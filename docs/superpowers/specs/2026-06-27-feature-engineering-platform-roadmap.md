@@ -107,3 +107,5 @@ The reference architecture (companion doc) is the shared contract every sub-proj
 ## 7. Recommended starting point
 
 **SP-0 (Foundations)** — it pins down the Feature Contract data model, the state machine, and the durable workflow runtime that every later spec references. **SP-1 (Metadata Overlay)** is a strong parallel alternative if a self-contained service is preferred as the first build.
+
+> SP-0 now has a written design spec: [`2026-06-27-sp0-foundations-design.md`](./2026-06-27-sp0-foundations-design.md) — immutable staged document chain, event-sourced state + projections, roll-your-own durable runtime (outbox · idempotency · durable timers · bounded retries), and identity + structural SoD.
