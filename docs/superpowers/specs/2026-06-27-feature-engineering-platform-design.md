@@ -13,7 +13,7 @@
 
 This document specifies the reference architecture for a **data-scientist-led, LLM-assisted, policy-aware, contract-driven, validator-enforced, human-approved, lifecycle-managed feature engineering platform** suitable for a regulated (banking-grade) environment.
 
-The platform accepts an unstructured feature *hypothesis* from a data scientist in natural language and converts it — through a sequence of LLM assistance, deterministic validation, and human confirmation — into a **versioned, monitored, governed production feature**.
+The platform accepts the data scientist's intent — a loose **hypothesis** *or* a precise **feature definition** (§14.1) — **generates** a feature implementation from it, and converts that — through a sequence of LLM assistance, deterministic validation, and human confirmation — into a **versioned, monitored, governed production feature**.
 
 ### 1.2 The one rule everything else serves
 
@@ -36,7 +36,7 @@ That pipeline is unsafe because it lets an LLM's unverified output reach product
 These boundaries are deliberate decisions, not omissions:
 
 - **Vendor-neutral.** This document states *capability requirements* ("the platform requires a catalog that exposes column-level availability time"), never product names. Binding to specific technologies (warehouse, orchestration engine, feature store, catalog) is left to implementation.
-- **Batch-only serving.** Features are computed on a schedule and **materialized** to a store; serving is a lookup of the latest materialized value. Feature freshness is therefore bounded by the batch cadence (minutes to hours). **True sub-second, compute-at-request features (e.g. in-the-moment card-fraud scoring) are out of scope** for this revision. See §14 for the future path.
+- **Batch-only serving.** Features are computed on a schedule and **materialized** to a store; serving is a lookup of the latest materialized value. Feature freshness is therefore bounded by the batch cadence (minutes to hours). **True sub-second, compute-at-request features (e.g. in-the-moment card-fraud scoring) are out of scope** for this revision. See §15 for the future path.
 - **Layer 0 (data catalog) is integrated, not built.** The platform consumes an existing enterprise catalog and *augments* it with a Metadata Overlay (§6). Standing up an enterprise catalog from scratch is a prerequisite, not part of this design.
 - **No model training framework.** The platform produces and governs *features*. It evaluates a feature's contribution to a model but does not own model training, deployment, or the model lifecycle. It *integrates with* the bank's model-risk process (§11).
 
@@ -86,11 +86,11 @@ Each layer below lists its **purpose**, **inputs → outputs**, **components**, 
 
 ### Layer 1 — Intake and normalization
 
-**Purpose:** turn free text into a structured *draft* — never executable.
+**Purpose:** turn the data scientist's intent into a structured *draft* — never executable. Intent arrives in one of **two modes** (§14.1): a loose **hypothesis** (the platform generates candidate definitions) or a precise **feature definition** (the platform translates it faithfully).
 
-**Inputs → outputs:** free-text hypothesis → **Draft Feature Contract** + **Assumption Ledger**.
+**Inputs → outputs:** free-text hypothesis *or* feature definition → **Draft Feature Contract** + **Assumption Ledger**.
 
-**Components:** Feature Intake UI/API; LLM Intake & Normalization Agent.
+**Components:** Feature Intake UI/API; LLM Intake & Normalization Agent; (hypothesis mode) the multi-candidate generation engine (§14.2).
 
 **Gate:** none yet — output is explicitly marked `status: NEEDS_CLARIFICATION` and cannot proceed past Layer 2 without confirmation.
 
@@ -140,9 +140,9 @@ Each layer below lists its **purpose**, **inputs → outputs**, **components**, 
 
 **Inputs → outputs:** sandbox-proven artifact → **evaluation report + risk assessment**.
 
-**Components:** Offline evaluation (lift, stability, out-of-time); **semantic/proxy leakage detection** (§7.4); fairness/proxy risk gate; cost evaluation; Critique Service (`EVALUATION_REVIEW` mode); **augmented human review** preparation (§5.6).
+**Components:** Offline evaluation via **model-free scoring** (IV/WoE) with an optional throwaway probe (§14.3); stability and out-of-time validation; the **search-overfitting guard** (§14.4); **semantic/proxy leakage detection** (§7.4); fairness/proxy risk gate; cost evaluation; Critique Service (`EVALUATION_REVIEW` mode); **augmented human review** preparation (§5.6).
 
-**Gate (hard):** no evaluation report → no final approval. A feature is **never** approved on a single improved metric (§6 evaluation rules).
+**Gate (hard):** no evaluation report → no final approval. A feature is **never** approved on a single improved metric, and reaches **USEFULNESS-CHECKED** (§14.5) only after clearing the overfitting guard (§14.4).
 
 ### Layer 7 — Approval, registry, and lifecycle
 
@@ -458,9 +458,11 @@ Temporal correctness and structural safety: column/table existence and types; en
 This split is a core safety decision. **"Leakage" is two different problems:**
 
 - **Temporal leakage** — *deterministically decidable*, a hard gate (`TemporalLeakageValidationPack`). Example: using `transaction_date` without also requiring `posted_at < as_of_date`.
-- **Semantic / proxy leakage** — *not statically decidable*. Target leakage via a proxy column, label-derived aggregates, train/test contamination through entity overlap, wrong SCD effective-dates in the *source* data. These are caught **downstream**, at evaluation (suspiciously high lift, high target correlation, §6 Layer 6) **plus mandatory human review** — never by the validation gate.
+- **Semantic / proxy leakage** — *not statically decidable*. Target leakage via a proxy column, label-derived aggregates, train/test contamination through entity overlap, wrong SCD effective-dates in the *source* data. These are caught **downstream**, at evaluation (suspiciously high lift, high target correlation, Layer 6 / §14.3) **plus mandatory human review** — never by the validation gate.
 
 > The word **PASSED** at the validation gate means *temporal and structural* safety only. It must never be read as "leakage-free." Semantic leakage is an evaluation-and-human concern.
+
+A third, related risk — **search-induced overfitting**, when many candidates are generated and scored and the best is kept — is likewise not a validation-gate concern; it is handled at evaluation by the guard in §14.4.
 
 ### 7.5 Feature-duplication checks the full space
 
@@ -680,7 +682,78 @@ A feature's risk tier (from its implementation path) follows it into production.
 
 ---
 
-## 14. Open questions and future work
+## 14. Feature generation, scoring, and staged verification
+
+The platform's responsibilities include **generating a feature implementation from the data scientist's intent**, not only validating one handed to it. This section specifies how generation works (bounded by human intent), how candidates are scored **without a trained downstream model**, and the honest verification status every feature carries. These additions adapt the LLM-FE program-search approach (arXiv:2503.14434), deliberately subordinated to the authority model (§2.1): the engine *proposes and scores*; the gates and the human *decide*.
+
+### 14.1 Two intake modes
+
+Intent arrives in one of two forms, which need different amounts of generation:
+
+- **Hypothesis-driven (loose intent → platform generates).** A belief, not a formula — e.g. *"customers with irregular salary credits are more likely to churn."* The platform proposes multiple candidate feature definitions/calculations (§14.2) for the scientist to confirm at Human Gate #1.
+- **Definition-driven (precise spec → platform translates).** The scientist states the exact feature — e.g. *"stddev of days between SALARY transactions over a 90-day lookback, grained by customer × as_of_date."* There is little to invent; the platform **grounds, compiles, and validates faithfully** rather than generating alternatives.
+
+Both modes converge on the same Confirmed Feature Contract (§4.2) and the same safety floor (§2.2).
+
+### 14.2 Multi-candidate generation and scored selection (assistive, bounded)
+
+For hypothesis-driven intake the platform generates **several candidate definitions** of the concept instead of silently committing to one — this resolves the calculation-method ambiguity flagged in §4.2. For "salary irregularity" it might generate: stddev of inter-credit gaps; coefficient of variation of amounts; count of missed expected paydays.
+
+What keeps this safe and human-led:
+
+- **Bounded, not autonomous.** The engine explores the *implementation space of the scientist's hypothesis*, never an open-ended space of all possible features. This bounding preserves the "data-scientist-led" principle and limits search-induced overfitting (§14.4).
+- **Proposes, never approves.** Candidates flow through the normal pipeline; the human confirms at Gate #1 and approves at Gate #2.
+- **Attempt memory + diversity.** The platform keeps a persistent memory of *every* attempt — definition, score, and (for rejects) the reason — and uses it to bias future suggestions and avoid re-proposing dead ends. To avoid converging prematurely on one mediocre idea, it keeps several diverse candidate lines alive in parallel (the "islands" pattern). This upgrades the duplication check (§7.5) and the harvest loop (§5.8) from static dedup into an active learning memory.
+- **Fast discard.** Candidates exceeding configured runtime/memory caps are dropped immediately during exploration, before consuming a full sandbox/evaluation cycle.
+
+Each surviving candidate is **scored (§14.3)** and the scientist is shown ranked options with evidence — a confirmation, not a blind guess.
+
+### 14.3 Scoring candidates without a trained model
+
+LLM-FE scores candidates by training a model in-loop. A feature platform usually has **no production model available at build time**, and may not even have data yet. Scoring is therefore **tiered by what is available**, and the platform is explicit about which tier it reached.
+
+**Tier 1 — model-free, label-aware scoring (default when labels exist).** The Confirmed Contract already defines the target (e.g. the churn definition, §4.2). Using a point-in-time-correct historical sample of `(feature_value, label)`, predictive power is measured with **no model**:
+
+- **Information Value (IV) / Weight of Evidence** — the banking standard. Bucket the feature; compare the target rate across buckets; large movement = strong feature (rule of thumb: IV > ~0.1 is worth keeping).
+- Equivalently, mutual information or single-feature AUC.
+
+Example: bucketing "salary irregularity" yields churn rates 10% → 20% → 40% across low/medium/high → IV ≈ 0.18 (strong). A flat churn rate across buckets → IV ≈ 0 (useless).
+
+**Tier 1b — throwaway probe for *incremental* value (optional).** To ask "does this add information beyond features we already have," train a small **disposable** model (shallow gradient-boosted tree or logistic regression) on `existing` vs `existing + candidate` and compare. This probe is a measuring stick, **not** the production model, and is discarded after scoring.
+
+**Tier 0 — no label available.** Predictive power cannot be measured honestly. The platform scores only **quality and novelty** (coverage / non-null rate, variance, stability over time, redundancy vs existing features) and marks the feature **"predictive value unverified."** It never fabricates a score.
+
+The historical scoring sample must itself be **point-in-time correct** (feature computed as-of past dates using only then-available data); otherwise the score is leaky and misleading.
+
+### 14.4 The search-overfitting guard
+
+Generating and scoring **many** candidates and keeping the best introduces a multiple-comparisons risk: the winner may look good **by chance**, and the risk grows with the number of candidates tried. (LLM-FE does not guard against this; for banking it is mandatory.)
+
+> **Guard:** any feature selected from a multi-candidate search must re-clear its score on a **separate out-of-time (and/or nested) holdout** before approval. The bar scales with how many candidates were tried. A winner whose score collapses out-of-time was a fluke and is rejected.
+
+This guard is *in addition to* the temporal-leakage gate (§7.3) and the semantic/proxy-leakage detection (§7.4).
+
+### 14.5 Staged verification stamp
+
+Different checks need different inputs. Every feature carries an explicit, honest stamp of **how far it has actually been verified**, so a metadata-only candidate is never mistaken for a production-ready feature:
+
+```
+DESIGN-CHECKED      (needs only schema + definitions + overlay)
+   plausible (LLM) · columns/types/grain valid · point-in-time safe ·
+   policy-allowed · not a duplicate
+
+DATA-CHECKED        (needs a data sample — sandbox, Layer 5)
+   actually runs · null rates acceptable · values sane · no key duplication
+
+USEFULNESS-CHECKED  (needs data + labels — scoring, §14.3)
+   predictive signal confirmed (IV / probe) · survives the overfitting guard (§14.4)
+```
+
+A feature may be **DESIGN-CHECKED** with only schema, column names, and definitions — a real and valuable result (it is sensible, safe, and well-formed) — but it is **not production-eligible** until it reaches **USEFULNESS-CHECKED**. The stamp is a registry attribute carried with the feature version, and the **hard approval gate (§10) requires USEFULNESS-CHECKED for production promotion.**
+
+---
+
+## 15. Open questions and future work
 
 - **Real-time (sub-second) serving.** Out of scope here (§1.4). A future revision adds a single-definition-compiled-to-both path (offline + online) with **mandatory equivalence testing**, and keeps **Path-2 LLM SQL batch-only** (un-vetted generated SQL must never reach a real-time path it can't be equivalence-proven on).
 - **DSL coverage metric.** Track the percentage of real requests Path 1 can express; use it to prioritize the harvest loop (§5.8).
@@ -695,13 +768,15 @@ A feature's risk tier (from its implementation path) follows it into production.
 ```
 Data scientist gives the idea.
 LLM turns it into a draft contract.
-Human confirms the important doubts (including which math defines the concept).
+Platform generates several candidate versions and scores them without a model (churn rates / Information Value).
+Human confirms the important doubts (including which math defines the concept), choosing from scored options.
 Schema Mapper connects it to real, allowed data (catalog + overlay).
 Validators prove it is temporally and structurally safe.
 The Router picks who writes the SQL (compiler, LLM, or human) — safest path first.
 Sandbox proves it runs correctly on safe data.
-Evaluation proves it is useful — and checks for semantic leakage and fairness.
+Evaluation proves it is useful — re-checks the winner on a different time period (so it isn't luck), and checks for semantic leakage and fairness.
 A human approves it, with the platform's analysis surfaced (not raw SQL).
+Every feature carries an honest stamp: Design-checked → Data-checked → Usefulness-checked.
 The Registry records an immutable version; the Store holds its batch-materialized values.
 The Lifecycle Manager keeps it healthy, and promotes good LLM features into the DSL.
 ```

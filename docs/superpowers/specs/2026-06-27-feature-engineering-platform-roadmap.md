@@ -36,8 +36,9 @@ PHASE B — VERTICAL SLICE / MVP  (one feature type, Path 1 only, happy path)
                 ▼
 PHASE C — COVERAGE  (broaden what can be built; parallelizable)
   SP-6  Path 2: LLM candidate SQL + repair loop + SQL validation gate
-  SP-7  Full validation suite + semantic/proxy leakage + fairness (deepen L4/L6)
+  SP-7  Full validation suite + semantic/proxy leakage + fairness + overfitting guard
   SP-8  Critique Service formalized (all 5 modes)
+  SP-12 Hypothesis-driven Feature Generation (multi-candidate + model-free scoring; bounded/assistive)
                 │
                 ▼
 PHASE D — HARDENING  (make it bank-grade & durable)
@@ -62,10 +63,10 @@ CROSS-CUTTING (designed in at SP-0, completed in Phase D):
 
 | ID | Delivers | Depends on |
 |---|---|---|
-| **SP-2** | LLM intake agent; draft contract; ambiguity + confidence scoring; doubt router; **Human Gate #1** (including the calculation-method choice); confirmed contract | SP-0 |
+| **SP-2** | LLM intake agent; **two intake modes** (hypothesis-driven generation vs definition-driven translation); draft contract; ambiguity + confidence scoring; doubt router; **Human Gate #1** (including the calculation-method choice, picked from scored candidates); confirmed contract | SP-0 |
 | **SP-3** | Policy-aware schema mapper; entity/grain resolver; **point-in-time + SCD mapper**; mapped contract; mapping review | SP-0, SP-1 |
 | **SP-4** | Core validation packs (schema, type, entity, grain, join, **temporal leakage / PIT**, policy); Implementation Router (Path-1 only); small DSL operation catalog + compiler; sandbox on masked data; feature-type DQ checks | SP-0, SP-1, SP-3 |
-| **SP-5** | Thin offline evaluation (lift, stability); **Human Gate #2** with augmented review; final approval; immutable registry entry; batch materialization to the store | SP-4 |
+| **SP-5** | Thin offline evaluation via **model-free scoring** (IV/WoE); the **staged verification stamp** (Design → Data → Usefulness-checked); **Human Gate #2** with augmented review; final approval; immutable registry entry; batch materialization to the store | SP-4 |
 
 **◆ Milestone (end of SP-5):** a data scientist takes one feature type from free text → clarified → grounded → validated → DSL-compiled → sandboxed → evaluated → approved → registered → materialized. The architecture is proven end-to-end.
 
@@ -74,8 +75,9 @@ CROSS-CUTTING (designed in at SP-0, completed in Phase D):
 | ID | Delivers | Depends on |
 |---|---|---|
 | **SP-6** | Path 2 (LLM candidate SQL); self-critique repair loop (non-gate); SQL validation gate for arbitrary SQL | SP-4, SP-5 |
-| **SP-7** | Remaining validation packs (backfill, cost, serving-feasibility, duplication incl. rejected/in-flight); **semantic/proxy leakage detection + fairness gate** at evaluation | SP-4, SP-5 |
+| **SP-7** | Remaining validation packs (backfill, cost, serving-feasibility, duplication incl. rejected/in-flight); **semantic/proxy leakage detection + fairness gate**; the **search-overfitting guard** (out-of-time re-check) at evaluation | SP-4, SP-5 |
 | **SP-8** | Critique Service as one reusable service across all five modes (CONTRACT / MAPPING / LOGIC / CODE / EVALUATION) | SP-2, SP-3, SP-4 |
+| **SP-12** | Hypothesis-driven **Feature Generation engine** (bounded, assistive): multi-candidate generation, attempt memory + diversity (islands), model-free scoring, fast resource-cap discard; **proposes only — never bypasses gates** (design §14) | SP-4, SP-5, SP-7 |
 
 ### Phase D — Hardening (bank-grade & durable)
 
