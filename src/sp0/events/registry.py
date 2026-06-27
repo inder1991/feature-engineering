@@ -79,6 +79,23 @@ class EventSchemaRegistry:
             version += 1
         return current
 
+    def set_status(self, type_name: str, schema_version: int, status: str) -> None:
+        key = (type_name, schema_version)
+        if key not in self._status:
+            raise SchemaValidationError(f"unknown schema {type_name}@v{schema_version}")
+        if status not in ("active", "deprecated", "withdrawn"):
+            raise SchemaValidationError(f"invalid status {status!r}")
+        self._status[key] = status
+
+    def assert_writable(self, type_name: str, schema_version: int) -> None:
+        status = self._status.get((type_name, schema_version))
+        if status is None:
+            raise SchemaValidationError(f"unknown schema {type_name}@v{schema_version}")
+        if status != "active":
+            raise SchemaValidationError(
+                f"{type_name}@v{schema_version} is {status}; no new writes allowed"
+            )
+
     def assert_evolution_complete(self) -> None:
         """§3.3 load-time enforcement: a breaking schema bump REQUIRES a stepwise upcaster.
         For every type, each consecutive registered version pair that is not backward-compatible
