@@ -79,6 +79,75 @@ class EventSchemaRegistry:
             version += 1
         return current
 
+    def assert_evolution_complete(self) -> None:
+        """§3.3 load-time enforcement: a breaking schema bump REQUIRES a stepwise upcaster.
+        For every type, each consecutive registered version pair that is not backward-compatible
+        must have a registered upcaster for every step between them; otherwise raise
+        SchemaValidationError (a load-time error, never a lazy read-time poison)."""
+        by_type: dict[str, list[int]] = {}
+        for (type_name, version) in self._schemas:
+            by_type.setdefault(type_name, []).append(version)
+        for type_name, versions in by_type.items():
+            versions.sort()
+            for prev, nxt in zip(versions, versions[1:]):
+                if is_backward_compatible(self._schemas[(type_name, prev)],
+                                          self._schemas[(type_name, nxt)]):
+                    continue  # additive bump: no upcaster required
+                for step in range(prev, nxt):
+                    if (type_name, step) not in self._upcasters:
+                        raise SchemaValidationError(
+                            f"breaking schema bump {type_name} v{prev}->v{nxt} requires a "
+                            f"stepwise upcaster {type_name} v{step}->v{step + 1}"
+                        )
+
+
+def _types_of(spec: Mapping[str, Any]) -> set[str]:
+    t = spec.get("type")
+    if t is None:
+        return set()
+    return set(t) if isinstance(t, list) else {t}
+
+
+def _type_compatible(old_spec: Mapping[str, Any], new_spec: Mapping[str, Any]) -> bool:
+    old_types = _types_of(old_spec)
+    new_types = _types_of(new_spec)
+    if not old_types or not new_types:
+        return True  # unconstrained on either side: not a narrowing we track
+    return old_types <= new_types  # widening (superset) is compatible
+
+
+def _enum_compatible(old_spec: Mapping[str, Any], new_spec: Mapping[str, Any]) -> bool:
+    old_enum = old_spec.get("enum")
+    new_enum = new_spec.get("enum")
+    if old_enum is None and new_enum is None:
+        return True
+    if old_enum is None and new_enum is not None:
+        return False  # adding an enum constraint narrows
+    if old_enum is not None and new_enum is None:
+        return True  # dropping the enum constraint widens
+    return set(old_enum) <= set(new_enum)  # adding values is compatible
+
+
+def is_backward_compatible(old_schema: Mapping[str, Any], new_schema: Mapping[str, Any]) -> bool:
+    """§3.3 backward-compat rule: compatible iff the new schema only adds optional
+    fields, widens types, or adds enum values; anything else is breaking."""
+    old_props: Mapping[str, Any] = old_schema.get("properties", {})
+    new_props: Mapping[str, Any] = new_schema.get("properties", {})
+    old_required = set(old_schema.get("required", []))
+    new_required = set(new_schema.get("required", []))
+
+    if new_required - old_required:
+        return False  # a newly-required field breaks old writers
+    if set(old_props) - set(new_props):
+        return False  # removing a known property breaks old readers
+    for name, old_spec in old_props.items():
+        new_spec = new_props[name]
+        if not _type_compatible(old_spec, new_spec):
+            return False
+        if not _enum_compatible(old_spec, new_spec):
+            return False
+    return True
+
 
 _REGISTRY: Optional[EventSchemaRegistry] = None
 
