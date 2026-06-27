@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+import hashlib
+import json as _json
 from typing import Any, Mapping, Optional
 
 import jsonschema
+from psycopg.rows import dict_row
+from psycopg.types.json import Jsonb
 
 from sp0.contracts import SchemaValidationError, Upcaster
+from sp0.contracts.db import DbConn
 
 
 class EventSchemaRegistry:
@@ -117,6 +122,29 @@ class EventSchemaRegistry:
                             f"stepwise upcaster {type_name} v{step}->v{step + 1}"
                         )
 
+    def snapshot_version(self) -> str:
+        """Content-addressed pinnable snapshot id over the {type_name: max_active_version} map.
+        Identical registry states yield the SAME id; distinct states yield DISTINCT ids — so a
+        provenance-pinned id resolves to exactly one {type: version} map (§3.3 determinism)."""
+        canonical = _json.dumps(self.max_active_versions(), sort_keys=True, separators=(",", ":"))
+        digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
+        return f"events@{digest}"
+
+    def max_active_versions(self) -> dict[str, int]:
+        """{type_name: highest active schema_version} for the snapshot contents."""
+        out: dict[str, int] = {}
+        for (type_name, version), status in self._status.items():
+            if status == "active":
+                out[type_name] = max(out.get(type_name, 0), version)
+        return out
+
+    def all_schemas(self) -> list[tuple[str, int, dict[str, Any], str, str]]:
+        """(type_name, schema_version, json_schema, owner, status) for every registration."""
+        return [
+            (t, v, self._schemas[(t, v)], self._owners[(t, v)], self._status[(t, v)])
+            for (t, v) in self._schemas
+        ]
+
 
 def _types_of(spec: Mapping[str, Any]) -> set[str]:
     t = spec.get("type")
@@ -179,3 +207,76 @@ def event_registry() -> EventSchemaRegistry:
 def reset_event_registry() -> None:
     global _REGISTRY
     _REGISTRY = EventSchemaRegistry()
+
+
+def persist_event_schemas(conn: DbConn, registry: EventSchemaRegistry) -> None:
+    """Durably record the in-memory schemas in event_type_registry (idempotent upsert).
+    Enforces the §3.3 breaking-bump rule FIRST: assert_evolution_complete() raises before any
+    write if a breaking schema bump lacks its mandatory upcaster."""
+    registry.assert_evolution_complete()
+    with conn.cursor() as cur:
+        for type_name, version, json_schema, owner, status in registry.all_schemas():
+            cur.execute(
+                """
+                INSERT INTO event_type_registry
+                    (type_name, schema_version, json_schema, owner, status)
+                VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT (type_name, schema_version)
+                DO UPDATE SET json_schema = EXCLUDED.json_schema,
+                              owner = EXCLUDED.owner,
+                              status = EXCLUDED.status
+                """,
+                (type_name, version, Jsonb(json_schema), owner, status),
+            )
+
+
+def persist_registry_snapshot(conn: DbConn, registry: EventSchemaRegistry) -> str:
+    """Write {type_name: max_active_version} under the content-addressed snapshot id; return it.
+    Because the id is derived from the same contents, ON CONFLICT re-writes identical contents
+    (no cross-state overwrite)."""
+    snapshot_id = registry.snapshot_version()
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO registry_snapshots (snapshot_id, registry, contents)
+            VALUES (%s, 'events', %s)
+            ON CONFLICT (snapshot_id)
+            DO UPDATE SET contents = EXCLUDED.contents, captured_at = now()
+            """,
+            (snapshot_id, Jsonb(registry.max_active_versions())),
+        )
+    return snapshot_id
+
+
+def load_registry_snapshot(conn: DbConn, snapshot_id: str) -> dict[str, int]:
+    """Resolve a pinned snapshot id back to its {type_name: schema_version} map so a replay can
+    drive upcast-on-read deterministically (§3.3/§8). Raises SchemaValidationError if unknown."""
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            "SELECT contents FROM registry_snapshots WHERE snapshot_id = %s",
+            (snapshot_id,),
+        )
+        row = cur.fetchone()
+    if row is None:
+        raise SchemaValidationError(f"unknown registry snapshot {snapshot_id!r}")
+    return {str(k): int(v) for k, v in row["contents"].items()}
+
+
+def hydrate_event_registry(conn: DbConn) -> EventSchemaRegistry:
+    """Reconstitute the process-global registry singleton's SCHEMAS from event_type_registry
+    (resets then reloads), so a fresh process can validate/append without re-declaring every
+    schema by hand. Upcasters are code: they are re-registered at import, not hydrated."""
+    reset_event_registry()
+    reg = event_registry()
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            "SELECT type_name, schema_version, json_schema, owner, status "
+            "FROM event_type_registry ORDER BY type_name, schema_version"
+        )
+        rows = cur.fetchall()
+    for r in rows:
+        reg.register_schema(
+            r["type_name"], r["schema_version"], r["json_schema"], r["owner"],
+            status=r["status"],
+        )
+    return reg
