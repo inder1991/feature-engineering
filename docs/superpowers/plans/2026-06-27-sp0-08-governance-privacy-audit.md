@@ -64,6 +64,18 @@ This task makes every later DB-backed task (4, 7–12) actually reach a green st
 consumed `db` fixture would not provision `feature_versions`/`events`/`documents`/`blob_index`/
 `security_audit`, and those tests would error on missing relations instead of passing.
 
+> **Integration-suite requirement (canonical migrations, NOT the shadow fixture).** The
+> `_prereq_phase08.sql` transcription + the `08*.sql` glob built below are a UNIT-isolation fixture
+> ONLY — they exist so each Phase-08 unit test runs fast and standalone, and they are NOT the proof
+> that the canonical schema is sufficient or consistent. A separate `tests/integration/` suite MUST
+> run ONLY the canonical migrations module `sp0/db/migrations.py` (the shared `MIGRATIONS` list that
+> Phase 01 owns and into which Phase 08's `0810`/`0820`/`0830` migrations are registered) — never the
+> `_prereq_phase08.sql` shadow or the `08*.sql` glob — and exercise a cross-phase happy path (seed a
+> `feature_version` → `place_legal_hold` → `crypto_shred` a body → `replay_run` labels it
+> privacy-degraded → `read_audit` returns the labeled view). That integration suite is the
+> authoritative check that the REAL migrations provision every table this phase depends on; the
+> shadow fixture stays for fast unit isolation only.
+
 **Files:**
 - Create: `tests/sp0/_prereq_phase08.sql`, `tests/sp0/_phase08_db.py`, `tests/sp0/governance/conftest.py`, `tests/sp0/privacy/conftest.py`, `tests/sp0/attempt_memory/conftest.py`
 - Test: `tests/sp0/governance/test_harness.py`
@@ -177,7 +189,7 @@ CREATE TABLE feature_versions (
     produced_by_run               text        NOT NULL,
     base_feature_version_id       text        NULL REFERENCES feature_versions(feature_version_id),
     verification_stamp            text        NOT NULL
-                                      CHECK (verification_stamp IN ('DESIGN','DATA','USEFULNESS-CHECKED')),
+                                      CHECK (verification_stamp IN ('DESIGN-CHECKED','DATA-CHECKED','USEFULNESS-CHECKED')),
     risk_tier                     text        NOT NULL,
     approval_type                 text        NOT NULL CHECK (approval_type IN ('EXPERIMENTAL','PRODUCTION')),
     approved_use_cases            text[]      NOT NULL DEFAULT '{}',
@@ -571,7 +583,7 @@ git add -A && git commit -m "feat(sp0-08): provenance builder + replay-pin/no-in
 
 **Interfaces:**
 - Consumes: stdlib only.
-- Produces: `GovernanceAttributes` (frozen, slots); `validate_governance_attributes(attrs) -> None`; `GovernanceAttributeError`; `VERIFICATION_STAMPS = ("DESIGN","DATA","USEFULNESS-CHECKED")`; `APPROVAL_TYPES = ("EXPERIMENTAL","PRODUCTION")`. (Slot vocabulary is SP-0-normative; thresholds/use-case meaning stay in SP-9/10/12.)
+- Produces: `GovernanceAttributes` (frozen, slots); `validate_governance_attributes(attrs) -> None`; `GovernanceAttributeError`; `VERIFICATION_STAMPS = ("DESIGN-CHECKED","DATA-CHECKED","USEFULNESS-CHECKED")`; `APPROVAL_TYPES = ("EXPERIMENTAL","PRODUCTION")`. (Slot vocabulary is SP-0-normative; thresholds/use-case meaning stay in SP-9/10/12.)
 
 **TDD steps:**
 
@@ -599,7 +611,7 @@ def _attrs(**over):
 
 
 def test_vocabularies_match_ddl_check_constraints():
-    assert VERIFICATION_STAMPS == ("DESIGN", "DATA", "USEFULNESS-CHECKED")
+    assert VERIFICATION_STAMPS == ("DESIGN-CHECKED", "DATA-CHECKED", "USEFULNESS-CHECKED")
     assert APPROVAL_TYPES == ("EXPERIMENTAL", "PRODUCTION")
 
 
@@ -639,7 +651,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Mapping, Optional
 
-VERIFICATION_STAMPS: tuple[str, ...] = ("DESIGN", "DATA", "USEFULNESS-CHECKED")
+VERIFICATION_STAMPS: tuple[str, ...] = ("DESIGN-CHECKED", "DATA-CHECKED", "USEFULNESS-CHECKED")
 APPROVAL_TYPES: tuple[str, ...] = ("EXPERIMENTAL", "PRODUCTION")
 
 
@@ -654,7 +666,7 @@ class GovernanceAttributes:
     feature_version_id: str
     feature_id: str
     produced_by_run: str
-    verification_stamp: str                         # DESIGN | DATA | USEFULNESS-CHECKED
+    verification_stamp: str                         # DESIGN-CHECKED | DATA-CHECKED | USEFULNESS-CHECKED
     risk_tier: str                                  # free string; ordering/ceiling is policy
     approval_type: str                              # EXPERIMENTAL | PRODUCTION
     base_feature_version_id: Optional[str] = None
@@ -862,9 +874,9 @@ def test_verification_stamp_ordering_uses_sp0_normative_rank():
     assert verification_stamp_satisfies(
         {"verification_stamp": "USEFULNESS-CHECKED", "required_stamp": "USEFULNESS-CHECKED"}) is True
     assert verification_stamp_satisfies(
-        {"verification_stamp": "DATA", "required_stamp": "USEFULNESS-CHECKED"}) is False
+        {"verification_stamp": "DATA-CHECKED", "required_stamp": "USEFULNESS-CHECKED"}) is False
     assert verification_stamp_satisfies(
-        {"verification_stamp": "USEFULNESS-CHECKED", "required_stamp": "DATA"}) is True
+        {"verification_stamp": "USEFULNESS-CHECKED", "required_stamp": "DATA-CHECKED"}) is True
 
 
 def test_use_case_block_and_artifact_presence_and_type_and_tier():
@@ -2197,4 +2209,4 @@ Run the whole phase suite green before handing off:
 ```
 python -m pytest tests/sp0/governance tests/sp0/privacy tests/sp0/attempt_memory -q
 ```
-Expected: all phase tests pass. This phase delivers the §3.8/§3.9/§8/§9 *mechanism* only — verification-threshold values, risk-tier ordering/ceilings, use-case permission matrices, the active/governed predicate behind crypto-shred retention, retention cadences, and the concrete KMS/blob/security-chain bindings remain owned by SP-9/SP-10/SP-12 and the runtime phases. Cross-phase wiring points: the injected Phase-07 callables (`authorize_command(conn, cmd) -> AuthzDecision`, `record_security_event`), the re-exported `AuditReadDenied` (`sp0.security.audit`), the `ProvenanceEnvelope` single-source re-export (Task 1), the `governance_active` resolver hook (Task 9), and the `load_stream` import path (`sp0.events`). The Phase-08-owned `db` fixture (Task 0) provisions the shared tables verbatim plus Phase 08's `08*.sql` migrations, so the suite is self-contained; confirm the final Phase-01/07 names at integration and reconcile via the overview if they differ.
+Expected: all phase tests pass. This phase delivers the §3.8/§3.9/§8/§9 *mechanism* only — verification-threshold values, risk-tier ordering/ceilings, use-case permission matrices, the active/governed predicate behind crypto-shred retention, retention cadences, and the concrete KMS/blob/security-chain bindings remain owned by SP-9/SP-10/SP-12 and the runtime phases. Cross-phase wiring points: the injected Phase-07 callables (`authorize_command(conn, cmd) -> AuthzDecision`, `record_security_event`), the re-exported `AuditReadDenied` (`sp0.security.audit`), the `ProvenanceEnvelope` single-source re-export (Task 1), the `governance_active` resolver hook (Task 9), and the `load_stream` import path (`sp0.events`). The Phase-08-owned `db` fixture (Task 0) provisions the shared tables verbatim plus Phase 08's `08*.sql` migrations, so the UNIT suite is self-contained for fast iteration; that shadow fixture is for unit isolation only and is NOT the canonical-sufficiency proof. The authoritative cross-phase check is the `tests/integration/` suite (per Task 0's integration-suite requirement) that runs ONLY the canonical `sp0/db/migrations.py` module — never the `_prereq_phase08.sql` shadow or the `08*.sql` glob — proving the real migrations are sufficient and consistent. Confirm the final Phase-01/07 names at integration and reconcile via the overview if they differ.

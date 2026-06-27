@@ -776,7 +776,7 @@ The Router picks who writes the SQL (compiler, LLM, or human) — safest path fi
 Sandbox proves it runs correctly on safe data.
 Evaluation proves it is useful — re-checks the winner on a different time period (so it isn't luck), and checks for semantic leakage and fairness.
 A human approves it, with the platform's analysis surfaced (not raw SQL).
-Every feature carries an honest stamp: Design-checked → Data-checked → Usefulness-checked.
+Every feature carries an honest stamp: DESIGN-CHECKED → DATA-CHECKED → USEFULNESS-CHECKED.
 The Registry records an immutable version; the Store holds its batch-materialized values.
 The Lifecycle Manager keeps it healthy, and promotes good LLM features into the DSL.
 ```

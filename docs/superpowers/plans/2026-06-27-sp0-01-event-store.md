@@ -6,11 +6,11 @@
 
 > **Phase 01 design refinement (degraded handling).** The shared `run_projection` docstring says it marks the affected aggregate degraded "(e.g. `run_workflow_state.degraded=true`)". `run_workflow_state` is owned by a later phase and its `current_state`/`table_version` `NOT NULL` columns require §4 concepts Phase 01 does not have. Phase 01 therefore implements `run_projection` **generically over the `Projection` Protocol** while still honoring the contract's "mark the affected aggregate degraded and stop advancing it":
 >
-> 1. A fail-closed projection's `apply`, on an unappliable event, persists **its own** table-specific degraded marker (for the run projection that is `run_workflow_state.degraded`) as its only surviving write and raises `ProjectionApplyError` carrying `aggregate`/`aggregate_id`/`reason`.
-> 2. `run_projection` catches that error and **records the affected aggregate in a Phase-01-owned generic `projection_degraded` ledger** — using the carried `ProjectionApplyError.aggregate`/`aggregate_id`/`reason` plus the poison event id — so the marking is realized by the runner itself (the carried payload is load-bearing), independent of which table the projection owns.
-> 3. `run_projection` then **halts without advancing past the poison event** (lag grows; downstream command-blocking is enforced by readers of `projection_degraded` and of the projection's own marker).
+> 1. `run_projection` wraps **every** `projection.apply(event)` in a **SAVEPOINT**. A fail-closed projection's `apply`, on an unappliable event, raises `ProjectionApplyError` carrying `aggregate`/`aggregate_id`/`reason`; any writes its body made before raising (including any table-specific marker of its own) are **discarded** by the runner's `ROLLBACK TO SAVEPOINT`, so **no partial projection state survives** the poison event.
+> 2. After rolling back, `run_projection` **records the affected aggregate in a Phase-01-owned generic `projection_degraded` ledger in a separate statement** — using the carried `ProjectionApplyError.aggregate`/`aggregate_id`/`reason` plus the poison event id — so the **only** surviving degraded marker is the one the runner itself writes (the carried payload is load-bearing), independent of which table the projection owns.
+> 3. `run_projection` then **halts without advancing past the poison event** (lag grows; downstream command-blocking is enforced by readers of `projection_degraded`).
 >
-> Analytics projections log-and-skip. This keeps `run_projection` table-agnostic while realizing the §3.6 contract and the shared `run_projection` docstring exactly.
+> Analytics projections log-and-skip (their poison `apply` is likewise SAVEPOINT-wrapped, so its partial writes are discarded before the runner continues). This keeps `run_projection` table-agnostic while realizing the §3.6 contract and the shared `run_projection` docstring exactly.
 
 ---
 
@@ -388,8 +388,11 @@ class NewEvent:
 
 @dataclass(frozen=True, slots=True)
 class NewDocument:
-    """A frozen document a handler emits (§3.4). derived_from MUST reference committed docs."""
+    """A frozen document a handler emits (§3.4). derived_from MUST reference committed docs.
+    doc_id is caller-supplied via HandlerContext.new_doc_id(); append_document persists it
+    (see Phase 02 / §3.4). Canonical shape lives in the overview (00) and Phase 02."""
 
+    doc_id: str
     stage: str
     schema_version: int
     branch_role: str
@@ -436,14 +439,32 @@ class NewTimer:
 
 
 @dataclass(frozen=True, slots=True)
+class NewActivation:
+    """A cross-aggregate feature activation a handler requests (§5.8). Applied by commit_step
+    via apply_activation() on the STEP-transaction conn (Phase 06) — never by the handler — so
+    the CAS, VERSION_ACTIVATED/ACTIVATION_CONFLICT events, active-map update, and expiry timer
+    are atomic with the rest of the step."""
+
+    feature_id: str
+    feature_version_id: str
+    use_case: str
+    base_feature_version_id: Optional[str]
+    approval_type: str
+    expires_at: Optional[datetime] = None
+    provenance: Optional[ProvenanceEnvelope] = None
+
+
+@dataclass(frozen=True, slots=True)
 class HandlerResult:
-    """A handler's typed return. Retry/permanent is signalled HERE, never via exceptions."""
+    """A handler's typed return. Retry/permanent is signalled HERE, never via exceptions.
+    Handlers are PURE: ALL effects are declared here and applied atomically by commit_step."""
 
     disposition: Disposition
     new_events: tuple[NewEvent, ...] = ()
     document: Optional[NewDocument] = None
     external_commands: tuple[NewExternalCommand, ...] = ()
     timers: tuple[NewTimer, ...] = ()
+    activations: tuple[NewActivation, ...] = ()
     error: Optional[str] = None
 
 
@@ -452,7 +473,13 @@ class HandlerContext:
     run_id: str
     triggering_event: EventEnvelope
     documents: Mapping[str, NewDocument]
-    conn: "DbConn"
+    read_conn: "DbConn"  # READ-ONLY (autocommit): load stream/documents only; handlers MUST NOT write
+
+    def new_doc_id(self) -> str:
+        """Mint a 'doc_'-prefixed id so the handler can set NewDocument(doc_id=...) and reference
+        that exact id in its emitted events; commit_step persists it via append_document.
+        (requires: from uuid import uuid4)"""
+        return f"doc_{uuid4().hex}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -2882,7 +2909,7 @@ git commit -m "feat(sp0-01): projection runner apply+checkpoint+lag+as-of"
 
 **Interfaces:**
 - Consumes: `run_projection`, `projection_lag` (Task 12); `ProjectionApplyError` (Task 1); `append_event` (Task 9); `projection_degraded` table (Task 2).
-- Produces: the §3.6 degraded semantics on `run_projection` — a non-analytics (fail-closed) `ProjectionApplyError` (a) lets the projection's own marker survive, (b) records the affected aggregate in the Phase-01-owned `projection_degraded` ledger using the **carried** `ProjectionApplyError.aggregate`/`aggregate_id`/`reason` + the poison event id (so the runner itself realizes "mark the affected aggregate degraded", honoring the shared `run_projection` docstring and making the carried payload load-bearing), and (c) HALTS without advancing past the poison event. An analytics (fail-open) `ProjectionApplyError` is wrapped in a savepoint, skipped, and the projection continues to head. Internal helper `_mark_degraded(conn, projection_name, exc, event)`.
+- Produces: the §3.6 degraded semantics on `run_projection` — every `projection.apply` is wrapped in a **SAVEPOINT**; a non-analytics (fail-closed) `ProjectionApplyError` (a) triggers a `ROLLBACK TO SAVEPOINT` that **discards any partial writes the apply body made before raising** (so no partial projection state survives), (b) records the affected aggregate in the Phase-01-owned `projection_degraded` ledger in a **separate statement after the rollback** using the **carried** `ProjectionApplyError.aggregate`/`aggregate_id`/`reason` + the poison event id (so the runner itself realizes "mark the affected aggregate degraded", honoring the shared `run_projection` docstring and making the carried payload load-bearing), and (c) HALTS without advancing past the poison event. An analytics (fail-open) `ProjectionApplyError` is wrapped in a savepoint, skipped, and the projection continues to head. Internal helper `_mark_degraded(conn, projection_name, exc, event)`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -2936,8 +2963,11 @@ class FailClosedProjection:
 
     def apply(self, conn, event) -> None:
         if event.global_seq == self.poison_seq:
-            # persist ONLY the degraded marker, then signal fail-closed.
+            # Write PARTIAL projection state (into BOTH temp tables), THEN signal fail-closed.
+            # Under the runner's SAVEPOINT wrapping these writes MUST be discarded by ROLLBACK
+            # TO SAVEPOINT — only the runner's projection_degraded marker may survive.
             with conn.cursor() as cur:
+                cur.execute("INSERT INTO fc_applied (global_seq) VALUES (%s)", (event.global_seq,))
                 cur.execute(
                     "INSERT INTO fc_degraded (run_id, reason, at_seq) VALUES (%s, %s, %s)",
                     (event.run_id, "unappliable", event.global_seq),
@@ -2979,13 +3009,16 @@ def test_fail_closed_halts_and_persists_degraded_marker(conn):
     assert applied == 1  # only the pre-poison event
 
     with conn.cursor(row_factory=dict_row) as cur:
+        # The poison apply wrote PARTIAL state into BOTH fc_applied and fc_degraded before raising;
+        # the runner's SAVEPOINT + ROLLBACK TO SAVEPOINT discarded ALL of it — fc_applied holds
+        # ONLY the pre-poison event and fc_degraded is empty (NO partial projection state survives).
         cur.execute("SELECT global_seq FROM fc_applied ORDER BY global_seq")
         assert [r["global_seq"] for r in cur.fetchall()] == [e1.global_seq]
-        cur.execute("SELECT at_seq FROM fc_degraded")
-        assert cur.fetchone()["at_seq"] == poison.global_seq
-        # run_projection itself recorded the affected aggregate in the generic degraded ledger,
-        # using the CARRIED ProjectionApplyError payload (aggregate/aggregate_id/reason) + the
-        # poison event — this is the runner realizing "mark the affected aggregate degraded".
+        cur.execute("SELECT count(*) AS n FROM fc_degraded")
+        assert cur.fetchone()["n"] == 0  # the apply body's own partial marker was rolled back
+        # The ONLY surviving degraded record is the one run_projection itself wrote, in a SEPARATE
+        # statement AFTER the rollback, into the generic ledger — using the CARRIED
+        # ProjectionApplyError payload (aggregate/aggregate_id/reason) + the poison event.
         cur.execute(
             "SELECT aggregate, aggregate_id, reason, poison_seq FROM projection_degraded "
             "WHERE projection_name = 'fc'"
@@ -3026,7 +3059,7 @@ Expected: FAIL — Task 12's `run_projection` does not catch `ProjectionApplyErr
 
 - [ ] **Step 3: Write minimal implementation**
 
-Add `_mark_degraded` and replace the apply loop in `run_projection` (in `src/sp0/projections/runner.py`). Note `apply` for a fail-closed projection persists its own marker then raises a *Python* `ProjectionApplyError` (not a SQL error), so the connection's transaction is still valid and the runner can write to `projection_degraded` afterwards:
+Add `_mark_degraded` and replace the apply loop in `run_projection` (in `src/sp0/projections/runner.py`). Every `projection.apply` is wrapped in a `SAVEPOINT proj_apply`. A fail-closed projection raises a *Python* `ProjectionApplyError` (not a SQL error), so the connection's transaction is still valid: the runner issues `ROLLBACK TO SAVEPOINT proj_apply` to discard **any partial writes the apply body made before raising** (no partial projection state survives), then writes the surviving degraded marker to `projection_degraded` in a separate statement:
 
 ```python
 def _mark_degraded(conn: DbConn, projection_name: str, exc: ProjectionApplyError, event) -> None:
@@ -3066,13 +3099,21 @@ Replace the `for row in rows:` apply loop in `run_projection` with:
             last_seq = event.global_seq
             applied += 1
         else:
+            with conn.cursor() as cur:
+                cur.execute("SAVEPOINT proj_apply")
             try:
-                projection.apply(conn, event)  # NO savepoint: the projection's own marker survives
+                projection.apply(conn, event)
             except ProjectionApplyError as exc:
-                # Fail-closed (§3.6): mark the affected aggregate degraded from the carried
-                # payload, then HALT without advancing past the poison event.
+                # Fail-closed (§3.6): discard ANY partial writes the apply body made before it
+                # raised (ROLLBACK TO SAVEPOINT), so no partial projection state survives; then
+                # mark the affected aggregate degraded from the carried payload in a SEPARATE
+                # statement (this marker persists), and HALT without advancing past the poison.
+                with conn.cursor() as cur:
+                    cur.execute("ROLLBACK TO SAVEPOINT proj_apply")
                 _mark_degraded(conn, projection.name, exc, event)
                 break
+            with conn.cursor() as cur:
+                cur.execute("RELEASE SAVEPOINT proj_apply")
             last_seq = event.global_seq
             applied += 1
 ```
@@ -3553,6 +3594,6 @@ git commit -m "feat(sp0-01): re-export core interfaces from sp0.contracts + cros
 
 - §3.2 event envelope + per-aggregate OCC (incl. the **ahead-of-head** gap case, not just stale) + monotonic `global_seq` → Tasks 1, 2, 9, 10, 16.
 - §3.3 registry: validate, total/chained stepwise upcasters, backward-compat rule **actively enforced** (breaking bump → mandatory upcaster, load-time error via `assert_evolution_complete` wired into `persist_event_schemas`), deprecate/withdraw, content-addressed pinned snapshot (write side) **and** the snapshot read-path (`load_registry_snapshot` driving upcast-on-read) + durable persistence **and** hydration → Tasks 4, 5, 6, 7, 8; upcast-on-read incl. snapshot-pinned replay → Task 11.
-- §3.6 projections: checkpoint, lag, as-of, fail-closed degraded (runner marks the affected aggregate in `projection_degraded` from the carried `ProjectionApplyError` payload, then halts) vs analytics fail-open, deterministic rebuild, parallel migration + atomic read-switch → Tasks 12, 13, 14, 15.
+- §3.6 projections: checkpoint, lag, as-of, fail-closed degraded (each apply is SAVEPOINT-wrapped; on a fail-closed `ProjectionApplyError` the runner rolls back the apply's partial writes, marks the affected aggregate in `projection_degraded` from the carried payload in a separate statement, then halts) vs analytics fail-open, deterministic rebuild, parallel migration + atomic read-switch → Tasks 12, 13, 14, 15.
 - Contract integrity: shared `Handler`/`Projection` Protocols and `HandlerContext` carry the contract's typed signatures verbatim (no `Any` weakening) — Task 1; core interface functions importable from `sp0.contracts` per the overview — Task 16.
 - §12 coverage owned here: optimistic-concurrency conflict incl. ahead-of-head guard (Task 10), schema evolution incl. breaking change caught proactively at persist + deprecated/withdrawn readable + content-addressed pinned snapshot resolvable back to its `{type: version}` map (Tasks 5–8, 11), registry hydration on a fresh process (Task 8), `as-of`/lag reads (Tasks 11, 12), fail-closed/`degraded` ledger handling (Task 13).

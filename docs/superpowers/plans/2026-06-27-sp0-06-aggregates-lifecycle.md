@@ -6,14 +6,14 @@
 
 ### Interfaces consumed from earlier phases (do not redefine)
 
-- **Shared contract module** `src/sp0/contracts/` (established by Phase 01) re-exports: `DbConn`, `IdentityEnvelope`, `ProvenanceEnvelope`, `NewEvent`, `EventEnvelope`, `ConcurrencyError`, `Command`, `CommandResult`, `Handler`, `HandlerResult`, `HandlerContext`, `Disposition`, `NewTimer`, `NewExternalCommand`, `SchemaRegistry`, `SchemaValidationError`.
+- **Shared contract module** `src/sp0/contracts/` (established by Phase 01) re-exports: `DbConn`, `IdentityEnvelope`, `ProvenanceEnvelope`, `NewEvent`, `EventEnvelope`, `ConcurrencyError`, `Command`, `CommandResult`, `Handler`, `HandlerResult`, `HandlerContext`, `Disposition`, `NewTimer`, `NewExternalCommand`, `NewActivation`, `SchemaRegistry`, `SchemaValidationError`. (`HandlerResult.activations: tuple[NewActivation, ...] = ()` and `NewActivation(feature_id, feature_version_id, use_case, base_feature_version_id, approval_type, expires_at=None, provenance=None)` are the contract's cross-aggregate-activation effect; Phase 06 declares them in the saga handler and applies them in `commit_step` — see Task 11.)
 - **Event store** (Phase 01), importable as `from sp0.eventstore import append_event, load_stream, event_registry`:
   - `append_event(conn, new_event, *, expected_version, table_version) -> EventEnvelope` — validates payload against `event_registry`, raises `ConcurrencyError` on stale `expected_version`.
   - `load_stream(conn, aggregate, aggregate_id, *, upto_seq=None, expected=None) -> list[EventEnvelope]`.
   - `event_registry` — the process-wide event `SchemaRegistry` instance that `append_event` validates against; exposes `register_schema(type_name, schema_version, json_schema, owner, *, status="active")` and `validate(type_name, schema_version, body)`. **Cross-phase note:** `event_registry` is a Phase-01 *implementation export*, not one of the shared Core-interface symbols (those define only the `SchemaRegistry` Protocol and `append_event`'s "validates against the event registry" prose). This phase depends on Phase 01 exposing this singleton from `sp0.eventstore`; the §"Production wiring" note below registers Phase-06 schemas into it so runtime appends validate outside pytest.
 - **Handler dispatch + registry** (Phase 04), importable as `from sp0.runtime.handlers import HandlerRegistry` and `from sp0.runtime.dispatch import process_one`:
   - `HandlerRegistry.register(handler: Handler) -> None` / `.get(name) -> Handler` — keyed by `Handler.name`; re-registering a name is a `ValueError`.
-  - `process_one(conn, registry, *, owner, document_loader=...)` — claims one `queue` row, looks up `registry.get(queue.handler)`, builds a **run-scoped** `HandlerContext` from `payload["run_id"]` + `payload["event_id"]` (loaded from the **run** stream), runs `handler.handle(ctx)`, and on `Disposition.OK` calls `commit_step` (which appends `result.new_events` to the run stream, writes the ledger, and emits outbox rows). The activation saga (Task 11) relies on exactly this: its queue payload carries `run_id`+`event_id` of the run-stream `ACTIVATION_REQUESTED` event, and its handler returns **no run-stream events** (it performs the feature-side CAS via `ctx.conn`).
+  - `process_one(conn, registry, *, owner, document_loader=...)` — claims one `queue` row, looks up `registry.get(queue.handler)`, builds a **run-scoped** `HandlerContext` from `payload["run_id"]` + `payload["event_id"]` (loaded from the **run** stream), runs `handler.handle(ctx)`, and on `Disposition.OK` calls `commit_step` (which appends `result.new_events` to the run stream, writes the ledger, and emits outbox rows). The activation saga (Task 11) relies on exactly this: its queue payload carries `run_id`+`event_id` of the run-stream `ACTIVATION_REQUESTED` event, and its handler returns **no run-stream events** — it is PURE with respect to persistence and instead DECLARES the cross-aggregate effect as `HandlerResult.activations`, which `commit_step` applies on the step-transaction connection (Task 11 extends `commit_step` for this).
 - **Tables created by other phases (Phase 06 only references them):** `events` + `UNIQUE(aggregate,aggregate_id,stream_version)` (Phase 01); `run_workflow_state` (Phase 01 projection; read for the degraded-block, cleared by `resolve_degraded`); `queue` (Phase 04; the activation saga enqueues a `feature:{feature_id}`-partitioned `activate_version` row); `timers` (Phase 05; the saga schedules `experiment_expiry`, and forced `deprecate` schedules a `business_repair` grace timer).
 - **Test fixtures (Phase 01 `tests/conftest.py`):** `db` — a function-scoped psycopg connection in an OPEN transaction, rolled back after each test, with every `src/sp0/db/migrations/*.sql` applied in lexical order.
 
@@ -115,6 +115,26 @@ def test_concept_claims_concept_key_is_pk(db):
         "WHERE i.indrelid = 'concept_claims'::regclass AND i.indisprimary"
     ).fetchone()
     assert row[0] == "concept_key"
+
+
+def _seed_feature_version(db):
+    db.execute(
+        "INSERT INTO feature_versions (feature_version_id, feature_id, produced_by_run, "
+        "verification_stamp, risk_tier, approval_type, content_hash) "
+        "VALUES ('fv_im','feat_im','run_im','DATA-CHECKED','low','PRODUCTION','sha256:1')"
+    )
+
+
+def test_feature_versions_reject_update(db):
+    _seed_feature_version(db)
+    with pytest.raises(Exception):  # plpgsql RAISE EXCEPTION from feature_versions_no_mutation
+        db.execute("UPDATE feature_versions SET risk_tier='high' WHERE feature_version_id='fv_im'")
+
+
+def test_feature_versions_reject_delete(db):
+    _seed_feature_version(db)
+    with pytest.raises(Exception):  # plpgsql RAISE EXCEPTION from feature_versions_no_mutation
+        db.execute("DELETE FROM feature_versions WHERE feature_version_id='fv_im'")
 ```
 
 2. **Run it, expect FAIL.**
@@ -133,7 +153,7 @@ CREATE TABLE feature_versions (
     produced_by_run               text        NOT NULL,
     base_feature_version_id       text        NULL REFERENCES feature_versions(feature_version_id),
     verification_stamp            text        NOT NULL
-                                      CHECK (verification_stamp IN ('DESIGN','DATA','USEFULNESS-CHECKED')),
+                                      CHECK (verification_stamp IN ('DESIGN-CHECKED','DATA-CHECKED','USEFULNESS-CHECKED')),
     risk_tier                     text        NOT NULL,
     approval_type                 text        NOT NULL CHECK (approval_type IN ('EXPERIMENTAL','PRODUCTION')),
     approved_use_cases            text[]      NOT NULL DEFAULT '{}',
@@ -148,6 +168,19 @@ CREATE TABLE feature_versions (
 );
 CREATE INDEX feature_versions_feature_idx ON feature_versions (feature_id);
 CREATE INDEX feature_versions_base_idx    ON feature_versions (base_feature_version_id);
+
+-- Physical immutability (no UPDATE/DELETE) — mirrors Phase 02's documents write-once trigger.
+-- The `immutable` boolean flag is a convention only; this trigger is the enforcement backstop.
+CREATE OR REPLACE FUNCTION feature_versions_write_once() RETURNS trigger AS $$
+BEGIN
+    RAISE EXCEPTION 'feature_versions are immutable: % not allowed on feature_version_id=%',
+        TG_OP, COALESCE(OLD.feature_version_id, NEW.feature_version_id);
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER feature_versions_no_mutation
+    BEFORE UPDATE OR DELETE ON feature_versions
+    FOR EACH ROW EXECUTE FUNCTION feature_versions_write_once();
 
 CREATE TABLE feature_active_versions (
     feature_id         text        NOT NULL,
@@ -1702,12 +1735,12 @@ def test_mint_freezes_version_and_emits_event(db):
 
 def test_base_version_fk_chain(db):
     base = mint_feature_version(
-        db, feature_id="feat_2", produced_by_run="run_a", verification_stamp="DATA",
+        db, feature_id="feat_2", produced_by_run="run_a", verification_stamp="DATA-CHECKED",
         risk_tier="low", approval_type="PRODUCTION", approved_use_cases=(), blocked_use_cases=(),
         required_artifact_refs={}, content_hash="sha256:1", actor=make_actor(),
         provenance=provenance_for())
     child = mint_feature_version(
-        db, feature_id="feat_2", produced_by_run="run_b", verification_stamp="DATA",
+        db, feature_id="feat_2", produced_by_run="run_b", verification_stamp="DATA-CHECKED",
         risk_tier="low", approval_type="PRODUCTION", approved_use_cases=(), blocked_use_cases=(),
         required_artifact_refs={}, content_hash="sha256:2", actor=make_actor(),
         provenance=provenance_for(), base_feature_version_id=base)
@@ -1782,17 +1815,19 @@ def mint_feature_version(
 
 **Files:**
 - Create: `src/sp0/aggregates/activation.py`
+- Modify: `src/sp0/runtime/step.py` (extend Phase-04 `commit_step` to apply `result.activations` on the step-transaction conn — §5.8; replaces the Phase-04 deferred guard)
 - Test: `tests/sp0/aggregates/test_activation.py`
 
 **Interfaces:**
-- Consumes: `feature_active_versions`, `queue`, `timers` tables; `append`, `mint_id`, `new_feature_version_id`, `mint_feature_version` (this phase); `EventEnvelope.global_seq` (set on `activated_seq`); `Handler`, `HandlerContext`, `HandlerResult`, `Disposition`, `IdentityEnvelope` (contracts); Phase-04 `HandlerRegistry` / `process_one` (the worker that dispatches the saga handler).
+- Consumes: `feature_active_versions`, `queue`, `timers` tables; `append`, `mint_id`, `new_feature_version_id`, `mint_feature_version`, `current_version` (this phase); `EventEnvelope.global_seq` (set on `activated_seq`); `Handler`, `HandlerContext`, `HandlerResult`, `Disposition`, `IdentityEnvelope`, `NewActivation` (contracts); Phase-04 `HandlerRegistry` / `process_one` / `commit_step` (the worker that dispatches the saga handler and the step boundary that applies the declared activations).
 - Produces:
   - `ActivationResult(activated: bool, conflict: bool, feature_version_id: str, use_case: str, event_id: str)`.
   - `apply_activation(conn, *, feature_id, feature_version_id, use_case, base_feature_version_id, approval_type, actor, expires_at=None, provenance=None) -> ActivationResult` — `SELECT ... FOR UPDATE` on `(feature_id, use_case)`; idempotent if already active at that version; **CAS via `_cas_claim_slot`** (closes the null-base race): the active-map write itself is the atomic gate (insert-if-absent for null base, conditional update for a non-null base), so two concurrent first-activations cannot both win; appends `VERSION_ACTIVATED` only after winning the slot, else appends `ACTIVATION_CONFLICT`; `APPROVED_EXPERIMENTAL` → `ACTIVE_EXPERIMENTAL` + schedules an `experiment_expiry` timer.
   - `_cas_claim_slot(conn, *, feature_id, use_case, new_fv, base, state, activated_seq) -> bool` — the atomic CAS primitive (insert-if-absent / conditional-update); returns whether this caller won the slot.
   - `on_run_approved(conn, *, feature_id, produced_by_run, use_case, approval_type, actor, provenance, verification_stamp, risk_tier, approved_use_cases, blocked_use_cases, required_artifact_refs, content_hash, base_feature_version_id=None, dsl_operation_catalog_version=None, approval=None, expires_at=None) -> SagaStep1Result` — **§5.8 saga step 1, in the run's own transaction**: mints the frozen `feature_version_id` (Task 10) AND enqueues the activation request (`request_activation`). `SagaStep1Result(feature_version_id: str, activation_message_id: str)`.
   - `request_activation(conn, *, feature_id, feature_version_id, use_case, base_feature_version_id, approval_type, produced_by_run, actor, expires_at=None) -> str` — appends `ACTIVATION_REQUESTED` on the **run** stream (carrying every arg the handler needs) and enqueues the activation onto `queue` (partition `feature:{feature_id}`, handler `activate_version`, deterministic `message_id`, payload `{"run_id", "event_id"}` so the Phase-04 worker can rebuild the `HandlerContext`).
-  - `ActivateVersionHandler` (a `Handler`: `name="activate_version"`, `version=1`, `timeout_seconds`, `handle(ctx)->HandlerResult`) + module singleton `ACTIVATE_VERSION_HANDLER`; `register_phase06_handlers(registry) -> None` — registers it into Phase-04's `HandlerRegistry`. **§5.8 saga step 2:** the worker dispatches this handler; it reads the activation args from `ctx.triggering_event.payload` (the run-stream `ACTIVATION_REQUESTED`), performs the feature-side CAS via `apply_activation(ctx.conn, ...)`, and returns `HandlerResult(disposition=OK)` with **no run-stream events** (so `commit_step` writes only the ledger). This handler is the sanctioned cross-aggregate saga executor — the general "handlers must not emit feature-stream events" rule (§5.3/contract) does not apply to it; the activation IS the single feature-aggregate transaction §5.8 mandates.
+  - `ActivateVersionHandler` (a `Handler`: `name="activate_version"`, `version=1`, `timeout_seconds`, `handle(ctx)->HandlerResult`) + module singleton `ACTIVATE_VERSION_HANDLER`; `register_phase06_handlers(registry) -> None` — registers it into Phase-04's `HandlerRegistry`. **§5.8 saga step 2:** the worker dispatches this handler; it reads the activation args from `ctx.triggering_event.payload` (the run-stream `ACTIVATION_REQUESTED`) and returns `HandlerResult(disposition=OK, activations=(NewActivation(...),))` with **no run-stream events**. The handler is PURE — it performs NO writes via `ctx`; `commit_step` applies each `NewActivation` by calling `apply_activation` on the SINGLE step-transaction connection (the dispatcher conn), so the feature-side CAS, the `VERSION_ACTIVATED`/`ACTIVATION_CONFLICT` event, and any expiry timer are atomic with the rest of the step. This handler is the sanctioned cross-aggregate saga executor — the general "handlers must not emit feature-stream events" rule (§5.3/contract) does not apply to its declared activation effect; the activation IS the single feature-aggregate transaction §5.8 mandates.
+  - `commit_step` extension (`Modify src/sp0/runtime/step.py`): a `_apply_activations(conn, ctx, result)` helper invoked inside `commit_step` that applies each `result.activations` entry via `apply_activation(conn, ...)` (actor from `ctx.triggering_event.actor`), replacing the Phase-04 deferred-guard clause for `activations`.
   - `activate_command(conn, cmd) -> CommandResult` — the **synchronous** lifecycle command (`activate`, §4.4); distinct entrypoint from the async `activate_version` handler, both delegating to `apply_activation`.
   - `deactivate_expired_version_command(conn, cmd) -> CommandResult`.
 
@@ -1808,7 +1843,8 @@ from datetime import datetime, timedelta, timezone
 
 from sp0.contracts import Disposition, HandlerContext
 from sp0.eventstore import load_stream
-from sp0.aggregates._append import provenance_for
+from sp0.runtime.step import commit_step
+from sp0.aggregates._append import current_version, provenance_for
 from sp0.aggregates.feature_versions import mint_feature_version
 from sp0.aggregates.activation import (
     apply_activation, activate_command, request_activation, deactivate_expired_version_command,
@@ -1940,7 +1976,8 @@ def test_saga_step1_mints_version_and_enqueues_in_one_tx(db):
 
 
 def test_activate_version_handler_executes_feature_side_activation(db):
-    # §5.8 saga step 2: the registered handler the Phase-04 worker dispatches.
+    # §5.8 saga step 2: the registered handler the Phase-04 worker dispatches. The handler is
+    # PURE — it only DECLARES the activation; commit_step applies it on the step-tx conn.
     v1 = _mint(db, "feat_hdl", "run_h")
     request_activation(db, feature_id="feat_hdl", feature_version_id=v1, use_case="fraud",
                        base_feature_version_id=None, approval_type="PRODUCTION",
@@ -1951,6 +1988,13 @@ def test_activate_version_handler_executes_feature_side_activation(db):
     result = ACTIVATE_VERSION_HANDLER.handle(ctx)
     assert result.disposition == Disposition.OK
     assert result.new_events == ()  # no run-stream events; commit_step writes only the ledger
+    # handler is pure: it declares the effect and writes NOTHING itself.
+    assert len(result.activations) == 1 and result.activations[0].feature_version_id == v1
+    assert db.execute("SELECT count(*) FROM feature_active_versions "
+                      "WHERE feature_id='feat_hdl'").fetchone()[0] == 0
+    # commit_step applies the declared activation on the step-transaction conn.
+    commit_step(db, ctx, result, message_id="msg_hdl",
+                expected_version=current_version(db, "run", "run_h"), table_version=1)
     row = db.execute("SELECT feature_version_id, activation_state FROM feature_active_versions "
                      "WHERE feature_id='feat_hdl' AND use_case='fraud'").fetchone()
     assert row == (v1, "PRODUCTION")
@@ -1964,10 +2008,39 @@ def test_activate_version_handler_is_idempotent(db):
                        produced_by_run="run_h2", actor=make_actor())
     req = load_stream(db, "run", "run_h2")[-1]
     ctx = HandlerContext(run_id="run_h2", triggering_event=req, documents={}, conn=db)
-    ACTIVATE_VERSION_HANDLER.handle(ctx)
-    ACTIVATE_VERSION_HANDLER.handle(ctx)  # duplicate delivery
+    # two deliveries; each goes handler -> commit_step; apply_activation no-ops the second time.
+    commit_step(db, ctx, ACTIVATE_VERSION_HANDLER.handle(ctx), message_id="msg_h2a",
+                expected_version=current_version(db, "run", "run_h2"), table_version=1)
+    commit_step(db, ctx, ACTIVATE_VERSION_HANDLER.handle(ctx), message_id="msg_h2b",
+                expected_version=current_version(db, "run", "run_h2"), table_version=1)
     activations = [e for e in load_stream(db, "feature", "feat_hdl2") if e.type == "VERSION_ACTIVATED"]
     assert len(activations) == 1  # idempotent: one effect
+
+
+def test_activation_is_atomic_with_step_rollback(db):
+    # A failure anywhere in the step rolls back the ENTIRE step: no orphan active-map row,
+    # no VERSION_ACTIVATED event, no expiry timer. Proves apply_activation ran on the step-tx
+    # conn (not an autocommit handler conn).
+    exp = datetime.now(timezone.utc) + timedelta(days=30)
+    v1 = _mint(db, "feat_atom", "run_atom", approval="EXPERIMENTAL", expires=exp)
+    request_activation(db, feature_id="feat_atom", feature_version_id=v1, use_case="fraud",
+                       base_feature_version_id=None, approval_type="EXPERIMENTAL",
+                       produced_by_run="run_atom", actor=make_actor(), expires_at=exp)
+    req = load_stream(db, "run", "run_atom")[-1]
+    ctx = HandlerContext(run_id="run_atom", triggering_event=req, documents={}, conn=db)
+    result = ACTIVATE_VERSION_HANDLER.handle(ctx)
+    try:
+        with db.transaction():  # mirrors process_one's per-step savepoint
+            commit_step(db, ctx, result, message_id="msg_atom",
+                        expected_version=current_version(db, "run", "run_atom"), table_version=1)
+            raise RuntimeError("boom: forced failure after commit_step, before savepoint release")
+    except RuntimeError:
+        pass
+    assert db.execute("SELECT count(*) FROM feature_active_versions "
+                      "WHERE feature_id='feat_atom'").fetchone()[0] == 0
+    assert [e for e in load_stream(db, "feature", "feat_atom")
+            if e.type == "VERSION_ACTIVATED"] == []
+    assert db.execute("SELECT count(*) FROM timers WHERE aggregate_id='feat_atom'").fetchone()[0] == 0
 
 
 def test_deactivate_expired_version_removes_active_entry(db):
@@ -2016,7 +2089,7 @@ from psycopg.types.json import Jsonb
 
 from sp0.contracts import (
     Command, CommandResult, DbConn, Disposition, Handler, HandlerContext, HandlerResult,
-    IdentityEnvelope, ProvenanceEnvelope,
+    IdentityEnvelope, NewActivation, ProvenanceEnvelope,
 )
 from sp0.aggregates._append import append
 from sp0.aggregates.ids import mint_id
@@ -2206,13 +2279,17 @@ def on_run_approved(
 
 class ActivateVersionHandler:
     """§5.8 saga step 2 — the feature-side activation step the Phase-04 worker dispatches
-    (keyed on `queue.handler == name`). Reads the activation args from the run-stream
-    ACTIVATION_REQUESTED triggering event and performs the CAS via ctx.conn. It returns NO
-    run-stream events (so commit_step writes only the ledger); the feature-stream
-    VERSION_ACTIVATED / ACTIVATION_CONFLICT is appended by apply_activation. Idempotent:
-    re-delivery re-runs apply_activation, which no-ops when already active at this version.
-    This is the sanctioned cross-aggregate saga executor; the general handler prohibition on
-    feature-stream writes (§5.3) does not apply to it."""
+    (keyed on `queue.handler == name`). The handler is PURE with respect to persistence: it
+    reads the activation args from the run-stream ACTIVATION_REQUESTED triggering event and
+    DECLARES the cross-aggregate effect as `HandlerResult.activations` — it performs NO writes
+    via `ctx`. `commit_step` applies each NewActivation by calling `apply_activation` on the
+    SINGLE step-transaction connection, so the active-map CAS, the feature-stream
+    VERSION_ACTIVATED / ACTIVATION_CONFLICT event, and any experiment_expiry timer are atomic
+    with the rest of the step (a failure rolls them ALL back — no orphan active-map row, event,
+    or timer). The handler returns NO run-stream events. Idempotent: re-delivery re-declares the
+    same effect and `apply_activation` no-ops when already active at this version. This is the
+    sanctioned cross-aggregate saga executor; the general handler prohibition on feature-stream
+    writes (§5.3) does not apply to its declared activation effect."""
     name = "activate_version"
     version = 1
     timeout_seconds = 30.0
@@ -2222,13 +2299,19 @@ class ActivateVersionHandler:
         expires_at = p.get("expires_at")
         if isinstance(expires_at, str):
             expires_at = datetime.fromisoformat(expires_at)
-        apply_activation(
-            ctx.conn, feature_id=p["feature_id"], feature_version_id=p["feature_version_id"],
-            use_case=p["use_case"], base_feature_version_id=p.get("base_feature_version_id"),
-            approval_type=p["approval_type"], actor=ctx.triggering_event.actor,
-            expires_at=expires_at,
+        return HandlerResult(
+            disposition=Disposition.OK,
+            activations=(
+                NewActivation(
+                    feature_id=p["feature_id"],
+                    feature_version_id=p["feature_version_id"],
+                    use_case=p["use_case"],
+                    base_feature_version_id=p.get("base_feature_version_id"),
+                    approval_type=p["approval_type"],
+                    expires_at=expires_at,
+                ),
+            ),
         )
-        return HandlerResult(disposition=Disposition.OK)
 
 
 ACTIVATE_VERSION_HANDLER: Handler = ActivateVersionHandler()
@@ -2263,11 +2346,63 @@ def deactivate_expired_version_command(conn: DbConn, cmd: Command) -> CommandRes
     return CommandResult(accepted=True, aggregate_id=feature_id, produced_event_ids=(evt.event_id,))
 ```
 
-4. **Run tests, expect PASS.**
-   `python -m pytest tests/sp0/aggregates/test_activation.py -q`
+4. **Extend `commit_step` to apply the declared activations (Modify `src/sp0/runtime/step.py`).**
+   The saga handler is pure: it only DECLARES `HandlerResult.activations`. Phase 04 added
+   `activations` to `commit_step`'s deferred guard ("applied by Phase 06"); this phase REPLACES
+   that deferral with the real cross-aggregate application. `apply_activation` runs on the SAME
+   transactional `conn` `commit_step` already uses for events/document/outbox/ledger — never an
+   autocommit handler connection — so the active-map CAS, the VERSION_ACTIVATED /
+   ACTIVATION_CONFLICT feature-stream event, and any experiment_expiry timer are atomic with the
+   step. The activation's `actor` comes from `ctx.triggering_event.actor` (the run-stream
+   ACTIVATION_REQUESTED event); the remaining args come from each `NewActivation`.
 
-5. **Commit.**
-   `git add -A && git commit -m "sp0-06: activation saga (CAS, ACTIVATION_CONFLICT, use-case map, experimental expiry)" -m "Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"`
+```python
+# src/sp0/runtime/step.py — Phase 06 cross-aggregate extension of commit_step (§5.8).
+
+
+def _apply_activations(conn, ctx: HandlerContext, result: HandlerResult) -> None:
+    """Apply each declared NewActivation on the STEP-TRANSACTION conn (never a handler conn),
+    so the active-map CAS + VERSION_ACTIVATED/ACTIVATION_CONFLICT event + expiry timer are
+    atomic with the rest of the step. apply_activation is idempotent (no-ops when already active
+    at this version), so re-delivery of the saga message produces exactly one effect."""
+    if not result.activations:
+        return
+    # Deferred import keeps Phase-04's step.py free of an import-time dependency on Phase 06.
+    from sp0.aggregates.activation import apply_activation
+
+    actor = ctx.triggering_event.actor
+    for act in result.activations:
+        apply_activation(
+            conn,
+            feature_id=act.feature_id,
+            feature_version_id=act.feature_version_id,
+            use_case=act.use_case,
+            base_feature_version_id=act.base_feature_version_id,
+            approval_type=act.approval_type,
+            actor=actor,
+            expires_at=act.expires_at,
+            provenance=act.provenance,
+        )
+```
+
+   Then make two edits inside `commit_step`'s body:
+   - **Drop `activations` from the deferred guard.** Phase 04's guard reads
+     `if result.timers or result.external_commands or result.activations:` (Phase 05 already
+     removed `timers`/`external_commands` when it wired their persistence); remove the
+     `or result.activations` clause so a result carrying activations is no longer refused.
+   - **Apply them inside the step.** Immediately after the document insert and BEFORE the
+     outbox/ledger section, add:
+
+```python
+    # Phase 06 (§5.8): apply cross-aggregate activations on the step-transaction conn.
+    _apply_activations(conn, ctx, result)
+```
+
+5. **Run tests, expect PASS.**
+   `python -m pytest tests/sp0/aggregates/test_activation.py tests/sp0/runtime/test_step.py -q`
+
+6. **Commit.**
+   `git add -A && git commit -m "sp0-06: activation saga (pure handler declares activations; commit_step applies them atomically; CAS, ACTIVATION_CONFLICT, use-case map, experimental expiry)" -m "Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"`
 
 ---
 
@@ -2300,7 +2435,7 @@ from tests.sp0._helpers import make_actor, make_cmd
 
 def _mint(db, feature_id, run, base=None, tier="low"):
     return mint_feature_version(
-        db, feature_id=feature_id, produced_by_run=run, verification_stamp="DATA",
+        db, feature_id=feature_id, produced_by_run=run, verification_stamp="DATA-CHECKED",
         risk_tier=tier, approval_type="PRODUCTION", approved_use_cases=("fraud",),
         blocked_use_cases=(), required_artifact_refs={}, content_hash="sha256:" + run,
         actor=make_actor(), provenance=provenance_for(), base_feature_version_id=base)
@@ -2671,7 +2806,7 @@ def test_requires_change_spawns_new_run(db):
 def test_deprecate_outcome_sets_active_map_deprecated(db):
     db.execute("INSERT INTO feature_versions (feature_version_id, feature_id, produced_by_run, "
                "verification_stamp, risk_tier, approval_type, content_hash) "
-               "VALUES ('fv_x','feat_d','run_x','DATA','low','PRODUCTION','sha256:1')")
+               "VALUES ('fv_x','feat_d','run_x','DATA-CHECKED','low','PRODUCTION','sha256:1')")
     db.execute("INSERT INTO feature_active_versions (feature_id, use_case, feature_version_id, "
                "activation_state, activated_seq) VALUES ('feat_d','fraud','fv_x','PRODUCTION',1)")
     raise_monitoring_alert_command(db, make_cmd("raise_monitoring_alert", "feature", "feat_d",
@@ -2988,7 +3123,7 @@ def bootstrap_phase06(handler_registry) -> None:
 ## §12 coverage map (this phase)
 
 - **Concurrent versions & activation CAS / no silent overwrite:** Task 11 `test_two_runs_from_v1_later_activation_fails_cas` (non-null base) + `test_cas_claim_slot_first_writer_wins_no_silent_overwrite` (the null-base race the CAS now closes); Task 14 `test_activation_cas_oracle_through_execute_command`.
-- **Approval→activation saga (mint in run tx; async feature-side step; idempotent; no half-applied):** Task 10 (`mint_feature_version`); Task 11 `test_saga_step1_mints_version_and_enqueues_in_one_tx` (step 1: `on_run_approved` mints + enqueues in one tx), `test_activate_version_handler_executes_feature_side_activation` + `test_activate_version_handler_is_idempotent` (step 2: the `ActivateVersionHandler` the Phase-04 worker dispatches).
+- **Approval→activation saga (mint in run tx; async feature-side step; idempotent; no half-applied):** Task 10 (`mint_feature_version`); Task 11 `test_saga_step1_mints_version_and_enqueues_in_one_tx` (step 1: `on_run_approved` mints + enqueues in one tx), `test_activate_version_handler_executes_feature_side_activation` + `test_activate_version_handler_is_idempotent` (step 2: the pure `ActivateVersionHandler` declares the activation, `commit_step` applies it), and `test_activation_is_atomic_with_step_rollback` (a failure rolls back the whole step — no orphan active-map row, event, or expiry timer).
 - **Use-case-scoped & experimental activation + expiry:** Task 11 `test_use_case_scoped_coexistence`, `test_experimental_activation_schedules_expiry_timer`, `test_deactivate_expired_version_removes_active_entry`.
 - **Multi-candidate / request aggregate (mint/bind/close siblings, explored count, 1:n); provenance.artifact_type is a §3.7 enum value:** Task 7 (`test_select_candidate_*`, incl. the `artifact_type == "APPROVAL_RECORD"` assertion) + Task 14.
 - **Lifecycle (`PRODUCTION→MONITORING_ALERT→REVALIDATION_REQUIRED→…`; revalidation-change spawns run; `fact_confirmed_resume` wakes parked runs; `deprecate` blocked with consumers; forced `deprecate` impact-analysis + quiesce/grace → `finalize_deprecate`; `SOURCE_CHANGED_REVALIDATE`):** Tasks 9, 12 (`test_force_deprecate_quiesces_with_grace_not_immediate_deprecation`, `test_finalize_deprecate_completes_after_grace_and_is_idempotent`), 13.

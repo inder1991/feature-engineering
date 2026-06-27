@@ -4,12 +4,13 @@
 
 ### Boundary notes (what this phase does and does NOT do)
 
-- **The atomic boundary `commit_step` persists the four participants whose tables exist by this phase and whose semantics this phase owns:** domain events (via Phase 01 `append_event`, OCC), a frozen document (INSERT into Phase 02's `documents` — Phase 02 owns the write-once trigger + DAG/`derived_from` validation; this phase only inserts the row respecting the contract columns), the processed-message ledger (`processed_messages`, owned here), and outbox messages (`outbox`, owned here). The two remaining §5.1 participants — **`timers`** and **`external_commands`** — have tables, CAS-on-task-version, dispatcher, and stale-result semantics owned by **Phase 05**. So `commit_step` **raises** if a `HandlerResult` carries `timers` or `external_commands` (nothing is ever silently dropped); **Phase 05 extends `commit_step`** to insert them when it creates those tables. This is the same intentional cross-phase extension pattern the overview calls out (Phase 05 hooks into Phase 04's step). **Explicit divergence note:** this phase's scope line names "upsert timers" as a one-tx participant of the §5.1 boundary, but the `timers` table is owned by and does not exist until Phase 05 (per the overview's phase-ownership table). We therefore defer ONLY the *persistence* of timers/external-commands to Phase 05 while keeping the boundary's all-or-nothing contract intact: `commit_step` refuses (raises) rather than partially honoring a step it cannot atomically complete. The single-tx append-events + insert-docs + record-ledger + insert-outbox boundary is fully implemented and tested here.
+- **The atomic boundary `commit_step` persists the four participants whose tables exist by this phase and whose semantics this phase owns:** domain events (via Phase 01 `append_event`, OCC), a frozen document (created via Phase 02's validated `append_document` — which owns the write-once trigger + DAG/`derived_from`/structural validation; this phase calls it inside the step tx with the handler-supplied `doc_id` and BEFORE appending events, so emitted events can reference the doc, rather than issuing a raw INSERT), the processed-message ledger (`processed_messages`, owned here), and outbox messages (`outbox`, owned here). The two remaining §5.1 participants — **`timers`** and **`external_commands`** — have tables, CAS-on-task-version, dispatcher, and stale-result semantics owned by **Phase 05**. So `commit_step` **raises** if a `HandlerResult` carries `timers` or `external_commands` (**Phase 05 extends `commit_step`** to insert them when it creates those tables) or `activations` (**Phase 06's commit-path extension** applies each via `apply_activation` inside the step tx); nothing is ever silently dropped. This is the same intentional cross-phase extension pattern the overview calls out (Phase 05 hooks into Phase 04's step). **Explicit divergence note:** this phase's scope line names "upsert timers" as a one-tx participant of the §5.1 boundary, but the `timers` table is owned by and does not exist until Phase 05 (per the overview's phase-ownership table). We therefore defer ONLY the *persistence* of timers/external-commands to Phase 05 while keeping the boundary's all-or-nothing contract intact: `commit_step` refuses (raises) rather than partially honoring a step it cannot atomically complete. The single-tx append-events + insert-docs + record-ledger + insert-outbox boundary is fully implemented and tested here.
 - **`commit_step` does NOT open/commit a transaction.** Per the shared contract ("every function that mutates participates in the caller's open transaction"), it runs inside the caller's open tx. The dispatcher (`process_one`) owns the transaction/savepoint structure so an OCC failure rolls back only the step writes.
 - **Outbox messages are derived, not handler-supplied.** `HandlerResult` has no outbox field; the mechanism emits exactly **one outbox row per committed event** (`message_id = event_id`, `partition_key` = aggregate key, `topic = event.type`). Fan-out to multiple topics/consumers is a later concern; one row per event is the MVP and is idempotent (`ON CONFLICT (message_id) DO NOTHING`).
 - **Routing (topic → handler) is policy, not mechanism.** The relay's `publish` callable is the integration seam: `make_queue_publisher(route)` enqueues a worker-queue row only for topics present in the caller-supplied route map. SP-1+ owns the real route map; this phase ships the mechanism + a test route.
 - **Worker-queue handlers are run-scoped.** Per the handler contract ("MUST NOT emit feature-/request-stream events, write outside its `run_id`"), `process_one` builds a `HandlerContext` for the **run** aggregate. Feature-/request-stream events still get outbox rows (for the relay / other consumers) but are not dispatched to step handlers here.
 - **`HandlerContext.documents` loading is injected.** The contract types it `Mapping[str, NewDocument]` keyed by stage; resolving "current primary per stage" is Phase 02's `stage_primary` projection. To stay decoupled, the dispatcher takes a `document_loader` callable (default returns `{}`); Phase 02/SP-1+ wires the real loader. This phase does not read mutable projections to build guards (it only loads frozen inputs via the injected loader).
+- **`HandlerContext.read_conn` is READ-ONLY; `ctx.new_doc_id()` mints document ids.** The connection handed to a handler (`ctx.read_conn`, a dedicated autocommit connection — see `_open_handler_conn`) is **read-only**: a handler uses it only to load streams/documents for its decisions and MUST NOT write through it. Every mutation is declared in the returned `HandlerResult` and applied by `commit_step` inside the single step transaction. When a handler emits a new document it mints the id via `ctx.new_doc_id()` (a `'doc_'`-prefixed id, the same form as `gen_id('doc')`), sets it on `NewDocument(doc_id=…)`, and references that exact id in any events it emits; `commit_step` then creates the document via Phase 02's validated `append_document` using that id BEFORE appending the events.
 
 ### File structure
 
@@ -22,7 +23,7 @@ src/sp0/runtime/
     ledger.py                       # processed_messages: is_processed/record_processed/prune/watermark
     outbox.py                       # OutboxMessage, insert/derive, leased relay, DLQ, reclaim, depth, queue publisher
     queue.py                        # QueueClaim, enqueue, SKIP-LOCKED claim_one, complete/fail/reclaim
-    step.py                         # commit_step (the §5.1 atomic boundary), StepCommit, document insert
+    step.py                         # commit_step (the §5.1 atomic boundary), StepCommit, document creation via append_document
     handlers.py                     # HandlerRegistry (register/get; re-registration is an error)
     dispatch.py                     # process_one (idempotent), HandlerTimeout, recover_stuck (§5.7)
 tests/sp0/runtime/
@@ -1349,11 +1350,11 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 - Test: `tests/sp0/runtime/test_step.py`
 
 **Interfaces:**
-- Consumes: `append_event`, `ConcurrencyError` (Phase 01); `documents` table (Phase 02 — write-once trigger + DAG/`derived_from` validation enforced there); `HandlerContext`, `HandlerResult`, `NewDocument`, `EventEnvelope` (contract); `record_processed` (Task 3); `outbox_messages_for_events`, `insert_outbox_message` (Task 4); `global_seq_seq` (Phase 01).
+- Consumes: `append_event`, `ConcurrencyError` (Phase 01); `append_document` (Phase 02 — the validated document-write path: write-once trigger + DAG/`derived_from`/structural validation enforced there); `HandlerContext`, `HandlerResult`, `NewDocument`, `NewEvent`, `EventEnvelope` (contract); `record_processed` (Task 3); `outbox_messages_for_events`, `insert_outbox_message` (Task 4); `global_seq_seq` (Phase 01).
 - Produces:
   - `StepCommit` — `@dataclass(frozen=True, slots=True)` with `appended_event_ids: tuple[str, ...]`, `document_id: str | None`, `outbox_message_ids: tuple[str, ...]`, `processed_seq: int`.
-  - `commit_step(conn, ctx: HandlerContext, result: HandlerResult, *, message_id: str, expected_version: int, table_version: int) -> StepCommit` — the §5.1 atomic boundary **inside the caller's open tx**: chained-OCC appends of `result.new_events`, optional `result.document` insert, one outbox row per appended event, and the processed-message ledger row. **Raises `RuntimeError` if `result.timers` or `result.external_commands` is non-empty** (Phase 05 extends this; nothing is silently dropped). Propagates `ConcurrencyError` so the caller's savepoint rolls back the whole step.
-  - `gen_id(prefix: str) -> str` — prefixed unique id (`doc_…`) used for minted document ids.
+  - `commit_step(conn, ctx: HandlerContext, result: HandlerResult, *, message_id: str, expected_version: int, table_version: int) -> StepCommit` — the §5.1 atomic boundary **inside the caller's open tx**: creates `result.document` FIRST via Phase 02's validated `append_document` (so its DAG/structural checks run and emitted events can reference it by the handler-supplied `doc_id`), validates the events' new-document references, chained-OCC appends of `result.new_events`, one outbox row per appended event, and the processed-message ledger row. **Raises `RuntimeError` if `result.timers`/`result.external_commands` (Phase 05 extends this) or `result.activations` (Phase 06's commit-path extension applies these) is non-empty — nothing is silently dropped.** Propagates `ConcurrencyError` so the caller's savepoint rolls back the whole step.
+  - `gen_id(prefix: str) -> str` — prefixed unique id (`doc_…`); the same `'doc_'`-prefixed form a handler mints via `ctx.new_doc_id()` and sets on `NewDocument(doc_id=…)`.
 
 ### TDD steps
 
@@ -1362,7 +1363,6 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 ```python
 from __future__ import annotations
 
-import psycopg
 import pytest
 
 from sp0.contracts import (
@@ -1370,11 +1370,13 @@ from sp0.contracts import (
     Disposition,
     HandlerContext,
     HandlerResult,
+    NewActivation,
     NewDocument,
     NewEvent,
     NewTimer,
 )
 from datetime import datetime, timezone
+from sp0.documents.store import DocumentValidationError
 from sp0.runtime.step import commit_step
 
 
@@ -1393,7 +1395,7 @@ def _next_event(ctx, actor, prov, *, type="STEP_DONE", payload=None) -> NewEvent
 
 def _ctx(db, trigger) -> HandlerContext:
     return HandlerContext(
-        run_id=trigger.run_id, triggering_event=trigger, documents={}, conn=db
+        run_id=trigger.run_id, triggering_event=trigger, documents={}, read_conn=db
     )
 
 
@@ -1425,6 +1427,7 @@ def test_commit_step_inserts_document(db, seed_run_event, actor, prov) -> None:
     trigger = seed_run_event("run_s2", type="STEP_TRIGGER")
     ctx = _ctx(db, trigger)
     doc = NewDocument(
+        doc_id=ctx.new_doc_id(),
         stage="CANDIDATE_SQL",
         schema_version=1,
         branch_role="candidate",
@@ -1493,6 +1496,33 @@ def test_commit_step_raises_on_timers(db, seed_run_event, actor, prov) -> None:
         )
 
 
+def test_commit_step_raises_on_activations(db, seed_run_event, actor, prov) -> None:
+    # Cross-aggregate activations are applied by Phase 06's commit-path extension; until then
+    # commit_step refuses them so nothing is ever silently dropped (mirrors the timers guard).
+    trigger = seed_run_event("run_s4b", type="STEP_TRIGGER")
+    ctx = _ctx(db, trigger)
+    result = HandlerResult(
+        disposition=Disposition.OK,
+        new_events=(_next_event(ctx, actor, prov),),
+        activations=(
+            NewActivation(
+                feature_id="feat_1",
+                feature_version_id="fv_1",
+                use_case="training",
+                base_feature_version_id="fv_0",
+                approval_type="auto",
+            ),
+        ),
+    )
+    with pytest.raises(RuntimeError):
+        commit_step(
+            db, ctx, result,
+            message_id=trigger.event_id,
+            expected_version=trigger.stream_version,
+            table_version=trigger.table_version,
+        )
+
+
 def test_commit_step_stale_expected_version_raises_concurrency(db, seed_run_event, actor, prov) -> None:
     trigger = seed_run_event("run_s5", type="STEP_TRIGGER")
     ctx = _ctx(db, trigger)
@@ -1512,28 +1542,29 @@ def test_commit_step_stale_expected_version_raises_concurrency(db, seed_run_even
 def test_commit_step_rolls_back_all_writes_when_document_insert_fails(
     db, seed_run_event, actor, prov
 ) -> None:
-    """Atomicity / no-orphan invariant (§5.1): if a participant fails AFTER an event was
-    appended, the WHOLE step rolls back. The event appends, then the document INSERT violates
-    documents_reject_reason_present (branch_role='rejected' with no reject_reason); the
-    per-step savepoint (as `process_one` uses it) must leave NO event, outbox row, or ledger
-    row behind."""
+    """Atomicity / no-orphan invariant (§5.1): commit_step creates the document FIRST via the
+    validated append_document path, so a rejected document (branch_role='rejected' with no
+    reject_reason -> DocumentValidationError) aborts the WHOLE step before any event is
+    appended; the per-step savepoint (as `process_one` uses it) must leave NO event, outbox row,
+    or ledger row behind."""
     trigger = seed_run_event("run_atomic", type="STEP_TRIGGER")
     ctx = _ctx(db, trigger)
     bad_doc = NewDocument(
+        doc_id=ctx.new_doc_id(),
         stage="CANDIDATE_SQL",
         schema_version=1,
-        branch_role="rejected",          # CHECK requires a reject_reason
+        branch_role="rejected",          # append_document requires a reject_reason
         content_hash="sha256:abc",
         body_classification="governance-retained",
         provenance=prov,
-        reject_reason=None,              # -> documents_reject_reason_present violation
+        reject_reason=None,              # -> DocumentValidationError (DB CHECK is the backstop)
     )
     result = HandlerResult(
         disposition=Disposition.OK,
         new_events=(_next_event(ctx, actor, prov),),
         document=bad_doc,
     )
-    with pytest.raises(psycopg.errors.CheckViolation):
+    with pytest.raises(DocumentValidationError):
         with db.transaction():           # mirrors process_one's per-step savepoint
             commit_step(
                 db, ctx, result,
@@ -1545,7 +1576,7 @@ def test_commit_step_rolls_back_all_writes_when_document_insert_fails(
         cur.execute(
             "SELECT count(*) FROM events WHERE run_id='run_atomic' AND type='STEP_DONE'"
         )
-        assert cur.fetchone()[0] == 0    # the appended event was rolled back
+        assert cur.fetchone()[0] == 0    # no event written (document rejected first)
         cur.execute("SELECT count(*) FROM outbox WHERE partition_key='run:run_atomic'")
         assert cur.fetchone()[0] == 0    # no orphan outbox row
         cur.execute(
@@ -1561,13 +1592,14 @@ def test_commit_step_rolls_back_all_writes_when_document_insert_fails(
 ```python
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
+from typing import Iterable
 from uuid import uuid4
 
 import psycopg
-from psycopg.types.json import Json
 
-from sp0.contracts import HandlerContext, HandlerResult, NewDocument
+from sp0.contracts import HandlerContext, HandlerResult, NewDocument, NewEvent
+from sp0.documents.store import append_document
 from sp0.event_store import append_event
 from sp0.runtime.ledger import record_processed
 from sp0.runtime.outbox import insert_outbox_message, outbox_messages_for_events
@@ -1587,28 +1619,43 @@ def gen_id(prefix: str) -> str:
     return f"{prefix}_{uuid4().hex}"
 
 
-def _jsonb(envelope) -> Json:
-    return Json(asdict(envelope))
-
-
 def _insert_document(conn: psycopg.Connection, ctx: HandlerContext, doc: NewDocument) -> str:
-    doc_id = gen_id("doc")
+    """Create the frozen document through Phase 02's VALIDATED append_document (§5.1) — NOT a
+    raw INSERT — so DAG/acyclicity/supersedes/derived_from/schema-lifecycle/blob + structural
+    validation all run inside the step tx. The id is the handler-supplied doc.doc_id (minted via
+    ctx.new_doc_id()); append_document uses it and returns it."""
     te = ctx.triggering_event
-    with conn.cursor() as cur:
-        cur.execute(
-            "INSERT INTO documents "
-            "(doc_id, request_id, feature_id, run_id, stage, schema_version, branch_role, "
-            " derived_from, supersedes, body_ref, content_hash, body_classification, "
-            " actor, provenance, reject_reason) "
-            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
-            (
-                doc_id, te.request_id, te.feature_id, ctx.run_id, doc.stage, doc.schema_version,
-                doc.branch_role, list(doc.derived_from), list(doc.supersedes), doc.body_ref,
-                doc.content_hash, doc.body_classification, _jsonb(te.actor),
-                _jsonb(doc.provenance), doc.reject_reason,
-            ),
-        )
-    return doc_id
+    return append_document(
+        conn,
+        doc,
+        run_id=ctx.run_id,
+        feature_id=te.feature_id,
+        request_id=te.request_id,
+        actor=te.actor,
+    )
+
+
+def _validate_event_doc_refs(
+    conn: psycopg.Connection,
+    events: Iterable[NewEvent],
+    *,
+    document_id: str | None,
+) -> None:
+    """Any new-document reference an event payload carries (payload['document_id']) MUST resolve
+    to the document this step just created (document_id) or to an already-committed document
+    (§5.1). Runs AFTER the document INSERT (so the supplied doc_id is visible) and BEFORE
+    appending events, so an event can never be committed referencing a doc that does not exist."""
+    for new_event in events:
+        ref = new_event.payload.get("document_id")
+        if ref is None or ref == document_id:
+            continue
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM documents WHERE doc_id = %s", (ref,))
+            if cur.fetchone() is None:
+                raise ValueError(
+                    f"event references new document_id {ref!r} that is neither this step's "
+                    f"new document nor an already-committed document"
+                )
 
 
 def commit_step(
@@ -1620,15 +1667,33 @@ def commit_step(
     expected_version: int,
     table_version: int,
 ) -> StepCommit:
-    """The §5.1 atomic boundary, inside the caller's open tx: append events (chained OCC),
-    insert one frozen document, write one outbox row per event, record the ledger row."""
+    """The §5.1 atomic boundary, inside the caller's open tx: create one frozen document FIRST
+    (via Phase 02's validated append_document, so its DAG/structural checks run and any emitted
+    event can reference it), validate the events' new-document references, append the events
+    (chained OCC), write one outbox row per event, and record the ledger row."""
     if result.timers or result.external_commands:
         raise RuntimeError(
             "commit_step: timers/external_commands persistence is added by Phase 05 "
             "(§5.4/§5.5); not supported in Phase 04"
         )
+    if result.activations:
+        raise RuntimeError(
+            "commit_step: cross-aggregate activations are applied by Phase 06's commit-path "
+            "extension (§6); not supported in Phase 04"
+        )
 
     te = ctx.triggering_event
+
+    # Document FIRST: append_document runs DAG/acyclicity/supersedes/derived_from/
+    # schema-lifecycle/blob + structural validation inside this tx, and lets the emitted events
+    # reference the doc by its handler-supplied id.
+    document_id = (
+        _insert_document(conn, ctx, result.document)
+        if result.document is not None
+        else None
+    )
+    _validate_event_doc_refs(conn, result.new_events, document_id=document_id)
+
     version = expected_version
     appended = []
     for new_event in result.new_events:
@@ -1637,12 +1702,6 @@ def commit_step(
         )
         appended.append(env)
         version = env.stream_version
-
-    document_id = (
-        _insert_document(conn, ctx, result.document)
-        if result.document is not None
-        else None
-    )
 
     outbox_ids: list[str] = []
     for msg in outbox_messages_for_events(appended):
@@ -1675,7 +1734,7 @@ def commit_step(
     )
 ```
 
-4. **Run tests, expect PASS** — `python -m pytest tests/sp0/runtime/test_step.py -q`. Expected: 6 passed.
+4. **Run tests, expect PASS** — `python -m pytest tests/sp0/runtime/test_step.py -q`. Expected: 7 passed.
 
 5. **Commit:**
 
@@ -1894,7 +1953,7 @@ def test_occ_conflict_reschedules_without_partial_writes(db, seed_run_event, act
         assert cur.fetchone()[0] == 0  # no ledger row
 ```
 
-> **Note (handler connection in tests):** `process_one`'s default `handler_conn_factory` opens a dedicated connection via `psycopg.connect(conn.info.dsn)`. The test handlers do no I/O on `ctx.conn`, so if the Phase-01 `db` fixture's DSN is not directly re-connectable in your environment, pass `handler_conn_factory=lambda c: c` to `process_one` in these tests — it stays safe here precisely because the test handlers never touch `ctx.conn`. Production keeps the isolating default.
+> **Note (handler connection in tests):** `process_one`'s default `handler_conn_factory` opens a dedicated connection via `psycopg.connect(conn.info.dsn)`. The test handlers do no I/O on `ctx.read_conn`, so if the Phase-01 `db` fixture's DSN is not directly re-connectable in your environment, pass `handler_conn_factory=lambda c: c` to `process_one` in these tests — it stays safe here precisely because the test handlers never touch `ctx.read_conn`. Production keeps the isolating default.
 
 2. **Run it, expect FAIL** — `python -m pytest tests/sp0/runtime/test_dispatch.py -q`. Expected: `ModuleNotFoundError: No module named 'sp0.runtime.dispatch'`.
 
@@ -1977,11 +2036,13 @@ def _default_document_loader(
 
 
 def _open_handler_conn(conn: psycopg.Connection) -> psycopg.Connection:
-    """A dedicated, autocommit connection handed to the handler as ctx.conn, ISOLATED from
-    the dispatcher's transactional `conn`. Isolation is mandatory: CPython cannot kill a
-    running thread, so a timed-out handler must never share the dispatcher's connection (the
-    dispatcher keeps using it to reschedule/fail the message — concurrent use of one psycopg
-    connection from two threads is unsafe). Override via
+    """A dedicated, autocommit connection handed to the handler as ctx.read_conn (READ-ONLY: a
+    handler loads streams/documents for its decisions but MUST NOT write through it — every
+    mutation is declared in the returned HandlerResult and applied by commit_step inside the
+    step tx). ISOLATED from the dispatcher's transactional `conn`. Isolation is mandatory:
+    CPython cannot kill a running thread, so a timed-out handler must never share the
+    dispatcher's connection (the dispatcher keeps using it to reschedule/fail the message —
+    concurrent use of one psycopg connection from two threads is unsafe). Override via
     process_one(..., handler_conn_factory=...) if the deployment DSN needs extra credentials."""
     handler_conn = psycopg.connect(conn.info.dsn)
     handler_conn.autocommit = True
@@ -1993,7 +2054,7 @@ def _run_with_timeout(handler: Handler, ctx: HandlerContext) -> HandlerResult:
     handler. The handler runs on a daemon thread joined for handler.timeout_seconds; we never
     use a ThreadPoolExecutor (whose context-manager __exit__ runs shutdown(wait=True), which
     would BLOCK until the handler returns and defeat the timeout). On breach we raise
-    HandlerTimeout and ABANDON the thread; because ctx.conn is a dedicated connection (see
+    HandlerTimeout and ABANDON the thread; because ctx.read_conn is a dedicated connection (see
     _open_handler_conn), the abandoned thread cannot corrupt the dispatcher's step transaction.
     A permanently wedged handler leaks its dedicated connection until the worker is restarted,
     and its message is redelivered (then DLQ'd after max_attempts) — the honest limit of
@@ -2031,7 +2092,8 @@ def _build_context(
     run_id = payload.get("run_id") or payload.get("aggregate_id")
     event_id = payload["event_id"]
     # The dispatcher's `conn` (not handler_conn) resolves the triggering event so it sees the
-    # step's in-flight writes; the handler only ever gets the isolated handler_conn.
+    # step's in-flight writes; the handler only ever gets the isolated, read-only handler_conn
+    # (as ctx.read_conn).
     stream = load_stream(conn, "run", run_id)
     triggering = next((e for e in stream if e.event_id == event_id), None)
     if triggering is None:
@@ -2040,7 +2102,7 @@ def _build_context(
         run_id=run_id,
         triggering_event=triggering,
         documents=document_loader(conn, run_id),
-        conn=handler_conn,  # dedicated, isolated from the dispatcher tx
+        read_conn=handler_conn,  # dedicated, READ-ONLY, isolated from the dispatcher tx
     )
 
 
@@ -2151,14 +2213,16 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 The spec §12 cases this phase owns (mechanism-under-test) are realized by the tasks above; a reviewer gate should confirm each:
 
 - **Idempotency — duplicate message/outbox-publish → one effect:** `test_dispatch.py::test_duplicate_message_is_skipped` (ledger skip, no second event); `test_outbox.py::test_insert_is_idempotent_on_message_id` + `test_queue.py::test_enqueue_idempotent_on_message_id` (`ON CONFLICT DO NOTHING`).
-- **Atomicity — OCC/failure rolls back the whole step (no orphan events/docs/outbox/ledger):** `test_step.py::test_commit_step_stale_expected_version_raises_concurrency` (stale OCC ⇒ `ConcurrencyError`); `test_step.py::test_commit_step_rolls_back_all_writes_when_document_insert_fails` (a failure AFTER a successful append rolls back the event + outbox + ledger via the savepoint — the no-orphan invariant has a real failing→pass cycle); `test_dispatch.py::test_occ_conflict_reschedules_without_partial_writes` forces a REAL OCC conflict so `process_one`'s `except ConcurrencyError ⇒ fail_retryable` savepoint branch runs and leaves no partial writes.
+- **Atomicity — OCC/failure rolls back the whole step (no orphan events/docs/outbox/ledger):** `test_step.py::test_commit_step_stale_expected_version_raises_concurrency` (stale OCC ⇒ `ConcurrencyError`); `test_step.py::test_commit_step_rolls_back_all_writes_when_document_insert_fails` (commit_step creates the document FIRST via the validated `append_document` path; a rejected document aborts the step before any event/outbox/ledger is written — the no-orphan invariant has a real failing→pass cycle); `test_dispatch.py::test_occ_conflict_reschedules_without_partial_writes` forces a REAL OCC conflict so `process_one`'s `except ConcurrencyError ⇒ fail_retryable` savepoint branch runs and leaves no partial writes.
 - **Queue partitioning — feature-/request-level events get per-aggregate ordering:** `test_outbox.py::test_partition_key_per_aggregate` + `partition_key_for` covers `run:`/`feature:`/`request:`; `test_queue.py::test_claim_skips_partition_with_inflight_lease` enforces one in-flight per partition.
 - **Retries — transient backoff vs permanent skip:** `test_dispatch.py::test_retryable_reschedules` / `::test_permanent_dlqs`; `test_queue.py::test_fail_retryable_reschedules` / `::test_fail_retryable_dlqs_at_max_attempts`; `test_backoff.py`.
 - **Outbox relay — publish-then-mark-sent (own-tx three-step), DLQ, stuck detection, backpressure:** `test_outbox.py::test_relay_publishes_then_marks_sent` / `::test_relay_backoff_on_publish_failure` / `::test_relay_routes_to_dlq_at_max_attempts` / `::test_reclaim_stuck_outbox` / `::test_pending_depth_counts_pending_and_leased` (depth signal) / `::test_backpressure_holds_outbox_pending_without_failing` (admission control: a saturated partition leaves the outbox row durably `pending` — durable waiting — with no attempt bump or DLQ).
 - **Crash/recovery (§5.7):** `test_dispatch.py::test_recover_stuck_reclaims_queue_and_outbox`; `test_queue.py::test_reclaim_stuck_queue`; `test_outbox.py::test_reclaim_stuck_outbox`.
-- **Handler timeout ⇒ delivery retry (non-blocking, connection-isolated):** `test_dispatch.py::test_timeout_is_retryable`. The dispatcher runs each handler on a daemon thread joined with a wall-clock timeout (no blocking `ThreadPoolExecutor` shutdown that would wait for the wedged handler), and hands the handler a DEDICATED connection (`_open_handler_conn`), not the dispatcher's transactional one, so a timed-out, un-killable thread cannot concurrently touch the connection the dispatcher uses to reschedule the message.
+- **Handler timeout ⇒ delivery retry (non-blocking, connection-isolated):** `test_dispatch.py::test_timeout_is_retryable`. The dispatcher runs each handler on a daemon thread joined with a wall-clock timeout (no blocking `ThreadPoolExecutor` shutdown that would wait for the wedged handler), and hands the handler a DEDICATED, read-only connection (`ctx.read_conn` via `_open_handler_conn`), not the dispatcher's transactional one, so a timed-out, un-killable thread cannot concurrently touch the connection the dispatcher uses to reschedule the message.
 - **Versioned handler registration (§10):** `test_dispatch.py::test_register_rejects_duplicate_name`.
 
 **Deferred to Phase 05 (noted, not silently skipped):** durable-timer ladder + overdue fire on recovery + business calendar; external-command dispatcher + stale-result guard + result caching + honest exactly-once caveat; cost-budget breaker auto-park; blob-GC. `commit_step` raises on `timers`/`external_commands` until Phase 05 wires their persistence (`test_step.py::test_commit_step_raises_on_timers`).
+
+**Deferred to Phase 06 (noted, not silently skipped):** cross-aggregate activations. `commit_step` raises on `result.activations` until Phase 06's commit-path extension applies each via `apply_activation` inside the step tx (`test_step.py::test_commit_step_raises_on_activations`).
 
 

@@ -178,7 +178,12 @@ BODY_CLASSIFICATIONS: tuple[str, ...] = ("pii-erasable", "governance-retained")
 
 @dataclass(frozen=True, slots=True)
 class NewDocument:
-    """A frozen document a handler emits (§3.4). derived_from MUST reference committed docs."""
+    """A frozen document a handler emits (§3.4). derived_from MUST reference committed docs.
+    doc_id is CALLER-SUPPLIED (minted via HandlerContext.new_doc_id()) so the handler can
+    reference the exact id in the events it emits in the same step; append_document persists
+    THIS id (it does not mint its own). This is the canonical NewDocument (owned by Phase 02 /
+    sp0/contracts/documents.py); the overview (00) is the authoritative shape."""
+    doc_id: str                                # caller-supplied (ctx.new_doc_id()); persisted as-is
     stage: str                                 # from the §3.7 stage/artifact enum
     schema_version: int
     branch_role: str                           # "candidate" | "primary" | "rejected" | "repair"
@@ -531,9 +536,12 @@ def append_document(
     actor: IdentityEnvelope,
 ) -> str:
     """Insert one frozen document inside the caller's OPEN transaction (§5.1).
-    Allocates doc_id + global_seq. The body is opaque-by-reference (body_ref +
-    content_hash); structural and DAG validation are added in Tasks 4-5."""
-    doc_id = new_id("doc")
+    Uses the CALLER-SUPPLIED new_document.doc_id (minted via HandlerContext.new_doc_id())
+    so events emitted in the same step can reference it; this is the single validated write
+    path — runtime handlers MUST go through here, never a raw INSERT. The body is
+    opaque-by-reference (body_ref + content_hash); structural and DAG validation are added
+    in Tasks 4-5."""
+    doc_id = new_document.doc_id
     conn.execute(
         """
         INSERT INTO documents (

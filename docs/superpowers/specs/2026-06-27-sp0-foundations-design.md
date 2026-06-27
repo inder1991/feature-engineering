@@ -205,7 +205,7 @@ So the parent's hard approval gates are *representable and enforceable*, SP-0 de
   "feature_id": "feat_01HZ...",
   "produced_by_run": "run_01HZ...",
   "base_feature_version_id": "fv_01HY...",        // the active version this run started from (per use-case); null if first
-  "verification_stamp": "USEFULNESS_CHECKED",     // DESIGN | DATA | USEFULNESS-CHECKED (parent §14.5)
+  "verification_stamp": "USEFULNESS-CHECKED",     // DESIGN-CHECKED | DATA-CHECKED | USEFULNESS-CHECKED (parent §14.5)
   "risk_tier": "medium",                          // parent §13.3; lowered by harvest
   "approval_type": "PRODUCTION",                  // EXPERIMENTAL | PRODUCTION
   "approved_use_cases": ["churn", "fraud"],
@@ -221,7 +221,7 @@ So the parent's hard approval gates are *representable and enforceable*, SP-0 de
 }
 ```
 
-Approval and activation transitions carry **guards over these declared inputs** (e.g. `verification_stamp == USEFULNESS_CHECKED` for production promotion, parent §10/§14.5; `monitoring_spec` present; target use-case ∉ `blocked_use_cases`; `risk_tier` ≤ the use-case ceiling). SP-0 supplies the slots + guard hooks; the thresholds are policy.
+Approval and activation transitions carry **guards over these declared inputs** (e.g. `verification_stamp == 'USEFULNESS-CHECKED'` for production promotion, parent §10/§14.5; `monitoring_spec` present; target use-case ∉ `blocked_use_cases`; `risk_tier` ≤ the use-case ceiling). SP-0 supplies the slots + guard hooks; the thresholds are policy.
 
 ### 3.9 Attempt-memory store (cross-aggregate)
 
@@ -491,7 +491,7 @@ Required coverage:
 - **Concurrent versions & activation CAS** — v1 `PRODUCTION` + v2 `DRAFT` coexist; two runs branching from v1 both approve → the later activation **fails CAS** → `ACTIVATION_CONFLICT` to a human (no silent overwrite).
 - **Approval→activation saga** — version minted in the run tx; activation idempotent; transient feature-side failure retries; no half-applied state.
 - **Use-case-scoped & experimental activation** — v2 active for fraud while v1 active for credit; `APPROVED_EXPERIMENTAL` → `ACTIVE_EXPERIMENTAL`; experimental `expires_at` auto-deactivates.
-- **Governance gates** — production promotion blocked unless `verification_stamp==USEFULNESS_CHECKED` and required artifacts present; activation into a `blocked_use_case` rejected; over-tier-ceiling rejected.
+- **Governance gates** — production promotion blocked unless `verification_stamp=='USEFULNESS-CHECKED'` and required artifacts present; activation into a `blocked_use_case` rejected; over-tier-ceiling rejected.
 - **Multi-candidate / request aggregate** — N candidate runs at different stages concurrently; `select_candidate` mints/binds `feature_id`, closes siblings; `candidates_explored_count` recorded; one request → multiple features.
 - **Candidate→primary promotion** — `PRIMARY_SELECTED` event sets the current primary; uniqueness (one live primary per `(run_id, stage)`); "current" resolved by `global_seq`, not `created_at`; **DAG acyclicity** invariant holds (edges only to committed docs).
 - **Schema evolution** — old-version **events and documents** upcast (total, chained); breaking change caught; **deprecated/withdrawn** schema versions still readable for in-flight; runs pin registry snapshots.
