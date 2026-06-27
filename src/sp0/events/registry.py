@@ -43,6 +43,42 @@ class EventSchemaRegistry:
                 f"{type_name}@v{schema_version}: {exc.message}"
             ) from exc
 
+    def register_upcaster(
+        self,
+        type_name: str,
+        from_version: int,
+        to_version: int,
+        upcaster: Upcaster,
+    ) -> None:
+        if to_version != from_version + 1:
+            raise ValueError(
+                f"upcaster must be stepwise vN->vN+1, got {from_version}->{to_version}"
+            )
+        self._upcasters[(type_name, from_version)] = upcaster
+
+    def upcast(
+        self,
+        type_name: str,
+        body: Mapping[str, Any],
+        from_version: int,
+        to_version: int,
+    ) -> Mapping[str, Any]:
+        if to_version < from_version:
+            raise SchemaValidationError(
+                f"cannot downcast {type_name} {from_version}->{to_version}"
+            )
+        current: dict[str, Any] = dict(body)
+        version = from_version
+        while version < to_version:
+            step = self._upcasters.get((type_name, version))
+            if step is None:
+                raise SchemaValidationError(
+                    f"missing upcaster {type_name} {version}->{version + 1}"
+                )
+            current = dict(step(current))
+            version += 1
+        return current
+
 
 _REGISTRY: Optional[EventSchemaRegistry] = None
 
