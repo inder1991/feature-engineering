@@ -3,3 +3,6 @@
 
 # OS cruft
 .DS_Store
+
+# Subagent-driven-development scratch (ledger)
+.superpowers/
