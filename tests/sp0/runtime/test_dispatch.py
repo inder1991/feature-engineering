@@ -156,6 +156,39 @@ def test_recover_stuck_reclaims_queue_and_outbox(db) -> None:
     assert recover_stuck(db) == (1, 1)
 
 
+class _ReadConnWriterHandler(_Handler):
+    """A misbehaving handler that tries to WRITE through ctx.read_conn (forbidden, §5.1)."""
+
+    name = "advance"  # routed from STEP_TRIGGER by _pipe_trigger_to_queue
+
+    def handle(self, ctx):
+        with ctx.read_conn.cursor() as cur:
+            cur.execute("CREATE TABLE handler_illegal_write (x int)")
+        return super().handle(ctx)
+
+
+def test_handler_write_through_read_conn_fails_fast(db, seed_run_event, actor, prov) -> None:
+    """ctx.read_conn is opened READ-ONLY (§5.1): a handler that writes through it must fail fast
+    (psycopg ReadOnlySqlTransaction) and persist NOTHING — every mutation must go through the
+    returned HandlerResult and commit_step inside the step tx, never the read connection."""
+    import psycopg
+    import pytest
+
+    trigger = seed_run_event("run_ro", type="STEP_TRIGGER")
+    _pipe_trigger_to_queue(db, trigger)
+    reg = HandlerRegistry()
+    reg.register(_ReadConnWriterHandler(actor, prov))
+    with pytest.raises(psycopg.errors.ReadOnlySqlTransaction):
+        process_one(db, reg, owner="w1")
+
+    # The illegal write never persisted (checked on an independent connection).
+    db.rollback()
+    with psycopg.connect(db.info.dsn) as probe:
+        with probe.cursor() as cur:
+            cur.execute("SELECT to_regclass('handler_illegal_write')")
+            assert cur.fetchone()[0] is None
+
+
 def test_occ_conflict_reschedules_without_partial_writes(db, seed_run_event, actor, prov) -> None:
     """A REAL OCC conflict (the run stream advanced after the step was triggered) must roll the
     step back inside its savepoint — no STEP_DONE event, no outbox row, no ledger row — and

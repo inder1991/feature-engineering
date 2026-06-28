@@ -55,7 +55,13 @@ def _open_handler_conn(conn: psycopg.Connection) -> psycopg.Connection:
     dispatcher's connection (the dispatcher keeps using it to reschedule/fail the message —
     concurrent use of one psycopg connection from two threads is unsafe). Override via
     process_one(..., handler_conn_factory=...) if the deployment DSN needs extra credentials."""
-    handler_conn = psycopg.connect(conn.info.dsn)
+    # READ-ONLY at the session level: any write a handler attempts through ctx.read_conn fails
+    # fast (psycopg ReadOnlySqlTransaction) instead of silently committing outside the §5.1 step
+    # boundary. Kept autocommit so the handler's reads do not hold an open transaction on this
+    # isolated connection.
+    handler_conn = psycopg.connect(
+        conn.info.dsn, options="-c default_transaction_read_only=on"
+    )
     handler_conn.autocommit = True
     return handler_conn
 

@@ -26,6 +26,17 @@ INSERT INTO events (
 RETURNING global_seq, recorded_at
 """
 
+# A single constant key for a transaction-scoped advisory lock that serializes global_seq
+# allocation across ALL concurrent appends (any aggregate). global_seq is allocated by the
+# table DEFAULT nextval(...) at INSERT time, but each append commits in its own transaction
+# later; without serialization a higher global_seq can COMMIT before a lower one, letting
+# run_projection() advance its checkpoint past the not-yet-committed lower seq and PERMANENTLY
+# skip it (violates §3.2 "no gaps" / §3.6 fail-closed). Holding this lock from just-before
+# allocation until the caller's transaction ends forces allocation order == commit order, so
+# the global_seq sequence a projection observes is gapless. (Correctness over throughput; the
+# spec defers allocator tuning.)
+_GLOBAL_SEQ_LOCK_KEY = 4_201_873_355_201_001  # arbitrary fixed key, unique to sp0 seq alloc
+
 
 def append_event(
     conn: DbConn,
@@ -79,6 +90,13 @@ def append_event(
         "caused_by": new_event.caused_by,
         "occurred_at": occurred_at,
     }
+    # Serialize global_seq allocation with commit order (§3.2 no-gaps / §3.6 fail-closed):
+    # take the transaction-scoped advisory lock IMMEDIATELY before allocating global_seq. It is
+    # held until the caller's top-level transaction commits/rolls back (savepoints below do not
+    # release it), so concurrent cross-aggregate appends commit in the same order they allocated.
+    with conn.cursor() as cur:
+        cur.execute("SELECT pg_advisory_xact_lock(%s)", (_GLOBAL_SEQ_LOCK_KEY,))
+
     try:
         with conn.transaction():  # savepoint: a concurrent racer that wins the UNIQUE keeps
             with conn.cursor(row_factory=dict_row) as cur:  # THIS connection usable
