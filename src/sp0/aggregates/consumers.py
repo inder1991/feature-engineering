@@ -7,6 +7,9 @@ from psycopg.types.json import Jsonb
 from sp0.contracts import Command, CommandResult, DbConn
 from sp0.aggregates._append import append, identity_dict
 from sp0.aggregates.ids import mint_id, new_consumer_id
+from sp0.aggregates.activation import _jsonable as _jsonable_inputs
+from sp0.aggregates.feature_versions import load_governance_attributes
+from sp0.governance.activation_policy import evaluate_activation_guards
 
 _DEFAULT_GRACE_SECONDS = 7 * 24 * 3600
 
@@ -60,6 +63,22 @@ def supersede_command(conn: DbConn, cmd: Command) -> CommandResult:
         (feature_id, use_case),
     ).fetchone()
     prior = row[0] if row else None
+    # §3.8 governance guards — a supersession promotes new_fv into the use-case slot, so it must
+    # pass the same activation guards (intrinsic use_case_not_blocked + policy-parameterized) as a
+    # fresh activation. On failure emit an audited ACTIVATION_BLOCKED event and do NOT promote.
+    attrs = load_governance_attributes(conn, new_fv)
+    failure = evaluate_activation_guards(attrs, use_case=use_case, approval_type="PRODUCTION")
+    if failure is not None:
+        evt = append(
+            conn, aggregate="feature", aggregate_id=feature_id, type="ACTIVATION_BLOCKED",
+            payload={"feature_id": feature_id, "feature_version_id": new_fv, "use_case": use_case,
+                     "approval_type": "PRODUCTION", "guard": failure.guard,
+                     "guard_inputs": _jsonable_inputs(failure.inputs),
+                     "guard_result": failure.result},
+            actor=cmd.actor, feature_id=feature_id,
+        )
+        return CommandResult(accepted=True, aggregate_id=feature_id,
+                             produced_event_ids=(evt.event_id,))
     if args.get("expected_prior") is not None and prior != args["expected_prior"]:
         evt = append(
             conn, aggregate="feature", aggregate_id=feature_id, type="ACTIVATION_CONFLICT",

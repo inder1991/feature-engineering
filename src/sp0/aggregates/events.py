@@ -26,6 +26,9 @@ EVENT_SCHEMAS: dict[str, dict] = {
     "VERSION_MINTED": _obj(["feature_id", "feature_version_id", "produced_by_run"]),
     "VERSION_ACTIVATED": _obj(["feature_id", "feature_version_id", "use_case", "activation_state"]),
     "ACTIVATION_CONFLICT": _obj(["feature_id", "feature_version_id", "use_case"]),
+    # §3.8 governance guard rejected the activation/supersession (use_case_not_blocked or a
+    # policy-parameterized guard). Audited with the failed guard name + resolved inputs/result.
+    "ACTIVATION_BLOCKED": _obj(["feature_id", "feature_version_id", "use_case", "guard"]),
     "VERSION_SUPERSEDED": _obj(["feature_id", "feature_version_id", "use_case"]),
     "VERSION_QUIESCED": _obj(["feature_id", "feature_version_id", "use_case", "impacted_consumers"]),
     "VERSION_DEPRECATED": _obj(["feature_id", "feature_version_id"]),

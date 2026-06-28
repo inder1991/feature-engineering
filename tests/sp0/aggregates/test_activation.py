@@ -222,6 +222,53 @@ def test_deactivate_expired_version_removes_active_entry(db):
     assert again.accepted and again.produced_event_ids == ()
 
 
+def _mint_full(db, feature_id, run, *, stamp, approval="PRODUCTION", blocked=(), tier="low"):
+    return mint_feature_version(
+        db, feature_id=feature_id, produced_by_run=run, verification_stamp=stamp,
+        risk_tier=tier, approval_type=approval, approved_use_cases=("fraud",),
+        blocked_use_cases=blocked, required_artifact_refs={}, content_hash="sha256:" + run,
+        actor=make_actor(), provenance=provenance_for())
+
+
+def test_activation_into_blocked_use_case_is_rejected(db):
+    # §3.8 intrinsic guard: activating INTO a use_case listed in blocked_use_cases is rejected
+    # WITHOUT claiming the slot, and emits an audited ACTIVATION_BLOCKED event.
+    v1 = _mint_full(db, "feat_blk", "run1", stamp="USEFULNESS-CHECKED",
+                    blocked=("credit_decisioning",))
+    res = apply_activation(db, feature_id="feat_blk", feature_version_id=v1,
+                           use_case="credit_decisioning", base_feature_version_id=None,
+                           approval_type="PRODUCTION", actor=make_actor())
+    assert not res.activated and not res.conflict
+    assert db.execute("SELECT count(*) FROM feature_active_versions "
+                      "WHERE feature_id='feat_blk'").fetchone()[0] == 0
+    last = load_stream(db, "feature", "feat_blk")[-1]
+    assert last.type == "ACTIVATION_BLOCKED" and last.payload["guard"] == "use_case_not_blocked"
+    assert [e for e in load_stream(db, "feature", "feat_blk")
+            if e.type == "VERSION_ACTIVATED"] == []
+
+
+def test_promote_non_usefulness_checked_to_production_is_rejected(db):
+    # §3.8 policy-parameterized guard via the injected policy hook: a policy that requires
+    # USEFULNESS-CHECKED for PRODUCTION promotion rejects a DATA-CHECKED version.
+    from sp0.governance.activation_policy import StandardActivationPolicy
+    policy = StandardActivationPolicy(production_required_stamp="USEFULNESS-CHECKED")
+    v1 = _mint_full(db, "feat_stamp", "run1", stamp="DATA-CHECKED")
+    res = apply_activation(db, feature_id="feat_stamp", feature_version_id=v1, use_case="fraud",
+                           base_feature_version_id=None, approval_type="PRODUCTION",
+                           actor=make_actor(), policy=policy)
+    assert not res.activated and not res.conflict
+    assert db.execute("SELECT count(*) FROM feature_active_versions "
+                      "WHERE feature_id='feat_stamp'").fetchone()[0] == 0
+    last = load_stream(db, "feature", "feat_stamp")[-1]
+    assert last.type == "ACTIVATION_BLOCKED"
+    assert last.payload["guard"] == "verification_stamp_satisfies"
+    # the same DATA-CHECKED version IS allowed as an EXPERIMENTAL activation under this policy
+    ok = apply_activation(db, feature_id="feat_stamp", feature_version_id=v1, use_case="fraud",
+                          base_feature_version_id=None, approval_type="EXPERIMENTAL",
+                          actor=make_actor(), policy=policy)
+    assert ok.activated
+
+
 def test_activate_command_wraps_apply_activation(db):
     v1 = _mint(db, "feat_h", "run1")
     res = activate_command(db, make_cmd("activate", "feature", "feat_h",

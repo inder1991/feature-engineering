@@ -12,7 +12,18 @@ from sp0.contracts import (
 )
 from sp0.aggregates._append import append
 from sp0.aggregates.ids import mint_id
-from sp0.aggregates.feature_versions import mint_feature_version
+from sp0.aggregates.feature_versions import load_governance_attributes, mint_feature_version
+from sp0.governance.activation_policy import ActivationPolicy, evaluate_activation_guards
+
+
+def _jsonable(value: Any) -> Any:
+    """Coerce guard inputs (which may carry tuples / nested mappings) to JSON-safe values for the
+    audited ACTIVATION_BLOCKED payload."""
+    if isinstance(value, Mapping):
+        return {str(k): _jsonable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_jsonable(v) for v in value]
+    return value
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,6 +88,7 @@ def apply_activation(
     conn: DbConn, *, feature_id: str, feature_version_id: str, use_case: str,
     base_feature_version_id: Optional[str], approval_type: str, actor: IdentityEnvelope,
     expires_at: Optional[datetime] = None, provenance: Optional[ProvenanceEnvelope] = None,
+    policy: Optional[ActivationPolicy] = None,
 ) -> ActivationResult:
     row = conn.execute(
         "SELECT feature_version_id FROM feature_active_versions "
@@ -86,6 +98,24 @@ def apply_activation(
     current = row[0] if row else None
     if current == feature_version_id:
         return ActivationResult(True, False, feature_version_id, use_case, "")  # idempotent
+    # §3.8 governance guards — evaluated against the frozen version attributes BEFORE claiming the
+    # slot. The intrinsic use_case_not_blocked guard plus the injected policy-parameterized guards
+    # (verification stamp / risk ceiling / required artifacts) gate the activation. On failure we
+    # emit an audited ACTIVATION_BLOCKED event and return WITHOUT activating (no CAS, no slot).
+    attrs = load_governance_attributes(conn, feature_version_id)
+    failure = evaluate_activation_guards(
+        attrs, use_case=use_case, approval_type=approval_type, policy=policy,
+    )
+    if failure is not None:
+        evt = append(
+            conn, aggregate="feature", aggregate_id=feature_id, type="ACTIVATION_BLOCKED",
+            payload={"feature_id": feature_id, "feature_version_id": feature_version_id,
+                     "use_case": use_case, "base_feature_version_id": base_feature_version_id,
+                     "approval_type": approval_type, "guard": failure.guard,
+                     "guard_inputs": _jsonable(failure.inputs), "guard_result": failure.result},
+            actor=actor, feature_id=feature_id,
+        )
+        return ActivationResult(False, False, feature_version_id, use_case, evt.event_id)
     if current != base_feature_version_id:
         evt = append(
             conn, aggregate="feature", aggregate_id=feature_id, type="ACTIVATION_CONFLICT",

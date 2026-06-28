@@ -8,6 +8,26 @@ from psycopg.types.json import Jsonb
 from sp0.contracts import DbConn, IdentityEnvelope, ProvenanceEnvelope
 from sp0.aggregates._append import append
 from sp0.aggregates.ids import new_feature_version_id
+from sp0.governance.attributes import GovernanceAttributes, from_feature_version_row
+
+_GOVERNANCE_COLUMNS: tuple[str, ...] = (
+    "feature_version_id", "feature_id", "produced_by_run", "base_feature_version_id",
+    "verification_stamp", "risk_tier", "approval_type", "approved_use_cases",
+    "blocked_use_cases", "required_artifact_refs", "dsl_operation_catalog_version",
+    "approval", "expires_at", "immutable",
+)
+
+
+def load_governance_attributes(conn: DbConn, feature_version_id: str) -> GovernanceAttributes:
+    """Load the immutable §3.8 governance attributes for a feature_version (read of a frozen,
+    write-once row — replay-safe for guard evaluation). Raises KeyError if the version is unknown."""
+    row = conn.execute(
+        f"SELECT {', '.join(_GOVERNANCE_COLUMNS)} FROM feature_versions WHERE feature_version_id=%s",
+        (feature_version_id,),
+    ).fetchone()
+    if row is None:
+        raise KeyError(f"unknown feature_version_id: {feature_version_id!r}")
+    return from_feature_version_row(dict(zip(_GOVERNANCE_COLUMNS, row)))
 
 
 def mint_feature_version(
