@@ -66,6 +66,31 @@ def _validate_event_doc_refs(
                 )
 
 
+def _apply_activations(conn: psycopg.Connection, ctx: HandlerContext, result: HandlerResult) -> None:
+    """Apply each declared NewActivation on the STEP-TRANSACTION conn (never a handler conn),
+    so the active-map CAS + VERSION_ACTIVATED/ACTIVATION_CONFLICT event + expiry timer are
+    atomic with the rest of the step. apply_activation is idempotent (no-ops when already active
+    at this version), so re-delivery of the saga message produces exactly one effect."""
+    if not result.activations:
+        return
+    # Deferred import keeps Phase-04's step.py free of an import-time dependency on Phase 06.
+    from sp0.aggregates.activation import apply_activation
+
+    actor = ctx.triggering_event.actor
+    for act in result.activations:
+        apply_activation(
+            conn,
+            feature_id=act.feature_id,
+            feature_version_id=act.feature_version_id,
+            use_case=act.use_case,
+            base_feature_version_id=act.base_feature_version_id,
+            approval_type=act.approval_type,
+            actor=actor,
+            expires_at=act.expires_at,
+            provenance=act.provenance,
+        )
+
+
 def commit_step(
     conn: psycopg.Connection,
     ctx: HandlerContext,
@@ -84,11 +109,6 @@ def commit_step(
             "commit_step: timers/external_commands persistence is added by Phase 05 "
             "(§5.4/§5.5); not supported in Phase 04"
         )
-    if result.activations:
-        raise RuntimeError(
-            "commit_step: cross-aggregate activations are applied by Phase 06's commit-path "
-            "extension (§6); not supported in Phase 04"
-        )
 
     te = ctx.triggering_event
 
@@ -101,6 +121,9 @@ def commit_step(
         else None
     )
     _validate_event_doc_refs(conn, result.new_events, document_id=document_id)
+
+    # Phase 06 (§5.8): apply cross-aggregate activations on the step-transaction conn.
+    _apply_activations(conn, ctx, result)
 
     version = expected_version
     appended = []

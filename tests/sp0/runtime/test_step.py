@@ -133,9 +133,20 @@ def test_commit_step_raises_on_timers(db, seed_run_event, actor, prov) -> None:
         )
 
 
-def test_commit_step_raises_on_activations(db, seed_run_event, actor, prov) -> None:
-    # Cross-aggregate activations are applied by Phase 06's commit-path extension; until then
-    # commit_step refuses them so nothing is ever silently dropped (mirrors the timers guard).
+def test_commit_step_applies_activations(db, seed_run_event, actor, prov) -> None:
+    # Phase 06 (§5.8): commit_step now APPLIES each declared NewActivation on the step-tx conn
+    # (replacing the Phase-04 deferral guard) via apply_activation — atomic with the rest of the
+    # step. The active-map CAS + VERSION_ACTIVATED event land in the same transaction.
+    from sp0.events.registry import event_registry
+    from sp0.aggregates.events import register_phase06_event_types
+    from sp0.aggregates.feature_versions import mint_feature_version
+
+    register_phase06_event_types(event_registry())
+    fv = mint_feature_version(
+        db, feature_id="feat_step", produced_by_run="run_s4b",
+        verification_stamp="USEFULNESS-CHECKED", risk_tier="low", approval_type="PRODUCTION",
+        approved_use_cases=("fraud",), blocked_use_cases=(), required_artifact_refs={},
+        content_hash="sha256:step", actor=actor, provenance=prov)
     trigger = seed_run_event("run_s4b", type="STEP_TRIGGER")
     ctx = _ctx(db, trigger)
     result = HandlerResult(
@@ -143,21 +154,23 @@ def test_commit_step_raises_on_activations(db, seed_run_event, actor, prov) -> N
         new_events=(_next_event(ctx, actor, prov),),
         activations=(
             NewActivation(
-                feature_id="feat_1",
-                feature_version_id="fv_1",
-                use_case="training",
-                base_feature_version_id="fv_0",
-                approval_type="auto",
+                feature_id="feat_step",
+                feature_version_id=fv,
+                use_case="fraud",
+                base_feature_version_id=None,
+                approval_type="PRODUCTION",
             ),
         ),
     )
-    with pytest.raises(RuntimeError):
-        commit_step(
-            db, ctx, result,
-            message_id=trigger.event_id,
-            expected_version=trigger.stream_version,
-            table_version=trigger.table_version,
-        )
+    commit_step(
+        db, ctx, result,
+        message_id=trigger.event_id,
+        expected_version=trigger.stream_version,
+        table_version=trigger.table_version,
+    )
+    row = db.execute("SELECT feature_version_id FROM feature_active_versions "
+                     "WHERE feature_id='feat_step' AND use_case='fraud'").fetchone()
+    assert row[0] == fv
 
 
 def test_commit_step_stale_expected_version_raises_concurrency(db, seed_run_event, actor, prov) -> None:
