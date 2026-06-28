@@ -42,6 +42,29 @@ def _register_runtime_test_event_types(_reset_registry):
             registry.validate(type_name, 1, {})  # re-raises if NOT actually registered
 
 
+class _RecordingCaller:
+    integration = "llm"
+
+    def __init__(self, *, invoke_result=None, reconcile_result=None):
+        self._invoke_result = invoke_result
+        self._reconcile_result = reconcile_result
+        self.invoke_calls = 0
+        self.reconcile_calls = 0
+
+    def invoke(self, request_payload):
+        self.invoke_calls += 1
+        return self._invoke_result
+
+    def reconcile(self, job_handle):
+        self.reconcile_calls += 1
+        return self._reconcile_result
+
+
+@pytest.fixture
+def recording_caller():
+    return _RecordingCaller
+
+
 @pytest.fixture
 def actor() -> IdentityEnvelope:
     return IdentityEnvelope(
