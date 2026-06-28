@@ -3,6 +3,7 @@ from sp0.aggregates.request_aggregate import create_request_command, create_run_
 from sp0.aggregates.run_lifecycle import (
     reject_command, cancel_command, withdraw_command,
     park_command, unpark_command, reopen_as_new_run_command, run_is_terminal,
+    fact_confirmed_resume_command, source_changed_revalidate_command,
 )
 from tests.sp0._helpers import make_cmd
 
@@ -68,3 +69,35 @@ def test_resolve_degraded_clears_flag(db):
         "SELECT degraded, degraded_reason FROM run_workflow_state WHERE run_id = 'run_d'"
     ).fetchone()
     assert row[0] is False and row[1] is None
+
+
+def test_fact_confirmed_resume_wakes_only_runs_waiting_on_that_fact(db):
+    waiting, _ = _new_run(db)
+    other, _ = _new_run(db)
+    park_command(db, make_cmd("park", "run", waiting, {"owner": "o", "waiting_on_fact": "overlay:123"}))
+    park_command(db, make_cmd("park", "run", other, {"owner": "o", "waiting_on_fact": "overlay:999"}))
+    res = fact_confirmed_resume_command(
+        db, make_cmd("fact_confirmed_resume", "run", None, {"fact_key": "overlay:123"}))
+    assert res.accepted
+    woken_types = [e.type for e in load_stream(db, "run", waiting)]
+    assert "FACT_CONFIRMED_RESUME" in woken_types and woken_types[-1] == "RUN_UNPARKED"
+    assert "FACT_CONFIRMED_RESUME" not in [e.type for e in load_stream(db, "run", other)]
+
+
+def test_source_changed_revalidate_for_in_flight_run(db):
+    run, _ = _new_run(db)
+    res = source_changed_revalidate_command(
+        db, make_cmd("source_changed_revalidate", "run", run,
+                     {"source_ref": "tbl.core.txn", "new_snapshot": "snap@42"}))
+    assert res.accepted
+    last = load_stream(db, "run", run)[-1]
+    assert last.type == "SOURCE_CHANGED_REVALIDATE"
+    assert last.payload["source_ref"] == "tbl.core.txn"
+
+
+def test_source_changed_revalidate_rejected_when_terminal(db):
+    run, _ = _new_run(db)
+    reject_command(db, make_cmd("reject", "run", run, {"reason": "x"}))
+    res = source_changed_revalidate_command(
+        db, make_cmd("source_changed_revalidate", "run", run, {"source_ref": "t"}))
+    assert res.accepted is False and "terminal" in res.denied_reason
