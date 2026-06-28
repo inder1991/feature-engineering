@@ -68,6 +68,38 @@ def test_tampering_breaks_chain(db):
     assert verify_chain(db) is False
 
 
+def test_editing_actor_role_claims_breaks_chain(db):
+    # The hash must cover the FULL actor envelope, not just actor.subject. Editing a
+    # non-subject field such as role_claims (with the physical trigger disabled, as the
+    # tamper test does) must break verify_chain().
+    a = build_human_identity(subject="user:raj", role_claims=["data_scientist"])
+    record_security_event(
+        db, event_type="COMMAND_DENIED", actor=a,
+        attempted_action="activate", decision="denied", reason="r1",
+    )
+    assert verify_chain(db) is True
+    db.execute("ALTER TABLE security_audit DISABLE TRIGGER security_audit_no_mutation")
+    db.execute(
+        "UPDATE security_audit "
+        "SET actor = jsonb_set(actor, '{role_claims}', '[\"admin\"]') WHERE seq = 1"
+    )
+    db.execute("ALTER TABLE security_audit ENABLE TRIGGER security_audit_no_mutation")
+    assert verify_chain(db) is False
+
+
+def test_editing_retention_class_breaks_chain(db):
+    # retention_class is part of the hashed logical row.
+    a = build_human_identity(subject="user:raj", role_claims=["data_scientist"])
+    record_security_event(
+        db, event_type="COMMAND_DENIED", actor=a,
+        attempted_action="activate", decision="denied", reason="r1",
+    )
+    db.execute("ALTER TABLE security_audit DISABLE TRIGGER security_audit_no_mutation")
+    db.execute("UPDATE security_audit SET retention_class = 'forever' WHERE seq = 1")
+    db.execute("ALTER TABLE security_audit ENABLE TRIGGER security_audit_no_mutation")
+    assert verify_chain(db) is False
+
+
 def test_denial_lands_in_security_stream_not_events(db):
     from sp0.security.audit import record_denial
     from types import SimpleNamespace
