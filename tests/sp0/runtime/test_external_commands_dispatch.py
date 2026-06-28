@@ -3,6 +3,8 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from decimal import Decimal
 
+import pytest
+
 from sp0.contracts import NewExternalCommand
 from sp0.runtime.external_commands import (
     IntegrationResult,
@@ -81,3 +83,55 @@ def test_recovery_dedup_supported_no_residual(conn, recording_caller):
     assert out.status == "succeeded"
     assert out.reinvoked is True and out.residual_duplicate_risk is False
     assert "_residual_duplicate_risk" not in _row(conn, cid)[1]
+
+
+class _CrashingCaller:
+    """Performs the external side effect, then crashes BEFORE the result is
+    finalized — simulating a dispatcher death between invoke() and the result
+    write (§5.4). Recovery must reconcile via the job handle, never re-invoke."""
+
+    integration = "llm"
+
+    def __init__(self, *, reconcile_result):
+        self._reconcile_result = reconcile_result
+        self.invoke_calls = 0
+        self.reconcile_calls = 0
+        self.side_effects = 0
+
+    def invoke(self, request_payload):
+        self.invoke_calls += 1
+        self.side_effects += 1  # the irreversible external effect HAPPENED
+        raise RuntimeError("crash after external effect, before finalize")
+
+    def reconcile(self, job_handle):
+        self.reconcile_calls += 1
+        return self._reconcile_result
+
+
+def test_crash_between_invoke_and_finalize_does_not_double_invoke(conn):
+    # A pending command with a reconcilable job handle.
+    cid = _record(conn, "crash", handle="job-crash")
+
+    caller = _CrashingCaller(
+        reconcile_result=IntegrationResult(True, {"answer": 99}, job_handle="job-crash")
+    )
+
+    # Dispatch: claim+mark-dispatched (committed), then the external call crashes
+    # AFTER the side effect but BEFORE the result is finalized.
+    with pytest.raises(RuntimeError):
+        dispatch_command(conn, cid, caller, now=NOW)
+    assert caller.invoke_calls == 1 and caller.side_effects == 1
+
+    # The 'dispatched' claim must have been COMMITTED in its own transaction, so
+    # it survives the crash/rollback — recovery can see it (this is the fix: the
+    # old single-transaction code rolled the mark back to 'pending').
+    conn.rollback()  # discard any open tx; read durably committed state
+    assert _row(conn, cid)[0] == "dispatched"
+
+    # Recovery: reconcile via the job handle — NO second invocation.
+    out = dispatch_command(conn, cid, caller, now=NOW)
+    assert out.status == "succeeded" and out.reconciled is True
+    assert caller.invoke_calls == 1 and caller.side_effects == 1  # not re-invoked
+    assert caller.reconcile_calls == 1
+    status, result, _ = _row(conn, cid)
+    assert status == "succeeded" and result["answer"] == 99

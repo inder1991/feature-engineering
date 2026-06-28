@@ -94,11 +94,22 @@ def _flag_residual(result: Mapping[str, Any], residual: bool) -> dict:
 def dispatch_command(
     conn: DbConn, command_id: str, caller: IntegrationCaller, *, now: datetime
 ) -> DispatchOutcome:
-    """Execute ONE pending/dispatched external command (§5.4). On recovery of a command
-    already 'dispatched': if a job_handle exists, reconcile (no re-invoke); else if the
-    integration does NOT honor the idempotency key (dedup_supported=False), re-invoke and
-    FLAG the residual-duplicate risk honestly (logged + persisted in result) — never a false
-    dedup claim. Retryable failures stay 'pending'; permanent failures go to 'failed'."""
+    """Execute ONE pending/dispatched external command crash-safely in THREE steps (§5.4),
+    so a death between the external call and the result write can never silently re-invoke a
+    side effect:
+
+      (1) CLAIM — lock the row, mark it 'dispatched' (attempts+1) and COMMIT that transaction
+          on its own, making the claim durable BEFORE any external work.
+      (2) CALL — invoke (or, on recovery, reconcile) the external system OUTSIDE any open DB
+          transaction. A crash here leaves the row durably 'dispatched', not 'pending'.
+      (3) FINALIZE — re-lock and write the result ('succeeded'/'failed', or back to 'pending'
+          for a retryable failure) in a SECOND committed transaction.
+
+    Recovery of a row already 'dispatched' (claim committed, never finalized) NEVER blindly
+    re-invokes: if a job_handle exists it is RECONCILED (no re-invoke); else if the integration
+    honors the idempotency key (dedup_supported) it is safe to re-invoke; else the
+    residual-duplicate risk is logged and persisted honestly (no false dedup claim)."""
+    # --- Step 1: claim + mark 'dispatched', then COMMIT on its own ---------------------
     with conn.cursor() as cur:
         cur.execute(
             "SELECT request_payload, job_handle, dedup_supported, status "
@@ -107,34 +118,60 @@ def dispatch_command(
         )
         row = cur.fetchone()
         if row is None:
+            conn.rollback()
             raise KeyError(command_id)
         payload, job_handle, dedup_supported, status = row
         if status in ("succeeded", "stale_ignored", "failed"):
+            conn.rollback()
             return DispatchOutcome(command_id, status)
-
-        reconciled = residual = reinvoked = False
-        if status == "dispatched":
-            if job_handle is not None:
-                res = caller.reconcile(job_handle)
-                reconciled = True
-                if res is None:
-                    return DispatchOutcome(command_id, "dispatched", reconciled=True)
-            else:
-                if not dedup_supported:
-                    residual = True
-                    _log.warning(
-                        "residual-duplicate risk: re-invoking %s (idempotency not honored)",
-                        command_id,
-                    )
-                res = caller.invoke(payload)
-                reinvoked = True
-        else:  # pending
+        if status == "pending":
             cur.execute(
                 "UPDATE external_commands SET status='dispatched', dispatched_at=%s, "
                 "attempts=attempts+1 WHERE command_id=%s",
                 (now, command_id),
             )
+    conn.commit()  # claim is now durable BEFORE the external side effect
+
+    # --- Step 2: external call OUTSIDE any DB transaction ------------------------------
+    # `status` is the value read at claim time: 'pending' => first dispatch (fresh invoke);
+    # 'dispatched' => recovery of a claimed-but-unfinalized command.
+    reconciled = residual = reinvoked = False
+    if status == "dispatched":
+        if job_handle is not None:
+            res = caller.reconcile(job_handle)
+            reconciled = True
+            if res is None:
+                # Not resolvable yet — leave durably 'dispatched' for a later sweep.
+                return DispatchOutcome(command_id, "dispatched", reconciled=True)
+        elif dedup_supported:
             res = caller.invoke(payload)
+            reinvoked = True
+        else:
+            residual = True
+            _log.warning(
+                "residual-duplicate risk: re-invoking %s (no job_handle; idempotency key "
+                "not honored by %s) — accepted risk flagged, no false dedup claim",
+                command_id, caller.integration,
+            )
+            res = caller.invoke(payload)
+            reinvoked = True
+    else:  # 'pending' -> claimed above; first invocation
+        res = caller.invoke(payload)
+
+    # --- Step 3: finalize the result in a SECOND committed transaction -----------------
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT status FROM external_commands WHERE command_id = %s FOR UPDATE",
+            (command_id,),
+        )
+        frow = cur.fetchone()
+        if frow is None:
+            conn.rollback()
+            raise KeyError(command_id)
+        if frow[0] in ("succeeded", "failed", "stale_ignored"):
+            # A concurrent dispatcher already finalized this command; honor it.
+            conn.rollback()
+            return DispatchOutcome(command_id, frow[0], reinvoked, residual, reconciled)
 
         if res.ok:
             cur.execute(
@@ -143,18 +180,22 @@ def dispatch_command(
                 (Jsonb(_flag_residual(res.result, residual)), res.cost_units, now,
                  res.job_handle, command_id),
             )
-            return DispatchOutcome(command_id, "succeeded", reinvoked, residual, reconciled)
-        if res.permanent:
+            outcome = DispatchOutcome(command_id, "succeeded", reinvoked, residual, reconciled)
+        elif res.permanent:
             cur.execute(
                 "UPDATE external_commands SET status='failed', result=%s, completed_at=%s "
                 "WHERE command_id=%s",
                 (Jsonb(dict(res.result)), now, command_id),
             )
-            return DispatchOutcome(command_id, "failed", reinvoked, residual, reconciled)
-        cur.execute(
-            "UPDATE external_commands SET status='pending' WHERE command_id=%s", (command_id,)
-        )
-        return DispatchOutcome(command_id, "pending", reinvoked, residual, reconciled)
+            outcome = DispatchOutcome(command_id, "failed", reinvoked, residual, reconciled)
+        else:
+            cur.execute(
+                "UPDATE external_commands SET status='pending' WHERE command_id=%s",
+                (command_id,),
+            )
+            outcome = DispatchOutcome(command_id, "pending", reinvoked, residual, reconciled)
+    conn.commit()
+    return outcome
 
 
 @dataclass(frozen=True, slots=True)
