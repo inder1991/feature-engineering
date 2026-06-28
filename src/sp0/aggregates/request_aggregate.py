@@ -1,11 +1,19 @@
 from __future__ import annotations
 
 from sp0.contracts import Command, CommandResult, DbConn
-from sp0.aggregates._append import append
+from sp0.aggregates._append import append, provenance_for
 from sp0.aggregates.concept_claims import claim_concept
+from sp0.aggregates.ids import new_feature_id
 from sp0.aggregates.ids import new_request_id
 from sp0.aggregates.ids import new_run_id
 from sp0.aggregates.ids import normalize_concept_key
+from sp0.events.store import load_stream
+
+_TERMINAL_RUN_TYPES = ("RUN_REJECTED", "RUN_CANCELLED", "RUN_WITHDRAWN")
+
+
+def _run_terminal_local(conn: DbConn, run_id: str) -> bool:
+    return any(e.type in _TERMINAL_RUN_TYPES for e in load_stream(conn, "run", run_id))
 
 
 def create_request_command(conn: DbConn, cmd: Command) -> CommandResult:
@@ -60,3 +68,51 @@ def duplicate_of_command(conn: DbConn, cmd: Command) -> CommandResult:
     )
     return CommandResult(accepted=True, aggregate_id=request_id,
                          produced_event_ids=(dup.event_id,))
+
+
+def select_candidate_command(conn: DbConn, cmd: Command) -> CommandResult:
+    request_id = cmd.aggregate_id
+    stream = load_stream(conn, "request", request_id)
+    all_runs = [e.payload["run_id"] for e in stream if e.type == "CANDIDATE_ADDED"]
+    selections = cmd.args["selections"]
+    selected_ids = {s["run_id"] for s in selections}
+    explored = cmd.args.get("candidates_explored_count", len(all_runs))
+    produced: list[str] = []
+    for sel in selections:
+        run_id = sel["run_id"]
+        feature_id = sel.get("feature_id")
+        if feature_id is None:
+            feature_id = new_feature_id()
+            created = append(
+                conn, aggregate="feature", aggregate_id=feature_id, type="FEATURE_CREATED",
+                payload={"feature_id": feature_id, "request_id": request_id,
+                         "concept_key": cmd.args.get("concept_key"), "origin_run_id": run_id},
+                actor=cmd.actor, request_id=request_id, feature_id=feature_id,
+                run_id=run_id, expected_version=0,
+            )
+            produced.append(created.event_id)
+        chosen = append(
+            conn, aggregate="request", aggregate_id=request_id, type="CANDIDATE_SELECTED",
+            payload={"request_id": request_id, "selected_run_id": run_id,
+                     "feature_id": feature_id, "candidates_explored_count": explored},
+            actor=cmd.actor,
+            provenance=provenance_for(candidates_explored_count=explored),
+            request_id=request_id, feature_id=feature_id, run_id=run_id,
+        )
+        produced.append(chosen.event_id)
+    for run_id in all_runs:
+        if run_id in selected_ids or _run_terminal_local(conn, run_id):
+            continue
+        rej_req = append(
+            conn, aggregate="request", aggregate_id=request_id, type="CANDIDATE_REJECTED",
+            payload={"request_id": request_id, "run_id": run_id, "reason": "sibling_closed"},
+            actor=cmd.actor, request_id=request_id, run_id=run_id,
+        )
+        rej_run = append(
+            conn, aggregate="run", aggregate_id=run_id, type="RUN_REJECTED",
+            payload={"run_id": run_id, "reason": "sibling_closed"},
+            actor=cmd.actor, run_id=run_id,
+        )
+        produced.extend([rej_req.event_id, rej_run.event_id])
+    return CommandResult(accepted=True, aggregate_id=request_id,
+                         produced_event_ids=tuple(produced))
