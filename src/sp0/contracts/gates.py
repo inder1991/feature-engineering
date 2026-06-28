@@ -1,27 +1,11 @@
-# Verbatim from the shared SP-0 contract; Phase 07 authoritative.
+# PHASE 06 IS AUTHORITATIVE for GateTaskSpec / SignalResult — they live in sp0.contracts.envelopes.
+# Phase 07 only CONSUMES these two dataclasses. The task brief was authored to TRANSCRIBE them here as
+# an independence bootstrap for the case where Phase 06 had not yet landed; in THIS repo Phase 06 is
+# present, so we RE-EXPORT the single authoritative definition instead of redefining it (the overview's
+# hard rule: "do not redefine shared symbols ... import them"). Re-exporting guarantees byte-identity
+# (and isinstance/identity across phases) by construction.
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Mapping, Optional
+from sp0.contracts.envelopes import GateTaskSpec, SignalResult
 
-
-@dataclass(frozen=True, slots=True)
-class GateTaskSpec:
-    gate: str
-    required_inputs: tuple[str, ...]
-    eligible_assignees: Mapping[str, str]
-    allowed_responses: tuple[str, ...]
-    run_id: Optional[str] = None
-    feature_id: Optional[str] = None
-    quorum_required: int = 1
-    quorum_of_role: Optional[str] = None
-    delegation_allowed: bool = True
-    sla: Optional[str] = None
-
-
-@dataclass(frozen=True, slots=True)
-class SignalResult:
-    task_id: str
-    status: str
-    counted: bool
-    quorum_met: bool
+__all__ = ["GateTaskSpec", "SignalResult"]

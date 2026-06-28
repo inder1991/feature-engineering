@@ -43,3 +43,11 @@ def test_service_attestation_round_trips():
         attestation="signed-deploy-id:sp2-intake@1.4.0",
     )
     assert identity_from_jsonb(identity_to_jsonb(svc)) == svc
+
+
+def test_gates_reexports_canonical_types():
+    import sp0.contracts.gates as gates
+    import sp0.contracts.envelopes as envelopes
+
+    assert gates.GateTaskSpec is envelopes.GateTaskSpec
+    assert gates.SignalResult is envelopes.SignalResult
