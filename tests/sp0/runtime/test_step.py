@@ -1,0 +1,222 @@
+from __future__ import annotations
+
+import pytest
+
+from sp0.contracts import (
+    ConcurrencyError,
+    Disposition,
+    HandlerContext,
+    HandlerResult,
+    NewActivation,
+    NewDocument,
+    NewEvent,
+    NewTimer,
+)
+from datetime import datetime, timezone
+from sp0.documents.store import DocumentValidationError
+from sp0.runtime.step import commit_step
+
+
+def _next_event(ctx, actor, prov, *, type="STEP_DONE", payload=None) -> NewEvent:
+    return NewEvent(
+        aggregate="run",
+        aggregate_id=ctx.run_id,
+        run_id=ctx.run_id,
+        type=type,
+        schema_version=1,
+        payload=payload or {},
+        actor=actor,
+        provenance=prov,
+    )
+
+
+def _ctx(db, trigger) -> HandlerContext:
+    return HandlerContext(
+        run_id=trigger.run_id, triggering_event=trigger, documents={}, read_conn=db
+    )
+
+
+def test_commit_step_appends_event_outbox_and_ledger(db, seed_run_event, actor, prov) -> None:
+    trigger = seed_run_event("run_s1", type="STEP_TRIGGER")
+    ctx = _ctx(db, trigger)
+    result = HandlerResult(
+        disposition=Disposition.OK,
+        new_events=(_next_event(ctx, actor, prov),),
+    )
+    sc = commit_step(
+        db, ctx, result,
+        message_id=trigger.event_id,
+        expected_version=trigger.stream_version,
+        table_version=trigger.table_version,
+    )
+    assert len(sc.appended_event_ids) == 1
+    assert sc.document_id is None
+    # one outbox row per appended event
+    with db.cursor() as cur:
+        cur.execute("SELECT topic FROM outbox WHERE message_id = %s", (sc.appended_event_ids[0],))
+        assert cur.fetchone()[0] == "STEP_DONE"
+        cur.execute("SELECT processed_seq FROM processed_messages WHERE message_id = %s",
+                    (trigger.event_id,))
+        assert cur.fetchone()[0] == sc.processed_seq
+
+
+def test_commit_step_inserts_document(db, seed_run_event, actor, prov) -> None:
+    trigger = seed_run_event("run_s2", type="STEP_TRIGGER")
+    ctx = _ctx(db, trigger)
+    doc = NewDocument(
+        doc_id=ctx.new_doc_id(),
+        stage="CANDIDATE_SQL",
+        schema_version=1,
+        branch_role="candidate",
+        content_hash="sha256:abc",
+        body_classification="governance-retained",
+        provenance=prov,
+    )
+    result = HandlerResult(
+        disposition=Disposition.OK,
+        new_events=(_next_event(ctx, actor, prov),),
+        document=doc,
+    )
+    sc = commit_step(
+        db, ctx, result,
+        message_id=trigger.event_id,
+        expected_version=trigger.stream_version,
+        table_version=trigger.table_version,
+    )
+    assert sc.document_id is not None
+    with db.cursor() as cur:
+        cur.execute("SELECT stage, run_id, branch_role FROM documents WHERE doc_id = %s",
+                    (sc.document_id,))
+        stage, run_id, role = cur.fetchone()
+    assert (stage, run_id, role) == ("CANDIDATE_SQL", "run_s2", "candidate")
+
+
+def test_commit_step_chains_occ_for_multiple_events(db, seed_run_event, actor, prov) -> None:
+    trigger = seed_run_event("run_s3", type="STEP_TRIGGER")
+    ctx = _ctx(db, trigger)
+    result = HandlerResult(
+        disposition=Disposition.OK,
+        new_events=(
+            _next_event(ctx, actor, prov, type="STEP_DONE"),
+            _next_event(ctx, actor, prov, type="STEP_NEXT"),
+        ),
+    )
+    sc = commit_step(
+        db, ctx, result,
+        message_id=trigger.event_id,
+        expected_version=trigger.stream_version,
+        table_version=trigger.table_version,
+    )
+    assert len(sc.appended_event_ids) == 2
+    with db.cursor() as cur:
+        cur.execute(
+            "SELECT stream_version FROM events WHERE run_id='run_s3' ORDER BY stream_version"
+        )
+        versions = [r[0] for r in cur.fetchall()]
+    assert versions == [1, 2, 3]  # trigger=1, then 2, 3
+
+
+def test_commit_step_raises_on_timers(db, seed_run_event, actor, prov) -> None:
+    trigger = seed_run_event("run_s4", type="STEP_TRIGGER")
+    ctx = _ctx(db, trigger)
+    result = HandlerResult(
+        disposition=Disposition.OK,
+        new_events=(_next_event(ctx, actor, prov),),
+        timers=(NewTimer(kind="sla", fire_at=datetime.now(timezone.utc), idempotency_key="t1"),),
+    )
+    with pytest.raises(RuntimeError):
+        commit_step(
+            db, ctx, result,
+            message_id=trigger.event_id,
+            expected_version=trigger.stream_version,
+            table_version=trigger.table_version,
+        )
+
+
+def test_commit_step_raises_on_activations(db, seed_run_event, actor, prov) -> None:
+    # Cross-aggregate activations are applied by Phase 06's commit-path extension; until then
+    # commit_step refuses them so nothing is ever silently dropped (mirrors the timers guard).
+    trigger = seed_run_event("run_s4b", type="STEP_TRIGGER")
+    ctx = _ctx(db, trigger)
+    result = HandlerResult(
+        disposition=Disposition.OK,
+        new_events=(_next_event(ctx, actor, prov),),
+        activations=(
+            NewActivation(
+                feature_id="feat_1",
+                feature_version_id="fv_1",
+                use_case="training",
+                base_feature_version_id="fv_0",
+                approval_type="auto",
+            ),
+        ),
+    )
+    with pytest.raises(RuntimeError):
+        commit_step(
+            db, ctx, result,
+            message_id=trigger.event_id,
+            expected_version=trigger.stream_version,
+            table_version=trigger.table_version,
+        )
+
+
+def test_commit_step_stale_expected_version_raises_concurrency(db, seed_run_event, actor, prov) -> None:
+    trigger = seed_run_event("run_s5", type="STEP_TRIGGER")
+    ctx = _ctx(db, trigger)
+    result = HandlerResult(
+        disposition=Disposition.OK, new_events=(_next_event(ctx, actor, prov),)
+    )
+    # expected_version 0 is stale (stream is already at version 1)
+    with pytest.raises(ConcurrencyError):
+        commit_step(
+            db, ctx, result,
+            message_id=trigger.event_id,
+            expected_version=0,
+            table_version=trigger.table_version,
+        )
+
+
+def test_commit_step_rolls_back_all_writes_when_document_insert_fails(
+    db, seed_run_event, actor, prov
+) -> None:
+    """Atomicity / no-orphan invariant (§5.1): commit_step creates the document FIRST via the
+    validated append_document path, so a rejected document (branch_role='rejected' with no
+    reject_reason -> DocumentValidationError) aborts the WHOLE step before any event is
+    appended; the per-step savepoint (as `process_one` uses it) must leave NO event, outbox row,
+    or ledger row behind."""
+    trigger = seed_run_event("run_atomic", type="STEP_TRIGGER")
+    ctx = _ctx(db, trigger)
+    bad_doc = NewDocument(
+        doc_id=ctx.new_doc_id(),
+        stage="CANDIDATE_SQL",
+        schema_version=1,
+        branch_role="rejected",          # append_document requires a reject_reason
+        content_hash="sha256:abc",
+        body_classification="governance-retained",
+        provenance=prov,
+        reject_reason=None,              # -> DocumentValidationError (DB CHECK is the backstop)
+    )
+    result = HandlerResult(
+        disposition=Disposition.OK,
+        new_events=(_next_event(ctx, actor, prov),),
+        document=bad_doc,
+    )
+    with pytest.raises(DocumentValidationError):
+        with db.transaction():           # mirrors process_one's per-step savepoint
+            commit_step(
+                db, ctx, result,
+                message_id=trigger.event_id,
+                expected_version=trigger.stream_version,
+                table_version=trigger.table_version,
+            )
+    with db.cursor() as cur:
+        cur.execute(
+            "SELECT count(*) FROM events WHERE run_id='run_atomic' AND type='STEP_DONE'"
+        )
+        assert cur.fetchone()[0] == 0    # no event written (document rejected first)
+        cur.execute("SELECT count(*) FROM outbox WHERE partition_key='run:run_atomic'")
+        assert cur.fetchone()[0] == 0    # no orphan outbox row
+        cur.execute(
+            "SELECT count(*) FROM processed_messages WHERE message_id=%s", (trigger.event_id,)
+        )
+        assert cur.fetchone()[0] == 0    # no ledger row
