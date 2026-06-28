@@ -109,6 +109,20 @@ def _mark_degraded(conn: DbConn, projection_name: str, exc: ProjectionApplyError
         )
 
 
+def rebuild_projection(conn: DbConn, projection: Projection) -> None:
+    """reset() then deterministically replay from global_seq=0 (§3.6)."""
+    projection.reset(conn)
+    _ensure_checkpoint(conn, projection.name, projection.is_analytics)
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE projection_checkpoints SET checkpoint_seq = 0, head_seq = 0, updated_at = now() "
+            "WHERE projection_name = %s",
+            (projection.name,),
+        )
+    while run_projection(conn, projection) > 0:
+        pass
+
+
 def projection_lag(conn: DbConn, name: str) -> int:
     """Live head_seq - checkpoint_seq for the named projection."""
     head = _head_seq(conn)
