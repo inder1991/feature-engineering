@@ -50,9 +50,33 @@ def run_projection(conn: DbConn, projection: Projection, *, batch: int = 500) ->
     last_seq = checkpoint
     for row in rows:
         event = row_to_event(row)
-        projection.apply(conn, event)
-        last_seq = event.global_seq
-        applied += 1
+        if projection.is_analytics:
+            try:
+                with conn.transaction():  # savepoint: discard the poison event's partial writes
+                    projection.apply(conn, event)
+            except ProjectionApplyError:
+                last_seq = event.global_seq  # fail open: record the skip and keep going
+                continue
+            last_seq = event.global_seq
+            applied += 1
+        else:
+            with conn.cursor() as cur:
+                cur.execute("SAVEPOINT proj_apply")
+            try:
+                projection.apply(conn, event)
+            except ProjectionApplyError as exc:
+                # Fail-closed (§3.6): discard ANY partial writes the apply body made before it
+                # raised (ROLLBACK TO SAVEPOINT), so no partial projection state survives; then
+                # mark the affected aggregate degraded from the carried payload in a SEPARATE
+                # statement (this marker persists), and HALT without advancing past the poison.
+                with conn.cursor() as cur:
+                    cur.execute("ROLLBACK TO SAVEPOINT proj_apply")
+                _mark_degraded(conn, projection.name, exc, event)
+                break
+            with conn.cursor() as cur:
+                cur.execute("RELEASE SAVEPOINT proj_apply")
+            last_seq = event.global_seq
+            applied += 1
 
     head = _head_seq(conn)
     with conn.cursor() as cur:
@@ -63,6 +87,26 @@ def run_projection(conn: DbConn, projection: Projection, *, batch: int = 500) ->
             (last_seq, head, projection.name),
         )
     return applied
+
+
+def _mark_degraded(conn: DbConn, projection_name: str, exc: ProjectionApplyError, event) -> None:
+    """Record the affected aggregate in the generic degraded ledger from the CARRIED
+    ProjectionApplyError payload (§3.6). Idempotent under re-runs of the same poison event."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO projection_degraded
+                (projection_name, aggregate, aggregate_id, reason, poison_event_id, poison_seq)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            ON CONFLICT (projection_name, aggregate, aggregate_id)
+            DO UPDATE SET reason = EXCLUDED.reason,
+                          poison_event_id = EXCLUDED.poison_event_id,
+                          poison_seq = EXCLUDED.poison_seq,
+                          degraded_at = now()
+            """,
+            (projection_name, exc.aggregate, exc.aggregate_id, exc.reason,
+             event.event_id, event.global_seq),
+        )
 
 
 def projection_lag(conn: DbConn, name: str) -> int:
