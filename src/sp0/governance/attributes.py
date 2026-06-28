@@ -4,6 +4,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Mapping, Optional
 
+from psycopg.types.json import Json
+
 VERIFICATION_STAMPS: tuple[str, ...] = ("DESIGN-CHECKED", "DATA-CHECKED", "USEFULNESS-CHECKED")
 APPROVAL_TYPES: tuple[str, ...] = ("EXPERIMENTAL", "PRODUCTION")
 
@@ -44,3 +46,51 @@ def validate_governance_attributes(attrs: GovernanceAttributes) -> None:
         raise GovernanceAttributeError(f"approval_type {attrs.approval_type!r} not in {APPROVAL_TYPES}")
     if attrs.max_uses is not None and attrs.max_uses <= 0:
         raise GovernanceAttributeError("max_uses must be None or a positive integer")
+
+
+def to_feature_version_row(attrs: GovernanceAttributes, *, content_hash: str) -> dict[str, object]:
+    approval = {
+        "conditions": list(attrs.conditions),
+        "expires_at": attrs.expires_at.isoformat() if attrs.expires_at else None,
+        "max_uses": attrs.max_uses,
+        "reviewed_evidence_refs": list(attrs.reviewed_evidence_refs),
+    }
+    return {
+        "feature_version_id": attrs.feature_version_id,
+        "feature_id": attrs.feature_id,
+        "produced_by_run": attrs.produced_by_run,
+        "base_feature_version_id": attrs.base_feature_version_id,
+        "verification_stamp": attrs.verification_stamp,
+        "risk_tier": attrs.risk_tier,
+        "approval_type": attrs.approval_type,
+        "approved_use_cases": list(attrs.approved_use_cases),
+        "blocked_use_cases": list(attrs.blocked_use_cases),
+        "required_artifact_refs": Json(dict(attrs.required_artifact_refs)),
+        "dsl_operation_catalog_version": attrs.dsl_operation_catalog_version,
+        "approval": Json(approval),
+        "expires_at": attrs.expires_at,
+        "content_hash": content_hash,
+        "immutable": attrs.immutable,
+    }
+
+
+def from_feature_version_row(row: Mapping[str, object]) -> GovernanceAttributes:
+    approval = dict(row.get("approval") or {})
+    return GovernanceAttributes(
+        feature_version_id=str(row["feature_version_id"]),
+        feature_id=str(row["feature_id"]),
+        produced_by_run=str(row["produced_by_run"]),
+        base_feature_version_id=row.get("base_feature_version_id") or None,  # type: ignore[arg-type]
+        verification_stamp=str(row["verification_stamp"]),
+        risk_tier=str(row["risk_tier"]),
+        approval_type=str(row["approval_type"]),
+        approved_use_cases=tuple(row.get("approved_use_cases") or ()),
+        blocked_use_cases=tuple(row.get("blocked_use_cases") or ()),
+        required_artifact_refs=dict(row.get("required_artifact_refs") or {}),
+        dsl_operation_catalog_version=row.get("dsl_operation_catalog_version") or None,  # type: ignore[arg-type]
+        conditions=tuple(approval.get("conditions") or ()),
+        expires_at=row.get("expires_at") or None,  # type: ignore[arg-type]
+        max_uses=approval.get("max_uses"),
+        reviewed_evidence_refs=tuple(approval.get("reviewed_evidence_refs") or ()),
+        immutable=bool(row["immutable"]),
+    )
