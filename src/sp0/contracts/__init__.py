@@ -1,6 +1,12 @@
 from __future__ import annotations
 
 from sp0.contracts.db import DbConn
+from sp0.contracts.documents import (
+    BODY_CLASSIFICATIONS,
+    BRANCH_ROLES,
+    STAGES,
+    Stage,
+)
 from sp0.contracts.envelopes import (
     Command,
     CommandResult,
@@ -45,6 +51,10 @@ __all__ = [
     "HandlerResult",
     "IdentityEnvelope",
     "NewDocument",
+    "Stage",
+    "STAGES",
+    "BRANCH_ROLES",
+    "BODY_CLASSIFICATIONS",
     "NewEvent",
     "NewExternalCommand",
     "NewTimer",
