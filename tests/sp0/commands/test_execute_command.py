@@ -9,10 +9,18 @@ from sp0.commands.authz_seam import (
 from tests.sp0._helpers import make_cmd
 
 
+class _AllowAll:
+    def authorize(self, conn, cmd):
+        return AuthzDecision(allowed=True)
+
+
 @pytest.fixture(autouse=True)
 def _clean_registry():
     clean_authorizer = current_authorizer()
     clear_registry()
+    # These seam/dispatch tests are not exercising authz; register an explicit allow-all so they
+    # are unaffected by the fail-safe deny-all default. Authz-specific tests override below.
+    register_command_authorizer(_AllowAll())
     yield
     clear_registry()
     register_command_authorizer(clean_authorizer)
@@ -55,6 +63,21 @@ def test_authz_denial_returns_not_accepted_and_does_not_dispatch(db):
     assert res.accepted is False
     assert res.denied_reason == "not permitted"
     assert called == []
+
+
+def test_unconfigured_default_authorizer_denies_state_mutating_command(db):
+    # Fail-safe: with NO real authorizer registered (bootstrap_phase07 not run), the factory
+    # default MUST deny every state-mutating command and never dispatch the handler.
+    from sp0.commands import authz_seam
+
+    assert isinstance(authz_seam._DEFAULT_AUTHORIZER, authz_seam._DenyAllAuthorizer)
+    called = []
+    register_command("act", lambda c, m: called.append(1))
+    register_command_authorizer(authz_seam._DenyAllAuthorizer())
+    res = execute_command(db, make_cmd("act", "run", "agg1", {}))
+    assert res.accepted is False
+    assert called == []
+    assert "no command authorizer configured" in (res.denied_reason or "")
 
 
 def test_degraded_run_is_blocked(db):

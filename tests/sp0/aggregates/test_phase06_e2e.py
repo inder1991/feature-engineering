@@ -4,18 +4,31 @@ import pytest
 from sp0.events.store import load_stream
 from sp0.commands.api import execute_command
 from sp0.commands.registry import clear_registry
+from sp0.commands.authz_seam import (
+    AuthzDecision, current_authorizer, register_command_authorizer,
+)
 from sp0.aggregates.commands import register_phase06_commands
 from sp0.aggregates._append import provenance_for
 from sp0.aggregates.feature_versions import mint_feature_version
 from tests.sp0._helpers import make_cmd, make_actor
 
 
+class _AllowAll:
+    def authorize(self, conn, cmd):
+        return AuthzDecision(allowed=True)
+
+
 @pytest.fixture(autouse=True)
 def _registered():
+    saved = current_authorizer()
     clear_registry()
     register_phase06_commands()
+    # Phase-06 e2e: not exercising §6.2 authz, so register an explicit allow-all instead of
+    # relying on the fail-safe deny-all default.
+    register_command_authorizer(_AllowAll())
     yield
     clear_registry()
+    register_command_authorizer(saved)
 
 
 def test_multi_candidate_request_flow_through_execute_command(db):
