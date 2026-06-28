@@ -25,6 +25,10 @@ where = ["src"]
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["tests"]
+# importlib mode lets test modules with the same basename coexist across packages
+# (e.g. tests/projections/test_migration.py and tests/sp0/documents/test_migration.py)
+# without requiring __init__.py shims; it is pytest's recommended mode.
+addopts = "--import-mode=importlib"
 # Hard per-test timeout so a hung/deadlocked test (e.g. concurrent DB-lock waits in
 # the optimistic-concurrency / race tasks) FAILS fast instead of hanging the runner.
 # "signal" (SIGALRM, main thread) interrupts blocked psycopg C calls, keeping any single

@@ -103,6 +103,94 @@ CREATE TABLE IF NOT EXISTS projection_degraded (
 );
 """
 
+# =========================================================================
+# Phase 02 — documents DAG: documents (write-once), stage_primary, blob_index,
+# document_type_registry. DDL verbatim from the shared contract (overview §
+# "Database schema"); the write-once trigger is owned by this phase.
+# =========================================================================
+
+# documents — immutable staged document DAG (§3.4). Write-once; no UPDATE.
+DOCUMENTS = """
+CREATE TABLE IF NOT EXISTS documents (
+    doc_id              text        PRIMARY KEY,
+    global_seq          bigint      NOT NULL DEFAULT nextval('global_seq_seq'),
+    request_id          text        NULL,
+    feature_id          text        NULL,
+    run_id              text        NULL,
+    stage               text        NOT NULL,
+    schema_version      integer     NOT NULL,
+    branch_role         text        NOT NULL CHECK (branch_role IN ('candidate','primary','rejected','repair')),
+    derived_from        text[]      NOT NULL DEFAULT '{}',
+    supersedes          text[]      NOT NULL DEFAULT '{}',
+    body_ref            text        NULL,
+    content_hash        text        NOT NULL,
+    body_classification text        NOT NULL CHECK (body_classification IN ('pii-erasable','governance-retained')),
+    actor               jsonb       NOT NULL,
+    provenance          jsonb       NOT NULL,
+    reject_reason       text        NULL,
+    created_at          timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT documents_stage_enum CHECK (stage IN (
+        'DRAFT_CONTRACT','ASSUMPTION_LEDGER','CONFIRMED_CONTRACT','MAPPED_CONTRACT',
+        'FEATURE_PLAN','CANDIDATE_SQL','VALIDATION_REPORT','SANDBOX_RESULT','DQ_REPORT',
+        'EVALUATION_REPORT','RISK_ASSESSMENT','EXPLAINABILITY','MONITORING_SPEC','APPROVAL_RECORD'
+    )),
+    CONSTRAINT documents_reject_reason_present CHECK (
+        branch_role <> 'rejected' OR reject_reason IS NOT NULL
+    )
+);
+CREATE INDEX IF NOT EXISTS documents_run_stage_idx ON documents (run_id, stage);
+CREATE INDEX IF NOT EXISTS documents_global_idx    ON documents (global_seq);
+
+-- Write-once enforcement (no UPDATE/DELETE) — installed as a row trigger by Phase 02.
+CREATE OR REPLACE FUNCTION documents_write_once() RETURNS trigger AS $$
+BEGIN
+    RAISE EXCEPTION 'documents are write-once: % not allowed on doc_id=%',
+        TG_OP, COALESCE(OLD.doc_id, NEW.doc_id);
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE TRIGGER documents_no_mutation
+    BEFORE UPDATE OR DELETE ON documents
+    FOR EACH ROW EXECUTE FUNCTION documents_write_once();
+"""
+
+# stage_primary — projection of PRIMARY_SELECTED (§3.4). Fail-closed.
+# Enforces "one live primary per (run_id, stage)"; current = highest global_seq.
+STAGE_PRIMARY = """
+CREATE TABLE IF NOT EXISTS stage_primary (
+    run_id        text        NOT NULL,
+    stage         text        NOT NULL,
+    doc_id        text        NOT NULL REFERENCES documents(doc_id),
+    selected_seq  bigint      NOT NULL,
+    selected_at   timestamptz NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS one_live_primary_per_run_stage ON stage_primary (run_id, stage);
+"""
+
+# blob_index (documents-index) — object-store index for mark-and-sweep blob GC (§5.1).
+# Schema owned here; GC mechanism built by Phase 05.
+BLOB_INDEX = """
+CREATE TABLE IF NOT EXISTS blob_index (
+    blob_id        text        PRIMARY KEY,
+    object_key     text        NOT NULL,
+    content_hash   text        NOT NULL,
+    classification text        NOT NULL CHECK (classification IN ('pii-erasable','governance-retained')),
+    kms_key_id     text        NULL,
+    referenced     boolean     NOT NULL DEFAULT false,
+    status         text        NOT NULL DEFAULT 'live'
+                       CHECK (status IN ('live','orphan','quarantined','swept','shredded')),
+    size_bytes     bigint      NULL,
+    created_at     timestamptz NOT NULL DEFAULT now(),
+    swept_at       timestamptz NULL
+);
+CREATE INDEX IF NOT EXISTS blob_index_gc_idx ON blob_index (status) WHERE status IN ('orphan','quarantined');
+"""
+
+# document_type_registry — versioned document/artifact schemas + upcasters (§3.7).
+DOCUMENT_TYPE_REGISTRY = """
+CREATE TABLE IF NOT EXISTS document_type_registry (LIKE event_type_registry INCLUDING ALL);
+"""
+
 MIGRATIONS: list[tuple[str, str]] = [
     ("0001_global_seq", GLOBAL_SEQ),
     ("0002_events", EVENTS),
@@ -111,6 +199,10 @@ MIGRATIONS: list[tuple[str, str]] = [
     ("0005_projection_checkpoints", PROJECTION_CHECKPOINTS),
     ("0006_projection_active_alias", PROJECTION_ACTIVE_ALIAS),
     ("0007_projection_degraded", PROJECTION_DEGRADED),
+    ("0008_documents", DOCUMENTS),
+    ("0009_stage_primary", STAGE_PRIMARY),
+    ("0010_blob_index", BLOB_INDEX),
+    ("0011_document_type_registry", DOCUMENT_TYPE_REGISTRY),
 ]
 
 
