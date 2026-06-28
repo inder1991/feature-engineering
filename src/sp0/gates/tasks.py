@@ -9,6 +9,7 @@ from sp0.contracts.db import DbConn
 from sp0.contracts.gates import GateTaskSpec, SignalResult
 from sp0.contracts.identity import IdentityEnvelope
 from sp0.gates.duration import parse_duration
+from sp0.identity.build import validate_identity
 from sp0.idgen import mint_id
 
 
@@ -185,6 +186,10 @@ def submit_human_signal(
     expected_task_version: int,
     on_behalf_of: str | None = None,
 ) -> SignalResult:
+    # §6.1 identity gate: even on the DIRECT call path (not routed through execute_command), an
+    # unauthenticated / unattested actor can never answer a gate. Mirrors the command-path check
+    # in authz.policy so the two paths cannot diverge (raises IdentityError on failure).
+    validate_identity(actor)
     row = conn.execute(
         """
         SELECT task_version, run_id, feature_id, gate, eligible_assignees,
@@ -317,3 +322,26 @@ def submit_human_signal(
                  task_version),
             )
     return SignalResult(task_id, new_status, counted=counted, quorum_met=quorum_met)
+
+
+def submit_human_signal_command(conn: DbConn, cmd):
+    """§4.4 command-catalog adapter for `submit_human_signal`. Registering it makes the gate-answer
+    path flow through `execute_command`, so it inherits authz (§6.2), command-idempotency, identity
+    validation and denial-routing instead of bypassing them. `cmd.args` carries `gate` (consulted by
+    authz), `task_id`, `response`, `expected_task_version` and optional `on_behalf_of`."""
+    from sp0.contracts import CommandResult
+
+    args = cmd.args
+    result = submit_human_signal(
+        conn,
+        args["task_id"],
+        response=args["response"],
+        actor=cmd.actor,
+        expected_task_version=args["expected_task_version"],
+        on_behalf_of=args.get("on_behalf_of"),
+    )
+    return CommandResult(
+        accepted=result.counted,
+        aggregate_id=cmd.aggregate_id or "",
+        produced_event_ids=(),
+    )

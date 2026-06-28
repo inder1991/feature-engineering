@@ -20,6 +20,7 @@ from sp0.aggregates.feature_lifecycle import (
     raise_monitoring_alert_command, require_revalidation_command,
     record_revalidation_outcome_command,
 )
+from sp0.gates.tasks import submit_human_signal_command
 
 _CATALOG = {
     "create_request": create_request_command,
@@ -46,6 +47,9 @@ _CATALOG = {
     "require_revalidation": require_revalidation_command,
     "record_revalidation_outcome": record_revalidation_outcome_command,
     "deactivate_expired_version": deactivate_expired_version_command,
+    # §4.4 human-gate answer path: routed through execute_command so it inherits authz/idempotency/
+    # identity-validation/denial-routing instead of being a bypassing direct call.
+    "submit_human_signal": submit_human_signal_command,
 }
 
 

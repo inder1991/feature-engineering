@@ -35,3 +35,17 @@ def bootstrap_phase06(handler_registry) -> None:
     register_phase06_event_schemas()      # idempotent (Task 3)
     register_phase06_commands()           # §4.4 catalog
     register_phase06_handlers(handler_registry)  # §5.8 activate_version handler
+
+
+def bootstrap_phase07(conn) -> None:
+    """Production wiring for §6.2 command authorization. Seeds the canonical authz-policy rows and
+    registers the concrete `PolicyAuthorizer` so `execute_command` enforces command-level authz and
+    routes denials to the tamper-evident security stream — replacing the allow-all Phase-06 default.
+    Idempotent: `seed_authz_policy` upserts, and re-registering the authorizer is a plain swap. Must
+    run AFTER `bootstrap_phase06` so the §4.4 catalog (incl. `submit_human_signal`) is registered."""
+    from sp0.authz.policy import seed_authz_policy
+    from sp0.authz.authorizer import PolicyAuthorizer
+    from sp0.commands.authz_seam import register_command_authorizer
+
+    seed_authz_policy(conn)
+    register_command_authorizer(PolicyAuthorizer())
