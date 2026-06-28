@@ -96,4 +96,9 @@ def _base_authorized(conn: DbConn, cmd: Command) -> AuthzDecision:
 
 
 def authorize_command(conn: DbConn, cmd: Command) -> AuthzDecision:
-    return _base_authorized(conn, cmd)
+    base = _base_authorized(conn, cmd)
+    if not base.allowed:
+        return base
+    from sp0.authz.sod import enforce_sod  # local import avoids module cycle
+
+    return enforce_sod(conn, cmd)
