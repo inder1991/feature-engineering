@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from sp0.contracts.db import DbConn
+from sp0.runtime.ddl import RUNTIME_CORE_DDL
 from sp0.state_machine.ddl import STATE_MACHINE_DDL
 
 GLOBAL_SEQ = """
@@ -205,6 +206,7 @@ MIGRATIONS: list[tuple[str, str]] = [
     ("0010_blob_index", BLOB_INDEX),
     ("0011_document_type_registry", DOCUMENT_TYPE_REGISTRY),
     ("0030_state_machine", STATE_MACHINE_DDL),  # <-- Phase 03 (added)
+    ("0040_runtime_core", RUNTIME_CORE_DDL),  # <-- Phase 04 (added)
 ]
 
 
