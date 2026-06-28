@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from decimal import Decimal
+from typing import Optional
+
 import pytest
 
 from sp0.contracts import IdentityEnvelope, NewEvent, ProvenanceEnvelope
@@ -86,3 +89,66 @@ def seed_run_event(db, actor, prov):
         )
 
     return _seed
+
+
+@pytest.fixture
+def insert_stub_event():
+    """Insert a minimal, schema-valid row into the Phase 01 `events` table (run stream)."""
+
+    def _insert(conn, *, event_id: str, run_id: str, type: str, stream_version: int) -> None:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO events (event_id, aggregate, aggregate_id, stream_version, run_id,
+                                    type, schema_version, table_version, actor, payload,
+                                    provenance, occurred_at)
+                VALUES (%s, 'run', %s, %s, %s, %s, 1, 1,
+                        '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, now())
+                """,
+                (event_id, run_id, stream_version, run_id, type),
+            )
+
+    return _insert
+
+
+@pytest.fixture
+def insert_run_state():
+    """Insert a row into the Phase 01 `run_workflow_state` projection."""
+
+    def _insert(
+        conn, *, run_id: str, request_id: str,
+        cost: Decimal = Decimal("0"), candidates: int = 0,
+    ) -> None:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO run_workflow_state (run_id, request_id, current_state, table_version,
+                                                cost_units, candidates_explored)
+                VALUES (%s, %s, 'AWAITING', 1, %s, %s)
+                """,
+                (run_id, request_id, cost, candidates),
+            )
+
+    return _insert
+
+
+@pytest.fixture
+def insert_stub_document():
+    """Insert a minimal committed row into the Phase 02 `documents` table referencing a blob."""
+
+    def _insert(
+        conn, *, doc_id: str, body_ref: Optional[str],
+        classification: str = "governance-retained",
+    ) -> None:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO documents (doc_id, stage, schema_version, branch_role, body_ref,
+                                       content_hash, body_classification, actor, provenance)
+                VALUES (%s, 'FEATURE_PLAN', 1, 'candidate', %s,
+                        'sha256:stub', %s, '{}'::jsonb, '{}'::jsonb)
+                """,
+                (doc_id, body_ref, classification),
+            )
+
+    return _insert

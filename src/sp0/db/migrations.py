@@ -1,8 +1,15 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 from sp0.contracts.db import DbConn
 from sp0.runtime.ddl import RUNTIME_CORE_DDL
 from sp0.state_machine.ddl import STATE_MACHINE_DDL
+
+# Phase 05+ migrations are authored as .sql files under db/migrations/ and applied in
+# lexical order AFTER the core Python DDL above. Their 05xx_ prefix sorts them after the
+# core tables (events, documents, runtime, ...) they reference.
+_SQL_MIGRATIONS_DIR = Path(__file__).resolve().parent / "migrations"
 
 GLOBAL_SEQ = """
 CREATE SEQUENCE IF NOT EXISTS global_seq_seq AS bigint
@@ -210,9 +217,21 @@ MIGRATIONS: list[tuple[str, str]] = [
 ]
 
 
+def _sql_file_migrations() -> list[tuple[str, str]]:
+    """Load db/migrations/*.sql in lexical order (Phase 05+ file-based migrations)."""
+    if not _SQL_MIGRATIONS_DIR.is_dir():
+        return []
+    return [
+        (path.stem, path.read_text(encoding="utf-8"))
+        for path in sorted(_SQL_MIGRATIONS_DIR.glob("*.sql"))
+    ]
+
+
 def apply_migrations(conn: DbConn) -> None:
-    """Create all Phase 01 DDL objects (idempotent)."""
+    """Create all DDL objects (idempotent): core Python DDL then file-based 05xx_ SQL."""
     with conn.cursor() as cur:
         for _name, sql in MIGRATIONS:
+            cur.execute(sql)
+        for _name, sql in _sql_file_migrations():
             cur.execute(sql)
     conn.commit()
