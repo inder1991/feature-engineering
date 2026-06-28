@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import datetime as _dt
 
+from psycopg.errors import UniqueViolation
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 from ulid import ULID
 
-from sp0.contracts import DbConn, EventEnvelope, NewEvent
+from sp0.contracts import ConcurrencyError, DbConn, EventEnvelope, NewEvent
 from sp0.events.registry import event_registry
 from sp0.events.serde import identity_to_jsonb, provenance_to_jsonb
 
@@ -31,12 +32,29 @@ def append_event(
     expected_version: int,
     table_version: int,
 ) -> EventEnvelope:
-    """Append one event inside the caller's OPEN transaction (§5.1). Allocates global_seq +
-    event_id and sets stream_version = expected_version + 1. (OCC conflict handling is added
-    in Task 10.) Validates payload against the registry before insert."""
+    """Append one event inside the caller's OPEN transaction (§5.1). Sets
+    stream_version = expected_version + 1. Raises ConcurrencyError if the stream is not exactly
+    at expected_version (stale OR ahead-of-head), and maps a lost UNIQUE race to ConcurrencyError
+    via a savepoint so the caller's transaction stays usable. Validates payload first."""
     registry = event_registry()
     registry.assert_writable(new_event.type, new_event.schema_version)
     registry.validate(new_event.type, new_event.schema_version, new_event.payload)
+
+    # OCC pre-check: the stream must currently be EXACTLY at expected_version. This rejects
+    # both stale (current > expected) and ahead-of-head (current < expected, gap) without
+    # touching the connection's transaction state.
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            "SELECT coalesce(max(stream_version), 0) AS v FROM events "
+            "WHERE aggregate = %s AND aggregate_id = %s",
+            (new_event.aggregate, new_event.aggregate_id),
+        )
+        current = cur.fetchone()["v"]
+    if current != expected_version:
+        raise ConcurrencyError(
+            f"{new_event.aggregate}:{new_event.aggregate_id} at stream_version {current}, "
+            f"expected {expected_version}"
+        )
 
     event_id = f"evt_{ULID()}"
     stream_version = expected_version + 1
@@ -59,9 +77,18 @@ def append_event(
         "caused_by": new_event.caused_by,
         "occurred_at": occurred_at,
     }
-    with conn.cursor(row_factory=dict_row) as cur:
-        cur.execute(_INSERT, params)
-        row = cur.fetchone()
+    try:
+        with conn.transaction():  # savepoint: a concurrent racer that wins the UNIQUE keeps
+            with conn.cursor(row_factory=dict_row) as cur:  # THIS connection usable
+                cur.execute(_INSERT, params)
+                row = cur.fetchone()
+    except UniqueViolation as exc:
+        if "events_optimistic_concurrency" in str(exc):
+            raise ConcurrencyError(
+                f"{new_event.aggregate}:{new_event.aggregate_id} lost a concurrent append at "
+                f"expected_version {expected_version}"
+            ) from exc
+        raise
 
     return EventEnvelope(
         event_id=event_id,
