@@ -10,6 +10,7 @@ from sp0.contracts import (
     NewActivation,
     NewDocument,
     NewEvent,
+    NewExternalCommand,
     NewTimer,
 )
 from datetime import datetime, timezone
@@ -116,21 +117,91 @@ def test_commit_step_chains_occ_for_multiple_events(db, seed_run_event, actor, p
     assert versions == [1, 2, 3]  # trigger=1, then 2, 3
 
 
-def test_commit_step_raises_on_timers(db, seed_run_event, actor, prov) -> None:
+def test_commit_step_persists_timers_and_external_commands_atomically(
+    db, seed_run_event, actor, prov
+) -> None:
+    """§5.1/§5.4/§5.5: a handler that returns BOTH a NewTimer and a NewExternalCommand has
+    each persisted in the SAME step transaction as its events (replacing the old Phase-04
+    guard that raised)."""
     trigger = seed_run_event("run_s4", type="STEP_TRIGGER")
     ctx = _ctx(db, trigger)
     result = HandlerResult(
         disposition=Disposition.OK,
         new_events=(_next_event(ctx, actor, prov),),
         timers=(NewTimer(kind="sla", fire_at=datetime.now(timezone.utc), idempotency_key="t1"),),
+        external_commands=(
+            NewExternalCommand(
+                integration="metadata_write",
+                idempotency_key="x1",
+                request_payload={"k": "v"},
+                expected_run_id="run_s4",
+            ),
+        ),
     )
-    with pytest.raises(RuntimeError):
-        commit_step(
-            db, ctx, result,
-            message_id=trigger.event_id,
-            expected_version=trigger.stream_version,
-            table_version=trigger.table_version,
+    sc = commit_step(
+        db, ctx, result,
+        message_id=trigger.event_id,
+        expected_version=trigger.stream_version,
+        table_version=trigger.table_version,
+    )
+    assert len(sc.appended_event_ids) == 1
+    assert len(sc.timer_ids) == 1
+    assert len(sc.external_command_ids) == 1
+    with db.cursor() as cur:
+        cur.execute(
+            "SELECT status, kind FROM timers WHERE timer_id = %s", (sc.timer_ids[0],)
         )
+        assert cur.fetchone() == ("scheduled", "sla")
+        cur.execute(
+            "SELECT status, integration FROM external_commands WHERE command_id = %s",
+            (sc.external_command_ids[0],),
+        )
+        assert cur.fetchone() == ("pending", "metadata_write")
+
+
+def test_commit_step_rolls_back_timers_and_external_commands_on_abort(
+    db, seed_run_event, actor, prov
+) -> None:
+    """The timer + external-command rows live in the caller's step transaction, so an abort
+    (e.g. an OCC rollback in process_one's per-step savepoint) discards them together with the
+    step's events — no orphan timer or pending side effect survives a rolled-back step."""
+    trigger = seed_run_event("run_s4r", type="STEP_TRIGGER")
+    ctx = _ctx(db, trigger)
+    result = HandlerResult(
+        disposition=Disposition.OK,
+        new_events=(_next_event(ctx, actor, prov),),
+        timers=(NewTimer(kind="sla", fire_at=datetime.now(timezone.utc), idempotency_key="t2"),),
+        external_commands=(
+            NewExternalCommand(
+                integration="metadata_write",
+                idempotency_key="x2",
+                request_payload={"k": "v"},
+            ),
+        ),
+    )
+
+    class _Abort(Exception):
+        pass
+
+    with pytest.raises(_Abort):
+        with db.transaction():  # mirrors process_one's per-step savepoint
+            commit_step(
+                db, ctx, result,
+                message_id=trigger.event_id,
+                expected_version=trigger.stream_version,
+                table_version=trigger.table_version,
+            )
+            raise _Abort  # force the whole step tx to roll back AFTER the writes
+
+    with db.cursor() as cur:
+        cur.execute("SELECT count(*) FROM timers WHERE idempotency_key = 't2'")
+        assert cur.fetchone()[0] == 0
+        cur.execute("SELECT count(*) FROM external_commands WHERE idempotency_key = 'x2'")
+        assert cur.fetchone()[0] == 0
+        cur.execute(
+            "SELECT count(*) FROM events WHERE run_id='run_s4r' AND type='STEP_DONE'"
+        )
+        assert cur.fetchone()[0] == 0
 
 
 def test_commit_step_applies_activations(db, seed_run_event, actor, prov) -> None:

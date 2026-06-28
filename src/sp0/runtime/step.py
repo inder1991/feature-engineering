@@ -9,8 +9,10 @@ import psycopg
 from sp0.contracts import HandlerContext, HandlerResult, NewDocument, NewEvent
 from sp0.documents.store import append_document
 from sp0.events.store import append_event
+from sp0.runtime.external_commands import record_external_command
 from sp0.runtime.ledger import record_processed
 from sp0.runtime.outbox import insert_outbox_message, outbox_messages_for_events
+from sp0.runtime.timers import schedule_timer
 
 
 @dataclass(frozen=True, slots=True)
@@ -20,6 +22,8 @@ class StepCommit:
     document_id: str | None
     outbox_message_ids: tuple[str, ...]
     processed_seq: int
+    timer_ids: tuple[str, ...] = ()
+    external_command_ids: tuple[str, ...] = ()
 
 
 def gen_id(prefix: str) -> str:
@@ -104,12 +108,6 @@ def commit_step(
     (via Phase 02's validated append_document, so its DAG/structural checks run and any emitted
     event can reference it), validate the events' new-document references, append the events
     (chained OCC), write one outbox row per event, and record the ledger row."""
-    if result.timers or result.external_commands:
-        raise RuntimeError(
-            "commit_step: timers/external_commands persistence is added by Phase 05 "
-            "(§5.4/§5.5); not supported in Phase 04"
-        )
-
     te = ctx.triggering_event
 
     # Document FIRST: append_document runs DAG/acyclicity/supersedes/derived_from/
@@ -133,6 +131,21 @@ def commit_step(
         )
         appended.append(env)
         version = env.stream_version
+
+    # §5.5: persist declared durable timers in the SAME step tx (idempotent on idempotency_key).
+    timer_ids: list[str] = []
+    for timer in result.timers:
+        timer_ids.append(
+            schedule_timer(conn, te.aggregate, te.aggregate_id, timer)
+        )
+
+    # §5.4: record declared external side effects in the SAME step tx (status='pending',
+    # idempotent on idempotency_key) so a dispatcher can later execute them at-least-once.
+    external_command_ids: list[str] = []
+    for cmd in result.external_commands:
+        external_command_ids.append(
+            record_external_command(conn, cmd, command_id=gen_id("cmd"), run_id=ctx.run_id)
+        )
 
     outbox_ids: list[str] = []
     for msg in outbox_messages_for_events(appended):
@@ -162,4 +175,6 @@ def commit_step(
         document_id=document_id,
         outbox_message_ids=tuple(outbox_ids),
         processed_seq=processed_seq,
+        timer_ids=tuple(timer_ids),
+        external_command_ids=tuple(external_command_ids),
     )
