@@ -1,4 +1,4 @@
-CREATE TABLE timers (
+CREATE TABLE IF NOT EXISTS timers (
     timer_id          text        PRIMARY KEY,
     idempotency_key   text        NOT NULL UNIQUE,
     aggregate         text        NOT NULL,
@@ -17,5 +17,5 @@ CREATE TABLE timers (
     payload           jsonb       NOT NULL DEFAULT '{}',
     created_at        timestamptz NOT NULL DEFAULT now()
 );
-CREATE INDEX timers_due_idx  ON timers (fire_at) WHERE status = 'scheduled';
-CREATE INDEX timers_task_idx ON timers (task_id) WHERE task_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS timers_due_idx  ON timers (fire_at) WHERE status = 'scheduled';
+CREATE INDEX IF NOT EXISTS timers_task_idx ON timers (task_id) WHERE task_id IS NOT NULL;

@@ -1,4 +1,4 @@
-CREATE TABLE external_commands (
+CREATE TABLE IF NOT EXISTS external_commands (
     command_id              text        PRIMARY KEY,
     idempotency_key         text        NOT NULL UNIQUE,
     run_id                  text        NULL,
@@ -19,5 +19,5 @@ CREATE TABLE external_commands (
     completed_at            timestamptz NULL,
     created_at              timestamptz NOT NULL DEFAULT now()
 );
-CREATE INDEX external_commands_status_idx ON external_commands (status, created_at);
-CREATE INDEX external_commands_run_idx    ON external_commands (run_id) WHERE run_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS external_commands_status_idx ON external_commands (status, created_at);
+CREATE INDEX IF NOT EXISTS external_commands_run_idx    ON external_commands (run_id) WHERE run_id IS NOT NULL;

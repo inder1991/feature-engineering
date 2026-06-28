@@ -4,6 +4,8 @@ import jsonschema
 import pytest
 
 from sp0.aggregates.events import EVENT_SCHEMAS, register_phase06_event_types
+from sp0.contracts import SchemaValidationError
+from sp0.events.registry import EventSchemaRegistry
 
 
 class _RecordingRegistry:
@@ -39,3 +41,22 @@ def test_sample_payload_validates_and_missing_required_fails():
     )
     with pytest.raises(jsonschema.ValidationError):
         jsonschema.validate({"feature_id": "feat_1"}, schema)
+
+
+def test_registry_rejects_bogus_enum_state_and_extra_fields():
+    reg = EventSchemaRegistry()
+    register_phase06_event_types(reg)
+    good = {"feature_id": "feat_1", "feature_version_id": "fv_1",
+            "use_case": "fraud", "activation_state": "PRODUCTION"}
+    reg.validate("VERSION_ACTIVATED", 1, good)
+    # bogus activation_state enum value is rejected
+    with pytest.raises(SchemaValidationError):
+        reg.validate("VERSION_ACTIVATED", 1, {**good, "activation_state": "TOTALLY_BOGUS"})
+    # bogus consumer_kind enum value is rejected
+    with pytest.raises(SchemaValidationError):
+        reg.validate("CONSUMER_REGISTERED", 1, {
+            "feature_id": "feat_1", "consumer_id": "con_1",
+            "consumer_kind": "spaceship", "consumer_ref": "m1"})
+    # unexpected extra field is rejected (additionalProperties: false)
+    with pytest.raises(SchemaValidationError):
+        reg.validate("VERSION_ACTIVATED", 1, {**good, "surprise": "x"})

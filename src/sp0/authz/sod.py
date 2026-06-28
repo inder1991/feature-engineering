@@ -40,7 +40,7 @@ def gather_gate_responders(
 ) -> set[str]:
     rows = conn.execute(
         """
-        SELECT r.subject
+        SELECT coalesce(r.on_behalf_of, r.subject)
           FROM human_task_responses r
           JOIN human_tasks t ON t.task_id = r.task_id
          WHERE t.gate = %s

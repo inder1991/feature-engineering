@@ -8,7 +8,7 @@ RUNTIME_CORE_DDL = """
 -- Phase 04: durable runtime I — transactional outbox, worker queue, idempotency ledger.
 
 -- outbox — transactional outbox + leased relay (§5.2). Partitioned by aggregate key.
-CREATE TABLE outbox (
+CREATE TABLE IF NOT EXISTS outbox (
     id               bigserial   PRIMARY KEY,
     message_id       text        NOT NULL UNIQUE,                 -- consumer idempotency key
     partition_key    text        NOT NULL,                        -- 'run:...' | 'feature:...' | 'request:...'
@@ -26,11 +26,11 @@ CREATE TABLE outbox (
     created_at       timestamptz NOT NULL DEFAULT now(),
     sent_at          timestamptz NULL
 );
-CREATE INDEX outbox_dispatch_idx  ON outbox (status, next_attempt_at) WHERE status IN ('pending','leased');
-CREATE INDEX outbox_partition_idx ON outbox (partition_key, id);
+CREATE INDEX IF NOT EXISTS outbox_dispatch_idx  ON outbox (status, next_attempt_at) WHERE status IN ('pending','leased');
+CREATE INDEX IF NOT EXISTS outbox_partition_idx ON outbox (partition_key, id);
 
 -- queue — worker queue, claimed via SELECT ... FOR UPDATE SKIP LOCKED (§5.2).
-CREATE TABLE queue (
+CREATE TABLE IF NOT EXISTS queue (
     id               bigserial   PRIMARY KEY,
     message_id       text        NOT NULL UNIQUE,                 -- idempotency
     partition_key    text        NOT NULL,                        -- aggregate key
@@ -47,9 +47,9 @@ CREATE TABLE queue (
     last_error       text        NULL,
     created_at       timestamptz NOT NULL DEFAULT now()
 );
-CREATE INDEX queue_claim_idx ON queue (priority, available_at, id) WHERE status = 'ready';
+CREATE INDEX IF NOT EXISTS queue_claim_idx ON queue (priority, available_at, id) WHERE status = 'ready';
 -- per-aggregate serialization: only one in-flight lease per partition
-CREATE UNIQUE INDEX queue_one_inflight_per_partition ON queue (partition_key) WHERE status = 'leased';
+CREATE UNIQUE INDEX IF NOT EXISTS queue_one_inflight_per_partition ON queue (partition_key) WHERE status = 'leased';
 -- Worker claim pattern:
 --   SELECT * FROM queue
 --    WHERE status='ready' AND available_at <= now()
@@ -58,7 +58,7 @@ CREATE UNIQUE INDEX queue_one_inflight_per_partition ON queue (partition_key) WH
 --    FOR UPDATE SKIP LOCKED LIMIT 1;
 
 -- processed_messages — idempotency ledger (§5.3). Pruned by global_seq watermark.
-CREATE TABLE processed_messages (
+CREATE TABLE IF NOT EXISTS processed_messages (
     message_id      text        PRIMARY KEY,
     aggregate       text        NOT NULL,
     aggregate_id    text        NOT NULL,
@@ -66,5 +66,5 @@ CREATE TABLE processed_messages (
     processed_seq   bigint      NOT NULL,                         -- global_seq at processing time
     processed_at    timestamptz NOT NULL DEFAULT now()
 );
-CREATE INDEX processed_messages_prune_idx ON processed_messages (processed_seq);
+CREATE INDEX IF NOT EXISTS processed_messages_prune_idx ON processed_messages (processed_seq);
 """

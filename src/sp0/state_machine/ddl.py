@@ -4,7 +4,7 @@ from __future__ import annotations
 # Each row is one transition; aggregates pin a table_version. Registered into
 # Phase 01's MIGRATIONS list by editing src/sp0/db/migrations.py (see below).
 STATE_MACHINE_DDL = """
-CREATE TABLE run_transition_table (
+CREATE TABLE IF NOT EXISTS run_transition_table (
     table_version integer     NOT NULL,
     from_state    text        NOT NULL,
     to_state      text        NOT NULL,
@@ -16,5 +16,5 @@ CREATE TABLE run_transition_table (
     on_guard_fail jsonb       NULL,                               -- {"to":..., "emits":"GUARD_FAILED"}
     PRIMARY KEY (table_version, from_state, trigger, precedence)
 );
-CREATE TABLE feature_lifecycle_table (LIKE run_transition_table INCLUDING ALL);
+CREATE TABLE IF NOT EXISTS feature_lifecycle_table (LIKE run_transition_table INCLUDING ALL);
 """

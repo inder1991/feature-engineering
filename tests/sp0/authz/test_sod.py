@@ -54,6 +54,40 @@ def test_resolvers(db):
     assert gather_gate_responders(db, "INDEPENDENT_VALIDATION", run_id="run_1") == {"user:val"}
 
 
+def test_delegated_validator_is_counted_in_three_party(db):
+    """A validator who answers INDEPENDENT_VALIDATION via a delegate (on_behalf_of) must be
+    counted under the EFFECTIVE authority (coalesce(on_behalf_of, subject)), so the same person
+    cannot then grant FINAL_APPROVAL. Before the fix, gather_gate_responders keyed on r.subject
+    (the delegate) and missed the validator authority entirely."""
+    seed_authz_policy(db)
+    _seed_run(db, "run_1", "user:author")
+    db.execute(
+        """
+        INSERT INTO human_tasks (task_id, run_id, gate, eligible_assignees, allowed_responses)
+        VALUES ('task_iv', %s, 'INDEPENDENT_VALIDATION', '{"role":"validator"}'::jsonb,
+                '{validate}')
+        """,
+        ("run_1",),
+    )
+    db.execute(
+        "INSERT INTO human_task_responses (task_id, subject, on_behalf_of, response, answered_seq)"
+        " VALUES ('task_iv', %s, %s, 'validate', 1)",
+        ("user:delegate", "user:val"),
+    )
+    # The effective validator (the authority), not the delegate, is the counted responder.
+    assert gather_gate_responders(db, "INDEPENDENT_VALIDATION", run_id="run_1") == {"user:val"}
+
+    val_as_approver = build_human_identity(subject="user:val", role_claims=["approver"])
+    cmd = Command(
+        action="submit_human_signal", aggregate="run", aggregate_id="run_1",
+        args={"gate": "FINAL_APPROVAL", "task_id": "task_fa"},
+        actor=val_as_approver, idempotency_key="i_deleg",
+    )
+    decision = authorize_command(db, cmd)
+    assert decision.allowed is False
+    assert "validator" in decision.reason
+
+
 def test_final_approval_blocks_requester_self_approval(db):
     seed_authz_policy(db)
     _seed_run(db, "run_1", "user:author")
