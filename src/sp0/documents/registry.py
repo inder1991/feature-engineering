@@ -76,6 +76,55 @@ class DocumentSchemaRegistry:
                 f"{type_name}@v{schema_version}: {exc.message}"
             ) from exc
 
+    def assert_writable(self, type_name: str, schema_version: int) -> None:
+        """Block NEW writes at a non-active version (§3.3): `deprecated` => no new
+        writes; `withdrawn` => upcast-only. Deprecated/withdrawn versions stay
+        READABLE via validate()/upcast() for in-flight docs. Producers call this
+        before writing a new document body at (type_name, schema_version)."""
+        row = self._conn.execute(
+            "SELECT status FROM document_type_registry "
+            "WHERE type_name=%s AND schema_version=%s",
+            (type_name, schema_version),
+        ).fetchone()
+        if row is None:
+            raise SchemaValidationError(f"unregistered type {type_name}@v{schema_version}")
+        if row[0] != "active":
+            raise SchemaValidationError(
+                f"{type_name}@v{schema_version} is {row[0]}: no new writes "
+                f"(deprecated => no new writes; withdrawn => upcast-only) (§3.3)"
+            )
+
+    def snapshot_version(self) -> str:
+        """Pinnable doc-registry snapshot id ('docs@vN') recorded in provenance for
+        replay determinism (§3.3/§8). `contents` is exactly {type_name:
+        max_active_version} (matches the shared-contract DDL — no extra keys).
+        Idempotent: an unchanged active set returns the existing snapshot id."""
+        contents = self._active_max_versions()
+        existing = self._conn.execute(
+            "SELECT snapshot_id FROM registry_snapshots "
+            "WHERE registry='docs' AND contents = %s",
+            (Jsonb(contents),),
+        ).fetchone()
+        if existing:
+            return existing[0]
+        n = self._conn.execute(
+            "SELECT count(*) FROM registry_snapshots WHERE registry='docs'"
+        ).fetchone()[0] + 1
+        snapshot_id = f"docs@v{n}"
+        self._conn.execute(
+            "INSERT INTO registry_snapshots (snapshot_id, registry, contents) "
+            "VALUES (%s, 'docs', %s)",
+            (snapshot_id, Jsonb(contents)),
+        )
+        return snapshot_id
+
+    def _active_max_versions(self) -> dict[str, int]:
+        rows = self._conn.execute(
+            "SELECT type_name, max(schema_version) FROM document_type_registry "
+            "WHERE status='active' GROUP BY type_name"
+        ).fetchall()
+        return {name: ver for name, ver in rows}
+
     def _load_schema(self, type_name: str, schema_version: int) -> dict[str, Any]:
         row = self._conn.execute(
             "SELECT json_schema FROM document_type_registry "
