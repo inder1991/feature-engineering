@@ -43,3 +43,47 @@ def test_provenance_envelope_resolves_to_one_class_across_import_paths():
     from sp0.contracts.provenance import ProvenanceEnvelope as P_mod
 
     assert P_pkg is P_env is P_mod
+
+
+from sp0.governance.provenance import ProvenanceError, build_provenance, validate_provenance
+
+
+def test_build_provenance_folds_named_tool_versions():
+    prov = build_provenance(
+        artifact_type="EVALUATION_REPORT",
+        schema_version=2,
+        producing_component="sp6-eval@2.0.0",
+        llm_model="m@1",
+        prompt_version="p@3",
+        validator="iv@1",
+        compiler="dsl@9",
+        event_registry_snapshot="events@v37",
+        doc_registry_snapshot="docs@v11",
+        random_seed=7,
+        candidates_explored_count=5,
+        external_refs=("sandbox_run:job_9",),
+    )
+    assert prov.tool_versions == {
+        "llm_model": "m@1", "prompt_version": "p@3", "validator": "iv@1", "compiler": "dsl@9",
+    }
+    assert prov.candidates_explored_count == 5
+    validate_provenance(prov)  # well-formed => no raise
+
+
+def test_validate_provenance_requires_component_and_positive_schema_version():
+    with pytest.raises(ProvenanceError):
+        validate_provenance(ProvenanceEnvelope(artifact_type="X", schema_version=1, producing_component=""))
+    with pytest.raises(ProvenanceError):
+        validate_provenance(ProvenanceEnvelope(artifact_type="X", schema_version=0, producing_component="c"))
+
+
+def test_validate_provenance_rejects_inline_external_refs_and_missing_replay_pins():
+    inline = ProvenanceEnvelope(
+        artifact_type="X", schema_version=1, producing_component="c",
+        external_refs=("this is a raw inline body, not a ref",),
+    )
+    with pytest.raises(ProvenanceError):
+        validate_provenance(inline)
+    no_pins = ProvenanceEnvelope(artifact_type="X", schema_version=1, producing_component="c")
+    with pytest.raises(ProvenanceError):
+        validate_provenance(no_pins, require_replay_pins=True)
