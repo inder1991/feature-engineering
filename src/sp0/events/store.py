@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import datetime as _dt
+from dataclasses import replace
+from typing import Mapping, Optional
 
 from psycopg.errors import UniqueViolation
 from psycopg.rows import dict_row
@@ -9,7 +11,7 @@ from ulid import ULID
 
 from sp0.contracts import ConcurrencyError, DbConn, EventEnvelope, NewEvent
 from sp0.events.registry import event_registry
-from sp0.events.serde import identity_to_jsonb, provenance_to_jsonb
+from sp0.events.serde import identity_to_jsonb, provenance_to_jsonb, row_to_event
 
 _INSERT = """
 INSERT INTO events (
@@ -109,3 +111,42 @@ def append_event(
         run_id=new_event.run_id,
         caused_by=new_event.caused_by,
     )
+
+
+def load_stream(
+    conn: DbConn,
+    aggregate: str,
+    aggregate_id: str,
+    *,
+    upto_seq: Optional[int] = None,
+    expected: Optional[Mapping[str, int]] = None,
+) -> list[EventEnvelope]:
+    """Load one aggregate instance's stream in stream_version order, upcasting each event
+    to the consumer's expected schema_version via the registry (§3.3)."""
+    sql = (
+        "SELECT * FROM events "
+        "WHERE aggregate = %(aggregate)s AND aggregate_id = %(aggregate_id)s"
+    )
+    params: dict[str, object] = {"aggregate": aggregate, "aggregate_id": aggregate_id}
+    if upto_seq is not None:
+        sql += " AND global_seq <= %(upto_seq)s"
+        params["upto_seq"] = upto_seq
+    sql += " ORDER BY stream_version ASC"
+
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(sql, params)
+        rows = cur.fetchall()
+
+    registry = event_registry()
+    out: list[EventEnvelope] = []
+    for row in rows:
+        event = row_to_event(row)
+        if expected and event.type in expected:
+            target = expected[event.type]
+            if target != event.schema_version:
+                upcast_payload = registry.upcast(
+                    event.type, event.payload, event.schema_version, target
+                )
+                event = replace(event, payload=dict(upcast_payload), schema_version=target)
+        out.append(event)
+    return out
