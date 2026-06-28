@@ -47,6 +47,28 @@ def test_create_run_links_request(db):
     assert set(added) == {r1.aggregate_id, r2.aggregate_id}
 
 
+def test_create_run_under_nonexistent_request_rejected(db):
+    res = create_run_command(
+        db, make_cmd("create_run", "request", "req_does_not_exist",
+                     {"request_id": "req_does_not_exist"}))
+    assert not res.accepted
+    assert res.produced_event_ids == ()
+    assert load_stream(db, "request", "req_does_not_exist") == []
+
+
+def test_select_candidate_rejects_non_candidate_run(db):
+    req = _open_request(db)
+    create_run_command(db, make_cmd("create_run", "request", req, {"request_id": req}))
+    before = [e.type for e in load_stream(db, "request", req)]
+    res = select_candidate_command(
+        db, make_cmd("select_candidate", "request", req,
+                     {"selections": ({"run_id": "run_not_a_candidate"},)}))
+    assert not res.accepted
+    assert res.produced_event_ids == ()
+    # no new events were appended to the request stream
+    assert [e.type for e in load_stream(db, "request", req)] == before
+
+
 def test_duplicate_of_links_existing_feature(db):
     req = _open_request(db)
     res = duplicate_of_command(
