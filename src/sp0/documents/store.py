@@ -7,7 +7,12 @@ from typing import Any, Optional
 from psycopg.types.json import Jsonb
 
 from sp0.contracts import DbConn, IdentityEnvelope
-from sp0.contracts.documents import NewDocument
+from sp0.contracts.documents import (
+    BODY_CLASSIFICATIONS,
+    BRANCH_ROLES,
+    STAGES,
+    NewDocument,
+)
 
 _GET_COLUMNS = (
     "doc_id", "global_seq", "request_id", "feature_id", "run_id", "stage",
@@ -18,6 +23,25 @@ _GET_COLUMNS = (
 
 class DagViolationError(Exception):
     """Raised when derived_from/supersedes references a doc that is not already committed."""
+
+
+class DocumentValidationError(Exception):
+    """Raised when a NewDocument violates a structural invariant before insert."""
+
+
+def _validate_structure(new_document: NewDocument) -> None:
+    if new_document.stage not in STAGES:
+        raise DocumentValidationError(f"unknown stage: {new_document.stage!r}")
+    if new_document.branch_role not in BRANCH_ROLES:
+        raise DocumentValidationError(
+            f"unknown branch_role: {new_document.branch_role!r}"
+        )
+    if new_document.body_classification not in BODY_CLASSIFICATIONS:
+        raise DocumentValidationError(
+            f"unknown body_classification: {new_document.body_classification!r}"
+        )
+    if new_document.branch_role == "rejected" and not new_document.reject_reason:
+        raise DocumentValidationError("branch_role='rejected' requires reject_reason")
 
 
 def compute_content_hash(body: bytes) -> str:
@@ -57,7 +81,10 @@ def append_document(
     Uses the CALLER-SUPPLIED new_document.doc_id (minted via HandlerContext.new_doc_id())
     so events emitted in the same step can reference it; this is the single validated write
     path — runtime handlers MUST go through here, never a raw INSERT. The body is
-    opaque-by-reference (body_ref + content_hash); structural validation is added in Task 5."""
+    opaque-by-reference (body_ref + content_hash); structural invariants (stage/branch_role/
+    body_classification vocab + reject_reason) are validated up front, with the DB CHECKs as
+    the backstop."""
+    _validate_structure(new_document)
     _validate_dag(conn, new_document)
     doc_id = new_document.doc_id
     conn.execute(
