@@ -42,6 +42,32 @@ def _register_runtime_test_event_types(_reset_registry):
             registry.validate(type_name, 1, {})  # re-raises if NOT actually registered
 
 
+class _RecordingDeleter:
+    def __init__(self):
+        self.deleted = []
+
+    def delete(self, object_key):
+        self.deleted.append(object_key)
+
+
+class _RecordingAudit:
+    def __init__(self):
+        self.reports = []
+
+    def record(self, report):
+        self.reports.append(report)
+
+
+@pytest.fixture
+def recording_deleter():
+    return _RecordingDeleter()
+
+
+@pytest.fixture
+def recording_audit():
+    return _RecordingAudit()
+
+
 class _RecordingCaller:
     integration = "llm"
 
