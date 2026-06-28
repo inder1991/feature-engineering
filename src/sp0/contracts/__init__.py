@@ -22,9 +22,9 @@ from sp0.contracts.envelopes import (
     NewEvent,
     NewExternalCommand,
     NewTimer,
-    ProvenanceEnvelope,
     SignalResult,
 )
+from sp0.contracts.provenance import ProvenanceEnvelope
 from sp0.contracts.errors import (
     ConcurrencyError,
     ProjectionApplyError,
