@@ -58,12 +58,13 @@ def test_concurrent_appends_keep_single_chain(db):
     # Two genuinely concurrent committers must NOT fork the tamper-evident chain
     # (no two genesis rows; the second must chain off the first). The advisory xact
     # lock in record_security_event serializes them.
-    import os
     import threading
 
     import psycopg
 
-    dsn = os.environ.get("SP0_TEST_DSN", "postgresql:///sp0_test")
+    # Connect worker threads to the SAME cluster as the fixture (ephemeral or env-provided),
+    # not a hard-coded default socket — the ephemeral test cluster has a dynamic DSN.
+    dsn = db.info.dsn
     actor = build_human_identity(subject="user:raj", role_claims=["data_scientist"])
     ready = threading.Barrier(2)
 
