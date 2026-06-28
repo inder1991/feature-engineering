@@ -101,6 +101,45 @@ def test_independent_validation_blocks_author_as_validator(db):
     assert authorize_command(db, cmd).allowed is False
 
 
+def test_retier_self_request_is_denied(db):
+    seed_authz_policy(db)
+    rel = build_human_identity(subject="user:rel", role_claims=["release"])
+    cmd = Command(
+        action="retier", aggregate="feature", aggregate_id="feature_1",
+        args={"feature_version_id": "fv_1", "new_risk_tier": "low",
+              "requested_by": "user:rel"},
+        actor=rel, idempotency_key="i5",
+    )
+    decision = authorize_command(db, cmd)
+    assert decision.allowed is False
+    assert "four-eyes" in decision.reason
+
+
+def test_retier_without_requester_is_denied(db):
+    seed_authz_policy(db)
+    rel = build_human_identity(subject="user:rel", role_claims=["release"])
+    cmd = Command(
+        action="retier", aggregate="feature", aggregate_id="feature_1",
+        args={"feature_version_id": "fv_1", "new_risk_tier": "low"},
+        actor=rel, idempotency_key="i6",
+    )
+    decision = authorize_command(db, cmd)
+    assert decision.allowed is False
+    assert "dual-controlled" in decision.reason
+
+
+def test_retier_two_party_is_allowed(db):
+    seed_authz_policy(db)
+    rel = build_human_identity(subject="user:rel", role_claims=["release"])
+    cmd = Command(
+        action="retier", aggregate="feature", aggregate_id="feature_1",
+        args={"feature_version_id": "fv_1", "new_risk_tier": "low",
+              "requested_by": "user:requester"},
+        actor=rel, idempotency_key="i7",
+    )
+    assert authorize_command(db, cmd).allowed is True
+
+
 def test_compliance_sensitive_activate_needs_four_eyes(db):
     seed_authz_policy(db)
     rel = build_human_identity(subject="user:rel", role_claims=["release"])

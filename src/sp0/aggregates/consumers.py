@@ -192,7 +192,8 @@ def retier_command(conn: DbConn, cmd: Command) -> CommandResult:
     evt = append(
         conn, aggregate="feature", aggregate_id=feature_id, type="VERSION_RETIERED",
         payload={"feature_id": feature_id, "feature_version_id": args["feature_version_id"],
-                 "old_risk_tier": old_tier, "new_risk_tier": args["new_risk_tier"]},
+                 "old_risk_tier": old_tier, "new_risk_tier": args["new_risk_tier"],
+                 "requested_by": args.get("requested_by")},
         actor=cmd.actor, feature_id=feature_id,
     )
     return CommandResult(accepted=True, aggregate_id=feature_id, produced_event_ids=(evt.event_id,))

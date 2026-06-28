@@ -32,13 +32,39 @@ def test_append_chains_and_verifies(db):
     assert verify_chain(db) is True
 
 
-def test_tampering_breaks_chain(db):
+def test_security_audit_is_physically_append_only(db):
+    # Defense in depth: even a privileged actor cannot edit or tail-truncate the audit chain.
+    # A BEFORE UPDATE OR DELETE row trigger RAISEs, mirroring documents/feature_versions.
+    import psycopg
+    import pytest
+
     a = build_human_identity(subject="user:raj", role_claims=["data_scientist"])
     record_security_event(
         db, event_type="COMMAND_DENIED", actor=a,
         attempted_action="activate", decision="denied", reason="r1",
     )
+    # Savepoints so an aborted statement does not discard the inserted row under test.
+    with pytest.raises(psycopg.errors.RaiseException, match="append-only"):
+        with db.transaction():
+            db.execute("UPDATE security_audit SET reason = 'edited' WHERE seq = 1")
+    with pytest.raises(psycopg.errors.RaiseException, match="append-only"):
+        with db.transaction():
+            db.execute("DELETE FROM security_audit WHERE seq = 1")
+    assert db.execute("SELECT count(*) FROM security_audit").fetchone()[0] == 1
+    assert db.execute("SELECT reason FROM security_audit WHERE seq = 1").fetchone()[0] == "r1"
+
+
+def test_tampering_breaks_chain(db):
+    # The hash chain catches tampering that bypasses the physical trigger (e.g. a heap-level
+    # edit or a disabled trigger). We simulate that bypass by disabling the append-only trigger.
+    a = build_human_identity(subject="user:raj", role_claims=["data_scientist"])
+    record_security_event(
+        db, event_type="COMMAND_DENIED", actor=a,
+        attempted_action="activate", decision="denied", reason="r1",
+    )
+    db.execute("ALTER TABLE security_audit DISABLE TRIGGER security_audit_no_mutation")
     db.execute("UPDATE security_audit SET reason = 'edited' WHERE seq = 1")
+    db.execute("ALTER TABLE security_audit ENABLE TRIGGER security_audit_no_mutation")
     assert verify_chain(db) is False
 
 

@@ -92,6 +92,15 @@ def enforce_sod(conn: DbConn, cmd: Command) -> AuthzDecision:
             conn, gate=gate, subject=cmd.actor.subject, run_id=run_id, feature_id=feature_id
         )
         return AuthzDecision(reason is None, reason)
+    if cmd.action == "retier":
+        # retier is ALWAYS dual-controlled (§4.4): the actor applying the risk-tier change must
+        # be distinct from the requester. Require an explicit requested_by and enforce four-eyes.
+        requested_by = cmd.args.get("requested_by")
+        if requested_by is None:
+            return AuthzDecision(False, "retier is dual-controlled: requested_by required")
+        if not two_party_ok(requested_by, cmd.actor.subject):
+            return AuthzDecision(False, "four-eyes: actor != requester for retier")
+        return AuthzDecision(True)
     if cmd.action in ("activate", "supersede", "deprecate") and cmd.args.get(
         "compliance_sensitive"
     ):
