@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Iterable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 
 import psycopg
+from psycopg.rows import dict_row
 from psycopg.types.json import Json
 
 from sp0.contracts import EventEnvelope
+from sp0.runtime.backoff import compute_backoff
+from sp0.runtime.queue import BackpressureError, enqueue, queue_depth
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,3 +76,138 @@ def insert_outbox_message(conn: psycopg.Connection, msg: OutboxMessage) -> int:
             return int(row[0])
         cur.execute("SELECT id FROM outbox WHERE message_id = %s", (msg.message_id,))
         return int(cur.fetchone()[0])
+
+
+def relay_publish_batch(
+    conn: psycopg.Connection,
+    publish: Callable[[psycopg.Connection, OutboxMessage], None],
+    *,
+    owner: str,
+    lease_seconds: int = 30,
+    batch: int = 100,
+) -> int:
+    """Three-step leased relay (§5.2). The relay is a BACKGROUND DAEMON, not a §5.1 step
+    participant: it OWNS its transactions. Each `with conn.transaction()` below is a durable
+    COMMIT when the relay runs on its own autocommit connection (production) and a SAVEPOINT
+    under the per-test transactional `db` fixture.
+
+      Step 1 (own tx): lease a batch of `pending` rows (`FOR UPDATE SKIP LOCKED`) and COMMIT,
+        so the lease is durable — a relay crash leaves a 'stuck' leased row that
+        reclaim_stuck_outbox returns to 'pending'.
+      Step 2 (no tx): call `publish` for each leased row (the external side effect).
+      Step 3 (own tx): mark the row 'sent' and COMMIT. A crash between Step 2 and Step 3
+        leaves the row 'leased' -> reclaimed -> re-published: a harmless at-least-once
+        duplicate (§5.3).
+
+    Publish failures back off ('pending') or route to DLQ ('dead') once attempts are
+    exhausted; a BackpressureError is durable waiting ('pending', short delay, NO attempt
+    bump, NO DLQ)."""
+    with conn.transaction():
+        with conn.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "UPDATE outbox SET status='leased', lease_owner=%s, "
+                "lease_expires_at = now() + make_interval(secs => %s) "
+                "WHERE id IN (SELECT id FROM outbox WHERE status='pending' AND next_attempt_at <= now() "
+                "ORDER BY id FOR UPDATE SKIP LOCKED LIMIT %s) RETURNING *",
+                (owner, lease_seconds, batch),
+            )
+            leased = cur.fetchall()
+
+    sent = 0
+    for row in leased:
+        msg = OutboxMessage(
+            message_id=row["message_id"],
+            partition_key=row["partition_key"],
+            topic=row["topic"],
+            payload=row["payload"],
+            caused_by_event=row["caused_by_event"],
+        )
+        try:
+            publish(conn, msg)
+        except BackpressureError as bp:
+            # Durable waiting (§5.2): downstream is saturated. Return the row to 'pending'
+            # with a delay WITHOUT bumping attempts or DLQ'ing — it is not a failure.
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "UPDATE outbox SET status='pending', last_error=%s, lease_owner=NULL, "
+                        "lease_expires_at=NULL, next_attempt_at = now() + make_interval(secs => %s) "
+                        "WHERE id=%s",
+                        (str(bp), lease_seconds, row["id"]),
+                    )
+            continue
+        except Exception as exc:  # noqa: BLE001 — failure classification is intentional
+            attempts = row["attempts"] + 1
+            with conn.transaction():
+                with conn.cursor() as cur:
+                    if attempts >= row["max_attempts"]:
+                        cur.execute(
+                            "UPDATE outbox SET status='dead', attempts=%s, last_error=%s, "
+                            "lease_owner=NULL, lease_expires_at=NULL WHERE id=%s",
+                            (attempts, str(exc), row["id"]),
+                        )
+                    else:
+                        delay = compute_backoff(attempts, jitter=0.0)
+                        cur.execute(
+                            "UPDATE outbox SET status='pending', attempts=%s, last_error=%s, "
+                            "lease_owner=NULL, lease_expires_at=NULL, "
+                            "next_attempt_at = now() + make_interval(secs => %s) WHERE id=%s",
+                            (attempts, str(exc), delay, row["id"]),
+                        )
+            continue
+        with conn.transaction():
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE outbox SET status='sent', sent_at=now() WHERE id=%s", (row["id"],)
+                )
+        sent += 1
+    return sent
+
+
+def reclaim_stuck_outbox(conn: psycopg.Connection) -> int:
+    """Return expired-lease rows to 'pending' (§5.2 stuck detection / §5.7 recovery)."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE outbox SET status='pending', lease_owner=NULL, lease_expires_at=NULL "
+            "WHERE status='leased' AND lease_expires_at < now()"
+        )
+        return cur.rowcount
+
+
+def outbox_pending_depth(conn: psycopg.Connection) -> int:
+    """Backlog (pending+leased) — a backpressure signal for the relay (§5.2)."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT count(*) FROM outbox WHERE status IN ('pending', 'leased')")
+        return int(cur.fetchone()[0])
+
+
+def make_queue_publisher(
+    route: Mapping[str, str],
+    *,
+    max_partition_depth: int | None = None,
+) -> Callable[[psycopg.Connection, OutboxMessage], None]:
+    """Build a `publish` that turns a routed outbox topic into a worker-queue row. When
+    `max_partition_depth` is set, it is admission control (§5.2 backpressure): if the target
+    partition already holds that many `ready`+`leased` queue items, it raises BackpressureError
+    so the relay leaves the outbox row durably `pending` (durable waiting) until the worker
+    queue drains — bounding per-partition backlog without dropping or failing work."""
+
+    def publish(conn: psycopg.Connection, msg: OutboxMessage) -> None:
+        handler = route.get(msg.topic)
+        if handler is None:
+            return  # topic has no internal step handler; nothing to enqueue
+        if max_partition_depth is not None and (
+            queue_depth(conn, partition_key=msg.partition_key) >= max_partition_depth
+        ):
+            raise BackpressureError(
+                f"partition {msg.partition_key!r} at capacity ({max_partition_depth})"
+            )
+        enqueue(
+            conn,
+            message_id=msg.message_id,
+            partition_key=msg.partition_key,
+            handler=handler,
+            payload=msg.payload,
+        )
+
+    return publish
