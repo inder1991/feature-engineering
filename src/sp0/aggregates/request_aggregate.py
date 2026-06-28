@@ -7,13 +7,8 @@ from sp0.aggregates.ids import new_feature_id
 from sp0.aggregates.ids import new_request_id
 from sp0.aggregates.ids import new_run_id
 from sp0.aggregates.ids import normalize_concept_key
+from sp0.aggregates.run_lifecycle import run_is_terminal
 from sp0.events.store import load_stream
-
-_TERMINAL_RUN_TYPES = ("RUN_REJECTED", "RUN_CANCELLED", "RUN_WITHDRAWN")
-
-
-def _run_terminal_local(conn: DbConn, run_id: str) -> bool:
-    return any(e.type in _TERMINAL_RUN_TYPES for e in load_stream(conn, "run", run_id))
 
 
 def create_request_command(conn: DbConn, cmd: Command) -> CommandResult:
@@ -101,7 +96,7 @@ def select_candidate_command(conn: DbConn, cmd: Command) -> CommandResult:
         )
         produced.append(chosen.event_id)
     for run_id in all_runs:
-        if run_id in selected_ids or _run_terminal_local(conn, run_id):
+        if run_id in selected_ids or run_is_terminal(conn, run_id):
             continue
         rej_req = append(
             conn, aggregate="request", aggregate_id=request_id, type="CANDIDATE_REJECTED",
