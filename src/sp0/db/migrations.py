@@ -112,6 +112,30 @@ CREATE TABLE IF NOT EXISTS projection_degraded (
 );
 """
 
+# run_workflow_state — SAMPLE state-bearing projection WITH a degraded flag (§3.6).
+# Fail-closed: an unappliable event marks the aggregate degraded and blocks its commands.
+# Phase-01-owned; DDL verbatim from the shared contract (overview § "Database schema").
+RUN_WORKFLOW_STATE = """
+CREATE TABLE IF NOT EXISTS run_workflow_state (
+    run_id              text        PRIMARY KEY,
+    request_id          text        NOT NULL,
+    feature_id          text        NULL,
+    current_state       text        NOT NULL,
+    table_version       integer     NOT NULL,
+    cost_units          numeric(18,4) NOT NULL DEFAULT 0,
+    candidates_explored integer     NOT NULL DEFAULT 0,
+    degraded            boolean     NOT NULL DEFAULT false,
+    degraded_reason     text        NULL,
+    degraded_event_id   text        NULL REFERENCES events(event_id),
+    last_applied_seq    bigint      NOT NULL DEFAULT 0,
+    updated_at          timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS run_workflow_state_degraded_idx
+    ON run_workflow_state (degraded) WHERE degraded = true;
+CREATE INDEX IF NOT EXISTS run_workflow_state_state_idx
+    ON run_workflow_state (current_state);
+"""
+
 # =========================================================================
 # Phase 02 — documents DAG: documents (write-once), stage_primary, blob_index,
 # document_type_registry. DDL verbatim from the shared contract (overview §
@@ -208,6 +232,7 @@ MIGRATIONS: list[tuple[str, str]] = [
     ("0005_projection_checkpoints", PROJECTION_CHECKPOINTS),
     ("0006_projection_active_alias", PROJECTION_ACTIVE_ALIAS),
     ("0007_projection_degraded", PROJECTION_DEGRADED),
+    ("0012_run_workflow_state", RUN_WORKFLOW_STATE),
     ("0008_documents", DOCUMENTS),
     ("0009_stage_primary", STAGE_PRIMARY),
     ("0010_blob_index", BLOB_INDEX),
