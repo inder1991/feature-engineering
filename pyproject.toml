@@ -13,7 +13,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0", "pytest-postgresql>=6.0"]
+dev = [
+    "pytest>=8.0",
+    "pytest-postgresql>=6.0",
+    "pytest-timeout>=2.4.0",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -21,3 +25,9 @@ where = ["src"]
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["tests"]
+# Hard per-test timeout so a hung/deadlocked test (e.g. concurrent DB-lock waits in
+# the optimistic-concurrency / race tasks) FAILS fast instead of hanging the runner.
+# "signal" (SIGALRM, main thread) interrupts blocked psycopg C calls, keeping any single
+# test well under the build runner's stall watchdog.
+timeout = 60
+timeout_method = "signal"
