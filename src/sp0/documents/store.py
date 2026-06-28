@@ -16,9 +16,32 @@ _GET_COLUMNS = (
 )
 
 
+class DagViolationError(Exception):
+    """Raised when derived_from/supersedes references a doc that is not already committed."""
+
+
 def compute_content_hash(body: bytes) -> str:
     """Content-address a body: 'sha256:<hex>' (§3.4)."""
     return "sha256:" + hashlib.sha256(body).hexdigest()
+
+
+def _validate_dag(conn: DbConn, new_document: NewDocument) -> None:
+    """Lineage edges may only point at already-committed docs (§3.4). Existence of a
+    reference ⇒ it has a lower global_seq ⇒ the lineage DAG is acyclic by construction."""
+    refs = tuple(new_document.derived_from) + tuple(new_document.supersedes)
+    if not refs:
+        return
+    found = {
+        r[0]
+        for r in conn.execute(
+            "SELECT doc_id FROM documents WHERE doc_id = ANY(%s)", (list(refs),)
+        ).fetchall()
+    }
+    missing = [r for r in refs if r not in found]
+    if missing:
+        raise DagViolationError(
+            f"derived_from/supersedes reference uncommitted docs: {missing}"
+        )
 
 
 def append_document(
@@ -34,8 +57,8 @@ def append_document(
     Uses the CALLER-SUPPLIED new_document.doc_id (minted via HandlerContext.new_doc_id())
     so events emitted in the same step can reference it; this is the single validated write
     path — runtime handlers MUST go through here, never a raw INSERT. The body is
-    opaque-by-reference (body_ref + content_hash); structural and DAG validation are added
-    in Tasks 4-5."""
+    opaque-by-reference (body_ref + content_hash); structural validation is added in Task 5."""
+    _validate_dag(conn, new_document)
     doc_id = new_document.doc_id
     conn.execute(
         """
