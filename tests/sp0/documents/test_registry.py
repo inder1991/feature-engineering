@@ -30,3 +30,25 @@ def test_validate_unregistered_type_raises(db):
     reg = DocumentSchemaRegistry(db)
     with pytest.raises(SchemaValidationError):
         reg.validate("FEATURE_PLAN", 99, {"x": 1})
+
+
+def test_upcast_chains_stepwise(db):
+    reg = DocumentSchemaRegistry(db)
+    reg.register_upcaster("DQ_REPORT", 1, 2, lambda b: {**b, "v2": True})
+    reg.register_upcaster("DQ_REPORT", 2, 3, lambda b: {**b, "v3": True})
+    out = reg.upcast("DQ_REPORT", {"v1": True}, 1, 3)
+    assert out == {"v1": True, "v2": True, "v3": True}
+
+
+def test_upcast_missing_step_is_poison(db):
+    reg = DocumentSchemaRegistry(db)
+    reg.register_upcaster("DQ_REPORT", 1, 2, lambda b: {**b, "v2": True})
+    with pytest.raises(SchemaValidationError):
+        reg.upcast("DQ_REPORT", {"v1": True}, 1, 3)
+
+
+def test_upcaster_must_be_stepwise():
+    reg = DocumentSchemaRegistry.__new__(DocumentSchemaRegistry)
+    reg._upcasters = {}
+    with pytest.raises(ValueError):
+        reg.register_upcaster("DQ_REPORT", 1, 3, lambda b: b)

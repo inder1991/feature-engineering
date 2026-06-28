@@ -5,7 +5,7 @@ from typing import Any, Mapping
 import jsonschema
 from psycopg.types.json import Jsonb
 
-from sp0.contracts import DbConn, SchemaValidationError
+from sp0.contracts import DbConn, SchemaValidationError, Upcaster
 
 
 class DocumentSchemaRegistry:
@@ -18,6 +18,7 @@ class DocumentSchemaRegistry:
 
     def __init__(self, conn: DbConn) -> None:
         self._conn = conn
+        self._upcasters: dict[tuple[str, int, int], Upcaster] = {}
 
     def register_schema(
         self,
@@ -40,6 +41,28 @@ class DocumentSchemaRegistry:
             """,
             (type_name, schema_version, Jsonb(dict(json_schema)), owner, status),
         )
+
+    def register_upcaster(
+        self, type_name: str, from_version: int, to_version: int, upcaster: Upcaster
+    ) -> None:
+        if to_version != from_version + 1:
+            raise ValueError("upcasters must be stepwise: to_version == from_version + 1")
+        self._upcasters[(type_name, from_version, to_version)] = upcaster
+
+    def upcast(
+        self, type_name: str, body: Mapping[str, Any], from_version: int, to_version: int
+    ) -> Mapping[str, Any]:
+        if to_version < from_version:
+            raise ValueError("cannot downcast")
+        current: Mapping[str, Any] = dict(body)
+        for v in range(from_version, to_version):
+            step = self._upcasters.get((type_name, v, v + 1))
+            if step is None:
+                raise SchemaValidationError(
+                    f"missing upcaster {type_name} v{v}->v{v + 1} (poison)"
+                )
+            current = dict(step(current))
+        return current
 
     def validate(self, type_name: str, schema_version: int, body: Mapping[str, Any]) -> None:
         """Validate body against the registered schema. STATUS-AGNOSTIC by design:
