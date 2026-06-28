@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from sp0.contracts.db import DbConn
+from sp0.state_machine.ddl import STATE_MACHINE_DDL
 
 GLOBAL_SEQ = """
 CREATE SEQUENCE IF NOT EXISTS global_seq_seq AS bigint
@@ -203,6 +204,7 @@ MIGRATIONS: list[tuple[str, str]] = [
     ("0009_stage_primary", STAGE_PRIMARY),
     ("0010_blob_index", BLOB_INDEX),
     ("0011_document_type_registry", DOCUMENT_TYPE_REGISTRY),
+    ("0030_state_machine", STATE_MACHINE_DDL),  # <-- Phase 03 (added)
 ]
 
 
