@@ -12,6 +12,7 @@ from ulid import ULID
 from sp0.contracts import ConcurrencyError, DbConn, EventEnvelope, NewEvent
 from sp0.events.registry import event_registry
 from sp0.events.serde import identity_to_jsonb, provenance_to_jsonb, row_to_event
+from sp0.privacy.classification import assert_no_inline_pii
 
 _INSERT = """
 INSERT INTO events (
@@ -52,6 +53,9 @@ def append_event(
     registry = event_registry()
     registry.assert_writable(new_event.type, new_event.schema_version)
     registry.validate(new_event.type, new_event.schema_version, new_event.payload)
+    # §9 invariant: no raw PII/secrets inline. Enforced here (not just via a helper) so it holds
+    # for EVERY caller, regardless of whether they remembered to scan first. Cheap/deterministic.
+    assert_no_inline_pii(new_event.payload)
 
     # OCC pre-check: the stream must currently be EXACTLY at expected_version. This rejects
     # both stale (current > expected) and ahead-of-head (current < expected, gap) without
