@@ -269,6 +269,39 @@ def test_promote_non_usefulness_checked_to_production_is_rejected(db):
     assert ok.activated
 
 
+def test_activation_of_version_from_another_feature_is_rejected(db):
+    # P1 integrity: a feature must not be able to activate ANOTHER feature's version. The
+    # version's stored feature_id must equal the activation's feature_id, else reject loudly
+    # and claim no slot / emit no VERSION_ACTIVATED.
+    import pytest
+    other = _mint(db, "feat_other", "run_other")  # belongs to feat_other
+    with pytest.raises(ValueError, match="feature_id"):
+        apply_activation(db, feature_id="feat_victim", feature_version_id=other, use_case="fraud",
+                         base_feature_version_id=None, approval_type="PRODUCTION", actor=make_actor())
+    assert db.execute("SELECT count(*) FROM feature_active_versions "
+                      "WHERE feature_id='feat_victim'").fetchone()[0] == 0
+    assert [e for e in load_stream(db, "feature", "feat_victim")
+            if e.type == "VERSION_ACTIVATED"] == []
+
+
+def test_activation_with_base_from_another_feature_is_rejected(db):
+    # P1 integrity: base_feature_version_id (the expected current active version) must also
+    # belong to the same feature_id. A base from another feature is rejected.
+    import pytest
+    v1 = _mint(db, "feat_base", "run1")
+    apply_activation(db, feature_id="feat_base", feature_version_id=v1, use_case="fraud",
+                     base_feature_version_id=None, approval_type="PRODUCTION", actor=make_actor())
+    v2 = _mint(db, "feat_base", "run2", base=v1)
+    foreign_base = _mint(db, "feat_elsewhere", "run_elsewhere")
+    with pytest.raises(ValueError, match="feature_id"):
+        apply_activation(db, feature_id="feat_base", feature_version_id=v2, use_case="fraud",
+                         base_feature_version_id=foreign_base, approval_type="PRODUCTION",
+                         actor=make_actor())
+    row = db.execute("SELECT feature_version_id FROM feature_active_versions "
+                     "WHERE feature_id='feat_base' AND use_case='fraud'").fetchone()
+    assert row[0] == v1  # unchanged; the cross-feature base did not displace it
+
+
 def test_activate_command_wraps_apply_activation(db):
     v1 = _mint(db, "feat_h", "run1")
     res = activate_command(db, make_cmd("activate", "feature", "feat_h",

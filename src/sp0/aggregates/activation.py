@@ -103,6 +103,23 @@ def apply_activation(
     # (verification stamp / risk ceiling / required artifacts) gate the activation. On failure we
     # emit an audited ACTIVATION_BLOCKED event and return WITHOUT activating (no CAS, no slot).
     attrs = load_governance_attributes(conn, feature_version_id)
+    # P1 cross-feature integrity: a feature must NOT be able to activate another feature's
+    # version. The version's frozen feature_id must equal the activation's feature_id — and the
+    # base (expected current active version), if supplied, must belong to the same feature too.
+    # Reject loudly BEFORE any slot claim or event so no cross-feature state is ever written.
+    # (Backstopped by the composite FK feature_active_versions(feature_id, feature_version_id).)
+    if attrs.feature_id != feature_id:
+        raise ValueError(
+            f"cross-feature activation: feature_version_id={feature_version_id!r} belongs to "
+            f"feature_id={attrs.feature_id!r}, not {feature_id!r}"
+        )
+    if base_feature_version_id is not None:
+        base_attrs = load_governance_attributes(conn, base_feature_version_id)
+        if base_attrs.feature_id != feature_id:
+            raise ValueError(
+                f"cross-feature base: base_feature_version_id={base_feature_version_id!r} "
+                f"belongs to feature_id={base_attrs.feature_id!r}, not {feature_id!r}"
+            )
     failure = evaluate_activation_guards(
         attrs, use_case=use_case, approval_type=approval_type, policy=policy,
     )

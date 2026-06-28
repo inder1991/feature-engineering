@@ -18,7 +18,11 @@ CREATE TABLE feature_versions (
     expires_at                    timestamptz NULL,
     content_hash                  text        NOT NULL,
     immutable                     boolean     NOT NULL DEFAULT true,
-    created_at                    timestamptz NOT NULL DEFAULT now()
+    created_at                    timestamptz NOT NULL DEFAULT now(),
+    -- Composite-key target so (feature_id, feature_version_id) integrity can be FK-enforced
+    -- downstream (e.g. feature_active_versions): a version is never claimable under a feature
+    -- it does not belong to. feature_version_id is already globally unique (PRIMARY KEY).
+    UNIQUE (feature_id, feature_version_id)
 );
 CREATE INDEX feature_versions_feature_idx ON feature_versions (feature_id);
 CREATE INDEX feature_versions_base_idx    ON feature_versions (base_feature_version_id);
@@ -39,12 +43,16 @@ CREATE TRIGGER feature_versions_no_mutation
 CREATE TABLE feature_active_versions (
     feature_id         text        NOT NULL,
     use_case           text        NOT NULL,
-    feature_version_id text        NOT NULL REFERENCES feature_versions(feature_version_id),
+    feature_version_id text        NOT NULL,
     activation_state   text        NOT NULL
                            CHECK (activation_state IN ('ACTIVE_EXPERIMENTAL','PRODUCTION','DEPRECATED')),
     activated_seq      bigint      NOT NULL,
     activated_at       timestamptz NOT NULL DEFAULT now(),
-    PRIMARY KEY (feature_id, use_case)
+    PRIMARY KEY (feature_id, use_case),
+    -- Composite FK: the active version MUST belong to the feature claiming it (no cross-feature
+    -- activation can ever land in the active map, even if the application check is bypassed).
+    FOREIGN KEY (feature_id, feature_version_id)
+        REFERENCES feature_versions (feature_id, feature_version_id)
 );
 
 CREATE TABLE consumers (
