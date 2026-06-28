@@ -93,3 +93,20 @@ def crypto_shred(
         outcomes.append(_record(conn, blob_id=blob_id, classification=classification, kms_key_id=kms_key_id,
                                 reason=reason, requested_by=requested_by, outcome="shredded"))
     return outcomes
+
+
+class BlobNotFoundError(Exception):
+    """Raised when a referenced blob_id is absent from blob_index."""
+
+
+def rotate_blob_key(conn: "DbConn", blob_id: str, *, key_manager: KeyManager) -> str:
+    """Rotate a body's per-body KMS key WITHOUT rewriting any events (§9)."""
+    row = conn.execute(
+        "SELECT object_key, kms_key_id FROM blob_index WHERE blob_id = %s", (blob_id,)
+    ).fetchone()
+    if row is None:
+        raise BlobNotFoundError(blob_id)
+    object_key, old_key = row
+    new_key = key_manager.rotate(old_key, object_key)
+    conn.execute("UPDATE blob_index SET kms_key_id = %s WHERE blob_id = %s", (new_key, blob_id))
+    return new_key
