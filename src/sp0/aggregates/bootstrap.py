@@ -24,3 +24,14 @@ def register_phase06_event_schemas() -> None:
         return
     register_phase06_event_types(registry)
     _REGISTERED_INTO = registry
+
+
+def bootstrap_phase06(handler_registry) -> None:
+    """Single production wiring call: event schemas (so runtime `append_event` validation
+    passes) + the §4.4 command catalog + the §5.8 saga handler into Phase-04's HandlerRegistry."""
+    from sp0.aggregates.commands import register_phase06_commands
+    from sp0.aggregates.activation import register_phase06_handlers
+
+    register_phase06_event_schemas()      # idempotent (Task 3)
+    register_phase06_commands()           # §4.4 catalog
+    register_phase06_handlers(handler_registry)  # §5.8 activate_version handler
