@@ -155,3 +155,57 @@ def dispatch_command(
             "UPDATE external_commands SET status='pending' WHERE command_id=%s", (command_id,)
         )
         return DispatchOutcome(command_id, "pending", reinvoked, residual, reconciled)
+
+
+@dataclass(frozen=True, slots=True)
+class ResultAcceptance:
+    command_id: str
+    accepted: bool
+    stale: bool
+    cached: bool = False
+
+
+def accept_result(
+    conn: DbConn,
+    command_id: str,
+    *,
+    current_run_id: Optional[str],
+    current_stream_version: Optional[int],
+    current_task_id: Optional[str],
+) -> ResultAcceptance:
+    """Stale-result acceptance guard (§5.4). The result is APPLIED only if the run/task it
+    was issued against has not moved on: expected_run_id == current_run_id AND (no
+    expected_stream_version OR current has not advanced past it) AND (no expected_task_id OR
+    == current). Otherwise it is accepted-and-IGNORED as stale (status='stale_ignored') —
+    never blindly applied to a moved-on run. Idempotent: a command already routed to
+    stale/applied returns cached."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT expected_run_id, expected_stream_version, expected_task_id, status, "
+            "result_event_id FROM external_commands WHERE command_id = %s FOR UPDATE",
+            (command_id,),
+        )
+        row = cur.fetchone()
+        if row is None:
+            raise KeyError(command_id)
+        exp_run, exp_sv, exp_task, status, result_event_id = row
+        if status == "stale_ignored":
+            return ResultAcceptance(command_id, accepted=False, stale=True, cached=True)
+        if result_event_id is not None:
+            return ResultAcceptance(command_id, accepted=True, stale=False, cached=True)
+        stale = False
+        if exp_run is not None and exp_run != current_run_id:
+            stale = True
+        elif (exp_sv is not None and current_stream_version is not None
+              and current_stream_version > exp_sv):
+            stale = True
+        elif exp_task is not None and exp_task != current_task_id:
+            stale = True
+        if stale:
+            cur.execute(
+                "UPDATE external_commands SET status='stale_ignored', completed_at=now() "
+                "WHERE command_id=%s",
+                (command_id,),
+            )
+            return ResultAcceptance(command_id, accepted=False, stale=True)
+    return ResultAcceptance(command_id, accepted=True, stale=False)
