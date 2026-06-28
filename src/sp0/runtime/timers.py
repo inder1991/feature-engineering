@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
 
 from psycopg.types.json import Jsonb
@@ -77,3 +77,33 @@ def build_escalation_ladder(
         )
         for kind, fire_at in rungs
     )
+
+
+def poll_due_timers(
+    conn: DbConn, *, owner: str, lease_seconds: int, batch: int, now: datetime
+) -> list[str]:
+    """Claim due AND overdue scheduled timers (fire_at <= now) plus timers whose lease has
+    expired, via FOR UPDATE SKIP LOCKED so concurrent pollers never double-claim (§5.5).
+    Overdue timers are picked up here regardless of how far past, giving crash-recovery
+    catch-up. Returns the claimed timer_ids (status -> 'leased')."""
+    lease_until = now + timedelta(seconds=lease_seconds)
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            WITH due AS (
+                SELECT timer_id FROM timers
+                 WHERE (status = 'scheduled' AND fire_at <= %s)
+                    OR (status = 'leased' AND lease_expires_at < %s)
+                 ORDER BY fire_at
+                 FOR UPDATE SKIP LOCKED
+                 LIMIT %s
+            )
+            UPDATE timers t
+               SET status = 'leased', lease_owner = %s, lease_expires_at = %s
+              FROM due
+             WHERE t.timer_id = due.timer_id
+            RETURNING t.timer_id
+            """,
+            (now, now, batch, owner, lease_until),
+        )
+        return [r[0] for r in cur.fetchall()]
