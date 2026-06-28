@@ -101,6 +101,62 @@ def record_denial(conn: DbConn, cmd: Any, reason: str) -> str:
     )
 
 
+class AuditReadDenied(Exception):
+    """Raised when a non-security/compliance actor attempts to read the security stream (§6.2)."""
+
+
+_AUDIT_READ_ROLES = ("security", "compliance")
+
+
+def read_security_audit(
+    conn: DbConn,
+    actor: IdentityEnvelope,
+    *,
+    limit: int = 100,
+) -> list[tuple[str, str, str, Optional[str]]]:
+    # This function is the SINGLE enforcement path for security-stream reads: they are NOT
+    # routed through execute_command/authz_policy, so there is no divergent second gate (the
+    # authz_policy `read_security_audit` rows are intentionally absent — see Task 6). A role
+    # claim alone is insufficient: the envelope must also be a VALID identity, else a spoofed
+    # or unauthenticated envelope carrying a "security" claim could read the stream.
+    from sp0.identity.build import IdentityError, validate_identity
+
+    try:
+        validate_identity(actor)
+        identity_ok = True
+    except IdentityError:
+        identity_ok = False
+    allowed = identity_ok and any(r in actor.role_claims for r in _AUDIT_READ_ROLES)
+    if not allowed:
+        record_security_event(
+            conn,
+            event_type="AUDIT_READ",
+            actor=actor,
+            attempted_action="read_security_audit",
+            decision="denied",
+            reason="security stream read restricted to security/compliance",
+        )
+        raise AuditReadDenied("security stream read restricted to security/compliance")
+    record_security_event(
+        conn,
+        event_type="AUDIT_READ",
+        actor=actor,
+        attempted_action="read_security_audit",
+        decision="flagged",
+        reason="security stream read",
+    )
+    rows = conn.execute(
+        """
+        SELECT security_event_id, event_type, decision, reason
+          FROM security_audit
+         ORDER BY seq ASC
+         LIMIT %s
+        """,
+        (limit,),
+    ).fetchall()
+    return [(r[0], r[1], r[2], r[3]) for r in rows]
+
+
 def verify_chain(conn: DbConn) -> bool:
     rows = conn.execute(
         """
