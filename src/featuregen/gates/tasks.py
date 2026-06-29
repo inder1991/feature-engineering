@@ -17,7 +17,9 @@ class GateError(Exception):
     """Raised on malformed/unknown human-gate task operations (§7)."""
 
 
-def _task_aggregate(run_id, feature_id) -> tuple[str, str]:
+def _task_aggregate(run_id, feature_id, fact_key=None) -> tuple[str, str]:
+    if fact_key:
+        return "overlay_fact", fact_key
     if run_id:
         return "run", run_id
     return "feature", feature_id
@@ -30,8 +32,9 @@ def open_task(conn: DbConn, spec: GateTaskSpec, actor: IdentityEnvelope) -> str:
         INSERT INTO human_tasks
             (task_id, task_version, run_id, feature_id, gate, required_inputs,
              eligible_assignees, allowed_responses, quorum_required, quorum_of_role,
-             delegation_allowed, sla, status)
-        VALUES (%s,1,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'open')
+             delegation_allowed, sla, status,
+             fact_key, draft_event_id, target_event_id, evidence_ref)
+        VALUES (%s,1,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'open',%s,%s,%s,%s)
         """,
         (
             task_id,
@@ -45,12 +48,16 @@ def open_task(conn: DbConn, spec: GateTaskSpec, actor: IdentityEnvelope) -> str:
             spec.quorum_of_role,
             spec.delegation_allowed,
             spec.sla,
+            spec.fact_key,
+            spec.draft_event_id,
+            spec.target_event_id,
+            spec.evidence_ref,
         ),
     )
     if spec.sla:
         base = datetime.now(UTC)
         sla = parse_duration(spec.sla)
-        agg, agg_id = _task_aggregate(spec.run_id, spec.feature_id)
+        agg, agg_id = _task_aggregate(spec.run_id, spec.feature_id, spec.fact_key)
         ladder = {
             "reminder": base + sla / 2,
             "sla": base + sla,

@@ -208,6 +208,10 @@ class GateTaskSpec:
     quorum_of_role: str | None = None
     delegation_allowed: bool = True
     sla: str | None = None
+    fact_key: str | None = None
+    draft_event_id: str | None = None
+    target_event_id: str | None = None
+    evidence_ref: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
