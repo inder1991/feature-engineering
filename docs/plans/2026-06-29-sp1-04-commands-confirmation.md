@@ -155,8 +155,8 @@ def test_proposer_ne_confirmer(db):
     svc = build_service_identity(
         subject="service:profiler", role_claims=("overlay",), attestation="sig"
     )
-    human_proposed = [_Evt("OVERLAY_FACT_PROPOSED", {"proposed_by": {"subject": "user:alice"}})]
-    svc_proposed = [_Evt("OVERLAY_FACT_PROPOSED", {"proposed_by": {"subject": "service:profiler"}})]
+    human_proposed = [_Evt("OVERLAY_FACT_PROPOSED", {"proposed_by": "user:alice"})]
+    svc_proposed = [_Evt("OVERLAY_FACT_PROPOSED", {"proposed_by": "service:profiler"})]
     assert proposer_ne_confirmer(human_proposed, alice) is False  # self-confirm blocked
     assert proposer_ne_confirmer(human_proposed, bob) is True
     assert proposer_ne_confirmer(svc_proposed, alice) is True  # service proposal, human confirm
