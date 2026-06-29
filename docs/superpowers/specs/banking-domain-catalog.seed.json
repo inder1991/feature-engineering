@@ -1,0 +1,179 @@
+{
+  "$schema_note": "Closed banking Domain/Use-Case Catalog seed (architecture §15). The platform admits ONLY these use_cases; anything else is rejected at intake (§15.5). compliance_confirmed=false everywhere: per the architecture, the registered domain/risk owner confirms domain facts and Compliance confirms policy facts before any use_case is production-eligible. Values here are proposed defaults to be ratified, not authority.",
+  "catalog_version": "0.1.0-draft",
+  "data_classes": [
+    "transactions", "balances", "salary", "payments", "product_holdings",
+    "applications", "credit_bureau", "digital_activity", "device", "geolocation",
+    "demographics", "kyc_documents", "watchlists", "counterparty", "protected_attribute"
+  ],
+  "entities": ["customer", "account", "product", "transaction", "counterparty", "exposure", "application"],
+  "use_cases": [
+    {
+      "use_case": "retail_churn", "domain": "marketing", "entity": "customer", "status": "active",
+      "target": { "name": "churn", "definition": "no financial transaction for 90 days after as_of_date" },
+      "primary_metric": "lift",
+      "feature_templates": ["rolling_balance_trend", "login_frequency_change", "inter_event_irregularity", "rfm_recency_frequency_monetary", "product_holding_decline"],
+      "allowed_data_classes": ["transactions", "balances", "salary", "product_holdings", "digital_activity"],
+      "blocked_data_classes": ["protected_attribute"],
+      "risk_tier": "low",
+      "regulatory": { "adverse_action": false, "fair_lending": false, "mrm_tier": "low", "aml": false },
+      "latency": "batch", "owner": "marketing-analytics", "compliance_confirmed": false, "version": 1
+    },
+    {
+      "use_case": "propensity_cross_sell", "domain": "marketing", "entity": "customer", "status": "active",
+      "target": { "name": "next_product_take_up", "definition": "customer opens product P within 60 days after as_of_date" },
+      "primary_metric": "lift",
+      "feature_templates": ["product_holding_gaps", "rfm_recency_frequency_monetary", "channel_engagement", "rolling_balance_trend"],
+      "allowed_data_classes": ["transactions", "balances", "product_holdings", "digital_activity", "salary"],
+      "blocked_data_classes": ["protected_attribute"],
+      "risk_tier": "low",
+      "regulatory": { "adverse_action": false, "fair_lending": false, "mrm_tier": "low", "aml": false },
+      "latency": "batch", "owner": "marketing-analytics", "compliance_confirmed": false, "version": 1
+    },
+    {
+      "use_case": "customer_lifetime_value", "domain": "marketing", "entity": "customer", "status": "active",
+      "target": { "name": "clv_12m", "definition": "net revenue contribution over the 12 months after as_of_date" },
+      "primary_metric": "normalized_rmse",
+      "feature_templates": ["rfm_recency_frequency_monetary", "product_holding_breadth", "balance_growth", "fee_income_trend"],
+      "allowed_data_classes": ["transactions", "balances", "product_holdings", "payments", "salary"],
+      "blocked_data_classes": ["protected_attribute"],
+      "risk_tier": "low",
+      "regulatory": { "adverse_action": false, "fair_lending": false, "mrm_tier": "low", "aml": false },
+      "latency": "batch", "owner": "marketing-analytics", "compliance_confirmed": false, "version": 1
+    },
+    {
+      "use_case": "customer_segmentation", "domain": "marketing", "entity": "customer", "status": "active",
+      "target": { "name": "none_unsupervised", "definition": "no label; quality/novelty screening only (architecture §14.3 Tier 0)" },
+      "primary_metric": "quality_novelty",
+      "feature_templates": ["rfm_recency_frequency_monetary", "product_holding_breadth", "channel_engagement", "balance_volatility"],
+      "allowed_data_classes": ["transactions", "balances", "product_holdings", "digital_activity"],
+      "blocked_data_classes": ["protected_attribute"],
+      "risk_tier": "low",
+      "regulatory": { "adverse_action": false, "fair_lending": false, "mrm_tier": "low", "aml": false },
+      "latency": "batch", "owner": "marketing-analytics", "compliance_confirmed": false, "version": 1
+    },
+    {
+      "use_case": "credit_origination", "domain": "retail_credit", "entity": "application", "status": "active",
+      "target": { "name": "default_12m", "definition": "90+ days past due within 12 months of account opening" },
+      "primary_metric": "ks",
+      "feature_templates": ["credit_utilization", "delinquency_history_count", "income_stability", "debt_to_income", "bureau_inquiry_velocity"],
+      "allowed_data_classes": ["applications", "credit_bureau", "transactions", "balances", "salary", "product_holdings"],
+      "blocked_data_classes": ["protected_attribute"],
+      "risk_tier": "high",
+      "regulatory": { "adverse_action": true, "fair_lending": true, "mrm_tier": "high", "aml": false },
+      "latency": "batch", "owner": "retail-credit-risk", "compliance_confirmed": false, "version": 1
+    },
+    {
+      "use_case": "behavioral_credit_scoring", "domain": "retail_credit", "entity": "customer", "status": "active",
+      "target": { "name": "default_12m", "definition": "90+ days past due within 12 months after as_of_date" },
+      "primary_metric": "ks",
+      "feature_templates": ["credit_utilization_trend", "delinquency_recency", "min_payment_behavior", "balance_volatility", "salary_irregularity"],
+      "allowed_data_classes": ["transactions", "balances", "salary", "payments", "product_holdings", "credit_bureau"],
+      "blocked_data_classes": ["protected_attribute"],
+      "risk_tier": "high",
+      "regulatory": { "adverse_action": true, "fair_lending": true, "mrm_tier": "high", "aml": false },
+      "latency": "batch", "owner": "retail-credit-risk", "compliance_confirmed": false, "version": 1
+    },
+    {
+      "use_case": "collections_prioritization", "domain": "retail_credit", "entity": "account", "status": "active",
+      "target": { "name": "cure_30d", "definition": "delinquent account returns to current within 30 days after contact" },
+      "primary_metric": "lift",
+      "feature_templates": ["delinquency_depth", "promise_to_pay_history", "partial_payment_pattern", "contactability_score"],
+      "allowed_data_classes": ["transactions", "balances", "payments", "product_holdings"],
+      "blocked_data_classes": ["protected_attribute"],
+      "risk_tier": "medium",
+      "regulatory": { "adverse_action": false, "fair_lending": true, "mrm_tier": "medium", "aml": false },
+      "latency": "batch", "owner": "collections", "compliance_confirmed": false, "version": 1
+    },
+    {
+      "use_case": "ifrs9_ecl", "domain": "retail_credit", "entity": "exposure", "status": "active",
+      "target": { "name": "stage_migration", "definition": "significant increase in credit risk (stage 1->2/3) over the horizon" },
+      "primary_metric": "auc",
+      "feature_templates": ["pd_trend", "delinquency_depth", "utilization_trend", "forbearance_flag_history"],
+      "allowed_data_classes": ["transactions", "balances", "payments", "credit_bureau", "product_holdings"],
+      "blocked_data_classes": ["protected_attribute"],
+      "risk_tier": "high",
+      "regulatory": { "adverse_action": false, "fair_lending": false, "mrm_tier": "high", "aml": false },
+      "latency": "batch", "owner": "credit-risk-finance", "compliance_confirmed": false, "version": 1
+    },
+    {
+      "use_case": "risk_based_pricing", "domain": "pricing", "entity": "application", "status": "active",
+      "target": { "name": "expected_loss_band", "definition": "realized 24m loss band given offered terms" },
+      "primary_metric": "normalized_rmse",
+      "feature_templates": ["pd_estimate", "lgd_proxy", "elasticity_signal", "relationship_depth"],
+      "allowed_data_classes": ["applications", "credit_bureau", "transactions", "balances", "product_holdings"],
+      "blocked_data_classes": ["protected_attribute"],
+      "risk_tier": "high",
+      "regulatory": { "adverse_action": true, "fair_lending": true, "mrm_tier": "high", "aml": false },
+      "latency": "batch", "owner": "pricing-risk", "compliance_confirmed": false, "version": 1
+    },
+    {
+      "use_case": "aml_transaction_monitoring", "domain": "financial_crime", "entity": "customer", "status": "active",
+      "target": { "name": "sar_filed", "definition": "a Suspicious Activity Report was filed within 90 days of the alert period" },
+      "primary_metric": "precision_at_k",
+      "feature_templates": ["structuring_pattern", "velocity_spike", "counterparty_novelty", "cross_border_ratio", "cash_intensity"],
+      "allowed_data_classes": ["transactions", "payments", "counterparty", "geolocation", "kyc_documents", "watchlists"],
+      "blocked_data_classes": ["protected_attribute"],
+      "risk_tier": "medium",
+      "regulatory": { "adverse_action": false, "fair_lending": false, "mrm_tier": "high", "aml": true },
+      "latency": "batch", "owner": "financial-crime", "compliance_confirmed": false, "version": 1
+    },
+    {
+      "use_case": "kyc_risk_rating", "domain": "financial_crime", "entity": "customer", "status": "active",
+      "target": { "name": "high_risk_customer", "definition": "customer classified high-risk at next periodic KYC review" },
+      "primary_metric": "auc",
+      "feature_templates": ["counterparty_risk_exposure", "cross_border_ratio", "cash_intensity", "occupation_risk_signal", "pep_proximity"],
+      "allowed_data_classes": ["transactions", "payments", "counterparty", "geolocation", "kyc_documents", "watchlists", "demographics"],
+      "blocked_data_classes": ["protected_attribute"],
+      "risk_tier": "medium",
+      "regulatory": { "adverse_action": false, "fair_lending": false, "mrm_tier": "high", "aml": true },
+      "latency": "batch", "owner": "financial-crime", "compliance_confirmed": false, "version": 1
+    },
+    {
+      "use_case": "sanctions_screening_support", "domain": "financial_crime", "entity": "transaction", "status": "active",
+      "target": { "name": "true_match", "definition": "screening alert confirmed a true sanctions match (vs false positive) on review" },
+      "primary_metric": "precision_at_k",
+      "feature_templates": ["name_match_strength", "corridor_risk", "counterparty_novelty", "prior_alert_disposition"],
+      "allowed_data_classes": ["payments", "counterparty", "watchlists", "geolocation"],
+      "blocked_data_classes": ["protected_attribute"],
+      "risk_tier": "medium",
+      "regulatory": { "adverse_action": false, "fair_lending": false, "mrm_tier": "high", "aml": true },
+      "latency": "batch", "owner": "financial-crime", "compliance_confirmed": false, "version": 1,
+      "note": "ML supports alert PRIORITIZATION / false-positive reduction; the screening decision itself remains rules/list-based."
+    },
+    {
+      "use_case": "application_fraud", "domain": "fraud", "entity": "application", "status": "active",
+      "target": { "name": "first_party_or_synthetic_fraud", "definition": "application confirmed fraudulent within 180 days" },
+      "primary_metric": "precision_at_k",
+      "feature_templates": ["identity_velocity", "device_reuse", "application_inconsistency", "bureau_thin_file_signal"],
+      "allowed_data_classes": ["applications", "device", "geolocation", "credit_bureau", "digital_activity"],
+      "blocked_data_classes": ["protected_attribute"],
+      "risk_tier": "medium",
+      "regulatory": { "adverse_action": false, "fair_lending": false, "mrm_tier": "medium", "aml": false },
+      "latency": "batch", "owner": "fraud", "compliance_confirmed": false, "version": 1
+    },
+    {
+      "use_case": "account_takeover", "domain": "fraud", "entity": "customer", "status": "active",
+      "target": { "name": "ato_confirmed", "definition": "account-takeover fraud confirmed within 30 days of the signal window" },
+      "primary_metric": "precision_at_k",
+      "feature_templates": ["device_change_velocity", "login_anomaly", "payee_novelty", "session_behavior_shift"],
+      "allowed_data_classes": ["digital_activity", "device", "geolocation", "transactions", "payments"],
+      "blocked_data_classes": ["protected_attribute"],
+      "risk_tier": "medium",
+      "regulatory": { "adverse_action": false, "fair_lending": false, "mrm_tier": "medium", "aml": false },
+      "latency": "batch", "owner": "fraud", "compliance_confirmed": false, "version": 1
+    },
+    {
+      "use_case": "card_fraud_realtime", "domain": "fraud", "entity": "transaction", "status": "out_of_scope",
+      "target": { "name": "card_fraud", "definition": "authorization later confirmed fraudulent" },
+      "primary_metric": "precision_at_k",
+      "feature_templates": ["merchant_risk", "spend_anomaly", "geo_velocity"],
+      "allowed_data_classes": ["transactions", "device", "geolocation", "counterparty"],
+      "blocked_data_classes": ["protected_attribute"],
+      "risk_tier": "high",
+      "regulatory": { "adverse_action": false, "fair_lending": false, "mrm_tier": "high", "aml": false },
+      "latency": "realtime", "owner": "fraud", "compliance_confirmed": false, "version": 1,
+      "note": "Recognized banking use-case but OUT OF SCOPE: requires sub-second compute-at-request serving (architecture §1.4). Listed so it is not silently absent; intake rejects it for now."
+    }
+  ]
+}
