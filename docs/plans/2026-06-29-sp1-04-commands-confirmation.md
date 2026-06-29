@@ -279,8 +279,8 @@ def proposer_ne_confirmer(stream: Sequence, actor: IdentityEnvelope) -> bool:
     proposer. A service/profiler proposal is trivially distinct from a human confirmer."""
     for e in reversed(list(stream)):
         if e.type == "OVERLAY_FACT_PROPOSED":
-            proposed_by = e.payload.get("proposed_by") or {}
-            return proposed_by.get("subject") != actor.subject
+            proposed_by = e.payload.get("proposed_by")
+            return proposed_by != actor.subject
     return True
 ```
 
@@ -556,7 +556,6 @@ from featuregen.gates.tasks import cancel_task, open_task
 from featuregen.overlay.authority import Authority, proposer_ne_confirmer, resolve_authority
 from featuregen.overlay.catalog import current_catalog_adapter
 from featuregen.overlay.facts import FactValidationError, validate_fact_value
-from featuregen.overlay.freshness import schedule_expiry
 from featuregen.overlay.identity import (
     display_object_ref,
     fact_key,
@@ -680,7 +679,7 @@ def propose_fact(conn: DbConn, cmd: Command) -> CommandResult:
             "proposed_value": proposed_value,
             "proposal_fingerprint": fp,
             "evidence_ref": evidence_ref,
-            "proposed_by": {"subject": cmd.actor.subject, "actor_kind": cmd.actor.actor_kind},
+            "proposed_by": cmd.actor.subject,
         },
         actor=cmd.actor,
         expected_version=0 if not existing else None,
@@ -1028,6 +1027,7 @@ def confirm_fact(conn: DbConn, cmd: Command) -> CommandResult:
     )
     # Arm the SP-0 overlay_expiry timer on this fact-key stream (decision 5; freshness.py is
     # created in this phase, Task 4.3, pin 10).
+    from featuregen.overlay.freshness import schedule_expiry  # local import (freshness.py is created in Task 4.3; avoids a top-level forward dependency)
     schedule_expiry(conn, key, confirmed.event_id, expires_at)
     _close_fact_tasks(conn, key, reason="fact confirmed")
     return CommandResult(accepted=True, aggregate_id=key, produced_event_ids=(confirmed.event_id,))
@@ -1248,7 +1248,7 @@ def enter_fact(conn: DbConn, cmd: Command) -> CommandResult:
             "proposed_value": proposed_value,
             "proposal_fingerprint": fp,
             "evidence_ref": None,
-            "proposed_by": {"subject": cmd.actor.subject, "actor_kind": "human"},
+            "proposed_by": cmd.actor.subject,
         },
         actor=cmd.actor,
         expected_version=0,
@@ -1276,6 +1276,7 @@ def enter_fact(conn: DbConn, cmd: Command) -> CommandResult:
         caused_by=draft.event_id,
     )
     # A self-confirmed fact reaches VERIFIED too, so it also gets an overlay_expiry timer (decision 5).
+    from featuregen.overlay.freshness import schedule_expiry  # local import (freshness.py is created in Task 4.3; avoids a top-level forward dependency)
     schedule_expiry(conn, key, confirmed.event_id, expires_at)
     return CommandResult(
         accepted=True, aggregate_id=key, produced_event_ids=(draft.event_id, confirmed.event_id)
@@ -1501,6 +1502,16 @@ def _confirm_approved_join(conn, cmd, key, stream, state, authority):
             aggregate_id=key,
             denied_reason="this owner already confirmed; awaiting the other owner",
         )
+    # Side coverage (finding 3): when one side has a KNOWN owner and the other routes to the
+    # governance queue, the two confirmations must be one owner + one platform-admin. Two
+    # platform-admins must NOT verify a join that has a known owner (that bypasses the owner's side).
+    if authority.governance_queue and owners:
+        if first not in owners and actor.subject not in owners:
+            return CommandResult(
+                accepted=False,
+                aggregate_id=key,
+                denied_reason="a known owner must confirm their side of the join",
+            )
     # Validate the FINAL value before the second-owner CONFIRMED append (pin 17 — the join confirm
     # path validates too, even though approved_join takes no override).
     value = proposed.payload["proposed_value"]
@@ -1527,6 +1538,7 @@ def _confirm_approved_join(conn, cmd, key, stream, state, authority):
         actor=actor,
         caused_by=state.draft_event_id,
     )
+    from featuregen.overlay.freshness import schedule_expiry  # local import (freshness.py is created in Task 4.3; avoids a top-level forward dependency)
     schedule_expiry(conn, key, confirmed.event_id, expires_at)  # arm overlay_expiry (decision 5)
     _close_fact_tasks(conn, key, reason="join fully confirmed")
     return CommandResult(accepted=True, aggregate_id=key, produced_event_ids=(confirmed.event_id,))
@@ -1656,8 +1668,9 @@ def get_task_proposal(conn: DbConn, task_id: str, actor) -> dict:
     authorized = (
         (subject is not None and actor.subject == subject)
         or (role is not None and role in actor.role_claims)
-        or ("platform-admin" in actor.role_claims)
     )
+    # Note: a platform-admin reads a GOVERNANCE task via the role branch above (its eligible role is
+    # "platform-admin"); it is NOT granted blanket read of every task's proposal (finding 4).
     if not authorized:
         raise OverlayCommandError("actor is not authorized to read this task proposal")
     proposed = _latest_proposed(load_fact(conn, key))
