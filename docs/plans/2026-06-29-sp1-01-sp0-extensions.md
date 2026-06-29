@@ -10,10 +10,13 @@ This phase ships the **additive, backward-compatible SP-0 extensions** that unbl
 (design §2.1–§2.3). All DDL changes to existing tables (`events`, `human_tasks`, `timers`) are **new
 idempotent `.sql` files** under `src/featuregen/db/migrations/` using `ALTER TABLE … DROP/ADD
 CONSTRAINT` and `ADD COLUMN IF NOT EXISTS` — editing a Stage-1 `CREATE TABLE IF NOT EXISTS` string
-does **not** alter an existing table. The new files use the `008x_` prefix so they sort after the gate
-(`0070`), security (`0071`), and runtime (`050x`) DDL they alter, and before privacy (`081x`). After
-each `.sql` file is added it is auto-globbed by `featuregen.db.migrations._sql_file_migrations()` and
-applied by the session test fixture's one-time `apply_migrations`.
+does **not** alter an existing table. Stage-2 `.sql` files apply in **lexical** order, so an SP-1 file
+that ALTERs an existing table MUST sort **after** that table's `.sql`. SP-1 therefore uses the
+`0504`–`0507` prefixes — after `0502` timers and `0503`, after `0070` gates, and before `0810` privacy.
+An `008x_` prefix would sort **before** `0502` and run the `timers` ALTER before the `timers` table
+exists — so it must not be used. After each `.sql` file is added it is auto-globbed by
+`featuregen.db.migrations._sql_file_migrations()` and applied by the session test fixture's one-time
+`apply_migrations`.
 
 > **Postgres constraint-name note (load-bearing):** an *unnamed inline* `CHECK` on a single column is
 > auto-named `{table}_{column}_check` by PostgreSQL. So SP-0's inline checks are named
@@ -26,7 +29,7 @@ applied by the session test fixture's one-time `apply_migrations`.
 ### Task 1.1: `events` — `overlay_fact` aggregate + `overlay_fact_id` column threaded through the append path
 
 **Files:**
-- Create: `src/featuregen/db/migrations/0080_overlay_events.sql`
+- Create: `src/featuregen/db/migrations/0504_overlay_events.sql`
 - Modify: `src/featuregen/contracts/envelopes.py:34-54` (`EventEnvelope`), `:57-72` (`NewEvent`)
 - Modify: `src/featuregen/events/store.py:17-28` (`_INSERT`), `:80-96` (params), `:117-135` (returned envelope)
 - Modify: `src/featuregen/events/serde.py:79-98` (`row_to_event`)
@@ -152,10 +155,10 @@ def test_overlay_events_migration_is_idempotent(conn):
 Run: `uv run pytest tests/featuregen/events/test_overlay_events.py -v`
 Expected: FAIL — `append()` rejects the unexpected `overlay_fact_id` keyword (TypeError) / the `aggregate='overlay_fact'` CHECK violation / no `overlay_fact_id` column.
 
-- [ ] **Step 3: Create the `0080_overlay_events.sql` migration**
+- [ ] **Step 3: Create the `0504_overlay_events.sql` migration**
 
 ```sql
--- src/featuregen/db/migrations/0080_overlay_events.sql
+-- src/featuregen/db/migrations/0504_overlay_events.sql
 -- SP-1 Phase 1 (design §2.1): additive, backward-compatible extension of SP-0's `events`
 -- table to host the `overlay_fact` aggregate. Idempotent: re-running is a clean no-op.
 
@@ -325,7 +328,7 @@ Expected: PASS (5 passed).
 - [ ] **Step 10: Commit**
 
 ```bash
-git add src/featuregen/db/migrations/0080_overlay_events.sql \
+git add src/featuregen/db/migrations/0504_overlay_events.sql \
         src/featuregen/contracts/envelopes.py src/featuregen/events/store.py \
         src/featuregen/events/serde.py src/featuregen/aggregates/_append.py \
         src/featuregen/runtime/outbox.py tests/featuregen/events/test_overlay_events.py
@@ -337,7 +340,7 @@ git commit -m "feat(overlay): add overlay_fact aggregate + overlay_fact_id to ev
 ### Task 1.2: `human_tasks` — overlay gate columns + gate enum, `GateTaskSpec.fact_key`, `_task_aggregate`/`open_task` plumbing
 
 **Files:**
-- Create: `src/featuregen/db/migrations/0081_overlay_gates.sql`
+- Create: `src/featuregen/db/migrations/0505_overlay_gates.sql`
 - Modify: `src/featuregen/contracts/envelopes.py:197-208` (`GateTaskSpec`)
 - Modify: `src/featuregen/gates/tasks.py:20-23` (`_task_aggregate`), `:26-70` (`open_task` INSERT)
 - Test: `tests/featuregen/gates/test_overlay_gates.py`
@@ -433,10 +436,10 @@ def test_overlay_gates_migration_is_idempotent(conn):
 Run: `uv run pytest tests/featuregen/gates/test_overlay_gates.py -v`
 Expected: FAIL — `GateTaskSpec` has no `fact_key` keyword; `_task_aggregate` takes 2 args; gate CHECK rejects `OVERLAY_DATA_OWNER`.
 
-- [ ] **Step 3: Create the `0081_overlay_gates.sql` migration**
+- [ ] **Step 3: Create the `0505_overlay_gates.sql` migration**
 
 ```sql
--- src/featuregen/db/migrations/0081_overlay_gates.sql
+-- src/featuregen/db/migrations/0505_overlay_gates.sql
 -- SP-1 Phase 1 (design §2.2): extend SP-0's human-gate model for overlay confirmations.
 -- Additive + idempotent.
 
@@ -559,7 +562,7 @@ Expected: PASS (5 passed).
 - [ ] **Step 8: Commit**
 
 ```bash
-git add src/featuregen/db/migrations/0081_overlay_gates.sql \
+git add src/featuregen/db/migrations/0505_overlay_gates.sql \
         src/featuregen/contracts/envelopes.py src/featuregen/gates/tasks.py \
         tests/featuregen/gates/test_overlay_gates.py
 git commit -m "feat(overlay): extend human_tasks gate model for overlay confirmations"
@@ -570,7 +573,7 @@ git commit -m "feat(overlay): extend human_tasks gate model for overlay confirma
 ### Task 1.3: `timers` — add `overlay_expiry` kind
 
 **Files:**
-- Create: `src/featuregen/db/migrations/0082_overlay_timers.sql`
+- Create: `src/featuregen/db/migrations/0506_overlay_timers.sql`
 - Test: `tests/featuregen/runtime/test_overlay_timers.py`
 
 **Interfaces:**
@@ -623,10 +626,10 @@ def test_overlay_timers_migration_is_idempotent(conn):
 Run: `uv run pytest tests/featuregen/runtime/test_overlay_timers.py -v`
 Expected: FAIL — inserting `kind='overlay_expiry'` violates `timers_kind_check`.
 
-- [ ] **Step 3: Create the `0082_overlay_timers.sql` migration**
+- [ ] **Step 3: Create the `0506_overlay_timers.sql` migration**
 
 ```sql
--- src/featuregen/db/migrations/0082_overlay_timers.sql
+-- src/featuregen/db/migrations/0506_overlay_timers.sql
 -- SP-1 Phase 1 (design §2.3): admit the overlay expiry timer kind. Additive + idempotent.
 ALTER TABLE timers DROP CONSTRAINT IF EXISTS timers_kind_check;
 ALTER TABLE timers ADD CONSTRAINT timers_kind_check CHECK (
@@ -643,7 +646,7 @@ Expected: PASS (2 passed).
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/featuregen/db/migrations/0082_overlay_timers.sql \
+git add src/featuregen/db/migrations/0506_overlay_timers.sql \
         tests/featuregen/runtime/test_overlay_timers.py
 git commit -m "feat(overlay): add overlay_expiry timer kind"
 ```
@@ -653,7 +656,7 @@ git commit -m "feat(overlay): add overlay_expiry timer kind"
 ### Task 1.4: overlay read/evidence/dependency/fingerprint tables + projection-checkpoint init
 
 **Files:**
-- Create: `src/featuregen/db/migrations/0083_overlay_tables.sql`
+- Create: `src/featuregen/db/migrations/0507_overlay_tables.sql`
 - Test: `tests/featuregen/db/test_overlay_tables.py`
 
 **Interfaces:**
@@ -711,10 +714,10 @@ def test_overlay_tables_migration_is_idempotent(conn):
 Run: `uv run pytest tests/featuregen/db/test_overlay_tables.py -v`
 Expected: FAIL — `to_regclass` returns `None` for the overlay tables; no `'overlay'` checkpoint row.
 
-- [ ] **Step 3: Create the `0083_overlay_tables.sql` migration**
+- [ ] **Step 3: Create the `0507_overlay_tables.sql` migration**
 
 ```sql
--- src/featuregen/db/migrations/0083_overlay_tables.sql
+-- src/featuregen/db/migrations/0507_overlay_tables.sql
 -- SP-1 Phase 1: overlay read model, immutable evidence, dependency index, catalog fingerprint
 -- snapshot, and projection-checkpoint init. All CREATE … IF NOT EXISTS; checkpoint insert is
 -- ON CONFLICT DO NOTHING — fully idempotent.
@@ -748,6 +751,7 @@ CREATE TABLE IF NOT EXISTS overlay_proposal (
     object_ref           text        NOT NULL,
     fact_type            text        NOT NULL,
     use_case             text        NULL,
+    prior_value          jsonb       NULL,
     updated_seq          bigint      NOT NULL
 );
 
@@ -797,7 +801,7 @@ Expected: PASS (3 passed).
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/featuregen/db/migrations/0083_overlay_tables.sql \
+git add src/featuregen/db/migrations/0507_overlay_tables.sql \
         tests/featuregen/db/test_overlay_tables.py
 git commit -m "feat(overlay): add overlay read/evidence/dependency tables + projection checkpoint"
 ```

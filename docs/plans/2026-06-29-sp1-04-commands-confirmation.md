@@ -13,9 +13,10 @@ production wiring (`bootstrap.py`: `register_overlay` + `seed_overlay_authz`). I
 §6.3, §6.4, §6.5, §7.2.
 
 **Cross-phase Consumes (built in earlier phases; used verbatim here):**
-- Phase 1: `events`/`human_tasks` overlay columns; `GateTaskSpec.fact_key`/`.draft_event_id`/`.target_event_id`/`.evidence_ref`; `_task_aggregate` overlay arm; `open_task` threading those columns; `0083` `projection_checkpoints('overlay')` seed.
+- Phase 1: `events`/`human_tasks` overlay columns; `GateTaskSpec.fact_key`/`.draft_event_id`/`.target_event_id`/`.evidence_ref`; `_task_aggregate` overlay arm; `open_task` threading those columns; `0507` `projection_checkpoints('overlay')` seed.
 - Phase 2: `overlay/identity.py` (`CatalogObjectRef`, `ApprovedJoinRef`, `ColumnPair`, `fact_key`, `display_object_ref`, `proposal_fingerprint`); `overlay/facts.py` (`validate_fact_value`, `FactValidationError`, `register_overlay_event_types`, the `OVERLAY_FACT_*` event schemas); `overlay/state.py` (`fold_overlay_state(stream) -> OverlayState` with `.status`, `.draft_event_id`, `.confirmed_event_id`); `overlay/store.py` (`append_overlay_event(...)`, `load_fact(conn, fact_key)`); `overlay/evidence.py` (`read_evidence`).
-- Phase 3: `overlay/catalog.py` (`CatalogAdapter` Protocol, `.owner_of`).
+- Phase 3: `overlay/catalog.py` (`CatalogAdapter` Protocol, `.owner_of`) **and the single-source adapter accessor `register_catalog_adapter(adapter)` / `current_catalog_adapter() -> CatalogAdapter`** (raises `RuntimeError` if none registered; there is no `register_catalog_adapter` variant). All overlay handlers obtain the adapter via `current_catalog_adapter()`.
+- Phase 7: `overlay/freshness.py::schedule_expiry(conn, fact_key, confirmed_event_id, expires_at: datetime) -> str` — arms the SP-0 `overlay_expiry` timer on the fact-key stream (idempotent). `confirm_fact`/`enter_fact`/`approved_join` confirmation call it after appending `OVERLAY_FACT_CONFIRMED` (decision 5). **Forward dependency:** Task 7.1 builds `freshness.py`; its `schedule_expiry` must exist before Task 4.3's confirm test goes green — implement Task 7.1's `schedule_expiry` (or pull a minimal copy forward) ahead of 4.3 if executing strictly phase-by-phase.
 - SP-0: `Command`/`CommandResult`/`DbConn`/`IdentityEnvelope`; `commands/api.py::execute_command`; `commands/registry.py::register_command`; `gates/tasks.py::open_task`/`cancel_task`; `authz/policy.py::seed_authz_policy`; `authz/authorizer.py::PolicyAuthorizer`; `commands/authz_seam.py::register_command_authorizer`; `identity/build.py::build_human_identity`/`build_service_identity`; `events/registry.py::event_registry`.
 
 ---
@@ -29,8 +30,8 @@ production wiring (`bootstrap.py`: `register_overlay` + `seed_overlay_authz`). I
 **Interfaces:**
 - Consumes: `featuregen.overlay.catalog.CatalogAdapter` (`.owner_of(ref) -> str | None`); `featuregen.overlay.identity.{CatalogObjectRef, ApprovedJoinRef, display_object_ref}`; `featuregen.contracts.{DbConn, IdentityEnvelope}`.
 - Produces:
-  - `Authority` (frozen/slots dataclass): `role: str`, `gate: str`, `subjects: tuple[str | None, ...]`, `governance_queue: bool`, `dual: bool = False`; property `eligible_assignees -> dict[str, str]`.
-  - `resolve_authority(conn, adapter, ref, fact_type) -> Authority` — data facts → data owner via `adapter.owner_of`; `policy_tag` → Compliance; unknown owner → governance-queue marker (`platform-admin`, never the submitter); `approved_join` → both owners.
+  - `Authority` (frozen/slots dataclass): `role: str`, `gate: str`, `subjects: tuple[str | None, ...]`, `governance_queue: bool`, `dual: bool = False`; property `eligible_assignees -> dict[str, str]`; **property `task_assignees -> tuple[dict[str, str], ...]`** — the per-side task plan (one `eligible_assignees` mapping per required confirmation; a known side → `{"role": "data_owner", "subject": <owner>}`, an unknown side → `{"role": "platform-admin"}`, deduped).
+  - `resolve_authority(conn, adapter, ref, fact_type) -> Authority` — data facts → data owner via `adapter.owner_of`; `policy_tag` → Compliance; unknown owner → governance-queue marker (`platform-admin`, never the submitter). **`approved_join` resolves authority PER SIDE** (`from_ref` owner, `to_ref` owner): two distinct owners → `dual` (two tasks); a **mixed** case (one known + one unknown) routes ONLY the unknown side to the platform-admin/governance queue and keeps the known side as its data owner — it is **never** collapsed to `role=platform-admin` with `subject=<known owner>` (decision 7).
   - `proposer_ne_confirmer(stream, actor) -> bool` — four-eyes SoD predicate (True ⇒ confirmer differs from the recorded proposer).
 
 - [ ] **Step 1 — write the failing test**
@@ -131,6 +132,23 @@ def test_approved_join_same_owner_both_sides_is_not_dual(db):
     assert auth.subjects == ("user:alice", "user:alice")
 
 
+def test_approved_join_mixed_owner_routes_only_unknown_side_to_governance(db):
+    a = _orders()
+    b = CatalogObjectRef("pg:core", "table", "sales", "customers")
+    cat = _Cat({display_object_ref(a): "user:alice"})  # b's owner unknown
+    ref = ApprovedJoinRef(a, b, (ColumnPair("customer_id", "id"),), "N:1")
+    auth = resolve_authority(db, cat, ref, "approved_join")
+    assert auth.governance_queue is True
+    assert auth.dual is True  # known owner + governance side = two distinct confirmations
+    assert auth.subjects == ("user:alice", None)
+    plans = auth.task_assignees
+    assert {"role": "data_owner", "subject": "user:alice"} in plans
+    assert {"role": "platform-admin"} in plans
+    # the known owner is NEVER folded onto the governance task (decision 7)
+    gov = next(p for p in plans if p["role"] == "platform-admin")
+    assert "subject" not in gov
+
+
 def test_proposer_ne_confirmer(db):
     alice = build_human_identity(subject="user:alice", role_claims=("data_owner",))
     bob = build_human_identity(subject="user:bob", role_claims=("data_owner",))
@@ -167,11 +185,14 @@ from featuregen.overlay.identity import ApprovedJoinRef, CatalogObjectRef
 
 @dataclass(frozen=True, slots=True)
 class Authority:
-    """Resolved authority for a fact. `subjects` holds the resolved owner subject(s)
-    (two ordered entries for an `approved_join`); `governance_queue` is True when a required
-    owner is unknown — the task then routes to the platform-admin/data-governance queue, NEVER
-    to whoever submitted the request (§6 step 1). `dual` is True only for an `approved_join`
-    with two DISTINCT known owners (two-task confirmation, §6.4)."""
+    """Resolved authority for a fact.
+
+    `subjects` holds the resolved owner subject(s) — two ordered entries (`from_ref`, `to_ref`) for an
+    `approved_join`, with `None` in a slot whose owner is unknown. `governance_queue` is True when ANY
+    required owner is unknown: that side's task routes to the platform-admin/data-governance queue,
+    NEVER to whoever submitted the request (§6 step 1). `dual` is True when two DISTINCT confirmations
+    are required (an `approved_join` with two distinct owners, OR one known owner + one governance
+    side; §6.4)."""
 
     role: str
     gate: str
@@ -186,6 +207,29 @@ class Authority:
         if known:
             a["subject"] = known[0]
         return a
+
+    @property
+    def task_assignees(self) -> tuple[dict[str, str], ...]:
+        """Per-side task plan — one `eligible_assignees` mapping per required confirmation. A known
+        side → `{"role": "data_owner", "subject": <owner>}`; an unknown side → `{"role": "platform-admin"}`
+        (governance). The known owner is NEVER folded onto the governance side (decision 7). Deduped
+        so same-owner-both-sides / both-unknown collapse to a single task."""
+        if self.role == "compliance":
+            return ({"role": "compliance"},)
+        if len(self.subjects) == 2:  # approved_join: resolve per side
+            plans: list[dict[str, str]] = []
+            seen: set[tuple] = set()
+            for s in self.subjects:
+                plan = {"role": "data_owner", "subject": s} if s else {"role": "platform-admin"}
+                marker = tuple(sorted(plan.items()))
+                if marker not in seen:
+                    seen.add(marker)
+                    plans.append(plan)
+            return tuple(plans)
+        known = [s for s in self.subjects if s]
+        if known:
+            return ({"role": "data_owner", "subject": known[0]},)
+        return ({"role": "platform-admin"},)
 
 
 def resolve_authority(
@@ -206,13 +250,18 @@ def resolve_authority(
         from_owner = adapter.owner_of(ref.from_ref)
         to_owner = adapter.owner_of(ref.to_ref)
         unknown = from_owner is None or to_owner is None
-        dual = (not unknown) and (from_owner != to_owner)
+        # One distinct confirmation per resolved side; an unknown side resolves to the governance
+        # (platform-admin) queue, NEVER to the other known owner (decision 7). `dual` counts the
+        # distinct (role, subject) sides — so a mixed (known + governance) join is dual.
+        sides = {
+            (("data_owner", o) if o else ("platform-admin", None)) for o in (from_owner, to_owner)
+        }
         return Authority(
-            role=("platform-admin" if unknown else "data_owner"),
+            role=("data_owner" if (from_owner or to_owner) else "platform-admin"),
             gate="OVERLAY_DATA_OWNER",
             subjects=(from_owner, to_owner),
             governance_queue=unknown,
-            dual=dual,
+            dual=len(sides) > 1,
         )
     assert isinstance(ref, CatalogObjectRef)
     owner = adapter.owner_of(ref)
@@ -237,7 +286,7 @@ def proposer_ne_confirmer(stream: Sequence, actor: IdentityEnvelope) -> bool:
 
 - [ ] **Step 4 — run it (passes)**
   - `uv run pytest tests/featuregen/overlay/test_authority.py -v`
-  - Expected: PASS (6 tests).
+  - Expected: PASS (7 tests).
 
 - [ ] **Step 5 — commit**
   - `git add src/featuregen/overlay/authority.py tests/featuregen/overlay/test_authority.py && git commit -m "feat(overlay): per-fact authority resolver + four-eyes SoD helper"`
@@ -252,8 +301,8 @@ def proposer_ne_confirmer(stream: Sequence, actor: IdentityEnvelope) -> bool:
 - Test: `tests/featuregen/overlay/test_propose_fact.py`
 
 **Interfaces:**
-- Consumes: `append_overlay_event`/`load_fact` (store.py); `fold_overlay_state` (state.py); `fact_key`/`display_object_ref`/`proposal_fingerprint` (identity.py); `validate_fact_value`/`FactValidationError` (facts.py); `resolve_authority` (authority.py); `GateTaskSpec` + `open_task` (SP-0 gates); `register_command` (SP-0).
-- Produces: `propose_fact(conn, cmd) -> CommandResult`; the catalog-adapter seam `register_overlay_catalog_adapter(adapter)` / `current_catalog_adapter()`; `OverlayCommandError`; module helpers `_latest_proposed`, `_cas_target`, `_actor_is_authority`, `_close_fact_tasks`. Appends `OVERLAY_FACT_PROPOSED` (`expected_version=0` for a new fact) and opens an `OVERLAY_DATA_OWNER`/`OVERLAY_COMPLIANCE` task per resolved owner.
+- Consumes: `append_overlay_event`/`load_fact` (store.py); `fold_overlay_state` (state.py); `fact_key`/`display_object_ref`/`proposal_fingerprint` (identity.py); `validate_fact_value`/`FactValidationError` (facts.py); `resolve_authority` (authority.py); **`current_catalog_adapter` (catalog.py — the single-source adapter accessor; there is no `register_catalog_adapter`)**; `GateTaskSpec` + `open_task` (SP-0 gates); `register_command`/`get_command` (SP-0).
+- Produces: `propose_fact(conn, cmd) -> CommandResult` (reads the ref from `cmd.args["ref"]`, resolves the adapter via `current_catalog_adapter()`); `OverlayCommandError`; module helpers `_latest_proposed`, `_cas_target`, `_actor_is_authority` (accepts `platform-admin` for governance-queue tasks), `_close_fact_tasks`. Enforces **replacement semantics** (decision 6): denies a proposal whenever a non-terminal fact already exists (status ∈ {DRAFT, PARTIALLY_CONFIRMED, VERIFIED, REVERIFY, STALE}); only an empty stream or a REJECTED terminal admits a new proposal (and a REJECTED fingerprint is sticky). Appends `OVERLAY_FACT_PROPOSED` (`expected_version=0` for a new fact) and opens one task **per resolved side** via `authority.task_assignees` (`OVERLAY_DATA_OWNER`/`OVERLAY_COMPLIANCE`).
 
 - [ ] **Step 1 — create the shared overlay test conftest**
 
@@ -262,10 +311,8 @@ def proposer_ne_confirmer(stream: Sequence, actor: IdentityEnvelope) -> bool:
 import pytest
 
 from featuregen.events.registry import event_registry
-from featuregen.overlay.commands import (
-    register_overlay_catalog_adapter,
-    register_overlay_commands,
-)
+from featuregen.overlay.catalog import register_catalog_adapter
+from featuregen.overlay.commands import register_overlay_commands
 from featuregen.overlay.facts import register_overlay_event_types
 from featuregen.overlay.identity import display_object_ref
 
@@ -293,18 +340,26 @@ class StubCatalog:
         return {}
 
 
-@pytest.fixture(autouse=True)
-def _register_overlay_runtime():
-    # Runs AFTER the autouse registry reset in tests/conftest.py, so overlay event schemas and
-    # the overlay command catalog are present for every overlay test.
-    register_overlay_event_types(event_registry())
+@pytest.fixture(scope="session", autouse=True)
+def _register_overlay_commands_once():
+    # The COMMAND registry persists across tests (the root test harness resets only the event
+    # registry — decision 8), so register the overlay command catalog exactly ONCE per session.
+    # `register_overlay_commands()` is itself idempotent (skips already-registered actions), so this
+    # is safe even if the registry was already populated by another module earlier in the session.
     register_overlay_commands()
+
+
+@pytest.fixture(autouse=True)
+def _register_overlay_event_types():
+    # The EVENT registry IS reset per test by the root harness, so re-register the overlay event
+    # schemas for every overlay test (so `append_event` validation passes).
+    register_overlay_event_types(event_registry())
 
 
 @pytest.fixture
 def catalog():
     cat = StubCatalog()
-    register_overlay_catalog_adapter(cat)
+    register_catalog_adapter(cat)  # single-source accessor from overlay/catalog.py
     return cat
 ```
 
@@ -316,8 +371,13 @@ from psycopg.rows import dict_row
 
 from featuregen.contracts import Command
 from featuregen.identity.build import build_human_identity
-from featuregen.overlay.commands import propose_fact
-from featuregen.overlay.identity import CatalogObjectRef, fact_key
+from featuregen.overlay.commands import confirm_fact, propose_fact, reject_fact
+from featuregen.overlay.identity import (
+    ApprovedJoinRef,
+    CatalogObjectRef,
+    ColumnPair,
+    fact_key,
+)
 
 
 def _orders() -> CatalogObjectRef:
@@ -386,6 +446,94 @@ def test_policy_tag_opens_compliance_task(db, catalog):
         row = cur.fetchone()
         assert row["gate"] == "OVERLAY_COMPLIANCE"
         assert row["eligible_assignees"] == {"role": "compliance"}
+
+
+def test_propose_on_verified_fact_is_denied(db, catalog):
+    """Replacement semantics (decision 6): a VERIFIED fact stays usable until its own re-verify
+    flow replaces it — a fresh proposal must NOT regress it to DRAFT."""
+    catalog.set_owner(_orders(), "user:alice")
+    bob = build_human_identity(subject="user:bob", role_claims=("data_owner",))
+    alice = build_human_identity(subject="user:alice", role_claims=("data_owner",))
+    p = propose_fact(
+        db,
+        _propose_cmd(ref=_orders(), fact_type="grain", value={"columns": ["order_id"], "is_unique": True}, actor=bob, key="p1"),
+    )
+    assert p.accepted
+    draft = p.produced_event_ids[0]
+    c = confirm_fact(
+        db,
+        Command(
+            "confirm_fact", "overlay_fact", None,
+            {"ref": _orders(), "fact_type": "grain", "target_event_id": draft}, alice, "c1",
+        ),
+    )
+    assert c.accepted, c.denied_reason  # now VERIFIED
+    again = propose_fact(
+        db,
+        _propose_cmd(ref=_orders(), fact_type="grain", value={"columns": ["order_id", "tenant"], "is_unique": True}, key="p2"),
+    )
+    assert again.accepted is False
+    assert "non-terminal" in again.denied_reason
+
+
+def test_repropose_after_reject_requires_new_fingerprint(db, catalog):
+    """After REJECTED, the same fingerprint is sticky-denied; a DIFFERENT fingerprint is allowed."""
+    catalog.set_owner(_orders(), "user:alice")
+    bob = build_human_identity(subject="user:bob", role_claims=("data_owner",))
+    alice = build_human_identity(subject="user:alice", role_claims=("data_owner",))
+    p = propose_fact(
+        db,
+        _propose_cmd(ref=_orders(), fact_type="grain", value={"columns": ["order_id"], "is_unique": True}, actor=bob, key="p1"),
+    )
+    draft = p.produced_event_ids[0]
+    r = reject_fact(
+        db,
+        Command(
+            "reject_fact", "overlay_fact", None,
+            {"ref": _orders(), "fact_type": "grain", "target_event_id": draft, "reason": "wrong key"}, alice, "r1",
+        ),
+    )
+    assert r.accepted, r.denied_reason
+    same = propose_fact(
+        db,
+        _propose_cmd(ref=_orders(), fact_type="grain", value={"columns": ["order_id"], "is_unique": True}, key="p2"),
+    )
+    assert same.accepted is False
+    assert "rejected" in same.denied_reason
+    diff = propose_fact(
+        db,
+        _propose_cmd(ref=_orders(), fact_type="grain", value={"columns": ["order_id", "tenant"], "is_unique": True}, key="p3"),
+    )
+    assert diff.accepted is True
+
+
+def test_mixed_owner_join_opens_owner_and_governance_tasks(db, catalog):
+    """approved_join with one known owner + one unknown owner opens TWO tasks: one for the known
+    owner and one routed to the platform-admin/governance queue (decision 7) — the known owner is
+    never folded onto the governance task."""
+    a = _orders()
+    b = CatalogObjectRef("pg:core", "table", "sales", "customers")
+    catalog.set_owner(a, "user:alice")  # b's owner is unknown
+    ref = ApprovedJoinRef(a, b, (ColumnPair("customer_id", "id"),), "N:1")
+    value = {
+        "from_columns": ["customer_id"],
+        "to_ref": {"catalog_source": "pg:core", "object_kind": "table", "schema": "sales", "table": "customers", "column": None},
+        "to_columns": ["id"],
+        "cardinality": "N:1",
+    }
+    res = propose_fact(db, _propose_cmd(ref=ref, fact_type="approved_join", value=value, key="j1"))
+    assert res.accepted is True, res.denied_reason
+    key = fact_key(ref, "approved_join")
+    with db.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            "SELECT eligible_assignees FROM human_tasks WHERE fact_key=%s AND status='open'", (key,)
+        )
+        rows = [r["eligible_assignees"] for r in cur.fetchall()]
+    assert sorted(r["role"] for r in rows) == ["data_owner", "platform-admin"]
+    owner_task = next(r for r in rows if r["role"] == "data_owner")
+    assert owner_task["subject"] == "user:alice"
+    gov_task = next(r for r in rows if r["role"] == "platform-admin")
+    assert "subject" not in gov_task  # NOT collapsed to the known owner
 ```
 
 - [ ] **Step 3 — run it (fails)**
@@ -401,13 +549,14 @@ from __future__ import annotations
 from dataclasses import asdict
 from datetime import UTC, datetime, timedelta
 
-from featuregen.commands.registry import register_command
+from featuregen.commands.registry import get_command, register_command
 from featuregen.contracts import Command, CommandResult, DbConn
 from featuregen.contracts.gates import GateTaskSpec
 from featuregen.gates.tasks import cancel_task, open_task
 from featuregen.overlay.authority import Authority, proposer_ne_confirmer, resolve_authority
-from featuregen.overlay.catalog import CatalogAdapter
+from featuregen.overlay.catalog import current_catalog_adapter
 from featuregen.overlay.facts import FactValidationError, validate_fact_value
+from featuregen.overlay.freshness import schedule_expiry
 from featuregen.overlay.identity import (
     display_object_ref,
     fact_key,
@@ -416,29 +565,20 @@ from featuregen.overlay.identity import (
 from featuregen.overlay.state import fold_overlay_state
 from featuregen.overlay.store import append_overlay_event, load_fact
 
-# Default re-verification horizon stamped on FACT_CONFIRMED; the SP-0 timer that fires at
-# `expires_at` is scheduled in Phase 7 (`freshness.schedule_expiry`) — Phase 4 only records it.
+# Default re-verification horizon stamped on FACT_CONFIRMED; the confirm handlers both record it on
+# the event payload AND arm the SP-0 `overlay_expiry` timer via `freshness.schedule_expiry`
+# (decision 5) — the Phase 7 `fire_due_overlay_expiries` poller fires it.
 _DEFAULT_TTL = timedelta(days=180)
 
 
 class OverlayCommandError(Exception):
-    """Raised on overlay command misconfiguration (e.g. no catalog adapter registered)."""
+    """Raised on overlay command misconfiguration / unauthorized task reads."""
 
 
-_CATALOG_ADAPTER: CatalogAdapter | None = None
-
-
-def register_overlay_catalog_adapter(adapter: CatalogAdapter) -> None:
-    """Inject the process-wide catalog adapter the handlers use to resolve authority (mirrors the
-    `commands.authz_seam` injection pattern)."""
-    global _CATALOG_ADAPTER
-    _CATALOG_ADAPTER = adapter
-
-
-def current_catalog_adapter() -> CatalogAdapter:
-    if _CATALOG_ADAPTER is None:
-        raise OverlayCommandError("no overlay catalog adapter registered")
-    return _CATALOG_ADAPTER
+# The catalog adapter is the single-source module global in `overlay/catalog.py`; every handler
+# resolves it via `current_catalog_adapter()` (imported above). There is NO per-module
+# `register_catalog_adapter` seam — production wires it once via `register_catalog_adapter`
+# in `bootstrap.register_overlay`, and tests register a `StubCatalog`/`FixtureCatalog` the same way.
 
 
 def _latest_proposed(stream):
@@ -457,6 +597,10 @@ def _cas_target(state) -> str | None:
 
 
 def _actor_is_authority(authority: Authority, actor) -> bool:
+    # A governance-queue fact (unknown owner) is confirmable by a platform-admin so fallback tasks
+    # are not stuck forever (decision 7); otherwise authority is role/owner-specific.
+    if authority.governance_queue and "platform-admin" in actor.role_claims:
+        return True
     if authority.role == "compliance":
         return "compliance" in actor.role_claims
     return actor.subject in {s for s in authority.subjects if s}
@@ -493,7 +637,12 @@ def propose_fact(conn: DbConn, cmd: Command) -> CommandResult:
     )
     existing = load_fact(conn, key)
     state = fold_overlay_state(existing)
-    if state.status in ("DRAFT", "PARTIALLY_CONFIRMED"):
+    # Replacement semantics (decision 6): a new proposal is DENIED whenever a non-terminal fact
+    # already exists — a live VERIFIED fact stays usable until its OWN re-verify flow replaces it
+    # (no VERIFIED->DRAFT regression). Only an empty stream or a REJECTED terminal admits a new
+    # proposal; a previously-rejected fingerprint stays sticky.
+    _NON_TERMINAL = ("DRAFT", "PARTIALLY_CONFIRMED", "VERIFIED", "REVERIFY", "STALE")
+    if state.status in _NON_TERMINAL:
         latest = _latest_proposed(existing)
         if latest is not None and latest.payload.get("proposal_fingerprint") == fp:
             return CommandResult(
@@ -501,15 +650,23 @@ def propose_fact(conn: DbConn, cmd: Command) -> CommandResult:
                 aggregate_id=key,
                 denied_reason="duplicate of a pending proposal (same fingerprint)",
             )
-    rejected_fps = {
-        e.payload.get("retired_fingerprint")
-        for e in existing
-        if e.type == "OVERLAY_FACT_REJECTED"
-    }
-    if fp in rejected_fps:
         return CommandResult(
-            accepted=False, aggregate_id=key, denied_reason="fingerprint previously rejected (sticky)"
+            accepted=False,
+            aggregate_id=key,
+            denied_reason=f"a non-terminal fact already exists (status={state.status}); cannot re-propose",
         )
+    if state.status == "REJECTED":
+        rejected_fps = {
+            e.payload.get("retired_fingerprint")
+            for e in existing
+            if e.type == "OVERLAY_FACT_REJECTED"
+        }
+        if fp in rejected_fps:
+            return CommandResult(
+                accepted=False,
+                aggregate_id=key,
+                denied_reason="fingerprint previously rejected (sticky); change the proposal to re-submit",
+            )
     authority = resolve_authority(conn, adapter, ref, fact_type)
     draft = append_overlay_event(
         conn,
@@ -528,17 +685,15 @@ def propose_fact(conn: DbConn, cmd: Command) -> CommandResult:
         actor=cmd.actor,
         expected_version=0 if not existing else None,
     )
-    targets = [s for s in authority.subjects if s] or [None]
-    for subj in targets:
-        eligible: dict[str, str] = {"role": authority.role}
-        if subj:
-            eligible["subject"] = subj
+    # One task per resolved side (decision 7): a known side -> the data owner; an unknown side ->
+    # the platform-admin/governance queue. `task_assignees` dedupes same-owner / both-unknown.
+    for eligible in authority.task_assignees:
         open_task(
             conn,
             GateTaskSpec(
                 gate=authority.gate,
                 required_inputs=("proposed_value",),
-                eligible_assignees=eligible,
+                eligible_assignees=dict(eligible),
                 allowed_responses=("confirm", "reject"),
                 fact_key=key,
                 draft_event_id=draft.event_id,
@@ -555,13 +710,19 @@ _OVERLAY_CATALOG = {
 
 
 def register_overlay_commands() -> None:
+    """Idempotent (decision 8): `register_command` raises on duplicate and the command registry
+    persists across tests (the root harness resets only the event registry), so skip any action
+    that is already registered instead of re-registering it."""
     for action, handler in _OVERLAY_CATALOG.items():
-        register_command(action, handler)
+        try:
+            get_command(action)
+        except KeyError:
+            register_command(action, handler)
 ```
 
 - [ ] **Step 5 — run it (passes)**
   - `uv run pytest tests/featuregen/overlay/test_propose_fact.py -v`
-  - Expected: PASS (3 tests).
+  - Expected: PASS (6 tests).
 
 - [ ] **Step 6 — commit**
   - `git add src/featuregen/overlay/commands.py tests/featuregen/overlay/conftest.py tests/featuregen/overlay/test_propose_fact.py && git commit -m "feat(overlay): propose_fact handler opens a human-gate task with dedup"`
@@ -575,8 +736,8 @@ def register_overlay_commands() -> None:
 - Test: `tests/featuregen/overlay/test_confirm_reject.py`
 
 **Interfaces:**
-- Consumes: everything from 4.2 plus `_cas_target`, `_actor_is_authority`, `_close_fact_tasks`, `proposer_ne_confirmer`.
-- Produces: `confirm_fact(conn, cmd) -> CommandResult` (appends `OVERLAY_FACT_CONFIRMED`: `value`, `confirmers`, `expires_at`, `confirms_event_id`); `reject_fact(conn, cmd) -> CommandResult` (appends `OVERLAY_FACT_REJECTED`: `rejected_by`, `reason`, `target_event_id`, `retired_fingerprint`). Both CAS on `cmd.args["target_event_id"]`, enforce resolved authority, and `cancel_task` the open task.
+- Consumes: everything from 4.2 plus `_cas_target`, `_actor_is_authority`, `_close_fact_tasks`, `proposer_ne_confirmer`; **`schedule_expiry` (Phase 7 `freshness.py`)**.
+- Produces: `confirm_fact(conn, cmd) -> CommandResult` (appends `OVERLAY_FACT_CONFIRMED`: `value`, `confirmers`, `expires_at`, `confirms_event_id`, then **calls `schedule_expiry(conn, fact_key, confirmed.event_id, expires_at)` to arm the `overlay_expiry` timer** — decision 5); `reject_fact(conn, cmd) -> CommandResult` (appends `OVERLAY_FACT_REJECTED`: `rejected_by`, `reason`, `target_event_id`, `retired_fingerprint`). Both CAS on `cmd.args["target_event_id"]`, enforce resolved authority (a `platform-admin` may confirm a governance-queue fact), and `cancel_task` the open task.
 
 - [ ] **Step 1 — write the failing test**
 
@@ -594,6 +755,7 @@ from featuregen.overlay.store import load_fact
 ALICE = build_human_identity(subject="user:alice", role_claims=("data_owner",))
 BOB = build_human_identity(subject="user:bob", role_claims=("data_owner",))
 COMPLIANCE = build_human_identity(subject="user:carol", role_claims=("compliance",))
+ADMIN = build_human_identity(subject="user:admin", role_claims=("platform-admin",))
 
 
 def _orders() -> CatalogObjectRef:
@@ -630,6 +792,21 @@ def test_owner_confirms_draft_to_verified(db, catalog):
     with db.cursor(row_factory=dict_row) as cur:
         cur.execute("SELECT status FROM human_tasks WHERE fact_key=%s", (key,))
         assert cur.fetchone()["status"] == "cancelled"
+        # confirming arms exactly one overlay_expiry timer on the fact-key stream (decision 5)
+        cur.execute(
+            "SELECT count(*) AS n FROM timers WHERE kind='overlay_expiry' AND aggregate_id=%s", (key,)
+        )
+        assert cur.fetchone()["n"] == 1
+
+
+def test_platform_admin_confirms_governance_queue_task(db, catalog):
+    # No owner recorded -> governance queue; a platform-admin may confirm the fallback task so it
+    # is not stuck forever (decision 7). Proposed by BOB, so four-eyes is satisfied.
+    draft = _propose(db)
+    res = confirm_fact(db, _confirm_cmd(target=draft, actor=ADMIN))
+    assert res.accepted is True, res.denied_reason
+    key = fact_key(_orders(), "grain")
+    assert fold_overlay_state(load_fact(db, key)).status == "VERIFIED"
 
 
 def test_wrong_role_is_denied(db, catalog):
@@ -732,7 +909,7 @@ def confirm_fact(conn: DbConn, cmd: Command) -> CommandResult:
     proposed = _latest_proposed(stream)
     value = args.get("value", proposed.payload["proposed_value"])
     role = "compliance" if fact_type == "policy_tag" else "data_owner"
-    expires_at = (datetime.now(UTC) + _DEFAULT_TTL).isoformat()
+    expires_at = datetime.now(UTC) + _DEFAULT_TTL
     confirmed = append_overlay_event(
         conn,
         fact_key=key,
@@ -740,12 +917,14 @@ def confirm_fact(conn: DbConn, cmd: Command) -> CommandResult:
         payload={
             "value": value,
             "confirmers": [{"subject": cmd.actor.subject, "role": role}],
-            "expires_at": expires_at,
+            "expires_at": expires_at.isoformat(),
             "confirms_event_id": args["target_event_id"],
         },
         actor=cmd.actor,
         caused_by=args["target_event_id"],
     )
+    # Arm the SP-0 overlay_expiry timer on this fact-key stream (decision 5; freshness.py is Phase 7).
+    schedule_expiry(conn, key, confirmed.event_id, expires_at)
     _close_fact_tasks(conn, key, reason="fact confirmed")
     return CommandResult(accepted=True, aggregate_id=key, produced_event_ids=(confirmed.event_id,))
 
@@ -809,7 +988,7 @@ _OVERLAY_CATALOG = {
 
 - [ ] **Step 4 — run it (passes)**
   - `uv run pytest tests/featuregen/overlay/test_confirm_reject.py -v`
-  - Expected: PASS (5 tests).
+  - Expected: PASS (6 tests).
 
 - [ ] **Step 5 — commit**
   - `git add src/featuregen/overlay/commands.py tests/featuregen/overlay/test_confirm_reject.py && git commit -m "feat(overlay): confirm_fact/reject_fact with CAS, fine authority and SoD"`
@@ -823,7 +1002,7 @@ _OVERLAY_CATALOG = {
 - Test: `tests/featuregen/overlay/test_enter_fact.py`
 
 **Interfaces:**
-- Consumes: `validate_fact_value`, `resolve_authority`, `_actor_is_authority`, `append_overlay_event`, `load_fact`.
+- Consumes: `validate_fact_value`, `resolve_authority`, `_actor_is_authority`, `append_overlay_event`, `load_fact`, `current_catalog_adapter` (catalog.py), `schedule_expiry` (Phase 7 `freshness.py`).
 - Produces: `enter_fact(conn, cmd) -> CommandResult` — when the human actor IS the resolved authority, atomically appends `OVERLAY_FACT_PROPOSED` (`expected_version=0`) + `OVERLAY_FACT_CONFIRMED` (self-confirm, audited). Denied for service principals and for a dual-owner `approved_join`.
 
 - [ ] **Step 1 — write the failing test**
@@ -972,7 +1151,7 @@ def enter_fact(conn: DbConn, cmd: Command) -> CommandResult:
     else:
         role = "compliance" if fact_type == "policy_tag" else "data_owner"
         confirmers = [{"subject": cmd.actor.subject, "role": role}]
-    expires_at = (datetime.now(UTC) + _DEFAULT_TTL).isoformat()
+    expires_at = datetime.now(UTC) + _DEFAULT_TTL
     confirmed = append_overlay_event(
         conn,
         fact_key=key,
@@ -980,12 +1159,14 @@ def enter_fact(conn: DbConn, cmd: Command) -> CommandResult:
         payload={
             "value": proposed_value,
             "confirmers": confirmers,
-            "expires_at": expires_at,
+            "expires_at": expires_at.isoformat(),
             "confirms_event_id": draft.event_id,
         },
         actor=cmd.actor,
         caused_by=draft.event_id,
     )
+    # A self-confirmed fact reaches VERIFIED too, so it also gets an overlay_expiry timer (decision 5).
+    schedule_expiry(conn, key, confirmed.event_id, expires_at)
     return CommandResult(
         accepted=True, aggregate_id=key, produced_event_ids=(draft.event_id, confirmed.event_id)
     )
@@ -1018,7 +1199,7 @@ _OVERLAY_CATALOG = {
 - Test: `tests/featuregen/overlay/test_approved_join.py`
 
 **Interfaces:**
-- Consumes: `confirm_fact` (extended), `_close_fact_tasks`, `_latest_proposed`, `append_overlay_event`.
+- Consumes: `confirm_fact` (extended), `_close_fact_tasks`, `_latest_proposed`, `append_overlay_event`, `schedule_expiry` (Phase 7 `freshness.py`).
 - Produces: dual-confirmation flow — first owner → `OVERLAY_FACT_PARTIALLY_CONFIRMED` (`by_owner`, `role`, `draft_event_id`); second (distinct) owner → `OVERLAY_FACT_CONFIRMED` recording BOTH confirmers; same-owner-both-sides verifies in a single confirm (handled by the existing single path, since `Authority.dual` is False); either owner's reject → REJECTED (existing `reject_fact`).
 
 - [ ] **Step 1 — write the failing test**
@@ -1172,7 +1353,11 @@ and add the helper at module scope:
 def _confirm_approved_join(conn, cmd, key, stream, state, authority):
     actor = cmd.actor
     owners = {s for s in authority.subjects if s}
-    if actor.subject not in owners:
+    # A mixed join (one known owner + one unknown/governance side) requires a platform-admin to act
+    # for the governance side; otherwise only the resolved owners may confirm (decision 7).
+    is_owner = actor.subject in owners
+    is_governance = authority.governance_queue and "platform-admin" in actor.role_claims
+    if not (is_owner or is_governance):
         return CommandResult(
             accepted=False, aggregate_id=key, denied_reason="actor is not an owner of either side of the join"
         )
@@ -1200,7 +1385,7 @@ def _confirm_approved_join(conn, cmd, key, stream, state, authority):
             aggregate_id=key,
             denied_reason="this owner already confirmed; awaiting the other owner",
         )
-    expires_at = (datetime.now(UTC) + _DEFAULT_TTL).isoformat()
+    expires_at = datetime.now(UTC) + _DEFAULT_TTL
     confirmed = append_overlay_event(
         conn,
         fact_key=key,
@@ -1211,12 +1396,13 @@ def _confirm_approved_join(conn, cmd, key, stream, state, authority):
                 {"subject": first, "role": "data_owner_from"},
                 {"subject": actor.subject, "role": "data_owner_to"},
             ],
-            "expires_at": expires_at,
+            "expires_at": expires_at.isoformat(),
             "confirms_event_id": state.draft_event_id,
         },
         actor=actor,
         caused_by=state.draft_event_id,
     )
+    schedule_expiry(conn, key, confirmed.event_id, expires_at)  # arm overlay_expiry (decision 5)
     _close_fact_tasks(conn, key, reason="join fully confirmed")
     return CommandResult(accepted=True, aggregate_id=key, produced_event_ids=(confirmed.event_id,))
 ```
@@ -1245,8 +1431,8 @@ owner because `_actor_is_authority` for a `data_owner` authority admits any subj
 - Test: `tests/featuregen/overlay/test_get_task_proposal.py`
 
 **Interfaces:**
-- Consumes: `human_tasks` (`fact_key`, `eligible_assignees`, `evidence_ref`); `load_fact`; `_latest_proposed`; `read_evidence` (evidence.py).
-- Produces: `get_task_proposal(conn, task_id, actor) -> dict` with keys `object_ref, fact_type, use_case, proposed_value, evidence`. Authorized to the task assignee (matching `eligible_assignees.subject`/`role`) or the governance role (`platform-admin`); raises `OverlayCommandError` otherwise.
+- Consumes: `human_tasks` (`fact_key`, `eligible_assignees`, `evidence_ref`); **`overlay_proposal` (`prior_value`, `target_event_id`, `draft_event_id`) — the Phase 2 `OverlayProjection` read model**; `load_fact`; `_latest_proposed`; `read_evidence` (evidence.py).
+- Produces: `get_task_proposal(conn, task_id, actor) -> dict` with keys `object_ref, fact_type, use_case, proposed_value, prior_value, target_event_id, evidence` (matches the overview Shared Contract). `prior_value` and `target_event_id` are read from `overlay_proposal` (falling back to `draft_event_id` for the CAS target while the proposal is a fresh DRAFT). Authorized to the task assignee (matching `eligible_assignees.subject`/`role`) or the governance role (`platform-admin`); raises `OverlayCommandError` otherwise.
 
 - [ ] **Step 1 — write the failing test**
 
@@ -1262,6 +1448,8 @@ from featuregen.overlay.commands import (
     propose_fact,
 )
 from featuregen.overlay.identity import CatalogObjectRef, display_object_ref, fact_key
+from featuregen.overlay.projection import OverlayProjection
+from featuregen.projections.runner import run_projection
 
 ALICE = build_human_identity(subject="user:alice", role_claims=("data_owner",))
 MALLORY = build_human_identity(subject="user:mallory", role_claims=("data_scientist",))
@@ -1288,27 +1476,33 @@ def _propose_and_task(db):
         ),
     )
     assert res.accepted
+    draft = res.produced_event_ids[0]
+    # get_task_proposal reads prior_value/target_event_id from the overlay_proposal read model, so
+    # the OverlayProjection (Phase 2) must run before the task-scoped read.
+    run_projection(db, OverlayProjection())
     key = fact_key(_orders(), "grain")
     row = db.execute(
         "SELECT task_id FROM human_tasks WHERE fact_key=%s AND status='open'", (key,)
     ).fetchone()
-    return row[0]
+    return row[0], draft
 
 
 def test_assignee_can_read_proposal(db, catalog):
     catalog.set_owner(_orders(), "user:alice")
-    task_id = _propose_and_task(db)
+    task_id, draft = _propose_and_task(db)
     out = get_task_proposal(db, task_id, ALICE)
     assert out["fact_type"] == "grain"
     assert out["object_ref"] == display_object_ref(_orders())
     assert out["proposed_value"] == {"columns": ["order_id"], "is_unique": True}
     assert out["use_case"] is None
+    assert out["prior_value"] is None  # a fresh DRAFT has no prior value
+    assert out["target_event_id"] == draft  # the CAS target for a fresh DRAFT is the draft event id
     assert out["evidence"] is None
 
 
 def test_non_assignee_is_denied(db, catalog):
     catalog.set_owner(_orders(), "user:alice")
-    task_id = _propose_and_task(db)
+    task_id, _ = _propose_and_task(db)
     with pytest.raises(OverlayCommandError):
         get_task_proposal(db, task_id, MALLORY)
 ```
@@ -1345,11 +1539,26 @@ def get_task_proposal(conn: DbConn, task_id: str, actor) -> dict:
     if proposed is None:
         raise OverlayCommandError(f"task {task_id} has no proposal on its fact stream")
     p = proposed.payload
+    # Prior value + the CAS target the confirmer must bind to come from the overlay_proposal read
+    # model (§7.2). For a fresh DRAFT the proposal's target_event_id is still NULL, so fall back to
+    # its draft_event_id (which IS the CAS target while awaiting first confirmation).
+    prow = conn.execute(
+        "SELECT prior_value, target_event_id, draft_event_id FROM overlay_proposal WHERE fact_key=%s",
+        (key,),
+    ).fetchone()
+    if prow is not None:
+        prior_value = prow[0]
+        target_event_id = prow[1] or prow[2]
+    else:
+        prior_value = None
+        target_event_id = None
     return {
         "object_ref": p["object_ref"],
         "fact_type": p["fact_type"],
         "use_case": p.get("use_case"),
         "proposed_value": p["proposed_value"],
+        "prior_value": prior_value,
+        "target_event_id": target_event_id,
         "evidence": read_evidence(conn, evidence_ref) if evidence_ref else None,
     }
 ```
@@ -1372,7 +1581,7 @@ def get_task_proposal(conn: DbConn, task_id: str, actor) -> dict:
 **Interfaces:**
 - Consumes: `register_overlay_event_types` (facts.py); `register_overlay_commands` (commands.py); `event_registry` (SP-0); `authz_policy` table; `projection_checkpoints` table.
 - Produces:
-  - `register_overlay(handler_registry) -> None` — registers overlay event schemas + the overlay command catalog. (The `timer.overlay_expiry` `OverlayExpiryHandler` is registered into `handler_registry` in Phase 7 Task 7.1, where `freshness.py` is built; this function is extended there.)
+  - `register_overlay(handler_registry) -> None` — registers overlay event schemas + the (idempotent) overlay command catalog. **There is no `timer.overlay_expiry` HandlerRegistry handler** — expiry is the explicit `fire_due_overlay_expiries(conn, *, now)` poller built in Phase 7 (decision 5). The catalog adapter is wired separately via `register_catalog_adapter(...)` from `overlay/catalog.py` (the deployment entrypoint / tests register a `PostgresCatalog`/`FixtureCatalog`). `handler_registry` is accepted for symmetry with the SP-0 bootstrap signature.
   - `seed_overlay_authz(conn) -> None` — idempotent INSERT of the 9 overlay authz rows (overview) + `projection_checkpoints('overlay')` init.
 
 - [ ] **Step 1 — write the failing test**
@@ -1388,7 +1597,7 @@ from featuregen.commands.authz_seam import register_command_authorizer
 from featuregen.contracts import Command
 from featuregen.identity.build import build_human_identity, build_service_identity
 from featuregen.overlay.bootstrap import register_overlay, seed_overlay_authz
-from featuregen.overlay.commands import register_overlay_catalog_adapter
+from featuregen.overlay.catalog import register_catalog_adapter
 from featuregen.overlay.identity import CatalogObjectRef, fact_key
 
 
@@ -1415,7 +1624,7 @@ def _wire(db, catalog):
 
     cat = StubCatalog()
     cat.set_owner(_orders(), "user:alice")
-    register_overlay_catalog_adapter(cat)
+    register_catalog_adapter(cat)
     return cat
 
 
@@ -1513,9 +1722,12 @@ _OVERLAY_POLICY_ROWS: tuple[tuple[str, str, str, str, str | None], ...] = (
 
 def register_overlay(handler_registry) -> None:
     """Production wiring for the overlay write side: event schemas (so `append_event` validation
-    passes) + the overlay command catalog. The `timer.overlay_expiry` handler is added to
-    `handler_registry` in Phase 7 (Task 7.1) once `freshness.OverlayExpiryHandler` exists; this
-    function is extended there. `handler_registry` is accepted now so callers can wire once."""
+    passes) + the (idempotent) overlay command catalog. Expiry is NOT a HandlerRegistry handler —
+    it is the explicit `freshness.fire_due_overlay_expiries` poller (decision 5), so nothing is
+    registered into `handler_registry` here; it is accepted only for signature symmetry with the
+    SP-0 bootstrap. The catalog adapter is injected separately via `register_catalog_adapter(...)`
+    from `overlay/catalog.py`."""
+    del handler_registry
     register_overlay_event_types(event_registry())
     register_overlay_commands()
 

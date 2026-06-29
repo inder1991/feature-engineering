@@ -404,3 +404,101 @@ Steps:
 - [ ] **Run the whole catalog suite + lint.** `uv run pytest tests/featuregen/overlay/test_catalog.py -v && uv run ruff check src/featuregen/overlay/catalog.py` — Expected: both green (all catalog tests pass, no lint findings).
 
 - [ ] **Commit.** `git add src/featuregen/overlay/catalog.py tests/featuregen/overlay/test_catalog.py && git commit -m "feat(overlay): PostgresCatalog over information_schema + pg_catalog oid"`
+
+---
+
+### Task 3.3: Single-source module-level adapter accessor (`register_catalog_adapter` / `current_catalog_adapter`)
+
+Both `propose_fact` (Phase 4) and `run_profiler` (Phases 4/6) need the same `CatalogAdapter` instance without threading it through every command's `args`. This task adds **one** process-wide accessor in `catalog.py` — `register_catalog_adapter(adapter)` / `current_catalog_adapter() -> CatalogAdapter` — mirroring the SP-0 `register_command_authorizer(...)` / `current_authorizer()` module-global pattern (`authz/authorizer.py`). This is the **single source** for the overlay catalog adapter: use these exact names — there is no `register_catalog_adapter`/`register_catalog_adapter` variant. Downstream phases (`propose_fact`, `run_profiler`) read the adapter via `current_catalog_adapter()` rather than holding their own copy. A test-only `_clear_catalog_adapter()` reset keeps the module global from leaking between tests.
+
+**Files:**
+- Modify `src/featuregen/overlay/catalog.py` — add the module-global accessor (append after `PostgresCatalog`).
+- Modify `tests/featuregen/overlay/test_catalog.py` — add the accessor test.
+
+**Interfaces:**
+- Produces:
+  ```python
+  def register_catalog_adapter(adapter: CatalogAdapter) -> None: ...
+  def current_catalog_adapter() -> CatalogAdapter: ...   # raises RuntimeError if none registered
+  def _clear_catalog_adapter() -> None: ...              # test-only reset
+  ```
+
+**Note:** `current_catalog_adapter()` **fails closed** — it raises `RuntimeError` when no adapter has been registered, rather than returning `None`, so callers never silently resolve facts against a missing catalog. `register_overlay()` (Phase 4 `bootstrap.py`) is the production caller of `register_catalog_adapter(...)`; overlay command/profiler tests register a `FixtureCatalog` and call `_clear_catalog_adapter()` on teardown (the overlay conftest's reset fixture).
+
+Steps:
+
+- [ ] **Write the failing test.** Add to `tests/featuregen/overlay/test_catalog.py` (extend the existing top-of-file import of `featuregen.overlay.catalog` to include the three new symbols):
+  ```python
+  import pytest
+
+  from featuregen.overlay.catalog import (  # add to existing imports at top
+      current_catalog_adapter,
+      register_catalog_adapter,
+      _clear_catalog_adapter,
+  )
+
+
+  def test_register_and_current_catalog_adapter():
+      _clear_catalog_adapter()
+      # Fails closed before anything is registered.
+      with pytest.raises(RuntimeError):
+          current_catalog_adapter()
+
+      cat = FixtureCatalog(catalog_source="pg:core")
+      register_catalog_adapter(cat)
+      # Same instance is returned (single source for propose_fact + run_profiler).
+      assert current_catalog_adapter() is cat
+
+      # A second registration replaces the first (last writer wins).
+      other = FixtureCatalog(catalog_source="pg:other")
+      register_catalog_adapter(other)
+      assert current_catalog_adapter() is other
+
+      # Test-only reset restores the fail-closed state.
+      _clear_catalog_adapter()
+      with pytest.raises(RuntimeError):
+          current_catalog_adapter()
+  ```
+
+- [ ] **Run it — expect failure.** `uv run pytest tests/featuregen/overlay/test_catalog.py::test_register_and_current_catalog_adapter -v` — Expected: FAIL (`ImportError: cannot import name 'current_catalog_adapter' from 'featuregen.overlay.catalog'`).
+
+- [ ] **Minimal implementation.** Append the module-global accessor to `src/featuregen/overlay/catalog.py` (after `PostgresCatalog`):
+  ```python
+  # --- Single-source overlay catalog adapter accessor ---------------------------------------
+  # The process-wide adapter shared by ``propose_fact`` and ``run_profiler``. Mirrors the SP-0
+  # ``register_command_authorizer`` / ``current_authorizer`` module-global pattern. This is the ONLY
+  # holder for the overlay catalog adapter — downstream phases call ``current_catalog_adapter()``.
+  _CATALOG_ADAPTER: CatalogAdapter | None = None
+
+
+  def register_catalog_adapter(adapter: CatalogAdapter) -> None:
+      """Register the process-wide overlay ``CatalogAdapter`` (last writer wins)."""
+      global _CATALOG_ADAPTER
+      _CATALOG_ADAPTER = adapter
+
+
+  def current_catalog_adapter() -> CatalogAdapter:
+      """Return the registered overlay ``CatalogAdapter``.
+
+      Fails closed: raises ``RuntimeError`` if no adapter has been registered, so callers never
+      resolve facts against a missing catalog.
+      """
+      if _CATALOG_ADAPTER is None:
+          raise RuntimeError(
+              "no catalog adapter registered; call register_catalog_adapter(...) "
+              "(register_overlay() does this in production)"
+          )
+      return _CATALOG_ADAPTER
+
+
+  def _clear_catalog_adapter() -> None:
+      """Test-only reset of the module-global adapter (call from the overlay conftest)."""
+      global _CATALOG_ADAPTER
+      _CATALOG_ADAPTER = None
+  ```
+
+- [ ] **Run it — expect pass.** `uv run pytest tests/featuregen/overlay/test_catalog.py::test_register_and_current_catalog_adapter -v` — Expected: PASS.
+
+- [ ] **Run the whole catalog suite + lint.** `uv run pytest tests/featuregen/overlay/test_catalog.py -v && uv run ruff check src/featuregen/overlay/catalog.py` — Expected: both green. (`ruff` may flag the `_clear_catalog_adapter` import as unused in the test if you reorder imports — keep it used by the test body as written.)
+
+- [ ] **Commit.** `git add src/featuregen/overlay/catalog.py tests/featuregen/overlay/test_catalog.py && git commit -m "feat(overlay): single-source catalog adapter accessor (register/current)"`
