@@ -5,13 +5,13 @@
 **Implements:** Reference architecture §15 (Domain / Use-Case Catalog) and §15.5 (banking-only scope)
 **Seed data:** [`banking-domain-catalog.seed.json`](./banking-domain-catalog.seed.json) — the machine-readable closed catalog the platform loads.
 
-> This is the **closed banking taxonomy** that makes "banking-only" concrete. Every feature's `use_case` must resolve to an entry here (architecture §15.3, fail-closed); anything else is **rejected at intake** (§15.5). The values are **proposed defaults to be ratified** — per the architecture's confirmation authority, the registered **domain/risk owner** confirms domain facts and **Compliance** confirms policy facts before a use-case is production-eligible (`compliance_confirmed: false` until then).
+> This makes "banking-only" concrete as a **closed banking boundary with an open, growing use-case set** (architecture §15.5). The platform builds **any banking feature**; the entries here are the **known** use-cases that get the fast path (templates + governance defaults), and a **new banking use-case is onboarded and added** (§15.6), *not* rejected. Only **non-banking** requests (plus out-of-scope latency / policy violations) are refused. Values are **proposed defaults to be ratified** — the registered **domain/risk owner** confirms domain facts and **Compliance** confirms policy facts before a use-case is production-eligible (`compliance_confirmed: false` until then).
 
 ---
 
 ## 1. What this artifact is
 
-The catalog is the **context** the whole pipeline reads off a feature's `use_case` (architecture §15.2): the generation prior + templates, the allowed/blocked data, the target + scoring metric, and the governance posture. It is a sibling of the Metadata Overlay — integrated/curated, versioned, owner-confirmed — and it is **closed**: the banking set below is the entire admissible domain.
+The catalog is the **context** the whole pipeline reads off a feature's `use_case` (architecture §15.2): the generation prior + templates, the allowed/blocked data, the target + scoring metric, and the governance posture. It is a sibling of the Metadata Overlay — integrated/curated, versioned, owner-confirmed. Its **scope is banking (a closed boundary)** but its **use-case set is open**: the entries below are the *known* banking use-cases (fast path); a new banking use-case is **onboarded and added** (§15.6), not rejected. Only non-banking requests are refused.
 
 Each entry follows the §15.1 schema: `use_case, domain, entity, target{name,definition}, primary_metric, feature_templates[], allowed_data_classes[], blocked_data_classes[], risk_tier, regulatory{adverse_action,fair_lending,mrm_tier,aml}, latency, owner, compliance_confirmed, version, status`.
 
@@ -92,9 +92,9 @@ Scored 1–5 per the §scorecard criteria (value, data availability/PIT, regulat
 
 ---
 
-## 4. Out-of-domain rejection (what the platform refuses)
+## 4. What is rejected vs. onboarded
 
-Because the catalog is closed, intake rejects anything that cannot resolve to it — with a reason, never a generic feature:
+The platform builds **any banking feature**. It refuses only what falls **outside banking** (plus per-use-case policy violations and out-of-scope latency). A **new banking** use-case is *onboarded* (§15.6), not rejected:
 
 | Request | Why rejected |
 |---|---|
@@ -103,6 +103,8 @@ Because the catalog is closed, intake rejects anything that cannot resolve to it
 | "Real-time **card-fraud** score at authorization" | Recognized but `latency: realtime` → out of scope (§1.4) |
 | "Use **ethnicity** to improve the credit model" | `protected_attribute` blocked for `credit_origination` (fair lending) |
 | "Build a churn feature from **salary** for **credit decisioning**" | Cross-use-case data-class violation (salary blocked for credit) |
+
+**Onboarded, not rejected** — a *new banking* use-case (e.g. `mortgage_prepayment`, `deposit_attrition`, `merchant_acquiring_risk`) is **not** refused: at the clarification gate its target, allowed/blocked data, and risk tier are defined, the domain/risk owner + Compliance confirm, the entry is added (versioned), and the feature proceeds (§15.6).
 
 ---
 
