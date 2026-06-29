@@ -20,9 +20,7 @@ class CountingProjection:
 
     def apply(self, conn, event) -> None:
         with conn.cursor() as cur:
-            cur.execute(
-                "INSERT INTO counter_state (global_seq) VALUES (%s)", (event.global_seq,)
-            )
+            cur.execute("INSERT INTO counter_state (global_seq) VALUES (%s)", (event.global_seq,))
 
 
 def _seed(conn, n: int) -> None:
@@ -37,8 +35,11 @@ def _seed(conn, n: int) -> None:
                 schema_version=1,
                 payload={"i": i},
                 actor=IdentityEnvelope(
-                    subject="u", actor_kind="human", authenticated=True,
-                    auth_method="oidc", role_claims=(),
+                    subject="u",
+                    actor_kind="human",
+                    authenticated=True,
+                    auth_method="oidc",
+                    role_claims=(),
                 ),
                 provenance=ProvenanceEnvelope(
                     artifact_type="DRAFT_CONTRACT", schema_version=1, producing_component="t@1"
@@ -63,7 +64,9 @@ def test_run_projection_applies_and_advances_checkpoint(conn):
     with conn.cursor(row_factory=dict_row) as cur:
         cur.execute("SELECT count(*) AS n FROM counter_state")
         assert cur.fetchone()["n"] == 3
-        cur.execute("SELECT checkpoint_seq FROM projection_checkpoints WHERE projection_name='counter'")
+        cur.execute(
+            "SELECT checkpoint_seq FROM projection_checkpoints WHERE projection_name='counter'"
+        )
         assert cur.fetchone()["checkpoint_seq"] > 0
 
 
@@ -85,9 +88,16 @@ def test_lag_and_as_of_track_checkpoint(conn):
     _seed_more = append_event(
         conn,
         NewEvent(
-            aggregate="run", aggregate_id="r", type="E", schema_version=1, payload={},
+            aggregate="run",
+            aggregate_id="r",
+            type="E",
+            schema_version=1,
+            payload={},
             actor=IdentityEnvelope(
-                subject="u", actor_kind="human", authenticated=True, auth_method="oidc",
+                subject="u",
+                actor_kind="human",
+                authenticated=True,
+                auth_method="oidc",
                 role_claims=(),
             ),
             provenance=ProvenanceEnvelope(

@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json as _json
-from typing import Any, Mapping, Optional
+from collections.abc import Mapping
+from typing import Any
 
 import jsonschema
 from psycopg.rows import dict_row
@@ -44,9 +45,7 @@ class EventSchemaRegistry:
         try:
             jsonschema.validate(instance=dict(body), schema=schema)
         except jsonschema.ValidationError as exc:
-            raise SchemaValidationError(
-                f"{type_name}@v{schema_version}: {exc.message}"
-            ) from exc
+            raise SchemaValidationError(f"{type_name}@v{schema_version}: {exc.message}") from exc
 
     def register_upcaster(
         self,
@@ -69,9 +68,7 @@ class EventSchemaRegistry:
         to_version: int,
     ) -> Mapping[str, Any]:
         if to_version < from_version:
-            raise SchemaValidationError(
-                f"cannot downcast {type_name} {from_version}->{to_version}"
-            )
+            raise SchemaValidationError(f"cannot downcast {type_name} {from_version}->{to_version}")
         current: dict[str, Any] = dict(body)
         version = from_version
         while version < to_version:
@@ -107,13 +104,14 @@ class EventSchemaRegistry:
         must have a registered upcaster for every step between them; otherwise raise
         SchemaValidationError (a load-time error, never a lazy read-time poison)."""
         by_type: dict[str, list[int]] = {}
-        for (type_name, version) in self._schemas:
+        for type_name, version in self._schemas:
             by_type.setdefault(type_name, []).append(version)
         for type_name, versions in by_type.items():
             versions.sort()
             for prev, nxt in zip(versions, versions[1:]):
-                if is_backward_compatible(self._schemas[(type_name, prev)],
-                                          self._schemas[(type_name, nxt)]):
+                if is_backward_compatible(
+                    self._schemas[(type_name, prev)], self._schemas[(type_name, nxt)]
+                ):
                     continue  # additive bump: no upcaster required
                 for step in range(prev, nxt):
                     if (type_name, step) not in self._upcasters:
@@ -194,7 +192,7 @@ def is_backward_compatible(old_schema: Mapping[str, Any], new_schema: Mapping[st
     return True
 
 
-_REGISTRY: Optional[EventSchemaRegistry] = None
+_REGISTRY: EventSchemaRegistry | None = None
 
 
 def event_registry() -> EventSchemaRegistry:
@@ -276,7 +274,10 @@ def hydrate_event_registry(conn: DbConn) -> EventSchemaRegistry:
         rows = cur.fetchall()
     for r in rows:
         reg.register_schema(
-            r["type_name"], r["schema_version"], r["json_schema"], r["owner"],
+            r["type_name"],
+            r["schema_version"],
+            r["json_schema"],
+            r["owner"],
             status=r["status"],
         )
     return reg

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Iterable, Optional
+from collections.abc import Iterable
 
 from featuregen.contracts.identity import IdentityEnvelope
 
@@ -33,10 +33,10 @@ def build_human_identity(
     role_claims: Iterable[str],
     auth_method: str = "oidc",
     groups: Iterable[str] = (),
-    tenant: Optional[str] = None,
-    source_of_authority: Optional[str] = None,
-    on_behalf_of: Optional[str] = None,
-    impersonation: Optional[str] = None,
+    tenant: str | None = None,
+    source_of_authority: str | None = None,
+    on_behalf_of: str | None = None,
+    impersonation: str | None = None,
     break_glass: bool = False,
 ) -> IdentityEnvelope:
     if not subject.startswith("user:"):
@@ -65,8 +65,8 @@ def build_service_identity(
     role_claims: Iterable[str],
     attestation: str,
     groups: Iterable[str] = (),
-    tenant: Optional[str] = None,
-    source_of_authority: Optional[str] = None,
+    tenant: str | None = None,
+    source_of_authority: str | None = None,
 ) -> IdentityEnvelope:
     if not subject.startswith("service:"):
         raise IdentityError("service subject must be prefixed 'service:'")

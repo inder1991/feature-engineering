@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Callable, Optional
+from typing import TYPE_CHECKING
 
 from featuregen.contracts import Command, EventEnvelope, IdentityEnvelope
 from featuregen.governance.replay import ReplayMode, replay_run
-from featuregen.security.audit import AuditReadDenied  # single shared exception class (Phase 07 authoritative)
+from featuregen.security.audit import (
+    AuditReadDenied,
+)  # single shared exception class (Phase 07 authoritative)
 
 if TYPE_CHECKING:
     from featuregen.contracts import DbConn
@@ -29,13 +32,13 @@ class AuditView:
 
 
 def read_audit(
-    conn: "DbConn",
+    conn: DbConn,
     *,
     run_id: str,
     actor: IdentityEnvelope,
     authorize_command: AuthorizeCommand,
     record_security_event: RecordSecurityEvent,
-    upto_seq: Optional[int] = None,
+    upto_seq: int | None = None,
 ) -> AuditView:
     """Authorized-and-logged audit read (§9/§6.2). Authorization is delegated to Phase 07's
     `authorize_command(conn, cmd) -> AuthzDecision` over a synthetic `read_audit` Command; every
@@ -53,15 +56,26 @@ def read_audit(
     decision = authorize_command(conn, cmd)
     if not decision.allowed:
         record_security_event(
-            conn, event_type="AUDIT_READ", actor=actor, attempted_action=_ACTION,
-            decision="denied", aggregate="run", aggregate_id=run_id,
+            conn,
+            event_type="AUDIT_READ",
+            actor=actor,
+            attempted_action=_ACTION,
+            decision="denied",
+            aggregate="run",
+            aggregate_id=run_id,
             reason=getattr(decision, "reason", None) or "unauthorized audit read",
         )
         raise AuditReadDenied(f"actor {actor.subject!r} may not read audit for run {run_id!r}")
 
     record_security_event(
-        conn, event_type="AUDIT_READ", actor=actor, attempted_action=_ACTION,
-        decision="flagged", aggregate="run", aggregate_id=run_id, reason="audit read",
+        conn,
+        event_type="AUDIT_READ",
+        actor=actor,
+        attempted_action=_ACTION,
+        decision="flagged",
+        aggregate="run",
+        aggregate_id=run_id,
+        reason="audit read",
     )
     result = replay_run(conn, run_id, upto_seq=upto_seq)
     return AuditView(

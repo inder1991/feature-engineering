@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
-from typing import Any, Mapping, Optional, Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 from psycopg.types.json import Jsonb
 
@@ -22,7 +23,7 @@ def record_external_command(
     cmd: NewExternalCommand,
     *,
     command_id: str,
-    run_id: Optional[str] = None,
+    run_id: str | None = None,
     require_dedup: frozenset[str] = frozenset({"sandbox"}),
 ) -> str:
     """Record a side-effecting command in the caller's §5.1 transaction (status='pending').
@@ -44,10 +45,18 @@ def record_external_command(
             ON CONFLICT (idempotency_key) DO NOTHING
             RETURNING command_id
             """,
-            (command_id, cmd.idempotency_key, run_id, cmd.integration,
-             Jsonb(dict(cmd.request_payload)), cmd.expected_run_id,
-             cmd.expected_stream_version, cmd.expected_task_id, cmd.job_handle,
-             cmd.dedup_supported),
+            (
+                command_id,
+                cmd.idempotency_key,
+                run_id,
+                cmd.integration,
+                Jsonb(dict(cmd.request_payload)),
+                cmd.expected_run_id,
+                cmd.expected_stream_version,
+                cmd.expected_task_id,
+                cmd.job_handle,
+                cmd.dedup_supported,
+            ),
         )
         row = cur.fetchone()
         if row is not None:
@@ -63,22 +72,23 @@ def record_external_command(
 class IntegrationResult:
     ok: bool
     result: Mapping[str, Any]
-    cost_units: Optional[Decimal] = None
-    job_handle: Optional[str] = None
-    permanent: bool = False        # deterministic failure => skip delivery retry (§5.6)
+    cost_units: Decimal | None = None
+    job_handle: str | None = None
+    permanent: bool = False  # deterministic failure => skip delivery retry (§5.6)
 
 
 @runtime_checkable
 class IntegrationCaller(Protocol):
     integration: str
+
     def invoke(self, request_payload: Mapping[str, Any]) -> IntegrationResult: ...
-    def reconcile(self, job_handle: str) -> Optional[IntegrationResult]: ...
+    def reconcile(self, job_handle: str) -> IntegrationResult | None: ...
 
 
 @dataclass(frozen=True, slots=True)
 class DispatchOutcome:
     command_id: str
-    status: str                    # succeeded|failed|pending|dispatched
+    status: str  # succeeded|failed|pending|dispatched
     reinvoked: bool = False
     residual_duplicate_risk: bool = False
     reconciled: bool = False
@@ -151,7 +161,8 @@ def dispatch_command(
             _log.warning(
                 "residual-duplicate risk: re-invoking %s (no job_handle; idempotency key "
                 "not honored by %s) — accepted risk flagged, no false dedup claim",
-                command_id, caller.integration,
+                command_id,
+                caller.integration,
             )
             res = caller.invoke(payload)
             reinvoked = True
@@ -177,8 +188,13 @@ def dispatch_command(
             cur.execute(
                 "UPDATE external_commands SET status='succeeded', result=%s, cost_units=%s, "
                 "completed_at=%s, job_handle=COALESCE(%s, job_handle) WHERE command_id=%s",
-                (Jsonb(_flag_residual(res.result, residual)), res.cost_units, now,
-                 res.job_handle, command_id),
+                (
+                    Jsonb(_flag_residual(res.result, residual)),
+                    res.cost_units,
+                    now,
+                    res.job_handle,
+                    command_id,
+                ),
             )
             outcome = DispatchOutcome(command_id, "succeeded", reinvoked, residual, reconciled)
         elif res.permanent:
@@ -210,9 +226,9 @@ def accept_result(
     conn: DbConn,
     command_id: str,
     *,
-    current_run_id: Optional[str],
-    current_stream_version: Optional[int],
-    current_task_id: Optional[str],
+    current_run_id: str | None,
+    current_stream_version: int | None,
+    current_task_id: str | None,
 ) -> ResultAcceptance:
     """Stale-result acceptance guard (§5.4). The result is APPLIED only if the run/task it
     was issued against has not moved on: expected_run_id == current_run_id AND (no
@@ -235,12 +251,17 @@ def accept_result(
         if result_event_id is not None:
             return ResultAcceptance(command_id, accepted=True, stale=False, cached=True)
         stale = False
-        if exp_run is not None and exp_run != current_run_id:
-            stale = True
-        elif (exp_sv is not None and current_stream_version is not None
-              and current_stream_version > exp_sv):
-            stale = True
-        elif exp_task is not None and exp_task != current_task_id:
+        if (
+            exp_run is not None
+            and exp_run != current_run_id
+            or (
+                exp_sv is not None
+                and current_stream_version is not None
+                and current_stream_version > exp_sv
+            )
+            or exp_task is not None
+            and exp_task != current_task_id
+        ):
             stale = True
         if stale:
             cur.execute(

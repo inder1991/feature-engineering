@@ -1,34 +1,40 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from featuregen.contracts import DbConn
 
-ATTEMPT_DISPOSITIONS: tuple[str, ...] = ("explored", "discarded", "rejected", "selected", "promoted")
+ATTEMPT_DISPOSITIONS: tuple[str, ...] = (
+    "explored",
+    "discarded",
+    "rejected",
+    "selected",
+    "promoted",
+)
 
 
 @dataclass(frozen=True, slots=True)
 class AttemptMemoryEntry:
     definition_hash: str
     disposition: str
-    score: Optional[float] = None
-    reason: Optional[str] = None
-    request_id: Optional[str] = None
-    feature_id: Optional[str] = None
+    score: float | None = None
+    reason: str | None = None
+    request_id: str | None = None
+    feature_id: str | None = None
     crypto_shred_exempt: bool = True
 
 
 def record_attempt(
-    conn: "DbConn",
+    conn: DbConn,
     *,
     definition_hash: str,
     disposition: str,
-    score: Optional[float] = None,
-    reason: Optional[str] = None,
-    request_id: Optional[str] = None,
-    feature_id: Optional[str] = None,
+    score: float | None = None,
+    reason: str | None = None,
+    request_id: str | None = None,
+    feature_id: str | None = None,
 ) -> None:
     if disposition not in ATTEMPT_DISPOSITIONS:
         raise ValueError(f"disposition {disposition!r} not in {ATTEMPT_DISPOSITIONS}")
@@ -48,7 +54,7 @@ def record_attempt(
     )
 
 
-def lookup_attempt(conn: "DbConn", definition_hash: str) -> Optional[AttemptMemoryEntry]:
+def lookup_attempt(conn: DbConn, definition_hash: str) -> AttemptMemoryEntry | None:
     row = conn.execute(
         "SELECT definition_hash, disposition, score, reason, request_id, feature_id, crypto_shred_exempt "
         "FROM attempt_memory WHERE definition_hash = %s",
@@ -68,7 +74,7 @@ def lookup_attempt(conn: "DbConn", definition_hash: str) -> Optional[AttemptMemo
 
 
 def count_candidates_explored(
-    conn: "DbConn", *, request_id: Optional[str] = None, feature_id: Optional[str] = None
+    conn: DbConn, *, request_id: str | None = None, feature_id: str | None = None
 ) -> int:
     if request_id is not None:
         row = conn.execute(

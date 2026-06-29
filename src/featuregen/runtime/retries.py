@@ -3,7 +3,6 @@ from __future__ import annotations
 import random
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Optional
 
 from featuregen.contracts import DbConn, Disposition
 
@@ -39,8 +38,8 @@ def within_budget(
 @dataclass(frozen=True, slots=True)
 class _TableSpec:
     table: str
-    available_col: str          # 'available_at' (queue) | 'next_attempt_at' (outbox)
-    ready_status: str           # 'ready' (queue) | 'pending' (outbox)
+    available_col: str  # 'available_at' (queue) | 'next_attempt_at' (outbox)
+    ready_status: str  # 'ready' (queue) | 'pending' (outbox)
     dead_status: str = "dead"
 
 
@@ -54,7 +53,7 @@ def record_delivery_outcome(
     row_id: int,
     *,
     disposition: Disposition,
-    error: Optional[str],
+    error: str | None,
     started_at: datetime,
     now: datetime,
     base_seconds: float,
@@ -80,7 +79,10 @@ def record_delivery_outcome(
         attempts, max_attempts = cur.fetchone()
         attempts += 1
         if disposition is Disposition.PERMANENT or not within_budget(
-            attempts=attempts, max_attempts=max_attempts, started_at=started_at, now=now,
+            attempts=attempts,
+            max_attempts=max_attempts,
+            started_at=started_at,
+            now=now,
             max_elapsed_seconds=max_elapsed_seconds,
         ):
             cur.execute(
@@ -88,7 +90,9 @@ def record_delivery_outcome(
                 (spec.dead_status, attempts, error, row_id),
             )
             return spec.dead_status
-        delay = compute_backoff(attempts, base_seconds=base_seconds, cap_seconds=cap_seconds, rng=rng)
+        delay = compute_backoff(
+            attempts, base_seconds=base_seconds, cap_seconds=cap_seconds, rng=rng
+        )
         next_at = now + timedelta(seconds=delay)
         cur.execute(
             f"UPDATE {spec.table} SET status=%s, attempts=%s, last_error=%s, "

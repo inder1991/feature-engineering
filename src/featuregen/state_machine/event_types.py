@@ -55,6 +55,4 @@ def register_state_machine_event_types(registry: Any) -> None:
     registry.register_schema(GUARD_FAILED, 1, _GUARD_FAILED_SCHEMA, _OWNER)
     registry.register_schema(TRANSITION_REJECTED, 1, _TRANSITION_REJECTED_SCHEMA, _OWNER)
     registry.register_schema(WORKFLOW_VERSION_MIGRATED, 1, _MIGRATION_SCHEMA, _OWNER)
-    registry.register_schema(
-        FEATURE_LIFECYCLE_VERSION_MIGRATED, 1, _MIGRATION_SCHEMA, _OWNER
-    )
+    registry.register_schema(FEATURE_LIFECYCLE_VERSION_MIGRATED, 1, _MIGRATION_SCHEMA, _OWNER)

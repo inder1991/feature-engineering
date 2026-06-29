@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import Any, Callable, Mapping, Protocol, runtime_checkable
+from collections.abc import Callable, Mapping
+from typing import Any, Protocol, runtime_checkable
 
 from featuregen.contracts.db import DbConn
 from featuregen.contracts.envelopes import (
@@ -19,11 +20,11 @@ class Projection(Protocol):
     name: str
     is_analytics: bool
 
-    def apply(self, conn: "DbConn", event: EventEnvelope) -> None:
+    def apply(self, conn: DbConn, event: EventEnvelope) -> None:
         """Apply ONE event (events arrive in strict global_seq order). State-bearing
         projections raise ProjectionApplyError on an unappliable event."""
 
-    def reset(self, conn: "DbConn") -> None:
+    def reset(self, conn: DbConn) -> None:
         """Truncate this projection's tables for a from-zero rebuild."""
 
 

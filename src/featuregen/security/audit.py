@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import json
-from datetime import datetime, timezone
-from typing import Any, Mapping, Optional
+from collections.abc import Mapping
+from datetime import UTC, datetime
+from typing import Any
 
 from psycopg.types.json import Json
 
@@ -26,20 +27,20 @@ def _canonical_ts(occurred_at: datetime) -> str:
     # value is later read back in (Postgres timestamptz round-trips an instant, not a
     # zone). Naive datetimes are treated as UTC.
     if occurred_at.tzinfo is None:
-        occurred_at = occurred_at.replace(tzinfo=timezone.utc)
-    return occurred_at.astimezone(timezone.utc).isoformat()
+        occurred_at = occurred_at.replace(tzinfo=UTC)
+    return occurred_at.astimezone(UTC).isoformat()
 
 
 def _entry_hash(
-    prev_hash: Optional[str],
+    prev_hash: str | None,
     sec_id: str,
     event_type: str,
     actor_jsonb: Mapping[str, Any],
     attempted_action: str,
-    aggregate: Optional[str],
-    aggregate_id: Optional[str],
+    aggregate: str | None,
+    aggregate_id: str | None,
     decision: str,
-    reason: Optional[str],
+    reason: str | None,
     retention_class: str,
     occurred_at: datetime,
 ) -> str:
@@ -74,9 +75,9 @@ def record_security_event(
     actor: IdentityEnvelope,
     attempted_action: str,
     decision: str,
-    reason: Optional[str] = None,
-    aggregate: Optional[str] = None,
-    aggregate_id: Optional[str] = None,
+    reason: str | None = None,
+    aggregate: str | None = None,
+    aggregate_id: str | None = None,
     retention_class: str = "regulator",
 ) -> str:
     # Serialize chain appends so the prev_hash read + insert is atomic for the single chain
@@ -91,10 +92,19 @@ def record_security_event(
     actor_jsonb = identity_to_jsonb(actor)
     # Set occurred_at explicitly (not via the column DEFAULT) so the exact instant is part
     # of the hash basis and matches what verify_chain() reads back.
-    occurred_at = datetime.now(timezone.utc)
+    occurred_at = datetime.now(UTC)
     entry_hash = _entry_hash(
-        prev_hash, sec_id, event_type, actor_jsonb, attempted_action,
-        aggregate, aggregate_id, decision, reason, retention_class, occurred_at,
+        prev_hash,
+        sec_id,
+        event_type,
+        actor_jsonb,
+        attempted_action,
+        aggregate,
+        aggregate_id,
+        decision,
+        reason,
+        retention_class,
+        occurred_at,
     )
     conn.execute(
         """
@@ -105,9 +115,18 @@ def record_security_event(
         VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
         """,
         (
-            sec_id, event_type, Json(actor_jsonb), attempted_action,
-            aggregate, aggregate_id, decision, reason, prev_hash, entry_hash,
-            retention_class, occurred_at,
+            sec_id,
+            event_type,
+            Json(actor_jsonb),
+            attempted_action,
+            aggregate,
+            aggregate_id,
+            decision,
+            reason,
+            prev_hash,
+            entry_hash,
+            retention_class,
+            occurred_at,
         ),
     )
     return sec_id
@@ -139,7 +158,7 @@ def read_security_audit(
     actor: IdentityEnvelope,
     *,
     limit: int = 100,
-) -> list[tuple[str, str, str, Optional[str]]]:
+) -> list[tuple[str, str, str, str | None]]:
     # This function is the SINGLE enforcement path for security-stream reads: they are NOT
     # routed through execute_command/authz_policy, so there is no divergent second gate (the
     # authz_policy `read_security_audit` rows are intentionally absent — see Task 6). A role
@@ -193,14 +212,39 @@ def verify_chain(conn: DbConn) -> bool:
          ORDER BY seq ASC
         """
     ).fetchall()
-    prev_hash: Optional[str] = None
-    for (sec_id, event_type, actor_jsonb, attempted_action, aggregate, aggregate_id,
-         decision, reason, retention_class, occurred_at, row_prev, entry_hash) in rows:
+    prev_hash: str | None = None
+    for (
+        sec_id,
+        event_type,
+        actor_jsonb,
+        attempted_action,
+        aggregate,
+        aggregate_id,
+        decision,
+        reason,
+        retention_class,
+        occurred_at,
+        row_prev,
+        entry_hash,
+    ) in rows:
         if row_prev != prev_hash:
             return False
-        if _entry_hash(prev_hash, sec_id, event_type, actor_jsonb, attempted_action,
-                       aggregate, aggregate_id, decision, reason, retention_class,
-                       occurred_at) != entry_hash:
+        if (
+            _entry_hash(
+                prev_hash,
+                sec_id,
+                event_type,
+                actor_jsonb,
+                attempted_action,
+                aggregate,
+                aggregate_id,
+                decision,
+                reason,
+                retention_class,
+                occurred_at,
+            )
+            != entry_hash
+        ):
             return False
         prev_hash = entry_hash
     return True

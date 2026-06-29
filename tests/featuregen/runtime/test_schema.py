@@ -15,24 +15,51 @@ def _columns(conn, table: str) -> set[str]:
 
 def test_outbox_has_contract_columns(conn) -> None:
     assert {
-        "id", "message_id", "partition_key", "topic", "payload", "caused_by_event",
-        "status", "lease_owner", "lease_expires_at", "attempts", "max_attempts",
-        "next_attempt_at", "last_error", "created_at", "sent_at",
+        "id",
+        "message_id",
+        "partition_key",
+        "topic",
+        "payload",
+        "caused_by_event",
+        "status",
+        "lease_owner",
+        "lease_expires_at",
+        "attempts",
+        "max_attempts",
+        "next_attempt_at",
+        "last_error",
+        "created_at",
+        "sent_at",
     } <= _columns(conn, "outbox")
 
 
 def test_queue_has_contract_columns(conn) -> None:
     assert {
-        "id", "message_id", "partition_key", "handler", "payload", "status",
-        "lease_owner", "lease_expires_at", "attempts", "max_attempts",
-        "available_at", "priority", "last_error", "created_at",
+        "id",
+        "message_id",
+        "partition_key",
+        "handler",
+        "payload",
+        "status",
+        "lease_owner",
+        "lease_expires_at",
+        "attempts",
+        "max_attempts",
+        "available_at",
+        "priority",
+        "last_error",
+        "created_at",
     } <= _columns(conn, "queue")
 
 
 def test_processed_messages_has_contract_columns(conn) -> None:
     assert {
-        "message_id", "aggregate", "aggregate_id", "result_event_id",
-        "processed_seq", "processed_at",
+        "message_id",
+        "aggregate",
+        "aggregate_id",
+        "result_event_id",
+        "processed_seq",
+        "processed_at",
     } <= _columns(conn, "processed_messages")
 
 

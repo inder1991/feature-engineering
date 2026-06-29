@@ -1,7 +1,7 @@
 from featuregen.contracts.identity import (
     IdentityEnvelope,
-    identity_to_jsonb,
     identity_from_jsonb,
+    identity_to_jsonb,
 )
 
 
@@ -46,8 +46,8 @@ def test_service_attestation_round_trips():
 
 
 def test_gates_reexports_canonical_types():
-    import featuregen.contracts.gates as gates
     import featuregen.contracts.envelopes as envelopes
+    import featuregen.contracts.gates as gates
 
     assert gates.GateTaskSpec is envelopes.GateTaskSpec
     assert gates.SignalResult is envelopes.SignalResult

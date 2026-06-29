@@ -57,13 +57,19 @@ def test_persist_event_schemas_writes_rows(conn):
 def test_persist_event_schemas_rejects_breaking_bump_without_upcaster(conn):
     reg = EventSchemaRegistry()
     reg.register_schema(
-        "T", 1, {"type": "object", "required": ["a"], "properties": {"a": {"type": "string"}}},
+        "T",
+        1,
+        {"type": "object", "required": ["a"], "properties": {"a": {"type": "string"}}},
         owner="o",
     )
     reg.register_schema(
-        "T", 2,
-        {"type": "object", "required": ["a", "b"],
-         "properties": {"a": {"type": "string"}, "b": {"type": "string"}}},  # breaking
+        "T",
+        2,
+        {
+            "type": "object",
+            "required": ["a", "b"],
+            "properties": {"a": {"type": "string"}, "b": {"type": "string"}},
+        },  # breaking
         owner="o",
     )
     with pytest.raises(SchemaValidationError):

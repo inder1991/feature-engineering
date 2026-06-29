@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import uuid
+from collections.abc import Callable, Iterable
 from dataclasses import asdict, dataclass
-from typing import TYPE_CHECKING, Callable, Iterable, Optional
+from typing import TYPE_CHECKING
 
 from psycopg.types.json import Json
 
@@ -20,7 +21,7 @@ if TYPE_CHECKING:
 GovernanceActiveResolver = Callable[["DbConn", str], bool]
 
 
-def _default_governance_active(conn: "DbConn", blob_id: str) -> bool:
+def _default_governance_active(conn: DbConn, blob_id: str) -> bool:
     """Fail-closed default: treat a governance-retained body as belonging to an active/governed
     version (retain). Callers wire a resolver that consults `feature_active_versions` to allow
     erasure of governance-retained bodies whose owning version is no longer active/governed (§9)."""
@@ -30,16 +31,16 @@ def _default_governance_active(conn: "DbConn", blob_id: str) -> bool:
 @dataclass(frozen=True, slots=True)
 class ErasureOutcome:
     blob_id: str
-    outcome: str                                   # shredded | retained_governance | retained_legal_hold | not_found
+    outcome: str  # shredded | retained_governance | retained_legal_hold | not_found
     erasure_id: str
 
 
 def _record(
-    conn: "DbConn",
+    conn: DbConn,
     *,
     blob_id: str,
-    classification: Optional[str],
-    kms_key_id: Optional[str],
+    classification: str | None,
+    kms_key_id: str | None,
     reason: str,
     requested_by: IdentityEnvelope,
     outcome: str,
@@ -49,13 +50,21 @@ def _record(
         "INSERT INTO erasure_audit "
         "(erasure_id, blob_id, classification, kms_key_id, reason, requested_by, outcome) "
         "VALUES (%s, %s, %s, %s, %s, %s, %s)",
-        (erasure_id, blob_id, classification, kms_key_id, reason, Json(asdict(requested_by)), outcome),
+        (
+            erasure_id,
+            blob_id,
+            classification,
+            kms_key_id,
+            reason,
+            Json(asdict(requested_by)),
+            outcome,
+        ),
     )
     return ErasureOutcome(blob_id=blob_id, outcome=outcome, erasure_id=erasure_id)
 
 
 def crypto_shred(
-    conn: "DbConn",
+    conn: DbConn,
     blob_ids: Iterable[str],
     *,
     reason: str,
@@ -74,24 +83,63 @@ def crypto_shred(
             "SELECT classification, kms_key_id FROM blob_index WHERE blob_id = %s", (blob_id,)
         ).fetchone()
         if row is None:
-            outcomes.append(_record(conn, blob_id=blob_id, classification=None, kms_key_id=None,
-                                    reason=reason, requested_by=requested_by, outcome="not_found"))
+            outcomes.append(
+                _record(
+                    conn,
+                    blob_id=blob_id,
+                    classification=None,
+                    kms_key_id=None,
+                    reason=reason,
+                    requested_by=requested_by,
+                    outcome="not_found",
+                )
+            )
             continue
         classification, kms_key_id = row
         if classification == GOVERNANCE_RETAINED and governance_active(conn, blob_id):
-            outcomes.append(_record(conn, blob_id=blob_id, classification=classification, kms_key_id=kms_key_id,
-                                    reason=reason, requested_by=requested_by, outcome="retained_governance"))
+            outcomes.append(
+                _record(
+                    conn,
+                    blob_id=blob_id,
+                    classification=classification,
+                    kms_key_id=kms_key_id,
+                    reason=reason,
+                    requested_by=requested_by,
+                    outcome="retained_governance",
+                )
+            )
             continue
         if is_under_legal_hold(conn, "blob", blob_id):
-            outcomes.append(_record(conn, blob_id=blob_id, classification=classification, kms_key_id=kms_key_id,
-                                    reason=reason, requested_by=requested_by, outcome="retained_legal_hold"))
+            outcomes.append(
+                _record(
+                    conn,
+                    blob_id=blob_id,
+                    classification=classification,
+                    kms_key_id=kms_key_id,
+                    reason=reason,
+                    requested_by=requested_by,
+                    outcome="retained_legal_hold",
+                )
+            )
             continue
         # pii-erasable, OR governance-retained whose owning version is no longer active/governed.
         if kms_key_id is not None:
             key_manager.destroy(kms_key_id)
-        conn.execute("UPDATE blob_index SET status = 'shredded', swept_at = now() WHERE blob_id = %s", (blob_id,))
-        outcomes.append(_record(conn, blob_id=blob_id, classification=classification, kms_key_id=kms_key_id,
-                                reason=reason, requested_by=requested_by, outcome="shredded"))
+        conn.execute(
+            "UPDATE blob_index SET status = 'shredded', swept_at = now() WHERE blob_id = %s",
+            (blob_id,),
+        )
+        outcomes.append(
+            _record(
+                conn,
+                blob_id=blob_id,
+                classification=classification,
+                kms_key_id=kms_key_id,
+                reason=reason,
+                requested_by=requested_by,
+                outcome="shredded",
+            )
+        )
     return outcomes
 
 
@@ -99,7 +147,7 @@ class BlobNotFoundError(Exception):
     """Raised when a referenced blob_id is absent from blob_index."""
 
 
-def rotate_blob_key(conn: "DbConn", blob_id: str, *, key_manager: KeyManager) -> str:
+def rotate_blob_key(conn: DbConn, blob_id: str, *, key_manager: KeyManager) -> str:
     """Rotate a body's per-body KMS key WITHOUT rewriting any events (§9)."""
     row = conn.execute(
         "SELECT object_key, kms_key_id FROM blob_index WHERE blob_id = %s", (blob_id,)

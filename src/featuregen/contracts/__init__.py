@@ -24,7 +24,6 @@ from featuregen.contracts.envelopes import (
     NewTimer,
     SignalResult,
 )
-from featuregen.contracts.provenance import ProvenanceEnvelope
 from featuregen.contracts.errors import (
     ConcurrencyError,
     ProjectionApplyError,
@@ -39,6 +38,7 @@ from featuregen.contracts.protocols import (
     SchemaRegistry,
     Upcaster,
 )
+from featuregen.contracts.provenance import ProvenanceEnvelope
 
 __all__ = [
     "DbConn",

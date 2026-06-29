@@ -5,7 +5,15 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "featuregen"
 version = "0.1.0"
+description = "Contract-driven, banking-grade feature engineering platform (foundation/SP-0)."
+readme = "README.md"
 requires-python = ">=3.11"
+license = { text = "Proprietary" }
+authors = [{ name = "FeatureGen Team" }]
+classifiers = [
+    "Private :: Do Not Upload",
+    "Programming Language :: Python :: 3.11",
+]
 dependencies = [
     "psycopg[binary]>=3.1",
     "jsonschema>=4.21",
@@ -17,6 +25,10 @@ dev = [
     "pytest>=8.0",
     "pytest-postgresql>=6.0",
     "pytest-timeout>=2.4.0",
+    "ruff>=0.6",
+    "mypy>=1.11",
+    "pre-commit>=3.7",
+    "types-jsonschema>=4.21",
 ]
 
 [tool.setuptools.packages.find]
@@ -35,3 +47,33 @@ addopts = "--import-mode=importlib"
 # test well under the build runner's stall watchdog.
 timeout = 60
 timeout_method = "signal"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+src = ["src", "tests"]
+extend-exclude = ["docs", ".venv"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "PIE"]
+ignore = [
+    "E501",   # line length is the formatter's job
+    "UP042",  # keep `class X(str, Enum)` — switching to StrEnum changes str() behavior
+    "B905",   # zip() strict= is noise for our short, equal-length zips
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Test idioms we use deliberately.
+"tests/**" = ["B011", "B017", "B007", "E402"]
+
+[tool.mypy]
+python_version = "3.11"
+files = ["src"]
+ignore_missing_imports = true
+namespace_packages = true
+explicit_package_bases = true
+mypy_path = "src"
+# Gradual typing: warn, don't block on every untyped corner yet (tightened over time).
+check_untyped_defs = true
+warn_unused_ignores = true
+warn_redundant_casts = true

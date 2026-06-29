@@ -12,7 +12,7 @@ if TYPE_CHECKING:
 
 
 def place_legal_hold(
-    conn: "DbConn",
+    conn: DbConn,
     *,
     hold_id: str,
     scope_kind: str,
@@ -27,11 +27,11 @@ def place_legal_hold(
     )
 
 
-def release_legal_hold(conn: "DbConn", hold_id: str) -> None:
+def release_legal_hold(conn: DbConn, hold_id: str) -> None:
     conn.execute("UPDATE legal_holds SET released_at = now() WHERE hold_id = %s", (hold_id,))
 
 
-def is_under_legal_hold(conn: "DbConn", scope_kind: str, scope_ref: str) -> bool:
+def is_under_legal_hold(conn: DbConn, scope_kind: str, scope_ref: str) -> bool:
     row = conn.execute(
         "SELECT 1 FROM legal_holds "
         "WHERE scope_kind = %s AND scope_ref = %s AND released_at IS NULL LIMIT 1",

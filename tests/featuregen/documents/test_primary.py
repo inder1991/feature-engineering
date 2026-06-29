@@ -30,8 +30,11 @@ def _candidate(provenance):
 
 def _emit_primary(db, *, run_id, doc_id, expected_version, actor, provenance):
     ev = new_primary_selected(
-        run_id=run_id, stage="CANDIDATE_SQL", doc_id=doc_id,
-        actor=actor, provenance=provenance,
+        run_id=run_id,
+        stage="CANDIDATE_SQL",
+        doc_id=doc_id,
+        actor=actor,
+        provenance=provenance,
     )
     return append_event(db, ev, expected_version=expected_version, table_version=1)
 
@@ -40,10 +43,12 @@ def test_current_primary_is_the_latest_by_global_seq(db, actor, provenance):
     register_primary_selected(db)
     a = append_document(db, _candidate(provenance), run_id="run_1", actor=actor)
     b = append_document(db, _candidate(provenance), run_id="run_1", actor=actor)
-    e1 = _emit_primary(db, run_id="run_1", doc_id=a, expected_version=0,
-                       actor=actor, provenance=provenance)
-    e2 = _emit_primary(db, run_id="run_1", doc_id=b, expected_version=1,
-                       actor=actor, provenance=provenance)
+    e1 = _emit_primary(
+        db, run_id="run_1", doc_id=a, expected_version=0, actor=actor, provenance=provenance
+    )
+    e2 = _emit_primary(
+        db, run_id="run_1", doc_id=b, expected_version=1, actor=actor, provenance=provenance
+    )
 
     proj = StagePrimaryProjection()
     proj.apply(db, e1)
@@ -60,21 +65,29 @@ def test_out_of_order_lower_seq_does_not_override(db, actor, provenance):
     register_primary_selected(db)
     a = append_document(db, _candidate(provenance), run_id="run_2", actor=actor)
     b = append_document(db, _candidate(provenance), run_id="run_2", actor=actor)
-    e1 = _emit_primary(db, run_id="run_2", doc_id=a, expected_version=0,
-                       actor=actor, provenance=provenance)
-    e2 = _emit_primary(db, run_id="run_2", doc_id=b, expected_version=1,
-                       actor=actor, provenance=provenance)
+    e1 = _emit_primary(
+        db, run_id="run_2", doc_id=a, expected_version=0, actor=actor, provenance=provenance
+    )
+    e2 = _emit_primary(
+        db, run_id="run_2", doc_id=b, expected_version=1, actor=actor, provenance=provenance
+    )
 
     proj = StagePrimaryProjection()
-    proj.apply(db, e2)   # higher seq first
-    proj.apply(db, e1)   # lower seq must not win
+    proj.apply(db, e2)  # higher seq first
+    proj.apply(db, e1)  # lower seq must not win
     assert current_primary(db, "run_2", "CANDIDATE_SQL") == b
 
 
 def test_projection_is_fail_closed_on_unknown_doc(db, actor, provenance):
     register_primary_selected(db)
-    ev = _emit_primary(db, run_id="run_3", doc_id="doc_ghost", expected_version=0,
-                       actor=actor, provenance=provenance)
+    ev = _emit_primary(
+        db,
+        run_id="run_3",
+        doc_id="doc_ghost",
+        expected_version=0,
+        actor=actor,
+        provenance=provenance,
+    )
     proj = StagePrimaryProjection()
     assert proj.is_analytics is False
     with pytest.raises(ProjectionApplyError):
@@ -92,10 +105,12 @@ def test_run_projection_applies_in_global_seq_order(db, actor, provenance):
     register_primary_selected(db)
     a = append_document(db, _candidate(provenance), run_id="run_4", actor=actor)
     b = append_document(db, _candidate(provenance), run_id="run_4", actor=actor)
-    _emit_primary(db, run_id="run_4", doc_id=a, expected_version=0,
-                  actor=actor, provenance=provenance)
-    _emit_primary(db, run_id="run_4", doc_id=b, expected_version=1,
-                  actor=actor, provenance=provenance)
+    _emit_primary(
+        db, run_id="run_4", doc_id=a, expected_version=0, actor=actor, provenance=provenance
+    )
+    _emit_primary(
+        db, run_id="run_4", doc_id=b, expected_version=1, actor=actor, provenance=provenance
+    )
 
     applied = run_projection(db, StagePrimaryProjection())
     assert applied >= 2

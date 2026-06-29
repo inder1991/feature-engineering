@@ -1,16 +1,12 @@
 from __future__ import annotations
 
-from typing import Optional
-
 import psycopg
 
 
 def is_processed(conn: psycopg.Connection, message_id: str) -> bool:
     """True if this message id has already produced its one effect (§5.3)."""
     with conn.cursor() as cur:
-        cur.execute(
-            "SELECT 1 FROM processed_messages WHERE message_id = %s", (message_id,)
-        )
+        cur.execute("SELECT 1 FROM processed_messages WHERE message_id = %s", (message_id,))
         return cur.fetchone() is not None
 
 
@@ -20,7 +16,7 @@ def record_processed(
     message_id: str,
     aggregate: str,
     aggregate_id: str,
-    result_event_id: Optional[str],
+    result_event_id: str | None,
     processed_seq: int,
 ) -> None:
     """Record that message_id was processed at global_seq=processed_seq (§5.3).
@@ -46,7 +42,5 @@ def prune_processed_messages(conn: psycopg.Connection) -> int:
     """Delete ledger rows below the watermark; returns the number deleted."""
     watermark = processed_watermark(conn)
     with conn.cursor() as cur:
-        cur.execute(
-            "DELETE FROM processed_messages WHERE processed_seq < %s", (watermark,)
-        )
+        cur.execute("DELETE FROM processed_messages WHERE processed_seq < %s", (watermark,))
         return cur.rowcount

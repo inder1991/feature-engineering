@@ -1,7 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Sequence
 
 from psycopg.types.json import Jsonb
 
@@ -13,7 +13,7 @@ class RepairLoopState:
     attempts_made: int
     max_attempts: int
     exhausted: bool
-    rearm_seq: int = 0          # global_seq baseline of the current loop EPISODE (last re-arm)
+    rearm_seq: int = 0  # global_seq baseline of the current loop EPISODE (last re-arm)
 
 
 def evaluate_repair_loop(
@@ -30,14 +30,12 @@ def evaluate_repair_loop(
     attempts after it start at zero and a fresh exhaustion can route again."""
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT COALESCE(MAX(global_seq), 0) FROM events "
-            "WHERE run_id = %s AND type = ANY(%s)",
+            "SELECT COALESCE(MAX(global_seq), 0) FROM events WHERE run_id = %s AND type = ANY(%s)",
             (run_id, list(rearm_event_types)),
         )
         baseline = cur.fetchone()[0]
         cur.execute(
-            "SELECT count(*) FROM events "
-            "WHERE run_id = %s AND type = ANY(%s) AND global_seq > %s",
+            "SELECT count(*) FROM events WHERE run_id = %s AND type = ANY(%s) AND global_seq > %s",
             (run_id, list(attempt_event_types), baseline),
         )
         attempts_made = cur.fetchone()[0]
@@ -62,9 +60,17 @@ def route_repair_exhaustion(
             "INSERT INTO queue (message_id, partition_key, handler, payload) "
             "VALUES (%s, %s, 'runtime.repair_exhausted', %s) "
             "ON CONFLICT (message_id) DO NOTHING",
-            (message_id, f"{aggregate}:{run_id}",
-             Jsonb({"run_id": run_id, "reason": "repair_exhausted",
-                    "attempts_made": state.attempts_made,
-                    "max_attempts": state.max_attempts})),
+            (
+                message_id,
+                f"{aggregate}:{run_id}",
+                Jsonb(
+                    {
+                        "run_id": run_id,
+                        "reason": "repair_exhausted",
+                        "attempts_made": state.attempts_made,
+                        "max_attempts": state.max_attempts,
+                    }
+                ),
+            ),
         )
         return cur.rowcount == 1

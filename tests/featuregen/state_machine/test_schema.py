@@ -12,8 +12,15 @@ def test_run_transition_table_has_contract_columns(conn) -> None:
         )
         cols = {r[0] for r in cur.fetchall()}
     assert {
-        "table_version", "from_state", "to_state", "trigger", "guard_expr",
-        "guard_inputs", "precedence", "on_success", "on_guard_fail",
+        "table_version",
+        "from_state",
+        "to_state",
+        "trigger",
+        "guard_expr",
+        "guard_inputs",
+        "precedence",
+        "on_success",
+        "on_guard_fail",
     } <= cols
 
 
@@ -25,8 +32,15 @@ def test_feature_lifecycle_table_inherits_columns(conn) -> None:
         )
         cols = {r[0] for r in cur.fetchall()}
     assert {
-        "table_version", "from_state", "to_state", "trigger", "guard_expr",
-        "guard_inputs", "precedence", "on_success", "on_guard_fail",
+        "table_version",
+        "from_state",
+        "to_state",
+        "trigger",
+        "guard_expr",
+        "guard_inputs",
+        "precedence",
+        "on_success",
+        "on_guard_fail",
     } <= cols
 
 

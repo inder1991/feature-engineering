@@ -15,7 +15,8 @@ from featuregen.events.registry import (
 def test_hydrate_reconstitutes_schemas_from_db(conn):
     seed = EventSchemaRegistry()
     seed.register_schema(
-        "RUN_STARTED", 1,
+        "RUN_STARTED",
+        1,
         {"type": "object", "required": ["x"], "properties": {"x": {"type": "string"}}},
         owner="featuregen",
     )

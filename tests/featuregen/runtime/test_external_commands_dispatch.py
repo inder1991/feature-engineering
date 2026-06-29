@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from decimal import Decimal
 
 import pytest
@@ -12,14 +12,20 @@ from featuregen.runtime.external_commands import (
     record_external_command,
 )
 
-NOW = datetime(2026, 6, 27, 12, 0, tzinfo=timezone.utc)
+NOW = datetime(2026, 6, 27, 12, 0, tzinfo=UTC)
 
 
 def _record(conn, key, *, integration="llm", dedup=False, handle=None, status="pending"):
-    cmd = NewExternalCommand(integration=integration, idempotency_key=key,
-                             request_payload={"p": 1}, dedup_supported=dedup, job_handle=handle)
-    cid = record_external_command(conn, cmd, command_id=f"cmd_{key}", run_id="run_1",
-                                  require_dedup=frozenset())
+    cmd = NewExternalCommand(
+        integration=integration,
+        idempotency_key=key,
+        request_payload={"p": 1},
+        dedup_supported=dedup,
+        job_handle=handle,
+    )
+    cid = record_external_command(
+        conn, cmd, command_id=f"cmd_{key}", run_id="run_1", require_dedup=frozenset()
+    )
     if status != "pending":
         with conn.cursor() as cur:
             cur.execute("UPDATE external_commands SET status=%s WHERE command_id=%s", (status, cid))
@@ -28,7 +34,9 @@ def _record(conn, key, *, integration="llm", dedup=False, handle=None, status="p
 
 def _row(conn, cid):
     with conn.cursor() as cur:
-        cur.execute("SELECT status, result, cost_units FROM external_commands WHERE command_id=%s", (cid,))
+        cur.execute(
+            "SELECT status, result, cost_units FROM external_commands WHERE command_id=%s", (cid,)
+        )
         return cur.fetchone()
 
 
@@ -44,7 +52,9 @@ def test_pending_success(conn, recording_caller):
 
 def test_retryable_stays_pending(conn, recording_caller):
     cid = _record(conn, "retry")
-    caller = recording_caller(invoke_result=IntegrationResult(False, {"err": "503"}, permanent=False))
+    caller = recording_caller(
+        invoke_result=IntegrationResult(False, {"err": "503"}, permanent=False)
+    )
     out = dispatch_command(conn, cid, caller, now=NOW)
     assert out.status == "pending"
     assert _row(conn, cid)[0] == "pending"
@@ -52,7 +62,9 @@ def test_retryable_stays_pending(conn, recording_caller):
 
 def test_permanent_fails(conn, recording_caller):
     cid = _record(conn, "perm")
-    caller = recording_caller(invoke_result=IntegrationResult(False, {"err": "bad input"}, permanent=True))
+    caller = recording_caller(
+        invoke_result=IntegrationResult(False, {"err": "bad input"}, permanent=True)
+    )
     out = dispatch_command(conn, cid, caller, now=NOW)
     assert out.status == "failed"
     assert _row(conn, cid)[0] == "failed"

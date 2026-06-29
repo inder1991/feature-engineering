@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING, Mapping, Optional
+from typing import TYPE_CHECKING
 
 from featuregen.contracts import EventEnvelope
 from featuregen.events import load_stream
@@ -21,7 +22,7 @@ class ArtifactReplayStatus:
     doc_id: str
     stage: str
     intact: bool
-    degraded_reason: Optional[str] = None
+    degraded_reason: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -34,11 +35,11 @@ class ReplayResult:
 
 
 def replay_run(
-    conn: "DbConn",
+    conn: DbConn,
     run_id: str,
     *,
-    upto_seq: Optional[int] = None,
-    expected: Optional[Mapping[str, int]] = None,
+    upto_seq: int | None = None,
+    expected: Mapping[str, int] | None = None,
 ) -> ReplayResult:
     """Reconstruct a run's decision trail and label it full vs privacy-degraded (§8). The event
     skeleton + provenance are always reconstructable; a body whose blob is crypto-shredded makes
@@ -68,8 +69,11 @@ def replay_run(
         ).fetchone()
         status = status_row[0] if status_row is not None else "shredded"
         if status == "shredded":
-            artifacts.append(ArtifactReplayStatus(
-                doc_id=doc_id, stage=stage, intact=False, degraded_reason="body crypto-shredded"))
+            artifacts.append(
+                ArtifactReplayStatus(
+                    doc_id=doc_id, stage=stage, intact=False, degraded_reason="body crypto-shredded"
+                )
+            )
             degraded.append(doc_id)
         else:
             artifacts.append(ArtifactReplayStatus(doc_id=doc_id, stage=stage, intact=True))

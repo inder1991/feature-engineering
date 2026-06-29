@@ -43,9 +43,16 @@ def _seed(conn, values):
         append_event(
             conn,
             NewEvent(
-                aggregate="run", aggregate_id="r", type="E", schema_version=1, payload={"n": v},
+                aggregate="run",
+                aggregate_id="r",
+                type="E",
+                schema_version=1,
+                payload={"n": v},
                 actor=IdentityEnvelope(
-                    subject="u", actor_kind="human", authenticated=True, auth_method="oidc",
+                    subject="u",
+                    actor_kind="human",
+                    authenticated=True,
+                    auth_method="oidc",
                     role_claims=(),
                 ),
                 provenance=ProvenanceEnvelope(

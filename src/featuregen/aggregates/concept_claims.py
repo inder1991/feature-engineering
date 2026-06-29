@@ -1,11 +1,9 @@
 from __future__ import annotations
 
-from typing import Optional
-
 from featuregen.contracts import DbConn
 
 
-def claim_concept(conn: DbConn, concept_key: str, request_id: str) -> Optional[str]:
+def claim_concept(conn: DbConn, concept_key: str, request_id: str) -> str | None:
     won = conn.execute(
         "INSERT INTO concept_claims (concept_key, request_id) VALUES (%s, %s) "
         "ON CONFLICT (concept_key) DO NOTHING RETURNING request_id",

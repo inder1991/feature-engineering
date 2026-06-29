@@ -35,16 +35,20 @@ def test_derived_from_committed_doc_is_accepted(db, actor, provenance):
 def test_derived_from_unknown_doc_is_rejected(db, actor, provenance):
     with pytest.raises(DagViolationError):
         append_document(
-            db, _doc(provenance, derived_from=("doc_does_not_exist",)),
-            run_id="run_1", actor=actor,
+            db,
+            _doc(provenance, derived_from=("doc_does_not_exist",)),
+            run_id="run_1",
+            actor=actor,
         )
 
 
 def test_supersedes_unknown_doc_is_rejected(db, actor, provenance):
     with pytest.raises(DagViolationError):
         append_document(
-            db, _doc(provenance, supersedes=("doc_ghost",)),
-            run_id="run_1", actor=actor,
+            db,
+            _doc(provenance, supersedes=("doc_ghost",)),
+            run_id="run_1",
+            actor=actor,
         )
 
 
@@ -52,8 +56,10 @@ def test_rejecting_bad_edge_inserts_nothing(db, actor, provenance):
     before = db.execute("SELECT count(*) FROM documents").fetchone()[0]
     with pytest.raises(DagViolationError):
         append_document(
-            db, _doc(provenance, derived_from=("doc_ghost",)),
-            run_id="run_1", actor=actor,
+            db,
+            _doc(provenance, derived_from=("doc_ghost",)),
+            run_id="run_1",
+            actor=actor,
         )
     after = db.execute("SELECT count(*) FROM documents").fetchone()[0]
     assert after == before

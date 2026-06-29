@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import asdict
-from datetime import datetime, timezone
-from typing import Any, Mapping, Optional
+from datetime import UTC, datetime
+from typing import Any
 
 from featuregen.contracts import (
-    DbConn, EventEnvelope, IdentityEnvelope, NewEvent, ProvenanceEnvelope,
+    DbConn,
+    EventEnvelope,
+    IdentityEnvelope,
+    NewEvent,
+    ProvenanceEnvelope,
 )
 from featuregen.events.store import append_event, load_stream
 
@@ -34,13 +39,17 @@ def table_version_for(conn: DbConn, aggregate: str, aggregate_id: str) -> int:
     return 1
 
 
-def provenance_for(artifact_type: str = GOVERNANCE_ARTIFACT_TYPE, **extra: Any) -> ProvenanceEnvelope:
+def provenance_for(
+    artifact_type: str = GOVERNANCE_ARTIFACT_TYPE, **extra: Any
+) -> ProvenanceEnvelope:
     """Build a ProvenanceEnvelope. `artifact_type` MUST be a §3.7 stage/artifact enum value
     (defaults to the governance record artifact for lifecycle events); never pass an event-type
     name here."""
     return ProvenanceEnvelope(
-        artifact_type=artifact_type, schema_version=1,
-        producing_component=PRODUCING_COMPONENT, **extra,
+        artifact_type=artifact_type,
+        schema_version=1,
+        producing_component=PRODUCING_COMPONENT,
+        **extra,
     )
 
 
@@ -49,23 +58,39 @@ def identity_dict(actor: IdentityEnvelope) -> dict:
 
 
 def append(
-    conn: DbConn, *, aggregate: str, aggregate_id: str, type: str,
-    payload: Mapping[str, Any], actor: IdentityEnvelope,
-    provenance: Optional[ProvenanceEnvelope] = None,
-    request_id: Optional[str] = None, feature_id: Optional[str] = None,
-    run_id: Optional[str] = None, caused_by: Optional[str] = None,
-    expected_version: Optional[int] = None,
+    conn: DbConn,
+    *,
+    aggregate: str,
+    aggregate_id: str,
+    type: str,
+    payload: Mapping[str, Any],
+    actor: IdentityEnvelope,
+    provenance: ProvenanceEnvelope | None = None,
+    request_id: str | None = None,
+    feature_id: str | None = None,
+    run_id: str | None = None,
+    caused_by: str | None = None,
+    expected_version: int | None = None,
 ) -> EventEnvelope:
     if expected_version is None:
         expected_version = current_version(conn, aggregate, aggregate_id)
     new_event = NewEvent(
-        aggregate=aggregate, aggregate_id=aggregate_id, type=type, schema_version=1,
-        payload=dict(payload), actor=actor,
+        aggregate=aggregate,
+        aggregate_id=aggregate_id,
+        type=type,
+        schema_version=1,
+        payload=dict(payload),
+        actor=actor,
         provenance=provenance or provenance_for(),  # §3.7 artifact_type, NOT the event-type name
-        request_id=request_id, feature_id=feature_id, run_id=run_id,
-        caused_by=caused_by, occurred_at=datetime.now(timezone.utc),
+        request_id=request_id,
+        feature_id=feature_id,
+        run_id=run_id,
+        caused_by=caused_by,
+        occurred_at=datetime.now(UTC),
     )
     return append_event(
-        conn, new_event, expected_version=expected_version,
+        conn,
+        new_event,
+        expected_version=expected_version,
         table_version=table_version_for(conn, aggregate, aggregate_id),
     )

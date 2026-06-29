@@ -4,8 +4,11 @@ from featuregen.privacy.crypto_shred import ErasureOutcome, crypto_shred
 from featuregen.privacy.legal_hold import place_legal_hold
 
 ACTOR = IdentityEnvelope(
-    subject="user:dpo", actor_kind="human", authenticated=True,
-    auth_method="oidc", role_claims=("privacy",),
+    subject="user:dpo",
+    actor_kind="human",
+    authenticated=True,
+    auth_method="oidc",
+    role_claims=("privacy",),
 )
 
 
@@ -36,8 +39,9 @@ def test_crypto_shred_targets_pii_erasable_and_retains_the_rest(db):
     _blob(db, "blob_p", "pii-erasable", "k1")
     _blob(db, "blob_g", "governance-retained", "k2")
     _blob(db, "blob_h", "pii-erasable", "k3")
-    place_legal_hold(db, hold_id="hold_h", scope_kind="blob", scope_ref="blob_h",
-                     reason="audit", placed_by=ACTOR)
+    place_legal_hold(
+        db, hold_id="hold_h", scope_kind="blob", scope_ref="blob_h", reason="audit", placed_by=ACTOR
+    )
     record_attempt(db, definition_hash="keep_me", disposition="rejected", feature_id="feat_1")
     db.execute(
         "INSERT INTO security_audit (security_event_id, event_type, actor, attempted_action, decision, entry_hash) "
@@ -46,8 +50,11 @@ def test_crypto_shred_targets_pii_erasable_and_retains_the_rest(db):
 
     km = FakeKeyManager()
     outcomes = crypto_shred(
-        db, ["blob_p", "blob_g", "blob_h", "blob_missing"],
-        reason="gdpr erasure", requested_by=ACTOR, key_manager=km,
+        db,
+        ["blob_p", "blob_g", "blob_h", "blob_missing"],
+        reason="gdpr erasure",
+        requested_by=ACTOR,
+        key_manager=km,
     )
     by_id = {o.blob_id: o.outcome for o in outcomes}
     assert isinstance(outcomes[0], ErasureOutcome)
@@ -65,8 +72,18 @@ def test_crypto_shred_targets_pii_erasable_and_retains_the_rest(db):
     # audited: one erasure_audit row per blob, with the outcome recorded
     assert db.execute("SELECT count(*) FROM erasure_audit").fetchone()[0] == 4
     # security stream + attempt-memory are exempt and untouched
-    assert db.execute("SELECT count(*) FROM security_audit WHERE security_event_id='sec_keep'").fetchone()[0] == 1
-    assert db.execute("SELECT count(*) FROM attempt_memory WHERE definition_hash='keep_me'").fetchone()[0] == 1
+    assert (
+        db.execute(
+            "SELECT count(*) FROM security_audit WHERE security_event_id='sec_keep'"
+        ).fetchone()[0]
+        == 1
+    )
+    assert (
+        db.execute(
+            "SELECT count(*) FROM attempt_memory WHERE definition_hash='keep_me'"
+        ).fetchone()[0]
+        == 1
+    )
 
 
 def test_governance_retained_body_of_ungoverned_version_is_erasable(db):
@@ -75,8 +92,11 @@ def test_governance_retained_body_of_ungoverned_version_is_erasable(db):
     _blob(db, "blob_old_gov", "governance-retained", "k9")
     km = FakeKeyManager()
     outcomes = crypto_shred(
-        db, ["blob_old_gov"],
-        reason="owning version deprecated + erasure request", requested_by=ACTOR, key_manager=km,
+        db,
+        ["blob_old_gov"],
+        reason="owning version deprecated + erasure request",
+        requested_by=ACTOR,
+        key_manager=km,
         governance_active=lambda conn, blob_id: False,  # owning version no longer active/governed
     )
     assert outcomes[0].outcome == "shredded"

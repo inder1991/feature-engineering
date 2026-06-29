@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
-from typing import Optional
 
 from featuregen.contracts import DbConn
 
@@ -57,7 +56,7 @@ def _add_business_days(cal: _Calendar, start: datetime, days: int) -> datetime:
 
 
 def resolve_business_deadline(
-    conn: DbConn, calendar_name: Optional[str], start: datetime, spec: str
+    conn: DbConn, calendar_name: str | None, start: datetime, spec: str
 ) -> datetime:
     """Resolve a duration spec to an absolute fire time (§5.5). Deterministic so timer
     deadlines reproduce on replay. 'd' against a named calendar counts BUSINESS days

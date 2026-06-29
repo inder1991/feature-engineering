@@ -1,12 +1,14 @@
 import pytest
-
-from featuregen.contracts import CommandResult
-from featuregen.commands.api import execute_command
-from featuregen.commands.registry import register_command, clear_registry
-from featuregen.commands.authz_seam import (
-    AuthzDecision, register_command_authorizer, current_authorizer,
-)
 from tests.featuregen._helpers import make_cmd
+
+from featuregen.commands.api import execute_command
+from featuregen.commands.authz_seam import (
+    AuthzDecision,
+    current_authorizer,
+    register_command_authorizer,
+)
+from featuregen.commands.registry import clear_registry, register_command
+from featuregen.contracts import CommandResult
 
 
 class _AllowAll:
@@ -29,6 +31,7 @@ def _clean_registry():
 def test_dispatch_routes_to_registered_handler(db):
     def handler(conn, cmd):
         return CommandResult(accepted=True, aggregate_id="agg1", produced_event_ids=("e1",))
+
     register_command("act", handler)
     res = execute_command(db, make_cmd("act", "run", "agg1", {}))
     assert res.accepted and res.produced_event_ids == ("e1",)
@@ -36,9 +39,11 @@ def test_dispatch_routes_to_registered_handler(db):
 
 def test_duplicate_idempotency_key_replays_original(db):
     calls = []
+
     def handler(conn, cmd):
         calls.append(1)
         return CommandResult(accepted=True, aggregate_id="agg1", produced_event_ids=("e1",))
+
     register_command("act", handler)
     cmd = make_cmd("act", "run", "agg1", {}, idem="k1")
     first = execute_command(db, cmd)
@@ -58,6 +63,7 @@ def test_authz_denial_returns_not_accepted_and_does_not_dispatch(db):
     class Deny:
         def authorize(self, conn, cmd):
             return AuthzDecision(allowed=False, reason="not permitted")
+
     register_command_authorizer(Deny())
     res = execute_command(db, make_cmd("act", "run", "agg1", {}))
     assert res.accepted is False
@@ -97,6 +103,7 @@ def test_denied_command_is_not_cached(db):
     class Deny:
         def authorize(self, conn, cmd):
             return AuthzDecision(allowed=False, reason="nope")
+
     register_command_authorizer(Deny())
     execute_command(db, make_cmd("act", "run", "agg1", {}, idem="dk"))
     rows = db.execute(
@@ -106,8 +113,10 @@ def test_denied_command_is_not_cached(db):
 
 
 def test_accepted_command_stores_final_non_pending_result(db):
-    register_command("act", lambda c, m: CommandResult(
-        accepted=True, aggregate_id="agg1", produced_event_ids=("e1",)))
+    register_command(
+        "act",
+        lambda c, m: CommandResult(accepted=True, aggregate_id="agg1", produced_event_ids=("e1",)),
+    )
     execute_command(db, make_cmd("act", "run", "agg1", {}, idem="fk"))
     stored = db.execute(
         "SELECT result FROM command_idempotency WHERE idempotency_key = %s", ("fk",)
@@ -121,9 +130,12 @@ def test_replay_does_not_rerun_handler_when_prior_committed(db):
     db.execute(
         "INSERT INTO command_idempotency (idempotency_key, action, result) VALUES "
         "(%s, %s, %s::jsonb)",
-        ("pre", "act",
-         '{"accepted": true, "aggregate_id": "agg9", "produced_event_ids": ["x1"], '
-         '"denied_reason": null}'),
+        (
+            "pre",
+            "act",
+            '{"accepted": true, "aggregate_id": "agg9", "produced_event_ids": ["x1"], '
+            '"denied_reason": null}',
+        ),
     )
     calls = []
     register_command("act", lambda c, m: calls.append(1))

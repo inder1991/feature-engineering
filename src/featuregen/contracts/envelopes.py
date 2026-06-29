@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from typing import Any, Mapping, Optional
+from typing import Any
 from uuid import uuid4
 
 from featuregen.contracts.db import DbConn
-from featuregen.contracts.provenance import ProvenanceEnvelope  # single source of truth (Phase 08 authoritative)
+from featuregen.contracts.provenance import (
+    ProvenanceEnvelope,
+)  # single source of truth (Phase 08 authoritative)
 
 
 @dataclass(frozen=True, slots=True)
@@ -20,12 +23,12 @@ class IdentityEnvelope:
     auth_method: str
     role_claims: tuple[str, ...]
     groups: tuple[str, ...] = ()
-    tenant: Optional[str] = None
-    on_behalf_of: Optional[str] = None
-    impersonation: Optional[str] = None
+    tenant: str | None = None
+    on_behalf_of: str | None = None
+    impersonation: str | None = None
     break_glass: bool = False
-    source_of_authority: Optional[str] = None
-    attestation: Optional[str] = None
+    source_of_authority: str | None = None
+    attestation: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,10 +48,10 @@ class EventEnvelope:
     provenance: ProvenanceEnvelope
     occurred_at: datetime
     recorded_at: datetime
-    request_id: Optional[str] = None
-    feature_id: Optional[str] = None
-    run_id: Optional[str] = None
-    caused_by: Optional[str] = None
+    request_id: str | None = None
+    feature_id: str | None = None
+    run_id: str | None = None
+    caused_by: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,11 +65,11 @@ class NewEvent:
     payload: Mapping[str, Any]
     actor: IdentityEnvelope
     provenance: ProvenanceEnvelope
-    request_id: Optional[str] = None
-    feature_id: Optional[str] = None
-    run_id: Optional[str] = None
-    caused_by: Optional[str] = None
-    occurred_at: Optional[datetime] = None
+    request_id: str | None = None
+    feature_id: str | None = None
+    run_id: str | None = None
+    caused_by: str | None = None
+    occurred_at: datetime | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -82,10 +85,10 @@ class NewDocument:
     content_hash: str
     body_classification: str
     provenance: ProvenanceEnvelope
-    body_ref: Optional[str] = None
+    body_ref: str | None = None
     derived_from: tuple[str, ...] = ()
     supersedes: tuple[str, ...] = ()
-    reject_reason: Optional[str] = None
+    reject_reason: str | None = None
 
 
 class Disposition(str, Enum):
@@ -101,10 +104,10 @@ class NewExternalCommand:
     integration: str
     idempotency_key: str
     request_payload: Mapping[str, Any]
-    expected_run_id: Optional[str] = None
-    expected_stream_version: Optional[int] = None
-    expected_task_id: Optional[str] = None
-    job_handle: Optional[str] = None
+    expected_run_id: str | None = None
+    expected_stream_version: int | None = None
+    expected_task_id: str | None = None
+    job_handle: str | None = None
     dedup_supported: bool = False
 
 
@@ -115,9 +118,9 @@ class NewTimer:
     kind: str
     fire_at: datetime
     idempotency_key: str
-    task_id: Optional[str] = None
-    business_calendar: Optional[str] = None
-    cas_task_version: Optional[int] = None
+    task_id: str | None = None
+    business_calendar: str | None = None
+    cas_task_version: int | None = None
     payload: Mapping[str, Any] = field(default_factory=dict)
 
 
@@ -131,10 +134,10 @@ class NewActivation:
     feature_id: str
     feature_version_id: str
     use_case: str
-    base_feature_version_id: Optional[str]
+    base_feature_version_id: str | None
     approval_type: str
-    expires_at: Optional[datetime] = None
-    provenance: Optional[ProvenanceEnvelope] = None
+    expires_at: datetime | None = None
+    provenance: ProvenanceEnvelope | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -144,11 +147,11 @@ class HandlerResult:
 
     disposition: Disposition
     new_events: tuple[NewEvent, ...] = ()
-    document: Optional[NewDocument] = None
+    document: NewDocument | None = None
     external_commands: tuple[NewExternalCommand, ...] = ()
     timers: tuple[NewTimer, ...] = ()
     activations: tuple[NewActivation, ...] = ()
-    error: Optional[str] = None
+    error: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -156,7 +159,7 @@ class HandlerContext:
     run_id: str
     triggering_event: EventEnvelope
     documents: Mapping[str, NewDocument]
-    read_conn: "DbConn"  # READ-ONLY (autocommit): load stream/documents only; handlers MUST NOT write
+    read_conn: DbConn  # READ-ONLY (autocommit): load stream/documents only; handlers MUST NOT write
 
     def new_doc_id(self) -> str:
         """Mint a 'doc_'-prefixed id so the handler can set NewDocument(doc_id=...) and reference
@@ -169,11 +172,11 @@ class HandlerContext:
 class Command:
     action: str
     aggregate: str
-    aggregate_id: Optional[str]
+    aggregate_id: str | None
     args: Mapping[str, Any]
     actor: IdentityEnvelope
     idempotency_key: str
-    expected_version: Optional[int] = None
+    expected_version: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -181,7 +184,7 @@ class CommandResult:
     accepted: bool
     aggregate_id: str
     produced_event_ids: tuple[str, ...] = ()
-    denied_reason: Optional[str] = None
+    denied_reason: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -197,12 +200,12 @@ class GateTaskSpec:
     required_inputs: tuple[str, ...]
     eligible_assignees: Mapping[str, str]
     allowed_responses: tuple[str, ...]
-    run_id: Optional[str] = None
-    feature_id: Optional[str] = None
+    run_id: str | None = None
+    feature_id: str | None = None
     quorum_required: int = 1
-    quorum_of_role: Optional[str] = None
+    quorum_of_role: str | None = None
     delegation_allowed: bool = True
-    sla: Optional[str] = None
+    sla: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

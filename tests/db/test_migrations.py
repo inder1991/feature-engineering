@@ -37,17 +37,16 @@ def test_aggregate_id_consistency_check_rejects_mismatch(conn):
     # CheckViolation at the INSERT (execute), NOT at commit. Wrap the INSERT itself in
     # a savepoint so the violation is caught here and the connection stays usable.
     try:
-        with conn.transaction():
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
+        with conn.transaction(), conn.cursor() as cur:
+            cur.execute(
+                """
                     INSERT INTO events (event_id, aggregate, aggregate_id, stream_version, run_id,
                                         type, schema_version, table_version, actor, payload,
                                         provenance, occurred_at)
                     VALUES ('evt_bad', 'run', 'run_1', 1, 'run_2', 'X', 1, 1, '{}'::jsonb,
                             '{}'::jsonb, '{}'::jsonb, now())
                     """
-                )
+            )
         raised = False
     except psycopg.errors.CheckViolation:
         # run aggregate with aggregate_id != run_id violates the CHECK at INSERT time.

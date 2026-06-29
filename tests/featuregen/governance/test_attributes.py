@@ -3,16 +3,20 @@ import pytest
 from featuregen.governance.attributes import (
     APPROVAL_TYPES,
     VERIFICATION_STAMPS,
-    GovernanceAttributes,
     GovernanceAttributeError,
+    GovernanceAttributes,
     validate_governance_attributes,
 )
 
 
 def _attrs(**over):
     base = dict(
-        feature_version_id="fv_1", feature_id="feat_1", produced_by_run="run_1",
-        verification_stamp="USEFULNESS-CHECKED", risk_tier="medium", approval_type="PRODUCTION",
+        feature_version_id="fv_1",
+        feature_id="feat_1",
+        produced_by_run="run_1",
+        verification_stamp="USEFULNESS-CHECKED",
+        risk_tier="medium",
+        approval_type="PRODUCTION",
     )
     base.update(over)
     return GovernanceAttributes(**base)
@@ -29,7 +33,9 @@ def test_valid_attributes_pass():
 
 def test_unknown_verification_stamp_rejected():
     with pytest.raises(GovernanceAttributeError):
-        validate_governance_attributes(_attrs(verification_stamp="USEFULNESS_CHECKED"))  # underscore is wrong
+        validate_governance_attributes(
+            _attrs(verification_stamp="USEFULNESS_CHECKED")
+        )  # underscore is wrong
 
 
 def test_unknown_approval_type_and_nonpositive_max_uses_rejected():

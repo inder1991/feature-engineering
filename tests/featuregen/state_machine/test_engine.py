@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from tests.featuregen.state_machine._predicates import truthy
+
 from featuregen.state_machine.engine import (
     GUARD_FAILED,
     TRANSITION_REJECTED,
@@ -7,7 +9,6 @@ from featuregen.state_machine.engine import (
 )
 from featuregen.state_machine.guards import InMemoryPredicateRegistry
 from featuregen.state_machine.transition_table import Transition, TransitionTable
-from tests.featuregen.state_machine._predicates import truthy
 
 INPUTS = {"confirmed_contract_ref": "doc_1"}
 
@@ -76,14 +77,17 @@ def test_guard_fail_emits_guard_failed_no_fallthrough() -> None:
     low = _alt_guarded("ALT_STATE", "ALT_EVENT", precedence=50)
     table = TransitionTable("run", 1, (high, low))
     res = evaluate_transition(
-        table, _registry(), "CONFIRMED_CONTRACT", "MAPPING_COMPLETED",
+        table,
+        _registry(),
+        "CONFIRMED_CONTRACT",
+        "MAPPING_COMPLETED",
         {"confirmed_contract_ref": "", "alt_ready_ref": "ready"},
     )
     assert res.matched and not res.passed
     assert res.selected_precedence == 100
     assert res.emitted_event_type == GUARD_FAILED
     assert res.to_state == "MAPPING_REVIEW_FAILED"
-    assert res.emitted_event_type != "ALT_EVENT"   # would-pass prec-50 was NOT chosen
+    assert res.emitted_event_type != "ALT_EVENT"  # would-pass prec-50 was NOT chosen
     assert res.to_state != "ALT_STATE"
     assert res.audit_payload["guard"]["passed"] is False
 
@@ -99,9 +103,15 @@ def test_no_matching_transition_is_rejected() -> None:
 
 def test_unguarded_transition_passes() -> None:
     t = Transition(
-        table_version=1, from_state="A", to_state="B", trigger="T",
-        guard_expr=None, guard_inputs={}, precedence=100,
-        on_success={"to": "B", "emits": "MOVED"}, on_guard_fail=None,
+        table_version=1,
+        from_state="A",
+        to_state="B",
+        trigger="T",
+        guard_expr=None,
+        guard_inputs={},
+        precedence=100,
+        on_success={"to": "B", "emits": "MOVED"},
+        on_guard_fail=None,
     )
     res = evaluate_transition(TransitionTable("run", 1, (t,)), _registry(), "A", "T", {})
     assert res.passed and res.to_state == "B" and res.emitted_event_type == "MOVED"

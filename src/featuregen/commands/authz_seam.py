@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, Protocol, runtime_checkable
+from typing import Protocol, runtime_checkable
 
 from featuregen.contracts import Command, DbConn
 
@@ -9,7 +9,7 @@ from featuregen.contracts import Command, DbConn
 @dataclass(frozen=True, slots=True)
 class AuthzDecision:
     allowed: bool
-    reason: Optional[str] = None
+    reason: str | None = None
 
 
 @runtime_checkable

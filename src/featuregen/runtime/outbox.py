@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
-from typing import Any, Callable, Iterable, Mapping
+from typing import Any
 
 import psycopg
 from psycopg.rows import dict_row
@@ -127,39 +128,34 @@ def relay_publish_batch(
         except BackpressureError as bp:
             # Durable waiting (§5.2): downstream is saturated. Return the row to 'pending'
             # with a delay WITHOUT bumping attempts or DLQ'ing — it is not a failure.
-            with conn.transaction():
-                with conn.cursor() as cur:
-                    cur.execute(
-                        "UPDATE outbox SET status='pending', last_error=%s, lease_owner=NULL, "
-                        "lease_expires_at=NULL, next_attempt_at = now() + make_interval(secs => %s) "
-                        "WHERE id=%s",
-                        (str(bp), lease_seconds, row["id"]),
-                    )
+            with conn.transaction(), conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE outbox SET status='pending', last_error=%s, lease_owner=NULL, "
+                    "lease_expires_at=NULL, next_attempt_at = now() + make_interval(secs => %s) "
+                    "WHERE id=%s",
+                    (str(bp), lease_seconds, row["id"]),
+                )
             continue
         except Exception as exc:  # noqa: BLE001 — failure classification is intentional
             attempts = row["attempts"] + 1
-            with conn.transaction():
-                with conn.cursor() as cur:
-                    if attempts >= row["max_attempts"]:
-                        cur.execute(
-                            "UPDATE outbox SET status='dead', attempts=%s, last_error=%s, "
-                            "lease_owner=NULL, lease_expires_at=NULL WHERE id=%s",
-                            (attempts, str(exc), row["id"]),
-                        )
-                    else:
-                        delay = compute_backoff(attempts, jitter=0.0)
-                        cur.execute(
-                            "UPDATE outbox SET status='pending', attempts=%s, last_error=%s, "
-                            "lease_owner=NULL, lease_expires_at=NULL, "
-                            "next_attempt_at = now() + make_interval(secs => %s) WHERE id=%s",
-                            (attempts, str(exc), delay, row["id"]),
-                        )
+            with conn.transaction(), conn.cursor() as cur:
+                if attempts >= row["max_attempts"]:
+                    cur.execute(
+                        "UPDATE outbox SET status='dead', attempts=%s, last_error=%s, "
+                        "lease_owner=NULL, lease_expires_at=NULL WHERE id=%s",
+                        (attempts, str(exc), row["id"]),
+                    )
+                else:
+                    delay = compute_backoff(attempts, jitter=0.0)
+                    cur.execute(
+                        "UPDATE outbox SET status='pending', attempts=%s, last_error=%s, "
+                        "lease_owner=NULL, lease_expires_at=NULL, "
+                        "next_attempt_at = now() + make_interval(secs => %s) WHERE id=%s",
+                        (attempts, str(exc), delay, row["id"]),
+                    )
             continue
-        with conn.transaction():
-            with conn.cursor() as cur:
-                cur.execute(
-                    "UPDATE outbox SET status='sent', sent_at=now() WHERE id=%s", (row["id"],)
-                )
+        with conn.transaction(), conn.cursor() as cur:
+            cur.execute("UPDATE outbox SET status='sent', sent_at=now() WHERE id=%s", (row["id"],))
         sent += 1
     return sent
 

@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Callable, Optional
 
 from psycopg.types.json import Jsonb
 from ulid import ULID  # python-ulid (declared by Phase 01); ULID-style id minting
@@ -26,15 +26,25 @@ def schedule_timer(conn: DbConn, aggregate: str, aggregate_id: str, timer: NewTi
             ON CONFLICT (idempotency_key) DO NOTHING
             RETURNING timer_id
             """,
-            (timer_id, timer.idempotency_key, aggregate, aggregate_id, timer.task_id,
-             timer.kind, timer.fire_at, timer.business_calendar, timer.cas_task_version,
-             Jsonb(dict(timer.payload))),
+            (
+                timer_id,
+                timer.idempotency_key,
+                aggregate,
+                aggregate_id,
+                timer.task_id,
+                timer.kind,
+                timer.fire_at,
+                timer.business_calendar,
+                timer.cas_task_version,
+                Jsonb(dict(timer.payload)),
+            ),
         )
         row = cur.fetchone()
         if row is not None:
             return row[0]
-        cur.execute("SELECT timer_id FROM timers WHERE idempotency_key = %s",
-                    (timer.idempotency_key,))
+        cur.execute(
+            "SELECT timer_id FROM timers WHERE idempotency_key = %s", (timer.idempotency_key,)
+        )
         return cur.fetchone()[0]
 
 
@@ -49,7 +59,7 @@ def build_escalation_ladder(
     sla: str,
     reminder: str,
     escalation: str,
-    business_calendar: Optional[str] = None,
+    business_calendar: str | None = None,
 ) -> tuple[NewTimer, ...]:
     """Compose the escalation ladder (§5.5) as durable timers, each CAS-stamped with
     task_version and keyed for idempotency, returned in FIRE-TIME order
@@ -64,8 +74,12 @@ def build_escalation_ladder(
     reminder_at = resolve_business_deadline(conn, business_calendar, opened_at, reminder)
     escalation_at = resolve_business_deadline(conn, business_calendar, sla_at, escalation)
     park_at = resolve_business_deadline(conn, business_calendar, escalation_at, escalation)
-    rungs = (("reminder", reminder_at), ("sla", sla_at),
-             ("escalation", escalation_at), ("auto_park", park_at))
+    rungs = (
+        ("reminder", reminder_at),
+        ("sla", sla_at),
+        ("escalation", escalation_at),
+        ("auto_park", park_at),
+    )
     return tuple(
         NewTimer(
             kind=kind,
@@ -110,10 +124,10 @@ def poll_due_timers(
         return [r[0] for r in cur.fetchall()]
 
 
-TaskVersionResolver = Callable[[DbConn, str], Optional[int]]
+TaskVersionResolver = Callable[[DbConn, str], int | None]
 
 
-def _default_task_version(conn: DbConn, task_id: str) -> Optional[int]:
+def _default_task_version(conn: DbConn, task_id: str) -> int | None:
     """Read the current task_version of an OPEN gate task. Returns None if the task is
     gone/answered/cancelled, which suppresses a late timer. NOTE: this is the LIBRARY
     DEFAULT only and queries Phase 07's `human_tasks` table — a *runtime* dependency on
@@ -132,7 +146,7 @@ def _default_task_version(conn: DbConn, task_id: str) -> Optional[int]:
 class TimerFireOutcome:
     timer_id: str
     fired: bool
-    suppressed_reason: Optional[str] = None  # already_fired|cas_mismatch|task_closed|not_found
+    suppressed_reason: str | None = None  # already_fired|cas_mismatch|task_closed|not_found
 
 
 def fire_timer(
@@ -181,8 +195,12 @@ def fire_timer(
             VALUES (%s, %s, %s, %s)
             ON CONFLICT (message_id) DO NOTHING
             """,
-            (idem, f"{aggregate}:{aggregate_id}", handler,
-             Jsonb({"timer_id": timer_id, "kind": kind, "task_id": task_id})),
+            (
+                idem,
+                f"{aggregate}:{aggregate_id}",
+                handler,
+                Jsonb({"timer_id": timer_id, "kind": kind, "task_id": task_id}),
+            ),
         )
         cur.execute("UPDATE timers SET status='fired' WHERE timer_id=%s", (timer_id,))
     return TimerFireOutcome(timer_id, True)

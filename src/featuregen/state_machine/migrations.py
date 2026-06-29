@@ -52,9 +52,7 @@ def _migrate(
         )
     target = load_transition_table(conn, kind, to_table_version)
     if not target.transitions:
-        raise MigrationError(
-            f"{kind} transition table version {to_table_version} does not exist"
-        )
+        raise MigrationError(f"{kind} transition table version {to_table_version} does not exist")
     if current_state not in target.states:
         raise MigrationError(
             f"current_state {current_state!r} not present in {kind} table "

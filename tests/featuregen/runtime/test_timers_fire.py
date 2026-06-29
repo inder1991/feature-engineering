@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from featuregen.contracts import NewTimer
 from featuregen.runtime.timers import (
@@ -10,14 +10,23 @@ from featuregen.runtime.timers import (
     schedule_timer,
 )
 
-UTC = timezone.utc
+UTC = UTC
 NOW = datetime(2026, 6, 27, 12, 0, tzinfo=UTC)
 
 
 def _sched(conn, key, *, kind="escalation", task_id=None, cas=None):
-    return schedule_timer(conn, "run", "run_1",
-                          NewTimer(kind=kind, fire_at=NOW - timedelta(minutes=1),
-                                   idempotency_key=key, task_id=task_id, cas_task_version=cas))
+    return schedule_timer(
+        conn,
+        "run",
+        "run_1",
+        NewTimer(
+            kind=kind,
+            fire_at=NOW - timedelta(minutes=1),
+            idempotency_key=key,
+            task_id=task_id,
+            cas_task_version=cas,
+        ),
+    )
 
 
 def _queue_count(conn, message_id):

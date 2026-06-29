@@ -5,9 +5,7 @@ import pytest
 
 
 def _table_exists(db, name: str) -> bool:
-    row = db.execute(
-        "SELECT to_regclass(%s) IS NOT NULL", (f"public.{name}",)
-    ).fetchone()
+    row = db.execute("SELECT to_regclass(%s) IS NOT NULL", (f"public.{name}",)).fetchone()
     return bool(row[0])
 
 
@@ -31,18 +29,14 @@ def _insert_doc(db, doc_id: str) -> None:
 
 def test_documents_are_write_once_no_update(db):
     _insert_doc(db, "doc_wo_update")
-    with pytest.raises(psycopg.errors.RaiseException):
-        with db.transaction():
-            db.execute(
-                "UPDATE documents SET branch_role='primary' WHERE doc_id='doc_wo_update'"
-            )
+    with pytest.raises(psycopg.errors.RaiseException), db.transaction():
+        db.execute("UPDATE documents SET branch_role='primary' WHERE doc_id='doc_wo_update'")
 
 
 def test_documents_are_write_once_no_delete(db):
     _insert_doc(db, "doc_wo_delete")
-    with pytest.raises(psycopg.errors.RaiseException):
-        with db.transaction():
-            db.execute("DELETE FROM documents WHERE doc_id='doc_wo_delete'")
+    with pytest.raises(psycopg.errors.RaiseException), db.transaction():
+        db.execute("DELETE FROM documents WHERE doc_id='doc_wo_delete'")
 
 
 def test_one_live_primary_per_run_stage_is_unique(db):
@@ -51,9 +45,8 @@ def test_one_live_primary_per_run_stage_is_unique(db):
         "INSERT INTO stage_primary (run_id, stage, doc_id, selected_seq) "
         "VALUES ('run_1', 'DRAFT_CONTRACT', 'doc_primary_a', 1)"
     )
-    with pytest.raises(psycopg.errors.UniqueViolation):
-        with db.transaction():
-            db.execute(
-                "INSERT INTO stage_primary (run_id, stage, doc_id, selected_seq) "
-                "VALUES ('run_1', 'DRAFT_CONTRACT', 'doc_primary_a', 2)"
-            )
+    with pytest.raises(psycopg.errors.UniqueViolation), db.transaction():
+        db.execute(
+            "INSERT INTO stage_primary (run_id, stage, doc_id, selected_seq) "
+            "VALUES ('run_1', 'DRAFT_CONTRACT', 'doc_primary_a', 2)"
+        )

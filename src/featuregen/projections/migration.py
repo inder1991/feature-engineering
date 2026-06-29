@@ -36,9 +36,7 @@ def migrate_projection(conn: DbConn, alias: str, new_projection: Projection) -> 
     then switch the alias atomically once the new projection has caught up to head (§3.6)."""
     rebuild_projection(conn, new_projection)
     if projection_lag(conn, new_projection.name) != 0:
-        raise RuntimeError(
-            f"migration aborted: {new_projection.name} not caught up to head"
-        )
+        raise RuntimeError(f"migration aborted: {new_projection.name} not caught up to head")
     head = _head_seq(conn)
     with conn.cursor() as cur:
         # single-statement atomic read-switch.

@@ -26,9 +26,7 @@ def test_compute_content_hash_is_deterministic_and_prefixed():
 
 
 def test_append_document_returns_doc_id_and_stores_fields(db, actor, provenance):
-    doc_id = append_document(
-        db, _candidate(provenance), run_id="run_1", actor=actor
-    )
+    doc_id = append_document(db, _candidate(provenance), run_id="run_1", actor=actor)
     assert doc_id.startswith("doc_")
     row = get_document(db, doc_id)
     assert row["stage"] == "DRAFT_CONTRACT"

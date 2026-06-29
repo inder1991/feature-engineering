@@ -104,8 +104,14 @@ def _mark_degraded(conn: DbConn, projection_name: str, exc: ProjectionApplyError
                           poison_seq = EXCLUDED.poison_seq,
                           degraded_at = now()
             """,
-            (projection_name, exc.aggregate, exc.aggregate_id, exc.reason,
-             event.event_id, event.global_seq),
+            (
+                projection_name,
+                exc.aggregate,
+                exc.aggregate_id,
+                exc.reason,
+                event.event_id,
+                event.global_seq,
+            ),
         )
 
 

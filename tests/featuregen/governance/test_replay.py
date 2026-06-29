@@ -6,9 +6,9 @@ def _seed_event(db, run_id):
         "INSERT INTO events (event_id, aggregate, aggregate_id, stream_version, run_id, type, "
         "schema_version, table_version, actor, payload, provenance, occurred_at) "
         "VALUES (%s,'run',%s,1,%s,'RUN_OPENED',1,1,"
-        "'{\"subject\":\"s\",\"actor_kind\":\"service\",\"authenticated\":true,"
-        "\"auth_method\":\"workload-identity\",\"role_claims\":[]}'::jsonb, '{}'::jsonb, "
-        "'{\"artifact_type\":\"DRAFT_CONTRACT\",\"schema_version\":1,\"producing_component\":\"featuregen@1\"}'::jsonb, now())",
+        '\'{"subject":"s","actor_kind":"service","authenticated":true,'
+        '"auth_method":"workload-identity","role_claims":[]}\'::jsonb, \'{}\'::jsonb, '
+        '\'{"artifact_type":"DRAFT_CONTRACT","schema_version":1,"producing_component":"featuregen@1"}\'::jsonb, now())',
         ("evt_" + run_id, run_id, run_id),
     )
 
@@ -26,7 +26,13 @@ def _doc(db, doc_id, run_id, stage, body_ref):
         "INSERT INTO documents (doc_id, run_id, stage, schema_version, branch_role, content_hash, "
         "body_classification, actor, provenance, body_ref) "
         "VALUES (%s, %s, %s, 1, 'primary', 'sha256:x', %s, '{}'::jsonb, '{}'::jsonb, %s)",
-        (doc_id, run_id, stage, "pii-erasable" if "p" in doc_id else "governance-retained", body_ref),
+        (
+            doc_id,
+            run_id,
+            stage,
+            "pii-erasable" if "p" in doc_id else "governance-retained",
+            body_ref,
+        ),
     )
 
 

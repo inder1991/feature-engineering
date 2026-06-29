@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Optional
 
 from psycopg.types.json import Jsonb
 
@@ -11,15 +10,15 @@ from featuregen.contracts import DbConn
 
 @dataclass(frozen=True, slots=True)
 class CostCeilings:
-    per_run: Optional[Decimal] = None
-    per_request: Optional[Decimal] = None
-    max_candidates: Optional[int] = None
+    per_run: Decimal | None = None
+    per_request: Decimal | None = None
+    max_candidates: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class CostBreakerOutcome:
     tripped: bool
-    ceiling: Optional[str] = None        # per_run|per_request|max_candidates
+    ceiling: str | None = None  # per_run|per_request|max_candidates
     run_cost: Decimal = Decimal(0)
     request_cost: Decimal = Decimal(0)
 
@@ -50,9 +49,7 @@ def request_cost(conn: DbConn, request_id: str) -> Decimal:
         return cur.fetchone()[0]
 
 
-def check_cost_breaker(
-    conn: DbConn, run_id: str, *, ceilings: CostCeilings
-) -> CostBreakerOutcome:
+def check_cost_breaker(conn: DbConn, run_id: str, *, ceilings: CostCeilings) -> CostBreakerOutcome:
     """Pure read of the durable counters; returns which ceiling (if any) is breached (§5.6).
     Per-run is checked first, then per-request, then candidate count."""
     with conn.cursor() as cur:
@@ -75,9 +72,7 @@ def check_cost_breaker(
     return CostBreakerOutcome(False, None, run_cost, req_cost)
 
 
-def trip_cost_breaker(
-    conn: DbConn, run_id: str, *, ceiling: str, aggregate: str = "run"
-) -> bool:
+def trip_cost_breaker(conn: DbConn, run_id: str, *, ceiling: str, aggregate: str = "run") -> bool:
     """Auto-park on ceiling (§5.6): enqueue exactly ONE parking work message (idempotent by a
     deterministic message_id) mirroring the §5.5 ladder's auto-park rung. Returns True if a
     new park message was enqueued, False if the run was already parked for this ceiling."""
@@ -86,7 +81,10 @@ def trip_cost_breaker(
         cur.execute(
             "INSERT INTO queue (message_id, partition_key, handler, payload) "
             "VALUES (%s, %s, 'runtime.auto_park', %s) ON CONFLICT (message_id) DO NOTHING",
-            (message_id, f"{aggregate}:{run_id}",
-             Jsonb({"run_id": run_id, "reason": "cost_ceiling", "ceiling": ceiling})),
+            (
+                message_id,
+                f"{aggregate}:{run_id}",
+                Jsonb({"run_id": run_id, "reason": "cost_ceiling", "ceiling": ceiling}),
+            ),
         )
         return cur.rowcount == 1

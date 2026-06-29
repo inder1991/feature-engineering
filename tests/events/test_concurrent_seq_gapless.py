@@ -34,7 +34,10 @@ def _new(agg_id: str) -> NewEvent:
         schema_version=1,
         payload={},
         actor=IdentityEnvelope(
-            subject="u", actor_kind="human", authenticated=True, auth_method="oidc",
+            subject="u",
+            actor_kind="human",
+            authenticated=True,
+            auth_method="oidc",
             role_claims=(),
         ),
         provenance=ProvenanceEnvelope(
@@ -71,8 +74,7 @@ def test_concurrent_cross_aggregate_appends_are_gapless(_dsn):
 
         def run_b() -> None:
             with conn_b.transaction():
-                b_box["env"] = append_event(conn_b, _new("rb"), expected_version=0,
-                                            table_version=1)
+                b_box["env"] = append_event(conn_b, _new("rb"), expected_version=0, table_version=1)
             b_done.set()
 
         t = threading.Thread(target=run_b, name="appender-b")
@@ -105,8 +107,7 @@ def test_concurrent_cross_aggregate_appends_are_gapless(_dsn):
             except Exception:  # noqa: BLE001
                 pass
             c.close()
-        with psycopg.connect(_dsn, autocommit=True) as cleanup:
-            with cleanup.cursor() as cur:
-                cur.execute("DELETE FROM events")
-                cur.execute("DELETE FROM projection_checkpoints")
-                cur.execute("DELETE FROM projection_degraded")
+        with psycopg.connect(_dsn, autocommit=True) as cleanup, cleanup.cursor() as cur:
+            cur.execute("DELETE FROM events")
+            cur.execute("DELETE FROM projection_checkpoints")
+            cur.execute("DELETE FROM projection_degraded")

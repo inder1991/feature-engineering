@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import pytest
+from tests.featuregen.state_machine._predicates import PeekingPredicate, truthy
 
 from featuregen.state_machine.guard_expr import GuardExprError
 from featuregen.state_machine.guards import (
     InMemoryPredicateRegistry,
     PredicateRegistrationError,
 )
-from tests.featuregen.state_machine._predicates import PeekingPredicate, truthy
 
 
 def _registry() -> InMemoryPredicateRegistry:
@@ -86,7 +86,9 @@ def test_missing_declared_input_raises() -> None:
 def test_unregistered_predicate_in_expr_raises() -> None:
     reg = _registry()
     with pytest.raises(KeyError):
-        reg.evaluate("confirmed_contract_exists AND not_registered", {"confirmed_contract_ref": "x"})
+        reg.evaluate(
+            "confirmed_contract_exists AND not_registered", {"confirmed_contract_ref": "x"}
+        )
 
 
 def test_malformed_expr_propagates() -> None:

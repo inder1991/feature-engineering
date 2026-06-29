@@ -35,9 +35,7 @@ def _new(run_id: str, payload: dict) -> NewEvent:
 
 
 def test_append_allocates_seq_and_stream_version(conn):
-    event_registry().register_schema(
-        "RUN_STARTED", 1, {"type": "object"}, owner="featuregen"
-    )
+    event_registry().register_schema("RUN_STARTED", 1, {"type": "object"}, owner="featuregen")
     env = append_event(conn, _new("run_a", {}), expected_version=0, table_version=1)
     assert env.stream_version == 1
     assert env.global_seq >= 1
@@ -46,9 +44,7 @@ def test_append_allocates_seq_and_stream_version(conn):
 
 
 def test_append_increments_stream_version_and_global_seq(conn):
-    event_registry().register_schema(
-        "RUN_STARTED", 1, {"type": "object"}, owner="featuregen"
-    )
+    event_registry().register_schema("RUN_STARTED", 1, {"type": "object"}, owner="featuregen")
     first = append_event(conn, _new("run_b", {}), expected_version=0, table_version=1)
     second = append_event(conn, _new("run_b", {}), expected_version=1, table_version=1)
     assert second.stream_version == 2

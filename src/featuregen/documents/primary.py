@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from typing import Optional
-
 from psycopg.types.json import Jsonb
 
 from featuregen.contracts import (
@@ -38,8 +36,7 @@ def register_primary_selected(conn: DbConn) -> None:
         VALUES (%s, %s, %s, 'featuregen', 'active')
         ON CONFLICT (type_name, schema_version) DO NOTHING
         """,
-        (PRIMARY_SELECTED, PRIMARY_SELECTED_SCHEMA_VERSION,
-         Jsonb(PRIMARY_SELECTED_JSON_SCHEMA)),
+        (PRIMARY_SELECTED, PRIMARY_SELECTED_SCHEMA_VERSION, Jsonb(PRIMARY_SELECTED_JSON_SCHEMA)),
     )
     # append_event validates against the in-memory event_registry() singleton (the DB
     # event_type_registry table is the durable record); register there too so writes pass.
@@ -66,7 +63,7 @@ def new_primary_selected(
     doc_id: str,
     actor: IdentityEnvelope,
     provenance: ProvenanceEnvelope,
-    caused_by: Optional[str] = None,
+    caused_by: str | None = None,
 ) -> NewEvent:
     """Canonical PRIMARY_SELECTED builder (§3.4). Promotion is an event, never an in-place flip."""
     return NewEvent(
@@ -100,7 +97,8 @@ class StagePrimaryProjection:
         ).fetchone()
         if known is None:
             raise ProjectionApplyError(
-                "run", run_id or "",
+                "run",
+                run_id or "",
                 f"PRIMARY_SELECTED references unknown doc {doc_id} for ({run_id},{stage})",
             )
         conn.execute(
@@ -120,7 +118,7 @@ class StagePrimaryProjection:
         conn.execute("TRUNCATE stage_primary")
 
 
-def current_primary(conn: DbConn, run_id: str, stage: str) -> Optional[str]:
+def current_primary(conn: DbConn, run_id: str, stage: str) -> str | None:
     """The live primary doc_id for (run_id, stage), or None (§3.4)."""
     row = conn.execute(
         "SELECT doc_id FROM stage_primary WHERE run_id=%s AND stage=%s",

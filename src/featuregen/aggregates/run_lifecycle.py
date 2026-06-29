@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from featuregen.contracts import Command, CommandResult, DbConn
-from featuregen.events.store import load_stream
 from featuregen.aggregates._append import append
 from featuregen.aggregates.ids import new_run_id
+from featuregen.contracts import Command, CommandResult, DbConn
+from featuregen.events.store import load_stream
 
 _TERMINAL_RUN_TYPES = ("RUN_REJECTED", "RUN_CANCELLED", "RUN_WITHDRAWN")
 
@@ -16,15 +16,20 @@ def _terminal_command(event_type: str):
     def handler(conn: DbConn, cmd: Command) -> CommandResult:
         run_id = cmd.aggregate_id
         if run_is_terminal(conn, run_id):
-            return CommandResult(accepted=False, aggregate_id=run_id,
-                                 denied_reason="run already terminal")
+            return CommandResult(
+                accepted=False, aggregate_id=run_id, denied_reason="run already terminal"
+            )
         evt = append(
-            conn, aggregate="run", aggregate_id=run_id, type=event_type,
+            conn,
+            aggregate="run",
+            aggregate_id=run_id,
+            type=event_type,
             payload={"run_id": run_id, "reason": cmd.args.get("reason")},
-            actor=cmd.actor, run_id=run_id,
+            actor=cmd.actor,
+            run_id=run_id,
         )
-        return CommandResult(accepted=True, aggregate_id=run_id,
-                             produced_event_ids=(evt.event_id,))
+        return CommandResult(accepted=True, aggregate_id=run_id, produced_event_ids=(evt.event_id,))
+
     return handler
 
 
@@ -36,10 +41,17 @@ withdraw_command = _terminal_command("RUN_WITHDRAWN")
 def park_command(conn: DbConn, cmd: Command) -> CommandResult:
     run_id = cmd.aggregate_id
     evt = append(
-        conn, aggregate="run", aggregate_id=run_id, type="RUN_PARKED",
-        payload={"run_id": run_id, "owner": cmd.args.get("owner"),
-                 "waiting_on_fact": cmd.args.get("waiting_on_fact")},
-        actor=cmd.actor, run_id=run_id,
+        conn,
+        aggregate="run",
+        aggregate_id=run_id,
+        type="RUN_PARKED",
+        payload={
+            "run_id": run_id,
+            "owner": cmd.args.get("owner"),
+            "waiting_on_fact": cmd.args.get("waiting_on_fact"),
+        },
+        actor=cmd.actor,
+        run_id=run_id,
     )
     return CommandResult(accepted=True, aggregate_id=run_id, produced_event_ids=(evt.event_id,))
 
@@ -47,8 +59,13 @@ def park_command(conn: DbConn, cmd: Command) -> CommandResult:
 def unpark_command(conn: DbConn, cmd: Command) -> CommandResult:
     run_id = cmd.aggregate_id
     evt = append(
-        conn, aggregate="run", aggregate_id=run_id, type="RUN_UNPARKED",
-        payload={"run_id": run_id}, actor=cmd.actor, run_id=run_id,
+        conn,
+        aggregate="run",
+        aggregate_id=run_id,
+        type="RUN_UNPARKED",
+        payload={"run_id": run_id},
+        actor=cmd.actor,
+        run_id=run_id,
     )
     return CommandResult(accepted=True, aggregate_id=run_id, produced_event_ids=(evt.event_id,))
 
@@ -57,21 +74,33 @@ def reopen_as_new_run_command(conn: DbConn, cmd: Command) -> CommandResult:
     source_run = cmd.args["source_run_id"]
     src_stream = load_stream(conn, "run", source_run)
     if not any(e.type == "RUN_REJECTED" for e in src_stream):
-        return CommandResult(accepted=False, aggregate_id=source_run,
-                             denied_reason="reopen requires a rejected run")
+        return CommandResult(
+            accepted=False, aggregate_id=source_run, denied_reason="reopen requires a rejected run"
+        )
     request_id = next((e.request_id for e in src_stream if e.type == "RUN_CREATED"), None)
     new_run = new_run_id()
     created = append(
-        conn, aggregate="run", aggregate_id=new_run, type="RUN_CREATED",
+        conn,
+        aggregate="run",
+        aggregate_id=new_run,
+        type="RUN_CREATED",
         payload={"run_id": new_run, "request_id": request_id, "reopened_from": source_run},
-        actor=cmd.actor, request_id=request_id, run_id=new_run, expected_version=0,
+        actor=cmd.actor,
+        request_id=request_id,
+        run_id=new_run,
+        expected_version=0,
     )
     produced = [created.event_id]
     if request_id is not None:
         added = append(
-            conn, aggregate="request", aggregate_id=request_id, type="CANDIDATE_ADDED",
+            conn,
+            aggregate="request",
+            aggregate_id=request_id,
+            type="CANDIDATE_ADDED",
             payload={"request_id": request_id, "run_id": new_run},
-            actor=cmd.actor, request_id=request_id, run_id=new_run,
+            actor=cmd.actor,
+            request_id=request_id,
+            run_id=new_run,
         )
         produced.append(added.event_id)
     return CommandResult(accepted=True, aggregate_id=new_run, produced_event_ids=tuple(produced))
@@ -93,28 +122,49 @@ def fact_confirmed_resume_command(conn: DbConn, cmd: Command) -> CommandResult:
     produced: list[str] = []
     for run_id in _runs_parked_on_fact(conn, fact_key):
         resume = append(
-            conn, aggregate="run", aggregate_id=run_id, type="FACT_CONFIRMED_RESUME",
-            payload={"run_id": run_id, "fact_key": fact_key}, actor=cmd.actor, run_id=run_id,
+            conn,
+            aggregate="run",
+            aggregate_id=run_id,
+            type="FACT_CONFIRMED_RESUME",
+            payload={"run_id": run_id, "fact_key": fact_key},
+            actor=cmd.actor,
+            run_id=run_id,
         )
         unparked = append(
-            conn, aggregate="run", aggregate_id=run_id, type="RUN_UNPARKED",
-            payload={"run_id": run_id}, actor=cmd.actor, run_id=run_id,
+            conn,
+            aggregate="run",
+            aggregate_id=run_id,
+            type="RUN_UNPARKED",
+            payload={"run_id": run_id},
+            actor=cmd.actor,
+            run_id=run_id,
         )
         produced.extend([resume.event_id, unparked.event_id])
-    return CommandResult(accepted=True, aggregate_id=cmd.aggregate_id or fact_key,
-                         produced_event_ids=tuple(produced))
+    return CommandResult(
+        accepted=True, aggregate_id=cmd.aggregate_id or fact_key, produced_event_ids=tuple(produced)
+    )
 
 
 def source_changed_revalidate_command(conn: DbConn, cmd: Command) -> CommandResult:
     run_id = cmd.aggregate_id
     if run_is_terminal(conn, run_id):
-        return CommandResult(accepted=False, aggregate_id=run_id,
-                             denied_reason="run is terminal; nothing to revalidate")
+        return CommandResult(
+            accepted=False,
+            aggregate_id=run_id,
+            denied_reason="run is terminal; nothing to revalidate",
+        )
     evt = append(
-        conn, aggregate="run", aggregate_id=run_id, type="SOURCE_CHANGED_REVALIDATE",
-        payload={"run_id": run_id, "source_ref": cmd.args["source_ref"],
-                 "new_snapshot": cmd.args.get("new_snapshot")},
-        actor=cmd.actor, run_id=run_id,
+        conn,
+        aggregate="run",
+        aggregate_id=run_id,
+        type="SOURCE_CHANGED_REVALIDATE",
+        payload={
+            "run_id": run_id,
+            "source_ref": cmd.args["source_ref"],
+            "new_snapshot": cmd.args.get("new_snapshot"),
+        },
+        actor=cmd.actor,
+        run_id=run_id,
     )
     return CommandResult(accepted=True, aggregate_id=run_id, produced_event_ids=(evt.event_id,))
 

@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Mapping, Optional
+from typing import Any
 
 import psycopg
 from psycopg.rows import dict_row
@@ -37,7 +38,7 @@ def enqueue(
     partition_key: str,
     handler: str,
     payload: Mapping[str, Any],
-    available_at: Optional[datetime] = None,
+    available_at: datetime | None = None,
     priority: int = 100,
 ) -> int:
     """Insert a 'ready' work item; idempotent on message_id. Returns the row id."""
@@ -57,7 +58,7 @@ def enqueue(
 
 def claim_one(
     conn: psycopg.Connection, *, owner: str, lease_seconds: int = 30
-) -> Optional[QueueClaim]:
+) -> QueueClaim | None:
     """Claim one ready item via FOR UPDATE SKIP LOCKED, excluding partitions that already
     have an in-flight lease (per-aggregate serialization, §5.2). Bumps attempts atomically.
 
@@ -102,8 +103,7 @@ def complete(conn: psycopg.Connection, queue_id: int) -> None:
     """Mark a claimed item done and release its lease."""
     with conn.cursor() as cur:
         cur.execute(
-            "UPDATE queue SET status='done', lease_owner=NULL, lease_expires_at=NULL "
-            "WHERE id=%s",
+            "UPDATE queue SET status='done', lease_owner=NULL, lease_expires_at=NULL WHERE id=%s",
             (queue_id,),
         )
 
@@ -149,16 +149,12 @@ def reclaim_stuck_queue(conn: psycopg.Connection) -> int:
         return cur.rowcount
 
 
-def queue_depth(
-    conn: psycopg.Connection, *, partition_key: Optional[str] = None
-) -> int:
+def queue_depth(conn: psycopg.Connection, *, partition_key: str | None = None) -> int:
     """In-flight backlog (ready+leased), globally or for one partition. The relay's admission
     control consults this for §5.2 backpressure (bound per-partition work-in-progress)."""
     with conn.cursor() as cur:
         if partition_key is None:
-            cur.execute(
-                "SELECT count(*) FROM queue WHERE status IN ('ready', 'leased')"
-            )
+            cur.execute("SELECT count(*) FROM queue WHERE status IN ('ready', 'leased')")
         else:
             cur.execute(
                 "SELECT count(*) FROM queue WHERE status IN ('ready', 'leased') "

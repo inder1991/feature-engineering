@@ -36,16 +36,23 @@ def test_attested_service_authorized(db):
         role_claims=["intake-agent"],
         attestation="signed-deploy-id:sp2-intake@1.4.0",
     )
-    assert authorize_command(
-        db, _cmd("create_run", svc, aggregate="request", aggregate_id="request_1")
-    ).allowed is True
+    assert (
+        authorize_command(
+            db, _cmd("create_run", svc, aggregate="request", aggregate_id="request_1")
+        ).allowed
+        is True
+    )
 
 
 def test_self_asserted_service_denied(db):
     seed_authz_policy(db)
     rogue = IdentityEnvelope(
-        subject="service:rogue", actor_kind="service", authenticated=True,
-        auth_method="workload-identity", role_claims=("intake-agent",), attestation=None,
+        subject="service:rogue",
+        actor_kind="service",
+        authenticated=True,
+        auth_method="workload-identity",
+        role_claims=("intake-agent",),
+        attestation=None,
     )
     decision = authorize_command(
         db, _cmd("create_run", rogue, aggregate="request", aggregate_id="request_1")
@@ -57,13 +64,25 @@ def test_gate_scoped_action_uses_gate_column(db):
     seed_authz_policy(db)
     owner = build_human_identity(subject="user:do", role_claims=["data_owner"])
     ok = authorize_command(
-        db, _cmd("submit_human_signal", owner, aggregate="run", aggregate_id="run_1",
-                 args={"gate": "DATA_STEWARD", "task_id": "task_1"}),
+        db,
+        _cmd(
+            "submit_human_signal",
+            owner,
+            aggregate="run",
+            aggregate_id="run_1",
+            args={"gate": "DATA_STEWARD", "task_id": "task_1"},
+        ),
     )
     assert ok.allowed is True
     wrong_gate = authorize_command(
-        db, _cmd("submit_human_signal", owner, aggregate="run", aggregate_id="run_1",
-                 args={"gate": "COMPLIANCE", "task_id": "task_1"}),
+        db,
+        _cmd(
+            "submit_human_signal",
+            owner,
+            aggregate="run",
+            aggregate_id="run_1",
+            args={"gate": "COMPLIANCE", "task_id": "task_1"},
+        ),
     )
     assert wrong_gate.allowed is False
 
@@ -77,9 +96,17 @@ def test_command_contract_fields_match():
     from featuregen.contracts.commands import Command, CommandResult
 
     assert [f.name for f in dataclasses.fields(Command)] == [
-        "action", "aggregate", "aggregate_id", "args", "actor",
-        "idempotency_key", "expected_version",
+        "action",
+        "aggregate",
+        "aggregate_id",
+        "args",
+        "actor",
+        "idempotency_key",
+        "expected_version",
     ]
     assert [f.name for f in dataclasses.fields(CommandResult)] == [
-        "accepted", "aggregate_id", "produced_event_ids", "denied_reason",
+        "accepted",
+        "aggregate_id",
+        "produced_event_ids",
+        "denied_reason",
     ]

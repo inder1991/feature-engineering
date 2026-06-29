@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import asdict
-from typing import Any, Optional
+from typing import Any
 
 from psycopg.types.json import Jsonb
 
@@ -15,9 +15,20 @@ from featuregen.contracts.documents import (
 )
 
 _GET_COLUMNS = (
-    "doc_id", "global_seq", "request_id", "feature_id", "run_id", "stage",
-    "schema_version", "branch_role", "derived_from", "supersedes", "body_ref",
-    "content_hash", "body_classification", "reject_reason",
+    "doc_id",
+    "global_seq",
+    "request_id",
+    "feature_id",
+    "run_id",
+    "stage",
+    "schema_version",
+    "branch_role",
+    "derived_from",
+    "supersedes",
+    "body_ref",
+    "content_hash",
+    "body_classification",
+    "reject_reason",
 )
 
 
@@ -33,9 +44,7 @@ def _validate_structure(new_document: NewDocument) -> None:
     if new_document.stage not in STAGES:
         raise DocumentValidationError(f"unknown stage: {new_document.stage!r}")
     if new_document.branch_role not in BRANCH_ROLES:
-        raise DocumentValidationError(
-            f"unknown branch_role: {new_document.branch_role!r}"
-        )
+        raise DocumentValidationError(f"unknown branch_role: {new_document.branch_role!r}")
     if new_document.body_classification not in BODY_CLASSIFICATIONS:
         raise DocumentValidationError(
             f"unknown body_classification: {new_document.body_classification!r}"
@@ -63,18 +72,16 @@ def _validate_dag(conn: DbConn, new_document: NewDocument) -> None:
     }
     missing = [r for r in refs if r not in found]
     if missing:
-        raise DagViolationError(
-            f"derived_from/supersedes reference uncommitted docs: {missing}"
-        )
+        raise DagViolationError(f"derived_from/supersedes reference uncommitted docs: {missing}")
 
 
 def append_document(
     conn: DbConn,
     new_document: NewDocument,
     *,
-    run_id: Optional[str] = None,
-    feature_id: Optional[str] = None,
-    request_id: Optional[str] = None,
+    run_id: str | None = None,
+    feature_id: str | None = None,
+    request_id: str | None = None,
     actor: IdentityEnvelope,
 ) -> str:
     """Insert one frozen document inside the caller's OPEN transaction (§5.1).
@@ -100,19 +107,27 @@ def append_document(
         )
         """,
         (
-            doc_id, request_id, feature_id, run_id, new_document.stage,
-            new_document.schema_version, new_document.branch_role,
-            list(new_document.derived_from), list(new_document.supersedes),
-            new_document.body_ref, new_document.content_hash,
+            doc_id,
+            request_id,
+            feature_id,
+            run_id,
+            new_document.stage,
+            new_document.schema_version,
+            new_document.branch_role,
+            list(new_document.derived_from),
+            list(new_document.supersedes),
+            new_document.body_ref,
+            new_document.content_hash,
             new_document.body_classification,
-            Jsonb(asdict(actor)), Jsonb(asdict(new_document.provenance)),
+            Jsonb(asdict(actor)),
+            Jsonb(asdict(new_document.provenance)),
             new_document.reject_reason,
         ),
     )
     return doc_id
 
 
-def get_document(conn: DbConn, doc_id: str) -> Optional[dict[str, Any]]:
+def get_document(conn: DbConn, doc_id: str) -> dict[str, Any] | None:
     row = conn.execute(
         f"SELECT {', '.join(_GET_COLUMNS)} FROM documents WHERE doc_id = %s",
         (doc_id,),

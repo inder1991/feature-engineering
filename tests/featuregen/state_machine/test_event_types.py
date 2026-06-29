@@ -4,12 +4,12 @@ import pytest
 
 from featuregen.contracts import SchemaValidationError
 from featuregen.events.registry import event_registry
+from featuregen.state_machine.engine import GUARD_FAILED, TRANSITION_REJECTED
 from featuregen.state_machine.event_types import (
     FEATURE_LIFECYCLE_VERSION_MIGRATED,
     WORKFLOW_VERSION_MIGRATED,
     register_state_machine_event_types,
 )
-from featuregen.state_machine.engine import GUARD_FAILED, TRANSITION_REJECTED
 
 
 class _RecordingRegistry:

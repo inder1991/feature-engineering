@@ -73,8 +73,9 @@ def test_snapshot_advances_when_active_set_changes(db):
 
 def test_deprecated_versions_excluded_from_snapshot(db):
     reg = DocumentSchemaRegistry(db)
-    reg.register_schema("EXPLAINABILITY", 1, {"type": "object"}, owner="featuregen",
-                        status="deprecated")
+    reg.register_schema(
+        "EXPLAINABILITY", 1, {"type": "object"}, owner="featuregen", status="deprecated"
+    )
     reg.register_schema("MONITORING_SPEC", 1, {"type": "object"}, owner="featuregen")
     snap_id = reg.snapshot_version()
     contents = db.execute(
@@ -105,16 +106,18 @@ def test_active_version_is_writable(db):
 def test_no_new_writes_at_deprecated_version(db):
     reg = DocumentSchemaRegistry(db)
     reg.register_schema("VALIDATION_REPORT", 1, {"type": "object"}, owner="featuregen")
-    reg.register_schema("VALIDATION_REPORT", 1, {"type": "object"}, owner="featuregen",
-                        status="deprecated")
+    reg.register_schema(
+        "VALIDATION_REPORT", 1, {"type": "object"}, owner="featuregen", status="deprecated"
+    )
     with pytest.raises(SchemaValidationError):
         reg.assert_writable("VALIDATION_REPORT", 1)
 
 
 def test_no_new_writes_at_withdrawn_version(db):
     reg = DocumentSchemaRegistry(db)
-    reg.register_schema("SANDBOX_RESULT", 1, {"type": "object"}, owner="featuregen",
-                        status="withdrawn")
+    reg.register_schema(
+        "SANDBOX_RESULT", 1, {"type": "object"}, owner="featuregen", status="withdrawn"
+    )
     with pytest.raises(SchemaValidationError):
         reg.assert_writable("SANDBOX_RESULT", 1)
 
@@ -122,8 +125,7 @@ def test_no_new_writes_at_withdrawn_version(db):
 def test_deprecated_version_still_readable_for_inflight(db):
     # §3.3: deprecated/withdrawn versions remain READABLE (validate) for in-flight docs.
     reg = DocumentSchemaRegistry(db)
-    schema = {"type": "object", "required": ["x"],
-              "properties": {"x": {"type": "integer"}}}
+    schema = {"type": "object", "required": ["x"], "properties": {"x": {"type": "integer"}}}
     reg.register_schema("DQ_REPORT", 1, schema, owner="featuregen", status="deprecated")
     reg.validate("DQ_REPORT", 1, {"x": 1})  # no raise — still readable
 
@@ -131,8 +133,7 @@ def test_deprecated_version_still_readable_for_inflight(db):
 def test_withdrawn_version_reachable_via_upcast(db):
     # §3.3: a withdrawn version is reachable only via upcast (old data upcast on read).
     reg = DocumentSchemaRegistry(db)
-    reg.register_schema("DQ_REPORT", 1, {"type": "object"}, owner="featuregen",
-                        status="withdrawn")
+    reg.register_schema("DQ_REPORT", 1, {"type": "object"}, owner="featuregen", status="withdrawn")
     reg.register_schema("DQ_REPORT", 2, {"type": "object"}, owner="featuregen")
     reg.register_upcaster("DQ_REPORT", 1, 2, lambda b: {**b, "v2": True})
     out = reg.upcast("DQ_REPORT", {"v1": True}, 1, 2)

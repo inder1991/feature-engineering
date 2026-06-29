@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from psycopg.types.json import Json
 
@@ -34,14 +34,21 @@ def open_task(conn: DbConn, spec: GateTaskSpec, actor: IdentityEnvelope) -> str:
         VALUES (%s,1,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'open')
         """,
         (
-            task_id, spec.run_id, spec.feature_id, spec.gate,
-            list(spec.required_inputs), Json(dict(spec.eligible_assignees)),
-            list(spec.allowed_responses), spec.quorum_required, spec.quorum_of_role,
-            spec.delegation_allowed, spec.sla,
+            task_id,
+            spec.run_id,
+            spec.feature_id,
+            spec.gate,
+            list(spec.required_inputs),
+            Json(dict(spec.eligible_assignees)),
+            list(spec.allowed_responses),
+            spec.quorum_required,
+            spec.quorum_of_role,
+            spec.delegation_allowed,
+            spec.sla,
         ),
     )
     if spec.sla:
-        base = datetime.now(timezone.utc)
+        base = datetime.now(UTC)
         sla = parse_duration(spec.sla)
         agg, agg_id = _task_aggregate(spec.run_id, spec.feature_id)
         ladder = {
@@ -200,8 +207,18 @@ def submit_human_signal(
     ).fetchone()
     if row is None:
         raise GateError(f"unknown task {task_id}")
-    (task_version, run_id, feature_id, gate, eligible, allowed_responses,
-     quorum_required, quorum_of_role, delegation_allowed, status) = row
+    (
+        task_version,
+        run_id,
+        feature_id,
+        gate,
+        eligible,
+        allowed_responses,
+        quorum_required,
+        quorum_of_role,
+        delegation_allowed,
+        status,
+    ) = row
 
     # late answer on a closed task is refused
     if status in ("answered", "conflict", "expired", "cancelled", "superseded"):
@@ -229,7 +246,7 @@ def submit_human_signal(
             raise IneligibleResponderError(
                 "no valid delegation grant for this delegate acting for the principal"
             )
-        authority = on_behalf_of           # principal eligibility was verified at grant time
+        authority = on_behalf_of  # principal eligibility was verified at grant time
     else:
         required_role = eligible.get("role")
         required_scope = eligible.get("scope")
@@ -318,8 +335,14 @@ def submit_human_signal(
                 VALUES (%s,%s,%s,%s,%s,'escalation', now(), 'scheduled', %s)
                 ON CONFLICT (idempotency_key) DO NOTHING
                 """,
-                (mint_id("tmr"), f"{task_id}:conflict-escalation", agg, agg_id, task_id,
-                 task_version),
+                (
+                    mint_id("tmr"),
+                    f"{task_id}:conflict-escalation",
+                    agg,
+                    agg_id,
+                    task_id,
+                    task_version,
+                ),
             )
     return SignalResult(task_id, new_status, counted=counted, quorum_met=quorum_met)
 

@@ -79,9 +79,12 @@ def test_delegated_validator_is_counted_in_three_party(db):
 
     val_as_approver = build_human_identity(subject="user:val", role_claims=["approver"])
     cmd = Command(
-        action="submit_human_signal", aggregate="run", aggregate_id="run_1",
+        action="submit_human_signal",
+        aggregate="run",
+        aggregate_id="run_1",
         args={"gate": "FINAL_APPROVAL", "task_id": "task_fa"},
-        actor=val_as_approver, idempotency_key="i_deleg",
+        actor=val_as_approver,
+        idempotency_key="i_deleg",
     )
     decision = authorize_command(db, cmd)
     assert decision.allowed is False
@@ -91,13 +94,14 @@ def test_delegated_validator_is_counted_in_three_party(db):
 def test_final_approval_blocks_requester_self_approval(db):
     seed_authz_policy(db)
     _seed_run(db, "run_1", "user:author")
-    author_as_approver = build_human_identity(
-        subject="user:author", role_claims=["approver"]
-    )
+    author_as_approver = build_human_identity(subject="user:author", role_claims=["approver"])
     cmd = Command(
-        action="submit_human_signal", aggregate="run", aggregate_id="run_1",
+        action="submit_human_signal",
+        aggregate="run",
+        aggregate_id="run_1",
         args={"gate": "FINAL_APPROVAL", "task_id": "task_fa"},
-        actor=author_as_approver, idempotency_key="i1",
+        actor=author_as_approver,
+        idempotency_key="i1",
     )
     decision = authorize_command(db, cmd)
     assert decision.allowed is False
@@ -108,13 +112,14 @@ def test_three_party_blocks_validator_as_approver(db):
     seed_authz_policy(db)
     _seed_run(db, "run_1", "user:author")
     _open_and_answer_iv(db, "run_1", "user:val")
-    validator_as_approver = build_human_identity(
-        subject="user:val", role_claims=["approver"]
-    )
+    validator_as_approver = build_human_identity(subject="user:val", role_claims=["approver"])
     cmd = Command(
-        action="submit_human_signal", aggregate="run", aggregate_id="run_1",
+        action="submit_human_signal",
+        aggregate="run",
+        aggregate_id="run_1",
         args={"gate": "FINAL_APPROVAL", "task_id": "task_fa"},
-        actor=validator_as_approver, idempotency_key="i2",
+        actor=validator_as_approver,
+        idempotency_key="i2",
     )
     decision = authorize_command(db, cmd)
     assert decision.allowed is False
@@ -124,13 +129,14 @@ def test_three_party_blocks_validator_as_approver(db):
 def test_independent_validation_blocks_author_as_validator(db):
     seed_authz_policy(db)
     _seed_run(db, "run_1", "user:author")
-    author_as_validator = build_human_identity(
-        subject="user:author", role_claims=["validator"]
-    )
+    author_as_validator = build_human_identity(subject="user:author", role_claims=["validator"])
     cmd = Command(
-        action="submit_human_signal", aggregate="run", aggregate_id="run_1",
+        action="submit_human_signal",
+        aggregate="run",
+        aggregate_id="run_1",
         args={"gate": "INDEPENDENT_VALIDATION", "task_id": "task_iv2"},
-        actor=author_as_validator, idempotency_key="i3",
+        actor=author_as_validator,
+        idempotency_key="i3",
     )
     assert authorize_command(db, cmd).allowed is False
 
@@ -139,10 +145,12 @@ def test_retier_self_request_is_denied(db):
     seed_authz_policy(db)
     rel = build_human_identity(subject="user:rel", role_claims=["release"])
     cmd = Command(
-        action="retier", aggregate="feature", aggregate_id="feature_1",
-        args={"feature_version_id": "fv_1", "new_risk_tier": "low",
-              "requested_by": "user:rel"},
-        actor=rel, idempotency_key="i5",
+        action="retier",
+        aggregate="feature",
+        aggregate_id="feature_1",
+        args={"feature_version_id": "fv_1", "new_risk_tier": "low", "requested_by": "user:rel"},
+        actor=rel,
+        idempotency_key="i5",
     )
     decision = authorize_command(db, cmd)
     assert decision.allowed is False
@@ -153,9 +161,12 @@ def test_retier_without_requester_is_denied(db):
     seed_authz_policy(db)
     rel = build_human_identity(subject="user:rel", role_claims=["release"])
     cmd = Command(
-        action="retier", aggregate="feature", aggregate_id="feature_1",
+        action="retier",
+        aggregate="feature",
+        aggregate_id="feature_1",
         args={"feature_version_id": "fv_1", "new_risk_tier": "low"},
-        actor=rel, idempotency_key="i6",
+        actor=rel,
+        idempotency_key="i6",
     )
     decision = authorize_command(db, cmd)
     assert decision.allowed is False
@@ -166,10 +177,16 @@ def test_retier_two_party_is_allowed(db):
     seed_authz_policy(db)
     rel = build_human_identity(subject="user:rel", role_claims=["release"])
     cmd = Command(
-        action="retier", aggregate="feature", aggregate_id="feature_1",
-        args={"feature_version_id": "fv_1", "new_risk_tier": "low",
-              "requested_by": "user:requester"},
-        actor=rel, idempotency_key="i7",
+        action="retier",
+        aggregate="feature",
+        aggregate_id="feature_1",
+        args={
+            "feature_version_id": "fv_1",
+            "new_risk_tier": "low",
+            "requested_by": "user:requester",
+        },
+        actor=rel,
+        idempotency_key="i7",
     )
     assert authorize_command(db, cmd).allowed is True
 
@@ -178,8 +195,11 @@ def test_compliance_sensitive_activate_needs_four_eyes(db):
     seed_authz_policy(db)
     rel = build_human_identity(subject="user:rel", role_claims=["release"])
     cmd = Command(
-        action="activate", aggregate="feature", aggregate_id="feature_1",
+        action="activate",
+        aggregate="feature",
+        aggregate_id="feature_1",
         args={"compliance_sensitive": True, "requested_by": "user:rel"},
-        actor=rel, idempotency_key="i4",
+        actor=rel,
+        idempotency_key="i4",
     )
     assert authorize_command(db, cmd).allowed is False

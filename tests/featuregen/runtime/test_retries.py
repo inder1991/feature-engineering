@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import random
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -14,7 +14,7 @@ from featuregen.runtime.retries import (
     within_budget,
 )
 
-NOW = datetime(2026, 6, 27, 12, 0, tzinfo=timezone.utc)
+NOW = datetime(2026, 6, 27, 12, 0, tzinfo=UTC)
 
 
 def test_compute_backoff_bounded_and_deterministic():
@@ -30,13 +30,25 @@ def test_compute_backoff_rejects_zero_attempts():
 
 
 def test_within_budget_caps():
-    assert within_budget(attempts=3, max_attempts=12, started_at=NOW, now=NOW,
-                         max_elapsed_seconds=3600) is True
-    assert within_budget(attempts=12, max_attempts=12, started_at=NOW, now=NOW,
-                         max_elapsed_seconds=3600) is False
+    assert (
+        within_budget(
+            attempts=3, max_attempts=12, started_at=NOW, now=NOW, max_elapsed_seconds=3600
+        )
+        is True
+    )
+    assert (
+        within_budget(
+            attempts=12, max_attempts=12, started_at=NOW, now=NOW, max_elapsed_seconds=3600
+        )
+        is False
+    )
     past = NOW - timedelta(hours=2)
-    assert within_budget(attempts=1, max_attempts=12, started_at=past, now=NOW,
-                         max_elapsed_seconds=3600) is False
+    assert (
+        within_budget(
+            attempts=1, max_attempts=12, started_at=past, now=NOW, max_elapsed_seconds=3600
+        )
+        is False
+    )
 
 
 def _insert_queue(conn, *, attempts=0, max_attempts=12):
@@ -69,8 +81,16 @@ def test_ok_disposition_is_rejected(conn):
     rid = _insert_queue(conn)
     with pytest.raises(ValueError):
         record_delivery_outcome(
-            conn, QUEUE_SPEC, rid, disposition=Disposition.OK, error=None,
-            started_at=NOW, now=NOW, base_seconds=1, cap_seconds=30, max_elapsed_seconds=3600,
+            conn,
+            QUEUE_SPEC,
+            rid,
+            disposition=Disposition.OK,
+            error=None,
+            started_at=NOW,
+            now=NOW,
+            base_seconds=1,
+            cap_seconds=30,
+            max_elapsed_seconds=3600,
             rng=random.Random(1),
         )
     assert _status(conn, "queue", rid) == "ready"  # untouched; OK is not a failure
@@ -79,8 +99,16 @@ def test_ok_disposition_is_rejected(conn):
 def test_permanent_goes_to_dlq(conn):
     rid = _insert_queue(conn)
     status = record_delivery_outcome(
-        conn, QUEUE_SPEC, rid, disposition=Disposition.PERMANENT, error="bad",
-        started_at=NOW, now=NOW, base_seconds=1, cap_seconds=30, max_elapsed_seconds=3600,
+        conn,
+        QUEUE_SPEC,
+        rid,
+        disposition=Disposition.PERMANENT,
+        error="bad",
+        started_at=NOW,
+        now=NOW,
+        base_seconds=1,
+        cap_seconds=30,
+        max_elapsed_seconds=3600,
         rng=random.Random(1),
     )
     assert status == "dead" and _status(conn, "queue", rid) == "dead"
@@ -89,8 +117,16 @@ def test_permanent_goes_to_dlq(conn):
 def test_retryable_within_budget_reschedules(conn):
     rid = _insert_queue(conn, attempts=0)
     status = record_delivery_outcome(
-        conn, QUEUE_SPEC, rid, disposition=Disposition.RETRYABLE, error="503",
-        started_at=NOW, now=NOW, base_seconds=1, cap_seconds=30, max_elapsed_seconds=3600,
+        conn,
+        QUEUE_SPEC,
+        rid,
+        disposition=Disposition.RETRYABLE,
+        error="503",
+        started_at=NOW,
+        now=NOW,
+        base_seconds=1,
+        cap_seconds=30,
+        max_elapsed_seconds=3600,
         rng=random.Random(1),
     )
     assert status == "ready"
@@ -103,8 +139,16 @@ def test_retryable_within_budget_reschedules(conn):
 def test_retryable_exhausted_goes_to_dlq(conn):
     rid = _insert_queue(conn, attempts=11, max_attempts=12)
     status = record_delivery_outcome(
-        conn, QUEUE_SPEC, rid, disposition=Disposition.RETRYABLE, error="503",
-        started_at=NOW, now=NOW, base_seconds=1, cap_seconds=30, max_elapsed_seconds=3600,
+        conn,
+        QUEUE_SPEC,
+        rid,
+        disposition=Disposition.RETRYABLE,
+        error="503",
+        started_at=NOW,
+        now=NOW,
+        base_seconds=1,
+        cap_seconds=30,
+        max_elapsed_seconds=3600,
         rng=random.Random(1),
     )
     assert status == "dead"
@@ -113,8 +157,16 @@ def test_retryable_exhausted_goes_to_dlq(conn):
 def test_outbox_uses_next_attempt_at(conn):
     rid = _insert_outbox(conn)
     status = record_delivery_outcome(
-        conn, OUTBOX_SPEC, rid, disposition=Disposition.RETRYABLE, error="x",
-        started_at=NOW, now=NOW, base_seconds=1, cap_seconds=30, max_elapsed_seconds=3600,
+        conn,
+        OUTBOX_SPEC,
+        rid,
+        disposition=Disposition.RETRYABLE,
+        error="x",
+        started_at=NOW,
+        now=NOW,
+        base_seconds=1,
+        cap_seconds=30,
+        max_elapsed_seconds=3600,
         rng=random.Random(1),
     )
     assert status == "pending"

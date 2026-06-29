@@ -38,16 +38,12 @@ def test_unknown_branch_role_rejected(db, actor, provenance):
 
 def test_unknown_classification_rejected(db, actor, provenance):
     with pytest.raises(DocumentValidationError):
-        append_document(
-            db, _doc(provenance, body_classification="secret"), run_id="r", actor=actor
-        )
+        append_document(db, _doc(provenance, body_classification="secret"), run_id="r", actor=actor)
 
 
 def test_rejected_requires_reject_reason(db, actor, provenance):
     with pytest.raises(DocumentValidationError):
-        append_document(
-            db, _doc(provenance, branch_role="rejected"), run_id="r", actor=actor
-        )
+        append_document(db, _doc(provenance, branch_role="rejected"), run_id="r", actor=actor)
 
 
 def test_rejected_with_reason_is_accepted(db, actor, provenance):
@@ -62,8 +58,5 @@ def test_rejected_with_reason_is_accepted(db, actor, provenance):
 
 def test_branch_role_is_immutable_after_commit(db, actor, provenance):
     doc_id = append_document(db, _doc(provenance), run_id="r", actor=actor)
-    with pytest.raises(psycopg.errors.RaiseException):
-        with db.transaction():
-            db.execute(
-                "UPDATE documents SET branch_role='primary' WHERE doc_id=%s", (doc_id,)
-            )
+    with pytest.raises(psycopg.errors.RaiseException), db.transaction():
+        db.execute("UPDATE documents SET branch_role='primary' WHERE doc_id=%s", (doc_id,))

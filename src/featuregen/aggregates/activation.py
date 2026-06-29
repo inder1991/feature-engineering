@@ -1,18 +1,27 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Mapping, Optional
+from typing import Any
 
 from psycopg.types.json import Jsonb
 
-from featuregen.contracts import (
-    Command, CommandResult, DbConn, Disposition, Handler, HandlerContext, HandlerResult,
-    IdentityEnvelope, NewActivation, ProvenanceEnvelope,
-)
 from featuregen.aggregates._append import append
-from featuregen.aggregates.ids import mint_id
 from featuregen.aggregates.feature_versions import load_governance_attributes, mint_feature_version
+from featuregen.aggregates.ids import mint_id
+from featuregen.contracts import (
+    Command,
+    CommandResult,
+    DbConn,
+    Disposition,
+    Handler,
+    HandlerContext,
+    HandlerResult,
+    IdentityEnvelope,
+    NewActivation,
+    ProvenanceEnvelope,
+)
 from featuregen.governance.activation_policy import ActivationPolicy, evaluate_activation_guards
 
 
@@ -41,21 +50,39 @@ class SagaStep1Result:
     activation_message_id: str
 
 
-def _schedule_expiry_timer(conn: DbConn, feature_id: str, feature_version_id: str,
-                           use_case: str, expires_at: datetime) -> None:
+def _schedule_expiry_timer(
+    conn: DbConn, feature_id: str, feature_version_id: str, use_case: str, expires_at: datetime
+) -> None:
     conn.execute(
         "INSERT INTO timers (timer_id, idempotency_key, aggregate, aggregate_id, kind, "
         "fire_at, payload) VALUES (%s,%s,'feature',%s,'experiment_expiry',%s,%s) "
         "ON CONFLICT (idempotency_key) DO NOTHING",
-        (mint_id("tmr"), f"expiry:{feature_version_id}:{use_case}", feature_id, expires_at,
-         Jsonb({"handler": "deactivate_expired_version", "feature_id": feature_id,
-                "feature_version_id": feature_version_id, "use_case": use_case})),
+        (
+            mint_id("tmr"),
+            f"expiry:{feature_version_id}:{use_case}",
+            feature_id,
+            expires_at,
+            Jsonb(
+                {
+                    "handler": "deactivate_expired_version",
+                    "feature_id": feature_id,
+                    "feature_version_id": feature_version_id,
+                    "use_case": use_case,
+                }
+            ),
+        ),
     )
 
 
 def _cas_claim_slot(
-    conn: DbConn, *, feature_id: str, use_case: str, new_fv: str,
-    base: Optional[str], state: str, activated_seq: int,
+    conn: DbConn,
+    *,
+    feature_id: str,
+    use_case: str,
+    new_fv: str,
+    base: str | None,
+    state: str,
+    activated_seq: int,
 ) -> bool:
     """Atomic CAS on the (feature_id, use_case) active-map slot. Returns True iff this caller
     won the slot. The DB write IS the gate (no read-then-write window):
@@ -85,10 +112,17 @@ def _cas_claim_slot(
 
 
 def apply_activation(
-    conn: DbConn, *, feature_id: str, feature_version_id: str, use_case: str,
-    base_feature_version_id: Optional[str], approval_type: str, actor: IdentityEnvelope,
-    expires_at: Optional[datetime] = None, provenance: Optional[ProvenanceEnvelope] = None,
-    policy: Optional[ActivationPolicy] = None,
+    conn: DbConn,
+    *,
+    feature_id: str,
+    feature_version_id: str,
+    use_case: str,
+    base_feature_version_id: str | None,
+    approval_type: str,
+    actor: IdentityEnvelope,
+    expires_at: datetime | None = None,
+    provenance: ProvenanceEnvelope | None = None,
+    policy: ActivationPolicy | None = None,
 ) -> ActivationResult:
     row = conn.execute(
         "SELECT feature_version_id FROM feature_active_versions "
@@ -121,52 +155,95 @@ def apply_activation(
                 f"belongs to feature_id={base_attrs.feature_id!r}, not {feature_id!r}"
             )
     failure = evaluate_activation_guards(
-        attrs, use_case=use_case, approval_type=approval_type, policy=policy,
+        attrs,
+        use_case=use_case,
+        approval_type=approval_type,
+        policy=policy,
     )
     if failure is not None:
         evt = append(
-            conn, aggregate="feature", aggregate_id=feature_id, type="ACTIVATION_BLOCKED",
-            payload={"feature_id": feature_id, "feature_version_id": feature_version_id,
-                     "use_case": use_case, "base_feature_version_id": base_feature_version_id,
-                     "approval_type": approval_type, "guard": failure.guard,
-                     "guard_inputs": _jsonable(failure.inputs), "guard_result": failure.result},
-            actor=actor, feature_id=feature_id,
+            conn,
+            aggregate="feature",
+            aggregate_id=feature_id,
+            type="ACTIVATION_BLOCKED",
+            payload={
+                "feature_id": feature_id,
+                "feature_version_id": feature_version_id,
+                "use_case": use_case,
+                "base_feature_version_id": base_feature_version_id,
+                "approval_type": approval_type,
+                "guard": failure.guard,
+                "guard_inputs": _jsonable(failure.inputs),
+                "guard_result": failure.result,
+            },
+            actor=actor,
+            feature_id=feature_id,
         )
         return ActivationResult(False, False, feature_version_id, use_case, evt.event_id)
     if current != base_feature_version_id:
         evt = append(
-            conn, aggregate="feature", aggregate_id=feature_id, type="ACTIVATION_CONFLICT",
-            payload={"feature_id": feature_id, "feature_version_id": feature_version_id,
-                     "use_case": use_case, "base_feature_version_id": base_feature_version_id,
-                     "current_active_version_id": current},
-            actor=actor, feature_id=feature_id,
+            conn,
+            aggregate="feature",
+            aggregate_id=feature_id,
+            type="ACTIVATION_CONFLICT",
+            payload={
+                "feature_id": feature_id,
+                "feature_version_id": feature_version_id,
+                "use_case": use_case,
+                "base_feature_version_id": base_feature_version_id,
+                "current_active_version_id": current,
+            },
+            actor=actor,
+            feature_id=feature_id,
         )
         return ActivationResult(False, True, feature_version_id, use_case, evt.event_id)
     activation_state = "ACTIVE_EXPERIMENTAL" if approval_type == "EXPERIMENTAL" else "PRODUCTION"
     # CAS-claim the slot FIRST (with a transient seq); only the winner appends VERSION_ACTIVATED.
     won = _cas_claim_slot(
-        conn, feature_id=feature_id, use_case=use_case, new_fv=feature_version_id,
-        base=base_feature_version_id, state=activation_state, activated_seq=0,
+        conn,
+        feature_id=feature_id,
+        use_case=use_case,
+        new_fv=feature_version_id,
+        base=base_feature_version_id,
+        state=activation_state,
+        activated_seq=0,
     )
     if not won:
         evt = append(
-            conn, aggregate="feature", aggregate_id=feature_id, type="ACTIVATION_CONFLICT",
-            payload={"feature_id": feature_id, "feature_version_id": feature_version_id,
-                     "use_case": use_case, "base_feature_version_id": base_feature_version_id,
-                     "current_active_version_id": None, "reason": "lost_cas_race"},
-            actor=actor, feature_id=feature_id,
+            conn,
+            aggregate="feature",
+            aggregate_id=feature_id,
+            type="ACTIVATION_CONFLICT",
+            payload={
+                "feature_id": feature_id,
+                "feature_version_id": feature_version_id,
+                "use_case": use_case,
+                "base_feature_version_id": base_feature_version_id,
+                "current_active_version_id": None,
+                "reason": "lost_cas_race",
+            },
+            actor=actor,
+            feature_id=feature_id,
         )
         return ActivationResult(False, True, feature_version_id, use_case, evt.event_id)
     evt = append(
-        conn, aggregate="feature", aggregate_id=feature_id, type="VERSION_ACTIVATED",
-        payload={"feature_id": feature_id, "feature_version_id": feature_version_id,
-                 "use_case": use_case, "base_feature_version_id": base_feature_version_id,
-                 "activation_state": activation_state},
-        actor=actor, provenance=provenance, feature_id=feature_id,
+        conn,
+        aggregate="feature",
+        aggregate_id=feature_id,
+        type="VERSION_ACTIVATED",
+        payload={
+            "feature_id": feature_id,
+            "feature_version_id": feature_version_id,
+            "use_case": use_case,
+            "base_feature_version_id": base_feature_version_id,
+            "activation_state": activation_state,
+        },
+        actor=actor,
+        provenance=provenance,
+        feature_id=feature_id,
     )
     conn.execute(
-        "UPDATE feature_active_versions SET activated_seq=%s "
-        "WHERE feature_id=%s AND use_case=%s",
+        "UPDATE feature_active_versions SET activated_seq=%s WHERE feature_id=%s AND use_case=%s",
         (evt.global_seq, feature_id, use_case),
     )
     if activation_state == "ACTIVE_EXPERIMENTAL" and expires_at is not None:
@@ -179,66 +256,117 @@ def activate_command(conn: DbConn, cmd: Command) -> CommandResult:
     `activate_version` saga handler; both delegate to apply_activation."""
     args = cmd.args
     res = apply_activation(
-        conn, feature_id=cmd.aggregate_id, feature_version_id=args["feature_version_id"],
-        use_case=args["use_case"], base_feature_version_id=args.get("base_feature_version_id"),
-        approval_type=args["approval_type"], actor=cmd.actor, expires_at=args.get("expires_at"),
+        conn,
+        feature_id=cmd.aggregate_id,
+        feature_version_id=args["feature_version_id"],
+        use_case=args["use_case"],
+        base_feature_version_id=args.get("base_feature_version_id"),
+        approval_type=args["approval_type"],
+        actor=cmd.actor,
+        expires_at=args.get("expires_at"),
     )
     event_ids = (res.event_id,) if res.event_id else ()
     return CommandResult(accepted=True, aggregate_id=cmd.aggregate_id, produced_event_ids=event_ids)
 
 
 def request_activation(
-    conn: DbConn, *, feature_id: str, feature_version_id: str, use_case: str,
-    base_feature_version_id: Optional[str], approval_type: str, produced_by_run: str,
-    actor: IdentityEnvelope, expires_at: Optional[datetime] = None,
+    conn: DbConn,
+    *,
+    feature_id: str,
+    feature_version_id: str,
+    use_case: str,
+    base_feature_version_id: str | None,
+    approval_type: str,
+    produced_by_run: str,
+    actor: IdentityEnvelope,
+    expires_at: datetime | None = None,
 ) -> str:
     """§5.8 saga step 1b (in the run's tx): record ACTIVATION_REQUESTED on the RUN stream
     (carrying every arg the feature-side handler needs, since the Phase-04 worker passes the
     handler only a HandlerContext built from this run-stream event), then enqueue a
     feature-partitioned `activate_version` queue row referencing it."""
     req = append(
-        conn, aggregate="run", aggregate_id=produced_by_run, type="ACTIVATION_REQUESTED",
-        payload={"run_id": produced_by_run, "feature_id": feature_id,
-                 "feature_version_id": feature_version_id, "use_case": use_case,
-                 "base_feature_version_id": base_feature_version_id,
-                 "approval_type": approval_type,
-                 "expires_at": expires_at.isoformat() if expires_at else None},
-        actor=actor, run_id=produced_by_run, feature_id=feature_id,
+        conn,
+        aggregate="run",
+        aggregate_id=produced_by_run,
+        type="ACTIVATION_REQUESTED",
+        payload={
+            "run_id": produced_by_run,
+            "feature_id": feature_id,
+            "feature_version_id": feature_version_id,
+            "use_case": use_case,
+            "base_feature_version_id": base_feature_version_id,
+            "approval_type": approval_type,
+            "expires_at": expires_at.isoformat() if expires_at else None,
+        },
+        actor=actor,
+        run_id=produced_by_run,
+        feature_id=feature_id,
     )
     message_id = f"activate:{feature_version_id}:{use_case}"
     conn.execute(
         "INSERT INTO queue (message_id, partition_key, handler, payload) "
         "VALUES (%s, %s, 'activate_version', %s) ON CONFLICT (message_id) DO NOTHING",
-        (message_id, f"feature:{feature_id}",
-         Jsonb({"run_id": produced_by_run, "event_id": req.event_id})),
+        (
+            message_id,
+            f"feature:{feature_id}",
+            Jsonb({"run_id": produced_by_run, "event_id": req.event_id}),
+        ),
     )
     return message_id
 
 
 def on_run_approved(
-    conn: DbConn, *, feature_id: str, produced_by_run: str, use_case: str, approval_type: str,
-    actor: IdentityEnvelope, provenance: ProvenanceEnvelope, verification_stamp: str,
-    risk_tier: str, approved_use_cases, blocked_use_cases, required_artifact_refs: Mapping[str, Any],
-    content_hash: str, base_feature_version_id: Optional[str] = None,
-    dsl_operation_catalog_version: Optional[str] = None,
-    approval: Optional[Mapping[str, Any]] = None, expires_at: Optional[datetime] = None,
+    conn: DbConn,
+    *,
+    feature_id: str,
+    produced_by_run: str,
+    use_case: str,
+    approval_type: str,
+    actor: IdentityEnvelope,
+    provenance: ProvenanceEnvelope,
+    verification_stamp: str,
+    risk_tier: str,
+    approved_use_cases,
+    blocked_use_cases,
+    required_artifact_refs: Mapping[str, Any],
+    content_hash: str,
+    base_feature_version_id: str | None = None,
+    dsl_operation_catalog_version: str | None = None,
+    approval: Mapping[str, Any] | None = None,
+    expires_at: datetime | None = None,
 ) -> SagaStep1Result:
     """§5.8 saga step 1, ALL in the run's own transaction: mint the frozen feature_version
     (Task 10) and emit the activation request (request_activation). The run is now terminal; the
     version exists but is not yet active — feature-side activation runs async via the worker."""
     fv_id = mint_feature_version(
-        conn, feature_id=feature_id, produced_by_run=produced_by_run,
-        verification_stamp=verification_stamp, risk_tier=risk_tier, approval_type=approval_type,
-        approved_use_cases=approved_use_cases, blocked_use_cases=blocked_use_cases,
-        required_artifact_refs=required_artifact_refs, content_hash=content_hash, actor=actor,
-        provenance=provenance, base_feature_version_id=base_feature_version_id,
-        dsl_operation_catalog_version=dsl_operation_catalog_version, approval=approval,
+        conn,
+        feature_id=feature_id,
+        produced_by_run=produced_by_run,
+        verification_stamp=verification_stamp,
+        risk_tier=risk_tier,
+        approval_type=approval_type,
+        approved_use_cases=approved_use_cases,
+        blocked_use_cases=blocked_use_cases,
+        required_artifact_refs=required_artifact_refs,
+        content_hash=content_hash,
+        actor=actor,
+        provenance=provenance,
+        base_feature_version_id=base_feature_version_id,
+        dsl_operation_catalog_version=dsl_operation_catalog_version,
+        approval=approval,
         expires_at=expires_at,
     )
     message_id = request_activation(
-        conn, feature_id=feature_id, feature_version_id=fv_id, use_case=use_case,
-        base_feature_version_id=base_feature_version_id, approval_type=approval_type,
-        produced_by_run=produced_by_run, actor=actor, expires_at=expires_at,
+        conn,
+        feature_id=feature_id,
+        feature_version_id=fv_id,
+        use_case=use_case,
+        base_feature_version_id=base_feature_version_id,
+        approval_type=approval_type,
+        produced_by_run=produced_by_run,
+        actor=actor,
+        expires_at=expires_at,
     )
     return SagaStep1Result(feature_version_id=fv_id, activation_message_id=message_id)
 
@@ -256,6 +384,7 @@ class ActivateVersionHandler:
     same effect and `apply_activation` no-ops when already active at this version. This is the
     sanctioned cross-aggregate saga executor; the general handler prohibition on feature-stream
     writes (§5.3) does not apply to its declared activation effect."""
+
     name = "activate_version"
     version = 1
     timeout_seconds = 30.0
@@ -300,10 +429,17 @@ def deactivate_expired_version_command(conn: DbConn, cmd: Command) -> CommandRes
     if row is None or row[0] != feature_version_id or row[1] != "ACTIVE_EXPERIMENTAL":
         return CommandResult(accepted=True, aggregate_id=feature_id)
     evt = append(
-        conn, aggregate="feature", aggregate_id=feature_id, type="VERSION_EXPIRED",
-        payload={"feature_id": feature_id, "feature_version_id": feature_version_id,
-                 "use_case": use_case},
-        actor=cmd.actor, feature_id=feature_id,
+        conn,
+        aggregate="feature",
+        aggregate_id=feature_id,
+        type="VERSION_EXPIRED",
+        payload={
+            "feature_id": feature_id,
+            "feature_version_id": feature_version_id,
+            "use_case": use_case,
+        },
+        actor=cmd.actor,
+        feature_id=feature_id,
     )
     conn.execute(
         "DELETE FROM feature_active_versions WHERE feature_id=%s AND use_case=%s",

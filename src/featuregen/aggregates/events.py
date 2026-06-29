@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import Any, Mapping, Sequence
+from collections.abc import Mapping, Sequence
+from typing import Any
 
 from featuregen.contracts import SchemaRegistry
 
@@ -52,13 +53,21 @@ EVENT_SCHEMAS: dict[str, dict] = {
         ["request_id", "run_id"],
     ),
     "DUPLICATE_OF": _obj(
-        {"request_id": _ID, "duplicate_of_request_id": _NID,
-         "duplicate_of_feature_id": _NID, "concept_key": _NSTR},
+        {
+            "request_id": _ID,
+            "duplicate_of_request_id": _NID,
+            "duplicate_of_feature_id": _NID,
+            "concept_key": _NSTR,
+        },
         ["request_id"],
     ),
     "CANDIDATE_SELECTED": _obj(
-        {"request_id": _ID, "selected_run_id": _ID, "feature_id": _ID,
-         "candidates_explored_count": _INT},
+        {
+            "request_id": _ID,
+            "selected_run_id": _ID,
+            "feature_id": _ID,
+            "candidates_explored_count": _INT,
+        },
         ["request_id", "selected_run_id", "feature_id"],
     ),
     "CANDIDATE_REJECTED": _obj(
@@ -71,46 +80,88 @@ EVENT_SCHEMAS: dict[str, dict] = {
         ["feature_id", "request_id"],
     ),
     "VERSION_MINTED": _obj(
-        {"feature_id": _ID, "feature_version_id": _ID, "produced_by_run": _ID,
-         "base_feature_version_id": _NID},
+        {
+            "feature_id": _ID,
+            "feature_version_id": _ID,
+            "produced_by_run": _ID,
+            "base_feature_version_id": _NID,
+        },
         ["feature_id", "feature_version_id", "produced_by_run"],
     ),
     "VERSION_ACTIVATED": _obj(
-        {"feature_id": _ID, "feature_version_id": _ID, "use_case": _STR,
-         "activation_state": _ACTIVATION_STATE, "base_feature_version_id": _NID},
+        {
+            "feature_id": _ID,
+            "feature_version_id": _ID,
+            "use_case": _STR,
+            "activation_state": _ACTIVATION_STATE,
+            "base_feature_version_id": _NID,
+        },
         ["feature_id", "feature_version_id", "use_case", "activation_state"],
     ),
     "ACTIVATION_CONFLICT": _obj(
-        {"feature_id": _ID, "feature_version_id": _ID, "use_case": _STR,
-         "base_feature_version_id": _NID, "current_active_version_id": _NID, "reason": _NSTR},
+        {
+            "feature_id": _ID,
+            "feature_version_id": _ID,
+            "use_case": _STR,
+            "base_feature_version_id": _NID,
+            "current_active_version_id": _NID,
+            "reason": _NSTR,
+        },
         ["feature_id", "feature_version_id", "use_case"],
     ),
     # §3.8 governance guard rejected the activation/supersession (use_case_not_blocked or a
     # policy-parameterized guard). Audited with the failed guard name + resolved inputs/result.
     "ACTIVATION_BLOCKED": _obj(
-        {"feature_id": _ID, "feature_version_id": _ID, "use_case": _STR, "guard": _STR,
-         "base_feature_version_id": _NID, "approval_type": _APPROVAL_TYPE,
-         "guard_inputs": {"type": "object"}, "guard_result": {}},
+        {
+            "feature_id": _ID,
+            "feature_version_id": _ID,
+            "use_case": _STR,
+            "guard": _STR,
+            "base_feature_version_id": _NID,
+            "approval_type": _APPROVAL_TYPE,
+            "guard_inputs": {"type": "object"},
+            "guard_result": {},
+        },
         ["feature_id", "feature_version_id", "use_case", "guard"],
     ),
     "VERSION_SUPERSEDED": _obj(
-        {"feature_id": _ID, "feature_version_id": _ID, "use_case": _STR,
-         "superseded_version_id": _NID},
+        {
+            "feature_id": _ID,
+            "feature_version_id": _ID,
+            "use_case": _STR,
+            "superseded_version_id": _NID,
+        },
         ["feature_id", "feature_version_id", "use_case"],
     ),
     "VERSION_QUIESCED": _obj(
-        {"feature_id": _ID, "feature_version_id": _ID, "use_case": _STR,
-         "impacted_consumers": {"type": "array"}, "grace_seconds": _INT, "reason": _NSTR},
+        {
+            "feature_id": _ID,
+            "feature_version_id": _ID,
+            "use_case": _STR,
+            "impacted_consumers": {"type": "array"},
+            "grace_seconds": _INT,
+            "reason": _NSTR,
+        },
         ["feature_id", "feature_version_id", "use_case", "impacted_consumers"],
     ),
     "VERSION_DEPRECATED": _obj(
-        {"feature_id": _ID, "feature_version_id": _ID, "use_case": _NSTR,
-         "reason": _NSTR, "via": _NSTR},
+        {
+            "feature_id": _ID,
+            "feature_version_id": _ID,
+            "use_case": _NSTR,
+            "reason": _NSTR,
+            "via": _NSTR,
+        },
         ["feature_id", "feature_version_id"],
     ),
     "VERSION_RETIERED": _obj(
-        {"feature_id": _ID, "feature_version_id": _ID, "new_risk_tier": _STR,
-         "old_risk_tier": _NSTR, "requested_by": _NSTR},
+        {
+            "feature_id": _ID,
+            "feature_version_id": _ID,
+            "new_risk_tier": _STR,
+            "old_risk_tier": _NSTR,
+            "requested_by": _NSTR,
+        },
         ["feature_id", "feature_version_id", "new_risk_tier"],
     ),
     "VERSION_EXPIRED": _obj(
@@ -118,13 +169,21 @@ EVENT_SCHEMAS: dict[str, dict] = {
         ["feature_id", "feature_version_id", "use_case"],
     ),
     "CONSUMER_REGISTERED": _obj(
-        {"feature_id": _ID, "consumer_id": _ID, "consumer_kind": _CONSUMER_KIND,
-         "consumer_ref": _STR},
+        {
+            "feature_id": _ID,
+            "consumer_id": _ID,
+            "consumer_kind": _CONSUMER_KIND,
+            "consumer_ref": _STR,
+        },
         ["feature_id", "consumer_id", "consumer_kind", "consumer_ref"],
     ),
     "CONSUMER_DEREGISTERED": _obj(
-        {"feature_id": _ID, "consumer_id": _ID, "consumer_kind": _CONSUMER_KIND,
-         "consumer_ref": _STR},
+        {
+            "feature_id": _ID,
+            "consumer_id": _ID,
+            "consumer_kind": _CONSUMER_KIND,
+            "consumer_ref": _STR,
+        },
         ["feature_id", "consumer_id"],
     ),
     "MONITORING_ALERT_RAISED": _obj(
@@ -141,16 +200,19 @@ EVENT_SCHEMAS: dict[str, dict] = {
     ),
     # ---- run stream ----
     "RUN_CREATED": _obj(
-        {"run_id": _ID, "request_id": _NID, "reopened_from": _NID,
-         "feature_id": _NID, "origin": _NSTR},
+        {
+            "run_id": _ID,
+            "request_id": _NID,
+            "reopened_from": _NID,
+            "feature_id": _NID,
+            "origin": _NSTR,
+        },
         ["run_id"],
     ),
     "RUN_CANCELLED": _obj({"run_id": _ID, "reason": _NSTR}, ["run_id"]),
     "RUN_WITHDRAWN": _obj({"run_id": _ID, "reason": _NSTR}, ["run_id"]),
     "RUN_REJECTED": _obj({"run_id": _ID, "reason": _NSTR}, ["run_id"]),
-    "RUN_PARKED": _obj(
-        {"run_id": _ID, "owner": _NSTR, "waiting_on_fact": _NSTR}, ["run_id"]
-    ),
+    "RUN_PARKED": _obj({"run_id": _ID, "owner": _NSTR, "waiting_on_fact": _NSTR}, ["run_id"]),
     "RUN_UNPARKED": _obj({"run_id": _ID}, ["run_id"]),
     "FACT_CONFIRMED_RESUME": _obj({"run_id": _ID, "fact_key": _STR}, ["run_id", "fact_key"]),
     "SOURCE_CHANGED_REVALIDATE": _obj(
@@ -162,8 +224,15 @@ EVENT_SCHEMAS: dict[str, dict] = {
     # because the Phase-04 worker passes only HandlerContext (run_id + this triggering
     # event), never the queue payload, to the handler.
     "ACTIVATION_REQUESTED": _obj(
-        {"run_id": _ID, "feature_id": _ID, "feature_version_id": _ID, "use_case": _STR,
-         "approval_type": _APPROVAL_TYPE, "base_feature_version_id": _NID, "expires_at": _NSTR},
+        {
+            "run_id": _ID,
+            "feature_id": _ID,
+            "feature_version_id": _ID,
+            "use_case": _STR,
+            "approval_type": _APPROVAL_TYPE,
+            "base_feature_version_id": _NID,
+            "expires_at": _NSTR,
+        },
         ["run_id", "feature_id", "feature_version_id", "use_case", "approval_type"],
     ),
 }

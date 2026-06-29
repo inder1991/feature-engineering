@@ -1,17 +1,18 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from featuregen.contracts import NewTimer
 from featuregen.runtime.timers import poll_due_timers, schedule_timer
 
-UTC = timezone.utc
+UTC = UTC
 NOW = datetime(2026, 6, 27, 12, 0, tzinfo=UTC)
 
 
 def _schedule(conn, key, fire_at, kind="sla"):
-    return schedule_timer(conn, "run", "run_1",
-                          NewTimer(kind=kind, fire_at=fire_at, idempotency_key=key))
+    return schedule_timer(
+        conn, "run", "run_1", NewTimer(kind=kind, fire_at=fire_at, idempotency_key=key)
+    )
 
 
 def _status(conn, tid):

@@ -1,6 +1,11 @@
 from featuregen.aggregates.ids import (
-    mint_id, new_request_id, new_feature_id, new_run_id,
-    new_feature_version_id, new_consumer_id, new_command_id,
+    mint_id,
+    new_command_id,
+    new_consumer_id,
+    new_feature_id,
+    new_feature_version_id,
+    new_request_id,
+    new_run_id,
     normalize_concept_key,
 )
 
@@ -24,11 +29,16 @@ def test_ulid_shape_and_uniqueness():
 
 def test_ids_are_lexicographically_time_sortable():
     import time
-    a = mint_id("x"); time.sleep(0.002); b = mint_id("x")
+
+    a = mint_id("x")
+    time.sleep(0.002)
+    b = mint_id("x")
     assert a < b
 
 
 def test_normalize_concept_key():
     assert normalize_concept_key("  Salary  Irregularity! ") == "salary-irregularity"
-    assert normalize_concept_key("Salary irregularity") == normalize_concept_key("salary IRREGULARITY")
+    assert normalize_concept_key("Salary irregularity") == normalize_concept_key(
+        "salary IRREGULARITY"
+    )
     assert normalize_concept_key("churn_risk (v2)") == "churn-risk-v2"

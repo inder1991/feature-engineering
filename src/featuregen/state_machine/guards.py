@@ -23,9 +23,7 @@ class InMemoryPredicateRegistry:
 
     def register(self, predicate: GuardPredicate) -> None:
         if predicate.name in self._predicates:
-            raise PredicateRegistrationError(
-                f"predicate {predicate.name!r} already registered"
-            )
+            raise PredicateRegistrationError(f"predicate {predicate.name!r} already registered")
         self._predicates[predicate.name] = predicate
 
     def get(self, name: str) -> GuardPredicate:
@@ -43,9 +41,7 @@ class InMemoryPredicateRegistry:
             view: dict[str, Any] = {}
             for key in predicate.declared_inputs:
                 if key not in inputs:
-                    raise KeyError(
-                        f"guard input {key!r} for predicate {name!r} not resolved"
-                    )
+                    raise KeyError(f"guard input {key!r} for predicate {name!r} not resolved")
                 view[key] = inputs[key]
             per_predicate[name] = bool(predicate(view))
             resolved.update(view)

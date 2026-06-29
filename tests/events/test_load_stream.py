@@ -17,7 +17,10 @@ def _new(run_id: str, type_: str, payload: dict) -> NewEvent:
         schema_version=1,
         payload=payload,
         actor=IdentityEnvelope(
-            subject="u", actor_kind="human", authenticated=True, auth_method="oidc",
+            subject="u",
+            actor_kind="human",
+            authenticated=True,
+            auth_method="oidc",
             role_claims=(),
         ),
         provenance=ProvenanceEnvelope(
@@ -71,7 +74,7 @@ def test_load_stream_upcasts_using_a_pinned_snapshot(conn):
     append_event(conn, _new("r6", "E", {"n": 1}), expected_version=0, table_version=1)
 
     snapshot_id = persist_registry_snapshot(conn, event_registry())  # pins {"E": 2}
-    expected = load_registry_snapshot(conn, snapshot_id)             # read path resolves it back
+    expected = load_registry_snapshot(conn, snapshot_id)  # read path resolves it back
     assert expected == {"E": 2}
 
     stream = load_stream(conn, "run", "r6", expected=expected)

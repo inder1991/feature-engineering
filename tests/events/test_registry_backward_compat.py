@@ -84,10 +84,17 @@ def test_evolution_complete_passes_for_compatible_chain():
     reg = EventSchemaRegistry()
     reg.register_schema("T", 1, V1, owner="o")
     reg.register_schema(
-        "T", 2,
-        {"type": "object", "required": ["a"],
-         "properties": {"a": {"type": "string"}, "b": {"type": "integer"},
-                        "d": {"type": "boolean"}}},  # add optional field => compatible
+        "T",
+        2,
+        {
+            "type": "object",
+            "required": ["a"],
+            "properties": {
+                "a": {"type": "string"},
+                "b": {"type": "integer"},
+                "d": {"type": "boolean"},
+            },
+        },  # add optional field => compatible
         owner="o",
     )
     reg.assert_evolution_complete()  # no upcaster needed; does not raise

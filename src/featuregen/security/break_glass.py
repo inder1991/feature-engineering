@@ -1,7 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
-from typing import Optional
+from datetime import UTC, datetime
 
 from psycopg.types.json import Json
 
@@ -22,8 +21,8 @@ def open_break_glass_review(
     actor: IdentityEnvelope,
     co_signer: IdentityEnvelope,
     attempted_action: str,
-    aggregate: Optional[str],
-    aggregate_id: Optional[str],
+    aggregate: str | None,
+    aggregate_id: str | None,
     sla: str,
 ) -> str:
     review_id = mint_id("bgr")
@@ -39,7 +38,7 @@ def open_break_glass_review(
     )
     agg = aggregate or "request"
     agg_id = aggregate_id or review_id
-    fire_at = datetime.now(timezone.utc) + parse_duration(sla)
+    fire_at = datetime.now(UTC) + parse_duration(sla)
     conn.execute(
         """
         INSERT INTO timers
@@ -48,9 +47,19 @@ def open_break_glass_review(
         VALUES (%s,%s,%s,%s,%s,'escalation',%s,'scheduled',%s)
         """,
         (
-            mint_id("tmr"), f"{review_id}:sla", agg, agg_id, review_id, fire_at,
-            Json({"break_glass_review": review_id, "invoker": actor.subject,
-                  "co_signer": co_signer.subject}),
+            mint_id("tmr"),
+            f"{review_id}:sla",
+            agg,
+            agg_id,
+            review_id,
+            fire_at,
+            Json(
+                {
+                    "break_glass_review": review_id,
+                    "invoker": actor.subject,
+                    "co_signer": co_signer.subject,
+                }
+            ),
         ),
     )
     return review_id
@@ -62,8 +71,8 @@ def invoke_break_glass(
     actor: IdentityEnvelope,
     co_signer: IdentityEnvelope,
     attempted_action: str,
-    aggregate: Optional[str] = None,
-    aggregate_id: Optional[str] = None,
+    aggregate: str | None = None,
+    aggregate_id: str | None = None,
     sla: str = "1d",
 ) -> str:
     if "platform-admin" not in actor.role_claims:
@@ -104,9 +113,7 @@ def sign_off_break_glass_review(
     if not any(r in reviewer.role_claims for r in ("compliance", "platform-admin")):
         raise BreakGlassError("break-glass reviewer must be compliance or platform-admin")
     if reviewer.subject in (invoker_subject, co_signer_subject):
-        raise BreakGlassError(
-            "break-glass review must be independent of invoker and co-signer"
-        )
+        raise BreakGlassError("break-glass review must be independent of invoker and co-signer")
     record_security_event(
         conn,
         event_type="BREAK_GLASS_REVIEW",

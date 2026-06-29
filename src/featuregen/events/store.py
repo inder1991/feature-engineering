@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import datetime as _dt
+from collections.abc import Mapping
 from dataclasses import replace
-from typing import Mapping, Optional
 
 from psycopg.errors import UniqueViolation
 from psycopg.rows import dict_row
@@ -75,7 +75,7 @@ def append_event(
 
     event_id = f"evt_{ULID()}"
     stream_version = expected_version + 1
-    occurred_at = new_event.occurred_at or _dt.datetime.now(_dt.timezone.utc)
+    occurred_at = new_event.occurred_at or _dt.datetime.now(_dt.UTC)
     payload = dict(new_event.payload)
     params = {
         "event_id": event_id,
@@ -140,15 +140,12 @@ def load_stream(
     aggregate: str,
     aggregate_id: str,
     *,
-    upto_seq: Optional[int] = None,
-    expected: Optional[Mapping[str, int]] = None,
+    upto_seq: int | None = None,
+    expected: Mapping[str, int] | None = None,
 ) -> list[EventEnvelope]:
     """Load one aggregate instance's stream in stream_version order, upcasting each event
     to the consumer's expected schema_version via the registry (§3.3)."""
-    sql = (
-        "SELECT * FROM events "
-        "WHERE aggregate = %(aggregate)s AND aggregate_id = %(aggregate_id)s"
-    )
+    sql = "SELECT * FROM events WHERE aggregate = %(aggregate)s AND aggregate_id = %(aggregate_id)s"
     params: dict[str, object] = {"aggregate": aggregate, "aggregate_id": aggregate_id}
     if upto_seq is not None:
         sql += " AND global_seq <= %(upto_seq)s"

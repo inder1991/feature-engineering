@@ -92,8 +92,10 @@ def test_assumption_ledger_schema_registered(db):
     reg = DocumentSchemaRegistry(db)
     register_draft_schemas(reg)
     reg.validate(
-        "ASSUMPTION_LEDGER", 1,
-        {"request_id": "req_1",
-         "assumptions": [{"field": "lookback_window", "value": 90,
-                          "rationale": "default"}]},
+        "ASSUMPTION_LEDGER",
+        1,
+        {
+            "request_id": "req_1",
+            "assumptions": [{"field": "lookback_window", "value": 90, "rationale": "default"}],
+        },
     )

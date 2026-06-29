@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from typing import Optional
-
 from featuregen.authz.policy import AuthzDecision
 from featuregen.contracts.commands import Command
 from featuregen.contracts.db import DbConn
@@ -12,14 +10,10 @@ def two_party_ok(requester: str, approver: str) -> bool:
 
 
 def three_party_disjoint(author: str, validators: set[str], approver: str) -> bool:
-    return (
-        author not in validators
-        and approver not in validators
-        and author != approver
-    )
+    return author not in validators and approver not in validators and author != approver
 
 
-def resolve_run_author(conn: DbConn, run_id: str) -> Optional[str]:
+def resolve_run_author(conn: DbConn, run_id: str) -> str | None:
     row = conn.execute(
         """
         SELECT actor->>'subject' FROM events
@@ -35,8 +29,8 @@ def gather_gate_responders(
     conn: DbConn,
     gate: str,
     *,
-    run_id: Optional[str] = None,
-    feature_id: Optional[str] = None,
+    run_id: str | None = None,
+    feature_id: str | None = None,
 ) -> set[str]:
     rows = conn.execute(
         """
@@ -55,11 +49,11 @@ def gather_gate_responders(
 def gate_sod_reason(
     conn: DbConn,
     *,
-    gate: Optional[str],
+    gate: str | None,
     subject: str,
-    run_id: Optional[str] = None,
-    feature_id: Optional[str] = None,
-) -> Optional[str]:
+    run_id: str | None = None,
+    feature_id: str | None = None,
+) -> str | None:
     """PURE-ish SoD predicate for a single gate answer, keyed to the EFFECTIVE authority
     (`subject`). Shared by BOTH the command-authz path (`enforce_sod`) and the direct
     `submit_human_signal` call path (§7) so the two can never diverge. Returns a denial reason
@@ -85,9 +79,7 @@ def enforce_sod(conn: DbConn, cmd: Command) -> AuthzDecision:
     if cmd.action == "submit_human_signal":
         gate = cmd.args.get("gate")
         run_id = cmd.aggregate_id if cmd.aggregate == "run" else cmd.args.get("run_id")
-        feature_id = (
-            cmd.aggregate_id if cmd.aggregate == "feature" else cmd.args.get("feature_id")
-        )
+        feature_id = cmd.aggregate_id if cmd.aggregate == "feature" else cmd.args.get("feature_id")
         reason = gate_sod_reason(
             conn, gate=gate, subject=cmd.actor.subject, run_id=run_id, feature_id=feature_id
         )

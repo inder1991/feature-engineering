@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
 from featuregen.runtime.business_calendar import parse_duration, resolve_business_deadline
 
-UTC = timezone.utc
+UTC = UTC
 
 
 def _seed_calendar(conn, name="ops", workdays=(1, 2, 3, 4, 5), holidays=()):

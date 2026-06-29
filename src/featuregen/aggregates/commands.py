@@ -1,25 +1,40 @@
 from __future__ import annotations
 
-from featuregen.commands.registry import register_command
-from featuregen.aggregates.request_aggregate import (
-    create_request_command, create_run_command, duplicate_of_command, select_candidate_command,
-)
-from featuregen.aggregates.run_lifecycle import (
-    reject_command, cancel_command, withdraw_command, park_command, unpark_command,
-    reopen_as_new_run_command, resolve_degraded_command,
-    fact_confirmed_resume_command, source_changed_revalidate_command,
-)
 from featuregen.aggregates.activation import (
-    activate_command, deactivate_expired_version_command,
+    activate_command,
+    deactivate_expired_version_command,
 )
 from featuregen.aggregates.consumers import (
-    register_consumer_command, deregister_consumer_command,
-    supersede_command, deprecate_command, finalize_deprecate_command, retier_command,
+    deprecate_command,
+    deregister_consumer_command,
+    finalize_deprecate_command,
+    register_consumer_command,
+    retier_command,
+    supersede_command,
 )
 from featuregen.aggregates.feature_lifecycle import (
-    raise_monitoring_alert_command, require_revalidation_command,
+    raise_monitoring_alert_command,
     record_revalidation_outcome_command,
+    require_revalidation_command,
 )
+from featuregen.aggregates.request_aggregate import (
+    create_request_command,
+    create_run_command,
+    duplicate_of_command,
+    select_candidate_command,
+)
+from featuregen.aggregates.run_lifecycle import (
+    cancel_command,
+    fact_confirmed_resume_command,
+    park_command,
+    reject_command,
+    reopen_as_new_run_command,
+    resolve_degraded_command,
+    source_changed_revalidate_command,
+    unpark_command,
+    withdraw_command,
+)
+from featuregen.commands.registry import register_command
 from featuregen.gates.tasks import submit_human_signal_command
 
 _CATALOG = {

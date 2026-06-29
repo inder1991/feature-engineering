@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from featuregen.contracts import EventEnvelope, IdentityEnvelope, ProvenanceEnvelope
 from featuregen.events.serde import (
@@ -42,7 +42,7 @@ def test_provenance_round_trips():
 
 
 def test_row_to_event_reconstructs_envelope():
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     row = {
         "event_id": "evt_1",
         "global_seq": 7,

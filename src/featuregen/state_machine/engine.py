@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any, Mapping
+from typing import Any
 
 from featuregen.contracts import GuardInputs, GuardOutcome, PredicateRegistry
 from featuregen.state_machine.transition_table import TransitionTable

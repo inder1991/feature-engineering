@@ -13,7 +13,10 @@ def _new(agg_id: str) -> NewEvent:
         schema_version=1,
         payload={},
         actor=IdentityEnvelope(
-            subject="u", actor_kind="human", authenticated=True, auth_method="oidc",
+            subject="u",
+            actor_kind="human",
+            authenticated=True,
+            auth_method="oidc",
             role_claims=(),
         ),
         provenance=ProvenanceEnvelope(

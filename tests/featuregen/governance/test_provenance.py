@@ -30,7 +30,9 @@ def test_provenance_envelope_is_frozen_slotted_and_carries_replay_pins():
 
 
 def test_provenance_envelope_defaults_are_empty():
-    prov = ProvenanceEnvelope(artifact_type="DRAFT_CONTRACT", schema_version=1, producing_component="featuregen@1")
+    prov = ProvenanceEnvelope(
+        artifact_type="DRAFT_CONTRACT", schema_version=1, producing_component="featuregen@1"
+    )
     assert prov.tool_versions == {}
     assert prov.source_snapshots == ()
     assert prov.event_registry_snapshot is None
@@ -64,7 +66,10 @@ def test_build_provenance_folds_named_tool_versions():
         external_refs=("sandbox_run:job_9",),
     )
     assert prov.tool_versions == {
-        "llm_model": "m@1", "prompt_version": "p@3", "validator": "iv@1", "compiler": "dsl@9",
+        "llm_model": "m@1",
+        "prompt_version": "p@3",
+        "validator": "iv@1",
+        "compiler": "dsl@9",
     }
     assert prov.candidates_explored_count == 5
     validate_provenance(prov)  # well-formed => no raise
@@ -72,14 +77,20 @@ def test_build_provenance_folds_named_tool_versions():
 
 def test_validate_provenance_requires_component_and_positive_schema_version():
     with pytest.raises(ProvenanceError):
-        validate_provenance(ProvenanceEnvelope(artifact_type="X", schema_version=1, producing_component=""))
+        validate_provenance(
+            ProvenanceEnvelope(artifact_type="X", schema_version=1, producing_component="")
+        )
     with pytest.raises(ProvenanceError):
-        validate_provenance(ProvenanceEnvelope(artifact_type="X", schema_version=0, producing_component="c"))
+        validate_provenance(
+            ProvenanceEnvelope(artifact_type="X", schema_version=0, producing_component="c")
+        )
 
 
 def test_validate_provenance_rejects_inline_external_refs_and_missing_replay_pins():
     inline = ProvenanceEnvelope(
-        artifact_type="X", schema_version=1, producing_component="c",
+        artifact_type="X",
+        schema_version=1,
+        producing_component="c",
         external_refs=("this is a raw inline body, not a ref",),
     )
     with pytest.raises(ProvenanceError):

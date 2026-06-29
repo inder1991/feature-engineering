@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from decimal import Decimal
-from typing import Optional
 
 import pytest
 
@@ -35,9 +34,7 @@ def _register_runtime_test_event_types(_reset_registry):
     registry = event_registry()
     for type_name in ("STEP_TRIGGER", "STEP_DONE", "STEP_NEXT"):
         try:
-            registry.register_schema(
-                type_name, 1, _PERMISSIVE, owner="featuregen-runtime-tests"
-            )
+            registry.register_schema(type_name, 1, _PERMISSIVE, owner="featuregen-runtime-tests")
         except Exception:  # noqa: BLE001 — only an idempotent re-registration is acceptable
             registry.validate(type_name, 1, {})  # re-raises if NOT actually registered
 
@@ -165,8 +162,12 @@ def insert_run_state():
     """Insert a row into the Phase 01 `run_workflow_state` projection."""
 
     def _insert(
-        conn, *, run_id: str, request_id: str,
-        cost: Decimal = Decimal("0"), candidates: int = 0,
+        conn,
+        *,
+        run_id: str,
+        request_id: str,
+        cost: Decimal = Decimal("0"),
+        candidates: int = 0,
     ) -> None:
         with conn.cursor() as cur:
             cur.execute(
@@ -186,7 +187,10 @@ def insert_stub_document():
     """Insert a minimal committed row into the Phase 02 `documents` table referencing a blob."""
 
     def _insert(
-        conn, *, doc_id: str, body_ref: Optional[str],
+        conn,
+        *,
+        doc_id: str,
+        body_ref: str | None,
         classification: str = "governance-retained",
     ) -> None:
         with conn.cursor() as cur:

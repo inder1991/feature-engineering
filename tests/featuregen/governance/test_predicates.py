@@ -1,6 +1,4 @@
-from datetime import datetime, timezone
-
-import pytest
+from datetime import UTC, datetime
 
 from featuregen.governance.predicates import (
     GOVERNANCE_PREDICATES,
@@ -16,28 +14,74 @@ from featuregen.governance.predicates import (
 
 
 def test_verification_stamp_ordering_uses_featuregen_normative_rank():
-    assert verification_stamp_satisfies(
-        {"verification_stamp": "USEFULNESS-CHECKED", "required_stamp": "USEFULNESS-CHECKED"}) is True
-    assert verification_stamp_satisfies(
-        {"verification_stamp": "DATA-CHECKED", "required_stamp": "USEFULNESS-CHECKED"}) is False
-    assert verification_stamp_satisfies(
-        {"verification_stamp": "USEFULNESS-CHECKED", "required_stamp": "DATA-CHECKED"}) is True
+    assert (
+        verification_stamp_satisfies(
+            {"verification_stamp": "USEFULNESS-CHECKED", "required_stamp": "USEFULNESS-CHECKED"}
+        )
+        is True
+    )
+    assert (
+        verification_stamp_satisfies(
+            {"verification_stamp": "DATA-CHECKED", "required_stamp": "USEFULNESS-CHECKED"}
+        )
+        is False
+    )
+    assert (
+        verification_stamp_satisfies(
+            {"verification_stamp": "USEFULNESS-CHECKED", "required_stamp": "DATA-CHECKED"}
+        )
+        is True
+    )
 
 
 def test_use_case_block_and_artifact_presence_and_type_and_tier():
-    assert use_case_not_blocked({"target_use_case": "fraud", "blocked_use_cases": ("credit_decisioning",)}) is True
-    assert use_case_not_blocked({"target_use_case": "credit_decisioning", "blocked_use_cases": ("credit_decisioning",)}) is False
-    assert required_artifact_present({"required_artifact_refs": {"monitoring_spec": "doc_m"}, "artifact_name": "monitoring_spec"}) is True
-    assert required_artifact_present({"required_artifact_refs": {"monitoring_spec": None}, "artifact_name": "monitoring_spec"}) is False
-    assert required_artifact_present({"required_artifact_refs": {}, "artifact_name": "monitoring_spec"}) is False
-    assert approval_type_is({"approval_type": "PRODUCTION", "expected_approval_type": "PRODUCTION"}) is True
+    assert (
+        use_case_not_blocked(
+            {"target_use_case": "fraud", "blocked_use_cases": ("credit_decisioning",)}
+        )
+        is True
+    )
+    assert (
+        use_case_not_blocked(
+            {"target_use_case": "credit_decisioning", "blocked_use_cases": ("credit_decisioning",)}
+        )
+        is False
+    )
+    assert (
+        required_artifact_present(
+            {
+                "required_artifact_refs": {"monitoring_spec": "doc_m"},
+                "artifact_name": "monitoring_spec",
+            }
+        )
+        is True
+    )
+    assert (
+        required_artifact_present(
+            {
+                "required_artifact_refs": {"monitoring_spec": None},
+                "artifact_name": "monitoring_spec",
+            }
+        )
+        is False
+    )
+    assert (
+        required_artifact_present(
+            {"required_artifact_refs": {}, "artifact_name": "monitoring_spec"}
+        )
+        is False
+    )
+    assert (
+        approval_type_is({"approval_type": "PRODUCTION", "expected_approval_type": "PRODUCTION"})
+        is True
+    )
     assert risk_tier_within_ceiling({"risk_tier_rank": 2, "ceiling_rank": 2}) is True
     assert risk_tier_within_ceiling({"risk_tier_rank": 3, "ceiling_rank": 2}) is False
 
 
 def test_expiry_and_max_uses_are_deterministic_in_supplied_inputs():
-    now = datetime(2026, 6, 27, tzinfo=timezone.utc)
-    future = datetime(2026, 12, 31, tzinfo=timezone.utc)
+    now = datetime(2026, 6, 27, tzinfo=UTC)
+    future = datetime(2026, 12, 31, tzinfo=UTC)
     assert approval_not_expired({"expires_at": None, "as_of": now}) is True
     assert approval_not_expired({"expires_at": future, "as_of": now}) is True
     assert approval_not_expired({"expires_at": now, "as_of": future}) is False
@@ -72,7 +116,11 @@ def test_register_governance_predicates_registers_all_seven():
     reg = FakeRegistry()
     register_governance_predicates(reg)
     assert set(reg.registered) == {
-        "verification_stamp_satisfies", "approval_type_is", "use_case_not_blocked",
-        "required_artifact_present", "risk_tier_within_ceiling", "approval_not_expired",
+        "verification_stamp_satisfies",
+        "approval_type_is",
+        "use_case_not_blocked",
+        "required_artifact_present",
+        "risk_tier_within_ceiling",
+        "approval_not_expired",
         "max_uses_not_exceeded",
     }

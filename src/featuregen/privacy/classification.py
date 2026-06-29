@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from typing import Iterable, Mapping
+from collections.abc import Iterable, Mapping
 
 PII_ERASABLE = "pii-erasable"
 GOVERNANCE_RETAINED = "governance-retained"
@@ -13,7 +13,7 @@ _REF_RE = re.compile(r"^(blob|doc)_[A-Za-z0-9]+$")
 # in an event payload (§9: "No raw PII/secrets in events ... references only"). Kept narrow on
 # purpose: each pattern is specific enough to avoid false positives on hashes/ULIDs/refs/metadata,
 # so the guard can run on EVERY append without breaking legitimate reference-only payloads.
-_SECRET_PATTERNS: tuple[tuple[str, "re.Pattern[str]"], ...] = (
+_SECRET_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("US SSN", re.compile(r"\b\d{3}-\d{2}-\d{4}\b")),
     ("PEM private key", re.compile(r"-----BEGIN (?:[A-Z]+ )?PRIVATE KEY-----")),
     ("AWS access key id", re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b")),
@@ -80,7 +80,9 @@ def assert_no_inline_pii(payload: Mapping[str, object]) -> None:
             )
 
 
-def assert_references_only(payload: Mapping[str, object], *, sensitive_fields: tuple[str, ...]) -> None:
+def assert_references_only(
+    payload: Mapping[str, object], *, sensitive_fields: tuple[str, ...]
+) -> None:
     for name in sensitive_fields:
         if name not in payload:
             continue

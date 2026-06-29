@@ -1,18 +1,22 @@
 import pytest
 
 EXPECTED_TABLES = [
-    "feature_versions", "feature_active_versions",
-    "consumers", "concept_claims", "command_idempotency",
+    "feature_versions",
+    "feature_active_versions",
+    "consumers",
+    "concept_claims",
+    "command_idempotency",
 ]
+
 
 @pytest.mark.parametrize("table", EXPECTED_TABLES)
 def test_table_exists(db, table):
     row = db.execute(
-        "SELECT 1 FROM information_schema.tables "
-        "WHERE table_schema = 'public' AND table_name = %s",
+        "SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = %s",
         (table,),
     ).fetchone()
     assert row is not None, f"missing table {table}"
+
 
 def test_feature_active_versions_pk_is_feature_id_use_case(db):
     cols = db.execute(
@@ -22,6 +26,7 @@ def test_feature_active_versions_pk_is_feature_id_use_case(db):
         "ORDER BY a.attname"
     ).fetchall()
     assert [c[0] for c in cols] == ["feature_id", "use_case"]
+
 
 def test_concept_claims_concept_key_is_pk(db):
     row = db.execute(

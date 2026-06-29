@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 import pytest
 
 from featuregen.contracts import (
@@ -13,7 +15,6 @@ from featuregen.contracts import (
     NewExternalCommand,
     NewTimer,
 )
-from datetime import datetime, timezone
 from featuregen.documents.store import DocumentValidationError
 from featuregen.runtime.step import commit_step
 
@@ -45,7 +46,9 @@ def test_commit_step_appends_event_outbox_and_ledger(db, seed_run_event, actor, 
         new_events=(_next_event(ctx, actor, prov),),
     )
     sc = commit_step(
-        db, ctx, result,
+        db,
+        ctx,
+        result,
         message_id=trigger.event_id,
         expected_version=trigger.stream_version,
         table_version=trigger.table_version,
@@ -56,8 +59,10 @@ def test_commit_step_appends_event_outbox_and_ledger(db, seed_run_event, actor, 
     with db.cursor() as cur:
         cur.execute("SELECT topic FROM outbox WHERE message_id = %s", (sc.appended_event_ids[0],))
         assert cur.fetchone()[0] == "STEP_DONE"
-        cur.execute("SELECT processed_seq FROM processed_messages WHERE message_id = %s",
-                    (trigger.event_id,))
+        cur.execute(
+            "SELECT processed_seq FROM processed_messages WHERE message_id = %s",
+            (trigger.event_id,),
+        )
         assert cur.fetchone()[0] == sc.processed_seq
 
 
@@ -79,15 +84,18 @@ def test_commit_step_inserts_document(db, seed_run_event, actor, prov) -> None:
         document=doc,
     )
     sc = commit_step(
-        db, ctx, result,
+        db,
+        ctx,
+        result,
         message_id=trigger.event_id,
         expected_version=trigger.stream_version,
         table_version=trigger.table_version,
     )
     assert sc.document_id is not None
     with db.cursor() as cur:
-        cur.execute("SELECT stage, run_id, branch_role FROM documents WHERE doc_id = %s",
-                    (sc.document_id,))
+        cur.execute(
+            "SELECT stage, run_id, branch_role FROM documents WHERE doc_id = %s", (sc.document_id,)
+        )
         stage, run_id, role = cur.fetchone()
     assert (stage, run_id, role) == ("CANDIDATE_SQL", "run_s2", "candidate")
 
@@ -103,7 +111,9 @@ def test_commit_step_chains_occ_for_multiple_events(db, seed_run_event, actor, p
         ),
     )
     sc = commit_step(
-        db, ctx, result,
+        db,
+        ctx,
+        result,
         message_id=trigger.event_id,
         expected_version=trigger.stream_version,
         table_version=trigger.table_version,
@@ -128,7 +138,7 @@ def test_commit_step_persists_timers_and_external_commands_atomically(
     result = HandlerResult(
         disposition=Disposition.OK,
         new_events=(_next_event(ctx, actor, prov),),
-        timers=(NewTimer(kind="sla", fire_at=datetime.now(timezone.utc), idempotency_key="t1"),),
+        timers=(NewTimer(kind="sla", fire_at=datetime.now(UTC), idempotency_key="t1"),),
         external_commands=(
             NewExternalCommand(
                 integration="metadata_write",
@@ -139,7 +149,9 @@ def test_commit_step_persists_timers_and_external_commands_atomically(
         ),
     )
     sc = commit_step(
-        db, ctx, result,
+        db,
+        ctx,
+        result,
         message_id=trigger.event_id,
         expected_version=trigger.stream_version,
         table_version=trigger.table_version,
@@ -148,9 +160,7 @@ def test_commit_step_persists_timers_and_external_commands_atomically(
     assert len(sc.timer_ids) == 1
     assert len(sc.external_command_ids) == 1
     with db.cursor() as cur:
-        cur.execute(
-            "SELECT status, kind FROM timers WHERE timer_id = %s", (sc.timer_ids[0],)
-        )
+        cur.execute("SELECT status, kind FROM timers WHERE timer_id = %s", (sc.timer_ids[0],))
         assert cur.fetchone() == ("scheduled", "sla")
         cur.execute(
             "SELECT status, integration FROM external_commands WHERE command_id = %s",
@@ -170,7 +180,7 @@ def test_commit_step_rolls_back_timers_and_external_commands_on_abort(
     result = HandlerResult(
         disposition=Disposition.OK,
         new_events=(_next_event(ctx, actor, prov),),
-        timers=(NewTimer(kind="sla", fire_at=datetime.now(timezone.utc), idempotency_key="t2"),),
+        timers=(NewTimer(kind="sla", fire_at=datetime.now(UTC), idempotency_key="t2"),),
         external_commands=(
             NewExternalCommand(
                 integration="metadata_write",
@@ -183,24 +193,23 @@ def test_commit_step_rolls_back_timers_and_external_commands_on_abort(
     class _Abort(Exception):
         pass
 
-    with pytest.raises(_Abort):
-        with db.transaction():  # mirrors process_one's per-step savepoint
-            commit_step(
-                db, ctx, result,
-                message_id=trigger.event_id,
-                expected_version=trigger.stream_version,
-                table_version=trigger.table_version,
-            )
-            raise _Abort  # force the whole step tx to roll back AFTER the writes
+    with pytest.raises(_Abort), db.transaction():  # mirrors process_one's per-step savepoint
+        commit_step(
+            db,
+            ctx,
+            result,
+            message_id=trigger.event_id,
+            expected_version=trigger.stream_version,
+            table_version=trigger.table_version,
+        )
+        raise _Abort  # force the whole step tx to roll back AFTER the writes
 
     with db.cursor() as cur:
         cur.execute("SELECT count(*) FROM timers WHERE idempotency_key = 't2'")
         assert cur.fetchone()[0] == 0
         cur.execute("SELECT count(*) FROM external_commands WHERE idempotency_key = 'x2'")
         assert cur.fetchone()[0] == 0
-        cur.execute(
-            "SELECT count(*) FROM events WHERE run_id='run_s4r' AND type='STEP_DONE'"
-        )
+        cur.execute("SELECT count(*) FROM events WHERE run_id='run_s4r' AND type='STEP_DONE'")
         assert cur.fetchone()[0] == 0
 
 
@@ -208,16 +217,25 @@ def test_commit_step_applies_activations(db, seed_run_event, actor, prov) -> Non
     # Phase 06 (§5.8): commit_step now APPLIES each declared NewActivation on the step-tx conn
     # (replacing the Phase-04 deferral guard) via apply_activation — atomic with the rest of the
     # step. The active-map CAS + VERSION_ACTIVATED event land in the same transaction.
-    from featuregen.events.registry import event_registry
     from featuregen.aggregates.events import register_phase06_event_types
     from featuregen.aggregates.feature_versions import mint_feature_version
+    from featuregen.events.registry import event_registry
 
     register_phase06_event_types(event_registry())
     fv = mint_feature_version(
-        db, feature_id="feat_step", produced_by_run="run_s4b",
-        verification_stamp="USEFULNESS-CHECKED", risk_tier="low", approval_type="PRODUCTION",
-        approved_use_cases=("fraud",), blocked_use_cases=(), required_artifact_refs={},
-        content_hash="sha256:step", actor=actor, provenance=prov)
+        db,
+        feature_id="feat_step",
+        produced_by_run="run_s4b",
+        verification_stamp="USEFULNESS-CHECKED",
+        risk_tier="low",
+        approval_type="PRODUCTION",
+        approved_use_cases=("fraud",),
+        blocked_use_cases=(),
+        required_artifact_refs={},
+        content_hash="sha256:step",
+        actor=actor,
+        provenance=prov,
+    )
     trigger = seed_run_event("run_s4b", type="STEP_TRIGGER")
     ctx = _ctx(db, trigger)
     result = HandlerResult(
@@ -234,26 +252,32 @@ def test_commit_step_applies_activations(db, seed_run_event, actor, prov) -> Non
         ),
     )
     commit_step(
-        db, ctx, result,
+        db,
+        ctx,
+        result,
         message_id=trigger.event_id,
         expected_version=trigger.stream_version,
         table_version=trigger.table_version,
     )
-    row = db.execute("SELECT feature_version_id FROM feature_active_versions "
-                     "WHERE feature_id='feat_step' AND use_case='fraud'").fetchone()
+    row = db.execute(
+        "SELECT feature_version_id FROM feature_active_versions "
+        "WHERE feature_id='feat_step' AND use_case='fraud'"
+    ).fetchone()
     assert row[0] == fv
 
 
-def test_commit_step_stale_expected_version_raises_concurrency(db, seed_run_event, actor, prov) -> None:
+def test_commit_step_stale_expected_version_raises_concurrency(
+    db, seed_run_event, actor, prov
+) -> None:
     trigger = seed_run_event("run_s5", type="STEP_TRIGGER")
     ctx = _ctx(db, trigger)
-    result = HandlerResult(
-        disposition=Disposition.OK, new_events=(_next_event(ctx, actor, prov),)
-    )
+    result = HandlerResult(disposition=Disposition.OK, new_events=(_next_event(ctx, actor, prov),))
     # expected_version 0 is stale (stream is already at version 1)
     with pytest.raises(ConcurrencyError):
         commit_step(
-            db, ctx, result,
+            db,
+            ctx,
+            result,
             message_id=trigger.event_id,
             expected_version=0,
             table_version=trigger.table_version,
@@ -274,11 +298,11 @@ def test_commit_step_rolls_back_all_writes_when_document_insert_fails(
         doc_id=ctx.new_doc_id(),
         stage="CANDIDATE_SQL",
         schema_version=1,
-        branch_role="rejected",          # append_document requires a reject_reason
+        branch_role="rejected",  # append_document requires a reject_reason
         content_hash="sha256:abc",
         body_classification="governance-retained",
         provenance=prov,
-        reject_reason=None,              # -> DocumentValidationError (DB CHECK is the backstop)
+        reject_reason=None,  # -> DocumentValidationError (DB CHECK is the backstop)
     )
     result = HandlerResult(
         disposition=Disposition.OK,
@@ -286,21 +310,21 @@ def test_commit_step_rolls_back_all_writes_when_document_insert_fails(
         document=bad_doc,
     )
     with pytest.raises(DocumentValidationError):
-        with db.transaction():           # mirrors process_one's per-step savepoint
+        with db.transaction():  # mirrors process_one's per-step savepoint
             commit_step(
-                db, ctx, result,
+                db,
+                ctx,
+                result,
                 message_id=trigger.event_id,
                 expected_version=trigger.stream_version,
                 table_version=trigger.table_version,
             )
     with db.cursor() as cur:
-        cur.execute(
-            "SELECT count(*) FROM events WHERE run_id='run_atomic' AND type='STEP_DONE'"
-        )
-        assert cur.fetchone()[0] == 0    # no event written (document rejected first)
+        cur.execute("SELECT count(*) FROM events WHERE run_id='run_atomic' AND type='STEP_DONE'")
+        assert cur.fetchone()[0] == 0  # no event written (document rejected first)
         cur.execute("SELECT count(*) FROM outbox WHERE partition_key='run:run_atomic'")
-        assert cur.fetchone()[0] == 0    # no orphan outbox row
+        assert cur.fetchone()[0] == 0  # no orphan outbox row
         cur.execute(
             "SELECT count(*) FROM processed_messages WHERE message_id=%s", (trigger.event_id,)
         )
-        assert cur.fetchone()[0] == 0    # no ledger row
+        assert cur.fetchone()[0] == 0  # no ledger row

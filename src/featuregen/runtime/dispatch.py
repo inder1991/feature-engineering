@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import threading
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from typing import Callable, Mapping
 
 import psycopg
 
@@ -40,9 +40,7 @@ class ProcessOutcome:
     queue_id: int | None
 
 
-def _default_document_loader(
-    conn: psycopg.Connection, run_id: str
-) -> Mapping[str, NewDocument]:
+def _default_document_loader(conn: psycopg.Connection, run_id: str) -> Mapping[str, NewDocument]:
     return {}
 
 
@@ -59,9 +57,7 @@ def _open_handler_conn(conn: psycopg.Connection) -> psycopg.Connection:
     # fast (psycopg ReadOnlySqlTransaction) instead of silently committing outside the §5.1 step
     # boundary. Kept autocommit so the handler's reads do not hold an open transaction on this
     # isolated connection.
-    handler_conn = psycopg.connect(
-        conn.info.dsn, options="-c default_transaction_read_only=on"
-    )
+    handler_conn = psycopg.connect(conn.info.dsn, options="-c default_transaction_read_only=on")
     handler_conn.autocommit = True
     return handler_conn
 
@@ -84,15 +80,11 @@ def _run_with_timeout(handler: Handler, ctx: HandlerContext) -> HandlerResult:
         except BaseException as exc:  # noqa: BLE001 — re-raised on the dispatcher thread
             box["error"] = exc
 
-    thread = threading.Thread(
-        target=_target, name=f"handler:{handler.name}", daemon=True
-    )
+    thread = threading.Thread(target=_target, name=f"handler:{handler.name}", daemon=True)
     thread.start()
     thread.join(timeout=handler.timeout_seconds)
     if thread.is_alive():
-        raise HandlerTimeout(
-            f"handler {handler.name!r} exceeded {handler.timeout_seconds}s"
-        )
+        raise HandlerTimeout(f"handler {handler.name!r} exceeded {handler.timeout_seconds}s")
     if "error" in box:
         raise box["error"]  # type: ignore[misc]
     return box["result"]  # type: ignore[return-value]
@@ -131,9 +123,7 @@ def process_one(
     document_loader: Callable[
         [psycopg.Connection, str], Mapping[str, NewDocument]
     ] = _default_document_loader,
-    handler_conn_factory: Callable[
-        [psycopg.Connection], psycopg.Connection
-    ] = _open_handler_conn,
+    handler_conn_factory: Callable[[psycopg.Connection], psycopg.Connection] = _open_handler_conn,
 ) -> ProcessOutcome:
     """Claim one queue item and drive it forward idempotently (§5.3). Runs in one outer tx;
     the OK path commits the step inside a savepoint so a real OCC conflict rolls back ONLY the
@@ -157,9 +147,7 @@ def process_one(
         handler_conn = handler_conn_factory(conn)
         timed_out = False
         try:
-            ctx = _build_context(
-                conn, claim, document_loader, handler_conn=handler_conn
-            )
+            ctx = _build_context(conn, claim, document_loader, handler_conn=handler_conn)
 
             try:
                 result = _run_with_timeout(handler, ctx)
@@ -174,7 +162,9 @@ def process_one(
                 try:
                     with conn.transaction():
                         commit_step(
-                            conn, ctx, result,
+                            conn,
+                            ctx,
+                            result,
                             message_id=claim.message_id,
                             expected_version=ctx.triggering_event.stream_version,
                             table_version=ctx.triggering_event.table_version,
@@ -185,9 +175,7 @@ def process_one(
                         status="retryable", message_id=claim.message_id, queue_id=claim.id
                     )
                 complete(conn, claim.id)
-                return ProcessOutcome(
-                    status="ok", message_id=claim.message_id, queue_id=claim.id
-                )
+                return ProcessOutcome(status="ok", message_id=claim.message_id, queue_id=claim.id)
 
             if result.disposition == Disposition.RETRYABLE:
                 fail_retryable(conn, claim.id, error=result.error or "retryable")

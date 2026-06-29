@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from featuregen.contracts import (
     Command,
@@ -56,7 +56,7 @@ def test_identity_envelope_is_frozen():
 
 
 def test_event_envelope_round_constructs():
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     env = EventEnvelope(
         event_id="evt_1",
         global_seq=1,

@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Mapping, Union
 
 
 class GuardExprError(Exception):
@@ -16,22 +16,22 @@ class Pred:
 
 @dataclass(frozen=True, slots=True)
 class Not:
-    operand: "Node"
+    operand: Node
 
 
 @dataclass(frozen=True, slots=True)
 class And:
-    left: "Node"
-    right: "Node"
+    left: Node
+    right: Node
 
 
 @dataclass(frozen=True, slots=True)
 class Or:
-    left: "Node"
-    right: "Node"
+    left: Node
+    right: Node
 
 
-Node = Union[Pred, Not, And, Or]
+Node = Pred | Not | And | Or
 
 _TOKEN_RE = re.compile(r"\(|\)|[A-Za-z_][A-Za-z0-9_]*")
 _KEYWORDS = frozenset({"AND", "OR", "NOT"})
@@ -71,7 +71,7 @@ class _Parser:
             raise GuardExprError("empty guard expression")
         node = self._or()
         if self._i != len(self._tokens):
-            raise GuardExprError(f"trailing tokens: {self._tokens[self._i:]}")
+            raise GuardExprError(f"trailing tokens: {self._tokens[self._i :]}")
         return node
 
     def _or(self) -> Node:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import Any, Mapping
+from collections.abc import Mapping
+from typing import Any
 
 import jsonschema
 from psycopg.types.json import Jsonb
@@ -58,9 +59,7 @@ class DocumentSchemaRegistry:
         for v in range(from_version, to_version):
             step = self._upcasters.get((type_name, v, v + 1))
             if step is None:
-                raise SchemaValidationError(
-                    f"missing upcaster {type_name} v{v}->v{v + 1} (poison)"
-                )
+                raise SchemaValidationError(f"missing upcaster {type_name} v{v}->v{v + 1} (poison)")
             current = dict(step(current))
         return current
 
@@ -72,9 +71,7 @@ class DocumentSchemaRegistry:
         try:
             jsonschema.validate(instance=dict(body), schema=schema)
         except jsonschema.ValidationError as exc:
-            raise SchemaValidationError(
-                f"{type_name}@v{schema_version}: {exc.message}"
-            ) from exc
+            raise SchemaValidationError(f"{type_name}@v{schema_version}: {exc.message}") from exc
 
     def assert_writable(self, type_name: str, schema_version: int) -> None:
         """Block NEW writes at a non-active version (§3.3): `deprecated` => no new
@@ -82,8 +79,7 @@ class DocumentSchemaRegistry:
         READABLE via validate()/upcast() for in-flight docs. Producers call this
         before writing a new document body at (type_name, schema_version)."""
         row = self._conn.execute(
-            "SELECT status FROM document_type_registry "
-            "WHERE type_name=%s AND schema_version=%s",
+            "SELECT status FROM document_type_registry WHERE type_name=%s AND schema_version=%s",
             (type_name, schema_version),
         ).fetchone()
         if row is None:
@@ -101,15 +97,17 @@ class DocumentSchemaRegistry:
         Idempotent: an unchanged active set returns the existing snapshot id."""
         contents = self._active_max_versions()
         existing = self._conn.execute(
-            "SELECT snapshot_id FROM registry_snapshots "
-            "WHERE registry='docs' AND contents = %s",
+            "SELECT snapshot_id FROM registry_snapshots WHERE registry='docs' AND contents = %s",
             (Jsonb(contents),),
         ).fetchone()
         if existing:
             return existing[0]
-        n = self._conn.execute(
-            "SELECT count(*) FROM registry_snapshots WHERE registry='docs'"
-        ).fetchone()[0] + 1
+        n = (
+            self._conn.execute(
+                "SELECT count(*) FROM registry_snapshots WHERE registry='docs'"
+            ).fetchone()[0]
+            + 1
+        )
         snapshot_id = f"docs@v{n}"
         self._conn.execute(
             "INSERT INTO registry_snapshots (snapshot_id, registry, contents) "
@@ -132,7 +130,5 @@ class DocumentSchemaRegistry:
             (type_name, schema_version),
         ).fetchone()
         if row is None:
-            raise SchemaValidationError(
-                f"unregistered type {type_name}@v{schema_version}"
-            )
+            raise SchemaValidationError(f"unregistered type {type_name}@v{schema_version}")
         return row[0]

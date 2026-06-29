@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Optional, Protocol, runtime_checkable
+from typing import Protocol, runtime_checkable
 
 from featuregen.contracts import DbConn
 
@@ -32,8 +32,8 @@ def register_blob(
     object_key: str,
     content_hash: str,
     classification: str,
-    kms_key_id: Optional[str] = None,
-    size_bytes: Optional[int] = None,
+    kms_key_id: str | None = None,
+    size_bytes: int | None = None,
 ) -> str:
     """Index a blob written to the object store BEFORE the §5.1 transaction (status='live',
     referenced=false). Idempotent on blob_id. A committed *_ref later flips referenced=true

@@ -24,9 +24,19 @@ def _prov() -> ProvenanceEnvelope:
 
 def test_stage_enum_is_the_normative_published_set_in_order():
     assert STAGES == (
-        "DRAFT_CONTRACT", "ASSUMPTION_LEDGER", "CONFIRMED_CONTRACT", "MAPPED_CONTRACT",
-        "FEATURE_PLAN", "CANDIDATE_SQL", "VALIDATION_REPORT", "SANDBOX_RESULT", "DQ_REPORT",
-        "EVALUATION_REPORT", "RISK_ASSESSMENT", "EXPLAINABILITY", "MONITORING_SPEC",
+        "DRAFT_CONTRACT",
+        "ASSUMPTION_LEDGER",
+        "CONFIRMED_CONTRACT",
+        "MAPPED_CONTRACT",
+        "FEATURE_PLAN",
+        "CANDIDATE_SQL",
+        "VALIDATION_REPORT",
+        "SANDBOX_RESULT",
+        "DQ_REPORT",
+        "EVALUATION_REPORT",
+        "RISK_ASSESSMENT",
+        "EXPLAINABILITY",
+        "MONITORING_SPEC",
         "APPROVAL_RECORD",
     )
     assert Stage.CONFIRMED_CONTRACT.value == "CONFIRMED_CONTRACT"

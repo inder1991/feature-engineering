@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import re
-from typing import Mapping, Optional
+from collections.abc import Mapping
 
 from featuregen.contracts.provenance import ProvenanceEnvelope
 
-_REF_RE = re.compile(r"^[^\s:]+:[^\s]+$")  # a reference id token "kind:id" — never an inline body (§9)
+_REF_RE = re.compile(
+    r"^[^\s:]+:[^\s]+$"
+)  # a reference id token "kind:id" — never an inline body (§9)
 
 
 class ProvenanceError(Exception):
@@ -17,25 +19,27 @@ def build_provenance(
     artifact_type: str,
     schema_version: int,
     producing_component: str,
-    llm_model: Optional[str] = None,
-    prompt_version: Optional[str] = None,
-    validator: Optional[str] = None,
-    compiler: Optional[str] = None,
-    tool_versions: Optional[Mapping[str, str]] = None,
-    dsl_operation_catalog_version: Optional[str] = None,
+    llm_model: str | None = None,
+    prompt_version: str | None = None,
+    validator: str | None = None,
+    compiler: str | None = None,
+    tool_versions: Mapping[str, str] | None = None,
+    dsl_operation_catalog_version: str | None = None,
     source_snapshots: tuple[str, ...] = (),
-    event_registry_snapshot: Optional[str] = None,
-    doc_registry_snapshot: Optional[str] = None,
-    evaluation_dataset_ref: Optional[str] = None,
-    holdout_partition_spec: Optional[str] = None,
-    random_seed: Optional[int] = None,
-    candidates_explored_count: Optional[int] = None,
+    event_registry_snapshot: str | None = None,
+    doc_registry_snapshot: str | None = None,
+    evaluation_dataset_ref: str | None = None,
+    holdout_partition_spec: str | None = None,
+    random_seed: int | None = None,
+    candidates_explored_count: int | None = None,
     external_refs: tuple[str, ...] = (),
 ) -> ProvenanceEnvelope:
     merged: dict[str, str] = dict(tool_versions or {})
     for key, value in (
-        ("llm_model", llm_model), ("prompt_version", prompt_version),
-        ("validator", validator), ("compiler", compiler),
+        ("llm_model", llm_model),
+        ("prompt_version", prompt_version),
+        ("validator", validator),
+        ("compiler", compiler),
     ):
         if value is not None:
             merged[key] = value
@@ -65,6 +69,10 @@ def validate_provenance(prov: ProvenanceEnvelope, *, require_replay_pins: bool =
         raise ProvenanceError("schema_version must be > 0")
     for ref in prov.external_refs:
         if not _REF_RE.match(ref):
-            raise ProvenanceError(f"external_ref {ref!r} must be a 'kind:id' reference, not inline content (§9)")
+            raise ProvenanceError(
+                f"external_ref {ref!r} must be a 'kind:id' reference, not inline content (§9)"
+            )
     if require_replay_pins and not (prov.event_registry_snapshot and prov.doc_registry_snapshot):
-        raise ProvenanceError("replay determinism requires event_registry_snapshot and doc_registry_snapshot (§8)")
+        raise ProvenanceError(
+            "replay determinism requires event_registry_snapshot and doc_registry_snapshot (§8)"
+        )

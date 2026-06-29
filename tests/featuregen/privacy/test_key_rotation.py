@@ -37,7 +37,10 @@ def test_rotate_updates_key_and_leaves_events_untouched(db):
 
     assert new_key == "k1_v2"
     assert km.rotated == [("k1", "k/blob_r")]
-    assert db.execute("SELECT kms_key_id FROM blob_index WHERE blob_id='blob_r'").fetchone()[0] == "k1_v2"
+    assert (
+        db.execute("SELECT kms_key_id FROM blob_index WHERE blob_id='blob_r'").fetchone()[0]
+        == "k1_v2"
+    )
     after = db.execute("SELECT count(*), max(event_id) FROM events").fetchone()
     assert after == before  # events never rewritten (§9)
 

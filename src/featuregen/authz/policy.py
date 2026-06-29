@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
 
 from featuregen.contracts.commands import Command
 from featuregen.contracts.db import DbConn
@@ -11,11 +10,11 @@ from featuregen.identity.build import IdentityError, validate_identity
 @dataclass(frozen=True, slots=True)
 class AuthzDecision:
     allowed: bool
-    reason: Optional[str] = None
+    reason: str | None = None
 
 
 # §6.2 canonical action vocabulary. gate='' for non-gate actions (PK forbids NULL).
-_POLICY_ROWS: tuple[tuple[str, str, str, str, Optional[str]], ...] = (
+_POLICY_ROWS: tuple[tuple[str, str, str, str, str | None], ...] = (
     ("create_request", "", "data_scientist", "human", None),
     ("create_request", "", "intake-agent", "service", None),
     ("create_run", "", "data_scientist", "human", None),

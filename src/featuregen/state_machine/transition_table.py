@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any, Mapping
+from typing import Any
 
 from psycopg.types.json import Json
 
@@ -35,11 +36,7 @@ class TransitionTable:
     transitions: tuple[Transition, ...]
 
     def matches(self, from_state: str, trigger: str) -> list[Transition]:
-        hits = [
-            t
-            for t in self.transitions
-            if t.from_state == from_state and t.trigger == trigger
-        ]
+        hits = [t for t in self.transitions if t.from_state == from_state and t.trigger == trigger]
         return sorted(hits, key=lambda t: t.precedence, reverse=True)
 
     @property
@@ -81,9 +78,7 @@ def _validate(transitions: list[Transition], registry: PredicateRegistry) -> Non
                 try:
                     predicate = registry.get(name)
                 except KeyError as exc:
-                    raise TransitionTableError(
-                        f"guard predicate {name!r} not registered"
-                    ) from exc
+                    raise TransitionTableError(f"guard predicate {name!r} not registered") from exc
                 bound = t.guard_inputs.get(name)
                 if bound is None:
                     raise TransitionTableError(

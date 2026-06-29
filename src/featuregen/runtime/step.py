@@ -1,7 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Iterable
 from uuid import uuid4
 
 import psycopg
@@ -18,6 +18,7 @@ from featuregen.runtime.timers import schedule_timer
 @dataclass(frozen=True, slots=True)
 class StepCommit:
     """Outcome of one atomic step (§5.1)."""
+
     appended_event_ids: tuple[str, ...]
     document_id: str | None
     outbox_message_ids: tuple[str, ...]
@@ -70,7 +71,9 @@ def _validate_event_doc_refs(
                 )
 
 
-def _apply_activations(conn: psycopg.Connection, ctx: HandlerContext, result: HandlerResult) -> None:
+def _apply_activations(
+    conn: psycopg.Connection, ctx: HandlerContext, result: HandlerResult
+) -> None:
     """Apply each declared NewActivation on the STEP-TRANSACTION conn (never a handler conn),
     so the active-map CAS + VERSION_ACTIVATED/ACTIVATION_CONFLICT event + expiry timer are
     atomic with the rest of the step. apply_activation is idempotent (no-ops when already active
@@ -114,9 +117,7 @@ def commit_step(
     # schema-lifecycle/blob + structural validation inside this tx, and lets the emitted events
     # reference the doc by its handler-supplied id.
     document_id = (
-        _insert_document(conn, ctx, result.document)
-        if result.document is not None
-        else None
+        _insert_document(conn, ctx, result.document) if result.document is not None else None
     )
     _validate_event_doc_refs(conn, result.new_events, document_id=document_id)
 
@@ -126,18 +127,14 @@ def commit_step(
     version = expected_version
     appended = []
     for new_event in result.new_events:
-        env = append_event(
-            conn, new_event, expected_version=version, table_version=table_version
-        )
+        env = append_event(conn, new_event, expected_version=version, table_version=table_version)
         appended.append(env)
         version = env.stream_version
 
     # §5.5: persist declared durable timers in the SAME step tx (idempotent on idempotency_key).
     timer_ids: list[str] = []
     for timer in result.timers:
-        timer_ids.append(
-            schedule_timer(conn, te.aggregate, te.aggregate_id, timer)
-        )
+        timer_ids.append(schedule_timer(conn, te.aggregate, te.aggregate_id, timer))
 
     # §5.4: record declared external side effects in the SAME step tx (status='pending',
     # idempotent on idempotency_key) so a dispatcher can later execute them at-least-once.

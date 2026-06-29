@@ -17,9 +17,16 @@ def _append(conn, run_id, version, payload):
     return append_event(
         conn,
         NewEvent(
-            aggregate="run", aggregate_id=run_id, type="E", schema_version=1, payload=payload,
+            aggregate="run",
+            aggregate_id=run_id,
+            type="E",
+            schema_version=1,
+            payload=payload,
             actor=IdentityEnvelope(
-                subject="u", actor_kind="human", authenticated=True, auth_method="oidc",
+                subject="u",
+                actor_kind="human",
+                authenticated=True,
+                auth_method="oidc",
                 role_claims=(),
             ),
             provenance=ProvenanceEnvelope(

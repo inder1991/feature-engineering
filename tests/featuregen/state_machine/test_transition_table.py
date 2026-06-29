@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import psycopg
 import pytest
+from tests.featuregen.state_machine._predicates import truthy
 
 from featuregen.state_machine.guards import InMemoryPredicateRegistry
 from featuregen.state_machine.transition_table import (
@@ -10,7 +11,6 @@ from featuregen.state_machine.transition_table import (
     install_transition_table,
     load_transition_table,
 )
-from tests.featuregen.state_machine._predicates import truthy
 
 
 def _registry() -> InMemoryPredicateRegistry:
@@ -81,7 +81,10 @@ def test_unregistered_predicate_rejected(conn) -> None:
 
 def test_guard_without_on_guard_fail_rejected(conn) -> None:
     bad = Transition(
-        table_version=1, from_state="A", to_state="B", trigger="T",
+        table_version=1,
+        from_state="A",
+        to_state="B",
+        trigger="T",
         guard_expr="confirmed_contract_exists",
         guard_inputs={"confirmed_contract_exists": "confirmed_contract_ref"},
         precedence=100,
@@ -94,7 +97,10 @@ def test_guard_without_on_guard_fail_rejected(conn) -> None:
 
 def test_binding_mismatch_rejected(conn) -> None:
     bad = Transition(
-        table_version=1, from_state="A", to_state="B", trigger="T",
+        table_version=1,
+        from_state="A",
+        to_state="B",
+        trigger="T",
         guard_expr="confirmed_contract_exists",
         guard_inputs={"confirmed_contract_exists": "WRONG_REF"},  # != declared_inputs
         precedence=100,
@@ -107,7 +113,10 @@ def test_binding_mismatch_rejected(conn) -> None:
 
 def test_missing_binding_rejected(conn) -> None:
     bad = Transition(
-        table_version=1, from_state="A", to_state="B", trigger="T",
+        table_version=1,
+        from_state="A",
+        to_state="B",
+        trigger="T",
         guard_expr="confirmed_contract_exists",
         guard_inputs={},  # no binding at all
         precedence=100,
@@ -120,8 +129,13 @@ def test_missing_binding_rejected(conn) -> None:
 
 def test_malformed_on_success_rejected(conn) -> None:
     bad = Transition(
-        table_version=1, from_state="A", to_state="B", trigger="T",
-        guard_expr=None, guard_inputs={}, precedence=100,
+        table_version=1,
+        from_state="A",
+        to_state="B",
+        trigger="T",
+        guard_expr=None,
+        guard_inputs={},
+        precedence=100,
         on_success={"to": "B"},  # missing 'emits'
         on_guard_fail=None,
     )
@@ -131,8 +145,13 @@ def test_malformed_on_success_rejected(conn) -> None:
 
 def test_unguarded_transition_installs(conn) -> None:
     ok = Transition(
-        table_version=1, from_state="A", to_state="B", trigger="T",
-        guard_expr=None, guard_inputs={}, precedence=100,
+        table_version=1,
+        from_state="A",
+        to_state="B",
+        trigger="T",
+        guard_expr=None,
+        guard_inputs={},
+        precedence=100,
         on_success={"to": "B", "emits": "MOVED"},
         on_guard_fail=None,
     )

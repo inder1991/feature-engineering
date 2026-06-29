@@ -3,7 +3,6 @@ from __future__ import annotations
 import pytest
 
 from featuregen.runtime.outbox import (
-    OutboxMessage,
     insert_outbox_message,
     outbox_messages_for_events,
     partition_key_for,
@@ -90,9 +89,7 @@ def test_relay_backoff_on_publish_failure(db) -> None:
 
     assert relay_publish_batch(db, publish, owner="relay1") == 0
     with db.cursor() as cur:
-        cur.execute(
-            "SELECT status, attempts, last_error FROM outbox WHERE message_id = 'rp2'"
-        )
+        cur.execute("SELECT status, attempts, last_error FROM outbox WHERE message_id = 'rp2'")
         status, attempts, last_error = cur.fetchone()
     assert status == "pending"
     assert attempts == 1
@@ -156,7 +153,7 @@ def test_backpressure_holds_outbox_pending_without_failing(db) -> None:
         cur.execute("SELECT status, attempts FROM outbox WHERE message_id='bp1'")
         status, attempts = cur.fetchone()
     assert status == "pending"  # held durably, not failed
-    assert attempts == 0        # backpressure is NOT a failure: no attempt bump, no DLQ
+    assert attempts == 0  # backpressure is NOT a failure: no attempt bump, no DLQ
     with db.cursor() as cur:
         cur.execute("SELECT count(*) FROM queue WHERE message_id='bp1'")
         assert cur.fetchone()[0] == 0  # not enqueued while saturated

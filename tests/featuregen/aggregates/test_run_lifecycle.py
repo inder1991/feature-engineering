@@ -1,17 +1,27 @@
-from featuregen.events.store import load_stream
+from tests.featuregen._helpers import make_cmd
+
 from featuregen.aggregates.request_aggregate import create_request_command, create_run_command
 from featuregen.aggregates.run_lifecycle import (
-    reject_command, cancel_command, withdraw_command,
-    park_command, unpark_command, reopen_as_new_run_command, run_is_terminal,
-    fact_confirmed_resume_command, source_changed_revalidate_command,
+    cancel_command,
+    fact_confirmed_resume_command,
+    park_command,
+    reject_command,
+    reopen_as_new_run_command,
+    run_is_terminal,
+    source_changed_revalidate_command,
+    unpark_command,
+    withdraw_command,
 )
-from tests.featuregen._helpers import make_cmd
+from featuregen.events.store import load_stream
 
 
 def _new_run(db):
     req = create_request_command(
-        db, make_cmd("create_request", "request", None, {"feature_concept": "x"})).aggregate_id
-    return create_run_command(db, make_cmd("create_run", "request", req, {"request_id": req})).aggregate_id, req
+        db, make_cmd("create_request", "request", None, {"feature_concept": "x"})
+    ).aggregate_id
+    return create_run_command(
+        db, make_cmd("create_run", "request", req, {"request_id": req})
+    ).aggregate_id, req
 
 
 def test_reject_makes_run_terminal_and_records_reason(db):
@@ -42,23 +52,28 @@ def test_reopen_as_new_run_links_rejected(db):
     run, req = _new_run(db)
     reject_command(db, make_cmd("reject", "run", run, {"reason": "leakage"}))
     res = reopen_as_new_run_command(
-        db, make_cmd("reopen_as_new_run", "run", run, {"source_run_id": run}))
+        db, make_cmd("reopen_as_new_run", "run", run, {"source_run_id": run})
+    )
     assert res.accepted and res.aggregate_id != run
     new_created = load_stream(db, "run", res.aggregate_id)[0]
     assert new_created.payload["reopened_from"] == run
-    added = [e.payload["run_id"] for e in load_stream(db, "request", req) if e.type == "CANDIDATE_ADDED"]
+    added = [
+        e.payload["run_id"] for e in load_stream(db, "request", req) if e.type == "CANDIDATE_ADDED"
+    ]
     assert res.aggregate_id in added
 
 
 def test_reopen_rejected_when_source_not_rejected(db):
     run, _ = _new_run(db)
     res = reopen_as_new_run_command(
-        db, make_cmd("reopen_as_new_run", "run", run, {"source_run_id": run}))
+        db, make_cmd("reopen_as_new_run", "run", run, {"source_run_id": run})
+    )
     assert res.accepted is False and "rejected" in res.denied_reason
 
 
 def test_resolve_degraded_clears_flag(db):
     from featuregen.aggregates.run_lifecycle import resolve_degraded_command
+
     db.execute(
         "INSERT INTO run_workflow_state (run_id, request_id, current_state, table_version, "
         "degraded, degraded_reason) VALUES ('run_d', 'req_d', 'DRAFT', 1, true, 'boom')"
@@ -74,10 +89,15 @@ def test_resolve_degraded_clears_flag(db):
 def test_fact_confirmed_resume_wakes_only_runs_waiting_on_that_fact(db):
     waiting, _ = _new_run(db)
     other, _ = _new_run(db)
-    park_command(db, make_cmd("park", "run", waiting, {"owner": "o", "waiting_on_fact": "overlay:123"}))
-    park_command(db, make_cmd("park", "run", other, {"owner": "o", "waiting_on_fact": "overlay:999"}))
+    park_command(
+        db, make_cmd("park", "run", waiting, {"owner": "o", "waiting_on_fact": "overlay:123"})
+    )
+    park_command(
+        db, make_cmd("park", "run", other, {"owner": "o", "waiting_on_fact": "overlay:999"})
+    )
     res = fact_confirmed_resume_command(
-        db, make_cmd("fact_confirmed_resume", "run", None, {"fact_key": "overlay:123"}))
+        db, make_cmd("fact_confirmed_resume", "run", None, {"fact_key": "overlay:123"})
+    )
     assert res.accepted
     woken_types = [e.type for e in load_stream(db, "run", waiting)]
     assert "FACT_CONFIRMED_RESUME" in woken_types and woken_types[-1] == "RUN_UNPARKED"
@@ -87,8 +107,14 @@ def test_fact_confirmed_resume_wakes_only_runs_waiting_on_that_fact(db):
 def test_source_changed_revalidate_for_in_flight_run(db):
     run, _ = _new_run(db)
     res = source_changed_revalidate_command(
-        db, make_cmd("source_changed_revalidate", "run", run,
-                     {"source_ref": "tbl.core.txn", "new_snapshot": "snap@42"}))
+        db,
+        make_cmd(
+            "source_changed_revalidate",
+            "run",
+            run,
+            {"source_ref": "tbl.core.txn", "new_snapshot": "snap@42"},
+        ),
+    )
     assert res.accepted
     last = load_stream(db, "run", run)[-1]
     assert last.type == "SOURCE_CHANGED_REVALIDATE"
@@ -99,5 +125,6 @@ def test_source_changed_revalidate_rejected_when_terminal(db):
     run, _ = _new_run(db)
     reject_command(db, make_cmd("reject", "run", run, {"reason": "x"}))
     res = source_changed_revalidate_command(
-        db, make_cmd("source_changed_revalidate", "run", run, {"source_ref": "t"}))
+        db, make_cmd("source_changed_revalidate", "run", run, {"source_ref": "t"})
+    )
     assert res.accepted is False and "terminal" in res.denied_reason

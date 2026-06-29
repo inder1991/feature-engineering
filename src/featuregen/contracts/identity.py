@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import Any, Mapping
+from collections.abc import Mapping
+from typing import Any
 
 # IdentityEnvelope is the shared contract type (overview §6.1); import & re-export
 # it here rather than redefining, so all phases share one frozen dataclass.

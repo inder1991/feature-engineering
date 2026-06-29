@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-from typing import Mapping, Optional
+from collections.abc import Mapping
 
 from psycopg.types.json import Jsonb
 
-from featuregen.contracts import Command, CommandResult, DbConn
-from featuregen.commands.registry import get_command
 from featuregen.commands.authz_seam import current_authorizer
+from featuregen.commands.registry import get_command
+from featuregen.contracts import Command, CommandResult, DbConn
 
 _PENDING = {"_pending": True}
 
@@ -56,7 +56,7 @@ def _release(conn: DbConn, key: str) -> None:
     conn.execute("DELETE FROM command_idempotency WHERE idempotency_key = %s", (key,))
 
 
-def _replay(conn: DbConn, key: str) -> Optional[CommandResult]:
+def _replay(conn: DbConn, key: str) -> CommandResult | None:
     row = conn.execute(
         "SELECT result FROM command_idempotency WHERE idempotency_key = %s", (key,)
     ).fetchone()
@@ -96,7 +96,8 @@ def execute_command(conn: DbConn, cmd: Command) -> CommandResult:
             if prior is not None:
                 return prior
             return CommandResult(
-                accepted=False, aggregate_id=cmd.aggregate_id or "",
+                accepted=False,
+                aggregate_id=cmd.aggregate_id or "",
                 denied_reason="idempotency claim contended; retry",
             )
     # We own the claim; only now run authz + handler.
@@ -104,13 +105,15 @@ def execute_command(conn: DbConn, cmd: Command) -> CommandResult:
     if not decision.allowed:
         _release(conn, key)
         return CommandResult(
-            accepted=False, aggregate_id=cmd.aggregate_id or "",
+            accepted=False,
+            aggregate_id=cmd.aggregate_id or "",
             denied_reason=decision.reason,
         )
     if cmd.action != "resolve_degraded" and _is_degraded(conn, cmd):
         _release(conn, key)
         return CommandResult(
-            accepted=False, aggregate_id=cmd.aggregate_id or "",
+            accepted=False,
+            aggregate_id=cmd.aggregate_id or "",
             denied_reason="aggregate is degraded",
         )
     result = get_command(cmd.action)(conn, cmd)

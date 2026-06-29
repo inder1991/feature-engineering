@@ -5,7 +5,6 @@ import time
 from featuregen.contracts import Disposition, HandlerContext, HandlerResult, NewEvent
 from featuregen.runtime.dispatch import (
     HandlerRegistry,
-    ProcessOutcome,
     process_one,
     recover_stuck,
 )
@@ -31,8 +30,13 @@ class _Handler:
 
     def handle(self, ctx: HandlerContext) -> HandlerResult:
         ev = NewEvent(
-            aggregate="run", aggregate_id=ctx.run_id, run_id=ctx.run_id,
-            type="STEP_DONE", schema_version=1, payload={}, actor=self._actor,
+            aggregate="run",
+            aggregate_id=ctx.run_id,
+            run_id=ctx.run_id,
+            type="STEP_DONE",
+            schema_version=1,
+            payload={},
+            actor=self._actor,
             provenance=self._prov,
         )
         return HandlerResult(
@@ -86,8 +90,13 @@ def test_duplicate_message_is_skipped(db, seed_run_event, actor, prov) -> None:
             "VALUES (%s, 'run', 'run_dup', 1)",
             (trigger.event_id,),
         )
-    enqueue(db, message_id=trigger.event_id, partition_key="run:run_dup",
-            handler="advance", payload={"event_id": trigger.event_id, "run_id": "run_dup"})
+    enqueue(
+        db,
+        message_id=trigger.event_id,
+        partition_key="run:run_dup",
+        handler="advance",
+        payload={"event_id": trigger.event_id, "run_id": "run_dup"},
+    )
     reg = HandlerRegistry()
     reg.register(_Handler(actor, prov))
     outcome = process_one(db, reg, owner="w1")
@@ -183,10 +192,9 @@ def test_handler_write_through_read_conn_fails_fast(db, seed_run_event, actor, p
 
     # The illegal write never persisted (checked on an independent connection).
     db.rollback()
-    with psycopg.connect(db.info.dsn) as probe:
-        with probe.cursor() as cur:
-            cur.execute("SELECT to_regclass('handler_illegal_write')")
-            assert cur.fetchone()[0] is None
+    with psycopg.connect(db.info.dsn) as probe, probe.cursor() as cur:
+        cur.execute("SELECT to_regclass('handler_illegal_write')")
+        assert cur.fetchone()[0] is None
 
 
 def test_occ_conflict_reschedules_without_partial_writes(db, seed_run_event, actor, prov) -> None:
@@ -206,9 +214,7 @@ def test_occ_conflict_reschedules_without_partial_writes(db, seed_run_event, act
     with db.cursor() as cur:
         cur.execute("SELECT status FROM queue WHERE message_id=%s", (trigger.event_id,))
         assert cur.fetchone()[0] == "ready"  # rescheduled, not lost
-        cur.execute(
-            "SELECT count(*) FROM events WHERE run_id='run_occ' AND type='STEP_DONE'"
-        )
+        cur.execute("SELECT count(*) FROM events WHERE run_id='run_occ' AND type='STEP_DONE'")
         assert cur.fetchone()[0] == 0  # no partial event from the rolled-back step
         cur.execute(
             "SELECT count(*) FROM processed_messages WHERE message_id=%s", (trigger.event_id,)
