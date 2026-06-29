@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from sp0.contracts import EventEnvelope, IdentityEnvelope, ProvenanceEnvelope
-from sp0.events.serde import (
+from featuregen.contracts import EventEnvelope, IdentityEnvelope, ProvenanceEnvelope
+from featuregen.events.serde import (
     identity_from_jsonb,
     identity_to_jsonb,
     provenance_from_jsonb,

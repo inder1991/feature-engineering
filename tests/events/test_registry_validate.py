@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import pytest
 
-from sp0.contracts import SchemaValidationError
-from sp0.events.registry import EventSchemaRegistry, event_registry, reset_event_registry
+from featuregen.contracts import SchemaValidationError
+from featuregen.events.registry import EventSchemaRegistry, event_registry, reset_event_registry
 
 SCHEMA = {
     "type": "object",

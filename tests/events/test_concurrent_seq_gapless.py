@@ -4,10 +4,10 @@ import threading
 
 import psycopg
 
-from sp0.contracts import IdentityEnvelope, NewEvent, ProvenanceEnvelope
-from sp0.events.registry import event_registry
-from sp0.events.store import append_event
-from sp0.projections.runner import run_projection
+from featuregen.contracts import IdentityEnvelope, NewEvent, ProvenanceEnvelope
+from featuregen.events.registry import event_registry
+from featuregen.events.store import append_event
+from featuregen.projections.runner import run_projection
 
 
 class _CollectAll:
@@ -98,7 +98,7 @@ def test_concurrent_cross_aggregate_appends_are_gapless(_dsn):
         assert env_b.global_seq in proj.seen
         assert applied >= 2
     finally:
-        # This test commits to the shared sp0_test DB; clean up so other tests start empty.
+        # This test commits to the shared featuregen_test DB; clean up so other tests start empty.
         for c in (conn_a, conn_b, conn_c):
             try:
                 c.rollback()

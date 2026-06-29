@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from sp0.contracts import (
+from featuregen.contracts import (
     Command,
     CommandResult,
     ConcurrencyError,
@@ -42,7 +42,7 @@ def _provenance() -> ProvenanceEnvelope:
     return ProvenanceEnvelope(
         artifact_type="CONFIRMED_CONTRACT",
         schema_version=1,
-        producing_component="sp0-test@0.1.0",
+        producing_component="featuregen-test@0.1.0",
     )
 
 

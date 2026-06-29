@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import pytest
 
-from sp0.contracts import SchemaValidationError
-from sp0.events.registry import (
+from featuregen.contracts import SchemaValidationError
+from featuregen.events.registry import (
     EventSchemaRegistry,
     event_registry,
     hydrate_event_registry,
@@ -17,7 +17,7 @@ def test_hydrate_reconstitutes_schemas_from_db(conn):
     seed.register_schema(
         "RUN_STARTED", 1,
         {"type": "object", "required": ["x"], "properties": {"x": {"type": "string"}}},
-        owner="sp0",
+        owner="featuregen",
     )
     persist_event_schemas(conn, seed)
 

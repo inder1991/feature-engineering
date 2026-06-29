@@ -3,8 +3,8 @@ from __future__ import annotations
 import pytest
 from psycopg.rows import dict_row
 
-from sp0.contracts import SchemaValidationError
-from sp0.events.registry import (
+from featuregen.contracts import SchemaValidationError
+from featuregen.events.registry import (
     EventSchemaRegistry,
     load_registry_snapshot,
     persist_event_schemas,

@@ -2,11 +2,11 @@ from __future__ import annotations
 
 from psycopg.rows import dict_row
 
-from sp0.contracts import IdentityEnvelope, NewEvent, ProvenanceEnvelope
-from sp0.events.registry import event_registry
-from sp0.events.store import append_event
-from sp0.projections.migration import migrate_projection, resolve_projection, set_alias
-from sp0.projections.runner import projection_lag, run_projection
+from featuregen.contracts import IdentityEnvelope, NewEvent, ProvenanceEnvelope
+from featuregen.events.registry import event_registry
+from featuregen.events.store import append_event
+from featuregen.projections.migration import migrate_projection, resolve_projection, set_alias
+from featuregen.projections.runner import projection_lag, run_projection
 
 
 class V1Projection:

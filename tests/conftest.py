@@ -6,15 +6,15 @@ import psycopg
 import pytest
 from pytest_postgresql import factories
 
-from sp0.db.migrations import apply_migrations
-from sp0.events.registry import reset_event_registry
+from featuregen.db.migrations import apply_migrations
+from featuregen.events.registry import reset_event_registry
 
-# Brief default is a reachable PostgreSQL 15+ at `postgresql:///sp0_test`, read from
-# SP0_TEST_DSN. On machines without a running server (CI / this dev box) we instead
+# Brief default is a reachable PostgreSQL 15+ at `postgresql:///featuregen_test`, read from
+# FEATUREGEN_TEST_DSN. On machines without a running server (CI / this dev box) we instead
 # launch an EPHEMERAL PostgreSQL cluster via pytest-postgresql, which boots a throwaway
 # cluster from the on-PATH `postgres` binary (PG 18 here, >= the 15 floor). Set
-# SP0_TEST_DSN to point the suite at an external server.
-_ENV_DSN = os.environ.get("SP0_TEST_DSN")
+# FEATUREGEN_TEST_DSN to point the suite at an external server.
+_ENV_DSN = os.environ.get("FEATUREGEN_TEST_DSN")
 
 # Ephemeral cluster process fixture. Defining it registers the fixture but does NOT
 # launch anything unless it is requested (only when _ENV_DSN is None, below).
@@ -43,10 +43,10 @@ def _dsn(request) -> str:
         admin_dsn = _conninfo(proc, "postgres")
         with psycopg.connect(admin_dsn, autocommit=True) as admin_conn:
             with admin_conn.cursor() as cur:
-                cur.execute("SELECT 1 FROM pg_database WHERE datname = %s", ("sp0_test",))
+                cur.execute("SELECT 1 FROM pg_database WHERE datname = %s", ("featuregen_test",))
                 if cur.fetchone() is None:
-                    cur.execute("CREATE DATABASE sp0_test")
-        dsn = _conninfo(proc, "sp0_test")
+                    cur.execute("CREATE DATABASE featuregen_test")
+        dsn = _conninfo(proc, "featuregen_test")
     with psycopg.connect(dsn) as setup_conn:
         apply_migrations(setup_conn)
     return dsn

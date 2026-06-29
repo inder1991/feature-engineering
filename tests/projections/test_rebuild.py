@@ -2,10 +2,10 @@ from __future__ import annotations
 
 from psycopg.rows import dict_row
 
-from sp0.contracts import IdentityEnvelope, NewEvent, ProvenanceEnvelope
-from sp0.events.registry import event_registry
-from sp0.events.store import append_event
-from sp0.projections.runner import rebuild_projection, run_projection
+from featuregen.contracts import IdentityEnvelope, NewEvent, ProvenanceEnvelope
+from featuregen.events.registry import event_registry
+from featuregen.events.store import append_event
+from featuregen.projections.runner import rebuild_projection, run_projection
 
 
 class SumProjection:

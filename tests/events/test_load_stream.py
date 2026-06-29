@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-from sp0.contracts import IdentityEnvelope, NewEvent, ProvenanceEnvelope
-from sp0.events.registry import (
+from featuregen.contracts import IdentityEnvelope, NewEvent, ProvenanceEnvelope
+from featuregen.events.registry import (
     event_registry,
     load_registry_snapshot,
     persist_registry_snapshot,
 )
-from sp0.events.store import append_event, load_stream
+from featuregen.events.store import append_event, load_stream
 
 
 def _new(run_id: str, type_: str, payload: dict) -> NewEvent:

@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import pytest
 
-from sp0.contracts import IdentityEnvelope, NewEvent, ProvenanceEnvelope
-from sp0.events.registry import event_registry
-from sp0.events.store import append_event
-from sp0.privacy.classification import InlinePIIError
+from featuregen.contracts import IdentityEnvelope, NewEvent, ProvenanceEnvelope
+from featuregen.events.registry import event_registry
+from featuregen.events.store import append_event
+from featuregen.privacy.classification import InlinePIIError
 
 
 def _idv() -> IdentityEnvelope:
@@ -42,7 +42,7 @@ def _register() -> None:
         "RUN_STARTED",
         1,
         {"type": "object", "additionalProperties": True},
-        owner="sp0",
+        owner="featuregen",
     )
 
 

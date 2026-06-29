@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from sp0.contracts import IdentityEnvelope, NewEvent, ProvenanceEnvelope
-from sp0.events.registry import event_registry
-from sp0.events.store import append_event
+from featuregen.contracts import IdentityEnvelope, NewEvent, ProvenanceEnvelope
+from featuregen.events.registry import event_registry
+from featuregen.events.store import append_event
 
 
 def _new(agg_id: str) -> NewEvent:

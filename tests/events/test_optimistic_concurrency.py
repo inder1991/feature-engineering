@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import pytest
 
-from sp0.contracts import ConcurrencyError, IdentityEnvelope, NewEvent, ProvenanceEnvelope
-from sp0.events.registry import event_registry
-from sp0.events.store import append_event
+from featuregen.contracts import ConcurrencyError, IdentityEnvelope, NewEvent, ProvenanceEnvelope
+from featuregen.events.registry import event_registry
+from featuregen.events.store import append_event
 
 
 def _new(run_id: str) -> NewEvent:
@@ -29,14 +29,14 @@ def _new(run_id: str) -> NewEvent:
 
 
 def test_stale_expected_version_raises_concurrency_error(conn):
-    event_registry().register_schema("RUN_STARTED", 1, {"type": "object"}, owner="sp0")
+    event_registry().register_schema("RUN_STARTED", 1, {"type": "object"}, owner="featuregen")
     append_event(conn, _new("run_x"), expected_version=0, table_version=1)
     with pytest.raises(ConcurrencyError):
         append_event(conn, _new("run_x"), expected_version=0, table_version=1)
 
 
 def test_ahead_of_head_expected_version_raises_concurrency_error(conn):
-    event_registry().register_schema("RUN_STARTED", 1, {"type": "object"}, owner="sp0")
+    event_registry().register_schema("RUN_STARTED", 1, {"type": "object"}, owner="featuregen")
     append_event(conn, _new("run_z"), expected_version=0, table_version=1)
     # expected_version GREATER than the current head (1) must NOT silently insert a
     # stream_version gap; it must raise ConcurrencyError.
@@ -45,7 +45,7 @@ def test_ahead_of_head_expected_version_raises_concurrency_error(conn):
 
 
 def test_connection_usable_after_conflict_and_correct_retry_succeeds(conn):
-    event_registry().register_schema("RUN_STARTED", 1, {"type": "object"}, owner="sp0")
+    event_registry().register_schema("RUN_STARTED", 1, {"type": "object"}, owner="featuregen")
     append_event(conn, _new("run_y"), expected_version=0, table_version=1)
     with pytest.raises(ConcurrencyError):
         append_event(conn, _new("run_y"), expected_version=0, table_version=1)

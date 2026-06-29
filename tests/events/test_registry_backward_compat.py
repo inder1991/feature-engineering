@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from sp0.events.registry import is_backward_compatible
+from featuregen.events.registry import is_backward_compatible
 
 V1 = {
     "type": "object",
@@ -70,8 +70,8 @@ def test_removed_enum_value_is_breaking():
 # ── assert_evolution_complete: §3.3 breaking-bump => mandatory upcaster (active enforcement)
 import pytest  # noqa: E402
 
-from sp0.contracts import SchemaValidationError  # noqa: E402
-from sp0.events.registry import EventSchemaRegistry  # noqa: E402
+from featuregen.contracts import SchemaValidationError  # noqa: E402
+from featuregen.events.registry import EventSchemaRegistry  # noqa: E402
 
 _BREAKING_V2 = {
     "type": "object",
