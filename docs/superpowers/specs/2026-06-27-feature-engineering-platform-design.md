@@ -753,6 +753,23 @@ USEFULNESS-CHECKED  (needs data + labels — scoring, §14.3)
 
 A feature may be **DESIGN-CHECKED** with only schema, column names, and definitions — a real and valuable result (it is sensible, safe, and well-formed) — but it is **not production-eligible** until it reaches **USEFULNESS-CHECKED**. The stamp is a registry attribute carried with the feature version, and the **hard approval gate (§10) requires USEFULNESS-CHECKED for production promotion.**
 
+### 14.6 Symbolic feature synthesis (optional, interpretable parametric features)
+
+A third, **optional** generation mode (adapting LLM-SR, arXiv:2404.18400) for use-cases where an **interpretable, defensible feature** matters more than raw flexibility. Instead of proposing separate transforms, it proposes a **closed-form formula skeleton** — e.g. `w1·utilization_trend + w2·delinquency_recency + w3·min_payment_behavior` — and **fits the coefficients to a point-in-time-correct sample**, yielding one explainable composite feature (a scorecard-style index).
+
+**Why it earns its place:** closed-form, weighted features are inherently explainable, which is exactly what **adverse-action, fair-lending, and model-risk** require — so this mode produces features high-governance banking models can actually *use*, not merely features that score well.
+
+**Scope (Domain-Catalog-gated).** Enabled only for use-cases with `symbolic_synthesis: true` — initially the high-explainability domains (`credit_origination`, `behavioral_credit_scoring`, `risk_based_pricing`, `ifrs9_ecl`). Every other domain keeps template/transform generation (§14.2); widening is a catalog decision, not a code change.
+
+**Fits the existing pipeline.** Output is a **parametric Feature Plan** (skeleton + fitted coefficients) → a Path-1 DSL expression once a parametric-expression operation is registered; it then flows through the same validate → sandbox → score → approve → register path. The **fitted coefficients, fit dataset, and random seed are frozen into the immutable feature version + provenance (§8)** — so the feature is exactly reproducible for a regulator.
+
+**Extra rigor (fitting parameters is a mini training step):**
+- **Overfitting** — the parameter fit *and* the candidate search compound the multiple-comparisons risk → the **search-overfitting guard (§14.4) applies, strengthened with a nested holdout** for the fit.
+- **Leakage** — coefficients are fit **only on a point-in-time-correct sample** (availability-time overlay, §6).
+- **Feature-vs-model line** — a fitted feature is closer to a *model*; the Domain Catalog may **raise its `risk_tier`** and route it through **model-risk (MRM) treatment** (§11.1), not just feature governance.
+
+**Authority unchanged (§2.1):** the engine *proposes and fits*; deterministic gates validate; the human approves with the formula + coefficients surfaced; the registry governs.
+
 ---
 
 ## 15. The Domain / Use-Case Catalog
@@ -779,6 +796,7 @@ Each `use_case` is a governed record:
   "latency": "batch",
   "owner": "marketing-analytics",
   "compliance_confirmed": true,
+  "symbolic_synthesis": false,
   "version": 3
 }
 ```

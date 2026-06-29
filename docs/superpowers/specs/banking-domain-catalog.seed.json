@@ -1,5 +1,5 @@
 {
-  "$schema_note": "Banking Domain/Use-Case Catalog seed (architecture §15). These are the KNOWN/seed banking use-cases that get the fast path (ready templates + governance defaults). The platform is banking-SCOPED but OPEN within banking: ANY banking feature may be built — a NEW banking use-case is ONBOARDED and added here (§15.6), never rejected. Only NON-banking requests (and out-of-scope latency or per-use-case policy violations) are rejected. compliance_confirmed=false everywhere: the registered domain/risk owner confirms domain facts and Compliance confirms policy facts before a use_case is production-eligible. Values here are proposed defaults to be ratified, not authority.",
+  "$schema_note": "Banking Domain/Use-Case Catalog seed (architecture §15). These are the KNOWN/seed banking use-cases that get the fast path (ready templates + governance defaults). The platform is banking-SCOPED but OPEN within banking: ANY banking feature may be built — a NEW banking use-case is ONBOARDED and added here (§15.6), never rejected. Only NON-banking requests (and out-of-scope latency or per-use-case policy violations) are rejected. compliance_confirmed=false everywhere: the registered domain/risk owner confirms domain facts and Compliance confirms policy facts before a use_case is production-eligible. Values here are proposed defaults to be ratified, not authority. The optional 'symbolic_synthesis' flag (true on high-explainability use-cases like credit/pricing) enables the interpretable parametric-feature generation mode (architecture §14.6); absent/false = template generation only.",
   "catalog_version": "0.1.0-draft",
   "data_classes": [
     "transactions", "balances", "salary", "payments", "product_holdings",
@@ -55,6 +55,7 @@
     {
       "use_case": "credit_origination", "domain": "retail_credit", "entity": "application", "status": "active",
       "target": { "name": "default_12m", "definition": "90+ days past due within 12 months of account opening" },
+      "symbolic_synthesis": true,
       "primary_metric": "ks",
       "feature_templates": ["credit_utilization", "delinquency_history_count", "income_stability", "debt_to_income", "bureau_inquiry_velocity"],
       "allowed_data_classes": ["applications", "credit_bureau", "transactions", "balances", "salary", "product_holdings"],
@@ -66,6 +67,7 @@
     {
       "use_case": "behavioral_credit_scoring", "domain": "retail_credit", "entity": "customer", "status": "active",
       "target": { "name": "default_12m", "definition": "90+ days past due within 12 months after as_of_date" },
+      "symbolic_synthesis": true,
       "primary_metric": "ks",
       "feature_templates": ["credit_utilization_trend", "delinquency_recency", "min_payment_behavior", "balance_volatility", "salary_irregularity"],
       "allowed_data_classes": ["transactions", "balances", "salary", "payments", "product_holdings", "credit_bureau"],
@@ -88,6 +90,7 @@
     {
       "use_case": "ifrs9_ecl", "domain": "retail_credit", "entity": "exposure", "status": "active",
       "target": { "name": "stage_migration", "definition": "significant increase in credit risk (stage 1->2/3) over the horizon" },
+      "symbolic_synthesis": true,
       "primary_metric": "auc",
       "feature_templates": ["pd_trend", "delinquency_depth", "utilization_trend", "forbearance_flag_history"],
       "allowed_data_classes": ["transactions", "balances", "payments", "credit_bureau", "product_holdings"],
@@ -99,6 +102,7 @@
     {
       "use_case": "risk_based_pricing", "domain": "pricing", "entity": "application", "status": "active",
       "target": { "name": "expected_loss_band", "definition": "realized 24m loss band given offered terms" },
+      "symbolic_synthesis": true,
       "primary_metric": "normalized_rmse",
       "feature_templates": ["pd_estimate", "lgd_proxy", "elasticity_signal", "relationship_depth"],
       "allowed_data_classes": ["applications", "credit_bureau", "transactions", "balances", "product_holdings"],

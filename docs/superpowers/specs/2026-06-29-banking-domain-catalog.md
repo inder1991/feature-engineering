@@ -123,6 +123,7 @@ The platform builds **any banking feature**. It refuses only what falls **outsid
 | `target`, `primary_metric` | Model-free scoring (Layer 6, §14.3) |
 | `risk_tier`, `regulatory`, use-case scoping | Feature-version governance attributes + activation guards (Layer 7) |
 | `latency` | Batch-only scope check (§1.4) |
+| `symbolic_synthesis` | Enables the optional **interpretable parametric-feature** generation mode (§14.6) — on for credit/pricing only; absent/false = template generation |
 | `entity` | Entity/grain resolver (Layer 3) |
 
 When SP-9 (governance) is built, it loads `banking-domain-catalog.seed.json` as the authoritative use-case registry; until then this doc + seed are the design-time source of truth.
