@@ -115,10 +115,10 @@ fact_key = sha256_hex(normalize(
     schema, table, column?,
     fact_type,        # see §3.3
     use_case?,        # REQUIRED for policy_tag, PROHIBITED for data facts (validated, §3.3)
-    relation?))       # RELATION facts (approved_join): the normalized tuple
-                      #   (from_ref, to_ref, cardinality, sorted [(from_col, to_col), …] PAIRS)
-                      #   — column pairs are sorted as units, never the two column lists
-                      #   independently (which would destroy pair semantics); distinct joins → distinct keys
+    relation?))       # RELATION facts (approved_join): derived from a structured ApprovedJoinRef (§4) —
+                      #   (from_ref, to_ref, cardinality, sorted [(from_col, to_col), …] PAIRS);
+                      #   pairs sorted as units, never the two column lists independently (which would
+                      #   destroy pair semantics); distinct joins → distinct keys
 object_ref = "core.transactions.posted_at"   # human-readable, carried alongside (display/audit)
 ```
 `fact_key` drives OCC, the projection key, and confirmation routing; `object_ref` is for humans.
@@ -172,11 +172,11 @@ DRAFT ─ confirm ─▶ VERIFIED ─ expiry ─▶ REVERIFY ─ confirm ─▶ 
 ```
 - **Canonical status values:** `DRAFT, PARTIALLY_CONFIRMED, VERIFIED, REJECTED, STALE, REVERIFY` (display `REVERIFY` as `RE-VERIFY`). `PARTIALLY_CONFIRMED` applies **only** to two-party facts (`approved_join`).
 - **Two-party facts (`approved_join`):** `DRAFT → (first owner confirms) PARTIALLY_CONFIRMED → (second owner confirms) VERIFIED`; either owner's rejection → REJECTED. Single-authority facts go `DRAFT → VERIFIED` directly.
-- **Rejecting a re-verification:** `REVERIFY → REJECTED` and `STALE → REJECTED` are valid — rejecting a fact under re-verification **retires** the prior value (it is *not* re-affirmed); the merged-view then returns non-VERIFIED, so consumers fail closed. `prior_value` stays visible as history (§7.1).
+- **Rejecting a re-verification:** `REVERIFY → REJECTED` and `STALE → REJECTED` are valid — rejecting a fact under re-verification **retires** the prior value (it is *not* re-affirmed); the merged-view then returns non-VERIFIED, so consumers fail closed. `prior_value` stays visible as history (§7.1). The **retired value's `proposal_fingerprint` is recorded as REJECTED**, so the profiler cannot immediately re-propose the same retired value (§5 dedup).
 - **REJECTED is sticky by `proposal_fingerprint`:** dedup keys on a **stable fingerprint = hash(canonical `proposed_value` + profiler version + thresholds)** — *not* the evidence id/timestamp (which change every profiling run). A rejected candidate therefore cannot return merely because a new snapshot produced fresh evidence; only a **materially different proposed value** yields a new DRAFT.
 - **Proactive (human-entered) facts (P1):** not everything is profiler-inferable, and §6 of the parent allows proactive verified entry. Two supported paths:
   - **Propose-then-confirm:** a human submits `FACT_PROPOSED(proposed_by=human)`, then the resolved authority confirms (normal gate).
-  - **Direct entry:** when the **acting principal *is* the resolved authority** for that fact (data owner for a data fact; Compliance for a policy fact), the command may emit `FACT_PROPOSED`+`FACT_CONFIRMED` atomically (a self-confirmation that still records actor + provenance and respects SoD — a data owner can never self-confirm a `policy_tag`). **This self-confirm is an explicit, audited exception to four-eyes (§6.5):** permitted only for a **human resolved authority** asserting an owner-known fact; a **service/profiler proposal can never be self-confirmed** — four-eyes always applies there.
+  - **Direct entry:** when the **acting principal *is* the resolved authority** for that fact (data owner for a data fact; Compliance for a policy fact), the command may emit `FACT_PROPOSED`+`FACT_CONFIRMED` atomically (a self-confirmation that still records actor + provenance and respects SoD — a data owner can never self-confirm a `policy_tag`). **This self-confirm is an explicit, audited exception to four-eyes (§6.5):** permitted only for a **human resolved authority** asserting an owner-known fact; a **service/profiler proposal can never be self-confirmed** — four-eyes always applies there. (For `approved_join`, direct entry is allowed **only when one principal owns both sides**, §6.4.)
 
 **Lifecycle wiring (P1).** The overlay lifecycle is pinned to an `OVERLAY_TABLE_VERSION` constant, stamped on
 every `FACT_*` event (SP-0 events require `table_version`). The projection stores the current `status` **and**
@@ -208,12 +208,24 @@ VERIFIED-fact projection above stays lean for the merged-view hot path; this one
 @dataclass(frozen=True)
 class CatalogObjectRef:
     catalog_source: str          # e.g. "pg:core"
-    object_kind: str             # "table" | "column" | "relation"
+    object_kind: str             # "table" | "column"
     schema: str
     table: str
     column: str | None = None
-    relation: str | None = None
     # fact_key(ref, fact_type, use_case?) and the display object_ref are derived from this.
+
+@dataclass(frozen=True)
+class ColumnPair:
+    from_col: str
+    to_col: str
+
+@dataclass(frozen=True)
+class ApprovedJoinRef:                    # relation ref for approved_join facts
+    from_ref: CatalogObjectRef           # source table
+    to_ref: CatalogObjectRef             # target table
+    column_pairs: tuple[ColumnPair, ...] # ordered (from_col, to_col) pairs
+    cardinality: str                     # "1:1" | "1:N" | "N:1"
+    # the join fact_key derives deterministically from (from_ref, to_ref, sorted column_pairs, cardinality).
 
 class CatalogAdapter(Protocol):
     def list_objects(self) -> Iterable[CatalogObject]: ...                    # tables/columns/types
@@ -284,8 +296,9 @@ The profiler runs only under bounded, auditable access:
    - **Policy facts (`policy_tag`)** → **Compliance**, *always*; a data owner attempting to confirm a policy fact
      is rejected by SP-0's structural SoD.
 2. **Confirm** → `FACT_CONFIRMED` (VERIFIED, with `expires_at`); **reject** → `FACT_REJECTED`.
-3. **Confirmation race semantics (P1):** a confirm/reject command carries the **`draft_event_id`** (or
-   `expected_stream_version`) **and the gate `task_version`**. The command is **rejected** if the fact has
+3. **Confirmation race semantics (P1):** a confirm/reject command carries the **`target_event_id`** (the
+   DRAFT's id for a first confirm, or the `confirmed_event_id` under re-verification — §2.2) **and the gate
+   `task_version`**. The command is **rejected** if the fact has
    advanced (a newer draft exists), expired, or been staled since the task was raised — i.e. a CAS on the
    stream (SP-0 OCC) plus task-version staleness. Stale confirmations never apply silently.
 4. Unauthorized attempts are denied and recorded in the **security-audit stream** (SP-0).
@@ -298,7 +311,9 @@ the **second** owner's confirm moves it `PARTIALLY_CONFIRMED → VERIFIED` (`FAC
 rejection → REJECTED. An unknown owner on either side routes that side to the governance queue (§6 step 1).
 **Both approvers are recorded** on the verified fact. **If the source and `to_ref` owners are the same principal,
 a single confirmation verifies the join** (`DRAFT → VERIFIED` directly), recorded as both roles satisfied by
-that principal — no artificial second task.
+that principal — no artificial second task. **Direct entry (§3.4 self-confirm) for an `approved_join` is
+permitted only when that same principal owns both sides;** a **dual-owner join cannot be directly
+self-confirmed** — it must go through the two-task confirmation flow.
 
 ### 6.5 Command authorization (P1)
 All commands run through SP-0 authz; the gate / SoD vocabulary:
@@ -359,9 +374,10 @@ the deferred end-user `resolve_fact` authz, so confirmation is implementable now
   and the renamed object is onboarded afresh (no identity is carried across a rename). A stable native id
   (`oid`) is used **only to recognize** that a change was a rename (vs an unrelated drop+add) so the operator
   can be told *"looks renamed from X"* — it does **not** preserve fact identity. Detected changes (add/drop/rename/type-change) emit an inbound signal → `FACT_STALED` for the
-  affected object's facts **(targeting the current `confirmed_event_id`; CAS no-op if already advanced)**; STALE **opens a re-verify task** (§6) for the resolved authority (carrying `prior_value` + target id), and owners are notified. A **reverse-reference index** maps each object/column to the `approved_join` facts that reference it
-  (source *or* `to_ref`), so a change to *either* side stales the dependent joins — not only facts on the
-  changed object itself. (The richer dependent-feature Change-Impact Analyzer is SP-10.)
+  affected object's facts **(targeting the current `confirmed_event_id`; CAS no-op if already advanced)**; STALE **opens a re-verify task** (§6) for the resolved authority (carrying `prior_value` + target id), and owners are notified. A **general fact-dependency index** records, for *every* fact, the table/column objects its value references —
+  extracted from the value (`grain.columns`, `availability_time.column`, `scd_effective_dating.valid_from`/
+  `valid_to`, and both sides of an `approved_join`). A drop/rename/type-change to *any* referenced object stales
+  the dependent fact(s) — not only facts whose own keyed object changed. (The richer dependent-feature Change-Impact Analyzer is SP-10.)
 
 ## 9. Error handling & concurrency
 
@@ -372,7 +388,7 @@ the deferred end-user `resolve_fact` authz, so confirmation is implementable now
 
 ## 10. Interfaces SP-1 exposes (for SP-2+ consumers)
 - `resolve_fact(ref: CatalogObjectRef, fact_type, use_case?) -> ResolvedFact` — the read path Layer 3 grounding uses (service-internal, §7.2).
-- Commands (all take a `CatalogObjectRef`): `propose_fact`, `confirm_fact`, `reject_fact`, `enter_fact` (proactive/direct, §3.4), `run_profiler(ref)`.
+- Commands take a `CatalogObjectRef` (or an **`ApprovedJoinRef`** for `approved_join`, §4): `propose_fact`, `confirm_fact`, `reject_fact`, `enter_fact` (proactive/direct, §3.4), `run_profiler(ref)`.
 - The `CatalogAdapter` protocol (deployments bind their real catalog).
 
 ## 11. What SP-1 deliberately does NOT do
@@ -380,7 +396,7 @@ LLM-suggestion / lazy-during-build proposing (SP-2) · console UI (frontend) · 
 
 ## 12. Testing
 - **Migration (P0):** `overlay_fact` appends succeed after the CHECK migration; existing request/feature/run appends + consistency CHECK still hold; **an `overlay_fact` append with a non-null `request_id`/`feature_id`/`run_id` is rejected** by the tightened constraint; the `overlay_lifecycle_table` loads via the extended transition engine; OCC on `fact_key`.
-- **SP-0 extensions (P1):** an overlay confirmation task opens with `fact_key`/`draft_event_id`/`evidence_ref` and an `OVERLAY_*` gate; `_task_aggregate` maps a `fact_key` task → `overlay_fact`; the outbox partitions `overlay:{fact_key}`; an `overlay_expiry` timer fires `FACT_EXPIRED`.
+- **SP-0 extensions (P1):** an overlay confirmation task opens with `fact_key`/`draft_event_id`/`target_event_id`/`evidence_ref` and an `OVERLAY_*` gate; `_task_aggregate` maps a `fact_key` task → `overlay_fact`; the outbox partitions `overlay:{fact_key}`; an `overlay_expiry` timer fires `FACT_EXPIRED`.
 - **Self-describing events / rebuild (P1):** the projection (`object_ref`/`fact_type`/`use_case`/`status`) rebuilds purely from the event stream (FACT_PROPOSED carries them); the transition engine **rejects an illegal trigger before append** (lifecycle wiring, `OVERLAY_TABLE_VERSION` stamped).
 - **Command authz (P1):** each command's actor/SoD enforced — service-attested `propose_fact`/`run_profiler`; human-only confirm/reject; proposer ≠ confirmer; **wrong-role denied → security-audit**; `get_task_proposal` returns proposal+evidence to the **assignee** and denies others.
 - **Value schemas (P1):** each fact type validates its value; malformed value rejected at append; **`policy_tag` requires `use_case`, data facts reject `use_case`**; **`approved_join` key uses ordered `(from,to)` column pairs** (independent re-sorting can't alias two different joins).
@@ -389,7 +405,7 @@ LLM-suggestion / lazy-during-build proposing (SP-2) · console UI (frontend) · 
 - **Lifecycle:** DRAFT→VERIFIED→EXPIRED→REVERIFY→VERIFIED · DRAFT→REJECTED · VERIFIED→STALE→VERIFIED · profiler **does not re-propose a REJECTED candidate even with fresh evidence** (dedup by `proposal_fingerprint`) · **EXPIRED/STALE opens a re-verify task** (`prior_value` + target `confirmed_event_id`) · **reject under REVERIFY/STALE → REJECTED** (prior value retired).
 - **Evidence (P1):** evidence record is immutable; `evidence_ref` resolves; **no raw values**; provenance present.
 - **Profiler (P1):** grain/availability-time inference correctness; **safety limits honored** (read-only role, allowlist, aggregate-only, timeout, max columns/combinations, sampling threshold).
-- **Confirmation race / lifecycle CAS (P1):** stale confirmation after a newer draft is **rejected**; **a stale expiry timer or late stale-signal is a no-op when a newer `FACT_CONFIRMED` exists**; concurrent confirm/reject.
+- **Confirmation race / lifecycle CAS (P1):** confirm/reject CAS on **`target_event_id`** — stale confirmation after a newer draft is **rejected**; a re-verify confirm targeting a superseded `confirmed_event_id` is **rejected**; **a stale expiry timer or late stale-signal is a no-op when a newer `FACT_CONFIRMED` exists**; concurrent confirm/reject.
 - **Freshness/change (P2):** timer expiry → REVERIFY; fingerprint diff (drop/type-change) → STALE; **a rename yields a new `fact_key` and STALEs the old fact** (`oid` only labels it as a rename) · **a change to a join's source *or* target stales it** (reverse-reference index).
 - **Read posture (P2):** `resolve_fact` is reachable service-internally; (human-facing authz is out of scope, asserted by test doc).
 - **Adapter:** `PostgresCatalog` against real PG (`information_schema` + `pg_catalog` `oid`); per-fact `authoritative` honored.
