@@ -131,7 +131,7 @@ shape, merged-view consumers, and confirmation editing all share one definition.
 *Structural* catalog facts — object existence, column list, column type — are **not** overlay fact types;
 they are fields of `CatalogObject` (via `list_objects`), consumed directly by the profiler and grounding.
 A catalog is *authoritative for an ML fact* only when it genuinely records one (e.g. a governance catalog
-holding `policy_tag`/PII or `availability_time`); `InformationSchemaCatalog` records none of the five, so
+holding `policy_tag`/PII or `availability_time`); `PostgresCatalog` records none of the five, so
 its `get_fact` returns `None` for all of them while still supplying structural metadata via `CatalogObject`.
 
 ### 3.4 Lifecycle (with REJECTED and proactive entry)
