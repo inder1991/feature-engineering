@@ -56,7 +56,8 @@ Seven layers: **0** metadata foundation (catalog + overlay + Domain Catalog) · 
 lifecycle.
 
 Read the full design and decisions:
-- **[Reference architecture →](docs/architecture/2026-06-27-feature-engineering-platform-design.md)**
+- **[Reference architecture & end-to-end flow →](docs/architecture/2026-06-29-reference-architecture.md)** — start here: diagrams, the agentic model, the complete flow.
+- **[Full design spec →](docs/architecture/2026-06-27-feature-engineering-platform-design.md)** — detailed design (16 sections).
 - **[Build roadmap →](docs/architecture/2026-06-27-feature-engineering-platform-roadmap.md)**
 - **[SP-0 Foundations spec →](docs/architecture/2026-06-27-sp0-foundations-design.md)**
 - **[SP-1 Metadata Overlay spec →](docs/architecture/2026-06-29-sp1-metadata-overlay-design.md)**
