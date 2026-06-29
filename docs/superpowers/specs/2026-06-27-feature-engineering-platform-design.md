@@ -707,6 +707,7 @@ What keeps this safe and human-led:
 - **Proposes, never approves.** Candidates flow through the normal pipeline; the human confirms at Gate #1 and approves at Gate #2.
 - **Attempt memory + diversity.** The platform keeps a persistent memory of *every* attempt — definition, score, and (for rejects) the reason — and uses it to bias future suggestions and avoid re-proposing dead ends. To avoid converging prematurely on one mediocre idea, it keeps several diverse candidate lines alive in parallel (the "islands" pattern). This upgrades the duplication check (§7.5) and the harvest loop (§5.8) from static dedup into an active learning memory.
 - **Fast discard.** Candidates exceeding configured runtime/memory caps are dropped immediately during exploration, before consuming a full sandbox/evaluation cycle.
+- **Reason → readable rules → code (FeatLLM-style).** The engine first emits **human-readable conditions, each with a one-line causal rationale** (e.g. *"Glucose ≥ 140 — sustained high blood glucose indicates diabetes"*), and only *then* compiles them to SQL/DSL — never code-first. The plain-English rules + rationale are **surfaced at Human Gate #1**, so the scientist/reviewer audits the *logic* before any code exists (reinforces the augmented review, §5.7).
 
 Each surviving candidate is **scored (§14.3)** and the scientist is shown ranked options with evidence — a confirmation, not a blind guess.
 
@@ -768,7 +769,19 @@ A third, **optional** generation mode (adapting LLM-SR, arXiv:2404.18400) for us
 - **Leakage** — coefficients are fit **only on a point-in-time-correct sample** (availability-time overlay, §6).
 - **Feature-vs-model line** — a fitted feature is closer to a *model*; the Domain Catalog may **raise its `risk_tier`** and route it through **model-risk (MRM) treatment** (§11.1), not just feature governance.
 
+**Preferred form for fair-lending-sensitive use-cases — the monotonic scorecard (FeatLLM-style).** For credit/pricing the default is a **scorecard**: bin each input (Weight-of-Evidence style) into conditions, then combine them with **non-negative (monotonic) weights** so each condition can only *add* evidence in one direction. This is the most regulator-defensible form — **monotonicity is often a fair-lending expectation**, and the points are directly explainable in an adverse-action notice. Sign-unconstrained coefficients are permitted only where monotonicity is not required.
+
 **Authority unchanged (§2.1):** the engine *proposes and fits*; deterministic gates validate; the human approves with the formula + coefficients surfaced; the registry governs.
+
+### 14.7 Few-shot / low-label generation (cold-start)
+
+Model-free scoring (§14.3) assumes labels exist, but many banking use-cases are **label-scarce at first** — rare positives (fraud, AML SARs) or a brand-new product with few outcomes. For these the platform engages a **few-shot mode** (adapting FeatLLM, NeurIPS 2024): generation leans on the **LLM's banking priors + a handful of in-context labeled examples + the Domain Catalog templates** to propose sensible candidate features even when there isn't enough data for a stable IV score.
+
+- **Auto-engaged**, not a per-use-case flag: when the labeled sample for a use-case is below a configured threshold, generation switches to the few-shot path.
+- **Honest stamping (§14.5):** with few labels a feature can reach **Design-checked / Data-checked** but **not Usefulness-checked** — it is *not* production-eligible until labels accumulate and it clears IV + the overfitting guard (§14.4). The platform never fabricates a usefulness score from a tiny sample.
+- **Robustness:** ensemble several diverse rule-sets over feature/sample subsets (the islands pattern, §14.2); keep only those that pass the sandbox.
+
+This lets a cold-start use-case begin producing reviewed, governed *candidate* features immediately and graduate to production as data arrives — instead of sitting idle waiting for labels.
 
 ---
 
