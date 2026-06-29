@@ -696,6 +696,7 @@ def propose_fact(conn: DbConn, cmd: Command) -> CommandResult:
                 allowed_responses=("confirm", "reject"),
                 fact_key=key,
                 draft_event_id=draft.event_id,
+                target_event_id=draft.event_id,
                 evidence_ref=evidence_ref,
             ),
             cmd.actor,
@@ -968,6 +969,11 @@ def schedule_expiry(
 
 ```python
 def confirm_fact(conn: DbConn, cmd: Command) -> CommandResult:
+    if cmd.actor.actor_kind != "human":
+        return CommandResult(
+            accepted=False, aggregate_id=cmd.aggregate_id or "",
+            denied_reason="confirm_fact requires a human authority",
+        )
     adapter = current_catalog_adapter()
     args = cmd.args
     ref = args["ref"]
@@ -1034,6 +1040,11 @@ def confirm_fact(conn: DbConn, cmd: Command) -> CommandResult:
 
 
 def reject_fact(conn: DbConn, cmd: Command) -> CommandResult:
+    if cmd.actor.actor_kind != "human":
+        return CommandResult(
+            accepted=False, aggregate_id=cmd.aggregate_id or "",
+            denied_reason="reject_fact requires a human authority",
+        )
     adapter = current_catalog_adapter()
     args = cmd.args
     ref = args["ref"]
@@ -1467,6 +1478,32 @@ def test_either_owner_reject_marks_rejected(db, catalog):
 and add the helper at module scope:
 
 ```python
+def _join_side(authority, subject) -> str:
+    """The join side (`from`/`to`) a confirmer covers, derived from the side-ordered
+    `authority.subjects` (None marks an unknown/governance side) — NOT confirmation order."""
+    subs = list(authority.subjects)  # ordered (from, to)
+    if subs and subs[0] == subject:
+        return "from"
+    if len(subs) > 1 and subs[1] == subject:
+        return "to"
+    if subs and subs[0] is None:        # a platform-admin covers the unknown side
+        return "from"
+    if len(subs) > 1 and subs[1] is None:
+        return "to"
+    return "from"
+
+
+def _join_confirmers(authority, first_subject, second_subject) -> list:
+    first_side = _join_side(authority, first_subject)
+    second_side = _join_side(authority, second_subject)
+    if first_side == second_side:       # both governance/unknown — disambiguate by order
+        second_side = "to" if first_side == "from" else "from"
+    return [
+        {"subject": first_subject, "role": f"data_owner_{first_side}"},
+        {"subject": second_subject, "role": f"data_owner_{second_side}"},
+    ]
+
+
 def _confirm_approved_join(conn, cmd, key, stream, state, authority):
     actor = cmd.actor
     owners = {s for s in authority.subjects if s}
@@ -1478,6 +1515,10 @@ def _confirm_approved_join(conn, cmd, key, stream, state, authority):
         return CommandResult(
             accepted=False, aggregate_id=key, denied_reason="actor is not an owner of either side of the join"
         )
+    if not proposer_ne_confirmer(stream, actor):
+        return CommandResult(
+            accepted=False, aggregate_id=key, denied_reason="proposer may not confirm (four-eyes, §6.5)"
+        )
     partial = [e for e in stream if e.type == "OVERLAY_FACT_PARTIALLY_CONFIRMED"]
     proposed = _latest_proposed(stream)
     if not partial:
@@ -1487,7 +1528,7 @@ def _confirm_approved_join(conn, cmd, key, stream, state, authority):
             type="OVERLAY_FACT_PARTIALLY_CONFIRMED",
             payload={
                 "by_owner": actor.subject,
-                "role": "data_owner",
+                "role": f"data_owner_{_join_side(authority, actor.subject)}",
                 "draft_event_id": state.draft_event_id,
             },
             actor=actor,
@@ -1528,10 +1569,7 @@ def _confirm_approved_join(conn, cmd, key, stream, state, authority):
         type="OVERLAY_FACT_CONFIRMED",
         payload={
             "value": value,
-            "confirmers": [
-                {"subject": first, "role": "data_owner_from"},
-                {"subject": actor.subject, "role": "data_owner_to"},
-            ],
+            "confirmers": _join_confirmers(authority, first, actor.subject),
             "expires_at": expires_at.isoformat(),
             "confirms_event_id": state.draft_event_id,
         },
