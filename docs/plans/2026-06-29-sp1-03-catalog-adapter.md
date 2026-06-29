@@ -224,7 +224,7 @@ Steps:
   class PostgresCatalog:  # CatalogAdapter
       def __init__(self, conn: DbConn, *, catalog_source: str = "pg:core",
                    schemas: tuple[str, ...] = ("public",)) -> None: ...
-      def list_objects(self) -> Iterable[CatalogObject]: ...      # tables (oid) + columns (data_type)
+      def list_objects(self) -> Iterable[CatalogObject]: ...      # tables (oid) + columns (data_type, "<table_oid>:<attnum>" native_oid)
       def get_fact(self, ref, fact_type, use_case=None) -> None:  # always None: records no ML facts
       def owner_of(self, ref) -> None:                            # always None: ownership not recorded
       def fingerprint(self) -> Mapping[str, CatalogObject]: ...   # object_ref -> CatalogObject (§8)
@@ -266,6 +266,14 @@ Steps:
       assert objs["public.overlay_cat_probe.posted_at"].data_type == "timestamp with time zone"
       assert objs["public.overlay_cat_probe.amount"].data_type == "numeric"
 
+      # A column's native_oid is the composite "<table_oid>:<attnum>" (overview pin 16) so the
+      # column has a stable identity that survives a rename (see the rename test below). The
+      # table_oid portion matches the owning table's native oid.
+      posted_native = objs["public.overlay_cat_probe.posted_at"].native_oid
+      assert posted_native is not None
+      tbl_oid, sep, attnum = posted_native.partition(":")
+      assert sep == ":" and tbl_oid == table_obj.native_oid and attnum.isdigit()
+
       # information_schema records NONE of the five ML fact types authoritatively.
       table_ref = CatalogObjectRef(
           catalog_source="pg:core", object_kind="table",
@@ -288,9 +296,40 @@ Steps:
       fp = cat.fingerprint()
       assert "public.overlay_cat_probe" in fp
       assert fp["public.overlay_cat_probe"].native_oid == table_obj.native_oid
+
+
+  def test_postgres_catalog_column_native_oid_is_stable_across_rename(db):
+      # A column's native_oid is "<table_oid>:<attnum>" (overview pin 16). pg_attribute.attnum is
+      # fixed at creation and not reused on rename, so the SAME column keeps the SAME native_oid
+      # after a RENAME COLUMN — letting change detection (Phase 7) track the rename instead of
+      # degrading it to a drop+add.
+      with db.cursor() as cur:
+          cur.execute(
+              "CREATE TABLE overlay_rename_probe ("
+              "  id bigint PRIMARY KEY,"
+              "  posted_at timestamptz NOT NULL"
+              ")"
+          )
+
+      cat = PostgresCatalog(db, catalog_source="pg:core", schemas=("public",))
+      before = {o.object_ref: o for o in cat.list_objects()}
+      native_before = before["public.overlay_rename_probe.posted_at"].native_oid
+      assert native_before is not None and ":" in native_before
+
+      with db.cursor() as cur:
+          cur.execute(
+              "ALTER TABLE overlay_rename_probe RENAME COLUMN posted_at TO event_time"
+          )
+
+      after = {o.object_ref: o for o in cat.list_objects()}
+      # The new name appears; the old name is gone.
+      assert "public.overlay_rename_probe.event_time" in after
+      assert "public.overlay_rename_probe.posted_at" not in after
+      # ...but the native_oid is unchanged: same column identity across the rename.
+      assert after["public.overlay_rename_probe.event_time"].native_oid == native_before
   ```
 
-- [ ] **Run it — expect failure.** `uv run pytest tests/featuregen/overlay/test_catalog.py::test_postgres_catalog_reads_structure_and_returns_no_ml_facts -v` — Expected: FAIL (`ImportError: cannot import name 'PostgresCatalog' from 'featuregen.overlay.catalog'`).
+- [ ] **Run it — expect failure.** `uv run pytest tests/featuregen/overlay/test_catalog.py -k postgres_catalog -v` — Expected: FAIL (`ImportError: cannot import name 'PostgresCatalog' from 'featuregen.overlay.catalog'`).
 
 - [ ] **Minimal implementation.** Add the imports and the `PostgresCatalog` class to `src/featuregen/overlay/catalog.py`. Imports near the top (alongside the existing ones):
   ```python
@@ -303,10 +342,13 @@ Steps:
   class PostgresCatalog:
       """Reference ``CatalogAdapter`` over a live PostgreSQL connection.
 
-      Structural metadata only: existence/columns/types from ``information_schema`` and the stable
-      native object id (``oid``) from ``pg_catalog`` (for rename detection, design §8). It records
-      NONE of the five ML fact types, so ``get_fact`` returns ``None`` for all of them and the
-      overlay owns those facts. ``owner_of`` returns ``None`` (ownership is not recorded here).
+      Structural metadata only: existence/columns/types from ``information_schema`` and stable
+      native object ids from ``pg_catalog`` (for rename detection, design §8 / overview pin 16) —
+      a table's ``native_oid`` is its ``pg_class.oid``; a column's ``native_oid`` is the composite
+      ``"<table_oid>:<attnum>"`` (``pg_attribute.attnum`` is not reused on rename, so column
+      identity survives renames). It records NONE of the five ML fact types, so ``get_fact``
+      returns ``None`` for all of them and the overlay owns those facts. ``owner_of`` returns
+      ``None`` (ownership is not recorded here).
       """
 
       def __init__(
@@ -354,14 +396,25 @@ Steps:
                           native_oid=row["oid"],
                       )
                   )
-              # Columns with their information_schema data types.
+              # Columns with their information_schema data types, plus a stable composite
+              # native_oid of "<table_oid>:<attnum>" (design §8, overview pin 16). attnum is
+              # assigned at column creation and is NOT reused on rename, so the column's identity
+              # survives a rename — letting change detection track renames instead of degrading
+              # them to drop/add. The table oid (pg_class.oid) and attnum (pg_attribute.attnum)
+              # come from pg_catalog; data_type stays from information_schema for stable spelling.
               cur.execute(
                   """
-                  SELECT table_schema AS sch, table_name AS tbl,
-                         column_name AS col, data_type AS dtype
-                  FROM information_schema.columns
-                  WHERE table_schema = ANY(%s)
-                  ORDER BY table_schema, table_name, ordinal_position
+                  SELECT isc.table_schema AS sch, isc.table_name AS tbl,
+                         isc.column_name AS col, isc.data_type AS dtype,
+                         c.oid::text AS table_oid, a.attnum AS attnum
+                  FROM information_schema.columns isc
+                  JOIN pg_catalog.pg_namespace n ON n.nspname = isc.table_schema
+                  JOIN pg_catalog.pg_class c
+                    ON c.relname = isc.table_name AND c.relnamespace = n.oid
+                  JOIN pg_catalog.pg_attribute a
+                    ON a.attrelid = c.oid AND a.attname = isc.column_name
+                  WHERE isc.table_schema = ANY(%s)
+                  ORDER BY isc.table_schema, isc.table_name, isc.ordinal_position
                   """,
                   (schemas,),
               )
@@ -381,7 +434,7 @@ Steps:
                           table=row["tbl"],
                           column=row["col"],
                           data_type=row["dtype"],
-                          native_oid=None,
+                          native_oid=f"{row['table_oid']}:{row['attnum']}",
                       )
                   )
           return objects
@@ -399,7 +452,7 @@ Steps:
           return {obj.object_ref: obj for obj in self.list_objects()}
   ```
 
-- [ ] **Run it — expect pass.** `uv run pytest tests/featuregen/overlay/test_catalog.py::test_postgres_catalog_reads_structure_and_returns_no_ml_facts -v` — Expected: PASS.
+- [ ] **Run it — expect pass.** `uv run pytest tests/featuregen/overlay/test_catalog.py -k postgres_catalog -v` — Expected: PASS (both the structure test and the rename-stability test).
 
 - [ ] **Run the whole catalog suite + lint.** `uv run pytest tests/featuregen/overlay/test_catalog.py -v && uv run ruff check src/featuregen/overlay/catalog.py` — Expected: both green (all catalog tests pass, no lint findings).
 

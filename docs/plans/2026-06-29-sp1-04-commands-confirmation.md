@@ -16,7 +16,7 @@ production wiring (`bootstrap.py`: `register_overlay` + `seed_overlay_authz`). I
 - Phase 1: `events`/`human_tasks` overlay columns; `GateTaskSpec.fact_key`/`.draft_event_id`/`.target_event_id`/`.evidence_ref`; `_task_aggregate` overlay arm; `open_task` threading those columns; `0507` `projection_checkpoints('overlay')` seed.
 - Phase 2: `overlay/identity.py` (`CatalogObjectRef`, `ApprovedJoinRef`, `ColumnPair`, `fact_key`, `display_object_ref`, `proposal_fingerprint`); `overlay/facts.py` (`validate_fact_value`, `FactValidationError`, `register_overlay_event_types`, the `OVERLAY_FACT_*` event schemas); `overlay/state.py` (`fold_overlay_state(stream) -> OverlayState` with `.status`, `.draft_event_id`, `.confirmed_event_id`); `overlay/store.py` (`append_overlay_event(...)`, `load_fact(conn, fact_key)`); `overlay/evidence.py` (`read_evidence`).
 - Phase 3: `overlay/catalog.py` (`CatalogAdapter` Protocol, `.owner_of`) **and the single-source adapter accessor `register_catalog_adapter(adapter)` / `current_catalog_adapter() -> CatalogAdapter`** (raises `RuntimeError` if none registered; there is no `register_catalog_adapter` variant). All overlay handlers obtain the adapter via `current_catalog_adapter()`.
-- Phase 7: `overlay/freshness.py::schedule_expiry(conn, fact_key, confirmed_event_id, expires_at: datetime) -> str` — arms the SP-0 `overlay_expiry` timer on the fact-key stream (idempotent). `confirm_fact`/`enter_fact`/`approved_join` confirmation call it after appending `OVERLAY_FACT_CONFIRMED` (decision 5). **Forward dependency:** Task 7.1 builds `freshness.py`; its `schedule_expiry` must exist before Task 4.3's confirm test goes green — implement Task 7.1's `schedule_expiry` (or pull a minimal copy forward) ahead of 4.3 if executing strictly phase-by-phase.
+- **`overlay/freshness.py::schedule_expiry(conn, fact_key, confirmed_event_id, expires_at: datetime) -> str` is CREATED IN THIS PHASE (Task 4.3, pin 10).** It arms the SP-0 `overlay_expiry` timer on the fact-key stream (idempotent). `confirm_fact`/`enter_fact`/the `approved_join` confirm path import it from `overlay.freshness` and call it after appending `OVERLAY_FACT_CONFIRMED` (decision 5). **No forward-phase dependency:** Task 4.3 creates `freshness.py` containing ONLY `schedule_expiry`; Phase 7 (Task 7.1) **extends the same file** with `fire_due_overlay_expiries`/`detect_catalog_changes`/`open_reverify_task`.
 - SP-0: `Command`/`CommandResult`/`DbConn`/`IdentityEnvelope`; `commands/api.py::execute_command`; `commands/registry.py::register_command`; `gates/tasks.py::open_task`/`cancel_task`; `authz/policy.py::seed_authz_policy`; `authz/authorizer.py::PolicyAuthorizer`; `commands/authz_seam.py::register_command_authorizer`; `identity/build.py::build_human_identity`/`build_service_identity`; `events/registry.py::event_registry`.
 
 ---
@@ -30,7 +30,7 @@ production wiring (`bootstrap.py`: `register_overlay` + `seed_overlay_authz`). I
 **Interfaces:**
 - Consumes: `featuregen.overlay.catalog.CatalogAdapter` (`.owner_of(ref) -> str | None`); `featuregen.overlay.identity.{CatalogObjectRef, ApprovedJoinRef, display_object_ref}`; `featuregen.contracts.{DbConn, IdentityEnvelope}`.
 - Produces:
-  - `Authority` (frozen/slots dataclass): `role: str`, `gate: str`, `subjects: tuple[str | None, ...]`, `governance_queue: bool`, `dual: bool = False`; property `eligible_assignees -> dict[str, str]`; **property `task_assignees -> tuple[dict[str, str], ...]`** — the per-side task plan (one `eligible_assignees` mapping per required confirmation; a known side → `{"role": "data_owner", "subject": <owner>}`, an unknown side → `{"role": "platform-admin"}`, deduped).
+  - `Authority` (frozen/slots dataclass): `role: str`, `gate: str`, `subjects: tuple[str | None, ...]`, `governance_queue: bool`, `dual: bool = False`; property `eligible_assignees -> dict[str, str]`; **property `task_assignees -> tuple[dict[str, str], ...]`** — the per-side task plan (one `eligible_assignees` mapping per required confirmation; a known side → `{"role": "data_owner", "subject": <owner>}`, an unknown side → `{"role": "platform-admin"}`, deduped). **This single per-side `task_assignees` is the authoritative source used by BOTH the initial proposal (Task 4.2 opens one task per entry) AND Phase 7's `open_reverify_task` (which reopens one re-verify task per entry, pin 19) — so the proposal and the re-verify reopen always target the same per-side assignees.**
   - `resolve_authority(conn, adapter, ref, fact_type) -> Authority` — data facts → data owner via `adapter.owner_of`; `policy_tag` → Compliance; unknown owner → governance-queue marker (`platform-admin`, never the submitter). **`approved_join` resolves authority PER SIDE** (`from_ref` owner, `to_ref` owner): two distinct owners → `dual` (two tasks); a **mixed** case (one known + one unknown) routes ONLY the unknown side to the platform-admin/governance queue and keeps the known side as its data owner — it is **never** collapsed to `role=platform-admin` with `subject=<known owner>` (decision 7).
   - `proposer_ne_confirmer(stream, actor) -> bool` — four-eyes SoD predicate (True ⇒ confirmer differs from the recorded proposer).
 
@@ -516,9 +516,9 @@ def test_mixed_owner_join_opens_owner_and_governance_tasks(db, catalog):
     catalog.set_owner(a, "user:alice")  # b's owner is unknown
     ref = ApprovedJoinRef(a, b, (ColumnPair("customer_id", "id"),), "N:1")
     value = {
-        "from_columns": ["customer_id"],
+        "from_ref": {"catalog_source": "pg:core", "object_kind": "table", "schema": "sales", "table": "orders", "column": None},
         "to_ref": {"catalog_source": "pg:core", "object_kind": "table", "schema": "sales", "table": "customers", "column": None},
-        "to_columns": ["id"],
+        "column_pairs": [{"from_col": "customer_id", "to_col": "id"}],
         "cardinality": "N:1",
     }
     res = propose_fact(db, _propose_cmd(ref=ref, fact_type="approved_join", value=value, key="j1"))
@@ -704,16 +704,18 @@ def propose_fact(conn: DbConn, cmd: Command) -> CommandResult:
     return CommandResult(accepted=True, aggregate_id=key, produced_event_ids=(draft.event_id,))
 
 
-_OVERLAY_CATALOG = {
-    "propose_fact": propose_fact,
-}
+# `_OVERLAY_CATALOG` is a TUPLE of (action, handler) pairs (pin 12 — mirrors SP-0's `_CATALOG`),
+# NOT a dict. Phase 6 appends `("run_profiler", _run_profiler)` to this tuple.
+_OVERLAY_CATALOG = (
+    ("propose_fact", propose_fact),
+)
 
 
 def register_overlay_commands() -> None:
     """Idempotent (decision 8): `register_command` raises on duplicate and the command registry
     persists across tests (the root harness resets only the event registry), so skip any action
     that is already registered instead of re-registering it."""
-    for action, handler in _OVERLAY_CATALOG.items():
+    for action, handler in _OVERLAY_CATALOG:
         try:
             get_command(action)
         except KeyError:
@@ -732,12 +734,17 @@ def register_overlay_commands() -> None:
 ### Task 4.3: `commands.py` — `confirm_fact` / `reject_fact` (CAS, authority, SoD, close task)
 
 **Files:**
+- **Create: `src/featuregen/overlay/freshness.py`** (pin 10 — created in THIS phase, containing ONLY `schedule_expiry`; Phase 7 extends the same file).
 - Modify: `src/featuregen/overlay/commands.py` (append two handlers; extend `_OVERLAY_CATALOG`)
 - Test: `tests/featuregen/overlay/test_confirm_reject.py`
+- Test: `tests/featuregen/overlay/test_freshness_schedule.py`
 
 **Interfaces:**
-- Consumes: everything from 4.2 plus `_cas_target`, `_actor_is_authority`, `_close_fact_tasks`, `proposer_ne_confirmer`; **`schedule_expiry` (Phase 7 `freshness.py`)**.
-- Produces: `confirm_fact(conn, cmd) -> CommandResult` (appends `OVERLAY_FACT_CONFIRMED`: `value`, `confirmers`, `expires_at`, `confirms_event_id`, then **calls `schedule_expiry(conn, fact_key, confirmed.event_id, expires_at)` to arm the `overlay_expiry` timer** — decision 5); `reject_fact(conn, cmd) -> CommandResult` (appends `OVERLAY_FACT_REJECTED`: `rejected_by`, `reason`, `target_event_id`, `retired_fingerprint`). Both CAS on `cmd.args["target_event_id"]`, enforce resolved authority (a `platform-admin` may confirm a governance-queue fact), and `cancel_task` the open task.
+- Consumes: everything from 4.2 plus `_cas_target`, `_actor_is_authority`, `_close_fact_tasks`, `proposer_ne_confirmer`; **`schedule_expiry` (created here in `overlay/freshness.py`, pin 10)**; SP-0 `runtime/timers.py::schedule_timer` + `contracts/envelopes.py::NewTimer`.
+- Produces:
+  - **`overlay/freshness.py::schedule_expiry(conn, fact_key, confirmed_event_id, expires_at) -> str`** — arms the SP-0 `overlay_expiry` timer (`aggregate="overlay_fact"`, `aggregate_id=fact_key`, `payload={"confirmed_event_id": …}`, idempotency-keyed on `(fact_key, confirmed_event_id)` so re-confirm is a no-op). This is the ONLY symbol in `freshness.py` for now; Phase 7 extends it with `fire_due_overlay_expiries`/`detect_catalog_changes`/`open_reverify_task`. NO forward-phase import.
+  - `confirm_fact(conn, cmd) -> CommandResult` — **validates the FINAL value with `validate_fact_value` (pin 17) BEFORE appending** (including any `args["value"]` override on a REVERIFY/STALE correction), appends `OVERLAY_FACT_CONFIRMED` (`value`, `confirmers`, `expires_at`, `confirms_event_id`), then **calls `schedule_expiry(conn, fact_key, confirmed.event_id, expires_at)`** (decision 5).
+  - `reject_fact(conn, cmd) -> CommandResult` (appends `OVERLAY_FACT_REJECTED`: `rejected_by`, `reason`, `target_event_id`, `retired_fingerprint`). Both CAS on `cmd.args["target_event_id"]`, enforce resolved authority (a `platform-admin` may confirm a governance-queue fact), and `cancel_task` the open task.
 
 - [ ] **Step 1 — write the failing test**
 
@@ -865,13 +872,100 @@ def test_data_owner_cannot_confirm_policy_tag(db, catalog):
         db, _confirm_cmd(fact_type="policy_tag", use_case="ads", target=draft, actor=COMPLIANCE, key="c2")
     )
     assert ok.accepted is True
+
+
+def test_confirm_with_malformed_override_value_is_rejected(db, catalog):
+    """pin 17: the confirmer may override the value (e.g. a REVERIFY/STALE correction), but the
+    FINAL value is validated with `validate_fact_value` BEFORE OVERLAY_FACT_CONFIRMED is appended —
+    a malformed override is rejected and nothing is persisted."""
+    catalog.set_owner(_orders(), "user:alice")
+    draft = _propose(db)  # valid grain proposed by BOB
+    bad = Command(
+        "confirm_fact",
+        "overlay_fact",
+        None,
+        # `is_unique` must be a bool and `columns` a non-empty list — this override is malformed.
+        {"ref": _orders(), "fact_type": "grain", "target_event_id": draft, "value": {"columns": [], "is_unique": "yes"}},
+        ALICE,
+        "c-bad",
+    )
+    res = confirm_fact(db, bad)
+    assert res.accepted is False
+    assert "invalid confirmed value" in res.denied_reason
+    key = fact_key(_orders(), "grain")
+    # still awaiting confirmation — no CONFIRMED event was written
+    assert fold_overlay_state(load_fact(db, key)).status == "DRAFT"
+```
+
+And a focused unit test for the newly-created `freshness.py::schedule_expiry`:
+
+```python
+# tests/featuregen/overlay/test_freshness_schedule.py
+from datetime import UTC, datetime, timedelta
+
+from psycopg.rows import dict_row
+
+from featuregen.overlay.freshness import schedule_expiry
+
+
+def test_schedule_expiry_arms_overlay_timer_and_is_idempotent(db):
+    fire_at = datetime.now(UTC) + timedelta(days=180)
+    tid = schedule_expiry(db, "fact_abc", "evt_confirmed_1", fire_at)
+    assert tid
+    # re-arming for the SAME (fact_key, confirmed_event_id) is a no-op (idempotency_key collision)
+    schedule_expiry(db, "fact_abc", "evt_confirmed_1", fire_at)
+    with db.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            "SELECT kind, aggregate, aggregate_id, payload FROM timers "
+            "WHERE kind='overlay_expiry' AND aggregate_id=%s",
+            ("fact_abc",),
+        )
+        rows = cur.fetchall()
+    assert len(rows) == 1
+    assert rows[0]["aggregate"] == "overlay_fact"
+    assert rows[0]["payload"]["confirmed_event_id"] == "evt_confirmed_1"
 ```
 
 - [ ] **Step 2 — run it (fails)**
   - `uv run pytest tests/featuregen/overlay/test_confirm_reject.py -v`
   - Expected: FAIL — `ImportError: cannot import name 'confirm_fact'`.
 
-- [ ] **Step 3 — minimal implementation** (append to `commands.py`, then extend `_OVERLAY_CATALOG`)
+- [ ] **Step 3a — create `freshness.py` with ONLY `schedule_expiry`** (pin 10 — created here, extended in Phase 7; no forward-phase import)
+
+```python
+# src/featuregen/overlay/freshness.py
+from __future__ import annotations
+
+from datetime import datetime
+
+from featuregen.contracts.db import DbConn
+from featuregen.contracts.envelopes import NewTimer
+from featuregen.runtime.timers import schedule_timer
+
+
+def schedule_expiry(
+    conn: DbConn, fact_key: str, confirmed_event_id: str, expires_at: datetime
+) -> str:
+    """Arm the SP-0 `overlay_expiry` timer on a confirmed fact's stream (decision 5). The timer
+    carries the `confirmed_event_id` in its payload so the Phase 7 `fire_due_overlay_expiries`
+    poller can CAS on it. Idempotency-keyed on `(fact_key, confirmed_event_id)` so re-confirming
+    the same event is a no-op. NOTE: this is the ONLY symbol in `freshness.py` for now — Phase 7
+    (Task 7.1) extends THIS file with `fire_due_overlay_expiries`/`detect_catalog_changes`/
+    `open_reverify_task`."""
+    return schedule_timer(
+        conn,
+        "overlay_fact",
+        fact_key,
+        NewTimer(
+            kind="overlay_expiry",
+            fire_at=expires_at,
+            idempotency_key=f"overlay_expiry:{fact_key}:{confirmed_event_id}",
+            payload={"confirmed_event_id": confirmed_event_id},
+        ),
+    )
+```
+
+- [ ] **Step 3b — minimal implementation** (append to `commands.py`, then extend `_OVERLAY_CATALOG`)
 
 ```python
 def confirm_fact(conn: DbConn, cmd: Command) -> CommandResult:
@@ -907,7 +1001,16 @@ def confirm_fact(conn: DbConn, cmd: Command) -> CommandResult:
             accepted=False, aggregate_id=key, denied_reason="four-eyes: a proposer may not confirm the same fact"
         )
     proposed = _latest_proposed(stream)
+    # The confirmer may override the value on a REVERIFY/STALE correction. Validate the FINAL value
+    # (override or original) BEFORE appending OVERLAY_FACT_CONFIRMED (pin 17) so a malformed
+    # correction can never be persisted as a confirmed fact.
     value = args.get("value", proposed.payload["proposed_value"])
+    try:
+        validate_fact_value(fact_type, value, use_case=use_case)
+    except FactValidationError as exc:
+        return CommandResult(
+            accepted=False, aggregate_id=key, denied_reason=f"invalid confirmed value: {exc}"
+        )
     role = "compliance" if fact_type == "policy_tag" else "data_owner"
     expires_at = datetime.now(UTC) + _DEFAULT_TTL
     confirmed = append_overlay_event(
@@ -923,7 +1026,8 @@ def confirm_fact(conn: DbConn, cmd: Command) -> CommandResult:
         actor=cmd.actor,
         caused_by=args["target_event_id"],
     )
-    # Arm the SP-0 overlay_expiry timer on this fact-key stream (decision 5; freshness.py is Phase 7).
+    # Arm the SP-0 overlay_expiry timer on this fact-key stream (decision 5; freshness.py is
+    # created in this phase, Task 4.3, pin 10).
     schedule_expiry(conn, key, confirmed.event_id, expires_at)
     _close_fact_tasks(conn, key, reason="fact confirmed")
     return CommandResult(accepted=True, aggregate_id=key, produced_event_ids=(confirmed.event_id,))
@@ -979,19 +1083,19 @@ def reject_fact(conn: DbConn, cmd: Command) -> CommandResult:
 Then extend the catalog:
 
 ```python
-_OVERLAY_CATALOG = {
-    "propose_fact": propose_fact,
-    "confirm_fact": confirm_fact,
-    "reject_fact": reject_fact,
-}
+_OVERLAY_CATALOG = (
+    ("propose_fact", propose_fact),
+    ("confirm_fact", confirm_fact),
+    ("reject_fact", reject_fact),
+)
 ```
 
 - [ ] **Step 4 — run it (passes)**
-  - `uv run pytest tests/featuregen/overlay/test_confirm_reject.py -v`
-  - Expected: PASS (6 tests).
+  - `uv run pytest tests/featuregen/overlay/test_confirm_reject.py tests/featuregen/overlay/test_freshness_schedule.py -v`
+  - Expected: PASS (7 confirm/reject tests + 1 freshness test).
 
 - [ ] **Step 5 — commit**
-  - `git add src/featuregen/overlay/commands.py tests/featuregen/overlay/test_confirm_reject.py && git commit -m "feat(overlay): confirm_fact/reject_fact with CAS, fine authority and SoD"`
+  - `git add src/featuregen/overlay/freshness.py src/featuregen/overlay/commands.py tests/featuregen/overlay/test_confirm_reject.py tests/featuregen/overlay/test_freshness_schedule.py && git commit -m "feat(overlay): confirm_fact/reject_fact with CAS, fine authority, SoD + schedule_expiry"`
 
 ---
 
@@ -1002,7 +1106,7 @@ _OVERLAY_CATALOG = {
 - Test: `tests/featuregen/overlay/test_enter_fact.py`
 
 **Interfaces:**
-- Consumes: `validate_fact_value`, `resolve_authority`, `_actor_is_authority`, `append_overlay_event`, `load_fact`, `current_catalog_adapter` (catalog.py), `schedule_expiry` (Phase 7 `freshness.py`).
+- Consumes: `validate_fact_value`, `resolve_authority`, `_actor_is_authority`, `append_overlay_event`, `load_fact`, `current_catalog_adapter` (catalog.py), `schedule_expiry` (`overlay/freshness.py`, created in Task 4.3, pin 10).
 - Produces: `enter_fact(conn, cmd) -> CommandResult` — when the human actor IS the resolved authority, atomically appends `OVERLAY_FACT_PROPOSED` (`expected_version=0`) + `OVERLAY_FACT_CONFIRMED` (self-confirm, audited). Denied for service principals and for a dual-owner `approved_join`.
 
 - [ ] **Step 1 — write the failing test**
@@ -1068,7 +1172,13 @@ def test_dual_owner_join_direct_entry_rejected(db, catalog):
     catalog.set_owner(_customers(), "user:bob")  # two distinct owners → dual
     ref = ApprovedJoinRef(_orders(), _customers(), (ColumnPair("customer_id", "id"),), "N:1")
     value = {
-        "from_columns": ["customer_id"],
+        "from_ref": {
+            "catalog_source": "pg:core",
+            "object_kind": "table",
+            "schema": "sales",
+            "table": "orders",
+            "column": None,
+        },
         "to_ref": {
             "catalog_source": "pg:core",
             "object_kind": "table",
@@ -1076,7 +1186,7 @@ def test_dual_owner_join_direct_entry_rejected(db, catalog):
             "table": "customers",
             "column": None,
         },
-        "to_columns": ["id"],
+        "column_pairs": [{"from_col": "customer_id", "to_col": "id"}],
         "cardinality": "N:1",
     }
     res = enter_fact(db, _enter(ref=ref, fact_type="approved_join", value=value))
@@ -1175,12 +1285,12 @@ def enter_fact(conn: DbConn, cmd: Command) -> CommandResult:
 Then extend the catalog:
 
 ```python
-_OVERLAY_CATALOG = {
-    "propose_fact": propose_fact,
-    "confirm_fact": confirm_fact,
-    "reject_fact": reject_fact,
-    "enter_fact": enter_fact,
-}
+_OVERLAY_CATALOG = (
+    ("propose_fact", propose_fact),
+    ("confirm_fact", confirm_fact),
+    ("reject_fact", reject_fact),
+    ("enter_fact", enter_fact),
+)
 ```
 
 - [ ] **Step 4 — run it (passes)**
@@ -1199,7 +1309,7 @@ _OVERLAY_CATALOG = {
 - Test: `tests/featuregen/overlay/test_approved_join.py`
 
 **Interfaces:**
-- Consumes: `confirm_fact` (extended), `_close_fact_tasks`, `_latest_proposed`, `append_overlay_event`, `schedule_expiry` (Phase 7 `freshness.py`).
+- Consumes: `confirm_fact` (extended), `_close_fact_tasks`, `_latest_proposed`, `append_overlay_event`, `validate_fact_value`/`FactValidationError` (pin 17 — the join confirm path validates the final value too), `schedule_expiry` (`overlay/freshness.py`, created in Task 4.3, pin 10).
 - Produces: dual-confirmation flow — first owner → `OVERLAY_FACT_PARTIALLY_CONFIRMED` (`by_owner`, `role`, `draft_event_id`); second (distinct) owner → `OVERLAY_FACT_CONFIRMED` recording BOTH confirmers; same-owner-both-sides verifies in a single confirm (handled by the existing single path, since `Authority.dual` is False); either owner's reject → REJECTED (existing `reject_fact`).
 
 - [ ] **Step 1 — write the failing test**
@@ -1232,7 +1342,13 @@ def _ref():
 
 def _value():
     return {
-        "from_columns": ["customer_id"],
+        "from_ref": {
+            "catalog_source": "pg:core",
+            "object_kind": "table",
+            "schema": "sales",
+            "table": "orders",
+            "column": None,
+        },
         "to_ref": {
             "catalog_source": "pg:core",
             "object_kind": "table",
@@ -1240,7 +1356,7 @@ def _value():
             "table": "customers",
             "column": None,
         },
-        "to_columns": ["id"],
+        "column_pairs": [{"from_col": "customer_id", "to_col": "id"}],
         "cardinality": "N:1",
     }
 
@@ -1385,13 +1501,22 @@ def _confirm_approved_join(conn, cmd, key, stream, state, authority):
             aggregate_id=key,
             denied_reason="this owner already confirmed; awaiting the other owner",
         )
+    # Validate the FINAL value before the second-owner CONFIRMED append (pin 17 — the join confirm
+    # path validates too, even though approved_join takes no override).
+    value = proposed.payload["proposed_value"]
+    try:
+        validate_fact_value("approved_join", value)
+    except FactValidationError as exc:
+        return CommandResult(
+            accepted=False, aggregate_id=key, denied_reason=f"invalid confirmed value: {exc}"
+        )
     expires_at = datetime.now(UTC) + _DEFAULT_TTL
     confirmed = append_overlay_event(
         conn,
         fact_key=key,
         type="OVERLAY_FACT_CONFIRMED",
         payload={
-            "value": proposed.payload["proposed_value"],
+            "value": value,
             "confirmers": [
                 {"subject": first, "role": "data_owner_from"},
                 {"subject": actor.subject, "role": "data_owner_to"},
@@ -1582,7 +1707,7 @@ def get_task_proposal(conn: DbConn, task_id: str, actor) -> dict:
 - Consumes: `register_overlay_event_types` (facts.py); `register_overlay_commands` (commands.py); `event_registry` (SP-0); `authz_policy` table; `projection_checkpoints` table.
 - Produces:
   - `register_overlay(handler_registry) -> None` — registers overlay event schemas + the (idempotent) overlay command catalog. **There is no `timer.overlay_expiry` HandlerRegistry handler** — expiry is the explicit `fire_due_overlay_expiries(conn, *, now)` poller built in Phase 7 (decision 5). The catalog adapter is wired separately via `register_catalog_adapter(...)` from `overlay/catalog.py` (the deployment entrypoint / tests register a `PostgresCatalog`/`FixtureCatalog`). `handler_registry` is accepted for symmetry with the SP-0 bootstrap signature.
-  - `seed_overlay_authz(conn) -> None` — idempotent INSERT of the 9 overlay authz rows (overview) + `projection_checkpoints('overlay')` init.
+  - `seed_overlay_authz(conn) -> None` — idempotent INSERT of the 11 overlay authz rows (overview authz block, including the two `platform-admin` `confirm_fact`/`reject_fact` governance-queue rows, pin 13) + `projection_checkpoints('overlay')` init.
 
 - [ ] **Step 1 — write the failing test**
 
@@ -1688,6 +1813,59 @@ def test_wrong_role_is_denied_and_audited(db, catalog):
             "WHERE event_type='COMMAND_DENIED' AND attempted_action='propose_fact'"
         )
         assert cur.fetchone()["n"] == 1
+
+
+def _payments() -> CatalogObjectRef:
+    return CatalogObjectRef("pg:core", "table", "fin", "payments")
+
+
+def test_platform_admin_clears_governance_queue_via_execute_command(db, catalog):
+    """pin 13 (finding 3) — END-TO-END through the PUBLIC `execute_command` path: an unknown-owner
+    fact opens a governance-queue task, and a platform-admin runs `confirm_fact` WITHOUT being
+    denied by authz (proves the seeded `("confirm_fact","","platform-admin","human",None)` row, not
+    just the in-handler `_actor_is_authority` check). `_payments` has NO owner recorded, so authority
+    resolves to the platform-admin/governance queue."""
+    _wire(db, catalog)  # only sets an owner for _orders(); _payments() owner stays unknown
+    svc = build_service_identity(subject="service:profiler", role_claims=("overlay",), attestation="sig")
+    admin = build_human_identity(subject="user:admin", role_claims=("platform-admin",))
+
+    proposed = execute_command(
+        db,
+        Command(
+            "propose_fact",
+            "overlay_fact",
+            None,
+            {"ref": _payments(), "fact_type": "grain", "proposed_value": {"columns": ["payment_id"], "is_unique": True}},
+            svc,
+            "ik-gov-propose",
+        ),
+    )
+    assert proposed.accepted is True, proposed.denied_reason
+    draft = proposed.produced_event_ids[0]
+    key = fact_key(_payments(), "grain")
+    with db.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            "SELECT eligible_assignees FROM human_tasks WHERE fact_key=%s AND status='open'", (key,)
+        )
+        assert cur.fetchone()["eligible_assignees"] == {"role": "platform-admin"}
+
+    confirmed = execute_command(
+        db,
+        Command(
+            "confirm_fact",
+            "overlay_fact",
+            None,
+            {"ref": _payments(), "fact_type": "grain", "target_event_id": draft},
+            admin,
+            "ik-gov-confirm",
+        ),
+    )
+    # NOT denied by authz ("no matching authz policy") — the platform-admin row admits the action.
+    assert confirmed.accepted is True, confirmed.denied_reason
+    n = db.execute(
+        "SELECT count(*) FROM events WHERE overlay_fact_id=%s AND type='OVERLAY_FACT_CONFIRMED'", (key,)
+    ).fetchone()[0]
+    assert n == 1
 ```
 
 - [ ] **Step 2 — run it (fails)**
@@ -1715,6 +1893,10 @@ _OVERLAY_POLICY_ROWS: tuple[tuple[str, str, str, str, str | None], ...] = (
     ("confirm_fact", "", "compliance", "human", None),
     ("reject_fact", "", "data_owner", "human", None),
     ("reject_fact", "", "compliance", "human", None),
+    # Governance-queue (unknown-owner) confirmations — a platform-admin clears the fallback task
+    # via the PUBLIC execute_command path; the handler still enforces fine-grained authority (pin 13).
+    ("confirm_fact", "", "platform-admin", "human", None),
+    ("reject_fact", "", "platform-admin", "human", None),
     ("enter_fact", "", "data_owner", "human", None),
     ("enter_fact", "", "compliance", "human", None),
 )
@@ -1751,14 +1933,14 @@ def seed_overlay_authz(conn: DbConn) -> None:
 
 - [ ] **Step 4 — run it (passes)**
   - `uv run pytest tests/featuregen/overlay/test_bootstrap.py -v`
-  - Expected: PASS (2 tests).
+  - Expected: PASS (3 tests).
 
 - [ ] **Step 5 — run the whole Phase-4 suite (no regression)**
   - `uv run pytest tests/featuregen/overlay/ -v`
   - Expected: PASS (all Phase-4 tests green).
 
 - [ ] **Step 6 — lint**
-  - `uv run ruff check src/featuregen/overlay/authority.py src/featuregen/overlay/commands.py src/featuregen/overlay/bootstrap.py`
+  - `uv run ruff check src/featuregen/overlay/authority.py src/featuregen/overlay/commands.py src/featuregen/overlay/freshness.py src/featuregen/overlay/bootstrap.py`
   - Expected: no findings.
 
 - [ ] **Step 7 — commit**
