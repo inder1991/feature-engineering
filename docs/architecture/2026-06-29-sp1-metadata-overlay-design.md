@@ -65,11 +65,16 @@ CONSTRAINT events_aggregate_id_consistent CHECK (
 `overlay_fact` has no typed mirror column, so it would violate **both** CHECKs. SP-1 therefore ships a
 **migration** that:
 1. **Recreates the `aggregate` CHECK** to include `'overlay_fact'`.
-2. **Recreates `events_aggregate_id_consistent`** adding a branch `OR (aggregate = 'overlay_fact')` —
-   for overlay facts, **`aggregate_id = fact_key` is the canonical key** and `request_id/feature_id/run_id`
-   stay `NULL` (the existing partial indexes already filter `… IS NOT NULL`, so they're unaffected; OCC
-   via `UNIQUE(aggregate, aggregate_id, stream_version)` works unchanged).
-3. **Registers `overlay_fact`** in the state-machine table (the lifecycle, §3.4).
+2. **Recreates `events_aggregate_id_consistent`** with an **explicit** overlay branch
+   `OR (aggregate = 'overlay_fact' AND request_id IS NULL AND feature_id IS NULL AND run_id IS NULL)` —
+   for overlay facts, **`aggregate_id = fact_key` is the canonical key** and the typed mirror columns are
+   *constrained* to `NULL` (so they can't be accidentally populated; the existing partial indexes already
+   filter `… IS NOT NULL`; OCC via `UNIQUE(aggregate, aggregate_id, stream_version)` works unchanged).
+3. **Adds an `overlay_fact` lifecycle to SP-0's transition engine.** SP-0's `_TABLE_NAMES` is hardcoded to
+   `{run, feature}` with no generic table (`state_machine/transition_table.py:12`); SP-1 extends it with a
+   new **`overlay_lifecycle_table`** plus an `"overlay_fact": "overlay_lifecycle_table"` entry, so the
+   lifecycle (§3.4) is declared as transitions and validated by the **same** install/load/guard engine as
+   run/feature. (Alternatively the validation could be command-level only; we reuse the engine for parity.)
 4. Creates the overlay **projection** and **evidence** tables (§3.6, §5.1).
 
 The **append/envelope layer** is updated to accept `aggregate = "overlay_fact"` with the typed mirror
@@ -92,6 +97,10 @@ object_ref = "core.transactions.posted_at"   # human-readable, carried alongside
 ```
 `fact_key` drives OCC, the projection key, and confirmation routing; `object_ref` is for humans.
 
+**APIs take a structured `CatalogObjectRef`** (`{catalog_source, object_kind, schema, table, column?, relation?}`),
+never a raw dotted string — both the `fact_key` and the display `object_ref` are **derived** from it, so the
+case/quoting/multi-catalog ambiguity the `fact_key` exists to avoid cannot re-enter through the API surface.
+
 ### 3.2 The `overlay_fact` aggregate (on SP-0's event store)
 Events (`aggregate="overlay_fact"`, `aggregate_id=fact_key`):
 ```
@@ -112,10 +121,17 @@ Every `proposed_value`/`value` is validated against a per-type schema at append 
 | `grain` | data owner | `{ columns: [str, …], is_unique: bool }` |
 | `scd_effective_dating` | data owner | `{ valid_from: str, valid_to: str\|null, current_flag?: str }` |
 | `approved_join` | data owner | `{ from_columns: [str,…], to_object: str, to_columns: [str,…], cardinality: "1:1"\|"1:N"\|"N:1" }` |
-| `policy_tag` | Compliance | `{ use_case: str, decision: "allow"\|"deny"\|"restricted", sensitivity?: str, basis: str }` |
+| `policy_tag` | Compliance | `{ decision: "allow"\|"deny"\|"restricted", sensitivity?: str, basis: str }` — `use_case` lives in the `fact_key`, **not** duplicated in the value |
 
 Schemas are registered with SP-0's schema registry (versioned) so event validation, the projection
 shape, merged-view consumers, and confirmation editing all share one definition.
+
+**Scope of `resolve_fact`/`get_fact` — ML facts only.** These operate over the **five fact types above**.
+*Structural* catalog facts — object existence, column list, column type — are **not** overlay fact types;
+they are fields of `CatalogObject` (via `list_objects`), consumed directly by the profiler and grounding.
+A catalog is *authoritative for an ML fact* only when it genuinely records one (e.g. a governance catalog
+holding `policy_tag`/PII or `availability_time`); `InformationSchemaCatalog` records none of the five, so
+its `get_fact` returns `None` for all of them while still supplying structural metadata via `CatalogObject`.
 
 ### 3.4 Lifecycle (with REJECTED and proactive entry)
 ```
@@ -124,7 +140,7 @@ DRAFT ─ confirm ─▶ VERIFIED ─ expiry ─▶ REVERIFY ─ confirm ─▶ 
                        └─ catalog change ─▶ STALE ─ confirm ─▶ VERIFIED
 ```
 - **Canonical status values:** `DRAFT, VERIFIED, REJECTED, STALE, REVERIFY` (display `REVERIFY` as `RE-VERIFY`).
-- **REJECTED is sticky for the proposed value:** the profiler dedups against REJECTED (and in-flight DRAFT) so a weak candidate is **not re-proposed / re-tasked**. A genuinely different proposal (new value/evidence) is a new DRAFT.
+- **REJECTED is sticky by `proposal_fingerprint`:** dedup keys on a **stable fingerprint = hash(canonical `proposed_value` + profiler version + thresholds)** — *not* the evidence id/timestamp (which change every profiling run). A rejected candidate therefore cannot return merely because a new snapshot produced fresh evidence; only a **materially different proposed value** yields a new DRAFT.
 - **Proactive (human-entered) facts (P1):** not everything is profiler-inferable, and §6 of the parent allows proactive verified entry. Two supported paths:
   - **Propose-then-confirm:** a human submits `FACT_PROPOSED(proposed_by=human)`, then the resolved authority confirms (normal gate).
   - **Direct entry:** when the **acting principal *is* the resolved authority** for that fact (data owner for a data fact; Compliance for a policy fact), the command may emit `FACT_PROPOSED`+`FACT_CONFIRMED` atomically (a self-confirmation that still records actor + provenance and respects SoD — a data owner can never self-confirm a `policy_tag`).
@@ -144,10 +160,20 @@ fail-closed projection rules apply).
 ## 4. Catalog adapter (P1 — per-fact authority)
 
 ```python
+@dataclass(frozen=True)
+class CatalogObjectRef:
+    catalog_source: str          # e.g. "pg:core"
+    object_kind: str             # "table" | "column" | "relation"
+    schema: str
+    table: str
+    column: str | None = None
+    relation: str | None = None
+    # fact_key(ref, fact_type, use_case?) and the display object_ref are derived from this.
+
 class CatalogAdapter(Protocol):
     def list_objects(self) -> Iterable[CatalogObject]: ...                    # tables/columns/types
-    def get_fact(self, object_ref, fact_type, use_case=None) -> CatalogFact | None: ...
-    def owner_of(self, object_ref) -> Principal | None: ...                   # ownership if recorded
+    def get_fact(self, ref: CatalogObjectRef, fact_type, use_case=None) -> CatalogFact | None: ...
+    def owner_of(self, ref: CatalogObjectRef) -> Principal | None: ...        # ownership if recorded
     def fingerprint(self) -> CatalogFingerprint: ...                          # for change detection (§8)
 
 @dataclass(frozen=True)
@@ -158,10 +184,10 @@ class CatalogFact:
 Authoritativeness is a **property of each returned `CatalogFact`**, not a global set — a catalog may be
 authoritative for PII tags on some columns but not others, or for type on a column but not its grain.
 
-- **`InformationSchemaCatalog`** (reference): reads real table/column/type/existence from Postgres
-  `information_schema`. Returns `authoritative=True` only for `existence`/`column`/`type`; for
-  `grain`/`availability_time`/`scd_effective_dating`/`approved_join`/`policy_tag` it returns `None`
-  (the overlay owns those). `owner_of` returns `None` unless ownership is recorded.
+- **`InformationSchemaCatalog`** (reference): exposes structural metadata (existence/columns/types) via
+  `list_objects` → `CatalogObject` — **not** as ML facts. Its `get_fact` (ML fact types) returns `None`
+  for all five (information_schema records none of them), so the overlay owns them. `owner_of` returns
+  `None` unless ownership is recorded.
 - **`FixtureCatalog`**: in-memory adapter for tests (can mark facts authoritative per object).
 
 A Snowflake / Unity Catalog adapter is just another implementation with its own per-fact authority and `owner_of`.
@@ -175,7 +201,9 @@ Inspects the actual data (read-only) and emits **DRAFT facts + evidence** for hu
   (name/type/monotonicity vs an event-time column); **scd_effective_dating** — candidate `valid_from/valid_to`.
 - evidence-only metrics: null-rate, distinct count, sample size.
 
-It dedups against REJECTED/DRAFT (§3.4) before proposing.
+Each proposal carries a **`proposal_fingerprint`** = hash(canonical `proposed_value` + profiler version +
+thresholds); the profiler dedups against REJECTED/DRAFT **by fingerprint** (§3.4) before proposing — fresh
+evidence alone never revives a rejected candidate.
 
 ### 5.1 Evidence store (P1)
 Evidence is an **immutable record** in an `overlay_evidence` table (an SP-0-style append-only artifact,
@@ -184,8 +212,10 @@ written once, never updated; referenced by `evidence_ref`). Schema:
 { evidence_id, fact_key, table_snapshot_at, row_count, sample_size, profile_version,
   thresholds_used, metric_values, created_by, created_at }
 ```
-**No raw values** are stored (SP-0 privacy rule) — only aggregate metrics. **Classification:** internal
-metadata, **non-PII**, governance-retained (retained with the fact's audit history, not crypto-shred class).
+**No raw values** are stored (SP-0 privacy rule) — only aggregate metrics. **Classification: sensitive
+operational metadata** — aggregate metrics over sensitive tables (small `row_count`, distinct counts,
+min/max dates, uniqueness over identifying columns) can themselves be revealing — so evidence is
+**governance-retained and service-internal / read-controlled** (no raw values, but *not* assumed non-sensitive).
 
 ### 5.2 Profiler safety limits (P1)
 The profiler runs only under bounded, auditable access:
@@ -215,7 +245,7 @@ The profiler runs only under bounded, auditable access:
 
 ### 7.1 Resolution
 ```python
-def resolve_fact(object_ref, fact_type, use_case=None) -> ResolvedFact
+def resolve_fact(ref: CatalogObjectRef, fact_type, use_case=None) -> ResolvedFact
 ```
 Precedence: **authoritative catalog fact → VERIFIED overlay fact → missing** (catalog wins *only* when the
 returned `CatalogFact.authoritative` is true, §4). STALE/REVERIFY/DRAFT/REJECTED overlay entries are **not**
@@ -223,10 +253,15 @@ served as VERIFIED. Return shape (P1):
 ```
 ResolvedFact{ value, status, source('catalog'|'overlay'|'missing'),
               catalog_object, fact_type, use_case, provenance,
-              confirmed_by, confirmed_at, expires_at, reason_if_missing }
+              confirmed_by, confirmed_at, expires_at, reason_if_missing,
+              prior_value }
 ```
 **Fail-closed:** `status == 'missing'` → the caller (grounding, Layer 3) blocks and routes to confirmation
 (the §6.2 hard floor).
+
+**REVERIFY/STALE serving (P2):** a fact in `REVERIFY` or `STALE` returns that `status` with **`value = null`
+(not usable)** and **`prior_value` = the last VERIFIED value** as context — so a consumer can show
+*"previous value … — re-confirmation required"* without ever treating it as current.
 
 ### 7.2 Read authorization posture (P2)
 `resolve_fact` can reveal policy tags, table existence, ownership, and metadata about sensitive columns.
@@ -252,19 +287,19 @@ end-user-safe.
 - **Idempotent** proposals (same proposed_value+evidence on an existing DRAFT → no-op) and confirmations (idempotent by `(fact_key, draft_event_id)`); confirmation CAS per §6.3.
 
 ## 10. Interfaces SP-1 exposes (for SP-2+ consumers)
-- `resolve_fact(object_ref, fact_type, use_case?) -> ResolvedFact` — the read path Layer 3 grounding uses (service-internal, §7.2).
-- Commands: `propose_fact`, `confirm_fact`, `reject_fact`, `enter_fact` (proactive/direct, §3.4), `run_profiler(object)`.
+- `resolve_fact(ref: CatalogObjectRef, fact_type, use_case?) -> ResolvedFact` — the read path Layer 3 grounding uses (service-internal, §7.2).
+- Commands (all take a `CatalogObjectRef`): `propose_fact`, `confirm_fact`, `reject_fact`, `enter_fact` (proactive/direct, §3.4), `run_profiler(ref)`.
 - The `CatalogAdapter` protocol (deployments bind their real catalog).
 
 ## 11. What SP-1 deliberately does NOT do
 LLM-suggestion / lazy-during-build proposing (SP-2) · console UI (frontend) · non-Postgres catalog adapters (later) · richer Change-Impact Analyzer / revalidation orchestration (SP-10) · human-facing read authz (SP-9/SP-11).
 
 ## 12. Testing
-- **Migration (P0):** `overlay_fact` appends succeed after the CHECK migration; existing request/feature/run appends + consistency CHECK still hold; OCC on `fact_key`.
+- **Migration (P0):** `overlay_fact` appends succeed after the CHECK migration; existing request/feature/run appends + consistency CHECK still hold; **an `overlay_fact` append with a non-null `request_id`/`feature_id`/`run_id` is rejected** by the tightened constraint; the `overlay_lifecycle_table` loads via the extended transition engine; OCC on `fact_key`.
 - **Value schemas (P1):** each fact type validates its value; malformed value rejected at append.
-- **Merged-view:** authoritative-catalog hit · overlay-fill · fail-closed-on-missing · not-served-when-STALE/REVERIFY · **per-fact authority** (catalog beats overlay only where `authoritative=true`).
+- **Merged-view:** authoritative-catalog hit · overlay-fill · fail-closed-on-missing · not-served-when-STALE/REVERIFY · **per-fact authority** (catalog beats overlay only where `authoritative=true`) · **ML-fact scope** (`get_fact` returns `None` for all five on information_schema; structural metadata via `list_objects`) · **REVERIFY/STALE returns `prior_value` with `value=null`**.
 - **Authority:** data-owner confirms data fact · Compliance confirms policy fact · wrong-role rejected · **unknown owner → governance queue** (not submitter) · **direct entry by the authority** (self-confirm) · data owner **cannot** self-confirm a `policy_tag`.
-- **Lifecycle:** DRAFT→VERIFIED→EXPIRED→REVERIFY→VERIFIED · DRAFT→REJECTED · VERIFIED→STALE→VERIFIED · profiler **does not re-propose a REJECTED candidate**.
+- **Lifecycle:** DRAFT→VERIFIED→EXPIRED→REVERIFY→VERIFIED · DRAFT→REJECTED · VERIFIED→STALE→VERIFIED · profiler **does not re-propose a REJECTED candidate even with fresh evidence** (dedup by `proposal_fingerprint`).
 - **Evidence (P1):** evidence record is immutable; `evidence_ref` resolves; **no raw values**; provenance present.
 - **Profiler (P1):** grain/availability-time inference correctness; **safety limits honored** (read-only role, allowlist, aggregate-only, timeout, max columns/combinations, sampling threshold).
 - **Confirmation race (P1):** stale confirmation after a newer draft is **rejected**; expired/staled confirmation rejected; concurrent confirm/reject.
