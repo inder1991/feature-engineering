@@ -783,6 +783,23 @@ Model-free scoring (§14.3) assumes labels exist, but many banking use-cases are
 
 This lets a cold-start use-case begin producing reviewed, governed *candidate* features immediately and graduate to production as data arrives — instead of sitting idle waiting for labels.
 
+### 14.8 Typed feature-strategy agents and a generation Router
+
+Adapting MALMAS (Memory-Augmented LLM Multi-Agent System). Instead of one generalist generator, generation is organized into **typed banking feature-strategy agents**, each an expert in one feature family, with a **Router** that picks which to run per request:
+
+- **Strategy agents (banking families):** unary transforms, ratios/cross-features, **aggregations over transactions**, **temporal/recency**, and distributional/local patterns. Each proposes structured candidates within its specialty, bounded by the hypothesis + the Domain Catalog templates (§15).
+- **Router:** each round it selects an *active subset* of strategies by (a) **dataset characteristics** (from catalog/overlay — skip `temporal` when there are no time columns, skip aggregation without a group key) and (b) **historical gain** (which strategy has earned the most **IV/WoE** uplift for this use-case). Warm-up runs all strategies; thereafter it favors what's working and prunes what isn't.
+- **Why:** better coverage (each family explored by an expert) + efficiency (no wasted generation on inapplicable or unproductive strategies).
+- **Bounded + governed:** strategies only *propose*; every candidate still flows through grounding, the deterministic gates (the **temporal-leakage gate is critical** for the aggregation/temporal agents), scoring (§14.3), and the human gates. The Router ranks strategies by **our model-free IV gain** — we do **not** adopt MALMAS's train-a-model-per-round evaluation.
+
+### 14.9 Conceptual memory (cross-round pattern distillation)
+
+The attempt memory (§14.2) records individual tries; this adds a **conceptual layer** that distills, per use-case, *what kinds of features keep working* — e.g. "for churn, declining-activity/recency features dominate; for fraud, sudden-velocity spikes."
+
+- **How:** after scoring, the platform summarizes the effective features into a few **conceptual rules** (which transforms/inputs/types paid off), kept per-strategy and as a **global** summary across strategies.
+- **Fed back two ways:** (1) it **primes future generation** (the Router and strategy agents see what's been productive); (2) a recurring, confirmed pattern can be **promoted into the Domain Catalog's `feature_templates`** — turning the catalog from static curation into a **learning registry**.
+- **Governance:** distilled rules are *suggestions to generation*, never governance truth; promoting one into the catalog runs through §15.6 onboarding (domain/risk owner + Compliance confirm). The platform improves with use without letting an LLM-written "rule" bypass human authority.
+
 ---
 
 ## 15. The Domain / Use-Case Catalog
@@ -832,7 +849,7 @@ The catalog is the **context** every stage reads off the feature's `use_case`:
 
 ### 15.4 Relationship to existing use-case scoping
 
-The catalog is the *source* of the use-case facts already referenced throughout: `approved_use_cases`/`blocked_use_cases` (§4.3), policy-aware exposure (§12), and risk-tier-as-lifecycle-attribute (§13.3). Previously those values were assumed; the catalog is where they are **defined, owned, and versioned** — and how a new domain is onboarded (score it, define its templates/policy/target/tier, have the owners + Compliance confirm).
+The catalog is the *source* of the use-case facts already referenced throughout: `approved_use_cases`/`blocked_use_cases` (§4.3), policy-aware exposure (§12), and risk-tier-as-lifecycle-attribute (§13.3). Previously those values were assumed; the catalog is where they are **defined, owned, and versioned** — and how a new domain is onboarded (score it, define its templates/policy/target/tier, have the owners + Compliance confirm). The `feature_templates` also **grow over time**: winning patterns distilled by conceptual memory (§14.9) are promoted in (with owner/Compliance confirmation, §15.6), making the catalog a **learning registry**.
 
 ### 15.5 Banking scope: closed boundary, open use-case set
 
