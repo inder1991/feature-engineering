@@ -8,16 +8,16 @@
 
 ### Consumes (shared symbols — do NOT redefine; import only)
 
-From `src/sp0/contracts/` (declared by the overview; Phase 01 owns the type alias, Phase 04 owns the runtime dataclasses):
+From `src/featuregen/contracts/` (declared by the overview; Phase 01 owns the type alias, Phase 04 owns the runtime dataclasses):
 
 ```python
-from sp0.contracts import DbConn            # = psycopg.Connection[Any]; the active tx handle (Phase 01)
-from sp0.contracts import NewTimer          # kind, fire_at, idempotency_key, task_id, business_calendar,
+from featuregen.contracts import DbConn            # = psycopg.Connection[Any]; the active tx handle (Phase 01)
+from featuregen.contracts import NewTimer          # kind, fire_at, idempotency_key, task_id, business_calendar,
                                             #   cas_task_version, payload  (Phase 04)
-from sp0.contracts import NewExternalCommand# integration, idempotency_key, request_payload, expected_run_id,
+from featuregen.contracts import NewExternalCommand# integration, idempotency_key, request_payload, expected_run_id,
                                             #   expected_stream_version, expected_task_id, job_handle,
                                             #   dedup_supported  (Phase 04)
-from sp0.contracts import Disposition       # Enum: OK / RETRYABLE / PERMANENT  (Phase 04)
+from featuregen.contracts import Disposition       # Enum: OK / RETRYABLE / PERMANENT  (Phase 04)
 ```
 
 Shared DDL this phase **reads** but does not own: `events` (Phase 01), `documents` + `blob_index` (Phase 02), `queue` + `outbox` (Phase 04), `run_workflow_state` (Phase 01). Shared DDL this phase **creates** (verbatim from the overview): `timers`, `external_commands`. **`blob_index` is created by Phase 02** (its `0002_documents.sql`, Task 2 — the overview assigns the `blob_index` schema to Phase 02); this phase only builds the mark-and-sweep GC mechanism over it and does NOT re-create the table. One phase-owned supporting table not in the shared DDL: `business_calendars` (does not redefine any shared symbol).
@@ -26,14 +26,14 @@ This phase deliberately does NOT call `append_event`/`open_task`/`submit_human_s
 
 ### Test harness assumptions
 
-`tests/conftest.py` (Phase 01) provides a function-scoped `conn` fixture: a `psycopg` connection to a throwaway PostgreSQL 15+ database with every `src/sp0/db/migrations/*.sql` applied in lexical order, autocommit off, rolled back after each test. Phase 05 migrations use the `05xx_` numeric prefix so they sort AFTER the core tables they reference. Run commands assume the repo root is on `PYTHONPATH` and `pytest` discovers `tests/`.
+`tests/conftest.py` (Phase 01) provides a function-scoped `conn` fixture: a `psycopg` connection to a throwaway PostgreSQL 15+ database with every `src/featuregen/db/migrations/*.sql` applied in lexical order, autocommit off, rolled back after each test. Phase 05 migrations use the `05xx_` numeric prefix so they sort AFTER the core tables they reference. Run commands assume the repo root is on `PYTHONPATH` and `pytest` discovers `tests/`.
 
 ---
 
 ### File structure
 
 ```
-src/sp0/
+src/featuregen/
   runtime/
     __init__.py                 # package marker (created by Phase 04; add if running Phase 05 first)
     business_calendar.py        # Task 1  — duration parsing + business-day deadline resolution
@@ -48,7 +48,7 @@ src/sp0/
     0502_timers.sql             # Task 2  (verbatim shared DDL)
     0503_external_commands.sql  # Task 5  (verbatim shared DDL)
     # blob_index is created by Phase 02 (0002_documents.sql); Phase 05 only builds GC over it
-tests/sp0/runtime/
+tests/featuregen/runtime/
     conftest.py                 # Task 1  — seed/fake fixtures (events, run_state, documents, callers)
     test_business_calendar.py   # Task 1
     test_timers_schedule.py     # Task 2
@@ -70,10 +70,10 @@ tests/sp0/runtime/
 Durable timers are "resolved against a named business calendar" (§5.5). This task creates the phase-owned calendar store, the shared test fixtures, and the deterministic (replay-safe) deadline resolver everything else builds on.
 
 **Files:**
-- Create: `src/sp0/db/migrations/0501_business_calendars.sql`
-- Create: `src/sp0/runtime/business_calendar.py`
-- Create: `tests/sp0/runtime/conftest.py`
-- Test: `tests/sp0/runtime/test_business_calendar.py`
+- Create: `src/featuregen/db/migrations/0501_business_calendars.sql`
+- Create: `src/featuregen/runtime/business_calendar.py`
+- Create: `tests/featuregen/runtime/conftest.py`
+- Test: `tests/featuregen/runtime/test_business_calendar.py`
 
 **Interfaces:**
 - Consumes: `DbConn` (Phase 01); `conn` test fixture (Phase 01).
@@ -81,11 +81,11 @@ Durable timers are "resolved against a named business calendar" (§5.5). This ta
   - `parse_duration(spec: str) -> tuple[int, str]`
   - `resolve_business_deadline(conn: DbConn, calendar_name: Optional[str], start: datetime, spec: str) -> datetime`
   - Table `business_calendars(calendar_name PK, timezone, workdays int[], holidays date[], created_at)`
-  - Fixtures in `tests/sp0/runtime/conftest.py`: `insert_stub_event`, `insert_run_state`, `insert_stub_document` (seed helpers); `recording_caller`, `recording_deleter`, `recording_audit` (fakes) — produced incrementally; this task introduces `insert_stub_event`, `insert_run_state`, `insert_stub_document`.
+  - Fixtures in `tests/featuregen/runtime/conftest.py`: `insert_stub_event`, `insert_run_state`, `insert_stub_document` (seed helpers); `recording_caller`, `recording_deleter`, `recording_audit` (fakes) — produced incrementally; this task introduces `insert_stub_event`, `insert_run_state`, `insert_stub_document`.
 
 **TDD steps:**
 
-- [ ] **(1) Write the failing test.** `tests/sp0/runtime/test_business_calendar.py`:
+- [ ] **(1) Write the failing test.** `tests/featuregen/runtime/test_business_calendar.py`:
 
 ```python
 from __future__ import annotations
@@ -94,7 +94,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from sp0.runtime.business_calendar import parse_duration, resolve_business_deadline
+from featuregen.runtime.business_calendar import parse_duration, resolve_business_deadline
 
 UTC = timezone.utc
 
@@ -149,11 +149,11 @@ def test_days_without_calendar_are_calendar_days(conn):
     assert resolve_business_deadline(conn, None, start, "2d") == start + timedelta(days=2)
 ```
 
-- [ ] **(2) Run it, expect FAIL.** `pytest tests/sp0/runtime/test_business_calendar.py -q` → fails with `ModuleNotFoundError: No module named 'sp0.runtime.business_calendar'` (and the `business_calendars` relation does not exist).
+- [ ] **(2) Run it, expect FAIL.** `pytest tests/featuregen/runtime/test_business_calendar.py -q` → fails with `ModuleNotFoundError: No module named 'featuregen.runtime.business_calendar'` (and the `business_calendars` relation does not exist).
 
 - [ ] **(3) Write minimal implementation.**
 
-`src/sp0/db/migrations/0501_business_calendars.sql`:
+`src/featuregen/db/migrations/0501_business_calendars.sql`:
 
 ```sql
 -- business_calendars — phase-05-owned calendar store for §5.5 timer resolution.
@@ -167,7 +167,7 @@ CREATE TABLE business_calendars (
 );
 ```
 
-`src/sp0/runtime/business_calendar.py`:
+`src/featuregen/runtime/business_calendar.py`:
 
 ```python
 from __future__ import annotations
@@ -176,7 +176,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from typing import Optional
 
-from sp0.contracts import DbConn
+from featuregen.contracts import DbConn
 
 _WALL_CLOCK_SECONDS = {"h": 3600, "m": 60, "s": 1}
 
@@ -242,7 +242,7 @@ def resolve_business_deadline(
     return _add_business_days(_load_calendar(conn, calendar_name), start, amount)
 ```
 
-`tests/sp0/runtime/conftest.py` (seed helpers used across this phase):
+`tests/featuregen/runtime/conftest.py` (seed helpers used across this phase):
 
 ```python
 from __future__ import annotations
@@ -307,7 +307,7 @@ def insert_stub_document():
     return _insert
 ```
 
-- [ ] **(4) Run tests, expect PASS.** `pytest tests/sp0/runtime/test_business_calendar.py -q` → all green.
+- [ ] **(4) Run tests, expect PASS.** `pytest tests/featuregen/runtime/test_business_calendar.py -q` → all green.
 
 - [ ] **(5) Commit.** `git add -A && git commit -m "SP-0 Phase 05: business-calendar deadline resolution (§5.5)"`
 
@@ -318,9 +318,9 @@ def insert_stub_document():
 Create the shared `timers` table (verbatim) and the idempotent insert + the escalation-ladder composer (§5.5). `open_task` (Phase 07) composes the ladder via `build_escalation_ladder` and schedules each returned rung via `schedule_timer` inside the §5.1 atomic step (note `open_task(conn, spec, actor) -> str` returns a task_id, not a HandlerResult — see the shared contract). **Rung ordering:** §5.5 lists the conceptual ladder as "SLA → reminder → escalation → auto-park", but the rungs are returned and fire in chronological *fire-time* order, which is `reminder → sla → escalation → auto_park`: the reminder is a courtesy nudge that deliberately fires BEFORE the SLA deadline (`reminder < sla`). The spec's listing is the conceptual ladder, not the fire sequence.
 
 **Files:**
-- Create: `src/sp0/db/migrations/0502_timers.sql`
-- Create: `src/sp0/runtime/timers.py`
-- Test: `tests/sp0/runtime/test_timers_schedule.py`
+- Create: `src/featuregen/db/migrations/0502_timers.sql`
+- Create: `src/featuregen/runtime/timers.py`
+- Test: `tests/featuregen/runtime/test_timers_schedule.py`
 
 **Interfaces:**
 - Consumes: `DbConn`, `NewTimer` (contract); `resolve_business_deadline` (Task 1).
@@ -331,15 +331,15 @@ Create the shared `timers` table (verbatim) and the idempotent insert + the esca
 
 **TDD steps:**
 
-- [ ] **(1) Write the failing test.** `tests/sp0/runtime/test_timers_schedule.py`:
+- [ ] **(1) Write the failing test.** `tests/featuregen/runtime/test_timers_schedule.py`:
 
 ```python
 from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from sp0.contracts import NewTimer
-from sp0.runtime.timers import build_escalation_ladder, schedule_timer
+from featuregen.contracts import NewTimer
+from featuregen.runtime.timers import build_escalation_ladder, schedule_timer
 
 UTC = timezone.utc
 
@@ -387,11 +387,11 @@ def test_build_escalation_ladder(conn):
     assert fire_times == sorted(fire_times)  # monotonically increasing rungs
 ```
 
-- [ ] **(2) Run it, expect FAIL.** `pytest tests/sp0/runtime/test_timers_schedule.py -q` → `ImportError: cannot import name 'schedule_timer'` (and `relation "timers" does not exist`).
+- [ ] **(2) Run it, expect FAIL.** `pytest tests/featuregen/runtime/test_timers_schedule.py -q` → `ImportError: cannot import name 'schedule_timer'` (and `relation "timers" does not exist`).
 
 - [ ] **(3) Write minimal implementation.**
 
-`src/sp0/db/migrations/0502_timers.sql` (verbatim shared DDL):
+`src/featuregen/db/migrations/0502_timers.sql` (verbatim shared DDL):
 
 ```sql
 CREATE TABLE timers (
@@ -417,7 +417,7 @@ CREATE INDEX timers_due_idx  ON timers (fire_at) WHERE status = 'scheduled';
 CREATE INDEX timers_task_idx ON timers (task_id) WHERE task_id IS NOT NULL;
 ```
 
-`src/sp0/runtime/timers.py`:
+`src/featuregen/runtime/timers.py`:
 
 ```python
 from __future__ import annotations
@@ -429,8 +429,8 @@ from typing import Callable, Optional
 from psycopg.types.json import Jsonb
 from ulid import ULID  # python-ulid (declared by Phase 01); ULID-style id minting
 
-from sp0.contracts import DbConn, NewTimer
-from sp0.runtime.business_calendar import resolve_business_deadline
+from featuregen.contracts import DbConn, NewTimer
+from featuregen.runtime.business_calendar import resolve_business_deadline
 
 
 def schedule_timer(conn: DbConn, aggregate: str, aggregate_id: str, timer: NewTimer) -> str:
@@ -502,7 +502,7 @@ def build_escalation_ladder(
     )
 ```
 
-- [ ] **(4) Run tests, expect PASS.** `pytest tests/sp0/runtime/test_timers_schedule.py -q` → green.
+- [ ] **(4) Run tests, expect PASS.** `pytest tests/featuregen/runtime/test_timers_schedule.py -q` → green.
 
 - [ ] **(5) Commit.** `git add -A && git commit -m "SP-0 Phase 05: timers table + schedule_timer + escalation ladder (§5.5)"`
 
@@ -513,8 +513,8 @@ def build_escalation_ladder(
 The poller fires due timers and **overdue** timers on recovery, and reclaims expired leases — without two pollers double-claiming (§5.5).
 
 **Files:**
-- Modify: `src/sp0/runtime/timers.py`
-- Test: `tests/sp0/runtime/test_timers_poller.py`
+- Modify: `src/featuregen/runtime/timers.py`
+- Test: `tests/featuregen/runtime/test_timers_poller.py`
 
 **Interfaces:**
 - Consumes: `DbConn`; `schedule_timer`, `timers` table (Task 2).
@@ -522,15 +522,15 @@ The poller fires due timers and **overdue** timers on recovery, and reclaims exp
 
 **TDD steps:**
 
-- [ ] **(1) Write the failing test.** `tests/sp0/runtime/test_timers_poller.py`:
+- [ ] **(1) Write the failing test.** `tests/featuregen/runtime/test_timers_poller.py`:
 
 ```python
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
-from sp0.contracts import NewTimer
-from sp0.runtime.timers import poll_due_timers, schedule_timer
+from featuregen.contracts import NewTimer
+from featuregen.runtime.timers import poll_due_timers, schedule_timer
 
 UTC = timezone.utc
 NOW = datetime(2026, 6, 27, 12, 0, tzinfo=UTC)
@@ -581,9 +581,9 @@ def test_expired_lease_reclaimed(conn):
         assert cur.fetchone()[0] == "poller-b"
 ```
 
-- [ ] **(2) Run it, expect FAIL.** `pytest tests/sp0/runtime/test_timers_poller.py -q` → `ImportError: cannot import name 'poll_due_timers'`.
+- [ ] **(2) Run it, expect FAIL.** `pytest tests/featuregen/runtime/test_timers_poller.py -q` → `ImportError: cannot import name 'poll_due_timers'`.
 
-- [ ] **(3) Write minimal implementation.** Append to `src/sp0/runtime/timers.py`:
+- [ ] **(3) Write minimal implementation.** Append to `src/featuregen/runtime/timers.py`:
 
 ```python
 from datetime import timedelta  # add to existing imports at top of timers.py
@@ -619,7 +619,7 @@ def poll_due_timers(
         return [r[0] for r in cur.fetchall()]
 ```
 
-- [ ] **(4) Run tests, expect PASS.** `pytest tests/sp0/runtime/test_timers_poller.py -q` → green.
+- [ ] **(4) Run tests, expect PASS.** `pytest tests/featuregen/runtime/test_timers_poller.py -q` → green.
 
 - [ ] **(5) Commit.** `git add -A && git commit -m "SP-0 Phase 05: timer poller — due/overdue claim + lease reclaim (§5.5)"`
 
@@ -630,8 +630,8 @@ def poll_due_timers(
 Firing applies a timer's effect exactly once by enqueueing one idempotent work message; the timer/answer race is resolved by CAS on the gate task's version plus atomic cancel-on-answer, so a late timer can never escalate an answered/changed gate (§5.5).
 
 **Files:**
-- Modify: `src/sp0/runtime/timers.py`
-- Test: `tests/sp0/runtime/test_timers_fire.py`
+- Modify: `src/featuregen/runtime/timers.py`
+- Test: `tests/featuregen/runtime/test_timers_fire.py`
 
 **Interfaces:**
 - Consumes: `DbConn`; `timers` (Task 2), `queue` (Phase 04).
@@ -643,15 +643,15 @@ Firing applies a timer's effect exactly once by enqueueing one idempotent work m
 
 **TDD steps:**
 
-- [ ] **(1) Write the failing test.** `tests/sp0/runtime/test_timers_fire.py`:
+- [ ] **(1) Write the failing test.** `tests/featuregen/runtime/test_timers_fire.py`:
 
 ```python
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
-from sp0.contracts import NewTimer
-from sp0.runtime.timers import (
+from featuregen.contracts import NewTimer
+from featuregen.runtime.timers import (
     cancel_timers_for_task,
     fire_timer,
     poll_due_timers,
@@ -741,9 +741,9 @@ def test_auto_park_rung_uses_canonical_handler(conn):
         assert cur.fetchone()[0] == "runtime.auto_park"
 ```
 
-- [ ] **(2) Run it, expect FAIL.** `pytest tests/sp0/runtime/test_timers_fire.py -q` → `ImportError: cannot import name 'fire_timer'`.
+- [ ] **(2) Run it, expect FAIL.** `pytest tests/featuregen/runtime/test_timers_fire.py -q` → `ImportError: cannot import name 'fire_timer'`.
 
-- [ ] **(3) Write minimal implementation.** Append to `src/sp0/runtime/timers.py`:
+- [ ] **(3) Write minimal implementation.** Append to `src/featuregen/runtime/timers.py`:
 
 ```python
 from psycopg.types.json import Jsonb  # already imported at top; keep one import only
@@ -840,7 +840,7 @@ def cancel_timers_for_task(conn: DbConn, task_id: str) -> int:
         return cur.rowcount
 ```
 
-- [ ] **(4) Run tests, expect PASS.** `pytest tests/sp0/runtime/test_timers_fire.py -q` → green.
+- [ ] **(4) Run tests, expect PASS.** `pytest tests/featuregen/runtime/test_timers_fire.py -q` → green.
 
 - [ ] **(5) Commit.** `git add -A && git commit -m "SP-0 Phase 05: fire_timer CAS race + idempotent enqueue + cancel-on-answer (§5.5)"`
 
@@ -851,9 +851,9 @@ def cancel_timers_for_task(conn: DbConn, task_id: str) -> int:
 Record side-effecting calls in the §5.1 transaction with an idempotency key; duplicates return the original command (result caching), and high-cost integrations must carry a dedup guarantee or job handle — no false exactly-once claim (§5.4).
 
 **Files:**
-- Create: `src/sp0/db/migrations/0503_external_commands.sql`
-- Create: `src/sp0/runtime/external_commands.py`
-- Test: `tests/sp0/runtime/test_external_commands_record.py`
+- Create: `src/featuregen/db/migrations/0503_external_commands.sql`
+- Create: `src/featuregen/runtime/external_commands.py`
+- Test: `tests/featuregen/runtime/test_external_commands_record.py`
 
 **Interfaces:**
 - Consumes: `DbConn`, `NewExternalCommand` (contract).
@@ -864,15 +864,15 @@ Record side-effecting calls in the §5.1 transaction with an idempotency key; du
 
 **TDD steps:**
 
-- [ ] **(1) Write the failing test.** `tests/sp0/runtime/test_external_commands_record.py`:
+- [ ] **(1) Write the failing test.** `tests/featuregen/runtime/test_external_commands_record.py`:
 
 ```python
 from __future__ import annotations
 
 import pytest
 
-from sp0.contracts import NewExternalCommand
-from sp0.runtime.external_commands import HighCostWithoutDedup, record_external_command
+from featuregen.contracts import NewExternalCommand
+from featuregen.runtime.external_commands import HighCostWithoutDedup, record_external_command
 
 
 def _count(conn, key):
@@ -913,11 +913,11 @@ def test_high_cost_with_job_handle_ok(conn):
     assert record_external_command(conn, cmd, command_id="cmd_s2") == "cmd_s2"
 ```
 
-- [ ] **(2) Run it, expect FAIL.** `pytest tests/sp0/runtime/test_external_commands_record.py -q` → `ModuleNotFoundError: No module named 'sp0.runtime.external_commands'`.
+- [ ] **(2) Run it, expect FAIL.** `pytest tests/featuregen/runtime/test_external_commands_record.py -q` → `ModuleNotFoundError: No module named 'featuregen.runtime.external_commands'`.
 
 - [ ] **(3) Write minimal implementation.**
 
-`src/sp0/db/migrations/0503_external_commands.sql` (verbatim shared DDL):
+`src/featuregen/db/migrations/0503_external_commands.sql` (verbatim shared DDL):
 
 ```sql
 CREATE TABLE external_commands (
@@ -945,7 +945,7 @@ CREATE INDEX external_commands_status_idx ON external_commands (status, created_
 CREATE INDEX external_commands_run_idx    ON external_commands (run_id) WHERE run_id IS NOT NULL;
 ```
 
-`src/sp0/runtime/external_commands.py`:
+`src/featuregen/runtime/external_commands.py`:
 
 ```python
 from __future__ import annotations
@@ -958,9 +958,9 @@ from typing import Any, Mapping, Optional, Protocol, runtime_checkable
 
 from psycopg.types.json import Jsonb
 
-from sp0.contracts import DbConn, NewExternalCommand
+from featuregen.contracts import DbConn, NewExternalCommand
 
-_log = logging.getLogger("sp0.external_commands")
+_log = logging.getLogger("featuregen.external_commands")
 
 
 class HighCostWithoutDedup(Exception):
@@ -1009,7 +1009,7 @@ def record_external_command(
         return cur.fetchone()[0]
 ```
 
-- [ ] **(4) Run tests, expect PASS.** `pytest tests/sp0/runtime/test_external_commands_record.py -q` → green.
+- [ ] **(4) Run tests, expect PASS.** `pytest tests/featuregen/runtime/test_external_commands_record.py -q` → green.
 
 - [ ] **(5) Commit.** `git add -A && git commit -m "SP-0 Phase 05: external_commands table + idempotent record + dedup guard (§5.4)"`
 
@@ -1020,9 +1020,9 @@ def record_external_command(
 The dispatcher executes pending commands and, on crash-recovery of an already-dispatched command, reconciles via job handle or honestly flags the residual-duplicate risk when the integration cannot dedup — never a false dedup claim (§5.4).
 
 **Files:**
-- Modify: `src/sp0/runtime/external_commands.py`
-- Modify: `tests/sp0/runtime/conftest.py` (add `recording_caller` fixture)
-- Test: `tests/sp0/runtime/test_external_commands_dispatch.py`
+- Modify: `src/featuregen/runtime/external_commands.py`
+- Modify: `tests/featuregen/runtime/conftest.py` (add `recording_caller` fixture)
+- Test: `tests/featuregen/runtime/test_external_commands_dispatch.py`
 
 **Interfaces:**
 - Consumes: `DbConn`; `external_commands` (Task 5).
@@ -1034,7 +1034,7 @@ The dispatcher executes pending commands and, on crash-recovery of an already-di
 
 **TDD steps:**
 
-- [ ] **(1) Write the failing test.** First add the fixture to `tests/sp0/runtime/conftest.py`. NOTE: the fake stores whatever `IntegrationResult` the test constructs and passes in — it never builds one itself — so conftest deliberately does NOT import `IntegrationResult`. Importing it here would make conftest fail to collect at step (2) and break the entire `tests/sp0/runtime/` directory (including Task 5's already-green tests); the failing import must live in the test module under construction, not in conftest.
+- [ ] **(1) Write the failing test.** First add the fixture to `tests/featuregen/runtime/conftest.py`. NOTE: the fake stores whatever `IntegrationResult` the test constructs and passes in — it never builds one itself — so conftest deliberately does NOT import `IntegrationResult`. Importing it here would make conftest fail to collect at step (2) and break the entire `tests/featuregen/runtime/` directory (including Task 5's already-green tests); the failing import must live in the test module under construction, not in conftest.
 
 ```python
 class _RecordingCaller:
@@ -1060,7 +1060,7 @@ def recording_caller():
     return _RecordingCaller
 ```
 
-Then `tests/sp0/runtime/test_external_commands_dispatch.py`:
+Then `tests/featuregen/runtime/test_external_commands_dispatch.py`:
 
 ```python
 from __future__ import annotations
@@ -1068,8 +1068,8 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from decimal import Decimal
 
-from sp0.contracts import NewExternalCommand
-from sp0.runtime.external_commands import (
+from featuregen.contracts import NewExternalCommand
+from featuregen.runtime.external_commands import (
     IntegrationResult,
     dispatch_command,
     record_external_command,
@@ -1148,9 +1148,9 @@ def test_recovery_dedup_supported_no_residual(conn, recording_caller):
     assert "_residual_duplicate_risk" not in _row(conn, cid)[1]
 ```
 
-- [ ] **(2) Run it, expect FAIL.** `pytest tests/sp0/runtime/test_external_commands_dispatch.py -q` → `ImportError: cannot import name 'IntegrationResult' from 'sp0.runtime.external_commands'`. (The dispatch test imports `IntegrationResult`, `dispatch_command`, and `record_external_command`; the first two are added in step (3), so collecting THIS module fails on the first missing name, `IntegrationResult`. Because conftest no longer imports anything undefined, Task 5's already-green tests are unaffected.)
+- [ ] **(2) Run it, expect FAIL.** `pytest tests/featuregen/runtime/test_external_commands_dispatch.py -q` → `ImportError: cannot import name 'IntegrationResult' from 'featuregen.runtime.external_commands'`. (The dispatch test imports `IntegrationResult`, `dispatch_command`, and `record_external_command`; the first two are added in step (3), so collecting THIS module fails on the first missing name, `IntegrationResult`. Because conftest no longer imports anything undefined, Task 5's already-green tests are unaffected.)
 
-- [ ] **(3) Write minimal implementation.** Append to `src/sp0/runtime/external_commands.py`:
+- [ ] **(3) Write minimal implementation.** Append to `src/featuregen/runtime/external_commands.py`:
 
 ```python
 @dataclass(frozen=True, slots=True)
@@ -1251,7 +1251,7 @@ def dispatch_command(
         return DispatchOutcome(command_id, "pending", reinvoked, residual, reconciled)
 ```
 
-- [ ] **(4) Run tests, expect PASS.** `pytest tests/sp0/runtime/test_external_commands_dispatch.py -q` → green.
+- [ ] **(4) Run tests, expect PASS.** `pytest tests/featuregen/runtime/test_external_commands_dispatch.py -q` → green.
 
 - [ ] **(5) Commit.** `git add -A && git commit -m "SP-0 Phase 05: external-command dispatcher — reconcile/residual caveat + retry classification (§5.4)"`
 
@@ -1262,8 +1262,8 @@ def dispatch_command(
 A result is applied only if the run/task it was issued against has not moved on; otherwise it is accepted-and-ignored as stale, never blindly applied (§5.4).
 
 **Files:**
-- Modify: `src/sp0/runtime/external_commands.py`
-- Test: `tests/sp0/runtime/test_external_commands_stale.py`
+- Modify: `src/featuregen/runtime/external_commands.py`
+- Test: `tests/featuregen/runtime/test_external_commands_stale.py`
 
 **Interfaces:**
 - Consumes: `DbConn`; `external_commands` (Task 5), `events` (Phase 01, for the cached-applied path).
@@ -1273,13 +1273,13 @@ A result is applied only if the run/task it was issued against has not moved on;
 
 **TDD steps:**
 
-- [ ] **(1) Write the failing test.** `tests/sp0/runtime/test_external_commands_stale.py`:
+- [ ] **(1) Write the failing test.** `tests/featuregen/runtime/test_external_commands_stale.py`:
 
 ```python
 from __future__ import annotations
 
-from sp0.contracts import NewExternalCommand
-from sp0.runtime.external_commands import accept_result, record_external_command
+from featuregen.contracts import NewExternalCommand
+from featuregen.runtime.external_commands import accept_result, record_external_command
 
 
 def _record(conn, key, **expected):
@@ -1344,9 +1344,9 @@ def test_applied_result_is_cached(conn, insert_stub_event):
     assert out.accepted is True and out.cached is True
 ```
 
-- [ ] **(2) Run it, expect FAIL.** `pytest tests/sp0/runtime/test_external_commands_stale.py -q` → `ImportError: cannot import name 'accept_result'`.
+- [ ] **(2) Run it, expect FAIL.** `pytest tests/featuregen/runtime/test_external_commands_stale.py -q` → `ImportError: cannot import name 'accept_result'`.
 
-- [ ] **(3) Write minimal implementation.** Append to `src/sp0/runtime/external_commands.py`:
+- [ ] **(3) Write minimal implementation.** Append to `src/featuregen/runtime/external_commands.py`:
 
 ```python
 @dataclass(frozen=True, slots=True)
@@ -1403,7 +1403,7 @@ def accept_result(
     return ResultAcceptance(command_id, accepted=True, stale=False)
 ```
 
-- [ ] **(4) Run tests, expect PASS.** `pytest tests/sp0/runtime/test_external_commands_stale.py -q` → green.
+- [ ] **(4) Run tests, expect PASS.** `pytest tests/featuregen/runtime/test_external_commands_stale.py -q` → green.
 
 - [ ] **(5) Commit.** `git add -A && git commit -m "SP-0 Phase 05: stale-result acceptance guard + result caching (§5.4)"`
 
@@ -1414,8 +1414,8 @@ def accept_result(
 Transient delivery failures back off with jitter to a per-message budget and `max_elapsed_time`; permanent (deterministic) failures skip retry and go straight to the DLQ (§5.6). Operates generically over the Phase 04 `queue` and `outbox` rows.
 
 **Files:**
-- Create: `src/sp0/runtime/retries.py`
-- Test: `tests/sp0/runtime/test_retries.py`
+- Create: `src/featuregen/runtime/retries.py`
+- Test: `tests/featuregen/runtime/test_retries.py`
 
 **Interfaces:**
 - Consumes: `DbConn`, `Disposition` (contract); `queue`, `outbox` (Phase 04).
@@ -1427,7 +1427,7 @@ Transient delivery failures back off with jitter to a per-message budget and `ma
 
 **TDD steps:**
 
-- [ ] **(1) Write the failing test.** `tests/sp0/runtime/test_retries.py`:
+- [ ] **(1) Write the failing test.** `tests/featuregen/runtime/test_retries.py`:
 
 ```python
 from __future__ import annotations
@@ -1437,8 +1437,8 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from sp0.contracts import Disposition
-from sp0.runtime.retries import (
+from featuregen.contracts import Disposition
+from featuregen.runtime.retries import (
     OUTBOX_SPEC,
     QUEUE_SPEC,
     compute_backoff,
@@ -1555,9 +1555,9 @@ def test_outbox_uses_next_attempt_at(conn):
         assert cur.fetchone()[0] >= NOW
 ```
 
-- [ ] **(2) Run it, expect FAIL.** `pytest tests/sp0/runtime/test_retries.py -q` → `ModuleNotFoundError: No module named 'sp0.runtime.retries'`.
+- [ ] **(2) Run it, expect FAIL.** `pytest tests/featuregen/runtime/test_retries.py -q` → `ModuleNotFoundError: No module named 'featuregen.runtime.retries'`.
 
-- [ ] **(3) Write minimal implementation.** `src/sp0/runtime/retries.py`:
+- [ ] **(3) Write minimal implementation.** `src/featuregen/runtime/retries.py`:
 
 ```python
 from __future__ import annotations
@@ -1567,7 +1567,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Optional
 
-from sp0.contracts import DbConn, Disposition
+from featuregen.contracts import DbConn, Disposition
 
 
 def compute_backoff(
@@ -1660,7 +1660,7 @@ def record_delivery_outcome(
         return spec.ready_status
 ```
 
-- [ ] **(4) Run tests, expect PASS.** `pytest tests/sp0/runtime/test_retries.py -q` → green.
+- [ ] **(4) Run tests, expect PASS.** `pytest tests/featuregen/runtime/test_retries.py -q` → green.
 
 - [ ] **(5) Commit.** `git add -A && git commit -m "SP-0 Phase 05: delivery-retry backoff/jitter + max_elapsed + DLQ (§5.6)"`
 
@@ -1671,8 +1671,8 @@ def record_delivery_outcome(
 A valid workflow failure routes to a failure state with bounded `N` attempts (each an attempt event); exhaustion routes to a human and `manual_retry` re-arms the loop (§5.6).
 
 **Files:**
-- Create: `src/sp0/runtime/repair_loop.py`
-- Test: `tests/sp0/runtime/test_repair_loop.py`
+- Create: `src/featuregen/runtime/repair_loop.py`
+- Test: `tests/featuregen/runtime/test_repair_loop.py`
 
 **Interfaces:**
 - Consumes: `DbConn`; `events` (Phase 01), `queue` (Phase 04); `insert_stub_event` fixture (Task 1).
@@ -1683,12 +1683,12 @@ A valid workflow failure routes to a failure state with bounded `N` attempts (ea
 
 **TDD steps:**
 
-- [ ] **(1) Write the failing test.** `tests/sp0/runtime/test_repair_loop.py`:
+- [ ] **(1) Write the failing test.** `tests/featuregen/runtime/test_repair_loop.py`:
 
 ```python
 from __future__ import annotations
 
-from sp0.runtime.repair_loop import evaluate_repair_loop, route_repair_exhaustion
+from featuregen.runtime.repair_loop import evaluate_repair_loop, route_repair_exhaustion
 
 ATTEMPT = ("REPAIR_ATTEMPTED",)
 
@@ -1764,9 +1764,9 @@ def test_not_exhausted_does_not_route(conn, insert_stub_event):
         assert cur.fetchone()[0] == 0
 ```
 
-- [ ] **(2) Run it, expect FAIL.** `pytest tests/sp0/runtime/test_repair_loop.py -q` → `ModuleNotFoundError: No module named 'sp0.runtime.repair_loop'`.
+- [ ] **(2) Run it, expect FAIL.** `pytest tests/featuregen/runtime/test_repair_loop.py -q` → `ModuleNotFoundError: No module named 'featuregen.runtime.repair_loop'`.
 
-- [ ] **(3) Write minimal implementation.** `src/sp0/runtime/repair_loop.py`:
+- [ ] **(3) Write minimal implementation.** `src/featuregen/runtime/repair_loop.py`:
 
 ```python
 from __future__ import annotations
@@ -1776,7 +1776,7 @@ from typing import Sequence
 
 from psycopg.types.json import Jsonb
 
-from sp0.contracts import DbConn
+from featuregen.contracts import DbConn
 
 
 @dataclass(frozen=True, slots=True)
@@ -1841,7 +1841,7 @@ def route_repair_exhaustion(
         return cur.rowcount == 1
 ```
 
-- [ ] **(4) Run tests, expect PASS.** `pytest tests/sp0/runtime/test_repair_loop.py -q` → green.
+- [ ] **(4) Run tests, expect PASS.** `pytest tests/featuregen/runtime/test_repair_loop.py -q` → green.
 
 - [ ] **(5) Commit.** `git add -A && git commit -m "SP-0 Phase 05: business repair loop — bounded attempts + exhaustion→human routing + manual_retry re-arm (§5.6)"`
 
@@ -1852,8 +1852,8 @@ def route_repair_exhaustion(
 A durable per-run cost counter (and per-request aggregate) trips the breaker at a ceiling and auto-parks the run by enqueueing one idempotent parking message — mirroring the §5.5 ladder (§5.6).
 
 **Files:**
-- Create: `src/sp0/runtime/cost_budget.py`
-- Test: `tests/sp0/runtime/test_cost_budget.py`
+- Create: `src/featuregen/runtime/cost_budget.py`
+- Test: `tests/featuregen/runtime/test_cost_budget.py`
 
 **Interfaces:**
 - Consumes: `DbConn`; `run_workflow_state` (Phase 01), `queue` (Phase 04); `insert_run_state` fixture (Task 1).
@@ -1867,14 +1867,14 @@ A durable per-run cost counter (and per-request aggregate) trips the breaker at 
 
 **TDD steps:**
 
-- [ ] **(1) Write the failing test.** `tests/sp0/runtime/test_cost_budget.py`:
+- [ ] **(1) Write the failing test.** `tests/featuregen/runtime/test_cost_budget.py`:
 
 ```python
 from __future__ import annotations
 
 from decimal import Decimal
 
-from sp0.runtime.cost_budget import (
+from featuregen.runtime.cost_budget import (
     CostCeilings,
     check_cost_breaker,
     record_cost,
@@ -1931,9 +1931,9 @@ def test_trip_auto_parks_idempotently(conn, insert_run_state):
         assert cur.fetchone()[0] == "runtime.auto_park"
 ```
 
-- [ ] **(2) Run it, expect FAIL.** `pytest tests/sp0/runtime/test_cost_budget.py -q` → `ModuleNotFoundError: No module named 'sp0.runtime.cost_budget'`.
+- [ ] **(2) Run it, expect FAIL.** `pytest tests/featuregen/runtime/test_cost_budget.py -q` → `ModuleNotFoundError: No module named 'featuregen.runtime.cost_budget'`.
 
-- [ ] **(3) Write minimal implementation.** `src/sp0/runtime/cost_budget.py`:
+- [ ] **(3) Write minimal implementation.** `src/featuregen/runtime/cost_budget.py`:
 
 ```python
 from __future__ import annotations
@@ -1944,7 +1944,7 @@ from typing import Optional
 
 from psycopg.types.json import Jsonb
 
-from sp0.contracts import DbConn
+from featuregen.contracts import DbConn
 
 
 @dataclass(frozen=True, slots=True)
@@ -2030,7 +2030,7 @@ def trip_cost_breaker(
         return cur.rowcount == 1
 ```
 
-- [ ] **(4) Run tests, expect PASS.** `pytest tests/sp0/runtime/test_cost_budget.py -q` → green.
+- [ ] **(4) Run tests, expect PASS.** `pytest tests/featuregen/runtime/test_cost_budget.py -q` → green.
 
 - [ ] **(5) Commit.** `git add -A && git commit -m "SP-0 Phase 05: cost-budget circuit breaker + auto-park (§5.6)"`
 
@@ -2041,9 +2041,9 @@ def trip_cost_breaker(
 A rolled-back step leaves an orphan blob (possibly sensitive). GC marks unreferenced blobs against committed document refs, quarantines sensitive orphans for §9 erasure, sweeps the rest from the object store, and audits every run (§5.1). The `blob_index` table itself is **created by Phase 02** (its `0002_documents.sql`, Task 2 — the overview assigns the `blob_index` schema to Phase 02); this task does NOT create it (a second `CREATE TABLE blob_index` would error with `relation "blob_index" already exists` since the test harness applies every migration in lexical order). This task builds only the GC mechanism — `register_blob` and `mark_and_sweep` — over the existing table.
 
 **Files:**
-- Create: `src/sp0/runtime/blob_gc.py`
-- Modify: `tests/sp0/runtime/conftest.py` (add `recording_deleter`, `recording_audit` fixtures)
-- Test: `tests/sp0/runtime/test_blob_gc.py`
+- Create: `src/featuregen/runtime/blob_gc.py`
+- Modify: `tests/featuregen/runtime/conftest.py` (add `recording_deleter`, `recording_audit` fixtures)
+- Test: `tests/featuregen/runtime/test_blob_gc.py`
 
 **Interfaces:**
 - Consumes: `DbConn`; `documents` + `blob_index` (Phase 02); `insert_stub_document` fixture (Task 1).
@@ -2056,7 +2056,7 @@ A rolled-back step leaves an orphan blob (possibly sensitive). GC marks unrefere
 
 **TDD steps:**
 
-- [ ] **(1) Write the failing test.** First add fakes to `tests/sp0/runtime/conftest.py`:
+- [ ] **(1) Write the failing test.** First add fakes to `tests/featuregen/runtime/conftest.py`:
 
 ```python
 class _RecordingDeleter:
@@ -2085,14 +2085,14 @@ def recording_audit():
     return _RecordingAudit()
 ```
 
-Then `tests/sp0/runtime/test_blob_gc.py`:
+Then `tests/featuregen/runtime/test_blob_gc.py`:
 
 ```python
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
-from sp0.runtime.blob_gc import mark_and_sweep, register_blob
+from featuregen.runtime.blob_gc import mark_and_sweep, register_blob
 
 UTC = timezone.utc
 NOW = datetime(2026, 6, 27, 12, 0, tzinfo=UTC)
@@ -2171,11 +2171,11 @@ def test_gc_run_is_audited(conn, recording_deleter, recording_audit):
     assert recording_audit.reports[0].ran_at == NOW
 ```
 
-- [ ] **(2) Run it, expect FAIL.** `pytest tests/sp0/runtime/test_blob_gc.py -q` → `ModuleNotFoundError: No module named 'sp0.runtime.blob_gc'`. (The `blob_index` relation already exists — Phase 02's `0002_documents.sql` created it — so the ONLY failure is the missing module.)
+- [ ] **(2) Run it, expect FAIL.** `pytest tests/featuregen/runtime/test_blob_gc.py -q` → `ModuleNotFoundError: No module named 'featuregen.runtime.blob_gc'`. (The `blob_index` relation already exists — Phase 02's `0002_documents.sql` created it — so the ONLY failure is the missing module.)
 
 - [ ] **(3) Write minimal implementation.**
 
-`src/sp0/runtime/blob_gc.py` (no migration in this task — `blob_index` is owned and created by Phase 02):
+`src/featuregen/runtime/blob_gc.py` (no migration in this task — `blob_index` is owned and created by Phase 02):
 
 ```python
 from __future__ import annotations
@@ -2184,7 +2184,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Optional, Protocol, runtime_checkable
 
-from sp0.contracts import DbConn
+from featuregen.contracts import DbConn
 
 
 @runtime_checkable
@@ -2282,7 +2282,7 @@ def mark_and_sweep(
     return report
 ```
 
-- [ ] **(4) Run tests, expect PASS.** `pytest tests/sp0/runtime/test_blob_gc.py -q` → green.
+- [ ] **(4) Run tests, expect PASS.** `pytest tests/featuregen/runtime/test_blob_gc.py -q` → green.
 
 - [ ] **(5) Commit.** `git add -A && git commit -m "SP-0 Phase 05: blob_index + mark-and-sweep GC (quarantine + audit, §5.1)"`
 
@@ -2290,7 +2290,7 @@ def mark_and_sweep(
 
 ## Phase 05 done-check (spec §12 coverage map)
 
-Run the whole phase suite — `pytest tests/sp0/runtime/ -q` — and confirm these §12 rows are exercised:
+Run the whole phase suite — `pytest tests/featuregen/runtime/ -q` — and confirm these §12 rows are exercised:
 
 - **Timers** — ladder built (Task 2) and fired across restarts via the poller (Task 3); overdue fire on recovery (`test_overdue_timer_claimed_on_recovery`, Task 3); late timer can't escalate an answered/changed gate (`test_cas_mismatch_suppressed`, `test_answered_task_suppressed`, `test_cancel_on_answer_voids_unfired_rungs`, Task 4); auto-park rung and cost breaker share one handler (`test_auto_park_rung_uses_canonical_handler`, Task 4); business calendar (Task 1).
 - **External effects** — dispatcher crash after call: with handle → reconcile/no dup; without + no dedup → residual logged/flagged (no false dedup); with dedup → safe (Task 6); stale result after run advanced ignored, not applied (Task 7).

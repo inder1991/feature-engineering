@@ -61,15 +61,15 @@ Intent
 ## Repository contents
 
 ```
-docs/superpowers/specs/
+docs/architecture/
 ├── 2026-06-27-feature-engineering-platform-design.md     # the reference architecture (15 sections)
 ├── 2026-06-27-feature-engineering-platform-roadmap.md    # build decomposition (SP-0 … SP-12, 4 phases)
 └── 2026-06-27-sp0-foundations-design.md                  # SP-0 sub-project spec (the backbone)
 ```
 
-- **[Reference architecture →](docs/superpowers/specs/2026-06-27-feature-engineering-platform-design.md)** — full design: layers, contract schemas, validation packs, state machine, governance, generation & scoring.
-- **[Build roadmap →](docs/superpowers/specs/2026-06-27-feature-engineering-platform-roadmap.md)** — the platform split into independently-buildable sub-projects.
-- **[SP-0 Foundations spec →](docs/superpowers/specs/2026-06-27-sp0-foundations-design.md)** — the backbone: feature aggregate, event-sourced store, immutable document chain, state machine, durable runtime, identity/SoD.
+- **[Reference architecture →](docs/architecture/2026-06-27-feature-engineering-platform-design.md)** — full design: layers, contract schemas, validation packs, state machine, governance, generation & scoring.
+- **[Build roadmap →](docs/architecture/2026-06-27-feature-engineering-platform-roadmap.md)** — the platform split into independently-buildable sub-projects.
+- **[SP-0 Foundations spec →](docs/architecture/2026-06-27-sp0-foundations-design.md)** — the backbone: feature aggregate, event-sourced store, immutable document chain, state machine, durable runtime, identity/SoD.
 
 ## Build roadmap (summary)
 
@@ -86,4 +86,4 @@ Each sub-project gets its own `brainstorm (spec) → plan → implementation` cy
 
 ## Status & next steps
 
-This is a design-stage repository. **SP-0 (Foundations)** now has its own [design spec](docs/superpowers/specs/2026-06-27-sp0-foundations-design.md); the next step is its implementation plan, or brainstorming **SP-1 (Metadata Overlay)** in parallel.
+This is a design-stage repository. **SP-0 (Foundations)** now has its own [design spec](docs/architecture/2026-06-27-sp0-foundations-design.md); the next step is its implementation plan, or brainstorming **SP-1 (Metadata Overlay)** in parallel.

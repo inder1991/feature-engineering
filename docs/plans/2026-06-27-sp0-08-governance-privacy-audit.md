@@ -9,51 +9,51 @@
 ### File structure (one responsibility per file)
 
 ```
-src/sp0/contracts/provenance.py        # ProvenanceEnvelope dataclass (verbatim contract symbol; Phase 08 is authoritative)
-src/sp0/governance/__init__.py         # package marker
-src/sp0/governance/provenance.py       # build_provenance, validate_provenance, ProvenanceError
-src/sp0/governance/attributes.py       # GovernanceAttributes slots + validate + (de)serialize to feature_versions row
-src/sp0/governance/predicates.py       # 7 governance guard predicates + register_governance_predicates
-src/sp0/governance/replay.py           # ReplayMode, ArtifactReplayStatus, ReplayResult, replay_run
-src/sp0/privacy/__init__.py            # package marker
-src/sp0/privacy/classification.py      # body-classification consts + assert_references_only + validate_classification
-src/sp0/privacy/kms.py                 # KeyManager Protocol
-src/sp0/privacy/legal_hold.py          # place_legal_hold / release_legal_hold / is_under_legal_hold
-src/sp0/privacy/crypto_shred.py        # crypto_shred, ErasureOutcome, rotate_blob_key, BlobNotFoundError
-src/sp0/privacy/audit_read.py          # read_audit, AuditView, AuditReadDenied
-src/sp0/attempt_memory/__init__.py     # package marker
-src/sp0/attempt_memory/store.py        # AttemptMemoryEntry, record_attempt, lookup_attempt, count_candidates_explored
-src/sp0/db/migrations/0810_attempt_memory.sql   # attempt_memory (shared DDL, verbatim; Phase 08 owns creation)
-src/sp0/db/migrations/0820_legal_holds.sql      # legal_holds (Phase-08-owned NET-NEW table; not in the overview shared DDL)
-src/sp0/db/migrations/0830_erasure_audit.sql    # erasure_audit (Phase-08-owned NET-NEW table; not in the overview shared DDL)
+src/featuregen/contracts/provenance.py        # ProvenanceEnvelope dataclass (verbatim contract symbol; Phase 08 is authoritative)
+src/featuregen/governance/__init__.py         # package marker
+src/featuregen/governance/provenance.py       # build_provenance, validate_provenance, ProvenanceError
+src/featuregen/governance/attributes.py       # GovernanceAttributes slots + validate + (de)serialize to feature_versions row
+src/featuregen/governance/predicates.py       # 7 governance guard predicates + register_governance_predicates
+src/featuregen/governance/replay.py           # ReplayMode, ArtifactReplayStatus, ReplayResult, replay_run
+src/featuregen/privacy/__init__.py            # package marker
+src/featuregen/privacy/classification.py      # body-classification consts + assert_references_only + validate_classification
+src/featuregen/privacy/kms.py                 # KeyManager Protocol
+src/featuregen/privacy/legal_hold.py          # place_legal_hold / release_legal_hold / is_under_legal_hold
+src/featuregen/privacy/crypto_shred.py        # crypto_shred, ErasureOutcome, rotate_blob_key, BlobNotFoundError
+src/featuregen/privacy/audit_read.py          # read_audit, AuditView, AuditReadDenied
+src/featuregen/attempt_memory/__init__.py     # package marker
+src/featuregen/attempt_memory/store.py        # AttemptMemoryEntry, record_attempt, lookup_attempt, count_candidates_explored
+src/featuregen/db/migrations/0810_attempt_memory.sql   # attempt_memory (shared DDL, verbatim; Phase 08 owns creation)
+src/featuregen/db/migrations/0820_legal_holds.sql      # legal_holds (Phase-08-owned NET-NEW table; not in the overview shared DDL)
+src/featuregen/db/migrations/0830_erasure_audit.sql    # erasure_audit (Phase-08-owned NET-NEW table; not in the overview shared DDL)
 
-tests/sp0/_prereq_phase08.sql          # TEST-ONLY verbatim shared tables (global_seq_seq/events/documents/blob_index/feature_versions/security_audit; owned by Phases 01/02/05/06/07)
-tests/sp0/_phase08_db.py               # builds the Phase-08 `db` fixture (prereq + every src/sp0/db/migrations/08*.sql)
-tests/sp0/governance/conftest.py       # re-exports the Phase-08 `db` fixture for governance tests
-tests/sp0/privacy/conftest.py          # re-exports the Phase-08 `db` fixture for privacy tests
-tests/sp0/attempt_memory/conftest.py   # re-exports the Phase-08 `db` fixture for attempt-memory tests
+tests/featuregen/_prereq_phase08.sql          # TEST-ONLY verbatim shared tables (global_seq_seq/events/documents/blob_index/feature_versions/security_audit; owned by Phases 01/02/05/06/07)
+tests/featuregen/_phase08_db.py               # builds the Phase-08 `db` fixture (prereq + every src/featuregen/db/migrations/08*.sql)
+tests/featuregen/governance/conftest.py       # re-exports the Phase-08 `db` fixture for governance tests
+tests/featuregen/privacy/conftest.py          # re-exports the Phase-08 `db` fixture for privacy tests
+tests/featuregen/attempt_memory/conftest.py   # re-exports the Phase-08 `db` fixture for attempt-memory tests
 
-tests/sp0/governance/test_harness.py
-tests/sp0/governance/test_provenance.py
-tests/sp0/governance/test_attributes.py
-tests/sp0/governance/test_attributes_roundtrip.py
-tests/sp0/governance/test_predicates.py
-tests/sp0/governance/test_replay.py
-tests/sp0/privacy/test_classification.py
-tests/sp0/privacy/test_legal_hold.py
-tests/sp0/privacy/test_crypto_shred.py
-tests/sp0/privacy/test_key_rotation.py
-tests/sp0/privacy/test_audit_read.py
-tests/sp0/attempt_memory/test_store.py
+tests/featuregen/governance/test_harness.py
+tests/featuregen/governance/test_provenance.py
+tests/featuregen/governance/test_attributes.py
+tests/featuregen/governance/test_attributes_roundtrip.py
+tests/featuregen/governance/test_predicates.py
+tests/featuregen/governance/test_replay.py
+tests/featuregen/privacy/test_classification.py
+tests/featuregen/privacy/test_legal_hold.py
+tests/featuregen/privacy/test_crypto_shred.py
+tests/featuregen/privacy/test_key_rotation.py
+tests/featuregen/privacy/test_audit_read.py
+tests/featuregen/attempt_memory/test_store.py
 ```
 
 ### Consumed module paths & test harness
 
-- **Shared contract symbols** (`IdentityEnvelope`, `EventEnvelope`, `Command`, `GuardPredicate`, `GuardInputs`, `PredicateRegistry`, `DbConn`) are imported from `sp0.contracts` (the shared interfaces package established by Phase 01). They are used VERBATIM — never redefined here.
-- **`ProvenanceEnvelope`** is the one shared contract symbol Phase 08 is *authoritative* for. Phase 01 currently inlines it in `sp0.contracts.envelopes`; Task 1 reconciles that to a single source of truth in `sp0.contracts.provenance` and re-exports it from both `sp0.contracts.envelopes` and `sp0.contracts.__init__`, so `from sp0.contracts import ProvenanceEnvelope` (Phase 02 tests), `from sp0.contracts.envelopes import ProvenanceEnvelope` (Phase 02 modules), and `from sp0.contracts.provenance import ProvenanceEnvelope` (Phase 08) ALL resolve to the same class (no divergent duplicate — the overview's clearLayers rule).
-- **`load_stream`** (Phase 01) is imported from `sp0.events`. Only the *import path* is Phase 01's detail; the signature is the shared-contract one. We rely on the documented behaviour that `load_stream(..., expected=None)` returns stored events with no upcasting (so replay tests can seed raw event rows).
-- **`authorize_command` + `record_security_event` + `AuditReadDenied`** (Phase 07) live in `sp0.authz.policy` / `sp0.security.audit`. `read_audit` (Task 12) consumes `authorize_command(conn, cmd: Command) -> AuthzDecision` (the ONLY Phase-07 authz entrypoint — there is no `is_authorized`) and `record_security_event(conn, *, event_type, actor, attempted_action, decision, reason=None, aggregate=None, aggregate_id=None, retention_class="regulator") -> str`, and re-exports Phase 07's `AuditReadDenied` (single shared exception class, not redefined).
-- **`db` pytest fixture — Phase-08-owned (Task 0).** The wider suite is inconsistent about the DB harness (Phase 01 yields a `conn` fixture and applies a Python `MIGRATIONS` list, not a `*.sql` glob; Phase 06 and Phase 07 each create a `tests/sp0/conftest.py` `db` fixture with different loaders). Rather than depend on any of those, Phase 08 OWNS its own `db` fixture (Task 0) via per-package conftests under `tests/sp0/governance/`, `tests/sp0/privacy/`, `tests/sp0/attempt_memory/` (these shadow any parent `tests/sp0/conftest.py` `db`). The fixture drops+recreates `public`, applies `tests/sp0/_prereq_phase08.sql` (the shared `global_seq_seq`/`events`/`documents`/`blob_index`/`feature_versions`/`security_audit` objects transcribed verbatim — owned by Phases 01/02/05/06/07, test-only), then applies every `src/sp0/db/migrations/08*.sql` that exists (Phase 08's `0810`/`0820`/`0830`), and rolls back after each test. `pytest.ini`/`pyproject.toml` put `src` on `pythonpath`; `SP0_TEST_DSN` (default `postgresql:///sp0_test`) selects the test database.
+- **Shared contract symbols** (`IdentityEnvelope`, `EventEnvelope`, `Command`, `GuardPredicate`, `GuardInputs`, `PredicateRegistry`, `DbConn`) are imported from `featuregen.contracts` (the shared interfaces package established by Phase 01). They are used VERBATIM — never redefined here.
+- **`ProvenanceEnvelope`** is the one shared contract symbol Phase 08 is *authoritative* for. Phase 01 currently inlines it in `featuregen.contracts.envelopes`; Task 1 reconciles that to a single source of truth in `featuregen.contracts.provenance` and re-exports it from both `featuregen.contracts.envelopes` and `featuregen.contracts.__init__`, so `from featuregen.contracts import ProvenanceEnvelope` (Phase 02 tests), `from featuregen.contracts.envelopes import ProvenanceEnvelope` (Phase 02 modules), and `from featuregen.contracts.provenance import ProvenanceEnvelope` (Phase 08) ALL resolve to the same class (no divergent duplicate — the overview's clearLayers rule).
+- **`load_stream`** (Phase 01) is imported from `featuregen.events`. Only the *import path* is Phase 01's detail; the signature is the shared-contract one. We rely on the documented behaviour that `load_stream(..., expected=None)` returns stored events with no upcasting (so replay tests can seed raw event rows).
+- **`authorize_command` + `record_security_event` + `AuditReadDenied`** (Phase 07) live in `featuregen.authz.policy` / `featuregen.security.audit`. `read_audit` (Task 12) consumes `authorize_command(conn, cmd: Command) -> AuthzDecision` (the ONLY Phase-07 authz entrypoint — there is no `is_authorized`) and `record_security_event(conn, *, event_type, actor, attempted_action, decision, reason=None, aggregate=None, aggregate_id=None, retention_class="regulator") -> str`, and re-exports Phase 07's `AuditReadDenied` (single shared exception class, not redefined).
+- **`db` pytest fixture — Phase-08-owned (Task 0).** The wider suite is inconsistent about the DB harness (Phase 01 yields a `conn` fixture and applies a Python `MIGRATIONS` list, not a `*.sql` glob; Phase 06 and Phase 07 each create a `tests/featuregen/conftest.py` `db` fixture with different loaders). Rather than depend on any of those, Phase 08 OWNS its own `db` fixture (Task 0) via per-package conftests under `tests/featuregen/governance/`, `tests/featuregen/privacy/`, `tests/featuregen/attempt_memory/` (these shadow any parent `tests/featuregen/conftest.py` `db`). The fixture drops+recreates `public`, applies `tests/featuregen/_prereq_phase08.sql` (the shared `global_seq_seq`/`events`/`documents`/`blob_index`/`feature_versions`/`security_audit` objects transcribed verbatim — owned by Phases 01/02/05/06/07, test-only), then applies every `src/featuregen/db/migrations/08*.sql` that exists (Phase 08's `0810`/`0820`/`0830`), and rolls back after each test. `pytest.ini`/`pyproject.toml` put `src` on `pythonpath`; `SP0_TEST_DSN` (default `postgresql:///sp0_test`) selects the test database.
 - All `*_id` keys are ULID-style prefixed strings; tests mint them with `uuid.uuid4().hex` and the appropriate prefix.
 
 ---
@@ -77,18 +77,18 @@ consumed `db` fixture would not provision `feature_versions`/`events`/`documents
 > shadow fixture stays for fast unit isolation only.
 
 **Files:**
-- Create: `tests/sp0/_prereq_phase08.sql`, `tests/sp0/_phase08_db.py`, `tests/sp0/governance/conftest.py`, `tests/sp0/privacy/conftest.py`, `tests/sp0/attempt_memory/conftest.py`
-- Test: `tests/sp0/governance/test_harness.py`
+- Create: `tests/featuregen/_prereq_phase08.sql`, `tests/featuregen/_phase08_db.py`, `tests/featuregen/governance/conftest.py`, `tests/featuregen/privacy/conftest.py`, `tests/featuregen/attempt_memory/conftest.py`
+- Test: `tests/featuregen/governance/test_harness.py`
 
 **Interfaces:**
 - Consumes: `psycopg`; the shared `global_seq_seq`/`events`/`documents`/`blob_index`/`feature_versions`/`security_audit` DDL (transcribed verbatim, test-only — canonical owners are Phases 01/02/05/06/07); `SP0_TEST_DSN` (default `postgresql:///sp0_test`).
-- Produces: a function-scoped `db` fixture (open psycopg connection; schema rebuilt per test; rolled back after) shared by all Phase-08 test packages. It applies the prereq, then every `src/sp0/db/migrations/08*.sql` that exists, so each later task's migration is picked up automatically once created.
+- Produces: a function-scoped `db` fixture (open psycopg connection; schema rebuilt per test; rolled back after) shared by all Phase-08 test packages. It applies the prereq, then every `src/featuregen/db/migrations/08*.sql` that exists, so each later task's migration is picked up automatically once created.
 
 **TDD steps:**
 
 1. Write the failing test:
 ```python
-# tests/sp0/governance/test_harness.py
+# tests/featuregen/governance/test_harness.py
 def test_prereq_schema_and_global_seq_present(db):
     assert db.execute("SELECT nextval('global_seq_seq')").fetchone()[0] >= 1
     for table in ("events", "documents", "blob_index", "feature_versions", "security_audit"):
@@ -100,13 +100,13 @@ def test_prereq_schema_and_global_seq_present(db):
 
 2. Run it, expect FAIL:
 ```
-python -m pytest tests/sp0/governance/test_harness.py -q
+python -m pytest tests/featuregen/governance/test_harness.py -q
 ```
 Expected: `fixture 'db' not found` (no conftest yet).
 
 3. Write minimal implementation. First the verbatim prereq DDL (test-only):
 ```sql
--- tests/sp0/_prereq_phase08.sql
+-- tests/featuregen/_prereq_phase08.sql
 -- TEST-ONLY prerequisite DDL for the Phase 08 suite. Canonical owners: Phase 01
 -- (global_seq_seq, events), Phase 02 (documents), Phase 05 (blob_index), Phase 06
 -- (feature_versions), Phase 07 (security_audit). Transcribed verbatim from the shared
@@ -223,7 +223,7 @@ CREATE TABLE security_audit (
 Then the fixture builder (reads the prereq + globs Phase-08 migrations each call, so a migration
 added by a later task is applied automatically):
 ```python
-# tests/sp0/_phase08_db.py
+# tests/featuregen/_phase08_db.py
 from __future__ import annotations
 
 import glob
@@ -261,7 +261,7 @@ def db():
 Then the three per-package conftests re-export the fixture (each puts `tests/sp0` on `sys.path` so
 the bare `_phase08_db` module imports without assuming any package layout):
 ```python
-# tests/sp0/governance/conftest.py
+# tests/featuregen/governance/conftest.py
 import sys
 from pathlib import Path
 
@@ -269,7 +269,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # tests/sp0
 from _phase08_db import db  # noqa: E402,F401  (re-export the Phase-08 `db` fixture)
 ```
 ```python
-# tests/sp0/privacy/conftest.py
+# tests/featuregen/privacy/conftest.py
 import sys
 from pathlib import Path
 
@@ -277,7 +277,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # tests/sp0
 from _phase08_db import db  # noqa: E402,F401
 ```
 ```python
-# tests/sp0/attempt_memory/conftest.py
+# tests/featuregen/attempt_memory/conftest.py
 import sys
 from pathlib import Path
 
@@ -287,7 +287,7 @@ from _phase08_db import db  # noqa: E402,F401
 
 4. Run the test, expect PASS:
 ```
-python -m pytest tests/sp0/governance/test_harness.py -q
+python -m pytest tests/featuregen/governance/test_harness.py -q
 ```
 Expected: `1 passed`. (At this point no `08*.sql` exist yet, so only the prereq tables are present — exactly what this test asserts. Tasks 7–9 add the `0810`/`0820`/`0830` migrations, which the glob then applies.)
 
@@ -301,24 +301,24 @@ git add -A && git commit -m "test(sp0-08): Phase 08 db harness (verbatim prereq 
 ### Task 1 — `ProvenanceEnvelope` dataclass (the §8 reproducibility envelope)
 
 **Files:**
-- Create: `src/sp0/contracts/provenance.py`
-- Modify: `src/sp0/contracts/__init__.py`, `src/sp0/contracts/envelopes.py` (single-source re-export of `ProvenanceEnvelope`)
-- Test: `tests/sp0/governance/test_provenance.py`
+- Create: `src/featuregen/contracts/provenance.py`
+- Modify: `src/featuregen/contracts/__init__.py`, `src/featuregen/contracts/envelopes.py` (single-source re-export of `ProvenanceEnvelope`)
+- Test: `tests/featuregen/governance/test_provenance.py`
 
 **Interfaces:**
 - Consumes: stdlib only.
-- Produces: `ProvenanceEnvelope` (frozen, slots) — the verbatim shared-contract symbol; Phase 08 is authoritative. Defined once in `sp0.contracts.provenance` and re-exported from `sp0.contracts.envelopes` and `sp0.contracts.__init__` so all consumer import paths resolve to ONE class. Imported by Phase 01 (`EventEnvelope.provenance`), Phase 02 (`NewDocument.provenance`), and every handler.
+- Produces: `ProvenanceEnvelope` (frozen, slots) — the verbatim shared-contract symbol; Phase 08 is authoritative. Defined once in `featuregen.contracts.provenance` and re-exported from `featuregen.contracts.envelopes` and `featuregen.contracts.__init__` so all consumer import paths resolve to ONE class. Imported by Phase 01 (`EventEnvelope.provenance`), Phase 02 (`NewDocument.provenance`), and every handler.
 
 **TDD steps:**
 
 1. Write the failing test:
 ```python
-# tests/sp0/governance/test_provenance.py
+# tests/featuregen/governance/test_provenance.py
 from dataclasses import FrozenInstanceError
 
 import pytest
 
-from sp0.contracts.provenance import ProvenanceEnvelope
+from featuregen.contracts.provenance import ProvenanceEnvelope
 
 
 def test_provenance_envelope_is_frozen_slotted_and_carries_replay_pins():
@@ -354,22 +354,22 @@ def test_provenance_envelope_defaults_are_empty():
 
 def test_provenance_envelope_resolves_to_one_class_across_import_paths():
     # The overview's clearLayers rule: a shared symbol must be ONE class, not duplicated per phase.
-    from sp0.contracts import ProvenanceEnvelope as P_pkg
-    from sp0.contracts.envelopes import ProvenanceEnvelope as P_env
-    from sp0.contracts.provenance import ProvenanceEnvelope as P_mod
+    from featuregen.contracts import ProvenanceEnvelope as P_pkg
+    from featuregen.contracts.envelopes import ProvenanceEnvelope as P_env
+    from featuregen.contracts.provenance import ProvenanceEnvelope as P_mod
 
     assert P_pkg is P_env is P_mod
 ```
 
 2. Run it, expect FAIL:
 ```
-python -m pytest tests/sp0/governance/test_provenance.py -q
+python -m pytest tests/featuregen/governance/test_provenance.py -q
 ```
-Expected: `ModuleNotFoundError: No module named 'sp0.contracts.provenance'`.
+Expected: `ModuleNotFoundError: No module named 'featuregen.contracts.provenance'`.
 
 3. Write minimal implementation (verbatim from the shared contract):
 ```python
-# src/sp0/contracts/provenance.py
+# src/featuregen/contracts/provenance.py
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -398,17 +398,17 @@ in `envelopes.py`; replace that inline definition with a re-export, and re-expor
 `__init__` too, so every consumer import path returns ONE class (overview's clearLayers rule). `provenance.py`
 imports stdlib only, so this introduces no cycle:
 ```python
-# src/sp0/contracts/envelopes.py  — replace the inline `class ProvenanceEnvelope` with:
-from sp0.contracts.provenance import ProvenanceEnvelope  # single source of truth (Phase 08 authoritative)
+# src/featuregen/contracts/envelopes.py  — replace the inline `class ProvenanceEnvelope` with:
+from featuregen.contracts.provenance import ProvenanceEnvelope  # single source of truth (Phase 08 authoritative)
 ```
 ```python
-# src/sp0/contracts/__init__.py  — ensure this re-export is present and "ProvenanceEnvelope" stays in __all__:
-from sp0.contracts.provenance import ProvenanceEnvelope
+# src/featuregen/contracts/__init__.py  — ensure this re-export is present and "ProvenanceEnvelope" stays in __all__:
+from featuregen.contracts.provenance import ProvenanceEnvelope
 ```
 
 4. Run tests, expect PASS:
 ```
-python -m pytest tests/sp0/governance/test_provenance.py -q
+python -m pytest tests/featuregen/governance/test_provenance.py -q
 ```
 Expected: `3 passed`.
 
@@ -422,8 +422,8 @@ git add -A && git commit -m "feat(sp0-08): ProvenanceEnvelope reproducibility en
 ### Task 2 — `build_provenance` + `validate_provenance` (reproducibility builder & replay-pin / no-inline-PII validation)
 
 **Files:**
-- Create: `src/sp0/governance/__init__.py`, `src/sp0/governance/provenance.py`
-- Test: `tests/sp0/governance/test_provenance.py` (extend)
+- Create: `src/featuregen/governance/__init__.py`, `src/featuregen/governance/provenance.py`
+- Test: `tests/featuregen/governance/test_provenance.py` (extend)
 
 **Interfaces:**
 - Consumes: `ProvenanceEnvelope` (Task 1).
@@ -433,8 +433,8 @@ git add -A && git commit -m "feat(sp0-08): ProvenanceEnvelope reproducibility en
 
 1. Write the failing test (append):
 ```python
-# tests/sp0/governance/test_provenance.py  (append)
-from sp0.governance.provenance import ProvenanceError, build_provenance, validate_provenance
+# tests/featuregen/governance/test_provenance.py  (append)
+from featuregen.governance.provenance import ProvenanceError, build_provenance, validate_provenance
 
 
 def test_build_provenance_folds_named_tool_versions():
@@ -480,22 +480,22 @@ def test_validate_provenance_rejects_inline_external_refs_and_missing_replay_pin
 
 2. Run it, expect FAIL:
 ```
-python -m pytest tests/sp0/governance/test_provenance.py -q
+python -m pytest tests/featuregen/governance/test_provenance.py -q
 ```
-Expected: `ModuleNotFoundError: No module named 'sp0.governance.provenance'`.
+Expected: `ModuleNotFoundError: No module named 'featuregen.governance.provenance'`.
 
 3. Write minimal implementation:
 ```python
-# src/sp0/governance/__init__.py
+# src/featuregen/governance/__init__.py
 ```
 ```python
-# src/sp0/governance/provenance.py
+# src/featuregen/governance/provenance.py
 from __future__ import annotations
 
 import re
 from typing import Mapping, Optional
 
-from sp0.contracts.provenance import ProvenanceEnvelope
+from featuregen.contracts.provenance import ProvenanceEnvelope
 
 _REF_RE = re.compile(r"^[^\s:]+:[^\s]+$")  # a reference id token "kind:id" — never an inline body (§9)
 
@@ -564,7 +564,7 @@ def validate_provenance(prov: ProvenanceEnvelope, *, require_replay_pins: bool =
 
 4. Run tests, expect PASS:
 ```
-python -m pytest tests/sp0/governance/test_provenance.py -q
+python -m pytest tests/featuregen/governance/test_provenance.py -q
 ```
 Expected: `6 passed` (3 from Task 1 + 3 here).
 
@@ -578,8 +578,8 @@ git add -A && git commit -m "feat(sp0-08): provenance builder + replay-pin/no-in
 ### Task 3 — `GovernanceAttributes` typed slots + `validate_governance_attributes` (§3.8 mechanism, no policy values)
 
 **Files:**
-- Create: `src/sp0/governance/attributes.py`
-- Test: `tests/sp0/governance/test_attributes.py`
+- Create: `src/featuregen/governance/attributes.py`
+- Test: `tests/featuregen/governance/test_attributes.py`
 
 **Interfaces:**
 - Consumes: stdlib only.
@@ -589,10 +589,10 @@ git add -A && git commit -m "feat(sp0-08): provenance builder + replay-pin/no-in
 
 1. Write the failing test:
 ```python
-# tests/sp0/governance/test_attributes.py
+# tests/featuregen/governance/test_attributes.py
 import pytest
 
-from sp0.governance.attributes import (
+from featuregen.governance.attributes import (
     APPROVAL_TYPES,
     VERIFICATION_STAMPS,
     GovernanceAttributes,
@@ -638,13 +638,13 @@ def test_empty_required_ids_rejected():
 
 2. Run it, expect FAIL:
 ```
-python -m pytest tests/sp0/governance/test_attributes.py -q
+python -m pytest tests/featuregen/governance/test_attributes.py -q
 ```
-Expected: `ModuleNotFoundError: No module named 'sp0.governance.attributes'`.
+Expected: `ModuleNotFoundError: No module named 'featuregen.governance.attributes'`.
 
 3. Write minimal implementation:
 ```python
-# src/sp0/governance/attributes.py
+# src/featuregen/governance/attributes.py
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -695,7 +695,7 @@ def validate_governance_attributes(attrs: GovernanceAttributes) -> None:
 
 4. Run tests, expect PASS:
 ```
-python -m pytest tests/sp0/governance/test_attributes.py -q
+python -m pytest tests/featuregen/governance/test_attributes.py -q
 ```
 Expected: `5 passed`.
 
@@ -709,8 +709,8 @@ git add -A && git commit -m "feat(sp0-08): typed feature-version governance attr
 ### Task 4 — `to_feature_version_row` / `from_feature_version_row` (round-trip against the real `feature_versions` table)
 
 **Files:**
-- Modify: `src/sp0/governance/attributes.py`
-- Test: `tests/sp0/governance/test_attributes_roundtrip.py`
+- Modify: `src/featuregen/governance/attributes.py`
+- Test: `tests/featuregen/governance/test_attributes_roundtrip.py`
 
 **Interfaces:**
 - Consumes: `GovernanceAttributes` (Task 3); shared `feature_versions` DDL (owned/created by Phase 06, present via the `db` fixture); `psycopg.types.json.Json`.
@@ -720,10 +720,10 @@ git add -A && git commit -m "feat(sp0-08): typed feature-version governance attr
 
 1. Write the failing test:
 ```python
-# tests/sp0/governance/test_attributes_roundtrip.py
+# tests/featuregen/governance/test_attributes_roundtrip.py
 from datetime import datetime, timezone
 
-from sp0.governance.attributes import (
+from featuregen.governance.attributes import (
     GovernanceAttributes,
     from_feature_version_row,
     to_feature_version_row,
@@ -767,13 +767,13 @@ def test_governance_attributes_round_trip_through_feature_versions(db):
 
 2. Run it, expect FAIL:
 ```
-python -m pytest tests/sp0/governance/test_attributes_roundtrip.py -q
+python -m pytest tests/featuregen/governance/test_attributes_roundtrip.py -q
 ```
-Expected: `ImportError: cannot import name 'to_feature_version_row' from 'sp0.governance.attributes'`.
+Expected: `ImportError: cannot import name 'to_feature_version_row' from 'featuregen.governance.attributes'`.
 
 3. Write minimal implementation (append to `attributes.py`):
 ```python
-# src/sp0/governance/attributes.py  (append)
+# src/featuregen/governance/attributes.py  (append)
 from psycopg.types.json import Json
 
 
@@ -827,7 +827,7 @@ def from_feature_version_row(row: Mapping[str, object]) -> GovernanceAttributes:
 
 4. Run tests, expect PASS:
 ```
-python -m pytest tests/sp0/governance/test_attributes_roundtrip.py -q
+python -m pytest tests/featuregen/governance/test_attributes_roundtrip.py -q
 ```
 Expected: `1 passed`.
 
@@ -841,8 +841,8 @@ git add -A && git commit -m "feat(sp0-08): governance-attribute (de)serializatio
 ### Task 5 — Governance guard predicates + `register_governance_predicates` (approval/activation hooks; pure, declared-inputs-only)
 
 **Files:**
-- Create: `src/sp0/governance/predicates.py`
-- Test: `tests/sp0/governance/test_predicates.py`
+- Create: `src/featuregen/governance/predicates.py`
+- Test: `tests/featuregen/governance/test_predicates.py`
 
 **Interfaces:**
 - Consumes: `GuardPredicate`, `GuardInputs`, `PredicateRegistry` (shared contract, Phase 03); `VERIFICATION_STAMPS` (Task 3).
@@ -852,12 +852,12 @@ git add -A && git commit -m "feat(sp0-08): governance-attribute (de)serializatio
 
 1. Write the failing test:
 ```python
-# tests/sp0/governance/test_predicates.py
+# tests/featuregen/governance/test_predicates.py
 from datetime import datetime, timezone
 
 import pytest
 
-from sp0.governance.predicates import (
+from featuregen.governance.predicates import (
     GOVERNANCE_PREDICATES,
     approval_not_expired,
     approval_type_is,
@@ -935,19 +935,19 @@ def test_register_governance_predicates_registers_all_seven():
 
 2. Run it, expect FAIL:
 ```
-python -m pytest tests/sp0/governance/test_predicates.py -q
+python -m pytest tests/featuregen/governance/test_predicates.py -q
 ```
-Expected: `ModuleNotFoundError: No module named 'sp0.governance.predicates'`.
+Expected: `ModuleNotFoundError: No module named 'featuregen.governance.predicates'`.
 
 3. Write minimal implementation:
 ```python
-# src/sp0/governance/predicates.py
+# src/featuregen/governance/predicates.py
 from __future__ import annotations
 
 from dataclasses import dataclass
 
-from sp0.contracts import GuardInputs, GuardPredicate, PredicateRegistry
-from sp0.governance.attributes import VERIFICATION_STAMPS
+from featuregen.contracts import GuardInputs, GuardPredicate, PredicateRegistry
+from featuregen.governance.attributes import VERIFICATION_STAMPS
 
 
 @dataclass(frozen=True, slots=True)
@@ -1045,7 +1045,7 @@ def register_governance_predicates(registry: PredicateRegistry) -> None:
 
 4. Run tests, expect PASS:
 ```
-python -m pytest tests/sp0/governance/test_predicates.py -q
+python -m pytest tests/featuregen/governance/test_predicates.py -q
 ```
 Expected: `5 passed`.
 
@@ -1059,8 +1059,8 @@ git add -A && git commit -m "feat(sp0-08): pure governance guard predicates + re
 ### Task 6 — Body classification + `assert_references_only` (no raw PII inline, §9)
 
 **Files:**
-- Create: `src/sp0/privacy/__init__.py`, `src/sp0/privacy/classification.py`
-- Test: `tests/sp0/privacy/test_classification.py`
+- Create: `src/featuregen/privacy/__init__.py`, `src/featuregen/privacy/classification.py`
+- Test: `tests/featuregen/privacy/test_classification.py`
 
 **Interfaces:**
 - Consumes: stdlib only.
@@ -1070,10 +1070,10 @@ git add -A && git commit -m "feat(sp0-08): pure governance guard predicates + re
 
 1. Write the failing test:
 ```python
-# tests/sp0/privacy/test_classification.py
+# tests/featuregen/privacy/test_classification.py
 import pytest
 
-from sp0.privacy.classification import (
+from featuregen.privacy.classification import (
     BODY_CLASSIFICATIONS,
     GOVERNANCE_RETAINED,
     PII_ERASABLE,
@@ -1113,16 +1113,16 @@ def test_references_only_rejects_inline_bodies_and_skips_absent_fields():
 
 2. Run it, expect FAIL:
 ```
-python -m pytest tests/sp0/privacy/test_classification.py -q
+python -m pytest tests/featuregen/privacy/test_classification.py -q
 ```
-Expected: `ModuleNotFoundError: No module named 'sp0.privacy.classification'`.
+Expected: `ModuleNotFoundError: No module named 'featuregen.privacy.classification'`.
 
 3. Write minimal implementation:
 ```python
-# src/sp0/privacy/__init__.py
+# src/featuregen/privacy/__init__.py
 ```
 ```python
-# src/sp0/privacy/classification.py
+# src/featuregen/privacy/classification.py
 from __future__ import annotations
 
 import re
@@ -1157,7 +1157,7 @@ def assert_references_only(payload: Mapping[str, object], *, sensitive_fields: t
 
 4. Run tests, expect PASS:
 ```
-python -m pytest tests/sp0/privacy/test_classification.py -q
+python -m pytest tests/featuregen/privacy/test_classification.py -q
 ```
 Expected: `3 passed`.
 
@@ -1171,8 +1171,8 @@ git add -A && git commit -m "feat(sp0-08): body classification + no-raw-PII-inli
 ### Task 7 — Attempt-memory store (migration + `record_attempt`/`lookup_attempt`/`count_candidates_explored`, §3.9)
 
 **Files:**
-- Create: `src/sp0/db/migrations/0810_attempt_memory.sql`, `src/sp0/attempt_memory/__init__.py`, `src/sp0/attempt_memory/store.py`
-- Test: `tests/sp0/attempt_memory/test_store.py`
+- Create: `src/featuregen/db/migrations/0810_attempt_memory.sql`, `src/featuregen/attempt_memory/__init__.py`, `src/featuregen/attempt_memory/store.py`
+- Test: `tests/featuregen/attempt_memory/test_store.py`
 
 **Interfaces:**
 - Consumes: `db` fixture; the shared `attempt_memory` DDL (verbatim — Phase 08 owns this table's creation).
@@ -1182,10 +1182,10 @@ git add -A && git commit -m "feat(sp0-08): body classification + no-raw-PII-inli
 
 1. Write the failing test:
 ```python
-# tests/sp0/attempt_memory/test_store.py
+# tests/featuregen/attempt_memory/test_store.py
 import pytest
 
-from sp0.attempt_memory.store import (
+from featuregen.attempt_memory.store import (
     ATTEMPT_DISPOSITIONS,
     AttemptMemoryEntry,
     count_candidates_explored,
@@ -1233,13 +1233,13 @@ def test_count_candidates_explored_scopes_by_request_and_feature(db):
 
 2. Run it, expect FAIL:
 ```
-python -m pytest tests/sp0/attempt_memory/test_store.py -q
+python -m pytest tests/featuregen/attempt_memory/test_store.py -q
 ```
-Expected: `ModuleNotFoundError: No module named 'sp0.attempt_memory'` (or, once the package exists, a failure that `attempt_memory` table is missing because the migration is absent).
+Expected: `ModuleNotFoundError: No module named 'featuregen.attempt_memory'` (or, once the package exists, a failure that `attempt_memory` table is missing because the migration is absent).
 
 3. Write minimal implementation:
 ```sql
--- src/sp0/db/migrations/0810_attempt_memory.sql
+-- src/featuregen/db/migrations/0810_attempt_memory.sql
 -- attempt_memory — cross-aggregate dedup/exploration memory (§3.9). Owned by Phase 08.
 -- Non-PII by construction; exempt from routine crypto-shred.
 CREATE TABLE attempt_memory (
@@ -1257,17 +1257,17 @@ CREATE TABLE attempt_memory (
 CREATE INDEX attempt_memory_feature_idx ON attempt_memory (feature_id) WHERE feature_id IS NOT NULL;
 ```
 ```python
-# src/sp0/attempt_memory/__init__.py
+# src/featuregen/attempt_memory/__init__.py
 ```
 ```python
-# src/sp0/attempt_memory/store.py
+# src/featuregen/attempt_memory/store.py
 from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
-    from sp0.contracts import DbConn
+    from featuregen.contracts import DbConn
 
 ATTEMPT_DISPOSITIONS: tuple[str, ...] = ("explored", "discarded", "rejected", "selected", "promoted")
 
@@ -1348,7 +1348,7 @@ def count_candidates_explored(
 
 4. Run tests, expect PASS:
 ```
-python -m pytest tests/sp0/attempt_memory/test_store.py -q
+python -m pytest tests/featuregen/attempt_memory/test_store.py -q
 ```
 Expected: `4 passed`.
 
@@ -1362,8 +1362,8 @@ git add -A && git commit -m "feat(sp0-08): cross-aggregate attempt-memory store 
 ### Task 8 — Legal holds (migration + `place_legal_hold`/`release_legal_hold`/`is_under_legal_hold`)
 
 **Files:**
-- Create: `src/sp0/db/migrations/0820_legal_holds.sql`, `src/sp0/privacy/legal_hold.py`
-- Test: `tests/sp0/privacy/test_legal_hold.py`
+- Create: `src/featuregen/db/migrations/0820_legal_holds.sql`, `src/featuregen/privacy/legal_hold.py`
+- Test: `tests/featuregen/privacy/test_legal_hold.py`
 
 **Interfaces:**
 - Consumes: `db` fixture; `IdentityEnvelope` (shared contract); `psycopg.types.json.Json`; `dataclasses.asdict`.
@@ -1373,9 +1373,9 @@ git add -A && git commit -m "feat(sp0-08): cross-aggregate attempt-memory store 
 
 1. Write the failing test:
 ```python
-# tests/sp0/privacy/test_legal_hold.py
-from sp0.contracts import IdentityEnvelope
-from sp0.privacy.legal_hold import is_under_legal_hold, place_legal_hold, release_legal_hold
+# tests/featuregen/privacy/test_legal_hold.py
+from featuregen.contracts import IdentityEnvelope
+from featuregen.privacy.legal_hold import is_under_legal_hold, place_legal_hold, release_legal_hold
 
 ACTOR = IdentityEnvelope(
     subject="user:legal", actor_kind="human", authenticated=True,
@@ -1395,13 +1395,13 @@ def test_place_then_release_toggles_active_hold(db):
 
 2. Run it, expect FAIL:
 ```
-python -m pytest tests/sp0/privacy/test_legal_hold.py -q
+python -m pytest tests/featuregen/privacy/test_legal_hold.py -q
 ```
-Expected: `ModuleNotFoundError: No module named 'sp0.privacy.legal_hold'`.
+Expected: `ModuleNotFoundError: No module named 'featuregen.privacy.legal_hold'`.
 
 3. Write minimal implementation:
 ```sql
--- src/sp0/db/migrations/0820_legal_holds.sql
+-- src/featuregen/db/migrations/0820_legal_holds.sql
 -- legal_holds — §9 legal-hold / open-audit erasure exemption. Phase-08-owned NET-NEW table
 -- (not part of the overview shared DDL; nothing else references it).
 CREATE TABLE legal_holds (
@@ -1417,7 +1417,7 @@ CREATE TABLE legal_holds (
 CREATE INDEX legal_holds_active_idx ON legal_holds (scope_kind, scope_ref) WHERE released_at IS NULL;
 ```
 ```python
-# src/sp0/privacy/legal_hold.py
+# src/featuregen/privacy/legal_hold.py
 from __future__ import annotations
 
 from dataclasses import asdict
@@ -1425,10 +1425,10 @@ from typing import TYPE_CHECKING
 
 from psycopg.types.json import Json
 
-from sp0.contracts import IdentityEnvelope
+from featuregen.contracts import IdentityEnvelope
 
 if TYPE_CHECKING:
-    from sp0.contracts import DbConn
+    from featuregen.contracts import DbConn
 
 
 def place_legal_hold(
@@ -1462,7 +1462,7 @@ def is_under_legal_hold(conn: "DbConn", scope_kind: str, scope_ref: str) -> bool
 
 4. Run tests, expect PASS:
 ```
-python -m pytest tests/sp0/privacy/test_legal_hold.py -q
+python -m pytest tests/featuregen/privacy/test_legal_hold.py -q
 ```
 Expected: `1 passed`.
 
@@ -1476,8 +1476,8 @@ git add -A && git commit -m "feat(sp0-08): legal-hold mechanism for erasure exem
 ### Task 9 — `KeyManager` Protocol + `crypto_shred` (target pii-erasable; retain governance-of-active-versions & legal-hold; audited; security-stream & attempt-memory exempt, §9)
 
 **Files:**
-- Create: `src/sp0/db/migrations/0830_erasure_audit.sql`, `src/sp0/privacy/kms.py`, `src/sp0/privacy/crypto_shred.py`
-- Test: `tests/sp0/privacy/test_crypto_shred.py`
+- Create: `src/featuregen/db/migrations/0830_erasure_audit.sql`, `src/featuregen/privacy/kms.py`, `src/featuregen/privacy/crypto_shred.py`
+- Test: `tests/featuregen/privacy/test_crypto_shred.py`
 
 **Interfaces:**
 - Consumes: `db` fixture; shared `blob_index` DDL (Phase 02/05) and `security_audit` DDL (Phase 07) and `attempt_memory` (Task 7); `is_under_legal_hold` (Task 8); `GOVERNANCE_RETAINED` (Task 6); `IdentityEnvelope` (contract); `psycopg.types.json.Json`.
@@ -1488,11 +1488,11 @@ git add -A && git commit -m "feat(sp0-08): legal-hold mechanism for erasure exem
 
 1. Write the failing test:
 ```python
-# tests/sp0/privacy/test_crypto_shred.py
-from sp0.attempt_memory.store import record_attempt
-from sp0.contracts import IdentityEnvelope
-from sp0.privacy.crypto_shred import ErasureOutcome, crypto_shred
-from sp0.privacy.legal_hold import place_legal_hold
+# tests/featuregen/privacy/test_crypto_shred.py
+from featuregen.attempt_memory.store import record_attempt
+from featuregen.contracts import IdentityEnvelope
+from featuregen.privacy.crypto_shred import ErasureOutcome, crypto_shred
+from featuregen.privacy.legal_hold import place_legal_hold
 
 ACTOR = IdentityEnvelope(
     subject="user:dpo", actor_kind="human", authenticated=True,
@@ -1577,13 +1577,13 @@ def test_governance_retained_body_of_ungoverned_version_is_erasable(db):
 
 2. Run it, expect FAIL:
 ```
-python -m pytest tests/sp0/privacy/test_crypto_shred.py -q
+python -m pytest tests/featuregen/privacy/test_crypto_shred.py -q
 ```
-Expected: `ModuleNotFoundError: No module named 'sp0.privacy.crypto_shred'`.
+Expected: `ModuleNotFoundError: No module named 'featuregen.privacy.crypto_shred'`.
 
 3. Write minimal implementation:
 ```sql
--- src/sp0/db/migrations/0830_erasure_audit.sql
+-- src/featuregen/db/migrations/0830_erasure_audit.sql
 -- erasure_audit — audited crypto-shred trail (§9). Phase-08-owned NET-NEW table (not part of the
 -- overview shared DDL). Records erasures AND retentions.
 CREATE TABLE erasure_audit (
@@ -1600,7 +1600,7 @@ CREATE TABLE erasure_audit (
 CREATE INDEX erasure_audit_blob_idx ON erasure_audit (blob_id);
 ```
 ```python
-# src/sp0/privacy/kms.py
+# src/featuregen/privacy/kms.py
 from __future__ import annotations
 
 from typing import Protocol, runtime_checkable
@@ -1616,7 +1616,7 @@ class KeyManager(Protocol):
         """Re-encrypt the body under a fresh key; return the new kms_key_id."""
 ```
 ```python
-# src/sp0/privacy/crypto_shred.py
+# src/featuregen/privacy/crypto_shred.py
 from __future__ import annotations
 
 import uuid
@@ -1625,13 +1625,13 @@ from typing import TYPE_CHECKING, Callable, Iterable, Optional
 
 from psycopg.types.json import Json
 
-from sp0.contracts import IdentityEnvelope
-from sp0.privacy.classification import GOVERNANCE_RETAINED
-from sp0.privacy.kms import KeyManager
-from sp0.privacy.legal_hold import is_under_legal_hold
+from featuregen.contracts import IdentityEnvelope
+from featuregen.privacy.classification import GOVERNANCE_RETAINED
+from featuregen.privacy.kms import KeyManager
+from featuregen.privacy.legal_hold import is_under_legal_hold
 
 if TYPE_CHECKING:
-    from sp0.contracts import DbConn
+    from featuregen.contracts import DbConn
 
 # Resolves whether a blob's owning feature_version is currently active/governed (=> retain).
 # The concrete blob->feature_version->feature_active_versions mapping + active/governed predicate
@@ -1716,7 +1716,7 @@ def crypto_shred(
 
 4. Run tests, expect PASS:
 ```
-python -m pytest tests/sp0/privacy/test_crypto_shred.py -q
+python -m pytest tests/featuregen/privacy/test_crypto_shred.py -q
 ```
 Expected: `2 passed`.
 
@@ -1730,8 +1730,8 @@ git add -A && git commit -m "feat(sp0-08): crypto-shred targeting pii-erasable +
 ### Task 10 — `rotate_blob_key` (key rotation without rewriting events, §9)
 
 **Files:**
-- Modify: `src/sp0/privacy/crypto_shred.py`
-- Test: `tests/sp0/privacy/test_key_rotation.py`
+- Modify: `src/featuregen/privacy/crypto_shred.py`
+- Test: `tests/featuregen/privacy/test_key_rotation.py`
 
 **Interfaces:**
 - Consumes: `db` fixture; shared `blob_index` DDL; shared `events` DDL + `global_seq_seq` (Phase 01); `KeyManager` (Task 9).
@@ -1741,10 +1741,10 @@ git add -A && git commit -m "feat(sp0-08): crypto-shred targeting pii-erasable +
 
 1. Write the failing test:
 ```python
-# tests/sp0/privacy/test_key_rotation.py
+# tests/featuregen/privacy/test_key_rotation.py
 import pytest
 
-from sp0.privacy.crypto_shred import BlobNotFoundError, rotate_blob_key
+from featuregen.privacy.crypto_shred import BlobNotFoundError, rotate_blob_key
 
 
 class FakeKeyManager:
@@ -1791,13 +1791,13 @@ def test_rotate_updates_key_and_leaves_events_untouched(db):
 
 2. Run it, expect FAIL:
 ```
-python -m pytest tests/sp0/privacy/test_key_rotation.py -q
+python -m pytest tests/featuregen/privacy/test_key_rotation.py -q
 ```
-Expected: `ImportError: cannot import name 'BlobNotFoundError' from 'sp0.privacy.crypto_shred'`.
+Expected: `ImportError: cannot import name 'BlobNotFoundError' from 'featuregen.privacy.crypto_shred'`.
 
 3. Write minimal implementation (append to `crypto_shred.py`):
 ```python
-# src/sp0/privacy/crypto_shred.py  (append)
+# src/featuregen/privacy/crypto_shred.py  (append)
 class BlobNotFoundError(Exception):
     """Raised when a referenced blob_id is absent from blob_index."""
 
@@ -1817,7 +1817,7 @@ def rotate_blob_key(conn: "DbConn", blob_id: str, *, key_manager: KeyManager) ->
 
 4. Run tests, expect PASS:
 ```
-python -m pytest tests/sp0/privacy/test_key_rotation.py -q
+python -m pytest tests/featuregen/privacy/test_key_rotation.py -q
 ```
 Expected: `1 passed`.
 
@@ -1831,19 +1831,19 @@ git add -A && git commit -m "feat(sp0-08): per-body key rotation without rewriti
 ### Task 11 — `replay_run` (labeled full vs privacy-degraded replay, §8)
 
 **Files:**
-- Create: `src/sp0/governance/replay.py`
-- Test: `tests/sp0/governance/test_replay.py`
+- Create: `src/featuregen/governance/replay.py`
+- Test: `tests/featuregen/governance/test_replay.py`
 
 **Interfaces:**
-- Consumes: `load_stream(conn, aggregate, aggregate_id, *, upto_seq=None, expected=None)` (shared contract; imported from `sp0.events`); shared `documents` + `blob_index` DDL; `EventEnvelope` (contract).
+- Consumes: `load_stream(conn, aggregate, aggregate_id, *, upto_seq=None, expected=None)` (shared contract; imported from `featuregen.events`); shared `documents` + `blob_index` DDL; `EventEnvelope` (contract).
 - Produces: `ReplayMode` (`FULL`/`PRIVACY_DEGRADED`); `ArtifactReplayStatus` (frozen, slots: `doc_id`, `stage`, `intact`, `degraded_reason`); `ReplayResult` (frozen, slots: `run_id`, `mode`, `events`, `artifacts`, `degraded_artifacts`); `replay_run(conn, run_id, *, upto_seq=None, expected=None) -> ReplayResult`. Labels mode = `PRIVACY_DEGRADED` iff any committed doc's body is `shredded`; metadata-only docs (`body_ref IS NULL`) and `governance-retained` (never shredded) bodies stay intact.
 
 **TDD steps:**
 
 1. Write the failing test:
 ```python
-# tests/sp0/governance/test_replay.py
-from sp0.governance.replay import ArtifactReplayStatus, ReplayMode, replay_run
+# tests/featuregen/governance/test_replay.py
+from featuregen.governance.replay import ArtifactReplayStatus, ReplayMode, replay_run
 
 
 def _seed_event(db, run_id):
@@ -1906,24 +1906,24 @@ def test_privacy_degraded_replay_labels_shredded_artifacts(db):
 
 2. Run it, expect FAIL:
 ```
-python -m pytest tests/sp0/governance/test_replay.py -q
+python -m pytest tests/featuregen/governance/test_replay.py -q
 ```
-Expected: `ModuleNotFoundError: No module named 'sp0.governance.replay'`.
+Expected: `ModuleNotFoundError: No module named 'featuregen.governance.replay'`.
 
 3. Write minimal implementation:
 ```python
-# src/sp0/governance/replay.py
+# src/featuregen/governance/replay.py
 from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING, Mapping, Optional
 
-from sp0.contracts import EventEnvelope
-from sp0.events import load_stream
+from featuregen.contracts import EventEnvelope
+from featuregen.events import load_stream
 
 if TYPE_CHECKING:
-    from sp0.contracts import DbConn
+    from featuregen.contracts import DbConn
 
 
 class ReplayMode(str, Enum):
@@ -2001,7 +2001,7 @@ def replay_run(
 
 4. Run tests, expect PASS:
 ```
-python -m pytest tests/sp0/governance/test_replay.py -q
+python -m pytest tests/featuregen/governance/test_replay.py -q
 ```
 Expected: `2 passed`.
 
@@ -2015,11 +2015,11 @@ git add -A && git commit -m "feat(sp0-08): labeled full vs privacy-degraded repl
 ### Task 12 — `read_audit` (authorized + logged audit read, §9/§6.2)
 
 **Files:**
-- Create: `src/sp0/privacy/audit_read.py`
-- Test: `tests/sp0/privacy/test_audit_read.py`
+- Create: `src/featuregen/privacy/audit_read.py`
+- Test: `tests/featuregen/privacy/test_audit_read.py`
 
 **Interfaces:**
-- Consumes: `replay_run` (Task 11); `Command` + `IdentityEnvelope` + `EventEnvelope` (contract); Phase 07's `AuditReadDenied` from `sp0.security.audit` — re-exported, NOT redefined (single shared exception class; the overview forbids divergent same-named definitions across phases); two injected Phase-07 callables (dependency-injected to avoid a hard `src/` import cycle, but matched to Phase 07's REAL signatures):
+- Consumes: `replay_run` (Task 11); `Command` + `IdentityEnvelope` + `EventEnvelope` (contract); Phase 07's `AuditReadDenied` from `featuregen.security.audit` — re-exported, NOT redefined (single shared exception class; the overview forbids divergent same-named definitions across phases); two injected Phase-07 callables (dependency-injected to avoid a hard `src/` import cycle, but matched to Phase 07's REAL signatures):
   - `authorize_command(conn, cmd: Command) -> AuthzDecision` — the ONLY Phase-07 authz entrypoint (there is no `is_authorized`). `read_audit` builds a synthetic `Command(action="read_audit", aggregate="run", aggregate_id=run_id, …)` and checks `decision.allowed`/`decision.reason`.
   - `record_security_event(conn, *, event_type: str, actor: IdentityEnvelope, attempted_action: str, decision: str, reason: str | None = None, aggregate: str | None = None, aggregate_id: str | None = None) -> str` (Phase 07 owns the `security_audit` tamper-evident chain; `decision` ∈ the DDL CHECK `denied`/`allowed_break_glass`/`flagged`).
 - Produces: `AuditView` (frozen, slots: `run_id`, `events`, `mode`, `degraded_artifacts`); `read_audit(conn, *, run_id, actor, authorize_command, record_security_event, upto_seq=None) -> AuditView`; re-exports `AuditReadDenied`. Action vocabulary used: `"read_audit"` (the canonical §6.2 action — matches Phase 07's `authz_policy` seed rows for `auditor`/`compliance`/`owner`; an authorizer keyed on the action would deny anything else). Every read writes an `AUDIT_READ` security entry (`flagged` on allow, `denied` on deny); a denied read raises `AuditReadDenied` and never returns data.
@@ -2028,12 +2028,12 @@ git add -A && git commit -m "feat(sp0-08): labeled full vs privacy-degraded repl
 
 1. Write the failing test:
 ```python
-# tests/sp0/privacy/test_audit_read.py
+# tests/featuregen/privacy/test_audit_read.py
 import pytest
 
-from sp0.contracts import IdentityEnvelope
-from sp0.governance.replay import ReplayMode
-from sp0.privacy.audit_read import AuditReadDenied, AuditView, read_audit
+from featuregen.contracts import IdentityEnvelope
+from featuregen.governance.replay import ReplayMode
+from featuregen.privacy.audit_read import AuditReadDenied, AuditView, read_audit
 
 ACTOR = IdentityEnvelope(
     subject="user:auditor", actor_kind="human", authenticated=True,
@@ -2109,25 +2109,25 @@ def test_denied_read_logs_denial_and_raises_without_returning_data(db):
 
 2. Run it, expect FAIL:
 ```
-python -m pytest tests/sp0/privacy/test_audit_read.py -q
+python -m pytest tests/featuregen/privacy/test_audit_read.py -q
 ```
-Expected: `ModuleNotFoundError: No module named 'sp0.privacy.audit_read'`.
+Expected: `ModuleNotFoundError: No module named 'featuregen.privacy.audit_read'`.
 
 3. Write minimal implementation:
 ```python
-# src/sp0/privacy/audit_read.py
+# src/featuregen/privacy/audit_read.py
 from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, Optional
 
-from sp0.contracts import Command, EventEnvelope, IdentityEnvelope
-from sp0.governance.replay import ReplayMode, replay_run
-from sp0.security.audit import AuditReadDenied  # single shared exception class (Phase 07 authoritative)
+from featuregen.contracts import Command, EventEnvelope, IdentityEnvelope
+from featuregen.governance.replay import ReplayMode, replay_run
+from featuregen.security.audit import AuditReadDenied  # single shared exception class (Phase 07 authoritative)
 
 if TYPE_CHECKING:
-    from sp0.contracts import DbConn
+    from featuregen.contracts import DbConn
 
 __all__ = ["AuditView", "AuditReadDenied", "read_audit"]
 
@@ -2192,7 +2192,7 @@ def read_audit(
 
 4. Run tests, expect PASS:
 ```
-python -m pytest tests/sp0/privacy/test_audit_read.py -q
+python -m pytest tests/featuregen/privacy/test_audit_read.py -q
 ```
 Expected: `2 passed`.
 
@@ -2207,6 +2207,6 @@ git add -A && git commit -m "feat(sp0-08): authorized + logged audit read with d
 
 Run the whole phase suite green before handing off:
 ```
-python -m pytest tests/sp0/governance tests/sp0/privacy tests/sp0/attempt_memory -q
+python -m pytest tests/featuregen/governance tests/featuregen/privacy tests/featuregen/attempt_memory -q
 ```
-Expected: all phase tests pass. This phase delivers the §3.8/§3.9/§8/§9 *mechanism* only — verification-threshold values, risk-tier ordering/ceilings, use-case permission matrices, the active/governed predicate behind crypto-shred retention, retention cadences, and the concrete KMS/blob/security-chain bindings remain owned by SP-9/SP-10/SP-12 and the runtime phases. Cross-phase wiring points: the injected Phase-07 callables (`authorize_command(conn, cmd) -> AuthzDecision`, `record_security_event`), the re-exported `AuditReadDenied` (`sp0.security.audit`), the `ProvenanceEnvelope` single-source re-export (Task 1), the `governance_active` resolver hook (Task 9), and the `load_stream` import path (`sp0.events`). The Phase-08-owned `db` fixture (Task 0) provisions the shared tables verbatim plus Phase 08's `08*.sql` migrations, so the UNIT suite is self-contained for fast iteration; that shadow fixture is for unit isolation only and is NOT the canonical-sufficiency proof. The authoritative cross-phase check is the `tests/integration/` suite (per Task 0's integration-suite requirement) that runs ONLY the canonical `sp0/db/migrations.py` module — never the `_prereq_phase08.sql` shadow or the `08*.sql` glob — proving the real migrations are sufficient and consistent. Confirm the final Phase-01/07 names at integration and reconcile via the overview if they differ.
+Expected: all phase tests pass. This phase delivers the §3.8/§3.9/§8/§9 *mechanism* only — verification-threshold values, risk-tier ordering/ceilings, use-case permission matrices, the active/governed predicate behind crypto-shred retention, retention cadences, and the concrete KMS/blob/security-chain bindings remain owned by SP-9/SP-10/SP-12 and the runtime phases. Cross-phase wiring points: the injected Phase-07 callables (`authorize_command(conn, cmd) -> AuthzDecision`, `record_security_event`), the re-exported `AuditReadDenied` (`featuregen.security.audit`), the `ProvenanceEnvelope` single-source re-export (Task 1), the `governance_active` resolver hook (Task 9), and the `load_stream` import path (`featuregen.events`). The Phase-08-owned `db` fixture (Task 0) provisions the shared tables verbatim plus Phase 08's `08*.sql` migrations, so the UNIT suite is self-contained for fast iteration; that shadow fixture is for unit isolation only and is NOT the canonical-sufficiency proof. The authoritative cross-phase check is the `tests/integration/` suite (per Task 0's integration-suite requirement) that runs ONLY the canonical `sp0/db/migrations.py` module — never the `_prereq_phase08.sql` shadow or the `08*.sql` glob — proving the real migrations are sufficient and consistent. Confirm the final Phase-01/07 names at integration and reconcile via the overview if they differ.

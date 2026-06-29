@@ -21,9 +21,9 @@
 ### File structure
 
 ```
-src/sp0/db/migrations.py            # EDIT (Phase 01-owned): add STATE_MACHINE_DDL constant + append
+src/featuregen/db/migrations.py            # EDIT (Phase 01-owned): add STATE_MACHINE_DDL constant + append
                                     #   ("0030_state_machine", STATE_MACHINE_DDL) to the MIGRATIONS list
-src/sp0/state_machine/
+src/featuregen/state_machine/
     __init__.py                     # package marker
     ddl.py                          # STATE_MACHINE_DDL string: run_transition_table, feature_lifecycle_table (verbatim)
     guard_expr.py                   # boolean expr parser/eval (AND/OR/NOT/parens), pure
@@ -32,7 +32,7 @@ src/sp0/state_machine/
     engine.py                       # evaluate_transition, TransitionResult, GUARD_FAILED/TRANSITION_REJECTED
     event_types.py                  # register Phase-03 event-type schemas into the event registry
     migrations.py                   # migrate_workflow_version / migrate_feature_lifecycle_version
-tests/sp0/state_machine/
+tests/featuregen/state_machine/
     _predicates.py                  # test-only GuardPredicate stubs (Truthy/Peeking)
     conftest.py                     # per-test (autouse) registration of SM event types + SM_TEST_SEED
     test_schema.py                  # DDL shape + PK behaviour
@@ -45,10 +45,10 @@ tests/sp0/state_machine/
 ```
 
 **Consumed from earlier phases / shared contract** (import, never redefine):
-- `sp0.contracts`: `GuardInputs`, `GuardPredicate`, `GuardOutcome`, `PredicateRegistry`, `IdentityEnvelope`, `ProvenanceEnvelope`, `EventEnvelope`, `NewEvent`, `ConcurrencyError`, `SchemaValidationError`.
-- `sp0.events.store` (Phase 01): `append_event(conn, new_event, *, expected_version, table_version) -> EventEnvelope`, `load_stream(conn, aggregate, aggregate_id, *, upto_seq=None, expected=None) -> list[EventEnvelope]`.
-- `sp0.events.registry` (Phase 01): the **module-level accessor function** `event_registry() -> EventSchemaRegistry` (NOT a bare instance — it is a singleton accessor; you must **call** it: `event_registry().register_schema(...)`, `event_registry().validate(...)`). The returned `EventSchemaRegistry` is what `append_event` validates against and exposes `register_schema(type_name, schema_version, json_schema, owner, *, status="active") -> None` and `validate(type_name, schema_version, body) -> None`. Also `reset_event_registry() -> None` (used by Phase 01's per-test reset fixture). *These import paths (`sp0.events.store`, `sp0.events.registry`) and the function-vs-instance shape of `event_registry()` are the real Phase 01 surface — do not re-create `sp0.event_store` and do not treat `event_registry` as a bare instance.*
-- `tests/conftest.py` (Phase 01, repository-root test conftest — applies to ALL tests including `tests/sp0/state_machine/`, inherited automatically): produces the function-scoped `conn` pytest fixture — a real `psycopg` connection (DSN `SP0_TEST_DSN`, default `postgresql:///sp0_test`) in a transaction that is **rolled back after each test**. The DDL is **not** glob-loaded from `*.sql`; it is the hardcoded Python `MIGRATIONS: list[tuple[str, str]]` in `src/sp0/db/migrations.py`, applied **once per session** by the session-scoped `_migrated` fixture via `apply_migrations(conn)` (which `COMMIT`s). The same conftest also defines a **function-scoped autouse `_reset_registry`** fixture that calls `reset_event_registry()` before AND after every test — so any registry registrations a child fixture needs must be (re)done per-test, AFTER `_reset_registry` runs (see Task 6's conftest).
+- `featuregen.contracts`: `GuardInputs`, `GuardPredicate`, `GuardOutcome`, `PredicateRegistry`, `IdentityEnvelope`, `ProvenanceEnvelope`, `EventEnvelope`, `NewEvent`, `ConcurrencyError`, `SchemaValidationError`.
+- `featuregen.events.store` (Phase 01): `append_event(conn, new_event, *, expected_version, table_version) -> EventEnvelope`, `load_stream(conn, aggregate, aggregate_id, *, upto_seq=None, expected=None) -> list[EventEnvelope]`.
+- `featuregen.events.registry` (Phase 01): the **module-level accessor function** `event_registry() -> EventSchemaRegistry` (NOT a bare instance — it is a singleton accessor; you must **call** it: `event_registry().register_schema(...)`, `event_registry().validate(...)`). The returned `EventSchemaRegistry` is what `append_event` validates against and exposes `register_schema(type_name, schema_version, json_schema, owner, *, status="active") -> None` and `validate(type_name, schema_version, body) -> None`. Also `reset_event_registry() -> None` (used by Phase 01's per-test reset fixture). *These import paths (`featuregen.events.store`, `featuregen.events.registry`) and the function-vs-instance shape of `event_registry()` are the real Phase 01 surface — do not re-create `featuregen.event_store` and do not treat `event_registry` as a bare instance.*
+- `tests/conftest.py` (Phase 01, repository-root test conftest — applies to ALL tests including `tests/featuregen/state_machine/`, inherited automatically): produces the function-scoped `conn` pytest fixture — a real `psycopg` connection (DSN `SP0_TEST_DSN`, default `postgresql:///sp0_test`) in a transaction that is **rolled back after each test**. The DDL is **not** glob-loaded from `*.sql`; it is the hardcoded Python `MIGRATIONS: list[tuple[str, str]]` in `src/featuregen/db/migrations.py`, applied **once per session** by the session-scoped `_migrated` fixture via `apply_migrations(conn)` (which `COMMIT`s). The same conftest also defines a **function-scoped autouse `_reset_registry`** fixture that calls `reset_event_registry()` before AND after every test — so any registry registrations a child fixture needs must be (re)done per-test, AFTER `_reset_registry` runs (see Task 6's conftest).
 
 **This phase is authoritative for** these contract symbols (shapes are the contract's verbatim; this phase provides the concrete behaviour): `GuardPredicate`, `GuardOutcome`, `GuardInputs`, `PredicateRegistry`.
 
@@ -57,19 +57,19 @@ tests/sp0/state_machine/
 ## Task 1 — DDL migration for the two transition tables
 
 **Files:**
-- Create: `src/sp0/state_machine/__init__.py`, `src/sp0/state_machine/ddl.py`
-- Edit (Phase 01-owned): `src/sp0/db/migrations.py`
-- Test: `tests/sp0/state_machine/test_schema.py`
+- Create: `src/featuregen/state_machine/__init__.py`, `src/featuregen/state_machine/ddl.py`
+- Edit (Phase 01-owned): `src/featuregen/db/migrations.py`
+- Test: `tests/featuregen/state_machine/test_schema.py`
 
 **Interfaces:**
-- Consumes: the `conn` fixture (Phase 01, `tests/conftest.py`) and Phase 01's migration mechanism — the Python `MIGRATIONS: list[tuple[str, str]]` in `src/sp0/db/migrations.py`, applied once per session by `apply_migrations(conn)`. Phase 01 does **not** glob `src/sp0/migrations/*.sql`, so this phase's DDL must be **registered into that list** to be created.
-- Produces: the `STATE_MACHINE_DDL` SQL string (in `src/sp0/state_machine/ddl.py`) and tables `run_transition_table`, `feature_lifecycle_table` (DDL exactly as the shared contract declares; `feature_lifecycle_table` is `LIKE run_transition_table INCLUDING ALL`, so it inherits the composite primary key `(table_version, from_state, trigger, precedence)`). Created by appending `("0030_state_machine", STATE_MACHINE_DDL)` to `MIGRATIONS`.
+- Consumes: the `conn` fixture (Phase 01, `tests/conftest.py`) and Phase 01's migration mechanism — the Python `MIGRATIONS: list[tuple[str, str]]` in `src/featuregen/db/migrations.py`, applied once per session by `apply_migrations(conn)`. Phase 01 does **not** glob `src/featuregen/migrations/*.sql`, so this phase's DDL must be **registered into that list** to be created.
+- Produces: the `STATE_MACHINE_DDL` SQL string (in `src/featuregen/state_machine/ddl.py`) and tables `run_transition_table`, `feature_lifecycle_table` (DDL exactly as the shared contract declares; `feature_lifecycle_table` is `LIKE run_transition_table INCLUDING ALL`, so it inherits the composite primary key `(table_version, from_state, trigger, precedence)`). Created by appending `("0030_state_machine", STATE_MACHINE_DDL)` to `MIGRATIONS`.
 
-> **Why edit Phase 01's `src/sp0/db/migrations.py`?** Per the overview, the table is declared once in the overview and **the owning phase creates the migration**. Phase 03 owns these two tables, but Phase 01 owns the *migration runner mechanism* (a Python list, not a `*.sql` glob). The only way the harness creates these tables is to add an entry to `MIGRATIONS`. This cross-phase edit is the wiring point; it adds one constant + one list entry and changes no existing Phase 01 DDL. (If a future Phase 01 revision adopts a `src/sp0/migrations/*.sql` glob loader, that is a contract change to raise back to the overview; until then, wire into the list.)
+> **Why edit Phase 01's `src/featuregen/db/migrations.py`?** Per the overview, the table is declared once in the overview and **the owning phase creates the migration**. Phase 03 owns these two tables, but Phase 01 owns the *migration runner mechanism* (a Python list, not a `*.sql` glob). The only way the harness creates these tables is to add an entry to `MIGRATIONS`. This cross-phase edit is the wiring point; it adds one constant + one list entry and changes no existing Phase 01 DDL. (If a future Phase 01 revision adopts a `src/featuregen/migrations/*.sql` glob loader, that is a contract change to raise back to the overview; until then, wire into the list.)
 
 ### TDD steps
 
-1. **Write the failing test** — `tests/sp0/state_machine/test_schema.py`:
+1. **Write the failing test** — `tests/featuregen/state_machine/test_schema.py`:
 
 ```python
 from __future__ import annotations
@@ -116,24 +116,24 @@ def test_feature_lifecycle_table_pk_enforced(conn) -> None:
             cur.execute(ins)
 ```
 
-2. **Run it, expect FAIL** — `python -m pytest tests/sp0/state_machine/test_schema.py -q`. Expected: errors like `psycopg.errors.UndefinedTable: relation "run_transition_table" does not exist`. The tables are absent because the DDL is not yet registered into Phase 01's `MIGRATIONS` list (Phase 01 applies only `0001`–`0006`).
+2. **Run it, expect FAIL** — `python -m pytest tests/featuregen/state_machine/test_schema.py -q`. Expected: errors like `psycopg.errors.UndefinedTable: relation "run_transition_table" does not exist`. The tables are absent because the DDL is not yet registered into Phase 01's `MIGRATIONS` list (Phase 01 applies only `0001`–`0006`).
 
 3. **Write minimal implementation.**
 
-First the package marker `src/sp0/state_machine/__init__.py`:
+First the package marker `src/featuregen/state_machine/__init__.py`:
 
 ```python
 """SP-0 Phase 03: declarative state-machine engine (§4.1/§4.2)."""
 ```
 
-Then the DDL string `src/sp0/state_machine/ddl.py` (verbatim from the shared-contract DDL; imports nothing, so wiring it into Phase 01's runner creates no import cycle):
+Then the DDL string `src/featuregen/state_machine/ddl.py` (verbatim from the shared-contract DDL; imports nothing, so wiring it into Phase 01's runner creates no import cycle):
 
 ```python
 from __future__ import annotations
 
 # Phase 03: versioned declarative state-machine tables (§4.1/§4.2).
 # Each row is one transition; aggregates pin a table_version. Registered into
-# Phase 01's MIGRATIONS list by editing src/sp0/db/migrations.py (see below).
+# Phase 01's MIGRATIONS list by editing src/featuregen/db/migrations.py (see below).
 STATE_MACHINE_DDL = """
 CREATE TABLE run_transition_table (
     table_version integer     NOT NULL,
@@ -151,11 +151,11 @@ CREATE TABLE feature_lifecycle_table (LIKE run_transition_table INCLUDING ALL);
 """
 ```
 
-Then wire it into Phase 01's migration runner — edit `src/sp0/db/migrations.py`: add the import near the existing imports at the top, and **append** one entry to the existing `MIGRATIONS` list (append-only; do not reorder or alter the `0001`–`0006` entries):
+Then wire it into Phase 01's migration runner — edit `src/featuregen/db/migrations.py`: add the import near the existing imports at the top, and **append** one entry to the existing `MIGRATIONS` list (append-only; do not reorder or alter the `0001`–`0006` entries):
 
 ```python
-# near the top imports of src/sp0/db/migrations.py
-from sp0.state_machine.ddl import STATE_MACHINE_DDL
+# near the top imports of src/featuregen/db/migrations.py
+from featuregen.state_machine.ddl import STATE_MACHINE_DDL
 
 # ... existing GLOBAL_SEQ / EVENTS / ... constants and MIGRATIONS list ...
 
@@ -172,12 +172,12 @@ MIGRATIONS: list[tuple[str, str]] = [
 
 `apply_migrations` executes the list in order; the SM tables have no FK to the core tables, so they are appended last for clarity. (Like the rest of Phase 01's DDL, these use plain `CREATE TABLE`, so the harness assumes a fresh database per session — the existing Phase 01 contract.)
 
-4. **Run tests, expect PASS** — `python -m pytest tests/sp0/state_machine/test_schema.py -q`. Expected: 3 passed (the session-scoped `_migrated` fixture now creates both tables).
+4. **Run tests, expect PASS** — `python -m pytest tests/featuregen/state_machine/test_schema.py -q`. Expected: 3 passed (the session-scoped `_migrated` fixture now creates both tables).
 
 5. **Commit:**
 
 ```
-git add src/sp0/state_machine/__init__.py src/sp0/state_machine/ddl.py src/sp0/db/migrations.py tests/sp0/state_machine/test_schema.py
+git add src/featuregen/state_machine/__init__.py src/featuregen/state_machine/ddl.py src/featuregen/db/migrations.py tests/featuregen/state_machine/test_schema.py
 git commit -m "SP-0 Phase 03: state-machine transition tables (DDL) wired into Phase 01 MIGRATIONS
 
 Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
@@ -188,8 +188,8 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 ## Task 2 — Boolean guard-expression parser/evaluator (pure)
 
 **Files:**
-- Create: `src/sp0/state_machine/guard_expr.py` (the package marker `src/sp0/state_machine/__init__.py` already exists from Task 1)
-- Test: `tests/sp0/state_machine/test_guard_expr.py`
+- Create: `src/featuregen/state_machine/guard_expr.py` (the package marker `src/featuregen/state_machine/__init__.py` already exists from Task 1)
+- Test: `tests/featuregen/state_machine/test_guard_expr.py`
 
 **Interfaces:**
 - Consumes: nothing (pure stdlib).
@@ -202,14 +202,14 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 
 ### TDD steps
 
-1. **Write the failing test** — `tests/sp0/state_machine/test_guard_expr.py`:
+1. **Write the failing test** — `tests/featuregen/state_machine/test_guard_expr.py`:
 
 ```python
 from __future__ import annotations
 
 import pytest
 
-from sp0.state_machine.guard_expr import (
+from featuregen.state_machine.guard_expr import (
     GuardExprError,
     eval_guard_expr,
     parse_guard_expr,
@@ -269,9 +269,9 @@ def test_unexpected_character_raises() -> None:
         parse_guard_expr("a & b")
 ```
 
-2. **Run it, expect FAIL** — `python -m pytest tests/sp0/state_machine/test_guard_expr.py -q`. Expected: `ModuleNotFoundError: No module named 'sp0.state_machine.guard_expr'`.
+2. **Run it, expect FAIL** — `python -m pytest tests/featuregen/state_machine/test_guard_expr.py -q`. Expected: `ModuleNotFoundError: No module named 'featuregen.state_machine.guard_expr'`.
 
-3. **Write minimal implementation** — `src/sp0/state_machine/guard_expr.py` (`src/sp0/state_machine/__init__.py` was already created in Task 1):
+3. **Write minimal implementation** — `src/featuregen/state_machine/guard_expr.py` (`src/featuregen/state_machine/__init__.py` was already created in Task 1):
 
 ```python
 from __future__ import annotations
@@ -414,12 +414,12 @@ def predicate_names(node: Node) -> frozenset[str]:
     raise GuardExprError(f"unknown node type {type(node)!r}")
 ```
 
-4. **Run tests, expect PASS** — `python -m pytest tests/sp0/state_machine/test_guard_expr.py -q`. Expected: 9 passed.
+4. **Run tests, expect PASS** — `python -m pytest tests/featuregen/state_machine/test_guard_expr.py -q`. Expected: 9 passed.
 
 5. **Commit:**
 
 ```
-git add src/sp0/state_machine/guard_expr.py tests/sp0/state_machine/test_guard_expr.py
+git add src/featuregen/state_machine/guard_expr.py tests/featuregen/state_machine/test_guard_expr.py
 git commit -m "SP-0 Phase 03: pure boolean guard-expression parser/evaluator
 
 Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
@@ -430,12 +430,12 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 ## Task 3 — InMemoryPredicateRegistry (register / get / evaluate + mechanical purity)
 
 **Files:**
-- Create: `src/sp0/state_machine/guards.py`
-- Create: `tests/sp0/state_machine/_predicates.py`
-- Test: `tests/sp0/state_machine/test_guards.py`
+- Create: `src/featuregen/state_machine/guards.py`
+- Create: `tests/featuregen/state_machine/_predicates.py`
+- Test: `tests/featuregen/state_machine/test_guards.py`
 
 **Interfaces:**
-- Consumes: `GuardInputs`, `GuardOutcome`, `GuardPredicate`, `PredicateRegistry` (from `sp0.contracts`); `parse_guard_expr`, `predicate_names`, `eval_guard_expr` (Task 2).
+- Consumes: `GuardInputs`, `GuardOutcome`, `GuardPredicate`, `PredicateRegistry` (from `featuregen.contracts`); `parse_guard_expr`, `predicate_names`, `eval_guard_expr` (Task 2).
 - Produces:
   - `InMemoryPredicateRegistry` — concrete implementation of the `PredicateRegistry` Protocol with methods `register(predicate: GuardPredicate) -> None`, `get(name: str) -> GuardPredicate`, `evaluate(guard_expr: str, inputs: GuardInputs) -> GuardOutcome`.
   - `PredicateRegistrationError(Exception)` (raised on duplicate registration — a load-time error per §4.1).
@@ -443,14 +443,14 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 
 ### TDD steps
 
-1. **Write the test-only predicate stubs** — `tests/sp0/state_machine/_predicates.py`:
+1. **Write the test-only predicate stubs** — `tests/featuregen/state_machine/_predicates.py`:
 
 ```python
 from __future__ import annotations
 
 from dataclasses import dataclass
 
-from sp0.contracts import GuardInputs
+from featuregen.contracts import GuardInputs
 
 
 @dataclass(frozen=True, slots=True)
@@ -482,19 +482,19 @@ def truthy(name: str, key: str) -> TruthyPredicate:
     return TruthyPredicate(name=name, declared_inputs=(key,), key=key)
 ```
 
-2. **Write the failing test** — `tests/sp0/state_machine/test_guards.py`:
+2. **Write the failing test** — `tests/featuregen/state_machine/test_guards.py`:
 
 ```python
 from __future__ import annotations
 
 import pytest
 
-from sp0.state_machine.guard_expr import GuardExprError
-from sp0.state_machine.guards import (
+from featuregen.state_machine.guard_expr import GuardExprError
+from featuregen.state_machine.guards import (
     InMemoryPredicateRegistry,
     PredicateRegistrationError,
 )
-from tests.sp0.state_machine._predicates import PeekingPredicate, truthy
+from tests.featuregen.state_machine._predicates import PeekingPredicate, truthy
 
 
 def _registry() -> InMemoryPredicateRegistry:
@@ -582,17 +582,17 @@ def test_malformed_expr_propagates() -> None:
         reg.evaluate("confirmed_contract_exists AND", {"confirmed_contract_ref": "x"})
 ```
 
-3. **Run it, expect FAIL** — `python -m pytest tests/sp0/state_machine/test_guards.py -q`. Expected: `ModuleNotFoundError: No module named 'sp0.state_machine.guards'`.
+3. **Run it, expect FAIL** — `python -m pytest tests/featuregen/state_machine/test_guards.py -q`. Expected: `ModuleNotFoundError: No module named 'featuregen.state_machine.guards'`.
 
-4. **Write minimal implementation** — `src/sp0/state_machine/guards.py`:
+4. **Write minimal implementation** — `src/featuregen/state_machine/guards.py`:
 
 ```python
 from __future__ import annotations
 
 from typing import Any
 
-from sp0.contracts import GuardInputs, GuardOutcome, GuardPredicate
-from sp0.state_machine.guard_expr import (
+from featuregen.contracts import GuardInputs, GuardOutcome, GuardPredicate
+from featuregen.state_machine.guard_expr import (
     eval_guard_expr,
     parse_guard_expr,
     predicate_names,
@@ -646,12 +646,12 @@ class InMemoryPredicateRegistry:
         )
 ```
 
-5. **Run tests, expect PASS** — `python -m pytest tests/sp0/state_machine/test_guards.py -q`. Expected: 10 passed.
+5. **Run tests, expect PASS** — `python -m pytest tests/featuregen/state_machine/test_guards.py -q`. Expected: 10 passed.
 
 6. **Commit:**
 
 ```
-git add src/sp0/state_machine/guards.py tests/sp0/state_machine/_predicates.py tests/sp0/state_machine/test_guards.py
+git add src/featuregen/state_machine/guards.py tests/featuregen/state_machine/_predicates.py tests/featuregen/state_machine/test_guards.py
 git commit -m "SP-0 Phase 03: predicate registry with mechanical purity (§4.1)
 
 Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
@@ -662,11 +662,11 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 ## Task 4 — Transition table model, load-time validation, install + load
 
 **Files:**
-- Create: `src/sp0/state_machine/transition_table.py`
-- Test: `tests/sp0/state_machine/test_transition_table.py`
+- Create: `src/featuregen/state_machine/transition_table.py`
+- Test: `tests/featuregen/state_machine/test_transition_table.py`
 
 **Interfaces:**
-- Consumes: `parse_guard_expr`, `predicate_names` (Task 2); `PredicateRegistry` (from `sp0.contracts`); `psycopg.types.json.Json`; `conn` fixture (Phase 01).
+- Consumes: `parse_guard_expr`, `predicate_names` (Task 2); `PredicateRegistry` (from `featuregen.contracts`); `psycopg.types.json.Json`; `conn` fixture (Phase 01).
 - Produces:
   - `Transition` (frozen dataclass): `table_version: int`, `from_state: str`, `to_state: str`, `trigger: str`, `guard_expr: str | None`, `guard_inputs: Mapping[str, Any]`, `precedence: int`, `on_success: Mapping[str, str]`, `on_guard_fail: Mapping[str, str] | None`.
   - `TransitionTable` (frozen dataclass): `kind: str`, `table_version: int`, `transitions: tuple[Transition, ...]`; method `matches(from_state, trigger) -> list[Transition]` (highest precedence first); property `states -> frozenset[str]`.
@@ -677,7 +677,7 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 
 ### TDD steps
 
-1. **Write the failing test** — `tests/sp0/state_machine/test_transition_table.py`:
+1. **Write the failing test** — `tests/featuregen/state_machine/test_transition_table.py`:
 
 ```python
 from __future__ import annotations
@@ -685,14 +685,14 @@ from __future__ import annotations
 import psycopg
 import pytest
 
-from sp0.state_machine.guards import InMemoryPredicateRegistry
-from sp0.state_machine.transition_table import (
+from featuregen.state_machine.guards import InMemoryPredicateRegistry
+from featuregen.state_machine.transition_table import (
     Transition,
     TransitionTableError,
     install_transition_table,
     load_transition_table,
 )
-from tests.sp0.state_machine._predicates import truthy
+from tests.featuregen.state_machine._predicates import truthy
 
 
 def _registry() -> InMemoryPredicateRegistry:
@@ -834,9 +834,9 @@ def test_db_pk_blocks_identical_rows(conn) -> None:
         install_transition_table(conn, "run", 1, [_guarded()], _registry())
 ```
 
-2. **Run it, expect FAIL** — `python -m pytest tests/sp0/state_machine/test_transition_table.py -q`. Expected: `ModuleNotFoundError: No module named 'sp0.state_machine.transition_table'`.
+2. **Run it, expect FAIL** — `python -m pytest tests/featuregen/state_machine/test_transition_table.py -q`. Expected: `ModuleNotFoundError: No module named 'featuregen.state_machine.transition_table'`.
 
-3. **Write minimal implementation** — `src/sp0/state_machine/transition_table.py`:
+3. **Write minimal implementation** — `src/featuregen/state_machine/transition_table.py`:
 
 ```python
 from __future__ import annotations
@@ -846,8 +846,8 @@ from typing import Any, Mapping
 
 from psycopg.types.json import Json
 
-from sp0.contracts import PredicateRegistry
-from sp0.state_machine.guard_expr import parse_guard_expr, predicate_names
+from featuregen.contracts import PredicateRegistry
+from featuregen.state_machine.guard_expr import parse_guard_expr, predicate_names
 
 _TABLE_NAMES = {"run": "run_transition_table", "feature": "feature_lifecycle_table"}
 
@@ -1006,12 +1006,12 @@ def load_transition_table(conn: Any, kind: str, table_version: int) -> Transitio
     return TransitionTable(kind=kind, table_version=table_version, transitions=transitions)
 ```
 
-4. **Run tests, expect PASS** — `python -m pytest tests/sp0/state_machine/test_transition_table.py -q`. Expected: 12 passed.
+4. **Run tests, expect PASS** — `python -m pytest tests/featuregen/state_machine/test_transition_table.py -q`. Expected: 12 passed.
 
 5. **Commit:**
 
 ```
-git add src/sp0/state_machine/transition_table.py tests/sp0/state_machine/test_transition_table.py
+git add src/featuregen/state_machine/transition_table.py tests/featuregen/state_machine/test_transition_table.py
 git commit -m "SP-0 Phase 03: transition-table model with load-time validation (§4.1)
 
 Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
@@ -1022,11 +1022,11 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 ## Task 5 — Transition engine: precedence, no fall-through, symmetric typing, pinning
 
 **Files:**
-- Create: `src/sp0/state_machine/engine.py`
-- Test: `tests/sp0/state_machine/test_engine.py`
+- Create: `src/featuregen/state_machine/engine.py`
+- Test: `tests/featuregen/state_machine/test_engine.py`
 
 **Interfaces:**
-- Consumes: `TransitionTable` (Task 4); `InMemoryPredicateRegistry`/`PredicateRegistry` (Task 3 / `sp0.contracts`); `GuardOutcome`, `GuardInputs` (from `sp0.contracts`).
+- Consumes: `TransitionTable` (Task 4); `InMemoryPredicateRegistry`/`PredicateRegistry` (Task 3 / `featuregen.contracts`); `GuardOutcome`, `GuardInputs` (from `featuregen.contracts`).
 - Produces:
   - Constants `GUARD_FAILED = "GUARD_FAILED"`, `TRANSITION_REJECTED = "TRANSITION_REJECTED"`.
   - `TransitionResult` (frozen dataclass): `matched: bool`, `passed: bool`, `from_state: str`, `to_state: str`, `trigger: str`, `emitted_event_type: str`, `selected_precedence: int | None`, `guard_outcome: GuardOutcome | None`, `audit_payload: Mapping[str, Any]`.
@@ -1035,19 +1035,19 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 
 ### TDD steps
 
-1. **Write the failing test** — `tests/sp0/state_machine/test_engine.py`:
+1. **Write the failing test** — `tests/featuregen/state_machine/test_engine.py`:
 
 ```python
 from __future__ import annotations
 
-from sp0.state_machine.engine import (
+from featuregen.state_machine.engine import (
     GUARD_FAILED,
     TRANSITION_REJECTED,
     evaluate_transition,
 )
-from sp0.state_machine.guards import InMemoryPredicateRegistry
-from sp0.state_machine.transition_table import Transition, TransitionTable
-from tests.sp0.state_machine._predicates import truthy
+from featuregen.state_machine.guards import InMemoryPredicateRegistry
+from featuregen.state_machine.transition_table import Transition, TransitionTable
+from tests.featuregen.state_machine._predicates import truthy
 
 INPUTS = {"confirmed_contract_ref": "doc_1"}
 
@@ -1158,9 +1158,9 @@ def test_table_version_pinning_resolves_differently() -> None:
     assert r2.to_state == "OTHER_STATE" and r2.emitted_event_type == "OTHER_EVENT"
 ```
 
-2. **Run it, expect FAIL** — `python -m pytest tests/sp0/state_machine/test_engine.py -q`. Expected: `ModuleNotFoundError: No module named 'sp0.state_machine.engine'`.
+2. **Run it, expect FAIL** — `python -m pytest tests/featuregen/state_machine/test_engine.py -q`. Expected: `ModuleNotFoundError: No module named 'featuregen.state_machine.engine'`.
 
-3. **Write minimal implementation** — `src/sp0/state_machine/engine.py`:
+3. **Write minimal implementation** — `src/featuregen/state_machine/engine.py`:
 
 ```python
 from __future__ import annotations
@@ -1168,8 +1168,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Mapping
 
-from sp0.contracts import GuardInputs, GuardOutcome, PredicateRegistry
-from sp0.state_machine.transition_table import TransitionTable
+from featuregen.contracts import GuardInputs, GuardOutcome, PredicateRegistry
+from featuregen.state_machine.transition_table import TransitionTable
 
 GUARD_FAILED = "GUARD_FAILED"
 TRANSITION_REJECTED = "TRANSITION_REJECTED"
@@ -1268,12 +1268,12 @@ def evaluate_transition(
     )
 ```
 
-4. **Run tests, expect PASS** — `python -m pytest tests/sp0/state_machine/test_engine.py -q`. Expected: 5 passed.
+4. **Run tests, expect PASS** — `python -m pytest tests/featuregen/state_machine/test_engine.py -q`. Expected: 5 passed.
 
 5. **Commit:**
 
 ```
-git add src/sp0/state_machine/engine.py tests/sp0/state_machine/test_engine.py
+git add src/featuregen/state_machine/engine.py tests/featuregen/state_machine/test_engine.py
 git commit -m "SP-0 Phase 03: transition engine (precedence, no fall-through, pinning)
 
 Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
@@ -1284,12 +1284,12 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 ## Task 6 — Phase-03 event-type registration
 
 **Files:**
-- Create: `src/sp0/state_machine/event_types.py`
-- Create: `tests/sp0/state_machine/conftest.py`
-- Test: `tests/sp0/state_machine/test_event_types.py`
+- Create: `src/featuregen/state_machine/event_types.py`
+- Create: `tests/featuregen/state_machine/conftest.py`
+- Test: `tests/featuregen/state_machine/test_event_types.py`
 
 **Interfaces:**
-- Consumes: the event registry's `register_schema(type_name, schema_version, json_schema, owner, *, status="active")` and `validate(type_name, schema_version, body)` (Phase 01); `SchemaValidationError` (from `sp0.contracts`); the **`event_registry()` accessor function** (Phase 01, `sp0.events.registry`) returning the singleton `EventSchemaRegistry` — it must be **called** (`event_registry().register_schema(...)`), not used as a bare instance.
+- Consumes: the event registry's `register_schema(type_name, schema_version, json_schema, owner, *, status="active")` and `validate(type_name, schema_version, body)` (Phase 01); `SchemaValidationError` (from `featuregen.contracts`); the **`event_registry()` accessor function** (Phase 01, `featuregen.events.registry`) returning the singleton `EventSchemaRegistry` — it must be **called** (`event_registry().register_schema(...)`), not used as a bare instance.
 - Produces:
   - Event-type name constants: `GUARD_FAILED`, `TRANSITION_REJECTED` (re-exported from `engine`), `WORKFLOW_VERSION_MIGRATED`, `FEATURE_LIFECYCLE_VERSION_MIGRATED`.
   - JSON-schema dicts `_GUARD_FAILED_SCHEMA`, `_TRANSITION_REJECTED_SCHEMA`, `_MIGRATION_SCHEMA` (all `schema_version=1`, `owner="sp0-state-machine"`).
@@ -1298,15 +1298,15 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 
 ### TDD steps
 
-1. **Write the package conftest** — `tests/sp0/state_machine/conftest.py`:
+1. **Write the package conftest** — `tests/featuregen/state_machine/conftest.py`:
 
 ```python
 from __future__ import annotations
 
 import pytest
 
-from sp0.events.registry import event_registry
-from sp0.state_machine.event_types import register_state_machine_event_types
+from featuregen.events.registry import event_registry
+from featuregen.state_machine.event_types import register_state_machine_event_types
 
 
 @pytest.fixture(autouse=True)
@@ -1332,21 +1332,21 @@ def _register_state_machine_event_types(_reset_registry) -> None:
 
 > Why depend on `_reset_registry` instead of just being function-scoped? Two autouse fixtures at the same (function) scope have no guaranteed relative order unless one requests the other. Without the dependency, this fixture could run *before* `_reset_registry`'s pre-yield reset, which would then wipe the SM schemas. Declaring `_reset_registry` as a parameter makes pytest order it strictly after the reset.
 
-2. **Write the failing test** — `tests/sp0/state_machine/test_event_types.py`:
+2. **Write the failing test** — `tests/featuregen/state_machine/test_event_types.py`:
 
 ```python
 from __future__ import annotations
 
 import pytest
 
-from sp0.contracts import SchemaValidationError
-from sp0.events.registry import event_registry
-from sp0.state_machine.event_types import (
+from featuregen.contracts import SchemaValidationError
+from featuregen.events.registry import event_registry
+from featuregen.state_machine.event_types import (
     FEATURE_LIFECYCLE_VERSION_MIGRATED,
     WORKFLOW_VERSION_MIGRATED,
     register_state_machine_event_types,
 )
-from sp0.state_machine.engine import GUARD_FAILED, TRANSITION_REJECTED
+from featuregen.state_machine.engine import GUARD_FAILED, TRANSITION_REJECTED
 
 
 class _RecordingRegistry:
@@ -1418,16 +1418,16 @@ def test_migration_schema_validates() -> None:
         event_registry().validate(WORKFLOW_VERSION_MIGRATED, 1, {"to_table_version": 2})
 ```
 
-3. **Run it, expect FAIL** — `python -m pytest tests/sp0/state_machine/test_event_types.py -q`. Expected: `ModuleNotFoundError: No module named 'sp0.state_machine.event_types'`.
+3. **Run it, expect FAIL** — `python -m pytest tests/featuregen/state_machine/test_event_types.py -q`. Expected: `ModuleNotFoundError: No module named 'featuregen.state_machine.event_types'`.
 
-4. **Write minimal implementation** — `src/sp0/state_machine/event_types.py`:
+4. **Write minimal implementation** — `src/featuregen/state_machine/event_types.py`:
 
 ```python
 from __future__ import annotations
 
 from typing import Any
 
-from sp0.state_machine.engine import GUARD_FAILED, TRANSITION_REJECTED
+from featuregen.state_machine.engine import GUARD_FAILED, TRANSITION_REJECTED
 
 WORKFLOW_VERSION_MIGRATED = "WORKFLOW_VERSION_MIGRATED"
 FEATURE_LIFECYCLE_VERSION_MIGRATED = "FEATURE_LIFECYCLE_VERSION_MIGRATED"
@@ -1485,12 +1485,12 @@ def register_state_machine_event_types(registry: Any) -> None:
     )
 ```
 
-5. **Run tests, expect PASS** — `python -m pytest tests/sp0/state_machine/test_event_types.py -q`. Expected: 5 passed.
+5. **Run tests, expect PASS** — `python -m pytest tests/featuregen/state_machine/test_event_types.py -q`. Expected: 5 passed.
 
 6. **Commit:**
 
 ```
-git add src/sp0/state_machine/event_types.py tests/sp0/state_machine/conftest.py tests/sp0/state_machine/test_event_types.py
+git add src/featuregen/state_machine/event_types.py tests/featuregen/state_machine/conftest.py tests/featuregen/state_machine/test_event_types.py
 git commit -m "SP-0 Phase 03: register GUARD_FAILED/TRANSITION_REJECTED/*_MIGRATED event types
 
 Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
@@ -1501,11 +1501,11 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 ## Task 7 — Audited table-version migration commands (run + feature)
 
 **Files:**
-- Create: `src/sp0/state_machine/migrations.py`
-- Test: `tests/sp0/state_machine/test_migrations.py`
+- Create: `src/featuregen/state_machine/migrations.py`
+- Test: `tests/featuregen/state_machine/test_migrations.py`
 
 **Interfaces:**
-- Consumes: `append_event`, `load_stream` (Phase 01, `sp0.events.store`); `NewEvent`, `EventEnvelope`, `IdentityEnvelope`, `ProvenanceEnvelope`, `ConcurrencyError` (from `sp0.contracts`); `load_transition_table` (Task 4); `WORKFLOW_VERSION_MIGRATED`, `FEATURE_LIFECYCLE_VERSION_MIGRATED` (Task 6); the `conn` fixture (Phase 01, `tests/conftest.py`); the autouse per-test event-type fixture (Task 6 conftest, which registers the `*_MIGRATED` and `SM_TEST_SEED` schemas into `event_registry()` so `append_event`'s internal validation passes). Note: `migrations.py` itself does NOT import `event_registry` — `append_event` validates against the singleton internally; the tests only rely on the conftest having populated it.
+- Consumes: `append_event`, `load_stream` (Phase 01, `featuregen.events.store`); `NewEvent`, `EventEnvelope`, `IdentityEnvelope`, `ProvenanceEnvelope`, `ConcurrencyError` (from `featuregen.contracts`); `load_transition_table` (Task 4); `WORKFLOW_VERSION_MIGRATED`, `FEATURE_LIFECYCLE_VERSION_MIGRATED` (Task 6); the `conn` fixture (Phase 01, `tests/conftest.py`); the autouse per-test event-type fixture (Task 6 conftest, which registers the `*_MIGRATED` and `SM_TEST_SEED` schemas into `event_registry()` so `append_event`'s internal validation passes). Note: `migrations.py` itself does NOT import `event_registry` — `append_event` validates against the singleton internally; the tests only rely on the conftest having populated it.
 
 > **AUTHZ / dual-control boundary (read before use).** `migrate_workflow_version` / `migrate_feature_lifecycle_version` are the §4.4 lifecycle commands `migrate_workflow_version` / `migrate_feature_lifecycle_version`, but the functions defined here are **low-level primitives**: they perform NO authorization, NO `command_idempotency`, and are NOT routed through `execute_command`. They MUST be invoked ONLY by Phase 06's `execute_command` (action vocabulary `migrate_workflow_version` / `migrate_feature_lifecycle_version`), which enforces the `authz_policy` check (platform-admin role, §6.2), command-level idempotency, and the degraded-aggregate block. **No other caller may invoke these functions directly** — doing so bypasses authorization and is an unauthorized-migration hole. Phase 06 is responsible for wiring these into the command catalog; this phase only provides the audited append primitive + validation.
 - Produces:
@@ -1517,7 +1517,7 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 
 ### TDD steps
 
-1. **Write the failing test** — `tests/sp0/state_machine/test_migrations.py`:
+1. **Write the failing test** — `tests/featuregen/state_machine/test_migrations.py`:
 
 ```python
 from __future__ import annotations
@@ -1526,20 +1526,20 @@ import uuid
 
 import pytest
 
-from sp0.contracts import (
+from featuregen.contracts import (
     ConcurrencyError,
     IdentityEnvelope,
     NewEvent,
     ProvenanceEnvelope,
 )
-from sp0.events.store import append_event, load_stream
-from sp0.state_machine.guards import InMemoryPredicateRegistry
-from sp0.state_machine.migrations import (
+from featuregen.events.store import append_event, load_stream
+from featuregen.state_machine.guards import InMemoryPredicateRegistry
+from featuregen.state_machine.migrations import (
     MigrationError,
     migrate_feature_lifecycle_version,
     migrate_workflow_version,
 )
-from sp0.state_machine.transition_table import Transition, install_transition_table
+from featuregen.state_machine.transition_table import Transition, install_transition_table
 
 ACTOR = IdentityEnvelope(
     subject="user:test",
@@ -1689,9 +1689,9 @@ def test_migrate_feature_lifecycle_version(conn) -> None:
     assert result.event.feature_id == feature_id
 ```
 
-2. **Run it, expect FAIL** — `python -m pytest tests/sp0/state_machine/test_migrations.py -q`. Expected: `ModuleNotFoundError: No module named 'sp0.state_machine.migrations'`.
+2. **Run it, expect FAIL** — `python -m pytest tests/featuregen/state_machine/test_migrations.py -q`. Expected: `ModuleNotFoundError: No module named 'featuregen.state_machine.migrations'`.
 
-3. **Write minimal implementation** — `src/sp0/state_machine/migrations.py`:
+3. **Write minimal implementation** — `src/featuregen/state_machine/migrations.py`:
 
 ```python
 from __future__ import annotations
@@ -1699,18 +1699,18 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from sp0.contracts import (
+from featuregen.contracts import (
     EventEnvelope,
     IdentityEnvelope,
     NewEvent,
     ProvenanceEnvelope,
 )
-from sp0.events.store import append_event, load_stream
-from sp0.state_machine.event_types import (
+from featuregen.events.store import append_event, load_stream
+from featuregen.state_machine.event_types import (
     FEATURE_LIFECYCLE_VERSION_MIGRATED,
     WORKFLOW_VERSION_MIGRATED,
 )
-from sp0.state_machine.transition_table import load_transition_table
+from featuregen.state_machine.transition_table import load_transition_table
 
 
 class MigrationError(Exception):
@@ -1827,12 +1827,12 @@ def migrate_feature_lifecycle_version(
     )
 ```
 
-4. **Run tests, expect PASS** — `python -m pytest tests/sp0/state_machine/test_migrations.py -q`. Expected: 7 passed.
+4. **Run tests, expect PASS** — `python -m pytest tests/featuregen/state_machine/test_migrations.py -q`. Expected: 7 passed.
 
 5. **Commit:**
 
 ```
-git add src/sp0/state_machine/migrations.py tests/sp0/state_machine/test_migrations.py
+git add src/featuregen/state_machine/migrations.py tests/featuregen/state_machine/test_migrations.py
 git commit -m "SP-0 Phase 03: audited table-version migration commands (§4.2)
 
 Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
@@ -1845,7 +1845,7 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 Run the whole phase suite and confirm green before handing off:
 
 ```
-python -m pytest tests/sp0/state_machine -q
+python -m pytest tests/featuregen/state_machine -q
 ```
 
 Expected: all tests pass (schema 3 + guard_expr 9 + guards 10 + transition_table 12 + engine 5 + event_types 5 + migrations 7).

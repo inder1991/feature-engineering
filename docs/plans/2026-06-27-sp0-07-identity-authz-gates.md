@@ -12,18 +12,18 @@ This phase reads/writes tables owned by other phases through their declared shap
 
 - **Phase 01** — `global_seq_seq` (allocator for `security_audit.seq` defaults and `human_task_responses.answered_seq`); the `events` table (read-only: `resolve_run_author` reads `events.actor->>'subject'`); the `DbConn` alias (psycopg connection / open transaction).
 - **Phase 05** — the `timers` table: `open_task` inserts the SLA→reminder→escalation→auto-park ladder rows (`status='scheduled'`, `cas_task_version` stamped for Phase 05's CAS-on-fire); `submit_human_signal`/`cancel_task` set `status='cancelled'` on answer/cancel (the answer side of the §5.5 timer/answer race; the fire side is Phase 05). `cas_task_version` is read by Phase 05's poller.
-- **Phase 06** — the `Command`/`CommandResult` dataclasses and `execute_command` (Phase 06 OWNS `src/sp0/contracts/commands.py`; this phase only transcribes those two dataclasses as a byte-identical, divergence-guarded bootstrap — it does not own the file). **Wiring points:** (1) Phase 06's `execute_command` calls `authorize_command(conn, cmd)`; on `allowed=False` it calls `record_denial(conn, cmd, reason)` (writes the security stream, NOT the domain stream) and returns `CommandResult(accepted=False, denied_reason=reason)` — this phase produces those two functions and the SoD they apply. (2) Phase 06's run-advancing lifecycle commands (or the Phase 03 state-machine transition) call this phase's `cancel_tasks_on_run_advance(conn, run_id)` to cancel open gate tasks when a run moves past their gate (§7). The triggering transition is owned upstream (Phase 03/06); the cancellation effect is owned here.
+- **Phase 06** — the `Command`/`CommandResult` dataclasses and `execute_command` (Phase 06 OWNS `src/featuregen/contracts/commands.py`; this phase only transcribes those two dataclasses as a byte-identical, divergence-guarded bootstrap — it does not own the file). **Wiring points:** (1) Phase 06's `execute_command` calls `authorize_command(conn, cmd)`; on `allowed=False` it calls `record_denial(conn, cmd, reason)` (writes the security stream, NOT the domain stream) and returns `CommandResult(accepted=False, denied_reason=reason)` — this phase produces those two functions and the SoD they apply. (2) Phase 06's run-advancing lifecycle commands (or the Phase 03 state-machine transition) call this phase's `cancel_tasks_on_run_advance(conn, run_id)` to cancel open gate tasks when a run moves past their gate (§7). The triggering transition is owned upstream (Phase 03/06); the cancellation effect is owned here.
 
 **Shared-contract bootstrap (verbatim, not redefined):** this phase transcribes — character-for-character from the overview's "Core interfaces" block — the dataclasses it is authoritative for or directly constructs: `IdentityEnvelope` (authoritative), `GateTaskSpec`/`SignalResult` (authoritative), and `Command`/`CommandResult` (Phase 06 authoritative — same file, imported, not altered). It also lays down a `DbConn` alias module. Every later phase imports these same symbols.
 
-**Test prerequisite DDL (test-only):** the Phase 01/05 objects this phase's tests read (`global_seq_seq`, `events`, `timers`) are transcribed verbatim into `tests/sp0/_prereq.sql` purely so the suite is independently runnable. The canonical migrations for those objects are owned by Phase 01/05; `_prereq.sql` is never imported by `src/`.
+**Test prerequisite DDL (test-only):** the Phase 01/05 objects this phase's tests read (`global_seq_seq`, `events`, `timers`) are transcribed verbatim into `tests/featuregen/_prereq.sql` purely so the suite is independently runnable. The canonical migrations for those objects are owned by Phase 01/05; `_prereq.sql` is never imported by `src/`.
 
 ---
 
 ## File structure
 
 ```
-src/sp0/
+src/featuregen/
   contracts/
     db.py                  # DbConn type alias (Phase 01-owned shape; transcribed)          [Task 3]
     identity.py            # IdentityEnvelope (verbatim) + identity_to_jsonb/from_jsonb       [Task 1]
@@ -50,7 +50,7 @@ src/sp0/
     tasks.py               # open_task/cancel_task/cancel_tasks_on_run_advance/bump_task_version/
                            #   grant_task_delegation/submit_human_signal                       [Task 8/9]
 
-tests/sp0/
+tests/featuregen/
   _prereq.sql              # verbatim global_seq_seq + events + timers (test-only)            [Task 3]
   conftest.py              # `db` fixture (fresh schema per test, rollback teardown)          [Task 3]
   contracts/test_identity_serde.py                                                            [Task 1]
@@ -73,9 +73,9 @@ tests/sp0/
 
 **Files:**
 - Create: `pytest.ini` (repo root; puts `src/` on the import path for the whole suite)
-- Create: `src/sp0/contracts/__init__.py`
-- Create: `src/sp0/contracts/identity.py`
-- Test: `tests/sp0/contracts/test_identity_serde.py`
+- Create: `src/featuregen/contracts/__init__.py`
+- Create: `src/featuregen/contracts/identity.py`
+- Test: `tests/featuregen/contracts/test_identity_serde.py`
 
 **Interfaces:**
 - Consumes: nothing.
@@ -84,8 +84,8 @@ tests/sp0/
 - [ ] **Step 1: Write the failing test**
 
 ```python
-# tests/sp0/contracts/test_identity_serde.py
-from sp0.contracts.identity import (
+# tests/featuregen/contracts/test_identity_serde.py
+from featuregen.contracts.identity import (
     IdentityEnvelope,
     identity_to_jsonb,
     identity_from_jsonb,
@@ -134,7 +134,7 @@ def test_service_attestation_round_trips():
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `python3 -m pytest tests/sp0/contracts/test_identity_serde.py -v`
+Run: `python3 -m pytest tests/featuregen/contracts/test_identity_serde.py -v`
 Expected: FAIL with `ModuleNotFoundError: No module named 'sp0'` — `pytest.ini`'s `pythonpath = src` is already in place (created in Step 3 below), so `src/` is on the path; the failure is the not-yet-created `src/sp0` package tree, not a missing path.
 
 - [ ] **Step 3: Write minimal implementation**
@@ -149,11 +149,11 @@ testpaths = tests
 ```
 
 ```python
-# src/sp0/contracts/__init__.py
+# src/featuregen/contracts/__init__.py
 ```
 
 ```python
-# src/sp0/contracts/identity.py
+# src/featuregen/contracts/identity.py
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -213,13 +213,13 @@ def identity_from_jsonb(d: Mapping[str, Any]) -> IdentityEnvelope:
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `python3 -m pytest tests/sp0/contracts/test_identity_serde.py -v`
+Run: `python3 -m pytest tests/featuregen/contracts/test_identity_serde.py -v`
 Expected: PASS (3 passed).
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add pytest.ini src/sp0/contracts/__init__.py src/sp0/contracts/identity.py tests/sp0/contracts/test_identity_serde.py
+git add pytest.ini src/featuregen/contracts/__init__.py src/featuregen/contracts/identity.py tests/featuregen/contracts/test_identity_serde.py
 git commit -m "feat(sp0-07): pytest pythonpath + IdentityEnvelope contract + jsonb serde"
 ```
 
@@ -228,9 +228,9 @@ git commit -m "feat(sp0-07): pytest pythonpath + IdentityEnvelope contract + jso
 ## Task 2: Identity construction & validation (OIDC humans, attested services)
 
 **Files:**
-- Create: `src/sp0/identity/__init__.py`
-- Create: `src/sp0/identity/build.py`
-- Test: `tests/sp0/identity/test_build.py`
+- Create: `src/featuregen/identity/__init__.py`
+- Create: `src/featuregen/identity/build.py`
+- Test: `tests/featuregen/identity/test_build.py`
 
 **Interfaces:**
 - Consumes: `IdentityEnvelope` (Task 1).
@@ -239,11 +239,11 @@ git commit -m "feat(sp0-07): pytest pythonpath + IdentityEnvelope contract + jso
 - [ ] **Step 1: Write the failing test**
 
 ```python
-# tests/sp0/identity/test_build.py
+# tests/featuregen/identity/test_build.py
 import pytest
 
-from sp0.contracts.identity import IdentityEnvelope
-from sp0.identity.build import (
+from featuregen.contracts.identity import IdentityEnvelope
+from featuregen.identity.build import (
     IdentityError,
     build_human_identity,
     build_service_identity,
@@ -303,22 +303,22 @@ def test_unauthenticated_is_rejected():
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `python3 -m pytest tests/sp0/identity/test_build.py -v`
-Expected: FAIL with `ModuleNotFoundError: No module named 'sp0.identity'` — `pytest.ini` (Task 1) is on the path and `sp0` resolves as a namespace package via the `src/sp0/contracts/` tree created in Task 1, so the missing module is specifically `sp0.identity`.
+Run: `python3 -m pytest tests/featuregen/identity/test_build.py -v`
+Expected: FAIL with `ModuleNotFoundError: No module named 'featuregen.identity'` — `pytest.ini` (Task 1) is on the path and `sp0` resolves as a namespace package via the `src/featuregen/contracts/` tree created in Task 1, so the missing module is specifically `featuregen.identity`.
 
 - [ ] **Step 3: Write minimal implementation**
 
 ```python
-# src/sp0/identity/__init__.py
+# src/featuregen/identity/__init__.py
 ```
 
 ```python
-# src/sp0/identity/build.py
+# src/featuregen/identity/build.py
 from __future__ import annotations
 
 from typing import Iterable, Optional
 
-from sp0.contracts.identity import IdentityEnvelope
+from featuregen.contracts.identity import IdentityEnvelope
 
 
 class IdentityError(Exception):
@@ -403,13 +403,13 @@ def build_service_identity(
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `python3 -m pytest tests/sp0/identity/test_build.py -v`
+Run: `python3 -m pytest tests/featuregen/identity/test_build.py -v`
 Expected: PASS (5 passed).
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/sp0/identity tests/sp0/identity/test_build.py
+git add src/featuregen/identity tests/featuregen/identity/test_build.py
 git commit -m "feat(sp0-07): OIDC human + attested service identity construction/validation"
 ```
 
@@ -418,21 +418,21 @@ git commit -m "feat(sp0-07): OIDC human + attested service identity construction
 ## Task 3: DB harness, id helper & Phase-07 migration
 
 **Files:**
-- Create: `src/sp0/contracts/db.py`
-- Create: `src/sp0/idgen.py`
-- Create: `src/sp0/db/migrations/007_identity_authz_gates.sql`
-- Create: `tests/sp0/_prereq.sql`
-- Create: `tests/sp0/conftest.py`
-- Test: `tests/sp0/db/test_migration.py`
+- Create: `src/featuregen/contracts/db.py`
+- Create: `src/featuregen/idgen.py`
+- Create: `src/featuregen/db/migrations/007_identity_authz_gates.sql`
+- Create: `tests/featuregen/_prereq.sql`
+- Create: `tests/featuregen/conftest.py`
+- Test: `tests/featuregen/db/test_migration.py`
 
 **Interfaces:**
 - Consumes: PostgreSQL 15+ via `psycopg`.
-- Produces: `DbConn` type alias (`src/sp0/contracts/db.py`); `mint_id(prefix: str) -> str` returning `f"{prefix}_{...}"` ULID-style prefixed strings; the `007` migration creating `authz_policy`, `security_audit`, `human_tasks`, `human_task_responses` **verbatim** from the shared DDL, plus the Phase-07-internal supporting table `task_delegations` (not in the core contract; backs §7 delegation validation); the pytest `db` fixture yielding an open `psycopg.Connection` against a freshly-built schema, rolled back after each test.
+- Produces: `DbConn` type alias (`src/featuregen/contracts/db.py`); `mint_id(prefix: str) -> str` returning `f"{prefix}_{...}"` ULID-style prefixed strings; the `007` migration creating `authz_policy`, `security_audit`, `human_tasks`, `human_task_responses` **verbatim** from the shared DDL, plus the Phase-07-internal supporting table `task_delegations` (not in the core contract; backs §7 delegation validation); the pytest `db` fixture yielding an open `psycopg.Connection` against a freshly-built schema, rolled back after each test.
 
 - [ ] **Step 1: Write the failing test**
 
 ```python
-# tests/sp0/db/test_migration.py
+# tests/featuregen/db/test_migration.py
 def test_phase07_tables_exist(db):
     rows = db.execute(
         """
@@ -459,7 +459,7 @@ def test_prereq_objects_present(db):
 
 
 def test_mint_id_prefixes():
-    from sp0.idgen import mint_id
+    from featuregen.idgen import mint_id
 
     one = mint_id("task")
     two = mint_id("task")
@@ -469,13 +469,13 @@ def test_mint_id_prefixes():
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `python3 -m pytest tests/sp0/db/test_migration.py -v`
+Run: `python3 -m pytest tests/featuregen/db/test_migration.py -v`
 Expected: FAIL — `conftest.py`/`db` fixture missing → `fixture 'db' not found`.
 
 - [ ] **Step 3: Write minimal implementation**
 
 ```python
-# src/sp0/contracts/db.py
+# src/featuregen/contracts/db.py
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
@@ -489,7 +489,7 @@ else:  # runtime placeholder; all uses are stringified annotations
 ```
 
 ```python
-# src/sp0/idgen.py
+# src/featuregen/idgen.py
 from __future__ import annotations
 
 import os
@@ -504,7 +504,7 @@ def mint_id(prefix: str) -> str:
 ```
 
 ```sql
--- src/sp0/db/migrations/007_identity_authz_gates.sql
+-- src/featuregen/db/migrations/007_identity_authz_gates.sql
 -- Phase 07 owned tables (verbatim from the shared SP-0 contract). PostgreSQL 15+.
 -- NOTE: authz_policy PK columns are NOT NULL by definition; the contract marks
 -- `gate` NULL but the PK forces it NOT NULL, so non-gate rows use the '' sentinel.
@@ -584,7 +584,7 @@ CREATE TABLE task_delegations (
 ```
 
 ```sql
--- tests/sp0/_prereq.sql
+-- tests/featuregen/_prereq.sql
 -- TEST-ONLY prerequisite DDL. Owned by Phase 01 (global_seq_seq, events) and
 -- Phase 05 (timers); transcribed verbatim from the shared contract so this
 -- phase's suite is runnable in isolation. NEVER imported by src/.
@@ -641,7 +641,7 @@ CREATE INDEX timers_task_idx ON timers (task_id) WHERE task_id IS NOT NULL;
 ```
 
 ```python
-# tests/sp0/conftest.py
+# tests/featuregen/conftest.py
 from __future__ import annotations
 
 import os
@@ -672,17 +672,17 @@ def db():
         conn.close()
 ```
 
-(The import path is already configured: `pytest.ini` with `pythonpath = src` was created in Task 1, so this fixture's `import psycopg` and the suite's `import sp0...` both resolve here.)
+(The import path is already configured: `pytest.ini` with `pythonpath = src` was created in Task 1, so this fixture's `import psycopg` and the suite's `import featuregen...` both resolve here.)
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `python3 -m pytest tests/sp0/db/test_migration.py -v`
+Run: `python3 -m pytest tests/featuregen/db/test_migration.py -v`
 Expected: PASS (3 passed). (Requires a reachable Postgres at `SP0_TEST_DSN`.)
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/sp0/contracts/db.py src/sp0/idgen.py src/sp0/db/migrations/007_identity_authz_gates.sql tests/sp0/_prereq.sql tests/sp0/conftest.py tests/sp0/db/test_migration.py
+git add src/featuregen/contracts/db.py src/featuregen/idgen.py src/featuregen/db/migrations/007_identity_authz_gates.sql tests/featuregen/_prereq.sql tests/featuregen/conftest.py tests/featuregen/db/test_migration.py
 git commit -m "feat(sp0-07): db test harness, id helper, phase-07 migration"
 ```
 
@@ -691,9 +691,9 @@ git commit -m "feat(sp0-07): db test harness, id helper, phase-07 migration"
 ## Task 4: Security stream — append + tamper-evident hash chain
 
 **Files:**
-- Create: `src/sp0/security/__init__.py`
-- Create: `src/sp0/security/audit.py`
-- Test: `tests/sp0/security/test_audit.py`
+- Create: `src/featuregen/security/__init__.py`
+- Create: `src/featuregen/security/audit.py`
+- Test: `tests/featuregen/security/test_audit.py`
 
 **Interfaces:**
 - Consumes: `mint_id` (Task 3); `IdentityEnvelope`, `identity_to_jsonb` (Task 1); `security_audit` table (Task 3); `DbConn`.
@@ -702,9 +702,9 @@ git commit -m "feat(sp0-07): db test harness, id helper, phase-07 migration"
 - [ ] **Step 1: Write the failing test**
 
 ```python
-# tests/sp0/security/test_audit.py
-from sp0.identity.build import build_human_identity
-from sp0.security.audit import record_security_event, verify_chain
+# tests/featuregen/security/test_audit.py
+from featuregen.identity.build import build_human_identity
+from featuregen.security.audit import record_security_event, verify_chain
 
 
 def test_append_chains_and_verifies(db):
@@ -748,7 +748,7 @@ def test_tampering_breaks_chain(db):
 
 
 def test_denial_lands_in_security_stream_not_events(db):
-    from sp0.security.audit import record_denial
+    from featuregen.security.audit import record_denial
     from types import SimpleNamespace
 
     a = build_human_identity(subject="user:mallory", role_claims=["data_scientist"])
@@ -801,17 +801,17 @@ def test_concurrent_appends_keep_single_chain(db):
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `python3 -m pytest tests/sp0/security/test_audit.py -v`
-Expected: FAIL with `ModuleNotFoundError: No module named 'sp0.security'`.
+Run: `python3 -m pytest tests/featuregen/security/test_audit.py -v`
+Expected: FAIL with `ModuleNotFoundError: No module named 'featuregen.security'`.
 
 - [ ] **Step 3: Write minimal implementation**
 
 ```python
-# src/sp0/security/__init__.py
+# src/featuregen/security/__init__.py
 ```
 
 ```python
-# src/sp0/security/audit.py
+# src/featuregen/security/audit.py
 from __future__ import annotations
 
 import hashlib
@@ -819,9 +819,9 @@ from typing import Any, Optional
 
 from psycopg.types.json import Json
 
-from sp0.contracts.db import DbConn
-from sp0.contracts.identity import IdentityEnvelope, identity_to_jsonb
-from sp0.idgen import mint_id
+from featuregen.contracts.db import DbConn
+from featuregen.contracts.identity import IdentityEnvelope, identity_to_jsonb
+from featuregen.idgen import mint_id
 
 # Transaction-scoped advisory-lock key that serializes ALL appends to the single
 # tamper-evident security chain (§6.2). Without it the chain can FORK: on an empty table
@@ -938,13 +938,13 @@ def verify_chain(conn: DbConn) -> bool:
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `python3 -m pytest tests/sp0/security/test_audit.py -v`
+Run: `python3 -m pytest tests/featuregen/security/test_audit.py -v`
 Expected: PASS (4 passed). (The concurrency test opens its own committing connections, so a reachable Postgres at `SP0_TEST_DSN` is required.)
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/sp0/security/__init__.py src/sp0/security/audit.py tests/sp0/security/test_audit.py
+git add src/featuregen/security/__init__.py src/featuregen/security/audit.py tests/featuregen/security/test_audit.py
 git commit -m "feat(sp0-07): tamper-evident security stream append + denial routing"
 ```
 
@@ -953,8 +953,8 @@ git commit -m "feat(sp0-07): tamper-evident security stream append + denial rout
 ## Task 5: Security stream — restricted, audited read
 
 **Files:**
-- Modify: `src/sp0/security/audit.py`
-- Test: `tests/sp0/security/test_audit_read.py`
+- Modify: `src/featuregen/security/audit.py`
+- Test: `tests/featuregen/security/test_audit_read.py`
 
 **Interfaces:**
 - Consumes: `record_security_event` (Task 4); `IdentityEnvelope` (Task 1); `security_audit` table.
@@ -963,12 +963,12 @@ git commit -m "feat(sp0-07): tamper-evident security stream append + denial rout
 - [ ] **Step 1: Write the failing test**
 
 ```python
-# tests/sp0/security/test_audit_read.py
+# tests/featuregen/security/test_audit_read.py
 import pytest
 
-from sp0.contracts.identity import IdentityEnvelope
-from sp0.identity.build import build_human_identity
-from sp0.security.audit import (
+from featuregen.contracts.identity import IdentityEnvelope
+from featuregen.identity.build import build_human_identity
+from featuregen.security.audit import (
     AuditReadDenied,
     read_security_audit,
     record_security_event,
@@ -1023,12 +1023,12 @@ def test_unauthenticated_envelope_with_security_role_is_denied(db):
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `python3 -m pytest tests/sp0/security/test_audit_read.py -v`
+Run: `python3 -m pytest tests/featuregen/security/test_audit_read.py -v`
 Expected: FAIL with `ImportError: cannot import name 'AuditReadDenied'`.
 
 - [ ] **Step 3: Write minimal implementation**
 
-Append to `src/sp0/security/audit.py`:
+Append to `src/featuregen/security/audit.py`:
 
 ```python
 class AuditReadDenied(Exception):
@@ -1049,7 +1049,7 @@ def read_security_audit(
     # authz_policy `read_security_audit` rows are intentionally absent — see Task 6). A role
     # claim alone is insufficient: the envelope must also be a VALID identity, else a spoofed
     # or unauthenticated envelope carrying a "security" claim could read the stream.
-    from sp0.identity.build import IdentityError, validate_identity
+    from featuregen.identity.build import IdentityError, validate_identity
 
     try:
         validate_identity(actor)
@@ -1089,13 +1089,13 @@ def read_security_audit(
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `python3 -m pytest tests/sp0/security/test_audit_read.py -v`
+Run: `python3 -m pytest tests/featuregen/security/test_audit_read.py -v`
 Expected: PASS (3 passed).
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/sp0/security/audit.py tests/sp0/security/test_audit_read.py
+git add src/featuregen/security/audit.py tests/featuregen/security/test_audit_read.py
 git commit -m "feat(sp0-07): restricted + self-audited security stream read"
 ```
 
@@ -1104,23 +1104,23 @@ git commit -m "feat(sp0-07): restricted + self-audited security stream read"
 ## Task 6: Command authorization — one vocabulary, policy rows, attested services
 
 **Files:**
-- Create: `src/sp0/contracts/commands.py`
-- Create: `src/sp0/authz/__init__.py`
-- Create: `src/sp0/authz/policy.py`
-- Test: `tests/sp0/authz/test_policy.py`
+- Create: `src/featuregen/contracts/commands.py`
+- Create: `src/featuregen/authz/__init__.py`
+- Create: `src/featuregen/authz/policy.py`
+- Test: `tests/featuregen/authz/test_policy.py`
 
 **Interfaces:**
-- Consumes: `IdentityEnvelope` (Task 1); `validate_identity`, `IdentityError` (Task 2); `authz_policy` table (Task 3); `DbConn`; **`Command`/`CommandResult`** — owned by Phase 06 (`src/sp0/contracts/commands.py`); this phase only transcribes them as an independence bootstrap (byte-identical to the overview, divergence-guarded by `test_command_contract_fields_match`) and never alters them.
+- Consumes: `IdentityEnvelope` (Task 1); `validate_identity`, `IdentityError` (Task 2); `authz_policy` table (Task 3); `DbConn`; **`Command`/`CommandResult`** — owned by Phase 06 (`src/featuregen/contracts/commands.py`); this phase only transcribes them as an independence bootstrap (byte-identical to the overview, divergence-guarded by `test_command_contract_fields_match`) and never alters them.
 - Produces: `AuthzDecision(allowed: bool, reason: Optional[str] = None)`; `seed_authz_policy(conn) -> None` (loads the §6.2 canonical vocabulary; non-gate rows use `gate=''`); `authorize_command(conn, cmd: Command) -> AuthzDecision` (matches a policy row by `(action, gate)` × role × `actor_kind` × `scope`; **service actors only match `service`/`any` rows when attested**; identity-invalid → denied).
 
 - [ ] **Step 1: Write the failing test**
 
 ```python
-# tests/sp0/authz/test_policy.py
-from sp0.authz.policy import AuthzDecision, authorize_command, seed_authz_policy
-from sp0.contracts.commands import Command
-from sp0.contracts.identity import IdentityEnvelope
-from sp0.identity.build import build_human_identity, build_service_identity
+# tests/featuregen/authz/test_policy.py
+from featuregen.authz.policy import AuthzDecision, authorize_command, seed_authz_policy
+from featuregen.contracts.commands import Command
+from featuregen.contracts.identity import IdentityEnvelope
+from featuregen.identity.build import build_human_identity, build_service_identity
 
 
 def _cmd(action, actor, *, aggregate="feature", aggregate_id="feature_1", args=None):
@@ -1193,7 +1193,7 @@ def test_command_contract_fields_match():
     # producing a silent clearLayers()-vs-clearFullLayers() mismatch across phases.
     import dataclasses
 
-    from sp0.contracts.commands import Command, CommandResult
+    from featuregen.contracts.commands import Command, CommandResult
 
     assert [f.name for f in dataclasses.fields(Command)] == [
         "action", "aggregate", "aggregate_id", "args", "actor",
@@ -1206,18 +1206,18 @@ def test_command_contract_fields_match():
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `python3 -m pytest tests/sp0/authz/test_policy.py -v`
-Expected: FAIL with `ModuleNotFoundError: No module named 'sp0.authz'`.
+Run: `python3 -m pytest tests/featuregen/authz/test_policy.py -v`
+Expected: FAIL with `ModuleNotFoundError: No module named 'featuregen.authz'`.
 
 - [ ] **Step 3: Write minimal implementation**
 
 ```python
-# src/sp0/contracts/commands.py
+# src/featuregen/contracts/commands.py
 # PHASE 06 IS AUTHORITATIVE for this file — it owns Command / CommandResult / execute_command /
 # command_idempotency per the overview "Key Produces interfaces". Phase 07 only CONSUMES the two
 # dataclasses below; it does NOT own them. They are transcribed CHARACTER-FOR-CHARACTER from the
 # overview "Core interfaces" block purely so this phase is independently runnable before Phase 06
-# lands (the same independence pattern as tests/sp0/_prereq.sql and contracts/db.py). When Phase 06
+# lands (the same independence pattern as tests/featuregen/_prereq.sql and contracts/db.py). When Phase 06
 # is present, its definition is authoritative and this transcription MUST be byte-identical — a
 # divergence is a build-breaking bug. `test_command_contract_fields_match` (this task) pins the
 # field signature so the two copies can never silently diverge.
@@ -1226,7 +1226,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Mapping, Optional
 
-from sp0.contracts.identity import IdentityEnvelope
+from featuregen.contracts.identity import IdentityEnvelope
 
 
 @dataclass(frozen=True, slots=True)
@@ -1249,19 +1249,19 @@ class CommandResult:
 ```
 
 ```python
-# src/sp0/authz/__init__.py
+# src/featuregen/authz/__init__.py
 ```
 
 ```python
-# src/sp0/authz/policy.py
+# src/featuregen/authz/policy.py
 from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Optional
 
-from sp0.contracts.commands import Command
-from sp0.contracts.db import DbConn
-from sp0.identity.build import IdentityError, validate_identity
+from featuregen.contracts.commands import Command
+from featuregen.contracts.db import DbConn
+from featuregen.identity.build import IdentityError, validate_identity
 
 
 @dataclass(frozen=True, slots=True)
@@ -1357,13 +1357,13 @@ def authorize_command(conn: DbConn, cmd: Command) -> AuthzDecision:
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `python3 -m pytest tests/sp0/authz/test_policy.py -v`
+Run: `python3 -m pytest tests/featuregen/authz/test_policy.py -v`
 Expected: PASS (6 passed).
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/sp0/contracts/commands.py src/sp0/authz/__init__.py src/sp0/authz/policy.py tests/sp0/authz/test_policy.py
+git add src/featuregen/contracts/commands.py src/featuregen/authz/__init__.py src/featuregen/authz/policy.py tests/featuregen/authz/test_policy.py
 git commit -m "feat(sp0-07): one-vocabulary command authorization with attested services"
 ```
 
@@ -1372,9 +1372,9 @@ git commit -m "feat(sp0-07): one-vocabulary command authorization with attested 
 ## Task 7: Segregation of duties — two-party four-eyes & three-party validation
 
 **Files:**
-- Create: `src/sp0/authz/sod.py`
-- Modify: `src/sp0/authz/policy.py` (wire `enforce_sod` into `authorize_command`)
-- Test: `tests/sp0/authz/test_sod.py`
+- Create: `src/featuregen/authz/sod.py`
+- Modify: `src/featuregen/authz/policy.py` (wire `enforce_sod` into `authorize_command`)
+- Test: `tests/featuregen/authz/test_sod.py`
 
 **Interfaces:**
 - Consumes: `AuthzDecision` (Task 6); `Command` (Task 6); `human_task_responses`/`human_tasks` (Task 3); `events` (Task 3, read-only); `DbConn`.
@@ -1383,18 +1383,18 @@ git commit -m "feat(sp0-07): one-vocabulary command authorization with attested 
 - [ ] **Step 1: Write the failing test**
 
 ```python
-# tests/sp0/authz/test_sod.py
+# tests/featuregen/authz/test_sod.py
 from psycopg.types.json import Json
 
-from sp0.authz.policy import authorize_command, seed_authz_policy
-from sp0.authz.sod import (
+from featuregen.authz.policy import authorize_command, seed_authz_policy
+from featuregen.authz.sod import (
     gather_gate_responders,
     resolve_run_author,
     three_party_disjoint,
     two_party_ok,
 )
-from sp0.contracts.commands import Command
-from sp0.identity.build import build_human_identity
+from featuregen.contracts.commands import Command
+from featuregen.identity.build import build_human_identity
 
 
 def _seed_run(db, run_id, author_subject):
@@ -1500,20 +1500,20 @@ def test_compliance_sensitive_activate_needs_four_eyes(db):
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `python3 -m pytest tests/sp0/authz/test_sod.py -v`
-Expected: FAIL with `ModuleNotFoundError: No module named 'sp0.authz.sod'`.
+Run: `python3 -m pytest tests/featuregen/authz/test_sod.py -v`
+Expected: FAIL with `ModuleNotFoundError: No module named 'featuregen.authz.sod'`.
 
 - [ ] **Step 3: Write minimal implementation**
 
 ```python
-# src/sp0/authz/sod.py
+# src/featuregen/authz/sod.py
 from __future__ import annotations
 
 from typing import Optional
 
-from sp0.authz.policy import AuthzDecision
-from sp0.contracts.commands import Command
-from sp0.contracts.db import DbConn
+from featuregen.authz.policy import AuthzDecision
+from featuregen.contracts.commands import Command
+from featuregen.contracts.db import DbConn
 
 
 def two_party_ok(requester: str, approver: str) -> bool:
@@ -1612,27 +1612,27 @@ def enforce_sod(conn: DbConn, cmd: Command) -> AuthzDecision:
     return AuthzDecision(True)
 ```
 
-Then wire SoD into `authorize_command` — replace the body in `src/sp0/authz/policy.py`:
+Then wire SoD into `authorize_command` — replace the body in `src/featuregen/authz/policy.py`:
 
 ```python
 def authorize_command(conn: DbConn, cmd: Command) -> AuthzDecision:
     base = _base_authorized(conn, cmd)
     if not base.allowed:
         return base
-    from sp0.authz.sod import enforce_sod  # local import avoids module cycle
+    from featuregen.authz.sod import enforce_sod  # local import avoids module cycle
 
     return enforce_sod(conn, cmd)
 ```
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `python3 -m pytest tests/sp0/authz/test_sod.py tests/sp0/authz/test_policy.py -v`
+Run: `python3 -m pytest tests/featuregen/authz/test_sod.py tests/featuregen/authz/test_policy.py -v`
 Expected: PASS (11 passed — Task 6's 5 tests still green alongside the 6 SoD tests).
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/sp0/authz/sod.py src/sp0/authz/policy.py tests/sp0/authz/test_sod.py
+git add src/featuregen/authz/sod.py src/featuregen/authz/policy.py tests/featuregen/authz/test_sod.py
 git commit -m "feat(sp0-07): two-party four-eyes + three-party validation SoD"
 ```
 
@@ -1641,11 +1641,11 @@ git commit -m "feat(sp0-07): two-party four-eyes + three-party validation SoD"
 ## Task 8: Human-gate task — open_task (+ SLA ladder), cancel, version bump
 
 **Files:**
-- Create: `src/sp0/contracts/gates.py`
-- Create: `src/sp0/gates/__init__.py`
-- Create: `src/sp0/gates/duration.py`
-- Create: `src/sp0/gates/tasks.py`
-- Test: `tests/sp0/gates/test_open_task.py`
+- Create: `src/featuregen/contracts/gates.py`
+- Create: `src/featuregen/gates/__init__.py`
+- Create: `src/featuregen/gates/duration.py`
+- Create: `src/featuregen/gates/tasks.py`
+- Test: `tests/featuregen/gates/test_open_task.py`
 
 **Interfaces:**
 - Consumes: `mint_id` (Task 3); `IdentityEnvelope` (Task 1); `human_tasks`/`timers` tables (Task 3); `DbConn`.
@@ -1654,21 +1654,21 @@ git commit -m "feat(sp0-07): two-party four-eyes + three-party validation SoD"
 - [ ] **Step 1: Write the failing test**
 
 ```python
-# tests/sp0/gates/test_open_task.py
+# tests/featuregen/gates/test_open_task.py
 from datetime import timedelta
 
 import pytest
 
-from sp0.contracts.gates import GateTaskSpec
-from sp0.gates.duration import parse_duration
-from sp0.gates.tasks import (
+from featuregen.contracts.gates import GateTaskSpec
+from featuregen.gates.duration import parse_duration
+from featuregen.gates.tasks import (
     GateError,
     bump_task_version,
     cancel_task,
     cancel_tasks_on_run_advance,
     open_task,
 )
-from sp0.identity.build import build_service_identity
+from featuregen.identity.build import build_service_identity
 
 
 def _spec(**kw):
@@ -1764,13 +1764,13 @@ def test_cancel_tasks_on_run_advance_cancels_all_open_for_run(db):
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `python3 -m pytest tests/sp0/gates/test_open_task.py -v`
-Expected: FAIL with `ModuleNotFoundError: No module named 'sp0.gates'`.
+Run: `python3 -m pytest tests/featuregen/gates/test_open_task.py -v`
+Expected: FAIL with `ModuleNotFoundError: No module named 'featuregen.gates'`.
 
 - [ ] **Step 3: Write minimal implementation**
 
 ```python
-# src/sp0/contracts/gates.py
+# src/featuregen/contracts/gates.py
 # Verbatim from the shared SP-0 contract; Phase 07 authoritative.
 from __future__ import annotations
 
@@ -1801,11 +1801,11 @@ class SignalResult:
 ```
 
 ```python
-# src/sp0/gates/__init__.py
+# src/featuregen/gates/__init__.py
 ```
 
 ```python
-# src/sp0/gates/duration.py
+# src/featuregen/gates/duration.py
 from __future__ import annotations
 
 from datetime import timedelta
@@ -1823,18 +1823,18 @@ def parse_duration(s: str) -> timedelta:
 ```
 
 ```python
-# src/sp0/gates/tasks.py
+# src/featuregen/gates/tasks.py
 from __future__ import annotations
 
 from datetime import datetime, timezone
 
 from psycopg.types.json import Json
 
-from sp0.contracts.db import DbConn
-from sp0.contracts.gates import GateTaskSpec
-from sp0.contracts.identity import IdentityEnvelope
-from sp0.gates.duration import parse_duration
-from sp0.idgen import mint_id
+from featuregen.contracts.db import DbConn
+from featuregen.contracts.gates import GateTaskSpec
+from featuregen.contracts.identity import IdentityEnvelope
+from featuregen.gates.duration import parse_duration
+from featuregen.idgen import mint_id
 
 
 class GateError(Exception):
@@ -1942,13 +1942,13 @@ def cancel_tasks_on_run_advance(
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `python3 -m pytest tests/sp0/gates/test_open_task.py -v`
+Run: `python3 -m pytest tests/featuregen/gates/test_open_task.py -v`
 Expected: PASS (5 passed).
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/sp0/contracts/gates.py src/sp0/gates tests/sp0/gates/test_open_task.py
+git add src/featuregen/contracts/gates.py src/featuregen/gates tests/featuregen/gates/test_open_task.py
 git commit -m "feat(sp0-07): human-gate open_task with SLA ladder, cancel, version bump"
 ```
 
@@ -1957,8 +1957,8 @@ git commit -m "feat(sp0-07): human-gate open_task with SLA ladder, cancel, versi
 ## Task 9: Human-gate task — submit_human_signal (eligibility, SoD, quorum_of_role, validated delegation, staleness, conflict, idempotency)
 
 **Files:**
-- Modify: `src/sp0/gates/tasks.py`
-- Test: `tests/sp0/gates/test_submit_signal.py`
+- Modify: `src/featuregen/gates/tasks.py`
+- Test: `tests/featuregen/gates/test_submit_signal.py`
 
 **Interfaces:**
 - Consumes: `SignalResult` (Task 8); `GateError` (Task 8); `mint_id` (Task 3); `human_tasks`/`human_task_responses`/`task_delegations`/`timers` (Task 3); `global_seq_seq` (Task 3); `gate_sod_reason` (Task 7); `IdentityEnvelope` (Task 1); `DbConn`.
@@ -1967,11 +1967,11 @@ git commit -m "feat(sp0-07): human-gate open_task with SLA ladder, cancel, versi
 - [ ] **Step 1: Write the failing test**
 
 ```python
-# tests/sp0/gates/test_submit_signal.py
+# tests/featuregen/gates/test_submit_signal.py
 import pytest
 
-from sp0.contracts.gates import GateTaskSpec
-from sp0.gates.tasks import (
+from featuregen.contracts.gates import GateTaskSpec
+from featuregen.gates.tasks import (
     IneligibleResponderError,
     ResponseNotAllowedError,
     SoDViolationError,
@@ -1980,7 +1980,7 @@ from sp0.gates.tasks import (
     open_task,
     submit_human_signal,
 )
-from sp0.identity.build import build_human_identity, build_service_identity
+from featuregen.identity.build import build_human_identity, build_service_identity
 
 
 def _svc():
@@ -2107,7 +2107,7 @@ def test_response_not_allowed_rejected(db):
 
 
 def test_late_answer_on_cancelled_task_refused(db):
-    from sp0.gates.tasks import cancel_task
+    from featuregen.gates.tasks import cancel_task
 
     task_id = _open(db)
     cancel_task(db, task_id, reason="run advanced")
@@ -2209,12 +2209,12 @@ def test_delegation_requires_grant_and_validates_principal(db):
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `python3 -m pytest tests/sp0/gates/test_submit_signal.py -v`
+Run: `python3 -m pytest tests/featuregen/gates/test_submit_signal.py -v`
 Expected: FAIL with `ImportError: cannot import name 'IneligibleResponderError'`.
 
 - [ ] **Step 3: Write minimal implementation**
 
-Append to `src/sp0/gates/tasks.py`. Two imports are added near the top: the existing `from sp0.contracts.gates import GateTaskSpec` line becomes `from sp0.contracts.gates import GateTaskSpec, SignalResult`, and a new top-level `from sp0.authz.sod import gate_sod_reason` is added (acyclic: `sp0.authz.sod` never imports `sp0.gates`).
+Append to `src/featuregen/gates/tasks.py`. Two imports are added near the top: the existing `from featuregen.contracts.gates import GateTaskSpec` line becomes `from featuregen.contracts.gates import GateTaskSpec, SignalResult`, and a new top-level `from featuregen.authz.sod import gate_sod_reason` is added (acyclic: `featuregen.authz.sod` never imports `featuregen.gates`).
 
 ```python
 class IneligibleResponderError(GateError):
@@ -2423,13 +2423,13 @@ def submit_human_signal(
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `python3 -m pytest tests/sp0/gates/test_submit_signal.py tests/sp0/gates/test_open_task.py -v`
+Run: `python3 -m pytest tests/featuregen/gates/test_submit_signal.py tests/featuregen/gates/test_open_task.py -v`
 Expected: PASS (17 passed — 12 submit-signal tests + Task 8's 5 tests still green).
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/sp0/gates/tasks.py tests/sp0/gates/test_submit_signal.py
+git add src/featuregen/gates/tasks.py tests/featuregen/gates/test_submit_signal.py
 git commit -m "feat(sp0-07): submit_human_signal quorum/staleness/conflict/idempotency"
 ```
 
@@ -2438,8 +2438,8 @@ git commit -m "feat(sp0-07): submit_human_signal quorum/staleness/conflict/idemp
 ## Task 10: Break-glass — dual control + mandatory after-the-fact review
 
 **Files:**
-- Create: `src/sp0/security/break_glass.py`
-- Test: `tests/sp0/security/test_break_glass.py`
+- Create: `src/featuregen/security/break_glass.py`
+- Test: `tests/featuregen/security/test_break_glass.py`
 
 **Interfaces:**
 - Consumes: `record_security_event` (Task 4); `mint_id` (Task 3); `parse_duration` (Task 8); `IdentityEnvelope` (Task 1); `timers`/`security_audit` tables (Task 3); `DbConn`.
@@ -2448,11 +2448,11 @@ git commit -m "feat(sp0-07): submit_human_signal quorum/staleness/conflict/idemp
 - [ ] **Step 1: Write the failing test**
 
 ```python
-# tests/sp0/security/test_break_glass.py
+# tests/featuregen/security/test_break_glass.py
 import pytest
 
-from sp0.identity.build import build_human_identity
-from sp0.security.break_glass import (
+from featuregen.identity.build import build_human_identity
+from featuregen.security.break_glass import (
     BreakGlassError,
     invoke_break_glass,
     sign_off_break_glass_review,
@@ -2522,13 +2522,13 @@ def test_review_sign_off_records_and_cancels_timer(db):
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `python3 -m pytest tests/sp0/security/test_break_glass.py -v`
-Expected: FAIL with `ModuleNotFoundError: No module named 'sp0.security.break_glass'`.
+Run: `python3 -m pytest tests/featuregen/security/test_break_glass.py -v`
+Expected: FAIL with `ModuleNotFoundError: No module named 'featuregen.security.break_glass'`.
 
 - [ ] **Step 3: Write minimal implementation**
 
 ```python
-# src/sp0/security/break_glass.py
+# src/featuregen/security/break_glass.py
 from __future__ import annotations
 
 from datetime import datetime, timezone
@@ -2536,11 +2536,11 @@ from typing import Optional
 
 from psycopg.types.json import Json
 
-from sp0.contracts.db import DbConn
-from sp0.contracts.identity import IdentityEnvelope
-from sp0.gates.duration import parse_duration
-from sp0.idgen import mint_id
-from sp0.security.audit import record_security_event
+from featuregen.contracts.db import DbConn
+from featuregen.contracts.identity import IdentityEnvelope
+from featuregen.gates.duration import parse_duration
+from featuregen.idgen import mint_id
+from featuregen.security.audit import record_security_event
 
 
 class BreakGlassError(Exception):
@@ -2654,13 +2654,13 @@ def sign_off_break_glass_review(
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `python3 -m pytest tests/sp0/security/test_break_glass.py -v`
+Run: `python3 -m pytest tests/featuregen/security/test_break_glass.py -v`
 Expected: PASS (4 passed).
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/sp0/security/break_glass.py tests/sp0/security/test_break_glass.py
+git add src/featuregen/security/break_glass.py tests/featuregen/security/test_break_glass.py
 git commit -m "feat(sp0-07): break-glass dual-control + mandatory independent review"
 ```
 

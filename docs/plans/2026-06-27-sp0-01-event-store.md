@@ -2,7 +2,7 @@
 
 **Goal:** Build the source-of-truth event store (monotonic `global_seq`, per-aggregate optimistic concurrency), the versioned event-schema registry (total/chained upcasters, backward-compat rule, deprecate/withdraw lifecycle, pinned snapshots), and the projection runner (checkpoint/lag/as-of, fail-closed degraded handling, deterministic rebuild, parallel migration with atomic read-switch) — the foundation every later SP-0 phase appends events into and projects from.
 
-> This phase physically lays down `src/sp0/contracts/` (the authoritative shared symbol module imported by every phase). Phase 01 is **semantically authoritative** only for the symbols in its "Produces" lists below; the other dataclasses/Protocols are copied **verbatim** from the shared contract as pure declarations so the package imports — later phases implement behavior against them without redefining them.
+> This phase physically lays down `src/featuregen/contracts/` (the authoritative shared symbol module imported by every phase). Phase 01 is **semantically authoritative** only for the symbols in its "Produces" lists below; the other dataclasses/Protocols are copied **verbatim** from the shared contract as pure declarations so the package imports — later phases implement behavior against them without redefining them.
 
 > **Phase 01 design refinement (degraded handling).** The shared `run_projection` docstring says it marks the affected aggregate degraded "(e.g. `run_workflow_state.degraded=true`)". `run_workflow_state` is owned by a later phase and its `current_state`/`table_version` `NOT NULL` columns require §4 concepts Phase 01 does not have. Phase 01 therefore implements `run_projection` **generically over the `Projection` Protocol** while still honoring the contract's "mark the affected aggregate degraded and stop advancing it":
 >
@@ -18,7 +18,7 @@
 
 ```
 pyproject.toml                              # package metadata, deps, pytest pythonpath=src
-src/sp0/
+src/featuregen/
   __init__.py
   contracts/
     __init__.py                             # re-exports every shared symbol (incl. lazy re-export
@@ -77,12 +77,12 @@ tests/
 
 **Files:**
 - Create: `pyproject.toml`
-- Create: `src/sp0/__init__.py`
-- Create: `src/sp0/contracts/errors.py`
-- Create: `src/sp0/contracts/db.py`
-- Create: `src/sp0/contracts/envelopes.py`
-- Create: `src/sp0/contracts/protocols.py`
-- Create: `src/sp0/contracts/__init__.py`
+- Create: `src/featuregen/__init__.py`
+- Create: `src/featuregen/contracts/errors.py`
+- Create: `src/featuregen/contracts/db.py`
+- Create: `src/featuregen/contracts/envelopes.py`
+- Create: `src/featuregen/contracts/protocols.py`
+- Create: `src/featuregen/contracts/__init__.py`
 - Test: `tests/contracts/test_contract_symbols.py`
 
 **Interfaces:**
@@ -97,7 +97,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from sp0.contracts import (
+from featuregen.contracts import (
     Command,
     CommandResult,
     ConcurrencyError,
@@ -257,12 +257,12 @@ testpaths = ["tests"]
 ```
 
 ```python
-# src/sp0/__init__.py
+# src/featuregen/__init__.py
 """SP-0 Foundations."""
 ```
 
 ```python
-# src/sp0/contracts/errors.py
+# src/featuregen/contracts/errors.py
 from __future__ import annotations
 
 
@@ -284,7 +284,7 @@ class SchemaValidationError(Exception):
 ```
 
 ```python
-# src/sp0/contracts/db.py
+# src/featuregen/contracts/db.py
 from __future__ import annotations
 
 from typing import Any
@@ -297,7 +297,7 @@ DbConn = psycopg.Connection[Any]
 ```
 
 ```python
-# src/sp0/contracts/envelopes.py
+# src/featuregen/contracts/envelopes.py
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -305,7 +305,7 @@ from datetime import datetime
 from enum import Enum
 from typing import Any, Mapping, Optional
 
-from sp0.contracts.db import DbConn
+from featuregen.contracts.db import DbConn
 
 
 @dataclass(frozen=True, slots=True)
@@ -531,13 +531,13 @@ class SignalResult:
 ```
 
 ```python
-# src/sp0/contracts/protocols.py
+# src/featuregen/contracts/protocols.py
 from __future__ import annotations
 
 from typing import Any, Callable, Mapping, Protocol, runtime_checkable
 
-from sp0.contracts.db import DbConn
-from sp0.contracts.envelopes import (
+from featuregen.contracts.db import DbConn
+from featuregen.contracts.envelopes import (
     EventEnvelope,
     GuardOutcome,
     HandlerContext,
@@ -620,11 +620,11 @@ class SchemaRegistry(Protocol):
 ```
 
 ```python
-# src/sp0/contracts/__init__.py
+# src/featuregen/contracts/__init__.py
 from __future__ import annotations
 
-from sp0.contracts.db import DbConn
-from sp0.contracts.envelopes import (
+from featuregen.contracts.db import DbConn
+from featuregen.contracts.envelopes import (
     Command,
     CommandResult,
     Disposition,
@@ -641,12 +641,12 @@ from sp0.contracts.envelopes import (
     ProvenanceEnvelope,
     SignalResult,
 )
-from sp0.contracts.errors import (
+from featuregen.contracts.errors import (
     ConcurrencyError,
     ProjectionApplyError,
     SchemaValidationError,
 )
-from sp0.contracts.protocols import (
+from featuregen.contracts.protocols import (
     GuardInputs,
     GuardPredicate,
     Handler,
@@ -700,7 +700,7 @@ Expected: PASS (6 passed).
 - [ ] **Step 5: Commit**
 
 ```bash
-git add pyproject.toml src/sp0/__init__.py src/sp0/contracts tests/contracts/test_contract_symbols.py
+git add pyproject.toml src/featuregen/__init__.py src/featuregen/contracts tests/contracts/test_contract_symbols.py
 git commit -m "feat(sp0-01): shared contract module + project scaffold"
 ```
 
@@ -709,8 +709,8 @@ git commit -m "feat(sp0-01): shared contract module + project scaffold"
 ### Task 2: Phase 01 DB migrations + pytest DB harness
 
 **Files:**
-- Create: `src/sp0/db/__init__.py`
-- Create: `src/sp0/db/migrations.py`
+- Create: `src/featuregen/db/__init__.py`
+- Create: `src/featuregen/db/migrations.py`
 - Create: `tests/conftest.py`
 - Test: `tests/db/test_migrations.py`
 
@@ -784,20 +784,20 @@ def test_aggregate_id_consistency_check_rejects_mismatch(conn):
 - [ ] **Step 2: Run test to verify it fails**
 
 Run: `python -m pytest tests/db/test_migrations.py -q`
-Expected: FAIL — `fixture 'conn' not found` / `ModuleNotFoundError: No module named 'sp0.db'`.
+Expected: FAIL — `fixture 'conn' not found` / `ModuleNotFoundError: No module named 'featuregen.db'`.
 
 - [ ] **Step 3: Write minimal implementation**
 
 ```python
-# src/sp0/db/__init__.py
+# src/featuregen/db/__init__.py
 """SP-0 database migrations."""
 ```
 
 ```python
-# src/sp0/db/migrations.py
+# src/featuregen/db/migrations.py
 from __future__ import annotations
 
-from sp0.contracts.db import DbConn
+from featuregen.contracts.db import DbConn
 
 GLOBAL_SEQ = """
 CREATE SEQUENCE IF NOT EXISTS global_seq_seq AS bigint
@@ -928,8 +928,8 @@ import os
 import psycopg
 import pytest
 
-from sp0.db.migrations import apply_migrations
-from sp0.events.registry import reset_event_registry
+from featuregen.db.migrations import apply_migrations
+from featuregen.events.registry import reset_event_registry
 
 DSN = os.environ.get("SP0_TEST_DSN", "postgresql:///sp0_test")
 
@@ -958,15 +958,15 @@ def _reset_registry():
     reset_event_registry()
 ```
 
-> `tests/conftest.py` imports `reset_event_registry` from `sp0.events.registry`, created in Task 4. Until then this import fails; that is expected and is resolved by Task 4. To keep Task 2 green in isolation, create the stub now:
+> `tests/conftest.py` imports `reset_event_registry` from `featuregen.events.registry`, created in Task 4. Until then this import fails; that is expected and is resolved by Task 4. To keep Task 2 green in isolation, create the stub now:
 
 ```python
-# src/sp0/events/__init__.py
+# src/featuregen/events/__init__.py
 """SP-0 event store."""
 ```
 
 ```python
-# src/sp0/events/registry.py
+# src/featuregen/events/registry.py
 from __future__ import annotations
 
 
@@ -982,7 +982,7 @@ Expected: PASS (3 passed).
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/sp0/db src/sp0/events/__init__.py src/sp0/events/registry.py tests/conftest.py tests/db/test_migrations.py
+git add src/featuregen/db src/featuregen/events/__init__.py src/featuregen/events/registry.py tests/conftest.py tests/db/test_migrations.py
 git commit -m "feat(sp0-01): Phase 01 DDL migrations + pytest PG harness"
 ```
 
@@ -991,7 +991,7 @@ git commit -m "feat(sp0-01): Phase 01 DDL migrations + pytest PG harness"
 ### Task 3: Envelope serde (identity / provenance / event row <-> jsonb)
 
 **Files:**
-- Create: `src/sp0/events/serde.py`
+- Create: `src/featuregen/events/serde.py`
 - Test: `tests/events/test_serde.py`
 
 **Interfaces:**
@@ -1006,8 +1006,8 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from sp0.contracts import EventEnvelope, IdentityEnvelope, ProvenanceEnvelope
-from sp0.events.serde import (
+from featuregen.contracts import EventEnvelope, IdentityEnvelope, ProvenanceEnvelope
+from featuregen.events.serde import (
     identity_from_jsonb,
     identity_to_jsonb,
     provenance_from_jsonb,
@@ -1090,17 +1090,17 @@ def test_row_to_event_reconstructs_envelope():
 - [ ] **Step 2: Run test to verify it fails**
 
 Run: `python -m pytest tests/events/test_serde.py -q`
-Expected: FAIL — `ImportError: cannot import name 'identity_from_jsonb' from 'sp0.events.serde'`.
+Expected: FAIL — `ImportError: cannot import name 'identity_from_jsonb' from 'featuregen.events.serde'`.
 
 - [ ] **Step 3: Write minimal implementation**
 
 ```python
-# src/sp0/events/serde.py
+# src/featuregen/events/serde.py
 from __future__ import annotations
 
 from typing import Any, Mapping
 
-from sp0.contracts import EventEnvelope, IdentityEnvelope, ProvenanceEnvelope
+from featuregen.contracts import EventEnvelope, IdentityEnvelope, ProvenanceEnvelope
 
 
 def identity_to_jsonb(idv: IdentityEnvelope) -> dict[str, Any]:
@@ -1203,7 +1203,7 @@ Expected: PASS (3 passed).
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/sp0/events/serde.py tests/events/test_serde.py
+git add src/featuregen/events/serde.py tests/events/test_serde.py
 git commit -m "feat(sp0-01): identity/provenance/event jsonb serde"
 ```
 
@@ -1212,7 +1212,7 @@ git commit -m "feat(sp0-01): identity/provenance/event jsonb serde"
 ### Task 4: Event schema registry — register + validate + singleton
 
 **Files:**
-- Modify: `src/sp0/events/registry.py` (replace the Task 2 stub with the real registry)
+- Modify: `src/featuregen/events/registry.py` (replace the Task 2 stub with the real registry)
 - Test: `tests/events/test_registry_validate.py`
 
 **Interfaces:**
@@ -1227,8 +1227,8 @@ from __future__ import annotations
 
 import pytest
 
-from sp0.contracts import SchemaValidationError
-from sp0.events.registry import EventSchemaRegistry, event_registry, reset_event_registry
+from featuregen.contracts import SchemaValidationError
+from featuregen.events.registry import EventSchemaRegistry, event_registry, reset_event_registry
 
 SCHEMA = {
     "type": "object",
@@ -1273,14 +1273,14 @@ Expected: FAIL — `ImportError: cannot import name 'EventSchemaRegistry'`.
 - [ ] **Step 3: Write minimal implementation**
 
 ```python
-# src/sp0/events/registry.py
+# src/featuregen/events/registry.py
 from __future__ import annotations
 
 from typing import Any, Mapping, Optional
 
 import jsonschema
 
-from sp0.contracts import SchemaValidationError, Upcaster
+from featuregen.contracts import SchemaValidationError, Upcaster
 
 
 class EventSchemaRegistry:
@@ -1343,7 +1343,7 @@ Expected: PASS (4 passed).
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/sp0/events/registry.py tests/events/test_registry_validate.py
+git add src/featuregen/events/registry.py tests/events/test_registry_validate.py
 git commit -m "feat(sp0-01): event schema registry register+validate+singleton"
 ```
 
@@ -1352,7 +1352,7 @@ git commit -m "feat(sp0-01): event schema registry register+validate+singleton"
 ### Task 5: Upcasters — stepwise, total, chained
 
 **Files:**
-- Modify: `src/sp0/events/registry.py` (add `register_upcaster`, `upcast`)
+- Modify: `src/featuregen/events/registry.py` (add `register_upcaster`, `upcast`)
 - Test: `tests/events/test_registry_upcast.py`
 
 **Interfaces:**
@@ -1367,8 +1367,8 @@ from __future__ import annotations
 
 import pytest
 
-from sp0.contracts import SchemaValidationError
-from sp0.events.registry import EventSchemaRegistry
+from featuregen.contracts import SchemaValidationError
+from featuregen.events.registry import EventSchemaRegistry
 
 
 def _reg() -> EventSchemaRegistry:
@@ -1414,7 +1414,7 @@ Expected: FAIL — `AttributeError: 'EventSchemaRegistry' object has no attribut
 
 - [ ] **Step 3: Write minimal implementation**
 
-Add these methods to `EventSchemaRegistry` in `src/sp0/events/registry.py`:
+Add these methods to `EventSchemaRegistry` in `src/featuregen/events/registry.py`:
 
 ```python
     def register_upcaster(
@@ -1462,7 +1462,7 @@ Expected: PASS (5 passed).
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/sp0/events/registry.py tests/events/test_registry_upcast.py
+git add src/featuregen/events/registry.py tests/events/test_registry_upcast.py
 git commit -m "feat(sp0-01): stepwise total chained event upcasters"
 ```
 
@@ -1471,7 +1471,7 @@ git commit -m "feat(sp0-01): stepwise total chained event upcasters"
 ### Task 6: Backward-compatibility rule
 
 **Files:**
-- Modify: `src/sp0/events/registry.py` (add module function `is_backward_compatible`)
+- Modify: `src/featuregen/events/registry.py` (add module function `is_backward_compatible`)
 - Test: `tests/events/test_registry_backward_compat.py`
 
 **Interfaces:**
@@ -1484,7 +1484,7 @@ git commit -m "feat(sp0-01): stepwise total chained event upcasters"
 # tests/events/test_registry_backward_compat.py
 from __future__ import annotations
 
-from sp0.events.registry import is_backward_compatible
+from featuregen.events.registry import is_backward_compatible
 
 V1 = {
     "type": "object",
@@ -1554,8 +1554,8 @@ def test_removed_enum_value_is_breaking():
 # ── assert_evolution_complete: §3.3 breaking-bump => mandatory upcaster (active enforcement)
 import pytest  # noqa: E402
 
-from sp0.contracts import SchemaValidationError  # noqa: E402
-from sp0.events.registry import EventSchemaRegistry  # noqa: E402
+from featuregen.contracts import SchemaValidationError  # noqa: E402
+from featuregen.events.registry import EventSchemaRegistry  # noqa: E402
 
 _BREAKING_V2 = {
     "type": "object",
@@ -1600,7 +1600,7 @@ Expected: FAIL — `ImportError: cannot import name 'is_backward_compatible'` (a
 
 - [ ] **Step 3: Write minimal implementation**
 
-Add to `src/sp0/events/registry.py` (module level, after the class):
+Add to `src/featuregen/events/registry.py` (module level, after the class):
 
 ```python
 def _types_of(spec: Mapping[str, Any]) -> set[str]:
@@ -1690,7 +1690,7 @@ Expected: PASS (10 passed).
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/sp0/events/registry.py tests/events/test_registry_backward_compat.py
+git add src/featuregen/events/registry.py tests/events/test_registry_backward_compat.py
 git commit -m "feat(sp0-01): backward-compatibility rule for event schemas"
 ```
 
@@ -1699,7 +1699,7 @@ git commit -m "feat(sp0-01): backward-compatibility rule for event schemas"
 ### Task 7: Deprecation lifecycle + write-gating
 
 **Files:**
-- Modify: `src/sp0/events/registry.py` (add `set_status`, `assert_writable`)
+- Modify: `src/featuregen/events/registry.py` (add `set_status`, `assert_writable`)
 - Test: `tests/events/test_registry_lifecycle.py`
 
 **Interfaces:**
@@ -1714,8 +1714,8 @@ from __future__ import annotations
 
 import pytest
 
-from sp0.contracts import SchemaValidationError
-from sp0.events.registry import EventSchemaRegistry
+from featuregen.contracts import SchemaValidationError
+from featuregen.events.registry import EventSchemaRegistry
 
 
 def _reg() -> EventSchemaRegistry:
@@ -1763,7 +1763,7 @@ Expected: FAIL — `AttributeError: 'EventSchemaRegistry' object has no attribut
 
 - [ ] **Step 3: Write minimal implementation**
 
-Add these methods to `EventSchemaRegistry` in `src/sp0/events/registry.py`:
+Add these methods to `EventSchemaRegistry` in `src/featuregen/events/registry.py`:
 
 ```python
     def set_status(self, type_name: str, schema_version: int, status: str) -> None:
@@ -1792,7 +1792,7 @@ Expected: PASS (5 passed).
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/sp0/events/registry.py tests/events/test_registry_lifecycle.py
+git add src/featuregen/events/registry.py tests/events/test_registry_lifecycle.py
 git commit -m "feat(sp0-01): schema deprecate/withdraw lifecycle + write-gating"
 ```
 
@@ -1801,7 +1801,7 @@ git commit -m "feat(sp0-01): schema deprecate/withdraw lifecycle + write-gating"
 ### Task 8: Pinnable registry snapshot + durable persistence, hydration & snapshot read-path
 
 **Files:**
-- Modify: `src/sp0/events/registry.py` (add `snapshot_version`, `max_active_versions`, `all_schemas`; module functions `persist_event_schemas`, `persist_registry_snapshot`, `load_registry_snapshot`, `hydrate_event_registry`)
+- Modify: `src/featuregen/events/registry.py` (add `snapshot_version`, `max_active_versions`, `all_schemas`; module functions `persist_event_schemas`, `persist_registry_snapshot`, `load_registry_snapshot`, `hydrate_event_registry`)
 - Test: `tests/events/test_registry_snapshot.py`
 - Test: `tests/events/test_registry_hydrate.py`
 
@@ -1823,8 +1823,8 @@ from __future__ import annotations
 import pytest
 from psycopg.rows import dict_row
 
-from sp0.contracts import SchemaValidationError
-from sp0.events.registry import (
+from featuregen.contracts import SchemaValidationError
+from featuregen.events.registry import (
     EventSchemaRegistry,
     load_registry_snapshot,
     persist_event_schemas,
@@ -1927,8 +1927,8 @@ from __future__ import annotations
 
 import pytest
 
-from sp0.contracts import SchemaValidationError
-from sp0.events.registry import (
+from featuregen.contracts import SchemaValidationError
+from featuregen.events.registry import (
     EventSchemaRegistry,
     event_registry,
     hydrate_event_registry,
@@ -2004,7 +2004,7 @@ Add `snapshot_version` method to `EventSchemaRegistry`:
         ]
 ```
 
-Add these imports near the top of `src/sp0/events/registry.py`:
+Add these imports near the top of `src/featuregen/events/registry.py`:
 
 ```python
 import hashlib
@@ -2013,7 +2013,7 @@ import json as _json
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
-from sp0.contracts.db import DbConn
+from featuregen.contracts.db import DbConn
 ```
 
 Add module-level functions:
@@ -2103,7 +2103,7 @@ Expected: PASS (10 passed: 8 snapshot + 2 hydrate).
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/sp0/events/registry.py tests/events/test_registry_snapshot.py tests/events/test_registry_hydrate.py
+git add src/featuregen/events/registry.py tests/events/test_registry_snapshot.py tests/events/test_registry_hydrate.py
 git commit -m "feat(sp0-01): content-addressed snapshot id, snapshot read-path, registry hydration"
 ```
 
@@ -2112,7 +2112,7 @@ git commit -m "feat(sp0-01): content-addressed snapshot id, snapshot read-path, 
 ### Task 9: append_event — global_seq, stream_version, registry-validated insert
 
 **Files:**
-- Create: `src/sp0/events/store.py`
+- Create: `src/featuregen/events/store.py`
 - Test: `tests/events/test_append_event.py`
 
 **Interfaces:**
@@ -2125,9 +2125,9 @@ git commit -m "feat(sp0-01): content-addressed snapshot id, snapshot read-path, 
 # tests/events/test_append_event.py
 from __future__ import annotations
 
-from sp0.contracts import IdentityEnvelope, NewEvent, ProvenanceEnvelope
-from sp0.events.registry import event_registry
-from sp0.events.store import append_event
+from featuregen.contracts import IdentityEnvelope, NewEvent, ProvenanceEnvelope
+from featuregen.events.registry import event_registry
+from featuregen.events.store import append_event
 
 
 def _idv() -> IdentityEnvelope:
@@ -2183,7 +2183,7 @@ def test_append_increments_stream_version_and_global_seq(conn):
 def test_append_validates_payload_against_registry(conn):
     import pytest
 
-    from sp0.contracts import SchemaValidationError
+    from featuregen.contracts import SchemaValidationError
 
     event_registry().register_schema(
         "RUN_STARTED",
@@ -2198,7 +2198,7 @@ def test_append_validates_payload_against_registry(conn):
 def test_append_blocks_writes_to_deprecated_schema(conn):
     import pytest
 
-    from sp0.contracts import SchemaValidationError
+    from featuregen.contracts import SchemaValidationError
 
     event_registry().register_schema("RUN_STARTED", 1, {"type": "object"}, owner="sp0")
     event_registry().set_status("RUN_STARTED", 1, "deprecated")
@@ -2209,7 +2209,7 @@ def test_append_blocks_writes_to_deprecated_schema(conn):
 - [ ] **Step 2: Run test to verify it fails**
 
 Run: `python -m pytest tests/events/test_append_event.py -q`
-Expected: FAIL — `ModuleNotFoundError: No module named 'sp0.events.store'`.
+Expected: FAIL — `ModuleNotFoundError: No module named 'featuregen.events.store'`.
 
 - [ ] **Step 3: Write minimal implementation**
 
@@ -2219,7 +2219,7 @@ Expected: FAIL — `ModuleNotFoundError: No module named 'sp0.events.store'`.
 > conflicts yet.
 
 ```python
-# src/sp0/events/store.py
+# src/featuregen/events/store.py
 from __future__ import annotations
 
 import datetime as _dt
@@ -2228,9 +2228,9 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 from ulid import ULID
 
-from sp0.contracts import DbConn, EventEnvelope, NewEvent
-from sp0.events.registry import event_registry
-from sp0.events.serde import identity_to_jsonb, provenance_to_jsonb
+from featuregen.contracts import DbConn, EventEnvelope, NewEvent
+from featuregen.events.registry import event_registry
+from featuregen.events.serde import identity_to_jsonb, provenance_to_jsonb
 
 _INSERT = """
 INSERT INTO events (
@@ -2314,7 +2314,7 @@ Expected: PASS (4 passed).
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/sp0/events/store.py tests/events/test_append_event.py
+git add src/featuregen/events/store.py tests/events/test_append_event.py
 git commit -m "feat(sp0-01): append_event with global_seq + registry-validated insert"
 ```
 
@@ -2323,7 +2323,7 @@ git commit -m "feat(sp0-01): append_event with global_seq + registry-validated i
 ### Task 10: Optimistic concurrency guard (stale, ahead-of-head, concurrent race)
 
 **Files:**
-- Modify: `src/sp0/events/store.py` (add the OCC guard to `append_event`)
+- Modify: `src/featuregen/events/store.py` (add the OCC guard to `append_event`)
 - Test: `tests/events/test_optimistic_concurrency.py`
 
 **Interfaces:**
@@ -2338,9 +2338,9 @@ from __future__ import annotations
 
 import pytest
 
-from sp0.contracts import ConcurrencyError, IdentityEnvelope, NewEvent, ProvenanceEnvelope
-from sp0.events.registry import event_registry
-from sp0.events.store import append_event
+from featuregen.contracts import ConcurrencyError, IdentityEnvelope, NewEvent, ProvenanceEnvelope
+from featuregen.events.registry import event_registry
+from featuregen.events.store import append_event
 
 
 def _new(run_id: str) -> NewEvent:
@@ -2397,12 +2397,12 @@ Expected: FAIL — Task 9's happy-path `append_event` has no OCC guard, so the s
 
 - [ ] **Step 3: Write minimal implementation**
 
-Replace the body of `append_event` in `src/sp0/events/store.py` with the OCC-complete version (add `from psycopg.errors import UniqueViolation` and `ConcurrencyError` to the imports):
+Replace the body of `append_event` in `src/featuregen/events/store.py` with the OCC-complete version (add `from psycopg.errors import UniqueViolation` and `ConcurrencyError` to the imports):
 
 ```python
 from psycopg.errors import UniqueViolation  # add to imports
 
-from sp0.contracts import ConcurrencyError, DbConn, EventEnvelope, NewEvent  # add ConcurrencyError
+from featuregen.contracts import ConcurrencyError, DbConn, EventEnvelope, NewEvent  # add ConcurrencyError
 
 
 def append_event(
@@ -2499,7 +2499,7 @@ Expected: PASS (3 OCC tests + 4 Task 9 append tests = 7 passed; Task 9's happy-p
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/sp0/events/store.py tests/events/test_optimistic_concurrency.py
+git add src/featuregen/events/store.py tests/events/test_optimistic_concurrency.py
 git commit -m "feat(sp0-01): OCC guard — stale + ahead-of-head + concurrent-race ConcurrencyError"
 ```
 
@@ -2508,7 +2508,7 @@ git commit -m "feat(sp0-01): OCC guard — stale + ahead-of-head + concurrent-ra
 ### Task 11: load_stream — ordered replay, as-of, upcast-on-read
 
 **Files:**
-- Modify: `src/sp0/events/store.py` (add `load_stream`)
+- Modify: `src/featuregen/events/store.py` (add `load_stream`)
 - Test: `tests/events/test_load_stream.py`
 
 **Interfaces:**
@@ -2521,13 +2521,13 @@ git commit -m "feat(sp0-01): OCC guard — stale + ahead-of-head + concurrent-ra
 # tests/events/test_load_stream.py
 from __future__ import annotations
 
-from sp0.contracts import IdentityEnvelope, NewEvent, ProvenanceEnvelope
-from sp0.events.registry import (
+from featuregen.contracts import IdentityEnvelope, NewEvent, ProvenanceEnvelope
+from featuregen.events.registry import (
     event_registry,
     load_registry_snapshot,
     persist_registry_snapshot,
 )
-from sp0.events.store import append_event, load_stream
+from featuregen.events.store import append_event, load_stream
 
 
 def _new(run_id: str, type_: str, payload: dict) -> NewEvent:
@@ -2607,7 +2607,7 @@ Expected: FAIL — `ImportError: cannot import name 'load_stream'`.
 
 - [ ] **Step 3: Write minimal implementation**
 
-Add to `src/sp0/events/store.py` (add `from dataclasses import replace` and `from typing import Mapping, Optional` to the imports, and `from sp0.events.serde import row_to_event`):
+Add to `src/featuregen/events/store.py` (add `from dataclasses import replace` and `from typing import Mapping, Optional` to the imports, and `from featuregen.events.serde import row_to_event`):
 
 ```python
 def load_stream(
@@ -2657,7 +2657,7 @@ Expected: PASS (5 passed).
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/sp0/events/store.py tests/events/test_load_stream.py
+git add src/featuregen/events/store.py tests/events/test_load_stream.py
 git commit -m "feat(sp0-01): load_stream ordered replay + as-of + upcast-on-read"
 ```
 
@@ -2666,8 +2666,8 @@ git commit -m "feat(sp0-01): load_stream ordered replay + as-of + upcast-on-read
 ### Task 12: Projection runner — apply, checkpoint, lag, as-of
 
 **Files:**
-- Create: `src/sp0/projections/__init__.py`
-- Create: `src/sp0/projections/runner.py`
+- Create: `src/featuregen/projections/__init__.py`
+- Create: `src/featuregen/projections/runner.py`
 - Test: `tests/projections/test_run_projection.py`
 
 **Interfaces:**
@@ -2682,10 +2682,10 @@ from __future__ import annotations
 
 from psycopg.rows import dict_row
 
-from sp0.contracts import IdentityEnvelope, NewEvent, ProvenanceEnvelope
-from sp0.events.registry import event_registry
-from sp0.events.store import append_event
-from sp0.projections.runner import projection_lag, read_as_of, run_projection
+from featuregen.contracts import IdentityEnvelope, NewEvent, ProvenanceEnvelope
+from featuregen.events.registry import event_registry
+from featuregen.events.store import append_event
+from featuregen.projections.runner import projection_lag, read_as_of, run_projection
 
 
 class CountingProjection:
@@ -2784,23 +2784,23 @@ def test_lag_and_as_of_track_checkpoint(conn):
 - [ ] **Step 2: Run test to verify it fails**
 
 Run: `python -m pytest tests/projections/test_run_projection.py -q`
-Expected: FAIL — `ModuleNotFoundError: No module named 'sp0.projections.runner'`.
+Expected: FAIL — `ModuleNotFoundError: No module named 'featuregen.projections.runner'`.
 
 - [ ] **Step 3: Write minimal implementation**
 
 ```python
-# src/sp0/projections/__init__.py
+# src/featuregen/projections/__init__.py
 """SP-0 projections."""
 ```
 
 ```python
-# src/sp0/projections/runner.py
+# src/featuregen/projections/runner.py
 from __future__ import annotations
 
 from psycopg.rows import dict_row
 
-from sp0.contracts import DbConn, Projection, ProjectionApplyError
-from sp0.events.serde import row_to_event
+from featuregen.contracts import DbConn, Projection, ProjectionApplyError
+from featuregen.events.serde import row_to_event
 
 
 def _ensure_checkpoint(conn: DbConn, name: str, is_analytics: bool) -> None:
@@ -2895,7 +2895,7 @@ Expected: PASS (3 passed).
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/sp0/projections/__init__.py src/sp0/projections/runner.py tests/projections/test_run_projection.py
+git add src/featuregen/projections/__init__.py src/featuregen/projections/runner.py tests/projections/test_run_projection.py
 git commit -m "feat(sp0-01): projection runner apply+checkpoint+lag+as-of"
 ```
 
@@ -2904,7 +2904,7 @@ git commit -m "feat(sp0-01): projection runner apply+checkpoint+lag+as-of"
 ### Task 13: Fail-closed degraded handling vs analytics fail-open
 
 **Files:**
-- Modify: `src/sp0/projections/runner.py` (add the fail-closed/analytics branches + `_mark_degraded` to `run_projection`)
+- Modify: `src/featuregen/projections/runner.py` (add the fail-closed/analytics branches + `_mark_degraded` to `run_projection`)
 - Test: `tests/projections/test_fail_closed.py`
 
 **Interfaces:**
@@ -2919,15 +2919,15 @@ from __future__ import annotations
 
 from psycopg.rows import dict_row
 
-from sp0.contracts import (
+from featuregen.contracts import (
     IdentityEnvelope,
     NewEvent,
     ProjectionApplyError,
     ProvenanceEnvelope,
 )
-from sp0.events.registry import event_registry
-from sp0.events.store import append_event
-from sp0.projections.runner import projection_lag, run_projection
+from featuregen.events.registry import event_registry
+from featuregen.events.store import append_event
+from featuregen.projections.runner import projection_lag, run_projection
 
 
 def _append(conn, run_id, version, payload):
@@ -3059,7 +3059,7 @@ Expected: FAIL — Task 12's `run_projection` does not catch `ProjectionApplyErr
 
 - [ ] **Step 3: Write minimal implementation**
 
-Add `_mark_degraded` and replace the apply loop in `run_projection` (in `src/sp0/projections/runner.py`). Every `projection.apply` is wrapped in a `SAVEPOINT proj_apply`. A fail-closed projection raises a *Python* `ProjectionApplyError` (not a SQL error), so the connection's transaction is still valid: the runner issues `ROLLBACK TO SAVEPOINT proj_apply` to discard **any partial writes the apply body made before raising** (no partial projection state survives), then writes the surviving degraded marker to `projection_degraded` in a separate statement:
+Add `_mark_degraded` and replace the apply loop in `run_projection` (in `src/featuregen/projections/runner.py`). Every `projection.apply` is wrapped in a `SAVEPOINT proj_apply`. A fail-closed projection raises a *Python* `ProjectionApplyError` (not a SQL error), so the connection's transaction is still valid: the runner issues `ROLLBACK TO SAVEPOINT proj_apply` to discard **any partial writes the apply body made before raising** (no partial projection state survives), then writes the surviving degraded marker to `projection_degraded` in a separate statement:
 
 ```python
 def _mark_degraded(conn: DbConn, projection_name: str, exc: ProjectionApplyError, event) -> None:
@@ -3126,7 +3126,7 @@ Expected: PASS (2 fail-closed tests + the Task 12 happy-path tests; the simplifi
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/sp0/projections/runner.py tests/projections/test_fail_closed.py
+git add src/featuregen/projections/runner.py tests/projections/test_fail_closed.py
 git commit -m "feat(sp0-01): fail-closed degraded-halt + ledger marking vs analytics fail-open"
 ```
 
@@ -3135,7 +3135,7 @@ git commit -m "feat(sp0-01): fail-closed degraded-halt + ledger marking vs analy
 ### Task 14: Deterministic rebuild from global_seq=0
 
 **Files:**
-- Modify: `src/sp0/projections/runner.py` (add `rebuild_projection`)
+- Modify: `src/featuregen/projections/runner.py` (add `rebuild_projection`)
 - Test: `tests/projections/test_rebuild.py`
 
 **Interfaces:**
@@ -3150,10 +3150,10 @@ from __future__ import annotations
 
 from psycopg.rows import dict_row
 
-from sp0.contracts import IdentityEnvelope, NewEvent, ProvenanceEnvelope
-from sp0.events.registry import event_registry
-from sp0.events.store import append_event
-from sp0.projections.runner import rebuild_projection, run_projection
+from featuregen.contracts import IdentityEnvelope, NewEvent, ProvenanceEnvelope
+from featuregen.events.registry import event_registry
+from featuregen.events.store import append_event
+from featuregen.projections.runner import rebuild_projection, run_projection
 
 
 class SumProjection:
@@ -3235,7 +3235,7 @@ Expected: FAIL — `ImportError: cannot import name 'rebuild_projection'`.
 
 - [ ] **Step 3: Write minimal implementation**
 
-Add to `src/sp0/projections/runner.py`:
+Add to `src/featuregen/projections/runner.py`:
 
 ```python
 def rebuild_projection(conn: DbConn, projection: Projection) -> None:
@@ -3260,7 +3260,7 @@ Expected: PASS (2 passed).
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/sp0/projections/runner.py tests/projections/test_rebuild.py
+git add src/featuregen/projections/runner.py tests/projections/test_rebuild.py
 git commit -m "feat(sp0-01): deterministic projection rebuild from global_seq=0"
 ```
 
@@ -3269,7 +3269,7 @@ git commit -m "feat(sp0-01): deterministic projection rebuild from global_seq=0"
 ### Task 15: Parallel migration with atomic read-switch
 
 **Files:**
-- Create: `src/sp0/projections/migration.py`
+- Create: `src/featuregen/projections/migration.py`
 - Test: `tests/projections/test_migration.py`
 
 **Interfaces:**
@@ -3284,11 +3284,11 @@ from __future__ import annotations
 
 from psycopg.rows import dict_row
 
-from sp0.contracts import IdentityEnvelope, NewEvent, ProvenanceEnvelope
-from sp0.events.registry import event_registry
-from sp0.events.store import append_event
-from sp0.projections.migration import migrate_projection, resolve_projection, set_alias
-from sp0.projections.runner import projection_lag, run_projection
+from featuregen.contracts import IdentityEnvelope, NewEvent, ProvenanceEnvelope
+from featuregen.events.registry import event_registry
+from featuregen.events.store import append_event
+from featuregen.projections.migration import migrate_projection, resolve_projection, set_alias
+from featuregen.projections.runner import projection_lag, run_projection
 
 
 class V1Projection:
@@ -3369,18 +3369,18 @@ def test_resolve_unknown_alias_returns_alias_itself(conn):
 - [ ] **Step 2: Run test to verify it fails**
 
 Run: `python -m pytest tests/projections/test_migration.py -q`
-Expected: FAIL — `ModuleNotFoundError: No module named 'sp0.projections.migration'`.
+Expected: FAIL — `ModuleNotFoundError: No module named 'featuregen.projections.migration'`.
 
 - [ ] **Step 3: Write minimal implementation**
 
 ```python
-# src/sp0/projections/migration.py
+# src/featuregen/projections/migration.py
 from __future__ import annotations
 
 from psycopg.rows import dict_row
 
-from sp0.contracts import DbConn, Projection
-from sp0.projections.runner import _head_seq, projection_lag, rebuild_projection
+from featuregen.contracts import DbConn, Projection
+from featuregen.projections.runner import _head_seq, projection_lag, rebuild_projection
 
 
 def set_alias(conn: DbConn, alias: str, projection_name: str) -> None:
@@ -3440,27 +3440,27 @@ Expected: PASS (2 passed).
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/sp0/projections/migration.py tests/projections/test_migration.py
+git add src/featuregen/projections/migration.py tests/projections/test_migration.py
 git commit -m "feat(sp0-01): parallel projection migration + atomic read-switch"
 ```
 
 ---
 
-### Task 16: Re-export core interfaces from `sp0.contracts` + cross-stream monotonic global_seq + full-suite gate
+### Task 16: Re-export core interfaces from `featuregen.contracts` + cross-stream monotonic global_seq + full-suite gate
 
 **Files:**
-- Modify: `src/sp0/contracts/__init__.py` (lazily re-export `append_event`, `load_stream`, `run_projection`, `rebuild_projection`, `projection_lag`)
+- Modify: `src/featuregen/contracts/__init__.py` (lazily re-export `append_event`, `load_stream`, `run_projection`, `rebuild_projection`, `projection_lag`)
 - Test: `tests/contracts/test_core_interface_reexports.py`
 - Test: `tests/events/test_global_seq_monotonic.py`
 
 **Interfaces:**
 - Consumes: `append_event`, `load_stream` (Tasks 9–11); `run_projection`, `rebuild_projection`, `projection_lag` (Tasks 12–14); `global_seq_seq` (Task 2).
-- Produces: the contract's promise that the core interface functions are importable from `sp0.contracts` (the overview says these "live in `src/sp0/contracts/` and are imported by every phase"). They are re-exported **lazily** via a module-level `__getattr__` (PEP 562) so importing `sp0.contracts` does not eagerly pull in `sp0.events.*` / `sp0.projections.*` (which import `sp0.contracts` themselves) — avoiding a circular import while still letting downstream phases write `from sp0.contracts import append_event`.
+- Produces: the contract's promise that the core interface functions are importable from `featuregen.contracts` (the overview says these "live in `src/featuregen/contracts/` and are imported by every phase"). They are re-exported **lazily** via a module-level `__getattr__` (PEP 562) so importing `featuregen.contracts` does not eagerly pull in `featuregen.events.*` / `featuregen.projections.*` (which import `featuregen.contracts` themselves) — avoiding a circular import while still letting downstream phases write `from featuregen.contracts import append_event`.
 - Regression guard (no new implementation): `global_seq` is strictly increasing and unique across appends in different aggregate streams (guaranteed by Task 2's `global_seq_seq` DEFAULT on `events`).
 
 - [ ] **Step 1: Write the failing test**
 
-The TDD subject of this task is the `sp0.contracts` re-export. Write the failing test:
+The TDD subject of this task is the `featuregen.contracts` re-export. Write the failing test:
 
 ```python
 # tests/contracts/test_core_interface_reexports.py
@@ -3468,9 +3468,9 @@ from __future__ import annotations
 
 
 def test_core_interface_functions_importable_from_contracts():
-    # The overview declares these AUTHORITATIVE functions live in sp0.contracts and are
+    # The overview declares these AUTHORITATIVE functions live in featuregen.contracts and are
     # imported by every phase. Downstream phases must be able to import them from here.
-    from sp0.contracts import (
+    from featuregen.contracts import (
         append_event,
         load_stream,
         projection_lag,
@@ -3483,9 +3483,9 @@ def test_core_interface_functions_importable_from_contracts():
 
 
 def test_reexported_functions_are_the_same_objects():
-    import sp0.contracts as contracts
-    from sp0.events.store import append_event as store_append
-    from sp0.projections.runner import run_projection as runner_run
+    import featuregen.contracts as contracts
+    from featuregen.events.store import append_event as store_append
+    from featuregen.projections.runner import run_projection as runner_run
 
     assert contracts.append_event is store_append
     assert contracts.run_projection is runner_run
@@ -3499,9 +3499,9 @@ this task's red→green subject):
 # tests/events/test_global_seq_monotonic.py
 from __future__ import annotations
 
-from sp0.contracts import IdentityEnvelope, NewEvent, ProvenanceEnvelope
-from sp0.events.registry import event_registry
-from sp0.events.store import append_event
+from featuregen.contracts import IdentityEnvelope, NewEvent, ProvenanceEnvelope
+from featuregen.events.registry import event_registry
+from featuregen.events.store import append_event
 
 
 def _new(agg_id: str) -> NewEvent:
@@ -3536,26 +3536,26 @@ def test_global_seq_strictly_increases_across_distinct_streams(conn):
 - [ ] **Step 2: Run test to verify it fails**
 
 Run: `python -m pytest tests/contracts/test_core_interface_reexports.py -q`
-Expected: FAIL — `ImportError: cannot import name 'append_event' from 'sp0.contracts'` (the re-export is not wired yet). The monotonic regression guard already passes (the `global_seq_seq` DEFAULT provides it).
+Expected: FAIL — `ImportError: cannot import name 'append_event' from 'featuregen.contracts'` (the re-export is not wired yet). The monotonic regression guard already passes (the `global_seq_seq` DEFAULT provides it).
 
 - [ ] **Step 3: Write minimal implementation**
 
-Append a lazy re-export to the BOTTOM of `src/sp0/contracts/__init__.py`. It MUST be a PEP-562
-module `__getattr__` (not a top-level `from sp0.events.store import ...`): `sp0.events.*` and
-`sp0.projections.*` import `sp0.contracts` at module load, so an eager import here would deadlock
+Append a lazy re-export to the BOTTOM of `src/featuregen/contracts/__init__.py`. It MUST be a PEP-562
+module `__getattr__` (not a top-level `from featuregen.events.store import ...`): `featuregen.events.*` and
+`featuregen.projections.*` import `featuregen.contracts` at module load, so an eager import here would deadlock
 the cycle. `__getattr__` defers the import to first attribute access, by which point all modules
 are fully initialized:
 
 ```python
 # ── Core interface functions (overview "Core interfaces"): re-exported so downstream phases can
-# `from sp0.contracts import append_event, ...`. Lazy (PEP 562) to avoid the import cycle with
-# sp0.events.* / sp0.projections.*, which import THIS module.
+# `from featuregen.contracts import append_event, ...`. Lazy (PEP 562) to avoid the import cycle with
+# featuregen.events.* / featuregen.projections.*, which import THIS module.
 _LAZY_EXPORTS = {
-    "append_event": ("sp0.events.store", "append_event"),
-    "load_stream": ("sp0.events.store", "load_stream"),
-    "run_projection": ("sp0.projections.runner", "run_projection"),
-    "rebuild_projection": ("sp0.projections.runner", "rebuild_projection"),
-    "projection_lag": ("sp0.projections.runner", "projection_lag"),
+    "append_event": ("featuregen.events.store", "append_event"),
+    "load_stream": ("featuregen.events.store", "load_stream"),
+    "run_projection": ("featuregen.projections.runner", "run_projection"),
+    "rebuild_projection": ("featuregen.projections.runner", "rebuild_projection"),
+    "projection_lag": ("featuregen.projections.runner", "projection_lag"),
 }
 
 
@@ -3584,8 +3584,8 @@ cross-stream monotonicity guard.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/sp0/contracts/__init__.py tests/contracts/test_core_interface_reexports.py tests/events/test_global_seq_monotonic.py
-git commit -m "feat(sp0-01): re-export core interfaces from sp0.contracts + cross-stream global_seq guard"
+git add src/featuregen/contracts/__init__.py tests/contracts/test_core_interface_reexports.py tests/events/test_global_seq_monotonic.py
+git commit -m "feat(sp0-01): re-export core interfaces from featuregen.contracts + cross-stream global_seq guard"
 ```
 
 ---
@@ -3595,5 +3595,5 @@ git commit -m "feat(sp0-01): re-export core interfaces from sp0.contracts + cros
 - §3.2 event envelope + per-aggregate OCC (incl. the **ahead-of-head** gap case, not just stale) + monotonic `global_seq` → Tasks 1, 2, 9, 10, 16.
 - §3.3 registry: validate, total/chained stepwise upcasters, backward-compat rule **actively enforced** (breaking bump → mandatory upcaster, load-time error via `assert_evolution_complete` wired into `persist_event_schemas`), deprecate/withdraw, content-addressed pinned snapshot (write side) **and** the snapshot read-path (`load_registry_snapshot` driving upcast-on-read) + durable persistence **and** hydration → Tasks 4, 5, 6, 7, 8; upcast-on-read incl. snapshot-pinned replay → Task 11.
 - §3.6 projections: checkpoint, lag, as-of, fail-closed degraded (each apply is SAVEPOINT-wrapped; on a fail-closed `ProjectionApplyError` the runner rolls back the apply's partial writes, marks the affected aggregate in `projection_degraded` from the carried payload in a separate statement, then halts) vs analytics fail-open, deterministic rebuild, parallel migration + atomic read-switch → Tasks 12, 13, 14, 15.
-- Contract integrity: shared `Handler`/`Projection` Protocols and `HandlerContext` carry the contract's typed signatures verbatim (no `Any` weakening) — Task 1; core interface functions importable from `sp0.contracts` per the overview — Task 16.
+- Contract integrity: shared `Handler`/`Projection` Protocols and `HandlerContext` carry the contract's typed signatures verbatim (no `Any` weakening) — Task 1; core interface functions importable from `featuregen.contracts` per the overview — Task 16.
 - §12 coverage owned here: optimistic-concurrency conflict incl. ahead-of-head guard (Task 10), schema evolution incl. breaking change caught proactively at persist + deprecated/withdrawn readable + content-addressed pinned snapshot resolvable back to its `{type: version}` map (Tasks 5–8, 11), registry hydration on a fresh process (Task 8), `as-of`/lag reads (Tasks 11, 12), fail-closed/`degraded` ledger handling (Task 13).

@@ -8,16 +8,16 @@
 
 This phase binds to these published Phase 01 interfaces (do not redefine them). If Phase 01 chose different module paths, adapt the imports — names, params, and return types are fixed.
 
-- **Shared contract symbols** — `from sp0.contracts import (...)`:
+- **Shared contract symbols** — `from featuregen.contracts import (...)`:
   - `DbConn` — alias for the active `psycopg` (psycopg 3) `Connection`/transaction handle.
-  - `IdentityEnvelope`, `ProvenanceEnvelope` — frozen envelopes (the `ProvenanceEnvelope` defining module is `sp0.contracts.envelopes`; import it from there inside `sp0.contracts.documents` to avoid an `__init__` import cycle).
+  - `IdentityEnvelope`, `ProvenanceEnvelope` — frozen envelopes (the `ProvenanceEnvelope` defining module is `featuregen.contracts.envelopes`; import it from there inside `featuregen.contracts.documents` to avoid an `__init__` import cycle).
   - `NewEvent`, `EventEnvelope`, `ConcurrencyError`.
   - `SchemaRegistry` (Protocol), `SchemaValidationError`, `Upcaster`.
   - `Projection` (Protocol), `ProjectionApplyError`, `run_projection(conn, projection, *, batch=500) -> int`.
-- **Event store** — `from sp0.events import append_event, load_stream`:
+- **Event store** — `from featuregen.events import append_event, load_stream`:
   - `append_event(conn, new_event, *, expected_version, table_version) -> EventEnvelope` — validates payload against the event registry **reading `event_type_registry` on the passed `conn`** before insert.
-- **Id minting** — `from sp0.ids import new_id`: `new_id(prefix: str) -> str` returns a ULID-style `"{prefix}_{26-char-ULID}"` (used for `evt_…`, `sec_…`, etc.).
-- **Migrations** — `from sp0.db.migrate import apply_migrations`: `apply_migrations(conn: DbConn) -> None` applies every `src/sp0/db/migrations/*.sql` in lexical order, idempotently. Phase 02 only drops a new `0002_*.sql` file; the runner picks it up.
+- **Id minting** — `from featuregen.ids import new_id`: `new_id(prefix: str) -> str` returns a ULID-style `"{prefix}_{26-char-ULID}"` (used for `evt_…`, `sec_…`, etc.).
+- **Migrations** — `from featuregen.db.migrate import apply_migrations`: `apply_migrations(conn: DbConn) -> None` applies every `src/featuregen/db/migrations/*.sql` in lexical order, idempotently. Phase 02 only drops a new `0002_*.sql` file; the runner picks it up.
 - **Phase 01 DDL this phase references:** `global_seq_seq` (sequence), `events`, `event_type_registry`, `registry_snapshots`, `projection_checkpoints`. The `LIKE event_type_registry` in this phase's migration requires `event_type_registry` to already exist (it does, from `0001_*.sql`).
 - **Test fixture** — a root `tests/conftest.py` (Phase 01) exposes a `db` pytest fixture yielding a clean `DbConn` with all migrations applied, rolled back between tests. This phase's tests request `db` by name.
 - **Project dependency** — `jsonschema` is a project dependency (added by Phase 01 for event-payload validation). This phase uses it for document-body validation.
@@ -32,7 +32,7 @@ This phase binds to these published Phase 01 interfaces (do not redefine them). 
 ### File structure
 
 ```
-src/sp0/
+src/featuregen/
   contracts/
     __init__.py                  # MODIFY: re-export NewDocument, Stage, STAGES, BRANCH_ROLES, BODY_CLASSIFICATIONS
     documents.py                 # CREATE: NewDocument (verbatim) + normative Stage enum + role/classification vocab
@@ -45,7 +45,7 @@ src/sp0/
     primary.py                   # CREATE: PRIMARY_SELECTED event + StagePrimaryProjection + current_primary
     draft.py                     # CREATE: normative Draft / Assumption-Ledger schema + validate_draft
 
-tests/sp0/documents/
+tests/featuregen/documents/
   conftest.py                    # CREATE: actor/provenance fixtures (build on root `db`)
   test_contracts.py              # Task 1
   test_migration.py              # Task 2
@@ -64,12 +64,12 @@ One responsibility per file. `store.py` is created in Task 3 and extended (Modif
 ## Task 1 — Document contract types + normative stage/artifact enum
 
 **Files:**
-- Create: `src/sp0/contracts/documents.py`
-- Modify: `src/sp0/contracts/__init__.py`
-- Test: `tests/sp0/documents/test_contracts.py`
+- Create: `src/featuregen/contracts/documents.py`
+- Modify: `src/featuregen/contracts/__init__.py`
+- Test: `tests/featuregen/documents/test_contracts.py`
 
 **Interfaces:**
-- Consumes: `from sp0.contracts.envelopes import ProvenanceEnvelope` (Phase 01).
+- Consumes: `from featuregen.contracts.envelopes import ProvenanceEnvelope` (Phase 01).
 - Produces:
   - `NewDocument` — frozen/slots dataclass (verbatim from the shared contract).
   - `Stage(str, Enum)` — the 14 normative stage/artifact names (§3.7).
@@ -77,7 +77,7 @@ One responsibility per file. `store.py` is created in Task 3 and extended (Modif
 
 **TDD cycle 1.1 — the contract types exist and are frozen**
 
-1. Write the failing test — `tests/sp0/documents/test_contracts.py`:
+1. Write the failing test — `tests/featuregen/documents/test_contracts.py`:
 
 ```python
 from __future__ import annotations
@@ -86,14 +86,14 @@ import dataclasses
 
 import pytest
 
-from sp0.contracts.documents import (
+from featuregen.contracts.documents import (
     BODY_CLASSIFICATIONS,
     BRANCH_ROLES,
     STAGES,
     NewDocument,
     Stage,
 )
-from sp0.contracts.envelopes import ProvenanceEnvelope
+from featuregen.contracts.envelopes import ProvenanceEnvelope
 
 
 def _prov() -> ProvenanceEnvelope:
@@ -138,10 +138,10 @@ def test_new_document_is_frozen_with_defaults():
 ```
 
 2. Run it, expect FAIL:
-   - `python -m pytest tests/sp0/documents/test_contracts.py -q`
-   - Expected: `ModuleNotFoundError: No module named 'sp0.contracts.documents'`.
+   - `python -m pytest tests/featuregen/documents/test_contracts.py -q`
+   - Expected: `ModuleNotFoundError: No module named 'featuregen.contracts.documents'`.
 
-3. Write minimal implementation — `src/sp0/contracts/documents.py`:
+3. Write minimal implementation — `src/featuregen/contracts/documents.py`:
 
 ```python
 from __future__ import annotations
@@ -150,7 +150,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Optional
 
-from sp0.contracts.envelopes import ProvenanceEnvelope
+from featuregen.contracts.envelopes import ProvenanceEnvelope
 
 
 class Stage(str, Enum):
@@ -196,10 +196,10 @@ class NewDocument:
     reject_reason: Optional[str] = None        # required when branch_role == "rejected"
 ```
 
-   Then append to `src/sp0/contracts/__init__.py` (downstream phases import these from the package root):
+   Then append to `src/featuregen/contracts/__init__.py` (downstream phases import these from the package root):
 
 ```python
-from sp0.contracts.documents import (
+from featuregen.contracts.documents import (
     BODY_CLASSIFICATIONS,
     BRANCH_ROLES,
     STAGES,
@@ -209,7 +209,7 @@ from sp0.contracts.documents import (
 ```
 
 4. Run tests, expect PASS:
-   - `python -m pytest tests/sp0/documents/test_contracts.py -q`
+   - `python -m pytest tests/featuregen/documents/test_contracts.py -q`
 
 5. Commit:
    - `git add -A && git commit -m "SP-0 Phase 02: NewDocument contract + normative stage/artifact enum
@@ -221,9 +221,9 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"`
 ## Task 2 — Migration: documents, stage_primary, blob_index, document_type_registry + write-once trigger
 
 **Files:**
-- Create: `src/sp0/db/migrations/0002_documents.sql`
-- Create: `tests/sp0/documents/conftest.py`
-- Test: `tests/sp0/documents/test_migration.py`
+- Create: `src/featuregen/db/migrations/0002_documents.sql`
+- Create: `tests/featuregen/documents/conftest.py`
+- Test: `tests/featuregen/documents/test_migration.py`
 
 **Interfaces:**
 - Consumes: `apply_migrations` (Phase 01, via the `db` fixture); `event_type_registry`, `registry_snapshots` (Phase 01 DDL).
@@ -233,14 +233,14 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"`
 
 **TDD cycle 2.1 — tables, indexes, and the write-once trigger**
 
-1. Write the failing test — first add the shared fixtures `tests/sp0/documents/conftest.py`:
+1. Write the failing test — first add the shared fixtures `tests/featuregen/documents/conftest.py`:
 
 ```python
 from __future__ import annotations
 
 import pytest
 
-from sp0.contracts import IdentityEnvelope, ProvenanceEnvelope
+from featuregen.contracts import IdentityEnvelope, ProvenanceEnvelope
 
 
 @pytest.fixture
@@ -263,7 +263,7 @@ def provenance() -> ProvenanceEnvelope:
     )
 ```
 
-   Then `tests/sp0/documents/test_migration.py`:
+   Then `tests/featuregen/documents/test_migration.py`:
 
 ```python
 from __future__ import annotations
@@ -328,10 +328,10 @@ def test_one_live_primary_per_run_stage_is_unique(db):
 ```
 
 2. Run it, expect FAIL:
-   - `python -m pytest tests/sp0/documents/test_migration.py -q`
+   - `python -m pytest tests/featuregen/documents/test_migration.py -q`
    - Expected: `test_phase02_tables_exist` fails (`assert False` for `documents`) because `0002_documents.sql` does not exist.
 
-3. Write minimal implementation — `src/sp0/db/migrations/0002_documents.sql` (DDL verbatim from the shared contract, plus the write-once trigger this phase owns):
+3. Write minimal implementation — `src/featuregen/db/migrations/0002_documents.sql` (DDL verbatim from the shared contract, plus the write-once trigger this phase owns):
 
 ```sql
 -- =========================================================================
@@ -418,7 +418,7 @@ CREATE TABLE document_type_registry (LIKE event_type_registry INCLUDING ALL);
 ```
 
 4. Run tests, expect PASS:
-   - `python -m pytest tests/sp0/documents/test_migration.py -q`
+   - `python -m pytest tests/featuregen/documents/test_migration.py -q`
 
 5. Commit:
    - `git add -A && git commit -m "SP-0 Phase 02: documents/stage_primary/blob_index/document_type_registry migration + write-once trigger
@@ -430,12 +430,12 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"`
 ## Task 3 — Document store: append_document core + content hashing + read-back
 
 **Files:**
-- Create: `src/sp0/documents/__init__.py` (empty package marker)
-- Create: `src/sp0/documents/store.py`
-- Test: `tests/sp0/documents/test_store_append.py`
+- Create: `src/featuregen/documents/__init__.py` (empty package marker)
+- Create: `src/featuregen/documents/store.py`
+- Test: `tests/featuregen/documents/test_store_append.py`
 
 **Interfaces:**
-- Consumes: `from sp0.contracts import DbConn, IdentityEnvelope`; `from sp0.contracts.documents import NewDocument`; `from sp0.ids import new_id`; `from psycopg.types.json import Jsonb`.
+- Consumes: `from featuregen.contracts import DbConn, IdentityEnvelope`; `from featuregen.contracts.documents import NewDocument`; `from featuregen.ids import new_id`; `from psycopg.types.json import Jsonb`.
 - Produces:
   - `append_document(conn, new_document, *, run_id=None, feature_id=None, request_id=None, actor) -> str` — inserts one frozen document inside the caller's open transaction (§5.1), allocating `doc_id` (`new_id("doc")`) + `global_seq` (DB default); returns the `doc_id`. The body is opaque-by-reference (`body_ref` + `content_hash`); body schema validation is the producer's job (Task 6/Task 8) before the blob is written.
   - `get_document(conn, doc_id) -> Optional[dict[str, Any]]`.
@@ -443,13 +443,13 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"`
 
 **TDD cycle 3.1 — append a candidate document and read it back; global_seq is monotonic**
 
-1. Write the failing test — `tests/sp0/documents/test_store_append.py`:
+1. Write the failing test — `tests/featuregen/documents/test_store_append.py`:
 
 ```python
 from __future__ import annotations
 
-from sp0.contracts.documents import NewDocument
-from sp0.documents.store import append_document, compute_content_hash, get_document
+from featuregen.contracts.documents import NewDocument
+from featuregen.documents.store import append_document, compute_content_hash, get_document
 
 
 def _candidate(provenance, content_hash="sha256:x", body_ref="blob_1"):
@@ -496,10 +496,10 @@ def test_get_document_returns_none_for_unknown(db):
 ```
 
 2. Run it, expect FAIL:
-   - `python -m pytest tests/sp0/documents/test_store_append.py -q`
-   - Expected: `ModuleNotFoundError: No module named 'sp0.documents'`.
+   - `python -m pytest tests/featuregen/documents/test_store_append.py -q`
+   - Expected: `ModuleNotFoundError: No module named 'featuregen.documents'`.
 
-3. Write minimal implementation — `src/sp0/documents/__init__.py` (empty), then `src/sp0/documents/store.py`:
+3. Write minimal implementation — `src/featuregen/documents/__init__.py` (empty), then `src/featuregen/documents/store.py`:
 
 ```python
 from __future__ import annotations
@@ -510,9 +510,9 @@ from typing import Any, Optional
 
 from psycopg.types.json import Jsonb
 
-from sp0.contracts import DbConn, IdentityEnvelope
-from sp0.contracts.documents import NewDocument
-from sp0.ids import new_id
+from featuregen.contracts import DbConn, IdentityEnvelope
+from featuregen.contracts.documents import NewDocument
+from featuregen.ids import new_id
 
 _GET_COLUMNS = (
     "doc_id", "global_seq", "request_id", "feature_id", "run_id", "stage",
@@ -578,7 +578,7 @@ def get_document(conn: DbConn, doc_id: str) -> Optional[dict[str, Any]]:
 ```
 
 4. Run tests, expect PASS:
-   - `python -m pytest tests/sp0/documents/test_store_append.py -q`
+   - `python -m pytest tests/featuregen/documents/test_store_append.py -q`
 
 5. Commit:
    - `git add -A && git commit -m "SP-0 Phase 02: append_document core + content hashing + read-back
@@ -590,23 +590,23 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"`
 ## Task 4 — DAG lineage validation (acyclicity by construction)
 
 **Files:**
-- Modify: `src/sp0/documents/store.py`
-- Test: `tests/sp0/documents/test_store_dag.py`
+- Modify: `src/featuregen/documents/store.py`
+- Test: `tests/featuregen/documents/test_store_dag.py`
 
 **Interfaces:**
 - Produces: `DagViolationError(Exception)`; `append_document` now rejects any `derived_from`/`supersedes` id that is not already committed. Existence-of-reference ⇒ lower `global_seq` ⇒ acyclic-by-construction (§3.4).
 
 **TDD cycle 4.1 — edges may only point at already-committed docs**
 
-1. Write the failing test — `tests/sp0/documents/test_store_dag.py`:
+1. Write the failing test — `tests/featuregen/documents/test_store_dag.py`:
 
 ```python
 from __future__ import annotations
 
 import pytest
 
-from sp0.contracts.documents import NewDocument
-from sp0.documents.store import DagViolationError, append_document, get_document
+from featuregen.contracts.documents import NewDocument
+from featuregen.documents.store import DagViolationError, append_document, get_document
 
 
 def _doc(provenance, *, stage="CONFIRMED_CONTRACT", derived_from=(), supersedes=()):
@@ -661,10 +661,10 @@ def test_rejecting_bad_edge_inserts_nothing(db, actor, provenance):
 ```
 
 2. Run it, expect FAIL:
-   - `python -m pytest tests/sp0/documents/test_store_dag.py -q`
+   - `python -m pytest tests/featuregen/documents/test_store_dag.py -q`
    - Expected: `ImportError: cannot import name 'DagViolationError'` (and the unknown-edge appends would otherwise succeed).
 
-3. Write minimal implementation — in `src/sp0/documents/store.py` add the error class and a validation helper, and call it at the top of `append_document` before minting the id:
+3. Write minimal implementation — in `src/featuregen/documents/store.py` add the error class and a validation helper, and call it at the top of `append_document` before minting the id:
 
 ```python
 class DagViolationError(Exception):
@@ -696,7 +696,7 @@ def _validate_dag(conn: DbConn, new_document: NewDocument) -> None:
 ```
 
 4. Run tests, expect PASS:
-   - `python -m pytest tests/sp0/documents/test_store_dag.py -q`
+   - `python -m pytest tests/featuregen/documents/test_store_dag.py -q`
 
 5. Commit:
    - `git add -A && git commit -m "SP-0 Phase 02: DAG lineage validation (acyclicity by construction)
@@ -708,15 +708,15 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"`
 ## Task 5 — Structural validation + branch_role immutability
 
 **Files:**
-- Modify: `src/sp0/documents/store.py`
-- Test: `tests/sp0/documents/test_store_validation.py`
+- Modify: `src/featuregen/documents/store.py`
+- Test: `tests/featuregen/documents/test_store_validation.py`
 
 **Interfaces:**
 - Produces: `DocumentValidationError(Exception)`; `append_document` now rejects unknown `stage`/`branch_role`/`body_classification` and a `rejected` document missing `reject_reason` with a typed error (the DB CHECKs are the backstop). `branch_role` immutability is structural — proven via the write-once trigger.
 
 **TDD cycle 5.1 — structural invariants and immutable branch_role**
 
-1. Write the failing test — `tests/sp0/documents/test_store_validation.py`:
+1. Write the failing test — `tests/featuregen/documents/test_store_validation.py`:
 
 ```python
 from __future__ import annotations
@@ -724,8 +724,8 @@ from __future__ import annotations
 import psycopg
 import pytest
 
-from sp0.contracts.documents import NewDocument
-from sp0.documents.store import (
+from featuregen.contracts.documents import NewDocument
+from featuregen.documents.store import (
     DocumentValidationError,
     append_document,
 )
@@ -789,13 +789,13 @@ def test_branch_role_is_immutable_after_commit(db, actor, provenance):
 ```
 
 2. Run it, expect FAIL:
-   - `python -m pytest tests/sp0/documents/test_store_validation.py -q`
+   - `python -m pytest tests/featuregen/documents/test_store_validation.py -q`
    - Expected: `ImportError: cannot import name 'DocumentValidationError'`.
 
-3. Write minimal implementation — in `src/sp0/documents/store.py` add the error and validator, importing the vocab:
+3. Write minimal implementation — in `src/featuregen/documents/store.py` add the error and validator, importing the vocab:
 
 ```python
-from sp0.contracts.documents import (
+from featuregen.contracts.documents import (
     BODY_CLASSIFICATIONS,
     BRANCH_ROLES,
     STAGES,
@@ -829,7 +829,7 @@ def _validate_structure(new_document: NewDocument) -> None:
 ```
 
 4. Run tests, expect PASS:
-   - `python -m pytest tests/sp0/documents/test_store_validation.py -q`
+   - `python -m pytest tests/featuregen/documents/test_store_validation.py -q`
 
 5. Commit:
    - `git add -A && git commit -m "SP-0 Phase 02: structural validation + immutable branch_role
@@ -841,24 +841,24 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"`
 ## Task 6 — Document schema registry (validate, chained upcasters, deprecation, snapshot)
 
 **Files:**
-- Create: `src/sp0/documents/registry.py`
-- Test: `tests/sp0/documents/test_registry.py`
+- Create: `src/featuregen/documents/registry.py`
+- Test: `tests/featuregen/documents/test_registry.py`
 
 **Interfaces:**
-- Consumes: `from sp0.contracts import DbConn, SchemaRegistry, SchemaValidationError, Upcaster`; `document_type_registry`, `registry_snapshots` (DDL); `jsonschema`.
+- Consumes: `from featuregen.contracts import DbConn, SchemaRegistry, SchemaValidationError, Upcaster`; `document_type_registry`, `registry_snapshots` (DDL); `jsonschema`.
 - Produces: `DocumentSchemaRegistry` — a second `SchemaRegistry` implementation (the contract states it is "implemented twice: events and documents") backed by `document_type_registry` (+ `registry_snapshots` for `snapshot_version`). Construct per-connection: `DocumentSchemaRegistry(conn)`. Implements `register_schema`, `validate` (status-agnostic so in-flight docs at deprecated/withdrawn versions stay readable), `register_upcaster`/`upcast` (chained, total — a missing step is a poison error), the §3.3 deprecation-lifecycle gate `assert_writable(type_name, schema_version)` (deprecated => no new writes; withdrawn => upcast-only), and `snapshot_version()` whose `registry_snapshots.contents` is exactly `{type_name: max_active_version}` (no extra keys).
 
 **TDD cycle 6.1 — register_schema + validate**
 
-1. Write the failing test — `tests/sp0/documents/test_registry.py`:
+1. Write the failing test — `tests/featuregen/documents/test_registry.py`:
 
 ```python
 from __future__ import annotations
 
 import pytest
 
-from sp0.contracts import SchemaValidationError
-from sp0.documents.registry import DocumentSchemaRegistry
+from featuregen.contracts import SchemaValidationError
+from featuregen.documents.registry import DocumentSchemaRegistry
 
 _SCHEMA = {
     "type": "object",
@@ -888,10 +888,10 @@ def test_validate_unregistered_type_raises(db):
 ```
 
 2. Run it, expect FAIL:
-   - `python -m pytest tests/sp0/documents/test_registry.py -q`
-   - Expected: `ModuleNotFoundError: No module named 'sp0.documents.registry'`.
+   - `python -m pytest tests/featuregen/documents/test_registry.py -q`
+   - Expected: `ModuleNotFoundError: No module named 'featuregen.documents.registry'`.
 
-3. Write minimal implementation — `src/sp0/documents/registry.py`:
+3. Write minimal implementation — `src/featuregen/documents/registry.py`:
 
 ```python
 from __future__ import annotations
@@ -901,7 +901,7 @@ from typing import Any, Mapping
 import jsonschema
 from psycopg.types.json import Jsonb
 
-from sp0.contracts import DbConn, SchemaValidationError
+from featuregen.contracts import DbConn, SchemaValidationError
 
 
 class DocumentSchemaRegistry:
@@ -963,7 +963,7 @@ class DocumentSchemaRegistry:
 ```
 
 4. Run tests, expect PASS:
-   - `python -m pytest tests/sp0/documents/test_registry.py -q`
+   - `python -m pytest tests/featuregen/documents/test_registry.py -q`
 
 5. Commit:
    - `git add -A && git commit -m "SP-0 Phase 02: document schema registry — register + validate
@@ -972,7 +972,7 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"`
 
 **TDD cycle 6.2 — chained reader-upcasters, total (missing step = poison)**
 
-1. Write the failing test — append to `tests/sp0/documents/test_registry.py`:
+1. Write the failing test — append to `tests/featuregen/documents/test_registry.py`:
 
 ```python
 def test_upcast_chains_stepwise(db):
@@ -998,12 +998,12 @@ def test_upcaster_must_be_stepwise():
 ```
 
 2. Run it, expect FAIL:
-   - `python -m pytest tests/sp0/documents/test_registry.py -q -k upcast`
+   - `python -m pytest tests/featuregen/documents/test_registry.py -q -k upcast`
    - Expected: `AttributeError: 'DocumentSchemaRegistry' object has no attribute 'register_upcaster'` (cycle 6.1 shipped only `register_schema`/`validate`/`_load_schema`, so neither `register_upcaster` nor `upcast` exists yet).
 
-3. Write minimal implementation — extend `src/sp0/documents/registry.py` with the upcaster machinery:
+3. Write minimal implementation — extend `src/featuregen/documents/registry.py` with the upcaster machinery:
    - Add `Upcaster` to the contracts import, so the header reads
-     `from sp0.contracts import DbConn, SchemaValidationError, Upcaster`.
+     `from featuregen.contracts import DbConn, SchemaValidationError, Upcaster`.
    - Add the in-memory upcaster map to `__init__` (after `self._conn = conn`):
      `self._upcasters: dict[tuple[str, int, int], Upcaster] = {}`.
    - Add the two methods (place them after `register_schema`):
@@ -1033,7 +1033,7 @@ def test_upcaster_must_be_stepwise():
 ```
 
 4. Run tests, expect PASS:
-   - `python -m pytest tests/sp0/documents/test_registry.py -q -k upcast`
+   - `python -m pytest tests/featuregen/documents/test_registry.py -q -k upcast`
 
 5. Commit:
    - `git add -A && git commit -m "SP-0 Phase 02: document schema registry — chained/total reader-upcasters
@@ -1050,7 +1050,7 @@ pinnable `snapshot_version` pins only the max *active* version per type, and its
 extra/non-type keys (the shared-contract DDL documents `contents` as that map, so a
 downstream consumer can iterate its keys as stage/artifact types safely).
 
-1. Write the failing test — append to `tests/sp0/documents/test_registry.py`:
+1. Write the failing test — append to `tests/featuregen/documents/test_registry.py`:
 
 ```python
 def test_snapshot_version_is_idempotent_when_unchanged(db):
@@ -1139,10 +1139,10 @@ def test_withdrawn_version_reachable_via_upcast(db):
 ```
 
 2. Run it, expect FAIL:
-   - `python -m pytest tests/sp0/documents/test_registry.py -q -k "snapshot or writable or deprecated or withdrawn"`
+   - `python -m pytest tests/featuregen/documents/test_registry.py -q -k "snapshot or writable or deprecated or withdrawn"`
    - Expected: `AttributeError: 'DocumentSchemaRegistry' object has no attribute 'snapshot_version'` (and `assert_writable`) — cycles 6.1/6.2 shipped neither. (`test_withdrawn_version_reachable_via_upcast` exercises 6.2's `upcast` plus the new status handling.)
 
-3. Write minimal implementation — extend `src/sp0/documents/registry.py` with the lifecycle gate, the snapshot, and the active-set helper:
+3. Write minimal implementation — extend `src/featuregen/documents/registry.py` with the lifecycle gate, the snapshot, and the active-set helper:
 
 ```python
     def assert_writable(self, type_name: str, schema_version: int) -> None:
@@ -1199,7 +1199,7 @@ def test_withdrawn_version_reachable_via_upcast(db):
    whitespace-independent, so an unchanged active map maps back to the same snapshot.
 
 4. Run tests, expect PASS:
-   - `python -m pytest tests/sp0/documents/test_registry.py -q`
+   - `python -m pytest tests/featuregen/documents/test_registry.py -q`
 
 5. Commit:
    - `git add -A && git commit -m "SP-0 Phase 02: document registry deprecation lifecycle + snapshot_version
@@ -1211,11 +1211,11 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"`
 ## Task 7 — PRIMARY_SELECTED event + one-live-primary projection (current = max global_seq)
 
 **Files:**
-- Create: `src/sp0/documents/primary.py`
-- Test: `tests/sp0/documents/test_primary.py`
+- Create: `src/featuregen/documents/primary.py`
+- Test: `tests/featuregen/documents/test_primary.py`
 
 **Interfaces:**
-- Consumes: `from sp0.contracts import DbConn, EventEnvelope, IdentityEnvelope, NewEvent, ProvenanceEnvelope, ProjectionApplyError, run_projection`; `from sp0.events import append_event`; `from psycopg.types.json import Jsonb`; `append_document` (Task 3).
+- Consumes: `from featuregen.contracts import DbConn, EventEnvelope, IdentityEnvelope, NewEvent, ProvenanceEnvelope, ProjectionApplyError, run_projection`; `from featuregen.events import append_event`; `from psycopg.types.json import Jsonb`; `append_document` (Task 3).
 - Produces:
   - `PRIMARY_SELECTED: str` constant + `PRIMARY_SELECTED_SCHEMA_VERSION: int` + `PRIMARY_SELECTED_JSON_SCHEMA`.
   - `register_primary_selected(conn: DbConn) -> None` — registers the event type into `event_type_registry` (so `append_event`'s validation passes) and ensures the `stage_primary` checkpoint row exists in `projection_checkpoints` (so the Phase 01 `run_projection` runner can consume the projection); both inserts idempotent.
@@ -1225,23 +1225,23 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"`
 
 **TDD cycle 7.1 — promotion is an explicit event; current primary follows global_seq; one row per (run, stage)**
 
-1. Write the failing test — `tests/sp0/documents/test_primary.py`:
+1. Write the failing test — `tests/featuregen/documents/test_primary.py`:
 
 ```python
 from __future__ import annotations
 
 import pytest
 
-from sp0.contracts import ProjectionApplyError, run_projection
-from sp0.contracts.documents import NewDocument
-from sp0.documents.primary import (
+from featuregen.contracts import ProjectionApplyError, run_projection
+from featuregen.contracts.documents import NewDocument
+from featuregen.documents.primary import (
     StagePrimaryProjection,
     current_primary,
     new_primary_selected,
     register_primary_selected,
 )
-from sp0.documents.store import append_document
-from sp0.events import append_event
+from featuregen.documents.store import append_document
+from featuregen.events import append_event
 
 
 def _candidate(provenance):
@@ -1331,10 +1331,10 @@ def test_run_projection_applies_in_global_seq_order(db, actor, provenance):
 ```
 
 2. Run it, expect FAIL:
-   - `python -m pytest tests/sp0/documents/test_primary.py -q`
-   - Expected: `ModuleNotFoundError: No module named 'sp0.documents.primary'` (every test in the file fails at import, including `test_run_projection_applies_in_global_seq_order`).
+   - `python -m pytest tests/featuregen/documents/test_primary.py -q`
+   - Expected: `ModuleNotFoundError: No module named 'featuregen.documents.primary'` (every test in the file fails at import, including `test_run_projection_applies_in_global_seq_order`).
 
-3. Write minimal implementation — `src/sp0/documents/primary.py`:
+3. Write minimal implementation — `src/featuregen/documents/primary.py`:
 
 ```python
 from __future__ import annotations
@@ -1343,7 +1343,7 @@ from typing import Optional
 
 from psycopg.types.json import Jsonb
 
-from sp0.contracts import (
+from featuregen.contracts import (
     DbConn,
     EventEnvelope,
     IdentityEnvelope,
@@ -1459,7 +1459,7 @@ def current_primary(conn: DbConn, run_id: str, stage: str) -> Optional[str]:
 ```
 
 4. Run tests, expect PASS:
-   - `python -m pytest tests/sp0/documents/test_primary.py -q`
+   - `python -m pytest tests/featuregen/documents/test_primary.py -q`
 
 5. Commit:
    - `git add -A && git commit -m "SP-0 Phase 02: PRIMARY_SELECTED event + one-live-primary projection
@@ -1471,11 +1471,11 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"`
 ## Task 8 — Normative Draft schema (raw_input by reference + classification, open_fields, ledger linkage)
 
 **Files:**
-- Create: `src/sp0/documents/draft.py`
-- Test: `tests/sp0/documents/test_draft.py`
+- Create: `src/featuregen/documents/draft.py`
+- Test: `tests/featuregen/documents/test_draft.py`
 
 **Interfaces:**
-- Consumes: `from sp0.contracts import SchemaValidationError`; `DocumentSchemaRegistry` (Task 6).
+- Consumes: `from featuregen.contracts import SchemaValidationError`; `DocumentSchemaRegistry` (Task 6).
 - Produces:
   - `DRAFT_CONTRACT_JSON_SCHEMA`, `ASSUMPTION_LEDGER_JSON_SCHEMA`, version constants, `RAW_INPUT_CLASSIFICATIONS`, `INTAKE_MODES`, `UNKNOWN` (the §3.5 unresolved-field sentinel).
   - `DraftValidationError(SchemaValidationError)`.
@@ -1485,22 +1485,22 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"`
 
 **TDD cycle 8.1 — validate_draft enforces the §3.5 / §9 invariants**
 
-1. Write the failing test — `tests/sp0/documents/test_draft.py`:
+1. Write the failing test — `tests/featuregen/documents/test_draft.py`:
 
 ```python
 from __future__ import annotations
 
 import pytest
 
-from sp0.contracts import SchemaValidationError
-from sp0.documents.draft import (
+from featuregen.contracts import SchemaValidationError
+from featuregen.documents.draft import (
     UNKNOWN,
     DraftValidationError,
     draft_has_open_fields,
     register_draft_schemas,
     validate_draft,
 )
-from sp0.documents.registry import DocumentSchemaRegistry
+from featuregen.documents.registry import DocumentSchemaRegistry
 
 
 def _valid_draft(**over):
@@ -1590,17 +1590,17 @@ def test_assumption_ledger_schema_registered(db):
 ```
 
 2. Run it, expect FAIL:
-   - `python -m pytest tests/sp0/documents/test_draft.py -q`
-   - Expected: `ModuleNotFoundError: No module named 'sp0.documents.draft'`.
+   - `python -m pytest tests/featuregen/documents/test_draft.py -q`
+   - Expected: `ModuleNotFoundError: No module named 'featuregen.documents.draft'`.
 
-3. Write minimal implementation — `src/sp0/documents/draft.py`:
+3. Write minimal implementation — `src/featuregen/documents/draft.py`:
 
 ```python
 from __future__ import annotations
 
 from typing import Any, Mapping
 
-from sp0.contracts import SchemaValidationError
+from featuregen.contracts import SchemaValidationError
 
 RAW_INPUT_CLASSIFICATIONS: tuple[str, ...] = ("contains_pii", "clean", "unscanned")
 INTAKE_MODES: tuple[str, ...] = ("hypothesis", "definition")
@@ -1713,7 +1713,7 @@ def register_draft_schemas(registry) -> None:
 ```
 
 4. Run tests, expect PASS:
-   - `python -m pytest tests/sp0/documents/test_draft.py -q`
+   - `python -m pytest tests/featuregen/documents/test_draft.py -q`
 
 5. Commit:
    - `git add -A && git commit -m "SP-0 Phase 02: normative Draft + Assumption-Ledger schema (raw_input by reference)
@@ -1724,7 +1724,7 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"`
 
 ## Final gate — run the whole phase suite
 
-- `python -m pytest tests/sp0/documents -q` — all tasks green together (catches cross-task regressions, e.g. the `sp0.contracts.__init__` re-exports and the registry/draft wiring).
+- `python -m pytest tests/featuregen/documents -q` — all tasks green together (catches cross-task regressions, e.g. the `featuregen.contracts.__init__` re-exports and the registry/draft wiring).
 - Commit any fixups:
   - `git add -A && git commit -m "SP-0 Phase 02: full documents suite green
 

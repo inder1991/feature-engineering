@@ -15,9 +15,9 @@
 ### File structure
 
 ```
-src/sp0/migrations/
+src/featuregen/migrations/
     0040_runtime_core.sql           # DDL: outbox, queue, processed_messages (verbatim from contract)
-src/sp0/runtime/
+src/featuregen/runtime/
     __init__.py                     # package marker
     backoff.py                      # compute_backoff — shared by outbox relay + worker queue
     ledger.py                       # processed_messages: is_processed/record_processed/prune/watermark
@@ -26,7 +26,7 @@ src/sp0/runtime/
     step.py                         # commit_step (the §5.1 atomic boundary), StepCommit, document creation via append_document
     handlers.py                     # HandlerRegistry (register/get; re-registration is an error)
     dispatch.py                     # process_one (idempotent), HandlerTimeout, recover_stuck (§5.7)
-tests/sp0/runtime/
+tests/featuregen/runtime/
     conftest.py                     # registers test event types into event_registry; actor/prov/seed helpers
     test_schema.py                  # DDL shape + constraints (status checks, one-inflight-per-partition)
     test_backoff.py                 # deterministic doubling, cap, jitter bounds
@@ -38,12 +38,12 @@ tests/sp0/runtime/
 ```
 
 **Consumed from earlier phases / shared contract** (import, never redefine):
-- `sp0.contracts`: `EventEnvelope`, `NewEvent`, `IdentityEnvelope`, `ProvenanceEnvelope`, `ConcurrencyError`, `Handler`, `HandlerResult`, `HandlerContext`, `Disposition`, `NewDocument`, `NewExternalCommand`, `NewTimer`. *(These dataclasses/Protocols are the shared "Core interfaces" block, seeded verbatim in `src/sp0/contracts/` by Phase 01. This phase imports them and is **authoritative for the concrete runtime behaviour** of `Handler`, `HandlerResult`, `HandlerContext`, `Disposition`, `NewExternalCommand`, `NewTimer` — it does not redefine their shapes.)*
-- `sp0.event_store` (Phase 01): `append_event(conn, new_event, *, expected_version, table_version) -> EventEnvelope`; `load_stream(conn, aggregate, aggregate_id, *, upto_seq=None, expected=None) -> list[EventEnvelope]`; the module-level `event_registry` instance `append_event` validates against (exposes `register_schema(type_name, schema_version, json_schema, owner, *, status="active")`). *If Phase 01 placed these at a different import path, reconcile the path only — do not redefine the symbols.*
-- `src/sp0/migrations/*.sql` (Phase 01: `global_seq_seq`, `events`, `projection_checkpoints`; Phase 02: `documents` + write-once trigger). Applied by the `db` fixture.
-- `tests/sp0/conftest.py` (Phase 01): the `db` fixture — a psycopg connection to a fresh database with every `src/sp0/migrations/*.sql` applied (per-test transaction, rolled back after each test). Inherited by `tests/sp0/runtime/`.
+- `featuregen.contracts`: `EventEnvelope`, `NewEvent`, `IdentityEnvelope`, `ProvenanceEnvelope`, `ConcurrencyError`, `Handler`, `HandlerResult`, `HandlerContext`, `Disposition`, `NewDocument`, `NewExternalCommand`, `NewTimer`. *(These dataclasses/Protocols are the shared "Core interfaces" block, seeded verbatim in `src/featuregen/contracts/` by Phase 01. This phase imports them and is **authoritative for the concrete runtime behaviour** of `Handler`, `HandlerResult`, `HandlerContext`, `Disposition`, `NewExternalCommand`, `NewTimer` — it does not redefine their shapes.)*
+- `featuregen.event_store` (Phase 01): `append_event(conn, new_event, *, expected_version, table_version) -> EventEnvelope`; `load_stream(conn, aggregate, aggregate_id, *, upto_seq=None, expected=None) -> list[EventEnvelope]`; the module-level `event_registry` instance `append_event` validates against (exposes `register_schema(type_name, schema_version, json_schema, owner, *, status="active")`). *If Phase 01 placed these at a different import path, reconcile the path only — do not redefine the symbols.*
+- `src/featuregen/migrations/*.sql` (Phase 01: `global_seq_seq`, `events`, `projection_checkpoints`; Phase 02: `documents` + write-once trigger). Applied by the `db` fixture.
+- `tests/featuregen/conftest.py` (Phase 01): the `db` fixture — a psycopg connection to a fresh database with every `src/featuregen/migrations/*.sql` applied (per-test transaction, rolled back after each test). Inherited by `tests/featuregen/runtime/`.
 
-> **INTEGRATION CONTRACT ADDENDUM — `event_registry` instance (raise to the overview if Phase 01 disagrees):** the shared contract's Phase-01 "Key Produces" names the event `SchemaRegistry` + `register_schema`/`register_upcaster`/`upcast`/`snapshot_version`, but it does NOT name the *instance* that `append_event` validates against. Every downstream phase's tests need that instance to register test event types. **This phase therefore requires Phase 01 to expose its event-registry singleton as `sp0.event_store.event_registry`** — the object whose `register_schema(type_name, schema_version, json_schema, owner, *, status="active")` matches the contract. This is the single reconciliation point: if Phase 01 exposes it under a different name/path, change ONLY the import in `tests/sp0/runtime/conftest.py` — do not fork the registry, and do not depend on any registry method beyond the contract's `register_schema`. (Per the overview's "Notes for phase authors", if Phase 01 cannot provide this seam, raise it back to the overview rather than diverging.)
+> **INTEGRATION CONTRACT ADDENDUM — `event_registry` instance (raise to the overview if Phase 01 disagrees):** the shared contract's Phase-01 "Key Produces" names the event `SchemaRegistry` + `register_schema`/`register_upcaster`/`upcast`/`snapshot_version`, but it does NOT name the *instance* that `append_event` validates against. Every downstream phase's tests need that instance to register test event types. **This phase therefore requires Phase 01 to expose its event-registry singleton as `featuregen.event_store.event_registry`** — the object whose `register_schema(type_name, schema_version, json_schema, owner, *, status="active")` matches the contract. This is the single reconciliation point: if Phase 01 exposes it under a different name/path, change ONLY the import in `tests/featuregen/runtime/conftest.py` — do not fork the registry, and do not depend on any registry method beyond the contract's `register_schema`. (Per the overview's "Notes for phase authors", if Phase 01 cannot provide this seam, raise it back to the overview rather than diverging.)
 
 **This phase is authoritative for** these contract symbols' concrete behaviour (shapes are the contract verbatim): `Handler`, `HandlerResult`, `HandlerContext`, `Disposition`, `NewExternalCommand`, `NewTimer`; plus the new runtime symbols listed under each task's **Produces**.
 
@@ -52,16 +52,16 @@ tests/sp0/runtime/
 ## Task 1 — DDL migration: outbox, queue, processed_messages
 
 **Files:**
-- Create: `src/sp0/migrations/0040_runtime_core.sql`
-- Test: `tests/sp0/runtime/test_schema.py`
+- Create: `src/featuregen/migrations/0040_runtime_core.sql`
+- Test: `tests/featuregen/runtime/test_schema.py`
 
 **Interfaces:**
-- Consumes: `db` fixture (Phase 01) — applies all `src/sp0/migrations/*.sql`; `events` table (Phase 01) for the `outbox.caused_by_event` / `processed_messages.result_event_id` FKs.
+- Consumes: `db` fixture (Phase 01) — applies all `src/featuregen/migrations/*.sql`; `events` table (Phase 01) for the `outbox.caused_by_event` / `processed_messages.result_event_id` FKs.
 - Produces: tables `outbox`, `queue`, `processed_messages` (+ indexes) exactly as the shared contract declares, including `queue_one_inflight_per_partition` (partial unique on `partition_key WHERE status='leased'`) and `processed_messages` PK on `message_id`.
 
 ### TDD steps
 
-1. **Write the failing test** — `tests/sp0/runtime/test_schema.py`:
+1. **Write the failing test** — `tests/featuregen/runtime/test_schema.py`:
 
 ```python
 from __future__ import annotations
@@ -144,9 +144,9 @@ def test_processed_messages_pk_is_message_id(db) -> None:
             cur.execute(ins)
 ```
 
-2. **Run it, expect FAIL** — `python -m pytest tests/sp0/runtime/test_schema.py -q`. Expected: `psycopg.errors.UndefinedTable: relation "outbox" does not exist` (the migration file does not exist yet).
+2. **Run it, expect FAIL** — `python -m pytest tests/featuregen/runtime/test_schema.py -q`. Expected: `psycopg.errors.UndefinedTable: relation "outbox" does not exist` (the migration file does not exist yet).
 
-3. **Write minimal implementation** — `src/sp0/migrations/0040_runtime_core.sql` (verbatim from the shared contract):
+3. **Write minimal implementation** — `src/featuregen/migrations/0040_runtime_core.sql` (verbatim from the shared contract):
 
 ```sql
 -- Phase 04: durable runtime I — transactional outbox, worker queue, idempotency ledger.
@@ -213,12 +213,12 @@ CREATE TABLE processed_messages (
 CREATE INDEX processed_messages_prune_idx ON processed_messages (processed_seq);
 ```
 
-4. **Run tests, expect PASS** — `python -m pytest tests/sp0/runtime/test_schema.py -q`. Expected: 7 passed.
+4. **Run tests, expect PASS** — `python -m pytest tests/featuregen/runtime/test_schema.py -q`. Expected: 7 passed.
 
 5. **Commit:**
 
 ```
-git add src/sp0/migrations/0040_runtime_core.sql tests/sp0/runtime/test_schema.py
+git add src/featuregen/migrations/0040_runtime_core.sql tests/featuregen/runtime/test_schema.py
 git commit -m "SP-0 Phase 04: outbox, queue, processed_messages (DDL)
 
 Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
@@ -229,9 +229,9 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 ## Task 2 — Backoff utility (shared by relay + queue)
 
 **Files:**
-- Create: `src/sp0/runtime/__init__.py`
-- Create: `src/sp0/runtime/backoff.py`
-- Test: `tests/sp0/runtime/test_backoff.py`
+- Create: `src/featuregen/runtime/__init__.py`
+- Create: `src/featuregen/runtime/backoff.py`
+- Test: `tests/featuregen/runtime/test_backoff.py`
 
 **Interfaces:**
 - Consumes: nothing (pure stdlib).
@@ -239,12 +239,12 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 
 ### TDD steps
 
-1. **Write the failing test** — `tests/sp0/runtime/test_backoff.py`:
+1. **Write the failing test** — `tests/featuregen/runtime/test_backoff.py`:
 
 ```python
 from __future__ import annotations
 
-from sp0.runtime.backoff import compute_backoff
+from featuregen.runtime.backoff import compute_backoff
 
 
 def test_doubling_without_jitter() -> None:
@@ -271,15 +271,15 @@ def test_jitter_stays_within_bounds_and_nonnegative() -> None:
         assert v >= 4.0
 ```
 
-2. **Run it, expect FAIL** — `python -m pytest tests/sp0/runtime/test_backoff.py -q`. Expected: `ModuleNotFoundError: No module named 'sp0.runtime.backoff'`.
+2. **Run it, expect FAIL** — `python -m pytest tests/featuregen/runtime/test_backoff.py -q`. Expected: `ModuleNotFoundError: No module named 'featuregen.runtime.backoff'`.
 
-3. **Write minimal implementation** — first `src/sp0/runtime/__init__.py`:
+3. **Write minimal implementation** — first `src/featuregen/runtime/__init__.py`:
 
 ```python
 """SP-0 Phase 04: durable runtime I — atomic boundary, outbox, queue, idempotency (§5.1–5.3, §5.7)."""
 ```
 
-Then `src/sp0/runtime/backoff.py`:
+Then `src/featuregen/runtime/backoff.py`:
 
 ```python
 from __future__ import annotations
@@ -306,12 +306,12 @@ def compute_backoff(
     return max(0.0, raw + random.uniform(-delta, delta))
 ```
 
-4. **Run tests, expect PASS** — `python -m pytest tests/sp0/runtime/test_backoff.py -q`. Expected: 4 passed.
+4. **Run tests, expect PASS** — `python -m pytest tests/featuregen/runtime/test_backoff.py -q`. Expected: 4 passed.
 
 5. **Commit:**
 
 ```
-git add src/sp0/runtime/__init__.py src/sp0/runtime/backoff.py tests/sp0/runtime/test_backoff.py
+git add src/featuregen/runtime/__init__.py src/featuregen/runtime/backoff.py tests/featuregen/runtime/test_backoff.py
 git commit -m "SP-0 Phase 04: shared exponential-backoff utility
 
 Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
@@ -322,9 +322,9 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 ## Task 3 — Processed-message ledger (idempotency + watermark pruning)
 
 **Files:**
-- Create: `src/sp0/runtime/ledger.py`
-- Create: `tests/sp0/runtime/conftest.py`
-- Test: `tests/sp0/runtime/test_ledger.py`
+- Create: `src/featuregen/runtime/ledger.py`
+- Create: `tests/featuregen/runtime/conftest.py`
+- Test: `tests/featuregen/runtime/test_ledger.py`
 
 **Interfaces:**
 - Consumes: `db` fixture; `projection_checkpoints` (Phase 01) for the prune watermark; `processed_messages` (Task 1).
@@ -336,22 +336,22 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 
 ### TDD steps
 
-1. **Write the failing test** — first the shared fixtures `tests/sp0/runtime/conftest.py`:
+1. **Write the failing test** — first the shared fixtures `tests/featuregen/runtime/conftest.py`:
 
 ```python
 from __future__ import annotations
 
 import pytest
 
-from sp0.contracts import IdentityEnvelope, NewEvent, ProvenanceEnvelope
-from sp0.event_store import append_event, event_registry
+from featuregen.contracts import IdentityEnvelope, NewEvent, ProvenanceEnvelope
+from featuregen.event_store import append_event, event_registry
 
 _PERMISSIVE = {"type": "object"}
 
 
 @pytest.fixture(scope="session", autouse=True)
 def _register_runtime_test_event_types():
-    # Requires the Phase-01 event-registry singleton at sp0.event_store.event_registry
+    # Requires the Phase-01 event-registry singleton at featuregen.event_store.event_registry
     # (see the INTEGRATION CONTRACT ADDENDUM in the phase plan). We register once per session;
     # a duplicate registration (the singleton may persist across modules) is tolerated, but we
     # re-confirm the type is registered via validate() so a REAL integration break (wrong name,
@@ -415,7 +415,7 @@ def seed_run_event(db, actor, prov):
     return _seed
 ```
 
-Then `tests/sp0/runtime/test_ledger.py`:
+Then `tests/featuregen/runtime/test_ledger.py`:
 
 ```python
 from __future__ import annotations
@@ -423,7 +423,7 @@ from __future__ import annotations
 import psycopg
 import pytest
 
-from sp0.runtime.ledger import (
+from featuregen.runtime.ledger import (
     is_processed,
     processed_watermark,
     prune_processed_messages,
@@ -477,9 +477,9 @@ def test_prune_deletes_below_min_checkpoint(db) -> None:
     assert is_processed(db, "keep") is True
 ```
 
-2. **Run it, expect FAIL** — `python -m pytest tests/sp0/runtime/test_ledger.py -q`. Expected: `ModuleNotFoundError: No module named 'sp0.runtime.ledger'`.
+2. **Run it, expect FAIL** — `python -m pytest tests/featuregen/runtime/test_ledger.py -q`. Expected: `ModuleNotFoundError: No module named 'featuregen.runtime.ledger'`.
 
-3. **Write minimal implementation** — `src/sp0/runtime/ledger.py`:
+3. **Write minimal implementation** — `src/featuregen/runtime/ledger.py`:
 
 ```python
 from __future__ import annotations
@@ -536,12 +536,12 @@ def prune_processed_messages(conn: psycopg.Connection) -> int:
         return cur.rowcount
 ```
 
-4. **Run tests, expect PASS** — `python -m pytest tests/sp0/runtime/test_ledger.py -q`. Expected: 4 passed.
+4. **Run tests, expect PASS** — `python -m pytest tests/featuregen/runtime/test_ledger.py -q`. Expected: 4 passed.
 
 5. **Commit:**
 
 ```
-git add src/sp0/runtime/ledger.py tests/sp0/runtime/conftest.py tests/sp0/runtime/test_ledger.py
+git add src/featuregen/runtime/ledger.py tests/featuregen/runtime/conftest.py tests/featuregen/runtime/test_ledger.py
 git commit -m "SP-0 Phase 04: processed-message idempotency ledger + watermark prune
 
 Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
@@ -552,8 +552,8 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 ## Task 4 — Outbox writer + derive-one-row-per-event + partition key
 
 **Files:**
-- Create: `src/sp0/runtime/outbox.py`
-- Test: `tests/sp0/runtime/test_outbox.py` (this task adds the writer/derive tests; Task 5 adds relay tests to the same file)
+- Create: `src/featuregen/runtime/outbox.py`
+- Test: `tests/featuregen/runtime/test_outbox.py` (this task adds the writer/derive tests; Task 5 adds relay tests to the same file)
 
 **Interfaces:**
 - Consumes: `EventEnvelope` (contract); `outbox` (Task 1); `db` + `seed_run_event` (conftest).
@@ -565,14 +565,14 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 
 ### TDD steps
 
-1. **Write the failing test** — `tests/sp0/runtime/test_outbox.py`:
+1. **Write the failing test** — `tests/featuregen/runtime/test_outbox.py`:
 
 ```python
 from __future__ import annotations
 
 import pytest
 
-from sp0.runtime.outbox import (
+from featuregen.runtime.outbox import (
     OutboxMessage,
     insert_outbox_message,
     outbox_messages_for_events,
@@ -618,9 +618,9 @@ def test_partition_key_for_unknown_aggregate_raises() -> None:
         partition_key_for(_Fake())  # type: ignore[arg-type]
 ```
 
-2. **Run it, expect FAIL** — `python -m pytest tests/sp0/runtime/test_outbox.py -q`. Expected: `ModuleNotFoundError: No module named 'sp0.runtime.outbox'`.
+2. **Run it, expect FAIL** — `python -m pytest tests/featuregen/runtime/test_outbox.py -q`. Expected: `ModuleNotFoundError: No module named 'featuregen.runtime.outbox'`.
 
-3. **Write minimal implementation** — `src/sp0/runtime/outbox.py` (this task's portion; Task 5 appends the relay functions to the same file):
+3. **Write minimal implementation** — `src/featuregen/runtime/outbox.py` (this task's portion; Task 5 appends the relay functions to the same file):
 
 ```python
 from __future__ import annotations
@@ -631,7 +631,7 @@ from typing import Any, Iterable, Mapping
 import psycopg
 from psycopg.types.json import Json
 
-from sp0.contracts import EventEnvelope
+from featuregen.contracts import EventEnvelope
 
 
 @dataclass(frozen=True, slots=True)
@@ -699,12 +699,12 @@ def insert_outbox_message(conn: psycopg.Connection, msg: OutboxMessage) -> int:
         return int(cur.fetchone()[0])
 ```
 
-4. **Run tests, expect PASS** — `python -m pytest tests/sp0/runtime/test_outbox.py -q`. Expected: 4 passed.
+4. **Run tests, expect PASS** — `python -m pytest tests/featuregen/runtime/test_outbox.py -q`. Expected: 4 passed.
 
 5. **Commit:**
 
 ```
-git add src/sp0/runtime/outbox.py tests/sp0/runtime/test_outbox.py
+git add src/featuregen/runtime/outbox.py tests/featuregen/runtime/test_outbox.py
 git commit -m "SP-0 Phase 04: outbox writer + derive-per-event + aggregate-key partitioning
 
 Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
@@ -715,8 +715,8 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 ## Task 5 — Leased relay: publish-then-mark-sent, DLQ, stuck-message reclaim, backpressure
 
 **Files:**
-- Modify: `src/sp0/runtime/outbox.py` (append relay functions)
-- Modify: `tests/sp0/runtime/test_outbox.py` (append relay tests)
+- Modify: `src/featuregen/runtime/outbox.py` (append relay functions)
+- Modify: `tests/featuregen/runtime/test_outbox.py` (append relay tests)
 
 **Interfaces:**
 - Consumes: `compute_backoff` (Task 2); `enqueue` (Task 6 — for `make_queue_publisher`); `outbox` (Task 1).
@@ -730,16 +730,16 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 
 ### TDD steps
 
-1. **Write the failing test** — append to `tests/sp0/runtime/test_outbox.py`:
+1. **Write the failing test** — append to `tests/featuregen/runtime/test_outbox.py`:
 
 ```python
-from sp0.runtime.outbox import (
+from featuregen.runtime.outbox import (
     make_queue_publisher,
     outbox_pending_depth,
     reclaim_stuck_outbox,
     relay_publish_batch,
 )
-from sp0.runtime.queue import enqueue
+from featuregen.runtime.queue import enqueue
 
 
 def _seed_pending(db, message_id: str, topic: str = "STEP_TRIGGER") -> None:
@@ -847,17 +847,17 @@ def test_backpressure_holds_outbox_pending_without_failing(db) -> None:
         assert cur.fetchone()[0] == 0  # not enqueued while saturated
 ```
 
-2. **Run it, expect FAIL** — `python -m pytest tests/sp0/runtime/test_outbox.py -q`. Expected: `ImportError: cannot import name 'relay_publish_batch' from 'sp0.runtime.outbox'`.
+2. **Run it, expect FAIL** — `python -m pytest tests/featuregen/runtime/test_outbox.py -q`. Expected: `ImportError: cannot import name 'relay_publish_batch' from 'featuregen.runtime.outbox'`.
 
-3. **Write minimal implementation** — append to `src/sp0/runtime/outbox.py`. First extend the imports at the top of the file:
+3. **Write minimal implementation** — append to `src/featuregen/runtime/outbox.py`. First extend the imports at the top of the file:
 
 ```python
 from typing import Callable
 
 from psycopg.rows import dict_row
 
-from sp0.runtime.backoff import compute_backoff
-from sp0.runtime.queue import BackpressureError, enqueue, queue_depth
+from featuregen.runtime.backoff import compute_backoff
+from featuregen.runtime.queue import BackpressureError, enqueue, queue_depth
 ```
 
 Then append the relay functions:
@@ -998,12 +998,12 @@ def make_queue_publisher(
     return publish
 ```
 
-4. **Run tests, expect PASS** — `python -m pytest tests/sp0/runtime/test_outbox.py -q`. Expected: 11 passed (4 from Task 4 + 7 here).
+4. **Run tests, expect PASS** — `python -m pytest tests/featuregen/runtime/test_outbox.py -q`. Expected: 11 passed (4 from Task 4 + 7 here).
 
 5. **Commit:**
 
 ```
-git add src/sp0/runtime/outbox.py tests/sp0/runtime/test_outbox.py
+git add src/featuregen/runtime/outbox.py tests/featuregen/runtime/test_outbox.py
 git commit -m "SP-0 Phase 04: leased relay (publish-then-sent, DLQ, reclaim, backpressure)
 
 Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
@@ -1014,8 +1014,8 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 ## Task 6 — Worker queue: SKIP-LOCKED claim, one-in-flight-per-partition, complete/fail/reclaim
 
 **Files:**
-- Create: `src/sp0/runtime/queue.py`
-- Test: `tests/sp0/runtime/test_queue.py`
+- Create: `src/featuregen/runtime/queue.py`
+- Test: `tests/featuregen/runtime/test_queue.py`
 
 **Interfaces:**
 - Consumes: `compute_backoff` (Task 2); `queue` (Task 1).
@@ -1032,12 +1032,12 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 
 ### TDD steps
 
-1. **Write the failing test** — `tests/sp0/runtime/test_queue.py`:
+1. **Write the failing test** — `tests/featuregen/runtime/test_queue.py`:
 
 ```python
 from __future__ import annotations
 
-from sp0.runtime.queue import (
+from featuregen.runtime.queue import (
     claim_one,
     complete,
     enqueue,
@@ -1156,9 +1156,9 @@ def test_queue_depth_counts_ready_and_leased(db) -> None:
     assert queue_depth(db, partition_key="run:nope") == 0
 ```
 
-2. **Run it, expect FAIL** — `python -m pytest tests/sp0/runtime/test_queue.py -q`. Expected: `ModuleNotFoundError: No module named 'sp0.runtime.queue'`.
+2. **Run it, expect FAIL** — `python -m pytest tests/featuregen/runtime/test_queue.py -q`. Expected: `ModuleNotFoundError: No module named 'featuregen.runtime.queue'`.
 
-3. **Write minimal implementation** — `src/sp0/runtime/queue.py`:
+3. **Write minimal implementation** — `src/featuregen/runtime/queue.py`:
 
 ```python
 from __future__ import annotations
@@ -1171,7 +1171,7 @@ import psycopg
 from psycopg.rows import dict_row
 from psycopg.types.json import Json
 
-from sp0.runtime.backoff import compute_backoff
+from featuregen.runtime.backoff import compute_backoff
 
 
 class BackpressureError(RuntimeError):
@@ -1330,12 +1330,12 @@ def queue_depth(
         return int(cur.fetchone()[0])
 ```
 
-4. **Run tests, expect PASS** — `python -m pytest tests/sp0/runtime/test_queue.py -q`. Expected: 10 passed (9 enqueue/claim/complete/fail/reclaim cases + `test_queue_depth_counts_ready_and_leased`).
+4. **Run tests, expect PASS** — `python -m pytest tests/featuregen/runtime/test_queue.py -q`. Expected: 10 passed (9 enqueue/claim/complete/fail/reclaim cases + `test_queue_depth_counts_ready_and_leased`).
 
 5. **Commit:**
 
 ```
-git add src/sp0/runtime/queue.py tests/sp0/runtime/test_queue.py
+git add src/featuregen/runtime/queue.py tests/featuregen/runtime/test_queue.py
 git commit -m "SP-0 Phase 04: worker queue (SKIP-LOCKED claim, per-partition serialization, retry/DLQ/reclaim)
 
 Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
@@ -1346,8 +1346,8 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 ## Task 7 — Atomic step boundary: `commit_step` (events + document + ledger + outbox)
 
 **Files:**
-- Create: `src/sp0/runtime/step.py`
-- Test: `tests/sp0/runtime/test_step.py`
+- Create: `src/featuregen/runtime/step.py`
+- Test: `tests/featuregen/runtime/test_step.py`
 
 **Interfaces:**
 - Consumes: `append_event`, `ConcurrencyError` (Phase 01); `append_document` (Phase 02 — the validated document-write path: write-once trigger + DAG/`derived_from`/structural validation enforced there); `HandlerContext`, `HandlerResult`, `NewDocument`, `NewEvent`, `EventEnvelope` (contract); `record_processed` (Task 3); `outbox_messages_for_events`, `insert_outbox_message` (Task 4); `global_seq_seq` (Phase 01).
@@ -1358,14 +1358,14 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 
 ### TDD steps
 
-1. **Write the failing test** — `tests/sp0/runtime/test_step.py`:
+1. **Write the failing test** — `tests/featuregen/runtime/test_step.py`:
 
 ```python
 from __future__ import annotations
 
 import pytest
 
-from sp0.contracts import (
+from featuregen.contracts import (
     ConcurrencyError,
     Disposition,
     HandlerContext,
@@ -1376,8 +1376,8 @@ from sp0.contracts import (
     NewTimer,
 )
 from datetime import datetime, timezone
-from sp0.documents.store import DocumentValidationError
-from sp0.runtime.step import commit_step
+from featuregen.documents.store import DocumentValidationError
+from featuregen.runtime.step import commit_step
 
 
 def _next_event(ctx, actor, prov, *, type="STEP_DONE", payload=None) -> NewEvent:
@@ -1585,9 +1585,9 @@ def test_commit_step_rolls_back_all_writes_when_document_insert_fails(
         assert cur.fetchone()[0] == 0    # no ledger row
 ```
 
-2. **Run it, expect FAIL** — `python -m pytest tests/sp0/runtime/test_step.py -q`. Expected: `ModuleNotFoundError: No module named 'sp0.runtime.step'`.
+2. **Run it, expect FAIL** — `python -m pytest tests/featuregen/runtime/test_step.py -q`. Expected: `ModuleNotFoundError: No module named 'featuregen.runtime.step'`.
 
-3. **Write minimal implementation** — `src/sp0/runtime/step.py`:
+3. **Write minimal implementation** — `src/featuregen/runtime/step.py`:
 
 ```python
 from __future__ import annotations
@@ -1598,11 +1598,11 @@ from uuid import uuid4
 
 import psycopg
 
-from sp0.contracts import HandlerContext, HandlerResult, NewDocument, NewEvent
-from sp0.documents.store import append_document
-from sp0.event_store import append_event
-from sp0.runtime.ledger import record_processed
-from sp0.runtime.outbox import insert_outbox_message, outbox_messages_for_events
+from featuregen.contracts import HandlerContext, HandlerResult, NewDocument, NewEvent
+from featuregen.documents.store import append_document
+from featuregen.event_store import append_event
+from featuregen.runtime.ledger import record_processed
+from featuregen.runtime.outbox import insert_outbox_message, outbox_messages_for_events
 
 
 @dataclass(frozen=True, slots=True)
@@ -1734,12 +1734,12 @@ def commit_step(
     )
 ```
 
-4. **Run tests, expect PASS** — `python -m pytest tests/sp0/runtime/test_step.py -q`. Expected: 7 passed.
+4. **Run tests, expect PASS** — `python -m pytest tests/featuregen/runtime/test_step.py -q`. Expected: 7 passed.
 
 5. **Commit:**
 
 ```
-git add src/sp0/runtime/step.py tests/sp0/runtime/test_step.py
+git add src/featuregen/runtime/step.py tests/featuregen/runtime/test_step.py
 git commit -m "SP-0 Phase 04: atomic step boundary commit_step (events+doc+outbox+ledger, chained OCC)
 
 Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
@@ -1750,9 +1750,9 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 ## Task 8 — Handler registry + idempotent dispatcher + crash recovery
 
 **Files:**
-- Create: `src/sp0/runtime/handlers.py`
-- Create: `src/sp0/runtime/dispatch.py`
-- Test: `tests/sp0/runtime/test_dispatch.py`
+- Create: `src/featuregen/runtime/handlers.py`
+- Create: `src/featuregen/runtime/dispatch.py`
+- Test: `tests/featuregen/runtime/test_dispatch.py`
 
 **Interfaces:**
 - Consumes: `Handler`, `HandlerResult`, `HandlerContext`, `Disposition`, `ConcurrencyError` (contract); `load_stream` (Phase 01); `claim_one`, `complete`, `fail_retryable`, `fail_permanent`, `reclaim_stuck_queue`, `QueueClaim` (Task 6); `reclaim_stuck_outbox` (Task 5); `is_processed` (Task 3); `commit_step` (Task 7).
@@ -1765,27 +1765,27 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 
 ### TDD steps
 
-1. **Write the failing test** — `tests/sp0/runtime/test_dispatch.py`:
+1. **Write the failing test** — `tests/featuregen/runtime/test_dispatch.py`:
 
 ```python
 from __future__ import annotations
 
 import time
 
-from sp0.contracts import Disposition, HandlerContext, HandlerResult, NewEvent
-from sp0.runtime.dispatch import (
+from featuregen.contracts import Disposition, HandlerContext, HandlerResult, NewEvent
+from featuregen.runtime.dispatch import (
     HandlerRegistry,
     ProcessOutcome,
     process_one,
     recover_stuck,
 )
-from sp0.runtime.outbox import (
+from featuregen.runtime.outbox import (
     insert_outbox_message,
     make_queue_publisher,
     outbox_messages_for_events,
     relay_publish_batch,
 )
-from sp0.runtime.queue import enqueue
+from featuregen.runtime.queue import enqueue
 
 
 class _Handler:
@@ -1955,14 +1955,14 @@ def test_occ_conflict_reschedules_without_partial_writes(db, seed_run_event, act
 
 > **Note (handler connection in tests):** `process_one`'s default `handler_conn_factory` opens a dedicated connection via `psycopg.connect(conn.info.dsn)`. The test handlers do no I/O on `ctx.read_conn`, so if the Phase-01 `db` fixture's DSN is not directly re-connectable in your environment, pass `handler_conn_factory=lambda c: c` to `process_one` in these tests — it stays safe here precisely because the test handlers never touch `ctx.read_conn`. Production keeps the isolating default.
 
-2. **Run it, expect FAIL** — `python -m pytest tests/sp0/runtime/test_dispatch.py -q`. Expected: `ModuleNotFoundError: No module named 'sp0.runtime.dispatch'`.
+2. **Run it, expect FAIL** — `python -m pytest tests/featuregen/runtime/test_dispatch.py -q`. Expected: `ModuleNotFoundError: No module named 'featuregen.runtime.dispatch'`.
 
-3. **Write minimal implementation** — first `src/sp0/runtime/handlers.py`:
+3. **Write minimal implementation** — first `src/featuregen/runtime/handlers.py`:
 
 ```python
 from __future__ import annotations
 
-from sp0.contracts import Handler
+from featuregen.contracts import Handler
 
 
 class HandlerRegistry:
@@ -1984,7 +1984,7 @@ class HandlerRegistry:
             raise KeyError(f"no handler registered: {name!r}") from None
 ```
 
-Then `src/sp0/runtime/dispatch.py`:
+Then `src/featuregen/runtime/dispatch.py`:
 
 ```python
 from __future__ import annotations
@@ -1995,7 +1995,7 @@ from typing import Callable, Mapping
 
 import psycopg
 
-from sp0.contracts import (
+from featuregen.contracts import (
     ConcurrencyError,
     Disposition,
     Handler,
@@ -2003,11 +2003,11 @@ from sp0.contracts import (
     HandlerResult,
     NewDocument,
 )
-from sp0.event_store import load_stream
-from sp0.runtime.handlers import HandlerRegistry
-from sp0.runtime.ledger import is_processed
-from sp0.runtime.outbox import reclaim_stuck_outbox
-from sp0.runtime.queue import (
+from featuregen.event_store import load_stream
+from featuregen.runtime.handlers import HandlerRegistry
+from featuregen.runtime.ledger import is_processed
+from featuregen.runtime.outbox import reclaim_stuck_outbox
+from featuregen.runtime.queue import (
     QueueClaim,
     claim_one,
     complete,
@@ -2015,7 +2015,7 @@ from sp0.runtime.queue import (
     fail_retryable,
     reclaim_stuck_queue,
 )
-from sp0.runtime.step import commit_step
+from featuregen.runtime.step import commit_step
 
 
 class HandlerTimeout(Exception):
@@ -2195,12 +2195,12 @@ def recover_stuck(conn: psycopg.Connection) -> tuple[int, int]:
     return (reclaim_stuck_queue(conn), reclaim_stuck_outbox(conn))
 ```
 
-4. **Run tests, expect PASS** — `python -m pytest tests/sp0/runtime/test_dispatch.py -q`. Expected: 9 passed.
+4. **Run tests, expect PASS** — `python -m pytest tests/featuregen/runtime/test_dispatch.py -q`. Expected: 9 passed.
 
 5. **Commit:**
 
 ```
-git add src/sp0/runtime/handlers.py src/sp0/runtime/dispatch.py tests/sp0/runtime/test_dispatch.py
+git add src/featuregen/runtime/handlers.py src/featuregen/runtime/dispatch.py tests/featuregen/runtime/test_dispatch.py
 git commit -m "SP-0 Phase 04: handler registry + idempotent dispatcher + crash recovery
 
 Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"

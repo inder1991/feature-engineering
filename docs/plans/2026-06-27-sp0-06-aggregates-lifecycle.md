@@ -6,23 +6,23 @@
 
 ### Interfaces consumed from earlier phases (do not redefine)
 
-- **Shared contract module** `src/sp0/contracts/` (established by Phase 01) re-exports: `DbConn`, `IdentityEnvelope`, `ProvenanceEnvelope`, `NewEvent`, `EventEnvelope`, `ConcurrencyError`, `Command`, `CommandResult`, `Handler`, `HandlerResult`, `HandlerContext`, `Disposition`, `NewTimer`, `NewExternalCommand`, `NewActivation`, `SchemaRegistry`, `SchemaValidationError`. (`HandlerResult.activations: tuple[NewActivation, ...] = ()` and `NewActivation(feature_id, feature_version_id, use_case, base_feature_version_id, approval_type, expires_at=None, provenance=None)` are the contract's cross-aggregate-activation effect; Phase 06 declares them in the saga handler and applies them in `commit_step` — see Task 11.)
-- **Event store** (Phase 01), importable as `from sp0.eventstore import append_event, load_stream, event_registry`:
+- **Shared contract module** `src/featuregen/contracts/` (established by Phase 01) re-exports: `DbConn`, `IdentityEnvelope`, `ProvenanceEnvelope`, `NewEvent`, `EventEnvelope`, `ConcurrencyError`, `Command`, `CommandResult`, `Handler`, `HandlerResult`, `HandlerContext`, `Disposition`, `NewTimer`, `NewExternalCommand`, `NewActivation`, `SchemaRegistry`, `SchemaValidationError`. (`HandlerResult.activations: tuple[NewActivation, ...] = ()` and `NewActivation(feature_id, feature_version_id, use_case, base_feature_version_id, approval_type, expires_at=None, provenance=None)` are the contract's cross-aggregate-activation effect; Phase 06 declares them in the saga handler and applies them in `commit_step` — see Task 11.)
+- **Event store** (Phase 01), importable as `from featuregen.eventstore import append_event, load_stream, event_registry`:
   - `append_event(conn, new_event, *, expected_version, table_version) -> EventEnvelope` — validates payload against `event_registry`, raises `ConcurrencyError` on stale `expected_version`.
   - `load_stream(conn, aggregate, aggregate_id, *, upto_seq=None, expected=None) -> list[EventEnvelope]`.
-  - `event_registry` — the process-wide event `SchemaRegistry` instance that `append_event` validates against; exposes `register_schema(type_name, schema_version, json_schema, owner, *, status="active")` and `validate(type_name, schema_version, body)`. **Cross-phase note:** `event_registry` is a Phase-01 *implementation export*, not one of the shared Core-interface symbols (those define only the `SchemaRegistry` Protocol and `append_event`'s "validates against the event registry" prose). This phase depends on Phase 01 exposing this singleton from `sp0.eventstore`; the §"Production wiring" note below registers Phase-06 schemas into it so runtime appends validate outside pytest.
-- **Handler dispatch + registry** (Phase 04), importable as `from sp0.runtime.handlers import HandlerRegistry` and `from sp0.runtime.dispatch import process_one`:
+  - `event_registry` — the process-wide event `SchemaRegistry` instance that `append_event` validates against; exposes `register_schema(type_name, schema_version, json_schema, owner, *, status="active")` and `validate(type_name, schema_version, body)`. **Cross-phase note:** `event_registry` is a Phase-01 *implementation export*, not one of the shared Core-interface symbols (those define only the `SchemaRegistry` Protocol and `append_event`'s "validates against the event registry" prose). This phase depends on Phase 01 exposing this singleton from `featuregen.eventstore`; the §"Production wiring" note below registers Phase-06 schemas into it so runtime appends validate outside pytest.
+- **Handler dispatch + registry** (Phase 04), importable as `from featuregen.runtime.handlers import HandlerRegistry` and `from featuregen.runtime.dispatch import process_one`:
   - `HandlerRegistry.register(handler: Handler) -> None` / `.get(name) -> Handler` — keyed by `Handler.name`; re-registering a name is a `ValueError`.
   - `process_one(conn, registry, *, owner, document_loader=...)` — claims one `queue` row, looks up `registry.get(queue.handler)`, builds a **run-scoped** `HandlerContext` from `payload["run_id"]` + `payload["event_id"]` (loaded from the **run** stream), runs `handler.handle(ctx)`, and on `Disposition.OK` calls `commit_step` (which appends `result.new_events` to the run stream, writes the ledger, and emits outbox rows). The activation saga (Task 11) relies on exactly this: its queue payload carries `run_id`+`event_id` of the run-stream `ACTIVATION_REQUESTED` event, and its handler returns **no run-stream events** — it is PURE with respect to persistence and instead DECLARES the cross-aggregate effect as `HandlerResult.activations`, which `commit_step` applies on the step-transaction connection (Task 11 extends `commit_step` for this).
 - **Tables created by other phases (Phase 06 only references them):** `events` + `UNIQUE(aggregate,aggregate_id,stream_version)` (Phase 01); `run_workflow_state` (Phase 01 projection; read for the degraded-block, cleared by `resolve_degraded`); `queue` (Phase 04; the activation saga enqueues a `feature:{feature_id}`-partitioned `activate_version` row); `timers` (Phase 05; the saga schedules `experiment_expiry`, and forced `deprecate` schedules a `business_repair` grace timer).
-- **Test fixtures (Phase 01 `tests/conftest.py`):** `db` — a function-scoped psycopg connection in an OPEN transaction, rolled back after each test, with every `src/sp0/db/migrations/*.sql` applied in lexical order.
+- **Test fixtures (Phase 01 `tests/conftest.py`):** `db` — a function-scoped psycopg connection in an OPEN transaction, rolled back after each test, with every `src/featuregen/db/migrations/*.sql` applied in lexical order.
 
 ---
 
 ### File structure (this phase)
 
 ```
-src/sp0/
+src/featuregen/
   db/migrations/
     0060_aggregates_lifecycle.sql      # Task 1: feature_versions, feature_active_versions,
                                        #         consumers, concept_claims, command_idempotency (verbatim DDL)
@@ -46,7 +46,7 @@ src/sp0/
     registry.py                        # Task 4: register_command/get_command/clear_registry
     authz_seam.py                      # Task 4: CommandAuthorizer, AuthzDecision, register_command_authorizer
     api.py                             # Task 4: execute_command (idempotency + degraded + authz)
-tests/sp0/
+tests/featuregen/
   conftest.py                          # Task 4: session-autouse register Phase-06 event types
   _helpers.py                          # Task 4: make_actor(), make_cmd()
   commands/
@@ -70,8 +70,8 @@ tests/sp0/
 ## Task 1 — Owned-table migration
 
 **Files:**
-- Create: `src/sp0/db/migrations/0060_aggregates_lifecycle.sql`
-- Test: `tests/sp0/aggregates/test_migration_0060.py`
+- Create: `src/featuregen/db/migrations/0060_aggregates_lifecycle.sql`
+- Test: `tests/featuregen/aggregates/test_migration_0060.py`
 
 **Interfaces:**
 - Consumes: the `db` fixture (Phase 01) which applies all migrations in lexical order.
@@ -82,7 +82,7 @@ tests/sp0/
 1. **Write the failing test.**
 
 ```python
-# tests/sp0/aggregates/test_migration_0060.py
+# tests/featuregen/aggregates/test_migration_0060.py
 import pytest
 
 EXPECTED_TABLES = [
@@ -138,13 +138,13 @@ def test_feature_versions_reject_delete(db):
 ```
 
 2. **Run it, expect FAIL.**
-   `python -m pytest tests/sp0/aggregates/test_migration_0060.py -q`
+   `python -m pytest tests/featuregen/aggregates/test_migration_0060.py -q`
    Expected: errors like `psycopg.errors.UndefinedTable: relation "feature_versions" does not exist` (migration not yet present).
 
 3. **Write minimal implementation.** Copy the shared-contract DDL VERBATIM into the migration:
 
 ```sql
--- src/sp0/db/migrations/0060_aggregates_lifecycle.sql
+-- src/featuregen/db/migrations/0060_aggregates_lifecycle.sql
 -- Phase 06 owns these tables (declared in the shared contract; columns/constraints verbatim).
 
 CREATE TABLE feature_versions (
@@ -222,7 +222,7 @@ CREATE TABLE command_idempotency (
 ```
 
 4. **Run tests, expect PASS.**
-   `python -m pytest tests/sp0/aggregates/test_migration_0060.py -q`
+   `python -m pytest tests/featuregen/aggregates/test_migration_0060.py -q`
 
 5. **Commit.**
    `git add -A && git commit -m "sp0-06: owned-table migration (feature_versions, active map, consumers, concept_claims, command_idempotency)" -m "Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"`
@@ -232,8 +232,8 @@ CREATE TABLE command_idempotency (
 ## Task 2 — Identifier minting & concept-key normalization
 
 **Files:**
-- Create: `src/sp0/aggregates/__init__.py` (empty), `src/sp0/aggregates/ids.py`
-- Test: `tests/sp0/aggregates/test_ids.py`
+- Create: `src/featuregen/aggregates/__init__.py` (empty), `src/featuregen/aggregates/ids.py`
+- Test: `tests/featuregen/aggregates/test_ids.py`
 
 **Interfaces:**
 - Produces: `mint_id(prefix: str) -> str`; `new_request_id()`, `new_feature_id()`, `new_run_id()`, `new_feature_version_id()`, `new_consumer_id()`, `new_command_id()` → prefixed ULID-style ids (`req_`, `feat_`, `run_`, `fv_`, `con_`, `cmd_`); `normalize_concept_key(concept: str) -> str`.
@@ -243,8 +243,8 @@ CREATE TABLE command_idempotency (
 1. **Write the failing test.**
 
 ```python
-# tests/sp0/aggregates/test_ids.py
-from sp0.aggregates.ids import (
+# tests/featuregen/aggregates/test_ids.py
+from featuregen.aggregates.ids import (
     mint_id, new_request_id, new_feature_id, new_run_id,
     new_feature_version_id, new_consumer_id, new_command_id,
     normalize_concept_key,
@@ -277,13 +277,13 @@ def test_normalize_concept_key():
 ```
 
 2. **Run it, expect FAIL.**
-   `python -m pytest tests/sp0/aggregates/test_ids.py -q`
-   Expected: `ModuleNotFoundError: No module named 'sp0.aggregates.ids'`.
+   `python -m pytest tests/featuregen/aggregates/test_ids.py -q`
+   Expected: `ModuleNotFoundError: No module named 'featuregen.aggregates.ids'`.
 
 3. **Write minimal implementation.**
 
 ```python
-# src/sp0/aggregates/ids.py
+# src/featuregen/aggregates/ids.py
 from __future__ import annotations
 
 import os
@@ -343,7 +343,7 @@ def normalize_concept_key(concept: str) -> str:
 ```
 
 4. **Run tests, expect PASS.**
-   `python -m pytest tests/sp0/aggregates/test_ids.py -q`
+   `python -m pytest tests/featuregen/aggregates/test_ids.py -q`
 
 5. **Commit.**
    `git add -A && git commit -m "sp0-06: ULID-style id minting + concept-key normalization" -m "Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"`
@@ -353,8 +353,8 @@ def normalize_concept_key(concept: str) -> str:
 ## Task 3 — Phase-06 event-type registration
 
 **Files:**
-- Create: `src/sp0/aggregates/events.py`
-- Test: `tests/sp0/aggregates/test_events.py`
+- Create: `src/featuregen/aggregates/events.py`
+- Test: `tests/featuregen/aggregates/test_events.py`
 
 **Interfaces:**
 - Consumes: `SchemaRegistry.register_schema(type_name, schema_version, json_schema, owner, *, status)` (Phase 01).
@@ -365,11 +365,11 @@ def normalize_concept_key(concept: str) -> str:
 1. **Write the failing test.** Uses a recording fake registry (no DB, no Phase-01 instance) plus a real JSON-schema validation check.
 
 ```python
-# tests/sp0/aggregates/test_events.py
+# tests/featuregen/aggregates/test_events.py
 import jsonschema
 import pytest
 
-from sp0.aggregates.events import EVENT_SCHEMAS, register_phase06_event_types
+from featuregen.aggregates.events import EVENT_SCHEMAS, register_phase06_event_types
 
 
 class _RecordingRegistry:
@@ -408,16 +408,16 @@ def test_sample_payload_validates_and_missing_required_fails():
 ```
 
 2. **Run it, expect FAIL.**
-   `python -m pytest tests/sp0/aggregates/test_events.py -q`
-   Expected: `ModuleNotFoundError: No module named 'sp0.aggregates.events'`.
+   `python -m pytest tests/featuregen/aggregates/test_events.py -q`
+   Expected: `ModuleNotFoundError: No module named 'featuregen.aggregates.events'`.
 
 3. **Write minimal implementation.**
 
 ```python
-# src/sp0/aggregates/events.py
+# src/featuregen/aggregates/events.py
 from __future__ import annotations
 
-from sp0.contracts import SchemaRegistry
+from featuregen.contracts import SchemaRegistry
 
 OWNER = "sp0-aggregates"
 
@@ -477,15 +477,15 @@ def register_phase06_event_types(registry: SchemaRegistry) -> None:
 ```
 
 4. **Run tests, expect PASS.**
-   `python -m pytest tests/sp0/aggregates/test_events.py -q`
+   `python -m pytest tests/featuregen/aggregates/test_events.py -q`
 
 5. **Write the bootstrap failing test.** The §"Production wiring" path must register Phase-06 schemas into the *real* process-wide `event_registry`, idempotently, so that `append_event` validation succeeds at runtime (outside pytest). Without this, every Phase-06 append fails schema validation in production.
 
 ```python
-# tests/sp0/aggregates/test_bootstrap.py
-from sp0.eventstore import event_registry
-from sp0.aggregates.events import EVENT_SCHEMAS
-from sp0.aggregates.bootstrap import register_phase06_event_schemas
+# tests/featuregen/aggregates/test_bootstrap.py
+from featuregen.eventstore import event_registry
+from featuregen.aggregates.events import EVENT_SCHEMAS
+from featuregen.aggregates.bootstrap import register_phase06_event_schemas
 
 
 def test_bootstrap_registers_every_type_into_real_event_registry():
@@ -507,11 +507,11 @@ def test_bootstrap_is_idempotent():
 6. **Write the bootstrap module.** `register_phase06_event_schemas()` is idempotent (guarded), registers into the shared singleton, and is the call the production process makes at startup.
 
 ```python
-# src/sp0/aggregates/bootstrap.py
+# src/featuregen/aggregates/bootstrap.py
 from __future__ import annotations
 
-from sp0.eventstore import event_registry
-from sp0.aggregates.events import register_phase06_event_types
+from featuregen.eventstore import event_registry
+from featuregen.aggregates.events import register_phase06_event_types
 
 _SCHEMAS_REGISTERED = False
 
@@ -528,7 +528,7 @@ def register_phase06_event_schemas() -> None:
 ```
 
 7. **Run tests, expect PASS.**
-   `python -m pytest tests/sp0/aggregates/test_bootstrap.py -q`
+   `python -m pytest tests/featuregen/aggregates/test_bootstrap.py -q`
 
 8. **Commit.**
    `git add -A && git commit -m "sp0-06: Phase-06 event-type schemas + register_phase06_event_types + idempotent bootstrap" -m "Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"`
@@ -538,9 +538,9 @@ def register_phase06_event_schemas() -> None:
 ## Task 4 — `execute_command` (command registry, authz seam, idempotency, degraded-block)
 
 **Files:**
-- Create: `src/sp0/commands/__init__.py` (empty), `src/sp0/commands/registry.py`, `src/sp0/commands/authz_seam.py`, `src/sp0/commands/api.py`
-- Create: `tests/sp0/conftest.py`, `tests/sp0/_helpers.py`
-- Test: `tests/sp0/commands/test_execute_command.py`
+- Create: `src/featuregen/commands/__init__.py` (empty), `src/featuregen/commands/registry.py`, `src/featuregen/commands/authz_seam.py`, `src/featuregen/commands/api.py`
+- Create: `tests/featuregen/conftest.py`, `tests/featuregen/_helpers.py`
+- Test: `tests/featuregen/commands/test_execute_command.py`
 
 **Interfaces:**
 - Consumes: `Command`, `CommandResult`, `DbConn` (contracts); `command_idempotency`, `run_workflow_state` tables; `event_registry` (Phase 01).
@@ -554,10 +554,10 @@ def register_phase06_event_schemas() -> None:
 1. **Write the failing test.** (First create the shared helpers + conftest so all later tasks reuse them.)
 
 ```python
-# tests/sp0/conftest.py
+# tests/featuregen/conftest.py
 import pytest
 
-from sp0.aggregates.bootstrap import register_phase06_event_schemas
+from featuregen.aggregates.bootstrap import register_phase06_event_schemas
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -568,9 +568,9 @@ def _register_phase06_event_types():
 ```
 
 ```python
-# tests/sp0/_helpers.py
-from sp0.contracts import Command, IdentityEnvelope
-from sp0.aggregates.ids import mint_id
+# tests/featuregen/_helpers.py
+from featuregen.contracts import Command, IdentityEnvelope
+from featuregen.aggregates.ids import mint_id
 
 
 def make_actor(subject="user:raj", actor_kind="human", roles=("data_scientist",)):
@@ -590,16 +590,16 @@ def make_cmd(action, aggregate, aggregate_id, args, *, actor=None, idem=None,
 ```
 
 ```python
-# tests/sp0/commands/test_execute_command.py
+# tests/featuregen/commands/test_execute_command.py
 import pytest
 
-from sp0.contracts import CommandResult
-from sp0.commands.api import execute_command
-from sp0.commands.registry import register_command, clear_registry
-from sp0.commands.authz_seam import (
+from featuregen.contracts import CommandResult
+from featuregen.commands.api import execute_command
+from featuregen.commands.registry import register_command, clear_registry
+from featuregen.commands.authz_seam import (
     AuthzDecision, register_command_authorizer, current_authorizer,
 )
-from tests.sp0._helpers import make_cmd
+from tests.featuregen._helpers import make_cmd
 
 
 @pytest.fixture(autouse=True)
@@ -703,18 +703,18 @@ def test_replay_does_not_rerun_handler_when_prior_committed(db):
 ```
 
 2. **Run it, expect FAIL.**
-   `python -m pytest tests/sp0/commands/test_execute_command.py -q`
-   Expected: `ModuleNotFoundError: No module named 'sp0.commands.api'`.
+   `python -m pytest tests/featuregen/commands/test_execute_command.py -q`
+   Expected: `ModuleNotFoundError: No module named 'featuregen.commands.api'`.
 
 3. **Write minimal implementation.**
 
 ```python
-# src/sp0/commands/registry.py
+# src/featuregen/commands/registry.py
 from __future__ import annotations
 
 from typing import Callable, Dict
 
-from sp0.contracts import Command, CommandResult, DbConn
+from featuregen.contracts import Command, CommandResult, DbConn
 
 CommandHandler = Callable[[DbConn, Command], CommandResult]
 _REGISTRY: Dict[str, CommandHandler] = {}
@@ -738,13 +738,13 @@ def clear_registry() -> None:
 ```
 
 ```python
-# src/sp0/commands/authz_seam.py
+# src/featuregen/commands/authz_seam.py
 from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Optional, Protocol, runtime_checkable
 
-from sp0.contracts import Command, DbConn
+from featuregen.contracts import Command, DbConn
 
 
 @dataclass(frozen=True, slots=True)
@@ -782,16 +782,16 @@ def current_authorizer() -> CommandAuthorizer:
 ```
 
 ```python
-# src/sp0/commands/api.py
+# src/featuregen/commands/api.py
 from __future__ import annotations
 
 from typing import Mapping, Optional
 
 from psycopg.types.json import Jsonb
 
-from sp0.contracts import Command, CommandResult, DbConn
-from sp0.commands.registry import get_command
-from sp0.commands.authz_seam import current_authorizer
+from featuregen.contracts import Command, CommandResult, DbConn
+from featuregen.commands.registry import get_command
+from featuregen.commands.authz_seam import current_authorizer
 
 _PENDING = {"_pending": True}
 
@@ -910,7 +910,7 @@ def execute_command(conn: DbConn, cmd: Command) -> CommandResult:
 > **Concurrency note:** the claim-first pattern is the airtight fix for the reviewer's concurrent double-submit concern. Sequential double-submit replays the finalized row; concurrent double-submit serializes on the unique `idempotency_key` so only one tx runs the handler and the loser replays the winner's committed result. Denials/degraded blocks release the claim (not cached), matching the prior "only accepted is recorded" behaviour.
 
 4. **Run tests, expect PASS.**
-   `python -m pytest tests/sp0/commands/test_execute_command.py -q`
+   `python -m pytest tests/featuregen/commands/test_execute_command.py -q`
 
 5. **Commit.**
    `git add -A && git commit -m "sp0-06: execute_command (registry, authz seam, idempotency, degraded-block)" -m "Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"`
@@ -920,8 +920,8 @@ def execute_command(conn: DbConn, cmd: Command) -> CommandResult:
 ## Task 5 — Append helper, concept claim & `create_request`
 
 **Files:**
-- Create: `src/sp0/aggregates/_append.py`, `src/sp0/aggregates/concept_claims.py`, `src/sp0/aggregates/request_aggregate.py`
-- Test: `tests/sp0/aggregates/test_concept_claims.py`, `tests/sp0/aggregates/test_request_aggregate.py`
+- Create: `src/featuregen/aggregates/_append.py`, `src/featuregen/aggregates/concept_claims.py`, `src/featuregen/aggregates/request_aggregate.py`
+- Test: `tests/featuregen/aggregates/test_concept_claims.py`, `tests/featuregen/aggregates/test_request_aggregate.py`
 
 **Interfaces:**
 - Consumes: `append_event`, `load_stream` (Phase 01); `NewEvent`, `EventEnvelope`, `IdentityEnvelope`, `ProvenanceEnvelope`, `CommandResult` (contracts); `run_workflow_state` (read for `table_version_for`).
@@ -937,8 +937,8 @@ def execute_command(conn: DbConn, cmd: Command) -> CommandResult:
 1. **Write the failing test.**
 
 ```python
-# tests/sp0/aggregates/test_concept_claims.py
-from sp0.aggregates.concept_claims import claim_concept
+# tests/featuregen/aggregates/test_concept_claims.py
+from featuregen.aggregates.concept_claims import claim_concept
 
 
 def test_first_committed_wins(db):
@@ -952,10 +952,10 @@ def test_first_committed_wins(db):
 ```
 
 ```python
-# tests/sp0/aggregates/test_request_aggregate.py
-from sp0.eventstore import load_stream
-from sp0.aggregates.request_aggregate import create_request_command
-from tests.sp0._helpers import make_cmd
+# tests/featuregen/aggregates/test_request_aggregate.py
+from featuregen.eventstore import load_stream
+from featuregen.aggregates.request_aggregate import create_request_command
+from tests.featuregen._helpers import make_cmd
 
 
 def test_create_request_mints_id_and_claims_concept(db):
@@ -985,23 +985,23 @@ def test_second_request_on_same_concept_emits_duplicate_of(db):
 ```
 
 2. **Run it, expect FAIL.**
-   `python -m pytest tests/sp0/aggregates/test_concept_claims.py tests/sp0/aggregates/test_request_aggregate.py -q`
-   Expected: `ModuleNotFoundError: No module named 'sp0.aggregates._append'`.
+   `python -m pytest tests/featuregen/aggregates/test_concept_claims.py tests/featuregen/aggregates/test_request_aggregate.py -q`
+   Expected: `ModuleNotFoundError: No module named 'featuregen.aggregates._append'`.
 
 3. **Write minimal implementation.**
 
 ```python
-# src/sp0/aggregates/_append.py
+# src/featuregen/aggregates/_append.py
 from __future__ import annotations
 
 from dataclasses import asdict
 from datetime import datetime, timezone
 from typing import Any, Mapping, Optional
 
-from sp0.contracts import (
+from featuregen.contracts import (
     DbConn, EventEnvelope, IdentityEnvelope, NewEvent, ProvenanceEnvelope,
 )
-from sp0.eventstore import append_event, load_stream
+from featuregen.eventstore import append_event, load_stream
 
 PRODUCING_COMPONENT = "sp0-aggregates@0.1.0"
 
@@ -1066,12 +1066,12 @@ def append(
 ```
 
 ```python
-# src/sp0/aggregates/concept_claims.py
+# src/featuregen/aggregates/concept_claims.py
 from __future__ import annotations
 
 from typing import Optional
 
-from sp0.contracts import DbConn
+from featuregen.contracts import DbConn
 
 
 def claim_concept(conn: DbConn, concept_key: str, request_id: str) -> Optional[str]:
@@ -1090,14 +1090,14 @@ def claim_concept(conn: DbConn, concept_key: str, request_id: str) -> Optional[s
 ```
 
 ```python
-# src/sp0/aggregates/request_aggregate.py
+# src/featuregen/aggregates/request_aggregate.py
 from __future__ import annotations
 
-from sp0.contracts import Command, CommandResult, DbConn
-from sp0.aggregates._append import append
-from sp0.aggregates.concept_claims import claim_concept
-from sp0.aggregates.ids import new_request_id
-from sp0.aggregates.ids import normalize_concept_key
+from featuregen.contracts import Command, CommandResult, DbConn
+from featuregen.aggregates._append import append
+from featuregen.aggregates.concept_claims import claim_concept
+from featuregen.aggregates.ids import new_request_id
+from featuregen.aggregates.ids import normalize_concept_key
 
 
 def create_request_command(conn: DbConn, cmd: Command) -> CommandResult:
@@ -1124,7 +1124,7 @@ def create_request_command(conn: DbConn, cmd: Command) -> CommandResult:
 ```
 
 4. **Run tests, expect PASS.**
-   `python -m pytest tests/sp0/aggregates/test_concept_claims.py tests/sp0/aggregates/test_request_aggregate.py -q`
+   `python -m pytest tests/featuregen/aggregates/test_concept_claims.py tests/featuregen/aggregates/test_request_aggregate.py -q`
 
 5. **Commit.**
    `git add -A && git commit -m "sp0-06: append helper, concept-claim reservation, create_request (+DUPLICATE_OF)" -m "Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"`
@@ -1134,8 +1134,8 @@ def create_request_command(conn: DbConn, cmd: Command) -> CommandResult:
 ## Task 6 — `create_run` (request→run binding) & `duplicate_of`
 
 **Files:**
-- Modify: `src/sp0/aggregates/request_aggregate.py`
-- Test: append to `tests/sp0/aggregates/test_request_aggregate.py`
+- Modify: `src/featuregen/aggregates/request_aggregate.py`
+- Test: append to `tests/featuregen/aggregates/test_request_aggregate.py`
 
 **Interfaces:**
 - Consumes: `append`, `new_run_id` (this phase).
@@ -1146,8 +1146,8 @@ def create_request_command(conn: DbConn, cmd: Command) -> CommandResult:
 1. **Write the failing test.**
 
 ```python
-# tests/sp0/aggregates/test_request_aggregate.py  (append)
-from sp0.aggregates.request_aggregate import create_run_command, duplicate_of_command
+# tests/featuregen/aggregates/test_request_aggregate.py  (append)
+from featuregen.aggregates.request_aggregate import create_run_command, duplicate_of_command
 
 
 def _open_request(db):
@@ -1177,14 +1177,14 @@ def test_duplicate_of_links_existing_feature(db):
 ```
 
 2. **Run it, expect FAIL.**
-   `python -m pytest tests/sp0/aggregates/test_request_aggregate.py -q`
+   `python -m pytest tests/featuregen/aggregates/test_request_aggregate.py -q`
    Expected: `ImportError: cannot import name 'create_run_command'`.
 
 3. **Write minimal implementation.**
 
 ```python
-# src/sp0/aggregates/request_aggregate.py  (append)
-from sp0.aggregates.ids import new_run_id
+# src/featuregen/aggregates/request_aggregate.py  (append)
+from featuregen.aggregates.ids import new_run_id
 
 
 def create_run_command(conn: DbConn, cmd: Command) -> CommandResult:
@@ -1219,7 +1219,7 @@ def duplicate_of_command(conn: DbConn, cmd: Command) -> CommandResult:
 ```
 
 4. **Run tests, expect PASS.**
-   `python -m pytest tests/sp0/aggregates/test_request_aggregate.py -q`
+   `python -m pytest tests/featuregen/aggregates/test_request_aggregate.py -q`
 
 5. **Commit.**
    `git add -A && git commit -m "sp0-06: create_run (request->run binding) + duplicate_of" -m "Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"`
@@ -1229,8 +1229,8 @@ def duplicate_of_command(conn: DbConn, cmd: Command) -> CommandResult:
 ## Task 7 — `select_candidate` (mint/bind feature_id, close siblings, 1:n)
 
 **Files:**
-- Modify: `src/sp0/aggregates/request_aggregate.py`
-- Test: append to `tests/sp0/aggregates/test_request_aggregate.py`
+- Modify: `src/featuregen/aggregates/request_aggregate.py`
+- Test: append to `tests/featuregen/aggregates/test_request_aggregate.py`
 
 **Interfaces:**
 - Consumes: `load_stream` (Phase 01); `new_feature_id`, `append`, `provenance_for` (this phase); `run_lifecycle.run_is_terminal` (Task 8 — implemented in this task’s minimal code as a local read until Task 8 exposes it; see note).
@@ -1243,8 +1243,8 @@ def duplicate_of_command(conn: DbConn, cmd: Command) -> CommandResult:
 1. **Write the failing test.**
 
 ```python
-# tests/sp0/aggregates/test_request_aggregate.py  (append)
-from sp0.aggregates.request_aggregate import select_candidate_command
+# tests/featuregen/aggregates/test_request_aggregate.py  (append)
+from featuregen.aggregates.request_aggregate import select_candidate_command
 
 
 def test_select_candidate_mints_feature_and_closes_siblings(db):
@@ -1298,16 +1298,16 @@ def test_one_request_yields_multiple_features(db):
 ```
 
 2. **Run it, expect FAIL.**
-   `python -m pytest tests/sp0/aggregates/test_request_aggregate.py -q`
+   `python -m pytest tests/featuregen/aggregates/test_request_aggregate.py -q`
    Expected: `ImportError: cannot import name 'select_candidate_command'`.
 
 3. **Write minimal implementation.**
 
 ```python
-# src/sp0/aggregates/request_aggregate.py  (append)
-from sp0.aggregates.ids import new_feature_id
-from sp0.aggregates._append import provenance_for
-from sp0.eventstore import load_stream
+# src/featuregen/aggregates/request_aggregate.py  (append)
+from featuregen.aggregates.ids import new_feature_id
+from featuregen.aggregates._append import provenance_for
+from featuregen.eventstore import load_stream
 
 _TERMINAL_RUN_TYPES = ("RUN_REJECTED", "RUN_CANCELLED", "RUN_WITHDRAWN")
 
@@ -1365,7 +1365,7 @@ def select_candidate_command(conn: DbConn, cmd: Command) -> CommandResult:
 ```
 
 4. **Run tests, expect PASS.**
-   `python -m pytest tests/sp0/aggregates/test_request_aggregate.py -q`
+   `python -m pytest tests/featuregen/aggregates/test_request_aggregate.py -q`
 
 5. **Commit.**
    `git add -A && git commit -m "sp0-06: select_candidate (mint/bind feature_id, close siblings, 1:n)" -m "Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"`
@@ -1375,9 +1375,9 @@ def select_candidate_command(conn: DbConn, cmd: Command) -> CommandResult:
 ## Task 8 — Run lifecycle: reject/cancel/withdraw, park/unpark, `reopen_as_new_run`
 
 **Files:**
-- Create: `src/sp0/aggregates/run_lifecycle.py`
-- Modify: `src/sp0/aggregates/request_aggregate.py` (replace local terminal helper with the canonical one)
-- Test: `tests/sp0/aggregates/test_run_lifecycle.py`
+- Create: `src/featuregen/aggregates/run_lifecycle.py`
+- Modify: `src/featuregen/aggregates/request_aggregate.py` (replace local terminal helper with the canonical one)
+- Test: `tests/featuregen/aggregates/test_run_lifecycle.py`
 
 **Interfaces:**
 - Consumes: `load_stream` (Phase 01); `append`, `new_run_id` (this phase).
@@ -1388,14 +1388,14 @@ def select_candidate_command(conn: DbConn, cmd: Command) -> CommandResult:
 1. **Write the failing test.**
 
 ```python
-# tests/sp0/aggregates/test_run_lifecycle.py
-from sp0.eventstore import load_stream
-from sp0.aggregates.request_aggregate import create_request_command, create_run_command
-from sp0.aggregates.run_lifecycle import (
+# tests/featuregen/aggregates/test_run_lifecycle.py
+from featuregen.eventstore import load_stream
+from featuregen.aggregates.request_aggregate import create_request_command, create_run_command
+from featuregen.aggregates.run_lifecycle import (
     reject_command, cancel_command, withdraw_command,
     park_command, unpark_command, reopen_as_new_run_command, run_is_terminal,
 )
-from tests.sp0._helpers import make_cmd
+from tests.featuregen._helpers import make_cmd
 
 
 def _new_run(db):
@@ -1448,7 +1448,7 @@ def test_reopen_rejected_when_source_not_rejected(db):
 
 
 def test_resolve_degraded_clears_flag(db):
-    from sp0.aggregates.run_lifecycle import resolve_degraded_command
+    from featuregen.aggregates.run_lifecycle import resolve_degraded_command
     db.execute(
         "INSERT INTO run_workflow_state (run_id, request_id, current_state, table_version, "
         "degraded, degraded_reason) VALUES ('run_d', 'req_d', 'DRAFT', 1, true, 'boom')"
@@ -1462,19 +1462,19 @@ def test_resolve_degraded_clears_flag(db):
 ```
 
 2. **Run it, expect FAIL.**
-   `python -m pytest tests/sp0/aggregates/test_run_lifecycle.py -q`
-   Expected: `ModuleNotFoundError: No module named 'sp0.aggregates.run_lifecycle'`.
+   `python -m pytest tests/featuregen/aggregates/test_run_lifecycle.py -q`
+   Expected: `ModuleNotFoundError: No module named 'featuregen.aggregates.run_lifecycle'`.
 
 3. **Write minimal implementation.**
 
 ```python
-# src/sp0/aggregates/run_lifecycle.py
+# src/featuregen/aggregates/run_lifecycle.py
 from __future__ import annotations
 
-from sp0.contracts import Command, CommandResult, DbConn
-from sp0.eventstore import load_stream
-from sp0.aggregates._append import append
-from sp0.aggregates.ids import new_run_id
+from featuregen.contracts import Command, CommandResult, DbConn
+from featuregen.eventstore import load_stream
+from featuregen.aggregates._append import append
+from featuregen.aggregates.ids import new_run_id
 
 _TERMINAL_RUN_TYPES = ("RUN_REJECTED", "RUN_CANCELLED", "RUN_WITHDRAWN")
 
@@ -1566,15 +1566,15 @@ def resolve_degraded_command(conn: DbConn, cmd: Command) -> CommandResult:
 Then replace the local terminal helper in `request_aggregate.py` with the canonical one:
 
 ```python
-# src/sp0/aggregates/request_aggregate.py  (modify: delete _run_terminal_local + _TERMINAL_RUN_TYPES,
+# src/featuregen/aggregates/request_aggregate.py  (modify: delete _run_terminal_local + _TERMINAL_RUN_TYPES,
 #                                           and at top of file add)
-from sp0.aggregates.run_lifecycle import run_is_terminal
+from featuregen.aggregates.run_lifecycle import run_is_terminal
 ```
 
 and in `select_candidate_command` replace `_run_terminal_local(conn, run_id)` with `run_is_terminal(conn, run_id)`.
 
 4. **Run tests, expect PASS.**
-   `python -m pytest tests/sp0/aggregates/test_run_lifecycle.py tests/sp0/aggregates/test_request_aggregate.py -q`
+   `python -m pytest tests/featuregen/aggregates/test_run_lifecycle.py tests/featuregen/aggregates/test_request_aggregate.py -q`
 
 5. **Commit.**
    `git add -A && git commit -m "sp0-06: run lifecycle (reject/cancel/withdraw/park/unpark/reopen_as_new_run)" -m "Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"`
@@ -1584,8 +1584,8 @@ and in `select_candidate_command` replace `_run_terminal_local(conn, run_id)` wi
 ## Task 9 — Inbound run signals: `fact_confirmed_resume` & `SOURCE_CHANGED_REVALIDATE`
 
 **Files:**
-- Modify: `src/sp0/aggregates/run_lifecycle.py`
-- Test: append to `tests/sp0/aggregates/test_run_lifecycle.py`
+- Modify: `src/featuregen/aggregates/run_lifecycle.py`
+- Test: append to `tests/featuregen/aggregates/test_run_lifecycle.py`
 
 **Interfaces:**
 - Consumes: the `events` table (read parked-on-fact runs by `payload->>'waiting_on_fact'`); `append`, `run_is_terminal` (this phase).
@@ -1596,8 +1596,8 @@ and in `select_candidate_command` replace `_run_terminal_local(conn, run_id)` wi
 1. **Write the failing test.**
 
 ```python
-# tests/sp0/aggregates/test_run_lifecycle.py  (append)
-from sp0.aggregates.run_lifecycle import (
+# tests/featuregen/aggregates/test_run_lifecycle.py  (append)
+from featuregen.aggregates.run_lifecycle import (
     fact_confirmed_resume_command, source_changed_revalidate_command,
 )
 
@@ -1635,13 +1635,13 @@ def test_source_changed_revalidate_rejected_when_terminal(db):
 ```
 
 2. **Run it, expect FAIL.**
-   `python -m pytest tests/sp0/aggregates/test_run_lifecycle.py -q`
+   `python -m pytest tests/featuregen/aggregates/test_run_lifecycle.py -q`
    Expected: `ImportError: cannot import name 'fact_confirmed_resume_command'`.
 
 3. **Write minimal implementation.**
 
 ```python
-# src/sp0/aggregates/run_lifecycle.py  (append)
+# src/featuregen/aggregates/run_lifecycle.py  (append)
 def _runs_parked_on_fact(conn: DbConn, fact_key: str) -> list[str]:
     rows = conn.execute(
         "SELECT DISTINCT run_id FROM events "
@@ -1685,7 +1685,7 @@ def source_changed_revalidate_command(conn: DbConn, cmd: Command) -> CommandResu
 ```
 
 4. **Run tests, expect PASS.**
-   `python -m pytest tests/sp0/aggregates/test_run_lifecycle.py -q`
+   `python -m pytest tests/featuregen/aggregates/test_run_lifecycle.py -q`
 
 5. **Commit.**
    `git add -A && git commit -m "sp0-06: fact_confirmed_resume (wake parked runs) + SOURCE_CHANGED_REVALIDATE" -m "Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"`
@@ -1695,8 +1695,8 @@ def source_changed_revalidate_command(conn: DbConn, cmd: Command) -> CommandResu
 ## Task 10 — `mint_feature_version` (frozen version in the run transaction)
 
 **Files:**
-- Create: `src/sp0/aggregates/feature_versions.py`
-- Test: `tests/sp0/aggregates/test_feature_versions.py`
+- Create: `src/featuregen/aggregates/feature_versions.py`
+- Test: `tests/featuregen/aggregates/test_feature_versions.py`
 
 **Interfaces:**
 - Consumes: `feature_versions` table; `append`, `new_feature_version_id` (this phase); `IdentityEnvelope`, `ProvenanceEnvelope` (contracts).
@@ -1707,11 +1707,11 @@ def source_changed_revalidate_command(conn: DbConn, cmd: Command) -> CommandResu
 1. **Write the failing test.**
 
 ```python
-# tests/sp0/aggregates/test_feature_versions.py
-from sp0.eventstore import load_stream
-from sp0.aggregates._append import provenance_for
-from sp0.aggregates.feature_versions import mint_feature_version
-from tests.sp0._helpers import make_actor
+# tests/featuregen/aggregates/test_feature_versions.py
+from featuregen.eventstore import load_stream
+from featuregen.aggregates._append import provenance_for
+from featuregen.aggregates.feature_versions import mint_feature_version
+from tests.featuregen._helpers import make_actor
 
 
 def test_mint_freezes_version_and_emits_event(db):
@@ -1751,13 +1751,13 @@ def test_base_version_fk_chain(db):
 ```
 
 2. **Run it, expect FAIL.**
-   `python -m pytest tests/sp0/aggregates/test_feature_versions.py -q`
-   Expected: `ModuleNotFoundError: No module named 'sp0.aggregates.feature_versions'`.
+   `python -m pytest tests/featuregen/aggregates/test_feature_versions.py -q`
+   Expected: `ModuleNotFoundError: No module named 'featuregen.aggregates.feature_versions'`.
 
 3. **Write minimal implementation.**
 
 ```python
-# src/sp0/aggregates/feature_versions.py
+# src/featuregen/aggregates/feature_versions.py
 from __future__ import annotations
 
 from datetime import datetime
@@ -1765,9 +1765,9 @@ from typing import Any, Mapping, Optional
 
 from psycopg.types.json import Jsonb
 
-from sp0.contracts import DbConn, IdentityEnvelope, ProvenanceEnvelope
-from sp0.aggregates._append import append
-from sp0.aggregates.ids import new_feature_version_id
+from featuregen.contracts import DbConn, IdentityEnvelope, ProvenanceEnvelope
+from featuregen.aggregates._append import append
+from featuregen.aggregates.ids import new_feature_version_id
 
 
 def mint_feature_version(
@@ -1804,7 +1804,7 @@ def mint_feature_version(
 ```
 
 4. **Run tests, expect PASS.**
-   `python -m pytest tests/sp0/aggregates/test_feature_versions.py -q`
+   `python -m pytest tests/featuregen/aggregates/test_feature_versions.py -q`
 
 5. **Commit.**
    `git add -A && git commit -m "sp0-06: mint_feature_version (frozen immutable version + VERSION_MINTED)" -m "Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"`
@@ -1814,9 +1814,9 @@ def mint_feature_version(
 ## Task 11 — Activation saga: CAS, `ACTIVATION_CONFLICT`, saga step 1 + feature-side handler, experimental expiry
 
 **Files:**
-- Create: `src/sp0/aggregates/activation.py`
-- Modify: `src/sp0/runtime/step.py` (extend Phase-04 `commit_step` to apply `result.activations` on the step-transaction conn — §5.8; replaces the Phase-04 deferred guard)
-- Test: `tests/sp0/aggregates/test_activation.py`
+- Create: `src/featuregen/aggregates/activation.py`
+- Modify: `src/featuregen/runtime/step.py` (extend Phase-04 `commit_step` to apply `result.activations` on the step-transaction conn — §5.8; replaces the Phase-04 deferred guard)
+- Test: `tests/featuregen/aggregates/test_activation.py`
 
 **Interfaces:**
 - Consumes: `feature_active_versions`, `queue`, `timers` tables; `append`, `mint_id`, `new_feature_version_id`, `mint_feature_version`, `current_version` (this phase); `EventEnvelope.global_seq` (set on `activated_seq`); `Handler`, `HandlerContext`, `HandlerResult`, `Disposition`, `IdentityEnvelope`, `NewActivation` (contracts); Phase-04 `HandlerRegistry` / `process_one` / `commit_step` (the worker that dispatches the saga handler and the step boundary that applies the declared activations).
@@ -1827,7 +1827,7 @@ def mint_feature_version(
   - `on_run_approved(conn, *, feature_id, produced_by_run, use_case, approval_type, actor, provenance, verification_stamp, risk_tier, approved_use_cases, blocked_use_cases, required_artifact_refs, content_hash, base_feature_version_id=None, dsl_operation_catalog_version=None, approval=None, expires_at=None) -> SagaStep1Result` — **§5.8 saga step 1, in the run's own transaction**: mints the frozen `feature_version_id` (Task 10) AND enqueues the activation request (`request_activation`). `SagaStep1Result(feature_version_id: str, activation_message_id: str)`.
   - `request_activation(conn, *, feature_id, feature_version_id, use_case, base_feature_version_id, approval_type, produced_by_run, actor, expires_at=None) -> str` — appends `ACTIVATION_REQUESTED` on the **run** stream (carrying every arg the handler needs) and enqueues the activation onto `queue` (partition `feature:{feature_id}`, handler `activate_version`, deterministic `message_id`, payload `{"run_id", "event_id"}` so the Phase-04 worker can rebuild the `HandlerContext`).
   - `ActivateVersionHandler` (a `Handler`: `name="activate_version"`, `version=1`, `timeout_seconds`, `handle(ctx)->HandlerResult`) + module singleton `ACTIVATE_VERSION_HANDLER`; `register_phase06_handlers(registry) -> None` — registers it into Phase-04's `HandlerRegistry`. **§5.8 saga step 2:** the worker dispatches this handler; it reads the activation args from `ctx.triggering_event.payload` (the run-stream `ACTIVATION_REQUESTED`) and returns `HandlerResult(disposition=OK, activations=(NewActivation(...),))` with **no run-stream events**. The handler is PURE — it performs NO writes via `ctx`; `commit_step` applies each `NewActivation` by calling `apply_activation` on the SINGLE step-transaction connection (the dispatcher conn), so the feature-side CAS, the `VERSION_ACTIVATED`/`ACTIVATION_CONFLICT` event, and any expiry timer are atomic with the rest of the step. This handler is the sanctioned cross-aggregate saga executor — the general "handlers must not emit feature-stream events" rule (§5.3/contract) does not apply to its declared activation effect; the activation IS the single feature-aggregate transaction §5.8 mandates.
-  - `commit_step` extension (`Modify src/sp0/runtime/step.py`): a `_apply_activations(conn, ctx, result)` helper invoked inside `commit_step` that applies each `result.activations` entry via `apply_activation(conn, ...)` (actor from `ctx.triggering_event.actor`), replacing the Phase-04 deferred-guard clause for `activations`.
+  - `commit_step` extension (`Modify src/featuregen/runtime/step.py`): a `_apply_activations(conn, ctx, result)` helper invoked inside `commit_step` that applies each `result.activations` entry via `apply_activation(conn, ...)` (actor from `ctx.triggering_event.actor`), replacing the Phase-04 deferred-guard clause for `activations`.
   - `activate_command(conn, cmd) -> CommandResult` — the **synchronous** lifecycle command (`activate`, §4.4); distinct entrypoint from the async `activate_version` handler, both delegating to `apply_activation`.
   - `deactivate_expired_version_command(conn, cmd) -> CommandResult`.
 
@@ -1838,19 +1838,19 @@ def mint_feature_version(
 1. **Write the failing test.**
 
 ```python
-# tests/sp0/aggregates/test_activation.py
+# tests/featuregen/aggregates/test_activation.py
 from datetime import datetime, timedelta, timezone
 
-from sp0.contracts import Disposition, HandlerContext
-from sp0.eventstore import load_stream
-from sp0.runtime.step import commit_step
-from sp0.aggregates._append import current_version, provenance_for
-from sp0.aggregates.feature_versions import mint_feature_version
-from sp0.aggregates.activation import (
+from featuregen.contracts import Disposition, HandlerContext
+from featuregen.eventstore import load_stream
+from featuregen.runtime.step import commit_step
+from featuregen.aggregates._append import current_version, provenance_for
+from featuregen.aggregates.feature_versions import mint_feature_version
+from featuregen.aggregates.activation import (
     apply_activation, activate_command, request_activation, deactivate_expired_version_command,
     on_run_approved, _cas_claim_slot, ACTIVATE_VERSION_HANDLER,
 )
-from tests.sp0._helpers import make_actor, make_cmd
+from tests.featuregen._helpers import make_actor, make_cmd
 
 
 def _mint(db, feature_id, run, base=None, approval="PRODUCTION", expires=None):
@@ -2072,13 +2072,13 @@ def test_activate_command_wraps_apply_activation(db):
 ```
 
 2. **Run it, expect FAIL.**
-   `python -m pytest tests/sp0/aggregates/test_activation.py -q`
-   Expected: `ModuleNotFoundError: No module named 'sp0.aggregates.activation'`.
+   `python -m pytest tests/featuregen/aggregates/test_activation.py -q`
+   Expected: `ModuleNotFoundError: No module named 'featuregen.aggregates.activation'`.
 
 3. **Write minimal implementation.**
 
 ```python
-# src/sp0/aggregates/activation.py
+# src/featuregen/aggregates/activation.py
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -2087,13 +2087,13 @@ from typing import Any, Mapping, Optional
 
 from psycopg.types.json import Jsonb
 
-from sp0.contracts import (
+from featuregen.contracts import (
     Command, CommandResult, DbConn, Disposition, Handler, HandlerContext, HandlerResult,
     IdentityEnvelope, NewActivation, ProvenanceEnvelope,
 )
-from sp0.aggregates._append import append
-from sp0.aggregates.ids import mint_id
-from sp0.aggregates.feature_versions import mint_feature_version
+from featuregen.aggregates._append import append
+from featuregen.aggregates.ids import mint_id
+from featuregen.aggregates.feature_versions import mint_feature_version
 
 
 @dataclass(frozen=True, slots=True)
@@ -2346,7 +2346,7 @@ def deactivate_expired_version_command(conn: DbConn, cmd: Command) -> CommandRes
     return CommandResult(accepted=True, aggregate_id=feature_id, produced_event_ids=(evt.event_id,))
 ```
 
-4. **Extend `commit_step` to apply the declared activations (Modify `src/sp0/runtime/step.py`).**
+4. **Extend `commit_step` to apply the declared activations (Modify `src/featuregen/runtime/step.py`).**
    The saga handler is pure: it only DECLARES `HandlerResult.activations`. Phase 04 added
    `activations` to `commit_step`'s deferred guard ("applied by Phase 06"); this phase REPLACES
    that deferral with the real cross-aggregate application. `apply_activation` runs on the SAME
@@ -2357,7 +2357,7 @@ def deactivate_expired_version_command(conn: DbConn, cmd: Command) -> CommandRes
    ACTIVATION_REQUESTED event); the remaining args come from each `NewActivation`.
 
 ```python
-# src/sp0/runtime/step.py — Phase 06 cross-aggregate extension of commit_step (§5.8).
+# src/featuregen/runtime/step.py — Phase 06 cross-aggregate extension of commit_step (§5.8).
 
 
 def _apply_activations(conn, ctx: HandlerContext, result: HandlerResult) -> None:
@@ -2368,7 +2368,7 @@ def _apply_activations(conn, ctx: HandlerContext, result: HandlerResult) -> None
     if not result.activations:
         return
     # Deferred import keeps Phase-04's step.py free of an import-time dependency on Phase 06.
-    from sp0.aggregates.activation import apply_activation
+    from featuregen.aggregates.activation import apply_activation
 
     actor = ctx.triggering_event.actor
     for act in result.activations:
@@ -2399,7 +2399,7 @@ def _apply_activations(conn, ctx: HandlerContext, result: HandlerResult) -> None
 ```
 
 5. **Run tests, expect PASS.**
-   `python -m pytest tests/sp0/aggregates/test_activation.py tests/sp0/runtime/test_step.py -q`
+   `python -m pytest tests/featuregen/aggregates/test_activation.py tests/featuregen/runtime/test_step.py -q`
 
 6. **Commit.**
    `git add -A && git commit -m "sp0-06: activation saga (pure handler declares activations; commit_step applies them atomically; CAS, ACTIVATION_CONFLICT, use-case map, experimental expiry)" -m "Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"`
@@ -2409,8 +2409,8 @@ def _apply_activations(conn, ctx: HandlerContext, result: HandlerResult) -> None
 ## Task 12 — Consumers, `supersede`, `deprecate` (consumer guard), `retier`
 
 **Files:**
-- Create: `src/sp0/aggregates/consumers.py`
-- Test: `tests/sp0/aggregates/test_consumers.py`
+- Create: `src/featuregen/aggregates/consumers.py`
+- Test: `tests/featuregen/aggregates/test_consumers.py`
 
 **Interfaces:**
 - Consumes: `consumers`, `feature_active_versions`, `feature_versions` tables; `append`, `new_consumer_id`, `identity_dict` (this phase).
@@ -2421,16 +2421,16 @@ def _apply_activations(conn, ctx: HandlerContext, result: HandlerResult) -> None
 1. **Write the failing test.**
 
 ```python
-# tests/sp0/aggregates/test_consumers.py
-from sp0.eventstore import load_stream
-from sp0.aggregates._append import provenance_for
-from sp0.aggregates.feature_versions import mint_feature_version
-from sp0.aggregates.activation import apply_activation
-from sp0.aggregates.consumers import (
+# tests/featuregen/aggregates/test_consumers.py
+from featuregen.eventstore import load_stream
+from featuregen.aggregates._append import provenance_for
+from featuregen.aggregates.feature_versions import mint_feature_version
+from featuregen.aggregates.activation import apply_activation
+from featuregen.aggregates.consumers import (
     register_consumer_command, deregister_consumer_command,
     supersede_command, deprecate_command, finalize_deprecate_command, retier_command,
 )
-from tests.sp0._helpers import make_actor, make_cmd
+from tests.featuregen._helpers import make_actor, make_cmd
 
 
 def _mint(db, feature_id, run, base=None, tier="low"):
@@ -2547,22 +2547,22 @@ def test_finalize_deprecate_completes_after_grace_and_is_idempotent(db):
 ```
 
 2. **Run it, expect FAIL.**
-   `python -m pytest tests/sp0/aggregates/test_consumers.py -q`
-   Expected: `ModuleNotFoundError: No module named 'sp0.aggregates.consumers'`.
+   `python -m pytest tests/featuregen/aggregates/test_consumers.py -q`
+   Expected: `ModuleNotFoundError: No module named 'featuregen.aggregates.consumers'`.
 
 3. **Write minimal implementation.**
 
 ```python
-# src/sp0/aggregates/consumers.py
+# src/featuregen/aggregates/consumers.py
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
 from psycopg.types.json import Jsonb
 
-from sp0.contracts import Command, CommandResult, DbConn
-from sp0.aggregates._append import append, identity_dict
-from sp0.aggregates.ids import mint_id, new_consumer_id
+from featuregen.contracts import Command, CommandResult, DbConn
+from featuregen.aggregates._append import append, identity_dict
+from featuregen.aggregates.ids import mint_id, new_consumer_id
 
 _DEFAULT_GRACE_SECONDS = 7 * 24 * 3600
 
@@ -2736,7 +2736,7 @@ def retier_command(conn: DbConn, cmd: Command) -> CommandResult:
 ```
 
 4. **Run tests, expect PASS.**
-   `python -m pytest tests/sp0/aggregates/test_consumers.py -q`
+   `python -m pytest tests/featuregen/aggregates/test_consumers.py -q`
 
 5. **Commit.**
    `git add -A && git commit -m "sp0-06: consumers + supersede + deprecate (consumer guard) + retier" -m "Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"`
@@ -2746,8 +2746,8 @@ def retier_command(conn: DbConn, cmd: Command) -> CommandResult:
 ## Task 13 — Feature inbound lifecycle signals & lifecycle states
 
 **Files:**
-- Create: `src/sp0/aggregates/feature_lifecycle.py`
-- Test: `tests/sp0/aggregates/test_feature_lifecycle.py`
+- Create: `src/featuregen/aggregates/feature_lifecycle.py`
+- Test: `tests/featuregen/aggregates/test_feature_lifecycle.py`
 
 **Interfaces:**
 - Consumes: `load_stream` (Phase 01); `append`, `new_run_id` (this phase); `feature_active_versions` table.
@@ -2758,13 +2758,13 @@ def retier_command(conn: DbConn, cmd: Command) -> CommandResult:
 1. **Write the failing test.**
 
 ```python
-# tests/sp0/aggregates/test_feature_lifecycle.py
-from sp0.eventstore import load_stream
-from sp0.aggregates.feature_lifecycle import (
+# tests/featuregen/aggregates/test_feature_lifecycle.py
+from featuregen.eventstore import load_stream
+from featuregen.aggregates.feature_lifecycle import (
     raise_monitoring_alert_command, require_revalidation_command,
     record_revalidation_outcome_command,
 )
-from tests.sp0._helpers import make_cmd, make_actor
+from tests.featuregen._helpers import make_cmd, make_actor
 
 
 def _svc():
@@ -2821,21 +2821,21 @@ def test_deprecate_outcome_sets_active_map_deprecated(db):
 ```
 
 2. **Run it, expect FAIL.**
-   `python -m pytest tests/sp0/aggregates/test_feature_lifecycle.py -q`
-   Expected: `ModuleNotFoundError: No module named 'sp0.aggregates.feature_lifecycle'`.
+   `python -m pytest tests/featuregen/aggregates/test_feature_lifecycle.py -q`
+   Expected: `ModuleNotFoundError: No module named 'featuregen.aggregates.feature_lifecycle'`.
 
 3. **Write minimal implementation.**
 
 ```python
-# src/sp0/aggregates/feature_lifecycle.py
+# src/featuregen/aggregates/feature_lifecycle.py
 from __future__ import annotations
 
 from typing import Optional
 
-from sp0.contracts import Command, CommandResult, DbConn
-from sp0.eventstore import load_stream
-from sp0.aggregates._append import append
-from sp0.aggregates.ids import new_run_id
+from featuregen.contracts import Command, CommandResult, DbConn
+from featuregen.eventstore import load_stream
+from featuregen.aggregates._append import append
+from featuregen.aggregates.ids import new_run_id
 
 _LIFECYCLE_TYPES = ("MONITORING_ALERT_RAISED", "REVALIDATION_REQUIRED",
                     "REVALIDATION_OUTCOME_RECORDED")
@@ -2910,7 +2910,7 @@ def record_revalidation_outcome_command(conn: DbConn, cmd: Command) -> CommandRe
 ```
 
 4. **Run tests, expect PASS.**
-   `python -m pytest tests/sp0/aggregates/test_feature_lifecycle.py -q`
+   `python -m pytest tests/featuregen/aggregates/test_feature_lifecycle.py -q`
 
 5. **Commit.**
    `git add -A && git commit -m "sp0-06: feature lifecycle signals (monitoring alert -> revalidation -> outcome, spawn new run)" -m "Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"`
@@ -2920,8 +2920,8 @@ def record_revalidation_outcome_command(conn: DbConn, cmd: Command) -> CommandRe
 ## Task 14 — Wire the command catalog into `execute_command` + end-to-end §12 oracles
 
 **Files:**
-- Create: `src/sp0/aggregates/commands.py`
-- Test: `tests/sp0/aggregates/test_phase06_e2e.py`
+- Create: `src/featuregen/aggregates/commands.py`
+- Test: `tests/featuregen/aggregates/test_phase06_e2e.py`
 
 **Interfaces:**
 - Consumes: `register_command` (Task 4); every `*_command` from Tasks 5–13; `execute_command` (Task 4).
@@ -2933,16 +2933,16 @@ def record_revalidation_outcome_command(conn: DbConn, cmd: Command) -> CommandRe
 1. **Write the failing test.**
 
 ```python
-# tests/sp0/aggregates/test_phase06_e2e.py
+# tests/featuregen/aggregates/test_phase06_e2e.py
 import pytest
 
-from sp0.eventstore import load_stream
-from sp0.commands.api import execute_command
-from sp0.commands.registry import clear_registry
-from sp0.aggregates.commands import register_phase06_commands
-from sp0.aggregates._append import provenance_for
-from sp0.aggregates.feature_versions import mint_feature_version
-from tests.sp0._helpers import make_cmd, make_actor
+from featuregen.eventstore import load_stream
+from featuregen.commands.api import execute_command
+from featuregen.commands.registry import clear_registry
+from featuregen.aggregates.commands import register_phase06_commands
+from featuregen.aggregates._append import provenance_for
+from featuregen.aggregates.feature_versions import mint_feature_version
+from tests.featuregen._helpers import make_cmd, make_actor
 
 
 @pytest.fixture(autouse=True)
@@ -3003,7 +3003,7 @@ def test_command_double_submit_is_idempotent(db):
 
 
 def test_every_catalog_action_is_registered():
-    from sp0.commands.registry import get_command
+    from featuregen.commands.registry import get_command
     for action in [
         "create_request", "create_run", "duplicate_of", "select_candidate", "cancel",
         "withdraw", "reject", "park", "unpark", "reopen_as_new_run", "resolve_degraded",
@@ -3032,32 +3032,32 @@ def test_resolve_degraded_unblocks_run_through_execute_command(db):
 ```
 
 2. **Run it, expect FAIL.**
-   `python -m pytest tests/sp0/aggregates/test_phase06_e2e.py -q`
-   Expected: `ModuleNotFoundError: No module named 'sp0.aggregates.commands'`.
+   `python -m pytest tests/featuregen/aggregates/test_phase06_e2e.py -q`
+   Expected: `ModuleNotFoundError: No module named 'featuregen.aggregates.commands'`.
 
 3. **Write minimal implementation.**
 
 ```python
-# src/sp0/aggregates/commands.py
+# src/featuregen/aggregates/commands.py
 from __future__ import annotations
 
-from sp0.commands.registry import register_command
-from sp0.aggregates.request_aggregate import (
+from featuregen.commands.registry import register_command
+from featuregen.aggregates.request_aggregate import (
     create_request_command, create_run_command, duplicate_of_command, select_candidate_command,
 )
-from sp0.aggregates.run_lifecycle import (
+from featuregen.aggregates.run_lifecycle import (
     reject_command, cancel_command, withdraw_command, park_command, unpark_command,
     reopen_as_new_run_command, resolve_degraded_command,
     fact_confirmed_resume_command, source_changed_revalidate_command,
 )
-from sp0.aggregates.activation import (
+from featuregen.aggregates.activation import (
     activate_command, deactivate_expired_version_command,
 )
-from sp0.aggregates.consumers import (
+from featuregen.aggregates.consumers import (
     register_consumer_command, deregister_consumer_command,
     supersede_command, deprecate_command, finalize_deprecate_command, retier_command,
 )
-from sp0.aggregates.feature_lifecycle import (
+from featuregen.aggregates.feature_lifecycle import (
     raise_monitoring_alert_command, require_revalidation_command,
     record_revalidation_outcome_command,
 )
@@ -3098,9 +3098,9 @@ def register_phase06_commands() -> None:
 **Production wiring (single entrypoint).** A running process is NOT inside pytest, so nothing implicitly registers schemas/handlers — the app must call this at startup (the conftest exercises the schema half of the same path, Task 4):
 
 ```python
-# src/sp0/aggregates/bootstrap.py  (append)
-from sp0.aggregates.commands import register_phase06_commands
-from sp0.aggregates.activation import register_phase06_handlers
+# src/featuregen/aggregates/bootstrap.py  (append)
+from featuregen.aggregates.commands import register_phase06_commands
+from featuregen.aggregates.activation import register_phase06_handlers
 
 
 def bootstrap_phase06(handler_registry) -> None:
@@ -3112,7 +3112,7 @@ def bootstrap_phase06(handler_registry) -> None:
 ```
 
 4. **Run tests, expect PASS.** Then run the whole phase suite.
-   `python -m pytest tests/sp0/aggregates/test_phase06_e2e.py -q`
+   `python -m pytest tests/featuregen/aggregates/test_phase06_e2e.py -q`
    `python -m pytest tests/sp0 -q`
 
 5. **Commit.**
