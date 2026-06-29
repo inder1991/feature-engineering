@@ -39,6 +39,7 @@ These boundaries are deliberate decisions, not omissions:
 - **Batch-only serving.** Features are computed on a schedule and **materialized** to a store; serving is a lookup of the latest materialized value. Feature freshness is therefore bounded by the batch cadence (minutes to hours). **True sub-second, compute-at-request features (e.g. in-the-moment card-fraud scoring) are out of scope** for this revision. See §16 for the future path.
 - **Layer 0 (data catalog) is integrated, not built.** The platform consumes an existing enterprise catalog and *augments* it with a Metadata Overlay (§6). Standing up an enterprise catalog from scratch is a prerequisite, not part of this design.
 - **No model training framework.** The platform produces and governs *features*. It evaluates a feature's contribution to a model but does not own model training, deployment, or the model lifecycle. It *integrates with* the bank's model-risk process (§11).
+- **Banking-only domain scope (enforced).** This is a **banking-vertical** platform, not a general-purpose feature store. Admissible work is bounded by the **closed banking Domain/Use-Case Catalog** (§15.5); a request whose use-case, entity, or concept does not resolve to that banking taxonomy is **rejected at intake**, never built generically. Banking entities, the banking business glossary, and banking regulatory frameworks (model risk, fair lending, AML, adverse action) are **first-class, not configuration**. (This is orthogonal to *vendor*-neutrality above: vendor-neutral on technology, deliberately *domain-specific* on banking.)
 
 ---
 
@@ -86,7 +87,7 @@ Each layer below lists its **purpose**, **inputs → outputs**, **components**, 
 
 ### Layer 1 — Intake and normalization
 
-**Purpose:** turn the data scientist's intent into a structured *draft* — never executable. Intent arrives in one of **two modes** (§14.1): a loose **hypothesis** (the platform generates candidate definitions) or a precise **feature definition** (the platform translates it faithfully).
+**Purpose:** turn the data scientist's intent into a structured *draft* — never executable. Intent arrives in one of **two modes** (§14.1): a loose **hypothesis** (the platform generates candidate definitions) or a precise **feature definition** (the platform translates it faithfully). Intake also **rejects out-of-domain requests** — anything whose use-case/entity/concept does not resolve to the closed banking Domain Catalog (§15.5).
 
 **Inputs → outputs:** free-text hypothesis *or* feature definition → **Draft Feature Contract** + **Assumption Ledger**.
 
@@ -756,7 +757,7 @@ A feature may be **DESIGN-CHECKED** with only schema, column names, and definiti
 
 ## 15. The Domain / Use-Case Catalog
 
-Feature engineering is domain-specific: the *same* raw data yields different features, on different permitted columns, against different targets, under different governance, depending on the **business domain (use-case)**. The **Domain / Use-Case Catalog** is the Layer 0 foundation artifact that encodes this — a sibling of the Metadata Overlay (§6). Like the overlay it is **integrated/curated, not invented per feature**, is versioned, and is confirmed by the responsible owners (the domain/risk owner for domain facts; **Compliance** for policy facts, §6.5).
+Feature engineering is domain-specific: the *same* raw data yields different features, on different permitted columns, against different targets, under different governance, depending on the **business domain (use-case)**. The **Domain / Use-Case Catalog** is the Layer 0 foundation artifact that encodes this — a sibling of the Metadata Overlay (§6), and a **closed banking taxonomy** (§15.5). Like the overlay it is **integrated/curated, not invented per feature**, is versioned, and is confirmed by the responsible owners (the domain/risk owner for domain facts; **Compliance** for policy facts, §6.5).
 
 ### 15.1 What a catalog entry holds
 
@@ -801,6 +802,17 @@ The catalog is the **context** every stage reads off the feature's `use_case`:
 ### 15.4 Relationship to existing use-case scoping
 
 The catalog is the *source* of the use-case facts already referenced throughout: `approved_use_cases`/`blocked_use_cases` (§4.3), policy-aware exposure (§12), and risk-tier-as-lifecycle-attribute (§13.3). Previously those values were assumed; the catalog is where they are **defined, owned, and versioned** — and how a new domain is onboarded (score it, define its templates/policy/target/tier, have the owners + Compliance confirm).
+
+### 15.5 Banking-only scope (closed taxonomy)
+
+This platform is a **banking vertical**, not a general-purpose feature store — an *enforced* scope, not a preference:
+
+- **The Domain Catalog is a *closed* banking taxonomy.** Admissible use-cases are the banking set only — e.g. `retail_churn`, `credit_origination`, `behavioral_credit_scoring`, `collections`, `ifrs9_ecl`, `application_fraud`, `account_takeover`, `aml_transaction_monitoring`, `kyc_risk`, `sanctions_screening`, `propensity_cross_sell`, `clv`, `risk_based_pricing`. (Real-time card fraud is recognized but out of scope per §1.4.) A `use_case` outside the set has no catalog entry and is **rejected at intake** under the §15.3 fail-closed rule.
+- **Banking entities are first-class.** The entity/grain resolver (Layer 3) resolves only banking entities — customer, account, product, transaction, counterparty, exposure, application — and nothing else.
+- **A banking business glossary** (delinquency, DPD, charge-off, utilization, SAR, structuring, churn/attrition, …) primes the LLM intake and generation so concepts map to *banking* meaning; a non-banking concept fails to ground.
+- **Banking regulatory frameworks are built-in, not configured:** model risk (SR 11-7-style), fair lending / disparate impact, adverse-action explainability (ECOA-style), AML/BSA, and PII/data-residency — they parameterize the governance guards (Layer 7) and the policy-aware mapper (§12).
+
+**Out-of-domain rejection:** if a hypothesis cannot be resolved to a banking use-case, a banking entity, and banking-glossary concepts, intake **rejects it with a clear reason** rather than generating a generic feature. The platform never silently builds a non-banking feature.
 
 ---
 
