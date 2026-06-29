@@ -18,7 +18,7 @@
 
 ### 1.1 In scope
 - The **overlay fact store** (event-sourced on SP-0) + the **immutable evidence store**.
-- The **`CatalogAdapter`** (interface + Postgres `information_schema` reference adapter + fixture).
+- The **`CatalogAdapter`** (interface + `PostgresCatalog` reference adapter over `information_schema` + `pg_catalog` + fixture).
 - The **merged-view read API** (authoritative-catalog → VERIFIED-overlay → missing; fail-closed).
 - The **confirmation workflow** + **authority resolver** + **proactive (human-entered) facts**.
 - The **deterministic data-profiling proposer** (emits DRAFT facts + evidence; bounded/safe).
@@ -104,7 +104,8 @@ case/quoting/multi-catalog ambiguity the `fact_key` exists to avoid cannot re-en
 ### 3.2 The `overlay_fact` aggregate (on SP-0's event store)
 Events (`aggregate="overlay_fact"`, `aggregate_id=fact_key`):
 ```
-FACT_PROPOSED   (DRAFT)     proposed_value, evidence_ref?, provenance, proposed_by(service|human)
+FACT_PROPOSED   (DRAFT)     catalog_object_ref, object_ref, fact_type, use_case?, proposed_value,
+                            proposal_fingerprint, evidence_ref?, provenance, proposed_by(service|human)
 FACT_CONFIRMED  (VERIFIED)  value, confirmed_by, authority_role, expires_at, confirms_event_id
 FACT_REJECTED   (REJECTED)  rejected_by, reason, rejects_event_id
 FACT_EXPIRED    (REVERIFY)  by timer
@@ -120,7 +121,7 @@ Every `proposed_value`/`value` is validated against a per-type schema at append 
 | `availability_time` | data owner | `{ column: str, basis: "posted_at"\|"ingested_at"\|"event_time_plus_lag", lag_hours?: number }` |
 | `grain` | data owner | `{ columns: [str, …], is_unique: bool }` |
 | `scd_effective_dating` | data owner | `{ valid_from: str, valid_to: str\|null, current_flag?: str }` |
-| `approved_join` | data owner | `{ from_columns: [str,…], to_object: str, to_columns: [str,…], cardinality: "1:1"\|"1:N"\|"N:1" }` |
+| `approved_join` | **both** owners | `{ from_columns: [str,…], to_ref: CatalogObjectRef, to_columns: [str,…], cardinality: "1:1"\|"1:N"\|"N:1" }` — dual-confirmation, §6 |
 | `policy_tag` | Compliance | `{ decision: "allow"\|"deny"\|"restricted", sensitivity?: str, basis: str }` — `use_case` lives in the `fact_key`, **not** duplicated in the value |
 
 Schemas are registered with SP-0's schema registry (versioned) so event validation, the projection
@@ -144,6 +145,13 @@ DRAFT ─ confirm ─▶ VERIFIED ─ expiry ─▶ REVERIFY ─ confirm ─▶ 
 - **Proactive (human-entered) facts (P1):** not everything is profiler-inferable, and §6 of the parent allows proactive verified entry. Two supported paths:
   - **Propose-then-confirm:** a human submits `FACT_PROPOSED(proposed_by=human)`, then the resolved authority confirms (normal gate).
   - **Direct entry:** when the **acting principal *is* the resolved authority** for that fact (data owner for a data fact; Compliance for a policy fact), the command may emit `FACT_PROPOSED`+`FACT_CONFIRMED` atomically (a self-confirmation that still records actor + provenance and respects SoD — a data owner can never self-confirm a `policy_tag`).
+
+**Lifecycle wiring (P1).** The overlay lifecycle is pinned to an `OVERLAY_TABLE_VERSION` constant, stamped on
+every `FACT_*` event (SP-0 events require `table_version`). The projection stores the current `status` **and**
+the `table_version` that produced it. Every `FACT_*` command path **runs the transition engine before
+appending**: `load_transition_table("overlay_fact", OVERLAY_TABLE_VERSION).matches(current_status, trigger)`,
+evaluates guards, and only then appends the resulting event on the same connection (SP-0 OCC) — so an illegal
+transition is rejected before it is written.
 
 ### 3.5 Evidence vs. fact (separation)
 Profiler output is **evidence**, not truth. `FACT_PROPOSED` carries the **proposed_value** (the business
@@ -184,10 +192,10 @@ class CatalogFact:
 Authoritativeness is a **property of each returned `CatalogFact`**, not a global set — a catalog may be
 authoritative for PII tags on some columns but not others, or for type on a column but not its grain.
 
-- **`InformationSchemaCatalog`** (reference): exposes structural metadata (existence/columns/types) via
+- **`PostgresCatalog`** (reference): reads structural metadata (existence/columns/types) from
+  `information_schema` and the **stable native object id (`oid`) from `pg_catalog`**, exposed via
   `list_objects` → `CatalogObject` — **not** as ML facts. Its `get_fact` (ML fact types) returns `None`
-  for all five (information_schema records none of them), so the overlay owns them. `owner_of` returns
-  `None` unless ownership is recorded.
+  for all five, so the overlay owns them. `owner_of` returns `None` unless ownership is recorded.
 - **`FixtureCatalog`**: in-memory adapter for tests (can mark facts authoritative per object).
 
 A Snowflake / Unity Catalog adapter is just another implementation with its own per-fact authority and `owner_of`.
@@ -220,7 +228,7 @@ min/max dates, uniqueness over identifying columns) can themselves be revealing 
 ### 5.2 Profiler safety limits (P1)
 The profiler runs only under bounded, auditable access:
 - **read-only DB role**; **schema allowlist** (only onboarded schemas);
-- **aggregate-only queries** (COUNT/DISTINCT/MIN/MAX over columns) — never row exports;
+- **aggregate-only queries** (COUNT/DISTINCT over columns; **extrema only as bucketed/derived metrics** — e.g. date→month, numeric→coarse range — never raw `MIN`/`MAX` of identifiers, balances, or dates) — never row exports;
 - **sampling policy** (TABLESAMPLE / `LIMIT` above a configurable row-count threshold; full scan only below it);
 - **statement timeout**, **max columns**, and **max column-combinations** per run (cap combinatorial key-set search);
 - every run records its provenance (§5.1) so a proposal can be explained and reproduced.
@@ -230,8 +238,9 @@ The profiler runs only under bounded, auditable access:
 ## 6. Confirmation workflow + authority resolver (P1)
 
 1. A DRAFT opens an SP-0 **human-gate task** routed to the **resolved authority**:
-   - **Data facts** → the **data owner**, resolved via `CatalogAdapter.owner_of(object_ref)`. **If the owner is
-     unknown → route to a data-governance / platform-admin queue** (never to whoever submitted the request).
+   - **Data facts** → the **data owner**. **If the owner is
+     unknown → route to a data-governance / platform-admin queue** (never to whoever submitted the request),
+     resolved via `CatalogAdapter.owner_of(ref)`.
    - **Policy facts (`policy_tag`)** → **Compliance**, *always*; a data owner attempting to confirm a policy fact
      is rejected by SP-0's structural SoD.
 2. **Confirm** → `FACT_CONFIRMED` (VERIFIED, with `expires_at`); **reject** → `FACT_REJECTED`.
@@ -240,6 +249,25 @@ The profiler runs only under bounded, auditable access:
    advanced (a newer draft exists), expired, or been staled since the task was raised — i.e. a CAS on the
    stream (SP-0 OCC) plus task-version staleness. Stale confirmations never apply silently.
 4. Unauthorized attempts are denied and recorded in the **security-audit stream** (SP-0).
+
+### 6.4 `approved_join` dual-confirmation (P1)
+An `approved_join` asserts cross-object data sharing, so its `value.to_ref` is a structured `CatalogObjectRef`
+and it requires **confirmation from the data owners of *both* the source object and `to_ref`** (two human-gate
+tasks; the fact reaches VERIFIED only when **both** confirm; either rejection → REJECTED). An unknown owner on
+either side routes that side to the governance queue (§6 step 1).
+
+### 6.5 Command authorization (P1)
+All commands run through SP-0 authz; the gate / SoD vocabulary:
+
+| command | actor kind | authorization / SoD | denial |
+|---|---|---|---|
+| `propose_fact` | service (profiler) **or** human | `overlay.propose` capability; a proposer may not also confirm the same fact (four-eyes) | → security-audit |
+| `confirm_fact` / `reject_fact` | **human** authority | actor must equal the **resolved authority** for the fact_type (data owner; Compliance for `policy_tag`; **both** owners for `approved_join`); gate `overlay_fact_confirmation`; confirmation CAS (§6.3) | → security-audit |
+| `enter_fact` (proactive/direct, §3.4) | **human** authority | actor must *be* the resolved authority; SoD still blocks a data owner entering a `policy_tag` | → security-audit |
+| `run_profiler` | service / data-eng operator | `overlay.profile` capability + target schema on the allowlist; runs under the read-only role (§5.2) | → security-audit |
+
+Service actions (`propose_fact` by the profiler, `run_profiler`) carry a **service attestation** (SP-0 service
+principal); confirmations require a **human** principal. "Wrong-role rejected" = the resolved-authority check above.
 
 ## 7. Merged-view read API
 
@@ -270,6 +298,11 @@ users — and **write/confirm authz is enforced now** (SP-0 authz + SoD on the c
 authorization is deferred to SP-9/SP-11**; this is stated explicitly so no consumer assumes the read path is
 end-user-safe.
 
+**Task-scoped proposal read (P1).** Confirmation still requires the assignee to see what they're confirming, so
+SP-1 exposes `get_task_proposal(task_id, actor) -> { object_ref, fact_type, use_case, proposed_value, evidence }`,
+authorized to the **task's assignee** (or the governance-queue role) — a narrow, task-scoped read, distinct from
+the deferred end-user `resolve_fact` authz, so confirmation is implementable now without the visual UI.
+
 ## 8. Freshness + catalog-change detection (P2 — stable identity)
 
 - **Expiry:** on `FACT_CONFIRMED`, schedule an SP-0 **timer** for `expires_at` (configurable horizon); firing
@@ -296,19 +329,21 @@ LLM-suggestion / lazy-during-build proposing (SP-2) · console UI (frontend) · 
 
 ## 12. Testing
 - **Migration (P0):** `overlay_fact` appends succeed after the CHECK migration; existing request/feature/run appends + consistency CHECK still hold; **an `overlay_fact` append with a non-null `request_id`/`feature_id`/`run_id` is rejected** by the tightened constraint; the `overlay_lifecycle_table` loads via the extended transition engine; OCC on `fact_key`.
+- **Self-describing events / rebuild (P1):** the projection (`object_ref`/`fact_type`/`use_case`/`status`) rebuilds purely from the event stream (FACT_PROPOSED carries them); the transition engine **rejects an illegal trigger before append** (lifecycle wiring, `OVERLAY_TABLE_VERSION` stamped).
+- **Command authz (P1):** each command's actor/SoD enforced — service-attested `propose_fact`/`run_profiler`; human-only confirm/reject; proposer ≠ confirmer; **wrong-role denied → security-audit**; `get_task_proposal` returns proposal+evidence to the **assignee** and denies others.
 - **Value schemas (P1):** each fact type validates its value; malformed value rejected at append.
 - **Merged-view:** authoritative-catalog hit · overlay-fill · fail-closed-on-missing · not-served-when-STALE/REVERIFY · **per-fact authority** (catalog beats overlay only where `authoritative=true`) · **ML-fact scope** (`get_fact` returns `None` for all five on information_schema; structural metadata via `list_objects`) · **REVERIFY/STALE returns `prior_value` with `value=null`**.
-- **Authority:** data-owner confirms data fact · Compliance confirms policy fact · wrong-role rejected · **unknown owner → governance queue** (not submitter) · **direct entry by the authority** (self-confirm) · data owner **cannot** self-confirm a `policy_tag`.
+- **Authority:** data-owner confirms data fact · Compliance confirms policy fact · wrong-role rejected · **unknown owner → governance queue** (not submitter) · **direct entry by the authority** (self-confirm) · data owner **cannot** self-confirm a `policy_tag` · **`approved_join` needs both source and `to_ref` owners** (one confirmation is insufficient).
 - **Lifecycle:** DRAFT→VERIFIED→EXPIRED→REVERIFY→VERIFIED · DRAFT→REJECTED · VERIFIED→STALE→VERIFIED · profiler **does not re-propose a REJECTED candidate even with fresh evidence** (dedup by `proposal_fingerprint`).
 - **Evidence (P1):** evidence record is immutable; `evidence_ref` resolves; **no raw values**; provenance present.
 - **Profiler (P1):** grain/availability-time inference correctness; **safety limits honored** (read-only role, allowlist, aggregate-only, timeout, max columns/combinations, sampling threshold).
 - **Confirmation race (P1):** stale confirmation after a newer draft is **rejected**; expired/staled confirmation rejected; concurrent confirm/reject.
 - **Freshness/change (P2):** timer expiry → REVERIFY; fingerprint diff (drop/type-change) → STALE; **rename via stable id** tracked, **rename without id** = drop+add → STALE.
 - **Read posture (P2):** `resolve_fact` is reachable service-internally; (human-facing authz is out of scope, asserted by test doc).
-- **Adapter:** `InformationSchemaCatalog` against real PG; per-fact `authoritative` honored.
+- **Adapter:** `PostgresCatalog` against real PG (`information_schema` + `pg_catalog` `oid`); per-fact `authoritative` honored.
 
 ## Appendix A — Sample stack (non-binding)
 PostgreSQL (overlay events reuse SP-0's event store + the §2.1 migration; a projection table + an
-`overlay_evidence` table; `information_schema` as the reference catalog; Postgres `oid` as the stable
-native object id for rename tracking) · Python 3.11 · pytest. The `overlay_fact` aggregate is registered
+`overlay_evidence` table; the `PostgresCatalog` reference adapter over `information_schema` + `pg_catalog`,
+using the stable `oid` for rename tracking) · Python 3.11 · pytest. The `overlay_fact` aggregate is registered
 with SP-0's event store and state-machine table via the canonical migrations module.
