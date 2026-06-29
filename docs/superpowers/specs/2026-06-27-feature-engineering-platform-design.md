@@ -36,7 +36,7 @@ That pipeline is unsafe because it lets an LLM's unverified output reach product
 These boundaries are deliberate decisions, not omissions:
 
 - **Vendor-neutral.** This document states *capability requirements* ("the platform requires a catalog that exposes column-level availability time"), never product names. Binding to specific technologies (warehouse, orchestration engine, feature store, catalog) is left to implementation.
-- **Batch-only serving.** Features are computed on a schedule and **materialized** to a store; serving is a lookup of the latest materialized value. Feature freshness is therefore bounded by the batch cadence (minutes to hours). **True sub-second, compute-at-request features (e.g. in-the-moment card-fraud scoring) are out of scope** for this revision. See §15 for the future path.
+- **Batch-only serving.** Features are computed on a schedule and **materialized** to a store; serving is a lookup of the latest materialized value. Feature freshness is therefore bounded by the batch cadence (minutes to hours). **True sub-second, compute-at-request features (e.g. in-the-moment card-fraud scoring) are out of scope** for this revision. See §16 for the future path.
 - **Layer 0 (data catalog) is integrated, not built.** The platform consumes an existing enterprise catalog and *augments* it with a Metadata Overlay (§6). Standing up an enterprise catalog from scratch is a prerequisite, not part of this design.
 - **No model training framework.** The platform produces and governs *features*. It evaluates a feature's contribution to a model but does not own model training, deployment, or the model lifecycle. It *integrates with* the bank's model-risk process (§11).
 
@@ -80,7 +80,7 @@ Each layer below lists its **purpose**, **inputs → outputs**, **components**, 
 
 **Purpose:** answer the questions every downstream layer depends on — *what data exists, what it means, who owns it, who may use it, when it is available, how it joins, and whether it is safe for this use case.*
 
-**Composition:** the **existing enterprise catalog** (source of truth for what it records) **+ the Metadata Overlay** (§6), which supplies the ML-specific facts the catalog does not record (availability time, asserted grain, SCD effective-dating, approved join graph, use-case-scoped policy tags).
+**Composition:** the **existing enterprise catalog** (source of truth for what it records) **+ the Metadata Overlay** (§6), which supplies the ML-specific facts the catalog does not record (availability time, asserted grain, SCD effective-dating, approved join graph, use-case-scoped policy tags) **+ the Domain / Use-Case Catalog** (§15), which defines the use-case taxonomy and, per domain, the candidate-feature templates, allowed/blocked data, target definition, scoring metric, and risk tier that drive and constrain generation.
 
 **Gate (Catalog Quality Gate):** a feature may not enter grounding (Layer 3) unless every metadata fact it requires is present and **VERIFIED** in the catalog or the overlay. Missing or unconfirmed facts route to the responsible human (§6).
 
@@ -90,7 +90,7 @@ Each layer below lists its **purpose**, **inputs → outputs**, **components**, 
 
 **Inputs → outputs:** free-text hypothesis *or* feature definition → **Draft Feature Contract** + **Assumption Ledger**.
 
-**Components:** Feature Intake UI/API; LLM Intake & Normalization Agent; (hypothesis mode) the multi-candidate generation engine (§14.2).
+**Components:** Feature Intake UI/API; LLM Intake & Normalization Agent; (hypothesis mode) the multi-candidate generation engine (§14.2), **primed by the Domain/Use-Case Catalog (§15)**.
 
 **Gate:** none yet — output is explicitly marked `status: NEEDS_CLARIFICATION` and cannot proceed past Layer 2 without confirmation.
 
@@ -701,6 +701,7 @@ For hypothesis-driven intake the platform generates **several candidate definiti
 
 What keeps this safe and human-led:
 
+- **Domain-primed.** The candidate set is seeded by the **Domain/Use-Case Catalog (§15)** — the use-case's known feature templates, allowed data, and target — so generation proposes *domain-salient* features on permitted columns, not generic transforms.
 - **Bounded, not autonomous.** The engine explores the *implementation space of the scientist's hypothesis*, never an open-ended space of all possible features. This bounding preserves the "data-scientist-led" principle and limits search-induced overfitting (§14.4).
 - **Proposes, never approves.** Candidates flow through the normal pipeline; the human confirms at Gate #1 and approves at Gate #2.
 - **Attempt memory + diversity.** The platform keeps a persistent memory of *every* attempt — definition, score, and (for rejects) the reason — and uses it to bias future suggestions and avoid re-proposing dead ends. To avoid converging prematurely on one mediocre idea, it keeps several diverse candidate lines alive in parallel (the "islands" pattern). This upgrades the duplication check (§7.5) and the harvest loop (§5.8) from static dedup into an active learning memory.
@@ -753,7 +754,57 @@ A feature may be **DESIGN-CHECKED** with only schema, column names, and definiti
 
 ---
 
-## 15. Open questions and future work
+## 15. The Domain / Use-Case Catalog
+
+Feature engineering is domain-specific: the *same* raw data yields different features, on different permitted columns, against different targets, under different governance, depending on the **business domain (use-case)**. The **Domain / Use-Case Catalog** is the Layer 0 foundation artifact that encodes this — a sibling of the Metadata Overlay (§6). Like the overlay it is **integrated/curated, not invented per feature**, is versioned, and is confirmed by the responsible owners (the domain/risk owner for domain facts; **Compliance** for policy facts, §6.5).
+
+### 15.1 What a catalog entry holds
+
+Each `use_case` is a governed record:
+
+```json
+{
+  "use_case": "retail_churn",
+  "domain": "marketing",
+  "entity": "customer",
+  "target": { "name": "churn", "definition": "no financial transaction for 90 days after as_of_date" },
+  "primary_metric": "lift",                       // the §14.3 scoring metric for this domain
+  "feature_templates": ["rolling_balance_trend", "login_frequency_change",
+                        "inter_event_irregularity", "rfm_recency_frequency_monetary"],
+  "allowed_data_classes": ["transactions", "balances", "digital_activity", "salary"],
+  "blocked_data_classes": ["protected_attribute"],
+  "risk_tier": "low",
+  "regulatory": { "adverse_action": false, "fair_lending": false, "mrm_tier": "low" },
+  "latency": "batch",
+  "owner": "marketing-analytics",
+  "compliance_confirmed": true,
+  "version": 3
+}
+```
+
+Contrast `credit_origination`: `risk_tier: high`, `regulatory.adverse_action: true`, `fair_lending: true`, `mrm_tier: high`; salary allowed but `protected_attribute` blocked; explainability artifact required.
+
+### 15.2 What it feeds (five hooks into the pipeline)
+
+The catalog is the **context** every stage reads off the feature's `use_case`:
+
+1. **Generation prior + templates (Layer 1, §14.2).** `feature_templates` seed the candidate set so generation proposes *domain-salient* features (churn → balance-decline, login-drop) rather than generic transforms; recurring templates promote into Path-1 DSL operations (§5.2).
+2. **Policy-scoped grounding (Layer 3, §12).** `allowed_/blocked_data_classes` drive the policy-aware Schema Mapper — *salary allowed for fraud, blocked for credit decisioning; protected attributes blocked for lending.*
+3. **Target + scoring (Layer 6, §14.3).** `target` and `primary_metric` are what model-free scoring (IV/WoE) ranks candidates against — no domain target, no usefulness score.
+4. **Governance guards (Layer 7).** `risk_tier`, `regulatory`, and the use-case scoping populate the feature-version governance attributes and the activation guards (a feature may not activate into a blocked use-case or above its tier ceiling); `adverse_action` makes the explainability artifact required.
+5. **Serving/latency check.** `latency` is checked against the batch-only scope (§1.4); real-time-only domains (in-the-moment card fraud) are flagged out of scope.
+
+### 15.3 Hard rule
+
+> Every feature carries a `use_case` that **must resolve to a Domain Catalog entry**. Generation, grounding, scoring, and governance all key off that entry. A feature whose `use_case` is unknown to the catalog cannot proceed — the same fail-closed discipline as the Metadata Overlay (§6.2).
+
+### 15.4 Relationship to existing use-case scoping
+
+The catalog is the *source* of the use-case facts already referenced throughout: `approved_use_cases`/`blocked_use_cases` (§4.3), policy-aware exposure (§12), and risk-tier-as-lifecycle-attribute (§13.3). Previously those values were assumed; the catalog is where they are **defined, owned, and versioned** — and how a new domain is onboarded (score it, define its templates/policy/target/tier, have the owners + Compliance confirm).
+
+---
+
+## 16. Open questions and future work
 
 - **Real-time (sub-second) serving.** Out of scope here (§1.4). A future revision adds a single-definition-compiled-to-both path (offline + online) with **mandatory equivalence testing**, and keeps **Path-2 LLM SQL batch-only** (un-vetted generated SQL must never reach a real-time path it can't be equivalence-proven on).
 - **DSL coverage metric.** Track the percentage of real requests Path 1 can express; use it to prioritize the harvest loop (§5.8).
