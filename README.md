@@ -59,6 +59,7 @@ Read the full design and decisions:
 - **[Reference architecture →](docs/architecture/2026-06-27-feature-engineering-platform-design.md)**
 - **[Build roadmap →](docs/architecture/2026-06-27-feature-engineering-platform-roadmap.md)**
 - **[SP-0 Foundations spec →](docs/architecture/2026-06-27-sp0-foundations-design.md)**
+- **[SP-1 Metadata Overlay spec →](docs/architecture/2026-06-29-sp1-metadata-overlay-design.md)**
 - **[Banking Domain Catalog →](docs/architecture/2026-06-29-banking-domain-catalog.md)**
 
 ## Roadmap
