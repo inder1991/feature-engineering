@@ -1,7 +1,8 @@
+import pytest
 from psycopg.rows import dict_row
 
 from featuregen.contracts import Command
-from featuregen.identity.build import build_human_identity
+from featuregen.identity.build import build_human_identity, build_service_identity
 from featuregen.overlay.commands import confirm_fact, propose_fact, reject_fact
 from featuregen.overlay.identity import CatalogObjectRef, fact_key
 from featuregen.overlay.state import fold_overlay_state
@@ -11,6 +12,11 @@ ALICE = build_human_identity(subject="user:alice", role_claims=("data_owner",))
 BOB = build_human_identity(subject="user:bob", role_claims=("data_owner",))
 COMPLIANCE = build_human_identity(subject="user:carol", role_claims=("compliance",))
 ADMIN = build_human_identity(subject="user:admin", role_claims=("platform-admin",))
+# A non-human (profiler) principal, attested + granted platform-admin so it WOULD clear the
+# authority/four-eyes checks if it were human — isolating the `actor_kind != "human"` guard.
+PROFILER = build_service_identity(
+    subject="service:profiler", role_claims=("platform-admin",), attestation="deploy-sig-abc"
+)
 
 
 def _orders() -> CatalogObjectRef:
@@ -35,6 +41,22 @@ def _confirm_cmd(*, fact_type="grain", use_case=None, target, actor=ALICE, key="
     if use_case is not None:
         args["use_case"] = use_case
     return Command("confirm_fact", "overlay_fact", None, args, actor, key)
+
+
+def _reject_cmd(*, fact_type="grain", use_case=None, target, actor=ALICE, reason="no", key="r"):
+    args = {
+        "ref": _orders(),
+        "fact_type": fact_type,
+        "target_event_id": target,
+        "reason": reason,
+    }
+    if use_case is not None:
+        args["use_case"] = use_case
+    return Command("reject_fact", "overlay_fact", None, args, actor, key)
+
+
+def _has_event(db, fact_type, event_type) -> bool:
+    return any(e.type == event_type for e in load_fact(db, fact_key(_orders(), fact_type)))
 
 
 def test_owner_confirms_draft_to_verified(db, catalog):
@@ -143,3 +165,76 @@ def test_confirm_with_malformed_override_value_is_rejected(db, catalog):
     key = fact_key(_orders(), "grain")
     # still awaiting confirmation — no CONFIRMED event was written
     assert fold_overlay_state(load_fact(db, key)).status == "DRAFT"
+
+
+# --- security-guard DENIAL paths (each test must FAIL if its guard were removed) ---------------
+
+
+@pytest.mark.parametrize(
+    ("handler", "verb", "event_type"),
+    [
+        (confirm_fact, "confirm_fact", "OVERLAY_FACT_CONFIRMED"),
+        (reject_fact, "reject_fact", "OVERLAY_FACT_REJECTED"),
+    ],
+)
+def test_non_human_actor_is_denied(db, catalog, handler, verb, event_type):
+    """confirm_fact / reject_fact are human-only (§6.3). No owner is recorded -> governance queue,
+    and PROFILER holds platform-admin + is attested, so it would clear the authority and four-eyes
+    checks if it were human. The ONLY thing blocking it is the `actor_kind != "human"` guard: drop
+    that guard and `accepted` flips to True (and the event is written), so this genuinely covers it.
+    """
+    draft = _propose(db, actor=BOB)  # human proposer -> four-eyes would be satisfied for PROFILER
+    cmd = Command(
+        verb,
+        "overlay_fact",
+        None,
+        {"ref": _orders(), "fact_type": "grain", "target_event_id": draft, "reason": "x"},
+        PROFILER,
+        "svc",
+    )
+    res = handler(db, cmd)
+    assert res.accepted is False
+    assert "human" in res.denied_reason
+    # nothing was appended: no terminal CONFIRMED/REJECTED event on the fact stream
+    assert not _has_event(db, "grain", event_type)
+
+
+def test_four_eyes_proposer_cannot_confirm_own_draft(db, catalog):
+    """Four-eyes SoD (§6.5): the proposer may not confirm the same fact. ALICE is BOTH the owner
+    (so the authority check passes) AND the proposer here, so `proposer_ne_confirmer` is the only
+    remaining blocker — remove it and ALICE self-confirms to VERIFIED.
+
+    Contrast: test_owner_confirms_draft_to_verified is the happy path with a DIFFERENT confirmer
+    (BOB proposes, ALICE confirms -> accepted)."""
+    catalog.set_owner(_orders(), "user:alice")
+    draft = _propose(db, actor=ALICE)  # proposed by the owner herself
+    res = confirm_fact(db, _confirm_cmd(target=draft, actor=ALICE))
+    assert res.accepted is False
+    assert "four-eyes" in res.denied_reason
+    # the authority check did NOT mask this: a non-owner confirmer would have failed on "authority".
+    stream = load_fact(db, fact_key(_orders(), "grain"))
+    assert not any(e.type == "OVERLAY_FACT_CONFIRMED" for e in stream)
+    assert fold_overlay_state(stream).status == "DRAFT"
+
+
+def test_reject_stale_target_event_id_is_denied(db, catalog):
+    """reject_fact CAS: a `target_event_id` that is not the current head is denied as stale and
+    nothing is appended (mirror of test_stale_target_event_id_is_denied for confirm)."""
+    catalog.set_owner(_orders(), "user:alice")
+    _propose(db)  # a real DRAFT exists, but we reject against a bogus (superseded) target
+    res = reject_fact(db, _reject_cmd(target="evt_does_not_exist", actor=ALICE))
+    assert res.accepted is False
+    assert "stale" in res.denied_reason
+    assert not _has_event(db, "grain", "OVERLAY_FACT_REJECTED")
+
+
+def test_reject_wrong_authority_is_denied(db, catalog):
+    """reject_fact authority: BOB is a human data_owner but NOT the resolved owner of `orders`
+    (ALICE is), so `_actor_is_authority` returns False and the rejection is denied with nothing
+    appended. Remove the authority check and BOB's rejection would succeed."""
+    catalog.set_owner(_orders(), "user:alice")
+    draft = _propose(db)  # proposed by BOB; rejected by BOB below (a non-owner human)
+    res = reject_fact(db, _reject_cmd(target=draft, actor=BOB))
+    assert res.accepted is False
+    assert "authority" in res.denied_reason
+    assert not _has_event(db, "grain", "OVERLAY_FACT_REJECTED")
