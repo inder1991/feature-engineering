@@ -326,12 +326,106 @@ def reject_fact(conn: DbConn, cmd: Command) -> CommandResult:
     return CommandResult(accepted=True, aggregate_id=key, produced_event_ids=(rejected.event_id,))
 
 
+def enter_fact(conn: DbConn, cmd: Command) -> CommandResult:
+    """Direct/proactive entry (§3.4): a HUMAN resolved authority self-confirms an owner-known fact.
+    An audited exception to four-eyes — never available to a service/profiler proposal, and never to
+    a dual-owner approved_join (which must use the two-task flow, §6.4)."""
+    adapter = current_catalog_adapter()
+    args = cmd.args
+    if cmd.actor.actor_kind != "human":
+        return CommandResult(
+            accepted=False,
+            aggregate_id="",
+            denied_reason="self-confirm (enter_fact) requires a human authority",
+        )
+    ref = args["ref"]
+    fact_type = args["fact_type"]
+    use_case = args.get("use_case")
+    proposed_value = args["proposed_value"]
+    try:
+        validate_fact_value(fact_type, proposed_value, use_case=use_case)
+    except FactValidationError as exc:
+        return CommandResult(
+            accepted=False, aggregate_id="", denied_reason=f"invalid fact value: {exc}"
+        )
+    key = fact_key(ref, fact_type, use_case)
+    authority = resolve_authority(conn, adapter, ref, fact_type)
+    if authority.dual:
+        return CommandResult(
+            accepted=False,
+            aggregate_id=key,
+            denied_reason="dual-owner approved_join cannot be self-confirmed; use the two-task flow",
+        )
+    if not _actor_is_authority(authority, cmd.actor):
+        return CommandResult(
+            accepted=False,
+            aggregate_id=key,
+            denied_reason="actor is not the resolved authority for this fact",
+        )
+    if load_fact(conn, key):
+        return CommandResult(
+            accepted=False, aggregate_id=key, denied_reason="fact already exists; use propose/confirm"
+        )
+    fp = proposal_fingerprint(proposed_value)
+    draft = append_overlay_event(
+        conn,
+        fact_key=key,
+        type="OVERLAY_FACT_PROPOSED",
+        payload={
+            "catalog_object_ref": asdict(ref),
+            "object_ref": display_object_ref(ref),
+            "fact_type": fact_type,
+            "use_case": use_case,
+            "proposed_value": proposed_value,
+            "proposal_fingerprint": fp,
+            "evidence_ref": None,
+            "proposed_by": cmd.actor.subject,
+        },
+        actor=cmd.actor,
+        expected_version=0,
+    )
+    if fact_type == "approved_join":
+        # Same-owner-both-sides reaches this path (Authority.dual is False); record BOTH side roles
+        # for the one principal so audit attribution matches a two-owner join (finding 4).
+        confirmers = [
+            {"subject": cmd.actor.subject, "role": "data_owner_from"},
+            {"subject": cmd.actor.subject, "role": "data_owner_to"},
+        ]
+    else:
+        role = "compliance" if fact_type == "policy_tag" else "data_owner"
+        confirmers = [{"subject": cmd.actor.subject, "role": role}]
+    expires_at = datetime.now(UTC) + _DEFAULT_TTL
+    confirmed = append_overlay_event(
+        conn,
+        fact_key=key,
+        type="OVERLAY_FACT_CONFIRMED",
+        payload={
+            "value": proposed_value,
+            "confirmers": confirmers,
+            "expires_at": expires_at.isoformat(),
+            "confirms_event_id": draft.event_id,
+        },
+        actor=cmd.actor,
+        caused_by=draft.event_id,
+    )
+    # A self-confirmed fact reaches VERIFIED too, so it also gets an overlay_expiry timer (decision 5).
+    from featuregen.overlay.freshness import (
+        schedule_expiry,  # local import: freshness.py is created in Task 4.3
+    )
+
+    schedule_expiry(conn, key, confirmed.event_id, expires_at)
+    return CommandResult(
+        accepted=True, aggregate_id=key, produced_event_ids=(draft.event_id, confirmed.event_id)
+    )
+
+
 # `_OVERLAY_CATALOG` is a TUPLE of (action, handler) pairs (pin 12 — mirrors SP-0's `_CATALOG`),
-# NOT a dict. Task 4.3 inserts confirm_fact/reject_fact; Phase 6 appends ("run_profiler", ...).
+# NOT a dict. Phase 6 appends ("run_profiler", ...).
 _OVERLAY_CATALOG = (
     ("propose_fact", propose_fact),
     ("confirm_fact", confirm_fact),
     ("reject_fact", reject_fact),
+    ("enter_fact", enter_fact),
 )
 
 
