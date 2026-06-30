@@ -125,7 +125,7 @@ class OverlayProjection:
                     (fact_key, object_ref, fact_type, use_case, status, value, confirmers,
                      confirmed_at, expires_at, prior_value, confirmed_event_id, updated_seq)
                 SELECT %s, prop.object_ref, prop.fact_type, prop.use_case,
-                       'VERIFIED', %s, %s, now(), %s, NULL, %s, %s
+                       'VERIFIED', %s, %s, %s, %s, NULL, %s, %s
                 FROM overlay_proposal prop WHERE prop.fact_key = %s
                 ON CONFLICT (fact_key) DO UPDATE SET
                     status = 'VERIFIED',
@@ -140,7 +140,7 @@ class OverlayProjection:
                 """,
                 (
                     fk, Jsonb(payload["value"]), Jsonb(payload["confirmers"]),
-                    payload.get("expires_at"), event.event_id, seq, fk,
+                    event.occurred_at, payload.get("expires_at"), event.event_id, seq, fk,
                 ),
             )
             conn.execute(
