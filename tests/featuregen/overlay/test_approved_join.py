@@ -4,7 +4,12 @@ import pytest
 
 from featuregen.contracts import Command, ConcurrencyError
 from featuregen.identity.build import build_human_identity
-from featuregen.overlay.commands import confirm_fact, propose_fact, reject_fact
+from featuregen.overlay.commands import (
+    confirm_fact,
+    get_task_proposal,
+    propose_fact,
+    reject_fact,
+)
 from featuregen.overlay.freshness import fire_due_overlay_expiries
 from featuregen.overlay.identity import ApprovedJoinRef, CatalogObjectRef, ColumnPair, fact_key
 from featuregen.overlay.state import fold_overlay_state
@@ -200,16 +205,58 @@ def test_reverify_requires_both_owners_again(db, catalog, first_actor, second_ac
     assert first.accepted is True, first.denied_reason
     assert fold_overlay_state(load_fact(db, key)).status == "PARTIALLY_CONFIRMED"
 
-    # cycle 2, second re-confirm: once PARTIALLY_CONFIRMED, _cas_target binds to draft_event_id
-    # (the cycle's proposal id == `draft`, per the contract). The OTHER owner must also re-confirm
-    # to reach VERIFIED again.
-    second = _confirm(db, target=draft, actor=second_actor, key="rc2")
+    # cycle 2, second re-confirm: the re-verify cycle's CAS target is cycle-stable at the prior
+    # confirmed_event_id (the id the per-side re-verify tasks are stamped with), so once
+    # PARTIALLY_CONFIRMED it stays at `confirmed_id` (P1a). The OTHER owner must also re-confirm
+    # to reach VERIFIED again, using the target their OWN task exposes (not a hand-fed draft id).
+    second = _confirm(db, target=confirmed_id, actor=second_actor, key="rc2")
     assert second.accepted is True, second.denied_reason
     stream = load_fact(db, key)
     assert fold_overlay_state(stream).status == "VERIFIED"
     confirmed = [e for e in stream if e.type == "OVERLAY_FACT_CONFIRMED"][-1]
     subjects = {c["subject"] for c in confirmed.payload["confirmers"]}
     assert subjects == {"user:alice", "user:bob"}
+
+
+@pytest.mark.parametrize(("first", "second"), [(ALICE, BOB), (BOB, ALICE)])
+def test_reverify_second_owner_uses_task_scoped_target(db, catalog, first, second):
+    """P1a: a two-owner approved_join re-verify cycle must complete using each owner's OWN
+    task-scoped target from get_task_proposal. After expiry the per-side re-verify tasks are both
+    stamped with the prior confirmed_event_id (C). The first re-confirm moves the fact to
+    PARTIALLY_CONFIRMED; the second owner then reads its still-open task (still target=C) and must
+    be accepted. Pre-fix the CAS target flipped to the draft id (D) at PARTIALLY_CONFIRMED, so the
+    second owner's task target C != D and the second re-confirm was wrongly denied as stale,
+    stranding the join. Driving both owners from their real task targets is what exposes the bug."""
+    catalog.set_owner(_orders(), "user:alice")
+    catalog.set_owner(_customers(), "user:bob")
+    draft = _propose(db)
+    key = fact_key(_ref(), "approved_join")
+    assert _confirm(db, target=draft, actor=ALICE, key="c1").accepted is True
+    assert _confirm(db, target=draft, actor=BOB, key="c2").accepted is True
+    assert fire_due_overlay_expiries(db, now=datetime.now(UTC) + timedelta(days=200)) == 1
+    assert fold_overlay_state(load_fact(db, key)).status == "REVERIFY"
+
+    def task_target(actor):
+        (task_id,) = db.execute(
+            "SELECT task_id FROM human_tasks "
+            "WHERE fact_key=%s AND status='open' AND eligible_assignees->>'subject'=%s",
+            (key, actor.subject),
+        ).fetchone()
+        return get_task_proposal(db, task_id, actor)["target_event_id"]
+
+    # First re-confirmer uses the target their task exposes -> PARTIALLY_CONFIRMED.
+    r1 = _confirm(db, target=task_target(first), actor=first, key="rc1")
+    assert r1.accepted is True, r1.denied_reason
+    assert fold_overlay_state(load_fact(db, key)).status == "PARTIALLY_CONFIRMED"
+
+    # Second re-confirmer reads its OWN task target AFTER the partial, like a real assignee.
+    # Pre-fix: that target is the old confirmed id C while _cas_target is draft id D -> denied.
+    r2 = _confirm(db, target=task_target(second), actor=second, key="rc2")
+    assert r2.accepted is True, r2.denied_reason  # FAILS pre-fix
+    stream = load_fact(db, key)
+    assert fold_overlay_state(stream).status == "VERIFIED"
+    confirmed = [e for e in stream if e.type == "OVERLAY_FACT_CONFIRMED"][-1]
+    assert {c["subject"] for c in confirmed.payload["confirmers"]} == {"user:alice", "user:bob"}
 
 
 def test_mixed_two_admins_cannot_bypass_known_owner(db, catalog):

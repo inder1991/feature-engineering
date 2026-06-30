@@ -64,11 +64,17 @@ def _latest_proposed(stream):
 def _cas_target(state) -> str | None:
     """The event id a confirm/reject must CAS against — the current head of the fact (§6.3).
 
-    DRAFT/PARTIALLY_CONFIRMED bind to the open draft (`draft_event_id`); REVERIFY/STALE bind to
-    the confirmed event being re-verified (`confirmed_event_id`). A `target_event_id` that does not
-    match this id has been superseded by a newer draft/confirmation and is denied as stale."""
-    if state.status in ("DRAFT", "PARTIALLY_CONFIRMED"):
+    DRAFT binds to the open draft (`draft_event_id`); REVERIFY/STALE bind to the confirmed event
+    being re-verified (`confirmed_event_id`). A `target_event_id` that does not match this id has
+    been superseded by a newer draft/confirmation and is denied as stale."""
+    if state.status == "DRAFT":
         return state.draft_event_id
+    if state.status == "PARTIALLY_CONFIRMED":
+        # Re-verify cycle carries the prior confirmed_event_id (the id the per-side re-verify tasks
+        # are stamped with by freshness.open_reverify_task); keep it as the cycle-stable CAS target
+        # so the SECOND re-confirmer's task-scoped target still matches after the first partial (P1a).
+        # The initial cycle has no prior confirmation (cleared on PROPOSED) -> bind to the open draft.
+        return state.confirmed_event_id or state.draft_event_id
     return state.confirmed_event_id
 
 
