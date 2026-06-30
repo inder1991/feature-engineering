@@ -259,6 +259,41 @@ def test_reverify_second_owner_uses_task_scoped_target(db, catalog, first, secon
     assert {c["subject"] for c in confirmed.payload["confirmers"]} == {"user:alice", "user:bob"}
 
 
+def test_reverify_confirmed_threads_prior_confirmed_not_draft(db, catalog):
+    """F7: a dual-owner approved_join re-verify's FINAL OVERLAY_FACT_CONFIRMED must thread the PRIOR
+    confirmed event (confirms_event_id + caused_by), not the original cycle-1 draft. _cas_target is
+    cycle-stable (PARTIALLY_CONFIRMED -> confirmed_event_id or draft_event_id): cycle 1 yields the
+    draft (unchanged), a reverify cycle yields the prior confirmed id — matching single-fact confirm.
+    Pre-fix both fields hard-coded state.draft_event_id, corrupting audit causality every reverify."""
+    catalog.set_owner(_orders(), "user:alice")
+    catalog.set_owner(_customers(), "user:bob")
+    draft = _propose(db)
+    key = fact_key(_ref(), "approved_join")
+
+    # cycle 1: both owners confirm -> VERIFIED; the CONFIRMED threads the draft (unchanged behavior)
+    assert _confirm(db, target=draft, actor=ALICE, key="c1").accepted is True
+    assert _confirm(db, target=draft, actor=BOB, key="c2").accepted is True
+    stream = load_fact(db, key)
+    c1 = [e for e in stream if e.type == "OVERLAY_FACT_CONFIRMED"][-1]
+    assert c1.payload["confirms_event_id"] == draft
+    assert c1.caused_by == draft
+    confirmed_id = c1.event_id
+
+    # expire the (future-dated) timer -> REVERIFY
+    assert fire_due_overlay_expiries(db, now=datetime.now(UTC) + timedelta(days=200)) == 1
+    assert fold_overlay_state(load_fact(db, key)).status == "REVERIFY"
+
+    # cycle 2: both owners re-confirm (CAS target = prior confirmed id) -> VERIFIED
+    assert _confirm(db, target=confirmed_id, actor=ALICE, key="rc1").accepted is True
+    assert _confirm(db, target=confirmed_id, actor=BOB, key="rc2").accepted is True
+    stream = load_fact(db, key)
+    c2 = [e for e in stream if e.type == "OVERLAY_FACT_CONFIRMED"][-1]
+    # F7: the re-verify CONFIRMED threads the PRIOR confirmed id, not the original draft.
+    assert c2.payload["confirms_event_id"] == confirmed_id
+    assert c2.caused_by == confirmed_id
+    assert c2.payload["confirms_event_id"] != draft
+
+
 def test_mixed_two_admins_cannot_bypass_known_owner(db, catalog):
     # The known owner's side must be confirmed by the owner: two platform-admins must NOT verify
     # a join that has a known owner (side-coverage guard, finding 3).

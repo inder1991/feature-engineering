@@ -437,6 +437,11 @@ def _confirm_approved_join(conn, cmd, key, stream, state, authority):
             accepted=False, aggregate_id=key, denied_reason=f"invalid confirmed value: {exc}"
         )
     expires_at = datetime.now(UTC) + _DEFAULT_TTL
+    # Thread the cycle-stable head (F7): _cas_target at PARTIALLY_CONFIRMED returns
+    # `confirmed_event_id or draft_event_id` — cycle 1 yields the draft (unchanged), a re-verify
+    # cycle yields the prior confirmed_event_id (the confirmation actually being re-verified), so the
+    # recorded causality (confirms_event_id + caused_by) matches single-fact confirm_fact.
+    confirms_event_id = _cas_target(state)
     confirmed = append_overlay_event(
         conn,
         fact_key=key,
@@ -445,10 +450,10 @@ def _confirm_approved_join(conn, cmd, key, stream, state, authority):
             "value": value,
             "confirmers": _join_confirmers(authority, first, actor.subject),
             "expires_at": expires_at.isoformat(),
-            "confirms_event_id": state.draft_event_id,
+            "confirms_event_id": confirms_event_id,
         },
         actor=actor,
-        caused_by=state.draft_event_id,
+        caused_by=confirms_event_id,
         expected_version=stream[-1].stream_version,  # pin OCC to the folded head (C2)
     )
     # local import: freshness.py is created in Task 4.3 (avoids a top-level forward dependency)
