@@ -1,10 +1,37 @@
+import pytest
+
 from featuregen.overlay.catalog import (
     CatalogFact,
     CatalogObject,
     FixtureCatalog,
     PostgresCatalog,
+    _clear_catalog_adapter,
+    current_catalog_adapter,
+    register_catalog_adapter,
 )
 from featuregen.overlay.identity import CatalogObjectRef
+
+
+def test_register_and_current_catalog_adapter():
+    _clear_catalog_adapter()
+    # Fails closed before anything is registered.
+    with pytest.raises(RuntimeError):
+        current_catalog_adapter()
+
+    cat = FixtureCatalog(catalog_source="pg:core")
+    register_catalog_adapter(cat)
+    # Same instance is returned (single source for propose_fact + run_profiler).
+    assert current_catalog_adapter() is cat
+
+    # A second registration replaces the first (last writer wins).
+    other = FixtureCatalog(catalog_source="pg:other")
+    register_catalog_adapter(other)
+    assert current_catalog_adapter() is other
+
+    # Test-only reset restores the fail-closed state.
+    _clear_catalog_adapter()
+    with pytest.raises(RuntimeError):
+        current_catalog_adapter()
 
 
 def test_fixture_catalog_objects_facts_and_owner():

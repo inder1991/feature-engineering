@@ -208,3 +208,36 @@ class PostgresCatalog:
 
     def fingerprint(self) -> Mapping[str, CatalogObject]:
         return {obj.object_ref: obj for obj in self.list_objects()}
+
+
+# --- Single-source overlay catalog adapter accessor ---------------------------------------
+# The process-wide adapter shared by ``propose_fact`` and ``run_profiler``. Mirrors the SP-0
+# ``register_command_authorizer`` / ``current_authorizer`` module-global pattern. This is the ONLY
+# holder for the overlay catalog adapter — downstream phases call ``current_catalog_adapter()``.
+_CATALOG_ADAPTER: CatalogAdapter | None = None
+
+
+def register_catalog_adapter(adapter: CatalogAdapter) -> None:
+    """Register the process-wide overlay ``CatalogAdapter`` (last writer wins)."""
+    global _CATALOG_ADAPTER
+    _CATALOG_ADAPTER = adapter
+
+
+def current_catalog_adapter() -> CatalogAdapter:
+    """Return the registered overlay ``CatalogAdapter``.
+
+    Fails closed: raises ``RuntimeError`` if no adapter has been registered, so callers never
+    resolve facts against a missing catalog.
+    """
+    if _CATALOG_ADAPTER is None:
+        raise RuntimeError(
+            "no catalog adapter registered; call register_catalog_adapter(...) "
+            "(register_overlay() does this in production)"
+        )
+    return _CATALOG_ADAPTER
+
+
+def _clear_catalog_adapter() -> None:
+    """Test-only reset of the module-global adapter (call from the overlay conftest)."""
+    global _CATALOG_ADAPTER
+    _CATALOG_ADAPTER = None
