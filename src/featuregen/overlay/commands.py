@@ -68,13 +68,26 @@ def _cas_target(state) -> str | None:
     return state.confirmed_event_id
 
 
-def _close_fact_tasks(conn: DbConn, fact_key: str, *, reason: str) -> None:
-    """Cancel every OPEN human-gate task for `fact_key` (and void its scheduled timers), called by
-    the same confirm/reject command that resolves the fact so the task is never left dangling."""
-    rows = conn.execute(
-        "SELECT task_id FROM human_tasks WHERE fact_key=%s AND status='open'",
-        (fact_key,),
-    ).fetchall()
+def _close_fact_tasks(
+    conn: DbConn, fact_key: str, *, reason: str, subject: str | None = None
+) -> None:
+    """Cancel OPEN human-gate tasks for `fact_key` (and void their scheduled timers), called by
+    the same confirm/reject command that resolves the fact so a task is never left dangling.
+
+    With `subject` set, only that assignee's side task is closed (matched on the task's
+    `eligible_assignees->>'subject'`) — used by the approved_join PARTIALLY_CONFIRMED step so the
+    OTHER side's task stays open for the second owner (decision 7). Default closes every open task."""
+    if subject is None:
+        rows = conn.execute(
+            "SELECT task_id FROM human_tasks WHERE fact_key=%s AND status='open'",
+            (fact_key,),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT task_id FROM human_tasks "
+            "WHERE fact_key=%s AND status='open' AND eligible_assignees->>'subject'=%s",
+            (fact_key, subject),
+        ).fetchall()
     for (task_id,) in rows:
         cancel_task(conn, task_id, reason=reason)
 
@@ -209,6 +222,11 @@ def confirm_fact(conn: DbConn, cmd: Command) -> CommandResult:
             denied_reason="stale confirmation: target_event_id has been superseded",
         )
     authority = resolve_authority(conn, adapter, ref, fact_type)
+    # Dual-owner approved_join (two distinct confirmations required) follows the two-step
+    # PARTIALLY_CONFIRMED -> VERIFIED flow (Task 4.5, §6.4). Same-owner-both-sides has
+    # `authority.dual` False and falls through to the single path below.
+    if fact_type == "approved_join" and authority.dual:
+        return _confirm_approved_join(conn, cmd, key, stream, state, authority)
     if not _actor_is_authority(authority, cmd.actor):
         return CommandResult(
             accepted=False,
@@ -265,6 +283,116 @@ def confirm_fact(conn: DbConn, cmd: Command) -> CommandResult:
 
     schedule_expiry(conn, key, confirmed.event_id, expires_at)
     _close_fact_tasks(conn, key, reason="fact confirmed")
+    return CommandResult(accepted=True, aggregate_id=key, produced_event_ids=(confirmed.event_id,))
+
+
+def _join_side(authority, subject) -> str:
+    """The join side (`from`/`to`) a confirmer covers, derived from the side-ordered
+    `authority.subjects` (None marks an unknown/governance side) — NOT confirmation order."""
+    subs = list(authority.subjects)  # ordered (from, to)
+    if subs and subs[0] == subject:
+        return "from"
+    if len(subs) > 1 and subs[1] == subject:
+        return "to"
+    if subs and subs[0] is None:        # a platform-admin covers the unknown side
+        return "from"
+    if len(subs) > 1 and subs[1] is None:
+        return "to"
+    return "from"
+
+
+def _join_confirmers(authority, first_subject, second_subject) -> list:
+    first_side = _join_side(authority, first_subject)
+    second_side = _join_side(authority, second_subject)
+    if first_side == second_side:       # both governance/unknown — disambiguate by order
+        second_side = "to" if first_side == "from" else "from"
+    return [
+        {"subject": first_subject, "role": f"data_owner_{first_side}"},
+        {"subject": second_subject, "role": f"data_owner_{second_side}"},
+    ]
+
+
+def _confirm_approved_join(conn, cmd, key, stream, state, authority):
+    """Dual-owner approved_join confirmation (§6.4). The FIRST authorized confirmer appends
+    OVERLAY_FACT_PARTIALLY_CONFIRMED (recording their side) and closes their task; the SECOND
+    (a DISTINCT subject covering the OTHER side) validates the final value and appends
+    OVERLAY_FACT_CONFIRMED recording BOTH confirmers, arms expiry, and closes the remaining task."""
+    actor = cmd.actor
+    owners = {s for s in authority.subjects if s}
+    # A mixed join (one known owner + one unknown/governance side) requires a platform-admin to act
+    # for the governance side; otherwise only the resolved owners may confirm (decision 7).
+    is_owner = actor.subject in owners
+    is_governance = authority.governance_queue and "platform-admin" in actor.role_claims
+    if not (is_owner or is_governance):
+        return CommandResult(
+            accepted=False, aggregate_id=key, denied_reason="actor is not an owner of either side of the join"
+        )
+    if not proposer_ne_confirmer(stream, actor):
+        return CommandResult(
+            accepted=False, aggregate_id=key, denied_reason="proposer may not confirm (four-eyes, §6.5)"
+        )
+    partial = [e for e in stream if e.type == "OVERLAY_FACT_PARTIALLY_CONFIRMED"]
+    proposed = _latest_proposed(stream)
+    if not partial:
+        evt = append_overlay_event(
+            conn,
+            fact_key=key,
+            type="OVERLAY_FACT_PARTIALLY_CONFIRMED",
+            payload={
+                "by_owner": actor.subject,
+                "role": f"data_owner_{_join_side(authority, actor.subject)}",
+                "draft_event_id": state.draft_event_id,
+            },
+            actor=actor,
+            caused_by=state.draft_event_id,
+        )
+        _close_fact_tasks(conn, key, subject=actor.subject, reason="first owner confirmed (partial)")
+        return CommandResult(accepted=True, aggregate_id=key, produced_event_ids=(evt.event_id,))
+    first = partial[-1].payload["by_owner"]
+    if actor.subject == first:
+        return CommandResult(
+            accepted=False,
+            aggregate_id=key,
+            denied_reason="this owner already confirmed; awaiting the other owner",
+        )
+    # Side coverage (finding 3): when one side has a KNOWN owner and the other routes to the
+    # governance queue, the two confirmations must be one owner + one platform-admin. Two
+    # platform-admins must NOT verify a join that has a known owner (that bypasses the owner's side).
+    if authority.governance_queue and owners:
+        if first not in owners and actor.subject not in owners:
+            return CommandResult(
+                accepted=False,
+                aggregate_id=key,
+                denied_reason="a known owner must confirm their side of the join",
+            )
+    # Validate the FINAL value before the second-owner CONFIRMED append (pin 17 — the join confirm
+    # path validates too, even though approved_join takes no override).
+    value = proposed.payload["proposed_value"]
+    try:
+        validate_fact_value("approved_join", value)
+    except FactValidationError as exc:
+        return CommandResult(
+            accepted=False, aggregate_id=key, denied_reason=f"invalid confirmed value: {exc}"
+        )
+    expires_at = datetime.now(UTC) + _DEFAULT_TTL
+    confirmed = append_overlay_event(
+        conn,
+        fact_key=key,
+        type="OVERLAY_FACT_CONFIRMED",
+        payload={
+            "value": value,
+            "confirmers": _join_confirmers(authority, first, actor.subject),
+            "expires_at": expires_at.isoformat(),
+            "confirms_event_id": state.draft_event_id,
+        },
+        actor=actor,
+        caused_by=state.draft_event_id,
+    )
+    # local import: freshness.py is created in Task 4.3 (avoids a top-level forward dependency)
+    from featuregen.overlay.freshness import schedule_expiry
+
+    schedule_expiry(conn, key, confirmed.event_id, expires_at)  # arm overlay_expiry (decision 5)
+    _close_fact_tasks(conn, key, reason="join fully confirmed")
     return CommandResult(accepted=True, aggregate_id=key, produced_event_ids=(confirmed.event_id,))
 
 
