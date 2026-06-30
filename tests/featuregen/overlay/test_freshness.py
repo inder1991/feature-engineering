@@ -114,7 +114,7 @@ def _seed_verified(conn, *, ref, fact_type, value, owner, use_case=None):
 def test_open_reverify_task_opens_data_owner_gate_targeting_confirmed_event(db):
     ref = _table_ref()
     key, confirmed_id = _seed_verified(
-        db, ref=ref, fact_type="grain", value={"columns": ["customer_id"]}, owner="user:owner-a"
+        db, ref=ref, fact_type="grain", value={"columns": ["customer_id"], "is_unique": True}, owner="user:owner-a"
     )
     # FixtureCatalog API (pin 15): catalog_source ctor + add_object(...) / set_owner(ref, ...)
     adapter = FixtureCatalog(catalog_source="pg:core")
@@ -253,7 +253,7 @@ def _grain_adapter(ref):
 def test_fire_due_overlay_expiries_emits_expired_and_opens_reverify_task(db):
     ref = _table_ref()
     key, confirmed_id = _seed_verified(
-        db, ref=ref, fact_type="grain", value={"columns": ["customer_id"]}, owner="user:owner-a"
+        db, ref=ref, fact_type="grain", value={"columns": ["customer_id"], "is_unique": True}, owner="user:owner-a"
     )
     # the poller resolves the adapter via the single-source accessor (decision 5)
     register_catalog_adapter(_grain_adapter(ref))
@@ -284,7 +284,7 @@ def test_fire_due_overlay_expiries_emits_expired_and_opens_reverify_task(db):
         state = cur.fetchone()
     assert state["status"] == "REVERIFY"
     assert state["value"] is None
-    assert state["prior_value"] == {"columns": ["customer_id"]}
+    assert state["prior_value"] == {"columns": ["customer_id"], "is_unique": True}
     # a re-verify task is open for this fact
     with db.cursor(row_factory=dict_row) as cur:
         cur.execute(
@@ -301,7 +301,7 @@ def test_stale_expiry_timer_is_noop_when_newer_confirm_supersedes_target(db):
 
     ref = _table_ref()
     key, first_confirmed_id = _seed_verified(
-        db, ref=ref, fact_type="grain", value={"columns": ["customer_id"]}, owner="user:owner-a"
+        db, ref=ref, fact_type="grain", value={"columns": ["customer_id"], "is_unique": True}, owner="user:owner-a"
     )
     register_catalog_adapter(_grain_adapter(ref))
     # the OLD timer was armed against the original confirmation, due in the past
@@ -314,7 +314,7 @@ def test_stale_expiry_timer_is_noop_when_newer_confirm_supersedes_target(db):
         type=OVERLAY_FACT_CONFIRMED,
         actor=confirmer,
         payload={
-            "value": {"columns": ["customer_id"]},
+            "value": {"columns": ["customer_id"], "is_unique": True},
             "confirmers": [{"subject": "user:owner-a", "role": "data_owner"}],
             "expires_at": (datetime.now(UTC) + timedelta(days=30)).isoformat(),
             "confirms_event_id": first_confirmed_id,
@@ -382,11 +382,12 @@ def test_drop_referenced_column_stales_grain_availability_and_join_source_side(d
     src_col = _col_ref("cust_id", "accounts")
     # grain + availability_time on accounts both reference core.accounts.cust_id
     grain_key, _ = _seed_verified(
-        db, ref=acct, fact_type="grain", value={"columns": ["cust_id"]}, owner="user:owner-a",
+        db, ref=acct, fact_type="grain",
+        value={"columns": ["cust_id"], "is_unique": True}, owner="user:owner-a",
     )
     avail_key, _ = _seed_verified(
         db, ref=acct, fact_type="availability_time",
-        value={"column": "cust_id"}, owner="user:owner-a",
+        value={"column": "cust_id", "basis": "posted_at"}, owner="user:owner-a",
     )
     # an approved_join whose from_col is core.accounts.cust_id — indexed via column_pairs
     # (not from_columns/to_columns, not the display relation string)
@@ -434,7 +435,7 @@ def test_rename_yields_new_key_and_stales_old_fact(db):
     old_col = _col_ref("region", "customers")
     new_col = _col_ref("region_code", "customers")
     grain_key, _ = _seed_verified(
-        db, ref=cust, fact_type="grain", value={"columns": ["region"]}, owner="user:owner-a",
+        db, ref=cust, fact_type="grain", value={"columns": ["region"], "is_unique": True}, owner="user:owner-a",
     )
     owners = {cust: "user:owner-a"}
     # finding 16 / pin 16: region keeps the SAME stable "<table_oid>:<attnum>" id across the
@@ -462,7 +463,7 @@ def test_stale_signal_is_noop_when_fact_already_advanced(db):
     cust = _table_ref("customers")
     region = _col_ref("region", "customers")
     grain_key, confirmed_id = _seed_verified(
-        db, ref=cust, fact_type="grain", value={"columns": ["region"]}, owner="user:owner-a",
+        db, ref=cust, fact_type="grain", value={"columns": ["region"], "is_unique": True}, owner="user:owner-a",
     )
     owners = {cust: "user:owner-a"}
     before = [_obj(cust, oid="oid-cust"), _obj(region, data_type="text", oid="oid-cust:2")]
