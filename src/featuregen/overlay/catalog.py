@@ -11,6 +11,9 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
+from psycopg.rows import dict_row
+
+from featuregen.contracts.db import DbConn
 from featuregen.overlay.identity import CatalogObjectRef, display_object_ref
 
 
@@ -92,3 +95,116 @@ class FixtureCatalog:
 
     def fingerprint(self) -> Mapping[str, CatalogObject]:
         return dict(self._objects)
+
+
+class PostgresCatalog:
+    """Reference ``CatalogAdapter`` over a live PostgreSQL connection.
+
+    Structural metadata only: existence/columns/types from ``information_schema`` and stable
+    native object ids from ``pg_catalog`` (for rename detection, design §8 / overview pin 16) —
+    a table's ``native_oid`` is its ``pg_class.oid``; a column's ``native_oid`` is the composite
+    ``"<table_oid>:<attnum>"`` (``pg_attribute.attnum`` is not reused on rename, so column
+    identity survives renames). It records NONE of the five ML fact types, so ``get_fact``
+    returns ``None`` for all of them and the overlay owns those facts. ``owner_of`` returns
+    ``None`` (ownership is not recorded here).
+    """
+
+    def __init__(
+        self,
+        conn: DbConn,
+        *,
+        catalog_source: str = "pg:core",
+        schemas: tuple[str, ...] = ("public",),
+    ) -> None:
+        self._conn = conn
+        self._catalog_source = catalog_source
+        self._schemas = schemas
+
+    def list_objects(self) -> Iterable[CatalogObject]:
+        schemas = list(self._schemas)
+        objects: list[CatalogObject] = []
+        with self._conn.cursor(row_factory=dict_row) as cur:
+            # Tables/views with their stable native oid from pg_catalog.
+            cur.execute(
+                """
+                SELECT n.nspname AS sch, c.relname AS tbl, c.oid::text AS oid
+                FROM pg_catalog.pg_class c
+                JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+                WHERE c.relkind IN ('r', 'p', 'v', 'm')
+                  AND n.nspname = ANY(%s)
+                ORDER BY n.nspname, c.relname
+                """,
+                (schemas,),
+            )
+            for row in cur.fetchall():
+                ref = CatalogObjectRef(
+                    catalog_source=self._catalog_source,
+                    object_kind="table",
+                    schema=row["sch"],
+                    table=row["tbl"],
+                )
+                objects.append(
+                    CatalogObject(
+                        object_ref=display_object_ref(ref),
+                        object_kind="table",
+                        schema=row["sch"],
+                        table=row["tbl"],
+                        column=None,
+                        data_type=None,
+                        native_oid=row["oid"],
+                    )
+                )
+            # Columns with their information_schema data types, plus a stable composite
+            # native_oid of "<table_oid>:<attnum>" (design §8, overview pin 16). attnum is
+            # assigned at column creation and is NOT reused on rename, so the column's identity
+            # survives a rename — letting change detection track renames instead of degrading
+            # them to drop/add. The table oid (pg_class.oid) and attnum (pg_attribute.attnum)
+            # come from pg_catalog; data_type stays from information_schema for stable spelling.
+            cur.execute(
+                """
+                SELECT isc.table_schema AS sch, isc.table_name AS tbl,
+                       isc.column_name AS col, isc.data_type AS dtype,
+                       c.oid::text AS table_oid, a.attnum AS attnum
+                FROM information_schema.columns isc
+                JOIN pg_catalog.pg_namespace n ON n.nspname = isc.table_schema
+                JOIN pg_catalog.pg_class c
+                  ON c.relname = isc.table_name AND c.relnamespace = n.oid
+                JOIN pg_catalog.pg_attribute a
+                  ON a.attrelid = c.oid AND a.attname = isc.column_name
+                WHERE isc.table_schema = ANY(%s)
+                ORDER BY isc.table_schema, isc.table_name, isc.ordinal_position
+                """,
+                (schemas,),
+            )
+            for row in cur.fetchall():
+                ref = CatalogObjectRef(
+                    catalog_source=self._catalog_source,
+                    object_kind="column",
+                    schema=row["sch"],
+                    table=row["tbl"],
+                    column=row["col"],
+                )
+                objects.append(
+                    CatalogObject(
+                        object_ref=display_object_ref(ref),
+                        object_kind="column",
+                        schema=row["sch"],
+                        table=row["tbl"],
+                        column=row["col"],
+                        data_type=row["dtype"],
+                        native_oid=f"{row['table_oid']}:{row['attnum']}",
+                    )
+                )
+        return objects
+
+    def get_fact(
+        self, ref: CatalogObjectRef, fact_type: str, use_case: str | None = None
+    ) -> CatalogFact | None:
+        # information_schema records none of the five ML fact types authoritatively.
+        return None
+
+    def owner_of(self, ref: CatalogObjectRef) -> str | None:
+        return None
+
+    def fingerprint(self) -> Mapping[str, CatalogObject]:
+        return {obj.object_ref: obj for obj in self.list_objects()}
