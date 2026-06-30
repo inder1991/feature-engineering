@@ -9,6 +9,7 @@ from featuregen.identity.build import build_human_identity, build_service_identi
 from featuregen.overlay.bootstrap import register_overlay, seed_overlay_authz
 from featuregen.overlay.catalog import register_catalog_adapter
 from featuregen.overlay.identity import CatalogObjectRef, fact_key
+from featuregen.security.audit import verify_chain
 
 
 class _Registry:
@@ -98,6 +99,126 @@ def test_wrong_role_is_denied_and_audited(db, catalog):
             "WHERE event_type='COMMAND_DENIED' AND attempted_action='propose_fact'"
         )
         assert cur.fetchone()["n"] == 1
+
+
+def _confirm_denied_count(db) -> int:
+    return db.execute(
+        "SELECT count(*) FROM security_audit "
+        "WHERE event_type='COMMAND_DENIED' AND attempted_action='confirm_fact'"
+    ).fetchone()[0]
+
+
+def test_handler_authority_denial_is_audited(db, catalog):
+    """F4: a fine-grained AUTHORITY denial inside the handler must write a tamper-evident
+    COMMAND_DENIED row (the coarse PolicyAuthorizer only audits role/kind/scope denials). carol
+    holds `compliance` -> PASSES coarse authz (confirm_fact has a compliance row) but is NOT the
+    resolved data-owner authority for orders (alice is), so the handler denies in-line."""
+    _wire(db, catalog)  # _orders() owned by user:alice; full execute_command path
+    svc = build_service_identity(
+        subject="service:profiler", role_claims=("overlay",), attestation="sig"
+    )
+    proposed = execute_command(
+        db,
+        Command(
+            "propose_fact",
+            "overlay_fact",
+            None,
+            {"ref": _orders(), "fact_type": "grain",
+             "proposed_value": {"columns": ["order_id"], "is_unique": True}},
+            svc,
+            "ik-propose",
+        ),
+    )
+    assert proposed.accepted is True, proposed.denied_reason
+    draft = proposed.produced_event_ids[0]
+    carol = build_human_identity(subject="user:carol", role_claims=("compliance",))
+    res = execute_command(
+        db,
+        Command(
+            "confirm_fact",
+            "overlay_fact",
+            None,
+            {"ref": _orders(), "fact_type": "grain", "target_event_id": draft},
+            carol,
+            "ik-wrong-authority",
+        ),
+    )
+    assert res.accepted is False
+    assert "authority" in res.denied_reason
+    assert _confirm_denied_count(db) == 1  # PRE-FIX: 0 -> FAILS
+    assert verify_chain(db) is True
+
+
+def test_handler_four_eyes_denial_is_audited(db, catalog):
+    """F4: a four-eyes (SoD) denial inside the handler must also be audited. alice owns orders and
+    proposes the fact, then attempts to confirm her own proposal -> proposer != confirmer fails."""
+    _wire(db, catalog)  # alice owns orders
+    alice = build_human_identity(subject="user:alice", role_claims=("data_owner",))
+    proposed = execute_command(
+        db,
+        Command(
+            "propose_fact",
+            "overlay_fact",
+            None,
+            {"ref": _orders(), "fact_type": "grain",
+             "proposed_value": {"columns": ["order_id"], "is_unique": True}},
+            alice,
+            "ik-propose-self",
+        ),
+    )
+    assert proposed.accepted is True, proposed.denied_reason
+    draft = proposed.produced_event_ids[0]
+    res = execute_command(
+        db,
+        Command(
+            "confirm_fact",
+            "overlay_fact",
+            None,
+            {"ref": _orders(), "fact_type": "grain", "target_event_id": draft},
+            alice,
+            "ik-selfconfirm",
+        ),
+    )
+    assert res.accepted is False and "four-eyes" in res.denied_reason
+    assert _confirm_denied_count(db) == 1  # PRE-FIX: 0 -> FAILS
+    assert verify_chain(db) is True
+
+
+def test_handler_benign_cas_stale_denial_is_not_audited(db, catalog):
+    """F4 guard: a BENIGN CAS-stale denial (concurrency/optimistic-lock, not an authority/SoD
+    violation) must NOT be audited — the fix must not over-audit. The legit owner alice confirms
+    against a bogus target_event_id, which is denied before any authority check."""
+    _wire(db, catalog)  # alice owns orders
+    svc = build_service_identity(
+        subject="service:profiler", role_claims=("overlay",), attestation="sig"
+    )
+    proposed = execute_command(
+        db,
+        Command(
+            "propose_fact",
+            "overlay_fact",
+            None,
+            {"ref": _orders(), "fact_type": "grain",
+             "proposed_value": {"columns": ["order_id"], "is_unique": True}},
+            svc,
+            "ik-propose-benign",
+        ),
+    )
+    assert proposed.accepted is True, proposed.denied_reason
+    alice = build_human_identity(subject="user:alice", role_claims=("data_owner",))
+    res = execute_command(
+        db,
+        Command(
+            "confirm_fact",
+            "overlay_fact",
+            None,
+            {"ref": _orders(), "fact_type": "grain", "target_event_id": "evt_bogus_superseded"},
+            alice,
+            "ik-cas-stale",
+        ),
+    )
+    assert res.accepted is False and "stale" in res.denied_reason
+    assert _confirm_denied_count(db) == 0  # benign denial stays unaudited
 
 
 def _payments() -> CatalogObjectRef:
