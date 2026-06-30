@@ -1,9 +1,7 @@
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from itertools import combinations
 
 from psycopg import sql
 
@@ -11,11 +9,16 @@ from featuregen.contracts import DbConn
 from featuregen.overlay.catalog import CatalogAdapter, CatalogObject
 from featuregen.overlay.facts import validate_fact_value
 from featuregen.overlay.identity import CatalogObjectRef
+from featuregen.overlay.profiler_heuristics import (
+    GRAIN,
+    Proposal,
+    _combination_grain,
+    _grain_proposal,
+)
 from featuregen.overlay.profiler_metrics import (
     _TIMESTAMP_TYPES,
     PROFILE_VERSION,
     _apply_statement_timeout,
-    _combination_distinct,
     _evidence,
     _profile_single,
     _sampling,
@@ -32,7 +35,6 @@ __all__ = [
     "SCD_EFFECTIVE_DATING",
 ]
 
-GRAIN = "grain"
 AVAILABILITY_TIME = "availability_time"
 SCD_EFFECTIVE_DATING = "scd_effective_dating"
 
@@ -55,15 +57,6 @@ class ProfilerLimits:
     sample_size: int = 100_000
 
 
-@dataclass(frozen=True, slots=True)
-class Proposal:
-    ref: CatalogObjectRef
-    fact_type: str
-    proposed_value: Mapping[str, object]
-    evidence_metrics: Mapping[str, object]
-    use_case: str | None = None
-
-
 def _now() -> datetime:
     return datetime.now(UTC)
 
@@ -81,78 +74,6 @@ def _availability_basis(column: str) -> str:
     if "post" in lowered:
         return "posted_at"
     return "ingested_at"
-
-
-def _grain_proposal(
-    ref: CatalogObjectRef,
-    columns: Sequence[str],
-    *,
-    distinct_count: int,
-    null_count: int,
-    scanned: int,
-    row_count: int,
-    sample_size: int,
-    table_snapshot_at: datetime,
-    limits: ProfilerLimits,
-) -> Proposal:
-    ratio = round(distinct_count / scanned, 6) if scanned else 0.0
-    proposed_value = {"columns": list(columns), "is_unique": ratio == 1.0}
-    validate_fact_value(GRAIN, proposed_value)
-    metric_values = {
-        "distinct_count": distinct_count,
-        "null_count": null_count,
-        "uniqueness_ratio": ratio,
-        "column_count": len(columns),
-    }
-    return Proposal(
-        ref=ref,
-        fact_type=GRAIN,
-        proposed_value=proposed_value,
-        evidence_metrics=_evidence(
-            row_count=row_count,
-            sample_size=sample_size,
-            table_snapshot_at=table_snapshot_at,
-            limits=limits,
-            metric_values=metric_values,
-        ),
-    )
-
-
-def _combination_grain(
-    conn: DbConn,
-    ref: CatalogObjectRef,
-    columns: Sequence[CatalogObject],
-    *,
-    row_count: int,
-    sample_size: int,
-    table_snapshot_at: datetime,
-    limits: ProfilerLimits,
-    sample: sql.Composable,
-) -> list[Proposal]:
-    proposals: list[Proposal] = []
-    probed = 0
-    names = [c.column for c in columns]
-    for pair in combinations(names, 2):
-        if probed >= limits.max_column_combinations:
-            break
-        probed += 1
-        n, distinct_count = _combination_distinct(conn, ref, pair, sample=sample)
-        ratio = distinct_count / n if n else 0.0
-        if ratio >= limits.uniqueness_threshold:
-            proposals.append(
-                _grain_proposal(
-                    ref,
-                    list(pair),
-                    distinct_count=distinct_count,
-                    null_count=0,
-                    scanned=n,
-                    row_count=row_count,
-                    sample_size=sample_size,
-                    table_snapshot_at=table_snapshot_at,
-                    limits=limits,
-                )
-            )
-    return proposals
 
 
 def run_profiler_scan(
