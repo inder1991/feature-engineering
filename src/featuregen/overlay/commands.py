@@ -501,6 +501,17 @@ def enter_fact(conn: DbConn, cmd: Command) -> CommandResult:
         )
     key = fact_key(ref, fact_type, use_case)
     authority = resolve_authority(conn, adapter, ref, fact_type)
+    # Direct self-confirm is restricted to OWNER-KNOWN facts (§3.4): there is no platform-admin
+    # enter_fact authz row (only data_owner/compliance), so an unowned fact — which resolves to the
+    # governance/platform-admin queue — must NOT be single-party self-asserted (I2). A principal
+    # holding both data_owner and platform-admin would otherwise clear `_actor_is_authority`'s
+    # governance branch and bypass the two-party propose->confirm path. Route it through propose.
+    if authority.governance_queue:
+        return CommandResult(
+            accepted=False,
+            aggregate_id=key,
+            denied_reason="unowned (governance-queue) fact cannot be self-confirmed; use propose/confirm",
+        )
     if authority.dual:
         return CommandResult(
             accepted=False,
