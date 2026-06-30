@@ -100,15 +100,21 @@ def poll_due_timers(
     """Claim due AND overdue scheduled timers (fire_at <= now) plus timers whose lease has
     expired, via FOR UPDATE SKIP LOCKED so concurrent pollers never double-claim (§5.5).
     Overdue timers are picked up here regardless of how far past, giving crash-recovery
-    catch-up. Returns the claimed timer_ids (status -> 'leased')."""
+    catch-up. Returns the claimed timer_ids (status -> 'leased').
+
+    `overlay_expiry` timers are EXCLUDED (I5): they are driven by the dedicated
+    `fire_due_overlay_expiries` poller (decision 5) and have NO `timer.overlay_expiry`
+    handler, so leasing one here would route it to a missing handler (poison loop) and the
+    fact would never expire."""
     lease_until = now + timedelta(seconds=lease_seconds)
     with conn.cursor() as cur:
         cur.execute(
             """
             WITH due AS (
                 SELECT timer_id FROM timers
-                 WHERE (status = 'scheduled' AND fire_at <= %s)
-                    OR (status = 'leased' AND lease_expires_at < %s)
+                 WHERE kind <> 'overlay_expiry'
+                   AND ((status = 'scheduled' AND fire_at <= %s)
+                        OR (status = 'leased' AND lease_expires_at < %s))
                  ORDER BY fire_at
                  FOR UPDATE SKIP LOCKED
                  LIMIT %s
@@ -146,7 +152,7 @@ def _default_task_version(conn: DbConn, task_id: str) -> int | None:
 class TimerFireOutcome:
     timer_id: str
     fired: bool
-    suppressed_reason: str | None = None  # already_fired|cas_mismatch|task_closed|not_found
+    suppressed_reason: str | None = None  # already_fired|cas_mismatch|task_closed|not_found|overlay_expiry
 
 
 def fire_timer(
@@ -160,7 +166,11 @@ def fire_timer(
     timer guards a task whose required_inputs changed (task_version bumped) or that is no
     longer open, the timer is voided ('cancelled') and produces NO effect — a late timer
     cannot escalate an answered/changed gate. Otherwise it enqueues exactly one work message
-    keyed by idempotency_key (overdue re-fire => one effect) and marks the timer 'fired'."""
+    keyed by idempotency_key (overdue re-fire => one effect) and marks the timer 'fired'.
+
+    `overlay_expiry` timers are a defensive no-op here (I5): they are owned by the dedicated
+    `fire_due_overlay_expiries` poller (decision 5) and have no `timer.overlay_expiry` handler,
+    so this generic driver must never route one (poll_due_timers already excludes them)."""
     with conn.cursor() as cur:
         cur.execute(
             "SELECT idempotency_key, aggregate, aggregate_id, task_id, kind, cas_task_version, status "
@@ -171,6 +181,10 @@ def fire_timer(
         if row is None:
             return TimerFireOutcome(timer_id, False, "not_found")
         idem, aggregate, aggregate_id, task_id, kind, cas_version, status = row
+        if kind == "overlay_expiry":
+            # Owned by fire_due_overlay_expiries (decision 5); no generic handler exists. Leave the
+            # timer untouched (scheduled) so the dedicated poller still processes it.
+            return TimerFireOutcome(timer_id, False, "overlay_expiry")
         if status == "fired":
             return TimerFireOutcome(timer_id, False, "already_fired")
         if status == "cancelled":

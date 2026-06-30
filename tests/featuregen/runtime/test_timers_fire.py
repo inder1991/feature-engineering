@@ -90,6 +90,18 @@ def test_cancel_on_answer_voids_unfired_rungs(conn):
     assert out.fired is False and out.suppressed_reason == "task_closed"
 
 
+def test_fire_overlay_expiry_is_defensive_noop(conn):
+    """I5 (defense in depth): even if an overlay_expiry timer reaches fire_timer (it should never,
+    since poll_due_timers excludes it), fire_timer must NOT route it to the missing
+    `timer.overlay_expiry` handler. It no-ops — no queue row, timer left scheduled for the dedicated
+    `fire_due_overlay_expiries` poller (decision 5)."""
+    tid = _sched(conn, "k-ovl", kind="overlay_expiry")
+    out = fire_timer(conn, tid, now=NOW)
+    assert out.fired is False and out.suppressed_reason == "overlay_expiry"
+    assert _queue_count(conn, "k-ovl") == 0
+    assert _status(conn, tid) == "scheduled"  # untouched — the dedicated poller owns it
+
+
 def test_auto_park_rung_uses_canonical_handler(conn):
     # The ladder's auto_park rung must enqueue the SAME handler the cost breaker uses
     # ('runtime.auto_park', Task 10), NOT 'timer.auto_park' (§5.6 mirrors the §5.5 ladder),
