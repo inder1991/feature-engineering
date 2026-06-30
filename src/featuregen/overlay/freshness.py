@@ -2,8 +2,20 @@ from __future__ import annotations
 
 from datetime import datetime
 
+from psycopg.rows import dict_row
+
 from featuregen.contracts.db import DbConn
 from featuregen.contracts.envelopes import NewTimer
+from featuregen.contracts.errors import ConcurrencyError
+from featuregen.contracts.gates import GateTaskSpec
+from featuregen.gates.tasks import open_task
+from featuregen.identity.build import build_service_identity
+from featuregen.overlay.authority import resolve_authority
+from featuregen.overlay.catalog import current_catalog_adapter
+from featuregen.overlay.facts import OVERLAY_FACT_EXPIRED
+from featuregen.overlay.identity import ApprovedJoinRef, CatalogObjectRef, ColumnPair
+from featuregen.overlay.state import fold_overlay_state
+from featuregen.overlay.store import append_overlay_event, load_fact
 from featuregen.runtime.timers import schedule_timer
 
 
@@ -27,3 +39,146 @@ def schedule_expiry(
             payload={"confirmed_event_id": confirmed_event_id},
         ),
     )
+
+
+def open_reverify_task(
+    conn: DbConn,
+    *,
+    fact_key: str,
+    fact_type: str,
+    target_confirmed_event_id: str,
+    authority,
+    actor,
+) -> tuple[str, ...]:
+    """Reopen the §6 re-verification gate, CAS-bound to the fact's current confirmed_event_id
+    (stored as each task's target_event_id; a later confirm/reject is rejected if the fact has
+    since advanced). Opens one task **per resolved side** by iterating `authority.task_assignees`
+    (pin 19) — the SAME per-side plan the initial proposal used (Phase 4 Task 4.2): a
+    single-authority fact yields one task, an `approved_join` with two distinct owners yields one
+    task per side (an unknown side routes to the platform-admin/governance queue). The gate is
+    shared (`authority.gate` — `OVERLAY_DATA_OWNER` for data facts, `OVERLAY_COMPLIANCE` for
+    policy_tag). prior_value is NOT stored on human_tasks (it has no such column) — it is surfaced
+    through the overlay_proposal read model, which the projection sets to the prior value on
+    EXPIRED/STALED, and read back via get_task_proposal (Phase 4.6). Returns the opened task ids."""
+    del fact_type  # gate is taken from the resolved authority; kept for caller symmetry
+    task_ids: list[str] = []
+    for eligible in authority.task_assignees:
+        spec = GateTaskSpec(
+            gate=authority.gate,
+            required_inputs=("prior_value", "target_confirmed_event_id"),
+            eligible_assignees=dict(eligible),
+            allowed_responses=("confirm", "reject"),
+            fact_key=fact_key,
+            target_event_id=target_confirmed_event_id,
+        )
+        task_ids.append(open_task(conn, spec, actor))
+    return tuple(task_ids)
+
+
+def _ref_from_payload(d):
+    """Rebuild the typed ref stored on OVERLAY_FACT_PROPOSED.payload['catalog_object_ref']
+    (an asdict() of CatalogObjectRef, or of ApprovedJoinRef for approved_join)."""
+    if "column_pairs" in d:
+        return ApprovedJoinRef(
+            from_ref=CatalogObjectRef(**d["from_ref"]),
+            to_ref=CatalogObjectRef(**d["to_ref"]),
+            column_pairs=tuple(ColumnPair(**p) for p in d["column_pairs"]),
+            cardinality=d["cardinality"],
+        )
+    return CatalogObjectRef(**d)
+
+
+def _expiry_target_current(state, confirmed_event_id: str) -> bool:
+    """CAS predicate used by the expiry poller: the targeted confirmation is still the live
+    one iff the fact is VERIFIED and its confirmed_event_id equals the target. A newer
+    FACT_CONFIRMED advances confirmed_event_id, so a stale timer reads False here and the
+    timer becomes a no-op (it is still consumed/marked fired)."""
+    return (
+        state is not None
+        and state.status == "VERIFIED"
+        and state.confirmed_event_id == confirmed_event_id
+    )
+
+
+def _apply_expiry(conn: DbConn, adapter, *, fact_key: str, confirmed_event_id: str, actor) -> bool:
+    """Apply one due overlay_expiry timer's effect transactionally (§8). No-op (CAS) if a
+    newer FACT_CONFIRMED has superseded the targeted confirmation. Otherwise append
+    OVERLAY_FACT_EXPIRED (VERIFIED → REVERIFY) and open the re-verify task(s) for the resolved
+    authority (one task PER side for an approved_join, pin 19), carrying the target
+    confirmed_event_id (prior_value flows through the proposal projection → get_task_proposal,
+    Phase 4.6). Returns True iff OVERLAY_FACT_EXPIRED was appended."""
+    stream = load_fact(conn, fact_key)
+    if not stream:
+        return False
+    state = fold_overlay_state(stream)
+    if not _expiry_target_current(state, confirmed_event_id):
+        return False
+    try:
+        append_overlay_event(
+            conn,
+            fact_key=fact_key,
+            type=OVERLAY_FACT_EXPIRED,
+            payload={"expires_confirmed_event_id": confirmed_event_id},
+            actor=actor,
+            expected_version=stream[-1].stream_version,
+        )
+    except ConcurrencyError:
+        # a concurrent confirm advanced the stream between fold and append → stale timer
+        return False
+    ref = _ref_from_payload(stream[0].payload["catalog_object_ref"])
+    authority = resolve_authority(conn, adapter, ref, state.fact_type)
+    open_reverify_task(
+        conn,
+        fact_key=fact_key,
+        fact_type=state.fact_type,
+        target_confirmed_event_id=confirmed_event_id,
+        authority=authority,
+        actor=actor,
+    )
+    return True
+
+
+def fire_due_overlay_expiries(conn: DbConn, *, now: datetime) -> int:
+    """Explicit transactional poller (overview decision 5) — NOT a HandlerRegistry handler.
+    The SP-0 timer runtime can't carry fact_key/confirmed_event_id to an overlay handler
+    nor open a gate task, so freshness owns its own driver. SELECT due overlay_expiry timers
+    FOR UPDATE SKIP LOCKED (row locks are held by the transaction until commit, so multiple
+    pollers never double-process), and for each: read fact_key from the timer's aggregate_id
+    and confirmed_event_id from its payload, CAS-apply the expiry (append OVERLAY_FACT_EXPIRED
+    + open the re-verify task; no-op if a newer FACT_CONFIRMED superseded the target), and
+    mark the timer `fired`. The poller acts as a system service principal and resolves the
+    catalog adapter via the single-source accessor. Returns the number of OVERLAY_FACT_EXPIRED
+    events emitted; a superseded timer is consumed (marked fired) without emitting."""
+    actor = build_service_identity(
+        subject="service:overlay-freshness",
+        role_claims=("overlay",),
+        attestation="overlay-expiry-poller",
+    )
+    adapter = current_catalog_adapter()
+    fired = 0
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            """
+            SELECT timer_id, aggregate_id, payload
+            FROM timers
+            WHERE kind = 'overlay_expiry' AND status = 'scheduled' AND fire_at <= %s
+            FOR UPDATE SKIP LOCKED
+            """,
+            (now,),
+        )
+        due = cur.fetchall()
+    for row in due:
+        if _apply_expiry(
+            conn,
+            adapter,
+            fact_key=row["aggregate_id"],
+            confirmed_event_id=row["payload"]["confirmed_event_id"],
+            actor=actor,
+        ):
+            fired += 1
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE timers SET status = 'fired' WHERE timer_id = %s",
+                (row["timer_id"],),
+            )
+    return fired
