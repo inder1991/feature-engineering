@@ -210,21 +210,24 @@ class Authority:
 
     @property
     def task_assignees(self) -> tuple[dict[str, str], ...]:
-        """Per-side task plan — one `eligible_assignees` mapping per required confirmation. A known
-        side → `{"role": "data_owner", "subject": <owner>}`; an unknown side → `{"role": "platform-admin"}`
-        (governance). The known owner is NEVER folded onto the governance side (decision 7). Deduped
-        so same-owner-both-sides / both-unknown collapse to a single task."""
+        """Per-side task plan — one `eligible_assignees` mapping per required confirmation, **side-labelled**.
+        A known side → `{"role": "data_owner", "subject": <owner>, "side": <from|to>}`; an unknown side →
+        `{"role": "platform-admin", "side": <from|to>}` (governance). The known owner is NEVER folded onto
+        the governance side (decision 7). The two sides are **never collapsed** — even a both-unknown join
+        opens TWO side-labelled governance tasks, so two distinct approvals are required (finding 3). The
+        ONLY single-task case is same-owner-both-sides."""
         if self.role == "compliance":
             return ({"role": "compliance"},)
-        if len(self.subjects) == 2:  # approved_join: resolve per side
+        if len(self.subjects) == 2:  # approved_join: one task PER SIDE
+            from_owner, to_owner = self.subjects
+            if from_owner is not None and from_owner == to_owner:
+                return ({"role": "data_owner", "subject": from_owner},)  # same owner both sides — one task
             plans: list[dict[str, str]] = []
-            seen: set[tuple] = set()
-            for s in self.subjects:
-                plan = {"role": "data_owner", "subject": s} if s else {"role": "platform-admin"}
-                marker = tuple(sorted(plan.items()))
-                if marker not in seen:
-                    seen.add(marker)
-                    plans.append(plan)
+            for side, owner in (("from", from_owner), ("to", to_owner)):
+                if owner:
+                    plans.append({"role": "data_owner", "subject": owner, "side": side})
+                else:
+                    plans.append({"role": "platform-admin", "side": side})
             return tuple(plans)
         known = [s for s in self.subjects if s]
         if known:
@@ -251,17 +254,16 @@ def resolve_authority(
         to_owner = adapter.owner_of(ref.to_ref)
         unknown = from_owner is None or to_owner is None
         # One distinct confirmation per resolved side; an unknown side resolves to the governance
-        # (platform-admin) queue, NEVER to the other known owner (decision 7). `dual` counts the
-        # distinct (role, subject) sides — so a mixed (known + governance) join is dual.
-        sides = {
-            (("data_owner", o) if o else ("platform-admin", None)) for o in (from_owner, to_owner)
-        }
+        # (platform-admin) queue, NEVER to the other known owner (decision 7). A join needs TWO distinct
+        # confirmations unless ONE principal owns BOTH sides — so both-unknown is still dual (two distinct
+        # governance approvals), preserving two-party accountability (finding 3).
+        same_owner = from_owner is not None and from_owner == to_owner
         return Authority(
             role=("data_owner" if (from_owner or to_owner) else "platform-admin"),
             gate="OVERLAY_DATA_OWNER",
             subjects=(from_owner, to_owner),
             governance_queue=unknown,
-            dual=len(sides) > 1,
+            dual=not same_owner,
         )
     assert isinstance(ref, CatalogObjectRef)
     owner = adapter.owner_of(ref)
@@ -340,12 +342,12 @@ class StubCatalog:
         return {}
 
 
-@pytest.fixture(scope="session", autouse=True)
-def _register_overlay_commands_once():
-    # The COMMAND registry persists across tests (the root test harness resets only the event
-    # registry — decision 8), so register the overlay command catalog exactly ONCE per session.
-    # `register_overlay_commands()` is itself idempotent (skips already-registered actions), so this
-    # is safe even if the registry was already populated by another module earlier in the session.
+@pytest.fixture(autouse=True)
+def _register_overlay_commands():
+    # Re-register the overlay command catalog before EVERY overlay test (function-scoped). Other test
+    # modules call clear_registry(), so a session-scoped single registration could be wiped mid-session
+    # under randomized ordering (finding 7). register_overlay_commands() is idempotent (skips already-
+    # registered actions), so per-test registration is cheap and order-robust.
     register_overlay_commands()
 
 
@@ -1016,7 +1018,16 @@ def confirm_fact(conn: DbConn, cmd: Command) -> CommandResult:
         return CommandResult(
             accepted=False, aggregate_id=key, denied_reason=f"invalid confirmed value: {exc}"
         )
-    role = "compliance" if fact_type == "policy_tag" else "data_owner"
+    if fact_type == "approved_join":
+        # same-owner-both-sides reaches the single path (Authority.dual is False); record BOTH side
+        # roles for the one principal so audit attribution matches a two-owner join (finding 4).
+        confirmers = [
+            {"subject": cmd.actor.subject, "role": "data_owner_from"},
+            {"subject": cmd.actor.subject, "role": "data_owner_to"},
+        ]
+    else:
+        role = "compliance" if fact_type == "policy_tag" else "data_owner"
+        confirmers = [{"subject": cmd.actor.subject, "role": role}]
     expires_at = datetime.now(UTC) + _DEFAULT_TTL
     confirmed = append_overlay_event(
         conn,
@@ -1024,7 +1035,7 @@ def confirm_fact(conn: DbConn, cmd: Command) -> CommandResult:
         type="OVERLAY_FACT_CONFIRMED",
         payload={
             "value": value,
-            "confirmers": [{"subject": cmd.actor.subject, "role": role}],
+            "confirmers": confirmers,
             "expires_at": expires_at.isoformat(),
             "confirms_event_id": args["target_event_id"],
         },
@@ -1652,9 +1663,8 @@ def _propose_and_task(db):
     )
     assert res.accepted
     draft = res.produced_event_ids[0]
-    # get_task_proposal reads prior_value/target_event_id from the overlay_proposal read model, so
-    # the OverlayProjection (Phase 2) must run before the task-scoped read.
-    run_projection(db, OverlayProjection())
+    # No projection needed: get_task_proposal reads the CAS target from human_tasks and prior_value
+    # from the event stream (finding 1) — both synchronous.
     key = fact_key(_orders(), "grain")
     row = db.execute(
         "SELECT task_id FROM human_tasks WHERE fact_key=%s AND status='open'", (key,)
@@ -1694,12 +1704,15 @@ def get_task_proposal(conn: DbConn, task_id: str, actor) -> dict:
     to the task's assignee (eligible subject/role) or the governance role; denied to anyone else —
     distinct from the deferred end-user `resolve_fact` authz."""
     row = conn.execute(
-        "SELECT fact_key, eligible_assignees, evidence_ref FROM human_tasks WHERE task_id=%s",
+        "SELECT fact_key, eligible_assignees, evidence_ref, target_event_id, status "
+        "FROM human_tasks WHERE task_id=%s",
         (task_id,),
     ).fetchone()
     if row is None:
         raise OverlayCommandError(f"unknown task {task_id}")
-    key, eligible, evidence_ref = row
+    key, eligible, evidence_ref, target_event_id, status = row
+    if status != "open":
+        raise OverlayCommandError(f"task {task_id} is not open (status={status})")
     eligible = eligible or {}
     role = eligible.get("role")
     subject = eligible.get("subject")
@@ -1711,23 +1724,16 @@ def get_task_proposal(conn: DbConn, task_id: str, actor) -> dict:
     # "platform-admin"); it is NOT granted blanket read of every task's proposal (finding 4).
     if not authorized:
         raise OverlayCommandError("actor is not authorized to read this task proposal")
-    proposed = _latest_proposed(load_fact(conn, key))
+    stream = load_fact(conn, key)
+    proposed = _latest_proposed(stream)
     if proposed is None:
         raise OverlayCommandError(f"task {task_id} has no proposal on its fact stream")
     p = proposed.payload
-    # Prior value + the CAS target the confirmer must bind to come from the overlay_proposal read
-    # model (§7.2). For a fresh DRAFT the proposal's target_event_id is still NULL, so fall back to
-    # its draft_event_id (which IS the CAS target while awaiting first confirmation).
-    prow = conn.execute(
-        "SELECT prior_value, target_event_id, draft_event_id FROM overlay_proposal WHERE fact_key=%s",
-        (key,),
-    ).fetchone()
-    if prow is not None:
-        prior_value = prow[0]
-        target_event_id = prow[1] or prow[2]
-    else:
-        prior_value = None
-        target_event_id = None
+    # CAS target + prior value come from AUTHORITATIVE, synchronous sources — the task row and the
+    # event stream — NOT the asynchronous projection (finding 1). `target_event_id` is stamped on the
+    # task at open time (the draft id for a fresh DRAFT; the confirmed id under re-verification); the
+    # prior verified value is folded from the stream.
+    prior_value = fold_overlay_state(stream).prior_value
     return {
         "object_ref": p["object_ref"],
         "fact_type": p["fact_type"],

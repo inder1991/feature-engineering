@@ -51,6 +51,7 @@ class EventEnvelope:
     request_id: str | None = None
     feature_id: str | None = None
     run_id: str | None = None
+    overlay_fact_id: str | None = None
     caused_by: str | None = None
 
 
@@ -68,6 +69,7 @@ class NewEvent:
     request_id: str | None = None
     feature_id: str | None = None
     run_id: str | None = None
+    overlay_fact_id: str | None = None
     caused_by: str | None = None
     occurred_at: datetime | None = None
 
@@ -206,6 +208,10 @@ class GateTaskSpec:
     quorum_of_role: str | None = None
     delegation_allowed: bool = True
     sla: str | None = None
+    fact_key: str | None = None
+    draft_event_id: str | None = None
+    target_event_id: str | None = None
+    evidence_ref: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

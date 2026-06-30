@@ -40,6 +40,20 @@ def test_overdue_timer_claimed_on_recovery(conn):
     assert tid in claimed
 
 
+def test_overlay_expiry_not_leased_by_generic_poller(conn):
+    """I5: overlay_expiry timers are driven by the dedicated `fire_due_overlay_expiries` poller
+    (decision 5). The generic SP-0 poller must NEVER lease one — there is no `timer.overlay_expiry`
+    handler, so `fire_timer` would route it to a missing handler (poison loop) and the fact would
+    never expire. A due overlay_expiry timer must be EXCLUDED from poll_due_timers, while a due
+    generic timer of another kind is still claimed."""
+    overlay_tid = _schedule(conn, "ovl", NOW - timedelta(minutes=1), kind="overlay_expiry")
+    generic_tid = _schedule(conn, "gen", NOW - timedelta(minutes=1), kind="sla")
+    claimed = poll_due_timers(conn, owner="poller-a", lease_seconds=60, batch=10, now=NOW)
+    assert overlay_tid not in claimed
+    assert generic_tid in claimed
+    assert _status(conn, overlay_tid) == "scheduled"  # untouched, left for the dedicated poller
+
+
 def test_expired_lease_reclaimed(conn):
     tid = _schedule(conn, "stale-lease", NOW - timedelta(minutes=5))
     with conn.cursor() as cur:

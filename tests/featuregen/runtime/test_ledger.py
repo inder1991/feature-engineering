@@ -50,6 +50,10 @@ def test_watermark_zero_when_no_projections(db) -> None:
 
 def test_prune_deletes_below_min_checkpoint(db) -> None:
     with db.cursor() as cur:
+        # Migrations seed real projection checkpoints (e.g. 'overlay' at seq 0); bump any
+        # pre-existing rows above the values under test so the watermark is governed by the
+        # two projections this case explicitly exercises. Rolled back on teardown.
+        cur.execute("UPDATE projection_checkpoints SET checkpoint_seq = 1000000")
         cur.execute(
             "INSERT INTO projection_checkpoints (projection_name, checkpoint_seq, head_seq) "
             "VALUES ('p_a', 100, 100), ('p_b', 60, 200)"

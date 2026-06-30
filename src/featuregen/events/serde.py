@@ -94,5 +94,6 @@ def row_to_event(row: Mapping[str, Any]) -> EventEnvelope:
         request_id=row["request_id"],
         feature_id=row["feature_id"],
         run_id=row["run_id"],
+        overlay_fact_id=row["overlay_fact_id"],
         caused_by=row["caused_by"],
     )
