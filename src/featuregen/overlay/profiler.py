@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from itertools import combinations
 
 from psycopg import sql
 
@@ -142,6 +143,77 @@ def _grain_proposal(
     )
 
 
+def _apply_statement_timeout(conn: DbConn, limits: ProfilerLimits) -> None:
+    # SET LOCAL is transaction-scoped, so the bound is dropped when the scan's txn ends.
+    conn.execute(
+        sql.SQL("SET LOCAL statement_timeout = {}").format(sql.Literal(limits.statement_timeout_ms))
+    )
+
+
+def _sampling(row_count: int, limits: ProfilerLimits) -> tuple[int, sql.Composable]:
+    if row_count > limits.sample_threshold_rows:
+        # Allow sub-1% so the cap is REAL: flooring at 1.0 would scan ~1% of a huge table while
+        # reporting the nominal sample_size (finding 5). BERNOULLI accepts a sub-1 percentage.
+        pct = min(100.0, 100.0 * limits.sample_size / row_count)
+        return min(row_count, limits.sample_size), sql.SQL("TABLESAMPLE BERNOULLI ({})").format(
+            sql.Literal(pct)
+        )
+    return row_count, sql.SQL("")
+
+
+def _combination_distinct(
+    conn: DbConn, ref: CatalogObjectRef, columns: Sequence[str], *, sample: sql.Composable
+) -> tuple[int, int]:
+    cols = sql.SQL(", ").join(sql.Identifier(c) for c in columns)
+    # ONE materialized sampled CTE so count(*) and the grouped-distinct count are computed from the
+    # SAME Bernoulli sample — applying {sample} twice would draw two different samples and skew the
+    # uniqueness ratio (finding 6).
+    query = sql.SQL(
+        "WITH s AS MATERIALIZED (SELECT {cols} FROM {tbl} {sample}) "
+        "SELECT (SELECT count(*) FROM s) AS n, "
+        "(SELECT count(*) FROM (SELECT 1 FROM s GROUP BY {cols}) g) AS distinct_count"
+    ).format(tbl=sql.Identifier(ref.schema, ref.table), sample=sample, cols=cols)
+    n, distinct_count = conn.execute(query).fetchone()
+    return int(n), int(distinct_count)
+
+
+def _combination_grain(
+    conn: DbConn,
+    ref: CatalogObjectRef,
+    columns: Sequence[CatalogObject],
+    *,
+    row_count: int,
+    sample_size: int,
+    table_snapshot_at: datetime,
+    limits: ProfilerLimits,
+    sample: sql.Composable,
+) -> list[Proposal]:
+    proposals: list[Proposal] = []
+    probed = 0
+    names = [c.column for c in columns]
+    for pair in combinations(names, 2):
+        if probed >= limits.max_column_combinations:
+            break
+        probed += 1
+        n, distinct_count = _combination_distinct(conn, ref, pair, sample=sample)
+        ratio = distinct_count / n if n else 0.0
+        if ratio >= limits.uniqueness_threshold:
+            proposals.append(
+                _grain_proposal(
+                    ref,
+                    list(pair),
+                    distinct_count=distinct_count,
+                    null_count=0,
+                    scanned=n,
+                    row_count=row_count,
+                    sample_size=sample_size,
+                    table_snapshot_at=table_snapshot_at,
+                    limits=limits,
+                )
+            )
+    return proposals
+
+
 def run_profiler_scan(
     conn: DbConn,
     adapter: CatalogAdapter,
@@ -149,19 +221,19 @@ def run_profiler_scan(
     *,
     limits: ProfilerLimits,
 ) -> list[Proposal]:
+    if ref.schema not in limits.allowed_schemas:
+        raise SchemaNotAllowedError(
+            f"schema {ref.schema!r} is not on the profiler allowlist {sorted(limits.allowed_schemas)}"
+        )
+    _apply_statement_timeout(conn, limits)
     columns = _columns_for(adapter, ref)[: limits.max_columns]
     table_snapshot_at = _now()
-    sample = sql.SQL("")
-    row_count, _ignored, _n = _profile_single(
-        conn, ref, columns[0].column, sample=sample
-    ) if columns else (
-        int(conn.execute(
+    row_count = int(
+        conn.execute(
             sql.SQL("SELECT count(*) FROM {tbl}").format(tbl=sql.Identifier(ref.schema, ref.table))
-        ).fetchone()[0]),
-        0,
-        0,
+        ).fetchone()[0]
     )
-    sample_size = row_count
+    sample_size, sample = _sampling(row_count, limits)
     proposals: list[Proposal] = []
 
     unique_singletons: list[str] = []
@@ -184,11 +256,36 @@ def run_profiler_scan(
                 )
             )
 
+    if not unique_singletons:
+        proposals.extend(
+            _combination_grain(
+                conn,
+                ref,
+                columns,
+                row_count=row_count,
+                sample_size=sample_size,
+                table_snapshot_at=table_snapshot_at,
+                limits=limits,
+                sample=sample,
+            )
+        )
+
     for col in columns:
         if (col.data_type or "").lower() in _TIMESTAMP_TYPES:
             n, distinct_count, null_count = _profile_single(conn, ref, col.column, sample=sample)
             proposed_value = {"column": col.column, "basis": _availability_basis(col.column)}
             validate_fact_value(AVAILABILITY_TIME, proposed_value)
+            month_buckets = int(
+                conn.execute(
+                    sql.SQL(
+                        "SELECT count(DISTINCT date_trunc('month', {col})) FROM {tbl} {sample}"
+                    ).format(
+                        col=sql.Identifier(col.column),
+                        tbl=sql.Identifier(ref.schema, ref.table),
+                        sample=sample,
+                    )
+                ).fetchone()[0]
+            )
             proposals.append(
                 Proposal(
                     ref=ref,
@@ -199,7 +296,11 @@ def run_profiler_scan(
                         sample_size=sample_size,
                         table_snapshot_at=table_snapshot_at,
                         limits=limits,
-                        metric_values={"distinct_count": distinct_count, "null_count": null_count},
+                        metric_values={
+                            "distinct_count": distinct_count,
+                            "null_count": null_count,
+                            "month_buckets": month_buckets,
+                        },
                     ),
                 )
             )
