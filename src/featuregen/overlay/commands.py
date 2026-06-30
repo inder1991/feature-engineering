@@ -602,9 +602,15 @@ def get_task_proposal(conn: DbConn, task_id: str, actor) -> dict:
     eligible = eligible or {}
     role = eligible.get("role")
     subject = eligible.get("subject")
-    authorized = (subject is not None and actor.subject == subject) or (
-        role is not None and role in actor.role_claims
-    )
+    # Subject-scoped authz (I3): when the task is bound to a specific subject (a known-owner data
+    # fact's task is {"role":"data_owner","subject":<owner>}), ONLY that subject may read it — the
+    # bare role must NOT also satisfy it, or any data_owner-role holder would read another team's
+    # proposal + evidence, silently defeating the subject narrowing. The role branch survives only
+    # for SUBJECT-LESS governance/compliance tasks. Mirrors the confirm handler's subject-scoping.
+    if subject is not None:
+        authorized = actor.subject == subject
+    else:
+        authorized = role is not None and role in actor.role_claims
     # A platform-admin reads a GOVERNANCE task via the role branch above (its eligible role is
     # "platform-admin"); it is NOT granted blanket read of every task's proposal (finding 4).
     if not authorized:

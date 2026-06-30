@@ -19,10 +19,20 @@ from featuregen.overlay.store import load_fact
 ALICE = build_human_identity(subject="user:alice", role_claims=("data_owner",))
 BOB = build_human_identity(subject="user:bob", role_claims=("data_owner",))
 MALLORY = build_human_identity(subject="user:mallory", role_claims=("data_scientist",))
+# A DIFFERENT data owner: holds the `data_owner` role but is NOT the task's eligible subject (I3).
+CHARLIE = build_human_identity(subject="user:charlie", role_claims=("data_owner",))
+# Governance principal for the subject-less governance/compliance task branch.
+ADMIN = build_human_identity(subject="user:admin", role_claims=("platform-admin",))
 
 
 def _orders():
     return CatalogObjectRef("pg:core", "table", "sales", "orders")
+
+
+def _unowned():
+    # An object with NO catalog owner → resolve_authority routes it to the platform-admin/
+    # governance queue, opening a SUBJECT-LESS task ({"role": "platform-admin"}).
+    return CatalogObjectRef("pg:core", "table", "sales", "unowned")
 
 
 def _propose_and_task(db):
@@ -70,6 +80,52 @@ def test_non_assignee_is_denied(db, catalog):
     task_id, _ = _propose_and_task(db)
     with pytest.raises(OverlayCommandError):
         get_task_proposal(db, task_id, MALLORY)
+
+
+def test_different_data_owner_denied_on_subject_bound_task(db, catalog):
+    """I3: a subject-bound task ({"role":"data_owner","subject":"user:alice"}) must be readable
+    ONLY by its eligible subject. A DIFFERENT data owner (holds the `data_owner` role but is NOT the
+    eligible subject) must be DENIED — the bare role must not satisfy a subject-narrowed task, or one
+    team would read another team's proposal + evidence. Mirrors the subject-scoped confirm path."""
+    catalog.set_owner(_orders(), "user:alice")
+    task_id, _ = _propose_and_task(db)
+    with pytest.raises(OverlayCommandError):
+        get_task_proposal(db, task_id, CHARLIE)
+
+
+def _propose_governance_task(db):
+    """Propose a fact on an UNOWNED object so it routes to the governance queue, opening a
+    SUBJECT-LESS task ({"role":"platform-admin"}). Returns that task id."""
+    res = propose_fact(
+        db,
+        Command(
+            "propose_fact",
+            "overlay_fact",
+            None,
+            {
+                "ref": _unowned(),
+                "fact_type": "grain",
+                "proposed_value": {"columns": ["order_id"], "is_unique": True},
+            },
+            BOB,
+            "pg",
+        ),
+    )
+    assert res.accepted, res.denied_reason
+    key = fact_key(_unowned(), "grain")
+    row = db.execute(
+        "SELECT task_id FROM human_tasks WHERE fact_key=%s AND status='open'", (key,)
+    ).fetchone()
+    return row[0]
+
+
+def test_subjectless_governance_task_readable_by_platform_admin(db, catalog):
+    """I3: the role branch survives for SUBJECT-LESS governance/compliance tasks — a platform-admin
+    reads a governance-queue task via its role even though it has no eligible subject."""
+    # _unowned() has no owner registered → governance queue.
+    task_id = _propose_governance_task(db)
+    out = get_task_proposal(db, task_id, ADMIN)
+    assert out["fact_type"] == "grain"
 
 
 def _cmd(action, args, actor, key):
