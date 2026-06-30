@@ -217,3 +217,69 @@ def test_run_profiler_skips_rejected_fingerprint_even_with_fresh_evidence(db):
     assert result.produced_event_ids == ()
     # round-5 finding 2: no ORPHAN evidence is written for the skipped candidate.
     assert _evidence_count(db, grain_key) == 0
+
+
+def test_run_profiler_no_orphan_evidence_when_fact_created_concurrently(db, monkeypatch):
+    """P2a: a concurrent tx commits a non-terminal fact for the same fact_key AFTER the profiler's
+    preflight read but BEFORE propose_fact's load_fact. The preflight (modeled by the monkeypatch
+    returning a stale empty snapshot) lets the candidate through the skip gates; propose_fact then
+    sees the seeded DRAFT and denies. No evidence row may be left behind: propose_fact now owns the
+    evidence INSERT and performs it only AFTER the replacement-semantics gates pass, so a denied
+    proposal writes NOTHING. Pre-fix the profiler pre-wrote evidence before proposing -> orphan."""
+    import featuregen.overlay.commands as overlay_commands
+
+    db.execute("CREATE TABLE prof_run_c (account_id integer)")
+    db.execute("INSERT INTO prof_run_c SELECT g FROM generate_series(1, 30) AS g")
+    ref = CatalogObjectRef(
+        catalog_source="pg:core", object_kind="table", schema="public", table="prof_run_c"
+    )
+    adapter = _Catalog(
+        _columns(ref, [("account_id", "integer")]),
+        owners={("public", "prof_run_c"): "user:owner-c"},
+    )
+    _setup_overlay(db, adapter)
+    grain_key = fact_key(ref, "grain")
+
+    # A concurrent transaction committed a non-terminal DRAFT for grain_key. Seed it on the
+    # AUTHORITATIVE event stream with a DIFFERENT fingerprint than the profiler will produce.
+    actor = _service_actor()
+    append_overlay_event(
+        db,
+        fact_key=grain_key,
+        type="OVERLAY_FACT_PROPOSED",
+        payload={
+            "catalog_object_ref": asdict(ref),
+            "object_ref": display_object_ref(ref),
+            "fact_type": "grain",
+            "use_case": None,
+            "proposed_value": {"columns": ["account_id"], "is_unique": True},
+            "proposal_fingerprint": "other-fp",
+            "evidence_ref": None,
+            "proposed_by": actor.subject,
+        },
+        actor=actor,
+        expected_version=0,
+    )
+
+    # Model the READ COMMITTED race: the profiler's preflight ran on an EARLIER snapshot that did not
+    # yet see the concurrent commit, so it returns (None, None) for grain_key the first time and
+    # lets the candidate past the skip gates into propose_fact.
+    real_fp = overlay_commands._existing_proposal_fingerprint
+    seen = {"grain_first": True}
+
+    def stale_preflight(conn, fk):
+        if fk == grain_key and seen["grain_first"]:
+            seen["grain_first"] = False
+            return (None, None)
+        return real_fp(conn, fk)
+
+    monkeypatch.setattr(overlay_commands, "_existing_proposal_fingerprint", stale_preflight)
+
+    result = execute_command(db, _run_profiler_cmd(ref))
+    assert result.accepted is True
+
+    # propose_fact's real load_fact sees the seeded DRAFT (non-terminal) and denies BEFORE minting
+    # evidence -> no orphan. Pre-fix the profiler had already written an evidence row by this point.
+    assert _evidence_count(db, grain_key) == 0
+    # No NEW DRAFT was proposed for the already-occupied fact_key (only the seeded one remains).
+    assert len(_proposed_for(db, grain_key)) == 1

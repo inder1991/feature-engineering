@@ -116,6 +116,11 @@ def propose_fact(conn: DbConn, cmd: Command) -> CommandResult:
     use_case = args.get("use_case")
     proposed_value = args["proposed_value"]
     evidence_ref = args.get("evidence_ref")
+    # P2a: a caller (the profiler) may hand propose_fact the raw evidence metric payload instead of
+    # a pre-minted evidence_ref. propose_fact mints the immutable evidence row ITSELF, after every
+    # replacement-semantics deny path has returned, so a denied proposal never orphans an evidence
+    # row. Legacy callers passing an explicit evidence_ref keep their existing behavior.
+    evidence_payload = args.get("evidence")
     try:
         validate_fact_value(fact_type, proposed_value, use_case=use_case)
     except FactValidationError as exc:
@@ -159,6 +164,23 @@ def propose_fact(conn: DbConn, cmd: Command) -> CommandResult:
                     "fingerprint previously rejected (sticky); change the proposal to re-submit"
                 ),
             )
+    # Mint evidence atomically with the accepted append (P2a). Every deny path above returns before
+    # this point, so no evidence row is written for a denied proposal. If a concurrent tx commits a
+    # non-terminal fact for this key between the load_fact above and the append below, append_event's
+    # OCC raises ConcurrencyError and this INSERT rolls back with the rest of the transaction —
+    # either way there is no orphan evidence.
+    if evidence_ref is None and evidence_payload is not None:
+        evidence_ref = write_evidence(
+            conn,
+            fact_key=key,
+            table_snapshot_at=evidence_payload["table_snapshot_at"],
+            row_count=evidence_payload["row_count"],
+            sample_size=evidence_payload["sample_size"],
+            profile_version=evidence_payload["profile_version"],
+            thresholds_used=evidence_payload["thresholds"],
+            metric_values=evidence_payload["metric_values"],
+            created_by=identity_to_jsonb(cmd.actor),  # pin 14: a dict, never a raw IdentityEnvelope
+        )
     authority = resolve_authority(conn, adapter, ref, fact_type)
     draft = append_overlay_event(
         conn,
@@ -703,20 +725,12 @@ def _run_profiler(conn: DbConn, cmd: Command) -> CommandResult:
         if status == "REJECTED" and existing_fp == fingerprint:
             continue  # sticky dedup: a rejected candidate is not re-proposed on identical value
 
-        evidence_ref = write_evidence(
-            conn,
-            fact_key=fk,
-            table_snapshot_at=metrics["table_snapshot_at"],
-            row_count=metrics["row_count"],
-            sample_size=metrics["sample_size"],
-            profile_version=metrics["profile_version"],
-            thresholds_used=metrics["thresholds"],
-            metric_values=metrics["metric_values"],
-            created_by=identity_to_jsonb(cmd.actor),  # pin 14: a dict, never a raw IdentityEnvelope
-        )
         # Issue propose_fact using ITS exact arg contract (Phase 4): a live CatalogObjectRef under
         # "ref"; propose_fact derives the proposal_fingerprint itself from proposed_value +
-        # profile_version + thresholds (matching `fingerprint` above).
+        # profile_version + thresholds (matching `fingerprint` above). The evidence metric payload is
+        # handed through under "evidence" so propose_fact mints the evidence row ATOMICALLY with the
+        # accepted append (P2a) — a denied proposal then never leaves orphan evidence. The preflight
+        # skip gates above remain a cheap fast path, but correctness no longer depends on them.
         propose_cmd = Command(
             action="propose_fact",
             aggregate="overlay_fact",
@@ -726,7 +740,7 @@ def _run_profiler(conn: DbConn, cmd: Command) -> CommandResult:
                 "fact_type": proposal.fact_type,
                 "use_case": proposal.use_case,
                 "proposed_value": dict(proposal.proposed_value),
-                "evidence_ref": evidence_ref,
+                "evidence": dict(metrics),
                 "profile_version": metrics["profile_version"],
                 "thresholds": metrics["thresholds"],
             },
