@@ -504,7 +504,16 @@ def reject_fact(conn: DbConn, cmd: Command) -> CommandResult:
             denied_reason="actor is not the resolved authority for this fact",
         )
     proposed = _latest_proposed(stream)
-    retired_fp = proposed.payload.get("proposal_fingerprint") if proposed else None
+    proposed_value = proposed.payload.get("proposed_value") if proposed else None
+    # Retire the fingerprint of the value actually under review (F8, mirrors confirm_fact's P1b).
+    # On a REVERIFY/STALE reject AFTER a confirm-time override, state.prior_value is the corrected
+    # value V' — retire ITS fingerprint so sticky-reject protects V' (not the discarded cycle-1 V0).
+    # The value-equality guard keeps the no-override path on the STORED proposal fingerprint, which
+    # also encodes profile_version+thresholds so a profiler re-propose of the same value still sticks.
+    if state.status in ("REVERIFY", "STALE") and state.prior_value not in (None, proposed_value):
+        retired_fp = proposal_fingerprint(state.prior_value)
+    else:
+        retired_fp = proposed.payload.get("proposal_fingerprint") if proposed else None
     rejected = append_overlay_event(
         conn,
         fact_key=key,
