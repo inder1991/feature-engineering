@@ -31,7 +31,11 @@ from featuregen.overlay.identity import (
     fact_key,
     proposal_fingerprint,
 )
-from featuregen.overlay.profiler import ProfilerLimits, run_profiler_scan
+from featuregen.overlay.profiler import (
+    ProfilerLimits,
+    SchemaNotAllowedError,
+    run_profiler_scan,
+)
 from featuregen.overlay.state import fold_overlay_state
 from featuregen.overlay.store import append_overlay_event, load_fact
 from featuregen.security.audit import record_denial
@@ -709,7 +713,26 @@ def _run_profiler(conn: DbConn, cmd: Command) -> CommandResult:
     ref = CatalogObjectRef(**dict(cmd.args["ref"]))
     limits = ProfilerLimits(allowed_schemas=frozenset(cmd.args.get("allowed_schemas", ())))
     adapter = current_catalog_adapter()
-    proposals = run_profiler_scan(conn, adapter, ref, limits=limits)
+    # F6(a): run the SCAN phase under an in-code read-only guard (defense-in-depth for §5.2's
+    # read-only DB role) so a stray write inside run_profiler_scan fails closed. The scan only
+    # SELECTs, so a savepoint we immediately roll back loses nothing; the rollback also clears
+    # `transaction_read_only = on` (it was SET LOCAL after the savepoint), restoring read-write for
+    # the subsequent propose_fact write phase — preserving the intentional single-transaction design.
+    # F6(b): an off-allowlist target raises SchemaNotAllowedError; every other handler denial returns
+    # a CommandResult, so catch it, record a §6.5 security-audit denial (authz_policy checks only
+    # capability+kind, NOT the schema, so the handler must audit it) and return cleanly.
+    conn.execute("SAVEPOINT profiler_readonly")
+    conn.execute("SET LOCAL transaction_read_only = on")
+    try:
+        proposals = run_profiler_scan(conn, adapter, ref, limits=limits)
+    except SchemaNotAllowedError as exc:
+        conn.execute("ROLLBACK TO SAVEPOINT profiler_readonly")  # clears read-only -> audit can write
+        record_denial(conn, cmd, str(exc))
+        return CommandResult(
+            accepted=False, aggregate_id=display_object_ref(ref), denied_reason=str(exc)
+        )
+    conn.execute("ROLLBACK TO SAVEPOINT profiler_readonly")  # clears read-only -> writes allowed again
+    conn.execute("RELEASE SAVEPOINT profiler_readonly")
 
     propose = get_command("propose_fact")
     produced: list[str] = []
