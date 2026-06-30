@@ -21,6 +21,7 @@ from featuregen.overlay.identity import (
     display_object_ref,
     fact_key,
 )
+from featuregen.overlay.projection import read_proposal
 
 _REASON_MISSING = "no_confirmed_fact"
 _REASON_CATALOG_INVALID = "catalog_value_invalid"
@@ -121,8 +122,29 @@ def resolve_fact(
         )
         row = cur.fetchone()
 
-    # 3) Nothing confirmed -> missing (fail-closed; routes to first-time confirmation).
+    # 3) No overlay_fact_state row -> the fact was never CONFIRMED. A fresh DRAFT /
+    # PARTIALLY_CONFIRMED / REJECTED lives only in overlay_proposal (the projection writes
+    # overlay_fact_state on CONFIRMED only), so consult it as a diagnostic fallback to report the
+    # real workflow status instead of collapsing everything to "missing". This NEVER serves a
+    # value (only VERIFIED is usable); fail-closed is preserved on every branch.
     if row is None:
+        prop = read_proposal(conn, key)
+        if prop is not None and prop["status"] in _REASON_BY_STATUS:
+            return ResolvedFact(
+                value=None,
+                status=prop["status"],
+                source="overlay",
+                catalog_object=obj,
+                fact_type=fact_type,
+                use_case=use_case,
+                provenance=None,
+                confirmed_by=(),
+                confirmed_at=None,
+                expires_at=None,
+                reason_if_missing=_REASON_BY_STATUS[prop["status"]],
+                prior_value=None,
+            )
+        # Nothing in flight -> missing (fail-closed; routes to first-time confirmation).
         return ResolvedFact(
             value=None,
             status="missing",

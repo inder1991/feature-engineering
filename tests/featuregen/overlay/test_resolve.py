@@ -3,9 +3,14 @@ from datetime import UTC, datetime
 import pytest
 from psycopg.types.json import Json
 
+from featuregen.contracts import IdentityEnvelope
+from featuregen.overlay import facts
 from featuregen.overlay.catalog import CatalogFact
 from featuregen.overlay.identity import CatalogObjectRef, display_object_ref, fact_key
+from featuregen.overlay.projection import OverlayProjection
 from featuregen.overlay.resolve import ResolvedFact, resolve_fact
+from featuregen.overlay.store import append_overlay_event
+from featuregen.projections.runner import run_projection
 
 _REF = CatalogObjectRef(
     catalog_source="enterprise",
@@ -213,3 +218,74 @@ def test_reverify_and_stale_return_prior_value(db, status):
     assert resolved.value is None  # never usable
     assert resolved.prior_value == {"column": "origination_ts"}
     assert resolved.reason_if_missing is not None
+
+
+def _human():
+    return IdentityEnvelope(
+        subject="owner_a", actor_kind="human", authenticated=True,
+        auth_method="oidc", role_claims=("data_owner",),
+    )
+
+
+def _propose_draft(db):
+    """Drive the REAL projection (not _seed_state): append a PROPOSED event and project it,
+    leaving overlay_proposal in DRAFT with NO overlay_fact_state row (production shape)."""
+    key = fact_key(_REF, "availability_time")
+    draft = append_overlay_event(
+        db, fact_key=key, type=facts.OVERLAY_FACT_PROPOSED, actor=_human(), expected_version=0,
+        payload={
+            "catalog_object_ref": {
+                "catalog_source": "enterprise", "object_kind": "column",
+                "schema": "risk", "table": "loans", "column": "origination_ts",
+            },
+            "object_ref": display_object_ref(_REF), "fact_type": "availability_time",
+            "proposed_value": {"column": "origination_ts", "basis": "posted_at"},
+            "proposal_fingerprint": "fp1", "evidence_ref": "eviu_1", "proposed_by": "owner_a",
+        },
+    )
+    return key, draft
+
+
+def test_fresh_draft_reports_draft_not_missing(db):
+    # A never-confirmed DRAFT lives only in overlay_proposal (no overlay_fact_state row).
+    # resolve_fact must report DRAFT/draft_unconfirmed, not collapse to "missing".
+    _propose_draft(db)
+    run_projection(db, OverlayProjection())
+
+    resolved = resolve_fact(db, _StubCatalog(None), _REF, "availability_time")
+
+    assert resolved.status == "DRAFT"
+    assert resolved.source == "overlay"
+    assert resolved.value is None  # fail-closed: only VERIFIED is ever usable
+    assert resolved.reason_if_missing == "draft_unconfirmed"
+
+
+def test_fresh_partially_confirmed_reports_partial_not_missing(db):
+    key, draft = _propose_draft(db)
+    append_overlay_event(
+        db, fact_key=key, type=facts.OVERLAY_FACT_PARTIALLY_CONFIRMED, actor=_human(),
+        expected_version=1,
+        payload={"by_owner": "user:alice", "role": "data_owner", "draft_event_id": draft.event_id},
+    )
+    run_projection(db, OverlayProjection())
+
+    resolved = resolve_fact(db, _StubCatalog(None), _REF, "availability_time")
+
+    assert resolved.status == "PARTIALLY_CONFIRMED"
+    assert resolved.value is None
+    assert resolved.reason_if_missing == "partial_confirmation_pending"
+
+
+def test_fresh_rejected_reports_rejected_not_missing(db):
+    key, draft = _propose_draft(db)
+    append_overlay_event(
+        db, fact_key=key, type=facts.OVERLAY_FACT_REJECTED, actor=_human(), expected_version=1,
+        payload={"rejected_by": "user:alice", "target_event_id": draft.event_id, "reason": "bad"},
+    )
+    run_projection(db, OverlayProjection())
+
+    resolved = resolve_fact(db, _StubCatalog(None), _REF, "availability_time")
+
+    assert resolved.status == "REJECTED"
+    assert resolved.value is None
+    assert resolved.reason_if_missing == "rejected"
