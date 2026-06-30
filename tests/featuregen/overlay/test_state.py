@@ -109,6 +109,30 @@ def test_reject_under_reverify_retains_prior_value():
     assert st.prior_value == {"columns": ["id"], "is_unique": True}
 
 
+def test_reproposed_after_rejected_resets_prior_value():
+    """I1: a fresh (re)proposal after REJECTED must reset prior_value (and value/confirmers/
+    partial_confirmers/expires_at/confirmed_event_id), mirroring the projection's PROPOSED reset.
+    PROPOSED->CONFIRMED->EXPIRED(prior_value=value)->REJECTED(retains it)->re-PROPOSED: without the
+    reset the fold keeps the retired value, so get_task_proposal surfaces a stale value to the
+    confirming authority."""
+    expired = _Evt(facts.OVERLAY_FACT_EXPIRED, "evt_exp",
+                   {"expires_confirmed_event_id": "evt_conf"})
+    rej = _Evt(facts.OVERLAY_FACT_REJECTED, "evt_rej",
+               {"rejected_by": "owner_a", "reason": "retire", "target_event_id": "evt_conf",
+                "retired_fingerprint": "fp1"})
+    reproposed = _proposed(eid="evt_draft2")
+    st = fold_overlay_state([_proposed(), _confirmed(), expired, rej, reproposed])
+    assert st.status == DRAFT
+    assert st.draft_event_id == "evt_draft2"
+    # all VERIFIED/REVERIFY carry-over must be cleared on the fresh DRAFT
+    assert st.prior_value is None
+    assert st.value is None
+    assert st.confirmers == []
+    assert st.partial_confirmers == []
+    assert st.expires_at is None
+    assert st.confirmed_event_id is None
+
+
 def test_stray_proposed_after_confirm_does_not_regress_to_draft():
     # A duplicate/stray PROPOSED arriving AFTER the fact is already VERIFIED must be ignored — the
     # fold must never regress a confirmed fact back to DRAFT (decision 6).

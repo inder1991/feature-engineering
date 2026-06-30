@@ -54,6 +54,15 @@ def fold_overlay_state(stream: Iterable) -> OverlayState:
             st.fact_type = payload["fact_type"]
             st.use_case = payload.get("use_case")
             st.evidence_ref = payload.get("evidence_ref")
+            # A fresh (re)proposal after REJECTED must clear all prior-cycle carry-over (I1) —
+            # mirror the projection's PROPOSED reset (decision 6/18) so get_task_proposal never
+            # surfaces a stale retired value (or stale confirmers/expiry) on the new DRAFT.
+            st.prior_value = None
+            st.value = None
+            st.confirmers = []
+            st.partial_confirmers = []
+            st.expires_at = None
+            st.confirmed_event_id = None
         elif event.type == facts.OVERLAY_FACT_PARTIALLY_CONFIRMED:
             st.status = PARTIALLY_CONFIRMED
             st.partial_confirmers = st.partial_confirmers + [
