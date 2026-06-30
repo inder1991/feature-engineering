@@ -6,9 +6,10 @@ seed the prior VERIFIED / REJECTED state by appending `OVERLAY_FACT_CONFIRMED` /
 `propose_fact`'s decision-6 denial + REJECTED-stickiness in isolation, without coupling Task 4.2 to
 unbuilt handlers.
 """
+import pytest
 from psycopg.rows import dict_row
 
-from featuregen.contracts import Command
+from featuregen.contracts import Command, ConcurrencyError
 from featuregen.identity.build import build_human_identity
 from featuregen.overlay.commands import propose_fact
 from featuregen.overlay.identity import (
@@ -211,3 +212,72 @@ def test_mixed_owner_join_opens_owner_and_governance_tasks(db, catalog):
     assert owner_task["subject"] == "user:alice"
     gov_task = next(r for r in rows if r["role"] == "platform-admin")
     assert "subject" not in gov_task  # NOT collapsed to the known owner
+
+
+# --- I4: re-propose-after-REJECTED append is CAS-pinned to the observed head -------------------
+
+
+def _reach_rejected(db, value):
+    """Drive `orders`/grain to REJECTED (PROPOSED then a direct OVERLAY_FACT_REJECTED seed, the
+    same event reject_fact emits) and return the fact_key. Stream is at stream_version 2."""
+    bob = build_human_identity(subject="user:bob", role_claims=("data_owner",))
+    p = propose_fact(
+        db, _propose_cmd(ref=_orders(), fact_type="grain", value=value, actor=bob, key="p1")
+    )
+    assert p.accepted
+    draft = p.produced_event_ids[0]
+    key = fact_key(_orders(), "grain")
+    alice = build_human_identity(subject="user:alice", role_claims=("data_owner",))
+    append_overlay_event(
+        db,
+        fact_key=key,
+        type="OVERLAY_FACT_REJECTED",
+        payload={
+            "rejected_by": "user:alice",
+            "reason": "wrong key",
+            "target_event_id": draft,
+            "retired_fingerprint": proposal_fingerprint(value),
+        },
+        actor=alice,
+    )  # now REJECTED at stream_version 2
+    return key
+
+
+def test_repropose_after_rejected_pins_expected_version(db, catalog, occ_spy):
+    """I4: the re-propose-after-REJECTED path (the only non-fresh propose that proceeds) must pin
+    its OVERLAY_FACT_PROPOSED append to the observed head (stream_version 2: PROPOSED + REJECTED),
+    NOT expected_version=None. With None, two concurrent re-proposals both append -> duplicate
+    DRAFT + duplicate human-gate task sets + fold/projection divergence."""
+    catalog.set_owner(_orders(), "user:alice")
+    _reach_rejected(db, {"columns": ["order_id"], "is_unique": True})
+    diff = propose_fact(
+        db,
+        _propose_cmd(
+            ref=_orders(),
+            fact_type="grain",
+            value={"columns": ["order_id", "tenant"], "is_unique": True},
+            key="p3",
+        ),
+    )
+    assert diff.accepted is True
+    assert occ_spy["OVERLAY_FACT_PROPOSED"] == 2  # pinned to the observed head & non-None
+
+
+def test_concurrent_repropose_after_rejected_collides(db, catalog, inject_concurrent_append):
+    """I4 (genuine concurrency): with the fact REJECTED, a concurrent re-propose lands a fresh
+    OVERLAY_FACT_PROPOSED out-of-band between this handler's load and its own append. Pinned to the
+    observed head, the handler's append must raise ConcurrencyError rather than append a duplicate
+    DRAFT."""
+    catalog.set_owner(_orders(), "user:alice")
+    _reach_rejected(db, {"columns": ["order_id"], "is_unique": True})
+    inject_concurrent_append("OVERLAY_FACT_PROPOSED")
+    with pytest.raises(ConcurrencyError):
+        propose_fact(
+            db,
+            _propose_cmd(
+                ref=_orders(),
+                fact_type="grain",
+                value={"columns": ["order_id", "tenant"], "is_unique": True},
+                key="p3",
+            ),
+        )

@@ -169,7 +169,10 @@ def propose_fact(conn: DbConn, cmd: Command) -> CommandResult:
             "proposed_by": cmd.actor.subject,
         },
         actor=cmd.actor,
-        expected_version=0 if not existing else None,
+        # Pin OCC to the observed head (I4): a fresh propose expects an empty stream (0); the only
+        # non-fresh propose that proceeds is a re-propose after REJECTED — pin it to the rejected
+        # head so a concurrent re-propose collides cleanly instead of appending a duplicate DRAFT.
+        expected_version=0 if not existing else existing[-1].stream_version,
     )
     # One task per resolved side (decision 7): a known side -> the data owner; an unknown side ->
     # the platform-admin/governance queue. `task_assignees` dedupes same-owner / both-unknown.
