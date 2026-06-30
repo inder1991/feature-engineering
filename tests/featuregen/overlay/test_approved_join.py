@@ -1,6 +1,11 @@
+from datetime import UTC, datetime, timedelta
+
+import pytest
+
 from featuregen.contracts import Command
 from featuregen.identity.build import build_human_identity
 from featuregen.overlay.commands import confirm_fact, propose_fact, reject_fact
+from featuregen.overlay.freshness import fire_due_overlay_expiries
 from featuregen.overlay.identity import ApprovedJoinRef, CatalogObjectRef, ColumnPair, fact_key
 from featuregen.overlay.state import fold_overlay_state
 from featuregen.overlay.store import load_fact
@@ -161,6 +166,50 @@ def test_mixed_known_and_governance_owner_plus_admin_verifies(db, catalog):
     confirmed = next(e for e in stream if e.type == "OVERLAY_FACT_CONFIRMED")
     subjects = {c["subject"] for c in confirmed.payload["confirmers"]}
     assert subjects == {"user:alice", "user:admin"}
+
+
+@pytest.mark.parametrize(("first_actor", "second_actor"), [(ALICE, BOB), (BOB, ALICE)])
+def test_reverify_requires_both_owners_again(db, catalog, first_actor, second_actor):
+    """C1: after a two-owner approved_join is VERIFIED and then EXPIRED (REVERIFY), a SINGLE
+    re-confirm must NOT verify it — the first/second-confirmer decision is cycle-scoped, so both
+    owners must re-confirm again. The buggy code scanned the WHOLE stream for a prior
+    PARTIALLY_CONFIRMED, so after cycle 1 it treated every re-verify as a "second confirm":
+    re-verifying with one owner either falsely reached VERIFIED (the cycle-1 second owner going
+    first) or wrongly denied the cycle-1 first owner. Both orderings are exercised here."""
+    catalog.set_owner(_orders(), "user:alice")  # from side
+    catalog.set_owner(_customers(), "user:bob")  # to side
+    draft = _propose(db)
+    key = fact_key(_ref(), "approved_join")
+
+    # cycle 1: both owners confirm -> VERIFIED
+    assert _confirm(db, target=draft, actor=ALICE, key="c1").accepted is True
+    assert _confirm(db, target=draft, actor=BOB, key="c2").accepted is True
+    stream = load_fact(db, key)
+    assert fold_overlay_state(stream).status == "VERIFIED"
+    confirmed_id = next(e for e in stream if e.type == "OVERLAY_FACT_CONFIRMED").event_id
+
+    # fire the (future-dated) expiry timer -> REVERIFY
+    assert fire_due_overlay_expiries(db, now=datetime.now(UTC) + timedelta(days=200)) == 1
+    assert fold_overlay_state(load_fact(db, key)).status == "REVERIFY"
+
+    # cycle 2, first re-confirm: CAS target is the confirmed_event_id while status==REVERIFY
+    # (sp1-04 _cas_target contract). A SINGLE re-confirm is accepted (never wrongly denied) but only
+    # reaches PARTIALLY_CONFIRMED — this step alone fails without the C1 fix (false VERIFIED, or the
+    # cycle-1 first owner wrongly denied).
+    first = _confirm(db, target=confirmed_id, actor=first_actor, key="rc1")
+    assert first.accepted is True, first.denied_reason
+    assert fold_overlay_state(load_fact(db, key)).status == "PARTIALLY_CONFIRMED"
+
+    # cycle 2, second re-confirm: once PARTIALLY_CONFIRMED, _cas_target binds to draft_event_id
+    # (the cycle's proposal id == `draft`, per the contract). The OTHER owner must also re-confirm
+    # to reach VERIFIED again.
+    second = _confirm(db, target=draft, actor=second_actor, key="rc2")
+    assert second.accepted is True, second.denied_reason
+    stream = load_fact(db, key)
+    assert fold_overlay_state(stream).status == "VERIFIED"
+    confirmed = [e for e in stream if e.type == "OVERLAY_FACT_CONFIRMED"][-1]
+    subjects = {c["subject"] for c in confirmed.payload["confirmers"]}
+    assert subjects == {"user:alice", "user:bob"}
 
 
 def test_mixed_two_admins_cannot_bypass_known_owner(db, catalog):

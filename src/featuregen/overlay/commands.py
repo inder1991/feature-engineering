@@ -335,7 +335,12 @@ def _confirm_approved_join(conn, cmd, key, stream, state, authority):
         return CommandResult(
             accepted=False, aggregate_id=key, denied_reason="proposer may not confirm (four-eyes, §6.5)"
         )
-    partial = [e for e in stream if e.type == "OVERLAY_FACT_PARTIALLY_CONFIRMED"]
+    # Decide first-vs-second from the CURRENT cycle's partials only (C1): the fold resets
+    # state.partial_confirmers = [] on every OVERLAY_FACT_CONFIRMED, and EXPIRED/STALED leave it
+    # empty, so a re-verify cycle starts with no partials. Scanning the raw stream would treat a
+    # PRIOR cycle's PARTIALLY_CONFIRMED as this cycle's first confirm and bypass two-party SoD on
+    # every re-verification (single re-confirm -> VERIFIED, or the cycle-1 first owner wrongly denied).
+    partial = state.partial_confirmers
     proposed = _latest_proposed(stream)
     if not partial:
         evt = append_overlay_event(
@@ -352,7 +357,7 @@ def _confirm_approved_join(conn, cmd, key, stream, state, authority):
         )
         _close_fact_tasks(conn, key, subject=actor.subject, reason="first owner confirmed (partial)")
         return CommandResult(accepted=True, aggregate_id=key, produced_event_ids=(evt.event_id,))
-    first = partial[-1].payload["by_owner"]
+    first = partial[-1]["subject"]
     if actor.subject == first:
         return CommandResult(
             accepted=False,
