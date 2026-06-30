@@ -255,8 +255,16 @@ def confirm_fact(conn: DbConn, cmd: Command) -> CommandResult:
     proposed = _latest_proposed(stream)
     # The confirmer may override the value on a REVERIFY/STALE correction. Validate the FINAL value
     # (override or original) BEFORE appending OVERLAY_FACT_CONFIRMED (pin 17) so a malformed
-    # correction can never be persisted as a confirmed fact.
-    value = args.get("value", proposed.payload["proposed_value"])
+    # correction can never be persisted as a confirmed fact. With NO override, a re-verify
+    # re-affirms the LAST VERIFIED value (state.prior_value) — defaulting to the cycle-1 proposed
+    # value would silently revert a prior human correction (P1b). A fresh DRAFT has no prior value,
+    # so it defaults to the proposed value.
+    default_value = (
+        state.prior_value
+        if state.status in ("REVERIFY", "STALE")
+        else proposed.payload["proposed_value"]
+    )
+    value = args.get("value", default_value)
     try:
         validate_fact_value(fact_type, value, use_case=use_case)
     except FactValidationError as exc:
@@ -392,8 +400,14 @@ def _confirm_approved_join(conn, cmd, key, stream, state, authority):
                 denied_reason="a known owner must confirm their side of the join",
             )
     # Validate the FINAL value before the second-owner CONFIRMED append (pin 17 — the join confirm
-    # path validates too, even though approved_join takes no override).
-    value = proposed.payload["proposed_value"]
+    # path validates too, even though approved_join takes no override). On a re-verify, re-affirm
+    # the last verified value (symmetry with confirm_fact, P1b); benign today since approved_join
+    # takes no override (prior_value == proposed_value across cycles), but future-proof.
+    value = (
+        state.prior_value
+        if state.status in ("REVERIFY", "STALE")
+        else proposed.payload["proposed_value"]
+    )
     try:
         validate_fact_value("approved_join", value)
     except FactValidationError as exc:

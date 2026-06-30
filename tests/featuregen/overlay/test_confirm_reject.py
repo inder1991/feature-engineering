@@ -1,9 +1,12 @@
+from datetime import UTC, datetime, timedelta
+
 import pytest
 from psycopg.rows import dict_row
 
 from featuregen.contracts import Command, ConcurrencyError
 from featuregen.identity.build import build_human_identity, build_service_identity
 from featuregen.overlay.commands import confirm_fact, propose_fact, reject_fact
+from featuregen.overlay.freshness import fire_due_overlay_expiries
 from featuregen.overlay.identity import CatalogObjectRef, fact_key
 from featuregen.overlay.state import fold_overlay_state
 from featuregen.overlay.store import load_fact
@@ -165,6 +168,46 @@ def test_confirm_with_malformed_override_value_is_rejected(db, catalog):
     key = fact_key(_orders(), "grain")
     # still awaiting confirmation — no CONFIRMED event was written
     assert fold_overlay_state(load_fact(db, key)).status == "DRAFT"
+
+
+def test_reverify_no_override_keeps_last_verified_override_not_original(db, catalog):
+    """P1b: a re-verify confirm with NO override must re-affirm the LAST VERIFIED value, not silently
+    revert to the original cycle-1 proposal. Cycle 1: BOB proposes V0, ALICE confirms with an
+    OVERRIDE V'. After expiry (REVERIFY) the only PROPOSED on the stream is still the cycle-1 V0
+    draft. A no-override re-confirm previously defaulted the value to proposed_value (V0), silently
+    discarding the human correction V' that state.prior_value still holds. The fix defaults to
+    state.prior_value on REVERIFY/STALE, so the confirmed value stays V'."""
+    catalog.set_owner(_orders(), "user:alice")
+    v0 = {"columns": ["order_id"], "is_unique": True}
+    vprime = {"columns": ["customer_id"], "is_unique": True}
+    draft = _propose(db, value=v0)  # proposer = BOB
+    res = confirm_fact(
+        db,
+        Command(
+            "confirm_fact",
+            "overlay_fact",
+            None,
+            {"ref": _orders(), "fact_type": "grain", "target_event_id": draft, "value": vprime},
+            ALICE,
+            "c1",
+        ),
+    )
+    assert res.accepted, res.denied_reason
+    key = fact_key(_orders(), "grain")
+    st = fold_overlay_state(load_fact(db, key))
+    assert st.status == "VERIFIED" and st.value == vprime
+    confirmed_id = st.confirmed_event_id
+    # expire the fact (confirm armed a +180d overlay_expiry timer; fire it from the future)
+    fired = fire_due_overlay_expiries(db, now=datetime.now(UTC) + timedelta(days=181))
+    assert fired == 1
+    st = fold_overlay_state(load_fact(db, key))
+    assert st.status == "REVERIFY" and st.prior_value == vprime
+    # cycle 2: re-confirm with NO override (CAS on the confirmed event id)
+    res = confirm_fact(db, _confirm_cmd(target=confirmed_id, actor=ALICE, key="c2"))
+    assert res.accepted, res.denied_reason
+    st = fold_overlay_state(load_fact(db, key))
+    # PRE-FIX this assert fails: value reverts to v0. POST-FIX value stays vprime.
+    assert st.value == vprime, f"re-verify silently reverted override to {st.value}"
 
 
 # --- security-guard DENIAL paths (each test must FAIL if its guard were removed) ---------------
