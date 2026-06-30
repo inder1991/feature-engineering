@@ -15,6 +15,7 @@ from datetime import UTC, datetime, timedelta
 from featuregen.commands.registry import get_command, register_command
 from featuregen.contracts import Command, CommandResult, DbConn
 from featuregen.contracts.gates import GateTaskSpec
+from featuregen.contracts.identity import identity_to_jsonb
 from featuregen.gates.tasks import cancel_task, open_task
 from featuregen.overlay.authority import (
     _actor_is_authority,
@@ -22,13 +23,15 @@ from featuregen.overlay.authority import (
     resolve_authority,
 )
 from featuregen.overlay.catalog import current_catalog_adapter
-from featuregen.overlay.evidence import read_evidence
+from featuregen.overlay.evidence import read_evidence, write_evidence
 from featuregen.overlay.facts import FactValidationError, validate_fact_value
 from featuregen.overlay.identity import (
+    CatalogObjectRef,
     display_object_ref,
     fact_key,
     proposal_fingerprint,
 )
+from featuregen.overlay.profiler import ProfilerLimits, run_profiler_scan
 from featuregen.overlay.state import fold_overlay_state
 from featuregen.overlay.store import append_overlay_event, load_fact
 
@@ -595,6 +598,97 @@ def get_task_proposal(conn: DbConn, task_id: str, actor) -> dict:
     }
 
 
+def _existing_proposal_fingerprint(conn: DbConn, fk: str) -> tuple[str | None, str | None]:
+    """Return (folded status, latest-proposed fingerprint) for `fk` read from the AUTHORITATIVE
+    event stream — NOT the asynchronous `overlay_proposal` projection (round-5 finding 2). Reading
+    the stream means the profiler's preflight sees exactly what `propose_fact` will, so it never
+    writes evidence for a proposal that `propose_fact` would then deny under projection lag."""
+    stream = load_fact(conn, fk)
+    if not stream:
+        return None, None
+    state = fold_overlay_state(stream)
+    proposed = _latest_proposed(stream)
+    fp = proposed.payload.get("proposal_fingerprint") if proposed else None
+    return state.status, fp
+
+
+def _run_profiler(conn: DbConn, cmd: Command) -> CommandResult:
+    """Service command (§6.6): run the deterministic profiler over `cmd.args["ref"]` and, for each
+    candidate, write evidence and issue a `propose_fact`. Runs inside `execute_command`'s
+    transaction, so `run_profiler_scan`'s `SET LOCAL statement_timeout` applies to this scan.
+
+    Stream-based preflight (round-5 finding 2): for each candidate the folded stream status decides
+    BEFORE any evidence is written — a non-terminal fact (DRAFT/PARTIALLY_CONFIRMED/VERIFIED/
+    REVERIFY/STALE) blocks any new proposal (decision 6), and a REJECTED fact with the SAME
+    `proposal_fingerprint` is sticky-skipped (fresh evidence alone never revives it). Skipping first
+    guarantees no orphan evidence is left for a candidate `propose_fact` would deny."""
+    ref = CatalogObjectRef(**dict(cmd.args["ref"]))
+    limits = ProfilerLimits(allowed_schemas=frozenset(cmd.args.get("allowed_schemas", ())))
+    adapter = current_catalog_adapter()
+    proposals = run_profiler_scan(conn, adapter, ref, limits=limits)
+
+    propose = get_command("propose_fact")
+    produced: list[str] = []
+    for proposal in proposals:
+        fk = fact_key(proposal.ref, proposal.fact_type, proposal.use_case)
+        metrics = proposal.evidence_metrics
+        # Compute the fingerprint the SAME way propose_fact will (proposed_value + profile_version +
+        # thresholds), so the dedup below matches the fingerprint that would be appended.
+        fingerprint = proposal_fingerprint(
+            proposal.proposed_value,
+            profile_version=metrics["profile_version"],
+            thresholds=metrics["thresholds"],
+        )
+        status, existing_fp = _existing_proposal_fingerprint(conn, fk)
+        # Preflight matching propose_fact's replacement semantics (decision 6) — skip BEFORE writing
+        # evidence so the profiler never creates orphan evidence for a denied proposal.
+        if status in _NON_TERMINAL:
+            continue  # a non-terminal fact exists; propose_fact would deny ANY new proposal
+        if status == "REJECTED" and existing_fp == fingerprint:
+            continue  # sticky dedup: a rejected candidate is not re-proposed on identical value
+
+        evidence_ref = write_evidence(
+            conn,
+            fact_key=fk,
+            table_snapshot_at=metrics["table_snapshot_at"],
+            row_count=metrics["row_count"],
+            sample_size=metrics["sample_size"],
+            profile_version=metrics["profile_version"],
+            thresholds_used=metrics["thresholds"],
+            metric_values=metrics["metric_values"],
+            created_by=identity_to_jsonb(cmd.actor),  # pin 14: a dict, never a raw IdentityEnvelope
+        )
+        # Issue propose_fact using ITS exact arg contract (Phase 4): a live CatalogObjectRef under
+        # "ref"; propose_fact derives the proposal_fingerprint itself from proposed_value +
+        # profile_version + thresholds (matching `fingerprint` above).
+        propose_cmd = Command(
+            action="propose_fact",
+            aggregate="overlay_fact",
+            aggregate_id=fk,
+            args={
+                "ref": proposal.ref,
+                "fact_type": proposal.fact_type,
+                "use_case": proposal.use_case,
+                "proposed_value": dict(proposal.proposed_value),
+                "evidence_ref": evidence_ref,
+                "profile_version": metrics["profile_version"],
+                "thresholds": metrics["thresholds"],
+            },
+            actor=cmd.actor,
+            idempotency_key=f"profiler:{fk}:{fingerprint}",
+        )
+        result = propose(conn, propose_cmd)
+        if not result.accepted:
+            continue  # defensive: a concurrent change made the fact non-terminal — do not count it
+        produced.extend(result.produced_event_ids)
+
+    return CommandResult(
+        accepted=True,
+        aggregate_id=display_object_ref(ref),
+        produced_event_ids=tuple(produced),
+    )
+
+
 # `_OVERLAY_CATALOG` is a TUPLE of (action, handler) pairs (pin 12 — mirrors SP-0's `_CATALOG`),
 # NOT a dict. Phase 6 appends ("run_profiler", ...).
 _OVERLAY_CATALOG = (
@@ -602,6 +696,7 @@ _OVERLAY_CATALOG = (
     ("confirm_fact", confirm_fact),
     ("reject_fact", reject_fact),
     ("enter_fact", enter_fact),
+    ("run_profiler", _run_profiler),
 )
 
 
