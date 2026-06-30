@@ -99,7 +99,11 @@ def resolve_authority(
             role="compliance", gate="OVERLAY_COMPLIANCE", subjects=(), governance_queue=False
         )
     if fact_type == "approved_join":
-        assert isinstance(ref, ApprovedJoinRef)
+        if not isinstance(ref, ApprovedJoinRef):
+            raise TypeError(
+                f"approved_join authority requires an ApprovedJoinRef, "
+                f"got {type(ref).__name__}"
+            )
         from_owner = adapter.owner_of(ref.from_ref)
         to_owner = adapter.owner_of(ref.to_ref)
         unknown = from_owner is None or to_owner is None
@@ -115,7 +119,10 @@ def resolve_authority(
             governance_queue=unknown,
             dual=not same_owner,
         )
-    assert isinstance(ref, CatalogObjectRef)
+    if not isinstance(ref, CatalogObjectRef):
+        raise TypeError(
+            f"{fact_type!r} authority requires a CatalogObjectRef, got {type(ref).__name__}"
+        )
     owner = adapter.owner_of(ref)
     if owner is None:
         return Authority(

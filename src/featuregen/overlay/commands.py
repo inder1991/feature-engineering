@@ -9,7 +9,7 @@ they need) land in Task 4.3; Phase 6 appends `("run_profiler", _run_profiler)` t
 """
 from __future__ import annotations
 
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import UTC, datetime, timedelta
 
 from featuregen.commands.registry import get_command, register_command
@@ -31,9 +31,14 @@ from featuregen.overlay.identity import (
     fact_key,
     proposal_fingerprint,
 )
-from featuregen.overlay.profiler import ProfilerLimits, run_profiler_scan
+from featuregen.overlay.profiler import (
+    ProfilerLimits,
+    SchemaNotAllowedError,
+    run_profiler_scan,
+)
 from featuregen.overlay.state import fold_overlay_state
 from featuregen.overlay.store import append_overlay_event, load_fact
+from featuregen.security.audit import record_denial
 
 # Non-terminal folded statuses: while a fact sits in any of these a fresh proposal is denied —
 # a live VERIFIED fact stays usable until its OWN re-verify flow replaces it (no VERIFIED->DRAFT
@@ -51,6 +56,17 @@ _DEFAULT_TTL = timedelta(days=180)
 
 class OverlayCommandError(Exception):
     """Raised on overlay command misconfiguration / unauthorized task reads."""
+
+
+def _deny_audited(conn: DbConn, cmd: Command, key: str, reason: str) -> CommandResult:
+    """Emit a tamper-evident COMMAND_DENIED security_audit row for an AUTHORITY or four-eyes/SoD
+    handler denial (F4), then return the denial. These fine-grained denials happen INSIDE the handler
+    (the coarse PolicyAuthorizer only audits role/kind/scope + coarse SoD denials), so without this
+    they leave zero audit trace — a detective-control gap in a regulator-retention security chain.
+    Benign validation/duplicate/wrong-state/CAS-stale denials stay unaudited (plain CommandResult).
+    The resolved fact_key is recorded as aggregate_id (overlay commands carry cmd.aggregate_id=None)."""
+    record_denial(conn, replace(cmd, aggregate_id=key), reason)
+    return CommandResult(accepted=False, aggregate_id=key, denied_reason=reason)
 
 
 def _latest_proposed(stream):
@@ -229,10 +245,8 @@ def confirm_fact(conn: DbConn, cmd: Command) -> CommandResult:
     validated BEFORE OVERLAY_FACT_CONFIRMED is appended (pin 17). On success it arms the
     overlay_expiry timer (decision 5) and closes the open task."""
     if cmd.actor.actor_kind != "human":
-        return CommandResult(
-            accepted=False,
-            aggregate_id=cmd.aggregate_id or "",
-            denied_reason="confirm_fact requires a human authority",
+        return _deny_audited(
+            conn, cmd, cmd.aggregate_id or "", "confirm_fact requires a human authority"
         )
     adapter = current_catalog_adapter()
     args = cmd.args
@@ -263,16 +277,12 @@ def confirm_fact(conn: DbConn, cmd: Command) -> CommandResult:
     if fact_type == "approved_join" and authority.dual:
         return _confirm_approved_join(conn, cmd, key, stream, state, authority)
     if not _actor_is_authority(authority, cmd.actor):
-        return CommandResult(
-            accepted=False,
-            aggregate_id=key,
-            denied_reason="actor is not the resolved authority for this fact",
+        return _deny_audited(
+            conn, cmd, key, "actor is not the resolved authority for this fact"
         )
     if not proposer_ne_confirmer(stream, cmd.actor):
-        return CommandResult(
-            accepted=False,
-            aggregate_id=key,
-            denied_reason="four-eyes: a proposer may not confirm the same fact",
+        return _deny_audited(
+            conn, cmd, key, "four-eyes: a proposer may not confirm the same fact"
         )
     proposed = _latest_proposed(stream)
     # The confirmer may override the value on a REVERIFY/STALE correction. Validate the FINAL value
@@ -371,13 +381,9 @@ def _confirm_approved_join(conn, cmd, key, stream, state, authority):
     is_owner = actor.subject in owners
     is_governance = authority.governance_queue and "platform-admin" in actor.role_claims
     if not (is_owner or is_governance):
-        return CommandResult(
-            accepted=False, aggregate_id=key, denied_reason="actor is not an owner of either side of the join"
-        )
+        return _deny_audited(conn, cmd, key, "actor is not an owner of either side of the join")
     if not proposer_ne_confirmer(stream, actor):
-        return CommandResult(
-            accepted=False, aggregate_id=key, denied_reason="proposer may not confirm (four-eyes, §6.5)"
-        )
+        return _deny_audited(conn, cmd, key, "proposer may not confirm (four-eyes, §6.5)")
     # Decide first-vs-second from the CURRENT cycle's partials only (C1): the fold resets
     # state.partial_confirmers = [] on every OVERLAY_FACT_CONFIRMED, and EXPIRED/STALED leave it
     # empty, so a re-verify cycle starts with no partials. Scanning the raw stream would treat a
@@ -406,20 +412,16 @@ def _confirm_approved_join(conn, cmd, key, stream, state, authority):
         return CommandResult(accepted=True, aggregate_id=key, produced_event_ids=(evt.event_id,))
     first = partial[-1]["subject"]
     if actor.subject == first:
-        return CommandResult(
-            accepted=False,
-            aggregate_id=key,
-            denied_reason="this owner already confirmed; awaiting the other owner",
+        return _deny_audited(
+            conn, cmd, key, "this owner already confirmed; awaiting the other owner"
         )
     # Side coverage (finding 3): when one side has a KNOWN owner and the other routes to the
     # governance queue, the two confirmations must be one owner + one platform-admin. Two
     # platform-admins must NOT verify a join that has a known owner (that bypasses the owner's side).
     if authority.governance_queue and owners:
         if first not in owners and actor.subject not in owners:
-            return CommandResult(
-                accepted=False,
-                aggregate_id=key,
-                denied_reason="a known owner must confirm their side of the join",
+            return _deny_audited(
+                conn, cmd, key, "a known owner must confirm their side of the join"
             )
     # Validate the FINAL value before the second-owner CONFIRMED append (pin 17 — the join confirm
     # path validates too, even though approved_join takes no override). On a re-verify, re-affirm
@@ -437,6 +439,11 @@ def _confirm_approved_join(conn, cmd, key, stream, state, authority):
             accepted=False, aggregate_id=key, denied_reason=f"invalid confirmed value: {exc}"
         )
     expires_at = datetime.now(UTC) + _DEFAULT_TTL
+    # Thread the cycle-stable head (F7): _cas_target at PARTIALLY_CONFIRMED returns
+    # `confirmed_event_id or draft_event_id` — cycle 1 yields the draft (unchanged), a re-verify
+    # cycle yields the prior confirmed_event_id (the confirmation actually being re-verified), so the
+    # recorded causality (confirms_event_id + caused_by) matches single-fact confirm_fact.
+    confirms_event_id = _cas_target(state)
     confirmed = append_overlay_event(
         conn,
         fact_key=key,
@@ -445,10 +452,10 @@ def _confirm_approved_join(conn, cmd, key, stream, state, authority):
             "value": value,
             "confirmers": _join_confirmers(authority, first, actor.subject),
             "expires_at": expires_at.isoformat(),
-            "confirms_event_id": state.draft_event_id,
+            "confirms_event_id": confirms_event_id,
         },
         actor=actor,
-        caused_by=state.draft_event_id,
+        caused_by=confirms_event_id,
         expected_version=stream[-1].stream_version,  # pin OCC to the folded head (C2)
     )
     # local import: freshness.py is created in Task 4.3 (avoids a top-level forward dependency)
@@ -464,10 +471,8 @@ def reject_fact(conn: DbConn, cmd: Command) -> CommandResult:
     `target_event_id`; fine-grained authority; records the rejected proposal's
     `retired_fingerprint` (sticky-denial fuel for propose_fact) and closes the open task."""
     if cmd.actor.actor_kind != "human":
-        return CommandResult(
-            accepted=False,
-            aggregate_id=cmd.aggregate_id or "",
-            denied_reason="reject_fact requires a human authority",
+        return _deny_audited(
+            conn, cmd, cmd.aggregate_id or "", "reject_fact requires a human authority"
         )
     adapter = current_catalog_adapter()
     args = cmd.args
@@ -493,13 +498,20 @@ def reject_fact(conn: DbConn, cmd: Command) -> CommandResult:
         )
     authority = resolve_authority(conn, adapter, ref, fact_type)
     if not _actor_is_authority(authority, cmd.actor):
-        return CommandResult(
-            accepted=False,
-            aggregate_id=key,
-            denied_reason="actor is not the resolved authority for this fact",
+        return _deny_audited(
+            conn, cmd, key, "actor is not the resolved authority for this fact"
         )
     proposed = _latest_proposed(stream)
-    retired_fp = proposed.payload.get("proposal_fingerprint") if proposed else None
+    proposed_value = proposed.payload.get("proposed_value") if proposed else None
+    # Retire the fingerprint of the value actually under review (F8, mirrors confirm_fact's P1b).
+    # On a REVERIFY/STALE reject AFTER a confirm-time override, state.prior_value is the corrected
+    # value V' — retire ITS fingerprint so sticky-reject protects V' (not the discarded cycle-1 V0).
+    # The value-equality guard keeps the no-override path on the STORED proposal fingerprint, which
+    # also encodes profile_version+thresholds so a profiler re-propose of the same value still sticks.
+    if state.status in ("REVERIFY", "STALE") and state.prior_value not in (None, proposed_value):
+        retired_fp = proposal_fingerprint(state.prior_value)
+    else:
+        retired_fp = proposed.payload.get("proposal_fingerprint") if proposed else None
     rejected = append_overlay_event(
         conn,
         fact_key=key,
@@ -526,10 +538,8 @@ def enter_fact(conn: DbConn, cmd: Command) -> CommandResult:
     adapter = current_catalog_adapter()
     args = cmd.args
     if cmd.actor.actor_kind != "human":
-        return CommandResult(
-            accepted=False,
-            aggregate_id="",
-            denied_reason="self-confirm (enter_fact) requires a human authority",
+        return _deny_audited(
+            conn, cmd, "", "self-confirm (enter_fact) requires a human authority"
         )
     ref = args["ref"]
     fact_type = args["fact_type"]
@@ -549,22 +559,22 @@ def enter_fact(conn: DbConn, cmd: Command) -> CommandResult:
     # holding both data_owner and platform-admin would otherwise clear `_actor_is_authority`'s
     # governance branch and bypass the two-party propose->confirm path. Route it through propose.
     if authority.governance_queue:
-        return CommandResult(
-            accepted=False,
-            aggregate_id=key,
-            denied_reason="unowned (governance-queue) fact cannot be self-confirmed; use propose/confirm",
+        return _deny_audited(
+            conn,
+            cmd,
+            key,
+            "unowned (governance-queue) fact cannot be self-confirmed; use propose/confirm",
         )
     if authority.dual:
-        return CommandResult(
-            accepted=False,
-            aggregate_id=key,
-            denied_reason="dual-owner approved_join cannot be self-confirmed; use the two-task flow",
+        return _deny_audited(
+            conn,
+            cmd,
+            key,
+            "dual-owner approved_join cannot be self-confirmed; use the two-task flow",
         )
     if not _actor_is_authority(authority, cmd.actor):
-        return CommandResult(
-            accepted=False,
-            aggregate_id=key,
-            denied_reason="actor is not the resolved authority for this fact",
+        return _deny_audited(
+            conn, cmd, key, "actor is not the resolved authority for this fact"
         )
     if load_fact(conn, key):
         return CommandResult(
@@ -703,7 +713,26 @@ def _run_profiler(conn: DbConn, cmd: Command) -> CommandResult:
     ref = CatalogObjectRef(**dict(cmd.args["ref"]))
     limits = ProfilerLimits(allowed_schemas=frozenset(cmd.args.get("allowed_schemas", ())))
     adapter = current_catalog_adapter()
-    proposals = run_profiler_scan(conn, adapter, ref, limits=limits)
+    # F6(a): run the SCAN phase under an in-code read-only guard (defense-in-depth for §5.2's
+    # read-only DB role) so a stray write inside run_profiler_scan fails closed. The scan only
+    # SELECTs, so a savepoint we immediately roll back loses nothing; the rollback also clears
+    # `transaction_read_only = on` (it was SET LOCAL after the savepoint), restoring read-write for
+    # the subsequent propose_fact write phase — preserving the intentional single-transaction design.
+    # F6(b): an off-allowlist target raises SchemaNotAllowedError; every other handler denial returns
+    # a CommandResult, so catch it, record a §6.5 security-audit denial (authz_policy checks only
+    # capability+kind, NOT the schema, so the handler must audit it) and return cleanly.
+    conn.execute("SAVEPOINT profiler_readonly")
+    conn.execute("SET LOCAL transaction_read_only = on")
+    try:
+        proposals = run_profiler_scan(conn, adapter, ref, limits=limits)
+    except SchemaNotAllowedError as exc:
+        conn.execute("ROLLBACK TO SAVEPOINT profiler_readonly")  # clears read-only -> audit can write
+        record_denial(conn, cmd, str(exc))
+        return CommandResult(
+            accepted=False, aggregate_id=display_object_ref(ref), denied_reason=str(exc)
+        )
+    conn.execute("ROLLBACK TO SAVEPOINT profiler_readonly")  # clears read-only -> writes allowed again
+    conn.execute("RELEASE SAVEPOINT profiler_readonly")
 
     propose = get_command("propose_fact")
     produced: list[str] = []

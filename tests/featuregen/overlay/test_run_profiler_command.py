@@ -10,6 +10,7 @@ authoritative source), not the projection.
 """
 from dataclasses import asdict
 
+import psycopg
 import pytest
 
 from featuregen.authz.authorizer import PolicyAuthorizer
@@ -126,6 +127,67 @@ def _evidence_count(conn, fk):
     return conn.execute(
         "SELECT count(*) FROM overlay_evidence WHERE fact_key = %s", (fk,)
     ).fetchone()[0]
+
+
+def test_run_profiler_off_allowlist_schema_denied_and_audited(db):
+    """F6(b): an off-allowlist target must yield a CLEAN, audited CommandResult denial — NOT a
+    SchemaNotAllowedError propagating out of execute_command. §6.5 maps the allowlist check to the
+    security-audit stream, but authz_policy only checks capability+kind (not the schema), so the
+    handler must record the denial itself. Pre-fix execute_command raises the exception."""
+    ref = CatalogObjectRef(
+        catalog_source="pg:core", object_kind="table", schema="restricted", table="secrets"
+    )
+    adapter = _Catalog(_columns(ref, [("id", "integer")]), owners={})
+    _setup_overlay(db, adapter)
+
+    result = execute_command(db, _run_profiler_cmd(ref))  # must NOT raise
+    assert result.accepted is False
+    assert "allowlist" in (result.denied_reason or "").lower()
+    # §6.5: the denied attempt is recorded in the security-audit stream.
+    n = db.execute(
+        "SELECT count(*) FROM security_audit "
+        "WHERE attempted_action = 'run_profiler' AND decision = 'denied'"
+    ).fetchone()[0]
+    assert n == 1
+
+
+def test_profiler_scan_runs_read_only(db, monkeypatch):
+    """F6(a): the scan phase runs under an in-code read-only guard (defense-in-depth for §5.2's
+    read-only role), while the SUBSEQUENT propose_fact write phase still succeeds in the SAME
+    transaction. A write attempted DURING the scan is rejected with ReadOnlySqlTransaction (probed
+    inside its own savepoint so the abort is contained); the scan then completes and drafts are
+    proposed. Pre-fix the probe write succeeds (no read-only mode set) -> pytest.raises fails."""
+    import featuregen.overlay.profiler as prof
+
+    real = prof._profile_single
+    probed = {"checked": False}
+
+    def probing(conn, ref, column, *, sample):
+        if not probed["checked"]:
+            probed["checked"] = True
+            conn.execute("SAVEPOINT _probe")
+            with pytest.raises(psycopg.errors.ReadOnlySqlTransaction):
+                conn.execute("CREATE TEMP TABLE _probe_write(i int)")  # write during scan must fail
+            conn.execute("ROLLBACK TO SAVEPOINT _probe")  # contain the aborted subtransaction
+        return real(conn, ref, column, sample=sample)
+
+    monkeypatch.setattr(prof, "_profile_single", probing)
+
+    db.execute("CREATE TABLE prof_run_ro (account_id integer)")
+    db.execute("INSERT INTO prof_run_ro SELECT g FROM generate_series(1, 30) AS g")
+    ref = CatalogObjectRef(
+        catalog_source="pg:core", object_kind="table", schema="public", table="prof_run_ro"
+    )
+    adapter = _Catalog(
+        _columns(ref, [("account_id", "integer")]),
+        owners={("public", "prof_run_ro"): "user:owner-ro"},
+    )
+    _setup_overlay(db, adapter)
+
+    result = execute_command(db, _run_profiler_cmd(ref))
+    assert result.accepted is True          # write phase (propose_fact) still works after the scan
+    assert result.produced_event_ids        # drafts were proposed
+    assert probed["checked"] is True        # the read-only probe actually ran
 
 
 def test_run_profiler_proposes_new_drafts(db):

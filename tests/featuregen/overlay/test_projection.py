@@ -10,7 +10,7 @@ from featuregen.overlay.projection import (
     read_proposal,
 )
 from featuregen.overlay.store import append_overlay_event
-from featuregen.projections.runner import run_projection
+from featuregen.projections.runner import rebuild_projection, run_projection
 
 
 def _human():
@@ -182,3 +182,42 @@ def test_reproposal_after_rejected_only_keeps_new_dependency_rows(db):
     assert fk in dependents_of(db, "core.transactions")
     assert fk in dependents_of(db, "core.transactions.txn_id")
     assert dependents_of(db, "core.transactions.id") == []
+
+
+def test_confirmed_at_is_replay_deterministic_from_event_time(db):
+    """confirmed_at must come from the event envelope (occurred_at), NOT projection
+    wall-clock now(), so reset+replay rebuilds reproduce the EXACT same timestamp
+    (Projection Protocol: deterministic/replayable, §3.6).
+
+    NOTE: equality-across-rebuild ALONE cannot catch the bug under this harness — the
+    `db` fixture runs the whole test in one rolled-back transaction, and SQL now() ==
+    transaction_timestamp() is stable within a transaction, so a buggy now()-sourced
+    confirmed_at would still equal itself across an in-transaction rebuild. The
+    load-bearing assertion is `confirmed_at == confirmed.occurred_at`: with now() the
+    stored value is the transaction-start clock (!= the event's recorded action time)
+    and this fails; once sourced from the envelope it passes and is replay-stable.
+    """
+    fk, draft = _grain_fact(db)
+    confirmed = append_overlay_event(
+        db, fact_key=fk, type=facts.OVERLAY_FACT_CONFIRMED, actor=_human(),
+        expected_version=1,
+        payload={
+            "value": {"columns": ["id"], "is_unique": True},
+            "confirmers": [{"subject": "owner_a", "role": "data_owner"}],
+            "expires_at": "2026-12-31T00:00:00+00:00",
+            "confirms_event_id": draft.event_id,
+        },
+    )
+    proj = OverlayProjection()
+    run_projection(db, proj)
+
+    first = current_fact(db, fk)["confirmed_at"]
+    # Anchored to the frozen event envelope, not projection wall-clock now().
+    assert first == confirmed.occurred_at
+
+    # Rebuild: reset() + deterministic replay from global_seq 0.
+    rebuild_projection(db, proj)
+    second = current_fact(db, fk)["confirmed_at"]
+
+    assert second == first                    # replay reproduces the identical timestamp
+    assert second == confirmed.occurred_at    # still envelope-sourced after rebuild

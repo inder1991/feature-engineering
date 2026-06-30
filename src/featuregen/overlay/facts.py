@@ -48,12 +48,20 @@ FACT_VALUE_SCHEMAS: dict[str, dict] = {
             "lag_hours": {"type": "number"},
         },
         "additionalProperties": False,
+        # basis "event_time_plus_lag" is undefined without a lag, so mandate lag_hours for it.
+        "if": {"properties": {"basis": {"const": "event_time_plus_lag"}}},
+        "then": {"required": ["lag_hours"]},
     },
     GRAIN: {
         "type": "object",
         "required": ["columns", "is_unique"],
         "properties": {
-            "columns": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+            "columns": {
+                "type": "array",
+                "items": {"type": "string"},
+                "minItems": 1,
+                "uniqueItems": True,
+            },
             "is_unique": {"type": "boolean"},
         },
         "additionalProperties": False,
@@ -81,6 +89,7 @@ FACT_VALUE_SCHEMAS: dict[str, dict] = {
             "column_pairs": {
                 "type": "array",
                 "minItems": 1,
+                "uniqueItems": True,
                 "items": {
                     "type": "object",
                     "required": ["from_col", "to_col"],

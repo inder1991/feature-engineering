@@ -7,7 +7,7 @@ from featuregen.contracts import Command, ConcurrencyError
 from featuregen.identity.build import build_human_identity, build_service_identity
 from featuregen.overlay.commands import confirm_fact, propose_fact, reject_fact
 from featuregen.overlay.freshness import fire_due_overlay_expiries
-from featuregen.overlay.identity import CatalogObjectRef, fact_key
+from featuregen.overlay.identity import CatalogObjectRef, fact_key, proposal_fingerprint
 from featuregen.overlay.state import fold_overlay_state
 from featuregen.overlay.store import load_fact
 
@@ -208,6 +208,72 @@ def test_reverify_no_override_keeps_last_verified_override_not_original(db, cata
     st = fold_overlay_state(load_fact(db, key))
     # PRE-FIX this assert fails: value reverts to v0. POST-FIX value stays vprime.
     assert st.value == vprime, f"re-verify silently reverted override to {st.value}"
+
+
+def test_reject_under_reverify_retires_corrected_override_fingerprint(db, catalog):
+    """F8: reject_fact must retire the fingerprint of the value actually under review. After a
+    confirm-time OVERRIDE, a REVERIFY/STALE reject is reviewing the corrected value (state.prior_value
+    V'), not the original cycle-1 proposal V0. Pre-fix it retired V0's stored fingerprint, so sticky-
+    reject failed to protect the corrected value (V' could be re-proposed) and wrongly blocked the
+    never-rejected V0. Mirrors confirm_fact's P1b selection."""
+    catalog.set_owner(_orders(), "user:alice")
+    v0 = {"columns": ["order_id"], "is_unique": True}
+    vprime = {"columns": ["customer_id"], "is_unique": True}
+    draft = _propose(db, value=v0)  # proposer = BOB
+    res = confirm_fact(
+        db,
+        Command(
+            "confirm_fact",
+            "overlay_fact",
+            None,
+            {"ref": _orders(), "fact_type": "grain", "target_event_id": draft, "value": vprime},
+            ALICE,
+            "c1",
+        ),
+    )
+    assert res.accepted, res.denied_reason
+    key = fact_key(_orders(), "grain")
+    st = fold_overlay_state(load_fact(db, key))
+    assert st.status == "VERIFIED" and st.value == vprime
+    confirmed_id = st.confirmed_event_id
+    # expire the fact (+181d) -> REVERIFY; the value under review is now V' (state.prior_value)
+    assert fire_due_overlay_expiries(db, now=datetime.now(UTC) + timedelta(days=181)) == 1
+    st = fold_overlay_state(load_fact(db, key))
+    assert st.status == "REVERIFY" and st.prior_value == vprime
+    # reject the re-verify (CAS on the prior confirmed event id)
+    rej = reject_fact(db, _reject_cmd(target=confirmed_id, actor=ALICE, key="r1"))
+    assert rej.accepted, rej.denied_reason
+    rejected = next(e for e in load_fact(db, key) if e.type == "OVERLAY_FACT_REJECTED")
+    # F8: the retired fingerprint is the corrected V''s, NOT the original V0's.
+    assert rejected.payload["retired_fingerprint"] == proposal_fingerprint(vprime)
+    assert rejected.payload["retired_fingerprint"] != proposal_fingerprint(v0)
+
+    # sticky contract end-to-end: re-proposing the just-rejected V' is denied; the never-rejected V0
+    # is admitted (pre-fix these were inverted — V' bypassed sticky and V0 was wrongly blocked).
+    deny = propose_fact(
+        db,
+        Command(
+            "propose_fact",
+            "overlay_fact",
+            None,
+            {"ref": _orders(), "fact_type": "grain", "proposed_value": vprime},
+            BOB,
+            "rp1",
+        ),
+    )
+    assert deny.accepted is False and "sticky" in deny.denied_reason
+    allow = propose_fact(
+        db,
+        Command(
+            "propose_fact",
+            "overlay_fact",
+            None,
+            {"ref": _orders(), "fact_type": "grain", "proposed_value": v0},
+            BOB,
+            "rp2",
+        ),
+    )
+    assert allow.accepted is True, allow.denied_reason
 
 
 # --- security-guard DENIAL paths (each test must FAIL if its guard were removed) ---------------

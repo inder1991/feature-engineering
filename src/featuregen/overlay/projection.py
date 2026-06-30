@@ -125,7 +125,7 @@ class OverlayProjection:
                     (fact_key, object_ref, fact_type, use_case, status, value, confirmers,
                      confirmed_at, expires_at, prior_value, confirmed_event_id, updated_seq)
                 SELECT %s, prop.object_ref, prop.fact_type, prop.use_case,
-                       'VERIFIED', %s, %s, now(), %s, NULL, %s, %s
+                       'VERIFIED', %s, %s, %s, %s, NULL, %s, %s
                 FROM overlay_proposal prop WHERE prop.fact_key = %s
                 ON CONFLICT (fact_key) DO UPDATE SET
                     status = 'VERIFIED',
@@ -140,7 +140,7 @@ class OverlayProjection:
                 """,
                 (
                     fk, Jsonb(payload["value"]), Jsonb(payload["confirmers"]),
-                    payload.get("expires_at"), event.event_id, seq, fk,
+                    event.occurred_at, payload.get("expires_at"), event.event_id, seq, fk,
                 ),
             )
             conn.execute(
@@ -148,6 +148,28 @@ class OverlayProjection:
                 "prior_value = NULL, updated_seq = %s WHERE fact_key = %s AND updated_seq < %s",
                 (event.event_id, seq, fk, seq),
             )
+            # Re-derive the dependency set from the AUTHORITATIVE (confirmed) value, not the
+            # proposal: a human override (pin 17) can change the referenced columns away from the
+            # proposed set, so the index must follow the confirmed value or catalog-change detection
+            # watches the wrong columns. Idempotent for no-override/approved_join (reproduces the
+            # PROPOSED set) and self-heals re-verify (EXPIRED/STALED carry no new PROPOSED).
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(
+                    "SELECT object_ref, fact_type FROM overlay_proposal WHERE fact_key = %s", (fk,)
+                )
+                prop = cur.fetchone()
+            if prop is not None:
+                conn.execute(
+                    "DELETE FROM overlay_fact_dependency WHERE fact_key = %s", (fk,)
+                )
+                for ref_object in _dependencies(
+                    prop["object_ref"], prop["fact_type"], payload["value"]
+                ):
+                    conn.execute(
+                        "INSERT INTO overlay_fact_dependency (fact_key, ref_object) "
+                        "VALUES (%s, %s) ON CONFLICT (fact_key, ref_object) DO NOTHING",
+                        (fk, ref_object),
+                    )
 
         elif event.type == facts.OVERLAY_FACT_EXPIRED:
             conn.execute(

@@ -71,6 +71,47 @@ def test_data_fact_rejects_use_case():
         facts.validate_fact_value(facts.GRAIN, {"columns": ["id"], "is_unique": True}, "fraud")
 
 
+def test_availability_time_requires_lag_hours_for_event_time_plus_lag():
+    # F11(a): valid when lag_hours is present
+    facts.validate_fact_value(
+        facts.AVAILABILITY_TIME,
+        {"column": "posted_at", "basis": "event_time_plus_lag", "lag_hours": 6},
+    )
+    # gap (a): event_time_plus_lag without lag_hours must be rejected
+    with pytest.raises(FactValidationError):
+        facts.validate_fact_value(
+            facts.AVAILABILITY_TIME,
+            {"column": "posted_at", "basis": "event_time_plus_lag"},
+        )
+
+
+def test_grain_columns_reject_duplicates():
+    # F11(b): valid distinct columns still accepted
+    facts.validate_fact_value(facts.GRAIN, {"columns": ["id", "region"], "is_unique": True})
+    # gap (b): duplicate grain columns must be rejected
+    with pytest.raises(FactValidationError):
+        facts.validate_fact_value(facts.GRAIN, {"columns": ["id", "id"], "is_unique": True})
+
+
+def test_approved_join_column_pairs_reject_duplicates():
+    # gap (c): duplicate column_pairs must be rejected
+    with pytest.raises(FactValidationError):
+        facts.validate_fact_value(
+            facts.APPROVED_JOIN,
+            {
+                "from_ref": {"catalog_source": "pg:core", "object_kind": "table",
+                             "schema": "core", "table": "transactions"},
+                "to_ref": {"catalog_source": "pg:core", "object_kind": "table",
+                           "schema": "core", "table": "customers"},
+                "column_pairs": [
+                    {"from_col": "customer_id", "to_col": "id"},
+                    {"from_col": "customer_id", "to_col": "id"},
+                ],
+                "cardinality": "N:1",
+            },
+        )
+
+
 def test_all_six_event_types_register_and_validate():
     reg = event_registry()  # already populated by the autouse fixture
     for type_name in (
