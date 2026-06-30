@@ -14,6 +14,7 @@ from datetime import UTC
 from psycopg.rows import dict_row
 
 from featuregen.overlay.catalog import CatalogAdapter
+from featuregen.overlay.facts import FactValidationError, validate_fact_value
 from featuregen.overlay.identity import (
     ApprovedJoinRef,
     CatalogObjectRef,
@@ -22,6 +23,7 @@ from featuregen.overlay.identity import (
 )
 
 _REASON_MISSING = "no_confirmed_fact"
+_REASON_CATALOG_INVALID = "catalog_value_invalid"
 _REASON_BY_STATUS = {
     "DRAFT": "draft_unconfirmed",
     "PARTIALLY_CONFIRMED": "partial_confirmation_pending",
@@ -68,6 +70,29 @@ def resolve_fact(
     # CatalogAdapter.get_fact protocol takes a CatalogObjectRef, so skip catalog precedence (finding 7).
     catalog_fact = None if fact_type == "approved_join" else adapter.get_fact(ref, fact_type, use_case)
     if catalog_fact is not None and catalog_fact.authoritative:
+        # Trust boundary: a pluggable CatalogAdapter is a public extension point, so its
+        # authoritative value must clear the SAME per-type schema every overlay write enforces
+        # (facts.validate_fact_value) before we stamp it VERIFIED. On failure FAIL CLOSED and do
+        # NOT fall through to the overlay: catalog precedence means the catalog owns this fact, and
+        # serving a stale overlay value would mask the catalog corruption. (TypeError/ValueError
+        # cover a non-Mapping value, since validate_fact_value does dict(value).)
+        try:
+            validate_fact_value(fact_type, catalog_fact.value, use_case)
+        except (FactValidationError, TypeError, ValueError):
+            return ResolvedFact(
+                value=None,
+                status="missing",
+                source="catalog",
+                catalog_object=obj,
+                fact_type=fact_type,
+                use_case=use_case,
+                provenance={"catalog_source": getattr(ref, "catalog_source", None)},
+                confirmed_by=(),
+                confirmed_at=None,
+                expires_at=None,
+                reason_if_missing=_REASON_CATALOG_INVALID,
+                prior_value=None,
+            )
         return ResolvedFact(
             value=catalog_fact.value,
             status="VERIFIED",

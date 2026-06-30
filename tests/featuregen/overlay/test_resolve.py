@@ -82,17 +82,49 @@ def test_authoritative_catalog_beats_overlay(db):
         db, key, status="VERIFIED", value={"column": "origination_ts"},
         confirmed_event_id="evt_overlay",
     )
-    adapter = _StubCatalog(CatalogFact(value={"column": "as_of_date"}, authoritative=True))
+    adapter = _StubCatalog(
+        CatalogFact(value={"column": "as_of_date", "basis": "posted_at"}, authoritative=True)
+    )
 
     resolved = resolve_fact(db, adapter, _REF, "availability_time")
 
     assert isinstance(resolved, ResolvedFact)
     assert resolved.source == "catalog"
     assert resolved.status == "VERIFIED"
-    assert resolved.value == {"column": "as_of_date"}
+    assert resolved.value == {"column": "as_of_date", "basis": "posted_at"}
     assert resolved.catalog_object == display_object_ref(_REF)
     assert resolved.reason_if_missing is None
     assert resolved.prior_value is None
+
+
+def test_malformed_authoritative_catalog_not_served_as_verified(db):
+    # A pluggable catalog claims authority but returns a value that violates the
+    # availability_time schema (missing required "basis"). It must NOT be served as VERIFIED.
+    adapter = _StubCatalog(CatalogFact(value={"bogus": "x"}, authoritative=True))
+
+    resolved = resolve_fact(db, adapter, _REF, "availability_time")
+
+    assert resolved.status != "VERIFIED"
+    assert resolved.value is None
+    assert resolved.reason_if_missing == "catalog_value_invalid"
+
+
+def test_malformed_authoritative_catalog_does_not_fall_through_to_overlay(db):
+    # Catalog precedence: the malformed authoritative catalog fact must fail closed and must
+    # NOT be masked by a stale overlay VERIFIED value for the same fact_key.
+    key = fact_key(_REF, "availability_time")
+    _seed_state(
+        db, key, status="VERIFIED", value={"column": "origination_ts", "basis": "posted_at"},
+        confirmed_event_id="evt_overlay_stale",
+    )
+    adapter = _StubCatalog(CatalogFact(value={"bogus": "x"}, authoritative=True))
+
+    resolved = resolve_fact(db, adapter, _REF, "availability_time")
+
+    assert resolved.source == "catalog"
+    assert resolved.status != "VERIFIED"
+    assert resolved.value is None
+    assert resolved.reason_if_missing == "catalog_value_invalid"
 
 
 def test_missing_is_fail_closed_with_reason(db):
