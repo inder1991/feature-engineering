@@ -2,7 +2,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from featuregen.contracts import Command
+from featuregen.contracts import Command, ConcurrencyError
 from featuregen.identity.build import build_human_identity
 from featuregen.overlay.commands import confirm_fact, propose_fact, reject_fact
 from featuregen.overlay.freshness import fire_due_overlay_expiries
@@ -225,3 +225,47 @@ def test_mixed_two_admins_cannot_bypass_known_owner(db, catalog):
     assert second.accepted is False
     assert "known owner" in second.denied_reason
     assert fold_overlay_state(load_fact(db, key)).status == "PARTIALLY_CONFIRMED"
+
+
+# --- C2: dual-owner join appends are CAS-pinned to the observed head ---------------------------
+
+
+def test_join_partial_pins_expected_version_to_observed_head(db, catalog, occ_spy):
+    """C2: the first owner's OVERLAY_FACT_PARTIALLY_CONFIRMED append is version-pinned to the head
+    the handler folded against (the DRAFT at stream_version 1). The WORST unpinned case: both join
+    owners load DRAFT, both take the first-confirmer branch and both append PARTIALLY_CONFIRMED,
+    each closing only their own side -> the join is permanently stranded (no CONFIRMED, no open
+    task, no self-heal). Pinning makes the second appender collide and re-load into the
+    second-confirmer -> VERIFIED path."""
+    catalog.set_owner(_orders(), "user:alice")
+    catalog.set_owner(_customers(), "user:bob")
+    draft = _propose(db)  # DRAFT at stream_version 1
+    first = _confirm(db, target=draft, actor=ALICE, key="c1")
+    assert first.accepted is True
+    assert occ_spy["OVERLAY_FACT_PARTIALLY_CONFIRMED"] == 1  # pinned & non-None
+
+
+def test_join_full_confirm_pins_expected_version_to_observed_head(db, catalog, occ_spy):
+    """C2: the second owner's OVERLAY_FACT_CONFIRMED append is version-pinned to the observed head
+    ([PROPOSED, PARTIALLY_CONFIRMED] -> stream_version 2)."""
+    catalog.set_owner(_orders(), "user:alice")
+    catalog.set_owner(_customers(), "user:bob")
+    draft = _propose(db)  # DRAFT at stream_version 1
+    first = _confirm(db, target=draft, actor=ALICE, key="c1")  # PARTIALLY_CONFIRMED at version 2
+    assert first.accepted is True
+    second = _confirm(db, target=draft, actor=BOB, key="c2")
+    assert second.accepted is True
+    assert occ_spy["OVERLAY_FACT_CONFIRMED"] == 2  # pinned & non-None
+
+
+def test_join_partial_append_collides_with_concurrent_partial(db, catalog, inject_concurrent_append):
+    """C2 (genuine concurrency): a concurrent first-owner confirm lands PARTIALLY_CONFIRMED
+    out-of-band between this handler's fold and its own append. Because the partial append is
+    pinned to the head the handler folded against, it must raise ConcurrencyError rather than land
+    a SECOND PARTIALLY_CONFIRMED that strands the join."""
+    catalog.set_owner(_orders(), "user:alice")
+    catalog.set_owner(_customers(), "user:bob")
+    draft = _propose(db)  # DRAFT at stream_version 1
+    inject_concurrent_append("OVERLAY_FACT_PARTIALLY_CONFIRMED")
+    with pytest.raises(ConcurrencyError):
+        _confirm(db, target=draft, actor=ALICE, key="c1")

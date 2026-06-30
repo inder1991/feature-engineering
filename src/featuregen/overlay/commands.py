@@ -278,6 +278,10 @@ def confirm_fact(conn: DbConn, cmd: Command) -> CommandResult:
         },
         actor=cmd.actor,
         caused_by=args["target_event_id"],
+        # Pin OCC to the head this handler folded against (C2): the target_event_id compare is only
+        # a pre-append read; re-asserting the version atomically stops two concurrent authorities
+        # from both landing a CONFIRMED (lost-update). Mirrors freshness.py _apply_expiry/_stale_one.
+        expected_version=stream[-1].stream_version,
     )
     # Arm the SP-0 overlay_expiry timer on this fact-key stream (decision 5; freshness.py is
     # created in this phase, Task 4.3, pin 10).
@@ -354,6 +358,10 @@ def _confirm_approved_join(conn, cmd, key, stream, state, authority):
             },
             actor=actor,
             caused_by=state.draft_event_id,
+            # Pin OCC to the folded head (C2): otherwise both owners can load DRAFT, both take this
+            # first-confirmer branch and both append PARTIALLY_CONFIRMED, permanently stranding the
+            # join (no CONFIRMED, no open task). The loser collides and re-loads into the second path.
+            expected_version=stream[-1].stream_version,
         )
         _close_fact_tasks(conn, key, subject=actor.subject, reason="first owner confirmed (partial)")
         return CommandResult(accepted=True, aggregate_id=key, produced_event_ids=(evt.event_id,))
@@ -396,6 +404,7 @@ def _confirm_approved_join(conn, cmd, key, stream, state, authority):
         },
         actor=actor,
         caused_by=state.draft_event_id,
+        expected_version=stream[-1].stream_version,  # pin OCC to the folded head (C2)
     )
     # local import: freshness.py is created in Task 4.3 (avoids a top-level forward dependency)
     from featuregen.overlay.freshness import schedule_expiry
@@ -458,6 +467,8 @@ def reject_fact(conn: DbConn, cmd: Command) -> CommandResult:
         },
         actor=cmd.actor,
         caused_by=args["target_event_id"],
+        # Pin OCC to the folded head (C2): stops a confirm-vs-reject lost-update on the same head.
+        expected_version=stream[-1].stream_version,
     )
     _close_fact_tasks(conn, key, reason="fact rejected")
     return CommandResult(accepted=True, aggregate_id=key, produced_event_ids=(rejected.event_id,))

@@ -1,7 +1,7 @@
 import pytest
 from psycopg.rows import dict_row
 
-from featuregen.contracts import Command
+from featuregen.contracts import Command, ConcurrencyError
 from featuregen.identity.build import build_human_identity, build_service_identity
 from featuregen.overlay.commands import confirm_fact, propose_fact, reject_fact
 from featuregen.overlay.identity import CatalogObjectRef, fact_key
@@ -238,3 +238,39 @@ def test_reject_wrong_authority_is_denied(db, catalog):
     assert res.accepted is False
     assert "authority" in res.denied_reason
     assert not _has_event(db, "grain", "OVERLAY_FACT_REJECTED")
+
+
+# --- C2: command appends are CAS-pinned to the observed head (lost-update guard) ---------------
+
+
+def test_confirm_pins_expected_version_to_observed_head(db, catalog, occ_spy):
+    """C2: confirm_fact's OVERLAY_FACT_CONFIRMED append is version-pinned to the head it folded
+    against (the DRAFT at stream_version 1), NOT expected_version=None. Without pinning, two
+    concurrent confirmers both pass the read-compare CAS and both append (double-CONFIRMED /
+    confirm-vs-reject lost-update)."""
+    catalog.set_owner(_orders(), "user:alice")
+    draft = _propose(db)  # DRAFT at stream_version 1
+    res = confirm_fact(db, _confirm_cmd(target=draft, actor=ALICE))
+    assert res.accepted is True
+    assert occ_spy["OVERLAY_FACT_CONFIRMED"] == 1  # pinned & non-None
+
+
+def test_reject_pins_expected_version_to_observed_head(db, catalog, occ_spy):
+    """C2: reject_fact's OVERLAY_FACT_REJECTED append is version-pinned to the observed head."""
+    catalog.set_owner(_orders(), "user:alice")
+    draft = _propose(db)  # DRAFT at stream_version 1
+    res = reject_fact(db, _reject_cmd(target=draft, actor=ALICE))
+    assert res.accepted is True
+    assert occ_spy["OVERLAY_FACT_REJECTED"] == 1  # pinned & non-None
+
+
+def test_confirm_append_collides_with_concurrent_confirm(db, catalog, inject_concurrent_append):
+    """C2 (genuine concurrency): a confirmer lands OVERLAY_FACT_CONFIRMED out-of-band between this
+    handler's fold and its own append. Because the handler pins its append to the head it folded
+    against, it must now raise ConcurrencyError — NOT silently land a second CONFIRMED one
+    stream_version higher (the lost-update the expected_version=None bug allowed)."""
+    catalog.set_owner(_orders(), "user:alice")
+    draft = _propose(db)  # DRAFT at stream_version 1
+    inject_concurrent_append("OVERLAY_FACT_CONFIRMED")
+    with pytest.raises(ConcurrencyError):
+        confirm_fact(db, _confirm_cmd(target=draft, actor=ALICE))
