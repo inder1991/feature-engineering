@@ -482,3 +482,59 @@ def test_stale_signal_is_noop_when_fact_already_advanced(db):
 
     # no second OVERLAY_FACT_STALED appended (CAS no-op: not VERIFIED)
     assert [e.type for e in load_fact(db, grain_key)] == types_before
+
+
+def test_dependency_index_tracks_confirmed_override_not_proposed_column(db):
+    """confirm_fact lets a human override the proposed value (pin 17); for grain/availability/scd
+    that override can change the REFERENCED COLUMNS. The general dependency index must follow the
+    CONFIRMED value, not the original proposal — else a drop/type-change of the actually-confirmed
+    column never STALEs the fact (false negative) and a change to the discarded proposed column
+    wrongly STALEs it (false positive)."""
+    from dataclasses import asdict
+
+    from featuregen.overlay.projection import dependents_of
+    from featuregen.overlay.store import append_overlay_event
+
+    tbl = _table_ref()            # core.customers
+    proposed_col = "region"       # proposed grain column (later discarded by the override)
+    confirmed_col = "tier"        # the column the human actually confirmed
+
+    key = fact_key(tbl, "grain", None)
+    proposer = build_human_identity(subject="user:proposer", role_claims=("data_owner",))
+    proposed = append_overlay_event(
+        db, fact_key=key, type=OVERLAY_FACT_PROPOSED, actor=proposer, expected_version=0,
+        payload={
+            "catalog_object_ref": asdict(tbl),
+            "object_ref": display_object_ref(tbl),
+            "fact_type": "grain",
+            "use_case": None,
+            "proposed_value": {"columns": [proposed_col], "is_unique": True},
+            "proposal_fingerprint": proposal_fingerprint({"columns": [proposed_col]}),
+            "proposed_by": proposer.subject,
+        },
+    )
+    # CONFIRMED with an OVERRIDE that changes the column set (region -> tier)
+    append_overlay_event(
+        db, fact_key=key, type=OVERLAY_FACT_CONFIRMED,
+        actor=build_human_identity(subject="user:owner-a", role_claims=("data_owner",)),
+        payload={
+            "value": {"columns": [confirmed_col], "is_unique": True},
+            "confirmers": [{"subject": "user:owner-a", "role": "data_owner"}],
+            "expires_at": (datetime.now(UTC) + timedelta(days=30)).isoformat(),
+            "confirms_event_id": proposed.event_id,
+        },
+    )
+    run_projection(db, OverlayProjection())
+
+    # the dependency index must point at the CONFIRMED column, not the proposed one
+    assert key in dependents_of(db, display_object_ref(_col_ref(confirmed_col)))
+    assert key not in dependents_of(db, display_object_ref(_col_ref(proposed_col)))
+
+    # and a drop of the confirmed column must STALE the fact (pre-fix it does NOT)
+    owners = {tbl: "user:owner-a"}
+    before = [_obj(tbl, oid="oid-cust"),
+              _obj(_col_ref(confirmed_col), data_type="text", oid="oid-cust:3")]
+    detect_catalog_changes(db, _adapter(before, owners), actor=SERVICE_ACTOR)  # baseline
+    after = [_obj(tbl, oid="oid-cust")]  # tier dropped
+    detect_catalog_changes(db, _adapter(after, owners), actor=SERVICE_ACTOR)
+    assert load_fact(db, key)[-1].type == OVERLAY_FACT_STALED
