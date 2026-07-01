@@ -61,7 +61,7 @@ class BankingDomainCatalog:
         return bool(self.version)
 
     @classmethod
-    def from_seed(cls, seed: Mapping) -> "BankingDomainCatalog":
+    def from_seed(cls, seed: Mapping) -> BankingDomainCatalog:
         """Map the SP-0-governed banking-domain-catalog seed shape → the reader dataclass. Optional
         seed keys override the built-in surface defaults: `sensitive_proxy_hints`,
         `out_of_scope_examples`, `predictive_markers`, `scoped_use_cases`."""

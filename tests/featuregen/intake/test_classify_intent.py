@@ -1,4 +1,3 @@
-import pytest
 
 from featuregen.intake.banking_catalog import (
     BankingDomainCatalog,
