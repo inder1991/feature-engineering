@@ -7,7 +7,12 @@ import jsonschema
 
 # UNKNOWN + the mode / classification vocabularies are SP-0's — reused VERBATIM (overview Shared
 # Contract). Any UNKNOWN-valued semantic field MUST be listed in open_fields (§4.0).
-from featuregen.documents.draft import INTAKE_MODES, RAW_INPUT_CLASSIFICATIONS, UNKNOWN
+from featuregen.documents.draft import (
+    INTAKE_MODES,
+    RAW_INPUT_CLASSIFICATIONS,
+    UNKNOWN,
+    register_draft_schemas,
+)
 
 __all__ = [
     "INTAKE_MODES", "RAW_INPUT_CLASSIFICATIONS", "UNKNOWN",
@@ -18,6 +23,7 @@ __all__ = [
     "DRAFT_CONTENT_SCHEMA", "CONFIRMED_CONTRACT_JSON_SCHEMA", "ASSUMPTION_LEDGER_CONTENT_SCHEMA",
     "ContractSemanticError", "validate_semantics",
     "reshape_calculation_method", "assemble_confirmed",
+    "CONTRACT_SCHEMA_OWNER", "register_contract_schemas",
 ]
 
 # ---- closed enum vocabularies (§4.0) ----
@@ -343,3 +349,29 @@ def assemble_confirmed(
         },
         "status": CONFIRMED_STATUS,
     }
+
+
+CONTRACT_SCHEMA_OWNER = "featuregen-intake"
+
+
+def register_contract_schemas(registry) -> None:
+    """Register SP-2's Feature Contract content-schemas in SP-0's document registry (§2.1 #3, §4.0).
+    Registers the genuinely NEW CONFIRMED_CONTRACT@1 (SP-0 registers no confirmed schema) and
+    re-affirms SP-0's envelope DRAFT_CONTRACT@1 + ASSUMPTION_LEDGER@1 via register_draft_schemas so
+    all three content stages are present after a single call. ADDITIVE (§2.1): register_schema uses
+    ON CONFLICT DO UPDATE, and the DRAFT/LEDGER re-affirmation writes SP-0's own schemas back
+    unchanged — no existing row is rewritten with a divergent schema. Idempotent. SP-2's *stricter*
+    Draft/Ledger SEMANTIC constraints are enforced separately by validate_semantics (§4.0) — SP-0's
+    registered envelope schemas stay the registry's Draft/Ledger schema of record.
+
+    Reader-upcasters (§4.0): every schema is versioned; each version bump ships a total, chained,
+    pure reader-upcaster registered via registry.register_upcaster(...). v1 is the base, so there is
+    nothing to register yet — a v1 read through the chain is the identity projection."""
+    register_draft_schemas(registry)   # SP-0 DRAFT_CONTRACT@1 + ASSUMPTION_LEDGER@1 (idempotent)
+    registry.register_schema(
+        "CONFIRMED_CONTRACT",
+        CONFIRMED_CONTRACT_SCHEMA_VERSION,
+        CONFIRMED_CONTRACT_JSON_SCHEMA,
+        CONTRACT_SCHEMA_OWNER,
+    )
+    # No upcasters at v1. First bump: registry.register_upcaster("CONFIRMED_CONTRACT", 1, 2, _v1_to_v2)
