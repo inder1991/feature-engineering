@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any
+
+import jsonschema
 
 # UNKNOWN + the mode / classification vocabularies are SP-0's — reused VERBATIM (overview Shared
 # Contract). Any UNKNOWN-valued semantic field MUST be listed in open_fields (§4.0).
@@ -13,6 +16,7 @@ __all__ = [
     "DRAFT_CONTRACT_SCHEMA_VERSION", "ASSUMPTION_LEDGER_SCHEMA_VERSION",
     "CONFIRMED_CONTRACT_SCHEMA_VERSION",
     "DRAFT_CONTENT_SCHEMA", "CONFIRMED_CONTRACT_JSON_SCHEMA", "ASSUMPTION_LEDGER_CONTENT_SCHEMA",
+    "ContractSemanticError", "validate_semantics",
 ]
 
 # ---- closed enum vocabularies (§4.0) ----
@@ -189,3 +193,57 @@ ASSUMPTION_LEDGER_CONTENT_SCHEMA: dict[str, Any] = {
         },
     },
 }
+
+
+class ContractSemanticError(Exception):
+    """Raised by `validate_semantics` when a contract body fails SP-2 SEMANTIC validation — the
+    content-schema, a closed-enum violation, or the UNKNOWN-listed-in-open_fields rule (§4.0).
+    Intake-owned (mirrors overlay's FactValidationError); every SP-2 phase imports THIS. SP-0's
+    envelope/required-field validation (documents/draft.py::validate_draft) is separate and
+    complementary — it raises SP-0's DraftValidationError."""
+
+
+_CONTENT_SCHEMAS: dict[str, dict] = {
+    "DRAFT_CONTRACT": DRAFT_CONTENT_SCHEMA,
+    "CONFIRMED_CONTRACT": CONFIRMED_CONTRACT_JSON_SCHEMA,
+    "ASSUMPTION_LEDGER": ASSUMPTION_LEDGER_CONTENT_SCHEMA,
+}
+
+
+def validate_semantics(body: Mapping[str, Any], *, stage: str) -> None:
+    """SP-2 semantic validation for a contract body at `stage` (§4.0). Validates the authoritative
+    content-schema (required semantic fields + closed enums + the tagged calculation_method), then —
+    for a Draft — enforces the UNKNOWN-listed-in-open_fields rule: any semantic field carrying the
+    UNKNOWN sentinel MUST appear in open_fields (§4.0). Raises ContractSemanticError on any
+    violation. `stage` ∈ the three SP-2 content stages; any other stage is a programmer error."""
+    schema = _CONTENT_SCHEMAS.get(stage)
+    if schema is None:
+        raise ContractSemanticError(f"no SP-2 semantic content-schema for stage {stage!r}")
+    try:
+        jsonschema.validate(instance=dict(body), schema=schema)
+    except jsonschema.ValidationError as exc:
+        raise ContractSemanticError(f"{stage} semantic invalid: {exc.message}") from exc
+    if stage == "DRAFT_CONTRACT":
+        _assert_unknowns_listed(body)
+
+
+def _assert_unknowns_listed(body: Mapping[str, Any]) -> None:
+    """Every UNKNOWN-valued semantic field must be listed in open_fields (§4.0). Covers the
+    top-level feature_semantics string fields by their own name, and a UNKNOWN filter predicate by
+    requiring at least one `filters`-prefixed open_fields path (the dotted encoding, e.g.
+    `filters.declined_status_encoding`, §4.1)."""
+    open_fields = set(body.get("open_fields") or ())
+    fs = body.get("feature_semantics") or {}
+    unlisted: list[str] = []
+    for name in ("entity", "calculation_method", "target_definition"):
+        val = fs.get(name)
+        if isinstance(val, str) and val == UNKNOWN and name not in open_fields:
+            unlisted.append(name)
+    for i, filt in enumerate(fs.get("filters") or ()):
+        if isinstance(filt, Mapping) and filt.get("predicate") == UNKNOWN:
+            if not any(str(of).startswith("filters") for of in open_fields):
+                unlisted.append(f"filters[{i}].predicate")
+    if unlisted:
+        raise ContractSemanticError(
+            f"UNKNOWN fields must be listed in open_fields: {unlisted} (§4.0)"
+        )
