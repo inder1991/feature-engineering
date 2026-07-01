@@ -21,7 +21,7 @@ from featuregen.overlay._lifecycle import (
     _deny_audited,
     _latest_proposed,
 )
-from featuregen.overlay._types import FactType, Role
+from featuregen.overlay._types import Confirmer, FactType, Role
 from featuregen.overlay.authority import (
     _actor_is_authority,
     proposer_ne_confirmer,
@@ -104,6 +104,7 @@ def confirm_fact(conn: DbConn, cmd: Command) -> CommandResult:
         return CommandResult(
             accepted=False, aggregate_id=key, denied_reason=f"invalid confirmed value: {exc}"
         )
+    confirmers: list[Confirmer]
     if fact_type == "approved_join":
         # same-owner-both-sides reaches the single path (Authority.dual is False); record BOTH side
         # roles for the one principal so audit attribution matches a two-owner join.
@@ -274,6 +275,7 @@ def enter_fact(conn: DbConn, cmd: Command) -> CommandResult:
         actor=cmd.actor,
         expected_version=0,
     )
+    confirmers: list[Confirmer]
     if fact_type == "approved_join":
         # Same-owner-both-sides reaches this path (Authority.dual is False); record BOTH side roles
         # for the one principal so audit attribution matches a two-owner join.

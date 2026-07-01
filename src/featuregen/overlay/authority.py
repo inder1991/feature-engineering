@@ -20,7 +20,7 @@ from dataclasses import dataclass
 
 from featuregen.contracts.db import DbConn
 from featuregen.contracts.identity import IdentityEnvelope
-from featuregen.overlay._types import FactType, Gate, Role
+from featuregen.overlay._types import EligibleAssignee, FactType, Gate, JoinSide, Role
 from featuregen.overlay.catalog import CatalogAdapter
 from featuregen.overlay.identity import ApprovedJoinRef, CatalogObjectRef
 
@@ -53,7 +53,7 @@ class Authority:
         return a
 
     @property
-    def task_assignees(self) -> tuple[dict[str, str], ...]:
+    def task_assignees(self) -> tuple[EligibleAssignee, ...]:
         """Per-side task plan — one assignee mapping per required confirmation, **side-labelled**.
 
         A known side → `{"role": "data_owner", "subject": <owner>, "side": <from|to>}`; an unknown
@@ -72,8 +72,12 @@ class Authority:
             if from_owner is not None and from_owner == to_owner:
                 # same principal owns BOTH sides — a single task (the only collapse case)
                 return ({"role": "data_owner", "subject": from_owner},)
-            plans: list[dict[str, str]] = []
-            for side, owner in (("from", from_owner), ("to", to_owner)):
+            plans: list[EligibleAssignee] = []
+            sides: tuple[tuple[JoinSide, str | None], ...] = (
+                ("from", from_owner),
+                ("to", to_owner),
+            )
+            for side, owner in sides:
                 if owner:
                     plans.append({"role": "data_owner", "subject": owner, "side": side})
                 else:

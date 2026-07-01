@@ -8,12 +8,13 @@ from __future__ import annotations
 
 from featuregen.contracts import DbConn
 from featuregen.overlay._lifecycle import OverlayCommandError, _latest_proposed
+from featuregen.overlay._types import TaskProposal
 from featuregen.overlay.evidence import read_evidence
 from featuregen.overlay.state import fold_overlay_state
 from featuregen.overlay.store import load_fact
 
 
-def get_task_proposal(conn: DbConn, task_id: str, actor) -> dict:
+def get_task_proposal(conn: DbConn, task_id: str, actor) -> TaskProposal:
     """Task-scoped proposal read (§7.2): returns what the assignee must see to confirm. Authorized
     to the task's assignee (eligible subject/role) or the governance role; denied to anyone else —
     distinct from the deferred end-user `resolve_fact` authz.
