@@ -30,7 +30,9 @@
   generic Draft schema (§2.1, §4).
 - **Layer 1 — Intake & Normalization:** the `submit_intent` command → **LLM Intake & Normalization Agent** →
   a **Draft Feature Contract** (`status: NEEDS_CLARIFICATION`, never executable) + **Assumption Ledger**
-  (§5). Rejects only **out-of-banking** requests.
+  (§5). Classifies each intent against the read-only **`BankingDomainCatalog`** (§4.5, §5.4) —
+  rejecting/parking out-of-scope (**`OUT_OF_SCOPE`**) and prohibited-class (**`PROHIBITED_DATA_CLASS`**)
+  intents (each stamping the catalog version) and routing sensitive-proxy / ambiguous ones to clarification.
 - The **two intake modes** — *definition-driven translation* (built end-to-end) and *hypothesis-driven
   generation* (real flow; deliberately dumb single-call generator stub) (§3).
 - **Layer 2 — Contract control & clarification:** per-field **ambiguity + confidence scoring**, the
@@ -60,7 +62,8 @@
   only cheap, model-free *plausibility/quality* signals to candidates; there is no ground-truth score yet (§7.3).
 - **The full Domain / Use-Case Catalog** (generation priming, per-use-case templates, governance defaults) →
   it is a Layer-0 foundation artifact (design §15). SP-2 reads it *read-only* for the closed **banking
-  boundary** and **blocked-data-class** screen only (§5.4, §1.3 decision D8).
+  boundary** and **blocked-data-class** screen only, via the read-only **`BankingDomainCatalog`**
+  (§4.5, §5.4, §1.3 decision D8).
 - **Any UI** — the confirmation/clarification console → the frontend sub-project. SP-2 is **API/command-first**,
   consistent with SP-0/SP-1 (§1.3 decision D6).
 
@@ -75,7 +78,7 @@
 | D5 | LLM reality | **`LLMClient` interface is mandatory; `FakeLLM` is the deterministic default; a real Claude adapter is shipped but config-gated, never required in CI.** Every call event-sourced; **no silent prod fallback**; structured-output → **bounded repair → fail into clarification**; **no PII to the LLM** (§9). |
 | D6 | Surface | **API/command-first, no UI** in SP-2. |
 | D7 | Catalog use | Catalog/overlay metadata used **only for normalization/ambiguity**, never as authoritative grounding (that is SP-3). SP-2 may *read* SP-1's merged-view API for names/types/grain (§4.4). |
-| D8 | Banking scope | SP-2 reads the **Domain/Use-Case Catalog as a read-only seed** for the closed banking boundary + `blocked_data_classes`. It rejects only **out-of-banking** requests and routes a **new banking use-case to onboarding**, not rejection (design §15.5–15.6). *(Decision record was silent on catalog availability — see the deviations register, §16.)* |
+| D8 | Banking scope | SP-2 reads the **`BankingDomainCatalog`** (§4.5) — **SP-0-governed, read-only reference data** — as the seed for the intake banking-boundary + prohibited-class screens (§5.4, §8.4). Deterministic outcomes: out-of-scope → **`OUT_OF_SCOPE`** and prohibited class → **`PROHIBITED_DATA_CLASS`** (both fail-closed, each stamping the reason/matched-class + catalog `version`); sensitive-proxy/ambiguous → clarification / compliance review; a new banking use-case routes to onboarding, not rejection (design §15.5–15.6). *(**RATIFIED** — the user explicitly approved the catalog as SP-0-governed read-only reference data; this resolves the former §16.8 open question, now §16 register entry 8 — not a deviation.)* |
 | D9 | LLM call store | LLM call records are an **SP-2-owned immutable append-only `llm_call` record store** (mirrors SP-1's evidence store), referenced by `llm_call_ref`, classified **sensitive**, plus an `LLM_CALL_RECORDED` domain event on the run. *(SP-0's artifact enum has no LLM-call type — see §16.)* |
 | D10 | Content schema | **Minimum-viable** contract content-schema, not maximal — only the fields Gate #1 and SP-3 need. |
 
@@ -123,7 +126,9 @@ SP-2 reuses, verbatim from SP-0:
    `FIELD_AUTO_RESOLVED`, `CLARIFICATION_REQUESTED`, `CLARIFICATION_ANSWERED` (a thin domain shadow of the
    SP-0 gate answer, carrying the re-normalization trigger), `CONTRACT_REFINED`, `MINIMUM_CONTRACT_VALIDATED`,
    `CONTRACT_CONFIRMED`, `USE_CASE_ONBOARDING_REQUESTED` (a new banking use-case parked for governance
-   onboarding, §5.4, §11), `INTENT_REJECTED`, and `LLM_CALL_RECORDED` (§9.3).
+   onboarding, §5.4, §11), `INTENT_REJECTED` (carrying the deterministic banking-boundary classification
+   reason — `OUT_OF_SCOPE` or `PROHIBITED_DATA_CLASS` — plus the `BankingDomainCatalog` version, §5.4, §8.4),
+   and `LLM_CALL_RECORDED` (§9.3).
 2. **Document content-schemas** for `DRAFT_CONTRACT`, `ASSUMPTION_LEDGER`, `CONFIRMED_CONTRACT` registered in
    SP-0's document registry (SP-0 §3.7), versioned, with reader-upcasters (§4).
 3. **The `llm_call` immutable record store** — a new SP-2-owned append-only table (an SP-0-style write-once
@@ -344,6 +349,46 @@ SP-2 **does not** call the write side of SP-1, does not open overlay confirmatio
 missing overlay fact as a blocker — a Draft can be confirmed with unresolved *grounding* because grounding
 happens downstream; it only needs unresolved *meaning* eliminated.
 
+### 4.5 The `BankingDomainCatalog` — SP-0-governed, read-only intake-classification reference data
+
+The banking-boundary / blocked-class reference data that SP-2's intake screens read (§5.4, §8.4) is the
+design's `banking-domain-catalog`, and it is **ratified as SP-0-governed, read-only reference data** used
+**only for intake classification** — **never for grounding or execution** (all VERIFIED-fact grounding is
+SP-3, §4.4, §10). SP-2 **reads** it; it never writes it. Because it is a *reference artifact* — not a
+buildable SP-2 dependency — reading it does **not** violate the "SP-0 only" foundation rule (Decision D8).
+This is the **ratified** resolution of the former §16.8 open question (the user explicitly approved it), **not
+a deviation**. *(Distinct from the SP-1 merged-view catalog metadata of §4.4, which frames normalization, and
+from the generation-priming `DomainCatalogEntry` slice the `CandidateGenerator` reads for allowed concepts,
+§7.1–§7.2; the richer generation catalog is deferred to SP-12, §14.)*
+
+**Contents — `BankingDomainCatalog`:**
+
+| Field | Meaning |
+|---|---|
+| `allowed_domains` / `allowed_use_cases` | in-scope banking domains and use cases — the **closed banking boundary** |
+| `out_of_scope_examples` | out-of-scope example intents / categories (→ **`OUT_OF_SCOPE`**, §5.4) |
+| `blocked_data_classes` | **explicitly prohibited / blocked** data classes (→ **`PROHIBITED_DATA_CLASS`**, §5.4, §8.4) |
+| `sensitive_proxy_hints` | sensitive-proxy hints carried **only** as *"requires clarification / compliance review"* — **never** an automatic block or standalone proof of prohibition (§6.2, §6.7, §8.4) |
+| `jurisdiction_scope` / `use_case_scope` | the scope in which each rule applies — **where rules differ by product or region** |
+| `version`, `owner`, `effective_date`, `source` / `provenance` | catalog **version**, governance **owner**, **effective date**, and **source/provenance** — the `version` is recorded on every non-clear classification outcome as audit / MRM provenance |
+
+**Deterministic intake-classification outcomes (the behaviour §5.4 and §8.4 encode).** The intake screen is a
+**deterministic classifier** over this seed (never the LLM's call, §5.4), producing exactly one of:
+
+1. **Out of banking scope** → **reject or park as `OUT_OF_SCOPE`**, recording the **reason** and the **catalog
+   `version`**. *(Terminal / park; fail-closed.)*
+2. **Explicit prohibited data class** → **block / reject as `PROHIBITED_DATA_CLASS`**, recording the **matched
+   class** and the **catalog `version`**. *(Terminal; fail-closed; re-checked as the authoritative backstop at
+   confirmation, §8.4.)*
+3. **Sensitive-proxy hint matched** → open **clarification / compliance review** (§6.2, §6.5) — **NOT** an
+   automatic block. *(Non-terminal; routes into the existing clarification path.)*
+4. **Ambiguous intent** → open **clarification** (§6.2) — **do NOT auto-reject**. *(Non-terminal.)*
+
+Outcomes 1–2 are **deterministic, fail-closed, and never fake a compliance approval** (§8.4), and each stamps
+the catalog `version` (and, for 2, the matched class) for audit/MRM; outcomes 3–4 are **not** terminal and
+route into the clarification path (§6.2, §6.5). *(An in-scope banking request that matches no known use-case is
+neither of these — it parks into `NEEDS_USE_CASE_ONBOARDING`, §5.4, §11.)*
+
 ---
 
 ## 5. Layer 1 — Intake & Normalization
@@ -369,7 +414,11 @@ Draft Feature Contract + Assumption Ledger.
 submit_intent(request)                                   authz: data scientist (request owner) or service:intake-agent
   └─ create_request (SP-0) + create_run (SP-0) → run in DRAFT
   └─ PII-scan + classify raw intent (SP-0-owned envelope classification → raw_input_classification, §9.4) → encrypted blob (SP-0 §9); emit INTENT_SUBMITTED
-  └─ in-banking-scope screen (§5.4)  ──reject──▶ INTENT_REJECTED (only if out-of-banking)
+  └─ banking-boundary classification (§5.4, over BankingDomainCatalog §4.5)
+        ├─ out of banking scope   ──▶ OUT_OF_SCOPE → INTENT_REJECTED / park  (reason + catalog version)
+        ├─ prohibited data class  ──▶ PROHIBITED_DATA_CLASS → reject          (matched class + catalog version)
+        ├─ sensitive-proxy/ambiguous ──▶ clarification / compliance review (§6.2)  (NOT terminal)
+        └─ in-banking, unknown use-case ──▶ NEEDS_USE_CASE_ONBOARDING (park, §5.4)
   └─ LLMClient.structure_intent(redacted_intent, catalog_metadata)   → event-sourced call record (§9)
         │  structured-output contract + bounded repair (§9.2)
         ▼
@@ -393,21 +442,37 @@ The Intake Agent is required to emit, for **every** field it did not take verbat
 settled. This is enforced deterministically: Minimum Contract Validation (§6.7) rejects any resolved field
 that lacks either a human confirmation or a ledger entry.
 
-### 5.4 The banking boundary — rejects only out-of-banking
+### 5.4 The banking boundary — deterministic classification over the `BankingDomainCatalog`
 
-Intake **rejects only out-of-*banking* requests** (design §3:90, §15.5): a request with no banking entity,
-data, or concept → `INTENT_REJECTED` with a reason. A **new banking use-case** (a banking request that
-doesn't match a known catalog use-case) is **routed to onboarding, not rejected** (design §15.6): instead of
-`INTENT_REJECTED`, the run is **parked** (SP-0 `park`) into a hold state **`NEEDS_USE_CASE_ONBOARDING`** and
-emits **`USE_CASE_ONBOARDING_REQUESTED`**, which opens a **governance use-case-onboarding human-gate task**
-(SP-0's human-gate task model, owned by governance). **SP-2 only routes/parks: the onboarding *workflow*
-itself is out of SP-2 build scope** (§14) — SP-2 defines the park state + the routing event, not the
-onboarding gate's semantics. The screen
-is a **deterministic classifier** over the read-only Domain/Use-Case Catalog seed (design's
-`banking-domain-catalog`): the closed banking boundary + the entity/concept taxonomy. It is *not* the LLM's
-call — the LLM may *suggest* a use-case label, but the deterministic screen decides in/out. (The richer
-domain-priming of *generation* is SP-12; SP-2 uses the catalog only as a boundary + a blocked-data-class list,
-Decision D8.)
+The intake **banking-boundary screen** is a **deterministic classifier** over the read-only
+`BankingDomainCatalog` seed (§4.5) — the closed banking boundary + entity/concept taxonomy (`allowed_domains`
+/ `allowed_use_cases`, `out_of_scope_examples`), the `blocked_data_classes`, and the `sensitive_proxy_hints`.
+It is **not** the LLM's call — the LLM may *suggest* a use-case label, but the deterministic screen decides the
+outcome. Every non-clear outcome **records the matched reason and the catalog `version`** as audit/MRM
+provenance. The screen produces exactly one of these **deterministic classification outcomes** (design §3:90,
+§15.5–15.6):
+
+1. **Out of banking scope** — no banking entity, data, or concept, or a match against `out_of_scope_examples`
+   → **reject or park as `OUT_OF_SCOPE`**, recording the **reason** and the **catalog `version`**. Surfaced as
+   `INTENT_REJECTED` (classification `OUT_OF_SCOPE`) or, where the request is held for review, an SP-0 `park`.
+   **Fail-closed:** an out-of-scope intent never reaches normalization.
+2. **Explicit prohibited data class** — the intent targets/filters on a `blocked_data_classes` member →
+   **block / reject as `PROHIBITED_DATA_CLASS`**, recording the **matched class** and the **catalog
+   `version`**. This is the **fail-closed** prohibited-class block; it is **re-run as the authoritative backstop
+   at confirmation** by the §8.4 prohibited-intent screen and **never fakes a compliance approval**.
+3. **Sensitive-proxy hint matched** — a `sensitive_proxy_hints` member → **open clarification / compliance
+   review** (§6.2, §6.5), carried **only** as *"requires clarification / compliance review,"* **NOT** an
+   automatic block or standalone proof. **Non-terminal.**
+4. **Ambiguous intent** — banking-plausible but under-specified scope → **open clarification** (§6.2). **Do NOT
+   auto-reject. Non-terminal.**
+
+A **new banking use-case** — a request that is *in-scope* banking but matches no known catalog use-case — is
+**neither rejected nor blocked**: the run is **parked** (SP-0 `park`) into a hold state
+**`NEEDS_USE_CASE_ONBOARDING`** and emits **`USE_CASE_ONBOARDING_REQUESTED`**, which opens a **governance
+use-case-onboarding human-gate task** (SP-0's human-gate task model, owned by governance). **SP-2 only
+routes/parks: the onboarding *workflow* itself is out of SP-2 build scope** (§14) — SP-2 defines the park state
++ the routing event, not the onboarding gate's semantics. (The richer domain-priming of *generation* is SP-12;
+SP-2 uses the catalog only as a boundary + blocked-class + proxy-hint reference, Decision D8, §4.5.)
 
 ---
 
@@ -448,8 +513,12 @@ otherwise → must-ask-human
 - **auto-resolve** → record an **Assumption Ledger entry** (§4.3), emit `FIELD_AUTO_RESOLVED`, and continue.
 - **must-ask-human** → raise a **Human Clarification task** (§6.5). The **calculation-method choice is always
   must-ask** in hypothesis mode (the whole point of Gate #1 is picking it), and any **policy-sensitive**
-  field (e.g. a filter touching a protected attribute, or a blocked data class per the Domain Catalog) is
-  always must-ask regardless of score — it may never be auto-resolved.
+  field (e.g. a filter touching a protected attribute) is always must-ask regardless of score — it may never
+  be auto-resolved. A **`sensitive_proxy_hints` match** (§4.5) is a **distinct routing outcome — "requires
+  clarification / compliance review"** — that always opens a clarification task and may never be
+  auto-resolved. This routing is **not** the deterministic prohibited-class block: a proxy hint is a *doubt to
+  be reviewed*, never a standalone block, whereas the deterministic `PROHIBITED_DATA_CLASS` outcome (§5.4,
+  §8.4) *rejects*.
 
 The thresholds are **config-gated constants**, deliberately conservative (fail toward asking). *(The exact
 threshold values were a reasonable call, §16.)*
@@ -530,11 +599,14 @@ machine-checkable (registered as SP-0 lifecycle guards, §11). All must hold:
 3. **No unresolved high-ambiguity field** — `open_fields` is empty and no field remains `ambiguity > 0.30`
    without a ledger entry or human confirmation.
 4. **Observation intent present** — point-in-time/observation rule is stated (so SP-3 can bind it).
-5. **In banking scope** — the §5.4 screen passed and (for a policy-sensitive use-case) the target is a
-   permitted, non-blocked concept (else it routes back to must-ask, or to the prohibited-intent block, §8.4).
-   This is the **deterministic pre-gate scope / blocked-class check** that lets Gate #1 *open*; it is
-   deliberately re-run as the **fail-closed compliance backstop at the moment of confirmation** by the
-   prohibited-intent screen of **§8.4 #2** (which is authoritative for the block). Both exist by design (§8.4).
+5. **In banking scope** — the §5.4 deterministic classification over the `BankingDomainCatalog` (§4.5)
+   returned neither `OUT_OF_SCOPE` nor `PROHIBITED_DATA_CLASS`, and (for a policy-sensitive use-case) the
+   target is a permitted, non-blocked concept. A **prohibited-data-class** match routes to the §8.4 block
+   (stamping the matched class + catalog `version`); a **sensitive-proxy-hint** match routes back to
+   **must-ask clarification / compliance review** (§6.2), *not* to the deterministic block. This is the
+   **deterministic pre-gate scope / blocked-class check** that lets Gate #1 *open*; it is deliberately re-run
+   as the **fail-closed compliance backstop at the moment of confirmation** by the prohibited-intent screen of
+   **§8.4 #2** (which is authoritative for the block). Both exist by design (§8.4).
 6. **Every resolved field is accountable** — each has either a human confirmation or an Assumption Ledger
    entry (the §5.3 rule).
 
@@ -575,7 +647,8 @@ machinery is identical for the stub and for SP-12** — only the `generate` body
 rationales, each compiled to a `calculation_method`, each a candidate document. It has **no** router, **no**
 specialists, **no** attempt/conceptual memory, **no** symbolic synthesis, **no** diversity/islands, and **no**
 few-shot — those are SP-12 (design §14.6–14.9). It is domain-*aware* only to the extent of reading the
-read-only Domain Catalog entry for the use-case (allowed concepts), never the full generation prior.
+read-only per-use-case `DomainCatalogEntry` (the allowed-concepts slice of the `BankingDomainCatalog`, §4.5),
+never the full generation prior.
 
 ### 7.3 What the stub does **not** do (the SP-12 boundary + rationale)
 
@@ -640,28 +713,38 @@ Bodies are `governance-retained` (SP-0 §9) — required for MRM reproduction, a
 Two deterministic screens run before / at Gate #1:
 
 1. **Risk-flag screen → `requires_independent_validation`.** If the intent carries risk flags — e.g. the
-   Domain Catalog marks the use-case high-risk (credit-decisioning, adverse-action, fair-lending, MRM-high),
+   `BankingDomainCatalog` (§4.5) marks the use-case high-risk (credit-decisioning, adverse-action,
+   fair-lending, MRM-high),
    or the target/filters touch a sensitive concept — the contract is confirmed **with
    `requires_independent_validation = true`**. This is a **flag only**: SP-2 does **not** require a second
    signer, and does **not** block. The independent validation / registration approval is **Gate #2 (SP-5)**;
    SP-2 just records that it will be needed (Decision D4). The credit-risk hypothesis example sets this true.
 
-2. **Prohibited-intent screen → block or force clarification.** If the intent is **obviously prohibited or
-   compliance-sensitive** — e.g. it targets or filters on a **blocked data class** (Domain Catalog
-   `blocked_data_classes`) such as a protected attribute used as a credit-decisioning input, or a use-case
-   that is out of policy — Gate #1 **blocks or forces clarification**. It **must not pretend to approve
-   compliance** (Decision D4): the contract cannot be CONFIRMED while a prohibited-intent finding stands. The
-   requester either **withdraws/edits** the intent (back through the Refinement Loop) or the run is
-   **`reject`ed** (SP-0) with the compliance reason recorded. Compliance *approval* is never Gate #1's to
-   give; it belongs to Compliance at the overlay/policy layer (SP-1) and the governance gates (SP-5/SP-9). The
-   screen is **deterministic** (a ruleset over the catalog's blocked classes + a prohibited-intent list), not
-   an LLM judgement. *(The concrete prohibited-intent ruleset mechanism was a reasonable call, §16.)*
+2. **Prohibited-intent screen → deterministic block, or route sensitive proxies to clarification.** This is
+   the **fail-closed compliance backstop**, re-running the §5.4 deterministic classification over the
+   `BankingDomainCatalog` (§4.5) at the moment of confirmation. It resolves into **two distinct routings**:
+   - **Explicit prohibited data class → `PROHIBITED_DATA_CLASS` block.** If the intent targets or filters on a
+     `blocked_data_classes` member (e.g. a protected attribute used as a credit-decisioning input), Gate #1
+     **blocks / rejects as `PROHIBITED_DATA_CLASS`**, recording the **matched class** and the **catalog
+     `version`**. It **must not pretend to approve compliance** (Decision D4): the contract cannot be CONFIRMED
+     while a prohibited-data-class finding stands. The requester either **withdraws/edits** the intent (back
+     through the Refinement Loop) or the run is **`reject`ed** (SP-0) with the compliance reason + catalog
+     `version` recorded. This is a **deterministic** ruleset over the catalog's blocked classes, **not** an LLM
+     judgement. *(The concrete ruleset mechanism was a reasonable call, §16.)*
+   - **Sensitive-proxy hint → clarification / compliance review (not a block).** If the intent matches a
+     `sensitive_proxy_hints` member, it is routed to **clarification / compliance review** (§6.2, §6.5), **NOT**
+     auto-blocked. A proxy hint is a *doubt requiring review*, never standalone proof of prohibition; it is
+     resolved (or escalated to compliance) before the contract can be CONFIRMED. This is the routing outcome
+     distinct from the deterministic prohibited-class block (§6.2, §6.7).
+
+   Compliance *approval* is never Gate #1's to give; it belongs to Compliance at the overlay/policy layer
+   (SP-1) and the governance gates (SP-5/SP-9).
    **Relationship to MCV #5 (§6.7) — why both exist.** MCV #5 is the **deterministic pre-gate**
    scope/blocked-class check whose job is to decide whether Gate #1 may *open*. This §8.4 screen re-runs the
-   same blocked-class/prohibited-intent check as the **fail-closed backstop at the moment of confirmation**,
-   so a contract can **never** be CONFIRMED if a prohibited-intent finding stands — even one that appeared (or
-   was missed) after the gate opened. They are the same deterministic ruleset applied at two checkpoints;
-   **this confirmation-time screen is authoritative for the block.**
+   same blocked-class/prohibited-intent classification (§5.4) as the **fail-closed backstop at the moment of
+   confirmation**, so a contract can **never** be CONFIRMED if a `PROHIBITED_DATA_CLASS` finding stands — even
+   one that appeared (or was missed) after the gate opened. They are the same deterministic ruleset applied at
+   two checkpoints; **this confirmation-time screen is authoritative for the block.**
 
 ### 8.5 Output
 
@@ -832,8 +915,13 @@ through SP-2 sub-states (all while the SP-0 run-state is `DRAFT`, until Gate #1)
 ```
                               submit_intent
                                    │
-              banking-scope screen (§5.4)
-                    ├── out-of-banking ──────────────► INTENT_REJECTED (run REJECTED)
+              banking-boundary classification (§5.4, over BankingDomainCatalog §4.5)
+                    ├── out of banking scope ────────► OUT_OF_SCOPE → INTENT_REJECTED (run REJECTED) | park
+                    │        records reason + catalog version (fail-closed)
+                    ├── prohibited data class ───────► PROHIBITED_DATA_CLASS → reject (run REJECTED)
+                    │        records matched class + catalog version (fail-closed; re-checked at §8.4)
+                    ├── sensitive-proxy / ambiguous ─► CLARIFYING (clarification / compliance review, §6.2)
+                    │        NOT terminal — routes into the clarification path
                     ├── in-banking, unknown use-case ─► NEEDS_USE_CASE_ONBOARDING  (SP-0 park + hold)
                     │        emit USE_CASE_ONBOARDING_REQUESTED → opens a governance onboarding
                     │        human-gate task  (the onboarding workflow itself is out of SP-2 scope, §14)
@@ -851,8 +939,10 @@ through SP-2 sub-states (all while the SP-0 run-state is `DRAFT`, until Gate #1)
                                    ▼                                  ▼
                          MINIMUM_CONTRACT_VALIDATED  ◄────────────────┘
                                    │
-                    prohibited-intent screen (§8.4)
-                    ├── prohibited ─► BLOCKED → (edit → loop) | reject
+                    prohibited-intent screen (§8.4, re-runs §5.4 over BankingDomainCatalog)
+                    ├── prohibited data class ─► PROHIBITED_DATA_CLASS: BLOCKED → (edit → loop) | reject
+                    │        records matched class + catalog version (authoritative block)
+                    ├── sensitive-proxy hint ──► CLARIFYING (clarification / compliance review, §6.2)
                     └── clear ─►  READY_FOR_GATE_1
                                    │
                     Human Gate #1  (author confirms / picks candidate; requester + actor_kind=human)
@@ -865,10 +955,17 @@ guards registered in SP-0's predicate registry (SP-0 §4.1) — `open_fields_emp
 `minimum_contract_validated`, `not_prohibited_intent`, `confirmer_is_requester_human`,
 `calculation_method_chosen`. Every SP-2 command runs the transition engine (guards evaluated on frozen
 documents/version-attributes, pure/deterministic) **before** appending, so an illegal advance is rejected
-before it is written. `INTENT_REJECTED`, `reject` (prohibited intent), an auto-parked exhausted loop, and
-`NEEDS_USE_CASE_ONBOARDING` (a new banking use-case parked for governance onboarding, §5.4) are the
-non-confirming exits. Terminal for SP-2's span: `CONFIRMED_CONTRACT` (hands off) or `REJECTED`; the
-`NEEDS_USE_CASE_ONBOARDING` park exits SP-2 into a governance onboarding flow that SP-2 does not build (§14).
+before it is written. **The two banking-boundary rejection outcomes are distinct and each carries its
+provenance:** **`OUT_OF_SCOPE`** (reject-or-park; records the reason + catalog `version`) and
+**`PROHIBITED_DATA_CLASS`** (block/reject; records the matched class + catalog `version`) — both are the
+terminal/park refinements of the earlier generic `INTENT_REJECTED`, surfaced via `INTENT_REJECTED` / `reject`
+/ `park` carrying that classification reason, and both are **fail-closed**. The **sensitive-proxy** and
+**ambiguous** cases are **not** terminal — they route into the existing clarification path (§6.2, §6.5).
+`INTENT_REJECTED` (classification `OUT_OF_SCOPE` or `PROHIBITED_DATA_CLASS`), `reject` (prohibited data class),
+an auto-parked exhausted loop, and `NEEDS_USE_CASE_ONBOARDING` (a new banking use-case parked for governance
+onboarding, §5.4) are the non-confirming exits. Terminal for SP-2's span: `CONFIRMED_CONTRACT` (hands off) or
+`REJECTED`; the `NEEDS_USE_CASE_ONBOARDING` park exits SP-2 into a governance onboarding flow that SP-2 does
+not build (§14).
 
 ---
 
@@ -929,8 +1026,12 @@ adapter is exercised only in an **opt-in, config-gated smoke test** never gated 
 
 - **Intake / normalization:** `submit_intent` produces a Draft with `status=NEEDS_CLARIFICATION` and populated
   `open_fields`; the **definition example** normalizes to the exact expected Draft (deterministic);
-  out-of-banking intent → `INTENT_REJECTED`; a new banking use-case routes to onboarding, **not** rejection;
-  the no-silent-assumption rule holds (every resolved field has a ledger entry or a human confirmation).
+  out-of-scope intent → **`OUT_OF_SCOPE`** (`INTENT_REJECTED`/park, stamping reason + catalog `version`); a
+  prohibited-data-class intent → **`PROHIBITED_DATA_CLASS`** (block/reject, stamping matched class + catalog
+  `version`); a sensitive-proxy-hint match → **clarification / compliance review** (not an auto-block); an
+  ambiguous intent → clarification (not auto-reject); a new banking use-case routes to onboarding, **not**
+  rejection; the no-silent-assumption rule holds (every resolved field has a ledger entry or a human
+  confirmation).
 - **Scoring + Doubt Router:** the deterministic catalog-cardinality check raises ambiguity the LLM under-
   reported (platform takes the cautious value); auto-resolve fires only inside the threshold **and** with a
   safe source **and** non-policy-sensitive **and** non-calculation-method field; a policy-sensitive field is
@@ -956,9 +1057,10 @@ adapter is exercised only in an **opt-in, config-gated smoke test** never gated 
   confirmer identity are all persisted**; definition mode confirms the faithful translation; hypothesis mode
   records the picked candidate.
 - **Risk flags + prohibited intent:** a high-risk-tier use-case sets `requires_independent_validation=true`
-  **without** requiring a second signer or blocking; an obviously-prohibited intent (blocked data class /
-  protected attribute as credit input) **blocks or forces clarification** and can **never** be CONFIRMED;
-  Gate #1 never "approves compliance."
+  **without** requiring a second signer or blocking; an explicit prohibited data class (blocked data class /
+  protected attribute as credit input) → **`PROHIBITED_DATA_CLASS`** block (matched class + catalog `version`
+  recorded) and can **never** be CONFIRMED; a **`sensitive_proxy_hints` match** routes to clarification /
+  compliance review, **not** an auto-block; Gate #1 never "approves compliance."
 - **Auditable-LLM surface:** every call writes an `llm_call` record + `LLM_CALL_RECORDED` event with provider /
   model / prompt+schema version / input-hash / output / validation-result / repair-attempts / latency-cost;
   **invalid output → bounded repair → (repaired) or fail into clarification** (never silent-accept, never
@@ -989,9 +1091,9 @@ adapter is exercised only in an **opt-in, config-gated smoke test** never gated 
 | 5 | Bounded repair budget | Decision 3: "bounded repair loop → on exhaustion fail into clarification" | **Reasonable call:** default **N = 2** structured-output repair attempts, config-gated, then fail into clarification; refusal treated as invalid (§9.2). The count was not specified. |
 | 6 | Refinement-loop bound | Decision (Components): "converge until minimum-contract passes" | **Reasonable call:** loop bounded by SP-0's durable-runtime hard loop limit; on exhaustion **auto-park** the run for human follow-up (§6.6). The specific round cap was not specified. |
 | 7 | LLM-call record store | Decision 3: "every LLM call is event-sourced" (fields enumerated) | **Reasonable call:** modelled as an **SP-2-owned immutable append-only `llm_call` store** (mirroring SP-1's evidence store) referenced by `llm_call_ref`, plus an `LLM_CALL_RECORDED` event — because SP-0's stage/artifact enum has no LLM-call type (§9.3, Decision D9). All enumerated fields captured. |
-| 8 | Banking-scope / Domain Catalog availability | Decision 1 & 4: "rejects only out-of-banking"; "depends on SP-0 only" | **Reasonable call:** SP-2 reads the **Domain/Use-Case Catalog as a read-only seed** (the design's `banking-domain-catalog`) for the closed boundary + `blocked_data_classes`, and defers the full generation-priming catalog to SP-12. Treated the catalog as a read-only *reference artifact*, not a build *dependency* — consistent with "SP-0 only" for buildable dependencies (§5.4, §8.4, Decision D8). The decision record was silent on whether/how the catalog is available. |
+| 8 | Banking-scope / `BankingDomainCatalog` dependency | Decision 1, 4 & 8: "rejects only out-of-banking"; "depends on SP-0 only" *(record was previously silent on catalog availability)* | **RATIFIED (user-approved).** The banking-boundary / blocked-class reference data is accepted as **SP-0-governed, read-only reference data** — the **`BankingDomainCatalog`** (§4.5): `allowed_domains`/`allowed_use_cases`, `out_of_scope_examples`, `blocked_data_classes`, `sensitive_proxy_hints` (carried **only** as "requires clarification / compliance review," never an auto-block), `jurisdiction_scope`/`use_case_scope`, and `version`/`owner`/`effective_date`/`provenance`. It is **read-only intake-classification reference data — never grounding/execution** — so it is *not* an SP-2 build dependency and does **not** violate "SP-0 only." Deterministic intake outcomes: out-of-scope → **`OUT_OF_SCOPE`** and prohibited class → **`PROHIBITED_DATA_CLASS`** (both fail-closed, each stamping the reason/matched-class + catalog `version`); sensitive-proxy/ambiguous → clarification / compliance review; a new banking use-case → onboarding park (§5.4, §8.4, §11). **This resolves the former open question (was silent, §16.8) — now ratified, not a deviation; the user explicitly approved it.** |
 | 9 | No-PII enforcement construction | Decision 3: "no raw data or PII to the LLM — enforce/validate this boundary" | **Reasonable call:** enforced at **two points** — ingest PII-scan/redact-or-fail, and a pre-send **egress guard** that hard-fails a payload carrying data values or un-redacted PII (→ security-audit), with `input_redaction` recorded for audit (§9.4). The decision record required the boundary; the two-point mechanism is the concrete encoding. |
-| 10 | Prohibited-intent mechanism | Decision 2: "obviously prohibited/compliance-sensitive → blocks or forces clarification; must NOT pretend to approve compliance" | **Reasonable call:** a **deterministic** screen over the Domain Catalog `blocked_data_classes` + a prohibited-intent ruleset; block → edit-and-loop or `reject`; never an LLM judgement, never a compliance approval (§8.4). The screen mechanism was not specified. |
+| 10 | Prohibited-intent mechanism | Decision 2: "obviously prohibited/compliance-sensitive → blocks or forces clarification; must NOT pretend to approve compliance" | **Reasonable call (mechanism); RATIFIED (contract, see entry 8).** A **deterministic** screen over the `BankingDomainCatalog` `blocked_data_classes` (§4.5): an explicit prohibited data class → **`PROHIBITED_DATA_CLASS`** block (matched class + catalog `version`) → edit-and-loop or `reject`; a `sensitive_proxy_hints` match is the **distinct** routing → clarification / compliance review, **not** an auto-block; never an LLM judgement, never a compliance approval (§8.4). The screen mechanism was not specified; the proxy-vs-block distinction is the user-ratified contract. |
 | 11 | Gate #1 is not four-eyes | Decision 2 | Encoded: author confirms own intent (audited intent lock); `requires_independent_validation` is a **flag only**, no second signer; independent validation is Gate #2 / SP-5 (§8.2, §8.4). |
 | 12 | Real adapter details | Decision 3: "real Claude adapter shipped, config-gated, never required in CI; no silent fallback" | Encoded with concrete Claude API: model `claude-opus-4-8`, adaptive thinking, structured outputs via `output_config.format`, `stop_reason=="refusal"` → repair/clarification, fail-closed (no fallback to FakeLLM) (§9.5). *Model/API specifics grounded in the current Claude API; not a deviation.* |
 
@@ -1008,8 +1110,9 @@ refusal / ambiguous) — the CI default. The real adapter is the **Anthropic Pyt
 model **`claude-opus-4-8`**, `thinking={"type":"adaptive"}`, structured output via
 `output_config={"format":{"type":"json_schema","schema":…}}` (or `client.messages.parse()`), `stop_reason`
 handled — config-gated, never in CI. Catalog reads go through **SP-1's merged-view API** (`resolve_fact` /
-`list_objects`). The Domain/Use-Case Catalog is loaded read-only from the design's `banking-domain-catalog`
-seed for the boundary + blocked-class screens.
+`list_objects`). The **`BankingDomainCatalog`** (§4.5) is loaded read-only from the design's
+`banking-domain-catalog` seed for the boundary + blocked-class + sensitive-proxy screens, and every non-clear
+classification stamps the catalog `version` for audit.
 
 ## Appendix B — The two running examples, end to end
 
@@ -1027,8 +1130,10 @@ Draft with `target = "higher credit risk"` (**policy-sensitive**, must-ask) and 
 **must-ask**. `StubCandidateGenerator` makes **one** LLM call → 3 candidate documents (distinct-MCC delta;
 top-category-share drift; distribution divergence), each with a plain-English rationale and cheap `signals`
 (**no** IV/WoE). Risk-flag screen fires (credit-decisioning, MRM-high) → `requires_independent_validation`
-will be set true. Prohibited-intent screen: target must be pinned to a permitted, non-blocked credit-risk
-label — clarified with the requester; if it named a protected attribute it would **block**. At **Gate #1** the
+will be set true. Prohibited-intent screen (§8.4, over `BankingDomainCatalog`): target must be pinned to a
+permitted, non-blocked credit-risk label — a `sensitive_proxy_hints` match here routes to **clarification /
+compliance review** with the requester; had it named a `blocked_data_classes` protected attribute it would
+**block as `PROHIBITED_DATA_CLASS`** (matched class + catalog `version` recorded). At **Gate #1** the
 requester reviews the three rationales + the Assumption Ledger, **picks one candidate** (`select_candidate`,
 siblings closed with reasons), confirms the pinned target → **Confirmed Contract** with
 `intake_mode=hypothesis`, `selected_candidate`/`rejected_candidates` recorded, `requires_independent_validation
