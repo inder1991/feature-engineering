@@ -20,6 +20,7 @@ from dataclasses import dataclass
 
 from featuregen.contracts.db import DbConn
 from featuregen.contracts.identity import IdentityEnvelope
+from featuregen.overlay._types import FactType, Gate, Role
 from featuregen.overlay.catalog import CatalogAdapter
 from featuregen.overlay.identity import ApprovedJoinRef, CatalogObjectRef
 
@@ -36,8 +37,8 @@ class Authority:
     sides do not share a single owner (two known owners, one known + one governance side, OR
     even both-unknown → two distinct governance approvals; §6.4)."""
 
-    role: str
-    gate: str
+    role: Role
+    gate: Gate
     subjects: tuple[str | None, ...]
     governance_queue: bool
     dual: bool = False
@@ -88,7 +89,7 @@ def resolve_authority(
     conn: DbConn,
     adapter: CatalogAdapter,
     ref: CatalogObjectRef | ApprovedJoinRef,
-    fact_type: str,
+    fact_type: FactType,
 ) -> Authority:
     # conn is part of the stable contract (owner overrides / governance config may be stored
     # in future); today authority is derived purely from the catalog adapter.

@@ -10,9 +10,11 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC
+from typing import Literal
 
 from psycopg.rows import dict_row
 
+from featuregen.overlay._types import FactStatus, FactType
 from featuregen.overlay.catalog import CatalogAdapter
 from featuregen.overlay.facts import FactValidationError, validate_fact_value
 from featuregen.overlay.identity import (
@@ -37,10 +39,14 @@ _REASON_BY_STATUS = {
 @dataclass(frozen=True, slots=True)
 class ResolvedFact:
     value: object | None
-    status: str
+    # A folded FactStatus for a real overlay/catalog fact, PLUS the read-only sentinel "missing"
+    # (paired with source in {"catalog","missing"}) that resolve stamps when nothing is servable.
+    # "missing" is deliberately NOT a member of FactStatus — it is a resolve-read outcome, not a
+    # persisted fact status — so it is surfaced explicitly here rather than by widening FactStatus.
+    status: FactStatus | Literal["missing"]
     source: str  # 'catalog' | 'overlay' | 'missing'
     catalog_object: str
-    fact_type: str
+    fact_type: FactType
     use_case: str | None
     provenance: Mapping | None
     confirmed_by: tuple[str, ...]
@@ -60,7 +66,7 @@ def _iso(value):
 # shape so each branch reads as the decision it makes, not a 12-field literal.
 
 
-def _catalog_verified(catalog_fact, ref, obj, fact_type, use_case) -> ResolvedFact:
+def _catalog_verified(catalog_fact, ref, obj, fact_type: FactType, use_case) -> ResolvedFact:
     # Authoritative catalog value that cleared per-type validation -> servable, VERIFIED.
     return ResolvedFact(
         value=catalog_fact.value,
@@ -78,7 +84,7 @@ def _catalog_verified(catalog_fact, ref, obj, fact_type, use_case) -> ResolvedFa
     )
 
 
-def _catalog_invalid(ref, obj, fact_type, use_case) -> ResolvedFact:
+def _catalog_invalid(ref, obj, fact_type: FactType, use_case) -> ResolvedFact:
     # Authoritative catalog value failed validation -> fail closed, do not fall through.
     return ResolvedFact(
         value=None,
@@ -96,7 +102,7 @@ def _catalog_invalid(ref, obj, fact_type, use_case) -> ResolvedFact:
     )
 
 
-def _missing(reason, obj, fact_type, use_case) -> ResolvedFact:
+def _missing(reason, obj, fact_type: FactType, use_case) -> ResolvedFact:
     # Nothing catalog-authoritative and nothing in flight -> first-time confirmation.
     return ResolvedFact(
         value=None,
@@ -114,7 +120,7 @@ def _missing(reason, obj, fact_type, use_case) -> ResolvedFact:
     )
 
 
-def _overlay_verified(row, obj, fact_type, use_case) -> ResolvedFact:
+def _overlay_verified(row, obj, fact_type: FactType, use_case) -> ResolvedFact:
     # The only servable overlay status: a CONFIRMED, VERIFIED overlay fact.
     confirmers = row["confirmers"] or []
     return ResolvedFact(
@@ -133,7 +139,9 @@ def _overlay_verified(row, obj, fact_type, use_case) -> ResolvedFact:
     )
 
 
-def _overlay_blocked(status, reason, obj, fact_type, use_case, prior_value=None) -> ResolvedFact:
+def _overlay_blocked(
+    status: FactStatus, reason, obj, fact_type: FactType, use_case, prior_value=None
+) -> ResolvedFact:
     # Any non-VERIFIED overlay state (in-flight proposal or blocked fact state) -> no value.
     return ResolvedFact(
         value=None,
@@ -155,7 +163,7 @@ def resolve_fact(
     conn,
     adapter: CatalogAdapter,
     ref: CatalogObjectRef | ApprovedJoinRef,
-    fact_type: str,
+    fact_type: FactType,
     use_case: str | None = None,
 ) -> ResolvedFact:
     key = fact_key(ref, fact_type, use_case)

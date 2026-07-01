@@ -4,19 +4,20 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 
 from featuregen.overlay import facts
+from featuregen.overlay._types import FactStatus, FactType
 
 # Canonical persisted status values (§3.4). Display REVERIFY as RE-VERIFY at the UI edge.
-DRAFT = "DRAFT"
-PARTIALLY_CONFIRMED = "PARTIALLY_CONFIRMED"
-VERIFIED = "VERIFIED"
-REJECTED = "REJECTED"
-STALE = "STALE"
-REVERIFY = "REVERIFY"
+DRAFT: FactStatus = "DRAFT"
+PARTIALLY_CONFIRMED: FactStatus = "PARTIALLY_CONFIRMED"
+VERIFIED: FactStatus = "VERIFIED"
+REJECTED: FactStatus = "REJECTED"
+STALE: FactStatus = "STALE"
+REVERIFY: FactStatus = "REVERIFY"
 
 
 @dataclass
 class OverlayState:
-    status: str | None = None
+    status: FactStatus | None = None
     value: object | None = None
     confirmers: list = field(default_factory=list)
     expires_at: str | None = None
@@ -27,7 +28,7 @@ class OverlayState:
     prior_value: object | None = None
     evidence_ref: str | None = None
     object_ref: str | None = None
-    fact_type: str | None = None
+    fact_type: FactType | None = None
     use_case: str | None = None
 
 
