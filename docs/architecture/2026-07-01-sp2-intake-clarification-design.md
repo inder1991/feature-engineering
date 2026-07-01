@@ -804,6 +804,42 @@ On success: the **Confirmed Feature Contract** (§4.2), a frozen document `deriv
 the primary artifact of the CONFIRMED_CONTRACT stage — **the input to SP-3 grounding** (§10). The run is now
 in SP-0's `CONFIRMED_CONTRACT` run-state; only now may it be handed downstream.
 
+### 8.6 The Gate #1 task lifecycle (open / confirm / edit / OCC)
+
+**Gate #1 is a SEPARATE, dedicated confirmation task — not the terminal per-field clarification task.** The
+per-field clarification tasks of §6.5 exist to *remove doubts*; Gate #1 is a single, distinct task where the
+author confirms (or edits/rejects) the **assembled** contract. It rides the same SP-0 `CLARIFICATION` gate
+infrastructure (§2, no new gate value), so it carries `allowed_responses = [confirm, edit, reject]`,
+`required_inputs`, `task_version`, and the `open | answered | conflict | expired | cancelled | superseded`
+lifecycle (SP-0 §7).
+
+- **`open_gate1_task`** — opens the dedicated confirmation task, and **only after Minimum Contract Validation
+  passes** (§6.7, guard `minimum_contract_validated`). Its `required_inputs = [the final Draft doc ref]` (so a
+  later re-normalization *stales* it by SP-0's task-staleness rule, §12); `eligible_assignees` = the request
+  owner; it is **request-owner + `actor_kind==human` guarded** (§8.2). **Opening the gate cancels any
+  still-pending per-field clarification tasks** for the run — they are moved to `cancelled` (SP-0 §7). (After a
+  passing MCV there should be none; the cancel is the defensive close so no stale field task can be answered
+  behind an open gate.)
+- **`confirm_contract`** — the **`confirm`** response on the Gate #1 task. It writes `CONTRACT_CONFIRMED` + the
+  frozen Confirmed-Contract document (§4.2, §8.3) — and in hypothesis mode the **document `PRIMARY_SELECTED`**
+  candidate promotion (§7.1) — and drives the DRAFT → CONFIRMED_CONTRACT transition (guards of §11). The Gate
+  #1 task moves to `answered`.
+- **`request_edit`** — the **`edit`** response on the Gate #1 task: a human field edit *at the gate*. It
+  produces a **REVISED Draft version** — a new frozen Draft document that `supersedes` the prior on the DAG —
+  captures the change in the confirmation `human_edits` list (§8.3), and **re-runs Minimum Contract Validation**
+  (§6.7) on the revised draft. Because the revised draft changes the Gate #1 task's `required_inputs`, the open
+  Gate #1 task is **staled/superseded**; if MCV still passes, `open_gate1_task` re-opens a fresh confirmation
+  task against the revised draft, and if the edit re-introduces an `open_field` the run drops back into the
+  **Refinement Loop** (§6.6). An edit therefore never confirms silently — it always re-validates.
+- **`reject`** — the **`reject`** response → `reject_intent` (run REJECTED) or, for a prohibited-class finding,
+  the §8.4 block; both are the non-confirming exits of §11.
+- **Task-version optimistic concurrency.** Every `confirm`/`edit`/`reject` carries the `task_version` it read;
+  SP-0's `submit_human_signal` **rejects a signal whose `expected_task_version != task_version`** (SP-0 §7,
+  `gates/tasks.py`) — so a confirm or edit against a **stale** Gate #1 task (one already superseded by a
+  concurrent re-normalization or a prior edit) is **not counted**, and the client must re-fetch the current
+  task. This is the OCC guard that prevents a confirm from racing an in-flight re-normalization: the winner
+  serializes on run-stream OCC (§12), the loser is rejected on `task_version`, never double-applied.
+
 ---
 
 ## 9. The auditable-LLM surface (`LLMClient` + `FakeLLM` + real Claude adapter)
@@ -998,8 +1034,13 @@ through SP-2 sub-states (all while the SP-0 run-state is `DRAFT`, until Gate #1)
                     │        records matched class + catalog version (authoritative block)
                     ├── sensitive-proxy hint ──► CLARIFYING (clarification / compliance review, §6.2)
                     └── clear ─►  READY_FOR_GATE_1
-                                   │
-                    Human Gate #1  (author confirms / picks candidate via document PRIMARY_SELECTED; requester + actor_kind=human)
+                                   │  open_gate1_task (dedicated CLARIFICATION-gate confirm task; cancels pending
+                                   │                   clarification tasks; required_inputs = final Draft; §8.6)
+                                   ▼
+                    Human Gate #1  (requester + actor_kind=human; task_version OCC, §8.6)
+                     ├── edit  ─► request_edit → REVISED Draft (supersedes) → re-run MCV ──► (loop / re-open gate)
+                     ├── reject ─► reject_intent (run REJECTED) | §8.4 block
+                     └── confirm ─► confirm_contract (picks candidate via document PRIMARY_SELECTED in hypothesis mode)
                                    ▼
                             CONFIRMED  →  run advances to CONFIRMED_CONTRACT  →  SP-3
 ```
@@ -1011,7 +1052,14 @@ guards registered in SP-0's predicate registry (SP-0 §4.1) — `open_fields_emp
 documents/version-attributes, pure/deterministic) **before** appending, so an illegal advance is rejected
 before it is written. In hypothesis mode, `calculation_method_chosen` is satisfied by a **document
 `PRIMARY_SELECTED`** promotion of the chosen candidate doc on the **run** aggregate (§7.1) — the document-level
-primitive, *not* the request-level `select_candidate` command. **The two banking-boundary rejection outcomes are distinct and each carries its
+primitive, *not* the request-level `select_candidate` command. **Gate #1 task lifecycle (§8.6):** once
+`minimum_contract_validated` holds, `open_gate1_task` opens a **dedicated** `CLARIFICATION`-gate confirmation
+task (distinct from the per-field clarification tasks, which it **cancels**), keyed to the final Draft doc via
+`required_inputs`. The confirmer's `confirm` → `confirm_contract` (DRAFT → CONFIRMED_CONTRACT); `edit` →
+`request_edit`, which supersedes the Draft with a **REVISED** version, re-runs MCV, and re-opens a fresh gate
+task (or re-enters the Refinement Loop); `reject` → the non-confirming exit. A `confirm`/`edit`/`reject`
+carrying a **stale `task_version`** is rejected (SP-0 `submit_human_signal` OCC, §8.6, §12) so a confirm can
+never race a re-normalization. **The two banking-boundary rejection outcomes are distinct and each carries its
 provenance:** **`OUT_OF_SCOPE`** (reject-or-park; records the reason + catalog `version`) and
 **`PROHIBITED_DATA_CLASS`** (block/reject; records the matched class + catalog `version`) — both are the
 terminal/park refinements of the earlier generic `INTENT_REJECTED`, surfaced via `INTENT_REJECTED` / `reject`
@@ -1033,10 +1081,12 @@ not build (§14).
   the LLM (§9.4). A prohibited intent blocks (§8.4). An exhausted refinement loop parks (§6.6).
 - **OCC on the run stream** (SP-0) — concurrent writers to one run serialize; each SP-2 step is one atomic
   SP-0 transaction (append event(s) + insert frozen doc(s) + upsert timers + outbox, SP-0 §5.1).
-- **Clarification staleness is keyed to the task, not the run** (SP-0 §7:429): a pending clarification answer
-  is rejected only if its `required_inputs` (the draft doc ref) changed since it opened — so a re-normalization
-  correctly stales an in-flight answer, while unrelated run activity (reminders, sibling-candidate writes) does
-  not. The timer/answer race uses CAS on `task_version` (SP-0 §5.5).
+- **Clarification/Gate-#1 staleness is keyed to the task, not the run** (SP-0 §7:429): a pending clarification
+  answer — or a Gate #1 `confirm`/`edit` (§8.6) — is rejected only if its `required_inputs` (the draft doc ref)
+  changed since it opened — so a re-normalization or a gate `edit` correctly stales an in-flight answer, while
+  unrelated run activity (reminders, sibling-candidate writes) does not. The timer/answer race, **and any
+  signal against a stale Gate #1 task,** are rejected by CAS on `task_version` (SP-0 §5.5, §8.6) — a confirm can
+  never race a re-normalization.
 - **Idempotency** — `submit_intent` is idempotent per request; clarification answers idempotent by
   `(task_id, subject)` (SP-0 §7); `LLMClient.call` records are keyed by `(run_id, task, input_hash,
   prompt_version)` so a retried identical call reuses its record rather than double-charging.
@@ -1054,10 +1104,13 @@ not build (§14).
 - **Commands:** `submit_intent(request, intent_text, intake_mode)`; `answer_clarification(task_id, actor,
   response)` (a thin wrapper over SP-0 `submit_human_signal(gate=CLARIFICATION)` that **enforces the SP-2
   request-owner guard** — acting `subject` == request owner, else DENY + security-audit, §8.2);
-  `confirm_contract(run_id, actor, candidate_doc_id?)` (Gate #1 — in hypothesis mode selects the calculation
-  method by promoting the chosen candidate **document** via SP-0 **`PRIMARY_SELECTED`**, §7.1; **not** the
-  request-level `select_candidate` command), likewise **request-owner + `actor_kind==human` guarded** (§8.2);
-  `reject_intent(run_id, actor, reason)`.
+  `open_gate1_task(run_id, actor)` (opens the dedicated Gate #1 confirmation task once MCV passes, cancelling
+  pending clarification tasks, §8.6); `confirm_contract(run_id, actor, task_version, candidate_doc_id?)` (Gate
+  #1 `confirm` — in hypothesis mode selects the calculation method by promoting the chosen candidate
+  **document** via SP-0 **`PRIMARY_SELECTED`**, §7.1; **not** the request-level `select_candidate` command);
+  `request_edit(run_id, actor, task_version, field_edit)` (Gate #1 `edit` → **REVISED** Draft version that
+  supersedes the prior + re-runs MCV, §8.6). All three are **request-owner + `actor_kind==human` guarded**
+  (§8.2) and reject a **stale `task_version`** (OCC, §8.6). `reject_intent(run_id, actor, reason)`.
 - **Read model:** `get_contract(run_id) -> {stage, status, draft|confirmed body, assumption_ledger,
   field_scores, open_questions}` — service-internal, for SP-3 to fetch the Confirmed Contract.
 - **The Confirmed Feature Contract document** (CONFIRMED_CONTRACT stage) — the governed hand-off artifact.
@@ -1121,6 +1174,12 @@ adapter is exercised only in an **opt-in, config-gated smoke test** never gated 
   scientist; confirmer must be the authenticated requester with `actor_kind=human`; **selected + rejected
   candidates + assumptions + human edits + ambiguity notes + confirmer identity are all persisted**; definition
   mode confirms the faithful translation; hypothesis mode records the picked candidate.
+- **Gate #1 task lifecycle (§8.6):** `open_gate1_task` fires **only after MCV passes** and **cancels** any
+  still-pending clarification tasks; a `confirm`/`edit`/`reject` carrying a **stale `task_version`** is
+  **rejected** (OCC) and never applied; `request_edit` produces a **REVISED** Draft that supersedes the prior,
+  **re-runs Minimum Contract Validation**, and (if a field re-opens) re-enters the Refinement Loop or re-opens a
+  fresh Gate #1 task; a confirm racing a concurrent re-normalization loses on `task_version` (never
+  double-applied).
 - **Risk flags + prohibited intent:** a high-risk-tier use-case sets `requires_independent_validation=true`
   **without** requiring a second signer or blocking; an explicit prohibited data class (blocked data class /
   protected attribute as credit input) → **`PROHIBITED_DATA_CLASS`** block (matched class + catalog `version`
