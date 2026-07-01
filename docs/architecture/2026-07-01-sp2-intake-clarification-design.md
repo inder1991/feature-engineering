@@ -122,7 +122,8 @@ SP-2 reuses, verbatim from SP-0:
    `run` aggregate: `INTENT_SUBMITTED`, `DRAFT_CONTRACT_PRODUCED`, `CONTRACT_CRITIQUED`,
    `FIELD_AUTO_RESOLVED`, `CLARIFICATION_REQUESTED`, `CLARIFICATION_ANSWERED` (a thin domain shadow of the
    SP-0 gate answer, carrying the re-normalization trigger), `CONTRACT_REFINED`, `MINIMUM_CONTRACT_VALIDATED`,
-   `CONTRACT_CONFIRMED`, `INTENT_REJECTED`, and `LLM_CALL_RECORDED` (§9.3).
+   `CONTRACT_CONFIRMED`, `USE_CASE_ONBOARDING_REQUESTED` (a new banking use-case parked for governance
+   onboarding, §5.4, §11), `INTENT_REJECTED`, and `LLM_CALL_RECORDED` (§9.3).
 2. **Document content-schemas** for `DRAFT_CONTRACT`, `ASSUMPTION_LEDGER`, `CONFIRMED_CONTRACT` registered in
    SP-0's document registry (SP-0 §3.7), versioned, with reader-upcasters (§4).
 3. **The `llm_call` immutable record store** — a new SP-2-owned append-only table (an SP-0-style write-once
@@ -214,9 +215,10 @@ fields wrap it):
 
 ```json
 {
-  "raw_intent_ref": "blob_01H...",              // encrypted, access-restricted; never inline (SP-0 §9)
-  "raw_intent_classification": "clean",         // clean | contains_pii | unscanned (SP-0 §3.5)
+  "raw_input_ref": "blob_01H...",               // SP-0 envelope field; encrypted, access-restricted; never inline (SP-0 §9)
+  "raw_input_classification": "clean",          // SP-0 envelope field: clean | contains_pii | unscanned (SP-0 §3.5)
   "intake_mode": "definition",
+  "proposed_feature_name": "declined_card_auth_count_90d",   // LLM-proposed; human-editable at Gate #1 → Confirmed feature_name (§4.2, §8.3)
   "feature_semantics": {
     "entity": "customer",
     "entity_grain": ["customer_id", "as_of_date"],   // as_of_date is an ASSUMPTION (see ledger)
@@ -258,11 +260,11 @@ Every P0 field resolved, either by human confirmation or a **recorded, human-ack
 
 ```json
 {
-  "feature_name": "declined_card_auth_count_90d",
+  "feature_name": "declined_card_auth_count_90d",   // from the Draft's proposed_feature_name (§4.1), human-editable at Gate #1 (§8.3)
   "intake_mode": "definition",
   "entity": "customer",
-  "entity_key": "customer_id",
-  "feature_grain": ["customer_id", "as_of_date"],
+  "entity_key": "customer_id",                   // split from the Draft's entity_grain (Draft→Confirmed rename, below)
+  "feature_grain": ["customer_id", "as_of_date"],  // the Draft's entity_grain (§4.1), persisted under this confirmed-stage name
   "observation_intent": {
     "kind": "point_in_time",
     "as_of_field": "as_of_date",
@@ -297,6 +299,14 @@ Every P0 field resolved, either by human confirmation or a **recorded, human-ack
 The **hypothesis example** produces the same shape with `intake_mode: "hypothesis"`, a non-null `target`
 (e.g. the confirmed credit-risk label definition), a `calculation_method.chosen` picked from
 `considered` (the candidates of §3.2), and `confirmation.selected_candidate`/`rejected_candidates` populated.
+
+> **Draft→Confirmed field renames (deliberate).** Two Draft fields take their confirmed-stage names here:
+> the Draft's **`entity_grain`** (§4.1) is persisted as **`feature_grain`**, with the entity key split out
+> into **`entity_key`** (here `customer_id`); and the Draft's LLM-proposed **`proposed_feature_name`** (§4.1)
+> is persisted as the human-editable **`feature_name`**. Everything else keeps its Draft name (including the
+> SP-0 envelope fields `raw_input_ref` / `raw_input_classification`). Minimum Contract Validation (§6.7)
+> validates the fields the **Draft** actually carries (`entity` + `entity_grain`); the renamed forms are the
+> confirmed-stage persistence.
 
 ### 4.3 Assumption Ledger (its own frozen document)
 
@@ -358,13 +368,17 @@ Draft Feature Contract + Assumption Ledger.
 ```
 submit_intent(request)                                   authz: data scientist (request owner) or service:intake-agent
   └─ create_request (SP-0) + create_run (SP-0) → run in DRAFT
-  └─ PII-scan + classify raw intent → encrypted blob (SP-0 §9); emit INTENT_SUBMITTED
+  └─ PII-scan + classify raw intent (SP-0-owned envelope classification → raw_input_classification, §9.4) → encrypted blob (SP-0 §9); emit INTENT_SUBMITTED
   └─ in-banking-scope screen (§5.4)  ──reject──▶ INTENT_REJECTED (only if out-of-banking)
   └─ LLMClient.structure_intent(redacted_intent, catalog_metadata)   → event-sourced call record (§9)
         │  structured-output contract + bounded repair (§9.2)
         ▼
   └─ Draft Feature Contract (frozen doc) + Assumption Ledger (frozen doc)
         status = NEEDS_CLARIFICATION, open_fields populated
+  └─ if intake_mode == hypothesis:  CandidateGenerator.generate(draft, catalog_metadata, domain_context)  (§7)
+        → 1–3 scored candidate-role staged docs under the Draft stage  [each generate = event-sourced LLM call (§9)]
+        this is the confirmable candidate set MCV #2 (§6.7) requires to exist pre-gate; the human picks one at Gate #1
+        (definition mode has NO generation step — there is one faithful translation to confirm)
      emit DRAFT_CONTRACT_PRODUCED   ──▶  hand to Layer 2 (§6)
 ```
 
@@ -383,7 +397,12 @@ that lacks either a human confirmation or a ledger entry.
 
 Intake **rejects only out-of-*banking* requests** (design §3:90, §15.5): a request with no banking entity,
 data, or concept → `INTENT_REJECTED` with a reason. A **new banking use-case** (a banking request that
-doesn't match a known catalog use-case) is **routed to onboarding, not rejected** (design §15.6). The screen
+doesn't match a known catalog use-case) is **routed to onboarding, not rejected** (design §15.6): instead of
+`INTENT_REJECTED`, the run is **parked** (SP-0 `park`) into a hold state **`NEEDS_USE_CASE_ONBOARDING`** and
+emits **`USE_CASE_ONBOARDING_REQUESTED`**, which opens a **governance use-case-onboarding human-gate task**
+(SP-0's human-gate task model, owned by governance). **SP-2 only routes/parks: the onboarding *workflow*
+itself is out of SP-2 build scope** (§14) — SP-2 defines the park state + the routing event, not the
+onboarding gate's semantics. The screen
 is a **deterministic classifier** over the read-only Domain/Use-Case Catalog seed (design's
 `banking-domain-catalog`): the closed banking boundary + the entity/concept taxonomy. It is *not* the LLM's
 call — the LLM may *suggest* a use-case label, but the deterministic screen decides in/out. (The richer
@@ -499,15 +518,23 @@ one on the DAG — full history is retained for audit.
 Before Gate #1 can open, a **deterministic checklist** must pass (design §3:104). It is pure and
 machine-checkable (registered as SP-0 lifecycle guards, §11). All must hold:
 
-1. **Grain resolved** — `entity` and `feature_grain` are present and non-`UNKNOWN`.
-2. **Calculation method chosen** — `calculation_method.chosen` is set (in hypothesis mode, exactly one
-   candidate is selectable; the selection itself happens *at* Gate #1, so pre-gate this requires a
-   confirmable candidate set to exist).
+1. **Grain resolved** — `entity` and the grain the **Draft carries** (`entity_grain`, §4.1) are present and
+   non-`UNKNOWN`. (At confirmation this is persisted as `feature_grain` + the derived `entity_key`, §4.2 —
+   MCV validates the Draft-stage field, not the renamed confirmed form.)
+2. **Calculation method available for selection** — a *confirmable* method exists **pre-gate** (this does
+   **not** assert `calculation_method.chosen` is already set — the CHOICE is recorded **at** Gate #1, §8):
+   in **definition mode**, the single faithfully-translated `calculation_method` is present and non-`UNKNOWN`;
+   in **hypothesis mode**, a **non-empty scored candidate set** (the 1–3 candidate-role docs produced by
+   `CandidateGenerator.generate()` during intake, §5.2, §7) exists under the Draft, exactly one of which the
+   confirmer selects at Gate #1.
 3. **No unresolved high-ambiguity field** — `open_fields` is empty and no field remains `ambiguity > 0.30`
    without a ledger entry or human confirmation.
 4. **Observation intent present** — point-in-time/observation rule is stated (so SP-3 can bind it).
 5. **In banking scope** — the §5.4 screen passed and (for a policy-sensitive use-case) the target is a
    permitted, non-blocked concept (else it routes back to must-ask, or to the prohibited-intent block, §8.4).
+   This is the **deterministic pre-gate scope / blocked-class check** that lets Gate #1 *open*; it is
+   deliberately re-run as the **fail-closed compliance backstop at the moment of confirmation** by the
+   prohibited-intent screen of **§8.4 #2** (which is authoritative for the block). Both exist by design (§8.4).
 6. **Every resolved field is accountable** — each has either a human confirmation or an Assumption Ledger
    entry (the §5.3 rule).
 
@@ -598,6 +625,8 @@ producing the **Confirmed Feature Contract** (§4.2) and moving the run DRAFT �
 
 `CONTRACT_CONFIRMED` and the Confirmed-Contract document persist, immutably (Decision D4):
 
+- the final **`feature_name`** — LLM-proposed in the Draft as `proposed_feature_name` (§4.1) and **editable
+  by the confirmer at Gate #1** (any edit is also captured in the human-edits list below),
 - **selected candidate** + **rejected candidates** (the sibling `doc_id`s and their rejection reasons),
 - the **Assumption Ledger** as-confirmed,
 - the **human edits** (field-level before/after),
@@ -627,6 +656,12 @@ Two deterministic screens run before / at Gate #1:
    give; it belongs to Compliance at the overlay/policy layer (SP-1) and the governance gates (SP-5/SP-9). The
    screen is **deterministic** (a ruleset over the catalog's blocked classes + a prohibited-intent list), not
    an LLM judgement. *(The concrete prohibited-intent ruleset mechanism was a reasonable call, §16.)*
+   **Relationship to MCV #5 (§6.7) — why both exist.** MCV #5 is the **deterministic pre-gate**
+   scope/blocked-class check whose job is to decide whether Gate #1 may *open*. This §8.4 screen re-runs the
+   same blocked-class/prohibited-intent check as the **fail-closed backstop at the moment of confirmation**,
+   so a contract can **never** be CONFIRMED if a prohibited-intent finding stands — even one that appeared (or
+   was missed) after the gate opened. They are the same deterministic ruleset applied at two checkpoints;
+   **this confirmation-time screen is authoritative for the block.**
 
 ### 8.5 Output
 
@@ -722,14 +757,19 @@ metadata** — object/column **names, types, and asserted grain** (from SP-1's m
 data rows, column *values*, samples, extrema, or overlay evidence metrics (Decision D5). This is enforced at
 **two points**:
 
-1. **Ingest:** the raw intent is PII-scanned and classified on submission (`raw_intent_classification`,
-   SP-0 §3.5); PII spans are redacted before the text is placed in any `LLMRequest.inputs`. If the intent
-   cannot be safely redacted (classification `contains_pii` with un-redactable spans), the call **fails into
-   the clarification/manual path** rather than sending it — no unsafe payload is ever dispatched.
-2. **Egress guard:** a deterministic pre-send check on every `LLMRequest` rejects any payload that carries
-   data *values* (as opposed to metadata) or un-redacted PII; a violation is a **hard failure** recorded in
-   the security-audit stream, not a warning. The `input_redaction` field on the call record documents what the
-   guard scrubbed, so the boundary is auditable after the fact. *(The two-point scan-and-egress-guard
+1. **Ingest (owned by SP-0):** **SP-0 owns envelope PII-scanning + classification.** On submission SP-0 scans
+   the raw intent and stamps `raw_input_classification ∈ {clean, contains_pii, unscanned}` (SP-0 §3.5); PII
+   spans are redacted before the text is placed in any `LLMRequest.inputs`. If the intent cannot be safely
+   redacted (classification `contains_pii` with un-redactable spans), the call **fails into the
+   clarification/manual path** rather than sending it — no unsafe payload is ever dispatched.
+2. **Egress guard (owned by SP-2 — the hard backstop):** SP-2 does **not trust** the envelope blindly. A
+   deterministic pre-send check on every `LLMRequest` **refuses to dispatch** any payload whose
+   `raw_input_classification` is **`unscanned`** (never send un-classified content to the LLM), or that
+   carries data *values* (as opposed to metadata) or un-redacted PII; a violation is a **hard failure**
+   recorded in the security-audit stream, not a warning. The `input_redaction` field on the call record
+   documents what the guard scrubbed, so the boundary is auditable after the fact. **Two-point boundary,
+   unambiguous:** SP-0 classifies at ingest; SP-2's egress guard is the fail-closed gate that lets only
+   `clean`/safely-redacted, metadata-only payloads reach the model. *(This two-point scan-and-egress-guard
    construction extends the decision record's "only intent text + catalog metadata" rule into a concrete
    enforced boundary, §16.)*
 
@@ -792,10 +832,17 @@ through SP-2 sub-states (all while the SP-0 run-state is `DRAFT`, until Gate #1)
 ```
                               submit_intent
                                    │
-              in-banking screen ──►│──── out-of-banking ──► INTENT_REJECTED (run REJECTED)
+              banking-scope screen (§5.4)
+                    ├── out-of-banking ──────────────► INTENT_REJECTED (run REJECTED)
+                    ├── in-banking, unknown use-case ─► NEEDS_USE_CASE_ONBOARDING  (SP-0 park + hold)
+                    │        emit USE_CASE_ONBOARDING_REQUESTED → opens a governance onboarding
+                    │        human-gate task  (the onboarding workflow itself is out of SP-2 scope, §14)
+                    └── in-banking, known use-case
                                    ▼
                           NEEDS_CLARIFICATION  (Draft produced, open_fields populated)
-                                   │
+                                   │  hypothesis mode: CandidateGenerator.generate() → 1–3 scored candidate docs (§7)
+                                   │  (definition mode: no generation step — one faithful translation)
+                                   ▼
                 Doubt Router: all fields auto-resolvable?
                     ├── yes ─────────────────────────────────────────┐
                     └── no ─► CLARIFYING ◄── refinement loop ─────────┤
@@ -818,8 +865,10 @@ guards registered in SP-0's predicate registry (SP-0 §4.1) — `open_fields_emp
 `minimum_contract_validated`, `not_prohibited_intent`, `confirmer_is_requester_human`,
 `calculation_method_chosen`. Every SP-2 command runs the transition engine (guards evaluated on frozen
 documents/version-attributes, pure/deterministic) **before** appending, so an illegal advance is rejected
-before it is written. `INTENT_REJECTED`, `reject` (prohibited intent), and an auto-parked exhausted loop are
-the non-confirming exits. Terminal for SP-2's span: `CONFIRMED_CONTRACT` (hands off) or `REJECTED`.
+before it is written. `INTENT_REJECTED`, `reject` (prohibited intent), an auto-parked exhausted loop, and
+`NEEDS_USE_CASE_ONBOARDING` (a new banking use-case parked for governance onboarding, §5.4) are the
+non-confirming exits. Terminal for SP-2's span: `CONFIRMED_CONTRACT` (hands off) or `REJECTED`; the
+`NEEDS_USE_CASE_ONBOARDING` park exits SP-2 into a governance onboarding flow that SP-2 does not build (§14).
 
 ---
 
@@ -867,7 +916,9 @@ The real hypothesis-generation engine (router, specialists, memory, symbolic, fe
 independent validation, four-eyes signer, MRM, Human Gate #2, registration — **SP-5** · the reusable
 five-mode Critique Service — **SP-8** · predictive candidate scoring (IV/WoE), overfitting guard — **SP-5/SP-7**
 · the full Domain/Use-Case Catalog + generation priming — Layer-0 catalog work · any UI/console — frontend ·
-building SP-1's overlay write side or the `FACT_CONFIRMED_RESUME` grounding saga — **SP-1/SP-3**.
+the **use-case onboarding workflow** for a new banking use-case (SP-2 only parks the run into
+`NEEDS_USE_CASE_ONBOARDING` and routes to it — the onboarding gate/workflow itself is governance-owned, §5.4)
+· building SP-1's overlay write side or the `FACT_CONFIRMED_RESUME` grounding saga — **SP-1/SP-3**.
 
 ---
 
