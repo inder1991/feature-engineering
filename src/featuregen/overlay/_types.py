@@ -28,7 +28,7 @@ not shadow them.
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal, NotRequired, TypedDict
 
 # Canonical persisted fact status (§3.4; runtime constants in state.py).
 FactStatus = Literal[
@@ -64,3 +64,53 @@ Role = Literal[
 
 # Ordered sides of an approved_join (authority.subjects is (from, to)).
 JoinSide = Literal["from", "to"]
+
+
+# --- Fixed-shape overlay payloads (SP-1 typing overlay) -----------------------------------------
+#
+# These `TypedDict`s name the CLOSED, fixed-shape dict payloads the overlay already builds, so
+# handler signatures state the shape instead of a bare `dict`. Like the `Literal` aliases above they
+# are ANNOTATIONS ONLY — a `TypedDict` is a plain `dict` at runtime, so importing/using them changes
+# no behaviour, equality, or serialization; the runtime payloads stay ordinary dict literals.
+#
+# Genuinely polymorphic payloads are intentionally NOT modelled here: a `proposed_value` TypedDict
+# (its shape varies per fact-type) and per-command `cmd.args` shapes are dynamic and left as `dict`.
+
+
+class Confirmer(TypedDict):
+    """One recorded confirmer on an ``OVERLAY_FACT_CONFIRMED`` payload's ``confirmers`` list.
+
+    ``role`` is the side-labelled confirmer role — a single-side data fact records ``data_owner``
+    (or ``compliance`` for a policy_tag); an ``approved_join`` records the two side-suffixed
+    ``data_owner_from`` / ``data_owner_to`` roles."""
+
+    subject: str
+    role: Role
+
+
+class EligibleAssignee(TypedDict):
+    """A single task's assignee descriptor, as stamped onto ``human_tasks.eligible_assignees``.
+
+    ``role`` is always present; ``subject`` is present for an owner-known side (absent for a
+    governance/platform-admin side); ``side`` (``from``/``to``) is present only on the per-side
+    ``approved_join`` task plan and absent for single-side facts."""
+
+    role: Role
+    subject: NotRequired[str]
+    side: NotRequired[JoinSide]
+
+
+class TaskProposal(TypedDict):
+    """The task-scoped proposal read returned by ``task_read.get_task_proposal`` (§7.2) — what a
+    task assignee must see to confirm/reject.
+
+    ``proposed_value``/``prior_value``/``evidence`` are left loose (``Any``): the confirmed value
+    is polymorphic per fact-type, and ``evidence`` is an ``Evidence`` record or ``None``."""
+
+    object_ref: str
+    fact_type: FactType
+    use_case: str | None
+    proposed_value: Any
+    prior_value: Any
+    target_event_id: str
+    evidence: Any
