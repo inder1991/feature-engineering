@@ -1,33 +1,12 @@
 import pytest
+from tests.featuregen.overlay._helpers import StubCatalog
 
 from featuregen.events.registry import event_registry
 from featuregen.overlay.catalog import _clear_catalog_adapter, register_catalog_adapter
 from featuregen.overlay.commands import register_overlay_commands
 from featuregen.overlay.facts import register_overlay_event_types
-from featuregen.overlay.identity import display_object_ref
 
-
-class StubCatalog:
-    """In-memory CatalogAdapter test double (stands in for Phase 3's FixtureCatalog so Phase 4
-    is independent of its constructor). Owners are keyed on the display object_ref string."""
-
-    def __init__(self) -> None:
-        self.owners: dict[str, str] = {}
-
-    def set_owner(self, ref, subject: str) -> None:
-        self.owners[display_object_ref(ref)] = subject
-
-    def owner_of(self, ref):
-        return self.owners.get(display_object_ref(ref))
-
-    def get_fact(self, ref, fact_type, use_case=None):
-        return None
-
-    def list_objects(self):
-        return []
-
-    def fingerprint(self):
-        return {}
+__all__ = ["StubCatalog"]
 
 
 @pytest.fixture(autouse=True)

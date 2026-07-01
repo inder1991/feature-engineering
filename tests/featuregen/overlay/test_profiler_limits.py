@@ -1,8 +1,8 @@
 import numbers
 
 import pytest
+from tests.featuregen.overlay._helpers import StubCatalog, catalog_columns
 
-from featuregen.overlay.catalog import CatalogObject
 from featuregen.overlay.identity import CatalogObjectRef
 from featuregen.overlay.profiler import (
     ProfilerLimits,
@@ -10,38 +10,6 @@ from featuregen.overlay.profiler import (
     _sampling,
     run_profiler_scan,
 )
-
-
-class _Catalog:
-    def __init__(self, objects):
-        self._objects = list(objects)
-
-    def list_objects(self):
-        return list(self._objects)
-
-    def get_fact(self, ref, fact_type, use_case=None):
-        return None
-
-    def owner_of(self, ref):
-        return None
-
-    def fingerprint(self):
-        return {o.object_ref: o for o in self._objects}
-
-
-def _columns(ref, specs):
-    return [
-        CatalogObject(
-            object_ref=f"{ref.schema}.{ref.table}.{name}",
-            object_kind="column",
-            schema=ref.schema,
-            table=ref.table,
-            column=name,
-            data_type=data_type,
-            native_oid=None,
-        )
-        for name, data_type in specs
-    ]
 
 
 def _ref(schema, table):
@@ -52,7 +20,7 @@ def _ref(schema, table):
 
 def test_non_allowlisted_schema_is_refused(db):
     ref = _ref("restricted", "secrets")
-    adapter = _Catalog(_columns(ref, [("id", "integer")]))
+    adapter = StubCatalog(objects=catalog_columns(ref, [("id", "integer")]))
     limits = ProfilerLimits(allowed_schemas=frozenset({"public"}))
 
     with pytest.raises(SchemaNotAllowedError):
@@ -68,8 +36,8 @@ def test_metric_values_contain_no_raw_column_values(db):
         "SELECT g, 'SSN-' || g, (g * 100.5)::numeric, now() FROM generate_series(1, 20) AS g"
     )
     ref = _ref("public", "prof_pii")
-    adapter = _Catalog(
-        _columns(
+    adapter = StubCatalog(
+        objects=catalog_columns(
             ref,
             [
                 ("customer_id", "integer"),
@@ -101,7 +69,7 @@ def test_column_combination_cap_is_honored(db):
     # singles are non-unique (distinct=2 each); the (a,b) PAIR is unique (4 distinct rows).
     db.execute("INSERT INTO prof_pair (a, b) VALUES (1,1),(1,2),(2,1),(2,2)")
     ref = _ref("public", "prof_pair")
-    adapter = _Catalog(_columns(ref, [("a", "integer"), ("b", "integer")]))
+    adapter = StubCatalog(objects=catalog_columns(ref, [("a", "integer"), ("b", "integer")]))
 
     no_combo = run_profiler_scan(
         db, adapter, ref, limits=ProfilerLimits(allowed_schemas=frozenset({"public"}), max_column_combinations=0)
