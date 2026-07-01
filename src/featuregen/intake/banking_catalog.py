@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import json
 import os
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
+from enum import Enum
 
 # Surface terms per blocked data class — the deterministic lexical expansion the intake screen
 # matches against raw intent text (§5.4). `protected_attribute` is the platform-wide blocked class
@@ -128,3 +129,146 @@ def load_banking_catalog(path: str | os.PathLike) -> BankingDomainCatalog:
     with open(path, encoding="utf-8") as fh:
         seed = json.load(fh)
     return BankingDomainCatalog.from_seed(seed)
+
+
+class IntakeOutcome(str, Enum):
+    """The deterministic intake-classification outcomes (§4.5, §5.4). Exactly one is produced per
+    intent (most-restrictive-wins). OUT_OF_SCOPE / PROHIBITED_DATA_CLASS / NEEDS_USE_CASE_ONBOARDING
+    share their string values with FeatureContractStatus so the fold can map them directly."""
+
+    OUT_OF_SCOPE = "OUT_OF_SCOPE"                             # TERMINAL reject → reject_intent / RUN_REJECTED (banking boundary)
+    PROHIBITED_DATA_CLASS = "PROHIBITED_DATA_CLASS"          # TERMINAL reject → reject_intent / RUN_REJECTED (blocked class)
+    SENSITIVE_PROXY_CLARIFY = "SENSITIVE_PROXY_CLARIFY"      # non-terminal → clarification / review
+    AMBIGUOUS_CLARIFY = "AMBIGUOUS_CLARIFY"                  # non-terminal → clarification
+    NEEDS_USE_CASE_ONBOARDING = "NEEDS_USE_CASE_ONBOARDING"  # in-scope, unknown use-case → HOLD (onboarding; the only hold, NOT a terminal reject)
+    CLEAR = "CLEAR"                                          # pass
+
+
+@dataclass(frozen=True)
+class IntakeClassification:
+    """One deterministic classification outcome + its audit/MRM provenance. `catalog_version` is
+    stamped on EVERY outcome incl. CLEAR (§4.5(c)); it is None only when the catalog was unavailable
+    (the fail-closed case, §4.5(b))."""
+
+    outcome: IntakeOutcome
+    catalog_version: str | None
+    reason: str
+    matched_class: str | None = None
+    matched_use_case: str | None = None
+
+    @property
+    def is_clear(self) -> bool:
+        return self.outcome is IntakeOutcome.CLEAR
+
+    @property
+    def blocks(self) -> bool:
+        return self.outcome in (IntakeOutcome.OUT_OF_SCOPE, IntakeOutcome.PROHIBITED_DATA_CLASS)
+
+    @property
+    def needs_clarification(self) -> bool:
+        return self.outcome in (
+            IntakeOutcome.SENSITIVE_PROXY_CLARIFY,
+            IntakeOutcome.AMBIGUOUS_CLARIFY,
+        )
+
+    def as_mapping(self) -> dict:
+        """R9 — the compact provenance mapping submit_intent (P4) persists on INTENT_SUBMITTED (§4.5);
+        MCV / not_prohibited_intent / refine read it back. Emits the outcome VALUE (not the enum),
+        the stamped catalog_version, and matched_class."""
+        return {
+            "outcome": self.outcome.value,
+            "catalog_version": self.catalog_version,
+            "matched_class": self.matched_class,
+        }
+
+
+def _first_match(text: str, terms: Iterable[str]) -> str | None:
+    """First (deterministically ordered) term that occurs in the lowercased intent, or None."""
+    for term in sorted(terms):
+        if term and term in text:
+            return term
+    return None
+
+
+def _match_use_case(text: str, catalog: BankingDomainCatalog) -> str | None:
+    """The first (deterministically ordered) known use-case any of whose keyword terms occurs."""
+    for use_case in sorted(catalog.use_case_terms):
+        if any(term and term in text for term in catalog.use_case_terms[use_case]):
+            return use_case
+    return None
+
+
+def classify_intent(
+    intent: str,
+    *,
+    product: str | None = None,
+    region: str | None = None,
+    catalog: BankingDomainCatalog | None,
+) -> IntakeClassification:
+    """Deterministic intake banking-boundary classifier over the read-only BankingDomainCatalog
+    (§4.5, §5.4) — NOT the LLM's call. TOTAL and fail-closed: it returns exactly one outcome for any
+    input under most-restrictive-wins precedence (PROHIBITED_DATA_CLASS > OUT_OF_SCOPE >
+    sensitive-proxy > ambiguous), and stamps the catalog `version` on every outcome incl. CLEAR
+    (§4.5 a/c). Completeness rules: (b) an unavailable/unversioned catalog fails closed to
+    AMBIGUOUS_CLARIFY (never CLEAR); (e) a scoped use-case missing product/region → AMBIGUOUS_CLARIFY."""
+    # (b) fail-closed on an absent / unversioned catalog — never auto-pass.
+    if catalog is None or not catalog.available:
+        return IntakeClassification(
+            IntakeOutcome.AMBIGUOUS_CLARIFY, None, "catalog_unavailable_fail_closed"
+        )
+    version = catalog.version
+    text = f" {intent.lower()} "
+
+    # 1. PROHIBITED_DATA_CLASS — most restrictive; dominates everything.
+    hit = _first_match(text, catalog.blocked_terms)
+    if hit is not None:
+        return IntakeClassification(
+            IntakeOutcome.PROHIBITED_DATA_CLASS, version,
+            f"blocked data class matched: {hit}", matched_class=catalog.blocked_terms[hit],
+        )
+
+    use_case = _match_use_case(text, catalog)
+
+    # 2. OUT_OF_SCOPE — explicit example term, an out-of-scope use-case, or no banking concept at all.
+    oos_term = _first_match(text, catalog.out_of_scope_terms)
+    if oos_term is not None:
+        return IntakeClassification(
+            IntakeOutcome.OUT_OF_SCOPE, version, f"out-of-scope example matched: {oos_term}"
+        )
+    if use_case is not None and use_case in catalog.out_of_scope_use_cases:
+        return IntakeClassification(
+            IntakeOutcome.OUT_OF_SCOPE, version, f"use-case out of scope: {use_case}",
+            matched_use_case=use_case,
+        )
+    if _first_match(text, catalog.banking_terms) is None:
+        return IntakeClassification(
+            IntakeOutcome.OUT_OF_SCOPE, version, "no banking entity / data / concept"
+        )
+
+    # 3. SENSITIVE_PROXY_CLARIFY — a proxy hint is a doubt to review, never a standalone block.
+    proxy = _first_match(text, catalog.sensitive_proxy_terms)
+    if proxy is not None:
+        return IntakeClassification(
+            IntakeOutcome.SENSITIVE_PROXY_CLARIFY, version,
+            f"sensitive-proxy hint matched: {proxy}",
+        )
+
+    # 4. AMBIGUOUS_CLARIFY — (e) a scoped use-case whose product/region context is missing.
+    if use_case is not None and use_case in catalog.scoped_use_cases and (
+        product is None or region is None
+    ):
+        return IntakeClassification(
+            IntakeOutcome.AMBIGUOUS_CLARIFY, version,
+            f"missing product/region for scoped use-case {use_case}", matched_use_case=use_case,
+        )
+
+    # 5. CLEAR (known use-case) / NEEDS_USE_CASE_ONBOARDING (in-scope banking, unknown use-case).
+    if use_case is not None:
+        return IntakeClassification(
+            IntakeOutcome.CLEAR, version, f"in banking scope: {use_case}", matched_use_case=use_case
+        )
+    if _first_match(text, catalog.predictive_markers) is not None:
+        return IntakeClassification(
+            IntakeOutcome.NEEDS_USE_CASE_ONBOARDING, version, "in-scope banking, unknown use-case"
+        )
+    return IntakeClassification(IntakeOutcome.CLEAR, version, "in banking scope: feature definition")
