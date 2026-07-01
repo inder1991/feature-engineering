@@ -159,6 +159,13 @@ SP-2 reuses, verbatim from SP-0:
    pins the acting `subject` to the request owner via `actor_is_request_owner` (at `answer_clarification`,
    §6.5) and `confirmer_is_requester_human` = `actor_is_request_owner ∧ actor_kind==human` (at
    `confirm_contract` / Gate #1, §8.2). A mismatch is **denied + written to the security-audit stream**.
+   **Plus one additive `authz_policy` row (rejection authority):** because SP-0's `reject` action is
+   **validator-only** (`authz/policy.py:42`), SP-2 registers **one additive `authz_policy` row** admitting the
+   **platform/service principal** (`service:intake-agent`) to issue the deterministic intake-rejection terminal
+   outcome **`reject_intent`** (→ SP-0 `RUN_REJECTED`; §5.4, §11). This **adds** a row and **changes no existing
+   SP-0 row**, so SoD holds — the validator-only `reject` and the data-scientist-owned `withdraw`
+   (`authz/policy.py:41`) are untouched, and **requester-initiated abandonment reuses that existing `withdraw`,
+   not `reject`.**
 5. **One additive human-gate + park-reason registration** — a small backward-compatible migration (mirroring
    SP-1's `0505_overlay_gates.sql`) that **widens SP-0's `human_tasks` gate CHECK** with a new
    `USE_CASE_ONBOARDING` gate value and registers the **`NEEDS_USE_CASE_ONBOARDING` park hold-state** as an
@@ -445,8 +452,8 @@ submit_intent(request)                                   authz: data scientist (
   └─ create_request (SP-0) + create_run (SP-0) → run in DRAFT
   └─ PII-scan + classify raw intent (SP-0-owned envelope classification → raw_input_classification, §9.4) → encrypted blob (SP-0 §9); emit INTENT_SUBMITTED
   └─ banking-boundary classification (§5.4, over BankingDomainCatalog §4.5)
-        ├─ out of banking scope   ──▶ OUT_OF_SCOPE → INTENT_REJECTED / park  (reason + catalog version)
-        ├─ prohibited data class  ──▶ PROHIBITED_DATA_CLASS → reject          (matched class + catalog version)
+        ├─ out of banking scope   ──▶ OUT_OF_SCOPE → reject_intent → INTENT_REJECTED / park  (platform/service-issued; reason + catalog version)
+        ├─ prohibited data class  ──▶ PROHIBITED_DATA_CLASS → reject_intent → INTENT_REJECTED  (platform/service-issued; matched class + catalog version)
         ├─ sensitive-proxy/ambiguous ──▶ clarification / compliance review (§6.2)  (NOT terminal)
         └─ in-banking, unknown use-case ──▶ NEEDS_USE_CASE_ONBOARDING (park, §5.4)
   └─ LLMClient.structure_intent(redacted_intent, catalog_metadata)   → event-sourced call record (§9)
@@ -495,6 +502,16 @@ provenance. The screen produces exactly one of these **deterministic classificat
    automatic block or standalone proof. **Non-terminal.**
 4. **Ambiguous intent** — banking-plausible but under-specified scope → **open clarification** (§6.2). **Do NOT
    auto-reject. Non-terminal.**
+
+**Rejection / withdrawal authority.** The two deterministic **terminal** rejections (`OUT_OF_SCOPE`,
+`PROHIBITED_DATA_CLASS`) are **platform/service-issued terminal outcomes** — the platform's *deterministic
+classifier* decided (running as the `service:intake-agent` principal), **not** a validator. They therefore do
+**not** reuse SP-0's `reject` command, whose authz is **validator-only** (`authz/policy.py:42`); reusing it
+would misattribute a platform decision to a human validator. SP-2 issues them via its own platform/service
+action **`reject_intent`** (→ SP-0 `RUN_REJECTED`) under an **additive service authz row** (§2.1 #4). By
+contrast, **requester-initiated abandonment** — the *author* choosing to walk away from their own intent (e.g.
+rather than edit a blocked or looping one) — reuses SP-0 **`withdraw`** (→ `RUN_WITHDRAWN`), which is
+**data-scientist-owned** (`authz/policy.py:41`), never the validator-only `reject`.
 
 A **new banking use-case** — a request that is *in-scope* banking but matches no known catalog use-case — is
 **neither rejected nor blocked**: the run is **parked** (SP-0 `park`) into a hold state
@@ -795,10 +812,14 @@ Two deterministic screens run before / at Gate #1:
      `blocked_data_classes` member (e.g. a protected attribute used as a credit-decisioning input), Gate #1
      **blocks / rejects as `PROHIBITED_DATA_CLASS`**, recording the **matched class** and the **catalog
      `version`**. It **must not pretend to approve compliance** (Decision D4): the contract cannot be CONFIRMED
-     while a prohibited-data-class finding stands. The requester either **withdraws/edits** the intent (back
-     through the Refinement Loop) or the run is **`reject`ed** (SP-0) with the compliance reason + catalog
-     `version` recorded. This is a **deterministic** ruleset over the catalog's blocked classes, **not** an LLM
-     judgement. *(The concrete ruleset mechanism was a reasonable call, §16.)*
+     while a prohibited-data-class finding stands. The requester either **edits** the intent (back through the
+     Refinement Loop) or **withdraws** it — a *requester-initiated abandonment* that reuses **SP-0 `withdraw`**
+     (data-scientist-owned, `authz/policy.py:41`, → `RUN_WITHDRAWN`); independently, the **platform** records
+     the deterministic block as its own **platform/service-issued terminal outcome** (`reject_intent` →
+     `RUN_REJECTED`, additive service authz §2.1 #4), with the matched class + catalog `version`. **Neither path
+     reuses SP-0's validator-only `reject`** (`authz/policy.py:42`): the classifier is not a validator, and the
+     requester owns `withdraw`, not `reject`. This is a **deterministic** ruleset over the catalog's blocked
+     classes, **not** an LLM judgement. *(The concrete ruleset mechanism was a reasonable call, §16.)*
    - **Sensitive-proxy hint → clarification / compliance review (not a block).** If the intent matches a
      `sensitive_proxy_hints` member, it is routed to **clarification / compliance review** (§6.2, §6.5), **NOT**
      auto-blocked. A proxy hint is a *doubt requiring review*, never standalone proof of prohibition; it is
@@ -848,8 +869,10 @@ lifecycle (SP-0 §7).
   Gate #1 task is **staled/superseded**; if MCV still passes, `open_gate1_task` re-opens a fresh confirmation
   task against the revised draft, and if the edit re-introduces an `open_field` the run drops back into the
   **Refinement Loop** (§6.6). An edit therefore never confirms silently — it always re-validates.
-- **`reject`** — the **`reject`** response → `reject_intent` (run REJECTED) or, for a prohibited-class finding,
-  the §8.4 block; both are the non-confirming exits of §11.
+- **`reject`** — the **`reject`** response is a **requester-initiated abandonment** of the author's own intent →
+  SP-0 **`withdraw`** (data-scientist-owned, `authz/policy.py:41`, → `RUN_WITHDRAWN`), **not** SP-0's
+  validator-only `reject` and **not** the platform's `reject_intent`. (A prohibited-class finding is instead the
+  §8.4 **platform/service-issued** block.) Both are non-confirming exits of §11.
 - **Task-version optimistic concurrency.** Every `confirm`/`edit`/`reject` carries the `task_version` it read;
   SP-0's `submit_human_signal` **rejects a signal whose `expected_task_version != task_version`** (SP-0 §7,
   `gates/tasks.py`) — so a confirm or edit against a **stale** Gate #1 task (one already superseded by a
@@ -992,7 +1015,10 @@ agent, no document, and no gate.
 Event store + envelope; staged-document DAG + document registry (incl. the document **`PRIMARY_SELECTED`**
 candidate-promotion primitive SP-2 uses for Gate #1 selection, §7.1); the run aggregate +
 DRAFT/CONFIRMED_CONTRACT states + the lifecycle command catalog (`create_request`, `create_run`,
-`submit_human_signal`, `park`/`unpark`, `reject`); the `CLARIFICATION` human-gate; identity/authz + structural
+`submit_human_signal`, `park`/`unpark`, and `withdraw` for requester abandonment → `RUN_WITHDRAWN` — but
+**not** SP-0's **validator-only** `reject`, which SP-2 never invokes from the requester/service path; SP-2's
+deterministic intake rejection is its own platform/service `reject_intent`, §2.1 #4, §5.4); the `CLARIFICATION`
+human-gate; identity/authz + structural
 SoD + the security-audit stream; the durable runtime (outbox, timers, bounded retries); privacy/retention
 (encrypted raw-intent blob, body classification). (SP-0 §§3–9.)
 
@@ -1022,10 +1048,11 @@ through SP-2 sub-states (all while the SP-0 run-state is `DRAFT`, until Gate #1)
                               submit_intent
                                    │
               banking-boundary classification (§5.4, over BankingDomainCatalog §4.5)
-                    ├── out of banking scope ────────► OUT_OF_SCOPE → INTENT_REJECTED (run REJECTED) | park
-                    │        records reason + catalog version (fail-closed)
-                    ├── prohibited data class ───────► PROHIBITED_DATA_CLASS → reject (run REJECTED)
-                    │        records matched class + catalog version (fail-closed; re-checked at §8.4)
+                    ├── out of banking scope ────────► OUT_OF_SCOPE → reject_intent → INTENT_REJECTED
+                    │        (run REJECTED, platform/service-issued) | park; reason + catalog version (fail-closed)
+                    ├── prohibited data class ───────► PROHIBITED_DATA_CLASS → reject_intent → INTENT_REJECTED
+                    │        (run REJECTED, platform/service-issued); matched class + catalog version
+                    │        (fail-closed; re-checked at §8.4)
                     ├── sensitive-proxy / ambiguous ─► CLARIFYING (clarification / compliance review, §6.2)
                     │        NOT terminal — routes into the clarification path
                     ├── in-banking, unknown use-case ─► NEEDS_USE_CASE_ONBOARDING  (SP-0 park + hold)
@@ -1047,7 +1074,8 @@ through SP-2 sub-states (all while the SP-0 run-state is `DRAFT`, until Gate #1)
                          MINIMUM_CONTRACT_VALIDATED  ◄────────────────┘
                                    │
                     prohibited-intent screen (§8.4, re-runs §5.4 over BankingDomainCatalog)
-                    ├── prohibited data class ─► PROHIBITED_DATA_CLASS: BLOCKED → (edit → loop) | reject
+                    ├── prohibited data class ─► PROHIBITED_DATA_CLASS: BLOCKED → (edit → loop)
+                    │        | withdraw (requester) | reject_intent (platform/service-issued)
                     │        records matched class + catalog version (authoritative block)
                     ├── sensitive-proxy hint ──► CLARIFYING (clarification / compliance review, §6.2)
                     └── clear ─►  READY_FOR_GATE_1
@@ -1056,7 +1084,7 @@ through SP-2 sub-states (all while the SP-0 run-state is `DRAFT`, until Gate #1)
                                    ▼
                     Human Gate #1  (requester + actor_kind=human; task_version OCC, §8.6)
                      ├── edit  ─► request_edit → REVISED Draft (supersedes) → re-run MCV ──► (loop / re-open gate)
-                     ├── reject ─► reject_intent (run REJECTED) | §8.4 block
+                     ├── reject ─► withdraw (requester abandonment, run WITHDRAWN) | §8.4 platform block
                      └── confirm ─► confirm_contract (picks candidate via document PRIMARY_SELECTED in hypothesis mode)
                                    ▼
                             CONFIRMED  →  run advances to CONFIRMED_CONTRACT  →  SP-3
@@ -1081,15 +1109,20 @@ carrying a **stale `task_version`** is rejected (SP-0 `submit_human_signal` OCC,
 never race a re-normalization. **The two banking-boundary rejection outcomes are distinct and each carries its
 provenance:** **`OUT_OF_SCOPE`** (reject-or-park; records the reason + catalog `version`) and
 **`PROHIBITED_DATA_CLASS`** (block/reject; records the matched class + catalog `version`) — both are the
-terminal/park refinements of the earlier generic `INTENT_REJECTED`, surfaced via `INTENT_REJECTED` / `reject`
-/ `park` carrying that classification reason, and both are **fail-closed**. The **sensitive-proxy** and
+terminal/park refinements of the earlier generic `INTENT_REJECTED`, surfaced via the **platform/service-issued**
+`reject_intent` → `INTENT_REJECTED` / `RUN_REJECTED` (additive service authz §2.1 #4 — **not** SP-0's
+validator-only `reject`, `authz/policy.py:42`) or an SP-0 `park`, carrying that classification reason, and both
+are **fail-closed**. The **sensitive-proxy** and
 **ambiguous** cases are **not** terminal — they route into the existing clarification path (§6.2, §6.5).
-`INTENT_REJECTED` (classification `OUT_OF_SCOPE` or `PROHIBITED_DATA_CLASS`), `reject` (prohibited data class),
-an auto-parked exhausted loop, and `NEEDS_USE_CASE_ONBOARDING` (a new banking use-case parked for governance
-onboarding, §5.4 — an **additive park hold-state + `USE_CASE_ONBOARDING` gate value** SP-2 registers, §2.1 #5)
-are the non-confirming exits. Terminal for SP-2's span: `CONFIRMED_CONTRACT` (hands off) or
-`REJECTED`; the `NEEDS_USE_CASE_ONBOARDING` park exits SP-2 into a governance onboarding flow that SP-2 does
-not build (§14).
+the **platform/service-issued** `reject_intent` → `INTENT_REJECTED` terminal outcome (classification
+`OUT_OF_SCOPE` or `PROHIBITED_DATA_CLASS`; own additive service authz, §2.1 #4), a **requester-initiated
+`withdraw`** (SP-0, data-scientist-owned, `authz/policy.py:41`, → `RUN_WITHDRAWN` — the author abandoning their
+own intent, e.g. a Gate #1 `reject` response), an auto-parked exhausted loop, and `NEEDS_USE_CASE_ONBOARDING`
+(a new banking use-case parked for governance onboarding, §5.4 — an **additive park hold-state +
+`USE_CASE_ONBOARDING` gate value** SP-2 registers, §2.1 #5) are the non-confirming exits. Terminal for SP-2's
+span: `CONFIRMED_CONTRACT` (hands off), `REJECTED` (platform/service-issued intake rejection), or `WITHDRAWN`
+(requester abandonment); the `NEEDS_USE_CASE_ONBOARDING` park exits SP-2 into a governance onboarding flow that
+SP-2 does not build (§14).
 
 ---
 
@@ -1131,7 +1164,12 @@ not build (§14).
   **document** via SP-0 **`PRIMARY_SELECTED`**, §7.1; **not** the request-level `select_candidate` command);
   `request_edit(run_id, actor, task_version, field_edit)` (Gate #1 `edit` → **REVISED** Draft version that
   supersedes the prior + re-runs MCV, §8.6). All three are **request-owner + `actor_kind==human` guarded**
-  (§8.2) and reject a **stale `task_version`** (OCC, §8.6). `reject_intent(run_id, actor, reason)`.
+  (§8.2) and reject a **stale `task_version`** (OCC, §8.6). `reject_intent(run_id, actor, reason)` — the
+  **platform/service-issued** deterministic-classifier terminal outcome (`INTENT_REJECTED` → SP-0
+  `RUN_REJECTED`) for `OUT_OF_SCOPE`/`PROHIBITED_DATA_CLASS`, carrying its **own additive service authz**
+  (§2.1 #4, §5.4) because SP-0's `reject` is **validator-only** (`authz/policy.py:42`). **Requester-initiated
+  abandonment** — the author walking away (e.g. a Gate #1 `reject` response) — instead reuses **SP-0 `withdraw`**
+  (data-scientist-owned, `authz/policy.py:41`, → `RUN_WITHDRAWN`), never the validator-only `reject`.
 - **Read model:** `get_contract(run_id) -> {stage, status, draft|confirmed body, assumption_ledger,
   field_scores, open_questions}` — service-internal, for SP-3 to fetch the Confirmed Contract.
 - **The Confirmed Feature Contract document** (CONFIRMED_CONTRACT stage) — the governed hand-off artifact.
@@ -1240,9 +1278,10 @@ adapter is exercised only in an **opt-in, config-gated smoke test** never gated 
 | 7 | LLM-call record store | Decision 3: "every LLM call is event-sourced" (fields enumerated) | **Reasonable call:** modelled as an **SP-2-owned immutable append-only `llm_call` store** (mirroring SP-1's evidence store) referenced by `llm_call_ref`, plus an `LLM_CALL_RECORDED` event — because SP-0's stage/artifact enum has no LLM-call type (§9.3, Decision D9). All enumerated fields captured. |
 | 8 | Banking-scope / `BankingDomainCatalog` dependency | Decision 1, 4 & 8: "rejects only out-of-banking"; "depends on SP-0 only" *(record was previously silent on catalog availability)* | **RATIFIED (user-approved).** The banking-boundary / blocked-class reference data is accepted as **SP-0-governed, read-only reference data** — the **`BankingDomainCatalog`** (§4.5): `allowed_domains`/`allowed_use_cases`, `out_of_scope_examples`, `blocked_data_classes`, `sensitive_proxy_hints` (carried **only** as "requires clarification / compliance review," never an auto-block), `jurisdiction_scope`/`use_case_scope`, and `version`/`owner`/`effective_date`/`provenance`. It is **read-only intake-classification reference data — never grounding/execution** — so it is *not* an SP-2 build dependency and does **not** violate "SP-0 only." Deterministic intake outcomes: out-of-scope → **`OUT_OF_SCOPE`** and prohibited class → **`PROHIBITED_DATA_CLASS`** (both fail-closed, each stamping the reason/matched-class + catalog `version`); sensitive-proxy/ambiguous → clarification / compliance review; a new banking use-case → onboarding park (§5.4, §8.4, §11). **This resolves the former open question (was silent, §16.8) — now ratified, not a deviation; the user explicitly approved it.** |
 | 9 | No-PII enforcement construction | Decision 3: "no raw data or PII to the LLM — enforce/validate this boundary" | **Reasonable call:** enforced at **two points** — ingest PII-scan/redact-or-fail, and a pre-send **egress guard** that hard-fails a payload carrying data values or un-redacted PII (→ security-audit), with `input_redaction` recorded for audit (§9.4). The decision record required the boundary; the two-point mechanism is the concrete encoding. |
-| 10 | Prohibited-intent mechanism | Decision 2: "obviously prohibited/compliance-sensitive → blocks or forces clarification; must NOT pretend to approve compliance" | **Reasonable call (mechanism); RATIFIED (contract, see entry 8).** A **deterministic** screen over the `BankingDomainCatalog` `blocked_data_classes` (§4.5): an explicit prohibited data class → **`PROHIBITED_DATA_CLASS`** block (matched class + catalog `version`) → edit-and-loop or `reject`; a `sensitive_proxy_hints` match is the **distinct** routing → clarification / compliance review, **not** an auto-block; never an LLM judgement, never a compliance approval (§8.4). The screen mechanism was not specified; the proxy-vs-block distinction is the user-ratified contract. |
+| 10 | Prohibited-intent mechanism | Decision 2: "obviously prohibited/compliance-sensitive → blocks or forces clarification; must NOT pretend to approve compliance" | **Reasonable call (mechanism); RATIFIED (contract, see entry 8).** A **deterministic** screen over the `BankingDomainCatalog` `blocked_data_classes` (§4.5): an explicit prohibited data class → **`PROHIBITED_DATA_CLASS`** block (matched class + catalog `version`) → edit-and-loop, requester **`withdraw`** (SP-0, data-scientist-owned), or the **platform/service-issued** `reject_intent` terminal outcome (not SP-0's validator-only `reject` — see entry 13); a `sensitive_proxy_hints` match is the **distinct** routing → clarification / compliance review, **not** an auto-block; never an LLM judgement, never a compliance approval (§8.4). The screen mechanism was not specified; the proxy-vs-block distinction is the user-ratified contract. |
 | 11 | Gate #1 is not four-eyes | Decision 2 | Encoded: author confirms own intent (audited intent lock); `requires_independent_validation` is a **flag only**, no second signer; independent validation is Gate #2 / SP-5 (§8.2, §8.4). |
 | 12 | Real adapter details | Decision 3: "real Claude adapter shipped, config-gated, never required in CI; no silent fallback" | Encoded with concrete Claude API: model `claude-opus-4-8`, adaptive thinking, structured outputs via `output_config.format`, `stop_reason=="refusal"` → repair/clarification, fail-closed (no fallback to FakeLLM) (§9.5). *Model/API specifics grounded in the current Claude API; not a deviation.* |
+| 13 | Rejection / withdrawal authority | SP-0: `reject` is **validator-only** (`authz/policy.py:42`); `withdraw` is **data-scientist-owned** (`authz/policy.py:41`) | **Corrected authority.** SP-2's deterministic intake rejections (`OUT_OF_SCOPE`/`PROHIBITED_DATA_CLASS`) are **platform/service-issued terminal outcomes** — the deterministic classifier decided, **not** a validator — issued via SP-2's own **`reject_intent`** action (→ SP-0 `RUN_REJECTED`) under **one additive service `authz_policy` row** (§2.1 #4); they do **not** reuse SP-0's validator-only `reject`. **Requester-initiated abandonment** (the author walking away — e.g. a Gate #1 `reject` response, or giving up on a blocked/looping intent) reuses **SP-0 `withdraw`** (→ `RUN_WITHDRAWN`), never `reject`. SP-0's validator-only `reject` stays reserved for independent validation (Gate #2 / SP-5). The added row **changes no existing SP-0 row**, so SoD holds. (§5.4, §8.4, §11, §13, §2.1.) |
 
 ---
 
