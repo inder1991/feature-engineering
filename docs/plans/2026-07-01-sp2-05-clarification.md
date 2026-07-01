@@ -764,10 +764,10 @@ def apply_critique(routing: dict[str, str], critique: CritiqueResult) -> dict[st
 - Test: `tests/featuregen/intake/test_mcv.py`
 
 **Interfaces:**
-- Consumes: `documents.draft.UNKNOWN`; `contracts.{IdentityEnvelope, CommandResult, DbConn}`; **R4** the ONE owner predicate `intake.state.actor_is_request_owner` + **R3** `intake.state.{fold_feature_contract_state, FeatureContractStatus}` (P2); **R1** `intake.store.{append_feature_contract_event, load_feature_contract}` (P1) and P4's same-package `commands.read_contract_body` (lazily, for the DB-backed wrapper only). The pure checklist + guard predicates are DB-free; `run_minimum_contract_validation` is the one DB-backed symbol.
+- Consumes: `documents.draft.UNKNOWN`; `contracts.{IdentityEnvelope, CommandResult, ConcurrencyError, DbConn}` (**X4** — `ConcurrencyError` for the CAS-on-folded-head guard); **R4** the ONE owner predicate `intake.state.actor_is_request_owner` + **R3** `intake.state.{fold_feature_contract_state, FeatureContractStatus}` (P2); **R1** `intake.store.{append_feature_contract_event, load_feature_contract}` (P1) and P4's same-package `commands.read_contract_body` (lazily, for the DB-backed wrapper only). The pure checklist + guard predicates are DB-free; `run_minimum_contract_validation` is the one DB-backed symbol.
 - Produces:
   - `MCVResult(passed: bool, failures: tuple[str, ...])`.
-  - **R5** — the two MCV symbols. Pure: `minimum_contract_validated(draft_body, ledger_body, classification, *, mode="definition", candidate_count=0, confirmed_fields=()) -> MCVResult` — the 6-check deterministic pre-gate checklist (spec §6.7), fail-closed on an absent/unversioned classification (check 5); the canonical `minimum_contract_validated(draft_body, ledger, classification)` 3-arg call is valid (the extras are optional keyword-only). DB-backed: `run_minimum_contract_validation(conn, run_id, *, actor) -> CommandResult` — folds the `feature_contract` status (**R3** `fold_feature_contract_state`), loads the current draft/ledger/classification, calls the pure checklist, appends `MINIMUM_CONTRACT_VALIDATED` on a pass; **P7 Task 7.6 reads `.accepted`.**
+  - **R5** — the two MCV symbols. Pure: `minimum_contract_validated(draft_body, ledger_body, classification, *, mode="definition", candidate_count=0, confirmed_fields=()) -> MCVResult` — the 6-check deterministic pre-gate checklist (spec §6.7), fail-closed on an absent/unversioned classification (check 5); the canonical `minimum_contract_validated(draft_body, ledger, classification)` 3-arg call is valid (the extras are optional keyword-only). DB-backed: `run_minimum_contract_validation(conn, run_id, *, actor) -> CommandResult` — folds the `feature_contract` status (**R3** `fold_feature_contract_state`), loads the current draft/ledger/classification, calls the pure checklist, appends `MINIMUM_CONTRACT_VALIDATED` on a pass with **X4** `expected_version=`folded-head `stream_version` (a `ConcurrencyError` denies `stale`); **P7 Task 7.6 reads `.accepted`.**
   - Lifecycle-guard predicates (evaluated inline by later handlers, spec §11): `open_fields_empty(draft_body)`, `not_prohibited_intent(classification)`, `calculation_method_available(draft_body, *, mode, candidate_count)`, `confirmer_is_requester_human(state, actor) = actor_is_request_owner(state, actor) ∧ actor_kind=="human"` (built on the **R4** `intake.state` predicate — mcv.py does NOT redefine `actor_is_request_owner`, it imports it from `intake.state`).
 
 - [ ] **Step 1 — write the failing test**
@@ -953,7 +953,7 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from featuregen.contracts import CommandResult, DbConn, IdentityEnvelope
+from featuregen.contracts import CommandResult, ConcurrencyError, DbConn, IdentityEnvelope
 from featuregen.documents.draft import UNKNOWN
 # R4: the ONE owner predicate is owned by P2 (intake.state) — mcv IMPORTS it, never redefines it.
 # R3: the DB-backed wrapper folds the feature_contract status through the P2 fold.
@@ -1083,12 +1083,19 @@ def run_minimum_contract_validation(conn: DbConn, run_id: str, *, actor) -> Comm
     `feature_contract` status (**R3** `fold_feature_contract_state`), loads the current draft/ledger/
     classification, runs the pure 6-check checklist, and appends `MINIMUM_CONTRACT_VALIDATED` on a pass.
     Reads the recorded classification mapping (**R9** `.catalog_version`) off the folded state. All
-    appends go through the **R1** `intake.store` seam."""
+    appends go through the **R1** `intake.store` seam. **X4** — the append is CAS-pinned to the folded
+    head's `stream_version`; a `ConcurrencyError` (a concurrent transition raced the fold) denies `stale`."""
     # Lazy import of the P4 body-read seam (same package) to avoid a commands↔mcv import cycle.
     from featuregen.intake.commands import _candidate_count, read_contract_body
     from featuregen.intake.store import append_feature_contract_event, load_feature_contract
 
     stream = load_feature_contract(conn, run_id)
+    # X4 (CAS on the folded head, Global Constraints): capture the folded head's stream_version and
+    # CAS the MCV transition on it. SP-0's `append` treats `expected_version=None` as "current head at
+    # append time" (`aggregates/_append.py:76`), so a stale fold + a None-append could commit
+    # MINIMUM_CONTRACT_VALIDATED on top of a concurrent transition (SP-1 capstone C2). Pinning the head
+    # makes that race fail closed as `stale` instead.
+    head_version = stream[-1].stream_version if stream else 0
     state = fold_feature_contract_state(stream)
     # No-regression guard (mirrors overlay/confirmation_commands.py): a fold already at/past MCV or
     # CONFIRMED does not re-append — idempotent accept.
@@ -1116,10 +1123,15 @@ def run_minimum_contract_validation(conn: DbConn, run_id: str, *, actor) -> Comm
             accepted=False, aggregate_id=run_id,
             denied_reason="mcv_failed: " + ",".join(res.failures),
         )
-    append_feature_contract_event(
-        conn, run_id=run_id, type="MINIMUM_CONTRACT_VALIDATED",
-        payload={"draft_doc_id": state.draft_doc_id}, actor=actor,
-    )
+    try:
+        append_feature_contract_event(
+            conn, run_id=run_id, type="MINIMUM_CONTRACT_VALIDATED",
+            payload={"draft_doc_id": state.draft_doc_id}, actor=actor,
+            expected_version=head_version,   # X4 — CAS on the folded head
+        )
+    except ConcurrencyError:
+        # A concurrent feature_contract transition advanced the head since the fold → fail closed.
+        return CommandResult(accepted=False, aggregate_id=run_id, denied_reason="stale")
     return CommandResult(accepted=True, aggregate_id=run_id)
 ```
 
@@ -1139,11 +1151,11 @@ def run_minimum_contract_validation(conn: DbConn, run_id: str, *, actor) -> Comm
 - Test: `tests/featuregen/intake/test_refine_contract.py`
 
 **Interfaces:**
-- Consumes: SP-0 `gates/tasks.py::open_task`; `contracts.gates.GateTaskSpec` (`delegation_allowed=False`); `aggregates/run_lifecycle.py::park_command`; `contracts.Command`; **R1** `intake.store.{append_feature_contract_event, load_feature_contract}` (P1); **R3** `intake.state.fold_feature_contract_state` (P2 — refine derives the owner from `state.requester`); P3 `intake.llm.{LLMRequest, call_llm}` + `intake.redaction.IntentRedactor`; P4 same-module `freeze_draft`/`read_contract_body`; `scoring.score_fields`; `doubt_router.{route_draft, default_thresholds}`; `critique.{contract_review, apply_critique}`; `mcv.minimum_contract_validated`.
+- Consumes: SP-0 `gates/tasks.py::open_task`; `contracts.gates.GateTaskSpec` (`delegation_allowed=False`); `aggregates/run_lifecycle.py::park_command`; `contracts.{Command, ConcurrencyError}` (**X4** — `ConcurrencyError` for the CAS-on-folded-head guard); **R1** `intake.store.{append_feature_contract_event, load_feature_contract}` (P1); **R3** `intake.state.fold_feature_contract_state` (P2 — refine derives the owner from `state.requester`); P3 `intake.llm.{LLMRequest, call_llm}` + `intake.redaction.IntentRedactor`; P4 same-module `freeze_draft`/`read_contract_body`; `scoring.score_fields`; `doubt_router.{route_draft, default_thresholds}`; `critique.{contract_review, apply_critique}`; `mcv.minimum_contract_validated`.
 - Produces:
-  - `open_clarification_task(conn, *, run_id, request_id, draft_doc_id, field, question, owner_subject, actor, candidate_readings=()) -> str` — opens an SP-0 `CLARIFICATION` gate task (`allowed_responses=[confirm,edit,reject]`, `required_inputs=[draft_doc_id]` so a re-normalized draft stales it, `eligible_assignees={role:data_scientist, subject:owner}`, **`delegation_allowed=False`**), then emits `CLARIFICATION_REQUESTED{task_id, field, question, routed_to:"human", draft_doc_id}` on the feature_contract aggregate.
-  - `refine_contract(conn, run_id, *, client=None, redactor=None, catalog=None, actor, thresholds=None, max_rounds=MAX_REFINEMENT_ROUNDS) -> RefineResult` — one bounded refinement round (spec §6.6): renormalize (if there are unfolded answers) → rescore → re-critique → re-route → auto-resolve safe fields (ledger + `FIELD_AUTO_RESOLVED`) → freeze the revised Draft (`CONTRACT_REFINED`) → open must-ask tasks; when no open field remains → run MCV → `MINIMUM_CONTRACT_VALIDATED`; when the round budget is exhausted → **auto-park** (SP-0 `park`). Defaults resolve deps from the P5 accessors.
-  - `RefineResult(status, draft_doc_id, open_fields, mcv)` (`status ∈ {clarifying, validated, mcv_failed, parked}`); `MAX_REFINEMENT_ROUNDS` (config-gated: `FEATUREGEN_MAX_REFINEMENT_ROUNDS`, default 5); `IntakeDeps` + `register_intake_deps(*, client, redactor, catalog)` / `current_intake_deps() -> IntakeDeps | None`.
+  - `open_clarification_task(conn, *, run_id, request_id, draft_doc_id, field, question, owner_subject, actor, candidate_readings=(), expected_version=None) -> str` — opens an SP-0 `CLARIFICATION` gate task (`allowed_responses=[confirm,edit,reject]`, `required_inputs=[draft_doc_id]` so a re-normalized draft stales it, `eligible_assignees={role:data_scientist, subject:owner}`, **`delegation_allowed=False`**), then emits `CLARIFICATION_REQUESTED{task_id, field, question, routed_to:"human", draft_doc_id}` on the feature_contract aggregate. **X4** — a folded caller (the Refinement Loop) passes `expected_version` to CAS the emit on its running head; a standalone call leaves it `None` (current head).
+  - `refine_contract(conn, run_id, *, client=None, redactor=None, catalog=None, actor, thresholds=None, max_rounds=MAX_REFINEMENT_ROUNDS) -> RefineResult` — one bounded refinement round (spec §6.6): renormalize (if there are unfolded answers) → rescore → re-critique → re-route → auto-resolve safe fields (ledger + `FIELD_AUTO_RESOLVED`) → freeze the revised Draft (`CONTRACT_REFINED`) → open must-ask tasks; when no open field remains → run MCV → `MINIMUM_CONTRACT_VALIDATED`; when the round budget is exhausted → **auto-park** (SP-0 `park`). Defaults resolve deps from the P5 accessors. **X4** — every domain append (`FIELD_AUTO_RESOLVED` / `CONTRACT_REFINED` / `MINIMUM_CONTRACT_VALIDATED` / `CLARIFICATION_REQUESTED`) threads a running `expected_version` re-anchored past the round's own LLM audit appends; a concurrent transition (or a status advance since the fold) returns `status="stale"` and commits nothing.
+  - `RefineResult(status, draft_doc_id, open_fields, mcv)` (`status ∈ {clarifying, validated, mcv_failed, parked, stale}`); `MAX_REFINEMENT_ROUNDS` (config-gated: `FEATUREGEN_MAX_REFINEMENT_ROUNDS`, default 5); `IntakeDeps` + `register_intake_deps(*, client, redactor, catalog)` / `current_intake_deps() -> IntakeDeps | None`.
 
 - [ ] **Step 1 — write the failing test**
 
@@ -1338,7 +1350,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 
 from featuregen.aggregates.run_lifecycle import park_command
-from featuregen.contracts import Command, CommandResult, DbConn
+from featuregen.contracts import Command, CommandResult, ConcurrencyError, DbConn
 from featuregen.contracts.gates import GateTaskSpec
 from featuregen.documents.draft import UNKNOWN
 from featuregen.gates.tasks import open_task
@@ -1362,7 +1374,7 @@ _RENORM_SETTINGS = {"provider": "fake", "model": "fake-structured", "max_tokens"
 
 @dataclass(frozen=True, slots=True)
 class RefineResult:
-    status: str                 # clarifying | validated | mcv_failed | parked
+    status: str                 # clarifying | validated | mcv_failed | parked | stale (X4 CAS lost-update)
     draft_doc_id: str
     open_fields: tuple[str, ...]
     mcv: object | None          # MCVResult when a checklist ran, else None
@@ -1431,12 +1443,16 @@ def open_clarification_task(
     owner_subject: str,
     actor,
     candidate_readings: tuple = (),
+    expected_version: int | None = None,
 ) -> str:
     """Open an SP-0 CLARIFICATION human-gate task for one must-ask field (spec §6.5). The eligible
     assignee is the REQUEST OWNER (author-owned intent lock) and `delegation_allowed=False` — the
     subject guard alone is necessary but not sufficient, since SP-0's GateTaskSpec.delegation_allowed
     defaults to True and a delegate could otherwise stand in (§8.2). `required_inputs=[draft_doc_id]`
-    so a later re-normalization stales any pending answer (SP-0 task staleness)."""
+    so a later re-normalization stales any pending answer (SP-0 task staleness). **X4**: when a caller
+    that folded state (the Refinement Loop) passes `expected_version`, the CLARIFICATION_REQUESTED
+    emit is CAS-pinned to that running head; a standalone call (`expected_version=None`) appends at the
+    current head."""
     spec = GateTaskSpec(
         gate="CLARIFICATION",
         required_inputs=(draft_doc_id,),
@@ -1450,7 +1466,7 @@ def open_clarification_task(
         conn, run_id=run_id, type="CLARIFICATION_REQUESTED",
         payload={"task_id": task_id, "field": field, "question": question, "routed_to": "human",
                  "draft_doc_id": draft_doc_id, "candidate_readings": list(candidate_readings)},
-        actor=actor,
+        actor=actor, expected_version=expected_version,   # X4 — CAS on the running head when folded
     )
     return task_id
 
@@ -1550,6 +1566,14 @@ def refine_contract(
     budget = MAX_REFINEMENT_ROUNDS if max_rounds is None else max_rounds
 
     stream = load_feature_contract(conn, run_id)
+    # X4 (CAS on the folded head): this round's decision is anchored to the folded head captured here.
+    # The renormalize/critique LLM passes below append their own audit events (LLM_CALL_RECORDED /
+    # CONTRACT_CRITIQUED) to this same feature_contract stream after the fold, so the fold-time head is
+    # re-anchored to the live head immediately before the domain transitions (the sanctioned "refold
+    # immediately before the append") — with a no-regression status re-check that fails closed if a
+    # concurrent transition advanced the status — and every domain append then threads a running
+    # `expected` head. A lost-update race trips ConcurrencyError → the whole round is stale.
+    head_version = stream[-1].stream_version if stream else 0
     state = fold_feature_contract_state(stream)   # R3 — the P2 fold; `state.requester` is the owner (R4)
     intent = _first(stream, "INTENT_SUBMITTED")
     request_id = intent.payload["request_id"]
@@ -1598,72 +1622,95 @@ def refine_contract(
         critique,
     )
 
-    # 5) Auto-resolve safe fields → ledger + FIELD_AUTO_RESOLVED (never a field already in the ledger
-    #    or already human-answered).
-    ledger_fields = {a["field"] for a in ledger_body.get("assumptions", [])}
-    additions = []
-    for field, decision in routing.items():
-        if decision == "auto" and field not in ledger_fields and field not in answers:
-            entry = _ledger_entry(field, semantics, field_scores[field])
-            additions.append(entry)
-            append_fc_event(conn, run_id=run_id, type="FIELD_AUTO_RESOLVED",
-                            payload={"field": field, "value": entry["value"], "source": entry["source"],
-                                     "ambiguity": entry["ambiguity"], "confidence": entry["confidence"]},
-                            actor=actor)
+    # X4 — re-anchor the running CAS head past this round's own LLM audit appends (renormalize /
+    # critique), refusing the round if a concurrent transition advanced the status since the fold, then
+    # thread `expected` (a running head) through every domain append below.
+    domain_stream = load_feature_contract(conn, run_id)
+    if fold_feature_contract_state(domain_stream).status != state.status:
+        return RefineResult("stale", draft_doc_id, tuple(open_fields), None)
+    expected = domain_stream[-1].stream_version if domain_stream else head_version
 
-    # 6) Freeze the revised Draft + Ledger and emit CONTRACT_REFINED when anything changed.
-    question_by_field = {e.payload["field"]: e.payload["question"]
-                         for e in stream if e.type == "CLARIFICATION_REQUESTED"}
-    new_ledger = {"request_id": request_id,
-                  "assumptions": list(ledger_body.get("assumptions", [])) + additions}
-    new_draft = {**draft_body, "feature_semantics": semantics, "field_scores": field_scores,
-                 "open_fields": open_fields, "open_questions": _open_questions(routing, question_by_field),
-                 "status": "NEEDS_CLARIFICATION"}
-    changed = renormalized or additions or open_fields != draft_body.get("open_fields", []) \
-        or field_scores != draft_body.get("field_scores", {})
-    if changed:
-        draft_doc_id, ledger_doc_id = freeze_draft(
-            conn, run_id=run_id, request_id=request_id, body=new_draft, ledger_body=new_ledger,
-            actor=actor, supersedes=(draft_doc_id,),
-        )
-        new_draft["assumption_ledger_ref"] = ledger_doc_id
-        append_fc_event(conn, run_id=run_id, type="CONTRACT_REFINED",
-                        payload={"draft_doc_id": draft_doc_id, "assumption_ledger_ref": ledger_doc_id,
-                                 "open_fields": open_fields, "round": rounds}, actor=actor)
+    def _append_domain(**kw):
+        """CAS every refine domain append on the running head (X4); advance it after each append so the
+        next transition CASes on the correct version."""
+        nonlocal expected
+        env = append_fc_event(conn, expected_version=expected, **kw)
+        expected = env.stream_version
+        return env
 
-    must_ask = [f for f, d in routing.items() if d == "human"
-                and any(_base(of) == f for of in open_fields)]
+    try:
+        # 5) Auto-resolve safe fields → ledger + FIELD_AUTO_RESOLVED (never a field already in the ledger
+        #    or already human-answered).
+        ledger_fields = {a["field"] for a in ledger_body.get("assumptions", [])}
+        additions = []
+        for field, decision in routing.items():
+            if decision == "auto" and field not in ledger_fields and field not in answers:
+                entry = _ledger_entry(field, semantics, field_scores[field])
+                additions.append(entry)
+                _append_domain(run_id=run_id, type="FIELD_AUTO_RESOLVED",
+                               payload={"field": field, "value": entry["value"], "source": entry["source"],
+                                        "ambiguity": entry["ambiguity"], "confidence": entry["confidence"]},
+                               actor=actor)
 
-    # 7) Converge → MCV; or bounded-exhausted → auto-park; or open must-ask tasks and loop.
-    if not open_fields and not must_ask:
-        candidate_count = _candidate_count(conn, run_id) if mode == "hypothesis" else 0
-        mcv = minimum_contract_validated(new_draft, new_ledger, classification, mode=mode,
-                                         candidate_count=candidate_count, confirmed_fields=set(answers))
-        if mcv.passed:
-            append_fc_event(conn, run_id=run_id, type="MINIMUM_CONTRACT_VALIDATED",
-                            payload={"draft_doc_id": draft_doc_id}, actor=actor)
-            return RefineResult("validated", draft_doc_id, (), mcv)
-        return RefineResult("mcv_failed", draft_doc_id, (), mcv)
+        # 6) Freeze the revised Draft + Ledger and emit CONTRACT_REFINED when anything changed.
+        question_by_field = {e.payload["field"]: e.payload["question"]
+                             for e in stream if e.type == "CLARIFICATION_REQUESTED"}
+        new_ledger = {"request_id": request_id,
+                      "assumptions": list(ledger_body.get("assumptions", [])) + additions}
+        new_draft = {**draft_body, "feature_semantics": semantics, "field_scores": field_scores,
+                     "open_fields": open_fields, "open_questions": _open_questions(routing, question_by_field),
+                     "status": "NEEDS_CLARIFICATION"}
+        changed = renormalized or additions or open_fields != draft_body.get("open_fields", []) \
+            or field_scores != draft_body.get("field_scores", {})
+        if changed:
+            draft_doc_id, ledger_doc_id = freeze_draft(
+                conn, run_id=run_id, request_id=request_id, body=new_draft, ledger_body=new_ledger,
+                actor=actor, supersedes=(draft_doc_id,),
+            )
+            new_draft["assumption_ledger_ref"] = ledger_doc_id
+            _append_domain(run_id=run_id, type="CONTRACT_REFINED",
+                           payload={"draft_doc_id": draft_doc_id, "assumption_ledger_ref": ledger_doc_id,
+                                    "open_fields": open_fields, "round": rounds}, actor=actor)
 
-    if rounds >= budget:
-        # Bounded (§6.6): stop looping — auto-park the run for human follow-up.
-        park_command(conn, Command(
-            action="park", aggregate="run", aggregate_id=run_id,
-            args={"owner": _REFINEMENT_PARK_OWNER, "waiting_on_fact": None},
-            actor=actor, idempotency_key=f"refine-park:{run_id}:{rounds}",
-        ))
-        return RefineResult("parked", draft_doc_id, tuple(open_fields), None)
+        must_ask = [f for f, d in routing.items() if d == "human"
+                    and any(_base(of) == f for of in open_fields)]
 
-    owner = state.requester   # R4 — the INTENT_SUBMITTED actor.subject; never payload.get("requested_by")
-    open_task_fields = {e.payload["field"] for e in stream
-                        if e.type == "CLARIFICATION_REQUESTED"} & set(must_ask)
-    for field in must_ask:
-        if field in open_task_fields:
-            continue  # a task for this field already exists on the stream (refresh handled by staleness)
-        open_clarification_task(conn, run_id=run_id, request_id=request_id, draft_doc_id=draft_doc_id,
-                                field=field, question=question_by_field.get(field, f"Please specify {field}."),
-                                owner_subject=owner, actor=actor)
-    return RefineResult("clarifying", draft_doc_id, tuple(open_fields), None)
+        # 7) Converge → MCV; or bounded-exhausted → auto-park; or open must-ask tasks and loop.
+        if not open_fields and not must_ask:
+            candidate_count = _candidate_count(conn, run_id) if mode == "hypothesis" else 0
+            mcv = minimum_contract_validated(new_draft, new_ledger, classification, mode=mode,
+                                             candidate_count=candidate_count, confirmed_fields=set(answers))
+            if mcv.passed:
+                _append_domain(run_id=run_id, type="MINIMUM_CONTRACT_VALIDATED",
+                               payload={"draft_doc_id": draft_doc_id}, actor=actor)
+                return RefineResult("validated", draft_doc_id, (), mcv)
+            return RefineResult("mcv_failed", draft_doc_id, (), mcv)
+
+        if rounds >= budget:
+            # Bounded (§6.6): stop looping — auto-park the run for human follow-up.
+            park_command(conn, Command(
+                action="park", aggregate="run", aggregate_id=run_id,
+                args={"owner": _REFINEMENT_PARK_OWNER, "waiting_on_fact": None},
+                actor=actor, idempotency_key=f"refine-park:{run_id}:{rounds}",
+            ))
+            return RefineResult("parked", draft_doc_id, tuple(open_fields), None)
+
+        owner = state.requester   # R4 — the INTENT_SUBMITTED actor.subject; never payload.get("requested_by")
+        open_task_fields = {e.payload["field"] for e in stream
+                            if e.type == "CLARIFICATION_REQUESTED"} & set(must_ask)
+        for field in must_ask:
+            if field in open_task_fields:
+                continue  # a task for this field already exists on the stream (refresh handled by staleness)
+            open_clarification_task(conn, run_id=run_id, request_id=request_id, draft_doc_id=draft_doc_id,
+                                    field=field, question=question_by_field.get(field, f"Please specify {field}."),
+                                    owner_subject=owner, actor=actor, expected_version=expected)
+            expected += 1   # X4 — the CLARIFICATION_REQUESTED landed at expected+1 → advance the head
+        return RefineResult("clarifying", draft_doc_id, tuple(open_fields), None)
+    except ConcurrencyError:
+        # X4 — a concurrent feature_contract transition advanced the head since the fold. The whole
+        # round is stale; nothing this round committed (single transaction) — the loop re-drives on the
+        # fresh head (e.g. answer_clarification's next signal, or the durable runtime's retry).
+        return RefineResult("stale", draft_doc_id, tuple(open_fields), None)
 ```
 
 - [ ] **Step 4 — run it (passes)**
@@ -1682,9 +1729,9 @@ def refine_contract(
 - Test: `tests/featuregen/intake/test_answer_clarification.py`
 
 **Interfaces:**
-- Consumes: SP-0 `gates/tasks.py::submit_human_signal`; `security/audit.py::record_denial`; **R1** `intake.store.{load_feature_contract, append_feature_contract_event}` (P1); **R3/R4** `intake.state.{fold_feature_contract_state, actor_is_request_owner}` (P2 — the request-owner guard); the Task-5.5 `refine_contract`/`current_intake_deps`.
+- Consumes: SP-0 `gates/tasks.py::submit_human_signal`; `security/audit.py::record_denial`; **R1** `intake.store.{load_feature_contract, append_feature_contract_event}` (P1); **R3/R4** `intake.state.{fold_feature_contract_state, actor_is_request_owner}` (P2 — the request-owner guard); `contracts.ConcurrencyError` (**X4** — reuses the module-level import added in Task 5.5, for the CAS-on-folded-head guard); the Task-5.5 `refine_contract`/`current_intake_deps`.
 - Produces:
-  - `answer_clarification(conn, cmd) -> CommandResult` — reads `cmd.args = {task_id, response, expected_task_version, answer}`; resolves the run + request owner from the `feature_contract` stream; enforces the **SP-2-built request-owner guard** (`actor_kind=="human" ∧ actor.subject == request owner`), a mismatch **denied + written to the security-audit stream** (never counted); `submit_human_signal(CLARIFICATION, expected_task_version)` (task-version OCC); on a counted, quorum-met answer emits `CLARIFICATION_ANSWERED` (the domain shadow) and drives the Refinement Loop (`refine_contract`, when deps are registered).
+  - `answer_clarification(conn, cmd) -> CommandResult` — reads `cmd.args = {task_id, response, expected_task_version, answer}`; resolves the run + request owner from the `feature_contract` stream; enforces the **SP-2-built request-owner guard** (`actor_kind=="human" ∧ actor.subject == request owner`), a mismatch **denied + written to the security-audit stream** (never counted); `submit_human_signal(CLARIFICATION, expected_task_version)` (task-version OCC); on a counted, quorum-met answer emits `CLARIFICATION_ANSWERED` (the domain shadow) with **X4** `expected_version=`folded-head `stream_version` (a `ConcurrencyError` denies `stale`) and drives the Refinement Loop (`refine_contract`, when deps are registered).
   - `_SP2_CATALOG` gains `("answer_clarification", answer_clarification)`; `register_sp2_commands()` (idempotent) registers it.
 
 - [ ] **Step 1 — write the failing test**
@@ -1829,8 +1876,9 @@ def answer_clarification(conn: DbConn, cmd: Command) -> CommandResult:
     provide: SP-0's `submit_human_signal` checks role/scope/quorum but NEVER that the acting subject
     is the task's requester (`gates/tasks.py`), so role-authz alone would let ANY data_scientist
     answer another author's clarification. A mismatch is DENIED + security-audited, never counted.
-    On a counted, quorum-met answer it emits the CLARIFICATION_ANSWERED domain shadow and drives the
-    Contract Refinement Loop (when the Layer-2 deps are registered)."""
+    On a counted, quorum-met answer it emits the CLARIFICATION_ANSWERED domain shadow (X4 — CAS-pinned
+    to the folded head; a concurrent transition denies `stale`) and drives the Contract Refinement Loop
+    (when the Layer-2 deps are registered)."""
     args = cmd.args
     task_id = args["task_id"]
     row = conn.execute("SELECT run_id FROM human_tasks WHERE task_id=%s", (task_id,)).fetchone()
@@ -1838,6 +1886,11 @@ def answer_clarification(conn: DbConn, cmd: Command) -> CommandResult:
         return CommandResult(accepted=False, aggregate_id="", denied_reason="unknown clarification task")
     run_id = row[0]
     stream = load_feature_contract(conn, run_id)
+    # X4 (CAS on the folded head): pin the answer shadow to the folded head. `submit_human_signal`
+    # advances only `human_tasks` (not the feature_contract stream), so the head captured here is still
+    # the head at the CLARIFICATION_ANSWERED append; a concurrent feature_contract transition since the
+    # fold trips ConcurrencyError → deny `stale` (the counted signal + shadow ride one transaction).
+    head_version = stream[-1].stream_version if stream else 0
     state = fold_feature_contract_state(stream)   # R3 — the P2 fold; state.requester is the owner (R4)
 
     # ── SP-2 request-owner guard (subject-level; SP-0 authz is role-level only) ──────────────────
@@ -1859,12 +1912,16 @@ def answer_clarification(conn: DbConn, cmd: Command) -> CommandResult:
         )
 
     field = _requested_field(stream, task_id)
-    append_fc_event(
-        conn, run_id=run_id, type="CLARIFICATION_ANSWERED",
-        payload={"task_id": task_id, "field": field, "answer": args.get("answer"),
-                 "response": args["response"], "answered_by": cmd.actor.subject},
-        actor=cmd.actor,
-    )
+    try:
+        append_fc_event(
+            conn, run_id=run_id, type="CLARIFICATION_ANSWERED",
+            payload={"task_id": task_id, "field": field, "answer": args.get("answer"),
+                     "response": args["response"], "answered_by": cmd.actor.subject},
+            actor=cmd.actor, expected_version=head_version,   # X4 — CAS on the folded head
+        )
+    except ConcurrencyError:
+        # A concurrent feature_contract transition raced this fold → fail closed, not counted.
+        return CommandResult(accepted=False, aggregate_id=run_id, denied_reason="stale")
 
     # Drive the Refinement Loop once quorum is met (§6.6) — only when the runtime deps are wired
     # (P9 bootstrap / test registration). Absent deps, the loop is driven by the durable runtime.
@@ -1906,6 +1963,7 @@ _SP2_CATALOG = (
 - `mcv.py` enforces the 6-check pre-gate checklist (fail-closed on an absent/unversioned classification) and exposes the pure lifecycle-guard predicates (`open_fields_empty`, `not_prohibited_intent`, `calculation_method_available`, `actor_is_request_owner`, `confirmer_is_requester_human`) — evaluated inline by P7, never via the state-machine engine.
 - The Human Clarification task rides SP-0's `CLARIFICATION` gate with `delegation_allowed=False`, eligible = the request owner, `required_inputs=[draft_doc_id]`; the bounded Refinement Loop renormalizes → rescores → re-critiques → re-routes → auto-resolves / opens must-ask tasks → MCV, and **auto-parks** on round-budget exhaustion (Decision 6).
 - `answer_clarification` enforces the SP-2-built request-owner guard (`actor_kind=="human" ∧ subject == owner`): a different data scientist / service / the LLM is **denied and written to the tamper-evident security-audit stream** (chain stays valid), never counted; a valid owner answer is task-version-OCC'd, shadowed as `CLARIFICATION_ANSWERED`, and drives the loop.
+- **X4 (CAS on the folded head):** every command that folds `feature_contract` state to reach a decision then appends its domain transition with `expected_version=`the folded head's `stream_version` — `run_minimum_contract_validation` (`MINIMUM_CONTRACT_VALIDATED`), `answer_clarification` (`CLARIFICATION_ANSWERED`), and the Refinement Loop (`FIELD_AUTO_RESOLVED` / `CONTRACT_REFINED` / `MINIMUM_CONTRACT_VALIDATED` / `CLARIFICATION_REQUESTED`, threaded on a running head re-anchored past the round's own LLM audit appends). A raced fold (`ConcurrencyError`) fails closed as `stale`/denied and commits nothing — never a `None`-append over a concurrent transition (`aggregates/_append.py:76`, SP-1 capstone C2).
 - No raw data / PII reaches the LLM: only structured Draft semantics (critique) and redacted answers + catalog metadata (renormalize) enter `LLMRequest.inputs`, all behind `call_llm`'s egress guard; every LLM call is event-sourced (`LLM_CALL_RECORDED`).
 
 **Produced for later phases:** `scoring.{FieldScore, combine_scores, catalog_cardinality_score, score_fields, CatalogView, register_catalog_view, current_catalog_view}`; `doubt_router.{RouterThresholds, default_thresholds, route_field, route_draft}`; `critique.{CritiqueFinding, CritiqueResult, contract_review, apply_critique}`; `mcv.{MCVResult, minimum_contract_validated, open_fields_empty, not_prohibited_intent, calculation_method_available, actor_is_request_owner, confirmer_is_requester_human}`; `commands.{open_clarification_task, refine_contract, RefineResult, answer_clarification, IntakeDeps, register_intake_deps, current_intake_deps, MAX_REFINEMENT_ROUNDS}` — consumed by **P6** (candidate `CatalogView` + hypothesis calc-method routing + MCV #2 `candidate_count`), **P7** (`minimum_contract_validated`/`confirmer_is_requester_human` guards, `refine_contract` re-entry on `request_edit`, `open_clarification_task` cancel-on-gate-open), and **P8** (the stream-readers `_first`/`_answered_fields`/`_current_draft_doc_id` folded into `fold_feature_contract_state`).

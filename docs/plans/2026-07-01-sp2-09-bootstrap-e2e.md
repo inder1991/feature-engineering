@@ -272,7 +272,7 @@ def register_sp2(handler_registry) -> None:  # P9 ADDS — the ONE new symbol (R
 
 **Interfaces:**
 - Consumes: `register_sp2`/`seed_sp2_authz` (Task 9.1); `register_phase06_event_schemas` (SP-0); `seed_authz_policy` + `PolicyAuthorizer` + `register_command_authorizer` + `execute_command` (SP-0); `get_contract` (P8); `current_primary` (SP-0); `run_is_terminal` (SP-0); the P2/P3/P6 seams **R8/R10** `load_banking_catalog_from_seed`/`register_intake_catalog`, **R19** `FakeLLM`/`FakeResponse`/`register_llm_client`, `DefaultIntentRedactor`/`register_intent_redactor`, `StubCandidateGenerator`/`register_candidate_generator`.
-- Produces: no new src — an **acceptance** test over the assembled P1–P8 stack. Helpers `_wire`, `_only_open_task`, `_Registry`, the `_BANKING_SEED`, and the `FakeLLM` fixture maps `_DEF_FIXTURES`/`_HYP_FIXTURES` (task-keyed deterministic outputs).
+- Produces: no new src — an **acceptance** test over the assembled P1–P8 stack. Helpers `_wire`, `_only_open_task`, `_Registry`, the `_BANKING_SEED`, and the `FakeLLM` fixture maps `_DEF_FIXTURES`/`_HYP_FIXTURES` (task-keyed deterministic outputs). The definition scenario **also** closes with the **X4 CAS / stale-append guard** end-to-end: a replayed `confirm_contract` at the now-stale gate-task version is **denied** and the confirmation **never double-applies** (SP-1 capstone C2 — this is the E2E-observable face of the folded-head `expected_version` CAS; the deep FC-stream `ConcurrencyError`→`stale` denial that a mid-fold concurrent transition raises is unit-covered per the overview's CAS Global Constraint in P4/P5/P7/P8, since a single-threaded black-box E2E cannot interleave inside one handler's fold→side-effects→append window).
 
 > **Acceptance-test discipline.** These E2E scenarios run over already-built code (P1–P8), so a scenario is expected to **PASS on first run**. A failure is a real integration defect — localize it to the phase that owns the failing step (the assertion messages name the step) and fix it there, not by weakening the assertion.
 
@@ -530,11 +530,39 @@ def test_definition_intent_reaches_confirmed_contract_for_sp3(db):
         "SELECT redacted_input, raw_output FROM llm_call WHERE run_id=%s", (run_id,)
     ).fetchall()
     assert stored, "llm_call records must be replayable (redacted_input stored, not hash-only)"
+
+    # ── X4 CAS / stale-append guard (SP-1 capstone C2), proven end-to-end ────────────────────
+    # Replay confirm_contract at the NOW-STALE gate-task version (a fresh idempotency key, so the
+    # command genuinely re-runs the guards rather than returning the cached success). The gate task
+    # was consumed by the first confirm and the folded feature_contract head is already CONFIRMED,
+    # so the stale fold+append must NOT commit a second transition: SP-2's folded-head expected_version
+    # CAS (or the task-version OCC) denies it, treating the concurrency/stale collision as a denial.
+    stale = execute_command(
+        db,
+        Command(
+            "confirm_contract",
+            "feature_contract",
+            run_id,
+            {"run_id": run_id, "task_id": gate_task, "expected_task_version": gv},
+            raj,
+            "ik-def-confirm-stale",  # distinct key ⇒ NOT an idempotent replay; the guards actually run
+        ),
+    )
+    assert stale.accepted is False, "a stale/replayed confirm must be DENIED, never double-applied (X4)"
+    # the transition was applied EXACTLY ONCE — the stale re-append never committed
+    assert (
+        db.execute(
+            "SELECT count(*) FROM events WHERE run_id=%s AND type='CONTRACT_CONFIRMED'", (run_id,)
+        ).fetchone()[0]
+        == 1
+    )
+    assert get_contract(db, run_id).status == "CONFIRMED"  # unchanged — no regression, no re-advance
+    assert current_primary(db, run_id, "CONFIRMED_CONTRACT") is not None  # still the ONE frozen artifact
 ```
 
 - [ ] **Step 2 — run it (expect PASS end-to-end)**
   - `uv run pytest tests/featuregen/intake/test_e2e.py::test_definition_intent_reaches_confirmed_contract_for_sp3 -v`
-  - Expected: PASS. A failure localizes an integration gap to the phase owning the failing step (P2 catalog/schema, P3 LLM/redaction, P4 intake, P5 clarification/MCV, P7 Gate #1, P8 read model).
+  - Expected: PASS. A failure localizes an integration gap to the phase owning the failing step (P2 catalog/schema, P3 LLM/redaction, P4 intake, P5 clarification/MCV, P7 Gate #1, P8 read model). The trailing **stale `confirm_contract` replay must be DENIED** with the confirmation applied **exactly once** (X4 CAS); if that stale replay is instead accepted or double-applies, the folded-head `expected_version` CAS / task-version OCC on `confirm_contract` (P7) is missing.
 
 - [ ] **Step 3 — commit**
   - `git add tests/featuregen/intake/test_e2e.py && git commit -m "test(intake): E2E definition-mode intent -> CONFIRMED contract (FakeLLM, real authz)"`
@@ -678,7 +706,7 @@ def test_non_owner_data_scientist_denied_clarify_and_confirm_and_audited(db):
 - Modify: `tests/featuregen/intake/test_e2e.py` (append scenario)
 
 **Interfaces:**
-- Consumes: the deterministic banking-boundary classifier `classify_intent` (P2, `PROHIBITED_DATA_CLASS` most-restrictive-wins, stamps matched class + catalog `version`); the platform/service-issued `reject_intent` → `INTENT_REJECTED` + SP-0 `RUN_REJECTED` (P8, runs as `service:intake-agent` under the additive authz row — **not** SP-0's validator-only `reject`); `run_is_terminal`.
+- Consumes: the deterministic banking-boundary classifier `classify_intent` (P2, `PROHIBITED_DATA_CLASS` most-restrictive-wins, stamps matched class + catalog `version`); the **intake-time terminal reject `submit_intent` appends itself** (P4, X5 — on a deterministic `OUT_OF_SCOPE`/`PROHIBITED_DATA_CLASS` classification `submit_intent` appends `INTENT_REJECTED` via the R1 `append_feature_contract_event` seam as the platform/service principal `service:intake-agent` **and** drives SP-0 `RUN_REJECTED` **itself** — it does **NOT** call P8's standalone `reject_intent`, and it is **not** SP-0's validator-only `reject`); `run_is_terminal`.
 - Produces: no new src — proves the block is **fail-closed BEFORE the redactor/LLM** (no `llm_call` row: an un-dispatched intent leaks nothing), terminal on the run aggregate, and carries the audit provenance (matched class + version).
 
 - [ ] **Step 1 — write the failing test (append)**
@@ -719,9 +747,9 @@ def test_prohibited_class_intent_is_blocked_before_any_llm_call(db):
     assert payload["classification"] == "PROHIBITED_DATA_CLASS"
     assert payload["matched_class"] == "race"
     assert payload["catalog_version"] == _BANKING_SEED["version"]
-    assert actor["subject"] == "service:intake-agent"  # NOT the requester, NOT a validator
+    assert actor["subject"] == "service:intake-agent"  # X5: submit_intent stamps the platform/service principal on its OWN intake-time INTENT_REJECTED — NOT the requester, NOT a validator, NOT a P8 reject_intent call
 
-    # SP-0 run terminal outcome is RUN_REJECTED (reject_intent), never the validator-only `reject`
+    # SP-0 run terminal outcome is RUN_REJECTED, driven by submit_intent's OWN intake-time reject (X5 — NOT a P8 reject_intent call), never the validator-only `reject`
     assert run_is_terminal(db, run_id) is True
     assert (
         db.execute(
@@ -738,7 +766,7 @@ def test_prohibited_class_intent_is_blocked_before_any_llm_call(db):
 
 - [ ] **Step 2 — run it (expect PASS)**
   - `uv run pytest tests/featuregen/intake/test_e2e.py::test_prohibited_class_intent_is_blocked_before_any_llm_call -v`
-  - Expected: PASS. A failure means the banking-boundary screen (P2/P4) is not running before redact→LLM, or `reject_intent` (P8) is misattributed.
+  - Expected: PASS. A failure means the banking-boundary screen (P2/P4) is not running before redact→LLM, or `submit_intent`'s OWN intake-time `INTENT_REJECTED`/`RUN_REJECTED` append (P4, X5 — NOT a P8 `reject_intent` call) is missing or misattributed.
 
 - [ ] **Step 3 — commit**
   - `git add tests/featuregen/intake/test_e2e.py && git commit -m "test(intake): E2E prohibited-class intent blocked, no LLM payload"`
@@ -1006,6 +1034,7 @@ def test_hypothesis_stub_candidates_select_and_confirm(db):
 
 - **`register_sp2` + `seed_sp2_authz`** wire the additive SP-0 surface (FC event schemas, contract content-schemas, command catalog, `PRIMARY_SELECTED`, the eight authz rows incl. the additive `reject_intent` service row + the FC-status checkpoint) — mirroring SP-1's `register_overlay`/`seed_overlay_authz`, rewriting no existing SP-0 row.
 - **Definition mode** end-to-end (`declined_card_auth_count_90d`): intent → Draft (`NEEDS_CLARIFICATION`) → one clarification → refinement → MCV → Gate #1 → **CONFIRMED** contract with the exact tagged `calculation_method`, `requires_independent_validation=false`, the frozen `CONFIRMED_CONTRACT` SP-3 consumes, and every LLM call event-sourced with a **replayable redacted input**.
+- **Stale-append guard (X4 CAS, SP-1 capstone C2)**: a replayed `confirm_contract` at the now-stale gate-task version is **denied** and the confirmation applies **exactly once** (one `CONTRACT_CONFIRMED`, status stays `CONFIRMED`, the ONE frozen `CONFIRMED_CONTRACT`) — the E2E-observable face of the folded-head `expected_version` CAS; the deep FC-stream `ConcurrencyError`→`stale` denial is unit-covered per the overview CAS Global Constraint (P4/P5/P7/P8).
 - **Request-owner guard**: a *different* `data_scientist` (admitted by coarse authz) is **denied** at clarify **and** confirm and **security-audited**, never counted; the true author proceeds.
-- **Prohibited class**: a `blocked_data_classes` intent is blocked as `PROHIBITED_DATA_CLASS` — platform/service-issued `reject_intent` → `RUN_REJECTED`, matched class + catalog version stamped, and **zero** payloads dispatched to the LLM.
+- **Prohibited class**: a `blocked_data_classes` intent is blocked as `PROHIBITED_DATA_CLASS` — `submit_intent` appends the platform/service-issued intake-time `INTENT_REJECTED` **itself** (X5, as `service:intake-agent`, NOT a P8 `reject_intent` call) → SP-0 `RUN_REJECTED`, matched class + catalog version stamped, and **zero** payloads dispatched to the LLM.
 - **Hypothesis mode**: the stub's single call yields candidate documents; the requester's Gate #1 pick promotes via document `PRIMARY_SELECTED`, records `selected_candidate`/`rejected_candidates`, and confirms with `requires_independent_validation=true`.

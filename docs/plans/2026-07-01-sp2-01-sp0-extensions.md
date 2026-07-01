@@ -15,8 +15,10 @@ event-store aggregate-CHECK widening** (`0508_feature_contract_events.sql`, the 
 `0504_overlay_events.sql`), registers the twelve SP-2 event-type schemas, threads the typed mirror id
 `feature_contract_id` through the append envelope/store, ships the `append_feature_contract_event(...)`
 wrapper (mirroring SP-1's `append_overlay_event`), widens the human-gate CHECK for the
-`USE_CASE_ONBOARDING` gate + the `NEEDS_USE_CASE_ONBOARDING` park hold-state
-(`0509_use_case_onboarding_gates.sql`, mirroring SP-1's `0505_overlay_gates.sql`), creates the
+`USE_CASE_ONBOARDING` gate (`0509_use_case_onboarding_gates.sql`, mirroring SP-1's
+`0505_overlay_gates.sql`) — the `NEEDS_USE_CASE_ONBOARDING` hold is **not** a DB value: it is the
+`feature_contract` folded status (via the `USE_CASE_ONBOARDING_REQUESTED` event) plus that gate
+task, and is **never** overloaded onto `RUN_PARKED.waiting_on_fact` (X6) — creates the
 sensitive/write-once `llm_call` record store (`0510_llm_call_store.sql`; P3 fills the writer), and
 introduces `seed_sp2_authz(conn)` (the additive `reject_intent` service authz row + the SP-2
 command-capability rows + `register_primary_selected` wiring + the FC read-model checkpoint init).
@@ -60,7 +62,7 @@ session test fixture's one-time `apply_migrations`.
 
 **Interfaces:**
 - Consumes: `append(conn, *, aggregate, aggregate_id, type, payload, actor, provenance=None, request_id=None, feature_id=None, run_id=None, overlay_fact_id=None, caused_by=None, expected_version=None) -> EventEnvelope` (`featuregen.aggregates._append`); `event_registry().register_schema(type_name, schema_version, json_schema, owner, *, status="active")`; `build_service_identity(*, subject, role_claims, attestation, ...) -> IdentityEnvelope`; `partition_key_for(event: EventEnvelope) -> str` (`featuregen.runtime.outbox`); `apply_migrations(conn)`.
-- Produces: `EventEnvelope.feature_contract_id: str | None`, `NewEvent.feature_contract_id: str | None`; `append(..., feature_contract_id=None)` keyword; an `events` table that accepts `aggregate='feature_contract'` with `aggregate_id == feature_contract_id` and `feature_id IS NULL` (correlation mirrors `request_id`/`run_id` MAY be set — the per-run contract lifecycle, §4.6/§11); `partition_key_for` returns `f"feature_contract:{feature_contract_id}"`.
+- Produces: `EventEnvelope.feature_contract_id: str | None`, `NewEvent.feature_contract_id: str | None`; `append(..., feature_contract_id=None)` keyword; an `events` table that accepts `aggregate='feature_contract'` with `aggregate_id == feature_contract_id == run_id` — the `run_id` mirror is **ALWAYS populated (NON-NULL)** for per-contract correlation and `feature_id IS NULL` always (a contract precedes any feature); `request_id` MAY be set (the per-run contract lifecycle, §4.6/§11) — X3; `partition_key_for` returns `f"feature_contract:{feature_contract_id}"`.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -144,6 +146,20 @@ def test_feature_contract_id_mismatch_is_rejected_by_consistency_check(conn):
         )
 
 
+def test_feature_contract_with_null_run_id_is_rejected_by_consistency_check(conn):
+    # X3: a feature_contract event MUST carry its run_id mirror (aggregate_id == feature_contract_id
+    # == run_id) — the consistency CHECK requires run_id NON-NULL even when the id-equality holds.
+    with pytest.raises(psycopg.errors.CheckViolation):
+        conn.execute(
+            "INSERT INTO events (event_id, aggregate, aggregate_id, stream_version, "
+            "feature_contract_id, type, schema_version, table_version, "
+            "actor, payload, provenance, occurred_at) "
+            "VALUES (%s,'feature_contract',%s,1,%s,'FEATURE_CONTRACT_TEST',1,1,"
+            "'{}'::jsonb,'{}'::jsonb,'{}'::jsonb, now())",
+            ("evt_null_run", _FC, _FC),
+        )
+
+
 def test_request_and_overlay_appends_still_pass(conn):
     _register("REQ_TEST")
     env = append(
@@ -218,9 +234,10 @@ ALTER TABLE events ADD CONSTRAINT events_aggregate_check
 ALTER TABLE events ADD COLUMN IF NOT EXISTS feature_contract_id text;
 
 -- 3. Rebuild the id-consistency invariant with an explicit feature_contract branch. The contract
---    lifecycle is per-run, so a feature_contract event MAY carry its correlation mirrors
---    request_id/run_id (consumed by the get_contract read model, §13); feature_id is ALWAYS NULL
---    (a contract precedes any feature). The request/feature/run/overlay_fact branches are
+--    lifecycle is per-run (one contract per run, aggregate_id == feature_contract_id == run_id), so
+--    a feature_contract event ALWAYS carries its run_id mirror (NON-NULL — the correlation key the
+--    get_contract read model reads, §13) and MAY carry request_id; feature_id is ALWAYS NULL (a
+--    contract precedes any feature) — X3. The request/feature/run/overlay_fact branches are
 --    preserved verbatim from SP-0 + SP-1's 0504.
 ALTER TABLE events DROP CONSTRAINT IF EXISTS events_aggregate_id_consistent;
 ALTER TABLE events ADD CONSTRAINT events_aggregate_id_consistent CHECK (
@@ -230,7 +247,7 @@ ALTER TABLE events ADD CONSTRAINT events_aggregate_id_consistent CHECK (
     (aggregate = 'overlay_fact' AND aggregate_id = overlay_fact_id
         AND request_id IS NULL AND feature_id IS NULL AND run_id IS NULL) OR
     (aggregate = 'feature_contract' AND aggregate_id = feature_contract_id
-        AND feature_id IS NULL)
+        AND run_id IS NOT NULL AND feature_id IS NULL)
 );
 
 -- 4. Partial index for per-contract lookups (mirrors events_overlay_fact_idx).
@@ -382,7 +399,7 @@ def partition_key_for(event: EventEnvelope) -> str:
 - [ ] **Step 9: Run the tests to verify they pass**
 
 Run: `uv run pytest tests/featuregen/intake/test_feature_contract_events.py -v`
-Expected: PASS (6 passed).
+Expected: PASS (7 passed).
 
 - [ ] **Step 10: Commit**
 
@@ -563,10 +580,14 @@ USE_CASE_ONBOARDING_REQUESTED = "USE_CASE_ONBOARDING_REQUESTED"
 INTENT_REJECTED = "INTENT_REJECTED"
 LLM_CALL_RECORDED = "LLM_CALL_RECORDED"
 
-# ---- additive gate value + park hold-state SP-2 registers (§2.1 #6, §5.4, §11) ----
-# The gate value is admitted by 0509's human_tasks_gate CHECK widening; the park hold-state is
-# carried in SP-0's RUN_PARKED.waiting_on_fact (its base payload is unconstrained, run_lifecycle.py),
-# so it needs no DB CHECK — this is the canonical constant handlers pass.
+# ---- additive gate value + the FC onboarding hold-state SP-2 registers (§2.1 #6, §5.4, §11) ----
+# The gate value is admitted by 0509's human_tasks_gate CHECK widening. NEEDS_USE_CASE_ONBOARDING is
+# NOT a DB value and is NOT stored in RUN_PARKED.waiting_on_fact (X6) — that field is SP-1's
+# fact-confirmed-resume key (run_lifecycle.py:112), so overloading it would let a later
+# fact_confirmed_resume WRONGLY unpark an onboarding hold. The hold is instead the `feature_contract`
+# folded status NEEDS_USE_CASE_ONBOARDING (carried by the USE_CASE_ONBOARDING_REQUESTED event, P4)
+# plus the USE_CASE_ONBOARDING gate task; a run parked for onboarding sets waiting_on_fact=None. These
+# are the canonical constants handlers/folds pass.
 USE_CASE_ONBOARDING_GATE = "USE_CASE_ONBOARDING"
 NEEDS_USE_CASE_ONBOARDING = "NEEDS_USE_CASE_ONBOARDING"
 
@@ -938,9 +959,11 @@ Expected: FAIL — `featuregen.intake.store` does not exist (ImportError).
 # src/featuregen/intake/store.py
 """The SP-2 append seam for the `feature_contract` aggregate (mirrors SP-1's overlay/store.py).
 Never INSERTs into `events` directly (Global Constraint) — it rides SP-0's OCC/provenance/global_seq
-helper. `aggregate_id == feature_contract_id == run_id` (R1 — one contract per run); request_id
-rides as a correlation mirror (consumed by the get_contract read model, §13). New streams open at
-expected_version=0; every FC event type MUST be registered (register_sp2_event_types) first."""
+helper. `aggregate_id == feature_contract_id == run_id` (R1 — one contract per run); the seam passes
+`run_id=run_id` explicitly so the run_id mirror column is ALWAYS populated (NON-NULL, = run_id) for
+correlation (X3), and request_id optionally rides as an additional correlation mirror (consumed by
+the get_contract read model, §13). New streams open at expected_version=0; every FC event type MUST
+be registered (register_sp2_event_types) first."""
 
 from __future__ import annotations
 
@@ -966,10 +989,12 @@ def append_feature_contract_event(
 ) -> EventEnvelope:
     """Append one feature_contract event via the SP-0 OCC helper (R1 — mirrors SP-1's
     append_overlay_event). One contract per run, so the seam sets
-    `aggregate_id == feature_contract_id == run_id`; `run_id`/`request_id` also ride as correlation
-    mirrors (consumed by the get_contract read model, §13). Raises ConcurrencyError if the stream is
-    not exactly at `expected_version`, and SchemaValidationError if `type` is unregistered or the
-    payload fails its schema (fail-closed, before any INSERT)."""
+    `aggregate_id == feature_contract_id == run_id` and passes `run_id=run_id` explicitly — the
+    run_id mirror column is ALWAYS populated (NON-NULL) for correlation (X3); `request_id` optionally
+    rides as an additional correlation mirror (consumed by the get_contract read model, §13). Raises
+    ConcurrencyError if the stream is not exactly at `expected_version` (callers that fold FC state to
+    decide MUST pass the folded head_version — X4), and SchemaValidationError if `type` is
+    unregistered or the payload fails its schema (fail-closed, before any INSERT)."""
     return append(
         conn,
         aggregate="feature_contract",
@@ -1015,7 +1040,7 @@ git commit -m "feat(intake): add append_feature_contract_event + load_feature_co
 
 **Interfaces:**
 - Consumes: `open_task(conn, spec: GateTaskSpec, actor) -> str` (`featuregen.gates.tasks`); `GateTaskSpec(gate, required_inputs, eligible_assignees, allowed_responses, run_id=None, feature_id=None, quorum_required=1, quorum_of_role=None, delegation_allowed=True, sla=None, ...)` (`featuregen.contracts.gates`); `append(...)` (Task 1.1); `USE_CASE_ONBOARDING_GATE` / `NEEDS_USE_CASE_ONBOARDING` (Task 1.2); `build_service_identity(...)`; `apply_migrations(conn)`.
-- Produces: `human_tasks_gate_check` admits `'USE_CASE_ONBOARDING'` (preserving CLARIFICATION/DATA_STEWARD/COMPLIANCE/INDEPENDENT_VALIDATION/FINAL_APPROVAL + SP-1's OVERLAY_DATA_OWNER/OVERLAY_COMPLIANCE); the `NEEDS_USE_CASE_ONBOARDING` park hold-state rides SP-0's `RUN_PARKED.waiting_on_fact` (no DB CHECK to widen); a partial index on open onboarding tasks. Consumed by P4 (`submit_intent` → park + `USE_CASE_ONBOARDING_REQUESTED`).
+- Produces: `human_tasks_gate_check` admits `'USE_CASE_ONBOARDING'` (preserving CLARIFICATION/DATA_STEWARD/COMPLIANCE/INDEPENDENT_VALIDATION/FINAL_APPROVAL + SP-1's OVERLAY_DATA_OWNER/OVERLAY_COMPLIANCE); a partial index on open onboarding tasks. The `NEEDS_USE_CASE_ONBOARDING` hold is **not** a DB value and is **never** stored in `RUN_PARKED.waiting_on_fact` (X6 — that is SP-1's fact-confirmed-resume key, `run_lifecycle.py:112`); it is the `feature_contract` folded status (via the `USE_CASE_ONBOARDING_REQUESTED` event) + the `USE_CASE_ONBOARDING` gate task, and a run parked for onboarding carries `waiting_on_fact=None`. Consumed by P4 (`submit_intent` → open the gate task + `USE_CASE_ONBOARDING_REQUESTED`, then park with `waiting_on_fact=None`).
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -1082,22 +1107,28 @@ def test_gate_check_rejects_unknown_gate(db):
         )
 
 
-def test_run_parked_carries_needs_use_case_onboarding_hold_state(conn):
-    # The park hold-state rides RUN_PARKED.waiting_on_fact (base payload is unconstrained).
+def test_onboarding_park_does_not_overload_waiting_on_fact(conn):
+    # X6: the NEEDS_USE_CASE_ONBOARDING hold is NEVER stored in RUN_PARKED.waiting_on_fact — that
+    # field is SP-1's fact-confirmed-resume key (run_lifecycle.py:112), so a later
+    # fact_confirmed_resume(fact_key="NEEDS_USE_CASE_ONBOARDING") could WRONGLY unpark the hold. The
+    # hold is instead the feature_contract folded status NEEDS_USE_CASE_ONBOARDING (carried by the
+    # USE_CASE_ONBOARDING_REQUESTED event, emitted by P4) + the USE_CASE_ONBOARDING gate task opened
+    # above. A run parked for onboarding therefore carries waiting_on_fact=None.
     env = append(
         conn,
         aggregate="run",
         aggregate_id=_RUN,
         run_id=_RUN,
         type="RUN_PARKED",
-        payload={"run_id": _RUN, "owner": "governance",
-                 "waiting_on_fact": NEEDS_USE_CASE_ONBOARDING},
+        payload={"run_id": _RUN, "owner": "governance", "waiting_on_fact": None},
         actor=_svc(),
     )
     got = conn.execute(
         "SELECT payload->>'waiting_on_fact' FROM events WHERE event_id=%s", (env.event_id,)
     ).fetchone()[0]
-    assert got == "NEEDS_USE_CASE_ONBOARDING"
+    assert got is None  # the onboarding hold is never overloaded onto waiting_on_fact
+    # NEEDS_USE_CASE_ONBOARDING stays a domain constant (the FC folded status), not a park-reason key.
+    assert NEEDS_USE_CASE_ONBOARDING == "NEEDS_USE_CASE_ONBOARDING"
 
 
 def test_use_case_onboarding_migration_is_idempotent(conn):
@@ -1137,12 +1168,14 @@ ALTER TABLE human_tasks ADD CONSTRAINT human_tasks_gate_check CHECK (
              'USE_CASE_ONBOARDING')
 );
 
--- 2. The NEEDS_USE_CASE_ONBOARDING park hold-state needs NO DDL: it rides SP-0's RUN_PARKED
---    payload field `waiting_on_fact` (the base payload is unconstrained — owner/waiting_on_fact,
---    run_lifecycle.py — and RUN_PARKED's registered event schema is additionalProperties:false over
---    exactly {run_id, owner, waiting_on_fact}, so the hold-state string fits without a schema bump).
---    The canonical constant is intake.events.NEEDS_USE_CASE_ONBOARDING. This comment is the
---    additive "registration" of the park-reason (no CHECK exists to widen).
+-- 2. The NEEDS_USE_CASE_ONBOARDING hold needs NO DDL because it is NOT a DB value at all (X6). It is
+--    NOT stored in SP-0's RUN_PARKED.waiting_on_fact: that field is SP-1's fact-confirmed-resume key
+--    (run_lifecycle.py:112 matches `payload->>'waiting_on_fact' = fact_key`), so overloading the
+--    onboarding hold there would let a later fact_confirmed_resume WRONGLY unpark it. The hold is
+--    represented entirely in the domain layer — the `feature_contract` folded status
+--    NEEDS_USE_CASE_ONBOARDING (via the USE_CASE_ONBOARDING_REQUESTED event, P4) + the
+--    USE_CASE_ONBOARDING gate task above; a run parked for onboarding sets waiting_on_fact=None. The
+--    canonical constant is intake.events.NEEDS_USE_CASE_ONBOARDING (no CHECK exists to widen).
 
 -- 3. Partial index for open onboarding tasks by run (mirrors human_tasks_fact_idx).
 CREATE INDEX IF NOT EXISTS human_tasks_use_case_onboarding_idx
@@ -1301,7 +1334,7 @@ git commit -m "feat(intake): add the sensitive write-once llm_call record store 
 
 **Interfaces:**
 - Consumes: `seed_authz_policy`-style `authz_policy` upsert (`INSERT ... ON CONFLICT (action, gate, permitted_role, actor_kind) DO NOTHING`, `authz/policy.py`); `register_primary_selected(conn)` (`featuregen.documents.primary`) — registers `PRIMARY_SELECTED` in the durable `event_type_registry` + the in-memory `event_registry()` singleton + seeds the `stage_primary` checkpoint; `projection_checkpoints` table.
-- Produces: `seed_sp2_authz(conn) -> None` — idempotently seeds the eight SP-2 command-capability rows (incl. the additive **`("reject_intent","","intake-agent","service",None)`** rejection authority, §2.1 #5; SP-0's `reject` stays validator-only), wires `PRIMARY_SELECTED` for hypothesis-mode candidate promotion, and idempotently ensures the `feature_contract` checkpoint. **No onboarding-answer row** (deferred, §14). `_SP2_POLICY_ROWS: tuple[...]`. Consumed by P9's `register_sp2` + the E2E suite; fine-grained authority (request-owner guard, `confirmer_is_requester_human`, delegation-off) is enforced in the handlers/`mcv.py` guards, **not** here.
+- Produces: `seed_sp2_authz(conn) -> None` — idempotently seeds the eight SP-2 command-capability rows (incl. the additive **`("reject_intent","","intake-agent","service",None)`** rejection authority, §2.1 #5; SP-0's `reject` stays validator-only), wires `PRIMARY_SELECTED` for hypothesis-mode candidate promotion, and idempotently ensures the `feature_contract` checkpoint. **No onboarding-answer row** (deferred, §14). `_SP2_POLICY_ROWS: tuple[...]`. This is the SP-2 DB-backed setup seam (X2): P9 **EXTENDS** `seed_sp2_authz` (adding the DocumentSchemaRegistry contract schemas) and pairs it with the CONN-LESS `register_sp2(handler_registry)` (event-type schemas + command catalog only); consumed by the E2E suite. Fine-grained authority (request-owner guard, `confirmer_is_requester_human`, delegation-off) is enforced in the handlers/`mcv.py` guards, **not** here.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1387,11 +1420,15 @@ Expected: FAIL — `featuregen.intake.bootstrap` does not exist (ImportError).
 ```python
 # src/featuregen/intake/bootstrap.py
 """SP-2 production wiring — the additive authz surface + candidate-promotion wiring (design §2.1 #5).
-P1 introduces `seed_sp2_authz`; P9's `register_sp2(handler_registry)` will build on this module
-(event schemas + contract schemas + commands). Same authz-row shape as authz.policy._POLICY_ROWS —
-coarse command capability only; fine-grained authority (the SP-2-built request-owner guard,
-confirmer_is_requester_human, delegation_allowed=False) lives in the command handlers + intake/mcv.py,
-NOT in these rows (mirrors SP-1)."""
+P1 introduces `seed_sp2_authz(conn)`, which owns ALL DB-backed SP-2 setup (X2): the authz rows, the
+`register_primary_selected(conn)` wiring, and the projection checkpoints — and which P9 EXTENDS to
+also register the DocumentSchemaRegistry contract schemas (`documents/registry.py:20`, requires a
+conn). P9's `register_sp2(handler_registry)` is CONN-LESS and registers ONLY in-memory things — the
+SP-2 event-type schemas + the command catalog — so it never touches the DB; production bootstrap calls
+BOTH (`register_sp2(...)` then `seed_sp2_authz(conn)`). Same authz-row shape as
+authz.policy._POLICY_ROWS — coarse command capability only; fine-grained authority (the SP-2-built
+request-owner guard, confirmer_is_requester_human, delegation_allowed=False) lives in the command
+handlers + intake/mcv.py, NOT in these rows (mirrors SP-1)."""
 
 from __future__ import annotations
 
@@ -1417,9 +1454,12 @@ _SP2_POLICY_ROWS: tuple[tuple[str, str, str, str, str | None], ...] = (
 
 
 def seed_sp2_authz(conn: DbConn) -> None:
-    """Idempotently seed SP-2's authz rows, wire PRIMARY_SELECTED for hypothesis-mode candidate
-    promotion (document-level primitive, §7.1), and ensure the (optional, P8) fail-closed FC-status
-    read-model checkpoint. Every step is ON CONFLICT DO NOTHING / an idempotent registration."""
+    """Idempotently seed SP-2's DB-backed setup (X2): the authz rows, the PRIMARY_SELECTED wiring for
+    hypothesis-mode candidate promotion (document-level primitive, §7.1), and the (optional, P8)
+    fail-closed FC-status read-model checkpoint. Every step is ON CONFLICT DO NOTHING / an idempotent
+    registration. P9 EXTENDS this function to also register the DocumentSchemaRegistry contract schemas
+    (which likewise require a conn); the conn-less `register_sp2(handler_registry)` stays event-type
+    schemas + command catalog only and never calls this."""
     for action, gate, role, kind, scope in _SP2_POLICY_ROWS:
         conn.execute(
             """

@@ -995,6 +995,7 @@ def generate_candidate_docs(
 **Interfaces:**
 - Consumes: `new_primary_selected(*, run_id, stage, doc_id, actor, provenance, caused_by=None) -> NewEvent` (SP-0 `documents/primary.py`); `append_event` (`featuregen.events`); `current_version`/`table_version_for`/`provenance_for` (`aggregates/_append.py`); `Stage` (`contracts/documents.py`); **`record_denial(conn, cmd, reason)` (`security/audit.py`, R15 — writes `decision="denied"`)**; **`fold_feature_contract_state` + `actor_is_request_owner(state, actor) -> bool` (P2 `intake/state.py`, R3/R4)** and **`load_feature_contract(conn, run_id)` (P1 `intake/store.py`, R1)** — the owner guard folds the `feature_contract` stream and calls the state-based predicate (NOT the `(conn, run_id, actor)` mcv form); `Command`/`CommandResult`/`DbConn` (`featuregen.contracts`); the P4-created `_SP2_CATALOG`/`register_sp2_commands`.
 - Produces: `select_candidate_doc(conn, cmd) -> CommandResult` — the **document-level** candidate promotion for hypothesis mode (§7.1). `cmd.args`: `run_id`, `candidate_doc_id`, `stage` (default `Stage.DRAFT_CONTRACT.value`). Guards (fail-closed, in order): **human** (`actor_kind == "human"`, else DENY); **request-owner** (fold the `feature_contract` stream → `actor_is_request_owner(state, cmd.actor)`, else DENY **via `record_denial`** → security-audit `COMMAND_DENIED`, `decision="denied"`, R15); the doc must be a **candidate-role** doc for `(run_id, stage)` (else DENY). On pass: emit `PRIMARY_SELECTED` via `new_primary_selected` on the **run** aggregate (OCC on the run stream) — records **only the chosen** doc; the losing sibling docs are write-once and **untouched** (no per-doc reject event; their `doc_id`s live only in the Gate #1 confirmation record, §8.3). **NOT** the request-level `select_candidate` (wrong granularity). Appended to `_SP2_CATALOG` so `execute_command` routes it (used by `confirm_contract` in hypothesis mode, P7, and the P9 E2E).
+- **X4 (CAS-on-folded-head) — this file's reconciliation:** `select_candidate_doc` folds the `feature_contract` stream **only** for the owner-guard; it appends **no** `feature_contract` domain transition, so there is **no** feature_contract folded head to CAS on. The `PRIMARY_SELECTED` promotion is a **document selection per SP-0** that rides the **run** aggregate, guarded by the **run stream's own OCC** (`expected_version=current_version(conn,"run",run_id)`) — do **NOT** thread the feature_contract folded head into this run-aggregate append (different aggregate). Candidate generation (Tasks 6.2/6.4) likewise appends no `feature_contract` event (docs + blob rows only; `DRAFT_CONTRACT_PRODUCED` is P4's). If any future revision of this file appends a `feature_contract` event **after** folding state, it MUST follow X4 verbatim: capture `head_version = stream[-1].stream_version` (or `0` for a brand-new stream) at fold time, pass it as `expected_version` to `append_feature_contract_event`, and catch `ConcurrencyError` → deny `"stale"`.
 
 - [ ] **Step 1 — write the failing test**
 
@@ -1179,7 +1180,10 @@ def select_candidate_doc(conn: DbConn, cmd: Command) -> CommandResult:
     `select_candidate` command (which promotes *run* candidates on a *request* stream — the wrong
     granularity; SP-2's candidates are documents under a single run). Owner + human guarded; invoked
     by `confirm_contract` in hypothesis mode (P7). OCC on the run stream serializes concurrent
-    selects."""
+    selects. X4: the `feature_contract` fold here is OWNER-GUARD-ONLY — this handler appends NO
+    `feature_contract` transition, so there is no FC folded head to CAS on; the `PRIMARY_SELECTED`
+    append rides the RUN aggregate under the run stream's own OCC (per SP-0). Do NOT pass the
+    feature_contract folded head as this append's `expected_version` (wrong aggregate)."""
     args = cmd.args
     run_id = args["run_id"]
     candidate_doc_id = args["candidate_doc_id"]
@@ -1223,6 +1227,10 @@ def select_candidate_doc(conn: DbConn, cmd: Command) -> CommandResult:
             denied_reason=f"doc {candidate_doc_id} is branch_role={row[0]!r}, not a candidate",
         )
 
+    # X4 / SP-0 carve-out: PRIMARY_SELECTED is a document promotion on the RUN aggregate — its OCC is
+    # the run stream's own head (`current_version(conn,"run",run_id)`), NOT the feature_contract folded
+    # head. This handler appends no feature_contract transition, so there is no FC head to CAS on
+    # (X4's folded-head expected_version rule is n/a here; the fold above is owner-guard-only).
     event = new_primary_selected(
         run_id=run_id,
         stage=stage,

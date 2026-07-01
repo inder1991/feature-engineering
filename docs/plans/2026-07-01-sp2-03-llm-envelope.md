@@ -52,7 +52,7 @@ CREATE TABLE IF NOT EXISTS llm_call (
 CREATE INDEX IF NOT EXISTS llm_call_identity_idx ON llm_call (run_id, task, input_hash);
 ```
 
-**`LLM_CALL_RECORDED` event schema (registered by P1; constant owned by P1's `intake/events.py`, R17):** `schema_version=1`, `additionalProperties: true`, `required: ["llm_call_ref"]` (**R2** — id fields NOT in `required`), owner `featuregen-intake`. P3 **imports the `LLM_CALL_RECORDED` constant from `featuregen.intake.events` (never redeclares it, R17)**, is the **sole emitter**, and pins the payload to SEMANTIC fields only (R2 — no id fields): `{"llm_call_ref", "task", "status", "validation_result"}`. Emitted via the **R1 store seam** `append_feature_contract_event(conn, run_id=..., type=LLM_CALL_RECORDED, ...)` (from `intake.store`, P1), which sets `aggregate="feature_contract"`, `aggregate_id = feature_contract_id = run_id` (the run/feature/request mirror columns are NULL — the `0508` `feature_contract` branch requires `aggregate_id = feature_contract_id`, mirroring `0504`'s overlay branch). `fold_feature_contract_state` (P8) MUST ignore `LLM_CALL_RECORDED` (it never advances the folded status).
+**`LLM_CALL_RECORDED` event schema (registered by P1; constant owned by P1's `intake/events.py`, R17):** `schema_version=1`, `additionalProperties: true`, `required: ["llm_call_ref"]` (**R2** — id fields NOT in `required`), owner `featuregen-intake`. P3 **imports the `LLM_CALL_RECORDED` constant from `featuregen.intake.events` (never redeclares it, R17)**, is the **sole emitter**, and pins the payload to SEMANTIC fields only (R2 — no id fields): `{"llm_call_ref", "task", "status", "validation_result"}`. Emitted via the **R1 store seam** `append_feature_contract_event(conn, run_id=..., type=LLM_CALL_RECORDED, ...)` (from `intake.store`, P1), which sets `aggregate="feature_contract"`, `aggregate_id = feature_contract_id = run_id`, and — per the **one event-identity invariant (X3)** — the **`run_id` mirror column ALWAYS populated** (`= run_id`, non-null, for correlation), **`feature_id` ALWAYS NULL**, and `request_id` optional. `LLM_CALL_RECORDED` is **never appended on the `run` aggregate** — it rides the `feature_contract` stream like every other SP-2 domain event. The `0508` `feature_contract` branch requires `aggregate_id = feature_contract_id` and `feature_id IS NULL` (mirroring `0504`'s overlay branch). `fold_feature_contract_state` (P8) MUST ignore `LLM_CALL_RECORDED` (it never advances the folded status).
 
 ---
 
@@ -1625,12 +1625,19 @@ Steps:
               aggregate_id=run_id,
           )
 
-      # 6. Emit LLM_CALL_RECORDED on the feature_contract aggregate via the R1 store seam
-      #    (append_feature_contract_event sets aggregate="feature_contract" and
-      #    aggregate_id == feature_contract_id == run_id internally — mirrors 0504's overlay branch;
-      #    call_llm never touches the low-level featuregen.aggregates._append.append). The redacted
-      #    body lives in the store (referenced by call_ref), never inlined in the event. Payload is
-      #    SEMANTIC-only (R2 — no id fields; feature_contract_id/run_id ride the typed columns).
+      # 6. Emit LLM_CALL_RECORDED on the feature_contract aggregate via the R1 store seam.
+      #    append_feature_contract_event sets aggregate="feature_contract",
+      #    aggregate_id == feature_contract_id == run_id, and the run_id mirror column ALWAYS
+      #    populated (= run_id, non-null, for correlation) — feature_id ALWAYS NULL, request_id
+      #    optional (X3 one event-identity invariant, mirrors 0504's overlay branch). This is NEVER
+      #    appended on the `run` aggregate; call_llm never touches the low-level
+      #    featuregen.aggregates._append.append. The redacted body lives in the store (referenced by
+      #    call_ref), never inlined in the event. Payload is SEMANTIC-only (R2 — no id fields;
+      #    feature_contract_id/run_id ride the typed columns).
+      #    X4: LLM_CALL_RECORDED is a NON-lifecycle audit event — fold_feature_contract_state ignores
+      #    it and call_llm makes no fold-based decision here, so the append rides current head
+      #    (expected_version=None is correct) and is NOT subject to the folded-head CAS rule (that
+      #    rule governs the lifecycle-transition commands in P4/P5/P7/P8, not this audit append).
       append_feature_contract_event(
           conn,
           run_id=run_id,

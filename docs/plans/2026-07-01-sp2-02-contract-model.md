@@ -1117,10 +1117,13 @@ def test_intent_rejected_folds_to_the_carried_classification():
     assert st.classification == "PROHIBITED_DATA_CLASS"
 
 
-def test_onboarding_request_parks_the_contract():
+def test_onboarding_request_folds_to_the_onboarding_hold_status():
+    # NEEDS_USE_CASE_ONBOARDING is a folded feature_contract status (from USE_CASE_ONBOARDING_REQUESTED),
+    # NOT a waiting_on_fact park — and it is a non-terminal HOLD, not a terminal reject.
     onb = _Evt(events.USE_CASE_ONBOARDING_REQUESTED, "evt_onb", {"catalog_version": "banking-cat@1"})
     st = fold_feature_contract_state([_submitted(), onb])
     assert st.status is FeatureContractStatus.NEEDS_USE_CASE_ONBOARDING
+    assert not st.is_terminal   # a hold, not a terminal reject (contrast OUT_OF_SCOPE / PROHIBITED_DATA_CLASS)
 
 
 def test_no_regression_guard_locks_confirmed_and_terminal_states():
@@ -1173,14 +1176,17 @@ class FeatureContractStatus(str, Enum):
     NEEDS_CLARIFICATION = "NEEDS_CLARIFICATION"
     MINIMUM_CONTRACT_VALIDATED = "MINIMUM_CONTRACT_VALIDATED"
     CONFIRMED = "CONFIRMED"
-    OUT_OF_SCOPE = "OUT_OF_SCOPE"                             # terminal (banking-boundary)
-    PROHIBITED_DATA_CLASS = "PROHIBITED_DATA_CLASS"          # terminal (blocked-class)
-    NEEDS_USE_CASE_ONBOARDING = "NEEDS_USE_CASE_ONBOARDING"  # park / hold
+    OUT_OF_SCOPE = "OUT_OF_SCOPE"                             # TERMINAL reject → reject_intent / RUN_REJECTED (banking-boundary)
+    PROHIBITED_DATA_CLASS = "PROHIBITED_DATA_CLASS"          # TERMINAL reject → reject_intent / RUN_REJECTED (blocked-class)
+    NEEDS_USE_CASE_ONBOARDING = "NEEDS_USE_CASE_ONBOARDING"  # the ONLY hold — a folded status (from USE_CASE_ONBOARDING_REQUESTED), NOT a waiting_on_fact park
 
 
-# CONFIRMED + the two banking-boundary rejections are no-regression-locked (a later, conflicting
-# event never moves the fold off them). NEEDS_USE_CASE_ONBOARDING is a park that a governance flow
-# (out of SP-2 scope) may later resume — so it is NOT locked here.
+# CONFIRMED + the two banking-boundary TERMINAL REJECTS (OUT_OF_SCOPE / PROHIBITED_DATA_CLASS →
+# reject_intent → RUN_REJECTED) are no-regression-locked (a later, conflicting event never moves the
+# fold off them). NEEDS_USE_CASE_ONBOARDING is NOT terminal — it is the single non-terminal HOLD, a
+# folded status (from USE_CASE_ONBOARDING_REQUESTED), NOT a waiting_on_fact park (that field is SP-1's
+# fact-resume key, run_lifecycle.py:41/112) — that a governance flow (out of SP-2 scope) may later
+# resume, so it is NOT locked here.
 TERMINAL_STATUSES: frozenset[FeatureContractStatus] = frozenset({
     FeatureContractStatus.CONFIRMED,
     FeatureContractStatus.OUT_OF_SCOPE,
@@ -1628,7 +1634,7 @@ git commit -m "feat(intake): read-only BankingDomainCatalog reference reader (fr
         # most-restrictive-wins (PROHIBITED_DATA_CLASS > OUT_OF_SCOPE > sensitive-proxy > ambiguous),
         # exactly one outcome, catalog `version` stamped on EVERY outcome incl. CLEAR (§4.5 a/b/c/e).
   ```
-  > `OUT_OF_SCOPE` / `PROHIBITED_DATA_CLASS` map to the P4 `reject_intent` terminal outcome (→ `INTENT_REJECTED` carrying `classification` = `outcome.value`); `NEEDS_USE_CASE_ONBOARDING` maps to the P4 onboarding park. The values deliberately match `FeatureContractStatus` (Task 2.5) so the fold can do `FeatureContractStatus(payload["classification"])`. **Catalog-unavailable fails closed to `AMBIGUOUS_CLARIFY`** (never CLEAR, `catalog_version=None`, `reason="catalog_unavailable_fail_closed"`); P4 treats a catalog-unavailable `AMBIGUOUS_CLARIFY` as the §4.5(b) manual-review park.
+  > `OUT_OF_SCOPE` / `PROHIBITED_DATA_CLASS` are **TERMINAL rejects** — each maps to the P4 intake-time terminal outcome (`submit_intent` appends `INTENT_REJECTED` carrying `classification` = `outcome.value` → SP-0 `RUN_REJECTED`); neither is a park. `NEEDS_USE_CASE_ONBOARDING` is the **only hold** — it maps to the P4 onboarding hold: the `NEEDS_USE_CASE_ONBOARDING` folded status (via `USE_CASE_ONBOARDING_REQUESTED`) + the `USE_CASE_ONBOARDING` governance gate task; if the run parks at all its `RUN_PARKED` payload keeps `waiting_on_fact=None` (never overloading SP-1's fact-resume key). The values deliberately match `FeatureContractStatus` (Task 2.5) so the fold can do `FeatureContractStatus(payload["classification"])`. **Catalog-unavailable fails closed to `AMBIGUOUS_CLARIFY`** (never CLEAR, `catalog_version=None`, `reason="catalog_unavailable_fail_closed"`); P4 treats a catalog-unavailable `AMBIGUOUS_CLARIFY` as the §4.5(b) manual-review park.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1782,11 +1788,11 @@ class IntakeOutcome(str, Enum):
     intent (most-restrictive-wins). OUT_OF_SCOPE / PROHIBITED_DATA_CLASS / NEEDS_USE_CASE_ONBOARDING
     share their string values with FeatureContractStatus so the fold can map them directly."""
 
-    OUT_OF_SCOPE = "OUT_OF_SCOPE"                             # terminal / park (banking boundary)
-    PROHIBITED_DATA_CLASS = "PROHIBITED_DATA_CLASS"          # terminal block (blocked class)
+    OUT_OF_SCOPE = "OUT_OF_SCOPE"                             # TERMINAL reject → reject_intent / RUN_REJECTED (banking boundary)
+    PROHIBITED_DATA_CLASS = "PROHIBITED_DATA_CLASS"          # TERMINAL reject → reject_intent / RUN_REJECTED (blocked class)
     SENSITIVE_PROXY_CLARIFY = "SENSITIVE_PROXY_CLARIFY"      # non-terminal → clarification / review
     AMBIGUOUS_CLARIFY = "AMBIGUOUS_CLARIFY"                  # non-terminal → clarification
-    NEEDS_USE_CASE_ONBOARDING = "NEEDS_USE_CASE_ONBOARDING"  # in-scope, unknown use-case → park
+    NEEDS_USE_CASE_ONBOARDING = "NEEDS_USE_CASE_ONBOARDING"  # in-scope, unknown use-case → HOLD (onboarding; the only hold, NOT a terminal reject)
     CLEAR = "CLEAR"                                          # pass
 
 
