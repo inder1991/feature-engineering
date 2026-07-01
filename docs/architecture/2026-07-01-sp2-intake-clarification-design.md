@@ -72,7 +72,7 @@
 | # | Decision | Choice |
 |---|---|---|
 | D1 | Scope shape | **Definition mode end-to-end + all shared Layer-1/2 machinery**; hypothesis mode is a real flow with a **stub single-call generator** (the real engine is SP-12). |
-| D2 | Foundation | **Build on SP-0 only.** Reuse the run aggregate, staged-document DAG (incl. candidate-role docs + the document **`PRIMARY_SELECTED`** promotion for hypothesis-mode candidate selection — *not* request-level `select_candidate`, §7.1), `CLARIFICATION` gate, durable runtime, identity/SoD, audit — **no new aggregate** (unlike SP-1). Additive event-type + document-schema registrations only (§2). |
+| D2 | Foundation | **Build on SP-0 only.** Reuse the run aggregate, staged-document DAG (incl. candidate-role docs + the document **`PRIMARY_SELECTED`** promotion for hypothesis-mode candidate selection — *not* request-level `select_candidate`, §7.1), `CLARIFICATION` gate, durable runtime, identity/SoD, audit — **no new aggregate and no event-store aggregate-CHECK** (unlike SP-1). Additive registrations: event-types, document-schemas, and **one backward-compatible human-gate/park-reason migration** (`USE_CASE_ONBOARDING` gate + `NEEDS_USE_CASE_ONBOARDING` park hold-state, mirroring SP-1's `0505`, §2.1). |
 | D3 | Contract ownership | **SP-2 owns contract *semantics*; SP-0 owns the *envelope* + generic Draft schema** (design SP-0 §3.5, §12). Confirmed-contract content-schema is registered with SP-0's document registry. |
 | D4 | Gate #1 confirmer | **Author self-confirms** — an *audited intent lock*, not a governance approval. Confirmer MUST be the authenticated human requester (never a service or the LLM). Independent bank-grade signer is Gate #2 (SP-5) (§8). |
 | D5 | LLM reality | **`LLMClient` interface is mandatory; `FakeLLM` is the deterministic default; a real Claude adapter is shipped but config-gated, never required in CI.** Every call event-sourced; **no silent prod fallback**; structured-output → **bounded repair → fail into clarification**; **no PII to the LLM** (§9). |
@@ -87,11 +87,17 @@
 ## 2. Foundation reuse (build on SP-0)
 
 SP-2 is a **thin domain layer over SP-0**, exactly as SP-1 is. Crucially — and unlike SP-1 — SP-2 needs **no
-new aggregate and no event-store CHECK migration**: the whole Layer-1/2 flow rides on SP-0's **existing `run`
-aggregate**, its **DRAFT → CONFIRMED_CONTRACT** run states, its **staged-document DAG**, its `CLARIFICATION`
-human-gate, and its **document `PRIMARY_SELECTED`** candidate promotion (hypothesis-mode candidate selection is
-document-level, *not* request-level `select_candidate`, §7.1). SP-2's additions are **additive registrations +
-handlers**.
+new aggregate and no event-store aggregate-CHECK migration**: the whole Layer-1/2 flow rides on SP-0's
+**existing `run` aggregate**, its **DRAFT → CONFIRMED_CONTRACT** run states, its **staged-document DAG**, its
+`CLARIFICATION` human-gate, and its **document `PRIMARY_SELECTED`** candidate promotion (hypothesis-mode
+candidate selection is document-level, *not* request-level `select_candidate`, §7.1). SP-2's additions are
+**additive registrations + handlers** — **including one small backward-compatible schema migration** that adds
+a `USE_CASE_ONBOARDING` human-gate value + a `NEEDS_USE_CASE_ONBOARDING` park hold-state (§2.1, §5.4),
+mirroring SP-1's additive `0505_overlay_gates.sql`. This is honest additive surface, not zero surface: SP-0's
+base gate enum (`0070_identity_authz_gates.sql`) has no onboarding gate and base `RUN_PARKED` carries only
+`owner`/`waiting_on_fact` (`run_lifecycle.py`), so SP-2 registers both additively. What SP-2 *avoids* (unlike
+SP-1) is a **new aggregate** or an **event-store aggregate-CHECK** migration — the human-gate widening is
+neither.
 
 SP-2 reuses, verbatim from SP-0:
 
@@ -111,16 +117,19 @@ SP-2 reuses, verbatim from SP-0:
   `allowed_responses: [confirm, edit, reject]`, `required_inputs`, `task_version`, quorum, and the
   `open | answered | conflict | expired | cancelled | superseded` lifecycle. SP-2 uses it directly for the
   Human Clarification Gate (§6.5) and Human Gate #1 (§8).
-- **Identity + command authz + structural SoD** (SP-0 §6) — `create_request`, `create_run`,
-  `submit_human_signal(gate=CLARIFICATION)`, and `create_run` all already carry authz rows admitting the
+- **Identity + command authz + structural SoD** (SP-0 §6) — `create_request`, `create_run`, and
+  `submit_human_signal(gate=CLARIFICATION)` all already carry authz rows admitting the
   **`data_scientist` role for *any* human** (role-scoped, **not** keyed to the specific request owner — SP-0
   §6.2, `authz_policy`), plus a `service:intake-agent` service principal for system-initiated steps
   (SP-0 §6.2). (Hypothesis-mode candidate selection is a **document `PRIMARY_SELECTED`** promotion, *not* the
   request-level `select_candidate` command — §7.1.) Because SP-0's role-authz and `submit_human_signal`
   eligibility check the *role/scope/quorum*,
   **not** that the acting `subject` is the task's requester, **SP-2 builds an explicit request-owner guard** on
-  top (§8.2, §6.5, §2.1) — additive, in SP-2's own handlers, changing no SP-0 row. SP-2 introduces no new gate
-  values.
+  top (§8.2, §6.5, §2.1) — additive, in SP-2's own handlers, changing no SP-0 row. **On gate/park vocabulary
+  SP-2 is *additive*, not zero-surface:** it registers **one new human-gate value + one park hold-state**
+  (`USE_CASE_ONBOARDING` gate / the `NEEDS_USE_CASE_ONBOARDING` park-reason, §5.4, §11) via a small
+  backward-compatible migration — exactly as SP-1 added its overlay gates (`0505_overlay_gates.sql`), §2.1 —
+  while adding **no new run aggregate and no event-store aggregate-CHECK** (§2).
 - **The durable runtime** (SP-0 §5) — outbox, idempotent handlers, durable timers (clarification-SLA →
   reminder → escalation → auto-park), bounded retries with hard loop limits (used to bound the Refinement
   Loop, §6.6), and the atomic one-transaction-per-step boundary.
@@ -150,8 +159,16 @@ SP-2 reuses, verbatim from SP-0:
    pins the acting `subject` to the request owner via `actor_is_request_owner` (at `answer_clarification`,
    §6.5) and `confirmer_is_requester_human` = `actor_is_request_owner ∧ actor_kind==human` (at
    `confirm_contract` / Gate #1, §8.2). A mismatch is **denied + written to the security-audit stream**.
+5. **One additive human-gate + park-reason registration** — a small backward-compatible migration (mirroring
+   SP-1's `0505_overlay_gates.sql`) that **widens SP-0's `human_tasks` gate CHECK** with a new
+   `USE_CASE_ONBOARDING` gate value and registers the **`NEEDS_USE_CASE_ONBOARDING` park hold-state** as an
+   additive `RUN_PARKED` park-reason (§5.4, §11). This is *required* because SP-0's base gate enum
+   (`0070_identity_authz_gates.sql`: `CLARIFICATION`/`DATA_STEWARD`/`COMPLIANCE`/`INDEPENDENT_VALIDATION`/
+   `FINAL_APPROVAL`) has **no** onboarding gate and base `RUN_PARKED` carries **only** `owner`/`waiting_on_fact`
+   (`run_lifecycle.py`). It only widens a CHECK / adds allowed values — it changes no existing row and adds no
+   new *aggregate*, so it is **not** an event-store aggregate-CHECK migration.
 
-All four are additive; no existing SP-0 row, document, or event changes.
+All five are additive and backward-compatible; no existing SP-0 row, document, or event is rewritten.
 
 ---
 
@@ -482,9 +499,13 @@ provenance. The screen produces exactly one of these **deterministic classificat
 A **new banking use-case** — a request that is *in-scope* banking but matches no known catalog use-case — is
 **neither rejected nor blocked**: the run is **parked** (SP-0 `park`) into a hold state
 **`NEEDS_USE_CASE_ONBOARDING`** and emits **`USE_CASE_ONBOARDING_REQUESTED`**, which opens a **governance
-use-case-onboarding human-gate task** (SP-0's human-gate task model, owned by governance). **SP-2 only
-routes/parks: the onboarding *workflow* itself is out of SP-2 build scope** (§14) — SP-2 defines the park state
-+ the routing event, not the onboarding gate's semantics. (The richer domain-priming of *generation* is SP-12;
+use-case-onboarding human-gate task** (SP-0's human-gate task model, owned by governance). Both the
+`NEEDS_USE_CASE_ONBOARDING` park hold-state and the `USE_CASE_ONBOARDING` gate value are **additive
+registrations SP-2 ships** (§2.1 #5) — SP-0's base `RUN_PARKED` payload carries only `owner`/`waiting_on_fact`
+(`run_lifecycle.py`) and its base gate enum has no onboarding gate (`0070`), so SP-2 registers both via a small
+backward-compatible migration (mirroring SP-1's `0505_overlay_gates.sql`). **SP-2 only routes/parks: the
+onboarding *workflow* itself is out of SP-2 build scope** (§14) — SP-2 defines the park state + the routing
+event + these additive registrations, not the onboarding gate's semantics. (The richer domain-priming of *generation* is SP-12;
 SP-2 uses the catalog only as a boundary + blocked-class + proxy-hint reference, Decision D8, §4.5.)
 
 ---
@@ -955,6 +976,7 @@ through SP-2 sub-states (all while the SP-0 run-state is `DRAFT`, until Gate #1)
                     ├── sensitive-proxy / ambiguous ─► CLARIFYING (clarification / compliance review, §6.2)
                     │        NOT terminal — routes into the clarification path
                     ├── in-banking, unknown use-case ─► NEEDS_USE_CASE_ONBOARDING  (SP-0 park + hold)
+                    │        [additive park-reason + USE_CASE_ONBOARDING gate value SP-2 registers, §2.1 #5]
                     │        emit USE_CASE_ONBOARDING_REQUESTED → opens a governance onboarding
                     │        human-gate task  (the onboarding workflow itself is out of SP-2 scope, §14)
                     └── in-banking, known use-case
@@ -997,7 +1019,8 @@ terminal/park refinements of the earlier generic `INTENT_REJECTED`, surfaced via
 **ambiguous** cases are **not** terminal — they route into the existing clarification path (§6.2, §6.5).
 `INTENT_REJECTED` (classification `OUT_OF_SCOPE` or `PROHIBITED_DATA_CLASS`), `reject` (prohibited data class),
 an auto-parked exhausted loop, and `NEEDS_USE_CASE_ONBOARDING` (a new banking use-case parked for governance
-onboarding, §5.4) are the non-confirming exits. Terminal for SP-2's span: `CONFIRMED_CONTRACT` (hands off) or
+onboarding, §5.4 — an **additive park hold-state + `USE_CASE_ONBOARDING` gate value** SP-2 registers, §2.1 #5)
+are the non-confirming exits. Terminal for SP-2's span: `CONFIRMED_CONTRACT` (hands off) or
 `REJECTED`; the `NEEDS_USE_CASE_ONBOARDING` park exits SP-2 into a governance onboarding flow that SP-2 does
 not build (§14).
 
@@ -1128,7 +1151,7 @@ adapter is exercised only in an **opt-in, config-gated smoke test** never gated 
 | # | Point | Decision-record source | What SP-2 did / where a call was made |
 |---|---|---|---|
 | 1 | Scope shape | Decision 1 | Definition mode end-to-end + all shared machinery; hypothesis is a real flow with a single-call **stub** generator; SP-12 boundary held (§3, §7). |
-| 2 | No new aggregate | Decision (Seams) | **Reasonable call:** SP-2 rides SP-0's existing `run` aggregate + DRAFT/CONFIRMED_CONTRACT states + `CLARIFICATION` gate + the document **`PRIMARY_SELECTED`** candidate-promotion primitive (candidate selection is document-level, *not* request-level `select_candidate`, §7.1) — **no event-store CHECK migration** (unlike SP-1). Additive event-type + document-schema registrations only (§2). *The decision record listed the SP-0 dependencies but did not specify whether a new aggregate was needed; using the existing run spine is the minimal faithful encoding.* |
+| 2 | No new aggregate | Decision (Seams) | **Reasonable call:** SP-2 rides SP-0's existing `run` aggregate + DRAFT/CONFIRMED_CONTRACT states + `CLARIFICATION` gate + the document **`PRIMARY_SELECTED`** candidate-promotion primitive (candidate selection is document-level, *not* request-level `select_candidate`, §7.1) — **no new aggregate and no event-store aggregate-CHECK migration** (unlike SP-1). Additive registrations only: event-types, document-schemas, and **one backward-compatible human-gate/park-reason migration** (`USE_CASE_ONBOARDING` gate + `NEEDS_USE_CASE_ONBOARDING` park hold-state, mirroring SP-1's `0505`, §2.1) — the base gate enum + `RUN_PARKED` payload carry neither (SP-0 `0070`, `run_lifecycle.py`). *The decision record listed the SP-0 dependencies but did not specify whether a new aggregate was needed; using the existing run spine is the minimal faithful encoding.* |
 | 3 | Ambiguity/confidence scale + combine rule | Decision (Components) said "each field scored for ambiguity + confidence" | **Reasonable call:** fixed a **0.0–1.0** scale for both, sourced from LLM self-report **+** a deterministic catalog-cardinality check, with the platform taking the **more cautious** value on disagreement (§6.1). Scale and combine rule were not specified. |
 | 4 | Doubt Router thresholds | Decision (Components): auto-resolve vs must-ask | **Reasonable call:** `auto-resolve iff ambiguity ≤ 0.30 AND confidence ≥ 0.70 AND safe source AND not policy-sensitive AND not calc-method`; config-gated, biased toward asking (§6.2). Exact thresholds were not specified. |
 | 5 | Bounded repair budget | Decision 3: "bounded repair loop → on exhaustion fail into clarification" | **Reasonable call:** default **N = 2** structured-output repair attempts, config-gated, then fail into clarification; refusal treated as invalid (§9.2). The count was not specified. |
