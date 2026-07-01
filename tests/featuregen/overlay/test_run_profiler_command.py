@@ -253,7 +253,7 @@ def test_run_profiler_no_orphan_evidence_when_fact_created_concurrently(db, monk
     sees the seeded DRAFT and denies. No evidence row may be left behind: propose_fact now owns the
     evidence INSERT and performs it only AFTER the replacement-semantics gates pass, so a denied
     proposal writes NOTHING. Pre-fix the profiler pre-wrote evidence before proposing -> orphan."""
-    import featuregen.overlay.commands as overlay_commands
+    import featuregen.overlay.profiler_command as profiler_command
 
     db.execute("CREATE TABLE prof_run_c (account_id integer)")
     db.execute("INSERT INTO prof_run_c SELECT g FROM generate_series(1, 30) AS g")
@@ -291,7 +291,7 @@ def test_run_profiler_no_orphan_evidence_when_fact_created_concurrently(db, monk
     # Model the READ COMMITTED race: the profiler's preflight ran on an EARLIER snapshot that did not
     # yet see the concurrent commit, so it returns (None, None) for grain_key the first time and
     # lets the candidate past the skip gates into propose_fact.
-    real_fp = overlay_commands._existing_proposal_fingerprint
+    real_fp = profiler_command._existing_proposal_fingerprint
     seen = {"grain_first": True}
 
     def stale_preflight(conn, fk):
@@ -300,7 +300,7 @@ def test_run_profiler_no_orphan_evidence_when_fact_created_concurrently(db, monk
             return (None, None)
         return real_fp(conn, fk)
 
-    monkeypatch.setattr(overlay_commands, "_existing_proposal_fingerprint", stale_preflight)
+    monkeypatch.setattr(profiler_command, "_existing_proposal_fingerprint", stale_preflight)
 
     result = execute_command(db, _run_profiler_cmd(ref))
     assert result.accepted is True

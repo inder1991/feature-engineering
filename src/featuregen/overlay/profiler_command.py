@@ -51,11 +51,6 @@ def _run_profiler(conn: DbConn, cmd: Command) -> CommandResult:
     REVERIFY/STALE) blocks any new proposal, and a REJECTED fact with the SAME
     `proposal_fingerprint` is sticky-skipped (fresh evidence alone never revives it). Skipping first
     guarantees no orphan evidence is left for a candidate `propose_fact` would deny."""
-    # local import: resolve `_existing_proposal_fingerprint` through the `commands` module so a test
-    # that monkeypatches `commands._existing_proposal_fingerprint` still intercepts the preflight
-    # below (and to avoid a top-level import cycle: commands imports `_run_profiler` for its catalog).
-    from featuregen.overlay import commands as _commands
-
     ref = CatalogObjectRef(**dict(cmd.args["ref"]))
     limits = ProfilerLimits(allowed_schemas=frozenset(cmd.args.get("allowed_schemas", ())))
     adapter = current_catalog_adapter()
@@ -92,7 +87,7 @@ def _run_profiler(conn: DbConn, cmd: Command) -> CommandResult:
             profile_version=metrics["profile_version"],
             thresholds=metrics["thresholds"],
         )
-        status, existing_fp = _commands._existing_proposal_fingerprint(conn, fk)
+        status, existing_fp = _existing_proposal_fingerprint(conn, fk)
         # Preflight matching propose_fact's replacement semantics — skip BEFORE writing
         # evidence so the profiler never creates orphan evidence for a denied proposal.
         if status in _NON_TERMINAL:

@@ -25,7 +25,7 @@ from featuregen.overlay.identity import (
     proposal_fingerprint,
 )
 from featuregen.overlay.state import fold_overlay_state
-from featuregen.overlay.store import load_fact
+from featuregen.overlay.store import append_overlay_event, load_fact
 
 
 def propose_fact(conn: DbConn, cmd: Command) -> CommandResult:
@@ -35,12 +35,6 @@ def propose_fact(conn: DbConn, cmd: Command) -> CommandResult:
     `fact_key`; only an empty stream or a REJECTED terminal admits a new proposal, and a previously
     rejected `proposal_fingerprint` stays sticky-denied.
     """
-    # local import: resolve `append_overlay_event` through the `commands` module so a test that
-    # monkeypatches `commands.append_overlay_event` (the occ_spy / inject-concurrent fixtures) still
-    # intercepts this append (and to avoid a top-level import cycle: commands imports `propose_fact`
-    # for its catalog).
-    from featuregen.overlay import commands as _commands
-
     adapter = current_catalog_adapter()
     args = cmd.args
     ref = args["ref"]
@@ -114,7 +108,7 @@ def propose_fact(conn: DbConn, cmd: Command) -> CommandResult:
             created_by=identity_to_jsonb(cmd.actor),  # a dict, never a raw IdentityEnvelope
         )
     authority = resolve_authority(conn, adapter, ref, fact_type)
-    draft = _commands.append_overlay_event(
+    draft = append_overlay_event(
         conn,
         fact_key=key,
         type="OVERLAY_FACT_PROPOSED",

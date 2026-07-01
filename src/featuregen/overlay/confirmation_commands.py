@@ -35,7 +35,7 @@ from featuregen.overlay.identity import (
 )
 from featuregen.overlay.join_confirmation import _confirm_approved_join
 from featuregen.overlay.state import fold_overlay_state
-from featuregen.overlay.store import load_fact
+from featuregen.overlay.store import append_overlay_event, load_fact
 
 
 def confirm_fact(conn: DbConn, cmd: Command) -> CommandResult:
@@ -44,12 +44,6 @@ def confirm_fact(conn: DbConn, cmd: Command) -> CommandResult:
     platform-admin); four-eyes (proposer ≠ confirmer); the FINAL value (override or original) is
     validated BEFORE OVERLAY_FACT_CONFIRMED is appended. On success it arms the
     overlay_expiry timer and closes the open task."""
-    # local import: resolve `append_overlay_event` through the `commands` module so a test that
-    # monkeypatches `commands.append_overlay_event` (the occ_spy / inject-concurrent fixtures) still
-    # intercepts these appends (and to avoid a top-level import cycle: commands imports this handler
-    # back for its catalog).
-    from featuregen.overlay import commands as _commands
-
     if cmd.actor.actor_kind != "human":
         return _deny_audited(
             conn, cmd, cmd.aggregate_id or "", "confirm_fact requires a human authority"
@@ -120,7 +114,7 @@ def confirm_fact(conn: DbConn, cmd: Command) -> CommandResult:
         role = "compliance" if fact_type == "policy_tag" else "data_owner"
         confirmers = [{"subject": cmd.actor.subject, "role": role}]
     expires_at = datetime.now(UTC) + _DEFAULT_TTL
-    confirmed = _commands.append_overlay_event(
+    confirmed = append_overlay_event(
         conn,
         fact_key=key,
         type="OVERLAY_FACT_CONFIRMED",
@@ -151,12 +145,6 @@ def reject_fact(conn: DbConn, cmd: Command) -> CommandResult:
     """Reject a proposed fact → REJECTED (§6.3). A **human** authority only; CAS on
     `target_event_id`; fine-grained authority; records the rejected proposal's
     `retired_fingerprint` (sticky-denial fuel for propose_fact) and closes the open task."""
-    # local import: resolve `append_overlay_event` through the `commands` module so a test that
-    # monkeypatches `commands.append_overlay_event` (the occ_spy / inject-concurrent fixtures) still
-    # intercepts this append (and to avoid a top-level import cycle: commands imports this handler
-    # back for its catalog).
-    from featuregen.overlay import commands as _commands
-
     if cmd.actor.actor_kind != "human":
         return _deny_audited(
             conn, cmd, cmd.aggregate_id or "", "reject_fact requires a human authority"
@@ -199,7 +187,7 @@ def reject_fact(conn: DbConn, cmd: Command) -> CommandResult:
         retired_fp = proposal_fingerprint(state.prior_value)
     else:
         retired_fp = proposed.payload.get("proposal_fingerprint") if proposed else None
-    rejected = _commands.append_overlay_event(
+    rejected = append_overlay_event(
         conn,
         fact_key=key,
         type="OVERLAY_FACT_REJECTED",
@@ -222,12 +210,6 @@ def enter_fact(conn: DbConn, cmd: Command) -> CommandResult:
     """Direct/proactive entry (§3.4): a HUMAN resolved authority self-confirms an owner-known fact.
     An audited exception to four-eyes — never available to a service/profiler proposal, and never to
     a dual-owner approved_join (which must use the two-task flow, §6.4)."""
-    # local import: resolve `append_overlay_event` through the `commands` module so a test that
-    # monkeypatches `commands.append_overlay_event` (the occ_spy / inject-concurrent fixtures) still
-    # intercepts these appends (and to avoid a top-level import cycle: commands imports this handler
-    # back for its catalog).
-    from featuregen.overlay import commands as _commands
-
     adapter = current_catalog_adapter()
     args = cmd.args
     if cmd.actor.actor_kind != "human":
@@ -274,7 +256,7 @@ def enter_fact(conn: DbConn, cmd: Command) -> CommandResult:
             accepted=False, aggregate_id=key, denied_reason="fact already exists; use propose/confirm"
         )
     fp = proposal_fingerprint(proposed_value)
-    draft = _commands.append_overlay_event(
+    draft = append_overlay_event(
         conn,
         fact_key=key,
         type="OVERLAY_FACT_PROPOSED",
@@ -302,7 +284,7 @@ def enter_fact(conn: DbConn, cmd: Command) -> CommandResult:
         role = "compliance" if fact_type == "policy_tag" else "data_owner"
         confirmers = [{"subject": cmd.actor.subject, "role": role}]
     expires_at = datetime.now(UTC) + _DEFAULT_TTL
-    confirmed = _commands.append_overlay_event(
+    confirmed = append_overlay_event(
         conn,
         fact_key=key,
         type="OVERLAY_FACT_CONFIRMED",

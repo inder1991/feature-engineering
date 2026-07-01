@@ -7,10 +7,9 @@ and the idempotent `register_overlay_commands`, and RE-EXPORTS every handler (`p
 (`OverlayCommandError`, `_confirm_approved_join`, `_existing_proposal_fingerprint`,
 `get_task_proposal`) so existing `featuregen.overlay.commands` imports keep resolving.
 
-`append_overlay_event` is re-exported here too: the handler modules resolve it through this module
-(`from featuregen.overlay import commands as _commands; _commands.append_overlay_event(...)`) so the
-occ_spy / inject-concurrent tests can monkeypatch `commands.append_overlay_event` and still intercept
-every overlay append.
+Each handler module imports `append_overlay_event` directly from `featuregen.overlay.store`; tests
+that need to observe or perturb an append (occ_spy / inject-concurrent) monkeypatch it on the owning
+handler module (e.g. `proposal_commands.append_overlay_event`), not through this facade.
 """
 from __future__ import annotations
 
@@ -29,7 +28,6 @@ from featuregen.overlay.profiler_command import (
     _run_profiler as _run_profiler,
 )
 from featuregen.overlay.proposal_commands import propose_fact as propose_fact
-from featuregen.overlay.store import append_overlay_event as append_overlay_event
 from featuregen.overlay.task_read import get_task_proposal as get_task_proposal
 
 # `_OVERLAY_CATALOG` is a TUPLE of (action, handler) pairs (mirrors SP-0's `_CATALOG`),

@@ -20,6 +20,7 @@ from featuregen.overlay._lifecycle import (
 )
 from featuregen.overlay.authority import proposer_ne_confirmer
 from featuregen.overlay.facts import FactValidationError, validate_fact_value
+from featuregen.overlay.store import append_overlay_event
 
 
 def _join_side(authority, subject) -> str:
@@ -53,12 +54,6 @@ def _confirm_approved_join(conn, cmd, key, stream, state, authority):
     OVERLAY_FACT_PARTIALLY_CONFIRMED (recording their side) and closes their task; the SECOND
     (a DISTINCT subject covering the OTHER side) validates the final value and appends
     OVERLAY_FACT_CONFIRMED recording BOTH confirmers, arms expiry, and closes the remaining task."""
-    # local import: resolve `append_overlay_event` through the `commands` module so a test that
-    # monkeypatches `commands.append_overlay_event` (the occ_spy / inject-concurrent fixtures) still
-    # intercepts these appends (and to avoid a top-level import cycle: commands imports this handler
-    # back for its confirm_fact dispatch).
-    from featuregen.overlay import commands as _commands
-
     actor = cmd.actor
     owners = {s for s in authority.subjects if s}
     # A mixed join (one known owner + one unknown/governance side) requires a platform-admin to act
@@ -77,7 +72,7 @@ def _confirm_approved_join(conn, cmd, key, stream, state, authority):
     partial = state.partial_confirmers
     proposed = _latest_proposed(stream)
     if not partial:
-        evt = _commands.append_overlay_event(
+        evt = append_overlay_event(
             conn,
             fact_key=key,
             type="OVERLAY_FACT_PARTIALLY_CONFIRMED",
@@ -129,7 +124,7 @@ def _confirm_approved_join(conn, cmd, key, stream, state, authority):
     # cycle yields the prior confirmed_event_id (the confirmation actually being re-verified), so the
     # recorded causality (confirms_event_id + caused_by) matches single-fact confirm_fact.
     confirms_event_id = _cas_target(state)
-    confirmed = _commands.append_overlay_event(
+    confirmed = append_overlay_event(
         conn,
         fact_key=key,
         type="OVERLAY_FACT_CONFIRMED",
