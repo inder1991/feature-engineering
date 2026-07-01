@@ -1,6 +1,8 @@
 from dataclasses import dataclass
 from typing import Any
 
+from tests.featuregen.overlay._helpers import StubCatalog
+
 from featuregen.identity.build import build_human_identity, build_service_identity
 from featuregen.overlay.authority import (
     Authority,
@@ -14,25 +16,6 @@ from featuregen.overlay.identity import (
     ColumnPair,
     display_object_ref,
 )
-
-
-class _Cat:
-    """Minimal CatalogAdapter test double keyed on the display object_ref string."""
-
-    def __init__(self, owners: dict[str, str] | None = None) -> None:
-        self._owners = owners or {}
-
-    def owner_of(self, ref: CatalogObjectRef) -> str | None:
-        return self._owners.get(display_object_ref(ref))
-
-    def get_fact(self, ref, fact_type, use_case=None):
-        return None
-
-    def list_objects(self):
-        return []
-
-    def fingerprint(self):
-        return {}
 
 
 @dataclass(frozen=True)
@@ -50,7 +33,7 @@ def _customers() -> CatalogObjectRef:
 
 
 def test_data_fact_resolves_to_data_owner(db):
-    cat = _Cat({display_object_ref(_orders()): "user:alice"})
+    cat = StubCatalog(owners={display_object_ref(_orders()): "user:alice"})
     auth = resolve_authority(db, cat, _orders(), "grain")
     assert auth.role == "data_owner"
     assert auth.gate == "OVERLAY_DATA_OWNER"
@@ -61,7 +44,7 @@ def test_data_fact_resolves_to_data_owner(db):
 
 
 def test_policy_tag_resolves_to_compliance(db):
-    cat = _Cat({display_object_ref(_orders()): "user:alice"})
+    cat = StubCatalog(owners={display_object_ref(_orders()): "user:alice"})
     auth = resolve_authority(db, cat, _orders(), "policy_tag")
     assert auth.role == "compliance"
     assert auth.gate == "OVERLAY_COMPLIANCE"
@@ -71,7 +54,7 @@ def test_policy_tag_resolves_to_compliance(db):
 
 
 def test_unknown_owner_routes_to_governance_not_submitter(db):
-    cat = _Cat({})  # ownership not recorded
+    cat = StubCatalog(owners={})  # ownership not recorded
     auth = resolve_authority(db, cat, _orders(), "availability_time")
     assert auth.governance_queue is True
     assert auth.role == "platform-admin"
@@ -83,7 +66,7 @@ def test_unknown_owner_routes_to_governance_not_submitter(db):
 def test_approved_join_two_distinct_owners_is_dual(db):
     a = _orders()
     b = _customers()
-    cat = _Cat({display_object_ref(a): "user:alice", display_object_ref(b): "user:bob"})
+    cat = StubCatalog(owners={display_object_ref(a): "user:alice", display_object_ref(b): "user:bob"})
     ref = ApprovedJoinRef(a, b, (ColumnPair("customer_id", "id"),), "N:1")
     auth = resolve_authority(db, cat, ref, "approved_join")
     assert auth.dual is True
@@ -99,7 +82,7 @@ def test_approved_join_two_distinct_owners_is_dual(db):
 def test_approved_join_same_owner_both_sides_is_not_dual(db):
     a = _orders()
     b = _customers()
-    cat = _Cat({display_object_ref(a): "user:alice", display_object_ref(b): "user:alice"})
+    cat = StubCatalog(owners={display_object_ref(a): "user:alice", display_object_ref(b): "user:alice"})
     ref = ApprovedJoinRef(a, b, (ColumnPair("customer_id", "id"),), "N:1")
     auth = resolve_authority(db, cat, ref, "approved_join")
     assert auth.dual is False
@@ -111,7 +94,7 @@ def test_approved_join_same_owner_both_sides_is_not_dual(db):
 def test_approved_join_mixed_owner_routes_only_unknown_side_to_governance(db):
     a = _orders()
     b = _customers()
-    cat = _Cat({display_object_ref(a): "user:alice"})  # b's owner unknown
+    cat = StubCatalog(owners={display_object_ref(a): "user:alice"})  # b's owner unknown
     ref = ApprovedJoinRef(a, b, (ColumnPair("customer_id", "id"),), "N:1")
     auth = resolve_authority(db, cat, ref, "approved_join")
     assert auth.governance_queue is True
@@ -129,7 +112,7 @@ def test_approved_join_mixed_owner_routes_only_unknown_side_to_governance(db):
 def test_approved_join_both_unknown_is_still_dual_two_governance_tasks(db):
     a = _orders()
     b = _customers()
-    cat = _Cat({})  # neither owner recorded
+    cat = StubCatalog(owners={})  # neither owner recorded
     ref = ApprovedJoinRef(a, b, (ColumnPair("customer_id", "id"),), "N:1")
     auth = resolve_authority(db, cat, ref, "approved_join")
     assert auth.governance_queue is True
@@ -146,7 +129,7 @@ def test_approved_join_both_unknown_is_still_dual_two_governance_tasks(db):
 
 
 def test_actor_is_authority(db):
-    cat = _Cat({display_object_ref(_orders()): "user:alice"})
+    cat = StubCatalog(owners={display_object_ref(_orders()): "user:alice"})
     alice = build_human_identity(subject="user:alice", role_claims=("data_owner",))
     bob = build_human_identity(subject="user:bob", role_claims=("data_owner",))
 
@@ -162,7 +145,7 @@ def test_actor_is_authority(db):
     assert _actor_is_authority(comp_auth, alice) is False
 
     # governance-queue fact (unknown owner): the platform-admin role is accepted
-    gov_auth = resolve_authority(db, _Cat({}), _orders(), "availability_time")
+    gov_auth = resolve_authority(db, StubCatalog(owners={}), _orders(), "availability_time")
     admin = build_human_identity(subject="user:dan", role_claims=("platform-admin",))
     assert gov_auth.governance_queue is True
     assert _actor_is_authority(gov_auth, admin) is True
@@ -180,7 +163,7 @@ def test_actor_is_authority_approved_join_sides(db):
     # both owners known → each owner is an authority; a bare platform-admin is NOT
     both = resolve_authority(
         db,
-        _Cat({display_object_ref(a): "user:alice", display_object_ref(b): "user:bob"}),
+        StubCatalog(owners={display_object_ref(a): "user:alice", display_object_ref(b): "user:bob"}),
         ref,
         "approved_join",
     )
@@ -189,7 +172,7 @@ def test_actor_is_authority_approved_join_sides(db):
     assert _actor_is_authority(both, admin) is False
 
     # mixed → known owner OR platform-admin (for the governance side) are authorities
-    mixed = resolve_authority(db, _Cat({display_object_ref(a): "user:alice"}), ref, "approved_join")
+    mixed = resolve_authority(db, StubCatalog(owners={display_object_ref(a): "user:alice"}), ref, "approved_join")
     assert _actor_is_authority(mixed, alice) is True
     assert _actor_is_authority(mixed, admin) is True
     assert _actor_is_authority(mixed, bob) is False

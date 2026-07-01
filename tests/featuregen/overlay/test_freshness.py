@@ -2,6 +2,7 @@ from dataclasses import asdict
 from datetime import UTC, datetime, timedelta
 
 from psycopg.rows import dict_row
+from tests.featuregen.overlay._helpers import seed_verified_via_command
 
 from featuregen.identity.build import build_human_identity, build_service_identity
 from featuregen.overlay.authority import resolve_authority
@@ -73,7 +74,20 @@ def _adapter(objs, owners=None):
 def _seed_verified(conn, *, ref, fact_type, value, owner, use_case=None):
     """Append PROPOSED + CONFIRMED for one fact and run the projection so
     overlay_fact_state + overlay_fact_dependency are populated. Returns
-    (fact_key, confirmed_event_id) where confirmed_event_id is the CONFIRMED event id."""
+    (fact_key, confirmed_event_id) where confirmed_event_id is the CONFIRMED event id.
+
+    Grain callers that only inspect the fact stream / projection go through the PUBLIC command path
+    (`seed_verified_via_command`). This DIRECT-seeding path is deliberately kept for callers whose
+    resulting state the command path would perturb: the two `approved_join` seeds (dual-owner /
+    join-ref shape) and the two expiry-timer tests — because the real `confirm_fact` arms an
+    `overlay_expiry` timer idempotency-keyed on `fact_key:confirmed_event_id`, which would make their
+    subsequent `schedule_expiry(..., <past>)` a no-op and leave the timer scheduled, not fired.
+
+    One more direct-seed reason: in `test_drop_referenced_column_stales_grain_availability_and_join_
+    source_side` the grain and availability_time seeds are ALSO kept direct — the command path would
+    suffice for those two alone, but they are co-seeded with an `approved_join` (which MUST be direct,
+    per the join-ref shape above), so keeping all three stale-target seeds on the one path keeps that
+    test cohesive rather than splitting it across the command and direct paths."""
     from featuregen.overlay.store import append_overlay_event
 
     key = fact_key(ref, fact_type, use_case)
@@ -113,7 +127,7 @@ def _seed_verified(conn, *, ref, fact_type, value, owner, use_case=None):
 
 def test_open_reverify_task_opens_data_owner_gate_targeting_confirmed_event(db):
     ref = _table_ref()
-    key, confirmed_id = _seed_verified(
+    key, confirmed_id = seed_verified_via_command(
         db, ref=ref, fact_type="grain", value={"columns": ["customer_id"], "is_unique": True}, owner="user:owner-a"
     )
     # FixtureCatalog API (pin 15): catalog_source ctor + add_object(...) / set_owner(ref, ...)
@@ -434,7 +448,7 @@ def test_rename_yields_new_key_and_stales_old_fact(db):
     cust = _table_ref("customers")
     old_col = _col_ref("region", "customers")
     new_col = _col_ref("region_code", "customers")
-    grain_key, _ = _seed_verified(
+    grain_key, _ = seed_verified_via_command(
         db, ref=cust, fact_type="grain", value={"columns": ["region"], "is_unique": True}, owner="user:owner-a",
     )
     owners = {cust: "user:owner-a"}
@@ -462,7 +476,7 @@ def test_rename_yields_new_key_and_stales_old_fact(db):
 def test_stale_signal_is_noop_when_fact_already_advanced(db):
     cust = _table_ref("customers")
     region = _col_ref("region", "customers")
-    grain_key, confirmed_id = _seed_verified(
+    grain_key, confirmed_id = seed_verified_via_command(
         db, ref=cust, fact_type="grain", value={"columns": ["region"], "is_unique": True}, owner="user:owner-a",
     )
     owners = {cust: "user:owner-a"}

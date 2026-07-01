@@ -16,7 +16,7 @@ _OVERLAY_POLICY_ROWS: tuple[tuple[str, str, str, str, str | None], ...] = (
     ("reject_fact", "", "data_owner", "human", None),
     ("reject_fact", "", "compliance", "human", None),
     # Governance-queue (unknown-owner) confirmations — a platform-admin clears the fallback task
-    # via the PUBLIC execute_command path; the handler still enforces fine-grained authority (pin 13).
+    # via the PUBLIC execute_command path; the handler still enforces fine-grained authority.
     ("confirm_fact", "", "platform-admin", "human", None),
     ("reject_fact", "", "platform-admin", "human", None),
     ("enter_fact", "", "data_owner", "human", None),
@@ -27,7 +27,7 @@ _OVERLAY_POLICY_ROWS: tuple[tuple[str, str, str, str, str | None], ...] = (
 def register_overlay(handler_registry) -> None:
     """Production wiring for the overlay write side: event schemas (so `append_event` validation
     passes) + the (idempotent) overlay command catalog. Expiry is NOT a HandlerRegistry handler —
-    it is the explicit `freshness.fire_due_overlay_expiries` poller (decision 5), so nothing is
+    it is the explicit `freshness.fire_due_overlay_expiries` poller, so nothing is
     registered into `handler_registry` here; it is accepted only for signature symmetry with the
     SP-0 bootstrap. The catalog adapter is injected separately via `register_catalog_adapter(...)`
     from `overlay/catalog.py`."""

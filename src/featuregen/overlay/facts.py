@@ -7,7 +7,7 @@ import jsonschema
 
 class FactValidationError(Exception):
     """Raised by `validate_fact_value` when a fact value fails its per-type schema or the use_case
-    rule (overview pin 9). Overlay-owned — every phase imports THIS, never SP-0's
+    rule. Overlay-owned — every overlay module imports THIS, never SP-0's
     `SchemaValidationError` (which is the event-registry's error)."""
 
 
@@ -78,7 +78,7 @@ FACT_VALUE_SCHEMAS: dict[str, dict] = {
     },
     APPROVED_JOIN: {
         # Reconciled on `column_pairs` (ordered list of {from_col,to_col}) plus the two structured
-        # endpoint refs — NOT flat `from_columns`/`to_columns` (decision 7). This mirrors
+        # endpoint refs — NOT flat `from_columns`/`to_columns`. This mirrors
         # `ApprovedJoinRef` so dependency extraction can index both tables and all paired columns
         # from the value alone, without ever parsing the display "from -> to" string.
         "type": "object",
@@ -120,7 +120,7 @@ FACT_VALUE_SCHEMAS: dict[str, dict] = {
 def validate_fact_value(fact_type: str, value: Mapping, use_case: str | None = None) -> None:
     """Validate a proposed/confirmed value against its per-type schema and enforce the use_case
     rule (§3.3): `use_case` REQUIRED for policy_tag, PROHIBITED for the four data facts. `use_case`
-    is OPTIONAL on the signature (pin 9) — data-fact callers omit it. Raises FactValidationError on
+    is OPTIONAL on the signature — data-fact callers omit it. Raises FactValidationError on
     any violation (caller raises before append)."""
     schema = FACT_VALUE_SCHEMAS.get(fact_type)
     if schema is None:
@@ -176,7 +176,7 @@ OVERLAY_EVENT_SCHEMAS: dict[str, dict] = {
             "proposed_value": {"type": "object"},
             "proposal_fingerprint": _STR,
             "evidence_ref": _NSTR,
-            "proposed_by": _STR,  # the actor subject STRING (pin 11), not an object
+            "proposed_by": _STR,  # the actor subject STRING, not an object
         },
         [
             "catalog_object_ref",

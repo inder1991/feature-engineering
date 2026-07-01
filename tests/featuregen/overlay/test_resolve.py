@@ -2,6 +2,7 @@ from datetime import UTC, datetime
 
 import pytest
 from psycopg.types.json import Json
+from tests.featuregen.overlay._helpers import StubCatalog
 
 from featuregen.contracts import IdentityEnvelope
 from featuregen.overlay import facts
@@ -19,25 +20,6 @@ _REF = CatalogObjectRef(
     table="loans",
     column="origination_ts",
 )
-
-
-class _StubCatalog:
-    """Minimal CatalogAdapter: resolve_fact only ever calls get_fact()."""
-
-    def __init__(self, fact: CatalogFact | None = None):
-        self._fact = fact
-
-    def list_objects(self):
-        return []
-
-    def get_fact(self, ref, fact_type, use_case=None):
-        return self._fact
-
-    def owner_of(self, ref):
-        return None
-
-    def fingerprint(self):
-        return {}
 
 
 def _seed_state(
@@ -87,8 +69,8 @@ def test_authoritative_catalog_beats_overlay(db):
         db, key, status="VERIFIED", value={"column": "origination_ts"},
         confirmed_event_id="evt_overlay",
     )
-    adapter = _StubCatalog(
-        CatalogFact(value={"column": "as_of_date", "basis": "posted_at"}, authoritative=True)
+    adapter = StubCatalog(
+        fact=CatalogFact(value={"column": "as_of_date", "basis": "posted_at"}, authoritative=True)
     )
 
     resolved = resolve_fact(db, adapter, _REF, "availability_time")
@@ -105,7 +87,7 @@ def test_authoritative_catalog_beats_overlay(db):
 def test_malformed_authoritative_catalog_not_served_as_verified(db):
     # A pluggable catalog claims authority but returns a value that violates the
     # availability_time schema (missing required "basis"). It must NOT be served as VERIFIED.
-    adapter = _StubCatalog(CatalogFact(value={"bogus": "x"}, authoritative=True))
+    adapter = StubCatalog(fact=CatalogFact(value={"bogus": "x"}, authoritative=True))
 
     resolved = resolve_fact(db, adapter, _REF, "availability_time")
 
@@ -122,7 +104,7 @@ def test_malformed_authoritative_catalog_does_not_fall_through_to_overlay(db):
         db, key, status="VERIFIED", value={"column": "origination_ts", "basis": "posted_at"},
         confirmed_event_id="evt_overlay_stale",
     )
-    adapter = _StubCatalog(CatalogFact(value={"bogus": "x"}, authoritative=True))
+    adapter = StubCatalog(fact=CatalogFact(value={"bogus": "x"}, authoritative=True))
 
     resolved = resolve_fact(db, adapter, _REF, "availability_time")
 
@@ -133,7 +115,7 @@ def test_malformed_authoritative_catalog_does_not_fall_through_to_overlay(db):
 
 
 def test_missing_is_fail_closed_with_reason(db):
-    adapter = _StubCatalog(None)  # catalog has no ML fact, no overlay row seeded
+    adapter = StubCatalog()  # catalog has no ML fact, no overlay row seeded
 
     resolved = resolve_fact(db, adapter, _REF, "availability_time")
 
@@ -150,7 +132,7 @@ def test_non_verified_overlay_blocks(db, status):
     key = fact_key(_REF, "availability_time")
     # Even with a value present on the row, a non-VERIFIED status must not be served.
     _seed_state(db, key, status=status, value={"column": "origination_ts"})
-    adapter = _StubCatalog(None)
+    adapter = StubCatalog()
 
     resolved = resolve_fact(db, adapter, _REF, "availability_time")
 
@@ -170,7 +152,7 @@ def test_overlay_verified_fill(db):
         confirmers=[{"subject": "u_owner", "role": "data_owner"}],
         confirmed_at=confirmed, expires_at=expires, confirmed_event_id="evt_conf1",
     )
-    adapter = _StubCatalog(None)  # no authoritative catalog fact -> overlay fills
+    adapter = StubCatalog()  # no authoritative catalog fact -> overlay fills
 
     resolved = resolve_fact(db, adapter, _REF, "availability_time")
 
@@ -192,7 +174,7 @@ def test_non_authoritative_catalog_uses_overlay(db):
         confirmed_event_id="evt_conf2",
     )
     # An ML fact: information_schema/catalog is NOT authoritative -> overlay must be used.
-    adapter = _StubCatalog(CatalogFact(value={"column": "as_of_date"}, authoritative=False))
+    adapter = StubCatalog(fact=CatalogFact(value={"column": "as_of_date"}, authoritative=False))
 
     resolved = resolve_fact(db, adapter, _REF, "availability_time")
 
@@ -209,7 +191,7 @@ def test_reverify_and_stale_return_prior_value(db, status):
         db, key, status=status, value=None,
         prior_value={"column": "origination_ts"}, confirmed_event_id="evt_prior",
     )
-    adapter = _StubCatalog(None)
+    adapter = StubCatalog()
 
     resolved = resolve_fact(db, adapter, _REF, "availability_time")
 
@@ -252,7 +234,7 @@ def test_fresh_draft_reports_draft_not_missing(db):
     _propose_draft(db)
     run_projection(db, OverlayProjection())
 
-    resolved = resolve_fact(db, _StubCatalog(None), _REF, "availability_time")
+    resolved = resolve_fact(db, StubCatalog(), _REF, "availability_time")
 
     assert resolved.status == "DRAFT"
     assert resolved.source == "overlay"
@@ -269,7 +251,7 @@ def test_fresh_partially_confirmed_reports_partial_not_missing(db):
     )
     run_projection(db, OverlayProjection())
 
-    resolved = resolve_fact(db, _StubCatalog(None), _REF, "availability_time")
+    resolved = resolve_fact(db, StubCatalog(), _REF, "availability_time")
 
     assert resolved.status == "PARTIALLY_CONFIRMED"
     assert resolved.value is None
@@ -284,7 +266,7 @@ def test_fresh_rejected_reports_rejected_not_missing(db):
     )
     run_projection(db, OverlayProjection())
 
-    resolved = resolve_fact(db, _StubCatalog(None), _REF, "availability_time")
+    resolved = resolve_fact(db, StubCatalog(), _REF, "availability_time")
 
     assert resolved.status == "REJECTED"
     assert resolved.value is None

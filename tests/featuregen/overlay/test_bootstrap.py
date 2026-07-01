@@ -31,7 +31,7 @@ def _wire(db, catalog):
     seed_authz_policy(db)
     seed_overlay_authz(db)
     register_command_authorizer(PolicyAuthorizer())
-    from tests.featuregen.overlay.conftest import StubCatalog  # type: ignore
+    from tests.featuregen.overlay._helpers import StubCatalog
 
     cat = StubCatalog()
     cat.set_owner(_orders(), "user:alice")

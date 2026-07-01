@@ -19,7 +19,7 @@ def _dependencies(object_ref: str, fact_type: str, value: Mapping) -> set[str]:
     object-keyed facts: the keyed object plus grain.columns / availability_time.column /
     scd valid_from+valid_to. For an approved_join the keyed `object_ref` is the synthetic
     "from -> to" relation display string, which must NEVER be parsed; instead read the STRUCTURED
-    value (decision 7) — `value['from_ref']`, `value['to_ref']`, and each `value['column_pairs']`
+    value — `value['from_ref']`, `value['to_ref']`, and each `value['column_pairs']`
     pair — and index BOTH tables and ALL paired columns on both sides. A drop/rename/type-change to
     ANY of these stales the dependent fact."""
     if fact_type == facts.APPROVED_JOIN:
@@ -91,7 +91,7 @@ class OverlayProjection:
                     payload.get("use_case"), payload.get("evidence_ref"), seq,
                 ),
             )
-            # Refresh the dependency set on every (re)proposal (pin 18): DELETE the fact's existing
+            # Refresh the dependency set on every (re)proposal: DELETE the fact's existing
             # rows first so a re-proposal after REJECTED — which may reference DIFFERENT columns —
             # never leaves stale dependency rows behind. Then insert the fresh set.
             conn.execute(
@@ -149,7 +149,7 @@ class OverlayProjection:
                 (event.event_id, seq, fk, seq),
             )
             # Re-derive the dependency set from the AUTHORITATIVE (confirmed) value, not the
-            # proposal: a human override (pin 17) can change the referenced columns away from the
+            # proposal: a human override can change the referenced columns away from the
             # proposed set, so the index must follow the confirmed value or catalog-change detection
             # watches the wrong columns. Idempotent for no-override/approved_join (reproduces the
             # PROPOSED set) and self-heals re-verify (EXPIRED/STALED carry no new PROPOSED).
@@ -181,7 +181,7 @@ class OverlayProjection:
             # Carry the just-retired VERIFIED value into the in-flight proposal row (now read from
             # overlay_fact_state.prior_value, set above) and bind target_event_id to the confirmed
             # event being re-verified so the re-verify task / get_task_proposal can show prior_value
-            # and CAS the re-confirm (P2 finding 7).
+            # and CAS the re-confirm.
             conn.execute(
                 "UPDATE overlay_proposal p SET status = 'REVERIFY', prior_value = s.prior_value, "
                 "target_event_id = %s, updated_seq = %s "

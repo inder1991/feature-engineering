@@ -12,6 +12,7 @@ from dataclasses import asdict
 
 import psycopg
 import pytest
+from tests.featuregen.overlay._helpers import StubCatalog, catalog_columns
 
 from featuregen.authz.authorizer import PolicyAuthorizer
 from featuregen.authz.policy import seed_authz_policy
@@ -24,7 +25,6 @@ from featuregen.contracts import Command
 from featuregen.identity.build import build_service_identity
 from featuregen.overlay.bootstrap import register_overlay, seed_overlay_authz
 from featuregen.overlay.catalog import (
-    CatalogObject,
     _clear_catalog_adapter,
     register_catalog_adapter,
 )
@@ -49,41 +49,6 @@ def _reset_process_globals():
     finally:
         _clear_catalog_adapter()
         register_command_authorizer(saved_authorizer)
-
-
-class _Catalog:
-    """Minimal in-test CatalogAdapter (Protocol impl); owners keyed on (schema, table)."""
-
-    def __init__(self, objects, owners):
-        self._objects = list(objects)
-        self._owners = dict(owners)
-
-    def list_objects(self):
-        return list(self._objects)
-
-    def get_fact(self, ref, fact_type, use_case=None):
-        return None
-
-    def owner_of(self, ref):
-        return self._owners.get((ref.schema, ref.table))
-
-    def fingerprint(self):
-        return {o.object_ref: o for o in self._objects}
-
-
-def _columns(ref, specs):
-    return [
-        CatalogObject(
-            object_ref=f"{ref.schema}.{ref.table}.{name}",
-            object_kind="column",
-            schema=ref.schema,
-            table=ref.table,
-            column=name,
-            data_type=dt,
-            native_oid=None,
-        )
-        for name, dt in specs
-    ]
 
 
 def _service_actor():
@@ -137,7 +102,7 @@ def test_run_profiler_off_allowlist_schema_denied_and_audited(db):
     ref = CatalogObjectRef(
         catalog_source="pg:core", object_kind="table", schema="restricted", table="secrets"
     )
-    adapter = _Catalog(_columns(ref, [("id", "integer")]), owners={})
+    adapter = StubCatalog(objects=catalog_columns(ref, [("id", "integer")]), owners={})
     _setup_overlay(db, adapter)
 
     result = execute_command(db, _run_profiler_cmd(ref))  # must NOT raise
@@ -178,8 +143,8 @@ def test_profiler_scan_runs_read_only(db, monkeypatch):
     ref = CatalogObjectRef(
         catalog_source="pg:core", object_kind="table", schema="public", table="prof_run_ro"
     )
-    adapter = _Catalog(
-        _columns(ref, [("account_id", "integer")]),
+    adapter = StubCatalog(
+        objects=catalog_columns(ref, [("account_id", "integer")]),
         owners={("public", "prof_run_ro"): "user:owner-ro"},
     )
     _setup_overlay(db, adapter)
@@ -196,8 +161,8 @@ def test_run_profiler_proposes_new_drafts(db):
     ref = CatalogObjectRef(
         catalog_source="pg:core", object_kind="table", schema="public", table="prof_run_a"
     )
-    adapter = _Catalog(
-        _columns(ref, [("account_id", "integer"), ("region", "text")]),
+    adapter = StubCatalog(
+        objects=catalog_columns(ref, [("account_id", "integer"), ("region", "text")]),
         owners={("public", "prof_run_a"): "user:owner-a"},
     )
     _setup_overlay(db, adapter)
@@ -218,8 +183,8 @@ def test_run_profiler_skips_rejected_fingerprint_even_with_fresh_evidence(db):
     ref = CatalogObjectRef(
         catalog_source="pg:core", object_kind="table", schema="public", table="prof_run_b"
     )
-    adapter = _Catalog(
-        _columns(ref, [("account_id", "integer")]),
+    adapter = StubCatalog(
+        objects=catalog_columns(ref, [("account_id", "integer")]),
         owners={("public", "prof_run_b"): "user:owner-b"},
     )
     _setup_overlay(db, adapter)
@@ -288,15 +253,15 @@ def test_run_profiler_no_orphan_evidence_when_fact_created_concurrently(db, monk
     sees the seeded DRAFT and denies. No evidence row may be left behind: propose_fact now owns the
     evidence INSERT and performs it only AFTER the replacement-semantics gates pass, so a denied
     proposal writes NOTHING. Pre-fix the profiler pre-wrote evidence before proposing -> orphan."""
-    import featuregen.overlay.commands as overlay_commands
+    import featuregen.overlay.profiler_command as profiler_command
 
     db.execute("CREATE TABLE prof_run_c (account_id integer)")
     db.execute("INSERT INTO prof_run_c SELECT g FROM generate_series(1, 30) AS g")
     ref = CatalogObjectRef(
         catalog_source="pg:core", object_kind="table", schema="public", table="prof_run_c"
     )
-    adapter = _Catalog(
-        _columns(ref, [("account_id", "integer")]),
+    adapter = StubCatalog(
+        objects=catalog_columns(ref, [("account_id", "integer")]),
         owners={("public", "prof_run_c"): "user:owner-c"},
     )
     _setup_overlay(db, adapter)
@@ -326,7 +291,7 @@ def test_run_profiler_no_orphan_evidence_when_fact_created_concurrently(db, monk
     # Model the READ COMMITTED race: the profiler's preflight ran on an EARLIER snapshot that did not
     # yet see the concurrent commit, so it returns (None, None) for grain_key the first time and
     # lets the candidate past the skip gates into propose_fact.
-    real_fp = overlay_commands._existing_proposal_fingerprint
+    real_fp = profiler_command._existing_proposal_fingerprint
     seen = {"grain_first": True}
 
     def stale_preflight(conn, fk):
@@ -335,7 +300,7 @@ def test_run_profiler_no_orphan_evidence_when_fact_created_concurrently(db, monk
             return (None, None)
         return real_fp(conn, fk)
 
-    monkeypatch.setattr(overlay_commands, "_existing_proposal_fingerprint", stale_preflight)
+    monkeypatch.setattr(profiler_command, "_existing_proposal_fingerprint", stale_preflight)
 
     result = execute_command(db, _run_profiler_cmd(ref))
     assert result.accepted is True

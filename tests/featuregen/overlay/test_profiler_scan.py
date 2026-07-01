@@ -1,48 +1,13 @@
 from datetime import datetime
 
-from featuregen.overlay.catalog import CatalogObject
+from tests.featuregen.overlay._helpers import StubCatalog, catalog_columns
+
 from featuregen.overlay.identity import CatalogObjectRef
 from featuregen.overlay.profiler import (
     PROFILE_VERSION,
     ProfilerLimits,
     run_profiler_scan,
 )
-
-
-class _Catalog:
-    """Minimal in-test CatalogAdapter (Protocol impl). Production uses Phase 3's
-    FixtureCatalog/PostgresCatalog; this double keeps Phase 6 decoupled from their constructors."""
-
-    def __init__(self, objects, owners=None):
-        self._objects = list(objects)
-        self._owners = dict(owners or {})
-
-    def list_objects(self):
-        return list(self._objects)
-
-    def get_fact(self, ref, fact_type, use_case=None):
-        return None
-
-    def owner_of(self, ref):
-        return self._owners.get((ref.schema, ref.table))
-
-    def fingerprint(self):
-        return {o.object_ref: o for o in self._objects}
-
-
-def _columns(ref, specs):
-    return [
-        CatalogObject(
-            object_ref=f"{ref.schema}.{ref.table}.{name}",
-            object_kind="column",
-            schema=ref.schema,
-            table=ref.table,
-            column=name,
-            data_type=data_type,
-            native_oid=None,
-        )
-        for name, data_type in specs
-    ]
 
 
 def _ref(table):
@@ -61,8 +26,8 @@ def test_scan_proposes_grain_for_unique_column(db):
         "SELECT g, 'eu', now() FROM generate_series(1, 40) AS g"
     )
     ref = _ref("prof_accounts")
-    adapter = _Catalog(
-        _columns(
+    adapter = StubCatalog(
+        objects=catalog_columns(
             ref,
             [("account_id", "integer"), ("region", "text"), ("posted_at", "timestamp with time zone")],
         )
@@ -93,8 +58,8 @@ def test_scan_detects_availability_time_candidate(db):
         "SELECT g, now() - (g || ' hours')::interval, 'x' FROM generate_series(1, 12) AS g"
     )
     ref = _ref("prof_txns")
-    adapter = _Catalog(
-        _columns(
+    adapter = StubCatalog(
+        objects=catalog_columns(
             ref,
             [("txn_id", "integer"), ("posted_at", "timestamp with time zone"), ("note", "text")],
         )

@@ -4,8 +4,8 @@ The engine/profiler *proposes*; a **human** authority *confirms*. This module an
 questions for the command handlers:
 
 * WHO may confirm a given fact — `resolve_authority(...)` maps a fact to its `Authority`
-  (data owner / Compliance / governance queue), resolved **per side** for `approved_join`
-  (decision 7); `_actor_is_authority(...)` then checks a concrete actor against it
+  (data owner / Compliance / governance queue), resolved **per side** for `approved_join`;
+  `_actor_is_authority(...)` then checks a concrete actor against it
   (accepting the `platform-admin` role for governance-queue tasks).
 * Four-eyes — `proposer_ne_confirmer(...)` blocks a confirmer who is the recorded proposer.
 
@@ -20,6 +20,7 @@ from dataclasses import dataclass
 
 from featuregen.contracts.db import DbConn
 from featuregen.contracts.identity import IdentityEnvelope
+from featuregen.overlay._types import EligibleAssignee, FactType, Gate, JoinSide, Role
 from featuregen.overlay.catalog import CatalogAdapter
 from featuregen.overlay.identity import ApprovedJoinRef, CatalogObjectRef
 
@@ -36,8 +37,8 @@ class Authority:
     sides do not share a single owner (two known owners, one known + one governance side, OR
     even both-unknown → two distinct governance approvals; §6.4)."""
 
-    role: str
-    gate: str
+    role: Role
+    gate: Gate
     subjects: tuple[str | None, ...]
     governance_queue: bool
     dual: bool = False
@@ -52,19 +53,18 @@ class Authority:
         return a
 
     @property
-    def task_assignees(self) -> tuple[dict[str, str], ...]:
+    def task_assignees(self) -> tuple[EligibleAssignee, ...]:
         """Per-side task plan — one assignee mapping per required confirmation, **side-labelled**.
 
         A known side → `{"role": "data_owner", "subject": <owner>, "side": <from|to>}`; an unknown
         side → `{"role": "platform-admin", "side": <from|to>}` (governance). The known owner is
-        NEVER folded onto the governance side (decision 7). The two sides are **never collapsed** —
+        NEVER folded onto the governance side. The two sides are **never collapsed** —
         even a both-unknown join opens TWO side-labelled governance tasks, so two distinct approvals
-        are required (finding 3). The ONLY single-task case is same-owner-both-sides.
+        are required. The ONLY single-task case is same-owner-both-sides.
 
         This single per-side plan is the authoritative source used by BOTH the initial proposal
-        (Task 4.2 opens one task per entry) AND Phase 7's `open_reverify_task` (which reopens one
-        re-verify task per entry, decision 19) — so proposal and re-verify always target the same
-        per-side assignees."""
+        (one task per entry) AND `open_reverify_task` (which reopens one re-verify task per entry) —
+        so proposal and re-verify always target the same per-side assignees."""
         if self.role == "compliance":
             return ({"role": "compliance"},)
         if len(self.subjects) == 2:  # approved_join: one task PER SIDE
@@ -72,8 +72,12 @@ class Authority:
             if from_owner is not None and from_owner == to_owner:
                 # same principal owns BOTH sides — a single task (the only collapse case)
                 return ({"role": "data_owner", "subject": from_owner},)
-            plans: list[dict[str, str]] = []
-            for side, owner in (("from", from_owner), ("to", to_owner)):
+            plans: list[EligibleAssignee] = []
+            sides: tuple[tuple[JoinSide, str | None], ...] = (
+                ("from", from_owner),
+                ("to", to_owner),
+            )
+            for side, owner in sides:
                 if owner:
                     plans.append({"role": "data_owner", "subject": owner, "side": side})
                 else:
@@ -89,7 +93,7 @@ def resolve_authority(
     conn: DbConn,
     adapter: CatalogAdapter,
     ref: CatalogObjectRef | ApprovedJoinRef,
-    fact_type: str,
+    fact_type: FactType,
 ) -> Authority:
     # conn is part of the stable contract (owner overrides / governance config may be stored
     # in future); today authority is derived purely from the catalog adapter.
@@ -108,9 +112,9 @@ def resolve_authority(
         to_owner = adapter.owner_of(ref.to_ref)
         unknown = from_owner is None or to_owner is None
         # One distinct confirmation per resolved side; an unknown side resolves to the governance
-        # (platform-admin) queue, NEVER to the other known owner (decision 7). A join needs TWO
+        # (platform-admin) queue, NEVER to the other known owner. A join needs TWO
         # distinct confirmations unless ONE principal owns BOTH sides — so both-unknown is still
-        # dual (two distinct governance approvals), preserving two-party accountability (finding 3).
+        # dual (two distinct governance approvals), preserving two-party accountability.
         same_owner = from_owner is not None and from_owner == to_owner
         return Authority(
             role=("data_owner" if (from_owner or to_owner) else "platform-admin"),
@@ -155,7 +159,7 @@ def _actor_is_authority(authority: Authority, actor: IdentityEnvelope) -> bool:
 
 def proposer_ne_confirmer(stream: Sequence, actor: IdentityEnvelope) -> bool:
     """Four-eyes SoD predicate (§6.5): True when the confirmer differs from the recorded
-    proposer. `proposed_by` is a string subject (pin 11); a service/profiler proposal is
+    proposer. `proposed_by` is a string subject; a service/profiler proposal is
     trivially distinct from a human confirmer."""
     for e in reversed(list(stream)):
         if e.type == "OVERLAY_FACT_PROPOSED":

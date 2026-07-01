@@ -1,33 +1,12 @@
 import pytest
+from tests.featuregen.overlay._helpers import StubCatalog
 
 from featuregen.events.registry import event_registry
 from featuregen.overlay.catalog import _clear_catalog_adapter, register_catalog_adapter
 from featuregen.overlay.commands import register_overlay_commands
 from featuregen.overlay.facts import register_overlay_event_types
-from featuregen.overlay.identity import display_object_ref
 
-
-class StubCatalog:
-    """In-memory CatalogAdapter test double (stands in for Phase 3's FixtureCatalog so Phase 4
-    is independent of its constructor). Owners are keyed on the display object_ref string."""
-
-    def __init__(self) -> None:
-        self.owners: dict[str, str] = {}
-
-    def set_owner(self, ref, subject: str) -> None:
-        self.owners[display_object_ref(ref)] = subject
-
-    def owner_of(self, ref):
-        return self.owners.get(display_object_ref(ref))
-
-    def get_fact(self, ref, fact_type, use_case=None):
-        return None
-
-    def list_objects(self):
-        return []
-
-    def fingerprint(self):
-        return {}
+__all__ = ["StubCatalog"]
 
 
 @pytest.fixture(autouse=True)
@@ -58,24 +37,38 @@ def catalog():
         _clear_catalog_adapter()
 
 
+def _append_seam_modules():
+    """The overlay handler modules that each import `append_overlay_event` from the store. The append
+    seam now lives on the OWNING module (CQ9): propose_fact -> proposal_commands, confirm/reject/enter
+    -> confirmation_commands, approved_join -> join_confirmation. Patching the name on every one of
+    them intercepts an append regardless of which command a test drives."""
+    from featuregen.overlay import (
+        confirmation_commands,
+        join_confirmation,
+        proposal_commands,
+    )
+
+    return (proposal_commands, confirmation_commands, join_confirmation)
+
+
 @pytest.fixture
 def occ_spy(monkeypatch):
     """Record (type -> expected_version) for every overlay command append (C2/I4 OCC pinning).
 
-    Patches the module-global `append_overlay_event` the command handlers call, so the spy sees
-    exactly the `expected_version` each handler passes (None means the append was NOT version-pinned
-    and `append()` would silently recompute the live head — the lost-update defect). The returned
-    dict maps each event type to the LAST `expected_version` observed for it."""
-    import featuregen.overlay.commands as m
-
-    real = m.append_overlay_event
+    Patches each handler module's `append_overlay_event`, so the spy sees exactly the
+    `expected_version` each handler passes (None means the append was NOT version-pinned and
+    `append()` would silently recompute the live head — the lost-update defect). The returned dict
+    maps each event type to the LAST `expected_version` observed for it."""
+    modules = _append_seam_modules()
+    real = modules[0].append_overlay_event  # the same store function in every module
     seen: dict[str, int | None] = {}
 
     def spy(conn, **kw):
         seen[kw.get("type")] = kw.get("expected_version")
         return real(conn, **kw)
 
-    monkeypatch.setattr(m, "append_overlay_event", spy)
+    for m in modules:
+        monkeypatch.setattr(m, "append_overlay_event", spy)
     return seen
 
 
@@ -87,9 +80,8 @@ def inject_concurrent_append(monkeypatch):
     event of the SAME type at the LIVE head (`expected_version=None`). A correctly version-pinned
     handler append then collides with `ConcurrencyError`; the buggy unpinned append would silently
     land one stream_version higher (the lost-update / double-confirm / stranded-join defect)."""
-    import featuregen.overlay.commands as m
-
-    real = m.append_overlay_event
+    modules = _append_seam_modules()
+    real = modules[0].append_overlay_event  # the same store function in every module
 
     def install(target_type: str):
         state = {"fired": False}
@@ -106,6 +98,7 @@ def inject_concurrent_append(monkeypatch):
                 )  # out-of-band concurrent winner at the live head
             return real(conn, **kw)
 
-        monkeypatch.setattr(m, "append_overlay_event", patched)
+        for m in modules:
+            monkeypatch.setattr(m, "append_overlay_event", patched)
 
     return install
