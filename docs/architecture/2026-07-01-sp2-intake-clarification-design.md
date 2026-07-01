@@ -949,27 +949,42 @@ class LLMRequest:
     prompt_id: str                  # versioned, registered prompt template id
     prompt_version: int
     inputs: dict                    # redacted intent text + catalog METADATA only — NO data values (§9.4)
-    output_schema_id: str           # the JSON schema the result MUST satisfy
+    output_schema_id: str           # the versioned, registered JSON schema the result MUST satisfy (no-PHI rule below)
     output_schema_version: int
+    generation_settings: dict       # provider/model + adaptive-thinking/effort/max_tokens etc. — pinned; part of the idempotency key (§9.3)
 
 @dataclass(frozen=True)
 class LLMResult:
     output: dict                    # parsed, schema-valid structured output (or the call FAILED, §9.2)
     self_reported_scores: dict      # per-field ambiguity/confidence the model reports (input to §6.1)
     call_ref: str                   # llm_call_ref → the event-sourced record (§9.3)
-    status: str                     # "ok" | "repaired" | "failed_into_clarification"
+    status: str                     # "ok" | "repaired" | "retried" | "failed_into_clarification" (§9.2)
 ```
 
 Every LLM interaction in SP-2 is **structured input → schema-validated structured output**. There is no
 free-text path into the contract: the model fills a schema, the platform validates it, and only validated
 structure enters a document.
 
-### 9.2 Structured-output contract → bounded repair → fail into clarification (no silent bad structure)
+**Output-schema constraint — no PHI/PII in the schema itself (Anthropic structured-output requirement).** The
+`output_schema` is a **registered, versioned, static artifact** (identified by `output_schema_id` /
+`output_schema_version`, §2.1 #2, §4) that the provider **server-side compiles and caches across calls** —
+unlike the per-request redacted `inputs`. Its **property names, `enum` values, `const`s, and `description`s
+must therefore carry no PHI/PII** — only structural / vocabulary metadata. This mirrors the §9.4 no-PII
+boundary for the *schema* dimension: `inputs` is redacted per call, but a schema that embedded a customer
+value in an enum or description would leak it into a cross-call, cached artifact. Enforcement is at schema
+authoring + registration (the registered §4 schemas are structural-only); because the schema is referenced by
+id/version (never authored per call) no per-call value can enter it, and the egress guard (§9.4) scans the
+resolved outbound body so a schema that smuggled a data value is still caught.
+
+### 9.2 Provider-failure taxonomy → bounded repair / bounded retry / fail-closed (no silent bad structure)
+
+Every provider outcome maps to **exactly one deterministic, fail-closed disposition** — no outcome is silently
+swallowed, guessed at, or executed on. The malformed-structure path is the common case:
 
 ```
 call model with output_schema (structured output; §9.5 real-adapter mechanics)
   ├─ output parses AND validates against output_schema  → status = ok
-  ├─ invalid / unparseable / refusal                    → REPAIR (bounded)
+  ├─ invalid / unparseable / schema-invalid structure   → REPAIR (bounded)
   │      re-prompt with the validation error, up to N attempts (default N = 2, config-gated)
   │      ├─ a repair validates  → status = repaired
   │      └─ repairs exhausted    → FAIL INTO CLARIFICATION / MANUAL PATH
@@ -978,11 +993,23 @@ call model with output_schema (structured output; §9.5 real-adapter mechanics)
   └─ NEVER: silently accept a malformed structure, guess the field, or execute on it
 ```
 
-This is the fail-closed core: **an invalid structure is a doubt, not a value.** On exhaustion the flow does
-not error out or fabricate — it degrades to the **human clarification path** the platform already has (§6.5),
-which is safe by construction. The default repair budget is **2** attempts; *(the number was a reasonable
-call, §16)*. A **refusal** (the model declining) is treated exactly like an invalid structure — routed to
-repair, then to clarification — never silently accepted (§9.5).
+**The full taxonomy** — each disposition is fail-closed; nothing proceeds on an unresolved outcome:
+
+| Provider outcome | Class | Disposition |
+|---|---|---|
+| Parses + validates against `output_schema` | success | `status = ok` |
+| Invalid / unparseable / schema-invalid JSON | malformed structure | **bounded repair** (re-prompt w/ error, N = 2); exhausted → **fail into clarification** |
+| **Refusal** (`stop_reason == "refusal"`) | policy decline | **fail into clarification / manual** — *not* repair. A decline is a policy signal, not a malformed structure; re-prompting it does not help and is never treated as acceptance (§9.5). |
+| **Max-token truncation** (`stop_reason == "max_tokens"`) | truncated output | **bounded retry** (raise `max_tokens` / stream); still truncated after the retry budget → fail into clarification |
+| **Schema-too-complex** / **schema-compilation timeout** | schema fault | **bounded retry** (compilation is server-cached ~24h, so a transient compile timeout may clear); persists → **fail into manual** — the schema must be simplified (a deterministic config fault, not a run-time doubt) |
+| **Provider timeout** / **rate-limit (429)** / **transient 5xx** (≥500 / overloaded) | transient infra | **bounded retry with backoff** (the SDK auto-retries 408/409/429/5xx); budget exhausted → fail into clarification |
+| **Non-retryable policy / 4xx** (auth, invalid request, non-retryable content policy) | non-retryable | **fail into clarification / manual**; auth / permission failures are additionally **security-audited**. Never silently swallowed, never retried blindly. |
+
+This is the fail-closed core: **an invalid structure is a doubt, not a value**, and every transient / infra
+failure either clears within a bounded budget or degrades to the **human clarification path** the platform
+already has (§6.5), which is safe by construction. The default repair budget is **2** attempts and the retry
+budgets are config-gated *(the numbers were a reasonable call, §16)*. Bounded retries reuse SP-0's durable-
+runtime **bounded-retry primitive with hard loop limits** (SP-0 §5), so no retry class can loop unboundedly.
 
 ### 9.3 Every call is event-sourced (the `llm_call` record + `LLM_CALL_RECORDED` event)
 
@@ -993,17 +1020,26 @@ reproducible provenance of the call** (Decision D5):
 ```
 { llm_call_ref, run_id, task, provider, model, prompt_id, prompt_version,
   output_schema_id, output_schema_version,
+  generation_settings,      // adaptive-thinking / effort / max_tokens etc. — pinned; part of the idempotency key (below)
   redaction_version,        // which IntentRedactor policy produced the LLM-safe text (§9.4)
-  input_hash,               // sha256 of the exact redacted (LLM-safe) input — dedup/idempotency component (§12)
+  input_hash,               // sha256 of the exact redacted (LLM-safe) input — dedup component of the key (below, §12)
   redacted_input,           // the STORED redacted (LLM-safe) input itself — NOT hash-only (retention note below)
   input_redaction,          // what was scrubbed, so a reviewer knows the boundary held (§9.4)
   raw_output,               // the model's structured output as returned
-  validation_result,        // ok | invalid(reasons) | refusal
-  repair_attempts,          // each attempt's error + re-prompt
+  validation_result,        // ok | invalid(reasons) | refusal | truncated | schema_fault | transient(retried) | non_retryable (§9.2)
+  repair_attempts,          // each repair re-prompt; bounded retries (class + backoff) recorded alongside (§9.2)
   latency_ms, cost_metadata,
   created_at, created_by }  // service:intake-agent (attested, SP-0 §6.1)
 ```
 
+- **Idempotency key — the full call identity.** A retried call reuses its record **only** when *every*
+  identity component matches: **`(run_id, task, input_hash, provider, model, prompt_id, prompt_version,
+  output_schema_id, output_schema_version, redaction_version, generation_settings)`**. The narrow
+  `(run_id, task, input_hash, prompt_version)` key is **insufficient** — a changed provider, model, output
+  schema, prompt id, redaction policy, or generation setting would otherwise **silently reuse a stale call's
+  output** even though the model would now answer differently. Widening the key to the full identity forces a
+  fresh call whenever anything that could change the answer changes, while still deduplicating a truly
+  identical retry (no double-charge, §12).
 - **Retention — stored-redacted, not hash-only.** The record stores the **redacted (LLM-safe) input itself**
   (`redacted_input`), not merely its `input_hash`. Hash-only retention would make the call **non-reproducible**
   — a hash can be neither replayed nor reviewed — so MRM / a regulator could not reconstruct the exact prompt
@@ -1071,9 +1107,15 @@ egress** — enforced at **three points**:
   implements `LLMClient` over the Anthropic SDK: default model **`claude-opus-4-8`**, **adaptive thinking**
   (`thinking={"type": "adaptive"}`), and **structured outputs** via
   `output_config={"format": {"type": "json_schema", "schema": <output_schema>}}` (equivalently
-  `messages.parse()` against the schema) so the model's response is schema-constrained at the source. It
-  **must handle `stop_reason == "refusal"`** by routing to the repair/clarification path (§9.2) — never
-  accepting empty/partial content as a value. The adapter carries **no production fallback to `FakeLLM`**: if
+  `messages.parse()` against the schema) so the model's response is schema-constrained at the source. These
+  **generation settings (model, thinking/effort, `max_tokens`) are pinned and recorded** as part of the call
+  identity / idempotency key (§9.3). It maps each provider outcome to its §9.2 disposition:
+  **`stop_reason == "refusal"` → fail into clarification** (a policy decline, *not* repair — never accepting
+  empty/partial content as a value); **`stop_reason == "max_tokens"` (truncation) → bounded retry**;
+  **provider timeout / rate-limit (429) / transient 5xx → bounded retry with backoff**; **non-retryable 4xx →
+  fail closed** (auth failures security-audited). The `output_schema` it sends carries **no PHI/PII in property
+  names, enums, or descriptions** (§9.1 constraint — the schema is server-compiled and cached across calls).
+  The adapter carries **no production fallback to `FakeLLM`**: if
   it is enabled and unavailable, the platform **fails closed into the clarification/manual path**, it does not
   silently swap in the fake (Decision D5, "no silent production fallback"). No PII/data ever leaves via the
   adapter (§9.4).
@@ -1215,8 +1257,11 @@ SP-2 does not build (§14).
   signal against a stale Gate #1 task,** are rejected by CAS on `task_version` (SP-0 §5.5, §8.6) — a confirm can
   never race a re-normalization.
 - **Idempotency** — `submit_intent` is idempotent per request; clarification answers idempotent by
-  `(task_id, subject)` (SP-0 §7); `LLMClient.call` records are keyed by `(run_id, task, input_hash,
-  prompt_version)` so a retried identical call reuses its record rather than double-charging.
+  `(task_id, subject)` (SP-0 §7); `LLMClient.call` records are keyed by the **full call identity**
+  `(run_id, task, input_hash, provider, model, prompt_id, prompt_version, output_schema_id,
+  output_schema_version, redaction_version, generation_settings)` (§9.3) so a retried *identical* call reuses
+  its record (no double-charge) while any provider / model / prompt / schema / redaction / settings change
+  forces a fresh call rather than silently reusing a stale one.
 - **Multi-candidate races** (hypothesis mode) — candidate documents are independent DAG writes; the Gate #1
   choice is a single **`PRIMARY_SELECTED`** promotion on the **run** aggregate (§7.1), so the run-stream **OCC**
   (above) serializes two concurrent promotions — only one wins; the losers stay **untouched** candidate-role
@@ -1324,10 +1369,13 @@ adapter is exercised only in an **opt-in, config-gated smoke test** never gated 
   recorded) and can **never** be CONFIRMED; a **`sensitive_proxy_hints` match** routes to clarification /
   compliance review, **not** an auto-block; Gate #1 never "approves compliance."
 - **Auditable-LLM surface:** every call writes an `llm_call` record + `LLM_CALL_RECORDED` event with provider /
-  model / prompt+schema version / input-hash / output / validation-result / repair-attempts / latency-cost;
-  **invalid output → bounded repair → (repaired) or fail into clarification** (never silent-accept, never
-  execute); a **refusal** is treated as invalid (repair → clarification), never accepted; **repair budget
-  exhausted → clarification task** raised; the record store is **immutable, sensitive, read-controlled**.
+  model / generation-settings / prompt+schema version / redaction-version / input-hash / stored redacted input /
+  output / validation-result / repair-attempts / latency-cost; **invalid output → bounded repair → (repaired)
+  or fail into clarification** (never silent-accept, never execute); a **refusal → fail into clarification
+  directly** (a policy decline, not repair), and **truncation / provider-timeout / rate-limit / transient 5xx →
+  bounded retry**, **non-retryable 4xx → fail closed** (§9.2 taxonomy); a **retried call reuses its record only
+  on a full-identity key match** (a schema / model / prompt / redaction / settings change forces a fresh call);
+  the record store is **immutable, sensitive, read-controlled**.
 - **No-PII boundary:** a payload carrying data values or un-redacted PII is **rejected by the egress guard →
   security-audit** (hard failure, not a warning); an un-redactable-PII intent **fails into the manual path**
   and no payload is dispatched; `input_redaction` documents what was scrubbed; `FakeLLM` asserts only
@@ -1351,17 +1399,18 @@ adapter is exercised only in an **opt-in, config-gated smoke test** never gated 
 | 2 | No new aggregate | Decision (Seams) | **Reasonable call:** SP-2 rides SP-0's existing `run` aggregate + DRAFT/CONFIRMED_CONTRACT states + `CLARIFICATION` gate + the document **`PRIMARY_SELECTED`** candidate-promotion primitive (candidate selection is document-level, *not* request-level `select_candidate`, §7.1) — **no new aggregate and no event-store aggregate-CHECK migration** (unlike SP-1). Additive registrations only: event-types, document-schemas, and **one backward-compatible human-gate/park-reason migration** (`USE_CASE_ONBOARDING` gate + `NEEDS_USE_CASE_ONBOARDING` park hold-state, mirroring SP-1's `0505`, §2.1) — the base gate enum + `RUN_PARKED` payload carry neither (SP-0 `0070`, `run_lifecycle.py`). *The decision record listed the SP-0 dependencies but did not specify whether a new aggregate was needed; using the existing run spine is the minimal faithful encoding.* |
 | 3 | Ambiguity/confidence scale + combine rule | Decision (Components) said "each field scored for ambiguity + confidence" | **Reasonable call:** fixed a **0.0–1.0** scale for both, sourced from LLM self-report **+** a deterministic catalog-cardinality check, with the platform taking the **more cautious** value on disagreement (§6.1). Scale and combine rule were not specified. |
 | 4 | Doubt Router thresholds | Decision (Components): auto-resolve vs must-ask | **Reasonable call:** `auto-resolve iff ambiguity ≤ 0.30 AND confidence ≥ 0.70 AND safe source AND not policy-sensitive AND not calc-method`; config-gated, biased toward asking (§6.2). Exact thresholds were not specified. |
-| 5 | Bounded repair budget | Decision 3: "bounded repair loop → on exhaustion fail into clarification" | **Reasonable call:** default **N = 2** structured-output repair attempts, config-gated, then fail into clarification; refusal treated as invalid (§9.2). The count was not specified. |
+| 5 | Bounded repair budget + refusal disposition | Decision 3: "bounded repair loop → on exhaustion fail into clarification" | **Reasonable call:** default **N = 2** structured-output repair attempts for *malformed structure*, config-gated, then fail into clarification. **Refusal reclassified:** a `stop_reason == "refusal"` is a **policy decline → fail into clarification directly** (not repair — re-prompting a decline does not help), part of the full provider-failure taxonomy (§9.2, entry 16). The counts were not specified. |
 | 6 | Refinement-loop bound | Decision (Components): "converge until minimum-contract passes" | **Reasonable call:** loop bounded by SP-0's durable-runtime hard loop limit; on exhaustion **auto-park** the run for human follow-up (§6.6). The specific round cap was not specified. |
 | 7 | LLM-call record store | Decision 3: "every LLM call is event-sourced" (fields enumerated) | **Reasonable call:** modelled as an **SP-2-owned immutable append-only `llm_call` store** (mirroring SP-1's evidence store) referenced by `llm_call_ref`, plus an `LLM_CALL_RECORDED` event — because SP-0's stage/artifact enum has no LLM-call type (§9.3, Decision D9). All enumerated fields captured. |
 | 8 | Banking-scope / `BankingDomainCatalog` dependency | Decision 1, 4 & 8: "rejects only out-of-banking"; "depends on SP-0 only" *(record was previously silent on catalog availability)* | **RATIFIED (user-approved).** The banking-boundary / blocked-class reference data is accepted as **SP-0-governed, read-only reference data** — the **`BankingDomainCatalog`** (§4.5): `allowed_domains`/`allowed_use_cases`, `out_of_scope_examples`, `blocked_data_classes`, `sensitive_proxy_hints` (carried **only** as "requires clarification / compliance review," never an auto-block), `jurisdiction_scope`/`use_case_scope`, and `version`/`owner`/`effective_date`/`provenance`. It is **read-only intake-classification reference data — never grounding/execution** — so it is *not* an SP-2 build dependency and does **not** violate "SP-0 only." Deterministic intake outcomes: out-of-scope → **`OUT_OF_SCOPE`** and prohibited class → **`PROHIBITED_DATA_CLASS`** (both fail-closed, each stamping the reason/matched-class + catalog `version`); sensitive-proxy/ambiguous → clarification / compliance review; a new banking use-case → onboarding park (§5.4, §8.4, §11). **This resolves the former open question (was silent, §16.8) — now ratified, not a deviation; the user explicitly approved it.** |
 | 9 | No-PII enforcement construction + redactor ownership | Decision 3: "no raw data or PII to the LLM — enforce/validate this boundary" | **Reasonable call.** Enforced at **three points** with a clean ownership split — **SP-0 *classifies*** (ingest, `raw_input_classification`; its `assert_no_inline_pii`, `privacy/classification.py:70`, is a classification guard, **not** a redactor), **SP-2 *redacts*** via an explicit **`IntentRedactor` seam** (interface + default impl) that emits the only LLM-safe intent rendering and fails closed on un-redactable/`unscanned` input, and **SP-2 *guards egress*** (pre-send hard-fail on data values / un-redacted PII → security-audit), with `input_redaction` recorded for audit (§9.4). The decision record required the boundary but assigned no redactor; SP-0 exposes no redactor API, so SP-2 owns the seam (§9.4, §5.2, §13). |
 | 10 | Prohibited-intent mechanism | Decision 2: "obviously prohibited/compliance-sensitive → blocks or forces clarification; must NOT pretend to approve compliance" | **Reasonable call (mechanism); RATIFIED (contract, see entry 8).** A **deterministic** screen over the `BankingDomainCatalog` `blocked_data_classes` (§4.5): an explicit prohibited data class → **`PROHIBITED_DATA_CLASS`** block (matched class + catalog `version`) → edit-and-loop, requester **`withdraw`** (SP-0, data-scientist-owned), or the **platform/service-issued** `reject_intent` terminal outcome (not SP-0's validator-only `reject` — see entry 13); a `sensitive_proxy_hints` match is the **distinct** routing → clarification / compliance review, **not** an auto-block; never an LLM judgement, never a compliance approval (§8.4). The screen mechanism was not specified; the proxy-vs-block distinction is the user-ratified contract. |
 | 11 | Gate #1 is not four-eyes | Decision 2 | Encoded: author confirms own intent (audited intent lock); `requires_independent_validation` is a **flag only**, no second signer; independent validation is Gate #2 / SP-5 (§8.2, §8.4). |
-| 12 | Real adapter details | Decision 3: "real Claude adapter shipped, config-gated, never required in CI; no silent fallback" | Encoded with concrete Claude API: model `claude-opus-4-8`, adaptive thinking, structured outputs via `output_config.format`, `stop_reason=="refusal"` → repair/clarification, fail-closed (no fallback to FakeLLM) (§9.5). *Model/API specifics grounded in the current Claude API; not a deviation.* |
+| 12 | Real adapter details | Decision 3: "real Claude adapter shipped, config-gated, never required in CI; no silent fallback" | Encoded with concrete Claude API: model `claude-opus-4-8`, adaptive thinking, structured outputs via `output_config.format`, `stop_reason=="refusal"` → **fail into clarification** (not repair; §9.2 taxonomy, entry 16), `stop_reason=="max_tokens"` / timeout / 429 / 5xx → bounded retry, non-retryable 4xx → fail-closed, no-PHI-in-schema (§9.1), no fallback to FakeLLM (§9.5). *Model/API specifics grounded in the current Claude API; not a deviation.* |
 | 13 | Rejection / withdrawal authority | SP-0: `reject` is **validator-only** (`authz/policy.py:42`); `withdraw` is **data-scientist-owned** (`authz/policy.py:41`) | **Corrected authority.** SP-2's deterministic intake rejections (`OUT_OF_SCOPE`/`PROHIBITED_DATA_CLASS`) are **platform/service-issued terminal outcomes** — the deterministic classifier decided, **not** a validator — issued via SP-2's own **`reject_intent`** action (→ SP-0 `RUN_REJECTED`) under **one additive service `authz_policy` row** (§2.1 #4); they do **not** reuse SP-0's validator-only `reject`. **Requester-initiated abandonment** (the author walking away — e.g. a Gate #1 `reject` response, or giving up on a blocked/looping intent) reuses **SP-0 `withdraw`** (→ `RUN_WITHDRAWN`), never `reject`. SP-0's validator-only `reject` stays reserved for independent validation (Gate #2 / SP-5). The added row **changes no existing SP-0 row**, so SoD holds. (§5.4, §8.4, §11, §13, §2.1.) |
 | 14 | `BankingDomainCatalog` classifier — completeness contract | Decision 8 (ratified catalog, entry 8) *(specified the outcomes but not precedence / availability / version-stamping / drift / scope inputs)* | **Completed the classifier contract (§4.5, §5.4).** (a) **Precedence = most-restrictive-wins** (`PROHIBITED_DATA_CLASS` > `OUT_OF_SCOPE` > sensitive-proxy → clarify > ambiguous → clarify) — exactly one outcome. (b) **Catalog unavailable / unversioned → fail-closed** (park for clarification/manual; never auto-pass). (c) **Catalog `version` stamped on EVERY outcome, including CLEAR/PASS** — an allow is as auditable as a block. (d) **Version drift** — `version` recorded at intake and **re-evaluated at confirmation** (§8.4); a changed version that would flip the outcome forces **re-clarify**, never a silent stale confirm. (e) **Jurisdiction / use-case scope** needs **product/region** on the request; absent → **ambiguity → clarify**. All deterministic, all fail-closed; **extends** the ratified catalog contract (entry 8), not a deviation. (§4.5, §5.4, §6.7, §8.4.) |
 | 15 | LLM-call retention — stored-redacted, not hash-only | Decision 3: "every LLM call is event-sourced / reproducible" | **Reasonable call.** The `llm_call` record stores the **redacted (LLM-safe) input itself** (`redacted_input` + `redaction_version`), **not** a bare `input_hash` — hash-only cannot be replayed or reviewed, defeating MRM / adverse-action reproducibility. The raw intent stays in SP-0's encrypted `raw_input_ref` blob (§9.4), so the stored text is already redacted; the record is classified **sensitive / governance-retained / read-controlled** with an authorized/audited read path (§9.3). Resolves the former "`input_hash` OR redacted input" ambiguity in favour of stored-redacted for replayability. (§9.3, §9.4.) |
+| 16 | LLM idempotency key + provider-failure taxonomy + no-PHI-in-schema | Decision 3: "every LLM call is event-sourced"; Anthropic structured-output requirement | **Reasonable call (mechanism).** (a) **Idempotency key widened** to the full call identity — `(run_id, task, input_hash, provider, model, prompt_id, prompt_version, output_schema_id, output_schema_version, redaction_version, generation_settings)` — so a schema / model / prompt / redaction / settings change can never silently reuse a stale call (the old 4-tuple `run_id/task/input_hash/prompt_version` could; §9.3, §12). (b) **Full provider-failure taxonomy**, each fail-closed: invalid JSON → repair; refusal → clarification; max-token truncation / schema-too-complex / schema-compilation timeout / provider timeout / rate-limit / transient 5xx → bounded retry; non-retryable 4xx / policy → clarification/manual (§9.2). (c) **No PHI/PII in the JSON output-schema's property names, enums, or descriptions** — the schema is a registered, server-compiled, cross-call-cached artifact, so PII there would leak beyond the per-call redacted input (Anthropic structured-output requirement; §9.1, §9.5). The decision record required event-sourcing + the boundary; these are the concrete encodings. |
 
 ---
 
