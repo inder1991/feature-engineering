@@ -49,6 +49,17 @@ def _grain_proposal(
     table_snapshot_at: datetime,
     limits: ProfilerLimits,
 ) -> Proposal:
+    """Build a GRAIN proposal for a (near-)unique column set.
+
+    Contract: a grain candidate is proposed only once its sampled uniqueness_ratio
+    (distinct_count / scanned) clears the profiler threshold
+    (``ProfilerLimits.uniqueness_threshold``, default 0.99) — the callers gate on that before
+    reaching here. ``is_unique`` asserts STRICT uniqueness: it is True ONLY when the sampled
+    ratio is exactly 1.0 (no duplicates observed in the sample). A near-unique candidate
+    (threshold <= ratio < 1.0) is still proposed, but with ``is_unique=False`` so a human
+    confirms whether the residual duplicates are real or a sampling artifact. The observed
+    ratio is carried in the evidence metrics (``uniqueness_ratio``) for that review.
+    """
     ratio = round(distinct_count / scanned, 6) if scanned else 0.0
     proposed_value = {"columns": list(columns), "is_unique": ratio == 1.0}
     validate_fact_value(GRAIN, proposed_value)

@@ -204,6 +204,12 @@ class PostgresCatalog:
         return None
 
     def owner_of(self, ref: CatalogObjectRef) -> str | None:
+        """No data owner: information_schema has no data-owner concept, so this bare
+        reference adapter records NO ownership by design. Ownership is an organizational
+        fact that must come from an external source of truth (a later, richer adapter that
+        joins the catalog to an ownership registry). Returning None is deliberate — it routes
+        every fact for this object to the governance queue rather than to a known data owner,
+        a fail-safe default, not a gap."""
         return None
 
     def fingerprint(self) -> Mapping[str, CatalogObject]:
