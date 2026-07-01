@@ -249,6 +249,38 @@ SP-0 validates the envelope and *required-field presence*; **SP-2 runs all seman
 resolved, method chosen, no unresolved high-ambiguity field, in-banking-scope — the Minimum Contract
 Validation of §6.7). A Draft with a non-empty `open_fields` cannot pass Gate #1 (SP-0 §3.5:182).
 
+**These content-schemas are AUTHORITATIVE, not illustrative.** The JSON blocks in §4.1–§4.3 are worked
+examples *of* the authoritative content-schemas SP-2 registers in SP-0's document registry (§2.1 #2); the
+registered schemas — **required fields, stable field paths, closed enum vocabularies, the `UNKNOWN`
+representation, and reader-upcasters** — are the contract SP-3 and Gate #1 bind to, shown as
+**Authoritative content-schema** blocks alongside each example below.
+
+**Closed enum vocabularies (the only permitted members; extended only by a schema-version bump + upcaster).**
+
+| Field path | Closed vocabulary | Source of truth |
+|---|---|---|
+| `intake_mode` | `definition` \| `hypothesis` | SP-0 `INTAKE_MODES` (`documents/draft.py`) |
+| `raw_input_classification` | `clean` \| `contains_pii` \| `unscanned` | SP-0 `RAW_INPUT_CLASSIFICATIONS` (`documents/draft.py`) |
+| Draft `status` | `NEEDS_CLARIFICATION` | SP-2 |
+| Confirmed `status` | `CONFIRMED` | SP-2 |
+| `observation_intent.kind` | `point_in_time` \| `as_of_event` | SP-2 |
+| `calculation_method.chosen.kind` / `considered[].kind` | `rolling_aggregate` \| `point_snapshot` \| `ratio` \| `distribution_divergence` | SP-2 (§4.2 tagged shape) |
+| `field_scores.*.source` / `assumptions[].source` | `llm` \| `default` \| `catalog` | SP-2 |
+| `open_questions[].routed_to` | `human` \| `auto` | SP-2 (Doubt Router §6.2) |
+
+**`UNKNOWN` representation (not-yet-resolved fields).** An unresolved semantic field carries the **string
+sentinel `"UNKNOWN"`** (SP-0's `UNKNOWN`, `documents/draft.py:10`) **and MUST be listed in `open_fields`** —
+SP-0's `validate_draft` rejects any `UNKNOWN`-valued field absent from `open_fields` (`documents/draft.py`). A
+**Confirmed** contract carries **no** `UNKNOWN` and an **empty** `open_fields` (§4.2, §6.7).
+
+**Upcaster rules (schema evolution).** Each content-schema is versioned (`schema_version`); every version bump
+ships a **total, chained reader-upcaster** registered in SP-0's document registry (SP-0 §3.7, §2.1 #2) mapping
+v(n-1) → v(n). Readers always read a frozen document **through the chain to the current version**; upcasts are
+**pure, deterministic, and additive-only** — new optional fields are defaulted, renamed fields are mapped
+(e.g. Draft `entity_grain` → Confirmed `feature_grain`, §4.2), and a closed-enum **addition** is
+backward-compatible. A frozen document is **never rewritten** — an upcast is a read-time projection, not a
+write — so full DAG history and content-hashes are preserved (§2).
+
 ### 4.1 Draft Feature Contract (Layer 1 output — never executable)
 
 Captures the LLM's structured reading of free text, with everything uncertain marked `UNKNOWN` and listed in
@@ -295,6 +327,59 @@ fields wrap it):
 }
 ```
 
+**Authoritative content-schema (`DRAFT_CONTRACT`, `schema_version: 1`).** The envelope fields (`request_id`,
+`intake_mode`, `raw_input_ref`, `raw_input_classification`, `open_fields`, `assumption_ledger_ref`, `status`)
+are validated by **SP-0** (`documents/draft.py`); the SP-2 semantic block is validated by SP-2 (§6.7). In the
+Draft, `calculation_method` is a **string label** (the faithful method name, or `"UNKNOWN"`); it is assembled
+into the tagged structure at confirmation (§4.2):
+
+```json
+{
+  "type": "object",
+  "required": ["request_id", "intake_mode", "raw_input_ref", "raw_input_classification",
+               "proposed_feature_name", "feature_semantics", "field_scores",
+               "open_fields", "assumption_ledger_ref", "provenance", "status"],
+  "not": { "required": ["raw_input"] },                       // raw text is never inline (§9.4)
+  "additionalProperties": true,                               // SP-0 owns + wraps the envelope (content-hash, etc.); SP-0's schema is additionalProperties:True
+  "properties": {
+    "request_id":               { "type": "string" },
+    "intake_mode":              { "enum": ["definition", "hypothesis"] },
+    "raw_input_ref":            { "type": "string", "pattern": "^(blob|doc)_" },
+    "raw_input_classification": { "enum": ["clean", "contains_pii", "unscanned"] },
+    "assumption_ledger_ref":    { "type": "string", "pattern": "^doc_" },
+    "proposed_feature_name":    { "type": "string" },         // human-editable → Confirmed feature_name
+    "feature_semantics": {
+      "type": "object",
+      "required": ["entity", "entity_grain", "observation_intent", "calculation_method", "windows", "filters"],
+      "properties": {
+        "entity":             { "type": "string" },           // "UNKNOWN" ⟹ path listed in open_fields
+        "entity_grain":       { "type": "array", "items": { "type": "string" } },
+        "observation_intent": { "$ref": "#/$defs/observation_intent" },
+        "calculation_method": { "type": "string" },           // faithful method label, or "UNKNOWN"
+        "windows":            { "type": "array" },
+        "filters":            { "type": "array" },
+        "target_definition":  { "type": "string" }            // "N/A ..." | target text | "UNKNOWN"
+      }
+    },
+    "field_scores":  { "type": "object", "additionalProperties": { "$ref": "#/$defs/field_score" } },
+    "open_fields":   { "type": "array", "items": { "type": "string" } },   // every "UNKNOWN" field path listed here
+    "open_questions":{ "type": "array", "items": { "$ref": "#/$defs/open_question" } },
+    "provenance":    { "type": "object", "required": ["schema_version"] },
+    "status":        { "const": "NEEDS_CLARIFICATION" }
+  },
+  "$defs": {
+    "field_score":       { "type": "object", "required": ["ambiguity", "confidence", "source"],
+                           "properties": { "ambiguity": { "type": "number" }, "confidence": { "type": "number" },
+                                           "source": { "enum": ["llm", "default", "catalog"] } } },
+    "observation_intent":{ "type": "object", "required": ["kind"],
+                           "properties": { "kind": { "enum": ["point_in_time", "as_of_event"] },
+                                           "as_of_field": { "type": "string" }, "rule": { "type": "string" } } },
+    "open_question":     { "type": "object", "required": ["field", "question", "blocks_progress", "routed_to"],
+                           "properties": { "routed_to": { "enum": ["human", "auto"] } } }
+  }
+}
+```
+
 ### 4.2 Confirmed Feature Contract (Layer 2 output — the first executable-eligible artifact)
 
 Every P0 field resolved, either by human confirmation or a **recorded, human-acknowledged default**. The
@@ -304,6 +389,8 @@ Every P0 field resolved, either by human confirmation or a **recorded, human-ack
 {
   "feature_name": "declined_card_auth_count_90d",   // from the Draft's proposed_feature_name (§4.1), human-editable at Gate #1 (§8.3)
   "intake_mode": "definition",
+  "raw_input_ref": "blob_01H...",                // SP-0 envelope field, carried from the Draft (§4.1); encrypted, access-restricted (SP-0 §9)
+  "raw_input_classification": "clean",           // SP-0 envelope field, carried from the Draft (§4.1): clean | contains_pii | unscanned
   "entity": "customer",
   "entity_key": "customer_id",                   // split from the Draft's entity_grain (Draft→Confirmed rename, below)
   "feature_grain": ["customer_id", "as_of_date"],  // the Draft's entity_grain (§4.1), persisted under this confirmed-stage name
@@ -312,14 +399,21 @@ Every P0 field resolved, either by human confirmation or a **recorded, human-ack
     "as_of_field": "as_of_date",
     "rule": "use only data available strictly before as_of_date"
   },
-  "calculation_method": {
-    "chosen": "rolling_count",
-    "considered": ["rolling_count"],             // definition mode: one faithful translation
-    "window": "90d",
-    "filter": {
-      "concept": "declined card authorization",
-      "predicate": "card_authorizations.auth_result = 'D'"   // confirmed at the clarification gate
-    }
+  "calculation_method": {                        // versioned + tagged (discriminated on chosen.kind) — SP-3 consumes deterministically (§4.0)
+    "method_version": 1,
+    "chosen": {
+      "kind": "rolling_aggregate",               // discriminant (closed enum, §4.0)
+      "aggregation": "count",
+      "window": "90d",
+      "filter": {
+        "concept": "declined card authorization",
+        "predicate": "card_authorizations.auth_result = 'D'"   // confirmed at the clarification gate
+      }
+    },
+    "considered": [                              // definition mode: one faithful translation
+      { "kind": "rolling_aggregate", "aggregation": "count", "window": "90d",
+        "filter": { "concept": "declined card authorization", "predicate": "card_authorizations.auth_result = 'D'" } }
+    ]
   },
   "target": null,                                // definition-mode feature; hypothesis mode carries a target
   "assumption_ledger_ref": "doc_01H...",
@@ -339,36 +433,131 @@ Every P0 field resolved, either by human confirmation or a **recorded, human-ack
 ```
 
 The **hypothesis example** produces the same shape with `intake_mode: "hypothesis"`, a non-null `target`
-(e.g. the confirmed credit-risk label definition), a `calculation_method.chosen` picked from
-`considered` (the candidates of §3.2), and `confirmation.selected_candidate`/`rejected_candidates` populated.
+(e.g. the confirmed credit-risk label definition), a `calculation_method.chosen` (the tagged method variant)
+picked from `considered` (the candidate methods of §3.2), and
+`confirmation.selected_candidate`/`rejected_candidates` populated.
 
 > **Draft→Confirmed field renames (deliberate).** Two Draft fields take their confirmed-stage names here:
 > the Draft's **`entity_grain`** (§4.1) is persisted as **`feature_grain`**, with the entity key split out
 > into **`entity_key`** (here `customer_id`); and the Draft's LLM-proposed **`proposed_feature_name`** (§4.1)
 > is persisted as the human-editable **`feature_name`**. Everything else keeps its Draft name (including the
-> SP-0 envelope fields `raw_input_ref` / `raw_input_classification`). Minimum Contract Validation (§6.7)
-> validates the fields the **Draft** actually carries (`entity` + `entity_grain`); the renamed forms are the
-> confirmed-stage persistence.
+> SP-0 envelope fields `raw_input_ref` / `raw_input_classification`). The Draft's **string
+> `calculation_method` label** (plus its `windows` / `filters`) is assembled at confirmation into the
+> **versioned, tagged `calculation_method`** structure (§4.2 schema) — a shape change, not a rename, applied
+> deterministically by the confirm step. Minimum Contract Validation (§6.7) validates the fields the **Draft**
+> actually carries (`entity` + `entity_grain`); the renamed/reshaped forms are the confirmed-stage persistence.
+
+**Authoritative content-schema (`CONFIRMED_CONTRACT`, `schema_version: 1`).** Structurally consistent with the
+Draft (same envelope fields carried forward, §4.1); the two renames (`entity_grain` → `feature_grain` +
+derived `entity_key`; `proposed_feature_name` → `feature_name`) and the `calculation_method` reshape are the
+confirmed-stage persistence (§4.0 upcasters). No field is `UNKNOWN`; `open_fields` is absent/empty:
+
+```json
+{
+  "type": "object",
+  "required": ["feature_name", "intake_mode", "raw_input_ref", "raw_input_classification",
+               "entity", "entity_key", "feature_grain", "observation_intent",
+               "calculation_method", "assumption_ledger_ref", "requires_independent_validation",
+               "confirmation", "provenance", "status"],
+  "additionalProperties": true,                              // SP-0 owns + wraps the envelope (content-hash, request_id, etc.)
+  "properties": {
+    "feature_name":                    { "type": "string" },
+    "intake_mode":                     { "enum": ["definition", "hypothesis"] },
+    "raw_input_ref":                   { "type": "string", "pattern": "^(blob|doc)_" },
+    "raw_input_classification":        { "enum": ["clean", "contains_pii", "unscanned"] },
+    "entity":                          { "type": "string" },
+    "entity_key":                      { "type": "string" },
+    "feature_grain":                   { "type": "array", "items": { "type": "string" } },
+    "observation_intent":              { "$ref": "#/$defs/observation_intent" },
+    "calculation_method":              { "$ref": "#/$defs/calculation_method" },   // versioned, tagged (below)
+    "target":                          { "type": ["object", "null"] },
+    "assumption_ledger_ref":           { "type": "string", "pattern": "^doc_" },
+    "requires_independent_validation": { "type": "boolean" },
+    "confirmation":                    { "type": "object", "required": ["confirmed_by", "confirmed_at"] },
+    "provenance":                      { "type": "object", "required": ["derived_from", "schema_version"] },
+    "status":                          { "const": "CONFIRMED" }
+  },
+  "$defs": {
+    "observation_intent": { "type": "object", "required": ["kind"],
+                            "properties": { "kind": { "enum": ["point_in_time", "as_of_event"] } } },
+    "calculation_method": {                                   // versioned; discriminated on chosen.kind — SP-3 switches on it
+      "type": "object",
+      "required": ["method_version", "chosen"],
+      "properties": {
+        "method_version": { "type": "integer" },
+        "chosen":         { "$ref": "#/$defs/method_variant" },
+        "considered":     { "type": "array", "items": { "$ref": "#/$defs/method_variant" } }
+      }
+    },
+    "method_variant": {                                       // tagged union — closed `kind` vocabulary (§4.0)
+      "type": "object",
+      "required": ["kind"],
+      "oneOf": [
+        { "required": ["kind", "aggregation", "window"],
+          "properties": { "kind": { "const": "rolling_aggregate" }, "aggregation": { "type": "string" },
+                          "window": { "type": "string" }, "filter": { "$ref": "#/$defs/filter" } } },
+        { "required": ["kind", "field"],
+          "properties": { "kind": { "const": "point_snapshot" }, "field": { "type": "string" },
+                          "filter": { "$ref": "#/$defs/filter" } } },
+        { "required": ["kind", "numerator", "denominator"],
+          "properties": { "kind": { "const": "ratio" }, "numerator": {}, "denominator": {},
+                          "window": { "type": "string" } } },
+        { "required": ["kind", "measure", "window", "baseline_window"],
+          "properties": { "kind": { "const": "distribution_divergence" }, "measure": { "type": "string" },
+                          "window": { "type": "string" }, "baseline_window": { "type": "string" } } }
+      ]
+    },
+    "filter": { "type": "object",
+                "properties": { "concept": { "type": "string" }, "predicate": { "type": "string" } } }
+  }
+}
+```
 
 ### 4.3 Assumption Ledger (its own frozen document)
 
 Every **inferred choice** the platform made instead of asking is recorded here — *never silently inlined*
-(SP-0 §3.5:183). Each entry is `{ field, chosen_value, source, rationale, ambiguity, confidence,
-auto_resolved_at }`, where `source ∈ {default, catalog, llm}`:
+(SP-0 §3.5:183). The top-level array is **`assumptions`** — the name SP-0's registered `ASSUMPTION_LEDGER`
+schema **requires** (`documents/draft.py:47`), *not* `entries`. Each item is `{ field, value, source,
+rationale, ambiguity, confidence, auto_resolved_at }` — SP-0's schema requires `field`, **`value`**, and
+`rationale` on every item (`documents/draft.py`), and SP-2 adds the semantic extras (`source ∈ {default,
+catalog, llm}`, scores, timestamp):
 
 ```json
-{ "entries": [
+{ "assumptions": [
   { "field": "entity_grain",
-    "chosen_value": ["customer_id", "as_of_date"],
+    "value": ["customer_id", "as_of_date"],
     "source": "default",
     "rationale": "point-in-time features are grained by entity × as_of_date by platform convention",
     "ambiguity": 0.30, "confidence": 0.72, "auto_resolved_at": "2026-07-01T10:19:03Z" },
   { "field": "calculation_method.window",
-    "chosen_value": "90d",
+    "value": "90d",
     "source": "llm",
     "rationale": "window stated verbatim in the intent ('90-day rolling')",
     "ambiguity": 0.05, "confidence": 0.98, "auto_resolved_at": "2026-07-01T10:19:03Z" }
 ]}
+```
+
+**Authoritative content-schema (`ASSUMPTION_LEDGER`, `schema_version: 1`).** Extends SP-0's registered
+`ASSUMPTION_LEDGER_JSON_SCHEMA` (`documents/draft.py`) — `required: ["request_id", "assumptions"]`, each item
+`required: ["field", "value", "rationale"]` — with the SP-2 semantic item fields, under the same reader-
+upcaster discipline (§4.0):
+
+```json
+{ "type": "object", "required": ["request_id", "assumptions"],
+  "properties": {
+    "request_id": { "type": "string" },
+    "assumptions": { "type": "array", "items": {
+      "type": "object",
+      "required": ["field", "value", "rationale"],
+      "properties": {
+        "field":            { "type": "string" },
+        "value":            {},                              // any JSON — the chosen value
+        "rationale":        { "type": "string" },
+        "source":           { "enum": ["default", "catalog", "llm"] },
+        "ambiguity":        { "type": "number" },
+        "confidence":       { "type": "number" },
+        "auto_resolved_at": { "type": "string" }
+      } } } } }
 ```
 
 The ledger is surfaced **in full** at Gate #1 so the confirmer reviews every assumption the platform made
@@ -734,7 +923,7 @@ class Candidate:
     candidate_id: str
     definition_text: str          # plain-English, FeatLLM-style (design §14.2)
     rationale: str                # one-line causal reasoning, surfaced at Gate #1
-    calculation_method: dict      # the structured method the definition compiles to
+    calculation_method: CalculationMethod   # versioned, tagged (discriminated on `kind`, §4.2) — the structured method SP-3 consumes deterministically
     signals: dict                 # cheap, model-free plausibility/quality signals ONLY (§7.3)
     provenance: dict              # llm_call_refs, generator_version
 ```
@@ -1293,6 +1482,10 @@ SP-2 does not build (§14).
 - **Read model:** `get_contract(run_id) -> {stage, status, draft|confirmed body, assumption_ledger,
   field_scores, open_questions}` — service-internal, for SP-3 to fetch the Confirmed Contract.
 - **The Confirmed Feature Contract document** (CONFIRMED_CONTRACT stage) — the governed hand-off artifact.
+- **Authoritative content-schemas (`DRAFT_CONTRACT`, `ASSUMPTION_LEDGER`, `CONFIRMED_CONTRACT`)** (§4.0–§4.3) —
+  registered, versioned, with closed enum vocabularies, the `UNKNOWN` representation, reader-upcasters, and the
+  **versioned/tagged `calculation_method`** (discriminated on `kind`) SP-3 consumes deterministically; these
+  are the binding contract, not the illustrative examples.
 - **`CandidateGenerator` protocol** (§7.1) — the seam SP-12 binds its real engine to.
 - **`IntentRedactor` protocol + default implementation** (§9.4) — the SP-2-owned seam that turns
   SP-0-classified raw intent into the redacted, LLM-safe text that is the only intent rendering allowed into an
@@ -1411,6 +1604,7 @@ adapter is exercised only in an **opt-in, config-gated smoke test** never gated 
 | 14 | `BankingDomainCatalog` classifier — completeness contract | Decision 8 (ratified catalog, entry 8) *(specified the outcomes but not precedence / availability / version-stamping / drift / scope inputs)* | **Completed the classifier contract (§4.5, §5.4).** (a) **Precedence = most-restrictive-wins** (`PROHIBITED_DATA_CLASS` > `OUT_OF_SCOPE` > sensitive-proxy → clarify > ambiguous → clarify) — exactly one outcome. (b) **Catalog unavailable / unversioned → fail-closed** (park for clarification/manual; never auto-pass). (c) **Catalog `version` stamped on EVERY outcome, including CLEAR/PASS** — an allow is as auditable as a block. (d) **Version drift** — `version` recorded at intake and **re-evaluated at confirmation** (§8.4); a changed version that would flip the outcome forces **re-clarify**, never a silent stale confirm. (e) **Jurisdiction / use-case scope** needs **product/region** on the request; absent → **ambiguity → clarify**. All deterministic, all fail-closed; **extends** the ratified catalog contract (entry 8), not a deviation. (§4.5, §5.4, §6.7, §8.4.) |
 | 15 | LLM-call retention — stored-redacted, not hash-only | Decision 3: "every LLM call is event-sourced / reproducible" | **Reasonable call.** The `llm_call` record stores the **redacted (LLM-safe) input itself** (`redacted_input` + `redaction_version`), **not** a bare `input_hash` — hash-only cannot be replayed or reviewed, defeating MRM / adverse-action reproducibility. The raw intent stays in SP-0's encrypted `raw_input_ref` blob (§9.4), so the stored text is already redacted; the record is classified **sensitive / governance-retained / read-controlled** with an authorized/audited read path (§9.3). Resolves the former "`input_hash` OR redacted input" ambiguity in favour of stored-redacted for replayability. (§9.3, §9.4.) |
 | 16 | LLM idempotency key + provider-failure taxonomy + no-PHI-in-schema | Decision 3: "every LLM call is event-sourced"; Anthropic structured-output requirement | **Reasonable call (mechanism).** (a) **Idempotency key widened** to the full call identity — `(run_id, task, input_hash, provider, model, prompt_id, prompt_version, output_schema_id, output_schema_version, redaction_version, generation_settings)` — so a schema / model / prompt / redaction / settings change can never silently reuse a stale call (the old 4-tuple `run_id/task/input_hash/prompt_version` could; §9.3, §12). (b) **Full provider-failure taxonomy**, each fail-closed: invalid JSON → repair; refusal → clarification; max-token truncation / schema-too-complex / schema-compilation timeout / provider timeout / rate-limit / transient 5xx → bounded retry; non-retryable 4xx / policy → clarification/manual (§9.2). (c) **No PHI/PII in the JSON output-schema's property names, enums, or descriptions** — the schema is a registered, server-compiled, cross-call-cached artifact, so PII there would leak beyond the per-call redacted input (Anthropic structured-output requirement; §9.1, §9.5). The decision record required event-sourcing + the boundary; these are the concrete encodings. |
+| 17 | Authoritative Draft / Confirmed / Ledger content-schemas | Decision D10 (minimum-viable content schema); SP-0 `documents/draft.py` (envelope + `assumptions` + `UNKNOWN`) | **Made the schemas authoritative, not illustrative (§4.0–§4.3).** (a) Registered **JSON Schemas** for `DRAFT_CONTRACT` / `CONFIRMED_CONTRACT` / `ASSUMPTION_LEDGER` — required fields, **stable field paths**, **closed enum vocabularies**, the **`UNKNOWN`** sentinel (SP-0 `documents/draft.py:10`, must be in `open_fields`), and **total chained reader-upcasters** (SP-0 §3.7, §2.1 #2). (b) Replaced the open `calculation_method: dict` with a **versioned, tagged** structure (`method_version` + `chosen.kind` discriminated union) SP-3 switches on deterministically (§4.2, §7.1). (c) **Assumption Ledger array renamed `entries` → `assumptions`**, item `chosen_value` → **`value`**, to match SP-0's registered `ASSUMPTION_LEDGER` schema (`documents/draft.py:47`; requires `assumptions`, item `field`/`value`/`rationale`). (d) Restored the SP-0 envelope fields `raw_input_ref` / `raw_input_classification` in the **Confirmed** example so Draft and Confirmed are structurally consistent (§4.2). |
 
 ---
 
