@@ -593,7 +593,11 @@ implements exactly **one** mode; the reusable five-mode Critique Service is SP-8
 Each must-ask field opens an **SP-0 `CLARIFICATION` human-gate task** (SP-0 §7) — the same infrastructure
 SP-1 uses for confirmations. The task carries the field, the open question, the candidate readings (with their
 scores), and `required_inputs` = the draft doc ref (so a re-normalized draft correctly *stales* a pending
-answer, SP-0 §7:429). `allowed_responses` = `[confirm, edit, reject]`. The **eligible assignee is the request
+answer, SP-0 §7:429). `allowed_responses` = `[confirm, edit, reject]`, and — because clarification is an
+**author-owned intent lock** — **`delegation_allowed = False`** (SP-2 sets this explicitly: SP-0's
+`GateTaskSpec.delegation_allowed` **defaults to `True`**, `contracts/envelopes.py:209`, so without it a
+delegate of the author could still answer even though the request-owner *subject* guard holds — the guard pins
+the acting subject, `delegation_allowed=False` forbids a stand-in). The **eligible assignee is the request
 owner** (the data scientist) — clarification is answered by the author, consistent with Gate #1 being an
 author-owned intent lock (§8). **But SP-0's `submit_human_signal` verifies the responder's *role/scope/quorum*,
 not that the acting `subject` is in `eligible_assignees`** (SP-0 §7 / `gates/tasks.py`), so role-authz alone
@@ -743,6 +747,12 @@ producing the **Confirmed Feature Contract** (§4.2) and moving the run DRAFT �
   human`** check (guard `confirmer_is_requester_human` = `actor_is_request_owner ∧ actor_kind==human`, §11). A
   service, the LLM, or a **different** data scientist is **denied and recorded in the security-audit stream**
   (SP-0 §6.2), never applied.
+- **Delegation is off — the author-owned intent lock.** The Gate #1 confirmation task **and** the §6.5
+  per-field clarification tasks are opened with **`delegation_allowed = False`**. The request-owner *subject*
+  guard is **necessary but not sufficient**: SP-0's `GateTaskSpec.delegation_allowed` **defaults to `True`**
+  (`contracts/envelopes.py:209`), which would otherwise let a delegate answer/confirm on the author's behalf
+  even with the subject guard in place. Setting it `False` seals the lock — no delegate, deputy, or role-peer
+  may stand in for the requester. (SP-2 sets this on the tasks it opens; it changes no SP-0 default.)
 - **This is not four-eyes.** Gate #1 deliberately lets the author confirm their *own* intent (that is its
   purpose). It does **not** invoke SP-0's `FINAL_APPROVAL` requester≠approver SoD — that is Gate #2 (SP-5).
 
@@ -816,7 +826,8 @@ lifecycle (SP-0 §7).
 - **`open_gate1_task`** — opens the dedicated confirmation task, and **only after Minimum Contract Validation
   passes** (§6.7, guard `minimum_contract_validated`). Its `required_inputs = [the final Draft doc ref]` (so a
   later re-normalization *stales* it by SP-0's task-staleness rule, §12); `eligible_assignees` = the request
-  owner; it is **request-owner + `actor_kind==human` guarded** (§8.2). **Opening the gate cancels any
+  owner; it is opened with **`delegation_allowed = False`** and is **request-owner + `actor_kind==human`
+  guarded** (§8.2). **Opening the gate cancels any
   still-pending per-field clarification tasks** for the run — they are moved to `cancelled` (SP-0 §7). (After a
   passing MCV there should be none; the cancel is the defensive close so no stale field task can be answered
   behind an open gate.)
@@ -1103,9 +1114,10 @@ not build (§14).
 
 - **Commands:** `submit_intent(request, intent_text, intake_mode)`; `answer_clarification(task_id, actor,
   response)` (a thin wrapper over SP-0 `submit_human_signal(gate=CLARIFICATION)` that **enforces the SP-2
-  request-owner guard** — acting `subject` == request owner, else DENY + security-audit, §8.2);
-  `open_gate1_task(run_id, actor)` (opens the dedicated Gate #1 confirmation task once MCV passes, cancelling
-  pending clarification tasks, §8.6); `confirm_contract(run_id, actor, task_version, candidate_doc_id?)` (Gate
+  request-owner guard** — acting `subject` == request owner, else DENY + security-audit; the underlying
+  clarification tasks are opened **`delegation_allowed = False`**, §6.5, §8.2);
+  `open_gate1_task(run_id, actor)` (opens the dedicated Gate #1 confirmation task once MCV passes, **with
+  `delegation_allowed = False`**, cancelling pending clarification tasks, §8.6); `confirm_contract(run_id, actor, task_version, candidate_doc_id?)` (Gate
   #1 `confirm` — in hypothesis mode selects the calculation method by promoting the chosen candidate
   **document** via SP-0 **`PRIMARY_SELECTED`**, §7.1; **not** the request-level `select_candidate` command);
   `request_edit(run_id, actor, task_version, field_edit)` (Gate #1 `edit` → **REVISED** Draft version that
