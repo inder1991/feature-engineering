@@ -81,7 +81,13 @@ def _seed_verified(conn, *, ref, fact_type, value, owner, use_case=None):
     resulting state the command path would perturb: the two `approved_join` seeds (dual-owner /
     join-ref shape) and the two expiry-timer tests — because the real `confirm_fact` arms an
     `overlay_expiry` timer idempotency-keyed on `fact_key:confirmed_event_id`, which would make their
-    subsequent `schedule_expiry(..., <past>)` a no-op and leave the timer scheduled, not fired."""
+    subsequent `schedule_expiry(..., <past>)` a no-op and leave the timer scheduled, not fired.
+
+    One more direct-seed reason: in `test_drop_referenced_column_stales_grain_availability_and_join_
+    source_side` the grain and availability_time seeds are ALSO kept direct — the command path would
+    suffice for those two alone, but they are co-seeded with an `approved_join` (which MUST be direct,
+    per the join-ref shape above), so keeping all three stale-target seeds on the one path keeps that
+    test cohesive rather than splitting it across the command and direct paths."""
     from featuregen.overlay.store import append_overlay_event
 
     key = fact_key(ref, fact_type, use_case)

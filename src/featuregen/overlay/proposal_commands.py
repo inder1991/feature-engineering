@@ -9,6 +9,7 @@ resolving.
 from __future__ import annotations
 
 from dataclasses import asdict
+from typing import cast
 
 from featuregen.contracts import Command, CommandResult, DbConn
 from featuregen.contracts.gates import GateTaskSpec
@@ -132,12 +133,16 @@ def propose_fact(conn: DbConn, cmd: Command) -> CommandResult:
     # One task per resolved side: a known side -> the data owner; an unknown side ->
     # the platform-admin/governance queue. `task_assignees` dedupes same-owner / both-unknown.
     for eligible in authority.task_assignees:
+        # dict(eligible) infers dict[str, object] (EligibleAssignee is a TypedDict); every value is a
+        # str Literal (role/subject/side), so narrowing to the Mapping[str, str] the spec wants is
+        # sound — a pure annotation, no runtime change.
+        assignees = cast("dict[str, str]", dict(eligible))
         open_task(
             conn,
             GateTaskSpec(
                 gate=authority.gate,
                 required_inputs=("proposed_value",),
-                eligible_assignees=dict(eligible),
+                eligible_assignees=assignees,
                 allowed_responses=("confirm", "reject"),
                 fact_key=key,
                 draft_event_id=draft.event_id,
