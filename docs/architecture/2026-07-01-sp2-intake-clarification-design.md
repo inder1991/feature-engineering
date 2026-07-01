@@ -682,8 +682,11 @@ class Candidate:
 Each returned candidate is written as a **candidate-role staged document** under the run's Draft stage (SP-0
 §3.4 multi-candidate support); the scientist's Gate #1 selection is a **document-candidate selection** — an
 SP-0 **`PRIMARY_SELECTED`** promotion of the chosen candidate doc on the **run** aggregate (SP-0 §3.4,
-`new_primary_selected` → payload `{doc_id, stage}`), recording the sibling `doc_id`s as `rejected` with a
-reason (§8.3). It is **not** the request-level `select_candidate` command, which selects among *run* candidates
+`new_primary_selected` → payload `{doc_id, stage}`), which records **only the chosen** doc. **Documents are
+write-once**, so the losing candidate docs are **left untouched** — there is **no per-doc "reject" event** (the
+DAG has no such write); the rejected sibling `doc_id`s (with the selection reason) are captured **only in the
+confirmation record** (§8.3, Decision D4's persisted set), never on the DAG. It is **not** the request-level
+`select_candidate` command, which selects among *run* candidates
 on a *request* stream (SP-0 §4.4, `request_aggregate.py`) — the wrong granularity here: SP-2's candidates are
 **documents under a single run**, not runs under a request. **This document/selection machinery is identical
 for the stub and for SP-12** — only the `generate` body changes.
@@ -762,7 +765,10 @@ producing the **Confirmed Feature Contract** (§4.2) and moving the run DRAFT �
 
 - the final **`feature_name`** — LLM-proposed in the Draft as `proposed_feature_name` (§4.1) and **editable
   by the confirmer at Gate #1** (any edit is also captured in the human-edits list below),
-- **selected candidate** + **rejected candidates** (the sibling `doc_id`s and their rejection reasons),
+- **selected candidate** + **rejected candidates** — the chosen candidate `doc_id` and the losing sibling
+  `doc_id`s with the selection reason, recorded **here in the confirmation record only** (documents are
+  write-once: there is **no per-doc rejection event** — the losers simply remain unpromoted candidate-role
+  docs on the DAG),
 - the **Assumption Ledger** as-confirmed,
 - the **human edits** (field-level before/after),
 - the **ambiguity notes**,
@@ -1063,7 +1069,9 @@ guards registered in SP-0's predicate registry (SP-0 §4.1) — `open_fields_emp
 documents/version-attributes, pure/deterministic) **before** appending, so an illegal advance is rejected
 before it is written. In hypothesis mode, `calculation_method_chosen` is satisfied by a **document
 `PRIMARY_SELECTED`** promotion of the chosen candidate doc on the **run** aggregate (§7.1) — the document-level
-primitive, *not* the request-level `select_candidate` command. **Gate #1 task lifecycle (§8.6):** once
+primitive, *not* the request-level `select_candidate` command. The promotion payload records **only the chosen**
+doc (`{doc_id, stage}`); the rejected sibling `doc_id`s are persisted **only in the confirmation record**
+(§8.3), never via a per-doc event — documents are write-once. **Gate #1 task lifecycle (§8.6):** once
 `minimum_contract_validated` holds, `open_gate1_task` opens a **dedicated** `CLARIFICATION`-gate confirmation
 task (distinct from the per-field clarification tasks, which it **cancels**), keyed to the final Draft doc via
 `required_inputs`. The confirmer's `confirm` → `confirm_contract` (DRAFT → CONFIRMED_CONTRACT); `edit` →
@@ -1103,8 +1111,9 @@ not build (§14).
   prompt_version)` so a retried identical call reuses its record rather than double-charging.
 - **Multi-candidate races** (hypothesis mode) — candidate documents are independent DAG writes; the Gate #1
   choice is a single **`PRIMARY_SELECTED`** promotion on the **run** aggregate (§7.1), so the run-stream **OCC**
-  (above) serializes two concurrent promotions — only one wins; the rest stay candidate-role docs recorded as
-  `rejected` (§8.3). This is the document-primary primitive (SP-0 §3.4), *not* request-level `select_candidate`.
+  (above) serializes two concurrent promotions — only one wins; the losers stay **untouched** candidate-role
+  docs (write-once — no per-doc reject event), their `doc_id`s recorded as rejected **only in the confirmation
+  record** (§8.3). This is the document-primary primitive (SP-0 §3.4), *not* request-level `select_candidate`.
 - **Degraded projections fail closed** (SP-0 §3.6) — a work-queue/lifecycle projection that cannot apply an
   event blocks the affected run's commands until `resolve_degraded`, never proceeding on a false view.
 
@@ -1176,8 +1185,9 @@ adapter is exercised only in an **opt-in, config-gated smoke test** never gated 
   (grain / method / high-ambiguity-open / observation-intent / in-scope / accountable-field); success emits
   `MINIMUM_CONTRACT_VALIDATED`; an under-specified contract can **never** open Gate #1.
 - **CandidateGenerator seam:** the **stub** emits 1–3 candidate documents with rationales; each is a candidate-
-  role staged doc; a document **`PRIMARY_SELECTED`** promotion picks one and records the siblings as `rejected`
-  with reasons (§7.1 — not request-level `select_candidate`); `signals` carries **no**
+  role staged doc; a document **`PRIMARY_SELECTED`** promotion picks one; the losing siblings are **untouched**
+  (write-once) and their `doc_id`s recorded as rejected **only in the confirmation record** (§8.3), never via a
+  per-doc event (§7.1 — not request-level `select_candidate`); `signals` carries **no**
   predictive score (no IV/WoE/AUC); the seam is generator-agnostic (a fake alternate generator plugs in
   unchanged) — proving the SP-12 boundary.
 - **Human Gate #1:** author-self-confirm produces the Confirmed Contract; **a service principal, the LLM, or a
@@ -1272,7 +1282,8 @@ permitted, non-blocked credit-risk label — a `sensitive_proxy_hints` match her
 compliance review** with the requester; had it named a `blocked_data_classes` protected attribute it would
 **block as `PROHIBITED_DATA_CLASS`** (matched class + catalog `version` recorded). At **Gate #1** the
 requester reviews the three rationales + the Assumption Ledger, **picks one candidate** (a document
-**`PRIMARY_SELECTED`** promotion, §7.1; siblings recorded as `rejected` with reasons), confirms the pinned
+**`PRIMARY_SELECTED`** promotion, §7.1; the losing siblings' `doc_id`s recorded in the confirmation record
+only — write-once docs, no per-doc reject event), confirms the pinned
 target → **Confirmed Contract** with
 `intake_mode=hypothesis`, `selected_candidate`/`rejected_candidates` recorded, `requires_independent_validation
 =true` → SP-3 (and, later, the flag drives Gate #2 at SP-5).
