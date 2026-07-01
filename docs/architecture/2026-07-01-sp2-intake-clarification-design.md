@@ -331,7 +331,7 @@ Every P0 field resolved, either by human confirmation or a **recorded, human-ack
     "rejected_candidates": [],                   // + the rejected sibling doc_ids (§8.3)
     "human_edits": [ { "field": "calculation_method.filter.predicate",
                        "from": "UNKNOWN", "to": "card_authorizations.auth_result = 'D'" } ],
-    "ambiguity_notes": "declined encoding confirmed against catalog value set by requester"
+    "ambiguity_notes": "declined encoding confirmed against catalog-declared enum/code metadata by requester"
   },
   "provenance": { "derived_from": ["doc_01H...(draft)"], "llm_call_refs": ["llmc_01H..."], "schema_version": 1 },
   "status": "CONFIRMED"
@@ -379,7 +379,10 @@ The ledger is surfaced **in full** at Gate #1 so the confirmer reviews every ass
 
 During normalization and scoring, SP-2 may **read** SP-1's merged-view read API (`resolve_fact` /
 `list_objects`, SP-1 §7, §10) for **names, types, and asserted grain** — e.g. to check that `customer_id`
-exists and to score the ambiguity of "declined authorization" against the actual value set of a status column.
+exists and to score the ambiguity of "declined authorization" against the **catalog-declared enum/code
+metadata** for a status column, **if present**. **Actual value sets / status-code sets are SP-1 profiling and
+SP-3 grounding, not SP-2** — SP-2 reads only names / types / grain (plus any catalog-*declared* enum/code
+metadata), never profiled column *values*, keeping the no-column-values-to-LLM boundary (§9.4) intact.
 This is **advisory context only**: it is used to *score* and *frame clarifying questions*, never to *bind* a
 concept to a column. **All policy-aware, VERIFIED-fact grounding is SP-3** (design §3:108–116). Concretely,
 SP-2 **does not** call the write side of SP-1, does not open overlay confirmation tasks, and does not treat a
@@ -573,13 +576,13 @@ Every semantic field carries two independent scores on a **0.0–1.0** scale:
 
 - **ambiguity** — how many plausible readings the field has (0.0 = exactly one reading; 1.0 = many
   incompatible readings). Driven by the intent text + catalog metadata (e.g. a status concept that maps to
-  several candidate columns/values scores high).
+  several candidate columns or catalog-declared codes scores high).
 - **confidence** — how sure the platform is of the *chosen* reading (0.0 = a guess; 1.0 = stated verbatim or
   catalog-unique).
 
 Scores come from **two sources, combined deterministically**: (i) the LLM's self-reported per-field
 uncertainty (structured output, §9.1), and (ii) a **deterministic catalog-cardinality check** (how many
-catalog objects/values a concept could bind to). Where they disagree, the **platform takes the more
+catalog objects or catalog-declared enum/code values a concept could bind to). Where they disagree, the **platform takes the more
 cautious** (higher ambiguity / lower confidence) — the LLM can never *lower* a doubt the deterministic check
 raised. *(The 0.0–1.0 scale and this combine rule were not fixed by the decision record; see §16.)*
 
@@ -613,7 +616,7 @@ threshold values were a reasonable call, §16.)*
 - **Definition (declined-auth count):** `windows=90d` (amb 0.05, conf 0.98) and `calculation_method=rolling_count`
   (amb 0.10, conf 0.90) → **auto-resolve** (ledger). `entity_grain` gets the `as_of_date` companion by default
   (amb 0.30, conf 0.72) → **auto-resolve** (ledger, `source: default`). `filters.declined_status_encoding`
-  (amb 0.80, conf 0.40) → **must-ask** — several columns/values could mark "declined." One clarification, then
+  (amb 0.80, conf 0.40) → **must-ask** — several columns or catalog-declared status codes could mark "declined." One clarification, then
   converge.
 - **Hypothesis (abrupt category shift → credit risk):** the **calculation method** is always must-ask →
   presented as the 1–3 scored candidates (§3.2, §7). The **target** ("higher credit risk") is policy-sensitive
@@ -1008,8 +1011,10 @@ reproducible provenance of the call** (Decision D5):
 ### 9.4 No raw data or PII to the LLM (boundary enforced, not merely intended)
 
 The LLM sees **only**: (a) the scientist's **intent text, PII-scanned and redacted**, and (b) **catalog
-metadata** — object/column **names, types, and asserted grain** (from SP-1's merged view). It **never** sees
-data rows, column *values*, samples, extrema, or overlay evidence metrics (Decision D5). This is enforced at
+metadata** — object/column **names, types, and asserted grain** (from SP-1's merged view), **plus any
+catalog-*declared* enum/code metadata** (schema-declared allowed codes, not profiled data; §4.4). It **never**
+sees data rows, column *values* — actual/profiled value sets or status-code sets (SP-1 profiling / SP-3
+grounding, §4.4) — samples, extrema, or overlay evidence metrics (Decision D5). This is enforced at
 **two points**:
 
 1. **Ingest (owned by SP-0):** **SP-0 owns envelope PII-scanning + classification.** On submission SP-0 scans
