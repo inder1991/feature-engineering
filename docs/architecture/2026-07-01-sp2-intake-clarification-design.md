@@ -407,7 +407,7 @@ from the generation-priming `DomainCatalogEntry` slice the `CandidateGenerator` 
 | `blocked_data_classes` | **explicitly prohibited / blocked** data classes (→ **`PROHIBITED_DATA_CLASS`**, §5.4, §8.4) |
 | `sensitive_proxy_hints` | sensitive-proxy hints carried **only** as *"requires clarification / compliance review"* — **never** an automatic block or standalone proof of prohibition (§6.2, §6.7, §8.4) |
 | `jurisdiction_scope` / `use_case_scope` | the scope in which each rule applies — **where rules differ by product or region** |
-| `version`, `owner`, `effective_date`, `source` / `provenance` | catalog **version**, governance **owner**, **effective date**, and **source/provenance** — the `version` is recorded on every non-clear classification outcome as audit / MRM provenance |
+| `version`, `owner`, `effective_date`, `source` / `provenance` | catalog **version**, governance **owner**, **effective date**, and **source/provenance** — the `version` is recorded on **every** classification outcome — **including a CLEAR/PASS** — as audit / MRM provenance (completeness rule (c) below) |
 
 **Deterministic intake-classification outcomes (the behaviour §5.4 and §8.4 encode).** The intake screen is a
 **deterministic classifier** over this seed (never the LLM's call, §5.4), producing exactly one of:
@@ -424,7 +424,33 @@ from the generation-priming `DomainCatalogEntry` slice the `CandidateGenerator` 
 Outcomes 1–2 are **deterministic, fail-closed, and never fake a compliance approval** (§8.4), and each stamps
 the catalog `version` (and, for 2, the matched class) for audit/MRM; outcomes 3–4 are **not** terminal and
 route into the clarification path (§6.2, §6.5). *(An in-scope banking request that matches no known use-case is
-neither of these — it parks into `NEEDS_USE_CASE_ONBOARDING`, §5.4, §11.)*
+neither of these — it parks into `NEEDS_USE_CASE_ONBOARDING`, §5.4, §11.)* The **completeness rules** below make
+the classifier contract **total**.
+
+**Classifier contract — completeness rules (deterministic, fail-closed).**
+
+- **(a) Precedence — most-restrictive-wins.** When an intent matches more than one outcome, the classifier
+  emits the single **most restrictive**: **`PROHIBITED_DATA_CLASS` > `OUT_OF_SCOPE` > sensitive-proxy → clarify
+  > ambiguous → clarify**. A prohibited-class match dominates everything; out-of-scope dominates the two
+  clarification routings; between the clarification routings the sensitive-proxy review outranks a plain
+  ambiguity. **Exactly one** outcome is produced, deterministically.
+- **(b) Catalog unavailable / unversioned → fail-closed.** If the `BankingDomainCatalog` cannot be loaded, or
+  carries no resolvable `version`, the screen **fails closed**: the run is **parked** for clarification /
+  manual review (§5.4) — **never auto-passed, never silently allowed**. An intake can never proceed against an
+  absent or unversioned catalog.
+- **(c) Version stamped on EVERY outcome — including CLEAR/PASS.** The catalog `version` is recorded on
+  **every** classification outcome, not only blocks/parks: a **CLEAR/PASS** (in-scope, not-prohibited) stamps
+  the `version` too, so an **allow is as auditable as a block** — MRM / adverse-action must be able to prove
+  *what an intent was cleared against*, not only what was rejected.
+- **(d) Version drift — record at intake, re-evaluate at confirmation.** The catalog `version` is recorded at
+  **intake** and the classification is **re-evaluated at confirmation** (§8.4). If the `version` has changed and
+  the new version would **flip** the outcome (e.g. a use-case now blocked, or a formerly-blocked class now
+  permitted), the run **re-clarifies** rather than silently confirming against the stale classification. A
+  confirmation never rides an out-of-date classification.
+- **(e) Jurisdiction / use-case scope needs request context.** The `jurisdiction_scope` / `use_case_scope`
+  rules apply per **product / region**; evaluating them requires the request to carry that product/region
+  context. If it is **absent**, the scope cannot be resolved → the outcome is **ambiguity → clarification**
+  (§6.2), never a silent pass.
 
 ---
 
@@ -485,9 +511,9 @@ The intake **banking-boundary screen** is a **deterministic classifier** over th
 `BankingDomainCatalog` seed (§4.5) — the closed banking boundary + entity/concept taxonomy (`allowed_domains`
 / `allowed_use_cases`, `out_of_scope_examples`), the `blocked_data_classes`, and the `sensitive_proxy_hints`.
 It is **not** the LLM's call — the LLM may *suggest* a use-case label, but the deterministic screen decides the
-outcome. Every non-clear outcome **records the matched reason and the catalog `version`** as audit/MRM
-provenance. The screen produces exactly one of these **deterministic classification outcomes** (design §3:90,
-§15.5–15.6):
+outcome. **Every** outcome — including a **CLEAR/PASS** — records the catalog `version` (and, for a non-clear
+outcome, the matched reason) as audit/MRM provenance (§4.5 completeness rule (c)). The screen produces exactly
+one of these **deterministic classification outcomes** (design §3:90, §15.5–15.6):
 
 1. **Out of banking scope** — no banking entity, data, or concept, or a match against `out_of_scope_examples`
    → **reject or park as `OUT_OF_SCOPE`**, recording the **reason** and the **catalog `version`**. Surfaced as
@@ -502,6 +528,14 @@ provenance. The screen produces exactly one of these **deterministic classificat
    automatic block or standalone proof. **Non-terminal.**
 4. **Ambiguous intent** — banking-plausible but under-specified scope → **open clarification** (§6.2). **Do NOT
    auto-reject. Non-terminal.**
+
+**The screen is total (completeness rules, §4.5).** When several outcomes match, the classifier applies
+**most-restrictive-wins** precedence (`PROHIBITED_DATA_CLASS` > `OUT_OF_SCOPE` > sensitive-proxy → clarify >
+ambiguous → clarify), emitting **exactly one** outcome (§4.5(a)). If the catalog is **unavailable or
+unversioned**, the screen **fails closed** — the run **parks** for clarification / manual review, never
+auto-passes (§4.5(b)). If the request lacks the **product / region** context that `jurisdiction_scope` /
+`use_case_scope` need, the scope is unresolved → **ambiguity → clarification** (§4.5(e)). The catalog `version`
+recorded here at intake is **re-evaluated at confirmation** for drift (§4.5(d), §8.4).
 
 **Rejection / withdrawal authority.** The two deterministic **terminal** rejections (`OUT_OF_SCOPE`,
 `PROHIBITED_DATA_CLASS`) are **platform/service-issued terminal outcomes** — the platform's *deterministic
@@ -663,7 +697,11 @@ machine-checkable (registered as SP-0 lifecycle guards, §11). All must hold:
    returned neither `OUT_OF_SCOPE` nor `PROHIBITED_DATA_CLASS`, and (for a policy-sensitive use-case) the
    target is a permitted, non-blocked concept. A **prohibited-data-class** match routes to the §8.4 block
    (stamping the matched class + catalog `version`); a **sensitive-proxy-hint** match routes back to
-   **must-ask clarification / compliance review** (§6.2), *not* to the deterministic block. This is the
+   **must-ask clarification / compliance review** (§6.2), *not* to the deterministic block. If the catalog is
+   **unavailable / unversioned**, MCV #5 **fails closed** — it can never pass on an absent classification; the
+   run **parks** for clarification / manual review (§4.5(b)). A passing (**CLEAR**) outcome **stamps the catalog
+   `version`** (§4.5(c)) so the *allow* is auditable, and that intake-time `version` is what §8.4 re-checks for
+   **drift** (§4.5(d)). This is the
    **deterministic pre-gate scope / blocked-class check** that lets Gate #1 *open*; it is deliberately re-run
    as the **fail-closed compliance backstop at the moment of confirmation** by the prohibited-intent screen of
    **§8.4 #2** (which is authoritative for the block). Both exist by design (§8.4).
@@ -807,7 +845,13 @@ Two deterministic screens run before / at Gate #1:
 
 2. **Prohibited-intent screen → deterministic block, or route sensitive proxies to clarification.** This is
    the **fail-closed compliance backstop**, re-running the §5.4 deterministic classification over the
-   `BankingDomainCatalog` (§4.5) at the moment of confirmation. It resolves into **two distinct routings**:
+   `BankingDomainCatalog` (§4.5) at the moment of confirmation. It also enforces **version drift** (§4.5(d)):
+   the **intake-time** catalog `version` recorded on the draft is compared to the **current** one, and if the
+   catalog changed such that the new version would **flip** the classification, the run **re-clarifies** rather
+   than confirming against a stale result — a confirmation never silently rides an out-of-date classification.
+   If the catalog is **unavailable / unversioned** at confirmation, the screen **fails closed** and parks
+   (§4.5(b)), and the CLEAR/PASS it grants **stamps the catalog `version`** (§4.5(c)). It resolves into **two
+   distinct routings**:
    - **Explicit prohibited data class → `PROHIBITED_DATA_CLASS` block.** If the intent targets or filters on a
      `blocked_data_classes` member (e.g. a protected attribute used as a credit-decisioning input), Gate #1
      **blocks / rejects as `PROHIBITED_DATA_CLASS`**, recording the **matched class** and the **catalog
@@ -1282,6 +1326,7 @@ adapter is exercised only in an **opt-in, config-gated smoke test** never gated 
 | 11 | Gate #1 is not four-eyes | Decision 2 | Encoded: author confirms own intent (audited intent lock); `requires_independent_validation` is a **flag only**, no second signer; independent validation is Gate #2 / SP-5 (§8.2, §8.4). |
 | 12 | Real adapter details | Decision 3: "real Claude adapter shipped, config-gated, never required in CI; no silent fallback" | Encoded with concrete Claude API: model `claude-opus-4-8`, adaptive thinking, structured outputs via `output_config.format`, `stop_reason=="refusal"` → repair/clarification, fail-closed (no fallback to FakeLLM) (§9.5). *Model/API specifics grounded in the current Claude API; not a deviation.* |
 | 13 | Rejection / withdrawal authority | SP-0: `reject` is **validator-only** (`authz/policy.py:42`); `withdraw` is **data-scientist-owned** (`authz/policy.py:41`) | **Corrected authority.** SP-2's deterministic intake rejections (`OUT_OF_SCOPE`/`PROHIBITED_DATA_CLASS`) are **platform/service-issued terminal outcomes** — the deterministic classifier decided, **not** a validator — issued via SP-2's own **`reject_intent`** action (→ SP-0 `RUN_REJECTED`) under **one additive service `authz_policy` row** (§2.1 #4); they do **not** reuse SP-0's validator-only `reject`. **Requester-initiated abandonment** (the author walking away — e.g. a Gate #1 `reject` response, or giving up on a blocked/looping intent) reuses **SP-0 `withdraw`** (→ `RUN_WITHDRAWN`), never `reject`. SP-0's validator-only `reject` stays reserved for independent validation (Gate #2 / SP-5). The added row **changes no existing SP-0 row**, so SoD holds. (§5.4, §8.4, §11, §13, §2.1.) |
+| 14 | `BankingDomainCatalog` classifier — completeness contract | Decision 8 (ratified catalog, entry 8) *(specified the outcomes but not precedence / availability / version-stamping / drift / scope inputs)* | **Completed the classifier contract (§4.5, §5.4).** (a) **Precedence = most-restrictive-wins** (`PROHIBITED_DATA_CLASS` > `OUT_OF_SCOPE` > sensitive-proxy → clarify > ambiguous → clarify) — exactly one outcome. (b) **Catalog unavailable / unversioned → fail-closed** (park for clarification/manual; never auto-pass). (c) **Catalog `version` stamped on EVERY outcome, including CLEAR/PASS** — an allow is as auditable as a block. (d) **Version drift** — `version` recorded at intake and **re-evaluated at confirmation** (§8.4); a changed version that would flip the outcome forces **re-clarify**, never a silent stale confirm. (e) **Jurisdiction / use-case scope** needs **product/region** on the request; absent → **ambiguity → clarify**. All deterministic, all fail-closed; **extends** the ratified catalog contract (entry 8), not a deviation. (§4.5, §5.4, §6.7, §8.4.) |
 
 ---
 
@@ -1297,8 +1342,9 @@ model **`claude-opus-4-8`**, `thinking={"type":"adaptive"}`, structured output v
 `output_config={"format":{"type":"json_schema","schema":…}}` (or `client.messages.parse()`), `stop_reason`
 handled — config-gated, never in CI. Catalog reads go through **SP-1's merged-view API** (`resolve_fact` /
 `list_objects`). The **`BankingDomainCatalog`** (§4.5) is loaded read-only from the design's
-`banking-domain-catalog` seed for the boundary + blocked-class + sensitive-proxy screens, and every non-clear
-classification stamps the catalog `version` for audit.
+`banking-domain-catalog` seed for the boundary + blocked-class + sensitive-proxy screens, and **every**
+classification — **including a CLEAR/PASS** — stamps the catalog `version` for audit (§4.5(c)); an
+unavailable/unversioned catalog **fails closed** (§4.5(b)).
 
 ## Appendix B — The two running examples, end to end
 
