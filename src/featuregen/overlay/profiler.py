@@ -10,7 +10,9 @@ from featuregen.overlay.catalog import CatalogAdapter, CatalogObject
 from featuregen.overlay.facts import validate_fact_value
 from featuregen.overlay.identity import CatalogObjectRef
 from featuregen.overlay.profiler_heuristics import (
+    AVAILABILITY_TIME,
     GRAIN,
+    SCD_EFFECTIVE_DATING,
     Proposal,
     _combination_grain,
     _grain_proposal,
@@ -34,9 +36,6 @@ __all__ = [
     "AVAILABILITY_TIME",
     "SCD_EFFECTIVE_DATING",
 ]
-
-AVAILABILITY_TIME = "availability_time"
-SCD_EFFECTIVE_DATING = "scd_effective_dating"
 
 _FROM_TOKENS = ("valid_from", "effective_from", "eff_from", "start_date", "valid_start")
 _TO_TOKENS = ("valid_to", "effective_to", "eff_to", "end_date", "valid_end")

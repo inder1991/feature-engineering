@@ -28,6 +28,7 @@ from featuregen.overlay.authority import (
     resolve_authority,
 )
 from featuregen.overlay.catalog import current_catalog_adapter
+from featuregen.overlay.expiry import schedule_expiry
 from featuregen.overlay.facts import FactValidationError, validate_fact_value
 from featuregen.overlay.identity import (
     display_object_ref,
@@ -134,10 +135,6 @@ def confirm_fact(conn: DbConn, cmd: Command) -> CommandResult:
         expected_version=stream[-1].stream_version,
     )
     # Arm the SP-0 overlay_expiry timer on this fact-key stream.
-    from featuregen.overlay.freshness import (
-        schedule_expiry,  # local import avoids a circular import between commands and freshness
-    )
-
     schedule_expiry(conn, key, confirmed.event_id, expires_at)
     _close_fact_tasks(conn, key, reason="fact confirmed")
     return CommandResult(accepted=True, aggregate_id=key, produced_event_ids=(confirmed.event_id,))
@@ -301,10 +298,6 @@ def enter_fact(conn: DbConn, cmd: Command) -> CommandResult:
         caused_by=draft.event_id,
     )
     # A self-confirmed fact reaches VERIFIED too, so it also gets an overlay_expiry timer.
-    from featuregen.overlay.freshness import (
-        schedule_expiry,  # local import avoids a circular import between commands and freshness
-    )
-
     schedule_expiry(conn, key, confirmed.event_id, expires_at)
     return CommandResult(
         accepted=True, aggregate_id=key, produced_event_ids=(draft.event_id, confirmed.event_id)

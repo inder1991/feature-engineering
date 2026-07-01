@@ -29,6 +29,20 @@ class ApprovedJoinRef:
     cardinality: str
 
 
+def _ref_from_payload(d):
+    """Rebuild the typed ref stored on OVERLAY_FACT_PROPOSED.payload['catalog_object_ref']
+    (an asdict() of CatalogObjectRef, or of ApprovedJoinRef for approved_join). Shared decoder
+    used by both freshness pollers (fire_due_overlay_expiries / detect_catalog_changes)."""
+    if "column_pairs" in d:
+        return ApprovedJoinRef(
+            from_ref=CatalogObjectRef(**d["from_ref"]),
+            to_ref=CatalogObjectRef(**d["to_ref"]),
+            column_pairs=tuple(ColumnPair(**p) for p in d["column_pairs"]),
+            cardinality=d["cardinality"],
+        )
+    return CatalogObjectRef(**d)
+
+
 def _norm(value: str | None) -> str | None:
     return value.strip().lower() if value is not None else None
 

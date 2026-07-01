@@ -20,6 +20,7 @@ from featuregen.overlay._lifecycle import (
 )
 from featuregen.overlay._types import JoinSide
 from featuregen.overlay.authority import proposer_ne_confirmer
+from featuregen.overlay.expiry import schedule_expiry
 from featuregen.overlay.facts import FactValidationError, validate_fact_value
 from featuregen.overlay.store import append_overlay_event
 
@@ -139,9 +140,6 @@ def _confirm_approved_join(conn, cmd, key, stream, state, authority):
         caused_by=confirms_event_id,
         expected_version=stream[-1].stream_version,  # pin OCC to the folded head
     )
-    # local import avoids a circular import between commands and freshness
-    from featuregen.overlay.freshness import schedule_expiry
-
     schedule_expiry(conn, key, confirmed.event_id, expires_at)  # arm overlay_expiry
     _close_fact_tasks(conn, key, reason="join fully confirmed")
     return CommandResult(accepted=True, aggregate_id=key, produced_event_ids=(confirmed.event_id,))

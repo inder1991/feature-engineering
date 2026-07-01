@@ -6,8 +6,8 @@ from dataclasses import dataclass
 from featuregen.contracts.db import DbConn
 from featuregen.contracts.errors import ConcurrencyError
 from featuregen.overlay.authority import resolve_authority
-from featuregen.overlay.expiry import _ref_from_payload
 from featuregen.overlay.facts import OVERLAY_FACT_STALED
+from featuregen.overlay.identity import _ref_from_payload
 from featuregen.overlay.projection import dependents_of
 from featuregen.overlay.reverify_tasks import open_reverify_task
 from featuregen.overlay.state import fold_overlay_state

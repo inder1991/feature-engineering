@@ -11,7 +11,7 @@ from featuregen.identity.build import build_service_identity
 from featuregen.overlay.authority import resolve_authority
 from featuregen.overlay.catalog import current_catalog_adapter
 from featuregen.overlay.facts import OVERLAY_FACT_EXPIRED
-from featuregen.overlay.identity import ApprovedJoinRef, CatalogObjectRef, ColumnPair
+from featuregen.overlay.identity import _ref_from_payload
 from featuregen.overlay.reverify_tasks import open_reverify_task
 from featuregen.overlay.state import fold_overlay_state
 from featuregen.overlay.store import append_overlay_event, load_fact
@@ -38,19 +38,6 @@ def schedule_expiry(
             payload={"confirmed_event_id": confirmed_event_id},
         ),
     )
-
-
-def _ref_from_payload(d):
-    """Rebuild the typed ref stored on OVERLAY_FACT_PROPOSED.payload['catalog_object_ref']
-    (an asdict() of CatalogObjectRef, or of ApprovedJoinRef for approved_join)."""
-    if "column_pairs" in d:
-        return ApprovedJoinRef(
-            from_ref=CatalogObjectRef(**d["from_ref"]),
-            to_ref=CatalogObjectRef(**d["to_ref"]),
-            column_pairs=tuple(ColumnPair(**p) for p in d["column_pairs"]),
-            cardinality=d["cardinality"],
-        )
-    return CatalogObjectRef(**d)
 
 
 def _expiry_target_current(state, confirmed_event_id: str) -> bool:

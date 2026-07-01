@@ -26,6 +26,8 @@ if TYPE_CHECKING:
     from featuregen.overlay.profiler import ProfilerLimits
 
 GRAIN = "grain"
+AVAILABILITY_TIME = "availability_time"
+SCD_EFFECTIVE_DATING = "scd_effective_dating"
 
 
 @dataclass(frozen=True, slots=True)
