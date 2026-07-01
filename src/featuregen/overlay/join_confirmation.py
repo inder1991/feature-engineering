@@ -62,14 +62,14 @@ def _confirm_approved_join(conn, cmd, key, stream, state, authority):
     actor = cmd.actor
     owners = {s for s in authority.subjects if s}
     # A mixed join (one known owner + one unknown/governance side) requires a platform-admin to act
-    # for the governance side; otherwise only the resolved owners may confirm (decision 7).
+    # for the governance side; otherwise only the resolved owners may confirm.
     is_owner = actor.subject in owners
     is_governance = authority.governance_queue and "platform-admin" in actor.role_claims
     if not (is_owner or is_governance):
         return _deny_audited(conn, cmd, key, "actor is not an owner of either side of the join")
     if not proposer_ne_confirmer(stream, actor):
         return _deny_audited(conn, cmd, key, "proposer may not confirm (four-eyes, §6.5)")
-    # Decide first-vs-second from the CURRENT cycle's partials only (C1): the fold resets
+    # Decide first-vs-second from the CURRENT cycle's partials only: the fold resets
     # state.partial_confirmers = [] on every OVERLAY_FACT_CONFIRMED, and EXPIRED/STALED leave it
     # empty, so a re-verify cycle starts with no partials. Scanning the raw stream would treat a
     # PRIOR cycle's PARTIALLY_CONFIRMED as this cycle's first confirm and bypass two-party SoD on
@@ -88,7 +88,7 @@ def _confirm_approved_join(conn, cmd, key, stream, state, authority):
             },
             actor=actor,
             caused_by=state.draft_event_id,
-            # Pin OCC to the folded head (C2): otherwise both owners can load DRAFT, both take this
+            # Pin OCC to the folded head: otherwise both owners can load DRAFT, both take this
             # first-confirmer branch and both append PARTIALLY_CONFIRMED, permanently stranding the
             # join (no CONFIRMED, no open task). The loser collides and re-loads into the second path.
             expected_version=stream[-1].stream_version,
@@ -100,7 +100,7 @@ def _confirm_approved_join(conn, cmd, key, stream, state, authority):
         return _deny_audited(
             conn, cmd, key, "this owner already confirmed; awaiting the other owner"
         )
-    # Side coverage (finding 3): when one side has a KNOWN owner and the other routes to the
+    # Side coverage: when one side has a KNOWN owner and the other routes to the
     # governance queue, the two confirmations must be one owner + one platform-admin. Two
     # platform-admins must NOT verify a join that has a known owner (that bypasses the owner's side).
     if authority.governance_queue and owners:
@@ -108,9 +108,9 @@ def _confirm_approved_join(conn, cmd, key, stream, state, authority):
             return _deny_audited(
                 conn, cmd, key, "a known owner must confirm their side of the join"
             )
-    # Validate the FINAL value before the second-owner CONFIRMED append (pin 17 — the join confirm
+    # Validate the FINAL value before the second-owner CONFIRMED append (the join confirm
     # path validates too, even though approved_join takes no override). On a re-verify, re-affirm
-    # the last verified value (symmetry with confirm_fact, P1b); benign today since approved_join
+    # the last verified value (symmetry with confirm_fact); benign today since approved_join
     # takes no override (prior_value == proposed_value across cycles), but future-proof.
     value = (
         state.prior_value
@@ -124,7 +124,7 @@ def _confirm_approved_join(conn, cmd, key, stream, state, authority):
             accepted=False, aggregate_id=key, denied_reason=f"invalid confirmed value: {exc}"
         )
     expires_at = datetime.now(UTC) + _DEFAULT_TTL
-    # Thread the cycle-stable head (F7): _cas_target at PARTIALLY_CONFIRMED returns
+    # Thread the cycle-stable head: _cas_target at PARTIALLY_CONFIRMED returns
     # `confirmed_event_id or draft_event_id` — cycle 1 yields the draft (unchanged), a re-verify
     # cycle yields the prior confirmed_event_id (the confirmation actually being re-verified), so the
     # recorded causality (confirms_event_id + caused_by) matches single-fact confirm_fact.
@@ -141,11 +141,11 @@ def _confirm_approved_join(conn, cmd, key, stream, state, authority):
         },
         actor=actor,
         caused_by=confirms_event_id,
-        expected_version=stream[-1].stream_version,  # pin OCC to the folded head (C2)
+        expected_version=stream[-1].stream_version,  # pin OCC to the folded head
     )
-    # local import: freshness.py is created in Task 4.3 (avoids a top-level forward dependency)
+    # local import avoids a circular import between commands and freshness
     from featuregen.overlay.freshness import schedule_expiry
 
-    schedule_expiry(conn, key, confirmed.event_id, expires_at)  # arm overlay_expiry (decision 5)
+    schedule_expiry(conn, key, confirmed.event_id, expires_at)  # arm overlay_expiry
     _close_fact_tasks(conn, key, reason="join fully confirmed")
     return CommandResult(accepted=True, aggregate_id=key, produced_event_ids=(confirmed.event_id,))

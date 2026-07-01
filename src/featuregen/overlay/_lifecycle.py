@@ -18,7 +18,7 @@ from featuregen.security.audit import record_denial
 
 # Non-terminal folded statuses: while a fact sits in any of these a fresh proposal is denied —
 # a live VERIFIED fact stays usable until its OWN re-verify flow replaces it (no VERIFIED->DRAFT
-# regression). Only an empty stream or a REJECTED terminal admits a new proposal (decision 6).
+# regression). Only an empty stream or a REJECTED terminal admits a new proposal.
 _NON_TERMINAL = ("DRAFT", "PARTIALLY_CONFIRMED", "VERIFIED", "REVERIFY", "STALE")
 
 # Statuses from which a fact is still awaiting a confirm/reject decision. VERIFIED is excluded
@@ -26,7 +26,7 @@ _NON_TERMINAL = ("DRAFT", "PARTIALLY_CONFIRMED", "VERIFIED", "REVERIFY", "STALE"
 _AWAITING_CONFIRMATION = ("DRAFT", "PARTIALLY_CONFIRMED", "REVERIFY", "STALE")
 
 # Default re-verify horizon stamped onto OVERLAY_FACT_CONFIRMED and armed as the overlay_expiry
-# timer (decision 5; the design calls this a "configurable horizon"). 180 days = semi-annual.
+# timer (the design calls this a "configurable horizon"). 180 days = semi-annual.
 _DEFAULT_TTL = timedelta(days=180)
 
 
@@ -36,7 +36,7 @@ class OverlayCommandError(Exception):
 
 def _deny_audited(conn: DbConn, cmd: Command, key: str, reason: str) -> CommandResult:
     """Emit a tamper-evident COMMAND_DENIED security_audit row for an AUTHORITY or four-eyes/SoD
-    handler denial (F4), then return the denial. These fine-grained denials happen INSIDE the handler
+    handler denial, then return the denial. These fine-grained denials happen INSIDE the handler
     (the coarse PolicyAuthorizer only audits role/kind/scope + coarse SoD denials), so without this
     they leave zero audit trace — a detective-control gap in a regulator-retention security chain.
     Benign validation/duplicate/wrong-state/CAS-stale denials stay unaudited (plain CommandResult).
@@ -64,7 +64,7 @@ def _cas_target(state) -> str | None:
     if state.status == "PARTIALLY_CONFIRMED":
         # Re-verify cycle carries the prior confirmed_event_id (the id the per-side re-verify tasks
         # are stamped with by freshness.open_reverify_task); keep it as the cycle-stable CAS target
-        # so the SECOND re-confirmer's task-scoped target still matches after the first partial (P1a).
+        # so the SECOND re-confirmer's task-scoped target still matches after the first partial.
         # The initial cycle has no prior confirmation (cleared on PROPOSED) -> bind to the open draft.
         return state.confirmed_event_id or state.draft_event_id
     return state.confirmed_event_id
@@ -78,7 +78,7 @@ def _close_fact_tasks(
 
     With `subject` set, only that assignee's side task is closed (matched on the task's
     `eligible_assignees->>'subject'`) — used by the approved_join PARTIALLY_CONFIRMED step so the
-    OTHER side's task stays open for the second owner (decision 7). Default closes every open task."""
+    OTHER side's task stays open for the second owner. Default closes every open task."""
     if subject is None:
         rows = conn.execute(
             "SELECT task_id FROM human_tasks WHERE fact_key=%s AND status='open'",

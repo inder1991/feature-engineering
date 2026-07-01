@@ -1,7 +1,7 @@
 """The proposal entry-point command (SP-1 design §6).
 
 Houses `propose_fact` — the proposal handler that validates a fact value, enforces replacement
-semantics (decision 6), mints evidence atomically (P2a), appends `OVERLAY_FACT_PROPOSED`, and opens
+semantics, mints evidence atomically, appends `OVERLAY_FACT_PROPOSED`, and opens
 one human-gate task per resolved authority side. Lifted out of `commands.py`; `commands` re-exports
 it (and references it from `_OVERLAY_CATALOG`) so existing `featuregen.overlay.commands` imports keep
 resolving.
@@ -31,7 +31,7 @@ from featuregen.overlay.store import load_fact
 def propose_fact(conn: DbConn, cmd: Command) -> CommandResult:
     """Validate and record a proposed fact, then open a human-gate task per authority side.
 
-    Replacement semantics (decision 6): denied whenever a non-terminal fact already exists for the
+    Replacement semantics: denied whenever a non-terminal fact already exists for the
     `fact_key`; only an empty stream or a REJECTED terminal admits a new proposal, and a previously
     rejected `proposal_fingerprint` stays sticky-denied.
     """
@@ -48,7 +48,7 @@ def propose_fact(conn: DbConn, cmd: Command) -> CommandResult:
     use_case = args.get("use_case")
     proposed_value = args["proposed_value"]
     evidence_ref = args.get("evidence_ref")
-    # P2a: a caller (the profiler) may hand propose_fact the raw evidence metric payload instead of
+    # a caller (the profiler) may hand propose_fact the raw evidence metric payload instead of
     # a pre-minted evidence_ref. propose_fact mints the immutable evidence row ITSELF, after every
     # replacement-semantics deny path has returned, so a denied proposal never orphans an evidence
     # row. Legacy callers passing an explicit evidence_ref keep their existing behavior.
@@ -96,7 +96,7 @@ def propose_fact(conn: DbConn, cmd: Command) -> CommandResult:
                     "fingerprint previously rejected (sticky); change the proposal to re-submit"
                 ),
             )
-    # Mint evidence atomically with the accepted append (P2a). Every deny path above returns before
+    # Mint evidence atomically with the accepted append. Every deny path above returns before
     # this point, so no evidence row is written for a denied proposal. If a concurrent tx commits a
     # non-terminal fact for this key between the load_fact above and the append below, append_event's
     # OCC raises ConcurrencyError and this INSERT rolls back with the rest of the transaction —
@@ -111,7 +111,7 @@ def propose_fact(conn: DbConn, cmd: Command) -> CommandResult:
             profile_version=evidence_payload["profile_version"],
             thresholds_used=evidence_payload["thresholds"],
             metric_values=evidence_payload["metric_values"],
-            created_by=identity_to_jsonb(cmd.actor),  # pin 14: a dict, never a raw IdentityEnvelope
+            created_by=identity_to_jsonb(cmd.actor),  # a dict, never a raw IdentityEnvelope
         )
     authority = resolve_authority(conn, adapter, ref, fact_type)
     draft = _commands.append_overlay_event(
@@ -129,12 +129,12 @@ def propose_fact(conn: DbConn, cmd: Command) -> CommandResult:
             "proposed_by": cmd.actor.subject,
         },
         actor=cmd.actor,
-        # Pin OCC to the observed head (I4): a fresh propose expects an empty stream (0); the only
+        # Pin OCC to the observed head: a fresh propose expects an empty stream (0); the only
         # non-fresh propose that proceeds is a re-propose after REJECTED — pin it to the rejected
         # head so a concurrent re-propose collides cleanly instead of appending a duplicate DRAFT.
         expected_version=0 if not existing else existing[-1].stream_version,
     )
-    # One task per resolved side (decision 7): a known side -> the data owner; an unknown side ->
+    # One task per resolved side: a known side -> the data owner; an unknown side ->
     # the platform-admin/governance queue. `task_assignees` dedupes same-owner / both-unknown.
     for eligible in authority.task_assignees:
         open_task(

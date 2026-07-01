@@ -1,7 +1,7 @@
 """Overlay command facade (SP-1 design §6).
 
 A thin facade that wires the overlay command handlers — each now lives in its own module — into the
-SP-0 command registry. It owns the `_OVERLAY_CATALOG` (the ordered `(action, handler)` tuple, pin 12)
+SP-0 command registry. It owns the `_OVERLAY_CATALOG` (the ordered `(action, handler)` tuple)
 and the idempotent `register_overlay_commands`, and RE-EXPORTS every handler (`propose_fact`,
 `confirm_fact`, `reject_fact`, `enter_fact`, `_run_profiler`) plus the back-compat names
 (`OverlayCommandError`, `_confirm_approved_join`, `_existing_proposal_fingerprint`,
@@ -32,8 +32,8 @@ from featuregen.overlay.proposal_commands import propose_fact as propose_fact
 from featuregen.overlay.store import append_overlay_event as append_overlay_event
 from featuregen.overlay.task_read import get_task_proposal as get_task_proposal
 
-# `_OVERLAY_CATALOG` is a TUPLE of (action, handler) pairs (pin 12 — mirrors SP-0's `_CATALOG`),
-# NOT a dict. Phase 6 appends ("run_profiler", ...).
+# `_OVERLAY_CATALOG` is a TUPLE of (action, handler) pairs (mirrors SP-0's `_CATALOG`),
+# NOT a dict; it includes ("run_profiler", ...).
 _OVERLAY_CATALOG = (
     ("propose_fact", propose_fact),
     ("confirm_fact", confirm_fact),
@@ -44,7 +44,7 @@ _OVERLAY_CATALOG = (
 
 
 def register_overlay_commands() -> None:
-    """Idempotent (decision 8): `register_command` raises on duplicate and the command registry
+    """Idempotent: `register_command` raises on duplicate and the command registry
     persists across tests (the root harness resets only the event registry), so skip any action
     that is already registered instead of re-registering it."""
     for action, handler in _OVERLAY_CATALOG:

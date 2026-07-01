@@ -17,13 +17,13 @@ def open_reverify_task(
     """Reopen the §6 re-verification gate, CAS-bound to the fact's current confirmed_event_id
     (stored as each task's target_event_id; a later confirm/reject is rejected if the fact has
     since advanced). Opens one task **per resolved side** by iterating `authority.task_assignees`
-    (pin 19) — the SAME per-side plan the initial proposal used (Phase 4 Task 4.2): a
+    — the SAME per-side plan the initial proposal used: a
     single-authority fact yields one task, an `approved_join` with two distinct owners yields one
     task per side (an unknown side routes to the platform-admin/governance queue). The gate is
     shared (`authority.gate` — `OVERLAY_DATA_OWNER` for data facts, `OVERLAY_COMPLIANCE` for
     policy_tag). prior_value is NOT stored on human_tasks (it has no such column) — it is surfaced
     through the overlay_proposal read model, which the projection sets to the prior value on
-    EXPIRED/STALED, and read back via get_task_proposal (Phase 4.6). Returns the opened task ids."""
+    EXPIRED/STALED, and read back via get_task_proposal. Returns the opened task ids."""
     del fact_type  # gate is taken from the resolved authority; kept for caller symmetry
     task_ids: list[str] = []
     for eligible in authority.task_assignees:

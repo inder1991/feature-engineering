@@ -101,7 +101,7 @@ class PostgresCatalog:
     """Reference ``CatalogAdapter`` over a live PostgreSQL connection.
 
     Structural metadata only: existence/columns/types from ``information_schema`` and stable
-    native object ids from ``pg_catalog`` (for rename detection, design §8 / overview pin 16) —
+    native object ids from ``pg_catalog`` (for rename detection, design §8) —
     a table's ``native_oid`` is its ``pg_class.oid``; a column's ``native_oid`` is the composite
     ``"<table_oid>:<attnum>"`` (``pg_attribute.attnum`` is not reused on rename, so column
     identity survives renames). It records NONE of the five ML fact types, so ``get_fact``
@@ -155,7 +155,7 @@ class PostgresCatalog:
                     )
                 )
             # Columns with their information_schema data types, plus a stable composite
-            # native_oid of "<table_oid>:<attnum>" (design §8, overview pin 16). attnum is
+            # native_oid of "<table_oid>:<attnum>" (design §8). attnum is
             # assigned at column creation and is NOT reused on rename, so the column's identity
             # survives a rename — letting change detection track renames instead of degrading
             # them to drop/add. The table oid (pg_class.oid) and attnum (pg_attribute.attnum)

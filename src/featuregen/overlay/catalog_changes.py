@@ -108,7 +108,7 @@ def _stale_one(conn: DbConn, adapter, fact_key: str, *, change_ref: str, actor) 
     CAS no-op when the fact has already advanced (not VERIFIED — already STALE/REVERIFY/
     REJECTED, or a concurrent confirm bumps the stream → ConcurrencyError). On success
     append OVERLAY_FACT_STALED + open the re-verify task(s) (one task PER side for an
-    approved_join, pin 19). Returns the event id or None."""
+    approved_join). Returns the event id or None."""
     stream = load_fact(conn, fact_key)
     if not stream:
         return None

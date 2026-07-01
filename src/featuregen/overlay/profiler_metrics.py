@@ -77,7 +77,7 @@ def _apply_statement_timeout(conn: DbConn, limits: ProfilerLimits) -> None:
 def _sampling(row_count: int, limits: ProfilerLimits) -> tuple[int, sql.Composable]:
     if row_count > limits.sample_threshold_rows:
         # Allow sub-1% so the cap is REAL: flooring at 1.0 would scan ~1% of a huge table while
-        # reporting the nominal sample_size (finding 5). BERNOULLI accepts a sub-1 percentage.
+        # reporting the nominal sample_size. BERNOULLI accepts a sub-1 percentage.
         pct = min(100.0, 100.0 * limits.sample_size / row_count)
         return min(row_count, limits.sample_size), sql.SQL("TABLESAMPLE BERNOULLI ({})").format(
             sql.Literal(pct)
@@ -91,7 +91,7 @@ def _combination_distinct(
     cols = sql.SQL(", ").join(sql.Identifier(c) for c in columns)
     # ONE materialized sampled CTE so count(*) and the grouped-distinct count are computed from the
     # SAME Bernoulli sample — applying {sample} twice would draw two different samples and skew the
-    # uniqueness ratio (finding 6).
+    # uniqueness ratio.
     query = sql.SQL(
         "WITH s AS MATERIALIZED (SELECT {cols} FROM {tbl} {sample}) "
         "SELECT (SELECT count(*) FROM s) AS n, "

@@ -42,8 +42,8 @@ def confirm_fact(conn: DbConn, cmd: Command) -> CommandResult:
     """Confirm a proposed fact → VERIFIED (§6.3). A **human** authority only; CAS on
     `target_event_id`; fine-grained authority (owner-of-object / Compliance / governance
     platform-admin); four-eyes (proposer ≠ confirmer); the FINAL value (override or original) is
-    validated BEFORE OVERLAY_FACT_CONFIRMED is appended (pin 17). On success it arms the
-    overlay_expiry timer (decision 5) and closes the open task."""
+    validated BEFORE OVERLAY_FACT_CONFIRMED is appended. On success it arms the
+    overlay_expiry timer and closes the open task."""
     # local import: resolve `append_overlay_event` through the `commands` module so a test that
     # monkeypatches `commands.append_overlay_event` (the occ_spy / inject-concurrent fixtures) still
     # intercepts these appends (and to avoid a top-level import cycle: commands imports this handler
@@ -78,7 +78,7 @@ def confirm_fact(conn: DbConn, cmd: Command) -> CommandResult:
         )
     authority = resolve_authority(conn, adapter, ref, fact_type)
     # Dual-owner approved_join (two distinct confirmations required) follows the two-step
-    # PARTIALLY_CONFIRMED -> VERIFIED flow (Task 4.5, §6.4). Same-owner-both-sides has
+    # PARTIALLY_CONFIRMED -> VERIFIED flow (§6.4). Same-owner-both-sides has
     # `authority.dual` False and falls through to the single path below.
     if fact_type == "approved_join" and authority.dual:
         return _confirm_approved_join(conn, cmd, key, stream, state, authority)
@@ -92,10 +92,10 @@ def confirm_fact(conn: DbConn, cmd: Command) -> CommandResult:
         )
     proposed = _latest_proposed(stream)
     # The confirmer may override the value on a REVERIFY/STALE correction. Validate the FINAL value
-    # (override or original) BEFORE appending OVERLAY_FACT_CONFIRMED (pin 17) so a malformed
+    # (override or original) BEFORE appending OVERLAY_FACT_CONFIRMED so a malformed
     # correction can never be persisted as a confirmed fact. With NO override, a re-verify
     # re-affirms the LAST VERIFIED value (state.prior_value) — defaulting to the cycle-1 proposed
-    # value would silently revert a prior human correction (P1b). A fresh DRAFT has no prior value,
+    # value would silently revert a prior human correction. A fresh DRAFT has no prior value,
     # so it defaults to the proposed value.
     default_value = (
         state.prior_value
@@ -111,8 +111,7 @@ def confirm_fact(conn: DbConn, cmd: Command) -> CommandResult:
         )
     if fact_type == "approved_join":
         # same-owner-both-sides reaches the single path (Authority.dual is False); record BOTH side
-        # roles for the one principal so audit attribution matches a two-owner join (finding 4).
-        # (The dual dispatch + _confirm_approved_join are Task 4.5.)
+        # roles for the one principal so audit attribution matches a two-owner join.
         confirmers = [
             {"subject": cmd.actor.subject, "role": "data_owner_from"},
             {"subject": cmd.actor.subject, "role": "data_owner_to"},
@@ -133,15 +132,14 @@ def confirm_fact(conn: DbConn, cmd: Command) -> CommandResult:
         },
         actor=cmd.actor,
         caused_by=args["target_event_id"],
-        # Pin OCC to the head this handler folded against (C2): the target_event_id compare is only
+        # Pin OCC to the head this handler folded against: the target_event_id compare is only
         # a pre-append read; re-asserting the version atomically stops two concurrent authorities
         # from both landing a CONFIRMED (lost-update). Mirrors freshness.py _apply_expiry/_stale_one.
         expected_version=stream[-1].stream_version,
     )
-    # Arm the SP-0 overlay_expiry timer on this fact-key stream (decision 5; freshness.py is
-    # created in this phase, Task 4.3, pin 10).
+    # Arm the SP-0 overlay_expiry timer on this fact-key stream.
     from featuregen.overlay.freshness import (
-        schedule_expiry,  # local import: freshness.py is created in Task 4.3
+        schedule_expiry,  # local import avoids a circular import between commands and freshness
     )
 
     schedule_expiry(conn, key, confirmed.event_id, expires_at)
@@ -192,7 +190,7 @@ def reject_fact(conn: DbConn, cmd: Command) -> CommandResult:
         )
     proposed = _latest_proposed(stream)
     proposed_value = proposed.payload.get("proposed_value") if proposed else None
-    # Retire the fingerprint of the value actually under review (F8, mirrors confirm_fact's P1b).
+    # Retire the fingerprint of the value actually under review (mirrors confirm_fact).
     # On a REVERIFY/STALE reject AFTER a confirm-time override, state.prior_value is the corrected
     # value V' — retire ITS fingerprint so sticky-reject protects V' (not the discarded cycle-1 V0).
     # The value-equality guard keeps the no-override path on the STORED proposal fingerprint, which
@@ -213,7 +211,7 @@ def reject_fact(conn: DbConn, cmd: Command) -> CommandResult:
         },
         actor=cmd.actor,
         caused_by=args["target_event_id"],
-        # Pin OCC to the folded head (C2): stops a confirm-vs-reject lost-update on the same head.
+        # Pin OCC to the folded head: stops a confirm-vs-reject lost-update on the same head.
         expected_version=stream[-1].stream_version,
     )
     _close_fact_tasks(conn, key, reason="fact rejected")
@@ -250,7 +248,7 @@ def enter_fact(conn: DbConn, cmd: Command) -> CommandResult:
     authority = resolve_authority(conn, adapter, ref, fact_type)
     # Direct self-confirm is restricted to OWNER-KNOWN facts (§3.4): there is no platform-admin
     # enter_fact authz row (only data_owner/compliance), so an unowned fact — which resolves to the
-    # governance/platform-admin queue — must NOT be single-party self-asserted (I2). A principal
+    # governance/platform-admin queue — must NOT be single-party self-asserted. A principal
     # holding both data_owner and platform-admin would otherwise clear `_actor_is_authority`'s
     # governance branch and bypass the two-party propose->confirm path. Route it through propose.
     if authority.governance_queue:
@@ -295,7 +293,7 @@ def enter_fact(conn: DbConn, cmd: Command) -> CommandResult:
     )
     if fact_type == "approved_join":
         # Same-owner-both-sides reaches this path (Authority.dual is False); record BOTH side roles
-        # for the one principal so audit attribution matches a two-owner join (finding 4).
+        # for the one principal so audit attribution matches a two-owner join.
         confirmers = [
             {"subject": cmd.actor.subject, "role": "data_owner_from"},
             {"subject": cmd.actor.subject, "role": "data_owner_to"},
@@ -317,9 +315,9 @@ def enter_fact(conn: DbConn, cmd: Command) -> CommandResult:
         actor=cmd.actor,
         caused_by=draft.event_id,
     )
-    # A self-confirmed fact reaches VERIFIED too, so it also gets an overlay_expiry timer (decision 5).
+    # A self-confirmed fact reaches VERIFIED too, so it also gets an overlay_expiry timer.
     from featuregen.overlay.freshness import (
-        schedule_expiry,  # local import: freshness.py is created in Task 4.3
+        schedule_expiry,  # local import avoids a circular import between commands and freshness
     )
 
     schedule_expiry(conn, key, confirmed.event_id, expires_at)

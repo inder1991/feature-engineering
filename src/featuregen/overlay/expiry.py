@@ -21,12 +21,12 @@ from featuregen.runtime.timers import schedule_timer
 def schedule_expiry(
     conn: DbConn, fact_key: str, confirmed_event_id: str, expires_at: datetime
 ) -> str:
-    """Arm the SP-0 `overlay_expiry` timer on a confirmed fact's stream (decision 5). The timer
-    carries the `confirmed_event_id` in its payload so the Phase 7 `fire_due_overlay_expiries`
+    """Arm the SP-0 `overlay_expiry` timer on a confirmed fact's stream. The timer
+    carries the `confirmed_event_id` in its payload so the `fire_due_overlay_expiries`
     poller can CAS on it. Idempotency-keyed on `(fact_key, confirmed_event_id)` so re-confirming
-    the same event is a no-op. NOTE: this is the ONLY symbol in `freshness.py` for now — Phase 7
-    (Task 7.1) extends THIS file with `fire_due_overlay_expiries`/`detect_catalog_changes`/
-    `open_reverify_task`."""
+    the same event is a no-op. The freshness area owns the overlay pollers now:
+    `fire_due_overlay_expiries` lives in this file, `detect_catalog_changes` in
+    `catalog_changes.py`, and `open_reverify_task` in `reverify_tasks.py`."""
     return schedule_timer(
         conn,
         "overlay_fact",
@@ -69,9 +69,9 @@ def _apply_expiry(conn: DbConn, adapter, *, fact_key: str, confirmed_event_id: s
     """Apply one due overlay_expiry timer's effect transactionally (§8). No-op (CAS) if a
     newer FACT_CONFIRMED has superseded the targeted confirmation. Otherwise append
     OVERLAY_FACT_EXPIRED (VERIFIED → REVERIFY) and open the re-verify task(s) for the resolved
-    authority (one task PER side for an approved_join, pin 19), carrying the target
-    confirmed_event_id (prior_value flows through the proposal projection → get_task_proposal,
-    Phase 4.6). Returns True iff OVERLAY_FACT_EXPIRED was appended."""
+    authority (one task PER side for an approved_join), carrying the target
+    confirmed_event_id (prior_value flows through the proposal projection → get_task_proposal).
+    Returns True iff OVERLAY_FACT_EXPIRED was appended."""
     stream = load_fact(conn, fact_key)
     if not stream:
         return False
@@ -104,7 +104,7 @@ def _apply_expiry(conn: DbConn, adapter, *, fact_key: str, confirmed_event_id: s
 
 
 def fire_due_overlay_expiries(conn: DbConn, *, now: datetime) -> int:
-    """Explicit transactional poller (overview decision 5) — NOT a HandlerRegistry handler.
+    """Explicit transactional poller — NOT a HandlerRegistry handler.
     The SP-0 timer runtime can't carry fact_key/confirmed_event_id to an overlay handler
     nor open a gate task, so freshness owns its own driver. SELECT due overlay_expiry timers
     FOR UPDATE SKIP LOCKED (row locks are held by the transaction until commit, so multiple

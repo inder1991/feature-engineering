@@ -163,7 +163,7 @@ def resolve_fact(
 
     # 1) Authoritative catalog fact wins (catalog beats overlay only where authoritative=True).
     # approved_join is overlay-only — a catalog is never authoritative for a relation, and the
-    # CatalogAdapter.get_fact protocol takes a CatalogObjectRef, so skip catalog precedence (finding 7).
+    # CatalogAdapter.get_fact protocol takes a CatalogObjectRef, so skip catalog precedence.
     catalog_fact = None if fact_type == "approved_join" else adapter.get_fact(ref, fact_type, use_case)
     if catalog_fact is not None and catalog_fact.authoritative:
         # Trust boundary: a pluggable CatalogAdapter is a public extension point, so its

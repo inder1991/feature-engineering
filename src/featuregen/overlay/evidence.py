@@ -40,7 +40,7 @@ def write_evidence(
     """Write one immutable evidence record (§5.1) and return its evidence_id. Append-only: each
     call mints a fresh `eviu_` id and INSERTs a new row — there is no update path. Stores ONLY
     aggregate metrics; callers must never pass raw values / raw MIN/MAX (Global Constraint).
-    `created_by` is a Mapping persisted as jsonb (pin 14) — callers pass `identity_to_jsonb(actor)`,
+    `created_by` is a Mapping persisted as jsonb — callers pass `identity_to_jsonb(actor)`,
     never a raw IdentityEnvelope."""
     evidence_id = mint_id("eviu")
     conn.execute(

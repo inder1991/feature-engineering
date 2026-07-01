@@ -16,7 +16,7 @@ from featuregen.overlay.facts import (
 def _enforce_fact_value_schema(
     conn: DbConn, fact_key: str, type: str, payload: Mapping[str, Any]
 ) -> None:
-    """F3 integrity boundary: enforce the per-fact-type FACT_VALUE_SCHEMAS at the overlay append
+    """Integrity boundary: enforce the per-fact-type FACT_VALUE_SCHEMAS at the overlay append
     boundary, NOT just at the command layer. `append_event` only checks the generic OVERLAY_EVENT
     schema (which declares value/proposed_value as a bare object), so a non-validating caller could
     otherwise persist a value that violates its fact type (§3.6 fail-closed). Reuses
@@ -64,7 +64,7 @@ def append_overlay_event(
     fact_key` (Shared Contract). Never INSERTs into `events` directly (Global Constraint).
 
     Fail-closed: PROPOSED/CONFIRMED values are validated against their per-fact-type schema BEFORE
-    any INSERT (F3), so a malformed value never reaches the event store."""
+    any INSERT, so a malformed value never reaches the event store."""
     _enforce_fact_value_schema(conn, fact_key, type, payload)
     return append(
         conn,

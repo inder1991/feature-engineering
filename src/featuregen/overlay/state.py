@@ -37,7 +37,7 @@ def fold_overlay_state(stream: Iterable) -> OverlayState:
     `.payload`. EXPIRED/STALED move the current value into prior_value; reject under
     REVERIFY/STALE retains prior_value (the retired value stays visible as history).
 
-    DEFENSIVE (decision 6 — no VERIFIED→DRAFT regression): a PROPOSED only (re)opens a DRAFT on an
+    DEFENSIVE (no VERIFIED→DRAFT regression): a PROPOSED only (re)opens a DRAFT on an
     empty stream or after a REJECTED. A stray PROPOSED that arrives once the fact has already been
     confirmed or partially confirmed (PARTIALLY_CONFIRMED / VERIFIED / REVERIFY / STALE) is
     IGNORED — the fold must never regress a confirmed fact back to DRAFT."""
@@ -54,8 +54,8 @@ def fold_overlay_state(stream: Iterable) -> OverlayState:
             st.fact_type = payload["fact_type"]
             st.use_case = payload.get("use_case")
             st.evidence_ref = payload.get("evidence_ref")
-            # A fresh (re)proposal after REJECTED must clear all prior-cycle carry-over (I1) —
-            # mirror the projection's PROPOSED reset (decision 6/18) so get_task_proposal never
+            # A fresh (re)proposal after REJECTED must clear all prior-cycle carry-over —
+            # mirror the projection's PROPOSED reset so get_task_proposal never
             # surfaces a stale retired value (or stale confirmers/expiry) on the new DRAFT.
             st.prior_value = None
             st.value = None

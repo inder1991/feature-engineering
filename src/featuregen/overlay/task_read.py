@@ -20,7 +20,7 @@ def get_task_proposal(conn: DbConn, task_id: str, actor) -> dict:
 
     NOT a registered command handler (no `_OVERLAY_CATALOG` entry) — a direct read function. The CAS
     target and prior value come from AUTHORITATIVE, synchronous sources (the `human_tasks` row and
-    the event stream), NOT the asynchronous `overlay_proposal` projection (finding 1)."""
+    the event stream), NOT the asynchronous `overlay_proposal` projection."""
     row = conn.execute(
         "SELECT fact_key, eligible_assignees, evidence_ref, target_event_id, status "
         "FROM human_tasks WHERE task_id=%s",
@@ -34,7 +34,7 @@ def get_task_proposal(conn: DbConn, task_id: str, actor) -> dict:
     eligible = eligible or {}
     role = eligible.get("role")
     subject = eligible.get("subject")
-    # Subject-scoped authz (I3): when the task is bound to a specific subject (a known-owner data
+    # Subject-scoped authz: when the task is bound to a specific subject (a known-owner data
     # fact's task is {"role":"data_owner","subject":<owner>}), ONLY that subject may read it — the
     # bare role must NOT also satisfy it, or any data_owner-role holder would read another team's
     # proposal + evidence, silently defeating the subject narrowing. The role branch survives only
@@ -44,7 +44,7 @@ def get_task_proposal(conn: DbConn, task_id: str, actor) -> dict:
     else:
         authorized = role is not None and role in actor.role_claims
     # A platform-admin reads a GOVERNANCE task via the role branch above (its eligible role is
-    # "platform-admin"); it is NOT granted blanket read of every task's proposal (finding 4).
+    # "platform-admin"); it is NOT granted blanket read of every task's proposal.
     if not authorized:
         raise OverlayCommandError("actor is not authorized to read this task proposal")
     stream = load_fact(conn, key)
