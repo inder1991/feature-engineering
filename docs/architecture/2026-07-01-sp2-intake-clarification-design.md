@@ -479,12 +479,14 @@ Draft Feature Contract + Assumption Ledger.
 ```
 submit_intent(request)                                   authz: data scientist (request owner) or service:intake-agent
   └─ create_request (SP-0) + create_run (SP-0) → run in DRAFT
-  └─ PII-scan + classify raw intent (SP-0-owned envelope classification → raw_input_classification, §9.4) → encrypted blob (SP-0 §9); emit INTENT_SUBMITTED
+  └─ classify raw intent (SP-0-owned envelope classification → raw_input_classification, §9.4) → hold raw text in encrypted blob (SP-0 §9); emit INTENT_SUBMITTED
   └─ banking-boundary classification (§5.4, over BankingDomainCatalog §4.5)
         ├─ out of banking scope   ──▶ OUT_OF_SCOPE → reject_intent → INTENT_REJECTED / park  (platform/service-issued; reason + catalog version)
         ├─ prohibited data class  ──▶ PROHIBITED_DATA_CLASS → reject_intent → INTENT_REJECTED  (platform/service-issued; matched class + catalog version)
         ├─ sensitive-proxy/ambiguous ──▶ clarification / compliance review (§6.2)  (NOT terminal)
         └─ in-banking, unknown use-case ──▶ NEEDS_USE_CASE_ONBOARDING (park, §5.4)
+  └─ IntentRedactor.redact(raw_intent, raw_input_classification) → redacted LLM-safe intent text (SP-2 seam, §9.4)
+        (un-redactable / unscanned → FAIL into clarification/manual — no payload dispatched)
   └─ LLMClient.structure_intent(redacted_intent, catalog_metadata)   → event-sourced call record (§9)
         │  structured-output contract + bounded repair (§9.2)
         ▼
@@ -991,7 +993,9 @@ reproducible provenance of the call** (Decision D5):
 ```
 { llm_call_ref, run_id, task, provider, model, prompt_id, prompt_version,
   output_schema_id, output_schema_version,
-  input_hash,               // sha256 of the exact (redacted) input — OR the redacted input itself
+  redaction_version,        // which IntentRedactor policy produced the LLM-safe text (§9.4)
+  input_hash,               // sha256 of the exact redacted (LLM-safe) input — dedup/idempotency component (§12)
+  redacted_input,           // the STORED redacted (LLM-safe) input itself — NOT hash-only (retention note below)
   input_redaction,          // what was scrubbed, so a reviewer knows the boundary held (§9.4)
   raw_output,               // the model's structured output as returned
   validation_result,        // ok | invalid(reasons) | refusal
@@ -1000,38 +1004,60 @@ reproducible provenance of the call** (Decision D5):
   created_at, created_by }  // service:intake-agent (attested, SP-0 §6.1)
 ```
 
-- **Classification: sensitive / governance-retained / read-controlled** (like SP-1's evidence store) — the
-  input hash + catalog metadata can be revealing, so the store is service-internal and access-controlled; no
-  raw data values are ever present (§9.4). *(Modelling LLM calls as an SP-2-owned record store rather than an
-  SP-0 aggregate/artifact was a reasonable call, Decision D9, §16.)*
-- **Reproducibility:** because prompt+schema versions, model, and input hash are all pinned, a regulator can
-  reproduce (or at least fully audit) exactly what was asked and what came back. Runs pin the registry
-  snapshot (SP-0 §3.3) so the prompt/schema versions replay deterministically.
+- **Retention — stored-redacted, not hash-only.** The record stores the **redacted (LLM-safe) input itself**
+  (`redacted_input`), not merely its `input_hash`. Hash-only retention would make the call **non-reproducible**
+  — a hash can be neither replayed nor reviewed — so MRM / a regulator could not reconstruct the exact prompt
+  the model saw; storing the LLM-safe text is what makes replay possible. The stored text is **already
+  redacted** (the raw intent never enters this store — it stays in SP-0's encrypted `raw_input_ref` blob,
+  §9.4), so storing it does not widen the PII surface. The `input_hash` is kept alongside as the
+  dedup/idempotency component (§12).
+- **Classification / access-control surface: sensitive / governance-retained / read-controlled** (like SP-1's
+  evidence store). Because the store holds the redacted intent text plus catalog metadata (both can be
+  revealing), it is **service-internal, access-controlled, and governance-retained** — read only through an
+  authorized/audited path, held for the MRM/adverse-action window, and never containing raw data values
+  (§9.4). *(Modelling LLM calls as an SP-2-owned record store rather than an SP-0 aggregate/artifact was a
+  reasonable call, Decision D9, §16; storing the redacted input rather than a bare hash — trading a slightly
+  larger controlled surface for replayability — is the §16 retention call.)*
+- **Reproducibility:** because prompt+schema versions, model, redaction version, and the stored redacted input
+  are all pinned, a regulator can **reproduce** exactly what was asked and what came back. Runs pin the
+  registry snapshot (SP-0 §3.3) so the prompt/schema versions replay deterministically.
 
-### 9.4 No raw data or PII to the LLM (boundary enforced, not merely intended)
+### 9.4 No raw data or PII to the LLM (SP-0 classifies · SP-2 redacts · SP-2 guards egress)
 
-The LLM sees **only**: (a) the scientist's **intent text, PII-scanned and redacted**, and (b) **catalog
-metadata** — object/column **names, types, and asserted grain** (from SP-1's merged view), **plus any
-catalog-*declared* enum/code metadata** (schema-declared allowed codes, not profiled data; §4.4). It **never**
-sees data rows, column *values* — actual/profiled value sets or status-code sets (SP-1 profiling / SP-3
-grounding, §4.4) — samples, extrema, or overlay evidence metrics (Decision D5). This is enforced at
-**two points**:
+The LLM sees **only**: (a) the scientist's intent as **redacted, LLM-safe text** produced by SP-2's
+**`IntentRedactor` seam** (below), and (b) **catalog metadata** — object/column **names, types, and asserted
+grain** (from SP-1's merged view), **plus any catalog-*declared* enum/code metadata** (schema-declared allowed
+codes, not profiled data; §4.4). It **never** sees data rows, column *values* — actual/profiled value sets or
+status-code sets (SP-1 profiling / SP-3 grounding, §4.4) — samples, extrema, or overlay evidence metrics
+(Decision D5). The boundary has a **clean ownership split — SP-0 classifies, SP-2 redacts, SP-2 guards
+egress** — enforced at **three points**:
 
-1. **Ingest (owned by SP-0):** **SP-0 owns envelope PII-scanning + classification.** On submission SP-0 scans
-   the raw intent and stamps `raw_input_classification ∈ {clean, contains_pii, unscanned}` (SP-0 §3.5); PII
-   spans are redacted before the text is placed in any `LLMRequest.inputs`. If the intent cannot be safely
-   redacted (classification `contains_pii` with un-redactable spans), the call **fails into the
-   clarification/manual path** rather than sending it — no unsafe payload is ever dispatched.
-2. **Egress guard (owned by SP-2 — the hard backstop):** SP-2 does **not trust** the envelope blindly. A
+1. **Ingest classification (owned by SP-0):** SP-0 owns the **envelope PII/secrets *classification*** only. On
+   submission SP-0 scans the raw intent, stamps `raw_input_classification ∈ {clean, contains_pii, unscanned}`
+   (SP-0 §3.5), and holds the raw text in an encrypted, access-restricted blob (`raw_input_ref`, SP-0 §9).
+   **SP-0 does *not* produce LLM-safe text — it has no redactor API:** its inline PII/secrets check
+   (`assert_no_inline_pii`, `privacy/classification.py:70`) is a *classification guard* that rejects inline
+   sensitive bodies in event payloads, **not** a redactor that emits a scrubbed intent string. SP-0 decides
+   *what class the intent is*; it never rewrites it.
+2. **Redaction — the `IntentRedactor` seam (owned by SP-2):** because SP-0 stops at classification, **SP-2
+   owns redaction**. SP-2 defines an explicit **`IntentRedactor` seam** — a stable interface **plus a default
+   implementation** — that consumes the raw intent + SP-0's `raw_input_classification` and produces the
+   **redacted, LLM-safe intent text** that is the *only* rendering of the intent ever placed in
+   `LLMRequest.inputs`. Each redaction stamps a **`redaction_version`** (recorded on the call, §9.3). If the
+   intent **cannot be safely redacted** (`contains_pii` with un-redactable spans, or `unscanned`), the
+   redactor **fails closed into the clarification/manual path** rather than emitting text — no unsafe payload
+   is ever produced. `IntentRedactor` is a seam (like `LLMClient`, §9.1), so the redaction policy can harden
+   without touching any agent (§13).
+3. **Egress guard (owned by SP-2 — the hard backstop):** SP-2 does **not trust** the upstream steps blindly. A
    deterministic pre-send check on every `LLMRequest` **refuses to dispatch** any payload whose
    `raw_input_classification` is **`unscanned`** (never send un-classified content to the LLM), or that
    carries data *values* (as opposed to metadata) or un-redacted PII; a violation is a **hard failure**
    recorded in the security-audit stream, not a warning. The `input_redaction` field on the call record
-   documents what the guard scrubbed, so the boundary is auditable after the fact. **Two-point boundary,
-   unambiguous:** SP-0 classifies at ingest; SP-2's egress guard is the fail-closed gate that lets only
-   `clean`/safely-redacted, metadata-only payloads reach the model. *(This two-point scan-and-egress-guard
-   construction extends the decision record's "only intent text + catalog metadata" rule into a concrete
-   enforced boundary, §16.)*
+   documents what the guard scrubbed, so the boundary is auditable after the fact. **Three-point boundary,
+   unambiguous:** SP-0 classifies at ingest; SP-2's `IntentRedactor` produces the only LLM-safe rendering;
+   SP-2's egress guard is the fail-closed gate that lets only `clean`/safely-redacted, metadata-only payloads
+   reach the model. *(SP-0 owning classification while SP-2 owns the redactor seam + egress guard — because
+   SP-0 exposes no redactor API — is a reasonable call, §16.)*
 
 ### 9.5 `FakeLLM` (default) and the real Claude adapter (config-gated)
 
@@ -1223,6 +1249,9 @@ SP-2 does not build (§14).
   field_scores, open_questions}` — service-internal, for SP-3 to fetch the Confirmed Contract.
 - **The Confirmed Feature Contract document** (CONFIRMED_CONTRACT stage) — the governed hand-off artifact.
 - **`CandidateGenerator` protocol** (§7.1) — the seam SP-12 binds its real engine to.
+- **`IntentRedactor` protocol + default implementation** (§9.4) — the SP-2-owned seam that turns
+  SP-0-classified raw intent into the redacted, LLM-safe text that is the only intent rendering allowed into an
+  `LLMRequest`; reusable by every later LLM-using sub-project that must place free text before a model.
 - **`LLMClient` protocol + the auditable-LLM envelope** (§9) — reusable by every later LLM-using sub-project
   (SP-3 grounding assistant, SP-6 candidate-SQL, SP-8 Critique, SP-12 generation).
 
@@ -1326,12 +1355,13 @@ adapter is exercised only in an **opt-in, config-gated smoke test** never gated 
 | 6 | Refinement-loop bound | Decision (Components): "converge until minimum-contract passes" | **Reasonable call:** loop bounded by SP-0's durable-runtime hard loop limit; on exhaustion **auto-park** the run for human follow-up (§6.6). The specific round cap was not specified. |
 | 7 | LLM-call record store | Decision 3: "every LLM call is event-sourced" (fields enumerated) | **Reasonable call:** modelled as an **SP-2-owned immutable append-only `llm_call` store** (mirroring SP-1's evidence store) referenced by `llm_call_ref`, plus an `LLM_CALL_RECORDED` event — because SP-0's stage/artifact enum has no LLM-call type (§9.3, Decision D9). All enumerated fields captured. |
 | 8 | Banking-scope / `BankingDomainCatalog` dependency | Decision 1, 4 & 8: "rejects only out-of-banking"; "depends on SP-0 only" *(record was previously silent on catalog availability)* | **RATIFIED (user-approved).** The banking-boundary / blocked-class reference data is accepted as **SP-0-governed, read-only reference data** — the **`BankingDomainCatalog`** (§4.5): `allowed_domains`/`allowed_use_cases`, `out_of_scope_examples`, `blocked_data_classes`, `sensitive_proxy_hints` (carried **only** as "requires clarification / compliance review," never an auto-block), `jurisdiction_scope`/`use_case_scope`, and `version`/`owner`/`effective_date`/`provenance`. It is **read-only intake-classification reference data — never grounding/execution** — so it is *not* an SP-2 build dependency and does **not** violate "SP-0 only." Deterministic intake outcomes: out-of-scope → **`OUT_OF_SCOPE`** and prohibited class → **`PROHIBITED_DATA_CLASS`** (both fail-closed, each stamping the reason/matched-class + catalog `version`); sensitive-proxy/ambiguous → clarification / compliance review; a new banking use-case → onboarding park (§5.4, §8.4, §11). **This resolves the former open question (was silent, §16.8) — now ratified, not a deviation; the user explicitly approved it.** |
-| 9 | No-PII enforcement construction | Decision 3: "no raw data or PII to the LLM — enforce/validate this boundary" | **Reasonable call:** enforced at **two points** — ingest PII-scan/redact-or-fail, and a pre-send **egress guard** that hard-fails a payload carrying data values or un-redacted PII (→ security-audit), with `input_redaction` recorded for audit (§9.4). The decision record required the boundary; the two-point mechanism is the concrete encoding. |
+| 9 | No-PII enforcement construction + redactor ownership | Decision 3: "no raw data or PII to the LLM — enforce/validate this boundary" | **Reasonable call.** Enforced at **three points** with a clean ownership split — **SP-0 *classifies*** (ingest, `raw_input_classification`; its `assert_no_inline_pii`, `privacy/classification.py:70`, is a classification guard, **not** a redactor), **SP-2 *redacts*** via an explicit **`IntentRedactor` seam** (interface + default impl) that emits the only LLM-safe intent rendering and fails closed on un-redactable/`unscanned` input, and **SP-2 *guards egress*** (pre-send hard-fail on data values / un-redacted PII → security-audit), with `input_redaction` recorded for audit (§9.4). The decision record required the boundary but assigned no redactor; SP-0 exposes no redactor API, so SP-2 owns the seam (§9.4, §5.2, §13). |
 | 10 | Prohibited-intent mechanism | Decision 2: "obviously prohibited/compliance-sensitive → blocks or forces clarification; must NOT pretend to approve compliance" | **Reasonable call (mechanism); RATIFIED (contract, see entry 8).** A **deterministic** screen over the `BankingDomainCatalog` `blocked_data_classes` (§4.5): an explicit prohibited data class → **`PROHIBITED_DATA_CLASS`** block (matched class + catalog `version`) → edit-and-loop, requester **`withdraw`** (SP-0, data-scientist-owned), or the **platform/service-issued** `reject_intent` terminal outcome (not SP-0's validator-only `reject` — see entry 13); a `sensitive_proxy_hints` match is the **distinct** routing → clarification / compliance review, **not** an auto-block; never an LLM judgement, never a compliance approval (§8.4). The screen mechanism was not specified; the proxy-vs-block distinction is the user-ratified contract. |
 | 11 | Gate #1 is not four-eyes | Decision 2 | Encoded: author confirms own intent (audited intent lock); `requires_independent_validation` is a **flag only**, no second signer; independent validation is Gate #2 / SP-5 (§8.2, §8.4). |
 | 12 | Real adapter details | Decision 3: "real Claude adapter shipped, config-gated, never required in CI; no silent fallback" | Encoded with concrete Claude API: model `claude-opus-4-8`, adaptive thinking, structured outputs via `output_config.format`, `stop_reason=="refusal"` → repair/clarification, fail-closed (no fallback to FakeLLM) (§9.5). *Model/API specifics grounded in the current Claude API; not a deviation.* |
 | 13 | Rejection / withdrawal authority | SP-0: `reject` is **validator-only** (`authz/policy.py:42`); `withdraw` is **data-scientist-owned** (`authz/policy.py:41`) | **Corrected authority.** SP-2's deterministic intake rejections (`OUT_OF_SCOPE`/`PROHIBITED_DATA_CLASS`) are **platform/service-issued terminal outcomes** — the deterministic classifier decided, **not** a validator — issued via SP-2's own **`reject_intent`** action (→ SP-0 `RUN_REJECTED`) under **one additive service `authz_policy` row** (§2.1 #4); they do **not** reuse SP-0's validator-only `reject`. **Requester-initiated abandonment** (the author walking away — e.g. a Gate #1 `reject` response, or giving up on a blocked/looping intent) reuses **SP-0 `withdraw`** (→ `RUN_WITHDRAWN`), never `reject`. SP-0's validator-only `reject` stays reserved for independent validation (Gate #2 / SP-5). The added row **changes no existing SP-0 row**, so SoD holds. (§5.4, §8.4, §11, §13, §2.1.) |
 | 14 | `BankingDomainCatalog` classifier — completeness contract | Decision 8 (ratified catalog, entry 8) *(specified the outcomes but not precedence / availability / version-stamping / drift / scope inputs)* | **Completed the classifier contract (§4.5, §5.4).** (a) **Precedence = most-restrictive-wins** (`PROHIBITED_DATA_CLASS` > `OUT_OF_SCOPE` > sensitive-proxy → clarify > ambiguous → clarify) — exactly one outcome. (b) **Catalog unavailable / unversioned → fail-closed** (park for clarification/manual; never auto-pass). (c) **Catalog `version` stamped on EVERY outcome, including CLEAR/PASS** — an allow is as auditable as a block. (d) **Version drift** — `version` recorded at intake and **re-evaluated at confirmation** (§8.4); a changed version that would flip the outcome forces **re-clarify**, never a silent stale confirm. (e) **Jurisdiction / use-case scope** needs **product/region** on the request; absent → **ambiguity → clarify**. All deterministic, all fail-closed; **extends** the ratified catalog contract (entry 8), not a deviation. (§4.5, §5.4, §6.7, §8.4.) |
+| 15 | LLM-call retention — stored-redacted, not hash-only | Decision 3: "every LLM call is event-sourced / reproducible" | **Reasonable call.** The `llm_call` record stores the **redacted (LLM-safe) input itself** (`redacted_input` + `redaction_version`), **not** a bare `input_hash` — hash-only cannot be replayed or reviewed, defeating MRM / adverse-action reproducibility. The raw intent stays in SP-0's encrypted `raw_input_ref` blob (§9.4), so the stored text is already redacted; the record is classified **sensitive / governance-retained / read-controlled** with an authorized/audited read path (§9.3). Resolves the former "`input_hash` OR redacted input" ambiguity in favour of stored-redacted for replayability. (§9.3, §9.4.) |
 
 ---
 
