@@ -14,16 +14,17 @@ from datetime import timedelta
 
 from featuregen.contracts import Command, CommandResult, DbConn
 from featuregen.gates.tasks import cancel_task
+from featuregen.overlay._types import FactStatus
 from featuregen.security.audit import record_denial
 
 # Non-terminal folded statuses: while a fact sits in any of these a fresh proposal is denied —
 # a live VERIFIED fact stays usable until its OWN re-verify flow replaces it (no VERIFIED->DRAFT
 # regression). Only an empty stream or a REJECTED terminal admits a new proposal.
-_NON_TERMINAL = ("DRAFT", "PARTIALLY_CONFIRMED", "VERIFIED", "REVERIFY", "STALE")
+_NON_TERMINAL: tuple[FactStatus, ...] = ("DRAFT", "PARTIALLY_CONFIRMED", "VERIFIED", "REVERIFY", "STALE")
 
 # Statuses from which a fact is still awaiting a confirm/reject decision. VERIFIED is excluded
 # (it is replaced via its own re-verify flow); REJECTED is terminal.
-_AWAITING_CONFIRMATION = ("DRAFT", "PARTIALLY_CONFIRMED", "REVERIFY", "STALE")
+_AWAITING_CONFIRMATION: tuple[FactStatus, ...] = ("DRAFT", "PARTIALLY_CONFIRMED", "REVERIFY", "STALE")
 
 # Default re-verify horizon stamped onto OVERLAY_FACT_CONFIRMED and armed as the overlay_expiry
 # timer (the design calls this a "configurable horizon"). 180 days = semi-annual.

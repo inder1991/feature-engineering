@@ -18,12 +18,13 @@ from featuregen.overlay._lifecycle import (
     _deny_audited,
     _latest_proposed,
 )
+from featuregen.overlay._types import JoinSide
 from featuregen.overlay.authority import proposer_ne_confirmer
 from featuregen.overlay.facts import FactValidationError, validate_fact_value
 from featuregen.overlay.store import append_overlay_event
 
 
-def _join_side(authority, subject) -> str:
+def _join_side(authority, subject) -> JoinSide:
     """The join side (`from`/`to`) a confirmer covers, derived from the side-ordered
     `authority.subjects` (None marks an unknown/governance side) — NOT confirmation order."""
     subs = list(authority.subjects)  # ordered (from, to)

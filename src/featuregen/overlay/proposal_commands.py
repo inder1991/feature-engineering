@@ -15,6 +15,7 @@ from featuregen.contracts.gates import GateTaskSpec
 from featuregen.contracts.identity import identity_to_jsonb
 from featuregen.gates.tasks import open_task
 from featuregen.overlay._lifecycle import _NON_TERMINAL, _latest_proposed
+from featuregen.overlay._types import FactType
 from featuregen.overlay.authority import resolve_authority
 from featuregen.overlay.catalog import current_catalog_adapter
 from featuregen.overlay.evidence import write_evidence
@@ -38,7 +39,7 @@ def propose_fact(conn: DbConn, cmd: Command) -> CommandResult:
     adapter = current_catalog_adapter()
     args = cmd.args
     ref = args["ref"]
-    fact_type = args["fact_type"]
+    fact_type: FactType = args["fact_type"]
     use_case = args.get("use_case")
     proposed_value = args["proposed_value"]
     evidence_ref = args.get("evidence_ref")

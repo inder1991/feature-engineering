@@ -21,6 +21,7 @@ from featuregen.overlay._lifecycle import (
     _deny_audited,
     _latest_proposed,
 )
+from featuregen.overlay._types import FactType, Role
 from featuregen.overlay.authority import (
     _actor_is_authority,
     proposer_ne_confirmer,
@@ -51,7 +52,7 @@ def confirm_fact(conn: DbConn, cmd: Command) -> CommandResult:
     adapter = current_catalog_adapter()
     args = cmd.args
     ref = args["ref"]
-    fact_type = args["fact_type"]
+    fact_type: FactType = args["fact_type"]
     use_case = args.get("use_case")
     key = fact_key(ref, fact_type, use_case)
     stream = load_fact(conn, key)
@@ -111,7 +112,7 @@ def confirm_fact(conn: DbConn, cmd: Command) -> CommandResult:
             {"subject": cmd.actor.subject, "role": "data_owner_to"},
         ]
     else:
-        role = "compliance" if fact_type == "policy_tag" else "data_owner"
+        role: Role = "compliance" if fact_type == "policy_tag" else "data_owner"
         confirmers = [{"subject": cmd.actor.subject, "role": role}]
     expires_at = datetime.now(UTC) + _DEFAULT_TTL
     confirmed = append_overlay_event(
@@ -152,7 +153,7 @@ def reject_fact(conn: DbConn, cmd: Command) -> CommandResult:
     adapter = current_catalog_adapter()
     args = cmd.args
     ref = args["ref"]
-    fact_type = args["fact_type"]
+    fact_type: FactType = args["fact_type"]
     use_case = args.get("use_case")
     key = fact_key(ref, fact_type, use_case)
     stream = load_fact(conn, key)
@@ -217,7 +218,7 @@ def enter_fact(conn: DbConn, cmd: Command) -> CommandResult:
             conn, cmd, "", "self-confirm (enter_fact) requires a human authority"
         )
     ref = args["ref"]
-    fact_type = args["fact_type"]
+    fact_type: FactType = args["fact_type"]
     use_case = args.get("use_case")
     proposed_value = args["proposed_value"]
     try:
@@ -281,7 +282,7 @@ def enter_fact(conn: DbConn, cmd: Command) -> CommandResult:
             {"subject": cmd.actor.subject, "role": "data_owner_to"},
         ]
     else:
-        role = "compliance" if fact_type == "policy_tag" else "data_owner"
+        role: Role = "compliance" if fact_type == "policy_tag" else "data_owner"
         confirmers = [{"subject": cmd.actor.subject, "role": role}]
     expires_at = datetime.now(UTC) + _DEFAULT_TTL
     confirmed = append_overlay_event(
