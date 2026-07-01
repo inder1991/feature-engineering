@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 import jsonschema
@@ -17,6 +17,7 @@ __all__ = [
     "CONFIRMED_CONTRACT_SCHEMA_VERSION",
     "DRAFT_CONTENT_SCHEMA", "CONFIRMED_CONTRACT_JSON_SCHEMA", "ASSUMPTION_LEDGER_CONTENT_SCHEMA",
     "ContractSemanticError", "validate_semantics",
+    "reshape_calculation_method", "assemble_confirmed",
 ]
 
 # ---- closed enum vocabularies (§4.0) ----
@@ -247,3 +248,98 @@ def _assert_unknowns_listed(body: Mapping[str, Any]) -> None:
         raise ContractSemanticError(
             f"UNKNOWN fields must be listed in open_fields: {unlisted} (§4.0)"
         )
+
+
+# label → (kind, aggregation) for the deterministic definition-mode reshape (§4.2). Any method not
+# here (point_snapshot / ratio / distribution_divergence, or a hypothesis candidate) MUST arrive as
+# an explicit tagged `chosen_method`.
+_ROLLING_AGGREGATIONS: dict[str, str] = {
+    "rolling_count": "count",
+    "rolling_sum": "sum",
+    "rolling_avg": "avg",
+    "rolling_average": "avg",
+    "rolling_mean": "avg",
+}
+
+
+def reshape_calculation_method(
+    feature_semantics: Mapping[str, Any], *, chosen_method: Mapping[str, Any] | None = None
+) -> dict[str, Any]:
+    """Reshape the Draft's string calculation_method (+ windows/filters) into the tagged, versioned
+    structure SP-3 consumes deterministically (§4.2). If `chosen_method` (a tagged method_variant) is
+    supplied — hypothesis-mode candidate selection, or any non-rolling method — it is used verbatim.
+    Otherwise a `rolling_*` label is reshaped to a `rolling_aggregate` variant using windows[0].value
+    and filters[0]. Fails closed (ContractSemanticError) on an UNKNOWN / un-reshapable method."""
+    if chosen_method is not None:
+        chosen: dict[str, Any] = dict(chosen_method)
+    else:
+        label = feature_semantics.get("calculation_method")
+        if not isinstance(label, str) or label == UNKNOWN:
+            raise ContractSemanticError("calculation_method must be resolved before assembly")
+        aggregation = _ROLLING_AGGREGATIONS.get(label)
+        if aggregation is None:
+            raise ContractSemanticError(
+                f"cannot auto-reshape calculation_method {label!r}; pass an explicit chosen_method"
+            )
+        windows = feature_semantics.get("windows") or ()
+        window = windows[0].get("value") if windows and isinstance(windows[0], Mapping) else None
+        if not window:
+            raise ContractSemanticError("rolling_aggregate requires a window from windows[0].value")
+        chosen = {"kind": "rolling_aggregate", "aggregation": aggregation, "window": window}
+        filters = feature_semantics.get("filters") or ()
+        if filters and isinstance(filters[0], Mapping):
+            f0 = filters[0]
+            filt: dict[str, Any] = {}
+            if f0.get("concept"):
+                filt["concept"] = f0["concept"]
+            predicate = f0.get("predicate")
+            if predicate and predicate != UNKNOWN:
+                filt["predicate"] = predicate
+            if filt:
+                chosen["filter"] = filt
+    return {"method_version": 1, "chosen": chosen, "considered": [dict(chosen)]}
+
+
+def assemble_confirmed(
+    draft_body: Mapping[str, Any],
+    *,
+    confirmation: Mapping[str, Any],
+    derived_from: Sequence[str],
+    feature_name: str | None = None,
+    chosen_method: Mapping[str, Any] | None = None,
+    requires_independent_validation: bool = False,
+    target: Mapping[str, Any] | None = None,
+    schema_version: int = 1,
+) -> dict[str, Any]:
+    """Deterministically assemble a CONFIRMED_CONTRACT body from a final Draft body (§4.2). Applies
+    the Draft→Confirmed renames — entity_grain → feature_grain (+ derived entity_key = grain[0]) and
+    proposed_feature_name → feature_name (overridden by a Gate #1 `feature_name` edit) — and reshapes
+    the string calculation_method into the tagged structure. Envelope fields (raw_input_ref /
+    raw_input_classification / intake_mode / observation_intent / assumption_ledger_ref) are carried
+    forward unchanged. The caller (P7 confirm_contract) validates the result with validate_semantics
+    before freezing the document."""
+    fs = draft_body["feature_semantics"]
+    grain = list(fs["entity_grain"])
+    method = reshape_calculation_method(fs, chosen_method=chosen_method)
+    draft_prov = draft_body.get("provenance") or {}
+    return {
+        "feature_name": feature_name or draft_body["proposed_feature_name"],
+        "intake_mode": draft_body["intake_mode"],
+        "raw_input_ref": draft_body["raw_input_ref"],
+        "raw_input_classification": draft_body["raw_input_classification"],
+        "entity": fs["entity"],
+        "entity_key": grain[0] if grain else fs["entity"],
+        "feature_grain": grain,
+        "observation_intent": dict(fs["observation_intent"]),
+        "calculation_method": method,
+        "target": dict(target) if target is not None else None,
+        "assumption_ledger_ref": draft_body["assumption_ledger_ref"],
+        "requires_independent_validation": bool(requires_independent_validation),
+        "confirmation": dict(confirmation),
+        "provenance": {
+            "derived_from": list(derived_from),
+            "llm_call_refs": list(draft_prov.get("llm_call_refs", ())),
+            "schema_version": schema_version,
+        },
+        "status": CONFIRMED_STATUS,
+    }
