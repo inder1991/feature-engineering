@@ -30,13 +30,14 @@ sibling docs are **write-once and left untouched** (no per-doc reject event); th
 **Cross-phase Consumes (built earlier; used verbatim here):**
 - **SP-0 documents:** `documents/store.py::append_document(conn, new_document, *, run_id=None, feature_id=None, request_id=None, actor) -> str` (single validated write path; validates stage/branch_role/classification vocab; `derived_from` must reference committed docs), `compute_content_hash(body: bytes) -> str` (`"sha256:<hex>"`), `get_document(conn, doc_id) -> dict | None`; `documents/primary.py::new_primary_selected(*, run_id, stage, doc_id, actor, provenance, caused_by=None) -> NewEvent` (payload `{doc_id, stage}`, aggregate `"run"`), `register_primary_selected(conn)`, `current_primary(conn, run_id, stage) -> str | None`, `StagePrimaryProjection`; `contracts/documents.py::Stage` (`Stage.DRAFT_CONTRACT`, published — not extended), `NewDocument(doc_id, stage, schema_version, branch_role, content_hash, body_classification, provenance, body_ref=None, derived_from=(), supersedes=(), reject_reason=None)`, `BRANCH_ROLES=("candidate","primary","rejected","repair")`, `BODY_CLASSIFICATIONS=("pii-erasable","governance-retained")`.
 - **SP-0 append/OCC + provenance:** `aggregates/_append.py::current_version(conn, aggregate, aggregate_id) -> int`, `table_version_for(conn, aggregate, aggregate_id) -> int`, `provenance_for(artifact_type=..., **extra) -> ProvenanceEnvelope`; `events/store.py::append_event(conn, new_event, *, expected_version, table_version) -> EventEnvelope`, `load_stream(conn, aggregate, aggregate_id)`.
-- **SP-0 run/request setup (tests only):** `aggregates/request_aggregate.py::create_request_command(conn, cmd)` (args `feature_concept`, `intake_mode?`), `create_run_command(conn, cmd)` (args `request_id`); `identity/build.py::build_human_identity`/`build_service_identity`; `ids.py::new_id(prefix) -> str`; `contracts::Command`/`CommandResult`/`DbConn`/`IdentityEnvelope`; `contracts.documents::NewDocument`.
-- **SP-0 security:** `security/audit.py::record_security_event(conn, *, event_type, actor, attempted_action, decision, reason=None, aggregate=None, aggregate_id=None, retention_class="regulator") -> str`.
+- **SP-0 run/request setup (tests only):** `aggregates/request_aggregate.py::create_request_command(conn, cmd)` (args `feature_concept`, `intake_mode?`), `create_run_command(conn, cmd)` (args `request_id`); `identity/build.py::build_human_identity`/`build_service_identity`; `idgen.py::mint_id(prefix) -> str` (R14 — the ONE id minter; NOT `ids.new_id`); `contracts::Command`/`CommandResult`/`DbConn`/`IdentityEnvelope`; `contracts.documents::NewDocument`.
+- **SP-0 security (R15):** `security/audit.py::record_denial(conn, cmd, reason) -> str` — the single SP-2 denial helper (routes a `COMMAND_DENIED` to the tamper-evident security-audit stream with `decision="denied"`, `attempted_action=cmd.action`). SP-2 **never** calls `record_security_event(..., decision="deny")` directly.
 - **P1:** `PRIMARY_SELECTED` is registered for candidate promotion (`register_primary_selected` wired in `seed_sp2_authz`); the additive `("select_candidate_doc","","data_scientist","human",None)` authz row is seeded there. Tests call `register_primary_selected(db)` directly (mirrors `tests/featuregen/documents/test_primary.py`).
 - **P2:** `intake/contract.py` — the tagged `calculation_method` shape (§4.2 `CONFIRMED_CONTRACT` `$defs.calculation_method`): `{method_version:int, chosen:method_variant, considered:[method_variant]}`; closed `chosen.kind`/`considered[].kind` vocabulary `{rolling_aggregate, point_snapshot, ratio, distribution_divergence}`. `documents/draft.py::DRAFT_CONTRACT_SCHEMA_VERSION` (=1).
 - **P3:** `intake/llm.py` — `LLMClient` Protocol (`call(request: LLMRequest) -> LLMResult`), `LLMRequest(task, prompt_id, prompt_version, inputs, output_schema_id, output_schema_version, generation_settings)`, `LLMResult(output: dict, self_reported_scores: dict, call_ref: str, status: str)`, and `call_llm(conn, client: LLMClient, request: LLMRequest, *, run_id: str, actor: IdentityEnvelope) -> LLMResult` (egress-guards, records the `llm_call`, emits `LLM_CALL_RECORDED`).
 - **P4:** `intake/commands.py` exists with `_SP2_CATALOG` (tuple of `(action, handler)`) + idempotent `register_sp2_commands()`; `submit_intent` freezes the primary `DRAFT_CONTRACT` doc and, in hypothesis mode, calls this phase's `generate_candidate_docs(...)` after the Draft is frozen (its returned candidate `doc_id`s ride the `DRAFT_CONTRACT_PRODUCED` event). This phase **appends** `select_candidate_doc` to that catalog.
-- **P5:** `intake/mcv.py::actor_is_request_owner(conn, run_id, actor) -> bool` — the canonical request-owner predicate (True iff `actor.subject` owns the run's request). P5 is implemented before P6 (phases run in order); single-sourcing the requester predicate here prevents drift with `confirm_contract`'s `confirmer_is_requester_human` guard (P7).
+- **P2 (`intake/state.py`, R3/R4):** `fold_feature_contract_state(stream) -> FeatureContractState` + the ONE canonical request-owner predicate `actor_is_request_owner(state, actor) -> bool` (state-based; `state.requester` is the `INTENT_SUBMITTED` event `actor.subject`). P6 folds the `feature_contract` stream and calls `actor_is_request_owner(state, cmd.actor)` — **NOT** a `(conn, run_id, actor)` form and **NOT** from `intake/mcv.py`. Single-sourcing the owner predicate in `state.py` prevents drift with `confirm_contract`'s `confirmer_is_requester_human` guard (P7).
+- **P1 (`intake/store.py`, R1):** `load_feature_contract(conn, run_id) -> list[EventEnvelope]` — the `feature_contract` load seam P6 folds for the owner guard (imported verbatim; never redefined).
 
 **Package layout:** all new code lives in `src/featuregen/intake/candidates.py` (new) and an append to `src/featuregen/intake/commands.py`; tests under `tests/featuregen/intake/`.
 
@@ -57,6 +58,7 @@ sibling docs are **write-once and left untouched** (no per-doc reject event); th
   - Type aliases `DraftContract = Mapping[str, Any]`, `CatalogView = Mapping[str, Any]`, `DomainCatalogEntry = Mapping[str, Any]` (structural-only metadata views — names/types/grain + declared enum/code metadata, **never** data values, §9.4).
   - `candidate_signals(calculation_method: dict, definition_text: str, *, known_concepts: set[str], sibling_methods: list[dict]) -> dict` — **cheap, model-free** plausibility signals ONLY (§7.3): `references_known_concept`, `window_sane`, `duplicate_of_sibling`, a heuristic `heuristic_rank ∈ [0,1]`, and `scored_by="cheap_model_free_heuristic"`. **Never** IV/WoE/AUC/overfitting.
   - `_METHOD_KINDS` (closed method-variant vocabulary, mirrors §4.0), and helpers `_variant_concept`, `_window_days`, `_window_is_sane`, `_same_variant`.
+  - **R10** the module-global collaborator DI seam **owned by P6**: `register_candidate_generator(generator) -> None` / `current_candidate_generator() -> CandidateGenerator` (fail-closed `RuntimeError` if unset). Mirrors SP-0's `overlay/catalog.py::register_catalog_adapter`/`current_catalog_adapter`. This is the ONLY holder — `submit_intent` (P4) resolves the generator via `current_candidate_generator()`; the P1 conftest `candidate_generator` fixture and P9's `register_sp2` wire it via `register_candidate_generator(...)`.
 
 - [ ] **Step 1 — write the failing test**
 
@@ -70,6 +72,8 @@ from featuregen.intake.candidates import (
     Candidate,
     CandidateGenerator,
     candidate_signals,
+    current_candidate_generator,
+    register_candidate_generator,
 )
 
 
@@ -136,6 +140,17 @@ def test_candidategenerator_is_a_runtime_checkable_protocol():
 
     assert isinstance(_G(), CandidateGenerator)  # structural conformance = the stable seam
     assert not isinstance(object(), CandidateGenerator)
+
+
+def test_candidate_generator_di_seam_registers_and_resolves():
+    # R10 — P6 OWNS the module-global register/current CandidateGenerator seam (fail-closed if unset).
+    class _G:
+        def generate(self, draft, catalog_metadata, domain_context=None):
+            return []
+
+    g = _G()
+    register_candidate_generator(g)
+    assert current_candidate_generator() is g  # last-writer-wins, mirrors register_catalog_adapter
 ```
 
 - [ ] **Step 2 — run it (fails)**
@@ -280,11 +295,36 @@ def candidate_signals(
         "heuristic_rank": round(rank, 3),
         "scored_by": "cheap_model_free_heuristic",  # honestly NOT measured predictive power (§7.3)
     }
+
+
+# --- R10 collaborator DI seam (module-global; mirrors overlay/catalog.py's
+# register_catalog_adapter/current_catalog_adapter) -----------------------------------------
+# The process-wide CandidateGenerator SP-2's hypothesis flow resolves. This is the ONLY holder:
+# submit_intent (P4) calls current_candidate_generator(); the P1 conftest `candidate_generator`
+# fixture and P9's register_sp2 register the concrete generator via register_candidate_generator(...).
+_CANDIDATE_GENERATOR: CandidateGenerator | None = None
+
+
+def register_candidate_generator(generator: CandidateGenerator) -> None:
+    """Register the process-wide `CandidateGenerator` (last writer wins)."""
+    global _CANDIDATE_GENERATOR
+    _CANDIDATE_GENERATOR = generator
+
+
+def current_candidate_generator() -> CandidateGenerator:
+    """Return the registered `CandidateGenerator`. Fails closed: raises `RuntimeError` if none has
+    been registered, so SP-2 never silently generates zero candidates on an unwired seam."""
+    if _CANDIDATE_GENERATOR is None:
+        raise RuntimeError(
+            "no CandidateGenerator registered; call register_candidate_generator(...) "
+            "(register_sp2() does this in production)"
+        )
+    return _CANDIDATE_GENERATOR
 ```
 
 - [ ] **Step 4 — run it (passes)**
   - `uv run pytest tests/featuregen/intake/test_candidates_seam.py -v`
-  - Expected: PASS (5 tests).
+  - Expected: PASS (6 tests).
 
 - [ ] **Step 5 — commit**
   - `git add src/featuregen/intake/candidates.py tests/featuregen/intake/__init__.py tests/featuregen/intake/test_candidates_seam.py && git commit -m "feat(intake): CandidateGenerator seam + Candidate schema + cheap model-free signals"`
@@ -298,7 +338,7 @@ def candidate_signals(
 - Test: `tests/featuregen/intake/test_stub_generator.py`
 
 **Interfaces:**
-- Consumes: `LLMClient`/`LLMRequest`/`LLMResult` (P3 `intake/llm.py`); `new_id` (`featuregen.ids`); the seam + `candidate_signals`/`_METHOD_KINDS` from Task 6.1.
+- Consumes: `LLMClient`/`LLMRequest`/`LLMResult` (P3 `intake/llm.py`); `mint_id` (`featuregen.idgen`, R14); the seam + `candidate_signals`/`_METHOD_KINDS` from Task 6.1.
 - Produces:
   - Module constants: `CANDIDATES_PROMPT_ID = "sp2.generate_candidates"`, `CANDIDATES_PROMPT_VERSION = 1`, `CANDIDATES_OUTPUT_SCHEMA_ID = "sp2.generate_candidates.output"`, `CANDIDATES_OUTPUT_SCHEMA_VERSION = 1`, `STUB_GENERATOR_VERSION = "sp2-stub-candidate-generator@1"`, `MAX_CANDIDATES = 3`.
   - `StubCandidateGenerator(client: LLMClient, *, generator_version: str = STUB_GENERATOR_VERSION)` implementing `CandidateGenerator.generate` — **exactly one** `client.call(...)` (task `"generate_candidates"`) → **1–3** `Candidate`s. Fail-closed: `status == "failed_into_clarification"` → `[]`; a structurally-invalid method variant (kind ∉ `_METHOD_KINDS`, or missing) is **skipped** per-item (never fabricated). Clamps to `MAX_CANDIDATES`. **No** router/specialists/memory/symbolic/diversity/few-shot (the SP-12 boundary, §7.2).
@@ -428,7 +468,7 @@ def test_bare_variant_is_wrapped_into_the_tagged_shape():
 Add to the imports:
 
 ```python
-from featuregen.ids import new_id
+from featuregen.idgen import mint_id
 from featuregen.intake.llm import LLMClient, LLMRequest
 ```
 
@@ -556,7 +596,7 @@ class StubCandidateGenerator:
             )
             candidates.append(
                 Candidate(
-                    candidate_id=new_id("cand"),
+                    candidate_id=mint_id("cand"),
                     definition_text=item.get("definition_text", ""),
                     rationale=item.get("rationale", ""),
                     calculation_method=method,
@@ -694,7 +734,7 @@ class RecordingLLMClient:
 - Test: `tests/featuregen/intake/test_candidate_docs.py`
 
 **Interfaces:**
-- Consumes: `append_document`/`compute_content_hash` (SP-0 `documents/store.py`); `NewDocument`/`Stage` (`contracts/documents.py`); `provenance_for` (`aggregates/_append.py`); `DRAFT_CONTRACT_SCHEMA_VERSION` (`documents/draft.py`); `new_id`; the `blob_index` table (SP-0 migration `0010`). `stdlib json`.
+- Consumes: `append_document`/`compute_content_hash` (SP-0 `documents/store.py`); `NewDocument`/`Stage` (`contracts/documents.py`); `provenance_for` (`aggregates/_append.py`); `DRAFT_CONTRACT_SCHEMA_VERSION` (`documents/draft.py`); `mint_id` (R14, already imported in Task 6.2); the `blob_index` table (SP-0 migration `0010`). `stdlib json`.
 - Produces:
   - `write_candidate_docs(conn, *, candidates: list[Candidate], draft_doc_id: str, run_id: str, request_id: str, actor: IdentityEnvelope) -> tuple[str, ...]` — freezes each `Candidate` as a **candidate-role `DRAFT_CONTRACT`** staged document under the run's Draft stage (`branch_role="candidate"`, `stage=Stage.DRAFT_CONTRACT.value`, `derived_from=(draft_doc_id,)`, `body_classification="governance-retained"`, body opaque-by-reference via `body_ref`+`content_hash`, §3.4/§4.3). Returns the candidate `doc_id`s in generation order.
   - `generate_candidate_docs(conn, generator: CandidateGenerator, *, draft, catalog_metadata, domain_context, draft_doc_id, run_id, request_id, actor) -> tuple[str, ...]` — the **hypothesis-mode entry point** `submit_intent` (P4) calls after the primary Draft is frozen: run the (event-sourced, via a `RecordingLLMClient`-wrapped) generator → freeze candidate docs → return their `doc_id`s (referenced by `DRAFT_CONTRACT_PRODUCED`). An **empty** result ⟹ generation failed closed → the run stays in clarification (§7.2).
@@ -708,7 +748,7 @@ from featuregen.aggregates._append import provenance_for
 from featuregen.contracts.documents import NewDocument, Stage
 from featuregen.documents.store import append_document, get_document
 from featuregen.identity.build import build_human_identity
-from featuregen.ids import new_id
+from featuregen.idgen import mint_id
 from featuregen.intake.candidates import (
     StubCandidateGenerator,
     generate_candidate_docs,
@@ -741,7 +781,7 @@ class _ScriptedLLM:
 
 
 def _draft_doc(db, run_id, request_id):
-    doc_id = new_id("doc")
+    doc_id = mint_id("doc")
     append_document(
         db,
         NewDocument(
@@ -846,7 +886,7 @@ def _persist_contract_body(conn: DbConn, *, body: dict) -> tuple[str, str]:
     Governance-retained bodies are needed for MRM reproduction / adverse-action explainability."""
     raw = json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
     content_hash = compute_content_hash(raw)
-    body_ref = new_id("blob")
+    body_ref = mint_id("blob")
     conn.execute(
         "INSERT INTO blob_index "
         "  (blob_id, object_key, content_hash, classification, referenced, status, size_bytes) "
@@ -882,7 +922,7 @@ def write_candidate_docs(
             "provenance": c.provenance,
         }
         body_ref, content_hash = _persist_contract_body(conn, body=body)
-        doc_id = new_id("doc")
+        doc_id = mint_id("doc")
         append_document(
             conn,
             NewDocument(
@@ -953,8 +993,8 @@ def generate_candidate_docs(
 - Test: `tests/featuregen/intake/test_select_candidate_doc.py`
 
 **Interfaces:**
-- Consumes: `new_primary_selected(*, run_id, stage, doc_id, actor, provenance, caused_by=None) -> NewEvent` (SP-0 `documents/primary.py`); `append_event` (`featuregen.events`); `current_version`/`table_version_for`/`provenance_for` (`aggregates/_append.py`); `Stage` (`contracts/documents.py`); `record_security_event` (`security/audit.py`); **`actor_is_request_owner(conn, run_id, actor) -> bool` (P5 `intake/mcv.py`)**; `Command`/`CommandResult`/`DbConn` (`featuregen.contracts`); the P4-created `_SP2_CATALOG`/`register_sp2_commands`.
-- Produces: `select_candidate_doc(conn, cmd) -> CommandResult` — the **document-level** candidate promotion for hypothesis mode (§7.1). `cmd.args`: `run_id`, `candidate_doc_id`, `stage` (default `Stage.DRAFT_CONTRACT.value`). Guards (fail-closed, in order): **human** (`actor_kind == "human"`, else DENY); **request-owner** (`actor_is_request_owner`, else DENY **+ security-audit** `COMMAND_DENIED`); the doc must be a **candidate-role** doc for `(run_id, stage)` (else DENY). On pass: emit `PRIMARY_SELECTED` via `new_primary_selected` on the **run** aggregate (OCC on the run stream) — records **only the chosen** doc; the losing sibling docs are write-once and **untouched** (no per-doc reject event; their `doc_id`s live only in the Gate #1 confirmation record, §8.3). **NOT** the request-level `select_candidate` (wrong granularity). Appended to `_SP2_CATALOG` so `execute_command` routes it (used by `confirm_contract` in hypothesis mode, P7, and the P9 E2E).
+- Consumes: `new_primary_selected(*, run_id, stage, doc_id, actor, provenance, caused_by=None) -> NewEvent` (SP-0 `documents/primary.py`); `append_event` (`featuregen.events`); `current_version`/`table_version_for`/`provenance_for` (`aggregates/_append.py`); `Stage` (`contracts/documents.py`); **`record_denial(conn, cmd, reason)` (`security/audit.py`, R15 — writes `decision="denied"`)**; **`fold_feature_contract_state` + `actor_is_request_owner(state, actor) -> bool` (P2 `intake/state.py`, R3/R4)** and **`load_feature_contract(conn, run_id)` (P1 `intake/store.py`, R1)** — the owner guard folds the `feature_contract` stream and calls the state-based predicate (NOT the `(conn, run_id, actor)` mcv form); `Command`/`CommandResult`/`DbConn` (`featuregen.contracts`); the P4-created `_SP2_CATALOG`/`register_sp2_commands`.
+- Produces: `select_candidate_doc(conn, cmd) -> CommandResult` — the **document-level** candidate promotion for hypothesis mode (§7.1). `cmd.args`: `run_id`, `candidate_doc_id`, `stage` (default `Stage.DRAFT_CONTRACT.value`). Guards (fail-closed, in order): **human** (`actor_kind == "human"`, else DENY); **request-owner** (fold the `feature_contract` stream → `actor_is_request_owner(state, cmd.actor)`, else DENY **via `record_denial`** → security-audit `COMMAND_DENIED`, `decision="denied"`, R15); the doc must be a **candidate-role** doc for `(run_id, stage)` (else DENY). On pass: emit `PRIMARY_SELECTED` via `new_primary_selected` on the **run** aggregate (OCC on the run stream) — records **only the chosen** doc; the losing sibling docs are write-once and **untouched** (no per-doc reject event; their `doc_id`s live only in the Gate #1 confirmation record, §8.3). **NOT** the request-level `select_candidate` (wrong granularity). Appended to `_SP2_CATALOG` so `execute_command` routes it (used by `confirm_contract` in hypothesis mode, P7, and the P9 E2E).
 
 - [ ] **Step 1 — write the failing test**
 
@@ -969,8 +1009,9 @@ from featuregen.contracts.documents import NewDocument, Stage
 from featuregen.documents.primary import register_primary_selected
 from featuregen.documents.store import append_document
 from featuregen.identity.build import build_human_identity, build_service_identity
-from featuregen.ids import new_id
+from featuregen.idgen import mint_id
 from featuregen.intake.commands import select_candidate_doc
+from featuregen.intake.store import append_feature_contract_event
 
 OWNER = build_human_identity(subject="user:raj", role_claims=("data_scientist",))
 STRANGER = build_human_identity(subject="user:mallory", role_claims=("data_scientist",))
@@ -980,22 +1021,37 @@ SERVICE = build_service_identity(
 
 
 def _open_run(db, owner, concept):
-    """A real requester-owned run: create_request + create_run both acted by `owner`, so the
-    request-owner guard resolves `owner` as the run's requester."""
+    """A real requester-owned run: create_request + create_run, then open the `feature_contract`
+    aggregate with an INTENT_SUBMITTED event acted by `owner` (R1 store seam). R4's fold sets
+    `state.requester` from THAT event's `actor.subject`, so the state-based request-owner guard
+    resolves `owner` as the run's requester."""
     req = create_request_command(
         db,
         Command("create_request", "request", None,
-                {"feature_concept": concept, "intake_mode": "hypothesis"}, owner, new_id("ik")),
+                {"feature_concept": concept, "intake_mode": "hypothesis"}, owner, mint_id("ik")),
     )
     run = create_run_command(
         db,
-        Command("create_run", "request", None, {"request_id": req.aggregate_id}, owner, new_id("ik")),
+        Command("create_run", "request", None, {"request_id": req.aggregate_id}, owner, mint_id("ik")),
+    )
+    # R1/R4: open the feature_contract stream so the fold has a requester. The fold reads the EVENT
+    # actor.subject for `state.requester` — the payload content does not set ownership.
+    append_feature_contract_event(
+        db,
+        run_id=run.aggregate_id,
+        type="INTENT_SUBMITTED",
+        payload={
+            "intake_mode": "hypothesis",
+            "classification": {"outcome": "IN_SCOPE", "catalog_version": "v0", "matched_class": None},
+        },
+        actor=owner,
+        request_id=req.aggregate_id,
     )
     return req.aggregate_id, run.aggregate_id
 
 
 def _candidate_doc(db, run_id, request_id, *, branch_role="candidate"):
-    doc_id = new_id("doc")
+    doc_id = mint_id("doc")
     append_document(
         db,
         NewDocument(
@@ -1006,7 +1062,7 @@ def _candidate_doc(db, run_id, request_id, *, branch_role="candidate"):
             content_hash="sha256:c",
             body_classification="governance-retained",
             provenance=provenance_for(artifact_type="DRAFT_CONTRACT"),
-            body_ref=new_id("blob"),
+            body_ref=mint_id("blob"),
         ),
         run_id=run_id,
         request_id=request_id,
@@ -1018,7 +1074,7 @@ def _candidate_doc(db, run_id, request_id, *, branch_role="candidate"):
 def _cmd(run_id, doc_id, actor):
     return Command(
         "select_candidate_doc", "run", None,
-        {"run_id": run_id, "candidate_doc_id": doc_id, "stage": "DRAFT_CONTRACT"}, actor, new_id("ik")
+        {"run_id": run_id, "candidate_doc_id": doc_id, "stage": "DRAFT_CONTRACT"}, actor, mint_id("ik")
     )
 
 
@@ -1063,7 +1119,7 @@ def test_non_owner_is_denied_and_security_audited(db):
     with db.cursor(row_factory=dict_row) as cur:
         cur.execute(
             "SELECT count(*) AS n FROM security_audit "
-            "WHERE attempted_action='select_candidate_doc' AND decision='deny'"
+            "WHERE attempted_action='select_candidate_doc' AND decision='denied'"
         )
         assert cur.fetchone()["n"] == 1
 
@@ -1107,8 +1163,9 @@ from featuregen.aggregates._append import current_version, provenance_for, table
 from featuregen.contracts.documents import Stage
 from featuregen.documents.primary import new_primary_selected
 from featuregen.events import append_event
-from featuregen.intake.mcv import actor_is_request_owner
-from featuregen.security.audit import record_security_event
+from featuregen.intake.state import actor_is_request_owner, fold_feature_contract_state
+from featuregen.intake.store import load_feature_contract
+from featuregen.security.audit import record_denial
 ```
 
 Append the handler:
@@ -1137,17 +1194,12 @@ def select_candidate_doc(conn: DbConn, cmd: Command) -> CommandResult:
             aggregate_id=run_id,
             denied_reason="select_candidate_doc requires the human requester (not a service)",
         )
-    if not actor_is_request_owner(conn, run_id, cmd.actor):
-        record_security_event(
-            conn,
-            event_type="COMMAND_DENIED",
-            actor=cmd.actor,
-            attempted_action="select_candidate_doc",
-            decision="deny",
-            reason="actor is not the request owner",
-            aggregate="run",
-            aggregate_id=run_id,
-        )
+    # R3/R4: fold the feature_contract stream and call the state-based owner predicate owned by P2
+    # (intake/state.py) — never the (conn, run_id, actor) mcv form. `state.requester` is the
+    # INTENT_SUBMITTED event actor.subject.
+    state = fold_feature_contract_state(load_feature_contract(conn, run_id))
+    if not actor_is_request_owner(state, cmd.actor):
+        record_denial(conn, cmd, "actor is not the request owner")  # R15 — writes decision="denied"
         return CommandResult(
             accepted=False,
             aggregate_id=run_id,

@@ -18,30 +18,29 @@ The Feature Contract lifecycle is SP-2's **folded `feature_contract` aggregate**
   - `featuregen.aggregates.run_lifecycle.run_is_terminal(conn, run_id) -> bool`.
   - `featuregen.events.registry.event_registry()`; `featuregen.documents.registry.DocumentSchemaRegistry`; `featuregen.documents.primary.{register_primary_selected, current_primary}`.
   - `featuregen.identity.build.{build_human_identity, build_service_identity}`; `featuregen.contracts.Command`.
-- **P1 (`intake/events.py` + migrations):** `register_sp2_event_types(registry)`; the twelve FC event-type schemas; migrations `0508_feature_contract_events.sql`, `0509_use_case_onboarding_gates.sql`; the `llm_call` record-store table + its checkpoint init.
-- **P2 (`intake/contract.py`, `intake/banking_catalog.py`):** `register_contract_schemas(registry)` (registers `DRAFT_CONTRACT`/`ASSUMPTION_LEDGER`/`CONFIRMED_CONTRACT` content-schemas + upcasters); `load_banking_catalog(seed) -> BankingDomainCatalog`, `register_banking_catalog(catalog)`.
-- **P3 (`intake/llm.py`, `intake/redaction.py`):** `FakeLLM`, `register_llm_client(client)`; `DefaultIntentRedactor`, `register_intent_redactor(redactor)`.
+- **P1 (`intake/events.py` + migrations + `intake/bootstrap.py`):** `register_sp2_event_types(registry)`; the twelve FC event-type schemas; migrations `0508_feature_contract_events.sql`, `0509_use_case_onboarding_gates.sql`; the `llm_call` record-store table + its checkpoint init; **R11** `intake/bootstrap.py::seed_sp2_authz(conn)` + the ONE `_SP2_POLICY_ROWS` (**P9 REUSES both verbatim — never re-declares them**; Task 9.1 only ADDS `register_sp2` and EXTENDS `seed_sp2_authz`).
+- **P2 (`intake/contract.py`, `intake/banking_catalog.py`, `intake/catalog.py`):** `register_contract_schemas(registry)` (registers `DRAFT_CONTRACT`/`ASSUMPTION_LEDGER`/`CONFIRMED_CONTRACT` content-schemas + upcasters); the module-global catalog seam **R8/R10** `load_banking_catalog_from_seed(seed) -> BankingDomainCatalog` + `register_intake_catalog(catalog)` / `current_intake_catalog()` (`intake/catalog.py`).
+- **P3 (`intake/llm.py`, `intake/redaction.py`):** **R19** `FakeLLM` + `FakeResponse`, `register_llm_client(client)`; `DefaultIntentRedactor`, `register_intent_redactor(redactor)`.
 - **P4–P8 (`intake/commands.py`, `intake/read_model.py`):** `register_sp2_commands()` (idempotent — skips already-registered actions); the seven handlers (`submit_intent`, `answer_clarification`, `select_candidate_doc`, `open_gate1_task`, `confirm_contract`, `request_edit`, `reject_intent`); `get_contract(conn, run_id) -> ContractView`; `fold_feature_contract_state`.
 - **P6 (`intake/candidates.py`):** `StubCandidateGenerator`, `register_candidate_generator(generator)`.
 
-> **Integration seams owned by P2–P6 (consumed, not defined, here).** The DI accessors this phase binds to at bootstrap/E2E time — `register_banking_catalog`/`register_llm_client`/`register_intent_redactor`/`register_candidate_generator` (each with a `current_*()` reader used by the handlers, mirroring SP-1's `overlay/catalog.py::current_catalog_adapter`) — are the **module-global seams P2/P3/P4/P6 register their implementations through**. If an earlier phase named a seam accessor differently, reconcile the import at integration; the *behaviour* asserted here is fixed by the overview.
+> **Integration seams owned by P2–P6 (consumed, not defined, here).** The DI accessors this phase binds to at bootstrap/E2E time — **R10** `register_intake_catalog`/`register_llm_client`/`register_intent_redactor`/`register_candidate_generator` (each with a `current_*()` reader used by the handlers, mirroring SP-1's `overlay/catalog.py::current_catalog_adapter`) — are the **module-global seams P2/P3/P4/P6 register their implementations through** (pinned names, per R10/R8). The *behaviour* asserted here is fixed by the overview.
 
 ---
 
 ### Task 9.1: `intake/bootstrap.py` — `register_sp2` + `seed_sp2_authz`
 
 **Files:**
-- Create: `src/featuregen/intake/bootstrap.py`
+- Modify: `src/featuregen/intake/bootstrap.py` (created by **P1 Task 1.6**; R11 — ADD `register_sp2`, EXTEND `seed_sp2_authz`; REUSE P1's ONE `_SP2_POLICY_ROWS`, never re-declare it)
 - Test: `tests/featuregen/intake/test_bootstrap.py`
 
 **Interfaces:**
-- Consumes: `register_sp2_event_types` (`intake/events.py`, P1); `register_sp2_commands` (`intake/commands.py`, P4–P8, idempotent); `register_contract_schemas` (`intake/contract.py`, P2); `DocumentSchemaRegistry` (SP-0); `register_primary_selected` (SP-0 `documents/primary.py`); `event_registry` (SP-0). Authz-table shape `authz_policy(action, gate, permitted_role, actor_kind, scope)` + `projection_checkpoints(projection_name)` (SP-0).
+- Consumes: **R11** `seed_sp2_authz(conn)` + the ONE `_SP2_POLICY_ROWS` (`intake/bootstrap.py`, **P1 Task 1.6** — REUSED, never re-declared); `register_sp2_event_types` (`intake/events.py`, P1); `register_sp2_commands` (`intake/commands.py`, P4–P8, idempotent); `register_contract_schemas` (`intake/contract.py`, P2); `DocumentSchemaRegistry` (SP-0); `register_primary_selected` (SP-0 `documents/primary.py`); `event_registry` (SP-0). Authz-table shape `authz_policy(action, gate, permitted_role, actor_kind, scope)` + `projection_checkpoints(projection_name)` (SP-0).
 - Produces:
-  - `register_sp2(handler_registry) -> None` — the **conn-less** in-memory registrations SP-0's `append` validation needs each process/test: the twelve FC event schemas into the `event_registry()` singleton **and** the idempotent SP-2 command catalog. `handler_registry` is accepted for signature symmetry with `bootstrap_phase06`/`register_overlay`; **SP-2 registers no durable-runtime handlers** (the auditable-LLM record write and the clarification/Gate-#1 flow ride command handlers, not `HandlerRegistry` handlers — like SP-1's overlay, whose expiry poller is explicit, not a registered handler).
-  - `seed_sp2_authz(conn) -> None` — the **conn-backed** seeding: the **eight** additive SP-2 `authz_policy` rows (incl. the `reject_intent` service row, §2.1 #5), the **contract content-schemas** into `document_type_registry` (`register_contract_schemas(DocumentSchemaRegistry(conn))`), the document **`PRIMARY_SELECTED`** registration (`register_primary_selected(conn)` — event schema + `stage_primary` checkpoint, for hypothesis-mode candidate promotion), and the **optional FC-status read-model** projection checkpoint (`'feature_contract'`). Idempotent throughout (`ON CONFLICT DO NOTHING`/`DO UPDATE`).
-  - `_SP2_POLICY_ROWS: tuple[tuple[str, str, str, str, str | None], ...]` — the eight rows exactly per the overview.
+  - `register_sp2(handler_registry) -> None` (**the ONE new symbol Task 9.1 adds**) — the **conn-less** in-memory registrations SP-0's `append` validation needs each process/test: the twelve FC event schemas into the `event_registry()` singleton **and** the idempotent SP-2 command catalog. `handler_registry` is accepted for signature symmetry with `bootstrap_phase06`/`register_overlay`; **SP-2 registers no durable-runtime handlers** (the auditable-LLM record write and the clarification/Gate-#1 flow ride command handlers, not `HandlerRegistry` handlers — like SP-1's overlay, whose expiry poller is explicit, not a registered handler).
+  - **Extends** the P1-created `seed_sp2_authz(conn)` (does **not** redefine P1's eight-row authz seeding or re-declare `_SP2_POLICY_ROWS`) with the **P9-owned** registrations — R11: *contract-schema registration lives in P9, NOT P1* — the **contract content-schemas** into `document_type_registry` (`register_contract_schemas(DocumentSchemaRegistry(conn))`), the document **`PRIMARY_SELECTED`** registration (`register_primary_selected(conn)` — event schema + `stage_primary` checkpoint, for hypothesis-mode candidate promotion), and the **optional FC-status read-model** projection checkpoint (`'feature_contract'`). Idempotent throughout (`ON CONFLICT DO NOTHING`/`DO UPDATE`).
 
-> **Why the DB-backed registrations ride `seed_sp2_authz(conn)` and not `register_sp2`.** The overview groups "event schemas + contract schemas + commands + PRIMARY_SELECTED" under `register_sp2` **conceptually**, but pins its signature to `register_sp2(handler_registry)` — **no conn**. The document-schema registry and `register_primary_selected` are DB-backed, so — exactly as SP-1 keeps `register_overlay` conn-less and does all DB seeding in `seed_overlay_authz(conn)` — the conn-requiring parts physically execute in `seed_sp2_authz(conn)`. Deployment calls both; tests call both. This drifts no shared *symbol* (both signatures are honoured verbatim).
+> **Why the P9-owned DB-backed registrations physically ride `seed_sp2_authz(conn)`.** R11 groups "event schemas + contract schemas + commands + PRIMARY_SELECTED" under `register_sp2` **conceptually**, but pins its signature to `register_sp2(handler_registry)` — **no conn**. The document-schema registry and `register_primary_selected` are DB-backed, so — exactly as SP-1 keeps `register_overlay` conn-less and does all DB seeding in `seed_overlay_authz(conn)` — the conn-requiring parts physically execute in the **P1-created `seed_sp2_authz(conn)`, which P9 EXTENDS** (never redefining P1's eight-row authz seeding, never re-declaring the ONE `_SP2_POLICY_ROWS`). Deployment calls both; tests call both. This drifts no shared *symbol* — `register_sp2(handler_registry)` and `seed_sp2_authz(conn)` are both honoured verbatim, and `_SP2_POLICY_ROWS` stays P1's (R11).
 
 - [ ] **Step 1 — write the failing test**
 
@@ -133,7 +132,7 @@ def test_seed_sp2_authz_seeds_the_eight_additive_rows(db):
 
 
 def test_seed_sp2_authz_registers_contract_schemas_primary_selected_and_checkpoints(db):
-    register_sp2(_Registry())  # PRIMARY_SELECTED also lands in the in-memory registry
+    register_sp2(_Registry())  # FC event schemas + command catalog in-memory (PRIMARY_SELECTED + contract schemas are seeded by seed_sp2_authz below)
     seed_sp2_authz(db)
     with db.cursor(row_factory=dict_row) as cur:
         cur.execute(
@@ -200,76 +199,61 @@ def test_unauthorized_submit_intent_is_denied_and_audited(db):
 
 - [ ] **Step 2 — run it (fails)**
   - `uv run pytest tests/featuregen/intake/test_bootstrap.py -v`
-  - Expected: FAIL — `ModuleNotFoundError: No module named 'featuregen.intake.bootstrap'`.
+  - Expected: FAIL — `ImportError: cannot import name 'register_sp2' from 'featuregen.intake.bootstrap'` (P1 Task 1.6 created the module with `seed_sp2_authz`/`_SP2_POLICY_ROWS`, but `register_sp2` — and the contract-schema/PRIMARY_SELECTED extension — is not yet added).
 
 - [ ] **Step 3 — minimal implementation**
 
 ```python
-# src/featuregen/intake/bootstrap.py
-from __future__ import annotations
+# src/featuregen/intake/bootstrap.py  — MODIFY (P1 Task 1.6 created this file; R11)
+#
+# P1 Task 1.6 ALREADY defines `_SP2_POLICY_ROWS` (the ONE eight-row tuple) and
+# `seed_sp2_authz(conn)` (seeds those eight rows via ON CONFLICT DO NOTHING + the `llm_call`
+# record-store / checkpoint init). P9 does NOT re-declare either. P9 ADDS the imports below +
+# `register_sp2`, and EXTENDS `seed_sp2_authz` with the P9-owned contract-schema +
+# PRIMARY_SELECTED + FC-status-checkpoint registration (R11: that registration lives in P9).
 
-from featuregen.contracts.db import DbConn
+# --- imports P9 adds to the existing module ---
 from featuregen.documents.primary import register_primary_selected
 from featuregen.documents.registry import DocumentSchemaRegistry
 from featuregen.events.registry import event_registry
 from featuregen.intake.commands import register_sp2_commands
 from featuregen.intake.contract import register_contract_schemas
 from featuregen.intake.events import register_sp2_event_types
-
-# §2.1 SP-2 command-capability rows (coarse capability only; fine authority — the request-owner
-# guard, `confirmer_is_requester_human`, delegation-off — lives in intake/mcv.py + the handlers,
-# NOT here, mirroring SP-1). The `reject_intent` service row is the ONE additive rejection
-# authority (§2.1 #5): SP-0's `reject` stays validator-only and is untouched; requester
-# abandonment reuses SP-0's `withdraw` (also untouched). No onboarding-answer row (deferred, §14).
-_SP2_POLICY_ROWS: tuple[tuple[str, str, str, str, str | None], ...] = (
-    ("submit_intent", "", "data_scientist", "human", None),
-    ("submit_intent", "", "intake-agent", "service", None),
-    ("answer_clarification", "", "data_scientist", "human", None),
-    ("select_candidate_doc", "", "data_scientist", "human", None),
-    ("open_gate1_task", "", "intake-agent", "service", None),
-    ("confirm_contract", "", "data_scientist", "human", None),
-    ("request_edit", "", "data_scientist", "human", None),
-    ("reject_intent", "", "intake-agent", "service", None),
-)
+# `_SP2_POLICY_ROWS` (the ONE eight-row tuple, incl. the additive `reject_intent` service row)
+# and the base `seed_sp2_authz(conn)` authz-row seeding are P1 Task 1.6 — present in this module,
+# NOT re-declared here (R11). SP-0's `reject` stays validator-only; `withdraw` untouched.
 
 
-def register_sp2(handler_registry) -> None:
+def register_sp2(handler_registry) -> None:  # P9 ADDS — the ONE new symbol (R11 owner)
     """Conn-less, in-memory registrations SP-0's `append` validation needs every process/test:
     the twelve `feature_contract` FC event schemas into the `event_registry()` singleton + the
     idempotent SP-2 command catalog. SP-2 registers NO durable-runtime handlers, so nothing is
     put into `handler_registry` (accepted only for signature symmetry with the SP-0/SP-1
-    bootstraps). The DB-backed contract-schema + PRIMARY_SELECTED registrations ride the
-    conn-taking `seed_sp2_authz` below (register_sp2 has no conn — same split as SP-1's
-    conn-less `register_overlay` + conn-backed `seed_overlay_authz`)."""
+    bootstraps). The contract-schema + PRIMARY_SELECTED registrations R11 groups under
+    `register_sp2` are DB-backed and this signature takes NO conn — so, exactly as SP-1 keeps
+    `register_overlay` conn-less and DB-seeds in `seed_overlay_authz(conn)`, they ride the
+    P1-created `seed_sp2_authz(conn)`, which P9 EXTENDS below. Both pinned signatures honoured."""
     del handler_registry
     register_sp2_event_types(event_registry())
     register_sp2_commands()  # idempotent: skips already-registered actions
 
 
-def seed_sp2_authz(conn: DbConn) -> None:
-    """Idempotently seed the eight additive SP-2 authz rows, register the contract content-schemas
-    + the document `PRIMARY_SELECTED` promotion primitive, and init the FC-status projection
-    checkpoint. All inserts additive/backward-compatible — no existing SP-0 row is rewritten."""
-    for action, gate, role, kind, scope in _SP2_POLICY_ROWS:
-        conn.execute(
-            """
-            INSERT INTO authz_policy (action, gate, permitted_role, actor_kind, scope)
-            VALUES (%s,%s,%s,%s,%s)
-            ON CONFLICT (action, gate, permitted_role, actor_kind) DO NOTHING
-            """,
-            (action, gate, role, kind, scope),
-        )
-    # Contract content-schemas (DRAFT/ASSUMPTION_LEDGER/CONFIRMED) into SP-0's document registry.
-    register_contract_schemas(DocumentSchemaRegistry(conn))
-    # Document PRIMARY_SELECTED: event schema (DB + in-memory) + stage_primary checkpoint, used for
-    # hypothesis-mode candidate promotion (§7.1). Idempotent.
-    register_primary_selected(conn)
-    # Optional fail-closed FC-status read-model projection checkpoint (secondary to the fold —
-    # queries only, never a command decision, §4.6/§11). Harmless if the projection is unwired.
-    conn.execute(
-        "INSERT INTO projection_checkpoints (projection_name) VALUES ('feature_contract') "
-        "ON CONFLICT (projection_name) DO NOTHING"
-    )
+# --- P9 EXTENDS the P1-created `seed_sp2_authz(conn)` (does NOT redefine the authz-row loop or
+#     re-declare `_SP2_POLICY_ROWS`). After P1's existing body — which seeds the eight
+#     `_SP2_POLICY_ROWS` (ON CONFLICT DO NOTHING) + the llm_call/checkpoint init — P9 appends the
+#     P9-owned registrations (R11: contract-schema registration lives in P9, not P1):
+#
+#         # Contract content-schemas (DRAFT/ASSUMPTION_LEDGER/CONFIRMED) into SP-0's doc registry.
+#         register_contract_schemas(DocumentSchemaRegistry(conn))
+#         # Document PRIMARY_SELECTED: event schema (DB + in-memory) + stage_primary checkpoint,
+#         # for hypothesis-mode candidate promotion (§7.1). Idempotent.
+#         register_primary_selected(conn)
+#         # Optional fail-closed FC-status read-model projection checkpoint (secondary to the
+#         # fold — queries only, never a command decision, §4.6/§11).
+#         conn.execute(
+#             "INSERT INTO projection_checkpoints (projection_name) VALUES ('feature_contract') "
+#             "ON CONFLICT (projection_name) DO NOTHING"
+#         )
 ```
 
 - [ ] **Step 4 — run it (passes)**
@@ -277,7 +261,7 @@ def seed_sp2_authz(conn: DbConn) -> None:
   - Expected: PASS (6 tests).
 
 - [ ] **Step 5 — commit**
-  - `git add src/featuregen/intake/bootstrap.py tests/featuregen/intake/test_bootstrap.py && git commit -m "feat(intake): register_sp2 + seed_sp2_authz bootstrap wiring"`
+  - `git add src/featuregen/intake/bootstrap.py tests/featuregen/intake/test_bootstrap.py && git commit -m "feat(intake): add register_sp2 + extend seed_sp2_authz bootstrap wiring"`
 
 ---
 
@@ -287,12 +271,12 @@ def seed_sp2_authz(conn: DbConn) -> None:
 - Create: `tests/featuregen/intake/test_e2e.py` (shared harness + the definition scenario; Tasks 9.3–9.5 append scenarios)
 
 **Interfaces:**
-- Consumes: `register_sp2`/`seed_sp2_authz` (Task 9.1); `register_phase06_event_schemas` (SP-0); `seed_authz_policy` + `PolicyAuthorizer` + `register_command_authorizer` + `execute_command` (SP-0); `get_contract` (P8); `current_primary` (SP-0); `run_is_terminal` (SP-0); the P2/P3/P6 seams `load_banking_catalog`/`register_banking_catalog`, `FakeLLM`/`register_llm_client`, `DefaultIntentRedactor`/`register_intent_redactor`, `StubCandidateGenerator`/`register_candidate_generator`.
+- Consumes: `register_sp2`/`seed_sp2_authz` (Task 9.1); `register_phase06_event_schemas` (SP-0); `seed_authz_policy` + `PolicyAuthorizer` + `register_command_authorizer` + `execute_command` (SP-0); `get_contract` (P8); `current_primary` (SP-0); `run_is_terminal` (SP-0); the P2/P3/P6 seams **R8/R10** `load_banking_catalog_from_seed`/`register_intake_catalog`, **R19** `FakeLLM`/`FakeResponse`/`register_llm_client`, `DefaultIntentRedactor`/`register_intent_redactor`, `StubCandidateGenerator`/`register_candidate_generator`.
 - Produces: no new src — an **acceptance** test over the assembled P1–P8 stack. Helpers `_wire`, `_only_open_task`, `_Registry`, the `_BANKING_SEED`, and the `FakeLLM` fixture maps `_DEF_FIXTURES`/`_HYP_FIXTURES` (task-keyed deterministic outputs).
 
 > **Acceptance-test discipline.** These E2E scenarios run over already-built code (P1–P8), so a scenario is expected to **PASS on first run**. A failure is a real integration defect — localize it to the phase that owns the failing step (the assertion messages name the step) and fix it there, not by weakening the assertion.
 
-> **`FakeLLM` fixtures are task-keyed for determinism.** The overview keys `FakeLLM` on `(task, prompt_id, input_hash)`; within a single scenario each `task` fires once (`structure_intent`, then `renormalize`, plus `generate_candidates` in hypothesis mode), so keying the fixture map on `task` alone is unambiguous and independent of the redactor's `input_hash`. If P3's `FakeLLM` constructor differs, adapt the two-line construction in `_wire`.
+> **`FakeLLM` fixtures are task-keyed for determinism.** The overview keys `FakeLLM` on `(task, prompt_id, input_hash)`; within a single scenario each `task` fires once (`structure_intent`, then `renormalize`, plus `generate_candidates` in hypothesis mode), so keying the **R19** `script={task_key: FakeResponse(...)}` map on `task` alone is unambiguous and independent of the redactor's `input_hash`. The construction in `_wire` uses the pinned form `FakeLLM(script=fixtures)` verbatim.
 
 - [ ] **Step 1 — write the failing test (harness + definition scenario)**
 
@@ -307,10 +291,10 @@ from featuregen.commands.authz_seam import register_command_authorizer
 from featuregen.contracts import Command
 from featuregen.documents.primary import current_primary
 from featuregen.identity.build import build_human_identity, build_service_identity
-from featuregen.intake.banking_catalog import load_banking_catalog, register_banking_catalog
 from featuregen.intake.bootstrap import register_sp2, seed_sp2_authz
 from featuregen.intake.candidates import StubCandidateGenerator, register_candidate_generator
-from featuregen.intake.llm import FakeLLM, register_llm_client
+from featuregen.intake.catalog import load_banking_catalog_from_seed, register_intake_catalog
+from featuregen.intake.llm import FakeLLM, FakeResponse, register_llm_client
 from featuregen.intake.read_model import get_contract
 from featuregen.intake.redaction import DefaultIntentRedactor, register_intent_redactor
 
@@ -393,7 +377,11 @@ _DEF_RENORMALIZE = {
         "filters": {"ambiguity": 0.05, "confidence": 0.95},
     },
 }
-_DEF_FIXTURES = {"structure_intent": _DEF_STRUCTURE, "renormalize": _DEF_RENORMALIZE}
+# R19 — FakeLLM(script={task_key: FakeResponse(...)}): wrap each task's deterministic output.
+_DEF_FIXTURES = {
+    "structure_intent": FakeResponse(**_DEF_STRUCTURE),
+    "renormalize": FakeResponse(**_DEF_RENORMALIZE),
+}
 
 
 class _Registry:
@@ -413,9 +401,9 @@ def _wire(db, *, fixtures, catalog_seed=_BANKING_SEED, generator=False):
     seed_authz_policy(db)  # SP-0 base rows (withdraw/park/open_task/etc.)
     seed_sp2_authz(db)  # SP-2 authz rows + contract doc-schemas + PRIMARY_SELECTED + checkpoints
     register_command_authorizer(PolicyAuthorizer())
-    register_banking_catalog(load_banking_catalog(catalog_seed))
+    register_intake_catalog(load_banking_catalog_from_seed(catalog_seed))  # R8/R10 seam
     register_intent_redactor(DefaultIntentRedactor())
-    llm = FakeLLM(fixtures)
+    llm = FakeLLM(script=fixtures)  # R19 — the ONE pinned FakeLLM construction form
     register_llm_client(llm)
     if generator:
         register_candidate_generator(StubCandidateGenerator(client=llm))
@@ -469,7 +457,7 @@ def test_definition_intent_reaches_confirmed_contract_for_sp3(db):
     run_id = submitted.aggregate_id  # P4 returns the run_id as the aggregate_id
 
     # a Draft was produced with ONE must-ask clarification (the declined-status encoding, amb 0.80)
-    assert get_contract(db, run_id)["status"] == "NEEDS_CLARIFICATION"
+    assert get_contract(db, run_id).status == "NEEDS_CLARIFICATION"
     task_id, tv = _only_open_task(db, run_id)
 
     answered = execute_command(
@@ -490,7 +478,7 @@ def test_definition_intent_reaches_confirmed_contract_for_sp3(db):
     )
     assert answered.accepted, answered.denied_reason
     # refinement loop closed all open fields → MCV passed
-    assert get_contract(db, run_id)["status"] == "MINIMUM_CONTRACT_VALIDATED"
+    assert get_contract(db, run_id).status == "MINIMUM_CONTRACT_VALIDATED"
 
     opened = execute_command(
         db,
@@ -513,7 +501,7 @@ def test_definition_intent_reaches_confirmed_contract_for_sp3(db):
     assert confirmed.accepted, confirmed.denied_reason
 
     view = get_contract(db, run_id)
-    assert view["status"] == "CONFIRMED"
+    assert view.status == "CONFIRMED"
     c = view["confirmed"]
     assert c["feature_name"] == "declined_card_auth_count_90d"
     assert c["intake_mode"] == "definition"
@@ -653,7 +641,7 @@ def test_non_owner_data_scientist_denied_clarify_and_confirm_and_audited(db):
         ),
     )
     assert bad_confirm.accepted is False
-    assert get_contract(db, run_id)["status"] != "CONFIRMED"
+    assert get_contract(db, run_id).status != "CONFIRMED"
     n2 = db.execute(
         "SELECT count(*) FROM security_audit "
         "WHERE attempted_action='confirm_contract' AND decision='denied'"
@@ -672,7 +660,7 @@ def test_non_owner_data_scientist_denied_clarify_and_confirm_and_audited(db):
         ),
     )
     assert good.accepted, good.denied_reason
-    assert get_contract(db, run_id)["status"] == "CONFIRMED"
+    assert get_contract(db, run_id).status == "CONFIRMED"
 ```
 
 - [ ] **Step 2 — run it (expect PASS)**
@@ -720,7 +708,7 @@ def test_prohibited_class_intent_is_blocked_before_any_llm_call(db):
     run_id = submitted.aggregate_id
 
     # the folded feature_contract status is the terminal block
-    assert get_contract(db, run_id)["status"] == "PROHIBITED_DATA_CLASS"
+    assert get_contract(db, run_id).status == "PROHIBITED_DATA_CLASS"
 
     # platform/service-issued terminal rejection, stamping the matched class + catalog version
     rej = db.execute(
@@ -870,10 +858,10 @@ _HYP_RENORMALIZE = {
         "target_definition": {"ambiguity": 0.05, "confidence": 0.95},
     },
 }
-_HYP_FIXTURES = {
-    "structure_intent": _HYP_STRUCTURE,
-    "generate_candidates": _HYP_CANDIDATES,
-    "renormalize": _HYP_RENORMALIZE,
+_HYP_FIXTURES = {  # R19 — FakeResponse-wrapped, keyed by task for FakeLLM(script=...)
+    "structure_intent": FakeResponse(**_HYP_STRUCTURE),
+    "generate_candidates": FakeResponse(**_HYP_CANDIDATES),
+    "renormalize": FakeResponse(**_HYP_RENORMALIZE),
 }
 
 
@@ -934,7 +922,7 @@ def test_hypothesis_stub_candidates_select_and_confirm(db):
         ),
     )
     assert answered.accepted, answered.denied_reason
-    assert get_contract(db, run_id)["status"] == "MINIMUM_CONTRACT_VALIDATED"
+    assert get_contract(db, run_id).status == "MINIMUM_CONTRACT_VALIDATED"
 
     execute_command(
         db,
@@ -964,7 +952,7 @@ def test_hypothesis_stub_candidates_select_and_confirm(db):
     assert current_primary(db, run_id, "DRAFT_CONTRACT") == chosen
 
     view = get_contract(db, run_id)
-    assert view["status"] == "CONFIRMED"
+    assert view.status == "CONFIRMED"
     c = view["confirmed"]
     assert c["intake_mode"] == "hypothesis"
     assert c["confirmation"]["selected_candidate"] == chosen

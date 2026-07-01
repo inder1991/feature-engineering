@@ -9,7 +9,7 @@
 This phase ships the **additive, backward-compatible SP-0 surface** that unblocks the rest of SP-2
 (design §2.1). Exactly as SP-1 did with its `overlay` aggregate, SP-2 carries the Feature Contract
 lifecycle on its **own event-sourced `feature_contract` aggregate** (folded from its stream —
-`fold_feature_contract_state`, built in P8; **not** an SP-0 run-state, **not** the built-but-unused
+`fold_feature_contract_state`, built in **P2**; **not** an SP-0 run-state, **not** the built-but-unused
 `state_machine/engine.py`, **not** `run_workflow_state`). P1 adds that aggregate via an **additive
 event-store aggregate-CHECK widening** (`0508_feature_contract_events.sql`, the exact recipe of SP-1's
 `0504_overlay_events.sql`), registers the twelve SP-2 event-type schemas, threads the typed mirror id
@@ -401,12 +401,13 @@ git commit -m "feat(intake): add feature_contract aggregate + feature_contract_i
 **Files:**
 - Create: `src/featuregen/intake/__init__.py`
 - Create: `src/featuregen/intake/events.py`
+- Create: `tests/featuregen/intake/__init__.py`
 - Create: `tests/featuregen/intake/conftest.py`
 - Test: `tests/featuregen/intake/test_sp2_events.py`
 
 **Interfaces:**
 - Consumes: `event_registry()` + `EventSchemaRegistry.register_schema(type_name, schema_version, json_schema, owner, *, status="active")` (`featuregen.events.registry`); `register_phase06_event_types(registry)` (`featuregen.aggregates.events`) — RUN_*/lifecycle schemas the intake suite reuses.
-- Produces: the twelve SP-2 event-type constants (`INTENT_SUBMITTED`, `DRAFT_CONTRACT_PRODUCED`, `CONTRACT_CRITIQUED`, `FIELD_AUTO_RESOLVED`, `CLARIFICATION_REQUESTED`, `CLARIFICATION_ANSWERED`, `CONTRACT_REFINED`, `MINIMUM_CONTRACT_VALIDATED`, `CONTRACT_CONFIRMED`, `USE_CASE_ONBOARDING_REQUESTED`, `INTENT_REJECTED`, `LLM_CALL_RECORDED`); the gate/park constants `USE_CASE_ONBOARDING_GATE = "USE_CASE_ONBOARDING"` and `NEEDS_USE_CASE_ONBOARDING = "NEEDS_USE_CASE_ONBOARDING"`; `SP2_EVENT_SCHEMAS: dict[str, dict]`, `SP2_EVENT_SCHEMA_VERSION = 1`, `SP2_OWNER = "featuregen-intake"`; `register_sp2_event_types(registry) -> None` — consumed by P4–P8 handlers (every FC event MUST be registered before append) and P9's `register_sp2`.
+- Produces: the twelve SP-2 event-type constants (`INTENT_SUBMITTED`, `DRAFT_CONTRACT_PRODUCED`, `CONTRACT_CRITIQUED`, `FIELD_AUTO_RESOLVED`, `CLARIFICATION_REQUESTED`, `CLARIFICATION_ANSWERED`, `CONTRACT_REFINED`, `MINIMUM_CONTRACT_VALIDATED`, `CONTRACT_CONFIRMED`, `USE_CASE_ONBOARDING_REQUESTED`, `INTENT_REJECTED`, `LLM_CALL_RECORDED`); the gate/park constants `USE_CASE_ONBOARDING_GATE = "USE_CASE_ONBOARDING"` and `NEEDS_USE_CASE_ONBOARDING = "NEEDS_USE_CASE_ONBOARDING"`; `SP2_EVENT_SCHEMAS: dict[str, dict]`, `SP2_EVENT_SCHEMA_VERSION = 1`, `SP2_OWNER = "featuregen-intake"`; `register_sp2_event_types(registry) -> None` — consumed by P4–P8 handlers (every FC event MUST be registered before append) and P9's `register_sp2`. Also creates the **R18** shared intake test scaffolding — `tests/featuregen/intake/__init__.py` + the ONE `tests/featuregen/intake/conftest.py` (autouse event-type registration + the four collaborator-seam fixtures `llm_client`/`intent_redactor`/`candidate_generator`/`intake_catalog`) — that P2/P4/P5/P7 later MODIFY/merge, never re-Create.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -467,21 +468,22 @@ def test_register_makes_every_type_writable():
 def test_intent_submitted_schema_validates_required_and_enums():
     reg = event_registry()
     register_sp2_event_types(reg)
+    # R2: the payload carries only SEMANTIC fields — id fields (feature_contract_id/run_id/request_id)
+    # ride typed columns and are NOT in required[].
     good = {
-        "feature_contract_id": "fc_1",
-        "run_id": "run_1",
-        "request_id": "req_1",
         "intake_mode": "definition",
         "raw_input_ref": "blob_01H",
         "raw_input_classification": "clean",
     }
-    reg.validate(INTENT_SUBMITTED, 1, good)  # no raise
+    reg.validate(INTENT_SUBMITTED, 1, good)  # no raise (no id fields needed)
     with pytest.raises(SchemaValidationError):
         reg.validate(INTENT_SUBMITTED, 1, {**good, "intake_mode": "guesswork"})  # closed enum
     with pytest.raises(SchemaValidationError):
         bad = dict(good)
-        del bad["run_id"]
-        reg.validate(INTENT_SUBMITTED, 1, bad)  # missing required
+        del bad["raw_input_ref"]
+        reg.validate(INTENT_SUBMITTED, 1, bad)  # missing a SEMANTIC required field
+    # R2: an id field is never required — a payload carrying one still validates (additive).
+    reg.validate(INTENT_SUBMITTED, 1, {**good, "run_id": "run_1"})
 
 
 def test_intent_rejected_classification_is_a_closed_enum():
@@ -497,6 +499,19 @@ def test_intent_rejected_classification_is_a_closed_enum():
     reg.validate(INTENT_REJECTED, 1, {**base, "classification": "PROHIBITED_DATA_CLASS"})
     with pytest.raises(SchemaValidationError):
         reg.validate(INTENT_REJECTED, 1, {**base, "classification": "MEH"})
+
+
+def test_event_schemas_require_only_semantic_fields():
+    # R2: no id field (feature_contract_id / run_id / request_id) appears in ANY required[].
+    id_fields = {"feature_contract_id", "run_id", "request_id"}
+    for type_name, schema in SP2_EVENT_SCHEMAS.items():
+        assert id_fields.isdisjoint(schema["required"]), type_name
+    assert SP2_EVENT_SCHEMAS[LLM_CALL_RECORDED]["required"] == ["llm_call_ref"]
+    assert SP2_EVENT_SCHEMAS[INTENT_SUBMITTED]["required"] == [
+        "intake_mode",
+        "raw_input_ref",
+        "raw_input_classification",
+    ]
 ```
 
 - [ ] **Step 2: Run the test to verify it fails**
@@ -504,11 +519,16 @@ def test_intent_rejected_classification_is_a_closed_enum():
 Run: `uv run pytest tests/featuregen/intake/test_sp2_events.py -v`
 Expected: FAIL — `featuregen.intake` package / `events` module does not exist (ImportError).
 
-- [ ] **Step 3: Create the `intake` package marker**
+- [ ] **Step 3: Create the `intake` package marker + the intake test-package marker (R18 scaffolding)**
 
 ```python
 # src/featuregen/intake/__init__.py
 """SP-2 — Intake, Clarification and Human Gate #1 (a thin domain layer over SP-0)."""
+```
+
+```python
+# tests/featuregen/intake/__init__.py
+# R18: the intake test-package marker — CREATED by P1 (single-create); later phases MODIFY, never Create.
 ```
 
 - [ ] **Step 4: Create `intake/events.py`**
@@ -576,6 +596,9 @@ def _evt(properties: Mapping[str, dict], required: list[str]) -> dict:
     }
 
 
+# R2 — id fields (feature_contract_id / run_id / request_id) ride typed event columns and appear in
+# NO required[]; each schema requires only its SEMANTIC fields (LLM_CALL_RECORDED -> ["llm_call_ref"]).
+# Emitters put NO id fields in the payload (mirrors SP-1 overlay events not requiring overlay_fact_id).
 SP2_EVENT_SCHEMAS: dict[str, dict] = {
     INTENT_SUBMITTED: _evt(
         {
@@ -587,8 +610,7 @@ SP2_EVENT_SCHEMAS: dict[str, dict] = {
             "raw_input_classification": _RAW_CLASS,
             "catalog_version": _NSTR,
         },
-        ["feature_contract_id", "run_id", "request_id", "intake_mode",
-         "raw_input_ref", "raw_input_classification"],
+        ["intake_mode", "raw_input_ref", "raw_input_classification"],
     ),
     DRAFT_CONTRACT_PRODUCED: _evt(
         {
@@ -600,7 +622,7 @@ SP2_EVENT_SCHEMAS: dict[str, dict] = {
             "open_fields": _ARR,
             "catalog_version": _NSTR,
         },
-        ["feature_contract_id", "run_id", "draft_doc_id"],
+        ["draft_doc_id"],
     ),
     CONTRACT_CRITIQUED: _evt(
         {
@@ -609,7 +631,7 @@ SP2_EVENT_SCHEMAS: dict[str, dict] = {
             "critique_call_ref": _NSTR,     # llm_call_ref of the CONTRACT_REVIEW critique (§6.4)
             "findings": _ARR,
         },
-        ["feature_contract_id", "run_id"],
+        [],
     ),
     FIELD_AUTO_RESOLVED: _evt(
         {
@@ -621,7 +643,7 @@ SP2_EVENT_SCHEMAS: dict[str, dict] = {
             "ambiguity": {"type": "number"},
             "confidence": {"type": "number"},
         },
-        ["feature_contract_id", "run_id", "field"],
+        ["field"],
     ),
     CLARIFICATION_REQUESTED: _evt(
         {
@@ -632,7 +654,7 @@ SP2_EVENT_SCHEMAS: dict[str, dict] = {
             "blocks_progress": _BOOL,
             "routed_to": _ROUTED_TO,
         },
-        ["feature_contract_id", "run_id", "task_id", "field"],
+        ["task_id", "field"],
     ),
     CLARIFICATION_ANSWERED: _evt(
         {
@@ -642,7 +664,7 @@ SP2_EVENT_SCHEMAS: dict[str, dict] = {
             "field": _NSTR,
             "renormalize": _BOOL,           # thin domain shadow: the re-normalization trigger (§2.1 #2)
         },
-        ["feature_contract_id", "run_id", "task_id"],
+        ["task_id"],
     ),
     CONTRACT_REFINED: _evt(
         {
@@ -652,7 +674,7 @@ SP2_EVENT_SCHEMAS: dict[str, dict] = {
             "supersedes": _ARR,
             "iteration": _INT,
         },
-        ["feature_contract_id", "run_id", "draft_doc_id"],
+        ["draft_doc_id"],
     ),
     MINIMUM_CONTRACT_VALIDATED: _evt(
         {
@@ -661,7 +683,7 @@ SP2_EVENT_SCHEMAS: dict[str, dict] = {
             "draft_doc_id": _NSTR,          # the final Draft the MCV checklist passed against
             "checks": {},                   # the deterministic MCV checklist result (§6.7)
         },
-        ["feature_contract_id", "run_id"],
+        [],
     ),
     CONTRACT_CONFIRMED: _evt(
         {
@@ -672,7 +694,7 @@ SP2_EVENT_SCHEMAS: dict[str, dict] = {
             "requires_independent_validation": _BOOL,
             "selected_candidate": _NSTR,    # hypothesis mode: chosen candidate doc_id
         },
-        ["feature_contract_id", "run_id", "confirmed_doc_id"],
+        ["confirmed_doc_id"],
     ),
     USE_CASE_ONBOARDING_REQUESTED: _evt(
         {
@@ -682,7 +704,7 @@ SP2_EVENT_SCHEMAS: dict[str, dict] = {
             "catalog_version": _STR,
             "proposed_use_case": _NSTR,
         },
-        ["feature_contract_id", "run_id", "catalog_version"],
+        ["catalog_version"],
     ),
     INTENT_REJECTED: _evt(
         {
@@ -693,7 +715,7 @@ SP2_EVENT_SCHEMAS: dict[str, dict] = {
             "catalog_version": _STR,          # stamped on every outcome (§4.5 completeness (c))
             "matched_class": _NSTR,           # the blocked_data_classes member, when prohibited
         },
-        ["feature_contract_id", "run_id", "classification", "catalog_version"],
+        ["classification", "catalog_version"],
     ),
     LLM_CALL_RECORDED: _evt(
         {
@@ -703,7 +725,7 @@ SP2_EVENT_SCHEMAS: dict[str, dict] = {
             "task": _STR,                   # structure_intent | contract_review | generate_candidates | renormalize
             "status": _NSTR,                # ok | repaired | retried | failed_into_clarification (§9.2)
         },
-        ["feature_contract_id", "run_id", "llm_call_ref", "task"],
+        ["llm_call_ref"],
     ),
 }
 
@@ -722,6 +744,11 @@ def register_sp2_event_types(registry) -> None:
 
 ```python
 # tests/featuregen/intake/conftest.py
+"""The ONE shared intake test harness (R18) — CREATED by P1; P2/P4/P5/P7 MODIFY/merge (never
+`Create`). Holds the autouse event-type registration + the four collaborator-seam fixtures
+(`llm_client`, `intent_redactor`, `candidate_generator`, `intake_catalog`). Each seam fixture imports
+its module + double LAZILY (inside the body) so P1's own suite — which never requests them — does not
+depend on the not-yet-built P2/P3/P6 modules; the owning phase fleshes out the double it registers."""
 import pytest
 
 from featuregen.aggregates.events import register_phase06_event_types
@@ -736,19 +763,60 @@ def _register_intake_event_types():
     # the phase-06 RUN_*/lifecycle schemas for every intake test so append_event validation passes.
     register_phase06_event_types(event_registry())
     register_sp2_event_types(event_registry())
+
+
+@pytest.fixture
+def llm_client():
+    """R10 llm seam — register a deterministic FakeLLM (P3 owns FakeLLM + the R19 script form)."""
+    from featuregen.intake.llm import FakeLLM, register_llm_client
+
+    client = FakeLLM(script={})
+    register_llm_client(client)
+    return client
+
+
+@pytest.fixture
+def intent_redactor():
+    """R10 redactor seam — register the DefaultIntentRedactor (P3 owns it)."""
+    from featuregen.intake.redaction import DefaultIntentRedactor, register_intent_redactor
+
+    redactor = DefaultIntentRedactor()
+    register_intent_redactor(redactor)
+    return redactor
+
+
+@pytest.fixture
+def candidate_generator():
+    """R10 candidate seam — register the StubCandidateGenerator (P6 owns it)."""
+    from featuregen.intake.candidates import StubCandidateGenerator, register_candidate_generator
+
+    generator = StubCandidateGenerator()
+    register_candidate_generator(generator)
+    return generator
+
+
+@pytest.fixture
+def intake_catalog():
+    """R10 catalog seam — register a BankingDomainCatalog from the seed (P2 owns the loader)."""
+    from featuregen.intake.catalog import load_banking_catalog_from_seed, register_intake_catalog
+
+    catalog = load_banking_catalog_from_seed({})
+    register_intake_catalog(catalog)
+    return catalog
 ```
 
 - [ ] **Step 6: Run the test to verify it passes**
 
 Run: `uv run pytest tests/featuregen/intake/test_sp2_events.py -v`
-Expected: PASS (5 passed).
+Expected: PASS (6 passed).
 
 - [ ] **Step 7: Commit**
 
 ```bash
 git add src/featuregen/intake/__init__.py src/featuregen/intake/events.py \
-        tests/featuregen/intake/conftest.py tests/featuregen/intake/test_sp2_events.py
-git commit -m "feat(intake): register the twelve SP-2 feature_contract event-type schemas"
+        tests/featuregen/intake/__init__.py tests/featuregen/intake/conftest.py \
+        tests/featuregen/intake/test_sp2_events.py
+git commit -m "feat(intake): register the twelve SP-2 feature_contract event-type schemas + shared harness"
 ```
 
 ---
@@ -761,7 +829,7 @@ git commit -m "feat(intake): register the twelve SP-2 feature_contract event-typ
 
 **Interfaces:**
 - Consumes: `append(conn, *, aggregate, aggregate_id, type, payload, actor, provenance=None, request_id=None, feature_id=None, run_id=None, overlay_fact_id=None, feature_contract_id=None, caused_by=None, expected_version=None) -> EventEnvelope` (Task 1.1); `load_stream(conn, aggregate, aggregate_id, *, upto_seq=None, expected=None) -> list[EventEnvelope]` (`featuregen.events.store`); `register_sp2_event_types(registry)` (Task 1.2); `ConcurrencyError` (`featuregen.contracts`).
-- Produces: `append_feature_contract_event(conn, *, feature_contract_id: str, type: str, payload: Mapping, actor: IdentityEnvelope, run_id: str | None = None, request_id: str | None = None, provenance: ProvenanceEnvelope | None = None, expected_version: int | None = None, caused_by: str | None = None) -> EventEnvelope` (the SP-2 append seam — mirrors SP-1's `append_overlay_event`; `aggregate="feature_contract"`, `aggregate_id == feature_contract_id`, new streams open at `expected_version=0`); `load_feature_contract(conn, feature_contract_id: str) -> list[EventEnvelope]`. Consumed by P4–P8 handlers + `fold_feature_contract_state` (P8).
+- Produces: `append_feature_contract_event(conn, *, run_id: str, type: str, payload: Mapping, actor: IdentityEnvelope, request_id: str | None = None, provenance: ProvenanceEnvelope | None = None, expected_version: int | None = None, caused_by: str | None = None) -> EventEnvelope` (the SP-2 append seam — mirrors SP-1's `append_overlay_event`; **R1** sets `aggregate="feature_contract"` and `aggregate_id == feature_contract_id == run_id` (one contract per run), new streams open at `expected_version=0`); `load_feature_contract(conn, run_id: str) -> list[EventEnvelope]`. Consumed by P3(`call_llm`)/P4–P8 handlers + `fold_feature_contract_state` (P8).
 
 - [ ] **Step 1: Write the failing test**
 
@@ -776,8 +844,7 @@ from featuregen.identity.build import build_service_identity
 from featuregen.intake.events import CONTRACT_REFINED, INTENT_SUBMITTED
 from featuregen.intake.store import append_feature_contract_event, load_feature_contract
 
-_FC = "fc_store01"
-_RUN = "run_store01"
+_RUN = "run_store01"  # R1: feature_contract_id == run_id (one contract per run)
 
 
 def _intake_actor():
@@ -789,10 +856,8 @@ def _intake_actor():
 
 
 def _intent_payload():
+    # R2: emitters put NO id fields in the payload — only the SEMANTIC fields.
     return {
-        "feature_contract_id": _FC,
-        "run_id": _RUN,
-        "request_id": "req_store01",
         "intake_mode": "definition",
         "raw_input_ref": "blob_01H",
         "raw_input_classification": "clean",
@@ -802,7 +867,6 @@ def _intent_payload():
 def test_open_stream_appends_at_version_0_and_carries_correlation(conn):
     env = append_feature_contract_event(
         conn,
-        feature_contract_id=_FC,
         run_id=_RUN,
         request_id="req_store01",
         type=INTENT_SUBMITTED,
@@ -811,40 +875,42 @@ def test_open_stream_appends_at_version_0_and_carries_correlation(conn):
         expected_version=0,
     )
     assert env.aggregate == "feature_contract"
-    assert env.feature_contract_id == _FC
-    assert env.aggregate_id == _FC
+    # R1: the seam sets feature_contract_id == aggregate_id == run_id.
+    assert env.feature_contract_id == _RUN
+    assert env.aggregate_id == _RUN
     assert env.run_id == _RUN
+    assert env.request_id == "req_store01"
     assert env.stream_version == 1
 
 
 def test_load_feature_contract_returns_the_stream_in_order(conn):
     append_feature_contract_event(
-        conn, feature_contract_id=_FC, run_id=_RUN, request_id="req_store01",
+        conn, run_id=_RUN, request_id="req_store01",
         type=INTENT_SUBMITTED, payload=_intent_payload(), actor=_intake_actor(),
         expected_version=0,
     )
     append_feature_contract_event(
-        conn, feature_contract_id=_FC, run_id=_RUN,
+        conn, run_id=_RUN,
         type=CONTRACT_REFINED,
-        payload={"feature_contract_id": _FC, "run_id": _RUN, "draft_doc_id": "doc_v2"},
+        payload={"draft_doc_id": "doc_v2"},
         actor=_intake_actor(), expected_version=1,
     )
-    stream = load_feature_contract(conn, _FC)
+    stream = load_feature_contract(conn, _RUN)
     assert [e.type for e in stream] == [INTENT_SUBMITTED, CONTRACT_REFINED]
     assert [e.stream_version for e in stream] == [1, 2]
 
 
 def test_stale_expected_version_raises_concurrency(conn):
     append_feature_contract_event(
-        conn, feature_contract_id=_FC, run_id=_RUN, request_id="req_store01",
+        conn, run_id=_RUN, request_id="req_store01",
         type=INTENT_SUBMITTED, payload=_intent_payload(), actor=_intake_actor(),
         expected_version=0,
     )
     with pytest.raises(ConcurrencyError):
         append_feature_contract_event(
-            conn, feature_contract_id=_FC, run_id=_RUN,
+            conn, run_id=_RUN,
             type=CONTRACT_REFINED,
-            payload={"feature_contract_id": _FC, "run_id": _RUN, "draft_doc_id": "doc_v2"},
+            payload={"draft_doc_id": "doc_v2"},
             actor=_intake_actor(), expected_version=0,  # stale — stream is already at 1
         )
 
@@ -855,7 +921,7 @@ def test_unregistered_type_fails_closed(conn):
     reset_event_registry()  # wipe the autouse registrations for this one assertion
     with pytest.raises(SchemaValidationError):
         append_feature_contract_event(
-            conn, feature_contract_id=_FC, run_id=_RUN, request_id="req_store01",
+            conn, run_id=_RUN, request_id="req_store01",
             type=INTENT_SUBMITTED, payload=_intent_payload(), actor=_intake_actor(),
             expected_version=0,
         )
@@ -872,8 +938,8 @@ Expected: FAIL — `featuregen.intake.store` does not exist (ImportError).
 # src/featuregen/intake/store.py
 """The SP-2 append seam for the `feature_contract` aggregate (mirrors SP-1's overlay/store.py).
 Never INSERTs into `events` directly (Global Constraint) — it rides SP-0's OCC/provenance/global_seq
-helper. `aggregate_id == feature_contract_id`; the per-run contract carries run_id/request_id as
-correlation mirrors (consumed by the get_contract read model, §13). New streams open at
+helper. `aggregate_id == feature_contract_id == run_id` (R1 — one contract per run); request_id
+rides as a correlation mirror (consumed by the get_contract read model, §13). New streams open at
 expected_version=0; every FC event type MUST be registered (register_sp2_event_types) first."""
 
 from __future__ import annotations
@@ -889,24 +955,26 @@ from featuregen.events.store import load_stream
 def append_feature_contract_event(
     conn: DbConn,
     *,
-    feature_contract_id: str,
+    run_id: str,
     type: str,
     payload: Mapping[str, Any],
     actor: IdentityEnvelope,
-    run_id: str | None = None,
     request_id: str | None = None,
     provenance: ProvenanceEnvelope | None = None,
     expected_version: int | None = None,
     caused_by: str | None = None,
 ) -> EventEnvelope:
-    """Append one feature_contract event via the SP-0 OCC helper. Raises ConcurrencyError if the
-    stream is not exactly at `expected_version`, and SchemaValidationError if `type` is unregistered
-    or the payload fails its schema (fail-closed, before any INSERT)."""
+    """Append one feature_contract event via the SP-0 OCC helper (R1 — mirrors SP-1's
+    append_overlay_event). One contract per run, so the seam sets
+    `aggregate_id == feature_contract_id == run_id`; `run_id`/`request_id` also ride as correlation
+    mirrors (consumed by the get_contract read model, §13). Raises ConcurrencyError if the stream is
+    not exactly at `expected_version`, and SchemaValidationError if `type` is unregistered or the
+    payload fails its schema (fail-closed, before any INSERT)."""
     return append(
         conn,
         aggregate="feature_contract",
-        aggregate_id=feature_contract_id,
-        feature_contract_id=feature_contract_id,
+        aggregate_id=run_id,
+        feature_contract_id=run_id,
         type=type,
         payload=payload,
         actor=actor,
@@ -918,10 +986,10 @@ def append_feature_contract_event(
     )
 
 
-def load_feature_contract(conn: DbConn, feature_contract_id: str) -> list[EventEnvelope]:
+def load_feature_contract(conn: DbConn, run_id: str) -> list[EventEnvelope]:
     """Load the full feature_contract event stream (stream_version ASC) — the input to
-    fold_feature_contract_state (P8)."""
-    return load_stream(conn, "feature_contract", feature_contract_id)
+    fold_feature_contract_state (P8). `feature_contract_id == run_id` (R1)."""
+    return load_stream(conn, "feature_contract", run_id)
 ```
 
 - [ ] **Step 4: Run the test to verify it passes**
@@ -1398,7 +1466,7 @@ Expected: PASS — the three new migrations (`0508`/`0509`/`0510`) apply idempot
 Verify the symbols the later phases bind to exist and match the overview's Shared Contract:
 - `append(..., feature_contract_id=None)` + `EventEnvelope.feature_contract_id` + `partition_key_for` `feature_contract:` branch (Task 1.1) — used by every SP-2 handler.
 - `register_sp2_event_types(registry)` + the twelve constants + `USE_CASE_ONBOARDING_GATE` / `NEEDS_USE_CASE_ONBOARDING` (Task 1.2) — P4–P8, P9.
-- `append_feature_contract_event(...)` / `load_feature_contract(...)` (Task 1.3) — P4–P8 + `fold_feature_contract_state` (P8).
+- `append_feature_contract_event(...)` / `load_feature_contract(...)` (Task 1.3) — P3(`call_llm`)/P4–P8 + `fold_feature_contract_state` (P8).
 - `USE_CASE_ONBOARDING` gate + `NEEDS_USE_CASE_ONBOARDING` park hold-state (Task 1.4) — P4.
 - the `llm_call` store + `feature_contract` checkpoint (Task 1.5) — P3 (`record_llm_call`/`read_llm_call`), P8 (FC projection).
 - `seed_sp2_authz(conn)` + the `reject_intent` service authz row + `PRIMARY_SELECTED` wiring (Task 1.6) — P9 `register_sp2`, P6 candidate promotion, P8 `reject_intent`.

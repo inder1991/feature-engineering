@@ -17,16 +17,18 @@ deterministic machinery with an **auditable, challenger-only** LLM. It ships, in
 - `critique.py` — the Critique **`CONTRACT_REVIEW`** mode (SP-2 owns this one mode): a single **challenger,
   never a gate** LLM pass that can only *raise* doubts / *add* open questions and **feeds the Doubt Router**
   (each `blocks_progress:true` finding ORs its field to must-ask, spec §6.4).
-- `mcv.py` — **Minimum Contract Validation** (the 6-check deterministic pre-gate checklist → the
-  `MINIMUM_CONTRACT_VALIDATED` event, spec §6.7) + the SP-2 lifecycle-guard predicates
-  (`open_fields_empty`, `not_prohibited_intent`, `calculation_method_available`, `actor_is_request_owner`,
-  `confirmer_is_requester_human`).
+- `mcv.py` — **Minimum Contract Validation** — **R5** BOTH the pure `minimum_contract_validated(...)`
+  6-check checklist AND the DB-backed `run_minimum_contract_validation(conn, run_id, *, actor) ->
+  CommandResult` (folds status via the P2 fold → the `MINIMUM_CONTRACT_VALIDATED` event, spec §6.7) + the
+  SP-2 lifecycle-guard predicates (`open_fields_empty`, `not_prohibited_intent`,
+  `calculation_method_available`, `confirmer_is_requester_human(state, actor)`) built on the **R4**
+  `intake.state.actor_is_request_owner` predicate (imported from P2, never redefined in mcv).
 - `commands.py` (extended) — the **Human Clarification tasks** (`open_clarification_task`: SP-0
   `CLARIFICATION` gate, `delegation_allowed=False`, eligible = the request owner), the bounded **Contract
   Refinement Loop** (`refine_contract`: renormalize → rescore → re-critique → re-route → auto-resolve /
   open must-ask tasks → MCV; exhausted → auto-park), and the **`answer_clarification`** command with the
-  SP-2-built **request-owner guard** (`actor.subject == request owner` else **deny + security-audit**) —
-  the guard SP-0 does **not** provide (spec §6.5, §2.1).
+  SP-2-built **request-owner guard** (**R4** `actor_is_request_owner(state, actor)` else **deny +
+  security-audit**) — the guard SP-0 does **not** provide (spec §6.5, §2.1).
 
 **Cross-phase Consumes (built earlier; used verbatim here):**
 
@@ -40,21 +42,30 @@ deterministic machinery with an **auditable, challenger-only** LLM. It ships, in
   `documents/draft.py::UNKNOWN`; `contracts.{DbConn, IdentityEnvelope}`; `identity/build.py::{build_human_identity,
   build_service_identity}`.
 - **P1 (sp2-01):** `intake/events.py::register_sp2_event_types(registry)`;
-  **`intake/events.py::append_fc_event(conn, run_id, *, type, payload, actor, caused_by=None,
-  expected_version=None) -> EventEnvelope`** — appends on the **`feature_contract`** aggregate
-  (`aggregate_id == feature_contract_id == run_id`), threading the typed mirror-id (§2.1 #1, the SP-1
-  `append_overlay_event` recipe); **`intake/events.py::load_feature_contract(conn, run_id) ->
-  list[EventEnvelope]`** (mirrors `overlay/store.py::load_fact`). Event-type names (string constants, all
-  registered `schema_version=1`): `INTENT_SUBMITTED`, `DRAFT_CONTRACT_PRODUCED`, `CONTRACT_CRITIQUED`,
+  the **R1** single append/load seam **`intake/store.py::append_feature_contract_event(conn, *, run_id,
+  type, payload, actor, request_id=None, provenance=None, expected_version=None, caused_by=None) ->
+  EventEnvelope`** — appends on the **`feature_contract`** aggregate (sets `aggregate="feature_contract"`,
+  `aggregate_id == feature_contract_id == run_id`), threading the typed mirror-id (§2.1 #1, the SP-1
+  `append_overlay_event` recipe); **`intake/store.py::load_feature_contract(conn, run_id) ->
+  list[EventEnvelope]`** (mirrors `overlay/store.py::load_fact`). P5 IMPORTS both verbatim from
+  `intake.store` (the short alias `append_feature_contract_event as append_fc_event` is the only
+  permitted rename — never a local `append_fc_event`/`intake.events` redefinition, R1). Event-type
+  names (string constants, all registered `schema_version=1`): `INTENT_SUBMITTED`,
+  `DRAFT_CONTRACT_PRODUCED`, `CONTRACT_CRITIQUED`,
   `FIELD_AUTO_RESOLVED`, `CLARIFICATION_REQUESTED`, `CLARIFICATION_ANSWERED`, `CONTRACT_REFINED`,
   `MINIMUM_CONTRACT_VALIDATED`, `LLM_CALL_RECORDED`. Plus the `llm_call` store + the `0508`/`0509` migrations.
 - **P2 (sp2-02):** `intake/contract.py::register_contract_schemas(registry)` (the `DRAFT_CONTRACT`/
   `ASSUMPTION_LEDGER`/`CONFIRMED_CONTRACT` document content-schemas **and** the four structural LLM
   output-schemas `structure_intent`/`contract_review`/`generate_candidates`/`renormalize` — P2's
   output-schema-registration remit — resolved by `call_llm`); the closed enum vocabularies + `UNKNOWN`
-  reuse. The **recorded classification** carried on `INTENT_SUBMITTED.payload["classification"] =
-  {outcome, version, matched_class?, sensitive_fields?}` (from `banking_catalog.classify_intent`, outcomes
-  as the string values of `IntakeOutcome`).
+  reuse. **R3/R4** `intake/state.py::{fold_feature_contract_state(stream) -> FeatureContractState,
+  FeatureContractStatus, actor_is_request_owner(state, actor) -> bool}` (P2 Task 2.5 — the ONE
+  `feature_contract` fold + the ONE owner predicate; `state.requester` = the `INTENT_SUBMITTED` event
+  `actor.subject`) — P5 CONSUMES these (never a duplicate `state.py`), and P8 consumes the same
+  unchanged. **R9** the **recorded classification** carried on `INTENT_SUBMITTED.payload["classification"]
+  = classify_intent(...).as_mapping() = {outcome, catalog_version, matched_class?}` (field is
+  `.catalog_version`, NOT `.version`; from `banking_catalog.classify_intent`, outcomes as the string
+  values of `IntakeOutcome`).
 - **P3 (sp2-03):** `intake/llm.py::{LLMClient (Protocol: .call(request) -> LLMResult), LLMRequest(task,
   prompt_id, prompt_version, inputs, output_schema_id, output_schema_version, generation_settings),
   LLMResult(output, self_reported_scores, call_ref, status), FakeLLM, call_llm(conn, client, request, *,
@@ -67,15 +78,20 @@ deterministic machinery with an **auditable, challenger-only** LLM. It ships, in
   `("answer_clarification", answer_clarification)`); and the Draft/Ledger **body-persistence seam**
   **`freeze_draft(conn, *, run_id, request_id, body, ledger_body, actor, supersedes=()) -> tuple[str, str]`**
   (returns `(draft_doc_id, ledger_doc_id)`; freezes the `DRAFT_CONTRACT` + `ASSUMPTION_LEDGER` documents on
-  the DAG) and **`read_contract_body(conn, doc_id) -> dict`**. `DRAFT_CONTRACT_PRODUCED.payload =
-  {draft_doc_id, ledger_doc_id, open_fields}`; `INTENT_SUBMITTED.payload = {request_id, run_id, intake_mode,
-  raw_input_ref, raw_input_classification, requested_by, classification}`.
+  the DAG) and **`read_contract_body(conn, doc_id) -> dict`**. **R12** `DRAFT_CONTRACT_PRODUCED.payload =
+  {draft_doc_id, assumption_ledger_ref, open_fields}` (NEVER `ledger_doc_id`); `INTENT_SUBMITTED.payload =
+  {request_id, run_id, intake_mode, raw_input_ref, raw_input_classification, classification}` (issued by
+  the human requester, so the event `actor.subject` IS the request owner the fold reads, R4 — P4 may also
+  mirror `requester` into the payload, but no owner lookup reads it).
 
-> **The `feature_contract` fold is P8.** P5 gates on the folded lifecycle indirectly: its guards are **pure
-> predicates over bodies/actors** (`mcv.py`) and its loop reads the `feature_contract` stream through the
-> P1 `load_feature_contract` reader — it never imports P8's `fold_feature_contract_state`. P8 later
-> consolidates the small P5 stream-readers (`_first`, `_answered_fields`, `_current_draft_doc_id`) into
-> `fold_feature_contract_state` and wires the MCV/owner predicates as the inline no-regression guards.
+> **The `feature_contract` fold is P2 (R3), consumed here.** `fold_feature_contract_state` /
+> `FeatureContractState` / `actor_is_request_owner(state, actor)` are owned by **P2 `intake/state.py`**
+> (Task 2.5) — **not** P8, which merely consumes the same fold unchanged (R3). P5 CONSUMES the P2 fold:
+> `run_minimum_contract_validation` folds the status before appending `MINIMUM_CONTRACT_VALIDATED`, and
+> `answer_clarification` resolves the request owner via `actor_is_request_owner(state, actor)` (R4 —
+> `state.requester` = the `INTENT_SUBMITTED` event `actor.subject`; **never** a `payload.get("requested_by")`
+> lookup). The small P5 stream-readers (`_first`, `_answered_fields`, `_current_draft_doc_id`) are local
+> loop helpers over the same stream — not a second fold and never a duplicate `state.py`.
 
 ---
 
@@ -487,44 +503,37 @@ def route_draft(
 
 **Files:**
 - Create: `src/featuregen/intake/critique.py`
-- Create: `tests/featuregen/intake/conftest.py`
+- Modify: `tests/featuregen/intake/conftest.py` (**R18** — CREATED by P1; P5 MERGES its fixtures in, never re-creates it)
 - Test: `tests/featuregen/intake/test_critique.py`
 
 **Interfaces:**
-- Consumes: `intake.llm.{LLMRequest, call_llm}` (P3); `intake.events.append_fc_event` (P1); `contracts.{DbConn, IdentityEnvelope}`.
+- Consumes: `intake.llm.{LLMRequest, call_llm}` (P3); `intake.store.append_feature_contract_event` (**R1**, P1); `contracts.{DbConn, IdentityEnvelope}`.
 - Produces:
   - `CritiqueFinding(severity, category, evidence, recommendation, blocks_progress, field=None)` — frozen; the structured `CONTRACT_REVIEW` finding shape (spec §6.4).
   - `CritiqueResult(review_type, status, findings: tuple[CritiqueFinding, ...], call_ref)`.
   - `contract_review(conn, client, draft_semantics, *, run_id, actor, catalog_metadata=None, prompt_id="contract_review", prompt_version=1) -> CritiqueResult` — one **challenger-only** LLM pass over the PII-free structured Draft semantics via `call_llm` (event-sourced), then emits a `CONTRACT_CRITIQUED` domain shadow on the `feature_contract` aggregate. It only *raises* doubts — it never confirms, lowers a doubt, or rewrites the contract.
   - `apply_critique(routing: dict[str, str], critique: CritiqueResult) -> dict[str, str]` — each `blocks_progress:true` finding **ORs** its field to `"human"` (spec §6.4); a finding without a `field` never lowers anything.
 
-- [ ] **Step 1 — create the shared intake test conftest**
+- [ ] **Step 1 — MODIFY the shared intake test conftest (created by P1, R18)**
+
+The ONE `tests/featuregen/intake/conftest.py` is **created by P1** and already provides the `db` alias
+fixture, the **autouse SP-2 event-type registration**, and the four collaborator-seam fixtures
+(`llm_client`, `intent_redactor`, `candidate_generator`, `intake_catalog`). P5 does **not** re-create it
+(R18) — it **merges in** the Layer-2 additions below: the `register_sp2_commands()` line inside the
+autouse fixture (so the command catalog is present once P4/P5 register commands), the `sp2_schemas`
+content-schema fixture, and the `owner`/`agent` identity fixtures.
 
 ```python
-# tests/featuregen/intake/conftest.py
-import pytest
-
+# tests/featuregen/intake/conftest.py  — P5 MERGES these into the P1-created conftest (do NOT re-create it)
 from featuregen.documents.registry import DocumentSchemaRegistry
-from featuregen.events.registry import event_registry
 from featuregen.identity.build import build_human_identity, build_service_identity
 from featuregen.intake.commands import register_sp2_commands
 from featuregen.intake.contract import register_contract_schemas
-from featuregen.intake.events import register_sp2_event_types
 
 
-@pytest.fixture
-def db(conn):
-    """Alias the repo-root `conn` fixture (real PG, rolled back on teardown) under the name the SP-2
-    briefs use; migrations (incl. 0508/0509 + the llm_call store) are applied once per session."""
-    return conn
-
-
-@pytest.fixture(autouse=True)
-def _register_sp2_runtime():
-    # The event registry IS reset per test by the root harness — re-register the SP-2 FC event
-    # schemas (so append_fc_event validates) and the command catalog (idempotent) every test.
-    register_sp2_event_types(event_registry())
-    register_sp2_commands()
+# P1's autouse `_register_sp2_runtime` already re-registers the SP-2 FC event schemas each test (the
+# root harness resets the event registry). P5 ADDS the command-catalog registration (idempotent) to it:
+#     register_sp2_commands()   # ← append inside P1's autouse _register_sp2_runtime fixture
 
 
 @pytest.fixture
@@ -555,7 +564,7 @@ from psycopg.rows import dict_row
 
 from featuregen.contracts import LLMResult  # re-exported by intake.llm; see note below
 from featuregen.intake.critique import CritiqueResult, apply_critique, contract_review
-from featuregen.intake.events import append_fc_event, load_feature_contract
+from featuregen.intake.store import append_feature_contract_event as append_fc_event, load_feature_contract
 
 
 class ScriptedLLM:
@@ -575,10 +584,10 @@ class ScriptedLLM:
 
 def _seed_contract(db, agent, run_id="run_crit"):
     append_fc_event(
-        db, run_id, type="INTENT_SUBMITTED",
+        db, run_id=run_id, type="INTENT_SUBMITTED",
         payload={"request_id": "req_crit", "run_id": run_id, "intake_mode": "definition",
                  "raw_input_ref": "blob_x", "raw_input_classification": "clean",
-                 "requested_by": "user:raj", "classification": {"outcome": "CLEAR", "version": "bdc-1"}},
+                 "classification": {"outcome": "CLEAR", "catalog_version": "bdc-1"}},
         actor=agent, expected_version=0,
     )
     return run_id
@@ -648,7 +657,7 @@ from dataclasses import asdict, dataclass
 from typing import Any
 
 from featuregen.contracts import DbConn, IdentityEnvelope
-from featuregen.intake.events import append_fc_event
+from featuregen.intake.store import append_feature_contract_event as append_fc_event
 from featuregen.intake.llm import LLMRequest, call_llm
 
 # Pinned generation settings for the challenger pass (part of the llm_call idempotency key, §9.3).
@@ -717,7 +726,7 @@ def contract_review(
         call_ref=result.call_ref,
     )
     append_fc_event(
-        conn, run_id, type="CONTRACT_CRITIQUED",
+        conn, run_id=run_id, type="CONTRACT_CRITIQUED",
         payload={
             "review_type": crit.review_type,
             "status": crit.status,
@@ -755,27 +764,31 @@ def apply_critique(routing: dict[str, str], critique: CritiqueResult) -> dict[st
 - Test: `tests/featuregen/intake/test_mcv.py`
 
 **Interfaces:**
-- Consumes: `documents.draft.UNKNOWN`; `contracts.IdentityEnvelope`. Pure — no DB.
+- Consumes: `documents.draft.UNKNOWN`; `contracts.{IdentityEnvelope, CommandResult, DbConn}`; **R4** the ONE owner predicate `intake.state.actor_is_request_owner` + **R3** `intake.state.{fold_feature_contract_state, FeatureContractStatus}` (P2); **R1** `intake.store.{append_feature_contract_event, load_feature_contract}` (P1) and P4's same-package `commands.read_contract_body` (lazily, for the DB-backed wrapper only). The pure checklist + guard predicates are DB-free; `run_minimum_contract_validation` is the one DB-backed symbol.
 - Produces:
   - `MCVResult(passed: bool, failures: tuple[str, ...])`.
-  - `minimum_contract_validated(draft_body, ledger_body, classification, *, mode, candidate_count, confirmed_fields=()) -> MCVResult` — the 6-check deterministic pre-gate checklist (spec §6.7). Fail-closed on an absent/unversioned classification (check 5).
-  - Lifecycle-guard predicates (evaluated inline by later handlers, spec §11): `open_fields_empty(draft_body)`, `not_prohibited_intent(classification)`, `calculation_method_available(draft_body, *, mode, candidate_count)`, `actor_is_request_owner(actor, *, request_owner)`, `confirmer_is_requester_human(actor, *, request_owner) = actor_is_request_owner ∧ actor_kind=="human"`.
+  - **R5** — the two MCV symbols. Pure: `minimum_contract_validated(draft_body, ledger_body, classification, *, mode="definition", candidate_count=0, confirmed_fields=()) -> MCVResult` — the 6-check deterministic pre-gate checklist (spec §6.7), fail-closed on an absent/unversioned classification (check 5); the canonical `minimum_contract_validated(draft_body, ledger, classification)` 3-arg call is valid (the extras are optional keyword-only). DB-backed: `run_minimum_contract_validation(conn, run_id, *, actor) -> CommandResult` — folds the `feature_contract` status (**R3** `fold_feature_contract_state`), loads the current draft/ledger/classification, calls the pure checklist, appends `MINIMUM_CONTRACT_VALIDATED` on a pass; **P7 Task 7.6 reads `.accepted`.**
+  - Lifecycle-guard predicates (evaluated inline by later handlers, spec §11): `open_fields_empty(draft_body)`, `not_prohibited_intent(classification)`, `calculation_method_available(draft_body, *, mode, candidate_count)`, `confirmer_is_requester_human(state, actor) = actor_is_request_owner(state, actor) ∧ actor_kind=="human"` (built on the **R4** `intake.state` predicate — mcv.py does NOT redefine `actor_is_request_owner`, it imports it from `intake.state`).
 
 - [ ] **Step 1 — write the failing test**
 
 ```python
 # tests/featuregen/intake/test_mcv.py
+from types import SimpleNamespace
+
 from featuregen.identity.build import build_human_identity, build_service_identity
 from featuregen.intake.mcv import (
-    actor_is_request_owner,
     calculation_method_available,
     confirmer_is_requester_human,
     minimum_contract_validated,
     not_prohibited_intent,
     open_fields_empty,
+    run_minimum_contract_validation,
 )
+# actor_is_request_owner is owned by P2 (intake.state), consumed here (R4) — never redefined in mcv.
+from featuregen.intake.state import actor_is_request_owner
 
-_CLEAR = {"outcome": "CLEAR", "version": "bdc-1"}
+_CLEAR = {"outcome": "CLEAR", "catalog_version": "bdc-1"}
 
 
 def _draft(**over):
@@ -831,7 +844,7 @@ def test_unresolved_grain_fails():
 
 def test_prohibited_class_blocks_mcv():
     res = minimum_contract_validated(
-        _draft(), _ledger(), {"outcome": "PROHIBITED_DATA_CLASS", "version": "bdc-1", "matched_class": "race"},
+        _draft(), _ledger(), {"outcome": "PROHIBITED_DATA_CLASS", "catalog_version": "bdc-1", "matched_class": "race"},
         mode="definition", candidate_count=0, confirmed_fields={"filters"},
     )
     assert res.passed is False
@@ -877,13 +890,53 @@ def test_owner_and_confirmer_guards():
     owner = build_human_identity(subject="user:raj", role_claims=("data_scientist",))
     other = build_human_identity(subject="user:mallory", role_claims=("data_scientist",))
     svc = build_service_identity(subject="service:intake-agent", role_claims=("intake-agent",), attestation="s")
-    assert actor_is_request_owner(owner, request_owner="user:raj") is True
-    assert actor_is_request_owner(other, request_owner="user:raj") is False
-    assert confirmer_is_requester_human(owner, request_owner="user:raj") is True
-    assert confirmer_is_requester_human(svc, request_owner="service:intake-agent") is False  # not human
+    # The ONE owner predicate is state-based (R4): actor_is_request_owner(state, actor); `state.requester`
+    # is set by the P2 fold to the INTENT_SUBMITTED actor.subject. A folded state exposes `.requester`.
+    raj_state = SimpleNamespace(requester="user:raj")
+    svc_state = SimpleNamespace(requester="service:intake-agent")
+    assert actor_is_request_owner(raj_state, owner) is True
+    assert actor_is_request_owner(raj_state, other) is False
+    assert confirmer_is_requester_human(raj_state, owner) is True
+    assert confirmer_is_requester_human(raj_state, other) is False  # a different data scientist can't confirm
+    assert confirmer_is_requester_human(svc_state, svc) is False    # a service can never confirm
     assert not_prohibited_intent(_CLEAR) is True
-    assert not_prohibited_intent({"outcome": "OUT_OF_SCOPE", "version": "bdc-1"}) is False
+    assert not_prohibited_intent({"outcome": "OUT_OF_SCOPE", "catalog_version": "bdc-1"}) is False
     assert open_fields_empty(_draft()) is True
+
+
+def test_run_minimum_contract_validation_folds_and_appends_the_event(db, sp2_schemas, agent):
+    """R5 DB-backed MCV: fold the feature_contract status (P2 R3), load the current draft/ledger/
+    classification, run the pure checklist, append MINIMUM_CONTRACT_VALIDATED on a pass; return a
+    CommandResult whose `.accepted` is the boundary P7's open_gate1_task reads."""
+    from featuregen.intake.commands import freeze_draft
+    from featuregen.intake.store import append_feature_contract_event, load_feature_contract
+
+    owner = build_human_identity(subject="user:raj", role_claims=("data_scientist",))
+    run_id = "run_mcv"
+    # INTENT_SUBMITTED is appended by the HUMAN requester → the fold's state.requester == user:raj (R4).
+    append_feature_contract_event(
+        db, run_id=run_id, type="INTENT_SUBMITTED",
+        payload={"request_id": "req_mcv", "run_id": run_id, "intake_mode": "definition",
+                 "raw_input_ref": "blob_x", "raw_input_classification": "clean", "classification": _CLEAR},
+        actor=owner, expected_version=0,
+    )
+    body = _draft()
+    body.update({"request_id": "req_mcv", "intake_mode": "definition", "raw_input_ref": "blob_x",
+                 "raw_input_classification": "clean", "proposed_feature_name": "f",
+                 "assumption_ledger_ref": "", "provenance": {"schema_version": 1},
+                 "status": "NEEDS_CLARIFICATION"})
+    draft_doc_id, ledger_doc_id = freeze_draft(
+        db, run_id=run_id, request_id="req_mcv", body=body,
+        ledger_body=_ledger(("entity_grain", "filters")), actor=agent,
+    )
+    append_feature_contract_event(
+        db, run_id=run_id, type="DRAFT_CONTRACT_PRODUCED",
+        payload={"draft_doc_id": draft_doc_id, "assumption_ledger_ref": ledger_doc_id, "open_fields": []},
+        actor=agent,
+    )
+    res = run_minimum_contract_validation(db, run_id, actor=agent)
+    assert res.accepted is True, res.denied_reason
+    assert "MINIMUM_CONTRACT_VALIDATED" in [e.type for e in load_feature_contract(db, run_id)]
 ```
 
 - [ ] **Step 2 — run it (fails)**
@@ -900,8 +953,15 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from featuregen.contracts import IdentityEnvelope
+from featuregen.contracts import CommandResult, DbConn, IdentityEnvelope
 from featuregen.documents.draft import UNKNOWN
+# R4: the ONE owner predicate is owned by P2 (intake.state) — mcv IMPORTS it, never redefines it.
+# R3: the DB-backed wrapper folds the feature_contract status through the P2 fold.
+from featuregen.intake.state import (
+    FeatureContractStatus,
+    actor_is_request_owner,
+    fold_feature_contract_state,
+)
 
 # Classification outcomes that terminally block a contract (string values of banking_catalog.IntakeOutcome).
 _BLOCKING_OUTCOMES = ("OUT_OF_SCOPE", "PROHIBITED_DATA_CLASS")
@@ -950,16 +1010,12 @@ def calculation_method_available(
     return bool(method) and method != UNKNOWN
 
 
-def actor_is_request_owner(actor: IdentityEnvelope, *, request_owner: str) -> bool:
-    """Guard `actor_is_request_owner` (§2.1, §11): the acting subject IS the contract requester. SP-0
-    role-authz admits ANY data_scientist, so SP-2 must pin the subject itself."""
-    return actor.subject == request_owner
-
-
-def confirmer_is_requester_human(actor: IdentityEnvelope, *, request_owner: str) -> bool:
-    """Guard `confirmer_is_requester_human` = actor_is_request_owner ∧ actor_kind=="human" (§8.2). A
-    service or the LLM can never confirm; a different data scientist can never confirm."""
-    return actor.actor_kind == "human" and actor_is_request_owner(actor, request_owner=request_owner)
+def confirmer_is_requester_human(state, actor: IdentityEnvelope) -> bool:
+    """Guard `confirmer_is_requester_human` = actor_is_request_owner ∧ actor_kind=="human" (§8.2),
+    built on the ONE state-based owner predicate P2 owns (R4 — `actor_is_request_owner(state, actor)`,
+    where `state.requester` is the INTENT_SUBMITTED actor.subject). A service or the LLM can never
+    confirm; a different data scientist can never confirm."""
+    return actor.actor_kind == "human" and actor_is_request_owner(state, actor)
 
 
 def minimum_contract_validated(
@@ -967,11 +1023,14 @@ def minimum_contract_validated(
     ledger_body: Mapping[str, Any],
     classification: Mapping[str, Any] | None,
     *,
-    mode: str,
-    candidate_count: int,
+    mode: str = "definition",
+    candidate_count: int = 0,
     confirmed_fields: Iterable[str] = (),
 ) -> MCVResult:
-    """The deterministic 6-check pre-gate checklist (spec §6.7). Pure and machine-checkable —
+    """The deterministic 6-check pre-gate checklist (spec §6.7). **R5** pure form — the canonical
+    `minimum_contract_validated(draft_body, ledger, classification)` 3-arg call is valid (the extras are
+    optional keyword-only; the DB-backed `run_minimum_contract_validation` supplies them). Pure and
+    machine-checkable —
     evaluated INLINE by `open_gate1_task` (P7) against the folded status, NOT the state-machine
     engine. A failure keeps the run in the Refinement Loop; success emits MINIMUM_CONTRACT_VALIDATED.
 
@@ -1005,7 +1064,7 @@ def minimum_contract_validated(
         failures.append("observation_intent_missing")
 
     # 5) In banking scope — fail-closed on absent/unversioned classification (§4.5(b)); else not blocked.
-    if classification is None or classification.get("version") in (None, ""):
+    if classification is None or classification.get("catalog_version") in (None, ""):
         failures.append("classification_unavailable")
     elif classification.get("outcome") in _BLOCKING_OUTCOMES:
         failures.append(f"blocked:{classification.get('outcome')}")
@@ -1017,11 +1076,56 @@ def minimum_contract_validated(
             failures.append(f"unaccounted:{field}")
 
     return MCVResult(passed=not failures, failures=tuple(failures))
+
+
+def run_minimum_contract_validation(conn: DbConn, run_id: str, *, actor) -> CommandResult:
+    """**R5** DB-backed MCV — the boundary guard P7's `open_gate1_task` reads via `.accepted`. Folds the
+    `feature_contract` status (**R3** `fold_feature_contract_state`), loads the current draft/ledger/
+    classification, runs the pure 6-check checklist, and appends `MINIMUM_CONTRACT_VALIDATED` on a pass.
+    Reads the recorded classification mapping (**R9** `.catalog_version`) off the folded state. All
+    appends go through the **R1** `intake.store` seam."""
+    # Lazy import of the P4 body-read seam (same package) to avoid a commands↔mcv import cycle.
+    from featuregen.intake.commands import _candidate_count, read_contract_body
+    from featuregen.intake.store import append_feature_contract_event, load_feature_contract
+
+    stream = load_feature_contract(conn, run_id)
+    state = fold_feature_contract_state(stream)
+    # No-regression guard (mirrors overlay/confirmation_commands.py): a fold already at/past MCV or
+    # CONFIRMED does not re-append — idempotent accept.
+    if state.status in (FeatureContractStatus.MINIMUM_CONTRACT_VALIDATED, FeatureContractStatus.CONFIRMED):
+        return CommandResult(accepted=True, aggregate_id=run_id)
+
+    draft_body = read_contract_body(conn, state.draft_doc_id)
+    ledger_ref = state.assumption_ledger_ref or draft_body.get("assumption_ledger_ref")
+    ledger_body = (
+        read_contract_body(conn, ledger_ref) if ledger_ref
+        else {"request_id": state.request_id, "assumptions": []}
+    )
+    # Human-answered fields are accountable (§5.3) — the fields the requester confirmed via clarification.
+    confirmed_fields = {
+        e.payload.get("field") for e in stream if e.type == "CLARIFICATION_ANSWERED"
+    }
+    candidate_count = _candidate_count(conn, run_id) if state.intake_mode == "hypothesis" else 0
+
+    res = minimum_contract_validated(
+        draft_body, ledger_body, state.classification, mode=state.intake_mode,
+        candidate_count=candidate_count, confirmed_fields=confirmed_fields,
+    )
+    if not res.passed:
+        return CommandResult(
+            accepted=False, aggregate_id=run_id,
+            denied_reason="mcv_failed: " + ",".join(res.failures),
+        )
+    append_feature_contract_event(
+        conn, run_id=run_id, type="MINIMUM_CONTRACT_VALIDATED",
+        payload={"draft_doc_id": state.draft_doc_id}, actor=actor,
+    )
+    return CommandResult(accepted=True, aggregate_id=run_id)
 ```
 
 - [ ] **Step 4 — run it (passes)**
   - `uv run pytest tests/featuregen/intake/test_mcv.py -v`
-  - Expected: PASS (9 tests).
+  - Expected: PASS (10 tests).
 
 - [ ] **Step 5 — commit**
   - `git add src/featuregen/intake/mcv.py tests/featuregen/intake/test_mcv.py && git commit -m "feat(intake): Minimum Contract Validation (6-check pre-gate checklist) + SP-2 lifecycle-guard predicates"`
@@ -1035,7 +1139,7 @@ def minimum_contract_validated(
 - Test: `tests/featuregen/intake/test_refine_contract.py`
 
 **Interfaces:**
-- Consumes: SP-0 `gates/tasks.py::open_task`; `contracts.gates.GateTaskSpec` (`delegation_allowed=False`); `aggregates/run_lifecycle.py::park_command`; `contracts.Command`; P1 `append_fc_event`/`load_feature_contract`; P3 `intake.llm.{LLMRequest, call_llm}` + `intake.redaction.IntentRedactor`; P4 same-module `freeze_draft`/`read_contract_body`; `scoring.score_fields`; `doubt_router.{route_draft, default_thresholds}`; `critique.{contract_review, apply_critique}`; `mcv.minimum_contract_validated`.
+- Consumes: SP-0 `gates/tasks.py::open_task`; `contracts.gates.GateTaskSpec` (`delegation_allowed=False`); `aggregates/run_lifecycle.py::park_command`; `contracts.Command`; **R1** `intake.store.{append_feature_contract_event, load_feature_contract}` (P1); **R3** `intake.state.fold_feature_contract_state` (P2 — refine derives the owner from `state.requester`); P3 `intake.llm.{LLMRequest, call_llm}` + `intake.redaction.IntentRedactor`; P4 same-module `freeze_draft`/`read_contract_body`; `scoring.score_fields`; `doubt_router.{route_draft, default_thresholds}`; `critique.{contract_review, apply_critique}`; `mcv.minimum_contract_validated`.
 - Produces:
   - `open_clarification_task(conn, *, run_id, request_id, draft_doc_id, field, question, owner_subject, actor, candidate_readings=()) -> str` — opens an SP-0 `CLARIFICATION` gate task (`allowed_responses=[confirm,edit,reject]`, `required_inputs=[draft_doc_id]` so a re-normalized draft stales it, `eligible_assignees={role:data_scientist, subject:owner}`, **`delegation_allowed=False`**), then emits `CLARIFICATION_REQUESTED{task_id, field, question, routed_to:"human", draft_doc_id}` on the feature_contract aggregate.
   - `refine_contract(conn, run_id, *, client=None, redactor=None, catalog=None, actor, thresholds=None, max_rounds=MAX_REFINEMENT_ROUNDS) -> RefineResult` — one bounded refinement round (spec §6.6): renormalize (if there are unfolded answers) → rescore → re-critique → re-route → auto-resolve safe fields (ledger + `FIELD_AUTO_RESOLVED`) → freeze the revised Draft (`CONTRACT_REFINED`) → open must-ask tasks; when no open field remains → run MCV → `MINIMUM_CONTRACT_VALIDATED`; when the round budget is exhausted → **auto-park** (SP-0 `park`). Defaults resolve deps from the P5 accessors.
@@ -1047,9 +1151,14 @@ def minimum_contract_validated(
 # tests/featuregen/intake/test_refine_contract.py
 from psycopg.rows import dict_row
 
+from featuregen.identity.build import build_human_identity
 from featuregen.intake.commands import RefineResult, open_clarification_task, refine_contract
-from featuregen.intake.events import append_fc_event, load_feature_contract
+from featuregen.intake.store import append_feature_contract_event as append_fc_event, load_feature_contract
 from featuregen.intake.redaction import DefaultIntentRedactor
+
+# R4: the request owner is the INTENT_SUBMITTED event actor.subject (state.requester) — never a payload
+# key. INTENT_SUBMITTED is issued by the HUMAN requester, so the P2 fold reads the owner from the event.
+OWNER = build_human_identity(subject="user:raj", role_claims=("data_scientist",))
 
 
 class ScriptedLLM:
@@ -1088,12 +1197,14 @@ def _semantics(filter_predicate="UNKNOWN"):
 
 
 def _seed_draft(db, agent, *, run_id="run_ref", open_fields=("filters.declined_status_encoding",)):
+    # R4: INTENT_SUBMITTED is appended by the HUMAN requester (OWNER) → the P2 fold sets state.requester
+    # == "user:raj", the owner the Refinement Loop scopes clarification tasks to (never a payload key).
     append_fc_event(
-        db, run_id, type="INTENT_SUBMITTED",
+        db, run_id=run_id, type="INTENT_SUBMITTED",
         payload={"request_id": "req_ref", "run_id": run_id, "intake_mode": "definition",
                  "raw_input_ref": "blob_x", "raw_input_classification": "clean",
-                 "requested_by": "user:raj", "classification": {"outcome": "CLEAR", "version": "bdc-1"}},
-        actor=agent, expected_version=0,
+                 "classification": {"outcome": "CLEAR", "catalog_version": "bdc-1"}},
+        actor=OWNER, expected_version=0,
     )
     ledger = {"request_id": "req_ref", "assumptions": [
         {"field": "entity_grain", "value": ["customer_id", "as_of_date"], "rationale": "pit convention",
@@ -1114,8 +1225,8 @@ def _seed_draft(db, agent, *, run_id="run_ref", open_fields=("filters.declined_s
     draft_doc_id, ledger_doc_id = freeze_draft(
         db, run_id=run_id, request_id="req_ref", body=body, ledger_body=ledger, actor=agent
     )
-    append_fc_event(db, run_id, type="DRAFT_CONTRACT_PRODUCED",
-                    payload={"draft_doc_id": draft_doc_id, "ledger_doc_id": ledger_doc_id,
+    append_fc_event(db, run_id=run_id, type="DRAFT_CONTRACT_PRODUCED",
+                    payload={"draft_doc_id": draft_doc_id, "assumption_ledger_ref": ledger_doc_id,
                              "open_fields": list(open_fields)}, actor=agent)
     return run_id, draft_doc_id
 
@@ -1161,7 +1272,7 @@ def test_initial_refine_opens_a_must_ask_task_for_the_open_field(db, sp2_schemas
 def test_answered_field_renormalizes_to_mcv_validated(db, sp2_schemas, agent):
     run_id, _ = _seed_draft(db, agent)
     # a prior human answer is pinned on the stream (as answer_clarification would emit, Task 5.6)
-    append_fc_event(db, run_id, type="CLARIFICATION_ANSWERED",
+    append_fc_event(db, run_id=run_id, type="CLARIFICATION_ANSWERED",
                     payload={"task_id": "task_x", "field": "filters",
                              "answer": "card_authorizations.auth_result = 'D'", "response": "confirm",
                              "answered_by": "user:raj"}, actor=agent)
@@ -1192,7 +1303,7 @@ def test_refinement_loop_is_bounded_and_auto_parks(db, sp2_schemas, agent, monke
     run_id, _ = _seed_draft(db, agent)
     # An answer that does NOT resolve the open field (renormalize keeps it UNKNOWN) → the loop cannot
     # converge; with the round budget = 1 the SECOND refine auto-parks instead of looping forever.
-    append_fc_event(db, run_id, type="CLARIFICATION_ANSWERED",
+    append_fc_event(db, run_id=run_id, type="CLARIFICATION_ANSWERED",
                     payload={"task_id": "t1", "field": "filters", "answer": "still unclear",
                              "response": "confirm", "answered_by": "user:raj"}, actor=agent)
     client = ScriptedLLM({
@@ -1233,10 +1344,13 @@ from featuregen.documents.draft import UNKNOWN
 from featuregen.gates.tasks import open_task
 from featuregen.intake.critique import apply_critique, contract_review
 from featuregen.intake.doubt_router import default_thresholds, route_draft
-from featuregen.intake.events import append_fc_event, load_feature_contract
+from featuregen.intake.store import append_feature_contract_event as append_fc_event, load_feature_contract
 from featuregen.intake.llm import LLMRequest, call_llm
 from featuregen.intake.mcv import minimum_contract_validated
 from featuregen.intake.scoring import score_fields
+# R3/R4: the ONE feature_contract fold + owner predicate are owned by P2 (intake.state); consumed here
+# (refine derives the request owner from state.requester; answer_clarification calls actor_is_request_owner).
+from featuregen.intake.state import actor_is_request_owner, fold_feature_contract_state
 from featuregen.security.audit import record_denial
 
 # Round budget for the Contract Refinement Loop (Decision 6, spec §6.6) — bounded by SP-0's durable
@@ -1333,7 +1447,7 @@ def open_clarification_task(
     )
     task_id = open_task(conn, spec, actor)
     append_fc_event(
-        conn, run_id, type="CLARIFICATION_REQUESTED",
+        conn, run_id=run_id, type="CLARIFICATION_REQUESTED",
         payload={"task_id": task_id, "field": field, "question": question, "routed_to": "human",
                  "draft_doc_id": draft_doc_id, "candidate_readings": list(candidate_readings)},
         actor=actor,
@@ -1436,10 +1550,11 @@ def refine_contract(
     budget = MAX_REFINEMENT_ROUNDS if max_rounds is None else max_rounds
 
     stream = load_feature_contract(conn, run_id)
+    state = fold_feature_contract_state(stream)   # R3 — the P2 fold; `state.requester` is the owner (R4)
     intent = _first(stream, "INTENT_SUBMITTED")
     request_id = intent.payload["request_id"]
     mode = intent.payload["intake_mode"]
-    classification = intent.payload.get("classification")
+    classification = intent.payload.get("classification")   # the recorded R9 mapping (`.catalog_version`)
     raw_class = intent.payload["raw_input_classification"]
     draft_doc_id = _current_draft_doc_id(stream)
     draft_body = read_contract_body(conn, draft_doc_id)
@@ -1491,7 +1606,7 @@ def refine_contract(
         if decision == "auto" and field not in ledger_fields and field not in answers:
             entry = _ledger_entry(field, semantics, field_scores[field])
             additions.append(entry)
-            append_fc_event(conn, run_id, type="FIELD_AUTO_RESOLVED",
+            append_fc_event(conn, run_id=run_id, type="FIELD_AUTO_RESOLVED",
                             payload={"field": field, "value": entry["value"], "source": entry["source"],
                                      "ambiguity": entry["ambiguity"], "confidence": entry["confidence"]},
                             actor=actor)
@@ -1512,8 +1627,8 @@ def refine_contract(
             actor=actor, supersedes=(draft_doc_id,),
         )
         new_draft["assumption_ledger_ref"] = ledger_doc_id
-        append_fc_event(conn, run_id, type="CONTRACT_REFINED",
-                        payload={"draft_doc_id": draft_doc_id, "ledger_doc_id": ledger_doc_id,
+        append_fc_event(conn, run_id=run_id, type="CONTRACT_REFINED",
+                        payload={"draft_doc_id": draft_doc_id, "assumption_ledger_ref": ledger_doc_id,
                                  "open_fields": open_fields, "round": rounds}, actor=actor)
 
     must_ask = [f for f, d in routing.items() if d == "human"
@@ -1525,7 +1640,7 @@ def refine_contract(
         mcv = minimum_contract_validated(new_draft, new_ledger, classification, mode=mode,
                                          candidate_count=candidate_count, confirmed_fields=set(answers))
         if mcv.passed:
-            append_fc_event(conn, run_id, type="MINIMUM_CONTRACT_VALIDATED",
+            append_fc_event(conn, run_id=run_id, type="MINIMUM_CONTRACT_VALIDATED",
                             payload={"draft_doc_id": draft_doc_id}, actor=actor)
             return RefineResult("validated", draft_doc_id, (), mcv)
         return RefineResult("mcv_failed", draft_doc_id, (), mcv)
@@ -1539,7 +1654,7 @@ def refine_contract(
         ))
         return RefineResult("parked", draft_doc_id, tuple(open_fields), None)
 
-    owner = intent.payload["requested_by"]
+    owner = state.requester   # R4 — the INTENT_SUBMITTED actor.subject; never payload.get("requested_by")
     open_task_fields = {e.payload["field"] for e in stream
                         if e.type == "CLARIFICATION_REQUESTED"} & set(must_ask)
     for field in must_ask:
@@ -1567,7 +1682,7 @@ def refine_contract(
 - Test: `tests/featuregen/intake/test_answer_clarification.py`
 
 **Interfaces:**
-- Consumes: SP-0 `gates/tasks.py::submit_human_signal`; `security/audit.py::record_denial`; P1 `load_feature_contract`/`append_fc_event`; the Task-5.5 `refine_contract`/`current_intake_deps`; the Task-5.4 owner predicate (inline).
+- Consumes: SP-0 `gates/tasks.py::submit_human_signal`; `security/audit.py::record_denial`; **R1** `intake.store.{load_feature_contract, append_feature_contract_event}` (P1); **R3/R4** `intake.state.{fold_feature_contract_state, actor_is_request_owner}` (P2 — the request-owner guard); the Task-5.5 `refine_contract`/`current_intake_deps`.
 - Produces:
   - `answer_clarification(conn, cmd) -> CommandResult` — reads `cmd.args = {task_id, response, expected_task_version, answer}`; resolves the run + request owner from the `feature_contract` stream; enforces the **SP-2-built request-owner guard** (`actor_kind=="human" ∧ actor.subject == request owner`), a mismatch **denied + written to the security-audit stream** (never counted); `submit_human_signal(CLARIFICATION, expected_task_version)` (task-version OCC); on a counted, quorum-met answer emits `CLARIFICATION_ANSWERED` (the domain shadow) and drives the Refinement Loop (`refine_contract`, when deps are registered).
   - `_SP2_CATALOG` gains `("answer_clarification", answer_clarification)`; `register_sp2_commands()` (idempotent) registers it.
@@ -1585,7 +1700,7 @@ from featuregen.intake.commands import (
     open_clarification_task,
     register_intake_deps,
 )
-from featuregen.intake.events import append_fc_event, load_feature_contract
+from featuregen.intake.store import append_feature_contract_event as append_fc_event, load_feature_contract
 from featuregen.intake.redaction import DefaultIntentRedactor
 from featuregen.security.audit import verify_chain
 
@@ -1611,11 +1726,14 @@ class _NoopLLM:
 def _seed_with_task(db, agent):
     from featuregen.intake.commands import freeze_draft
     run_id = "run_ans"
-    append_fc_event(db, run_id, type="INTENT_SUBMITTED",
+    # R4: INTENT_SUBMITTED is appended by the HUMAN requester (OWNER), so the P2 fold sets
+    # state.requester == "user:raj" — the value the request-owner guard checks. (The service `agent`
+    # still produces the downstream Draft/task events.)
+    append_fc_event(db, run_id=run_id, type="INTENT_SUBMITTED",
                     payload={"request_id": "req_ans", "run_id": run_id, "intake_mode": "definition",
                              "raw_input_ref": "blob_x", "raw_input_classification": "clean",
-                             "requested_by": "user:raj", "classification": {"outcome": "CLEAR", "version": "bdc-1"}},
-                    actor=agent, expected_version=0)
+                             "classification": {"outcome": "CLEAR", "catalog_version": "bdc-1"}},
+                    actor=OWNER, expected_version=0)
     body = {"request_id": "req_ans", "intake_mode": "definition", "raw_input_ref": "blob_x",
             "raw_input_classification": "clean", "proposed_feature_name": "f",
             "feature_semantics": {"entity": "customer", "entity_grain": ["customer_id", "as_of_date"],
@@ -1626,8 +1744,8 @@ def _seed_with_task(db, agent):
     ledger = {"request_id": "req_ans", "assumptions": []}
     draft_doc_id, _ = freeze_draft(db, run_id=run_id, request_id="req_ans", body=body,
                                    ledger_body=ledger, actor=agent)
-    append_fc_event(db, run_id, type="DRAFT_CONTRACT_PRODUCED",
-                    payload={"draft_doc_id": draft_doc_id, "ledger_doc_id": "",
+    append_fc_event(db, run_id=run_id, type="DRAFT_CONTRACT_PRODUCED",
+                    payload={"draft_doc_id": draft_doc_id, "assumption_ledger_ref": "",
                              "open_fields": ["filters.declined_status_encoding"]}, actor=agent)
     task_id = open_clarification_task(db, run_id=run_id, request_id="req_ans", draft_doc_id=draft_doc_id,
                                       field="filters", question="Which column?", owner_subject="user:raj",
@@ -1720,11 +1838,11 @@ def answer_clarification(conn: DbConn, cmd: Command) -> CommandResult:
         return CommandResult(accepted=False, aggregate_id="", denied_reason="unknown clarification task")
     run_id = row[0]
     stream = load_feature_contract(conn, run_id)
-    intent = _first(stream, "INTENT_SUBMITTED")
-    owner = intent.payload.get("requested_by") if intent else None
+    state = fold_feature_contract_state(stream)   # R3 — the P2 fold; state.requester is the owner (R4)
 
     # ── SP-2 request-owner guard (subject-level; SP-0 authz is role-level only) ──────────────────
-    if cmd.actor.actor_kind != "human" or owner is None or cmd.actor.subject != owner:
+    # R4: the ONE owner predicate is actor_is_request_owner(state, actor) — never payload.get("requested_by").
+    if cmd.actor.actor_kind != "human" or not actor_is_request_owner(state, cmd.actor):
         return _deny_owner_guard(
             conn, cmd, run_id, "answer_clarification denied: actor is not the request owner"
         )
@@ -1742,7 +1860,7 @@ def answer_clarification(conn: DbConn, cmd: Command) -> CommandResult:
 
     field = _requested_field(stream, task_id)
     append_fc_event(
-        conn, run_id, type="CLARIFICATION_ANSWERED",
+        conn, run_id=run_id, type="CLARIFICATION_ANSWERED",
         payload={"task_id": task_id, "field": field, "answer": args.get("answer"),
                  "response": args["response"], "answered_by": cmd.actor.subject},
         actor=cmd.actor,

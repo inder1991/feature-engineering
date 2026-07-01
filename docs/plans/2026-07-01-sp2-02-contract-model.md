@@ -12,16 +12,16 @@
 
 This phase builds SP-2's **content-schema + catalog + fold** foundation. It reads SP-0's `documents/draft.py` (`UNKNOWN`, `INTAKE_MODES`, `RAW_INPUT_CLASSIFICATIONS`, `register_draft_schemas`) and `documents/registry.py` (`DocumentSchemaRegistry`) — it writes **no** events and opens **no** tasks (that is P4–P8). The **fold** (`fold_feature_contract_state`) is built HERE, early, so every later command phase (P4–P8) gates on it inline (mirroring `overlay/confirmation_commands.py`), **not** on `state_machine/engine.py` (built-but-unused) and **not** on `run_workflow_state` (unwired scaffold).
 
-**New package + test dirs:** `src/featuregen/intake/` and `tests/featuregen/intake/`. Tasks 2.1–2.4 (`contract.py`), 2.5 (`state.py`), 2.6–2.7 (`banking_catalog.py`) are independent except 2.2 consumes the schema constants of 2.1, 2.3 consumes 2.2's reshape, and 2.7 consumes 2.6's reader. Implement in numeric order.
+**New package + test dirs:** `src/featuregen/intake/` (the package `__init__.py` files are **created by P1** — R18 — so this phase MODIFIES/merges, never re-creates them) and `tests/featuregen/intake/`. Tasks 2.1–2.4 (`contract.py`), 2.5 (`state.py`), 2.6–2.7 (`banking_catalog.py`), 2.8 (`catalog.py` — the module-global intake-catalog DI seam, R8/R10) are independent except 2.2 consumes the schema constants of 2.1, 2.3 consumes 2.2's reshape, and both 2.7 and 2.8 consume 2.6's reader. Implement in numeric order.
 
 ---
 
 ### Task 2.1: `intake/contract.py` — closed-enum vocabularies + authoritative content-schemas + tagged `calculation_method`
 
 **Files:**
-- Create: `src/featuregen/intake/__init__.py`
+- Modify (P1 CREATES it — R18; do NOT re-create): `src/featuregen/intake/__init__.py`
 - Create: `src/featuregen/intake/contract.py`
-- Create: `tests/featuregen/intake/__init__.py`
+- Modify (P1 CREATES it — R18; do NOT re-create): `tests/featuregen/intake/__init__.py`
 - Test: `tests/featuregen/intake/test_contract_schemas.py`
 
 **Interfaces:**
@@ -48,7 +48,7 @@ This phase builds SP-2's **content-schema + catalog + fold** foundation. It read
 
 - [ ] **Step 1: Write the failing test**
 
-Create `tests/featuregen/intake/__init__.py` (empty) and `tests/featuregen/intake/test_contract_schemas.py`:
+The package marker `tests/featuregen/intake/__init__.py` already exists (**created by P1** — R18; do not re-create it). Add `tests/featuregen/intake/test_contract_schemas.py`:
 
 ```python
 import jsonschema
@@ -141,7 +141,7 @@ Expected: FAIL with `ModuleNotFoundError: No module named 'featuregen.intake'`
 
 - [ ] **Step 3: Write minimal implementation**
 
-Create `src/featuregen/intake/__init__.py` (empty). Create `src/featuregen/intake/contract.py`:
+The package `src/featuregen/intake/__init__.py` already exists (**created by P1** — R18; do not re-create it). Create `src/featuregen/intake/contract.py`:
 
 ```python
 from __future__ import annotations
@@ -347,8 +347,7 @@ Expected: PASS (7 passed)
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/featuregen/intake/__init__.py src/featuregen/intake/contract.py \
-        tests/featuregen/intake/__init__.py tests/featuregen/intake/test_contract_schemas.py
+git add src/featuregen/intake/contract.py tests/featuregen/intake/test_contract_schemas.py
 git commit -m "feat(intake): Feature Contract closed-enum vocabularies + authoritative Draft/Confirmed/Ledger content-schemas + tagged calculation_method"
 ```
 
@@ -966,14 +965,14 @@ git commit -m "feat(intake): register_contract_schemas — CONFIRMED_CONTRACT@1 
 
 ---
 
-### Task 2.5: `intake/state.py` — `FeatureContractStatus` + `FeatureContractState` + `fold_feature_contract_state`
+### Task 2.5: `intake/state.py` — `FeatureContractStatus` + `FeatureContractState` (R3 union field set) + `fold_feature_contract_state` + `actor_is_request_owner` (R4)
 
 **Files:**
 - Create: `src/featuregen/intake/state.py`
 - Test: `tests/featuregen/intake/test_state.py`
 
 **Interfaces:**
-- Consumes: the SP-2 FC event-type **string constants** from `featuregen.intake.events` (P1) — `INTENT_SUBMITTED`, `DRAFT_CONTRACT_PRODUCED`, `FIELD_AUTO_RESOLVED`, `CLARIFICATION_ANSWERED`, `CONTRACT_REFINED`, `MINIMUM_CONTRACT_VALIDATED`, `CONTRACT_CONFIRMED`, `INTENT_REJECTED`, `USE_CASE_ONBOARDING_REQUESTED`, `LLM_CALL_RECORDED` (+ `CONTRACT_CRITIQUED`, `CLARIFICATION_REQUESTED`, folded as no-ops). Stream items expose `.type`, `.event_id`, `.payload` (SP-0 `EventEnvelope`).
+- Consumes: the SP-2 FC event-type **string constants** from `featuregen.intake.events` (P1) — `INTENT_SUBMITTED`, `DRAFT_CONTRACT_PRODUCED`, `FIELD_AUTO_RESOLVED`, `CLARIFICATION_ANSWERED`, `CONTRACT_REFINED`, `MINIMUM_CONTRACT_VALIDATED`, `CONTRACT_CONFIRMED`, `INTENT_REJECTED`, `USE_CASE_ONBOARDING_REQUESTED`, `LLM_CALL_RECORDED` (+ `CONTRACT_CRITIQUED`, `CLARIFICATION_REQUESTED`, folded as no-ops). Stream items expose `.type`, `.event_id`, `.payload`, and `.actor` (SP-0 `EventEnvelope`; `actor` is an `IdentityEnvelope` with `.subject`, `contracts/envelopes.py:17`). The fold reads the **`INTENT_SUBMITTED` event's `actor.subject`** as the request owner (**R4**).
 - Produces:
   ```python
   class FeatureContractStatus(str, Enum):        # closed lifecycle vocabulary (overview §4.6)
@@ -981,17 +980,23 @@ git commit -m "feat(intake): register_contract_schemas — CONFIRMED_CONTRACT@1 
       OUT_OF_SCOPE; PROHIBITED_DATA_CLASS; NEEDS_USE_CASE_ONBOARDING
   TERMINAL_STATUSES: frozenset[FeatureContractStatus]   # CONFIRMED, OUT_OF_SCOPE, PROHIBITED_DATA_CLASS
   @dataclass(frozen=True)
-  class FeatureContractState:
+  class FeatureContractState:                    # R3 — the ONE union field set (overview R3); P8 CONSUMES
       status: FeatureContractStatus | None
       open_fields: tuple[str, ...]
+      requester: str | None                      # R4 — the INTENT_SUBMITTED event actor.subject
       request_id / run_id / intake_mode / draft_doc_id / assumption_ledger_ref /
-      confirmed_doc_id / candidate_doc_ids / catalog_version / classification /
-      matched_class / confirmed_by / llm_call_refs   # folded provenance
+      confirmed_doc_id / candidate_doc_ids / catalog_version / classification / matched_class /
+      proposed_feature_name / feature_name / field_scores / open_questions /
+      requires_independent_validation / selected_candidate / rejection_classification /
+      rejection_reason / confirmed_by / llm_call_refs        # folded provenance
       # + properties: is_terminal, is_confirmed, mcv_passed
   def fold_feature_contract_state(stream: Iterable) -> FeatureContractState
         # mirrors overlay/state.py::fold_overlay_state — folds the feature_contract stream to the
         # authoritative status, with a NO-REGRESSION guard (a fold at/past terminal/confirmed refuses
-        # a conflicting re-advance). NEVER a projection row.
+        # a conflicting re-advance). Sets requester from the INTENT_SUBMITTED event actor.subject (R4).
+        # NEVER a projection row.
+  def actor_is_request_owner(state: FeatureContractState, actor) -> bool
+        # R4 — the ONE request-owner predicate P5/P6/P7/P8 call: actor.subject == state.requester.
   ```
 
 - [ ] **Step 1: Write the failing test**
@@ -1005,8 +1010,14 @@ from featuregen.intake import events
 from featuregen.intake.state import (
     FeatureContractState,
     FeatureContractStatus,
+    actor_is_request_owner,
     fold_feature_contract_state,
 )
+
+
+@dataclass
+class _Actor:
+    subject: str
 
 
 @dataclass
@@ -1014,12 +1025,14 @@ class _Evt:
     type: str
     event_id: str
     payload: dict
+    actor: _Actor | None = None       # SP-0 EventEnvelope.actor (IdentityEnvelope with .subject)
 
 
-def _submitted(eid="evt_sub"):
+def _submitted(eid="evt_sub", subject="user:raj"):
     return _Evt(events.INTENT_SUBMITTED, eid,
                 {"request_id": "req_1", "run_id": "run_1", "intake_mode": "definition",
-                 "catalog_version": "banking-cat@1"})
+                 "catalog_version": "banking-cat@1"},
+                actor=_Actor(subject=subject))
 
 
 def _produced(open_fields=("filters.declined_status_encoding",), candidates=()):
@@ -1045,7 +1058,17 @@ def test_submit_then_draft_is_needs_clarification_with_open_fields():
     assert st.draft_doc_id == "doc_draft1"
     assert st.assumption_ledger_ref == "doc_led1"
     assert st.catalog_version == "banking-cat@1"
+    assert st.requester == "user:raj"
     assert not st.mcv_passed
+
+
+def test_requester_is_the_intent_submitted_event_actor_and_owner_predicate():
+    # R4 — the request owner is folded from the INTENT_SUBMITTED event's actor.subject, and the ONE
+    # owner predicate P5–P8 call compares an acting principal's .subject to it.
+    st = fold_feature_contract_state([_submitted(subject="user:raj")])
+    assert st.requester == "user:raj"
+    assert actor_is_request_owner(st, _Actor("user:raj"))
+    assert not actor_is_request_owner(st, _Actor("user:mallory"))
 
 
 def test_answering_and_auto_resolving_clears_open_fields():
@@ -1135,9 +1158,10 @@ Create `src/featuregen/intake/state.py`:
 ```python
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from enum import Enum
+from typing import Any
 
 from featuregen.intake import events
 
@@ -1167,10 +1191,12 @@ TERMINAL_STATUSES: frozenset[FeatureContractStatus] = frozenset({
 @dataclass(frozen=True)
 class FeatureContractState:
     """The authoritative folded state of the feature_contract aggregate — the value every SP-2
-    command handler gates on inline before appending (spec §11), mirroring OverlayState."""
+    command handler gates on inline before appending (spec §11), mirroring OverlayState. Carries the
+    ONE union field set (overview R3) both the inline guards and P8's get_contract read model need."""
 
     status: FeatureContractStatus | None = None
     open_fields: tuple[str, ...] = ()
+    requester: str | None = None                 # R4 — the INTENT_SUBMITTED event actor.subject
     request_id: str | None = None
     run_id: str | None = None
     intake_mode: str | None = None
@@ -1181,6 +1207,14 @@ class FeatureContractState:
     catalog_version: str | None = None
     classification: str | None = None
     matched_class: str | None = None
+    proposed_feature_name: str | None = None
+    feature_name: str | None = None
+    field_scores: Mapping[str, Any] = field(default_factory=dict)
+    open_questions: tuple[Any, ...] = ()
+    requires_independent_validation: bool = False
+    selected_candidate: str | None = None
+    rejection_classification: str | None = None
+    rejection_reason: str | None = None
     confirmed_by: str | None = None
     llm_call_refs: tuple[str, ...] = ()
 
@@ -1213,10 +1247,15 @@ def fold_feature_contract_state(stream: Iterable) -> FeatureContractState:
     not regression past a lock)."""
     status: FeatureContractStatus | None = None
     open_fields: tuple[str, ...] = ()
-    request_id = run_id = intake_mode = None
+    requester = request_id = run_id = intake_mode = None
     draft_doc_id = assumption_ledger_ref = confirmed_doc_id = None
     candidate_doc_ids: tuple[str, ...] = ()
     catalog_version = classification = matched_class = confirmed_by = None
+    proposed_feature_name = feature_name = None
+    field_scores: Mapping[str, Any] = {}
+    open_questions: tuple[Any, ...] = ()
+    requires_independent_validation = False
+    selected_candidate = rejection_classification = rejection_reason = None
     llm_call_refs: tuple[str, ...] = ()
 
     for event in stream:
@@ -1232,14 +1271,21 @@ def fold_feature_contract_state(stream: Iterable) -> FeatureContractState:
             run_id = p.get("run_id")
             intake_mode = p.get("intake_mode")
             catalog_version = p.get("catalog_version", catalog_version)
+            actor = getattr(event, "actor", None)                     # R4 — the request owner is this
+            requester = getattr(actor, "subject", None) or p.get("requester")  # event's actor.subject
         elif t == events.DRAFT_CONTRACT_PRODUCED:
             draft_doc_id = p.get("draft_doc_id")
             assumption_ledger_ref = p.get("assumption_ledger_ref")
             open_fields = tuple(p.get("open_fields") or ())
             candidate_doc_ids = tuple(p.get("candidate_doc_ids") or ())
+            proposed_feature_name = p.get("proposed_feature_name", proposed_feature_name)
+            field_scores = p.get("field_scores", field_scores)
+            open_questions = tuple(p.get("open_questions") or open_questions)
         elif t == events.CONTRACT_REFINED:
             draft_doc_id = p.get("draft_doc_id", draft_doc_id)
             open_fields = tuple(p.get("open_fields") or ())
+            field_scores = p.get("field_scores", field_scores)
+            open_questions = tuple(p.get("open_questions") or open_questions)
             if status is FeatureContractStatus.MINIMUM_CONTRACT_VALIDATED and open_fields:
                 status = FeatureContractStatus.NEEDS_CLARIFICATION
         elif t in (events.FIELD_AUTO_RESOLVED, events.CLARIFICATION_ANSWERED):
@@ -1252,10 +1298,17 @@ def fold_feature_contract_state(stream: Iterable) -> FeatureContractState:
             status = FeatureContractStatus.CONFIRMED
             confirmed_doc_id = p.get("confirmed_doc_id")
             confirmed_by = p.get("confirmed_by")
+            feature_name = p.get("feature_name", feature_name)
+            requires_independent_validation = bool(
+                p.get("requires_independent_validation", requires_independent_validation)
+            )
+            selected_candidate = p.get("selected_candidate", selected_candidate)
         elif t == events.INTENT_REJECTED:
             classification = p.get("classification")
             status = FeatureContractStatus(classification)   # OUT_OF_SCOPE | PROHIBITED_DATA_CLASS
             matched_class = p.get("matched_class")
+            rejection_classification = classification
+            rejection_reason = p.get("reason")
             catalog_version = p.get("catalog_version", catalog_version)
         elif t == events.USE_CASE_ONBOARDING_REQUESTED:
             status = FeatureContractStatus.NEEDS_USE_CASE_ONBOARDING
@@ -1265,25 +1318,40 @@ def fold_feature_contract_state(stream: Iterable) -> FeatureContractState:
         # CONTRACT_CRITIQUED / CLARIFICATION_REQUESTED: doubt/question shadows — no status change.
 
     return FeatureContractState(
-        status=status, open_fields=open_fields, request_id=request_id, run_id=run_id,
-        intake_mode=intake_mode, draft_doc_id=draft_doc_id,
+        status=status, open_fields=open_fields, requester=requester, request_id=request_id,
+        run_id=run_id, intake_mode=intake_mode, draft_doc_id=draft_doc_id,
         assumption_ledger_ref=assumption_ledger_ref, confirmed_doc_id=confirmed_doc_id,
         candidate_doc_ids=candidate_doc_ids, catalog_version=catalog_version,
-        classification=classification, matched_class=matched_class, confirmed_by=confirmed_by,
-        llm_call_refs=llm_call_refs,
+        classification=classification, matched_class=matched_class,
+        proposed_feature_name=proposed_feature_name, feature_name=feature_name,
+        field_scores=field_scores, open_questions=open_questions,
+        requires_independent_validation=requires_independent_validation,
+        selected_candidate=selected_candidate, rejection_classification=rejection_classification,
+        rejection_reason=rejection_reason, confirmed_by=confirmed_by, llm_call_refs=llm_call_refs,
     )
+
+
+def actor_is_request_owner(state: FeatureContractState, actor) -> bool:
+    """R4 — the ONE request-owner predicate every SP-2 command phase (P5/P6/P7/P8) calls. True iff the
+    acting principal's `subject` matches the request owner folded from the INTENT_SUBMITTED event
+    (`state.requester` = that event's `actor.subject`). SP-0's `submit_human_signal` checks
+    role/scope/quorum only — never subject membership (overview §2.1) — so this subject guard is the
+    request-owner check SP-0 does not provide; a mismatch is a denial (P5–P8 route it to record_denial
+    + the security-audit stream)."""
+    subject = getattr(actor, "subject", None)
+    return bool(subject) and subject == state.requester
 ```
 
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `uv run pytest tests/featuregen/intake/test_state.py -v`
-Expected: PASS (9 passed)
+Expected: PASS (10 passed)
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add src/featuregen/intake/state.py tests/featuregen/intake/test_state.py
-git commit -m "feat(intake): FeatureContractStatus + FeatureContractState + fold_feature_contract_state (no-regression guard)"
+git commit -m "feat(intake): FeatureContractStatus + FeatureContractState (R3 union fields) + fold + actor_is_request_owner (R4, no-regression guard)"
 ```
 
 ---
@@ -1550,9 +1618,10 @@ git commit -m "feat(intake): read-only BankingDomainCatalog reference reader (fr
       AMBIGUOUS_CLARIFY; NEEDS_USE_CASE_ONBOARDING; CLEAR
   @dataclass(frozen=True)
   class IntakeClassification:
-      outcome: IntakeOutcome; catalog_version: str | None; reason: str
+      outcome: IntakeOutcome; catalog_version: str | None; reason: str   # R9 — field is catalog_version
       matched_class: str | None; matched_use_case: str | None
       # + properties: is_clear, blocks (OUT_OF_SCOPE|PROHIBITED_DATA_CLASS), needs_clarification
+      def as_mapping(self) -> dict   # R9 — {"outcome": outcome.value, "catalog_version": ..., "matched_class": ...}
   def classify_intent(intent: str, *, product: str | None = None, region: str | None = None,
                       catalog: BankingDomainCatalog | None) -> IntakeClassification
         # deterministic (NOT the LLM's call, §5.4). TOTAL + fail-closed + precedence
@@ -1676,6 +1745,21 @@ def test_every_outcome_stamps_the_catalog_version_when_catalog_is_available():
         r = classify_intent(text, catalog=CAT)
         assert isinstance(r, IntakeClassification)
         assert r.catalog_version == "banking-cat@1"              # §4.5(c): version on EVERY outcome
+
+
+def test_as_mapping_is_the_persisted_provenance_shape():
+    # R9 — submit_intent persists classification.as_mapping() on INTENT_SUBMITTED; MCV /
+    # not_prohibited_intent / refine read it back. outcome is the string VALUE, not the enum.
+    r = classify_intent("predict churn using race", catalog=CAT)
+    assert r.as_mapping() == {
+        "outcome": "PROHIBITED_DATA_CLASS",
+        "catalog_version": "banking-cat@1",
+        "matched_class": "protected_attribute",
+    }
+    clear = classify_intent("build a credit risk score for customers", catalog=CAT)
+    assert clear.as_mapping() == {
+        "outcome": "CLEAR", "catalog_version": "banking-cat@1", "matched_class": None,
+    }
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -1732,6 +1816,16 @@ class IntakeClassification:
             IntakeOutcome.SENSITIVE_PROXY_CLARIFY,
             IntakeOutcome.AMBIGUOUS_CLARIFY,
         )
+
+    def as_mapping(self) -> dict:
+        """R9 — the compact provenance mapping submit_intent (P4) persists on INTENT_SUBMITTED (§4.5);
+        MCV / not_prohibited_intent / refine read it back. Emits the outcome VALUE (not the enum),
+        the stamped catalog_version, and matched_class."""
+        return {
+            "outcome": self.outcome.value,
+            "catalog_version": self.catalog_version,
+            "matched_class": self.matched_class,
+        }
 
 
 def _first_match(text: str, terms: Iterable[str]) -> str | None:
@@ -1829,7 +1923,7 @@ def classify_intent(
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `uv run pytest tests/featuregen/intake/test_classify_intent.py -v`
-Expected: PASS (11 passed)
+Expected: PASS (12 passed)
 
 - [ ] **Step 5: Commit**
 
@@ -1840,12 +1934,130 @@ git commit -m "feat(intake): deterministic classify_intent — total, fail-close
 
 ---
 
+### Task 2.8: `intake/catalog.py` — the module-global intake-catalog DI seam + `load_banking_catalog_from_seed` (R8/R10)
+
+**Files:**
+- Create: `src/featuregen/intake/catalog.py`
+- Test: `tests/featuregen/intake/test_catalog_seam.py`
+
+**Interfaces:**
+- Consumes: `BankingDomainCatalog` (Task 2.6).
+- Produces (the **R8/R10** collaborator DI seam — module-global, pinned names, parallel to `register_llm_client`/`register_intent_redactor`/`register_candidate_generator`):
+  ```python
+  def register_intake_catalog(catalog: BankingDomainCatalog) -> None      # R8/R10 — process-global register
+  def current_intake_catalog() -> BankingDomainCatalog                    # R8/R10 — fail-closed if unset
+  def load_banking_catalog_from_seed(seed: Mapping) -> BankingDomainCatalog  # R8 — thin from_seed wrapper
+  ```
+  > This is the seam P7 `_prohibited_intent_screen` reads via `current_intake_catalog()` (NOT `load_banking_catalog(conn)`), and the seam **P9 wires** via `register_intake_catalog(...)`. Fail-closed: an unset catalog raises (never silently None → never auto-pass the §4.5(b) banking-boundary screen). The autouse `intake_catalog` fixture (the shared conftest, **created by P1** — R18) registers a double per test and resets it.
+
+- [ ] **Step 1: Write the failing test**
+
+Create `tests/featuregen/intake/test_catalog_seam.py`:
+
+```python
+import pytest
+
+from featuregen.intake import catalog
+from featuregen.intake.banking_catalog import BankingDomainCatalog
+
+_SEED = {
+    "catalog_version": "banking-cat@1",
+    "data_classes": ["transactions", "protected_attribute"],
+    "entities": ["customer", "account"],
+    "use_cases": [{"use_case": "retail_churn", "status": "active",
+                   "blocked_data_classes": ["protected_attribute"]}],
+}
+
+
+def test_load_banking_catalog_from_seed_builds_a_reader():
+    cat = catalog.load_banking_catalog_from_seed(_SEED)
+    assert isinstance(cat, BankingDomainCatalog)
+    assert cat.version == "banking-cat@1"
+    assert cat.available
+
+
+def test_register_then_current_round_trips_the_same_instance():
+    cat = catalog.load_banking_catalog_from_seed(_SEED)
+    catalog.register_intake_catalog(cat)
+    assert catalog.current_intake_catalog() is cat
+
+
+def test_current_intake_catalog_fails_closed_when_unset(monkeypatch):
+    monkeypatch.setattr(catalog, "_INTAKE_CATALOG", None, raising=False)
+    with pytest.raises(RuntimeError):
+        catalog.current_intake_catalog()
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `uv run pytest tests/featuregen/intake/test_catalog_seam.py -v`
+Expected: FAIL with `ModuleNotFoundError: No module named 'featuregen.intake.catalog'`
+
+- [ ] **Step 3: Write minimal implementation**
+
+Create `src/featuregen/intake/catalog.py`:
+
+```python
+from __future__ import annotations
+
+from collections.abc import Mapping
+
+from featuregen.intake.banking_catalog import BankingDomainCatalog
+
+# Process-global registered read-only catalog (mirrors SP-1's collaborator seams). Wired by P9 via
+# register_intake_catalog(...); reset per test by the shared conftest's autouse intake_catalog fixture.
+_INTAKE_CATALOG: BankingDomainCatalog | None = None
+
+
+class IntakeCatalogNotConfigured(RuntimeError):
+    """Raised by current_intake_catalog when no catalog has been registered — fail-closed (§4.5(b))."""
+
+
+def register_intake_catalog(catalog: BankingDomainCatalog) -> None:
+    """R8/R10 — register the process-global, read-only BankingDomainCatalog the intake banking-boundary
+    screens read (§4.5, Decision D8). Idempotent last-writer-wins; P9 wires the seeded catalog here."""
+    global _INTAKE_CATALOG
+    _INTAKE_CATALOG = catalog
+
+
+def current_intake_catalog() -> BankingDomainCatalog:
+    """R8/R10 — the registered catalog, or FAIL CLOSED if unset (§4.5(b)): never silently None, so the
+    banking-boundary screen can never auto-pass against a missing catalog. P7 `_prohibited_intent_screen`
+    reads this seam (NOT load_banking_catalog(conn))."""
+    if _INTAKE_CATALOG is None:
+        raise IntakeCatalogNotConfigured(
+            "no intake catalog registered; call register_intake_catalog(...) first"
+        )
+    return _INTAKE_CATALOG
+
+
+def load_banking_catalog_from_seed(seed: Mapping) -> BankingDomainCatalog:
+    """R8 — build a read-only BankingDomainCatalog from an in-memory seed mapping (a thin wrapper over
+    BankingDomainCatalog.from_seed; read-only, never grounding — Decision D8)."""
+    return BankingDomainCatalog.from_seed(seed)
+```
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `uv run pytest tests/featuregen/intake/test_catalog_seam.py -v`
+Expected: PASS (3 passed)
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/featuregen/intake/catalog.py tests/featuregen/intake/test_catalog_seam.py
+git commit -m "feat(intake): intake-catalog DI seam (register/current_intake_catalog) + load_banking_catalog_from_seed (R8/R10)"
+```
+
+---
+
 ## Phase 2 exit criteria
 
-- [ ] `uv run pytest tests/featuregen/intake -v` is green (all 7 test modules).
-- [ ] `contract.py` exports: the closed-enum vocabularies (`OBSERVATION_INTENT_KINDS`, `METHOD_KINDS`, `SCORE_SOURCES`, `ROUTED_TO`) + `UNKNOWN`/`INTAKE_MODES`/`RAW_INPUT_CLASSIFICATIONS` re-exported from SP-0; the three authoritative content-schema constants (`DRAFT_CONTENT_SCHEMA`, `CONFIRMED_CONTRACT_JSON_SCHEMA`, `ASSUMPTION_LEDGER_CONTENT_SCHEMA`) with the tagged/versioned `calculation_method`; `validate_semantics(body, *, stage)`; `assemble_confirmed(...)` + `reshape_calculation_method(...)`; `register_contract_schemas(registry)` (CONFIRMED_CONTRACT@1 + additive Draft/Ledger re-affirm + the v1 upcaster seam).
-- [ ] `state.py` exports `FeatureContractStatus` (the 6 lifecycle values), `FeatureContractState`, and **`fold_feature_contract_state(stream)`** with the no-regression guard — the authoritative fold every later command phase (P4–P8) gates on inline (mirroring `overlay/confirmation_commands.py`); it is **not** `state_machine/engine.py` and **not** `run_workflow_state`.
-- [ ] `banking_catalog.py` exports the read-only `BankingDomainCatalog` reader (`from_seed` / `load_banking_catalog`) and the deterministic `classify_intent(...) -> IntakeClassification` + `IntakeOutcome` — total, fail-closed, precedence most-restrictive-wins, version stamped on every outcome.
-- [ ] No events appended, no tasks opened, no authz seeded — those are P3–P8. This phase is pure content-model + fold + reference reader.
+- [ ] `uv run pytest tests/featuregen/intake -v` is green (all 8 test modules).
+- [ ] `contract.py` exports: the closed-enum vocabularies (`OBSERVATION_INTENT_KINDS`, `METHOD_KINDS`, `SCORE_SOURCES`, `ROUTED_TO`) + `UNKNOWN`/`INTAKE_MODES`/`RAW_INPUT_CLASSIFICATIONS` re-exported from SP-0; the three authoritative content-schema constants (`DRAFT_CONTENT_SCHEMA`, `CONFIRMED_CONTRACT_JSON_SCHEMA`, `ASSUMPTION_LEDGER_CONTENT_SCHEMA`) with the tagged/versioned `calculation_method`; **R6** `validate_semantics(body, *, stage) -> None` (raises `ContractSemanticError`); **R7** `assemble_confirmed(...)` + `reshape_calculation_method(...)`; `register_contract_schemas(registry)` (CONFIRMED_CONTRACT@1 + additive Draft/Ledger re-affirm + the v1 upcaster seam).
+- [ ] `state.py` exports `FeatureContractStatus` (the 6 lifecycle values), **`FeatureContractState`** carrying the **R3 union field set** (incl. `requester`, `proposed_feature_name`, `feature_name`, `field_scores`, `open_questions`, `requires_independent_validation`, `selected_candidate`, `rejection_classification`, `rejection_reason`), **`fold_feature_contract_state(stream)`** with the no-regression guard (sets `requester` from the `INTENT_SUBMITTED` event `actor.subject` — **R4**), and **`actor_is_request_owner(state, actor)`** (**R4** — the ONE owner predicate P5–P8 call) — the authoritative fold every later command phase (P4–P8) gates on inline (mirroring `overlay/confirmation_commands.py`); it is **not** `state_machine/engine.py` and **not** `run_workflow_state`. **P8 CONSUMES this fold + state — no duplicate `state.py`/`test_state.py`.**
+- [ ] `banking_catalog.py` exports the read-only `BankingDomainCatalog` reader (`from_seed` / `load_banking_catalog`) and the deterministic `classify_intent(...) -> IntakeClassification` + `IntakeOutcome` — total, fail-closed, precedence most-restrictive-wins, version stamped on every outcome. **R9** `IntakeClassification.catalog_version` (NOT `.version`) + `.as_mapping() -> {"outcome", "catalog_version", "matched_class"}`.
+- [ ] `catalog.py` exports the **R8/R10** module-global intake-catalog DI seam `register_intake_catalog(catalog)` / `current_intake_catalog()` (fail-closed if unset) + `load_banking_catalog_from_seed(seed)`.
+- [ ] No events appended, no tasks opened, no authz seeded — those are P3–P8. This phase is pure content-model + fold + reference reader + the catalog DI seam.
 
-**Downstream consumers (do not drift these symbols):** P3 registers `CONFIRMED_CONTRACT`'s LLM output-schema against `register_contract_schemas`; P4 (`submit_intent`) uses `classify_intent` + `validate_semantics(stage="DRAFT_CONTRACT")` + emits the Draft/Ledger docs; P5 (`mcv.py`) folds `fold_feature_contract_state` and validates the Draft; P7 (`confirm_contract`) calls `assemble_confirmed` + `validate_semantics(stage="CONFIRMED_CONTRACT")`; P8 re-uses `fold_feature_contract_state` for the inline lifecycle guards + `get_contract` read model.
+**Downstream consumers (do not drift these symbols):** P3 registers `CONFIRMED_CONTRACT`'s LLM output-schema against `register_contract_schemas`; P4 (`submit_intent`) uses `classify_intent` + persists `classification.as_mapping()` on `INTENT_SUBMITTED` (**R9**) + `validate_semantics(stage="DRAFT_CONTRACT")` (**R6**) + emits the Draft/Ledger docs; P5 (`mcv.py`) folds `fold_feature_contract_state` and validates the Draft; P5/P6/P7/P8 call `actor_is_request_owner(state, actor)` (**R4**); P7 (`confirm_contract`) calls `assemble_confirmed` (**R7**) + `validate_semantics(stage="CONFIRMED_CONTRACT")` + reads `current_intake_catalog()` (**R8**); P8 re-uses `fold_feature_contract_state` for the inline lifecycle guards + `get_contract` read model; P9 wires the catalog via `register_intake_catalog(...)` (**R8/R10**).

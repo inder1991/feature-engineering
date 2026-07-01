@@ -8,8 +8,8 @@
 
 This phase builds SP-2's most consequential contribution — the platform's **first and permanent auditable-LLM boundary** (spec §9). Three modules:
 
-- `src/featuregen/intake/redaction.py` — the **`IntentRedactor` seam** (Protocol + `DefaultIntentRedactor` + `RedactionResult`), the reserved LLM-safe `inputs` key vocabulary, the `build_llm_inputs(...)` assembler, and the fail-closed **egress guard** `assert_llm_safe(request)` (refuses `unscanned` / data-values / un-redacted PII → hard failure).
-- `src/featuregen/intake/llm.py` — the **`LLMClient` Protocol**, `LLMRequest` / `LLMResult`, the deterministic scriptable **`FakeLLM`**, the structured-output **bounded-repair / bounded-retry / fail-closed taxonomy** (`drive_structured_call`), the append-only **`llm_call` record store** (`record_llm_call` / `read_llm_call` / `find_llm_call`) with the **full-identity idempotency key**, and the event-sourced wrapper **`call_llm(conn, client, request, *, run_id, actor)`** (egress-guards → dedups → validates against the registered output-schema → records the call → emits `LLM_CALL_RECORDED` on the `feature_contract` aggregate).
+- `src/featuregen/intake/redaction.py` — the **`IntentRedactor` seam** (Protocol + `DefaultIntentRedactor` + `RedactionResult`), the reserved LLM-safe `inputs` key vocabulary, the `build_llm_inputs(...)` assembler, the fail-closed **egress guard** `assert_llm_safe(request)` (refuses `unscanned` / data-values / un-redacted PII → hard failure), and the **R10** collaborator DI seam `register_intent_redactor` / `current_intent_redactor` (module-global, fail-closed if unset).
+- `src/featuregen/intake/llm.py` — the **`LLMClient` Protocol**, `LLMRequest` / `LLMResult`, the deterministic scriptable **`FakeLLM`** (**R19** `FakeLLM(script={task_key: FakeResponse(...)})` construction form + task-key fallback), the **R10** collaborator DI seam `register_llm_client` / `current_llm_client` (module-global, fail-closed if unset), the structured-output **bounded-repair / bounded-retry / fail-closed taxonomy** (`drive_structured_call`), the append-only **`llm_call` record store** (`record_llm_call` / `read_llm_call` / `find_llm_call`) with the **full-identity idempotency key**, and the event-sourced wrapper **`call_llm(conn, client, request, *, run_id, actor)`** — which **imports the R1 store seam** `append_feature_contract_event` (from `intake.store`, P1) and the **R17** `LLM_CALL_RECORDED` constant (from `intake.events`, P1) — egress-guards → dedups → validates against the registered output-schema → records the call → emits `LLM_CALL_RECORDED` on the `feature_contract` aggregate.
 - `src/featuregen/intake/llm_claude.py` — the **config-gated real Claude adapter** (Anthropic SDK, `anthropic` imported lazily, never in CI; model config-driven, default `claude-opus-4-8`; no-PHI-in-schema; **no silent fallback to `FakeLLM`**), with the SDK syntax in an Adapter Appendix.
 
 **Authority-model invariants this phase enforces (verbatim, load-bearing):** the LLM *structures/suggests*, the platform *validates/enforces*. A malformed LLM structure is a **doubt, not a value** — bounded repair → fail into the clarification/manual path (no silent bad structure). A refusal fails into clarification directly (not repair). No PII / no data values ever reach the model (`IntentRedactor` redacts; `assert_llm_safe` is the hard egress backstop → security-audit). Every call is one immutable, **replayable** (`redacted_input` stored, not hash-only) record + one `LLM_CALL_RECORDED` event. **No silent production fallback** — an enabled-but-unavailable real adapter fails closed into clarification, never swaps in `FakeLLM` (Decision D5).
@@ -52,7 +52,7 @@ CREATE TABLE IF NOT EXISTS llm_call (
 CREATE INDEX IF NOT EXISTS llm_call_identity_idx ON llm_call (run_id, task, input_hash);
 ```
 
-**`LLM_CALL_RECORDED` event schema (registered by P1):** `schema_version=1`, `additionalProperties: true`, `required: ["llm_call_ref"]`, owner `featuregen-intake`. P3 is the **sole emitter** and pins the payload: `{"llm_call_ref", "task", "status", "validation_result"}`. Emitted on `aggregate="feature_contract"`, `aggregate_id=run_id`, `feature_contract_id=run_id` (the run/feature/request mirror columns are NULL — the `0508` `feature_contract` branch requires `aggregate_id = feature_contract_id`, mirroring `0504`'s overlay branch). `fold_feature_contract_state` (P8) MUST ignore `LLM_CALL_RECORDED` (it never advances the folded status).
+**`LLM_CALL_RECORDED` event schema (registered by P1; constant owned by P1's `intake/events.py`, R17):** `schema_version=1`, `additionalProperties: true`, `required: ["llm_call_ref"]` (**R2** — id fields NOT in `required`), owner `featuregen-intake`. P3 **imports the `LLM_CALL_RECORDED` constant from `featuregen.intake.events` (never redeclares it, R17)**, is the **sole emitter**, and pins the payload to SEMANTIC fields only (R2 — no id fields): `{"llm_call_ref", "task", "status", "validation_result"}`. Emitted via the **R1 store seam** `append_feature_contract_event(conn, run_id=..., type=LLM_CALL_RECORDED, ...)` (from `intake.store`, P1), which sets `aggregate="feature_contract"`, `aggregate_id = feature_contract_id = run_id` (the run/feature/request mirror columns are NULL — the `0508` `feature_contract` branch requires `aggregate_id = feature_contract_id`, mirroring `0504`'s overlay branch). `fold_feature_contract_state` (P8) MUST ignore `LLM_CALL_RECORDED` (it never advances the folded status).
 
 ---
 
@@ -60,7 +60,7 @@ CREATE INDEX IF NOT EXISTS llm_call_identity_idx ON llm_call (run_id, task, inpu
 
 **Files:**
 - Create `src/featuregen/intake/__init__.py` (empty) if it does not already exist (P1 may have created it).
-- Create `src/featuregen/intake/redaction.py` — `IntentRedactor` Protocol, `RedactionResult`, `DefaultIntentRedactor`, the reserved `INPUT_KEY_*` constants, the shared `_PII_PATTERNS`, `EgressViolation`, and `build_llm_inputs`.
+- Create `src/featuregen/intake/redaction.py` — `IntentRedactor` Protocol, `RedactionResult`, `DefaultIntentRedactor`, the reserved `INPUT_KEY_*` constants, the shared `_PII_PATTERNS`, `EgressViolation`, `build_llm_inputs`, and the **R10** collaborator seam `register_intent_redactor` / `current_intent_redactor`.
 - Create `tests/featuregen/intake/__init__.py` (empty) so the test package imports.
 - Create `tests/featuregen/intake/test_redaction.py` — pure unit tests (no DB fixture).
 
@@ -92,6 +92,10 @@ CREATE INDEX IF NOT EXISTS llm_call_identity_idx ON llm_call (run_id, task, inpu
 
   def build_llm_inputs(redaction: RedactionResult, *, catalog_metadata: Mapping[str, Any],
                        raw_input_classification: str) -> dict: ...   # assembles the reserved-keyed inputs dict
+
+  # R10 collaborator DI seam (module-global; owned by P3, imported verbatim by P4/P9). Fail-closed.
+  def register_intent_redactor(redactor: IntentRedactor) -> None: ...
+  def current_intent_redactor() -> IntentRedactor: ...   # raises RuntimeError if unset
   ```
 
 Steps:
@@ -177,6 +181,18 @@ Steps:
                             redacted_spans=(), disposition="fail_into_clarification")
       with pytest.raises(EgressViolation):
           build_llm_inputs(red, catalog_metadata={}, raw_input_classification="unscanned")
+
+
+  def test_intent_redactor_seam_registers_and_fails_closed_when_unset():
+      # R10 module-global DI seam: current_ fails closed until register_ is called; then round-trips.
+      from featuregen.intake import redaction as _rmod
+      from featuregen.intake.redaction import current_intent_redactor, register_intent_redactor
+
+      _rmod._INTENT_REDACTOR = None  # ensure unset for a deterministic fail-closed assertion
+      with pytest.raises(RuntimeError):
+          current_intent_redactor()
+      register_intent_redactor(DefaultIntentRedactor())
+      assert isinstance(current_intent_redactor(), DefaultIntentRedactor)
   ```
 
 - [ ] **Run it — expect failure.** `uv run pytest tests/featuregen/intake/test_redaction.py -v` — Expected: FAIL (`ModuleNotFoundError: No module named 'featuregen.intake.redaction'`).
@@ -290,6 +306,29 @@ Steps:
           INPUT_KEY_REDACTION_VERSION: redaction.redaction_version,
           INPUT_KEY_REDACTION: {"redacted_spans": [dict(s) for s in redaction.redacted_spans]},
       }
+
+
+  # ---- R10 collaborator DI seam (module-global; mirrors overlay/catalog.py) --------------------
+  # The ONE holder for the active IntentRedactor. P4 (submit_intent) resolves the redactor via
+  # current_intent_redactor(); P9 registers it via register_intent_redactor(...). Fail-closed if
+  # unset — the platform never silently redacts with a default the caller did not choose (§9.4).
+  _INTENT_REDACTOR: IntentRedactor | None = None
+
+
+  def register_intent_redactor(redactor: IntentRedactor) -> None:
+      """Register the process-wide IntentRedactor (last writer wins). P9 wires DefaultIntentRedactor."""
+      global _INTENT_REDACTOR
+      _INTENT_REDACTOR = redactor
+
+
+  def current_intent_redactor() -> IntentRedactor:
+      """Return the registered IntentRedactor; fail closed (RuntimeError) if none is registered."""
+      if _INTENT_REDACTOR is None:
+          raise RuntimeError(
+              "no IntentRedactor registered; call register_intent_redactor(...) "
+              "(register_sp2()/_wire does this)"
+          )
+      return _INTENT_REDACTOR
   ```
 
 - [ ] **Run it — expect pass.** `uv run pytest tests/featuregen/intake/test_redaction.py -v` — Expected: PASS.
@@ -447,7 +486,7 @@ Steps:
 `LLMClient.call(request) -> LLMResult` is the **provider seam**: adapters return a *single-shot* `LLMResult` whose `status` carries a **provider outcome token** (`PROVIDER_*`) and whose `call_ref` is the empty sentinel (the adapter does not write the record — `call_llm` stamps the real `call_ref` and maps the token to the final `STATUS_*` vocabulary). `FakeLLM` is the deterministic CI default: it keys on `(task, prompt_id, input_hash)` (input_hash via the shared `compute_input_hash`, which excludes transient `_`-prefixed keys so repair re-calls hit the same fixture) and consumes a **per-key sequence** so a script can drive `[invalid, valid]` → repaired, `[refusal]` → fail-into-clarification, etc.
 
 **Files:**
-- Create `src/featuregen/intake/llm.py` — `LLMRequest`, `LLMResult`, `LLMClient` Protocol, the `PROVIDER_*` / `STATUS_*` constants, `compute_input_hash`, `FakeResponse`, `FakeLLM`.
+- Create `src/featuregen/intake/llm.py` — `LLMRequest`, `LLMResult`, `LLMClient` Protocol, the `PROVIDER_*` / `STATUS_*` constants, `compute_input_hash`, `FakeResponse`, `FakeLLM` (**R19** `FakeLLM(script={task_key: FakeResponse(...)})` construction form + task-key fallback), and the **R10** collaborator seam `register_llm_client` / `current_llm_client`.
 - Create `tests/featuregen/intake/test_llm.py` — pure unit tests (no DB fixture).
 
 **Interfaces:**
@@ -492,9 +531,17 @@ Steps:
       provider_status: str = PROVIDER_OK
 
   class FakeLLM:                          # LLMClient; scriptable to invalid/refusal/ambiguous
-      def script(self, *, task: str, prompt_id: str,
+      # R19 canonical construction form (owner P3; P9's `_wire` uses EXACTLY this): a task-keyed
+      # script whose values are a FakeResponse or a Sequence[FakeResponse]; `.call` resolves via a
+      # task-key fallback. Constructing with no script is allowed (register scripts via `.script`).
+      def __init__(self, script: Mapping[str, "FakeResponse | Sequence[FakeResponse]"] | None = None) -> None: ...
+      def script(self, *, task: str, prompt_id: str,   # finer-grained (task,prompt_id,input_hash) builder for unit tests
                  responses: Sequence[FakeResponse], input_hash: str | None = None) -> None: ...
       def call(self, request: LLMRequest) -> LLMResult: ...
+
+  # R10 collaborator DI seam (module-global; owned by P3, imported verbatim by P4/P9). Fail-closed.
+  def register_llm_client(client: LLMClient) -> None: ...
+  def current_llm_client() -> LLMClient: ...     # raises RuntimeError if unset
   ```
 
 Steps:
@@ -571,6 +618,39 @@ Steps:
   def test_fakellm_raises_on_unscripted_key():
       with pytest.raises(KeyError):
           FakeLLM().call(_req())
+
+
+  def test_fakellm_task_key_constructor_form_with_fallback():
+      # R19 canonical construction: task-keyed script + task-key fallback (P9's `_wire` uses EXACTLY
+      # this). A request for the task resolves regardless of prompt_id / inputs.
+      fake = FakeLLM(script={"structure_intent": FakeResponse(output={"entity": "customer"})})
+      out = fake.call(_req(prompt_id="whatever.v9", inputs={"redacted_intent": "z"}))
+      assert isinstance(out, LLMResult)
+      assert out.output == {"entity": "customer"}
+      assert out.status == PROVIDER_OK
+      assert out.call_ref == ""
+
+
+  def test_fakellm_constructor_accepts_sequence_value():
+      # A task-key value may be a SEQUENCE consumed in order (drives repair/retry paths in the E2E).
+      fake = FakeLLM(script={"structure_intent": [FakeResponse(output={}, provider_status="invalid"),
+                                                  FakeResponse(output={"entity": "customer"})]})
+      r = _req()
+      assert fake.call(r).status == "invalid"
+      assert fake.call(r).status == PROVIDER_OK
+
+
+  def test_llm_client_seam_registers_and_fails_closed_when_unset():
+      # R10 module-global DI seam: current_ fails closed until register_ is called; then round-trips.
+      from featuregen.intake import llm as _lmod
+      from featuregen.intake.llm import current_llm_client, register_llm_client
+
+      _lmod._LLM_CLIENT = None  # ensure unset for a deterministic fail-closed assertion
+      with pytest.raises(RuntimeError):
+          current_llm_client()
+      fake = FakeLLM(script={"structure_intent": FakeResponse(output={"entity": "customer"})})
+      register_llm_client(fake)
+      assert current_llm_client() is fake
   ```
 
 - [ ] **Run it — expect failure.** `uv run pytest tests/featuregen/intake/test_llm.py -v` — Expected: FAIL (`ModuleNotFoundError: No module named 'featuregen.intake.llm'`).
@@ -657,14 +737,31 @@ Steps:
 
 
   class FakeLLM:
-      """Deterministic LLMClient for CI (mirrors SP-1's FixtureCatalog). Maps
-      (task, prompt_id, input_hash) -> a per-key SEQUENCE of FakeResponse consumed in order across
-      calls (so a script drives repair/retry paths), repeating the last once exhausted. `input_hash`
-      may be None to wildcard on (task, prompt_id). Hermetic: no network, required in CI (§15)."""
+      """Deterministic LLMClient for CI (mirrors SP-1's FixtureCatalog). Hermetic: no network,
+      required in CI (§15).
 
-      def __init__(self) -> None:
+      R19 canonical construction form (owner P3; P9's `_wire` uses EXACTLY this): a task-keyed
+      script passed to the constructor — `FakeLLM(script={task_key: FakeResponse(...)})` — where each
+      value is a single FakeResponse or a Sequence[FakeResponse]. `.call` resolves a request in
+      priority order: (1) the exact `(task, prompt_id, input_hash)` entry, (2) the
+      `(task, prompt_id, None)` wildcard, then (3) the **task-key fallback** keyed on `request.task`
+      alone (the constructor script). A per-key SEQUENCE is consumed in order across calls (so a
+      script drives repair/retry paths), repeating the last response once the sequence is exhausted.
+      The finer-grained `.script(...)` builder registers `(task, prompt_id, input_hash)` entries for
+      unit tests; the constructor task-key form is the one P9 wires."""
+
+      def __init__(
+          self,
+          script: Mapping[str, "FakeResponse | Sequence[FakeResponse]"] | None = None,
+      ) -> None:
           self._scripts: dict[tuple[str, str, str | None], list[FakeResponse]] = {}
+          # R19 task-key fallback: {request.task -> [FakeResponse, ...]}, matched on task alone.
+          self._task_fallback: dict[str, list[FakeResponse]] = {}
           self._calls: dict[tuple[str, str, str], int] = {}
+          for task_key, responses in (script or {}).items():
+              self._task_fallback[task_key] = (
+                  [responses] if isinstance(responses, FakeResponse) else list(responses)
+              )
 
       def script(
           self,
@@ -678,8 +775,10 @@ Steps:
 
       def call(self, request: LLMRequest) -> LLMResult:
           h = compute_input_hash(request.inputs)
-          seq = self._scripts.get((request.task, request.prompt_id, h)) or self._scripts.get(
-              (request.task, request.prompt_id, None)
+          seq = (
+              self._scripts.get((request.task, request.prompt_id, h))
+              or self._scripts.get((request.task, request.prompt_id, None))
+              or self._task_fallback.get(request.task)   # R19 task-key fallback
           )
           if not seq:
               raise KeyError(
@@ -695,6 +794,29 @@ Steps:
               call_ref="",
               status=resp.provider_status,
           )
+
+
+  # ---- R10 collaborator DI seam (module-global; mirrors overlay/catalog.py) --------------------
+  # The ONE holder for the active LLMClient. All SP-2 agent code depends on the INTERFACE, never a
+  # provider (Decision D5). P4 resolves the client via current_llm_client(); P9 registers the FakeLLM
+  # via register_llm_client(...). Fail-closed if unset — never a silent default provider.
+  _LLM_CLIENT: LLMClient | None = None
+
+
+  def register_llm_client(client: LLMClient) -> None:
+      """Register the process-wide LLMClient (last writer wins). P9 wires the FakeLLM here."""
+      global _LLM_CLIENT
+      _LLM_CLIENT = client
+
+
+  def current_llm_client() -> LLMClient:
+      """Return the registered LLMClient; fail closed (RuntimeError) if none is registered."""
+      if _LLM_CLIENT is None:
+          raise RuntimeError(
+              "no LLMClient registered; call register_llm_client(...) "
+              "(register_sp2()/_wire does this)"
+          )
+      return _LLM_CLIENT
   ```
 
 - [ ] **Run it — expect pass.** `uv run pytest tests/featuregen/intake/test_llm.py -v` — Expected: PASS.
@@ -1249,12 +1371,12 @@ Steps:
 The wrapper ties it together (overview §9.1, §9.3). Order: (1) **egress guard** — on `EgressViolation`, security-audit + re-raise (hard failure, no dispatch); (2) **idempotency** — `find_llm_call` on the full identity; reuse ⟹ return the reconstructed `LLMResult` with **no new call, no new record, no new event**; (3) **drive** the taxonomy, validating the LLM output against the registered output-schema via `DocumentSchemaRegistry(conn).validate(output_schema_id, output_schema_version, output)`; (4) **record** the `llm_call`; (5) **security-audit** on an auth failure; (6) **emit `LLM_CALL_RECORDED`** on the `feature_contract` aggregate. Returns the final `LLMResult` (`STATUS_*`) with the real `call_ref`.
 
 **Files:**
-- Modify `src/featuregen/intake/llm.py` — add imports (`time`, `append`, `DocumentSchemaRegistry`, `record_security_event`, `assert_llm_safe` + reserved keys from `redaction`) and `call_llm` (append at end).
+- Modify `src/featuregen/intake/llm.py` — add imports (`time`, the **R1** store seam `append_feature_contract_event` from `intake.store`, the **R17** `LLM_CALL_RECORDED` constant from `intake.events`, `DocumentSchemaRegistry`, `record_security_event`, `assert_llm_safe` + reserved keys from `redaction`) and `call_llm` (append at end).
 - Create `tests/featuregen/intake/test_call_llm.py` — DB-backed tests.
 
 **Interfaces:**
 - Consumes:
-  - From P1 (`sp2-01`): `featuregen.aggregates._append.append(conn, *, aggregate="feature_contract", aggregate_id, feature_contract_id, type, payload, actor, ...) -> EventEnvelope` (the `feature_contract_id=` keyword P1 adds mirroring `overlay_fact_id`); the registered `LLM_CALL_RECORDED@v1` schema via `featuregen.intake.events.register_sp2_event_types(event_registry())`; the `llm_call` table.
+  - From P1 (`sp2-01`): **R1** — `featuregen.intake.store.append_feature_contract_event(conn, *, run_id, type, payload, actor, request_id=None, provenance=None, expected_version=None, caused_by=None) -> EventEnvelope`, the ONE Feature-Contract append seam (sets `aggregate="feature_contract"`, `aggregate_id == feature_contract_id == run_id` internally — mirroring SP-1's `overlay_fact_id`). `call_llm` **IMPORTS this seam verbatim** and never calls the low-level `featuregen.aggregates._append.append` directly, nor redefines an `append_fc_event`. **R17** — the `LLM_CALL_RECORDED` constant is imported from `featuregen.intake.events` (never redeclared here); its registered `@v1` schema is provided by `featuregen.intake.events.register_sp2_event_types(event_registry())`. Also the `llm_call` table.
   - From SP-0: `featuregen.documents.registry.DocumentSchemaRegistry(conn).validate(type_name, schema_version, body)` (raises `SchemaValidationError` on an invalid structure — the output-schema resolver, per-connection, over `document_type_registry`); `featuregen.security.audit.record_security_event(conn, *, event_type, actor, attempted_action, decision, reason, aggregate, aggregate_id)`; `featuregen.contracts.IdentityEnvelope`; `featuregen.events.store.load_stream`.
   - From this module: `assert_llm_safe`, `EgressViolation`, `INPUT_KEY_REDACTION_VERSION`, `INPUT_KEY_REDACTION` (from `redaction.py`); `drive_structured_call`, `record_llm_call`, `find_llm_call`, `_result_from_record`, `compute_input_hash`, the `STATUS_*` constants.
 - Produces:
@@ -1400,23 +1522,24 @@ Steps:
   ```python
   import time
 
-  from featuregen.aggregates._append import append
   from featuregen.contracts import IdentityEnvelope
   from featuregen.contracts.identity import identity_to_jsonb
   from featuregen.documents.registry import DocumentSchemaRegistry
+  from featuregen.intake.events import LLM_CALL_RECORDED  # R17 — IMPORTED, never redeclared here
   from featuregen.intake.redaction import (
       INPUT_KEY_REDACTION,
       INPUT_KEY_REDACTION_VERSION,
       EgressViolation,
       assert_llm_safe,
   )
+  from featuregen.intake.store import append_feature_contract_event  # R1 — the ONE FC append seam (P1)
   from featuregen.security.audit import record_security_event
   ```
   Append at the end of `src/featuregen/intake/llm.py`:
   ```python
   # ---- the event-sourced wrapper (§9.1, §9.3) -------------------------------------------------
-
-  LLM_CALL_RECORDED = "LLM_CALL_RECORDED"
+  # NOTE (R17): LLM_CALL_RECORDED is IMPORTED from featuregen.intake.events (P1) above — it is the
+  # single source for the constant and is NEVER redeclared here.
 
 
   def call_llm(
@@ -1502,14 +1625,15 @@ Steps:
               aggregate_id=run_id,
           )
 
-      # 6. Emit LLM_CALL_RECORDED on the feature_contract aggregate (aggregate_id == run_id ==
-      #    feature_contract_id; the 0508 branch requires it — mirrors 0504's overlay branch). The
-      #    redacted body lives in the store (referenced by call_ref), never inlined in the event.
-      append(
+      # 6. Emit LLM_CALL_RECORDED on the feature_contract aggregate via the R1 store seam
+      #    (append_feature_contract_event sets aggregate="feature_contract" and
+      #    aggregate_id == feature_contract_id == run_id internally — mirrors 0504's overlay branch;
+      #    call_llm never touches the low-level featuregen.aggregates._append.append). The redacted
+      #    body lives in the store (referenced by call_ref), never inlined in the event. Payload is
+      #    SEMANTIC-only (R2 — no id fields; feature_contract_id/run_id ride the typed columns).
+      append_feature_contract_event(
           conn,
-          aggregate="feature_contract",
-          aggregate_id=run_id,
-          feature_contract_id=run_id,
+          run_id=run_id,
           type=LLM_CALL_RECORDED,
           payload={
               "llm_call_ref": call_ref,
