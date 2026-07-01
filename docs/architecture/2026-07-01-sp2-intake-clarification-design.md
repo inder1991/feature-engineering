@@ -72,37 +72,51 @@
 | # | Decision | Choice |
 |---|---|---|
 | D1 | Scope shape | **Definition mode end-to-end + all shared Layer-1/2 machinery**; hypothesis mode is a real flow with a **stub single-call generator** (the real engine is SP-12). |
-| D2 | Foundation | **Build on SP-0 only.** Reuse the run aggregate, staged-document DAG (incl. candidate-role docs + the document **`PRIMARY_SELECTED`** promotion for hypothesis-mode candidate selection — *not* request-level `select_candidate`, §7.1), `CLARIFICATION` gate, durable runtime, identity/SoD, audit — **no new aggregate and no event-store aggregate-CHECK** (unlike SP-1). Additive registrations: event-types, document-schemas, and **one backward-compatible human-gate/park-reason migration** (`USE_CASE_ONBOARDING` gate + `NEEDS_USE_CASE_ONBOARDING` park hold-state, mirroring SP-1's `0505`, §2.1). |
+| D2 | Foundation | **Build on SP-0 only.** Reuse the run aggregate (for the SP-0 run-lifecycle *terminal* outcomes — `reject`/`withdraw`/`park`, folded by `run_is_terminal`, `run_lifecycle.py`), staged-document DAG (incl. candidate-role docs + the document **`PRIMARY_SELECTED`** promotion for hypothesis-mode candidate selection — *not* request-level `select_candidate`, §7.1), `CLARIFICATION` gate, durable runtime, identity/SoD, audit. **The Feature Contract lifecycle is SP-2's own event-sourced `feature_contract` aggregate** — its status is **FOLDED from its event stream** (`fold_feature_contract_state`, mirroring SP-1's `overlay/state.py::fold_overlay_state`) and **validated inline** in each command handler (mirroring `overlay/confirmation_commands.py`); there is **no SP-0 run-state enum** to ride (SP-0 folds run terminality, it does not carry a `DRAFT`/`CONFIRMED_CONTRACT` run-state). Like SP-1, this adds **one new aggregate + one additive event-store aggregate-CHECK widening migration** (the same recipe as SP-1's `0504_overlay_events.sql`), **plus** one backward-compatible human-gate/park-reason migration (`USE_CASE_ONBOARDING` gate + `NEEDS_USE_CASE_ONBOARDING` park hold-state, mirroring SP-1's `0505`, §2.1). Additive registrations: FC event-types, document-schemas. |
 | D3 | Contract ownership | **SP-2 owns contract *semantics*; SP-0 owns the *envelope* + generic Draft schema** (design SP-0 §3.5, §12). Confirmed-contract content-schema is registered with SP-0's document registry. |
 | D4 | Gate #1 confirmer | **Author self-confirms** — an *audited intent lock*, not a governance approval. Confirmer MUST be the authenticated human requester (never a service or the LLM). Independent bank-grade signer is Gate #2 (SP-5) (§8). |
 | D5 | LLM reality | **`LLMClient` interface is mandatory; `FakeLLM` is the deterministic default; a real Claude adapter is shipped but config-gated, never required in CI.** Every call event-sourced; **no silent prod fallback**; structured-output → **bounded repair → fail into clarification**; **no PII to the LLM** (§9). |
 | D6 | Surface | **API/command-first, no UI** in SP-2. |
 | D7 | Catalog use | Catalog/overlay metadata used **only for normalization/ambiguity**, never as authoritative grounding (that is SP-3). SP-2 may *read* SP-1's merged-view API for names/types/grain (§4.4). |
 | D8 | Banking scope | SP-2 reads the **`BankingDomainCatalog`** (§4.5) — **SP-0-governed, read-only reference data** — as the seed for the intake banking-boundary + prohibited-class screens (§5.4, §8.4). Deterministic outcomes: out-of-scope → **`OUT_OF_SCOPE`** and prohibited class → **`PROHIBITED_DATA_CLASS`** (both fail-closed, each stamping the reason/matched-class + catalog `version`); sensitive-proxy/ambiguous → clarification / compliance review; a new banking use-case routes to onboarding, not rejection (design §15.5–15.6). *(**RATIFIED** — the user explicitly approved the catalog as SP-0-governed read-only reference data; this resolves the former §16.8 open question, now §16 register entry 8 — not a deviation.)* |
-| D9 | LLM call store | LLM call records are an **SP-2-owned immutable append-only `llm_call` record store** (mirrors SP-1's evidence store), referenced by `llm_call_ref`, classified **sensitive**, plus an `LLM_CALL_RECORDED` domain event on the run. *(SP-0's artifact enum has no LLM-call type — see §16.)* |
+| D9 | LLM call store | LLM call records are an **SP-2-owned immutable append-only `llm_call` record store** (mirrors SP-1's evidence store), referenced by `llm_call_ref`, classified **sensitive**, plus an `LLM_CALL_RECORDED` domain event on the **`feature_contract`** aggregate (§2.1 #2). *(SP-0's artifact enum has no LLM-call type — see §16.)* |
 | D10 | Content schema | **Minimum-viable** contract content-schema, not maximal — only the fields Gate #1 and SP-3 need. |
 
 ---
 
 ## 2. Foundation reuse (build on SP-0)
 
-SP-2 is a **thin domain layer over SP-0**, exactly as SP-1 is. Crucially — and unlike SP-1 — SP-2 needs **no
-new aggregate and no event-store aggregate-CHECK migration**: the whole Layer-1/2 flow rides on SP-0's
-**existing `run` aggregate**, its **DRAFT → CONFIRMED_CONTRACT** run states, its **staged-document DAG**, its
-`CLARIFICATION` human-gate, and its **document `PRIMARY_SELECTED`** candidate promotion (hypothesis-mode
-candidate selection is document-level, *not* request-level `select_candidate`, §7.1). SP-2's additions are
-**additive registrations + handlers** — **including one small backward-compatible schema migration** that adds
-a `USE_CASE_ONBOARDING` human-gate value + a `NEEDS_USE_CASE_ONBOARDING` park hold-state (§2.1, §5.4),
-mirroring SP-1's additive `0505_overlay_gates.sql`. This is honest additive surface, not zero surface: SP-0's
-base gate enum (`0070_identity_authz_gates.sql`) has no onboarding gate and base `RUN_PARKED` carries only
-`owner`/`waiting_on_fact` (`run_lifecycle.py`), so SP-2 registers both additively. What SP-2 *avoids* (unlike
-SP-1) is a **new aggregate** or an **event-store aggregate-CHECK** migration — the human-gate widening is
-neither.
+SP-2 is a **thin domain layer over SP-0**, exactly as SP-1 is — and, exactly as SP-1 did, it introduces **one
+new event-sourced aggregate of its own**: the **`feature_contract` aggregate** that carries the Feature
+Contract lifecycle. There is **no SP-0 run-state enum** for that lifecycle to ride: SP-0's `run` aggregate
+carries only *terminal* run outcomes (`RUN_REJECTED`/`RUN_CANCELLED`/`RUN_WITHDRAWN`/`RUN_PARKED`), folded from
+the stream by `run_is_terminal` (`run_lifecycle.py`) — it has no `DRAFT`/`CONFIRMED_CONTRACT` run-state, and
+its `run_workflow_state` projection is an unwired sample (never authoritative). SP-2 therefore **folds the
+contract lifecycle from the `feature_contract` event stream** (`fold_feature_contract_state`, mirroring
+SP-1's `overlay/state.py::fold_overlay_state`) and **validates every advance inline** in the command handlers
+(mirroring `overlay/confirmation_commands.py` gating on the folded `status`, incl. a no-regression guard) —
+**not** via SP-0's declarative `state_machine/engine.py`, which is built-but-**unused** (SP-1 deliberately did
+not wire it), and **not** via the document `Stage` enum (that is artifact taxonomy, §4.6). The contract
+lifecycle **emits** SP-0 `Stage`-typed documents (`DRAFT_CONTRACT`/`ASSUMPTION_LEDGER`/`CONFIRMED_CONTRACT`) as
+its write-once artifacts on the **staged-document DAG**, uses the `CLARIFICATION` human-gate, and reuses the
+**document `PRIMARY_SELECTED`** candidate promotion (hypothesis-mode candidate selection is document-level,
+*not* request-level `select_candidate`, §7.1). SP-2's additions are **additive registrations + handlers** plus
+**two small backward-compatible migrations, both mirroring SP-1's precedents:** (i) an **event-store
+aggregate-CHECK widening** that admits the new `feature_contract` aggregate (the same recipe as SP-1's
+`0504_overlay_events.sql` — widen `events_aggregate_check`, add a typed mirror-id column, rebuild
+`events_aggregate_id_consistent` with a `feature_contract` branch, add a partial index), and (ii) a gate/park
+migration that adds a `USE_CASE_ONBOARDING` human-gate value + a `NEEDS_USE_CASE_ONBOARDING` park hold-state
+(§2.1, §5.4), mirroring SP-1's `0505_overlay_gates.sql`. This is honest additive surface: SP-0's base gate enum
+(`0070_identity_authz_gates.sql`) has no onboarding gate and base `RUN_PARKED` carries only
+`owner`/`waiting_on_fact` (`run_lifecycle.py`), so SP-2 registers both additively; and, exactly like SP-1's
+`0504`, the aggregate-CHECK widening **adds an allowed aggregate value and rewrites no existing row**.
 
 SP-2 reuses, verbatim from SP-0:
 
-- **The event store + envelope + `global_seq`** (SP-0 §3.1) — every SP-2 action is an event on the `run`/`request`
-  aggregate with the standard identity + provenance envelope.
+- **The event store + envelope + `global_seq`** (SP-0 §3.1) — every SP-2 action is an event with the standard
+  identity + provenance envelope: the contract-lifecycle events on SP-2's own **`feature_contract`** aggregate
+  (§4.6, §11), the terminal run outcomes (`reject`/`withdraw`/`park`) on SP-0's **`run`** aggregate, correlated
+  by `request_id`/`run_id`.
 - **The staged-document DAG** (SP-0 §3.4) — the Draft Contract, Assumption Ledger, and Confirmed Contract are
   **frozen, content-hashed, DAG-linked documents** (`derived_from`/`supersedes`), with candidate/primary
   branch roles and `PRIMARY_SELECTED` events (used for multi-candidate hypothesis mode, §7).
@@ -111,8 +125,10 @@ SP-2 reuses, verbatim from SP-0:
   in and validates the *semantics*** (§4). SP-0 validates envelope + required-field presence; **semantic
   validation is SP-2's** (SP-0 §3.5:184).
 - **The document/artifact schema registry** (SP-0 §3.7) — SP-2 registers versioned content-schemas for
-  `DRAFT_CONTRACT`, `ASSUMPTION_LEDGER`, and `CONFIRMED_CONTRACT` (already in SP-0's published stage enum) with
-  total/chained reader-upcasters. The stage enum is **not** extended.
+  `DRAFT_CONTRACT`, `ASSUMPTION_LEDGER`, and `CONFIRMED_CONTRACT` (already in SP-0's published document `Stage`
+  enum, `contracts/documents.py`) with total/chained reader-upcasters. The stage enum is **not** extended.
+  These are **write-once artifact *kinds*** the contract *emits* — an artifact taxonomy, **not** the folded
+  contract lifecycle status (the `DRAFT_CONTRACT`/`CONFIRMED_CONTRACT` name-collision is resolved in §4.6).
 - **The human-gate task model** (SP-0 §7) — the `CLARIFICATION` gate already exists with
   `allowed_responses: [confirm, edit, reject]`, `required_inputs`, `task_version`, quorum, and the
   `open | answered | conflict | expired | cancelled | superseded` lifecycle. SP-2 uses it directly for the
@@ -128,8 +144,10 @@ SP-2 reuses, verbatim from SP-0:
   top (§8.2, §6.5, §2.1) — additive, in SP-2's own handlers, changing no SP-0 row. **On gate/park vocabulary
   SP-2 is *additive*, not zero-surface:** it registers **one new human-gate value + one park hold-state**
   (`USE_CASE_ONBOARDING` gate / the `NEEDS_USE_CASE_ONBOARDING` park-reason, §5.4, §11) via a small
-  backward-compatible migration — exactly as SP-1 added its overlay gates (`0505_overlay_gates.sql`), §2.1 —
-  while adding **no new run aggregate and no event-store aggregate-CHECK** (§2).
+  backward-compatible migration — exactly as SP-1 added its overlay gates (`0505_overlay_gates.sql`), §2.1.
+  The Feature Contract lifecycle itself rides SP-2's **own `feature_contract` aggregate** (folded status +
+  inline guards, §4.6, §11), admitted by an additive event-store aggregate-CHECK widening that mirrors SP-1's
+  `0504_overlay_events.sql` (§2, §2.1) — not any SP-0 run-state enum.
 - **The durable runtime** (SP-0 §5) — outbox, idempotent handlers, durable timers (clarification-SLA →
   reminder → escalation → auto-park), bounded retries with hard loop limits (used to bound the Refinement
   Loop, §6.6), and the atomic one-transaction-per-step boundary.
@@ -138,23 +156,36 @@ SP-2 reuses, verbatim from SP-0:
 
 ### 2.1 Additive SP-0 registrations SP-2 ships (all backward-compatible)
 
-1. **Event types** registered in SP-0's event-type registry (SP-0 §3.3), schema-owned by SP-2, emitted on the
-   `run` aggregate: `INTENT_SUBMITTED`, `DRAFT_CONTRACT_PRODUCED`, `CONTRACT_CRITIQUED`,
+1. **The `feature_contract` aggregate + an additive event-store aggregate-CHECK migration** (mirroring SP-1's
+   `0504_overlay_events.sql`) — SP-2's Feature Contract lifecycle is its own event-sourced aggregate, admitted
+   by **widening `events_aggregate_check` to include `'feature_contract'`, adding the typed mirror-id column,
+   rebuilding `events_aggregate_id_consistent` with a `feature_contract` branch, and adding a partial index**,
+   exactly as SP-1 admitted its `overlay` aggregate. This **adds an allowed aggregate value and rewrites no
+   existing row** (additive, backward-compatible — like `0504`). The aggregate's status is **folded** from its
+   event stream (`fold_feature_contract_state`, §4.6, §11), never read from a projection.
+2. **Event types** registered in SP-0's event-type registry (SP-0 §3.3), schema-owned by SP-2 — the
+   contract-lifecycle events emitted on the **`feature_contract`** aggregate: `INTENT_SUBMITTED`,
+   `DRAFT_CONTRACT_PRODUCED`, `CONTRACT_CRITIQUED`,
    `FIELD_AUTO_RESOLVED`, `CLARIFICATION_REQUESTED`, `CLARIFICATION_ANSWERED` (a thin domain shadow of the
    SP-0 gate answer, carrying the re-normalization trigger), `CONTRACT_REFINED`, `MINIMUM_CONTRACT_VALIDATED`,
    `CONTRACT_CONFIRMED`, `USE_CASE_ONBOARDING_REQUESTED` (a new banking use-case parked for governance
    onboarding, §5.4, §11), `INTENT_REJECTED` (carrying the deterministic banking-boundary classification
    reason — `OUT_OF_SCOPE` or `PROHIBITED_DATA_CLASS` — plus the `BankingDomainCatalog` version, §5.4, §8.4),
-   and `LLM_CALL_RECORDED` (§9.3).
-2. **Document content-schemas** for `DRAFT_CONTRACT`, `ASSUMPTION_LEDGER`, `CONFIRMED_CONTRACT` registered in
-   SP-0's document registry (SP-0 §3.7), versioned, with reader-upcasters (§4).
-3. **The `llm_call` immutable record store** — a new SP-2-owned append-only table (an SP-0-style write-once
+   and `LLM_CALL_RECORDED` (§9.3). The **terminal run outcomes** (`RUN_REJECTED`/`RUN_WITHDRAWN`/`RUN_PARKED`)
+   are emitted on SP-0's `run` aggregate via its existing lifecycle commands (§5.4, §11).
+3. **Document content-schemas** for `DRAFT_CONTRACT`, `ASSUMPTION_LEDGER`, `CONFIRMED_CONTRACT` registered in
+   SP-0's document registry (SP-0 §3.7), versioned, with reader-upcasters (§4). These are the write-once
+   `Stage` artifacts the contract *emits* — an artifact taxonomy, not the folded lifecycle status (§4.6).
+4. **The `llm_call` immutable record store** — a new SP-2-owned append-only table (an SP-0-style write-once
    artifact, like SP-1's `overlay_evidence`), referenced by `llm_call_ref`, **classified sensitive /
-   governance-retained / read-controlled** (§9.3). This is *not* an event aggregate and needs no CHECK change.
-4. **Handlers + a lifecycle guard set** wired into SP-0's durable runtime for the Layer-1/2 flow (§11), and
-   the SP-2 lifecycle guards registered in SP-0's predicate registry (SP-0 §4.1) so the DRAFT →
-   CONFIRMED_CONTRACT transition is machine-checkable — **including the SP-2-built request-owner guard** that
-   SP-0 authz does **not** provide. SP-0 admits the `data_scientist` role generally (`authz_policy`, SP-0 §6.2)
+   governance-retained / read-controlled** (§9.3). This is a *table*, **not** an event aggregate, so it needs
+   no aggregate-CHECK change (distinct from the `feature_contract` aggregate of #1).
+5. **Handlers + an inline lifecycle-guard set** wired into SP-0's durable runtime for the Layer-1/2 flow (§11):
+   each command handler **folds the `feature_contract` status** (`fold_feature_contract_state`) and **validates
+   the advance inline before appending** (mirroring `overlay/confirmation_commands.py`, incl. a no-regression
+   guard) — **not** via SP-0's built-but-unused `state_machine/engine.py`. This guard set **includes the
+   SP-2-built request-owner guard** that SP-0 authz does **not** provide. SP-0 admits the `data_scientist` role
+   generally (`authz_policy`, SP-0 §6.2)
    and `submit_human_signal` never checks the acting `subject` against `eligible_assignees`; SP-2 therefore
    pins the acting `subject` to the request owner via `actor_is_request_owner` (at `answer_clarification`,
    §6.5) and `confirmer_is_requester_human` = `actor_is_request_owner ∧ actor_kind==human` (at
@@ -166,16 +197,20 @@ SP-2 reuses, verbatim from SP-0:
    SP-0 row**, so SoD holds — the validator-only `reject` and the data-scientist-owned `withdraw`
    (`authz/policy.py:41`) are untouched, and **requester-initiated abandonment reuses that existing `withdraw`,
    not `reject`.**
-5. **One additive human-gate + park-reason registration** — a small backward-compatible migration (mirroring
+6. **One additive human-gate + park-reason registration** — a small backward-compatible migration (mirroring
    SP-1's `0505_overlay_gates.sql`) that **widens SP-0's `human_tasks` gate CHECK** with a new
    `USE_CASE_ONBOARDING` gate value and registers the **`NEEDS_USE_CASE_ONBOARDING` park hold-state** as an
    additive `RUN_PARKED` park-reason (§5.4, §11). This is *required* because SP-0's base gate enum
    (`0070_identity_authz_gates.sql`: `CLARIFICATION`/`DATA_STEWARD`/`COMPLIANCE`/`INDEPENDENT_VALIDATION`/
    `FINAL_APPROVAL`) has **no** onboarding gate and base `RUN_PARKED` carries **only** `owner`/`waiting_on_fact`
-   (`run_lifecycle.py`). It only widens a CHECK / adds allowed values — it changes no existing row and adds no
-   new *aggregate*, so it is **not** an event-store aggregate-CHECK migration.
+   (`run_lifecycle.py`). It only widens a gate CHECK / adds allowed values — distinct from the
+   `feature_contract` **event-store** aggregate-CHECK widening of #1 (SP-1 shipped the analogous pair,
+   `0504` + `0505`). SP-2 opens the onboarding gate task and parks; it **does not build the onboarding-answer /
+   resolution workflow** (deferred, §14), so **no onboarding-answer authz row is added**.
 
-All five are additive and backward-compatible; no existing SP-0 row, document, or event is rewritten.
+All six are additive and backward-compatible; no existing SP-0 row, document, or event is rewritten — the two
+CHECK widenings (the `feature_contract` aggregate value of #1, the gate/park values of #6) only *add* allowed
+values, exactly as SP-1's `0504`/`0505` did.
 
 ---
 
@@ -250,7 +285,7 @@ resolved, method chosen, no unresolved high-ambiguity field, in-banking-scope �
 Validation of §6.7). A Draft with a non-empty `open_fields` cannot pass Gate #1 (SP-0 §3.5:182).
 
 **These content-schemas are AUTHORITATIVE, not illustrative.** The JSON blocks in §4.1–§4.3 are worked
-examples *of* the authoritative content-schemas SP-2 registers in SP-0's document registry (§2.1 #2); the
+examples *of* the authoritative content-schemas SP-2 registers in SP-0's document registry (§2.1 #3); the
 registered schemas — **required fields, stable field paths, closed enum vocabularies, the `UNKNOWN`
 representation, and reader-upcasters** — are the contract SP-3 and Gate #1 bind to, shown as
 **Authoritative content-schema** blocks alongside each example below.
@@ -274,7 +309,7 @@ SP-0's `validate_draft` rejects any `UNKNOWN`-valued field absent from `open_fie
 **Confirmed** contract carries **no** `UNKNOWN` and an **empty** `open_fields` (§4.2, §6.7).
 
 **Upcaster rules (schema evolution).** Each content-schema is versioned (`schema_version`); every version bump
-ships a **total, chained reader-upcaster** registered in SP-0's document registry (SP-0 §3.7, §2.1 #2) mapping
+ships a **total, chained reader-upcaster** registered in SP-0's document registry (SP-0 §3.7, §2.1 #3) mapping
 v(n-1) → v(n). Readers always read a frozen document **through the chain to the current version**; upcasts are
 **pure, deterministic, and additive-only** — new optional fields are defaulted, renamed fields are mapped
 (e.g. Draft `entity_grain` → Confirmed `feature_grain`, §4.2), and a closed-enum **addition** is
@@ -644,6 +679,28 @@ the classifier contract **total**.
   context. If it is **absent**, the scope cannot be resolved → the outcome is **ambiguity → clarification**
   (§6.2), never a silent pass.
 
+### 4.6 The `feature_contract` aggregate *status* vs. the emitted `Stage` documents (name-collision resolved)
+
+The Feature Contract has **three distinct notions of "state," and only one is authoritative for command
+decisions.** Confusing them is the over-claim this section exists to prevent:
+
+| Concept | What it is | Where it lives | Authoritative for? |
+|---|---|---|---|
+| **`feature_contract` aggregate status** | SP-2's **event-sourced lifecycle**, **FOLDED** from the aggregate's event stream by `fold_feature_contract_state(stream) -> FeatureContractState` (mirroring SP-1's `overlay/state.py::fold_overlay_state`). Closed status vocabulary: `NEEDS_CLARIFICATION → MINIMUM_CONTRACT_VALIDATED → CONFIRMED`, plus the branch/terminal statuses `OUT_OF_SCOPE`, `PROHIBITED_DATA_CLASS`, `NEEDS_USE_CASE_ONBOARDING`. | Derived at read time from the `feature_contract` stream (never a stored enum, never a projection row). | **YES — every command handler folds this and gates inline on it (§11).** |
+| **Document `status` field** | A per-document body field: `NEEDS_CLARIFICATION` on a Draft, `CONFIRMED` on a Confirmed (§4.0 closed enums). | Inside each frozen `DRAFT_CONTRACT` / `CONFIRMED_CONTRACT` body. | Content validation of that one document only — **not** the lifecycle. |
+| **Document `Stage` artifact kind** | SP-0's `contracts/documents.py::Stage` enum — `DRAFT_CONTRACT` / `ASSUMPTION_LEDGER` / `CONFIRMED_CONTRACT`: **write-once artifact *kinds*** (an artifact taxonomy), linked on the DAG by `derived_from`/`supersedes`. | The staged-document DAG. | Identifying *which kind of artifact* a document is — **not** a lifecycle that "advances." |
+
+**Resolving the `DRAFT_CONTRACT` / `CONFIRMED_CONTRACT` name-collision.** These names appear as **both** a
+`Stage` artifact kind **and** (coincidentally) evoke the lifecycle — but they are **not** lifecycle statuses.
+`Stage.DRAFT_CONTRACT` and `Stage.CONFIRMED_CONTRACT` are the **kinds of write-once document the contract
+*emits*** as it advances; the contract *advancing* is the **folded `feature_contract` status** changing. The
+contract at status `MINIMUM_CONTRACT_VALIDATED` is still carrying its `DRAFT_CONTRACT`-kind document; a status
+`CONFIRMED` is what *causes* a `CONFIRMED_CONTRACT`-kind document to be emitted. Likewise, hypothesis
+candidates are candidate-role `DRAFT_CONTRACT` documents and **`PRIMARY_SELECTED`** is per-stage candidate
+*promotion* (§7.1) — **not** a lifecycle advance. There is **no** SP-0 "run-state," **no** document-`Stage`
+transition machine, **no** `run_workflow_state` row, and **no** `state_machine/engine.py` involved in deciding
+whether the contract may advance — that decision is **only** the folded status, checked inline (§11).
+
 ---
 
 ## 5. Layer 1 — Intake & Normalization
@@ -667,8 +724,8 @@ Draft Feature Contract + Assumption Ledger.
 
 ```
 submit_intent(request)                                   authz: data scientist (request owner) or service:intake-agent
-  └─ create_request (SP-0) + create_run (SP-0) → run in DRAFT
-  └─ classify raw intent (SP-0-owned envelope classification → raw_input_classification, §9.4) → hold raw text in encrypted blob (SP-0 §9); emit INTENT_SUBMITTED
+  └─ create_request (SP-0) + create_run (SP-0)  → open the feature_contract aggregate (folded status NEEDS_CLARIFICATION, §4.6)
+  └─ classify raw intent (SP-0-owned envelope classification → raw_input_classification, §9.4) → hold raw text in encrypted blob (SP-0 §9); emit INTENT_SUBMITTED (on feature_contract)
   └─ banking-boundary classification (§5.4, over BankingDomainCatalog §4.5)
         ├─ out of banking scope   ──▶ OUT_OF_SCOPE → reject_intent → INTENT_REJECTED / park  (platform/service-issued; reason + catalog version)
         ├─ prohibited data class  ──▶ PROHIBITED_DATA_CLASS → reject_intent → INTENT_REJECTED  (platform/service-issued; matched class + catalog version)
@@ -688,8 +745,10 @@ submit_intent(request)                                   authz: data scientist (
      emit DRAFT_CONTRACT_PRODUCED   ──▶  hand to Layer 2 (§6)
 ```
 
-The run sits in SP-0's **DRAFT** run-state until Gate #1; **no downstream command may advance it** to
-`CONFIRMED_CONTRACT` while `open_fields` is non-empty (guard `open_fields_empty`, §11).
+The `feature_contract` aggregate holds folded status **`NEEDS_CLARIFICATION`** until Gate #1 (§4.6); **no
+command may fold it to `CONFIRMED`** while `open_fields` is non-empty — each handler folds the status and
+checks the inline guard `open_fields_empty` before appending (§11). (There is no SP-0 "DRAFT run-state"; the
+`DRAFT_CONTRACT` document kind is the emitted artifact, §4.6.)
 
 ### 5.3 No-silent-assumption rule
 
@@ -736,7 +795,7 @@ recorded here at intake is **re-evaluated at confirmation** for drift (§4.5(d),
 classifier* decided (running as the `service:intake-agent` principal), **not** a validator. They therefore do
 **not** reuse SP-0's `reject` command, whose authz is **validator-only** (`authz/policy.py:42`); reusing it
 would misattribute a platform decision to a human validator. SP-2 issues them via its own platform/service
-action **`reject_intent`** (→ SP-0 `RUN_REJECTED`) under an **additive service authz row** (§2.1 #4). By
+action **`reject_intent`** (→ SP-0 `RUN_REJECTED`) under an **additive service authz row** (§2.1 #5). By
 contrast, **requester-initiated abandonment** — the *author* choosing to walk away from their own intent (e.g.
 rather than edit a blocked or looping one) — reuses SP-0 **`withdraw`** (→ `RUN_WITHDRAWN`), which is
 **data-scientist-owned** (`authz/policy.py:41`), never the validator-only `reject`.
@@ -746,7 +805,7 @@ A **new banking use-case** — a request that is *in-scope* banking but matches 
 **`NEEDS_USE_CASE_ONBOARDING`** and emits **`USE_CASE_ONBOARDING_REQUESTED`**, which opens a **governance
 use-case-onboarding human-gate task** (SP-0's human-gate task model, owned by governance). Both the
 `NEEDS_USE_CASE_ONBOARDING` park hold-state and the `USE_CASE_ONBOARDING` gate value are **additive
-registrations SP-2 ships** (§2.1 #5) — SP-0's base `RUN_PARKED` payload carries only `owner`/`waiting_on_fact`
+registrations SP-2 ships** (§2.1 #6) — SP-0's base `RUN_PARKED` payload carries only `owner`/`waiting_on_fact`
 (`run_lifecycle.py`) and its base gate enum has no onboarding gate (`0070`), so SP-2 registers both via a small
 backward-compatible migration (mirroring SP-1's `0505_overlay_gates.sql`). **SP-2 only routes/parks: the
 onboarding *workflow* itself is out of SP-2 build scope** (§14) — SP-2 defines the park state + the routing
@@ -873,7 +932,8 @@ one on the DAG — full history is retained for audit.
 ### 6.7 Minimum Contract Validation (the deterministic checklist that gates Gate #1)
 
 Before Gate #1 can open, a **deterministic checklist** must pass (design §3:104). It is pure and
-machine-checkable (registered as SP-0 lifecycle guards, §11). All must hold:
+machine-checkable — evaluated **inline** by the command handler against the folded `feature_contract` status
+(the `minimum_contract_validated` guard, §4.6, §11), **not** via the state-machine engine. All must hold:
 
 1. **Grain resolved** — `entity` and the grain the **Draft carries** (`entity_grain`, §4.1) are present and
    non-`UNKNOWN`. (At confirmation this is persisted as `feature_grain` + the derived `entity_key`, §4.2 —
@@ -983,7 +1043,8 @@ code exists). The confirmer then either:
 - **Hypothesis mode:** *picks the calculation method from the scored candidates* (a document-candidate
   **`PRIMARY_SELECTED`** promotion of the chosen candidate doc, §7.1 — not request-level `select_candidate`),
 
-producing the **Confirmed Feature Contract** (§4.2) and moving the run DRAFT → **CONFIRMED_CONTRACT**.
+producing the **Confirmed Feature Contract** (§4.2) and folding the `feature_contract` status to **`CONFIRMED`**
+(emitting the `CONFIRMED_CONTRACT` document, §4.6).
 
 ### 8.2 Confirmer guardrails (verbatim intent of Decision D4)
 
@@ -1054,7 +1115,7 @@ Two deterministic screens run before / at Gate #1:
      Refinement Loop) or **withdraws** it — a *requester-initiated abandonment* that reuses **SP-0 `withdraw`**
      (data-scientist-owned, `authz/policy.py:41`, → `RUN_WITHDRAWN`); independently, the **platform** records
      the deterministic block as its own **platform/service-issued terminal outcome** (`reject_intent` →
-     `RUN_REJECTED`, additive service authz §2.1 #4), with the matched class + catalog `version`. **Neither path
+     `RUN_REJECTED`, additive service authz §2.1 #5), with the matched class + catalog `version`. **Neither path
      reuses SP-0's validator-only `reject`** (`authz/policy.py:42`): the classifier is not a validator, and the
      requester owns `withdraw`, not `reject`. This is a **deterministic** ruleset over the catalog's blocked
      classes, **not** an LLM judgement. *(The concrete ruleset mechanism was a reasonable call, §16.)*
@@ -1076,8 +1137,10 @@ Two deterministic screens run before / at Gate #1:
 ### 8.5 Output
 
 On success: the **Confirmed Feature Contract** (§4.2), a frozen document `derived_from` the final Draft, is
-the primary artifact of the CONFIRMED_CONTRACT stage — **the input to SP-3 grounding** (§10). The run is now
-in SP-0's `CONFIRMED_CONTRACT` run-state; only now may it be handed downstream.
+the primary artifact of the `CONFIRMED_CONTRACT` **document stage** — **the input to SP-3 grounding** (§10).
+The `feature_contract` aggregate's folded status is now **`CONFIRMED`** (§4.6); only now — with that folded
+status confirmed — may the contract be handed downstream. (The `CONFIRMED_CONTRACT` here is the emitted
+artifact *kind*, distinct from the folded status `CONFIRMED`, §4.6.)
 
 ### 8.6 The Gate #1 task lifecycle (open / confirm / edit / OCC)
 
@@ -1098,8 +1161,8 @@ lifecycle (SP-0 §7).
   behind an open gate.)
 - **`confirm_contract`** — the **`confirm`** response on the Gate #1 task. It writes `CONTRACT_CONFIRMED` + the
   frozen Confirmed-Contract document (§4.2, §8.3) — and in hypothesis mode the **document `PRIMARY_SELECTED`**
-  candidate promotion (§7.1) — and drives the DRAFT → CONFIRMED_CONTRACT transition (guards of §11). The Gate
-  #1 task moves to `answered`.
+  candidate promotion (§7.1) — folding the `feature_contract` status to **`CONFIRMED`** (checked inline against
+  the §11 guards before the append). The Gate #1 task moves to `answered`.
 - **`request_edit`** — the **`edit`** response on the Gate #1 task: a human field edit *at the gate*. It
   produces a **REVISED Draft version** — a new frozen Draft document that `supersedes` the prior on the DAG —
   captures the change in the confirmation `human_edits` list (§8.3), and **re-runs Minimum Contract Validation**
@@ -1156,7 +1219,7 @@ structure enters a document.
 
 **Output-schema constraint — no PHI/PII in the schema itself (Anthropic structured-output requirement).** The
 `output_schema` is a **registered, versioned, static artifact** (identified by `output_schema_id` /
-`output_schema_version`, §2.1 #2, §4) that the provider **server-side compiles and caches across calls** —
+`output_schema_version`, §2.1 #3, §4) that the provider **server-side compiles and caches across calls** —
 unlike the per-request redacted `inputs`. Its **property names, `enum` values, `const`s, and `description`s
 must therefore carry no PHI/PII** — only structural / vocabulary metadata. This mirrors the §9.4 no-PII
 boundary for the *schema* dimension: `inputs` is redacted per call, but a schema that embedded a customer
@@ -1203,8 +1266,8 @@ runtime **bounded-retry primitive with hard loop limits** (SP-0 §5), so no retr
 ### 9.3 Every call is event-sourced (the `llm_call` record + `LLM_CALL_RECORDED` event)
 
 Each `LLMClient.call` writes **one immutable record** to the SP-2-owned append-only `llm_call` store and emits
-an `LLM_CALL_RECORDED` event on the run referencing it by `call_ref`. The record captures **the full,
-reproducible provenance of the call** (Decision D5):
+an `LLM_CALL_RECORDED` event on the **`feature_contract`** aggregate (§2.1 #2) referencing it by `call_ref`.
+The record captures **the full, reproducible provenance of the call** (Decision D5):
 
 ```
 { llm_call_ref, run_id, task, provider, model, prompt_id, prompt_version,
@@ -1318,12 +1381,15 @@ agent, no document, and no gate.
 
 ### 10.1 Consumes (SP-0)
 
-Event store + envelope; staged-document DAG + document registry (incl. the document **`PRIMARY_SELECTED`**
-candidate-promotion primitive SP-2 uses for Gate #1 selection, §7.1); the run aggregate +
-DRAFT/CONFIRMED_CONTRACT states + the lifecycle command catalog (`create_request`, `create_run`,
-`submit_human_signal`, `park`/`unpark`, and `withdraw` for requester abandonment → `RUN_WITHDRAWN` — but
+Event store + envelope (SP-2 adds its **own `feature_contract` aggregate** via an additive aggregate-CHECK
+widening, mirroring SP-1's `0504`, §2.1 #1); staged-document DAG + document registry (incl. the document
+**`PRIMARY_SELECTED`** candidate-promotion primitive SP-2 uses for Gate #1 selection, §7.1); the run aggregate
+for its **terminal** outcomes (folded by `run_is_terminal`; SP-0 has **no** `DRAFT`/`CONFIRMED_CONTRACT`
+run-state — those are document `Stage` kinds, §4.6) + the lifecycle command catalog (`create_request`,
+`create_run`, `submit_human_signal`, `park`/`unpark`, and `withdraw` for requester abandonment →
+`RUN_WITHDRAWN` — but
 **not** SP-0's **validator-only** `reject`, which SP-2 never invokes from the requester/service path; SP-2's
-deterministic intake rejection is its own platform/service `reject_intent`, §2.1 #4, §5.4); the `CLARIFICATION`
+deterministic intake rejection is its own platform/service `reject_intent`, §2.1 #5, §5.4); the `CLARIFICATION`
 human-gate; identity/authz + structural
 SoD + the security-audit stream; the durable runtime (outbox, timers, bounded retries); privacy/retention
 (encrypted raw-intent blob, body classification). (SP-0 §§3–9.)
@@ -1347,8 +1413,19 @@ Ledger and confirmation record, is SP-2's sole downstream output — the **input
 
 ## 11. State machine / contract lifecycle
 
-SP-2 spans SP-0's run-state **DRAFT → CONFIRMED_CONTRACT** (SP-0 §4.3). Internally, the contract advances
-through SP-2 sub-states (all while the SP-0 run-state is `DRAFT`, until Gate #1):
+The Feature Contract lifecycle is a **fold + inline-guard** state machine over SP-2's own **`feature_contract`
+event stream** — **not** an SP-0 run-state (there is none: SP-0 only folds run *terminality*, `run_is_terminal`),
+**not** a document-`Stage` transition (that enum is artifact taxonomy, §4.6), **not** the
+`run_workflow_state` projection (unwired scaffold), and **not** the declarative `state_machine/engine.py`
+(built-but-unused — SP-1 deliberately did not wire it). Each command handler **folds the current status**
+(`fold_feature_contract_state(stream) -> FeatureContractState`, mirroring SP-1's `overlay/state.py`) and
+**validates the advance inline before appending** (mirroring `overlay/confirmation_commands.py`, incl. a
+no-regression guard). The closed status vocabulary is
+`NEEDS_CLARIFICATION → MINIMUM_CONTRACT_VALIDATED → CONFIRMED`, plus the branch/terminal statuses
+`OUT_OF_SCOPE` / `PROHIBITED_DATA_CLASS` / `NEEDS_USE_CASE_ONBOARDING` (§4.6). As the folded status advances,
+the contract **emits** its write-once `Stage` documents (`DRAFT_CONTRACT` / `ASSUMPTION_LEDGER` /
+`CONFIRMED_CONTRACT`) as DAG artifacts (§4.6) and, at the terminal/park statuses, drives the SP-0 **run**
+lifecycle commands (`reject_intent`→`RUN_REJECTED`, `withdraw`→`RUN_WITHDRAWN`, `park`→`RUN_PARKED`):
 
 ```
                               submit_intent
@@ -1362,7 +1439,7 @@ through SP-2 sub-states (all while the SP-0 run-state is `DRAFT`, until Gate #1)
                     ├── sensitive-proxy / ambiguous ─► CLARIFYING (clarification / compliance review, §6.2)
                     │        NOT terminal — routes into the clarification path
                     ├── in-banking, unknown use-case ─► NEEDS_USE_CASE_ONBOARDING  (SP-0 park + hold)
-                    │        [additive park-reason + USE_CASE_ONBOARDING gate value SP-2 registers, §2.1 #5]
+                    │        [additive park-reason + USE_CASE_ONBOARDING gate value SP-2 registers, §2.1 #6]
                     │        emit USE_CASE_ONBOARDING_REQUESTED → opens a governance onboarding
                     │        human-gate task  (the onboarding workflow itself is out of SP-2 scope, §14)
                     └── in-banking, known use-case
@@ -1393,22 +1470,27 @@ through SP-2 sub-states (all while the SP-0 run-state is `DRAFT`, until Gate #1)
                      ├── reject ─► withdraw (requester abandonment, run WITHDRAWN) | §8.4 platform block
                      └── confirm ─► confirm_contract (picks candidate via document PRIMARY_SELECTED in hypothesis mode)
                                    ▼
-                            CONFIRMED  →  run advances to CONFIRMED_CONTRACT  →  SP-3
+              status CONFIRMED  →  emits CONFIRMED_CONTRACT document  →  SP-3
 ```
 
-**Lifecycle wiring.** The DRAFT → CONFIRMED_CONTRACT transition is declared in SP-0's transition engine with
-guards registered in SP-0's predicate registry (SP-0 §4.1) — `open_fields_empty`,
-`minimum_contract_validated`, `not_prohibited_intent`, `confirmer_is_requester_human`,
-`calculation_method_chosen`. Every SP-2 command runs the transition engine (guards evaluated on frozen
-documents/version-attributes, pure/deterministic) **before** appending, so an illegal advance is rejected
-before it is written. In hypothesis mode, `calculation_method_chosen` is satisfied by a **document
+**Lifecycle wiring (fold + inline guard — NOT the engine).** The advance to folded status `CONFIRMED` is
+**not** declared in any transition engine and **not** driven by a `run_workflow_state` row. Each SP-2 command
+handler **folds the `feature_contract` status from the stream** (`fold_feature_contract_state`) and evaluates
+the inline guards — `open_fields_empty`, `minimum_contract_validated`, `not_prohibited_intent`,
+`confirmer_is_requester_human`, `calculation_method_chosen` — plus a **no-regression guard** (a fold already at
+or past a terminal/confirmed status refuses a conflicting re-advance), **pure/deterministic, before**
+appending, so an illegal advance is rejected before it is written (mirroring `overlay/confirmation_commands.py`
+gating on the folded `status`). The **authoritative state for every decision is the fold**, never a projection
+row; an optional fail-closed read-model projection (like SP-1's `OverlayProjection`) is **secondary** and never
+consulted for a command decision (§12). In hypothesis mode, `calculation_method_chosen` is satisfied by a **document
 `PRIMARY_SELECTED`** promotion of the chosen candidate doc on the **run** aggregate (§7.1) — the document-level
 primitive, *not* the request-level `select_candidate` command. The promotion payload records **only the chosen**
 doc (`{doc_id, stage}`); the rejected sibling `doc_id`s are persisted **only in the confirmation record**
 (§8.3), never via a per-doc event — documents are write-once. **Gate #1 task lifecycle (§8.6):** once
 `minimum_contract_validated` holds, `open_gate1_task` opens a **dedicated** `CLARIFICATION`-gate confirmation
 task (distinct from the per-field clarification tasks, which it **cancels**), keyed to the final Draft doc via
-`required_inputs`. The confirmer's `confirm` → `confirm_contract` (DRAFT → CONFIRMED_CONTRACT); `edit` →
+`required_inputs`. The confirmer's `confirm` → `confirm_contract` (folds status to `CONFIRMED` + emits the `CONFIRMED_CONTRACT`
+document); `edit` →
 `request_edit`, which supersedes the Draft with a **REVISED** version, re-runs MCV, and re-opens a fresh gate
 task (or re-enters the Refinement Loop); `reject` → the non-confirming exit. A `confirm`/`edit`/`reject`
 carrying a **stale `task_version`** is rejected (SP-0 `submit_human_signal` OCC, §8.6, §12) so a confirm can
@@ -1416,19 +1498,20 @@ never race a re-normalization. **The two banking-boundary rejection outcomes are
 provenance:** **`OUT_OF_SCOPE`** (reject-or-park; records the reason + catalog `version`) and
 **`PROHIBITED_DATA_CLASS`** (block/reject; records the matched class + catalog `version`) — both are the
 terminal/park refinements of the earlier generic `INTENT_REJECTED`, surfaced via the **platform/service-issued**
-`reject_intent` → `INTENT_REJECTED` / `RUN_REJECTED` (additive service authz §2.1 #4 — **not** SP-0's
+`reject_intent` → `INTENT_REJECTED` / `RUN_REJECTED` (additive service authz §2.1 #5 — **not** SP-0's
 validator-only `reject`, `authz/policy.py:42`) or an SP-0 `park`, carrying that classification reason, and both
 are **fail-closed**. The **sensitive-proxy** and
 **ambiguous** cases are **not** terminal — they route into the existing clarification path (§6.2, §6.5).
 the **platform/service-issued** `reject_intent` → `INTENT_REJECTED` terminal outcome (classification
-`OUT_OF_SCOPE` or `PROHIBITED_DATA_CLASS`; own additive service authz, §2.1 #4), a **requester-initiated
+`OUT_OF_SCOPE` or `PROHIBITED_DATA_CLASS`; own additive service authz, §2.1 #5), a **requester-initiated
 `withdraw`** (SP-0, data-scientist-owned, `authz/policy.py:41`, → `RUN_WITHDRAWN` — the author abandoning their
 own intent, e.g. a Gate #1 `reject` response), an auto-parked exhausted loop, and `NEEDS_USE_CASE_ONBOARDING`
 (a new banking use-case parked for governance onboarding, §5.4 — an **additive park hold-state +
-`USE_CASE_ONBOARDING` gate value** SP-2 registers, §2.1 #5) are the non-confirming exits. Terminal for SP-2's
-span: `CONFIRMED_CONTRACT` (hands off), `REJECTED` (platform/service-issued intake rejection), or `WITHDRAWN`
-(requester abandonment); the `NEEDS_USE_CASE_ONBOARDING` park exits SP-2 into a governance onboarding flow that
-SP-2 does not build (§14).
+`USE_CASE_ONBOARDING` gate value** SP-2 registers, §2.1 #6) are the non-confirming exits. Terminal for SP-2's
+span: folded status **`CONFIRMED`** (emits the `CONFIRMED_CONTRACT` document and hands off), or the SP-0 run
+terminals `RUN_REJECTED` (platform/service-issued intake rejection) / `RUN_WITHDRAWN` (requester abandonment);
+the `NEEDS_USE_CASE_ONBOARDING` park exits SP-2 into a governance onboarding flow that SP-2 **only routes/parks
+into and does not build** (§14) — SP-2 opens the onboarding gate task but adds no onboarding-answer authz.
 
 ---
 
@@ -1476,7 +1559,7 @@ SP-2 does not build (§14).
   (§8.2) and reject a **stale `task_version`** (OCC, §8.6). `reject_intent(run_id, actor, reason)` — the
   **platform/service-issued** deterministic-classifier terminal outcome (`INTENT_REJECTED` → SP-0
   `RUN_REJECTED`) for `OUT_OF_SCOPE`/`PROHIBITED_DATA_CLASS`, carrying its **own additive service authz**
-  (§2.1 #4, §5.4) because SP-0's `reject` is **validator-only** (`authz/policy.py:42`). **Requester-initiated
+  (§2.1 #5, §5.4) because SP-0's `reject` is **validator-only** (`authz/policy.py:42`). **Requester-initiated
   abandonment** — the author walking away (e.g. a Gate #1 `reject` response) — instead reuses **SP-0 `withdraw`**
   (data-scientist-owned, `authz/policy.py:41`, → `RUN_WITHDRAWN`), never the validator-only `reject`.
 - **Read model:** `get_contract(run_id) -> {stage, status, draft|confirmed body, assumption_ledger,
@@ -1575,9 +1658,11 @@ adapter is exercised only in an **opt-in, config-gated smoke test** never gated 
   metadata (names/types/grain) — never values — reaches the model.
 - **No silent fallback:** with the real adapter enabled-but-unavailable, the flow **fails closed into
   clarification**, and does **not** swap in `FakeLLM` (asserted via a fault-injected adapter).
-- **Lifecycle / guards:** the DRAFT → CONFIRMED_CONTRACT transition is **rejected before append** when any
-  guard fails (`open_fields_empty`, `minimum_contract_validated`, `not_prohibited_intent`,
-  `confirmer_is_requester_human`); events rebuild the read model purely from the stream (self-describing).
+- **Lifecycle / guards:** the advance to folded status `CONFIRMED` is **rejected before append** when any
+  **inline** guard fails (`open_fields_empty`, `minimum_contract_validated`, `not_prohibited_intent`,
+  `confirmer_is_requester_human`), evaluated against the `feature_contract` status folded from the stream
+  (`fold_feature_contract_state`, §4.6, §11) — **not** the state-machine engine; the fold is authoritative and
+  events rebuild any secondary read model purely from the stream (self-describing).
 - **Concurrency:** OCC serializes concurrent run writers; two concurrent candidate `PRIMARY_SELECTED`
   promotions on one run can't both win (run-stream OCC);
   a retried identical `LLMClient.call` reuses its record (no double-charge).
@@ -1589,7 +1674,7 @@ adapter is exercised only in an **opt-in, config-gated smoke test** never gated 
 | # | Point | Decision-record source | What SP-2 did / where a call was made |
 |---|---|---|---|
 | 1 | Scope shape | Decision 1 | Definition mode end-to-end + all shared machinery; hypothesis is a real flow with a single-call **stub** generator; SP-12 boundary held (§3, §7). |
-| 2 | No new aggregate | Decision (Seams) | **Reasonable call:** SP-2 rides SP-0's existing `run` aggregate + DRAFT/CONFIRMED_CONTRACT states + `CLARIFICATION` gate + the document **`PRIMARY_SELECTED`** candidate-promotion primitive (candidate selection is document-level, *not* request-level `select_candidate`, §7.1) — **no new aggregate and no event-store aggregate-CHECK migration** (unlike SP-1). Additive registrations only: event-types, document-schemas, and **one backward-compatible human-gate/park-reason migration** (`USE_CASE_ONBOARDING` gate + `NEEDS_USE_CASE_ONBOARDING` park hold-state, mirroring SP-1's `0505`, §2.1) — the base gate enum + `RUN_PARKED` payload carry neither (SP-0 `0070`, `run_lifecycle.py`). *The decision record listed the SP-0 dependencies but did not specify whether a new aggregate was needed; using the existing run spine is the minimal faithful encoding.* |
+| 2 | Contract lifecycle = own `feature_contract` aggregate (folded) | Decision (Seams); grounded against SP-0/SP-1 source | **Corrected over-claim.** An earlier draft attributed the contract lifecycle to "SP-0's `DRAFT → CONFIRMED_CONTRACT` run-states (§4.3)". A code investigation found **there is no such SP-0 run-state enum**: SP-0 only folds run *terminality* (`run_is_terminal`, `run_lifecycle.py`), `run_workflow_state.current_state` is unwired scaffold, `state_machine/engine.py` is built-but-unused, and `Stage.DRAFT_CONTRACT`/`CONFIRMED_CONTRACT` are write-once document artifact *kinds*, not a lifecycle (§4.6). So — exactly as SP-1 did — SP-2 carries the lifecycle on its **own event-sourced `feature_contract` aggregate**, whose status (`NEEDS_CLARIFICATION → MINIMUM_CONTRACT_VALIDATED → CONFIRMED` + `OUT_OF_SCOPE`/`PROHIBITED_DATA_CLASS`/`NEEDS_USE_CASE_ONBOARDING`) is **FOLDED** from its stream (`fold_feature_contract_state`, mirroring `overlay/state.py`) and **validated inline** in each handler (mirroring `overlay/confirmation_commands.py`, incl. a no-regression guard) — **not** the engine, **not** `run_workflow_state`. It still rides SP-0's run aggregate for the **terminal** outcomes, the `CLARIFICATION` gate, and the document **`PRIMARY_SELECTED`** candidate-promotion primitive (§7.1). This adds **one new aggregate + one additive event-store aggregate-CHECK widening** (mirroring SP-1's `0504_overlay_events.sql`) **plus** the additive human-gate/park migration (mirroring `0505`, §2.1) — both additive, rewriting no existing SP-0 row. |
 | 3 | Ambiguity/confidence scale + combine rule | Decision (Components) said "each field scored for ambiguity + confidence" | **Reasonable call:** fixed a **0.0–1.0** scale for both, sourced from LLM self-report **+** a deterministic catalog-cardinality check, with the platform taking the **more cautious** value on disagreement (§6.1). Scale and combine rule were not specified. |
 | 4 | Doubt Router thresholds | Decision (Components): auto-resolve vs must-ask | **Reasonable call:** `auto-resolve iff ambiguity ≤ 0.30 AND confidence ≥ 0.70 AND safe source AND not policy-sensitive AND not calc-method`; config-gated, biased toward asking (§6.2). Exact thresholds were not specified. |
 | 5 | Bounded repair budget + refusal disposition | Decision 3: "bounded repair loop → on exhaustion fail into clarification" | **Reasonable call:** default **N = 2** structured-output repair attempts for *malformed structure*, config-gated, then fail into clarification. **Refusal reclassified:** a `stop_reason == "refusal"` is a **policy decline → fail into clarification directly** (not repair — re-prompting a decline does not help), part of the full provider-failure taxonomy (§9.2, entry 16). The counts were not specified. |
@@ -1600,11 +1685,11 @@ adapter is exercised only in an **opt-in, config-gated smoke test** never gated 
 | 10 | Prohibited-intent mechanism | Decision 2: "obviously prohibited/compliance-sensitive → blocks or forces clarification; must NOT pretend to approve compliance" | **Reasonable call (mechanism); RATIFIED (contract, see entry 8).** A **deterministic** screen over the `BankingDomainCatalog` `blocked_data_classes` (§4.5): an explicit prohibited data class → **`PROHIBITED_DATA_CLASS`** block (matched class + catalog `version`) → edit-and-loop, requester **`withdraw`** (SP-0, data-scientist-owned), or the **platform/service-issued** `reject_intent` terminal outcome (not SP-0's validator-only `reject` — see entry 13); a `sensitive_proxy_hints` match is the **distinct** routing → clarification / compliance review, **not** an auto-block; never an LLM judgement, never a compliance approval (§8.4). The screen mechanism was not specified; the proxy-vs-block distinction is the user-ratified contract. |
 | 11 | Gate #1 is not four-eyes | Decision 2 | Encoded: author confirms own intent (audited intent lock); `requires_independent_validation` is a **flag only**, no second signer; independent validation is Gate #2 / SP-5 (§8.2, §8.4). |
 | 12 | Real adapter details | Decision 3: "real Claude adapter shipped, config-gated, never required in CI; no silent fallback" | Encoded with concrete Claude API: model `claude-opus-4-8`, adaptive thinking, structured outputs via `output_config.format`, `stop_reason=="refusal"` → **fail into clarification** (not repair; §9.2 taxonomy, entry 16), `stop_reason=="max_tokens"` / timeout / 429 / 5xx → bounded retry, non-retryable 4xx → fail-closed, no-PHI-in-schema (§9.1), no fallback to FakeLLM (§9.5). *Model/API specifics grounded in the current Claude API; not a deviation.* |
-| 13 | Rejection / withdrawal authority | SP-0: `reject` is **validator-only** (`authz/policy.py:42`); `withdraw` is **data-scientist-owned** (`authz/policy.py:41`) | **Corrected authority.** SP-2's deterministic intake rejections (`OUT_OF_SCOPE`/`PROHIBITED_DATA_CLASS`) are **platform/service-issued terminal outcomes** — the deterministic classifier decided, **not** a validator — issued via SP-2's own **`reject_intent`** action (→ SP-0 `RUN_REJECTED`) under **one additive service `authz_policy` row** (§2.1 #4); they do **not** reuse SP-0's validator-only `reject`. **Requester-initiated abandonment** (the author walking away — e.g. a Gate #1 `reject` response, or giving up on a blocked/looping intent) reuses **SP-0 `withdraw`** (→ `RUN_WITHDRAWN`), never `reject`. SP-0's validator-only `reject` stays reserved for independent validation (Gate #2 / SP-5). The added row **changes no existing SP-0 row**, so SoD holds. (§5.4, §8.4, §11, §13, §2.1.) |
+| 13 | Rejection / withdrawal authority | SP-0: `reject` is **validator-only** (`authz/policy.py:42`); `withdraw` is **data-scientist-owned** (`authz/policy.py:41`) | **Corrected authority.** SP-2's deterministic intake rejections (`OUT_OF_SCOPE`/`PROHIBITED_DATA_CLASS`) are **platform/service-issued terminal outcomes** — the deterministic classifier decided, **not** a validator — issued via SP-2's own **`reject_intent`** action (→ SP-0 `RUN_REJECTED`) under **one additive service `authz_policy` row** (§2.1 #5); they do **not** reuse SP-0's validator-only `reject`. **Requester-initiated abandonment** (the author walking away — e.g. a Gate #1 `reject` response, or giving up on a blocked/looping intent) reuses **SP-0 `withdraw`** (→ `RUN_WITHDRAWN`), never `reject`. SP-0's validator-only `reject` stays reserved for independent validation (Gate #2 / SP-5). The added row **changes no existing SP-0 row**, so SoD holds. (§5.4, §8.4, §11, §13, §2.1.) |
 | 14 | `BankingDomainCatalog` classifier — completeness contract | Decision 8 (ratified catalog, entry 8) *(specified the outcomes but not precedence / availability / version-stamping / drift / scope inputs)* | **Completed the classifier contract (§4.5, §5.4).** (a) **Precedence = most-restrictive-wins** (`PROHIBITED_DATA_CLASS` > `OUT_OF_SCOPE` > sensitive-proxy → clarify > ambiguous → clarify) — exactly one outcome. (b) **Catalog unavailable / unversioned → fail-closed** (park for clarification/manual; never auto-pass). (c) **Catalog `version` stamped on EVERY outcome, including CLEAR/PASS** — an allow is as auditable as a block. (d) **Version drift** — `version` recorded at intake and **re-evaluated at confirmation** (§8.4); a changed version that would flip the outcome forces **re-clarify**, never a silent stale confirm. (e) **Jurisdiction / use-case scope** needs **product/region** on the request; absent → **ambiguity → clarify**. All deterministic, all fail-closed; **extends** the ratified catalog contract (entry 8), not a deviation. (§4.5, §5.4, §6.7, §8.4.) |
 | 15 | LLM-call retention — stored-redacted, not hash-only | Decision 3: "every LLM call is event-sourced / reproducible" | **Reasonable call.** The `llm_call` record stores the **redacted (LLM-safe) input itself** (`redacted_input` + `redaction_version`), **not** a bare `input_hash` — hash-only cannot be replayed or reviewed, defeating MRM / adverse-action reproducibility. The raw intent stays in SP-0's encrypted `raw_input_ref` blob (§9.4), so the stored text is already redacted; the record is classified **sensitive / governance-retained / read-controlled** with an authorized/audited read path (§9.3). Resolves the former "`input_hash` OR redacted input" ambiguity in favour of stored-redacted for replayability. (§9.3, §9.4.) |
 | 16 | LLM idempotency key + provider-failure taxonomy + no-PHI-in-schema | Decision 3: "every LLM call is event-sourced"; Anthropic structured-output requirement | **Reasonable call (mechanism).** (a) **Idempotency key widened** to the full call identity — `(run_id, task, input_hash, provider, model, prompt_id, prompt_version, output_schema_id, output_schema_version, redaction_version, generation_settings)` — so a schema / model / prompt / redaction / settings change can never silently reuse a stale call (the old 4-tuple `run_id/task/input_hash/prompt_version` could; §9.3, §12). (b) **Full provider-failure taxonomy**, each fail-closed: invalid JSON → repair; refusal → clarification; max-token truncation / schema-too-complex / schema-compilation timeout / provider timeout / rate-limit / transient 5xx → bounded retry; non-retryable 4xx / policy → clarification/manual (§9.2). (c) **No PHI/PII in the JSON output-schema's property names, enums, or descriptions** — the schema is a registered, server-compiled, cross-call-cached artifact, so PII there would leak beyond the per-call redacted input (Anthropic structured-output requirement; §9.1, §9.5). The decision record required event-sourcing + the boundary; these are the concrete encodings. |
-| 17 | Authoritative Draft / Confirmed / Ledger content-schemas | Decision D10 (minimum-viable content schema); SP-0 `documents/draft.py` (envelope + `assumptions` + `UNKNOWN`) | **Made the schemas authoritative, not illustrative (§4.0–§4.3).** (a) Registered **JSON Schemas** for `DRAFT_CONTRACT` / `CONFIRMED_CONTRACT` / `ASSUMPTION_LEDGER` — required fields, **stable field paths**, **closed enum vocabularies**, the **`UNKNOWN`** sentinel (SP-0 `documents/draft.py:10`, must be in `open_fields`), and **total chained reader-upcasters** (SP-0 §3.7, §2.1 #2). (b) Replaced the open `calculation_method: dict` with a **versioned, tagged** structure (`method_version` + `chosen.kind` discriminated union) SP-3 switches on deterministically (§4.2, §7.1). (c) **Assumption Ledger array renamed `entries` → `assumptions`**, item `chosen_value` → **`value`**, to match SP-0's registered `ASSUMPTION_LEDGER` schema (`documents/draft.py:47`; requires `assumptions`, item `field`/`value`/`rationale`). (d) Restored the SP-0 envelope fields `raw_input_ref` / `raw_input_classification` in the **Confirmed** example so Draft and Confirmed are structurally consistent (§4.2). |
+| 17 | Authoritative Draft / Confirmed / Ledger content-schemas | Decision D10 (minimum-viable content schema); SP-0 `documents/draft.py` (envelope + `assumptions` + `UNKNOWN`) | **Made the schemas authoritative, not illustrative (§4.0–§4.3).** (a) Registered **JSON Schemas** for `DRAFT_CONTRACT` / `CONFIRMED_CONTRACT` / `ASSUMPTION_LEDGER` — required fields, **stable field paths**, **closed enum vocabularies**, the **`UNKNOWN`** sentinel (SP-0 `documents/draft.py:10`, must be in `open_fields`), and **total chained reader-upcasters** (SP-0 §3.7, §2.1 #3). (b) Replaced the open `calculation_method: dict` with a **versioned, tagged** structure (`method_version` + `chosen.kind` discriminated union) SP-3 switches on deterministically (§4.2, §7.1). (c) **Assumption Ledger array renamed `entries` → `assumptions`**, item `chosen_value` → **`value`**, to match SP-0's registered `ASSUMPTION_LEDGER` schema (`documents/draft.py:47`; requires `assumptions`, item `field`/`value`/`rationale`). (d) Restored the SP-0 envelope fields `raw_input_ref` / `raw_input_classification` in the **Confirmed** example so Draft and Confirmed are structurally consistent (§4.2). |
 
 ---
 
