@@ -72,7 +72,7 @@
 | # | Decision | Choice |
 |---|---|---|
 | D1 | Scope shape | **Definition mode end-to-end + all shared Layer-1/2 machinery**; hypothesis mode is a real flow with a **stub single-call generator** (the real engine is SP-12). |
-| D2 | Foundation | **Build on SP-0 only.** Reuse the run aggregate, staged-document DAG, `CLARIFICATION` gate, `select_candidate`, durable runtime, identity/SoD, audit — **no new aggregate** (unlike SP-1). Additive event-type + document-schema registrations only (§2). |
+| D2 | Foundation | **Build on SP-0 only.** Reuse the run aggregate, staged-document DAG (incl. candidate-role docs + the document **`PRIMARY_SELECTED`** promotion for hypothesis-mode candidate selection — *not* request-level `select_candidate`, §7.1), `CLARIFICATION` gate, durable runtime, identity/SoD, audit — **no new aggregate** (unlike SP-1). Additive event-type + document-schema registrations only (§2). |
 | D3 | Contract ownership | **SP-2 owns contract *semantics*; SP-0 owns the *envelope* + generic Draft schema** (design SP-0 §3.5, §12). Confirmed-contract content-schema is registered with SP-0's document registry. |
 | D4 | Gate #1 confirmer | **Author self-confirms** — an *audited intent lock*, not a governance approval. Confirmer MUST be the authenticated human requester (never a service or the LLM). Independent bank-grade signer is Gate #2 (SP-5) (§8). |
 | D5 | LLM reality | **`LLMClient` interface is mandatory; `FakeLLM` is the deterministic default; a real Claude adapter is shipped but config-gated, never required in CI.** Every call event-sourced; **no silent prod fallback**; structured-output → **bounded repair → fail into clarification**; **no PII to the LLM** (§9). |
@@ -89,7 +89,9 @@
 SP-2 is a **thin domain layer over SP-0**, exactly as SP-1 is. Crucially — and unlike SP-1 — SP-2 needs **no
 new aggregate and no event-store CHECK migration**: the whole Layer-1/2 flow rides on SP-0's **existing `run`
 aggregate**, its **DRAFT → CONFIRMED_CONTRACT** run states, its **staged-document DAG**, its `CLARIFICATION`
-human-gate, and its `select_candidate` command. SP-2's additions are **additive registrations + handlers**.
+human-gate, and its **document `PRIMARY_SELECTED`** candidate promotion (hypothesis-mode candidate selection is
+document-level, *not* request-level `select_candidate`, §7.1). SP-2's additions are **additive registrations +
+handlers**.
 
 SP-2 reuses, verbatim from SP-0:
 
@@ -110,10 +112,12 @@ SP-2 reuses, verbatim from SP-0:
   `open | answered | conflict | expired | cancelled | superseded` lifecycle. SP-2 uses it directly for the
   Human Clarification Gate (§6.5) and Human Gate #1 (§8).
 - **Identity + command authz + structural SoD** (SP-0 §6) — `create_request`, `create_run`,
-  `submit_human_signal(gate=CLARIFICATION)`, and `select_candidate` all already carry authz rows admitting the
+  `submit_human_signal(gate=CLARIFICATION)`, and `create_run` all already carry authz rows admitting the
   **`data_scientist` role for *any* human** (role-scoped, **not** keyed to the specific request owner — SP-0
   §6.2, `authz_policy`), plus a `service:intake-agent` service principal for system-initiated steps
-  (SP-0 §6.2). Because SP-0's role-authz and `submit_human_signal` eligibility check the *role/scope/quorum*,
+  (SP-0 §6.2). (Hypothesis-mode candidate selection is a **document `PRIMARY_SELECTED`** promotion, *not* the
+  request-level `select_candidate` command — §7.1.) Because SP-0's role-authz and `submit_human_signal`
+  eligibility check the *role/scope/quorum*,
   **not** that the acting `subject` is the task's requester, **SP-2 builds an explicit request-owner guard** on
   top (§8.2, §6.5, §2.1) — additive, in SP-2's own handlers, changing no SP-0 row. SP-2 introduces no new gate
   values.
@@ -651,9 +655,13 @@ class Candidate:
 ```
 
 Each returned candidate is written as a **candidate-role staged document** under the run's Draft stage (SP-0
-§3.4 multi-candidate support); the scientist's Gate #1 selection is an SP-0 `select_candidate` +
-`PRIMARY_SELECTED`, closing the siblings as `rejected` with a reason (§8.3). **This document/selection
-machinery is identical for the stub and for SP-12** — only the `generate` body changes.
+§3.4 multi-candidate support); the scientist's Gate #1 selection is a **document-candidate selection** — an
+SP-0 **`PRIMARY_SELECTED`** promotion of the chosen candidate doc on the **run** aggregate (SP-0 §3.4,
+`new_primary_selected` → payload `{doc_id, stage}`), recording the sibling `doc_id`s as `rejected` with a
+reason (§8.3). It is **not** the request-level `select_candidate` command, which selects among *run* candidates
+on a *request* stream (SP-0 §4.4, `request_aggregate.py`) — the wrong granularity here: SP-2's candidates are
+**documents under a single run**, not runs under a request. **This document/selection machinery is identical
+for the stub and for SP-12** — only the `generate` body changes.
 
 ### 7.2 The SP-2 stub generator (deliberately dumb, single call)
 
@@ -695,7 +703,8 @@ with their plain-English definitions + rationales** (design §14.2: the scientis
 code exists). The confirmer then either:
 
 - **Definition mode:** *confirms the faithful translation* (optionally editing a field), or
-- **Hypothesis mode:** *picks the calculation method from the scored candidates* (`select_candidate`),
+- **Hypothesis mode:** *picks the calculation method from the scored candidates* (a document-candidate
+  **`PRIMARY_SELECTED`** promotion of the chosen candidate doc, §7.1 — not request-level `select_candidate`),
 
 producing the **Confirmed Feature Contract** (§4.2) and moving the run DRAFT → **CONFIRMED_CONTRACT**.
 
@@ -703,8 +712,9 @@ producing the **Confirmed Feature Contract** (§4.2) and moving the run DRAFT �
 
 - The confirmer **MUST be the authenticated human requester** — **never a service principal, never a
   *different* data scientist, and never the LLM**. **SP-2 builds this guard; SP-0 does not enforce it.** SP-0
-  authz on `select_candidate` / `submit_human_signal(CLARIFICATION)` only admits the **`data_scientist` role
-  for any human** (SP-0 §6.2, `authz_policy`), and SP-0's `submit_human_signal` checks role/scope/quorum but
+  authz only admits the **`data_scientist` role for any human** (SP-0 §6.2, `authz_policy`) — for both the
+  `submit_human_signal(CLARIFICATION)` path and the base run rows covering the Gate #1 `PRIMARY_SELECTED`
+  promotion — and SP-0's `submit_human_signal` checks role/scope/quorum but
   **not** that the acting `subject` is in the task's `eligible_assignees` (`gates/tasks.py`) — so role-authz
   alone would let *any* data scientist confirm another's contract. SP-2 therefore adds an **explicit
   request-owner guard** in `confirm_contract` (and `answer_clarification`, §6.5): the acting human's
@@ -905,9 +915,10 @@ agent, no document, and no gate.
 
 ### 10.1 Consumes (SP-0)
 
-Event store + envelope; staged-document DAG + document registry; the run aggregate + DRAFT/CONFIRMED_CONTRACT
-states + the lifecycle command catalog (`create_request`, `create_run`, `submit_human_signal`,
-`select_candidate`, `park`/`unpark`, `reject`); the `CLARIFICATION` human-gate; identity/authz + structural
+Event store + envelope; staged-document DAG + document registry (incl. the document **`PRIMARY_SELECTED`**
+candidate-promotion primitive SP-2 uses for Gate #1 selection, §7.1); the run aggregate +
+DRAFT/CONFIRMED_CONTRACT states + the lifecycle command catalog (`create_request`, `create_run`,
+`submit_human_signal`, `park`/`unpark`, `reject`); the `CLARIFICATION` human-gate; identity/authz + structural
 SoD + the security-audit stream; the durable runtime (outbox, timers, bounded retries); privacy/retention
 (encrypted raw-intent blob, body classification). (SP-0 §§3–9.)
 
@@ -966,7 +977,7 @@ through SP-2 sub-states (all while the SP-0 run-state is `DRAFT`, until Gate #1)
                     ├── sensitive-proxy hint ──► CLARIFYING (clarification / compliance review, §6.2)
                     └── clear ─►  READY_FOR_GATE_1
                                    │
-                    Human Gate #1  (author confirms / picks candidate; requester + actor_kind=human)
+                    Human Gate #1  (author confirms / picks candidate via document PRIMARY_SELECTED; requester + actor_kind=human)
                                    ▼
                             CONFIRMED  →  run advances to CONFIRMED_CONTRACT  →  SP-3
 ```
@@ -976,7 +987,9 @@ guards registered in SP-0's predicate registry (SP-0 §4.1) — `open_fields_emp
 `minimum_contract_validated`, `not_prohibited_intent`, `confirmer_is_requester_human`,
 `calculation_method_chosen`. Every SP-2 command runs the transition engine (guards evaluated on frozen
 documents/version-attributes, pure/deterministic) **before** appending, so an illegal advance is rejected
-before it is written. **The two banking-boundary rejection outcomes are distinct and each carries its
+before it is written. In hypothesis mode, `calculation_method_chosen` is satisfied by a **document
+`PRIMARY_SELECTED`** promotion of the chosen candidate doc on the **run** aggregate (§7.1) — the document-level
+primitive, *not* the request-level `select_candidate` command. **The two banking-boundary rejection outcomes are distinct and each carries its
 provenance:** **`OUT_OF_SCOPE`** (reject-or-park; records the reason + catalog `version`) and
 **`PROHIBITED_DATA_CLASS`** (block/reject; records the matched class + catalog `version`) — both are the
 terminal/park refinements of the earlier generic `INTENT_REJECTED`, surfaced via `INTENT_REJECTED` / `reject`
@@ -1004,9 +1017,10 @@ not build (§14).
 - **Idempotency** — `submit_intent` is idempotent per request; clarification answers idempotent by
   `(task_id, subject)` (SP-0 §7); `LLMClient.call` records are keyed by `(run_id, task, input_hash,
   prompt_version)` so a retried identical call reuses its record rather than double-charging.
-- **Multi-candidate races** (hypothesis mode) — candidate documents are independent DAG writes; `select_candidate`
-  is an SP-0 CAS that mints/binds the choice and closes siblings, so two concurrent selections cannot both win
-  (SP-0 §4.4 `select_candidate`).
+- **Multi-candidate races** (hypothesis mode) — candidate documents are independent DAG writes; the Gate #1
+  choice is a single **`PRIMARY_SELECTED`** promotion on the **run** aggregate (§7.1), so the run-stream **OCC**
+  (above) serializes two concurrent promotions — only one wins; the rest stay candidate-role docs recorded as
+  `rejected` (§8.3). This is the document-primary primitive (SP-0 §3.4), *not* request-level `select_candidate`.
 - **Degraded projections fail closed** (SP-0 §3.6) — a work-queue/lifecycle projection that cannot apply an
   event blocks the affected run's commands until `resolve_degraded`, never proceeding on a false view.
 
@@ -1017,8 +1031,10 @@ not build (§14).
 - **Commands:** `submit_intent(request, intent_text, intake_mode)`; `answer_clarification(task_id, actor,
   response)` (a thin wrapper over SP-0 `submit_human_signal(gate=CLARIFICATION)` that **enforces the SP-2
   request-owner guard** — acting `subject` == request owner, else DENY + security-audit, §8.2);
-  `confirm_contract` / `select_candidate(run_id, actor, candidate_id)` (Gate #1, over SP-0 `select_candidate`,
-  likewise **request-owner + `actor_kind==human` guarded**, §8.2); `reject_intent(run_id, actor, reason)`.
+  `confirm_contract(run_id, actor, candidate_doc_id?)` (Gate #1 — in hypothesis mode selects the calculation
+  method by promoting the chosen candidate **document** via SP-0 **`PRIMARY_SELECTED`**, §7.1; **not** the
+  request-level `select_candidate` command), likewise **request-owner + `actor_kind==human` guarded** (§8.2);
+  `reject_intent(run_id, actor, reason)`.
 - **Read model:** `get_contract(run_id) -> {stage, status, draft|confirmed body, assumption_ledger,
   field_scores, open_questions}` — service-internal, for SP-3 to fetch the Confirmed Contract.
 - **The Confirmed Feature Contract document** (CONFIRMED_CONTRACT stage) — the governed hand-off artifact.
@@ -1072,7 +1088,8 @@ adapter is exercised only in an **opt-in, config-gated smoke test** never gated 
   (grain / method / high-ambiguity-open / observation-intent / in-scope / accountable-field); success emits
   `MINIMUM_CONTRACT_VALIDATED`; an under-specified contract can **never** open Gate #1.
 - **CandidateGenerator seam:** the **stub** emits 1–3 candidate documents with rationales; each is a candidate-
-  role staged doc; `select_candidate` picks one and closes siblings with reasons; `signals` carries **no**
+  role staged doc; a document **`PRIMARY_SELECTED`** promotion picks one and records the siblings as `rejected`
+  with reasons (§7.1 — not request-level `select_candidate`); `signals` carries **no**
   predictive score (no IV/WoE/AUC); the seam is generator-agnostic (a fake alternate generator plugs in
   unchanged) — proving the SP-12 boundary.
 - **Human Gate #1:** author-self-confirm produces the Confirmed Contract; **a service principal, the LLM, or a
@@ -1100,7 +1117,8 @@ adapter is exercised only in an **opt-in, config-gated smoke test** never gated 
 - **Lifecycle / guards:** the DRAFT → CONFIRMED_CONTRACT transition is **rejected before append** when any
   guard fails (`open_fields_empty`, `minimum_contract_validated`, `not_prohibited_intent`,
   `confirmer_is_requester_human`); events rebuild the read model purely from the stream (self-describing).
-- **Concurrency:** OCC serializes concurrent run writers; two concurrent `select_candidate`s can't both win;
+- **Concurrency:** OCC serializes concurrent run writers; two concurrent candidate `PRIMARY_SELECTED`
+  promotions on one run can't both win (run-stream OCC);
   a retried identical `LLMClient.call` reuses its record (no double-charge).
 
 ---
@@ -1110,7 +1128,7 @@ adapter is exercised only in an **opt-in, config-gated smoke test** never gated 
 | # | Point | Decision-record source | What SP-2 did / where a call was made |
 |---|---|---|---|
 | 1 | Scope shape | Decision 1 | Definition mode end-to-end + all shared machinery; hypothesis is a real flow with a single-call **stub** generator; SP-12 boundary held (§3, §7). |
-| 2 | No new aggregate | Decision (Seams) | **Reasonable call:** SP-2 rides SP-0's existing `run` aggregate + DRAFT/CONFIRMED_CONTRACT states + `CLARIFICATION` gate + `select_candidate` — **no event-store CHECK migration** (unlike SP-1). Additive event-type + document-schema registrations only (§2). *The decision record listed the SP-0 dependencies but did not specify whether a new aggregate was needed; using the existing run spine is the minimal faithful encoding.* |
+| 2 | No new aggregate | Decision (Seams) | **Reasonable call:** SP-2 rides SP-0's existing `run` aggregate + DRAFT/CONFIRMED_CONTRACT states + `CLARIFICATION` gate + the document **`PRIMARY_SELECTED`** candidate-promotion primitive (candidate selection is document-level, *not* request-level `select_candidate`, §7.1) — **no event-store CHECK migration** (unlike SP-1). Additive event-type + document-schema registrations only (§2). *The decision record listed the SP-0 dependencies but did not specify whether a new aggregate was needed; using the existing run spine is the minimal faithful encoding.* |
 | 3 | Ambiguity/confidence scale + combine rule | Decision (Components) said "each field scored for ambiguity + confidence" | **Reasonable call:** fixed a **0.0–1.0** scale for both, sourced from LLM self-report **+** a deterministic catalog-cardinality check, with the platform taking the **more cautious** value on disagreement (§6.1). Scale and combine rule were not specified. |
 | 4 | Doubt Router thresholds | Decision (Components): auto-resolve vs must-ask | **Reasonable call:** `auto-resolve iff ambiguity ≤ 0.30 AND confidence ≥ 0.70 AND safe source AND not policy-sensitive AND not calc-method`; config-gated, biased toward asking (§6.2). Exact thresholds were not specified. |
 | 5 | Bounded repair budget | Decision 3: "bounded repair loop → on exhaustion fail into clarification" | **Reasonable call:** default **N = 2** structured-output repair attempts, config-gated, then fail into clarification; refusal treated as invalid (§9.2). The count was not specified. |
@@ -1159,7 +1177,8 @@ will be set true. Prohibited-intent screen (§8.4, over `BankingDomainCatalog`):
 permitted, non-blocked credit-risk label — a `sensitive_proxy_hints` match here routes to **clarification /
 compliance review** with the requester; had it named a `blocked_data_classes` protected attribute it would
 **block as `PROHIBITED_DATA_CLASS`** (matched class + catalog `version` recorded). At **Gate #1** the
-requester reviews the three rationales + the Assumption Ledger, **picks one candidate** (`select_candidate`,
-siblings closed with reasons), confirms the pinned target → **Confirmed Contract** with
+requester reviews the three rationales + the Assumption Ledger, **picks one candidate** (a document
+**`PRIMARY_SELECTED`** promotion, §7.1; siblings recorded as `rejected` with reasons), confirms the pinned
+target → **Confirmed Contract** with
 `intake_mode=hypothesis`, `selected_candidate`/`rejected_candidates` recorded, `requires_independent_validation
 =true` → SP-3 (and, later, the flag drives Gate #2 at SP-5).
