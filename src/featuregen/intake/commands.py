@@ -340,8 +340,9 @@ def withdraw_intent(conn: DbConn, cmd: Command) -> CommandResult:
 # ── Phase-4-local classifier override (NOT a shared seam) ─────────────────────────────────────
 # R10: the LLM / redactor / catalog collaborator seams are the canonical module-globals owned by
 # P3 (`current_llm_client`, `current_intent_redactor`) and P2 (`current_intake_catalog`) — imported
-# above, NEVER redefined here (Phase 9's `register_sp2` wires all four in production; tests wire
-# stubs via the same `register_*` functions). Phase 4 keeps ONLY a local override of P2's pure
+# above, NEVER redefined here (Phase 9's `_wire` composition root wires all four in production —
+# NOT register_sp2, which is conn-less schema/catalog registration only; tests wire stubs via the
+# same `register_*` functions). Phase 4 keeps ONLY a local override of P2's pure
 # `classify_intent` so a test can pin the banking outcome deterministically.
 _CLASSIFIER = None  # None ⟹ production default `classify_intent`
 

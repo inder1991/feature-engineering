@@ -148,7 +148,8 @@ def candidate_signals(
 # register_catalog_adapter/current_catalog_adapter) -----------------------------------------
 # The process-wide CandidateGenerator SP-2's hypothesis flow resolves. This is the ONLY holder:
 # submit_intent (P4) calls current_candidate_generator(); the P1 conftest `candidate_generator`
-# fixture and P9's register_sp2 register the concrete generator via register_candidate_generator(...).
+# fixture and P9's `_wire` composition root register the concrete generator via
+# register_candidate_generator(...) — register_sp2 (conn-less schema/catalog only) does NOT wire it.
 _CANDIDATE_GENERATOR: CandidateGenerator | None = None
 
 
@@ -164,7 +165,7 @@ def current_candidate_generator() -> CandidateGenerator:
     if _CANDIDATE_GENERATOR is None:
         raise RuntimeError(
             "no CandidateGenerator registered; call register_candidate_generator(...) "
-            "(register_sp2() does this in production)"
+            "(the _wire composition root does this in production)"
         )
     return _CANDIDATE_GENERATOR
 

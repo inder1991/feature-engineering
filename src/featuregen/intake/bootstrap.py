@@ -15,8 +15,10 @@ from featuregen.contracts.db import DbConn
 from featuregen.documents.primary import register_primary_selected
 from featuregen.documents.registry import DocumentSchemaRegistry
 from featuregen.events.registry import event_registry
+from featuregen.intake.candidates import register_candidate_schemas
 from featuregen.intake.commands import register_sp2_commands
 from featuregen.intake.contract import register_contract_schemas
+from featuregen.intake.critique import register_critique_schemas
 from featuregen.intake.events import register_sp2_event_types
 
 # §2.1 #5 + the SP-2 command-capability rows. The additive rejection authority `reject_intent`
@@ -77,7 +79,14 @@ def seed_sp2_authz(conn: DbConn) -> None:
     # Contract content-schemas (DRAFT_CONTRACT / ASSUMPTION_LEDGER / CONFIRMED_CONTRACT) into SP-0's
     # per-connection document registry (R11: contract-schema registration lives in P9, not P1). DB-backed
     # (DocumentSchemaRegistry needs a conn), so it rides seed_sp2_authz, not the conn-less register_sp2.
-    register_contract_schemas(DocumentSchemaRegistry(conn))
+    # ALSO register the two structured-output schemas call_llm validates against — contract_review (§5.3/
+    # §6.4) and sp2.generate_candidates.output (§6.x). DocumentSchemaRegistry.validate() FAILS CLOSED on
+    # an unregistered type, so without these the first real challenger/hypothesis LLM pass raises in
+    # production. Reuse ONE registry across all three; all three are idempotent upserts.
+    reg = DocumentSchemaRegistry(conn)
+    register_contract_schemas(reg)
+    register_critique_schemas(reg)     # contract_review output-schema (§5.3/6.4)
+    register_candidate_schemas(reg)    # sp2.generate_candidates.output (§6.x)
     # PRIMARY_SELECTED (SP-0 primitive) — registers the schema durably + in the in-memory singleton
     # and seeds the stage_primary checkpoint, so the P6 select_candidate_doc promotion appends validate.
     register_primary_selected(conn)

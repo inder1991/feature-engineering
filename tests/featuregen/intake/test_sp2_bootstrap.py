@@ -1,7 +1,16 @@
 from __future__ import annotations
 
+from featuregen.documents.registry import DocumentSchemaRegistry
 from featuregen.events.registry import event_registry
 from featuregen.intake.bootstrap import seed_sp2_authz
+from featuregen.intake.candidates import (
+    CANDIDATES_OUTPUT_SCHEMA_ID,
+    CANDIDATES_OUTPUT_SCHEMA_VERSION,
+)
+from featuregen.intake.critique import (
+    CONTRACT_REVIEW_SCHEMA_ID,
+    CONTRACT_REVIEW_SCHEMA_VERSION,
+)
 
 
 def _authz_rows(conn):
@@ -57,6 +66,27 @@ def test_seed_wires_primary_selected_and_checkpoints(conn):
         ).fetchall()
     }
     assert names == {"stage_primary", "feature_contract"}
+
+
+def test_seed_registers_critique_and_candidate_output_schemas(conn):
+    # Production wiring (Task 9.1): seed_sp2_authz must register the critique (contract_review) AND
+    # candidate (generate_candidates) structured-output schemas — not just the CONTRACT content-
+    # schemas — because call_llm validates every structured pass via DocumentSchemaRegistry(conn).
+    # That registry FAILS CLOSED on an unregistered type ("unregistered type ...@vN"), so without
+    # this the first real contract_review / generate_candidates LLM pass raises in production.
+    seed_sp2_authz(conn)
+    reg = DocumentSchemaRegistry(conn)
+    # A production call_llm output validation must RESOLVE the schema (not raise "unregistered type").
+    reg.validate(
+        CONTRACT_REVIEW_SCHEMA_ID,
+        CONTRACT_REVIEW_SCHEMA_VERSION,
+        {"review_type": "contract_review", "status": "OK", "findings": []},
+    )
+    reg.validate(
+        CANDIDATES_OUTPUT_SCHEMA_ID,
+        CANDIDATES_OUTPUT_SCHEMA_VERSION,
+        {"candidates": []},
+    )
 
 
 def test_seed_is_idempotent(conn):
