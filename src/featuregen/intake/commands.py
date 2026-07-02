@@ -15,7 +15,12 @@ import os
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 
-from featuregen.aggregates._append import append, provenance_for
+from featuregen.aggregates._append import (
+    append,
+    current_version,
+    provenance_for,
+    table_version_for,
+)
 from featuregen.aggregates.request_aggregate import (
     create_request_command,
     create_run_command,
@@ -38,8 +43,10 @@ from featuregen.documents.draft import (
     UNKNOWN,
     validate_draft,
 )
+from featuregen.documents.primary import new_primary_selected
 from featuregen.documents.registry import DocumentSchemaRegistry
 from featuregen.documents.store import append_document, compute_content_hash
+from featuregen.events import append_event
 from featuregen.events.store import load_stream
 from featuregen.gates.tasks import open_task, submit_human_signal
 from featuregen.idgen import mint_id
@@ -1297,3 +1304,88 @@ def answer_clarification(conn: DbConn, cmd: Command) -> CommandResult:
 # Reassigned AFTER answer_clarification is defined; register_sp2_commands reads the module-global at
 # call time (idempotent), so the appended entry is picked up.
 _SP2_CATALOG = _SP2_CATALOG + (("answer_clarification", answer_clarification),)
+
+
+# ═══ Task 6.5 — select_candidate_doc (document PRIMARY_SELECTED promotion, owner+human guarded) ═══════
+def select_candidate_doc(conn: DbConn, cmd: Command) -> CommandResult:
+    """Hypothesis-mode candidate selection (§7.1): a document-level `PRIMARY_SELECTED` promotion of
+    the chosen candidate doc on the RUN aggregate (`new_primary_selected`) — records ONLY the chosen
+    doc; the losing candidate docs are write-once and LEFT UNTOUCHED (no per-doc reject event; their
+    `doc_id`s live only in the Gate #1 confirmation record, §8.3). This is NOT the request-level
+    `select_candidate` command (which promotes *run* candidates on a *request* stream — the wrong
+    granularity; SP-2's candidates are documents under a single run). Owner + human guarded; invoked
+    by `confirm_contract` in hypothesis mode (P7). OCC on the run stream serializes concurrent
+    selects. X4: the `feature_contract` fold here is OWNER-GUARD-ONLY — this handler appends NO
+    `feature_contract` transition, so there is no FC folded head to CAS on; the `PRIMARY_SELECTED`
+    append rides the RUN aggregate under the run stream's own OCC (per SP-0). Do NOT pass the
+    feature_contract folded head as this append's `expected_version` (wrong aggregate).
+
+    Handler on an EXISTING stream: fold → decide → deny BEFORE any side-effecting append/promotion
+    (execute_command does NOT roll back on accepted=False, so every denial must commit nothing)."""
+    args = cmd.args
+    run_id = args["run_id"]
+    candidate_doc_id = args["candidate_doc_id"]
+    stage = args.get("stage", Stage.DRAFT_CONTRACT.value)
+
+    # Gate #1 is an author-owned intent lock: the confirmer MUST be the authenticated human requester
+    # (never a service, never the LLM, never a different data scientist). SP-0 authz admits any
+    # data_scientist human, so SP-2 enforces the fine owner-guard here (§8.2).
+    if cmd.actor.actor_kind != "human":
+        return CommandResult(
+            accepted=False,
+            aggregate_id=run_id,
+            denied_reason="select_candidate_doc requires the human requester (not a service)",
+        )
+    # R3/R4: fold the feature_contract stream and call the state-based owner predicate owned by P2
+    # (intake/state.py) — never the (conn, run_id, actor) mcv form. `state.requester` is the
+    # INTENT_SUBMITTED event actor.subject.
+    state = fold_feature_contract_state(load_feature_contract(conn, run_id))
+    if not actor_is_request_owner(state, cmd.actor):
+        record_denial(conn, cmd, "actor is not the request owner")  # R15 — writes decision="denied"
+        return CommandResult(
+            accepted=False,
+            aggregate_id=run_id,
+            denied_reason="actor is not the request owner (owner-guard, §8.2)",
+        )
+
+    row = conn.execute(
+        "SELECT branch_role FROM documents WHERE doc_id=%s AND run_id=%s AND stage=%s",
+        (candidate_doc_id, run_id, stage),
+    ).fetchone()
+    if row is None:
+        return CommandResult(
+            accepted=False,
+            aggregate_id=run_id,
+            denied_reason=f"unknown candidate doc {candidate_doc_id} for (run={run_id}, stage={stage})",
+        )
+    if row[0] != "candidate":
+        return CommandResult(
+            accepted=False,
+            aggregate_id=run_id,
+            denied_reason=f"doc {candidate_doc_id} is branch_role={row[0]!r}, not a candidate",
+        )
+
+    # X4 / SP-0 carve-out: PRIMARY_SELECTED is a document promotion on the RUN aggregate — its OCC is
+    # the run stream's own head (`current_version(conn,"run",run_id)`), NOT the feature_contract folded
+    # head. This handler appends no feature_contract transition, so there is no FC head to CAS on
+    # (X4's folded-head expected_version rule is n/a here; the fold above is owner-guard-only).
+    event = new_primary_selected(
+        run_id=run_id,
+        stage=stage,
+        doc_id=candidate_doc_id,
+        actor=cmd.actor,
+        provenance=provenance_for(artifact_type=stage),
+    )
+    appended = append_event(
+        conn,
+        event,
+        expected_version=current_version(conn, "run", run_id),
+        table_version=table_version_for(conn, "run", run_id),
+    )
+    return CommandResult(
+        accepted=True, aggregate_id=run_id, produced_event_ids=(appended.event_id,)
+    )
+
+
+# Task 6.5 — extend the SP-2 command catalog with the document PRIMARY_SELECTED promotion.
+_SP2_CATALOG = _SP2_CATALOG + (("select_candidate_doc", select_candidate_doc),)
