@@ -4,6 +4,9 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 
+from featuregen.idgen import mint_id
+from featuregen.intake.llm import LLMClient, LLMRequest
+
 # Structural-only metadata views (names/types/grain + catalog-DECLARED enum/code metadata ONLY —
 # never profiled column values, rows, samples, or overlay metrics; §9.4 no-data-to-LLM boundary).
 DraftContract = Mapping[str, Any]
@@ -157,3 +160,139 @@ def current_candidate_generator() -> CandidateGenerator:
             "(register_sp2() does this in production)"
         )
     return _CANDIDATE_GENERATOR
+
+
+CANDIDATES_PROMPT_ID = "sp2.generate_candidates"
+CANDIDATES_PROMPT_VERSION = 1
+CANDIDATES_OUTPUT_SCHEMA_ID = "sp2.generate_candidates.output"
+CANDIDATES_OUTPUT_SCHEMA_VERSION = 1
+STUB_GENERATOR_VERSION = "sp2-stub-candidate-generator@1"
+MAX_CANDIDATES = 3
+
+# Pinned, structured-output generation settings for the stub's single pass (part of the P3
+# idempotency key). Structural-only — no PHI/PII in property names/enums/descriptions (§16 (c)).
+_STUB_GENERATION_SETTINGS = {
+    "provider": "fake",
+    "model": "fake-structured",
+    "thinking": "off",
+    "max_tokens": 2048,
+}
+
+
+def _known_concepts(
+    catalog_metadata: CatalogView, domain_context: DomainCatalogEntry | None
+) -> set[str]:
+    """The set of catalog concept NAMES the candidate may plausibly reference (§9.4: names only —
+    never profiled values). Union of catalog object/column/concept names + the read-only per-use-case
+    `DomainCatalogEntry.allowed_concepts` slice of the `BankingDomainCatalog` (§4.5, §7.2)."""
+    names: set[str] = set()
+    cm = catalog_metadata or {}
+    for key in ("objects", "columns", "concepts"):
+        for name in cm.get(key, ()) or ():
+            if isinstance(name, str):
+                names.add(name)
+    if domain_context:
+        for name in domain_context.get("allowed_concepts", ()) or ():
+            if isinstance(name, str):
+                names.add(name)
+    return names
+
+
+def _as_tagged_method(cm: object) -> dict | None:
+    """Normalize an LLM-proposed calculation method into the tagged §4.2 shape, or None if its
+    variant kind is not in the closed vocabulary (fail-closed per-item — never fabricate a method).
+    A bare variant `{kind, ...}` is wrapped as `{method_version:1, chosen, considered:[chosen]}`."""
+    if not isinstance(cm, Mapping):
+        return None
+    if "chosen" in cm:
+        chosen = cm.get("chosen")
+        method_version = cm.get("method_version", 1)
+        considered = cm.get("considered")
+    else:
+        chosen = cm
+        method_version = 1
+        considered = None
+    if not isinstance(chosen, Mapping) or chosen.get("kind") not in _METHOD_KINDS:
+        return None
+    chosen_d = dict(chosen)
+    if isinstance(considered, list) and considered:
+        considered_d = [dict(c) for c in considered if isinstance(c, Mapping)]
+    else:
+        considered_d = [chosen_d]
+    return {"method_version": method_version, "chosen": chosen_d, "considered": considered_d}
+
+
+class StubCandidateGenerator:
+    """The deliberately-dumb SP-2 hypothesis generator (§7.2): ONE `LLMClient` structuring pass →
+    1–3 candidate definitions, each with a one-line rationale, a tagged `calculation_method`, and
+    cheap model-free `signals`. It has NO router, NO specialists, NO attempt/conceptual memory, NO
+    symbolic synthesis, NO diversity/islands, and NO few-shot — those are SP-12 (design §14.6–14.9).
+    It is domain-AWARE only via the read-only per-use-case `DomainCatalogEntry` allowed-concepts slice
+    (§4.5), never the full generation prior. SP-2 MUST NOT import SP-12 scope. The `CandidateGenerator`
+    seam is IDENTICAL for the stub and SP-12 — only this `generate` body changes."""
+
+    def __init__(
+        self, client: LLMClient, *, generator_version: str = STUB_GENERATOR_VERSION
+    ) -> None:
+        self._client = client
+        self._generator_version = generator_version
+
+    def generate(
+        self,
+        draft: DraftContract,
+        catalog_metadata: CatalogView,
+        domain_context: DomainCatalogEntry | None = None,
+    ) -> list[Candidate]:
+        known = _known_concepts(catalog_metadata, domain_context)
+        semantics = draft.get("feature_semantics") or {}
+        request = LLMRequest(
+            task="generate_candidates",
+            prompt_id=CANDIDATES_PROMPT_ID,
+            prompt_version=CANDIDATES_PROMPT_VERSION,
+            inputs={
+                # Redacted, LLM-safe metadata ONLY (§9.4) — names, the proposed name, the (redacted)
+                # target label, and the allowed concept NAMES. Never data values / profiled sets.
+                "proposed_feature_name": draft.get("proposed_feature_name"),
+                "intake_mode": draft.get("intake_mode"),
+                "target": draft.get("target"),
+                "entity": semantics.get("entity"),
+                "allowed_concepts": sorted(known),
+            },
+            output_schema_id=CANDIDATES_OUTPUT_SCHEMA_ID,
+            output_schema_version=CANDIDATES_OUTPUT_SCHEMA_VERSION,
+            generation_settings=_STUB_GENERATION_SETTINGS,
+        )
+        result = self._client.call(request)  # THE single LLM pass (§7.2)
+        if result.status == "failed_into_clarification":
+            return []  # fail closed: no candidates → the run stays in clarification (never fabricate)
+        raw = list((result.output or {}).get("candidates", []))[:MAX_CANDIDATES]
+        call_refs = [result.call_ref] if result.call_ref else []
+        candidates: list[Candidate] = []
+        sibling_methods: list[dict] = []
+        for item in raw:
+            if not isinstance(item, Mapping):
+                continue
+            method = _as_tagged_method(item.get("calculation_method"))
+            if method is None:
+                continue  # skip a structurally-invalid variant (fail-closed per-item)
+            signals = candidate_signals(
+                method,
+                item.get("definition_text", ""),
+                known_concepts=known,
+                sibling_methods=sibling_methods,
+            )
+            candidates.append(
+                Candidate(
+                    candidate_id=mint_id("cand"),
+                    definition_text=item.get("definition_text", ""),
+                    rationale=item.get("rationale", ""),
+                    calculation_method=method,
+                    signals=signals,
+                    provenance={
+                        "llm_call_refs": list(call_refs),
+                        "generator_version": self._generator_version,
+                    },
+                )
+            )
+            sibling_methods.append(method)
+        return candidates
