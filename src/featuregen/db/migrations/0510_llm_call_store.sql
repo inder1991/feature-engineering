@@ -25,7 +25,7 @@ CREATE TABLE IF NOT EXISTS llm_call (
     input_redaction       jsonb       NOT NULL DEFAULT '{}',   -- what was scrubbed (audit boundary)
     raw_output            jsonb       NULL,                    -- the model's structured output
     validation_result     jsonb       NOT NULL DEFAULT '{}',   -- ok|invalid|refusal|truncated|... (§9.2)
-    repair_attempts       integer     NOT NULL DEFAULT 0,
+    repair_attempts       jsonb       NOT NULL DEFAULT '[]',   -- LIST of {attempt,class,reason} records (§9.2)
     latency_ms            integer     NULL,
     cost_metadata         jsonb       NULL,
     created_at            timestamptz NOT NULL DEFAULT now(),

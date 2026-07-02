@@ -14,7 +14,12 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from typing import Any, Protocol, runtime_checkable
 
+from psycopg.rows import dict_row
+from psycopg.types.json import Jsonb
+
 from featuregen.contracts import SchemaValidationError
+from featuregen.contracts.db import DbConn
+from featuregen.idgen import mint_id
 
 # ---- shared-contract shapes (overview §9.1) -------------------------------------------------
 
@@ -259,3 +264,153 @@ def current_llm_client() -> LLMClient:
             "(register_sp2()/_wire does this)"
         )
     return _LLM_CLIENT
+
+
+# ---- the append-only llm_call record store (§9.3) -------------------------------------------
+
+
+@dataclass(frozen=True)
+class LLMCallRecord:
+    llm_call_ref: str
+    run_id: str
+    task: str
+    provider: str
+    model: str
+    prompt_id: str
+    prompt_version: int
+    output_schema_id: str
+    output_schema_version: int
+    generation_settings: dict
+    redaction_version: str
+    input_hash: str
+    redacted_input: dict
+    input_redaction: dict
+    raw_output: dict
+    validation_result: dict
+    repair_attempts: list
+    latency_ms: int | None
+    cost_metadata: dict | None
+    created_at: object
+    created_by: dict
+
+
+def _canonical(obj: Any) -> str:
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def _record_from_row(row: Mapping[str, Any]) -> LLMCallRecord:
+    return LLMCallRecord(
+        llm_call_ref=row["llm_call_ref"], run_id=row["run_id"], task=row["task"],
+        provider=row["provider"], model=row["model"], prompt_id=row["prompt_id"],
+        prompt_version=row["prompt_version"], output_schema_id=row["output_schema_id"],
+        output_schema_version=row["output_schema_version"],
+        generation_settings=row["generation_settings"], redaction_version=row["redaction_version"],
+        input_hash=row["input_hash"], redacted_input=row["redacted_input"],
+        input_redaction=row["input_redaction"], raw_output=row["raw_output"],
+        validation_result=row["validation_result"], repair_attempts=row["repair_attempts"],
+        latency_ms=row["latency_ms"], cost_metadata=row["cost_metadata"],
+        created_at=row["created_at"], created_by=row["created_by"],
+    )
+
+
+def record_llm_call(
+    conn: DbConn,
+    *,
+    run_id: str,
+    request: LLMRequest,
+    input_hash: str,
+    redaction_version: str,
+    input_redaction: Mapping[str, Any],
+    raw_output: Mapping[str, Any],      # {"output": ..., "self_reported_scores": ...}
+    validation_result: Mapping[str, Any],
+    repair_attempts: list,
+    latency_ms: int | None,
+    cost_metadata: Mapping[str, Any] | None,
+    created_by: Mapping[str, Any],      # identity_to_jsonb(actor)
+) -> str:
+    """Write ONE immutable llm_call record (§9.3) and return its `llm_call_ref`. Append-only: each
+    call mints a fresh `llmc_` id and INSERTs — there is no update path. Stores the REDACTED input
+    itself (`redacted_input`, replayable — never the raw intent, which stays in SP-0's encrypted
+    raw_input_ref). `provider`/`model` are lifted from generation_settings into their own columns."""
+    gs = dict(request.generation_settings)
+    ref = mint_id("llmc")
+    conn.execute(
+        """
+        INSERT INTO llm_call
+            (llm_call_ref, run_id, task, provider, model, prompt_id, prompt_version,
+             output_schema_id, output_schema_version, generation_settings, redaction_version,
+             input_hash, redacted_input, input_redaction, raw_output, validation_result,
+             repair_attempts, latency_ms, cost_metadata, created_by)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        """,
+        (
+            ref, run_id, request.task, gs.get("provider"), gs.get("model"),
+            request.prompt_id, request.prompt_version, request.output_schema_id,
+            request.output_schema_version, Jsonb(gs), redaction_version, input_hash,
+            Jsonb(dict(request.inputs)), Jsonb(dict(input_redaction)), Jsonb(dict(raw_output)),
+            Jsonb(dict(validation_result)), Jsonb(list(repair_attempts)), latency_ms,
+            Jsonb(dict(cost_metadata)) if cost_metadata is not None else None, Jsonb(dict(created_by)),
+        ),
+    )
+    return ref
+
+
+def read_llm_call(conn: DbConn, call_ref: str) -> LLMCallRecord:
+    """Resolve an `llm_call_ref` to its immutable record. Raises KeyError if unknown."""
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute("SELECT * FROM llm_call WHERE llm_call_ref = %s", (call_ref,))
+        row = cur.fetchone()
+    if row is None:
+        raise KeyError(f"unknown llm_call_ref {call_ref!r}")
+    return _record_from_row(row)
+
+
+def find_llm_call(
+    conn: DbConn,
+    *,
+    run_id: str,
+    task: str,
+    input_hash: str,
+    provider: str,
+    model: str,
+    prompt_id: str,
+    prompt_version: int,
+    output_schema_id: str,
+    output_schema_version: int,
+    redaction_version: str,
+    generation_settings: Mapping[str, Any],
+) -> LLMCallRecord | None:
+    """Full-identity idempotency lookup (§9.3, Decision D16): reuse a record ONLY when EVERY
+    identity component matches. Queries the (run_id, task, input_hash) candidate set (indexed) and
+    compares the rest — including a canonicalized generation_settings — in Python."""
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            "SELECT * FROM llm_call WHERE run_id=%s AND task=%s AND input_hash=%s "
+            "ORDER BY created_at ASC",
+            (run_id, task, input_hash),
+        )
+        rows = cur.fetchall()
+    target_gs = _canonical(dict(generation_settings))
+    for row in rows:
+        if (
+            row["provider"] == provider
+            and row["model"] == model
+            and row["prompt_id"] == prompt_id
+            and row["prompt_version"] == prompt_version
+            and row["output_schema_id"] == output_schema_id
+            and row["output_schema_version"] == output_schema_version
+            and row["redaction_version"] == redaction_version
+            and _canonical(row["generation_settings"]) == target_gs
+        ):
+            return _record_from_row(row)
+    return None
+
+
+def _result_from_record(rec: LLMCallRecord) -> LLMResult:
+    """Rebuild the caller-facing LLMResult from a stored record (idempotent reuse — no new call)."""
+    return LLMResult(
+        output=dict(rec.raw_output.get("output", {})),
+        self_reported_scores=dict(rec.raw_output.get("self_reported_scores", {})),
+        call_ref=rec.llm_call_ref,
+        status=rec.validation_result.get("result", STATUS_FAILED),
+    )
