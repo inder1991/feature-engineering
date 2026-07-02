@@ -2124,3 +2124,9 @@ def request_edit(conn: DbConn, cmd: Command) -> CommandResult:
 
 # Task 7.6 — extend the SP-2 command catalog with the Gate-#1 edit handler (Phase-7 last command).
 _SP2_CATALOG = _SP2_CATALOG + (("request_edit", request_edit),)
+
+# Task 8.7 — register the standalone, post-intake service terminal reject (X5). `reject_intent` is
+# defined above (Task 8.3, R16) under the additive ("reject_intent","","intake-agent","service",None)
+# authz row (P1/Task 1.6). `withdraw_intent` is deliberately NOT registered — it is the requester's
+# abandonment reuse wrapper over SP-0's `withdraw` (no new action, no new authz row).
+_SP2_CATALOG = _SP2_CATALOG + (("reject_intent", reject_intent),)
