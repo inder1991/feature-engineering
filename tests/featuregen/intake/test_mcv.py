@@ -6,15 +6,15 @@ from featuregen.contracts import ConcurrencyError
 from featuregen.identity.build import build_human_identity, build_service_identity
 from featuregen.intake.mcv import (
     calculation_method_available,
-    confirmer_is_requester_human,
     minimum_contract_validated,
     not_prohibited_intent,
     open_fields_empty,
     run_minimum_contract_validation,
 )
 
-# actor_is_request_owner is owned by P2 (intake.state), consumed here (R4) — never redefined in mcv.
-from featuregen.intake.state import actor_is_request_owner
+# actor_is_request_owner + confirmer_is_requester_human are owned by P2 (intake.state), consumed here
+# (R4) — never redefined in mcv.
+from featuregen.intake.state import actor_is_request_owner, confirmer_is_requester_human
 
 _CLEAR = {"outcome": "CLEAR", "catalog_version": "bdc-1"}
 

@@ -206,3 +206,12 @@ def actor_is_request_owner(state: FeatureContractState, actor) -> bool:
     + the security-audit stream)."""
     subject = getattr(actor, "subject", None)
     return bool(subject) and subject == state.requester
+
+
+def confirmer_is_requester_human(state: FeatureContractState, actor) -> bool:
+    """The ONE §8.2 Gate-#1 / withdrawal guard: `confirmer_is_requester_human` = actor_is_request_owner
+    ∧ actor_kind=='human'. Composes the R4 owner predicate above (the owner subject is read from
+    `state.requester`, NOT a local re-derivation). A service or the LLM can never confirm; a DIFFERENT
+    data scientist can never confirm. Both commands.py (confirm/edit handlers) and mcv import this — it
+    is NOT redefined in either module."""
+    return actor.actor_kind == "human" and actor_is_request_owner(state, actor)

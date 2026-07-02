@@ -110,6 +110,7 @@ from featuregen.intake.state import (
     FeatureContractState,
     FeatureContractStatus,
     actor_is_request_owner,
+    confirmer_is_requester_human,
     fold_feature_contract_state,
 )
 from featuregen.intake.store import (  # R1 seam (P1, store.py)
@@ -163,8 +164,8 @@ __all__ = [
     "EventEnvelope",
     "IdentityEnvelope",
     # Task 8.2 — inline lifecycle guards (fold-companion predicates the SP-2 handlers run BEFORE append).
+    # confirmer_is_requester_human is owned by intake.state (imported, not redefined here).
     "open_fields_empty",
-    "confirmer_is_requester_human",
     "guard_advance",
 ]
 
@@ -184,13 +185,6 @@ class IntakeError(Exception):
 def open_fields_empty(state: FeatureContractState) -> bool:
     """The Gate-#1 hard invariant (§11): a run with a non-empty open_fields can never advance."""
     return len(state.open_fields) == 0
-
-
-def confirmer_is_requester_human(state: FeatureContractState, actor: IdentityEnvelope) -> bool:
-    """Gate #1 / withdrawal guard (§8.2): the acting subject is the request owner AND a human — a
-    service (or the LLM) can never confirm or abandon a contract. Composes P2's `actor_is_request_owner`
-    (imported, R4)."""
-    return actor.actor_kind == "human" and actor_is_request_owner(state, actor)
 
 
 def guard_advance(
@@ -1508,14 +1502,6 @@ def _final_draft(stream) -> tuple[str | None, dict | None]:
     return doc_id, body
 
 
-def _confirmer_is_requester_human(state, actor) -> bool:
-    """§8.2 guard: confirmer_is_requester_human = actor_is_request_owner ∧ actor_kind=='human'.
-    Composes the ONE R4 owner predicate (intake/state.py); SP-0 authz only admits the data_scientist
-    ROLE (never the specific subject), so SP-2 pins it. The owner subject is read from state.requester,
-    NOT a local re-derivation."""
-    return actor.actor_kind == "human" and actor_is_request_owner(state, actor)
-
-
 def _deny_audited(conn: DbConn, cmd: Command, aggregate_id: str, reason: str) -> CommandResult:
     """A confirmer/authority denial happens INSIDE the handler (SP-0's coarse authorizer only audits
     role/kind/scope), so route it to the tamper-evident security-audit stream (§8.2) — a spoofed
@@ -1721,7 +1707,7 @@ def confirm_contract(conn: DbConn, cmd: Command) -> CommandResult:
         )
     # §8.2 — the confirmer MUST be the authenticated human requester (never a service, the LLM, or a
     # DIFFERENT data scientist). A mismatch is denied + security-audited, before the gate is consumed.
-    if not _confirmer_is_requester_human(state, cmd.actor):
+    if not confirmer_is_requester_human(state, cmd.actor):
         return _deny_audited(
             conn, cmd, run_id,
             "Gate #1 confirm requires the authenticated human requester (confirmer_is_requester_human)",
@@ -1907,7 +1893,7 @@ def request_edit(conn: DbConn, cmd: Command) -> CommandResult:
         )
     # §8.2 — the editor MUST be the authenticated human requester (never a service, the LLM, or a
     # DIFFERENT data scientist). A mismatch is denied + security-audited, before the gate is consumed.
-    if not _confirmer_is_requester_human(state, cmd.actor):
+    if not confirmer_is_requester_human(state, cmd.actor):
         return _deny_audited(
             conn, cmd, run_id,
             "Gate #1 edit requires the authenticated human requester (confirmer_is_requester_human)",

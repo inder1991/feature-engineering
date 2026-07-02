@@ -3,13 +3,13 @@ from types import SimpleNamespace
 import featuregen.intake.events as ev
 from featuregen.contracts import IdentityEnvelope
 from featuregen.intake.commands import (
-    confirmer_is_requester_human,
     guard_advance,
     open_fields_empty,
 )
 from featuregen.intake.state import (
     FeatureContractStatus,
     actor_is_request_owner,
+    confirmer_is_requester_human,
     fold_feature_contract_state,
 )
 
@@ -52,6 +52,15 @@ def test_owner_guards():
     # confirmer_is_requester_human = owner AND actor_kind == human (a service can never confirm).
     assert confirmer_is_requester_human(st, _OWNER) is True
     assert confirmer_is_requester_human(st, _SERVICE) is False
+
+
+def test_confirmer_is_requester_human_non_owner_human_denied():
+    # The deny path that distinguishes confirmer_is_requester_human from a plain actor_kind=="human"
+    # check: a HUMAN who is NOT the request owner (a different data scientist) is still denied.
+    st = _draft([])
+    assert _OTHER.actor_kind == "human"
+    assert actor_is_request_owner(st, _OTHER) is False
+    assert confirmer_is_requester_human(st, _OTHER) is False
 
 
 def test_guard_advance_none_terminal_and_illegal():

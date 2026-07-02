@@ -9,9 +9,9 @@ R5 two-symbol split:
     (a ConcurrencyError denies `stale`). P7's Task 7.6 open_gate1_task reads `.accepted`.
 
 Plus the guard predicates later handlers evaluate inline (§11): `open_fields_empty`,
-`not_prohibited_intent`, `calculation_method_available`, `confirmer_is_requester_human` (built on the
-ONE state-based owner predicate P2 owns — R4 `intake.state.actor_is_request_owner`, imported not
-redefined).
+`not_prohibited_intent`, `calculation_method_available`. The §8.2 `confirmer_is_requester_human`
+predicate — built on the ONE state-based owner predicate P2 owns (R4 `actor_is_request_owner`) — is
+owned by P2 (`intake.state`) and imported by the handlers, never redefined here.
 
 IMPLEMENTATION NOTE (deviation from the brief's illustrative Step-3 code, kept inside this task's two
 files): the brief read the bodies via `commands.read_contract_body(conn, doc_id)` and the classification
@@ -29,7 +29,7 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
-from featuregen.contracts import CommandResult, ConcurrencyError, DbConn, IdentityEnvelope
+from featuregen.contracts import CommandResult, ConcurrencyError, DbConn
 from featuregen.documents.draft import UNKNOWN
 from featuregen.intake.events import (
     CLARIFICATION_ANSWERED,
@@ -37,11 +37,10 @@ from featuregen.intake.events import (
     MINIMUM_CONTRACT_VALIDATED,
 )
 
-# R4: the ONE owner predicate is owned by P2 (intake.state) — mcv IMPORTS it, never redefines it.
+# R4: the ONE owner/confirmer predicates are owned by P2 (intake.state) — never redefined here.
 # R3: the DB-backed wrapper folds the feature_contract status through the P2 fold.
 from featuregen.intake.state import (
     FeatureContractStatus,
-    actor_is_request_owner,
     fold_feature_contract_state,
 )
 from featuregen.intake.store import append_feature_contract_event, load_feature_contract
@@ -92,14 +91,6 @@ def calculation_method_available(
         return candidate_count >= 1
     method = draft_body.get("feature_semantics", {}).get("calculation_method")
     return bool(method) and method != UNKNOWN
-
-
-def confirmer_is_requester_human(state, actor: IdentityEnvelope) -> bool:
-    """Guard `confirmer_is_requester_human` = actor_is_request_owner ∧ actor_kind=="human" (§8.2),
-    built on the ONE state-based owner predicate P2 owns (R4 — `actor_is_request_owner(state, actor)`,
-    where `state.requester` is the INTENT_SUBMITTED actor.subject). A service or the LLM can never
-    confirm; a different data scientist can never confirm."""
-    return actor.actor_kind == "human" and actor_is_request_owner(state, actor)
 
 
 # ── the pure 6-check pre-gate checklist (R5, §6.7) ─────────────────────────────────────────────
