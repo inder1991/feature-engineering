@@ -176,8 +176,9 @@ __all__ = [
     # Task 8.3 — the standalone post-intake platform/service terminal reject (X5; wired into
     # _SP2_CATALOG in Task 8.7, not here).
     "reject_intent",
-    # Task 8.4 — the requester's own abandonment reusing SP-0 `withdraw` (RUN_WITHDRAWN; wired into
-    # _SP2_CATALOG in Task 8.7, not here).
+    # Task 8.4 — the requester's own abandonment reusing SP-0 `withdraw` (RUN_WITHDRAWN); wired into
+    # _SP2_CATALOG + given its own ("withdraw_intent",...,"data_scientist","human") authz row in Task 9.1
+    # (bootstrap._SP2_POLICY_ROWS) so a requester can dispatch it via execute_command.
     "withdraw_intent",
 ]
 
@@ -2127,6 +2128,13 @@ _SP2_CATALOG = _SP2_CATALOG + (("request_edit", request_edit),)
 
 # Task 8.7 — register the standalone, post-intake service terminal reject (X5). `reject_intent` is
 # defined above (Task 8.3, R16) under the additive ("reject_intent","","intake-agent","service",None)
-# authz row (P1/Task 1.6). `withdraw_intent` is deliberately NOT registered — it is the requester's
-# abandonment reuse wrapper over SP-0's `withdraw` (no new action, no new authz row).
+# authz row (P1/Task 1.6).
 _SP2_CATALOG = _SP2_CATALOG + (("reject_intent", reject_intent),)
+
+# Task 9.1 — register the requester's own abandonment (Task 8.4) so it is dispatchable via
+# execute_command. `withdraw_intent` reuses SP-0's RUN_WITHDRAWN behind SP-2's request-owner guard;
+# execute_command routes authz by cmd.action, so it needs its OWN action row —
+# ("withdraw_intent","","data_scientist","human",None), seeded from bootstrap._SP2_POLICY_ROWS —
+# distinct from SP-0's `withdraw` row. Without this wiring the Task-8.4 requester-abandonment guards
+# are unreachable in production (the Task-8.7 review orphan). SP-0's validator-only `reject` is untouched.
+_SP2_CATALOG = _SP2_CATALOG + (("withdraw_intent", withdraw_intent),)
