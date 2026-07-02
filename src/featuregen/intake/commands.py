@@ -52,7 +52,12 @@ from featuregen.intake.events import (
     USE_CASE_ONBOARDING_GATE,
     USE_CASE_ONBOARDING_REQUESTED,
 )
-from featuregen.intake.llm import LLMRequest, call_llm, current_llm_client  # R10 seam (P3, llm.py)
+from featuregen.intake.llm import (  # R10 seam (P3, llm.py)
+    STATUS_FAILED,
+    LLMRequest,
+    call_llm,
+    current_llm_client,
+)
 from featuregen.intake.redaction import (  # R10 seam (P3, redaction.py)
     build_llm_inputs,
     current_intent_redactor,
@@ -329,6 +334,63 @@ def _emit_document(
     return doc_id
 
 
+def _open_clarification_task(conn: DbConn, *, run_id: str, actor: IdentityEnvelope) -> str:
+    """Open a human CLARIFICATION gate task (Task 4.6 pattern) and return its real `task_id` — the
+    CLARIFICATION_REQUESTED schema requires it. Shared by the fail-closed manual path and the
+    non-terminal sensitive-proxy / ambiguous routing."""
+    return open_task(
+        conn,
+        GateTaskSpec(
+            gate="CLARIFICATION", required_inputs=(), eligible_assignees={"role": "intake_reviewer"},
+            allowed_responses=("clarify",), run_id=run_id, delegation_allowed=True,
+        ),
+        actor,
+    )
+
+
+def _fail_into_clarification(
+    conn: DbConn, *, run_id: str, request_id: str | None, actor: IdentityEnvelope, reason: str,
+) -> EventEnvelope:
+    """Fail-closed manual path (§9.4 redaction / §9.2 exhausted structure). No payload was dispatched
+    and no Draft is frozen — a human handles it via the clarification path. Opens a CLARIFICATION gate
+    task and threads its real `task_id` (the CLARIFICATION_REQUESTED schema requires it). R1: threads
+    only run_id (feature_contract_id == run_id); R2: no id fields in the payload."""
+    task_id = _open_clarification_task(conn, run_id=run_id, actor=actor)
+    return append_fc_event(  # R1 seam — feature_contract_id == run_id, thread only run_id
+        conn, run_id=run_id, type=CLARIFICATION_REQUESTED,
+        expected_version=_fc_head(conn, run_id),  # X4 — CAS on the folded head
+        payload={  # R2 — no aggregate-id fields; task_id is the schema-required gate-task ref
+            "task_id": task_id,
+            "field": "raw_intent",
+            "question": f"the intent could not be safely {reason}; please restate without sensitive "
+                        f"data or specify the feature directly",
+            "kind": f"{reason}_failed", "routed_to": "human", "blocks_progress": True,
+        },
+        actor=actor, request_id=request_id,
+    )
+
+
+def _emit_banking_clarification(
+    conn: DbConn, *, run_id: str, request_id: str | None, actor: IdentityEnvelope,
+    classification: IntakeClassification,
+) -> EventEnvelope:
+    """Non-terminal sensitive-proxy / ambiguous routing (§5.4 outcomes 3–4). A doubt to be reviewed,
+    never a block — the Draft is still produced; this records the compliance-review / disambiguation
+    need on a CLARIFICATION gate task (the full clarification task machinery is Phase 5)."""
+    task_id = _open_clarification_task(conn, run_id=run_id, actor=actor)
+    return append_fc_event(  # R1 seam — feature_contract_id == run_id, thread only run_id
+        conn, run_id=run_id, type=CLARIFICATION_REQUESTED,
+        expected_version=_fc_head(conn, run_id),  # X4 — CAS on the folded head
+        payload={  # R2 — no aggregate-id fields.
+            "task_id": task_id, "field": "banking_scope",
+            "question": classification.reason or "requires clarification / compliance review",
+            "kind": f"banking_{classification.outcome.value.lower()}",
+            "routed_to": "human", "blocks_progress": False,
+        },
+        actor=actor, request_id=request_id,
+    )
+
+
 def _produce_draft(
     conn: DbConn,
     *,
@@ -342,12 +404,25 @@ def _produce_draft(
     classification: IntakeClassification,
     produced: list,
 ) -> CommandResult:
-    """Redact → structure_intent → Draft + Assumption Ledger (§5.2). The LLM sees only redacted,
-    LLM-safe text + catalog metadata (never raw data / PII, §9.4); every inferred field is accounted
-    (§5.3) before the Draft is frozen."""
+    """Redact → structure_intent → Draft + Assumption Ledger (§5.2), fail-closed at both the redaction
+    egress and the structured-output boundary (§9.2/§9.4). The LLM sees only redacted, LLM-safe text +
+    catalog metadata (never raw data / PII); every inferred field is accounted (§5.3) before the Draft
+    is frozen. Non-terminal sensitive-proxy / ambiguous outcomes still produce the Draft and append a
+    compliance-review clarification (§5.4 #3–#4)."""
+    # 1. Redact — fail closed on `unscanned` / un-redactable (§9.4): no payload is ever dispatched and
+    #    no Draft is frozen; a human handles it via the clarification path.
     redactor = current_intent_redactor()  # R10 seam (P3, redaction.py)
     redaction = redactor.redact(intent_text, raw_input_classification)
-    inputs = build_llm_inputs(  # reserved-keyed, LLM-safe (§9.4) — fails closed on un-redactable text
+    if redaction.text is None or redaction.disposition != "ok":
+        clar = _fail_into_clarification(
+            conn, run_id=run_id, request_id=request_id, actor=cmd.actor, reason="redacted"
+        )
+        produced.append(clar.event_id)
+        return CommandResult(accepted=True, aggregate_id=run_id, produced_event_ids=tuple(produced))
+
+    # 2. Structure the intent through the event-sourced, egress-guarded LLM wrapper. build_llm_inputs
+    #    keeps the §9.4 redaction_version / input_redaction egress-guard fields (never the raw intent).
+    inputs = build_llm_inputs(  # reserved-keyed, LLM-safe (§9.4) — guaranteed-safe past the check above
         redaction, catalog_metadata={}, raw_input_classification=raw_input_classification
     )
     request = LLMRequest(
@@ -360,6 +435,13 @@ def _produce_draft(
         generation_settings=_GEN_SETTINGS,
     )
     result = call_llm(conn, current_llm_client(), request, run_id=run_id, actor=cmd.actor)  # R10 seam
+    # 2b. LLM fail-closed (§9.2): exhausted repair / refusal / non-retryable → clarification, NO Draft.
+    if result.status == STATUS_FAILED:
+        clar = _fail_into_clarification(
+            conn, run_id=run_id, request_id=request_id, actor=cmd.actor, reason="structured"
+        )
+        produced.append(clar.event_id)
+        return CommandResult(accepted=True, aggregate_id=run_id, produced_event_ids=tuple(produced))
     out = result.output
 
     ledger_body = assemble_ledger_body(request_id=request_id, assumptions=out.get("assumptions", []))
@@ -397,6 +479,16 @@ def _produce_draft(
         provenance=provenance_for(Stage.DRAFT_CONTRACT.value),
     )
     produced.append(produced_evt.event_id)
+
+    # 4. Non-terminal sensitive-proxy / ambiguous outcomes also raise a clarification (§5.4 #3–#4):
+    #    the Draft stands; the clarification records the compliance-review / disambiguation need.
+    if classification.outcome in (
+        IntakeOutcome.SENSITIVE_PROXY_CLARIFY, IntakeOutcome.AMBIGUOUS_CLARIFY
+    ):
+        clar = _emit_banking_clarification(
+            conn, run_id=run_id, request_id=request_id, actor=cmd.actor, classification=classification
+        )
+        produced.append(clar.event_id)
     return CommandResult(accepted=True, aggregate_id=run_id, produced_event_ids=tuple(produced))
 
 
