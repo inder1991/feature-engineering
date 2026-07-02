@@ -30,7 +30,11 @@ from featuregen.commands.api import execute_command
 from featuregen.commands.authz_seam import register_command_authorizer
 from featuregen.contracts import Command
 from featuregen.identity.build import build_human_identity, build_service_identity
-from featuregen.intake.banking_catalog import IntakeClassification, IntakeOutcome
+from featuregen.intake.banking_catalog import (
+    IntakeClassification,
+    IntakeOutcome,
+    classify_intent,
+)
 from featuregen.intake.bootstrap import register_sp2, seed_sp2_authz
 from featuregen.intake.candidates import StubCandidateGenerator, register_candidate_generator
 from featuregen.intake.catalog import load_banking_catalog_from_seed, register_intake_catalog
@@ -485,3 +489,86 @@ def test_non_owner_data_scientist_denied_clarify_and_confirm_and_audited(db):
     )
     assert good.accepted, good.denied_reason
     assert get_contract(db, run_id).status == "CONFIRMED"
+
+
+def test_prohibited_class_intent_is_blocked_before_any_llm_call(db):
+    """The hard no-PII / fail-closed-before-the-model boundary (§5.4, Task 4.5; X5/X8), end-to-end
+    over the REAL PolicyAuthorizer + audit. A `submit_intent` whose raw intent names a PROHIBITED data
+    class is BLOCKED at intake — submit_intent's deterministic banking-boundary screen (P2
+    `classify_intent`, most-restrictive-wins) resolves PROHIBITED_DATA_CLASS BEFORE `_produce_draft`,
+    so the intake-time terminal reject fires (submit_intent appends INTENT_REJECTED ITSELF via the R1
+    seam, then drives SP-0 RUN_REJECTED — X5, NOT a P8 `reject_intent` call, NOT SP-0's validator-only
+    `reject`) and NO payload is ever redacted or dispatched: the auditable-LLM envelope is never
+    reached, so the FakeLLM is never called and the `llm_call` store stays empty for the run.
+
+    NOTE — this scenario runs the REAL deterministic `classify_intent` over the `_BANKING_SEED` catalog
+    (the harness otherwise pins a CLEAR intake stub for a hermetic boundary); the block MUST come from
+    the genuine P2 screen. The assertions match the verified Task-4.5 code (cf. test_submit_intent_reject
+    / test_classify_intent), which differs from the brief's illustrative example in three particulars:
+    the reject actor is the dispatching requester (`_do_reject_intent` stamps `cmd.actor`), the seed's
+    blocked data class is `protected_attribute` (the class name `classify_intent` stamps as
+    `matched_class`, not the surface term "race"), and the catalog version key is `catalog_version`.
+    """
+    llm = _wire(db, fixtures={})  # no LLM fixtures — a blocked intent must never reach the model
+    # Run the REAL P2 banking-boundary screen over the seed (not the harness's pinned CLEAR stub): the
+    # block is exactly the deterministic classify_intent → PROHIBITED_DATA_CLASS this task proves fires.
+    register_intake_classifier(classify_intent)
+    raj = _data_scientist("user:raj")
+
+    submitted = execute_command(
+        db,
+        Command(
+            "submit_intent",
+            "feature_contract",
+            None,
+            {
+                "request_id": "req-prohib-1",
+                "intent_text": "count of declined card authorizations per customer, split by customer race",
+                "intake_mode": "definition",
+                "product": "card_payments",
+                "region": "US",
+            },
+            raj,
+            "ik-prohib-submit",
+        ),
+    )
+    assert submitted.accepted, submitted.denied_reason  # the command runs; the CONTRACT is what folds terminal
+    run_id = submitted.aggregate_id
+
+    # the folded feature_contract status is the terminal block
+    assert get_contract(db, run_id).status == "PROHIBITED_DATA_CLASS"
+
+    # submit_intent's OWN intake-time terminal rejection, stamping the matched class + catalog version
+    rej = db.execute(
+        "SELECT payload, actor FROM events WHERE run_id=%s AND type='INTENT_REJECTED'", (run_id,)
+    ).fetchone()
+    assert rej is not None, "a prohibited intent must emit INTENT_REJECTED"
+    payload, actor = rej
+    assert payload["classification"] == "PROHIBITED_DATA_CLASS"
+    assert payload["matched_class"] == "protected_attribute"  # the seed's blocked class name (surface term: "race")
+    assert payload["catalog_version"] == _BANKING_SEED["catalog_version"]
+    # X5: submit_intent appends its OWN intake-time INTENT_REJECTED (NOT a P8 reject_intent call, NOT a
+    # validator-only reject); _do_reject_intent stamps cmd.actor — here the dispatching requester.
+    assert actor["subject"] == raj.subject
+
+    # SP-0 run terminal outcome is RUN_REJECTED, driven by submit_intent's OWN intake-time reject
+    assert run_is_terminal(db, run_id) is True
+    assert (
+        db.execute(
+            "SELECT count(*) FROM events WHERE run_id=%s AND type='RUN_REJECTED'", (run_id,)
+        ).fetchone()[0]
+        == 1
+    )
+
+    # the hard no-PII boundary: no payload was ever dispatched — the FakeLLM was never called, no
+    # LLM_CALL_RECORDED was event-sourced, and the llm_call store is empty for the run.
+    assert llm._calls == {}, "the model must never be invoked on an intake-time block"
+    assert (
+        db.execute(
+            "SELECT count(*) FROM events WHERE run_id=%s AND type='LLM_CALL_RECORDED'", (run_id,)
+        ).fetchone()[0]
+        == 0
+    )
+    assert (
+        db.execute("SELECT count(*) FROM llm_call WHERE run_id=%s", (run_id,)).fetchone()[0] == 0
+    )
