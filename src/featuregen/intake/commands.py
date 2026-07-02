@@ -1599,7 +1599,13 @@ def confirm_contract(conn: DbConn, cmd: Command) -> CommandResult:
             accepted=False, aggregate_id=run_id,
             denied_reason=f"not ready for Gate #1 (status={status})",
         )
-    # [Task 7.3 INSERT: confirmer_is_requester_human guard]
+    # §8.2 — the confirmer MUST be the authenticated human requester (never a service, the LLM, or a
+    # DIFFERENT data scientist). A mismatch is denied + security-audited, before the gate is consumed.
+    if not _confirmer_is_requester_human(state, cmd.actor):
+        return _deny_audited(
+            conn, cmd, run_id,
+            "Gate #1 confirm requires the authenticated human requester (confirmer_is_requester_human)",
+        )
     draft_doc_id, draft_body = _final_draft(stream)
     if draft_body is None:
         return CommandResult(accepted=False, aggregate_id=run_id, denied_reason="no draft to confirm")
