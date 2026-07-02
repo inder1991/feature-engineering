@@ -28,7 +28,8 @@ from featuregen.authz.authorizer import PolicyAuthorizer
 from featuregen.authz.policy import seed_authz_policy
 from featuregen.commands.api import execute_command
 from featuregen.commands.authz_seam import register_command_authorizer
-from featuregen.contracts import Command
+from featuregen.contracts import Command, run_projection
+from featuregen.documents.primary import StagePrimaryProjection, current_primary
 from featuregen.identity.build import build_human_identity, build_service_identity
 from featuregen.intake.banking_catalog import (
     IntakeClassification,
@@ -36,12 +37,19 @@ from featuregen.intake.banking_catalog import (
     classify_intent,
 )
 from featuregen.intake.bootstrap import register_sp2, seed_sp2_authz
-from featuregen.intake.candidates import StubCandidateGenerator, register_candidate_generator
+from featuregen.intake.candidates import (
+    RecordingLLMClient,
+    StubCandidateGenerator,
+    current_candidate_generator,
+    generate_candidate_docs,
+    register_candidate_generator,
+)
 from featuregen.intake.catalog import load_banking_catalog_from_seed, register_intake_catalog
 from featuregen.intake.commands import register_intake_classifier, register_intake_deps
 from featuregen.intake.llm import FakeLLM, FakeResponse, register_llm_client
 from featuregen.intake.read_model import get_contract
 from featuregen.intake.redaction import DefaultIntentRedactor, register_intent_redactor
+from featuregen.intake.store import load_feature_contract
 
 # ── the SP-0-governed read-only BankingDomainCatalog seed (§4.5) ──────────────────────────────────
 # Shaped so the REAL deterministic classify_intent (which the §8.4 confirmation-time re-screen runs,
@@ -572,3 +580,206 @@ def test_prohibited_class_intent_is_blocked_before_any_llm_call(db):
     assert (
         db.execute("SELECT count(*) FROM llm_call WHERE run_id=%s", (run_id,)).fetchone()[0] == 0
     )
+
+
+# ══ hypothesis-mode E2E (Task 9.5): stub candidates → advance_intake → confirm(candidate) → CONFIRMED ══
+# The hypothesis-mode acceptance milestone: a hypothesis intent is driven end-to-end over the ASSEMBLED
+# P1–P8 stack under the REAL PolicyAuthorizer + audit, from `submit_intent` to a CONFIRMED contract whose
+# calculation_method is a human-selected candidate promoted to PRIMARY (PRIMARY_SELECTED). The FakeLLM is
+# scripted per task (structure_intent → 1 resolved hypothesis Draft; generate_candidates → 3 scored
+# candidate-role Draft docs; contract_review → a finding-free verdict so refine_contract converges).
+#
+# PRODUCTION-GAP NOTE (flagged — mirrors the earlier Draft→MCV / advance_intake glue gap): candidate
+# generation is NOT triggered by the production pipeline. `generate_candidate_docs` (Task 6.4) is an
+# orchestrator with NO production caller — neither `submit_intent`/`_produce_draft` nor `advance_intake`
+# invoke `current_candidate_generator()`, and `_produce_draft`'s DRAFT_CONTRACT_PRODUCED payload records
+# no `candidate_doc_ids`. So this E2E DRIVES candidate generation explicitly (event-sourced via
+# RecordingLLMClient + StubCandidateGenerator, wired through register_candidate_generator) BEFORE
+# advance_intake. Once candidate docs exist, the REAL pipeline carries the run the rest of the way:
+# refine_contract's MCV reads the candidate count off the DB (`_candidate_count`), so it PASSES (§6.7 #2,
+# hypothesis: a non-empty scored candidate set) and advance_intake opens Human Gate #1 — no manual MCV.
+# The Draft is scripted fully resolved so the Doubt Router asks nothing and MCV passes on the first pass.
+
+# structure_intent: a schema-valid, fully-resolved hypothesis DRAFT_CONTRACT body (clones the proven
+# definition envelope so `call_llm` validates it against DRAFT_CONTRACT@1). The primary Draft's string
+# calculation_method stays a resolvable `rolling_count` — confirm_contract reshapes the CONFIRMED body's
+# tagged method from the PRIMARY Draft (§4.2), NOT from the promoted candidate doc, so it must resolve.
+# The screen-contributing fields (proposed_feature_name / target_definition / filter concept "declined
+# card authorization") classify CLEAR under _BANKING_SEED at the §8.4 confirmation-time re-screen.
+_HYP_STRUCTURE_OUTPUT = {
+    **_STRUCTURE_OUTPUT,
+    "intake_mode": "hypothesis",
+    "proposed_feature_name": "card_auth_shift_30d",
+    "feature_semantics": {
+        **_STRUCTURE_OUTPUT["feature_semantics"],
+        "windows": [{"name": "lookback", "value": "30d"}],
+        "target_definition": "delinquency 90+ days past due within 12 months (permitted performance label)",
+    },
+}
+# generate_candidates: 3 candidate definitions, each with a tagged `calculation_method` whose `chosen.kind`
+# is in the closed §4.2 vocabulary — the deterministic normalizer (`_as_tagged_method`) keeps all three.
+_HYP_CANDIDATES_OUTPUT = {
+    "candidates": [
+        {
+            "definition_text": "distinct merchant-category codes last 30d minus prior 30d",
+            "rationale": "abrupt breadth change signals distress",
+            "calculation_method": {
+                "method_version": 1,
+                "chosen": {"kind": "distribution_divergence", "measure": "distinct_mcc_delta",
+                           "window": "30d", "baseline_window": "30d"},
+                "considered": [],
+            },
+        },
+        {
+            "definition_text": "top-1 category spend share this month vs the 3-month average",
+            "rationale": "concentration shift",
+            "calculation_method": {
+                "method_version": 1,
+                "chosen": {"kind": "ratio", "numerator": "top1_share_1m",
+                           "denominator": "top1_share_3m_avg", "window": "1m"},
+                "considered": [],
+            },
+        },
+        {
+            "definition_text": "Jensen-Shannon divergence of category-spend vs trailing 6 months",
+            "rationale": "distribution drift",
+            "calculation_method": {
+                "method_version": 1,
+                "chosen": {"kind": "distribution_divergence", "measure": "jensen_shannon",
+                           "window": "1m", "baseline_window": "6m"},
+                "considered": [],
+            },
+        },
+    ]
+}
+_HYP_FIXTURES = {  # R19 — FakeResponse-wrapped, keyed by task for FakeLLM(script=...)
+    "structure_intent": FakeResponse(output=_HYP_STRUCTURE_OUTPUT),
+    "contract_review": FakeResponse(output=_OK_REVIEW),
+    "generate_candidates": FakeResponse(output=_HYP_CANDIDATES_OUTPUT),
+}
+
+
+def _candidate_doc_ids(db, run_id):
+    """The candidate-role DRAFT_CONTRACT documents frozen under the run's Draft stage (§7.1)."""
+    rows = db.execute(
+        "SELECT doc_id FROM documents WHERE run_id=%s AND stage='DRAFT_CONTRACT' "
+        "AND branch_role='candidate' ORDER BY doc_id",
+        (run_id,),
+    ).fetchall()
+    return [r[0] for r in rows]
+
+
+def _primary_draft(db, run_id):
+    """(draft_doc_id, request_id, draft_body) of the run's primary Draft — the inputs the hypothesis
+    candidate generator (Task 6.4 `generate_candidate_docs`) derives its candidate docs from."""
+    stream = load_feature_contract(db, run_id)
+    produced = next(e for e in stream if e.type == "DRAFT_CONTRACT_PRODUCED")
+    return produced.payload["draft_doc_id"], produced.request_id, produced.payload["draft_body"]
+
+
+def test_hypothesis_stub_candidates_select_and_confirm(db):
+    llm = _wire(db, fixtures=_HYP_FIXTURES, generator=True)
+    raj = _data_scientist("user:raj")
+    agent = _intake_agent()
+
+    # ── intake: submit_intent (hypothesis, CLEAR) → frozen primary Draft, fully resolved ────────────
+    submitted = execute_command(
+        db,
+        Command(
+            "submit_intent",
+            "feature_contract",
+            None,
+            {
+                "request_id": "req-hyp-1",
+                "intent_text": "customers who abruptly shift spending category are higher credit risk",
+                "intake_mode": "hypothesis",
+                "product": "credit_risk",
+                "region": "US",
+            },
+            raj,
+            "ik-hyp-submit",
+        ),
+    )
+    assert submitted.accepted, submitted.denied_reason
+    run_id = submitted.aggregate_id
+    assert get_contract(db, run_id).status == "NEEDS_CLARIFICATION"
+
+    # ── PRODUCTION GAP (flagged): nothing in the pipeline triggers candidate generation. Drive it
+    #    explicitly — event-sourced via RecordingLLMClient (one `generate_candidates` LLM call recorded)
+    #    → StubCandidateGenerator → generate_candidate_docs freezes 1–3 candidate-role Draft docs. ─────
+    draft_doc_id, request_id, draft_body = _primary_draft(db, run_id)
+    register_candidate_generator(
+        StubCandidateGenerator(RecordingLLMClient(conn=db, inner=llm, run_id=run_id, actor=raj))
+    )
+    cand_ids = generate_candidate_docs(
+        db,
+        current_candidate_generator(),
+        draft=draft_body,
+        catalog_metadata={"concepts": ["declined card authorization", "mcc", "transactions"]},
+        domain_context=None,
+        draft_doc_id=draft_doc_id,
+        run_id=run_id,
+        request_id=request_id,
+        actor=raj,
+    )
+    assert 1 <= len(cand_ids) <= 3
+    assert set(_candidate_doc_ids(db, run_id)) == set(cand_ids)
+    chosen = cand_ids[0]
+    # the ONE hypothesis-generation pass was event-sourced (auditable-LLM envelope, §9.1/§9.3)
+    assert db.execute(
+        "SELECT count(*) FROM llm_call WHERE run_id=%s AND task='generate_candidates'", (run_id,)
+    ).fetchone()[0] == 1
+
+    # ── advance_intake self-drives refine → MCV → Gate #1 (Task 9.2a). MCV #2 passes because a NON-EMPTY
+    #    scored candidate set now exists (`_candidate_count` reads the frozen candidate docs, §6.7 #2). ──
+    advanced = execute_command(
+        db,
+        Command("advance_intake", "feature_contract", run_id, {"run_id": run_id}, agent, "ik-hyp-advance"),
+    )
+    assert advanced.accepted, advanced.denied_reason
+    assert get_contract(db, run_id).status == "MINIMUM_CONTRACT_VALIDATED"
+    gate_task, gv = _only_open_task(db, run_id)
+
+    # ── Gate #1: the owner confirms with the human-SELECTED candidate → PRIMARY_SELECTED promotion +
+    #    the confirmation record (selected / rejected write-once losers) → CONTRACT_CONFIRMED. ──────────
+    confirmed = execute_command(
+        db,
+        Command(
+            "confirm_contract",
+            "feature_contract",
+            run_id,
+            {
+                "run_id": run_id,
+                "task_id": gate_task,
+                "expected_task_version": gv,
+                "candidate_doc_id": chosen,
+            },
+            raj,
+            "ik-hyp-confirm",
+        ),
+    )
+    assert confirmed.accepted, confirmed.denied_reason
+
+    # the chosen candidate was promoted via document PRIMARY_SELECTED (write-once losers untouched). The
+    # stage_primary projection is checkpoint-driven — drive it synchronously to read it back (§3.4).
+    run_projection(db, StagePrimaryProjection())
+    assert current_primary(db, run_id, "DRAFT_CONTRACT") == chosen
+
+    # ── SP-3 hand-off: the CONFIRMED contract get_contract serves ───────────────────────────────────
+    view = get_contract(db, run_id)
+    assert view.status == "CONFIRMED"
+    c = view["confirmed"]
+    assert c["intake_mode"] == "hypothesis"
+    assert c["confirmation"]["selected_candidate"] == chosen
+    # the write-once losing candidate doc-ids live ONLY in the Gate #1 confirmation record (§8.3)
+    assert set(c["confirmation"]["rejected_candidates"]) == set(cand_ids) - {chosen}
+    # confirm reshapes the CONFIRMED body's tagged calculation_method from the PRIMARY Draft (§4.2) — SP-3
+    # switches on chosen.kind; the closed vocabulary holds (the candidate docs carry the interesting
+    # method variants — distribution_divergence / ratio — recorded on the candidate docs themselves).
+    assert c["calculation_method"]["chosen"]["kind"] in (
+        "rolling_aggregate", "point_snapshot", "ratio", "distribution_divergence",
+    )
+    # PRODUCTION GAP (flagged): the §8.4 risk-flag screen is NOT wired — `assemble_draft_body` never
+    # populates `risk_flags`, so requires_independent_validation is always False from the REAL pipeline
+    # (the True path is unit-covered by Task 7.5 via a seeded risk_flags Draft).
+    assert c["requires_independent_validation"] is False
