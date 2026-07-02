@@ -44,6 +44,25 @@ def test_record_and_read_round_trip(db):
     assert rec.validation_result == {"result": STATUS_OK}
 
 
+def test_populated_repair_attempts_round_trip(db):
+    # The 0510 change made repair_attempts a LIST of {attempt,class,reason} records (jsonb).
+    # Assert a NON-empty list survives the jsonb round-trip with order + dict contents intact.
+    run_id = new_run_id()
+    attempts = [
+        {"attempt": 1, "class": "invalid", "reason": "schema_mismatch"},
+        {"attempt": 2, "class": "invalid", "reason": "..."},
+    ]
+    ref = record_llm_call(
+        db, run_id=run_id, request=_req(), input_hash="hash-abc",
+        redaction_version="default-redactor@1", input_redaction={"redacted_spans": []},
+        raw_output={"output": {"entity": "customer"}, "self_reported_scores": {}},
+        validation_result={"result": STATUS_OK}, repair_attempts=attempts,
+        latency_ms=3, cost_metadata={"input_tokens": 40}, created_by=identity_to_jsonb(service_actor()),
+    )
+    rec = read_llm_call(db, ref)
+    assert rec.repair_attempts == attempts
+
+
 def test_read_unknown_raises(db):
     with pytest.raises(KeyError):
         read_llm_call(db, "llmc_nope")
