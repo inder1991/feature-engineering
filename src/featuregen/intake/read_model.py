@@ -129,3 +129,14 @@ def get_contract(conn: DbConn, run_id: str) -> ContractView | None:
         reason_if_unavailable=reason,
         _bodies=bodies,
     )
+
+
+def read_contract_status(conn: DbConn, run_id: str) -> FeatureContractStatus | None:
+    """OPTIONAL, SECONDARY status query (§11, §12). Fold-backed and fail-closed: returns the folded
+    status, or None when no `feature_contract` was opened for the run. NEVER a command decision —
+    handlers always fold their own stream inline (a stored OverlayProjection-style table is out of
+    scope: SP-2 ships exactly two migrations, both in P1)."""
+    stream = load_feature_contract(conn, run_id)
+    if not stream:
+        return None
+    return fold_feature_contract_state(stream).status
