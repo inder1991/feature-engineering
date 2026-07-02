@@ -1,13 +1,19 @@
 import pytest
 
+from featuregen.contracts import SchemaValidationError
 from featuregen.intake.llm import (
     PROVIDER_OK,
     PROVIDER_REFUSAL,
+    STATUS_FAILED,
+    STATUS_OK,
+    STATUS_REPAIRED,
+    STATUS_RETRIED,
     FakeLLM,
     FakeResponse,
     LLMRequest,
     LLMResult,
     compute_input_hash,
+    drive_structured_call,
 )
 
 
@@ -101,3 +107,74 @@ def test_llm_client_seam_registers_and_fails_closed_when_unset():
     fake = FakeLLM(script={"structure_intent": FakeResponse(output={"entity": "customer"})})
     register_llm_client(fake)
     assert current_llm_client() is fake
+
+
+# ---- structured-output taxonomy (§9.2) ------------------------------------------------------
+
+
+def _needs_entity(output):
+    if "entity" not in output:
+        raise SchemaValidationError("missing required field: entity")
+
+
+def test_ok_first_try():
+    fake = FakeLLM()
+    fake.script(task="structure_intent", prompt_id="intake.v1",
+                responses=[FakeResponse(output={"entity": "customer"})])
+    out = drive_structured_call(fake, _req(), _needs_entity)
+    assert out.status == STATUS_OK
+    assert out.output == {"entity": "customer"}
+    assert out.repair_attempts == ()
+    assert out.validation_result == {"result": STATUS_OK}
+
+
+def test_provider_ok_but_schema_invalid_repairs_then_validates():
+    fake = FakeLLM()
+    fake.script(task="structure_intent", prompt_id="intake.v1",
+                responses=[FakeResponse(output={"wrong": 1}),                 # ok token, invalid body
+                           FakeResponse(output={"entity": "customer"})])       # repair validates
+    out = drive_structured_call(fake, _req(), _needs_entity)
+    assert out.status == STATUS_REPAIRED
+    assert out.output == {"entity": "customer"}
+    assert len(out.repair_attempts) == 1 and out.repair_attempts[0]["class"] == "repair"
+
+
+def test_repair_budget_exhausted_fails_into_clarification():
+    fake = FakeLLM()
+    fake.script(task="structure_intent", prompt_id="intake.v1",
+                responses=[FakeResponse(output={}, provider_status="invalid"),
+                           FakeResponse(output={}, provider_status="invalid"),
+                           FakeResponse(output={}, provider_status="invalid")])
+    out = drive_structured_call(fake, _req(), _needs_entity, repair_budget=2)
+    assert out.status == STATUS_FAILED
+    assert len(out.repair_attempts) == 2  # N=2 repairs attempted, then fail closed
+    assert out.validation_result["result"] == STATUS_FAILED
+
+
+def test_refusal_fails_into_clarification_without_repair():
+    fake = FakeLLM()
+    fake.script(task="structure_intent", prompt_id="intake.v1",
+                responses=[FakeResponse(output={}, provider_status="refusal"),
+                           FakeResponse(output={"entity": "customer"})])  # must NOT be consumed
+    out = drive_structured_call(fake, _req(), _needs_entity)
+    assert out.status == STATUS_FAILED
+    assert out.repair_attempts == ()  # a decline is not a malformed structure — no repair
+
+
+def test_max_tokens_retries_then_validates():
+    fake = FakeLLM()
+    fake.script(task="structure_intent", prompt_id="intake.v1",
+                responses=[FakeResponse(output={}, provider_status="max_tokens"),
+                           FakeResponse(output={"entity": "customer"})])
+    out = drive_structured_call(fake, _req(), _needs_entity)
+    assert out.status == STATUS_RETRIED
+    assert out.repair_attempts[0]["class"] == "retry"
+
+
+def test_auth_error_fails_closed_and_flags_security_audit():
+    fake = FakeLLM()
+    fake.script(task="structure_intent", prompt_id="intake.v1",
+                responses=[FakeResponse(output={}, provider_status="auth_error")])
+    out = drive_structured_call(fake, _req(), _needs_entity)
+    assert out.status == STATUS_FAILED
+    assert out.security_audit_reason is not None

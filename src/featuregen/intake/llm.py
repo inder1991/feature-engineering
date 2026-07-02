@@ -10,9 +10,11 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, field, replace
 from typing import Any, Protocol, runtime_checkable
+
+from featuregen.contracts import SchemaValidationError
 
 # ---- shared-contract shapes (overview §9.1) -------------------------------------------------
 
@@ -135,6 +137,105 @@ class FakeLLM:
             call_ref="",
             status=resp.provider_status,
         )
+
+
+# ---- structured-output taxonomy (§9.2): bounded repair / bounded retry / fail-closed ---------
+
+DEFAULT_REPAIR_BUDGET = 2   # config-gated malformed-structure repairs (Decision D5)
+DEFAULT_RETRY_BUDGET = 2    # config-gated truncation/schema-fault/transient retries
+
+_RETRYABLE = (PROVIDER_MAX_TOKENS, PROVIDER_SCHEMA_FAULT, PROVIDER_TRANSIENT)
+
+
+@dataclass(frozen=True)
+class StructuredCallOutcome:
+    output: dict
+    self_reported_scores: dict
+    status: str                 # STATUS_*
+    validation_result: dict     # {"result": status, "reason"?: str}
+    repair_attempts: tuple      # ({attempt, class, reason}, ...)
+    cost_metadata: dict
+    security_audit_reason: str | None
+
+
+def _failed(resp: LLMResult, attempts: list, reason: str, *, security_audit: bool = False) -> StructuredCallOutcome:
+    return StructuredCallOutcome(
+        output=dict(resp.output),
+        self_reported_scores=dict(resp.self_reported_scores),
+        status=STATUS_FAILED,
+        validation_result={"result": STATUS_FAILED, "reason": reason},
+        repair_attempts=tuple(attempts),
+        cost_metadata={},
+        security_audit_reason=reason if security_audit else None,
+    )
+
+
+def drive_structured_call(
+    client: LLMClient,
+    request: LLMRequest,
+    validate_output: Callable[[Mapping[str, Any]], None],
+    *,
+    repair_budget: int = DEFAULT_REPAIR_BUDGET,
+    retry_budget: int = DEFAULT_RETRY_BUDGET,
+) -> StructuredCallOutcome:
+    """Drive one structured LLM call to a fail-closed disposition (§9.2). Provider-agnostic:
+    re-invokes `client.call` for repairs/retries. `validate_output(output)` raises
+    SchemaValidationError on an invalid structure. A `PROVIDER_OK` whose body fails validation is
+    malformed structure → bounded repair. Refusal → fail into clarification directly (no repair).
+    Truncation/schema-fault/transient → bounded retry. Auth → fail closed + security-audit signal.
+    Nothing proceeds on an unresolved outcome; an invalid structure is a doubt, not a value."""
+    attempts: list[dict] = []
+    repairs_used = 0
+    retries_used = 0
+    errors: list[str] = []
+    resp = client.call(request)
+    while True:
+        ps = resp.status
+        if ps == PROVIDER_OK:
+            try:
+                validate_output(resp.output)
+            except SchemaValidationError as exc:
+                ps = PROVIDER_INVALID
+                errors.append(str(exc))
+            else:
+                status = (
+                    STATUS_REPAIRED if repairs_used
+                    else STATUS_RETRIED if retries_used
+                    else STATUS_OK
+                )
+                return StructuredCallOutcome(
+                    output=dict(resp.output),
+                    self_reported_scores=dict(resp.self_reported_scores),
+                    status=status,
+                    validation_result={"result": status},
+                    repair_attempts=tuple(attempts),
+                    cost_metadata={},
+                    security_audit_reason=None,
+                )
+        if ps == PROVIDER_INVALID:
+            if repairs_used < repair_budget:
+                repairs_used += 1
+                reason = errors[-1] if errors else "structure did not validate"
+                attempts.append({"attempt": repairs_used, "class": "repair", "reason": reason})
+                # re-prompt with the accumulated validation error, via a transient (`_`-prefixed)
+                # key EXCLUDED from the identity hash so the repair keeps its parent's identity.
+                request = replace(request, inputs={**request.inputs, "_repair_errors": list(errors)})
+                resp = client.call(request)
+                continue
+            return _failed(resp, attempts, "repair budget exhausted (malformed structure)")
+        if ps == PROVIDER_REFUSAL:
+            return _failed(resp, attempts, "provider refusal (policy decline)")
+        if ps in _RETRYABLE:
+            if retries_used < retry_budget:
+                retries_used += 1
+                attempts.append({"attempt": retries_used, "class": "retry", "reason": ps})
+                resp = client.call(request)
+                continue
+            return _failed(resp, attempts, f"{ps} retry budget exhausted")
+        if ps == PROVIDER_AUTH_ERROR:
+            return _failed(resp, attempts, "provider auth failure", security_audit=True)
+        # PROVIDER_NON_RETRYABLE and any unknown token → fail closed
+        return _failed(resp, attempts, f"non-retryable provider outcome ({ps})")
 
 
 # ---- R10 collaborator DI seam (module-global; mirrors overlay/catalog.py) --------------------
