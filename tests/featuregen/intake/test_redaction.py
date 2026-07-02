@@ -1,3 +1,5 @@
+from dataclasses import dataclass as _dc
+
 import pytest
 
 from featuregen.intake.redaction import (
@@ -9,6 +11,7 @@ from featuregen.intake.redaction import (
     DefaultIntentRedactor,
     EgressViolation,
     RedactionResult,
+    assert_llm_safe,
     build_llm_inputs,
 )
 
@@ -89,3 +92,58 @@ def test_intent_redactor_seam_registers_and_fails_closed_when_unset():
         current_intent_redactor()
     register_intent_redactor(DefaultIntentRedactor())
     assert isinstance(current_intent_redactor(), DefaultIntentRedactor)
+
+
+@_dc(frozen=True)
+class _Req:  # a duck-typed stand-in for LLMRequest (Task 3.3) — the guard reads .inputs only
+    inputs: dict
+
+
+def _safe_inputs():
+    return {
+        INPUT_KEY_INTENT: "count declined auths per customer",
+        INPUT_KEY_CATALOG: {"objects": ["card_authorizations"], "columns": {"auth_result": "text"}},
+        INPUT_KEY_CLASSIFICATION: "clean",
+        INPUT_KEY_REDACTION_VERSION: "default-redactor@1",
+        INPUT_KEY_REDACTION: {"redacted_spans": []},
+    }
+
+
+def test_egress_allows_clean_metadata_only_payload():
+    assert_llm_safe(_Req(_safe_inputs()))  # no raise
+
+
+def test_egress_refuses_unscanned():
+    i = _safe_inputs()
+    i[INPUT_KEY_CLASSIFICATION] = "unscanned"
+    with pytest.raises(EgressViolation):
+        assert_llm_safe(_Req(i))
+
+
+def test_egress_refuses_missing_classification():
+    i = _safe_inputs()
+    del i[INPUT_KEY_CLASSIFICATION]
+    with pytest.raises(EgressViolation):
+        assert_llm_safe(_Req(i))
+
+
+def test_egress_refuses_data_value_keys():
+    i = _safe_inputs()
+    i["column_values"] = ["D", "A", "R"]  # profiled value set — SP-1/SP-3 territory, never to the LLM
+    with pytest.raises(EgressViolation):
+        assert_llm_safe(_Req(i))
+
+
+def test_egress_refuses_contains_pii_without_redaction_version():
+    i = _safe_inputs()
+    i[INPUT_KEY_CLASSIFICATION] = "contains_pii"
+    del i[INPUT_KEY_REDACTION_VERSION]
+    with pytest.raises(EgressViolation):
+        assert_llm_safe(_Req(i))
+
+
+def test_egress_refuses_unredacted_pii_in_content():
+    i = _safe_inputs()
+    i[INPUT_KEY_INTENT] = "count logins for jane.doe@bank.example"  # slipped past redaction
+    with pytest.raises(EgressViolation):
+        assert_llm_safe(_Req(i))

@@ -107,6 +107,57 @@ def build_llm_inputs(
     }
 
 
+# Keys that carry DATA VALUES (rows / samples / profiled value-sets / extrema) rather than
+# METADATA. Actual value/status-code sets are SP-1 profiling + SP-3 grounding (§4.4) — they must
+# NEVER reach the LLM. Their presence in an outbound payload is a hard egress violation.
+_FORBIDDEN_INPUT_KEYS = (
+    "raw_input", "data_values", "column_values", "value_set",
+    "rows", "samples", "profile", "extrema", "min", "max",
+)
+
+
+def _iter_strings(value: Any):
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, Mapping):
+        for v in value.values():
+            yield from _iter_strings(v)
+    elif isinstance(value, (list, tuple)):
+        for v in value:
+            yield from _iter_strings(v)
+
+
+def _first_pii(*values: Any) -> str | None:
+    for value in values:
+        for s in _iter_strings(value):
+            for label, pat in _PII_PATTERNS:
+                if pat.search(s):
+                    return label
+    return None
+
+
+def assert_llm_safe(request) -> None:
+    """Egress hard-backstop (§9.4). Deterministic pre-send check on an LLMRequest: refuses
+    `unscanned`/unclassified content, data-value keys, a `contains_pii` payload that never went
+    through redaction, or any un-redacted PII in the model-facing content. Raises EgressViolation
+    (a HARD failure) — the conn-holding caller (call_llm) records it in the security-audit stream.
+    Never mutates; never a warning."""
+    inputs = request.inputs
+    cls = inputs.get(INPUT_KEY_CLASSIFICATION)
+    if cls == "unscanned":
+        raise EgressViolation("refusing to dispatch an `unscanned` intent to the LLM")
+    if cls not in ("clean", "contains_pii"):
+        raise EgressViolation(f"missing/invalid {INPUT_KEY_CLASSIFICATION}: {cls!r}")
+    present = [k for k in _FORBIDDEN_INPUT_KEYS if k in inputs]
+    if present:
+        raise EgressViolation(f"payload carries data-value keys, not metadata: {present}")
+    if cls == "contains_pii" and not inputs.get(INPUT_KEY_REDACTION_VERSION):
+        raise EgressViolation("`contains_pii` payload lacks a redaction_version (never redacted)")
+    hit = _first_pii(inputs.get(INPUT_KEY_INTENT), inputs.get(INPUT_KEY_CATALOG))
+    if hit:
+        raise EgressViolation(f"un-redacted {hit} detected in outbound payload")
+
+
 # ---- R10 collaborator DI seam (module-global; mirrors overlay/catalog.py) --------------------
 # The ONE holder for the active IntentRedactor. P4 (submit_intent) resolves the redactor via
 # current_intent_redactor(); P9 registers it via register_intent_redactor(...). Fail-closed if
