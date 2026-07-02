@@ -12,6 +12,7 @@ import pytest
 from featuregen.aggregates.bootstrap import register_phase06_event_schemas
 from featuregen.documents.registry import DocumentSchemaRegistry
 from featuregen.events.registry import event_registry
+from featuregen.identity.build import build_human_identity, build_service_identity
 from featuregen.intake.banking_catalog import IntakeClassification, IntakeOutcome
 from featuregen.intake.catalog import (  # R8/R10 seam (P2, catalog.py)
     _clear_intake_catalog,
@@ -145,3 +146,28 @@ def intake_catalog():
     catalog = load_banking_catalog_from_seed({})
     register_intake_catalog(catalog)
     return catalog
+
+
+@pytest.fixture
+def sp2_schemas(db):
+    """The DRAFT/LEDGER/CONFIRMED content-schemas + the CONTRACT_REVIEW structured LLM output-schema
+    that call_llm resolves (Task 5.3). register_critique_schemas is imported LAZILY so a critique-module
+    import fault confines itself to critique tests rather than the whole intake suite."""
+    from featuregen.intake.critique import register_critique_schemas
+
+    registry = DocumentSchemaRegistry(db)
+    register_contract_schemas(registry)
+    register_critique_schemas(registry)
+    return db
+
+
+@pytest.fixture
+def owner():
+    return build_human_identity(subject="user:raj", role_claims=("data_scientist",))
+
+
+@pytest.fixture
+def agent():
+    return build_service_identity(
+        subject="service:intake-agent", role_claims=("intake-agent",), attestation="sig"
+    )
