@@ -115,6 +115,41 @@ _DEF_FIXTURES = {
     "contract_review": FakeResponse(output=_OK_REVIEW),
 }
 
+# ── clarification-round FakeLLM fixture (Task 9.3 SoD E2E): an AMBIGUOUS Draft with ONE must-ask open
+#    field so the SELF-DRIVING pipeline opens a REAL clarification task. structure_intent returns the
+#    same resolved envelope but with a high-ambiguity `filters` open field (predicate UNKNOWN) → the
+#    Doubt Router routes it to a human and advance_intake → refine_contract opens the clarification task
+#    the non-owner then tries (and fails) to answer. The owner's answer drives a `renormalize` round
+#    that resolves the field back to the fully-resolved semantics (open_fields=[]) → MCV → Gate #1.
+_AMBIGUOUS_STRUCTURE = {
+    **_STRUCTURE_OUTPUT,
+    "feature_semantics": {
+        **_STRUCTURE_OUTPUT["feature_semantics"],
+        "filters": [{"concept": "declined card authorization", "predicate": "UNKNOWN"}],
+    },
+    "field_scores": {
+        **_STRUCTURE_OUTPUT["field_scores"],
+        "filters": {"ambiguity": 0.80, "confidence": 0.40, "source": "llm"},
+    },
+    "open_fields": ["filters.declined_status_encoding"],
+    "open_questions": [{"field": "filters.declined_status_encoding",
+                        "question": "Which column/value marks a declined authorization?",
+                        "ambiguity": 0.80, "confidence": 0.40, "blocks_progress": True,
+                        "routed_to": "human"}],
+}
+# The owner's answer targets the still-open `filters` field → refine_contract runs a `renormalize`
+# round; this scripts it to resolve to the fully-resolved semantics (open_fields=[]) so the Loop
+# converges to MINIMUM_CONTRACT_VALIDATED and the next advance_intake opens Human Gate #1.
+_RENORMALIZE_RESOLVED = FakeResponse(
+    output={"feature_semantics": _STRUCTURE_OUTPUT["feature_semantics"], "open_fields": []},
+    self_reported_scores=_STRUCTURE_OUTPUT["field_scores"],
+)
+_CLARIFY_FIXTURES = {
+    "structure_intent": FakeResponse(output=_AMBIGUOUS_STRUCTURE),
+    "contract_review": FakeResponse(output=_OK_REVIEW),
+    "renormalize": _RENORMALIZE_RESOLVED,
+}
+
 
 class _ScoringView:
     """The R10 merged-view scoring seam refine_contract re-scores against (candidate_count + metadata).
@@ -315,3 +350,138 @@ def test_definition_intent_reaches_confirmed_contract_for_sp3(db):
     )
     assert get_contract(db, run_id).status == "CONFIRMED"  # unchanged — no regression, no re-advance
     assert _confirmed_primary_doc(db, run_id) is not None  # still the ONE frozen artifact
+
+
+def test_non_owner_data_scientist_denied_clarify_and_confirm_and_audited(db):
+    """SoD / request-owner enforcement E2E (§8.2, R4/R15): SP-0 role-authz is NECESSARY BUT NOT
+    SUFFICIENT. A DIFFERENT `data_scientist` — admitted by the coarse role row, yet NOT the request
+    owner — is DENIED by the in-handler owner guard at BOTH `answer_clarification`
+    (`actor_is_request_owner`) and `confirm_contract` (`confirmer_is_requester_human`); each denial is
+    routed to the tamper-evident security-audit stream (`record_denial` → decision='denied'), never
+    counted, with NO state change — while the rightful author still succeeds at each step.
+
+    Driven end-to-end via the production driver `advance_intake` (Task 9.2a) over the REAL
+    PolicyAuthorizer + audit: the scripted Draft carries ONE high-ambiguity must-ask field, so
+    advance_intake → refine_contract opens a REAL clarification task the impostor then attacks; the
+    owner's answer drives the Loop to MCV and a further advance opens Human Gate #1 (NOT a manual
+    open_gate1_task). Proves the coarse role row admits the impostor while the fine owner guard denies +
+    audits her, and the guard blocks the impostor — never the author."""
+    agent = _intake_agent()
+    _wire(db, fixtures=_CLARIFY_FIXTURES)
+    raj = _data_scientist("user:raj")          # the request owner (INTENT_SUBMITTED actor, REQUESTER)
+    mallory = _data_scientist("user:mallory")  # a DIFFERENT data_scientist (SAME role, not the owner)
+
+    submitted = execute_command(
+        db,
+        Command(
+            "submit_intent",
+            "feature_contract",
+            None,
+            {
+                "request_id": "req-owner-1",
+                "intent_text": "90-day rolling count of declined card authorizations per customer",
+                "intake_mode": "definition",
+                "product": "card_payments",
+                "region": "US",
+            },
+            raj,
+            "ik-own-submit",
+        ),
+    )
+    assert submitted.accepted, submitted.denied_reason
+    run_id = submitted.aggregate_id
+
+    # advance_intake self-drives refine_contract, which opens a REAL must-ask clarification task
+    # (the scripted Draft has one high-ambiguity open field) — the state the impostor then attacks.
+    adv = execute_command(
+        db,
+        Command("advance_intake", "feature_contract", run_id, {"run_id": run_id}, agent, "ik-own-advance-1"),
+    )
+    assert adv.accepted, adv.denied_reason
+    task_id, tv = _only_open_task(db, run_id)
+
+    # coarse authz admits mallory (role=data_scientist), but the request-owner guard denies her
+    denied = execute_command(
+        db,
+        Command(
+            "answer_clarification",
+            "feature_contract",
+            run_id,
+            {
+                "task_id": task_id,
+                "response": "confirm",
+                "expected_task_version": tv,
+                "answer": "card_authorizations.auth_result = 'D'",
+            },
+            mallory,
+            "ik-own-mallory-answer",
+        ),
+    )
+    assert denied.accepted is False
+    assert "owner" in (denied.denied_reason or "").lower()
+    n = db.execute(
+        "SELECT count(*) FROM security_audit "
+        "WHERE attempted_action='answer_clarification' AND decision='denied'"
+    ).fetchone()[0]
+    assert n >= 1
+    # nothing was counted — the task is UNTOUCHED and the true owner can still answer it
+    task_id2, tv2 = _only_open_task(db, run_id)
+    assert (task_id2, tv2) == (task_id, tv)
+    ok = execute_command(
+        db,
+        Command(
+            "answer_clarification",
+            "feature_contract",
+            run_id,
+            {
+                "task_id": task_id2,
+                "response": "confirm",
+                "expected_task_version": tv2,
+                "answer": "card_authorizations.auth_result = 'D'",
+            },
+            raj,
+            "ik-own-raj-answer",
+        ),
+    )
+    assert ok.accepted, ok.denied_reason
+
+    # the owner's answer drove the Loop to MCV; advance opens Human Gate #1 (Task 9.2a — NOT a manual
+    # open_gate1_task) — then prove a NON-owner cannot confirm either.
+    adv2 = execute_command(
+        db,
+        Command("advance_intake", "feature_contract", run_id, {"run_id": run_id}, agent, "ik-own-advance-2"),
+    )
+    assert adv2.accepted, adv2.denied_reason
+    gate_task, gv = _only_open_task(db, run_id)
+    bad_confirm = execute_command(
+        db,
+        Command(
+            "confirm_contract",
+            "feature_contract",
+            run_id,
+            {"run_id": run_id, "task_id": gate_task, "expected_task_version": gv},
+            mallory,
+            "ik-own-mallory-confirm",
+        ),
+    )
+    assert bad_confirm.accepted is False
+    assert get_contract(db, run_id).status != "CONFIRMED"
+    n2 = db.execute(
+        "SELECT count(*) FROM security_audit "
+        "WHERE attempted_action='confirm_contract' AND decision='denied'"
+    ).fetchone()[0]
+    assert n2 >= 1
+    # and the real owner CAN confirm (the guard blocks the impostor, not the author)
+    good = execute_command(
+        db,
+        Command(
+            "confirm_contract",
+            "feature_contract",
+            run_id,
+            {"run_id": run_id, "task_id": gate_task, "expected_task_version": gv},
+            raj,
+            "ik-own-raj-confirm",
+        ),
+    )
+    assert good.accepted, good.denied_reason
+    assert get_contract(db, run_id).status == "CONFIRMED"
