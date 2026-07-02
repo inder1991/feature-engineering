@@ -41,6 +41,9 @@ _SP2_POLICY_ROWS: tuple[tuple[str, str, str, str, str | None], ...] = (
     ("reject_intent", "", "intake-agent", "service", None),  # additive rejection authority (§2.1 #5)
     # requester abandonment (Task 8.4) — same scope as SP-0's `withdraw` (data_scientist/human), own action.
     ("withdraw_intent", "", "data_scientist", "human", None),
+    # Task 9.2a — the durable runtime drives advance_intake after submit_intent / answer_clarification
+    # (Draft → clarification | MCV → Gate #1); a service/platform capability, mirroring reject_intent.
+    ("advance_intake", "", "intake-agent", "service", None),
 )
 
 
@@ -48,7 +51,8 @@ def register_sp2(handler_registry) -> None:
     """Conn-less, in-memory registrations SP-0's `append` validation needs every process/test: the
     twelve `feature_contract` FC event schemas into the `event_registry()` singleton + the idempotent
     SP-2 command catalog (`_SP2_CATALOG` — submit_intent, answer_clarification, select_candidate_doc,
-    open_gate1_task, confirm_contract, request_edit, reject_intent, withdraw_intent). SP-2 registers NO
+    open_gate1_task, advance_intake, confirm_contract, request_edit, reject_intent, withdraw_intent).
+    SP-2 registers NO
     durable-runtime handlers, so nothing is put into `handler_registry` (accepted only for signature
     symmetry with the SP-0/SP-1 bootstraps — like SP-1's overlay, whose expiry poller is explicit, not a
     registered handler). The contract/critique/candidate output-schema registrations R11 groups under

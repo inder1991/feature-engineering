@@ -180,6 +180,8 @@ __all__ = [
     # _SP2_CATALOG + given its own ("withdraw_intent",...,"data_scientist","human") authz row in Task 9.1
     # (bootstrap._SP2_POLICY_ROWS) so a requester can dispatch it via execute_command.
     "withdraw_intent",
+    # Task 9.2a — the thin production driver connecting a Draft to (clarification | MCV) → Gate #1.
+    "advance_intake",
 ]
 
 
@@ -1683,6 +1685,50 @@ def _freeze_contract_doc(
     return doc_id
 
 
+# ── Gate #1 vs. clarification task discrimination (shared by _open_gate1_task + advance_intake) ──────
+# Both ride gate="CLARIFICATION" and carry the confirm/edit/reject response set, so they are
+# indistinguishable at the human_tasks-row level ALONE. The one structural tell: every per-field /
+# manual clarification task emits a CLARIFICATION_REQUESTED shadow carrying its `task_id`, while
+# `_open_gate1_task` appends NO feature_contract event — so a Gate #1 task's id NEVER appears in a
+# CLARIFICATION_REQUESTED. That shadow set is the discriminator both helpers below key on.
+_GATE1_RESPONSES = frozenset({"confirm", "edit", "reject"})
+
+
+def _clarification_task_ids(stream) -> set[str]:
+    """The gate-task ids the per-field / manual CLARIFICATION_REQUESTED shadows point at (a Gate #1 task
+    is never among them — `_open_gate1_task` appends no fc event)."""
+    ids = {e.payload.get("task_id") for e in stream if e.type == CLARIFICATION_REQUESTED}
+    ids.discard(None)
+    return ids
+
+
+def _open_clarification_task_ids(conn: DbConn, run_id: str, stream) -> list[str]:
+    """Open human_tasks for the run that ARE per-field / manual clarifications (a CLARIFICATION_REQUESTED
+    shadow points at them). Excludes an open Gate #1 confirmation task (no shadow) — so advance_intake
+    can tell "waiting on a human answer" from "the gate is already open"."""
+    shadowed = _clarification_task_ids(stream)
+    rows = conn.execute(
+        "SELECT task_id FROM human_tasks WHERE run_id=%s AND status='open'", (run_id,)
+    ).fetchall()
+    return [tid for (tid,) in rows if tid in shadowed]
+
+
+def _gate1_task_open(conn: DbConn, run_id: str, stream) -> bool:
+    """True iff an open Gate #1 confirmation task already exists for the run: an OPEN CLARIFICATION-gate
+    task whose allowed_responses are exactly the Gate #1 set AND which carries NO CLARIFICATION_REQUESTED
+    shadow (a per-field clarification always carries one; a leftover non-gate task uses a different
+    response set). Lets a retried open_gate1_task / advance_intake NO-OP instead of cancelling +
+    recreating a live gate (which would strand the requester's in-flight confirm on a superseded
+    task_version)."""
+    shadowed = _clarification_task_ids(stream)
+    rows = conn.execute(
+        "SELECT task_id, allowed_responses FROM human_tasks "
+        "WHERE run_id=%s AND status='open' AND gate='CLARIFICATION'",
+        (run_id,),
+    ).fetchall()
+    return any(tid not in shadowed and set(resp or ()) == _GATE1_RESPONSES for tid, resp in rows)
+
+
 # ── open_gate1_task (Task 7.1) ────────────────────────────────────────────────────────────────────
 def _open_gate1_task(conn: DbConn, run_id: str, *, actor) -> CommandResult:
     """Open the SEPARATE, dedicated Gate-#1 confirmation task — ONLY after MCV passes (§8.6). Reused by
@@ -1714,6 +1760,12 @@ def _open_gate1_task(conn: DbConn, run_id: str, *, actor) -> CommandResult:
         return CommandResult(
             accepted=False, aggregate_id=run_id, denied_reason="no request owner recorded"
         )
+    # Idempotency (Task 9.2a): a retried open (a re-driven advance_intake, a re-dispatched
+    # open_gate1_task) must NOT cancel + recreate an already-open Gate #1 task — churning its
+    # task_version would strand the requester's in-flight confirm on a now-superseded version. If the
+    # gate is already open, this is a no-op accept — CHECKED FIRST, before the defensive cancel below.
+    if _gate1_task_open(conn, run_id, stream):
+        return CommandResult(accepted=True, aggregate_id=run_id)
     draft_doc_id, _ = _final_draft(stream)
     # Defensive close: cancel any still-pending per-field clarification tasks so none can be answered
     # behind the open gate (§8.6). After a passing MCV there should be none.
@@ -1743,6 +1795,83 @@ def open_gate1_task(conn: DbConn, cmd: Command) -> CommandResult:
 
 # Task 7.1 — extend the SP-2 command catalog with the dedicated Gate-#1 opener.
 _SP2_CATALOG = _SP2_CATALOG + (("open_gate1_task", open_gate1_task),)
+
+
+# ═══ Task 9.2a — advance_intake: the thin production driver (Draft → clarification | MCV → Gate #1) ═══
+# The pipeline-initiation driver a durable runtime dispatches after submit_intent / answer_clarification
+# to carry an opened contract forward WITHOUT a fresh human answer — closing the gap the E2E surfaced
+# (submit_intent leaves a Draft; nothing wired it to MCV / Gate #1). It is a THIN driver over existing
+# pieces and duplicates NO router / MCV logic: `refine_contract` (Task 5.5) stays the routing engine
+# (score → critique → doubt-router → open must-ask tasks, or MINIMUM_CONTRACT_VALIDATED when clean) and
+# `_open_gate1_task` (Task 7.1) stays the gate opener. It decides off the P2 fold and NEVER leaves the
+# run stuck. X4: refine_contract / _open_gate1_task each CAS-pin their OWN head; advance_intake itself
+# appends only the Gate #1 human_task (no feature_contract transition of its own).
+def advance_intake(conn: DbConn, cmd: Command) -> CommandResult:
+    """Advance an opened feature_contract one production step (§6.6/§8.6). Folds the FC status, then:
+
+      * CONFIRMED / OUT_OF_SCOPE / PROHIBITED_DATA_CLASS (terminal) → no-op accept (nothing to drive).
+      * MINIMUM_CONTRACT_VALIDATED → open Gate #1 (idempotent — an already-open gate is a no-op).
+      * NEEDS_CLARIFICATION with an OPEN clarification task → no-op accept (waiting on the human).
+      * NEEDS_CLARIFICATION with NO open clarification task → run the FIRST-PASS route through
+        `refine_contract` (no prior answer needed: it re-scores → critiques → routes the CURRENT Draft):
+          - `validated`      → open Gate #1;
+          - `clarifying`     → leave the must-ask tasks it opened (no-op further);
+          - `parked`         → the Loop auto-parked for human follow-up (no-op further);
+          - `mcv_failed`     → open a manual review CLARIFICATION task + park (never a stranding denial);
+          - `stale`          → deny (X4 lost-update — a concurrent transition raced the fold).
+
+    Handler on an EXISTING stream: fold → decide; every commit is owned by refine_contract /
+    _open_gate1_task, each CAS-pinned to its own head (X4, fail-closed)."""
+    run_id = cmd.args.get("run_id") or cmd.aggregate_id
+    stream = load_feature_contract(conn, run_id)
+    if not stream:
+        return CommandResult(
+            accepted=False, aggregate_id=run_id or "", denied_reason="unknown feature_contract"
+        )
+    state = fold_feature_contract_state(stream)
+    status = state.status
+
+    # A no-regression-locked terminal (CONFIRMED / the banking-boundary rejects) — nothing to advance.
+    if state.is_terminal:
+        return CommandResult(accepted=True, aggregate_id=run_id)
+    # Already validated → open the audited Gate #1 (idempotent — _open_gate1_task no-ops a live gate).
+    if status is FeatureContractStatus.MINIMUM_CONTRACT_VALIDATED:
+        return _open_gate1_task(conn, run_id, actor=cmd.actor)
+    # NEEDS_CLARIFICATION is the only drivable state; an onboarding hold (or an un-opened stream) waits.
+    if status is not FeatureContractStatus.NEEDS_CLARIFICATION:
+        return CommandResult(accepted=True, aggregate_id=run_id)
+    # Waiting on a human: an open per-field / manual clarification task exists → no-op (do not re-route).
+    if _open_clarification_task_ids(conn, run_id, stream):
+        return CommandResult(accepted=True, aggregate_id=run_id)
+
+    # No open clarification → drive the first-pass route through the routing engine (NOT raw MCV): it
+    # opens must-ask tasks OR converges to MINIMUM_CONTRACT_VALIDATED. Deps default to the registered
+    # Layer-2 collaborators (client / redactor / catalog).
+    result = refine_contract(conn, run_id, actor=cmd.actor)
+    if result.status == "validated":
+        return _open_gate1_task(conn, run_id, actor=cmd.actor)
+    if result.status == "stale":
+        return CommandResult(
+            accepted=False, aggregate_id=run_id, denied_reason="stale: contract advanced concurrently"
+        )
+    if result.status == "mcv_failed":
+        # Never strand the run on a denial (a resolved-but-MCV-failing Draft has no open field for the
+        # Loop to re-ask): route it to a human via a manual review CLARIFICATION task + a park — the same
+        # fail-closed manual path §4.5(b) uses. A re-driven advance then no-ops on that open task.
+        failures = getattr(result.mcv, "failures", ()) or ()
+        _fail_closed_park(
+            conn, run_id=run_id, request_id=state.request_id, actor=cmd.actor,
+            field="minimum_contract",
+            question="minimum contract validation failed (" + ",".join(failures)
+                     + "); manual review required",
+        )
+        return CommandResult(accepted=True, aggregate_id=run_id)
+    # "clarifying" (must-ask tasks opened) / "parked" (bounded-exhaustion follow-up) — leave them as is.
+    return CommandResult(accepted=True, aggregate_id=run_id)
+
+
+# Task 9.2a — register advance_intake in the SP-2 command catalog (picked up by register_sp2_commands).
+_SP2_CATALOG = _SP2_CATALOG + (("advance_intake", advance_intake),)
 
 
 # ═══ Task 7.2 — confirm_contract (definition-mode happy path → CONFIRMED, §8.2/§8.5/§8.6) ═════════════

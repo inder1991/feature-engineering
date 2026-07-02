@@ -27,6 +27,7 @@ from featuregen.intake.catalog import (  # R8/R10 seam (P2, catalog.py)
 )
 from featuregen.intake.commands import (
     register_intake_classifier,  # Phase-4-local override of P2's classify_intent (NOT a shared seam)
+    register_intake_deps,
     register_sp2_commands,
     reset_intake_seams,
 )
@@ -50,8 +51,10 @@ def _register_intake_schemas(db):
     register_contract_schemas(DocumentSchemaRegistry(db))
     register_sp2_commands()  # idempotent
     reset_intake_seams()  # clear the Phase-4 classifier override between tests
+    register_intake_deps(client=None, redactor=None, catalog=None)  # no Refinement-Loop deps leak in
     yield
     reset_intake_seams()
+    register_intake_deps(client=None, redactor=None, catalog=None)  # …nor out (advance_intake/answer)
     _clear_intake_catalog()  # R10 catalog module-global must not leak across tests (Task 2.8 review)
 
 
