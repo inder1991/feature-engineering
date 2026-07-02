@@ -134,6 +134,13 @@ def fold_feature_contract_state(stream: Iterable) -> FeatureContractState:
             proposed_feature_name = p.get("proposed_feature_name", proposed_feature_name)
             field_scores = p.get("field_scores", field_scores)
             open_questions = tuple(p.get("open_questions") or open_questions)
+        elif t == events.CANDIDATES_GENERATED:
+            # Hypothesis mode (Task 9.5a): the primary Draft's DRAFT_CONTRACT_PRODUCED fires BEFORE the
+            # candidates exist (the generator runs off the frozen Draft), so the fold surfaces
+            # state.candidate_doc_ids from THIS shadow — the source run_minimum_contract_validation's
+            # MCV #2 (`len(state.candidate_doc_ids)`) and refine_contract's live `_candidate_count`
+            # now AGREE on the candidate count (§6.7 #2, closes gap D).
+            candidate_doc_ids = tuple(p.get("candidate_doc_ids") or candidate_doc_ids)
         elif t == events.CONTRACT_REFINED:
             draft_doc_id = p.get("draft_doc_id", draft_doc_id)
             open_fields = tuple(p.get("open_fields") or ())

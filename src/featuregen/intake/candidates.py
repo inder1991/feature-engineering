@@ -11,7 +11,13 @@ from featuregen.contracts.documents import NewDocument, Stage
 from featuregen.documents.draft import DRAFT_CONTRACT_SCHEMA_VERSION
 from featuregen.documents.store import append_document, compute_content_hash
 from featuregen.idgen import mint_id
-from featuregen.intake.llm import LLMClient, LLMRequest, LLMResult, call_llm
+from featuregen.intake.llm import (
+    LLMClient,
+    LLMRequest,
+    LLMResult,
+    call_llm,
+    current_llm_client,
+)
 from featuregen.intake.redaction import _first_pii, build_llm_inputs, current_intent_redactor
 
 # Structural-only metadata views (names/types/grain + catalog-DECLARED enum/code metadata ONLY —
@@ -147,9 +153,10 @@ def candidate_signals(
 # --- R10 collaborator DI seam (module-global; mirrors overlay/catalog.py's
 # register_catalog_adapter/current_catalog_adapter) -----------------------------------------
 # The process-wide CandidateGenerator SP-2's hypothesis flow resolves. This is the ONLY holder:
-# submit_intent (P4) calls current_candidate_generator(); the P1 conftest `candidate_generator`
-# fixture and P9's `_wire` composition root register the concrete generator via
-# register_candidate_generator(...) — register_sp2 (conn-less schema/catalog only) does NOT wire it.
+# advance_intake (P4, Task 9.5a) resolves it via `generate_candidates_for_run` (which calls
+# current_candidate_generator()); the P1 conftest `candidate_generator` fixture and P9's `_wire`
+# composition root register the concrete generator via register_candidate_generator(...) —
+# register_sp2 (conn-less schema/catalog only) does NOT wire it.
 _CANDIDATE_GENERATOR: CandidateGenerator | None = None
 
 
@@ -494,10 +501,10 @@ def generate_candidate_docs(
     request_id: str,
     actor: IdentityEnvelope,
 ) -> tuple[str, ...]:
-    """Hypothesis-mode entry point `submit_intent` (P4) calls after the primary Draft is frozen:
-    run the (event-sourced, `RecordingLLMClient`-wrapped) generator → freeze each candidate as a
-    candidate-role Draft document → return the candidate `doc_id`s (referenced by
-    `DRAFT_CONTRACT_PRODUCED`). Empty ⟹ generation failed closed → the run stays in clarification
+    """Hypothesis-mode orchestrator `generate_candidates_for_run` (Task 9.5a) calls after the primary
+    Draft is frozen: run the (event-sourced, `RecordingLLMClient`-wrapped) generator → freeze each
+    candidate as a candidate-role Draft document → return the candidate `doc_id`s (recorded on the
+    `CANDIDATES_GENERATED` shadow). Empty ⟹ generation failed closed → the run stays in clarification
     (§7.2). Generator-agnostic: this orchestration is IDENTICAL for the stub and SP-12."""
     candidates = generator.generate(draft, catalog_metadata, domain_context)
     if not candidates:
@@ -505,6 +512,55 @@ def generate_candidate_docs(
     return write_candidate_docs(
         conn,
         candidates=candidates,
+        draft_doc_id=draft_doc_id,
+        run_id=run_id,
+        request_id=request_id,
+        actor=actor,
+    )
+
+
+def _with_recording_client(
+    generator: CandidateGenerator, recording: RecordingLLMClient
+) -> CandidateGenerator:
+    """Rebind the registered generator's ONE LLM pass to the per-run, event-sourcing
+    `RecordingLLMClient` so `generate_candidates` writes an auditable `LLM_CALL_RECORDED` (§9.1/§9.3).
+    SP-2 ships exactly one concrete generator (`StubCandidateGenerator`); rebind preserves its pinned
+    `generator_version`. A future (SP-12) generator that manages its own event-sourced client is
+    returned unchanged (it already records)."""
+    if isinstance(generator, StubCandidateGenerator):
+        return StubCandidateGenerator(recording, generator_version=generator._generator_version)
+    return generator
+
+
+def generate_candidates_for_run(
+    conn: DbConn,
+    *,
+    draft: DraftContract,
+    catalog_metadata: CatalogView,
+    domain_context: DomainCatalogEntry | None,
+    draft_doc_id: str,
+    run_id: str,
+    request_id: str,
+    actor: IdentityEnvelope,
+) -> tuple[str, ...]:
+    """The PRODUCTION hypothesis-mode candidate-generation entry point `advance_intake` (Task 9.5a)
+    calls once a primary Draft exists but no candidates do (§7.2, closes gap B). Resolves the registered
+    `CandidateGenerator` (fail-closed via `current_candidate_generator()` — never silently zero
+    candidates on an unwired seam), rebinds its ONE LLM pass to the per-run event-sourcing
+    `RecordingLLMClient(conn, inner=current_llm_client(), run_id, actor)` so the generation pass is an
+    auditable `LLM_CALL_RECORDED`, then runs `generate_candidate_docs` to freeze 1–3 candidate-role
+    Draft docs. Returns the candidate `doc_id`s (empty ⟹ generation failed closed → the caller
+    fail-closed-parks; never a silent zero-candidate MCV pass)."""
+    generator = current_candidate_generator()  # fail-closed if the seam is unwired (§7.2)
+    recording = RecordingLLMClient(
+        conn=conn, inner=current_llm_client(), run_id=run_id, actor=actor
+    )
+    return generate_candidate_docs(
+        conn,
+        _with_recording_client(generator, recording),
+        draft=draft,
+        catalog_metadata=catalog_metadata,
+        domain_context=domain_context,
         draft_doc_id=draft_doc_id,
         run_id=run_id,
         request_id=request_id,

@@ -29,10 +29,13 @@ _ALL_TWELVE = {
     "INTENT_REJECTED",
     "LLM_CALL_RECORDED",
 }
+# Task 9.5a — the hypothesis-mode candidate-generation shadow advance_intake records so the P2 fold
+# surfaces state.candidate_doc_ids (its candidate_doc_ids drive MCV #2, §6.7 #2 / gap D).
+_ALL_FC_EVENT_TYPES = _ALL_TWELVE | {"CANDIDATES_GENERATED"}
 
 
 def test_all_twelve_fc_event_types_present():
-    assert set(SP2_EVENT_SCHEMAS) == _ALL_TWELVE
+    assert set(SP2_EVENT_SCHEMAS) == _ALL_FC_EVENT_TYPES
     assert INTENT_SUBMITTED == "INTENT_SUBMITTED"
     assert LLM_CALL_RECORDED == "LLM_CALL_RECORDED"
 
@@ -45,7 +48,7 @@ def test_gate_and_park_constants():
 def test_register_makes_every_type_writable():
     reg = event_registry()
     register_sp2_event_types(reg)
-    for type_name in _ALL_TWELVE:
+    for type_name in _ALL_FC_EVENT_TYPES:
         reg.assert_writable(type_name, SP2_EVENT_SCHEMA_VERSION)  # active → no raise
         assert reg.max_active_versions()[type_name] == SP2_EVENT_SCHEMA_VERSION
 

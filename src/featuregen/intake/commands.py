@@ -65,6 +65,9 @@ from featuregen.intake.banking_catalog import (
     IntakeOutcome,
     classify_intent,
 )
+from featuregen.intake.candidates import (  # R10 hypothesis seam (P6, candidates.py)
+    generate_candidates_for_run,
+)
 from featuregen.intake.catalog import current_intake_catalog  # R8/R10 seam (P2, catalog.py)
 from featuregen.intake.contract import (  # R6/R7 (P2, contract.py)
     CONTRACT_SCHEMA_OWNER,
@@ -74,6 +77,7 @@ from featuregen.intake.contract import (  # R6/R7 (P2, contract.py)
 from featuregen.intake.critique import apply_critique, contract_review  # P5 challenger seam
 from featuregen.intake.doubt_router import default_thresholds, route_draft  # P5 routing seam
 from featuregen.intake.events import (
+    CANDIDATES_GENERATED,
     CLARIFICATION_ANSWERED,
     CLARIFICATION_REQUESTED,
     CONTRACT_CONFIRMED,
@@ -1806,14 +1810,77 @@ _SP2_CATALOG = _SP2_CATALOG + (("open_gate1_task", open_gate1_task),)
 # `_open_gate1_task` (Task 7.1) stays the gate opener. It decides off the P2 fold and NEVER leaves the
 # run stuck. X4: refine_contract / _open_gate1_task each CAS-pin their OWN head; advance_intake itself
 # appends only the Gate #1 human_task (no feature_contract transition of its own).
+def _generate_hypothesis_candidates(
+    conn: DbConn, run_id: str, state: FeatureContractState, *, actor: IdentityEnvelope
+) -> CommandResult | None:
+    """Task 9.5a — freeze the hypothesis-mode scored candidate set BEFORE the first-pass route (§7.2),
+    so MCV #2 (`calculation_method_available`, §6.7 #2) sees a NON-EMPTY candidate set (closing gap B —
+    without this a hypothesis run parks at 0 candidates and never reaches Gate #1). Runs the registered
+    CandidateGenerator through the per-run event-sourcing RecordingLLMClient (one auditable
+    `LLM_CALL_RECORDED` for `generate_candidates`), freezes 1–3 candidate-role Draft docs, then records
+    a `CANDIDATES_GENERATED` shadow whose `candidate_doc_ids` the P2 fold reads into
+    `state.candidate_doc_ids` (so `run_minimum_contract_validation`'s MCV #2 and `refine_contract`'s
+    DB-count MCV #2 AGREE — closing gap D). Idempotent: the caller only invokes this when no candidate
+    exists yet. Returns a `CommandResult` to SHORT-CIRCUIT advance_intake — a fail-closed park on empty
+    generation (never a silent zero-candidate MCV pass), or `stale` on a raced CAS append — or `None`
+    to continue the normal route. X4: the shadow CASes on the folded head."""
+    stream = load_feature_contract(conn, run_id)
+    draft_doc_id, draft_body = _final_draft(stream)
+    if draft_body is None:
+        raise IntakeError(f"no draft_body on the feature_contract stream for run {run_id!r}")
+    request_id = state.request_id or _request_id(stream)
+    deps = current_intake_deps()
+    catalog_metadata = dict(deps.catalog.metadata()) if deps and deps.catalog else {}
+    candidate_doc_ids = generate_candidates_for_run(
+        conn,
+        draft=draft_body,
+        catalog_metadata=catalog_metadata,
+        domain_context=None,   # per-use-case DomainCatalogEntry slice deferred (SP-2 prep, §4.5)
+        draft_doc_id=draft_doc_id,
+        run_id=run_id,
+        request_id=request_id,
+        actor=actor,
+    )
+    if not candidate_doc_ids:
+        # Fail closed (§7.2): generation produced NO candidate → the run must not strand or silently
+        # pass MCV. Park for human/retry follow-up via the same manual review path §4.5(b) / mcv_failed
+        # use (opens a CLARIFICATION task + parks; a re-driven advance then no-ops on that open task).
+        _fail_closed_park(
+            conn, run_id=run_id, request_id=request_id, actor=actor,
+            field="calculation_method",
+            question="hypothesis-mode candidate generation produced no candidates; manual review/retry required",
+        )
+        return CommandResult(accepted=True, aggregate_id=run_id)
+    # Record the candidate_doc_ids so the P2 fold surfaces state.candidate_doc_ids (gap D). X4 — CAS on
+    # the folded head, re-loaded PAST the generation pass's interleaved LLM_CALL_RECORDED.
+    try:
+        append_fc_event(
+            conn, run_id=run_id, type=CANDIDATES_GENERATED,
+            expected_version=_fc_head(conn, run_id),  # X4 — CAS on the folded head
+            payload={  # R2 — no aggregate-id fields; doc_ids are DAG refs, not aggregate ids.
+                "draft_doc_id": draft_doc_id,
+                "candidate_doc_ids": list(candidate_doc_ids),
+            },
+            actor=actor, request_id=request_id,
+        )
+    except ConcurrencyError:
+        return CommandResult(
+            accepted=False, aggregate_id=run_id, denied_reason="stale: contract advanced concurrently"
+        )
+    return None
+
+
 def advance_intake(conn: DbConn, cmd: Command) -> CommandResult:
     """Advance an opened feature_contract one production step (§6.6/§8.6). Folds the FC status, then:
 
       * CONFIRMED / OUT_OF_SCOPE / PROHIBITED_DATA_CLASS (terminal) → no-op accept (nothing to drive).
       * MINIMUM_CONTRACT_VALIDATED → open Gate #1 (idempotent — an already-open gate is a no-op).
       * NEEDS_CLARIFICATION with an OPEN clarification task → no-op accept (waiting on the human).
-      * NEEDS_CLARIFICATION with NO open clarification task → run the FIRST-PASS route through
-        `refine_contract` (no prior answer needed: it re-scores → critiques → routes the CURRENT Draft):
+      * NEEDS_CLARIFICATION with NO open clarification task → (Task 9.5a) in HYPOTHESIS mode with no
+        candidate yet, first generate the scored candidate set (event-sourced, `CANDIDATES_GENERATED`
+        shadow so MCV #2 sees a non-empty set, §6.7 #2 — a fail-closed park on empty generation), then
+        run the FIRST-PASS route through `refine_contract` (no prior answer needed: it re-scores →
+        critiques → routes the CURRENT Draft):
           - `validated`      → open Gate #1;
           - `clarifying`     → leave the must-ask tasks it opened (no-op further);
           - `parked`         → the Loop auto-parked for human follow-up (no-op further);
@@ -1843,6 +1910,15 @@ def advance_intake(conn: DbConn, cmd: Command) -> CommandResult:
     # Waiting on a human: an open per-field / manual clarification task exists → no-op (do not re-route).
     if _open_clarification_task_ids(conn, run_id, stream):
         return CommandResult(accepted=True, aggregate_id=run_id)
+
+    # Hypothesis mode (Task 9.5a, closes gap B): freeze the scored candidate set BEFORE the first-pass
+    # route so MCV #2 sees a non-empty candidate set (§6.7 #2). Idempotent — skip when candidates
+    # already exist. A short-circuit result (fail-closed park on empty generation, or a raced `stale`)
+    # is returned as-is; None means "candidates ready — continue the normal route".
+    if state.intake_mode == "hypothesis" and _candidate_count(conn, run_id) == 0:
+        short_circuit = _generate_hypothesis_candidates(conn, run_id, state, actor=cmd.actor)
+        if short_circuit is not None:
+            return short_circuit
 
     # No open clarification → drive the first-pass route through the routing engine (NOT raw MCV): it
     # opens must-ask tasks OR converges to MINIMUM_CONTRACT_VALIDATED. Deps default to the registered

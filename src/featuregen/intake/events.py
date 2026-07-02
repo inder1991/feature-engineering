@@ -12,9 +12,10 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 
-# ---- the twelve feature_contract-aggregate event types (§2.1 #2) ----
+# ---- the feature_contract-aggregate event types (§2.1 #2) ----
 INTENT_SUBMITTED = "INTENT_SUBMITTED"
 DRAFT_CONTRACT_PRODUCED = "DRAFT_CONTRACT_PRODUCED"
+CANDIDATES_GENERATED = "CANDIDATES_GENERATED"  # hypothesis mode: the 1–3 frozen candidate docs (§7.2)
 CONTRACT_CRITIQUED = "CONTRACT_CRITIQUED"
 FIELD_AUTO_RESOLVED = "FIELD_AUTO_RESOLVED"
 CLARIFICATION_REQUESTED = "CLARIFICATION_REQUESTED"
@@ -90,6 +91,16 @@ SP2_EVENT_SCHEMAS: dict[str, dict] = {
             "catalog_version": _NSTR,
         },
         ["draft_doc_id"],
+    ),
+    CANDIDATES_GENERATED: _evt(
+        {
+            "feature_contract_id": _ID,
+            "run_id": _ID,
+            "draft_doc_id": _ID,            # the primary Draft the candidates derive from (§7.1)
+            "candidate_doc_ids": _ARR,      # the 1–3 frozen candidate-role Draft docs (§7.2)
+            "generator_version": _NSTR,     # the CandidateGenerator that produced them (audit)
+        },
+        ["candidate_doc_ids"],
     ),
     CONTRACT_CRITIQUED: _evt(
         {
@@ -198,7 +209,7 @@ SP2_EVENT_SCHEMAS: dict[str, dict] = {
 
 
 def register_sp2_event_types(registry) -> None:
-    """Register the twelve SP-2 feature_contract event schemas (schema_version=1) so append_event
+    """Register the SP-2 feature_contract event schemas (schema_version=1) so append_event
     validation passes (Global Constraint: every new event type MUST be registered before any append).
     Idempotent — register_schema is an upsert; safe to call repeatedly (P4–P8, P9 register_sp2)."""
     for type_name, schema in SP2_EVENT_SCHEMAS.items():
