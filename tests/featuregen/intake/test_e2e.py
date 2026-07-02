@@ -38,10 +38,7 @@ from featuregen.intake.banking_catalog import (
 )
 from featuregen.intake.bootstrap import register_sp2, seed_sp2_authz
 from featuregen.intake.candidates import (
-    RecordingLLMClient,
     StubCandidateGenerator,
-    current_candidate_generator,
-    generate_candidate_docs,
     register_candidate_generator,
 )
 from featuregen.intake.catalog import load_banking_catalog_from_seed, register_intake_catalog
@@ -49,6 +46,7 @@ from featuregen.intake.commands import register_intake_classifier, register_inta
 from featuregen.intake.llm import FakeLLM, FakeResponse, register_llm_client
 from featuregen.intake.read_model import get_contract
 from featuregen.intake.redaction import DefaultIntentRedactor, register_intent_redactor
+from featuregen.intake.state import fold_feature_contract_state
 from featuregen.intake.store import load_feature_contract
 
 # ── the SP-0-governed read-only BankingDomainCatalog seed (§4.5) ──────────────────────────────────
@@ -582,23 +580,22 @@ def test_prohibited_class_intent_is_blocked_before_any_llm_call(db):
     )
 
 
-# ══ hypothesis-mode E2E (Task 9.5): stub candidates → advance_intake → confirm(candidate) → CONFIRMED ══
+# ══ hypothesis-mode E2E (Task 9.5/9.5a): submit → advance (generates candidates) → select → confirm ══
 # The hypothesis-mode acceptance milestone: a hypothesis intent is driven end-to-end over the ASSEMBLED
 # P1–P8 stack under the REAL PolicyAuthorizer + audit, from `submit_intent` to a CONFIRMED contract whose
 # calculation_method is a human-selected candidate promoted to PRIMARY (PRIMARY_SELECTED). The FakeLLM is
 # scripted per task (structure_intent → 1 resolved hypothesis Draft; generate_candidates → 3 scored
 # candidate-role Draft docs; contract_review → a finding-free verdict so refine_contract converges).
 #
-# PRODUCTION-GAP NOTE (flagged — mirrors the earlier Draft→MCV / advance_intake glue gap): candidate
-# generation is NOT triggered by the production pipeline. `generate_candidate_docs` (Task 6.4) is an
-# orchestrator with NO production caller — neither `submit_intent`/`_produce_draft` nor `advance_intake`
-# invoke `current_candidate_generator()`, and `_produce_draft`'s DRAFT_CONTRACT_PRODUCED payload records
-# no `candidate_doc_ids`. So this E2E DRIVES candidate generation explicitly (event-sourced via
-# RecordingLLMClient + StubCandidateGenerator, wired through register_candidate_generator) BEFORE
-# advance_intake. Once candidate docs exist, the REAL pipeline carries the run the rest of the way:
-# refine_contract's MCV reads the candidate count off the DB (`_candidate_count`), so it PASSES (§6.7 #2,
-# hypothesis: a non-empty scored candidate set) and advance_intake opens Human Gate #1 — no manual MCV.
-# The Draft is scripted fully resolved so the Doubt Router asks nothing and MCV passes on the first pass.
+# SELF-DRIVING (Task 9.5a — closes gap B): candidate generation is now triggered BY THE PRODUCTION
+# PIPELINE. `advance_intake`, on a hypothesis run with no candidate yet, runs the registered
+# CandidateGenerator through a per-run RecordingLLMClient (one auditable `LLM_CALL_RECORDED` for
+# generate_candidates), freezes 1–3 candidate-role Draft docs, and records a `CANDIDATES_GENERATED`
+# shadow whose candidate_doc_ids the P2 fold surfaces as `state.candidate_doc_ids` (so
+# run_minimum_contract_validation's MCV #2 and refine_contract's live `_candidate_count` agree — gap D).
+# refine_contract's MCV #2 then PASSES (§6.7 #2, hypothesis: a non-empty scored candidate set) and
+# advance_intake opens Human Gate #1 — nothing here manually calls generate_candidate_docs or MCV. The
+# Draft is scripted fully resolved so the Doubt Router asks nothing and MCV passes on the first pass.
 
 # structure_intent: a schema-valid, fully-resolved hypothesis DRAFT_CONTRACT body (clones the proven
 # definition envelope so `call_llm` validates it against DRAFT_CONTRACT@1). The primary Draft's string
@@ -669,16 +666,8 @@ def _candidate_doc_ids(db, run_id):
     return [r[0] for r in rows]
 
 
-def _primary_draft(db, run_id):
-    """(draft_doc_id, request_id, draft_body) of the run's primary Draft — the inputs the hypothesis
-    candidate generator (Task 6.4 `generate_candidate_docs`) derives its candidate docs from."""
-    stream = load_feature_contract(db, run_id)
-    produced = next(e for e in stream if e.type == "DRAFT_CONTRACT_PRODUCED")
-    return produced.payload["draft_doc_id"], produced.request_id, produced.payload["draft_body"]
-
-
 def test_hypothesis_stub_candidates_select_and_confirm(db):
-    llm = _wire(db, fixtures=_HYP_FIXTURES, generator=True)
+    _wire(db, fixtures=_HYP_FIXTURES, generator=True)
     raj = _data_scientist("user:raj")
     agent = _intake_agent()
 
@@ -703,45 +692,56 @@ def test_hypothesis_stub_candidates_select_and_confirm(db):
     assert submitted.accepted, submitted.denied_reason
     run_id = submitted.aggregate_id
     assert get_contract(db, run_id).status == "NEEDS_CLARIFICATION"
+    # the pipeline has NOT generated candidates yet — advance_intake does that (Task 9.5a)
+    assert _candidate_doc_ids(db, run_id) == []
 
-    # ── PRODUCTION GAP (flagged): nothing in the pipeline triggers candidate generation. Drive it
-    #    explicitly — event-sourced via RecordingLLMClient (one `generate_candidates` LLM call recorded)
-    #    → StubCandidateGenerator → generate_candidate_docs freezes 1–3 candidate-role Draft docs. ─────
-    draft_doc_id, request_id, draft_body = _primary_draft(db, run_id)
-    register_candidate_generator(
-        StubCandidateGenerator(RecordingLLMClient(conn=db, inner=llm, run_id=run_id, actor=raj))
-    )
-    cand_ids = generate_candidate_docs(
-        db,
-        current_candidate_generator(),
-        draft=draft_body,
-        catalog_metadata={"concepts": ["declined card authorization", "mcc", "transactions"]},
-        domain_context=None,
-        draft_doc_id=draft_doc_id,
-        run_id=run_id,
-        request_id=request_id,
-        actor=raj,
-    )
-    assert 1 <= len(cand_ids) <= 3
-    assert set(_candidate_doc_ids(db, run_id)) == set(cand_ids)
-    chosen = cand_ids[0]
-    # the ONE hypothesis-generation pass was event-sourced (auditable-LLM envelope, §9.1/§9.3)
-    assert db.execute(
-        "SELECT count(*) FROM llm_call WHERE run_id=%s AND task='generate_candidates'", (run_id,)
-    ).fetchone()[0] == 1
-
-    # ── advance_intake self-drives refine → MCV → Gate #1 (Task 9.2a). MCV #2 passes because a NON-EMPTY
-    #    scored candidate set now exists (`_candidate_count` reads the frozen candidate docs, §6.7 #2). ──
+    # ── advance_intake SELF-DRIVES the whole hypothesis route (Task 9.5a, closes gap B): it FIRST
+    #    generates the scored candidate set — event-sourced via a per-run RecordingLLMClient (one
+    #    `generate_candidates` LLM call recorded) → the registered StubCandidateGenerator freezes 1–3
+    #    candidate-role Draft docs + records CANDIDATES_GENERATED — THEN refine → MCV → Gate #1. MCV #2
+    #    passes because a NON-EMPTY scored candidate set now exists (§6.7 #2). Nothing here manually
+    #    calls generate_candidate_docs / run_minimum_contract_validation / open_gate1_task. ────────────
     advanced = execute_command(
         db,
         Command("advance_intake", "feature_contract", run_id, {"run_id": run_id}, agent, "ik-hyp-advance"),
     )
     assert advanced.accepted, advanced.denied_reason
+
+    # the PIPELINE generated the candidate docs (Task 9.5a — no manual generate_candidate_docs call)
+    cand_ids = _candidate_doc_ids(db, run_id)
+    assert 1 <= len(cand_ids) <= 3
+    # the ONE hypothesis-generation pass was event-sourced by the pipeline (auditable-LLM envelope, §9.1/§9.3)
+    assert db.execute(
+        "SELECT count(*) FROM llm_call WHERE run_id=%s AND task='generate_candidates'", (run_id,)
+    ).fetchone()[0] == 1
+    # CANDIDATES_GENERATED carries the candidate_doc_ids into the fold → state.candidate_doc_ids (gap D):
+    # run_minimum_contract_validation's MCV #2 (len(state.candidate_doc_ids)) and refine_contract's live
+    # _candidate_count now AGREE on the count.
+    state = fold_feature_contract_state(load_feature_contract(db, run_id))
+    assert set(state.candidate_doc_ids) == set(cand_ids)
+
+    # advance_intake then drove refine → MCV → Human Gate #1
     assert get_contract(db, run_id).status == "MINIMUM_CONTRACT_VALIDATED"
     gate_task, gv = _only_open_task(db, run_id)
 
-    # ── Gate #1: the owner confirms with the human-SELECTED candidate → PRIMARY_SELECTED promotion +
-    #    the confirmation record (selected / rejected write-once losers) → CONTRACT_CONFIRMED. ──────────
+    # ── Gate #1 selection: the owner selects a candidate via select_candidate_doc (document
+    #    PRIMARY_SELECTED promotion, owner+human guarded) — then confirms it. ──────────────────────────
+    chosen = cand_ids[0]
+    selected = execute_command(
+        db,
+        Command(
+            "select_candidate_doc",
+            "feature_contract",
+            run_id,
+            {"run_id": run_id, "candidate_doc_id": chosen},
+            raj,
+            "ik-hyp-select",
+        ),
+    )
+    assert selected.accepted, selected.denied_reason
+
+    # ── Gate #1 confirm: the owner confirms with the human-SELECTED candidate → PRIMARY_SELECTED
+    #    promotion + the confirmation record (selected / rejected write-once losers) → CONTRACT_CONFIRMED.
     confirmed = execute_command(
         db,
         Command(
