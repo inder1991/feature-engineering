@@ -54,7 +54,8 @@ _THREE = {
     ]
 }
 _DRAFT = {"intake_mode": "hypothesis", "proposed_feature_name": "abrupt_category_shift",
-          "target": "higher credit risk", "feature_semantics": {}}
+          "target": "higher credit risk", "feature_semantics": {},
+          "raw_input_classification": "clean"}
 _CATALOG = {"concepts": ["merchant_category_code", "total_spend", "top_category_spend"]}
 _DOMAIN = {"allowed_concepts": ["merchant_category_code"]}
 
@@ -108,6 +109,40 @@ def test_unscanned_draft_fails_closed_no_llm_pass():
     draft = {**_DRAFT, "raw_input_classification": "unscanned"}
     assert StubCandidateGenerator(llm).generate(draft, _CATALOG, _DOMAIN) == []
     assert llm.calls == 0  # the LLM is never reached on the fail-closed redaction path
+
+
+def test_contains_pii_origin_with_clean_composed_text_still_generates():
+    # Regression (forward-risk): the composed candidate-gen text is built from the draft's ALREADY-
+    # STRUCTURED, clean-by-construction fields — the LLM that structured them never saw the raw PII
+    # (`_produce_draft` redacted it upstream, BEFORE structuring). So a draft whose ORIGIN was
+    # `contains_pii` but whose COMPOSED fields carry NO locatable PII must NOT inherit the stale
+    # origin classification and hit the redactor's "contains_pii but nothing to scrub → fail closed"
+    # branch. It must GENERATE, with LLM-safe inputs (classified clean) — no false fail-closed.
+    llm = _ScriptedLLM(_THREE)
+    draft = {**_DRAFT, "raw_input_classification": "contains_pii"}  # origin PII, composed CLEAN
+    cands = StubCandidateGenerator(llm).generate(draft, _CATALOG, _DOMAIN)
+    assert llm.calls == 1  # the LLM IS reached — the false fail-closed is gone
+    assert len(cands) == 3
+    inputs = llm.last_request.inputs
+    assert set(inputs) >= {
+        "redacted_intent", "catalog_metadata", "raw_input_classification",
+        "redaction_version", "input_redaction",
+    }
+    # the composed structured text is clean-by-construction → dispatched classified "clean"
+    assert inputs["raw_input_classification"] == "clean"
+    assert "abrupt_category_shift" in inputs["redacted_intent"]
+
+
+def test_missing_or_unknown_origin_classification_fails_closed():
+    # Minor: the origin classification default was fail-OPEN ("clean"). A draft whose origin is
+    # missing / None / an unknown value can't be trusted as clean-by-construction → fail SAFE:
+    # no LLM pass, no candidates (never silently send unscanned/unknown content).
+    llm = _ScriptedLLM(_THREE)
+    missing = {k: v for k, v in _DRAFT.items() if k != "raw_input_classification"}
+    assert StubCandidateGenerator(llm).generate(missing, _CATALOG, _DOMAIN) == []
+    assert StubCandidateGenerator(llm).generate({**_DRAFT, "raw_input_classification": None}, _CATALOG, _DOMAIN) == []
+    assert StubCandidateGenerator(llm).generate({**_DRAFT, "raw_input_classification": "weird"}, _CATALOG, _DOMAIN) == []
+    assert llm.calls == 0  # the LLM is never reached on any untrusted-origin path
 
 
 def test_clamps_to_at_most_three_candidates():

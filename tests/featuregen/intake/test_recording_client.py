@@ -1,5 +1,3 @@
-import json
-
 from tests.featuregen.intake._helpers import service_actor
 
 from featuregen.documents.registry import DocumentSchemaRegistry
@@ -16,7 +14,7 @@ from featuregen.intake.candidates import (
     StubCandidateGenerator,
 )
 from featuregen.intake.events import register_sp2_event_types
-from featuregen.intake.llm import LLMRequest, LLMResult, read_llm_call
+from featuregen.intake.llm import LLMRequest, LLMResult
 from featuregen.intake.redaction import DefaultIntentRedactor, register_intent_redactor
 
 OWNER = build_human_identity(subject="user:raj", role_claims=("data_scientist",))
@@ -132,7 +130,12 @@ def test_full_path_records_llm_call_and_emits_event(db):
     assert recorded[0].payload["task"] == "generate_candidates"
 
 
-def test_pii_draft_field_is_redacted_before_reaching_the_llm(db):
+def test_pii_in_composed_draft_text_fails_closed_no_call_no_record(db):
+    # No-PII egress backstop (§9.4): the draft's structured fields are clean-BY-CONSTRUCTION (the LLM
+    # that structured them never saw raw PII — `_produce_draft` redacted upstream). So PII in the
+    # COMPOSED candidate-gen text is an UPSTREAM redaction breach: the generator scans the ACTUAL
+    # composed text and FAILS CLOSED — never dispatches it (even redacted). No provider call, no
+    # immutable llm_call record, no LLM_CALL_RECORDED event; the PII never leaves the boundary.
     _setup(db)
     run_id = new_run_id()
     inner = _CapturingInner(_CANDS)
@@ -141,19 +144,10 @@ def test_pii_draft_field_is_redacted_before_reaching_the_llm(db):
              "target": "escalate to jane.doe@bank.example about higher credit risk",
              "raw_input_classification": "contains_pii"}
 
-    cands = StubCandidateGenerator(rec).generate(draft, _CATALOG, _DOMAIN)
-
-    assert cands  # still generated — the PII was scrubbed, not fatal
-    # (a) the raw email NEVER reached the provider; only the redacted marker did (the no-PII backstop)
-    assert inner.seen, "the LLM must be reached on the clean/redacted path"
-    for req in inner.seen:
-        assert "jane.doe@bank.example" not in json.dumps(req.inputs)
-        assert "[REDACTED:EMAIL]" in req.inputs["redacted_intent"]
-    # (b) the immutable, replayable llm_call record stores the REDACTED input (never raw PII)
-    call_ref = db.execute("SELECT llm_call_ref FROM llm_call WHERE run_id=%s", (run_id,)).fetchone()[0]
-    stored = read_llm_call(db, call_ref)
-    assert "jane.doe@bank.example" not in json.dumps(stored.redacted_input)
-    assert "[REDACTED:EMAIL]" in stored.redacted_input["redacted_intent"]
+    assert StubCandidateGenerator(rec).generate(draft, _CATALOG, _DOMAIN) == []
+    assert inner.seen == []  # the provider is NEVER reached — PII never leaves the boundary
+    assert db.execute("SELECT count(*) FROM llm_call WHERE run_id=%s", (run_id,)).fetchone()[0] == 0
+    assert load_stream(db, "feature_contract", run_id) == []
 
 
 def test_unscanned_draft_fails_closed_no_call_no_record(db):

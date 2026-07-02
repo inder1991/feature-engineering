@@ -7,7 +7,7 @@ from typing import Any, Protocol, runtime_checkable
 from featuregen.contracts import DbConn, IdentityEnvelope
 from featuregen.idgen import mint_id
 from featuregen.intake.llm import LLMClient, LLMRequest, LLMResult, call_llm
-from featuregen.intake.redaction import build_llm_inputs, current_intent_redactor
+from featuregen.intake.redaction import _first_pii, build_llm_inputs, current_intent_redactor
 
 # Structural-only metadata views (names/types/grain + catalog-DECLARED enum/code metadata ONLY —
 # never profiled column values, rows, samples, or overlay metrics; §9.4 no-data-to-LLM boundary).
@@ -264,27 +264,39 @@ class StubCandidateGenerator:
     ) -> list[Candidate]:
         known = _known_concepts(catalog_metadata, domain_context)
         semantics = draft.get("feature_semantics") or {}
-        # §9.4 no-PII egress backstop: the draft's human free-text (proposed name / target / entity)
-        # is scrubbed into the SINGLE reserved `redacted_intent`; only catalog NAMES ride
-        # `catalog_metadata`. This mirrors `_produce_draft` (commands.py) — the generator owns
-        # redaction so the request is reserved-keyed + LLM-safe BEFORE it reaches call_llm (which
-        # re-guards egress). Un-redactable / `unscanned` intent fails closed here → no LLM pass, no
-        # candidates (never leak un-redacted draft text, never fabricate).
-        raw_input_classification = draft.get("raw_input_classification", "clean")
-        redaction = current_intent_redactor().redact(
-            _compose_intent(
-                proposed_feature_name=draft.get("proposed_feature_name"),
-                target=draft.get("target"),
-                entity=semantics.get("entity"),
-            ),
-            raw_input_classification,
+        # §9.4 no-PII egress backstop. The candidate-gen free-text is composed from the draft's
+        # ALREADY-STRUCTURED fields (proposed name / target / entity), which are clean-BY-CONSTRUCTION:
+        # `_produce_draft` (commands.py) redacts the RAW intent BEFORE the LLM structures it, so the
+        # LLM never saw raw PII. We therefore decide egress safety by scanning the ACTUAL composed
+        # text being sent — NOT by inheriting the raw intent's stale origin classification. (Inheriting
+        # it would send a `contains_pii`-ORIGIN draft whose composed fields are already clean into the
+        # redactor's "contains_pii but nothing locatable to scrub → fail closed" branch: a FALSE
+        # fail-closed that yields zero candidates for a legitimate class of runs.)
+        #
+        # Fail SAFE on an origin we cannot trust as clean-by-construction (`unscanned` / missing /
+        # unknown): only `clean` and `contains_pii` origins went through _produce_draft's redact-then-
+        # structure path. Anything else → no LLM pass, no candidates (never send unscanned/unknown content).
+        if draft.get("raw_input_classification") not in ("clean", "contains_pii"):
+            return []  # fail closed: untrusted origin → no candidates (the run stays in clarification)
+        composed = _compose_intent(
+            proposed_feature_name=draft.get("proposed_feature_name"),
+            target=draft.get("target"),
+            entity=semantics.get("entity"),
         )
+        # Scan the ACTUAL composed text with redaction's OWN scanner (the same `_first_pii` that
+        # assert_llm_safe / critique use). The fields are clean-by-construction, so residual PII here is
+        # an UPSTREAM redaction breach — fail closed, never dispatch it (even redacted) to the LLM.
+        if _first_pii(composed) is not None:
+            return []  # fail closed: PII in composed draft text → no LLM pass, no candidates
+        # Composed text is clean-by-construction → build the reserved LLM-safe request classified
+        # `clean`; call_llm's own `_first_pii` egress backstop still re-guards the whole payload (DiD).
+        redaction = current_intent_redactor().redact(composed, "clean")
         if redaction.text is None or redaction.disposition != "ok":
             return []  # fail closed: no LLM-safe intent → no candidates (the run stays in clarification)
         inputs = build_llm_inputs(
             redaction,
             catalog_metadata={"allowed_concepts": sorted(known)},  # catalog NAMES only (§9.4)
-            raw_input_classification=raw_input_classification,
+            raw_input_classification="clean",
         )
         inputs["intake_mode"] = draft.get("intake_mode")  # structural enum context (no data values)
         request = LLMRequest(
