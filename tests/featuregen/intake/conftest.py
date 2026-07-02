@@ -22,6 +22,7 @@ from featuregen.idgen import mint_id
 from featuregen.intake.banking_catalog import IntakeClassification, IntakeOutcome
 from featuregen.intake.catalog import (  # R8/R10 seam (P2, catalog.py)
     _clear_intake_catalog,
+    load_banking_catalog_from_seed,
     register_intake_catalog,
 )
 from featuregen.intake.commands import (
@@ -195,6 +196,43 @@ INTAKE_SVC = build_service_identity(
     subject="service:intake-agent", role_claims=("intake-agent",), attestation="sig"
 )
 
+# ── §8.4 confirmation-time prohibited-intent screen (Task 7.4) test seams ─────────────────────────
+# The default banking catalog an MCV-validated run was screened under at intake: version bdc-2026.06
+# (matching definition_draft's provenance.catalog_version — i.e. NO version drift). Its use-case term
+# `card authorization` matches definition_draft's filter concept so the confirmation-time re-screen
+# classifies CLEAR; the protected_attribute surface terms it blocks are absent from the draft text.
+_DEFAULT_INTAKE_CATALOG_SEED = {
+    "catalog_version": "bdc-2026.06",
+    "entities": ["customer", "account", "card", "transaction", "application"],
+    "data_classes": ["transactions", "balances", "card_authorizations", "protected_attribute"],
+    "use_cases": [
+        {
+            "use_case": "card_authorization",
+            "status": "active",
+            "target": {"name": "declined_auth"},
+            "blocked_data_classes": ["protected_attribute"],
+        }
+    ],
+}
+
+
+class _StubCatalog:
+    """A minimal versioned BankingDomainCatalog stand-in — the §8.4 screen reads only `.version`
+    (the classifier itself is monkeypatched in these tests). Used to inject a drifted catalog."""
+
+    def __init__(self, version):
+        self.version = version
+
+
+class _Cls:
+    """A minimal IntakeClassification stand-in the monkeypatched classify_intent returns — the §8.4
+    screen reads `.outcome`, `.matched_class`, `.catalog_version`."""
+
+    def __init__(self, outcome, catalog_version, *, matched_class=None):
+        self.outcome = outcome
+        self.catalog_version = catalog_version
+        self.matched_class = matched_class
+
 
 def definition_draft(request_id="req_def", *, intake_mode="definition", risk_flags=()):
     """A post-clarification Draft body (empty open_fields → MCV has passed)."""
@@ -302,4 +340,8 @@ def seed_validated_contract(db, *, run_id, request_id, draft_body, candidate_doc
         db, run_id=run_id, type="MINIMUM_CONTRACT_VALIDATED",
         payload={"run_id": run_id}, actor=INTAKE_SVC,
     )
+    # An MCV-validated run was screened against an available intake catalog; register the current
+    # one (bdc-2026.06 — no drift vs the draft provenance) so the §8.4 confirmation-time re-screen
+    # (Task 7.4) has a catalog to read. Tests override it via monkeypatch (drift / unavailable).
+    register_intake_catalog(load_banking_catalog_from_seed(_DEFAULT_INTAKE_CATALOG_SEED))
     return draft_doc_id, cand_ids

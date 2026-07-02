@@ -1562,6 +1562,44 @@ def _requires_independent_validation(draft_body: dict) -> bool:
     return bool(draft_body.get("risk_flags"))
 
 
+def _screen_text(draft_body: dict) -> str:
+    """The confirmation-time screen text: the target/feature concept + filter concepts the §8.4
+    deterministic classifier screens against the catalog's blocked/sensitive classes (non-PII)."""
+    fs = draft_body.get("feature_semantics", {})
+    parts = [str(draft_body.get("proposed_feature_name", "")), str(fs.get("target_definition", ""))]
+    for f in fs.get("filters", []) or []:
+        parts.append(str(f.get("concept", "")))
+    return " ".join(p for p in parts if p)
+
+
+def _prohibited_intent_screen(conn: DbConn, draft_body: dict) -> str | None:
+    """§8.4 #2 — the fail-closed compliance backstop, AUTHORITATIVE for the block. Re-runs the §5.4
+    deterministic classification over the CURRENT BankingDomainCatalog (the R8 module-global
+    current_intake_catalog() seam) at the moment of confirmation (so a version drift that would flip
+    the classification is caught, §8.4(d)). Returns a denial reason, or None when CLEAR. NEVER
+    pretends to approve compliance. (conn is unused — the catalog rides the module-global seam.)"""
+    catalog = current_intake_catalog()
+    if catalog is None or not getattr(catalog, "version", None):
+        return "banking catalog unavailable/unversioned at confirmation — fail-closed park for review (§8.4)"
+    cls = classify_intent(
+        _screen_text(draft_body),
+        product=draft_body.get("product"),
+        region=draft_body.get("region"),
+        catalog=catalog,
+    )
+    if cls.outcome is IntakeOutcome.PROHIBITED_DATA_CLASS:
+        return (
+            f"prohibited data class: {cls.matched_class} (catalog {cls.catalog_version}); cannot confirm — "
+            f"edit the intent or withdraw (§8.4)"
+        )
+    if cls.outcome is not IntakeOutcome.CLEAR:
+        return (
+            f"confirmation-time classification requires clarification/review "
+            f"(outcome={cls.outcome.value}, catalog {cls.catalog_version}) (§8.4)"
+        )
+    return None  # CLEAR under the current catalog — the allow is auditable at cls.catalog_version (§4.5(c))
+
+
 def confirm_contract(conn: DbConn, cmd: Command) -> CommandResult:
     """Human Gate #1 — the author-self-confirm happy path (§8.2/§8.5/§8.6). The request owner (the
     authenticated HUMAN requester) confirms an MCV-passed Draft: fold → no-regression + MCV guards →
@@ -1610,6 +1648,9 @@ def confirm_contract(conn: DbConn, cmd: Command) -> CommandResult:
     if draft_body is None:
         return CommandResult(accepted=False, aggregate_id=run_id, denied_reason="no draft to confirm")
     # [Task 7.4 INSERT: §8.4 prohibited-intent screen + version-drift re-check]
+    blocked = _prohibited_intent_screen(conn, draft_body)
+    if blocked is not None:
+        return CommandResult(accepted=False, aggregate_id=run_id, denied_reason=blocked)
     # [Task 7.5 INSERT: hypothesis calculation_method_chosen guard]
 
     # ── task-version OCC (consume the Gate #1 task) ── a confirm against a stale/superseded Gate #1
