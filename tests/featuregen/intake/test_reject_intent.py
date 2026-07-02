@@ -59,3 +59,57 @@ def test_reject_intent_out_of_scope_terminates_contract_and_run(db):
     run_types = [e.type for e in __import__("featuregen.events.store", fromlist=["load_stream"])
                  .load_stream(db, "run", "run_1")]
     assert "RUN_REJECTED" in run_types
+
+
+def test_reject_intent_rejects_bad_classification(db):
+    _open_run_and_contract(db)
+    res = reject_intent(db, _cmd("run_1", classification="AMBIGUOUS_CLARIFY", catalog_version="v1"))
+    assert res.accepted is False
+    assert "classification must be one of" in res.denied_reason
+    # nothing appended, run untouched
+    assert ev.INTENT_REJECTED not in [e.type for e in load_feature_contract(db, "run_1")]
+    assert run_is_terminal(db, "run_1") is False
+
+
+def test_reject_intent_no_regression_after_confirmed(db):
+    _open_run_and_contract(db)
+    append_feature_contract_event(db, run_id="run_1", type=ev.MINIMUM_CONTRACT_VALIDATED,
+                    payload={"run_id": "run_1"}, actor=_SERVICE)
+    append_feature_contract_event(db, run_id="run_1", type=ev.CONTRACT_CONFIRMED,
+                    payload={"run_id": "run_1", "confirmed_doc_id": "doc_conf1"}, actor=_REQUESTER)
+    res = reject_intent(db, _cmd("run_1", classification="OUT_OF_SCOPE", catalog_version="v1"))
+    assert res.accepted is False
+    assert "already terminal" in res.denied_reason
+    # the CONFIRMED fold is intact; run never rejected
+    st = fold_feature_contract_state(load_feature_contract(db, "run_1"))
+    assert st.status is FeatureContractStatus.CONFIRMED
+    assert run_is_terminal(db, "run_1") is False
+
+
+def test_reject_intent_prohibited_data_class_records_matched_class(db):
+    _open_run_and_contract(db)
+    res = reject_intent(db, _cmd("run_1", classification="PROHIBITED_DATA_CLASS",
+                                 matched_class="protected_attribute", catalog_version="bdc-2026.06"))
+    assert res.accepted is True
+    st = fold_feature_contract_state(load_feature_contract(db, "run_1"))
+    assert st.status is FeatureContractStatus.PROHIBITED_DATA_CLASS
+    assert st.matched_class == "protected_attribute"
+
+
+def test_reject_intent_denies_stale_on_concurrent_advance(db, monkeypatch):
+    # X4 (SP-1 capstone C2): a concurrent feature_contract transition lands between the fold and the
+    # CAS append → append_feature_contract_event raises ConcurrencyError → deny `stale`, and SP-0's
+    # RUN_REJECTED is NEVER driven (the run stays live).
+    import featuregen.intake.commands as cmds
+    from featuregen.contracts import ConcurrencyError
+
+    _open_run_and_contract(db)
+
+    def _stale_append(*a, **k):
+        raise ConcurrencyError("stream advanced")
+
+    monkeypatch.setattr(cmds, "append_feature_contract_event", _stale_append)
+    res = reject_intent(db, _cmd("run_1", classification="OUT_OF_SCOPE", catalog_version="v1"))
+    assert res.accepted is False
+    assert "stale" in res.denied_reason
+    assert run_is_terminal(db, "run_1") is False
