@@ -107,6 +107,7 @@ from featuregen.intake.scoring import score_fields  # P5 per-field scoring (Task
 # actor.subject) via actor_is_request_owner — never a payload key.
 from featuregen.intake.state import (
     TERMINAL_STATUSES,
+    FeatureContractState,
     FeatureContractStatus,
     actor_is_request_owner,
     fold_feature_contract_state,
@@ -161,11 +162,52 @@ __all__ = [
     "DbConn",
     "EventEnvelope",
     "IdentityEnvelope",
+    # Task 8.2 — inline lifecycle guards (fold-companion predicates the SP-2 handlers run BEFORE append).
+    "open_fields_empty",
+    "confirmer_is_requester_human",
+    "guard_advance",
 ]
 
 
 class IntakeError(Exception):
     """Raised on intake command misconfiguration."""
+
+
+# ── Task 8.2 — inline lifecycle guards (fold-companion predicates, §8.2/§11) ───────────────────────
+# Pure, deterministic functions of the FOLDED FeatureContractState that every advancing SP-2 handler
+# (P8's reject_intent / withdraw_intent, etc.) evaluates BEFORE appending — the direct analogue of
+# `overlay/confirmation_commands.py`'s `if state.status not in _AWAITING_CONFIRMATION: return DENY(...)`.
+# The no-regression check reads P2's `FeatureContractState.is_terminal` property and composes P2's
+# `actor_is_request_owner` (both imported from intake.state, R3/R4) — neither is redefined here.
+
+
+def open_fields_empty(state: FeatureContractState) -> bool:
+    """The Gate-#1 hard invariant (§11): a run with a non-empty open_fields can never advance."""
+    return len(state.open_fields) == 0
+
+
+def confirmer_is_requester_human(state: FeatureContractState, actor: IdentityEnvelope) -> bool:
+    """Gate #1 / withdrawal guard (§8.2): the acting subject is the request owner AND a human — a
+    service (or the LLM) can never confirm or abandon a contract. Composes P2's `actor_is_request_owner`
+    (imported, R4)."""
+    return actor.actor_kind == "human" and actor_is_request_owner(state, actor)
+
+
+def guard_advance(
+    state: FeatureContractState,
+    allowed_from: tuple[FeatureContractStatus, ...],
+) -> str | None:
+    """The inline lifecycle guard every advancing handler runs BEFORE appending (§11), mirroring
+    `overlay/confirmation_commands.py`. Returns a deny reason, or None to proceed. Enforces (a) an
+    opened contract, (b) NO-REGRESSION — a terminal/confirmed fold refuses a conflicting re-advance,
+    read from the P2 `FeatureContractState.is_terminal` property — and (c) the allowed source status."""
+    if state.status is None:
+        return "no feature contract for this run"
+    if state.is_terminal:
+        return f"contract already terminal (status={state.status.value})"
+    if state.status not in allowed_from:
+        return f"illegal advance from {state.status.value}"
+    return None
 
 
 # ── Phase-4-local classifier override (NOT a shared seam) ─────────────────────────────────────
