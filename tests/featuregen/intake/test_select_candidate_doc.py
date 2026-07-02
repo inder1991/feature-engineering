@@ -1,8 +1,9 @@
 from psycopg.rows import dict_row
 
+import featuregen.intake.commands as cmds
 from featuregen.aggregates._append import provenance_for
 from featuregen.aggregates.request_aggregate import create_request_command, create_run_command
-from featuregen.contracts import Command
+from featuregen.contracts import Command, ConcurrencyError
 from featuregen.contracts.documents import NewDocument, Stage
 from featuregen.documents.primary import register_primary_selected
 from featuregen.documents.store import append_document
@@ -131,6 +132,19 @@ def test_service_principal_cannot_select(db):
     res = select_candidate_doc(db, _cmd(run_id, chosen, SERVICE))
     assert res.accepted is False
     assert "human" in res.denied_reason
+    # nothing promoted
+    assert db.execute(
+        "SELECT count(*) FROM events WHERE aggregate_id=%s AND type='PRIMARY_SELECTED'", (run_id,)
+    ).fetchone()[0] == 0
+    # R15: a non-human attempting the human-only Gate #1 is security-audited (the escalation signal),
+    # traceable to the run (aggregate_id=run_id) — not a plain unaudited denial.
+    with db.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            "SELECT count(*) AS n FROM security_audit "
+            "WHERE attempted_action='select_candidate_doc' AND decision='denied' AND aggregate_id=%s",
+            (run_id,),
+        )
+        assert cur.fetchone()["n"] == 1
 
 
 def test_non_candidate_doc_is_rejected_fail_closed(db):
@@ -148,3 +162,44 @@ def test_unknown_doc_for_run_is_rejected(db):
     res = select_candidate_doc(db, _cmd(run_id, "doc_does_not_exist", OWNER))
     assert res.accepted is False
     assert "unknown" in res.denied_reason
+
+
+def test_concurrent_run_append_denies_stale(db, monkeypatch):
+    """The RUN-aggregate PRIMARY_SELECTED append is CAS-guarded on the run stream's OCC head; a
+    concurrent run-aggregate write raises ConcurrencyError. execute_command does NOT catch it, so the
+    handler must — fail closed as `stale` (mirrors submit_intent / refine_contract / answer_clarification)
+    rather than raising uncaught + leaking the idempotency claim."""
+    register_primary_selected(db)
+    request_id, run_id = _open_run(db, OWNER, "abrupt category shift F")
+    chosen = _candidate_doc(db, run_id, request_id)
+
+    def _boom(*a, **k):
+        raise ConcurrencyError("run head advanced")
+
+    monkeypatch.setattr(cmds, "append_event", _boom)
+    res = select_candidate_doc(db, _cmd(run_id, chosen, OWNER))
+    assert res.accepted is False
+    assert res.denied_reason == "stale"
+    # nothing promoted — the raced append committed nothing
+    assert db.execute(
+        "SELECT count(*) FROM events WHERE aggregate_id=%s AND type='PRIMARY_SELECTED'", (run_id,)
+    ).fetchone()[0] == 0
+
+
+def test_cross_run_candidate_doc_is_rejected(db):
+    """Cross-run ISOLATION: a real candidate doc frozen under run B may NOT be promoted under run A.
+    The doc lookup is scoped by (doc_id, run_id, stage), so B's doc_id is `unknown` for run A → denied,
+    no promotion. (Distinct from the nonexistent-id case — here the doc genuinely exists, just not on A.)"""
+    register_primary_selected(db)
+    req_a, run_a = _open_run(db, OWNER, "abrupt category shift G-A")
+    req_b, run_b = _open_run(db, OWNER, "abrupt category shift G-B")
+    foreign = _candidate_doc(db, run_b, req_b)  # a real candidate — but under run B
+
+    res = select_candidate_doc(db, _cmd(run_a, foreign, OWNER))
+    assert res.accepted is False
+    assert "unknown" in res.denied_reason
+    # neither run promoted anything (no cross-run leak)
+    assert db.execute(
+        "SELECT count(*) FROM events WHERE type='PRIMARY_SELECTED' AND aggregate_id = ANY(%s)",
+        ([run_a, run_b],),
+    ).fetchone()[0] == 0

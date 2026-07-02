@@ -1330,18 +1330,21 @@ def select_candidate_doc(conn: DbConn, cmd: Command) -> CommandResult:
     # Gate #1 is an author-owned intent lock: the confirmer MUST be the authenticated human requester
     # (never a service, never the LLM, never a different data scientist). SP-0 authz admits any
     # data_scientist human, so SP-2 enforces the fine owner-guard here (§8.2).
+    # R15: a NON-HUMAN (service / LLM) attempting the human-only Gate #1 is the escalation signal the
+    # security-audit stream exists to capture — deny via `record_denial` (mirrors `_deny_owner_guard`,
+    # which handles both the non-human and non-owner arms), never a plain unaudited denial.
     if cmd.actor.actor_kind != "human":
-        return CommandResult(
-            accepted=False,
-            aggregate_id=run_id,
-            denied_reason="select_candidate_doc requires the human requester (not a service)",
-        )
+        reason = "select_candidate_doc requires the human requester (not a service)"
+        record_denial(conn, replace(cmd, aggregate_id=run_id), reason)  # R15 — decision="denied"
+        return CommandResult(accepted=False, aggregate_id=run_id, denied_reason=reason)
     # R3/R4: fold the feature_contract stream and call the state-based owner predicate owned by P2
     # (intake/state.py) — never the (conn, run_id, actor) mcv form. `state.requester` is the
     # INTENT_SUBMITTED event actor.subject.
     state = fold_feature_contract_state(load_feature_contract(conn, run_id))
     if not actor_is_request_owner(state, cmd.actor):
-        record_denial(conn, cmd, "actor is not the request owner")  # R15 — writes decision="denied"
+        # R15 — writes decision="denied"; `replace(cmd, aggregate_id=run_id)` so the security record is
+        # traceable to the run (cmd.aggregate_id is None here — run_id rides args), mirroring `_deny_owner_guard`.
+        record_denial(conn, replace(cmd, aggregate_id=run_id), "actor is not the request owner")
         return CommandResult(
             accepted=False,
             aggregate_id=run_id,
@@ -1376,12 +1379,20 @@ def select_candidate_doc(conn: DbConn, cmd: Command) -> CommandResult:
         actor=cmd.actor,
         provenance=provenance_for(artifact_type=stage),
     )
-    appended = append_event(
-        conn,
-        event,
-        expected_version=current_version(conn, "run", run_id),
-        table_version=table_version_for(conn, "run", run_id),
-    )
+    # The RUN-aggregate promotion is CAS-guarded on the run stream's own OCC head; a concurrent
+    # run-aggregate write between the read and the append raises ConcurrencyError. Deny `stale`
+    # (execute_command does NOT catch it → an uncaught raise would leak the idempotency claim),
+    # matching every other appending handler in this file (submit_intent / refine_contract /
+    # answer_clarification).
+    try:
+        appended = append_event(
+            conn,
+            event,
+            expected_version=current_version(conn, "run", run_id),
+            table_version=table_version_for(conn, "run", run_id),
+        )
+    except ConcurrencyError:
+        return CommandResult(accepted=False, aggregate_id=run_id, denied_reason="stale")
     return CommandResult(
         accepted=True, aggregate_id=run_id, produced_event_ids=(appended.event_id,)
     )
