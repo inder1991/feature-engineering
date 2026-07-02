@@ -1,8 +1,11 @@
+import pytest
+
 from featuregen.intake.critique import (
     CritiqueResult,
     apply_critique,
     contract_review,
 )
+from featuregen.intake.redaction import EgressViolation
 from featuregen.intake.store import (
     append_feature_contract_event as append_fc_event,
 )
@@ -119,3 +122,27 @@ def test_contract_review_llm_failure_fails_closed(db, sp2_schemas, agent):
     assert "CONTRACT_CRITIQUED" in types
     # a failed critique never silently unblocks the router
     assert apply_critique({"filters": "human"}, result)["filters"] == "human"
+
+
+class _ExplodingLLM:
+    """A raw LLMClient double whose .call MUST NEVER fire — proves the egress backstop fails closed
+    BEFORE any model dispatch (call_llm would invoke .call on this)."""
+
+    def call(self, request):  # pragma: no cover - firing it is the test failure
+        raise AssertionError("LLM must not be called: draft_semantics carried residual PII")
+
+
+def test_contract_review_fails_closed_on_residual_pii_in_draft_semantics(db, sp2_schemas, agent):
+    """The PRIMARY model-facing payload (draft_semantics) must clear the no-PII egress backstop
+    (§9.4): a Draft whose semantic content carries residual PII fails CLOSED (EgressViolation) and
+    NEVER reaches the LLM — no LLM_CALL_RECORDED is written to the stream."""
+    run_id = _seed_contract(db, agent)
+    draft_with_pii = {
+        "entity": "customer",
+        "filters": [{"concept": "declined card", "note": "email requester alice@example.com"}],
+    }
+    with pytest.raises(EgressViolation):
+        contract_review(db, _ExplodingLLM(), draft_with_pii, run_id=run_id, actor=agent)
+    types = [e.type for e in load_feature_contract(db, run_id)]
+    assert "LLM_CALL_RECORDED" not in types   # the draft never reached (or was recorded against) the LLM
+    assert "CONTRACT_CRITIQUED" not in types  # no critique shadow on a fail-closed egress breach

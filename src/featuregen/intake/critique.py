@@ -24,7 +24,12 @@ from featuregen.intake.llm import (
     LLMRequest,
     call_llm,
 )
-from featuregen.intake.redaction import INPUT_KEY_CATALOG, INPUT_KEY_CLASSIFICATION
+from featuregen.intake.redaction import (
+    INPUT_KEY_CATALOG,
+    INPUT_KEY_CLASSIFICATION,
+    EgressViolation,
+    _first_pii,
+)
 from featuregen.intake.store import append_feature_contract_event as append_fc_event
 
 # The CONTRACT_REVIEW structured-output schema id/version call_llm resolves + validates against.
@@ -129,6 +134,14 @@ def contract_review(
         output_schema_version=CONTRACT_REVIEW_SCHEMA_VERSION,
         generation_settings=dict(_REVIEW_SETTINGS),
     )
+    # Egress hard-backstop over the PRIMARY model-facing payload (§9.4). The Draft is "PII-free by
+    # construction", but the global no-PII boundary demands a real scan on anything reaching the LLM:
+    # assert_llm_safe only guards the reserved intent/catalog keys, not draft_semantics. Reuse
+    # redaction's OWN scanner (recurses into nested str/dict/list) and FAIL CLOSED — residual PII in a
+    # draft is an upstream invariant breach that must surface (EgressViolation), never be silently sent.
+    hit = _first_pii(draft_semantics)
+    if hit:
+        raise EgressViolation(f"un-redacted {hit} detected in critique draft_semantics payload")
     result = call_llm(conn, client, request, run_id=run_id, actor=actor)
 
     if result.status in _USABLE_STATUSES:
