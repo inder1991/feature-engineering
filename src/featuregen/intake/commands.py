@@ -43,7 +43,11 @@ from featuregen.intake.banking_catalog import (
 )
 from featuregen.intake.catalog import current_intake_catalog  # R8/R10 seam (P2, catalog.py)
 from featuregen.intake.contract import validate_semantics  # R6 (P2, contract.py)
-from featuregen.intake.events import DRAFT_CONTRACT_PRODUCED, INTENT_SUBMITTED
+from featuregen.intake.events import (
+    DRAFT_CONTRACT_PRODUCED,
+    INTENT_REJECTED,
+    INTENT_SUBMITTED,
+)
 from featuregen.intake.llm import LLMRequest, call_llm, current_llm_client  # R10 seam (P3, llm.py)
 from featuregen.intake.redaction import (  # R10 seam (P3, redaction.py)
     build_llm_inputs,
@@ -392,6 +396,31 @@ def _produce_draft(
     return CommandResult(accepted=True, aggregate_id=run_id, produced_event_ids=tuple(produced))
 
 
+def _do_reject_intent(
+    conn: DbConn, *, run_id: str, request_id: str | None, actor: IdentityEnvelope,
+    classification: str, catalog_version: str | None, reason: str | None, matched_class: str | None,
+) -> list[str]:
+    """The INTAKE-TIME, platform/service-issued deterministic rejection (§5.4, §13, X5). INTENT_REJECTED
+    (fc) carries the classification + catalog version (+ matched class); RUN_REJECTED (SP-0 run) makes the
+    run terminal (X8). X4: the fc append is CAS-guarded on the folded head. NOT SP-0's validator-only
+    `reject`, and NOT the standalone P8 `reject_intent` command — submit_intent appends this ITSELF."""
+    rej_fc = append_fc_event(
+        conn, run_id=run_id, type=INTENT_REJECTED,
+        expected_version=_fc_head(conn, run_id),  # X4 — CAS on the folded head
+        payload={
+            # R2 — no id fields; run_id/request_id ride the seam kwargs.
+            "classification": classification, "catalog_version": catalog_version,
+            "matched_class": matched_class, "reason": reason,
+        },
+        actor=actor, request_id=request_id,
+    )
+    rej_run = append(
+        conn, aggregate="run", aggregate_id=run_id, type="RUN_REJECTED",
+        payload={"run_id": run_id, "reason": reason or classification}, actor=actor, run_id=run_id,
+    )
+    return [rej_fc.event_id, rej_run.event_id]
+
+
 def submit_intent(conn: DbConn, cmd: Command) -> CommandResult:
     """Definition-mode intake happy path (§5.2): open the SP-0 request+run, classify at the banking
     boundary, then on CLEAR / *_CLARIFY normalize into a frozen Draft + Assumption Ledger. Opens the
@@ -477,11 +506,15 @@ def submit_intent(conn: DbConn, cmd: Command) -> CommandResult:
             )
         outcome = classification.outcome
         if outcome in (IntakeOutcome.OUT_OF_SCOPE, IntakeOutcome.PROHIBITED_DATA_CLASS):
-            # X8 — terminal reject: submit_intent appends INTENT_REJECTED ITSELF (Task 4.5), never P8.
-            return CommandResult(
-                accepted=False, aggregate_id=run_id,
-                denied_reason=f"banking-boundary block: {outcome.value}",
+            # X8 — both are terminal rejects. X5 — submit_intent appends INTENT_REJECTED ITSELF (never P8).
+            produced.extend(
+                _do_reject_intent(
+                    conn, run_id=run_id, request_id=request_id, actor=cmd.actor,
+                    classification=outcome.value, catalog_version=classification.catalog_version,
+                    reason=classification.reason, matched_class=classification.matched_class,
+                )
             )
+            return CommandResult(accepted=True, aggregate_id=run_id, produced_event_ids=tuple(produced))
         if outcome is IntakeOutcome.NEEDS_USE_CASE_ONBOARDING:
             # Routed to an SP-0 park + USE_CASE_ONBOARDING gate in Task 4.6.
             return CommandResult(
