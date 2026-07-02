@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 
 from featuregen.aggregates._append import append, provenance_for
@@ -41,7 +41,7 @@ from featuregen.documents.draft import (
 from featuregen.documents.registry import DocumentSchemaRegistry
 from featuregen.documents.store import append_document, compute_content_hash
 from featuregen.events.store import load_stream
-from featuregen.gates.tasks import open_task
+from featuregen.gates.tasks import open_task, submit_human_signal
 from featuregen.idgen import mint_id
 from featuregen.intake.banking_catalog import (
     IntakeClassification,
@@ -87,9 +87,10 @@ from featuregen.intake.redaction import (  # R10 seam (P3, redaction.py)
 )
 from featuregen.intake.scoring import score_fields  # P5 per-field scoring (Task 5.1)
 
-# R3/R4: the ONE feature_contract fold is owned by P2 (intake.state); refine derives the request owner
-# from state.requester (the INTENT_SUBMITTED actor.subject) — never a payload key.
-from featuregen.intake.state import fold_feature_contract_state
+# R3/R4: the ONE feature_contract fold + the ONE request-owner predicate are owned by P2 (intake.state);
+# refine / answer_clarification derive the request owner from state.requester (the INTENT_SUBMITTED
+# actor.subject) via actor_is_request_owner — never a payload key.
+from featuregen.intake.state import actor_is_request_owner, fold_feature_contract_state
 from featuregen.intake.store import (  # R1 seam (P1, store.py)
     append_feature_contract_event as append_fc_event,
 )
@@ -97,6 +98,9 @@ from featuregen.intake.store import (
     load_feature_contract,
 )
 from featuregen.privacy.classification import InlinePIIError, assert_no_inline_pii
+from featuregen.security.audit import (
+    record_denial,  # R15 — SoD/owner-guard denials → security stream
+)
 
 __all__ = [
     "IntakeError",
@@ -117,6 +121,8 @@ __all__ = [
     "freeze_draft",
     "open_clarification_task",
     "refine_contract",
+    # Task 5.6 — the human's answer to a Clarification gate task (request-owner guard → drives the loop).
+    "answer_clarification",
     "RefineResult",
     "MAX_REFINEMENT_ROUNDS",
     "IntakeDeps",
@@ -876,6 +882,16 @@ def _answered_fields(stream) -> dict[str, object]:
     return answers
 
 
+def _requested_field(stream, task_id: str) -> str | None:
+    """The `field` the CLARIFICATION_REQUESTED that opened this task asked about — threaded onto the
+    answer's CLARIFICATION_ANSWERED so the P2 fold prunes it from open_fields and the Loop pins it
+    (§6.6). None when the task has no matching request shadow on the stream."""
+    for e in stream:
+        if e.type == CLARIFICATION_REQUESTED and e.payload.get("task_id") == task_id:
+            return e.payload.get("field")
+    return None
+
+
 # ── clarification task ──────────────────────────────────────────────────────────────────────────────
 def open_clarification_task(
     conn: DbConn,
@@ -1199,3 +1215,85 @@ def refine_contract(
         # X4 — a concurrent feature_contract transition advanced the head since the fold. The whole round
         # is stale; nothing this round committed (single transaction) — the Loop re-drives on the fresh head.
         return RefineResult("stale", draft_doc_id, tuple(open_fields), None)
+
+
+# ═══ Task 5.6 — the answer_clarification command (request-owner guard → drives the loop, §6.5) ════════
+def _deny_owner_guard(conn: DbConn, cmd: Command, run_id: str, reason: str) -> CommandResult:
+    """A request-owner / SoD denial is a security event, not a benign validation error (R15): route it
+    to the tamper-evident security-audit stream (§6.2, §8.2), NEVER the domain stream. Mirrors the
+    overlay `_deny_audited`; the resolved run_id is recorded as the aggregate_id."""
+    record_denial(conn, replace(cmd, aggregate_id=run_id), reason)
+    return CommandResult(accepted=False, aggregate_id=run_id, denied_reason=reason)
+
+
+def answer_clarification(conn: DbConn, cmd: Command) -> CommandResult:
+    """Answer a Human Clarification task (spec §6.5). SP-2 adds the request-owner guard SP-0 does not
+    provide: SP-0's `submit_human_signal` checks role/scope/quorum but NEVER that the acting subject is
+    the task's requester (`gates/tasks.py`), so role-authz alone would let ANY data_scientist answer
+    another author's clarification. R4: the ONE owner predicate is `actor_is_request_owner(state, actor)`
+    AND a human actor-kind; a non-owner / non-human is DENIED + security-audited (R15), never counted and
+    with NO state change. On a counted, quorum-met answer it emits the CLARIFICATION_ANSWERED domain
+    shadow (X4 — CAS-pinned to the folded head; a concurrent transition denies `stale`) and drives the
+    Contract Refinement Loop (`refine_contract`) when the Layer-2 deps are registered.
+
+    Handler on an EXISTING stream: fold → decide → deny BEFORE any side-effecting append (execute_command
+    does NOT roll back on accepted=False, so a benign non-count / owner denial must commit nothing)."""
+    args = cmd.args
+    task_id = args["task_id"]
+    row = conn.execute("SELECT run_id FROM human_tasks WHERE task_id=%s", (task_id,)).fetchone()
+    if row is None or row[0] is None:
+        return CommandResult(accepted=False, aggregate_id="", denied_reason="unknown clarification task")
+    run_id = row[0]
+    stream = load_feature_contract(conn, run_id)
+    # X4 (CAS on the folded head): pin the answer shadow to the folded head. `submit_human_signal`
+    # advances only `human_tasks` (not the feature_contract stream), so the head captured here is still
+    # the head at the CLARIFICATION_ANSWERED append; a concurrent feature_contract transition since the
+    # fold trips ConcurrencyError → deny `stale` (the counted signal + shadow ride one transaction).
+    head_version = stream[-1].stream_version if stream else 0
+    state = fold_feature_contract_state(stream)   # R3 — the P2 fold; state.requester is the owner (R4)
+
+    # ── SP-2 request-owner guard (subject-level; SP-0 authz is role-level only) ──────────────────
+    # R4: the ONE owner predicate is actor_is_request_owner(state, actor) — never payload.get("requested_by").
+    # DECIDE-BEFORE-APPEND: a mismatch (non-owner / non-human) denies + security-audits and commits nothing.
+    if cmd.actor.actor_kind != "human" or not actor_is_request_owner(state, cmd.actor):
+        return _deny_owner_guard(
+            conn, cmd, run_id, "answer_clarification denied: actor is not the request owner"
+        )
+
+    result = submit_human_signal(
+        conn, task_id, response=args["response"], actor=cmd.actor,
+        expected_task_version=args["expected_task_version"],
+    )
+    if not result.counted:
+        # Benign non-count (stale task_version / already-closed) — NOT a security event.
+        return CommandResult(
+            accepted=False, aggregate_id=run_id,
+            denied_reason=f"clarification not counted (status={result.status})",
+        )
+
+    field = _requested_field(stream, task_id)
+    try:
+        append_fc_event(
+            conn, run_id=run_id, type=CLARIFICATION_ANSWERED,
+            payload={"task_id": task_id, "field": field, "answer": args.get("answer"),
+                     "response": args["response"], "answered_by": cmd.actor.subject},
+            actor=cmd.actor, expected_version=head_version,   # X4 — CAS on the folded head
+        )
+    except ConcurrencyError:
+        # A concurrent feature_contract transition raced this fold → fail closed, not counted.
+        return CommandResult(accepted=False, aggregate_id=run_id, denied_reason="stale")
+
+    # Drive the Refinement Loop once quorum is met (§6.6) — only when the runtime deps are wired
+    # (P9 bootstrap / test registration). Absent deps, the loop is driven by the durable runtime.
+    if result.quorum_met:
+        deps = current_intake_deps()
+        if deps is not None and deps.client is not None:
+            refine_contract(conn, run_id, client=deps.client, redactor=deps.redactor,
+                            catalog=deps.catalog, actor=cmd.actor)
+    return CommandResult(accepted=True, aggregate_id=run_id)
+
+
+# Task 5.6 — extend the P4 command catalog (this is the command P9 registers in the SP-2 catalog).
+# Reassigned AFTER answer_clarification is defined; register_sp2_commands reads the module-global at
+# call time (idempotent), so the appended entry is picked up.
+_SP2_CATALOG = _SP2_CATALOG + (("answer_clarification", answer_clarification),)
