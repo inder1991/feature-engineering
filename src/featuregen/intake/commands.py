@@ -20,7 +20,7 @@ from featuregen.aggregates.request_aggregate import (
     create_request_command,
     create_run_command,
 )
-from featuregen.aggregates.run_lifecycle import park_command
+from featuregen.aggregates.run_lifecycle import park_command, run_is_terminal
 from featuregen.commands.registry import get_command, register_command
 from featuregen.contracts import (
     Command,
@@ -40,6 +40,7 @@ from featuregen.documents.draft import (
 )
 from featuregen.documents.registry import DocumentSchemaRegistry
 from featuregen.documents.store import append_document, compute_content_hash
+from featuregen.events.store import load_stream
 from featuregen.gates.tasks import open_task
 from featuregen.idgen import mint_id
 from featuregen.intake.banking_catalog import (
@@ -72,10 +73,15 @@ from featuregen.intake.llm import (  # R10 seam (P3, llm.py)
     call_llm,
     current_llm_client,
 )
-from featuregen.intake.mcv import minimum_contract_validated  # P5 pre-gate checklist (Task 5.4)
+from featuregen.intake.mcv import (  # P5 pre-gate checklist (Task 5.4)
+    _latest_body,
+    minimum_contract_validated,
+)
 from featuregen.intake.redaction import (  # R10 seam (P3, redaction.py)
     INPUT_KEY_CATALOG,
     INPUT_KEY_CLASSIFICATION,
+    EgressViolation,
+    _first_pii,
     build_llm_inputs,
     current_intent_redactor,
 )
@@ -109,7 +115,6 @@ __all__ = [
     "submit_intent",
     # Task 5.5 — Human Clarification task + the bounded Contract Refinement Loop (§6.5, §6.6).
     "freeze_draft",
-    "read_contract_body",
     "open_clarification_task",
     "refine_contract",
     "RefineResult",
@@ -809,15 +814,12 @@ def current_intake_deps() -> IntakeDeps | None:
     return _INTAKE_DEPS
 
 
-# ── the frozen-body content store (P4 seam) ─────────────────────────────────────────────────────────
+# ── the frozen-body DAG documents (P4 seam) ─────────────────────────────────────────────────────────
 # Documents are opaque-by-reference (documents/store.py — a content_hash + body_ref, never the body);
-# SP-0's encrypted blob store is the durable resolver of `body_ref`. Task 5.4 deferred building
-# freeze_draft/read_contract_body, so this task ships the ONE governance-retained-body seam the Loop
-# needs: freeze_draft freezes the DAG documents (real rows + lineage) and stashes the semantic body
-# (PII-free by construction), read_contract_body resolves it. The CONTRACT_REFINED / DRAFT_CONTRACT_
-# PRODUCED events ALSO inline `draft_body` (Phase-8 replay + mcv._latest_body), so the event stream
-# remains the authoritative replay source; this map is the blob-store stand-in for by-id reads.
-_CONTRACT_BODIES: dict[str, dict] = {}
+# SP-0's encrypted blob store is the durable resolver of `body_ref`. `freeze_draft` freezes the DAG
+# documents (real rows + lineage) for the revised Draft; the SEMANTIC body itself rides the
+# DRAFT_CONTRACT_PRODUCED / CONTRACT_REFINED events inline (Phase-8 replay), so the READ path is the
+# event stream (mcv._latest_body), NOT any in-process map — replay-/cross-process-safe.
 
 
 def freeze_draft(
@@ -833,8 +835,9 @@ def freeze_draft(
     """Freeze a Draft + its Assumption Ledger as governance-retained DAG documents (§3.4) and return
     `(draft_doc_id, ledger_doc_id)`. The ledger is frozen first so its real doc id can be threaded into
     the Draft's `assumption_ledger_ref` (R12); the Draft `derived_from` the ledger and `supersedes` the
-    prior Draft (full refinement history retained). Bodies are stashed for by-id reads (the blob-store
-    stand-in) — they carry NO raw intent / PII, only the semantic contract."""
+    prior Draft (full refinement history retained). The bodies carry NO raw intent / PII, only the
+    semantic contract; the authoritative READ is the inlined event stream (mcv._latest_body), never a
+    by-doc-id lookup here."""
     ledger_doc_id = _emit_document(
         conn, stage=Stage.ASSUMPTION_LEDGER.value, body=ledger_body,
         run_id=run_id, request_id=request_id, actor=actor,
@@ -845,18 +848,7 @@ def freeze_draft(
         run_id=run_id, request_id=request_id, actor=actor,
         derived_from=(ledger_doc_id,), supersedes=tuple(supersedes),
     )
-    _CONTRACT_BODIES[draft_doc_id] = draft_body
-    _CONTRACT_BODIES[ledger_doc_id] = dict(ledger_body)
     return draft_doc_id, ledger_doc_id
-
-
-def read_contract_body(conn: DbConn, doc_id: str) -> dict:
-    """Resolve a frozen contract/ledger body by its doc id (the blob-store stand-in — see
-    `_CONTRACT_BODIES`). Raises IntakeError on an unknown id (fail closed — never a silent empty body)."""
-    body = _CONTRACT_BODIES.get(doc_id)
-    if body is None:
-        raise IntakeError(f"no stored body for document {doc_id!r}")
-    return dict(body)
 
 
 # ── feature_contract stream readers ─────────────────────────────────────────────────────────────────
@@ -985,6 +977,19 @@ def _candidate_count(conn: DbConn, run_id: str) -> int:
     return int(row[0]) if row else 0
 
 
+def _run_is_parked(conn: DbConn, run_id: str) -> bool:
+    """True iff the SP-0 run is CURRENTLY parked (a RUN_PARKED not since cleared by RUN_UNPARKED). The
+    bounded-exhaustion auto-park is a direct park outside execute_command, so this idempotency check is
+    what stops an auto-park re-drive from appending a duplicate RUN_PARKED on a still-parked run."""
+    parked = False
+    for e in load_stream(conn, "run", run_id):
+        if e.type == "RUN_PARKED":
+            parked = True
+        elif e.type == "RUN_UNPARKED":
+            parked = False
+    return parked
+
+
 def _redact_answers(redactor, answers, classification: str) -> dict:
     """Belt-and-suspenders: a clarification answer is human free text — redact it before it enters an
     LLM renormalize request (§9.4). call_llm additionally egress-guards the whole request."""
@@ -1024,14 +1029,24 @@ def refine_contract(
     stream = load_feature_contract(conn, run_id)
     state = fold_feature_contract_state(stream)   # R3 — the P2 fold; `state.requester` is the owner (R4)
     intent = _first(stream, INTENT_SUBMITTED)
-    request_id = intent.payload["request_id"]
+    # R2: request_id rides the typed event column (submit_intent puts NO id fields in the payload); a
+    # seed that inlines it in the payload still resolves via the fallback.
+    request_id = intent.request_id or intent.payload.get("request_id")
     mode = intent.payload["intake_mode"]
     classification = intent.payload.get("classification")   # the recorded R9 mapping (`.catalog_version`)
     raw_class = intent.payload["raw_input_classification"]
     draft_doc_id = _current_draft_doc_id(stream)
-    draft_body = read_contract_body(conn, draft_doc_id)
-    ledger_body = read_contract_body(conn, draft_body["assumption_ledger_ref"]) if draft_body.get(
-        "assumption_ledger_ref") else {"request_id": request_id, "assumptions": []}
+    # Read the CURRENT draft/ledger body from the INLINED event stream (the same scan mcv._latest_body
+    # uses) — the real producer (_produce_draft/submit_intent) inlines draft_body/assumption_ledger_body
+    # on DRAFT_CONTRACT_PRODUCED and refine re-inlines them on CONTRACT_REFINED, so the read is
+    # replay-/cross-process-safe (never the in-process body map).
+    latest_draft = _latest_body(stream, "draft_body")
+    if latest_draft is None:
+        raise IntakeError(f"no draft_body on the feature_contract stream for run {run_id!r}")
+    draft_body = dict(latest_draft)
+    latest_ledger = _latest_body(stream, "assumption_ledger_body")
+    ledger_body = dict(latest_ledger) if latest_ledger is not None else {
+        "request_id": request_id, "assumptions": []}
     answers = _answered_fields(stream)
     rounds = sum(1 for e in stream if e.type == CONTRACT_REFINED)
 
@@ -1052,6 +1067,14 @@ def refine_contract(
             output_schema_id=RENORMALIZE_SCHEMA_ID, output_schema_version=RENORMALIZE_SCHEMA_VERSION,
             generation_settings=dict(_RENORM_SETTINGS),
         )
+        # Egress hard-backstop (§9.4), mirroring critique.py: call_llm's assert_llm_safe only scans the
+        # reserved intent/catalog keys, but the renormalize request carries model-facing content under
+        # non-reserved keys — `prior_semantics` (sent RAW) and `answers` (pre-redacted). Scan both with
+        # redaction's OWN detector and FAIL CLOSED before dispatch — residual PII is an upstream
+        # invariant breach that must surface (EgressViolation), never be silently sent.
+        hit = _first_pii(request.inputs["prior_semantics"], request.inputs["answers"])
+        if hit:
+            raise EgressViolation(f"un-redacted {hit} detected in renormalize model-facing content")
         result = call_llm(conn, client, request, run_id=run_id, actor=actor)
         semantics = result.output["feature_semantics"]
         llm_scores = result.self_reported_scores
@@ -1108,9 +1131,10 @@ def refine_contract(
                                actor=actor)
 
         # 6) Freeze the revised Draft + Ledger and emit CONTRACT_REFINED when anything changed. The
-        #    payload INLINES draft_body + assumption_ledger_body + open_fields + field_scores so the P2
-        #    fold tracks the open-field set / scores and mcv._latest_body reads the CURRENT body — omit
-        #    them and a later MCV validates the STALE original Draft / silently clears the open fields.
+        #    payload INLINES draft_body + assumption_ledger_body + open_fields + field_scores +
+        #    open_questions so the P2 fold tracks the open-field/question set + scores and
+        #    mcv._latest_body reads the CURRENT body — omit them and a later MCV validates the STALE
+        #    original Draft / the fold keeps the stale pre-refinement open_questions.
         question_by_field = {e.payload["field"]: e.payload.get("question", f"Please specify {e.payload['field']}.")
                              for e in stream if e.type == CLARIFICATION_REQUESTED and e.payload.get("field")}
         new_ledger = {"request_id": request_id,
@@ -1129,6 +1153,7 @@ def refine_contract(
             _append_domain(run_id=run_id, type=CONTRACT_REFINED,
                            payload={"draft_doc_id": draft_doc_id, "assumption_ledger_ref": ledger_doc_id,
                                     "open_fields": open_fields, "field_scores": field_scores,
+                                    "open_questions": new_draft["open_questions"],
                                     "draft_body": new_draft, "assumption_ledger_body": new_ledger,
                                     "iteration": rounds}, actor=actor)
 
@@ -1148,11 +1173,15 @@ def refine_contract(
 
         if rounds >= budget:
             # Bounded (§6.6): stop looping — auto-park the run for human follow-up (X6 waiting_on_fact=None).
-            park_command(conn, Command(
-                action="park", aggregate="run", aggregate_id=run_id,
-                args={"owner": _REFINEMENT_PARK_OWNER, "waiting_on_fact": None},
-                actor=actor, idempotency_key=f"refine-park:{run_id}:{rounds}",
-            ))
+            # This is a DIRECT park_command (outside execute_command → its idempotency_key is NOT honoured
+            # and run_is_terminal is NOT checked), so guard it here: never park an already-terminal run,
+            # and make an auto-park re-drive idempotent (no duplicate RUN_PARKED on a still-parked run).
+            if not run_is_terminal(conn, run_id) and not _run_is_parked(conn, run_id):
+                park_command(conn, Command(
+                    action="park", aggregate="run", aggregate_id=run_id,
+                    args={"owner": _REFINEMENT_PARK_OWNER, "waiting_on_fact": None},
+                    actor=actor, idempotency_key=f"refine-park:{run_id}:{rounds}",
+                ))
             return RefineResult("parked", draft_doc_id, tuple(open_fields), None)
 
         owner = state.requester   # R4 — the INTENT_SUBMITTED actor.subject; never payload.get("requested_by")
