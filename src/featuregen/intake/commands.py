@@ -11,6 +11,8 @@ so a test can pin the banking outcome deterministically."""
 from __future__ import annotations
 
 import json
+import os
+from dataclasses import dataclass
 from datetime import UTC, datetime
 
 from featuregen.aggregates._append import append, provenance_for
@@ -18,6 +20,7 @@ from featuregen.aggregates.request_aggregate import (
     create_request_command,
     create_run_command,
 )
+from featuregen.aggregates.run_lifecycle import park_command
 from featuregen.commands.registry import get_command, register_command
 from featuregen.contracts import (
     Command,
@@ -32,8 +35,10 @@ from featuregen.contracts.envelopes import GateTaskSpec, NewDocument
 from featuregen.documents.draft import (
     INTAKE_MODES,
     RAW_INPUT_CLASSIFICATIONS,
+    UNKNOWN,
     validate_draft,
 )
+from featuregen.documents.registry import DocumentSchemaRegistry
 from featuregen.documents.store import append_document, compute_content_hash
 from featuregen.gates.tasks import open_task
 from featuregen.idgen import mint_id
@@ -43,12 +48,21 @@ from featuregen.intake.banking_catalog import (
     classify_intent,
 )
 from featuregen.intake.catalog import current_intake_catalog  # R8/R10 seam (P2, catalog.py)
-from featuregen.intake.contract import validate_semantics  # R6 (P2, contract.py)
+from featuregen.intake.contract import (  # R6 (P2, contract.py)
+    CONTRACT_SCHEMA_OWNER,
+    validate_semantics,
+)
+from featuregen.intake.critique import apply_critique, contract_review  # P5 challenger seam
+from featuregen.intake.doubt_router import default_thresholds, route_draft  # P5 routing seam
 from featuregen.intake.events import (
+    CLARIFICATION_ANSWERED,
     CLARIFICATION_REQUESTED,
+    CONTRACT_REFINED,
     DRAFT_CONTRACT_PRODUCED,
+    FIELD_AUTO_RESOLVED,
     INTENT_REJECTED,
     INTENT_SUBMITTED,
+    MINIMUM_CONTRACT_VALIDATED,
     USE_CASE_ONBOARDING_GATE,
     USE_CASE_ONBOARDING_REQUESTED,
 )
@@ -58,10 +72,18 @@ from featuregen.intake.llm import (  # R10 seam (P3, llm.py)
     call_llm,
     current_llm_client,
 )
+from featuregen.intake.mcv import minimum_contract_validated  # P5 pre-gate checklist (Task 5.4)
 from featuregen.intake.redaction import (  # R10 seam (P3, redaction.py)
+    INPUT_KEY_CATALOG,
+    INPUT_KEY_CLASSIFICATION,
     build_llm_inputs,
     current_intent_redactor,
 )
+from featuregen.intake.scoring import score_fields  # P5 per-field scoring (Task 5.1)
+
+# R3/R4: the ONE feature_contract fold is owned by P2 (intake.state); refine derives the request owner
+# from state.requester (the INTENT_SUBMITTED actor.subject) — never a payload key.
+from featuregen.intake.state import fold_feature_contract_state
 from featuregen.intake.store import (  # R1 seam (P1, store.py)
     append_feature_contract_event as append_fc_event,
 )
@@ -85,6 +107,16 @@ __all__ = [
     "assert_no_silent_assumption",
     # Task 4.4 the first intake command handler (definition-mode CLEAR happy path).
     "submit_intent",
+    # Task 5.5 — Human Clarification task + the bounded Contract Refinement Loop (§6.5, §6.6).
+    "freeze_draft",
+    "read_contract_body",
+    "open_clarification_task",
+    "refine_contract",
+    "RefineResult",
+    "MAX_REFINEMENT_ROUNDS",
+    "IntakeDeps",
+    "register_intake_deps",
+    "current_intake_deps",
     # re-exported collaborator seams (R10) + R1 append/load — the handlers added by later Phase-4
     # tasks read these off this module; consumers import them from here.
     "append_fc_event",
@@ -309,10 +341,12 @@ def _emit_document(
     request_id: str,
     actor: IdentityEnvelope,
     derived_from: tuple[str, ...] = (),
+    supersedes: tuple[str, ...] = (),
 ) -> str:
     """Emit one frozen, content-hashed governance-retained document on the run's DAG (§3.4). The body
     itself rides the DRAFT_CONTRACT_PRODUCED event for replay; the document carries the content hash
-    for lineage/integrity (the body_ref points at the encrypted blob — never inlined here)."""
+    for lineage/integrity (the body_ref points at the encrypted blob — never inlined here). A revised
+    Draft `supersedes` the prior one (§3.4) so the full refinement history is retained on the DAG."""
     doc_id = mint_id("doc")
     append_document(
         conn,
@@ -326,6 +360,7 @@ def _emit_document(
             provenance=provenance_for(stage),
             body_ref=mint_id("blob"),
             derived_from=derived_from,
+            supersedes=supersedes,
         ),
         run_id=run_id,
         request_id=request_id,
@@ -707,3 +742,431 @@ def submit_intent(conn: DbConn, cmd: Command) -> CommandResult:
 _SP2_CATALOG = (
     ("submit_intent", submit_intent),
 )
+
+
+# ═══ Task 5.5 — Human Clarification task + the bounded Contract Refinement Loop (§6.5, §6.6) ═════════
+#
+# Round budget for the Contract Refinement Loop (Decision 6, spec §6.6) — bounded by SP-0's durable
+# hard-loop-limit posture, config-gated; on exhaustion the run auto-parks for human follow-up (never
+# loops forever). Read as a module-global so a test can monkeypatch it.
+MAX_REFINEMENT_ROUNDS = int(os.environ.get("FEATUREGEN_MAX_REFINEMENT_ROUNDS", "5"))
+_REFINEMENT_PARK_OWNER = "governance:intake-refinement"
+_RENORM_SETTINGS = {"provider": "fake", "model": "fake-structured", "max_tokens": 2048}
+
+# The `renormalize` structured-output schema call_llm validates the re-normalization output against
+# (§9.1). Intentionally LENIENT vs the full DRAFT_CONTRACT content-schema: the re-normalization returns
+# only the revised SEMANTIC subset (feature_semantics + the still-open fields); the platform re-wraps
+# the SP-0 envelope. additionalProperties stays open (additive-friendly, mirrors events.py/critique.py).
+RENORMALIZE_SCHEMA_ID = "renormalize"
+RENORMALIZE_SCHEMA_VERSION = 1
+RENORMALIZE_OUTPUT_SCHEMA = {
+    "type": "object",
+    "required": ["feature_semantics"],
+    "properties": {
+        "feature_semantics": {"type": "object"},
+        "open_fields": {"type": "array", "items": {"type": "string"}},
+    },
+    "additionalProperties": True,
+}
+
+
+def register_renormalize_schema(registry) -> None:
+    """Register the `renormalize` structured-output schema in SP-0's document registry so call_llm can
+    validate the re-normalization response (§9.1). Idempotent (register_schema upserts)."""
+    registry.register_schema(
+        RENORMALIZE_SCHEMA_ID, RENORMALIZE_SCHEMA_VERSION, RENORMALIZE_OUTPUT_SCHEMA,
+        CONTRACT_SCHEMA_OWNER,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class RefineResult:
+    status: str                 # clarifying | validated | mcv_failed | parked | stale (X4 CAS lost-update)
+    draft_doc_id: str | None
+    open_fields: tuple[str, ...]
+    mcv: object | None          # MCVResult when a checklist ran, else None
+
+
+@dataclass(frozen=True, slots=True)
+class IntakeDeps:
+    client: object      # LLMClient (§9.1)
+    redactor: object    # IntentRedactor (§9.4)
+    catalog: object     # CatalogView (scoring seam, §6.1)
+
+
+_INTAKE_DEPS: IntakeDeps | None = None
+
+
+def register_intake_deps(*, client, redactor, catalog) -> None:
+    """Single-source registration of the Layer-2 runtime deps (LLM client / redactor / merged-view
+    catalog). P9 bootstrap wires FakeLLM + DefaultIntentRedactor + the SP-1 merged-view adapter; the
+    auto-drive in the Refinement Loop uses these when a caller does not pass them explicitly."""
+    global _INTAKE_DEPS
+    _INTAKE_DEPS = IntakeDeps(client=client, redactor=redactor, catalog=catalog)
+
+
+def current_intake_deps() -> IntakeDeps | None:
+    return _INTAKE_DEPS
+
+
+# ── the frozen-body content store (P4 seam) ─────────────────────────────────────────────────────────
+# Documents are opaque-by-reference (documents/store.py — a content_hash + body_ref, never the body);
+# SP-0's encrypted blob store is the durable resolver of `body_ref`. Task 5.4 deferred building
+# freeze_draft/read_contract_body, so this task ships the ONE governance-retained-body seam the Loop
+# needs: freeze_draft freezes the DAG documents (real rows + lineage) and stashes the semantic body
+# (PII-free by construction), read_contract_body resolves it. The CONTRACT_REFINED / DRAFT_CONTRACT_
+# PRODUCED events ALSO inline `draft_body` (Phase-8 replay + mcv._latest_body), so the event stream
+# remains the authoritative replay source; this map is the blob-store stand-in for by-id reads.
+_CONTRACT_BODIES: dict[str, dict] = {}
+
+
+def freeze_draft(
+    conn: DbConn,
+    *,
+    run_id: str,
+    request_id: str,
+    body: dict,
+    ledger_body: dict,
+    actor: IdentityEnvelope,
+    supersedes: tuple[str, ...] = (),
+) -> tuple[str, str]:
+    """Freeze a Draft + its Assumption Ledger as governance-retained DAG documents (§3.4) and return
+    `(draft_doc_id, ledger_doc_id)`. The ledger is frozen first so its real doc id can be threaded into
+    the Draft's `assumption_ledger_ref` (R12); the Draft `derived_from` the ledger and `supersedes` the
+    prior Draft (full refinement history retained). Bodies are stashed for by-id reads (the blob-store
+    stand-in) — they carry NO raw intent / PII, only the semantic contract."""
+    ledger_doc_id = _emit_document(
+        conn, stage=Stage.ASSUMPTION_LEDGER.value, body=ledger_body,
+        run_id=run_id, request_id=request_id, actor=actor,
+    )
+    draft_body = {**body, "assumption_ledger_ref": ledger_doc_id}
+    draft_doc_id = _emit_document(
+        conn, stage=Stage.DRAFT_CONTRACT.value, body=draft_body,
+        run_id=run_id, request_id=request_id, actor=actor,
+        derived_from=(ledger_doc_id,), supersedes=tuple(supersedes),
+    )
+    _CONTRACT_BODIES[draft_doc_id] = draft_body
+    _CONTRACT_BODIES[ledger_doc_id] = dict(ledger_body)
+    return draft_doc_id, ledger_doc_id
+
+
+def read_contract_body(conn: DbConn, doc_id: str) -> dict:
+    """Resolve a frozen contract/ledger body by its doc id (the blob-store stand-in — see
+    `_CONTRACT_BODIES`). Raises IntakeError on an unknown id (fail closed — never a silent empty body)."""
+    body = _CONTRACT_BODIES.get(doc_id)
+    if body is None:
+        raise IntakeError(f"no stored body for document {doc_id!r}")
+    return dict(body)
+
+
+# ── feature_contract stream readers ─────────────────────────────────────────────────────────────────
+def _first(stream, event_type: str):
+    return next((e for e in stream if e.type == event_type), None)
+
+
+def _current_draft_doc_id(stream) -> str | None:
+    """The newest frozen Draft on the stream (a CONTRACT_REFINED supersedes a DRAFT_CONTRACT_PRODUCED)."""
+    for e in reversed(list(stream)):
+        if e.type in (CONTRACT_REFINED, DRAFT_CONTRACT_PRODUCED):
+            return e.payload.get("draft_doc_id")
+    return None
+
+
+def _answered_fields(stream) -> dict[str, object]:
+    """Pinned answers: {field: answer} from every CLARIFICATION_ANSWERED (last write wins). Pinning
+    answered fields is what makes the Loop converge (§6.6)."""
+    answers: dict[str, object] = {}
+    for e in stream:
+        if e.type == CLARIFICATION_ANSWERED:
+            field = e.payload.get("field")
+            if field is not None:
+                answers[field] = e.payload.get("answer")
+    return answers
+
+
+# ── clarification task ──────────────────────────────────────────────────────────────────────────────
+def open_clarification_task(
+    conn: DbConn,
+    *,
+    run_id: str,
+    request_id: str,
+    draft_doc_id: str,
+    field: str,
+    question: str,
+    owner_subject: str,
+    actor: IdentityEnvelope,
+    candidate_readings: tuple = (),
+    expected_version: int | None = None,
+) -> str:
+    """Open an SP-0 CLARIFICATION human-gate task for one must-ask field (§6.5), then emit
+    CLARIFICATION_REQUESTED on the feature_contract aggregate. The eligible assignee is the REQUEST
+    OWNER (author-owned intent lock) and `delegation_allowed=False` — the subject guard alone is
+    necessary but not sufficient, since GateTaskSpec.delegation_allowed defaults to True and a delegate
+    could otherwise stand in (§8.2). `required_inputs=[draft_doc_id]` so a later re-normalization stales
+    any pending answer (SP-0 task staleness). **X4**: a folded caller (the Refinement Loop) passes
+    `expected_version` to CAS the emit on its running head; a standalone call leaves it None (current head)."""
+    spec = GateTaskSpec(
+        gate="CLARIFICATION",
+        required_inputs=(draft_doc_id,),
+        eligible_assignees={"role": "data_scientist", "subject": owner_subject},
+        allowed_responses=("confirm", "edit", "reject"),
+        run_id=run_id,
+        delegation_allowed=False,
+    )
+    task_id = open_task(conn, spec, actor)
+    append_fc_event(
+        conn, run_id=run_id, type=CLARIFICATION_REQUESTED,
+        payload={"task_id": task_id, "field": field, "question": question, "routed_to": "human",
+                 "draft_doc_id": draft_doc_id, "candidate_readings": list(candidate_readings),
+                 "blocks_progress": True},
+        actor=actor, request_id=request_id, expected_version=expected_version,  # X4 CAS when folded
+    )
+    return task_id
+
+
+# ── contract semantics helpers ────────────────────────────────────────────────────────────────────
+def _base(path: str) -> str:
+    return path.split(".", 1)[0]
+
+
+def _concepts(semantics) -> dict[str, str]:
+    """Concept-bearing fields for the catalog-cardinality check (§6.1). Only fields whose meaning binds
+    to a catalog object / declared code get a cardinality lookup."""
+    concepts: dict[str, str] = {}
+    entity = semantics.get("entity")
+    if entity and entity != UNKNOWN:
+        concepts["entity"] = entity
+    filters = semantics.get("filters") or []
+    if isinstance(filters, list) and filters and isinstance(filters[0], dict):
+        concept = filters[0].get("concept")
+        if concept:
+            concepts["filters"] = concept
+    return concepts
+
+
+def _policy_fields(classification, semantics) -> set[str]:
+    """Policy-sensitive fields that may NEVER auto-resolve (§6.2): any sensitive-proxy field the
+    classifier flagged, plus a present `target` (credit-decisioning use-cases pin the label at Gate #1)."""
+    fields = set((classification or {}).get("sensitive_fields", []) or [])
+    target = semantics.get("target")
+    if target not in (None, UNKNOWN):
+        fields.add("target")
+    td = semantics.get("target_definition")
+    if isinstance(td, str) and td and td != UNKNOWN and not td.startswith("N/A"):
+        fields.add("target")
+    return fields
+
+
+def _ledger_entry(field, semantics, score) -> dict:
+    return {
+        "field": field,
+        "value": semantics.get(field),
+        "source": score["source"],
+        "rationale": f"auto-resolved: {field} is low-ambiguity ({score['ambiguity']}) from {score['source']}",
+        "ambiguity": score["ambiguity"],
+        "confidence": score["confidence"],
+        "auto_resolved_at": datetime.now(UTC).isoformat(),
+    }
+
+
+def _open_questions(routing, question_by_field) -> list[dict]:
+    return [
+        {"field": f, "question": question_by_field.get(f, f"Please specify {f}."),
+         "blocks_progress": True, "routed_to": "human"}
+        for f, decision in routing.items() if decision == "human"
+    ]
+
+
+def _candidate_count(conn: DbConn, run_id: str) -> int:
+    row = conn.execute(
+        "SELECT count(*) FROM documents WHERE run_id=%s AND stage=%s AND branch_role='candidate'",
+        (run_id, Stage.DRAFT_CONTRACT.value),
+    ).fetchone()
+    return int(row[0]) if row else 0
+
+
+def _redact_answers(redactor, answers, classification: str) -> dict:
+    """Belt-and-suspenders: a clarification answer is human free text — redact it before it enters an
+    LLM renormalize request (§9.4). call_llm additionally egress-guards the whole request."""
+    out: dict[str, str] = {}
+    for field, answer in answers.items():
+        red = redactor.redact(str(answer), classification)
+        out[field] = red.text if red.text is not None else "[REDACTED]"
+    return out
+
+
+# ── the bounded Contract Refinement Loop (§6.6) ─────────────────────────────────────────────────────
+def refine_contract(
+    conn: DbConn,
+    run_id: str,
+    *,
+    client=None,
+    redactor=None,
+    catalog=None,
+    actor: IdentityEnvelope,
+    thresholds=None,
+    max_rounds: int | None = None,
+) -> RefineResult:
+    """One bounded refinement round (spec §6.6): re-normalize (only when an answer targets a still-open
+    field) → re-score (5.1) → re-critique (5.3) → re-route (5.2) → auto-resolve safe fields (ledger +
+    FIELD_AUTO_RESOLVED) → freeze the revised Draft (CONTRACT_REFINED) → open must-ask tasks; converge to
+    MCV when no open field remains (MINIMUM_CONTRACT_VALIDATED); auto-park when the round budget is
+    exhausted (never loops forever). Deps default to the P5 accessors. **X4** — every domain append is
+    CAS-pinned to a running head re-anchored past this round's own LLM audit appends; a concurrent
+    transition (or a status advance since the fold) returns status="stale" and commits nothing."""
+    deps = current_intake_deps()
+    client = client or (deps.client if deps else None)
+    redactor = redactor or (deps.redactor if deps else None)
+    catalog = catalog or (deps.catalog if deps else None)
+    thresholds = thresholds or default_thresholds()
+    budget = MAX_REFINEMENT_ROUNDS if max_rounds is None else max_rounds
+
+    stream = load_feature_contract(conn, run_id)
+    state = fold_feature_contract_state(stream)   # R3 — the P2 fold; `state.requester` is the owner (R4)
+    intent = _first(stream, INTENT_SUBMITTED)
+    request_id = intent.payload["request_id"]
+    mode = intent.payload["intake_mode"]
+    classification = intent.payload.get("classification")   # the recorded R9 mapping (`.catalog_version`)
+    raw_class = intent.payload["raw_input_classification"]
+    draft_doc_id = _current_draft_doc_id(stream)
+    draft_body = read_contract_body(conn, draft_doc_id)
+    ledger_body = read_contract_body(conn, draft_body["assumption_ledger_ref"]) if draft_body.get(
+        "assumption_ledger_ref") else {"request_id": request_id, "assumptions": []}
+    answers = _answered_fields(stream)
+    rounds = sum(1 for e in stream if e.type == CONTRACT_REFINED)
+
+    # 1) Re-normalize only when an answer targets a field still open on the current Draft. The
+    #    re-normalization output is AUTHORITATIVE on what remains open (an answer that fails to resolve
+    #    keeps its field open → the Loop cannot converge and eventually parks, §6.6).
+    unfolded = [f for f in answers if any(_base(of) == f for of in draft_body.get("open_fields", []))]
+    if unfolded:
+        register_renormalize_schema(DocumentSchemaRegistry(conn))  # §9.1 output-schema (idempotent)
+        request = LLMRequest(
+            task="renormalize", prompt_id="renormalize", prompt_version=1,
+            inputs={
+                "prior_semantics": draft_body["feature_semantics"],
+                "answers": _redact_answers(redactor, {f: answers[f] for f in unfolded}, raw_class),
+                INPUT_KEY_CATALOG: dict(catalog.metadata()),
+                INPUT_KEY_CLASSIFICATION: raw_class,  # egress guard (§9.4) — LLM-safe, no raw intent
+            },
+            output_schema_id=RENORMALIZE_SCHEMA_ID, output_schema_version=RENORMALIZE_SCHEMA_VERSION,
+            generation_settings=dict(_RENORM_SETTINGS),
+        )
+        result = call_llm(conn, client, request, run_id=run_id, actor=actor)
+        semantics = result.output["feature_semantics"]
+        llm_scores = result.self_reported_scores
+        open_fields = list(result.output.get("open_fields", []))
+        rounds += 1
+        renormalized = True
+    else:
+        semantics = draft_body["feature_semantics"]
+        llm_scores = {f: dict(s) for f, s in draft_body.get("field_scores", {}).items()}
+        open_fields = list(draft_body.get("open_fields", []))
+        renormalized = False
+
+    # 2) Re-score (LLM self-report ⊕ catalog cardinality, cautious-max).
+    field_scores = score_fields(llm_scores, _concepts(semantics), catalog.candidate_count)
+
+    # 3) Re-run the challenger critique and 4) route, ORing blocking findings to must-ask.
+    critique = contract_review(conn, client, semantics, run_id=run_id, actor=actor,
+                               catalog_metadata=catalog.metadata())
+    routing = apply_critique(
+        route_draft(field_scores, open_fields, mode=mode,
+                    policy_sensitive_fields=_policy_fields(classification, semantics), thresholds=thresholds),
+        critique,
+    )
+
+    # X4 — re-anchor the running CAS head PAST this round's own LLM audit appends (renormalize / critique
+    # each appended LLM_CALL_RECORDED / CONTRACT_CRITIQUED to this same stream), refusing the round if a
+    # concurrent transition advanced the status since the fold, then thread `expected` (a running head)
+    # through every domain append below. A lost-update race trips ConcurrencyError → the whole round is stale.
+    domain_stream = load_feature_contract(conn, run_id)
+    if fold_feature_contract_state(domain_stream).status != state.status:
+        return RefineResult("stale", draft_doc_id, tuple(open_fields), None)
+    expected = domain_stream[-1].stream_version if domain_stream else 0
+
+    def _append_domain(**kw):
+        """CAS every refine domain append on the running head (X4); advance it after each append so the
+        next transition CASes on the correct version."""
+        nonlocal expected
+        env = append_fc_event(conn, expected_version=expected, **kw)
+        expected = env.stream_version
+        return env
+
+    try:
+        # 5) Auto-resolve safe fields → ledger + FIELD_AUTO_RESOLVED (never a field already in the ledger
+        #    or already human-answered).
+        ledger_fields = {a["field"] for a in ledger_body.get("assumptions", [])}
+        additions = []
+        for field, decision in routing.items():
+            if decision == "auto" and field not in ledger_fields and field not in answers:
+                entry = _ledger_entry(field, semantics, field_scores[field])
+                additions.append(entry)
+                _append_domain(run_id=run_id, type=FIELD_AUTO_RESOLVED,
+                               payload={"field": field, "value": entry["value"], "source": entry["source"],
+                                        "ambiguity": entry["ambiguity"], "confidence": entry["confidence"]},
+                               actor=actor)
+
+        # 6) Freeze the revised Draft + Ledger and emit CONTRACT_REFINED when anything changed. The
+        #    payload INLINES draft_body + assumption_ledger_body + open_fields + field_scores so the P2
+        #    fold tracks the open-field set / scores and mcv._latest_body reads the CURRENT body — omit
+        #    them and a later MCV validates the STALE original Draft / silently clears the open fields.
+        question_by_field = {e.payload["field"]: e.payload.get("question", f"Please specify {e.payload['field']}.")
+                             for e in stream if e.type == CLARIFICATION_REQUESTED and e.payload.get("field")}
+        new_ledger = {"request_id": request_id,
+                      "assumptions": list(ledger_body.get("assumptions", [])) + additions}
+        new_draft = {**draft_body, "feature_semantics": semantics, "field_scores": field_scores,
+                     "open_fields": open_fields, "open_questions": _open_questions(routing, question_by_field),
+                     "status": DRAFT_STATUS}
+        changed = renormalized or bool(additions) or open_fields != list(draft_body.get("open_fields", [])) \
+            or field_scores != draft_body.get("field_scores", {})
+        if changed:
+            draft_doc_id, ledger_doc_id = freeze_draft(
+                conn, run_id=run_id, request_id=request_id, body=new_draft, ledger_body=new_ledger,
+                actor=actor, supersedes=(draft_doc_id,) if draft_doc_id else (),
+            )
+            new_draft["assumption_ledger_ref"] = ledger_doc_id
+            _append_domain(run_id=run_id, type=CONTRACT_REFINED,
+                           payload={"draft_doc_id": draft_doc_id, "assumption_ledger_ref": ledger_doc_id,
+                                    "open_fields": open_fields, "field_scores": field_scores,
+                                    "draft_body": new_draft, "assumption_ledger_body": new_ledger,
+                                    "iteration": rounds}, actor=actor)
+
+        must_ask = [f for f, d in routing.items() if d == "human"
+                    and any(_base(of) == f for of in open_fields)]
+
+        # 7) Converge → MCV; or bounded-exhausted → auto-park; or open must-ask tasks and loop.
+        if not open_fields and not must_ask:
+            candidate_count = _candidate_count(conn, run_id) if mode == "hypothesis" else 0
+            mcv = minimum_contract_validated(new_draft, new_ledger, classification, mode=mode,
+                                             candidate_count=candidate_count, confirmed_fields=set(answers))
+            if mcv.passed:
+                _append_domain(run_id=run_id, type=MINIMUM_CONTRACT_VALIDATED,
+                               payload={"draft_doc_id": draft_doc_id, "checks": {"failures": []}}, actor=actor)
+                return RefineResult("validated", draft_doc_id, (), mcv)
+            return RefineResult("mcv_failed", draft_doc_id, (), mcv)
+
+        if rounds >= budget:
+            # Bounded (§6.6): stop looping — auto-park the run for human follow-up (X6 waiting_on_fact=None).
+            park_command(conn, Command(
+                action="park", aggregate="run", aggregate_id=run_id,
+                args={"owner": _REFINEMENT_PARK_OWNER, "waiting_on_fact": None},
+                actor=actor, idempotency_key=f"refine-park:{run_id}:{rounds}",
+            ))
+            return RefineResult("parked", draft_doc_id, tuple(open_fields), None)
+
+        owner = state.requester   # R4 — the INTENT_SUBMITTED actor.subject; never payload.get("requested_by")
+        open_task_fields = {e.payload["field"] for e in stream
+                            if e.type == CLARIFICATION_REQUESTED and e.payload.get("field")} & set(must_ask)
+        for field in must_ask:
+            if field in open_task_fields:
+                continue  # a task for this field already exists on the stream (refresh handled by staleness)
+            open_clarification_task(conn, run_id=run_id, request_id=request_id, draft_doc_id=draft_doc_id,
+                                    field=field, question=question_by_field.get(field, f"Please specify {field}."),
+                                    owner_subject=owner, actor=actor, expected_version=expected)
+            expected += 1   # X4 — the CLARIFICATION_REQUESTED landed at expected+1 → advance the head
+        return RefineResult("clarifying", draft_doc_id, tuple(open_fields), None)
+    except ConcurrencyError:
+        # X4 — a concurrent feature_contract transition advanced the head since the fold. The whole round
+        # is stale; nothing this round committed (single transaction) — the Loop re-drives on the fresh head.
+        return RefineResult("stale", draft_doc_id, tuple(open_fields), None)
