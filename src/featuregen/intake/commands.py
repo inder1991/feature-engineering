@@ -1600,6 +1600,37 @@ def _prohibited_intent_screen(conn: DbConn, draft_body: dict) -> str | None:
     return None  # CLEAR under the current catalog — the allow is auditable at cls.catalog_version (§4.5(c))
 
 
+def _sibling_candidates(conn: DbConn, run_id: str, selected_doc_id: str) -> list[str]:
+    """The write-once losing candidate docs (documents are never rejected — §7.1, §8.3). They stay
+    untouched candidate-role docs; their `doc_id`s live ONLY in the Gate #1 confirmation record."""
+    rows = conn.execute(
+        "SELECT doc_id FROM documents "
+        "WHERE run_id=%s AND stage='DRAFT_CONTRACT' AND branch_role='candidate' AND doc_id <> %s "
+        "ORDER BY global_seq",
+        (run_id, selected_doc_id),
+    ).fetchall()
+    return [r[0] for r in rows]
+
+
+def _promote_candidate(conn: DbConn, run_id: str, candidate_doc_id: str, actor) -> None:
+    """calculation_method_chosen (hypothesis mode) — the document PRIMARY_SELECTED promotion of the
+    chosen candidate on the RUN aggregate (§7.1). NOT the request-level select_candidate. The
+    promotion records ONLY the chosen doc; the losers stay untouched candidate-role docs."""
+    ne = new_primary_selected(
+        run_id=run_id,
+        stage="DRAFT_CONTRACT",
+        doc_id=candidate_doc_id,
+        actor=actor,
+        provenance=provenance_for("DRAFT_CONTRACT"),
+    )
+    append_event(
+        conn,
+        ne,
+        expected_version=current_version(conn, "run", run_id),
+        table_version=table_version_for(conn, "run", run_id),
+    )
+
+
 def confirm_contract(conn: DbConn, cmd: Command) -> CommandResult:
     """Human Gate #1 — the author-self-confirm happy path (§8.2/§8.5/§8.6). The request owner (the
     authenticated HUMAN requester) confirms an MCV-passed Draft: fold → no-regression + MCV guards →
@@ -1647,11 +1678,20 @@ def confirm_contract(conn: DbConn, cmd: Command) -> CommandResult:
     draft_doc_id, draft_body = _final_draft(stream)
     if draft_body is None:
         return CommandResult(accepted=False, aggregate_id=run_id, denied_reason="no draft to confirm")
+    intake_mode = draft_body.get("intake_mode")
+    candidate_doc_id = cmd.args.get("candidate_doc_id")
     # [Task 7.4 INSERT: §8.4 prohibited-intent screen + version-drift re-check]
     blocked = _prohibited_intent_screen(conn, draft_body)
     if blocked is not None:
         return CommandResult(accepted=False, aggregate_id=run_id, denied_reason=blocked)
     # [Task 7.5 INSERT: hypothesis calculation_method_chosen guard]
+    # Fail-closed (§7.1): a hypothesis contract cannot be confirmed with no chosen calculation method —
+    # confirmation binds the human-SELECTED candidate (promoted to PRIMARY). No selection → DENY.
+    if intake_mode == "hypothesis" and not candidate_doc_id:
+        return CommandResult(
+            accepted=False, aggregate_id=run_id,
+            denied_reason="hypothesis mode requires a selected candidate_doc_id (calculation_method_chosen)",
+        )
 
     # ── task-version OCC (consume the Gate #1 task) ── a confirm against a stale/superseded Gate #1
     # task is NOT counted (§8.6, §12); the client must re-fetch the current task_version.
@@ -1672,6 +1712,14 @@ def confirm_contract(conn: DbConn, cmd: Command) -> CommandResult:
     # calculation_method string (reshape_calculation_method dict()s a non-None chosen_method).
     chosen_method: dict | None = None
     # [Task 7.5 INSERT: hypothesis document PRIMARY_SELECTED promotion → set selected/rejected/chosen_method]
+    # Hypothesis mode: promote the human-selected candidate to PRIMARY on the RUN aggregate (§7.1) and
+    # record the selected + losing (write-once, untouched) candidate doc-ids in the confirmation record
+    # (§8.3). chosen_method stays None so R7 reshapes the promoted candidate's calculation_method from
+    # its Draft semantics (the selected candidate is the effective final Draft).
+    if intake_mode == "hypothesis":
+        _promote_candidate(conn, run_id, candidate_doc_id, cmd.actor)
+        selected_candidate = candidate_doc_id
+        rejected_candidates = _sibling_candidates(conn, run_id, candidate_doc_id)
 
     feature_name = cmd.args.get("feature_name") or draft_body.get("proposed_feature_name")
     riv = _requires_independent_validation(draft_body)
