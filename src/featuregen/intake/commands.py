@@ -10,6 +10,7 @@ so a test can pin the banking outcome deterministically."""
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 from dataclasses import dataclass, replace
@@ -89,6 +90,7 @@ from featuregen.intake.llm import (  # R10 seam (P3, llm.py)
 from featuregen.intake.mcv import (  # P5 pre-gate checklist (Task 5.4)
     _latest_body,
     minimum_contract_validated,
+    run_minimum_contract_validation,
 )
 from featuregen.intake.redaction import (  # R10 seam (P3, redaction.py)
     INPUT_KEY_CATALOG,
@@ -1803,3 +1805,125 @@ def confirm_contract(conn: DbConn, cmd: Command) -> CommandResult:
 
 # Task 7.2 — extend the SP-2 command catalog with the Gate-#1 confirm handler.
 _SP2_CATALOG = _SP2_CATALOG + (("confirm_contract", confirm_contract),)
+
+
+# ═══ Task 7.6 — request_edit (owner edits at Gate #1 → REVISED Draft + re-run MCV + re-open, §8.6) ════
+def _apply_edit(body: dict, field: str, value) -> None:
+    """Set a dotted-path field on a Draft body (e.g. 'feature_semantics.calculation_method')."""
+    parts = field.split(".")
+    node = body
+    for p in parts[:-1]:
+        node = node[p]
+    node[parts[-1]] = value
+
+
+def request_edit(conn: DbConn, cmd: Command) -> CommandResult:
+    """Human Gate #1 EDIT loop (§8.6): the request owner amends the MCV-passed Draft at the open gate.
+    Supersede the Draft with a REVISED DRAFT_CONTRACT carrying the edit, append CONTRACT_REFINED (folds
+    → NEEDS_CLARIFICATION when a field is re-opened), re-run Minimum Contract Validation (R5), and
+    re-open a fresh Gate #1 task — unless the edit re-introduced an open field (`to == UNKNOWN`), in
+    which case the run stays in the Refinement Loop (no gate re-open). An edit never confirms silently.
+
+    Owner+human guarded (§8.2 `confirmer_is_requester_human`): a non-owner / non-human is DENIED +
+    security-audited (R15), before the gate is consumed. task-version OCC via `submit_human_signal
+    (response="edit")` — a stale/superseded Gate #1 task is not counted. Handler on an EXISTING stream:
+    fold → decide → deny BEFORE any side-effecting append (execute_command does NOT roll back on
+    accepted=False). X4: the CONTRACT_REFINED append CASes on the folded head; a ConcurrencyError (a
+    concurrent transition since the fold) is a `stale` denial and the whole edit rolls back."""
+    run_id = cmd.args.get("run_id") or cmd.aggregate_id
+    task_id = cmd.args["task_id"]
+    expected_task_version = cmd.args["expected_task_version"]
+    field_edit = cmd.args["field_edit"]
+    stream = load_stream(conn, "feature_contract", run_id)
+    if not stream:
+        return CommandResult(accepted=False, aggregate_id=run_id or "", denied_reason="unknown feature_contract")
+    state = fold_feature_contract_state(stream)
+    head_version = stream[-1].stream_version  # X4 — pin the folded head for CAS on the FC append (§12)
+    # No-regression guard (§4.6, §11): CONFIRMED / the terminal rejects refuse a conflicting re-advance.
+    if state.status in TERMINAL_STATUSES:
+        return CommandResult(
+            accepted=False, aggregate_id=run_id,
+            denied_reason=f"contract already {state.status.value}; no re-advance (no-regression)",
+        )
+    if state.status is not FeatureContractStatus.MINIMUM_CONTRACT_VALIDATED:
+        status = state.status.value if state.status is not None else None
+        return CommandResult(
+            accepted=False, aggregate_id=run_id,
+            denied_reason=f"no open Gate #1 to edit (status={status})",
+        )
+    # §8.2 — the editor MUST be the authenticated human requester (never a service, the LLM, or a
+    # DIFFERENT data scientist). A mismatch is denied + security-audited, before the gate is consumed.
+    if not _confirmer_is_requester_human(state, cmd.actor):
+        return _deny_audited(
+            conn, cmd, run_id,
+            "Gate #1 edit requires the authenticated human requester (confirmer_is_requester_human)",
+        )
+    # task-version OCC — an edit against a stale/superseded Gate #1 task is NOT counted (§8.6, §12);
+    # the client must re-fetch the current task_version.
+    sig = submit_human_signal(
+        conn, task_id, response="edit", actor=cmd.actor, expected_task_version=expected_task_version
+    )
+    if not sig.counted:
+        return CommandResult(
+            accepted=False, aggregate_id=run_id,
+            denied_reason=f"stale/closed Gate #1 task (status={sig.status}); re-fetch task_version (OCC)",
+        )
+
+    draft_doc_id, draft_body = _final_draft(stream)
+    request_id = _request_id(stream)
+    revised = copy.deepcopy(draft_body)
+    field = field_edit["field"]
+    value = field_edit["to"]
+    _apply_edit(revised, field, value)
+    reopened = value == UNKNOWN
+    if reopened and field not in revised.setdefault("open_fields", []):
+        revised["open_fields"].append(field)  # a re-opened field MUST be in open_fields (§3.5)
+    human_edit = {"field": field, "from": field_edit.get("from"), "to": value}
+
+    revised_doc_id = _freeze_contract_doc(
+        conn, run_id=run_id, request_id=request_id, stage="DRAFT_CONTRACT",
+        body=revised, branch_role="primary", derived_from=(),
+        supersedes=(draft_doc_id,) if draft_doc_id else (), actor=cmd.actor,
+    )
+    # X4 — CAS on the folded head (§12, Global Constraints): a None-append would silently ride a
+    # concurrent transition; a raised ConcurrencyError is a stale denial. The gate task was consumed
+    # above, but the caught error keeps the txn usable (the events store raises pre-INSERT / via
+    # savepoint) so the whole edit rolls back on the denial.
+    #
+    # The CONTRACT_REFINED payload INLINES draft_body (mcv._latest_body reads the newest event carrying
+    # it — else MCV re-runs on the STALE draft) AND the TOP-LEVEL open_fields / open_questions /
+    # field_scores the P2 fold reads (state.py:137 — omit open_fields and the fold silently CLEARS the
+    # open-field set, so a re-opened field would not drop the status to NEEDS_CLARIFICATION).
+    try:
+        append_fc_event(
+            conn, run_id=run_id, type=CONTRACT_REFINED,
+            payload={
+                "draft_doc_id": revised_doc_id,
+                "assumption_ledger_ref": revised.get("assumption_ledger_ref"),
+                "draft_body": revised,
+                "open_fields": list(revised.get("open_fields", [])),
+                "open_questions": list(revised.get("open_questions", [])),
+                "field_scores": revised.get("field_scores", {}),
+                "human_edits": [human_edit],
+                "reopened": reopened,
+            },
+            actor=cmd.actor,
+            expected_version=head_version,  # X4 — CAS on the folded head (§12)
+        )
+    except ConcurrencyError:
+        return CommandResult(
+            accepted=False, aggregate_id=run_id,
+            denied_reason="stale: feature_contract advanced concurrently since fold (OCC)",
+        )
+    if reopened:
+        # The edit re-introduced an open field → back into the Refinement Loop (§6.6); no gate re-open.
+        return CommandResult(accepted=True, aggregate_id=run_id)
+    # Re-run MCV (R5, DB-backed) on the revised Draft; if it still passes, re-open a fresh Gate #1 task (§8.6).
+    mcv = run_minimum_contract_validation(conn, run_id, actor=cmd.actor)
+    if mcv.accepted:
+        _open_gate1_task(conn, run_id, actor=cmd.actor)
+    return CommandResult(accepted=True, aggregate_id=run_id)
+
+
+# Task 7.6 — extend the SP-2 command catalog with the Gate-#1 edit handler (Phase-7 last command).
+_SP2_CATALOG = _SP2_CATALOG + (("request_edit", request_edit),)
