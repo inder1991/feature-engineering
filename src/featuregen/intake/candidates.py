@@ -4,8 +4,10 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 
+from featuregen.contracts import DbConn, IdentityEnvelope
 from featuregen.idgen import mint_id
-from featuregen.intake.llm import LLMClient, LLMRequest
+from featuregen.intake.llm import LLMClient, LLMRequest, LLMResult, call_llm
+from featuregen.intake.redaction import build_llm_inputs, current_intent_redactor
 
 # Structural-only metadata views (names/types/grain + catalog-DECLARED enum/code metadata ONLY —
 # never profiled column values, rows, samples, or overlay metrics; §9.4 no-data-to-LLM boundary).
@@ -179,6 +181,23 @@ _STUB_GENERATION_SETTINGS = {
 }
 
 
+def _compose_intent(
+    *, proposed_feature_name: object, target: object, entity: object
+) -> str:
+    """Render the draft's human-authored FREE-TEXT fields as ONE intent string for redaction (§9.4).
+    Only these fields can carry PII; catalog concept NAMES ride `catalog_metadata` separately and
+    never need scrubbing. The rendered text is what the redactor scrubs into the single LLM-safe
+    `redacted_intent` — no un-redacted draft free-text is ever placed in LLMRequest.inputs."""
+    parts = []
+    if proposed_feature_name:
+        parts.append(f"proposed feature name: {proposed_feature_name}")
+    if target:
+        parts.append(f"target: {target}")
+    if entity:
+        parts.append(f"entity: {entity}")
+    return "; ".join(parts)
+
+
 def _known_concepts(
     catalog_metadata: CatalogView, domain_context: DomainCatalogEntry | None
 ) -> set[str]:
@@ -245,19 +264,34 @@ class StubCandidateGenerator:
     ) -> list[Candidate]:
         known = _known_concepts(catalog_metadata, domain_context)
         semantics = draft.get("feature_semantics") or {}
+        # §9.4 no-PII egress backstop: the draft's human free-text (proposed name / target / entity)
+        # is scrubbed into the SINGLE reserved `redacted_intent`; only catalog NAMES ride
+        # `catalog_metadata`. This mirrors `_produce_draft` (commands.py) — the generator owns
+        # redaction so the request is reserved-keyed + LLM-safe BEFORE it reaches call_llm (which
+        # re-guards egress). Un-redactable / `unscanned` intent fails closed here → no LLM pass, no
+        # candidates (never leak un-redacted draft text, never fabricate).
+        raw_input_classification = draft.get("raw_input_classification", "clean")
+        redaction = current_intent_redactor().redact(
+            _compose_intent(
+                proposed_feature_name=draft.get("proposed_feature_name"),
+                target=draft.get("target"),
+                entity=semantics.get("entity"),
+            ),
+            raw_input_classification,
+        )
+        if redaction.text is None or redaction.disposition != "ok":
+            return []  # fail closed: no LLM-safe intent → no candidates (the run stays in clarification)
+        inputs = build_llm_inputs(
+            redaction,
+            catalog_metadata={"allowed_concepts": sorted(known)},  # catalog NAMES only (§9.4)
+            raw_input_classification=raw_input_classification,
+        )
+        inputs["intake_mode"] = draft.get("intake_mode")  # structural enum context (no data values)
         request = LLMRequest(
             task="generate_candidates",
             prompt_id=CANDIDATES_PROMPT_ID,
             prompt_version=CANDIDATES_PROMPT_VERSION,
-            inputs={
-                # Redacted, LLM-safe metadata ONLY (§9.4) — names, the proposed name, the (redacted)
-                # target label, and the allowed concept NAMES. Never data values / profiled sets.
-                "proposed_feature_name": draft.get("proposed_feature_name"),
-                "intake_mode": draft.get("intake_mode"),
-                "target": draft.get("target"),
-                "entity": semantics.get("entity"),
-                "allowed_concepts": sorted(known),
-            },
+            inputs=inputs,
             output_schema_id=CANDIDATES_OUTPUT_SCHEMA_ID,
             output_schema_version=CANDIDATES_OUTPUT_SCHEMA_VERSION,
             generation_settings=_STUB_GENERATION_SETTINGS,
@@ -296,3 +330,24 @@ class StubCandidateGenerator:
             )
             sibling_methods.append(method)
         return candidates
+
+
+@dataclass(frozen=True)
+class RecordingLLMClient:
+    """Binds SP-2's event-sourced `call_llm` envelope (P3) to the pure `LLMClient.call` seam so a
+    `CandidateGenerator` — which only ever sees `client.call` — still writes the immutable `llm_call`
+    record + emits `LLM_CALL_RECORDED` for its ONE generation pass. Constructed per-run (conn/run_id/
+    actor captured here) so the generator stays db-agnostic and the seam stays stable SP-2 → SP-12.
+    `call` returns `call_llm`'s `LLMResult`, whose `call_ref` is the real event-sourced record id.
+
+    This is a GENERIC bridge: it forwards the request UNCHANGED. Making the request LLM-safe
+    (reserved-keyed, redacted per §9.4) is the caller/generator's job — `StubCandidateGenerator`
+    builds the reserved shape via `build_llm_inputs` above; `call_llm` then re-guards egress."""
+
+    conn: DbConn
+    inner: LLMClient
+    run_id: str
+    actor: IdentityEnvelope
+
+    def call(self, request: LLMRequest) -> LLMResult:
+        return call_llm(self.conn, self.inner, request, run_id=self.run_id, actor=self.actor)
