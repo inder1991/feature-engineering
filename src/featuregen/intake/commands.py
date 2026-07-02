@@ -36,6 +36,9 @@ __all__ = [
     "DRAFT_SCHEMA_VERSION",
     "assemble_ledger_body",
     "assemble_draft_body",
+    # Task 4.3 no-silent-assumption rule (§5.3).
+    "NoSilentAssumptionError",
+    "assert_no_silent_assumption",
     # re-exported collaborator seams (R10) + R1 append/load — the handlers added by later Phase-4
     # tasks read these off this module; consumers import them from here.
     "append_fc_event",
@@ -170,3 +173,40 @@ def assemble_draft_body(
         "provenance": {"llm_call_refs": [llm_call_ref], "schema_version": DRAFT_SCHEMA_VERSION},
         "status": DRAFT_STATUS,
     }
+
+
+# ── no-silent-assumption rule (Task 4.3, §5.3) ────────────────────────────────────────────────
+class NoSilentAssumptionError(IntakeError):
+    """Raised when a Draft carries an inferred field that is neither an open question nor a
+    recorded Assumption Ledger entry (§5.3 — no field is silently settled)."""
+
+
+def assert_no_silent_assumption(draft_body: dict, ledger_body: dict) -> None:
+    """§5.3, enforced deterministically at Draft production. Every field the agent did not take
+    verbatim must be surfaced — either as an open question (unresolved) or a ledger entry
+    (auto-recorded). There is no third option."""
+    open_fields = set(draft_body.get("open_fields", []))
+    open_q_fields = {q["field"] for q in draft_body.get("open_questions", [])}
+    ledger_fields = {a["field"] for a in ledger_body.get("assumptions", [])}
+
+    # (1) every open field is backed by an open question
+    for f in open_fields:
+        if f not in open_q_fields:
+            raise NoSilentAssumptionError(
+                f"open field {f!r} has no matching open_question (§5.3)"
+            )
+
+    # (2) every inferred (non-verbatim) field is accounted — in the ledger or in open_fields
+    for field, score in draft_body.get("field_scores", {}).items():
+        if score.get("source") not in ("default", "catalog"):
+            continue  # a verbatim/model-grounded reading (source == "llm") needs no accounting
+        accounted = (
+            field in ledger_fields
+            or field in open_fields
+            or any(of == field or of.startswith(field + ".") for of in open_fields)
+        )
+        if not accounted:
+            raise NoSilentAssumptionError(
+                f"inferred field {field!r} (source={score.get('source')!r}) is neither in the "
+                f"Assumption Ledger nor an open field (§5.3)"
+            )
