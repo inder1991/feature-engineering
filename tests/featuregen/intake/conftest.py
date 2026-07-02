@@ -130,10 +130,12 @@ def intent_redactor():
 
 @pytest.fixture
 def candidate_generator():
-    """R10 candidate seam — register the StubCandidateGenerator (P6 owns it)."""
+    """R10 candidate seam — register the StubCandidateGenerator (P6 owns it). The stub now requires an
+    injected LLMClient (Task 6.2/6.3): construct it with a scripted _ScriptLLM so the fixture is usable
+    (a no-arg StubCandidateGenerator() is broken)."""
     from featuregen.intake.candidates import StubCandidateGenerator, register_candidate_generator
 
-    generator = StubCandidateGenerator()
+    generator = StubCandidateGenerator(_ScriptLLM({"candidates": []}))
     register_candidate_generator(generator)
     return generator
 
@@ -153,11 +155,13 @@ def sp2_schemas(db):
     """The DRAFT/LEDGER/CONFIRMED content-schemas + the CONTRACT_REVIEW structured LLM output-schema
     that call_llm resolves (Task 5.3). register_critique_schemas is imported LAZILY so a critique-module
     import fault confines itself to critique tests rather than the whole intake suite."""
+    from featuregen.intake.candidates import register_candidate_schemas
     from featuregen.intake.critique import register_critique_schemas
 
     registry = DocumentSchemaRegistry(db)
     register_contract_schemas(registry)
     register_critique_schemas(registry)
+    register_candidate_schemas(registry)  # durable generate_candidates output-schema (Task-6.3 carry-forward)
     return db
 
 

@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 
+from featuregen.aggregates._append import provenance_for
 from featuregen.contracts import DbConn, IdentityEnvelope
+from featuregen.contracts.documents import NewDocument, Stage
+from featuregen.documents.draft import DRAFT_CONTRACT_SCHEMA_VERSION
+from featuregen.documents.store import append_document, compute_content_hash
 from featuregen.idgen import mint_id
 from featuregen.intake.llm import LLMClient, LLMRequest, LLMResult, call_llm
 from featuregen.intake.redaction import _first_pii, build_llm_inputs, current_intent_redactor
@@ -170,6 +175,44 @@ CANDIDATES_OUTPUT_SCHEMA_ID = "sp2.generate_candidates.output"
 CANDIDATES_OUTPUT_SCHEMA_VERSION = 1
 STUB_GENERATOR_VERSION = "sp2-stub-candidate-generator@1"
 MAX_CANDIDATES = 3
+CANDIDATES_SCHEMA_OWNER = "featuregen-intake"
+
+# The generate_candidates structured-output schema `call_llm` resolves + validates the ONE generation
+# pass against (§9.1) — mirrors critique.py's CONTRACT_REVIEW_OUTPUT_SCHEMA. Lenient/additive on the
+# item shape: the generator itself fail-closes per-item on a structurally-invalid `calculation_method`
+# (`_as_tagged_method`), so the schema only asserts the envelope (a `candidates` array of objects) and
+# leaves item-level enforcement to the deterministic normalizer. additionalProperties stays open.
+CANDIDATES_OUTPUT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "required": ["candidates"],
+    "properties": {
+        "candidates": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "definition_text": {"type": "string"},
+                    "rationale": {"type": "string"},
+                    "calculation_method": {"type": "object"},
+                },
+                "additionalProperties": True,
+            },
+        },
+    },
+    "additionalProperties": True,
+}
+
+
+def register_candidate_schemas(registry) -> None:
+    """Register the generate_candidates structured-output schema in SP-0's document registry so
+    call_llm can validate the hypothesis generation pass (§9.1). Idempotent (register_schema upserts).
+    Mirrors register_critique_schemas; wire it into the SP-2 schema-registration path."""
+    registry.register_schema(
+        CANDIDATES_OUTPUT_SCHEMA_ID,
+        CANDIDATES_OUTPUT_SCHEMA_VERSION,
+        CANDIDATES_OUTPUT_SCHEMA,
+        CANDIDATES_SCHEMA_OWNER,
+    )
 
 # Pinned, structured-output generation settings for the stub's single pass (part of the P3
 # idempotency key). Structural-only — no PHI/PII in property names/enums/descriptions (§16 (c)).
@@ -363,3 +406,106 @@ class RecordingLLMClient:
 
     def call(self, request: LLMRequest) -> LLMResult:
         return call_llm(self.conn, self.inner, request, run_id=self.run_id, actor=self.actor)
+
+
+# Candidates are candidate-role documents UNDER the run's Draft stage (§7.1) — the stage enum is
+# not extended; `branch_role` distinguishes a candidate from the primary Draft.
+_CANDIDATE_STAGE = Stage.DRAFT_CONTRACT.value
+
+
+def _persist_contract_body(conn: DbConn, *, body: dict) -> tuple[str, str]:
+    """Freeze a governance-retained contract body BY REFERENCE (§3.4, §4.3): canonical-JSON
+    content-hash + a live `blob_index` row. The document row stores `body_ref` + `content_hash`
+    only (opaque-by-reference) — the body itself lives in the object store keyed by `body_ref`.
+    Governance-retained bodies are needed for MRM reproduction / adverse-action explainability."""
+    raw = json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    content_hash = compute_content_hash(raw)
+    body_ref = mint_id("blob")
+    conn.execute(
+        "INSERT INTO blob_index "
+        "  (blob_id, object_key, content_hash, classification, referenced, status, size_bytes) "
+        "VALUES (%s, %s, %s, 'governance-retained', true, 'live', %s)",
+        (body_ref, f"contracts/{body_ref}.json", content_hash, len(raw)),
+    )
+    return body_ref, content_hash
+
+
+def write_candidate_docs(
+    conn: DbConn,
+    *,
+    candidates: list[Candidate],
+    draft_doc_id: str,
+    run_id: str,
+    request_id: str,
+    actor: IdentityEnvelope,
+) -> tuple[str, ...]:
+    """Freeze each candidate as a candidate-role `DRAFT_CONTRACT` staged document under the run's
+    Draft stage (§7.1): `branch_role="candidate"`, `derived_from=(draft_doc_id,)`,
+    `body_classification="governance-retained"`, body opaque-by-reference. Returns the candidate
+    `doc_id`s in generation order. Documents are write-once — the Gate #1 `PRIMARY_SELECTED`
+    promotion (Task 6.5) later picks ONE; the losers are simply left in place."""
+    doc_ids: list[str] = []
+    for c in candidates:
+        body = {
+            "request_id": request_id,
+            "candidate_id": c.candidate_id,
+            "definition_text": c.definition_text,
+            "rationale": c.rationale,
+            "calculation_method": c.calculation_method,
+            "signals": c.signals,
+            "provenance": c.provenance,
+        }
+        body_ref, content_hash = _persist_contract_body(conn, body=body)
+        doc_id = mint_id("doc")
+        append_document(
+            conn,
+            NewDocument(
+                doc_id=doc_id,
+                stage=_CANDIDATE_STAGE,
+                schema_version=DRAFT_CONTRACT_SCHEMA_VERSION,
+                branch_role="candidate",
+                content_hash=content_hash,
+                body_classification="governance-retained",
+                provenance=provenance_for(
+                    artifact_type=_CANDIDATE_STAGE,
+                    external_refs=tuple(c.provenance.get("llm_call_refs", ()) or ()),
+                ),
+                body_ref=body_ref,
+                derived_from=(draft_doc_id,),
+            ),
+            run_id=run_id,
+            request_id=request_id,
+            actor=actor,
+        )
+        doc_ids.append(doc_id)
+    return tuple(doc_ids)
+
+
+def generate_candidate_docs(
+    conn: DbConn,
+    generator: CandidateGenerator,
+    *,
+    draft: DraftContract,
+    catalog_metadata: CatalogView,
+    domain_context: DomainCatalogEntry | None,
+    draft_doc_id: str,
+    run_id: str,
+    request_id: str,
+    actor: IdentityEnvelope,
+) -> tuple[str, ...]:
+    """Hypothesis-mode entry point `submit_intent` (P4) calls after the primary Draft is frozen:
+    run the (event-sourced, `RecordingLLMClient`-wrapped) generator → freeze each candidate as a
+    candidate-role Draft document → return the candidate `doc_id`s (referenced by
+    `DRAFT_CONTRACT_PRODUCED`). Empty ⟹ generation failed closed → the run stays in clarification
+    (§7.2). Generator-agnostic: this orchestration is IDENTICAL for the stub and SP-12."""
+    candidates = generator.generate(draft, catalog_metadata, domain_context)
+    if not candidates:
+        return ()
+    return write_candidate_docs(
+        conn,
+        candidates=candidates,
+        draft_doc_id=draft_doc_id,
+        run_id=run_id,
+        request_id=request_id,
+        actor=actor,
+    )
