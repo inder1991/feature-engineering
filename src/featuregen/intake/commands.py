@@ -26,7 +26,7 @@ from featuregen.aggregates.request_aggregate import (
     create_request_command,
     create_run_command,
 )
-from featuregen.aggregates.run_lifecycle import park_command, run_is_terminal
+from featuregen.aggregates.run_lifecycle import park_command, reject_command, run_is_terminal
 from featuregen.commands.registry import get_command, register_command
 from featuregen.contracts import (
     Command,
@@ -113,11 +113,12 @@ from featuregen.intake.state import (
     confirmer_is_requester_human,
     fold_feature_contract_state,
 )
+from featuregen.intake.store import (
+    append_feature_contract_event,  # R1 seam (unaliased) — reject_intent's CAS append (X4); monkeypatch target
+    load_feature_contract,
+)
 from featuregen.intake.store import (  # R1 seam (P1, store.py)
     append_feature_contract_event as append_fc_event,
-)
-from featuregen.intake.store import (
-    load_feature_contract,
 )
 from featuregen.privacy.classification import InlinePIIError, assert_no_inline_pii
 from featuregen.security.audit import (
@@ -167,6 +168,9 @@ __all__ = [
     # confirmer_is_requester_human is owned by intake.state (imported, not redefined here).
     "open_fields_empty",
     "guard_advance",
+    # Task 8.3 — the standalone post-intake platform/service terminal reject (X5; wired into
+    # _SP2_CATALOG in Task 8.7, not here).
+    "reject_intent",
 ]
 
 
@@ -202,6 +206,74 @@ def guard_advance(
     if state.status not in allowed_from:
         return f"illegal advance from {state.status.value}"
     return None
+
+
+# ── Task 8.3 — reject_intent: the standalone, POST-INTAKE platform/service terminal (§5.4, §8.4, §11) ─
+# The STANDALONE platform/service-issued terminal outcome for OUT_OF_SCOPE / PROHIBITED_DATA_CLASS
+# (Decision D13): append INTENT_REJECTED on the feature_contract (folding the status to the matching
+# terminal) then drive SP-0's RUN_REJECTED via `run_lifecycle.reject_command`. X5 — this is DISTINCT
+# from submit_intent's INTAKE-TIME terminal reject (`_do_reject_intent`, which submit_intent appends
+# ITSELF): reject_intent covers rejections determined AFTER intake (the §8.4 Gate-#1 re-screen after
+# MCV, or a boundary call while still in clarification). P8 owns it; P4 does NOT call it. SP-2 NEVER
+# touches SP-0's validator-only `reject` action.
+_REJECTABLE_FROM: tuple[FeatureContractStatus, ...] = (
+    FeatureContractStatus.NEEDS_CLARIFICATION,
+    FeatureContractStatus.MINIMUM_CONTRACT_VALIDATED,
+)
+_REJECT_CLASSIFICATIONS = ("OUT_OF_SCOPE", "PROHIBITED_DATA_CLASS")
+
+
+def reject_intent(conn: DbConn, cmd: Command) -> CommandResult:
+    """Standalone, POST-INTAKE platform/service rejection (§5.4, §8.4, §11; X5). Folds the FC status,
+    runs the inline no-regression guard, appends INTENT_REJECTED (X4 — CAS-pinned to the folded head)
+    so the fold advances to the matching terminal, then drives SP-0's RUN_REJECTED. Idempotent by
+    no-regression: a re-reject of an already-terminal contract is denied (never double-charged). NOT
+    called by P4 — `submit_intent` appends the intake-time INTENT_REJECTED itself."""
+    args = cmd.args
+    run_id = args["run_id"]
+    classification = args.get("classification")
+    if classification not in _REJECT_CLASSIFICATIONS:
+        return CommandResult(
+            accepted=False, aggregate_id=run_id,
+            denied_reason=f"reject_intent classification must be one of {_REJECT_CLASSIFICATIONS}, "
+                          f"got {classification!r}",
+        )
+    stream = load_feature_contract(conn, run_id)
+    state = fold_feature_contract_state(stream)
+    head_version = stream[-1].stream_version if stream else 0  # X4 — the folded head, captured at fold time
+    deny = guard_advance(state, _REJECTABLE_FROM)
+    if deny is not None:
+        return CommandResult(accepted=False, aggregate_id=run_id, denied_reason=deny)
+
+    payload = {"run_id": run_id, "classification": classification,
+               "catalog_version": args["catalog_version"]}
+    if args.get("reason") is not None:
+        payload["reason"] = args["reason"]
+    if args.get("matched_class") is not None:
+        payload["matched_class"] = args["matched_class"]
+    # X4 (GLOBAL CONSTRAINT / SP-1 capstone C2): CAS the append on the folded head. SP-0's `append`
+    # treats expected_version=None as "current head at append time" (aggregates/_append.py:76), so a
+    # stale fold + this append could otherwise commit AFTER a concurrent transition. A raised
+    # ConcurrencyError => the stream advanced between fold and append => deny `stale` (no RUN_REJECTED).
+    try:
+        rejected = append_feature_contract_event(
+            conn, run_id=run_id, type=INTENT_REJECTED, payload=payload, actor=cmd.actor,
+            expected_version=head_version,  # X4 CAS pin to the folded head (§12)
+        )
+    except ConcurrencyError:
+        return CommandResult(accepted=False, aggregate_id=run_id,
+                             denied_reason="stale: contract advanced concurrently")
+    # Drive SP-0's run terminal via the existing lifecycle handler (NOT the validator-only `reject`
+    # action): `reject_command` reads cmd.aggregate_id (run_id) + cmd.args["reason"] and checks run
+    # terminality itself.
+    run_cmd = replace(cmd, aggregate="run", aggregate_id=run_id, args={"reason": args.get("reason")})
+    run_res = reject_command(conn, run_cmd)
+    if not run_res.accepted:
+        return run_res
+    return CommandResult(
+        accepted=True, aggregate_id=run_id,
+        produced_event_ids=(rejected.event_id, *run_res.produced_event_ids),
+    )
 
 
 # ── Phase-4-local classifier override (NOT a shared seam) ─────────────────────────────────────
