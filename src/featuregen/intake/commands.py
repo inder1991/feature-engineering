@@ -10,6 +10,8 @@ so a test can pin the banking outcome deterministically."""
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 from featuregen.aggregates._append import append
 from featuregen.commands.registry import get_command, register_command
 from featuregen.contracts import DbConn, EventEnvelope, IdentityEnvelope
@@ -29,6 +31,11 @@ __all__ = [
     "register_intake_classifier",
     "reset_intake_seams",
     "register_sp2_commands",
+    # Task 4.2 pure body assemblers + their platform-owned constants.
+    "DRAFT_STATUS",
+    "DRAFT_SCHEMA_VERSION",
+    "assemble_ledger_body",
+    "assemble_draft_body",
     # re-exported collaborator seams (R10) + R1 append/load — the handlers added by later Phase-4
     # tasks read these off this module; consumers import them from here.
     "append_fc_event",
@@ -98,3 +105,68 @@ def register_sp2_commands() -> None:
             get_command(action)
         except KeyError:
             register_command(action, handler)
+
+
+# ── pure body assemblers (Task 4.2) ───────────────────────────────────────────────────────────
+# PURE: no DB / no LLM call (that is Task 4.4's `submit_intent`). These build the DRAFT_CONTRACT and
+# ASSUMPTION_LEDGER bodies from the normalized LLM output; the platform — NOT the model — owns the
+# SP-0 envelope. Outputs conform to Task-2.1's schemas and pass Task-2.2's `validate_semantics`.
+DRAFT_STATUS = "NEEDS_CLARIFICATION"
+DRAFT_SCHEMA_VERSION = 1
+
+
+def assemble_ledger_body(*, request_id: str, assumptions: list[dict]) -> dict:
+    """Build the ASSUMPTION_LEDGER body (§4.3). The top-level array is `assumptions` (SP-0's required
+    name, R9); each item keeps SP-0's required `field`/`value`/`rationale` and adds the SP-2 semantic
+    extras + a stamped `auto_resolved_at`. `source` defaults to `llm` and `auto_resolved_at` is
+    stamped now when the model omitted them."""
+    stamped = datetime.now(UTC).isoformat()
+    items = []
+    for a in assumptions:
+        item = {
+            "field": a["field"],
+            "value": a["value"],
+            "rationale": a["rationale"],
+            "source": a.get("source", "llm"),
+            "auto_resolved_at": a.get("auto_resolved_at", stamped),
+        }
+        # ambiguity/confidence are optional numeric extras (§4.3): the content-schema types them as
+        # `number`, so a null must be OMITTED — never stamped as None — to stay schema-valid when the
+        # model supplied only SP-0's required field/value/rationale.
+        for extra in ("ambiguity", "confidence"):
+            if a.get(extra) is not None:
+                item[extra] = a[extra]
+        items.append(item)
+    return {"request_id": request_id, "assumptions": items}
+
+
+def assemble_draft_body(
+    *,
+    request_id: str,
+    intake_mode: str,
+    raw_input_ref: str,
+    raw_input_classification: str,
+    assumption_ledger_ref: str,
+    llm_output: dict,
+    llm_call_ref: str,
+) -> dict:
+    """Build the DRAFT_CONTRACT body (§4.1) from the LLM's semantic subset + the authoritative SP-0
+    envelope. The platform owns the envelope: `request_id`, `raw_input_ref`,
+    `raw_input_classification`, `assumption_ledger_ref`, and `status` are set here, NEVER taken from
+    the model — any echoed envelope field is discarded (the no-silent-boundary for the envelope).
+    Only the semantic subset (`proposed_feature_name`, `feature_semantics`, `field_scores`,
+    `open_fields`, `open_questions`) is read from `llm_output`."""
+    return {
+        "request_id": request_id,
+        "intake_mode": intake_mode,
+        "raw_input_ref": raw_input_ref,
+        "raw_input_classification": raw_input_classification,
+        "proposed_feature_name": llm_output["proposed_feature_name"],
+        "feature_semantics": llm_output["feature_semantics"],
+        "field_scores": llm_output.get("field_scores", {}),
+        "open_fields": list(llm_output.get("open_fields", [])),
+        "open_questions": list(llm_output.get("open_questions", [])),
+        "assumption_ledger_ref": assumption_ledger_ref,
+        "provenance": {"llm_call_refs": [llm_call_ref], "schema_version": DRAFT_SCHEMA_VERSION},
+        "status": DRAFT_STATUS,
+    }
