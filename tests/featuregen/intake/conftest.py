@@ -309,6 +309,15 @@ def seed_needs_clarification(db, *, run_id, request_id, draft_body):
             "intake_mode": draft_body["intake_mode"],
             "raw_input_ref": draft_body["raw_input_ref"],
             "raw_input_classification": draft_body["raw_input_classification"],
+            # A genuinely MCV-validated contract was screened in-scope: submit_intent persists
+            # classification.as_mapping() (R9) on INTENT_SUBMITTED, and MCV check 5 reads it back. Without
+            # it a real MCV re-run (e.g. request_edit's re-validation of an edited body) would spuriously
+            # fail `classification_unavailable`, so the seed carries the CLEAR mapping the real flow would.
+            "classification": {
+                "outcome": "CLEAR",
+                "catalog_version": draft_body.get("provenance", {}).get("catalog_version", "bdc-2026.06"),
+                "matched_class": None,
+            },
         },
         actor=REQUESTER, expected_version=0,
     )

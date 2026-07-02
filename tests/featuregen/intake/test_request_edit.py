@@ -78,6 +78,32 @@ def test_edit_reopening_a_field_drops_into_refinement_loop(db):
         assert cur.fetchone()["n"] == 0
 
 
+def test_edit_degrading_a_required_field_to_blank_does_not_reopen_gate(db):
+    """MCV-floor bypass guard (§6.7): a non-UNKNOWN edit that DEGRADES a required field to a blank value
+    (calculation_method -> "") must NOT re-open a confirmable Gate #1. Blanking a required field is
+    invalidating (aligned with mcv._is_unknown — "", None, [], not only the exact sentinel), so the field
+    re-opens and the run drops into the Refinement Loop (NEEDS_CLARIFICATION) instead of re-opening the
+    gate on a contract that would FAIL the machine-checkable MCV floor. (Before the 7.6 fix this re-opened
+    the gate: value == UNKNOWN was False, so the degraded field never entered open_fields and the stale
+    MINIMUM_CONTRACT_VALIDATED short-circuit accepted an invalid contract.)"""
+    _, task_id, tv = _ready(db, "run_ed5")
+    edit = {"field": "feature_semantics.calculation_method", "from": "rolling_count", "to": ""}
+    res = request_edit(db, _edit_cmd("run_ed5", task_id, tv, edit))
+    assert res.accepted is True, res.denied_reason
+    stream = load_stream(db, "feature_contract", "run_ed5")
+    # NOT confirmable: the blanked required field re-opened → NEEDS_CLARIFICATION, never MCV-passed.
+    assert fold_feature_contract_state(stream).status is FeatureContractStatus.NEEDS_CLARIFICATION
+    refined = next(e for e in stream if e.type == "CONTRACT_REFINED")
+    assert "feature_semantics.calculation_method" in refined.payload["draft_body"]["open_fields"]
+    # NO fresh Gate #1 task re-opened on the invalid contract (Refinement Loop owns re-clarification).
+    with db.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            "SELECT count(*) AS n FROM human_tasks WHERE run_id=%s AND status='open' AND gate='CLARIFICATION'",
+            ("run_ed5",),
+        )
+        assert cur.fetchone()["n"] == 0
+
+
 def test_edit_by_non_owner_is_denied_and_audited(db):
     _, task_id, tv = _ready(db, "run_ed3")
     edit = {"field": "proposed_feature_name", "to": "x"}

@@ -88,9 +88,9 @@ from featuregen.intake.llm import (  # R10 seam (P3, llm.py)
     current_llm_client,
 )
 from featuregen.intake.mcv import (  # P5 pre-gate checklist (Task 5.4)
+    _is_unknown,
     _latest_body,
     minimum_contract_validated,
-    run_minimum_contract_validation,
 )
 from featuregen.intake.redaction import (  # R10 seam (P3, redaction.py)
     INPUT_KEY_CATALOG,
@@ -1819,17 +1819,29 @@ def _apply_edit(body: dict, field: str, value) -> None:
 
 def request_edit(conn: DbConn, cmd: Command) -> CommandResult:
     """Human Gate #1 EDIT loop (§8.6): the request owner amends the MCV-passed Draft at the open gate.
-    Supersede the Draft with a REVISED DRAFT_CONTRACT carrying the edit, append CONTRACT_REFINED (folds
-    → NEEDS_CLARIFICATION when a field is re-opened), re-run Minimum Contract Validation (R5), and
-    re-open a fresh Gate #1 task — unless the edit re-introduced an open field (`to == UNKNOWN`), in
-    which case the run stays in the Refinement Loop (no gate re-open). An edit never confirms silently.
+    GENUINELY re-validate the edited body against the machine-checkable MCV floor (§6.7) BEFORE deciding
+    whether the gate may re-open — an edit can never bypass the floor. Supersede the Draft with a REVISED
+    DRAFT_CONTRACT carrying the edit, append CONTRACT_REFINED, and:
+      * re-open a fresh Gate #1 task ONLY when the REVISED body still PASSES the pure MCV checklist
+        (`minimum_contract_validated`, R5) — the existing happy path (e.g. a proposed_feature_name rename);
+      * otherwise re-open the edited field into `open_fields` (CONTRACT_REFINED folds → NEEDS_CLARIFICATION)
+        so the run drops back into the Refinement Loop with NO confirmable gate. The edit is "invalidating"
+        when the new value is UNKNOWN/blank — aligned with `mcv._is_unknown` (`""`, `None`, `[]`, not only
+        the exact sentinel), so blanking a required field consistently re-clarifies — OR when the revised
+        body fails the pure checklist for any other reason. An edit never confirms (or re-opens a
+        confirmable gate on) an invalid contract.
 
     Owner+human guarded (§8.2 `confirmer_is_requester_human`): a non-owner / non-human is DENIED +
     security-audited (R15), before the gate is consumed. task-version OCC via `submit_human_signal
     (response="edit")` — a stale/superseded Gate #1 task is not counted. Handler on an EXISTING stream:
     fold → decide → deny BEFORE any side-effecting append (execute_command does NOT roll back on
     accepted=False). X4: the CONTRACT_REFINED append CASes on the folded head; a ConcurrencyError (a
-    concurrent transition since the fold) is a `stale` denial and the whole edit rolls back."""
+    concurrent transition since the fold) is a `stale` denial. NOTE: that denial does NOT roll back the
+    edit's already-committed side effects — `submit_human_signal` has consumed the Gate #1 task and
+    `_freeze_contract_doc` has inserted the REVISED Draft doc BEFORE the CAS append; the caught
+    ConcurrencyError is raised pre-INSERT (keeping the connection usable) but undoes NEITHER, and
+    execute_command does not roll back on `accepted=False`. Re-driving the edit on the fresh head is safe
+    (the REVISED doc is write-once / content-hashed; a re-consumed task is a no-op)."""
     run_id = cmd.args.get("run_id") or cmd.aggregate_id
     task_id = cmd.args["task_id"]
     expected_task_version = cmd.args["expected_task_version"]
@@ -1875,9 +1887,32 @@ def request_edit(conn: DbConn, cmd: Command) -> CommandResult:
     field = field_edit["field"]
     value = field_edit["to"]
     _apply_edit(revised, field, value)
-    reopened = value == UNKNOWN
+
+    # Close the MCV-floor-bypass-via-edit hole (§6.7): GENUINELY re-validate the REVISED body against the
+    # pure MCV checklist (R5) BEFORE deciding whether the gate may re-open. The DB-backed R5 wrapper
+    # short-circuits on the stale MINIMUM_CONTRACT_VALIDATED status and would accept WITHOUT re-checking
+    # the edited body, so re-run the PURE `minimum_contract_validated` directly on `revised` — the same
+    # in-handler pattern refine_contract uses to converge the Loop, reading its inputs off the inlined
+    # stream. An edit is INVALIDATING when either (1) the new value is UNKNOWN/blank — aligned with
+    # mcv._is_unknown ("", None, [], not only the exact sentinel), so blanking a required field always
+    # re-clarifies — OR (2) the revised body FAILS the checklist for any other reason. Only a
+    # still-passing revised body re-opens a confirmable Gate #1; every other edit re-opens the edited
+    # field into open_fields → CONTRACT_REFINED folds → NEEDS_CLARIFICATION (the Refinement Loop).
+    reopened = _is_unknown(value)
+    if not reopened:
+        intent = _first(stream, INTENT_SUBMITTED)
+        classification = intent.payload.get("classification") if intent is not None else None
+        ledger_body = _latest_body(stream, "assumption_ledger_body") or {
+            "request_id": request_id, "assumptions": []}
+        mode = state.intake_mode or "definition"
+        candidate_count = _candidate_count(conn, run_id) if mode == "hypothesis" else 0
+        revalidation = minimum_contract_validated(
+            revised, ledger_body, classification, mode=mode,
+            candidate_count=candidate_count, confirmed_fields=set(_answered_fields(stream)),
+        )
+        reopened = not revalidation.passed
     if reopened and field not in revised.setdefault("open_fields", []):
-        revised["open_fields"].append(field)  # a re-opened field MUST be in open_fields (§3.5)
+        revised["open_fields"].append(field)  # a re-opened / invalidated field MUST be in open_fields (§3.5)
     human_edit = {"field": field, "from": field_edit.get("from"), "to": value}
 
     revised_doc_id = _freeze_contract_doc(
@@ -1886,12 +1921,14 @@ def request_edit(conn: DbConn, cmd: Command) -> CommandResult:
         supersedes=(draft_doc_id,) if draft_doc_id else (), actor=cmd.actor,
     )
     # X4 — CAS on the folded head (§12, Global Constraints): a None-append would silently ride a
-    # concurrent transition; a raised ConcurrencyError is a stale denial. The gate task was consumed
-    # above, but the caught error keeps the txn usable (the events store raises pre-INSERT / via
-    # savepoint) so the whole edit rolls back on the denial.
+    # concurrent transition; a raised ConcurrencyError is a stale denial. NOTE: the Gate #1 task was
+    # already consumed (submit_human_signal) and the REVISED doc already frozen (_freeze_contract_doc)
+    # ABOVE — a caught ConcurrencyError is raised pre-INSERT so the connection stays usable, but it does
+    # NOT roll those back (execute_command does not roll back on accepted=False); re-driving the edit on
+    # the fresh head is safe (write-once/content-hashed doc, no-op re-consume of the task).
     #
     # The CONTRACT_REFINED payload INLINES draft_body (mcv._latest_body reads the newest event carrying
-    # it — else MCV re-runs on the STALE draft) AND the TOP-LEVEL open_fields / open_questions /
+    # it — else a later MCV re-runs on the STALE draft) AND the TOP-LEVEL open_fields / open_questions /
     # field_scores the P2 fold reads (state.py:137 — omit open_fields and the fold silently CLEARS the
     # open-field set, so a re-opened field would not drop the status to NEEDS_CLARIFICATION).
     try:
@@ -1916,12 +1953,12 @@ def request_edit(conn: DbConn, cmd: Command) -> CommandResult:
             denied_reason="stale: feature_contract advanced concurrently since fold (OCC)",
         )
     if reopened:
-        # The edit re-introduced an open field → back into the Refinement Loop (§6.6); no gate re-open.
+        # An UNKNOWN/blank or otherwise MCV-FAILING edit re-opened the field → back into the Refinement
+        # Loop (§6.6); NO confirmable Gate #1 re-opens on a contract that would fail the MCV floor (§6.7).
         return CommandResult(accepted=True, aggregate_id=run_id)
-    # Re-run MCV (R5, DB-backed) on the revised Draft; if it still passes, re-open a fresh Gate #1 task (§8.6).
-    mcv = run_minimum_contract_validation(conn, run_id, actor=cmd.actor)
-    if mcv.accepted:
-        _open_gate1_task(conn, run_id, actor=cmd.actor)
+    # The revised body genuinely re-passed the pure MCV floor above (and, with no re-opened field, the
+    # fold keeps status MINIMUM_CONTRACT_VALIDATED) → re-open a fresh Gate #1 task on the REVISED Draft (§8.6).
+    _open_gate1_task(conn, run_id, actor=cmd.actor)
     return CommandResult(accepted=True, aggregate_id=run_id)
 
 
