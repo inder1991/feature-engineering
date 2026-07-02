@@ -1,4 +1,6 @@
 
+import pytest
+
 from featuregen.intake.banking_catalog import (
     BankingDomainCatalog,
     IntakeClassification,
@@ -122,3 +124,61 @@ def test_as_mapping_is_the_persisted_provenance_shape():
     assert clear.as_mapping() == {
         "outcome": "CLEAR", "catalog_version": "banking-cat@1", "matched_class": None,
     }
+
+
+# ── N1: PROHIBITED_DATA_CLASS / scope matching is word-bounded, not raw substring ────────────────
+# A catalog whose blocked protected-attribute surface terms include the short tokens ("age", "race",
+# "religion") a raw-substring matcher false-fires on inside ordinary banking words ("aver-AGE",
+# "mort-gAGE", "t-RACE"). PROHIBITED_DATA_CLASS is a TERMINAL reject, so a substring false-positive
+# permanently rejects valid banking work — the bug N1 fixes.
+CAT_N1 = BankingDomainCatalog(
+    version="banking-cat@n1",
+    banking_entities=frozenset({"customer", "account", "card"}),
+    banking_terms=frozenset({"customer", "account", "card", "transaction", "credit",
+                             "balance", "mortgage", "payment", "payments"}),
+    allowed_use_cases=frozenset({"behavioral_credit_scoring"}),
+    out_of_scope_use_cases=frozenset(),
+    out_of_scope_terms=frozenset({"netflix"}),
+    blocked_data_classes=frozenset({"protected_attribute"}),
+    blocked_terms={
+        "age": "protected_attribute", "race": "protected_attribute",
+        "religion": "protected_attribute", "gender": "protected_attribute",
+    },
+    sensitive_proxy_terms=frozenset({"zip code"}),
+    use_case_terms={"behavioral_credit_scoring": ("credit risk", "credit score")},
+    predictive_markers=frozenset({"predict", "propensity"}),
+    scoped_use_cases=frozenset(),
+)
+
+
+@pytest.mark.parametrize("intent", [
+    "average transaction value",   # 'aver-AGE' must NOT match blocked term 'age'
+    "mortgage balance",            # 'mort-gAGE' must NOT match blocked term 'age'
+    "trace the payment",           # 't-RACE' must NOT match blocked term 'race'
+])
+def test_substring_lookalikes_do_not_false_reject_as_prohibited(intent):
+    # Fails BEFORE the fix (raw substring 'age' in 'average'/'mortgage', 'race' in 'trace' →
+    # PROHIBITED_DATA_CLASS terminal reject); passes AFTER (word-bounded → classified by real content).
+    r = classify_intent(intent, catalog=CAT_N1)
+    assert r.outcome is not IntakeOutcome.PROHIBITED_DATA_CLASS
+    assert not r.blocks
+    assert r.outcome is IntakeOutcome.CLEAR   # classified by its real (banking) content
+
+
+@pytest.mark.parametrize("intent", [
+    "predict default using customer race",   # standalone 'race'
+    "score the applicant age",               # standalone 'age'
+    "segment customers by religion",         # standalone 'religion'
+])
+def test_standalone_protected_attribute_still_blocks(intent):
+    # A genuine, whole-word protected attribute MUST still terminally block (fail-closed posture).
+    r = classify_intent(intent, catalog=CAT_N1)
+    assert r.outcome is IntakeOutcome.PROHIBITED_DATA_CLASS
+    assert r.matched_class == "protected_attribute"
+    assert r.blocks
+
+
+def test_legitimate_in_scope_intent_unaffected_by_boundary_matching():
+    r = classify_intent("build a credit risk score for customers", catalog=CAT_N1)
+    assert r.outcome is IntakeOutcome.CLEAR
+    assert r.matched_use_case == "behavioral_credit_scoring"

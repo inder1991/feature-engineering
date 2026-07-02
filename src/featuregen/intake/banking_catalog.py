@@ -2,16 +2,19 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from enum import Enum
+from functools import lru_cache
 
 # Surface terms per blocked data class — the deterministic lexical expansion the intake screen
 # matches against raw intent text (§5.4). `protected_attribute` is the platform-wide blocked class
 # in the seed (every use-case blocks it); these are the protected characteristics it covers.
 _PROTECTED_ATTRIBUTE_TERMS: tuple[str, ...] = (
-    "race", "ethnicity", "gender", "sex", "religion", "age", "disability",
-    "marital status", "national origin", "sexual orientation",
+    "race", "ethnicity", "ethnic", "gender", "sex", "religion", "religious", "creed",
+    "age", "disability", "marital status", "national origin", "nationality",
+    "sexual orientation",
 )
 _CLASS_SURFACE_TERMS: dict[str, tuple[str, ...]] = {
     "protected_attribute": _PROTECTED_ATTRIBUTE_TERMS,
@@ -19,8 +22,9 @@ _CLASS_SURFACE_TERMS: dict[str, tuple[str, ...]] = {
 # Data classes that are sensitive PROXIES (route to clarification / compliance review, NOT a block,
 # §4.5, §6.2), and their raw-text surface terms.
 _PROXY_TERMS_BY_CLASS: dict[str, tuple[str, ...]] = {
-    "geolocation": ("zip code", "postal code", "neighbourhood", "neighborhood"),
-    "demographics": ("age band", "income bracket"),
+    "geolocation": ("zip code", "zipcode", "postal code", "postcode", "postal",
+                    "neighbourhood", "neighborhood"),
+    "demographics": ("age band", "age bracket", "income bracket", "income band"),
     "device": (),
 }
 _DEFAULT_PREDICTIVE_MARKERS: tuple[str, ...] = (
@@ -182,18 +186,36 @@ class IntakeClassification:
         }
 
 
+@lru_cache(maxsize=2048)
+def _term_pattern(term: str) -> re.Pattern[str]:
+    r"""A word/token-bounded, case-insensitive matcher for a single surface term (N1). The term is
+    anchored on both sides by `\b`, so it matches only as a whole word — a genuine standalone
+    "age"/"race"/"religion" — never as a raw substring of a larger word ("aver-age", "mort-gage",
+    "t-race"). A trailing simple plural ("customer"→"customers", "balance"→"balances") is still
+    allowed so scope detection is not weakened; that extension is on the right only, so it never
+    re-opens the suffix false-positives (the left `\b` still fails inside "average"/"trace")."""
+    return re.compile(rf"\b{re.escape(term)}(?:es|s)?\b", re.IGNORECASE)
+
+
+def _term_in(text: str, term: str) -> bool:
+    """True iff `term` occurs in `text` as a whole word/token (word-bounded, not a raw substring)."""
+    return bool(term) and _term_pattern(term).search(text) is not None
+
+
 def _first_match(text: str, terms: Iterable[str]) -> str | None:
-    """First (deterministically ordered) term that occurs in the lowercased intent, or None."""
+    """First (deterministically ordered) term that occurs in the lowercased intent as a whole
+    word/token, or None. Word-bounded (N1): never a raw substring match."""
     for term in sorted(terms):
-        if term and term in text:
+        if _term_in(text, term):
             return term
     return None
 
 
 def _match_use_case(text: str, catalog: BankingDomainCatalog) -> str | None:
-    """The first (deterministically ordered) known use-case any of whose keyword terms occurs."""
+    """The first (deterministically ordered) known use-case any of whose keyword terms occurs as a
+    whole word/token (word-bounded, consistent with _first_match — N1)."""
     for use_case in sorted(catalog.use_case_terms):
-        if any(term and term in text for term in catalog.use_case_terms[use_case]):
+        if any(_term_in(text, term) for term in catalog.use_case_terms[use_case]):
             return use_case
     return None
 
