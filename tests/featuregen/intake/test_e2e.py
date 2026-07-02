@@ -7,16 +7,19 @@ Hermetic: the only non-deterministic collaborator — the LLM — is the P3 `Fak
 (`register_intake_catalog` / `register_intent_redactor` / `register_llm_client` /
 `register_candidate_generator`) + Task-9.1's `register_sp2`/`seed_sp2_authz` are wired by `_wire`.
 
-Flow (definition mode, CLEAR):
+Flow (definition mode, CLEAR) — the SELF-DRIVING pipeline, all via real dispatch (Task 9.2a):
   execute_command(submit_intent)  → FakeLLM.structure_intent → frozen Draft + Assumption Ledger
-  run_minimum_contract_validation → the pre-gate 6-check checklist passes on the initial (fully
-                                    resolved, NO open_fields) Draft → MINIMUM_CONTRACT_VALIDATED
-  execute_command(open_gate1_task)→ the dedicated Human Gate #1 confirmation task
+  execute_command(advance_intent) → the thin production driver folds the Draft, runs the first-pass
+                                    route through refine_contract (score → critique → doubt-router;
+                                    clean → MINIMUM_CONTRACT_VALIDATED), then opens Human Gate #1
   execute_command(confirm_contract)→ CONTRACT_CONFIRMED → CONFIRMED
   get_contract(conn, run_id)      → the frozen, servable CONFIRMED_CONTRACT body (SP-3 hand-off)
 
-The Draft is scripted fully resolved so the Doubt Router asks nothing and MCV passes directly on the
-initial Draft — this sidesteps the per-field clarification round (Tasks 9.3+ exercise that path).
+The E2E proves the self-driving pipeline: nothing manually calls `run_minimum_contract_validation`
+or `open_gate1_task` — `advance_intake` sequences the routing engine + the gate opener over real
+`execute_command` dispatch (submit → advance → gate → confirm). The Draft is scripted fully resolved
+so the Doubt Router asks nothing and MCV passes on the first refine pass — this sidesteps the
+per-field clarification round (Tasks 9.3+ exercise that path).
 The scenario closes with the X4 CAS / stale-append guard proven end-to-end (SP-1 capstone C2): a
 replayed `confirm_contract` at the now-stale gate-task version is DENIED and never double-applies.
 """
@@ -31,9 +34,8 @@ from featuregen.intake.banking_catalog import IntakeClassification, IntakeOutcom
 from featuregen.intake.bootstrap import register_sp2, seed_sp2_authz
 from featuregen.intake.candidates import StubCandidateGenerator, register_candidate_generator
 from featuregen.intake.catalog import load_banking_catalog_from_seed, register_intake_catalog
-from featuregen.intake.commands import register_intake_classifier
+from featuregen.intake.commands import register_intake_classifier, register_intake_deps
 from featuregen.intake.llm import FakeLLM, FakeResponse, register_llm_client
-from featuregen.intake.mcv import run_minimum_contract_validation
 from featuregen.intake.read_model import get_contract
 from featuregen.intake.redaction import DefaultIntentRedactor, register_intent_redactor
 
@@ -104,8 +106,26 @@ _STRUCTURE_OUTPUT = {
          "ambiguity": 0.30, "confidence": 0.72},
     ],
 }
-# R19 — FakeLLM(script={task_key: FakeResponse(...)}): wrap each task's deterministic output.
-_DEF_FIXTURES = {"structure_intent": FakeResponse(output=_STRUCTURE_OUTPUT)}
+# R19 — FakeLLM(script={task_key: FakeResponse(...)}): wrap each task's deterministic output. The
+# self-driving route runs refine_contract, whose challenger critique needs a scripted `contract_review`
+# (an OK, finding-free verdict on the already-resolved Draft → the Loop converges straight to MCV).
+_OK_REVIEW = {"review_type": "CONTRACT_REVIEW", "status": "OK", "findings": []}
+_DEF_FIXTURES = {
+    "structure_intent": FakeResponse(output=_STRUCTURE_OUTPUT),
+    "contract_review": FakeResponse(output=_OK_REVIEW),
+}
+
+
+class _ScoringView:
+    """The R10 merged-view scoring seam refine_contract re-scores against (candidate_count + metadata).
+    One binding per concept keeps the deterministic cardinality doubt low — the resolved Draft's own
+    low-ambiguity self-report drives routing, so nothing re-opens."""
+
+    def candidate_count(self, concept):
+        return 1
+
+    def metadata(self):
+        return {}
 
 
 class _Registry:
@@ -140,6 +160,9 @@ def _wire(db, *, fixtures, catalog_seed=_BANKING_SEED, generator=False):
     register_intake_classifier(_clear_classification)  # deterministic intake boundary
     llm = FakeLLM(script=fixtures)  # R19 — the ONE pinned FakeLLM construction form
     register_llm_client(llm)
+    # The Refinement-Loop deps advance_intake drives refine_contract with (Task 9.2a): the same FakeLLM +
+    # redactor + the merged-view scoring seam. (conftest resets these per test so they never leak.)
+    register_intake_deps(client=llm, redactor=DefaultIntentRedactor(), catalog=_ScoringView())
     if generator:
         register_candidate_generator(StubCandidateGenerator(llm))
     return llm
@@ -209,17 +232,16 @@ def test_definition_intent_reaches_confirmed_contract_for_sp3(db):
     assert view.open_fields == ()  # scripted fully resolved → Doubt Router opens no clarification
     assert view.reason_if_unavailable is not None  # fail-closed: a Draft is never servable
 
-    # ── MCV: the pre-gate 6-check checklist passes directly on the initial Draft ────────────────────
-    mcv = run_minimum_contract_validation(db, run_id, actor=agent)
-    assert mcv.accepted, mcv.denied_reason
-    assert get_contract(db, run_id).status == "MINIMUM_CONTRACT_VALIDATED"
-
-    # ── Gate #1: open the dedicated confirmation task (service), then the requester confirms ────────
-    opened = execute_command(
+    # ── advance_intake: the thin production driver self-drives Draft → refine (clean) → MCV → Gate #1,
+    #    all via real dispatch. Nothing here manually calls run_minimum_contract_validation /
+    #    open_gate1_task — advance_intake sequences the routing engine + the gate opener (Task 9.2a). ──
+    advanced = execute_command(
         db,
-        Command("open_gate1_task", "feature_contract", run_id, {"run_id": run_id}, agent, "ik-def-gate"),
+        Command("advance_intake", "feature_contract", run_id, {"run_id": run_id}, agent, "ik-def-advance"),
     )
-    assert opened.accepted, opened.denied_reason
+    assert advanced.accepted, advanced.denied_reason
+    assert get_contract(db, run_id).status == "MINIMUM_CONTRACT_VALIDATED"
+    # the dedicated Human Gate #1 confirmation task is now open (the requester then confirms)
     gate_task, gv = _only_open_task(db, run_id)
 
     confirmed = execute_command(
