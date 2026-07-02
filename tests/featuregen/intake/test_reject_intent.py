@@ -113,3 +113,21 @@ def test_reject_intent_denies_stale_on_concurrent_advance(db, monkeypatch):
     assert res.accepted is False
     assert "stale" in res.denied_reason
     assert run_is_terminal(db, "run_1") is False
+
+
+def test_reject_intent_denies_before_fc_append_when_run_terminal_out_of_band(db):
+    # Deny-before-append atomicity: the run is made terminal OUT-OF-BAND (RUN_WITHDRAWN writes NO fc
+    # event) while the FC is still non-terminal. reject_intent must deny "run already terminal" BEFORE
+    # appending INTENT_REJECTED — otherwise the fc terminal is orphaned on a differently-terminal run
+    # (reject_command would deny, and the paired RUN_REJECTED would never fire).
+    _open_run_and_contract(db)
+    append(db, aggregate="run", aggregate_id="run_1", type="RUN_WITHDRAWN",
+           payload={"run_id": "run_1", "reason": "requester withdrew"}, actor=_SERVICE, run_id="run_1")
+
+    res = reject_intent(db, _cmd("run_1", classification="OUT_OF_SCOPE", catalog_version="v1"))
+    assert res.accepted is False
+    assert res.denied_reason == "run already terminal"
+    # NO orphaned fc terminal: INTENT_REJECTED was never appended, the FC fold is untouched.
+    assert ev.INTENT_REJECTED not in [e.type for e in load_feature_contract(db, "run_1")]
+    st = fold_feature_contract_state(load_feature_contract(db, "run_1"))
+    assert st.status is FeatureContractStatus.NEEDS_CLARIFICATION

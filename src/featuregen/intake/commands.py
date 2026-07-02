@@ -244,6 +244,14 @@ def reject_intent(conn: DbConn, cmd: Command) -> CommandResult:
     deny = guard_advance(state, _REJECTABLE_FROM)
     if deny is not None:
         return CommandResult(accepted=False, aggregate_id=run_id, denied_reason=deny)
+    # Deny-before-append (X5 discipline): `reject_command` below itself denies "run already terminal"
+    # (run_lifecycle.py:18-21) when the run was made terminal OUT-OF-BAND (e.g. RUN_WITHDRAWN /
+    # RUN_CANCELLED, which write NO fc event) while the FC is still non-terminal. Appending
+    # INTENT_REJECTED first would then orphan an fc terminal on a differently-terminal run (the paired
+    # RUN_REJECTED never fires). Hoist the run-terminality deny BEFORE the fc append so no orphan is ever
+    # written — matching submit_intent / _do_reject_intent, which never deny after an append.
+    if run_is_terminal(conn, run_id):
+        return CommandResult(accepted=False, aggregate_id=run_id, denied_reason="run already terminal")
 
     payload = {"run_id": run_id, "classification": classification,
                "catalog_version": args["catalog_version"]}
@@ -266,7 +274,8 @@ def reject_intent(conn: DbConn, cmd: Command) -> CommandResult:
     # Drive SP-0's run terminal via the existing lifecycle handler (NOT the validator-only `reject`
     # action): `reject_command` reads cmd.aggregate_id (run_id) + cmd.args["reason"] and checks run
     # terminality itself.
-    run_cmd = replace(cmd, aggregate="run", aggregate_id=run_id, args={"reason": args.get("reason")})
+    run_cmd = replace(cmd, aggregate="run", aggregate_id=run_id,
+                      args={"reason": args.get("reason") or classification})
     run_res = reject_command(conn, run_cmd)
     if not run_res.accepted:
         return run_res
