@@ -5,6 +5,7 @@ from featuregen.contracts import Command
 from featuregen.identity.build import build_human_identity
 from featuregen.intake.commands import (
     RefineResult,
+    _classify_raw_input,
     freeze_draft,
     open_clarification_task,
     refine_contract,
@@ -55,13 +56,15 @@ def _semantics(filter_predicate="UNKNOWN"):
 
 
 def _seed_draft(db, agent, *, run_id="run_ref", open_fields=("filters.declined_status_encoding",),
-                semantics=None):
+                semantics=None, raw_input_classification="clean"):
     # R4: INTENT_SUBMITTED is appended by the HUMAN requester (OWNER) → the P2 fold sets state.requester
     # == "user:raj", the owner the Refinement Loop scopes clarification tasks to (never a payload key).
+    # `raw_input_classification` is the ORIGINAL intent label refine_contract reads as `raw_class`; a
+    # `contains_pii`-origin run must still renormalize cleanly (its draft fields are already redacted).
     append_fc_event(
         db, run_id=run_id, type="INTENT_SUBMITTED",
         payload={"request_id": "req_ref", "run_id": run_id, "intake_mode": "definition",
-                 "raw_input_ref": "blob_x", "raw_input_classification": "clean",
+                 "raw_input_ref": "blob_x", "raw_input_classification": raw_input_classification,
                  "classification": {"outcome": "CLEAR", "catalog_version": "bdc-1"}},
         actor=OWNER, expected_version=0,
     )
@@ -291,4 +294,66 @@ def test_renormalize_fails_closed_on_pii_in_prior_semantics(db, sp2_schemas, age
         refine_contract(db, run_id, client=_ExplodingLLM(), redactor=DefaultIntentRedactor(),
                         catalog=_View(), actor=agent)
     # no LLM was dispatched → no audit call recorded on the stream (fail-closed, nothing committed)
+    assert "LLM_CALL_RECORDED" not in [e.type for e in load_feature_contract(db, run_id)]
+
+
+def test_renormalize_survives_contains_pii_origin_intent(db, sp2_schemas, agent):
+    # SP-2 merge-blocker: `renormalize` composes its request from the ALREADY-REDACTED structured draft
+    # fields, so it must classify THAT payload "clean" (+ stamp a redaction_version) — NOT forward the
+    # raw intent's original `contains_pii` label. Before the fix it forwarded raw_class="contains_pii"
+    # with no redaction_version, so assert_llm_safe HARD-RAISED EgressViolation on EVERY clarification
+    # round of a PII-origin run: call_llm records LLM_EGRESS_BLOCKED and re-raises, and there is NO
+    # `except EgressViolation` in refine_contract/advance_intake → an UNHANDLED CRASH on exactly the
+    # PII-bearing runs the redaction machinery exists to serve. Fails before the fix; passes after.
+    #
+    # The intent is AUTO-classified `contains_pii` by SP-0's inline-secret scan (an SSN in the raw text):
+    pii_intent = "90-day declined-auth count per customer; contact me re: ssn 123-45-6789"
+    assert _classify_raw_input(pii_intent, None) == "contains_pii"
+
+    # ...but the STRUCTURED draft (renormalize's ACTUAL payload source) is clean-by-construction, and an
+    # answer targets the one open field → the renormalize branch is taken with raw_class="contains_pii".
+    run_id, _ = _seed_draft(db, agent, raw_input_classification="contains_pii")
+    append_fc_event(db, run_id=run_id, type="CLARIFICATION_ANSWERED",
+                    payload={"task_id": "task_x", "field": "filters",
+                             "answer": "card_authorizations.auth_result = 'D'", "response": "confirm",
+                             "answered_by": "user:raj"}, actor=agent)
+    client = ScriptedLLM({
+        "renormalize": {
+            "output": {"feature_semantics": _semantics("card_authorizations.auth_result = 'D'"),
+                       "open_fields": []},
+            "self_reported_scores": {
+                "entity": {"ambiguity": 0.05, "confidence": 0.97, "source": "llm"},
+                "entity_grain": {"ambiguity": 0.30, "confidence": 0.72, "source": "default"},
+                "windows": {"ambiguity": 0.05, "confidence": 0.98, "source": "llm"},
+                "filters": {"ambiguity": 0.10, "confidence": 0.92, "source": "llm"},
+            },
+        },
+        "contract_review": {"review_type": "CONTRACT_REVIEW", "status": "OK", "findings": []},
+    })
+    # No unhandled EgressViolation: the renormalize round completes as a `clean`-origin run would, the
+    # renormalize LLM call actually DISPATCHED (assert_llm_safe passed → LLM_CALL_RECORDED), reaching MCV.
+    res = refine_contract(db, run_id, client=client, redactor=DefaultIntentRedactor(),
+                          catalog=_View(), actor=agent)
+    assert res.status == "validated", res
+    types = [e.type for e in load_feature_contract(db, run_id)]
+    assert "LLM_CALL_RECORDED" in types      # renormalize dispatched (was egress-blocked before the fix)
+    assert "CONTRACT_REFINED" in types
+    assert "MINIMUM_CONTRACT_VALIDATED" in types
+
+
+def test_renormalize_still_fails_closed_on_genuine_pii_for_contains_pii_origin(db, sp2_schemas, agent):
+    # Companion to the above: classifying the renormalize payload "clean" must NOT weaken the no-PII
+    # boundary. GENUINE PII in the composed model-facing content still FAILS CLOSED via the `_first_pii`
+    # pre-scan BEFORE any dispatch — even for a `contains_pii`-origin run.
+    pii_semantics = _semantics()
+    pii_semantics["filters"] = [{"concept": "declined card authorization",
+                                 "predicate": "escalate to ops.alerts@example.com"}]  # EMAIL leak
+    run_id, _ = _seed_draft(db, agent, semantics=pii_semantics, raw_input_classification="contains_pii")
+    append_fc_event(db, run_id=run_id, type="CLARIFICATION_ANSWERED",
+                    payload={"task_id": "t1", "field": "filters", "answer": "still unclear",
+                             "response": "confirm", "answered_by": "user:raj"}, actor=agent)
+    with pytest.raises(EgressViolation):
+        refine_contract(db, run_id, client=_ExplodingLLM(), redactor=DefaultIntentRedactor(),
+                        catalog=_View(), actor=agent)
+    # fail-closed at the pre-scan → the LLM was never dispatched, nothing committed to the stream.
     assert "LLM_CALL_RECORDED" not in [e.type for e in load_feature_contract(db, run_id)]

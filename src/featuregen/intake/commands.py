@@ -104,6 +104,8 @@ from featuregen.intake.mcv import (  # P5 pre-gate checklist (Task 5.4)
 from featuregen.intake.redaction import (  # R10 seam (P3, redaction.py)
     INPUT_KEY_CATALOG,
     INPUT_KEY_CLASSIFICATION,
+    INPUT_KEY_REDACTION_VERSION,
+    REDACTION_VERSION,
     EgressViolation,
     _first_pii,
     build_llm_inputs,
@@ -1273,7 +1275,16 @@ def refine_contract(
                 "prior_semantics": draft_body["feature_semantics"],
                 "answers": _redact_answers(redactor, {f: answers[f] for f in unfolded}, raw_class),
                 INPUT_KEY_CATALOG: dict(catalog.metadata()),
-                INPUT_KEY_CLASSIFICATION: raw_class,  # egress guard (§9.4) — LLM-safe, no raw intent
+                # The renormalize payload is composed ENTIRELY from ALREADY-REDACTED structured draft
+                # fields (prior_semantics from the frozen Draft, answers pre-redacted just above) — NOT
+                # the raw intent — so it is `clean` by construction and carries a redaction_version,
+                # exactly as the sibling already-redacted-payload callers do (critique.py / candidates.py).
+                # Forwarding the raw intent's original `contains_pii` label (with no redaction_version)
+                # would make assert_llm_safe (§9.4) HARD-RAISE on every clarification round of a
+                # PII-origin run — a false-positive egress block, never a leak. The `_first_pii` pre-scan
+                # below still fails closed on any GENUINE residual PII in the composed content.
+                INPUT_KEY_CLASSIFICATION: "clean",       # egress guard (§9.4) — LLM-safe, no raw intent
+                INPUT_KEY_REDACTION_VERSION: REDACTION_VERSION,
             },
             output_schema_id=RENORMALIZE_SCHEMA_ID, output_schema_version=RENORMALIZE_SCHEMA_VERSION,
             generation_settings=dict(_RENORM_SETTINGS),
