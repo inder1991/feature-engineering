@@ -1,0 +1,130 @@
+"""SP-2 no-PII boundary (spec §9.4): the IntentRedactor seam + default impl + the reserved
+LLM-safe `inputs` vocabulary + the fail-closed egress guard.
+
+Ownership split (spec §9.4): SP-0 CLASSIFIES the raw intent (raw_input_classification);
+SP-2 REDACTS here (fails closed on un-redactable / `unscanned`); SP-2 GUARDS EGRESS
+(`assert_llm_safe`, Task 3.2). The redactor produces the ONLY LLM-safe rendering of the intent
+ever placed in LLMRequest.inputs. `input_redaction` records span TYPES/POSITIONS, never values.
+"""
+from __future__ import annotations
+
+import re
+from collections.abc import Mapping
+from dataclasses import dataclass
+from typing import Any, Protocol, runtime_checkable
+
+# Reserved keys that structure LLMRequest.inputs. The model-facing content is INTENT + CATALOG;
+# the rest is provenance the egress guard + call_llm read. Provenance keys carry no data values.
+INPUT_KEY_INTENT = "redacted_intent"
+INPUT_KEY_CATALOG = "catalog_metadata"
+INPUT_KEY_CLASSIFICATION = "raw_input_classification"
+INPUT_KEY_REDACTION_VERSION = "redaction_version"
+INPUT_KEY_REDACTION = "input_redaction"
+
+REDACTION_VERSION = "default-redactor@1"
+
+# Deterministic PII detectors shared by the redactor and the egress backstop (Task 3.2). PHONE is
+# deliberately excluded (false positives on window/date literals like "90-day"); the set is
+# conservative-and-testable, not exhaustive. Placeholders are digit/at-free so a residual scan of
+# a redacted string never re-matches.
+_PII_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("EMAIL", re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")),
+    ("SSN", re.compile(r"\b\d{3}-\d{2}-\d{4}\b")),
+    ("PAN", re.compile(r"\b\d{4}[ \-]?\d{4}[ \-]?\d{4}[ \-]?\d{1,4}\b")),
+)
+
+
+class EgressViolation(Exception):
+    """A payload that must never reach the LLM (unscanned, data values, or un-redacted PII), or
+    a redactor that failed closed. A HARD failure — call_llm routes it to the security-audit
+    stream (§9.4); it is never a warning."""
+
+
+@dataclass(frozen=True)
+class RedactionResult:
+    text: str | None            # the ONLY LLM-safe rendering placed in inputs; None ⟹ fail closed
+    redaction_version: str      # stamped onto the llm_call record
+    redacted_spans: tuple       # ({"type","start","end"}, ...) — types/positions, NEVER values
+    disposition: str            # "ok" | "fail_into_clarification"
+
+
+@runtime_checkable
+class IntentRedactor(Protocol):
+    def redact(self, raw_intent: str, raw_input_classification: str) -> RedactionResult: ...
+
+
+def _scan(text: str) -> list[dict[str, Any]]:
+    spans: list[dict[str, Any]] = []
+    for label, pat in _PII_PATTERNS:
+        for m in pat.finditer(text):
+            spans.append({"type": label, "start": m.start(), "end": m.end()})
+    return spans
+
+
+class DefaultIntentRedactor:
+    """Default IntentRedactor. `clean` passes through; `contains_pii` scrubs the located spans and
+    fails closed if it cannot locate any (cannot prove safety); `unscanned` fails closed outright.
+    Never emits text for an un-redactable or unscanned intent (§9.4)."""
+
+    def redact(self, raw_intent: str, raw_input_classification: str) -> RedactionResult:
+        if raw_input_classification == "unscanned":
+            return RedactionResult(None, REDACTION_VERSION, (), "fail_into_clarification")
+        if raw_input_classification == "clean":
+            return RedactionResult(raw_intent, REDACTION_VERSION, (), "ok")
+        if raw_input_classification == "contains_pii":
+            spans = _scan(raw_intent)
+            if not spans:
+                # classified PII but nothing locatable to scrub → cannot prove safe → fail closed
+                return RedactionResult(None, REDACTION_VERSION, (), "fail_into_clarification")
+            redacted = raw_intent
+            for label, pat in _PII_PATTERNS:
+                redacted = pat.sub(f"[REDACTED:{label}]", redacted)
+            if _scan(redacted):  # defense in depth: residual PII ⟹ fail closed
+                return RedactionResult(None, REDACTION_VERSION, (), "fail_into_clarification")
+            return RedactionResult(redacted, REDACTION_VERSION, tuple(spans), "ok")
+        # unknown classification: fail closed (never guess)
+        return RedactionResult(None, REDACTION_VERSION, (), "fail_into_clarification")
+
+
+def build_llm_inputs(
+    redaction: RedactionResult,
+    *,
+    catalog_metadata: Mapping[str, Any],
+    raw_input_classification: str,
+) -> dict:
+    """Assemble the reserved-keyed LLMRequest.inputs from a RedactionResult + catalog METADATA.
+    Refuses (EgressViolation) when the redactor failed closed — no unsafe payload is ever built."""
+    if redaction.text is None:
+        raise EgressViolation(
+            "redactor failed closed; no LLM-safe text to dispatch (fail into clarification)"
+        )
+    return {
+        INPUT_KEY_INTENT: redaction.text,
+        INPUT_KEY_CATALOG: dict(catalog_metadata),
+        INPUT_KEY_CLASSIFICATION: raw_input_classification,
+        INPUT_KEY_REDACTION_VERSION: redaction.redaction_version,
+        INPUT_KEY_REDACTION: {"redacted_spans": [dict(s) for s in redaction.redacted_spans]},
+    }
+
+
+# ---- R10 collaborator DI seam (module-global; mirrors overlay/catalog.py) --------------------
+# The ONE holder for the active IntentRedactor. P4 (submit_intent) resolves the redactor via
+# current_intent_redactor(); P9 registers it via register_intent_redactor(...). Fail-closed if
+# unset — the platform never silently redacts with a default the caller did not choose (§9.4).
+_INTENT_REDACTOR: IntentRedactor | None = None
+
+
+def register_intent_redactor(redactor: IntentRedactor) -> None:
+    """Register the process-wide IntentRedactor (last writer wins). P9 wires DefaultIntentRedactor."""
+    global _INTENT_REDACTOR
+    _INTENT_REDACTOR = redactor
+
+
+def current_intent_redactor() -> IntentRedactor:
+    """Return the registered IntentRedactor; fail closed (RuntimeError) if none is registered."""
+    if _INTENT_REDACTOR is None:
+        raise RuntimeError(
+            "no IntentRedactor registered; call register_intent_redactor(...) "
+            "(register_sp2()/_wire does this)"
+        )
+    return _INTENT_REDACTOR
