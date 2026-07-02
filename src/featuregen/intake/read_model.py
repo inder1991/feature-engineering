@@ -5,7 +5,6 @@ The fold is authoritative — this reader never consults a projection for a deci
 
 from __future__ import annotations
 
-import json
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
@@ -14,6 +13,7 @@ from featuregen.contracts import DbConn
 from featuregen.contracts.documents import Stage
 from featuregen.documents.store import get_document
 from featuregen.events.store import load_stream
+from featuregen.intake.mcv import _latest_body  # R13 authoritative stream body read (mcv.py:158)
 from featuregen.intake.state import FeatureContractStatus, fold_feature_contract_state
 from featuregen.intake.store import load_feature_contract  # R1 — append/load seam owned by P1
 
@@ -44,12 +44,19 @@ class ContractView:
     _bodies: Mapping[str, Any] = field(default_factory=dict, repr=False)
 
     def __getitem__(self, key: str) -> Mapping[str, Any] | None:
-        """R13 DUAL ACCESS: `view["confirmed"]` / `view["draft"]` return the frozen contract BODY
-        (parsed from the governance-retained blob at the document's `body_ref` via the document store),
-        while `view.status` / `view.run_id` / ... stay plain attribute access. Any other key → KeyError.
-        SP-3 and the P9 E2E read `view["confirmed"][...]`."""
+        """R13 DUAL ACCESS: `view["confirmed"]` / `view["draft"]` return the frozen contract BODY (read
+        off the event stream `get_contract` folds — the bodies ride CONTRACT_CONFIRMED /
+        DRAFT_CONTRACT_PRODUCED / CONTRACT_REFINED inline), while `view.status` / `view.run_id` / ... stay
+        plain attribute access. Any other key → KeyError. SP-3 and the P9 E2E read `view["confirmed"][...]`.
+
+        FAIL-CLOSED: the EXECUTABLE confirmed body is served ONLY when the contract is servable
+        (`reason_if_unavailable is None`); a blocked run (non-CONFIRMED fold OR a terminal run) yields
+        None even though confirmed_body sits on the stream — "no servable confirmed contract → nothing
+        downstream" (§12). The draft body is never the executable artifact, so it is returned regardless."""
         if key not in ("confirmed", "draft"):
             raise KeyError(key)
+        if key == "confirmed" and self.reason_if_unavailable is not None:
+            return None  # fail-closed: only a servable contract exposes its executable confirmed body
         return self._bodies.get(key)
 
 
@@ -58,26 +65,6 @@ def _run_terminal_outcome(conn: DbConn, run_id: str) -> str | None:
         if e.type in _RUN_TERMINALS:
             return e.type
     return None
-
-
-def _read_frozen_body(conn: DbConn, body_ref: str | None) -> bytes | None:
-    """Read the governance-retained object SP-2 wrote when it froze a contract document (`body_ref`),
-    or None if unresolved. The object-store binding is wired in P9 (the E2E freezes real bodies); the
-    fold + attribute view never depend on it (fail-soft), so unit tests need no object store."""
-    if body_ref is None:
-        return None
-    # SP-2 governance-retained object-store read (bound in P9's `_wire`); fail-soft until then.
-    return None
-
-
-def _load_document_body(conn: DbConn, doc_id: str) -> Mapping[str, Any] | None:
-    """Resolve a frozen document's parsed body for R13 subscript access: `get_document` → `body_ref` →
-    the governance-retained blob → JSON. None when the document or its body is not resolvable."""
-    doc = get_document(conn, doc_id)
-    if doc is None:
-        return None
-    raw = _read_frozen_body(conn, doc.get("body_ref"))
-    return json.loads(raw) if raw is not None else None
 
 
 def get_contract(conn: DbConn, run_id: str) -> ContractView | None:
@@ -94,6 +81,8 @@ def get_contract(conn: DbConn, run_id: str) -> ContractView | None:
     stage = Stage.CONFIRMED_CONTRACT.value if is_confirmed else Stage.DRAFT_CONTRACT.value
     doc_id = state.confirmed_doc_id if is_confirmed else state.draft_doc_id
 
+    # body_ref / content_hash — governance-integrity metadata for the served document (the frozen body
+    # itself is READ from the event stream below, not the stubbed object store).
     body_ref = content_hash = None
     if doc_id is not None:
         doc = get_document(conn, doc_id)
@@ -109,10 +98,14 @@ def get_contract(conn: DbConn, run_id: str) -> ContractView | None:
     else:
         reason = None
 
-    # R13 — resolve the frozen bodies for subscript access (fail-soft when the object store is unbound).
+    # R13 — resolve the frozen bodies for subscript access from the AUTHORITATIVE event stream (§13): the
+    # bodies ride the event payload inline — draft_body on DRAFT_CONTRACT_PRODUCED / CONTRACT_REFINED,
+    # confirmed_body on CONTRACT_CONFIRMED (commands.py:708/:1949/:2100) — and `mcv._latest_body` returns
+    # the newest payload carrying each key. The EXECUTABLE confirmed body is gated on servability at the
+    # subscript seam (`__getitem__`), so a blocked run never hands one back.
     bodies = {
-        "draft": _load_document_body(conn, state.draft_doc_id) if state.draft_doc_id else None,
-        "confirmed": _load_document_body(conn, state.confirmed_doc_id) if state.confirmed_doc_id else None,
+        "draft": _latest_body(stream, "draft_body"),
+        "confirmed": _latest_body(stream, "confirmed_body"),
     }
 
     return ContractView(

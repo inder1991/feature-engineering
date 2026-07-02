@@ -78,6 +78,12 @@ def _emit_confirmed_doc(db, run_id="run_1", doc_id="doc_conf1"):
     return doc_id
 
 
+# The frozen bodies ride the event payload inline (draft_body on DRAFT_CONTRACT_PRODUCED,
+# confirmed_body on CONTRACT_CONFIRMED — commands.py:708/:1949); get_contract reads them off the stream.
+_DRAFT_BODY = {"feature_name": "declined_card_auth_count_90d", "status": "DRAFT", "open_fields": []}
+_CONFIRMED_BODY = {"feature_name": "declined_card_auth_count_90d", "status": "CONFIRMED"}
+
+
 def _seed_confirmed(db, run_id="run_1"):
     _open_run(db, run_id)
     append_feature_contract_event(db, run_id=run_id, type=ev.INTENT_SUBMITTED,
@@ -86,7 +92,8 @@ def _seed_confirmed(db, run_id="run_1"):
                              "raw_input_ref": "blob_raw1", "raw_input_classification": "clean"},
                     actor=_SERVICE, expected_version=0)
     append_feature_contract_event(db, run_id=run_id, type=ev.DRAFT_CONTRACT_PRODUCED,
-                    payload={"run_id": run_id, "draft_doc_id": "doc_draft1", "open_fields": []},
+                    payload={"run_id": run_id, "draft_doc_id": "doc_draft1", "open_fields": [],
+                             "draft_body": _DRAFT_BODY},
                     actor=_SERVICE)
     append_feature_contract_event(db, run_id=run_id, type=ev.MINIMUM_CONTRACT_VALIDATED,
                     payload={"run_id": run_id}, actor=_SERVICE)
@@ -94,7 +101,8 @@ def _seed_confirmed(db, run_id="run_1"):
     append_feature_contract_event(db, run_id=run_id, type=ev.CONTRACT_CONFIRMED,
                     payload={"run_id": run_id, "confirmed_doc_id": doc_id,
                              "feature_name": "declined_card_auth_count_90d",
-                             "requires_independent_validation": False, "selected_candidate": None},
+                             "requires_independent_validation": False, "selected_candidate": None,
+                             "confirmed_body": _CONFIRMED_BODY},
                     actor=_REQUESTER)
 
 
@@ -109,10 +117,11 @@ def test_get_contract_confirmed_is_servable(db):
     assert view.content_hash is not None
     assert view.terminal_outcome is None
     assert view.reason_if_unavailable is None  # the ONLY servable case
-    # R13 dual access: subscript body access alongside attribute access. The frozen body resolves in the
-    # P9 E2E (object store bound); here it is fail-soft to None. A non-body key still raises KeyError.
+    # R13 dual access: subscript body access alongside attribute access. The frozen bodies are read off
+    # the event stream (draft_body / confirmed_body inline). A non-body key still raises KeyError.
     assert view.run_id == "run_1"                                  # attribute access
-    assert view["confirmed"] is None or view["confirmed"]["feature_name"] == "declined_card_auth_count_90d"
+    assert view["confirmed"]["feature_name"] == "declined_card_auth_count_90d"  # REAL executable body
+    assert view["draft"]["feature_name"] == "declined_card_auth_count_90d"      # REAL draft body
     with pytest.raises(KeyError):
         view["nonsense"]
 
@@ -129,3 +138,24 @@ def test_get_contract_withdrawn_run_is_blocked(db):
     view = get_contract(db, "run_2")
     assert view.terminal_outcome == "RUN_WITHDRAWN"
     assert view.reason_if_unavailable == "run terminal: RUN_WITHDRAWN"
+
+
+def test_get_contract_confirmed_then_terminal_fails_closed(db):
+    """A CONFIRMED contract whose RUN later goes terminal (RUN_WITHDRAWN) is blocked: the fold is
+    no-regression-locked at CONFIRMED while terminal_outcome comes off the RUN aggregate, so
+    reason_if_unavailable is set AND the subscript seam must FAIL CLOSED — view["confirmed"] does NOT
+    hand back the executable body even though CONTRACT_CONFIRMED inlined confirmed_body on the stream.
+    (The non-executable draft body stays readable.) Guards "no servable confirmed contract → nothing
+    downstream"; this ASSERTION fails before the __getitem__ servability gate and passes after."""
+    _seed_confirmed(db)
+    append(db, aggregate="run", aggregate_id="run_1", type="RUN_WITHDRAWN",
+           payload={"run_id": "run_1", "reason": "requester withdrew after confirm"}, actor=_REQUESTER,
+           run_id="run_1")
+    view = get_contract(db, "run_1")
+    assert view.status == "CONFIRMED"                  # fold is no-regression-locked at CONFIRMED
+    assert view.terminal_outcome == "RUN_WITHDRAWN"
+    assert view.reason_if_unavailable == "run terminal: RUN_WITHDRAWN"
+    # FAIL-CLOSED: the executable confirmed body must NOT be servable once the run is terminal.
+    assert view["confirmed"] is None
+    # the non-executable draft body is still readable regardless of servability.
+    assert view["draft"]["feature_name"] == "declined_card_auth_count_90d"
