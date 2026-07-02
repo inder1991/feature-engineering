@@ -7,12 +7,18 @@ catalog, and clears the Phase-4 classifier override + the R10 catalog module-glo
 neither leaks. The seams are the R10 canonical module-globals owned by P3 (`current_llm_client`,
 `current_intent_redactor`) / P2 (`current_intake_catalog`); each seam fixture imports its module +
 double LAZILY so P1's own suite does not depend on the not-yet-built P2/P3/P6 modules."""
+import json
+
 import pytest
 
+from featuregen.aggregates._append import append, provenance_for
 from featuregen.aggregates.bootstrap import register_phase06_event_schemas
+from featuregen.contracts import NewDocument
 from featuregen.documents.registry import DocumentSchemaRegistry
+from featuregen.documents.store import append_document, compute_content_hash
 from featuregen.events.registry import event_registry
 from featuregen.identity.build import build_human_identity, build_service_identity
+from featuregen.idgen import mint_id
 from featuregen.intake.banking_catalog import IntakeClassification, IntakeOutcome
 from featuregen.intake.catalog import (  # R8/R10 seam (P2, catalog.py)
     _clear_intake_catalog,
@@ -30,6 +36,7 @@ from featuregen.intake.redaction import (  # R10 seam (P3, redaction.py)
     DefaultIntentRedactor,
     register_intent_redactor,
 )
+from featuregen.intake.store import append_feature_contract_event as append_fc_event  # R1 seam
 
 
 @pytest.fixture(autouse=True)
@@ -175,3 +182,124 @@ def agent():
     return build_service_identity(
         subject="service:intake-agent", role_claims=("intake-agent",), attestation="sig"
     )
+
+
+# ── Gate-#1 (Phase-7) test seams: identity constants + contract seed helpers (Task 7.1) ──────────
+# Author-self-confirms (§8.2): the eligible Gate-#1 confirmer is the authenticated HUMAN requester
+# (the request owner), never a service / the LLM / a second signer. REQUESTER is that owner.
+REQUESTER = build_human_identity(
+    subject="user:raj", role_claims=("data_scientist",), source_of_authority="oidc:raj"
+)
+OTHER_DS = build_human_identity(subject="user:mia", role_claims=("data_scientist",))
+INTAKE_SVC = build_service_identity(
+    subject="service:intake-agent", role_claims=("intake-agent",), attestation="sig"
+)
+
+
+def definition_draft(request_id="req_def", *, intake_mode="definition", risk_flags=()):
+    """A post-clarification Draft body (empty open_fields → MCV has passed)."""
+    return {
+        "request_id": request_id,
+        "intake_mode": intake_mode,
+        "raw_input_ref": "blob_raw_def",
+        "raw_input_classification": "clean",
+        "proposed_feature_name": "declined_card_auth_count_90d",
+        "feature_semantics": {
+            "entity": "customer",
+            "entity_grain": ["customer_id", "as_of_date"],
+            "observation_intent": {
+                "kind": "point_in_time",
+                "as_of_field": "as_of_date",
+                "rule": "use only data available strictly before as_of_date",
+            },
+            "calculation_method": "rolling_count",
+            "windows": [{"name": "lookback", "value": "90d"}],
+            "filters": [
+                {
+                    "concept": "declined card authorization",
+                    "predicate": "card_authorizations.auth_result = 'D'",
+                }
+            ],
+            "target_definition": "N/A (definition-mode feature, no target)",
+        },
+        "field_scores": {"entity": {"ambiguity": 0.05, "confidence": 0.97, "source": "llm"}},
+        "open_fields": [],
+        "assumption_ledger_ref": "doc_ledger_def",
+        "provenance": {"schema_version": 1, "catalog_version": "bdc-2026.06"},
+        "status": "NEEDS_CLARIFICATION",
+        "product": "cards",
+        "region": "US",
+        "risk_flags": list(risk_flags),
+    }
+
+
+def _freeze_draft_doc(db, *, run_id, request_id, body, branch_role="primary", supersedes=()):
+    doc_id = mint_id("doc")
+    body_bytes = json.dumps(body, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    append_document(
+        db,
+        NewDocument(
+            doc_id=doc_id,
+            stage="DRAFT_CONTRACT",
+            schema_version=1,
+            branch_role=branch_role,
+            content_hash=compute_content_hash(body_bytes),
+            body_classification="governance-retained",
+            provenance=provenance_for("DRAFT_CONTRACT"),
+            body_ref=None,
+            supersedes=tuple(supersedes),
+        ),
+        run_id=run_id,
+        request_id=request_id,
+        actor=REQUESTER,
+    )
+    return doc_id
+
+
+def seed_needs_clarification(db, *, run_id, request_id, draft_body):
+    """Seed a run whose contract folds to NEEDS_CLARIFICATION (Draft produced, MCV NOT run)."""
+    append(
+        db, aggregate="run", aggregate_id=run_id, type="RUN_CREATED",
+        payload={"run_id": run_id, "request_id": request_id}, actor=REQUESTER,
+        request_id=request_id, run_id=run_id, expected_version=0,
+    )
+    draft_doc_id = _freeze_draft_doc(db, run_id=run_id, request_id=request_id, body=draft_body)
+    append_fc_event(
+        db, run_id=run_id, type="INTENT_SUBMITTED",
+        payload={
+            "request_id": request_id,
+            "intake_mode": draft_body["intake_mode"],
+            "raw_input_ref": draft_body["raw_input_ref"],
+            "raw_input_classification": draft_body["raw_input_classification"],
+        },
+        actor=REQUESTER, expected_version=0,
+    )
+    append_fc_event(
+        db, run_id=run_id, type="DRAFT_CONTRACT_PRODUCED",
+        payload={
+            "draft_doc_id": draft_doc_id,
+            "assumption_ledger_ref": draft_body["assumption_ledger_ref"],
+            "draft_body": draft_body,
+        },
+        actor=INTAKE_SVC,
+    )
+    return draft_doc_id
+
+
+def seed_validated_contract(db, *, run_id, request_id, draft_body, candidate_docs=0):
+    """Seed a run whose contract folds to MINIMUM_CONTRACT_VALIDATED (ready for Gate #1).
+    Returns (final_draft_doc_id, [candidate_doc_ids])."""
+    draft_doc_id = seed_needs_clarification(
+        db, run_id=run_id, request_id=request_id, draft_body=draft_body
+    )
+    cand_ids = [
+        _freeze_draft_doc(
+            db, run_id=run_id, request_id=request_id, body=draft_body, branch_role="candidate"
+        )
+        for _ in range(candidate_docs)
+    ]
+    append_fc_event(
+        db, run_id=run_id, type="MINIMUM_CONTRACT_VALIDATED",
+        payload={"run_id": run_id}, actor=INTAKE_SVC,
+    )
+    return draft_doc_id, cand_ids

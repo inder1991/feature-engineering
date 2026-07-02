@@ -48,7 +48,11 @@ from featuregen.documents.registry import DocumentSchemaRegistry
 from featuregen.documents.store import append_document, compute_content_hash
 from featuregen.events import append_event
 from featuregen.events.store import load_stream
-from featuregen.gates.tasks import open_task, submit_human_signal
+from featuregen.gates.tasks import (
+    cancel_tasks_on_run_advance,
+    open_task,
+    submit_human_signal,
+)
 from featuregen.idgen import mint_id
 from featuregen.intake.banking_catalog import (
     IntakeClassification,
@@ -97,7 +101,11 @@ from featuregen.intake.scoring import score_fields  # P5 per-field scoring (Task
 # R3/R4: the ONE feature_contract fold + the ONE request-owner predicate are owned by P2 (intake.state);
 # refine / answer_clarification derive the request owner from state.requester (the INTENT_SUBMITTED
 # actor.subject) via actor_is_request_owner — never a payload key.
-from featuregen.intake.state import actor_is_request_owner, fold_feature_contract_state
+from featuregen.intake.state import (
+    FeatureContractStatus,
+    actor_is_request_owner,
+    fold_feature_contract_state,
+)
 from featuregen.intake.store import (  # R1 seam (P1, store.py)
     append_feature_contract_event as append_fc_event,
 )
@@ -1400,3 +1408,149 @@ def select_candidate_doc(conn: DbConn, cmd: Command) -> CommandResult:
 
 # Task 6.5 — extend the SP-2 command catalog with the document PRIMARY_SELECTED promotion.
 _SP2_CATALOG = _SP2_CATALOG + (("select_candidate_doc", select_candidate_doc),)
+
+
+# ═══ Phase 7 — Human Gate #1 (the AUDITED INTENT LOCK, §8.2/§8.6) ═════════════════════════════════
+# Gate #1 = author-self-confirms: the eligible confirmer is the authenticated HUMAN requester (the
+# request owner) — NEVER a service principal, the LLM, or a second signer (independent validation is
+# deferred to Gate #2 / SP-5). The dedicated confirm task opens ONLY after Minimum Contract Validation
+# passes (Task 5.4); it is the task `confirm_contract` (Task 7.2) completes.
+
+
+# ── shared Gate-#1 stream helpers (pure reads of the feature_contract stream) ─────────────────────
+def _request_id(stream) -> str | None:
+    """The request_id the feature_contract carries — read off INTENT_SUBMITTED (typed column first,
+    payload fallback; R2 keeps id fields off the payload)."""
+    for e in stream:
+        if e.type == INTENT_SUBMITTED:
+            return getattr(e, "request_id", None) or e.payload.get("request_id")
+    return None
+
+
+def _final_draft(stream) -> tuple[str | None, dict | None]:
+    """The (doc_id, body) of the latest Draft the contract carries — the initial
+    DRAFT_CONTRACT_PRODUCED or the most recent CONTRACT_REFINED supersession (§8.6)."""
+    doc_id: str | None = None
+    body: dict | None = None
+    for e in stream:
+        if e.type in (DRAFT_CONTRACT_PRODUCED, CONTRACT_REFINED):
+            doc_id = e.payload.get("draft_doc_id")
+            body = e.payload.get("draft_body")
+    return doc_id, body
+
+
+def _confirmer_is_requester_human(state, actor) -> bool:
+    """§8.2 guard: confirmer_is_requester_human = actor_is_request_owner ∧ actor_kind=='human'.
+    Composes the ONE R4 owner predicate (intake/state.py); SP-0 authz only admits the data_scientist
+    ROLE (never the specific subject), so SP-2 pins it. The owner subject is read from state.requester,
+    NOT a local re-derivation."""
+    return actor.actor_kind == "human" and actor_is_request_owner(state, actor)
+
+
+def _deny_audited(conn: DbConn, cmd: Command, aggregate_id: str, reason: str) -> CommandResult:
+    """A confirmer/authority denial happens INSIDE the handler (SP-0's coarse authorizer only audits
+    role/kind/scope), so route it to the tamper-evident security-audit stream (§8.2) — a spoofed
+    confirmer never leaves zero audit trace. Benign wrong-state / stale-OCC / prohibited-block denials
+    stay unaudited (plain CommandResult)."""
+    record_denial(conn, replace(cmd, aggregate_id=aggregate_id), reason)
+    return CommandResult(accepted=False, aggregate_id=aggregate_id, denied_reason=reason)
+
+
+def _freeze_contract_doc(
+    conn: DbConn,
+    *,
+    run_id: str,
+    request_id: str | None,
+    stage: str,
+    body: dict,
+    branch_role: str,
+    derived_from: tuple[str, ...],
+    supersedes: tuple[str, ...],
+    actor,
+) -> str:
+    """Freeze one write-once, content-hashed SP-2 contract document on the SP-0 DAG (§4.6). The body
+    itself rides the emitting FC event payload (replayable, non-PII — mirrors SP-1's confirmed value);
+    the document row is the DAG artifact (content-hash + lineage). governance-retained (§8.3)."""
+    doc_id = mint_id("doc")
+    body_bytes = json.dumps(body, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    append_document(
+        conn,
+        NewDocument(
+            doc_id=doc_id,
+            stage=stage,
+            schema_version=1,
+            branch_role=branch_role,
+            content_hash=compute_content_hash(body_bytes),
+            body_classification="governance-retained",
+            provenance=provenance_for(stage),
+            body_ref=None,
+            derived_from=tuple(derived_from),
+            supersedes=tuple(supersedes),
+        ),
+        run_id=run_id,
+        request_id=request_id,
+        actor=actor,
+    )
+    return doc_id
+
+
+# ── open_gate1_task (Task 7.1) ────────────────────────────────────────────────────────────────────
+def _open_gate1_task(conn: DbConn, run_id: str, *, actor) -> CommandResult:
+    """Open the SEPARATE, dedicated Gate-#1 confirmation task — ONLY after MCV passes (§8.6). Reused by
+    both the `open_gate1_task` command and `request_edit`'s gate re-open (Task 7.6). X4: this handler
+    folds the FC status for its guards but appends NO feature_contract event (it writes only human_tasks
+    rows via cancel_tasks_on_run_advance + open_task), so there is no FC-stream append to CAS on — the
+    shared X4 rule has nothing to attach to here and is a no-op."""
+    stream = load_stream(conn, "feature_contract", run_id)
+    if not stream:
+        return CommandResult(
+            accepted=False, aggregate_id=run_id or "", denied_reason="unknown feature_contract"
+        )
+    state = fold_feature_contract_state(stream)
+    if state.status is not FeatureContractStatus.MINIMUM_CONTRACT_VALIDATED:
+        status = state.status.value if state.status is not None else None
+        return CommandResult(
+            accepted=False,
+            aggregate_id=run_id,
+            denied_reason=f"Gate #1 requires MINIMUM_CONTRACT_VALIDATED (status={status})",
+        )
+    if state.open_fields:  # open_fields_empty (§6.7) — never open Gate #1 on an under-specified contract
+        return CommandResult(
+            accepted=False,
+            aggregate_id=run_id,
+            denied_reason=f"open_fields not empty: {tuple(state.open_fields)}",
+        )
+    owner = state.requester
+    if owner is None:
+        return CommandResult(
+            accepted=False, aggregate_id=run_id, denied_reason="no request owner recorded"
+        )
+    draft_doc_id, _ = _final_draft(stream)
+    # Defensive close: cancel any still-pending per-field clarification tasks so none can be answered
+    # behind the open gate (§8.6). After a passing MCV there should be none.
+    cancel_tasks_on_run_advance(
+        conn, run_id, reason="Gate #1 opened — pending clarification tasks cancelled"
+    )
+    open_task(
+        conn,
+        GateTaskSpec(
+            gate="CLARIFICATION",  # rides the existing CLARIFICATION gate — no new gate value (§8.6)
+            required_inputs=(draft_doc_id,) if draft_doc_id else (),
+            eligible_assignees={"role": "data_scientist", "subject": owner},
+            allowed_responses=("confirm", "edit", "reject"),
+            run_id=run_id,
+            delegation_allowed=False,  # the author-owned intent lock (§8.2)
+        ),
+        actor,
+    )
+    return CommandResult(accepted=True, aggregate_id=run_id)
+
+
+def open_gate1_task(conn: DbConn, cmd: Command) -> CommandResult:
+    """Open the dedicated post-MCV Human Gate #1 confirmation task (the audited intent lock, §8.6)."""
+    run_id = cmd.args.get("run_id") or cmd.aggregate_id
+    return _open_gate1_task(conn, run_id, actor=cmd.actor)
+
+
+# Task 7.1 — extend the SP-2 command catalog with the dedicated Gate-#1 opener.
+_SP2_CATALOG = _SP2_CATALOG + (("open_gate1_task", open_gate1_task),)
