@@ -6,6 +6,7 @@ from featuregen.identity.build import build_human_identity
 from featuregen.intake.commands import (
     RefineResult,
     _classify_raw_input,
+    _redact_answers,
     freeze_draft,
     open_clarification_task,
     refine_contract,
@@ -357,3 +358,68 @@ def test_renormalize_still_fails_closed_on_genuine_pii_for_contains_pii_origin(d
                         catalog=_View(), actor=agent)
     # fail-closed at the pre-scan → the LLM was never dispatched, nothing committed to the stream.
     assert "LLM_CALL_RECORDED" not in [e.type for e in load_feature_contract(db, run_id)]
+
+
+# ── N2: never trust a caller-supplied classification / re-classify clarification answers ───────────────
+def test_classify_raw_input_does_not_trust_caller_clean():
+    # N2 merge-blocker: a caller can label PII-bearing text `clean` — `_classify_raw_input` must RESCAN
+    # and override, never trust it. Before the fix it returned `provided` verbatim (→ `clean`), so the
+    # redactor was bypassed and PII could reach the LLM. This assertion FAILS before the fix, passes after.
+    pii = "declined-auth count; call +1-555-123-4567 or IBAN GB82WEST12345698765432"
+    assert _classify_raw_input(pii, "clean") == "contains_pii"        # rescanned + overridden, not trusted
+    assert _classify_raw_input("acct 12345678901 balance", "clean") == "contains_pii"
+    # a genuinely clean feature intent labelled clean is still honoured as clean (no false positive)
+    assert _classify_raw_input("90-day declined-auth count per customer", "clean") == "clean"
+    # contains_pii / unscanned only tighten → honoured verbatim (never loosened)
+    assert _classify_raw_input("anything", "unscanned") == "unscanned"
+    assert _classify_raw_input("90-day count", "contains_pii") == "contains_pii"
+
+
+def test_redact_answers_reclassifies_each_answer_at_its_own_ingress():
+    # N2: `_redact_answers` no longer inherits the intent's classification — it re-scans each answer.
+    out = _redact_answers(DefaultIntentRedactor(),
+                          {"filters": "declined auths for account 12345678901"})
+    assert "12345678901" not in out["filters"]
+    assert "[REDACTED:ACCOUNT]" in out["filters"]
+    # a clean answer passes through untouched — no over-redaction to "[REDACTED]"
+    clean = _redact_answers(DefaultIntentRedactor(), {"filters": "card_authorizations.auth_result = 'D'"})
+    assert clean["filters"] == "card_authorizations.auth_result = 'D'"
+
+
+def test_clarification_answer_with_pii_is_reredacted_not_inheriting_clean(db, sp2_schemas, agent):
+    # N2 part 3: a clarification answer on a CLEAN-origin run that carries a bank-account number must be
+    # RE-redacted at its own ingress — not inherit the intent's stale `clean` (which would pass the PII
+    # straight into the renormalize model-facing payload). Before the fix the un-redacted answer tripped
+    # the `_first_pii` pre-scan → EgressViolation crash on the PII-bearing round; after, it is scrubbed.
+    run_id, _ = _seed_draft(db, agent, raw_input_classification="clean")
+    append_fc_event(db, run_id=run_id, type="CLARIFICATION_ANSWERED",
+                    payload={"task_id": "task_x", "field": "filters",
+                             "answer": "declined auths for account 12345678901",
+                             "response": "confirm", "answered_by": "user:raj"}, actor=agent)
+    captured: dict = {}
+
+    class _Capture(ScriptedLLM):
+        def call(self, request):
+            captured[request.task] = request
+            return super().call(request)
+
+    client = _Capture({
+        "renormalize": {
+            "output": {"feature_semantics": _semantics("card_authorizations.auth_result = 'D'"),
+                       "open_fields": []},
+            "self_reported_scores": {
+                "entity": {"ambiguity": 0.05, "confidence": 0.97, "source": "llm"},
+                "entity_grain": {"ambiguity": 0.30, "confidence": 0.72, "source": "default"},
+                "windows": {"ambiguity": 0.05, "confidence": 0.98, "source": "llm"},
+                "filters": {"ambiguity": 0.10, "confidence": 0.92, "source": "llm"},
+            },
+        },
+        "contract_review": {"review_type": "CONTRACT_REVIEW", "status": "OK", "findings": []},
+    })
+    res = refine_contract(db, run_id, client=client, redactor=DefaultIntentRedactor(),
+                          catalog=_View(), actor=agent)
+    assert res.status == "validated", res
+    # the account number was scrubbed OUT of the dispatched renormalize answers (never inherited clean)
+    answers = str(captured["renormalize"].inputs["answers"])
+    assert "12345678901" not in answers
+    assert "[REDACTED:ACCOUNT]" in answers

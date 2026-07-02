@@ -523,19 +523,38 @@ def _fc_head(conn: DbConn, run_id: str) -> int:
     return stream[-1].stream_version if stream else 0
 
 
+def _scan_text_classification(text: str) -> str:
+    """Single source of truth for classifying ANY un-vetted free-text ingress → `contains_pii` |
+    `clean`. Scans with BOTH the SP-2 shared redaction pattern set (email/SSN/PAN/phone/IBAN/account/
+    DOB/address — via `_first_pii`) AND SP-0's inline-secret detector (`assert_no_inline_pii`). Used to
+    rescan a caller-supplied `clean` (never trusted, N2) and to re-classify each clarification answer
+    at its own ingress. Text we scanned is, by definition, not `unscanned`."""
+    if _first_pii(text) is not None:
+        return "contains_pii"
+    try:
+        assert_no_inline_pii({"intent": text})
+    except InlinePIIError:
+        return "contains_pii"
+    return "clean"
+
+
 def _classify_raw_input(text: str, provided: str | None) -> str:
     """Determine the SP-0 envelope `raw_input_classification`. Ingest may supply it; otherwise scan
-    with SP-0's inline-secret detector (`assert_no_inline_pii`) → clean | contains_pii. `unscanned`
-    is only ever caller-supplied (an intent no scanner touched)."""
+    (`_scan_text_classification`) → clean | contains_pii. `unscanned` is only ever caller-supplied
+    (an intent no scanner touched).
+
+    N2 (SP-2): a caller-supplied `clean` is NOT trusted — we rescan the raw text and, if a PII pattern
+    hits, override to `contains_pii` so redaction actually runs (or fails closed) instead of a
+    mislabelled `clean` bypassing the redactor. `contains_pii`/`unscanned` are honoured as-is (they
+    only tighten, never loosen)."""
     if provided is not None:
         if provided not in RAW_INPUT_CLASSIFICATIONS:
             raise IntakeError(f"invalid raw_input_classification: {provided!r}")
+        # Never trust a caller `clean`: a PII hit reclassifies so the redactor runs / fails closed.
+        if provided == "clean" and _scan_text_classification(text) == "contains_pii":
+            return "contains_pii"
         return provided
-    try:
-        assert_no_inline_pii({"intent": text})
-        return "clean"
-    except InlinePIIError:
-        return "contains_pii"
+    return _scan_text_classification(text)
 
 
 def _canonical(body: dict) -> bytes:
@@ -1212,12 +1231,18 @@ def _run_is_parked(conn: DbConn, run_id: str) -> bool:
     return parked
 
 
-def _redact_answers(redactor, answers, classification: str) -> dict:
+def _redact_answers(redactor, answers) -> dict:
     """Belt-and-suspenders: a clarification answer is human free text — redact it before it enters an
-    LLM renormalize request (§9.4). call_llm additionally egress-guards the whole request."""
+    LLM renormalize request (§9.4). call_llm additionally egress-guards the whole request.
+
+    N2 (SP-2): each answer is RE-classified at its OWN ingress (`_scan_text_classification`) — it does
+    NOT inherit the intent's original label. A PII-bearing answer is redacted even if the origin intent
+    was `clean` (the stale-clean bypass); a clean answer on a `contains_pii`-origin run is no longer
+    force-redacted to "[REDACTED]"."""
     out: dict[str, str] = {}
     for field, answer in answers.items():
-        red = redactor.redact(str(answer), classification)
+        text = str(answer)
+        red = redactor.redact(text, _scan_text_classification(text))
         out[field] = red.text if red.text is not None else "[REDACTED]"
     return out
 
@@ -1256,7 +1281,8 @@ def refine_contract(
     request_id = intent.request_id or intent.payload.get("request_id")
     mode = intent.payload["intake_mode"]
     classification = intent.payload.get("classification")   # the recorded R9 mapping (`.catalog_version`)
-    raw_class = intent.payload["raw_input_classification"]
+    # N2: clarification answers are RE-classified at their own ingress inside `_redact_answers` (they no
+    # longer inherit the intent's `raw_input_classification`), so the intent label is not read here.
     draft_doc_id = _current_draft_doc_id(stream)
     # Read the CURRENT draft/ledger body from the INLINED event stream (the same scan mcv._latest_body
     # uses) — the real producer (_produce_draft/submit_intent) inlines draft_body/assumption_ledger_body
@@ -1282,7 +1308,7 @@ def refine_contract(
             task="renormalize", prompt_id="renormalize", prompt_version=1,
             inputs={
                 "prior_semantics": draft_body["feature_semantics"],
-                "answers": _redact_answers(redactor, {f: answers[f] for f in unfolded}, raw_class),
+                "answers": _redact_answers(redactor, {f: answers[f] for f in unfolded}),
                 INPUT_KEY_CATALOG: dict(catalog.metadata()),
                 # The renormalize payload is composed ENTIRELY from ALREADY-REDACTED structured draft
                 # fields (prior_semantics from the frozen Draft, answers pre-redacted just above) — NOT

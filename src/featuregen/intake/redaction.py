@@ -23,14 +23,44 @@ INPUT_KEY_REDACTION = "input_redaction"
 
 REDACTION_VERSION = "default-redactor@1"
 
-# Deterministic PII detectors shared by the redactor and the egress backstop (Task 3.2). PHONE is
-# deliberately excluded (false positives on window/date literals like "90-day"); the set is
-# conservative-and-testable, not exhaustive. Placeholders are digit/at-free so a residual scan of
-# a redacted string never re-matches.
+# Deterministic PII detectors shared by the redactor AND the egress backstop (Task 3.2) — one source
+# of truth so widening the set hardens BOTH the redactor and `assert_llm_safe`'s egress guard. The
+# set is conservative-and-testable, not exhaustive: every pattern is bounded so legitimate feature
+# values (window literals "90d", counts, thresholds, a bare "90") never false-match — PHONE/DOB
+# require real separator/date shapes, ACCOUNT requires a 9+ digit run, ADDRESS requires a
+# number+street-suffix shape. Placeholders are digit/at-free so a residual scan of a redacted string
+# never re-matches. N2 (SP-2): phone / IBAN / generic bank-account / DOB / postal-address added.
+#
+# DEFERRED (not built here): NER-grade personal-NAME detection ("Jane Doe"). Regex cannot do it
+# safely; the drop-in seam is the `IntentRedactor` Protocol below — register a NER-backed redactor
+# via register_intent_redactor(...) to layer it in without touching this deterministic set.
 _PII_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("EMAIL", re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")),
     ("SSN", re.compile(r"\b\d{3}-\d{2}-\d{4}\b")),
     ("PAN", re.compile(r"\b\d{4}[ \-]?\d{4}[ \-]?\d{4}[ \-]?\d{1,4}\b")),
+    # IBAN: 2-letter country + 2 check digits + 11-30 alnum (BBAN). Distinctive; ordered before
+    # ACCOUNT/PHONE so its embedded digit run is labelled IBAN, not a bare account.
+    ("IBAN", re.compile(r"\b[A-Z]{2}\d{2}[A-Z0-9]{11,30}\b")),
+    # PHONE: NANP-style NNN·NNN·NNNN with REAL separators (never bare digits → no "90-day" match),
+    # or a `+`-prefixed international run (the leading + keeps it off unprefixed feature numbers).
+    ("PHONE", re.compile(
+        r"(?<![\w.])(?:\+\d{1,3}[\s.\-]?)?\(?\d{3}\)?[\s.\-]\d{3}[\s.\-]\d{4}(?![\d.])"
+        r"|(?<![\w.])\+\d{1,3}(?:[\s.\-]\d{2,5}){2,5}(?![\d.])"
+    )),
+    # ACCOUNT: a bare 9-17 digit run (routing/account numbers). Min 9 clears windows/counts/
+    # thresholds and 8-digit compact dates; lookarounds bar decimal- and digit-adjacent partials.
+    ("ACCOUNT", re.compile(r"(?<![\w.])\d{9,17}(?![\d.])")),
+    # DOB: a D/M/Y (or ISO Y/M/D) date with two real separators — a bare "90" or "1.5" cannot form it.
+    ("DOB", re.compile(
+        r"(?<![\w.])(?:\d{1,2}[/.\-]\d{1,2}[/.\-]\d{2,4}|\d{4}[/.\-]\d{1,2}[/.\-]\d{1,2})(?![\d.])"
+    )),
+    # ADDRESS: house-number + optional capitalised name(s) + a street-type suffix, or a P.O. Box.
+    # The leading number + capitalised suffix keeps it off prose like "30 Day window".
+    ("ADDRESS", re.compile(
+        r"\b\d{1,6}\s+(?:[A-Z][A-Za-z0-9.'\-]*\s+){0,4}"
+        r"(?:Street|St|Avenue|Ave|Boulevard|Blvd|Road|Rd|Lane|Ln|Drive|Dr|Court|Ct|Terrace|Ter|Place|Pl)\b\.?"
+        r"|P\.?\s?O\.?\s?Box\s+\d{1,7}\b"
+    )),
 )
 
 

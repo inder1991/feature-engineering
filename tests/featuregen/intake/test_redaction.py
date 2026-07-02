@@ -11,6 +11,7 @@ from featuregen.intake.redaction import (
     DefaultIntentRedactor,
     EgressViolation,
     RedactionResult,
+    _scan,
     assert_llm_safe,
     build_llm_inputs,
 )
@@ -40,6 +41,43 @@ def test_contains_pii_scrubs_located_spans():
     kinds = {s["type"] for s in r.redacted_spans}
     assert kinds == {"EMAIL", "SSN"}
     assert all("start" in s and "end" in s and "value" not in s for s in r.redacted_spans)
+
+
+# ── N2: wider deterministic PII set (phone / IBAN / bank-account / DOB / postal-address) ───────────────
+@pytest.mark.parametrize("raw,label", [
+    ("+1-555-123-4567", "PHONE"),
+    ("(555) 123-4567", "PHONE"),
+    ("+44 20 7946 0958", "PHONE"),
+    ("GB82WEST12345698765432", "IBAN"),
+    ("12345678901", "ACCOUNT"),          # a bare 11-digit account run (PAN needs >=13, so this is ACCOUNT)
+    ("1990-01-02", "DOB"),
+    ("01/02/1990", "DOB"),
+    ("123 Main St", "ADDRESS"),
+    ("P.O. Box 12345", "ADDRESS"),
+])
+def test_default_redactor_scrubs_each_new_pii_class(raw, label):
+    # N2: each new class is located, scrubbed, and TYPE-recorded — and the placeholder is digit/at-free
+    # so the residual defense-in-depth re-scan stays clean (the redactor emits text, never fails closed).
+    r = DefaultIntentRedactor().redact(f"declined-auth count; contact {raw} for details", "contains_pii")
+    assert r.disposition == "ok" and r.text is not None
+    assert raw not in r.text
+    assert f"[REDACTED:{label}]" in r.text
+    assert label in {s["type"] for s in r.redacted_spans}
+
+
+@pytest.mark.parametrize("value", [
+    "90-day rolling count of declined card authorizations per customer",
+    "90d",
+    "window 90",
+    "top 100 customers over a 365 day lookback",
+    "threshold 0.75 and ratio 1.5",
+    "count 5 transactions; 1000000 rows",
+    "declined_card_auth_count_90d",
+    "card_authorizations.auth_result = 'D'",
+])
+def test_pii_patterns_do_not_false_match_feature_values(value):
+    # N2: the wider set must never fire on legitimate feature literals (windows/counts/thresholds/a bare 90).
+    assert _scan(value) == []
 
 
 def test_unscanned_fails_closed_no_text():
@@ -147,3 +185,22 @@ def test_egress_refuses_unredacted_pii_in_content():
     i[INPUT_KEY_INTENT] = "count logins for jane.doe@bank.example"  # slipped past redaction
     with pytest.raises(EgressViolation):
         assert_llm_safe(_Req(i))
+
+
+@pytest.mark.parametrize("raw", [
+    "+1-555-123-4567", "GB82WEST12345698765432", "12345678901", "1990-01-02", "123 Main St",
+])
+def test_egress_backstop_refuses_new_pii_classes(raw):
+    # N2: the wider shared set also hardens the egress backstop — un-redacted phone/IBAN/account/DOB/
+    # address in the model-facing INTENT is a HARD refuse, not just the redactor's concern.
+    i = _safe_inputs()
+    i[INPUT_KEY_INTENT] = f"count declined auths for {raw}"
+    with pytest.raises(EgressViolation):
+        assert_llm_safe(_Req(i))
+
+
+def test_egress_backstop_allows_feature_value_numbers():
+    # N2 companion: numeric feature literals (windows/counts/thresholds) are NOT PII and pass egress.
+    i = _safe_inputs()
+    i[INPUT_KEY_INTENT] = "90-day rolling count over a 365 day lookback for the top 100 customers"
+    assert_llm_safe(_Req(i))  # no raise
