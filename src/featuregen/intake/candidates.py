@@ -11,6 +11,7 @@ from featuregen.contracts.documents import NewDocument, Stage
 from featuregen.documents.draft import DRAFT_CONTRACT_SCHEMA_VERSION
 from featuregen.documents.store import append_document, compute_content_hash
 from featuregen.idgen import mint_id
+from featuregen.intake.blobs import write_blob
 from featuregen.intake.llm import (
     LLMClient,
     LLMRequest,
@@ -422,13 +423,16 @@ _CANDIDATE_STAGE = Stage.DRAFT_CONTRACT.value
 
 
 def _persist_contract_body(conn: DbConn, *, body: dict) -> tuple[str, str]:
-    """Freeze a governance-retained contract body BY REFERENCE (§3.4, §4.3): canonical-JSON
-    content-hash + a live `blob_index` row. The document row stores `body_ref` + `content_hash`
-    only (opaque-by-reference) — the body itself lives in the object store keyed by `body_ref`.
+    """Freeze a governance-retained contract body BY REFERENCE (§3.4, §4.3): write the body itself to
+    the write-once blob store keyed by the minted `body_ref`, plus a canonical-JSON content-hash + a
+    live `blob_index` row. The document row stores `body_ref` + `content_hash` only (opaque-by-
+    reference) — but the body is now durably resolvable via `read_blob(body_ref)`, which candidate
+    bodies (NOT event-inlined) require for binding the chosen candidate + audit/replay (fix F1, P1-b).
     Governance-retained bodies are needed for MRM reproduction / adverse-action explainability."""
     raw = json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
     content_hash = compute_content_hash(raw)
     body_ref = mint_id("blob")
+    write_blob(conn, body_ref, body)  # durable body: read_blob(body_ref) round-trips the exact body
     conn.execute(
         "INSERT INTO blob_index "
         "  (blob_id, object_key, content_hash, classification, referenced, status, size_bytes) "

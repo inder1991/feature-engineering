@@ -65,6 +65,7 @@ from featuregen.intake.banking_catalog import (
     IntakeOutcome,
     classify_intent,
 )
+from featuregen.intake.blobs import write_blob  # F1 write-once blob store (P1-b/P2-c)
 from featuregen.intake.candidates import (  # R10 hypothesis seam (P6, candidates.py)
     generate_candidates_for_run,
 )
@@ -553,10 +554,14 @@ def _emit_document(
     supersedes: tuple[str, ...] = (),
 ) -> str:
     """Emit one frozen, content-hashed governance-retained document on the run's DAG (§3.4). The body
-    itself rides the DRAFT_CONTRACT_PRODUCED event for replay; the document carries the content hash
-    for lineage/integrity (the body_ref points at the encrypted blob — never inlined here). A revised
-    Draft `supersedes` the prior one (§3.4) so the full refinement history is retained on the DAG."""
+    itself rides the DRAFT_CONTRACT_PRODUCED event for replay AND is written to the write-once blob
+    store keyed by `body_ref`, so the document's `body_ref` is durably resolvable via read_blob (F1) —
+    the body is no longer a minted-but-unwritten ref. The document carries the content hash for
+    lineage/integrity (the body is never inlined on the document row). A revised Draft `supersedes`
+    the prior one (§3.4) so the full refinement history is retained on the DAG."""
     doc_id = mint_id("doc")
+    body_ref = mint_id("blob")
+    write_blob(conn, body_ref, body)  # durable body: read_blob(body_ref) round-trips the exact body
     append_document(
         conn,
         NewDocument(
@@ -567,7 +572,7 @@ def _emit_document(
             content_hash=compute_content_hash(_canonical(body)),
             body_classification="governance-retained",
             provenance=provenance_for(stage),
-            body_ref=mint_id("blob"),
+            body_ref=body_ref,
             derived_from=derived_from,
             supersedes=supersedes,
         ),
@@ -868,10 +873,14 @@ def submit_intent(conn: DbConn, cmd: Command) -> CommandResult:
         return run
     run_id = run.aggregate_id
 
-    # 2. Envelope classification + hold the raw intent by reference only (§9.4). The raw text stays
-    #    in-memory for the redactor; it is NEVER inlined into an event or document.
+    # 2. Envelope classification + hold the raw intent by reference only (§9.4). The raw text is
+    #    written to the write-once blob store keyed by `raw_input_ref` — this is the audit-of-record
+    #    for raw-intent replay + the confirm-time raw re-screen (F1, P2-c). It is held BY REFERENCE
+    #    ONLY: it is NEVER inlined into an event or document, and NEVER sent to the LLM (the redactor
+    #    produces the LLM-safe text separately).
     raw_input_classification = _classify_raw_input(intent_text, args.get("raw_input_classification"))
     raw_input_ref = mint_id("blob")
+    write_blob(conn, raw_input_ref, {"raw_input": intent_text})  # resolvable via read_blob(raw_input_ref)
 
     # 3. Deterministic banking-boundary classification (§5.4, over the read-only BankingDomainCatalog)
     #    runs BEFORE INTENT_SUBMITTED so the event can persist classification.as_mapping() (R9). An
