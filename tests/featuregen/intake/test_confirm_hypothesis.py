@@ -72,3 +72,58 @@ def test_hypothesis_confirm_promotes_candidate_and_records_rejected(db):
     assert body["intake_mode"] == "hypothesis"
     assert fold_feature_contract_state(load_stream(db, "feature_contract", "run_hyp1")).status \
         is FeatureContractStatus.CONFIRMED
+
+
+def _assert_denied_no_writes(db, run_id, res, reason_substr):
+    """A candidate-guard denial: fail-closed, decided BEFORE the task OCC + promotion — so NO
+    PRIMARY_SELECTED, NO CONTRACT_CONFIRMED, and the contract status is UNCHANGED (still MCV-validated)."""
+    assert res.accepted is False
+    assert reason_substr in res.denied_reason.lower()
+    assert db.execute(
+        "SELECT count(*) FROM events WHERE aggregate='run' AND aggregate_id=%s AND type='PRIMARY_SELECTED'",
+        (run_id,),
+    ).fetchone()[0] == 0
+    stream = load_stream(db, "feature_contract", run_id)
+    assert not any(e.type == "CONTRACT_CONFIRMED" for e in stream)
+    assert fold_feature_contract_state(stream).status is FeatureContractStatus.MINIMUM_CONTRACT_VALIDATED
+
+
+def test_hypothesis_confirm_foreign_candidate_is_denied(db):
+    """Integrity (§7.1): a REAL candidate doc frozen under ANOTHER run may NOT be promoted here. The
+    guard is scoped by (doc_id, run_id, DRAFT_CONTRACT), so run B's candidate is `unknown` for run A →
+    fail-closed AUDITED deny, no promotion, no CONFIRMED, status unchanged (mirrors select_candidate_doc's
+    cross-run test)."""
+    task_id, tv, _ = _ready(db, "run_hypF")
+    _tb, _vb, foreign_cands = _ready(db, "run_hypF_other")  # real candidates — but under a DIFFERENT run
+    res = confirm_contract(db, _cmd("run_hypF", task_id, tv, candidate_doc_id=foreign_cands[0]))
+    _assert_denied_no_writes(db, "run_hypF", res, "unknown")
+    # the spoofed-candidate confirm is recorded on the tamper-evident security-audit stream (§8.2)
+    with db.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            "SELECT count(*) AS n FROM security_audit "
+            "WHERE attempted_action='confirm_contract' AND decision='denied' AND aggregate_id=%s",
+            ("run_hypF",),
+        )
+        assert cur.fetchone()["n"] == 1
+
+
+def test_hypothesis_confirm_unknown_candidate_is_denied(db):
+    """A nonexistent candidate_doc_id → fail-closed AUDITED deny (no promotion / no CONFIRMED)."""
+    task_id, tv, _ = _ready(db, "run_hypU")
+    res = confirm_contract(db, _cmd("run_hypU", task_id, tv, candidate_doc_id="doc_does_not_exist"))
+    _assert_denied_no_writes(db, "run_hypU", res, "unknown")
+
+
+def test_hypothesis_confirm_non_candidate_doc_is_denied(db):
+    """A REAL doc of THIS run but branch_role!='candidate' (the primary Draft) → fail-closed AUDITED deny
+    (no promotion / no CONFIRMED). Mirrors select_candidate_doc's non-candidate guard."""
+    task_id, tv, _ = _ready(db, "run_hypN")
+    with db.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            "SELECT doc_id FROM documents "
+            "WHERE run_id=%s AND stage='DRAFT_CONTRACT' AND branch_role='primary'",
+            ("run_hypN",),
+        )
+        primary_doc = cur.fetchone()["doc_id"]
+    res = confirm_contract(db, _cmd("run_hypN", task_id, tv, candidate_doc_id=primary_doc))
+    _assert_denied_no_writes(db, "run_hypN", res, "not a candidate")

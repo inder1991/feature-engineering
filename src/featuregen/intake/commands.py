@@ -1314,14 +1314,68 @@ _SP2_CATALOG = _SP2_CATALOG + (("answer_clarification", answer_clarification),)
 
 
 # ═══ Task 6.5 — select_candidate_doc (document PRIMARY_SELECTED promotion, owner+human guarded) ═══════
+# ── shared candidate guard + PRIMARY_SELECTED promotion (Task 6.5 owns these; confirm_contract's
+#    hypothesis-mode calculation_method_chosen, Task 7.5, reuses the SAME two helpers) ────────────────
+def _candidate_doc_guard(
+    conn: DbConn, run_id: str, candidate_doc_id: str, stage: str = "DRAFT_CONTRACT"
+) -> str | None:
+    """The existence + branch_role guard: the chosen doc MUST exist under (run_id, stage) AND carry
+    branch_role='candidate'. Returns a fail-closed denial REASON for a foreign / unknown / non-candidate
+    id, else None. A PURE READ (no append) so callers can decide BEFORE any promotion — and, in
+    confirm_contract, BEFORE the Gate #1 task OCC — so a bogus id promotes nothing and mutates no state."""
+    row = conn.execute(
+        "SELECT branch_role FROM documents WHERE doc_id=%s AND run_id=%s AND stage=%s",
+        (candidate_doc_id, run_id, stage),
+    ).fetchone()
+    if row is None:
+        return f"unknown candidate doc {candidate_doc_id} for (run={run_id}, stage={stage})"
+    if row[0] != "candidate":
+        return f"doc {candidate_doc_id} is branch_role={row[0]!r}, not a candidate"
+    return None
+
+
+def _promote_candidate(
+    conn: DbConn, run_id: str, candidate_doc_id: str, actor, stage: str = "DRAFT_CONTRACT"
+) -> tuple[str | None, object | None]:
+    """calculation_method_chosen (hypothesis mode) — the document PRIMARY_SELECTED promotion of the
+    chosen candidate on the RUN aggregate (§7.1). NOT the request-level select_candidate; records ONLY
+    the chosen doc (the losers stay untouched candidate-role docs). Callers MUST pre-validate via
+    `_candidate_doc_guard`. Returns (None, appended) on success, or ("stale", None) when a concurrent
+    run-aggregate write advanced the run head between the guard read and this append (ConcurrencyError —
+    execute_command does NOT catch it, so this helper does; mirrors submit_intent / refine_contract /
+    answer_clarification).
+
+    X4 / SP-0 carve-out: PRIMARY_SELECTED rides the RUN aggregate under the run stream's OWN OCC head
+    (current_version(conn,"run",run_id)) — NOT the feature_contract folded head (no FC transition here)."""
+    event = new_primary_selected(
+        run_id=run_id,
+        stage=stage,
+        doc_id=candidate_doc_id,
+        actor=actor,
+        provenance=provenance_for(artifact_type=stage),
+    )
+    try:
+        appended = append_event(
+            conn,
+            event,
+            expected_version=current_version(conn, "run", run_id),
+            table_version=table_version_for(conn, "run", run_id),
+        )
+    except ConcurrencyError:
+        return ("stale", None)
+    return (None, appended)
+
+
 def select_candidate_doc(conn: DbConn, cmd: Command) -> CommandResult:
     """Hypothesis-mode candidate selection (§7.1): a document-level `PRIMARY_SELECTED` promotion of
     the chosen candidate doc on the RUN aggregate (`new_primary_selected`) — records ONLY the chosen
     doc; the losing candidate docs are write-once and LEFT UNTOUCHED (no per-doc reject event; their
     `doc_id`s live only in the Gate #1 confirmation record, §8.3). This is NOT the request-level
     `select_candidate` command (which promotes *run* candidates on a *request* stream — the wrong
-    granularity; SP-2's candidates are documents under a single run). Owner + human guarded; invoked
-    by `confirm_contract` in hypothesis mode (P7). OCC on the run stream serializes concurrent
+    granularity; SP-2's candidates are documents under a single run). Owner + human guarded. Shares its
+    existence+branch_role guard and PRIMARY_SELECTED promotion (`_candidate_doc_guard` /
+    `_promote_candidate`) with `confirm_contract`'s hypothesis-mode calculation_method_chosen (Task 7.5);
+    confirm calls those helpers directly — NOT this handler. OCC on the run stream serializes concurrent
     selects. X4: the `feature_contract` fold here is OWNER-GUARD-ONLY — this handler appends NO
     `feature_contract` transition, so there is no FC folded head to CAS on; the `PRIMARY_SELECTED`
     append rides the RUN aggregate under the run stream's own OCC (per SP-0). Do NOT pass the
@@ -1358,48 +1412,20 @@ def select_candidate_doc(conn: DbConn, cmd: Command) -> CommandResult:
             denied_reason="actor is not the request owner (owner-guard, §8.2)",
         )
 
-    row = conn.execute(
-        "SELECT branch_role FROM documents WHERE doc_id=%s AND run_id=%s AND stage=%s",
-        (candidate_doc_id, run_id, stage),
-    ).fetchone()
-    if row is None:
-        return CommandResult(
-            accepted=False,
-            aggregate_id=run_id,
-            denied_reason=f"unknown candidate doc {candidate_doc_id} for (run={run_id}, stage={stage})",
-        )
-    if row[0] != "candidate":
-        return CommandResult(
-            accepted=False,
-            aggregate_id=run_id,
-            denied_reason=f"doc {candidate_doc_id} is branch_role={row[0]!r}, not a candidate",
-        )
+    # Existence + branch_role guard (shared with confirm_contract's hypothesis promotion). A wrong
+    # doc_id here is a benign owner client error (the owner+human guards above already passed), so it
+    # stays a PLAIN unaudited denial — not the security-stream `record_denial` the non-owner/non-human
+    # arms use. Decide BEFORE the promotion append (execute_command does NOT roll back accepted=False).
+    guard_reason = _candidate_doc_guard(conn, run_id, candidate_doc_id, stage)
+    if guard_reason is not None:
+        return CommandResult(accepted=False, aggregate_id=run_id, denied_reason=guard_reason)
 
     # X4 / SP-0 carve-out: PRIMARY_SELECTED is a document promotion on the RUN aggregate — its OCC is
-    # the run stream's own head (`current_version(conn,"run",run_id)`), NOT the feature_contract folded
-    # head. This handler appends no feature_contract transition, so there is no FC head to CAS on
-    # (X4's folded-head expected_version rule is n/a here; the fold above is owner-guard-only).
-    event = new_primary_selected(
-        run_id=run_id,
-        stage=stage,
-        doc_id=candidate_doc_id,
-        actor=cmd.actor,
-        provenance=provenance_for(artifact_type=stage),
-    )
-    # The RUN-aggregate promotion is CAS-guarded on the run stream's own OCC head; a concurrent
-    # run-aggregate write between the read and the append raises ConcurrencyError. Deny `stale`
-    # (execute_command does NOT catch it → an uncaught raise would leak the idempotency claim),
-    # matching every other appending handler in this file (submit_intent / refine_contract /
-    # answer_clarification).
-    try:
-        appended = append_event(
-            conn,
-            event,
-            expected_version=current_version(conn, "run", run_id),
-            table_version=table_version_for(conn, "run", run_id),
-        )
-    except ConcurrencyError:
-        return CommandResult(accepted=False, aggregate_id=run_id, denied_reason="stale")
+    # the run stream's own head, NOT the feature_contract folded head (this handler appends no FC
+    # transition; the fold above is owner-guard-only). A concurrent run-aggregate write → deny `stale`.
+    promote_reason, appended = _promote_candidate(conn, run_id, candidate_doc_id, cmd.actor, stage)
+    if promote_reason is not None:
+        return CommandResult(accepted=False, aggregate_id=run_id, denied_reason=promote_reason)
     return CommandResult(
         accepted=True, aggregate_id=run_id, produced_event_ids=(appended.event_id,)
     )
@@ -1612,25 +1638,6 @@ def _sibling_candidates(conn: DbConn, run_id: str, selected_doc_id: str) -> list
     return [r[0] for r in rows]
 
 
-def _promote_candidate(conn: DbConn, run_id: str, candidate_doc_id: str, actor) -> None:
-    """calculation_method_chosen (hypothesis mode) — the document PRIMARY_SELECTED promotion of the
-    chosen candidate on the RUN aggregate (§7.1). NOT the request-level select_candidate. The
-    promotion records ONLY the chosen doc; the losers stay untouched candidate-role docs."""
-    ne = new_primary_selected(
-        run_id=run_id,
-        stage="DRAFT_CONTRACT",
-        doc_id=candidate_doc_id,
-        actor=actor,
-        provenance=provenance_for("DRAFT_CONTRACT"),
-    )
-    append_event(
-        conn,
-        ne,
-        expected_version=current_version(conn, "run", run_id),
-        table_version=table_version_for(conn, "run", run_id),
-    )
-
-
 def confirm_contract(conn: DbConn, cmd: Command) -> CommandResult:
     """Human Gate #1 — the author-self-confirm happy path (§8.2/§8.5/§8.6). The request owner (the
     authenticated HUMAN requester) confirms an MCV-passed Draft: fold → no-regression + MCV guards →
@@ -1687,11 +1694,20 @@ def confirm_contract(conn: DbConn, cmd: Command) -> CommandResult:
     # [Task 7.5 INSERT: hypothesis calculation_method_chosen guard]
     # Fail-closed (§7.1): a hypothesis contract cannot be confirmed with no chosen calculation method —
     # confirmation binds the human-SELECTED candidate (promoted to PRIMARY). No selection → DENY.
-    if intake_mode == "hypothesis" and not candidate_doc_id:
-        return CommandResult(
-            accepted=False, aggregate_id=run_id,
-            denied_reason="hypothesis mode requires a selected candidate_doc_id (calculation_method_chosen)",
-        )
+    if intake_mode == "hypothesis":
+        if not candidate_doc_id:
+            return CommandResult(
+                accepted=False, aggregate_id=run_id,
+                denied_reason="hypothesis mode requires a selected candidate_doc_id (calculation_method_chosen)",
+            )
+        # Integrity guard (§7.1): the human-selected candidate MUST be a real candidate doc of THIS run —
+        # it must exist under (run_id, DRAFT_CONTRACT) AND carry branch_role='candidate' (the SAME guard
+        # select_candidate_doc enforces). A foreign / unknown / non-candidate id (owner typo or client
+        # bug) is a fail-closed AUDITED deny, decided BEFORE the task OCC + promotion below — so a bogus
+        # id never promotes to PRIMARY nor lands an internally-inconsistent confirmation record.
+        guard_reason = _candidate_doc_guard(conn, run_id, candidate_doc_id)
+        if guard_reason is not None:
+            return _deny_audited(conn, cmd, run_id, guard_reason)
 
     # ── task-version OCC (consume the Gate #1 task) ── a confirm against a stale/superseded Gate #1
     # task is NOT counted (§8.6, §12); the client must re-fetch the current task_version.
@@ -1717,7 +1733,11 @@ def confirm_contract(conn: DbConn, cmd: Command) -> CommandResult:
     # (§8.3). chosen_method stays None so R7 reshapes the promoted candidate's calculation_method from
     # its Draft semantics (the selected candidate is the effective final Draft).
     if intake_mode == "hypothesis":
-        _promote_candidate(conn, run_id, candidate_doc_id, cmd.actor)
+        # candidate_doc_id was already existence+branch_role validated above (pre-OCC); promote it to
+        # PRIMARY on the RUN aggregate. A concurrent run-aggregate write since that guard read → stale.
+        promote_reason, _ = _promote_candidate(conn, run_id, candidate_doc_id, cmd.actor)
+        if promote_reason is not None:
+            return CommandResult(accepted=False, aggregate_id=run_id, denied_reason=promote_reason)
         selected_candidate = candidate_doc_id
         rejected_candidates = _sibling_candidates(conn, run_id, candidate_doc_id)
 
