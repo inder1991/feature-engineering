@@ -26,7 +26,12 @@ from featuregen.aggregates.request_aggregate import (
     create_request_command,
     create_run_command,
 )
-from featuregen.aggregates.run_lifecycle import park_command, reject_command, run_is_terminal
+from featuregen.aggregates.run_lifecycle import (
+    park_command,
+    reject_command,
+    run_is_terminal,
+    withdraw_command,
+)
 from featuregen.commands.registry import get_command, register_command
 from featuregen.contracts import (
     Command,
@@ -171,6 +176,9 @@ __all__ = [
     # Task 8.3 — the standalone post-intake platform/service terminal reject (X5; wired into
     # _SP2_CATALOG in Task 8.7, not here).
     "reject_intent",
+    # Task 8.4 — the requester's own abandonment reusing SP-0 `withdraw` (RUN_WITHDRAWN; wired into
+    # _SP2_CATALOG in Task 8.7, not here).
+    "withdraw_intent",
 ]
 
 
@@ -283,6 +291,49 @@ def reject_intent(conn: DbConn, cmd: Command) -> CommandResult:
         accepted=True, aggregate_id=run_id,
         produced_event_ids=(rejected.event_id, *run_res.produced_event_ids),
     )
+
+
+# ── Task 8.4 — withdraw_intent: the requester's OWN abandonment reuses SP-0 `withdraw` (§11, §13) ────
+def withdraw_intent(conn: DbConn, cmd: Command) -> CommandResult:
+    """Requester-initiated abandonment (§11, §13, Decision D13). Reuses SP-0's data-scientist-owned
+    `withdraw` (→ RUN_WITHDRAWN) behind SP-2's request-owner guard — NOT the validator-only `reject`.
+    Human + data_scientist + request-owner only; appends NO feature_contract event (withdrawal is a
+    run-level terminal). Adds no authz row: it delegates to SP-0's existing `withdraw` capability.
+    X4: it folds FC state to decide, so it refolds immediately before the delegated run append and
+    denies `stale` if the FC head advanced concurrently."""
+    args = cmd.args
+    run_id = args["run_id"]
+    if cmd.actor.actor_kind != "human":
+        return _deny_audited(conn, cmd, run_id, "withdraw requires a human requester")
+    if "data_scientist" not in cmd.actor.role_claims:
+        return _deny_audited(conn, cmd, run_id, "withdraw requires the data_scientist role")
+    stream = load_feature_contract(conn, run_id)
+    if not stream:
+        return CommandResult(accepted=False, aggregate_id=run_id,
+                             denied_reason="no feature contract for this run")
+    state = fold_feature_contract_state(stream)
+    head_version = stream[-1].stream_version    # X4 — the folded head, captured at gate time
+    if state.is_terminal:                       # P2 FeatureContractState property (R3)
+        return CommandResult(accepted=False, aggregate_id=run_id,
+                             denied_reason=f"contract already terminal (status={state.status.value})")
+    if not actor_is_request_owner(state, cmd.actor):
+        return _deny_audited(conn, cmd, run_id,
+                             "actor is not the request owner; withdrawal is requester-initiated")
+    # X4/C2 refold-before-append: `withdraw_intent` emits no feature_contract event, so there is no FC
+    # append to CAS. Instead confirm the FC head has NOT advanced since the owner/terminal gate — a
+    # concurrent transition (e.g. CONTRACT_CONFIRMED) must not let a stale fold withdraw the run.
+    if load_feature_contract(conn, run_id)[-1].stream_version != head_version:
+        return CommandResult(accepted=False, aggregate_id=run_id,
+                             denied_reason="stale: contract advanced concurrently")
+    run_cmd = replace(
+        cmd, aggregate="run", aggregate_id=run_id,
+        args={"reason": args.get("reason", "requester withdrew intent")},
+    )
+    try:
+        return withdraw_command(conn, run_cmd)   # SP-0's own run-stream OCC; a lost race → stale
+    except ConcurrencyError:
+        return CommandResult(accepted=False, aggregate_id=run_id,
+                             denied_reason="stale: run advanced concurrently")
 
 
 # ── Phase-4-local classifier override (NOT a shared seam) ─────────────────────────────────────
