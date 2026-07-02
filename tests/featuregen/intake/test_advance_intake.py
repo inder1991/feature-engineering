@@ -280,6 +280,14 @@ def test_mcv_failed_opens_manual_review_and_parks(db):
     assert res.accepted, res.denied_reason  # not a stranding denial
     tasks = _open_tasks(db, "run_f")
     assert len(tasks) == 1  # a manual review CLARIFICATION task was opened
+    # N4: the mcv_failed park threads state.request_id, folded from the ENVELOPE (the seed keeps NO id
+    # in the payload). The CLARIFICATION_REQUESTED it emits carries the REAL request_id, never None.
+    park_req_id = db.execute(
+        "SELECT request_id FROM events WHERE aggregate='feature_contract' AND run_id=%s "
+        "AND type='CLARIFICATION_REQUESTED' ORDER BY global_seq DESC LIMIT 1",
+        ("run_f",),
+    ).fetchone()[0]
+    assert park_req_id == "req_f"
     # the run was parked for the human follow-up
     n_parked = db.execute(
         "SELECT count(*) FROM events WHERE aggregate='run' AND run_id=%s AND type='RUN_PARKED'",

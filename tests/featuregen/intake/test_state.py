@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 
+from featuregen.identity.build import build_service_identity
 from featuregen.intake import events
 from featuregen.intake.state import (
     FeatureContractState,
@@ -7,6 +8,7 @@ from featuregen.intake.state import (
     actor_is_request_owner,
     fold_feature_contract_state,
 )
+from featuregen.intake.store import append_feature_contract_event, load_feature_contract
 
 
 @dataclass
@@ -20,6 +22,11 @@ class _Evt:
     event_id: str
     payload: dict
     actor: _Actor | None = None  # SP-0 EventEnvelope.actor (IdentityEnvelope with .subject)
+    # R2/N4 — the typed EventEnvelope id columns production emitters populate (ids ride here, NOT the
+    # payload). Default None so the existing payload-carrying fixtures still exercise the fallback path.
+    request_id: str | None = None
+    run_id: str | None = None
+    aggregate_id: str | None = None
 
 
 def _submitted(eid="evt_sub", subject="user:raj"):
@@ -175,3 +182,76 @@ def test_llm_call_refs_accrete_even_after_confirmation():
     st = fold_feature_contract_state([_submitted(), conf, llm])
     assert st.llm_call_refs == ("llmc_9",)
     assert st.status is FeatureContractStatus.CONFIRMED
+
+
+# ── N4: the fold reads request_id / run_id from the event ENVELOPE, not the payload (R2) ──────────────
+def test_fold_reads_request_id_and_run_id_from_the_envelope_not_the_payload(conn):
+    # The ROOT-cause regression (N4): production emitters (append_feature_contract_event / submit_intent)
+    # keep id fields OFF the payload — they ride the typed EventEnvelope columns (request_id / run_id /
+    # aggregate_id, R2). Build a real feature_contract stream exactly the way production does (ids on the
+    # seam kwargs, a payload that carries ONLY the semantic fields) and prove the fold surfaces the REAL
+    # ids, NOT None. This assertion FAILS before the fix (the fold read p.get("request_id") → None).
+    actor = build_service_identity(
+        subject="service:intake-agent", role_claims=["intake-agent"], attestation="sig"
+    )
+    append_feature_contract_event(
+        conn,
+        run_id="run_env01",
+        request_id="req_env01",
+        type=events.INTENT_SUBMITTED,
+        payload={  # R2 — NO request_id / run_id keys; only the semantic fields
+            "intake_mode": "definition",
+            "raw_input_ref": "blob_env01",
+            "raw_input_classification": "clean",
+        },
+        actor=actor,
+        expected_version=0,
+    )
+    st = fold_feature_contract_state(load_feature_contract(conn, "run_env01"))
+    assert st.request_id == "req_env01"  # from the envelope, NOT None
+    assert st.run_id == "run_env01"  # envelope run_id (== aggregate_id, X3), NOT None
+    assert st.request_id is not None and st.run_id is not None
+    assert st.intake_mode == "definition"
+    assert st.requester == "service:intake-agent"  # R4 — still the event actor.subject
+
+
+def test_fold_prefers_envelope_ids_over_payload_and_falls_back_to_payload():
+    # Precedence contract: the ENVELOPE typed columns win; a stray payload id is only a defensive
+    # fallback. An INTENT_SUBMITTED carrying its ids ONLY on the envelope (as production does — no ids in
+    # the payload) still folds to non-None ids; a legacy event with ids ONLY in the payload still resolves.
+    envelope_only = _Evt(
+        events.INTENT_SUBMITTED,
+        "evt_env",
+        {"intake_mode": "definition"},  # NO request_id / run_id in the payload
+        actor=_Actor("user:raj"),
+        request_id="req_env",
+        run_id="run_env",
+        aggregate_id="run_env",
+    )
+    st = fold_feature_contract_state([envelope_only])
+    assert st.request_id == "req_env"
+    assert st.run_id == "run_env"
+
+    # envelope columns take precedence over any (legacy) payload ids
+    both = _Evt(
+        events.INTENT_SUBMITTED,
+        "evt_both",
+        {"request_id": "req_payload", "run_id": "run_payload", "intake_mode": "definition"},
+        actor=_Actor("user:raj"),
+        request_id="req_env",
+        run_id="run_env",
+    )
+    st_both = fold_feature_contract_state([both])
+    assert st_both.request_id == "req_env"
+    assert st_both.run_id == "run_env"
+
+    # legacy synthetic event with ids ONLY in the payload → payload fallback still resolves them
+    legacy = _Evt(
+        events.INTENT_SUBMITTED,
+        "evt_legacy",
+        {"request_id": "req_payload", "run_id": "run_payload", "intake_mode": "definition"},
+        actor=_Actor("user:raj"),
+    )
+    st_legacy = fold_feature_contract_state([legacy])
+    assert st_legacy.request_id == "req_payload"
+    assert st_legacy.run_id == "run_payload"

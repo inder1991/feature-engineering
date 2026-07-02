@@ -308,7 +308,8 @@ def seed_needs_clarification(db, *, run_id, request_id, draft_body):
     append_fc_event(
         db, run_id=run_id, type="INTENT_SUBMITTED",
         payload={
-            "request_id": request_id,
+            # R2 (N4) — id fields ride the envelope seam kwargs (request_id=…/run_id=…), NOT the
+            # payload, exactly as submit_intent emits them; the fold reads them off the envelope.
             "intake_mode": draft_body["intake_mode"],
             "raw_input_ref": draft_body["raw_input_ref"],
             "raw_input_classification": draft_body["raw_input_classification"],
@@ -322,7 +323,7 @@ def seed_needs_clarification(db, *, run_id, request_id, draft_body):
                 "matched_class": None,
             },
         },
-        actor=REQUESTER, expected_version=0,
+        actor=REQUESTER, request_id=request_id, expected_version=0,
     )
     append_fc_event(
         db, run_id=run_id, type="DRAFT_CONTRACT_PRODUCED",

@@ -118,8 +118,18 @@ def fold_feature_contract_state(stream: Iterable) -> FeatureContractState:
             continue
         if t == events.INTENT_SUBMITTED:
             status = FeatureContractStatus.NEEDS_CLARIFICATION
-            request_id = p.get("request_id")
-            run_id = p.get("run_id")
+            # R2 (N4) — id fields ride the event ENVELOPE typed columns, NOT the payload; production
+            # emitters (append_feature_contract_event / submit_intent) keep them OFF the payload. Read
+            # the envelope FIRST (mirrors how `requester` below is taken from the event's actor.subject,
+            # and _request_id's helper), with payload.get(...) only a defensive fallback for
+            # legacy/synthetic streams. X3 — aggregate_id == run_id == feature_contract_id, so the
+            # envelope's aggregate_id is a valid run_id source when the run_id mirror column is absent.
+            request_id = getattr(event, "request_id", None) or p.get("request_id")
+            run_id = (
+                getattr(event, "run_id", None)
+                or getattr(event, "aggregate_id", None)
+                or p.get("run_id")
+            )
             intake_mode = p.get("intake_mode")
             catalog_version = p.get("catalog_version", catalog_version)
             actor = getattr(event, "actor", None)  # R4 — the request owner is this
