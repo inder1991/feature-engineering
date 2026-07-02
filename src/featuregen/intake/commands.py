@@ -28,13 +28,14 @@ from featuregen.contracts import (
     IdentityEnvelope,
 )
 from featuregen.contracts.documents import Stage
-from featuregen.contracts.envelopes import NewDocument
+from featuregen.contracts.envelopes import GateTaskSpec, NewDocument
 from featuregen.documents.draft import (
     INTAKE_MODES,
     RAW_INPUT_CLASSIFICATIONS,
     validate_draft,
 )
 from featuregen.documents.store import append_document, compute_content_hash
+from featuregen.gates.tasks import open_task
 from featuregen.idgen import mint_id
 from featuregen.intake.banking_catalog import (
     IntakeClassification,
@@ -44,9 +45,12 @@ from featuregen.intake.banking_catalog import (
 from featuregen.intake.catalog import current_intake_catalog  # R8/R10 seam (P2, catalog.py)
 from featuregen.intake.contract import validate_semantics  # R6 (P2, contract.py)
 from featuregen.intake.events import (
+    CLARIFICATION_REQUESTED,
     DRAFT_CONTRACT_PRODUCED,
     INTENT_REJECTED,
     INTENT_SUBMITTED,
+    USE_CASE_ONBOARDING_GATE,
+    USE_CASE_ONBOARDING_REQUESTED,
 )
 from featuregen.intake.llm import LLMRequest, call_llm, current_llm_client  # R10 seam (P3, llm.py)
 from featuregen.intake.redaction import (  # R10 seam (P3, redaction.py)
@@ -421,6 +425,74 @@ def _do_reject_intent(
     return [rej_fc.event_id, rej_run.event_id]
 
 
+def _park_run(
+    conn: DbConn, *, run_id: str, actor: IdentityEnvelope, owner: str,
+    waiting_on_fact: str | None = None,
+) -> EventEnvelope:
+    """Park the SP-0 `run` aggregate (RUN_PARKED). R2/strict-SP-0-schema: the payload carries ONLY
+    `{run_id, owner, waiting_on_fact}` — extra keys are rejected by the RUN_PARKED CHECK. X6: an
+    onboarding/fail-closed hold NEVER overloads `waiting_on_fact` (SP-1's fact-confirmed-resume key,
+    run_lifecycle.py:112) — callers pass `waiting_on_fact=None`; the hold rides the fc aggregate."""
+    return append(
+        conn, aggregate="run", aggregate_id=run_id, type="RUN_PARKED",
+        payload={"run_id": run_id, "owner": owner, "waiting_on_fact": waiting_on_fact},
+        actor=actor, run_id=run_id,
+    )
+
+
+def _do_onboarding_park(
+    conn: DbConn, *, run_id: str, request_id: str | None, actor: IdentityEnvelope, catalog_version,
+) -> list[str]:
+    """In-scope banking, unknown use-case → NEEDS_USE_CASE_ONBOARDING (§5.4). The folded hold-state
+    rides USE_CASE_ONBOARDING_REQUESTED on the fc aggregate (§4.6); SP-2 opens the governance
+    onboarding gate task and parks — the onboarding workflow itself is out of scope (§14)."""
+    onb = append_fc_event(
+        conn, run_id=run_id, type=USE_CASE_ONBOARDING_REQUESTED,
+        expected_version=_fc_head(conn, run_id),  # X4 — CAS on the folded head
+        payload={"catalog_version": catalog_version},  # R2 — no id fields
+        actor=actor, request_id=request_id,
+    )
+    open_task(
+        conn,
+        GateTaskSpec(
+            gate=USE_CASE_ONBOARDING_GATE, required_inputs=(),
+            eligible_assignees={"role": "governance"}, allowed_responses=("acknowledge",),
+            run_id=run_id, delegation_allowed=True,
+        ),
+        actor,
+    )
+    parked = _park_run(conn, run_id=run_id, actor=actor, owner="governance", waiting_on_fact=None)
+    return [onb.event_id, parked.event_id]
+
+
+def _fail_closed_park(
+    conn: DbConn, *, run_id: str, request_id: str | None, actor: IdentityEnvelope,
+    field: str, question: str,
+) -> list[str]:
+    """§4.5(b): the banking catalog is unavailable/unversioned → fail closed. Never auto-pass an
+    absent classification — open a human CLARIFICATION review task, record the clarification (its
+    schema-required `task_id` points at that task) and park for manual review (X6 waiting_on_fact=None)."""
+    task_id = open_task(
+        conn,
+        GateTaskSpec(
+            gate="CLARIFICATION", required_inputs=(), eligible_assignees={"role": "intake_reviewer"},
+            allowed_responses=("clarify",), run_id=run_id, delegation_allowed=True,
+        ),
+        actor,
+    )
+    clar = append_fc_event(
+        conn, run_id=run_id, type=CLARIFICATION_REQUESTED,
+        expected_version=_fc_head(conn, run_id),  # X4 — CAS on the folded head
+        payload={  # R2 — no aggregate-id fields; task_id is the schema-required gate-task ref
+            "task_id": task_id, "field": field, "question": question,
+            "kind": "manual", "routed_to": "human", "blocks_progress": True,
+        },
+        actor=actor, request_id=request_id,
+    )
+    parked = _park_run(conn, run_id=run_id, actor=actor, owner="intake-manual", waiting_on_fact=None)
+    return [clar.event_id, parked.event_id]
+
+
 def submit_intent(conn: DbConn, cmd: Command) -> CommandResult:
     """Definition-mode intake happy path (§5.2): open the SP-0 request+run, classify at the banking
     boundary, then on CLEAR / *_CLARIFY normalize into a frozen Draft + Assumption Ledger. Opens the
@@ -499,11 +571,15 @@ def submit_intent(conn: DbConn, cmd: Command) -> CommandResult:
     #      the guard is threaded uniformly per the Global-Constraints lost-update rule.)
     try:
         if classification is None:
-            # §4.5(b): catalog unavailable/unversioned → fail closed. Hardened into a park in Task 4.6.
-            return CommandResult(
-                accepted=False, aggregate_id=run_id,
-                denied_reason="banking-domain catalog unavailable",
+            # §4.5(b): catalog unavailable/unversioned → fail-closed park (INTENT_SUBMITTED already opened the fc).
+            produced.extend(
+                _fail_closed_park(
+                    conn, run_id=run_id, request_id=request_id, actor=cmd.actor,
+                    field="banking_scope",
+                    question="the banking-domain catalog is unavailable/unversioned; manual review required",
+                )
             )
+            return CommandResult(accepted=True, aggregate_id=run_id, produced_event_ids=tuple(produced))
         outcome = classification.outcome
         if outcome in (IntakeOutcome.OUT_OF_SCOPE, IntakeOutcome.PROHIBITED_DATA_CLASS):
             # X8 — both are terminal rejects. X5 — submit_intent appends INTENT_REJECTED ITSELF (never P8).
@@ -516,11 +592,13 @@ def submit_intent(conn: DbConn, cmd: Command) -> CommandResult:
             )
             return CommandResult(accepted=True, aggregate_id=run_id, produced_event_ids=tuple(produced))
         if outcome is IntakeOutcome.NEEDS_USE_CASE_ONBOARDING:
-            # Routed to an SP-0 park + USE_CASE_ONBOARDING gate in Task 4.6.
-            return CommandResult(
-                accepted=False, aggregate_id=run_id,
-                denied_reason="new banking use-case: onboarding required",
+            produced.extend(
+                _do_onboarding_park(
+                    conn, run_id=run_id, request_id=request_id, actor=cmd.actor,
+                    catalog_version=classification.catalog_version,
+                )
             )
+            return CommandResult(accepted=True, aggregate_id=run_id, produced_event_ids=tuple(produced))
 
         # CLEAR / SENSITIVE_PROXY_CLARIFY / AMBIGUOUS_CLARIFY → normalize into a Draft.
         return _produce_draft(
