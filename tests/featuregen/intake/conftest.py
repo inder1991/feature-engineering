@@ -77,7 +77,7 @@ def intake_env():
     register_intent_redactor(DefaultIntentRedactor())  # R10 (P3, redaction.py)
     register_intake_classifier(
         lambda intent, *, product=None, region=None, catalog=None: IntakeClassification(
-            outcome=IntakeOutcome.CLEAR, catalog_version="bdc-2026.1"
+            outcome=IntakeOutcome.CLEAR, catalog_version="bdc-2026.1", reason="intake_env default stub"
         )
     )
 

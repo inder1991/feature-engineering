@@ -10,21 +10,52 @@ so a test can pin the banking outcome deterministically."""
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 
-from featuregen.aggregates._append import append
+from featuregen.aggregates._append import append, provenance_for
+from featuregen.aggregates.request_aggregate import (
+    create_request_command,
+    create_run_command,
+)
 from featuregen.commands.registry import get_command, register_command
-from featuregen.contracts import DbConn, EventEnvelope, IdentityEnvelope
-from featuregen.intake.banking_catalog import IntakeClassification, classify_intent
+from featuregen.contracts import (
+    Command,
+    CommandResult,
+    ConcurrencyError,
+    DbConn,
+    EventEnvelope,
+    IdentityEnvelope,
+)
+from featuregen.contracts.documents import Stage
+from featuregen.contracts.envelopes import NewDocument
+from featuregen.documents.draft import (
+    INTAKE_MODES,
+    RAW_INPUT_CLASSIFICATIONS,
+    validate_draft,
+)
+from featuregen.documents.store import append_document, compute_content_hash
+from featuregen.idgen import mint_id
+from featuregen.intake.banking_catalog import (
+    IntakeClassification,
+    IntakeOutcome,
+    classify_intent,
+)
 from featuregen.intake.catalog import current_intake_catalog  # R8/R10 seam (P2, catalog.py)
-from featuregen.intake.llm import current_llm_client  # R10 seam (P3, llm.py)
-from featuregen.intake.redaction import current_intent_redactor  # R10 seam (P3, redaction.py)
+from featuregen.intake.contract import validate_semantics  # R6 (P2, contract.py)
+from featuregen.intake.events import DRAFT_CONTRACT_PRODUCED, INTENT_SUBMITTED
+from featuregen.intake.llm import LLMRequest, call_llm, current_llm_client  # R10 seam (P3, llm.py)
+from featuregen.intake.redaction import (  # R10 seam (P3, redaction.py)
+    build_llm_inputs,
+    current_intent_redactor,
+)
 from featuregen.intake.store import (  # R1 seam (P1, store.py)
     append_feature_contract_event as append_fc_event,
 )
 from featuregen.intake.store import (
     load_feature_contract,
 )
+from featuregen.privacy.classification import InlinePIIError, assert_no_inline_pii
 
 __all__ = [
     "IntakeError",
@@ -39,6 +70,8 @@ __all__ = [
     # Task 4.3 no-silent-assumption rule (§5.3).
     "NoSilentAssumptionError",
     "assert_no_silent_assumption",
+    # Task 4.4 the first intake command handler (definition-mode CLEAR happy path).
+    "submit_intent",
     # re-exported collaborator seams (R10) + R1 append/load — the handlers added by later Phase-4
     # tasks read these off this module; consumers import them from here.
     "append_fc_event",
@@ -96,8 +129,8 @@ def reset_intake_seams() -> None:
 # `_SP2_CATALOG` is a TUPLE of (action, handler) pairs (mirrors SP-0's `_CATALOG`); Phase 4 appends only
 # `submit_intent` (Task 4.4). Later phases extend commands.py with their own handlers — P5/P6/P7 add
 # answer_clarification / select_candidate_doc / confirm_contract / request_edit, and P8 adds the
-# standalone `reject_intent` (X5 — NOT Phase 4).
-_SP2_CATALOG: tuple[tuple[str, object], ...] = ()
+# standalone `reject_intent` (X5 — NOT Phase 4). The tuple is ASSIGNED at the END of this module,
+# after `submit_intent` is defined; `register_sp2_commands` reads the module-global at call time.
 
 
 def register_sp2_commands() -> None:
@@ -210,3 +243,264 @@ def assert_no_silent_assumption(draft_body: dict, ledger_body: dict) -> None:
                 f"inferred field {field!r} (source={score.get('source')!r}) is neither in the "
                 f"Assumption Ledger nor an open field (§5.3)"
             )
+
+
+# ── submit_intent — the first intake command handler (Task 4.4, §5.2) ──────────────────────────
+# Definition-mode, in-scope/CLEAR happy path: classify → redact → structure_intent (call_llm) →
+# assemble Draft + Assumption Ledger → enforce §5.3 → freeze both governance-retained documents →
+# append INTENT_SUBMITTED then DRAFT_CONTRACT_PRODUCED on the feature_contract aggregate. The banking
+# terminal-reject / onboarding-park branches return clearly-marked placeholders here (hardened in
+# Tasks 4.5–4.7); the CLEAR / *_CLARIFY paths are complete.
+PROMPT_STRUCTURE_INTENT_ID = "sp2.structure_intent"
+PROMPT_STRUCTURE_INTENT_VERSION = 1
+OUTPUT_SCHEMA_ID = "DRAFT_CONTRACT"
+OUTPUT_SCHEMA_VERSION = 1
+_GEN_SETTINGS = {"provider": "fake", "model": "fake", "thinking": "adaptive", "max_tokens": 4096}
+
+
+def _fc_head(conn: DbConn, run_id: str) -> int:
+    """The folded head `stream_version` of the `feature_contract` aggregate (0 for a brand-new/empty
+    stream), captured IMMEDIATELY before a CAS append (X4 — the Global-Constraints lost-update guard).
+    Re-loading here naturally accounts for `call_llm`'s interleaved `LLM_CALL_RECORDED`. Every fc
+    append after the opening `INTENT_SUBMITTED` passes this as `expected_version`; a raised
+    `ConcurrencyError` is denied as `stale` (never `expected_version=None`)."""
+    stream = load_feature_contract(conn, run_id)
+    return stream[-1].stream_version if stream else 0
+
+
+def _classify_raw_input(text: str, provided: str | None) -> str:
+    """Determine the SP-0 envelope `raw_input_classification`. Ingest may supply it; otherwise scan
+    with SP-0's inline-secret detector (`assert_no_inline_pii`) → clean | contains_pii. `unscanned`
+    is only ever caller-supplied (an intent no scanner touched)."""
+    if provided is not None:
+        if provided not in RAW_INPUT_CLASSIFICATIONS:
+            raise IntakeError(f"invalid raw_input_classification: {provided!r}")
+        return provided
+    try:
+        assert_no_inline_pii({"intent": text})
+        return "clean"
+    except InlinePIIError:
+        return "contains_pii"
+
+
+def _canonical(body: dict) -> bytes:
+    return json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+
+def _emit_document(
+    conn: DbConn,
+    *,
+    stage: str,
+    body: dict,
+    run_id: str,
+    request_id: str,
+    actor: IdentityEnvelope,
+    derived_from: tuple[str, ...] = (),
+) -> str:
+    """Emit one frozen, content-hashed governance-retained document on the run's DAG (§3.4). The body
+    itself rides the DRAFT_CONTRACT_PRODUCED event for replay; the document carries the content hash
+    for lineage/integrity (the body_ref points at the encrypted blob — never inlined here)."""
+    doc_id = mint_id("doc")
+    append_document(
+        conn,
+        NewDocument(
+            doc_id=doc_id,
+            stage=stage,
+            schema_version=DRAFT_SCHEMA_VERSION,
+            branch_role="primary",
+            content_hash=compute_content_hash(_canonical(body)),
+            body_classification="governance-retained",
+            provenance=provenance_for(stage),
+            body_ref=mint_id("blob"),
+            derived_from=derived_from,
+        ),
+        run_id=run_id,
+        request_id=request_id,
+        actor=actor,
+    )
+    return doc_id
+
+
+def _produce_draft(
+    conn: DbConn,
+    *,
+    cmd: Command,
+    run_id: str,
+    request_id: str,
+    intent_text: str,
+    intake_mode: str,
+    raw_input_ref: str,
+    raw_input_classification: str,
+    classification: IntakeClassification,
+    produced: list,
+) -> CommandResult:
+    """Redact → structure_intent → Draft + Assumption Ledger (§5.2). The LLM sees only redacted,
+    LLM-safe text + catalog metadata (never raw data / PII, §9.4); every inferred field is accounted
+    (§5.3) before the Draft is frozen."""
+    redactor = current_intent_redactor()  # R10 seam (P3, redaction.py)
+    redaction = redactor.redact(intent_text, raw_input_classification)
+    inputs = build_llm_inputs(  # reserved-keyed, LLM-safe (§9.4) — fails closed on un-redactable text
+        redaction, catalog_metadata={}, raw_input_classification=raw_input_classification
+    )
+    request = LLMRequest(
+        task="structure_intent",
+        prompt_id=PROMPT_STRUCTURE_INTENT_ID,
+        prompt_version=PROMPT_STRUCTURE_INTENT_VERSION,
+        inputs=inputs,
+        output_schema_id=OUTPUT_SCHEMA_ID,
+        output_schema_version=OUTPUT_SCHEMA_VERSION,
+        generation_settings=_GEN_SETTINGS,
+    )
+    result = call_llm(conn, current_llm_client(), request, run_id=run_id, actor=cmd.actor)  # R10 seam
+    out = result.output
+
+    ledger_body = assemble_ledger_body(request_id=request_id, assumptions=out.get("assumptions", []))
+    ledger_doc = _emit_document(
+        conn, stage=Stage.ASSUMPTION_LEDGER.value, body=ledger_body,
+        run_id=run_id, request_id=request_id, actor=cmd.actor,
+    )
+    draft_body = assemble_draft_body(
+        request_id=request_id, intake_mode=intake_mode, raw_input_ref=raw_input_ref,
+        raw_input_classification=raw_input_classification, assumption_ledger_ref=ledger_doc,
+        llm_output=out, llm_call_ref=result.call_ref,
+    )
+    assert_no_silent_assumption(draft_body, ledger_body)  # §5.3 — no field silently settled
+    validate_draft(draft_body)                            # SP-0 envelope + required-field validation
+    validate_semantics(draft_body, stage="DRAFT_CONTRACT")  # R6 — raises ContractSemanticError
+    draft_doc = _emit_document(
+        conn, stage=Stage.DRAFT_CONTRACT.value, body=draft_body,
+        run_id=run_id, request_id=request_id, actor=cmd.actor, derived_from=(ledger_doc,),
+    )
+    produced_evt = append_fc_event(
+        conn, run_id=run_id, type=DRAFT_CONTRACT_PRODUCED,
+        expected_version=_fc_head(conn, run_id),  # X4 — CAS on the folded head (incl. interleaved LLM_CALL_RECORDED)
+        payload={
+            # R12 standardized doc-ref keys; R2 — NO run_id/request_id id fields in the payload.
+            "draft_doc_id": draft_doc,
+            "assumption_ledger_ref": ledger_doc,
+            "catalog_version": classification.catalog_version,
+            "intake_mode": intake_mode,
+            "open_fields": list(draft_body.get("open_fields", [])),
+            "draft_body": draft_body,               # Phase-8 read model replays the frozen body
+            "assumption_ledger_body": ledger_body,
+            "status": DRAFT_STATUS,
+        },
+        actor=cmd.actor, request_id=request_id,
+        provenance=provenance_for(Stage.DRAFT_CONTRACT.value),
+    )
+    produced.append(produced_evt.event_id)
+    return CommandResult(accepted=True, aggregate_id=run_id, produced_event_ids=tuple(produced))
+
+
+def submit_intent(conn: DbConn, cmd: Command) -> CommandResult:
+    """Definition-mode intake happy path (§5.2): open the SP-0 request+run, classify at the banking
+    boundary, then on CLEAR / *_CLARIFY normalize into a frozen Draft + Assumption Ledger. Opens the
+    feature_contract stream with INTENT_SUBMITTED (expected_version=0); every later fc append is
+    CAS-guarded on the folded head (X4). Raw intent is held by reference only — never inlined (§9.4)."""
+    args = cmd.args
+    intent_text = args["intent_text"]
+    intake_mode = args.get("intake_mode", "definition")
+    if intake_mode not in INTAKE_MODES:
+        return CommandResult(
+            accepted=False, aggregate_id="", denied_reason=f"invalid intake_mode: {intake_mode!r}"
+        )
+    product = args.get("product")
+    region = args.get("region")
+
+    # 1. Open the SP-0 request + run.
+    concept = args.get("feature_concept") or intent_text
+    req = create_request_command(
+        conn,
+        Command(
+            "create_request", "request", None,
+            {"feature_concept": concept, "intake_mode": intake_mode},
+            cmd.actor, cmd.idempotency_key + ":req",
+        ),
+    )
+    if not req.accepted:
+        return req
+    request_id = req.aggregate_id
+    run = create_run_command(
+        conn,
+        Command(
+            "create_run", "run", None, {"request_id": request_id},
+            cmd.actor, cmd.idempotency_key + ":run",
+        ),
+    )
+    if not run.accepted:
+        return run
+    run_id = run.aggregate_id
+
+    # 2. Envelope classification + hold the raw intent by reference only (§9.4). The raw text stays
+    #    in-memory for the redactor; it is NEVER inlined into an event or document.
+    raw_input_classification = _classify_raw_input(intent_text, args.get("raw_input_classification"))
+    raw_input_ref = mint_id("blob")
+
+    # 3. Deterministic banking-boundary classification (§5.4, over the read-only BankingDomainCatalog)
+    #    runs BEFORE INTENT_SUBMITTED so the event can persist classification.as_mapping() (R9). An
+    #    unavailable/unversioned catalog leaves `classification is None` → fail-closed park (Task 4.6).
+    catalog = current_intake_catalog()  # R8/R10 canonical seam (P2, catalog.py); fail-closed if unset
+    classification = (
+        _current_classifier()(intent_text, product=product, region=region, catalog=catalog)
+        if getattr(catalog, "version", None) is not None
+        else None
+    )
+
+    # 4. INTENT_SUBMITTED opens the feature_contract aggregate (folded NEEDS_CLARIFICATION, §4.6).
+    #    R2: NO id fields in the payload (run_id/request_id ride the seam kwargs / typed columns).
+    #    R9: persist classification.as_mapping(). R4: mirror requester = this event's actor.subject.
+    submitted = append_fc_event(
+        conn, run_id=run_id, type=INTENT_SUBMITTED,
+        payload={
+            "intake_mode": intake_mode,
+            "raw_input_ref": raw_input_ref,
+            "raw_input_classification": raw_input_classification,
+            "product": product,
+            "region": region,
+            "requester": cmd.actor.subject,
+            "classification": classification.as_mapping() if classification is not None else None,
+        },
+        actor=cmd.actor, request_id=request_id, expected_version=0,
+    )
+    produced = [submitted.event_id]
+
+    # 5–6. Route on the classification outcome. Every fc append after the opening INTENT_SUBMITTED is
+    #      CAS-guarded on the folded head (X4, via `_fc_head`); a ConcurrencyError from any branch is a
+    #      `stale` denial. (submit_intent OPENS the stream, so in practice this never fires here — but
+    #      the guard is threaded uniformly per the Global-Constraints lost-update rule.)
+    try:
+        if classification is None:
+            # §4.5(b): catalog unavailable/unversioned → fail closed. Hardened into a park in Task 4.6.
+            return CommandResult(
+                accepted=False, aggregate_id=run_id,
+                denied_reason="banking-domain catalog unavailable",
+            )
+        outcome = classification.outcome
+        if outcome in (IntakeOutcome.OUT_OF_SCOPE, IntakeOutcome.PROHIBITED_DATA_CLASS):
+            # X8 — terminal reject: submit_intent appends INTENT_REJECTED ITSELF (Task 4.5), never P8.
+            return CommandResult(
+                accepted=False, aggregate_id=run_id,
+                denied_reason=f"banking-boundary block: {outcome.value}",
+            )
+        if outcome is IntakeOutcome.NEEDS_USE_CASE_ONBOARDING:
+            # Routed to an SP-0 park + USE_CASE_ONBOARDING gate in Task 4.6.
+            return CommandResult(
+                accepted=False, aggregate_id=run_id,
+                denied_reason="new banking use-case: onboarding required",
+            )
+
+        # CLEAR / SENSITIVE_PROXY_CLARIFY / AMBIGUOUS_CLARIFY → normalize into a Draft.
+        return _produce_draft(
+            conn, cmd=cmd, run_id=run_id, request_id=request_id, intent_text=intent_text,
+            intake_mode=intake_mode, raw_input_ref=raw_input_ref,
+            raw_input_classification=raw_input_classification,
+            classification=classification, produced=produced,
+        )
+    except ConcurrencyError:  # X4 — a concurrent transition advanced the fc head between fold and append.
+        return CommandResult(accepted=False, aggregate_id=run_id, denied_reason="stale")
+
+
+# Populated here (after the handler is defined) so `register_sp2_commands` picks it up at call time.
+_SP2_CATALOG = (
+    ("submit_intent", submit_intent),
+)
