@@ -60,8 +60,9 @@ from featuregen.intake.banking_catalog import (
     classify_intent,
 )
 from featuregen.intake.catalog import current_intake_catalog  # R8/R10 seam (P2, catalog.py)
-from featuregen.intake.contract import (  # R6 (P2, contract.py)
+from featuregen.intake.contract import (  # R6/R7 (P2, contract.py)
     CONTRACT_SCHEMA_OWNER,
+    assemble_confirmed,
     validate_semantics,
 )
 from featuregen.intake.critique import apply_critique, contract_review  # P5 challenger seam
@@ -69,6 +70,7 @@ from featuregen.intake.doubt_router import default_thresholds, route_draft  # P5
 from featuregen.intake.events import (
     CLARIFICATION_ANSWERED,
     CLARIFICATION_REQUESTED,
+    CONTRACT_CONFIRMED,
     CONTRACT_REFINED,
     DRAFT_CONTRACT_PRODUCED,
     FIELD_AUTO_RESOLVED,
@@ -102,6 +104,7 @@ from featuregen.intake.scoring import score_fields  # P5 per-field scoring (Task
 # refine / answer_clarification derive the request owner from state.requester (the INTENT_SUBMITTED
 # actor.subject) via actor_is_request_owner — never a payload key.
 from featuregen.intake.state import (
+    TERMINAL_STATUSES,
     FeatureContractStatus,
     actor_is_request_owner,
     fold_feature_contract_state,
@@ -878,11 +881,10 @@ def _first(stream, event_type: str):
 
 
 def _current_draft_doc_id(stream) -> str | None:
-    """The newest frozen Draft on the stream (a CONTRACT_REFINED supersedes a DRAFT_CONTRACT_PRODUCED)."""
-    for e in reversed(list(stream)):
-        if e.type in (CONTRACT_REFINED, DRAFT_CONTRACT_PRODUCED):
-            return e.payload.get("draft_doc_id")
-    return None
+    """The newest frozen Draft doc-id on the stream (a CONTRACT_REFINED supersedes a
+    DRAFT_CONTRACT_PRODUCED). Delegates to `_final_draft` (Task 7.1) — the ONE newest-Draft scan; DRY
+    per the 7.1 review."""
+    return _final_draft(stream)[0]
 
 
 def _answered_fields(stream) -> dict[str, object]:
@@ -1233,12 +1235,9 @@ def refine_contract(
 
 
 # ═══ Task 5.6 — the answer_clarification command (request-owner guard → drives the loop, §6.5) ════════
-def _deny_owner_guard(conn: DbConn, cmd: Command, run_id: str, reason: str) -> CommandResult:
-    """A request-owner / SoD denial is a security event, not a benign validation error (R15): route it
-    to the tamper-evident security-audit stream (§6.2, §8.2), NEVER the domain stream. Mirrors the
-    overlay `_deny_audited`; the resolved run_id is recorded as the aggregate_id."""
-    record_denial(conn, replace(cmd, aggregate_id=run_id), reason)
-    return CommandResult(accepted=False, aggregate_id=run_id, denied_reason=reason)
+# The request-owner / SoD denial helper is the shared `_deny_audited` (Task 7.1, below) — a subject
+# guard denial is a security event routed to the tamper-evident security-audit stream (R15, §6.2/§8.2),
+# NEVER the domain stream. `_deny_owner_guard` was folded into it (DRY, per the 7.1 review).
 
 
 def answer_clarification(conn: DbConn, cmd: Command) -> CommandResult:
@@ -1271,7 +1270,7 @@ def answer_clarification(conn: DbConn, cmd: Command) -> CommandResult:
     # R4: the ONE owner predicate is actor_is_request_owner(state, actor) — never payload.get("requested_by").
     # DECIDE-BEFORE-APPEND: a mismatch (non-owner / non-human) denies + security-audits and commits nothing.
     if cmd.actor.actor_kind != "human" or not actor_is_request_owner(state, cmd.actor):
-        return _deny_owner_guard(
+        return _deny_audited(
             conn, cmd, run_id, "answer_clarification denied: actor is not the request owner"
         )
 
@@ -1339,7 +1338,7 @@ def select_candidate_doc(conn: DbConn, cmd: Command) -> CommandResult:
     # (never a service, never the LLM, never a different data scientist). SP-0 authz admits any
     # data_scientist human, so SP-2 enforces the fine owner-guard here (§8.2).
     # R15: a NON-HUMAN (service / LLM) attempting the human-only Gate #1 is the escalation signal the
-    # security-audit stream exists to capture — deny via `record_denial` (mirrors `_deny_owner_guard`,
+    # security-audit stream exists to capture — deny via `record_denial` (mirrors `_deny_audited`,
     # which handles both the non-human and non-owner arms), never a plain unaudited denial.
     if cmd.actor.actor_kind != "human":
         reason = "select_candidate_doc requires the human requester (not a service)"
@@ -1351,7 +1350,7 @@ def select_candidate_doc(conn: DbConn, cmd: Command) -> CommandResult:
     state = fold_feature_contract_state(load_feature_contract(conn, run_id))
     if not actor_is_request_owner(state, cmd.actor):
         # R15 — writes decision="denied"; `replace(cmd, aggregate_id=run_id)` so the security record is
-        # traceable to the run (cmd.aggregate_id is None here — run_id rides args), mirroring `_deny_owner_guard`.
+        # traceable to the run (cmd.aggregate_id is None here — run_id rides args), mirroring `_deny_audited`.
         record_denial(conn, replace(cmd, aggregate_id=run_id), "actor is not the request owner")
         return CommandResult(
             accepted=False,
@@ -1554,3 +1553,138 @@ def open_gate1_task(conn: DbConn, cmd: Command) -> CommandResult:
 
 # Task 7.1 — extend the SP-2 command catalog with the dedicated Gate-#1 opener.
 _SP2_CATALOG = _SP2_CATALOG + (("open_gate1_task", open_gate1_task),)
+
+
+# ═══ Task 7.2 — confirm_contract (definition-mode happy path → CONFIRMED, §8.2/§8.5/§8.6) ═════════════
+def _requires_independent_validation(draft_body: dict) -> bool:
+    """§8.4 #1 risk-flag → requires_independent_validation. A FLAG ONLY: SP-2 does not require a
+    second signer and does not block; the independent validation is Gate #2 (SP-5)."""
+    return bool(draft_body.get("risk_flags"))
+
+
+def confirm_contract(conn: DbConn, cmd: Command) -> CommandResult:
+    """Human Gate #1 — the author-self-confirm happy path (§8.2/§8.5/§8.6). The request owner (the
+    authenticated HUMAN requester) confirms an MCV-passed Draft: fold → no-regression + MCV guards →
+    consume the Gate #1 task (task-version OCC) → assemble the CONFIRMED_CONTRACT body via R7
+    `assemble_confirmed` (which stamps status="CONFIRMED", the confirmation record, and
+    requires_independent_validation — the handler does NOT re-derive them) → R6 semantic backstop →
+    freeze the CONFIRMED_CONTRACT document `derived_from` the final Draft → append CONTRACT_CONFIRMED
+    (folds status → CONFIRMED). Persists the FULL confirmation record incl. the CONFIRMER IDENTITY
+    (Decision 2). X4: the FC append CASes on the folded head; a ConcurrencyError (a concurrent
+    transition since the fold) is a `stale` denial.
+
+    Handler on an EXISTING stream: fold → decide → deny BEFORE any side-effecting append (execute_command
+    does NOT roll back on accepted=False, so every non-count / wrong-state denial must commit nothing).
+    Guardrails / the §8.4 prohibited-intent screen / hypothesis-mode candidate promotion are Tasks
+    7.3–7.5 (the marked INSERT slots)."""
+    run_id = cmd.args.get("run_id") or cmd.aggregate_id
+    task_id = cmd.args["task_id"]
+    expected_task_version = cmd.args["expected_task_version"]
+    stream = load_stream(conn, "feature_contract", run_id)
+    if not stream:
+        return CommandResult(
+            accepted=False, aggregate_id=run_id or "", denied_reason="unknown feature_contract"
+        )
+    state = fold_feature_contract_state(stream)
+    head_version = stream[-1].stream_version  # X4 — pin the folded head for CAS on the FC append (§12)
+    # No-regression guard (§4.6, §11): CONFIRMED / the terminal rejects refuse a conflicting re-advance.
+    if state.status in TERMINAL_STATUSES:
+        return CommandResult(
+            accepted=False, aggregate_id=run_id,
+            denied_reason=f"contract already {state.status.value}; no re-advance (no-regression)",
+        )
+    if state.status is not FeatureContractStatus.MINIMUM_CONTRACT_VALIDATED:
+        status = state.status.value if state.status is not None else None
+        return CommandResult(
+            accepted=False, aggregate_id=run_id,
+            denied_reason=f"not ready for Gate #1 (status={status})",
+        )
+    # [Task 7.3 INSERT: confirmer_is_requester_human guard]
+    draft_doc_id, draft_body = _final_draft(stream)
+    if draft_body is None:
+        return CommandResult(accepted=False, aggregate_id=run_id, denied_reason="no draft to confirm")
+    # [Task 7.4 INSERT: §8.4 prohibited-intent screen + version-drift re-check]
+    # [Task 7.5 INSERT: hypothesis calculation_method_chosen guard]
+
+    # ── task-version OCC (consume the Gate #1 task) ── a confirm against a stale/superseded Gate #1
+    # task is NOT counted (§8.6, §12); the client must re-fetch the current task_version.
+    sig = submit_human_signal(
+        conn, task_id, response="confirm", actor=cmd.actor, expected_task_version=expected_task_version
+    )
+    if not sig.counted:
+        return CommandResult(
+            accepted=False, aggregate_id=run_id,
+            denied_reason=f"stale/closed Gate #1 task (status={sig.status}); re-fetch task_version (OCC)",
+        )
+
+    # ── writes ──
+    selected_candidate: str | None = None
+    rejected_candidates: list[str] = []
+    # Definition mode: chosen_method stays None so R7 reshapes the Draft's `rolling_*` label from the
+    # semantics (§4.2). It is a tagged method_variant Mapping ONLY in hypothesis mode — NEVER the raw
+    # calculation_method string (reshape_calculation_method dict()s a non-None chosen_method).
+    chosen_method: dict | None = None
+    # [Task 7.5 INSERT: hypothesis document PRIMARY_SELECTED promotion → set selected/rejected/chosen_method]
+
+    feature_name = cmd.args.get("feature_name") or draft_body.get("proposed_feature_name")
+    riv = _requires_independent_validation(draft_body)
+    # Decision 2 — the FULL confirmation record: selected/rejected candidates, human edits, ambiguity
+    # notes, AND the CONFIRMER IDENTITY (subject / role claims / source of authority).
+    confirmation = {
+        "confirmed_by": cmd.actor.subject,
+        "confirmed_at": datetime.now(UTC).isoformat(),
+        "confirmer_role_claims": list(cmd.actor.role_claims),
+        "source_of_authority": cmd.actor.source_of_authority,
+        "selected_candidate": selected_candidate,
+        "rejected_candidates": rejected_candidates,
+        "human_edits": list(cmd.args.get("human_edits") or []),
+        "ambiguity_notes": cmd.args.get("ambiguity_notes", ""),
+    }
+    # R7 — pass ALL pinned args to P2's assemble_confirmed; it stamps status="CONFIRMED", the
+    # confirmation record, and requires_independent_validation. The handler does NOT re-derive them.
+    confirmed_body = assemble_confirmed(
+        draft_body,
+        confirmation=confirmation,
+        derived_from=(draft_doc_id,) if draft_doc_id else (),
+        requires_independent_validation=riv,
+        chosen_method=chosen_method,
+        feature_name=feature_name,
+    )
+    # R6 — semantic backstop on the assembled Confirmed body (raises ContractSemanticError).
+    validate_semantics(confirmed_body, stage="CONFIRMED_CONTRACT")
+
+    request_id = _request_id(stream)
+    confirmed_doc_id = _freeze_contract_doc(
+        conn, run_id=run_id, request_id=request_id, stage=Stage.CONFIRMED_CONTRACT.value,
+        body=confirmed_body, branch_role="primary",
+        derived_from=(draft_doc_id,) if draft_doc_id else (), supersedes=(), actor=cmd.actor,
+    )
+    # X4 — CAS on the folded head (§12, Global Constraints): a None-append would take the CURRENT head,
+    # letting a stale fold + these writes silently land AFTER a concurrent transition. Pin
+    # expected_version to the head folded above and treat a raised ConcurrencyError as a stale denial.
+    try:
+        evt = append_fc_event(
+            conn, run_id=run_id, type=CONTRACT_CONFIRMED,
+            payload={  # R2 — no aggregate-id fields; confirmed_doc_id is the schema-required doc ref.
+                "confirmed_doc_id": confirmed_doc_id,
+                "confirmed_by": cmd.actor.subject,
+                "feature_name": feature_name,
+                "confirmed_body": confirmed_body,
+                "confirmation": confirmation,
+                "requires_independent_validation": riv,
+                "selected_candidate": selected_candidate,
+                "rejected_candidates": rejected_candidates,
+            },
+            actor=cmd.actor, request_id=request_id,
+            expected_version=head_version,  # X4 — CAS on the folded head (§12)
+        )
+    except ConcurrencyError:
+        return CommandResult(
+            accepted=False, aggregate_id=run_id,
+            denied_reason="stale: feature_contract advanced concurrently since fold (OCC)",
+        )
+    return CommandResult(accepted=True, aggregate_id=run_id, produced_event_ids=(evt.event_id,))
+
+
+# Task 7.2 — extend the SP-2 command catalog with the Gate-#1 confirm handler.
+_SP2_CATALOG = _SP2_CATALOG + (("confirm_contract", confirm_contract),)
