@@ -31,7 +31,10 @@ class ScriptedLLM:
         from featuregen.intake.llm import LLMResult
         spec = self._by_task[request.task]
         return LLMResult(
-            output=spec.get("output", {}),
+            # a spec may wrap the output under "output" (renormalize) or BE the output itself
+            # (contract_review specs). Falling back to `spec` gives the critique a USABLE structured
+            # verdict rather than an empty {} that validate-fails into a fail-closed critique (F5).
+            output=spec.get("output", spec),
             self_reported_scores=spec.get("self_reported_scores", {}),
             call_ref="", status="ok",
         )
@@ -163,6 +166,37 @@ def test_answered_field_renormalizes_to_mcv_validated(db, sp2_schemas, agent):
     types = [e.type for e in load_feature_contract(db, run_id)]
     assert "CONTRACT_REFINED" in types
     assert "MINIMUM_CONTRACT_VALIDATED" in types
+
+
+def test_critique_failure_fails_closed_into_manual_review(db, sp2_schemas, agent):
+    """F5/P2-a: when the challenger critique cannot return a usable structured verdict, the refine round
+    MUST NOT converge as if it passed clean — it raises a manual-review open field (critique_review) and
+    keeps the draft in NEEDS_CLARIFICATION. The SAME setup with a CLEAN critique converges (test above);
+    only the critique changes here — proving the fail-closed behavior, not an unrelated open field."""
+    run_id, _ = _seed_draft(db, agent)
+    append_fc_event(db, run_id=run_id, type="CLARIFICATION_ANSWERED",
+                    payload={"task_id": "task_x", "field": "filters",
+                             "answer": "card_authorizations.auth_result = 'D'", "response": "confirm",
+                             "answered_by": "user:raj"}, actor=agent)
+    client = ScriptedLLM({
+        "renormalize": {
+            "output": {"feature_semantics": _semantics("card_authorizations.auth_result = 'D'"),
+                       "open_fields": []},
+            "self_reported_scores": {
+                "entity": {"ambiguity": 0.05, "confidence": 0.97, "source": "llm"},
+                "entity_grain": {"ambiguity": 0.30, "confidence": 0.72, "source": "default"},
+                "windows": {"ambiguity": 0.05, "confidence": 0.98, "source": "llm"},
+                "filters": {"ambiguity": 0.10, "confidence": 0.92, "source": "llm"},
+            },
+        },
+        # an invalid critique output → validate-fails → bounded repair exhausts → FAILED critique (usable=False)
+        "contract_review": {"output": {}},
+    })
+    res = refine_contract(db, run_id, client=client, redactor=DefaultIntentRedactor(),
+                          catalog=_View(), actor=agent)
+    assert res.status != "validated", res  # a failed challenger must NOT converge (fail-closed)
+    assert "critique_review" in res.open_fields
+    assert "MINIMUM_CONTRACT_VALIDATED" not in [e.type for e in load_feature_contract(db, run_id)]
 
 
 def test_refinement_loop_is_bounded_and_auto_parks(db, sp2_schemas, agent, monkeypatch):

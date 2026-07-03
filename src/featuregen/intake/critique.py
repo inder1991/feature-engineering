@@ -100,6 +100,9 @@ class CritiqueResult:
     status: str
     findings: tuple[CritiqueFinding, ...]
     call_ref: str
+    # False when the challenger did not return a usable structured verdict (LLM failure/refusal). The
+    # caller MUST fail closed on this — a non-usable critique is NOT a clean pass (F5 / P2-a).
+    usable: bool = True
 
 
 def contract_review(
@@ -170,6 +173,7 @@ def contract_review(
         status=status,
         findings=findings,
         call_ref=result.call_ref,
+        usable=result.status in _USABLE_STATUSES,  # F5 — the caller fails closed when this is False
     )
     append_fc_event(
         conn,

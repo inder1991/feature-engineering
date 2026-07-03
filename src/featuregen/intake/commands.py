@@ -1222,6 +1222,12 @@ def _ledger_entry(field, semantics, score) -> dict:
     }
 
 
+# F5 / P2-a — the synthetic open field a refine round raises when the challenger critique could not run
+# (LLM failure/refusal). It keeps the draft in NEEDS_CLARIFICATION (manual review) instead of letting it
+# converge as if the critique passed clean; it clears automatically once the critique runs successfully.
+_CRITIQUE_REVIEW_FIELD = "critique_review"
+
+
 def _open_questions(routing, question_by_field) -> list[dict]:
     return [
         {"field": f, "question": question_by_field.get(f, f"Please specify {f}."),
@@ -1375,6 +1381,18 @@ def refine_contract(
                     policy_sensitive_fields=_policy_fields(classification, semantics), thresholds=thresholds),
         critique,
     )
+    # F5 / P2-a — the challenger fails CLOSED. A non-usable critique (LLM failure/refusal) must NOT let the
+    # draft converge as if it passed clean: raise a manual-review open field so this round opens a
+    # clarification task instead of reaching MCV (§9.2). Lift it once the critique runs successfully.
+    if not critique.usable:
+        if _CRITIQUE_REVIEW_FIELD not in open_fields:
+            open_fields.append(_CRITIQUE_REVIEW_FIELD)
+        routing[_CRITIQUE_REVIEW_FIELD] = "human"
+        field_scores[_CRITIQUE_REVIEW_FIELD] = {"ambiguity": 1.0, "confidence": 0.0, "source": "critique"}
+    elif _CRITIQUE_REVIEW_FIELD in open_fields:  # challenger recovered → lift the manual-review block
+        open_fields.remove(_CRITIQUE_REVIEW_FIELD)
+        routing.pop(_CRITIQUE_REVIEW_FIELD, None)
+        field_scores.pop(_CRITIQUE_REVIEW_FIELD, None)
 
     # X4 — re-anchor the running CAS head PAST this round's own LLM audit appends (renormalize / critique
     # each appended LLM_CALL_RECORDED / CONTRACT_CRITIQUED to this same stream), refusing the round if a
