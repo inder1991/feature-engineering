@@ -305,6 +305,43 @@ def test_run_worker_once_advances_projections_on_autocommit(
     assert tick.projections_advanced >= 1  # the seeded event was consumed by the projections
 
 
+def test_advisory_lock_sites_work_on_autocommit_connection(
+    autocommit_worker_conn, actor, prov
+) -> None:
+    """append_event and record_security_event take a TRANSACTION-scoped advisory lock; on the
+    daemon's AUTOCOMMIT connection the lock is only held if it runs inside a transaction (a bare
+    lock statement self-commits and releases it before the read/insert it guards). Both now open a
+    real transaction on autocommit — verify they produce correct, chained results there (SP-0.5
+    round-2 advisory-lock autocommit safety). NOTE: this exercises the autocommit path for
+    no-regression; the concurrency race the lock prevents is not itself deterministically unit-tested."""
+    from featuregen.contracts import NewEvent
+    from featuregen.events import append_event
+    from featuregen.security.audit import record_security_event, verify_chain
+
+    ac = autocommit_worker_conn
+    # append_event on autocommit: two appends produce ascending, chained global_seq (no gap/fork).
+    e1 = append_event(
+        ac,
+        NewEvent(aggregate="run", aggregate_id="run_al", run_id="run_al", type="STEP_TRIGGER",
+                 schema_version=1, payload={}, actor=actor, provenance=prov),
+        expected_version=0, table_version=1,
+    )
+    e2 = append_event(
+        ac,
+        NewEvent(aggregate="run", aggregate_id="run_al", run_id="run_al", type="STEP_TRIGGER",
+                 schema_version=1, payload={}, actor=actor, provenance=prov),
+        expected_version=1, table_version=1,
+    )
+    assert e2.global_seq > e1.global_seq
+
+    # record_security_event on autocommit: two appends produce a valid, linked hash chain.
+    record_security_event(ac, event_type="COMMAND_DENIED", actor=actor,
+                          attempted_action="activate", decision="denied", reason="r1")
+    record_security_event(ac, event_type="COMMAND_DENIED", actor=actor,
+                          attempted_action="deprecate", decision="denied", reason="r2")
+    assert verify_chain(ac) is True
+
+
 def test_run_worker_once_fires_a_due_timer_on_autocommit(autocommit_worker_conn) -> None:
     """fire_timer holds a SELECT ... FOR UPDATE across the enqueue + mark-fired statements; on the
     AUTOCOMMIT daemon connection that lock releases at statement end unless the tick wraps it in a
