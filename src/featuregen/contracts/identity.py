@@ -1,13 +1,18 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
 from typing import Any
 
 # IdentityEnvelope is the shared contract type (overview §6.1); import & re-export
 # it here rather than redefining, so all phases share one frozen dataclass.
 from featuregen.contracts.envelopes import IdentityEnvelope
 
-__all__ = ["IdentityEnvelope", "identity_to_jsonb", "identity_from_jsonb"]
+# NOTE: this module deliberately exposes only the SERIALIZER (``identity_to_jsonb``). The inverse
+# ``identity_from_jsonb`` deserializer lives solely in ``events/serde.py`` (SP-0.5 BLOCKER #1): a
+# stored ``authenticated=True`` actor must be reconstructed through the sanctioned trust-capability
+# factory, and ``contracts`` is the foundational layer that CANNOT import the ``identity/`` package
+# (where that factory lives) without a cycle. A duplicate deserializer here would forge an
+# authenticated envelope straight from an untrusted dict, so it is intentionally absent.
+__all__ = ["IdentityEnvelope", "identity_to_jsonb"]
 
 
 def identity_to_jsonb(env: IdentityEnvelope) -> dict[str, Any]:
@@ -25,20 +30,3 @@ def identity_to_jsonb(env: IdentityEnvelope) -> dict[str, Any]:
         "source_of_authority": env.source_of_authority,
         "attestation": env.attestation,
     }
-
-
-def identity_from_jsonb(d: Mapping[str, Any]) -> IdentityEnvelope:
-    return IdentityEnvelope(
-        subject=d["subject"],
-        actor_kind=d["actor_kind"],
-        authenticated=d["authenticated"],
-        auth_method=d["auth_method"],
-        role_claims=tuple(d.get("role_claims", ())),
-        groups=tuple(d.get("groups", ())),
-        tenant=d.get("tenant"),
-        on_behalf_of=d.get("on_behalf_of"),
-        impersonation=d.get("impersonation"),
-        break_glass=d.get("break_glass", False),
-        source_of_authority=d.get("source_of_authority"),
-        attestation=d.get("attestation"),
-    )

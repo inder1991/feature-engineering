@@ -1,8 +1,10 @@
-from featuregen.contracts.identity import (
-    IdentityEnvelope,
-    identity_from_jsonb,
-    identity_to_jsonb,
-)
+from featuregen.contracts.identity import IdentityEnvelope, identity_to_jsonb
+
+# The inverse deserializer is the SINGLE sanctioned one in events/serde.py: it reconstructs a
+# stored authenticated actor through the sanctioned trust-capability factory. contracts/
+# intentionally no longer ships a duplicate (SP-0.5 BLOCKER #1), so the round-trip below crosses
+# the serializer here with the sanctioned deserializer there.
+from featuregen.events.serde import identity_from_jsonb
 
 
 def _human() -> IdentityEnvelope:
