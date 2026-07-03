@@ -38,6 +38,21 @@ def test_open_gate1_opens_dedicated_confirm_task_for_owner(db):
     assert row["quorum_required"] == 1
 
 
+def test_open_gate1_arms_the_sla_timer_ladder(db):
+    """N6: a Gate #1 confirmation task carries an SLA, so open_task schedules SP-0's timer ladder
+    (reminder / sla / escalation / auto_park). Before the fix, sla=None scheduled NO timers → a stalled
+    gate never reminded or escalated."""
+    seed_validated_contract(db, run_id="run_sla", request_id="req_sla",
+                            draft_body=definition_draft("req_sla"))
+    assert open_gate1_task(db, _open_cmd("run_sla")).accepted is True
+    with db.cursor(row_factory=dict_row) as cur:
+        cur.execute("SELECT task_id FROM human_tasks WHERE run_id=%s AND status='open'", ("run_sla",))
+        task_id = cur.fetchone()["task_id"]
+        cur.execute("SELECT kind FROM timers WHERE task_id=%s AND status='scheduled'", (task_id,))
+        kinds = {r["kind"] for r in cur.fetchall()}
+    assert "reminder" in kinds and "escalation" in kinds, f"SLA ladder must arm (N6); got {kinds}"
+
+
 def test_open_gate1_denied_before_mcv(db):
     """Gate #1 can NEVER open on an under-specified contract (§6.7): folded status must be
     MINIMUM_CONTRACT_VALIDATED."""

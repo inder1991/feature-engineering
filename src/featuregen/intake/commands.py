@@ -615,6 +615,12 @@ def _emit_document(
     return doc_id
 
 
+# N6 — every human task carries an SLA so SP-0's timer ladder (reminder at sla/2, escalation at sla*1.5,
+# auto-park at sla*2) ARMS. Without an sla, open_task schedules no timers and a task can stall forever.
+_HUMAN_TASK_SLA = "3d"        # clarification / Gate #1 confirmation / fail-closed manual review
+_ONBOARDING_TASK_SLA = "10d"  # use-case governance onboarding legitimately takes longer
+
+
 def _open_clarification_task(conn: DbConn, *, run_id: str, actor: IdentityEnvelope) -> str:
     """Open a human CLARIFICATION gate task (Task 4.6 pattern) and return its real `task_id` — the
     CLARIFICATION_REQUESTED schema requires it. Shared by the fail-closed manual path and the
@@ -623,7 +629,7 @@ def _open_clarification_task(conn: DbConn, *, run_id: str, actor: IdentityEnvelo
         conn,
         GateTaskSpec(
             gate="CLARIFICATION", required_inputs=(), eligible_assignees={"role": "intake_reviewer"},
-            allowed_responses=("clarify",), run_id=run_id, delegation_allowed=True,
+            allowed_responses=("clarify",), run_id=run_id, delegation_allowed=True, sla=_HUMAN_TASK_SLA,
         ),
         actor,
     )
@@ -846,7 +852,7 @@ def _do_onboarding_park(
         GateTaskSpec(
             gate=USE_CASE_ONBOARDING_GATE, required_inputs=(),
             eligible_assignees={"role": "governance"}, allowed_responses=("acknowledge",),
-            run_id=run_id, delegation_allowed=True,
+            run_id=run_id, delegation_allowed=True, sla=_ONBOARDING_TASK_SLA,
         ),
         actor,
     )
@@ -865,7 +871,7 @@ def _fail_closed_park(
         conn,
         GateTaskSpec(
             gate="CLARIFICATION", required_inputs=(), eligible_assignees={"role": "intake_reviewer"},
-            allowed_responses=("clarify",), run_id=run_id, delegation_allowed=True,
+            allowed_responses=("clarify",), run_id=run_id, delegation_allowed=True, sla=_HUMAN_TASK_SLA,
         ),
         actor,
     )
@@ -1174,6 +1180,7 @@ def open_clarification_task(
         allowed_responses=("confirm", "edit", "reject"),
         run_id=run_id,
         delegation_allowed=False,
+        sla=_HUMAN_TASK_SLA,
     )
     task_id = open_task(conn, spec, actor)
     append_fc_event(
@@ -1905,6 +1912,7 @@ def _open_gate1_task(conn: DbConn, run_id: str, *, actor) -> CommandResult:
             allowed_responses=("confirm", "edit", "reject"),
             run_id=run_id,
             delegation_allowed=False,  # the author-owned intent lock (§8.2)
+            sla=_HUMAN_TASK_SLA,
         ),
         actor,
     )
