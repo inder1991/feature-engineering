@@ -459,6 +459,19 @@ _TIMER_RUNTIME_ACTOR = IdentityEnvelope(
     role_claims=(),
 )
 
+# dispatch_timer_command runs as the TRUSTED _TIMER_RUNTIME_ACTOR and dispatches straight through
+# the command registry, BYPASSING execute_command's authz seam. It must therefore only ever be able
+# to invoke this explicit, minimal set of §4.4 actions — a corrupted/hostile timer row naming
+# anything else (activate/reject/deprecate/…) is refused BEFORE dispatch, so it can never run an
+# unauthenticated privileged command. Widen this set deliberately as new timer commands are added.
+_TIMER_COMMAND_ALLOWLIST = frozenset({"deactivate_expired_version"})
+
+
+class DisallowedTimerCommand(Exception):
+    """A fired timer->command message named a §4.4 action that is NOT in `_TIMER_COMMAND_ALLOWLIST`.
+    DETERMINISTIC failure — the single queue consumer routes it straight to the DLQ, never retries
+    it, and never dispatches the command."""
+
 
 def dispatch_timer_command(conn: DbConn, payload: Mapping[str, Any]) -> CommandResult:
     """Consume a fired timer->queue message whose stored payload NAMES a §4.4 command action
@@ -472,8 +485,17 @@ def dispatch_timer_command(conn: DbConn, payload: Mapping[str, Any]) -> CommandR
     (`get_command`) — the same §4.4 dispatch every lifecycle command uses, NOT a new mechanism.
     For `experiment_expiry` that command is the already-catalogued `deactivate_expired_version`,
     which emits VERSION_EXPIRED and clears the CAS active-map slot. Idempotent under at-least-once
-    queue redelivery: the command re-checks the slot and no-ops once it is already cleared."""
+    queue redelivery: the command re-checks the slot and no-ops once it is already cleared.
+
+    The named action is ALLOWLIST-CHECKED first (see `_TIMER_COMMAND_ALLOWLIST`): because this path
+    bypasses execute_command's authz seam and runs as a trusted actor, anything not allowlisted is
+    rejected with `DisallowedTimerCommand` before any Command is built or dispatched."""
     action = payload["handler"]
+    if action not in _TIMER_COMMAND_ALLOWLIST:
+        raise DisallowedTimerCommand(
+            f"timer command action {action!r} is not allowlisted "
+            f"(allowed: {sorted(_TIMER_COMMAND_ALLOWLIST)})"
+        )
     cmd = Command(
         action=action,
         aggregate="feature",
@@ -483,6 +505,9 @@ def dispatch_timer_command(conn: DbConn, payload: Mapping[str, Any]) -> CommandR
             "use_case": payload["use_case"],
         },
         actor=_TIMER_RUNTIME_ACTOR,
+        # Retained for traceability only: this bridge bypasses the command_idempotency ledger, so
+        # redelivery dedup does NOT rest on this key — it comes from the command body's slot
+        # re-check in deactivate_expired_version_command (an idempotent no-op once the slot clears).
         idempotency_key=f"timer-cmd:{payload['timer_id']}",
     )
     return get_command(action)(conn, cmd)
