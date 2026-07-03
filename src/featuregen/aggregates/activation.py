@@ -24,6 +24,7 @@ from featuregen.contracts import (
     ProvenanceEnvelope,
 )
 from featuregen.governance.activation_policy import ActivationPolicy, evaluate_activation_guards
+from featuregen.identity._trust import mint_trusted_identity
 
 
 def _jsonable(value: Any) -> Any:
@@ -451,10 +452,12 @@ def deactivate_expired_version_command(conn: DbConn, cmd: Command) -> CommandRes
 
 # Trusted internal identity for timer-initiated commands: the durable timer runtime is the actor
 # (there is no human/service token behind an auto-expiry). Recorded on the VERSION_EXPIRED event.
-_TIMER_RUNTIME_ACTOR = IdentityEnvelope(
+# Minted through the sanctioned capability factory (SP-0.5 BLOCKER #1) — the timer runtime is an
+# internal trust ROOT that produces an authenticated principal without a token, so it must not
+# assert ``authenticated=True`` ad hoc.
+_TIMER_RUNTIME_ACTOR = mint_trusted_identity(
     subject="service:timer-runtime",
     actor_kind="service",
-    authenticated=True,
     auth_method="internal",
     role_claims=(),
 )

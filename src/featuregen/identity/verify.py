@@ -1,14 +1,17 @@
 """Identity attestation seam (SP-0.5 BLOCKER #1).
 
-The ONLY place an ``authenticated=True`` IdentityEnvelope may be produced. ``build.py`` is
-fail-closed; a verifier proves a token and passes the internal ``_verified=True`` flag so the
-resulting principal is trustworthy for authz / four-eyes / audit attribution.
+A verifier is the ONLY token-facing code that may mint an ``authenticated=True`` IdentityEnvelope.
+``build.py`` is fail-closed; a verifier proves a token and then hands ``build_*`` the private trust
+CAPABILITY (``identity._trust._TRUST_CAPABILITY``) so the resulting principal is trustworthy for
+authz / four-eyes / audit attribution. The capability replaces the old forgeable ``_verified: bool``
+flag: ordinary code cannot name the object, so cannot mint a principal it has not proven.
 
 OIDC-first, swappable issuer: ``OidcVerifier`` takes ``issuer`` / ``audience`` / ``jwks`` as
 CONFIG. Moving from local users today to enterprise AD / Entra later is a configuration change
-(different issuer + JWKS), never a code change. Service (machine) identity is a separate
-concern and stays on its own path (``verify_service``); its full mechanism (mTLS / signed
-deploy token) is stubbed here and wired at deploy time.
+(different issuer + JWKS), never a code change. Both human (``verify_human``) and service
+(``verify_service``) tokens are proven the same RS256/JWKS way. This is the IN-PROCESS verification
+seam only; the deploy-time transport EDGE — where a bearer/mTLS token physically arrives and is
+resolved into a call — is a separate deferred task (the SP-0.5 forgery-blocker follow-up).
 """
 
 from __future__ import annotations
@@ -22,7 +25,8 @@ from featuregen.contracts.identity import IdentityEnvelope
 
 # IdentityError is defined in build.py (many modules already import it there). Re-export it so
 # the verifier seam is self-contained: ``from featuregen.identity.verify import IdentityError``.
-from featuregen.identity.build import IdentityError, build_human_identity
+from featuregen.identity._trust import _TRUST_CAPABILITY
+from featuregen.identity.build import IdentityError, build_human_identity, build_service_identity
 
 __all__ = [
     "IdentityError",
@@ -50,9 +54,9 @@ class OidcVerifier:
     authenticated human IdentityEnvelope.
 
     Trust is established by PyJWT: the signature is checked against the JWKS key selected by the
-    token's ``kid`` header, and ``iss`` / ``aud`` / ``exp`` are enforced. Only after that do we
-    call ``build_human_identity(..., _verified=True)`` — so the ``authenticated=True`` envelope
-    can exist ONLY downstream of a proven token.
+    token's ``kid`` header, and ``iss`` / ``aud`` / ``exp`` are enforced. Only after that do we call
+    ``build_*`` with the private trust capability — so an ``authenticated=True`` envelope can exist
+    ONLY downstream of a proven token.
     """
 
     def __init__(self, *, issuer: str, audience: str, jwks: dict[str, Any]) -> None:
@@ -99,7 +103,12 @@ class OidcVerifier:
                 role_claims=tuple(claims.get("roles", ())),
                 groups=tuple(claims.get("groups", ())),
                 tenant=claims.get("tenant"),
-                _verified=True,
+                # source_of_authority is a provenance attribute the IdP may assert (e.g. the IAM
+                # snapshot the session was authorized against); it is carried onto the envelope.
+                # break_glass / impersonation are deliberately NOT mapped from claims — those are
+                # privileged and must never be self-assertable by a token (SECURITY).
+                source_of_authority=claims.get("source_of_authority"),
+                _capability=_TRUST_CAPABILITY,
             )
         except IdentityError:
             raise
@@ -107,14 +116,29 @@ class OidcVerifier:
             raise IdentityError(f"could not map verified claims to identity: {exc}") from exc
 
     def verify_service(self, token: str) -> IdentityEnvelope:
-        # Service (machine) identity is a SEPARATE concern from human OIDC. Its full mechanism
-        # (mTLS / signed deploy token) is not modelled by this human-OIDC verifier. Keeping this
-        # explicit — rather than silently reusing the human path — preserves the distinction and
-        # fails closed until a real service verifier is wired at deploy time.
-        raise IdentityError(
-            "OidcVerifier proves human OIDC tokens only; service identity uses the "
-            "workload-identity mechanism (wired at deploy time)"
-        )
+        """Prove a signed workload-identity token (JWT-SVID style) and map it to an authenticated
+        SERVICE principal. Same RS256/JWKS proof as ``verify_human`` — the signature, issuer,
+        audience and expiry are enforced before the capability mints the envelope, so a service
+        principal too can exist ONLY downstream of a proven token. The deploy-time transport edge
+        (mTLS termination / token delivery) remains deferred."""
+        claims = self._verify_claims(token)
+        subject = claims["sub"]
+        try:
+            return build_service_identity(
+                subject=subject,
+                role_claims=tuple(claims.get("roles", ())),
+                attestation=claims.get("attestation"),
+                groups=tuple(claims.get("groups", ())),
+                tenant=claims.get("tenant"),
+                source_of_authority=claims.get("source_of_authority"),
+                _capability=_TRUST_CAPABILITY,
+            )
+        except IdentityError:
+            raise
+        except Exception as exc:  # pragma: no cover - defensive claim-shape guard
+            raise IdentityError(
+                f"could not map verified claims to service identity: {exc}"
+            ) from exc
 
 
 # Process-wide identity verifier. Mirrors the `register_catalog_adapter` / `current_catalog_adapter`

@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 
 from featuregen.contracts.identity import IdentityEnvelope
+from featuregen.identity._trust import _TRUST_CAPABILITY
 
 
 class IdentityError(Exception):
@@ -38,23 +39,26 @@ def build_human_identity(
     on_behalf_of: str | None = None,
     impersonation: str | None = None,
     break_glass: bool = False,
-    _verified: bool = False,
+    _capability: object | None = None,
 ) -> IdentityEnvelope:
     """Construct a human IdentityEnvelope.
 
     FAIL-CLOSED (SP-0.5 BLOCKER #1): ordinary callers get ``authenticated=False``. Claims on
-    an envelope are only *asserted* here — they become *authenticated* solely when a verifier
-    (``identity.verify.OidcVerifier``) has proven the token's signature/issuer/audience/expiry
-    and passes the internal ``_verified=True`` flag. ``_verified`` is NOT part of the public
-    contract: no application code may set it; only the identity-verification seam may. This is
-    what makes it impossible for arbitrary code to mint a principal it has not proven.
+    an envelope are only *asserted* here — they become *authenticated* solely when the caller
+    hands over the private trust CAPABILITY (``identity._trust._TRUST_CAPABILITY``), which only a
+    verifier holds after proving a token's signature/issuer/audience/expiry. The capability is
+    compared by identity (``is``), never by value, and is absent from every ``__all__`` — so it
+    replaces the old forgeable ``_verified: bool`` seam: ordinary code cannot name the object, so
+    cannot mint a principal it has not proven. Passing the removed ``_verified`` kwarg now raises
+    ``TypeError`` instead of forging anything.
     """
     if not subject.startswith("user:"):
         raise IdentityError("human subject must be prefixed 'user:'")
+    authenticated = _capability is _TRUST_CAPABILITY
     env = IdentityEnvelope(
         subject=subject,
         actor_kind="human",
-        authenticated=_verified,
+        authenticated=authenticated,
         auth_method=auth_method,
         role_claims=tuple(role_claims),
         groups=tuple(groups),
@@ -65,7 +69,7 @@ def build_human_identity(
         source_of_authority=source_of_authority,
         attestation=None,
     )
-    if _verified:
+    if authenticated:
         # Only a verified envelope must satisfy the §6.1 authentication invariants; an
         # unauthenticated envelope is a legitimate value (e.g. anonymous / pre-authn).
         validate_identity(env)
@@ -80,22 +84,22 @@ def build_service_identity(
     groups: Iterable[str] = (),
     tenant: str | None = None,
     source_of_authority: str | None = None,
-    _verified: bool = False,
+    _capability: object | None = None,
 ) -> IdentityEnvelope:
     """Construct a service (machine) IdentityEnvelope.
 
     FAIL-CLOSED like ``build_human_identity``: an ``attestation`` string supplied by a caller
-    is a *claim*, not proof. The envelope is only ``authenticated=True`` when the service
-    identity mechanism (mTLS / signed deploy token — stubbed for now, wired at deploy time)
-    has verified it and passes ``_verified=True``. Service identity is a separate concern from
-    human OIDC and stays on its own path.
+    is a *claim*, not proof. The envelope is only ``authenticated=True`` when the caller hands
+    over the private trust CAPABILITY, which the service verifier holds after proving a signed
+    workload-identity token. The forgeable ``_verified: bool`` seam is gone.
     """
     if not subject.startswith("service:"):
         raise IdentityError("service subject must be prefixed 'service:'")
+    authenticated = _capability is _TRUST_CAPABILITY
     env = IdentityEnvelope(
         subject=subject,
         actor_kind="service",
-        authenticated=_verified,
+        authenticated=authenticated,
         auth_method="workload-identity",
         role_claims=tuple(role_claims),
         groups=tuple(groups),
@@ -103,6 +107,6 @@ def build_service_identity(
         attestation=attestation,
         source_of_authority=source_of_authority,
     )
-    if _verified:
+    if authenticated:
         validate_identity(env)
     return env

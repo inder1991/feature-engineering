@@ -53,6 +53,9 @@ class FakeOidc:
         audience: str | None = None,
         expired: bool = False,
         groups: list[str] | None = None,
+        source_of_authority: str | None = None,
+        attestation: str | None = None,
+        extra: dict[str, Any] | None = None,
     ) -> str:
         now = int(time.time())
         claims: dict[str, Any] = {
@@ -64,6 +67,12 @@ class FakeOidc:
             "iat": now,
             "exp": now - 60 if expired else now + 3600,
         }
+        if source_of_authority is not None:
+            claims["source_of_authority"] = source_of_authority
+        if attestation is not None:
+            claims["attestation"] = attestation
+        if extra:
+            claims.update(extra)
         key = self.attacker_key if sign_with == "attacker-key" else self.trusted_key
         return jwt.encode(claims, key, algorithm="RS256", headers={"kid": self.kid})
 
@@ -168,6 +177,65 @@ def test_oidc_verifier_maps_groups(fake_oidc: FakeOidc) -> None:
         fake_oidc.mint(subject="user:raj", roles=["data_scientist"], groups=["team-risk"])
     )
     assert env.groups == ("team-risk",)
+
+
+def test_oidc_verifier_maps_source_of_authority(fake_oidc: FakeOidc) -> None:
+    """A verified provenance claim (source_of_authority) is carried onto the envelope, so the
+    genuine verifier path preserves the field the intake flow attributes on Gate-#1 confirms."""
+    from featuregen.identity.verify import OidcVerifier
+
+    v = OidcVerifier(issuer=fake_oidc.issuer, audience="featuregen", jwks=fake_oidc.jwks)
+    env = v.verify_human(
+        fake_oidc.mint(subject="user:raj", roles=["data_scientist"], source_of_authority="oidc:raj")
+    )
+    assert env.source_of_authority == "oidc:raj"
+
+
+def test_oidc_verifier_never_trusts_break_glass_from_a_token(fake_oidc: FakeOidc) -> None:
+    """SECURITY: break-glass (and impersonation) are privileged and must NEVER be self-assertable
+    by a token claim; the verifier ignores them so a forged/hostile token cannot escalate."""
+    from featuregen.identity.verify import OidcVerifier
+
+    v = OidcVerifier(issuer=fake_oidc.issuer, audience="featuregen", jwks=fake_oidc.jwks)
+    env = v.verify_human(
+        fake_oidc.mint(
+            subject="user:raj",
+            roles=["data_scientist"],
+            extra={"break_glass": True, "impersonation": "user:ceo"},
+        )
+    )
+    assert env.break_glass is False
+    assert env.impersonation is None
+
+
+def test_oidc_verifier_accepts_a_valid_service_token(fake_oidc: FakeOidc) -> None:
+    """A signed workload-identity token (JWT-SVID style) proven by the verifier mints an
+    authenticated SERVICE principal carrying its attestation. This is the in-process verification
+    seam; the deploy-time transport edge (mTLS termination) is deferred."""
+    from featuregen.identity.verify import OidcVerifier
+
+    v = OidcVerifier(issuer=fake_oidc.issuer, audience="featuregen", jwks=fake_oidc.jwks)
+    env = v.verify_service(
+        fake_oidc.mint(subject="service:profiler", roles=["overlay"], attestation="sig")
+    )
+    assert env.authenticated is True
+    assert env.actor_kind == "service"
+    assert env.auth_method == "workload-identity"
+    assert env.attestation == "sig"
+    assert env.role_claims == ("overlay",)
+
+
+def test_oidc_verifier_rejects_forged_service_token(fake_oidc: FakeOidc) -> None:
+    from featuregen.identity.verify import IdentityError, OidcVerifier
+
+    v = OidcVerifier(issuer=fake_oidc.issuer, audience="featuregen", jwks=fake_oidc.jwks)
+    with pytest.raises(IdentityError):
+        v.verify_service(
+            fake_oidc.mint(
+                subject="service:rogue", roles=["platform-admin"],
+                attestation="x", sign_with="attacker-key",
+            )
+        )
 
 
 def test_current_identity_verifier_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
