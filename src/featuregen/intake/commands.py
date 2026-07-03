@@ -1580,8 +1580,13 @@ def answer_clarification(conn: DbConn, cmd: Command) -> CommandResult:
     if result.quorum_met:
         deps = current_intake_deps()
         if deps is not None and deps.client is not None:
-            refine_contract(conn, run_id, client=deps.client, redactor=deps.redactor,
-                            catalog=deps.catalog, actor=cmd.actor)
+            refine = refine_contract(conn, run_id, client=deps.client, redactor=deps.redactor,
+                                     catalog=deps.catalog, actor=cmd.actor)
+            # F7 / P3 — self-advance: when the answer completes the contract (refine re-passed the MCV
+            # floor), open Gate #1 HERE so the run reaches the gate WITHOUT a separate advance_intake
+            # dispatch. _open_gate1_task is idempotent (a later advance_intake no-ops on an open gate).
+            if refine is not None and refine.status == "validated":
+                _open_gate1_task(conn, run_id, actor=cmd.actor)
     return CommandResult(accepted=True, aggregate_id=run_id)
 
 

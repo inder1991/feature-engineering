@@ -151,3 +151,43 @@ def test_owner_answer_drives_the_refinement_loop_when_deps_registered(db, sp2_sc
         register_intake_deps(client=None, redactor=None, catalog=None)
     types = [e.type for e in load_feature_contract(db, run_id)]
     assert "CONTRACT_REFINED" in types  # the loop ran a round on the answer
+
+
+class _ValidatingLoopLLM:
+    """Like _LoopLLM but the renormalize output is fully MCV-complete (a window is present), so the
+    answer's refinement round re-passes the MCV floor → RefineResult 'validated'."""
+
+    def call(self, request):
+        from featuregen.intake.llm import LLMResult
+
+        if request.task == "renormalize":
+            return LLMResult(
+                output={"feature_semantics": {
+                    "entity": "customer", "entity_grain": ["customer_id", "as_of_date"],
+                    "observation_intent": {"kind": "point_in_time"},
+                    "calculation_method": "rolling_count",
+                    "windows": [{"name": "lookback", "value": "90d"}],
+                    "filters": [{"concept": "declined auth", "predicate": "auth_result='D'"}]},
+                    "open_fields": []},
+                self_reported_scores={"filters": {"ambiguity": 0.10, "confidence": 0.92, "source": "llm"}},
+                call_ref="", status="ok")
+        return LLMResult(output={"review_type": "CONTRACT_REVIEW", "status": "OK", "findings": []},
+                         self_reported_scores={}, call_ref="", status="ok")
+
+
+def test_owner_answer_self_advances_to_gate1_when_validated(db, sp2_schemas, agent):
+    """F7/P3: when the answer completes the contract (refine re-passes the MCV floor), answer_clarification
+    opens Gate #1 ITSELF — the run reaches the gate with NO separate advance_intake dispatch."""
+    run_id, task_id = _seed_with_task(db, agent)
+    register_intake_deps(client=_ValidatingLoopLLM(), redactor=DefaultIntentRedactor(), catalog=_View())
+    try:
+        res = answer_clarification(db, _answer_cmd(task_id, OWNER))
+    finally:
+        register_intake_deps(client=None, redactor=None, catalog=None)
+    assert res.accepted is True
+    assert "MINIMUM_CONTRACT_VALIDATED" in [e.type for e in load_feature_contract(db, run_id)]
+    with db.cursor(row_factory=dict_row) as cur:
+        cur.execute("SELECT allowed_responses FROM human_tasks WHERE run_id=%s AND status='open'", (run_id,))
+        rows = cur.fetchall()
+    assert any(set(r["allowed_responses"]) == {"confirm", "edit", "reject"} for r in rows), \
+        "Gate #1 must self-open on a validating answer (F7)"
