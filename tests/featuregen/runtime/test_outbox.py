@@ -163,6 +163,34 @@ def test_make_queue_publisher_enqueues_routed_topics_only(db) -> None:
     assert rows == [("qp1", "my_handler")]  # qp2 unrouted -> no queue row
 
 
+def test_route_required_unrouted_topic_dlqs_not_drains(db) -> None:
+    # A topic declared ROUTE-REQUIRED but with no route is a LOUD failure: relay backs off -> DLQ
+    # and counts it, instead of silently marking it 'sent' (SP-0.5 round-2 outbox route policy).
+    from featuregen.runtime.observability import counters
+
+    _seed_pending(db, "rr1", topic="MUST_ROUTE")
+    with db.cursor() as cur:
+        cur.execute("UPDATE outbox SET attempts = max_attempts - 1 WHERE message_id = 'rr1'")
+    counters.reset()
+    publish = make_queue_publisher({}, route_required=frozenset({"MUST_ROUTE"}))
+    relay_publish_batch(db, publish, owner="relay1")
+    with db.cursor() as cur:
+        cur.execute("SELECT status FROM outbox WHERE message_id = 'rr1'")
+        assert cur.fetchone()[0] == "dead"  # not silently drained to 'sent'
+    assert counters.snapshot()["counters"].get("outbox.unrouted.MUST_ROUTE", 0) >= 1
+
+
+def test_unrouted_topic_not_required_still_drains_to_sent(db) -> None:
+    # The SAME unrouted topic, when NOT route-required, is a benign drain (marked 'sent') — the
+    # empty-default policy keeps every current event topic draining, so nothing breaks today.
+    _seed_pending(db, "dr1", topic="MUST_ROUTE")
+    publish = make_queue_publisher({})  # empty route_required
+    assert relay_publish_batch(db, publish, owner="relay1") == 1
+    with db.cursor() as cur:
+        cur.execute("SELECT status FROM outbox WHERE message_id = 'dr1'")
+        assert cur.fetchone()[0] == "sent"
+
+
 def test_backpressure_holds_outbox_pending_without_failing(db) -> None:
     _seed_pending(db, "bp1", topic="STEP_TRIGGER")  # partition run:r1
     # saturate the run:r1 worker-queue partition up to the admission limit
