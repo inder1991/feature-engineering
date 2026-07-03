@@ -77,12 +77,13 @@ def seed_verified_via_command(
     ``expires_at``/override value, or seeds a dual-owner ``approved_join`` must keep hand-seeding.
     """
     # Function-local imports keep this doubles-only module import-cheap for callers that never seed.
+    from tests.featuregen._helpers import mint_test_identity, mint_test_service_identity
+
     from featuregen.authz.authorizer import PolicyAuthorizer
     from featuregen.authz.policy import seed_authz_policy
     from featuregen.commands.api import execute_command
     from featuregen.commands.authz_seam import register_command_authorizer
     from featuregen.contracts import Command
-    from featuregen.identity.build import build_human_identity, build_service_identity
     from featuregen.overlay.bootstrap import register_overlay, seed_overlay_authz
     from featuregen.overlay.catalog import register_catalog_adapter
     from featuregen.overlay.identity import fact_key
@@ -97,10 +98,10 @@ def seed_verified_via_command(
     cat.set_owner(ref, owner)
     register_catalog_adapter(cat)
 
-    svc = proposer or build_service_identity(
+    svc = proposer or mint_test_service_identity(
         subject="service:overlay-seed", role_claims=("overlay",), attestation="att-seed"
     )
-    owner_actor = build_human_identity(subject=owner, role_claims=("data_owner",))
+    owner_actor = mint_test_identity(subject=owner, role_claims=("data_owner",))
     tag = uuid.uuid4().hex[:8]
 
     proposed = execute_command(

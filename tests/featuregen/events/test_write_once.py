@@ -2,17 +2,17 @@ from __future__ import annotations
 
 import psycopg
 import pytest
+from tests.featuregen._helpers import mint_test_service_identity
 from ulid import ULID
 
 from featuregen.aggregates._append import append
 from featuregen.events.registry import event_registry
-from featuregen.identity.build import build_service_identity
 
 _EVENT_TYPE = "WRITE_ONCE_TEST"
 
 
 def _actor():
-    return build_service_identity(
+    return mint_test_service_identity(
         subject="service:write-once-test",
         role_claims=["overlay"],
         attestation="signed-deploy-id:write-once@1.0.0",

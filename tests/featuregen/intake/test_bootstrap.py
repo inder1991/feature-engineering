@@ -1,4 +1,5 @@
 from psycopg.rows import dict_row
+from tests.featuregen._helpers import mint_test_identity, mint_test_service_identity
 
 from featuregen.aggregates._append import append
 from featuregen.aggregates.run_lifecycle import run_is_terminal
@@ -9,7 +10,6 @@ from featuregen.commands.authz_seam import register_command_authorizer
 from featuregen.commands.registry import get_command
 from featuregen.contracts import Command
 from featuregen.events.registry import event_registry
-from featuregen.identity.build import build_human_identity, build_service_identity
 from featuregen.intake.bootstrap import register_sp2, seed_sp2_authz
 from featuregen.intake.store import append_feature_contract_event
 
@@ -112,8 +112,8 @@ def test_seed_sp2_authz_registers_contract_schemas_primary_selected_and_checkpoi
 def test_seeded_rows_admit_the_owner_and_the_service_at_the_authz_layer(db):
     seed_authz_policy(db)  # SP-0 base rows
     seed_sp2_authz(db)
-    raj = build_human_identity(subject="user:raj", role_claims=("data_scientist",))
-    svc = build_service_identity(
+    raj = mint_test_identity(subject="user:raj", role_claims=("data_scientist",))
+    svc = mint_test_service_identity(
         subject="service:intake-agent", role_claims=("intake-agent",), attestation="deploy-sig"
     )
     submit = Command("submit_intent", "feature_contract", None, {}, raj, "ik-a")
@@ -121,7 +121,7 @@ def test_seeded_rows_admit_the_owner_and_the_service_at_the_authz_layer(db):
     assert authorize_command(db, submit).allowed is True
     assert authorize_command(db, reject).allowed is True
     # a role that is NOT data_scientist is refused at the authz layer
-    analyst = build_human_identity(subject="user:mallory", role_claims=("analyst",))
+    analyst = mint_test_identity(subject="user:mallory", role_claims=("analyst",))
     assert authorize_command(db, Command("submit_intent", "feature_contract", None, {}, analyst, "ik-c")).allowed is False
 
 
@@ -130,7 +130,7 @@ def test_unauthorized_submit_intent_is_denied_and_audited(db):
     seed_authz_policy(db)
     seed_sp2_authz(db)
     register_command_authorizer(PolicyAuthorizer())
-    analyst = build_human_identity(subject="user:mallory", role_claims=("analyst",))
+    analyst = mint_test_identity(subject="user:mallory", role_claims=("analyst",))
     res = execute_command(
         db,
         Command(
@@ -165,8 +165,8 @@ def test_register_sp2_wires_withdraw_intent_into_the_command_catalog():
 def test_withdraw_intent_row_admits_the_requester_and_denies_the_service(db):
     seed_authz_policy(db)
     seed_sp2_authz(db)
-    raj = build_human_identity(subject="user:raj", role_claims=("data_scientist",))
-    svc = build_service_identity(
+    raj = mint_test_identity(subject="user:raj", role_claims=("data_scientist",))
+    svc = mint_test_service_identity(
         subject="service:intake-agent", role_claims=("intake-agent",), attestation="deploy-sig"
     )
     ok = Command("withdraw_intent", "run", "run_w", {"run_id": "run_w"}, raj, "wk-a")
@@ -181,7 +181,7 @@ def test_owner_dispatches_withdraw_intent_via_execute_command(db):
     seed_authz_policy(db)
     seed_sp2_authz(db)
     register_command_authorizer(PolicyAuthorizer())
-    raj = build_human_identity(subject="user:raj", role_claims=("data_scientist",))
+    raj = mint_test_identity(subject="user:raj", role_claims=("data_scientist",))
     # open an owned run + feature_contract stream (INTENT_SUBMITTED.requester == the owner)
     append(
         db, aggregate="run", aggregate_id="run_w", type="RUN_CREATED",

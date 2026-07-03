@@ -1,15 +1,16 @@
+from tests.featuregen._helpers import mint_test_identity, mint_test_service_identity
+
 from featuregen.contracts import Command
-from featuregen.identity.build import build_human_identity, build_service_identity
 from featuregen.overlay.commands import enter_fact
 from featuregen.overlay.identity import ApprovedJoinRef, CatalogObjectRef, ColumnPair, fact_key
 from featuregen.overlay.state import fold_overlay_state
 from featuregen.overlay.store import load_fact
 
-ALICE = build_human_identity(subject="user:alice", role_claims=("data_owner",))
-SVC = build_service_identity(subject="service:profiler", role_claims=("overlay",), attestation="sig")
+ALICE = mint_test_identity(subject="user:alice", role_claims=("data_owner",))
+SVC = mint_test_service_identity(subject="service:profiler", role_claims=("overlay",), attestation="sig")
 # A single principal holding BOTH the coarse data_owner authz claim AND the governance
 # platform-admin claim — the combined-claim attacker for I2.
-DANA = build_human_identity(
+DANA = mint_test_identity(
     subject="user:dana", role_claims=("data_owner", "platform-admin")
 )
 

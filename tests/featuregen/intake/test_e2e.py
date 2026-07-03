@@ -23,6 +23,8 @@ per-field clarification round (Tasks 9.3+ exercise that path).
 The scenario closes with the X4 CAS / stale-append guard proven end-to-end (SP-1 capstone C2): a
 replayed `confirm_contract` at the now-stale gate-task version is DENIED and never double-applies.
 """
+from tests.featuregen._helpers import mint_test_identity, mint_test_service_identity
+
 from featuregen.aggregates.run_lifecycle import run_is_terminal
 from featuregen.authz.authorizer import PolicyAuthorizer
 from featuregen.authz.policy import seed_authz_policy
@@ -30,7 +32,6 @@ from featuregen.commands.api import execute_command
 from featuregen.commands.authz_seam import register_command_authorizer
 from featuregen.contracts import Command, run_projection
 from featuregen.documents.primary import StagePrimaryProjection, current_primary
-from featuregen.identity.build import build_human_identity, build_service_identity
 from featuregen.intake.banking_catalog import (
     IntakeClassification,
     IntakeOutcome,
@@ -244,11 +245,11 @@ def _only_open_task(db, run_id):
 
 
 def _data_scientist(subject):
-    return build_human_identity(subject=subject, role_claims=("data_scientist",))
+    return mint_test_identity(subject=subject, role_claims=("data_scientist",))
 
 
 def _intake_agent():
-    return build_service_identity(
+    return mint_test_service_identity(
         subject="service:intake-agent", role_claims=("intake-agent",), attestation="deploy-sig"
     )
 

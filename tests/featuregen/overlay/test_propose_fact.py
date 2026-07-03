@@ -8,9 +8,9 @@ unbuilt handlers.
 """
 import pytest
 from psycopg.rows import dict_row
+from tests.featuregen._helpers import mint_test_identity
 
 from featuregen.contracts import Command, ConcurrencyError
-from featuregen.identity.build import build_human_identity
 from featuregen.overlay.commands import propose_fact
 from featuregen.overlay.identity import (
     ApprovedJoinRef,
@@ -27,7 +27,7 @@ def _orders() -> CatalogObjectRef:
 
 
 def _propose_cmd(*, ref, fact_type, value, use_case=None, actor=None, key="k1"):
-    actor = actor or build_human_identity(subject="user:alice", role_claims=("data_owner",))
+    actor = actor or mint_test_identity(subject="user:alice", role_claims=("data_owner",))
     args = {"ref": ref, "fact_type": fact_type, "proposed_value": value}
     if use_case is not None:
         args["use_case"] = use_case
@@ -97,7 +97,7 @@ def test_propose_on_verified_fact_is_denied(db, catalog):
     flow replaces it — a fresh proposal must NOT regress it to DRAFT. (Task 4.3 emits the
     confirmation; here we seed OVERLAY_FACT_CONFIRMED directly to reach VERIFIED.)"""
     catalog.set_owner(_orders(), "user:alice")
-    bob = build_human_identity(subject="user:bob", role_claims=("data_owner",))
+    bob = mint_test_identity(subject="user:bob", role_claims=("data_owner",))
     value = {"columns": ["order_id"], "is_unique": True}
     p = propose_fact(
         db, _propose_cmd(ref=_orders(), fact_type="grain", value=value, actor=bob, key="p1")
@@ -105,7 +105,7 @@ def test_propose_on_verified_fact_is_denied(db, catalog):
     assert p.accepted
     draft = p.produced_event_ids[0]
     key = fact_key(_orders(), "grain")
-    alice = build_human_identity(subject="user:alice", role_claims=("data_owner",))
+    alice = mint_test_identity(subject="user:alice", role_claims=("data_owner",))
     append_overlay_event(
         db,
         fact_key=key,
@@ -134,7 +134,7 @@ def test_repropose_after_reject_requires_new_fingerprint(db, catalog):
     """After REJECTED, the same fingerprint is sticky-denied; a DIFFERENT fingerprint is allowed.
     (Task 4.3 emits the rejection; here we seed OVERLAY_FACT_REJECTED directly.)"""
     catalog.set_owner(_orders(), "user:alice")
-    bob = build_human_identity(subject="user:bob", role_claims=("data_owner",))
+    bob = mint_test_identity(subject="user:bob", role_claims=("data_owner",))
     value = {"columns": ["order_id"], "is_unique": True}
     p = propose_fact(
         db, _propose_cmd(ref=_orders(), fact_type="grain", value=value, actor=bob, key="p1")
@@ -142,7 +142,7 @@ def test_repropose_after_reject_requires_new_fingerprint(db, catalog):
     assert p.accepted
     draft = p.produced_event_ids[0]
     key = fact_key(_orders(), "grain")
-    alice = build_human_identity(subject="user:alice", role_claims=("data_owner",))
+    alice = mint_test_identity(subject="user:alice", role_claims=("data_owner",))
     append_overlay_event(
         db,
         fact_key=key,
@@ -220,14 +220,14 @@ def test_mixed_owner_join_opens_owner_and_governance_tasks(db, catalog):
 def _reach_rejected(db, value):
     """Drive `orders`/grain to REJECTED (PROPOSED then a direct OVERLAY_FACT_REJECTED seed, the
     same event reject_fact emits) and return the fact_key. Stream is at stream_version 2."""
-    bob = build_human_identity(subject="user:bob", role_claims=("data_owner",))
+    bob = mint_test_identity(subject="user:bob", role_claims=("data_owner",))
     p = propose_fact(
         db, _propose_cmd(ref=_orders(), fact_type="grain", value=value, actor=bob, key="p1")
     )
     assert p.accepted
     draft = p.produced_event_ids[0]
     key = fact_key(_orders(), "grain")
-    alice = build_human_identity(subject="user:alice", role_claims=("data_owner",))
+    alice = mint_test_identity(subject="user:alice", role_claims=("data_owner",))
     append_overlay_event(
         db,
         fact_key=key,

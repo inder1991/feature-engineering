@@ -1,9 +1,9 @@
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from tests.featuregen._helpers import mint_test_identity
 
 from featuregen.contracts import Command
-from featuregen.identity.build import build_human_identity
 from featuregen.overlay.commands import (
     OverlayCommandError,
     confirm_fact,
@@ -16,13 +16,13 @@ from featuregen.overlay.identity import CatalogObjectRef, display_object_ref, fa
 from featuregen.overlay.state import fold_overlay_state
 from featuregen.overlay.store import load_fact
 
-ALICE = build_human_identity(subject="user:alice", role_claims=("data_owner",))
-BOB = build_human_identity(subject="user:bob", role_claims=("data_owner",))
-MALLORY = build_human_identity(subject="user:mallory", role_claims=("data_scientist",))
+ALICE = mint_test_identity(subject="user:alice", role_claims=("data_owner",))
+BOB = mint_test_identity(subject="user:bob", role_claims=("data_owner",))
+MALLORY = mint_test_identity(subject="user:mallory", role_claims=("data_scientist",))
 # A DIFFERENT data owner: holds the `data_owner` role but is NOT the task's eligible subject (I3).
-CHARLIE = build_human_identity(subject="user:charlie", role_claims=("data_owner",))
+CHARLIE = mint_test_identity(subject="user:charlie", role_claims=("data_owner",))
 # Governance principal for the subject-less governance/compliance task branch.
-ADMIN = build_human_identity(subject="user:admin", role_claims=("platform-admin",))
+ADMIN = mint_test_identity(subject="user:admin", role_claims=("platform-admin",))
 
 
 def _orders():
@@ -47,7 +47,7 @@ def _propose_and_task(db):
                 "fact_type": "grain",
                 "proposed_value": {"columns": ["order_id"], "is_unique": True},
             },
-            build_human_identity(subject="user:bob", role_claims=("data_owner",)),
+            mint_test_identity(subject="user:bob", role_claims=("data_owner",)),
             "p",
         ),
     )

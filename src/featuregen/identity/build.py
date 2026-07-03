@@ -38,13 +38,23 @@ def build_human_identity(
     on_behalf_of: str | None = None,
     impersonation: str | None = None,
     break_glass: bool = False,
+    _verified: bool = False,
 ) -> IdentityEnvelope:
+    """Construct a human IdentityEnvelope.
+
+    FAIL-CLOSED (SP-0.5 BLOCKER #1): ordinary callers get ``authenticated=False``. Claims on
+    an envelope are only *asserted* here — they become *authenticated* solely when a verifier
+    (``identity.verify.OidcVerifier``) has proven the token's signature/issuer/audience/expiry
+    and passes the internal ``_verified=True`` flag. ``_verified`` is NOT part of the public
+    contract: no application code may set it; only the identity-verification seam may. This is
+    what makes it impossible for arbitrary code to mint a principal it has not proven.
+    """
     if not subject.startswith("user:"):
         raise IdentityError("human subject must be prefixed 'user:'")
     env = IdentityEnvelope(
         subject=subject,
         actor_kind="human",
-        authenticated=True,
+        authenticated=_verified,
         auth_method=auth_method,
         role_claims=tuple(role_claims),
         groups=tuple(groups),
@@ -55,7 +65,10 @@ def build_human_identity(
         source_of_authority=source_of_authority,
         attestation=None,
     )
-    validate_identity(env)
+    if _verified:
+        # Only a verified envelope must satisfy the §6.1 authentication invariants; an
+        # unauthenticated envelope is a legitimate value (e.g. anonymous / pre-authn).
+        validate_identity(env)
     return env
 
 
@@ -67,13 +80,22 @@ def build_service_identity(
     groups: Iterable[str] = (),
     tenant: str | None = None,
     source_of_authority: str | None = None,
+    _verified: bool = False,
 ) -> IdentityEnvelope:
+    """Construct a service (machine) IdentityEnvelope.
+
+    FAIL-CLOSED like ``build_human_identity``: an ``attestation`` string supplied by a caller
+    is a *claim*, not proof. The envelope is only ``authenticated=True`` when the service
+    identity mechanism (mTLS / signed deploy token — stubbed for now, wired at deploy time)
+    has verified it and passes ``_verified=True``. Service identity is a separate concern from
+    human OIDC and stays on its own path.
+    """
     if not subject.startswith("service:"):
         raise IdentityError("service subject must be prefixed 'service:'")
     env = IdentityEnvelope(
         subject=subject,
         actor_kind="service",
-        authenticated=True,
+        authenticated=_verified,
         auth_method="workload-identity",
         role_claims=tuple(role_claims),
         groups=tuple(groups),
@@ -81,5 +103,6 @@ def build_service_identity(
         attestation=attestation,
         source_of_authority=source_of_authority,
     )
-    validate_identity(env)
+    if _verified:
+        validate_identity(env)
     return env

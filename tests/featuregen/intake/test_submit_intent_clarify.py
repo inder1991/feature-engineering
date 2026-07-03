@@ -1,13 +1,13 @@
+from tests.featuregen._helpers import mint_test_identity
 from tests.featuregen.intake.test_submit_intent_definition import _DEFINITION_OUTPUT
 
 from featuregen.contracts import Command
 from featuregen.events.store import load_stream
-from featuregen.identity.build import build_human_identity
 from featuregen.intake.banking_catalog import IntakeOutcome
 from featuregen.intake.commands import submit_intent
 from featuregen.intake.events import CLARIFICATION_REQUESTED, DRAFT_CONTRACT_PRODUCED
 
-ALICE = build_human_identity(subject="user:alice", role_claims=("data_scientist",))
+ALICE = mint_test_identity(subject="user:alice", role_claims=("data_scientist",))
 
 
 def _cmd(**args):

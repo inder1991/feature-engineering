@@ -1,4 +1,5 @@
 from psycopg.rows import dict_row
+from tests.featuregen._helpers import mint_test_identity, mint_test_service_identity
 
 import featuregen.intake.commands as cmds
 from featuregen.aggregates._append import provenance_for
@@ -9,14 +10,13 @@ from featuregen.contracts.envelopes import GateTaskSpec
 from featuregen.documents.primary import register_primary_selected
 from featuregen.documents.store import append_document
 from featuregen.gates.tasks import open_task
-from featuregen.identity.build import build_human_identity, build_service_identity
 from featuregen.idgen import mint_id
 from featuregen.intake.commands import select_candidate_doc
 from featuregen.intake.store import append_feature_contract_event
 
-OWNER = build_human_identity(subject="user:raj", role_claims=("data_scientist",))
-STRANGER = build_human_identity(subject="user:mallory", role_claims=("data_scientist",))
-SERVICE = build_service_identity(
+OWNER = mint_test_identity(subject="user:raj", role_claims=("data_scientist",))
+STRANGER = mint_test_identity(subject="user:mallory", role_claims=("data_scientist",))
+SERVICE = mint_test_service_identity(
     subject="service:intake-agent", role_claims=("intake-agent",), attestation="sig"
 )
 

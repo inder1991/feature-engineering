@@ -10,6 +10,7 @@ double LAZILY so P1's own suite does not depend on the not-yet-built P2/P3/P6 mo
 import json
 
 import pytest
+from tests.featuregen._helpers import mint_test_identity, mint_test_service_identity
 
 from featuregen.aggregates._append import append, provenance_for
 from featuregen.aggregates.bootstrap import register_phase06_event_schemas
@@ -17,7 +18,6 @@ from featuregen.contracts import NewDocument
 from featuregen.documents.registry import DocumentSchemaRegistry
 from featuregen.documents.store import append_document, compute_content_hash
 from featuregen.events.registry import event_registry
-from featuregen.identity.build import build_human_identity, build_service_identity
 from featuregen.idgen import mint_id
 from featuregen.intake.banking_catalog import IntakeClassification, IntakeOutcome
 from featuregen.intake.catalog import (  # R8/R10 seam (P2, catalog.py)
@@ -178,12 +178,12 @@ def sp2_schemas(db):
 
 @pytest.fixture
 def owner():
-    return build_human_identity(subject="user:raj", role_claims=("data_scientist",))
+    return mint_test_identity(subject="user:raj", role_claims=("data_scientist",))
 
 
 @pytest.fixture
 def agent():
-    return build_service_identity(
+    return mint_test_service_identity(
         subject="service:intake-agent", role_claims=("intake-agent",), attestation="sig"
     )
 
@@ -191,11 +191,11 @@ def agent():
 # ── Gate-#1 (Phase-7) test seams: identity constants + contract seed helpers (Task 7.1) ──────────
 # Author-self-confirms (§8.2): the eligible Gate-#1 confirmer is the authenticated HUMAN requester
 # (the request owner), never a service / the LLM / a second signer. REQUESTER is that owner.
-REQUESTER = build_human_identity(
+REQUESTER = mint_test_identity(
     subject="user:raj", role_claims=("data_scientist",), source_of_authority="oidc:raj"
 )
-OTHER_DS = build_human_identity(subject="user:mia", role_claims=("data_scientist",))
-INTAKE_SVC = build_service_identity(
+OTHER_DS = mint_test_identity(subject="user:mia", role_claims=("data_scientist",))
+INTAKE_SVC = mint_test_service_identity(
     subject="service:intake-agent", role_claims=("intake-agent",), attestation="sig"
 )
 

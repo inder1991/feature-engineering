@@ -2,9 +2,9 @@ from dataclasses import asdict
 from datetime import UTC, datetime, timedelta
 
 from psycopg.rows import dict_row
+from tests.featuregen._helpers import mint_test_identity, mint_test_service_identity
 from tests.featuregen.overlay._helpers import seed_verified_via_command
 
-from featuregen.identity.build import build_human_identity, build_service_identity
 from featuregen.overlay.authority import resolve_authority
 from featuregen.overlay.catalog import CatalogObject, FixtureCatalog, register_catalog_adapter
 from featuregen.overlay.facts import (
@@ -31,7 +31,7 @@ from featuregen.overlay.projection import OverlayProjection
 from featuregen.overlay.store import load_fact
 from featuregen.projections.runner import run_projection
 
-SERVICE_ACTOR = build_service_identity(
+SERVICE_ACTOR = mint_test_service_identity(
     subject="service:overlay-freshness", role_claims=("overlay",), attestation="att-test"
 )
 
@@ -91,7 +91,7 @@ def _seed_verified(conn, *, ref, fact_type, value, owner, use_case=None):
     from featuregen.overlay.store import append_overlay_event
 
     key = fact_key(ref, fact_type, use_case)
-    proposer = build_human_identity(subject="user:proposer", role_claims=("data_owner",))
+    proposer = mint_test_identity(subject="user:proposer", role_claims=("data_owner",))
     proposed = append_overlay_event(
         conn,
         fact_key=key,
@@ -108,7 +108,7 @@ def _seed_verified(conn, *, ref, fact_type, value, owner, use_case=None):
             "proposed_by": proposer.subject,
         },
     )
-    confirmer = build_human_identity(subject=owner, role_claims=("data_owner",))
+    confirmer = mint_test_identity(subject=owner, role_claims=("data_owner",))
     confirmed = append_overlay_event(
         conn,
         fact_key=key,
@@ -321,7 +321,7 @@ def test_stale_expiry_timer_is_noop_when_newer_confirm_supersedes_target(db):
     # the OLD timer was armed against the original confirmation, due in the past
     schedule_expiry(db, key, first_confirmed_id, datetime.now(UTC) - timedelta(seconds=1))
     # a newer FACT_CONFIRMED supersedes the original confirmation (e.g. a re-confirm)
-    confirmer = build_human_identity(subject="user:owner-a", role_claims=("data_owner",))
+    confirmer = mint_test_identity(subject="user:owner-a", role_claims=("data_owner",))
     newer = append_overlay_event(
         db,
         fact_key=key,
@@ -515,7 +515,7 @@ def test_dependency_index_tracks_confirmed_override_not_proposed_column(db):
     confirmed_col = "tier"        # the column the human actually confirmed
 
     key = fact_key(tbl, "grain", None)
-    proposer = build_human_identity(subject="user:proposer", role_claims=("data_owner",))
+    proposer = mint_test_identity(subject="user:proposer", role_claims=("data_owner",))
     proposed = append_overlay_event(
         db, fact_key=key, type=OVERLAY_FACT_PROPOSED, actor=proposer, expected_version=0,
         payload={
@@ -531,7 +531,7 @@ def test_dependency_index_tracks_confirmed_override_not_proposed_column(db):
     # CONFIRMED with an OVERRIDE that changes the column set (region -> tier)
     append_overlay_event(
         db, fact_key=key, type=OVERLAY_FACT_CONFIRMED,
-        actor=build_human_identity(subject="user:owner-a", role_claims=("data_owner",)),
+        actor=mint_test_identity(subject="user:owner-a", role_claims=("data_owner",)),
         payload={
             "value": {"columns": [confirmed_col], "is_unique": True},
             "confirmers": [{"subject": "user:owner-a", "role": "data_owner"}],

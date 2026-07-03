@@ -1,4 +1,5 @@
 from psycopg.types.json import Json
+from tests.featuregen._helpers import mint_test_identity
 
 from featuregen.authz.policy import authorize_command, seed_authz_policy
 from featuregen.authz.sod import (
@@ -8,7 +9,6 @@ from featuregen.authz.sod import (
     two_party_ok,
 )
 from featuregen.contracts.commands import Command
-from featuregen.identity.build import build_human_identity
 
 
 def _seed_run(db, run_id, author_subject):
@@ -77,7 +77,7 @@ def test_delegated_validator_is_counted_in_three_party(db):
     # The effective validator (the authority), not the delegate, is the counted responder.
     assert gather_gate_responders(db, "INDEPENDENT_VALIDATION", run_id="run_1") == {"user:val"}
 
-    val_as_approver = build_human_identity(subject="user:val", role_claims=["approver"])
+    val_as_approver = mint_test_identity(subject="user:val", role_claims=["approver"])
     cmd = Command(
         action="submit_human_signal",
         aggregate="run",
@@ -94,7 +94,7 @@ def test_delegated_validator_is_counted_in_three_party(db):
 def test_final_approval_blocks_requester_self_approval(db):
     seed_authz_policy(db)
     _seed_run(db, "run_1", "user:author")
-    author_as_approver = build_human_identity(subject="user:author", role_claims=["approver"])
+    author_as_approver = mint_test_identity(subject="user:author", role_claims=["approver"])
     cmd = Command(
         action="submit_human_signal",
         aggregate="run",
@@ -112,7 +112,7 @@ def test_three_party_blocks_validator_as_approver(db):
     seed_authz_policy(db)
     _seed_run(db, "run_1", "user:author")
     _open_and_answer_iv(db, "run_1", "user:val")
-    validator_as_approver = build_human_identity(subject="user:val", role_claims=["approver"])
+    validator_as_approver = mint_test_identity(subject="user:val", role_claims=["approver"])
     cmd = Command(
         action="submit_human_signal",
         aggregate="run",
@@ -129,7 +129,7 @@ def test_three_party_blocks_validator_as_approver(db):
 def test_independent_validation_blocks_author_as_validator(db):
     seed_authz_policy(db)
     _seed_run(db, "run_1", "user:author")
-    author_as_validator = build_human_identity(subject="user:author", role_claims=["validator"])
+    author_as_validator = mint_test_identity(subject="user:author", role_claims=["validator"])
     cmd = Command(
         action="submit_human_signal",
         aggregate="run",
@@ -143,7 +143,7 @@ def test_independent_validation_blocks_author_as_validator(db):
 
 def test_retier_self_request_is_denied(db):
     seed_authz_policy(db)
-    rel = build_human_identity(subject="user:rel", role_claims=["release"])
+    rel = mint_test_identity(subject="user:rel", role_claims=["release"])
     cmd = Command(
         action="retier",
         aggregate="feature",
@@ -159,7 +159,7 @@ def test_retier_self_request_is_denied(db):
 
 def test_retier_without_requester_is_denied(db):
     seed_authz_policy(db)
-    rel = build_human_identity(subject="user:rel", role_claims=["release"])
+    rel = mint_test_identity(subject="user:rel", role_claims=["release"])
     cmd = Command(
         action="retier",
         aggregate="feature",
@@ -175,7 +175,7 @@ def test_retier_without_requester_is_denied(db):
 
 def test_retier_two_party_is_allowed(db):
     seed_authz_policy(db)
-    rel = build_human_identity(subject="user:rel", role_claims=["release"])
+    rel = mint_test_identity(subject="user:rel", role_claims=["release"])
     cmd = Command(
         action="retier",
         aggregate="feature",
@@ -193,7 +193,7 @@ def test_retier_two_party_is_allowed(db):
 
 def test_compliance_sensitive_activate_needs_four_eyes(db):
     seed_authz_policy(db)
-    rel = build_human_identity(subject="user:rel", role_claims=["release"])
+    rel = mint_test_identity(subject="user:rel", role_claims=["release"])
     cmd = Command(
         action="activate",
         aggregate="feature",

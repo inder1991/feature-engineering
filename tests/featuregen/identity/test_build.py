@@ -9,13 +9,25 @@ from featuregen.identity.build import (
 )
 
 
-def test_build_human_is_oidc_authenticated():
+def test_build_human_is_unauthenticated_by_default():
+    """FAIL-CLOSED (BLOCKER #1): a directly-built human identity carries its claimed shape but
+    is NOT authenticated. Authentication is granted only by a verifier (see test_verify.py)."""
     env = build_human_identity(subject="user:raj", role_claims=["data_scientist"])
     assert env.actor_kind == "human"
     assert env.auth_method == "oidc"
-    assert env.authenticated is True
+    assert env.authenticated is False
     assert env.role_claims == ("data_scientist",)
     assert env.attestation is None
+
+
+def test_verified_flag_yields_authenticated_human():
+    """The internal _verified flag (only a verifier passes it) is what mints an authenticated
+    principal; a verified envelope must satisfy the §6.1 authentication invariants."""
+    env = build_human_identity(
+        subject="user:raj", role_claims=["data_scientist"], _verified=True
+    )
+    assert env.authenticated is True
+    assert env.actor_kind == "human"
 
 
 def test_build_human_rejects_unprefixed_subject():

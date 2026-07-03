@@ -11,13 +11,13 @@ advance_intake duplicates NO routing / MCV logic: `refine_contract` stays the ro
 import copy
 
 from psycopg.rows import dict_row
+from tests.featuregen._helpers import mint_test_identity, mint_test_service_identity
 
 from featuregen.authz.authorizer import PolicyAuthorizer
 from featuregen.authz.policy import seed_authz_policy
 from featuregen.commands.api import execute_command
 from featuregen.commands.authz_seam import register_command_authorizer
 from featuregen.contracts import Command
-from featuregen.identity.build import build_human_identity, build_service_identity
 from featuregen.intake.banking_catalog import IntakeClassification, IntakeOutcome
 from featuregen.intake.bootstrap import register_sp2, seed_sp2_authz
 from featuregen.intake.catalog import load_banking_catalog_from_seed, register_intake_catalog
@@ -31,8 +31,8 @@ from featuregen.intake.read_model import get_contract
 from featuregen.intake.redaction import DefaultIntentRedactor, register_intent_redactor
 from featuregen.intake.store import append_feature_contract_event as append_fc_event
 
-RAJ = build_human_identity(subject="user:raj", role_claims=("data_scientist",))
-AGENT = build_service_identity(
+RAJ = mint_test_identity(subject="user:raj", role_claims=("data_scientist",))
+AGENT = mint_test_service_identity(
     subject="service:intake-agent", role_claims=("intake-agent",), attestation="sig"
 )
 

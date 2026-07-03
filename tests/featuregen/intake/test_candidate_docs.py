@@ -1,8 +1,9 @@
+from tests.featuregen._helpers import mint_test_identity
+
 from featuregen.aggregates._append import provenance_for
 from featuregen.contracts.documents import NewDocument, Stage
 from featuregen.documents.registry import DocumentSchemaRegistry
 from featuregen.documents.store import append_document, get_document
-from featuregen.identity.build import build_human_identity
 from featuregen.idgen import mint_id
 from featuregen.intake.candidates import (
     CANDIDATES_OUTPUT_SCHEMA_ID,
@@ -14,7 +15,7 @@ from featuregen.intake.candidates import (
 )
 from featuregen.intake.llm import LLMResult
 
-OWNER = build_human_identity(subject="user:raj", role_claims=("data_scientist",))
+OWNER = mint_test_identity(subject="user:raj", role_claims=("data_scientist",))
 
 _OUT = {"candidates": [
     {"definition_text": "distinct MCC delta 30d", "rationale": "churn",

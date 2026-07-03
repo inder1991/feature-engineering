@@ -1,6 +1,6 @@
 import pytest
+from tests.featuregen._helpers import mint_test_identity
 
-from featuregen.identity.build import build_human_identity
 from featuregen.security.break_glass import (
     BreakGlassError,
     invoke_break_glass,
@@ -9,14 +9,14 @@ from featuregen.security.break_glass import (
 
 
 def _admin(subject):
-    return build_human_identity(subject=subject, role_claims=["platform-admin"])
+    return mint_test_identity(subject=subject, role_claims=["platform-admin"])
 
 
 def test_invoke_requires_two_distinct_admins(db):
     a = _admin("user:adm1")
     with pytest.raises(BreakGlassError):
         invoke_break_glass(db, actor=a, co_signer=a, attempted_action="admin_correct")
-    non_admin = build_human_identity(subject="user:b", role_claims=["data_scientist"])
+    non_admin = mint_test_identity(subject="user:b", role_claims=["data_scientist"])
     with pytest.raises(BreakGlassError):
         invoke_break_glass(db, actor=a, co_signer=non_admin, attempted_action="admin_correct")
 
@@ -57,7 +57,7 @@ def test_review_must_be_independent(db):
 def test_review_sign_off_records_and_cancels_timer(db):
     a, b = _admin("user:adm1"), _admin("user:adm2")
     review_id = invoke_break_glass(db, actor=a, co_signer=b, attempted_action="admin_correct")
-    reviewer = build_human_identity(subject="user:cmp", role_claims=["compliance"])
+    reviewer = mint_test_identity(subject="user:cmp", role_claims=["compliance"])
     sign_off_break_glass_review(
         db,
         review_id,

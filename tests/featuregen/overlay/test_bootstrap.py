@@ -1,11 +1,11 @@
 from psycopg.rows import dict_row
+from tests.featuregen._helpers import mint_test_identity, mint_test_service_identity
 
 from featuregen.authz.authorizer import PolicyAuthorizer
 from featuregen.authz.policy import seed_authz_policy
 from featuregen.commands.api import execute_command
 from featuregen.commands.authz_seam import register_command_authorizer
 from featuregen.contracts import Command
-from featuregen.identity.build import build_human_identity, build_service_identity
 from featuregen.overlay.bootstrap import register_overlay, seed_overlay_authz
 from featuregen.overlay.catalog import register_catalog_adapter
 from featuregen.overlay.identity import CatalogObjectRef, fact_key
@@ -41,8 +41,8 @@ def _wire(db, catalog):
 
 def test_data_owner_can_propose_and_confirm_via_execute_command(db, catalog):
     _wire(db, catalog)
-    svc = build_service_identity(subject="service:profiler", role_claims=("overlay",), attestation="sig")
-    owner = build_human_identity(subject="user:alice", role_claims=("data_owner",))
+    svc = mint_test_service_identity(subject="service:profiler", role_claims=("overlay",), attestation="sig")
+    owner = mint_test_identity(subject="user:alice", role_claims=("data_owner",))
 
     proposed = execute_command(
         db,
@@ -79,7 +79,7 @@ def test_data_owner_can_propose_and_confirm_via_execute_command(db, catalog):
 
 def test_wrong_role_is_denied_and_audited(db, catalog):
     _wire(db, catalog)
-    mallory = build_human_identity(subject="user:mallory", role_claims=("data_scientist",))
+    mallory = mint_test_identity(subject="user:mallory", role_claims=("data_scientist",))
     res = execute_command(
         db,
         Command(
@@ -114,7 +114,7 @@ def test_handler_authority_denial_is_audited(db, catalog):
     holds `compliance` -> PASSES coarse authz (confirm_fact has a compliance row) but is NOT the
     resolved data-owner authority for orders (alice is), so the handler denies in-line."""
     _wire(db, catalog)  # _orders() owned by user:alice; full execute_command path
-    svc = build_service_identity(
+    svc = mint_test_service_identity(
         subject="service:profiler", role_claims=("overlay",), attestation="sig"
     )
     proposed = execute_command(
@@ -131,7 +131,7 @@ def test_handler_authority_denial_is_audited(db, catalog):
     )
     assert proposed.accepted is True, proposed.denied_reason
     draft = proposed.produced_event_ids[0]
-    carol = build_human_identity(subject="user:carol", role_claims=("compliance",))
+    carol = mint_test_identity(subject="user:carol", role_claims=("compliance",))
     res = execute_command(
         db,
         Command(
@@ -153,7 +153,7 @@ def test_handler_four_eyes_denial_is_audited(db, catalog):
     """F4: a four-eyes (SoD) denial inside the handler must also be audited. alice owns orders and
     proposes the fact, then attempts to confirm her own proposal -> proposer != confirmer fails."""
     _wire(db, catalog)  # alice owns orders
-    alice = build_human_identity(subject="user:alice", role_claims=("data_owner",))
+    alice = mint_test_identity(subject="user:alice", role_claims=("data_owner",))
     proposed = execute_command(
         db,
         Command(
@@ -189,7 +189,7 @@ def test_handler_benign_cas_stale_denial_is_not_audited(db, catalog):
     violation) must NOT be audited — the fix must not over-audit. The legit owner alice confirms
     against a bogus target_event_id, which is denied before any authority check."""
     _wire(db, catalog)  # alice owns orders
-    svc = build_service_identity(
+    svc = mint_test_service_identity(
         subject="service:profiler", role_claims=("overlay",), attestation="sig"
     )
     proposed = execute_command(
@@ -205,7 +205,7 @@ def test_handler_benign_cas_stale_denial_is_not_audited(db, catalog):
         ),
     )
     assert proposed.accepted is True, proposed.denied_reason
-    alice = build_human_identity(subject="user:alice", role_claims=("data_owner",))
+    alice = mint_test_identity(subject="user:alice", role_claims=("data_owner",))
     res = execute_command(
         db,
         Command(
@@ -232,8 +232,8 @@ def test_platform_admin_clears_governance_queue_via_execute_command(db, catalog)
     just the in-handler `_actor_is_authority` check). `_payments` has NO owner recorded, so authority
     resolves to the platform-admin/governance queue."""
     _wire(db, catalog)  # only sets an owner for _orders(); _payments() owner stays unknown
-    svc = build_service_identity(subject="service:profiler", role_claims=("overlay",), attestation="sig")
-    admin = build_human_identity(subject="user:admin", role_claims=("platform-admin",))
+    svc = mint_test_service_identity(subject="service:profiler", role_claims=("overlay",), attestation="sig")
+    admin = mint_test_identity(subject="user:admin", role_claims=("platform-admin",))
 
     proposed = execute_command(
         db,

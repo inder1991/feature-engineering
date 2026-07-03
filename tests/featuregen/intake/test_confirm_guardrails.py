@@ -1,4 +1,5 @@
 from psycopg.rows import dict_row
+from tests.featuregen._helpers import mint_test_service_identity
 from tests.featuregen.intake.conftest import (
     INTAKE_SVC,
     OTHER_DS,
@@ -9,7 +10,6 @@ from tests.featuregen.intake.conftest import (
 
 from featuregen.contracts import Command
 from featuregen.events.store import load_stream
-from featuregen.identity.build import build_service_identity
 from featuregen.intake.commands import confirm_contract, open_gate1_task
 from featuregen.intake.state import FeatureContractStatus, fold_feature_contract_state
 from featuregen.security.audit import verify_chain
@@ -60,7 +60,7 @@ def test_different_data_scientist_is_denied_and_audited(db):
 
 def test_service_principal_cannot_confirm(db):
     task_id, tv = _ready(db, "run_svc")
-    svc = build_service_identity(subject="service:intake-agent", role_claims=("intake-agent",), attestation="s")
+    svc = mint_test_service_identity(subject="service:intake-agent", role_claims=("intake-agent",), attestation="s")
     res = confirm_contract(db, _cmd("run_svc", task_id, tv, svc))  # actor_kind != human
     assert res.accepted is False
     assert "requester" in res.denied_reason

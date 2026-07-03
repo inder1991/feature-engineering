@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 
-from featuregen.identity.build import build_service_identity
+from tests.featuregen._helpers import mint_test_service_identity
+
 from featuregen.intake import events
 from featuregen.intake.state import (
     FeatureContractState,
@@ -191,7 +192,7 @@ def test_fold_reads_request_id_and_run_id_from_the_envelope_not_the_payload(conn
     # aggregate_id, R2). Build a real feature_contract stream exactly the way production does (ids on the
     # seam kwargs, a payload that carries ONLY the semantic fields) and prove the fold surfaces the REAL
     # ids, NOT None. This assertion FAILS before the fix (the fold read p.get("request_id") → None).
-    actor = build_service_identity(
+    actor = mint_test_service_identity(
         subject="service:intake-agent", role_claims=["intake-agent"], attestation="sig"
     )
     append_feature_contract_event(

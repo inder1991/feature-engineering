@@ -1,7 +1,7 @@
 from psycopg.rows import dict_row
+from tests.featuregen._helpers import mint_test_identity
 
 from featuregen.contracts import Command
-from featuregen.identity.build import build_human_identity
 from featuregen.intake.commands import (
     answer_clarification,
     open_clarification_task,
@@ -12,8 +12,8 @@ from featuregen.intake.store import append_feature_contract_event as append_fc_e
 from featuregen.intake.store import load_feature_contract
 from featuregen.security.audit import verify_chain
 
-OWNER = build_human_identity(subject="user:raj", role_claims=("data_scientist",))
-MALLORY = build_human_identity(subject="user:mallory", role_claims=("data_scientist",))
+OWNER = mint_test_identity(subject="user:raj", role_claims=("data_scientist",))
+MALLORY = mint_test_identity(subject="user:mallory", role_claims=("data_scientist",))
 
 
 class _View:

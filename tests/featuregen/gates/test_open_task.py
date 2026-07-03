@@ -1,6 +1,7 @@
 from datetime import timedelta
 
 import pytest
+from tests.featuregen._helpers import mint_test_service_identity
 
 from featuregen.contracts.gates import GateTaskSpec
 from featuregen.gates.duration import parse_duration
@@ -11,7 +12,6 @@ from featuregen.gates.tasks import (
     cancel_tasks_on_run_advance,
     open_task,
 )
-from featuregen.identity.build import build_service_identity
 
 
 def _spec(**kw):
@@ -28,7 +28,7 @@ def _spec(**kw):
 
 
 def _svc():
-    return build_service_identity(
+    return mint_test_service_identity(
         subject="service:intake-agent",
         role_claims=["workflow"],
         attestation="signed-deploy-id:sp2-intake@1.4.0",

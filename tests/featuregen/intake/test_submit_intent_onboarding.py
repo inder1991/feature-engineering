@@ -1,8 +1,8 @@
 from psycopg.rows import dict_row
+from tests.featuregen._helpers import mint_test_identity
 
 from featuregen.contracts import Command
 from featuregen.events.store import load_stream
-from featuregen.identity.build import build_human_identity
 from featuregen.intake.banking_catalog import IntakeOutcome
 from featuregen.intake.commands import submit_intent
 from featuregen.intake.events import (
@@ -11,7 +11,7 @@ from featuregen.intake.events import (
     USE_CASE_ONBOARDING_REQUESTED,
 )
 
-ALICE = build_human_identity(subject="user:alice", role_claims=("data_scientist",))
+ALICE = mint_test_identity(subject="user:alice", role_claims=("data_scientist",))
 
 
 def _cmd():
