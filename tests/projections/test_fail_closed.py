@@ -170,3 +170,14 @@ def test_analytics_skip_is_recorded(conn, poison_analytics_projection) -> None:
     assert row is not None and row[0] == poison_seq
     # Fail-open preserved: the checkpoint still advanced PAST the poison event (to head).
     assert projection_lag(conn, proj.name) == 0
+
+
+def test_analytics_skip_increments_counter(conn, poison_analytics_projection) -> None:
+    """A durable analytics skip must ALSO surface as the `projection.skip` counter so a health
+    endpoint/operator can see BCBS-239 completeness gaps, not just a table row (SP-0.5 round-2)."""
+    from featuregen.runtime.observability import counters
+
+    proj, _ = poison_analytics_projection
+    counters.reset()
+    run_projection(conn, proj)
+    assert counters.snapshot()["counters"].get("projection.skip", 0) >= 1

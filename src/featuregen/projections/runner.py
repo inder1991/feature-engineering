@@ -4,6 +4,7 @@ from psycopg.rows import dict_row
 
 from featuregen.contracts import DbConn, Projection, ProjectionApplyError
 from featuregen.events.serde import row_to_event
+from featuregen.runtime.observability import counters
 
 
 def _ensure_checkpoint(conn: DbConn, name: str, is_analytics: bool) -> None:
@@ -65,6 +66,7 @@ def run_projection(conn: DbConn, projection: Projection, *, batch: int = 500) ->
                     "VALUES (%s, %s, %s) ON CONFLICT DO NOTHING",
                     (projection.name, event.global_seq, str(exc)[:500]),
                 )
+                counters.incr("projection.skip")  # surface the completeness gap as a metric
                 last_seq = event.global_seq  # fail open, but the skip is now durable + auditable
                 continue
             last_seq = event.global_seq

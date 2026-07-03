@@ -72,6 +72,20 @@ def test_run_worker_once_drives_a_queued_step(db, seeded_pipeline) -> None:
         assert [r[0] for r in cur.fetchall()] == ["STEP_TRIGGER", "STEP_DONE"]
 
 
+def test_run_worker_once_emits_depth_and_lag_gauges(db, seeded_pipeline) -> None:
+    """Each tick must publish queue-depth and per-projection lag gauges so a health endpoint can
+    see backlog/staleness, not just counters (SP-0.5 round-2)."""
+    from featuregen.runtime.observability import counters
+    from featuregen.runtime.worker import run_worker_once
+
+    reg, projections = seeded_pipeline
+    counters.reset()
+    run_worker_once(db, reg, projections, owner="w1", now=_now())
+    gauges = counters.snapshot()["gauges"]
+    assert "queue.depth" in gauges
+    assert any(k.startswith("projection.lag.") for k in gauges)
+
+
 def test_run_worker_once_is_idle_on_empty(db, seeded_pipeline) -> None:
     """After draining to idle, the next tick does no queue work — no busy-spin."""
     from featuregen.runtime.worker import run_worker_once

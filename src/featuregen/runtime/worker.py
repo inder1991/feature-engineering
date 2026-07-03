@@ -27,11 +27,16 @@ from psycopg.rows import dict_row
 from featuregen.contracts import Command, Projection
 from featuregen.overlay.catalog import current_catalog_adapter
 from featuregen.overlay.expiry import fire_due_overlay_expiries
-from featuregen.projections.runner import run_projection
+from featuregen.projections.runner import projection_lag, run_projection
 from featuregen.runtime.dispatch import process_one, recover_stuck
 from featuregen.runtime.observability import counters, log
 from featuregen.runtime.outbox import OutboxMessage, make_queue_publisher, relay_publish_batch
-from featuregen.runtime.queue import CONTROL_SIGNAL_HANDLERS, complete, fail_permanent
+from featuregen.runtime.queue import (
+    CONTROL_SIGNAL_HANDLERS,
+    complete,
+    fail_permanent,
+    queue_depth,
+)
 from featuregen.runtime.timers import fire_timer, poll_due_timers
 
 # Outbox topic -> internal step handler. EMPTY by default: in this SP-0.5 slice the async steps
@@ -292,6 +297,12 @@ def run_worker_once(
 
     errors = counters.snapshot()["counters"].get("worker.errors", 0) - errors_before
     counters.gauge("worker.last_tick.queue_processed", queue_processed)
+    # Health gauges: backlog depth + per-projection replay lag, so an operator/health endpoint
+    # sees the running system's state each tick (SP-0.5 round-2).
+    counters.gauge("queue.depth", queue_depth(conn))
+    for projection in projections:
+        name = getattr(projection, "name", "?")
+        counters.gauge(f"projection.lag.{name}", projection_lag(conn, name))
     return WorkerTick(
         queue_processed=queue_processed,
         relay_published=relay_published,
