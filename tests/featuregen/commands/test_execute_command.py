@@ -166,6 +166,26 @@ def test_projection_degraded_blocks_commands(db):
     assert ran == []  # handler never dispatched for a degraded aggregate
 
 
+def test_execute_command_is_atomic_on_an_autocommit_connection(db):
+    # On an autocommit connection, a handler that raises must NOT leave the idempotency claim
+    # committed — the whole command runs in ONE transaction, so a failure rolls the claim back and
+    # a retry can re-claim (SP-0.5 round-2: transaction-agnostic execute_command). Without the wrap
+    # the claim INSERT auto-commits and strands a _pending row.
+    import psycopg
+
+    def boom(conn, cmd):
+        raise RuntimeError("handler blew up mid-command")
+
+    register_command("boom", boom)
+    with psycopg.connect(db.info.dsn, autocommit=True) as ac:
+        with pytest.raises(RuntimeError):
+            execute_command(ac, make_cmd("boom", "run", "agg_ac", {}, idem="ac_atomic"))
+        row = ac.execute(
+            "SELECT 1 FROM command_idempotency WHERE idempotency_key = 'ac_atomic'"
+        ).fetchone()
+    assert row is None  # claim rolled back atomically; no stranded _pending
+
+
 def test_resolve_degraded_bypasses_the_degraded_gate(db):
     # resolve_degraded must run EVEN WHEN the aggregate is degraded — otherwise it could never be
     # un-blocked. It is the sole action special-cased past the degraded gate.
