@@ -444,6 +444,8 @@ def assemble_draft_body(
     llm_output: dict,
     llm_call_ref: str,
     risk_flags: list[str] | None = None,
+    product: str | None = None,
+    region: str | None = None,
 ) -> dict:
     """Build the DRAFT_CONTRACT body (§4.1) from the LLM's semantic subset + the authoritative SP-0
     envelope. The platform owns the envelope: `request_id`, `raw_input_ref`,
@@ -465,6 +467,10 @@ def assemble_draft_body(
         "open_questions": list(llm_output.get("open_questions", [])),
         "assumption_ledger_ref": assumption_ledger_ref,
         "risk_flags": list(risk_flags or []),
+        # P2-b/F6 — the scoped-use-case context, carried so the confirm-time §8.4 re-screen can pass the
+        # intent's product/region (assemble_draft_body previously dropped them → re-screen ran None/None).
+        "product": product,
+        "region": region,
         "provenance": {"llm_call_refs": [llm_call_ref], "schema_version": DRAFT_SCHEMA_VERSION},
         "status": DRAFT_STATUS,
     }
@@ -677,6 +683,8 @@ def _produce_draft(
     raw_input_ref: str,
     raw_input_classification: str,
     classification: IntakeClassification,
+    product: str | None,
+    region: str | None,
     produced: list,
 ) -> CommandResult:
     """Redact → structure_intent → Draft + Assumption Ledger (§5.2), fail-closed at both the redaction
@@ -741,6 +749,7 @@ def _produce_draft(
         raw_input_classification=raw_input_classification, assumption_ledger_ref=ledger_doc,
         llm_output=out, llm_call_ref=result.call_ref,
         risk_flags=_risk_flags_for(classification, _catalog),
+        product=product, region=region,
     )
     assert_no_silent_assumption(draft_body, ledger_body)  # §5.3 — no field silently settled
     validate_draft(draft_body)                            # SP-0 envelope + required-field validation
@@ -989,7 +998,7 @@ def submit_intent(conn: DbConn, cmd: Command) -> CommandResult:
             conn, cmd=cmd, run_id=run_id, request_id=request_id, intent_text=intent_text,
             intake_mode=intake_mode, raw_input_ref=raw_input_ref,
             raw_input_classification=raw_input_classification,
-            classification=classification, produced=produced,
+            classification=classification, product=product, region=region, produced=produced,
         )
     except ConcurrencyError:  # X4 — a concurrent transition advanced the fc head between fold and append.
         return CommandResult(accepted=False, aggregate_id=run_id, denied_reason="stale")
@@ -2074,22 +2083,29 @@ def _prohibited_intent_screen(conn: DbConn, draft_body: dict) -> str | None:
     catalog = current_intake_catalog()
     if catalog is None or not getattr(catalog, "version", None):
         return "banking catalog unavailable/unversioned at confirmation — fail-closed park for review (§8.4)"
-    cls = classify_intent(
-        _screen_text(draft_body),
-        product=draft_body.get("product"),
-        region=draft_body.get("region"),
-        catalog=catalog,
-    )
-    if cls.outcome is IntakeOutcome.PROHIBITED_DATA_CLASS:
-        return (
-            f"prohibited data class: {cls.matched_class} (catalog {cls.catalog_version}); cannot confirm — "
-            f"edit the intent or withdraw (§8.4)"
-        )
-    if cls.outcome is not IntakeOutcome.CLEAR:
-        return (
-            f"confirmation-time classification requires clarification/review "
-            f"(outcome={cls.outcome.value}, catalog {cls.catalog_version}) (§8.4)"
-        )
+    product = draft_body.get("product")
+    region = draft_body.get("region")
+    # P2-b/F6 — screen the ORIGINAL RAW intent (resolved by reference from the F1 write-once blob store),
+    # NOT only the lossy structured Draft text: a prohibited phrase dropped/softened during structuring
+    # would otherwise escape this backstop. Both texts are re-classified over the CURRENT catalog with the
+    # intent's product/region; most-restrictive-wins — EITHER being non-CLEAR blocks the confirm.
+    texts = [_screen_text(draft_body)]
+    raw_ref = draft_body.get("raw_input_ref")
+    raw_blob = read_blob(conn, raw_ref) if raw_ref else None
+    if raw_blob and raw_blob.get("raw_input"):
+        texts.append(str(raw_blob["raw_input"]))
+    for text in texts:
+        cls = classify_intent(text, product=product, region=region, catalog=catalog)
+        if cls.outcome is IntakeOutcome.PROHIBITED_DATA_CLASS:
+            return (
+                f"prohibited data class: {cls.matched_class} (catalog {cls.catalog_version}); cannot confirm — "
+                f"edit the intent or withdraw (§8.4)"
+            )
+        if cls.outcome is not IntakeOutcome.CLEAR:
+            return (
+                f"confirmation-time classification requires clarification/review "
+                f"(outcome={cls.outcome.value}, catalog {cls.catalog_version}) (§8.4)"
+            )
     return None  # CLEAR under the current catalog — the allow is auditable at cls.catalog_version (§4.5(c))
 
 

@@ -53,6 +53,34 @@ def test_prohibited_data_class_blocks_confirmation(db, monkeypatch):
         assert cur.fetchone()["status"] == "open"
 
 
+def test_confirm_rescreens_the_raw_intent_not_only_the_lossy_draft(db, monkeypatch):
+    """F6/P2-b: the confirm-time §8.4 backstop re-screens the ORIGINAL raw intent (resolved from the F1
+    write-once blob store), not only the lossy structured Draft. A prohibited phrase present in the raw
+    intent but dropped/softened during structuring — so ABSENT from the Draft screen text — still blocks."""
+    import featuregen.intake.commands as C
+    from featuregen.intake.blobs import write_blob
+
+    def _text_sensitive(text, *, product=None, region=None, catalog):
+        # the Draft screen text (feature name / target / filter concepts) has no "race" → CLEAR; only the
+        # RAW intent does → PROHIBITED. So a block here can ONLY come from the raw re-screen.
+        if "race" in text.lower():
+            return _Cls(IntakeOutcome.PROHIBITED_DATA_CLASS, catalog.version,
+                        matched_class="protected_attribute:race")
+        return _Cls(IntakeOutcome.CLEAR, catalog.version)
+
+    monkeypatch.setattr(C, "classify_intent", _text_sensitive)
+    draft = definition_draft("req_raw")  # raw_input_ref = "blob_raw_def"; the Draft screen text is CLEAR
+    task_id, tv = _ready(db, "run_raw", draft)
+    write_blob(db, draft["raw_input_ref"], {"raw_input": "predict credit risk using the customer's race"})
+    res = confirm_contract(db, _cmd("run_raw", task_id, tv))
+    assert res.accepted is False
+    assert "prohibited data class" in res.denied_reason
+    assert "protected_attribute:race" in res.denied_reason
+    # the gate stays open (not consumed) — the run can edit/withdraw
+    assert fold_feature_contract_state(load_stream(db, "feature_contract", "run_raw")).status \
+        is FeatureContractStatus.MINIMUM_CONTRACT_VALIDATED
+
+
 def test_sensitive_proxy_routes_to_clarification_not_block(db, monkeypatch):
     import featuregen.intake.commands as C
     monkeypatch.setattr(
