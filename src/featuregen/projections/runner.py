@@ -30,9 +30,10 @@ def run_projection(conn: DbConn, projection: Projection, *, batch: int = 500) ->
     """Consume events with global_seq > checkpoint_seq in order, calling apply(); advance the
     checkpoint to the last applied event. Returns the count applied.
 
-    NOTE: this Task-12 version handles the happy path only. The §3.6 fail-closed degraded-halt and
-    analytics fail-open branches (and the `projection_degraded` marking) are added in Task 13,
-    where a failing test drives them in."""
+    Fail-closed for a normal projection (§3.6): a poison event HALTS the projection (no advance
+    past it) and marks the affected aggregate in `projection_degraded`. An analytics projection
+    (`is_analytics`) fails OPEN: it records the skip in `projection_skips` (+ the `projection.skip`
+    counter) and advances past the poison, so a completeness gap is never silent."""
     _ensure_checkpoint(conn, projection.name, projection.is_analytics)
     with conn.cursor(row_factory=dict_row) as cur:
         cur.execute(
