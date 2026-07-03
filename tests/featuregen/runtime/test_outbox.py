@@ -96,6 +96,27 @@ def test_relay_backoff_on_publish_failure(db) -> None:
     assert "downstream down" in last_error
 
 
+def test_relay_backoff_applies_jitter(db) -> None:
+    """m7: two outbox rows failing at the SAME attempt count must not reschedule to the identical
+    next_attempt_at — jitter must reach the outbox reschedule (the outbox analogue of the queue
+    test_fail_retryable_applies_jitter). now() is fixed within the test transaction, so any
+    difference between the two next_attempt_at values comes purely from jitter in the backoff."""
+    _seed_pending(db, "jit_a")
+    _seed_pending(db, "jit_b")
+
+    def publish(conn, msg) -> None:
+        raise RuntimeError("downstream down")
+
+    assert relay_publish_batch(db, publish, owner="relay1") == 0
+    with db.cursor() as cur:
+        cur.execute(
+            "SELECT next_attempt_at FROM outbox WHERE message_id IN ('jit_a', 'jit_b') "
+            "ORDER BY message_id"
+        )
+        ts = [r[0] for r in cur.fetchall()]
+    assert ts[0] != ts[1]  # jitter makes an identical reschedule astronomically unlikely
+
+
 def test_relay_routes_to_dlq_at_max_attempts(db) -> None:
     _seed_pending(db, "rp3")
     with db.cursor() as cur:

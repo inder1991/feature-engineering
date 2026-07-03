@@ -148,6 +148,38 @@ def test_fail_permanent_dlqs(db) -> None:
         assert cur.fetchone()[0] == "dead"
 
 
+def test_fail_permanent_increments_dlq_counter(db) -> None:
+    """m5: a permanent (poison) DLQ transition emits a dedicated queue.dlq counter, distinct from
+    the transient queue.fail backoff counter."""
+    from featuregen.runtime.observability import counters
+
+    counters.reset()
+    qid = enqueue(db, message_id="dlq_perm", partition_key="run:r1", handler="h", payload={})
+    fail_permanent(db, qid, error="deterministic")
+    assert counters.snapshot()["counters"].get("queue.dlq", 0) == 1
+
+
+def test_fail_retryable_at_budget_increments_dlq_counter(db) -> None:
+    """m5: the retry-EXHAUSTED DLQ path (attempts hit max_attempts) also emits queue.dlq — but a
+    transient backoff reschedule (attempts below budget) does NOT."""
+    from featuregen.runtime.observability import counters
+
+    counters.reset()
+    # below budget: reschedule with backoff, NOT a DLQ
+    reschedule = enqueue(db, message_id="dlq_rt_ok", partition_key="run:r1", handler="h", payload={})
+    with db.cursor() as cur:
+        cur.execute("UPDATE queue SET attempts = 1 WHERE id = %s", (reschedule,))
+    fail_retryable(db, reschedule, error="transient")
+    assert counters.snapshot()["counters"].get("queue.dlq", 0) == 0  # no DLQ on backoff
+
+    # at budget: retry-exhausted DLQ
+    exhausted = enqueue(db, message_id="dlq_rt", partition_key="run:r2", handler="h", payload={})
+    with db.cursor() as cur:
+        cur.execute("UPDATE queue SET attempts = max_attempts WHERE id = %s", (exhausted,))
+    fail_retryable(db, exhausted, error="exhausted")
+    assert counters.snapshot()["counters"].get("queue.dlq", 0) == 1
+
+
 def test_reclaim_stuck_queue(db) -> None:
     with db.cursor() as cur:
         cur.execute(

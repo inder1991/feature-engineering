@@ -128,6 +128,13 @@ def _mark_degraded(conn: DbConn, projection_name: str, exc: ProjectionApplyError
 def rebuild_projection(conn: DbConn, projection: Projection) -> None:
     """reset() then deterministically replay from global_seq=0 (§3.6)."""
     projection.reset(conn)
+    # Clear this projection's stale skip ledger BEFORE replay: after a fix-and-replay, leftover
+    # projection_skips rows would report a phantom completeness gap (m4). A clean replay either
+    # re-records a genuine skip or leaves the ledger empty.
+    with conn.cursor() as cur:
+        cur.execute(
+            "DELETE FROM projection_skips WHERE projection_name = %s", (projection.name,)
+        )
     _ensure_checkpoint(conn, projection.name, projection.is_analytics)
     with conn.cursor() as cur:
         cur.execute(

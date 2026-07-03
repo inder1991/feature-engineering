@@ -73,6 +73,44 @@ def test_rebuild_reproduces_identical_state(conn):
     assert after == before
 
 
+def test_rebuild_clears_projection_skips(conn):
+    # m4 (final review): after a fix-and-replay rebuild, stale projection_skips rows would report a
+    # phantom completeness gap (a BCBS 239 accuracy signal). rebuild must clear the ledger for this
+    # projection (only), before replay.
+    with conn.cursor() as cur:
+        cur.execute("CREATE TEMP TABLE sum_state (global_seq bigint, n int)")
+    _seed(conn, [1, 2])
+    proj = SumProjection()
+    run_projection(conn, proj)
+
+    conn.execute(
+        "INSERT INTO projection_skips (projection_name, event_global_seq, reason) "
+        "VALUES (%s, %s, %s)",
+        (proj.name, 1, "stale poison from a prior run"),
+    )
+    # a skip for a DIFFERENT projection must survive (the clear is scoped by projection_name)
+    conn.execute(
+        "INSERT INTO projection_skips (projection_name, event_global_seq, reason) "
+        "VALUES (%s, %s, %s)",
+        ("other_proj", 1, "unrelated"),
+    )
+
+    rebuild_projection(conn, proj)
+
+    assert (
+        conn.execute(
+            "SELECT count(*) FROM projection_skips WHERE projection_name=%s", (proj.name,)
+        ).fetchone()[0]
+        == 0  # rebuild cleared this projection's stale skip ledger
+    )
+    assert (
+        conn.execute(
+            "SELECT count(*) FROM projection_skips WHERE projection_name='other_proj'"
+        ).fetchone()[0]
+        == 1  # the other projection's ledger is untouched
+    )
+
+
 def test_rebuild_resets_checkpoint_then_replays(conn):
     with conn.cursor() as cur:
         cur.execute("CREATE TEMP TABLE sum_state (global_seq bigint, n int)")

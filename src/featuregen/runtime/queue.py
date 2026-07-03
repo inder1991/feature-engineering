@@ -10,6 +10,15 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Json
 
 from featuregen.runtime.backoff import compute_backoff
+from featuregen.runtime.observability import counters, log
+
+
+def _record_dead_letter(queue_id: int, *, error: str, reason: str) -> None:
+    """Emit a dedicated DLQ metric + log when a message transitions to status='dead' (m5). Captures
+    BOTH DLQ paths — poison-permanent (fail_permanent) and retry-exhausted (fail_retryable at the
+    attempt budget) — and is deliberately SEPARATE from the transient `queue.fail` backoff counter."""
+    counters.incr("queue.dlq")
+    log("queue.dead_letter", level="error", queue_id=queue_id, reason=reason, error=error)
 
 # Control-plane queue handlers owned by the dedicated control-signal poller
 # (`drain_control_signals`), NOT by the general `process_one` consumer. These carry no run
@@ -134,6 +143,7 @@ def fail_retryable(conn: psycopg.Connection, queue_id: int, *, error: str) -> No
                 "lease_expires_at=NULL WHERE id=%s",
                 (error, queue_id),
             )
+            _record_dead_letter(queue_id, error=error, reason="retry_exhausted")
         else:
             delay = compute_backoff(row["attempts"])  # default jitter=0.5 (review MINOR #23)
             cur.execute(
@@ -152,6 +162,7 @@ def fail_permanent(conn: psycopg.Connection, queue_id: int, *, error: str) -> No
             "lease_expires_at=NULL WHERE id=%s",
             (error, queue_id),
         )
+    _record_dead_letter(queue_id, error=error, reason="poison_permanent")
 
 
 def reclaim_stuck_queue(conn: psycopg.Connection) -> int:

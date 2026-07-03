@@ -571,6 +571,45 @@ def test_process_one_dlqs_non_allowlisted_timer_command(db):
         clear_registry()
 
 
+def test_process_one_reschedules_transiently_failing_timer_command(db):
+    # m8: the timer-command path has a retryable branch for an ALLOWLISTED command that fails
+    # TRANSIENTLY (not DisallowedTimerCommand). process_one must reschedule the queue row to 'ready'
+    # (bounded delivery retry), NOT DLQ it. Register a transient-failing stand-in under the
+    # allowlisted `deactivate_expired_version` action to exercise exactly that branch.
+    from featuregen.commands.registry import clear_registry, register_command
+    from featuregen.runtime.dispatch import HandlerRegistry, process_one
+    from featuregen.runtime.queue import enqueue
+
+    clear_registry()
+
+    def _boom(conn, cmd):
+        raise RuntimeError("transient downstream fault")
+
+    register_command("deactivate_expired_version", _boom)  # allowlisted action, transiently failing
+    try:
+        enqueue(
+            db,
+            message_id="expiry:transient:fraud",
+            partition_key="feature:feat_transient",
+            handler="timer.experiment_expiry",  # timer-command envelope
+            payload={
+                "handler": "deactivate_expired_version",  # allowlisted
+                "feature_id": "feat_transient",
+                "feature_version_id": "fv_transient",
+                "use_case": "fraud",
+                "timer_id": "tmr_transient",
+            },
+        )
+        outcome = process_one(db, HandlerRegistry(), owner="w1")
+        assert outcome.status == "retryable"  # NOT 'permanent' (DLQ)
+        row = db.execute(
+            "SELECT status FROM queue WHERE message_id='expiry:transient:fraud'"
+        ).fetchone()
+        assert row[0] == "ready"  # rescheduled with backoff, not 'dead'
+    finally:
+        clear_registry()
+
+
 def _mint_full(db, feature_id, run, *, stamp, approval="PRODUCTION", blocked=(), tier="low"):
     return mint_feature_version(
         db,
