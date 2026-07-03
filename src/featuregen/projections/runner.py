@@ -54,8 +54,18 @@ def run_projection(conn: DbConn, projection: Projection, *, batch: int = 500) ->
             try:
                 with conn.transaction():  # savepoint: discard the poison event's partial writes
                     projection.apply(conn, event)
-            except ProjectionApplyError:
-                last_seq = event.global_seq  # fail open: record the skip and keep going
+            except ProjectionApplyError as exc:
+                # Fail open (§3.6): analytics projections still advance past a poison event, but
+                # the skip must NOT be silent (review MAJOR #20 — a BCBS 239 accuracy gap). Record
+                # it durably in the skip ledger, in a SEPARATE statement outside the rolled-back
+                # savepoint, so the omission is auditable. ON CONFLICT DO NOTHING keeps it
+                # idempotent under re-runs of the same poison event.
+                conn.execute(
+                    "INSERT INTO projection_skips (projection_name, event_global_seq, reason) "
+                    "VALUES (%s, %s, %s) ON CONFLICT DO NOTHING",
+                    (projection.name, event.global_seq, str(exc)[:500]),
+                )
+                last_seq = event.global_seq  # fail open, but the skip is now durable + auditable
                 continue
             last_seq = event.global_seq
             applied += 1

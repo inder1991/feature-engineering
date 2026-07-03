@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pytest
 from psycopg.rows import dict_row
 
 from featuregen.contracts import (
@@ -140,3 +141,32 @@ def test_analytics_skips_poison_and_continues(conn):
         cur.execute("SELECT global_seq FROM an_applied ORDER BY global_seq")
         assert [r["global_seq"] for r in cur.fetchall()] == [a1.global_seq, a3.global_seq]
     assert projection_lag(conn, "an") == 0  # advanced to head despite the skip
+
+
+@pytest.fixture
+def poison_analytics_projection(conn):
+    """An analytics Projection whose apply() raises ProjectionApplyError on exactly one seeded
+    (poison) event. Yields (projection, poison_global_seq)."""
+    event_registry().register_schema("E", 1, {"type": "object"}, owner="o")
+    with conn.cursor() as cur:
+        cur.execute("CREATE TEMP TABLE an_applied (global_seq bigint)")
+    _append(conn, "r", 0, {})
+    poison = _append(conn, "r", 1, {})
+    _append(conn, "r", 2, {})  # after the poison event
+    return AnalyticsProjection(poison_seq=poison.global_seq), poison.global_seq
+
+
+def test_analytics_skip_is_recorded(conn, poison_analytics_projection) -> None:
+    """An analytics projection that fail-opens past a poison event must record the skip durably
+    (review MAJOR #20) — silent skips are a BCBS 239 accuracy gap."""
+    proj, poison_seq = poison_analytics_projection
+    run_projection(conn, proj)
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT event_global_seq, reason FROM projection_skips WHERE projection_name=%s",
+            (proj.name,),
+        )
+        row = cur.fetchone()
+    assert row is not None and row[0] == poison_seq
+    # Fail-open preserved: the checkpoint still advanced PAST the poison event (to head).
+    assert projection_lag(conn, proj.name) == 0
