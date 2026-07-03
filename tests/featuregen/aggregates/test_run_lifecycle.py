@@ -71,19 +71,21 @@ def test_reopen_rejected_when_source_not_rejected(db):
     assert res.accepted is False and "rejected" in res.denied_reason
 
 
-def test_resolve_degraded_clears_flag(db):
+def test_resolve_degraded_clears_marker(db):
+    # resolve_degraded deletes the projection_degraded marker the runner writes (the ledger
+    # execute_command now enforces, SP-0.5 round-2 B1), not the never-set run_workflow_state column.
     from featuregen.aggregates.run_lifecycle import resolve_degraded_command
 
     db.execute(
-        "INSERT INTO run_workflow_state (run_id, request_id, current_state, table_version, "
-        "degraded, degraded_reason) VALUES ('run_d', 'req_d', 'DRAFT', 1, true, 'boom')"
+        "INSERT INTO projection_degraded (projection_name, aggregate, aggregate_id, reason, "
+        "poison_event_id, poison_seq) VALUES ('run','run','run_d','boom',NULL,1)"
     )
     res = resolve_degraded_command(db, make_cmd("resolve_degraded", "run", "run_d", {}))
     assert res.accepted
-    row = db.execute(
-        "SELECT degraded, degraded_reason FROM run_workflow_state WHERE run_id = 'run_d'"
-    ).fetchone()
-    assert row[0] is False and row[1] is None
+    left = db.execute(
+        "SELECT count(*) FROM projection_degraded WHERE aggregate_id='run_d'"
+    ).fetchone()[0]
+    assert left == 0
 
 
 def test_fact_confirmed_resume_wakes_only_runs_waiting_on_that_fact(db):

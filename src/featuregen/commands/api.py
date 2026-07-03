@@ -66,13 +66,18 @@ def _replay(conn: DbConn, key: str) -> CommandResult | None:
 
 
 def _is_degraded(conn: DbConn, cmd: Command) -> bool:
-    if cmd.aggregate != "run" or cmd.aggregate_id is None:
+    # Fail-closed enforcement of the §3.6 projection halt (SP-0.5 round-2 B1). A poison event marks
+    # the affected aggregate in projection_degraded (keyed by aggregate + aggregate_id, any
+    # projection); a command against a degraded aggregate is blocked. resolve_degraded is
+    # special-cased by execute_command so it can clear the marker. (The prior check read
+    # run_workflow_state.degraded, a column no production code ever sets — so nothing was blocked.)
+    if cmd.aggregate_id is None:
         return False
     row = conn.execute(
-        "SELECT degraded FROM run_workflow_state WHERE run_id = %s",
-        (cmd.aggregate_id,),
+        "SELECT 1 FROM projection_degraded WHERE aggregate = %s AND aggregate_id = %s LIMIT 1",
+        (cmd.aggregate, cmd.aggregate_id),
     ).fetchone()
-    return bool(row and row[0])
+    return row is not None
 
 
 def execute_command(conn: DbConn, cmd: Command) -> CommandResult:

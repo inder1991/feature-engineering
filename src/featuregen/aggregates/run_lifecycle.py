@@ -170,15 +170,16 @@ def source_changed_revalidate_command(conn: DbConn, cmd: Command) -> CommandResu
 
 
 def resolve_degraded_command(conn: DbConn, cmd: Command) -> CommandResult:
-    """Clear a `degraded` projection entry after remediation (§3.6/§4.4). This is a projection
-    repair (no domain event): it un-blocks the aggregate's commands. `execute_command`
-    special-cases this action so it is NOT itself blocked by the degraded gate. Scope here is the
-    `run_workflow_state` sample projection (the only degraded-bearing projection in this phase);
-    other aggregates' degraded handling is owned by their projection phases."""
-    run_id = cmd.aggregate_id
+    """Clear the degraded marker(s) for an aggregate after remediation (§3.6/§4.4), un-blocking its
+    commands. Deletes from `projection_degraded` — the ledger the runner writes on a poison halt and
+    that `execute_command` now enforces (SP-0.5 round-2 B1). `execute_command` special-cases this
+    action so it is NOT itself blocked by the degraded gate.
+
+    NOTE: this is the minimal marker-clear so the block/unblock cycle is consistent. A follow-up
+    increment adds prove-health-before-clear (re-run the projection past the poison and only clear
+    if it advances) + a generic security_audit remediation record."""
     conn.execute(
-        "UPDATE run_workflow_state SET degraded = false, degraded_reason = NULL, "
-        "degraded_event_id = NULL, updated_at = now() WHERE run_id = %s",
-        (run_id,),
+        "DELETE FROM projection_degraded WHERE aggregate = %s AND aggregate_id = %s",
+        (cmd.aggregate, cmd.aggregate_id),
     )
-    return CommandResult(accepted=True, aggregate_id=run_id or "")
+    return CommandResult(accepted=True, aggregate_id=cmd.aggregate_id or "")

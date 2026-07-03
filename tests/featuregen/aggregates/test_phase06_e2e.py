@@ -175,8 +175,8 @@ def test_every_catalog_action_is_registered():
 
 def test_resolve_degraded_unblocks_run_through_execute_command(db):
     db.execute(
-        "INSERT INTO run_workflow_state (run_id, request_id, current_state, table_version, "
-        "degraded, degraded_reason) VALUES ('run_rd', 'req_rd', 'DRAFT', 1, true, 'boom')"
+        "INSERT INTO projection_degraded (projection_name, aggregate, aggregate_id, reason, "
+        "poison_event_id, poison_seq) VALUES ('run','run','run_rd','boom',NULL,1)"
     )
     # a normal command on a degraded run is blocked...
     blocked = execute_command(db, make_cmd("park", "run", "run_rd", {"owner": "o"}))
