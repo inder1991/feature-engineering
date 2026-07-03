@@ -69,7 +69,10 @@ from featuregen.intake.blobs import read_blob, write_blob  # F1 write-once blob 
 from featuregen.intake.candidates import (  # R10 hypothesis seam (P6, candidates.py)
     generate_candidates_for_run,
 )
-from featuregen.intake.catalog import current_intake_catalog  # R8/R10 seam (P2, catalog.py)
+from featuregen.intake.catalog import (  # R8/R10 seam (P2, catalog.py)
+    IntakeCatalogNotConfigured,
+    current_intake_catalog,
+)
 from featuregen.intake.contract import (  # R6/R7 (P2, contract.py)
     CONTRACT_SCHEMA_OWNER,
     assemble_confirmed,
@@ -440,12 +443,15 @@ def assemble_draft_body(
     assumption_ledger_ref: str,
     llm_output: dict,
     llm_call_ref: str,
+    risk_flags: list[str] | None = None,
 ) -> dict:
     """Build the DRAFT_CONTRACT body (§4.1) from the LLM's semantic subset + the authoritative SP-0
     envelope. The platform owns the envelope: `request_id`, `raw_input_ref`,
-    `raw_input_classification`, `assumption_ledger_ref`, and `status` are set here, NEVER taken from
-    the model — any echoed envelope field is discarded (the no-silent-boundary for the envelope).
-    Only the semantic subset (`proposed_feature_name`, `feature_semantics`, `field_scores`,
+    `raw_input_classification`, `assumption_ledger_ref`, `risk_flags`, and `status` are set here, NEVER
+    taken from the model — any echoed envelope field is discarded (the no-silent-boundary for the
+    envelope). `risk_flags` (P1-d) is computed platform-side from the intake classification (see
+    `_risk_flags_for`) → carried through refinement/edit → read by `_requires_independent_validation` at
+    Gate #1. Only the semantic subset (`proposed_feature_name`, `feature_semantics`, `field_scores`,
     `open_fields`, `open_questions`) is read from `llm_output`."""
     return {
         "request_id": request_id,
@@ -458,6 +464,7 @@ def assemble_draft_body(
         "open_fields": list(llm_output.get("open_fields", [])),
         "open_questions": list(llm_output.get("open_questions", [])),
         "assumption_ledger_ref": assumption_ledger_ref,
+        "risk_flags": list(risk_flags or []),
         "provenance": {"llm_call_refs": [llm_call_ref], "schema_version": DRAFT_SCHEMA_VERSION},
         "status": DRAFT_STATUS,
     }
@@ -717,10 +724,18 @@ def _produce_draft(
         conn, stage=Stage.ASSUMPTION_LEDGER.value, body=ledger_body,
         run_id=run_id, request_id=request_id, actor=cmd.actor,
     )
+    # P1-d — compute risk_flags platform-side from the intake classification + the catalog's declared
+    # high-risk set (never the LLM), so a high-risk use-case sets requires_independent_validation at
+    # Gate #1. Fail-closed: an unset catalog yields no flag (RIV stays False), never a fabricated pass.
+    try:
+        _catalog = current_intake_catalog()
+    except IntakeCatalogNotConfigured:
+        _catalog = None
     draft_body = assemble_draft_body(
         request_id=request_id, intake_mode=intake_mode, raw_input_ref=raw_input_ref,
         raw_input_classification=raw_input_classification, assumption_ledger_ref=ledger_doc,
         llm_output=out, llm_call_ref=result.call_ref,
+        risk_flags=_risk_flags_for(classification, _catalog),
     )
     assert_no_silent_assumption(draft_body, ledger_body)  # §5.3 — no field silently settled
     validate_draft(draft_body)                            # SP-0 envelope + required-field validation
@@ -1997,6 +2012,20 @@ _SP2_CATALOG = _SP2_CATALOG + (("advance_intake", advance_intake),)
 
 
 # ═══ Task 7.2 — confirm_contract (definition-mode happy path → CONFIRMED, §8.2/§8.5/§8.6) ═════════════
+def _risk_flags_for(classification, catalog) -> list[str]:
+    """Platform-side risk tagging (Decision 2 / P1-d): a CATALOG-DECLARED high-risk matched use-case →
+    a `high_risk_use_case:<name>` flag that sets requires_independent_validation at Gate #1. Derived from
+    the ALREADY-computed intake classification + the catalog's declared high-risk set — NO new LLM call,
+    NO PII. Fail-closed: a missing signal simply yields no flag (RIV stays False); it never fabricates
+    approval. The second SIGNER is deferred to Gate #2 (SP-5); SP-2 only sets the flag."""
+    use_case = getattr(classification, "matched_use_case", None)
+    if not use_case or catalog is None:
+        return []
+    if use_case in getattr(catalog, "high_risk_use_cases", frozenset()):
+        return [f"high_risk_use_case:{use_case}"]
+    return []
+
+
 def _requires_independent_validation(draft_body: dict) -> bool:
     """§8.4 #1 risk-flag → requires_independent_validation. A FLAG ONLY: SP-2 does not require a
     second signer and does not block; the independent validation is Gate #2 (SP-5)."""

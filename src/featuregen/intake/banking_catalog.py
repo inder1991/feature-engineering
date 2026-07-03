@@ -54,6 +54,10 @@ class BankingDomainCatalog:
     use_case_terms: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
     predictive_markers: frozenset[str] = frozenset()
     scoped_use_cases: frozenset[str] = frozenset()
+    # Catalog-DECLARED high-risk use-cases (credit decisioning / fair lending / model-risk-MRM). A matched
+    # high-risk use-case sets requires_independent_validation at Gate #1 (Decision 2 / P1-d); the second
+    # signer is deferred to Gate #2 (SP-5). Seed entries carry `"high_risk": true`.
+    high_risk_use_cases: frozenset[str] = frozenset()
     owner: str | None = None
     effective_date: str | None = None
     provenance: str | None = None
@@ -121,6 +125,7 @@ class BankingDomainCatalog:
                 seed.get("predictive_markers") or _DEFAULT_PREDICTIVE_MARKERS
             ),
             scoped_use_cases=frozenset(seed.get("scoped_use_cases") or ()),
+            high_risk_use_cases=frozenset(u["use_case"] for u in use_cases if u.get("high_risk")),
             owner=seed.get("owner"),
             effective_date=seed.get("effective_date"),
             provenance=seed.get("source") or seed.get("provenance"),

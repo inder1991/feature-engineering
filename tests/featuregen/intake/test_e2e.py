@@ -63,7 +63,11 @@ _BANKING_SEED = {
             "status": "active",
             "target": {"name": "declined_auth"},
             "blocked_data_classes": ["protected_attribute"],
-        }
+        },
+        # A catalog-DECLARED high-risk use-case (P1-d/F4): a matched high-risk use-case sets
+        # requires_independent_validation at Gate #1. The hypothesis intent ("...higher credit risk")
+        # matches its name-derived term "credit risk".
+        {"use_case": "credit_risk", "status": "active", "high_risk": True},
     ],
 }
 _CATALOG_VERSION = _BANKING_SEED["catalog_version"]
@@ -182,12 +186,15 @@ class _Registry:
 
 
 def _clear_classification(intent, *, product=None, region=None, catalog=None):
-    """A pinned CLEAR intake classification (deterministic, hermetic). The confirmation-time §8.4
-    re-screen uses the REAL classify_intent over the registered catalog — this only pins the intake
-    boundary so submit_intent normalizes into a Draft rather than exercising the classifier heuristics
-    (those are unit-covered)."""
+    """A pinned-CLEAR intake classification (deterministic, hermetic) that still carries the REAL
+    matched_use_case over the registered catalog — so the platform-side risk_flags / RIV wiring (P1-d)
+    is exercised end-to-end (definition → benign use-case → RIV False; hypothesis → the high-risk
+    `credit_risk` use-case → RIV True). This only pins the intake BOUNDARY outcome to CLEAR so
+    submit_intent normalizes into a Draft rather than exercising the boundary heuristics (unit-covered);
+    the confirmation-time §8.4 re-screen still uses the real classify_intent."""
+    matched = classify_intent(intent, product=product, region=region, catalog=catalog).matched_use_case
     return IntakeClassification(
-        IntakeOutcome.CLEAR, _CATALOG_VERSION, "e2e: pinned in-scope (CLEAR)"
+        IntakeOutcome.CLEAR, _CATALOG_VERSION, "e2e: pinned in-scope (CLEAR)", matched_use_case=matched,
     )
 
 
@@ -779,7 +786,7 @@ def test_hypothesis_stub_candidates_select_and_confirm(db):
     assert c["calculation_method"]["chosen"]["kind"] in (
         "rolling_aggregate", "point_snapshot", "ratio", "distribution_divergence",
     )
-    # PRODUCTION GAP (flagged): the §8.4 risk-flag screen is NOT wired — `assemble_draft_body` never
-    # populates `risk_flags`, so requires_independent_validation is always False from the REAL pipeline
-    # (the True path is unit-covered by Task 7.5 via a seeded risk_flags Draft).
-    assert c["requires_independent_validation"] is False
+    # P1-d/F4 (gap closed): risk_flags is now computed platform-side from the intake classification —
+    # this hypothesis matched the catalog-declared high-risk `credit_risk` use-case, so the REAL pipeline
+    # sets requires_independent_validation=True at Gate #1 (the second SIGNER is still deferred to SP-5).
+    assert c["requires_independent_validation"] is True
