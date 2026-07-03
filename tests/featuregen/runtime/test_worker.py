@@ -57,6 +57,17 @@ def _now() -> datetime:
     return datetime.now(UTC)
 
 
+@pytest.fixture(autouse=True)
+def _reset_counters():
+    """`counters` is a process-global singleton; reset it around each test so leaked-connection /
+    metric counts from one test never bleed into another (e.g. the leaked-cap-halt test)."""
+    from featuregen.runtime.observability import counters
+
+    counters.reset()
+    yield
+    counters.reset()
+
+
 def test_run_worker_once_drives_a_queued_step(db, seeded_pipeline) -> None:
     """One worker tick claims + processes a ready queue item, advancing the run — proving the
     daemon actually drives work (review BLOCKER #3). Bounded and non-blocking (no sleeps)."""
@@ -84,6 +95,21 @@ def test_run_worker_once_emits_depth_and_lag_gauges(db, seeded_pipeline) -> None
     gauges = counters.snapshot()["gauges"]
     assert "queue.depth" in gauges
     assert any(k.startswith("projection.lag.") for k in gauges)
+
+
+def test_run_worker_once_halts_claiming_past_leaked_conn_cap(db, seeded_pipeline) -> None:
+    """Once abandoned (leaked) handler connections exceed the cap, the worker stops claiming new
+    work and surfaces it LOUD, so a wedged-handler leak is bounded, not unbounded (SP-0.5 r2)."""
+    from featuregen.runtime.observability import counters
+    from featuregen.runtime.worker import run_worker_once
+
+    reg, projections = seeded_pipeline
+    counters.reset()
+    counters.incr("dispatch.leaked_connections", 100)  # simulate many leaked connections
+    tick = run_worker_once(db, reg, projections, owner="w1", now=_now(), leaked_conn_cap=10)
+
+    assert tick.queue_processed == 0  # claiming halted despite a ready queue item
+    assert counters.snapshot()["counters"].get("worker.leaked_cap_halt", 0) >= 1
 
 
 def test_run_worker_once_is_idle_on_empty(db, seeded_pipeline) -> None:

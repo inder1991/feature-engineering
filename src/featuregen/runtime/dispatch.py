@@ -17,6 +17,7 @@ from featuregen.contracts import (
 from featuregen.events.store import load_stream
 from featuregen.runtime.handlers import HandlerRegistry
 from featuregen.runtime.ledger import is_processed
+from featuregen.runtime.observability import counters
 from featuregen.runtime.outbox import reclaim_stuck_outbox
 from featuregen.runtime.queue import (
     QueueClaim,
@@ -213,6 +214,10 @@ def process_one(
                 result = _run_with_timeout(handler, ctx)
             except HandlerTimeout as exc:
                 timed_out = True
+                # The wedged handler thread cannot be killed, so its dedicated connection is
+                # deliberately abandoned (see the finally below). Make that leak OBSERVABLE — a
+                # bounded cap in the worker loop halts claiming once it grows (SP-0.5 round-2).
+                counters.incr("dispatch.leaked_connections")
                 fail_retryable(conn, claim.id, error=str(exc))
                 return ProcessOutcome(
                     status="retryable", message_id=claim.message_id, queue_id=claim.id

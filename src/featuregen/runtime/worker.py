@@ -230,6 +230,7 @@ def run_worker_once(
     now: datetime,
     batch: int = 50,
     publish: Callable[[psycopg.Connection, OutboxMessage], None] | None = None,
+    leaked_conn_cap: int | None = None,
 ) -> WorkerTick:
     """ONE bounded, non-blocking pass over every runtime stage (no sleeps, so unit-testable):
 
@@ -241,6 +242,8 @@ def run_worker_once(
     Returns a `WorkerTick` of per-stage counts for tests + metrics."""
     if publish is None:
         publish = make_queue_publisher(_DEFAULT_RELAY_ROUTE)
+    if leaked_conn_cap is None:
+        leaked_conn_cap = int(os.environ.get("FEATUREGEN_LEAKED_CONN_CAP", "50"))
     errors_before = counters.snapshot()["counters"].get("worker.errors", 0)
 
     reclaimed = _stage("recover_stuck")(lambda: recover_stuck(conn), (0, 0))
@@ -250,6 +253,14 @@ def run_worker_once(
     parked = _stage("control_signals")(lambda: drain_control_signals(conn), 0)
 
     def _drain_queue() -> int:
+        # Bound the abandoned-connection leak (SP-0.5 r2): once wedged-handler timeouts have leaked
+        # more than the cap, STOP claiming new work and surface it LOUD so an operator restarts,
+        # instead of leaking one more connection per claim indefinitely.
+        leaked = counters.snapshot()["counters"].get("dispatch.leaked_connections", 0)
+        if leaked > leaked_conn_cap:
+            counters.incr("worker.leaked_cap_halt")
+            log("worker.leaked_cap_halt", leaked=leaked, cap=leaked_conn_cap, owner=owner)
+            return 0
         processed = 0
         for _ in range(batch):
             outcome = process_one(conn, registry, owner=owner)
