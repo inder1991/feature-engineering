@@ -948,9 +948,13 @@ def submit_intent(conn: DbConn, cmd: Command) -> CommandResult:
     _raw_body = {"raw_input": intent_text}
     _raw_bytes = json.dumps(_raw_body, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
     write_blob(conn, raw_input_ref, _raw_body)  # resolvable via read_blob(raw_input_ref)
-    # N12 — the raw intent is PII: register it in blob_index as the ERASABLE-PII class (right-to-erasure /
-    # crypto-shred eligible via kms_key_id), referenced + live. Without a blob_index row, governance GC
-    # cannot track it AND replay would misclassify the blob as 'shredded' (replay defaults absent → shredded).
+    # N12 — the raw intent is PII: register it in blob_index as the ERASABLE-PII class so governance GC
+    # tracks it (referenced + live) and replay does not misclassify the blob as 'shredded' (replay defaults
+    # absent → shredded). CAVEAT (F1/N12 erasure gap — TRACKED, must land before production): the body is
+    # CURRENTLY plaintext in the write-once `blob` table with NO kms_key_id, so crypto_shred cannot yet
+    # PHYSICALLY erase it (it only flips status). Right-to-erasure EXECUTION — a KMS-keyed/encrypted body or
+    # a write-once-exempt expunge path — is deferred to the erasure-execution layer (Phase 06 / SP-9+); this
+    # class marks the blob for erasure, it does not yet perform it.
     conn.execute(
         "INSERT INTO blob_index "
         "  (blob_id, object_key, content_hash, classification, referenced, status, size_bytes) "

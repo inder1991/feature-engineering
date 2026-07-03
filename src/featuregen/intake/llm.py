@@ -444,6 +444,7 @@ def _result_from_record(rec: LLMCallRecord) -> LLMResult:
         self_reported_scores=dict(rec.raw_output.get("self_reported_scores", {})),
         call_ref=rec.llm_call_ref,
         status=rec.validation_result.get("result", STATUS_FAILED),
+        cost_metadata=dict(rec.cost_metadata or {}),  # N9 — preserve captured cost on the reuse path
     )
 
 
