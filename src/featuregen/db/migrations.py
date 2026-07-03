@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 
 from featuregen.contracts.db import DbConn
@@ -242,6 +243,19 @@ MIGRATIONS: list[tuple[str, str]] = [
 ]
 
 
+# Applied-migration ledger (review MAJOR #8). Bootstrapped FIRST — before any ledger read —
+# so apply_migrations can record what it ran (name + SHA-256 of the source SQL + applied_at),
+# skip already-applied unchanged migrations instead of blindly re-executing their DDL, and
+# raise on drift when an already-applied migration's source SQL has since changed.
+SCHEMA_MIGRATIONS = """
+CREATE TABLE IF NOT EXISTS schema_migrations (
+    name       text        PRIMARY KEY,
+    checksum   text        NOT NULL,
+    applied_at timestamptz NOT NULL DEFAULT now()
+);
+"""
+
+
 def _sql_file_migrations() -> list[tuple[str, str]]:
     """Load db/migrations/*.sql in lexical order (Phase 05+ file-based migrations)."""
     if not _SQL_MIGRATIONS_DIR.is_dir():
@@ -253,10 +267,34 @@ def _sql_file_migrations() -> list[tuple[str, str]]:
 
 
 def apply_migrations(conn: DbConn) -> None:
-    """Create all DDL objects (idempotent): core Python DDL then file-based 05xx_ SQL."""
+    """Apply all migrations once, ledgered (idempotent): core Python DDL then file-based 05xx_ SQL.
+
+    Each migration is recorded in ``schema_migrations`` with a SHA-256 of its source SQL. Per
+    migration, in order:
+      * a ledger row with the SAME checksum → SKIP (do not re-execute the DDL);
+      * a ledger row with a DIFFERENT checksum → raise ``RuntimeError`` (drift: an already-applied
+        migration's source SQL changed — silently skipping it would leave the schema wrong);
+      * no ledger row → execute the SQL and INSERT the ledger row.
+
+    On a FRESH database every migration runs exactly once and the ledger is populated; on a
+    re-run against an already-migrated DB every migration SKIPs, so this stays safely re-runnable.
+    All of it happens inside one committing transaction (as before).
+    """
     with conn.cursor() as cur:
-        for _name, sql in MIGRATIONS:
+        cur.execute(SCHEMA_MIGRATIONS)
+        for name, sql in [*MIGRATIONS, *_sql_file_migrations()]:
+            checksum = hashlib.sha256(sql.encode()).hexdigest()
+            cur.execute("SELECT checksum FROM schema_migrations WHERE name = %s", (name,))
+            row = cur.fetchone()
+            if row is not None:
+                if row[0] == checksum:
+                    continue  # already applied, unchanged — skip
+                raise RuntimeError(
+                    f"migration {name} checksum drift: recorded {row[0]} != source {checksum}"
+                )
             cur.execute(sql)
-        for _name, sql in _sql_file_migrations():
-            cur.execute(sql)
+            cur.execute(
+                "INSERT INTO schema_migrations (name, checksum) VALUES (%s, %s)",
+                (name, checksum),
+            )
     conn.commit()

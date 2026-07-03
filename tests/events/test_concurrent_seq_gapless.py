@@ -117,8 +117,15 @@ def test_concurrent_cross_aggregate_appends_are_gapless(_dsn):
             # so clearing referencing rows first would not help. CASCADE truncates those
             # event-derived tables too, which is exactly the empty-DB state this cleanup wants.
             cur.execute("TRUNCATE events CASCADE")
-            # projection_checkpoints has no FK to events, so CASCADE does not touch it — clear it
-            # explicitly. projection_degraded is already emptied by the CASCADE above, but clear it
-            # explicitly too so the cleanup's intent survives any future FK change.
-            cur.execute("DELETE FROM projection_checkpoints")
+            # projection_checkpoints has no FK to events, so CASCADE does not touch it. Restore the
+            # freshly-migrated baseline: delete only THIS test's own probe checkpoint row and reset
+            # the migration-seeded rows (overlay, feature_contract) back to seq 0 — do NOT delete
+            # the seeded rows. apply_migrations now ledgers each migration and runs it exactly once,
+            # so a deleted seed row is no longer re-inserted on the next apply_migrations call;
+            # blanket-deleting here would strip the seeded baseline other tests rely on.
+            cur.execute(
+                "DELETE FROM projection_checkpoints WHERE projection_name = %s",
+                (_CollectAll.name,),
+            )
+            cur.execute("UPDATE projection_checkpoints SET checkpoint_seq = 0, head_seq = 0")
             cur.execute("DELETE FROM projection_degraded")
