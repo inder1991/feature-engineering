@@ -85,6 +85,25 @@ def test_provider_cost_metadata_is_captured_on_the_record(db):
     assert rec.cost_metadata == {"input_tokens": 120, "output_tokens": 30, "usd": "0.0021"}
 
 
+def test_call_llm_attaches_resolved_output_schema_for_the_adapter(db):
+    """N11: call_llm resolves the registered structural output-schema and attaches it to the request the
+    provider client receives, so a real adapter can ENFORCE structured output (output_config.format)."""
+    _setup(db)
+    run_id = new_run_id()
+    seen = {}
+
+    class _SpyClient:
+        def call(self, request):
+            from featuregen.intake.llm import LLMResult
+            seen["output_schema"] = request.output_schema
+            return LLMResult(output={"entity": "customer"}, self_reported_scores={},
+                             call_ref="", status="ok")
+
+    res = call_llm(db, _SpyClient(), _req(), run_id=run_id, actor=service_actor())
+    assert res.status == STATUS_OK
+    assert seen["output_schema"] == _OUT_SCHEMA  # the registered TEST_STRUCT@1 schema was attached
+
+
 def test_idempotent_reuse_no_double_charge(db):
     _setup(db)
     run_id = new_run_id()

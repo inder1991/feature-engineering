@@ -61,7 +61,9 @@ _STOP_REASON_MAP = {
 
 
 def _map_stop_reason(stop_reason: str) -> str:
-    return _STOP_REASON_MAP.get(stop_reason, PROVIDER_OK)
+    # An UNKNOWN/unexpected stop_reason must NOT be treated as OK (fail-open) — a new provider outcome
+    # the driver doesn't recognize fails CLOSED into the manual path rather than passing a bad result (N11).
+    return _STOP_REASON_MAP.get(stop_reason, PROVIDER_NON_RETRYABLE)
 
 
 class ClaudeLLM:
@@ -103,15 +105,21 @@ class ClaudeLLM:
             f"Catalog metadata (names/types/grain only): {request.inputs.get(INPUT_KEY_CATALOG, {})}"
         )
         try:
+            # N11 — ENFORCE structured output: attach the registered structural schema (resolved by
+            # call_llm from output_schema_id/version onto request.output_schema) via output_config.format.
+            # The schema is structural only — it carries no PHI/PII (§9.1). Fail closed if it is missing.
+            if not request.output_schema:
+                return _fail(PROVIDER_NON_RETRYABLE)
+            output_config = {
+                "effort": self._config.effort,
+                "format": {"type": "json_schema", "schema": request.output_schema},
+            }
             resp = client.messages.create(
                 model=model,
                 max_tokens=request.generation_settings.get("max_tokens", self._config.max_tokens),
                 thinking={"type": self._config.thinking},
-                output_config={"effort": self._config.effort},
+                output_config=output_config,
                 messages=[{"role": "user", "content": user_content}],
-                # NOTE: attach the registered structural output-schema via
-                # output_config={"format": {"type": "json_schema", "schema": <schema>}} — resolved
-                # from output_schema_id/version by the caller; see the Adapter Appendix.
             )
         except anthropic.APIStatusError as exc:  # map transport/status failures to the taxonomy
             status = getattr(exc, "status_code", 0)

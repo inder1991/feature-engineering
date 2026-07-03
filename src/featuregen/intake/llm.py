@@ -47,6 +47,9 @@ class LLMRequest:
     output_schema_id: str
     output_schema_version: int
     generation_settings: dict   # provider/model + thinking/effort/max_tokens — pinned; idempotency key
+    # N11 — the resolved structural JSON schema, attached by call_llm from the registry so the real
+    # adapter can enforce structured output (output_config.format). NOT part of the idempotency key.
+    output_schema: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -504,6 +507,12 @@ def call_llm(
     def validate_output(output: Mapping[str, Any]) -> None:
         doc_registry.validate(request.output_schema_id, request.output_schema_version, output)
 
+    # N11 — attach the resolved structural output-schema so a provider adapter can ENFORCE structured
+    # output (output_config.format). Inputs-only identity/hash is unchanged; FakeLLM ignores it.
+    request = replace(
+        request,
+        output_schema=doc_registry.schema_for(request.output_schema_id, request.output_schema_version),
+    )
     t0 = time.monotonic()
     outcome = drive_structured_call(client, request, validate_output)
     latency_ms = int((time.monotonic() - t0) * 1000)

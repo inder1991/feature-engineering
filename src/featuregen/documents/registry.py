@@ -73,6 +73,15 @@ class DocumentSchemaRegistry:
         except jsonschema.ValidationError as exc:
             raise SchemaValidationError(f"{type_name}@v{schema_version}: {exc.message}") from exc
 
+    def schema_for(self, type_name: str, schema_version: int) -> dict | None:
+        """The registered JSON schema dict for (type_name, version), or None if unregistered. Used to
+        attach the structural output-schema to a provider request for structured-output enforcement (N11)."""
+        row = self._conn.execute(
+            "SELECT json_schema FROM document_type_registry WHERE type_name=%s AND schema_version=%s",
+            (type_name, schema_version),
+        ).fetchone()
+        return dict(row[0]) if row else None
+
     def assert_writable(self, type_name: str, schema_version: int) -> None:
         """Block NEW writes at a non-active version (§3.3): `deprecated` => no new
         writes; `withdrawn` => upcast-only. Deprecated/withdrawn versions stay

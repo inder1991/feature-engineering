@@ -523,7 +523,18 @@ PROMPT_STRUCTURE_INTENT_ID = "sp2.structure_intent"
 PROMPT_STRUCTURE_INTENT_VERSION = 1
 OUTPUT_SCHEMA_ID = "DRAFT_CONTRACT"
 OUTPUT_SCHEMA_VERSION = 1
-_GEN_SETTINGS = {"provider": "fake", "model": "fake", "thinking": "adaptive", "max_tokens": 4096}
+def _gen_settings() -> dict:
+    """N11 — the structure_intent generation settings, DERIVED from the configured provider (never a
+    hard-coded 'fake' baked into the production path). Defaults to the fake provider when the anthropic
+    adapter is not enabled (CI / local), so generation_settings + the idempotency key reflect the REAL
+    provider in production. Import is lazy-safe: ClaudeConfig does NOT import the anthropic SDK."""
+    from featuregen.intake.llm_claude import ClaudeConfig
+
+    cfg = ClaudeConfig.from_env()
+    if cfg.enabled:
+        return {"provider": "anthropic", "model": cfg.model, "thinking": cfg.thinking,
+                "max_tokens": cfg.max_tokens, "effort": cfg.effort}
+    return {"provider": "fake", "model": "fake", "thinking": "adaptive", "max_tokens": 4096}
 
 
 def _fc_head(conn: DbConn, run_id: str) -> int:
@@ -726,7 +737,7 @@ def _produce_draft(
         inputs=inputs,
         output_schema_id=OUTPUT_SCHEMA_ID,
         output_schema_version=OUTPUT_SCHEMA_VERSION,
-        generation_settings=_GEN_SETTINGS,
+        generation_settings=_gen_settings(),
     )
     result = call_llm(conn, current_llm_client(), request, run_id=run_id, actor=cmd.actor)  # R10 seam
     # 2b. LLM fail-closed (§9.2): exhausted repair / refusal / non-retryable → clarification, NO Draft.
