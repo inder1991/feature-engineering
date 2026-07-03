@@ -109,6 +109,26 @@ def test_definition_intent_produces_draft_and_ledger(db, intake_env):
     assert all(r["body_classification"] == "governance-retained" for r in rows)
 
 
+def test_first_draft_is_grounded_in_catalog_metadata(db, intake_env):
+    """N3: the FIRST normalization consults the SP-1 merged-view catalog metadata via
+    deps.catalog.metadata() (names/types/grain, LLM-safe) — before the fix _produce_draft passed
+    catalog_metadata={} and only the refinement/candidate paths were catalog-grounded."""
+    from featuregen.intake.commands import register_intake_deps
+
+    consulted = []
+
+    class _SpyCatalog:
+        def metadata(self):
+            consulted.append("metadata")
+            return {"entities": ["customer", "card"], "concepts": ["declined card authorization"]}
+
+    intake_env.script_llm(_DEFINITION_OUTPUT)
+    register_intake_deps(client=None, redactor=None, catalog=_SpyCatalog())
+    res = submit_intent(db, _cmd())
+    assert res.accepted is True, res.denied_reason
+    assert consulted == ["metadata"], "first normalization must consult deps.catalog.metadata() (N3)"
+
+
 def test_invalid_intake_mode_is_denied(db, intake_env):
     res = submit_intent(db, _cmd(intake_mode="nonsense"))
     assert res.accepted is False

@@ -697,8 +697,13 @@ def _produce_draft(
 
     # 2. Structure the intent through the event-sourced, egress-guarded LLM wrapper. build_llm_inputs
     #    keeps the §9.4 redaction_version / input_redaction egress-guard fields (never the raw intent).
+    #    N3 — ground the FIRST normalization in the SP-1 merged-view catalog metadata (names/types/grain,
+    #    LLM-safe — never values/PII), exactly as the refinement + candidate-generation paths do; the
+    #    catalog NAMES ride catalog_metadata separately and are re-scanned by the egress guard.
+    deps = current_intake_deps()
+    catalog_metadata = dict(deps.catalog.metadata()) if deps and deps.catalog else {}
     inputs = build_llm_inputs(  # reserved-keyed, LLM-safe (§9.4) — guaranteed-safe past the check above
-        redaction, catalog_metadata={}, raw_input_classification=raw_input_classification
+        redaction, catalog_metadata=catalog_metadata, raw_input_classification=raw_input_classification
     )
     request = LLMRequest(
         task="structure_intent",
