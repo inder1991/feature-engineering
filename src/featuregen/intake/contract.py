@@ -1,3 +1,16 @@
+"""SP-2 Feature-Contract content-schema + assembly (§4.2, Decision 4).
+
+DELIBERATELY MINIMAL (Decision 4 — "minimum-viable contract content-schema, not maximal"): the CONFIRMED
+contract carries intent semantics at the fidelity intake can establish WITHOUT grounding — filter
+predicates as raw strings, a closed-but-small calculation_method vocabulary (METHOD_KINDS), untyped ratio
+components, and a mode-dependent target (None for a definition-mode feature with no target). It is an
+AUDITED INTENT LOCK, NOT an executable artifact.
+
+HARD DOWNSTREAM DEPENDENCY (N10): a CONFIRMED contract MUST NOT be mapped / compiled / executed until SP-3
+grounding applies its normalization gate (typed predicates, resolved concepts, validated method + target).
+SP-2's `validate_semantics` enforces ONLY the intake-level floor (§4.2) — it is NOT SP-3 grounding.
+Invariants: "no confirmed contract → no execution" (SP-2) AND "no SP-3 normalization → no execution" (SP-3).
+"""
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
