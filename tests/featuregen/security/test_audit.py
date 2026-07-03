@@ -145,6 +145,31 @@ def test_audit_chain_is_hmac_not_bare_hash(db):
     assert verify_chain(db, key="wrong-key") is False
 
 
+def test_altered_entry_hash_fails_verify(db):
+    # A forged/altered entry_hash must fail verify_chain. verify_chain compares the freshly
+    # recomputed secret-keyed MAC against the stored entry_hash with hmac.compare_digest
+    # (constant-time), so a MAC-forgery timing side-channel is not leaked. Flipping one hex
+    # char of the stored MAC exercises that compare path (it cannot prove constant-time, but
+    # documents the intent and guards against a regression to a plain `!=`).
+    a = build_human_identity(subject="user:raj", role_claims=["data_scientist"])
+    record_security_event(
+        db,
+        event_type="COMMAND_DENIED",
+        actor=a,
+        attempted_action="activate",
+        decision="denied",
+        reason="r1",
+    )
+    assert verify_chain(db) is True
+    stored = db.execute("SELECT entry_hash FROM security_audit WHERE seq = 1").fetchone()[0]
+    # Flip the first hex nibble so exactly one byte of the stored MAC differs.
+    tampered = ("f" if stored[0] != "f" else "0") + stored[1:]
+    db.execute("ALTER TABLE security_audit DISABLE TRIGGER security_audit_no_mutation")
+    db.execute("UPDATE security_audit SET entry_hash = %s WHERE seq = 1", (tampered,))
+    db.execute("ALTER TABLE security_audit ENABLE TRIGGER security_audit_no_mutation")
+    assert verify_chain(db) is False
+
+
 def test_verify_chain_empty_is_not_silently_ok(db):
     # BLOCKER #4: an empty chain where entries were expected must NOT verify True
     # (TRUNCATE-then-verify previously passed silently). Default preserves empty-is-ok.

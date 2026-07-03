@@ -283,23 +283,24 @@ def verify_chain(
     ) in rows:
         if row_prev != prev_hash:
             return False
-        if (
-            _entry_hash(
-                signing_key,
-                prev_hash,
-                sec_id,
-                event_type,
-                actor_jsonb,
-                attempted_action,
-                aggregate,
-                aggregate_id,
-                decision,
-                reason,
-                retention_class,
-                occurred_at,
-            )
-            != entry_hash
-        ):
+        computed = _entry_hash(
+            signing_key,
+            prev_hash,
+            sec_id,
+            event_type,
+            actor_jsonb,
+            attempted_action,
+            aggregate,
+            aggregate_id,
+            decision,
+            reason,
+            retention_class,
+            occurred_at,
+        )
+        # Constant-time compare: entry_hash is a secret-keyed MAC, so a short-circuiting `!=`
+        # on hex strings would leak a MAC-forgery timing side-channel. The row_prev/prev_hash
+        # check above is public stored hashes only, so it stays a plain `!=`. §6.2.
+        if not hmac.compare_digest(computed, entry_hash):
             return False
         prev_hash = entry_hash
     return True
