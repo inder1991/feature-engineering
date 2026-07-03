@@ -49,9 +49,9 @@ def test_contains_pii_scrubs_located_spans():
     ("(555) 123-4567", "PHONE"),
     ("+44 20 7946 0958", "PHONE"),
     ("GB82WEST12345698765432", "IBAN"),
-    ("12345678901", "ACCOUNT"),          # a bare 11-digit account run (PAN needs >=13, so this is ACCOUNT)
-    ("1990-01-02", "DOB"),
-    ("01/02/1990", "DOB"),
+    ("account 12345678901", "ACCOUNT"),  # 11-digit run WITH an account cue (PAN needs >=13, so ACCOUNT)
+    ("DOB 1990-01-02", "DOB"),           # a date WITH a birth cue (N2a: bare dates no longer match)
+    ("born 01/02/1990", "DOB"),
     ("123 Main St", "ADDRESS"),
     ("P.O. Box 12345", "ADDRESS"),
 ])
@@ -78,6 +78,48 @@ def test_default_redactor_scrubs_each_new_pii_class(raw, label):
 def test_pii_patterns_do_not_false_match_feature_values(value):
     # N2: the wider set must never fire on legitimate feature literals (windows/counts/thresholds/a bare 90).
     assert _scan(value) == []
+
+
+# ── N2a: DOB/ACCOUNT are CONTEXT-ANCHORED — bare feature dates / large numbers are NOT PII ─────────
+@pytest.mark.parametrize("value", [
+    "declined auths as of 2024-01-01",          # a bare ISO as-of date (no birth cue)
+    "effective 2023-12-31 through 2024-06-30",  # bare effective/cohort dates
+    "cohort start 2022/01/01",
+    "1719446400",                               # an epoch-seconds timestamp
+    "1000000000 rows",                          # a billion-row threshold
+    "count events over threshold 123456789012", # a 12-digit feature threshold
+])
+def test_bare_dates_and_large_numbers_are_not_pii(value):
+    # N2a: a bare ISO/effective date or a large feature number carries NO birth/account context, so
+    # the context-anchored DOB/ACCOUNT patterns must NOT fire. FAILS before the N2a fix, where the
+    # broad `\d{4}-\d\d-\d\d` / `\d{9,17}` over-matched these legitimate feature literals.
+    assert _scan(value) == []
+
+
+def test_egress_allows_bare_dates_and_large_numbers():
+    # N2a companion on the shared egress backstop: a bare as-of date + large feature numbers in the
+    # model-facing INTENT are NOT PII and must pass egress (FAILS before the fix — broad DOB/ACCOUNT).
+    i = _safe_inputs()
+    i[INPUT_KEY_INTENT] = "declined auths as of 2024-01-01 over 1000000000 rows (epoch 1719446400)"
+    assert_llm_safe(_Req(i))  # no raise
+
+
+@pytest.mark.parametrize("raw,label", [
+    ("DOB: 1990-05-01", "DOB"),
+    ("date of birth 05/01/1990", "DOB"),
+    ("born 1990-05-01", "DOB"),
+    ("account 1234567890", "ACCOUNT"),   # 10-digit run + cue (below PAN's >=13, so cleanly ACCOUNT)
+    ("acct 123456789012", "ACCOUNT"),    # 12-digit run + cue
+    ("a/c 987654321", "ACCOUNT"),        # 9-digit run + cue
+])
+def test_dob_account_with_context_still_redacted(raw, label):
+    # N2a preserves fail-closed: a GENUINE birth-date / account reference WITH its cue still scans,
+    # redacts, and TYPE-records — context anchoring narrows false positives, never true PII.
+    assert label in {s["type"] for s in _scan(raw)}
+    r = DefaultIntentRedactor().redact(f"segment customers by {raw} please", "contains_pii")
+    assert r.disposition == "ok" and r.text is not None
+    assert raw not in r.text and f"[REDACTED:{label}]" in r.text
+    assert label in {s["type"] for s in r.redacted_spans}
 
 
 def test_unscanned_fails_closed_no_text():
@@ -188,7 +230,7 @@ def test_egress_refuses_unredacted_pii_in_content():
 
 
 @pytest.mark.parametrize("raw", [
-    "+1-555-123-4567", "GB82WEST12345698765432", "12345678901", "1990-01-02", "123 Main St",
+    "+1-555-123-4567", "GB82WEST12345698765432", "account 12345678901", "DOB 1990-01-02", "123 Main St",
 ])
 def test_egress_backstop_refuses_new_pii_classes(raw):
     # N2: the wider shared set also hardens the egress backstop — un-redacted phone/IBAN/account/DOB/

@@ -26,10 +26,13 @@ REDACTION_VERSION = "default-redactor@1"
 # Deterministic PII detectors shared by the redactor AND the egress backstop (Task 3.2) — one source
 # of truth so widening the set hardens BOTH the redactor and `assert_llm_safe`'s egress guard. The
 # set is conservative-and-testable, not exhaustive: every pattern is bounded so legitimate feature
-# values (window literals "90d", counts, thresholds, a bare "90") never false-match — PHONE/DOB
-# require real separator/date shapes, ACCOUNT requires a 9+ digit run, ADDRESS requires a
-# number+street-suffix shape. Placeholders are digit/at-free so a residual scan of a redacted string
-# never re-matches. N2 (SP-2): phone / IBAN / generic bank-account / DOB / postal-address added.
+# values (window literals "90d", counts, thresholds, a bare "90", as-of/effective dates, epoch
+# timestamps, big row-counts) never false-match — PHONE requires real separators, ADDRESS a
+# number+street-suffix shape, and (N2a) DOB/ACCOUNT are CONTEXT-ANCHORED: a date only reads as a
+# DOB when a birth cue sits adjacent, a 9-17 digit run only reads as an ACCOUNT when an account cue
+# sits adjacent — a bare ISO date or bare long integer carries no cue and is left untouched.
+# Placeholders are digit/at-free so a residual scan of a redacted string never re-matches. N2 (SP-2):
+# phone / IBAN / generic bank-account / DOB / postal-address added.
 #
 # DEFERRED (not built here): NER-grade personal-NAME detection ("Jane Doe"). Regex cannot do it
 # safely; the drop-in seam is the `IntentRedactor` Protocol below — register a NER-backed redactor
@@ -47,12 +50,25 @@ _PII_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
         r"(?<![\w.])(?:\+\d{1,3}[\s.\-]?)?\(?\d{3}\)?[\s.\-]\d{3}[\s.\-]\d{4}(?![\d.])"
         r"|(?<![\w.])\+\d{1,3}(?:[\s.\-]\d{2,5}){2,5}(?![\d.])"
     )),
-    # ACCOUNT: a bare 9-17 digit run (routing/account numbers). Min 9 clears windows/counts/
-    # thresholds and 8-digit compact dates; lookarounds bar decimal- and digit-adjacent partials.
-    ("ACCOUNT", re.compile(r"(?<![\w.])\d{9,17}(?![\d.])")),
-    # DOB: a D/M/Y (or ISO Y/M/D) date with two real separators — a bare "90" or "1.5" cannot form it.
+    # ACCOUNT (N2a: context-anchored): a 9-17 digit run (routing/account numbers) ONLY when an
+    # account cue (account / acct / a/c) sits within 15 chars on either side — so epoch timestamps,
+    # big row-counts and numeric thresholds (bare long integers with no cue) never false-match.
+    # Lookarounds bar decimal- and digit-adjacent partials; min 9 still clears windows/counts.
+    ("ACCOUNT", re.compile(
+        r"\b(?:accounts?|acct\.?|a/?c)\b[^\n]{0,15}?(?<![\w.])\d{9,17}(?![\d.])"
+        r"|(?<![\w.])\d{9,17}(?![\d.])[^\n]{0,15}?\b(?:accounts?|acct\.?|a/?c)\b",
+        re.IGNORECASE,
+    )),
+    # DOB (N2a: context-anchored): a D/M/Y or ISO Y/M/D date (two real separators) ONLY when a birth
+    # cue (dob / d.o.b / date of birth / birth date / born) sits within 20 chars on either side — so
+    # a bare as-of/effective/cohort feature date carries no cue and is left untouched, while a genuine
+    # birth-date reference still redacts (fail-closed preserved).
     ("DOB", re.compile(
+        r"\b(?:dob|d\.o\.b\.?|date\s+of\s+birth|birth\s*date|born)\b[^\n]{0,20}?"
         r"(?<![\w.])(?:\d{1,2}[/.\-]\d{1,2}[/.\-]\d{2,4}|\d{4}[/.\-]\d{1,2}[/.\-]\d{1,2})(?![\d.])"
+        r"|(?<![\w.])(?:\d{1,2}[/.\-]\d{1,2}[/.\-]\d{2,4}|\d{4}[/.\-]\d{1,2}[/.\-]\d{1,2})(?![\d.])"
+        r"[^\n]{0,20}?\b(?:dob|d\.o\.b\.?|date\s+of\s+birth|birth\s*date|born)\b",
+        re.IGNORECASE,
     )),
     # ADDRESS: house-number + optional capitalised name(s) + a street-type suffix, or a P.O. Box.
     # The leading number + capitalised suffix keeps it off prose like "30 Day window".
