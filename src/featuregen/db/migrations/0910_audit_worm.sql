@@ -32,9 +32,17 @@ CREATE OR REPLACE TRIGGER security_audit_no_mutation
 
 -- Guarded grant revoke: revoke destructive DML from the production app role when it exists.
 -- No-op in the superuser test cluster where 'featuregen_app' is absent.
+--
+-- security_audit AND events are both revoked here. The events_no_mutation trigger (0900) is a
+-- BEFORE UPDATE OR DELETE row trigger and, like every FOR EACH ROW trigger, does NOT fire on a
+-- statement-level TRUNCATE — so without this revoke the source-of-truth `events` ledger could be
+-- TRUNCATE'd by the app role. This is the SAME deployment control as for security_audit (a
+-- superuser still bypasses grants entirely; blocking TRUNCATE therefore relies on production
+-- running under the NON-superuser 'featuregen_app' role).
 DO $$
 BEGIN
     IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'featuregen_app') THEN
         REVOKE UPDATE, DELETE, TRUNCATE ON security_audit FROM featuregen_app;
+        REVOKE UPDATE, DELETE, TRUNCATE ON events FROM featuregen_app;
     END IF;
 END $$;

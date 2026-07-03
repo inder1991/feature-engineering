@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import psycopg
 import pytest
 from tests.featuregen._helpers import mint_test_service_identity
 from ulid import ULID
 
+import featuregen.db.migrations as _migrations
 from featuregen.aggregates._append import append
 from featuregen.events.registry import event_registry
 
@@ -60,3 +63,37 @@ def test_events_are_write_once(db, seed_event) -> None:
     with pytest.raises(psycopg.errors.RaiseException):
         with db.transaction():
             db.execute("DELETE FROM events WHERE event_id=%s", (ev,))
+
+
+def _worm_migration_sql() -> str:
+    return (
+        Path(_migrations.__file__).resolve().parent / "migrations" / "0910_audit_worm.sql"
+    ).read_text(encoding="utf-8")
+
+
+def test_events_truncate_revoked_from_app_role_by_worm_migration(db) -> None:
+    """M2 (final review): the row trigger blocks UPDATE/DELETE but NOT statement-level TRUNCATE,
+    so the source-of-truth `events` ledger must ALSO have destructive DML revoked from the
+    production app role (a deployment/grant control; a superuser bypasses it). The WORM migration
+    (0910) must carry a guarded REVOKE UPDATE, DELETE, TRUNCATE ON events FROM featuregen_app,
+    mirroring the security_audit revoke. Applying the migration when the role exists must strip
+    those privileges. (The revoke is a no-op in the bare superuser test cluster where the role is
+    absent, so we create it here to exercise the guarded branch — rolled back on teardown.)"""
+    db.execute("CREATE ROLE featuregen_app NOLOGIN")
+    db.execute("GRANT UPDATE, DELETE, TRUNCATE ON events TO featuregen_app")
+    for priv in ("UPDATE", "DELETE", "TRUNCATE"):
+        assert (
+            db.execute(
+                "SELECT has_table_privilege('featuregen_app', 'events', %s)", (priv,)
+            ).fetchone()[0]
+            is True
+        )
+    # Apply the real WORM migration SQL exactly as apply_migrations does (multi-statement execute).
+    db.execute(_worm_migration_sql())
+    for priv in ("UPDATE", "DELETE", "TRUNCATE"):
+        assert (
+            db.execute(
+                "SELECT has_table_privilege('featuregen_app', 'events', %s)", (priv,)
+            ).fetchone()[0]
+            is False
+        ), f"{priv} on events should be revoked from featuregen_app by the WORM migration"

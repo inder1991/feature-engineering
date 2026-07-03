@@ -419,6 +419,75 @@ def test_run_forever_runs_one_tick_then_exits_on_shutdown(
     assert calls["n"] == 1  # exactly one tick ran, then the loop exited cleanly on the event
 
 
+def test_run_forever_survives_a_fatal_tick_and_counts_it(
+    _throwaway_autocommit_db, monkeypatch
+) -> None:
+    """M6: a `run_worker_once` that RAISES must NOT propagate out of `run_forever` — the loop's
+    fatal-tick backstop catches it, increments `worker.tick.fatal`, and still exits cleanly on the
+    shutdown_event. A refactor deleting the try/except would let the exception escape and fail this
+    test (the finding: the backstop was untested)."""
+    import threading
+
+    import featuregen.runtime.worker as worker
+    from featuregen.runtime.observability import counters
+    from featuregen.runtime.worker import run_forever
+
+    counters.reset()
+    shutdown = threading.Event()
+    calls = {"n": 0}
+
+    def _boom_tick(conn, registry, projections, *, owner, now, **_kw):
+        calls["n"] += 1
+        shutdown.set()  # stop the loop after this single (failing) tick
+        raise RuntimeError("tick exploded")
+
+    monkeypatch.setattr(worker, "run_worker_once", _boom_tick)
+
+    # No exception must escape: if it did, this call would raise and fail the test.
+    run_forever(_throwaway_autocommit_db, interval=0.0, shutdown_event=shutdown, owner="w-fatal")
+
+    assert calls["n"] == 1  # the tick ran and raised, but the daemon loop survived it
+    assert counters.snapshot()["counters"].get("worker.tick.fatal", 0) >= 1
+
+
+def test_run_forever_installs_signal_handlers_when_no_event(
+    _throwaway_autocommit_db, monkeypatch
+) -> None:
+    """M6: with `shutdown_event=None`, `run_forever` must install SIGINT/SIGTERM handlers so a real
+    signal triggers graceful shutdown. Assert the handlers CHANGED (then restore them). Hermetic: a
+    fake tick raises a BaseException to unwind the loop instead of delivering a real signal."""
+    import signal
+
+    import featuregen.runtime.worker as worker
+    from featuregen.runtime.worker import run_forever
+
+    class _StopLoop(BaseException):
+        """Not an Exception, so run_forever's fatal-tick backstop won't catch it — it unwinds
+        the loop cleanly through the finally (conn.close)."""
+
+    orig_int = signal.getsignal(signal.SIGINT)
+    orig_term = signal.getsignal(signal.SIGTERM)
+    seen: dict[str, object] = {}
+
+    def _capture_then_stop(conn, registry, projections, *, owner, now, **_kw):
+        # By now run_forever must have installed its handlers (shutdown_event was None).
+        seen["int"] = signal.getsignal(signal.SIGINT)
+        seen["term"] = signal.getsignal(signal.SIGTERM)
+        raise _StopLoop
+
+    monkeypatch.setattr(worker, "run_worker_once", _capture_then_stop)
+    try:
+        with pytest.raises(_StopLoop):
+            run_forever(_throwaway_autocommit_db, interval=0.0, shutdown_event=None, owner="w-sig")
+    finally:
+        signal.signal(signal.SIGINT, orig_int)
+        signal.signal(signal.SIGTERM, orig_term)
+
+    assert seen["int"] is not orig_int  # a SIGINT handler was installed
+    assert seen["term"] is not orig_term  # a SIGTERM handler was installed
+    assert callable(seen["int"]) and callable(seen["term"])
+
+
 def test_migrate_subcommand_applies_migrations(_dsn) -> None:
     """`python -m featuregen migrate` applies migrations (idempotently, against the already-set-up
     test DB) — the production migration runner the Task-9 review flagged as missing."""

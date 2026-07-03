@@ -467,7 +467,7 @@ _TIMER_RUNTIME_ACTOR = mint_trusted_identity(
 # to invoke this explicit, minimal set of §4.4 actions — a corrupted/hostile timer row naming
 # anything else (activate/reject/deprecate/…) is refused BEFORE dispatch, so it can never run an
 # unauthenticated privileged command. Widen this set deliberately as new timer commands are added.
-_TIMER_COMMAND_ALLOWLIST = frozenset({"deactivate_expired_version"})
+_TIMER_COMMAND_ALLOWLIST = frozenset({"deactivate_expired_version", "finalize_deprecate"})
 
 
 class DisallowedTimerCommand(Exception):

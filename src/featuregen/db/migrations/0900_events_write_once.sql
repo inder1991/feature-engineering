@@ -6,8 +6,11 @@
 -- DB-level guard, so a privileged actor could still tamper with or truncate the stream.
 -- This trigger makes any row-level mutation physically impossible, mirroring Phase-02's
 -- documents_no_mutation and the security_audit / feature_versions / blob write-once triggers.
--- INSERT (append_event) is unaffected; UPDATE and DELETE are rejected. Statement-level
--- TRUNCATE is covered separately by the WORM grant revoke (Task 6).
+-- INSERT (append_event) is unaffected; UPDATE and DELETE are rejected. A FOR EACH ROW trigger
+-- does NOT fire on a statement-level TRUNCATE, so TRUNCATE is covered separately in 0910 by the
+-- guarded `REVOKE UPDATE, DELETE, TRUNCATE ON events FROM featuregen_app` (mirroring the
+-- security_audit revoke). That is a DEPLOYMENT/grant control: production runs under the
+-- NON-superuser 'featuregen_app' role, and a superuser still bypasses grants entirely.
 --
 -- Sorts after the core Python DDL (0002_events) and all 05xx overlay/feature-contract
 -- migrations that extend the events table. Idempotent: CREATE OR REPLACE FUNCTION +
