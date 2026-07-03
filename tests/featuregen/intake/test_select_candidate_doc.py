@@ -5,8 +5,10 @@ from featuregen.aggregates._append import provenance_for
 from featuregen.aggregates.request_aggregate import create_request_command, create_run_command
 from featuregen.contracts import Command, ConcurrencyError
 from featuregen.contracts.documents import NewDocument, Stage
+from featuregen.contracts.envelopes import GateTaskSpec
 from featuregen.documents.primary import register_primary_selected
 from featuregen.documents.store import append_document
+from featuregen.gates.tasks import open_task
 from featuregen.identity.build import build_human_identity, build_service_identity
 from featuregen.idgen import mint_id
 from featuregen.intake.commands import select_candidate_doc
@@ -48,6 +50,22 @@ def _open_run(db, owner, concept):
         actor=owner,
         request_id=req.aggregate_id,
     )
+    # N5: candidate selection is a Gate #1 action — the run must be MCV-validated (gate-ready) with an
+    # OPEN Gate #1 task. Seed both so select_candidate_doc's lifecycle guards are exercised, not bypassed.
+    append_feature_contract_event(
+        db, run_id=run.aggregate_id, type="MINIMUM_CONTRACT_VALIDATED",
+        payload={"run_id": run.aggregate_id}, actor=SERVICE, request_id=req.aggregate_id,
+    )
+    open_task(
+        db,
+        GateTaskSpec(
+            gate="CLARIFICATION", required_inputs=(),
+            eligible_assignees={"role": "data_scientist", "subject": owner.subject},
+            allowed_responses=("confirm", "edit", "reject"),
+            run_id=run.aggregate_id, delegation_allowed=False,
+        ),
+        owner,
+    )
     return req.aggregate_id, run.aggregate_id
 
 
@@ -77,6 +95,28 @@ def _cmd(run_id, doc_id, actor):
         "select_candidate_doc", "run", None,
         {"run_id": run_id, "candidate_doc_id": doc_id, "stage": "DRAFT_CONTRACT"}, actor, mint_id("ik")
     )
+
+
+def test_select_denied_before_mcv_no_open_gate(db):
+    """N5: a candidate cannot be promoted before the run reaches Gate #1. A pre-MCV (NEEDS_CLARIFICATION)
+    run with NO open gate is DENIED — not silently promoted at the wrong lifecycle point."""
+    register_primary_selected(db)
+    req = create_request_command(db, Command("create_request", "request", None,
+        {"feature_concept": "x", "intake_mode": "hypothesis"}, OWNER, mint_id("ik")))
+    run = create_run_command(db, Command("create_run", "request", None,
+        {"request_id": req.aggregate_id}, OWNER, mint_id("ik")))
+    append_feature_contract_event(db, run_id=run.aggregate_id, type="INTENT_SUBMITTED",
+        payload={"intake_mode": "hypothesis", "raw_input_ref": mint_id("blob"),
+                 "raw_input_classification": "clean",
+                 "classification": {"outcome": "IN_SCOPE", "catalog_version": "v0", "matched_class": None}},
+        actor=OWNER, request_id=req.aggregate_id)  # NO MCV, NO gate task → not at Gate #1
+    doc = _candidate_doc(db, run.aggregate_id, req.aggregate_id)
+    res = select_candidate_doc(db, _cmd(run.aggregate_id, doc, OWNER))
+    assert res.accepted is False
+    assert "Gate #1" in res.denied_reason
+    # nothing promoted (the run is untouched on the RUN aggregate)
+    from featuregen.events.store import load_stream
+    assert not any(e.type == "PRIMARY_SELECTED" for e in load_stream(db, "run", run.aggregate_id))
 
 
 def test_owner_promotes_only_the_chosen_candidate(db):

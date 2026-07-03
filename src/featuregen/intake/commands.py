@@ -1672,7 +1672,8 @@ def select_candidate_doc(conn: DbConn, cmd: Command) -> CommandResult:
     # R3/R4: fold the feature_contract stream and call the state-based owner predicate owned by P2
     # (intake/state.py) — never the (conn, run_id, actor) mcv form. `state.requester` is the
     # INTENT_SUBMITTED event actor.subject.
-    state = fold_feature_contract_state(load_feature_contract(conn, run_id))
+    fc_stream = load_feature_contract(conn, run_id)
+    state = fold_feature_contract_state(fc_stream)
     if not actor_is_request_owner(state, cmd.actor):
         # R15 — writes decision="denied"; `replace(cmd, aggregate_id=run_id)` so the security record is
         # traceable to the run (cmd.aggregate_id is None here — run_id rides args), mirroring `_deny_audited`.
@@ -1681,6 +1682,32 @@ def select_candidate_doc(conn: DbConn, cmd: Command) -> CommandResult:
             accepted=False,
             aggregate_id=run_id,
             denied_reason="actor is not the request owner (owner-guard, §8.2)",
+        )
+
+    # N5 — lifecycle guards: candidate selection is a HYPOTHESIS-mode Gate #1 action, on a NON-terminal,
+    # MCV-validated run, WITH an open Gate #1 task. Without these a candidate could be promoted at the
+    # WRONG point (pre-MCV, definition mode, a terminal run, or with no gate open). Decided BEFORE the
+    # promotion append (execute_command does NOT roll back accepted=False).
+    if state.status in TERMINAL_STATUSES:
+        return CommandResult(
+            accepted=False, aggregate_id=run_id,
+            denied_reason=f"contract already {state.status.value}; cannot select a candidate (no-regression)",
+        )
+    if state.status is not FeatureContractStatus.MINIMUM_CONTRACT_VALIDATED:
+        status = state.status.value if state.status is not None else None
+        return CommandResult(
+            accepted=False, aggregate_id=run_id,
+            denied_reason=f"no open Gate #1 to select a candidate (status={status})",
+        )
+    if state.intake_mode != "hypothesis":
+        return CommandResult(
+            accepted=False, aggregate_id=run_id,
+            denied_reason=f"candidate selection is a hypothesis-mode Gate #1 action (mode={state.intake_mode})",
+        )
+    if not _gate1_task_open(conn, run_id, fc_stream):
+        return CommandResult(
+            accepted=False, aggregate_id=run_id,
+            denied_reason="no open Gate #1 task to select a candidate against",
         )
 
     # Existence + branch_role guard (shared with confirm_contract's hypothesis promotion). A wrong
