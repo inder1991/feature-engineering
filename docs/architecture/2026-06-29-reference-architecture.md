@@ -43,7 +43,7 @@ flowchart TB
     L2["L2 · Contract control · Human Gate #1 — SP-2"]
     L3["L3 · Grounding · point-in-time / SCD — SP-3"]
     L4["L4 · Validation + Implementation Router — SP-4"]
-    L5["L5 · Compile + Sandbox — SP-4 / SP-6 / SP-11"]
+    L5["L5 · Compile + Sandbox — SP-4 / SP-6 / SP-11b"]
     L6["L6 · Evaluation + Risk — SP-5 / SP-7"]
     L7["L7 · Approval · Human Gate #2 + Lifecycle — SP-5 / SP-9 / SP-10"]
     L1 --> L2 --> L3 --> L4 --> L5 --> L6 --> L7
@@ -226,20 +226,24 @@ This is what makes "submit and walk away" actually work.
 | Layer / capability | Sub-project | Status |
 |---|---|---|
 | Backbone (event store, state machine, durable runtime, gates, identity/SoD, governance, privacy) | **SP-0** | ✅ **Built** (Python + Postgres, 478 tests) |
-| Layer 0 · Metadata Overlay (fact store, merged-view, confirmation, profiler, freshness) | **SP-1** | 📋 Spec + implementation plan ready |
-| L1–2 · Intake + Clarification + Human Gate #1 | **SP-2** | 🔭 Designed |
-| L3 · Grounding (point-in-time / SCD) | **SP-3** | 🔭 Designed |
-| L4–5 · Validation core + DSL compiler + Sandbox (Path 1) | **SP-4** | 🔭 Designed |
-| L6–7 · Eval (model-free) + staged stamp + Gate #2 + Registry + Store | **SP-5** | 🔭 Designed |
-| Path 2 · LLM candidate SQL + repair + SQL gate | **SP-6** | 🔭 Designed |
-| Full validation + semantic leakage + fairness + overfitting guard | **SP-7** | 🔭 Designed |
-| Critique Service (5 modes) | **SP-8** | 🔭 Designed |
-| Hypothesis-driven Generation engine (§14: router, specialists, memory, symbolic, few-shot) | **SP-12** | 🔭 Designed |
-| Governance (MRM, explainability artifact, SoD, reproducibility) | **SP-9** | 🔭 Designed |
-| Lifecycle & Monitoring (drift/PSI, change-impact, harvest loop) | **SP-10** | 🔭 Designed |
-| Path 3 (human SQL) + RBAC / exposure enforcement | **SP-11** | 🔭 Designed |
+| Layer 0 · Metadata Overlay (fact store, merged-view, confirmation, profiler, freshness) | **SP-1** | ✅ **Built** (merged; SP-1.5 hardening scheduled) |
+| L1–2 · Intake + Clarification + Human Gate #1 | **SP-2** | 🏗 **In build** (`feature/sp2-intake`; design spec ready) |
+| L3 · Grounding (point-in-time / SCD) | **SP-3** | 🗒 Outlined in master design (per-SP spec pending) |
+| L4–5 · Validation core + DSL compiler + Sandbox (Path 1) | **SP-4** | 🗒 Outlined in master design (per-SP spec pending) |
+| L6–7 · Eval (model-free) + staged stamp + Gate #2 + Registry + Store | **SP-5** | 🗒 Outlined in master design (per-SP spec pending) |
+| Path 2 · LLM candidate SQL + repair + SQL gate | **SP-6** | 🗒 Outlined in master design (per-SP spec pending) |
+| Full validation + semantic leakage + fairness + overfitting guard | **SP-7** | 🗒 Outlined in master design (per-SP spec pending) |
+| Critique Service (5 modes) | **SP-8** | 🗒 Outlined in master design (per-SP spec pending) |
+| Hypothesis-driven Generation engine (§14: router, specialists, memory, symbolic, few-shot) | **SP-12** | 🗒 Outlined in master design (per-SP spec pending) |
+| Governance (MRM, explainability artifact, SoD, reproducibility) | **SP-9** | 🗒 Outlined in master design (per-SP spec pending) |
+| Lifecycle & Monitoring (drift/PSI, change-impact, harvest loop) | **SP-10** | 🗒 Outlined in master design (per-SP spec pending) |
+| Exposure/access enforcement (**SP-11a**, pulled to Phase C) · Path 3 human SQL (**SP-11b**, Phase D) | **SP-11a/b** | 🗒 Outlined in master design (per-SP spec pending) |
+| Online serving + streaming (online store, stream compute, on-demand, equivalence) | **SP-13** | 🧭 Proposed (Phase E, 2026-07-02) |
+| Consumption (PIT training-set service, SDK, serving reads, consumer registration) | **SP-14** | 🧭 Proposed (Phase E, 2026-07-02) |
+| Adoption (discovery console, brownfield import, environments, features-as-code) | **SP-15** | 🧭 Proposed (Phase E, 2026-07-02) |
+| Discovery Intelligence (design §17: atlas, funnel, portfolio scoring, outcome loop) | **SP-16** | 🧭 Proposed (Phase F, 2026-07-02) |
 
-Build order (roadmap): **Phase A** SP-0 ✅ / SP-1 → **Phase B** vertical slice SP-2…SP-5 (the end-to-end "walking skeleton") → **Phase C** coverage SP-6/7/8/12 → **Phase D** hardening SP-9/10/11.
+Build order (roadmap): **Phase A** SP-0 ✅ / SP-1 ✅ (+ SP-0.5/SP-1.5 hardening, SP-1b domain-catalog service) → **Phase B** vertical slice SP-2…SP-5 (the end-to-end "walking skeleton"; output capped at `APPROVED_EXPERIMENTAL` until SP-7 + SP-10) → **Phase C** coverage SP-6/7/8/**11a**/12 → **Phase D** hardening SP-9/10/11b → **Phase E** serving & consumption SP-13/14/15 → **Phase F** discovery intelligence SP-16.
 
 ---
 
@@ -256,8 +260,26 @@ Build order (roadmap): **Phase A** SP-0 ✅ / SP-1 → **Phase B** vertical slic
 
 ---
 
-## 9. Where to read more
-- Full design detail → [`2026-06-27-feature-engineering-platform-design.md`](./2026-06-27-feature-engineering-platform-design.md) (§1 authority model, §6 overlay, §14 generation, §15 domain catalog).
+## 9. Non-functional targets (draft — to ratify)
+
+No throughput, scale, or resilience targets existed anywhere in SP-0..SP-12 (2026-07-02 review). These are **draft targets to ratify** with the platform, data-platform, and risk owners; from SP-3 onward, every SP spec must state which of these it affects and how it meets them.
+
+| Dimension | Draft target |
+|---|---|
+| Registered feature versions (steady state) | 10,000+; 1,000+ active in production |
+| Concurrent in-flight requests | 500+ multi-day workflows without degradation |
+| Intake latency (submit → draft contract) | p95 < 30 s, p99 < 2 min (LLM path) |
+| Human-gate SLAs | clarification: 2 business days; Gate #2: 5 business days; then the SP-0 escalation ladder |
+| Batch materialization window | all active features refreshed daily within 4 h |
+| Backfill | 5 years × 10 M customers per feature < 24 h; incremental thereafter |
+| Training-set generation (Phase E) | 100 features × 1 M-row spine, PIT-correct, < 1 h |
+| Online serving (Phase E) | p99 < 50 ms reads; freshness per feature contract |
+| Projection lag / rebuild | p99 < 5 s lag; full rebuild overnight |
+| Availability / DR | 99.9% control plane; RPO ≤ 5 min, RTO ≤ 1 h (align to bank standards) |
+| Audit | security-audit export to SIEM < 1 min lag; WORM chain-head anchoring at least daily |
+
+## 10. Where to read more
+- Full design detail → [`2026-06-27-feature-engineering-platform-design.md`](./2026-06-27-feature-engineering-platform-design.md) (§1 authority model, §6 overlay, §14 generation, §15 domain catalog, §17 discovery intelligence).
 - Build decomposition → [`2026-06-27-feature-engineering-platform-roadmap.md`](./2026-06-27-feature-engineering-platform-roadmap.md).
 - Backbone → [`2026-06-27-sp0-foundations-design.md`](./2026-06-27-sp0-foundations-design.md).
 - Metadata Overlay → [`2026-06-29-sp1-metadata-overlay-design.md`](./2026-06-29-sp1-metadata-overlay-design.md).

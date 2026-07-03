@@ -164,6 +164,8 @@ Two distinct systems, deliberately separated:
 
 The registry governs *what a feature is and whether it may exist*; the store holds *its computed values*.
 
+**Online-aware from day one (reserved 2026-07-02):** every registry version carries a **`serving_mode`** attribute (`batch | online | on_demand`) and a **freshness contract**, even while only `batch` is buildable — so the Phase E online path (roadmap SP-13/14) lands as new attribute values, not a schema migration. Consumption is likewise platform-owned: training sets are produced by a **PIT-correct training-set generation service** (roadmap SP-14, scoped into SP-5's registry/store design) — never by hand-written joins against the store, which would reintroduce the leakage the gates exist to prevent.
+
 ---
 
 ## 4. The Feature Contract lifecycle
@@ -324,6 +326,8 @@ All three then pass through: SQL validation → sandbox → DQ → augmented hum
 ### 5.2 Path 1 — DSL / compiler (low risk)
 
 The LLM (or router) emits only a **Feature Plan** drawn from a **governed, versioned catalog of trusted operations** (e.g. `count_events`, `days_since_last_event`, `rolling_avg`, `ratio_windows`, `stddev_days_between_events`). The LLM may choose an operation and its parameters; it may **not** invent operations. A trusted, audited compiler turns the plan into SQL. Coverage grows deliberately by adding operations to the catalog — primarily via the harvest loop (§5.7).
+
+**Dual-target rule (reserved 2026-07-02):** every operation admitted to the catalog must be specified as compilable to **both** the batch target and a future streaming/online target with provable equivalence; an operation that cannot be dual-compiled is admitted explicitly as `batch_only`. This keeps the single-definition-compiled-to-both promise (§16, roadmap SP-13) buildable without re-opening the catalog later — and Path-2 SQL stays batch-only permanently (§16).
 
 ### 5.3 Path 2 — LLM candidate SQL (medium risk)
 
@@ -715,7 +719,7 @@ Each surviving candidate is **scored (§14.3)** and the scientist is shown ranke
 
 LLM-FE scores candidates by training a model in-loop. A feature platform usually has **no production model available at build time**, and may not even have data yet. Scoring is therefore **tiered by what is available**, and the platform is explicit about which tier it reached.
 
-**Tier 1 — model-free, label-aware scoring (default when labels exist).** The Confirmed Contract already defines the target (e.g. the churn definition, §4.2). Using a point-in-time-correct historical sample of `(feature_value, label)`, predictive power is measured with **no model**:
+**Tier 1 — model-free, label-aware scoring (default when labels exist).** The Confirmed Contract already defines the target (e.g. the churn definition, §4.2). The target is itself a governed artifact — an executable, versioned **label contract** (roadmap SP-5): the prose definition compiles to a label query subject to the **same point-in-time validation as features**, with **maturity/embargo** rules (a churn-90d label does not exist for as-of dates within the last 90 days). A prose-only target is not scoreable; label engineering is exactly as leakage-prone as feature engineering and is gated accordingly. Using a point-in-time-correct historical sample of `(feature_value, label)`, predictive power is measured with **no model**:
 
 - **Information Value (IV) / Weight of Evidence** — the banking standard. Bucket the feature; compare the target rate across buckets; large movement = strong feature (rule of thumb: IV > ~0.1 is worth keeping).
 - Equivalently, mutual information or single-feature AUC.
@@ -884,6 +888,137 @@ So **building is open across all of banking**; **production promotion still requ
 - **Calibration of LLM confidence.** The Doubt Router should rely on the **deterministic P0 field list** for blocking decisions and treat LLM-reported confidence only as a tunable hint (LLM confidence is poorly calibrated).
 - **Compile-target breadth.** This revision assumes a single primary compile target; SQL/PySpark/dbt multi-target is future work (each target multiplies compiler surface area).
 - **Concurrency.** Define behavior for simultaneous near-identical requests, deprecation racing adoption, and mid-flight schema changes.
+
+---
+
+## 17. Discovery Intelligence (finding the *right* features, not only valid ones)
+
+*Added 2026-07-02 (design dialogue following the full platform review). Status: designed direction; staging in §17.11. Everything in this section obeys the authority model (§2.1) unchanged: these mechanisms make the platform's **proposals** smarter — they never approve, never bypass a gate, never mutate a confirmed contract.*
+
+### 17.1 Purpose and relationship to §14
+
+§14 specifies a **bounded candidate generator with memory**: strategy agents propose within a hypothesis, scoring ranks, memory avoids repeats. That makes generation *safe and organized*; it does not make it *intelligent*. As designed, the platform's discovery ability is the LLM's priors plus catalog templates — it learns almost nothing from the bank's data, from production, or from its own humans.
+
+§17 specifies the learning loops that close that gap. The organizing idea:
+
+> **A feature platform that owns generation, evaluation, registration, AND lifecycle is sitting on training signal no vendor platform has. Discovery intelligence = systematically harvesting that signal and feeding it back into what gets proposed — while the gates stay exactly where they are.**
+
+One safety consequence is stated up front: every mechanism below **intensifies search**, and search intensity multiplies the multiple-comparisons risk. The §14.4 overfitting guard therefore graduates from per-request to **cumulative, per-use-case accounting** (selection-aware correction, tracked total comparisons, rotating embargoed out-of-time windows) as a *precondition* of this section, not an accompaniment.
+
+### 17.2 The production outcome loop (the flywheel)
+
+Today the platform's definition of a good feature ends at approval-time IV. The real verdict arrives later, in production:
+
+- **Adoption** — which registered features consuming models actually use (via consumer registration, §11.1);
+- **Retained importance** — feature importance (gain/SHAP) reported back by consuming models on a cadence;
+- **Survival** — which features hold up under drift monitoring (§13) vs. degrade or get deprecated unused.
+
+These outcomes feed back three ways: into the generation Router's "historical gain" (§14.8, replacing build-time IV as the fitness signal once production data exists), into the conceptual memory (§14.9 — "recency features not only score well for churn, they *retain importance for years*"), and into candidate ranking shown at Gate #1 ("features of this family have an 85% production-adoption rate in this domain").
+
+At scale this becomes the flywheel: several thousand features with production-outcome labels form a supervised dataset of *what makes a feature work in this bank* — usable first as a ranking prior, eventually to tune generation itself.
+
+**Governance:** outcome data is an **advisory prior on proposals only**. It never substitutes for the gates — a historically successful family's new candidate still clears every pack, the sandbox, scoring, and both human gates. Prerequisite: model→feature **consumer registration** must exist (registry consumers are named, versioned, purpose-scoped); without it, store reads are anonymous and this loop is structurally impossible.
+
+### 17.3 Evidence-driven enumeration and the signal atlas
+
+The LLM proposes what *sounds* plausible. Add its deterministic complement: **systematic enumeration** of the legal feature space — mechanical composition of governed aggregation primitives (the Path-1 op catalog, §5.2) over the **approved join graph** the overlay already stores (§6.3), bounded by the use case's `allowed_data_classes` (§15) — with every enumerated candidate cheap-scored (sampled IV, §14.3) against the use case's label.
+
+The output is a per-use-case **signal atlas**: a standing, versioned map of where predictive signal lives in the data that use case is permitted to touch. It serves three consumers:
+
+1. **Generation priming** — strategy agents (§14.8) start from evidence, not guesses.
+2. **The scientist, at Gate #1** — alongside candidates for *their* hypothesis, the platform can honestly report: *"your salary-irregularity hypothesis is supported (IV ≈ 0.18); the strongest untapped signal in your permitted data is declining login recency (IV ≈ 0.31) — generate candidates from that family?"* This is the moment the platform stops being a translator and becomes an analyst. The scientist remains free to decline; the report is recorded.
+3. **A floor for §17.4** — enumerated baselines expose when an elaborate LLM candidate is just a worse version of a simple aggregate.
+
+**Bounds:** enumeration runs on the same PIT-correct sampled data as Tier-1 scoring; atlas entries are *proposals about signal*, never auto-built features; the atlas itself is refreshed on a schedule and versioned like any evaluation artifact (its scores are subject to the §17.1 cumulative accounting — an atlas is a very large search).
+
+### 17.4 Portfolio-aware scoring: "right" means *incremental*
+
+Ranking candidates by standalone IV finds five correlated velocity features and calls all five winners — one signal, bought five times, with five governance bills. Scoring therefore becomes **conditional by default**:
+
+- A candidate's headline score is its **incremental value given the already-registered portfolio** for that use case (conditional mutual information, or the §14.3 Tier-1b throwaway probe run as `portfolio` vs `portfolio + candidate` — made standard rather than optional).
+- Multi-candidate selection optimizes the **set**, not top-k individually (greedy conditional-gain / mRMR-style), so the ranked options at Gate #1 are *complementary* by construction.
+- This also upgrades `FeatureDuplicationValidationPack` (§7.5) from structural matching to an **informational test**: two features are duplicates when each adds ~zero conditional value given the other, however different their SQL looks.
+
+Both scores (standalone and incremental) are shown at Gate #1; a strong-standalone/zero-incremental candidate is a legitimate *documentation* of redundancy, not noise.
+
+### 17.5 The multi-fidelity screening funnel
+
+A candidate's cost today is near-binary: a cheap heuristic rank, or a full sandbox + evaluation cycle. World-class search uses **successive halving**:
+
+```
+Tier 0  metadata plausibility (schema/policy/grain, DESIGN-CHECK subset)   ~1000 candidates
+Tier 1  IV on a small PIT-correct sample (~1%)                             →  ~100
+Tier 2  IV on the full scoring sample + stability across sub-periods       →   ~20
+Tier 3  sandbox run + out-of-time re-check (§14.4)                         →    ~5 to Gate #1
+```
+
+Each tier's survivors earn the next tier's spend; each tier's *attempts* are logged to the attempt memory (§14.2) and counted by the cumulative overfitting accounting (§17.1). Every funnel run carries a **governed per-hypothesis budget** (candidates, LLM tokens, sample-compute) so exploration is generous but bounded. Result: the platform genuinely explores thousands of definitions per hypothesis at the sandbox cost of a handful — *with the statistics done honestly*.
+
+### 17.6 Semantic data cards: let generation see the data, not just the schema
+
+An LLM proposing features over columns it knows only by name proposes *name-plausible* features. `transaction_type` with 400 codes, where `'SALARY'` covers payroll-file credits but not gig-economy deposits, quietly wrecks a salary-irregularity feature no gate will catch as *wrong* — it is merely *worse than intended*.
+
+Extend the SP-1 profiler evidence into a **semantic data card** per table/column — privacy-safe statistics only: distributions and null rates, cardinalities, **code-value glossaries** (what the codes actually mean, owner-confirmed like any overlay fact), temporal coverage, seasonality, freshness reality vs SLA. Cards prime generation and the Critique Service (§8) — enabling findings like *"this filter matches 0.2% of rows; did you mean to include DIRECT_CREDIT?"* — and are governed exactly like overlay facts (confirmed, versioned, expiring, §6.6–6.7).
+
+### 17.7 Two new governed feature families: relational and peer-relative
+
+Much of banking's discriminative signal lives in **relationships** and **relative position**; the single-entity, single-table contract shape can express neither. Two families become first-class DSL citizens, each with its own leakage rules:
+
+- **Graph features** — degree/velocity over approved relationship tables (transfers-to-flagged-counterparties, shared device/address/employer links, money-flow through an account). The backbone of AML and fraud-ring detection. Edges come only from **approved join / relationship facts** (§6); traversal depth and edge types are op-catalog parameters, never free-form.
+- **Peer-relative features** — the customer vs. their own cohort's baseline (utilization z-score within segment, spend percentile among peers). Often more predictive *and more stable* than absolute values, and frequently more defensible in fair-lending review — they encode "unusual for customers like this" rather than raw magnitude. **Hard rule:** peer groups are themselves feature-like artifacts — defined PIT-correctly (the cohort as it was known at `as_of`), policy-checked (a peer group may not proxy a protected attribute), and versioned.
+
+Both families flow through the standard floor (§2.2); they carry family-specific validation packs (graph: fan-out/degree explosion, edge-table PIT; peer: cohort-definition leakage, minimum cohort size for privacy).
+
+### 17.8 Proactive discovery: the platform initiates, humans still gate
+
+Everything in §14 is request-driven. Three triggers make the platform hunt rather than wait — each opens a **normal intake run** (proposal + full pipeline + gates), never a registered feature:
+
+1. **New data onboarded** — when a table's overlay facts reach VERIFIED, propose ranked candidate features for the existing use cases *allowed* to use it ("new BNPL transactions table → 8 velocity/utilization candidates for behavioral credit scoring").
+2. **Model degradation** — a consuming model's drift/performance alert (§13) triggers a targeted search over the segments where errors concentrate, proposing gap-filling candidates to the model's owner.
+3. **Label arrival** — a cold-start use case (§14.7) crossing its label threshold automatically re-scores its Design/Data-checked inventory toward USEFULNESS-CHECKED and surfaces the newly-scoreable winners.
+
+Proactive proposals are rate-limited per team, clearly attributed ("platform-initiated"), and land as suggestions in a queue — a bank team's backlog must never be flooded by a robot.
+
+### 17.9 Learning from humans and from failure
+
+The platform currently discards two rich training signals it already produces:
+
+- **Gate decisions are preference data.** Which candidate the human picked, what they edited before confirming, the rationale recorded when overriding scores (assisted-definition §7.2) — logged as structured preference records and used to train a **reranker** that pulls candidate ordering toward the bank's demonstrated taste. Learning affects *ordering only*; it never adds or removes options, and it is evaluated (offline, against held-out gate decisions) before any ranking change ships.
+- **Rejections need a taxonomy, not free text.** The attempt memory (§14.2) upgrades its `reason` to a closed enum — `LEAKED / UNSTABLE / REDUNDANT_WITH:<id> / TOO_SPARSE / POLICY_BLOCKED / COST / NOT_USEFUL` — so (a) generation can reason about avoidance explicitly, (b) a cheap **reject-predictor** trained on attempt history pre-filters Tier-0 of the funnel (§17.5), and (c) rejection analytics become a governance artifact ("40% of AML candidates die on cohort sparsity — fix the data, not the search"). Rejections carry a **re-evaluation trigger** (upstream data change flips `TOO_SPARSE` candidates back to eligible) so the memory never wrongly blocks a feature the world has since made viable.
+
+### 17.10 Further out (parked, not designed)
+
+- **Hypothesis decomposition (mechanism copilot).** Decompose "irregular salary → churn" into competing mechanisms (liquidity stress vs. gig-employment lifecycle), propose *discriminating* features per mechanism, and report which mechanism the data supports. Elevates the platform from feature generator to analytical partner; requires careful claims-honesty design (correlational evidence presented as such).
+- **Uncertainty-honest scoring.** Bootstrap confidence intervals on IV surfaced at Gate #1, so a human choosing between 0.18 ± 0.02 and 0.21 ± 0.15 makes an informed call rather than chasing a noisy point estimate; stability selection (a candidate must win across resamples) as a funnel tier.
+
+### 17.11 Prerequisites, design hooks to reserve now, and staging
+
+§17 is explicitly **post-vertical-slice** work — none of it should delay Phase B. But five cheap hooks must be reserved *now*, or later delivery becomes a rewrite:
+
+| Hook | Where | Enables |
+|---|---|---|
+| Consumer-registration schema (model ↔ feature version, purpose, environment) | Registry data model (SP-5/SP-9) | §17.2 outcome loop |
+| Structured rejection-reason enum + re-evaluation trigger on attempt records | Attempt memory (SP-2/SP-12) | §17.9 |
+| Candidate scoring behind **one seam** (single scorer interface) | SP-2 `candidate_signals` → SP-12 | §17.4 portfolio scoring, §17.5 funnel slot in without rewiring |
+| Label contracts (executable, versioned targets) + metric registry | SP-5 | §17.3 atlas, all non-binary scoring |
+| Profiler evidence model shaped as per-object cards (not one-shot guesses) | SP-1 profiler | §17.6 |
+| Cumulative-comparison ledger per use case | Evaluation (SP-5/SP-7) | §17.1 guard — precondition for everything above |
+
+**Staging:** the outcome loop (§17.2) cannot precede consumption (features must be servable and consumed before production feedback exists) — so the natural build order is: hooks in Phases B–D → consumption/serving (the Phase E addition to the roadmap) → **§17 as its own sub-project (proposed SP-16, Phase F)**, sequenced roughly: signal atlas + funnel + portfolio scoring (all build-time, no production dependency) → semantic cards + failure taxonomy → new feature families → proactive triggers → outcome loop + preference reranker (need Phase E live).
+
+### 17.12 Non-negotiables
+
+```
+Everything here PROPOSES; gates and humans decide (§2.1) — unchanged.
+Cumulative overfitting accounting BEFORE the funnel scales search.
+Outcome/preference learning adjusts ordering and priors only —
+  never auto-promotes, never relaxes a gate, never skips a stamp (§14.5).
+Peer groups and graph edges are governed, PIT-correct, policy-checked artifacts.
+Every learned component (reranker, reject-predictor) is versioned,
+  offline-evaluated before deployment, and recorded in provenance (§11.4).
+Proactive proposals are rate-limited, attributed, and declinable.
+All new thresholds/budgets are versioned, owned artifacts — not env vars.
+```
 
 ---
 
