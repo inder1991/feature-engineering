@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Any, Protocol, runtime_checkable
 
@@ -170,6 +170,25 @@ def dispatch_command(
         res = caller.invoke(payload)
 
     # --- Step 3: finalize the result in a SECOND committed transaction -----------------
+    return _finalize(
+        conn, command_id, res, now,
+        reinvoked=reinvoked, residual=residual, reconciled=reconciled,
+    )
+
+
+def _finalize(
+    conn: DbConn,
+    command_id: str,
+    res: IntegrationResult,
+    now: datetime,
+    *,
+    reinvoked: bool,
+    residual: bool,
+    reconciled: bool,
+) -> DispatchOutcome:
+    """Write the external call's result in its OWN committed transaction (§5.4 Step 3): re-lock the
+    row, honor a concurrent finalize if one already landed, else persist succeeded/failed/pending.
+    Shared by dispatch_command (first dispatch + recovery) and invoke_claimed_external."""
     with conn.cursor() as cur:
         cur.execute(
             "SELECT status FROM external_commands WHERE command_id = %s FOR UPDATE",
@@ -271,3 +290,104 @@ def accept_result(
             )
             return ResultAcceptance(command_id, accepted=False, stale=True)
     return ResultAcceptance(command_id, accepted=True, stale=False)
+
+
+# --- Worker wiring: caller registry + first-dispatch claim + crash-recovery sweep ----------
+
+_CALLERS: dict[str, IntegrationCaller] = {}
+
+
+def register_integration_caller(caller: IntegrationCaller) -> None:
+    """Register the IntegrationCaller that CAN execute an integration's external commands. The
+    worker only claims commands whose integration is registered (fail-closed); an unregistered
+    integration's rows are never invoked, only counted (SP-0.5 round-2). Idempotent — last wins."""
+    _CALLERS[caller.integration] = caller
+
+
+def current_integration_callers() -> dict[str, IntegrationCaller]:
+    """Snapshot of registered integration -> caller; its keys gate the claim queries so an
+    un-callable integration is never claimed."""
+    return dict(_CALLERS)
+
+
+@dataclass(frozen=True, slots=True)
+class ClaimedExternal:
+    command_id: str
+    integration: str
+    payload: Mapping[str, Any]
+    job_handle: str | None
+    dedup_supported: bool
+
+
+def claim_next_pending(
+    conn: DbConn, registered_integrations, *, now: datetime
+) -> ClaimedExternal | None:
+    """Atomically claim ONE pending external command whose integration is registered (mark it
+    'dispatched', attempts+1) with FOR UPDATE SKIP LOCKED, so two concurrent workers never hand
+    the same row to a fresh invoke. Returns None if nothing is claimable. FIRST-dispatch only — the
+    claimed row is invoked via invoke_claimed_external, NOT dispatch_command's recovery branch."""
+    reg = list(registered_integrations)
+    if not reg:
+        return None
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE external_commands SET status='dispatched', dispatched_at=%s, "
+            "attempts=attempts+1 WHERE command_id = (SELECT command_id FROM external_commands "
+            "WHERE status='pending' AND integration = ANY(%s) "
+            "ORDER BY created_at FOR UPDATE SKIP LOCKED LIMIT 1) "
+            "RETURNING command_id, integration, request_payload, job_handle, dedup_supported",
+            (now, reg),
+        )
+        row = cur.fetchone()
+    conn.commit()  # claim durable BEFORE the external call (mirrors dispatch_command Step 1)
+    if row is None:
+        return None
+    return ClaimedExternal(row[0], row[1], row[2], row[3], row[4])
+
+
+def invoke_claimed_external(
+    conn: DbConn, claimed: ClaimedExternal, caller: IntegrationCaller, *, now: datetime
+) -> DispatchOutcome:
+    """CALL + FINALIZE a row claim_next_pending already claimed as a FIRST dispatch — a known-fresh
+    invoke, so it never takes dispatch_command's recovery branch (no false residual-risk flag)."""
+    res = caller.invoke(claimed.payload)
+    return _finalize(
+        conn, claimed.command_id, res, now, reinvoked=False, residual=False, reconciled=False
+    )
+
+
+def claim_stale_dispatched(
+    conn: DbConn, registered_integrations, *, stale_after_seconds: float, now: datetime
+) -> list[tuple[str, str]]:
+    """Find external commands stuck in 'dispatched' (a worker died after claiming, before
+    finalizing) older than `stale_after_seconds` — CRASH RECOVERY. Returns [(command_id,
+    integration)] for registered integrations only, FOR UPDATE SKIP LOCKED so two workers do not
+    both sweep the same row. The caller routes each through dispatch_command, whose 'dispatched' ->
+    recover path (reconcile / dedup-safe re-invoke / honest residual flag) is idempotency-safe."""
+    reg = list(registered_integrations)
+    if not reg:
+        return []
+    cutoff = now - timedelta(seconds=stale_after_seconds)
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT command_id, integration FROM external_commands "
+            "WHERE status='dispatched' AND integration = ANY(%s) AND dispatched_at < %s "
+            "ORDER BY dispatched_at FOR UPDATE SKIP LOCKED",
+            (reg, cutoff),
+        )
+        rows = cur.fetchall()
+    conn.rollback()  # release row locks; dispatch_command re-locks each in its own Step 1
+    return [(r[0], r[1]) for r in rows]
+
+
+def pending_unhandled_count(conn: DbConn, registered_integrations) -> int:
+    """Count pending rows whose integration has NO registered caller — surfaced as a gauge so an
+    operator registers the missing caller (rows are never lost, just currently un-invokable)."""
+    reg = list(registered_integrations)
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT count(*) FROM external_commands "
+            "WHERE status='pending' AND NOT (integration = ANY(%s))",
+            (reg,),
+        )
+        return int(cur.fetchone()[0])

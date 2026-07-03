@@ -228,48 +228,6 @@ def test_control_signal_survives_process_one_first_then_poller_parks(db) -> None
         assert cur.fetchone()[0] == "done"
 
 
-@pytest.fixture
-def _throwaway_autocommit_db(_dsn):
-    """Create an isolated, throwaway, MIGRATED database and yield its DSN; drop it on teardown. Its
-    committed side effects never leak into the shared (rolled-back) test DB — the exact isolation an
-    AUTOCOMMIT daemon connection (run_worker_once / run_forever) needs."""
-    import psycopg
-
-    from featuregen.db.migrations import apply_migrations
-
-    dbname = "fg_worker_ac_test"
-    new_dsn = " ".join((f"dbname={dbname}" if p.startswith("dbname=") else p) for p in _dsn.split())
-
-    admin = psycopg.connect(_dsn, autocommit=True)
-    try:
-        admin.execute(f"DROP DATABASE IF EXISTS {dbname} WITH (FORCE)")
-        admin.execute(f"CREATE DATABASE {dbname}")
-    finally:
-        admin.close()
-    with psycopg.connect(new_dsn) as mconn:
-        apply_migrations(mconn)
-    try:
-        yield new_dsn
-    finally:
-        admin = psycopg.connect(_dsn, autocommit=True)
-        try:
-            admin.execute(f"DROP DATABASE IF EXISTS {dbname} WITH (FORCE)")
-        finally:
-            admin.close()
-
-
-@pytest.fixture
-def autocommit_worker_conn(_throwaway_autocommit_db):
-    """An isolated, throwaway, AUTOCOMMIT connection — the exact connection mode run_forever opens."""
-    import psycopg
-
-    ac = psycopg.connect(_throwaway_autocommit_db, autocommit=True)
-    try:
-        yield ac
-    finally:
-        ac.close()
-
-
 def test_run_worker_once_advances_projections_on_autocommit(
     autocommit_worker_conn, actor, prov
 ) -> None:
