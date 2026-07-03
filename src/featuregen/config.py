@@ -17,12 +17,18 @@ class Settings:
 
     dsn: str | None
     test_dsn: str | None
+    # Verifier-held key for the tamper-evident security-audit HMAC chain (§6.2). Held by the
+    # process, NOT stored in the DB: a writer who can recompute an unkeyed hash could forge
+    # the chain, so the signature must be keyed. Fail-closed — audit.py refuses to sign when
+    # this is unset rather than fall back to a default (see security.audit).
+    audit_hmac_key: str | None
 
     @classmethod
     def from_env(cls) -> Settings:
         return cls(
             dsn=os.environ.get("FEATUREGEN_DSN"),
             test_dsn=os.environ.get("FEATUREGEN_TEST_DSN"),
+            audit_hmac_key=os.environ.get("FEATUREGEN_AUDIT_HMAC_KEY"),
         )
 
 

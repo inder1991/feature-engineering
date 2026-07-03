@@ -1,3 +1,5 @@
+import pytest
+
 from featuregen.identity.build import build_human_identity
 from featuregen.security.audit import record_security_event, verify_chain
 
@@ -124,6 +126,48 @@ def test_denial_lands_in_security_stream_not_events(db):
     record_denial(db, cmd, "no matching authz policy")
     assert db.execute("SELECT count(*) FROM security_audit").fetchone()[0] == 1
     assert db.execute("SELECT count(*) FROM events").fetchone()[0] == 0
+
+
+def test_audit_chain_is_hmac_not_bare_hash(db):
+    # BLOCKER #4: chain signatures must be KEYED (HMAC), not a bare SHA-256 that any writer
+    # can recompute. A chain signed with one key must NOT verify under a different key.
+    a = build_human_identity(subject="user:raj", role_claims=["data_scientist"])
+    record_security_event(
+        db,
+        event_type="COMMAND_DENIED",
+        actor=a,
+        attempted_action="activate",
+        decision="denied",
+        reason="r1",
+        key="right-key",
+    )
+    assert verify_chain(db, key="right-key") is True
+    assert verify_chain(db, key="wrong-key") is False
+
+
+def test_verify_chain_empty_is_not_silently_ok(db):
+    # BLOCKER #4: an empty chain where entries were expected must NOT verify True
+    # (TRUNCATE-then-verify previously passed silently). Default preserves empty-is-ok.
+    assert verify_chain(db, expect_nonempty=True) is False
+    assert verify_chain(db) is True
+
+
+def test_audit_signing_fails_closed_without_key(db, monkeypatch):
+    # Fail closed: with no HMAC key configured, refuse to sign rather than fall back to a
+    # default/unkeyed hash that would silently restore forgeability.
+    import featuregen.security.audit as audit_mod
+
+    monkeypatch.delenv("FEATUREGEN_AUDIT_HMAC_KEY", raising=False)
+    a = build_human_identity(subject="user:raj", role_claims=["data_scientist"])
+    with pytest.raises(audit_mod.AuditKeyNotConfigured):
+        record_security_event(
+            db,
+            event_type="COMMAND_DENIED",
+            actor=a,
+            attempted_action="activate",
+            decision="denied",
+            reason="r1",
+        )
 
 
 def test_concurrent_appends_keep_single_chain(db):

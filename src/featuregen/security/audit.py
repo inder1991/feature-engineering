@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 from collections.abc import Mapping
 from datetime import UTC, datetime
@@ -8,9 +9,35 @@ from typing import Any
 
 from psycopg.types.json import Json
 
+from featuregen.config import get_settings
 from featuregen.contracts.db import DbConn
 from featuregen.contracts.identity import IdentityEnvelope, identity_to_jsonb
 from featuregen.idgen import mint_id
+
+
+class AuditKeyNotConfigured(RuntimeError):
+    """Raised when the security-audit HMAC key is not configured (§6.2, BLOCKER #4).
+
+    The chain signature is KEYED so that a writer who can recompute an unkeyed hash cannot
+    forge it. We fail CLOSED: rather than sign with a built-in default key (which would
+    silently restore forgeability), signing/verification aborts until the operator sets
+    ``FEATUREGEN_AUDIT_HMAC_KEY``. Tests inject a deterministic key via the environment.
+    """
+
+
+def _audit_hmac_key() -> str:
+    """Resolve the audit-signing key from config (env ``FEATUREGEN_AUDIT_HMAC_KEY``).
+
+    Resolved INSIDE the module so callers of ``record_security_event`` need not thread a key
+    through. Fail-closed: a missing/empty key raises rather than defaulting.
+    """
+    key = get_settings().audit_hmac_key
+    if not key:
+        raise AuditKeyNotConfigured(
+            "FEATUREGEN_AUDIT_HMAC_KEY is not configured; refusing to sign the "
+            "security-audit chain with a default key (fail-closed)."
+        )
+    return key
 
 # Transaction-scoped advisory-lock key that serializes ALL appends to the single
 # tamper-evident security chain (§6.2). Without it the chain can FORK: on an empty table
@@ -32,6 +59,7 @@ def _canonical_ts(occurred_at: datetime) -> str:
 
 
 def _entry_hash(
+    key: str,
     prev_hash: str | None,
     sec_id: str,
     event_type: str,
@@ -65,7 +93,15 @@ def _entry_hash(
         separators=(",", ":"),
         ensure_ascii=False,
     )
-    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    # KEYED signature (HMAC-SHA256), not a bare SHA-256 (BLOCKER #4): a bare digest is
+    # forgeable by any writer who can recompute the chain. The MAC covers prev_hash ||
+    # canonical so both the row content and its link to the previous entry are authenticated.
+    prev_bytes = (prev_hash or "").encode("utf-8")
+    return hmac.new(
+        key.encode("utf-8"),
+        prev_bytes + canonical.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
 
 
 def record_security_event(
@@ -79,7 +115,11 @@ def record_security_event(
     aggregate: str | None = None,
     aggregate_id: str | None = None,
     retention_class: str = "regulator",
+    key: str | None = None,
 ) -> str:
+    # Resolve the signing key from config when not injected (tests pass an explicit key).
+    # Fail-closed: raises AuditKeyNotConfigured if unset — before any DB write.
+    signing_key = key if key is not None else _audit_hmac_key()
     # Serialize chain appends so the prev_hash read + insert is atomic for the single chain
     # (fixes the empty-table / same-prev fork race; FOR UPDATE alone cannot lock a row that
     # does not exist yet).
@@ -94,6 +134,7 @@ def record_security_event(
     # of the hash basis and matches what verify_chain() reads back.
     occurred_at = datetime.now(UTC)
     entry_hash = _entry_hash(
+        signing_key,
         prev_hash,
         sec_id,
         event_type,
@@ -202,7 +243,15 @@ def read_security_audit(
     return [(r[0], r[1], r[2], r[3]) for r in rows]
 
 
-def verify_chain(conn: DbConn) -> bool:
+def verify_chain(
+    conn: DbConn,
+    *,
+    key: str | None = None,
+    expect_nonempty: bool = False,
+) -> bool:
+    # Recompute each row's KEYED signature with the configured (or injected) key. A wrong key
+    # fails to verify — proof the chain is HMAC'd, not a bare hash (BLOCKER #4).
+    signing_key = key if key is not None else _audit_hmac_key()
     rows = conn.execute(
         """
         SELECT security_event_id, event_type, actor, attempted_action,
@@ -212,6 +261,11 @@ def verify_chain(conn: DbConn) -> bool:
          ORDER BY seq ASC
         """
     ).fetchall()
+    # An empty table verifying True let a TRUNCATE'd chain pass silently (BLOCKER #4). When a
+    # non-empty chain is expected, treat empty as a verification FAILURE. Default preserves
+    # the prior empty-is-ok contract for existing callers.
+    if not rows:
+        return not expect_nonempty
     prev_hash: str | None = None
     for (
         sec_id,
@@ -231,6 +285,7 @@ def verify_chain(conn: DbConn) -> bool:
             return False
         if (
             _entry_hash(
+                signing_key,
                 prev_hash,
                 sec_id,
                 event_type,
