@@ -120,7 +120,7 @@ def fail_retryable(conn: psycopg.Connection, queue_id: int, *, error: str) -> No
                 (error, queue_id),
             )
         else:
-            delay = compute_backoff(row["attempts"], jitter=0.0)
+            delay = compute_backoff(row["attempts"])  # default jitter=0.5 (review MINOR #23)
             cur.execute(
                 "UPDATE queue SET status='ready', last_error=%s, lease_owner=NULL, "
                 "lease_expires_at=NULL, available_at = now() + make_interval(secs => %s) "

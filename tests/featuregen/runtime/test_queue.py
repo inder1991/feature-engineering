@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from featuregen.runtime.queue import (
     claim_one,
     complete,
@@ -9,6 +11,21 @@ from featuregen.runtime.queue import (
     queue_depth,
     reclaim_stuck_queue,
 )
+
+
+@pytest.fixture
+def make_queue_row(db):
+    """Local factory: enqueue a ready row then force its attempt count, returning the row id."""
+
+    def _make(*, message_id: str, attempts: int) -> int:
+        qid = enqueue(
+            db, message_id=message_id, partition_key=f"run:{message_id}", handler="h", payload={}
+        )
+        with db.cursor() as cur:
+            cur.execute("UPDATE queue SET attempts=%s WHERE id=%s", (attempts, qid))
+        return qid
+
+    return _make
 
 
 def test_enqueue_idempotent_on_message_id(db) -> None:
@@ -117,3 +134,18 @@ def test_queue_depth_counts_ready_and_leased(db) -> None:
     assert queue_depth(db) == 2
     assert queue_depth(db, partition_key="run:r1") == 1
     assert queue_depth(db, partition_key="run:nope") == 0
+
+
+def test_fail_retryable_applies_jitter(db, make_queue_row) -> None:
+    """Two rows failed at the same attempt count must not reschedule to the identical instant —
+    jitter breaks the thundering herd after an outage (review MINOR #23)."""
+    from featuregen.runtime.queue import fail_retryable
+
+    a = make_queue_row(message_id="m_a", attempts=2)
+    b = make_queue_row(message_id="m_b", attempts=2)
+    fail_retryable(db, a, error="x")
+    fail_retryable(db, b, error="x")
+    with db.cursor() as cur:
+        cur.execute("SELECT available_at FROM queue WHERE id IN (%s,%s) ORDER BY id", (a, b))
+        ts = [r[0] for r in cur.fetchall()]
+    assert ts[0] != ts[1]  # jitter makes collisions astronomically unlikely

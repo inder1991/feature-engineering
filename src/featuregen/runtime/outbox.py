@@ -150,7 +150,7 @@ def relay_publish_batch(
                         (attempts, str(exc), row["id"]),
                     )
                 else:
-                    delay = compute_backoff(attempts, jitter=0.0)
+                    delay = compute_backoff(attempts)  # default jitter=0.5 (review MINOR #23)
                     cur.execute(
                         "UPDATE outbox SET status='pending', attempts=%s, last_error=%s, "
                         "lease_owner=NULL, lease_expires_at=NULL, "
