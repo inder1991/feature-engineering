@@ -91,3 +91,35 @@ def test_unauthenticated_is_rejected():
     )
     with pytest.raises(IdentityError):
         validate_identity(anon)
+
+
+def test_validate_identity_admits_attested_internal_trust_root():
+    # The durable timer runtime is an internal trust root (no token); it authenticates via the
+    # sanctioned capability with auth_method="internal" + an attestation. validate_identity must
+    # admit it (SP-0.5 round-2). It currently rejects auth_method != "workload-identity".
+    from featuregen.aggregates.activation import _TIMER_RUNTIME_ACTOR
+
+    validate_identity(_TIMER_RUNTIME_ACTOR)  # must not raise
+
+
+def test_validate_identity_still_rejects_unattested_internal():
+    # No weakening: an internal service envelope WITHOUT attestation is still rejected.
+    from featuregen.identity._trust import mint_trusted_identity
+
+    env = mint_trusted_identity(
+        subject="service:x", actor_kind="service", auth_method="internal",
+        role_claims=(), attestation=None,
+    )
+    with pytest.raises(IdentityError):
+        validate_identity(env)
+
+
+def test_validate_identity_still_rejects_unattested_workload_service():
+    from featuregen.identity._trust import mint_trusted_identity
+
+    env = mint_trusted_identity(
+        subject="service:y", actor_kind="service", auth_method="workload-identity",
+        role_claims=(), attestation=None,
+    )
+    with pytest.raises(IdentityError):
+        validate_identity(env)
