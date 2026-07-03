@@ -64,11 +64,25 @@ def require_revalidation_command(conn: DbConn, cmd: Command) -> CommandResult:
 def record_revalidation_outcome_command(conn: DbConn, cmd: Command) -> CommandResult:
     feature_id = cmd.aggregate_id
     outcome = cmd.args["outcome"]
+    # Bound ONCE (DRY) and reused for both the event payload and the deprecate UPDATE. Nullable for
+    # non-deprecate outcomes (revalidated/requires_change run no scoped UPDATE, so a null slot id is
+    # harmless there), but a "deprecate" outcome scopes an UPDATE by it — see the guard below.
+    feature_version_id = cmd.args.get("feature_version_id")
     if _last_lifecycle(conn, feature_id) != "REVALIDATION_REQUIRED":
         return CommandResult(
             accepted=False,
             aggregate_id=feature_id,
             denied_reason="record_revalidation_outcome requires REVALIDATION_REQUIRED",
+        )
+    # Fail LOUD before emitting anything: a null feature_version_id would make the deprecate UPDATE
+    # (... AND feature_version_id = NULL) match ZERO rows — silently deprecating nothing while
+    # claiming success (under-deprecation trap). A deprecate outcome must name its version or be
+    # rejected; it must never emit REVALIDATION_OUTCOME_RECORDED and then no-op the deprecation.
+    if outcome == "deprecate" and feature_version_id is None:
+        return CommandResult(
+            accepted=False,
+            aggregate_id=feature_id,
+            denied_reason="deprecate outcome requires feature_version_id",
         )
     produced: list[str] = []
     new_run = None
@@ -100,7 +114,7 @@ def record_revalidation_outcome_command(conn: DbConn, cmd: Command) -> CommandRe
         type="REVALIDATION_OUTCOME_RECORDED",
         payload={
             "feature_id": feature_id,
-            "feature_version_id": cmd.args.get("feature_version_id"),
+            "feature_version_id": feature_version_id,
             "outcome": outcome,
             "new_run_id": new_run,
         },
@@ -118,6 +132,6 @@ def record_revalidation_outcome_command(conn: DbConn, cmd: Command) -> CommandRe
         conn.execute(
             "UPDATE feature_active_versions SET activation_state='DEPRECATED' "
             "WHERE feature_id=%s AND feature_version_id=%s",
-            (feature_id, cmd.args.get("feature_version_id")),
+            (feature_id, feature_version_id),
         )
     return CommandResult(accepted=True, aggregate_id=feature_id, produced_event_ids=tuple(produced))
