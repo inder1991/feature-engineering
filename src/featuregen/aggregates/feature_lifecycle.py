@@ -86,6 +86,25 @@ def record_revalidation_outcome_command(conn: DbConn, cmd: Command) -> CommandRe
         )
     produced: list[str] = []
     new_run = None
+    if outcome == "deprecate":
+        # Deprecate the revalidated version's slot FIRST and require it actually matched a row.
+        # Otherwise a 0-row UPDATE (version no longer the active slot) would still emit
+        # REVALIDATION_OUTCOME_RECORDED and return success — a false audit trail that deprecates
+        # nothing (SP-0.5 round-2). Scope to the revalidated version: feature_active_versions'
+        # grain is (feature_id, use_case) and this command carries no use_case, so we scope by
+        # the tightest available discriminator, feature_version_id — mirroring _deprecate_now
+        # (consumers.py) minus the use_case term. Follow-up: carry use_case to reach that grain.
+        updated = conn.execute(
+            "UPDATE feature_active_versions SET activation_state='DEPRECATED' "
+            "WHERE feature_id=%s AND feature_version_id=%s",
+            (feature_id, feature_version_id),
+        ).rowcount
+        if updated == 0:
+            return CommandResult(
+                accepted=False,
+                aggregate_id=feature_id,
+                denied_reason="deprecate outcome matched no active version (already superseded?)",
+            )
     if outcome == "requires_change":
         new_run = new_run_id()
         created = append(
@@ -122,16 +141,4 @@ def record_revalidation_outcome_command(conn: DbConn, cmd: Command) -> CommandRe
         feature_id=feature_id,
     )
     produced.append(evt.event_id)
-    if outcome == "deprecate":
-        # Scope to the revalidated version's slot(s). feature_active_versions' grain is
-        # (feature_id, use_case), so an unscoped UPDATE would deprecate EVERY use_case/version of
-        # the feature on a single outcome. This command carries no use_case (see the
-        # REVALIDATION_OUTCOME_RECORDED payload / require_revalidation flow), so we scope by the
-        # tightest available discriminator, feature_version_id — mirroring _deprecate_now
-        # (consumers.py) minus the use_case term. Follow-up: carry use_case to reach that grain.
-        conn.execute(
-            "UPDATE feature_active_versions SET activation_state='DEPRECATED' "
-            "WHERE feature_id=%s AND feature_version_id=%s",
-            (feature_id, feature_version_id),
-        )
     return CommandResult(accepted=True, aggregate_id=feature_id, produced_event_ids=tuple(produced))

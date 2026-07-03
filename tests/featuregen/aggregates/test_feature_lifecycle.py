@@ -255,3 +255,40 @@ def test_deprecate_outcome_scopes_to_revalidated_version(db):
     )
     assert states["fraud"] == "DEPRECATED"  # the revalidated version's slot
     assert states["credit"] == "PRODUCTION"  # the unrelated version's slot must survive
+
+
+def test_deprecate_outcome_no_active_slot_is_rejected_not_falsely_recorded(db):
+    # A "deprecate" outcome whose version is no longer the active slot must UPDATE 0 rows and
+    # be REJECTED (accepted=False) — it must NOT emit REVALIDATION_OUTCOME_RECORDED and claim
+    # success while deprecating nothing (SP-0.5 round-2: revalidation rowcount).
+    db.execute(
+        "INSERT INTO feature_versions (feature_version_id, feature_id, produced_by_run, "
+        "verification_stamp, risk_tier, approval_type, content_hash) "
+        "VALUES ('fv_g','feat_g','run_g','DATA-CHECKED','low','PRODUCTION','sha256:9')"
+    )
+    db.execute(
+        "INSERT INTO feature_active_versions (feature_id, use_case, feature_version_id, "
+        "activation_state, activated_seq) VALUES ('feat_g','fraud','fv_g','PRODUCTION',1)"
+    )
+    raise_monitoring_alert_command(
+        db,
+        make_cmd("raise_monitoring_alert", "feature", "feat_g", {"feature_version_id": "fv_g"},
+                 actor=_svc()),
+    )
+    require_revalidation_command(
+        db,
+        make_cmd("require_revalidation", "feature", "feat_g", {"feature_version_id": "fv_g"},
+                 actor=_svc()),
+    )
+    # The active slot is gone by the time the outcome is recorded (already superseded/removed),
+    # so the scoped deprecate UPDATE matches 0 rows.
+    db.execute("DELETE FROM feature_active_versions WHERE feature_id='feat_g'")
+
+    res = record_revalidation_outcome_command(
+        db,
+        make_cmd("record_revalidation_outcome", "feature", "feat_g",
+                 {"feature_version_id": "fv_g", "outcome": "deprecate"}, actor=_svc()),
+    )
+    assert res.accepted is False  # nothing deprecated -> not a success
+    # No false audit trail: the last feature event is still REVALIDATION_REQUIRED, not OUTCOME.
+    assert load_stream(db, "feature", "feat_g")[-1].type == "REVALIDATION_REQUIRED"
