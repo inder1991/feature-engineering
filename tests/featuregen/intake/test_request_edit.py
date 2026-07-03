@@ -33,6 +33,33 @@ def _edit_cmd(run_id, task_id, tv, field_edit, actor=REQUESTER):
     )
 
 
+def test_request_edit_stale_cas_rolls_back_no_committed_side_effects(db, monkeypatch):
+    """F3/P1-c: a stale CONTRACT_REFINED CAS rolls the edit savepoint back — the Gate #1 task stays OPEN,
+    no CONTRACT_REFINED transition, status unchanged — never a stranded run. (Before the fix the
+    task-consume + frozen REVISED doc committed BEFORE the append and survived the stale deny.)"""
+    import featuregen.intake.commands as cmds
+    from featuregen.contracts.errors import ConcurrencyError
+
+    _draft_doc_id, task_id, tv = _ready(db, "run_edit_strand")
+    real_append = cmds.append_fc_event
+
+    def _fail_on_refined(*a, **k):
+        if k.get("type") == cmds.CONTRACT_REFINED:
+            raise ConcurrencyError("simulated concurrent transition")
+        return real_append(*a, **k)
+
+    monkeypatch.setattr(cmds, "append_fc_event", _fail_on_refined)
+    edit = {"field": "proposed_feature_name", "from": "declined_card_auth_count_90d", "to": "renamed_feature_ct"}
+    res = request_edit(db, _edit_cmd("run_edit_strand", task_id, tv, edit))
+    assert res.accepted is False and "stale" in res.denied_reason
+    with db.cursor(row_factory=dict_row) as cur:
+        cur.execute("SELECT status FROM human_tasks WHERE task_id=%s", (task_id,))
+        assert cur.fetchone()["status"] == "open"  # task-consume rolled back (not 'answered')
+    stream = load_stream(db, "feature_contract", "run_edit_strand")
+    assert not any(e.type == "CONTRACT_REFINED" for e in stream)  # freeze + append rolled back
+    assert fold_feature_contract_state(stream).status is FeatureContractStatus.MINIMUM_CONTRACT_VALIDATED
+
+
 def test_edit_supersedes_draft_reruns_mcv_and_reopens_gate(db):
     draft_doc_id, task_id, tv = _ready(db, "run_ed1")
     edit = {"field": "proposed_feature_name", "from": "declined_card_auth_count_90d", "to": "declined_auth_ct_90d"}

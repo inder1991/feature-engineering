@@ -2053,6 +2053,11 @@ def _sibling_candidates(conn: DbConn, run_id: str, selected_doc_id: str) -> list
     return [r[0] for r in rows]
 
 
+class _GateRollback(Exception):
+    """Signals a fail-closed denial INSIDE a Gate #1 write savepoint (stale task / stale promotion) so
+    `conn.transaction()` rolls the WHOLE side-effecting block back — no stranded run (F3 / P1-c)."""
+
+
 def confirm_contract(conn: DbConn, cmd: Command) -> CommandResult:
     """Human Gate #1 — the author-self-confirm happy path (§8.2/§8.5/§8.6). The request owner (the
     authenticated HUMAN requester) confirms an MCV-passed Draft: fold → no-regression + MCV guards →
@@ -2124,35 +2129,17 @@ def confirm_contract(conn: DbConn, cmd: Command) -> CommandResult:
         if guard_reason is not None:
             return _deny_audited(conn, cmd, run_id, guard_reason)
 
-    # ── task-version OCC (consume the Gate #1 task) ── a confirm against a stale/superseded Gate #1
-    # task is NOT counted (§8.6, §12); the client must re-fetch the current task_version.
-    sig = submit_human_signal(
-        conn, task_id, response="confirm", actor=cmd.actor, expected_task_version=expected_task_version
-    )
-    if not sig.counted:
-        return CommandResult(
-            accepted=False, aggregate_id=run_id,
-            denied_reason=f"stale/closed Gate #1 task (status={sig.status}); re-fetch task_version (OCC)",
-        )
-
-    # ── writes ──
+    # ── reads: resolve the FULL Confirmed body BEFORE any write, so the write block below is a tight,
+    # atomic savepoint (F3 / P1-c). selected/rejected/chosen_method are pure reads; the PRIMARY_SELECTED
+    # promotion (a write) moves into the savepoint. An unresolvable candidate or an invalid body denies
+    # here with NOTHING committed (the Gate #1 task is not yet consumed).
     selected_candidate: str | None = None
     rejected_candidates: list[str] = []
     # Definition mode: chosen_method stays None so R7 reshapes the Draft's `rolling_*` label from the
     # semantics (§4.2). It is a tagged method_variant Mapping ONLY in hypothesis mode — NEVER the raw
     # calculation_method string (reshape_calculation_method dict()s a non-None chosen_method).
     chosen_method: dict | None = None
-    # [Task 7.5 INSERT / P1-a fix: hypothesis PRIMARY_SELECTED promotion → BIND the chosen candidate's method]
-    # Hypothesis mode: promote the human-selected candidate to PRIMARY on the RUN aggregate (§7.1), record
-    # selected + losing candidate doc-ids (§8.3), AND bind the CHOSEN candidate's OWN tagged
-    # calculation_method into the Confirmed contract (P1-a) — loaded from the candidate's durable body
-    # (F1 blob store). The human's Gate #1 choice GOVERNS the output, NOT the original Draft's method.
     if intake_mode == "hypothesis":
-        # candidate_doc_id was already existence+branch_role validated above (pre-OCC); promote it to
-        # PRIMARY on the RUN aggregate. A concurrent run-aggregate write since that guard read → stale.
-        promote_reason, _ = _promote_candidate(conn, run_id, candidate_doc_id, cmd.actor)
-        if promote_reason is not None:
-            return CommandResult(accepted=False, aggregate_id=run_id, denied_reason=promote_reason)
         selected_candidate = candidate_doc_id
         rejected_candidates = _sibling_candidates(conn, run_id, candidate_doc_id)
         # P1-a — load the CHOSEN candidate's durable body (F1) and bind its tagged calculation_method so
@@ -2202,37 +2189,57 @@ def confirm_contract(conn: DbConn, cmd: Command) -> CommandResult:
     )
     # R6 — semantic backstop on the assembled Confirmed body (raises ContractSemanticError).
     validate_semantics(confirmed_body, stage="CONFIRMED_CONTRACT")
-
     request_id = _request_id(stream)
-    confirmed_doc_id = _freeze_contract_doc(
-        conn, run_id=run_id, request_id=request_id, stage=Stage.CONFIRMED_CONTRACT.value,
-        body=confirmed_body, branch_role="primary",
-        derived_from=confirmed_derived_from, supersedes=(), actor=cmd.actor,
-    )
-    # X4 — CAS on the folded head (§12, Global Constraints): a None-append would take the CURRENT head,
-    # letting a stale fold + these writes silently land AFTER a concurrent transition. Pin
-    # expected_version to the head folded above and treat a raised ConcurrencyError as a stale denial.
+
+    # ── writes (F3 / P1-c): ONE savepoint. psycopg3 `conn.transaction()` COMMITS on normal exit and
+    # ROLLS BACK on exception, so the Gate #1 task-consume + hypothesis PRIMARY_SELECTED promotion +
+    # frozen Confirmed doc + the X4 CAS append are ATOMIC. A stale task, a stale promotion, or a stale
+    # CAS raises → the savepoint unwinds → NOTHING commits (no stranded run). execute_command does not
+    # roll back on accepted=False, which is exactly why this section must roll itself back.
     try:
-        evt = append_fc_event(
-            conn, run_id=run_id, type=CONTRACT_CONFIRMED,
-            payload={  # R2 — no aggregate-id fields; confirmed_doc_id is the schema-required doc ref.
-                "confirmed_doc_id": confirmed_doc_id,
-                "confirmed_by": cmd.actor.subject,
-                "feature_name": feature_name,
-                "confirmed_body": confirmed_body,
-                "confirmation": confirmation,
-                "requires_independent_validation": riv,
-                "selected_candidate": selected_candidate,
-                "rejected_candidates": rejected_candidates,
-            },
-            actor=cmd.actor, request_id=request_id,
-            expected_version=head_version,  # X4 — CAS on the folded head (§12)
-        )
+        with conn.transaction():
+            sig = submit_human_signal(
+                conn, task_id, response="confirm", actor=cmd.actor,
+                expected_task_version=expected_task_version,
+            )
+            if not sig.counted:
+                raise _GateRollback(
+                    f"stale/closed Gate #1 task (status={sig.status}); re-fetch task_version (OCC)"
+                )
+            if intake_mode == "hypothesis":
+                # candidate_doc_id was existence+branch_role validated above (pre-OCC); promote it to
+                # PRIMARY on the RUN aggregate. A concurrent run-aggregate write since that guard read →
+                # stale (rolls back with this block, not a strand).
+                promote_reason, _ = _promote_candidate(conn, run_id, candidate_doc_id, cmd.actor)
+                if promote_reason is not None:
+                    raise _GateRollback(promote_reason)
+            confirmed_doc_id = _freeze_contract_doc(
+                conn, run_id=run_id, request_id=request_id, stage=Stage.CONFIRMED_CONTRACT.value,
+                body=confirmed_body, branch_role="primary",
+                derived_from=confirmed_derived_from, supersedes=(), actor=cmd.actor,
+            )
+            evt = append_fc_event(
+                conn, run_id=run_id, type=CONTRACT_CONFIRMED,
+                payload={  # R2 — no aggregate-id fields; confirmed_doc_id is the schema-required doc ref.
+                    "confirmed_doc_id": confirmed_doc_id,
+                    "confirmed_by": cmd.actor.subject,
+                    "feature_name": feature_name,
+                    "confirmed_body": confirmed_body,
+                    "confirmation": confirmation,
+                    "requires_independent_validation": riv,
+                    "selected_candidate": selected_candidate,
+                    "rejected_candidates": rejected_candidates,
+                },
+                actor=cmd.actor, request_id=request_id,
+                expected_version=head_version,  # X4 — CAS on the folded head (§12)
+            )
     except ConcurrencyError:
         return CommandResult(
             accepted=False, aggregate_id=run_id,
             denied_reason="stale: feature_contract advanced concurrently since fold (OCC)",
         )
+    except _GateRollback as exc:
+        return CommandResult(accepted=False, aggregate_id=run_id, denied_reason=str(exc))
     return CommandResult(accepted=True, aggregate_id=run_id, produced_event_ids=(evt.event_id,))
 
 
@@ -2269,12 +2276,10 @@ def request_edit(conn: DbConn, cmd: Command) -> CommandResult:
     (response="edit")` — a stale/superseded Gate #1 task is not counted. Handler on an EXISTING stream:
     fold → decide → deny BEFORE any side-effecting append (execute_command does NOT roll back on
     accepted=False). X4: the CONTRACT_REFINED append CASes on the folded head; a ConcurrencyError (a
-    concurrent transition since the fold) is a `stale` denial. NOTE: that denial does NOT roll back the
-    edit's already-committed side effects — `submit_human_signal` has consumed the Gate #1 task and
-    `_freeze_contract_doc` has inserted the REVISED Draft doc BEFORE the CAS append; the caught
-    ConcurrencyError is raised pre-INSERT (keeping the connection usable) but undoes NEITHER, and
-    execute_command does not roll back on `accepted=False`. Re-driving the edit on the fresh head is safe
-    (the REVISED doc is write-once / content-hashed; a re-consumed task is a no-op)."""
+    concurrent transition since the fold) is a `stale` denial. F3/P1-c: the task-consume, the REVISED
+    Draft freeze, and the CAS append run inside ONE `conn.transaction()` savepoint, so a stale task or a
+    stale CAS rolls ALL of them back — the run is never stranded with a consumed task / frozen doc and no
+    folded transition."""
     run_id = cmd.args.get("run_id") or cmd.aggregate_id
     task_id = cmd.args["task_id"]
     expected_task_version = cmd.args["expected_task_version"]
@@ -2303,17 +2308,6 @@ def request_edit(conn: DbConn, cmd: Command) -> CommandResult:
             conn, cmd, run_id,
             "Gate #1 edit requires the authenticated human requester (confirmer_is_requester_human)",
         )
-    # task-version OCC — an edit against a stale/superseded Gate #1 task is NOT counted (§8.6, §12);
-    # the client must re-fetch the current task_version.
-    sig = submit_human_signal(
-        conn, task_id, response="edit", actor=cmd.actor, expected_task_version=expected_task_version
-    )
-    if not sig.counted:
-        return CommandResult(
-            accepted=False, aggregate_id=run_id,
-            denied_reason=f"stale/closed Gate #1 task (status={sig.status}); re-fetch task_version (OCC)",
-        )
-
     draft_doc_id, draft_body = _final_draft(stream)
     request_id = _request_id(stream)
     revised = copy.deepcopy(draft_body)
@@ -2348,43 +2342,51 @@ def request_edit(conn: DbConn, cmd: Command) -> CommandResult:
         revised["open_fields"].append(field)  # a re-opened / invalidated field MUST be in open_fields (§3.5)
     human_edit = {"field": field, "from": field_edit.get("from"), "to": value}
 
-    revised_doc_id = _freeze_contract_doc(
-        conn, run_id=run_id, request_id=request_id, stage="DRAFT_CONTRACT",
-        body=revised, branch_role="primary", derived_from=(),
-        supersedes=(draft_doc_id,) if draft_doc_id else (), actor=cmd.actor,
-    )
-    # X4 — CAS on the folded head (§12, Global Constraints): a None-append would silently ride a
-    # concurrent transition; a raised ConcurrencyError is a stale denial. NOTE: the Gate #1 task was
-    # already consumed (submit_human_signal) and the REVISED doc already frozen (_freeze_contract_doc)
-    # ABOVE — a caught ConcurrencyError is raised pre-INSERT so the connection stays usable, but it does
-    # NOT roll those back (execute_command does not roll back on accepted=False); re-driving the edit on
-    # the fresh head is safe (write-once/content-hashed doc, no-op re-consume of the task).
-    #
-    # The CONTRACT_REFINED payload INLINES draft_body (mcv._latest_body reads the newest event carrying
-    # it — else a later MCV re-runs on the STALE draft) AND the TOP-LEVEL open_fields / open_questions /
-    # field_scores the P2 fold reads (state.py:137 — omit open_fields and the fold silently CLEARS the
-    # open-field set, so a re-opened field would not drop the status to NEEDS_CLARIFICATION).
+    # ── writes (F3 / P1-c): ONE savepoint over the task-consume + REVISED-doc freeze + X4 CAS append, so
+    # a stale Gate #1 task or a stale CAS rolls the WHOLE edit back — never a consumed-task / frozen-doc
+    # strand with no folded transition. psycopg3 conn.transaction() COMMITS on normal exit, ROLLS BACK on
+    # exception. The CONTRACT_REFINED payload INLINES draft_body (mcv._latest_body reads the newest event
+    # carrying it — else a later MCV re-runs on the STALE draft) AND the TOP-LEVEL open_fields /
+    # open_questions / field_scores the P2 fold reads (state.py — omit open_fields and the fold silently
+    # CLEARS the open-field set, so a re-opened field would not drop status to NEEDS_CLARIFICATION).
     try:
-        append_fc_event(
-            conn, run_id=run_id, type=CONTRACT_REFINED,
-            payload={
-                "draft_doc_id": revised_doc_id,
-                "assumption_ledger_ref": revised.get("assumption_ledger_ref"),
-                "draft_body": revised,
-                "open_fields": list(revised.get("open_fields", [])),
-                "open_questions": list(revised.get("open_questions", [])),
-                "field_scores": revised.get("field_scores", {}),
-                "human_edits": [human_edit],
-                "reopened": reopened,
-            },
-            actor=cmd.actor,
-            expected_version=head_version,  # X4 — CAS on the folded head (§12)
-        )
+        with conn.transaction():
+            # task-version OCC — an edit against a stale/superseded Gate #1 task is NOT counted (§8.6, §12).
+            sig = submit_human_signal(
+                conn, task_id, response="edit", actor=cmd.actor,
+                expected_task_version=expected_task_version,
+            )
+            if not sig.counted:
+                raise _GateRollback(
+                    f"stale/closed Gate #1 task (status={sig.status}); re-fetch task_version (OCC)"
+                )
+            revised_doc_id = _freeze_contract_doc(
+                conn, run_id=run_id, request_id=request_id, stage="DRAFT_CONTRACT",
+                body=revised, branch_role="primary", derived_from=(),
+                supersedes=(draft_doc_id,) if draft_doc_id else (), actor=cmd.actor,
+            )
+            append_fc_event(
+                conn, run_id=run_id, type=CONTRACT_REFINED,
+                payload={
+                    "draft_doc_id": revised_doc_id,
+                    "assumption_ledger_ref": revised.get("assumption_ledger_ref"),
+                    "draft_body": revised,
+                    "open_fields": list(revised.get("open_fields", [])),
+                    "open_questions": list(revised.get("open_questions", [])),
+                    "field_scores": revised.get("field_scores", {}),
+                    "human_edits": [human_edit],
+                    "reopened": reopened,
+                },
+                actor=cmd.actor,
+                expected_version=head_version,  # X4 — CAS on the folded head (§12)
+            )
     except ConcurrencyError:
         return CommandResult(
             accepted=False, aggregate_id=run_id,
             denied_reason="stale: feature_contract advanced concurrently since fold (OCC)",
         )
+    except _GateRollback as exc:
+        return CommandResult(accepted=False, aggregate_id=run_id, denied_reason=str(exc))
     if reopened:
         # An UNKNOWN/blank or otherwise MCV-FAILING edit re-opened the field → back into the Refinement
         # Loop (§6.6); NO confirmable Gate #1 re-opens on a contract that would fail the MCV floor (§6.7).

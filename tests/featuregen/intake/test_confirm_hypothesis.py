@@ -93,6 +93,35 @@ def test_hypothesis_confirm_binds_the_chosen_candidate_method_not_the_draft(db):
     assert chosen in body["provenance"]["derived_from"]
 
 
+def test_confirm_stale_cas_rolls_back_no_committed_side_effects(db, monkeypatch):
+    """F3/P1-c: a stale CONTRACT_CONFIRMED CAS rolls the WHOLE Gate #1 write savepoint back — the task
+    stays OPEN, no PRIMARY_SELECTED promotion, no CONFIRMED event — never a stranded run. (Before the fix
+    the task-consume + promotion + frozen doc committed BEFORE the append and survived the stale deny.)"""
+    import featuregen.intake.commands as cmds
+    from featuregen.contracts.errors import ConcurrencyError
+
+    task_id, tv, cands = _ready(db, "run_hyp_strand")
+    chosen = cands[1]
+    real_append = cmds.append_fc_event
+
+    def _fail_on_confirmed(*a, **k):
+        if k.get("type") == cmds.CONTRACT_CONFIRMED:
+            raise ConcurrencyError("simulated concurrent transition")
+        return real_append(*a, **k)
+
+    monkeypatch.setattr(cmds, "append_fc_event", _fail_on_confirmed)
+    res = confirm_contract(db, _cmd("run_hyp_strand", task_id, tv, candidate_doc_id=chosen))
+    assert res.accepted is False and "stale" in res.denied_reason
+    with db.cursor(row_factory=dict_row) as cur:
+        cur.execute("SELECT status FROM human_tasks WHERE task_id=%s", (task_id,))
+        assert cur.fetchone()["status"] == "open"  # task-consume rolled back (not 'answered')
+    run_projection(db, StagePrimaryProjection())
+    assert current_primary(db, "run_hyp_strand", "DRAFT_CONTRACT") is None  # promotion rolled back
+    stream = load_stream(db, "feature_contract", "run_hyp_strand")
+    assert not any(e.type == "CONTRACT_CONFIRMED" for e in stream)  # no folded transition
+    assert fold_feature_contract_state(stream).status is FeatureContractStatus.MINIMUM_CONTRACT_VALIDATED
+
+
 def _assert_denied_no_writes(db, run_id, res, reason_substr):
     """A candidate-guard denial: fail-closed, decided BEFORE the task OCC + promotion — so NO
     PRIMARY_SELECTED, NO CONTRACT_CONFIRMED, and the contract status is UNCHANGED (still MCV-validated)."""
