@@ -11,6 +11,15 @@ from psycopg.types.json import Json
 
 from featuregen.runtime.backoff import compute_backoff
 
+# Control-plane queue handlers owned by the dedicated control-signal poller
+# (`drain_control_signals`), NOT by the general `process_one` consumer. These carry no run
+# event_id, so process_one's HandlerContext path would DLQ them for a missing handler — and across
+# workers process_one could claim one BEFORE the control poller, silently converting a safety park
+# into an unknown-handler DLQ. This is the SINGLE SOURCE OF TRUTH that keeps the two consumers
+# exactly complementary: `claim_one` EXCLUDES these (below) and `drain_control_signals` claims
+# ONLY these, both under FOR UPDATE SKIP LOCKED so neither double-processes across workers.
+CONTROL_SIGNAL_HANDLERS = frozenset({"runtime.auto_park", "runtime.repair_exhausted"})
+
 
 class BackpressureError(RuntimeError):
     """Admission control signal (§5.2): a partition is at capacity. Raised by the queue
@@ -62,6 +71,11 @@ def claim_one(
     """Claim one ready item via FOR UPDATE SKIP LOCKED, excluding partitions that already
     have an in-flight lease (per-aggregate serialization, §5.2). Bumps attempts atomically.
 
+    Control-signal rows (`CONTROL_SIGNAL_HANDLERS`) are EXCLUDED so this — and thus process_one —
+    can NEVER claim an `auto_park` / `repair_exhausted` row on any worker: they are owned by
+    `drain_control_signals`. Without this, a multi-worker race lets a general consumer claim a
+    control signal first, hit an unknown handler, and DLQ a safety park (the run is never parked).
+
     Concurrent-claimer race: two workers can both pass the partition-exclusion subquery before
     either commits its lease; `queue_one_inflight_per_partition` then rejects the loser with a
     UniqueViolation. We run the claim in a SAVEPOINT and translate that violation into
@@ -74,6 +88,7 @@ def claim_one(
                     "WITH c AS ("
                     "  SELECT id FROM queue"
                     "   WHERE status='ready' AND available_at <= now()"
+                    "     AND handler <> ALL(%s)"
                     "     AND partition_key NOT IN (SELECT partition_key FROM queue WHERE status='leased')"
                     "   ORDER BY priority, available_at, id"
                     "   FOR UPDATE SKIP LOCKED LIMIT 1"
@@ -81,7 +96,7 @@ def claim_one(
                     "UPDATE queue q SET status='leased', lease_owner=%s, "
                     "  lease_expires_at = now() + make_interval(secs => %s), attempts = q.attempts + 1 "
                     "FROM c WHERE q.id = c.id RETURNING q.*",
-                    (owner, lease_seconds),
+                    (list(CONTROL_SIGNAL_HANDLERS), owner, lease_seconds),
                 )
                 row = cur.fetchone()
     except psycopg.errors.UniqueViolation:

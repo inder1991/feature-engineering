@@ -71,6 +71,42 @@ def test_claim_returns_none_when_empty(db) -> None:
     assert claim_one(db, owner="w1") is None
 
 
+@pytest.mark.parametrize("handler", ["runtime.auto_park", "runtime.repair_exhausted"])
+def test_claim_one_never_claims_a_control_signal_row(db, handler) -> None:
+    """A control-signal row (runtime.auto_park / runtime.repair_exhausted) is OWNED by the dedicated
+    control poller. claim_one MUST exclude it so process_one — on ANY worker — can never steal it and
+    convert a safety park into an unknown-handler DLQ. Even as the ONLY ready row it stays 'ready'."""
+    enqueue(
+        db,
+        message_id=f"cs:{handler}",
+        partition_key="run:rp1",
+        handler=handler,
+        payload={"run_id": "rp1"},
+    )
+    assert claim_one(db, owner="w1") is None
+    with db.cursor() as cur:
+        cur.execute("SELECT status FROM queue WHERE message_id = %s", (f"cs:{handler}",))
+        assert cur.fetchone()[0] == "ready"  # left for the control poller, never leased
+
+
+def test_claim_one_still_claims_a_normal_row_alongside_a_control_signal(db) -> None:
+    """The exclusion is surgical and the two consumers are COMPLEMENTARY: a normal step row is still
+    claimable even when a higher-priority control-signal row sits ahead of it in the queue."""
+    enqueue(
+        db,
+        message_id="cs_ap",
+        partition_key="run:rp1",
+        handler="runtime.auto_park",
+        payload={"run_id": "rp1"},
+        priority=1,  # would sort FIRST, but claim_one must skip it
+    )
+    enqueue(db, message_id="normal1", partition_key="run:rp2", handler="advance", payload={})
+    claim = claim_one(db, owner="w1")
+    assert claim is not None
+    assert claim.message_id == "normal1"
+    assert claim.handler == "advance"
+
+
 def test_complete_sets_done(db) -> None:
     qid = enqueue(db, message_id="d1", partition_key="run:r1", handler="h", payload={})
     claim_one(db, owner="w1")

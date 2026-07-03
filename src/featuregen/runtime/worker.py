@@ -31,7 +31,7 @@ from featuregen.projections.runner import run_projection
 from featuregen.runtime.dispatch import process_one, recover_stuck
 from featuregen.runtime.observability import counters, log
 from featuregen.runtime.outbox import OutboxMessage, make_queue_publisher, relay_publish_batch
-from featuregen.runtime.queue import complete, fail_permanent
+from featuregen.runtime.queue import CONTROL_SIGNAL_HANDLERS, complete, fail_permanent
 from featuregen.runtime.timers import fire_timer, poll_due_timers
 
 # Outbox topic -> internal step handler. EMPTY by default: in this SP-0.5 slice the async steps
@@ -40,11 +40,11 @@ from featuregen.runtime.timers import fire_timer, poll_due_timers
 # deployment adds real routes (or swaps in an external-bus publisher) by passing `publish=`.
 _DEFAULT_RELAY_ROUTE: dict[str, str] = {}
 
-# Control-plane queue handlers that are NOT §5.1 run-stream step handlers (they carry no run
-# event_id, so they can never flow through process_one's HandlerContext path). Owned by the
-# dedicated control-signal stage below, mirroring the overlay-expiry dedicated-poller pattern.
+# Control-plane queue handlers are defined ONCE in runtime/queue.py as CONTROL_SIGNAL_HANDLERS: the
+# dedicated control-signal stage below claims exactly those, and claim_one excludes exactly those,
+# so the two consumers are complementary and can never drift. `_AUTO_PARK` is the one member the
+# stage dispatches specially (park a run); every other member has no wired consumer yet (DLQ'd loud).
 _AUTO_PARK = "runtime.auto_park"
-_REPAIR_EXHAUSTED = "runtime.repair_exhausted"
 
 
 @dataclass(frozen=True, slots=True)
@@ -100,12 +100,17 @@ def _park_run(conn: psycopg.Connection, *, run_id: str, actor, payload) -> None:
     )
 
 
-def drain_control_signals(conn: psycopg.Connection, *, actor) -> int:
-    """Dedicated poller for `runtime.auto_park` / `runtime.repair_exhausted` — control-plane
-    messages that are NOT registry step handlers (they carry no run event_id, so process_one would
-    DLQ them for a missing handler; design §5.5's "auto-park if unanswered" would then never park).
+def drain_control_signals(
+    conn: psycopg.Connection, *, actor_factory: Callable[[], object] = _control_actor
+) -> int:
+    """Dedicated poller for `CONTROL_SIGNAL_HANDLERS` (`runtime.auto_park` / `runtime.repair_exhausted`)
+    — control-plane messages that are NOT registry step handlers (they carry no run event_id, so
+    process_one would DLQ them for a missing handler; design §5.5's "auto-park if unanswered" would
+    then never park).
 
-    Runs BEFORE the process_one drain and OWNS these handlers so process_one never sees them:
+    process_one can NEVER see these rows: `claim_one` EXCLUDES `CONTROL_SIGNAL_HANDLERS` at claim
+    time (the same single-source constant this poller claims by), so on any worker ordering a general
+    consumer cannot steal a control signal — this stage owns them exclusively:
       * `runtime.auto_park` WITH a run_id (the §5.6 cost-breaker path) -> park the run (RUN_PARKED),
         complete the row. A genuine, registered-command-backed consumer.
       * everything else (`runtime.repair_exhausted`, which needs a Phase-07 human failure gate; or an
@@ -113,23 +118,33 @@ def drain_control_signals(conn: psycopg.Connection, *, actor) -> int:
         consumer yet -> surface LOUD (counted + logged) and route to the DLQ with an explanatory
         error. NEVER silent. Wiring those correctly is a documented SP-0.5 follow-up.
 
-    One transaction (`conn.transaction()`): FOR UPDATE SKIP LOCKED holds the row locks until commit,
-    and the park + queue-status write commit atomically. Returns the number of runs parked."""
+    Unlike `claim_one`, this poller does NOT apply the per-partition in-flight exclusion, so an
+    `auto_park` can be processed while a step for the same run holds a lease. `park_command`'s OCC
+    append is the accepted backstop: `_park_run` is idempotent (never re-parks an already-parked or
+    terminal run) and OCC-guarded, so a concurrent step and this park cannot both take effect twice.
+
+    `actor_factory` is invoked LAZILY — only when a parkable row exists — so an empty control queue
+    never builds a service principal. One transaction (`conn.transaction()`): FOR UPDATE SKIP LOCKED
+    holds the row locks until commit, and the park + queue-status write commit atomically (multiple
+    control pollers across workers therefore never double-process). Returns the number of runs parked."""
     parked = 0
+    actor = None
     with conn.transaction():
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute(
                 "SELECT id, message_id, handler, payload FROM queue "
                 "WHERE status = 'ready' AND available_at <= now() "
-                "AND handler IN (%s, %s) "
+                "AND handler = ANY(%s) "
                 "ORDER BY priority, available_at, id FOR UPDATE SKIP LOCKED",
-                (_AUTO_PARK, _REPAIR_EXHAUSTED),
+                (list(CONTROL_SIGNAL_HANDLERS),),
             )
             rows = cur.fetchall()
         for row in rows:
             payload = row["payload"] or {}
             run_id = payload.get("run_id")
             if row["handler"] == _AUTO_PARK and run_id:
+                if actor is None:
+                    actor = actor_factory()
                 _park_run(conn, run_id=run_id, actor=actor, payload=payload)
                 complete(conn, row["id"])
                 counters.incr("control.auto_park.parked")
@@ -225,9 +240,9 @@ def run_worker_once(
 
     reclaimed = _stage("recover_stuck")(lambda: recover_stuck(conn), (0, 0))
 
-    parked = _stage("control_signals")(
-        lambda: drain_control_signals(conn, actor=_control_actor()), 0
-    )
+    # `_control_actor` is passed as a factory so it is built ONLY when a parkable row exists — an
+    # empty control queue (the common tick) never mints a service principal.
+    parked = _stage("control_signals")(lambda: drain_control_signals(conn), 0)
 
     def _drain_queue() -> int:
         processed = 0

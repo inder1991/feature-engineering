@@ -152,10 +152,47 @@ def test_run_worker_once_surfaces_unconsumed_repair_exhausted(db, seeded_pipelin
     assert snap["counters"].get("control.unconsumed.runtime.repair_exhausted", 0) >= 1
 
 
+def test_control_signal_survives_process_one_first_then_poller_parks(db) -> None:
+    """Multi-worker control-signal race guard. Worker B's process_one, running BEFORE worker A's
+    control poller, must NOT claim or DLQ a runtime.auto_park row (claim_one excludes
+    CONTROL_SIGNAL_HANDLERS). The row stays 'ready'; worker A's control poller then parks the run
+    (RUN_PARKED) — the safety action is never defeated on any worker ordering."""
+    from featuregen.runtime.dispatch import process_one
+    from featuregen.runtime.queue import enqueue
+    from featuregen.runtime.worker import compose, drain_control_signals
+
+    reg, _projections = compose(db)
+    enqueue(
+        db,
+        message_id="cb:runB:hard",
+        partition_key="run:runB",
+        handler="runtime.auto_park",
+        payload={"run_id": "runB", "reason": "cost_ceiling"},
+    )
+
+    # Worker B drains the general queue FIRST. The only ready row is a control signal, which
+    # claim_one excludes, so process_one is idle — it does not steal or DLQ the park.
+    outcome = process_one(db, reg, owner="workerB")
+    assert outcome.status == "idle"
+    with db.cursor() as cur:
+        cur.execute("SELECT status FROM queue WHERE message_id = 'cb:runB:hard'")
+        assert cur.fetchone()[0] == "ready"  # NOT stolen, NOT DLQ'd
+
+    # Worker A's control poller then owns and parks the run.
+    parked = drain_control_signals(db)
+    assert parked == 1
+    with db.cursor() as cur:
+        cur.execute("SELECT count(*) FROM events WHERE run_id = 'runB' AND type = 'RUN_PARKED'")
+        assert cur.fetchone()[0] == 1
+        cur.execute("SELECT status FROM queue WHERE message_id = 'cb:runB:hard'")
+        assert cur.fetchone()[0] == "done"
+
+
 @pytest.fixture
-def autocommit_worker_conn(_dsn):
-    """An isolated, throwaway, AUTOCOMMIT connection — the exact connection mode run_forever opens.
-    Created on its own database so its committed side effects never leak into the shared test DB."""
+def _throwaway_autocommit_db(_dsn):
+    """Create an isolated, throwaway, MIGRATED database and yield its DSN; drop it on teardown. Its
+    committed side effects never leak into the shared (rolled-back) test DB — the exact isolation an
+    AUTOCOMMIT daemon connection (run_worker_once / run_forever) needs."""
     import psycopg
 
     from featuregen.db.migrations import apply_migrations
@@ -171,17 +208,26 @@ def autocommit_worker_conn(_dsn):
         admin.close()
     with psycopg.connect(new_dsn) as mconn:
         apply_migrations(mconn)
-
-    ac = psycopg.connect(new_dsn, autocommit=True)
     try:
-        yield ac
+        yield new_dsn
     finally:
-        ac.close()
         admin = psycopg.connect(_dsn, autocommit=True)
         try:
             admin.execute(f"DROP DATABASE IF EXISTS {dbname} WITH (FORCE)")
         finally:
             admin.close()
+
+
+@pytest.fixture
+def autocommit_worker_conn(_throwaway_autocommit_db):
+    """An isolated, throwaway, AUTOCOMMIT connection — the exact connection mode run_forever opens."""
+    import psycopg
+
+    ac = psycopg.connect(_throwaway_autocommit_db, autocommit=True)
+    try:
+        yield ac
+    finally:
+        ac.close()
 
 
 def test_run_worker_once_advances_projections_on_autocommit(
@@ -217,6 +263,160 @@ def test_run_worker_once_advances_projections_on_autocommit(
 
     assert tick.errors == 0
     assert tick.projections_advanced >= 1  # the seeded event was consumed by the projections
+
+
+def test_run_worker_once_fires_a_due_timer_on_autocommit(autocommit_worker_conn) -> None:
+    """fire_timer holds a SELECT ... FOR UPDATE across the enqueue + mark-fired statements; on the
+    AUTOCOMMIT daemon connection that lock releases at statement end unless the tick wraps it in a
+    transaction. Prove the wrapping works for the TIMER stage (not only run_projection): a due timer
+    fires (timers_fired >= 1) with no stage error on the real daemon connection."""
+    from datetime import timedelta
+
+    from featuregen.contracts import NewTimer
+    from featuregen.runtime.timers import schedule_timer
+    from featuregen.runtime.worker import compose, run_worker_once
+
+    ac = autocommit_worker_conn
+    reg, projections = compose(ac)
+    now = _now()
+    schedule_timer(
+        ac,
+        "run",
+        "run_tmr1",
+        NewTimer(
+            kind="reminder",
+            fire_at=now - timedelta(seconds=5),  # due in the past
+            idempotency_key="tmr:run_tmr1:reminder",
+            payload={},
+        ),
+    )
+
+    tick = run_worker_once(ac, reg, projections, owner="w1", now=now)
+
+    assert tick.errors == 0
+    assert tick.timers_fired >= 1
+
+
+def test_run_worker_once_fires_a_due_overlay_expiry_on_autocommit(autocommit_worker_conn) -> None:
+    """fire_due_overlay_expiries also holds a FOR UPDATE lock across statements; prove the tick runs
+    it durably on the AUTOCOMMIT daemon connection. A due overlay_expiry timer expires a VERIFIED
+    fact (overlay_expiries >= 1) with no stage error — covering the overlay stage, not just
+    run_projection."""
+    from dataclasses import asdict
+    from datetime import timedelta
+
+    from tests.featuregen._helpers import mint_test_identity
+
+    from featuregen.overlay.catalog import (
+        CatalogObject,
+        FixtureCatalog,
+        _clear_catalog_adapter,
+        register_catalog_adapter,
+    )
+    from featuregen.overlay.expiry import schedule_expiry
+    from featuregen.overlay.facts import OVERLAY_FACT_CONFIRMED, OVERLAY_FACT_PROPOSED
+    from featuregen.overlay.identity import (
+        CatalogObjectRef,
+        display_object_ref,
+        fact_key,
+        proposal_fingerprint,
+    )
+    from featuregen.overlay.store import append_overlay_event
+    from featuregen.runtime.worker import compose, run_worker_once
+
+    ac = autocommit_worker_conn
+    reg, projections = compose(ac)  # registers overlay event schemas so the appends validate
+    now = _now()
+
+    ref = CatalogObjectRef(
+        catalog_source="pg:core",
+        object_kind="table",
+        schema="core",
+        table="customers",
+        column=None,
+    )
+    key = fact_key(ref, "grain", None)
+    value = {"columns": ["customer_id"], "is_unique": True}
+    proposer = mint_test_identity(subject="user:proposer", role_claims=("data_owner",))
+    proposed = append_overlay_event(
+        ac,
+        fact_key=key,
+        type=OVERLAY_FACT_PROPOSED,
+        actor=proposer,
+        expected_version=0,
+        payload={
+            "catalog_object_ref": asdict(ref),
+            "object_ref": display_object_ref(ref),
+            "fact_type": "grain",
+            "use_case": None,
+            "proposed_value": value,
+            "proposal_fingerprint": proposal_fingerprint(value),
+            "proposed_by": proposer.subject,
+        },
+    )
+    owner = mint_test_identity(subject="user:owner-a", role_claims=("data_owner",))
+    confirmed = append_overlay_event(
+        ac,
+        fact_key=key,
+        type=OVERLAY_FACT_CONFIRMED,
+        actor=owner,
+        payload={
+            "value": value,
+            "confirmers": [{"subject": "user:owner-a", "role": "data_owner"}],
+            "expires_at": (now + timedelta(days=30)).isoformat(),
+            "confirms_event_id": proposed.event_id,
+        },
+    )
+    adapter = FixtureCatalog(catalog_source="pg:core")
+    adapter.add_object(
+        CatalogObject(
+            object_ref=display_object_ref(ref),
+            object_kind="table",
+            schema="core",
+            table="customers",
+            column=None,
+            data_type=None,
+            native_oid="oid-cust",
+        )
+    )
+    adapter.set_owner(ref, "user:owner-a")
+    register_catalog_adapter(adapter)  # process-global; cleared below so it never leaks
+    try:
+        # confirm_fact would have armed this timer; arm it directly, due in the past.
+        schedule_expiry(ac, key, confirmed.event_id, now - timedelta(seconds=5))
+        tick = run_worker_once(ac, reg, projections, owner="w1", now=now)
+    finally:
+        _clear_catalog_adapter()
+
+    assert tick.errors == 0
+    assert tick.overlay_expiries >= 1
+
+
+def test_run_forever_runs_one_tick_then_exits_on_shutdown(
+    _throwaway_autocommit_db, monkeypatch
+) -> None:
+    """run_forever opens ONE autocommit connection, composes, and loops run_worker_once until the
+    shutdown_event is set. Cover the loop/shutdown path: a monkeypatched tick sets the event after a
+    single pass, so the loop runs exactly one tick then exits cleanly (connection closed in finally,
+    no signal handlers installed because an event was injected)."""
+    import threading
+
+    import featuregen.runtime.worker as worker
+    from featuregen.runtime.worker import WorkerTick, run_forever
+
+    shutdown = threading.Event()
+    calls = {"n": 0}
+
+    def _fake_tick(conn, registry, projections, *, owner, now, **_kw):
+        calls["n"] += 1
+        shutdown.set()  # ask the loop to stop after this single tick
+        return WorkerTick(0, 0, 0, 0, 0, (0, 0), 0, 0)
+
+    monkeypatch.setattr(worker, "run_worker_once", _fake_tick)
+
+    run_forever(_throwaway_autocommit_db, interval=0.0, shutdown_event=shutdown, owner="w-test")
+
+    assert calls["n"] == 1  # exactly one tick ran, then the loop exited cleanly on the event
 
 
 def test_migrate_subcommand_applies_migrations(_dsn) -> None:
