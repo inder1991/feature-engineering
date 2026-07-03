@@ -35,6 +35,8 @@ def partition_key_for(event: EventEnvelope) -> str:
         return f"request:{event.request_id or event.aggregate_id}"
     if event.aggregate == "overlay_fact":
         return f"overlay_fact:{event.overlay_fact_id or event.aggregate_id}"
+    if event.aggregate == "feature_contract":
+        return f"feature_contract:{event.feature_contract_id or event.aggregate_id}"
     raise ValueError(f"unknown aggregate {event.aggregate!r}")
 
 

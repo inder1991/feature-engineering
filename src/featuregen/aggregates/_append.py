@@ -70,6 +70,7 @@ def append(
     feature_id: str | None = None,
     run_id: str | None = None,
     overlay_fact_id: str | None = None,
+    feature_contract_id: str | None = None,
     caused_by: str | None = None,
     expected_version: int | None = None,
 ) -> EventEnvelope:
@@ -87,6 +88,7 @@ def append(
         feature_id=feature_id,
         run_id=run_id,
         overlay_fact_id=overlay_fact_id,
+        feature_contract_id=feature_contract_id,
         caused_by=caused_by,
         occurred_at=datetime.now(UTC),
     )

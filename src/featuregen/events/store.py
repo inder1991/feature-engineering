@@ -17,11 +17,13 @@ from featuregen.privacy.classification import assert_no_inline_pii
 _INSERT = """
 INSERT INTO events (
     event_id, aggregate, aggregate_id, stream_version,
-    request_id, feature_id, run_id, overlay_fact_id, type, schema_version, table_version,
+    request_id, feature_id, run_id, overlay_fact_id, feature_contract_id,
+    type, schema_version, table_version,
     actor, payload, provenance, caused_by, occurred_at
 ) VALUES (
     %(event_id)s, %(aggregate)s, %(aggregate_id)s, %(stream_version)s,
-    %(request_id)s, %(feature_id)s, %(run_id)s, %(overlay_fact_id)s, %(type)s, %(schema_version)s, %(table_version)s,
+    %(request_id)s, %(feature_id)s, %(run_id)s, %(overlay_fact_id)s, %(feature_contract_id)s,
+    %(type)s, %(schema_version)s, %(table_version)s,
     %(actor)s, %(payload)s, %(provenance)s, %(caused_by)s, %(occurred_at)s
 )
 RETURNING global_seq, recorded_at
@@ -86,6 +88,7 @@ def append_event(
         "feature_id": new_event.feature_id,
         "run_id": new_event.run_id,
         "overlay_fact_id": new_event.overlay_fact_id,
+        "feature_contract_id": new_event.feature_contract_id,
         "type": new_event.type,
         "schema_version": new_event.schema_version,
         "table_version": table_version,
@@ -133,6 +136,7 @@ def append_event(
         feature_id=new_event.feature_id,
         run_id=new_event.run_id,
         overlay_fact_id=new_event.overlay_fact_id,
+        feature_contract_id=new_event.feature_contract_id,
         caused_by=new_event.caused_by,
     )
 

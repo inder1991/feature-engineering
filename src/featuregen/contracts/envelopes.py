@@ -52,6 +52,7 @@ class EventEnvelope:
     feature_id: str | None = None
     run_id: str | None = None
     overlay_fact_id: str | None = None
+    feature_contract_id: str | None = None
     caused_by: str | None = None
 
 
@@ -70,6 +71,7 @@ class NewEvent:
     feature_id: str | None = None
     run_id: str | None = None
     overlay_fact_id: str | None = None
+    feature_contract_id: str | None = None
     caused_by: str | None = None
     occurred_at: datetime | None = None
 

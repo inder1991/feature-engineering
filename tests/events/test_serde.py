@@ -75,6 +75,7 @@ def test_row_to_event_reconstructs_envelope():
         "feature_id": None,
         "run_id": "run_1",
         "overlay_fact_id": None,
+        "feature_contract_id": None,
         "caused_by": None,
     }
     env = row_to_event(row)
@@ -83,3 +84,4 @@ def test_row_to_event_reconstructs_envelope():
     assert env.actor.subject == "user:raj"
     assert env.payload["confirmed_contract_ref"] == "doc_1"
     assert env.overlay_fact_id is None
+    assert env.feature_contract_id is None
