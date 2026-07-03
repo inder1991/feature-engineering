@@ -343,12 +343,43 @@ def seed_validated_contract(db, *, run_id, request_id, draft_body, candidate_doc
     draft_doc_id = seed_needs_clarification(
         db, run_id=run_id, request_id=request_id, draft_body=draft_body
     )
-    cand_ids = [
-        _freeze_draft_doc(
-            db, run_id=run_id, request_id=request_id, body=draft_body, branch_role="candidate"
+    # Seed candidate docs the PRODUCTION way (write_candidate_docs → durable body via the F1 blob store,
+    # each with a distinct tagged calculation_method) so confirm_contract can LOAD the chosen candidate's
+    # body and bind its method (P1-a). A draft-clone with body_ref=None would not resolve via read_blob.
+    from featuregen.intake.candidates import Candidate, write_candidate_docs
+
+    _aggs = ["count", "sum", "avg", "max", "min"]
+    _cands = [
+        Candidate(
+            candidate_id=f"cand_{i}",
+            definition_text=f"candidate {i} for {run_id}",
+            rationale=f"stub rationale {i}",
+            calculation_method={
+                "method_version": 1,
+                "chosen": {
+                    "kind": "rolling_aggregate",
+                    "aggregation": _aggs[i % len(_aggs)],
+                    "window": f"{30 * (i + 1)}d",
+                },
+                "considered": [
+                    {
+                        "kind": "rolling_aggregate",
+                        "aggregation": _aggs[i % len(_aggs)],
+                        "window": f"{30 * (i + 1)}d",
+                    }
+                ],
+            },
+            signals={},
+            provenance={"generator_version": "seed-stub", "llm_call_refs": []},
         )
-        for _ in range(candidate_docs)
+        for i in range(candidate_docs)
     ]
+    cand_ids = list(
+        write_candidate_docs(
+            db, candidates=_cands, draft_doc_id=draft_doc_id, run_id=run_id,
+            request_id=request_id, actor=INTAKE_SVC,
+        )
+    )
     append_fc_event(
         db, run_id=run_id, type="MINIMUM_CONTRACT_VALIDATED",
         payload={"run_id": run_id}, actor=INTAKE_SVC,

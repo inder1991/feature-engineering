@@ -74,6 +74,25 @@ def test_hypothesis_confirm_promotes_candidate_and_records_rejected(db):
         is FeatureContractStatus.CONFIRMED
 
 
+def test_hypothesis_confirm_binds_the_chosen_candidate_method_not_the_draft(db):
+    """P1-a: the confirmed contract's calculation_method is the CHOSEN candidate's method — loaded from
+    its durable body (F1 blob store) — NOT the original Draft's. The human's Gate #1 selection GOVERNS
+    the output. (Before the fix, chosen_method stayed None and the Draft's method was used.)"""
+    task_id, tv, cands = _ready(db, "run_hyp_bind")
+    chosen = cands[1]  # seeded with chosen = rolling_aggregate/sum/60d — distinct from the draft's count/90d
+    res = confirm_contract(db, _cmd("run_hyp_bind", task_id, tv, candidate_doc_id=chosen))
+    assert res.accepted is True, res.denied_reason
+    body = next(
+        e for e in load_stream(db, "feature_contract", "run_hyp_bind") if e.type == "CONTRACT_CONFIRMED"
+    ).payload["confirmed_body"]
+    method = body["calculation_method"]["chosen"]
+    # the CANDIDATE's method governs, not the draft's (draft would reshape to count/90d)
+    assert method["aggregation"] == "sum" and method["window"] == "60d", method
+    assert not (method["aggregation"] == "count" and method["window"] == "90d")
+    # the confirmed contract derives from the chosen candidate doc (P1-a provenance)
+    assert chosen in body["provenance"]["derived_from"]
+
+
 def _assert_denied_no_writes(db, run_id, res, reason_substr):
     """A candidate-guard denial: fail-closed, decided BEFORE the task OCC + promotion — so NO
     PRIMARY_SELECTED, NO CONTRACT_CONFIRMED, and the contract status is UNCHANGED (still MCV-validated)."""

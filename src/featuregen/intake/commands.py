@@ -51,7 +51,7 @@ from featuregen.documents.draft import (
 )
 from featuregen.documents.primary import new_primary_selected
 from featuregen.documents.registry import DocumentSchemaRegistry
-from featuregen.documents.store import append_document, compute_content_hash
+from featuregen.documents.store import append_document, compute_content_hash, get_document
 from featuregen.events import append_event
 from featuregen.events.store import load_stream
 from featuregen.gates.tasks import (
@@ -65,7 +65,7 @@ from featuregen.intake.banking_catalog import (
     IntakeOutcome,
     classify_intent,
 )
-from featuregen.intake.blobs import write_blob  # F1 write-once blob store (P1-b/P2-c)
+from featuregen.intake.blobs import read_blob, write_blob  # F1 write-once blob store (P1-b/P2-c)
 from featuregen.intake.candidates import (  # R10 hypothesis seam (P6, candidates.py)
     generate_candidates_for_run,
 )
@@ -2142,11 +2142,11 @@ def confirm_contract(conn: DbConn, cmd: Command) -> CommandResult:
     # semantics (§4.2). It is a tagged method_variant Mapping ONLY in hypothesis mode — NEVER the raw
     # calculation_method string (reshape_calculation_method dict()s a non-None chosen_method).
     chosen_method: dict | None = None
-    # [Task 7.5 INSERT: hypothesis document PRIMARY_SELECTED promotion → set selected/rejected/chosen_method]
-    # Hypothesis mode: promote the human-selected candidate to PRIMARY on the RUN aggregate (§7.1) and
-    # record the selected + losing (write-once, untouched) candidate doc-ids in the confirmation record
-    # (§8.3). chosen_method stays None so R7 reshapes the promoted candidate's calculation_method from
-    # its Draft semantics (the selected candidate is the effective final Draft).
+    # [Task 7.5 INSERT / P1-a fix: hypothesis PRIMARY_SELECTED promotion → BIND the chosen candidate's method]
+    # Hypothesis mode: promote the human-selected candidate to PRIMARY on the RUN aggregate (§7.1), record
+    # selected + losing candidate doc-ids (§8.3), AND bind the CHOSEN candidate's OWN tagged
+    # calculation_method into the Confirmed contract (P1-a) — loaded from the candidate's durable body
+    # (F1 blob store). The human's Gate #1 choice GOVERNS the output, NOT the original Draft's method.
     if intake_mode == "hypothesis":
         # candidate_doc_id was already existence+branch_role validated above (pre-OCC); promote it to
         # PRIMARY on the RUN aggregate. A concurrent run-aggregate write since that guard read → stale.
@@ -2155,9 +2155,29 @@ def confirm_contract(conn: DbConn, cmd: Command) -> CommandResult:
             return CommandResult(accepted=False, aggregate_id=run_id, denied_reason=promote_reason)
         selected_candidate = candidate_doc_id
         rejected_candidates = _sibling_candidates(conn, run_id, candidate_doc_id)
+        # P1-a — load the CHOSEN candidate's durable body (F1) and bind its tagged calculation_method so
+        # the confirmed contract reflects the human's selection, not the Draft. Fail closed if unresolvable.
+        cand_doc = get_document(conn, candidate_doc_id)
+        cand_body = read_blob(conn, cand_doc["body_ref"]) if cand_doc and cand_doc.get("body_ref") else None
+        if cand_body is None:
+            return CommandResult(
+                accepted=False, aggregate_id=run_id,
+                denied_reason="cannot resolve the selected candidate body (fail-closed)",
+            )
+        # candidate.calculation_method is the tagged {method_version, chosen, considered}; reshape wants the
+        # inner `chosen` variant verbatim (it re-wraps). Fail closed if the candidate has no chosen method.
+        chosen_variant = (cand_body.get("calculation_method") or {}).get("chosen")
+        if not isinstance(chosen_variant, dict) or not chosen_variant:
+            return CommandResult(
+                accepted=False, aggregate_id=run_id,
+                denied_reason="selected candidate has no chosen calculation_method (fail-closed)",
+            )
+        chosen_method = dict(chosen_variant)
 
     feature_name = cmd.args.get("feature_name") or draft_body.get("proposed_feature_name")
     riv = _requires_independent_validation(draft_body)
+    # P1-a — the Confirmed contract derives from the Draft AND (hypothesis) the chosen candidate doc.
+    confirmed_derived_from = tuple(d for d in (draft_doc_id, selected_candidate) if d)
     # Decision 2 — the FULL confirmation record: selected/rejected candidates, human edits, ambiguity
     # notes, AND the CONFIRMER IDENTITY (subject / role claims / source of authority).
     confirmation = {
@@ -2175,7 +2195,7 @@ def confirm_contract(conn: DbConn, cmd: Command) -> CommandResult:
     confirmed_body = assemble_confirmed(
         draft_body,
         confirmation=confirmation,
-        derived_from=(draft_doc_id,) if draft_doc_id else (),
+        derived_from=confirmed_derived_from,
         requires_independent_validation=riv,
         chosen_method=chosen_method,
         feature_name=feature_name,
@@ -2187,7 +2207,7 @@ def confirm_contract(conn: DbConn, cmd: Command) -> CommandResult:
     confirmed_doc_id = _freeze_contract_doc(
         conn, run_id=run_id, request_id=request_id, stage=Stage.CONFIRMED_CONTRACT.value,
         body=confirmed_body, branch_role="primary",
-        derived_from=(draft_doc_id,) if draft_doc_id else (), supersedes=(), actor=cmd.actor,
+        derived_from=confirmed_derived_from, supersedes=(), actor=cmd.actor,
     )
     # X4 — CAS on the folded head (§12, Global Constraints): a None-append would take the CURRENT head,
     # letting a stale fold + these writes silently land AFTER a concurrent transition. Pin
