@@ -40,6 +40,23 @@ class ProcessOutcome:
     queue_id: int | None
 
 
+def _is_timer_command_message(claim: QueueClaim) -> bool:
+    """Discriminate a fired timer->command message (e.g. `timer.experiment_expiry`, MAJOR #22)
+    from a normal §5.1 run-stream step-trigger message.
+
+    A timer command message is enqueued by `fire_timer` with a `timer.<kind>` handler name AND
+    carries `payload["handler"]` naming the §4.4 command to run; it has NO run_id/event_id, so it
+    MUST NOT enter `_build_context`/`registry.get` (that path requires `payload["event_id"]` and a
+    `run` stream, so it would DLQ the message — the review CRITICAL).
+
+    A step message is routed to a BUSINESS handler name (never `timer.`-prefixed) and its payload
+    carries `event_id`, never a `handler` command field — so the two shapes are DISJOINT and this
+    predicate can never misroute a step message. Requiring BOTH the `timer.` handler prefix and the
+    in-payload `handler` command field keeps other `timer.<kind>` markers (reminder/sla/escalation,
+    which carry no `handler` field) on their unchanged path."""
+    return claim.handler.startswith("timer.") and "handler" in claim.payload
+
+
 def _default_document_loader(conn: psycopg.Connection, run_id: str) -> Mapping[str, NewDocument]:
     return {}
 
@@ -143,7 +160,50 @@ def process_one(
                 status="duplicate", message_id=claim.message_id, queue_id=claim.id
             )
 
-        handler = registry.get(claim.handler)
+        # A fired timer->command message (e.g. `timer.experiment_expiry`, MAJOR #22 / review
+        # CRITICAL) is NOT a run-stream step: it has no run event, so `_build_context`/`registry.get`
+        # below would DLQ it. Route it — inside THIS single claim/consumption path, so no separate
+        # poller can race process_one for the row — to the command-path bridge, which dispatches an
+        # ALLOWLISTED §4.4 command and then completes the queue row. Step-message handling below is
+        # byte-for-byte unchanged (the discriminator is disjoint from every step message).
+        if _is_timer_command_message(claim):
+            # Deferred import keeps the Phase-04 dispatcher free of an import-time dependency on the
+            # Phase-06 aggregate (mirrors runtime/step.py's deferred apply_activation import).
+            from featuregen.aggregates.activation import (
+                DisallowedTimerCommand,
+                dispatch_timer_command,
+            )
+
+            try:
+                # Nested savepoint isolates the command's writes: a fault rolls back ONLY those
+                # writes, leaving the outer tx valid for fail_* to record the disposition.
+                with conn.transaction():
+                    dispatch_timer_command(conn, claim.payload)
+            except DisallowedTimerCommand as exc:
+                # A non-allowlisted action is a DETERMINISTIC failure — straight to DLQ, never
+                # retried (mirrors the unknown-handler branch), and never dispatched.
+                fail_permanent(conn, claim.id, error=str(exc))
+                return ProcessOutcome(
+                    status="permanent", message_id=claim.message_id, queue_id=claim.id
+                )
+            except Exception as exc:  # noqa: BLE001 — bounded poison guard, as the step path
+                fail_retryable(conn, claim.id, error=f"timer command fault: {exc!r}")
+                return ProcessOutcome(
+                    status="retryable", message_id=claim.message_id, queue_id=claim.id
+                )
+            complete(conn, claim.id)
+            return ProcessOutcome(status="ok", message_id=claim.message_id, queue_id=claim.id)
+
+        # Resolve the handler under the poison guard: an unknown handler name is a
+        # DETERMINISTIC failure (never retryable) — route straight to DLQ (review BLOCKER #2).
+        try:
+            handler = registry.get(claim.handler)
+        except KeyError as exc:
+            fail_permanent(conn, claim.id, error=str(exc))
+            return ProcessOutcome(
+                status="permanent", message_id=claim.message_id, queue_id=claim.id
+            )
+
         handler_conn = handler_conn_factory(conn)
         timed_out = False
         try:
@@ -186,6 +246,16 @@ def process_one(
             fail_permanent(conn, claim.id, error=result.error or "permanent")
             return ProcessOutcome(
                 status="permanent", message_id=claim.message_id, queue_id=claim.id
+            )
+        except Exception as exc:  # noqa: BLE001 — the poison backstop
+            # A handler that raised (or _build_context that could not resolve the triggering
+            # event) is treated as a TRANSIENT delivery failure: bump attempts + backoff, DLQ
+            # at the budget. This is what prevents the infinite poison-retry (review BLOCKER #2).
+            # ConcurrencyError is handled above; HandlerTimeout returned above; anything here is
+            # an unexpected fault, retried a bounded number of times then DLQ'd.
+            fail_retryable(conn, claim.id, error=f"handler fault: {exc!r}")
+            return ProcessOutcome(
+                status="retryable", message_id=claim.message_id, queue_id=claim.id
             )
         finally:
             # Close the dedicated handler connection only if the handler actually returned. On

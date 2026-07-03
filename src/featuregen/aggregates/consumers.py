@@ -79,6 +79,16 @@ def supersede_command(conn: DbConn, cmd: Command) -> CommandResult:
     args = cmd.args
     use_case = args["use_case"]
     new_fv = args["feature_version_id"]
+    # MAJOR #14: supersede must compare-and-swap on expected_prior, exactly like activate
+    # (activation.py:105-111). Omitting it must be DENIED — never an unconditional overwrite of the
+    # production-active slot — so the no-silent-clobber property (§5.8/§12) holds on this path too.
+    expected_prior = args.get("expected_prior")
+    if not expected_prior:
+        return CommandResult(
+            accepted=False,
+            aggregate_id=feature_id,
+            denied_reason="supersede requires expected_prior (CAS)",
+        )
     row = conn.execute(
         "SELECT feature_version_id FROM feature_active_versions "
         "WHERE feature_id=%s AND use_case=%s FOR UPDATE",
@@ -111,24 +121,21 @@ def supersede_command(conn: DbConn, cmd: Command) -> CommandResult:
         return CommandResult(
             accepted=True, aggregate_id=feature_id, produced_event_ids=(evt.event_id,)
         )
-    if args.get("expected_prior") is not None and prior != args["expected_prior"]:
-        evt = append(
-            conn,
-            aggregate="feature",
-            aggregate_id=feature_id,
-            type="ACTIVATION_CONFLICT",
-            payload={
-                "feature_id": feature_id,
-                "feature_version_id": new_fv,
-                "use_case": use_case,
-                "base_feature_version_id": args["expected_prior"],
-                "current_active_version_id": prior,
-            },
-            actor=cmd.actor,
-            feature_id=feature_id,
-        )
+    # CAS-claim the slot FIRST (transient seq), guarded by expected_prior — mirror activate's
+    # _cas_claim_slot non-null-base branch (activation.py:105-111). 0 rows updated means the slot no
+    # longer holds expected_prior: CAS conflict, no clobber, and (crucially) NO VERSION_SUPERSEDED
+    # event — the event append below runs ONLY on the CAS-success path.
+    updated = conn.execute(
+        "UPDATE feature_active_versions SET feature_version_id=%s, activation_state='PRODUCTION', "
+        "activated_seq=%s, activated_at=now() "
+        "WHERE feature_id=%s AND use_case=%s AND feature_version_id=%s",
+        (new_fv, 0, feature_id, use_case, expected_prior),
+    ).rowcount
+    if updated == 0:
         return CommandResult(
-            accepted=True, aggregate_id=feature_id, produced_event_ids=(evt.event_id,)
+            accepted=False,
+            aggregate_id=feature_id,
+            denied_reason="supersede CAS conflict",
         )
     evt = append(
         conn,
@@ -145,13 +152,8 @@ def supersede_command(conn: DbConn, cmd: Command) -> CommandResult:
         feature_id=feature_id,
     )
     conn.execute(
-        "INSERT INTO feature_active_versions "
-        "(feature_id, use_case, feature_version_id, activation_state, activated_seq) "
-        "VALUES (%s,%s,%s,'PRODUCTION',%s) "
-        "ON CONFLICT (feature_id, use_case) DO UPDATE SET "
-        "feature_version_id=EXCLUDED.feature_version_id, activation_state='PRODUCTION', "
-        "activated_seq=EXCLUDED.activated_seq, activated_at=now()",
-        (feature_id, use_case, new_fv, evt.global_seq),
+        "UPDATE feature_active_versions SET activated_seq=%s WHERE feature_id=%s AND use_case=%s",
+        (evt.global_seq, feature_id, use_case),
     )
     return CommandResult(accepted=True, aggregate_id=feature_id, produced_event_ids=(evt.event_id,))
 

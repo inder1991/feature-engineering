@@ -1,8 +1,8 @@
 import pytest
 from psycopg.rows import dict_row
+from tests.featuregen._helpers import mint_test_identity
 
 from featuregen.contracts import Command
-from featuregen.identity.build import build_human_identity
 from featuregen.intake.commands import (
     RefineResult,
     _classify_raw_input,
@@ -18,7 +18,7 @@ from featuregen.intake.store import load_feature_contract
 
 # R4: the request owner is the INTENT_SUBMITTED event actor.subject (state.requester) — never a payload
 # key. INTENT_SUBMITTED is issued by the HUMAN requester, so the P2 fold reads the owner from the event.
-OWNER = build_human_identity(subject="user:raj", role_claims=("data_scientist",))
+OWNER = mint_test_identity(subject="user:raj", role_claims=("data_scientist",))
 
 
 class ScriptedLLM:

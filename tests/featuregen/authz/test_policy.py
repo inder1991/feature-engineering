@@ -1,7 +1,8 @@
+from tests.featuregen._helpers import mint_test_identity, mint_test_service_identity
+
 from featuregen.authz.policy import AuthzDecision, authorize_command, seed_authz_policy
 from featuregen.contracts.commands import Command
 from featuregen.contracts.identity import IdentityEnvelope
-from featuregen.identity.build import build_human_identity, build_service_identity
 
 
 def _cmd(action, actor, *, aggregate="feature", aggregate_id="feature_1", args=None):
@@ -17,13 +18,13 @@ def _cmd(action, actor, *, aggregate="feature", aggregate_id="feature_1", args=N
 
 def test_authorized_human_action(db):
     seed_authz_policy(db)
-    raj = build_human_identity(subject="user:raj", role_claims=["release"])
+    raj = mint_test_identity(subject="user:raj", role_claims=["release"])
     assert authorize_command(db, _cmd("activate", raj)) == AuthzDecision(True)
 
 
 def test_wrong_role_denied(db):
     seed_authz_policy(db)
-    raj = build_human_identity(subject="user:raj", role_claims=["data_scientist"])
+    raj = mint_test_identity(subject="user:raj", role_claims=["data_scientist"])
     decision = authorize_command(db, _cmd("activate", raj))
     assert decision.allowed is False
     assert decision.reason == "no matching authz policy"
@@ -31,7 +32,7 @@ def test_wrong_role_denied(db):
 
 def test_attested_service_authorized(db):
     seed_authz_policy(db)
-    svc = build_service_identity(
+    svc = mint_test_service_identity(
         subject="service:intake-agent",
         role_claims=["intake-agent"],
         attestation="signed-deploy-id:sp2-intake@1.4.0",
@@ -62,7 +63,7 @@ def test_self_asserted_service_denied(db):
 
 def test_gate_scoped_action_uses_gate_column(db):
     seed_authz_policy(db)
-    owner = build_human_identity(subject="user:do", role_claims=["data_owner"])
+    owner = mint_test_identity(subject="user:do", role_claims=["data_owner"])
     ok = authorize_command(
         db,
         _cmd(

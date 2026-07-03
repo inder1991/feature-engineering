@@ -18,7 +18,11 @@ dependencies = [
     "psycopg[binary]>=3.1",
     "jsonschema>=4.21",
     "python-ulid>=2.2",
+    "PyJWT[crypto]>=2.8",
 ]
+
+[project.scripts]
+featuregen = "featuregen.__main__:main"
 
 [project.optional-dependencies]
 dev = [

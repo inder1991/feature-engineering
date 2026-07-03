@@ -1,5 +1,5 @@
 import pytest
-from tests.featuregen._helpers import make_cmd
+from tests.featuregen._helpers import make_cmd, mint_test_identity, mint_test_service_identity
 
 from featuregen.aggregates.bootstrap import bootstrap_phase07
 from featuregen.aggregates.commands import register_phase06_commands
@@ -9,7 +9,7 @@ from featuregen.commands.registry import clear_registry
 from featuregen.contracts.gates import GateTaskSpec
 from featuregen.contracts.identity import IdentityEnvelope
 from featuregen.gates.tasks import open_task, submit_human_signal
-from featuregen.identity.build import IdentityError, build_human_identity, build_service_identity
+from featuregen.identity.build import IdentityError
 
 
 @pytest.fixture(autouse=True)
@@ -25,7 +25,7 @@ def _wired(db):
 
 
 def _svc():
-    return build_service_identity(
+    return mint_test_service_identity(
         subject="service:intake-agent",
         role_claims=["workflow"],
         attestation="signed-deploy-id:wf@1.0.0",
@@ -51,7 +51,7 @@ def test_unauthorized_command_is_denied_logged_and_emits_no_event(db):
     # A data_scientist may NOT `activate` (§6.2 requires the `release` role). With the real
     # PolicyAuthorizer registered, execute_command must deny, route the denial to the
     # tamper-evident security stream, and run NO handler (no domain event).
-    actor = build_human_identity(subject="user:ds", role_claims=["data_scientist"])
+    actor = mint_test_identity(subject="user:ds", role_claims=["data_scientist"])
     before = db.execute("SELECT count(*) FROM events").fetchone()[0]
     res = execute_command(
         db,
@@ -75,7 +75,7 @@ def test_unauthorized_command_is_denied_logged_and_emits_no_event(db):
 
 def test_submit_human_signal_routes_through_execute_command(db):
     task_id = _data_steward_task(db, "run_ok")
-    owner = build_human_identity(
+    owner = mint_test_identity(
         subject="user:do", role_claims=["data_owner"], groups=["core.transactions"]
     )
     res = execute_command(
@@ -102,7 +102,7 @@ def test_submit_human_signal_routes_through_execute_command(db):
 
 def test_submit_human_signal_denied_for_wrong_role_logs_and_skips_handler(db):
     task_id = _data_steward_task(db, "run_bad")
-    intruder = build_human_identity(
+    intruder = mint_test_identity(
         subject="user:intruder", role_claims=["compliance"], groups=["core.transactions"]
     )
     res = execute_command(

@@ -1,9 +1,9 @@
 from types import SimpleNamespace
 
 import pytest
+from tests.featuregen._helpers import mint_test_identity, mint_test_service_identity
 
 from featuregen.contracts import ConcurrencyError
-from featuregen.identity.build import build_human_identity, build_service_identity
 from featuregen.intake.mcv import (
     calculation_method_available,
     minimum_contract_validated,
@@ -115,9 +115,9 @@ def test_platform_supplied_field_needs_a_ledger_entry_check_6():
 
 
 def test_owner_and_confirmer_guards():
-    owner = build_human_identity(subject="user:raj", role_claims=("data_scientist",))
-    other = build_human_identity(subject="user:mallory", role_claims=("data_scientist",))
-    svc = build_service_identity(subject="service:intake-agent", role_claims=("intake-agent",), attestation="s")
+    owner = mint_test_identity(subject="user:raj", role_claims=("data_scientist",))
+    other = mint_test_identity(subject="user:mallory", role_claims=("data_scientist",))
+    svc = mint_test_service_identity(subject="service:intake-agent", role_claims=("intake-agent",), attestation="s")
     # The ONE owner predicate is state-based (R4): actor_is_request_owner(state, actor); `state.requester`
     # is set by the P2 fold to the INTENT_SUBMITTED actor.subject. A folded state exposes `.requester`.
     raj_state = SimpleNamespace(requester="user:raj")
@@ -168,7 +168,7 @@ def test_run_minimum_contract_validation_folds_and_appends_the_event(db, agent):
     return a CommandResult whose `.accepted` is the boundary P7's open_gate1_task reads."""
     from featuregen.intake.store import load_feature_contract
 
-    owner = build_human_identity(subject="user:raj", role_claims=("data_scientist",))
+    owner = mint_test_identity(subject="user:raj", role_claims=("data_scientist",))
     run_id = "run_mcv"
     _open_stream(db, run_id, owner)
 
@@ -181,7 +181,7 @@ def test_run_minimum_contract_validation_denies_a_failing_contract(db, agent):
     """A failing pure checklist → denied, NO event appended (stays in the Refinement Loop)."""
     from featuregen.intake.store import load_feature_contract
 
-    owner = build_human_identity(subject="user:raj", role_claims=("data_scientist",))
+    owner = mint_test_identity(subject="user:raj", role_claims=("data_scientist",))
     run_id = "run_mcv_fail"
     _open_stream(db, run_id, owner, draft=_draft(open_fields=["filters.declined_status_encoding"]))
 
@@ -195,7 +195,7 @@ def test_run_minimum_contract_validation_is_idempotent(db, agent):
     """A second run over an already-validated contract accepts without re-appending (no-regression)."""
     from featuregen.intake.store import load_feature_contract
 
-    owner = build_human_identity(subject="user:raj", role_claims=("data_scientist",))
+    owner = mint_test_identity(subject="user:raj", role_claims=("data_scientist",))
     run_id = "run_mcv_idem"
     _open_stream(db, run_id, owner)
 
@@ -210,7 +210,7 @@ def test_run_minimum_contract_validation_x4_stale_denies(db, agent, monkeypatch)
     fails closed as `stale` rather than committing MCV on top of a raced head."""
     import featuregen.intake.mcv as mcv
 
-    owner = build_human_identity(subject="user:raj", role_claims=("data_scientist",))
+    owner = mint_test_identity(subject="user:raj", role_claims=("data_scientist",))
     run_id = "run_mcv_stale"
     _open_stream(db, run_id, owner)
 
@@ -227,7 +227,7 @@ def test_hypothesis_mode_uses_candidate_docs(db, agent):
     """Hypothesis mode: the candidate count comes from the folded candidate_doc_ids, not a method."""
     from featuregen.intake.store import append_feature_contract_event, load_feature_contract
 
-    owner = build_human_identity(subject="user:raj", role_claims=("data_scientist",))
+    owner = mint_test_identity(subject="user:raj", role_claims=("data_scientist",))
     run_id = "run_mcv_hyp"
     d = _draft()
     d["feature_semantics"].pop("calculation_method")  # hypothesis: no single method — a candidate set
@@ -253,7 +253,7 @@ def test_hypothesis_mode_uses_candidate_docs(db, agent):
 @pytest.mark.parametrize("bad", [None, {}])
 def test_run_denies_when_no_draft_body_on_stream(db, agent, bad):
     """Defensive: a stream with no DRAFT_CONTRACT_PRODUCED body cannot pass the checklist."""
-    owner = build_human_identity(subject="user:raj", role_claims=("data_scientist",))
+    owner = mint_test_identity(subject="user:raj", role_claims=("data_scientist",))
     run_id = f"run_mcv_nobody_{id(bad)}"
     from featuregen.intake.store import append_feature_contract_event
 

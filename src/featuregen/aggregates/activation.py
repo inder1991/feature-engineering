@@ -10,6 +10,7 @@ from psycopg.types.json import Jsonb
 from featuregen.aggregates._append import append
 from featuregen.aggregates.feature_versions import load_governance_attributes, mint_feature_version
 from featuregen.aggregates.ids import mint_id
+from featuregen.commands.registry import get_command
 from featuregen.contracts import (
     Command,
     CommandResult,
@@ -23,6 +24,7 @@ from featuregen.contracts import (
     ProvenanceEnvelope,
 )
 from featuregen.governance.activation_policy import ActivationPolicy, evaluate_activation_guards
+from featuregen.identity._trust import mint_trusted_identity
 
 
 def _jsonable(value: Any) -> Any:
@@ -446,3 +448,69 @@ def deactivate_expired_version_command(conn: DbConn, cmd: Command) -> CommandRes
         (feature_id, use_case),
     )
     return CommandResult(accepted=True, aggregate_id=feature_id, produced_event_ids=(evt.event_id,))
+
+
+# Trusted internal identity for timer-initiated commands: the durable timer runtime is the actor
+# (there is no human/service token behind an auto-expiry). Recorded on the VERSION_EXPIRED event.
+# Minted through the sanctioned capability factory (SP-0.5 BLOCKER #1) — the timer runtime is an
+# internal trust ROOT that produces an authenticated principal without a token, so it must not
+# assert ``authenticated=True`` ad hoc.
+_TIMER_RUNTIME_ACTOR = mint_trusted_identity(
+    subject="service:timer-runtime",
+    actor_kind="service",
+    auth_method="internal",
+    role_claims=(),
+)
+
+# dispatch_timer_command runs as the TRUSTED _TIMER_RUNTIME_ACTOR and dispatches straight through
+# the command registry, BYPASSING execute_command's authz seam. It must therefore only ever be able
+# to invoke this explicit, minimal set of §4.4 actions — a corrupted/hostile timer row naming
+# anything else (activate/reject/deprecate/…) is refused BEFORE dispatch, so it can never run an
+# unauthenticated privileged command. Widen this set deliberately as new timer commands are added.
+_TIMER_COMMAND_ALLOWLIST = frozenset({"deactivate_expired_version", "finalize_deprecate"})
+
+
+class DisallowedTimerCommand(Exception):
+    """A fired timer->command message named a §4.4 action that is NOT in `_TIMER_COMMAND_ALLOWLIST`.
+    DETERMINISTIC failure — the single queue consumer routes it straight to the DLQ, never retries
+    it, and never dispatches the command."""
+
+
+def dispatch_timer_command(conn: DbConn, payload: Mapping[str, Any]) -> CommandResult:
+    """Consume a fired timer->queue message whose stored payload NAMES a §4.4 command action
+    (the MAJOR #22 bridge for `timer.experiment_expiry`).
+
+    A message enqueued by `fire_timer` is NOT a §5.1 run-stream STEP event: it has no run_id /
+    triggering event_id, so it CANNOT flow through `process_one`'s HandlerContext path
+    (`_build_context` requires `payload["event_id"]` and a `run` stream). Instead the timer's
+    stored payload carries the feature refs plus the command action to run (`handler`); this
+    bridge rebuilds the Command and dispatches it through the ESTABLISHED command registry
+    (`get_command`) — the same §4.4 dispatch every lifecycle command uses, NOT a new mechanism.
+    For `experiment_expiry` that command is the already-catalogued `deactivate_expired_version`,
+    which emits VERSION_EXPIRED and clears the CAS active-map slot. Idempotent under at-least-once
+    queue redelivery: the command re-checks the slot and no-ops once it is already cleared.
+
+    The named action is ALLOWLIST-CHECKED first (see `_TIMER_COMMAND_ALLOWLIST`): because this path
+    bypasses execute_command's authz seam and runs as a trusted actor, anything not allowlisted is
+    rejected with `DisallowedTimerCommand` before any Command is built or dispatched."""
+    action = payload["handler"]
+    if action not in _TIMER_COMMAND_ALLOWLIST:
+        raise DisallowedTimerCommand(
+            f"timer command action {action!r} is not allowlisted "
+            f"(allowed: {sorted(_TIMER_COMMAND_ALLOWLIST)})"
+        )
+    cmd = Command(
+        action=action,
+        aggregate="feature",
+        aggregate_id=payload["feature_id"],
+        args={
+            "feature_version_id": payload["feature_version_id"],
+            "use_case": payload["use_case"],
+        },
+        actor=_TIMER_RUNTIME_ACTOR,
+        # Retained for traceability only: this bridge bypasses the command_idempotency ledger, so
+        # redelivery dedup does NOT rest on this key — it comes from the command body's slot
+        # re-check in deactivate_expired_version_command (an idempotent no-op once the slot clears).
+        idempotency_key=f"timer-cmd:{payload['timer_id']}",
+    )
+    return get_command(action)(conn, cmd)

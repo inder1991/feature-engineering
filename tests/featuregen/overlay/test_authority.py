@@ -1,9 +1,9 @@
 from dataclasses import dataclass
 from typing import Any
 
+from tests.featuregen._helpers import mint_test_identity, mint_test_service_identity
 from tests.featuregen.overlay._helpers import StubCatalog
 
-from featuregen.identity.build import build_human_identity, build_service_identity
 from featuregen.overlay.authority import (
     Authority,
     _actor_is_authority,
@@ -130,8 +130,8 @@ def test_approved_join_both_unknown_is_still_dual_two_governance_tasks(db):
 
 def test_actor_is_authority(db):
     cat = StubCatalog(owners={display_object_ref(_orders()): "user:alice"})
-    alice = build_human_identity(subject="user:alice", role_claims=("data_owner",))
-    bob = build_human_identity(subject="user:bob", role_claims=("data_owner",))
+    alice = mint_test_identity(subject="user:alice", role_claims=("data_owner",))
+    bob = mint_test_identity(subject="user:bob", role_claims=("data_owner",))
 
     # data-owner fact: only the recorded owner is an authority (fine-grained owner-of-object)
     data_auth = resolve_authority(db, cat, _orders(), "grain")
@@ -140,13 +140,13 @@ def test_actor_is_authority(db):
 
     # policy_tag fact: only the compliance role is an authority
     comp_auth = resolve_authority(db, cat, _orders(), "policy_tag")
-    carol = build_human_identity(subject="user:carol", role_claims=("compliance",))
+    carol = mint_test_identity(subject="user:carol", role_claims=("compliance",))
     assert _actor_is_authority(comp_auth, carol) is True
     assert _actor_is_authority(comp_auth, alice) is False
 
     # governance-queue fact (unknown owner): the platform-admin role is accepted
     gov_auth = resolve_authority(db, StubCatalog(owners={}), _orders(), "availability_time")
-    admin = build_human_identity(subject="user:dan", role_claims=("platform-admin",))
+    admin = mint_test_identity(subject="user:dan", role_claims=("platform-admin",))
     assert gov_auth.governance_queue is True
     assert _actor_is_authority(gov_auth, admin) is True
     assert _actor_is_authority(gov_auth, alice) is False
@@ -155,9 +155,9 @@ def test_actor_is_authority(db):
 def test_actor_is_authority_approved_join_sides(db):
     a = _orders()
     b = _customers()
-    alice = build_human_identity(subject="user:alice", role_claims=("data_owner",))
-    bob = build_human_identity(subject="user:bob", role_claims=("data_owner",))
-    admin = build_human_identity(subject="user:dan", role_claims=("platform-admin",))
+    alice = mint_test_identity(subject="user:alice", role_claims=("data_owner",))
+    bob = mint_test_identity(subject="user:bob", role_claims=("data_owner",))
+    admin = mint_test_identity(subject="user:dan", role_claims=("platform-admin",))
     ref = ApprovedJoinRef(a, b, (ColumnPair("customer_id", "id"),), "N:1")
 
     # both owners known → each owner is an authority; a bare platform-admin is NOT
@@ -179,9 +179,9 @@ def test_actor_is_authority_approved_join_sides(db):
 
 
 def test_proposer_ne_confirmer(db):
-    alice = build_human_identity(subject="user:alice", role_claims=("data_owner",))
-    bob = build_human_identity(subject="user:bob", role_claims=("data_owner",))
-    svc = build_service_identity(
+    alice = mint_test_identity(subject="user:alice", role_claims=("data_owner",))
+    bob = mint_test_identity(subject="user:bob", role_claims=("data_owner",))
+    svc = mint_test_service_identity(
         subject="service:profiler", role_claims=("overlay",), attestation="sig"
     )
     human_proposed = [_Evt("OVERLAY_FACT_PROPOSED", {"proposed_by": "user:alice"})]

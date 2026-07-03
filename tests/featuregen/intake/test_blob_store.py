@@ -8,20 +8,20 @@ import json
 
 import pytest
 from psycopg.types.json import Jsonb
+from tests.featuregen._helpers import mint_test_identity
 
 from featuregen.aggregates._append import provenance_for
 from featuregen.contracts import Command
 from featuregen.contracts.documents import NewDocument, Stage
 from featuregen.documents.store import append_document, get_document
 from featuregen.events.store import load_stream
-from featuregen.identity.build import build_human_identity
 from featuregen.idgen import mint_id
 from featuregen.intake.blobs import BlobConflictError, read_blob, write_blob
 from featuregen.intake.candidates import Candidate, write_candidate_docs
 from featuregen.intake.commands import submit_intent
 from featuregen.intake.events import INTENT_SUBMITTED
 
-OWNER = build_human_identity(subject="user:raj", role_claims=("data_scientist",))
+OWNER = mint_test_identity(subject="user:raj", role_claims=("data_scientist",))
 
 
 # ── the store itself ────────────────────────────────────────────────────────────────────────────

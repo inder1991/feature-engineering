@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import psycopg
 import pytest
+from tests.featuregen._helpers import mint_test_service_identity
 
 from featuregen.aggregates._append import append
 from featuregen.db.migrations import apply_migrations
 from featuregen.events.registry import event_registry
-from featuregen.identity.build import build_service_identity
 from featuregen.runtime.outbox import partition_key_for
 
 _FC = "fc_test0001"
@@ -14,7 +14,7 @@ _RUN = "run_test0001"
 
 
 def _intake_actor():
-    return build_service_identity(
+    return mint_test_service_identity(
         subject="service:intake-agent",
         role_claims=["intake-agent"],
         attestation="signed-deploy-id:intake@1.0.0",

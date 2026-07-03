@@ -9,6 +9,15 @@ from pytest_postgresql import factories
 from featuregen.db.migrations import apply_migrations
 from featuregen.events.registry import reset_event_registry
 
+# Deterministic HMAC key for the tamper-evident security-audit chain (§6.2, BLOCKER #4).
+# security.audit fails CLOSED when FEATUREGEN_AUDIT_HMAC_KEY is unset, so the whole suite —
+# not just security tests, but every intake/overlay/authz/privacy test that appends a
+# denial to the security stream — needs a key present. Set at import time (config reads the
+# env lazily) so it is available before any fixture or collection-time code runs. setdefault
+# lets a real environment override win. Individual tests may monkeypatch.delenv to exercise
+# the fail-closed path.
+os.environ.setdefault("FEATUREGEN_AUDIT_HMAC_KEY", "test-audit-hmac-key-deterministic")
+
 # Brief default is a reachable PostgreSQL 15+ at `postgresql:///featuregen_test`, read from
 # FEATUREGEN_TEST_DSN. On machines without a running server (CI / this dev box) we instead
 # launch an EPHEMERAL PostgreSQL cluster via pytest-postgresql, which boots a throwaway

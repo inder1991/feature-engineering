@@ -177,24 +177,78 @@ class _ReadConnWriterHandler(_Handler):
 
 
 def test_handler_write_through_read_conn_fails_fast(db, seed_run_event, actor, prov) -> None:
-    """ctx.read_conn is opened READ-ONLY (§5.1): a handler that writes through it must fail fast
-    (psycopg ReadOnlySqlTransaction) and persist NOTHING — every mutation must go through the
-    returned HandlerResult and commit_step inside the step tx, never the read connection."""
+    """ctx.read_conn is opened READ-ONLY (§5.1): a handler that writes through it fails fast
+    (psycopg ReadOnlySqlTransaction) and persists NOTHING — every mutation must go through the
+    returned HandlerResult and commit_step inside the step tx, never the read connection.
+
+    Under the poison-message guard (review BLOCKER #2) the read-only violation no longer
+    propagates out of process_one and crashes the worker loop: it is a handler fault, so it is
+    CONTAINED as a bounded retryable delivery failure (=> DLQ at the budget). The load-bearing
+    invariant is unchanged — the illegal write must still persist NOTHING."""
     import psycopg
-    import pytest
 
     trigger = seed_run_event("run_ro", type="STEP_TRIGGER")
     _pipe_trigger_to_queue(db, trigger)
     reg = HandlerRegistry()
     reg.register(_ReadConnWriterHandler(actor, prov))
-    with pytest.raises(psycopg.errors.ReadOnlySqlTransaction):
-        process_one(db, reg, owner="w1")
+    # The read-only violation is a handler fault: contained by the poison guard, never propagated.
+    outcome = process_one(db, reg, owner="w1")
+    assert outcome.status == "retryable"
 
     # The illegal write never persisted (checked on an independent connection).
     db.rollback()
     with psycopg.connect(db.info.dsn) as probe, probe.cursor() as cur:
         cur.execute("SELECT to_regclass('handler_illegal_write')")
         assert cur.fetchone()[0] is None
+
+
+class _RaisingHandler(_Handler):
+    name = "advance"
+
+    def handle(self, ctx):
+        raise RuntimeError("boom in handler body")
+
+
+def test_raising_handler_bumps_attempts_and_dlqs(db, seed_run_event, actor, prov) -> None:
+    """A handler that raises must NOT propagate and must NOT retry forever: attempts is
+    durably bumped and the row DLQs at max_attempts (poison-message guard, review BLOCKER #2)."""
+    trigger = seed_run_event("run_poison", type="STEP_TRIGGER")
+    _pipe_trigger_to_queue(db, trigger)
+    # Shrink the delivery budget so the poison message reaches the DLQ deterministically within
+    # the drive loop below (the default budget is 12 with exponential backoff, which the loop
+    # cannot exhaust in wall-clock-zero time). max_attempts=1 => DLQ on the first fault.
+    with db.cursor() as cur:
+        cur.execute("UPDATE queue SET max_attempts=1 WHERE message_id=%s", (trigger.event_id,))
+    reg = HandlerRegistry()
+    reg.register(_RaisingHandler(actor, prov))
+
+    # Drive until the queue row leaves 'ready'/'leased'. With max_attempts small it must DLQ.
+    seen = set()
+    for _ in range(10):
+        outcome = process_one(db, reg, owner="w1")
+        seen.add(outcome.status)
+        if outcome.status == "idle":
+            break
+    with db.cursor() as cur:
+        cur.execute("SELECT status FROM queue WHERE message_id=%s", (trigger.event_id,))
+        status = cur.fetchone()[0]
+    assert "retryable" in seen
+    assert status == "dead"  # reached the DLQ, did not loop forever
+
+
+def test_unknown_handler_is_permanent(db, seed_run_event, actor, prov) -> None:
+    """A queue row naming an unregistered handler is a permanent (deterministic) failure —
+    routed straight to DLQ, never a KeyError out of process_one (review BLOCKER #2 / dispatch.py:146)."""
+    trigger = seed_run_event("run_nohandler", type="STEP_TRIGGER")
+    _pipe_trigger_to_queue(db, trigger)
+    reg = HandlerRegistry()  # deliberately empty — no "advance" handler
+    outcome = process_one(db, reg, owner="w1")
+    assert outcome.status == "permanent"
+    with db.cursor() as cur:
+        cur.execute("SELECT status, last_error FROM queue WHERE message_id=%s", (trigger.event_id,))
+        status, last_error = cur.fetchone()
+    assert status == "dead"
+    assert "no handler registered" in (last_error or "")
 
 
 def test_occ_conflict_reschedules_without_partial_writes(db, seed_run_event, actor, prov) -> None:

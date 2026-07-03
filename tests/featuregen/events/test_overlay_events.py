@@ -2,18 +2,18 @@ from __future__ import annotations
 
 import psycopg
 import pytest
+from tests.featuregen._helpers import mint_test_service_identity
 
 from featuregen.aggregates._append import append
 from featuregen.db.migrations import apply_migrations
 from featuregen.events.registry import event_registry
-from featuregen.identity.build import build_service_identity
 from featuregen.runtime.outbox import partition_key_for
 
 _FK = "a1b2c3d4e5f6"  # stand-in for a fact_key (sha256 hex) — Phase 1 store layer is key-agnostic
 
 
 def _overlay_actor():
-    return build_service_identity(
+    return mint_test_service_identity(
         subject="service:overlay-profiler",
         role_claims=["overlay"],
         attestation="signed-deploy-id:overlay@1.0.0",

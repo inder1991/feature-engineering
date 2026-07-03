@@ -4,6 +4,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from featuregen.contracts import EventEnvelope, IdentityEnvelope, ProvenanceEnvelope
+from featuregen.identity._trust import mint_trusted_identity
 
 
 def identity_to_jsonb(idv: IdentityEnvelope) -> dict[str, Any]:
@@ -24,10 +25,13 @@ def identity_to_jsonb(idv: IdentityEnvelope) -> dict[str, Any]:
 
 
 def identity_from_jsonb(d: Mapping[str, Any]) -> IdentityEnvelope:
-    return IdentityEnvelope(
+    # Reconstruct the actor recorded on a write-once event. The event store is itself a trust ROOT:
+    # a historically-authenticated actor is restored through the sanctioned capability factory
+    # (SP-0.5 BLOCKER #1) rather than by asserting ``authenticated=True`` ad hoc. A stored
+    # unauthenticated actor stays unauthenticated (no forgery risk in that direction).
+    common: dict[str, Any] = dict(
         subject=d["subject"],
         actor_kind=d["actor_kind"],
-        authenticated=d["authenticated"],
         auth_method=d["auth_method"],
         role_claims=tuple(d.get("role_claims", ())),
         groups=tuple(d.get("groups", ())),
@@ -38,6 +42,9 @@ def identity_from_jsonb(d: Mapping[str, Any]) -> IdentityEnvelope:
         source_of_authority=d.get("source_of_authority"),
         attestation=d.get("attestation"),
     )
+    if d["authenticated"]:
+        return mint_trusted_identity(**common)
+    return IdentityEnvelope(authenticated=False, **common)
 
 
 def provenance_to_jsonb(p: ProvenanceEnvelope) -> dict[str, Any]:

@@ -144,6 +144,70 @@ def test_supersede_updates_active_and_keeps_prior_immutable(db):
     assert load_stream(db, "feature", "feat_c")[-1].type == "VERSION_SUPERSEDED"
 
 
+def test_supersede_requires_expected_prior(db):
+    """supersede must CAS on expected_prior; omitting it must be denied, not an unconditional
+    overwrite of the active slot (review MAJOR #14 — parity with activate's mandatory CAS)."""
+    v1 = _mint(db, "feat_g", "run1")
+    apply_activation(
+        db,
+        feature_id="feat_g",
+        feature_version_id=v1,
+        use_case="fraud",
+        base_feature_version_id=None,
+        approval_type="PRODUCTION",
+        actor=make_actor(),
+    )
+    v2 = _mint(db, "feat_g", "run2", base=v1)
+    result = supersede_command(
+        db,
+        make_cmd(
+            "supersede",
+            "feature",
+            "feat_g",
+            {"feature_version_id": v2, "use_case": "fraud"},  # no expected_prior
+        ),
+    )
+    assert result.accepted is False
+    assert "expected_prior" in (result.denied_reason or "")
+    # no clobber: the production-active slot still holds v1, and no event was appended.
+    row = db.execute(
+        "SELECT feature_version_id FROM feature_active_versions "
+        "WHERE feature_id='feat_g' AND use_case='fraud'"
+    ).fetchone()
+    assert row[0] == v1
+    assert load_stream(db, "feature", "feat_g")[-1].type != "VERSION_SUPERSEDED"
+
+
+def test_supersede_stale_expected_prior_conflicts(db):
+    v1 = _mint(db, "feat_h", "run1")
+    apply_activation(
+        db,
+        feature_id="feat_h",
+        feature_version_id=v1,
+        use_case="fraud",
+        base_feature_version_id=None,
+        approval_type="PRODUCTION",
+        actor=make_actor(),
+    )
+    v2 = _mint(db, "feat_h", "run2", base=v1)
+    result = supersede_command(
+        db,
+        make_cmd(
+            "supersede",
+            "feature",
+            "feat_h",
+            {"feature_version_id": v2, "use_case": "fraud", "expected_prior": "fv_stale_nonmatch"},
+        ),
+    )
+    assert result.accepted is False  # CAS mismatch, no clobber
+    row = db.execute(
+        "SELECT feature_version_id FROM feature_active_versions "
+        "WHERE feature_id='feat_h' AND use_case='fraud'"
+    ).fetchone()
+    assert row[0] == v1
+    assert load_stream(db, "feature", "feat_h")[-1].type != "VERSION_SUPERSEDED"
+
+
 def test_retier_emits_event_without_mutating_version(db):
     v1 = _mint(db, "feat_d", "run1", tier="high")
     res = retier_command(
@@ -211,6 +275,99 @@ def test_force_deprecate_quiesces_with_grace_not_immediate_deprecation(db):
         "WHERE aggregate='feature' AND aggregate_id='feat_e'"
     ).fetchone()
     assert timer == ("business_repair", "finalize_deprecate")
+
+
+def test_force_quiesce_timer_finalizes_deprecate_via_process_one(db):
+    # M1 regression (final review): the force-quiesce grace timer is scheduled with
+    # kind='business_repair' + payload handler='finalize_deprecate'. The production consumer
+    # `process_one` routes the fired timer message to the command-path bridge
+    # (dispatch_timer_command), which ALLOWLIST-checks the action. Before the fix
+    # 'finalize_deprecate' was NOT allowlisted -> DisallowedTimerCommand -> fail_permanent ->
+    # the queue row went 'dead' and the version stayed PRODUCTION past its grace window forever.
+    # Mirrors test_experiment_expiry_auto_deactivates_via_process_one.
+    from datetime import UTC, datetime, timedelta
+
+    from featuregen.aggregates.commands import register_phase06_commands
+    from featuregen.commands.registry import clear_registry
+    from featuregen.runtime.dispatch import HandlerRegistry, process_one
+    from featuregen.runtime.timers import fire_timer, poll_due_timers
+
+    clear_registry()
+    register_phase06_commands()
+    try:
+        v1 = _mint(db, "feat_fq_po", "run1")
+        apply_activation(
+            db,
+            feature_id="feat_fq_po",
+            feature_version_id=v1,
+            use_case="fraud",
+            base_feature_version_id=None,
+            approval_type="PRODUCTION",
+            actor=make_actor(),
+        )
+        register_consumer_command(
+            db,
+            make_cmd(
+                "register_consumer",
+                "feature",
+                "feat_fq_po",
+                {"consumer_kind": "model", "consumer_ref": "model:churn"},
+            ),
+        )
+        # Force-quiesce with an already-elapsed grace window (grace_seconds=0 => fire_at ~= now).
+        deprecate_command(
+            db,
+            make_cmd(
+                "deprecate",
+                "feature",
+                "feat_fq_po",
+                {
+                    "feature_version_id": v1,
+                    "use_case": "fraud",
+                    "force_quiesce": True,
+                    "grace_seconds": 0,
+                },
+            ),
+        )
+        # version stays PRODUCTION during quiesce
+        assert (
+            db.execute(
+                "SELECT activation_state FROM feature_active_versions "
+                "WHERE feature_id='feat_fq_po' AND use_case='fraud'"
+            ).fetchone()[0]
+            == "PRODUCTION"
+        )
+
+        now = datetime.now(UTC) + timedelta(seconds=5)  # ensure the grace timer is due
+        claimed = poll_due_timers(db, owner="t1", lease_seconds=30, batch=10, now=now)
+        tid = db.execute(
+            "SELECT timer_id FROM timers WHERE aggregate_id='feat_fq_po' AND kind='business_repair'"
+        ).fetchone()[0]
+        assert tid in claimed
+        assert fire_timer(db, tid, now=now).fired is True
+
+        # The production consumer drives the timer.business_repair message through the command
+        # bridge (empty registry: it is routed OUT of the step path).
+        outcome = process_one(db, HandlerRegistry(), owner="w1")
+        assert outcome.status == "ok"  # NOT 'permanent' (DLQ)
+
+        # deactivation ACTUALLY happened: VERSION_DEPRECATED + slot DEPRECATED + queue row done
+        assert load_stream(db, "feature", "feat_fq_po")[-1].type == "VERSION_DEPRECATED"
+        assert (
+            db.execute(
+                "SELECT activation_state FROM feature_active_versions "
+                "WHERE feature_id='feat_fq_po' AND use_case='fraud'"
+            ).fetchone()[0]
+            == "DEPRECATED"
+        )
+        assert (
+            db.execute(
+                "SELECT status FROM queue WHERE handler='timer.business_repair'"
+            ).fetchone()[0]
+            == "done"  # NOT 'dead'
+        )
+    finally:
+        clear_registry()
 
 
 def test_finalize_deprecate_completes_after_grace_and_is_idempotent(db):

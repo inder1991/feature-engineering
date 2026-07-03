@@ -9,13 +9,47 @@ from featuregen.identity.build import (
 )
 
 
-def test_build_human_is_oidc_authenticated():
+def test_build_human_is_unauthenticated_by_default():
+    """FAIL-CLOSED (BLOCKER #1): a directly-built human identity carries its claimed shape but
+    is NOT authenticated. Authentication is granted only by a verifier (see test_verify.py)."""
     env = build_human_identity(subject="user:raj", role_claims=["data_scientist"])
     assert env.actor_kind == "human"
     assert env.auth_method == "oidc"
-    assert env.authenticated is True
+    assert env.authenticated is False
     assert env.role_claims == ("data_scientist",)
     assert env.attestation is None
+
+
+def test_verified_bool_kwarg_is_removed_and_cannot_forge():
+    """The old forgeable ``_verified: bool`` seam is GONE (SP-0.5 BLOCKER #1 hardening). Passing
+    it can no longer mint an authenticated principal — the kwarg does not exist, so an ordinary
+    caller trying the historic bypass gets a TypeError, not a forged authenticated envelope."""
+    with pytest.raises(TypeError):
+        build_human_identity(
+            subject="user:raj", role_claims=["data_scientist"], _verified=True
+        )
+
+
+def test_service_verified_bool_kwarg_is_removed_and_cannot_forge():
+    with pytest.raises(TypeError):
+        build_service_identity(
+            subject="service:x", role_claims=["r"], attestation="a", _verified=True
+        )
+
+
+def test_mint_trusted_identity_yields_authenticated_principal():
+    """The sanctioned internal factory (used only by the event-store serde and timer runtime) is
+    the capability-holding path that mints an authenticated principal WITHOUT a token."""
+    from featuregen.identity._trust import mint_trusted_identity
+
+    env = mint_trusted_identity(
+        subject="service:timer-runtime",
+        actor_kind="service",
+        auth_method="internal",
+        role_claims=(),
+    )
+    assert env.authenticated is True
+    assert env.actor_kind == "service"
 
 
 def test_build_human_rejects_unprefixed_subject():

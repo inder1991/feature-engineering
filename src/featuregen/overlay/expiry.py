@@ -101,6 +101,11 @@ def fire_due_overlay_expiries(conn: DbConn, *, now: datetime) -> int:
     mark the timer `fired`. The poller acts as a system service principal and resolves the
     catalog adapter via the single-source accessor. Returns the number of OVERLAY_FACT_EXPIRED
     events emitted; a superseded timer is consumed (marked fired) without emitting."""
+    # SP-0.5 BLOCKER #1: build_service_identity is now fail-closed, so this in-process poller's
+    # principal is authenticated=False until the service-identity mechanism (mTLS / signed deploy
+    # token) is wired at deploy time and verifies it. That is fail-SAFE (an unattested machine
+    # principal, not a forged one) and nothing on the expiry path authorizes against it today; the
+    # service-verifier wiring is the deferred follow-up (see task-10 report).
     actor = build_service_identity(
         subject="service:overlay-freshness",
         role_claims=("overlay",),

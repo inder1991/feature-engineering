@@ -1,9 +1,9 @@
+from tests.featuregen._helpers import mint_test_identity
 from tests.featuregen.intake._helpers import service_actor
 
 from featuregen.documents.registry import DocumentSchemaRegistry
 from featuregen.events.registry import event_registry
 from featuregen.events.store import load_stream
-from featuregen.identity.build import build_human_identity
 from featuregen.idgen import new_run_id
 from featuregen.intake.candidates import (
     CANDIDATES_OUTPUT_SCHEMA_ID,
@@ -17,7 +17,7 @@ from featuregen.intake.events import register_sp2_event_types
 from featuregen.intake.llm import LLMRequest, LLMResult
 from featuregen.intake.redaction import DefaultIntentRedactor, register_intent_redactor
 
-OWNER = build_human_identity(subject="user:raj", role_claims=("data_scientist",))
+OWNER = mint_test_identity(subject="user:raj", role_claims=("data_scientist",))
 
 
 class _Inner:

@@ -2,15 +2,15 @@ from __future__ import annotations
 
 import psycopg
 import pytest
+from tests.featuregen._helpers import mint_test_service_identity
 
 from featuregen.contracts.gates import GateTaskSpec
 from featuregen.db.migrations import apply_migrations
 from featuregen.gates.tasks import _task_aggregate, open_task
-from featuregen.identity.build import build_service_identity
 
 
 def _svc():
-    return build_service_identity(
+    return mint_test_service_identity(
         subject="service:overlay",
         role_claims=["overlay"],
         attestation="signed-deploy-id:overlay@1.0.0",

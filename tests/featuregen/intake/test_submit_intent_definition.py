@@ -1,14 +1,14 @@
 import json
 
 from psycopg.rows import dict_row
+from tests.featuregen._helpers import mint_test_identity
 
 from featuregen.contracts import Command
 from featuregen.events.store import load_stream
-from featuregen.identity.build import build_human_identity
 from featuregen.intake.commands import submit_intent
 from featuregen.intake.events import DRAFT_CONTRACT_PRODUCED, INTENT_SUBMITTED
 
-ALICE = build_human_identity(subject="user:alice", role_claims=("data_scientist",))
+ALICE = mint_test_identity(subject="user:alice", role_claims=("data_scientist",))
 
 _INTENT = "90-day rolling count of declined card authorizations per customer"
 

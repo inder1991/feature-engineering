@@ -173,14 +173,14 @@ def fire_timer(
     so this generic driver must never route one (poll_due_timers already excludes them)."""
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT idempotency_key, aggregate, aggregate_id, task_id, kind, cas_task_version, status "
-            "FROM timers WHERE timer_id = %s FOR UPDATE",
+            "SELECT idempotency_key, aggregate, aggregate_id, task_id, kind, cas_task_version, "
+            "status, payload FROM timers WHERE timer_id = %s FOR UPDATE",
             (timer_id,),
         )
         row = cur.fetchone()
         if row is None:
             return TimerFireOutcome(timer_id, False, "not_found")
-        idem, aggregate, aggregate_id, task_id, kind, cas_version, status = row
+        idem, aggregate, aggregate_id, task_id, kind, cas_version, status, stored_payload = row
         if kind == "overlay_expiry":
             # Owned by fire_due_overlay_expiries (decision 5); no generic handler exists. Leave the
             # timer untouched (scheduled) so the dedicated poller still processes it.
@@ -203,6 +203,13 @@ def fire_timer(
         # handler. Downstream therefore registers a single 'runtime.auto_park' handler; all
         # other rungs route to their per-kind 'timer.<kind>' handler.
         handler = "runtime.auto_park" if kind == "auto_park" else f"timer.{kind}"
+        # Carry the timer's STORED payload (feature refs + the command it names, e.g.
+        # experiment_expiry -> deactivate_expired_version) into the work message, merged UNDER the
+        # base envelope so those reserved keys can never be clobbered (MAJOR #22). Without this the
+        # downstream consumer has no feature_version_id/use_case to act on.
+        merged_payload = {"timer_id": timer_id, "kind": kind, "task_id": task_id}
+        if stored_payload:
+            merged_payload = {**dict(stored_payload), **merged_payload}
         cur.execute(
             """
             INSERT INTO queue (message_id, partition_key, handler, payload)
@@ -213,7 +220,7 @@ def fire_timer(
                 idem,
                 f"{aggregate}:{aggregate_id}",
                 handler,
-                Jsonb({"timer_id": timer_id, "kind": kind, "task_id": task_id}),
+                Jsonb(merged_payload),
             ),
         )
         cur.execute("UPDATE timers SET status='fired' WHERE timer_id=%s", (timer_id,))

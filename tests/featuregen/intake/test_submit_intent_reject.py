@@ -1,14 +1,15 @@
 # X5 — Phase 4 owns only the INTAKE-TIME terminal append (submit_intent appends INTENT_REJECTED itself);
 # the standalone `reject_intent` command is P8's and is tested in Phase 8, not here.
+from tests.featuregen._helpers import mint_test_identity
+
 from featuregen.aggregates.run_lifecycle import run_is_terminal
 from featuregen.contracts import Command
 from featuregen.events.store import load_stream
-from featuregen.identity.build import build_human_identity
 from featuregen.intake.banking_catalog import IntakeOutcome
 from featuregen.intake.commands import submit_intent
 from featuregen.intake.events import DRAFT_CONTRACT_PRODUCED, INTENT_REJECTED
 
-ALICE = build_human_identity(subject="user:alice", role_claims=("data_scientist",))
+ALICE = mint_test_identity(subject="user:alice", role_claims=("data_scientist",))
 
 
 def _cmd(intent="predict tomorrow's weather", mode="definition"):

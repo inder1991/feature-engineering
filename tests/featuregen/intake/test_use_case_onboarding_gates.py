@@ -2,19 +2,19 @@ from __future__ import annotations
 
 import psycopg
 import pytest
+from tests.featuregen._helpers import mint_test_service_identity
 
 from featuregen.aggregates._append import append
 from featuregen.contracts.gates import GateTaskSpec
 from featuregen.db.migrations import apply_migrations
 from featuregen.gates.tasks import open_task
-from featuregen.identity.build import build_service_identity
 from featuregen.intake.events import NEEDS_USE_CASE_ONBOARDING, USE_CASE_ONBOARDING_GATE
 
 _RUN = "run_onb01"
 
 
 def _svc(subject="service:workflow", role="workflow"):
-    return build_service_identity(
+    return mint_test_service_identity(
         subject=subject, role_claims=[role],
         attestation="signed-deploy-id:workflow@1.0.0",
     )

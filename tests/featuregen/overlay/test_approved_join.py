@@ -1,9 +1,9 @@
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from tests.featuregen._helpers import mint_test_identity
 
 from featuregen.contracts import Command, ConcurrencyError
-from featuregen.identity.build import build_human_identity
 from featuregen.overlay.commands import (
     confirm_fact,
     get_task_proposal,
@@ -15,11 +15,11 @@ from featuregen.overlay.identity import ApprovedJoinRef, CatalogObjectRef, Colum
 from featuregen.overlay.state import fold_overlay_state
 from featuregen.overlay.store import load_fact
 
-ALICE = build_human_identity(subject="user:alice", role_claims=("data_owner",))
-BOB = build_human_identity(subject="user:bob", role_claims=("data_owner",))
-EVE = build_human_identity(subject="user:eve", role_claims=("data_owner",))
-ADMIN = build_human_identity(subject="user:admin", role_claims=("platform-admin",))
-ADMIN2 = build_human_identity(subject="user:admin2", role_claims=("platform-admin",))
+ALICE = mint_test_identity(subject="user:alice", role_claims=("data_owner",))
+BOB = mint_test_identity(subject="user:bob", role_claims=("data_owner",))
+EVE = mint_test_identity(subject="user:eve", role_claims=("data_owner",))
+ADMIN = mint_test_identity(subject="user:admin", role_claims=("platform-admin",))
+ADMIN2 = mint_test_identity(subject="user:admin2", role_claims=("platform-admin",))
 
 
 def _orders():

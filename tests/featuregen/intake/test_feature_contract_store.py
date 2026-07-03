@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import pytest
+from tests.featuregen._helpers import mint_test_service_identity
 
 from featuregen.contracts import ConcurrencyError, SchemaValidationError
-from featuregen.identity.build import build_service_identity
 from featuregen.intake.events import CONTRACT_REFINED, INTENT_SUBMITTED
 from featuregen.intake.store import append_feature_contract_event, load_feature_contract
 
@@ -11,7 +11,7 @@ _RUN = "run_store01"  # R1: feature_contract_id == run_id (one contract per run)
 
 
 def _intake_actor():
-    return build_service_identity(
+    return mint_test_service_identity(
         subject="service:intake-agent",
         role_claims=["intake-agent"],
         attestation="signed-deploy-id:intake@1.0.0",

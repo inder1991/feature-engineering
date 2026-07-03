@@ -1,4 +1,5 @@
 import pytest
+from tests.featuregen._helpers import mint_test_identity, mint_test_service_identity
 
 from featuregen.contracts.gates import GateTaskSpec
 from featuregen.gates.tasks import (
@@ -10,11 +11,10 @@ from featuregen.gates.tasks import (
     open_task,
     submit_human_signal,
 )
-from featuregen.identity.build import build_human_identity, build_service_identity
 
 
 def _svc():
-    return build_service_identity(
+    return mint_test_service_identity(
         subject="service:intake-agent",
         role_claims=["workflow"],
         attestation="signed-deploy-id:sp2-intake@1.4.0",
@@ -35,7 +35,7 @@ def _open(db, **kw):
 
 
 def _owner(subject):
-    return build_human_identity(
+    return mint_test_identity(
         subject=subject, role_claims=["data_owner"], groups=["core.transactions"]
     )
 
@@ -124,7 +124,7 @@ def test_stale_answer_rejected_on_version_change_not_run_advance(db):
 
 def test_ineligible_role_rejected(db):
     task_id = _open(db)
-    wrong = build_human_identity(
+    wrong = mint_test_identity(
         subject="user:x", role_claims=["data_scientist"], groups=["core.transactions"]
     )
     with pytest.raises(IneligibleResponderError):
@@ -133,7 +133,7 @@ def test_ineligible_role_rejected(db):
 
 def test_wrong_scope_rejected(db):
     task_id = _open(db)
-    wrong_scope = build_human_identity(
+    wrong_scope = mint_test_identity(
         subject="user:y", role_claims=["data_owner"], groups=["other.table"]
     )
     with pytest.raises(IneligibleResponderError):
@@ -184,7 +184,7 @@ def test_direct_submit_enforces_sod(db):
         allowed_responses=("validate", "reject"),
         required_inputs=("feature_plan_ref",),
     )
-    author_as_validator = build_human_identity(subject="user:author", role_claims=["validator"])
+    author_as_validator = mint_test_identity(subject="user:author", role_claims=["validator"])
     with pytest.raises(SoDViolationError):
         submit_human_signal(
             db, task_id, response="validate", actor=author_as_validator, expected_task_version=1
@@ -203,13 +203,13 @@ def test_quorum_of_role_enforced_distinct_from_eligible_role(db):
         quorum_required=2,
         allowed_responses=("confirm", "reject"),
     )
-    only_reviewer = build_human_identity(subject="user:r0", role_claims=["reviewer"])
+    only_reviewer = mint_test_identity(subject="user:r0", role_claims=["reviewer"])
     with pytest.raises(IneligibleResponderError):
         submit_human_signal(
             db, task_id, response="confirm", actor=only_reviewer, expected_task_version=1
         )
-    a = build_human_identity(subject="user:a", role_claims=["reviewer", "data_owner"])
-    b = build_human_identity(subject="user:b", role_claims=["reviewer", "data_owner"])
+    a = mint_test_identity(subject="user:a", role_claims=["reviewer", "data_owner"])
+    b = mint_test_identity(subject="user:b", role_claims=["reviewer", "data_owner"])
     r1 = submit_human_signal(db, task_id, response="confirm", actor=a, expected_task_version=1)
     assert r1.quorum_met is False
     r2 = submit_human_signal(db, task_id, response="confirm", actor=b, expected_task_version=1)
@@ -219,7 +219,7 @@ def test_quorum_of_role_enforced_distinct_from_eligible_role(db):
 
 def test_delegation_requires_grant_and_validates_principal(db):
     task_id = _open(db)  # DATA_STEWARD: eligible role=data_owner, scope=core.transactions
-    delegate = build_human_identity(subject="user:assistant", role_claims=["intern"])
+    delegate = mint_test_identity(subject="user:assistant", role_claims=["intern"])
 
     # 1) no grant -> a delegated answer is refused
     with pytest.raises(IneligibleResponderError):
@@ -233,10 +233,10 @@ def test_delegation_requires_grant_and_validates_principal(db):
         )
 
     # 2) granting for an INELIGIBLE principal is refused (principal eligibility verified here)
-    ineligible = build_human_identity(
+    ineligible = mint_test_identity(
         subject="user:nobody", role_claims=["intern"], groups=["core.transactions"]
     )
-    principal = build_human_identity(
+    principal = mint_test_identity(
         subject="user:owner", role_claims=["data_owner"], groups=["core.transactions"]
     )
     with pytest.raises(IneligibleResponderError):

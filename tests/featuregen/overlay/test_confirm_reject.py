@@ -2,22 +2,22 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 from psycopg.rows import dict_row
+from tests.featuregen._helpers import mint_test_identity, mint_test_service_identity
 
 from featuregen.contracts import Command, ConcurrencyError
-from featuregen.identity.build import build_human_identity, build_service_identity
 from featuregen.overlay.commands import confirm_fact, propose_fact, reject_fact
 from featuregen.overlay.freshness import fire_due_overlay_expiries
 from featuregen.overlay.identity import CatalogObjectRef, fact_key, proposal_fingerprint
 from featuregen.overlay.state import fold_overlay_state
 from featuregen.overlay.store import load_fact
 
-ALICE = build_human_identity(subject="user:alice", role_claims=("data_owner",))
-BOB = build_human_identity(subject="user:bob", role_claims=("data_owner",))
-COMPLIANCE = build_human_identity(subject="user:carol", role_claims=("compliance",))
-ADMIN = build_human_identity(subject="user:admin", role_claims=("platform-admin",))
+ALICE = mint_test_identity(subject="user:alice", role_claims=("data_owner",))
+BOB = mint_test_identity(subject="user:bob", role_claims=("data_owner",))
+COMPLIANCE = mint_test_identity(subject="user:carol", role_claims=("compliance",))
+ADMIN = mint_test_identity(subject="user:admin", role_claims=("platform-admin",))
 # A non-human (profiler) principal, attested + granted platform-admin so it WOULD clear the
 # authority/four-eyes checks if it were human — isolating the `actor_kind != "human"` guard.
-PROFILER = build_service_identity(
+PROFILER = mint_test_service_identity(
     subject="service:profiler", role_claims=("platform-admin",), attestation="deploy-sig-abc"
 )
 

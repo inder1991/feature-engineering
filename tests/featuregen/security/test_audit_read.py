@@ -1,7 +1,7 @@
 import pytest
+from tests.featuregen._helpers import mint_test_identity
 
 from featuregen.contracts.identity import IdentityEnvelope
-from featuregen.identity.build import build_human_identity
 from featuregen.security.audit import (
     AuditReadDenied,
     read_security_audit,
@@ -10,7 +10,7 @@ from featuregen.security.audit import (
 
 
 def _seed(db):
-    a = build_human_identity(subject="user:raj", role_claims=["data_scientist"])
+    a = mint_test_identity(subject="user:raj", role_claims=["data_scientist"])
     record_security_event(
         db,
         event_type="COMMAND_DENIED",
@@ -23,7 +23,7 @@ def _seed(db):
 
 def test_security_role_can_read_and_read_is_logged(db):
     _seed(db)
-    sec = build_human_identity(subject="user:sec", role_claims=["security"])
+    sec = mint_test_identity(subject="user:sec", role_claims=["security"])
     rows = read_security_audit(db, sec)
     types = {r[1] for r in rows}
     assert "COMMAND_DENIED" in types
@@ -36,7 +36,7 @@ def test_security_role_can_read_and_read_is_logged(db):
 
 def test_feature_owner_cannot_read_security_stream(db):
     _seed(db)
-    owner = build_human_identity(subject="user:owner", role_claims=["owner"])
+    owner = mint_test_identity(subject="user:owner", role_claims=["owner"])
     with pytest.raises(AuditReadDenied):
         read_security_audit(db, owner)
     denied = db.execute(

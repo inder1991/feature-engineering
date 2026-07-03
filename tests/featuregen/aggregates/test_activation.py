@@ -437,6 +437,179 @@ def test_deactivate_expired_version_removes_active_entry(db):
     assert again.accepted and again.produced_event_ids == ()
 
 
+def test_experiment_expiry_auto_deactivates_via_process_one(db):
+    # MAJOR #22 / review CRITICAL, driven through the PRODUCTION consumer `process_one` (NOT a
+    # hand-wired claim_one -> dispatch_timer_command, which proved a path production never takes).
+    # A due experiment_expiry timer fires a `timer.experiment_expiry` queue message; process_one
+    # must DISCRIMINATE it from a run-stream step message and route it to the command-path bridge
+    # (deactivate_expired_version), which emits VERSION_EXPIRED and clears the CAS active slot.
+    # Before the routing fix process_one sent the message to registry.get -> KeyError ->
+    # fail_permanent -> DLQ, so the version NEVER auto-deactivated (the fix was dead code).
+    from featuregen.aggregates.commands import register_phase06_commands
+    from featuregen.commands.registry import clear_registry
+    from featuregen.runtime.dispatch import HandlerRegistry, process_one
+    from featuregen.runtime.timers import fire_timer, poll_due_timers
+
+    clear_registry()
+    register_phase06_commands()
+    try:
+        past = datetime(2020, 1, 1, tzinfo=UTC)  # timer fire_at (already due)
+        now = datetime(2030, 1, 1, tzinfo=UTC)
+        fid, uc = "feat_exp_po", "fraud"
+        v1 = _mint(db, fid, "run1", approval="EXPERIMENTAL", expires=past)
+        apply_activation(
+            db,
+            feature_id=fid,
+            feature_version_id=v1,
+            use_case=uc,
+            base_feature_version_id=None,
+            approval_type="EXPERIMENTAL",
+            actor=make_actor(),
+            expires_at=past,
+        )
+        assert (
+            db.execute(
+                "SELECT activation_state FROM feature_active_versions "
+                "WHERE feature_id=%s AND use_case=%s",
+                (fid, uc),
+            ).fetchone()[0]
+            == "ACTIVE_EXPERIMENTAL"
+        )
+
+        # poll -> fire the due timer (enqueues the timer.experiment_expiry work message)
+        claimed = poll_due_timers(db, owner="t1", lease_seconds=30, batch=10, now=now)
+        tid = db.execute(
+            "SELECT timer_id FROM timers WHERE aggregate_id=%s AND kind='experiment_expiry'",
+            (fid,),
+        ).fetchone()[0]
+        assert tid in claimed
+        assert fire_timer(db, tid, now=now).fired is True
+
+        # THE PRODUCTION CONSUMER drives it forward. An empty HandlerRegistry proves the message is
+        # routed OUT of the step path: it needs no `timer.experiment_expiry` step handler.
+        outcome = process_one(db, HandlerRegistry(), owner="w1")
+        assert outcome.status == "ok"
+
+        # deactivation ACTUALLY happened: VERSION_EXPIRED emitted + active slot cleared + row done
+        assert load_stream(db, "feature", fid)[-1].type == "VERSION_EXPIRED"
+        assert (
+            db.execute(
+                "SELECT count(*) FROM feature_active_versions WHERE feature_id=%s", (fid,)
+            ).fetchone()[0]
+            == 0
+        )
+        assert (
+            db.execute(
+                "SELECT status FROM queue WHERE handler='timer.experiment_expiry'"
+            ).fetchone()[0]
+            == "done"
+        )
+    finally:
+        clear_registry()
+
+
+def test_timer_command_bridge_rejects_non_allowlisted_action(db):
+    # Important finding: dispatch_timer_command dispatches as the TRUSTED service:timer-runtime
+    # actor (bypassing execute_command's authz seam), so it MUST refuse any action outside its
+    # explicit allowlist. A corrupted/hostile timer row naming a real-but-privileged command
+    # (`activate`) is rejected BEFORE dispatch — no event appended, no state change.
+    import pytest
+
+    from featuregen.aggregates.activation import DisallowedTimerCommand, dispatch_timer_command
+    from featuregen.aggregates.commands import register_phase06_commands
+    from featuregen.commands.registry import clear_registry
+
+    clear_registry()
+    register_phase06_commands()
+    try:
+        payload = {
+            "handler": "activate",  # catalogued, but NOT timer-allowlisted
+            "feature_id": "feat_evil",
+            "feature_version_id": "fv_evil",
+            "use_case": "fraud",
+            "timer_id": "tmr_evil",
+        }
+        with pytest.raises(DisallowedTimerCommand):
+            dispatch_timer_command(db, payload)
+        assert load_stream(db, "feature", "feat_evil") == []  # not dispatched
+    finally:
+        clear_registry()
+
+
+def test_process_one_dlqs_non_allowlisted_timer_command(db):
+    # The production consumer routes a non-allowlisted timer command to the DLQ (a deterministic
+    # failure, like an unknown handler) and NEVER dispatches it.
+    from featuregen.aggregates.commands import register_phase06_commands
+    from featuregen.commands.registry import clear_registry
+    from featuregen.runtime.dispatch import HandlerRegistry, process_one
+    from featuregen.runtime.queue import enqueue
+
+    clear_registry()
+    register_phase06_commands()
+    try:
+        enqueue(
+            db,
+            message_id="expiry:evil:fraud",
+            partition_key="feature:feat_evil2",
+            handler="timer.experiment_expiry",  # timer-shaped envelope
+            payload={
+                "handler": "activate",  # non-allowlisted action
+                "feature_id": "feat_evil2",
+                "feature_version_id": "fv_evil2",
+                "use_case": "fraud",
+                "timer_id": "tmr_evil2",
+            },
+        )
+        outcome = process_one(db, HandlerRegistry(), owner="w1")
+        assert outcome.status == "permanent"
+        row = db.execute(
+            "SELECT status FROM queue WHERE message_id='expiry:evil:fraud'"
+        ).fetchone()
+        assert row[0] == "dead"
+        assert load_stream(db, "feature", "feat_evil2") == []  # not dispatched
+    finally:
+        clear_registry()
+
+
+def test_process_one_reschedules_transiently_failing_timer_command(db):
+    # m8: the timer-command path has a retryable branch for an ALLOWLISTED command that fails
+    # TRANSIENTLY (not DisallowedTimerCommand). process_one must reschedule the queue row to 'ready'
+    # (bounded delivery retry), NOT DLQ it. Register a transient-failing stand-in under the
+    # allowlisted `deactivate_expired_version` action to exercise exactly that branch.
+    from featuregen.commands.registry import clear_registry, register_command
+    from featuregen.runtime.dispatch import HandlerRegistry, process_one
+    from featuregen.runtime.queue import enqueue
+
+    clear_registry()
+
+    def _boom(conn, cmd):
+        raise RuntimeError("transient downstream fault")
+
+    register_command("deactivate_expired_version", _boom)  # allowlisted action, transiently failing
+    try:
+        enqueue(
+            db,
+            message_id="expiry:transient:fraud",
+            partition_key="feature:feat_transient",
+            handler="timer.experiment_expiry",  # timer-command envelope
+            payload={
+                "handler": "deactivate_expired_version",  # allowlisted
+                "feature_id": "feat_transient",
+                "feature_version_id": "fv_transient",
+                "use_case": "fraud",
+                "timer_id": "tmr_transient",
+            },
+        )
+        outcome = process_one(db, HandlerRegistry(), owner="w1")
+        assert outcome.status == "retryable"  # NOT 'permanent' (DLQ)
+        row = db.execute(
+            "SELECT status FROM queue WHERE message_id='expiry:transient:fraud'"
+        ).fetchone()
+        assert row[0] == "ready"  # rescheduled with backoff, not 'dead'
+    finally:
+        clear_registry()
+
+
 def _mint_full(db, feature_id, run, *, stamp, approval="PRODUCTION", blocked=(), tier="low"):
     return mint_feature_version(
         db,

@@ -12,6 +12,7 @@ from dataclasses import asdict
 
 import psycopg
 import pytest
+from tests.featuregen._helpers import mint_test_service_identity
 from tests.featuregen.overlay._helpers import StubCatalog, catalog_columns
 
 from featuregen.authz.authorizer import PolicyAuthorizer
@@ -22,7 +23,6 @@ from featuregen.commands.authz_seam import (
     register_command_authorizer,
 )
 from featuregen.contracts import Command
-from featuregen.identity.build import build_service_identity
 from featuregen.overlay.bootstrap import register_overlay, seed_overlay_authz
 from featuregen.overlay.catalog import (
     _clear_catalog_adapter,
@@ -52,7 +52,7 @@ def _reset_process_globals():
 
 
 def _service_actor():
-    return build_service_identity(
+    return mint_test_service_identity(
         subject="service:profiler",
         role_claims=("overlay",),
         attestation="att-profiler-1",

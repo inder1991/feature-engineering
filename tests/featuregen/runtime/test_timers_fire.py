@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
+from psycopg.rows import dict_row
+
 from featuregen.contracts import NewTimer
 from featuregen.runtime.timers import (
     cancel_timers_for_task,
@@ -112,3 +114,40 @@ def test_auto_park_rung_uses_canonical_handler(conn):
     with conn.cursor() as cur:
         cur.execute("SELECT handler FROM queue WHERE message_id='k-park'")
         assert cur.fetchone()[0] == "runtime.auto_park"
+
+
+def test_fire_carries_stored_timer_payload_into_queue_message(conn):
+    # MAJOR #22: fire_timer must MERGE the timer's stored payload (the feature refs + the command
+    # the timer names) into the enqueued queue message, not just {timer_id, kind, task_id}. Without
+    # it the downstream consumer has no feature_version_id/use_case to act on, so an
+    # ACTIVE_EXPERIMENTAL version never auto-deactivates.
+    tid = schedule_timer(
+        conn,
+        "feature",
+        "feat_x",
+        NewTimer(
+            kind="experiment_expiry",
+            fire_at=NOW - timedelta(minutes=1),
+            idempotency_key="k-exp-payload",
+            payload={
+                "handler": "deactivate_expired_version",
+                "feature_id": "feat_x",
+                "feature_version_id": "fv_1",
+                "use_case": "fraud",
+            },
+        ),
+    )
+    poll_due_timers(conn, owner="p", lease_seconds=60, batch=10, now=NOW)
+    assert fire_timer(conn, tid, now=NOW).fired is True
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute("SELECT handler, payload FROM queue WHERE message_id='k-exp-payload'")
+        row = cur.fetchone()
+    assert row["handler"] == "timer.experiment_expiry"
+    p = row["payload"]
+    # the stored feature refs + command action ride through into the enqueued message ...
+    assert p["feature_id"] == "feat_x"
+    assert p["feature_version_id"] == "fv_1"
+    assert p["use_case"] == "fraud"
+    assert p["handler"] == "deactivate_expired_version"
+    # ... alongside the base envelope fields fire_timer already carried.
+    assert p["timer_id"] == tid and p["kind"] == "experiment_expiry"
