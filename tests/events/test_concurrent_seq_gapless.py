@@ -108,6 +108,17 @@ def test_concurrent_cross_aggregate_appends_are_gapless(_dsn):
                 pass
             c.close()
         with psycopg.connect(_dsn, autocommit=True) as cleanup, cleanup.cursor() as cur:
-            cur.execute("DELETE FROM events")
+            # events is now WORM at the row level (events_no_mutation trigger), so a row-level
+            # DELETE is rejected; reset the shared table with statement-level TRUNCATE instead
+            # (same idiom the append-only security_audit test cleanup uses). CASCADE is required
+            # because several tables carry an FK to events(event_id) — projection_degraded,
+            # run_workflow_state, and the runtime command tables — and a plain TRUNCATE errors on
+            # the mere existence of those FK constraints (a schema-level check, not a row check),
+            # so clearing referencing rows first would not help. CASCADE truncates those
+            # event-derived tables too, which is exactly the empty-DB state this cleanup wants.
+            cur.execute("TRUNCATE events CASCADE")
+            # projection_checkpoints has no FK to events, so CASCADE does not touch it — clear it
+            # explicitly. projection_degraded is already emptied by the CASCADE above, but clear it
+            # explicitly too so the cleanup's intent survives any future FK change.
             cur.execute("DELETE FROM projection_checkpoints")
             cur.execute("DELETE FROM projection_degraded")
