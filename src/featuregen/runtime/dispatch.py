@@ -143,7 +143,16 @@ def process_one(
                 status="duplicate", message_id=claim.message_id, queue_id=claim.id
             )
 
-        handler = registry.get(claim.handler)
+        # Resolve the handler under the poison guard: an unknown handler name is a
+        # DETERMINISTIC failure (never retryable) — route straight to DLQ (review BLOCKER #2).
+        try:
+            handler = registry.get(claim.handler)
+        except KeyError as exc:
+            fail_permanent(conn, claim.id, error=str(exc))
+            return ProcessOutcome(
+                status="permanent", message_id=claim.message_id, queue_id=claim.id
+            )
+
         handler_conn = handler_conn_factory(conn)
         timed_out = False
         try:
@@ -186,6 +195,16 @@ def process_one(
             fail_permanent(conn, claim.id, error=result.error or "permanent")
             return ProcessOutcome(
                 status="permanent", message_id=claim.message_id, queue_id=claim.id
+            )
+        except Exception as exc:  # noqa: BLE001 — the poison backstop
+            # A handler that raised (or _build_context that could not resolve the triggering
+            # event) is treated as a TRANSIENT delivery failure: bump attempts + backoff, DLQ
+            # at the budget. This is what prevents the infinite poison-retry (review BLOCKER #2).
+            # ConcurrencyError is handled above; HandlerTimeout returned above; anything here is
+            # an unexpected fault, retried a bounded number of times then DLQ'd.
+            fail_retryable(conn, claim.id, error=f"handler fault: {exc!r}")
+            return ProcessOutcome(
+                status="retryable", message_id=claim.message_id, queue_id=claim.id
             )
         finally:
             # Close the dedicated handler connection only if the handler actually returned. On
