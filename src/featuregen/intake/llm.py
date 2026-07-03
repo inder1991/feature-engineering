@@ -77,6 +77,9 @@ STATUS_OK = "ok"
 STATUS_REPAIRED = "repaired"
 STATUS_RETRIED = "retried"
 STATUS_FAILED = "failed_into_clarification"
+# N7 — only a SUCCESSFUL call is idempotent-reusable. A FAILED (transient/refusal) record must NOT be
+# replayed forever for the same identity; find_llm_call skips it so call_llm re-drives.
+_REUSABLE_STATUSES = frozenset({STATUS_OK, STATUS_REPAIRED, STATUS_RETRIED})
 
 
 def compute_input_hash(inputs: Mapping[str, Any]) -> str:
@@ -416,7 +419,13 @@ def find_llm_call(
             and row["redaction_version"] == redaction_version
             and _canonical(row["generation_settings"]) == target_gs
         ):
-            return _record_from_row(row)
+            rec = _record_from_row(row)
+            # N7 — reuse ONLY a SUCCESSFUL record. A FAILED call is NOT replayed for the same identity;
+            # skip it so call_llm re-drives (record_llm_call is append-only, so a later successful record
+            # coexists and is reused thereafter). Rows are ordered created_at ASC — the first successful
+            # match wins.
+            if rec.validation_result.get("result") in _REUSABLE_STATUSES:
+                return rec
     return None
 
 

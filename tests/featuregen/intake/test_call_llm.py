@@ -107,6 +107,26 @@ def test_refusal_fails_into_clarification_and_is_recorded(db):
     assert load_stream(db, "feature_contract", run_id)[0].type == "LLM_CALL_RECORDED"
 
 
+def test_failed_call_is_not_reused_and_retry_succeeds(db):
+    """N7: a FAILED (transient/refusal) llm_call is NOT replayed forever for the same identity. An
+    IDENTICAL retry re-drives (never served the cached failure) and, on success, records a fresh usable
+    record that is reused thereafter. Before the fix, find_llm_call reused the failed record."""
+    _setup(db)
+    run_id = new_run_id()
+    failing = FakeLLM()
+    failing.script(task="structure_intent", prompt_id="intake.v1",
+                   responses=[FakeResponse(output={}, provider_status="refusal")])
+    r1 = call_llm(db, failing, _req(), run_id=run_id, actor=service_actor())
+    assert r1.status == STATUS_FAILED
+    # an identical retry is NOT served the cached failure — it re-drives and succeeds
+    r2 = call_llm(db, _fake_ok(), _req(), run_id=run_id, actor=service_actor())
+    assert r2.status == STATUS_OK, "a transient failure must be retryable, not replayed forever (N7)"
+    assert r2.call_ref != r1.call_ref  # a fresh successful record, not the cached failure
+    # a further identical call NOW reuses the SUCCESSFUL record (idempotent — no provider call)
+    r3 = call_llm(db, _fake_ok(), _req(), run_id=run_id, actor=service_actor())
+    assert r3.call_ref == r2.call_ref
+
+
 def test_egress_violation_hard_fails_and_security_audits(db):
     _setup(db)
     run_id = new_run_id()
