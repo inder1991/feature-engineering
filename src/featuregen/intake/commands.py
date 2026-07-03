@@ -945,7 +945,19 @@ def submit_intent(conn: DbConn, cmd: Command) -> CommandResult:
     #    produces the LLM-safe text separately).
     raw_input_classification = _classify_raw_input(intent_text, args.get("raw_input_classification"))
     raw_input_ref = mint_id("blob")
-    write_blob(conn, raw_input_ref, {"raw_input": intent_text})  # resolvable via read_blob(raw_input_ref)
+    _raw_body = {"raw_input": intent_text}
+    _raw_bytes = json.dumps(_raw_body, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    write_blob(conn, raw_input_ref, _raw_body)  # resolvable via read_blob(raw_input_ref)
+    # N12 — the raw intent is PII: register it in blob_index as the ERASABLE-PII class (right-to-erasure /
+    # crypto-shred eligible via kms_key_id), referenced + live. Without a blob_index row, governance GC
+    # cannot track it AND replay would misclassify the blob as 'shredded' (replay defaults absent → shredded).
+    conn.execute(
+        "INSERT INTO blob_index "
+        "  (blob_id, object_key, content_hash, classification, referenced, status, size_bytes) "
+        "VALUES (%s, %s, %s, 'pii-erasable', true, 'live', %s)",
+        (raw_input_ref, f"raw-intent/{raw_input_ref}.json",
+         compute_content_hash(_raw_bytes), len(_raw_bytes)),
+    )
 
     # 3. Deterministic banking-boundary classification (§5.4, over the read-only BankingDomainCatalog)
     #    runs BEFORE INTENT_SUBMITTED so the event can persist classification.as_mapping() (R9). An

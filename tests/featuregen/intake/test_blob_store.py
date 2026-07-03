@@ -160,3 +160,10 @@ def test_submit_intent_raw_input_ref_resolves_to_raw_intent(db, intake_env):
     assert read_blob(db, raw_input_ref) == {"raw_input": _INTENT}
     # …and it was NOT inlined into the event payload (§9.4)
     assert _INTENT not in json.dumps(submitted.payload)
+    # N12 — the raw intent is tracked in blob_index as the ERASABLE-PII class (crypto-shred / GC eligible),
+    # referenced + live — never untracked (which replay would misclassify as 'shredded').
+    row = db.execute(
+        "SELECT classification, status, referenced FROM blob_index WHERE blob_id=%s", (raw_input_ref,)
+    ).fetchone()
+    assert row is not None
+    assert row[0] == "pii-erasable" and row[1] == "live" and row[2] is True
