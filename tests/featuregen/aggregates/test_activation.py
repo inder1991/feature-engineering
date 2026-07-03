@@ -437,6 +437,75 @@ def test_deactivate_expired_version_removes_active_entry(db):
     assert again.accepted and again.produced_event_ids == ()
 
 
+def test_experiment_expiry_auto_deactivates_end_to_end(db):
+    # MAJOR #22 end-to-end: a due experiment_expiry timer must ACTUALLY auto-deactivate the
+    # ACTIVE_EXPERIMENTAL version. poll_due_timers -> fire_timer enqueues a `timer.experiment_expiry`
+    # work message carrying the feature refs + the command it names; dispatching that message
+    # through the command-path bridge runs `deactivate_expired_version`, which emits VERSION_EXPIRED
+    # and clears the CAS active slot. Before the fix the timer routed to a missing handler AND
+    # dropped its payload, so deactivation never happened (design §5.8 guarantee was inert).
+    from featuregen.aggregates.activation import dispatch_timer_command
+    from featuregen.aggregates.commands import register_phase06_commands
+    from featuregen.commands.registry import clear_registry
+    from featuregen.runtime.queue import claim_one, complete
+    from featuregen.runtime.timers import fire_timer, poll_due_timers
+
+    clear_registry()
+    register_phase06_commands()
+    try:
+        past = datetime(2020, 1, 1, tzinfo=UTC)  # timer fire_at (already due)
+        now = datetime(2030, 1, 1, tzinfo=UTC)
+        fid, uc = "feat_exp_e2e", "fraud"
+        v1 = _mint(db, fid, "run1", approval="EXPERIMENTAL", expires=past)
+        apply_activation(
+            db,
+            feature_id=fid,
+            feature_version_id=v1,
+            use_case=uc,
+            base_feature_version_id=None,
+            approval_type="EXPERIMENTAL",
+            actor=make_actor(),
+            expires_at=past,
+        )
+        assert (
+            db.execute(
+                "SELECT activation_state FROM feature_active_versions "
+                "WHERE feature_id=%s AND use_case=%s",
+                (fid, uc),
+            ).fetchone()[0]
+            == "ACTIVE_EXPERIMENTAL"
+        )
+
+        # poll -> fire the due timer
+        claimed = poll_due_timers(db, owner="t1", lease_seconds=30, batch=10, now=now)
+        tid = db.execute(
+            "SELECT timer_id FROM timers WHERE aggregate_id=%s AND kind='experiment_expiry'",
+            (fid,),
+        ).fetchone()[0]
+        assert tid in claimed
+        assert fire_timer(db, tid, now=now).fired is True
+
+        # dispatch the enqueued command message through the command-path bridge (the message has no
+        # run_id/event_id, so it CANNOT flow through process_one's step path).
+        claim = claim_one(db, owner="w1")
+        assert claim.handler == "timer.experiment_expiry"
+        assert claim.payload["feature_version_id"] == v1 and claim.payload["use_case"] == uc
+        result = dispatch_timer_command(db, claim.payload)
+        complete(db, claim.id)
+        assert result.accepted
+
+        # deactivation ACTUALLY happened: VERSION_EXPIRED emitted + active slot cleared
+        assert load_stream(db, "feature", fid)[-1].type == "VERSION_EXPIRED"
+        assert (
+            db.execute(
+                "SELECT count(*) FROM feature_active_versions WHERE feature_id=%s", (fid,)
+            ).fetchone()[0]
+            == 0
+        )
+    finally:
+        clear_registry()
+
+
 def _mint_full(db, feature_id, run, *, stamp, approval="PRODUCTION", blocked=(), tier="low"):
     return mint_feature_version(
         db,

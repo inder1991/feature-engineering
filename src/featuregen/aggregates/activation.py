@@ -10,6 +10,7 @@ from psycopg.types.json import Jsonb
 from featuregen.aggregates._append import append
 from featuregen.aggregates.feature_versions import load_governance_attributes, mint_feature_version
 from featuregen.aggregates.ids import mint_id
+from featuregen.commands.registry import get_command
 from featuregen.contracts import (
     Command,
     CommandResult,
@@ -446,3 +447,42 @@ def deactivate_expired_version_command(conn: DbConn, cmd: Command) -> CommandRes
         (feature_id, use_case),
     )
     return CommandResult(accepted=True, aggregate_id=feature_id, produced_event_ids=(evt.event_id,))
+
+
+# Trusted internal identity for timer-initiated commands: the durable timer runtime is the actor
+# (there is no human/service token behind an auto-expiry). Recorded on the VERSION_EXPIRED event.
+_TIMER_RUNTIME_ACTOR = IdentityEnvelope(
+    subject="service:timer-runtime",
+    actor_kind="service",
+    authenticated=True,
+    auth_method="internal",
+    role_claims=(),
+)
+
+
+def dispatch_timer_command(conn: DbConn, payload: Mapping[str, Any]) -> CommandResult:
+    """Consume a fired timer->queue message whose stored payload NAMES a §4.4 command action
+    (the MAJOR #22 bridge for `timer.experiment_expiry`).
+
+    A message enqueued by `fire_timer` is NOT a §5.1 run-stream STEP event: it has no run_id /
+    triggering event_id, so it CANNOT flow through `process_one`'s HandlerContext path
+    (`_build_context` requires `payload["event_id"]` and a `run` stream). Instead the timer's
+    stored payload carries the feature refs plus the command action to run (`handler`); this
+    bridge rebuilds the Command and dispatches it through the ESTABLISHED command registry
+    (`get_command`) — the same §4.4 dispatch every lifecycle command uses, NOT a new mechanism.
+    For `experiment_expiry` that command is the already-catalogued `deactivate_expired_version`,
+    which emits VERSION_EXPIRED and clears the CAS active-map slot. Idempotent under at-least-once
+    queue redelivery: the command re-checks the slot and no-ops once it is already cleared."""
+    action = payload["handler"]
+    cmd = Command(
+        action=action,
+        aggregate="feature",
+        aggregate_id=payload["feature_id"],
+        args={
+            "feature_version_id": payload["feature_version_id"],
+            "use_case": payload["use_case"],
+        },
+        actor=_TIMER_RUNTIME_ACTOR,
+        idempotency_key=f"timer-cmd:{payload['timer_id']}",
+    )
+    return get_command(action)(conn, cmd)
