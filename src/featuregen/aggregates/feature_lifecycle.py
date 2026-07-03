@@ -109,8 +109,15 @@ def record_revalidation_outcome_command(conn: DbConn, cmd: Command) -> CommandRe
     )
     produced.append(evt.event_id)
     if outcome == "deprecate":
+        # Scope to the revalidated version's slot(s). feature_active_versions' grain is
+        # (feature_id, use_case), so an unscoped UPDATE would deprecate EVERY use_case/version of
+        # the feature on a single outcome. This command carries no use_case (see the
+        # REVALIDATION_OUTCOME_RECORDED payload / require_revalidation flow), so we scope by the
+        # tightest available discriminator, feature_version_id — mirroring _deprecate_now
+        # (consumers.py) minus the use_case term. Follow-up: carry use_case to reach that grain.
         conn.execute(
-            "UPDATE feature_active_versions SET activation_state='DEPRECATED' WHERE feature_id=%s",
-            (feature_id,),
+            "UPDATE feature_active_versions SET activation_state='DEPRECATED' "
+            "WHERE feature_id=%s AND feature_version_id=%s",
+            (feature_id, cmd.args.get("feature_version_id")),
         )
     return CommandResult(accepted=True, aggregate_id=feature_id, produced_event_ids=tuple(produced))

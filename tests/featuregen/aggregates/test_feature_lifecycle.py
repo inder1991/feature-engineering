@@ -144,3 +144,59 @@ def test_deprecate_outcome_sets_active_map_deprecated(db):
         "SELECT activation_state FROM feature_active_versions WHERE feature_id='feat_d'"
     ).fetchone()[0]
     assert state == "DEPRECATED"
+
+
+def test_deprecate_outcome_scopes_to_revalidated_version(db):
+    # Two slots under the SAME feature but DIFFERENT use_cases + versions. A revalidation
+    # "deprecate" outcome for ONE version must deprecate only that slot — never every use_case
+    # of the feature (feature_active_versions grain is (feature_id, use_case)).
+    for fv in ("fv_p", "fv_q"):
+        db.execute(
+            "INSERT INTO feature_versions (feature_version_id, feature_id, produced_by_run, "
+            "verification_stamp, risk_tier, approval_type, content_hash) "
+            "VALUES (%s,'feat_e','run_e','DATA-CHECKED','low','PRODUCTION','sha256:1')",
+            (fv,),
+        )
+    db.execute(
+        "INSERT INTO feature_active_versions (feature_id, use_case, feature_version_id, "
+        "activation_state, activated_seq) VALUES "
+        "('feat_e','fraud','fv_p','PRODUCTION',1),"
+        "('feat_e','credit','fv_q','PRODUCTION',2)"
+    )
+    raise_monitoring_alert_command(
+        db,
+        make_cmd(
+            "raise_monitoring_alert",
+            "feature",
+            "feat_e",
+            {"feature_version_id": "fv_p"},
+            actor=_svc(),
+        ),
+    )
+    require_revalidation_command(
+        db,
+        make_cmd(
+            "require_revalidation",
+            "feature",
+            "feat_e",
+            {"feature_version_id": "fv_p"},
+            actor=_svc(),
+        ),
+    )
+    record_revalidation_outcome_command(
+        db,
+        make_cmd(
+            "record_revalidation_outcome",
+            "feature",
+            "feat_e",
+            {"feature_version_id": "fv_p", "outcome": "deprecate"},
+            actor=_svc(),
+        ),
+    )
+    states = dict(
+        db.execute(
+            "SELECT use_case, activation_state FROM feature_active_versions WHERE feature_id='feat_e'"
+        ).fetchall()
+    )
+    assert states["fraud"] == "DEPRECATED"  # the revalidated version's slot
+    assert states["credit"] == "PRODUCTION"  # the unrelated version's slot must survive
