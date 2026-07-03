@@ -376,6 +376,12 @@ def compose(conn: psycopg.Connection) -> tuple[object, list[Projection]]:
     seed_overlay_authz(conn)
 
     projections: list[Projection] = [StagePrimaryProjection(), OverlayProjection()]
+    # Register the runner-driven projections for repair so resolve_degraded can re-run one to
+    # PROVE health before clearing its degraded marker (SP-0.5 round-2 prove-health).
+    from featuregen.projections.runner import register_projection_for_repair
+
+    for projection in projections:
+        register_projection_for_repair(projection.name, projection)
     return registry, projections
 
 

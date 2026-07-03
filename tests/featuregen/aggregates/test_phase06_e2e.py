@@ -174,14 +174,29 @@ def test_every_catalog_action_is_registered():
 
 
 def test_resolve_degraded_unblocks_run_through_execute_command(db):
+    # A no-op projection registered for repair makes health trivially provable so resolve succeeds;
+    # the prove-health refuse/verify branches live in tests/projections/test_fail_closed.py.
+    from featuregen.projections.runner import register_projection_for_repair
+
+    class _NoopRun:
+        name = "run"
+        is_analytics = False
+
+        def reset(self, conn):
+            pass
+
+        def apply(self, conn, event):
+            pass
+
+    register_projection_for_repair("run", _NoopRun())
     db.execute(
         "INSERT INTO projection_degraded (projection_name, aggregate, aggregate_id, reason, "
-        "poison_event_id, poison_seq) VALUES ('run','run','run_rd','boom',NULL,1)"
+        "poison_event_id, poison_seq) VALUES ('run','run','run_rd','boom',NULL,0)"
     )
     # a normal command on a degraded run is blocked...
     blocked = execute_command(db, make_cmd("park", "run", "run_rd", {"owner": "o"}))
     assert blocked.accepted is False and "degraded" in blocked.denied_reason
-    # ...resolve_degraded bypasses the block and clears the flag...
+    # ...resolve_degraded proves health, clears the marker, and audits...
     cleared = execute_command(db, make_cmd("resolve_degraded", "run", "run_rd", {}))
     assert cleared.accepted
     # ...and the run accepts commands again.

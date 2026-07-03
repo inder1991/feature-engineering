@@ -171,15 +171,54 @@ def source_changed_revalidate_command(conn: DbConn, cmd: Command) -> CommandResu
 
 def resolve_degraded_command(conn: DbConn, cmd: Command) -> CommandResult:
     """Clear the degraded marker(s) for an aggregate after remediation (§3.6/§4.4), un-blocking its
-    commands. Deletes from `projection_degraded` — the ledger the runner writes on a poison halt and
-    that `execute_command` now enforces (SP-0.5 round-2 B1). `execute_command` special-cases this
-    action so it is NOT itself blocked by the degraded gate.
+    commands — but PROVE HEALTH first (SP-0.5 round-2). For each `projection_degraded` marker on the
+    aggregate, re-run the named projection and require it to advance PAST the recorded poison_seq;
+    only then delete the markers and record a remediation audit event. `execute_command` enforces
+    this ledger (B1) and special-cases this action so it is NOT itself blocked by the degraded gate.
 
-    NOTE: this is the minimal marker-clear so the block/unblock cycle is consistent. A follow-up
-    increment adds prove-health-before-clear (re-run the projection past the poison and only clear
-    if it advances) + a generic security_audit remediation record."""
+    Fail-closed: no marker for the aggregate, an unregistered projection, or a projection that still
+    cannot advance past the poison → `accepted=False` with the marker UNCHANGED (never a silent
+    unblock, never an exception through execute_command)."""
+    from featuregen.projections.runner import advance_projection_past, projection_for_repair
+    from featuregen.security.audit import record_security_event
+
+    aid = cmd.aggregate_id
+    markers = conn.execute(
+        "SELECT projection_name, poison_seq FROM projection_degraded "
+        "WHERE aggregate = %s AND aggregate_id = %s",
+        (cmd.aggregate, aid),
+    ).fetchall()
+    if not markers:
+        return CommandResult(
+            accepted=False, aggregate_id=aid or "",
+            denied_reason="no degraded marker for this aggregate",
+        )
+    for projection_name, poison_seq in markers:
+        projection = projection_for_repair(projection_name)
+        if projection is None:
+            return CommandResult(
+                accepted=False, aggregate_id=aid or "",
+                denied_reason=f"cannot prove health: projection '{projection_name}' "
+                              "is not registered for repair",
+            )
+        if not advance_projection_past(conn, projection, poison_seq):
+            return CommandResult(
+                accepted=False, aggregate_id=aid or "",
+                denied_reason=f"projection '{projection_name}' still cannot advance past the "
+                              "poison; remediate the cause before resolving",
+            )
     conn.execute(
         "DELETE FROM projection_degraded WHERE aggregate = %s AND aggregate_id = %s",
-        (cmd.aggregate, cmd.aggregate_id),
+        (cmd.aggregate, aid),
     )
-    return CommandResult(accepted=True, aggregate_id=cmd.aggregate_id or "")
+    record_security_event(
+        conn,
+        event_type="DEGRADED_RESOLVED",
+        actor=cmd.actor,
+        attempted_action="resolve_degraded",
+        decision="flagged",
+        aggregate=cmd.aggregate,
+        aggregate_id=aid,
+        reason="operator remediation proven healthy (projection advanced past poison)",
+    )
+    return CommandResult(accepted=True, aggregate_id=aid or "")

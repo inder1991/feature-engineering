@@ -149,6 +149,40 @@ def rebuild_projection(conn: DbConn, projection: Projection) -> None:
         pass
 
 
+_REPAIR_REGISTRY: dict[str, Projection] = {}
+
+
+def register_projection_for_repair(name: str, projection: Projection) -> None:
+    """Register a projection under its name so `resolve_degraded` can re-run it to PROVE health
+    before clearing a degraded marker (SP-0.5 round-2). Idempotent — last registration wins."""
+    _REPAIR_REGISTRY[name] = projection
+
+
+def projection_for_repair(name: str) -> Projection | None:
+    """The projection registered under `name`, or None if none is (resolve then fail-closes)."""
+    return _REPAIR_REGISTRY.get(name)
+
+
+def _checkpoint_seq(conn: DbConn, name: str) -> int:
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            "SELECT checkpoint_seq FROM projection_checkpoints WHERE projection_name = %s",
+            (name,),
+        )
+        row = cur.fetchone()
+    return int(row["checkpoint_seq"]) if row else 0
+
+
+def advance_projection_past(conn: DbConn, projection: Projection, poison_seq: int) -> bool:
+    """Re-run the projection and report whether it advanced PAST `poison_seq` — i.e. the poison
+    event now applies (remediated). A projection that is STILL poisoned re-halts BEFORE poison_seq
+    (run_projection re-marks it), leaving the checkpoint < poison_seq, so this returns False. This
+    is how `resolve_degraded` proves health before clearing a marker instead of trusting the
+    operator blindly."""
+    run_projection(conn, projection)
+    return _checkpoint_seq(conn, projection.name) >= poison_seq
+
+
 def projection_lag(conn: DbConn, name: str) -> int:
     """Live head_seq - checkpoint_seq for the named projection."""
     head = _head_seq(conn)
