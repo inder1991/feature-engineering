@@ -144,6 +144,70 @@ def test_supersede_updates_active_and_keeps_prior_immutable(db):
     assert load_stream(db, "feature", "feat_c")[-1].type == "VERSION_SUPERSEDED"
 
 
+def test_supersede_requires_expected_prior(db):
+    """supersede must CAS on expected_prior; omitting it must be denied, not an unconditional
+    overwrite of the active slot (review MAJOR #14 — parity with activate's mandatory CAS)."""
+    v1 = _mint(db, "feat_g", "run1")
+    apply_activation(
+        db,
+        feature_id="feat_g",
+        feature_version_id=v1,
+        use_case="fraud",
+        base_feature_version_id=None,
+        approval_type="PRODUCTION",
+        actor=make_actor(),
+    )
+    v2 = _mint(db, "feat_g", "run2", base=v1)
+    result = supersede_command(
+        db,
+        make_cmd(
+            "supersede",
+            "feature",
+            "feat_g",
+            {"feature_version_id": v2, "use_case": "fraud"},  # no expected_prior
+        ),
+    )
+    assert result.accepted is False
+    assert "expected_prior" in (result.denied_reason or "")
+    # no clobber: the production-active slot still holds v1, and no event was appended.
+    row = db.execute(
+        "SELECT feature_version_id FROM feature_active_versions "
+        "WHERE feature_id='feat_g' AND use_case='fraud'"
+    ).fetchone()
+    assert row[0] == v1
+    assert load_stream(db, "feature", "feat_g")[-1].type != "VERSION_SUPERSEDED"
+
+
+def test_supersede_stale_expected_prior_conflicts(db):
+    v1 = _mint(db, "feat_h", "run1")
+    apply_activation(
+        db,
+        feature_id="feat_h",
+        feature_version_id=v1,
+        use_case="fraud",
+        base_feature_version_id=None,
+        approval_type="PRODUCTION",
+        actor=make_actor(),
+    )
+    v2 = _mint(db, "feat_h", "run2", base=v1)
+    result = supersede_command(
+        db,
+        make_cmd(
+            "supersede",
+            "feature",
+            "feat_h",
+            {"feature_version_id": v2, "use_case": "fraud", "expected_prior": "fv_stale_nonmatch"},
+        ),
+    )
+    assert result.accepted is False  # CAS mismatch, no clobber
+    row = db.execute(
+        "SELECT feature_version_id FROM feature_active_versions "
+        "WHERE feature_id='feat_h' AND use_case='fraud'"
+    ).fetchone()
+    assert row[0] == v1
+    assert load_stream(db, "feature", "feat_h")[-1].type != "VERSION_SUPERSEDED"
+
+
 def test_retier_emits_event_without_mutating_version(db):
     v1 = _mint(db, "feat_d", "run1", tier="high")
     res = retier_command(
