@@ -55,6 +55,9 @@ class LLMResult:
     self_reported_scores: dict
     call_ref: str               # "" from a provider single-shot; the real llmc_ ref from call_llm
     status: str                 # PROVIDER_* single-shot; STATUS_* from call_llm
+    # N9 — provider-reported usage/cost (input/output tokens, $), captured onto the immutable llm_call so
+    # per-call LLM cost is auditable. The real adapter fills this from the provider usage; FakeLLM {} by default.
+    cost_metadata: dict = field(default_factory=dict)
 
 
 @runtime_checkable
@@ -99,6 +102,7 @@ class FakeResponse:
     output: dict
     self_reported_scores: dict = field(default_factory=dict)
     provider_status: str = PROVIDER_OK
+    cost_metadata: dict = field(default_factory=dict)  # N9 — simulated provider usage/cost for tests
 
 
 class FakeLLM:
@@ -158,6 +162,7 @@ class FakeLLM:
             self_reported_scores=dict(resp.self_reported_scores),
             call_ref="",
             status=resp.provider_status,
+            cost_metadata=dict(resp.cost_metadata),
         )
 
 
@@ -231,7 +236,7 @@ def drive_structured_call(
                     status=status,
                     validation_result={"result": status},
                     repair_attempts=tuple(attempts),
-                    cost_metadata={},
+                    cost_metadata=dict(resp.cost_metadata),  # N9 — capture provider usage/cost
                     security_audit_reason=None,
                 )
         if ps == PROVIDER_INVALID:

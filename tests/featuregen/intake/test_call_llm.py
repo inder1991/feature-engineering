@@ -70,6 +70,21 @@ def test_ok_records_and_emits_event(db):
     assert stream[0].payload["status"] == STATUS_OK
 
 
+def test_provider_cost_metadata_is_captured_on_the_record(db):
+    """N9: provider-reported usage/cost is captured onto the immutable llm_call record so per-call LLM
+    cost is auditable. Before the fix, cost_metadata was always {} (usage was never captured)."""
+    _setup(db)
+    run_id = new_run_id()
+    fake = FakeLLM()
+    fake.script(task="structure_intent", prompt_id="intake.v1",
+                responses=[FakeResponse(output={"entity": "customer"},
+                                        cost_metadata={"input_tokens": 120, "output_tokens": 30, "usd": "0.0021"})])
+    res = call_llm(db, fake, _req(), run_id=run_id, actor=service_actor())
+    assert res.status == STATUS_OK
+    rec = read_llm_call(db, res.call_ref)
+    assert rec.cost_metadata == {"input_tokens": 120, "output_tokens": 30, "usd": "0.0021"}
+
+
 def test_idempotent_reuse_no_double_charge(db):
     _setup(db)
     run_id = new_run_id()
