@@ -272,3 +272,28 @@ def test_fresh_rejected_reports_rejected_not_missing(db):
     assert resolved.status == "REJECTED"
     assert resolved.value is None
     assert resolved.reason_if_missing == "rejected"
+
+
+def test_verified_past_expiry_blocks_expired_pending_reverify(db):
+    # SP-1.5 Task 3: a VERIFIED overlay fact past its expires_at must fail closed (the async poller
+    # may not have STALED it yet) — blocked REVERIFY, surfacing the current value as prior_value.
+    from datetime import UTC, datetime, timedelta
+
+    key = fact_key(_REF, "availability_time")
+    exp = datetime(2026, 6, 1, tzinfo=UTC)
+    _seed_state(
+        db, key, status="VERIFIED", value={"column": "origination_ts"},
+        confirmed_event_id="evt_c", expires_at=exp,
+    )
+    adapter = StubCatalog(fact=None)  # no authoritative catalog fact -> overlay path
+
+    blocked = resolve_fact(db, adapter, _REF, "availability_time", now=exp + timedelta(days=1))
+    assert blocked.status == "REVERIFY"
+    assert blocked.reason_if_missing == "expired_pending_reverify"
+    assert blocked.value is None and blocked.prior_value == {"column": "origination_ts"}
+    assert blocked.expires_at == exp.isoformat()
+    assert blocked.provenance["confirmed_event_id"] == "evt_c"
+    assert blocked.provenance["catalog_source"] == "enterprise"
+
+    served = resolve_fact(db, adapter, _REF, "availability_time", now=exp - timedelta(days=1))
+    assert served.status == "VERIFIED" and served.value == {"column": "origination_ts"}

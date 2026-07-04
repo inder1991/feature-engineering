@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import UTC
+from datetime import UTC, datetime
 from typing import Literal
 
 from psycopg.rows import dict_row
@@ -27,6 +27,7 @@ from featuregen.overlay.projection import read_proposal
 
 _REASON_MISSING = "no_confirmed_fact"
 _REASON_CATALOG_INVALID = "catalog_value_invalid"
+_REASON_EXPIRED = "expired_pending_reverify"  # SP-1.5 Task 3: read-time time-expiry guard
 _REASON_BY_STATUS = {
     "DRAFT": "draft_unconfirmed",
     "PARTIALLY_CONFIRMED": "partial_confirmation_pending",
@@ -140,9 +141,12 @@ def _overlay_verified(row, obj, fact_type: FactType, use_case) -> ResolvedFact:
 
 
 def _overlay_blocked(
-    status: FactStatus, reason, obj, fact_type: FactType, use_case, prior_value=None
+    status: FactStatus, reason, obj, fact_type: FactType, use_case, prior_value=None,
+    *, expires_at=None, provenance=None,
 ) -> ResolvedFact:
-    # Any non-VERIFIED overlay state (in-flight proposal or blocked fact state) -> no value.
+    # Any non-VERIFIED overlay state (in-flight proposal or blocked fact state) -> no value. A
+    # blocked result carries expires_at + provenance {confirmed_event_id, catalog_source} when known
+    # (SP-1.5 Task 3) so SP-3 / operators can distinguish expired / drift-stale / reverify / missing.
     return ResolvedFact(
         value=None,
         status=status,
@@ -150,10 +154,10 @@ def _overlay_blocked(
         catalog_object=obj,
         fact_type=fact_type,
         use_case=use_case,
-        provenance=None,
+        provenance=provenance,
         confirmed_by=(),
         confirmed_at=None,
-        expires_at=None,
+        expires_at=expires_at,
         reason_if_missing=reason,
         prior_value=prior_value,
     )
@@ -165,7 +169,12 @@ def resolve_fact(
     ref: CatalogObjectRef | ApprovedJoinRef,
     fact_type: FactType,
     use_case: str | None = None,
+    *,
+    now: datetime | None = None,
 ) -> ResolvedFact:
+    # `now` is an optional injected clock (SP-1.5 Task 3) — deterministic tests + one clock basis
+    # shared with the pollers. Compare expiry in PYTHON (not SQL) to avoid a second clock source.
+    now = now or datetime.now(UTC)
     key = fact_key(ref, fact_type, use_case)
     obj = display_object_ref(ref)
 
@@ -191,7 +200,7 @@ def resolve_fact(
         cur.execute(
             """
             SELECT status, value, confirmers, confirmed_at, expires_at,
-                   prior_value, confirmed_event_id
+                   prior_value, confirmed_event_id, catalog_source
             FROM overlay_fact_state
             WHERE fact_key = %s
             """,
@@ -216,6 +225,19 @@ def resolve_fact(
     # VERIFIED overlay entry -> usable value (the only servable overlay status).
     status = row["status"]
     if status == "VERIFIED":
+        # Read-time TIME-EXPIRY guard (SP-1.5 Task 3): between expires_at passing and the async
+        # expiry poller STALEing the fact, do NOT serve a past-expiry value — fail closed to
+        # REVERIFY, surfacing the current value as read-only prior_value + the expiry context.
+        exp = row["expires_at"]
+        if exp is not None and exp <= now:
+            return _overlay_blocked(
+                "REVERIFY", _REASON_EXPIRED, obj, fact_type, use_case,
+                prior_value=row["value"], expires_at=_iso(exp),
+                provenance={
+                    "confirmed_event_id": row["confirmed_event_id"],
+                    "catalog_source": row["catalog_source"],
+                },
+            )
         return _overlay_verified(row, obj, fact_type, use_case)
 
     # Non-VERIFIED overlay entry -> blocked (fail-closed). REVERIFY/STALE surface the
