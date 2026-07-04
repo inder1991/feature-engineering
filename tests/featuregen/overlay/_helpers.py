@@ -41,6 +41,11 @@ class StubCatalog:
         self._owners[display_object_ref(ref)] = subject
 
     def owner_of(self, ref):
+        # NOTE (SP-1.5 review #10, DEFERRED): production FixtureCatalog/PostgresCatalog fail closed on
+        # a foreign catalog_source; StubCatalog deliberately does NOT yet, because ~45 command tests
+        # pair this default-'fixture' double with other-source refs. Aligning each test's
+        # catalog_source is a mechanical follow-up; until then the F5 boundary is covered by
+        # FixtureCatalog in test_source_qualified.py.
         key = display_object_ref(ref)
         if key in self._owners:
             return self._owners[key]

@@ -66,7 +66,10 @@ def within_renewal_grace(state, now) -> bool:
         grace = current_overlay_config().renewal_grace
     except RuntimeError:
         return False
-    return now >= datetime.fromisoformat(state.expires_at) - grace  # expires_at is an ISO string
+    exp = datetime.fromisoformat(state.expires_at)  # expires_at is an ISO string
+    # STRICTLY pre-expiry (review #3): [expires_at - grace, expires_at). A PAST-expiry fact is not
+    # "renewable" — it goes through the expiry -> REVERIFY flow (reads are already fail-closed there).
+    return exp - grace <= now < exp
 
 
 def referent_gap(adapter, ref, fact_type: str, value) -> str | None:

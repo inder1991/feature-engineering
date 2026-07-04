@@ -43,7 +43,7 @@ def test_within_renewal_grace_math():
     assert within_renewal_grace(st(days=100), now) is False  # far from expiry
     assert within_renewal_grace(st("REVERIFY", days=1), now) is False  # not VERIFIED
     past = OverlayState(status="VERIFIED", expires_at=(now - timedelta(days=1)).isoformat())
-    assert within_renewal_grace(past, now) is True  # past expiry is still re-confirmable
+    assert within_renewal_grace(past, now) is False  # past expiry -> expiry/reverify, not renewal
 
 
 def _stack(conn, ref, owner):

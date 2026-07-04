@@ -131,9 +131,16 @@ def detect_catalog_changes(
         if _type_fingerprint(current[r]) != prior[r]["type_fingerprint"]:
             changes.append(Change(csource, r, "type_change", current[r].native_oid))
 
-    for ch in changes:
-        if ch.kind in ("drop", "type_change", "rename"):
-            _stale_dependents(conn, adapter, ch, actor=actor)
+    try:
+        for ch in changes:
+            if ch.kind in ("drop", "type_change", "rename"):
+                _stale_dependents(conn, adapter, ch, actor=actor)
+    except ConcurrencyError:
+        # A concurrent confirm conflicted with a dependent stale (review #7). Return WITHOUT
+        # advancing the snapshot or watermark so the next scan re-detects + re-stales (idempotent:
+        # an already-STALE fact is a CAS no-op). Any partial STALED appends from this scan commit
+        # harmlessly; the un-advanced snapshot is what guarantees the change is not laundered.
+        return changes
 
     _save_snapshot(conn, csource, current)
     # Atomic completion (SP-1.5 Task 4): the watermark advances in the SAME transaction as the
@@ -168,7 +175,11 @@ def _stale_one(conn: DbConn, adapter, fact_key: str, *, change_ref: str, actor) 
             expected_version=stream[-1].stream_version,
         )
     except ConcurrencyError:
-        return None  # a concurrent confirm advanced the stream
+        # A concurrent confirm bumped the stream mid-scan. Do NOT swallow-and-continue (review #7):
+        # re-raise so detect_catalog_changes leaves the snapshot + watermark UN-advanced and the
+        # change is re-detected next scan, instead of laundering it (the fact would stay VERIFIED
+        # referencing a dropped/retyped object until TTL).
+        raise
     ref = _ref_from_payload(stream[0].payload["catalog_object_ref"])
     authority = resolve_authority(conn, adapter, ref, state.fact_type)
     open_reverify_task(

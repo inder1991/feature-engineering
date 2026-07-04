@@ -12,6 +12,14 @@
 -- checkpoint_seq==head_seq BEFORE resuming read traffic (until then resolve_fact fails closed for
 -- previously-VERIFIED facts). Applied ONCE by the checksummed schema_migrations ledger.
 
+-- RUNBOOK (review #5): TRUNCATE of overlay_catalog_object discards the drift-detection BASELINE, so
+-- any catalog change that happened between the last pre-migration drift scan and the first
+-- post-migration scan would NOT be detected as a drop (an empty baseline makes everything look
+-- "added") and its dependent facts would replay to VERIFIED un-STALEd. The deploy MUST therefore run
+-- inside a maintenance window with catalog DDL QUIESCED (no schema changes) and run a final drift
+-- scan to head immediately BEFORE this migration; the first post-migration scan then rebuilds the
+-- baseline against an unchanged catalog, so nothing is laundered.
+
 -- Empty first (so ADD COLUMN NOT NULL is legal, and no stale source-less rows survive).
 TRUNCATE overlay_fact_state, overlay_proposal, overlay_fact_dependency, overlay_catalog_object;
 

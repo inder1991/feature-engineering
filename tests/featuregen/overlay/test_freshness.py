@@ -565,3 +565,33 @@ def test_drift_scan_writes_watermark(db):
     assert drift_watermark(db, "pg:core") is None  # none until the first scan completes
     detect_catalog_changes(db, _adapter([]), actor=SERVICE_ACTOR, now=now)
     assert drift_watermark(db, "pg:core") == now
+
+
+def test_drift_concurrent_confirm_does_not_launder(db, monkeypatch):
+    # SP-1.5 review #7: if a concurrent confirm bumps a dependent's stream mid-scan (STALE append ->
+    # ConcurrencyError), detect must NOT advance the snapshot/watermark — the change is re-detected
+    # next scan instead of being laundered (fact left VERIFIED referencing a dropped object).
+    from datetime import UTC, datetime, timedelta
+
+    from featuregen.contracts.errors import ConcurrencyError
+    from featuregen.overlay import catalog_changes
+    from featuregen.overlay.catalog_changes import drift_watermark
+
+    acct = _table_ref("accounts")
+    col = _col_ref("cust_id", "accounts")
+    _seed_verified(db, ref=acct, fact_type="grain",
+                   value={"columns": ["cust_id"], "is_unique": True}, owner="user:owner-a")
+    owners = {acct: "user:owner-a"}
+    t0 = datetime(2026, 6, 1, tzinfo=UTC)
+    before = [_obj(acct, oid="oid-acct"), _obj(col, data_type="text", oid="oid-acct:4")]
+    detect_catalog_changes(db, _adapter(before, owners), actor=SERVICE_ACTOR, now=t0)  # baseline
+    assert drift_watermark(db, "pg:core") == t0
+
+    def _boom(*a, **k):
+        raise ConcurrencyError("concurrent confirm advanced the stream")
+
+    monkeypatch.setattr(catalog_changes, "append_overlay_event", _boom)
+    after = [_obj(acct, oid="oid-acct")]  # accounts.cust_id dropped
+    detect_catalog_changes(db, _adapter(after, owners), actor=SERVICE_ACTOR,
+                           now=t0 + timedelta(hours=1))
+    assert drift_watermark(db, "pg:core") == t0  # NOT advanced -> change re-detected next scan
