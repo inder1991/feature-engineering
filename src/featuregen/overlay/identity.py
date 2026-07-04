@@ -111,7 +111,10 @@ def join_write_error(ref, fact_type: str, value: Mapping, use_case: str | None =
         return None
     if not isinstance(ref, ApprovedJoinRef):
         return "approved_join requires an ApprovedJoinRef"
-    if ref.from_ref.catalog_source != ref.to_ref.catalog_source:
+    # Compare NORMALIZED sources (review #8): fact_key/_ref_tuple treat catalog_source as
+    # case/whitespace-insensitive, so a raw != here would falsely reject a same-source join whose
+    # two endpoints differ only in casing.
+    if _norm(ref.from_ref.catalog_source) != _norm(ref.to_ref.catalog_source):
         return (
             "cross-catalog approved_join disallowed in SP-1.5 "
             f"(from={ref.from_ref.catalog_source}, to={ref.to_ref.catalog_source})"

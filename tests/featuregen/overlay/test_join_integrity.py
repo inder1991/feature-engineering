@@ -81,3 +81,59 @@ def test_projection_source_qualifies_join_dependencies_per_referent(db):
     assert fk in dependents_of(db, "pg:core", "core.orders")      # from-side under pg:core
     assert fk in dependents_of(db, "pg:mart", "core.customers")   # to-side under pg:mart
     assert fk not in dependents_of(db, "pg:core", "core.customers")  # NOT laundered to from-source
+
+
+def _same_owner_adapter():
+    cat = StubCatalog(catalog_source="pg:core")
+    cat.set_owner(_join_ref("pg:core", "pg:core").from_ref, "user:alice")
+    cat.set_owner(_join_ref("pg:core", "pg:core").to_ref, "user:alice")  # same owner -> single path
+    register_catalog_adapter(cat)
+    return cat
+
+
+def _propose_join(db, ref, value):
+    from featuregen.overlay.proposal_commands import propose_fact
+    return propose_fact(db, Command(
+        "propose_fact", "overlay_fact", None,
+        {"ref": ref, "fact_type": "approved_join", "proposed_value": value}, _svc(), "p",
+    )).produced_event_ids[0]
+
+
+def test_confirm_override_rejects_mismatched_join_value(db):
+    # SP-1.5 re-review #1: a same-owner join confirmer must not be able to OVERRIDE with a value
+    # describing a different (here cross-catalog) join than the ref they have authority over.
+    from tests.featuregen._helpers import mint_test_identity
+
+    from featuregen.overlay.confirmation_commands import confirm_fact
+
+    ref = _join_ref("pg:core", "pg:core")
+    _same_owner_adapter()
+    draft = _propose_join(db, ref, _join_value("pg:core", "pg:core"))
+
+    bad = _join_value("pg:core", "pg:mart", to_table="customers")  # cross-catalog / other tables
+    res = confirm_fact(db, Command(
+        "confirm_fact", "overlay_fact", None,
+        {"ref": ref, "fact_type": "approved_join", "target_event_id": draft, "value": bad},
+        mint_test_identity(subject="user:alice", role_claims=("data_owner",)), "c",
+    ))
+    assert not res.accepted
+    assert "does not match ref" in (res.denied_reason or "")
+
+
+def test_confirm_same_owner_join_without_override_still_verifies(db):
+    from tests.featuregen._helpers import mint_test_identity
+
+    from featuregen.overlay.confirmation_commands import confirm_fact
+    from featuregen.overlay.state import fold_overlay_state
+    from featuregen.overlay.store import load_fact
+
+    ref = _join_ref("pg:core", "pg:core")
+    _same_owner_adapter()
+    draft = _propose_join(db, ref, _join_value("pg:core", "pg:core"))
+    res = confirm_fact(db, Command(
+        "confirm_fact", "overlay_fact", None,
+        {"ref": ref, "fact_type": "approved_join", "target_event_id": draft},
+        mint_test_identity(subject="user:alice", role_claims=("data_owner",)), "c",
+    ))
+    assert res.accepted, res.denied_reason
+    assert fold_overlay_state(load_fact(db, fact_key(ref, "approved_join"))).status == "VERIFIED"

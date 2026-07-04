@@ -127,10 +127,17 @@ def confirm_fact(conn: DbConn, cmd: Command) -> CommandResult:
         return CommandResult(
             accepted=False, aggregate_id=key, denied_reason=f"invalid confirmed value: {exc}"
         )
-    # SP-1.5 Task 7: re-confirming a drift-STALEd fact must not re-affirm a value whose object/column
-    # the catalog no longer has (e.g. the dropped column that caused the STALE was never restored).
-    # Config-gated: full SP-1.5 hardening is active only when a deployment has sealed an OverlayConfig.
-    if state.status == "STALE":
+    # SP-1.5 review fix #1: a confirmer may OVERRIDE the value (args["value"]), so the FINAL value —
+    # not just the proposal — must pass the same F4 + ref/value-consistency gate propose_fact and
+    # enter_fact apply. Without this a legitimate owner of the ref's tables could VERIFY a
+    # cross-catalog or different-tables approved_join value under the ref's fact_key.
+    join_err = join_write_error(ref, fact_type, value, use_case)
+    if join_err is not None:
+        return _deny_audited(conn, cmd, key, join_err)
+    # SP-1.5 Task 7 (+ review #5b): re-confirming a drift-STALEd OR expiry-REVERIFY fact must not
+    # re-affirm a value whose object/column the catalog no longer has. Config-gated: full SP-1.5
+    # hardening is active only when a deployment has sealed an OverlayConfig.
+    if state.status in ("STALE", "REVERIFY"):
         try:
             current_overlay_config()
         except RuntimeError:
