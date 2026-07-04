@@ -93,8 +93,9 @@ rows, every time (this is what keeps drift honest).
 
 ### D. Validate + large-change brake (fail closed)
 - **Contract validation:** required fields present per row; type recognized/normalized; `joins_to`
-  resolves to a table present in this upload; no blank table/column. Report the failing rows; a hard
-  failure rejects the whole file (all-or-nothing).
+  resolves to a table present in this upload; no blank table/column. **Per-row** problems quarantine the
+  row (see *Graceful degradation*); only a **structural** failure (a required field unmappable for the
+  whole file) rejects the upload.
 - **Large-change brake:** compare this upload's object set to the source's last snapshot; if it would
   remove more than a threshold (default **30%**) of objects, **HOLD** and require an explicit
   "confirm large change" — so a truncated / wrong-source file can't silently stale the catalog.
@@ -249,16 +250,42 @@ placed, wired-in part of the estate.
 - Every LLM output is either **validated by deterministic code** or **confirmed by a human** before it
   affects the catalog. All LLM calls are audited in the event backbone (prompt, model, output).
 
+## Graceful degradation — the deterministic layer is robust, not brittle
+
+Reading is deterministic and needs no understanding; *understanding* is a separate, flexible ladder
+(aliasing → LLM → human → preserve). So the pipeline never "fails to understand" — when it can't place
+something, it **preserves and flags** rather than dropping, guessing, or halting. **Partial
+understanding is fine: ingest what's understood, preserve what isn't, flag it, never silently lose or
+invent anything.**
+
+- **Unknown *column*** (a header no alias knows and the LLM can't confidently place, e.g. `RGLTRY_CLSS`)
+  → kept as an **`unclassified` attribute** on those columns + queued for mapping. The rest of the file
+  ingests; nothing about the column is discarded or fabricated.
+- **Structural junk rows** (blank / title / subtotal / merged-cell rows that don't fit the grid) →
+  skipped deterministically by the reader.
+- **Unrecognized *value* in a mapped field** (e.g. `type = "blobby"`) → that **row is quarantined**
+  (kept as `unclassified` + review queue), *not* dropped and *not* rejecting the file — the other
+  99% of good rows still ingest.
+
+### "All-or-nothing" ≠ "one bad row rejects everything"
+All-or-nothing protects against a **half-applied catalog**, not against imperfect rows. Precisely: the
+**commit is atomic** (the good rows + the quarantine list land together, or nothing does), but per-row
+problems **quarantine**, they do not reject the file. Only a **structural** failure rejects the whole
+upload — an unreadable file, or a *required* field (`table`/`column`/`type`) that cannot be mapped
+**at all**.
+
 ## Fail-closed behaviors (summary)
 
 | condition | outcome |
 |-----------|---------|
 | unreadable / unknown format | reject; prior catalog intact |
-| contract validation failure | reject with the failing rows |
+| **structural** failure (required field unmappable for the whole file) | reject with the reason |
+| unknown column (unmappable) | **preserve as `unclassified`** + review queue; rest ingests |
+| unrecognized value in a mapped field (per row) | **quarantine that row** (`unclassified` + review); rest ingests |
 | ambiguous load-bearing mapping | hold for a one-time human confirm (onboarding) |
-| oversized removal (> brake threshold) | hold for explicit "confirm large change" |
+| oversized removal / low overlap (> brake) | hold for explicit "confirm large change" |
 | enrichment failure | non-fatal; schema + facts still ingest; re-runnable |
-| any partial state | never — commit is all-or-nothing |
+| partial *catalog* state | never — the commit (good rows + quarantine) is atomic |
 
 ## Open decisions
 
