@@ -18,7 +18,7 @@ from featuregen.overlay.config import OverlayConfig, register_overlay_config
 from featuregen.overlay.identity import CatalogObjectRef, display_object_ref, fact_key
 from featuregen.overlay.projection import OverlayProjection, current_fact
 from featuregen.overlay.state import OverlayState
-from featuregen.overlay.store import append_overlay_event
+from featuregen.overlay.store import append_overlay_event, load_fact
 from featuregen.projections.runner import run_projection
 
 
@@ -170,10 +170,9 @@ def test_renewal_poller_skips_far_from_expiry(db):
     assert fire_due_overlay_renewals(db, now=datetime.now(UTC)) == 0
 
 
-def test_renewal_poller_does_not_reopen_poison_task_after_close(db):
-    # SP-1.5 review #3: after a renewal closes the re-verify task, the poller (reading the LAGGING
-    # projection that still shows the old confirmed_event_id) must NOT reopen a poison task for that
-    # now-superseded version. Idempotency is keyed on (fact_key, target_event_id), not "status=open".
+def test_renewal_poller_skips_just_renewed_fact_while_projection_lags(db):
+    # SP-1.5 re-review #9: a fact that was JUST renewed (stream advanced to a far-future expiry) must
+    # not get a poison task from the LAGGING read model that still shows the old within-grace version.
     from featuregen.overlay.expiry import fire_due_overlay_renewals
 
     ref = CatalogObjectRef(catalog_source="fixture", object_kind="table", schema="core", table="t")
@@ -183,6 +182,35 @@ def test_renewal_poller_does_not_reopen_poison_task_after_close(db):
     now = datetime.now(UTC)
 
     assert fire_due_overlay_renewals(db, now=now) == 1  # opens the renewal task
-    # Simulate the renewal confirm having CLOSED the task (projection still lagging: fs unchanged).
+    # Simulate the renewal: append a new CONFIRMED (far-future expiry) + close the task, but DON'T run
+    # the projection — overlay_fact_state still shows the OLD within-grace version.
+    stream = load_fact(db, key)
+    append_overlay_event(
+        db, fact_key=key, type=facts.OVERLAY_FACT_CONFIRMED,
+        actor=mint_test_identity(subject="user:owner-a", role_claims=("data_owner",)),
+        payload={
+            "value": {"columns": ["id"], "is_unique": True},
+            "confirmers": [{"subject": "user:owner-a", "role": "data_owner"}],
+            "expires_at": (now + timedelta(days=180)).isoformat(),
+            "confirms_event_id": stream[-1].event_id,
+        },
+    )
     db.execute("UPDATE human_tasks SET status = 'cancelled' WHERE fact_key = %s", (key,))
-    assert fire_due_overlay_renewals(db, now=now) == 0  # no poison reopen for the same version
+    # The stream (authoritative) is now far from expiry, so the poller must NOT open a poison task.
+    assert fire_due_overlay_renewals(db, now=now) == 0
+
+
+def test_renewal_poller_reopens_after_cancel_without_renewal(db):
+    # SP-1.5 re-review #3: a task cancelled WITHOUT the fact renewing (stream still within grace) must
+    # be re-prompted — keying on task existence alone would silently suppress the renewal until expiry.
+    from featuregen.overlay.expiry import fire_due_overlay_renewals
+
+    ref = CatalogObjectRef(catalog_source="fixture", object_kind="table", schema="core", table="t")
+    _stack(db, ref, owner="user:owner-a")
+    _register_config(grace_days=14)
+    key = _seed_near_expiry(db, ref=ref, proposed_by="service:seed", confirmer="user:owner-a")
+    now = datetime.now(UTC)
+
+    assert fire_due_overlay_renewals(db, now=now) == 1  # opens the task
+    db.execute("UPDATE human_tasks SET status = 'cancelled' WHERE fact_key = %s", (key,))  # no renewal
+    assert fire_due_overlay_renewals(db, now=now) == 1  # fact still within grace -> re-prompt

@@ -91,13 +91,18 @@ def _apply_expiry(conn: DbConn, adapter, *, fact_key: str, confirmed_event_id: s
 
 
 def fire_due_overlay_renewals(conn: DbConn, *, now: datetime) -> int:
-    """Pre-expiry RENEWAL poller (SP-1.5 Task 6): for each VERIFIED fact inside its renewal grace
-    window (expires_at - renewal_grace <= now < expires_at) with NO open human task yet, open a
-    re-verify task so an owner can RE-CONFIRM *before* expiry — closing the recurring outage window.
-    Idempotent: the NOT EXISTS open-task guard (+ FOR UPDATE SKIP LOCKED) means a re-run opens no
-    duplicate task/timer — the exact case open_reverify_task alone would duplicate (F1). Skips (0)
-    when no OverlayConfig is sealed. The confirm handler's within-grace path (within_renewal_grace)
-    is what accepts the resulting re-confirmation of a still-VERIFIED fact."""
+    """Pre-expiry RENEWAL poller (SP-1.5 Task 6): for each single-owner-renewable VERIFIED fact inside
+    its renewal grace window with NO OPEN human task, open a re-verify task so an owner can RE-CONFIRM
+    *before* expiry — closing the recurring outage window. approved_join is EXCLUDED: a dual-owner
+    join cannot renew in place (confirm_fact denies it) so a pre-expiry task would be a dead end — it
+    re-verifies via the expiry/reverify flow instead (review #12).
+
+    Every candidate is RE-VALIDATED against the AUTHORITATIVE event stream before a task opens: the
+    overlay_fact_state read model LAGS, so a task keyed only on the projection would (a) open a POISON
+    task for a just-renewed, now-superseded version (review #9), or (b) be wrongly suppressed after a
+    prior task was cancelled without renewing (review #3). Checking the stream — still VERIFIED, still
+    within grace — avoids both. Skips (0) when no OverlayConfig is sealed."""
+    from featuregen.overlay._lifecycle import within_renewal_grace
     from featuregen.overlay.config import current_overlay_config
 
     try:
@@ -113,21 +118,14 @@ def fire_due_overlay_renewals(conn: DbConn, *, now: datetime) -> int:
     with conn.cursor(row_factory=dict_row) as cur:
         cur.execute(
             """
-            SELECT fs.fact_key, fs.confirmed_event_id, fs.fact_type
+            SELECT fs.fact_key
             FROM overlay_fact_state fs
             WHERE fs.status = 'VERIFIED' AND fs.expires_at IS NOT NULL
               AND fs.expires_at <= %s AND fs.expires_at > %s
+              AND fs.fact_type <> 'approved_join'
               AND NOT EXISTS (
-                  -- Idempotency keyed on (fact_key, confirmed_event_id), NOT "status = open"
-                  -- (SP-1.5 review fix #3): a renewal confirm CLOSES the old task and advances
-                  -- confirmed_event_id, but overlay_fact_state LAGS — reading a closed-task +
-                  -- lagging-VERIFIED row under "status=open" reopens a POISON task bound to the
-                  -- superseded event, which then disables the next renewal cycle. Keying on the
-                  -- confirmed_event_id (any status) never reopens a task for a version already
-                  -- prompted; the next cycle's new confirmed_event_id gets its own task.
                   SELECT 1 FROM human_tasks ht
-                  WHERE ht.fact_key = fs.fact_key
-                    AND ht.target_event_id = fs.confirmed_event_id
+                  WHERE ht.fact_key = fs.fact_key AND ht.status = 'open'
               )
             FOR UPDATE OF fs SKIP LOCKED
             """,
@@ -139,13 +137,19 @@ def fire_due_overlay_renewals(conn: DbConn, *, now: datetime) -> int:
         stream = load_fact(conn, row["fact_key"])
         if not stream:
             continue
+        state = fold_overlay_state(stream)
+        # Authoritative re-check against the STREAM (the read model lags): only prompt a fact that is
+        # STILL VERIFIED and within grace at the stream head — a just-renewed fact is already past
+        # this version, so its stream fails within_renewal_grace and no poison task is opened.
+        if state.status != "VERIFIED" or not within_renewal_grace(state, now):
+            continue
         ref = _ref_from_payload(stream[0].payload["catalog_object_ref"])
-        authority = resolve_authority(conn, adapter, ref, row["fact_type"])
+        authority = resolve_authority(conn, adapter, ref, state.fact_type)
         open_reverify_task(
             conn,
             fact_key=row["fact_key"],
-            fact_type=row["fact_type"],
-            target_confirmed_event_id=row["confirmed_event_id"],
+            fact_type=state.fact_type,
+            target_confirmed_event_id=state.confirmed_event_id,
             authority=authority,
             actor=actor,
         )
