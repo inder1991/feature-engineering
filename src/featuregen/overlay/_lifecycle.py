@@ -69,6 +69,28 @@ def within_renewal_grace(state, now) -> bool:
     return now >= datetime.fromisoformat(state.expires_at) - grace  # expires_at is an ISO string
 
 
+def referent_gap(adapter, ref, fact_type: str, value) -> str | None:
+    """Structured re-confirm validation (SP-1.5 Task 7, shared by confirm_fact AND the dual-owner
+    join path): every object/column a fact's value REFERS to must still exist in THIS adapter's
+    catalog. Returns a rejection reason, or None when all referents are present. Each referent is
+    checked UNDER ITS OWN source (per-referent qualification): a referent whose catalog_source this
+    adapter does not serve is fail-closed (F4/F5). F6: existence is checked against
+    adapter.fingerprint() keyed on the display object_ref — there is no get_object."""
+    from featuregen.overlay.identity import display_object_ref
+    from featuregen.overlay.projection import _dependencies
+
+    present = set(adapter.fingerprint().keys())
+    single_source = getattr(ref, "catalog_source", None)  # None for an ApprovedJoinRef (uses value)
+    for dep_source, referent in _dependencies(
+        display_object_ref(ref), fact_type, value, single_source
+    ):
+        if dep_source != adapter.catalog_source:
+            return f"referent catalog_source '{dep_source}' is not served by this adapter"
+        if referent not in present:
+            return f"referent no longer in catalog: {referent}"
+    return None
+
+
 class OverlayCommandError(Exception):
     """Raised on overlay command misconfiguration / unauthorized task reads."""
 

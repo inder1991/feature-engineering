@@ -19,6 +19,7 @@ from featuregen.overlay._lifecycle import (
     _close_fact_tasks,
     _deny_audited,
     _latest_proposed,
+    referent_gap,
     resolve_ttl,
     within_renewal_grace,
 )
@@ -39,27 +40,8 @@ from featuregen.overlay.identity import (
     proposal_fingerprint,
 )
 from featuregen.overlay.join_confirmation import _confirm_approved_join
-from featuregen.overlay.projection import _dependencies
 from featuregen.overlay.state import fold_overlay_state
 from featuregen.overlay.store import append_overlay_event, load_fact
-
-
-def _referent_gap(adapter, ref, fact_type: FactType, value) -> str | None:
-    """Structured re-confirm validation (SP-1.5 Task 7): every object/column a fact's value REFERS to
-    must still exist in THIS adapter's catalog. Returns a rejection reason, or None when all referents
-    are present. Each referent is checked UNDER ITS OWN source (per-referent qualification): F4/F5 —
-    a referent whose catalog_source this adapter does not serve is fail-closed. F6: existence is
-    checked against adapter.fingerprint() keyed on the display object_ref — there is no get_object."""
-    present = set(adapter.fingerprint().keys())
-    single_source = getattr(ref, "catalog_source", None)  # None for an ApprovedJoinRef (uses value)
-    for dep_source, referent in _dependencies(
-        display_object_ref(ref), fact_type, value, single_source
-    ):
-        if dep_source != adapter.catalog_source:
-            return f"referent catalog_source '{dep_source}' is not served by this adapter"
-        if referent not in present:
-            return f"referent no longer in catalog: {referent}"
-    return None
 
 
 def confirm_fact(conn: DbConn, cmd: Command) -> CommandResult:
@@ -103,6 +85,19 @@ def confirm_fact(conn: DbConn, cmd: Command) -> CommandResult:
     # PARTIALLY_CONFIRMED -> VERIFIED flow (§6.4). Same-owner-both-sides has
     # `authority.dual` False and falls through to the single path below.
     if fact_type == "approved_join" and authority.dual:
+        # SP-1.5 review fix: a still-VERIFIED dual join must NOT renew in place. The two-step join
+        # confirm would regress VERIFIED -> PARTIALLY_CONFIRMED for a live fact, opening a
+        # drift-laundering + expiry-skip window. Dual joins re-verify via the normal expiry/reverify
+        # flow (from a non-live STALE/REVERIFY state), where the two-step is safe.
+        if renewing and state.status == "VERIFIED":
+            return CommandResult(
+                accepted=False,
+                aggregate_id=key,
+                denied_reason=(
+                    "dual-owner approved_join cannot renew in place; it re-verifies via the "
+                    "expiry/reverify flow"
+                ),
+            )
         return _confirm_approved_join(conn, cmd, key, stream, state, authority)
     if not _actor_is_authority(authority, cmd.actor):
         return _deny_audited(
@@ -141,7 +136,7 @@ def confirm_fact(conn: DbConn, cmd: Command) -> CommandResult:
         except RuntimeError:
             pass  # no OverlayConfig sealed -> hardening off (backward-compat)
         else:
-            gap = _referent_gap(adapter, ref, fact_type, value)
+            gap = referent_gap(adapter, ref, fact_type, value)
             if gap is not None:
                 return _deny_audited(conn, cmd, key, f"stale re-confirm blocked: {gap}")
     confirmers: list[Confirmer]
