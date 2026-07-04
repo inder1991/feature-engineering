@@ -141,6 +141,23 @@ def _confirm_approved_join(conn, cmd, key, stream, state, authority):
         return CommandResult(
             accepted=False, aggregate_id=key, denied_reason=f"invalid confirmed value: {exc}"
         )
+    # SP-1.5 re-review #2: the referent gate must run AGAIN here, at the VERIFY-producing second
+    # confirm — the first-partial gate above only fires when the folded status is STALE, but the
+    # first partial flips status to PARTIALLY_CONFIRMED, so a referent that VANISHES between the two
+    # owners' confirms (a days-long window) would otherwise reach VERIFIED un-checked. Config-gated.
+    try:
+        current_overlay_config()
+    except RuntimeError:
+        pass  # no OverlayConfig sealed -> hardening off (backward-compat)
+    else:
+        gap = referent_gap(
+            current_catalog_adapter(),
+            _ref_from_payload(stream[0].payload["catalog_object_ref"]),
+            "approved_join",
+            value,
+        )
+        if gap is not None:
+            return _deny_audited(conn, cmd, key, f"join re-confirm blocked: {gap}")
     expires_at = datetime.now(UTC) + resolve_ttl("approved_join", key)  # SP-1.5 Task 6.3 (was 180d)
     # Thread the cycle-stable head: _cas_target at PARTIALLY_CONFIRMED returns
     # `confirmed_event_id or draft_event_id` — cycle 1 yields the draft (unchanged), a re-verify

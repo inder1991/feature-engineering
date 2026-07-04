@@ -45,8 +45,21 @@ def _config(**over):
     register_overlay_config(OverlayConfig(**base))
 
 
-def _adapter(*, objects=()):
-    cat = StubCatalog(objects=list(objects), catalog_source="pg:core")
+_JOIN_OBJECTS = [
+    CatalogObject("sales.orders", "table", "sales", "orders", None, None, "1"),
+    CatalogObject("sales.customers", "table", "sales", "customers", None, None, "2"),
+    CatalogObject("sales.orders.customer_id", "column", "sales", "orders", "customer_id",
+                  "bigint", "1:1"),
+    CatalogObject("sales.customers.id", "column", "sales", "customers", "id", "bigint", "2:1"),
+]
+
+
+def _adapter(*, objects=None):
+    # Default to the join's referents present (a real join's tables exist); tests that need a
+    # dropped referent pass objects=[] to re-register an empty catalog.
+    cat = StubCatalog(
+        objects=list(_JOIN_OBJECTS if objects is None else objects), catalog_source="pg:core"
+    )
     cat.set_owner(ORDERS, "user:alice")
     cat.set_owner(CUSTOMERS, "user:bob")
     register_catalog_adapter(cat)
@@ -85,7 +98,7 @@ def test_dual_join_uses_configurable_ttl(db):
 def test_dual_join_stale_reconfirm_blocked_when_referent_missing(db):
     # BLOCKER #2: a drift-STALEd dual join must not re-VERIFY while a referent is gone.
     _config()
-    _adapter()  # adapter has NO objects -> referents absent
+    _adapter()  # referents present for the initial verify
     _verify_dual(db)
     confirmed = next(e for e in load_fact(db, KEY) if e.type == "OVERLAY_FACT_CONFIRMED")
     append_overlay_event(
@@ -94,6 +107,7 @@ def test_dual_join_stale_reconfirm_blocked_when_referent_missing(db):
                  "stales_confirmed_event_id": confirmed.event_id},
     )
     run_projection(db, OverlayProjection())
+    _adapter(objects=[])  # the referent is now DROPPED -> re-register an empty catalog
     blocked = _confirm(db, ALICE, confirmed.event_id, "reconf")  # first STALE re-confirm
     assert not blocked.accepted
     assert "stale re-confirm blocked" in (blocked.denied_reason or "")
@@ -101,13 +115,7 @@ def test_dual_join_stale_reconfirm_blocked_when_referent_missing(db):
 
 def test_dual_join_stale_reconfirm_allowed_when_referents_present(db):
     _config()
-    _adapter(objects=[
-        CatalogObject("sales.orders", "table", "sales", "orders", None, None, "1"),
-        CatalogObject("sales.customers", "table", "sales", "customers", None, None, "2"),
-        CatalogObject("sales.orders.customer_id", "column", "sales", "orders", "customer_id",
-                      "bigint", "1:1"),
-        CatalogObject("sales.customers.id", "column", "sales", "customers", "id", "bigint", "2:1"),
-    ])
+    _adapter()  # referents present throughout
     _verify_dual(db)
     confirmed = next(e for e in load_fact(db, KEY) if e.type == "OVERLAY_FACT_CONFIRMED")
     append_overlay_event(
@@ -146,3 +154,24 @@ def test_verified_dual_join_cannot_renew_in_place(db):
     denied = _confirm(db, BOB, confirmed.event_id, "renew")
     assert not denied.accepted
     assert "cannot renew in place" in (denied.denied_reason or "")
+
+
+def test_dual_join_referent_vanishing_between_confirms_is_blocked(db):
+    # SP-1.5 re-review #2: a referent dropped BETWEEN the two owners' re-confirms must block the
+    # second (VERIFY-producing) confirm — the first-partial gate alone is not enough.
+    _config()
+    _adapter()  # referents present for the initial verify + first re-confirm
+    _verify_dual(db)
+    confirmed = next(e for e in load_fact(db, KEY) if e.type == "OVERLAY_FACT_CONFIRMED")
+    append_overlay_event(
+        db, fact_key=KEY, type=facts.OVERLAY_FACT_STALED, actor=EVE,
+        payload={"catalog_change_ref": "typecheck", "stales_confirmed_event_id": confirmed.event_id},
+    )
+    run_projection(db, OverlayProjection())
+
+    r1 = _confirm(db, ALICE, confirmed.event_id, "re1")  # first re-confirm (referents present)
+    assert r1.accepted, r1.denied_reason
+    _adapter(objects=[])  # a referent is DROPPED between the two owners' confirms
+    r2 = _confirm(db, BOB, confirmed.event_id, "re2")  # second (VERIFY) confirm must be blocked
+    assert not r2.accepted
+    assert "join re-confirm blocked" in (r2.denied_reason or "")
