@@ -16,6 +16,8 @@ from psycopg.rows import dict_row
 
 from featuregen.overlay._types import FactStatus, FactType
 from featuregen.overlay.catalog import CatalogAdapter
+from featuregen.overlay.catalog_changes import drift_watermark
+from featuregen.overlay.config import current_overlay_config
 from featuregen.overlay.facts import FactValidationError, validate_fact_value
 from featuregen.overlay.identity import (
     ApprovedJoinRef,
@@ -28,6 +30,18 @@ from featuregen.overlay.projection import read_proposal
 _REASON_MISSING = "no_confirmed_fact"
 _REASON_CATALOG_INVALID = "catalog_value_invalid"
 _REASON_EXPIRED = "expired_pending_reverify"  # SP-1.5 Task 3: read-time time-expiry guard
+_REASON_DRIFT_STALE = "drift_stale_pending_scan"  # SP-1.5 Task 5: read-time drift-freshness guard
+_REASON_NO_FRESHNESS = "no_freshness_proof"  # SP-1.5 Task 5 F2: VERIFIED fact with no deps (corrupt)
+
+
+def _dependent_sources(conn, key: str) -> set[str]:
+    """The DISTINCT catalog_sources a fact's referents span (SP-1.5 Task 5 F1). A cross-catalog
+    join would span two — the drift guard must be fresh in EVERY one, not a single column."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT DISTINCT catalog_source FROM overlay_fact_dependency WHERE fact_key = %s", (key,)
+        )
+        return {r[0] for r in cur.fetchall()}
 _REASON_BY_STATUS = {
     "DRAFT": "draft_unconfirmed",
     "PARTIALLY_CONFIRMED": "partial_confirmation_pending",
@@ -238,6 +252,33 @@ def resolve_fact(
                     "catalog_source": row["catalog_source"],
                 },
             )
+        # Read-time DRIFT-FRESHNESS guard (SP-1.5 Task 5): the fact's referents must be attested
+        # fresh in EVERY catalog they span (a cross-catalog join spans two, F1). ACTIVE only when a
+        # deployment has sealed an OverlayConfig (the drift subsystem's opt-in); off otherwise for
+        # backward-compat. Fail closed if any dependent source's watermark is missing/stale, or —
+        # projection corruption — a VERIFIED fact has NO dependency rows at all (F2).
+        try:
+            config = current_overlay_config()
+        except RuntimeError:
+            config = None
+        if config is not None:
+            prov = {
+                "confirmed_event_id": row["confirmed_event_id"],
+                "catalog_source": row["catalog_source"],
+            }
+            sources = _dependent_sources(conn, key)
+            if not sources:
+                return _overlay_blocked(
+                    "REVERIFY", _REASON_NO_FRESHNESS, obj, fact_type, use_case,
+                    prior_value=row["value"], expires_at=_iso(exp), provenance=prov,
+                )
+            for src in sorted(sources):
+                wm = drift_watermark(conn, src)
+                if wm is None or (now - wm) > config.drift_freshness_sla:
+                    return _overlay_blocked(
+                        "REVERIFY", _REASON_DRIFT_STALE, obj, fact_type, use_case,
+                        prior_value=row["value"], expires_at=_iso(exp), provenance={**prov, "stale_source": src},
+                    )
         return _overlay_verified(row, obj, fact_type, use_case)
 
     # Non-VERIFIED overlay entry -> blocked (fail-closed). REVERIFY/STALE surface the

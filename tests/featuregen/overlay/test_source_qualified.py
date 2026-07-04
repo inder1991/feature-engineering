@@ -97,3 +97,42 @@ def test_adapter_fails_closed_on_foreign_source(db):
     assert adapter.get_fact(mart_ref, "availability_time") is None  # foreign source -> closed
     assert adapter.owner_of(core_ref) == "team-core"
     assert adapter.owner_of(mart_ref) is None
+
+
+def test_drift_freshness_guard_blocks_stale_and_missing(db):
+    # SP-1.5 Task 5: a VERIFIED fact is served only when its dependent catalog's drift watermark is
+    # within drift_freshness_sla; missing or stale -> fail closed drift_stale_pending_scan.
+    from datetime import UTC, datetime, timedelta
+
+    from featuregen.overlay.catalog import FixtureCatalog
+    from featuregen.overlay.catalog_changes import _write_watermark
+    from featuregen.overlay.config import OverlayConfig, register_overlay_config
+    from featuregen.overlay.identity import CatalogObjectRef
+    from featuregen.overlay.resolve import resolve_fact
+
+    _propose_and_confirm(db, "pg:core")  # VERIFIED grain fact on public.customers (+ deps)
+    run_projection(db, OverlayProjection())
+    ref = CatalogObjectRef(catalog_source="pg:core", object_kind="table",
+                           schema="public", table="customers")
+    adapter = FixtureCatalog(catalog_source="pg:core")
+    now = datetime(2026, 6, 1, tzinfo=UTC)
+    register_overlay_config(OverlayConfig(
+        ttl_default=timedelta(days=180), ttl_min=timedelta(days=30), ttl_max=timedelta(days=365),
+        ttl_jitter_fraction=0.1, renewal_grace=timedelta(days=14),
+        drift_scan_interval=timedelta(minutes=15), drift_freshness_sla=timedelta(minutes=60),
+        profiler_require_restricted_role=False,
+    ))
+
+    # No watermark yet -> blocked.
+    blocked = resolve_fact(db, adapter, ref, "grain", now=now)
+    assert blocked.status == "REVERIFY" and blocked.reason_if_missing == "drift_stale_pending_scan"
+
+    # Fresh watermark -> served.
+    _write_watermark(db, "pg:core", now - timedelta(minutes=10))
+    assert resolve_fact(db, adapter, ref, "grain", now=now).status == "VERIFIED"
+
+    # Stale watermark (older than the 60m SLA) -> blocked, naming the stale source.
+    _write_watermark(db, "pg:core", now - timedelta(hours=2))
+    stale = resolve_fact(db, adapter, ref, "grain", now=now)
+    assert stale.status == "REVERIFY" and stale.reason_if_missing == "drift_stale_pending_scan"
+    assert stale.provenance["stale_source"] == "pg:core"
