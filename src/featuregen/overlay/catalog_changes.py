@@ -16,6 +16,7 @@ from featuregen.overlay.store import append_overlay_event, load_fact
 
 @dataclass(frozen=True, slots=True)
 class Change:
+    catalog_source: str
     object_ref: str
     kind: str  # "add" | "drop" | "type_change" | "rename"
     native_oid: str | None = None
@@ -29,39 +30,50 @@ def _type_fingerprint(obj) -> str:
     return hashlib.sha256(f"{obj.object_kind}|{obj.data_type}".encode()).hexdigest()
 
 
-def _load_snapshot(conn: DbConn) -> dict[str, dict]:
+def _load_snapshot(conn: DbConn, catalog_source: str) -> dict[str, dict]:
+    """The prior snapshot for ONE catalog_source (SP-1.5 Task 2 — never mixes catalogs)."""
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT object_ref, native_oid, type_fingerprint FROM overlay_catalog_object"
+            "SELECT object_ref, native_oid, type_fingerprint FROM overlay_catalog_object "
+            "WHERE catalog_source = %s",
+            (catalog_source,),
         )
         return {
             r[0]: {"native_oid": r[1], "type_fingerprint": r[2]} for r in cur.fetchall()
         }
 
 
-def _save_snapshot(conn: DbConn, current) -> None:
+def _save_snapshot(conn: DbConn, catalog_source: str, current) -> None:
     refs = list(current)
     with conn.cursor() as cur:
         for ref, obj in current.items():
             cur.execute(
                 """
                 INSERT INTO overlay_catalog_object
-                    (object_ref, native_oid, columns_fingerprint, type_fingerprint, updated_at)
-                VALUES (%s, %s, %s, %s, now())
-                ON CONFLICT (object_ref) DO UPDATE
+                    (catalog_source, object_ref, native_oid, columns_fingerprint,
+                     type_fingerprint, updated_at)
+                VALUES (%s, %s, %s, %s, %s, now())
+                ON CONFLICT (catalog_source, object_ref) DO UPDATE
                    SET native_oid = EXCLUDED.native_oid,
                        columns_fingerprint = EXCLUDED.columns_fingerprint,
                        type_fingerprint = EXCLUDED.type_fingerprint,
                        updated_at = now()
                 """,
-                (ref, obj.native_oid, "", _type_fingerprint(obj)),
+                (catalog_source, ref, obj.native_oid, "", _type_fingerprint(obj)),
             )
+        # Catalog-SCOPED anti-join (SP-1.5 §7): only this catalog's stale rows are pruned — another
+        # catalog's snapshot is never touched. Scoped to one source, object_ref is a plain text[]
+        # so `<> ALL` is a robust contract (F7's composite-key concern does not arise here).
         if refs:
             cur.execute(
-                "DELETE FROM overlay_catalog_object WHERE object_ref <> ALL(%s)", (refs,)
+                "DELETE FROM overlay_catalog_object "
+                "WHERE catalog_source = %s AND object_ref <> ALL(%s)",
+                (catalog_source, refs),
             )
         else:
-            cur.execute("DELETE FROM overlay_catalog_object")
+            cur.execute(
+                "DELETE FROM overlay_catalog_object WHERE catalog_source = %s", (catalog_source,)
+            )
 
 
 def detect_catalog_changes(conn: DbConn, adapter, *, actor) -> list[Change]:
@@ -72,8 +84,9 @@ def detect_catalog_changes(conn: DbConn, adapter, *, actor) -> list[Change]:
     type-change / rename(old side), each dependent fact found via the general dependency
     index is STALEd (CAS on confirmed_event_id) + gets a re-verify task. Returns all
     detected changes; the snapshot is advanced to `current` at the end."""
+    csource = adapter.catalog_source
     current = adapter.fingerprint()
-    prior = _load_snapshot(conn)
+    prior = _load_snapshot(conn, csource)
     cur_refs, prior_refs = set(current), set(prior)
     added, dropped = cur_refs - prior_refs, prior_refs - cur_refs
 
@@ -84,22 +97,22 @@ def detect_catalog_changes(conn: DbConn, adapter, *, actor) -> list[Change]:
 
     changes: list[Change] = []
     for old, new in renamed.items():
-        changes.append(Change(old, "rename", prior[old]["native_oid"], renamed_to=new))
+        changes.append(Change(csource, old, "rename", prior[old]["native_oid"], renamed_to=new))
     for r in dropped:
         if r not in renamed:
-            changes.append(Change(r, "drop", prior[r]["native_oid"]))
+            changes.append(Change(csource, r, "drop", prior[r]["native_oid"]))
     for r in added:
         if r not in renamed_new:
-            changes.append(Change(r, "add", current[r].native_oid))
+            changes.append(Change(csource, r, "add", current[r].native_oid))
     for r in cur_refs & prior_refs:
         if _type_fingerprint(current[r]) != prior[r]["type_fingerprint"]:
-            changes.append(Change(r, "type_change", current[r].native_oid))
+            changes.append(Change(csource, r, "type_change", current[r].native_oid))
 
     for ch in changes:
         if ch.kind in ("drop", "type_change", "rename"):
             _stale_dependents(conn, adapter, ch, actor=actor)
 
-    _save_snapshot(conn, current)
+    _save_snapshot(conn, csource, current)
     return changes
 
 
@@ -148,5 +161,5 @@ def _stale_dependents(conn: DbConn, adapter, change: Change, *, actor) -> None:
     display_object_ref string — the same key the projection records in
     overlay_fact_dependency."""
     change_ref = f"{change.kind}:{change.object_ref}"
-    for fact_key in dependents_of(conn, change.object_ref):
+    for fact_key in dependents_of(conn, change.catalog_source, change.object_ref):
         _stale_one(conn, adapter, fact_key, change_ref=change_ref, actor=actor)

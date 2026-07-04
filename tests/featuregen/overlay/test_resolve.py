@@ -41,13 +41,14 @@ def _seed_state(
         cur.execute(
             """
             INSERT INTO overlay_fact_state
-              (fact_key, object_ref, fact_type, use_case, status, value, confirmers,
+              (fact_key, object_ref, catalog_source, fact_type, use_case, status, value, confirmers,
                confirmed_at, expires_at, prior_value, confirmed_event_id, updated_seq)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """,
             (
                 key,
                 display_object_ref(_REF),
+                _REF.catalog_source,
                 fact_type,
                 use_case,
                 status,

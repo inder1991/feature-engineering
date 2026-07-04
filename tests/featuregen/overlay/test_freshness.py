@@ -542,8 +542,8 @@ def test_dependency_index_tracks_confirmed_override_not_proposed_column(db):
     run_projection(db, OverlayProjection())
 
     # the dependency index must point at the CONFIRMED column, not the proposed one
-    assert key in dependents_of(db, display_object_ref(_col_ref(confirmed_col)))
-    assert key not in dependents_of(db, display_object_ref(_col_ref(proposed_col)))
+    assert key in dependents_of(db, "pg:core", display_object_ref(_col_ref(confirmed_col)))
+    assert key not in dependents_of(db, "pg:core", display_object_ref(_col_ref(proposed_col)))
 
     # and a drop of the confirmed column must STALE the fact (pre-fix it does NOT)
     owners = {tbl: "user:owner-a"}
