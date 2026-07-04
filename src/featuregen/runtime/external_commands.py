@@ -10,8 +10,32 @@ from typing import Any, Protocol, runtime_checkable
 from psycopg.types.json import Jsonb
 
 from featuregen.contracts import DbConn, NewExternalCommand
+from featuregen.runtime.observability import counters
 
 _log = logging.getLogger("featuregen.external_commands")
+
+
+def _record_external_cost(
+    conn: DbConn, command_id: str, run_id: str | None, cost_units: Decimal | None
+) -> None:
+    """Roll a succeeded external command's cost into its run's durable §5.6 budget so the cost
+    breaker sees external spend (SP-0.5 round-2). Exactly-once: _finalize reaches here only on the
+    transition INTO 'succeeded' (a re-finalize honors the existing status and returns early).
+    Tolerant: a command whose run has no workflow-state row is counted/logged, not fatal."""
+    if run_id is None or cost_units is None:
+        return
+    from featuregen.runtime.cost_budget import record_cost
+
+    try:
+        record_cost(conn, run_id, cost_units)
+    except KeyError:
+        counters.incr("external.cost_unattributed")
+        _log.warning(
+            "external cost %s for %s not attributed: run %s has no workflow state",
+            cost_units,
+            command_id,
+            run_id,
+        )
 
 
 class HighCostWithoutDedup(Exception):
@@ -191,17 +215,18 @@ def _finalize(
     Shared by dispatch_command (first dispatch + recovery) and invoke_claimed_external."""
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT status FROM external_commands WHERE command_id = %s FOR UPDATE",
+            "SELECT status, run_id FROM external_commands WHERE command_id = %s FOR UPDATE",
             (command_id,),
         )
         frow = cur.fetchone()
         if frow is None:
             conn.rollback()
             raise KeyError(command_id)
-        if frow[0] in ("succeeded", "failed", "stale_ignored"):
+        status, run_id = frow
+        if status in ("succeeded", "failed", "stale_ignored"):
             # A concurrent dispatcher already finalized this command; honor it.
             conn.rollback()
-            return DispatchOutcome(command_id, frow[0], reinvoked, residual, reconciled)
+            return DispatchOutcome(command_id, status, reinvoked, residual, reconciled)
 
         if res.ok:
             cur.execute(
@@ -215,6 +240,7 @@ def _finalize(
                     command_id,
                 ),
             )
+            _record_external_cost(conn, command_id, run_id, res.cost_units)
             outcome = DispatchOutcome(command_id, "succeeded", reinvoked, residual, reconciled)
         elif res.permanent:
             cur.execute(

@@ -109,6 +109,28 @@ def test_claim_stale_dispatched_ignores_fresh_dispatched_rows(autocommit_worker_
     assert claim_stale_dispatched(conn, ["llm"], stale_after_seconds=60, now=NOW) == []
 
 
+def test_external_command_cost_rolls_into_run_budget(autocommit_worker_conn, recording_caller):
+    # A succeeded external command's cost must roll into the run's durable §5.6 budget so the cost
+    # breaker sees external spend, not only the external_commands row (SP-0.5 round-2).
+    conn = autocommit_worker_conn
+    conn.execute(
+        "INSERT INTO run_workflow_state (run_id, request_id, current_state, table_version, "
+        "cost_units) VALUES ('run_1','req_1','DRAFT',1,0)"
+    )
+    caller = recording_caller(invoke_result=IntegrationResult(True, {"ok": 1}, Decimal("3.5")))
+    register_integration_caller(caller)
+    cid = _record(conn, "costed")  # run_id='run_1'
+
+    claimed = claim_next_pending(conn, ["llm"], now=NOW)
+    invoke_claimed_external(conn, claimed, caller, now=NOW)
+
+    cost = conn.execute(
+        "SELECT cost_units FROM run_workflow_state WHERE run_id='run_1'"
+    ).fetchone()[0]
+    assert cost == Decimal("3.5")
+    assert _status(conn, cid) == "succeeded"
+
+
 def test_run_worker_once_dispatches_external_commands(autocommit_worker_conn, recording_caller):
     # End-to-end wiring: a registered caller + a pending external command -> the worker's external
     # stage claims + invokes it on the real autocommit daemon connection (SP-0.5 round-2).
