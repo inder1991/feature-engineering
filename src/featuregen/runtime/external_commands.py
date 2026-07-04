@@ -28,7 +28,16 @@ def _record_external_cost(
     command. Tolerant: a command whose run has no workflow-state row is counted/logged, not fatal."""
     if run_id is None or cost_units is None:
         return
+    # Reject a non-finite or negative cost at the boundary (SP-0.5 r2 review #4): a bad integration
+    # value must never corrupt the durable budget / request totals or break later comparisons.
+    if not cost_units.is_finite() or cost_units < 0:
+        counters.incr("external.cost_invalid")
+        _log.warning(
+            "external command %s returned invalid cost_units=%s; not recorded", command_id, cost_units
+        )
+        return
     from featuregen.runtime.cost_budget import (
+        CostConfigError,
         check_cost_breaker,
         current_cost_ceilings,
         record_cost,
@@ -47,7 +56,20 @@ def _record_external_cost(
         )
         return
     # Enforce §5.6 on the fresh spend: auto-park the run if it now breaches a configured ceiling.
-    outcome = check_cost_breaker(conn, run_id, ceilings=current_cost_ceilings())
+    # NEVER let malformed ceiling config raise here — the external call already executed and the
+    # cost is recorded; raising would roll back the finalize and strand the row 'dispatched' for a
+    # duplicate recovery invoke (SP-0.5 r2 review #3). run_forever validates config at startup;
+    # this is defense-in-depth against a mid-run change.
+    try:
+        ceilings = current_cost_ceilings()
+        outcome = check_cost_breaker(conn, run_id, ceilings=ceilings)
+    except (CostConfigError, KeyError) as exc:
+        # NEVER roll back an already-executed external call because breaker EVALUATION failed (bad
+        # config, or the run row raced away): skip enforcement + surface it. (A genuine DB error
+        # from trip_cost_breaker below is NOT swallowed — that legitimately rolls the finalize back.)
+        counters.incr("external.cost_breaker_skipped")
+        _log.error("cost-breaker evaluation skipped for %s: %s", command_id, exc)
+        return
     if outcome.tripped and outcome.ceiling is not None:
         trip_cost_breaker(conn, run_id, ceiling=outcome.ceiling)
 
@@ -158,6 +180,14 @@ def dispatch_command(
     honors the idempotency key (dedup_supported) it is safe to re-invoke; else the
     residual-duplicate risk is logged and persisted honestly (no false dedup claim)."""
     # --- Step 1: claim + mark 'dispatched', then COMMIT on its own ---------------------
+    # NOTE (SP-0.5 round-2 review): on an AUTOCOMMIT connection the SELECT ... FOR UPDATE self-commits
+    # and releases the row lock BEFORE the pending->dispatched UPDATE, so the pending-claim path is
+    # NOT autocommit-atomic (two callers could both claim a 'pending' row). This is currently
+    # UNREACHED: the worker drives first-dispatch via claim_next_pending (a single atomic UPDATE) and
+    # only drives dispatch_command for 'dispatched' RECOVERY, which takes no UPDATE here. If a future
+    # caller ever drives dispatch_command for a 'pending' row on the autocommit daemon connection,
+    # wrap this read+UPDATE in `conn.transaction()` (as _finalize does) FIRST. The explicit commit
+    # below is load-bearing crash-safety — the claim must be durable before the external side effect.
     with conn.cursor() as cur:
         cur.execute(
             "SELECT request_payload, job_handle, dedup_supported, status "
@@ -271,6 +301,17 @@ def _finalize(
                     (Jsonb(dict(res.result)), now, command_id),
                 )
                 outcome = DispatchOutcome(command_id, "failed", reinvoked, residual, reconciled)
+            elif attempts >= _external_max_attempts():
+                # Retries exhausted: give up to a terminal 'failed' (DLQ), mirroring the queue/outbox
+                # max-attempts behavior — a persistently-failing (non-permanent) integration must not
+                # retry FOREVER, which for a bank is an unbounded cost/noise path (SP-0.5 r2 review).
+                cur.execute(
+                    "UPDATE external_commands SET status='failed', result=%s, completed_at=%s "
+                    "WHERE command_id=%s",
+                    (Jsonb({"_dlq": "max_attempts_exhausted", **dict(res.result)}), now, command_id),
+                )
+                counters.incr("external.dlq")
+                outcome = DispatchOutcome(command_id, "failed", reinvoked, residual, reconciled)
             else:
                 # Retryable failure: back off before the row is claimable again, so a persistently
                 # failing command is not re-invoked up to `batch` times per tick (SP-0.5 r2 review).
@@ -281,6 +322,15 @@ def _finalize(
                 )
                 outcome = DispatchOutcome(command_id, "pending", reinvoked, residual, reconciled)
     return outcome
+
+
+def _external_max_attempts() -> int:
+    """Max dispatch attempts before a retryable external command is DLQ'd to 'failed' (§5.6). Config
+    via FEATUREGEN_EXTERNAL_MAX_ATTEMPTS, default 10 — mirrors the queue/outbox max-attempts DLQ so a
+    persistently-failing (non-permanent) integration cannot retry forever."""
+    import os
+
+    return int(os.environ.get("FEATUREGEN_EXTERNAL_MAX_ATTEMPTS", "10"))
 
 
 @dataclass(frozen=True, slots=True)

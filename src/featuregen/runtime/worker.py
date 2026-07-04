@@ -14,10 +14,11 @@ a counted, logged error and NEVER stalls the tick.
 
 from __future__ import annotations
 
+import json
 import os
 import signal
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
@@ -54,20 +55,31 @@ from featuregen.runtime.timers import fire_timer, poll_due_timers
 _DEFAULT_RELAY_ROUTE: dict[str, str] = {}
 
 
-def _relay_publisher_from_env() -> Callable[[psycopg.Connection, OutboxMessage], None]:
-    """Build the production relay publisher from env config (SP-0.5 round-2 review): the outbox
-    route policy is otherwise unreachable through the worker. `FEATUREGEN_RELAY_ROUTES` =
-    'topic:handler,topic:handler' maps a fan-out topic to its internal step handler;
-    `FEATUREGEN_RELAY_REQUIRED` = 'topicA,topicB' marks topics that MUST have a route (an unrouted
-    route-required topic is a LOUD failure -> DLQ, not a silent drain). Both default empty, so the
-    default is exactly today's drain-everything behavior — nothing breaks until a deployment
-    declares real fan-out topics."""
-    routes: dict[str, str] = {}
-    raw = os.environ.get("FEATUREGEN_RELAY_ROUTES", "").strip()
-    for pair in (p for p in raw.split(",") if p.strip()):
-        topic, _, handler = pair.partition(":")
-        if topic.strip() and handler.strip():
-            routes[topic.strip()] = handler.strip()
+def _relay_publisher_from_env(
+    relay_routes: Mapping[str, str] | None = None,
+) -> Callable[[psycopg.Connection, OutboxMessage], None]:
+    """Build the production relay publisher (SP-0.5 round-2 review #5 — the outbox route policy is
+    otherwise unreachable through the worker, and the config format must match the plan).
+    `FEATUREGEN_RELAY_ROUTES` = PATH to a JSON file `{topic: handler}`; a programmatic `relay_routes`
+    mapping (from run_forever) overrides it. A set-but-unreadable/invalid file is a LOUD failure, NOT
+    a silent empty map. `FEATUREGEN_RELAY_REQUIRED` = 'topicA,topicB' marks route-required topics (an
+    unrouted route-required topic is a LOUD failure -> DLQ). Both default empty, so the default is
+    exactly today's drain-everything behavior until a deployment declares real fan-out topics."""
+    if relay_routes is not None:
+        routes: dict[str, str] = dict(relay_routes)
+    else:
+        routes = {}
+        path = os.environ.get("FEATUREGEN_RELAY_ROUTES", "").strip()
+        if path:
+            with open(path, encoding="utf-8") as fh:  # loud on missing file / bad JSON
+                routes = json.load(fh)
+            if not isinstance(routes, dict) or not all(
+                isinstance(k, str) and isinstance(v, str) for k, v in routes.items()
+            ):
+                raise ValueError(
+                    f"FEATUREGEN_RELAY_ROUTES file {path!r} must be a JSON object of "
+                    "{topic: handler} strings"
+                )
     required = os.environ.get("FEATUREGEN_RELAY_REQUIRED", "").strip()
     route_required = frozenset(t.strip() for t in required.split(",") if t.strip())
     return make_queue_publisher(routes, route_required=route_required)
@@ -471,11 +483,17 @@ def run_forever(
     interval: float = 1.0,
     shutdown_event: threading.Event | None = None,
     owner: str | None = None,
+    relay_routes: Mapping[str, str] | None = None,
 ) -> None:
     """Open ONE autocommit connection and loop `run_worker_once` until shutdown (SIGINT/SIGTERM set a
     threading.Event). Autocommit is required: each stage owns its own `with conn.transaction()` so a
     stage's writes commit durably (not a per-test savepoint). A tick is fully guarded, then we wait
-    `interval` seconds (interruptible via the event) so an empty queue does not busy-spin."""
+    `interval` seconds (interruptible via the event) so an empty queue does not busy-spin.
+
+    `relay_routes` overrides the env-file route map (SP-0.5 r2 review #5). Cost-ceiling config is
+    validated up front so a typo fails the worker at boot, not mid-finalize (review #3)."""
+    from featuregen.runtime.cost_budget import current_cost_ceilings
+
     owner = owner or f"worker-{os.getpid()}"
     if shutdown_event is None:
         shutdown_event = threading.Event()
@@ -484,7 +502,8 @@ def run_forever(
     conn = psycopg.connect(dsn, autocommit=True)
     try:
         registry, projections = compose(conn)
-        publish = _relay_publisher_from_env()  # production route policy from env (SP-0.5 r2)
+        publish = _relay_publisher_from_env(relay_routes)  # production route policy (SP-0.5 r2)
+        current_cost_ceilings()  # fail-fast on malformed cost-ceiling config (review #3)
         log("worker.start", dsn=_safe_dsn(dsn), owner=owner, interval=interval)
         while not shutdown_event.is_set():
             now = datetime.now(UTC)
@@ -499,6 +518,7 @@ def run_forever(
                     timers_fired=tick.timers_fired,
                     overlay_expiries=tick.overlay_expiries,
                     projections_advanced=tick.projections_advanced,
+                    external_dispatched=tick.external_dispatched,
                     reclaimed=list(tick.reclaimed),
                     parked=tick.parked,
                     errors=tick.errors,

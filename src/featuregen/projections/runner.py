@@ -185,17 +185,21 @@ def _checkpoint_seq(conn: DbConn, name: str) -> int:
 
 def advance_projection_past(
     conn: DbConn, projection: Projection, aggregate: str, aggregate_id: str
-) -> bool:
-    """Re-run the projection and report whether it is now HEALTHY for (aggregate, aggregate_id) —
-    i.e. the projection advanced past the poison that halted it. Healthy iff, AFTER the re-run,
-    the checkpoint is >= the CURRENT degraded marker's poison_seq (or the marker is gone).
+) -> tuple[bool, int | None]:
+    """Replay the projection to completion, then evaluate health for (aggregate, aggregate_id).
+    Returns `(healthy, poison_seq)`:
+      * `(False, None)` — still stuck (checkpoint < the current poison): the caller must REFUSE.
+      * `(True, None)`  — no degraded marker remains for this aggregate: healthy, nothing to delete.
+      * `(True, P)`     — proven past poison_seq P: the caller deletes EXACTLY that marker.
 
-    Re-reading the marker AFTER the run is load-bearing (SP-0.5 round-2 review): if the projection
-    advances past the ORIGINAL poison but re-halts at a LATER, second-stage poison, run_projection
-    re-marks the SAME row with the later poison_seq — trusting the pre-run snapshot would report
-    healthy and falsely unblock. A projection still stuck re-halts and leaves checkpoint < the
-    (current) poison_seq, so this returns False."""
-    run_projection(conn, projection)
+    Bounded-loop replay (SP-0.5 round-2 review #2): `run_projection` applies at most `batch` events
+    per call, so on a long stream a SINGLE call may not even reach the poison — loop until it stops
+    advancing (reached head or re-halted). Re-reading the marker AFTER the replay is load-bearing
+    (review): a second-stage poison re-halts + re-marks the SAME row at a LATER seq, so the pre-run
+    snapshot cannot be trusted. Returning the exact proven poison_seq lets the caller delete only
+    that marker (review #1), never a concurrently-inserted fresh one."""
+    while run_projection(conn, projection) > 0:
+        pass
     with conn.cursor(row_factory=dict_row) as cur:
         cur.execute(
             "SELECT poison_seq FROM projection_degraded "
@@ -204,8 +208,11 @@ def advance_projection_past(
         )
         marker = cur.fetchone()
     if marker is None:
-        return True  # no marker for this aggregate after the re-run — healthy
-    return _checkpoint_seq(conn, projection.name) >= marker["poison_seq"]
+        return (True, None)  # no marker for this aggregate after the replay — healthy, nothing to delete
+    poison_seq = marker["poison_seq"]
+    if _checkpoint_seq(conn, projection.name) >= poison_seq:
+        return (True, poison_seq)  # proven past this exact poison
+    return (False, None)  # still stuck below the (current) poison — refuse
 
 
 def projection_lag(conn: DbConn, name: str) -> int:
