@@ -20,13 +20,20 @@ _log = logging.getLogger("featuregen.external_commands")
 def _record_external_cost(
     conn: DbConn, command_id: str, run_id: str | None, cost_units: Decimal | None
 ) -> None:
-    """Roll a succeeded external command's cost into its run's durable §5.6 budget so the cost
-    breaker sees external spend (SP-0.5 round-2). Exactly-once: _finalize reaches here only on the
-    transition INTO 'succeeded' (a re-finalize honors the existing status and returns early).
-    Tolerant: a command whose run has no workflow-state row is counted/logged, not fatal."""
+    """Roll a succeeded external command's cost into its run's durable §5.6 budget AND enforce the
+    cost breaker on the fresh spend (SP-0.5 round-2 review): if a ceiling is now breached, auto-park
+    the run — otherwise external integrations could blow a run's budget without ever tripping the
+    breaker. Exactly-once: _finalize reaches here only on the transition INTO 'succeeded' (a
+    re-finalize honors the existing status and returns early), so the check/trip runs once per
+    command. Tolerant: a command whose run has no workflow-state row is counted/logged, not fatal."""
     if run_id is None or cost_units is None:
         return
-    from featuregen.runtime.cost_budget import record_cost
+    from featuregen.runtime.cost_budget import (
+        check_cost_breaker,
+        current_cost_ceilings,
+        record_cost,
+        trip_cost_breaker,
+    )
 
     try:
         record_cost(conn, run_id, cost_units)
@@ -38,6 +45,11 @@ def _record_external_cost(
             command_id,
             run_id,
         )
+        return
+    # Enforce §5.6 on the fresh spend: auto-park the run if it now breaches a configured ceiling.
+    outcome = check_cost_breaker(conn, run_id, ceilings=current_cost_ceilings())
+    if outcome.tripped and outcome.ceiling is not None:
+        trip_cost_breaker(conn, run_id, ceiling=outcome.ceiling)
 
 
 class HighCostWithoutDedup(Exception):

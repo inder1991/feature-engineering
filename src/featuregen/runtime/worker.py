@@ -53,6 +53,25 @@ from featuregen.runtime.timers import fire_timer, poll_due_timers
 # deployment adds real routes (or swaps in an external-bus publisher) by passing `publish=`.
 _DEFAULT_RELAY_ROUTE: dict[str, str] = {}
 
+
+def _relay_publisher_from_env() -> Callable[[psycopg.Connection, OutboxMessage], None]:
+    """Build the production relay publisher from env config (SP-0.5 round-2 review): the outbox
+    route policy is otherwise unreachable through the worker. `FEATUREGEN_RELAY_ROUTES` =
+    'topic:handler,topic:handler' maps a fan-out topic to its internal step handler;
+    `FEATUREGEN_RELAY_REQUIRED` = 'topicA,topicB' marks topics that MUST have a route (an unrouted
+    route-required topic is a LOUD failure -> DLQ, not a silent drain). Both default empty, so the
+    default is exactly today's drain-everything behavior — nothing breaks until a deployment
+    declares real fan-out topics."""
+    routes: dict[str, str] = {}
+    raw = os.environ.get("FEATUREGEN_RELAY_ROUTES", "").strip()
+    for pair in (p for p in raw.split(",") if p.strip()):
+        topic, _, handler = pair.partition(":")
+        if topic.strip() and handler.strip():
+            routes[topic.strip()] = handler.strip()
+    required = os.environ.get("FEATUREGEN_RELAY_REQUIRED", "").strip()
+    route_required = frozenset(t.strip() for t in required.split(",") if t.strip())
+    return make_queue_publisher(routes, route_required=route_required)
+
 # Control-plane queue handlers are defined ONCE in runtime/queue.py as CONTROL_SIGNAL_HANDLERS: the
 # dedicated control-signal stage below claims exactly those, and claim_one excludes exactly those,
 # so the two consumers are complementary and can never drift. `_AUTO_PARK` is the one member the
@@ -465,11 +484,14 @@ def run_forever(
     conn = psycopg.connect(dsn, autocommit=True)
     try:
         registry, projections = compose(conn)
+        publish = _relay_publisher_from_env()  # production route policy from env (SP-0.5 r2)
         log("worker.start", dsn=_safe_dsn(dsn), owner=owner, interval=interval)
         while not shutdown_event.is_set():
             now = datetime.now(UTC)
             try:
-                tick = run_worker_once(conn, registry, projections, owner=owner, now=now)
+                tick = run_worker_once(
+                    conn, registry, projections, owner=owner, now=now, publish=publish
+                )
                 log(
                     "worker.tick",
                     queue_processed=tick.queue_processed,

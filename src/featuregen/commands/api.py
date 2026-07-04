@@ -94,15 +94,29 @@ def execute_command(conn: DbConn, cmd: Command) -> CommandResult:
     responsible for writing denials to `security_audit` (NOT the domain stream)** — that
     fulfils the contract's "on deny, writes to security_audit" for `execute_command`. The
     default Phase-06 seam (allow-all) writes nothing because it never denies."""
-    # Atomicity is only at RISK on an autocommit connection, where each statement would otherwise
-    # self-commit (a handler failure would strand a committed _pending claim). Wrap ONLY then. A
-    # non-autocommit caller already owns a transaction (the body runs in it / a savepoint), so we
-    # must NOT open+commit our own — that would defeat the caller's rollback (e.g. test isolation)
-    # and break the `_claim` ON CONFLICT-blocks-loser mechanism that relies on the caller's tx.
+    # On an AUTOCOMMIT connection each statement self-commits, so wrap the whole body in one real
+    # transaction (a handler failure then rolls the claim back instead of stranding a committed
+    # _pending).
     if conn.autocommit:
         with conn.transaction():
             return _execute_command_body(conn, cmd)
-    return _execute_command_body(conn, cmd)
+    # On a NON-autocommit connection the caller owns commit, so we must NOT open+commit our own
+    # transaction (that would defeat the caller's rollback / test isolation). But we still bracket
+    # the body in a SAVEPOINT so a handler exception rolls back OUR claim within execute_command —
+    # otherwise a caller that catches the exception then commits would strand a committed _pending
+    # claim and block retries (SP-0.5 round-2 review). The savepoint rides the caller's transaction
+    # (auto-begun by the first statement); RELEASE on success, ROLLBACK TO on failure, never commit.
+    with conn.cursor() as cur:
+        cur.execute("SAVEPOINT execute_command")
+    try:
+        result = _execute_command_body(conn, cmd)
+    except BaseException:
+        with conn.cursor() as cur:
+            cur.execute("ROLLBACK TO SAVEPOINT execute_command")
+        raise
+    with conn.cursor() as cur:
+        cur.execute("RELEASE SAVEPOINT execute_command")
+    return result
 
 
 def _execute_command_body(conn: DbConn, cmd: Command) -> CommandResult:

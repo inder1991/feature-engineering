@@ -112,6 +112,27 @@ def test_run_worker_once_halts_claiming_past_leaked_conn_cap(db, seeded_pipeline
     assert counters.snapshot()["counters"].get("worker.leaked_cap_halt", 0) >= 1
 
 
+def test_relay_publisher_from_env_wires_route_policy(db, monkeypatch) -> None:
+    """The production worker path must be able to CONFIGURE the outbox route policy (routes +
+    route-required topics) via env, else the policy is unreachable in production (SP-0.5 r2 review)."""
+    from featuregen.runtime.outbox import OutboxMessage, UnroutedOutboxTopic
+    from featuregen.runtime.worker import _relay_publisher_from_env
+
+    monkeypatch.setenv("FEATUREGEN_RELAY_ROUTES", "STEP_TRIGGER:h")
+    monkeypatch.setenv("FEATUREGEN_RELAY_REQUIRED", "MUST_ROUTE")
+    publish = _relay_publisher_from_env()
+
+    # A route-required topic with no configured route is a LOUD failure.
+    with pytest.raises(UnroutedOutboxTopic):
+        publish(db, OutboxMessage("m1", "p", "MUST_ROUTE", {}, "e1"))
+    # A configured topic enqueues to its handler.
+    publish(db, OutboxMessage("m2", "run:r", "STEP_TRIGGER", {}, "e2"))
+    assert db.execute("SELECT handler FROM queue WHERE message_id='m2'").fetchone()[0] == "h"
+    # An unrouted, non-required topic drains silently (no raise, no enqueue).
+    publish(db, OutboxMessage("m3", "p", "SOME_EVENT", {}, "e3"))
+    assert db.execute("SELECT count(*) FROM queue WHERE message_id='m3'").fetchone()[0] == 0
+
+
 def test_run_worker_once_is_idle_on_empty(db, seeded_pipeline) -> None:
     """After draining to idle, the next tick does no queue work — no busy-spin."""
     from featuregen.runtime.worker import run_worker_once

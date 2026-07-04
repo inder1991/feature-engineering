@@ -180,6 +180,53 @@ def test_retryable_external_command_backs_off_not_hot_looped(autocommit_worker_c
     assert claim_next_pending(conn, ["llm"], now=NOW + timedelta(hours=2)) is not None
 
 
+def _seed_run(conn, run_id="run_1", cost=0):
+    conn.execute(
+        "INSERT INTO run_workflow_state (run_id, request_id, current_state, table_version, "
+        "cost_units) VALUES (%s,'req_1','DRAFT',1,%s)",
+        (run_id, cost),
+    )
+
+
+def test_external_cost_over_ceiling_trips_breaker_and_auto_parks(
+    autocommit_worker_conn, recording_caller, monkeypatch
+):
+    # A succeeded external command whose cost pushes the run over the per-run ceiling must TRIP the
+    # §5.6 cost breaker (enqueue runtime.auto_park), not just record spend (SP-0.5 round-2 review).
+    monkeypatch.setenv("FEATUREGEN_COST_PER_RUN", "5")
+    conn = autocommit_worker_conn
+    _seed_run(conn)
+    caller = recording_caller(invoke_result=IntegrationResult(True, {"ok": 1}, Decimal("6.0")))
+    register_integration_caller(caller)
+    cid = _record(conn, "over")
+
+    invoke_claimed_external(conn, claim_next_pending(conn, ["llm"], now=NOW), caller, now=NOW)
+
+    assert _status(conn, cid) == "succeeded"
+    row = conn.execute(
+        "SELECT handler, payload FROM queue WHERE message_id = 'cost-breaker:run_1:per_run'"
+    ).fetchone()
+    assert row is not None and row[0] == "runtime.auto_park"
+    assert row[1]["reason"] == "cost_ceiling" and row[1]["ceiling"] == "per_run"
+
+
+def test_external_cost_under_ceiling_does_not_trip(
+    autocommit_worker_conn, recording_caller, monkeypatch
+):
+    monkeypatch.setenv("FEATUREGEN_COST_PER_RUN", "100")
+    conn = autocommit_worker_conn
+    _seed_run(conn)
+    caller = recording_caller(invoke_result=IntegrationResult(True, {"ok": 1}, Decimal("6.0")))
+    register_integration_caller(caller)
+    _record(conn, "under")
+
+    invoke_claimed_external(conn, claim_next_pending(conn, ["llm"], now=NOW), caller, now=NOW)
+
+    assert conn.execute(
+        "SELECT count(*) FROM queue WHERE handler = 'runtime.auto_park'"
+    ).fetchone()[0] == 0
+
+
 def test_run_worker_once_dispatches_external_commands(autocommit_worker_conn, recording_caller):
     # End-to-end wiring: a registered caller + a pending external command -> the worker's external
     # stage claims + invokes it on the real autocommit daemon connection (SP-0.5 round-2).

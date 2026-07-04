@@ -298,6 +298,37 @@ def test_resolve_degraded_refuses_when_a_second_stage_poison_remains(conn):
     ).fetchone()[0] == 0
 
 
+def test_rebuild_clears_stale_degraded_only_after_clean_replay(conn):
+    """A successful rebuild-to-head must clear stale projection_degraded markers so an operator who
+    fixed the cause + rebuilt gets commands un-blocked WITHOUT a separate resolve_degraded — but a
+    rebuild that re-halts (still poisoned) must KEEP the markers, fail-closed (SP-0.5 r2 review)."""
+    from featuregen.projections.runner import rebuild_projection
+
+    event_registry().register_schema("E", 1, {"type": "object"}, owner="o")
+    _append(conn, "run_rb", 0, {})
+    poison = _append(conn, "run_rb", 1, {})
+    _append(conn, "run_rb", 2, {})
+
+    proj = HealableProjection(poison_seq=poison.global_seq)
+    run_projection(conn, proj)  # halts -> degraded marker
+    assert conn.execute(
+        "SELECT count(*) FROM projection_degraded WHERE projection_name='healable'"
+    ).fetchone()[0] == 1
+
+    # Still poisoned: rebuild re-halts (lag > 0) -> marker KEPT (fail-closed).
+    rebuild_projection(conn, proj)
+    assert conn.execute(
+        "SELECT count(*) FROM projection_degraded WHERE projection_name='healable'"
+    ).fetchone()[0] == 1
+
+    # Cause fixed: rebuild reaches head cleanly (lag 0) -> stale marker cleared.
+    proj.healed = True
+    rebuild_projection(conn, proj)
+    assert conn.execute(
+        "SELECT count(*) FROM projection_degraded WHERE projection_name='healable'"
+    ).fetchone()[0] == 0
+
+
 def test_resolve_degraded_fails_closed_when_projection_not_registered(conn):
     """A marker naming a projection not registered for repair cannot be health-proven, so resolve
     fail-closes (accepted=False, marker unchanged) rather than blindly unblocking (SP-0.5 r2)."""
