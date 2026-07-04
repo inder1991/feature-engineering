@@ -273,6 +273,26 @@ def test_current_cost_ceilings_rejects_malformed_config(monkeypatch):
             current_cost_ceilings()
 
 
+def test_retryable_external_command_dlqs_after_max_attempts(
+    autocommit_worker_conn, recording_caller, monkeypatch
+):
+    # A persistently-retryable (non-permanent) external command must GIVE UP to terminal 'failed'
+    # after max attempts, not retry forever — mirrors the queue/outbox DLQ (SP-0.5 r2 review #5).
+    monkeypatch.setenv("FEATUREGEN_EXTERNAL_MAX_ATTEMPTS", "2")
+    conn = autocommit_worker_conn
+    caller = recording_caller(invoke_result=IntegrationResult(False, {}, permanent=False))
+    register_integration_caller(caller)
+    cid = _record(conn, "dlq")
+
+    # attempt 1 -> back to pending (attempts=1 < 2)
+    invoke_claimed_external(conn, claim_next_pending(conn, ["llm"], now=NOW), caller, now=NOW)
+    assert _status(conn, cid) == "pending"
+    # attempt 2 (after the backoff window) -> attempts=2 >= 2 -> DLQ terminal 'failed'
+    later = NOW + timedelta(hours=2)
+    invoke_claimed_external(conn, claim_next_pending(conn, ["llm"], now=later), caller, now=later)
+    assert _status(conn, cid) == "failed"
+
+
 def test_run_worker_once_dispatches_external_commands(autocommit_worker_conn, recording_caller):
     # End-to-end wiring: a registered caller + a pending external command -> the worker's external
     # stage claims + invokes it on the real autocommit daemon connection (SP-0.5 round-2).

@@ -301,6 +301,17 @@ def _finalize(
                     (Jsonb(dict(res.result)), now, command_id),
                 )
                 outcome = DispatchOutcome(command_id, "failed", reinvoked, residual, reconciled)
+            elif attempts >= _external_max_attempts():
+                # Retries exhausted: give up to a terminal 'failed' (DLQ), mirroring the queue/outbox
+                # max-attempts behavior — a persistently-failing (non-permanent) integration must not
+                # retry FOREVER, which for a bank is an unbounded cost/noise path (SP-0.5 r2 review).
+                cur.execute(
+                    "UPDATE external_commands SET status='failed', result=%s, completed_at=%s "
+                    "WHERE command_id=%s",
+                    (Jsonb({"_dlq": "max_attempts_exhausted", **dict(res.result)}), now, command_id),
+                )
+                counters.incr("external.dlq")
+                outcome = DispatchOutcome(command_id, "failed", reinvoked, residual, reconciled)
             else:
                 # Retryable failure: back off before the row is claimable again, so a persistently
                 # failing command is not re-invoked up to `batch` times per tick (SP-0.5 r2 review).
@@ -311,6 +322,15 @@ def _finalize(
                 )
                 outcome = DispatchOutcome(command_id, "pending", reinvoked, residual, reconciled)
     return outcome
+
+
+def _external_max_attempts() -> int:
+    """Max dispatch attempts before a retryable external command is DLQ'd to 'failed' (§5.6). Config
+    via FEATUREGEN_EXTERNAL_MAX_ATTEMPTS, default 10 — mirrors the queue/outbox max-attempts DLQ so a
+    persistently-failing (non-permanent) integration cannot retry forever."""
+    import os
+
+    return int(os.environ.get("FEATUREGEN_EXTERNAL_MAX_ATTEMPTS", "10"))
 
 
 @dataclass(frozen=True, slots=True)
