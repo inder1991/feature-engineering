@@ -26,12 +26,27 @@ def drift_watermark(conn: DbConn, catalog_source: str) -> datetime | None:
     return row[0] if row else None
 
 
+def drift_head_seq(conn: DbConn, catalog_source: str) -> int | None:
+    """The global_seq the catalog_source's last drift scan advanced to (SP-1.5 review #2). resolve_fact
+    fails closed until the overlay projection checkpoint reaches this, so a just-drifted fact's STALE
+    is applied to the read model before it can be served."""
+    row = conn.execute(
+        "SELECT head_seq FROM overlay_drift_watermark WHERE catalog_source = %s",
+        (catalog_source,),
+    ).fetchone()
+    return row[0] if row else None
+
+
 def _write_watermark(conn: DbConn, catalog_source: str, now: datetime) -> None:
+    # head_seq = the global_seq at drift completion (after this scan's OVERLAY_FACT_STALED appends).
+    # The read-time guard requires the overlay projection checkpoint to reach it before serving.
+    head_seq = conn.execute("SELECT COALESCE(max(global_seq), 0) FROM events").fetchone()[0]
     conn.execute(
-        "INSERT INTO overlay_drift_watermark (catalog_source, last_completed_at, last_run_id) "
-        "VALUES (%s, %s, %s) ON CONFLICT (catalog_source) DO UPDATE "
-        "SET last_completed_at = EXCLUDED.last_completed_at, last_run_id = EXCLUDED.last_run_id",
-        (catalog_source, now, mint_id("drift")),
+        "INSERT INTO overlay_drift_watermark (catalog_source, last_completed_at, last_run_id, "
+        "head_seq) VALUES (%s, %s, %s, %s) ON CONFLICT (catalog_source) DO UPDATE "
+        "SET last_completed_at = EXCLUDED.last_completed_at, last_run_id = EXCLUDED.last_run_id, "
+        "head_seq = EXCLUDED.head_seq",
+        (catalog_source, now, mint_id("drift"), head_seq),
     )
 
 

@@ -16,7 +16,7 @@ from psycopg.rows import dict_row
 
 from featuregen.overlay._types import FactStatus, FactType
 from featuregen.overlay.catalog import CatalogAdapter
-from featuregen.overlay.catalog_changes import drift_watermark
+from featuregen.overlay.catalog_changes import drift_head_seq, drift_watermark
 from featuregen.overlay.config import current_overlay_config
 from featuregen.overlay.facts import FactValidationError, validate_fact_value
 from featuregen.overlay.identity import (
@@ -26,12 +26,14 @@ from featuregen.overlay.identity import (
     fact_key,
 )
 from featuregen.overlay.projection import read_proposal
+from featuregen.projections.runner import _checkpoint_seq
 from featuregen.runtime.observability import counters
 
 _REASON_MISSING = "no_confirmed_fact"
 _REASON_CATALOG_INVALID = "catalog_value_invalid"
 _REASON_EXPIRED = "expired_pending_reverify"  # SP-1.5 Task 3: read-time time-expiry guard
 _REASON_DRIFT_STALE = "drift_stale_pending_scan"  # SP-1.5 Task 5: read-time drift-freshness guard
+_REASON_DRIFT_LAGGING = "drift_projection_lagging"  # SP-1.5 review #2: projection behind the drift scan
 _REASON_NO_FRESHNESS = "no_freshness_proof"  # SP-1.5 Task 5 F2: VERIFIED fact with no deps (corrupt)
 
 
@@ -276,12 +278,25 @@ def resolve_fact(
                     "REVERIFY", _REASON_NO_FRESHNESS, obj, fact_type, use_case,
                     prior_value=row["value"], expires_at=_iso(exp), provenance=prov,
                 )
+            overlay_checkpoint = _checkpoint_seq(conn, "overlay")
             for src in sorted(sources):
                 wm = drift_watermark(conn, src)
                 if wm is None or (now - wm) > config.drift_freshness_sla:
                     return _overlay_blocked(
                         "REVERIFY", _REASON_DRIFT_STALE, obj, fact_type, use_case,
                         prior_value=row["value"], expires_at=_iso(exp), provenance={**prov, "stale_source": src},
+                    )
+                # Projection-lag guard (review #2): the drift scan advanced to head_seq in ONE
+                # transaction (STALED events + watermark), but the overlay projection applies those
+                # STALEs in a SEPARATE, lagging stage. Until the checkpoint reaches head_seq, a
+                # just-drifted fact is still VERIFIED in the read model with a fresh watermark — so
+                # fail closed rather than serve it.
+                head = drift_head_seq(conn, src)
+                if head is not None and head > overlay_checkpoint:
+                    return _overlay_blocked(
+                        "REVERIFY", _REASON_DRIFT_LAGGING, obj, fact_type, use_case,
+                        prior_value=row["value"], expires_at=_iso(exp),
+                        provenance={**prov, "lagging_source": src},
                     )
         return _overlay_verified(row, obj, fact_type, use_case)
 

@@ -136,3 +136,40 @@ def test_drift_freshness_guard_blocks_stale_and_missing(db):
     stale = resolve_fact(db, adapter, ref, "grain", now=now)
     assert stale.status == "REVERIFY" and stale.reason_if_missing == "drift_stale_pending_scan"
     assert stale.provenance["stale_source"] == "pg:core"
+
+
+def test_drift_projection_lag_blocks_until_caught_up(db):
+    # SP-1.5 re-review #2: while the overlay projection LAGS behind the drift scan (checkpoint <
+    # head_seq), a VERIFIED fact must fail closed — its STALE (if any) is in the store but not yet
+    # applied to the read model, so serving it would be a fail-open.
+    from datetime import UTC, datetime, timedelta
+
+    from featuregen.overlay.catalog import FixtureCatalog
+    from featuregen.overlay.catalog_changes import _write_watermark
+    from featuregen.overlay.config import OverlayConfig, register_overlay_config
+    from featuregen.overlay.identity import CatalogObjectRef
+    from featuregen.overlay.resolve import resolve_fact
+
+    _propose_and_confirm(db, "pg:core")
+    run_projection(db, OverlayProjection())  # checkpoint now at head
+    ref = CatalogObjectRef(catalog_source="pg:core", object_kind="table",
+                           schema="public", table="customers")
+    adapter = FixtureCatalog(catalog_source="pg:core")
+    now = datetime(2026, 6, 1, tzinfo=UTC)
+    register_overlay_config(OverlayConfig(
+        ttl_default=timedelta(days=180), ttl_min=timedelta(days=30), ttl_max=timedelta(days=365),
+        ttl_jitter_fraction=0.1, renewal_grace=timedelta(days=14),
+        drift_scan_interval=timedelta(minutes=15), drift_freshness_sla=timedelta(minutes=60),
+        profiler_require_restricted_role=False,
+    ))
+    _write_watermark(db, "pg:core", now - timedelta(minutes=10))  # fresh; head_seq == checkpoint
+
+    # Drift advanced BEYOND the projection (projection lagging) -> fail closed.
+    db.execute("UPDATE overlay_drift_watermark SET head_seq = head_seq + 1 WHERE catalog_source = 'pg:core'")
+    blocked = resolve_fact(db, adapter, ref, "grain", now=now)
+    assert blocked.status == "REVERIFY" and blocked.reason_if_missing == "drift_projection_lagging"
+    assert blocked.provenance["lagging_source"] == "pg:core"
+
+    # Projection caught up (checkpoint >= head_seq) -> served.
+    db.execute("UPDATE overlay_drift_watermark SET head_seq = head_seq - 1 WHERE catalog_source = 'pg:core'")
+    assert resolve_fact(db, adapter, ref, "grain", now=now).status == "VERIFIED"
