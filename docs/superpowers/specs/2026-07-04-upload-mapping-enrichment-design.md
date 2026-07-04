@@ -9,9 +9,11 @@ The **front door** of the upload-driven catalog. It turns arbitrary uploaded sch
 varying headers, one or more per source) into validated **canonical rows** plus advisory enrichment,
 then commits them as events that feed the facts / drift / graph / search projections.
 
-In scope: reading, header→field mapping, value rules, validation, the large-change brake, and LLM
-enrichment. Out of scope (separate docs): the downstream projections, search ranking, and the serve
-path. Assumes the pivot: no live DB, no ownership, no approval, governance retired.
+In scope: reading, header→field mapping (incl. **save & remember** per source), value rules, validation,
+the large-change brake, LLM enrichment, and — at the design level — how ingested content **links** across
+sources (graph edges) and is **retrieved** at feature-engineering time. Out of scope (separate docs): the
+detailed search-ranking algorithm and the serve/query implementation. Assumes the pivot: no live DB, no
+ownership, no approval, governance retired.
 
 ## Principles (decided in design dialogue)
 
@@ -117,16 +119,100 @@ Test for "can the LLM decide with no human?": *if it is confidently wrong, does 
 it silently corrupt something?* Code-catchable or low-stakes → no human. Silent + high-stakes → one
 confirm at onboarding.
 
-## Per-source mapping & drift stability
+## Mapping — save & remember (the load-bearing memory)
 
-The saved mapping per source: `{ source, header→field, value_rules, established_at, established_by }`,
-reused on every re-upload. Two distinct change types must not be confused:
-- **Header change** (the FILE's columns change — a header added/removed/renamed) → a **mapping event**:
-  re-run Step B for the changed headers only, update the saved mapping (human glance if load-bearing).
-- **Data change** (the schema the file describes changes — a table/column dropped/renamed) → a **drift
-  event**: handled by the drift diff in F.
-Keeping the mapping stable is what lets the drift diff attribute a change to the *schema*, not to the
-platform re-reading the file.
+This is the piece everything downstream rides on: get the "remember" wrong and re-uploads either need
+re-mapping every time or corrupt drift.
+
+### Two identities — never conflate them
+- **`source`** — a *bookkeeping* label used only for drift (which prior snapshot the next upload diffs
+  against). Must be **stable across re-uploads**. A random/uninformative filename is bad *only* for this,
+  so `source` is set explicitly (a `source` column, else the filename stem, overridable at upload).
+- **Meaning** (domain / concept / definition) — *inferred from the file's CONTENT* by Step E, never from
+  the name. A file of `txn_id, amount, merchant, posted_at` classifies to *Payments / Card Transactions*
+  regardless of what it's called. A random filename costs nothing on understanding.
+
+### The mapping record (per source)
+```
+source            : "deposits"
+format            : "csv"
+header_signature  : ["Physical Table","Attribute Name","SQL Type","PII Flag","Comment"]   # exact expected headers
+field_map         : { "Physical Table"→table, "Attribute Name"→column, "SQL Type"→type,
+                      "PII Flag"→sensitivity, "Comment"→definition }
+value_rules       : { sensitivity: { "Y"→pii, "N"→null } }
+established_by     : human | llm      established_at : 2026-07-04      confidence : …
+```
+`field_map` (header→field) + `header_signature` (the fingerprint of the header set this mapping was built
+for) do the work.
+
+### Stored as EVENTS, not a config row
+`MAPPING_ESTABLISHED` / `MAPPING_UPDATED` events in the same append-only log; the "current mapping per
+source" is a projection (fold). Buys **audit** (who/when/why a source is mapped this way), **history**
+(the mapping changed when the export tool changed), and **consistency** with the backbone. The durable
+data is still the committed canonical rows (fact/catalog events) — the mapping only interprets the *next*
+upload, so old files are never re-mapped.
+
+### Reuse on re-upload — the header-signature match
+1. Identify the `source` → load its current mapping (projection). None → **new source** → full Step B
+   (aliasing + LLM, human only on ambiguous load-bearing fields) → `MAPPING_ESTABLISHED`.
+2. Mapping exists → compare the file's headers to the saved `header_signature`:
+   - **match → reuse the mapping directly** — no LLM, no human, deterministic (the normal re-upload).
+   - **mismatch → the file's columns changed** → re-run Step B for the *changed headers only* →
+     `MAPPING_UPDATED` (human glance if load-bearing).
+3. Apply → canonical rows → D onward.
+
+### The crux: mapping-change vs drift-change (the `header_signature` disambiguates)
+- **Headers change** (file format changed, e.g. tool now writes `COL` not `Attribute Name`) → a **mapping
+  event** — remap; do NOT fire drift.
+- **Data changes** (headers same, but `posted_at` renamed to `event_ts` in the schema) → a **drift event**
+  — mapping untouched, the drift diff stales the affected facts.
+- Confusing these is catastrophic: a harmless tool-format change would look like the whole schema drifted,
+  or a real rename would be silently absorbed by re-guessing the mapping. Stable + fingerprinted mapping
+  prevents both.
+
+*deposits, three months:* M1 new source → establish + save. M2 same headers, `posted_at→event_ts` in the
+data → headers match → reuse automatically → drift stales the fact. M3 export tool changed the headers →
+mismatch → remap (`MAPPING_UPDATED`) → then ingest + drift.
+
+## Linking — how columns connect across sources
+
+An uploaded file becomes *connected*, not a lonely blob, through graph **edges** at four strengths:
+
+1. **Declared joins (strongest).** `joins_to = accounts.account_id` becomes an explicit edge — and it may
+   cross sources (a transactions file → the `accounts` table from a *different* upload). Every object is
+   **source-qualified**, so cross-file joins are unambiguous. The more `joins_to` your files carry, the
+   richer and more trustworthy the graph.
+2. **Pending joins.** If the target isn't loaded yet (`accounts` not uploaded), the edge is recorded
+   **pending** and **resolves automatically** when that source arrives — so upload order doesn't matter.
+3. **Suggested joins (LLM/heuristic).** Undeclared links are *proposed* from name + type + concept
+   similarity (`transactions.acct_id` ↔ `accounts.account_id`) → **surfaced for a one-time human confirm,
+   never auto-applied** (load-bearing).
+4. **Concept links.** Columns sharing a `concept` tag connect through a concept node (`transactions.amount`
+   and `accounts.balance` both → *monetary amount*), powering estate-wide queries ("every monetary field
+   at the customer grain").
+5. **Domain grouping.** The file's tables join their `domain` node as siblings of related tables.
+
+**No-DB limitation (be explicit):** without the data we cannot verify a join by value overlap. So
+cross-source links come from **declared `joins_to`** (reliable) and **metadata similarity** (a hint, not
+proof) — which is exactly why *suggested* joins are advisory and human-confirmed. Declared joins are
+always the strongest glue.
+
+## Retrieval — how it's found at feature-engineering time
+
+Ingested content becomes **graph nodes** (name, type, definition, domain/subdomain, concept tags) and
+flows into the **search index** (full-text over names + definitions + tags). So an analyst never needs the
+filename:
+
+- Search "customer transaction amount" → `transactions.amount` surfaces because full-text matched its
+  name/definition, its `concept = monetary amount` matched "amount", its `domain = Payments` matched
+  "transaction" — **ranked by graph context** (connected/joinable/grained/already-used beats an orphan).
+- The result carries context, not just a hit: *"amount (transactions) · Payments · monetary · joins
+  accounts on acct_id · accounts is customer-grained."* So the analyst gets **the join key and the grain**
+  needed to build the feature correctly, point-in-time — without archaeology.
+
+Retrieval quality is therefore a product of: good **definitions** (drafted at ingest), **concept/domain**
+tags, and the **link edges** above — the graph is what makes a random-named transaction dump a findable,
+placed, wired-in part of the estate.
 
 ## LLM usage boundaries (safety)
 
