@@ -570,3 +570,44 @@ def test_migrate_subcommand_applies_migrations(_dsn) -> None:
     from featuregen.__main__ import main
 
     assert main(["migrate", "--dsn", _dsn]) == 0
+
+
+def test_run_drift_scan_skips_and_cadence_gates(db):
+    # SP-1.5 Task 4: the drift stage skips (0) with no adapter/config, runs when due, and skips
+    # within the scan interval (not every tick).
+    from datetime import UTC, datetime, timedelta
+
+    from featuregen.overlay.catalog import (
+        FixtureCatalog,
+        _clear_catalog_adapter,
+        register_catalog_adapter,
+    )
+    from featuregen.overlay.catalog_changes import drift_watermark
+    from featuregen.overlay.config import (
+        OverlayConfig,
+        _clear_overlay_config,
+        register_overlay_config,
+    )
+    from featuregen.runtime.worker import _run_drift_scan
+
+    now = datetime(2026, 6, 1, tzinfo=UTC)
+    assert _run_drift_scan(db, now=now) == 0  # no adapter -> skip-loud
+
+    register_catalog_adapter(FixtureCatalog(catalog_source="pg:core"))
+    register_overlay_config(OverlayConfig(
+        ttl_default=timedelta(days=180), ttl_min=timedelta(days=30), ttl_max=timedelta(days=365),
+        ttl_jitter_fraction=0.1, renewal_grace=timedelta(days=14),
+        drift_scan_interval=timedelta(minutes=15), drift_freshness_sla=timedelta(minutes=60),
+        profiler_require_restricted_role=False,
+    ))
+    try:
+        _run_drift_scan(db, now=now)  # first run (no watermark) -> runs
+        assert drift_watermark(db, "pg:core") == now
+        _run_drift_scan(db, now=now + timedelta(minutes=5))  # within interval -> skip
+        assert drift_watermark(db, "pg:core") == now
+        later = now + timedelta(minutes=20)  # past interval -> runs again
+        _run_drift_scan(db, now=later)
+        assert drift_watermark(db, "pg:core") == later
+    finally:
+        _clear_catalog_adapter()
+        _clear_overlay_config()

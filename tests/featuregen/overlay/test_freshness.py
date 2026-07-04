@@ -553,3 +553,15 @@ def test_dependency_index_tracks_confirmed_override_not_proposed_column(db):
     after = [_obj(tbl, oid="oid-cust")]  # tier dropped
     detect_catalog_changes(db, _adapter(after, owners), actor=SERVICE_ACTOR)
     assert load_fact(db, key)[-1].type == OVERLAY_FACT_STALED
+
+
+def test_drift_scan_writes_watermark(db):
+    # SP-1.5 Task 4: a completed drift scan advances the per-source watermark atomically.
+    from datetime import UTC, datetime
+
+    from featuregen.overlay.catalog_changes import drift_watermark
+
+    now = datetime(2026, 6, 1, tzinfo=UTC)
+    assert drift_watermark(db, "pg:core") is None  # none until the first scan completes
+    detect_catalog_changes(db, _adapter([]), actor=SERVICE_ACTOR, now=now)
+    assert drift_watermark(db, "pg:core") == now

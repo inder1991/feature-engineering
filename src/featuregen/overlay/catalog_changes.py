@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass
+from datetime import UTC, datetime
 
 from featuregen.contracts.db import DbConn
 from featuregen.contracts.errors import ConcurrencyError
+from featuregen.idgen import mint_id
 from featuregen.overlay.authority import resolve_authority
 from featuregen.overlay.facts import OVERLAY_FACT_STALED
 from featuregen.overlay.identity import _ref_from_payload
@@ -12,6 +14,25 @@ from featuregen.overlay.projection import dependents_of
 from featuregen.overlay.reverify_tasks import open_reverify_task
 from featuregen.overlay.state import fold_overlay_state
 from featuregen.overlay.store import append_overlay_event, load_fact
+
+
+def drift_watermark(conn: DbConn, catalog_source: str) -> datetime | None:
+    """The last_completed_at of the most recent SUCCESSFUL drift scan for `catalog_source`, or None
+    if none has completed (SP-1.5 Task 4). Read by Task 5's read-time drift-freshness guard."""
+    row = conn.execute(
+        "SELECT last_completed_at FROM overlay_drift_watermark WHERE catalog_source = %s",
+        (catalog_source,),
+    ).fetchone()
+    return row[0] if row else None
+
+
+def _write_watermark(conn: DbConn, catalog_source: str, now: datetime) -> None:
+    conn.execute(
+        "INSERT INTO overlay_drift_watermark (catalog_source, last_completed_at, last_run_id) "
+        "VALUES (%s, %s, %s) ON CONFLICT (catalog_source) DO UPDATE "
+        "SET last_completed_at = EXCLUDED.last_completed_at, last_run_id = EXCLUDED.last_run_id",
+        (catalog_source, now, mint_id("drift")),
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,7 +97,9 @@ def _save_snapshot(conn: DbConn, catalog_source: str, current) -> None:
             )
 
 
-def detect_catalog_changes(conn: DbConn, adapter, *, actor) -> list[Change]:
+def detect_catalog_changes(
+    conn: DbConn, adapter, *, actor, now: datetime | None = None
+) -> list[Change]:
     """Snapshot adapter.fingerprint() into overlay_catalog_object and diff it against the
     prior snapshot (§8). Because fact_key is name-based, a rename always yields a NEW key:
     the old object is STALEd and the renamed object is onboarded afresh; the stable native
@@ -113,6 +136,10 @@ def detect_catalog_changes(conn: DbConn, adapter, *, actor) -> list[Change]:
             _stale_dependents(conn, adapter, ch, actor=actor)
 
     _save_snapshot(conn, csource, current)
+    # Atomic completion (SP-1.5 Task 4): the watermark advances in the SAME transaction as the
+    # snapshot advance + dependent-staling above, so a crash before commit re-detects the drift next
+    # run (never laundered). This is what Task 5's read-time freshness guard attests to.
+    _write_watermark(conn, csource, now or datetime.now(UTC))
     return changes
 
 

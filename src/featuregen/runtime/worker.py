@@ -14,6 +14,7 @@ a counted, logged error and NEVER stalls the tick.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import signal
@@ -27,6 +28,8 @@ from psycopg.rows import dict_row
 
 from featuregen.contracts import Command, Projection
 from featuregen.overlay.catalog import current_catalog_adapter
+from featuregen.overlay.catalog_changes import detect_catalog_changes, drift_watermark
+from featuregen.overlay.config import current_overlay_config
 from featuregen.overlay.expiry import fire_due_overlay_expiries
 from featuregen.projections.runner import projection_lag, run_projection
 from featuregen.runtime.dispatch import process_one, recover_stuck
@@ -233,6 +236,44 @@ def _advance_overlay_expiries(conn: psycopg.Connection, *, now: datetime) -> int
     return fire_due_overlay_expiries(conn, now=now)
 
 
+def _drift_actor():
+    """Fail-safe (unattested, never forged) service principal for the drift scanner's STALE events +
+    re-verify task opens — mirrors _control_actor / the overlay-expiry poller."""
+    from featuregen.identity.build import build_service_identity
+
+    return build_service_identity(
+        subject="service:overlay-drift", role_claims=("overlay",), attestation="drift-scanner"
+    )
+
+
+def _run_drift_scan(conn: psycopg.Connection, *, now: datetime) -> int:
+    """Cadence-gated, multi-worker-safe catalog-drift scan (SP-1.5 Task 4). SKIPS (not errors) when
+    no catalog adapter or OverlayConfig is wired. `pg_try_advisory_xact_lock` ensures ONE worker
+    scans a catalog at a time; the scan runs only when the drift watermark is older than
+    `drift_scan_interval` (or absent), so it is NOT run every ~1s tick. detect_catalog_changes
+    advances the snapshot + watermark atomically (crash-safe)."""
+    try:
+        adapter = current_catalog_adapter()
+    except RuntimeError:
+        counters.incr("overlay.drift.skipped_no_adapter")
+        return 0
+    try:
+        config = current_overlay_config()
+    except RuntimeError:
+        counters.incr("overlay.drift.skipped_no_config")
+        return 0
+    csource = adapter.catalog_source
+    lock_key = int.from_bytes(
+        hashlib.sha256(f"overlay_drift:{csource}".encode()).digest()[:8], "big", signed=True
+    )
+    if not conn.execute("SELECT pg_try_advisory_xact_lock(%s)", (lock_key,)).fetchone()[0]:
+        return 0  # another worker is scanning this catalog this tick
+    wm = drift_watermark(conn, csource)
+    if wm is not None and (now - wm) < config.drift_scan_interval:
+        return 0  # not due yet (slow cadence, not every tick)
+    return len(detect_catalog_changes(conn, adapter, actor=_drift_actor(), now=now))
+
+
 def _stage(name: str) -> Callable:
     """Wrap a stage callable so a fault increments a counted, logged error and returns a fallback
     instead of propagating — one failing stage never stalls the tick (the poison guard already
@@ -365,6 +406,10 @@ def run_worker_once(
     overlay_expiries = _stage("overlay_expiry")(
         lambda: _tx(conn, lambda: _advance_overlay_expiries(conn, now=now)), 0
     )
+
+    # Catalog-drift scan (SP-1.5 Task 4): its own transaction (advisory-locked, cadence-gated,
+    # snapshot+watermark advanced atomically). Skips cleanly when no adapter/config is wired.
+    _stage("drift")(lambda: _tx(conn, lambda: _run_drift_scan(conn, now=now)), 0)
 
     def _advance_projections() -> int:
         advanced = 0
