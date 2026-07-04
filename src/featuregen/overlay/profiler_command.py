@@ -25,6 +25,7 @@ from featuregen.overlay.profiler import (
 )
 from featuregen.overlay.state import fold_overlay_state
 from featuregen.overlay.store import load_fact
+from featuregen.runtime.observability import counters
 from featuregen.security.audit import record_denial
 
 
@@ -42,23 +43,45 @@ def _existing_proposal_fingerprint(conn: DbConn, fk: str) -> tuple[str | None, s
     return state.status, fp
 
 
-def _effective_allowed_schemas(cmd: Command, adapter) -> frozenset[str]:
-    """The SERVER-SIDE profiler allowlist (SP-1.5 Task 8). When an OverlayConfig is sealed, the
-    schemas the profiler may scan come from config.profiler_rules (allow=True, for THIS adapter's
-    catalog_source) — the AUTHORITATIVE list. A caller's `allowed_schemas` can only NARROW it, never
-    widen it, so a caller can no longer point the profiler at a restricted schema. With no config
-    sealed, the caller-supplied list stands (backward-compat)."""
+def _profiler_denial(cmd: Command, adapter, ref) -> str | None:
+    """TABLE-GRANULAR server-side profiler gate (SP-1.5 Task 8 + review #4/#8). Returns a denial
+    reason, or None when the profiler may scan `ref`.
+
+    When an OverlayConfig is sealed, config.profiler_rules is AUTHORITATIVE and evaluated PER TABLE
+    (not per schema): a target `schema.table` for this adapter's catalog_source is permitted iff it
+    matches an allow rule AND no deny rule — DENY WINS, DEFAULT DENY. So a single table-scoped allow
+    no longer opens the whole schema, and a table-scoped deny is honored. A caller's `allowed_schemas`
+    can only NARROW this. With no OverlayConfig sealed, the caller-supplied schemas stand (dev /
+    backward-compat) — counted loudly, since production is expected to seal a config."""
     caller = frozenset(cmd.args.get("allowed_schemas", ()))
     try:
         config = current_overlay_config()
     except RuntimeError:
-        return caller
-    allowed = frozenset(
-        r.schema
-        for r in config.profiler_rules
-        if r.allow and r.catalog_source == adapter.catalog_source
-    )
-    return (caller & allowed) if caller else allowed
+        counters.incr("overlay.profiler.no_config_caller_allowlist")
+        return None if ref.schema in caller else (
+            f"schema {ref.schema!r} is not on the caller allowlist {sorted(caller)}"
+        )
+    matches = [
+        r for r in config.profiler_rules
+        if r.catalog_source == adapter.catalog_source
+        and r.schema == ref.schema
+        and r.table == ref.table
+    ]
+    if any(not r.allow for r in matches):
+        return f"{ref.schema}.{ref.table} is denied by profiler policy"
+    if not any(r.allow for r in matches):
+        return f"{ref.schema}.{ref.table} matches no profiler allow rule (default deny)"
+    if caller and ref.schema not in caller:
+        return f"schema {ref.schema!r} is not on the caller allowlist {sorted(caller)}"
+    return None
+
+
+def _profiler_requires_restricted_role() -> bool:
+    """OverlayConfig.profiler_require_restricted_role, or False when no config is sealed."""
+    try:
+        return current_overlay_config().profiler_require_restricted_role
+    except RuntimeError:
+        return False
 
 
 def _run_profiler(conn: DbConn, cmd: Command) -> CommandResult:
@@ -73,7 +96,15 @@ def _run_profiler(conn: DbConn, cmd: Command) -> CommandResult:
     guarantees no orphan evidence is left for a candidate `propose_fact` would deny."""
     ref = CatalogObjectRef(**dict(cmd.args["ref"]))
     adapter = current_catalog_adapter()
-    limits = ProfilerLimits(allowed_schemas=_effective_allowed_schemas(cmd, adapter))
+    # TABLE-GRANULAR server-side gate (review #4): decide allow/deny for THIS exact schema.table
+    # before scanning; a single table-allow no longer opens the whole schema.
+    denial = _profiler_denial(cmd, adapter, ref)
+    if denial is not None:
+        record_denial(conn, cmd, denial)
+        return CommandResult(
+            accepted=False, aggregate_id=display_object_ref(ref), denied_reason=denial
+        )
+    limits = ProfilerLimits(allowed_schemas=frozenset({ref.schema}))  # gate passed for this target
     # Run the SCAN phase under an in-code read-only guard (defense-in-depth for §5.2's
     # read-only DB role) so a stray write inside run_profiler_scan fails closed. The scan only
     # SELECTs, so a savepoint we immediately roll back loses nothing; the rollback also clears
@@ -84,6 +115,18 @@ def _run_profiler(conn: DbConn, cmd: Command) -> CommandResult:
     # capability+kind, NOT the schema, so the handler must audit it) and return cleanly.
     conn.execute("SAVEPOINT profiler_readonly")
     conn.execute("SET LOCAL transaction_read_only = on")
+    # profiler_require_restricted_role (review #9): actually ENFORCE the flag — verify the read-only
+    # guard took effect on this session; fail closed if a misconfigured/privileged connection ignored
+    # SET LOCAL, rather than scanning under an unrestricted session.
+    if _profiler_requires_restricted_role() and (
+        conn.execute("SHOW transaction_read_only").fetchone()[0] != "on"
+    ):
+        conn.execute("ROLLBACK TO SAVEPOINT profiler_readonly")
+        reason = "profiler_require_restricted_role: read-only session guard did not take effect"
+        record_denial(conn, cmd, reason)
+        return CommandResult(
+            accepted=False, aggregate_id=display_object_ref(ref), denied_reason=reason
+        )
     try:
         proposals = run_profiler_scan(conn, adapter, ref, limits=limits)
     except SchemaNotAllowedError as exc:
