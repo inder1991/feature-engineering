@@ -82,6 +82,43 @@ class OverlayConfig:
             )
 
 
+def overlay_config_from_env(env: Mapping[str, str] | None = None) -> OverlayConfig:
+    """Build the sealed OverlayConfig from the deployment environment (single-node defaults). Wired
+    by register_overlay in PRODUCTION so the SP-1.5 guards (drift-freshness, renewal, referent
+    validation, profiler policy) are ACTIVE rather than silently off. Invalid combinations raise
+    OverlayConfigError at deploy (fail-closed). profiler_rules default to EMPTY -> the profiler
+    default-denies every target until a deployment configures OVERLAY_PROFILER_RULES (fail-safe)."""
+    import json
+    import os
+
+    e = os.environ if env is None else env
+
+    def _days(key: str, default: float) -> timedelta:
+        return timedelta(days=float(e.get(key, default)))
+
+    def _mins(key: str, default: float) -> timedelta:
+        return timedelta(minutes=float(e.get(key, default)))
+
+    rules_raw = e.get("OVERLAY_PROFILER_RULES", "")
+    rules = tuple(
+        ProfilerRule(r["catalog_source"], r["schema"], r["table"], bool(r["allow"]))
+        for r in (json.loads(rules_raw) if rules_raw else [])
+    )
+    return OverlayConfig(
+        ttl_default=_days("OVERLAY_TTL_DEFAULT_DAYS", 180),
+        ttl_min=_days("OVERLAY_TTL_MIN_DAYS", 30),
+        ttl_max=_days("OVERLAY_TTL_MAX_DAYS", 365),
+        ttl_jitter_fraction=float(e.get("OVERLAY_TTL_JITTER_FRACTION", 0.1)),
+        renewal_grace=_days("OVERLAY_RENEWAL_GRACE_DAYS", 14),
+        drift_scan_interval=_mins("OVERLAY_DRIFT_SCAN_INTERVAL_MIN", 15),
+        drift_freshness_sla=_mins("OVERLAY_DRIFT_FRESHNESS_SLA_MIN", 60),
+        profiler_require_restricted_role=(
+            e.get("OVERLAY_PROFILER_REQUIRE_RESTRICTED_ROLE", "").lower() in ("1", "true", "yes")
+        ),
+        profiler_rules=rules,
+    )
+
+
 # --- Sealed, fail-closed accessor (mirrors current_catalog_adapter) ------------------------
 _OVERLAY_CONFIG: OverlayConfig | None = None
 

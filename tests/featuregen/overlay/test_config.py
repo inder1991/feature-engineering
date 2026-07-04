@@ -164,3 +164,30 @@ def test_profiler_caller_can_only_narrow():
     assert _profiler_denial(narrowing, adapter, ref) is not None  # caller excluded core
     permissive = Command("run_profiler", "overlay_fact", None, {"allowed_schemas": ["core"]}, actor, "k")
     assert _profiler_denial(permissive, adapter, ref) is None
+
+
+def test_overlay_config_from_env_defaults_and_overrides():
+    # SP-1.5 review (reachability): production builds the sealed config from env — defaults are valid,
+    # env overrides apply, and profiler_rules default to EMPTY (profiler default-denies until set).
+    from datetime import timedelta
+
+    from featuregen.overlay.config import overlay_config_from_env
+
+    c = overlay_config_from_env({})
+    assert c.ttl_default == timedelta(days=180)
+    assert c.renewal_grace == timedelta(days=14)
+    assert c.drift_scan_interval == timedelta(minutes=15)
+    assert c.drift_freshness_sla == timedelta(minutes=60)
+    assert c.profiler_rules == ()  # fail-safe: nothing profileable until configured
+
+    c2 = overlay_config_from_env({
+        "OVERLAY_TTL_DEFAULT_DAYS": "90",
+        "OVERLAY_DRIFT_FRESHNESS_SLA_MIN": "45",
+        "OVERLAY_PROFILER_REQUIRE_RESTRICTED_ROLE": "true",
+        "OVERLAY_PROFILER_RULES":
+            '[{"catalog_source":"pg:core","schema":"core","table":"orders","allow":true}]',
+    })
+    assert c2.ttl_default == timedelta(days=90)
+    assert c2.drift_freshness_sla == timedelta(minutes=45)
+    assert c2.profiler_require_restricted_role is True
+    assert len(c2.profiler_rules) == 1 and c2.profiler_rules[0].table == "orders"

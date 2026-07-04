@@ -563,6 +563,7 @@ def run_forever(
 
     `relay_routes` overrides the env-file route map (SP-0.5 r2 review #5). Cost-ceiling config is
     validated up front so a typo fails the worker at boot, not mid-finalize (review #3)."""
+    from featuregen.overlay.config import overlay_config_from_env, register_overlay_config
     from featuregen.runtime.cost_budget import current_cost_ceilings
 
     owner = owner or f"worker-{os.getpid()}"
@@ -573,6 +574,12 @@ def run_forever(
     conn = psycopg.connect(dsn, autocommit=True)
     try:
         registry, projections = compose(conn)
+        # SP-1.5 (review — reachability): seal the OverlayConfig from env at boot so the drift,
+        # renewal, referent-validation and profiler guards are ACTIVE in production, not silently
+        # off. Fails fast on malformed config (OverlayConfigError), like the cost ceilings below.
+        # (The read/API process must likewise seal it via overlay_config_from_env() for resolve_fact's
+        # drift-freshness guard; drift-STALEing itself is driven here in the worker.)
+        register_overlay_config(overlay_config_from_env())
         publish = _relay_publisher_from_env(relay_routes)  # production route policy (SP-0.5 r2)
         current_cost_ceilings()  # fail-fast on malformed cost-ceiling config (review #3)
         log("worker.start", dsn=_safe_dsn(dsn), owner=owner, interval=interval)
