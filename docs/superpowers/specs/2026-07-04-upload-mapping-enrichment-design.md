@@ -132,11 +132,31 @@ re-mapping every time or corrupt drift.
 
 ### Two identities — never conflate them
 - **`source`** — a *bookkeeping* label used only for drift (which prior snapshot the next upload diffs
-  against). Must be **stable across re-uploads**. A random/uninformative filename is bad *only* for this,
-  so `source` is set explicitly (a `source` column, else the filename stem, overridable at upload).
+  against). Must be **stable across re-uploads**. It is the *drift baseline key*, so getting it right
+  matters; see the resolution ladder below.
 - **Meaning** (domain / concept / definition) — *inferred from the file's CONTENT* by Step E, never from
   the name. A file of `txn_id, amount, merchant, posted_at` classifies to *Payments / Card Transactions*
   regardless of what it's called. A random filename costs nothing on understanding.
+
+### Resolving `source` — the DBA almost never types it (onboard-once, auto-thereafter)
+Determined by a ladder, cheapest-first — the filename is **not** used (random/inconsistent names are the
+whole problem):
+1. **`source` column in the file → zero-touch.** If the export carries a `system`/`source` column, read
+   it. No prompt, even on a first upload. (Encouraged in the template.)
+2. **Content auto-match on re-upload → automatic, confirm by exception.** Before asking anything, compare
+   the file's *table/column set* to every existing source's snapshot. Strong, unambiguous overlap →
+   **recognized as that source automatically** (covers the whole monthly-re-upload case — nothing to
+   select). This is **confidence-gated because it is load-bearing**: a wrong match diffs against the wrong
+   baseline (false drift / missed drift), and table names *can* collide (`deposits` vs `deposits_reporting`
+   both have `accounts`). So: high overlap → auto; medium / two plausible sources → "looks like `deposits`
+   (85%) — confirm?"; low / none → treat as new.
+3. **New source (no match) → propose a name, don't ask for one.** Derive a candidate from the `source`
+   column if present, else the LLM inferring it from the content ("these look like a Deposits system →
+   `deposits`"); the user **confirms or renames in one click**, never a blank field.
+
+Manual selection is only the fallback when auto-match is genuinely ambiguous — not the default. Same
+"silent + load-bearing → gate it" rule as grain/join mapping: auto when confident, confirm when not,
+never blind.
 
 ### The mapping record (per source)
 ```
@@ -242,8 +262,8 @@ placed, wired-in part of the estate.
 
 ## Open decisions
 
-- **`source` determination** — a `source` column, the filename stem, or chosen at upload. Recommend:
-  a `source` column when present, else the filename stem, overridable at upload.
+- **`source` determination** — RESOLVED: the ladder in "Resolving `source`" above (`source` column →
+  content auto-match, confidence-gated → propose-a-name for a new source). Filename is not used.
 - **One file → many sources?** Recommend: allow a `source` column so one file can carry several.
 - **Brake threshold** (default 30% object removal) — policy, tunable per deployment.
 - **First-onboarding human confirm** — recommend: required *only* when a load-bearing field is
