@@ -27,11 +27,24 @@ from psycopg.rows import dict_row
 from featuregen.contracts import Command, Projection
 from featuregen.overlay.catalog import current_catalog_adapter
 from featuregen.overlay.expiry import fire_due_overlay_expiries
-from featuregen.projections.runner import run_projection
+from featuregen.projections.runner import projection_lag, run_projection
 from featuregen.runtime.dispatch import process_one, recover_stuck
+from featuregen.runtime.external_commands import (
+    claim_next_pending,
+    claim_stale_dispatched,
+    current_integration_callers,
+    dispatch_command,
+    invoke_claimed_external,
+    pending_unhandled_count,
+)
 from featuregen.runtime.observability import counters, log
 from featuregen.runtime.outbox import OutboxMessage, make_queue_publisher, relay_publish_batch
-from featuregen.runtime.queue import CONTROL_SIGNAL_HANDLERS, complete, fail_permanent
+from featuregen.runtime.queue import (
+    CONTROL_SIGNAL_HANDLERS,
+    complete,
+    fail_permanent,
+    queue_depth,
+)
 from featuregen.runtime.timers import fire_timer, poll_due_timers
 
 # Outbox topic -> internal step handler. EMPTY by default: in this SP-0.5 slice the async steps
@@ -57,6 +70,7 @@ class WorkerTick:
     reclaimed: tuple[int, int]
     parked: int
     errors: int
+    external_dispatched: int = 0
 
 
 def _control_actor():
@@ -225,6 +239,8 @@ def run_worker_once(
     now: datetime,
     batch: int = 50,
     publish: Callable[[psycopg.Connection, OutboxMessage], None] | None = None,
+    leaked_conn_cap: int | None = None,
+    external_stale_seconds: float | None = None,
 ) -> WorkerTick:
     """ONE bounded, non-blocking pass over every runtime stage (no sleeps, so unit-testable):
 
@@ -236,6 +252,10 @@ def run_worker_once(
     Returns a `WorkerTick` of per-stage counts for tests + metrics."""
     if publish is None:
         publish = make_queue_publisher(_DEFAULT_RELAY_ROUTE)
+    if leaked_conn_cap is None:
+        leaked_conn_cap = int(os.environ.get("FEATUREGEN_LEAKED_CONN_CAP", "50"))
+    if external_stale_seconds is None:
+        external_stale_seconds = float(os.environ.get("FEATUREGEN_EXTERNAL_STALE_SECONDS", "300"))
     errors_before = counters.snapshot()["counters"].get("worker.errors", 0)
 
     reclaimed = _stage("recover_stuck")(lambda: recover_stuck(conn), (0, 0))
@@ -245,6 +265,14 @@ def run_worker_once(
     parked = _stage("control_signals")(lambda: drain_control_signals(conn), 0)
 
     def _drain_queue() -> int:
+        # Bound the abandoned-connection leak (SP-0.5 r2): once wedged-handler timeouts have leaked
+        # more than the cap, STOP claiming new work and surface it LOUD so an operator restarts,
+        # instead of leaking one more connection per claim indefinitely.
+        leaked = counters.snapshot()["counters"].get("dispatch.leaked_connections", 0)
+        if leaked > leaked_conn_cap:
+            counters.incr("worker.leaked_cap_halt")
+            log("worker.leaked_cap_halt", leaked=leaked, cap=leaked_conn_cap, owner=owner)
+            return 0
         processed = 0
         for _ in range(batch):
             outcome = process_one(conn, registry, owner=owner)
@@ -260,6 +288,33 @@ def run_worker_once(
     relay_published = _stage("relay")(
         lambda: relay_publish_batch(conn, publish, owner=owner), 0
     )
+
+    def _dispatch_external() -> int:
+        # External commands own their OWN transactions (claim + call + finalize each commit), so
+        # this stage runs on the raw autocommit connection — NOT wrapped in _tx (SP-0.5 round-2).
+        callers = current_integration_callers()
+        registered = list(callers)
+        processed = 0
+        # First dispatch: claim (SKIP LOCKED) + FRESH invoke each pending command whose integration
+        # has a registered caller. An unregistered integration is never claimed.
+        for _ in range(batch):
+            claimed = claim_next_pending(conn, registered, now=now)
+            if claimed is None:
+                break
+            invoke_claimed_external(conn, claimed, callers[claimed.integration], now=now)
+            processed += 1
+        # Crash recovery: sweep rows stuck in 'dispatched' (a worker died mid-dispatch) through
+        # dispatch_command's idempotency-safe recovery path.
+        for cid, integration in claim_stale_dispatched(
+            conn, registered, stale_after_seconds=external_stale_seconds, now=now, limit=batch
+        ):
+            dispatch_command(conn, cid, callers[integration], now=now)
+            processed += 1
+        # Observability: pending rows whose integration has NO registered caller (never lost).
+        counters.gauge("external.pending_unhandled", pending_unhandled_count(conn, registered))
+        return processed
+
+    external_dispatched = _stage("external")(_dispatch_external, 0)
 
     def _fire_timers() -> int:
         # Lease due timers durably (one atomic UPDATE), then fire each in its OWN transaction so a
@@ -292,6 +347,12 @@ def run_worker_once(
 
     errors = counters.snapshot()["counters"].get("worker.errors", 0) - errors_before
     counters.gauge("worker.last_tick.queue_processed", queue_processed)
+    # Health gauges: backlog depth + per-projection replay lag, so an operator/health endpoint
+    # sees the running system's state each tick (SP-0.5 round-2).
+    counters.gauge("queue.depth", queue_depth(conn))
+    for projection in projections:
+        name = getattr(projection, "name", "?")
+        counters.gauge(f"projection.lag.{name}", projection_lag(conn, name))
     return WorkerTick(
         queue_processed=queue_processed,
         relay_published=relay_published,
@@ -301,6 +362,7 @@ def run_worker_once(
         reclaimed=reclaimed,
         parked=parked,
         errors=errors,
+        external_dispatched=external_dispatched,
     )
 
 
@@ -354,6 +416,12 @@ def compose(conn: psycopg.Connection) -> tuple[object, list[Projection]]:
     seed_overlay_authz(conn)
 
     projections: list[Projection] = [StagePrimaryProjection(), OverlayProjection()]
+    # Register the runner-driven projections for repair so resolve_degraded can re-run one to
+    # PROVE health before clearing its degraded marker (SP-0.5 round-2 prove-health).
+    from featuregen.projections.runner import register_projection_for_repair
+
+    for projection in projections:
+        register_projection_for_repair(projection.name, projection)
     return registry, projections
 
 

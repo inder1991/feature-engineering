@@ -14,8 +14,15 @@ def validate_identity(env: IdentityEnvelope) -> None:
     if not env.authenticated:
         raise IdentityError("actor not authenticated")
     if env.actor_kind == "service":
-        if env.auth_method != "workload-identity":
-            raise IdentityError("service actor must authenticate via workload-identity")
+        # A service authenticates either via a workload-identity token, or as a capability-minted
+        # INTERNAL trust root (e.g. the durable timer runtime, which has no token). BOTH must be
+        # attested — an unattested service is rejected regardless of method, so admitting
+        # "internal" does not weaken the control (an internal envelope is only producible via the
+        # sealed mint_trusted_identity capability, SP-0.5 BLOCKER #1).
+        if env.auth_method not in ("workload-identity", "internal"):
+            raise IdentityError(
+                "service actor must authenticate via workload-identity or internal trust root"
+            )
         if not env.attestation:
             raise IdentityError(
                 "service role_claims must be attested by a signed deploy identity, "

@@ -170,15 +170,57 @@ def source_changed_revalidate_command(conn: DbConn, cmd: Command) -> CommandResu
 
 
 def resolve_degraded_command(conn: DbConn, cmd: Command) -> CommandResult:
-    """Clear a `degraded` projection entry after remediation (§3.6/§4.4). This is a projection
-    repair (no domain event): it un-blocks the aggregate's commands. `execute_command`
-    special-cases this action so it is NOT itself blocked by the degraded gate. Scope here is the
-    `run_workflow_state` sample projection (the only degraded-bearing projection in this phase);
-    other aggregates' degraded handling is owned by their projection phases."""
-    run_id = cmd.aggregate_id
+    """Clear the degraded marker(s) for an aggregate after remediation (§3.6/§4.4), un-blocking its
+    commands — but PROVE HEALTH first (SP-0.5 round-2). For each `projection_degraded` marker on the
+    aggregate, re-run the named projection and require it to advance PAST the recorded poison_seq;
+    only then delete the markers and record a remediation audit event. `execute_command` enforces
+    this ledger (B1) and special-cases this action so it is NOT itself blocked by the degraded gate.
+
+    Fail-closed: no marker for the aggregate, an unregistered projection, or a projection that still
+    cannot advance past the poison → `accepted=False` with the marker UNCHANGED (never a silent
+    unblock, never an exception through execute_command)."""
+    from featuregen.projections.runner import advance_projection_past, projection_for_repair
+    from featuregen.security.audit import record_security_event
+
+    aid = cmd.aggregate_id
+    markers = conn.execute(
+        "SELECT DISTINCT projection_name FROM projection_degraded "
+        "WHERE aggregate = %s AND aggregate_id = %s",
+        (cmd.aggregate, aid),
+    ).fetchall()
+    if not markers:
+        return CommandResult(
+            accepted=False, aggregate_id=aid or "",
+            denied_reason="no degraded marker for this aggregate",
+        )
+    for (projection_name,) in markers:
+        projection = projection_for_repair(projection_name)
+        if projection is None:
+            return CommandResult(
+                accepted=False, aggregate_id=aid or "",
+                denied_reason=f"cannot prove health: projection '{projection_name}' "
+                              "is not registered for repair",
+            )
+        # Re-run + re-read the LIVE marker (a second-stage poison re-halts at a later seq, so the
+        # pre-loop snapshot cannot be trusted, SP-0.5 round-2 review).
+        if not advance_projection_past(conn, projection, cmd.aggregate, aid):
+            return CommandResult(
+                accepted=False, aggregate_id=aid or "",
+                denied_reason=f"projection '{projection_name}' still cannot advance past the "
+                              "poison; remediate the cause before resolving",
+            )
     conn.execute(
-        "UPDATE run_workflow_state SET degraded = false, degraded_reason = NULL, "
-        "degraded_event_id = NULL, updated_at = now() WHERE run_id = %s",
-        (run_id,),
+        "DELETE FROM projection_degraded WHERE aggregate = %s AND aggregate_id = %s",
+        (cmd.aggregate, aid),
     )
-    return CommandResult(accepted=True, aggregate_id=run_id or "")
+    record_security_event(
+        conn,
+        event_type="DEGRADED_RESOLVED",
+        actor=cmd.actor,
+        attempted_action="resolve_degraded",
+        decision="flagged",
+        aggregate=cmd.aggregate,
+        aggregate_id=aid,
+        reason="operator remediation proven healthy (projection advanced past poison)",
+    )
+    return CommandResult(accepted=True, aggregate_id=aid or "")

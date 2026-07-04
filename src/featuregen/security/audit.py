@@ -4,6 +4,7 @@ import hashlib
 import hmac
 import json
 from collections.abc import Mapping
+from contextlib import nullcontext
 from datetime import UTC, datetime
 from typing import Any
 
@@ -122,55 +123,61 @@ def record_security_event(
     signing_key = key if key is not None else _audit_hmac_key()
     # Serialize chain appends so the prev_hash read + insert is atomic for the single chain
     # (fixes the empty-table / same-prev fork race; FOR UPDATE alone cannot lock a row that
-    # does not exist yet).
-    conn.execute("SELECT pg_advisory_xact_lock(%s)", (_SECURITY_CHAIN_LOCK_KEY,))
-    prev = conn.execute(
-        "SELECT entry_hash FROM security_audit ORDER BY seq DESC LIMIT 1"
-    ).fetchone()
-    prev_hash = prev[0] if prev else None
-    sec_id = mint_id("sec")
-    actor_jsonb = identity_to_jsonb(actor)
-    # Set occurred_at explicitly (not via the column DEFAULT) so the exact instant is part
-    # of the hash basis and matches what verify_chain() reads back.
-    occurred_at = datetime.now(UTC)
-    entry_hash = _entry_hash(
-        signing_key,
-        prev_hash,
-        sec_id,
-        event_type,
-        actor_jsonb,
-        attempted_action,
-        aggregate,
-        aggregate_id,
-        decision,
-        reason,
-        retention_class,
-        occurred_at,
-    )
-    conn.execute(
-        """
-        INSERT INTO security_audit
-            (security_event_id, event_type, actor, attempted_action, aggregate,
-             aggregate_id, decision, reason, prev_hash, entry_hash, retention_class,
-             occurred_at)
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-        """,
-        (
+    # does not exist yet). The lock is transaction-scoped: on an autocommit connection a bare lock
+    # statement would self-commit and release BEFORE the read/insert (chain-fork race, SP-0.5
+    # round-2), so open a real transaction there. A non-autocommit caller already spans the
+    # lock+read+insert in its own transaction, so we must NOT open+commit our own — that would
+    # defeat the caller's rollback (test isolation) — hence the nullcontext.
+    tx = conn.transaction() if conn.autocommit else nullcontext()
+    with tx:
+        conn.execute("SELECT pg_advisory_xact_lock(%s)", (_SECURITY_CHAIN_LOCK_KEY,))
+        prev = conn.execute(
+            "SELECT entry_hash FROM security_audit ORDER BY seq DESC LIMIT 1"
+        ).fetchone()
+        prev_hash = prev[0] if prev else None
+        sec_id = mint_id("sec")
+        actor_jsonb = identity_to_jsonb(actor)
+        # Set occurred_at explicitly (not via the column DEFAULT) so the exact instant is part
+        # of the hash basis and matches what verify_chain() reads back.
+        occurred_at = datetime.now(UTC)
+        entry_hash = _entry_hash(
+            signing_key,
+            prev_hash,
             sec_id,
             event_type,
-            Json(actor_jsonb),
+            actor_jsonb,
             attempted_action,
             aggregate,
             aggregate_id,
             decision,
             reason,
-            prev_hash,
-            entry_hash,
             retention_class,
             occurred_at,
-        ),
-    )
-    return sec_id
+        )
+        conn.execute(
+            """
+            INSERT INTO security_audit
+                (security_event_id, event_type, actor, attempted_action, aggregate,
+                 aggregate_id, decision, reason, prev_hash, entry_hash, retention_class,
+                 occurred_at)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            """,
+            (
+                sec_id,
+                event_type,
+                Json(actor_jsonb),
+                attempted_action,
+                aggregate,
+                aggregate_id,
+                decision,
+                reason,
+                prev_hash,
+                entry_hash,
+                retention_class,
+                occurred_at,
+            ),
+        )
+        return sec_id
 
 
 def record_denial(conn: DbConn, cmd: Any, reason: str) -> str:

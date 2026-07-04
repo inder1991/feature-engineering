@@ -2,16 +2,42 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Mapping
+from contextlib import nullcontext
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Any, Protocol, runtime_checkable
 
 from psycopg.types.json import Jsonb
 
 from featuregen.contracts import DbConn, NewExternalCommand
+from featuregen.runtime.backoff import compute_backoff
+from featuregen.runtime.observability import counters
 
 _log = logging.getLogger("featuregen.external_commands")
+
+
+def _record_external_cost(
+    conn: DbConn, command_id: str, run_id: str | None, cost_units: Decimal | None
+) -> None:
+    """Roll a succeeded external command's cost into its run's durable §5.6 budget so the cost
+    breaker sees external spend (SP-0.5 round-2). Exactly-once: _finalize reaches here only on the
+    transition INTO 'succeeded' (a re-finalize honors the existing status and returns early).
+    Tolerant: a command whose run has no workflow-state row is counted/logged, not fatal."""
+    if run_id is None or cost_units is None:
+        return
+    from featuregen.runtime.cost_budget import record_cost
+
+    try:
+        record_cost(conn, run_id, cost_units)
+    except KeyError:
+        counters.incr("external.cost_unattributed")
+        _log.warning(
+            "external cost %s for %s not attributed: run %s has no workflow state",
+            cost_units,
+            command_id,
+            run_id,
+        )
 
 
 class HighCostWithoutDedup(Exception):
@@ -170,47 +196,78 @@ def dispatch_command(
         res = caller.invoke(payload)
 
     # --- Step 3: finalize the result in a SECOND committed transaction -----------------
-    with conn.cursor() as cur:
-        cur.execute(
-            "SELECT status FROM external_commands WHERE command_id = %s FOR UPDATE",
-            (command_id,),
-        )
-        frow = cur.fetchone()
-        if frow is None:
-            conn.rollback()
-            raise KeyError(command_id)
-        if frow[0] in ("succeeded", "failed", "stale_ignored"):
-            # A concurrent dispatcher already finalized this command; honor it.
-            conn.rollback()
-            return DispatchOutcome(command_id, frow[0], reinvoked, residual, reconciled)
+    return _finalize(
+        conn, command_id, res, now,
+        reinvoked=reinvoked, residual=residual, reconciled=reconciled,
+    )
 
-        if res.ok:
+
+def _finalize(
+    conn: DbConn,
+    command_id: str,
+    res: IntegrationResult,
+    now: datetime,
+    *,
+    reinvoked: bool,
+    residual: bool,
+    reconciled: bool,
+) -> DispatchOutcome:
+    """Write the external call's result ATOMICALLY (§5.4 Step 3): re-lock the row, honor a
+    concurrent finalize if one already landed, else persist succeeded/failed/pending (+ roll a
+    succeeded cost into the run budget). Shared by dispatch_command and invoke_claimed_external.
+
+    On the worker's AUTOCOMMIT connection the check-then-act (FOR UPDATE read -> status UPDATE ->
+    cost roll-up) MUST run in ONE transaction (SP-0.5 round-2 review): otherwise the row lock
+    releases at statement end and two concurrent recoverers of the SAME stale 'dispatched' row both
+    read 'dispatched', both write 'succeeded', and both double-count the cost into the durable §5.6
+    budget. Wrap in a real transaction on autocommit; a non-autocommit caller already spans it."""
+    tx = conn.transaction() if conn.autocommit else nullcontext()
+    with tx:
+        with conn.cursor() as cur:
             cur.execute(
-                "UPDATE external_commands SET status='succeeded', result=%s, cost_units=%s, "
-                "completed_at=%s, job_handle=COALESCE(%s, job_handle) WHERE command_id=%s",
-                (
-                    Jsonb(_flag_residual(res.result, residual)),
-                    res.cost_units,
-                    now,
-                    res.job_handle,
-                    command_id,
-                ),
-            )
-            outcome = DispatchOutcome(command_id, "succeeded", reinvoked, residual, reconciled)
-        elif res.permanent:
-            cur.execute(
-                "UPDATE external_commands SET status='failed', result=%s, completed_at=%s "
-                "WHERE command_id=%s",
-                (Jsonb(dict(res.result)), now, command_id),
-            )
-            outcome = DispatchOutcome(command_id, "failed", reinvoked, residual, reconciled)
-        else:
-            cur.execute(
-                "UPDATE external_commands SET status='pending' WHERE command_id=%s",
+                "SELECT status, run_id, attempts FROM external_commands "
+                "WHERE command_id = %s FOR UPDATE",
                 (command_id,),
             )
-            outcome = DispatchOutcome(command_id, "pending", reinvoked, residual, reconciled)
-    conn.commit()
+            frow = cur.fetchone()
+            if frow is None:
+                raise KeyError(command_id)
+            status, run_id, attempts = frow
+            if status in ("succeeded", "failed", "stale_ignored"):
+                # A concurrent dispatcher already finalized this command; honor it (a second
+                # recoverer blocks on FOR UPDATE above until the first commits, then lands here).
+                return DispatchOutcome(command_id, status, reinvoked, residual, reconciled)
+
+            if res.ok:
+                cur.execute(
+                    "UPDATE external_commands SET status='succeeded', result=%s, cost_units=%s, "
+                    "completed_at=%s, job_handle=COALESCE(%s, job_handle) WHERE command_id=%s",
+                    (
+                        Jsonb(_flag_residual(res.result, residual)),
+                        res.cost_units,
+                        now,
+                        res.job_handle,
+                        command_id,
+                    ),
+                )
+                _record_external_cost(conn, command_id, run_id, res.cost_units)
+                outcome = DispatchOutcome(command_id, "succeeded", reinvoked, residual, reconciled)
+            elif res.permanent:
+                cur.execute(
+                    "UPDATE external_commands SET status='failed', result=%s, completed_at=%s "
+                    "WHERE command_id=%s",
+                    (Jsonb(dict(res.result)), now, command_id),
+                )
+                outcome = DispatchOutcome(command_id, "failed", reinvoked, residual, reconciled)
+            else:
+                # Retryable failure: back off before the row is claimable again, so a persistently
+                # failing command is not re-invoked up to `batch` times per tick (SP-0.5 r2 review).
+                cur.execute(
+                    "UPDATE external_commands SET status='pending', "
+                    "next_attempt_at = %s + make_interval(secs => %s) WHERE command_id=%s",
+                    (now, compute_backoff(attempts), command_id),
+                )
+                outcome = DispatchOutcome(command_id, "pending", reinvoked, residual, reconciled)
     return outcome
 
 
@@ -271,3 +328,114 @@ def accept_result(
             )
             return ResultAcceptance(command_id, accepted=False, stale=True)
     return ResultAcceptance(command_id, accepted=True, stale=False)
+
+
+# --- Worker wiring: caller registry + first-dispatch claim + crash-recovery sweep ----------
+
+_CALLERS: dict[str, IntegrationCaller] = {}
+
+
+def register_integration_caller(caller: IntegrationCaller) -> None:
+    """Register the IntegrationCaller that CAN execute an integration's external commands. The
+    worker only claims commands whose integration is registered (fail-closed); an unregistered
+    integration's rows are never invoked, only counted (SP-0.5 round-2). Idempotent — last wins."""
+    _CALLERS[caller.integration] = caller
+
+
+def current_integration_callers() -> dict[str, IntegrationCaller]:
+    """Snapshot of registered integration -> caller; its keys gate the claim queries so an
+    un-callable integration is never claimed."""
+    return dict(_CALLERS)
+
+
+@dataclass(frozen=True, slots=True)
+class ClaimedExternal:
+    command_id: str
+    integration: str
+    payload: Mapping[str, Any]
+    job_handle: str | None
+    dedup_supported: bool
+
+
+def claim_next_pending(
+    conn: DbConn, registered_integrations, *, now: datetime
+) -> ClaimedExternal | None:
+    """Atomically claim ONE pending external command whose integration is registered (mark it
+    'dispatched', attempts+1) with FOR UPDATE SKIP LOCKED, so two concurrent workers never hand
+    the same row to a fresh invoke. Returns None if nothing is claimable. FIRST-dispatch only — the
+    claimed row is invoked via invoke_claimed_external, NOT dispatch_command's recovery branch."""
+    reg = list(registered_integrations)
+    if not reg:
+        return None
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE external_commands SET status='dispatched', dispatched_at=%s, "
+            "attempts=attempts+1 WHERE command_id = (SELECT command_id FROM external_commands "
+            "WHERE status='pending' AND integration = ANY(%s) "
+            "AND (next_attempt_at IS NULL OR next_attempt_at <= %s) "
+            "ORDER BY created_at FOR UPDATE SKIP LOCKED LIMIT 1) "
+            "RETURNING command_id, integration, request_payload, job_handle, dedup_supported",
+            (now, reg, now),
+        )
+        row = cur.fetchone()
+    conn.commit()  # claim durable BEFORE the external call (mirrors dispatch_command Step 1)
+    if row is None:
+        return None
+    return ClaimedExternal(row[0], row[1], row[2], row[3], row[4])
+
+
+def invoke_claimed_external(
+    conn: DbConn, claimed: ClaimedExternal, caller: IntegrationCaller, *, now: datetime
+) -> DispatchOutcome:
+    """CALL + FINALIZE a row claim_next_pending already claimed as a FIRST dispatch — a known-fresh
+    invoke, so it never takes dispatch_command's recovery branch (no false residual-risk flag)."""
+    res = caller.invoke(claimed.payload)
+    return _finalize(
+        conn, claimed.command_id, res, now, reinvoked=False, residual=False, reconciled=False
+    )
+
+
+def claim_stale_dispatched(
+    conn: DbConn, registered_integrations, *, stale_after_seconds: float, now: datetime, limit: int
+) -> list[tuple[str, str]]:
+    """Claim up to `limit` external commands stuck in 'dispatched' (a worker died after claiming,
+    before finalizing) older than `stale_after_seconds` — CRASH RECOVERY. Returns [(command_id,
+    integration)] for registered integrations only.
+
+    Atomic exclusion (SP-0.5 round-2 review): a bare SELECT ... FOR UPDATE SKIP LOCKED releases its
+    row locks at statement end on the autocommit daemon connection, so two workers would both sweep
+    the SAME stale row and both re-invoke the side effect. Instead this RE-STAMPS dispatched_at in
+    the SAME atomic UPDATE, pushing each claimed row PAST the stale cutoff — so a concurrent sweep's
+    subquery skips it. The caller routes each through dispatch_command, whose 'dispatched' -> recover
+    path (reconcile / dedup-safe re-invoke / honest residual flag) is idempotency-safe. `limit`
+    bounds the sweep so a mass-crash recovery stays within run_worker_once's one-bounded-pass
+    contract (rows past the limit are swept on later ticks)."""
+    reg = list(registered_integrations)
+    if not reg:
+        return []
+    cutoff = now - timedelta(seconds=stale_after_seconds)
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE external_commands SET dispatched_at=%s "
+            "WHERE command_id IN (SELECT command_id FROM external_commands "
+            "WHERE status='dispatched' AND integration = ANY(%s) AND dispatched_at < %s "
+            "ORDER BY dispatched_at FOR UPDATE SKIP LOCKED LIMIT %s) "
+            "RETURNING command_id, integration",
+            (now, reg, cutoff, limit),
+        )
+        rows = cur.fetchall()
+    conn.commit()  # re-stamp durable before recovery; concurrent sweeps now exclude these rows
+    return [(r[0], r[1]) for r in rows]
+
+
+def pending_unhandled_count(conn: DbConn, registered_integrations) -> int:
+    """Count pending rows whose integration has NO registered caller — surfaced as a gauge so an
+    operator registers the missing caller (rows are never lost, just currently un-invokable)."""
+    reg = list(registered_integrations)
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT count(*) FROM external_commands "
+            "WHERE status='pending' AND NOT (integration = ANY(%s))",
+            (reg,),
+        )
+        return int(cur.fetchone()[0])

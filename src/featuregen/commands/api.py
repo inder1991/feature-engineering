@@ -66,23 +66,46 @@ def _replay(conn: DbConn, key: str) -> CommandResult | None:
 
 
 def _is_degraded(conn: DbConn, cmd: Command) -> bool:
-    if cmd.aggregate != "run" or cmd.aggregate_id is None:
+    # Fail-closed enforcement of the §3.6 projection halt (SP-0.5 round-2 B1). A poison event marks
+    # the affected aggregate in projection_degraded (keyed by aggregate + aggregate_id, any
+    # projection); a command against a degraded aggregate is blocked. resolve_degraded is
+    # special-cased by execute_command so it can clear the marker. (The prior check read
+    # run_workflow_state.degraded, a column no production code ever sets — so nothing was blocked.)
+    if cmd.aggregate_id is None:
         return False
     row = conn.execute(
-        "SELECT degraded FROM run_workflow_state WHERE run_id = %s",
-        (cmd.aggregate_id,),
+        "SELECT 1 FROM projection_degraded WHERE aggregate = %s AND aggregate_id = %s LIMIT 1",
+        (cmd.aggregate, cmd.aggregate_id),
     ).fetchone()
-    return bool(row and row[0])
+    return row is not None
 
 
 def execute_command(conn: DbConn, cmd: Command) -> CommandResult:
     """Single command entrypoint (§4.4/§10). Claim-first idempotency (concurrent-safe),
     authz seam, degraded-block, dispatch.
 
+    Runs the whole body in ONE transaction (SP-0.5 round-2): a SAVEPOINT when the caller already
+    holds a transaction (preserves the `_claim` ON CONFLICT-blocks-the-loser concurrency and every
+    existing in-transaction caller), a real transaction on an autocommit connection (so claim +
+    handler + finalize are atomic — a handler failure rolls the claim back and a retry re-claims,
+    instead of stranding a committed `_pending`). It NEVER calls conn.commit() itself.
+
     Authorization: the active authorizer (Phase 07) decides; **the Phase-07 authorizer is
     responsible for writing denials to `security_audit` (NOT the domain stream)** — that
     fulfils the contract's "on deny, writes to security_audit" for `execute_command`. The
     default Phase-06 seam (allow-all) writes nothing because it never denies."""
+    # Atomicity is only at RISK on an autocommit connection, where each statement would otherwise
+    # self-commit (a handler failure would strand a committed _pending claim). Wrap ONLY then. A
+    # non-autocommit caller already owns a transaction (the body runs in it / a savepoint), so we
+    # must NOT open+commit our own — that would defeat the caller's rollback (e.g. test isolation)
+    # and break the `_claim` ON CONFLICT-blocks-loser mechanism that relies on the caller's tx.
+    if conn.autocommit:
+        with conn.transaction():
+            return _execute_command_body(conn, cmd)
+    return _execute_command_body(conn, cmd)
+
+
+def _execute_command_body(conn: DbConn, cmd: Command) -> CommandResult:
     key = cmd.idempotency_key
     owned = _claim(conn, key, cmd.action)
     if not owned:

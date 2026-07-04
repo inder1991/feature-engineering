@@ -99,15 +99,18 @@ def append_event(
         "occurred_at": occurred_at,
     }
     # Serialize global_seq allocation with commit order (§3.2 no-gaps / §3.6 fail-closed):
-    # take the transaction-scoped advisory lock IMMEDIATELY before allocating global_seq. It is
-    # held until the caller's top-level transaction commits/rolls back (savepoints below do not
-    # release it), so concurrent cross-aggregate appends commit in the same order they allocated.
-    with conn.cursor() as cur:
-        cur.execute("SELECT pg_advisory_xact_lock(%s)", (_GLOBAL_SEQ_LOCK_KEY,))
-
+    # take the transaction-scoped advisory lock IMMEDIATELY before allocating global_seq, INSIDE
+    # the transaction block below. It must be inside a transaction to be held at all — on an
+    # autocommit connection a bare lock statement self-commits and releases the lock before the
+    # INSERT (SP-0.5 round-2). Advisory xact locks bind to the TOP-LEVEL transaction, so acquiring
+    # it inside the savepoint still holds it until the caller's top-level tx commits/rolls back
+    # (savepoint rollback does not release it), so concurrent cross-aggregate appends commit in the
+    # same order they allocated.
     try:
         with conn.transaction():  # savepoint: a concurrent racer that wins the UNIQUE keeps
-            with conn.cursor(row_factory=dict_row) as cur:  # THIS connection usable
+            with conn.cursor() as cur:  # THIS connection usable
+                cur.execute("SELECT pg_advisory_xact_lock(%s)", (_GLOBAL_SEQ_LOCK_KEY,))
+            with conn.cursor(row_factory=dict_row) as cur:
                 cur.execute(_INSERT, params)
                 row = cur.fetchone()
     except UniqueViolation as exc:

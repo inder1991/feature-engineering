@@ -460,6 +460,7 @@ _TIMER_RUNTIME_ACTOR = mint_trusted_identity(
     actor_kind="service",
     auth_method="internal",
     role_claims=(),
+    attestation="internal-trust-root:timer-runtime",
 )
 
 # dispatch_timer_command runs as the TRUSTED _TIMER_RUNTIME_ACTOR and dispatches straight through

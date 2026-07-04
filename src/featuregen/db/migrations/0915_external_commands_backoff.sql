@@ -1,0 +1,14 @@
+-- src/featuregen/db/migrations/0915_external_commands_backoff.sql
+-- Backoff for retryable external commands (SP-0.5 round-2 review, finding 3).
+--
+-- The worker's external-dispatch stage claims pending external commands oldest-first and invokes
+-- them. A persistently-retryable command (invoke returns not-ok, not-permanent) is set back to
+-- 'pending' by _finalize, so WITHOUT a delay it is immediately the oldest pending row again and is
+-- re-claimed + re-invoked up to `batch` times in a SINGLE tick (a hot loop that burns cost/API
+-- quota), and remains the permanent head-of-line that starves newer commands across ticks.
+--
+-- next_attempt_at mirrors the outbox/queue backoff: _finalize's retryable branch stamps it with
+-- now + compute_backoff(attempts), and claim_next_pending only claims rows whose next_attempt_at
+-- is null or due. NULL default = "due now", so existing pending rows are unaffected. Idempotent
+-- (ADD COLUMN IF NOT EXISTS) so apply_migrations stays re-runnable.
+ALTER TABLE external_commands ADD COLUMN IF NOT EXISTS next_attempt_at timestamptz NULL;

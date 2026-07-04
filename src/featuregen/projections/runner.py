@@ -4,6 +4,7 @@ from psycopg.rows import dict_row
 
 from featuregen.contracts import DbConn, Projection, ProjectionApplyError
 from featuregen.events.serde import row_to_event
+from featuregen.runtime.observability import counters
 
 
 def _ensure_checkpoint(conn: DbConn, name: str, is_analytics: bool) -> None:
@@ -29,9 +30,10 @@ def run_projection(conn: DbConn, projection: Projection, *, batch: int = 500) ->
     """Consume events with global_seq > checkpoint_seq in order, calling apply(); advance the
     checkpoint to the last applied event. Returns the count applied.
 
-    NOTE: this Task-12 version handles the happy path only. The §3.6 fail-closed degraded-halt and
-    analytics fail-open branches (and the `projection_degraded` marking) are added in Task 13,
-    where a failing test drives them in."""
+    Fail-closed for a normal projection (§3.6): a poison event HALTS the projection (no advance
+    past it) and marks the affected aggregate in `projection_degraded`. An analytics projection
+    (`is_analytics`) fails OPEN: it records the skip in `projection_skips` (+ the `projection.skip`
+    counter) and advances past the poison, so a completeness gap is never silent."""
     _ensure_checkpoint(conn, projection.name, projection.is_analytics)
     with conn.cursor(row_factory=dict_row) as cur:
         cur.execute(
@@ -65,6 +67,7 @@ def run_projection(conn: DbConn, projection: Projection, *, batch: int = 500) ->
                     "VALUES (%s, %s, %s) ON CONFLICT DO NOTHING",
                     (projection.name, event.global_seq, str(exc)[:500]),
                 )
+                counters.incr("projection.skip")  # surface the completeness gap as a metric
                 last_seq = event.global_seq  # fail open, but the skip is now durable + auditable
                 continue
             last_seq = event.global_seq
@@ -144,6 +147,55 @@ def rebuild_projection(conn: DbConn, projection: Projection) -> None:
         )
     while run_projection(conn, projection) > 0:
         pass
+
+
+_REPAIR_REGISTRY: dict[str, Projection] = {}
+
+
+def register_projection_for_repair(name: str, projection: Projection) -> None:
+    """Register a projection under its name so `resolve_degraded` can re-run it to PROVE health
+    before clearing a degraded marker (SP-0.5 round-2). Idempotent — last registration wins."""
+    _REPAIR_REGISTRY[name] = projection
+
+
+def projection_for_repair(name: str) -> Projection | None:
+    """The projection registered under `name`, or None if none is (resolve then fail-closes)."""
+    return _REPAIR_REGISTRY.get(name)
+
+
+def _checkpoint_seq(conn: DbConn, name: str) -> int:
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            "SELECT checkpoint_seq FROM projection_checkpoints WHERE projection_name = %s",
+            (name,),
+        )
+        row = cur.fetchone()
+    return int(row["checkpoint_seq"]) if row else 0
+
+
+def advance_projection_past(
+    conn: DbConn, projection: Projection, aggregate: str, aggregate_id: str
+) -> bool:
+    """Re-run the projection and report whether it is now HEALTHY for (aggregate, aggregate_id) —
+    i.e. the projection advanced past the poison that halted it. Healthy iff, AFTER the re-run,
+    the checkpoint is >= the CURRENT degraded marker's poison_seq (or the marker is gone).
+
+    Re-reading the marker AFTER the run is load-bearing (SP-0.5 round-2 review): if the projection
+    advances past the ORIGINAL poison but re-halts at a LATER, second-stage poison, run_projection
+    re-marks the SAME row with the later poison_seq — trusting the pre-run snapshot would report
+    healthy and falsely unblock. A projection still stuck re-halts and leaves checkpoint < the
+    (current) poison_seq, so this returns False."""
+    run_projection(conn, projection)
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            "SELECT poison_seq FROM projection_degraded "
+            "WHERE projection_name = %s AND aggregate = %s AND aggregate_id = %s",
+            (projection.name, aggregate, aggregate_id),
+        )
+        marker = cur.fetchone()
+    if marker is None:
+        return True  # no marker for this aggregate after the re-run — healthy
+    return _checkpoint_seq(conn, projection.name) >= marker["poison_seq"]
 
 
 def projection_lag(conn: DbConn, name: str) -> int:

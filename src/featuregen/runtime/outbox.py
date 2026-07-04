@@ -10,7 +10,14 @@ from psycopg.types.json import Json
 
 from featuregen.contracts import EventEnvelope
 from featuregen.runtime.backoff import compute_backoff
+from featuregen.runtime.observability import counters
 from featuregen.runtime.queue import BackpressureError, enqueue, queue_depth
+
+
+class UnroutedOutboxTopic(Exception):
+    """Raised by the queue publisher when a topic declared ROUTE-REQUIRED has no configured route.
+    It is a LOUD delivery failure (relay backs off -> DLQ), distinct from a topic that is
+    intentionally drain-only (no route, not required -> silent no-op). SP-0.5 round-2."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -141,6 +148,10 @@ def relay_publish_batch(
                 )
             continue
         except Exception as exc:  # noqa: BLE001 — failure classification is intentional
+            if isinstance(exc, UnroutedOutboxTopic):
+                # A route-required topic with no route: surface it LOUD so an operator configures
+                # the route, then fall through to the normal backoff/DLQ handling below.
+                counters.incr(f"outbox.unrouted.{row['topic']}")
             attempts = row["attempts"] + 1
             with conn.transaction(), conn.cursor() as cur:
                 if attempts >= row["max_attempts"]:
@@ -185,17 +196,27 @@ def make_queue_publisher(
     route: Mapping[str, str],
     *,
     max_partition_depth: int | None = None,
+    route_required: frozenset[str] = frozenset(),
 ) -> Callable[[psycopg.Connection, OutboxMessage], None]:
     """Build a `publish` that turns a routed outbox topic into a worker-queue row. When
     `max_partition_depth` is set, it is admission control (§5.2 backpressure): if the target
     partition already holds that many `ready`+`leased` queue items, it raises BackpressureError
     so the relay leaves the outbox row durably `pending` (durable waiting) until the worker
-    queue drains — bounding per-partition backlog without dropping or failing work."""
+    queue drains — bounding per-partition backlog without dropping or failing work.
+
+    Route policy (SP-0.5 round-2): `commit_step` writes an outbox row for EVERY event, and most
+    topics are NOT meant to fan out (no route -> intentional no-op drain). `route_required` names
+    the topics that MUST fan out: an unrouted topic in that set is a LOUD failure
+    (UnroutedOutboxTopic -> relay DLQ + `outbox.unrouted.<topic>` counter), never a silent drain.
+    The default set is empty, so today every event topic drains and nothing breaks; the loud path
+    engages only once a real fan-out topic is declared route-required but left unrouted."""
 
     def publish(conn: psycopg.Connection, msg: OutboxMessage) -> None:
         handler = route.get(msg.topic)
         if handler is None:
-            return  # topic has no internal step handler; nothing to enqueue
+            if msg.topic in route_required:
+                raise UnroutedOutboxTopic(msg.topic)  # must fan out but no route configured
+            return  # drain-only topic: no internal step handler; nothing to enqueue
         if max_partition_depth is not None and (
             queue_depth(conn, partition_key=msg.partition_key) >= max_partition_depth
         ):

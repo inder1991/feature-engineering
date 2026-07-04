@@ -87,9 +87,11 @@ def test_unconfigured_default_authorizer_denies_state_mutating_command(db):
 
 
 def test_degraded_run_is_blocked(db):
+    # Enforcement reads the projection_degraded ledger the runner actually writes (SP-0.5 round-2
+    # B1); the old run_workflow_state.degraded column was never set in production.
     db.execute(
-        "INSERT INTO run_workflow_state (run_id, request_id, current_state, table_version, degraded) "
-        "VALUES ('run_deg', 'req_x', 'DRAFT', 1, true)"
+        "INSERT INTO projection_degraded (projection_name, aggregate, aggregate_id, reason, "
+        "poison_event_id, poison_seq) VALUES ('run','run','run_deg','boom',NULL,1)"
     )
     register_command("act", lambda c, m: CommandResult(accepted=True, aggregate_id="run_deg"))
     res = execute_command(db, make_cmd("act", "run", "run_deg", {}))
@@ -142,3 +144,58 @@ def test_replay_does_not_rerun_handler_when_prior_committed(db):
     res = execute_command(db, make_cmd("act", "run", "agg9", {}, idem="pre"))
     assert res.accepted and res.aggregate_id == "agg9" and res.produced_event_ids == ("x1",)
     assert calls == []  # handler never invoked; result replayed from the committed claim
+
+
+def test_projection_degraded_blocks_commands(db):
+    # A poisoned projection writes projection_degraded for the affected aggregate; execute_command
+    # must fail-close its commands (SP-0.5 round-2 B1: enforcement was wired to a never-set column).
+    ran = []
+
+    def handler(conn, cmd):
+        ran.append(1)
+        return CommandResult(accepted=True, aggregate_id="agg_d")
+
+    register_command("some_action", handler)
+    db.execute(
+        "INSERT INTO projection_degraded (projection_name, aggregate, aggregate_id, reason, "
+        "poison_event_id, poison_seq) VALUES ('run','run','agg_d','boom',NULL,1)"
+    )
+    res = execute_command(db, make_cmd("some_action", "run", "agg_d", {}))
+    assert res.accepted is False
+    assert "degraded" in (res.denied_reason or "").lower()
+    assert ran == []  # handler never dispatched for a degraded aggregate
+
+
+def test_execute_command_is_atomic_on_an_autocommit_connection(db):
+    # On an autocommit connection, a handler that raises must NOT leave the idempotency claim
+    # committed — the whole command runs in ONE transaction, so a failure rolls the claim back and
+    # a retry can re-claim (SP-0.5 round-2: transaction-agnostic execute_command). Without the wrap
+    # the claim INSERT auto-commits and strands a _pending row.
+    import psycopg
+
+    def boom(conn, cmd):
+        raise RuntimeError("handler blew up mid-command")
+
+    register_command("boom", boom)
+    with psycopg.connect(db.info.dsn, autocommit=True) as ac:
+        with pytest.raises(RuntimeError):
+            execute_command(ac, make_cmd("boom", "run", "agg_ac", {}, idem="ac_atomic"))
+        row = ac.execute(
+            "SELECT 1 FROM command_idempotency WHERE idempotency_key = 'ac_atomic'"
+        ).fetchone()
+    assert row is None  # claim rolled back atomically; no stranded _pending
+
+
+def test_resolve_degraded_bypasses_the_degraded_gate(db):
+    # resolve_degraded must run EVEN WHEN the aggregate is degraded — otherwise it could never be
+    # un-blocked. It is the sole action special-cased past the degraded gate.
+    register_command(
+        "resolve_degraded",
+        lambda c, m: CommandResult(accepted=True, aggregate_id="agg_r"),
+    )
+    db.execute(
+        "INSERT INTO projection_degraded (projection_name, aggregate, aggregate_id, reason, "
+        "poison_event_id, poison_seq) VALUES ('run','run','agg_r','boom',NULL,2)"
+    )
+    res = execute_command(db, make_cmd("resolve_degraded", "run", "agg_r", {}))
+    assert res.accepted is True

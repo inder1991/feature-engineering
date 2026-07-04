@@ -57,6 +57,17 @@ def _now() -> datetime:
     return datetime.now(UTC)
 
 
+@pytest.fixture(autouse=True)
+def _reset_counters():
+    """`counters` is a process-global singleton; reset it around each test so leaked-connection /
+    metric counts from one test never bleed into another (e.g. the leaked-cap-halt test)."""
+    from featuregen.runtime.observability import counters
+
+    counters.reset()
+    yield
+    counters.reset()
+
+
 def test_run_worker_once_drives_a_queued_step(db, seeded_pipeline) -> None:
     """One worker tick claims + processes a ready queue item, advancing the run — proving the
     daemon actually drives work (review BLOCKER #3). Bounded and non-blocking (no sleeps)."""
@@ -70,6 +81,35 @@ def test_run_worker_once_drives_a_queued_step(db, seeded_pipeline) -> None:
     with db.cursor() as cur:
         cur.execute("SELECT type FROM events WHERE run_id='run_worker1' ORDER BY stream_version")
         assert [r[0] for r in cur.fetchall()] == ["STEP_TRIGGER", "STEP_DONE"]
+
+
+def test_run_worker_once_emits_depth_and_lag_gauges(db, seeded_pipeline) -> None:
+    """Each tick must publish queue-depth and per-projection lag gauges so a health endpoint can
+    see backlog/staleness, not just counters (SP-0.5 round-2)."""
+    from featuregen.runtime.observability import counters
+    from featuregen.runtime.worker import run_worker_once
+
+    reg, projections = seeded_pipeline
+    counters.reset()
+    run_worker_once(db, reg, projections, owner="w1", now=_now())
+    gauges = counters.snapshot()["gauges"]
+    assert "queue.depth" in gauges
+    assert any(k.startswith("projection.lag.") for k in gauges)
+
+
+def test_run_worker_once_halts_claiming_past_leaked_conn_cap(db, seeded_pipeline) -> None:
+    """Once abandoned (leaked) handler connections exceed the cap, the worker stops claiming new
+    work and surfaces it LOUD, so a wedged-handler leak is bounded, not unbounded (SP-0.5 r2)."""
+    from featuregen.runtime.observability import counters
+    from featuregen.runtime.worker import run_worker_once
+
+    reg, projections = seeded_pipeline
+    counters.reset()
+    counters.incr("dispatch.leaked_connections", 100)  # simulate many leaked connections
+    tick = run_worker_once(db, reg, projections, owner="w1", now=_now(), leaked_conn_cap=10)
+
+    assert tick.queue_processed == 0  # claiming halted despite a ready queue item
+    assert counters.snapshot()["counters"].get("worker.leaked_cap_halt", 0) >= 1
 
 
 def test_run_worker_once_is_idle_on_empty(db, seeded_pipeline) -> None:
@@ -188,48 +228,6 @@ def test_control_signal_survives_process_one_first_then_poller_parks(db) -> None
         assert cur.fetchone()[0] == "done"
 
 
-@pytest.fixture
-def _throwaway_autocommit_db(_dsn):
-    """Create an isolated, throwaway, MIGRATED database and yield its DSN; drop it on teardown. Its
-    committed side effects never leak into the shared (rolled-back) test DB — the exact isolation an
-    AUTOCOMMIT daemon connection (run_worker_once / run_forever) needs."""
-    import psycopg
-
-    from featuregen.db.migrations import apply_migrations
-
-    dbname = "fg_worker_ac_test"
-    new_dsn = " ".join((f"dbname={dbname}" if p.startswith("dbname=") else p) for p in _dsn.split())
-
-    admin = psycopg.connect(_dsn, autocommit=True)
-    try:
-        admin.execute(f"DROP DATABASE IF EXISTS {dbname} WITH (FORCE)")
-        admin.execute(f"CREATE DATABASE {dbname}")
-    finally:
-        admin.close()
-    with psycopg.connect(new_dsn) as mconn:
-        apply_migrations(mconn)
-    try:
-        yield new_dsn
-    finally:
-        admin = psycopg.connect(_dsn, autocommit=True)
-        try:
-            admin.execute(f"DROP DATABASE IF EXISTS {dbname} WITH (FORCE)")
-        finally:
-            admin.close()
-
-
-@pytest.fixture
-def autocommit_worker_conn(_throwaway_autocommit_db):
-    """An isolated, throwaway, AUTOCOMMIT connection — the exact connection mode run_forever opens."""
-    import psycopg
-
-    ac = psycopg.connect(_throwaway_autocommit_db, autocommit=True)
-    try:
-        yield ac
-    finally:
-        ac.close()
-
-
 def test_run_worker_once_advances_projections_on_autocommit(
     autocommit_worker_conn, actor, prov
 ) -> None:
@@ -263,6 +261,43 @@ def test_run_worker_once_advances_projections_on_autocommit(
 
     assert tick.errors == 0
     assert tick.projections_advanced >= 1  # the seeded event was consumed by the projections
+
+
+def test_advisory_lock_sites_work_on_autocommit_connection(
+    autocommit_worker_conn, actor, prov
+) -> None:
+    """append_event and record_security_event take a TRANSACTION-scoped advisory lock; on the
+    daemon's AUTOCOMMIT connection the lock is only held if it runs inside a transaction (a bare
+    lock statement self-commits and releases it before the read/insert it guards). Both now open a
+    real transaction on autocommit — verify they produce correct, chained results there (SP-0.5
+    round-2 advisory-lock autocommit safety). NOTE: this exercises the autocommit path for
+    no-regression; the concurrency race the lock prevents is not itself deterministically unit-tested."""
+    from featuregen.contracts import NewEvent
+    from featuregen.events import append_event
+    from featuregen.security.audit import record_security_event, verify_chain
+
+    ac = autocommit_worker_conn
+    # append_event on autocommit: two appends produce ascending, chained global_seq (no gap/fork).
+    e1 = append_event(
+        ac,
+        NewEvent(aggregate="run", aggregate_id="run_al", run_id="run_al", type="STEP_TRIGGER",
+                 schema_version=1, payload={}, actor=actor, provenance=prov),
+        expected_version=0, table_version=1,
+    )
+    e2 = append_event(
+        ac,
+        NewEvent(aggregate="run", aggregate_id="run_al", run_id="run_al", type="STEP_TRIGGER",
+                 schema_version=1, payload={}, actor=actor, provenance=prov),
+        expected_version=1, table_version=1,
+    )
+    assert e2.global_seq > e1.global_seq
+
+    # record_security_event on autocommit: two appends produce a valid, linked hash chain.
+    record_security_event(ac, event_type="COMMAND_DENIED", actor=actor,
+                          attempted_action="activate", decision="denied", reason="r1")
+    record_security_event(ac, event_type="COMMAND_DENIED", actor=actor,
+                          attempted_action="deprecate", decision="denied", reason="r2")
+    assert verify_chain(ac) is True
 
 
 def test_run_worker_once_fires_a_due_timer_on_autocommit(autocommit_worker_conn) -> None:

@@ -141,6 +141,22 @@ def test_timeout_is_retryable(db, seed_run_event, actor, prov) -> None:
         assert cur.fetchone()[0] == "ready"
 
 
+def test_handler_timeout_increments_leaked_connection_counter(db, seed_run_event, actor, prov) -> None:
+    """A handler timeout deliberately abandons its (unclosable) connection; that leak must be
+    OBSERVABLE via the dispatch.leaked_connections counter, not silent (SP-0.5 round-2)."""
+    from featuregen.runtime.observability import counters
+
+    trigger = seed_run_event("run_leak", type="STEP_TRIGGER")
+    for msg in outbox_messages_for_events([trigger]):
+        insert_outbox_message(db, msg)
+    relay_publish_batch(db, make_queue_publisher({"STEP_TRIGGER": "slow"}), owner="relay1")
+    reg = HandlerRegistry()
+    reg.register(_SlowHandler(actor, prov))
+    counters.reset()
+    assert process_one(db, reg, owner="w1").status == "retryable"
+    assert counters.snapshot()["counters"].get("dispatch.leaked_connections", 0) >= 1
+
+
 def test_register_rejects_duplicate_name(actor, prov) -> None:
     reg = HandlerRegistry()
     reg.register(_Handler(actor, prov))
