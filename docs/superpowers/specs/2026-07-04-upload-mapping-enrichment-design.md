@@ -46,17 +46,25 @@ have to match it.
 
 | field | required | category | meaning |
 |-------|----------|----------|---------|
-| `source` | yes | key | one catalog per source (filename stem, a `source` column, or chosen at upload) |
+| `source` | yes | key | one catalog per source (resolved by the ladder above; not the filename) |
 | `table` | yes | schema | table/view name |
 | `column` | yes | schema | column name |
 | `type` | yes | schema | data type (normalized) |
-| `is_grain` | no | **load-bearing** | part of the table's grain key |
-| `joins_to` | no | **load-bearing** | `table.column` this column joins to |
+| `is_grain` | no | **load-bearing** | member of the table's grain key (marked columns = the grain *set*) |
+| `join_id` | no | **load-bearing** | groups the columns of one join; same `join_id` on both tables = a composite join (per S2) |
+| `joins_to` | no | **load-bearing** | `table.column` this column pairs with, within its `join_id` |
+| `cardinality` | no | **load-bearing** | `N:1` / `1:1` / `1:N` for the join — governs safe aggregation |
 | `as_of_column` | no | **load-bearing** | marks the point-in-time / as-of column |
+| `valid_from` / `valid_to` | no | **load-bearing** | SCD-2 effective-dating columns (silent-wrongness if absent on a versioned table) |
+| `unit` / `currency` | no | **load-bearing** | scale/unit of a numeric column (dollars vs **cents**, currency) — wrong value = silently wrong feature |
 | `sensitivity` | no | **load-bearing** | pii / restricted / … |
 | `definition` | no | advisory | business description (drives search) |
 | `domain` / `subdomain` | no | advisory | business grouping |
-| `concept` | no | advisory | glossary concept tag |
+| `concept` | no | advisory | glossary concept tag (controlled vocabulary) |
+
+`unit`/`currency` and `valid_from`/`valid_to` are **load-bearing** deliberately: unlike a missing `definition`
+(which only weakens search), a wrong unit or an unmodelled SCD produces a *silently wrong feature* — worse
+than a missing one.
 
 ## The pipeline (A–F)
 
@@ -200,6 +208,57 @@ upload, so old files are never re-mapped.
 *deposits, three months:* M1 new source → establish + save. M2 same headers, `posted_at→event_ts` in the
 data → headers match → reuse automatically → drift stales the fact. M3 export tool changed the headers →
 mismatch → remap (`MAPPING_UPDATED`) → then ingest + drift.
+
+## Graph metadata model — what nodes/edges carry, and how features use it
+
+### Mechanics (how metadata is attached)
+Nodes and edges are **rows** in projection tables (`graph_node`, `graph_edge`), folded from the event log:
+- **Load-bearing** metadata (type, grain, join, as-of, valid-from/to, unit/currency, sensitivity) ←
+  `FACT_ASSERTED` → **typed columns** (the things you filter/join/aggregate on).
+- **Advisory** metadata (definition, concept, domain, any stats) ← `ENRICHMENT_APPLIED` → a **JSONB
+  payload** (extensible without a migration per tag type).
+- **Every item carries its own provenance** (`origin`, `confidence`, `source_upload_id`,
+  `mapping_version` or `llm_call_id`). The *same* field can arrive from different origins and you must
+  know which to trust: `sensitivity=pii` *declared* by the DBA vs *guessed* by the LLM.
+
+### Per-node fields
+- **Column** — identity (source·table·column); `type` (normalized); facts (`is_grain`, `is_as_of`,
+  `valid_from/to`, `unit/currency`, `sensitivity`); enrichment (`concept`, `domain`, `definition`);
+  `state` (active/stale + source watermark); `stats` (sparse — only if declared); provenance per item.
+- **Table** — grain **set**, the `as_of` column, SCD `valid_from/to` columns, domain/subdomain,
+  definition, join-degree, column count, drift status.
+- **Concept** — controlled-vocabulary name + definition + members. **Domain** — name, subdomain
+  hierarchy, member tables.
+
+### Per-edge fields
+- **Join** (the load-bearing one) — `join_id`; the **paired** `from→to` columns (composite); `cardinality`
+  (N:1 / 1:1 / 1:N); `origin` + `confidence`; `type_compat`.
+- **Contains** (table→column) — ordinal. **Concept** (column→concept) / **Domain** (table→domain) —
+  provenance + confidence.
+
+### How feature-building leverages it (each field earns its place)
+
+| the builder's question | the metadata that answers it |
+|---|---|
+| where do I filter to avoid **leaking the future**? | the table's **`as_of`** (and SCD `valid_from/to`) |
+| how exactly do I **join** these tables? | the **join edge's paired columns** (composite) |
+| is the join safe to aggregate, or will it **double-count**? | the edge's **`cardinality`** (N:1 = safe fan-in) |
+| what key do I **aggregate to**? | the tables' **grain sets** |
+| what operations are **valid**, and in what **unit**? | the **normalized `type`** + **`unit`/`currency`** |
+| am I **allowed** to use this? | the **`sensitivity`** tag → mask / exclude / flag |
+| how much do I **trust** this before building on it? | **provenance + drift** (declared vs llm_suggested; active vs stale) |
+
+So "avg customer balance over 90 days" becomes an automatic, correct recipe: as-of → point-in-time
+filter; grain → aggregate key; join + N:1 → safe fan-in; type+unit → valid avg in the right scale;
+sensitivity → drop PII; provenance → "one join in this path is only LLM-suggested, verify."
+
+### Is it enough? (honest gaps)
+Enough for **correctness** (join right, aggregate right, no leakage, compliance-aware). Thin on:
+- **Statistical metadata** (cardinality, null-rate, distribution, min/max) — the **no-DB tax**; only
+  present if the upload declares it. Phase-2 may profile if a data sample is ever available.
+- **Enums / valid value sets** (for one-hot features) — V2.
+`unit`/`currency` and SCD `valid_from/to` are pulled *into* the contract (above) precisely because their
+absence causes *silent wrongness*, not mere sparsity.
 
 ## Linking — how columns connect across sources
 

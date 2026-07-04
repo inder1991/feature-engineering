@@ -54,6 +54,12 @@ the delta (see H2).
   reconciliation is V2.
 - **T4 Duplicate/empty rows (BUILD).** Two rows for the same `table.column`: identical → dedup; conflicting
   (e.g. two types) → validation error. Empty/header-only file → clean rejection.
+- **T5 Graph metadata model + contract additions (RESOLVE).** Concrete per-node/per-edge fields defined
+  (see *Graph metadata model* in the mapping spec): load-bearing → typed columns, advisory → JSONB, every
+  item provenance-stamped. The contract gains **`unit`/`currency`** and SCD **`valid_from`/`valid_to`** as
+  *load-bearing* — their absence causes *silently wrong features* (wrong scale / no effective-dating),
+  which is worse than a missing definition. **Statistical** metadata (cardinality/null-rate/distribution)
+  stays **sparse** (no-DB tax; declared-only, phase-2 profiling if a sample appears); **enums** are V2.
 
 ## Drift & brake (RESOLVE)
 
