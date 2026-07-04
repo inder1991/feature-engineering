@@ -77,3 +77,15 @@ def _reset_registry():
     reset_event_registry()
     yield
     reset_event_registry()
+
+
+@pytest.fixture(autouse=True)
+def _reset_repair_registry():
+    """The projection repair registry is a process-global; reset it around each test so a
+    projection registered for repair in one test never bleeds into another (mirrors the counters
+    and integration-caller resets)."""
+    from featuregen.projections import runner
+
+    runner._REPAIR_REGISTRY.clear()
+    yield
+    runner._REPAIR_REGISTRY.clear()

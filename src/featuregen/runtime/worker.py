@@ -306,7 +306,7 @@ def run_worker_once(
         # Crash recovery: sweep rows stuck in 'dispatched' (a worker died mid-dispatch) through
         # dispatch_command's idempotency-safe recovery path.
         for cid, integration in claim_stale_dispatched(
-            conn, registered, stale_after_seconds=external_stale_seconds, now=now
+            conn, registered, stale_after_seconds=external_stale_seconds, now=now, limit=batch
         ):
             dispatch_command(conn, cid, callers[integration], now=now)
             processed += 1

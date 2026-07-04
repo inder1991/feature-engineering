@@ -244,6 +244,60 @@ def test_resolve_degraded_proves_health_before_clearing(conn):
     ).fetchone()[0] >= 1
 
 
+class MultiPoisonProjection:
+    """Poisons on a SET of seqs; healing removes seqs from the set. Models a projection with a
+    second-stage poison at a later seq than the one that first halted it."""
+
+    name = "multi"
+    is_analytics = False
+
+    def __init__(self, poisons):
+        self.poisons = set(poisons)
+
+    def reset(self, conn):
+        pass
+
+    def apply(self, conn, event):
+        if event.global_seq in self.poisons:
+            raise ProjectionApplyError("run", event.run_id, "poison")
+
+
+def test_resolve_degraded_refuses_when_a_second_stage_poison_remains(conn):
+    """resolve must re-read the LIVE marker: healing the FIRST poison lets the projection advance
+    only to a LATER poison, which re-marks the aggregate — resolve must still REFUSE, not clear on
+    the stale pre-run snapshot (SP-0.5 round-2 review, finding 6)."""
+    from tests.featuregen._helpers import make_cmd
+
+    from featuregen.aggregates.run_lifecycle import resolve_degraded_command
+    from featuregen.projections.runner import register_projection_for_repair
+
+    event_registry().register_schema("E", 1, {"type": "object"}, owner="o")
+    _append(conn, "run_m", 0, {})
+    p1 = _append(conn, "run_m", 1, {})
+    p2 = _append(conn, "run_m", 2, {})
+
+    proj = MultiPoisonProjection({p1.global_seq, p2.global_seq})
+    register_projection_for_repair("multi", proj)
+    run_projection(conn, proj)  # halts at p1 -> marker poison_seq = p1
+
+    cmd = make_cmd("resolve_degraded", "run", "run_m", {})
+    # Heal ONLY the first poison; the second (p2) still halts the projection.
+    proj.poisons.discard(p1.global_seq)
+    res = resolve_degraded_command(conn, cmd)
+    assert res.accepted is False  # advanced past p1 but re-halted at p2 -> still degraded
+    left = conn.execute(
+        "SELECT poison_seq FROM projection_degraded WHERE aggregate_id='run_m'"
+    ).fetchone()
+    assert left is not None and left[0] == p2.global_seq  # marker moved to the second-stage poison
+
+    # Heal the second poison too -> now fully healthy -> resolve clears.
+    proj.poisons.discard(p2.global_seq)
+    assert resolve_degraded_command(conn, cmd).accepted is True
+    assert conn.execute(
+        "SELECT count(*) FROM projection_degraded WHERE aggregate_id='run_m'"
+    ).fetchone()[0] == 0
+
+
 def test_resolve_degraded_fails_closed_when_projection_not_registered(conn):
     """A marker naming a projection not registered for repair cannot be health-proven, so resolve
     fail-closes (accepted=False, marker unchanged) rather than blindly unblocking (SP-0.5 r2)."""

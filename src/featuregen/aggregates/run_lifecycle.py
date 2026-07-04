@@ -184,7 +184,7 @@ def resolve_degraded_command(conn: DbConn, cmd: Command) -> CommandResult:
 
     aid = cmd.aggregate_id
     markers = conn.execute(
-        "SELECT projection_name, poison_seq FROM projection_degraded "
+        "SELECT DISTINCT projection_name FROM projection_degraded "
         "WHERE aggregate = %s AND aggregate_id = %s",
         (cmd.aggregate, aid),
     ).fetchall()
@@ -193,7 +193,7 @@ def resolve_degraded_command(conn: DbConn, cmd: Command) -> CommandResult:
             accepted=False, aggregate_id=aid or "",
             denied_reason="no degraded marker for this aggregate",
         )
-    for projection_name, poison_seq in markers:
+    for (projection_name,) in markers:
         projection = projection_for_repair(projection_name)
         if projection is None:
             return CommandResult(
@@ -201,7 +201,9 @@ def resolve_degraded_command(conn: DbConn, cmd: Command) -> CommandResult:
                 denied_reason=f"cannot prove health: projection '{projection_name}' "
                               "is not registered for repair",
             )
-        if not advance_projection_past(conn, projection, poison_seq):
+        # Re-run + re-read the LIVE marker (a second-stage poison re-halts at a later seq, so the
+        # pre-loop snapshot cannot be trusted, SP-0.5 round-2 review).
+        if not advance_projection_past(conn, projection, cmd.aggregate, aid):
             return CommandResult(
                 accepted=False, aggregate_id=aid or "",
                 denied_reason=f"projection '{projection_name}' still cannot advance past the "

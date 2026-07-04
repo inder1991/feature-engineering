@@ -28,7 +28,14 @@ def register_phase06_event_schemas() -> None:
 
 def bootstrap_phase06(handler_registry) -> None:
     """Single production wiring call: event schemas (so runtime `append_event` validation
-    passes) + the §4.4 command catalog + the §5.8 saga handler into Phase-04's HandlerRegistry."""
+    passes) + the §4.4 command catalog + the §5.8 saga handler into Phase-04's HandlerRegistry.
+
+    NOTE (SP-0.5 round-2): the §4.4 catalog includes `resolve_degraded`, whose prove-health
+    additionally needs the runner-driven projections registered for repair
+    (`register_projection_for_repair`). The worker's `runtime.worker.compose` does that
+    registration; a process wired via THIS call but WITHOUT `compose` will fail-closed on
+    `resolve_degraded` ("projection not registered for repair") — safe, but it cannot un-block a
+    degraded aggregate. Un-blocking is a worker-process operation."""
     from featuregen.aggregates.activation import register_phase06_handlers
     from featuregen.aggregates.commands import register_phase06_commands
 

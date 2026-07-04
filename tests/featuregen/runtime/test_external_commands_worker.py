@@ -87,8 +87,11 @@ def test_claim_stale_dispatched_recovers_a_crashed_dispatch(autocommit_worker_co
             (NOW - timedelta(hours=1), cid),
         )
 
-    stale = claim_stale_dispatched(conn, ["llm"], stale_after_seconds=60, now=NOW)
+    stale = claim_stale_dispatched(conn, ["llm"], stale_after_seconds=60, now=NOW, limit=10)
     assert stale == [(cid, "llm")]
+    # Atomic exclusion: the row's dispatched_at was re-stamped past the cutoff, so an immediately
+    # concurrent sweep does NOT pick it up again (no double recovery / double invoke).
+    assert claim_stale_dispatched(conn, ["llm"], stale_after_seconds=60, now=NOW, limit=10) == []
 
     # Route through dispatch_command's recovery branch: job_handle -> reconcile, no re-invoke.
     caller = recording_caller(reconcile_result=IntegrationResult(True, {"reconciled": True}))
@@ -106,7 +109,34 @@ def test_claim_stale_dispatched_ignores_fresh_dispatched_rows(autocommit_worker_
             "UPDATE external_commands SET status='dispatched', dispatched_at=%s WHERE command_id=%s",
             (NOW, cid),  # just dispatched -> not stale yet
         )
-    assert claim_stale_dispatched(conn, ["llm"], stale_after_seconds=60, now=NOW) == []
+    assert claim_stale_dispatched(conn, ["llm"], stale_after_seconds=60, now=NOW, limit=10) == []
+
+
+def test_finalize_is_exactly_once_under_a_repeat_recovery(autocommit_worker_conn, recording_caller):
+    # If the same command is recovered twice (e.g. a duplicate sweep), the cost must be counted
+    # ONCE: the first finalize wins the FOR-UPDATE transaction, the second honors 'succeeded' and
+    # does NOT re-record cost (SP-0.5 round-2 review — no durable-budget double-count).
+    conn = autocommit_worker_conn
+    conn.execute(
+        "INSERT INTO run_workflow_state (run_id, request_id, current_state, table_version, "
+        "cost_units) VALUES ('run_1','req_1','DRAFT',1,0)"
+    )
+    caller = recording_caller(reconcile_result=IntegrationResult(True, {"ok": 1}, Decimal("4.0")))
+    register_integration_caller(caller)
+    cid = _record(conn, "twice", handle="job-x")
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE external_commands SET status='dispatched', dispatched_at=%s WHERE command_id=%s",
+            (NOW - timedelta(hours=1), cid),
+        )
+
+    dispatch_command(conn, cid, caller, now=NOW)  # first recovery -> succeeded, cost recorded once
+    dispatch_command(conn, cid, caller, now=NOW)  # second -> honors 'succeeded', no re-record
+
+    cost = conn.execute(
+        "SELECT cost_units FROM run_workflow_state WHERE run_id='run_1'"
+    ).fetchone()[0]
+    assert cost == Decimal("4.0")  # counted exactly once, not 8.0
 
 
 def test_external_command_cost_rolls_into_run_budget(autocommit_worker_conn, recording_caller):

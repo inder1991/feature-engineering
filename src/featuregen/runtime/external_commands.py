@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Mapping
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from decimal import Decimal
@@ -210,52 +211,58 @@ def _finalize(
     residual: bool,
     reconciled: bool,
 ) -> DispatchOutcome:
-    """Write the external call's result in its OWN committed transaction (§5.4 Step 3): re-lock the
-    row, honor a concurrent finalize if one already landed, else persist succeeded/failed/pending.
-    Shared by dispatch_command (first dispatch + recovery) and invoke_claimed_external."""
-    with conn.cursor() as cur:
-        cur.execute(
-            "SELECT status, run_id FROM external_commands WHERE command_id = %s FOR UPDATE",
-            (command_id,),
-        )
-        frow = cur.fetchone()
-        if frow is None:
-            conn.rollback()
-            raise KeyError(command_id)
-        status, run_id = frow
-        if status in ("succeeded", "failed", "stale_ignored"):
-            # A concurrent dispatcher already finalized this command; honor it.
-            conn.rollback()
-            return DispatchOutcome(command_id, status, reinvoked, residual, reconciled)
+    """Write the external call's result ATOMICALLY (§5.4 Step 3): re-lock the row, honor a
+    concurrent finalize if one already landed, else persist succeeded/failed/pending (+ roll a
+    succeeded cost into the run budget). Shared by dispatch_command and invoke_claimed_external.
 
-        if res.ok:
+    On the worker's AUTOCOMMIT connection the check-then-act (FOR UPDATE read -> status UPDATE ->
+    cost roll-up) MUST run in ONE transaction (SP-0.5 round-2 review): otherwise the row lock
+    releases at statement end and two concurrent recoverers of the SAME stale 'dispatched' row both
+    read 'dispatched', both write 'succeeded', and both double-count the cost into the durable §5.6
+    budget. Wrap in a real transaction on autocommit; a non-autocommit caller already spans it."""
+    tx = conn.transaction() if conn.autocommit else nullcontext()
+    with tx:
+        with conn.cursor() as cur:
             cur.execute(
-                "UPDATE external_commands SET status='succeeded', result=%s, cost_units=%s, "
-                "completed_at=%s, job_handle=COALESCE(%s, job_handle) WHERE command_id=%s",
-                (
-                    Jsonb(_flag_residual(res.result, residual)),
-                    res.cost_units,
-                    now,
-                    res.job_handle,
-                    command_id,
-                ),
-            )
-            _record_external_cost(conn, command_id, run_id, res.cost_units)
-            outcome = DispatchOutcome(command_id, "succeeded", reinvoked, residual, reconciled)
-        elif res.permanent:
-            cur.execute(
-                "UPDATE external_commands SET status='failed', result=%s, completed_at=%s "
-                "WHERE command_id=%s",
-                (Jsonb(dict(res.result)), now, command_id),
-            )
-            outcome = DispatchOutcome(command_id, "failed", reinvoked, residual, reconciled)
-        else:
-            cur.execute(
-                "UPDATE external_commands SET status='pending' WHERE command_id=%s",
+                "SELECT status, run_id FROM external_commands WHERE command_id = %s FOR UPDATE",
                 (command_id,),
             )
-            outcome = DispatchOutcome(command_id, "pending", reinvoked, residual, reconciled)
-    conn.commit()
+            frow = cur.fetchone()
+            if frow is None:
+                raise KeyError(command_id)
+            status, run_id = frow
+            if status in ("succeeded", "failed", "stale_ignored"):
+                # A concurrent dispatcher already finalized this command; honor it (a second
+                # recoverer blocks on FOR UPDATE above until the first commits, then lands here).
+                return DispatchOutcome(command_id, status, reinvoked, residual, reconciled)
+
+            if res.ok:
+                cur.execute(
+                    "UPDATE external_commands SET status='succeeded', result=%s, cost_units=%s, "
+                    "completed_at=%s, job_handle=COALESCE(%s, job_handle) WHERE command_id=%s",
+                    (
+                        Jsonb(_flag_residual(res.result, residual)),
+                        res.cost_units,
+                        now,
+                        res.job_handle,
+                        command_id,
+                    ),
+                )
+                _record_external_cost(conn, command_id, run_id, res.cost_units)
+                outcome = DispatchOutcome(command_id, "succeeded", reinvoked, residual, reconciled)
+            elif res.permanent:
+                cur.execute(
+                    "UPDATE external_commands SET status='failed', result=%s, completed_at=%s "
+                    "WHERE command_id=%s",
+                    (Jsonb(dict(res.result)), now, command_id),
+                )
+                outcome = DispatchOutcome(command_id, "failed", reinvoked, residual, reconciled)
+            else:
+                cur.execute(
+                    "UPDATE external_commands SET status='pending' WHERE command_id=%s",
+                    (command_id,),
+                )
+                outcome = DispatchOutcome(command_id, "pending", reinvoked, residual, reconciled)
     return outcome
 
 
@@ -383,26 +390,35 @@ def invoke_claimed_external(
 
 
 def claim_stale_dispatched(
-    conn: DbConn, registered_integrations, *, stale_after_seconds: float, now: datetime
+    conn: DbConn, registered_integrations, *, stale_after_seconds: float, now: datetime, limit: int
 ) -> list[tuple[str, str]]:
-    """Find external commands stuck in 'dispatched' (a worker died after claiming, before
-    finalizing) older than `stale_after_seconds` — CRASH RECOVERY. Returns [(command_id,
-    integration)] for registered integrations only, FOR UPDATE SKIP LOCKED so two workers do not
-    both sweep the same row. The caller routes each through dispatch_command, whose 'dispatched' ->
-    recover path (reconcile / dedup-safe re-invoke / honest residual flag) is idempotency-safe."""
+    """Claim up to `limit` external commands stuck in 'dispatched' (a worker died after claiming,
+    before finalizing) older than `stale_after_seconds` — CRASH RECOVERY. Returns [(command_id,
+    integration)] for registered integrations only.
+
+    Atomic exclusion (SP-0.5 round-2 review): a bare SELECT ... FOR UPDATE SKIP LOCKED releases its
+    row locks at statement end on the autocommit daemon connection, so two workers would both sweep
+    the SAME stale row and both re-invoke the side effect. Instead this RE-STAMPS dispatched_at in
+    the SAME atomic UPDATE, pushing each claimed row PAST the stale cutoff — so a concurrent sweep's
+    subquery skips it. The caller routes each through dispatch_command, whose 'dispatched' -> recover
+    path (reconcile / dedup-safe re-invoke / honest residual flag) is idempotency-safe. `limit`
+    bounds the sweep so a mass-crash recovery stays within run_worker_once's one-bounded-pass
+    contract (rows past the limit are swept on later ticks)."""
     reg = list(registered_integrations)
     if not reg:
         return []
     cutoff = now - timedelta(seconds=stale_after_seconds)
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT command_id, integration FROM external_commands "
+            "UPDATE external_commands SET dispatched_at=%s "
+            "WHERE command_id IN (SELECT command_id FROM external_commands "
             "WHERE status='dispatched' AND integration = ANY(%s) AND dispatched_at < %s "
-            "ORDER BY dispatched_at FOR UPDATE SKIP LOCKED",
-            (reg, cutoff),
+            "ORDER BY dispatched_at FOR UPDATE SKIP LOCKED LIMIT %s) "
+            "RETURNING command_id, integration",
+            (now, reg, cutoff, limit),
         )
         rows = cur.fetchall()
-    conn.rollback()  # release row locks; dispatch_command re-locks each in its own Step 1
+    conn.commit()  # re-stamp durable before recovery; concurrent sweeps now exclude these rows
     return [(r[0], r[1]) for r in rows]
 
 

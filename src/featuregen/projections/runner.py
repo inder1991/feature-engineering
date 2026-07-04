@@ -173,14 +173,29 @@ def _checkpoint_seq(conn: DbConn, name: str) -> int:
     return int(row["checkpoint_seq"]) if row else 0
 
 
-def advance_projection_past(conn: DbConn, projection: Projection, poison_seq: int) -> bool:
-    """Re-run the projection and report whether it advanced PAST `poison_seq` — i.e. the poison
-    event now applies (remediated). A projection that is STILL poisoned re-halts BEFORE poison_seq
-    (run_projection re-marks it), leaving the checkpoint < poison_seq, so this returns False. This
-    is how `resolve_degraded` proves health before clearing a marker instead of trusting the
-    operator blindly."""
+def advance_projection_past(
+    conn: DbConn, projection: Projection, aggregate: str, aggregate_id: str
+) -> bool:
+    """Re-run the projection and report whether it is now HEALTHY for (aggregate, aggregate_id) —
+    i.e. the projection advanced past the poison that halted it. Healthy iff, AFTER the re-run,
+    the checkpoint is >= the CURRENT degraded marker's poison_seq (or the marker is gone).
+
+    Re-reading the marker AFTER the run is load-bearing (SP-0.5 round-2 review): if the projection
+    advances past the ORIGINAL poison but re-halts at a LATER, second-stage poison, run_projection
+    re-marks the SAME row with the later poison_seq — trusting the pre-run snapshot would report
+    healthy and falsely unblock. A projection still stuck re-halts and leaves checkpoint < the
+    (current) poison_seq, so this returns False."""
     run_projection(conn, projection)
-    return _checkpoint_seq(conn, projection.name) >= poison_seq
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            "SELECT poison_seq FROM projection_degraded "
+            "WHERE projection_name = %s AND aggregate = %s AND aggregate_id = %s",
+            (projection.name, aggregate, aggregate_id),
+        )
+        marker = cur.fetchone()
+    if marker is None:
+        return True  # no marker for this aggregate after the re-run — healthy
+    return _checkpoint_seq(conn, projection.name) >= marker["poison_seq"]
 
 
 def projection_lag(conn: DbConn, name: str) -> int:
