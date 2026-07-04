@@ -25,6 +25,17 @@ def _register_overlay_event_types():
     register_overlay_event_types(event_registry())
 
 
+@pytest.fixture(autouse=True)
+def _reset_overlay_config():
+    # OverlayConfig is a process-wide module global (SP-1.5 §3.1); reset it around each test so a
+    # config registered in one test never leaks into another that expects fail-closed.
+    from featuregen.overlay.config import _clear_overlay_config
+
+    _clear_overlay_config()
+    yield
+    _clear_overlay_config()
+
+
 @pytest.fixture
 def catalog():
     cat = StubCatalog()
