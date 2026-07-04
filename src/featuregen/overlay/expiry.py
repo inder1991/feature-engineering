@@ -90,6 +90,61 @@ def _apply_expiry(conn: DbConn, adapter, *, fact_key: str, confirmed_event_id: s
     return True
 
 
+def fire_due_overlay_renewals(conn: DbConn, *, now: datetime) -> int:
+    """Pre-expiry RENEWAL poller (SP-1.5 Task 6): for each VERIFIED fact inside its renewal grace
+    window (expires_at - renewal_grace <= now < expires_at) with NO open human task yet, open a
+    re-verify task so an owner can RE-CONFIRM *before* expiry — closing the recurring outage window.
+    Idempotent: the NOT EXISTS open-task guard (+ FOR UPDATE SKIP LOCKED) means a re-run opens no
+    duplicate task/timer — the exact case open_reverify_task alone would duplicate (F1). Skips (0)
+    when no OverlayConfig is sealed. The confirm handler's within-grace path (within_renewal_grace)
+    is what accepts the resulting re-confirmation of a still-VERIFIED fact."""
+    from featuregen.overlay.config import current_overlay_config
+
+    try:
+        grace = current_overlay_config().renewal_grace
+    except RuntimeError:
+        return 0
+    actor = build_service_identity(
+        subject="service:overlay-renewal",
+        role_claims=("overlay",),
+        attestation="overlay-renewal-poller",
+    )
+    adapter = current_catalog_adapter()
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            """
+            SELECT fs.fact_key, fs.confirmed_event_id, fs.fact_type
+            FROM overlay_fact_state fs
+            WHERE fs.status = 'VERIFIED' AND fs.expires_at IS NOT NULL
+              AND fs.expires_at <= %s AND fs.expires_at > %s
+              AND NOT EXISTS (
+                  SELECT 1 FROM human_tasks ht
+                  WHERE ht.fact_key = fs.fact_key AND ht.status = 'open'
+              )
+            FOR UPDATE OF fs SKIP LOCKED
+            """,
+            (now + grace, now),
+        )
+        due = cur.fetchall()
+    opened = 0
+    for row in due:
+        stream = load_fact(conn, row["fact_key"])
+        if not stream:
+            continue
+        ref = _ref_from_payload(stream[0].payload["catalog_object_ref"])
+        authority = resolve_authority(conn, adapter, ref, row["fact_type"])
+        open_reverify_task(
+            conn,
+            fact_key=row["fact_key"],
+            fact_type=row["fact_type"],
+            target_confirmed_event_id=row["confirmed_event_id"],
+            authority=authority,
+            actor=actor,
+        )
+        opened += 1
+    return opened
+
+
 def fire_due_overlay_expiries(conn: DbConn, *, now: datetime) -> int:
     """Explicit transactional poller — NOT a HandlerRegistry handler.
     The SP-0 timer runtime can't carry fact_key/confirmed_event_id to an overlay handler

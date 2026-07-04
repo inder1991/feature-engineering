@@ -20,6 +20,7 @@ from featuregen.overlay._lifecycle import (
     _deny_audited,
     _latest_proposed,
     resolve_ttl,
+    within_renewal_grace,
 )
 from featuregen.overlay._types import Confirmer, FactType, Role
 from featuregen.overlay.authority import (
@@ -60,7 +61,11 @@ def confirm_fact(conn: DbConn, cmd: Command) -> CommandResult:
     if not stream:
         return CommandResult(accepted=False, aggregate_id=key, denied_reason="fact does not exist")
     state = fold_overlay_state(stream)
-    if state.status not in _AWAITING_CONFIRMATION:
+    # A VERIFIED fact inside its pre-expiry renewal grace window IS re-confirmable (SP-1.5 Task 6) —
+    # this is what prevents the recurring expiry outage. Authority + four-eyes + CAS below are
+    # UNCHANGED, so renewal preserves every guard (F8: a self-entered fact still needs a 2nd signer).
+    renewing = within_renewal_grace(state, datetime.now(UTC))
+    if state.status not in _AWAITING_CONFIRMATION and not renewing:
         return CommandResult(
             accepted=False,
             aggregate_id=key,
@@ -93,11 +98,12 @@ def confirm_fact(conn: DbConn, cmd: Command) -> CommandResult:
     # re-affirms the LAST VERIFIED value (state.prior_value) — defaulting to the cycle-1 proposed
     # value would silently revert a prior human correction. A fresh DRAFT has no prior value,
     # so it defaults to the proposed value.
-    default_value = (
-        state.prior_value
-        if state.status in ("REVERIFY", "STALE")
-        else proposed.payload["proposed_value"]
-    )
+    if state.status == "VERIFIED":
+        default_value = state.value  # renewal within grace: re-affirm the CURRENT confirmed value
+    elif state.status in ("REVERIFY", "STALE"):
+        default_value = state.prior_value
+    else:
+        default_value = proposed.payload["proposed_value"]
     value = args.get("value", default_value)
     try:
         validate_fact_value(fact_type, value, use_case=use_case)

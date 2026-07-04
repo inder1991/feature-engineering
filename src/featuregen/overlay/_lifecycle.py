@@ -10,7 +10,7 @@ imports keep resolving.
 from __future__ import annotations
 
 from dataclasses import replace
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 from featuregen.contracts import Command, CommandResult, DbConn
 from featuregen.gates.tasks import cancel_task
@@ -50,6 +50,23 @@ def resolve_ttl(fact_type: str, fact_key: str) -> timedelta:
         frac = (h / 2**64) * 2 - 1  # deterministic per fact_key, in [-1, 1)
         base = base + base * (config.ttl_jitter_fraction * frac)
     return max(config.ttl_min, min(config.ttl_max, base))  # clamp (jitter can nudge out of band)
+
+
+def within_renewal_grace(state, now) -> bool:
+    """True when a still-VERIFIED fact is inside its pre-expiry renewal window (SP-1.5 Task 6): an
+    OverlayConfig is sealed and `now >= expires_at - renewal_grace`. Lets an owner RE-CONFIRM before
+    expiry (no outage) — the confirm path keeps four-eyes (proposer != confirmer) and authority, so a
+    self-entered fact still needs a different signer to renew (F8). Off (False) when no config is
+    sealed, so the pre-SP-1.5 'VERIFIED is not re-confirmable' rule holds by default."""
+    from featuregen.overlay.config import current_overlay_config
+
+    if state.status != "VERIFIED" or state.expires_at is None:
+        return False
+    try:
+        grace = current_overlay_config().renewal_grace
+    except RuntimeError:
+        return False
+    return now >= datetime.fromisoformat(state.expires_at) - grace  # expires_at is an ISO string
 
 
 class OverlayCommandError(Exception):

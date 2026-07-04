@@ -30,7 +30,7 @@ from featuregen.contracts import Command, Projection
 from featuregen.overlay.catalog import current_catalog_adapter
 from featuregen.overlay.catalog_changes import detect_catalog_changes, drift_watermark
 from featuregen.overlay.config import current_overlay_config
-from featuregen.overlay.expiry import fire_due_overlay_expiries
+from featuregen.overlay.expiry import fire_due_overlay_expiries, fire_due_overlay_renewals
 from featuregen.projections.runner import projection_lag, run_projection
 from featuregen.runtime.dispatch import process_one, recover_stuck
 from featuregen.runtime.external_commands import (
@@ -236,6 +236,17 @@ def _advance_overlay_expiries(conn: psycopg.Connection, *, now: datetime) -> int
     return fire_due_overlay_expiries(conn, now=now)
 
 
+def _advance_overlay_renewals(conn: psycopg.Connection, *, now: datetime) -> int:
+    """Pre-expiry renewal poller (SP-1.5 Task 6), skipping (NOT erroring) when no catalog adapter is
+    wired — same configuration-state handling as _advance_overlay_expiries."""
+    try:
+        current_catalog_adapter()
+    except RuntimeError:
+        counters.incr("overlay.renewal.skipped_no_adapter")
+        return 0
+    return fire_due_overlay_renewals(conn, now=now)
+
+
 def _drift_actor():
     """Fail-safe (unattested, never forged) service principal for the drift scanner's STALE events +
     re-verify task opens — mirrors _control_actor / the overlay-expiry poller."""
@@ -405,6 +416,12 @@ def run_worker_once(
 
     overlay_expiries = _stage("overlay_expiry")(
         lambda: _tx(conn, lambda: _advance_overlay_expiries(conn, now=now)), 0
+    )
+
+    # Pre-expiry renewal (SP-1.5 Task 6): opens re-verify tasks for facts approaching expiry so an
+    # owner re-confirms before the outage window. Its own transaction; skips cleanly with no adapter.
+    _stage("overlay_renewal")(
+        lambda: _tx(conn, lambda: _advance_overlay_renewals(conn, now=now)), 0
     )
 
     # Catalog-drift scan (SP-1.5 Task 4): its own transaction (advisory-locked, cadence-gated,
