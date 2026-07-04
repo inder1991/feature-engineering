@@ -3,6 +3,11 @@
 Date: 2026-07-04. Status: proposed. Depends on the
 [upload-catalog pivot](2026-07-04-upload-catalog-pivot-design.md).
 
+> **Amended by the [architecture-review resolutions](2026-07-04-upload-catalog-review-resolutions.md)** —
+> composite grain/join contract, controlled concept vocabulary, defined ranking + provenance/trace,
+> diff-append + incremental enrichment, enrichment-as-events, and the **redacted-sample** rule (the LLM
+> sees schema + column *statistics*, never raw cell values — no PII into the immutable log).
+
 ## Purpose & scope
 
 The **front door** of the upload-driven catalog. It turns arbitrary uploaded schema files (Excel/CSV,
@@ -72,8 +77,9 @@ catalog untouched.
 - **New source** (or the file's header set changed):
   1. **Deterministic aliasing** — match headers to fields via a variant dictionary
      (case/space/underscore-insensitive: `table` ← {`table_name`, `TABLE_NAME`, `physical_table`}, …).
-  2. **LLM proposal for the remainder** — given the *unmatched headers + a few sample cell values*
-     (never the full data), propose `field`, `confidence`, `reason`.
+  2. **LLM proposal for the remainder** — given the *unmatched headers + column statistics/patterns*
+     (redacted — **never raw cell values**, so no PII enters the immutable log), propose `field`,
+     `confidence`, `reason`.
   3. **Value rules** where a field is encoded — e.g. `PII Flag` Y/N → `sensitivity = pii`.
   4. **Confidence gate:**
      - **schema fields** (table/column/type) high-confidence + validation-clean → **auto**.
@@ -216,7 +222,8 @@ placed, wired-in part of the estate.
 
 ## LLM usage boundaries (safety)
 
-- **Used:** Step B mapping proposal (headers + samples only), Step E enrichment + fact suggestions.
+- **Used:** Step B mapping proposal (headers + redacted column stats only — never raw values), Step E
+  enrichment + fact suggestions.
 - **Never used:** reading files, applying mappings, producing any table/column/type value, or gating a
   load-bearing fact without a human confirm.
 - Every LLM output is either **validated by deterministic code** or **confirmed by a human** before it

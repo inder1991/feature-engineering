@@ -2,6 +2,12 @@
 
 Date: 2026-07-04. Status: proposed direction, pending build.
 
+> **Amended by the [architecture-review resolutions](2026-07-04-upload-catalog-review-resolutions.md).**
+> Key corrections: v1 is **catalog/column search, not feature search** (feature nodes/lineage → phase-2);
+> facts use a single **`FACT_ASSERTED`/`FACT_RETRACTED`** event (diff-appended), not propose+confirm;
+> a small **read-scope authz stays** (the PII map must not be world-readable); enrichment is persisted as
+> events; the join/grain contract is **composite-capable**. Read that doc alongside this one.
+
 ## The pivot in one paragraph
 
 The platform was built as a **human-governed metadata overlay**: facts about data (grain, join keys,
