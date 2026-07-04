@@ -14,6 +14,7 @@ from featuregen.overlay.projection import dependents_of
 from featuregen.overlay.reverify_tasks import open_reverify_task
 from featuregen.overlay.state import fold_overlay_state
 from featuregen.overlay.store import append_overlay_event, load_fact
+from featuregen.runtime.observability import counters
 
 
 def drift_watermark(conn: DbConn, catalog_source: str) -> datetime | None:
@@ -155,6 +156,9 @@ def detect_catalog_changes(
         # advancing the snapshot or watermark so the next scan re-detects + re-stales (idempotent:
         # an already-STALE fact is a CAS no-op). Any partial STALED appends from this scan commit
         # harmlessly; the un-advanced snapshot is what guarantees the change is not laundered.
+        # Skip-LOUD (review #11): count the truncated scan so a re-detect loop is observable, not
+        # silently indistinguishable from a completed scan.
+        counters.incr("overlay.drift.truncated_concurrent_confirm")
         return changes
 
     _save_snapshot(conn, csource, current)

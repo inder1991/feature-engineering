@@ -79,12 +79,12 @@ def referent_gap(adapter, ref, fact_type: str, value) -> str | None:
     checked UNDER ITS OWN source (per-referent qualification): a referent whose catalog_source this
     adapter does not serve is fail-closed (F4/F5). F6: existence is checked against
     adapter.fingerprint() keyed on the display object_ref — there is no get_object."""
+    from featuregen.overlay.dependencies import fact_dependencies
     from featuregen.overlay.identity import display_object_ref
-    from featuregen.overlay.projection import _dependencies
 
     present = set(adapter.fingerprint().keys())
     single_source = getattr(ref, "catalog_source", None)  # None for an ApprovedJoinRef (uses value)
-    for dep_source, referent in _dependencies(
+    for dep_source, referent in fact_dependencies(
         display_object_ref(ref), fact_type, value, single_source
     ):
         if dep_source != adapter.catalog_source:

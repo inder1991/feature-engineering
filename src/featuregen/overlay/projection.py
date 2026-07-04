@@ -7,45 +7,7 @@ from psycopg.types.json import Jsonb
 
 from featuregen.contracts import DbConn, EventEnvelope
 from featuregen.overlay import facts
-
-
-def _table_obj(ref: Mapping) -> str:
-    """Dotted `schema.table` for a structured CatalogObjectRef dict (no column)."""
-    return ".".join(p for p in [ref["schema"], ref["table"]] if p)
-
-
-def _dependencies(
-    object_ref: str, fact_type: str, value: Mapping, catalog_source: str
-) -> set[tuple[str, str]]:
-    """(catalog_source, ref_object) pairs a fact's value references (§8 general dependency index),
-    each referent qualified by ITS OWN source. For the four object-keyed facts every referent (the
-    keyed object plus grain.columns / availability_time.column / scd valid_from+valid_to) lives in
-    the fact's single `catalog_source`. For an approved_join the keyed `object_ref` is the synthetic
-    "from -> to" display string which must NEVER be parsed; instead read the STRUCTURED value —
-    `value['from_ref']`/`value['to_ref']` (each carrying its OWN catalog_source) and each
-    `value['column_pairs']` pair — and index BOTH tables and ALL paired columns on both sides UNDER
-    THEIR RESPECTIVE SOURCES (SP-1.5 review fix: a cross-catalog join's to-side must be tracked under
-    the to-catalog, or its drift-staling and the F1 read-time freshness guard both fail open). A
-    drop/rename/type-change to ANY referent stales the dependent fact."""
-    if fact_type == facts.APPROVED_JOIN:
-        fr, tr = value["from_ref"], value["to_ref"]
-        from_src, to_src = fr["catalog_source"], tr["catalog_source"]
-        from_obj, to_obj = _table_obj(fr), _table_obj(tr)
-        deps: set[tuple[str, str]] = {(from_src, from_obj), (to_src, to_obj)}
-        for pair in value.get("column_pairs", []):
-            deps.add((from_src, f"{from_obj}.{pair['from_col']}"))
-            deps.add((to_src, f"{to_obj}.{pair['to_col']}"))
-        return deps
-    deps = {(catalog_source, object_ref)}
-    if fact_type == facts.GRAIN:
-        deps |= {(catalog_source, f"{object_ref}.{c}") for c in value.get("columns", [])}
-    elif fact_type == facts.AVAILABILITY_TIME:
-        deps.add((catalog_source, f"{object_ref}.{value['column']}"))
-    elif fact_type == facts.SCD_EFFECTIVE_DATING:
-        deps.add((catalog_source, f"{object_ref}.{value['valid_from']}"))
-        if value.get("valid_to"):
-            deps.add((catalog_source, f"{object_ref}.{value['valid_to']}"))
-    return deps
+from featuregen.overlay.dependencies import fact_dependencies
 
 
 def _catalog_source(payload: Mapping) -> str:
@@ -115,7 +77,7 @@ class OverlayProjection:
             conn.execute(
                 "DELETE FROM overlay_fact_dependency WHERE fact_key = %s", (fk,)
             )
-            for dep_source, ref_object in _dependencies(
+            for dep_source, ref_object in fact_dependencies(
                 payload["object_ref"], payload["fact_type"], payload["proposed_value"], csource
             ):
                 conn.execute(
@@ -184,7 +146,7 @@ class OverlayProjection:
                 conn.execute(
                     "DELETE FROM overlay_fact_dependency WHERE fact_key = %s", (fk,)
                 )
-                for dep_source, ref_object in _dependencies(
+                for dep_source, ref_object in fact_dependencies(
                     prop["object_ref"], prop["fact_type"], payload["value"], prop["catalog_source"]
                 ):
                     conn.execute(
