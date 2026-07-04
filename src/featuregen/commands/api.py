@@ -101,11 +101,21 @@ def execute_command(conn: DbConn, cmd: Command) -> CommandResult:
         with conn.transaction():
             return _execute_command_body(conn, cmd)
     # On a NON-autocommit connection the caller owns commit, so we must NOT open+commit our own
-    # transaction (that would defeat the caller's rollback / test isolation). But we still bracket
-    # the body in a SAVEPOINT so a handler exception rolls back OUR claim within execute_command —
+    # transaction (that would defeat the caller's rollback / test isolation). We still bracket the
+    # body in a savepoint so a handler exception rolls back OUR claim within execute_command —
     # otherwise a caller that catches the exception then commits would strand a committed _pending
-    # claim and block retries (SP-0.5 round-2 review). The savepoint rides the caller's transaction
-    # (auto-begun by the first statement); RELEASE on success, ROLLBACK TO on failure, never commit.
+    # claim and block retries (SP-0.5 round-2 review).
+    from psycopg.pq import TransactionStatus
+
+    if conn.info.transaction_status == TransactionStatus.INTRANS:
+        # Already inside a caller transaction: use a psycopg-managed savepoint (UNIQUE name, so a
+        # handler that RE-ENTERS execute_command does not collide on a fixed savepoint name and
+        # mis-scope the rollback). It RELEASEs on success without committing the caller's tx.
+        with conn.transaction():
+            return _execute_command_body(conn, cmd)
+    # IDLE non-autocommit: the caller has not begun a transaction. A raw SAVEPOINT auto-begins the
+    # tx WITHOUT committing it (the caller still owns commit); a re-entrant call then sees INTRANS
+    # above and gets a unique savepoint, so the fixed name here can never nest.
     with conn.cursor() as cur:
         cur.execute("SAVEPOINT execute_command")
     try:

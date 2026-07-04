@@ -62,11 +62,14 @@ def _record_external_cost(
     # this is defense-in-depth against a mid-run change.
     try:
         ceilings = current_cost_ceilings()
-    except CostConfigError:
-        counters.incr("external.cost_config_error")
-        _log.error("invalid cost-ceiling config; breaker skipped for %s", command_id)
+        outcome = check_cost_breaker(conn, run_id, ceilings=ceilings)
+    except (CostConfigError, KeyError) as exc:
+        # NEVER roll back an already-executed external call because breaker EVALUATION failed (bad
+        # config, or the run row raced away): skip enforcement + surface it. (A genuine DB error
+        # from trip_cost_breaker below is NOT swallowed — that legitimately rolls the finalize back.)
+        counters.incr("external.cost_breaker_skipped")
+        _log.error("cost-breaker evaluation skipped for %s: %s", command_id, exc)
         return
-    outcome = check_cost_breaker(conn, run_id, ceilings=ceilings)
     if outcome.tripped and outcome.ceiling is not None:
         trip_cost_breaker(conn, run_id, ceiling=outcome.ceiling)
 
@@ -177,6 +180,14 @@ def dispatch_command(
     honors the idempotency key (dedup_supported) it is safe to re-invoke; else the
     residual-duplicate risk is logged and persisted honestly (no false dedup claim)."""
     # --- Step 1: claim + mark 'dispatched', then COMMIT on its own ---------------------
+    # NOTE (SP-0.5 round-2 review): on an AUTOCOMMIT connection the SELECT ... FOR UPDATE self-commits
+    # and releases the row lock BEFORE the pending->dispatched UPDATE, so the pending-claim path is
+    # NOT autocommit-atomic (two callers could both claim a 'pending' row). This is currently
+    # UNREACHED: the worker drives first-dispatch via claim_next_pending (a single atomic UPDATE) and
+    # only drives dispatch_command for 'dispatched' RECOVERY, which takes no UPDATE here. If a future
+    # caller ever drives dispatch_command for a 'pending' row on the autocommit daemon connection,
+    # wrap this read+UPDATE in `conn.transaction()` (as _finalize does) FIRST. The explicit commit
+    # below is load-bearing crash-safety — the claim must be durable before the external side effect.
     with conn.cursor() as cur:
         cur.execute(
             "SELECT request_payload, job_handle, dedup_supported, status "
