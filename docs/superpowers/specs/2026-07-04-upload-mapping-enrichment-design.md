@@ -300,6 +300,70 @@ Retrieval quality is therefore a product of: good **definitions** (drafted at in
 tags, and the **link edges** above — the graph is what makes a random-named transaction dump a findable,
 placed, wired-in part of the estate.
 
+## Search ranking function (detail)
+
+**Searchable document** per node — a **weighted `tsvector`**: `A`=name, `B`=definition, `C`=concept,
+`D`=domain+table (so a name/definition hit outweighs a domain hit). Plus a **`pg_trgm`** index on name
+for fuzzy/partial matches. Both Postgres-native; no external search engine.
+
+**Auth pre-filter (a hard filter, NOT a weight).** Nodes the user's read-scope can't see (e.g. `pii`
+without the role) are **dropped before scoring** — security must never be a rankable weight.
+
+**Four terms, each normalized to [0,1]:**
+- `text` = `ts_rank_cd(weighted_tsvector, query)` + a boost for exact/prefix **name** match.
+- `sem` = 1 if the node's `concept`/`domain` matches the **query's classified** concept/domain (partial
+  for related concepts), else 0. Query classification: synonym-dictionary lookup first, an optional cheap
+  LLM classify for hard queries (cached). This is the "meaningful" lift keyword alone misses — without
+  embeddings.
+- `graph` = a **precomputed** node-usefulness score — normalized blend of join-degree, `is_grain`,
+  has-`as_of` (+ phase-2 feature-usage). Precomputed in the projection → **no query-time graph walk**.
+- `fresh` = 1 if the source is fresh; linear decay past the drift SLA; **excluded** if stale.
+
+**Score** = `w_text·text + w_sem·sem + w_graph·graph + w_fresh·fresh`. Default weights **.50 / .25 / .15 /
+.10**, tunable per deployment (R4/V2: usage feedback tunes them). **Tiebreakers:** `declared` >
+`llm_suggested` provenance, then shorter/exact name.
+
+**Homonyms / generic names** (`id`, `amount`, `date`): text alone is ambiguous → `sem` + `graph` break
+ties, queries can be **domain-scoped** ("amount in Payments"), and results **group by domain/table** so
+the user disambiguates.
+
+**Explainability** — because the score is a sum of named terms, each result shows its contribution:
+*"matched 'balance' in definition · concept=monetary amount · grain key · fresh."* This is the
+explainability edge over embedding cosine scores.
+
+**Performance** — a GIN index on the `tsvector` + the precomputed `graph_signal` column + a freshness
+join = a **single indexed query**, bounded, no per-query traversal.
+
+## Trace queries (detail)
+
+Every belief the platform holds traces back to its origin via **bounded lookups/joins over the event log
++ provenance stamps (L1)** — no special infra. Each record carries the join keys:
+- `FACT_ASSERTED`/`FACT_RETRACTED`: fact id, value, `origin`, `confidence`, `source_upload_id`,
+  `mapping_version`, `catalog_change_ref` (for staling), actor, ts.
+- `upload`: `upload_id`, source, file, format, uploaded_by, ts, mapping_version, row_count, brake_status.
+- `mapping` (versioned): `MAPPING_ESTABLISHED`/`UPDATED` events.
+- `llm_call`: id, purpose (mapping/enrichment/plausibility), model, prompt, **redacted** input, output,
+  confidence, ts.
+- `ENRICHMENT_APPLIED`: node, field, value, `llm_call_id`, confidence.
+
+The queries:
+1. **Fact provenance** — *"why does the platform believe accounts' grain is `(branch,account)`?"* → fact →
+   asserting event → upload (file / uploaded_by / time) + `mapping_version` + the source row(s) + origin.
+2. **Join/edge provenance** — edge → `origin` (declared / suggested / confirmed) + confidence + upload/rows
+   (+ confirmer/time if human-confirmed).
+3. **Enrichment provenance** — *"why is `ssn_hash` PII?"* → tag/definition → `ENRICHMENT_APPLIED` →
+   `llm_call` (prompt / model / redacted input / output / confidence), or the mapping value-rule if declared.
+4. **Drift causation** — *"why was this fact staled?"* → stale fact → `STALED`/`RETRACTED` event →
+   `catalog_change_ref` → the drift scan → the re-upload + the exact object delta.
+5. **Upload impact (reverse)** — *"what did this upload change?"* → `upload_id` → every event stamped with
+   it (facts asserted/retracted, objects +/−, staled, enrichment applied).
+6. **Column history** — fold the events for an object over time → its type/facts/tags timeline across uploads.
+7. **Feature-freshness lineage (phase-2)** — feature → derives-from columns → sources → watermarks →
+   fresh/stale. Deferred (needs features, S1).
+
+Audit value: for **any** belief `X`, there is a bounded query back to the upload / row / mapping-version /
+LLM-call that produced it — the bank-grade "show me why."
+
 ## LLM usage boundaries (safety)
 
 - **Used:** Step B mapping proposal (headers + redacted column stats only — never raw values), Step E
