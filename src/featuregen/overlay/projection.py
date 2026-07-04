@@ -14,31 +14,37 @@ def _table_obj(ref: Mapping) -> str:
     return ".".join(p for p in [ref["schema"], ref["table"]] if p)
 
 
-def _dependencies(object_ref: str, fact_type: str, value: Mapping) -> set[str]:
-    """Object refs a fact's value references (§8 general dependency index). For the four
-    object-keyed facts: the keyed object plus grain.columns / availability_time.column /
-    scd valid_from+valid_to. For an approved_join the keyed `object_ref` is the synthetic
-    "from -> to" relation display string, which must NEVER be parsed; instead read the STRUCTURED
-    value — `value['from_ref']`, `value['to_ref']`, and each `value['column_pairs']`
-    pair — and index BOTH tables and ALL paired columns on both sides. A drop/rename/type-change to
-    ANY of these stales the dependent fact."""
+def _dependencies(
+    object_ref: str, fact_type: str, value: Mapping, catalog_source: str
+) -> set[tuple[str, str]]:
+    """(catalog_source, ref_object) pairs a fact's value references (§8 general dependency index),
+    each referent qualified by ITS OWN source. For the four object-keyed facts every referent (the
+    keyed object plus grain.columns / availability_time.column / scd valid_from+valid_to) lives in
+    the fact's single `catalog_source`. For an approved_join the keyed `object_ref` is the synthetic
+    "from -> to" display string which must NEVER be parsed; instead read the STRUCTURED value —
+    `value['from_ref']`/`value['to_ref']` (each carrying its OWN catalog_source) and each
+    `value['column_pairs']` pair — and index BOTH tables and ALL paired columns on both sides UNDER
+    THEIR RESPECTIVE SOURCES (SP-1.5 review fix: a cross-catalog join's to-side must be tracked under
+    the to-catalog, or its drift-staling and the F1 read-time freshness guard both fail open). A
+    drop/rename/type-change to ANY referent stales the dependent fact."""
     if fact_type == facts.APPROVED_JOIN:
-        from_obj = _table_obj(value["from_ref"])
-        to_obj = _table_obj(value["to_ref"])
-        deps: set[str] = {from_obj, to_obj}
+        fr, tr = value["from_ref"], value["to_ref"]
+        from_src, to_src = fr["catalog_source"], tr["catalog_source"]
+        from_obj, to_obj = _table_obj(fr), _table_obj(tr)
+        deps: set[tuple[str, str]] = {(from_src, from_obj), (to_src, to_obj)}
         for pair in value.get("column_pairs", []):
-            deps.add(f"{from_obj}.{pair['from_col']}")
-            deps.add(f"{to_obj}.{pair['to_col']}")
+            deps.add((from_src, f"{from_obj}.{pair['from_col']}"))
+            deps.add((to_src, f"{to_obj}.{pair['to_col']}"))
         return deps
-    deps = {object_ref}
+    deps = {(catalog_source, object_ref)}
     if fact_type == facts.GRAIN:
-        deps |= {f"{object_ref}.{c}" for c in value.get("columns", [])}
+        deps |= {(catalog_source, f"{object_ref}.{c}") for c in value.get("columns", [])}
     elif fact_type == facts.AVAILABILITY_TIME:
-        deps.add(f"{object_ref}.{value['column']}")
+        deps.add((catalog_source, f"{object_ref}.{value['column']}"))
     elif fact_type == facts.SCD_EFFECTIVE_DATING:
-        deps.add(f"{object_ref}.{value['valid_from']}")
+        deps.add((catalog_source, f"{object_ref}.{value['valid_from']}"))
         if value.get("valid_to"):
-            deps.add(f"{object_ref}.{value['valid_to']}")
+            deps.add((catalog_source, f"{object_ref}.{value['valid_to']}"))
     return deps
 
 
@@ -109,14 +115,14 @@ class OverlayProjection:
             conn.execute(
                 "DELETE FROM overlay_fact_dependency WHERE fact_key = %s", (fk,)
             )
-            for ref_object in _dependencies(
-                payload["object_ref"], payload["fact_type"], payload["proposed_value"]
+            for dep_source, ref_object in _dependencies(
+                payload["object_ref"], payload["fact_type"], payload["proposed_value"], csource
             ):
                 conn.execute(
                     "INSERT INTO overlay_fact_dependency (fact_key, catalog_source, ref_object) "
                     "VALUES (%s, %s, %s) ON CONFLICT (fact_key, catalog_source, ref_object) "
                     "DO NOTHING",
-                    (fk, csource, ref_object),
+                    (fk, dep_source, ref_object),
                 )
 
         elif event.type == facts.OVERLAY_FACT_PARTIALLY_CONFIRMED:
@@ -178,14 +184,14 @@ class OverlayProjection:
                 conn.execute(
                     "DELETE FROM overlay_fact_dependency WHERE fact_key = %s", (fk,)
                 )
-                for ref_object in _dependencies(
-                    prop["object_ref"], prop["fact_type"], payload["value"]
+                for dep_source, ref_object in _dependencies(
+                    prop["object_ref"], prop["fact_type"], payload["value"], prop["catalog_source"]
                 ):
                     conn.execute(
                         "INSERT INTO overlay_fact_dependency (fact_key, catalog_source, ref_object) "
                         "VALUES (%s, %s, %s) ON CONFLICT (fact_key, catalog_source, ref_object) "
                         "DO NOTHING",
-                        (fk, prop["catalog_source"], ref_object),
+                        (fk, dep_source, ref_object),
                     )
 
         elif event.type == facts.OVERLAY_FACT_EXPIRED:

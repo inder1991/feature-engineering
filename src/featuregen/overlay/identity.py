@@ -99,6 +99,37 @@ def display_object_ref(ref: CatalogObjectRef | ApprovedJoinRef) -> str:
     return ".".join(parts)
 
 
+def join_write_error(ref, fact_type: str, value: Mapping, use_case: str | None = None) -> str | None:
+    """Write-path integrity gate for approved_join proposals/entries (SP-1.5 review fix). Returns a
+    rejection reason, or None when the join is well-formed:
+      * F4 — cross-catalog joins are DISALLOWED in SP-1.5 (a single catalog adapter cannot attest an
+        endpoint in another source); reject from_ref.catalog_source != to_ref.catalog_source.
+      * ref/value consistency — authority + fact_key derive from `ref` while the stored value is what
+        consumers read; reject if the proposed_value describes a DIFFERENT join than `ref` (else the
+        wrong owners could attest a join whose value points at other tables)."""
+    if fact_type != "approved_join":
+        return None
+    if not isinstance(ref, ApprovedJoinRef):
+        return "approved_join requires an ApprovedJoinRef"
+    if ref.from_ref.catalog_source != ref.to_ref.catalog_source:
+        return (
+            "cross-catalog approved_join disallowed in SP-1.5 "
+            f"(from={ref.from_ref.catalog_source}, to={ref.to_ref.catalog_source})"
+        )
+    try:
+        value_ref = ApprovedJoinRef(
+            from_ref=CatalogObjectRef(**value["from_ref"]),
+            to_ref=CatalogObjectRef(**value["to_ref"]),
+            column_pairs=tuple(ColumnPair(**p) for p in value["column_pairs"]),
+            cardinality=value["cardinality"],
+        )
+    except (KeyError, TypeError):
+        return "approved_join proposed_value is not a well-formed join"
+    if fact_key(value_ref, "approved_join") != fact_key(ref, "approved_join"):
+        return "approved_join proposed_value does not match ref (from/to/column_pairs/cardinality)"
+    return None
+
+
 def proposal_fingerprint(
     proposed_value: Mapping,
     *,

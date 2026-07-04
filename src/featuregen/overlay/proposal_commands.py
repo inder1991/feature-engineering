@@ -24,6 +24,7 @@ from featuregen.overlay.facts import FactValidationError, validate_fact_value
 from featuregen.overlay.identity import (
     display_object_ref,
     fact_key,
+    join_write_error,
     proposal_fingerprint,
 )
 from featuregen.overlay.state import fold_overlay_state
@@ -55,6 +56,12 @@ def propose_fact(conn: DbConn, cmd: Command) -> CommandResult:
         return CommandResult(
             accepted=False, aggregate_id="", denied_reason=f"invalid fact value: {exc}"
         )
+    # SP-1.5 review fix: reject a cross-catalog approved_join (F4) or one whose proposed_value
+    # describes a different join than `ref` (authority/key derive from ref; the value is what
+    # consumers read — a mismatch lets the wrong owners attest a join over other tables).
+    join_err = join_write_error(ref, fact_type, proposed_value, use_case)
+    if join_err is not None:
+        return CommandResult(accepted=False, aggregate_id="", denied_reason=join_err)
     key = fact_key(ref, fact_type, use_case)
     fp = proposal_fingerprint(
         proposed_value,

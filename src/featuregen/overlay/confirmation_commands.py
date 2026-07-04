@@ -35,6 +35,7 @@ from featuregen.overlay.facts import FactValidationError, validate_fact_value
 from featuregen.overlay.identity import (
     display_object_ref,
     fact_key,
+    join_write_error,
     proposal_fingerprint,
 )
 from featuregen.overlay.join_confirmation import _confirm_approved_join
@@ -46,16 +47,16 @@ from featuregen.overlay.store import append_overlay_event, load_fact
 def _referent_gap(adapter, ref, fact_type: FactType, value) -> str | None:
     """Structured re-confirm validation (SP-1.5 Task 7): every object/column a fact's value REFERS to
     must still exist in THIS adapter's catalog. Returns a rejection reason, or None when all referents
-    are present. F4/F5: the referent's catalog_source must be the one this adapter serves (SP-1.5
-    disallows cross-catalog joins, so a foreign source is fail-closed here). F6: existence is checked
-    against adapter.fingerprint() keyed on the display object_ref — there is no get_object."""
-    src = (
-        ref.from_ref.catalog_source if fact_type == "approved_join" else ref.catalog_source
-    )
-    if src != adapter.catalog_source:
-        return f"referent catalog_source '{src}' is not served by this adapter"
+    are present. Each referent is checked UNDER ITS OWN source (per-referent qualification): F4/F5 —
+    a referent whose catalog_source this adapter does not serve is fail-closed. F6: existence is
+    checked against adapter.fingerprint() keyed on the display object_ref — there is no get_object."""
     present = set(adapter.fingerprint().keys())
-    for referent in _dependencies(display_object_ref(ref), fact_type, value):
+    single_source = getattr(ref, "catalog_source", None)  # None for an ApprovedJoinRef (uses value)
+    for dep_source, referent in _dependencies(
+        display_object_ref(ref), fact_type, value, single_source
+    ):
+        if dep_source != adapter.catalog_source:
+            return f"referent catalog_source '{dep_source}' is not served by this adapter"
         if referent not in present:
             return f"referent no longer in catalog: {referent}"
     return None
@@ -263,6 +264,9 @@ def enter_fact(conn: DbConn, cmd: Command) -> CommandResult:
         return CommandResult(
             accepted=False, aggregate_id="", denied_reason=f"invalid fact value: {exc}"
         )
+    join_err = join_write_error(ref, fact_type, proposed_value, use_case)  # SP-1.5 F4 + consistency
+    if join_err is not None:
+        return CommandResult(accepted=False, aggregate_id="", denied_reason=join_err)
     key = fact_key(ref, fact_type, use_case)
     authority = resolve_authority(conn, adapter, ref, fact_type)
     # Direct self-confirm is restricted to OWNER-KNOWN facts (§3.4): there is no platform-admin
