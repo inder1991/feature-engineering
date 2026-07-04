@@ -113,3 +113,32 @@ def test_resolve_ttl_jitter_deterministic_and_bounded():
     assert a == resolve_ttl("grain", "fk-A")  # deterministic per fact_key
     assert resolve_ttl("grain", "fk-B") != a or True  # different key may differ (not asserted equal)
     assert timedelta(days=180) <= a <= timedelta(days=220)  # within +/-10% of 200d, clamped
+
+
+def test_profiler_allowlist_is_server_side_and_source_scoped():
+    # SP-1.5 Task 8: the profiler's scan allowlist comes from the SEALED config (server-side); a
+    # caller can only narrow it, never widen it, and it is scoped to the adapter's catalog_source.
+    from tests.featuregen._helpers import mint_test_service_identity
+    from tests.featuregen.overlay._helpers import StubCatalog
+
+    from featuregen.contracts import Command
+    from featuregen.overlay.config import ProfilerRule
+    from featuregen.overlay.profiler_command import _effective_allowed_schemas
+
+    actor = mint_test_service_identity(subject="service:p", role_claims=("overlay",), attestation="a")
+    adapter = StubCatalog(catalog_source="fixture")
+    cmd = Command("run_profiler", "overlay_fact", None,
+                  {"allowed_schemas": ["core", "secret"]}, actor, "ik")
+
+    assert _effective_allowed_schemas(cmd, adapter) == frozenset({"core", "secret"})  # no config
+
+    register_overlay_config(_ttl_config(profiler_rules=(
+        ProfilerRule("fixture", "core", "t", True),      # allowed for THIS source
+        ProfilerRule("fixture", "denied", "x", False),   # explicitly not allowed
+        ProfilerRule("other", "secret", "y", True),      # a DIFFERENT source -> irrelevant
+    )))
+    # caller {core, secret} intersect config-allowed-for-fixture {core} -> {core}
+    assert _effective_allowed_schemas(cmd, adapter) == frozenset({"core"})
+    # a caller that passes nothing gets the full config allowlist for its source
+    empty = Command("run_profiler", "overlay_fact", None, {}, actor, "ik2")
+    assert _effective_allowed_schemas(empty, adapter) == frozenset({"core"})

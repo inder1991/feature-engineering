@@ -11,6 +11,7 @@ from featuregen.commands.registry import get_command
 from featuregen.contracts import Command, CommandResult, DbConn
 from featuregen.overlay._lifecycle import _NON_TERMINAL, _latest_proposed
 from featuregen.overlay.catalog import current_catalog_adapter
+from featuregen.overlay.config import current_overlay_config
 from featuregen.overlay.identity import (
     CatalogObjectRef,
     display_object_ref,
@@ -41,6 +42,25 @@ def _existing_proposal_fingerprint(conn: DbConn, fk: str) -> tuple[str | None, s
     return state.status, fp
 
 
+def _effective_allowed_schemas(cmd: Command, adapter) -> frozenset[str]:
+    """The SERVER-SIDE profiler allowlist (SP-1.5 Task 8). When an OverlayConfig is sealed, the
+    schemas the profiler may scan come from config.profiler_rules (allow=True, for THIS adapter's
+    catalog_source) — the AUTHORITATIVE list. A caller's `allowed_schemas` can only NARROW it, never
+    widen it, so a caller can no longer point the profiler at a restricted schema. With no config
+    sealed, the caller-supplied list stands (backward-compat)."""
+    caller = frozenset(cmd.args.get("allowed_schemas", ()))
+    try:
+        config = current_overlay_config()
+    except RuntimeError:
+        return caller
+    allowed = frozenset(
+        r.schema
+        for r in config.profiler_rules
+        if r.allow and r.catalog_source == adapter.catalog_source
+    )
+    return (caller & allowed) if caller else allowed
+
+
 def _run_profiler(conn: DbConn, cmd: Command) -> CommandResult:
     """Service command (§6.6): run the deterministic profiler over `cmd.args["ref"]` and, for each
     candidate, write evidence and issue a `propose_fact`. Runs inside `execute_command`'s
@@ -52,8 +72,8 @@ def _run_profiler(conn: DbConn, cmd: Command) -> CommandResult:
     `proposal_fingerprint` is sticky-skipped (fresh evidence alone never revives it). Skipping first
     guarantees no orphan evidence is left for a candidate `propose_fact` would deny."""
     ref = CatalogObjectRef(**dict(cmd.args["ref"]))
-    limits = ProfilerLimits(allowed_schemas=frozenset(cmd.args.get("allowed_schemas", ())))
     adapter = current_catalog_adapter()
+    limits = ProfilerLimits(allowed_schemas=_effective_allowed_schemas(cmd, adapter))
     # Run the SCAN phase under an in-code read-only guard (defense-in-depth for §5.2's
     # read-only DB role) so a stray write inside run_profiler_scan fails closed. The scan only
     # SELECTs, so a savepoint we immediately roll back loses nothing; the rollback also clears
