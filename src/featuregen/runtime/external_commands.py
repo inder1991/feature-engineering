@@ -11,6 +11,7 @@ from typing import Any, Protocol, runtime_checkable
 from psycopg.types.json import Jsonb
 
 from featuregen.contracts import DbConn, NewExternalCommand
+from featuregen.runtime.backoff import compute_backoff
 from featuregen.runtime.observability import counters
 
 _log = logging.getLogger("featuregen.external_commands")
@@ -224,13 +225,14 @@ def _finalize(
     with tx:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT status, run_id FROM external_commands WHERE command_id = %s FOR UPDATE",
+                "SELECT status, run_id, attempts FROM external_commands "
+                "WHERE command_id = %s FOR UPDATE",
                 (command_id,),
             )
             frow = cur.fetchone()
             if frow is None:
                 raise KeyError(command_id)
-            status, run_id = frow
+            status, run_id, attempts = frow
             if status in ("succeeded", "failed", "stale_ignored"):
                 # A concurrent dispatcher already finalized this command; honor it (a second
                 # recoverer blocks on FOR UPDATE above until the first commits, then lands here).
@@ -258,9 +260,12 @@ def _finalize(
                 )
                 outcome = DispatchOutcome(command_id, "failed", reinvoked, residual, reconciled)
             else:
+                # Retryable failure: back off before the row is claimable again, so a persistently
+                # failing command is not re-invoked up to `batch` times per tick (SP-0.5 r2 review).
                 cur.execute(
-                    "UPDATE external_commands SET status='pending' WHERE command_id=%s",
-                    (command_id,),
+                    "UPDATE external_commands SET status='pending', "
+                    "next_attempt_at = %s + make_interval(secs => %s) WHERE command_id=%s",
+                    (now, compute_backoff(attempts), command_id),
                 )
                 outcome = DispatchOutcome(command_id, "pending", reinvoked, residual, reconciled)
     return outcome
@@ -367,9 +372,10 @@ def claim_next_pending(
             "UPDATE external_commands SET status='dispatched', dispatched_at=%s, "
             "attempts=attempts+1 WHERE command_id = (SELECT command_id FROM external_commands "
             "WHERE status='pending' AND integration = ANY(%s) "
+            "AND (next_attempt_at IS NULL OR next_attempt_at <= %s) "
             "ORDER BY created_at FOR UPDATE SKIP LOCKED LIMIT 1) "
             "RETURNING command_id, integration, request_payload, job_handle, dedup_supported",
-            (now, reg),
+            (now, reg, now),
         )
         row = cur.fetchone()
     conn.commit()  # claim durable BEFORE the external call (mirrors dispatch_command Step 1)

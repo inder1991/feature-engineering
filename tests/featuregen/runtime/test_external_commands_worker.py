@@ -161,6 +161,25 @@ def test_external_command_cost_rolls_into_run_budget(autocommit_worker_conn, rec
     assert _status(conn, cid) == "succeeded"
 
 
+def test_retryable_external_command_backs_off_not_hot_looped(autocommit_worker_conn, recording_caller):
+    # A retryable failure must set a FUTURE next_attempt_at so the row is NOT immediately
+    # re-claimable — otherwise one failing command is re-invoked up to `batch` times per tick
+    # (SP-0.5 round-2 review, finding 3).
+    conn = autocommit_worker_conn
+    caller = recording_caller(invoke_result=IntegrationResult(False, {}, permanent=False))
+    register_integration_caller(caller)
+    cid = _record(conn, "retry")
+
+    claimed = claim_next_pending(conn, ["llm"], now=NOW)
+    invoke_claimed_external(conn, claimed, caller, now=NOW)
+    assert _status(conn, cid) == "pending"  # retryable -> back to pending
+
+    # Not immediately re-claimable at the same instant (backoff window is in the future).
+    assert claim_next_pending(conn, ["llm"], now=NOW) is None
+    # After the backoff window elapses, it IS claimable again.
+    assert claim_next_pending(conn, ["llm"], now=NOW + timedelta(hours=2)) is not None
+
+
 def test_run_worker_once_dispatches_external_commands(autocommit_worker_conn, recording_caller):
     # End-to-end wiring: a registered caller + a pending external command -> the worker's external
     # stage claims + invokes it on the real autocommit daemon connection (SP-0.5 round-2).
