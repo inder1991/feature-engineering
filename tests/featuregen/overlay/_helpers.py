@@ -24,10 +24,18 @@ class StubCatalog:
       * ``fact``    -> a constant ``get_fact()`` return (resolve tests, which only ever call get_fact).
     """
 
-    def __init__(self, objects=None, owners=None, fact: CatalogFact | None = None) -> None:
+    def __init__(
+        self, objects=None, owners=None, fact: CatalogFact | None = None,
+        catalog_source: str = "fixture",
+    ) -> None:
         self._objects = list(objects or [])
         self._owners = dict(owners or {})
         self._fact = fact
+        self._catalog_source = catalog_source
+
+    @property
+    def catalog_source(self) -> str:
+        return self._catalog_source
 
     def set_owner(self, ref, subject: str) -> None:
         self._owners[display_object_ref(ref)] = subject

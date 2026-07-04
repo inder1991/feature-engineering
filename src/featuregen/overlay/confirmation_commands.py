@@ -29,6 +29,7 @@ from featuregen.overlay.authority import (
     resolve_authority,
 )
 from featuregen.overlay.catalog import current_catalog_adapter
+from featuregen.overlay.config import current_overlay_config
 from featuregen.overlay.expiry import schedule_expiry
 from featuregen.overlay.facts import FactValidationError, validate_fact_value
 from featuregen.overlay.identity import (
@@ -37,8 +38,27 @@ from featuregen.overlay.identity import (
     proposal_fingerprint,
 )
 from featuregen.overlay.join_confirmation import _confirm_approved_join
+from featuregen.overlay.projection import _dependencies
 from featuregen.overlay.state import fold_overlay_state
 from featuregen.overlay.store import append_overlay_event, load_fact
+
+
+def _referent_gap(adapter, ref, fact_type: FactType, value) -> str | None:
+    """Structured re-confirm validation (SP-1.5 Task 7): every object/column a fact's value REFERS to
+    must still exist in THIS adapter's catalog. Returns a rejection reason, or None when all referents
+    are present. F4/F5: the referent's catalog_source must be the one this adapter serves (SP-1.5
+    disallows cross-catalog joins, so a foreign source is fail-closed here). F6: existence is checked
+    against adapter.fingerprint() keyed on the display object_ref — there is no get_object."""
+    src = (
+        ref.from_ref.catalog_source if fact_type == "approved_join" else ref.catalog_source
+    )
+    if src != adapter.catalog_source:
+        return f"referent catalog_source '{src}' is not served by this adapter"
+    present = set(adapter.fingerprint().keys())
+    for referent in _dependencies(display_object_ref(ref), fact_type, value):
+        if referent not in present:
+            return f"referent no longer in catalog: {referent}"
+    return None
 
 
 def confirm_fact(conn: DbConn, cmd: Command) -> CommandResult:
@@ -111,6 +131,18 @@ def confirm_fact(conn: DbConn, cmd: Command) -> CommandResult:
         return CommandResult(
             accepted=False, aggregate_id=key, denied_reason=f"invalid confirmed value: {exc}"
         )
+    # SP-1.5 Task 7: re-confirming a drift-STALEd fact must not re-affirm a value whose object/column
+    # the catalog no longer has (e.g. the dropped column that caused the STALE was never restored).
+    # Config-gated: full SP-1.5 hardening is active only when a deployment has sealed an OverlayConfig.
+    if state.status == "STALE":
+        try:
+            current_overlay_config()
+        except RuntimeError:
+            pass  # no OverlayConfig sealed -> hardening off (backward-compat)
+        else:
+            gap = _referent_gap(adapter, ref, fact_type, value)
+            if gap is not None:
+                return _deny_audited(conn, cmd, key, f"stale re-confirm blocked: {gap}")
     confirmers: list[Confirmer]
     if fact_type == "approved_join":
         # same-owner-both-sides reaches the single path (Authority.dual is False); record BOTH side
