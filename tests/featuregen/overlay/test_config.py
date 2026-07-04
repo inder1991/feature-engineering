@@ -191,3 +191,19 @@ def test_overlay_config_from_env_defaults_and_overrides():
     assert c2.drift_freshness_sla == timedelta(minutes=45)
     assert c2.profiler_require_restricted_role is True
     assert len(c2.profiler_rules) == 1 and c2.profiler_rules[0].table == "orders"
+
+
+def test_env_config_strict_bool_parsing():
+    # re-review #6/#10: bool("false") == True must NOT flip a DENY rule to ALLOW; a typo'd flag must
+    # FAIL at boot rather than silently disable a security control.
+    import pytest
+
+    from featuregen.overlay.config import OverlayConfigError, overlay_config_from_env
+
+    deny_json = '[{"catalog_source":"pg:core","schema":"core","table":"t","allow":false}]'
+    assert overlay_config_from_env({"OVERLAY_PROFILER_RULES": deny_json}).profiler_rules[0].allow is False
+    deny_str = '[{"catalog_source":"pg:core","schema":"core","table":"t","allow":"false"}]'
+    assert overlay_config_from_env({"OVERLAY_PROFILER_RULES": deny_str}).profiler_rules[0].allow is False
+
+    with pytest.raises(OverlayConfigError):
+        overlay_config_from_env({"OVERLAY_PROFILER_REQUIRE_RESTRICTED_ROLE": "ture"})  # typo

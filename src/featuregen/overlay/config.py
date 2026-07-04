@@ -99,9 +99,23 @@ def overlay_config_from_env(env: Mapping[str, str] | None = None) -> OverlayConf
     def _mins(key: str, default: float) -> timedelta:
         return timedelta(minutes=float(e.get(key, default)))
 
+    def _strict_bool(raw: object, key: str) -> bool:
+        # Robust + strict (review #6/#10): a JSON bool passes through; a string is parsed against a
+        # KNOWN set; anything else (a typo like "ture", a number) FAILS at boot rather than silently
+        # becoming True (bool("false") == True) or False (an unrecognized truthy value).
+        if isinstance(raw, bool):
+            return raw
+        token = str(raw).strip().lower()
+        if token in ("true", "1", "yes"):
+            return True
+        if token in ("false", "0", "no", ""):
+            return False
+        raise OverlayConfigError(f"{key} must be a boolean, got {raw!r}")
+
     rules_raw = e.get("OVERLAY_PROFILER_RULES", "")
     rules = tuple(
-        ProfilerRule(r["catalog_source"], r["schema"], r["table"], bool(r["allow"]))
+        ProfilerRule(r["catalog_source"], r["schema"], r["table"],
+                     _strict_bool(r["allow"], "profiler rule 'allow'"))
         for r in (json.loads(rules_raw) if rules_raw else [])
     )
     return OverlayConfig(
@@ -112,8 +126,9 @@ def overlay_config_from_env(env: Mapping[str, str] | None = None) -> OverlayConf
         renewal_grace=_days("OVERLAY_RENEWAL_GRACE_DAYS", 14),
         drift_scan_interval=_mins("OVERLAY_DRIFT_SCAN_INTERVAL_MIN", 15),
         drift_freshness_sla=_mins("OVERLAY_DRIFT_FRESHNESS_SLA_MIN", 60),
-        profiler_require_restricted_role=(
-            e.get("OVERLAY_PROFILER_REQUIRE_RESTRICTED_ROLE", "").lower() in ("1", "true", "yes")
+        profiler_require_restricted_role=_strict_bool(
+            e.get("OVERLAY_PROFILER_REQUIRE_RESTRICTED_ROLE", "false"),
+            "OVERLAY_PROFILER_REQUIRE_RESTRICTED_ROLE",
         ),
         profiler_rules=rules,
     )
