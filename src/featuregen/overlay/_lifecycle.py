@@ -31,6 +31,27 @@ _AWAITING_CONFIRMATION: tuple[FactStatus, ...] = ("DRAFT", "PARTIALLY_CONFIRMED"
 _DEFAULT_TTL = timedelta(days=180)
 
 
+def resolve_ttl(fact_type: str, fact_key: str) -> timedelta:
+    """Per-fact-type re-verify horizon from OverlayConfig (SP-1.5 Task 6.3): per-type value falling
+    back to ttl_default, with DETERMINISTIC per-fact-key jitter (spreads an onboarding wave so facts
+    do not expire in lockstep — reproducible, no Math.random), clamped to [ttl_min, ttl_max]. Falls
+    back to _DEFAULT_TTL when no OverlayConfig is sealed (backward-compat)."""
+    import hashlib
+
+    from featuregen.overlay.config import current_overlay_config
+
+    try:
+        config = current_overlay_config()
+    except RuntimeError:
+        return _DEFAULT_TTL
+    base = config.ttl_by_fact_type.get(fact_type, config.ttl_default)
+    if config.ttl_jitter_fraction:
+        h = int.from_bytes(hashlib.sha256(fact_key.encode()).digest()[:8], "big")
+        frac = (h / 2**64) * 2 - 1  # deterministic per fact_key, in [-1, 1)
+        base = base + base * (config.ttl_jitter_fraction * frac)
+    return max(config.ttl_min, min(config.ttl_max, base))  # clamp (jitter can nudge out of band)
+
+
 class OverlayCommandError(Exception):
     """Raised on overlay command misconfiguration / unauthorized task reads."""
 

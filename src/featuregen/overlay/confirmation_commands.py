@@ -15,11 +15,11 @@ from datetime import UTC, datetime
 from featuregen.contracts import Command, CommandResult, DbConn
 from featuregen.overlay._lifecycle import (
     _AWAITING_CONFIRMATION,
-    _DEFAULT_TTL,
     _cas_target,
     _close_fact_tasks,
     _deny_audited,
     _latest_proposed,
+    resolve_ttl,
 )
 from featuregen.overlay._types import Confirmer, FactType, Role
 from featuregen.overlay.authority import (
@@ -116,7 +116,7 @@ def confirm_fact(conn: DbConn, cmd: Command) -> CommandResult:
     else:
         role: Role = "compliance" if fact_type == "policy_tag" else "data_owner"
         confirmers = [{"subject": cmd.actor.subject, "role": role}]
-    expires_at = datetime.now(UTC) + _DEFAULT_TTL
+    expires_at = datetime.now(UTC) + resolve_ttl(fact_type, key)
     confirmed = append_overlay_event(
         conn,
         fact_key=key,
@@ -283,7 +283,7 @@ def enter_fact(conn: DbConn, cmd: Command) -> CommandResult:
     else:
         role: Role = "compliance" if fact_type == "policy_tag" else "data_owner"
         confirmers = [{"subject": cmd.actor.subject, "role": role}]
-    expires_at = datetime.now(UTC) + _DEFAULT_TTL
+    expires_at = datetime.now(UTC) + resolve_ttl(fact_type, key)
     confirmed = append_overlay_event(
         conn,
         fact_key=key,
