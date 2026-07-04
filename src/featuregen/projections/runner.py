@@ -147,6 +147,16 @@ def rebuild_projection(conn: DbConn, projection: Projection) -> None:
         )
     while run_projection(conn, projection) > 0:
         pass
+    # Clear stale degraded markers ONLY on a clean replay to head (SP-0.5 round-2 review): if the
+    # rebuild caught the projection fully up (lag 0, so no poison re-halted it), any surviving
+    # marker is stale and the operator who fixed the cause + rebuilt should get the aggregate
+    # un-blocked WITHOUT a separate resolve_degraded. A partial replay (still poisoned -> lag > 0)
+    # keeps its markers (fail-closed).
+    if projection_lag(conn, projection.name) == 0:
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM projection_degraded WHERE projection_name = %s", (projection.name,)
+            )
 
 
 _REPAIR_REGISTRY: dict[str, Projection] = {}

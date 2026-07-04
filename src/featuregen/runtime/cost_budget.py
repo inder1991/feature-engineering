@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from decimal import Decimal
 
@@ -13,6 +14,24 @@ class CostCeilings:
     per_run: Decimal | None = None
     per_request: Decimal | None = None
     max_candidates: int | None = None
+
+
+def current_cost_ceilings() -> CostCeilings:
+    """Resolve the active §5.6 cost ceilings from config (env). An unset ceiling is None (that
+    limit is disabled). A deployment sets FEATUREGEN_COST_PER_RUN / _PER_REQUEST / _MAX_CANDIDATES.
+    Mirrors the worker's other config-driven caps; the VALUES are a deployment/policy decision, the
+    enforcement wiring is not."""
+
+    def _dec(name: str) -> Decimal | None:
+        raw = os.environ.get(name)
+        return Decimal(raw) if raw else None
+
+    max_candidates = os.environ.get("FEATUREGEN_MAX_CANDIDATES")
+    return CostCeilings(
+        per_run=_dec("FEATUREGEN_COST_PER_RUN"),
+        per_request=_dec("FEATUREGEN_COST_PER_REQUEST"),
+        max_candidates=int(max_candidates) if max_candidates else None,
+    )
 
 
 @dataclass(frozen=True, slots=True)

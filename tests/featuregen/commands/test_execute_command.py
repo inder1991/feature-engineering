@@ -186,6 +186,23 @@ def test_execute_command_is_atomic_on_an_autocommit_connection(db):
     assert row is None  # claim rolled back atomically; no stranded _pending
 
 
+def test_execute_command_rolls_back_claim_on_handler_error_non_autocommit(db):
+    # On a non-autocommit connection a handler exception must roll back the idempotency claim
+    # WITHIN execute_command (via savepoint), so it is not left in the caller's transaction to be
+    # committed and strand retries (SP-0.5 round-2 review).
+    def boom(conn, cmd):
+        raise RuntimeError("handler blew up mid-command")
+
+    register_command("boom_na", boom)
+    with pytest.raises(RuntimeError):
+        execute_command(db, make_cmd("boom_na", "run", "agg_na", {}, idem="na_claim"))
+
+    row = db.execute(
+        "SELECT 1 FROM command_idempotency WHERE idempotency_key = 'na_claim'"
+    ).fetchone()
+    assert row is None  # claim rolled back by the savepoint, not stranded in the caller's tx
+
+
 def test_resolve_degraded_bypasses_the_degraded_gate(db):
     # resolve_degraded must run EVEN WHEN the aggregate is degraded — otherwise it could never be
     # un-blocked. It is the sole action special-cased past the degraded gate.
