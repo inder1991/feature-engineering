@@ -118,8 +118,16 @@ def fire_due_overlay_renewals(conn: DbConn, *, now: datetime) -> int:
             WHERE fs.status = 'VERIFIED' AND fs.expires_at IS NOT NULL
               AND fs.expires_at <= %s AND fs.expires_at > %s
               AND NOT EXISTS (
+                  -- Idempotency keyed on (fact_key, confirmed_event_id), NOT "status = open"
+                  -- (SP-1.5 review fix #3): a renewal confirm CLOSES the old task and advances
+                  -- confirmed_event_id, but overlay_fact_state LAGS — reading a closed-task +
+                  -- lagging-VERIFIED row under "status=open" reopens a POISON task bound to the
+                  -- superseded event, which then disables the next renewal cycle. Keying on the
+                  -- confirmed_event_id (any status) never reopens a task for a version already
+                  -- prompted; the next cycle's new confirmed_event_id gets its own task.
                   SELECT 1 FROM human_tasks ht
-                  WHERE ht.fact_key = fs.fact_key AND ht.status = 'open'
+                  WHERE ht.fact_key = fs.fact_key
+                    AND ht.target_event_id = fs.confirmed_event_id
               )
             FOR UPDATE OF fs SKIP LOCKED
             """,

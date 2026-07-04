@@ -168,3 +168,21 @@ def test_renewal_poller_skips_far_from_expiry(db):
                       days_to_expiry=120)  # far outside the 14d grace window
 
     assert fire_due_overlay_renewals(db, now=datetime.now(UTC)) == 0
+
+
+def test_renewal_poller_does_not_reopen_poison_task_after_close(db):
+    # SP-1.5 review #3: after a renewal closes the re-verify task, the poller (reading the LAGGING
+    # projection that still shows the old confirmed_event_id) must NOT reopen a poison task for that
+    # now-superseded version. Idempotency is keyed on (fact_key, target_event_id), not "status=open".
+    from featuregen.overlay.expiry import fire_due_overlay_renewals
+
+    ref = CatalogObjectRef(catalog_source="fixture", object_kind="table", schema="core", table="t")
+    _stack(db, ref, owner="user:owner-a")
+    _register_config(grace_days=14)
+    key = _seed_near_expiry(db, ref=ref, proposed_by="service:seed", confirmer="user:owner-a")
+    now = datetime.now(UTC)
+
+    assert fire_due_overlay_renewals(db, now=now) == 1  # opens the renewal task
+    # Simulate the renewal confirm having CLOSED the task (projection still lagging: fs unchanged).
+    db.execute("UPDATE human_tasks SET status = 'cancelled' WHERE fact_key = %s", (key,))
+    assert fire_due_overlay_renewals(db, now=now) == 0  # no poison reopen for the same version

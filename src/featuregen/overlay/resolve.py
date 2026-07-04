@@ -26,6 +26,7 @@ from featuregen.overlay.identity import (
     fact_key,
 )
 from featuregen.overlay.projection import read_proposal
+from featuregen.runtime.observability import counters
 
 _REASON_MISSING = "no_confirmed_fact"
 _REASON_CATALOG_INVALID = "catalog_value_invalid"
@@ -260,6 +261,9 @@ def resolve_fact(
         try:
             config = current_overlay_config()
         except RuntimeError:
+            # Skip-LOUD (review #11): a read-serving process that never sealed an OverlayConfig runs
+            # with the drift-freshness guard OFF — surface it via a counter rather than silently.
+            counters.incr("overlay.resolve.drift_guard_skipped_no_config")
             config = None
         if config is not None:
             prov = {

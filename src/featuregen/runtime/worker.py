@@ -237,13 +237,22 @@ def _advance_overlay_expiries(conn: psycopg.Connection, *, now: datetime) -> int
 
 
 def _advance_overlay_renewals(conn: psycopg.Connection, *, now: datetime) -> int:
-    """Pre-expiry renewal poller (SP-1.5 Task 6), skipping (NOT erroring) when no catalog adapter is
-    wired — same configuration-state handling as _advance_overlay_expiries."""
+    """Pre-expiry renewal poller (SP-1.5 Task 6), skipping-LOUD (counter, NOT silent) when no catalog
+    adapter or OverlayConfig is wired, and serialized across workers by a global advisory lock so two
+    pollers can't both open a task for the same fact (review #12/#13)."""
     try:
         current_catalog_adapter()
     except RuntimeError:
         counters.incr("overlay.renewal.skipped_no_adapter")
         return 0
+    try:
+        current_overlay_config()
+    except RuntimeError:
+        counters.incr("overlay.renewal.skipped_no_config")
+        return 0
+    lock_key = int.from_bytes(hashlib.sha256(b"overlay_renewal").digest()[:8], "big", signed=True)
+    if not conn.execute("SELECT pg_try_advisory_xact_lock(%s)", (lock_key,)).fetchone()[0]:
+        return 0  # another worker holds the renewal poller lock this tick
     return fire_due_overlay_renewals(conn, now=now)
 
 
