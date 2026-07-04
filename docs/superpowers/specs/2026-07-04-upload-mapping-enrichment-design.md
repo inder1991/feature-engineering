@@ -57,14 +57,18 @@ have to match it.
 | `as_of_column` | no | **load-bearing** | marks the point-in-time / as-of column |
 | `valid_from` / `valid_to` | no | **load-bearing** | SCD-2 effective-dating columns (silent-wrongness if absent on a versioned table) |
 | `unit` / `currency` | no | **load-bearing** | scale/unit of a numeric column (dollars vs **cents**, currency) — wrong value = silently wrong feature |
+| `additivity` | no | **load-bearing** | `additive` / `semi_additive` / `non_additive` — governs safe aggregation (you may not SUM a balance over time) |
+| `time_grain` | no | **load-bearing** | table-level: `snapshot_daily` / `snapshot_monthly` / `event` — governs correct windowing |
 | `sensitivity` | no | **load-bearing** | pii / restricted / … |
+| `entity` | no | advisory | the business entity this id/column denotes (`Customer`, `Account`) — anchors cross-source linking |
 | `definition` | no | advisory | business description (drives search) |
 | `domain` / `subdomain` | no | advisory | business grouping |
 | `concept` | no | advisory | glossary concept tag (controlled vocabulary) |
 
-`unit`/`currency` and `valid_from`/`valid_to` are **load-bearing** deliberately: unlike a missing `definition`
-(which only weakens search), a wrong unit or an unmodelled SCD produces a *silently wrong feature* — worse
-than a missing one.
+`unit`/`currency`, `valid_from`/`valid_to`, `additivity`, and `time_grain` are **load-bearing** deliberately:
+unlike a missing `definition` (which only weakens search), a wrong unit, an unmodelled SCD, or summing a
+non-additive measure over time produces a *silently wrong feature* — worse than a missing one. When these
+are **declared** they're trusted; when the LLM **infers** them they follow the suggest→confirm rule (Step E).
 
 ## The pipeline (A–F)
 
@@ -108,13 +112,15 @@ rows, every time (this is what keeps drift honest).
   remove more than a threshold (default **30%**) of objects, **HOLD** and require an explicit
   "confirm large change" — so a truncated / wrong-source file can't silently stale the catalog.
 
-### E. Enrich (LLM — advisory auto, fact suggestions human-confirm)
+### E. Enrich (LLM — advisory auto, load-bearing suggestions human-confirm)
 On the validated canonical rows:
-- **Advisory (auto-apply, reviewable):** classify `domain`/`subdomain`, tag `concept`, and **draft
-  missing `definition`s** from name + type + table context. Wrong = worse search, not wrong facts.
-- **Fact suggestions (human-confirm, load-bearing):** where a fact column is BLANK, the LLM may
-  *suggest* candidates ("likely grain: `account_id`"; "`acct_id` likely joins `accounts.account_id`")
-  with confidence — surfaced for a quick OK, **never auto-applied**.
+- **Advisory (auto-apply, reviewable):** classify `domain`/`subdomain`, tag `concept`, resolve **`entity`**
+  (which ids denote `Customer`/`Account` across sources), draft missing `definition`s, and **flag likely
+  `sensitivity`** (proactive PII from names/definitions — `dob`, `email` — even when untagged, into the
+  review queue). Wrong = worse search/linking, not wrong facts.
+- **Load-bearing suggestions (human-confirm):** where a load-bearing column is BLANK, the LLM may
+  *suggest* — grain, joins, **`additivity`** (additive/semi/non), **`time_grain`** — with confidence,
+  surfaced for a quick OK, **never auto-applied** (a wrong additivity/join = wrong feature).
 Enrichment failures are non-fatal: schema + facts still ingest; enrichment is re-runnable.
 
 ### F. Commit (atomic → events)
@@ -223,12 +229,15 @@ Nodes and edges are **rows** in projection tables (`graph_node`, `graph_edge`), 
 
 ### Per-node fields
 - **Column** — identity (source·table·column); `type` (normalized); facts (`is_grain`, `is_as_of`,
-  `valid_from/to`, `unit/currency`, `sensitivity`); enrichment (`concept`, `domain`, `definition`);
-  `state` (active/stale + source watermark); `stats` (sparse — only if declared); provenance per item.
-- **Table** — grain **set**, the `as_of` column, SCD `valid_from/to` columns, domain/subdomain,
-  definition, join-degree, column count, drift status.
+  `valid_from/to`, `unit/currency`, **`additivity`**, `sensitivity`); enrichment (`concept`, `domain`,
+  `definition`, **`entity`**); `state` (active/stale + source watermark); `stats` (sparse — only if
+  declared); provenance per item.
+- **Table** — grain **set**, the `as_of` column, SCD `valid_from/to` columns, **`time_grain`**,
+  domain/subdomain, definition, join-degree, column count, drift status.
 - **Concept** — controlled-vocabulary name + definition + members. **Domain** — name, subdomain
   hierarchy, member tables.
+- **Entity** *(new)* — a business entity (`Customer`, `Account`) that resolves the id columns pointing at
+  it across sources; members = those columns; anchors linking and gives features a stable cross-source grain.
 
 ### Per-edge fields
 - **Join** (the load-bearing one) — `join_id`; the **paired** `from→to` columns (composite); `cardinality`
@@ -243,7 +252,8 @@ Nodes and edges are **rows** in projection tables (`graph_node`, `graph_edge`), 
 | where do I filter to avoid **leaking the future**? | the table's **`as_of`** (and SCD `valid_from/to`) |
 | how exactly do I **join** these tables? | the **join edge's paired columns** (composite) |
 | is the join safe to aggregate, or will it **double-count**? | the edge's **`cardinality`** (N:1 = safe fan-in) |
-| what key do I **aggregate to**? | the tables' **grain sets** |
+| can I **SUM** this measure, and over which dimensions? | **`additivity`** (never SUM a `semi_additive` balance over time) + **`time_grain`** |
+| what key do I **aggregate to**, stable across sources? | the tables' **grain sets** + the **`entity`** the ids resolve to |
 | what operations are **valid**, and in what **unit**? | the **normalized `type`** + **`unit`/`currency`** |
 | am I **allowed** to use this? | the **`sensitivity`** tag → mask / exclude / flag |
 | how much do I **trust** this before building on it? | **provenance + drift** (declared vs llm_suggested; active vs stale) |
@@ -363,6 +373,26 @@ The queries:
 
 Audit value: for **any** belief `X`, there is a bounded query back to the upload / row / mapping-version /
 LLM-call that produced it — the bank-grade "show me why."
+
+## Phase-2: LLM feature-assist (vision — gated on the feature layer, S1)
+
+The v1 graph is deliberately built to feed a feature-*assist* tier once features can enter the system.
+These are **suggestions a human acts on**, never auto-wired into a load-bearing fact — a wrong join path
+or missed leakage is a *wrong model*, the high-stakes side of the split.
+
+- **Multi-hop join-path suggestion** — from "customer demographics on a transaction," the LLM reasons over
+  the graph edges to propose the **path** `transactions → accounts → customers` (with each hop's `as_of`
+  and `cardinality`), and flags missing or only-suggested links. Inputs: join edges, entities, cardinality.
+- **Target-leakage warning** — flags columns likely to be the **label or derived from it** ("`churned_flag`
+  looks like your target — using it leaks"), from naming + as-of relationships. Prevents the #1 ML mistake.
+- **Feature recommendation** — given an objective ("churn"), proposes candidate features grounded in the
+  *actual* graph ("90-day balance trend, txn frequency, days-since-last-activity"), each already knowing its
+  grain/join/as-of/additivity. The home for the retired intake layer's ambition.
+- **NL feature → recipe (capstone)** — "customer spending velocity last quarter" → a concrete, correct
+  recipe: tables, join path, as-of filter, aggregation (respecting `additivity`), grain. Search + graph +
+  LLM into a leakage-free, executable feature spec.
+
+These are named here so v1's metadata (additivity, entities, join paths, as-of) is built to support them.
 
 ## LLM usage boundaries (safety)
 

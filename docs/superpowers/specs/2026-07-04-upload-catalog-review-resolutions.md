@@ -60,6 +60,13 @@ the delta (see H2).
   *load-bearing* — their absence causes *silently wrong features* (wrong scale / no effective-dating),
   which is worse than a missing definition. **Statistical** metadata (cardinality/null-rate/distribution)
   stays **sparse** (no-DB tax; declared-only, phase-2 profiling if a sample appears); **enums** are V2.
+- **T6 Aggregation-semantics + entity metadata (RESOLVE).** Contract + graph gain **`additivity`**
+  (additive/semi/non — never SUM a balance over time) and **`time_grain`** as *load-bearing*, an **Entity**
+  node (`Customer`/`Account`, resolving ids across sources), and **proactive PII flagging** in enrichment.
+  Declared → trusted; LLM-inferred load-bearing ones follow suggest→confirm.
+- **P1 Phase-2 LLM feature-assist (V2, on record).** Gated on the feature layer (S1): multi-hop
+  join-path suggestion, target-leakage warnings, feature recommendation, NL→recipe. Named so v1 metadata
+  is built to feed them; all are human-acted suggestions, never auto-wired into load-bearing facts.
 
 ## Drift & brake (RESOLVE)
 
