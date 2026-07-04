@@ -193,6 +193,7 @@ def resolve_degraded_command(conn: DbConn, cmd: Command) -> CommandResult:
             accepted=False, aggregate_id=aid or "",
             denied_reason="no degraded marker for this aggregate",
         )
+    proven: list[tuple[str, int]] = []
     for (projection_name,) in markers:
         projection = projection_for_repair(projection_name)
         if projection is None:
@@ -201,18 +202,31 @@ def resolve_degraded_command(conn: DbConn, cmd: Command) -> CommandResult:
                 denied_reason=f"cannot prove health: projection '{projection_name}' "
                               "is not registered for repair",
             )
-        # Re-run + re-read the LIVE marker (a second-stage poison re-halts at a later seq, so the
-        # pre-loop snapshot cannot be trusted, SP-0.5 round-2 review).
-        if not advance_projection_past(conn, projection, cmd.aggregate, aid):
+        # Replay to completion + re-read the LIVE marker (a second-stage poison re-halts at a later
+        # seq, so the pre-loop snapshot cannot be trusted, SP-0.5 round-2 review).
+        healthy, poison_seq = advance_projection_past(conn, projection, cmd.aggregate, aid)
+        if not healthy:
             return CommandResult(
                 accepted=False, aggregate_id=aid or "",
                 denied_reason=f"projection '{projection_name}' still cannot advance past the "
                               "poison; remediate the cause before resolving",
             )
-    conn.execute(
-        "DELETE FROM projection_degraded WHERE aggregate = %s AND aggregate_id = %s",
-        (cmd.aggregate, aid),
-    )
+        if poison_seq is not None:
+            proven.append((projection_name, poison_seq))
+    if not proven:
+        return CommandResult(
+            accepted=False, aggregate_id=aid or "",
+            denied_reason="no degraded marker remained to clear for this aggregate",
+        )
+    # Delete ONLY the specific proven markers, scoped by poison_seq (SP-0.5 round-2 review #1): a
+    # concurrent projection can insert a FRESH marker for this aggregate after the snapshot, or
+    # re-mark at a different seq, between prove and delete — a blanket delete would erase it unproven.
+    for projection_name, poison_seq in proven:
+        conn.execute(
+            "DELETE FROM projection_degraded WHERE projection_name = %s AND aggregate = %s "
+            "AND aggregate_id = %s AND poison_seq = %s",
+            (projection_name, cmd.aggregate, aid, poison_seq),
+        )
     record_security_event(
         conn,
         event_type="DEGRADED_RESOLVED",

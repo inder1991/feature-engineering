@@ -112,25 +112,45 @@ def test_run_worker_once_halts_claiming_past_leaked_conn_cap(db, seeded_pipeline
     assert counters.snapshot()["counters"].get("worker.leaked_cap_halt", 0) >= 1
 
 
-def test_relay_publisher_from_env_wires_route_policy(db, monkeypatch) -> None:
-    """The production worker path must be able to CONFIGURE the outbox route policy (routes +
-    route-required topics) via env, else the policy is unreachable in production (SP-0.5 r2 review)."""
+def test_relay_publisher_from_env_wires_route_policy(db, monkeypatch, tmp_path) -> None:
+    """The production worker path must CONFIGURE the outbox route policy via a JSON routes file (per
+    the plan) + a route-required list, else the policy is unreachable in production (SP-0.5 r2 #5)."""
+    import json as _json
+
     from featuregen.runtime.outbox import OutboxMessage, UnroutedOutboxTopic
     from featuregen.runtime.worker import _relay_publisher_from_env
 
-    monkeypatch.setenv("FEATUREGEN_RELAY_ROUTES", "STEP_TRIGGER:h")
+    routes_file = tmp_path / "routes.json"
+    routes_file.write_text(_json.dumps({"STEP_TRIGGER": "h"}))
+    monkeypatch.setenv("FEATUREGEN_RELAY_ROUTES", str(routes_file))
     monkeypatch.setenv("FEATUREGEN_RELAY_REQUIRED", "MUST_ROUTE")
     publish = _relay_publisher_from_env()
 
-    # A route-required topic with no configured route is a LOUD failure.
-    with pytest.raises(UnroutedOutboxTopic):
+    with pytest.raises(UnroutedOutboxTopic):  # route-required + unrouted -> loud
         publish(db, OutboxMessage("m1", "p", "MUST_ROUTE", {}, "e1"))
-    # A configured topic enqueues to its handler.
-    publish(db, OutboxMessage("m2", "run:r", "STEP_TRIGGER", {}, "e2"))
+    publish(db, OutboxMessage("m2", "run:r", "STEP_TRIGGER", {}, "e2"))  # configured -> enqueues
     assert db.execute("SELECT handler FROM queue WHERE message_id='m2'").fetchone()[0] == "h"
-    # An unrouted, non-required topic drains silently (no raise, no enqueue).
-    publish(db, OutboxMessage("m3", "p", "SOME_EVENT", {}, "e3"))
+    publish(db, OutboxMessage("m3", "p", "SOME_EVENT", {}, "e3"))  # unrouted non-required -> drains
     assert db.execute("SELECT count(*) FROM queue WHERE message_id='m3'").fetchone()[0] == 0
+
+
+def test_relay_publisher_fails_loud_on_missing_routes_file(monkeypatch) -> None:
+    # A set-but-unreadable FEATUREGEN_RELAY_ROUTES must fail LOUD, not silently load an empty map
+    # (SP-0.5 r2 review #5 — a deployment following the plan would otherwise route nothing).
+    from featuregen.runtime.worker import _relay_publisher_from_env
+
+    monkeypatch.setenv("FEATUREGEN_RELAY_ROUTES", "/nonexistent/relay-routes.json")
+    with pytest.raises(FileNotFoundError):
+        _relay_publisher_from_env()
+
+
+def test_relay_publisher_programmatic_override(db) -> None:
+    from featuregen.runtime.outbox import OutboxMessage
+    from featuregen.runtime.worker import _relay_publisher_from_env
+
+    publish = _relay_publisher_from_env({"STEP_TRIGGER": "h2"})  # overrides the env file
+    publish(db, OutboxMessage("mo", "run:r", "STEP_TRIGGER", {}, "eo"))
+    assert db.execute("SELECT handler FROM queue WHERE message_id='mo'").fetchone()[0] == "h2"
 
 
 def test_run_worker_once_is_idle_on_empty(db, seeded_pipeline) -> None:

@@ -298,6 +298,36 @@ def test_resolve_degraded_refuses_when_a_second_stage_poison_remains(conn):
     ).fetchone()[0] == 0
 
 
+def test_resolve_replays_beyond_one_batch_to_find_later_poison(conn):
+    """advance_projection_past must replay to COMPLETION, not a single run_projection (batch=500):
+    a second-stage poison BEYOND the first batch must be found so resolve REFUSES rather than
+    falsely clearing on an incomplete replay (SP-0.5 round-2 review #2)."""
+    from tests.featuregen._helpers import make_cmd
+
+    from featuregen.aggregates.run_lifecycle import resolve_degraded_command
+    from featuregen.projections.runner import register_projection_for_repair
+
+    event_registry().register_schema("E", 1, {"type": "object"}, owner="o")
+    first = last = None
+    for i in range(502):  # > one batch; poison at the first + last event
+        ev = _append(conn, "run_big", i, {})
+        first = first or ev
+        last = ev
+
+    proj = MultiPoisonProjection({first.global_seq, last.global_seq})
+    register_projection_for_repair("multi", proj)
+    run_projection(conn, proj)  # halts at the first poison -> marker poison_seq = first
+
+    proj.poisons.discard(first.global_seq)  # heal ONLY the first poison
+    res = resolve_degraded_command(conn, make_cmd("resolve_degraded", "run", "run_big", {}))
+
+    assert res.accepted is False  # replay reached the far poison (beyond batch) -> still degraded
+    left = conn.execute(
+        "SELECT poison_seq FROM projection_degraded WHERE aggregate_id='run_big'"
+    ).fetchone()
+    assert left is not None and left[0] == last.global_seq
+
+
 def test_rebuild_clears_stale_degraded_only_after_clean_replay(conn):
     """A successful rebuild-to-head must clear stale projection_degraded markers so an operator who
     fixed the cause + rebuilt gets commands un-blocked WITHOUT a separate resolve_degraded — but a

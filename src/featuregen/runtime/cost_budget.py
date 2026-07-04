@@ -16,21 +16,44 @@ class CostCeilings:
     max_candidates: int | None = None
 
 
+class CostConfigError(ValueError):
+    """A cost-ceiling env value is malformed (non-numeric, non-finite, or negative)."""
+
+
 def current_cost_ceilings() -> CostCeilings:
     """Resolve the active §5.6 cost ceilings from config (env). An unset ceiling is None (that
     limit is disabled). A deployment sets FEATUREGEN_COST_PER_RUN / _PER_REQUEST / _MAX_CANDIDATES.
-    Mirrors the worker's other config-driven caps; the VALUES are a deployment/policy decision, the
-    enforcement wiring is not."""
+
+    VALIDATES each value (finite, non-negative) and raises CostConfigError on a malformed one, so a
+    typo is caught at STARTUP (run_forever calls this once) rather than deep inside a finalize
+    transaction where it would roll back an already-executed external side effect (SP-0.5 r2 review
+    #3). NaN is explicitly rejected — a NaN ceiling would make every `>=` comparison silently false."""
 
     def _dec(name: str) -> Decimal | None:
         raw = os.environ.get(name)
-        return Decimal(raw) if raw else None
+        if not raw:
+            return None
+        try:
+            val = Decimal(raw)
+        except ArithmeticError as exc:
+            raise CostConfigError(f"{name}={raw!r} is not a valid number") from exc
+        if not val.is_finite() or val < 0:
+            raise CostConfigError(f"{name}={raw!r} must be finite and non-negative")
+        return val
 
-    max_candidates = os.environ.get("FEATUREGEN_MAX_CANDIDATES")
+    mc_raw = os.environ.get("FEATUREGEN_MAX_CANDIDATES")
+    max_candidates: int | None = None
+    if mc_raw:
+        try:
+            max_candidates = int(mc_raw)
+        except ValueError as exc:
+            raise CostConfigError(f"FEATUREGEN_MAX_CANDIDATES={mc_raw!r} is not an integer") from exc
+        if max_candidates < 0:
+            raise CostConfigError(f"FEATUREGEN_MAX_CANDIDATES={mc_raw!r} must be non-negative")
     return CostCeilings(
         per_run=_dec("FEATUREGEN_COST_PER_RUN"),
         per_request=_dec("FEATUREGEN_COST_PER_REQUEST"),
-        max_candidates=int(max_candidates) if max_candidates else None,
+        max_candidates=max_candidates,
     )
 
 

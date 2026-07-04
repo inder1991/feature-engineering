@@ -28,7 +28,16 @@ def _record_external_cost(
     command. Tolerant: a command whose run has no workflow-state row is counted/logged, not fatal."""
     if run_id is None or cost_units is None:
         return
+    # Reject a non-finite or negative cost at the boundary (SP-0.5 r2 review #4): a bad integration
+    # value must never corrupt the durable budget / request totals or break later comparisons.
+    if not cost_units.is_finite() or cost_units < 0:
+        counters.incr("external.cost_invalid")
+        _log.warning(
+            "external command %s returned invalid cost_units=%s; not recorded", command_id, cost_units
+        )
+        return
     from featuregen.runtime.cost_budget import (
+        CostConfigError,
         check_cost_breaker,
         current_cost_ceilings,
         record_cost,
@@ -47,7 +56,17 @@ def _record_external_cost(
         )
         return
     # Enforce §5.6 on the fresh spend: auto-park the run if it now breaches a configured ceiling.
-    outcome = check_cost_breaker(conn, run_id, ceilings=current_cost_ceilings())
+    # NEVER let malformed ceiling config raise here — the external call already executed and the
+    # cost is recorded; raising would roll back the finalize and strand the row 'dispatched' for a
+    # duplicate recovery invoke (SP-0.5 r2 review #3). run_forever validates config at startup;
+    # this is defense-in-depth against a mid-run change.
+    try:
+        ceilings = current_cost_ceilings()
+    except CostConfigError:
+        counters.incr("external.cost_config_error")
+        _log.error("invalid cost-ceiling config; breaker skipped for %s", command_id)
+        return
+    outcome = check_cost_breaker(conn, run_id, ceilings=ceilings)
     if outcome.tripped and outcome.ceiling is not None:
         trip_cost_breaker(conn, run_id, ceiling=outcome.ceiling)
 
