@@ -86,7 +86,9 @@ def column_joins(conn, catalog_source: str, object_ref: str) -> list[JoinEdge]:
     """The join edges out of a column — including ones whose target isn't loaded yet (pending)."""
     rows = conn.execute(
         "SELECT e.from_ref, e.to_ref, e.cardinality, "
-        "  EXISTS(SELECT 1 FROM graph_node n WHERE n.object_ref = e.to_ref) AS resolved "
+        # M5: scope by catalog — a cross-source target present in ANOTHER catalog is NOT resolved here.
+        "  EXISTS(SELECT 1 FROM graph_node n WHERE n.object_ref = e.to_ref "
+        "         AND n.catalog_source = e.catalog_source) AS resolved "
         "FROM graph_edge e "
         "WHERE e.catalog_source = %s AND e.kind = 'joins' AND e.from_ref = %s "
         "ORDER BY e.to_ref",

@@ -69,3 +69,17 @@ def test_slice_ingest_serve_drift_and_brake(db):
     rows3 = [CanonicalRow(source, "accounts", "id", "integer", is_grain=True)]
     res3 = ingest_upload(db, source, rows3, actor=_actor(), now=now)
     assert res3.status == "held"
+
+
+def test_enrichment_failure_does_not_abort_ingest(db):
+    _seal_config()
+    now = datetime(2026, 7, 5, tzinfo=timezone.utc)
+
+    class _Boom:
+        def call(self, request):
+            raise RuntimeError("provider down")
+
+    rows = [CanonicalRow("s", "accounts", "id", "integer", is_grain=True)]
+    res = ingest_upload(db, "s", rows, actor=_actor(), now=now, client=_Boom())
+    assert res.status == "ingested"   # advisory enrichment failure must not abort the upload's facts
+    assert res.asserted >= 1

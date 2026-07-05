@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -16,6 +17,8 @@ from featuregen.overlay.upload.graph import build_graph
 from featuregen.overlay.upload.review_queue import persist_quarantine
 from featuregen.overlay.upload.upload_catalog import UploadCatalog, table_ref
 from featuregen.projections.runner import run_projection
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -95,9 +98,15 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
 
     concepts = definitions = domains = None
     if client is not None:
-        concepts = enrich_concepts(conn, vr.good, client, actor)
-        definitions = draft_definitions(conn, vr.good, client, actor)
-        domains = classify_domains(conn, vr.good, client, actor)
+        try:
+            concepts = enrich_concepts(conn, vr.good, client, actor)
+            definitions = draft_definitions(conn, vr.good, client, actor)
+            domains = classify_domains(conn, vr.good, client, actor)
+        except Exception:  # noqa: BLE001 — enrichment is ADVISORY (migration 0950): a provider/network
+            # error must degrade search, NEVER abort the upload's facts. Proceed without enrichment.
+            logger.warning("enrichment failed for %r; proceeding without it", catalog_source,
+                           exc_info=True)
+            concepts = definitions = domains = None
     build_graph(conn, catalog_source, vr.good, concepts, definitions, domains)
     persist_quarantine(conn, catalog_source, vr.quarantined)
     flagged = (f"first upload of '{catalog_source}' ({len(vr.good)} objects) — review recommended"

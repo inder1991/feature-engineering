@@ -33,8 +33,8 @@ def test_duplicate_same_type_dedups_conflicting_type_quarantines():
     rows = [_row(column="id", type="integer"), _row(column="id", type="integer"),
             _row(column="id", type="text")]
     result = validate_rows(rows)
-    assert len(result.good) == 1               # deduped identical
-    assert len(result.quarantined) == 1        # conflicting type
+    assert len(result.good) == 0               # conflicting column fails closed (not graphed)
+    assert len(result.quarantined) == 2        # first + conflicting row both surfaced for review
 
 
 def test_row_carries_definition():
@@ -48,3 +48,14 @@ def test_unrecognized_sensitivity_is_quarantined():
     assert result.good == []
     assert len(result.quarantined) == 1
     assert "sensitivity" in result.quarantined[0].message
+
+
+def test_conflicting_metadata_for_a_column_fails_closed():
+    # A later duplicate with a pii tag must NOT be silently dropped (leaving the column world-readable).
+    rows = [
+        CanonicalRow("s", "t", "ssn", "text"),                     # untagged
+        CanonicalRow("s", "t", "ssn", "text", sensitivity="pii"),  # same column, now pii
+    ]
+    result = validate_rows(rows)
+    assert all(not (r.table == "t" and r.column == "ssn") for r in result.good)  # neither accepted
+    assert sum(1 for q in result.quarantined if q.row and q.row.column == "ssn") == 2
