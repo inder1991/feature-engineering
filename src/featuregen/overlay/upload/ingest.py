@@ -70,7 +70,7 @@ def _assert_fact(conn, source: str, table: str, fact_type: str, value: dict, *, 
 
 def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
                   actor, now: datetime | None = None, client=None) -> IngestResult:
-    vr = validate_rows(rows)
+    vr = validate_rows(rows, catalog_source)
     if vr.structural_error:
         return IngestResult("rejected", vr.structural_error, 0, 0, len(vr.quarantined))
 

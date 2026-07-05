@@ -70,3 +70,14 @@ def test_reupload_recovers_a_staled_fact(db):
     recovered = resolve_fact(db, UploadCatalog(src, []), ref, "availability_time", now=NOW)
     assert recovered.status == "VERIFIED"
     assert recovered.value == {"column": "posted_at", "basis": "posted_at"}
+
+
+def test_multi_source_rows_quarantined_not_crash(db):
+    """M5: a foreign-source row (same table.column) must be quarantined, not crash the ingest."""
+    _seal()
+    rows = [CanonicalRow("deposits", "accounts", "id", "integer", is_grain=True),
+            CanonicalRow("cards", "accounts", "id", "integer")]   # foreign source -> dup object_ref
+    res = ingest_upload(db, "deposits", rows, actor=_actor(), now=NOW)
+    assert res.status == "ingested"          # no UniqueViolation / rollback
+    assert res.quarantined == 1              # the 'cards' row is quarantined
+    assert _grain(db, "deposits", "accounts").value == {"columns": ["id"], "is_unique": True}

@@ -37,7 +37,11 @@ class ValidationResult:
     structural_error: str | None = None
 
 
-def validate_rows(rows: list[CanonicalRow]) -> ValidationResult:
+def validate_rows(rows: list[CanonicalRow],
+                  catalog_source: str | None = None) -> ValidationResult:
+    """Validate rows for one upload. When `catalog_source` is given (the upload's source), any row
+    declaring a DIFFERENT source is quarantined — the upload is single-source (T3), and downstream
+    (facts, graph) key object identity on this one source, so a foreign-source row would collide."""
     if not rows:
         return ValidationResult(structural_error="empty upload: no rows")
     if all(not r.source for r in rows):
@@ -51,6 +55,10 @@ def validate_rows(rows: list[CanonicalRow]) -> ValidationResult:
         missing = [f for f in _REQUIRED if not getattr(r, f)]
         if missing:
             quarantined.append(RowError(i, f"missing required field(s): {', '.join(missing)}", r))
+            continue
+        if catalog_source is not None and r.source != catalog_source:
+            quarantined.append(RowError(
+                i, f"row source '{r.source}' does not match upload source '{catalog_source}'", r))
             continue
         key = (r.source, r.table, r.column)
         if key in seen:
