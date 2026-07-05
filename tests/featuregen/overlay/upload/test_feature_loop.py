@@ -13,6 +13,7 @@ def _bank(db):
     rows = [
         CanonicalRow("bank", "accounts", "id", "integer", is_grain=True),
         CanonicalRow("bank", "accounts", "balance", "numeric", additivity="semi_additive"),
+        CanonicalRow("bank", "accounts", "posted_at", "timestamp", as_of=True),  # point-in-time basis
         CanonicalRow("bank", "accounts", "churned", "boolean"),   # the target label
     ]
     build_graph(db, "bank", rows)
@@ -83,10 +84,12 @@ def test_cross_domain_gather_spans_catalogs(db):
     """With an entity anchor, the loop gathers candidates from EVERY catalog holding that entity."""
     build_graph(db, "deposits", [
         CanonicalRow("deposits", "accounts", "cust_ref", "integer", entity="Customer"),
-        CanonicalRow("deposits", "accounts", "balance", "numeric")])
+        CanonicalRow("deposits", "accounts", "balance", "numeric"),
+        CanonicalRow("deposits", "accounts", "posted_at", "timestamp", as_of=True)])
     build_graph(db, "cards", [
         CanonicalRow("cards", "card_accounts", "cust_id", "integer", entity="Customer"),
-        CanonicalRow("cards", "card_accounts", "spend", "numeric")])
+        CanonicalRow("cards", "card_accounts", "spend", "numeric"),
+        CanonicalRow("cards", "card_accounts", "txn_date", "timestamp", as_of=True)])
     _fresh_watermark(db, "deposits", NOW)
     _fresh_watermark(db, "cards", NOW)
 
@@ -131,3 +134,39 @@ def test_multi_set_and_advisory_recommendation(db):
     assert rec.recommended_lens == "monetary"               # advisory pick
     assert rec.reasoning                                    # explained
     assert "backtest" in rec.caveat                         # and honestly caveated
+
+
+def _bank_with_asof(db, as_of=True):
+    rows = [CanonicalRow("t", "accounts", "id", "integer", is_grain=True),
+            CanonicalRow("t", "accounts", "balance", "numeric")]
+    if as_of:
+        rows.append(CanonicalRow("t", "accounts", "posted_at", "timestamp", as_of=True))
+    build_graph(db, "t", rows)
+    _fresh_watermark(db, "t", NOW)
+
+
+def test_windowed_feature_needs_point_in_time_basis(db):
+    # No as-of column on the table -> a windowed feature can't be point-in-time -> rejected.
+    _bank_with_asof(db, as_of=False)
+    client = FakeLLM(script={"overlay.feature.recommend": FakeResponse(output={"features": [
+        {"name": "avg_balance_90d", "derives_from": ["public.accounts.balance"],
+         "aggregation": "avg_90d"}]})})
+    assert recommend_features(db, "churn", client, catalog_source="t", now=NOW) == []
+
+
+def test_windowed_feature_ok_with_as_of(db):
+    _bank_with_asof(db, as_of=True)
+    client = FakeLLM(script={"overlay.feature.recommend": FakeResponse(output={"features": [
+        {"name": "avg_balance_90d", "derives_from": ["public.accounts.balance"],
+         "aggregation": "avg_90d"}]})})
+    out = recommend_features(db, "churn", client, catalog_source="t", now=NOW)
+    assert [f.name for f in out] == ["avg_balance_90d"]
+
+
+def test_non_windowed_feature_needs_no_as_of(db):
+    _bank_with_asof(db, as_of=False)
+    client = FakeLLM(script={"overlay.feature.recommend": FakeResponse(output={"features": [
+        {"name": "current_balance", "derives_from": ["public.accounts.balance"],
+         "aggregation": "latest"}]})})       # not windowed -> no point-in-time requirement
+    out = recommend_features(db, "churn", client, catalog_source="t", now=NOW)
+    assert [f.name for f in out] == ["current_balance"]
