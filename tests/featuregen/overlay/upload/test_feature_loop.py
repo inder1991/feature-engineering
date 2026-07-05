@@ -354,3 +354,48 @@ def test_set_signals_counts_columns_and_size(db):
                     derives_pairs=(("bank", "public.accounts.balance"),))])
     sig = set_signals(db, fs)
     assert sig["size"] == 2 and sig["distinct_columns"] == 1   # both read the same column
+
+
+def test_router_flat_catalog_gates_out_temporal_and_aggregation(db):
+    from featuregen.overlay.upload.feature_assist import _candidate_columns, route_strategies
+    build_graph(db, "flat", [
+        CanonicalRow("flat", "t", "a", "numeric"),
+        CanonicalRow("flat", "t", "b", "numeric")])   # 2 numeric; no as-of / join / entity
+    names = [n for n, _ in route_strategies(db, _candidate_columns(db, "flat", ()))]
+    assert "unary" in names and "ratio" in names
+    assert "temporal" not in names          # no as-of column -> don't propose windowed features
+    assert "aggregation" not in names       # no join edge
+    assert "distributional" not in names    # no entity
+
+
+def test_router_includes_temporal_and_distributional_when_present(db):
+    from featuregen.overlay.upload.feature_assist import _candidate_columns, route_strategies
+    build_graph(db, "rich", [
+        CanonicalRow("rich", "acct", "cust", "integer", entity="Customer"),
+        CanonicalRow("rich", "acct", "bal", "numeric"),
+        CanonicalRow("rich", "acct", "posted_at", "timestamp", as_of=True)])
+    names = [n for n, _ in route_strategies(db, _candidate_columns(db, "rich", ()))]
+    assert "temporal" in names          # as-of present
+    assert "distributional" in names    # entity present
+
+
+def test_router_includes_aggregation_with_a_join_key(db):
+    from featuregen.overlay.upload.feature_assist import _candidate_columns, route_strategies
+    build_graph(db, "j", [
+        CanonicalRow("j", "orders", "id", "integer", is_grain=True),
+        CanonicalRow("j", "orders", "acct_id", "integer", joins_to="accounts.id"),
+        CanonicalRow("j", "accounts", "id", "integer", is_grain=True)])
+    names = [n for n, _ in route_strategies(db, _candidate_columns(db, "j", ()))]
+    assert "aggregation" in names       # a join key exists -> aggregation applies
+
+
+def test_feature_rationale_flows_from_generator_to_gate1(db):
+    # §14.2 — a per-feature causal rationale rides the candidate through to Gate #1.
+    _bank(db)
+    _fresh_watermark(db, "bank", NOW)
+    client = FakeLLM(script={"overlay.feature.recommend": FakeResponse(output={"features": [
+        {"name": "avg_bal", "derives_from": ["public.accounts.balance"], "aggregation": "avg_90d",
+         "rationale": "90-day average balance operationalizes the balance-level hypothesis"}]})})
+    out = recommend_features(db, "predict churn", client, catalog_source="bank",
+                             target_ref="public.accounts.churned", now=NOW, critic=False)
+    assert out and out[0].rationale.startswith("90-day average balance")

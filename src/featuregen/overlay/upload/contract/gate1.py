@@ -102,6 +102,7 @@ def _idea_json(f: FeatureIdea | None) -> dict | None:
             "grain_table": f.grain_table,   # keep grain — it disambiguates same-named options
             "verification": f.verification,   # honest §14.5 stamp surfaced at Gate #1 (item 4)
             "critic_note": f.critic_note,     # advisory residual critic note — the human weighs it
+            "rationale": f.rationale,         # §14.2 one-line causal 'why' — audit the logic first
             "derives_pairs": [list(p) for p in f.derives_pairs]}   # for server-side reconstruction
 
 
