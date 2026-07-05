@@ -107,3 +107,27 @@ def test_cross_domain_gather_spans_catalogs(db):
     assert "public.card_accounts.spend" in captured["refs"]
     # ...and a cross-domain feature was accepted (both sources fresh, no leak/unsafe).
     assert [f.name for f in out] == ["cross"]
+
+
+def test_multi_set_and_advisory_recommendation(db):
+    from featuregen.overlay.upload.feature_assist import recommend_feature_sets, recommend_set
+    _bank(db)
+    _fresh_watermark(db, "bank", NOW)
+    client = FakeLLM(script={
+        "overlay.feature.recommend": FakeResponse(output={"features": [
+            {"name": "avg_balance_90d", "derives_from": ["public.accounts.balance"],
+             "aggregation": "avg_90d"}]}),
+        "overlay.feature.recommend_set": FakeResponse(output={
+            "recommended_lens": "monetary",
+            "reasoning": "monetary best matches the balance-drop hypothesis"}),
+    })
+    sets = recommend_feature_sets(db, "predict churn", client, catalog_source="bank",
+                                  target_ref="public.accounts.churned", now=NOW,
+                                  lenses=("behavioral", "monetary"), per_set=1)
+    assert {s.lens for s in sets} == {"behavioral", "monetary"}
+    assert all(len(s.features) == 1 for s in sets)          # each set is validated + non-empty
+
+    rec = recommend_set(db, sets, "customers churn when balance drops", client)
+    assert rec.recommended_lens == "monetary"               # advisory pick
+    assert rec.reasoning                                    # explained
+    assert "backtest" in rec.caveat                         # and honestly caveated
