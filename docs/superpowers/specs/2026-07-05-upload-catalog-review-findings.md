@@ -111,6 +111,27 @@ SQL in the caches (fixed `_CACHES` dict, no injection); declared-definition-neve
 zero-LLM-on-reingest (cache-first); the empty-`allowed` authz path (PII hidden with no role); Excel
 header-generator resume (no first-data-row consumption); CSV short/long rows via `restval`/`restkey`.
 
+## Resolution status (fix campaign, 2026-07-05 — branch `fix/upload-review-findings`)
+**FIXED, each with a regression test that reproduced it first** (full suite 1227 green):
+- **B1** — `_assert_fact` now diffs on value; re-upload updates changed values + recovers staled facts.
+- **M1** — recovery path (re-assert on non-VERIFIED stream).
+- **M5** — `validate_rows` quarantines foreign-source rows (no duplicate-key crash).
+- **M6** — `feature_assist` threads `roles` + the read-scope filter (no PII to the LLM).
+- **M2/M3** — `_call` status-gated, returns None on failure/empty → never caches a failure; a real
+  provider's fail-closed degrades to no-op (full call_llm+redaction integration = documented follow-on).
+- **M4** — concept classification sends names/types only (no free-text definition egress).
+- **M9** — `_bounded` rejects empty/over-long/multiline/list-stringified definition & domain output.
+- **M7** — join-path steps oriented to traversal (reverse N:1 → 1:N); the locked-in test corrected.
+- **M8** — `availability_time.basis` follows a declared `as_of_basis`.
+- **Minors fixed:** CSV BOM strip; `content_hash` JSON+source (collision + cross-source sharing);
+  `IngestResult.flagged` first-upload gate; unknown-sensitivity quarantine.
+
+**DEFERRED (low-value robustness, named):** quarantine-refresh-on-held (arguably correct; doc wording),
+multiple-`as_of` collapse, dedup-flag-loss, concurrency-truncation status downgrade, malformed-`joins_to`
+vs-pending distinction, `build_graph` per-source advisory lock, `field_map` last-alias-wins, Excel
+blank-row detection consistency. And the big documented follow-on: the **real-provider enrichment**
+(`call_llm` + schema registration + redaction) so enrichment works against Anthropic, not just `FakeLLM`.
+
 ## Priority / disposition
 - **Fix before ANY real use (silent-data + crash + PII):** B1, M1, M5, M6.
 - **Fix before wiring a real LLM provider:** M2, M3, M4, M9 (the enrichment path is not production-ready).
