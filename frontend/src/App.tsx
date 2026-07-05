@@ -97,7 +97,7 @@ const PAGES: { route: Route; label: string; eyebrow: string; title: string; desc
     eyebrow: 'CATALOG · GENERATE',
     title: 'Feature generation',
     description:
-      'Tell the engine your goal; it proposes safe, catalog-grounded features you approve into the registry.',
+      'State your goal, then take either path; both land in one candidate list you approve into the registry.',
   },
   {
     route: 'search',

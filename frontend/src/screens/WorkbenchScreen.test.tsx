@@ -1,4 +1,4 @@
-import { act, render, screen } from '@testing-library/react'
+import { act, fireEvent, render, screen } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import * as api from '../api'
@@ -93,7 +93,7 @@ async function renderAndGenerate(ideas: api.FeatureIdea[], scope: Scope = {}) {
     await userEvent.type(screen.getByLabelText('Target column'), scope.target)
   }
   await userEvent.type(screen.getByLabelText('Prediction goal'), 'predict churn')
-  await userEvent.click(screen.getByRole('button', { name: 'Generate features' }))
+  await userEvent.click(screen.getByRole('button', { name: /generate candidates/i }))
 }
 
 async function selectCandidate(name: string) {
@@ -107,7 +107,7 @@ async function registerSelection(count: number) {
 }
 
 async function openDescribe() {
-  await userEvent.click(screen.getByRole('button', { name: 'Or describe a feature yourself' }))
+  await userEvent.click(screen.getByRole('button', { name: /write definitions myself/i }))
 }
 
 async function draftFeature(description: string) {
@@ -143,7 +143,7 @@ describe('generation', () => {
     render(<WorkbenchScreen />)
     expect(screen.queryByText(/no grounded candidates/i)).not.toBeInTheDocument()
     await userEvent.type(screen.getByLabelText('Prediction goal'), 'predict churn')
-    await userEvent.click(screen.getByRole('button', { name: 'Generate features' }))
+    await userEvent.click(screen.getByRole('button', { name: /generate candidates/i }))
     expect(await screen.findByText(/no grounded candidates for that goal/i)).toBeInTheDocument()
   })
 
@@ -153,11 +153,18 @@ describe('generation', () => {
     recommendFeatures
       .mockImplementationOnce(() => first.promise)
       .mockImplementationOnce(() => second.promise)
-    render(<WorkbenchScreen />)
+    const { container } = render(<WorkbenchScreen />)
     await userEvent.type(screen.getByLabelText('Prediction goal'), 'predict churn')
-    const generate = screen.getByRole('button', { name: 'Generate features' })
-    await userEvent.click(generate)
-    await userEvent.click(generate)
+    await userEvent.click(screen.getByRole('button', { name: /generate candidates/i }))
+    // Round 1 is in flight: the path card swaps to Generating and disables (no casual re-submit).
+    expect(screen.getByRole('button', { name: /generating/i })).toBeDisabled()
+    // The disabled card blocks the button, so a second round can only arrive as a re-submit
+    // (StrictMode remount, programmatic) — exactly the race the sequence guard defends against.
+    const form = container.querySelector('form')
+    if (!form) throw new Error('generation form not found')
+    await act(async () => {
+      fireEvent.submit(form)
+    })
     await act(async () => {
       second.resolve([OTHER_IDEA])
     })
@@ -174,17 +181,17 @@ describe('generation', () => {
     recommendFeatures.mockRejectedValue(new api.ApiError(503, 'not configured'))
     render(<WorkbenchScreen />)
     await userEvent.type(screen.getByLabelText('Prediction goal'), 'predict churn')
-    await userEvent.click(screen.getByRole('button', { name: 'Generate features' }))
+    await userEvent.click(screen.getByRole('button', { name: /generate candidates/i }))
     const alert = await screen.findByRole('alert')
     expect(alert).toHaveTextContent(/ai assist is not configured/i)
   })
 
   it('the example chip fills the goal input and enables the primary action', async () => {
     render(<WorkbenchScreen />)
-    expect(screen.getByRole('button', { name: 'Generate features' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: /generate candidates/i })).toBeDisabled()
     await userEvent.click(screen.getByRole('button', { name: 'predict churn' }))
     expect(screen.getByLabelText('Prediction goal')).toHaveValue('predict churn')
-    expect(screen.getByRole('button', { name: 'Generate features' })).toBeEnabled()
+    expect(screen.getByRole('button', { name: /generate candidates/i })).toBeEnabled()
     expect(recommendFeatures).not.toHaveBeenCalled()
   })
 })
@@ -295,7 +302,7 @@ describe('selection and registration', () => {
     await registerSelection(1)
     expect(await screen.findByText(/registered/i)).toBeInTheDocument()
     // Second round returns a candidate with the same LLM-chosen name: it was never registered.
-    await userEvent.click(screen.getByRole('button', { name: 'Generate features' }))
+    await userEvent.click(screen.getByRole('button', { name: /generate candidates/i }))
     const checkbox = await screen.findByRole('checkbox', { name: 'Select avg_balance' })
     expect(checkbox).not.toBeChecked()
     expect(screen.queryByText(/registered/i)).not.toBeInTheDocument()
@@ -383,6 +390,19 @@ describe('scope changes', () => {
 })
 
 describe('described drafts', () => {
+  it('the write-definitions path toggles the composer and reflects aria-pressed', async () => {
+    render(<WorkbenchScreen />)
+    const card = screen.getByRole('button', { name: /write definitions myself/i })
+    expect(card).toHaveAttribute('aria-pressed', 'false')
+    expect(screen.queryByLabelText('Describe the feature you want')).not.toBeInTheDocument()
+    await userEvent.click(card)
+    expect(card).toHaveAttribute('aria-pressed', 'true')
+    expect(screen.getByLabelText('Describe the feature you want')).toBeInTheDocument()
+    await userEvent.click(card)
+    expect(card).toHaveAttribute('aria-pressed', 'false')
+    expect(screen.queryByLabelText('Describe the feature you want')).not.toBeInTheDocument()
+  })
+
   it('drafts a candidate and registers it with the snapshot-source pairs', async () => {
     registerFeature.mockResolvedValue('feat_09')
     featureFreshness.mockResolvedValue(FRESH)

@@ -1,6 +1,6 @@
-// One guided feature-generation flow: kickoff hero (goal + scope + Generate), an optional
-// describe composer that drafts candidates, one shared candidate list, and a selection tray
-// with an explicit confirm step before anything is registered.
+// One guided feature-generation flow: a goal + scope hero with two peer paths (Generate
+// candidates through the engine, or Write definitions myself through the batch composer), one
+// shared candidate list, and a selection tray with an explicit confirm before anything registers.
 //
 // Invariants carried over from the hardening campaign:
 // - Lineage comes ONLY from backend-resolved pairs (FeatureIdea.derives_pairs for generated
@@ -10,7 +10,7 @@
 // - Every fetch handler carries an out-of-order guard (monotonic sequence refs).
 // - Scope edits invalidate candidates: source edits clear everything (draft snapshots no longer
 //   match the context), entity/target edits clear generated candidates only.
-import { type FormEvent, useRef, useState } from 'react'
+import { type FormEvent, type ReactNode, useRef, useState } from 'react'
 import {
   ApiError, type FeatureFreshness, type FeatureIdea, type FeatureSpecIn, type JoinStep,
   type Recipe, featureFreshness, featureRecipe, recommendFeatures, registerFeature,
@@ -20,13 +20,6 @@ const HELP_STYLE = { fontSize: 12 } as const
 // Solid ok chip (index.css has no fresh badge class; mirrors .badge.stale's solid treatment).
 const OK_SOLID_CHIP_STYLE = {
   background: 'var(--ok-solid)', borderColor: 'transparent', color: 'var(--chip-ink)',
-} as const
-// Quiet link-shaped button (the describe toggle): overrides the global button chrome. Inline
-// styles win over the stylesheet hover rules, so it stays a link on hover too.
-const LINK_BUTTON_STYLE = {
-  background: 'transparent', border: 'none', padding: '0 2px', height: 32,
-  color: 'var(--accent)', fontWeight: 500,
-  textDecoration: 'underline', textUnderlineOffset: 2,
 } as const
 // Sticky-feel selection tray: the last row of the candidate list, pinned while the list scrolls.
 const TRAY_STYLE = {
@@ -59,6 +52,27 @@ function CalloutGlyph({ d }: { d: string }) {
         <path d={d} />
       </svg>
     </span>
+  )
+}
+
+// Peer-path card icons (plus-in-circle for Generate, pencil for Write definitions). Decorative:
+// the card title text carries the meaning.
+function PathGlyph({ children }: { children: ReactNode }) {
+  return (
+    <svg
+      width="16"
+      height="16"
+      viewBox="0 0 16 16"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.5"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+      focusable="false"
+    >
+      {children}
+    </svg>
   )
 }
 
@@ -460,11 +474,6 @@ export function WorkbenchScreen() {
   return (
     <section>
       <div className="panel">
-        <h2>Generate features</h2>
-        <p style={{ color: 'var(--ink-soft)', marginBottom: 16, maxWidth: 640 }}>
-          Tell the engine your prediction goal. It proposes catalog-grounded, safety-checked
-          features; you approve what enters the registry.
-        </p>
         {notice && (
           <div role="alert" className="callout callout--warn">
             <CalloutGlyph d={WARN_GLYPH} />
@@ -483,7 +492,14 @@ export function WorkbenchScreen() {
               placeholder="e.g. predict customer churn in the next 90 days"
               style={{ height: 40 }}
             />
-            <div className="hint" style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <div
+              className="hint"
+              style={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 8 }}
+            >
+              <span>
+                Both paths use it: the engine generates against it, and written definitions attach
+                to it.
+              </span>
               <span>Try</span>
               <button type="button" className="role-chip" onClick={() => setGoal(EXAMPLE_GOAL)}>
                 {EXAMPLE_GOAL}
@@ -529,25 +545,43 @@ export function WorkbenchScreen() {
               </p>
             </div>
           </div>
-          <div>
+          <div className="paths">
             <button
               type="submit"
-              className="btn btn--primary"
-              style={{ height: 40, padding: '0 22px' }}
-              disabled={!goal.trim()}
+              className="path path-generate"
+              disabled={!goal.trim() || generating}
             >
-              {generating ? 'Generating' : 'Generate features'}
+              <span className="k">Path 1 · The engine</span>
+              <span className="t">
+                <PathGlyph>
+                  <circle cx="8" cy="8" r="6.2" />
+                  <path d="M8 5v6M5 8h6" />
+                </PathGlyph>
+                {generating ? 'Generating' : 'Generate candidates'}
+              </span>
+              <span className="d">
+                The engine proposes catalog-grounded, design-checked features for your goal, each
+                with its causal rationale.
+              </span>
             </button>
-          </div>
-          <div>
             <button
               type="button"
-              style={LINK_BUTTON_STYLE}
-              aria-expanded={describeOpen}
+              className="path path-describe"
+              aria-pressed={describeOpen}
               aria-controls="wb-describe-panel"
               onClick={() => setDescribeOpen(open => !open)}
             >
-              Or describe a feature yourself
+              <span className="k">Path 2 · Your definitions</span>
+              <span className="t">
+                <PathGlyph>
+                  <path d="M3 13h10M4 10.5 10.8 3.7a1.4 1.4 0 0 1 2 2L6 12.5l-2.8.8z" />
+                </PathGlyph>
+                Write definitions myself
+              </span>
+              <span className="d">
+                One definition per line; each becomes a draft candidate with its real join path,
+                drafted together.
+              </span>
             </button>
           </div>
         </form>

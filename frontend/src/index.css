@@ -1094,3 +1094,108 @@ section > h2:first-child {
   background: color-mix(in oklch, var(--accent) 16%, var(--surface));
   border-color: transparent;
 }
+
+/* ---------------------------------------------------------------- path cards (workbench hero)
+   Two equal peer entries below the goal + scope row: Generate candidates (the engine) and Write
+   definitions myself (the composer toggle). Both are real <button>s, so this section overrides
+   the global button chrome (32px height, horizontal padding, centering) to build a tall,
+   left-aligned card. Existing tokens only; appended additively, nothing above is modified.
+   Specificity note: .path (0,1,0) outranks the base `button:where(...)` rule (0,0,1); the
+   variant hovers (.path-*:hover, 0,2,0) outrank the base hover (0,1,1). */
+
+.paths {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 14px;
+  margin-top: 4px;
+}
+
+.path {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  justify-content: flex-start;
+  gap: 6px;
+  min-height: 104px;
+  height: auto;
+  padding: 16px;
+  border-radius: var(--radius-panel);
+  text-align: left;
+}
+
+/* micro-label: mono 10px caps, quieter than the body of the card */
+.path .k {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  opacity: 0.75;
+}
+
+.path .t {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.path .t svg {
+  flex: none;
+}
+
+.path .d {
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+/* Path 1: the committed primary. Accent fill + chip-ink text (mirrors .btn--primary). */
+.path-generate {
+  background: var(--accent);
+  border: 1px solid var(--accent);
+  color: var(--chip-ink);
+}
+
+.path-generate .d {
+  /* dimmed against the accent fill, still high-contrast light-on-petrol */
+  color: oklch(0.9 0.02 208);
+}
+
+.path-generate:hover {
+  background: var(--accent-hover);
+  border-color: var(--accent-hover);
+}
+
+/* Path 2: the quiet peer. Surface + hairline; accent border on hover; accent-soft fill when the
+   composer is open (aria-pressed=true carries the state, never color alone). */
+.path-describe {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  color: var(--ink);
+}
+
+.path-describe:hover {
+  background: var(--surface);
+  border-color: var(--accent);
+}
+
+.path-describe[aria-pressed='true'] {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+}
+
+@media (max-width: 900px) {
+  .paths {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* self-contained transition, gated on motion preference (DESIGN.md). The global reduce rule
+   already neutralizes the base button transition; this keeps the .path section explicit. */
+@media (prefers-reduced-motion: no-preference) {
+  .path {
+    transition: background-color var(--dur-fast) var(--ease-out-quart),
+      border-color var(--dur-fast) var(--ease-out-quart);
+  }
+}
