@@ -21,6 +21,7 @@ class CanonicalRow:
 class RowError:
     row_index: int
     message: str
+    row: "CanonicalRow | None" = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,13 +44,14 @@ def validate_rows(rows: list[CanonicalRow]) -> ValidationResult:
     for i, r in enumerate(rows):
         missing = [f for f in _REQUIRED if not getattr(r, f)]
         if missing:
-            quarantined.append(RowError(i, f"missing required field(s): {', '.join(missing)}"))
+            quarantined.append(RowError(i, f"missing required field(s): {', '.join(missing)}", r))
             continue
         key = (r.source, r.table, r.column)
         if key in seen:
             if seen[key] == r.type:
                 continue  # identical duplicate -> dedup
-            quarantined.append(RowError(i, f"conflicting type for {key}: {seen[key]} vs {r.type}"))
+            quarantined.append(
+                RowError(i, f"conflicting type for {key}: {seen[key]} vs {r.type}", r))
             continue
         seen[key] = r.type
         good.append(r)
