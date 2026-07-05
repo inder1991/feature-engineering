@@ -89,5 +89,14 @@ single seam (`featuregen.api.deps.get_identity`) to replace with real session au
 an unauthenticated dev principal (`user:<subject>`) through the fail-closed identity builder;
 authenticated envelopes only ever come from a registered verifier once the real IdP lands.
 
+## Frontend
+
+`make frontend-dev` serves the React app on `http://localhost:5173`, proxying API calls to the
+FastAPI server (`make api`). Dev loop: `make api` in one terminal, `make frontend-dev` in another,
+then upload `docs/examples/deposits.csv` as source `deposits` and search for “balance”.
+The session bar (top right) is stub auth — toggle `pii_reader` to see read-scope filtering live.
+Feature-assist panels show a “not configured” notice unless the API deployment sets
+`FEATUREGEN_LLM_PROVIDER=anthropic`.
+
 ## License
 Proprietary — see [LICENSE](LICENSE).
