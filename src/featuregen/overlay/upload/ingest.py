@@ -10,6 +10,7 @@ from featuregen.overlay.projection import OverlayProjection
 from featuregen.overlay.store import append_overlay_event, load_fact
 from featuregen.overlay.upload.brake import large_change_brake
 from featuregen.overlay.upload.canonical import CanonicalRow, validate_rows
+from featuregen.overlay.upload.graph import build_graph
 from featuregen.overlay.upload.upload_catalog import UploadCatalog, table_ref
 from featuregen.projections.runner import run_projection
 
@@ -76,4 +77,5 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
     run_projection(conn, OverlayProjection())
     staled = sum(1 for c in changes if c.kind in ("drop", "type_change", "rename"))
 
+    build_graph(conn, catalog_source, vr.good)
     return IngestResult("ingested", None, asserted, staled, len(vr.quarantined))

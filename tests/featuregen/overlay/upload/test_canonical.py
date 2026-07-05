@@ -35,3 +35,8 @@ def test_duplicate_same_type_dedups_conflicting_type_quarantines():
     result = validate_rows(rows)
     assert len(result.good) == 1               # deduped identical
     assert len(result.quarantined) == 1        # conflicting type
+
+
+def test_row_carries_definition():
+    r = CanonicalRow("deposits", "accounts", "balance", "numeric", definition="ledger balance")
+    assert r.definition == "ledger balance"
