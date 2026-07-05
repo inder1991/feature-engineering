@@ -74,3 +74,29 @@ def test_cross_catalog_path_joins_then_entity_bridge(db):
     assert path[0].kind == "join"
     assert path[1].kind == "entity" and path[1].detail == "Customer"
     assert find_cross_catalog_path(db, "cards", "transactions", "deposits", "nowhere") is None
+
+
+def test_suggest_confirm_and_survive_reupload(db):
+    from featuregen.intake.llm import FakeLLM, FakeResponse
+    from featuregen.overlay.upload.canonical import CanonicalRow
+    from featuregen.overlay.upload.entity import (
+        apply_entity_suggestion,
+        list_entity_suggestions,
+        suggest_entities,
+    )
+    from featuregen.overlay.upload.graph import build_graph
+    rows = [CanonicalRow("deposits", "accounts", "cust_ref", "integer"),   # id-like, no entity
+            CanonicalRow("deposits", "accounts", "balance", "numeric")]    # not id-like -> skipped
+    build_graph(db, "deposits", rows)
+    client = FakeLLM(script={"overlay.enrich.entity": FakeResponse(output={"entity": "Customer"})})
+    assert suggest_entities(db, client, "deposits") == 1
+    sugg = list_entity_suggestions(db, "deposits")
+    assert len(sugg) == 1 and sugg[0].column == "cust_ref" and sugg[0].suggested_entity == "Customer"
+    # human confirms -> written as the column's entity
+    assert apply_entity_suggestion(db, "deposits", sugg[0].object_ref)
+    q = "SELECT entity FROM graph_node WHERE catalog_source='deposits' AND object_ref=%s"
+    assert db.execute(q, (sugg[0].object_ref,)).fetchone()[0] == "Customer"
+    # re-upload (the upload STILL doesn't declare the entity) -> the confirmed tag survives
+    build_graph(db, "deposits", rows)
+    assert db.execute(q, (sugg[0].object_ref,)).fetchone()[0] == "Customer"
+    assert list_entity_suggestions(db, "deposits") == []   # nothing pending anymore
