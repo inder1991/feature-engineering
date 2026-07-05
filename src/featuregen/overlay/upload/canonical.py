@@ -14,6 +14,7 @@ class CanonicalRow:
     is_grain: bool = False
     as_of: bool = False
     definition: str = ""
+    sensitivity: str = ""
 
 
 @dataclass(frozen=True, slots=True)

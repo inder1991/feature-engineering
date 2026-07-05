@@ -51,10 +51,10 @@ def build_graph(conn, catalog_source: str, rows: list[CanonicalRow],
         definition = r.definition or definitions.get(content_hash(r)) or None
         conn.execute(
             "INSERT INTO graph_node (catalog_source, object_ref, kind, table_name, column_name, "
-            "data_type, definition, is_grain, is_as_of, concept, domain, search_doc) "
-            f"VALUES (%s, %s, 'column', %s, %s, %s, %s, %s, %s, %s, %s, {_SEARCH_DOC})",
+            "data_type, definition, is_grain, is_as_of, concept, domain, sensitivity, search_doc) "
+            f"VALUES (%s, %s, 'column', %s, %s, %s, %s, %s, %s, %s, %s, %s, {_SEARCH_DOC})",
             (catalog_source, c_ref, r.table, r.column, r.type, definition,
-             r.is_grain, r.as_of, concept, domain,
+             r.is_grain, r.as_of, concept, domain, r.sensitivity or None,
              r.column, definition or "", r.table, humanize(concept) if concept else "",
              domain or ""))
         conn.execute(
