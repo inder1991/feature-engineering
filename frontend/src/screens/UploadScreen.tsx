@@ -3,10 +3,29 @@ import type { CSSProperties, DragEvent, FormEvent, ReactNode } from 'react'
 import { ApiError, uploadFile } from '../api'
 import type { IngestResult } from '../api'
 
+const MAX_UPLOAD_BYTES = 20 * 1024 * 1024
+
+// Client-side pre-flight only; the server remains the authoritative control. Both the picker
+// and the drop path go through this (the `accept` attribute filters the picker dialog but does
+// nothing for drops).
+function describeInvalidFile(candidate: File): string {
+  if (!/\.(csv|xlsx)$/i.test(candidate.name)) {
+    return `Unsupported file type: ${candidate.name}. Choose a .csv or .xlsx file.`
+  }
+  if (candidate.size > MAX_UPLOAD_BYTES) {
+    return `${candidate.name} is larger than the 20 MB upload limit. Split it into smaller uploads.`
+  }
+  return ''
+}
+
 export function UploadScreen({ onReviewQueue }: { onReviewQueue: (source: string) => void }) {
   const [source, setSource] = useState('')
   const [file, setFile] = useState<File | null>(null)
-  const [result, setResult] = useState<IngestResult | null>(null)
+  const [fileError, setFileError] = useState('')
+  // The result is stored with the source it was uploaded to, so the result panel and the
+  // review-queue handoff never read the live input (which the user may already have edited
+  // for the next upload).
+  const [uploaded, setUploaded] = useState<{ result: IngestResult; source: string } | null>(null)
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
   const [hover, setHover] = useState(false)
@@ -15,12 +34,13 @@ export function UploadScreen({ onReviewQueue }: { onReviewQueue: (source: string
 
   async function submit(e: FormEvent) {
     e.preventDefault()
-    if (!file || !source.trim()) return
+    const submittedSource = source.trim()
+    if (!file || !submittedSource) return
     setBusy(true)
     setError('')
-    setResult(null)
+    setUploaded(null)
     try {
-      setResult(await uploadFile(file, source.trim()))
+      setUploaded({ result: await uploadFile(file, submittedSource), source: submittedSource })
     } catch (err) {
       setError(err instanceof ApiError ? err.detail : String(err))
     } finally {
@@ -28,11 +48,22 @@ export function UploadScreen({ onReviewQueue }: { onReviewQueue: (source: string
     }
   }
 
+  function selectFile(candidate: File) {
+    const problem = describeInvalidFile(candidate)
+    if (problem) {
+      setFile(null)
+      setFileError(problem)
+      return
+    }
+    setFileError('')
+    setFile(candidate)
+  }
+
   function onDrop(e: DragEvent<HTMLLabelElement>) {
     e.preventDefault()
     setDragging(false)
     const dropped = e.dataTransfer.files?.[0]
-    if (dropped) setFile(dropped)
+    if (dropped) selectFile(dropped)
   }
 
   // Drop-target styling is inline because index.css has no drop-target class and this screen
@@ -90,7 +121,11 @@ export function UploadScreen({ onReviewQueue }: { onReviewQueue: (source: string
                 type="file"
                 accept=".csv,.xlsx"
                 className="visually-hidden"
-                onChange={e => setFile(e.target.files?.[0] ?? null)}
+                onChange={e => {
+                  const chosen = e.target.files?.[0]
+                  if (chosen) selectFile(chosen)
+                  else setFile(null)
+                }}
                 onFocus={() => setFocus(true)}
                 onBlur={() => setFocus(false)}
               />
@@ -104,6 +139,19 @@ export function UploadScreen({ onReviewQueue }: { onReviewQueue: (source: string
                 </span>
               )}
             </label>
+            {fileError && (
+              <div className="callout callout--danger" role="alert" style={{ marginBlock: 0 }}>
+                <CalloutGlyph>
+                  <circle cx="8" cy="8" r="6.25" />
+                  <path d="m5.75 5.75 4.5 4.5m0-4.5-4.5 4.5" />
+                </CalloutGlyph>
+                <div className="callout-body">
+                  <p>
+                    <strong>File not accepted.</strong> {fileError}
+                  </p>
+                </div>
+              </div>
+            )}
           </div>
           <button
             type="submit"
@@ -128,8 +176,12 @@ export function UploadScreen({ onReviewQueue }: { onReviewQueue: (source: string
           </div>
         </div>
       )}
-      {result && (
-        <IngestResultCallout result={result} source={source.trim()} onReviewQueue={onReviewQueue} />
+      {uploaded && (
+        <IngestResultCallout
+          result={uploaded.result}
+          source={uploaded.source}
+          onReviewQueue={onReviewQueue}
+        />
       )}
     </section>
   )
@@ -181,12 +233,14 @@ function IngestResultCallout({
         </CalloutGlyph>
         <div className="callout-body">
           <p>
-            <strong>Held: confirm this large change.</strong>
+            <strong>
+              Held: this change removes too much of the existing catalog to apply automatically.
+            </strong>
           </p>
           <p>{result.reason}</p>
           <p>
-            Nothing was applied. Check the file targets the right source, then re-upload to
-            confirm.
+            Nothing was applied. There is no override yet. Adjust the file so it keeps most
+            existing objects, or split the change into smaller uploads.
           </p>
         </div>
       </div>
