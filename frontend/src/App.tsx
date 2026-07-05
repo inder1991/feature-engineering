@@ -1,4 +1,3 @@
-import { useState } from 'react'
 import type { ReactElement } from 'react'
 import { useHashRoute } from './nav'
 import type { Route } from './nav'
@@ -119,9 +118,10 @@ const PAGES: { route: Route; label: string; title: string; description: string }
 
 export default function App() {
   const { route, navigate, params } = useHashRoute()
-  const [reviewSource, setReviewSource] = useState('')
+  // The upload -> review handoff travels entirely in the URL (?source=). No component state:
+  // the hash is the single source of truth, so back/forward and shared deep links always show
+  // the queue the address bar names.
   const openReview = (source: string) => {
-    setReviewSource(source)
     navigate('review', { source })
   }
   const page = PAGES.find(p => p.route === route) ?? PAGES[0]
@@ -164,9 +164,7 @@ export default function App() {
         {route === 'overview' && <OverviewScreen navigate={navigate} />}
         {route === 'upload' && <UploadScreen onReviewQueue={openReview} />}
         {route === 'search' && <SearchScreen />}
-        {route === 'review' && (
-          <ReviewQueueScreen initialSource={reviewSource || params.get('source') || ''} />
-        )}
+        {route === 'review' && <ReviewQueueScreen initialSource={params.get('source') ?? ''} />}
         {route === 'workbench' && <WorkbenchScreen />}
       </main>
     </div>
