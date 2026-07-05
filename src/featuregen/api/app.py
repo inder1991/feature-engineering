@@ -8,7 +8,15 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from featuregen.aggregates.bootstrap import register_phase06_event_schemas
-from featuregen.api.routes import assist, features, graph, quarantine, search, uploads
+from featuregen.api.routes import (
+    assist,
+    contract,
+    features,
+    graph,
+    quarantine,
+    search,
+    uploads,
+)
 from featuregen.events.registry import event_registry
 from featuregen.intake.llm import LLMClient
 from featuregen.overlay.config import overlay_config_from_env, register_overlay_config
@@ -37,6 +45,7 @@ def create_app(llm_client: LLMClient | None = None) -> FastAPI:
     app.include_router(graph.router)
     app.include_router(features.router)
     app.include_router(assist.router)
+    app.include_router(contract.router)
 
     @app.get("/health")
     def health() -> dict[str, str]:

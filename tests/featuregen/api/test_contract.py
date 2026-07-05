@@ -1,0 +1,75 @@
+from tests.featuregen.api._helpers import AUTH, DEPOSITS_CSV, upload_csv
+
+from featuregen.intake.llm import FakeLLM, FakeResponse
+
+
+def _fake() -> FakeLLM:
+    return FakeLLM(script={
+        # upload runs ingest enrichment first (must be scripted or upload 500s)
+        "overlay.enrich.concept": FakeResponse(output={"concept": "monetary"}),
+        "overlay.enrich.definition": FakeResponse(output={"definition": "a column"}),
+        "overlay.enrich.domain": FakeResponse(output={"domain": "Deposits"}),
+        "overlay.feature.recommend": FakeResponse(output={"features": [{
+            "name": "avg_balance_90d", "description": "avg balance",
+            "derives_from": ["public.accounts.balance"], "aggregation": "avg_90d",
+            "grain_table": "accounts"}]}),
+        "overlay.feature.recommend_set": FakeResponse(output={
+            "recommended_lens": "monetary", "reasoning": "fits the hypothesis"}),
+        "overlay.contract.draft": FakeResponse(output={
+            "definition": "Average 90-day end-of-day ledger balance per account."}),
+        "overlay.contract.critique": FakeResponse(output={"findings": []}),
+    })
+
+
+def test_considered_set_returns_anchor_and_alternatives(make_client):
+    client = make_client(_fake())
+    upload_csv(client, "deposits", DEPOSITS_CSV)
+    res = client.post("/contract/considered-set", json={
+        "hypothesis": "customers churn when their balance drops",
+        "definition": "90-day average balance per account",
+        "objective": "predict churn", "catalog_source": "deposits"}, headers=AUTH)
+    assert res.status_code == 200
+    body = res.json()
+    assert body["intent_id"]
+    assert body["anchor"]["name"] == "avg_balance_90d"
+    assert any(f["name"] == "avg_balance_90d"
+               for s in body["alternatives"] for f in s["features"])
+    assert body["recommendation"]["recommended_lens"] == "monetary"
+
+
+def test_blank_hypothesis_is_422(make_client):
+    client = make_client(_fake())
+    upload_csv(client, "deposits", DEPOSITS_CSV)
+    res = client.post("/contract/considered-set", json={
+        "hypothesis": "", "objective": "x", "catalog_source": "deposits"}, headers=AUTH)
+    assert res.status_code == 422
+
+
+def test_draft_then_confirm_registers_contract(make_client):
+    client = make_client(_fake())
+    upload_csv(client, "deposits", DEPOSITS_CSV)
+    feature = {"name": "avg_balance_90d", "derives_from": ["public.accounts.balance"],
+               "aggregation": "avg_90d", "grain_table": "accounts",
+               "derives_pairs": [["deposits", "public.accounts.balance"]]}
+    dr = client.post("/contract/draft", json={"feature": feature}, headers=AUTH)
+    assert dr.status_code == 200
+    draft = dr.json()["draft"]
+    assert draft["definition"].startswith("Average")
+    assert dr.json()["unresolved"] == []
+    # the human confirms the draft -> a governed, versioned contract
+    cr = client.post("/contract/confirm", json=draft, headers=AUTH)
+    assert cr.status_code == 200
+    assert cr.json()["version"] == 1
+    assert cr.json()["feature_id"].startswith("feat")
+
+
+def test_confirm_rejects_a_leaky_draft_422(make_client):
+    client = make_client(_fake())
+    upload_csv(client, "deposits", DEPOSITS_CSV)
+    leaky = {"feature_name": "x", "definition": "d", "grain_table": "accounts",
+             "aggregation": "avg_90d", "as_of_column": "posted_at",
+             "derives_from": ["public.accounts.balance"],
+             "target_ref": "public.accounts.balance",   # derives the target -> leaks
+             "derives_pairs": [["deposits", "public.accounts.balance"]], "join_path": []}
+    res = client.post("/contract/confirm", json=leaky, headers=AUTH)
+    assert res.status_code == 422
