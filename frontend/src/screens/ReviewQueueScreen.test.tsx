@@ -23,18 +23,22 @@ describe('review queue screen', () => {
       row_index: 9, reason: 'missing required field(s): type',
       raw: { source: 'deposits', table: 'accounts', column: 'opened_at', type: '' } }])
     render(<ReviewQueueScreen initialSource="" />)
-    await userEvent.type(screen.getByLabelText('source'), 'deposits')
+    await userEvent.type(screen.getByLabelText('Source'), 'deposits')
     await userEvent.click(screen.getByRole('button', { name: /load queue/i }))
     expect(await screen.findByText(/missing required field\(s\): type/)).toBeInTheDocument()
     expect(screen.getByText('opened_at')).toBeInTheDocument()
     expect(screen.getByText(/row 9/)).toBeInTheDocument()
-    expect(screen.getByText(/fix them in the source file and re-upload/i)).toBeInTheDocument()
+    expect(
+      screen.getByText(/1 quarantined row\. fix them in the source file and re-upload/i),
+    ).toBeInTheDocument()
   })
 
   it('auto-loads when arriving with a source from the upload screen', async () => {
     listQuarantine.mockResolvedValue([])
     render(<ReviewQueueScreen initialSource="deposits" />)
-    expect(await screen.findByText(/queue clear/i)).toBeInTheDocument()
+    expect(
+      await screen.findByText('Queue clear. No quarantined rows for this source.'),
+    ).toBeInTheDocument()
     expect(listQuarantine).toHaveBeenCalledWith('deposits')
   })
 })

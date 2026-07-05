@@ -30,15 +30,19 @@ export function ReviewQueueScreen({ initialSource }: { initialSource: string }) 
 
   return (
     <section>
-      <h2>Review queue</h2>
       <form onSubmit={submit}>
-        <input
-          aria-label="source"
-          value={source}
-          onChange={e => setSource(e.target.value)}
-          placeholder="source name"
-        />
-        <button type="submit">Load queue</button>
+        <div className="field">
+          <label htmlFor="review-source">Source</label>
+          <input
+            id="review-source"
+            value={source}
+            onChange={e => setSource(e.target.value)}
+            placeholder="source name"
+          />
+        </div>
+        <button type="submit" className="btn">
+          Load queue
+        </button>
       </form>
       {error && (
         <p role="alert" className="error">
@@ -46,32 +50,38 @@ export function ReviewQueueScreen({ initialSource }: { initialSource: string }) 
         </p>
       )}
       {items?.length === 0 && (
-        <p className="empty">Queue clear — no quarantined rows for this source.</p>
+        <p className="empty">Queue clear. No quarantined rows for this source.</p>
       )}
       {items && items.length > 0 && (
         <>
           <p>
             {items.length} quarantined row{items.length === 1 ? '' : 's'}. Fix them in the source
-            file and re-upload — a clean upload clears this queue.
+            file and re-upload; a clean upload clears this queue.
           </p>
-          {items.map(item => (
-            <article className="card quarantine" key={item.row_index}>
-              <header>
-                <span className="badge rejected">row {item.row_index}</span>
-                <strong>{item.reason}</strong>
-              </header>
-              <dl>
-                {Object.entries(item.raw)
-                  .filter(([, v]) => v !== '' && v !== null && v !== false)
-                  .map(([k, v]) => (
-                    <div key={k}>
-                      <dt>{k}</dt>
-                      <dd>{String(v)}</dd>
-                    </div>
-                  ))}
-              </dl>
-            </article>
-          ))}
+          <ul className="rows">
+            {items.map(item => (
+              <li
+                className="row"
+                key={item.row_index}
+                style={{ flexDirection: 'column', alignItems: 'stretch' }}
+              >
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                  <span className="badge rejected">row {item.row_index}</span>
+                  <strong style={{ fontWeight: 600 }}>{item.reason}</strong>
+                </div>
+                <dl className="kv">
+                  {Object.entries(item.raw)
+                    .filter(([, v]) => v !== '' && v !== null && v !== false)
+                    .map(([k, v]) => (
+                      <div key={k}>
+                        <dt className="mono">{k}</dt>
+                        <dd>{String(v)}</dd>
+                      </div>
+                    ))}
+                </dl>
+              </li>
+            ))}
+          </ul>
         </>
       )}
     </section>
