@@ -761,3 +761,165 @@ section > h2 {
 section > h2:first-child {
   margin-top: 0;
 }
+
+/* ---------------------------------------------------------------- review queue: mock inline fixes
+   Appended for ReviewQueueScreen's client-side mock flows (fix inline, revalidate, dismiss,
+   mapping rules). Composes the existing .row / .kv / .callout / .badge vocabulary; nothing above
+   this line is modified. Every resolution here is local-only and labeled as such in the copy. */
+
+/* one quarantine row, stacked: head + kv + optional editor */
+.q-item {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 10px;
+  padding-block: 12px;
+}
+
+.q-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.q-reason {
+  font-weight: 600;
+}
+
+.q-actions {
+  margin-left: auto;
+  display: flex;
+  gap: 8px;
+}
+
+/* resolved rows dim; the badge + note carry the state (never color alone) */
+.q-item--resolved {
+  opacity: 0.62;
+}
+
+.q-reason--muted {
+  color: var(--ink-soft);
+  font-weight: 500;
+}
+
+.q-note {
+  color: var(--ink-soft);
+  font-size: 13px;
+}
+
+/* offending cell(s) in the kv grid: danger-soft wash + danger text on the key and value */
+.kv dt.q-off,
+.kv dd.q-off {
+  background: var(--danger-soft);
+  color: var(--danger);
+  border-radius: 4px;
+  padding: 1px 6px;
+  margin: -1px -6px;
+}
+
+.q-blank {
+  color: var(--ink-faint);
+  font-style: italic;
+}
+
+/* Dismiss: ghost/tertiary — no border, quiet until hovered */
+.q-ghost {
+  border-color: transparent;
+  background: transparent;
+  color: var(--ink-soft);
+}
+
+.q-ghost:hover {
+  border-color: var(--line);
+  background: var(--paper);
+  color: var(--ink);
+}
+
+/* inline editor revealed under a row */
+.q-editor {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: end;
+  gap: 12px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--paper);
+}
+
+.q-editor-field {
+  display: grid;
+  gap: 6px;
+}
+
+.q-editor-field input {
+  min-width: 180px;
+}
+
+.q-editor-actions {
+  display: flex;
+  gap: 8px;
+}
+
+/* mapping-rule callout form: replacement input + primary action */
+.q-rule-form {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.q-rule-form input {
+  min-width: 200px;
+}
+
+/* mapping-rule chip strip */
+.q-rules {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-block: 12px;
+}
+
+.q-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.q-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 28px;
+  padding: 2px 4px 2px 10px;
+  border: 1px solid var(--accent-line);
+  border-radius: 999px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-size: 13px;
+}
+
+.q-chip-x {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  min-height: 0;
+  padding: 0;
+  border: none;
+  border-radius: 999px;
+  background: transparent;
+  color: inherit;
+  font-size: 15px;
+  line-height: 1;
+}
+
+.q-chip-x:hover {
+  background: color-mix(in oklch, var(--accent) 16%, var(--surface));
+  border-color: transparent;
+}
