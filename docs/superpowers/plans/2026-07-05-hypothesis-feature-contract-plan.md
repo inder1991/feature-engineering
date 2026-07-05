@@ -135,15 +135,21 @@ Test `.../contract/test_author.py`.
 
 ---
 
-## Phase 6 — Retire the superseded SP-2 intake discovery
+## Phase 6 — Retire the superseded SP-2 intake discovery — **DEFERRED (needs its own plan)**
 
-**Files:** delete `intake/{candidates,scoring,mcv,doubt_router}.py` + intake-discovery commands/tests that
-the loop replaces; keep `intake/{redaction,events,state,contract}.py` (reused). Rewire `intake/bootstrap.py`.
+**Pre-flight run 2026-07-05 — it is NOT a clean delete. Three blocking findings:**
+1. **Wired into the production runtime:** `runtime/worker.py` imports `intake.commands`/`bootstrap`/
+   `read_model` — the SP-2 intake flow is mounted in the worker, not just dormant. Deleting the discovery
+   modules breaks the worker; the worker must be rewired first.
+2. **The keep-set is entangled with the delete-set:** `intake/state.py` has `mcv_passed()`, folds
+   `candidates`, and imports are shared with `mcv`/`commands`. The feature-contract `events`/`state`/
+   `contract` (which Phases 1–5 reuse) cannot be cleanly separated from `candidates`/`scoring`/`mcv`/
+   `doubt_router` — it is one aggregate. A split, not a delete.
+3. **~459 test functions across 55 intake test files** exercise this flow — all need triage.
 
-- [ ] **Pre-flight:** grep for every importer of the to-delete modules; confirm only the retired intake
-  flow depends on them (the KEPT redactor/events/state must not). Present the delete list + any surprising
-  dependency to the human before deleting.
-- [ ] TDD: delete → run full suite → fix fallout → commit `refactor(contract): retire superseded SP-2 intake discovery`.
+**Decision (2026-07-05):** DEFERRED. The dormant SP-2 discovery harms nothing, and Phases 1–5 deliver the
+new contract flow without touching it. Retirement is a genuine refactor (worker rewire + aggregate split +
+test triage) that deserves its own spec+plan — not a tail-end deletion. Do NOT execute blind.
 
 ---
 
