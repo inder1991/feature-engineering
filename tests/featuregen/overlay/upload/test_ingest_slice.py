@@ -36,6 +36,11 @@ def test_slice_ingest_serve_drift_and_brake(db):
     res1 = ingest_upload(db, source, rows1, actor=_actor(), now=now)
     assert res1.status == "ingested"
 
+    # The graph is materialized on a successful ingest.
+    node_count = db.execute(
+        "SELECT count(*) FROM graph_node WHERE catalog_source='deposits'").fetchone()[0]
+    assert node_count > 0
+
     cat1 = UploadCatalog(source, rows1)
     grain = resolve_fact(db, cat1, table_ref(source, "accounts"), "grain", now=now)
     assert grain.status == "VERIFIED"
