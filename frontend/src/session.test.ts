@@ -1,7 +1,9 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { getSession, setSession, subscribe } from './session'
 
-beforeEach(() => setSession({ user: 'dev', roles: ['data_owner'] }))
+beforeEach(() => {
+  setSession({ user: 'dev', roles: ['data_owner'] })
+})
 
 describe('session store', () => {
   it('holds the dev session and notifies subscribers', () => {
