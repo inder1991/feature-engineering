@@ -35,7 +35,10 @@ def validate_minimum(conn, draft: ContractDraft, *, target_ref: str | None = Non
     gone stale or been dropped since discovery). Reuses the feature loop's checks. No LLM."""
     raw = {"derives_from": draft.derives_from, "aggregation": draft.aggregation}
     known = _live_columns(conn, draft.derives_from)   # LIVE graph, not set(draft.derives_from) (B2)
-    idea, reason = _validate_idea(conn, raw, known, target_ref, now, fresh_within)
+    src_of: dict[str, set[str]] = {}                  # the draft's carried (catalog, ref) pairs (B3)
+    for cs, ref in draft.derives_pairs:
+        src_of.setdefault(ref, set()).add(cs)
+    idea, reason = _validate_idea(conn, raw, known, src_of, target_ref, now, fresh_within)
     return (idea is not None, [] if idea is not None else [reason])
 
 

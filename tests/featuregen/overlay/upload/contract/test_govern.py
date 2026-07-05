@@ -28,7 +28,8 @@ def _bank(db, watermark=NOW):
 
 def _draft():
     return ContractDraft("avg_balance_90d", "Average 90-day ledger balance.", "accounts",
-                         "avg_90d", "posted_at", ["public.accounts.balance"])
+                         "avg_90d", "posted_at", ["public.accounts.balance"],
+                         derives_pairs=(("bank", "public.accounts.balance"),))
 
 
 def test_confirm_registers_versioned_contract_and_wires_feature(db):
@@ -76,11 +77,13 @@ def test_confirm_reruns_mcv_and_refuses_bad_drafts(db):
         confirm_contract(db, _draft(), actor="ds1", target_ref="public.accounts.balance", now=NOW)
     # empty-definition draft refused (no empty-narrative governing contract)
     empty = ContractDraft("avg_balance_90d", "", "accounts", "avg_90d", "posted_at",
-                          ["public.accounts.balance"])
+                          ["public.accounts.balance"],
+                          derives_pairs=(("bank", "public.accounts.balance"),))
     with pytest.raises(ContractValidationError):
         confirm_contract(db, empty, actor="ds1", now=NOW)
     # draft referencing a vanished column refused (grounding via live graph)
-    ghost = ContractDraft("g", "def", "accounts", "avg_90d", "posted_at", ["public.accounts.vanished"])
+    ghost = ContractDraft("g", "def", "accounts", "avg_90d", "posted_at", ["public.accounts.vanished"],
+                          derives_pairs=(("bank", "public.accounts.vanished"),))
     with pytest.raises(ContractValidationError):
         confirm_contract(db, ghost, actor="ds1", now=NOW)
 
@@ -95,16 +98,12 @@ def test_reconfirm_reuses_one_feature_not_a_new_one(db):
     assert db.execute("SELECT count(*) FROM feature WHERE name = 'avg_balance_90d'").fetchone()[0] == 1
 
 
-def test_ambiguous_multi_catalog_object_ref_is_refused(db):
-    # B3: the same object_ref in two catalogs is ambiguous -> fail closed, don't bind to both
-    from featuregen.overlay.upload.contract.govern import ContractValidationError
+def test_confirm_wires_the_carried_catalog_pairs(db):
+    # B3: govern uses the draft's carried (catalog_source, object_ref) — feature lineage binds ONLY to
+    # the catalog the feature actually read, even with a same-named column in another catalog.
     _bank(db)
-    build_graph(db, "bank2", [
-        CanonicalRow("bank2", "accounts", "balance", "numeric"),
-        CanonicalRow("bank2", "accounts", "posted_at", "timestamp", as_of=True)])
-    db.execute(
-        "INSERT INTO overlay_drift_watermark (catalog_source, last_completed_at, last_run_id, head_seq) "
-        "VALUES ('bank2', %s, 'r', 0) ON CONFLICT (catalog_source) DO UPDATE SET last_completed_at = %s",
-        (NOW, NOW))
-    with pytest.raises(ContractValidationError):
-        confirm_contract(db, _draft(), actor="ds1", now=NOW)
+    build_graph(db, "bank2", [CanonicalRow("bank2", "accounts", "balance", "numeric")])  # same object_ref
+    c = confirm_contract(db, _draft(), actor="ds1", now=NOW)   # draft carries ("bank", ...)
+    pairs = db.execute("SELECT catalog_source FROM feature_derives_from WHERE feature_id = %s",
+                       (c.feature_id,)).fetchall()
+    assert {r[0] for r in pairs} == {"bank"}                  # bound to 'bank' only, not 'bank2'

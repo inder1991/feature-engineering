@@ -170,3 +170,21 @@ def test_non_windowed_feature_needs_no_as_of(db):
          "aggregation": "latest"}]})})       # not windowed -> no point-in-time requirement
     out = recommend_features(db, "churn", client, catalog_source="t", now=NOW)
     assert [f.name for f in out] == ["current_balance"]
+
+
+def test_loop_rejects_ambiguous_cross_catalog_column(db):
+    # B3: the same object_ref in two entity-linked catalogs can't be resolved to one catalog -> rejected
+    build_graph(db, "c1", [
+        CanonicalRow("c1", "accounts", "cust", "integer", entity="Customer"),
+        CanonicalRow("c1", "accounts", "val", "numeric"),
+        CanonicalRow("c1", "accounts", "posted_at", "timestamp", as_of=True)])
+    build_graph(db, "c2", [
+        CanonicalRow("c2", "accounts", "cust", "integer", entity="Customer"),
+        CanonicalRow("c2", "accounts", "val", "numeric"),
+        CanonicalRow("c2", "accounts", "posted_at", "timestamp", as_of=True)])
+    _fresh_watermark(db, "c1", NOW)
+    _fresh_watermark(db, "c2", NOW)
+    client = FakeLLM(script={"overlay.feature.recommend": FakeResponse(output={"features": [
+        {"name": "ambig", "derives_from": ["public.accounts.val"], "aggregation": "avg_90d"}]})})
+    out = recommend_features(db, "x", client, entity="Customer", now=NOW)
+    assert out == []   # public.accounts.val is in c1 AND c2 -> ambiguous -> rejected

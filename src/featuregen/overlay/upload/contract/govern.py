@@ -47,26 +47,6 @@ def _actor_json(actor) -> str | None:
         return json.dumps({"repr": str(actor)})   # structured, parseable JSON — not a repr string
 
 
-def _derives_pairs(conn, object_refs: list[str]) -> tuple[tuple[str, str], ...]:
-    # Map each grounded object_ref back to its catalog_source. B3: object_ref is NOT catalog-qualified,
-    # so if one lives in >1 catalog we CANNOT know which the feature read — fail closed rather than bind
-    # the contract to catalogs it never used. (Full fix: carry catalog_source on FeatureIdea.derives_from.)
-    if not object_refs:
-        return ()
-    rows = conn.execute(
-        "SELECT object_ref, catalog_source FROM graph_node WHERE kind = 'column' "
-        "AND object_ref = ANY(%s)", (list(object_refs),)).fetchall()
-    by_ref: dict[str, set[str]] = {}
-    for ref, src in rows:
-        by_ref.setdefault(ref, set()).add(src)
-    ambiguous = sorted(ref for ref, srcs in by_ref.items() if len(srcs) > 1)
-    if ambiguous:
-        raise ContractValidationError(
-            f"ambiguous catalog_source for {ambiguous} — object_ref spans multiple catalogs; "
-            "catalog-qualified derives_from required (B3)")
-    return tuple((next(iter(srcs)), ref) for ref, srcs in by_ref.items())
-
-
 def confirm_contract(conn, draft: ContractDraft, *, actor, target_ref: str | None = None,
                      now: datetime | None = None) -> Contract:
     """The human gate. RE-RUNS the deterministic MCV (B1) and refuses to govern an invalid draft, then
@@ -78,7 +58,7 @@ def confirm_contract(conn, draft: ContractDraft, *, actor, target_ref: str | Non
         raise ContractValidationError(f"contract failed MCV, not governed: {reasons}")
     if not (draft.definition or "").strip():
         raise ContractValidationError("contract has an empty definition, not governed")
-    pairs = _derives_pairs(conn, draft.derives_from)
+    pairs = draft.derives_pairs   # B3: resolved (catalog_source, object_ref) carried on the draft
     # B4: ONE feature per feature_name — re-confirm reuses + refreshes the feature (no proliferation),
     # so drift impact/freshness point at a single live feature, not N duplicates.
     prev = conn.execute("SELECT feature_id, version FROM contract WHERE feature_name = %s "
@@ -101,9 +81,10 @@ def confirm_contract(conn, draft: ContractDraft, *, actor, target_ref: str | Non
         version = 1
     contract_id = mint_id("contract")
     conn.execute(
-        "INSERT INTO contract (contract_id, feature_id, feature_name, definition, version, actor) "
-        "VALUES (%s, %s, %s, %s, %s, %s::jsonb)",
-        (contract_id, feature_id, draft.feature_name, draft.definition, version, _actor_json(actor)))
+        "INSERT INTO contract (contract_id, feature_id, feature_name, definition, version, actor, "
+        "join_path) VALUES (%s, %s, %s, %s, %s, %s::jsonb, %s::jsonb)",
+        (contract_id, feature_id, draft.feature_name, draft.definition, version, _actor_json(actor),
+         json.dumps(list(draft.join_path))))
     return Contract(contract_id, feature_id, draft.feature_name, version)
 
 
