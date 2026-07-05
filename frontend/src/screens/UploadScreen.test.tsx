@@ -34,8 +34,9 @@ describe('upload screen', () => {
       flagged: "first upload of 'deposits' (9 objects) — review recommended" }))
     render(<UploadScreen onReviewQueue={() => {}} />)
     await submit()
-    expect(await screen.findByText(/4 facts asserted, 1 staled, 0 quarantined/))
-      .toBeInTheDocument()
+    // Counts are wrapped in semantic-color spans; assert the full line via its container's text.
+    expect(await screen.findByText(/facts asserted/))
+      .toHaveTextContent('4 facts asserted, 1 staled, 0 quarantined')
     expect(screen.getByText(/first upload of 'deposits'/)).toBeInTheDocument()
   })
 

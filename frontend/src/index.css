@@ -5,30 +5,48 @@
 /* ---------------------------------------------------------------- tokens */
 
 :root {
-  /* neutrals (tinted toward hue 200) */
-  --paper:        oklch(0.975 0.005 200);  /* app background */
-  --surface:      oklch(0.993 0.003 200);  /* panels, table rows */
-  --ink:          oklch(0.26 0.02 220);    /* primary text */
-  --ink-soft:     oklch(0.45 0.015 220);   /* secondary text */
-  --ink-faint:    oklch(0.60 0.012 220);   /* tertiary, placeholders */
-  --line:         oklch(0.885 0.008 200);  /* hairline borders */
-  --line-strong:  oklch(0.80 0.012 200);
+  /* content neutrals: the ground is VISIBLY colder than panels (value separation is the point) */
+  --ground:       oklch(0.955 0.009 215);  /* app background behind panels */
+  --paper:        var(--ground);           /* legacy alias */
+  --surface:      oklch(0.995 0.002 210);  /* panels, rows: near-white, floats on the ground */
+  --surface-2:    oklch(0.975 0.006 212);  /* inset zones inside panels (kv grids, editors) */
+  --ink:          oklch(0.25 0.025 225);
+  --ink-soft:     oklch(0.44 0.02 222);
+  --ink-faint:    oklch(0.58 0.015 220);
+  --line:         oklch(0.86 0.012 212);
+  --line-strong:  oklch(0.76 0.018 212);
+  --shadow:       0 1px 2px oklch(0.25 0.025 225 / 0.05), 0 6px 20px oklch(0.25 0.025 225 / 0.07);
 
-  /* brand accent: petrol ink */
-  --accent:       oklch(0.42 0.085 205);
-  --accent-hover: oklch(0.36 0.09 205);
-  --accent-soft:  oklch(0.945 0.02 202);   /* selected nav, soft chips */
-  --accent-line:  oklch(0.75 0.06 204);
+  /* the rail: a committed dark petrol surface (identity lives here) */
+  --rail-bg:      oklch(0.27 0.045 215);
+  --rail-bg-2:    oklch(0.23 0.04 215);    /* rail footer / inset */
+  --rail-ink:     oklch(0.93 0.01 210);    /* rail primary text */
+  --rail-ink-soft:oklch(0.72 0.02 212);    /* rail secondary text */
+  --rail-line:    oklch(0.36 0.04 215);
+  --rail-active:  oklch(0.36 0.06 212);    /* active nav fill */
+  --rail-accent:  oklch(0.78 0.09 200);    /* active nav text / logomark on dark */
 
-  /* semantic states (never color alone; always pair with label/glyph) */
-  --ok:           oklch(0.52 0.10 165);    /* fresh, ingested, registered */
-  --ok-soft:      oklch(0.955 0.025 165);
-  --warn:         oklch(0.55 0.11 75);     /* held, flagged, stale */
-  --warn-soft:    oklch(0.965 0.035 85);
-  --danger:       oklch(0.50 0.14 25);     /* rejected, quarantined, leakage */
-  --danger-soft:  oklch(0.965 0.02 25);
-  --proposal:     oklch(0.47 0.10 300);    /* AI suggestions, pre-confirm */
-  --proposal-soft:oklch(0.96 0.02 300);
+  /* accent: petrol, now with real presence */
+  --accent:       oklch(0.46 0.11 210);
+  --accent-hover: oklch(0.39 0.115 210);
+  --accent-soft:  oklch(0.93 0.03 208);
+  --accent-line:  oklch(0.70 0.08 208);
+  --accent-deep:  oklch(0.30 0.06 214);    /* committed hero surfaces (Overview start-here) */
+
+  /* semantic states: -solid fills carry chip text (small caps text needs fill L <= 0.55) */
+  --ok:           oklch(0.50 0.115 163);
+  --ok-solid:     oklch(0.52 0.115 163);
+  --ok-soft:      oklch(0.945 0.035 163);
+  --warn:         oklch(0.53 0.115 70);
+  --warn-solid:   oklch(0.52 0.115 70);
+  --warn-soft:    oklch(0.955 0.045 85);
+  --danger:       oklch(0.48 0.15 25);
+  --danger-solid: oklch(0.50 0.15 25);
+  --danger-soft:  oklch(0.955 0.025 25);
+  --proposal:     oklch(0.46 0.115 300);
+  --proposal-solid: oklch(0.47 0.115 300);
+  --proposal-soft:oklch(0.955 0.025 300);
+  --chip-ink:     oklch(0.985 0.005 210);  /* text on -solid chips */
 
   /* primitives */
   --font-sans: 'IBM Plex Sans', system-ui, sans-serif;
@@ -65,7 +83,7 @@ figure {
 }
 
 body {
-  background: var(--paper);
+  background: var(--ground);
   color: var(--ink);
   font-family: var(--font-sans);
   font-size: 14px;
@@ -172,10 +190,20 @@ table,
   height: 100vh;
   display: flex;
   flex-direction: column;
-  background: var(--surface);
-  border-right: 1px solid var(--line);
-  /* the one permitted shadow: lifts the rail off the paper, barely */
-  box-shadow: 1px 0 12px oklch(0.4 0.02 220 / 0.04);
+  background: var(--rail-bg);
+  color: var(--rail-ink);
+  border-right: 1px solid var(--rail-line);
+  /* the one permitted shadow: lifts the dark rail off the ground */
+  box-shadow: 2px 0 16px oklch(0.2 0.03 220 / 0.12);
+}
+
+/* everything focusable on the rail rings in the rail accent, not the light accent-line */
+.rail :focus-visible {
+  outline-color: var(--rail-accent);
+}
+
+.rail .micro-label {
+  color: var(--rail-ink-soft);
 }
 
 .rail-brand {
@@ -187,7 +215,7 @@ table,
 
 .rail-brand svg {
   flex: none;
-  color: var(--accent);
+  color: var(--rail-accent);
 }
 
 .rail-brand-text {
@@ -199,6 +227,7 @@ table,
 .rail-brand-name {
   font-size: 15px;
   font-weight: 600;
+  color: var(--rail-accent);
 }
 
 .rail-nav {
@@ -217,7 +246,7 @@ table,
   border: none;
   border-radius: var(--radius);
   background: transparent;
-  color: var(--ink-soft);
+  color: var(--rail-ink-soft);
   font: inherit;
   font-weight: 500;
   text-align: left;
@@ -231,20 +260,22 @@ table,
 }
 
 .nav-item:hover {
-  background: var(--paper);
-  color: var(--ink);
+  background: color-mix(in oklch, var(--rail-active) 45%, transparent);
+  color: var(--rail-ink);
 }
 
 .nav-item.active {
-  background: var(--accent-soft);
-  color: var(--accent);
+  background: var(--rail-active);
+  color: var(--rail-accent);
   font-weight: 600;
 }
 
 .rail-session {
   margin-top: auto;
   padding: 14px 16px 16px;
-  border-top: 1px solid var(--line);
+  background: var(--rail-bg-2);
+  color: var(--rail-ink);
+  border-top: 1px solid var(--rail-line);
 }
 
 .shell > main {
@@ -266,6 +297,17 @@ table,
 .page-head p {
   margin-top: 4px;
   color: var(--ink-soft);
+}
+
+/* mono accent eyebrow opening every page head: CATALOG · <ROUTE> */
+.page-head .page-head-eyebrow {
+  margin: 0 0 6px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--accent);
 }
 
 /* ---------------------------------------------------------------- session (rail footer) */
@@ -321,6 +363,39 @@ table,
   outline-offset: 2px;
 }
 
+/* session footer on the dark rail: input + role chips adapted for the petrol surface.
+   Scoped under .rail so the content-column role chips (Search suggestions) stay light. */
+.rail .session-user {
+  background: var(--rail-bg);
+  border-color: var(--rail-line);
+  color: var(--rail-ink);
+}
+
+.rail .session-user::placeholder {
+  color: var(--rail-ink-soft);
+}
+
+.rail .role-chip {
+  background: transparent;
+  border-color: var(--rail-line);
+  color: var(--rail-ink-soft);
+}
+
+.rail .role-chip:hover {
+  border-color: var(--rail-accent);
+  color: var(--rail-ink);
+}
+
+.rail .role-chip.on {
+  background: color-mix(in oklch, var(--rail-accent) 18%, transparent);
+  border-color: var(--rail-accent);
+  color: var(--rail-ink);
+}
+
+.rail .role-chip:focus-within {
+  outline-color: var(--rail-accent);
+}
+
 /* ---------------------------------------------------------------- panel */
 
 .panel {
@@ -329,6 +404,7 @@ table,
   border-radius: var(--radius-panel);
   padding: 16px 20px;
   margin-block: 16px;
+  box-shadow: var(--shadow);
 }
 
 .panel > h2:first-child {
@@ -347,6 +423,7 @@ table,
   border-radius: var(--radius-panel);
   background: var(--surface);
   margin-block: 16px;
+  box-shadow: var(--shadow);
 }
 
 .callout-glyph {
@@ -375,6 +452,38 @@ table,
 .callout--accent .callout-glyph,
 .callout--accent strong {
   color: var(--accent);
+}
+
+/* the one hero moment: Overview's start-here becomes a committed deep-petrol surface with light
+   text, code refs that read on dark, and an inverted (light-on-dark) primary button. */
+.callout--hero {
+  background: var(--accent-deep);
+  border-color: var(--accent-deep);
+  color: var(--chip-ink);
+}
+
+.callout--hero .callout-glyph,
+.callout--hero strong {
+  color: var(--chip-ink);
+}
+
+.callout--hero .mono {
+  color: var(--rail-accent);
+}
+
+.callout--hero .btn--primary {
+  background: var(--chip-ink);
+  border-color: var(--chip-ink);
+  color: var(--accent-deep);
+}
+
+.callout--hero .btn--primary:hover {
+  background: color-mix(in oklch, var(--chip-ink), var(--accent-deep) 10%);
+  border-color: color-mix(in oklch, var(--chip-ink), var(--accent-deep) 10%);
+}
+
+.callout--hero .btn--primary:focus-visible {
+  outline-color: var(--chip-ink);
 }
 
 .callout--ok {
@@ -449,30 +558,34 @@ table,
   color: var(--ink-soft);
 }
 
+/* strong states are SOLID chips: -solid fill, chip-ink text, 600 weight (base weight is 600).
+   Quiet facts (grain, as-of, ok) stay soft. Color never works alone: labels are always present. */
 .badge.pii,
-.badge.sensitivity {
-  background: var(--danger-soft);
+.badge.sensitivity,
+.badge.rejected {
+  background: var(--danger-solid);
   border-color: transparent;
-  color: var(--danger);
+  color: var(--chip-ink);
 }
 
 .badge.stale,
 .badge.held {
-  background: var(--warn-soft);
+  background: var(--warn-solid);
   border-color: transparent;
-  color: var(--warn);
+  color: var(--chip-ink);
 }
 
 .badge.proposal {
-  background: var(--proposal-soft);
+  background: var(--proposal-solid);
   border-color: transparent;
-  color: var(--proposal);
+  color: var(--chip-ink);
 }
 
-.badge.rejected {
-  background: var(--danger-soft);
+/* review queue's resolved-mock badge: a solid ok chip (distinct from the soft .badge.ok) */
+.badge.resolved {
+  background: var(--ok-solid);
   border-color: transparent;
-  color: var(--danger);
+  color: var(--chip-ink);
 }
 
 .badge.ok {
@@ -629,6 +742,7 @@ form {
   margin-block: 16px;
   padding: 0;
   list-style: none;
+  box-shadow: var(--shadow);
 }
 
 .row {
@@ -675,6 +789,9 @@ td.num {
   grid-template-columns: max-content 1fr;
   gap: 6px 16px;
   margin: 0;
+  padding: 10px 12px;
+  background: var(--surface-2);
+  border-radius: var(--radius);
 }
 
 .kv > div {
@@ -727,8 +844,9 @@ td.num {
 
 .flow-num {
   font-family: var(--font-mono);
-  font-size: 13px;
+  font-size: 20px;
   font-weight: 500;
+  line-height: 1.2;
   color: var(--accent);
   flex: none;
 }
@@ -843,7 +961,7 @@ section > h2:first-child {
   padding: 12px;
   border: 1px solid var(--line);
   border-radius: var(--radius);
-  background: var(--paper);
+  background: var(--surface-2);
 }
 
 .q-editor-field {

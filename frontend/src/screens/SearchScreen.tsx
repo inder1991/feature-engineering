@@ -90,7 +90,8 @@ export function SearchScreen() {
       {hits && hits.length > 0 && (
         <>
           <p className="micro-label tabular-nums" role="status">
-            {hits.length} {hits.length === 1 ? 'column' : 'columns'}
+            <span style={{ color: 'var(--accent)', fontWeight: 600 }}>{hits.length}</span>{' '}
+            {hits.length === 1 ? 'column' : 'columns'}
           </p>
           <ul className="rows">
             {hits.map(hit => (

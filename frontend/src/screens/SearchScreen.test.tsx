@@ -45,14 +45,15 @@ describe('search screen', () => {
     searchCatalog.mockResolvedValue([HIT, { ...HIT, object_ref: 'public.accounts.opened_at' }])
     render(<SearchScreen />)
     await search()
-    expect(await screen.findByText('2 columns')).toBeInTheDocument()
+    // The count number is wrapped in an accent span; assert the whole line via role=status.
+    expect(await screen.findByRole('status')).toHaveTextContent('2 columns')
   })
 
   it('uses the singular for a single result', async () => {
     searchCatalog.mockResolvedValue([HIT])
     render(<SearchScreen />)
     await search()
-    expect(await screen.findByText('1 column')).toBeInTheDocument()
+    expect(await screen.findByRole('status')).toHaveTextContent('1 column')
   })
 
   it('omits absent enrichment fields and includes them when present', async () => {

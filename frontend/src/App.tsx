@@ -155,6 +155,9 @@ export default function App() {
       </aside>
       <main>
         <header className="page-head">
+          <p className="page-head-eyebrow">
+            {route === 'overview' ? 'FEATUREGEN · START' : `CATALOG · ${page.label.toUpperCase()}`}
+          </p>
           <h1>{page.title}</h1>
           <p>{page.description}</p>
         </header>

@@ -135,6 +135,15 @@ export function UploadScreen({ onReviewQueue }: { onReviewQueue: (source: string
   )
 }
 
+// Semantic count: asserted/live reads in --ok; staled/quarantined in --warn, but only when
+// nonzero (a plain 0 stays quiet ink). Presentational only; the number and text are unchanged.
+function Count({ value, tone }: { value: number; tone: 'ok' | 'warn' }) {
+  const colored = tone === 'ok' || value > 0
+  return (
+    <span style={colored ? { color: `var(--${tone})`, fontWeight: 600 } : undefined}>{value}</span>
+  )
+}
+
 function CalloutGlyph({ children }: { children: ReactNode }) {
   return (
     <span className="callout-glyph" aria-hidden="true">
@@ -210,8 +219,9 @@ function IngestResultCallout({
           <strong>Ingested.</strong>
         </p>
         <p className="tabular-nums">
-          {result.asserted} facts asserted, {result.staled} staled, {result.quarantined}{' '}
-          quarantined
+          <Count value={result.asserted} tone="ok" /> facts asserted,{' '}
+          <Count value={result.staled} tone="warn" /> staled,{' '}
+          <Count value={result.quarantined} tone="warn" /> quarantined
         </p>
         {result.flagged && (
           <p style={{ color: 'var(--warn)' }}>

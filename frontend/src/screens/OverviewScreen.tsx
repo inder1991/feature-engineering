@@ -48,7 +48,7 @@ export function OverviewScreen({
       </ol>
 
       <h2>Start here</h2>
-      <div className="callout callout--accent">
+      <div className="callout callout--hero">
         <span className="callout-glyph" aria-hidden="true">
           <svg
             width="16"

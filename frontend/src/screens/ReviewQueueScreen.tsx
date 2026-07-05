@@ -425,7 +425,7 @@ function QueueBody(props: QueueBodyProps) {
               <li className="row q-item q-item--resolved" key={item.row_index}>
                 <div className="q-head">
                   <span className="badge rejected">row {item.row_index}</span>
-                  <span className="badge ok">resolved · mock</span>
+                  <span className="badge resolved">resolved · mock</span>
                   <span className="q-reason q-reason--muted">{item.reason}</span>
                 </div>
                 <p className="q-note">{res.note}</p>

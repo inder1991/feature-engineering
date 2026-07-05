@@ -7,38 +7,72 @@ scene forces a light, high-contrast, glare-friendly instrument. No dark mode in 
 
 ## Color
 
-OKLCH throughout. Strategy: **Restrained-plus** — warm-cool paper neutrals tinted toward the brand
-hue, one committed petrol-ink accent carrying identity (nav, actions, focus), and a disciplined
-semantic set for data states. No pure #000/#fff anywhere.
+OKLCH throughout. Strategy: **Committed** — the left rail is a deep petrol-ink surface that
+carries the identity (roughly a sixth of every screen), content sits on a distinctly colder gray
+ground with near-white panels lifted by soft shadows, and strong data states speak in solid
+chips. Amplified 2026-07-05 after the first cut read as a wireframe: value separation,
+saturation, and depth were all under-committed. No pure #000/#fff anywhere.
 
 ```css
 :root {
-  /* neutrals (tinted toward hue 200) */
-  --paper:        oklch(0.975 0.005 200);  /* app background */
-  --surface:      oklch(0.993 0.003 200);  /* panels, table rows */
-  --ink:          oklch(0.26 0.02 220);    /* primary text */
-  --ink-soft:     oklch(0.45 0.015 220);   /* secondary text */
-  --ink-faint:    oklch(0.60 0.012 220);   /* tertiary, placeholders */
-  --line:         oklch(0.885 0.008 200);  /* hairline borders */
-  --line-strong:  oklch(0.80 0.012 200);
+  /* content neutrals: the ground is VISIBLY colder than panels (value separation is the point) */
+  --ground:       oklch(0.955 0.009 215);  /* app background behind panels */
+  --paper:        var(--ground);           /* legacy alias */
+  --surface:      oklch(0.995 0.002 210);  /* panels, rows: near-white, floats on the ground */
+  --surface-2:    oklch(0.975 0.006 212);  /* inset zones inside panels (kv grids, editors) */
+  --ink:          oklch(0.25 0.025 225);
+  --ink-soft:     oklch(0.44 0.02 222);
+  --ink-faint:    oklch(0.58 0.015 220);
+  --line:         oklch(0.86 0.012 212);
+  --line-strong:  oklch(0.76 0.018 212);
+  --shadow:       0 1px 2px oklch(0.25 0.025 225 / 0.05), 0 6px 20px oklch(0.25 0.025 225 / 0.07);
 
-  /* brand accent: petrol ink */
-  --accent:       oklch(0.42 0.085 205);
-  --accent-hover: oklch(0.36 0.09 205);
-  --accent-soft:  oklch(0.945 0.02 202);   /* selected nav, soft chips */
-  --accent-line:  oklch(0.75 0.06 204);
+  /* the rail: a committed dark petrol surface (identity lives here) */
+  --rail-bg:      oklch(0.27 0.045 215);
+  --rail-bg-2:    oklch(0.23 0.04 215);    /* rail footer / inset */
+  --rail-ink:     oklch(0.93 0.01 210);    /* rail primary text */
+  --rail-ink-soft:oklch(0.72 0.02 212);    /* rail secondary text */
+  --rail-line:    oklch(0.36 0.04 215);
+  --rail-active:  oklch(0.36 0.06 212);    /* active nav fill */
+  --rail-accent:  oklch(0.78 0.09 200);    /* active nav text / logomark on dark */
 
-  /* semantic states (never color alone; always pair with label/glyph) */
-  --ok:           oklch(0.52 0.10 165);    /* fresh, ingested, registered */
-  --ok-soft:      oklch(0.955 0.025 165);
-  --warn:         oklch(0.55 0.11 75);     /* held, flagged, stale */
-  --warn-soft:    oklch(0.965 0.035 85);
-  --danger:       oklch(0.50 0.14 25);     /* rejected, quarantined, leakage */
-  --danger-soft:  oklch(0.965 0.02 25);
-  --proposal:     oklch(0.47 0.10 300);    /* AI suggestions, pre-confirm */
-  --proposal-soft:oklch(0.96 0.02 300);
+  /* accent: petrol, now with real presence */
+  --accent:       oklch(0.46 0.11 210);
+  --accent-hover: oklch(0.39 0.115 210);
+  --accent-soft:  oklch(0.93 0.03 208);
+  --accent-line:  oklch(0.70 0.08 208);
+  --accent-deep:  oklch(0.30 0.06 214);    /* committed hero surfaces (Overview start-here) */
+
+  /* semantic states: -solid fills carry chip text (small caps text needs fill L <= 0.55) */
+  --ok:           oklch(0.50 0.115 163);
+  --ok-solid:     oklch(0.52 0.115 163);
+  --ok-soft:      oklch(0.945 0.035 163);
+  --warn:         oklch(0.53 0.115 70);
+  --warn-solid:   oklch(0.52 0.115 70);
+  --warn-soft:    oklch(0.955 0.045 85);
+  --danger:       oklch(0.48 0.15 25);
+  --danger-solid: oklch(0.50 0.15 25);
+  --danger-soft:  oklch(0.955 0.025 25);
+  --proposal:     oklch(0.46 0.115 300);
+  --proposal-solid: oklch(0.47 0.115 300);
+  --proposal-soft:oklch(0.955 0.025 300);
+  --chip-ink:     oklch(0.985 0.005 210);  /* text on -solid chips */
 }
 ```
+
+Application rules that make it read committed, not decorated:
+
+- Panels, rows, and callouts sit on `--surface` with `--shadow`; the colder ground shows between
+  them. Depth comes from this one shadow, used consistently; hairlines remain.
+- Strong states (held, rejected, pii, stale, proposal, resolved-mock) are SOLID chips
+  (`*-solid` fill, `--chip-ink` text, 600 weight, 10-11px caps). Quiet facts (grain, as-of)
+  stay soft chips. Labels always present; color never works alone.
+- Numbers carry meaning: counts in ingest summaries and result lines take their semantic color
+  at 600 weight (ok for asserted/live, warn for staled/quarantined).
+- Every page-head opens with a mono 11px uppercase accent eyebrow: `CATALOG · <ROUTE>`.
+- One hero moment for the whole app, on Overview: the start-here callout becomes an
+  `--accent-deep` surface with light text and a light-on-dark primary button, and the loop's
+  step numbers are 20px Plex Mono in `--accent`. Nothing else in the content column goes dark.
 
 ## Typography
 
