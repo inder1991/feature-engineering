@@ -13,7 +13,11 @@ from __future__ import annotations
 from collections.abc import Iterable
 from dataclasses import dataclass
 
+from featuregen.overlay.upload.enrich_llm import audited_enrich_call
 from featuregen.overlay.upload.read_scope import allowed_sensitivities
+
+# A blank / unknown / list-stringified entity suggestion is not applied.
+_KNOWN_ENTITYISH = 40   # max plausible entity-name length
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,3 +83,22 @@ def cross_join_via_entity(conn, from_source: str, from_table: str, to_source: st
         if entity in to_keys:
             return EntityBridge(entity=entity, from_ref=from_ref, to_ref=to_keys[entity])
     return None
+
+
+def suggest_entity(conn, client, *, table: str, column: str, type: str, concept: str | None = None,
+                   actor=None) -> str | None:
+    """ADVISORY: ask the LLM which business entity an id-like column denotes (Customer, Account, ...),
+    from metadata only (name/type/concept — no data). A SUGGESTION for a human to confirm before it's
+    written as the column's entity — never auto-applied (a wrong entity mis-links catalogs). Returns
+    the suggested entity name, or None on failure / empty / implausible output."""
+    raw = audited_enrich_call(
+        conn, client, task="overlay.enrich.entity", prompt_id="overlay_entity_v1",
+        schema_id="overlay_entity",
+        catalog_metadata={"table": table, "column": column, "type": type, "concept": concept or ""},
+        out_key="entity",
+        instruction="Which business entity (e.g. Customer, Account) does this id-like column denote, "
+                    "if any? Reply with the entity name only, or empty if it denotes none.",
+        actor=actor)
+    if not raw or len(raw) > _KNOWN_ENTITYISH or "\n" in raw or raw.startswith("["):
+        return None
+    return raw

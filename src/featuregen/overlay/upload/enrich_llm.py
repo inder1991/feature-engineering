@@ -43,6 +43,8 @@ _SCHEMAS: dict[tuple[str, int], dict] = {
                                 "required": ["definition"]},
     ("overlay_domain", 1): {"type": "object", "additionalProperties": False,
                             "properties": {"domain": {"type": "string"}}, "required": ["domain"]},
+    ("overlay_entity", 1): {"type": "object", "additionalProperties": False,
+                            "properties": {"entity": {"type": "string"}}, "required": ["entity"]},
 }
 
 # Fallback service identity for when no real actor is threaded in. authenticated=False — a
