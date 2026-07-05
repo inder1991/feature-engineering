@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import { SessionBar } from './SessionBar'
+import { ReviewQueueScreen } from './screens/ReviewQueueScreen'
 import { SearchScreen } from './screens/SearchScreen'
 import { UploadScreen } from './screens/UploadScreen'
 
@@ -29,7 +30,7 @@ export default function App() {
       <main>
         {tab === 'Upload' && <UploadScreen onReviewQueue={openReview} />}
         {tab === 'Search' && <SearchScreen />}
-        {tab === 'Review queue' && <section><h2>Review queue</h2><p>{reviewSource}</p></section>}
+        {tab === 'Review queue' && <ReviewQueueScreen initialSource={reviewSource} />}
         {tab === 'Workbench' && <section><h2>Workbench</h2></section>}
       </main>
     </div>
