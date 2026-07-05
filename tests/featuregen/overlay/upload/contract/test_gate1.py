@@ -91,3 +91,16 @@ def test_confirm_gate1_validates_the_alternative_source(db):
         confirm_gate1(db, cs, chosen_source="alternative", chosen_option_id="anchor_feat", actor="ds1")
     assert confirm_gate1(db, cs, chosen_source="alternative", chosen_option_id="alt_feat",
                          actor="ds1") == "alt_feat"
+
+
+def test_intent_is_persisted_at_gate1(db):
+    # M6: the mandatory hypothesis is durably recorded when the flow reaches Gate #1
+    _bank(db)
+    intent = submit_intent(hypothesis="customers churn when their balance drops",
+                           definition="90-day average balance per customer", actor="ds1")
+    build_considered_set(db, intent, _client(), catalog_source="bank",
+                         target_ref="public.accounts.churned", now=NOW)
+    row = db.execute("SELECT hypothesis, definition, intake_mode FROM contract_intent "
+                     "WHERE intent_id = %s", (intent.intent_id,)).fetchone()
+    assert row == ("customers churn when their balance drops",
+                   "90-day average balance per customer", "definition")

@@ -1,10 +1,17 @@
 # Hypothesis-Driven Feature Contract — final design
 *(reconciles SP-2 intake + the assisted-definition addendum + the feature loop)*
 
-Date: 2026-07-05. Status: agreed direction (retire-and-salvage), pending build. Supersedes, for the
-go-forward product: `docs/architecture/2026-07-02-assisted-definition-design.md` (designed, never built)
-and the discovery half of the SP-2 intake layer (`intake/*`, dormant + unwired). Builds on the merged
+Date: 2026-07-05. Status: BUILT (Phases 1-5 merged) + review-fixed. Supersedes, for the go-forward
+product: `docs/architecture/2026-07-02-assisted-definition-design.md` (designed, never built) and the
+discovery half of the SP-2 intake layer (`intake/*`, dormant + unwired). Builds on the merged
 [feature loop](2026-07-05-feature-engineering-loop-design.md).
+
+**PERSISTENCE DECISION (2026-07-05, M6): RELATIONAL, not event-sourced.** The flow persists to plain
+Postgres tables (`contract_intent`, `contract_gate1_choice`, `contract`) + records every LLM call in
+`llm_call`. It does NOT emit SP-2 `feature_contract` lifecycle events / reuse `intake/{events,state}`. The
+audit a bank needs — who confirmed, the considered set they saw + why, every AI call — is captured
+relationally; event-replay parity was judged not worth the complexity. All "event-sourced / reuse
+intake/events" language below is superseded by this decision.
 
 ## The decision (why this exists)
 Three overlapping attempts at the *same idea* — hypothesis-driven, LLM-assisted, human-confirmed feature
@@ -34,7 +41,7 @@ redaction, the Human Gate #1 considered-set audit, and a versioned, event-source
 | Mandatory-hypothesis intake + optional anchor definition | **salvage** (build) |
 | Text redaction/egress on hypothesis + definition | **salvage** — reuse SP-2 redactor/`assert_llm_safe` |
 | Human Gate #1 considered-set audit (anchor + alternatives + choice + who + why) | **salvage** (build) |
-| Governed, versioned, event-sourced feature **contract** (draft→critique→refine→confirm) | **salvage** — reuse SP-2 contract events, re-ground in the catalog |
+| Governed, versioned, **relational** feature **contract** (draft→critique→refine→confirm) | **built** — plain tables (`contract`, `contract_gate1_choice`, `contract_intent`); audit via `llm_call` (M6, not event-sourced) |
 | Drift-linked contract freshness/impact | **salvage** — reuse `feature_freshness` / `features_affected_by` |
 
 ## Authority model (the spine — unchanged from SP-2 & the loop)
@@ -95,9 +102,18 @@ GOVERN   — drift-linked: contract freshness = its derives-from sources' waterm
 
 ## Reuses (already built)
 The feature loop + the deterministic gauntlet (= MCV), the entity layer + cross-catalog path, the audited
-LLM seam (`enrich_llm.audited_enrich_call`), `feature_freshness` / `features_affected_by`, and — from
-SP-2, re-grounded — the **redactor + egress guard** (`intake/redaction.py`) and the **feature-contract
-events/state** (`intake/{events,state,contract}.py`).
+LLM seam (`enrich_llm.audited_structured_call` / `audited_enrich_call`), `feature_freshness` /
+`features_affected_by`, and — from SP-2, re-grounded — the **redactor + egress guard**
+(`intake/redaction.py`). **NOT** the SP-2 `intake/{events,state,contract}` aggregate — persistence is
+relational (`contract_intent`, `contract_gate1_choice`, `contract`) per the M6 decision.
+
+## Open follow-ups (post-review)
+- **Join path in the contract** (spec's AUTHOR node): DEFERRED — bundled with the **full B3 refactor**
+  (carry `(catalog_source, object_ref)` through `FeatureIdea.derives_from`), since authoring a
+  cross-catalog join path needs the same catalog_source threading. Until then the contract carries
+  grain/as-of/aggregation/derives-from + the definition narrative; the join path is confirmed at Gate #1
+  but not persisted on the contract.
+- Other reduced `ContractDraft` fields (io_schema, unit, assumptions) — incremental, low priority.
 
 ## Build plan
 See `docs/superpowers/plans/2026-07-05-hypothesis-feature-contract-plan.md` — phased:
