@@ -18,8 +18,10 @@ from featuregen.overlay.upload.contract.review import validate_minimum
 from featuregen.overlay.upload.features import (
     FeatureFreshness,
     FeatureSpec,
+    consumers_of_feature,
     feature_freshness,
     features_affected_by,
+    get_feature,
     register_feature,
 )
 
@@ -119,3 +121,30 @@ def get_contract_detail(conn, contract_id: str) -> dict | None:
     return {"contract_id": row[0], "feature_id": row[1], "feature_name": row[2], "definition": row[3],
             "version": row[4], "verification": row[5], "intent_id": row[6],
             "created_at": row[7].isoformat()}
+
+
+def feature_detail(conn, feature_id: str) -> dict | None:
+    """Feature 360: everything about one feature in a single view — its definition + verification stamp
+    + lineage (from get_feature), the governed contract's narrative + join path, the HYPOTHESIS it was
+    born from (feature -> latest contract -> intent), and its consumers (which models use it). The
+    hypothesis is present only for features born through the hypothesis-driven flow (None otherwise)."""
+    feat = get_feature(conn, feature_id)
+    if feat is None:
+        return None
+    row = conn.execute(
+        "SELECT contract_id, definition, version, verification, intent_id, join_path FROM contract "
+        "WHERE feature_id = %s ORDER BY version DESC LIMIT 1", (feature_id,)).fetchone()
+    contract = None
+    hypothesis = None
+    if row is not None:
+        contract = {"contract_id": row[0], "definition": row[1], "version": row[2],
+                    "verification": row[3], "join_path": row[5]}
+        if row[4]:   # intent_id -> the hypothesis behind the feature
+            i = conn.execute(
+                "SELECT hypothesis, definition, intake_mode, target_ref FROM contract_intent "
+                "WHERE intent_id = %s", (row[4],)).fetchone()
+            if i is not None:
+                hypothesis = {"hypothesis": i[0], "definition": i[1], "intake_mode": i[2],
+                              "target_ref": i[3]}
+    return {**feat, "contract": contract, "hypothesis": hypothesis,
+            "consumers": consumers_of_feature(conn, feature_id)}

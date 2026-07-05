@@ -94,3 +94,21 @@ def test_confirm_rejects_a_leaky_draft_422(make_client):
              "derives_pairs": [["deposits", "public.accounts.balance"]], "join_path": []}
     res = client.post("/contract/confirm", json=leaky, headers=AUTH)
     assert res.status_code == 422
+
+
+def test_feature_360_shows_hypothesis_lineage_and_stamp(make_client):
+    client = make_client(_fake())
+    upload_csv(client, "deposits", DEPOSITS_CSV)
+    intent_id = _intent_id(client)
+    dr = client.post("/contract/draft", json={
+        "intent_id": intent_id, "chosen_source": "anchor",
+        "chosen_option_id": "avg_balance_90d", "why": "fit"}, headers=AUTH)
+    draft = dr.json()["draft"]
+    draft["intent_id"] = dr.json()["intent_id"]
+    fid = client.post("/contract/confirm", json=draft, headers=AUTH).json()["feature_id"]
+    # click the feature -> the 360 view carries the hypothesis it was born from
+    body = client.get(f"/features/{fid}", headers=AUTH).json()
+    assert body["hypothesis"]["hypothesis"].startswith("customers churn")
+    assert body["contract"]["definition"]              # the governed narrative
+    assert body["verification"] == "DESIGN-CHECKED"
+    assert body["derives_from"]                         # lineage present

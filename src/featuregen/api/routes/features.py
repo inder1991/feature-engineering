@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field
 
 from featuregen.api.deps import get_conn, get_identity
 from featuregen.contracts.envelopes import IdentityEnvelope
+from featuregen.overlay.upload.contract.govern import feature_detail
 from featuregen.overlay.upload.features import (
     FeatureFreshness,
     FeatureSpec,
@@ -16,7 +17,6 @@ from featuregen.overlay.upload.features import (
     feature_freshness,
     features_affected_by,
     features_for_consumer,
-    get_feature,
     list_features,
     register_consumer,
     register_feature,
@@ -91,7 +91,8 @@ def list_registered_features(conn: _Conn, identity: _Identity, limit: int = 50) 
 
 @router.get("/features/{feature_id}")
 def get_registered_feature(feature_id: str, conn: _Conn, identity: _Identity) -> dict:
-    feat = get_feature(conn, feature_id)
+    """Feature 360: definition + verification + lineage + the HYPOTHESIS it was born from + consumers."""
+    feat = feature_detail(conn, feature_id)
     if feat is None:
         raise HTTPException(status_code=404, detail=f"unknown feature {feature_id!r}")
     return feat
