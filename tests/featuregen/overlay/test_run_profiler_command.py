@@ -61,11 +61,24 @@ def _service_actor():
 
 
 def _setup_overlay(conn, adapter):
+    from datetime import timedelta
+
+    from featuregen.overlay.config import OverlayConfig, ProfilerRule, register_overlay_config
+
     register_overlay(HandlerRegistry())
     seed_authz_policy(conn)
     seed_overlay_authz(conn)
     register_command_authorizer(PolicyAuthorizer())
     register_catalog_adapter(adapter)
+    # SP-1.5 review #4: the profiler now FAILS CLOSED without a sealed OverlayConfig. Seal one whose
+    # server-side allowlist permits public/* for the fixture adapter (a deployment configures its own).
+    register_overlay_config(OverlayConfig(
+        ttl_default=timedelta(days=180), ttl_min=timedelta(days=30), ttl_max=timedelta(days=365),
+        ttl_jitter_fraction=0.0, renewal_grace=timedelta(days=14),
+        drift_scan_interval=timedelta(minutes=15), drift_freshness_sla=timedelta(minutes=60),
+        profiler_require_restricted_role=False,
+        profiler_rules=(ProfilerRule("fixture", "public", "*", True),),
+    ))
 
 
 def _run_profiler_cmd(ref):
@@ -310,3 +323,29 @@ def test_run_profiler_no_orphan_evidence_when_fact_created_concurrently(db, monk
     assert _evidence_count(db, grain_key) == 0
     # No NEW DRAFT was proposed for the already-occupied fact_key (only the seeded one remains).
     assert len(_proposed_for(db, grain_key)) == 1
+
+
+def test_profiler_requires_restricted_role_fails_closed(db):
+    # re-review #5: when profiler_require_restricted_role is set but no restricted scan role exists
+    # (deferred), the profiler must FAIL CLOSED rather than scan through the command connection.
+    from datetime import timedelta
+
+    from featuregen.overlay.config import OverlayConfig, ProfilerRule, register_overlay_config
+
+    db.execute("CREATE TABLE prof_rr (id integer)")
+    ref = CatalogObjectRef(
+        catalog_source="pg:core", object_kind="table", schema="public", table="prof_rr"
+    )
+    adapter = StubCatalog(objects=catalog_columns(ref, [("id", "integer")]),
+                          owners={("public", "prof_rr"): "user:owner-a"})
+    _setup_overlay(db, adapter)
+    register_overlay_config(OverlayConfig(
+        ttl_default=timedelta(days=180), ttl_min=timedelta(days=30), ttl_max=timedelta(days=365),
+        ttl_jitter_fraction=0.0, renewal_grace=timedelta(days=14),
+        drift_scan_interval=timedelta(minutes=15), drift_freshness_sla=timedelta(minutes=60),
+        profiler_require_restricted_role=True,  # required, but not provisioned -> deny
+        profiler_rules=(ProfilerRule("fixture", "public", "*", True),),
+    ))
+    result = execute_command(db, _run_profiler_cmd(ref))
+    assert result.accepted is False
+    assert "restricted" in (result.denied_reason or "").lower()

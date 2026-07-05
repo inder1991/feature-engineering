@@ -15,11 +15,13 @@ from datetime import UTC, datetime
 from featuregen.contracts import Command, CommandResult, DbConn
 from featuregen.overlay._lifecycle import (
     _AWAITING_CONFIRMATION,
-    _DEFAULT_TTL,
     _cas_target,
     _close_fact_tasks,
     _deny_audited,
     _latest_proposed,
+    referent_gap,
+    resolve_ttl,
+    within_renewal_grace,
 )
 from featuregen.overlay._types import Confirmer, FactType, Role
 from featuregen.overlay.authority import (
@@ -28,11 +30,13 @@ from featuregen.overlay.authority import (
     resolve_authority,
 )
 from featuregen.overlay.catalog import current_catalog_adapter
+from featuregen.overlay.config import current_overlay_config
 from featuregen.overlay.expiry import schedule_expiry
 from featuregen.overlay.facts import FactValidationError, validate_fact_value
 from featuregen.overlay.identity import (
     display_object_ref,
     fact_key,
+    join_write_error,
     proposal_fingerprint,
 )
 from featuregen.overlay.join_confirmation import _confirm_approved_join
@@ -60,7 +64,11 @@ def confirm_fact(conn: DbConn, cmd: Command) -> CommandResult:
     if not stream:
         return CommandResult(accepted=False, aggregate_id=key, denied_reason="fact does not exist")
     state = fold_overlay_state(stream)
-    if state.status not in _AWAITING_CONFIRMATION:
+    # A VERIFIED fact inside its pre-expiry renewal grace window IS re-confirmable (SP-1.5 Task 6) —
+    # this is what prevents the recurring expiry outage. Authority + four-eyes + CAS below are
+    # UNCHANGED, so renewal preserves every guard (F8: a self-entered fact still needs a 2nd signer).
+    renewing = within_renewal_grace(state, datetime.now(UTC))
+    if state.status not in _AWAITING_CONFIRMATION and not renewing:
         return CommandResult(
             accepted=False,
             aggregate_id=key,
@@ -77,6 +85,19 @@ def confirm_fact(conn: DbConn, cmd: Command) -> CommandResult:
     # PARTIALLY_CONFIRMED -> VERIFIED flow (§6.4). Same-owner-both-sides has
     # `authority.dual` False and falls through to the single path below.
     if fact_type == "approved_join" and authority.dual:
+        # SP-1.5 review fix: a still-VERIFIED dual join must NOT renew in place. The two-step join
+        # confirm would regress VERIFIED -> PARTIALLY_CONFIRMED for a live fact, opening a
+        # drift-laundering + expiry-skip window. Dual joins re-verify via the normal expiry/reverify
+        # flow (from a non-live STALE/REVERIFY state), where the two-step is safe.
+        if renewing and state.status == "VERIFIED":
+            return CommandResult(
+                accepted=False,
+                aggregate_id=key,
+                denied_reason=(
+                    "dual-owner approved_join cannot renew in place; it re-verifies via the "
+                    "expiry/reverify flow"
+                ),
+            )
         return _confirm_approved_join(conn, cmd, key, stream, state, authority)
     if not _actor_is_authority(authority, cmd.actor):
         return _deny_audited(
@@ -93,11 +114,12 @@ def confirm_fact(conn: DbConn, cmd: Command) -> CommandResult:
     # re-affirms the LAST VERIFIED value (state.prior_value) — defaulting to the cycle-1 proposed
     # value would silently revert a prior human correction. A fresh DRAFT has no prior value,
     # so it defaults to the proposed value.
-    default_value = (
-        state.prior_value
-        if state.status in ("REVERIFY", "STALE")
-        else proposed.payload["proposed_value"]
-    )
+    if state.status == "VERIFIED":
+        default_value = state.value  # renewal within grace: re-affirm the CURRENT confirmed value
+    elif state.status in ("REVERIFY", "STALE"):
+        default_value = state.prior_value
+    else:
+        default_value = proposed.payload["proposed_value"]
     value = args.get("value", default_value)
     try:
         validate_fact_value(fact_type, value, use_case=use_case)
@@ -105,6 +127,25 @@ def confirm_fact(conn: DbConn, cmd: Command) -> CommandResult:
         return CommandResult(
             accepted=False, aggregate_id=key, denied_reason=f"invalid confirmed value: {exc}"
         )
+    # SP-1.5 review fix #1: a confirmer may OVERRIDE the value (args["value"]), so the FINAL value —
+    # not just the proposal — must pass the same F4 + ref/value-consistency gate propose_fact and
+    # enter_fact apply. Without this a legitimate owner of the ref's tables could VERIFY a
+    # cross-catalog or different-tables approved_join value under the ref's fact_key.
+    join_err = join_write_error(ref, fact_type, value, use_case)
+    if join_err is not None:
+        return _deny_audited(conn, cmd, key, join_err)
+    # SP-1.5 Task 7 (+ review #5b): re-confirming a drift-STALEd OR expiry-REVERIFY fact must not
+    # re-affirm a value whose object/column the catalog no longer has. Config-gated: full SP-1.5
+    # hardening is active only when a deployment has sealed an OverlayConfig.
+    if state.status in ("STALE", "REVERIFY"):
+        try:
+            current_overlay_config()
+        except RuntimeError:
+            pass  # no OverlayConfig sealed -> hardening off (backward-compat)
+        else:
+            gap = referent_gap(adapter, ref, fact_type, value)
+            if gap is not None:
+                return _deny_audited(conn, cmd, key, f"stale re-confirm blocked: {gap}")
     confirmers: list[Confirmer]
     if fact_type == "approved_join":
         # same-owner-both-sides reaches the single path (Authority.dual is False); record BOTH side
@@ -116,7 +157,7 @@ def confirm_fact(conn: DbConn, cmd: Command) -> CommandResult:
     else:
         role: Role = "compliance" if fact_type == "policy_tag" else "data_owner"
         confirmers = [{"subject": cmd.actor.subject, "role": role}]
-    expires_at = datetime.now(UTC) + _DEFAULT_TTL
+    expires_at = datetime.now(UTC) + resolve_ttl(fact_type, key)
     confirmed = append_overlay_event(
         conn,
         fact_key=key,
@@ -225,6 +266,9 @@ def enter_fact(conn: DbConn, cmd: Command) -> CommandResult:
         return CommandResult(
             accepted=False, aggregate_id="", denied_reason=f"invalid fact value: {exc}"
         )
+    join_err = join_write_error(ref, fact_type, proposed_value, use_case)  # SP-1.5 F4 + consistency
+    if join_err is not None:
+        return CommandResult(accepted=False, aggregate_id="", denied_reason=join_err)
     key = fact_key(ref, fact_type, use_case)
     authority = resolve_authority(conn, adapter, ref, fact_type)
     # Direct self-confirm is restricted to OWNER-KNOWN facts (§3.4): there is no platform-admin
@@ -283,7 +327,7 @@ def enter_fact(conn: DbConn, cmd: Command) -> CommandResult:
     else:
         role: Role = "compliance" if fact_type == "policy_tag" else "data_owner"
         confirmers = [{"subject": cmd.actor.subject, "role": role}]
-    expires_at = datetime.now(UTC) + _DEFAULT_TTL
+    expires_at = datetime.now(UTC) + resolve_ttl(fact_type, key)
     confirmed = append_overlay_event(
         conn,
         fact_key=key,

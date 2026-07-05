@@ -14,6 +14,7 @@ a counted, logged error and NEVER stalls the tick.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import signal
@@ -27,7 +28,9 @@ from psycopg.rows import dict_row
 
 from featuregen.contracts import Command, Projection
 from featuregen.overlay.catalog import current_catalog_adapter
-from featuregen.overlay.expiry import fire_due_overlay_expiries
+from featuregen.overlay.catalog_changes import detect_catalog_changes, drift_watermark
+from featuregen.overlay.config import current_overlay_config
+from featuregen.overlay.expiry import fire_due_overlay_expiries, fire_due_overlay_renewals
 from featuregen.projections.runner import projection_lag, run_projection
 from featuregen.runtime.dispatch import process_one, recover_stuck
 from featuregen.runtime.external_commands import (
@@ -233,6 +236,73 @@ def _advance_overlay_expiries(conn: psycopg.Connection, *, now: datetime) -> int
     return fire_due_overlay_expiries(conn, now=now)
 
 
+def _advance_overlay_renewals(conn: psycopg.Connection, *, now: datetime) -> int:
+    """Pre-expiry renewal poller (SP-1.5 Task 6), skipping-LOUD (counter, NOT silent) when no catalog
+    adapter or OverlayConfig is wired, and serialized across workers by a global advisory lock so two
+    pollers can't both open a task for the same fact (review #12/#13)."""
+    try:
+        current_catalog_adapter()
+    except RuntimeError:
+        counters.incr("overlay.renewal.skipped_no_adapter")
+        return 0
+    try:
+        current_overlay_config()
+    except RuntimeError:
+        counters.incr("overlay.renewal.skipped_no_config")
+        return 0
+    lock_key = int.from_bytes(hashlib.sha256(b"overlay_renewal").digest()[:8], "big", signed=True)
+    if not conn.execute("SELECT pg_try_advisory_xact_lock(%s)", (lock_key,)).fetchone()[0]:
+        return 0  # another worker holds the renewal poller lock this tick
+    return fire_due_overlay_renewals(conn, now=now)
+
+
+def _drift_actor():
+    """Fail-safe (unattested, never forged) service principal for the drift scanner's STALE events +
+    re-verify task opens — mirrors _control_actor / the overlay-expiry poller."""
+    from featuregen.identity.build import build_service_identity
+
+    return build_service_identity(
+        subject="service:overlay-drift", role_claims=("overlay",), attestation="drift-scanner"
+    )
+
+
+def _run_drift_scan(conn: psycopg.Connection, *, now: datetime) -> int:
+    """Cadence-gated, multi-worker-safe catalog-drift scan (SP-1.5 Task 4). SKIPS (not errors) when
+    no catalog adapter or OverlayConfig is wired. `pg_try_advisory_xact_lock` ensures ONE worker
+    scans a catalog at a time; the scan runs only when the drift watermark is older than
+    `drift_scan_interval` (or absent), so it is NOT run every ~1s tick. detect_catalog_changes
+    advances the snapshot + watermark atomically (crash-safe)."""
+    try:
+        adapter = current_catalog_adapter()
+    except RuntimeError:
+        counters.incr("overlay.drift.skipped_no_adapter")
+        return 0
+    try:
+        config = current_overlay_config()
+    except RuntimeError:
+        counters.incr("overlay.drift.skipped_no_config")
+        return 0
+    csource = adapter.catalog_source
+    lock_key = int.from_bytes(
+        hashlib.sha256(f"overlay_drift:{csource}".encode()).digest()[:8], "big", signed=True
+    )
+    if not conn.execute("SELECT pg_try_advisory_xact_lock(%s)", (lock_key,)).fetchone()[0]:
+        return 0  # another worker is scanning this catalog this tick
+    wm = drift_watermark(conn, csource)
+    if wm is not None and (now - wm) < config.drift_scan_interval:
+        return 0  # not due yet (slow cadence, not every tick)
+    # BLOCKER (deep-dive #1): drift finds dependents via the overlay projection's dependency index,
+    # which LAGS the event stream (the drift stage runs before the projection stage; the projection
+    # can also halt fail-closed on poison). Scanning while the projection is behind would find zero
+    # dependents for a just-confirmed fact, STALE nothing, and still advance the snapshot -> the drop
+    # is consumed and never re-detected (laundered for the full TTL). Skip until the overlay
+    # projection has applied every appended event; reads fail closed meanwhile via the aging watermark.
+    if projection_lag(conn, "overlay") > 0:
+        counters.incr("overlay.drift.skipped_projection_lag")
+        return 0
+    return len(detect_catalog_changes(conn, adapter, actor=_drift_actor(), now=now))
+
+
 def _stage(name: str) -> Callable:
     """Wrap a stage callable so a fault increments a counted, logged error and returns a fallback
     instead of propagating — one failing stage never stalls the tick (the poison guard already
@@ -366,6 +436,16 @@ def run_worker_once(
         lambda: _tx(conn, lambda: _advance_overlay_expiries(conn, now=now)), 0
     )
 
+    # Pre-expiry renewal (SP-1.5 Task 6): opens re-verify tasks for facts approaching expiry so an
+    # owner re-confirms before the outage window. Its own transaction; skips cleanly with no adapter.
+    _stage("overlay_renewal")(
+        lambda: _tx(conn, lambda: _advance_overlay_renewals(conn, now=now)), 0
+    )
+
+    # Catalog-drift scan (SP-1.5 Task 4): its own transaction (advisory-locked, cadence-gated,
+    # snapshot+watermark advanced atomically). Skips cleanly when no adapter/config is wired.
+    _stage("drift")(lambda: _tx(conn, lambda: _run_drift_scan(conn, now=now)), 0)
+
     def _advance_projections() -> int:
         advanced = 0
         for projection in projections:
@@ -492,6 +572,7 @@ def run_forever(
 
     `relay_routes` overrides the env-file route map (SP-0.5 r2 review #5). Cost-ceiling config is
     validated up front so a typo fails the worker at boot, not mid-finalize (review #3)."""
+    from featuregen.overlay.config import overlay_config_from_env, register_overlay_config
     from featuregen.runtime.cost_budget import current_cost_ceilings
 
     owner = owner or f"worker-{os.getpid()}"
@@ -502,6 +583,12 @@ def run_forever(
     conn = psycopg.connect(dsn, autocommit=True)
     try:
         registry, projections = compose(conn)
+        # SP-1.5 (review — reachability): seal the OverlayConfig from env at boot so the drift,
+        # renewal, referent-validation and profiler guards are ACTIVE in production, not silently
+        # off. Fails fast on malformed config (OverlayConfigError), like the cost ceilings below.
+        # (The read/API process must likewise seal it via overlay_config_from_env() for resolve_fact's
+        # drift-freshness guard; drift-STALEing itself is driven here in the worker.)
+        register_overlay_config(overlay_config_from_env())
         publish = _relay_publisher_from_env(relay_routes)  # production route policy (SP-0.5 r2)
         current_cost_ceilings()  # fail-fast on malformed cost-ceiling config (review #3)
         log("worker.start", dsn=_safe_dsn(dsn), owner=owner, interval=interval)

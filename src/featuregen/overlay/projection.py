@@ -7,39 +7,17 @@ from psycopg.types.json import Jsonb
 
 from featuregen.contracts import DbConn, EventEnvelope
 from featuregen.overlay import facts
+from featuregen.overlay.dependencies import fact_dependencies
 
 
-def _table_obj(ref: Mapping) -> str:
-    """Dotted `schema.table` for a structured CatalogObjectRef dict (no column)."""
-    return ".".join(p for p in [ref["schema"], ref["table"]] if p)
-
-
-def _dependencies(object_ref: str, fact_type: str, value: Mapping) -> set[str]:
-    """Object refs a fact's value references (§8 general dependency index). For the four
-    object-keyed facts: the keyed object plus grain.columns / availability_time.column /
-    scd valid_from+valid_to. For an approved_join the keyed `object_ref` is the synthetic
-    "from -> to" relation display string, which must NEVER be parsed; instead read the STRUCTURED
-    value — `value['from_ref']`, `value['to_ref']`, and each `value['column_pairs']`
-    pair — and index BOTH tables and ALL paired columns on both sides. A drop/rename/type-change to
-    ANY of these stales the dependent fact."""
-    if fact_type == facts.APPROVED_JOIN:
-        from_obj = _table_obj(value["from_ref"])
-        to_obj = _table_obj(value["to_ref"])
-        deps: set[str] = {from_obj, to_obj}
-        for pair in value.get("column_pairs", []):
-            deps.add(f"{from_obj}.{pair['from_col']}")
-            deps.add(f"{to_obj}.{pair['to_col']}")
-        return deps
-    deps = {object_ref}
-    if fact_type == facts.GRAIN:
-        deps |= {f"{object_ref}.{c}" for c in value.get("columns", [])}
-    elif fact_type == facts.AVAILABILITY_TIME:
-        deps.add(f"{object_ref}.{value['column']}")
-    elif fact_type == facts.SCD_EFFECTIVE_DATING:
-        deps.add(f"{object_ref}.{value['valid_from']}")
-        if value.get("valid_to"):
-            deps.add(f"{object_ref}.{value['valid_to']}")
-    return deps
+def _catalog_source(payload: Mapping) -> str:
+    """The catalog_source of a fact's referenced object(s), read from the STRUCTURED
+    catalog_object_ref on the event (SP-1.5 Task 2). Single ref -> its catalog_source; an
+    approved_join -> from_ref's — SP-1.5 disallows cross-catalog joins (F4), so from == to source."""
+    cor = payload["catalog_object_ref"]
+    if "from_ref" in cor:
+        return cor["from_ref"]["catalog_source"]
+    return cor["catalog_source"]
 
 
 class OverlayProjection:
@@ -68,14 +46,15 @@ class OverlayProjection:
                 """
                 INSERT INTO overlay_proposal
                     (fact_key, status, proposed_value, proposal_fingerprint, draft_event_id,
-                     object_ref, fact_type, use_case, evidence_ref, updated_seq)
-                VALUES (%s, 'DRAFT', %s, %s, %s, %s, %s, %s, %s, %s)
+                     object_ref, catalog_source, fact_type, use_case, evidence_ref, updated_seq)
+                VALUES (%s, 'DRAFT', %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (fact_key) DO UPDATE SET
                     status = 'DRAFT',
                     proposed_value = EXCLUDED.proposed_value,
                     proposal_fingerprint = EXCLUDED.proposal_fingerprint,
                     draft_event_id = EXCLUDED.draft_event_id,
                     object_ref = EXCLUDED.object_ref,
+                    catalog_source = EXCLUDED.catalog_source,
                     fact_type = EXCLUDED.fact_type,
                     use_case = EXCLUDED.use_case,
                     evidence_ref = EXCLUDED.evidence_ref,
@@ -87,23 +66,25 @@ class OverlayProjection:
                 """,
                 (
                     fk, Jsonb(payload["proposed_value"]), payload["proposal_fingerprint"],
-                    event.event_id, payload["object_ref"], payload["fact_type"],
-                    payload.get("use_case"), payload.get("evidence_ref"), seq,
+                    event.event_id, payload["object_ref"], _catalog_source(payload),
+                    payload["fact_type"], payload.get("use_case"), payload.get("evidence_ref"), seq,
                 ),
             )
             # Refresh the dependency set on every (re)proposal: DELETE the fact's existing
             # rows first so a re-proposal after REJECTED — which may reference DIFFERENT columns —
             # never leaves stale dependency rows behind. Then insert the fresh set.
+            csource = _catalog_source(payload)
             conn.execute(
                 "DELETE FROM overlay_fact_dependency WHERE fact_key = %s", (fk,)
             )
-            for ref_object in _dependencies(
-                payload["object_ref"], payload["fact_type"], payload["proposed_value"]
+            for dep_source, ref_object in fact_dependencies(
+                payload["object_ref"], payload["fact_type"], payload["proposed_value"], csource
             ):
                 conn.execute(
-                    "INSERT INTO overlay_fact_dependency (fact_key, ref_object) "
-                    "VALUES (%s, %s) ON CONFLICT (fact_key, ref_object) DO NOTHING",
-                    (fk, ref_object),
+                    "INSERT INTO overlay_fact_dependency (fact_key, catalog_source, ref_object) "
+                    "VALUES (%s, %s, %s) ON CONFLICT (fact_key, catalog_source, ref_object) "
+                    "DO NOTHING",
+                    (fk, dep_source, ref_object),
                 )
 
         elif event.type == facts.OVERLAY_FACT_PARTIALLY_CONFIRMED:
@@ -122,9 +103,10 @@ class OverlayProjection:
             conn.execute(
                 """
                 INSERT INTO overlay_fact_state
-                    (fact_key, object_ref, fact_type, use_case, status, value, confirmers,
-                     confirmed_at, expires_at, prior_value, confirmed_event_id, updated_seq)
-                SELECT %s, prop.object_ref, prop.fact_type, prop.use_case,
+                    (fact_key, object_ref, catalog_source, fact_type, use_case, status, value,
+                     confirmers, confirmed_at, expires_at, prior_value, confirmed_event_id,
+                     updated_seq)
+                SELECT %s, prop.object_ref, prop.catalog_source, prop.fact_type, prop.use_case,
                        'VERIFIED', %s, %s, %s, %s, NULL, %s, %s
                 FROM overlay_proposal prop WHERE prop.fact_key = %s
                 ON CONFLICT (fact_key) DO UPDATE SET
@@ -155,20 +137,23 @@ class OverlayProjection:
             # PROPOSED set) and self-heals re-verify (EXPIRED/STALED carry no new PROPOSED).
             with conn.cursor(row_factory=dict_row) as cur:
                 cur.execute(
-                    "SELECT object_ref, fact_type FROM overlay_proposal WHERE fact_key = %s", (fk,)
+                    "SELECT object_ref, catalog_source, fact_type FROM overlay_proposal "
+                    "WHERE fact_key = %s",
+                    (fk,),
                 )
                 prop = cur.fetchone()
             if prop is not None:
                 conn.execute(
                     "DELETE FROM overlay_fact_dependency WHERE fact_key = %s", (fk,)
                 )
-                for ref_object in _dependencies(
-                    prop["object_ref"], prop["fact_type"], payload["value"]
+                for dep_source, ref_object in fact_dependencies(
+                    prop["object_ref"], prop["fact_type"], payload["value"], prop["catalog_source"]
                 ):
                     conn.execute(
-                        "INSERT INTO overlay_fact_dependency (fact_key, ref_object) "
-                        "VALUES (%s, %s) ON CONFLICT (fact_key, ref_object) DO NOTHING",
-                        (fk, ref_object),
+                        "INSERT INTO overlay_fact_dependency (fact_key, catalog_source, ref_object) "
+                        "VALUES (%s, %s, %s) ON CONFLICT (fact_key, catalog_source, ref_object) "
+                        "DO NOTHING",
+                        (fk, dep_source, ref_object),
                     )
 
         elif event.type == facts.OVERLAY_FACT_EXPIRED:
@@ -232,11 +217,14 @@ def read_proposal(conn: DbConn, fact_key: str) -> dict | None:
         return cur.fetchone()
 
 
-def dependents_of(conn: DbConn, object_ref: str) -> list[str]:
-    """fact_keys whose value references `object_ref` (reverse-reference index, §8)."""
+def dependents_of(conn: DbConn, catalog_source: str, object_ref: str) -> list[str]:
+    """fact_keys whose value references `(catalog_source, object_ref)` (reverse-reference index,
+    §8). Source-qualified (SP-1.5 Task 2): drift in one catalog never stales another catalog's
+    facts even when their objects share a `schema.table.column` name."""
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT fact_key FROM overlay_fact_dependency WHERE ref_object = %s ORDER BY fact_key",
-            (object_ref,),
+            "SELECT fact_key FROM overlay_fact_dependency "
+            "WHERE catalog_source = %s AND ref_object = %s ORDER BY fact_key",
+            (catalog_source, object_ref),
         )
         return [row[0] for row in cur.fetchall()]

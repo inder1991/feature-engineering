@@ -9,13 +9,15 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import UTC
+from datetime import UTC, datetime
 from typing import Literal
 
 from psycopg.rows import dict_row
 
 from featuregen.overlay._types import FactStatus, FactType
 from featuregen.overlay.catalog import CatalogAdapter
+from featuregen.overlay.catalog_changes import drift_head_seq, drift_watermark
+from featuregen.overlay.config import current_overlay_config
 from featuregen.overlay.facts import FactValidationError, validate_fact_value
 from featuregen.overlay.identity import (
     ApprovedJoinRef,
@@ -24,9 +26,25 @@ from featuregen.overlay.identity import (
     fact_key,
 )
 from featuregen.overlay.projection import read_proposal
+from featuregen.projections.runner import _checkpoint_seq
+from featuregen.runtime.observability import counters
 
 _REASON_MISSING = "no_confirmed_fact"
 _REASON_CATALOG_INVALID = "catalog_value_invalid"
+_REASON_EXPIRED = "expired_pending_reverify"  # SP-1.5 Task 3: read-time time-expiry guard
+_REASON_DRIFT_STALE = "drift_stale_pending_scan"  # SP-1.5 Task 5: read-time drift-freshness guard
+_REASON_DRIFT_LAGGING = "drift_projection_lagging"  # SP-1.5 review #2: projection behind the drift scan
+_REASON_NO_FRESHNESS = "no_freshness_proof"  # SP-1.5 Task 5 F2: VERIFIED fact with no deps (corrupt)
+
+
+def _dependent_sources(conn, key: str) -> set[str]:
+    """The DISTINCT catalog_sources a fact's referents span (SP-1.5 Task 5 F1). A cross-catalog
+    join would span two — the drift guard must be fresh in EVERY one, not a single column."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT DISTINCT catalog_source FROM overlay_fact_dependency WHERE fact_key = %s", (key,)
+        )
+        return {r[0] for r in cur.fetchall()}
 _REASON_BY_STATUS = {
     "DRAFT": "draft_unconfirmed",
     "PARTIALLY_CONFIRMED": "partial_confirmation_pending",
@@ -140,9 +158,12 @@ def _overlay_verified(row, obj, fact_type: FactType, use_case) -> ResolvedFact:
 
 
 def _overlay_blocked(
-    status: FactStatus, reason, obj, fact_type: FactType, use_case, prior_value=None
+    status: FactStatus, reason, obj, fact_type: FactType, use_case, prior_value=None,
+    *, expires_at=None, provenance=None,
 ) -> ResolvedFact:
-    # Any non-VERIFIED overlay state (in-flight proposal or blocked fact state) -> no value.
+    # Any non-VERIFIED overlay state (in-flight proposal or blocked fact state) -> no value. A
+    # blocked result carries expires_at + provenance {confirmed_event_id, catalog_source} when known
+    # (SP-1.5 Task 3) so SP-3 / operators can distinguish expired / drift-stale / reverify / missing.
     return ResolvedFact(
         value=None,
         status=status,
@@ -150,10 +171,10 @@ def _overlay_blocked(
         catalog_object=obj,
         fact_type=fact_type,
         use_case=use_case,
-        provenance=None,
+        provenance=provenance,
         confirmed_by=(),
         confirmed_at=None,
-        expires_at=None,
+        expires_at=expires_at,
         reason_if_missing=reason,
         prior_value=prior_value,
     )
@@ -165,7 +186,12 @@ def resolve_fact(
     ref: CatalogObjectRef | ApprovedJoinRef,
     fact_type: FactType,
     use_case: str | None = None,
+    *,
+    now: datetime | None = None,
 ) -> ResolvedFact:
+    # `now` is an optional injected clock (SP-1.5 Task 3) — deterministic tests + one clock basis
+    # shared with the pollers. Compare expiry in PYTHON (not SQL) to avoid a second clock source.
+    now = now or datetime.now(UTC)
     key = fact_key(ref, fact_type, use_case)
     obj = display_object_ref(ref)
 
@@ -191,7 +217,7 @@ def resolve_fact(
         cur.execute(
             """
             SELECT status, value, confirmers, confirmed_at, expires_at,
-                   prior_value, confirmed_event_id
+                   prior_value, confirmed_event_id, catalog_source
             FROM overlay_fact_state
             WHERE fact_key = %s
             """,
@@ -216,6 +242,62 @@ def resolve_fact(
     # VERIFIED overlay entry -> usable value (the only servable overlay status).
     status = row["status"]
     if status == "VERIFIED":
+        # Read-time TIME-EXPIRY guard (SP-1.5 Task 3): between expires_at passing and the async
+        # expiry poller STALEing the fact, do NOT serve a past-expiry value — fail closed to
+        # REVERIFY, surfacing the current value as read-only prior_value + the expiry context.
+        exp = row["expires_at"]
+        if exp is not None and exp <= now:
+            return _overlay_blocked(
+                "REVERIFY", _REASON_EXPIRED, obj, fact_type, use_case,
+                prior_value=row["value"], expires_at=_iso(exp),
+                provenance={
+                    "confirmed_event_id": row["confirmed_event_id"],
+                    "catalog_source": row["catalog_source"],
+                },
+            )
+        # Read-time DRIFT-FRESHNESS guard (SP-1.5 Task 5): the fact's referents must be attested
+        # fresh in EVERY catalog they span (a cross-catalog join spans two, F1). ACTIVE only when a
+        # deployment has sealed an OverlayConfig (the drift subsystem's opt-in); off otherwise for
+        # backward-compat. Fail closed if any dependent source's watermark is missing/stale, or —
+        # projection corruption — a VERIFIED fact has NO dependency rows at all (F2).
+        try:
+            config = current_overlay_config()
+        except RuntimeError:
+            # Skip-LOUD (review #11): a read-serving process that never sealed an OverlayConfig runs
+            # with the drift-freshness guard OFF — surface it via a counter rather than silently.
+            counters.incr("overlay.resolve.drift_guard_skipped_no_config")
+            config = None
+        if config is not None:
+            prov = {
+                "confirmed_event_id": row["confirmed_event_id"],
+                "catalog_source": row["catalog_source"],
+            }
+            sources = _dependent_sources(conn, key)
+            if not sources:
+                return _overlay_blocked(
+                    "REVERIFY", _REASON_NO_FRESHNESS, obj, fact_type, use_case,
+                    prior_value=row["value"], expires_at=_iso(exp), provenance=prov,
+                )
+            overlay_checkpoint = _checkpoint_seq(conn, "overlay")
+            for src in sorted(sources):
+                wm = drift_watermark(conn, src)
+                if wm is None or (now - wm) > config.drift_freshness_sla:
+                    return _overlay_blocked(
+                        "REVERIFY", _REASON_DRIFT_STALE, obj, fact_type, use_case,
+                        prior_value=row["value"], expires_at=_iso(exp), provenance={**prov, "stale_source": src},
+                    )
+                # Projection-lag guard (review #2): the drift scan advanced to head_seq in ONE
+                # transaction (STALED events + watermark), but the overlay projection applies those
+                # STALEs in a SEPARATE, lagging stage. Until the checkpoint reaches head_seq, a
+                # just-drifted fact is still VERIFIED in the read model with a fresh watermark — so
+                # fail closed rather than serve it.
+                head = drift_head_seq(conn, src)
+                if head is not None and head > overlay_checkpoint:
+                    return _overlay_blocked(
+                        "REVERIFY", _REASON_DRIFT_LAGGING, obj, fact_type, use_case,
+                        prior_value=row["value"], expires_at=_iso(exp),
+                        provenance={**prov, "lagging_source": src},
+                    )
         return _overlay_verified(row, obj, fact_type, use_case)
 
     # Non-VERIFIED overlay entry -> blocked (fail-closed). REVERIFY/STALE surface the

@@ -24,15 +24,28 @@ class StubCatalog:
       * ``fact``    -> a constant ``get_fact()`` return (resolve tests, which only ever call get_fact).
     """
 
-    def __init__(self, objects=None, owners=None, fact: CatalogFact | None = None) -> None:
+    def __init__(
+        self, objects=None, owners=None, fact: CatalogFact | None = None,
+        catalog_source: str = "fixture",
+    ) -> None:
         self._objects = list(objects or [])
         self._owners = dict(owners or {})
         self._fact = fact
+        self._catalog_source = catalog_source
+
+    @property
+    def catalog_source(self) -> str:
+        return self._catalog_source
 
     def set_owner(self, ref, subject: str) -> None:
         self._owners[display_object_ref(ref)] = subject
 
     def owner_of(self, ref):
+        # NOTE (SP-1.5 review #10, DEFERRED): production FixtureCatalog/PostgresCatalog fail closed on
+        # a foreign catalog_source; StubCatalog deliberately does NOT yet, because ~45 command tests
+        # pair this default-'fixture' double with other-source refs. Aligning each test's
+        # catalog_source is a mechanical follow-up; until then the F5 boundary is covered by
+        # FixtureCatalog in test_source_qualified.py.
         key = display_object_ref(ref)
         if key in self._owners:
             return self._owners[key]

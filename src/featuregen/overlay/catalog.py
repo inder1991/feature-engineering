@@ -40,6 +40,8 @@ class CatalogFact:
 
 @runtime_checkable
 class CatalogAdapter(Protocol):
+    catalog_source: str  # the ONE catalog this adapter authoritatively covers (SP-1.5 §5)
+
     def list_objects(self) -> Iterable[CatalogObject]: ...
 
     def get_fact(
@@ -63,6 +65,10 @@ class FixtureCatalog:
         self._objects: dict[str, CatalogObject] = {}
         self._facts: dict[tuple[str, str, str | None], CatalogFact] = {}
         self._owners: dict[str, str] = {}
+
+    @property
+    def catalog_source(self) -> str:
+        return self._catalog_source
 
     def add_object(self, obj: CatalogObject) -> None:
         self._objects[obj.object_ref] = obj
@@ -88,9 +94,15 @@ class FixtureCatalog:
     def get_fact(
         self, ref: CatalogObjectRef, fact_type: str, use_case: str | None = None
     ) -> CatalogFact | None:
+        # F5 (SP-1.5): fail closed on a ref from ANOTHER catalog_source — never return a same-named
+        # object's fact from a different source.
+        if ref.catalog_source != self._catalog_source:
+            return None
         return self._facts.get((display_object_ref(ref), fact_type, use_case))
 
     def owner_of(self, ref: CatalogObjectRef) -> str | None:
+        if ref.catalog_source != self._catalog_source:
+            return None
         return self._owners.get(display_object_ref(ref))
 
     def fingerprint(self) -> Mapping[str, CatalogObject]:
@@ -119,6 +131,10 @@ class PostgresCatalog:
         self._conn = conn
         self._catalog_source = catalog_source
         self._schemas = schemas
+
+    @property
+    def catalog_source(self) -> str:
+        return self._catalog_source
 
     def list_objects(self) -> Iterable[CatalogObject]:
         schemas = list(self._schemas)

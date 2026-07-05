@@ -49,8 +49,8 @@ def test_propose_creates_proposal_row_and_dependencies(db):
     assert prop["object_ref"] == "core.transactions"
     assert prop["fact_type"] == "grain"
     assert current_fact(db, fk) is None  # not VERIFIED yet
-    assert fk in dependents_of(db, "core.transactions")
-    assert fk in dependents_of(db, "core.transactions.id")
+    assert fk in dependents_of(db, "pg:core", "core.transactions")
+    assert fk in dependents_of(db, "pg:core", "core.transactions.id")
 
 
 def test_confirm_advances_fact_state_to_verified(db):
@@ -120,7 +120,15 @@ def test_approved_join_indexes_both_tables_and_all_paired_columns(db):
     append_overlay_event(
         db, fact_key=fk, type=facts.OVERLAY_FACT_PROPOSED, actor=_human(), expected_version=0,
         payload={
-            "catalog_object_ref": {"kind": "relation"},
+            "catalog_object_ref": {
+                "from_ref": {"catalog_source": "pg:core", "object_kind": "table",
+                             "schema": "core", "table": "transactions"},
+                "to_ref": {"catalog_source": "pg:core", "object_kind": "table",
+                           "schema": "core", "table": "customers"},
+                "column_pairs": [{"from_col": "customer_id", "to_col": "id"},
+                                 {"from_col": "region", "to_col": "region"}],
+                "cardinality": "N:1",
+            },
             "object_ref": "core.transactions -> core.customers",  # display string — NEVER parsed
             "fact_type": "approved_join",
             "proposed_value": {
@@ -144,9 +152,9 @@ def test_approved_join_indexes_both_tables_and_all_paired_columns(db):
         "core.transactions.customer_id", "core.customers.id",
         "core.transactions.region", "core.customers.region",
     ):
-        assert fk in dependents_of(db, ref_object), ref_object
+        assert fk in dependents_of(db, "pg:core", ref_object), ref_object
     # ...and the synthetic "from -> to" display relation string is NEVER indexed.
-    assert dependents_of(db, "core.transactions -> core.customers") == []
+    assert dependents_of(db, "pg:core", "core.transactions -> core.customers") == []
 
 
 def test_reproposal_after_rejected_only_keeps_new_dependency_rows(db):
@@ -179,9 +187,9 @@ def test_reproposal_after_rejected_only_keeps_new_dependency_rows(db):
     )
     assert run_projection(db, OverlayProjection()) == 3
     # The table itself and the NEW column are indexed; the stale `id` column row is gone.
-    assert fk in dependents_of(db, "core.transactions")
-    assert fk in dependents_of(db, "core.transactions.txn_id")
-    assert dependents_of(db, "core.transactions.id") == []
+    assert fk in dependents_of(db, "pg:core", "core.transactions")
+    assert fk in dependents_of(db, "pg:core", "core.transactions.txn_id")
+    assert dependents_of(db, "pg:core", "core.transactions.id") == []
 
 
 def test_confirmed_at_is_replay_deterministic_from_event_time(db):

@@ -10,7 +10,7 @@ imports keep resolving.
 from __future__ import annotations
 
 from dataclasses import replace
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 from featuregen.contracts import Command, CommandResult, DbConn
 from featuregen.gates.tasks import cancel_task
@@ -29,6 +29,69 @@ _AWAITING_CONFIRMATION: tuple[FactStatus, ...] = ("DRAFT", "PARTIALLY_CONFIRMED"
 # Default re-verify horizon stamped onto OVERLAY_FACT_CONFIRMED and armed as the overlay_expiry
 # timer (the design calls this a "configurable horizon"). 180 days = semi-annual.
 _DEFAULT_TTL = timedelta(days=180)
+
+
+def resolve_ttl(fact_type: str, fact_key: str) -> timedelta:
+    """Per-fact-type re-verify horizon from OverlayConfig (SP-1.5 Task 6.3): per-type value falling
+    back to ttl_default, with DETERMINISTIC per-fact-key jitter (spreads an onboarding wave so facts
+    do not expire in lockstep — reproducible, no Math.random), clamped to [ttl_min, ttl_max]. Falls
+    back to _DEFAULT_TTL when no OverlayConfig is sealed (backward-compat)."""
+    import hashlib
+
+    from featuregen.overlay.config import current_overlay_config
+
+    try:
+        config = current_overlay_config()
+    except RuntimeError:
+        return _DEFAULT_TTL
+    base = config.ttl_by_fact_type.get(fact_type, config.ttl_default)
+    if config.ttl_jitter_fraction:
+        h = int.from_bytes(hashlib.sha256(fact_key.encode()).digest()[:8], "big")
+        frac = (h / 2**64) * 2 - 1  # deterministic per fact_key, in [-1, 1)
+        base = base + base * (config.ttl_jitter_fraction * frac)
+    return max(config.ttl_min, min(config.ttl_max, base))  # clamp (jitter can nudge out of band)
+
+
+def within_renewal_grace(state, now) -> bool:
+    """True when a still-VERIFIED fact is inside its pre-expiry renewal window (SP-1.5 Task 6): an
+    OverlayConfig is sealed and `now >= expires_at - renewal_grace`. Lets an owner RE-CONFIRM before
+    expiry (no outage) — the confirm path keeps four-eyes (proposer != confirmer) and authority, so a
+    self-entered fact still needs a different signer to renew (F8). Off (False) when no config is
+    sealed, so the pre-SP-1.5 'VERIFIED is not re-confirmable' rule holds by default."""
+    from featuregen.overlay.config import current_overlay_config
+
+    if state.status != "VERIFIED" or state.expires_at is None:
+        return False
+    try:
+        grace = current_overlay_config().renewal_grace
+    except RuntimeError:
+        return False
+    exp = datetime.fromisoformat(state.expires_at)  # expires_at is an ISO string
+    # STRICTLY pre-expiry (review #3): [expires_at - grace, expires_at). A PAST-expiry fact is not
+    # "renewable" — it goes through the expiry -> REVERIFY flow (reads are already fail-closed there).
+    return exp - grace <= now < exp
+
+
+def referent_gap(adapter, ref, fact_type: str, value) -> str | None:
+    """Structured re-confirm validation (SP-1.5 Task 7, shared by confirm_fact AND the dual-owner
+    join path): every object/column a fact's value REFERS to must still exist in THIS adapter's
+    catalog. Returns a rejection reason, or None when all referents are present. Each referent is
+    checked UNDER ITS OWN source (per-referent qualification): a referent whose catalog_source this
+    adapter does not serve is fail-closed (F4/F5). F6: existence is checked against
+    adapter.fingerprint() keyed on the display object_ref — there is no get_object."""
+    from featuregen.overlay.dependencies import fact_dependencies
+    from featuregen.overlay.identity import display_object_ref
+
+    present = set(adapter.fingerprint().keys())
+    single_source = getattr(ref, "catalog_source", None)  # None for an ApprovedJoinRef (uses value)
+    for dep_source, referent in fact_dependencies(
+        display_object_ref(ref), fact_type, value, single_source
+    ):
+        if dep_source != adapter.catalog_source:
+            return f"referent catalog_source '{dep_source}' is not served by this adapter"
+        if referent not in present:
+            return f"referent no longer in catalog: {referent}"
+    return None
 
 
 class OverlayCommandError(Exception):
