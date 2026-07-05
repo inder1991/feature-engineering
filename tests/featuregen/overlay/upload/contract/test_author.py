@@ -40,3 +40,27 @@ def test_draft_records_an_audited_llm_call(db):
     draft_contract(db, feature, client)
     after = db.execute("SELECT count(*) FROM llm_call WHERE run_id = 'overlay-enrichment'").fetchone()[0]
     assert after == before + 1                        # the authoring call is audited
+
+
+def test_authoring_respects_read_scope(db):
+    # M1: a restricted column's definition must NOT be sent to the LLM
+    import json
+    build_graph(db, "bank", [
+        CanonicalRow("bank", "accounts", "balance", "numeric", definition="ledger balance"),
+        CanonicalRow("bank", "accounts", "ssn", "text", sensitivity="restricted",
+                     definition="social security number"),
+        CanonicalRow("bank", "accounts", "posted_at", "timestamp", as_of=True)])
+    feature = FeatureIdea("f", "", ["public.accounts.balance", "public.accounts.ssn"],
+                          "avg_90d", "accounts")
+    captured = {}
+
+    class _Cap:
+        def call(self, req):
+            captured["inputs"] = req.inputs
+            from featuregen.intake.llm import LLMResult
+            return LLMResult(output={"definition": "x"}, self_reported_scores={}, call_ref="", status="ok")
+
+    draft_contract(db, feature, _Cap(), roles=())          # caller has no restricted access
+    blob = json.dumps(captured["inputs"], default=str)
+    assert "ledger balance" in blob                        # allowed column's definition present
+    assert "social security number" not in blob            # restricted column's definition withheld

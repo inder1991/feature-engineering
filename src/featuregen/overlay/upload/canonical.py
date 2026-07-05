@@ -31,7 +31,7 @@ class CanonicalRow:
 class RowError:
     row_index: int
     message: str
-    row: "CanonicalRow | None" = None
+    row: CanonicalRow | None = None
 
 
 @dataclass(frozen=True, slots=True)

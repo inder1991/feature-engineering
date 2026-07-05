@@ -71,3 +71,25 @@ def test_structural_defect_surfaces_and_stops(db):
     final, unresolved = author_contract(db, draft, client, target_ref="public.accounts.churned",
                                         now=NOW, budget=3)
     assert unresolved and "leaks target" in unresolved[0]
+
+
+def test_mcv_grounding_uses_live_graph_not_the_draft(db):
+    # B2: a draft claiming a column that no longer exists in the graph must fail grounding.
+    _bank(db)
+    ghost = _draft(["public.accounts.vanished"])
+    ok, reasons = validate_minimum(db, ghost, now=NOW)
+    assert not ok and "ungrounded" in reasons[0]
+
+
+def test_critique_is_audited(db):
+    # M5: the critique call is recorded in llm_call (routed through the audited seam)
+    from featuregen.intake.llm import FakeLLM, FakeResponse
+    from featuregen.overlay.upload.contract.review import critique_contract
+    _bank(db)
+    client = FakeLLM(script={"overlay.contract.critique": FakeResponse(
+        output={"findings": ["state the window"]})})
+    before = db.execute("SELECT count(*) FROM llm_call WHERE run_id = 'overlay-enrichment'").fetchone()[0]
+    findings = critique_contract(db, _draft(["public.accounts.balance"]), client)
+    after = db.execute("SELECT count(*) FROM llm_call WHERE run_id = 'overlay-enrichment'").fetchone()[0]
+    assert findings == ["state the window"]
+    assert after == before + 1

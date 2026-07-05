@@ -16,6 +16,11 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
+from featuregen.intake.llm import LLMClient, LLMRequest
+from featuregen.overlay.catalog_changes import drift_watermark
+from featuregen.overlay.upload.join_path import JoinStep, find_join_path
+from featuregen.overlay.upload.read_scope import allowed_sensitivities
+
 _WINDOW_RE = re.compile(r"\d+\s*[dwmy]\b")   # 90d, 30 d, 12m, 1y
 _WINDOW_WORDS = ("trend", "rolling", "window", "velocity", "growth", "over_time", "all_time",
                  "delta", "moving")
@@ -24,11 +29,6 @@ _WINDOW_WORDS = ("trend", "rolling", "window", "velocity", "growth", "over_time"
 def _is_windowed(aggregation: str | None) -> bool:
     a = (aggregation or "").lower()
     return bool(_WINDOW_RE.search(a)) or any(w in a for w in _WINDOW_WORDS)
-
-from featuregen.intake.llm import LLMClient, LLMRequest
-from featuregen.overlay.catalog_changes import drift_watermark
-from featuregen.overlay.upload.join_path import JoinStep, find_join_path
-from featuregen.overlay.upload.read_scope import allowed_sensitivities
 
 
 def _call_raw(client: LLMClient, task: str, prompt_id: str, schema_id: str, inputs: dict) -> dict:
@@ -111,8 +111,10 @@ def _validate_idea(conn, raw: dict, known: set[str], target_ref: str | None,
                 return None, f"unsafe SUM of {d}"
     if _is_windowed(raw.get("aggregation")):   # point-in-time: a windowed feature needs an as-of column
         for d in derives:
+            # object_ref is "[catalog.]schema.table.column" — the table is the second-to-last segment,
+            # so split(".")[-2] is correct for 3- and 4-part refs alike (was [1], wrong for 4-part).
             if d in meta and d.count(".") >= 2 and not _table_has_as_of(
-                    conn, meta[d]["catalog_source"], d.split(".")[1]):
+                    conn, meta[d]["catalog_source"], d.split(".")[-2]):
                 return None, f"no point-in-time basis for {d} (future-leakage risk)"
     return FeatureIdea(
         name=str(raw.get("name", "")), description=str(raw.get("description", "")),

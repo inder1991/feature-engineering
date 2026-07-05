@@ -55,8 +55,12 @@ def build_considered_set(conn, intent: Intent, client: LLMClient, *, entity: str
     return ConsideredSet(intent.intent_id, anchor, alternatives, recommendation)
 
 
+def _alternative_ids(cs: ConsideredSet) -> set[str]:
+    return {f.name for s in cs.alternatives for f in s.features}
+
+
 def _option_ids(cs: ConsideredSet) -> set[str]:
-    ids = {f.name for s in cs.alternatives for f in s.features}
+    ids = _alternative_ids(cs)
     if cs.anchor is not None:
         ids.add(cs.anchor.name)
     return ids
@@ -65,7 +69,8 @@ def _option_ids(cs: ConsideredSet) -> set[str]:
 def _idea_json(f: FeatureIdea | None) -> dict | None:
     if f is None:
         return None
-    return {"name": f.name, "derives_from": f.derives_from, "aggregation": f.aggregation}
+    return {"name": f.name, "derives_from": f.derives_from, "aggregation": f.aggregation,
+            "grain_table": f.grain_table}   # keep grain — it disambiguates same-named options
 
 
 def _snapshot(cs: ConsideredSet) -> dict:
@@ -79,13 +84,15 @@ def _snapshot(cs: ConsideredSet) -> dict:
     }
 
 
-def _actor_json(actor) -> str:
+def _actor_json(actor) -> str | None:
+    if actor is None:
+        return None                            # -> SQL NULL ("unknown actor"), not the string "None"
     if isinstance(actor, str):
         return json.dumps(actor)
     try:
         return json.dumps(identity_to_jsonb(actor))
     except Exception:
-        return json.dumps(str(actor))
+        return json.dumps({"repr": str(actor)})   # structured, parseable JSON — not a repr string
 
 
 def confirm_gate1(conn, considered: ConsideredSet, *, chosen_source: str, chosen_option_id: str,
@@ -99,6 +106,8 @@ def confirm_gate1(conn, considered: ConsideredSet, *, chosen_source: str, chosen
     if chosen_source == "anchor" and (
             considered.anchor is None or considered.anchor.name != chosen_option_id):
         raise Gate1Error("chosen_source 'anchor' but the chosen option is not the anchor")
+    if chosen_source == "alternative" and chosen_option_id not in _alternative_ids(considered):
+        raise Gate1Error("chosen_source 'alternative' but the chosen option is not an alternative")
     conn.execute(
         "INSERT INTO contract_gate1_choice "
         "(intent_id, chosen_source, chosen_option_id, why, actor, considered) "
