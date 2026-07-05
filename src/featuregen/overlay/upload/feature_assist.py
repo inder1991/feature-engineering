@@ -13,8 +13,10 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 
 from featuregen.intake.llm import LLMClient, LLMRequest
+from featuregen.overlay.catalog_changes import drift_watermark
 from featuregen.overlay.upload.join_path import JoinStep, find_join_path
 from featuregen.overlay.upload.read_scope import allowed_sensitivities
 
@@ -28,13 +30,19 @@ def _call_raw(client: LLMClient, task: str, prompt_id: str, schema_id: str, inpu
     return out if isinstance(out, dict) else {}
 
 
-def _candidate_columns(conn, catalog_source: str | None, roles: Iterable[str]) -> list[dict]:
+def _candidate_columns(conn, catalog_source: str | None, roles: Iterable[str],
+                       entity: str | None = None) -> list[dict]:
     # Read-scope: never feed a sensitivity-tagged column the caller can't see to the LLM (M6).
     sql = ("SELECT catalog_source, object_ref, table_name, column_name, concept, domain, definition "
            "FROM graph_node WHERE kind = 'column' "
            "AND (sensitivity IS NULL OR sensitivity = ANY(%s))")
     params: list = [allowed_sensitivities(roles)]
-    if catalog_source:
+    if entity:
+        # Cross-domain gather: candidates from EVERY catalog that contains this entity, not one source.
+        sql += (" AND catalog_source IN "
+                "(SELECT DISTINCT catalog_source FROM graph_node WHERE entity = %s)")
+        params.append(entity)
+    elif catalog_source:
         sql += " AND catalog_source = %s"
         params.append(catalog_source)
     rows = conn.execute(sql, params).fetchall()
@@ -55,23 +63,70 @@ class FeatureIdea:
     grain_table: str | None
 
 
+def _column_meta(conn, object_refs: list[str]) -> dict[str, dict]:
+    if not object_refs:
+        return {}
+    rows = conn.execute(
+        "SELECT object_ref, catalog_source, additivity FROM graph_node WHERE object_ref = ANY(%s)",
+        (object_refs,)).fetchall()
+    return {r[0]: {"catalog_source": r[1], "additivity": r[2]} for r in rows}
+
+
+def _validate_idea(conn, raw: dict, known: set[str], target_ref: str | None,
+                   now: datetime | None, fresh_within: timedelta):
+    """The deterministic gauntlet. Returns (FeatureIdea, 'ok') or (None, reason). Runs every pass so a
+    leaky / stale / unsafe candidate can NEVER be returned — the checks recommend_features used to skip."""
+    derives = [d for d in raw.get("derives_from", []) if d in known]
+    if not derives:
+        return None, "ungrounded"
+    if target_ref and target_ref in derives:
+        return None, "leaks target"
+    meta = _column_meta(conn, derives)
+    if now is not None:   # freshness — every source a derives-from column lives in must be fresh
+        for src in {meta[d]["catalog_source"] for d in derives if d in meta}:
+            wm = drift_watermark(conn, src)
+            if wm is None or wm < now - fresh_within:
+                return None, f"stale source: {src}"
+    if "sum" in (raw.get("aggregation") or "").lower():   # aggregation safety (additivity)
+        for d in derives:
+            if meta.get(d, {}).get("additivity") in ("semi_additive", "non_additive"):
+                return None, f"unsafe SUM of {d}"
+    return FeatureIdea(
+        name=str(raw.get("name", "")), description=str(raw.get("description", "")),
+        derives_from=derives, aggregation=raw.get("aggregation"),
+        grain_table=raw.get("grain_table")), "ok"
+
+
 def recommend_features(conn, objective: str, client: LLMClient, *,
-                       catalog_source: str | None = None,
-                       roles: Iterable[str] = ()) -> list[FeatureIdea]:
-    cols = _candidate_columns(conn, catalog_source, roles)
+                       catalog_source: str | None = None, roles: Iterable[str] = (),
+                       entity: str | None = None,
+                       target_ref: str | None = None, now: datetime | None = None,
+                       fresh_within: timedelta = timedelta(hours=24),
+                       target: int = 5, budget: int = 3) -> list[FeatureIdea]:
+    """Bounded generate-validate-refine loop. Each round the LLM proposes; every candidate runs the
+    deterministic gauntlet; rejections feed back as `avoid` hints to the next round; stops at `target`
+    accepted or `budget` rounds. The LLM only proposes — code owns the loop, the checks are deterministic.
+    Pass `entity` to gather candidates CROSS-DOMAIN (every catalog containing that entity)."""
+    cols = _candidate_columns(conn, catalog_source, roles, entity)
     known = {c["object_ref"] for c in cols}
-    out = _call_raw(client, "overlay.feature.recommend", "feature_recommend_v1", "feature_ideas",
-                    {"objective": objective, "columns": _menu(cols)})
-    ideas: list[FeatureIdea] = []
-    for raw in out.get("features", []):
-        derives = [d for d in raw.get("derives_from", []) if d in known]   # drop hallucinated
-        if not derives:
-            continue
-        ideas.append(FeatureIdea(
-            name=str(raw.get("name", "")), description=str(raw.get("description", "")),
-            derives_from=derives, aggregation=raw.get("aggregation"),
-            grain_table=raw.get("grain_table")))
-    return ideas
+    accepted: list[FeatureIdea] = []
+    seen: set[str] = set()
+    avoid: list[dict] = []
+    for _ in range(budget):
+        if len(accepted) >= target:
+            break
+        out = _call_raw(client, "overlay.feature.recommend", "feature_recommend_v1", "feature_ideas",
+                        {"objective": objective, "columns": _menu(cols), "avoid": avoid})
+        for raw in out.get("features", []):
+            idea, reason = _validate_idea(conn, raw, known, target_ref, now, fresh_within)
+            if idea is None:
+                avoid.append({"name": raw.get("name", ""), "reason": reason})   # refine
+                continue
+            if idea.name in seen:
+                continue
+            accepted.append(idea)
+            seen.add(idea.name)
+    return accepted[:target]
 
 
 @dataclass(frozen=True, slots=True)
@@ -116,3 +171,50 @@ def leakage_check(conn, derives_from: list[str], target_ref: str,
     return [LeakageWarning(object_ref=w["object_ref"], reason=str(w.get("reason", "")))
             for w in out.get("leaks", [])
             if isinstance(w, dict) and w.get("object_ref") in used]
+
+
+@dataclass(frozen=True, slots=True)
+class FeatureSet:
+    lens: str                       # the strategy this set explores (behavioral, monetary, ...)
+    features: list[FeatureIdea]     # all validated (each ran the gauntlet)
+
+
+@dataclass(frozen=True, slots=True)
+class SetRecommendation:
+    recommended_lens: str
+    reasoning: str                  # ADVISORY — grounded in hypothesis + metadata, not a performance claim
+    caveat: str = ("advisory only — a fit/coverage judgment over the metadata, not a performance "
+                   "prediction; confirm the winner with a backtest once features are computed")
+
+
+def recommend_feature_sets(conn, objective: str, client: LLMClient, *,
+                           entity: str | None = None, catalog_source: str | None = None,
+                           roles: Iterable[str] = (), target_ref: str | None = None,
+                           now: datetime | None = None, fresh_within: timedelta = timedelta(hours=24),
+                           lenses: tuple[str, ...] = ("behavioral", "monetary", "engagement"),
+                           per_set: int = 3, budget: int = 2) -> list[FeatureSet]:
+    """Generate N DIVERSE, each-fully-validated feature sets — one per strategy lens — by running the
+    validated loop once per lens. Every feature in every set has passed the gauntlet, so the human only
+    ever curates among SAFE options."""
+    return [
+        FeatureSet(lens=lens, features=recommend_features(
+            conn, f"{objective} (focus: {lens})", client, entity=entity,
+            catalog_source=catalog_source, roles=roles, target_ref=target_ref, now=now,
+            fresh_within=fresh_within, target=per_set, budget=budget))
+        for lens in lenses
+    ]
+
+
+def recommend_set(conn, sets: list[FeatureSet], hypothesis: str,
+                  client: LLMClient) -> SetRecommendation:
+    """Advisory: the LLM reasons over the validated sets + the analyst's HYPOTHESIS (+ the metadata
+    already in each feature) and recommends one, WITH reasons — a fit/coverage judgment, never a
+    performance prediction (see SetRecommendation.caveat)."""
+    summary = [{"lens": s.lens,
+                "features": [{"name": f.name, "derives_from": f.derives_from,
+                              "aggregation": f.aggregation} for f in s.features]} for s in sets]
+    out = _call_raw(client, "overlay.feature.recommend_set", "feature_set_v1", "feature_set_rec",
+                    {"hypothesis": hypothesis, "sets": summary})
+    default = sets[0].lens if sets else ""
+    return SetRecommendation(recommended_lens=str(out.get("recommended_lens", default)),
+                             reasoning=str(out.get("reasoning", "")))
