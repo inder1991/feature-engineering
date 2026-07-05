@@ -7,8 +7,8 @@ const LOOP: { route: Route; name: string; line: string }[] = [
   { route: 'review', name: 'Review queue', line: 'Review what the catalog refused to trust.' },
   {
     route: 'workbench',
-    name: 'Workbench',
-    line: 'Assemble features with leakage- and freshness-checked suggestions.',
+    name: 'Generate features',
+    line: 'Generate features: the engine proposes, you approve and register.',
   },
 ]
 
@@ -67,7 +67,8 @@ export function OverviewScreen({
           <p>
             Upload <span className="mono">docs/examples/deposits.csv</span> as source{' '}
             <span className="mono">deposits</span>, then search for{' '}
-            <span className="mono">balance</span>.
+            <span className="mono">balance</span>. Once data is in, Generate features is where the
+            engine works for you.
           </p>
           <button type="button" className="btn btn--primary" onClick={() => navigate('upload')}>
             Go to Upload
@@ -95,8 +96,8 @@ export function OverviewScreen({
         <div className="callout-body">
           <p>This is a stub dev session. Roles switch in the rail.</p>
           <p>
-            AI assist depends on the deployment's LLM provider; the Workbench shows its live
-            status.
+            AI assist depends on the deployment's LLM provider; the Generate features screen shows
+            its live status.
           </p>
           <p>Search serves only freshness-vouched facts.</p>
         </div>
