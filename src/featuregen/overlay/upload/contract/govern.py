@@ -48,7 +48,7 @@ def _actor_json(actor) -> str | None:
 
 
 def confirm_contract(conn, draft: ContractDraft, *, actor, target_ref: str | None = None,
-                     now: datetime | None = None) -> Contract:
+                     now: datetime | None = None, intent_id: str | None = None) -> Contract:
     """The human gate. RE-RUNS the deterministic MCV (B1) and refuses to govern an invalid draft, then
     registers a versioned governed contract + wires its derives-from into the feature layer. Re-confirming
     the same feature bumps the version. A non-empty definition is required (no empty-narrative contract)."""
@@ -82,9 +82,9 @@ def confirm_contract(conn, draft: ContractDraft, *, actor, target_ref: str | Non
     contract_id = mint_id("contract")
     conn.execute(
         "INSERT INTO contract (contract_id, feature_id, feature_name, definition, version, actor, "
-        "join_path) VALUES (%s, %s, %s, %s, %s, %s::jsonb, %s::jsonb)",
+        "join_path, intent_id) VALUES (%s, %s, %s, %s, %s, %s::jsonb, %s::jsonb, %s)",
         (contract_id, feature_id, draft.feature_name, draft.definition, version, _actor_json(actor),
-         json.dumps(list(draft.join_path))))
+         json.dumps(list(draft.join_path)), intent_id))   # intent_id: audit link to the hypothesis (M5)
     return Contract(contract_id, feature_id, draft.feature_name, version)
 
 
