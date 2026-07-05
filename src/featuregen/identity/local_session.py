@@ -63,9 +63,17 @@ def create_group(conn: DbConn, name: str, roles: tuple[str, ...] = ()) -> str:
     return group_id
 
 
-def add_user_to_group(conn: DbConn, user_id: str, group_id: str) -> None:
+def add_user_to_group(conn: DbConn, user_id: str, group_id: str) -> bool:
+    """Idempotent. Returns False if the user or group doesn't exist (checked first, so a bad id can't
+    abort the transaction on a foreign-key violation)."""
+    exists = conn.execute(
+        "SELECT (SELECT 1 FROM app_user WHERE user_id = %s), "
+        "(SELECT 1 FROM app_group WHERE group_id = %s)", (user_id, group_id)).fetchone()
+    if not (exists[0] and exists[1]):
+        return False
     conn.execute("INSERT INTO app_user_group (user_id, group_id) VALUES (%s, %s) "
                  "ON CONFLICT DO NOTHING", (user_id, group_id))
+    return True
 
 
 # ---- login + session resolution -----------------------------------------------------------------
@@ -112,3 +120,77 @@ def resolve_session(conn: DbConn, token: str | None, *, now: datetime) -> Identi
 def logout(conn: DbConn, token: str | None) -> None:
     if token:
         conn.execute("DELETE FROM app_session WHERE token_hash = %s", (_token_hash(token),))
+
+
+# ---- administration (list / mutate users, groups, roles, membership) ----------------------------
+def list_users(conn: DbConn) -> list[dict]:
+    rows = conn.execute("SELECT user_id, username, disabled FROM app_user ORDER BY username").fetchall()
+    return [{"user_id": r[0], "username": r[1], "disabled": r[2]} for r in rows]
+
+
+def set_user_disabled(conn: DbConn, user_id: str, disabled: bool) -> bool:
+    # resolve_session already rejects a disabled user, so existing tokens stop working immediately.
+    row = conn.execute("UPDATE app_user SET disabled = %s WHERE user_id = %s RETURNING user_id",
+                       (disabled, user_id)).fetchone()
+    return row is not None
+
+
+def set_password(conn: DbConn, user_id: str, password: str) -> bool:
+    row = conn.execute("UPDATE app_user SET password_hash = %s WHERE user_id = %s RETURNING user_id",
+                       (hash_password(password), user_id)).fetchone()
+    if row is not None:
+        conn.execute("DELETE FROM app_session WHERE user_id = %s", (user_id,))   # revoke old sessions
+    return row is not None
+
+
+def delete_user(conn: DbConn, user_id: str) -> bool:
+    row = conn.execute("DELETE FROM app_user WHERE user_id = %s RETURNING user_id",
+                       (user_id,)).fetchone()
+    return row is not None   # sessions + memberships cascade (FK ON DELETE CASCADE)
+
+
+def list_groups(conn: DbConn) -> list[dict]:
+    rows = conn.execute(
+        "SELECT g.group_id, g.name, "
+        "COALESCE(array_agg(gr.role) FILTER (WHERE gr.role IS NOT NULL), '{}') "
+        "FROM app_group g LEFT JOIN app_group_role gr ON gr.group_id = g.group_id "
+        "GROUP BY g.group_id, g.name ORDER BY g.name").fetchall()
+    return [{"group_id": r[0], "name": r[1], "roles": sorted(r[2])} for r in rows]
+
+
+def grant_role(conn: DbConn, group_id: str, role: str) -> bool:
+    if conn.execute("SELECT 1 FROM app_group WHERE group_id = %s", (group_id,)).fetchone() is None:
+        return False
+    conn.execute("INSERT INTO app_group_role (group_id, role) VALUES (%s, %s) ON CONFLICT DO NOTHING",
+                 (group_id, role))
+    return True
+
+
+def revoke_role(conn: DbConn, group_id: str, role: str) -> None:
+    conn.execute("DELETE FROM app_group_role WHERE group_id = %s AND role = %s", (group_id, role))
+
+
+def remove_user_from_group(conn: DbConn, user_id: str, group_id: str) -> None:
+    conn.execute("DELETE FROM app_user_group WHERE user_id = %s AND group_id = %s",
+                 (user_id, group_id))
+
+
+def delete_group(conn: DbConn, group_id: str) -> bool:
+    row = conn.execute("DELETE FROM app_group WHERE group_id = %s RETURNING group_id",
+                       (group_id,)).fetchone()
+    return row is not None
+
+
+def user_count(conn: DbConn) -> int:
+    return conn.execute("SELECT count(*) FROM app_user").fetchone()[0]
+
+
+def bootstrap_admin(conn: DbConn, username: str, password: str, *, admin_role: str = "admin") -> str | None:
+    """Create the first admin (user + an 'admins' group granting the admin role) ONLY when there are
+    no users yet — a one-time, first-run action. Returns the new user_id, or None if users exist."""
+    if user_count(conn) > 0:
+        return None
+    uid = create_user(conn, username, password)
+    gid = create_group(conn, "admins", roles=(admin_role,))
+    add_user_to_group(conn, uid, gid)
+    return uid
