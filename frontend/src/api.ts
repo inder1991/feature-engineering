@@ -16,17 +16,32 @@ export class ApiError extends Error {
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const { user, roles } = getSession()
+  // X-User is free text from the session bar. Header values must be ISO-8859-1, so a
+  // non-Latin-1 name would make fetch throw before any request is sent. Percent-encode at
+  // the boundary; the server sees the encoded name, which is acceptable for the dev stub.
   const res = await fetch(path, {
     ...init,
-    headers: { 'X-User': user, 'X-Roles': roles.join(','), ...(init?.headers ?? {}) },
+    headers: {
+      'X-User': encodeURIComponent(user),
+      'X-Roles': roles.join(','),
+      ...(init?.headers ?? {}),
+    },
   })
   if (!res.ok) {
-    let detail = res.statusText
+    // statusText is empty under HTTP/2, so never let the message end up blank.
+    let detail = res.statusText || `HTTP ${res.status}`
     try {
       const body = await res.json()
-      if (typeof body.detail === 'string') detail = body.detail
+      if (typeof body.detail === 'string') {
+        detail = body.detail
+      } else if (Array.isArray(body.detail) && body.detail.length > 0) {
+        // FastAPI 422 validation shape: detail is [{loc, msg, type}, ...]
+        detail = body.detail
+          .map((e: { loc?: unknown[]; msg?: string }) => `${(e.loc ?? []).join('.')}: ${e.msg}`)
+          .join('; ')
+      }
     } catch {
-      // non-JSON error body — keep the status text
+      // non-JSON error body (proxy HTML page and the like): keep the status fallback
     }
     throw new ApiError(res.status, detail)
   }
@@ -95,6 +110,10 @@ export interface FeatureIdea {
   derives_from: string[]
   aggregation: string | null
   grain_table: string | null
+  // (catalog_source, object_ref) pairs the backend resolves at recommend time. Registration
+  // lineage MUST come from these, never from client-side source context: re-deriving the
+  // catalog on the client would corrupt freshness and drift-impact for cross-catalog ideas.
+  derives_pairs: [string, string][]
 }
 
 export interface Recipe {
@@ -169,11 +188,14 @@ export async function recommendFeatures(
   objective: string,
   catalogSource: string | null,
   targetRef: string | null = null,
+  entity: string | null = null,
 ): Promise<FeatureIdea[]> {
   const body = await post<{ proposals: FeatureIdea[] }>('/features/recommend', {
     objective,
     catalog_source: catalogSource,
     target_ref: targetRef,
+    // Entity-scoped gather: candidates come from every catalog holding this entity.
+    entity: entity ?? null,
   })
   return body.proposals
 }

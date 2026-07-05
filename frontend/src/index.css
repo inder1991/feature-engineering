@@ -1,34 +1,1096 @@
-:root { color-scheme: light dark; font-family: system-ui, sans-serif; line-height: 1.45; }
-* { box-sizing: border-box; }
-body { margin: 0; }
-.app { max-width: 960px; margin: 0 auto; padding: 1rem; }
-header { display: flex; flex-wrap: wrap; align-items: center; gap: 1rem; }
-header h1 { font-size: 1.3rem; margin: 0; }
-nav { display: flex; gap: 0.25rem; }
-.tab { border: none; background: none; padding: 0.5rem 0.75rem; cursor: pointer; border-bottom: 2px solid transparent; font: inherit; }
-.tab.active { border-bottom-color: currentColor; font-weight: 600; }
-.session-bar { margin-left: auto; display: flex; align-items: center; gap: 0.5rem; font-size: 0.85rem; opacity: 0.9; }
-.session-bar input[type='text'], .session-bar input:not([type]) { width: 6rem; }
-.session-note { font-style: italic; opacity: 0.7; }
-main { margin-top: 1.5rem; }
-form { display: flex; flex-wrap: wrap; gap: 0.75rem; align-items: end; margin-block: 0.75rem; }
-label { display: flex; flex-direction: column; gap: 0.25rem; font-size: 0.9rem; }
-input, button { font: inherit; padding: 0.4rem 0.6rem; }
-button { cursor: pointer; }
-.card { border: 1px solid color-mix(in srgb, currentColor 25%, transparent); border-radius: 8px; padding: 0.75rem 1rem; margin-block: 0.75rem; }
-.card header { display: flex; gap: 0.5rem; align-items: center; }
-.badge { font-size: 0.75rem; padding: 0.1rem 0.5rem; border-radius: 999px; border: 1px solid currentColor; }
-.badge.sensitivity, .badge.rejected { color: #b3261e; }
-.badge.grain, .badge.proposal { color: #175fbe; }
-dl { display: grid; grid-template-columns: max-content 1fr; gap: 0.15rem 0.75rem; margin: 0.5rem 0 0; }
-dl div { display: contents; }
-dt { opacity: 0.65; }
-dd { margin: 0; }
-.result, .warning-banner { border-radius: 8px; padding: 0.75rem 1rem; margin-block: 0.75rem; border: 1px solid; }
-.result.ingested { border-color: #2e7d32; }
-.result.held { border-color: #b58900; }
-.result.rejected, .warning-banner { border-color: #b3261e; }
-.error, .notice, .warning { color: #b3261e; }
-.flagged, .warning { font-weight: 500; }
-.empty, .hint { opacity: 0.75; font-style: italic; }
-.registered { color: #2e7d32; }
+/* FeatureGen design system. Binding reference: frontend/DESIGN.md.
+   A light, high-contrast instrument: hairlines, not shadows (one subtle shadow on the rail
+   only). Fonts (@fontsource IBM Plex Sans/Mono) are imported in main.tsx. */
+
+/* ---------------------------------------------------------------- tokens */
+
+:root {
+  /* content neutrals: the ground is VISIBLY colder than panels (value separation is the point) */
+  --ground:       oklch(0.955 0.009 215);  /* app background behind panels */
+  --paper:        var(--ground);           /* legacy alias */
+  --surface:      oklch(0.995 0.002 210);  /* panels, rows: near-white, floats on the ground */
+  --surface-2:    oklch(0.975 0.006 212);  /* inset zones inside panels (kv grids, editors) */
+  --ink:          oklch(0.25 0.025 225);
+  --ink-soft:     oklch(0.44 0.02 222);
+  /* tertiary text AND placeholders: 5.25:1 on ground, 5.89:1 on surface, 5.56:1 on surface-2,
+     4.90:1 on accent-soft — keep >= 4.5:1 everywhere it renders (WCAG 1.4.3, PRODUCT.md) */
+  --ink-faint:    oklch(0.50 0.015 220);
+  --line:         oklch(0.86 0.012 212);
+  --line-strong:  oklch(0.76 0.018 212);
+  --shadow:       0 1px 2px oklch(0.25 0.025 225 / 0.05), 0 6px 20px oklch(0.25 0.025 225 / 0.07);
+
+  /* the rail: a committed dark petrol surface (identity lives here) */
+  --rail-bg:      oklch(0.27 0.045 215);
+  --rail-bg-2:    oklch(0.23 0.04 215);    /* rail footer / inset */
+  --rail-ink:     oklch(0.93 0.01 210);    /* rail primary text */
+  --rail-ink-soft:oklch(0.72 0.02 212);    /* rail secondary text */
+  --rail-line:    oklch(0.36 0.04 215);
+  --rail-active:  oklch(0.36 0.06 212);    /* active nav fill */
+  --rail-accent:  oklch(0.78 0.09 200);    /* active nav text / logomark on dark */
+
+  /* accent: petrol, now with real presence */
+  --accent:       oklch(0.46 0.11 210);
+  --accent-hover: oklch(0.39 0.115 210);
+  --accent-soft:  oklch(0.93 0.03 208);
+  --accent-line:  oklch(0.70 0.08 208);
+  --accent-deep:  oklch(0.30 0.06 214);    /* committed hero surfaces (Overview start-here) */
+
+  /* semantic states: -solid fills carry chip text (small caps text needs fill L <= 0.55) */
+  --ok:           oklch(0.50 0.115 163);
+  --ok-solid:     oklch(0.52 0.115 163);
+  --ok-soft:      oklch(0.945 0.035 163);
+  --warn:         oklch(0.53 0.115 70);
+  --warn-solid:   oklch(0.52 0.115 70);
+  --warn-soft:    oklch(0.955 0.045 85);
+  --danger:       oklch(0.48 0.15 25);
+  --danger-solid: oklch(0.50 0.15 25);
+  --danger-soft:  oklch(0.955 0.025 25);
+  --proposal:     oklch(0.46 0.115 300);
+  --proposal-solid: oklch(0.47 0.115 300);
+  --proposal-soft:oklch(0.955 0.025 300);
+  --chip-ink:     oklch(0.985 0.005 210);  /* text on -solid chips */
+
+  /* primitives */
+  --font-sans: 'IBM Plex Sans', system-ui, sans-serif;
+  --font-mono: 'IBM Plex Mono', ui-monospace, 'SF Mono', monospace;
+  --radius: 8px;
+  --radius-panel: 10px;
+  --ease-out-quart: cubic-bezier(0.25, 1, 0.5, 1);
+  --dur: 160ms;
+  --dur-fast: 120ms;
+
+  color-scheme: light;
+}
+
+/* ---------------------------------------------------------------- reset + base */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body,
+h1,
+h2,
+h3,
+p,
+ul,
+ol,
+dl,
+dd,
+figure {
+  margin: 0;
+}
+
+body {
+  background: var(--ground);
+  color: var(--ink);
+  font-family: var(--font-sans);
+  font-size: 14px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+}
+
+::selection {
+  background: color-mix(in oklch, var(--accent) 18%, var(--paper));
+}
+
+/* focus ring must hold >= 3:1 against adjacent colors (WCAG 1.4.11): --accent is 5.73:1 on
+   ground, 6.43:1 on surface, 5.35:1 on accent-soft. The dark rail scopes its own ring color
+   (--rail-accent: 7.70:1 on rail-bg, 5.49:1 on rail-active) — see .rail :focus-visible. */
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+:focus:not(:focus-visible) {
+  outline: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* ---------------------------------------------------------------- typography */
+
+h1 {
+  font-size: 22px;
+  font-weight: 600;
+  line-height: 1.25;
+  letter-spacing: -0.01em;
+}
+
+h2 {
+  font-size: 15px;
+  font-weight: 600;
+  line-height: 1.35;
+}
+
+a {
+  color: var(--accent);
+  text-decoration: underline;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 2px;
+  border-radius: 2px;
+}
+
+a:hover {
+  color: var(--accent-hover);
+}
+
+code,
+kbd,
+.mono {
+  font-family: var(--font-mono);
+  font-size: 13px;
+}
+
+.micro-label {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+}
+
+.tabular-nums,
+table,
+.rows {
+  font-variant-numeric: tabular-nums;
+}
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* ---------------------------------------------------------------- app shell */
+
+.shell {
+  display: flex;
+  min-height: 100vh;
+}
+
+.rail {
+  flex: 0 0 240px;
+  position: sticky;
+  top: 0;
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  background: var(--rail-bg);
+  color: var(--rail-ink);
+  border-right: 1px solid var(--rail-line);
+  /* the one permitted shadow: lifts the dark rail off the ground */
+  box-shadow: 2px 0 16px oklch(0.2 0.03 220 / 0.12);
+}
+
+/* everything focusable on the rail rings in the rail accent, not the light accent-line */
+.rail :focus-visible {
+  outline-color: var(--rail-accent);
+}
+
+.rail .micro-label {
+  color: var(--rail-ink-soft);
+}
+
+.rail-brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 20px 16px 18px;
+}
+
+.rail-brand svg {
+  flex: none;
+  color: var(--rail-accent);
+}
+
+.rail-brand-text {
+  display: grid;
+  gap: 1px;
+  line-height: 1.2;
+}
+
+.rail-brand-name {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--rail-accent);
+}
+
+.rail-nav {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 4px 8px;
+}
+
+.nav-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  height: 32px;
+  padding: 0 10px;
+  border: none;
+  border-radius: var(--radius);
+  background: transparent;
+  color: var(--rail-ink-soft);
+  font: inherit;
+  font-weight: 500;
+  text-align: left;
+  cursor: pointer;
+  transition: background-color var(--dur-fast) var(--ease-out-quart),
+    color var(--dur-fast) var(--ease-out-quart);
+}
+
+.nav-item svg {
+  flex: none;
+}
+
+.nav-item:hover {
+  background: color-mix(in oklch, var(--rail-active) 45%, transparent);
+  color: var(--rail-ink);
+}
+
+.nav-item.active {
+  background: var(--rail-active);
+  color: var(--rail-accent);
+  font-weight: 600;
+}
+
+.rail-session {
+  margin-top: auto;
+  padding: 14px 16px 16px;
+  background: var(--rail-bg-2);
+  color: var(--rail-ink);
+  border-top: 1px solid var(--rail-line);
+}
+
+.shell > main {
+  flex: 1;
+  min-width: 0;
+  padding: 36px 32px 64px;
+}
+
+.shell > main > * {
+  max-width: 1120px;
+}
+
+/* ---------------------------------------------------------------- page head */
+
+.page-head {
+  margin-bottom: 32px;
+}
+
+.page-head p {
+  margin-top: 4px;
+  color: var(--ink-soft);
+}
+
+/* mono accent eyebrow opening every page head: CATALOG · <ROUTE> */
+.page-head .page-head-eyebrow {
+  margin: 0 0 6px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--accent);
+}
+
+/* ---------------------------------------------------------------- session (rail footer) */
+
+.session {
+  display: grid;
+  gap: 8px;
+}
+
+.session-user {
+  width: 100%;
+}
+
+.session-roles {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.role-chip {
+  display: inline-flex;
+  align-items: center;
+  min-height: 32px;
+  padding: 0 10px;
+  border: 1px solid var(--line-strong);
+  border-radius: 999px;
+  background: var(--surface);
+  color: var(--ink-soft);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: 400;
+  cursor: pointer;
+  user-select: none;
+  transition: background-color var(--dur-fast) var(--ease-out-quart),
+    color var(--dur-fast) var(--ease-out-quart),
+    border-color var(--dur-fast) var(--ease-out-quart);
+}
+
+.role-chip:hover {
+  border-color: var(--accent-line);
+  color: var(--ink);
+}
+
+.role-chip.on {
+  background: var(--accent-soft);
+  border-color: var(--accent-line);
+  color: var(--accent);
+  font-weight: 500;
+}
+
+.role-chip:focus-within {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* session footer on the dark rail: input + role chips adapted for the petrol surface.
+   Scoped under .rail so the content-column role chips (Search suggestions) stay light. */
+.rail .session-user {
+  background: var(--rail-bg);
+  border-color: var(--rail-line);
+  color: var(--rail-ink);
+}
+
+.rail .session-user::placeholder {
+  color: var(--rail-ink-soft);
+}
+
+.rail .role-chip {
+  background: transparent;
+  border-color: var(--rail-line);
+  color: var(--rail-ink-soft);
+}
+
+.rail .role-chip:hover {
+  border-color: var(--rail-accent);
+  color: var(--rail-ink);
+}
+
+.rail .role-chip.on {
+  background: color-mix(in oklch, var(--rail-accent) 18%, transparent);
+  border-color: var(--rail-accent);
+  color: var(--rail-ink);
+}
+
+.rail .role-chip:focus-within {
+  outline-color: var(--rail-accent);
+}
+
+/* ---------------------------------------------------------------- panel */
+
+.panel {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-panel);
+  padding: 16px 20px;
+  margin-block: 16px;
+  box-shadow: var(--shadow);
+}
+
+.panel > h2:first-child {
+  margin-bottom: 12px;
+}
+
+/* ---------------------------------------------------------------- callout */
+
+.callout {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 10px;
+  align-items: start;
+  padding: 14px 16px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-panel);
+  background: var(--surface);
+  margin-block: 16px;
+  box-shadow: var(--shadow);
+}
+
+.callout-glyph {
+  display: inline-flex;
+  margin-top: 2px;
+  color: var(--ink-soft);
+}
+
+.callout-glyph svg {
+  display: block;
+}
+
+.callout-body > * + * {
+  margin-top: 10px;
+}
+
+.callout strong {
+  font-weight: 600;
+}
+
+.callout--accent {
+  background: var(--accent-soft);
+  border-color: var(--accent-line);
+}
+
+.callout--accent .callout-glyph,
+.callout--accent strong {
+  color: var(--accent);
+}
+
+/* the one hero moment: Overview's start-here becomes a committed deep-petrol surface with light
+   text, code refs that read on dark, and an inverted (light-on-dark) primary button. */
+.callout--hero {
+  background: var(--accent-deep);
+  border-color: var(--accent-deep);
+  color: var(--chip-ink);
+}
+
+.callout--hero .callout-glyph,
+.callout--hero strong {
+  color: var(--chip-ink);
+}
+
+.callout--hero .mono {
+  color: var(--rail-accent);
+}
+
+.callout--hero .btn--primary {
+  background: var(--chip-ink);
+  border-color: var(--chip-ink);
+  color: var(--accent-deep);
+}
+
+.callout--hero .btn--primary:hover {
+  background: color-mix(in oklch, var(--chip-ink), var(--accent-deep) 10%);
+  border-color: color-mix(in oklch, var(--chip-ink), var(--accent-deep) 10%);
+}
+
+.callout--hero .btn--primary:focus-visible {
+  outline-color: var(--chip-ink);
+}
+
+.callout--ok {
+  background: var(--ok-soft);
+  border-color: color-mix(in oklch, var(--ok) 40%, var(--line));
+}
+
+.callout--ok .callout-glyph,
+.callout--ok strong {
+  color: var(--ok);
+}
+
+.callout--warn {
+  background: var(--warn-soft);
+  border-color: color-mix(in oklch, var(--warn) 40%, var(--line));
+}
+
+.callout--warn .callout-glyph,
+.callout--warn strong {
+  color: var(--warn);
+}
+
+.callout--danger {
+  background: var(--danger-soft);
+  border-color: color-mix(in oklch, var(--danger) 40%, var(--line));
+}
+
+.callout--danger .callout-glyph,
+.callout--danger strong {
+  color: var(--danger);
+}
+
+.callout--proposal {
+  background: var(--proposal-soft);
+  border-color: color-mix(in oklch, var(--proposal) 40%, var(--line));
+}
+
+.callout--proposal .callout-glyph,
+.callout--proposal strong {
+  color: var(--proposal);
+}
+
+/* ---------------------------------------------------------------- badge */
+
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 20px;
+  padding: 0 8px;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  background: var(--paper);
+  border-color: var(--line);
+  color: var(--ink-soft);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.badge.grain {
+  background: var(--accent-soft);
+  border-color: transparent;
+  color: var(--accent);
+}
+
+.badge.asof {
+  background: var(--paper);
+  border-color: var(--line);
+  color: var(--ink-soft);
+}
+
+/* strong states are SOLID chips: -solid fill, chip-ink text, 600 weight (base weight is 600).
+   Quiet facts (grain, as-of, ok) stay soft. Color never works alone: labels are always present. */
+.badge.pii,
+.badge.sensitivity,
+.badge.rejected {
+  background: var(--danger-solid);
+  border-color: transparent;
+  color: var(--chip-ink);
+}
+
+.badge.stale,
+.badge.held {
+  background: var(--warn-solid);
+  border-color: transparent;
+  color: var(--chip-ink);
+}
+
+.badge.proposal {
+  background: var(--proposal-solid);
+  border-color: transparent;
+  color: var(--chip-ink);
+}
+
+/* review queue's resolved-mock badge: a solid ok chip (distinct from the soft .badge.ok) */
+.badge.resolved {
+  background: var(--ok-solid);
+  border-color: transparent;
+  color: var(--chip-ink);
+}
+
+.badge.ok {
+  background: var(--ok-soft);
+  border-color: transparent;
+  color: var(--ok);
+}
+
+/* ---------------------------------------------------------------- buttons */
+
+button {
+  font: inherit;
+}
+
+.btn,
+button:where(:not(.nav-item)) {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  height: 32px;
+  padding: 0 14px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: var(--ink);
+  font-weight: 500;
+  cursor: pointer;
+  transition: background-color var(--dur-fast) var(--ease-out-quart),
+    border-color var(--dur-fast) var(--ease-out-quart),
+    color var(--dur-fast) var(--ease-out-quart);
+}
+
+.btn:hover,
+button:where(:not(.nav-item)):hover {
+  border-color: var(--accent-line);
+  background: var(--paper);
+}
+
+.btn:active,
+button:where(:not(.nav-item)):active {
+  transform: translateY(0.5px);
+}
+
+.btn:disabled,
+button:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+  transform: none;
+}
+
+.btn--primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--surface);
+}
+
+.btn--primary:hover {
+  background: var(--accent-hover);
+  border-color: var(--accent-hover);
+}
+
+.btn--danger {
+  background: var(--danger);
+  border-color: var(--danger);
+  color: var(--surface);
+}
+
+.btn--danger:hover {
+  background: color-mix(in oklch, var(--danger), black 12%);
+  border-color: color-mix(in oklch, var(--danger), black 12%);
+}
+
+.btn--proposal-confirm {
+  background: var(--proposal);
+  border-color: var(--proposal);
+  color: var(--surface);
+}
+
+.btn--proposal-confirm:hover {
+  background: color-mix(in oklch, var(--proposal), black 12%);
+  border-color: color-mix(in oklch, var(--proposal), black 12%);
+}
+
+/* ---------------------------------------------------------------- fields */
+
+input,
+select,
+textarea {
+  font: inherit;
+  color: var(--ink);
+  background: var(--surface);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius);
+  height: 32px;
+  padding: 0 10px;
+}
+
+textarea {
+  height: auto;
+  padding: 6px 10px;
+}
+
+input::placeholder,
+textarea::placeholder {
+  color: var(--ink-faint);
+}
+
+input[type='checkbox'],
+input[type='radio'] {
+  height: auto;
+  accent-color: var(--accent);
+}
+
+input[type='file'] {
+  padding: 4px 10px;
+  background: transparent;
+  border-color: var(--line);
+}
+
+.field {
+  display: grid;
+  gap: 6px;
+}
+
+.field > label,
+label {
+  display: grid;
+  gap: 6px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--ink-soft);
+}
+
+/* some screens nest the control inside its label (Upload source name + file drop, review-queue
+   inline editor); controls use `font: inherit`, so without this reset they would inherit the
+   12px/600 label typography above and render differently from htmlFor + sibling controls on
+   other screens. (.mono still wins font-size for mono inputs: 13px, weight 400.) */
+label input,
+label select,
+label textarea {
+  font-size: 14px;
+  font-weight: 400;
+}
+
+.field-error {
+  color: var(--danger);
+  font-size: 13px;
+}
+
+form {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: end;
+  gap: 12px;
+  margin-block: 12px;
+}
+
+/* ---------------------------------------------------------------- rows / lists */
+
+.rows {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-panel);
+  margin-block: 16px;
+  padding: 0;
+  list-style: none;
+  box-shadow: var(--shadow);
+}
+
+.row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-height: 40px;
+  padding: 8px 16px;
+}
+
+.row + .row {
+  border-top: 1px solid var(--line);
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+th {
+  text-align: left;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--ink-soft);
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--line-strong);
+}
+
+td {
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--line);
+  height: 40px;
+}
+
+th.num,
+td.num {
+  text-align: right;
+}
+
+/* ---------------------------------------------------------------- key-value grid */
+
+.kv {
+  display: grid;
+  /* keys size to content but cap at 240px: an unbroken uploaded key wraps (with the
+     overflow-wrap rule below) instead of blowing the column out */
+  grid-template-columns: fit-content(240px) 1fr;
+  gap: 6px 16px;
+  margin: 0;
+  padding: 10px 12px;
+  background: var(--surface-2);
+  border-radius: var(--radius);
+}
+
+.kv > div {
+  display: contents;
+}
+
+.kv dt {
+  color: var(--ink-soft);
+  font-size: 13px;
+}
+
+.kv dd {
+  margin: 0;
+  min-width: 0;
+}
+
+/* ---------------------------------------------------------------- empty state */
+
+.empty {
+  border: 1px dashed var(--line-strong);
+  border-radius: var(--radius-panel);
+  padding: 20px;
+  margin-block: 16px;
+  color: var(--ink-soft);
+}
+
+.empty .next {
+  margin-top: 6px;
+  color: var(--ink);
+}
+
+/* ---------------------------------------------------------------- flow list (Overview loop) */
+
+.flow-list {
+  list-style: none;
+  margin: 12px 0 0;
+  padding: 0;
+}
+
+.flow-list li {
+  display: flex;
+  gap: 16px;
+  align-items: baseline;
+  min-height: 40px;
+  padding: 12px 4px;
+}
+
+.flow-list li + li {
+  border-top: 1px solid var(--line);
+}
+
+.flow-num {
+  font-family: var(--font-mono);
+  font-size: 20px;
+  font-weight: 500;
+  line-height: 1.2;
+  color: var(--accent);
+  flex: none;
+}
+
+.flow-body a {
+  font-weight: 600;
+}
+
+.flow-body p {
+  margin-top: 1px;
+  color: var(--ink-soft);
+}
+
+/* ---------------------------------------------------------------- misc text states */
+
+.error {
+  color: var(--danger);
+  font-size: 13px;
+}
+
+.hint {
+  color: var(--ink-faint);
+  font-size: 13px;
+}
+
+/* uploaded strings are hostile: a single unbroken token (object_ref, raw value, reason,
+   filename) must wrap inside its container, never stretch rows or push actions off-screen.
+   overflow-wrap inherits, so .row covers its descendants too. */
+.row,
+.kv dt,
+.kv dd,
+.callout p,
+.error,
+.field-error,
+.hint,
+code,
+.mono {
+  overflow-wrap: anywhere;
+}
+
+/* the callout text column is a 1fr grid track: without min-width:0 a long unbroken token
+   would still widen it past the panel edge */
+.callout-body {
+  min-width: 0;
+}
+
+section > h2 {
+  margin-top: 32px;
+}
+
+section > h2:first-child {
+  margin-top: 0;
+}
+
+/* ---------------------------------------------------------------- review queue: mock inline fixes
+   Appended for ReviewQueueScreen's client-side mock flows (fix inline, revalidate, dismiss,
+   mapping rules). Composes the existing .row / .kv / .callout / .badge vocabulary; nothing above
+   this line is modified. Every resolution here is local-only and labeled as such in the copy. */
+
+/* one quarantine row, stacked: head + kv + optional editor */
+.q-item {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 10px;
+  padding-block: 12px;
+}
+
+.q-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.q-reason {
+  font-weight: 600;
+  /* flex item: allow it to shrink and wrap so a hostile reason string cannot push
+     the Fix inline / Dismiss actions off-screen */
+  min-width: 0;
+}
+
+.q-actions {
+  margin-left: auto;
+  display: flex;
+  gap: 8px;
+  flex: none;
+}
+
+/* resolved rows dim; the badge + note carry the state (never color alone) */
+.q-item--resolved {
+  opacity: 0.62;
+}
+
+.q-reason--muted {
+  color: var(--ink-soft);
+  font-weight: 500;
+}
+
+.q-note {
+  color: var(--ink-soft);
+  font-size: 13px;
+}
+
+/* offending cell(s) in the kv grid: danger-soft wash + danger text on the key and value */
+.kv dt.q-off,
+.kv dd.q-off {
+  background: var(--danger-soft);
+  color: var(--danger);
+  border-radius: 4px;
+  padding: 1px 6px;
+  margin: -1px -6px;
+}
+
+.q-blank {
+  color: var(--ink-faint);
+  font-style: italic;
+}
+
+/* Dismiss: ghost/tertiary — no border, quiet until hovered */
+.q-ghost {
+  border-color: transparent;
+  background: transparent;
+  color: var(--ink-soft);
+}
+
+.q-ghost:hover {
+  border-color: var(--line);
+  background: var(--paper);
+  color: var(--ink);
+}
+
+/* inline editor revealed under a row */
+.q-editor {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: end;
+  gap: 12px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface-2);
+}
+
+.q-editor-field {
+  display: grid;
+  gap: 6px;
+}
+
+.q-editor-field input {
+  min-width: 180px;
+}
+
+.q-editor-actions {
+  display: flex;
+  gap: 8px;
+}
+
+/* mapping-rule callout form: replacement input + primary action */
+.q-rule-form {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.q-rule-form input {
+  min-width: 200px;
+}
+
+/* mapping-rule chip strip */
+.q-rules {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-block: 12px;
+}
+
+.q-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.q-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 28px;
+  padding: 2px 4px 2px 10px;
+  border: 1px solid var(--accent-line);
+  border-radius: 999px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-size: 13px;
+}
+
+.q-chip-x {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  min-height: 0;
+  padding: 0;
+  border: none;
+  border-radius: 999px;
+  background: transparent;
+  color: inherit;
+  font-size: 15px;
+  line-height: 1;
+}
+
+/* the glyph stays 22px, but the clickable box is 32x32 (PRODUCT.md: hit targets >= 32px);
+   chip gaps (8px) keep the expanded targets from overlapping neighbors */
+.q-chip-x::after {
+  content: '';
+  position: absolute;
+  inset: -5px;
+}
+
+.q-chip-x:hover {
+  background: color-mix(in oklch, var(--accent) 16%, var(--surface));
+  border-color: transparent;
+}
