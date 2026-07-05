@@ -101,11 +101,11 @@ def _column_meta(conn, pairs: list[tuple[str, str]]) -> dict[str, dict]:
         return {}
     refs = [ref for _, ref in pairs]
     rows = conn.execute(
-        "SELECT catalog_source, object_ref, additivity FROM graph_node "
+        "SELECT catalog_source, object_ref, additivity, unit, currency FROM graph_node "
         "WHERE kind = 'column' AND object_ref = ANY(%s)", (refs,)).fetchall()
     wanted = set(pairs)
-    return {ref: {"catalog_source": cs, "additivity": add}
-            for cs, ref, add in rows if (cs, ref) in wanted}
+    return {ref: {"catalog_source": cs, "additivity": add, "unit": unit, "currency": cur}
+            for cs, ref, add, unit, cur in rows if (cs, ref) in wanted}
 
 
 def _table_has_as_of(conn, catalog_source: str, table: str) -> bool:
@@ -150,6 +150,14 @@ def _validate_idea(conn, raw: dict, known: set[str], src_of: dict[str, set[str]]
         for d in derives:
             if meta.get(d, {}).get("additivity") in ("semi_additive", "non_additive"):
                 return None, f"unsafe additive aggregation of {d}"
+    # unit/currency safety: combining columns of mixed scale (dollars vs cents) / currency is
+    # silently wrong (migration 0957). Reject when the derives span >1 distinct non-empty unit/currency.
+    units = {meta[d]["unit"] for d in derives if meta.get(d, {}).get("unit")}
+    currencies = {meta[d]["currency"] for d in derives if meta.get(d, {}).get("currency")}
+    if len(units) > 1:
+        return None, f"mixed units {sorted(units)} — aggregation would be silently wrong"
+    if len(currencies) > 1:
+        return None, f"mixed currencies {sorted(currencies)}"
     if _is_windowed(raw.get("aggregation")):   # point-in-time: a windowed feature needs an as-of column
         for src, d in pairs:
             # object_ref is "[catalog.]schema.table.column"; table is the second-to-last segment.

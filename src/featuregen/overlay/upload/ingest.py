@@ -84,6 +84,10 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
     upload = UploadCatalog(catalog_source, vr.good)
     brake = large_change_brake(conn, catalog_source, upload)
     if brake.held:
+        # persist the quarantine even when held, so a reviewer can see WHY this upload's rows failed
+        # (was: returned before persist_quarantine -> the queue still showed the previous upload).
+        persist_quarantine(conn, catalog_source, vr.quarantined)
+        logger.warning("upload of %r held by the large-change brake: %s", catalog_source, brake.reason)
         return IngestResult("held", brake.reason, 0, 0, len(vr.quarantined))
 
     asserted = 0

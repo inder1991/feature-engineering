@@ -222,3 +222,17 @@ def test_feature_assist_egress_guard_blocks_pii_objective(db):
     out = recommend_features(db, "predict churn for joe@bank.com", client,
                              catalog_source="bank", now=NOW)
     assert out == []   # egress guard raised on the email -> no dispatch -> no features
+
+
+def test_gauntlet_rejects_mixed_units(db):
+    # a feature combining dollars + cents is silently wrong -> rejected
+    build_graph(db, "t", [
+        CanonicalRow("t", "accounts", "id", "integer", is_grain=True),
+        CanonicalRow("t", "accounts", "balance", "numeric", unit="dollars"),
+        CanonicalRow("t", "accounts", "fee", "numeric", unit="cents"),
+        CanonicalRow("t", "accounts", "posted_at", "timestamp", as_of=True)])
+    _fresh_watermark(db, "t", NOW)
+    client = FakeLLM(script={"overlay.feature.recommend": FakeResponse(output={"features": [
+        {"name": "mixed", "derives_from": ["public.accounts.balance", "public.accounts.fee"],
+         "aggregation": "avg_90d"}]})})
+    assert recommend_features(db, "x", client, catalog_source="t", now=NOW) == []
