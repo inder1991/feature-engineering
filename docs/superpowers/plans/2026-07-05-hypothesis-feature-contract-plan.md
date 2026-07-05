@@ -38,10 +38,12 @@ Test `tests/featuregen/overlay/upload/contract/test_intake.py`.
 
 **Interfaces (Produces):**
 - `@dataclass Intent{ intent_id, hypothesis, definition, intake_mode, redacted_hypothesis, redacted_definition, classification }`
-- `submit_intent(conn, *, hypothesis: str, definition: str = "", actor) -> Intent` — **denies** (raises
-  `IntentValidationError`) when `hypothesis` is blank (no run created — resubmit, not a terminal reject);
-  fixes `intake_mode` = `definition` if `definition` else `hypothesis` (immutable); redacts+classifies BOTH
-  texts via the SP-2 redactor (`intake/redaction.py`); persists the intent (event or row).
+- `submit_intent(*, hypothesis: str, definition: str = "", actor, redactor=None) -> Intent` — **denies**
+  (raises `IntentValidationError`) when `hypothesis` is blank (no run created — resubmit, not a terminal
+  reject); fixes `intake_mode` = `definition` if `definition` else `hypothesis` (immutable);
+  redacts+classifies BOTH texts via the SP-2 redactor (`intake/redaction.py`), classified against its own
+  scanner. **Persistence deferred to Phase 2** — the intent is recorded together with the considered-set at
+  Gate #1, so Phase 1 stays a pure, DB-free intake unit (no `conn`).
 
 - [ ] **Step 1: Failing test** — `submit_intent` with no hypothesis raises `IntentValidationError`; with a
   hypothesis sets `intake_mode='hypothesis'`; with both sets `intake_mode='definition'` and both redacted
@@ -99,10 +101,18 @@ Test `.../contract/test_author.py`.
 - `critique_contract(conn, draft, client, *, actor) -> list[Finding]` — adversarial LLM review (leakage/
   unsafe-aggregation/wrong-grain/undocumented-assumption/drift-fragility); emits `CONTRACT_CRITIQUED`.
 - `refine_contract(conn, draft, findings, client, *, actor) -> ContractDraft` — emits `CONTRACT_REFINED`.
-- A bounded **critique→refine loop** (mirrors the feature loop: LLM proposes, code owns the loop).
 - `validate_minimum(conn, draft) -> (bool, reasons)` — **MCV = the deterministic gauntlet** (reuse
   `_validate_idea`'s checks: leakage/freshness/additivity/point-in-time/join-path); emits
   `MINIMUM_CONTRACT_VALIDATED` on pass.
+- A bounded **critique→refine loop**, symmetric with the feature loop: **the deterministic MCV runs
+  inside every pass** and its failures feed `refine` alongside the LLM critique — so refinement is driven
+  by deterministic defects, not just LLM opinion, and the LLM never gates alone:
+  ```
+  for _ in range(budget):
+      findings = critique_contract(draft) + validate_minimum(draft).reasons   # LLM + deterministic
+      if not findings: break
+      draft = refine_contract(draft, findings)
+  ```
 
 - [ ] Tasks: TDD each (critique flags a planted leak; refine clears it; MCV rejects an unsafe draft) →
   commit `feat(contract): critique→refine loop + deterministic MCV`.
@@ -125,15 +135,21 @@ Test `.../contract/test_author.py`.
 
 ---
 
-## Phase 6 — Retire the superseded SP-2 intake discovery
+## Phase 6 — Retire the superseded SP-2 intake discovery — **DEFERRED (needs its own plan)**
 
-**Files:** delete `intake/{candidates,scoring,mcv,doubt_router}.py` + intake-discovery commands/tests that
-the loop replaces; keep `intake/{redaction,events,state,contract}.py` (reused). Rewire `intake/bootstrap.py`.
+**Pre-flight run 2026-07-05 — it is NOT a clean delete. Three blocking findings:**
+1. **Wired into the production runtime:** `runtime/worker.py` imports `intake.commands`/`bootstrap`/
+   `read_model` — the SP-2 intake flow is mounted in the worker, not just dormant. Deleting the discovery
+   modules breaks the worker; the worker must be rewired first.
+2. **The keep-set is entangled with the delete-set:** `intake/state.py` has `mcv_passed()`, folds
+   `candidates`, and imports are shared with `mcv`/`commands`. The feature-contract `events`/`state`/
+   `contract` (which Phases 1–5 reuse) cannot be cleanly separated from `candidates`/`scoring`/`mcv`/
+   `doubt_router` — it is one aggregate. A split, not a delete.
+3. **~459 test functions across 55 intake test files** exercise this flow — all need triage.
 
-- [ ] **Pre-flight:** grep for every importer of the to-delete modules; confirm only the retired intake
-  flow depends on them (the KEPT redactor/events/state must not). Present the delete list + any surprising
-  dependency to the human before deleting.
-- [ ] TDD: delete → run full suite → fix fallout → commit `refactor(contract): retire superseded SP-2 intake discovery`.
+**Decision (2026-07-05):** DEFERRED. The dormant SP-2 discovery harms nothing, and Phases 1–5 deliver the
+new contract flow without touching it. Retirement is a genuine refactor (worker rewire + aggregate split +
+test triage) that deserves its own spec+plan — not a tail-end deletion. Do NOT execute blind.
 
 ---
 

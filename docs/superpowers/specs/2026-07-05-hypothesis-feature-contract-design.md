@@ -63,8 +63,10 @@ AUTHOR CONTRACT (LLM)   — DRAFT_CONTRACT_PRODUCED: author the full contract fr
         │                  unit, lineage narrative, assumptions).
         ▼
 CRITIQUE → REFINE (LLM loop)   — CONTRACT_CRITIQUED (adversarial) → CONTRACT_REFINED; bounded, code-owned.
+        │                          The deterministic MCV runs INSIDE each pass; its failures feed refine
+        │                          alongside the LLM critique (symmetric with the feature loop).
         ▼
-MCV (code)   — MINIMUM_CONTRACT_VALIDATED = the deterministic gauntlet. No LLM.
+MCV (code)   — MINIMUM_CONTRACT_VALIDATED = the deterministic gauntlet. No LLM. Also the final gate.
         ▼
 CONTRACT_CONFIRMED (human)   — the governing write. Registered, versioned.
         ▼

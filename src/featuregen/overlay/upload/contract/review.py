@@ -1,0 +1,68 @@
+"""Phase 4 — critique → refine loop + MCV (minimum contract validation).
+
+The bounded loop is symmetric with the feature loop: each pass runs the **deterministic MCV** (the gauntlet
+re-applied to the draft) *and* the **LLM critique** (advisory, on the definition narrative); their combined
+findings drive `refine`; the loop stops clean or at budget. The MCV never lets the LLM gate — a structural
+defect the LLM cannot fix stops the loop and is surfaced. The structured facts are immutable; refine only
+re-authors the definition narrative (audited).
+"""
+from __future__ import annotations
+
+from dataclasses import replace
+from datetime import datetime, timedelta
+
+from featuregen.intake.llm import LLMClient
+from featuregen.overlay.upload.contract.author import ContractDraft
+from featuregen.overlay.upload.enrich_llm import audited_enrich_call
+from featuregen.overlay.upload.feature_assist import _call_raw, _validate_idea
+
+
+def validate_minimum(conn, draft: ContractDraft, *, target_ref: str | None = None,
+                     now: datetime | None = None,
+                     fresh_within: timedelta = timedelta(hours=24)) -> tuple[bool, list[str]]:
+    """MCV — the deterministic gauntlet re-applied to the draft (defense in depth: a source could have
+    gone stale since discovery). Reuses the feature loop's checks. No LLM."""
+    raw = {"derives_from": draft.derives_from, "aggregation": draft.aggregation}
+    idea, reason = _validate_idea(conn, raw, set(draft.derives_from), target_ref, now, fresh_within)
+    return (idea is not None, [] if idea is not None else [reason])
+
+
+def critique_contract(conn, draft: ContractDraft, client: LLMClient) -> list[str]:
+    """Advisory adversarial review of the definition NARRATIVE (accuracy / completeness / undocumented
+    assumptions). Does NOT gate — the deterministic MCV does."""
+    out = _call_raw(client, "overlay.contract.critique", "contract_critique_v1", "contract_critique",
+                    {"feature": draft.feature_name, "definition": draft.definition,
+                     "aggregation": draft.aggregation, "derives_from": draft.derives_from})
+    return [str(f) for f in out.get("findings", []) if f]
+
+
+def refine_contract(conn, draft: ContractDraft, findings: list[str], client: LLMClient, *,
+                    actor=None) -> ContractDraft:
+    """Re-author the definition to address the findings (audited). Structured facts are immutable."""
+    new_def = audited_enrich_call(
+        conn, client, task="overlay.contract.refine", prompt_id="overlay_contract_v1",
+        schema_id="overlay_contract",
+        catalog_metadata={"feature": draft.feature_name, "definition": draft.definition,
+                          "findings": list(findings)},
+        out_key="definition",
+        instruction="Revise the feature definition to address these review findings. Metadata only; "
+                    "no data values.",
+        actor=actor)
+    return replace(draft, definition=new_def) if new_def else draft
+
+
+def author_contract(conn, draft: ContractDraft, client: LLMClient, *, target_ref: str | None = None,
+                    now: datetime | None = None, budget: int = 2,
+                    actor=None) -> tuple[ContractDraft, list[str]]:
+    """Bounded critique→refine loop; MCV each pass. Returns (draft, unresolved_mcv_reasons) — an empty
+    list means the contract passed MCV and the critique is clean (or budget was spent with MCV clean)."""
+    for _ in range(budget):
+        _, mcv = validate_minimum(conn, draft, target_ref=target_ref, now=now)
+        critique = critique_contract(conn, draft, client)
+        if not mcv and not critique:
+            return draft, []                       # clean
+        if mcv and not critique:
+            return draft, mcv                      # structural defect the LLM can't fix → surface
+        draft = refine_contract(conn, draft, mcv + critique, client, actor=actor)
+    _, mcv = validate_minimum(conn, draft, target_ref=target_ref, now=now)
+    return draft, mcv
