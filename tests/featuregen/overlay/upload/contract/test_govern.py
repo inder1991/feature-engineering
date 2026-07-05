@@ -1,6 +1,8 @@
 """Phase 5 — confirm + govern: versioned, drift-linked contract."""
 from datetime import datetime, timedelta, timezone
 
+import pytest
+
 from featuregen.overlay.upload.canonical import CanonicalRow
 from featuregen.overlay.upload.contract.author import ContractDraft
 from featuregen.overlay.upload.contract.govern import (
@@ -64,3 +66,20 @@ def test_contracts_affected_by_drift(db):
     # drift on the balance column surfaces the contract as impacted
     assert c.contract_id in contracts_affected_by(db, "bank", "public.accounts.balance")
     assert contracts_affected_by(db, "bank", "public.accounts.nonexistent") == []
+
+
+def test_confirm_reruns_mcv_and_refuses_bad_drafts(db):
+    from featuregen.overlay.upload.contract.govern import ContractValidationError
+    _bank(db)
+    # B1: leaky draft (derives the declared target) refused at the gate
+    with pytest.raises(ContractValidationError):
+        confirm_contract(db, _draft(), actor="ds1", target_ref="public.accounts.balance", now=NOW)
+    # empty-definition draft refused (no empty-narrative governing contract)
+    empty = ContractDraft("avg_balance_90d", "", "accounts", "avg_90d", "posted_at",
+                          ["public.accounts.balance"])
+    with pytest.raises(ContractValidationError):
+        confirm_contract(db, empty, actor="ds1", now=NOW)
+    # draft referencing a vanished column refused (grounding via live graph)
+    ghost = ContractDraft("g", "def", "accounts", "avg_90d", "posted_at", ["public.accounts.vanished"])
+    with pytest.raises(ContractValidationError):
+        confirm_contract(db, ghost, actor="ds1", now=NOW)

@@ -14,6 +14,7 @@ from datetime import datetime
 from featuregen.aggregates.ids import mint_id
 from featuregen.contracts.identity import identity_to_jsonb
 from featuregen.overlay.upload.contract.author import ContractDraft
+from featuregen.overlay.upload.contract.review import validate_minimum
 from featuregen.overlay.upload.features import (
     FeatureFreshness,
     FeatureSpec,
@@ -21,6 +22,10 @@ from featuregen.overlay.upload.features import (
     features_affected_by,
     register_feature,
 )
+
+
+class ContractValidationError(Exception):
+    """The draft failed the deterministic MCV — it must not be governed."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -50,9 +55,16 @@ def _derives_pairs(conn, object_refs: list[str]) -> tuple[tuple[str, str], ...]:
     return tuple((r[1], r[0]) for r in rows)
 
 
-def confirm_contract(conn, draft: ContractDraft, *, actor) -> Contract:
-    """The human gate. Registers the draft as a versioned governed contract + wires its derives-from
-    into the feature layer. Re-confirming the same feature bumps the version."""
+def confirm_contract(conn, draft: ContractDraft, *, actor, target_ref: str | None = None,
+                     now: datetime | None = None) -> Contract:
+    """The human gate. RE-RUNS the deterministic MCV (B1) and refuses to govern an invalid draft, then
+    registers a versioned governed contract + wires its derives-from into the feature layer. Re-confirming
+    the same feature bumps the version. A non-empty definition is required (no empty-narrative contract)."""
+    ok, reasons = validate_minimum(conn, draft, target_ref=target_ref, now=now)
+    if not ok:
+        raise ContractValidationError(f"contract failed MCV, not governed: {reasons}")
+    if not (draft.definition or "").strip():
+        raise ContractValidationError("contract has an empty definition, not governed")
     pairs = _derives_pairs(conn, draft.derives_from)
     feature_id = register_feature(conn, FeatureSpec(
         name=draft.feature_name, description=draft.definition, grain_table=draft.grain_table,

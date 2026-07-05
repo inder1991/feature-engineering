@@ -17,13 +17,25 @@ from featuregen.overlay.upload.enrich_llm import audited_enrich_call
 from featuregen.overlay.upload.feature_assist import _call_raw, _validate_idea
 
 
+def _live_columns(conn, object_refs: list[str]) -> set[str]:
+    """The columns that ACTUALLY exist in the graph now (not the draft's own claim) — so a column
+    dropped/renamed since discovery is caught as ungrounded (B2)."""
+    if not object_refs:
+        return set()
+    rows = conn.execute(
+        "SELECT DISTINCT object_ref FROM graph_node WHERE kind = 'column' AND object_ref = ANY(%s)",
+        (list(object_refs),)).fetchall()
+    return {r[0] for r in rows}
+
+
 def validate_minimum(conn, draft: ContractDraft, *, target_ref: str | None = None,
                      now: datetime | None = None,
                      fresh_within: timedelta = timedelta(hours=24)) -> tuple[bool, list[str]]:
     """MCV — the deterministic gauntlet re-applied to the draft (defense in depth: a source could have
-    gone stale since discovery). Reuses the feature loop's checks. No LLM."""
+    gone stale or been dropped since discovery). Reuses the feature loop's checks. No LLM."""
     raw = {"derives_from": draft.derives_from, "aggregation": draft.aggregation}
-    idea, reason = _validate_idea(conn, raw, set(draft.derives_from), target_ref, now, fresh_within)
+    known = _live_columns(conn, draft.derives_from)   # LIVE graph, not set(draft.derives_from) (B2)
+    idea, reason = _validate_idea(conn, raw, known, target_ref, now, fresh_within)
     return (idea is not None, [] if idea is not None else [reason])
 
 

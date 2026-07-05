@@ -71,3 +71,11 @@ def test_structural_defect_surfaces_and_stops(db):
     final, unresolved = author_contract(db, draft, client, target_ref="public.accounts.churned",
                                         now=NOW, budget=3)
     assert unresolved and "leaks target" in unresolved[0]
+
+
+def test_mcv_grounding_uses_live_graph_not_the_draft(db):
+    # B2: a draft claiming a column that no longer exists in the graph must fail grounding.
+    _bank(db)
+    ghost = _draft(["public.accounts.vanished"])
+    ok, reasons = validate_minimum(db, ghost, now=NOW)
+    assert not ok and "ungrounded" in reasons[0]
