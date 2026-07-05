@@ -21,6 +21,10 @@ _ALIASES: dict[str, set[str]] = {
     "sensitivity": {"sensitivity", "sensitive", "classification"},
     "joins_to": {"joinsto", "fk", "fktarget", "foreignkey", "references"},
     "cardinality": {"cardinality", "card"},
+    "additivity": {"additivity", "additive"},
+    "unit": {"unit", "units"},
+    "currency": {"currency", "ccy"},
+    "entity": {"entity", "businessentity"},
 }
 _TRUE = {"y", "yes", "true", "1"}
 
@@ -54,4 +58,6 @@ def build_row(fmap: Mapping[str, str], rowdict: Mapping[str, object], source: st
         table=cell("table"), column=cell("column"), type=cell("type"),
         is_grain=flag("is_grain"), as_of=flag("as_of"),
         definition=cell("definition"), sensitivity=cell("sensitivity").lower(),
-        joins_to=cell("joins_to"), cardinality=cell("cardinality"))
+        joins_to=cell("joins_to"), cardinality=cell("cardinality"),
+        additivity=cell("additivity").lower(), unit=cell("unit"),
+        currency=cell("currency"), entity=cell("entity"))
