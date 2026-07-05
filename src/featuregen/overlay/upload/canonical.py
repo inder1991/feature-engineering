@@ -13,6 +13,7 @@ class CanonicalRow:
     type: str
     is_grain: bool = False
     as_of: bool = False
+    definition: str = ""
 
 
 @dataclass(frozen=True, slots=True)

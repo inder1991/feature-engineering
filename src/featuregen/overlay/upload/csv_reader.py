@@ -12,6 +12,7 @@ _ALIASES = {
     "type": {"type", "datatype", "sqltype"},
     "is_grain": {"isgrain", "grain"},
     "as_of": {"asof", "asofcolumn"},
+    "definition": {"definition", "description", "comment", "notes"},
 }
 _TRUE = {"y", "yes", "true", "1"}
 
@@ -45,5 +46,6 @@ def read_csv_rows(text: str, *, source: str) -> list[CanonicalRow]:
         rows.append(CanonicalRow(
             source=cell("source") or source,
             table=cell("table"), column=cell("column"), type=cell("type"),
-            is_grain=flag("is_grain"), as_of=flag("as_of")))
+            is_grain=flag("is_grain"), as_of=flag("as_of"),
+            definition=cell("definition")))
     return rows
