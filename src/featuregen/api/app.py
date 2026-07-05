@@ -8,15 +8,21 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from featuregen.aggregates.bootstrap import register_phase06_event_schemas
+from featuregen.api.routes import uploads
+from featuregen.events.registry import event_registry
 from featuregen.intake.llm import LLMClient
 from featuregen.overlay.config import overlay_config_from_env, register_overlay_config
+from featuregen.overlay.facts import register_overlay_event_types
 
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     # The same process bootstrap the worker and the test suite use: event schemas (idempotent)
     # + the sealed overlay config (fail-closed accessor needs it registered before any ingest).
+    # The overlay OVERLAY_FACT_* schemas are what an upload's append_event validation needs
+    # (production wires them via register_overlay in runtime.worker); register them here too.
     register_phase06_event_schemas()
+    register_overlay_event_types(event_registry())
     register_overlay_config(overlay_config_from_env())
     yield
 
@@ -24,6 +30,8 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
 def create_app(llm_client: LLMClient | None = None) -> FastAPI:
     app = FastAPI(title="FeatureGen API", lifespan=_lifespan)
     app.state.llm_client = llm_client
+
+    app.include_router(uploads.router)
 
     @app.get("/health")
     def health() -> dict[str, str]:
