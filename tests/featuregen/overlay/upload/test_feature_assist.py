@@ -45,7 +45,13 @@ def test_feature_recipe_pairs_llm_intent_with_deterministic_join_path(db):
     assert recipe.derives_from == ["public.transactions.amount"]
     # the join path is real (found deterministically), not invented by the LLM
     assert len(recipe.join_path) == 1
-    assert recipe.join_path[0].cardinality == "N:1"
+    step = recipe.join_path[0]
+    # Traversal accounts -> transactions is the REVERSE of the stored transactions->accounts N:1,
+    # so oriented to the traversal it is 1:N (one account fans out to many transactions) and the
+    # step reads forward from the grain (M7).
+    assert step.cardinality == "1:N"
+    assert step.from_ref == "public.accounts.account_id"
+    assert step.to_ref == "public.transactions.acct_id"
 
 
 def test_leakage_check_flags_target_derived_column(db):

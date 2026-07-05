@@ -36,9 +36,12 @@ def _table_facts(rows: list[CanonicalRow]):
         grain_cols = [r.column for r in trows if r.is_grain]
         if grain_cols:
             yield table, "grain", {"columns": grain_cols, "is_unique": True}
-        as_of = next((r.column for r in trows if r.as_of), None)
-        if as_of:
-            yield table, "availability_time", {"column": as_of, "basis": "posted_at"}
+        as_of_row = next((r for r in trows if r.as_of), None)
+        if as_of_row:
+            # Use the declared basis when valid; default to posted_at (M8 — no longer hard-coded).
+            basis = as_of_row.as_of_basis if as_of_row.as_of_basis in (
+                "posted_at", "ingested_at") else "posted_at"
+            yield table, "availability_time", {"column": as_of_row.column, "basis": basis}
 
 
 def _assert_fact(conn, source: str, table: str, fact_type: str, value: dict, *, actor) -> bool:

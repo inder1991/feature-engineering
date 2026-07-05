@@ -81,3 +81,15 @@ def test_multi_source_rows_quarantined_not_crash(db):
     assert res.status == "ingested"          # no UniqueViolation / rollback
     assert res.quarantined == 1              # the 'cards' row is quarantined
     assert _grain(db, "deposits", "accounts").value == {"columns": ["id"], "is_unique": True}
+
+
+def test_declared_as_of_basis_is_used(db):
+    """M8: availability_time.basis follows the declared as_of_basis, not a hard-coded posted_at."""
+    _seal()
+    src = "events"
+    rows = [CanonicalRow(src, "log", "id", "integer", is_grain=True),
+            CanonicalRow(src, "log", "ingested_ts", "timestamp", as_of=True,
+                         as_of_basis="ingested_at")]
+    assert ingest_upload(db, src, rows, actor=_actor(), now=NOW).status == "ingested"
+    av = resolve_fact(db, UploadCatalog(src, []), table_ref(src, "log"), "availability_time", now=NOW)
+    assert av.value == {"column": "ingested_ts", "basis": "ingested_at"}

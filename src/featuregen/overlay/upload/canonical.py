@@ -13,6 +13,7 @@ class CanonicalRow:
     type: str
     is_grain: bool = False
     as_of: bool = False
+    as_of_basis: str = ""     # posted_at | ingested_at (how availability is derived)
     definition: str = ""
     sensitivity: str = ""
     joins_to: str = ""        # target "table.column" (single-column join)
