@@ -25,9 +25,11 @@ delete modules + tests, (5) clean DB artifacts, (6) verify. Each phase leaves th
   `feature_contract` aggregate. So the keep-set must be **trimmed before delete** (Phase 1a): remove
   `call_llm` (used ONLY by delete-set) and the `events`/FC `store` imports from `llm.py`. The overlay uses
   `record_llm_call` (decoupled — writes only `llm_call`), NOT `call_llm`, so this is safe.
-- **`intake/llm_claude.py`:** the real `LLMClient` adapter. **CORRECTION:** it has ZERO external callers
-  (`build_claude_llm` is uncalled; the overlay takes its client as a parameter). Keep it as the sole real
-  adapter for future real-provider wiring, but it is not a live dependency — deleting is also defensible.
+- **`intake/llm_claude.py`:** the real `LLMClient` adapter. **HARD KEEP — it now HAS a live caller**
+  (superseding the earlier "zero external callers / deleting also defensible" note): the HTTP API's
+  production entrypoint `featuregen.api.app.create_app_from_env` imports `ClaudeConfig`/`build_claude_llm`
+  and constructs the adapter when `FEATUREGEN_LLM_PROVIDER=anthropic`. Deleting it breaks the API at
+  import time. Treat it exactly like the rest of the keep-set (signatures frozen).
 - **The overlay real-provider enrichment + the whole `overlay/upload/contract/` flow MUST keep passing** —
   they import `intake.llm` (LLMClient/LLMRequest/drive_structured_call/record_llm_call/compute_input_hash/
   STATUS_FAILED) and `intake.redaction` (assert_llm_safe/build_llm_inputs/RedactionResult/EgressViolation/
@@ -167,7 +169,7 @@ FC-table disposition.
   generic nullable `feature_contract_id` correlation column, `outbox` has one `aggregate=="feature_contract"`
   partition case, and `0508` has a dead CHECK arm. Nothing appends FC events post-retirement, so these are
   **leave-able in place** — no shim needed. Only remove if a later cleanup wants it.
-- **`llm_claude` has no callers:** `build_claude_llm` is uncalled; the overlay takes its client as a param.
-  Keep it as the sole real adapter (defensible) — but it is not a live dependency (the earlier "overlay
-  needs it" reason was wrong).
+- **`llm_claude` HAS a live caller (updated):** `featuregen.api.app.create_app_from_env` (the uvicorn
+  `--factory` entrypoint) calls `build_claude_llm` when `FEATUREGEN_LLM_PROVIDER=anthropic`. The earlier
+  "no callers / deleting defensible" assessment predates the API layer — `llm_claude.py` is a hard keep.
 - **Scale:** ~2549-line `commands.py` + ~40 test files — expect several green-fix iterations in Phase 4.
