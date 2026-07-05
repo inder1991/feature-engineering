@@ -12,6 +12,7 @@ from featuregen.api.routes import (
     assist,
     auth,
     contract,
+    entity,
     features,
     graph,
     quarantine,
@@ -48,6 +49,7 @@ def create_app(llm_client: LLMClient | None = None) -> FastAPI:
     app.include_router(features.router)
     app.include_router(assist.router)
     app.include_router(contract.router)
+    app.include_router(entity.router)
 
     @app.get("/health")
     def health() -> dict[str, str]:

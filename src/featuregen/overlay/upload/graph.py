@@ -73,6 +73,15 @@ def build_graph(conn, catalog_source: str, rows: list[CanonicalRow],
                 "VALUES (%s, 'joins', %s, %s, %s) ON CONFLICT DO NOTHING",
                 (catalog_source, c_ref, to_ref, r.cardinality or None))
 
+    # Re-apply human-confirmed entity tags (entity_suggestion). The graph was just rebuilt from the
+    # upload, which may not declare these; a confirmed tag must survive re-upload. Only fills a blank —
+    # a freshly-declared entity on the upload wins.
+    conn.execute(
+        "UPDATE graph_node n SET entity = s.suggested_entity FROM entity_suggestion s "
+        "WHERE s.catalog_source = n.catalog_source AND s.object_ref = n.object_ref "
+        "AND s.status = 'applied' AND n.catalog_source = %s AND n.entity IS NULL",
+        (catalog_source,))
+
 
 @dataclass(frozen=True, slots=True)
 class JoinEdge:

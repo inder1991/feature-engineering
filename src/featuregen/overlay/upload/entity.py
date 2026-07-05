@@ -5,20 +5,19 @@ columns across different catalogs denote the same business entity. Columns carry
 tag (`Customer`, `Account`); this module reads that tag out of the graph to expose entity membership
 **across catalogs** — the raw material for cross-source join paths and cross-domain candidate gathering.
 
-No new tables: entity membership is derived from `graph_node.entity`. Reads are read-scoped (an entity
-key column may itself be sensitive).
+Entity membership is derived from `graph_node.entity`; human-confirmed suggestions are persisted in
+`entity_suggestion` (advisory until applied). Reads are read-scoped (an entity key column may be sensitive).
 
-STATUS: NOT YET WIRED into the live flow. The live cross-domain gather (`feature_assist._candidate_columns`
-with `entity=`) queries `graph_node.entity` directly; this module (`cross_join_via_entity`,
-`find_cross_catalog_path`, `suggest_entity`) is the scaffolding for the DEFERRED cross-catalog contract
-authoring / entity-resolution follow-up (see `contract/author.py` + the loop design spec). It is fully
-tested so it is ready to wire — it is NOT dead-by-accident.
+WIRED: `find_cross_catalog_path` authors cross-catalog join paths (`contract/author.py`); the
+suggest→confirm flow (`suggest_entities`/`apply_entity_suggestion`) is exposed at `/entity/*` and its
+confirmed tags are re-applied by `build_graph` so they survive re-upload.
 """
 from __future__ import annotations
 
 from collections.abc import Iterable
 from dataclasses import dataclass
 
+from featuregen.overlay.upload.contract._serial import actor_json as _actor_json
 from featuregen.overlay.upload.enrich_llm import audited_enrich_call
 from featuregen.overlay.upload.read_scope import allowed_sensitivities
 
@@ -108,6 +107,89 @@ def suggest_entity(conn, client, *, table: str, column: str, type: str, concept:
     if not raw or len(raw) > _KNOWN_ENTITYISH or "\n" in raw or raw.startswith("["):
         return None
     return raw
+
+
+_ID_SUFFIXES = ("_id", "_ref", "_key", "_no", "_num", "_code", "_fk")
+_NON_ID_TYPES = ("numeric", "float", "double", "decimal", "boolean", "bool", "date", "timestamp",
+                 "time", "json", "jsonb")
+
+
+def _is_id_like(column_name: str, data_type: str | None) -> bool:
+    n = (column_name or "").lower()
+    if not (n == "id" or n.endswith(_ID_SUFFIXES)):
+        return False
+    return (data_type or "").lower() not in _NON_ID_TYPES   # ids are int/text/uuid, never numeric/ts
+
+
+@dataclass(frozen=True, slots=True)
+class EntitySuggestion:
+    object_ref: str
+    table: str
+    column: str
+    suggested_entity: str
+    status: str
+
+
+def suggest_entities(conn, client, catalog_source: str, *, roles: Iterable[str] = (),
+                     actor=None) -> int:
+    """For each id-like column in this catalog that has NO entity yet, ask the LLM (advisory) which
+    entity it denotes and store a PENDING suggestion — never auto-applied. Read-scoped. On-demand
+    (NOT in the ingest hot path). Returns the number of suggestions written. Re-running refreshes
+    pending rows but never clobbers an already-applied one."""
+    cols = conn.execute(
+        "SELECT object_ref, table_name, column_name, data_type, concept FROM graph_node "
+        "WHERE kind = 'column' AND catalog_source = %s AND entity IS NULL "
+        "AND (sensitivity IS NULL OR sensitivity = ANY(%s))",
+        (catalog_source, allowed_sensitivities(roles))).fetchall()
+    written = 0
+    for object_ref, table, column, data_type, concept in cols:
+        if not _is_id_like(column, data_type):
+            continue
+        suggested = suggest_entity(conn, client, table=table, column=column, type=data_type,
+                                   concept=concept, actor=actor)
+        if not suggested:
+            continue
+        conn.execute(
+            "INSERT INTO entity_suggestion (catalog_source, object_ref, table_name, column_name, "
+            "suggested_entity, status) VALUES (%s, %s, %s, %s, %s, 'pending') "
+            "ON CONFLICT (catalog_source, object_ref) DO UPDATE SET "
+            "suggested_entity = EXCLUDED.suggested_entity "
+            "WHERE entity_suggestion.status <> 'applied'",   # don't disturb a confirmed tag
+            (catalog_source, object_ref, table, column, suggested))
+        written += 1
+    return written
+
+
+def list_entity_suggestions(conn, catalog_source: str, *,
+                            status: str = "pending") -> list[EntitySuggestion]:
+    rows = conn.execute(
+        "SELECT object_ref, table_name, column_name, suggested_entity, status FROM entity_suggestion "
+        "WHERE catalog_source = %s AND status = %s ORDER BY object_ref",
+        (catalog_source, status)).fetchall()
+    return [EntitySuggestion(r[0], r[1], r[2], r[3], r[4]) for r in rows]
+
+
+def apply_entity_suggestion(conn, catalog_source: str, object_ref: str, *, actor=None) -> bool:
+    """Human confirms a suggestion: mark it applied and write it as the column's entity. Durable —
+    build_graph re-applies 'applied' suggestions after a re-upload. Returns False if none pending."""
+    row = conn.execute(
+        "UPDATE entity_suggestion SET status = 'applied', actor = %s "
+        "WHERE catalog_source = %s AND object_ref = %s AND status = 'pending' "
+        "RETURNING suggested_entity",
+        (_actor_json(actor), catalog_source, object_ref)).fetchone()
+    if row is None:
+        return False
+    conn.execute("UPDATE graph_node SET entity = %s WHERE catalog_source = %s AND object_ref = %s",
+                 (row[0], catalog_source, object_ref))
+    return True
+
+
+def dismiss_entity_suggestion(conn, catalog_source: str, object_ref: str) -> bool:
+    row = conn.execute(
+        "UPDATE entity_suggestion SET status = 'dismissed' "
+        "WHERE catalog_source = %s AND object_ref = %s AND status = 'pending' RETURNING object_ref",
+        (catalog_source, object_ref)).fetchone()
+    return row is not None
 
 
 from collections import deque  # noqa: E402
