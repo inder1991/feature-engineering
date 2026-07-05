@@ -67,6 +67,11 @@ the delta (see H2).
 - **P1 Phase-2 LLM feature-assist (V2, on record).** Gated on the feature layer (S1): multi-hop
   join-path suggestion, target-leakage warnings, feature recommendation, NL→recipe. Named so v1 metadata
   is built to feed them; all are human-acted suggestions, never auto-wired into load-bearing facts.
+- **Q1 Quarantine handling + review queue (increment after the slice).** Backend detects + counts
+  quarantine in the slice; the increment persists detail (raw row + reason + resolution, redacted, into
+  L2 trace), surfaces a per-source **review queue** (discovery via upload result / queue / notification to
+  a configured reviewer), and offers fix paths: inline-edit→revalidate, accept-suggestion, rule fix for
+  systematic values, dismiss — plus re-upload as the canonical fallback. UI mocked (`quarantine-review`).
 
 ## Drift & brake (RESOLVE)
 

@@ -427,6 +427,32 @@ problems **quarantine**, they do not reject the file. Only a **structural** fail
 upload — an unreadable file, or a *required* field (`table`/`column`/`type`) that cannot be mapped
 **at all**.
 
+### Quarantine handling & the review queue (named increment — backend detects now, UI later)
+A quarantined row is *set aside with a reason*, not dropped and not blocking the good rows. Its lifecycle:
+
+- **Discovery — three channels.** (1) The **upload result** returns counts + detail (*"142 ingested, 3
+  quarantined"*). (2) A persistent **review queue** per source (also holds drift impact, brake holds,
+  unclassified columns, low-confidence enrichment) — browsable anytime. (3) **Notifications** to a
+  configured *reviewer* (per-source/team — not an owner; the pivot removed ownership).
+- **What the reviewer sees** per row: source + upload, the **raw row** (sensitive cells **redacted**) with
+  the offending cell highlighted, the **reason** (missing / conflict / unrecognized value), and, where
+  possible, an **LLM-suggested fix** (advisory, one-click).
+- **Fix paths.** (A) **Fix inline → revalidate** — edit the bad cell in the queue; if it passes it ingests,
+  no full re-upload. (B) **Accept suggestion** (e.g. `int4 → integer`). (C) **Rule fix** for a *systematic*
+  problem — one recurring value fixed once as a mapping/vocabulary rule resolves every occurrence and
+  applies to future uploads. (D) **Dismiss** (junk — retained for audit). The canonical fallback is always:
+  fix the source file and re-upload.
+- **Re-evaluated each upload** — quarantine is not sticky state; a fixed row ingests next time, a still-broken
+  one re-quarantines. Quarantined rows are **not** in the catalog (no fact/search/drift) until fixed.
+- **Persistence & audit.** Ingest **persists the quarantine detail** (raw row + reason + resolution) to a
+  queryable store/event — so *"what was quarantined in last week's deposits upload, and how was it resolved?"*
+  is traceable (ties into L2 trace queries).
+- **Quarantine × drift edge:** a column that flips good→quarantined is absent from this upload's good set, so
+  drift may read it as a *drop* (and stale dependents); a **mass** flip is caught by the large-change brake.
+- **Scope:** the slice **detects + counts** quarantine (`IngestResult`). Persisting detail, the queue
+  surface, notifications, and inline-edit revalidation are the **review-queue increment** (mockup:
+  `quarantine-review` artifact), not the spine slice.
+
 ## Fail-closed behaviors (summary)
 
 | condition | outcome |
