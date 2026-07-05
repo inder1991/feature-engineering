@@ -9,6 +9,7 @@ from fastapi import FastAPI
 
 from featuregen.aggregates.bootstrap import register_phase06_event_schemas
 from featuregen.api.routes import (
+    admin,
     assist,
     auth,
     contract,
@@ -42,6 +43,7 @@ def create_app(llm_client: LLMClient | None = None) -> FastAPI:
     app.state.llm_client = llm_client
 
     app.include_router(auth.router)
+    app.include_router(admin.router)
     app.include_router(uploads.router)
     app.include_router(search.router)
     app.include_router(quarantine.router)
