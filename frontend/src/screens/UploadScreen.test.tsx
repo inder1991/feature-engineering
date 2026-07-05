@@ -34,9 +34,16 @@ describe('upload screen', () => {
       flagged: "first upload of 'deposits' (9 objects) — review recommended" }))
     render(<UploadScreen onReviewQueue={() => {}} />)
     await submit()
-    expect(await screen.findByText(/4 facts asserted · 1 staled · 0 quarantined/))
+    expect(await screen.findByText(/4 facts asserted, 1 staled, 0 quarantined/))
       .toBeInTheDocument()
     expect(screen.getByText(/first upload of 'deposits'/)).toBeInTheDocument()
+  })
+
+  it('shows the chosen filename in the drop target', async () => {
+    render(<UploadScreen onReviewQueue={() => {}} />)
+    await userEvent.upload(
+      screen.getByLabelText(/file/i), new File(['x'], 'deposits-q3.csv', { type: 'text/csv' }))
+    expect(screen.getByText('deposits-q3.csv')).toBeInTheDocument()
   })
 
   it('renders held as a brake with the reason, not an error', async () => {
@@ -44,7 +51,7 @@ describe('upload screen', () => {
       status: 'held', reason: 'overlap 20% < 60% (possible wrong source)' }))
     render(<UploadScreen onReviewQueue={() => {}} />)
     await submit()
-    expect(await screen.findByText(/held — confirm this large change/i)).toBeInTheDocument()
+    expect(await screen.findByText(/held: confirm this large change/i)).toBeInTheDocument()
     expect(screen.getByText(/overlap 20%/)).toBeInTheDocument()
     expect(screen.queryByRole('alert')).not.toBeInTheDocument()
   })
