@@ -32,3 +32,11 @@ def test_consumer_registration_endpoints(make_client, conn):
     assert feats.status_code == 200 and feats.json()[0]["feature_id"] == fid
     assert client.post("/features/nope/consumers", json={"model_ref": "m"},
                        headers=AUTH).status_code == 404
+
+
+def test_feature_360_has_no_hypothesis_for_a_directly_registered_feature(make_client, conn):
+    fid = _feat(conn)
+    body = make_client().get(f"/features/{fid}", headers=AUTH).json()
+    assert body["hypothesis"] is None and body["contract"] is None   # not born from the hypothesis flow
+    assert body["verification"] == "DESIGN-CHECKED"
+    assert body["consumers"] == []
