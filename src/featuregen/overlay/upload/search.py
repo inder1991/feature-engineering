@@ -12,6 +12,7 @@ from featuregen.overlay.upload.read_scope import allowed_sensitivities
 _SQL = """
 SELECT n.object_ref, n.table_name, n.column_name, n.kind, n.data_type, n.definition,
        n.is_grain, n.is_as_of, n.catalog_source, n.concept, n.domain, n.sensitivity,
+       n.additivity, n.unit, n.currency, n.entity,
        ts_rank_cd(n.search_doc, plainto_tsquery('english', %(q)s))
          + (CASE WHEN n.is_grain THEN 0.5 ELSE 0 END)
          + (CASE WHEN n.is_as_of THEN 0.3 ELSE 0 END) AS score
@@ -39,6 +40,10 @@ class SearchHit:
     concept: str | None
     domain: str | None
     sensitivity: str | None
+    additivity: str | None
+    unit: str | None
+    currency: str | None
+    entity: str | None
     score: float
 
 
@@ -54,4 +59,5 @@ def search(conn, query: str, *, now: datetime, roles: Iterable[str] = (),
         kind=r["kind"], data_type=r["data_type"], definition=r["definition"],
         is_grain=r["is_grain"], is_as_of=r["is_as_of"], catalog_source=r["catalog_source"],
         concept=r["concept"], domain=r["domain"], sensitivity=r["sensitivity"],
+        additivity=r["additivity"], unit=r["unit"], currency=r["currency"], entity=r["entity"],
         score=float(r["score"])) for r in rows]

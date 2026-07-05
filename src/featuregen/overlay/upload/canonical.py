@@ -17,6 +17,10 @@ class CanonicalRow:
     sensitivity: str = ""
     joins_to: str = ""        # target "table.column" (single-column join)
     cardinality: str = ""     # N:1 | 1:1 | 1:N
+    additivity: str = ""      # additive | semi_additive | non_additive (safe-aggregation)
+    unit: str = ""            # e.g. dollars, cents
+    currency: str = ""        # e.g. USD
+    entity: str = ""          # the business entity this column denotes (Customer, Account)
 
 
 @dataclass(frozen=True, slots=True)
