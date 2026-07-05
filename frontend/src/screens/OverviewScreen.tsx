@@ -94,7 +94,10 @@ export function OverviewScreen({
         </span>
         <div className="callout-body">
           <p>This is a stub dev session. Roles switch in the rail.</p>
-          <p>AI assist is not configured on this deployment.</p>
+          <p>
+            AI assist depends on the deployment's LLM provider; the Workbench shows its live
+            status.
+          </p>
           <p>Search serves only freshness-vouched facts.</p>
         </div>
       </div>

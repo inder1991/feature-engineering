@@ -12,7 +12,9 @@
   --surface-2:    oklch(0.975 0.006 212);  /* inset zones inside panels (kv grids, editors) */
   --ink:          oklch(0.25 0.025 225);
   --ink-soft:     oklch(0.44 0.02 222);
-  --ink-faint:    oklch(0.58 0.015 220);
+  /* tertiary text AND placeholders: 5.25:1 on ground, 5.89:1 on surface, 5.56:1 on surface-2,
+     4.90:1 on accent-soft — keep >= 4.5:1 everywhere it renders (WCAG 1.4.3, PRODUCT.md) */
+  --ink-faint:    oklch(0.50 0.015 220);
   --line:         oklch(0.86 0.012 212);
   --line-strong:  oklch(0.76 0.018 212);
   --shadow:       0 1px 2px oklch(0.25 0.025 225 / 0.05), 0 6px 20px oklch(0.25 0.025 225 / 0.07);
@@ -95,8 +97,11 @@ body {
   background: color-mix(in oklch, var(--accent) 18%, var(--paper));
 }
 
+/* focus ring must hold >= 3:1 against adjacent colors (WCAG 1.4.11): --accent is 5.73:1 on
+   ground, 6.43:1 on surface, 5.35:1 on accent-soft. The dark rail scopes its own ring color
+   (--rail-accent: 7.70:1 on rail-bg, 5.49:1 on rail-active) — see .rail :focus-visible. */
 :focus-visible {
-  outline: 2px solid var(--accent-line);
+  outline: 2px solid var(--accent);
   outline-offset: 2px;
 }
 
@@ -359,7 +364,7 @@ table,
 }
 
 .role-chip:focus-within {
-  outline: 2px solid var(--accent-line);
+  outline: 2px solid var(--accent);
   outline-offset: 2px;
 }
 
@@ -720,6 +725,17 @@ label {
   color: var(--ink-soft);
 }
 
+/* some screens nest the control inside its label (Upload source name + file drop, review-queue
+   inline editor); controls use `font: inherit`, so without this reset they would inherit the
+   12px/600 label typography above and render differently from htmlFor + sibling controls on
+   other screens. (.mono still wins font-size for mono inputs: 13px, weight 400.) */
+label input,
+label select,
+label textarea {
+  font-size: 14px;
+  font-weight: 400;
+}
+
 .field-error {
   color: var(--danger);
   font-size: 13px;
@@ -786,7 +802,9 @@ td.num {
 
 .kv {
   display: grid;
-  grid-template-columns: max-content 1fr;
+  /* keys size to content but cap at 240px: an unbroken uploaded key wraps (with the
+     overflow-wrap rule below) instead of blowing the column out */
+  grid-template-columns: fit-content(240px) 1fr;
   gap: 6px 16px;
   margin: 0;
   padding: 10px 12px;
@@ -805,6 +823,7 @@ td.num {
 
 .kv dd {
   margin: 0;
+  min-width: 0;
 }
 
 /* ---------------------------------------------------------------- empty state */
@@ -872,6 +891,27 @@ td.num {
   font-size: 13px;
 }
 
+/* uploaded strings are hostile: a single unbroken token (object_ref, raw value, reason,
+   filename) must wrap inside its container, never stretch rows or push actions off-screen.
+   overflow-wrap inherits, so .row covers its descendants too. */
+.row,
+.kv dt,
+.kv dd,
+.callout p,
+.error,
+.field-error,
+.hint,
+code,
+.mono {
+  overflow-wrap: anywhere;
+}
+
+/* the callout text column is a 1fr grid track: without min-width:0 a long unbroken token
+   would still widen it past the panel edge */
+.callout-body {
+  min-width: 0;
+}
+
 section > h2 {
   margin-top: 32px;
 }
@@ -901,12 +941,16 @@ section > h2:first-child {
 
 .q-reason {
   font-weight: 600;
+  /* flex item: allow it to shrink and wrap so a hostile reason string cannot push
+     the Fix inline / Dismiss actions off-screen */
+  min-width: 0;
 }
 
 .q-actions {
   margin-left: auto;
   display: flex;
   gap: 8px;
+  flex: none;
 }
 
 /* resolved rows dim; the badge + note carry the state (never color alone) */
@@ -1022,6 +1066,7 @@ section > h2:first-child {
 }
 
 .q-chip-x {
+  position: relative;
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -1035,6 +1080,14 @@ section > h2:first-child {
   color: inherit;
   font-size: 15px;
   line-height: 1;
+}
+
+/* the glyph stays 22px, but the clickable box is 32x32 (PRODUCT.md: hit targets >= 32px);
+   chip gaps (8px) keep the expanded targets from overlapping neighbors */
+.q-chip-x::after {
+  content: '';
+  position: absolute;
+  inset: -5px;
 }
 
 .q-chip-x:hover {
