@@ -41,6 +41,13 @@ class ValidationResult:
     structural_error: str | None = None
 
 
+def _material(r: CanonicalRow) -> tuple:
+    """The load-bearing fields of a row (everything but the advisory `definition`). Two rows for the
+    same column that agree here are true duplicates; disagreement is a conflict worth quarantining."""
+    return (r.type, r.is_grain, r.as_of, r.as_of_basis, r.sensitivity, r.joins_to,
+            r.cardinality, r.additivity, r.unit, r.currency, r.entity)
+
+
 def validate_rows(rows: list[CanonicalRow],
                   catalog_source: str | None = None) -> ValidationResult:
     """Validate rows for one upload. When `catalog_source` is given (the upload's source), any row
@@ -53,7 +60,8 @@ def validate_rows(rows: list[CanonicalRow],
 
     good: list[CanonicalRow] = []
     quarantined: list[RowError] = []
-    seen: dict[tuple[str, str, str], str] = {}  # (source,table,column) -> type
+    seen: dict[tuple[str, str, str], tuple[CanonicalRow, int]] = {}  # key -> (first row, its index)
+    conflicted: set[tuple[str, str, str]] = set()
 
     for i, r in enumerate(rows):
         missing = [f for f in _REQUIRED if not getattr(r, f)]
@@ -73,12 +81,21 @@ def validate_rows(rows: list[CanonicalRow],
             continue
         key = (r.source, r.table, r.column)
         if key in seen:
-            if seen[key] == r.type:
-                continue  # identical duplicate -> dedup
-            quarantined.append(
-                RowError(i, f"conflicting type for {key}: {seen[key]} vs {r.type}", r))
+            first_row, first_i = seen[key]
+            if _material(first_row) == _material(r):
+                continue  # same load-bearing metadata (advisory `definition` may differ) -> dedup
+            # Same column, differing metadata. Dedup used to keep the FIRST row and silently drop the
+            # later one's fields — including `sensitivity`, so a later `pii` tag could be lost and the
+            # column left world-readable (fail-OPEN). Fail CLOSED instead: quarantine ALL rows for the
+            # column (pull the already-accepted first one back out) so it is NOT graphed until resolved.
+            msg = f"conflicting metadata for {key} (rows for the same column disagree)"
+            if key not in conflicted:
+                conflicted.add(key)
+                good.remove(first_row)
+                quarantined.append(RowError(first_i, msg, first_row))
+            quarantined.append(RowError(i, msg, r))
             continue
-        seen[key] = r.type
+        seen[key] = (r, i)
         good.append(r)
 
     return ValidationResult(good=good, quarantined=quarantined, structural_error=None)

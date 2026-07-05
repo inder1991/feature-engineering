@@ -188,3 +188,25 @@ def test_loop_rejects_ambiguous_cross_catalog_column(db):
         {"name": "ambig", "derives_from": ["public.accounts.val"], "aggregation": "avg_90d"}]})})
     out = recommend_features(db, "x", client, entity="Customer", now=NOW)
     assert out == []   # public.accounts.val is in c1 AND c2 -> ambiguous -> rejected
+
+
+def test_gauntlet_catches_windowed_names_without_digit_unit(db):
+    # M1: "avg_last_12_months" / "ytd" evade the old regex but ARE windowed -> need an as-of column
+    _bank_with_asof(db, as_of=False)   # table 't' has NO as-of column
+    for agg in ("avg_last_12_months", "ytd_total", "cumulative_balance", "monthly_avg"):
+        client = FakeLLM(script={"overlay.feature.recommend": FakeResponse(output={"features": [
+            {"name": f"f_{agg}", "derives_from": ["public.accounts.balance"], "aggregation": agg}]})})
+        assert recommend_features(db, "x", client, catalog_source="t", now=NOW) == [], agg
+
+
+def test_gauntlet_catches_additive_unsafe_names_without_sum(db):
+    # M2: "total_balance"/"running_total" sum a semi-additive balance but contain no "sum" substring
+    build_graph(db, "t", [
+        CanonicalRow("t", "accounts", "id", "integer", is_grain=True),
+        CanonicalRow("t", "accounts", "balance", "numeric", additivity="semi_additive"),
+        CanonicalRow("t", "accounts", "posted_at", "timestamp", as_of=True)])
+    _fresh_watermark(db, "t", NOW)
+    for agg in ("total_balance", "running_total", "cumulative"):
+        client = FakeLLM(script={"overlay.feature.recommend": FakeResponse(output={"features": [
+            {"name": f"f_{agg}", "derives_from": ["public.accounts.balance"], "aggregation": agg}]})})
+        assert recommend_features(db, "x", client, catalog_source="t", now=NOW) == [], agg

@@ -21,14 +21,28 @@ from featuregen.overlay.catalog_changes import drift_watermark
 from featuregen.overlay.upload.join_path import JoinStep, find_join_path
 from featuregen.overlay.upload.read_scope import allowed_sensitivities
 
-_WINDOW_RE = re.compile(r"\d+\s*[dwmy]\b")   # 90d, 30 d, 12m, 1y
+# A number + a time unit, tolerating space/underscore separators: 90d, 30 d, 12m, "90 days",
+# "last_12_months", "1y". (`[\s_]*` so "12_months" matches; unit optionally pluralised.)
+_WINDOW_RE = re.compile(
+    r"\d+[\s_]*(?:d|w|m|y|h|day|week|month|year|hour|qtr|quarter)s?\b")
+# Time-window vocabulary that carries no digit. Widened after review (naming-based detection is
+# inherently incomplete — the real fix is structured aggregation metadata, tracked as a follow-up).
 _WINDOW_WORDS = ("trend", "rolling", "window", "velocity", "growth", "over_time", "all_time",
-                 "delta", "moving")
+                 "delta", "moving", "cumulative", "running", "ytd", "mtd", "qtd", "since",
+                 "lifetime", "recent", "lag", "daily", "weekly", "monthly", "quarterly",
+                 "annual", "yearly", "period")
+# Aggregations that sum values over rows/time — unsafe on a semi/non-additive measure.
+_UNSAFE_ADDITIVE_WORDS = ("sum", "total", "cumulative", "running", "net_", "aggregate")
 
 
 def _is_windowed(aggregation: str | None) -> bool:
     a = (aggregation or "").lower()
     return bool(_WINDOW_RE.search(a)) or any(w in a for w in _WINDOW_WORDS)
+
+
+def _is_additive_unsafe(aggregation: str | None) -> bool:
+    a = (aggregation or "").lower()
+    return any(w in a for w in _UNSAFE_ADDITIVE_WORDS)
 
 
 def _call_raw(client: LLMClient, task: str, prompt_id: str, schema_id: str, inputs: dict) -> dict:
@@ -76,13 +90,19 @@ class FeatureIdea:
     derives_pairs: tuple[tuple[str, str], ...] = ()
 
 
-def _column_meta(conn, object_refs: list[str]) -> dict[str, dict]:
-    if not object_refs:
+def _column_meta(conn, pairs: list[tuple[str, str]]) -> dict[str, dict]:
+    """Additivity/catalog for each (catalog_source, object_ref) pair — scoped to the EXACT pair, so a
+    same-named column in another catalog cannot contaminate the reading (M3), and a fabricated pair is
+    simply absent from the result (used for the M4 existence check)."""
+    if not pairs:
         return {}
+    refs = [ref for _, ref in pairs]
     rows = conn.execute(
-        "SELECT object_ref, catalog_source, additivity FROM graph_node WHERE object_ref = ANY(%s)",
-        (object_refs,)).fetchall()
-    return {r[0]: {"catalog_source": r[1], "additivity": r[2]} for r in rows}
+        "SELECT catalog_source, object_ref, additivity FROM graph_node "
+        "WHERE kind = 'column' AND object_ref = ANY(%s)", (refs,)).fetchall()
+    wanted = set(pairs)
+    return {ref: {"catalog_source": cs, "additivity": add}
+            for cs, ref, add in rows if (cs, ref) in wanted}
 
 
 def _table_has_as_of(conn, catalog_source: str, table: str) -> bool:
@@ -109,6 +129,13 @@ def _validate_idea(conn, raw: dict, known: set[str], src_of: dict[str, set[str]]
         if len(srcs) != 1:
             return None, f"ambiguous catalog for {d}"
         pairs.append((next(iter(srcs)), d))
+    # M4: verify each resolved (catalog_source, object_ref) pair actually EXISTS as a graph node.
+    # `src_of` may be client-supplied over HTTP (the MCV path) — a fabricated catalog must fail closed,
+    # not sail through freshness on a catalog the column doesn't live in. _column_meta is pair-scoped.
+    meta = _column_meta(conn, pairs)
+    for src, d in pairs:
+        if d not in meta or meta[d]["catalog_source"] != src:
+            return None, f"unknown column {d} in catalog {src}"
     if target_ref and target_ref in derives:
         return None, "leaks target"
     if now is not None:   # freshness — every RESOLVED source must be fresh
@@ -116,11 +143,10 @@ def _validate_idea(conn, raw: dict, known: set[str], src_of: dict[str, set[str]]
             wm = drift_watermark(conn, src)
             if wm is None or wm < now - fresh_within:
                 return None, f"stale source: {src}"
-    meta = _column_meta(conn, derives)
-    if "sum" in (raw.get("aggregation") or "").lower():   # aggregation safety (additivity)
+    if _is_additive_unsafe(raw.get("aggregation")):   # aggregation safety (additivity) — M2 widened
         for d in derives:
             if meta.get(d, {}).get("additivity") in ("semi_additive", "non_additive"):
-                return None, f"unsafe SUM of {d}"
+                return None, f"unsafe additive aggregation of {d}"
     if _is_windowed(raw.get("aggregation")):   # point-in-time: a windowed feature needs an as-of column
         for src, d in pairs:
             # object_ref is "[catalog.]schema.table.column"; table is the second-to-last segment.

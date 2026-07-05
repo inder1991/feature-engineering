@@ -73,3 +73,14 @@ def test_build_graph_folds_drafted_definition_and_domain(db):
             "SELECT count(*) FROM graph_node WHERE object_ref='public.accounts.bal' "
             "AND search_doc @@ plainto_tsquery('english', %s)", (term,)).fetchone()[0]
         assert hit == 1, term
+
+
+def test_column_joins_resolved_is_catalog_scoped(db):
+    from featuregen.overlay.upload.canonical import CanonicalRow
+    from featuregen.overlay.upload.graph import build_graph, column_joins
+    # A has a join to public.customers.id that is NOT loaded in A (cross-source pending)
+    build_graph(db, "A", [
+        CanonicalRow("A", "accounts", "cust", "integer", joins_to="customers.id", cardinality="N:1")])
+    build_graph(db, "B", [CanonicalRow("B", "customers", "id", "integer", is_grain=True)])
+    edges = column_joins(db, "A", "public.accounts.cust")
+    assert edges and edges[0].resolved is False   # B's node must NOT resolve A's cross-source edge
