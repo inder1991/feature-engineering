@@ -12,6 +12,8 @@ uploader free text or data values — so it is classified `clean` and passes the
 """
 from __future__ import annotations
 
+import logging
+
 from featuregen.contracts.envelopes import IdentityEnvelope
 from featuregen.contracts.identity import identity_to_jsonb
 from featuregen.documents.registry import DocumentSchemaRegistry
@@ -29,6 +31,8 @@ from featuregen.intake.redaction import (
     assert_llm_safe,
     build_llm_inputs,
 )
+
+logger = logging.getLogger(__name__)
 
 _OWNER = "featuregen-overlay"
 _RUN = "overlay-enrichment"          # the audit run bucket for catalog enrichment llm_call records
@@ -97,6 +101,7 @@ def audited_structured_call(conn, client: LLMClient, *, task: str, prompt_id: st
     try:
         assert_llm_safe(req)              # §9.4 egress backstop
     except EgressViolation:
+        logger.warning("egress guard blocked %s (schema %s); no dispatch", task, schema_id)
         return None                       # hard fail closed — no dispatch, no cache
 
     outcome = drive_structured_call(
@@ -109,6 +114,8 @@ def audited_structured_call(conn, client: LLMClient, *, task: str, prompt_id: st
         latency_ms=None, cost_metadata=outcome.cost_metadata, created_by=identity_to_jsonb(actor))
 
     if outcome.status == STATUS_FAILED:
+        logger.warning("enrichment call %s (schema %s) failed: %s", task, schema_id,
+                       outcome.validation_result)
         return None                       # provider/repair failure -> don't cache
     return outcome.output if isinstance(outcome.output, dict) else None
 

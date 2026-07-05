@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from datetime import datetime
 
 from featuregen.aggregates.ids import mint_id
-from featuregen.contracts.identity import identity_to_jsonb
+from featuregen.overlay.upload.contract._serial import actor_json as _actor_json
 from featuregen.overlay.upload.contract.author import ContractDraft
 from featuregen.overlay.upload.contract.review import validate_minimum
 from featuregen.overlay.upload.features import (
@@ -35,16 +35,6 @@ class Contract:
     feature_name: str
     version: int
 
-
-def _actor_json(actor) -> str | None:
-    if actor is None:
-        return None                            # -> SQL NULL ("unknown actor"), not the string "None"
-    if isinstance(actor, str):
-        return json.dumps(actor)
-    try:
-        return json.dumps(identity_to_jsonb(actor))
-    except Exception:
-        return json.dumps({"repr": str(actor)})   # structured, parseable JSON — not a repr string
 
 
 def confirm_contract(conn, draft: ContractDraft, *, actor, target_ref: str | None = None,

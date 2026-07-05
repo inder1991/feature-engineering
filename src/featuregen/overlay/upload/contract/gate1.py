@@ -11,8 +11,8 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 
-from featuregen.contracts.identity import identity_to_jsonb
 from featuregen.intake.llm import LLMClient
+from featuregen.overlay.upload.contract._serial import actor_json as _actor_json
 from featuregen.overlay.upload.contract.intake import Intent
 from featuregen.overlay.upload.feature_assist import (
     FeatureIdea,
@@ -111,17 +111,6 @@ def _snapshot(cs: ConsideredSet) -> dict:
             "recommended_lens": cs.recommendation.recommended_lens,
             "reasoning": cs.recommendation.reasoning, "caveat": cs.recommendation.caveat},
     }
-
-
-def _actor_json(actor) -> str | None:
-    if actor is None:
-        return None                            # -> SQL NULL ("unknown actor"), not the string "None"
-    if isinstance(actor, str):
-        return json.dumps(actor)
-    try:
-        return json.dumps(identity_to_jsonb(actor))
-    except Exception:
-        return json.dumps({"repr": str(actor)})   # structured, parseable JSON — not a repr string
 
 
 def confirm_gate1(conn, considered: ConsideredSet, *, chosen_source: str, chosen_option_id: str,
