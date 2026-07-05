@@ -58,3 +58,32 @@ def test_leakage_check_flags_target_derived_column(db):
     warnings = leakage_check(db, derives, "public.accounts.churned", client)
     assert len(warnings) == 1
     assert warnings[0].object_ref == "public.accounts.churned"
+
+
+def test_recommend_and_recipe_respect_read_scope(db):
+    """M6: a PII column must NOT be fed to the LLM (or returned) without the role."""
+    from featuregen.overlay.upload.canonical import CanonicalRow
+    rows = [
+        CanonicalRow("bank", "accounts", "balance", "numeric", definition="ledger balance"),
+        CanonicalRow("bank", "accounts", "ssn", "text", sensitivity="pii", definition="customer SSN"),
+    ]
+    build_graph(db, "bank", rows)
+
+    captured = {}
+
+    class _CaptureLLM:
+        def call(self, request):
+            captured["columns"] = request.inputs.get("columns", [])
+            from featuregen.intake.llm import LLMResult
+            return LLMResult(output={"features": []}, self_reported_scores={}, call_ref="", status="ok")
+
+    # No role -> the PII column is not among the candidate columns sent to the LLM.
+    recommend_features(db, "predict risk", _CaptureLLM(), catalog_source="bank")
+    refs = {c["object_ref"] for c in captured["columns"]}
+    assert "public.accounts.balance" in refs
+    assert "public.accounts.ssn" not in refs
+
+    # With the pii_reader role -> the PII column is available.
+    recommend_features(db, "predict risk", _CaptureLLM(), catalog_source="bank", roles={"pii_reader"})
+    refs2 = {c["object_ref"] for c in captured["columns"]}
+    assert "public.accounts.ssn" in refs2
