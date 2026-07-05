@@ -18,9 +18,16 @@ delete modules + tests, (5) clean DB artifacts, (6) verify. Each phase leaves th
 **Tech Stack:** Python 3.12, Postgres (event-sourced), `uv run pytest`.
 
 ## Global Constraints
-- **Keep-set (verified reused outside the discovery flow — MUST NOT be deleted or broken):**
-  `intake/redaction.py`, `intake/llm.py`, `intake/store.py` (llm depends on it), `intake/llm_claude.py`
-  (the real `LLMClient` adapter the overlay real-provider path needs). Their tests stay.
+- **Keep-set (reused outside the discovery flow — MUST NOT be broken):** `intake/redaction.py`,
+  `intake/llm.py`, `intake/store.py`. **CORRECTION (review 2026-07-05):** `intake/llm.py` is NOT
+  self-contained — `llm.py:26` imports `LLM_CALL_RECORDED` from delete-set `intake/events.py`, `:34`
+  imports `append_feature_contract_event` from `store.py`, and `call_llm:558` appends to the
+  `feature_contract` aggregate. So the keep-set must be **trimmed before delete** (Phase 1a): remove
+  `call_llm` (used ONLY by delete-set) and the `events`/FC `store` imports from `llm.py`. The overlay uses
+  `record_llm_call` (decoupled — writes only `llm_call`), NOT `call_llm`, so this is safe.
+- **`intake/llm_claude.py`:** the real `LLMClient` adapter. **CORRECTION:** it has ZERO external callers
+  (`build_claude_llm` is uncalled; the overlay takes its client as a parameter). Keep it as the sole real
+  adapter for future real-provider wiring, but it is not a live dependency — deleting is also defensible.
 - **The overlay real-provider enrichment + the whole `overlay/upload/contract/` flow MUST keep passing** —
   they import `intake.llm` (LLMClient/LLMRequest/drive_structured_call/record_llm_call/compute_input_hash/
   STATUS_FAILED) and `intake.redaction` (assert_llm_safe/build_llm_inputs/RedactionResult/EgressViolation/
@@ -37,14 +44,19 @@ delete modules + tests, (5) clean DB artifacts, (6) verify. Each phase leaves th
 
 ---
 
-## Phase 1 — Pin & prove the keep-set
+## Phase 1 — Trim & pin the keep-set
 
-**Files:** none changed yet — this phase is verification that de-risks everything after it.
+**Files:** Modify `src/featuregen/intake/llm.py` (remove `call_llm` + the FC-append coupling).
 
-- [ ] **Step 1:** Grep the keep-set's own imports for any delete-set dependency:
-  `grep -nE "candidates|scoring|mcv|doubt_router|critique|commands|read_model|events|state|contract|bootstrap|banking_catalog|catalog|blobs" src/featuregen/intake/{redaction,llm,store,llm_claude}.py`
-  Expected: no matches (keep-set is self-contained). **If any match, it is a real coupling — resolve it
-  here** (inline the needed symbol or move it into the keep-set) before proceeding.
+- [ ] **Step 1 (VERIFIED coupling — must resolve, not just check):** `llm.py` imports delete-set
+  `events`/`store` FC symbols and defines `call_llm` (appends `feature_contract`). Confirm `call_llm`'s
+  only callers are delete-set: `grep -rn "call_llm(" src/featuregen | grep -v intake/llm.py` → expect only
+  `candidates.py`/`critique.py`/`commands.py`. Then **delete `call_llm` from `llm.py`** and its imports of
+  `intake.events` (`LLM_CALL_RECORDED`) + `append_feature_contract_event` from `store`. Keep
+  `record_llm_call` (decoupled) untouched — the overlay depends on it.
+- [ ] **Step 1b:** Grep the trimmed keep-set for any remaining delete-set dependency:
+  `grep -nE "candidates|scoring|mcv|doubt_router|critique|commands|read_model|events|state|contract|bootstrap|banking_catalog|catalog|blobs" src/featuregen/intake/{redaction,llm,store}.py`
+  Now expect no matches. Resolve any remainder before proceeding.
 - [ ] **Step 2:** Confirm `record_llm_call` (intake/llm.py) does NOT append to the `feature_contract`
   aggregate (enrich_llm relies on it being decoupled): read the function; it must write only to the
   `llm_call` store. If it couples, extract the decoupled path the overlay already uses.
@@ -147,12 +159,15 @@ FC-table disposition.
 - Worker boots without SP-2; boot test updated to assert absence.
 - ~40 discovery test files deleted; ~15 keep-set test files retained (listed explicitly).
 
-## Risk register
-- **Event-backbone coupling (highest):** if `_append`/`serde`/`store` treat `feature_contract` as a
-  required registered aggregate, removal may need a shim (a registered-but-empty aggregate) rather than a
-  clean delete. Phase 3 Step 1 decides this; if a shim is needed, keep a minimal `events.py` with only the
-  event-type registration and delete the rest.
-- **Hidden real-provider dependency on `llm_claude`:** only `commands.py` imports it today, but it is the
-  real adapter — confirm the overlay's production wiring constructs `ClaudeLLM` from it (keep-set) before
-  deleting `commands.py`.
+## Risk register (re-ordered per the 2026-07-05 review)
+- **Keep-set coupling (HIGHEST — verified):** `intake/llm.py` imports delete-set `events`/`store` FC
+  symbols and defines `call_llm`. Deleting `events.py` without first trimming `llm.py` (Phase 1) breaks the
+  overlay + every overlay test (`from featuregen.intake.llm import FakeLLM`). This is the real blocker.
+- **Event-backbone coupling (LOW — was mis-ranked as highest):** `_append`/`serde`/`store` reference a
+  generic nullable `feature_contract_id` correlation column, `outbox` has one `aggregate=="feature_contract"`
+  partition case, and `0508` has a dead CHECK arm. Nothing appends FC events post-retirement, so these are
+  **leave-able in place** — no shim needed. Only remove if a later cleanup wants it.
+- **`llm_claude` has no callers:** `build_claude_llm` is uncalled; the overlay takes its client as a param.
+  Keep it as the sole real adapter (defensible) — but it is not a live dependency (the earlier "overlay
+  needs it" reason was wrong).
 - **Scale:** ~2549-line `commands.py` + ~40 test files — expect several green-fix iterations in Phase 4.

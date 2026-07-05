@@ -138,9 +138,10 @@ Test `.../contract/test_author.py`.
 ## Phase 6 — Retire the superseded SP-2 intake discovery — **DEFERRED (needs its own plan)**
 
 **Pre-flight run 2026-07-05 — it is NOT a clean delete. Three blocking findings:**
-1. **Wired into the production runtime:** `runtime/worker.py` imports `intake.commands`/`bootstrap`/
-   `read_model` — the SP-2 intake flow is mounted in the worker, not just dormant. Deleting the discovery
-   modules breaks the worker; the worker must be rewired first.
+1. **Wired into the production runtime:** `runtime/worker.py` imports `intake.commands` (`_run_is_parked`)
+   + `intake.bootstrap` (`register_sp2`/`seed_sp2_authz`) — the SP-2 intake flow is mounted in the worker,
+   not just dormant. Deleting the discovery modules breaks the worker; the worker must be rewired first.
+   (Correction: `read_model` is NOT a worker import — it has no importer outside `intake/`.)
 2. **The keep-set is entangled with the delete-set:** `intake/state.py` has `mcv_passed()`, folds
    `candidates`, and imports are shared with `mcv`/`commands`. The feature-contract `events`/`state`/
    `contract` (which Phases 1–5 reuse) cannot be cleanly separated from `candidates`/`scoring`/`mcv`/
