@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 from featuregen.overlay.upload.canonical import CanonicalRow
 from featuregen.overlay.upload.concepts import humanize
 from featuregen.overlay.upload.enrich import content_hash
@@ -61,3 +63,30 @@ def build_graph(conn, catalog_source: str, rows: list[CanonicalRow],
             "INSERT INTO graph_edge (catalog_source, kind, from_ref, to_ref) "
             "VALUES (%s, 'contains', %s, %s) ON CONFLICT DO NOTHING",
             (catalog_source, _table_ref(r.table), c_ref))
+        if r.joins_to:
+            # Single-column join: this column -> target "table.column" (may be not-yet-loaded).
+            to_ref = f"{_SCHEMA}.{r.joins_to}" if r.joins_to.count(".") == 1 else r.joins_to
+            conn.execute(
+                "INSERT INTO graph_edge (catalog_source, kind, from_ref, to_ref, cardinality) "
+                "VALUES (%s, 'joins', %s, %s, %s) ON CONFLICT DO NOTHING",
+                (catalog_source, c_ref, to_ref, r.cardinality or None))
+
+
+@dataclass(frozen=True, slots=True)
+class JoinEdge:
+    from_ref: str
+    to_ref: str
+    cardinality: str | None
+    resolved: bool   # whether to_ref is a known node (a pending/cross-source target is unresolved)
+
+
+def column_joins(conn, catalog_source: str, object_ref: str) -> list[JoinEdge]:
+    """The join edges out of a column — including ones whose target isn't loaded yet (pending)."""
+    rows = conn.execute(
+        "SELECT e.from_ref, e.to_ref, e.cardinality, "
+        "  EXISTS(SELECT 1 FROM graph_node n WHERE n.object_ref = e.to_ref) AS resolved "
+        "FROM graph_edge e "
+        "WHERE e.catalog_source = %s AND e.kind = 'joins' AND e.from_ref = %s "
+        "ORDER BY e.to_ref",
+        (catalog_source, object_ref)).fetchall()
+    return [JoinEdge(from_ref=r[0], to_ref=r[1], cardinality=r[2], resolved=r[3]) for r in rows]
