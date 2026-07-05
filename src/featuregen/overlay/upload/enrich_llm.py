@@ -43,6 +43,15 @@ _SCHEMAS: dict[tuple[str, int], dict] = {
                                 "required": ["definition"]},
     ("overlay_domain", 1): {"type": "object", "additionalProperties": False,
                             "properties": {"domain": {"type": "string"}}, "required": ["domain"]},
+    ("overlay_entity", 1): {"type": "object", "additionalProperties": False,
+                            "properties": {"entity": {"type": "string"}}, "required": ["entity"]},
+    ("overlay_contract", 1): {"type": "object", "additionalProperties": False,
+                              "properties": {"definition": {"type": "string"}},
+                              "required": ["definition"]},
+    ("overlay_critique", 1): {"type": "object", "additionalProperties": False,
+                              "properties": {"findings": {"type": "array",
+                                                          "items": {"type": "string"}}},
+                              "required": ["findings"]},
 }
 
 # Fallback service identity for when no real actor is threaded in. authenticated=False — a
@@ -61,12 +70,13 @@ def register_enrichment_schemas(conn) -> None:
         reg.register_schema(name, ver, schema, _OWNER)
 
 
-def audited_enrich_call(conn, client: LLMClient, *, task: str, prompt_id: str, schema_id: str,
-                        catalog_metadata: dict, out_key: str, instruction: str,
-                        actor: IdentityEnvelope | None = None) -> str | None:
-    """Run one governed enrichment call. Returns the trimmed output string, or None on any egress
-    block / non-success / empty output (so the caller never caches a failure). Attaches the registered
-    output-schema (so a real provider does NOT fail closed) and records one immutable llm_call."""
+def audited_structured_call(conn, client: LLMClient, *, task: str, prompt_id: str, schema_id: str,
+                            catalog_metadata: dict, instruction: str,
+                            actor: IdentityEnvelope | None = None) -> dict | None:
+    """Run one governed metadata-only call and return the VALIDATED output dict, or None on any egress
+    block / non-success. Attaches the registered output-schema (so a real provider does NOT fail closed),
+    runs the egress guard, and records one immutable llm_call. The single audited seam for every overlay
+    LLM node — enrichment, contract authoring/refine, and contract critique."""
     actor = actor or _ENRICH_ACTOR
     reg = DocumentSchemaRegistry(conn)
     schema = reg.schema_for(schema_id, 1)
@@ -100,5 +110,18 @@ def audited_enrich_call(conn, client: LLMClient, *, task: str, prompt_id: str, s
 
     if outcome.status == STATUS_FAILED:
         return None                       # provider/repair failure -> don't cache
-    val = str(outcome.output.get(out_key, "")).strip()
+    return outcome.output if isinstance(outcome.output, dict) else None
+
+
+def audited_enrich_call(conn, client: LLMClient, *, task: str, prompt_id: str, schema_id: str,
+                        catalog_metadata: dict, out_key: str, instruction: str,
+                        actor: IdentityEnvelope | None = None) -> str | None:
+    """Single-string convenience over `audited_structured_call`: returns the trimmed `out_key` field, or
+    None on any egress block / non-success / empty output (so the caller never caches a failure)."""
+    out = audited_structured_call(
+        conn, client, task=task, prompt_id=prompt_id, schema_id=schema_id,
+        catalog_metadata=catalog_metadata, instruction=instruction, actor=actor)
+    if not out:
+        return None
+    val = str(out.get(out_key, "")).strip()
     return val or None

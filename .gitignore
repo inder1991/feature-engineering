@@ -18,3 +18,6 @@ __pycache__/
 
 # build artifacts
 build/
+
+# local worktrees (frontend session, etc.)
+.claude/worktrees/

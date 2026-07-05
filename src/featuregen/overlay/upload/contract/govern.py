@@ -1,0 +1,129 @@
+"""Phase 5 — confirm + govern (versioned, drift-linked).
+
+`confirm_contract` is the HUMAN GATE — the only write that makes a contract governing. It registers the
+draft as a versioned feature contract and wires its derives-from into the feature layer, so freshness
+lineage and drift impact apply for free: a governed contract KNOWS when its inputs drifted. A re-confirm
+of the same feature is a new version; history stays.
+"""
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass
+from datetime import datetime
+
+from featuregen.aggregates.ids import mint_id
+from featuregen.contracts.identity import identity_to_jsonb
+from featuregen.overlay.upload.contract.author import ContractDraft
+from featuregen.overlay.upload.contract.review import validate_minimum
+from featuregen.overlay.upload.features import (
+    FeatureFreshness,
+    FeatureSpec,
+    feature_freshness,
+    features_affected_by,
+    register_feature,
+)
+
+
+class ContractValidationError(Exception):
+    """The draft failed the deterministic MCV — it must not be governed."""
+
+
+@dataclass(frozen=True, slots=True)
+class Contract:
+    contract_id: str
+    feature_id: str
+    feature_name: str
+    version: int
+
+
+def _actor_json(actor) -> str | None:
+    if actor is None:
+        return None                            # -> SQL NULL ("unknown actor"), not the string "None"
+    if isinstance(actor, str):
+        return json.dumps(actor)
+    try:
+        return json.dumps(identity_to_jsonb(actor))
+    except Exception:
+        return json.dumps({"repr": str(actor)})   # structured, parseable JSON — not a repr string
+
+
+def _derives_pairs(conn, object_refs: list[str]) -> tuple[tuple[str, str], ...]:
+    # Map each grounded object_ref back to its catalog_source. B3: object_ref is NOT catalog-qualified,
+    # so if one lives in >1 catalog we CANNOT know which the feature read — fail closed rather than bind
+    # the contract to catalogs it never used. (Full fix: carry catalog_source on FeatureIdea.derives_from.)
+    if not object_refs:
+        return ()
+    rows = conn.execute(
+        "SELECT object_ref, catalog_source FROM graph_node WHERE kind = 'column' "
+        "AND object_ref = ANY(%s)", (list(object_refs),)).fetchall()
+    by_ref: dict[str, set[str]] = {}
+    for ref, src in rows:
+        by_ref.setdefault(ref, set()).add(src)
+    ambiguous = sorted(ref for ref, srcs in by_ref.items() if len(srcs) > 1)
+    if ambiguous:
+        raise ContractValidationError(
+            f"ambiguous catalog_source for {ambiguous} — object_ref spans multiple catalogs; "
+            "catalog-qualified derives_from required (B3)")
+    return tuple((next(iter(srcs)), ref) for ref, srcs in by_ref.items())
+
+
+def confirm_contract(conn, draft: ContractDraft, *, actor, target_ref: str | None = None,
+                     now: datetime | None = None) -> Contract:
+    """The human gate. RE-RUNS the deterministic MCV (B1) and refuses to govern an invalid draft, then
+    registers a versioned governed contract + wires its derives-from into the feature layer. Re-confirming
+    the same feature bumps the version. A non-empty definition is required (no empty-narrative contract)."""
+    tref = target_ref if target_ref is not None else draft.target_ref   # M3: fall back to the draft's
+    ok, reasons = validate_minimum(conn, draft, target_ref=tref, now=now)
+    if not ok:
+        raise ContractValidationError(f"contract failed MCV, not governed: {reasons}")
+    if not (draft.definition or "").strip():
+        raise ContractValidationError("contract has an empty definition, not governed")
+    pairs = _derives_pairs(conn, draft.derives_from)
+    # B4: ONE feature per feature_name — re-confirm reuses + refreshes the feature (no proliferation),
+    # so drift impact/freshness point at a single live feature, not N duplicates.
+    prev = conn.execute("SELECT feature_id, version FROM contract WHERE feature_name = %s "
+                        "ORDER BY version DESC LIMIT 1", (draft.feature_name,)).fetchone()
+    if prev is not None:
+        feature_id, version = prev[0], prev[1] + 1
+        conn.execute(
+            "UPDATE feature SET description = %s, grain_table = %s, aggregation = %s, "
+            "as_of_column = %s WHERE feature_id = %s",
+            (draft.definition, draft.grain_table, draft.aggregation, draft.as_of_column, feature_id))
+        conn.execute("DELETE FROM feature_derives_from WHERE feature_id = %s", (feature_id,))
+        for catalog_source, object_ref in pairs:
+            conn.execute("INSERT INTO feature_derives_from (feature_id, catalog_source, object_ref) "
+                         "VALUES (%s, %s, %s) ON CONFLICT DO NOTHING",
+                         (feature_id, catalog_source, object_ref))
+    else:
+        feature_id = register_feature(conn, FeatureSpec(
+            name=draft.feature_name, description=draft.definition, grain_table=draft.grain_table,
+            aggregation=draft.aggregation, as_of_column=draft.as_of_column, derives_from=pairs))
+        version = 1
+    contract_id = mint_id("contract")
+    conn.execute(
+        "INSERT INTO contract (contract_id, feature_id, feature_name, definition, version, actor) "
+        "VALUES (%s, %s, %s, %s, %s, %s::jsonb)",
+        (contract_id, feature_id, draft.feature_name, draft.definition, version, _actor_json(actor)))
+    return Contract(contract_id, feature_id, draft.feature_name, version)
+
+
+def contract_freshness(conn, contract_id: str, *, now: datetime) -> FeatureFreshness:
+    """A contract is only as fresh as its feature's stalest source — catalog drift stales the contract."""
+    row = conn.execute("SELECT feature_id FROM contract WHERE contract_id = %s",
+                       (contract_id,)).fetchone()
+    if row is None:
+        raise KeyError(contract_id)
+    return feature_freshness(conn, row[0], now=now)
+
+
+def contracts_affected_by(conn, catalog_source: str, object_ref: str) -> list[str]:
+    """Drift impact: the CURRENT contract (max version) per feature that derives from a drifted column
+    — not every historical version (B4)."""
+    feature_ids = features_affected_by(conn, catalog_source, object_ref)
+    if not feature_ids:
+        return []
+    rows = conn.execute(
+        "SELECT DISTINCT ON (feature_name) contract_id FROM contract "
+        "WHERE feature_id = ANY(%s) ORDER BY feature_name, version DESC",
+        (feature_ids,)).fetchall()
+    return sorted(r[0] for r in rows)
