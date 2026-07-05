@@ -127,6 +127,9 @@ class FeatureIdea:
     # Residual ADVISORY note from the LLM-2 critic when it was still unsatisfied after the review cap —
     # the feature goes forward to Gate #1 carrying it, and the HUMAN decides whether it's a fit.
     critic_note: str = ""
+    # §14.2 reason->rules: a one-line causal rationale for WHY this feature operationalizes the
+    # hypothesis, surfaced at Gate #1 so the reviewer audits the logic before any code exists.
+    rationale: str = ""
 
 
 def _column_meta(conn, pairs: list[tuple[str, str]]) -> dict[str, dict]:
@@ -204,7 +207,8 @@ def _validate_idea(conn, raw: dict, known: set[str], src_of: dict[str, set[str]]
     return FeatureIdea(
         name=str(raw.get("name", "")), description=str(raw.get("description", "")),
         derives_from=derives, aggregation=raw.get("aggregation"),
-        grain_table=raw.get("grain_table"), derives_pairs=tuple(pairs)), None
+        grain_table=raw.get("grain_table"), derives_pairs=tuple(pairs),
+        rationale=str(raw.get("rationale", ""))), None   # §14.2 one-line causal rationale (opportunistic)
 
 
 def _redundant_of(idea: FeatureIdea, accepted: list[FeatureIdea]) -> bool:
@@ -421,21 +425,62 @@ class SetRecommendation:
                    "prediction; confirm the winner with a backtest once features are computed")
 
 
+_NUMERIC_TYPES = ("numeric", "integer", "bigint", "int", "int4", "int8", "smallint", "float",
+                  "double", "double precision", "decimal", "real", "money")
+
+
+def _is_numeric(data_type: str | None) -> bool:
+    return (data_type or "").lower() in _NUMERIC_TYPES
+
+
+def route_strategies(conn, cols: list[dict]) -> list[tuple[str, str]]:
+    """§14.8 Router: DETERMINISTICALLY pick which typed feature-strategy families APPLY to this
+    candidate set, from the graph's shape — so generation never wastes a round proposing a feature the
+    data can't support (which the gauntlet would only reject). `unary` always applies; the rest gate on
+    structure: `ratio` needs >=2 numeric columns; `temporal` needs a point-in-time (as-of) column;
+    `aggregation` needs a join key; `distributional` needs an entity to form a peer group. Returns
+    (strategy_name, prompt_focus) pairs."""
+    picks = [("unary", "single-column transforms — bucketing, flags, or log of one column")]
+    refs = [c["object_ref"] for c in cols]
+    if not refs:
+        return picks
+    rows = conn.execute(
+        "SELECT data_type, is_as_of, entity FROM graph_node WHERE kind = 'column' "
+        "AND object_ref = ANY(%s)", (refs,)).fetchall()
+    if sum(1 for dt, _, _ in rows if _is_numeric(dt)) >= 2:
+        picks.append(("ratio", "ratios / cross-features between two numeric columns (e.g. utilization)"))
+    if conn.execute("SELECT 1 FROM graph_edge WHERE kind = 'joins' AND from_ref = ANY(%s) LIMIT 1",
+                    (refs,)).fetchone() is not None:
+        picks.append(("aggregation", "aggregations (count/sum/avg) over related child rows via a join key"))
+    if any(a for _, a, _ in rows):
+        picks.append(("temporal", "recency / trend / velocity over a point-in-time (as-of) column"))
+    if any(e for _, _, e in rows):
+        picks.append(("distributional",
+                      "distributional features vs a peer group (z-score / percentile per entity)"))
+    return picks
+
+
 def recommend_feature_sets(conn, objective: str, client: LLMClient, *,
                            entity: str | None = None, catalog_source: str | None = None,
                            roles: Iterable[str] = (), target_ref: str | None = None,
                            now: datetime | None = None, fresh_within: timedelta = timedelta(hours=24),
-                           lenses: tuple[str, ...] = ("behavioral", "monetary", "engagement"),
+                           lenses: tuple[str, ...] | None = None,
                            per_set: int = 3, budget: int = 2) -> list[FeatureSet]:
-    """Generate N DIVERSE, each-fully-validated feature sets — one per strategy lens — by running the
-    validated loop once per lens. Every feature in every set has passed the gauntlet, so the human only
+    """Generate N DIVERSE, each-fully-validated feature sets — one per strategy — by running the loop
+    once per strategy. When `lenses` is None (default) the §14.8 Router picks the APPLICABLE typed
+    strategies from the data's shape (skipping e.g. temporal when there's no as-of column); pass explicit
+    `lenses` to force a fixed set. Every feature in every set has passed the gauntlet, so the human only
     ever curates among SAFE options."""
+    if lenses is None:
+        strategies = route_strategies(conn, _candidate_columns(conn, catalog_source, roles, entity))
+    else:
+        strategies = [(lens, lens) for lens in lenses]
     return [
-        FeatureSet(lens=lens, features=recommend_features(
-            conn, f"{objective} (focus: {lens})", client, entity=entity,
+        FeatureSet(lens=name, features=recommend_features(
+            conn, f"{objective} (focus: {focus})", client, entity=entity,
             catalog_source=catalog_source, roles=roles, target_ref=target_ref, now=now,
             fresh_within=fresh_within, target=per_set, budget=budget))
-        for lens in lenses
+        for name, focus in strategies
     ]
 
 
