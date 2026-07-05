@@ -13,6 +13,7 @@ def _bank_graph(db):
         CanonicalRow("bank", "transactions", "acct_id", "integer",
                      joins_to="accounts.account_id", cardinality="N:1"),
         CanonicalRow("bank", "transactions", "amount", "numeric", definition="txn amount"),
+        CanonicalRow("bank", "transactions", "txn_date", "timestamp", as_of=True),  # point-in-time
         CanonicalRow("bank", "accounts", "account_id", "integer", is_grain=True),
         CanonicalRow("bank", "accounts", "churned", "boolean", definition="customer churned flag"),
     ]

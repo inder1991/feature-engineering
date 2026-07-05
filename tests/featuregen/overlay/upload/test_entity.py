@@ -44,3 +44,33 @@ def test_cross_join_none_when_no_shared_entity(db):
     _two_catalogs(db)
     build_graph(db, "loans", [CanonicalRow("loans", "loan_accounts", "loan_id", "integer")])  # no entity
     assert cross_join_via_entity(db, "deposits", "accounts", "loans", "loan_accounts") is None
+
+
+def test_suggest_entity_advisory(db):
+    from featuregen.intake.llm import FakeLLM, FakeResponse
+    from featuregen.overlay.upload.entity import suggest_entity
+    ok = FakeLLM(script={"overlay.enrich.entity": FakeResponse(output={"entity": "Customer"})})
+    assert suggest_entity(db, ok, table="accounts", column="cust_ref", type="integer") == "Customer"
+    # empty / implausible suggestion is not applied
+    empty = FakeLLM(script={"overlay.enrich.entity": FakeResponse(output={"entity": ""})})
+    assert suggest_entity(db, empty, table="accounts", column="balance", type="numeric") is None
+    listish = FakeLLM(script={"overlay.enrich.entity": FakeResponse(output={"entity": "['a','b']"})})
+    assert suggest_entity(db, listish, table="accounts", column="x", type="text") is None
+
+
+def test_cross_catalog_path_joins_then_entity_bridge(db):
+    from featuregen.overlay.upload.entity import find_cross_catalog_path
+    build_graph(db, "cards", [
+        CanonicalRow("cards", "transactions", "acct_id", "integer",
+                     joins_to="card_accounts.card_id", cardinality="N:1"),
+        CanonicalRow("cards", "card_accounts", "card_id", "integer", is_grain=True),
+        CanonicalRow("cards", "card_accounts", "cust_id", "integer", entity="Customer")])
+    build_graph(db, "deposits", [
+        CanonicalRow("deposits", "accounts", "account_id", "integer", is_grain=True),
+        CanonicalRow("deposits", "accounts", "cust_ref", "integer", entity="Customer")])
+    # cards.transactions --join--> cards.card_accounts --entity(Customer)--> deposits.accounts
+    path = find_cross_catalog_path(db, "cards", "transactions", "deposits", "accounts")
+    assert path is not None and len(path) == 2
+    assert path[0].kind == "join"
+    assert path[1].kind == "entity" and path[1].detail == "Customer"
+    assert find_cross_catalog_path(db, "cards", "transactions", "deposits", "nowhere") is None

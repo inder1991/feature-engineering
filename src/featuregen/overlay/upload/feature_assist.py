@@ -11,9 +11,19 @@ proposals only.
 """
 from __future__ import annotations
 
+import re
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+
+_WINDOW_RE = re.compile(r"\d+\s*[dwmy]\b")   # 90d, 30 d, 12m, 1y
+_WINDOW_WORDS = ("trend", "rolling", "window", "velocity", "growth", "over_time", "all_time",
+                 "delta", "moving")
+
+
+def _is_windowed(aggregation: str | None) -> bool:
+    a = (aggregation or "").lower()
+    return bool(_WINDOW_RE.search(a)) or any(w in a for w in _WINDOW_WORDS)
 
 from featuregen.intake.llm import LLMClient, LLMRequest
 from featuregen.overlay.catalog_changes import drift_watermark
@@ -72,6 +82,14 @@ def _column_meta(conn, object_refs: list[str]) -> dict[str, dict]:
     return {r[0]: {"catalog_source": r[1], "additivity": r[2]} for r in rows}
 
 
+def _table_has_as_of(conn, catalog_source: str, table: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM graph_node WHERE catalog_source = %s AND table_name = %s "
+        "AND is_as_of = true LIMIT 1",
+        (catalog_source, table)).fetchone()
+    return row is not None
+
+
 def _validate_idea(conn, raw: dict, known: set[str], target_ref: str | None,
                    now: datetime | None, fresh_within: timedelta):
     """The deterministic gauntlet. Returns (FeatureIdea, 'ok') or (None, reason). Runs every pass so a
@@ -91,6 +109,11 @@ def _validate_idea(conn, raw: dict, known: set[str], target_ref: str | None,
         for d in derives:
             if meta.get(d, {}).get("additivity") in ("semi_additive", "non_additive"):
                 return None, f"unsafe SUM of {d}"
+    if _is_windowed(raw.get("aggregation")):   # point-in-time: a windowed feature needs an as-of column
+        for d in derives:
+            if d in meta and d.count(".") >= 2 and not _table_has_as_of(
+                    conn, meta[d]["catalog_source"], d.split(".")[1]):
+                return None, f"no point-in-time basis for {d} (future-leakage risk)"
     return FeatureIdea(
         name=str(raw.get("name", "")), description=str(raw.get("description", "")),
         derives_from=derives, aggregation=raw.get("aggregation"),
