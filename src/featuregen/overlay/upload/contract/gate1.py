@@ -21,6 +21,7 @@ from featuregen.overlay.upload.feature_assist import (
     recommend_feature_sets,
     recommend_features,
     recommend_set,
+    set_signals,
 )
 
 
@@ -79,7 +80,7 @@ def build_considered_set(conn, intent: Intent, client: LLMClient, *, entity: str
     conn.execute(   # persist the validated set so /contract/draft reconstructs the chosen feature here
         "INSERT INTO contract_considered (intent_id, considered) VALUES (%s, %s::jsonb) "
         "ON CONFLICT (intent_id) DO UPDATE SET considered = EXCLUDED.considered",
-        (intent.intent_id, json.dumps(_snapshot(cs))))
+        (intent.intent_id, json.dumps(_snapshot(conn, cs))))
     return cs
 
 
@@ -99,13 +100,16 @@ def _idea_json(f: FeatureIdea | None) -> dict | None:
         return None
     return {"name": f.name, "derives_from": f.derives_from, "aggregation": f.aggregation,
             "grain_table": f.grain_table,   # keep grain — it disambiguates same-named options
+            "verification": f.verification,   # honest §14.5 stamp surfaced at Gate #1 (item 4)
+            "critic_note": f.critic_note,     # advisory residual critic note — the human weighs it
             "derives_pairs": [list(p) for p in f.derives_pairs]}   # for server-side reconstruction
 
 
-def _snapshot(cs: ConsideredSet) -> dict:
+def _snapshot(conn, cs: ConsideredSet) -> dict:
     return {
         "anchor": _idea_json(cs.anchor),
-        "alternatives": [{"lens": s.lens, "features": [_idea_json(f) for f in s.features]}
+        "alternatives": [{"lens": s.lens, "features": [_idea_json(f) for f in s.features],
+                          "signals": set_signals(conn, s)}   # deterministic ranking signals (item 1b)
                          for s in cs.alternatives],
         "recommendation": None if cs.recommendation is None else {
             "recommended_lens": cs.recommendation.recommended_lens,
@@ -134,7 +138,7 @@ def confirm_gate1(conn, considered: ConsideredSet, *, chosen_source: str, chosen
         "chosen_option_id = EXCLUDED.chosen_option_id, why = EXCLUDED.why, actor = EXCLUDED.actor, "
         "considered = EXCLUDED.considered",
         (considered.intent_id, chosen_source, chosen_option_id, why,
-         _actor_json(actor), json.dumps(_snapshot(considered))))
+         _actor_json(actor), json.dumps(_snapshot(conn, considered))))
     return chosen_option_id
 
 

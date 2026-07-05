@@ -64,6 +64,9 @@ _SCHEMAS: dict[tuple[str, int], dict] = {
     ("leakage", 1): {"type": "object", "additionalProperties": True,
                      "properties": {"leaks": {"type": "array"}}},
     ("feature_set_rec", 1): {"type": "object", "additionalProperties": True},
+    # LLM-2 candidate critic (SP-12 item 5): {"issues": [{"name","issue"}]} — advisory quality/fit notes.
+    ("feature_candidate_critique", 1): {"type": "object", "additionalProperties": True,
+                                        "properties": {"issues": {"type": "array"}}},
 }
 
 # Fallback service identity for when no real actor is threaded in. authenticated=False — a
