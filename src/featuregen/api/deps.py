@@ -9,6 +9,7 @@ from fastapi import Header, HTTPException, Request
 
 from featuregen.config import get_settings
 from featuregen.contracts.envelopes import IdentityEnvelope
+from featuregen.identity.build import IdentityError, build_human_identity
 from featuregen.intake.llm import LLMClient
 
 
@@ -33,19 +34,31 @@ def get_identity(
     x_user: str | None = Header(default=None),
     x_roles: str = Header(default=""),
 ) -> IdentityEnvelope:
-    """Stub session auth (spec build-step 1): subject + roles from headers until the real IdP
-    lands. This dependency is the M6 seam — swap it for real session resolution without touching
-    any endpoint. Roles must never be accepted from request params or bodies."""
+    """Stub session auth (spec build-step 1): subject + roles from headers until the real IdP lands.
+
+    Routes identity through the fail-closed builder (``build_human_identity``) WITHOUT the private
+    trust capability, so the envelope comes back ``authenticated=False`` (SP-0.5 BLOCKER #1). That is
+    the honest state of a header stub: it *asserts* an identity, it does not *prove* one — only a
+    verifier that has checked a token may mint ``authenticated=True``. Nothing on the API's paths
+    requires an authenticated actor: the event store records ``authenticated`` as data, and read
+    scope derives from roles alone (verified by the identity + api suites). ``auth_method="stub"`` is
+    deliberate honesty (allowed because ``validate_identity`` only runs on authenticated envelopes),
+    and the builder prepends the mandatory ``user:`` subject prefix.
+
+    This dependency is the M6 seam — swap it for real session resolution without touching any
+    endpoint. When the real IdP lands (handoff-spec build-step 5), the body becomes
+    ``current_identity_verifier().verify_human(bearer_token)``: same seam, same routes, but the
+    returned envelopes are genuinely ``authenticated=True``. Roles must never be accepted from
+    request params or bodies."""
     if not x_user:
         raise HTTPException(status_code=401, detail="missing X-User header (stub auth)")
     roles = tuple(r.strip() for r in x_roles.split(",") if r.strip())
-    return IdentityEnvelope(
-        subject=x_user,
-        actor_kind="human",
-        authenticated=True,
-        auth_method="stub",
-        role_claims=roles,
-    )
+    try:
+        return build_human_identity(
+            subject=f"user:{x_user}", role_claims=roles, auth_method="stub"
+        )
+    except IdentityError as exc:
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
 
 
 def get_llm(request: Request) -> LLMClient:

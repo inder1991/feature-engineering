@@ -85,7 +85,9 @@ Environment:
 
 Auth is a development stub: send `X-User: <subject>` and `X-Roles: pii_reader,restricted_reader,…`.
 Roles gate read-scope (PII-tagged columns are hidden without `pii_reader`). The stub is the
-single seam (`featuregen.api.deps.get_identity`) to replace with real session auth.
+single seam (`featuregen.api.deps.get_identity`) to replace with real session auth. The stub mints
+an unauthenticated dev principal (`user:<subject>`) through the fail-closed identity builder;
+authenticated envelopes only ever come from a registered verifier once the real IdP lands.
 
 ## License
 Proprietary — see [LICENSE](LICENSE).

@@ -16,11 +16,13 @@ def test_identity_requires_user_header():
     assert exc.value.status_code == 401
 
 
-def test_identity_parses_subject_and_roles():
+def test_identity_parses_subject_and_roles_unauthenticated_stub():
+    # The stub asserts identity, it does not prove it (SP-0.5 trust boundary): the envelope is
+    # authenticated=False until a real verifier proves a token.
     ident = get_identity(x_user="ana", x_roles="pii_reader, data_owner")
-    assert ident.subject == "ana"
+    assert ident.subject == "user:ana"
     assert ident.role_claims == ("pii_reader", "data_owner")
-    assert ident.authenticated is True
+    assert ident.authenticated is False
     assert ident.auth_method == "stub"
 
 
