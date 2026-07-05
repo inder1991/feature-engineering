@@ -1,0 +1,81 @@
+"""Entity layer — the cross-domain anchor.
+
+A feature is *the customer's* feature, not *a deposits* feature, only if the platform knows which
+columns across different catalogs denote the same business entity. Columns carry a declared `entity`
+tag (`Customer`, `Account`); this module reads that tag out of the graph to expose entity membership
+**across catalogs** — the raw material for cross-source join paths and cross-domain candidate gathering.
+
+No new tables: entity membership is derived from `graph_node.entity`. Reads are read-scoped (an entity
+key column may itself be sensitive).
+"""
+from __future__ import annotations
+
+from collections.abc import Iterable
+from dataclasses import dataclass
+
+from featuregen.overlay.upload.read_scope import allowed_sensitivities
+
+
+@dataclass(frozen=True, slots=True)
+class EntityColumn:
+    entity: str
+    catalog_source: str
+    table: str
+    object_ref: str
+
+
+def list_entities(conn) -> list[str]:
+    rows = conn.execute(
+        "SELECT DISTINCT entity FROM graph_node WHERE entity IS NOT NULL ORDER BY entity").fetchall()
+    return [r[0] for r in rows]
+
+
+def entity_of(conn, catalog_source: str, object_ref: str) -> str | None:
+    row = conn.execute(
+        "SELECT entity FROM graph_node WHERE catalog_source = %s AND object_ref = %s",
+        (catalog_source, object_ref)).fetchone()
+    return row[0] if row else None
+
+
+def entity_key_columns(conn, entity: str, *, roles: Iterable[str] = ()) -> list[EntityColumn]:
+    """Every column that denotes `entity`, ACROSS all catalogs (read-scoped). These are the keys a
+    cross-source join hangs on — e.g. deposits.cust_ref and cards.cust_id both → Customer."""
+    rows = conn.execute(
+        "SELECT catalog_source, table_name, object_ref FROM graph_node "
+        "WHERE kind = 'column' AND entity = %s "
+        "AND (sensitivity IS NULL OR sensitivity = ANY(%s)) "
+        "ORDER BY catalog_source, object_ref",
+        (entity, allowed_sensitivities(roles))).fetchall()
+    return [EntityColumn(entity=entity, catalog_source=r[0], table=r[1], object_ref=r[2])
+            for r in rows]
+
+
+@dataclass(frozen=True, slots=True)
+class EntityBridge:
+    entity: str
+    from_ref: str          # the from-table's entity key column
+    to_ref: str            # the to-table's entity key column
+
+
+def _table_entity_keys(conn, catalog_source: str, table: str,
+                       roles: Iterable[str]) -> dict[str, str]:
+    rows = conn.execute(
+        "SELECT entity, object_ref FROM graph_node "
+        "WHERE kind = 'column' AND catalog_source = %s AND table_name = %s AND entity IS NOT NULL "
+        "AND (sensitivity IS NULL OR sensitivity = ANY(%s))",
+        (catalog_source, table, allowed_sensitivities(roles))).fetchall()
+    return {r[0]: r[1] for r in rows}
+
+
+def cross_join_via_entity(conn, from_source: str, from_table: str, to_source: str, to_table: str, *,
+                          roles: Iterable[str] = ()) -> EntityBridge | None:
+    """Bridge two tables in (possibly) different catalogs via a shared entity — the cross-domain join
+    primitive. Returns the entity + the key columns to join on, or None if they share no entity. The
+    link is declared/entity-resolved, NOT value-verified (no DB), so callers surface it for human
+    confirmation before a feature that uses it is registered."""
+    from_keys = _table_entity_keys(conn, from_source, from_table, roles)
+    to_keys = _table_entity_keys(conn, to_source, to_table, roles)
+    for entity, from_ref in from_keys.items():
+        if entity in to_keys:
+            return EntityBridge(entity=entity, from_ref=from_ref, to_ref=to_keys[entity])
+    return None
