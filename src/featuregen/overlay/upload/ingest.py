@@ -21,6 +21,15 @@ from featuregen.projections.runner import run_projection
 logger = logging.getLogger(__name__)
 
 
+def _drain_projection(conn) -> None:
+    """Run the overlay projection until caught up. A single run_projection caps at 500 events and an
+    upload emits 2 per (re)asserted fact, so one pass on a large upload leaves the dependency index
+    stale when detect_catalog_changes reads it (false stale / missed drop). Each pass advances the
+    checkpoint, so this terminates (a partial batch = caught up or poison-halted)."""
+    while run_projection(conn, OverlayProjection()) >= 500:
+        pass
+
+
 @dataclass(frozen=True, slots=True)
 class IngestResult:
     status: str            # "ingested" | "held" | "rejected"
@@ -95,9 +104,9 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
         if _assert_fact(conn, catalog_source, table, fact_type, value, actor=actor):
             asserted += 1
 
-    run_projection(conn, OverlayProjection())
+    _drain_projection(conn)   # fully catch up BEFORE the diff reads the dependency index (>500-event uploads)
     changes = detect_catalog_changes(conn, upload, actor=actor, now=now, open_reverify=False)
-    run_projection(conn, OverlayProjection())
+    _drain_projection(conn)
     staled = sum(1 for c in changes if c.kind in ("drop", "type_change", "rename"))
 
     concepts = definitions = domains = None
