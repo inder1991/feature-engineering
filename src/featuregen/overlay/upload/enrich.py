@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 
-from featuregen.intake.llm import LLMClient, LLMRequest
+from featuregen.intake.llm import PROVIDER_OK, LLMClient, LLMRequest
 from featuregen.overlay.upload.canonical import CanonicalRow
 from featuregen.overlay.upload.concepts import UNCLASSIFIED, is_known_concept
 
@@ -48,14 +48,30 @@ def _cache_put(conn, cache_table: str, content_hash_: str, value: str) -> None:
 
 
 def _call(client: LLMClient, task: str, prompt_id: str, schema_id: str, inputs: dict,
-          out_key: str) -> str:
+          out_key: str) -> str | None:
+    """Return the trimmed string output, or None on ANY failure/empty. None means 'no answer this
+    time' — the caller must NOT cache it, so a transient provider failure never poisons the cache
+    permanently (M3). A real provider that fails closed (M2) also yields None -> enrichment simply
+    produces nothing until the full call_llm+redaction integration lands (documented follow-on)."""
     req = LLMRequest(
         task=task, prompt_id=prompt_id, prompt_version=1,
-        inputs=inputs,   # schema metadata only — never data values
+        inputs=inputs,   # schema NAMES/types only — never free-text or data values (M4 egress)
         output_schema_id=schema_id, output_schema_version=1,
         generation_settings={"provider": "fake", "model": "test"},
     )
-    return str(client.call(req).output.get(out_key, "")).strip()
+    result = client.call(req)
+    if result.status != PROVIDER_OK or not isinstance(result.output, dict):
+        return None
+    val = str(result.output.get(out_key, "")).strip()
+    return val or None
+
+
+def _bounded(val: str | None, max_len: int) -> str | None:
+    """Accept a plausible short single-line label/definition; reject empty, over-long, multiline,
+    or list-stringified (`['a','b']`) LLM output (M9). Returns None to skip caching."""
+    if not val or len(val) > max_len or "\n" in val or val.startswith("["):
+        return None
+    return val
 
 
 def enrich_concepts(conn, rows: list[CanonicalRow], client: LLMClient) -> dict[str, str]:
@@ -64,10 +80,12 @@ def enrich_concepts(conn, rows: list[CanonicalRow], client: LLMClient) -> dict[s
     for h, row in by_hash.items():
         if h in result:
             continue
-        concept = _call(client, _TASK, "overlay_concept_v1", "overlay_concept",
-                        {"table": row.table, "column": row.column, "type": row.type,
-                         "definition": row.definition}, "concept")
-        concept = concept if is_known_concept(concept) else UNCLASSIFIED
+        # Metadata only (names/types) — NOT the uploader's free-text definition (M4 egress risk).
+        raw = _call(client, _TASK, "overlay_concept_v1", "overlay_concept",
+                    {"table": row.table, "column": row.column, "type": row.type}, "concept")
+        if raw is None:
+            continue   # failure/empty -> don't cache; retry next ingest (M3)
+        concept = raw if is_known_concept(raw) else UNCLASSIFIED
         _cache_put(conn, "enrichment_concept", h, concept)
         result[h] = concept
     return result
@@ -80,8 +98,11 @@ def draft_definitions(conn, rows: list[CanonicalRow], client: LLMClient) -> dict
     for h, row in blank.items():
         if h in result:
             continue
-        drafted = _call(client, _DEF_TASK, "overlay_definition_v1", "overlay_definition",
-                        {"table": row.table, "column": row.column, "type": row.type}, "definition")
+        drafted = _bounded(_call(client, _DEF_TASK, "overlay_definition_v1", "overlay_definition",
+                                 {"table": row.table, "column": row.column, "type": row.type},
+                                 "definition"), 500)
+        if drafted is None:
+            continue   # failure / empty / over-long / list-stringified -> don't cache (M3/M9)
         _cache_put(conn, "enrichment_definition", h, drafted)
         result[h] = drafted
     return result
@@ -102,8 +123,10 @@ def classify_domains(conn, rows: list[CanonicalRow], client: LLMClient) -> dict[
         if h in cached:
             result[table] = cached[h]
             continue
-        domain = _call(client, _DOMAIN_TASK, "overlay_domain_v1", "overlay_domain",
-                       {"table": table, "columns": sorted(cols)}, "domain")
+        domain = _bounded(_call(client, _DOMAIN_TASK, "overlay_domain_v1", "overlay_domain",
+                                {"table": table, "columns": sorted(cols)}, "domain"), 64)
+        if domain is None:
+            continue   # failure / empty / over-long / list-stringified -> don't cache (M3/M9)
         _cache_put(conn, "enrichment_domain", h, domain)
         result[table] = domain
     return result

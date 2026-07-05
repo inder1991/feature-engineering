@@ -49,3 +49,46 @@ def test_classifies_domain_per_table(db):
     client = FakeLLM(script={"overlay.enrich.domain": FakeResponse(output={"domain": "Deposits"})})
     out = classify_domains(db, rows, client)
     assert out["accounts"] == "Deposits"
+
+
+def test_provider_failure_is_not_cached(db):
+    """M3: a non-OK provider outcome must not poison the cache — retried next time."""
+    from featuregen.intake.llm import PROVIDER_REFUSAL
+    rows = [CanonicalRow("deposits", "accounts", "x", "text")]
+    fail = FakeLLM(script={_TASK: FakeResponse(output={}, provider_status=PROVIDER_REFUSAL)})
+    out = enrich_concepts(db, rows, fail)
+    assert out == {}                                      # nothing cached
+    assert db.execute("SELECT count(*) FROM enrichment_concept").fetchone()[0] == 0
+    # A later OK call succeeds (the failure did not stick).
+    ok = FakeLLM(script={_TASK: FakeResponse(output={"concept": "account_identifier"})})
+    out2 = enrich_concepts(db, rows, ok)
+    assert out2[content_hash(rows[0])] == "account_identifier"
+
+
+def test_garbage_domain_and_definition_are_rejected(db):
+    from featuregen.overlay.upload.enrich import classify_domains, draft_definitions
+    rows = [CanonicalRow("deposits", "accounts", "bal", "numeric")]
+    listish = FakeLLM(script={
+        "overlay.enrich.definition": FakeResponse(output={"definition": "['a', 'b']"}),
+        "overlay.enrich.domain": FakeResponse(output={"domain": "['Deposits','Payments']"}),
+    })
+    assert draft_definitions(db, rows, listish) == {}     # list-stringified -> rejected
+    assert classify_domains(db, rows, listish) == {}
+
+
+def test_concept_inputs_exclude_free_text_definition(db):
+    """M4: the uploader's free-text definition must not be sent to the LLM."""
+    captured = {}
+
+    class _Capture:
+        def call(self, request):
+            captured["inputs"] = dict(request.inputs)
+            from featuregen.intake.llm import LLMResult
+            return LLMResult(output={"concept": "monetary_amount"}, self_reported_scores={},
+                             call_ref="", status="ok")
+
+    rows = [CanonicalRow("deposits", "accounts", "bal", "numeric",
+                         definition="holder SSN 123-45-6789")]   # PII in free text
+    enrich_concepts(db, rows, _Capture())
+    assert "definition" not in captured["inputs"]
+    assert set(captured["inputs"]) == {"table", "column", "type"}
