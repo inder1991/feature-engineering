@@ -114,7 +114,7 @@ def _save_snapshot(conn: DbConn, catalog_source: str, current) -> None:
 
 
 def detect_catalog_changes(
-    conn: DbConn, adapter, *, actor, now: datetime | None = None
+    conn: DbConn, adapter, *, actor, now: datetime | None = None, open_reverify: bool = True
 ) -> list[Change]:
     """Snapshot adapter.fingerprint() into overlay_catalog_object and diff it against the
     prior snapshot (§8). Because fact_key is name-based, a rename always yields a NEW key:
@@ -150,7 +150,7 @@ def detect_catalog_changes(
     try:
         for ch in changes:
             if ch.kind in ("drop", "type_change", "rename"):
-                _stale_dependents(conn, adapter, ch, actor=actor)
+                _stale_dependents(conn, adapter, ch, actor=actor, open_reverify=open_reverify)
     except ConcurrencyError:
         # A concurrent confirm conflicted with a dependent stale (review #7). Return WITHOUT
         # advancing the snapshot or watermark so the next scan re-detects + re-stales (idempotent:
@@ -169,7 +169,9 @@ def detect_catalog_changes(
     return changes
 
 
-def _stale_one(conn: DbConn, adapter, fact_key: str, *, change_ref: str, actor) -> str | None:
+def _stale_one(
+    conn: DbConn, adapter, fact_key: str, *, change_ref: str, actor, open_reverify: bool = True
+) -> str | None:
     """STALE one dependent fact (VERIFIED → STALE) targeting its current confirmed_event_id.
     CAS no-op when the fact has already advanced (not VERIFIED — already STALE/REVERIFY/
     REJECTED, or a concurrent confirm bumps the stream → ConcurrencyError). On success
@@ -199,24 +201,31 @@ def _stale_one(conn: DbConn, adapter, fact_key: str, *, change_ref: str, actor) 
         # change is re-detected next scan, instead of laundering it (the fact would stay VERIFIED
         # referencing a dropped/retyped object until TTL).
         raise
-    ref = _ref_from_payload(stream[0].payload["catalog_object_ref"])
-    authority = resolve_authority(conn, adapter, ref, state.fact_type)
-    open_reverify_task(
-        conn,
-        fact_key=fact_key,
-        fact_type=state.fact_type,
-        target_confirmed_event_id=state.confirmed_event_id,
-        authority=authority,
-        actor=actor,
-    )
+    if open_reverify:
+        # Governance path: route the stale to the data owner(s). The upload-catalog ingest
+        # (no owners) passes open_reverify=False — the fact still STALEs via the append above,
+        # but no owner task is opened.
+        ref = _ref_from_payload(stream[0].payload["catalog_object_ref"])
+        authority = resolve_authority(conn, adapter, ref, state.fact_type)
+        open_reverify_task(
+            conn,
+            fact_key=fact_key,
+            fact_type=state.fact_type,
+            target_confirmed_event_id=state.confirmed_event_id,
+            authority=authority,
+            actor=actor,
+        )
     return env.event_id
 
 
-def _stale_dependents(conn: DbConn, adapter, change: Change, *, actor) -> None:
+def _stale_dependents(
+    conn: DbConn, adapter, change: Change, *, actor, open_reverify: bool = True
+) -> None:
     """For every fact whose value references the changed object (general dependency index,
     both sides of an approved_join), STALE it. ref_object is the changed object's
     display_object_ref string — the same key the projection records in
     overlay_fact_dependency."""
     change_ref = f"{change.kind}:{change.object_ref}"
     for fact_key in dependents_of(conn, change.catalog_source, change.object_ref):
-        _stale_one(conn, adapter, fact_key, change_ref=change_ref, actor=actor)
+        _stale_one(conn, adapter, fact_key, change_ref=change_ref, actor=actor,
+                   open_reverify=open_reverify)
