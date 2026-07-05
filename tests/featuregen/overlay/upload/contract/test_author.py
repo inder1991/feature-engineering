@@ -17,7 +17,8 @@ def _bank(db):
 def test_draft_contract_grounds_facts_and_authors_definition(db):
     _bank(db)
     feature = FeatureIdea(name="avg_balance_90d", description="", aggregation="avg_90d",
-                          grain_table="accounts", derives_from=["public.accounts.balance"])
+                          grain_table="accounts", derives_from=["public.accounts.balance"],
+                          derives_pairs=(("bank", "public.accounts.balance"),))
     client = FakeLLM(script={"overlay.contract.draft": FakeResponse(output={
         "definition": "Average end-of-day ledger balance per account over the trailing 90 days."})})
 
@@ -34,7 +35,8 @@ def test_draft_contract_grounds_facts_and_authors_definition(db):
 def test_draft_records_an_audited_llm_call(db):
     _bank(db)
     feature = FeatureIdea(name="avg_balance_90d", description="", aggregation="avg_90d",
-                          grain_table="accounts", derives_from=["public.accounts.balance"])
+                          grain_table="accounts", derives_from=["public.accounts.balance"],
+                          derives_pairs=(("bank", "public.accounts.balance"),))
     client = FakeLLM(script={"overlay.contract.draft": FakeResponse(output={"definition": "x"})})
     before = db.execute("SELECT count(*) FROM llm_call WHERE run_id = 'overlay-enrichment'").fetchone()[0]
     draft_contract(db, feature, client)
@@ -51,7 +53,9 @@ def test_authoring_respects_read_scope(db):
                      definition="social security number"),
         CanonicalRow("bank", "accounts", "posted_at", "timestamp", as_of=True)])
     feature = FeatureIdea("f", "", ["public.accounts.balance", "public.accounts.ssn"],
-                          "avg_90d", "accounts")
+                          "avg_90d", "accounts",
+                          derives_pairs=(("bank", "public.accounts.balance"),
+                                         ("bank", "public.accounts.ssn")))
     captured = {}
 
     class _Cap:
@@ -64,3 +68,19 @@ def test_authoring_respects_read_scope(db):
     blob = json.dumps(captured["inputs"], default=str)
     assert "ledger balance" in blob                        # allowed column's definition present
     assert "social security number" not in blob            # restricted column's definition withheld
+
+
+def test_draft_authors_the_join_path(db):
+    # B3 follow-on: the deterministic join path (grain -> derived table) is authored onto the draft
+    build_graph(db, "bank", [
+        CanonicalRow("bank", "transactions", "acct_id", "integer",
+                     joins_to="accounts.account_id", cardinality="N:1"),
+        CanonicalRow("bank", "transactions", "amount", "numeric"),
+        CanonicalRow("bank", "accounts", "account_id", "integer", is_grain=True)])
+    feature = FeatureIdea("txn_count", "", ["public.transactions.amount"], "count", "accounts",
+                          derives_pairs=(("bank", "public.transactions.amount"),))
+    client = FakeLLM(script={"overlay.contract.draft": FakeResponse(output={"definition": "x"})})
+    draft = draft_contract(db, feature, client)
+    assert draft.join_path                                  # a join step from accounts <-> transactions
+    step = draft.join_path[0]
+    assert step["from"] and step["to"] and "accounts" in (step["from"] + step["to"])

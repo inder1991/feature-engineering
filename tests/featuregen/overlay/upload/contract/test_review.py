@@ -23,7 +23,8 @@ def _bank(db):
 
 def _draft(derives, defn="vague"):
     return ContractDraft(feature_name="avg_balance_90d", definition=defn, grain_table="accounts",
-                         aggregation="avg_90d", as_of_column="posted_at", derives_from=derives)
+                         aggregation="avg_90d", as_of_column="posted_at", derives_from=derives,
+                         derives_pairs=tuple(("bank", d) for d in derives))
 
 
 class _SeqLLM:

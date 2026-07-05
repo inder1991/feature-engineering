@@ -71,6 +71,9 @@ class FeatureIdea:
     derives_from: list[str]           # object_refs, grounded (they exist in the graph)
     aggregation: str | None
     grain_table: str | None
+    # B3: (catalog_source, object_ref) resolved at recommend time from the candidate context, so
+    # downstream carries the catalog and never re-derives it ambiguously from the whole graph.
+    derives_pairs: tuple[tuple[str, str], ...] = ()
 
 
 def _column_meta(conn, object_refs: list[str]) -> dict[str, dict]:
@@ -90,36 +93,43 @@ def _table_has_as_of(conn, catalog_source: str, table: str) -> bool:
     return row is not None
 
 
-def _validate_idea(conn, raw: dict, known: set[str], target_ref: str | None,
-                   now: datetime | None, fresh_within: timedelta):
+def _validate_idea(conn, raw: dict, known: set[str], src_of: dict[str, set[str]],
+                   target_ref: str | None, now: datetime | None, fresh_within: timedelta):
     """The deterministic gauntlet. Returns (FeatureIdea, 'ok') or (None, reason). Runs every pass so a
-    leaky / stale / unsafe candidate can NEVER be returned — the checks recommend_features used to skip."""
+    leaky / stale / unsafe candidate can NEVER be returned. `src_of` maps object_ref -> the catalog
+    source(s) it lives in within the candidate context, used to resolve each derive's catalog (B3)."""
     derives = [d for d in raw.get("derives_from", []) if d in known]
     if not derives:
         return None, "ungrounded"
+    # B3: resolve each derive to exactly one catalog_source from the candidate context. If a bare
+    # object_ref maps to >1 catalog we cannot know which the LLM meant -> fail closed.
+    pairs: list[tuple[str, str]] = []
+    for d in derives:
+        srcs = src_of.get(d, set())
+        if len(srcs) != 1:
+            return None, f"ambiguous catalog for {d}"
+        pairs.append((next(iter(srcs)), d))
     if target_ref and target_ref in derives:
         return None, "leaks target"
-    meta = _column_meta(conn, derives)
-    if now is not None:   # freshness — every source a derives-from column lives in must be fresh
-        for src in {meta[d]["catalog_source"] for d in derives if d in meta}:
+    if now is not None:   # freshness — every RESOLVED source must be fresh
+        for src in {p[0] for p in pairs}:
             wm = drift_watermark(conn, src)
             if wm is None or wm < now - fresh_within:
                 return None, f"stale source: {src}"
+    meta = _column_meta(conn, derives)
     if "sum" in (raw.get("aggregation") or "").lower():   # aggregation safety (additivity)
         for d in derives:
             if meta.get(d, {}).get("additivity") in ("semi_additive", "non_additive"):
                 return None, f"unsafe SUM of {d}"
     if _is_windowed(raw.get("aggregation")):   # point-in-time: a windowed feature needs an as-of column
-        for d in derives:
-            # object_ref is "[catalog.]schema.table.column" — the table is the second-to-last segment,
-            # so split(".")[-2] is correct for 3- and 4-part refs alike (was [1], wrong for 4-part).
-            if d in meta and d.count(".") >= 2 and not _table_has_as_of(
-                    conn, meta[d]["catalog_source"], d.split(".")[-2]):
+        for src, d in pairs:
+            # object_ref is "[catalog.]schema.table.column"; table is the second-to-last segment.
+            if d.count(".") >= 2 and not _table_has_as_of(conn, src, d.split(".")[-2]):
                 return None, f"no point-in-time basis for {d} (future-leakage risk)"
     return FeatureIdea(
         name=str(raw.get("name", "")), description=str(raw.get("description", "")),
         derives_from=derives, aggregation=raw.get("aggregation"),
-        grain_table=raw.get("grain_table")), "ok"
+        grain_table=raw.get("grain_table"), derives_pairs=tuple(pairs)), "ok"
 
 
 def recommend_features(conn, objective: str, client: LLMClient, *,
@@ -134,6 +144,9 @@ def recommend_features(conn, objective: str, client: LLMClient, *,
     Pass `entity` to gather candidates CROSS-DOMAIN (every catalog containing that entity)."""
     cols = _candidate_columns(conn, catalog_source, roles, entity)
     known = {c["object_ref"] for c in cols}
+    src_of: dict[str, set[str]] = {}          # object_ref -> catalog_source(s) in the candidate context
+    for c in cols:
+        src_of.setdefault(c["object_ref"], set()).add(c["catalog_source"])
     accepted: list[FeatureIdea] = []
     seen: set[str] = set()
     avoid: list[dict] = []
@@ -143,7 +156,7 @@ def recommend_features(conn, objective: str, client: LLMClient, *,
         out = _call_raw(client, "overlay.feature.recommend", "feature_recommend_v1", "feature_ideas",
                         {"objective": objective, "columns": _menu(cols), "avoid": avoid})
         for raw in out.get("features", []):
-            idea, reason = _validate_idea(conn, raw, known, target_ref, now, fresh_within)
+            idea, reason = _validate_idea(conn, raw, known, src_of, target_ref, now, fresh_within)
             if idea is None:
                 avoid.append({"name": raw.get("name", ""), "reason": reason})   # refine
                 continue
