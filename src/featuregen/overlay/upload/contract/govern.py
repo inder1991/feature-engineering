@@ -72,9 +72,10 @@ def confirm_contract(conn, draft: ContractDraft, *, actor, target_ref: str | Non
     contract_id = mint_id("contract")
     conn.execute(
         "INSERT INTO contract (contract_id, feature_id, feature_name, definition, version, actor, "
-        "join_path, intent_id) VALUES (%s, %s, %s, %s, %s, %s::jsonb, %s::jsonb, %s)",
+        "join_path, intent_id, verification) VALUES (%s, %s, %s, %s, %s, %s::jsonb, %s::jsonb, %s, %s)",
         (contract_id, feature_id, draft.feature_name, draft.definition, version, _actor_json(actor),
-         json.dumps(list(draft.join_path)), intent_id))   # intent_id: audit link to the hypothesis (M5)
+         json.dumps(list(draft.join_path)), intent_id,   # intent_id: audit link to the hypothesis (M5)
+         "DESIGN-CHECKED"))   # §14.5 stamp — gauntlet-passed; predictive value unverified (0968)
     return Contract(contract_id, feature_id, draft.feature_name, version)
 
 
@@ -98,3 +99,23 @@ def contracts_affected_by(conn, catalog_source: str, object_ref: str) -> list[st
         "WHERE feature_id = ANY(%s) ORDER BY feature_name, version DESC",
         (feature_ids,)).fetchall()
     return sorted(r[0] for r in rows)
+
+
+def list_contracts(conn, *, limit: int = 50) -> list[dict]:
+    """The governed-contract inventory (registry READ surface)."""
+    rows = conn.execute(
+        "SELECT contract_id, feature_id, feature_name, version, verification, created_at "
+        "FROM contract ORDER BY created_at DESC LIMIT %s", (limit,)).fetchall()
+    return [{"contract_id": r[0], "feature_id": r[1], "feature_name": r[2], "version": r[3],
+             "verification": r[4], "created_at": r[5].isoformat()} for r in rows]
+
+
+def get_contract_detail(conn, contract_id: str) -> dict | None:
+    row = conn.execute(
+        "SELECT contract_id, feature_id, feature_name, definition, version, verification, intent_id, "
+        "created_at FROM contract WHERE contract_id = %s", (contract_id,)).fetchone()
+    if row is None:
+        return None
+    return {"contract_id": row[0], "feature_id": row[1], "feature_name": row[2], "definition": row[3],
+            "version": row[4], "verification": row[5], "intent_id": row[6],
+            "created_at": row[7].isoformat()}
