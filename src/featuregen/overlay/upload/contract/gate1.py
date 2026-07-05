@@ -36,11 +36,23 @@ class ConsideredSet:
     recommendation: SetRecommendation | None      # advisory — fit vs hypothesis, not a performance claim
 
 
+def persist_intent(conn, intent: Intent) -> None:
+    """Durably record the intent — the mandatory hypothesis is the feature's premise (M6). Idempotent."""
+    conn.execute(
+        "INSERT INTO contract_intent (intent_id, hypothesis, definition, intake_mode, "
+        "redacted_hypothesis, redacted_definition, actor) VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb) "
+        "ON CONFLICT (intent_id) DO NOTHING",
+        (intent.intent_id, intent.hypothesis, intent.definition, intent.intake_mode,
+         intent.redacted_hypothesis, intent.redacted_definition, _actor_json(intent.actor)))
+
+
 def build_considered_set(conn, intent: Intent, client: LLMClient, *, entity: str | None = None,
                          catalog_source: str | None = None, roles=(), target_ref: str | None = None,
                          now=None) -> ConsideredSet:
     """Discovery loop → validated alternatives; the anchor is the requester's definition run through the
-    same validated loop (definition mode only). Every option shown to the human has passed the gauntlet."""
+    same validated loop (definition mode only). Every option shown to the human has passed the gauntlet.
+    Persists the intent (M6) — the hypothesis is durably recorded when the flow reaches Gate #1."""
+    persist_intent(conn, intent)
     alternatives = recommend_feature_sets(
         conn, intent.redacted_hypothesis, client, entity=entity, catalog_source=catalog_source,
         roles=roles, target_ref=target_ref, now=now)
