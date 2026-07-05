@@ -84,3 +84,21 @@ def test_draft_authors_the_join_path(db):
     assert draft.join_path                                  # a join step from accounts <-> transactions
     step = draft.join_path[0]
     assert step["from"] and step["to"] and "accounts" in (step["from"] + step["to"])
+
+
+def test_draft_authors_cross_catalog_join_path_via_entity(db):
+    # entity.py wired: a feature spanning two catalogs gets an entity-bridged join path authored
+    build_graph(db, "deposits", [
+        CanonicalRow("deposits", "accounts", "cust_ref", "integer", entity="Customer"),
+        CanonicalRow("deposits", "accounts", "balance", "numeric")])
+    build_graph(db, "cards", [
+        CanonicalRow("cards", "card_accounts", "cust_id", "integer", entity="Customer"),
+        CanonicalRow("cards", "card_accounts", "spend", "numeric")])
+    feature = FeatureIdea("cross", "", ["public.accounts.balance", "public.card_accounts.spend"],
+                          "avg", "accounts",
+                          derives_pairs=(("deposits", "public.accounts.balance"),
+                                         ("cards", "public.card_accounts.spend")))
+    client = FakeLLM(script={"overlay.contract.draft": FakeResponse(output={"definition": "x"})})
+    draft = draft_contract(db, feature, client)
+    assert any(step.get("kind") == "entity" and step.get("via") == "Customer"
+               for step in draft.join_path)   # accounts --entity(Customer)--> card_accounts

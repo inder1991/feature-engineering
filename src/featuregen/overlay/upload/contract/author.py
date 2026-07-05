@@ -13,6 +13,7 @@ from dataclasses import dataclass
 
 from featuregen.intake.llm import LLMClient
 from featuregen.overlay.upload.enrich_llm import audited_enrich_call
+from featuregen.overlay.upload.entity import find_cross_catalog_path
 from featuregen.overlay.upload.feature_assist import FeatureIdea
 from featuregen.overlay.upload.join_path import find_join_path
 from featuregen.overlay.upload.read_scope import allowed_sensitivities
@@ -60,22 +61,34 @@ def _column_defs(conn, pairs: tuple[tuple[str, str], ...], roles: Iterable[str])
             for r in rows if (r[0], r[1]) in wanted]
 
 
-def _join_path(conn, grain_table: str | None,
-               pairs: tuple[tuple[str, str], ...]) -> tuple[dict, ...]:
+def _join_path(conn, grain_table: str | None, pairs: tuple[tuple[str, str], ...],
+               roles: Iterable[str] = ()) -> tuple[dict, ...]:
     """The deterministic join path from the grain table to each other table the feature reads. Single-
-    catalog only for now (cross-catalog rides find_cross_catalog_path)."""
+    catalog uses the column-level `find_join_path`; CROSS-catalog uses `entity.find_cross_catalog_path`,
+    so a feature spanning catalogs records how its tables bridge via the shared entity (Customer)."""
     if not grain_table or not pairs:
         return ()
-    catalogs = {cs for cs, _ in pairs}
-    if len(catalogs) != 1:
+    tables = sorted({(cs, ref.split(".")[-2]) for cs, ref in pairs if ref.count(".") >= 2})
+    if not tables:
         return ()
-    catalog = next(iter(catalogs))
-    tables = {ref.split(".")[-2] for _, ref in pairs if ref.count(".") >= 2}
+    catalogs = {cs for cs, _ in tables}
     steps: list[dict] = []
-    for t in sorted(tables):
-        if t != grain_table:
-            for s in (find_join_path(conn, catalog, grain_table, t) or []):
-                steps.append({"from": s.from_ref, "to": s.to_ref, "cardinality": s.cardinality})
+    if len(catalogs) == 1:                              # single-catalog: column-level path
+        catalog = next(iter(catalogs))
+        for _, t in tables:
+            if t != grain_table:
+                for s in (find_join_path(conn, catalog, grain_table, t) or []):
+                    steps.append({"kind": "join", "from": s.from_ref, "to": s.to_ref,
+                                  "cardinality": s.cardinality})
+        return tuple(steps)
+    # cross-catalog: bridge each other-catalog table to the grain via the entity graph (wires entity.py)
+    grain_catalog = next((cs for cs, t in tables if t == grain_table), tables[0][0])
+    for cs, t in tables:
+        if (cs, t) != (grain_catalog, grain_table):
+            for s in (find_cross_catalog_path(conn, grain_catalog, grain_table, cs, t,
+                                              roles=roles) or []):
+                steps.append({"kind": s.kind, "from": f"{s.from_source}.{s.from_table}",
+                              "to": f"{s.to_source}.{s.to_table}", "via": s.detail})
     return tuple(steps)
 
 
@@ -101,4 +114,4 @@ def draft_contract(conn, feature: FeatureIdea, client: LLMClient, *, actor=None,
         as_of_column=_as_of_column(conn, feature.grain_table, grain_catalog),
         derives_from=list(feature.derives_from), target_ref=target_ref,
         derives_pairs=feature.derives_pairs,
-        join_path=_join_path(conn, feature.grain_table, feature.derives_pairs))
+        join_path=_join_path(conn, feature.grain_table, feature.derives_pairs, roles))
