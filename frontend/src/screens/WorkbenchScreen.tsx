@@ -1,15 +1,43 @@
+// One guided feature-generation flow: kickoff hero (goal + scope + Generate), an optional
+// describe composer that drafts candidates, one shared candidate list, and a selection tray
+// with an explicit confirm step before anything is registered.
+//
+// Invariants carried over from the hardening campaign:
+// - Lineage comes ONLY from backend-resolved pairs (FeatureIdea.derives_pairs for generated
+//   candidates, the drafted-against source snapshot for drafts), never from typed context.
+// - registerFeature fires only after the explicit Confirm registration step, exactly once per
+//   candidate (batch in-flight ref + per-candidate registered state).
+// - Every fetch handler carries an out-of-order guard (monotonic sequence refs).
+// - Scope edits invalidate candidates: source edits clear everything (draft snapshots no longer
+//   match the context), entity/target edits clear generated candidates only.
 import { type FormEvent, useRef, useState } from 'react'
 import {
-  ApiError, type FeatureFreshness, type FeatureIdea, type LeakageWarning, type Recipe,
-  featureFreshness, featureRecipe, leakageCheck, recommendFeatures, registerFeature,
+  ApiError, type FeatureFreshness, type FeatureIdea, type FeatureSpecIn, type JoinStep,
+  type Recipe, featureFreshness, featureRecipe, recommendFeatures, registerFeature,
 } from '../api'
 
 const HELP_STYLE = { fontSize: 12 } as const
-const CLUSTER_STYLE = { display: 'flex', flexWrap: 'wrap', gap: 8 } as const
 // Solid ok chip (index.css has no fresh badge class; mirrors .badge.stale's solid treatment).
 const OK_SOLID_CHIP_STYLE = {
   background: 'var(--ok-solid)', borderColor: 'transparent', color: 'var(--chip-ink)',
 } as const
+// Quiet link-shaped button (the describe toggle): overrides the global button chrome. Inline
+// styles win over the stylesheet hover rules, so it stays a link on hover too.
+const LINK_BUTTON_STYLE = {
+  background: 'transparent', border: 'none', padding: '0 2px', height: 32,
+  color: 'var(--accent)', fontWeight: 500,
+  textDecoration: 'underline', textUnderlineOffset: 2,
+} as const
+// Sticky-feel selection tray: the last row of the candidate list, pinned while the list scrolls.
+const TRAY_STYLE = {
+  position: 'sticky', bottom: 0, zIndex: 1, background: 'var(--surface)',
+  borderBottomLeftRadius: 'var(--radius-panel)', borderBottomRightRadius: 'var(--radius-panel)',
+  flexWrap: 'wrap', gap: 12,
+} as const
+
+const EXAMPLE_GOAL = 'predict churn'
+
+const WARN_GLYPH = 'M8 2.5 1.5 13.25h13L8 2.5ZM8 6.75v3M8 12v.01'
 
 function CalloutGlyph({ d }: { d: string }) {
   return (
@@ -30,8 +58,32 @@ function CalloutGlyph({ d }: { d: string }) {
   )
 }
 
-const WARN_GLYPH = 'M8 2.5 1.5 13.25h13L8 2.5ZM8 6.75v3M8 12v.01'
-const DANGER_GLYPH = 'M8 1.75a6.25 6.25 0 1 0 0 12.5 6.25 6.25 0 0 0 0-12.5ZM8 5v3.5M8 11v.01'
+// Registered rows swap their checkbox for this ok mark; the "Registered <id>" text carries the
+// state, so the glyph is decorative (color never works alone).
+function CheckGlyph() {
+  return (
+    <span
+      aria-hidden="true"
+      style={{
+        display: 'inline-flex', width: 32, height: 32, flex: 'none',
+        alignItems: 'center', justifyContent: 'center', color: 'var(--ok)',
+      }}
+    >
+      <svg
+        width="16"
+        height="16"
+        viewBox="0 0 16 16"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="1.5"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      >
+        <path d="m3 8.5 3.5 3.5L13 4.5" />
+      </svg>
+    </span>
+  )
+}
 
 // Uploaded cardinality is unvalidated free text. Only a normalized N:1 or 1:1 hop is known-safe;
 // anything else ('1:N', '1:n', 'one_to_many', ...) can multiply rows, and a missing value means
@@ -48,39 +100,144 @@ function stepFansOut(raw: string | null): boolean {
   return norm !== null && !SAFE_CARDINALITIES.has(norm)
 }
 
-// Proposals carry a per-suggest key (suggest sequence + index + name): LLM-chosen names are not
-// unique across rounds, so keying registered/confirming state by name alone shows phantom
-// "Registered as" on a fresh, never-registered proposal that reuses an old name.
-interface Proposal {
+// Suggested feature name for a draft: a slug of the description, editable before selection.
+function slugFrom(text: string): string {
+  return text
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '_')
+    .replace(/^_+|_+$/g, '')
+    .slice(0, 63)
+}
+
+// Candidates carry per-fetch keys (sequence + index + name): LLM-chosen names are not unique
+// across rounds, so keying registered state by name alone would show phantom "Registered" on a
+// fresh, never-registered candidate that reuses an old name.
+interface GeneratedCandidate {
+  kind: 'generated'
   key: string
   idea: FeatureIdea
 }
+
+// A described feature drafted through /features/recipe. Recipes are single-catalog by API
+// contract, so the source it was drafted against is snapshotted and registration lineage uses
+// [snapshotSource, ref] pairs; the live source field may have changed since.
+interface DraftCandidate {
+  kind: 'draft'
+  key: string
+  name: string
+  description: string
+  recipe: Recipe
+  snapshotSource: string
+}
+
+type Candidate = GeneratedCandidate | DraftCandidate
 
 interface Registration {
   id: string
   freshness: FeatureFreshness | null
 }
 
+function specFor(candidate: Candidate): FeatureSpecIn {
+  if (candidate.kind === 'generated') {
+    const { idea } = candidate
+    return {
+      name: idea.name, description: idea.description, grain_table: idea.grain_table,
+      aggregation: idea.aggregation, as_of_column: null,
+      // Lineage comes from the pairs the backend resolved at recommend time, never from the
+      // typed source context: the typed source can differ from where a derive actually lives.
+      derives_from: idea.derives_pairs.map(([catalog_source, object_ref]) => ({
+        catalog_source, object_ref })),
+    }
+  }
+  const { recipe } = candidate
+  return {
+    name: candidate.name.trim(), description: candidate.description,
+    grain_table: recipe.grain_table, aggregation: recipe.aggregation,
+    as_of_column: recipe.as_of_column,
+    // Recipes are single-catalog: every derive lives in the snapshotted source.
+    derives_from: recipe.derives_from.map(object_ref => ({
+      catalog_source: candidate.snapshotSource, object_ref })),
+  }
+}
+
+function JoinPathDetails({ steps }: { steps: JoinStep[] }) {
+  if (steps.length === 0) return null
+  const fansOut = steps.some(s => stepFansOut(s.cardinality))
+  const hasUnknownHop = steps.some(s => normalizeCardinality(s.cardinality) === null)
+  return (
+    <details>
+      <summary style={{ cursor: 'pointer', padding: '6px 0', fontWeight: 500, color: 'var(--ink-soft)' }}>
+        Join path ({steps.length} {steps.length === 1 ? 'hop' : 'hops'})
+      </summary>
+      <ol className="mono" style={{ margin: '8px 0 0', paddingLeft: 22, display: 'grid', gap: 4 }}>
+        {steps.map(s => (
+          <li key={`${s.from_ref}->${s.to_ref}`}>
+            {s.from_ref} → {s.to_ref}{' '}
+            <span
+              style={
+                stepFansOut(s.cardinality)
+                  ? { color: 'var(--warn)', fontWeight: 600 }
+                  : { color: 'var(--ink-soft)' }
+              }
+            >
+              ({normalizeCardinality(s.cardinality) === null
+                ? 'cardinality unknown'
+                : s.cardinality})
+            </span>
+          </li>
+        ))}
+      </ol>
+      {hasUnknownHop && (
+        <p className="hint" style={{ marginTop: 8 }}>
+          Cardinality is missing on at least one hop, so fan-out cannot be ruled out. Confirm the
+          join direction before registering this feature.
+        </p>
+      )}
+      {fansOut && (
+        <div className="callout callout--warn">
+          <CalloutGlyph d={WARN_GLYPH} />
+          <div className="callout-body">
+            <p>
+              <strong>Fan-out.</strong> A one-to-many hop multiplies rows. Aggregate before
+              joining or the feature will double-count.
+            </p>
+          </div>
+        </div>
+      )}
+    </details>
+  )
+}
+
 export function WorkbenchScreen() {
+  const [goal, setGoal] = useState('')
   const [source, setSource] = useState('')
   const [entity, setEntity] = useState('')
-  const [objective, setObjective] = useState('')
-  const [proposals, setProposals] = useState<Proposal[] | null>(null)
-  const [nlQuery, setNlQuery] = useState('')
-  const [recipe, setRecipe] = useState<Recipe | null>(null)
   const [target, setTarget] = useState('')
-  const [warnings, setWarnings] = useState<LeakageWarning[] | null>(null)
-  const [confirming, setConfirming] = useState<string | null>(null)
-  const [registering, setRegistering] = useState<string | null>(null)
+  const [generated, setGenerated] = useState<GeneratedCandidate[] | null>(null)
+  const [drafts, setDrafts] = useState<DraftCandidate[]>([])
+  const [selected, setSelected] = useState<Set<string>>(new Set())
   const [registered, setRegistered] = useState<Record<string, Registration>>({})
+  const [errors, setErrors] = useState<Record<string, string>>({})
+  const [screenedTarget, setScreenedTarget] = useState<string | null>(null)
+  const [scopeChanged, setScopeChanged] = useState(false)
+  const [describeOpen, setDescribeOpen] = useState(false)
+  const [describeText, setDescribeText] = useState('')
+  const [generating, setGenerating] = useState(false)
+  const [drafting, setDrafting] = useState(false)
+  const [confirmingBatch, setConfirmingBatch] = useState(false)
+  const [batchBusy, setBatchBusy] = useState(false)
   const [notice, setNotice] = useState('')
   // Out-of-order guards: only the latest request per handler may apply its response.
-  const suggestSeq = useRef(0)
-  const recipeSeq = useRef(0)
-  const leakageSeq = useRef(0)
-  // Reentry guard for the register mutation: state updates are async, so a double click could
-  // otherwise fire two POSTs before the disabled attribute lands.
-  const registerInFlight = useRef(false)
+  const generateSeq = useRef(0)
+  const draftSeq = useRef(0)
+  // Reentry guard for the register batch: state updates are async, so a double click on
+  // Confirm registration could otherwise start two batches before the disabled attribute lands.
+  const batchInFlight = useRef(false)
+
+  const candidates: Candidate[] = [...(generated ?? []), ...drafts]
+  // Selection is the intersection of the set and the live candidate list: keys from cleared
+  // rounds are inert, and registered candidates can never re-enter a batch.
+  const selectedCandidates = candidates.filter(c => selected.has(c.key) && !registered[c.key])
 
   function fail(err: unknown) {
     setNotice(
@@ -94,401 +251,473 @@ export function WorkbenchScreen() {
 
   function changeSource(value: string) {
     setSource(value)
-    // Proposals, registration state, leakage results, and the recipe were produced for the
-    // previous source context. Keeping them would let a review of one context silently bind
-    // to another.
-    setProposals(null)
-    setConfirming(null)
+    // Generated candidates were produced for the previous source context, and draft snapshots
+    // no longer match it either: a source edit clears everything.
+    const hadCandidates = candidates.length > 0
+    setGenerated(null)
+    setDrafts([])
+    setSelected(new Set())
     setRegistered({})
-    setWarnings(null)
-    setRecipe(null)
+    setErrors({})
+    setScreenedTarget(null)
+    setConfirmingBatch(false)
+    if (hadCandidates) setScopeChanged(true)
+  }
+
+  // Entity and target edits invalidate generated candidates (they were gathered and screened
+  // for the previous scope). Drafts survive: their snapshot source is unchanged.
+  function invalidateGenerated() {
+    const hadGenerated = (generated?.length ?? 0) > 0
+    setGenerated(null)
+    setSelected(new Set())
+    setScreenedTarget(null)
+    setConfirmingBatch(false)
+    if (hadGenerated) setScopeChanged(true)
+  }
+
+  function changeEntity(value: string) {
+    setEntity(value)
+    invalidateGenerated()
   }
 
   function changeTarget(value: string) {
     setTarget(value)
-    // Leakage results were computed against the previous target.
-    setWarnings(null)
+    invalidateGenerated()
   }
 
-  async function suggest(e: FormEvent) {
+  async function generate(e: FormEvent) {
     e.preventDefault()
-    const seq = ++suggestSeq.current
+    const objective = goal.trim()
+    if (!objective) return
+    const seq = ++generateSeq.current
     setNotice('')
-    // A new suggestion round voids everything scoped to the previous proposals.
-    setWarnings(null)
-    setConfirming(null)
-    setRegistered({})
+    setScopeChanged(false)
+    setGenerating(true)
     try {
       const ideas = await recommendFeatures(
-        objective.trim(), source.trim() || null, target.trim() || null, entity.trim() || null)
-      if (seq !== suggestSeq.current) return
-      setProposals(ideas.map((idea, i) => ({ key: `${seq}:${i}:${idea.name}`, idea })))
+        objective, source.trim() || null, target.trim() || null, entity.trim() || null)
+      if (seq !== generateSeq.current) return
+      setGenerated(ideas.map((idea, i) => ({
+        kind: 'generated' as const, key: `g${seq}:${i}:${idea.name}`, idea,
+      })))
+      setScreenedTarget(target.trim() || null)
+      setConfirmingBatch(false)
     } catch (err) {
-      if (seq !== suggestSeq.current) return
-      setProposals(null)
-      fail(err)
-    }
-  }
-
-  async function buildRecipe(e: FormEvent) {
-    e.preventDefault()
-    const seq = ++recipeSeq.current
-    setNotice('')
-    try {
-      const next = await featureRecipe(nlQuery.trim(), source.trim())
-      if (seq !== recipeSeq.current) return
-      setRecipe(next)
-    } catch (err) {
-      if (seq !== recipeSeq.current) return
-      setRecipe(null)
-      fail(err)
-    }
-  }
-
-  async function checkLeakage(p: FeatureIdea) {
-    const seq = ++leakageSeq.current
-    setNotice('')
-    try {
-      const next = await leakageCheck(p.derives_from, target.trim())
-      if (seq !== leakageSeq.current) return
-      setWarnings(next)
-    } catch (err) {
-      if (seq !== leakageSeq.current) return
-      setWarnings(null)
-      fail(err)
-    }
-  }
-
-  async function confirmRegister(key: string, idea: FeatureIdea) {
-    if (registerInFlight.current) return
-    registerInFlight.current = true
-    setRegistering(key)
-    setNotice('')
-    try {
-      const id = await registerFeature({
-        name: idea.name, description: idea.description, grain_table: idea.grain_table,
-        aggregation: idea.aggregation, as_of_column: null,
-        // Lineage comes from the pairs the backend resolved at recommend time, never from the
-        // typed source context: the typed source can differ from where a derive actually lives.
-        derives_from: idea.derives_pairs.map(([catalog_source, object_ref]) => ({
-          catalog_source, object_ref })),
-      })
-      let freshness: FeatureFreshness | null = null
-      try {
-        freshness = await featureFreshness(id)
-      } catch {
-        // Freshness is advisory on this note: omit the chip rather than fail the registration UI.
-      }
-      setRegistered(prev => ({ ...prev, [key]: { id, freshness } }))
-      setConfirming(null)
-    } catch (err) {
+      if (seq !== generateSeq.current) return
+      setGenerated(null)
+      setScreenedTarget(null)
       fail(err)
     } finally {
-      registerInFlight.current = false
-      setRegistering(null)
+      if (seq === generateSeq.current) setGenerating(false)
     }
   }
 
-  const joinSteps = recipe?.join_path ?? []
-  const fansOut = joinSteps.some(s => stepFansOut(s.cardinality))
-  const hasUnknownHop = joinSteps.some(s => normalizeCardinality(s.cardinality) === null)
+  async function draftCandidate(e: FormEvent) {
+    e.preventDefault()
+    const query = describeText.trim()
+    const snapshotSource = source.trim()
+    if (!query || !snapshotSource) return
+    const seq = ++draftSeq.current
+    setNotice('')
+    setDrafting(true)
+    try {
+      const recipe = await featureRecipe(query, snapshotSource)
+      if (seq !== draftSeq.current) return
+      setDrafts(prev => [...prev, {
+        kind: 'draft' as const, key: `d${seq}`, name: slugFrom(query), description: query,
+        recipe, snapshotSource,
+      }])
+      setDescribeText('')
+    } catch (err) {
+      if (seq !== draftSeq.current) return
+      fail(err)
+    } finally {
+      if (seq === draftSeq.current) setDrafting(false)
+    }
+  }
+
+  function renameDraft(key: string, value: string) {
+    setDrafts(prev => prev.map(d => (d.key === key ? { ...d, name: value } : d)))
+    if (!value.trim()) {
+      // A draft without a name cannot be registered: drop it from the selection too.
+      setSelected(prev => {
+        if (!prev.has(key)) return prev
+        const next = new Set(prev)
+        next.delete(key)
+        return next
+      })
+    }
+  }
+
+  function toggleSelect(key: string) {
+    // Changing the selection backs out of the confirm step: the confirm copy must always
+    // describe exactly what will be registered.
+    setConfirmingBatch(false)
+    setSelected(prev => {
+      const next = new Set(prev)
+      if (next.has(key)) {
+        next.delete(key)
+      } else {
+        next.add(key)
+      }
+      return next
+    })
+  }
+
+  async function confirmRegistration() {
+    if (batchInFlight.current) return
+    const batch = candidates.filter(c =>
+      selected.has(c.key) && !registered[c.key] && (c.kind === 'generated' || c.name.trim() !== ''))
+    if (batch.length === 0) return
+    batchInFlight.current = true
+    setBatchBusy(true)
+    setNotice('')
+    try {
+      // Sequential, one request per candidate. A failure marks its candidate and the batch
+      // continues; the failed candidate stays selected for retry.
+      for (const candidate of batch) {
+        try {
+          const id = await registerFeature(specFor(candidate))
+          let freshness: FeatureFreshness | null = null
+          try {
+            freshness = await featureFreshness(id)
+          } catch {
+            // Freshness is advisory on this note: omit the chip rather than fail the
+            // registration UI.
+          }
+          setRegistered(prev => ({ ...prev, [candidate.key]: { id, freshness } }))
+          setSelected(prev => {
+            const next = new Set(prev)
+            next.delete(candidate.key)
+            return next
+          })
+          setErrors(prev => {
+            if (!(candidate.key in prev)) return prev
+            const next = { ...prev }
+            delete next[candidate.key]
+            return next
+          })
+        } catch (err) {
+          setErrors(prev => ({
+            ...prev,
+            [candidate.key]: err instanceof ApiError ? err.detail : String(err),
+          }))
+        }
+      }
+    } finally {
+      batchInFlight.current = false
+      setBatchBusy(false)
+      setConfirmingBatch(false)
+    }
+  }
+
+  const selectedCount = selectedCandidates.length
 
   return (
     <section>
-      <h2 className="visually-hidden">Feature workbench</h2>
-
-      {notice && (
-        <div role="alert" className="callout callout--warn">
-          <CalloutGlyph d={WARN_GLYPH} />
-          <div className="callout-body">
-            <p>{notice}</p>
-          </div>
-        </div>
-      )}
-
       <div className="panel">
-        <h2>Context</h2>
-        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 20 }}>
-          <div className="field" style={{ flex: '1 1 260px' }}>
-            <label htmlFor="wb-source">Catalog source</label>
-            <input
-              id="wb-source"
-              aria-label="catalog source"
-              value={source}
-              onChange={e => changeSource(e.target.value)}
-              placeholder="e.g. deposits"
-            />
-            <p className="hint" style={HELP_STYLE}>
-              Scopes suggestions and recipes to one source. Leave it blank to gather from every
-              catalog.
-            </p>
+        <h2>Generate features</h2>
+        <p style={{ color: 'var(--ink-soft)', marginBottom: 16, maxWidth: 640 }}>
+          Tell the engine your prediction goal. It proposes catalog-grounded, safety-checked
+          features; you approve what enters the registry.
+        </p>
+        {notice && (
+          <div role="alert" className="callout callout--warn">
+            <CalloutGlyph d={WARN_GLYPH} />
+            <div className="callout-body">
+              <p>{notice}</p>
+            </div>
           </div>
-          <div className="field" style={{ flex: '1 1 260px' }}>
-            <label htmlFor="wb-entity">Entity</label>
+        )}
+        <form onSubmit={generate} style={{ display: 'grid', gap: 16, margin: 0 }}>
+          <div className="field" style={{ maxWidth: 640 }}>
+            <label htmlFor="wb-goal">Prediction goal</label>
             <input
-              id="wb-entity"
-              aria-label="entity"
-              value={entity}
-              onChange={e => setEntity(e.target.value)}
-              placeholder="e.g. customer"
+              id="wb-goal"
+              value={goal}
+              onChange={e => setGoal(e.target.value)}
+              placeholder="e.g. predict customer churn in the next 90 days"
+              style={{ height: 40 }}
             />
-            <p className="hint" style={HELP_STYLE}>
-              Optional. Scopes suggestions across every catalog holding that entity.
-            </p>
+            <div className="hint" style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+              <span>Try</span>
+              <button type="button" className="role-chip" onClick={() => setGoal(EXAMPLE_GOAL)}>
+                {EXAMPLE_GOAL}
+              </button>
+            </div>
           </div>
-          <div className="field" style={{ flex: '1 1 260px' }}>
-            <label htmlFor="wb-target">Target column</label>
-            <input
-              id="wb-target"
-              aria-label="target column"
-              value={target}
-              onChange={e => changeTarget(e.target.value)}
-              placeholder="e.g. public.labels.churned"
-            />
-            <p className="hint" style={HELP_STYLE}>
-              Enables leakage checks. New suggestions are also pre-screened against it server-side.
-            </p>
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 20 }}>
+            <div className="field" style={{ flex: '1 1 220px' }}>
+              <label htmlFor="wb-source">Catalog source</label>
+              <input
+                id="wb-source"
+                value={source}
+                onChange={e => changeSource(e.target.value)}
+                placeholder="e.g. deposits"
+              />
+              <p className="hint" style={HELP_STYLE}>
+                Optional. Scopes candidates to one upload source; blank searches every catalog.
+              </p>
+            </div>
+            <div className="field" style={{ flex: '1 1 220px' }}>
+              <label htmlFor="wb-entity">Entity</label>
+              <input
+                id="wb-entity"
+                value={entity}
+                onChange={e => changeEntity(e.target.value)}
+                placeholder="e.g. customer"
+              />
+              <p className="hint" style={HELP_STYLE}>
+                Optional. Gathers from every catalog holding this entity, e.g. Customer.
+              </p>
+            </div>
+            <div className="field" style={{ flex: '1 1 220px' }}>
+              <label htmlFor="wb-target">Target column</label>
+              <input
+                id="wb-target"
+                value={target}
+                onChange={e => changeTarget(e.target.value)}
+                placeholder="e.g. public.labels.churned"
+              />
+              <p className="hint" style={HELP_STYLE}>
+                What you are predicting. Candidates are screened against it server-side, so leaky
+                features never reach you.
+              </p>
+            </div>
           </div>
-        </div>
+          <div>
+            <button
+              type="submit"
+              className="btn btn--primary"
+              style={{ height: 40, padding: '0 22px' }}
+              disabled={!goal.trim()}
+            >
+              {generating ? 'Generating' : 'Generate features'}
+            </button>
+          </div>
+          <div>
+            <button
+              type="button"
+              style={LINK_BUTTON_STYLE}
+              aria-expanded={describeOpen}
+              aria-controls="wb-describe-panel"
+              onClick={() => setDescribeOpen(open => !open)}
+            >
+              Or describe a feature yourself
+            </button>
+          </div>
+        </form>
       </div>
 
-      <h2>Suggest features</h2>
-      <p className="hint" style={HELP_STYLE}>
-        Everything below is a suggestion until you explicitly register it.
-      </p>
-      <form onSubmit={suggest}>
-        <div className="field" style={{ flex: '1 1 320px', maxWidth: 480 }}>
-          <label htmlFor="wb-objective">Objective</label>
-          <input
-            id="wb-objective"
-            aria-label="objective"
-            value={objective}
-            onChange={e => setObjective(e.target.value)}
-            placeholder="e.g. predict churn"
-          />
-        </div>
-        <button type="submit" className="btn btn--primary" disabled={!objective.trim()}>
-          Suggest features
-        </button>
-      </form>
-
-      {proposals?.length === 0 && (
-        <div className="empty" role="status">
-          <p>No grounded proposals for that objective.</p>
-          <p className="next">Try rephrasing the objective, or set a different catalog source.</p>
-        </div>
-      )}
-
-      {proposals && proposals.length > 0 && (
-        <ul className="rows">
-          {proposals.map(({ key, idea: p }) => {
-            const reg = registered[key]
-            return (
-              <li className="row" key={key} style={{ alignItems: 'flex-start' }}>
-                <div style={{ display: 'grid', gap: 8, flex: 1, minWidth: 0, padding: '6px 0' }}>
-                  <div style={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 10 }}>
-                    <span className="badge proposal">Proposal</span>
-                    <span style={{ fontWeight: 600 }}>{p.name}</span>
-                  </div>
-                  <p style={{ color: 'var(--ink-soft)' }}>{p.description}</p>
-                  <dl className="kv">
-                    <div>
-                      <dt>derives from</dt>
-                      <dd className="mono">{p.derives_from.join(', ')}</dd>
-                    </div>
-                    {p.aggregation && (
-                      <div>
-                        <dt>aggregation</dt>
-                        <dd>{p.aggregation}</dd>
-                      </div>
-                    )}
-                    {p.grain_table && (
-                      <div>
-                        <dt>grain</dt>
-                        <dd>{p.grain_table}</dd>
-                      </div>
-                    )}
-                  </dl>
-                  {reg ? (
-                    <p
-                      style={{
-                        color: 'var(--ok)', fontWeight: 500,
-                        display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 8,
-                      }}
-                    >
-                      <span>
-                        Registered as <span className="mono">{reg.id}</span>
-                      </span>
-                      {reg.freshness && (reg.freshness.fresh ? (
-                        <span className="badge" style={OK_SOLID_CHIP_STYLE}>fresh</span>
-                      ) : (
-                        <span className="badge stale">
-                          stale: {reg.freshness.stale_sources.join(', ')}
-                        </span>
-                      ))}
-                    </p>
-                  ) : confirming === key ? (
-                    <div style={CLUSTER_STYLE}>
-                      <button
-                        type="button"
-                        className="btn btn--proposal-confirm"
-                        disabled={registering === key}
-                        onClick={() => confirmRegister(key, p)}
-                      >
-                        Confirm register
-                      </button>
-                      <button
-                        type="button"
-                        className="btn"
-                        disabled={registering === key}
-                        onClick={() => setConfirming(null)}
-                      >
-                        Cancel
-                      </button>
-                    </div>
-                  ) : (
-                    <div style={CLUSTER_STYLE}>
-                      <button
-                        type="button"
-                        className="btn"
-                        onClick={() => setConfirming(key)}
-                      >
-                        Register…
-                      </button>
-                      <button
-                        type="button"
-                        className="btn"
-                        disabled={!target.trim()}
-                        onClick={() => checkLeakage(p)}
-                      >
-                        Check leakage
-                      </button>
-                    </div>
-                  )}
-                </div>
-              </li>
-            )
-          })}
-        </ul>
-      )}
-
-      {warnings?.length === 0 && (
+      {scopeChanged && (
         <p role="status" className="hint">
-          No leakage warnings.
+          Scope changed. Regenerate to refresh candidates.
         </p>
       )}
-      {warnings && warnings.length > 0 && (
-        <div className="callout callout--danger" role="alert">
-          <CalloutGlyph d={DANGER_GLYPH} />
-          <div className="callout-body">
-            <p>
-              <strong>Possible target leakage</strong>
-            </p>
-            <ul style={{ paddingLeft: 18, display: 'grid', gap: 4 }}>
-              {warnings.map(w => (
-                <li key={w.object_ref}>
-                  <span className="mono">{w.object_ref}</span>: {w.reason}
-                </li>
-              ))}
-            </ul>
-            <p>Review these columns before registering the feature.</p>
-          </div>
+
+      {describeOpen && (
+        <div className="panel" id="wb-describe-panel">
+          <h2>Describe a feature</h2>
+          <form onSubmit={draftCandidate} style={{ display: 'grid', gap: 12, margin: 0 }}>
+            <div className="field" style={{ maxWidth: 640 }}>
+              <label htmlFor="wb-describe">Describe the feature you want</label>
+              <textarea
+                id="wb-describe"
+                rows={3}
+                value={describeText}
+                onChange={e => setDescribeText(e.target.value)}
+                placeholder="e.g. total spend per customer over the last 90 days"
+              />
+            </div>
+            <div style={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 12 }}>
+              <button
+                type="submit"
+                className="btn"
+                disabled={!describeText.trim() || !source.trim() || drafting}
+              >
+                {drafting ? 'Drafting' : 'Draft candidate'}
+              </button>
+              {!source.trim() && (
+                <p className="hint">
+                  Recipes read one catalog source. Set Catalog source above to draft.
+                </p>
+              )}
+            </div>
+          </form>
         </div>
       )}
 
-      <h2>Describe a feature</h2>
-      <p className="hint" style={HELP_STYLE}>
-        Builds a recipe from real catalog columns and join edges. Needs a catalog source.
-      </p>
-      <form onSubmit={buildRecipe}>
-        <div className="field" style={{ flex: '1 1 320px', maxWidth: 480 }}>
-          <label htmlFor="wb-nl">Feature description</label>
-          <input
-            id="wb-nl"
-            aria-label="feature description"
-            value={nlQuery}
-            onChange={e => setNlQuery(e.target.value)}
-            placeholder="e.g. total spend per customer over 90 days"
-          />
+      {generated?.length === 0 && (
+        <div className="empty" role="status">
+          <p>No grounded candidates for that goal.</p>
+          <p className="next">Rephrase the goal, or change the catalog source and generate again.</p>
         </div>
-        <button type="submit" className="btn" disabled={!nlQuery.trim() || !source.trim()}>
-          Build recipe
-        </button>
-      </form>
+      )}
 
-      {recipe && (
-        <div className="panel">
-          <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 12 }}>
-            <span className="badge proposal">Proposal</span>
-            <h3 style={{ fontSize: 15, fontWeight: 600 }}>Recipe</h3>
+      {candidates.length > 0 && (
+        <>
+          <div style={{ display: 'flex', alignItems: 'baseline', gap: 12, marginTop: 32 }}>
+            <h2>Proposed features</h2>
+            <span className="micro-label tabular-nums">
+              <span style={{ color: 'var(--accent)' }}>{candidates.length}</span>{' '}
+              {candidates.length === 1 ? 'candidate' : 'candidates'}
+            </span>
           </div>
-          <dl className="kv">
-            {recipe.grain_table && (
-              <div>
-                <dt>grain</dt>
-                <dd>{recipe.grain_table}</dd>
-              </div>
-            )}
-            {recipe.aggregation && (
-              <div>
-                <dt>aggregation</dt>
-                <dd>{recipe.aggregation}</dd>
-              </div>
-            )}
-            <div>
-              <dt>derives from</dt>
-              <dd className="mono">{recipe.derives_from.join(', ') || 'none'}</dd>
-            </div>
-            {recipe.as_of_column && (
-              <div>
-                <dt>as-of</dt>
-                <dd className="mono">{recipe.as_of_column}</dd>
-              </div>
-            )}
-          </dl>
-          {recipe.join_path.length > 0 && (
-            <>
-              <p className="micro-label" style={{ marginTop: 16 }}>
-                Join path (real edges)
-              </p>
-              <ol className="mono" style={{ marginTop: 8, paddingLeft: 22, display: 'grid', gap: 4 }}>
-                {recipe.join_path.map(s => (
-                  <li key={`${s.from_ref}->${s.to_ref}`}>
-                    {s.from_ref} → {s.to_ref}{' '}
-                    <span
-                      style={
-                        stepFansOut(s.cardinality)
-                          ? { color: 'var(--warn)', fontWeight: 600 }
-                          : { color: 'var(--ink-soft)' }
-                      }
-                    >
-                      ({normalizeCardinality(s.cardinality) === null
-                        ? 'cardinality unknown'
-                        : s.cardinality})
-                    </span>
-                  </li>
-                ))}
-              </ol>
-              {hasUnknownHop && (
-                <p className="hint" style={{ marginTop: 8 }}>
-                  Cardinality is missing on at least one hop, so fan-out cannot be ruled out.
-                  Confirm the join direction before building on this recipe.
-                </p>
-              )}
-              {fansOut && (
-                <div className="callout callout--warn">
-                  <CalloutGlyph d={WARN_GLYPH} />
-                  <div className="callout-body">
-                    <p>
-                      <strong>Fan-out.</strong> A one-to-many hop multiplies rows. Aggregate
-                      before joining or the feature will double-count.
-                    </p>
-                  </div>
-                </div>
-              )}
-            </>
+          {screenedTarget && (
+            <p className="hint" style={{ marginTop: 4 }}>
+              Screened against <span className="mono">{screenedTarget}</span>: leaky candidates
+              were rejected before reaching you.
+            </p>
           )}
-        </div>
+          <ul className="rows">
+            {candidates.map(c => {
+              const reg = registered[c.key]
+              const error = errors[c.key]
+              const rawName = c.kind === 'generated' ? c.idea.name : c.name
+              const displayName = rawName.trim() || 'unnamed draft'
+              const canSelect = c.kind === 'generated' || c.name.trim() !== ''
+              const description = c.kind === 'generated' ? c.idea.description : c.description
+              const aggregation = c.kind === 'generated' ? c.idea.aggregation : c.recipe.aggregation
+              const grain = c.kind === 'generated' ? c.idea.grain_table : c.recipe.grain_table
+              const derives = c.kind === 'generated'
+                ? c.idea.derives_pairs.map(([s, ref]) => `${s}:${ref}`).join(', ') || 'none'
+                : c.recipe.derives_from.map(ref => `${c.snapshotSource}:${ref}`).join(', ') || 'none'
+              return (
+                <li className="row" key={c.key} style={{ alignItems: 'flex-start' }}>
+                  {reg ? (
+                    <CheckGlyph />
+                  ) : (
+                    <input
+                      type="checkbox"
+                      aria-label={`Select ${displayName}`}
+                      checked={selected.has(c.key)}
+                      disabled={batchBusy || !canSelect}
+                      onChange={() => toggleSelect(c.key)}
+                      style={{ width: 18, height: 18, margin: 10, flex: 'none' }}
+                    />
+                  )}
+                  <div style={{ display: 'grid', gap: 8, flex: 1, minWidth: 0, padding: '6px 0' }}>
+                    <div style={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 10 }}>
+                      <span className={c.kind === 'draft' ? 'mono' : undefined} style={{ fontWeight: 600 }}>
+                        {displayName}
+                      </span>
+                      <span className="badge proposal">
+                        {c.kind === 'generated' ? 'Proposal' : 'Draft'}
+                      </span>
+                    </div>
+                    <p style={{ color: 'var(--ink-soft)' }}>{description}</p>
+                    <dl className="kv">
+                      <div>
+                        <dt>derives from</dt>
+                        <dd className="mono">{derives}</dd>
+                      </div>
+                      {aggregation && (
+                        <div>
+                          <dt>aggregation</dt>
+                          <dd>{aggregation}</dd>
+                        </div>
+                      )}
+                      {grain && (
+                        <div>
+                          <dt>grain</dt>
+                          <dd>{grain}</dd>
+                        </div>
+                      )}
+                      {c.kind === 'draft' && (
+                        <div>
+                          <dt>drafted against</dt>
+                          <dd className="mono">{c.snapshotSource}</dd>
+                        </div>
+                      )}
+                    </dl>
+                    {c.kind === 'draft' && !reg && (
+                      <div className="field" style={{ maxWidth: 380 }}>
+                        <label htmlFor={`wb-name-${c.key}`}>Name</label>
+                        <input
+                          id={`wb-name-${c.key}`}
+                          className="mono"
+                          value={c.name}
+                          onChange={e => renameDraft(c.key, e.target.value)}
+                          placeholder="feature_name"
+                        />
+                        {!c.name.trim() && (
+                          <p className="hint">Name this draft to select it for registration.</p>
+                        )}
+                      </div>
+                    )}
+                    {c.kind === 'draft' && <JoinPathDetails steps={c.recipe.join_path} />}
+                    {error && (
+                      <p className="error" role="alert">
+                        {error}
+                      </p>
+                    )}
+                    {reg && (
+                      <p
+                        style={{
+                          color: 'var(--ok)', fontWeight: 500,
+                          display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 8,
+                        }}
+                      >
+                        <span>
+                          Registered <span className="mono">{reg.id}</span>
+                        </span>
+                        {reg.freshness && (reg.freshness.fresh ? (
+                          <span className="badge" style={OK_SOLID_CHIP_STYLE}>fresh</span>
+                        ) : (
+                          <span className="badge stale">
+                            stale: {reg.freshness.stale_sources.join(', ')}
+                          </span>
+                        ))}
+                      </p>
+                    )}
+                  </div>
+                </li>
+              )
+            })}
+            {selectedCount > 0 && (
+              <li className="row" style={TRAY_STYLE}>
+                {confirmingBatch ? (
+                  <>
+                    <p style={{ flex: '1 1 260px', fontWeight: 500 }}>
+                      {selectedCount === 1
+                        ? 'This feature will enter the catalog registry with its lineage.'
+                        : `These ${selectedCount} features will enter the catalog registry with their lineage.`}
+                    </p>
+                    <button
+                      type="button"
+                      className="btn btn--proposal-confirm"
+                      disabled={batchBusy}
+                      onClick={() => void confirmRegistration()}
+                    >
+                      Confirm registration
+                    </button>
+                    <button
+                      type="button"
+                      className="btn"
+                      disabled={batchBusy}
+                      onClick={() => setConfirmingBatch(false)}
+                    >
+                      Cancel
+                    </button>
+                  </>
+                ) : (
+                  <>
+                    <span className="tabular-nums" style={{ flex: '1 1 auto', fontWeight: 600 }}>
+                      {selectedCount} selected
+                    </span>
+                    <button
+                      type="button"
+                      className="btn btn--primary"
+                      onClick={() => setConfirmingBatch(true)}
+                    >
+                      Register {selectedCount} {selectedCount === 1 ? 'feature' : 'features'}
+                    </button>
+                  </>
+                )}
+              </li>
+            )}
+          </ul>
+        </>
       )}
     </section>
   )

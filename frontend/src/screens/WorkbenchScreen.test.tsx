@@ -17,31 +17,41 @@ vi.mock('../api', async importOriginal => {
 })
 const recommendFeatures = vi.mocked(api.recommendFeatures)
 const featureRecipe = vi.mocked(api.featureRecipe)
-const leakageCheck = vi.mocked(api.leakageCheck)
 const registerFeature = vi.mocked(api.registerFeature)
 const featureFreshness = vi.mocked(api.featureFreshness)
 
 beforeEach(() => {
   recommendFeatures.mockReset()
   featureRecipe.mockReset()
-  leakageCheck.mockReset()
   registerFeature.mockReset()
   featureFreshness.mockReset()
 })
 
 // derives_pairs deliberately names a catalog ('cards') that differs from the source the tests
-// type into the Context field ('deposits'): registration lineage must come from the backend
-// pairs, never from the typed source.
+// type into the scope row ('deposits'): registration lineage must come from the backend pairs,
+// never from the typed source.
 const IDEA: api.FeatureIdea = {
   name: 'avg_balance', description: 'average balance per customer',
   derives_from: ['public.accounts.balance'], aggregation: 'avg', grain_table: 'customers',
   derives_pairs: [['cards', 'public.accounts.balance']],
 }
 
+const IDEA_SPEC: api.FeatureSpecIn = {
+  name: 'avg_balance', description: 'average balance per customer',
+  grain_table: 'customers', aggregation: 'avg', as_of_column: null,
+  derives_from: [{ catalog_source: 'cards', object_ref: 'public.accounts.balance' }],
+}
+
 const OTHER_IDEA: api.FeatureIdea = {
   name: 'txn_count', description: 'transactions per customer',
   derives_from: ['public.transactions.id'], aggregation: 'count', grain_table: 'customers',
   derives_pairs: [['cards', 'public.transactions.id']],
+}
+
+const OTHER_IDEA_SPEC: api.FeatureSpecIn = {
+  name: 'txn_count', description: 'transactions per customer',
+  grain_table: 'customers', aggregation: 'count', as_of_column: null,
+  derives_from: [{ catalog_source: 'cards', object_ref: 'public.transactions.id' }],
 }
 
 const FRESH: api.FeatureFreshness = { fresh: true, stale_sources: [] }
@@ -54,218 +64,424 @@ function recipeWith(joinPath: api.JoinStep[]): api.Recipe {
   }
 }
 
-async function suggest() {
-  await userEvent.type(screen.getByLabelText('catalog source'), 'deposits')
-  await userEvent.type(screen.getByLabelText('objective'), 'predict churn')
-  await userEvent.click(screen.getByRole('button', { name: /suggest features/i }))
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  const promise = new Promise<T>(res => { resolve = res })
+  return { promise, resolve }
 }
 
-async function confirmFirstProposal() {
-  await userEvent.click(await screen.findByRole('button', { name: 'Register…' }))
-  await userEvent.click(screen.getByRole('button', { name: 'Confirm register' }))
+interface Scope {
+  source?: string
+  entity?: string
+  target?: string
 }
 
-async function buildRecipe(joinPath: api.JoinStep[]) {
+async function renderAndGenerate(ideas: api.FeatureIdea[], scope: Scope = {}) {
+  recommendFeatures.mockResolvedValue(ideas)
+  render(<WorkbenchScreen />)
+  if (scope.source) {
+    await userEvent.type(screen.getByLabelText('Catalog source'), scope.source)
+  }
+  if (scope.entity) {
+    await userEvent.type(screen.getByLabelText('Entity'), scope.entity)
+  }
+  if (scope.target) {
+    await userEvent.type(screen.getByLabelText('Target column'), scope.target)
+  }
+  await userEvent.type(screen.getByLabelText('Prediction goal'), 'predict churn')
+  await userEvent.click(screen.getByRole('button', { name: 'Generate features' }))
+}
+
+async function selectCandidate(name: string) {
+  await userEvent.click(await screen.findByRole('checkbox', { name: `Select ${name}` }))
+}
+
+async function registerSelection(count: number) {
+  const plural = count === 1 ? 'feature' : 'features'
+  await userEvent.click(screen.getByRole('button', { name: `Register ${count} ${plural}` }))
+  await userEvent.click(screen.getByRole('button', { name: 'Confirm registration' }))
+}
+
+async function openDescribe() {
+  await userEvent.click(screen.getByRole('button', { name: 'Or describe a feature yourself' }))
+}
+
+async function draftFeature(description: string) {
+  await userEvent.type(screen.getByLabelText('Describe the feature you want'), description)
+  await userEvent.click(screen.getByRole('button', { name: 'Draft candidate' }))
+}
+
+async function renderAndDraft(joinPath: api.JoinStep[] = []) {
   featureRecipe.mockResolvedValue(recipeWith(joinPath))
   render(<WorkbenchScreen />)
-  await userEvent.type(screen.getByLabelText('catalog source'), 'deposits')
-  await userEvent.type(screen.getByLabelText('feature description'), 'total spend per customer')
-  await userEvent.click(screen.getByRole('button', { name: /build recipe/i }))
-  expect(await screen.findByText(/join path/i)).toBeInTheDocument()
+  await userEvent.type(screen.getByLabelText('Catalog source'), 'deposits')
+  await openDescribe()
+  await draftFeature('total spend per customer')
+  expect(await screen.findByText('Draft')).toBeInTheDocument()
 }
 
-describe('workbench screen', () => {
-  it('registers a proposal only after an explicit confirm, with lineage from the backend pairs', async () => {
-    recommendFeatures.mockResolvedValue([IDEA])
-    registerFeature.mockResolvedValue('feat_01')
-    featureFreshness.mockResolvedValue(FRESH)
-    render(<WorkbenchScreen />)
-    await suggest()
-    await userEvent.click(await screen.findByRole('button', { name: 'Register…' }))
-    expect(registerFeature).not.toHaveBeenCalled()
-    await userEvent.click(screen.getByRole('button', { name: 'Confirm register' }))
-    // Lineage comes from derives_pairs ('cards'), not the typed Context source ('deposits').
-    expect(registerFeature).toHaveBeenCalledWith({
-      name: 'avg_balance', description: 'average balance per customer',
-      grain_table: 'customers', aggregation: 'avg', as_of_column: null,
-      derives_from: [{ catalog_source: 'cards', object_ref: 'public.accounts.balance' }],
+describe('generation', () => {
+  it('passes the goal and every scope field through to the recommend call', async () => {
+    await renderAndGenerate([], {
+      source: 'deposits', entity: 'customer', target: 'public.labels.churned',
     })
-    expect(registerFeature).toHaveBeenCalledTimes(1)
-    expect(await screen.findByText(/registered as/i)).toBeInTheDocument()
-    expect(featureFreshness).toHaveBeenCalledWith('feat_01')
-    expect(screen.getByText('fresh')).toBeInTheDocument()
+    expect(recommendFeatures).toHaveBeenCalledWith(
+      'predict churn', 'deposits', 'public.labels.churned', 'customer')
   })
 
-  it('sends exactly one register request when confirm is clicked twice in flight', async () => {
-    recommendFeatures.mockResolvedValue([IDEA])
-    let resolveRegister!: (id: string) => void
-    registerFeature.mockImplementation(
-      () => new Promise<string>(resolve => { resolveRegister = resolve }))
-    featureFreshness.mockResolvedValue(FRESH)
-    render(<WorkbenchScreen />)
-    await suggest()
-    await userEvent.click(await screen.findByRole('button', { name: 'Register…' }))
-    const confirm = screen.getByRole('button', { name: 'Confirm register' })
-    await userEvent.click(confirm)
-    await userEvent.click(confirm)
-    expect(registerFeature).toHaveBeenCalledTimes(1)
-    expect(confirm).toBeDisabled()
-    await act(async () => {
-      resolveRegister('feat_01')
-    })
-    expect(await screen.findByText(/registered as/i)).toBeInTheDocument()
-    expect(registerFeature).toHaveBeenCalledTimes(1)
+  it('sends null for scope fields left blank', async () => {
+    await renderAndGenerate([])
+    expect(recommendFeatures).toHaveBeenCalledWith('predict churn', null, null, null)
   })
 
-  it('cancel backs out of the confirm step without registering', async () => {
-    recommendFeatures.mockResolvedValue([IDEA])
-    render(<WorkbenchScreen />)
-    await suggest()
-    await userEvent.click(await screen.findByRole('button', { name: 'Register…' }))
-    await userEvent.click(screen.getByRole('button', { name: 'Cancel' }))
-    expect(registerFeature).not.toHaveBeenCalled()
-    expect(screen.getByRole('button', { name: 'Register…' })).toBeInTheDocument()
-  })
-
-  it('keeps the retry UI and shows the error when registration fails', async () => {
-    recommendFeatures.mockResolvedValue([IDEA])
-    registerFeature.mockRejectedValue(new api.ApiError(409, 'feature name already registered'))
-    render(<WorkbenchScreen />)
-    await suggest()
-    await confirmFirstProposal()
-    expect(await screen.findByText('feature name already registered')).toBeInTheDocument()
-    expect(screen.queryByText(/registered as/i)).not.toBeInTheDocument()
-    const confirm = screen.getByRole('button', { name: 'Confirm register' })
-    expect(confirm).toBeInTheDocument()
-    expect(confirm).toBeEnabled()
-  })
-
-  it('marks a fresh registration with a fresh chip', async () => {
-    recommendFeatures.mockResolvedValue([IDEA])
-    registerFeature.mockResolvedValue('feat_01')
-    featureFreshness.mockResolvedValue(FRESH)
-    render(<WorkbenchScreen />)
-    await suggest()
-    await confirmFirstProposal()
-    expect(await screen.findByText('fresh')).toBeInTheDocument()
-    expect(screen.queryByText(/stale:/)).not.toBeInTheDocument()
-  })
-
-  it('marks a stale registration with the stale sources', async () => {
-    recommendFeatures.mockResolvedValue([IDEA])
-    registerFeature.mockResolvedValue('feat_01')
-    featureFreshness.mockResolvedValue({ fresh: false, stale_sources: ['cards'] })
-    render(<WorkbenchScreen />)
-    await suggest()
-    await confirmFirstProposal()
-    expect(await screen.findByText('stale: cards')).toBeInTheDocument()
-    expect(screen.queryByText('fresh')).not.toBeInTheDocument()
-  })
-
-  it('omits the freshness chip silently when the freshness call fails', async () => {
-    recommendFeatures.mockResolvedValue([IDEA])
-    registerFeature.mockResolvedValue('feat_01')
-    featureFreshness.mockRejectedValue(new api.ApiError(500, 'freshness unavailable'))
-    render(<WorkbenchScreen />)
-    await suggest()
-    await confirmFirstProposal()
-    expect(await screen.findByText(/registered as/i)).toBeInTheDocument()
-    expect(screen.queryByText('fresh')).not.toBeInTheDocument()
-    expect(screen.queryByText(/stale:/)).not.toBeInTheDocument()
-    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
-  })
-
-  it('does not show a phantom registered state when a re-suggest reuses a name', async () => {
-    recommendFeatures.mockResolvedValue([IDEA])
-    registerFeature.mockResolvedValue('feat_01')
-    featureFreshness.mockResolvedValue(FRESH)
-    render(<WorkbenchScreen />)
-    await suggest()
-    await confirmFirstProposal()
-    expect(await screen.findByText(/registered as/i)).toBeInTheDocument()
-    // Second round returns a proposal with the same LLM-chosen name: it was never registered.
-    await userEvent.click(screen.getByRole('button', { name: /suggest features/i }))
-    expect(await screen.findByRole('button', { name: 'Register…' })).toBeInTheDocument()
-    expect(screen.queryByText(/registered as/i)).not.toBeInTheDocument()
-  })
-
-  it('clears proposals and registration state when the catalog source changes', async () => {
-    recommendFeatures.mockResolvedValue([IDEA])
-    render(<WorkbenchScreen />)
-    await suggest()
-    expect(await screen.findByText('avg_balance')).toBeInTheDocument()
-    await userEvent.type(screen.getByLabelText('catalog source'), 'x')
-    expect(screen.queryByText('avg_balance')).not.toBeInTheDocument()
-  })
-
-  it('shows the honest 503 state when assist is unconfigured', async () => {
-    recommendFeatures.mockRejectedValue(new api.ApiError(503, 'not configured'))
-    render(<WorkbenchScreen />)
-    await userEvent.type(screen.getByLabelText('objective'), 'churn')
-    await userEvent.click(screen.getByRole('button', { name: /suggest features/i }))
-    expect(await screen.findByText(/ai assist is not configured/i)).toBeInTheDocument()
-  })
-
-  it('shows the empty state only after a suggestion round returns no proposals', async () => {
+  it('shows the empty note only after a generation round returns nothing', async () => {
     recommendFeatures.mockResolvedValue([])
     render(<WorkbenchScreen />)
-    expect(screen.queryByText(/no grounded proposals/i)).not.toBeInTheDocument()
-    await userEvent.type(screen.getByLabelText('objective'), 'churn')
-    await userEvent.click(screen.getByRole('button', { name: /suggest features/i }))
-    expect(await screen.findByText(/no grounded proposals/i)).toBeInTheDocument()
+    expect(screen.queryByText(/no grounded candidates/i)).not.toBeInTheDocument()
+    await userEvent.type(screen.getByLabelText('Prediction goal'), 'predict churn')
+    await userEvent.click(screen.getByRole('button', { name: 'Generate features' }))
+    expect(await screen.findByText(/no grounded candidates for that goal/i)).toBeInTheDocument()
   })
 
-  it('passes the optional entity scope through to the recommend call', async () => {
-    recommendFeatures.mockResolvedValue([])
-    render(<WorkbenchScreen />)
-    await userEvent.type(screen.getByLabelText('entity'), 'customer')
-    await userEvent.type(screen.getByLabelText('objective'), 'churn')
-    await userEvent.click(screen.getByRole('button', { name: /suggest features/i }))
-    expect(recommendFeatures).toHaveBeenCalledWith('churn', null, null, 'customer')
-  })
-
-  it('applies only the latest suggestion round when responses arrive out of order', async () => {
-    let resolveFirst!: (ideas: api.FeatureIdea[]) => void
-    let resolveSecond!: (ideas: api.FeatureIdea[]) => void
+  it('applies only the latest generation round when responses arrive out of order', async () => {
+    const first = deferred<api.FeatureIdea[]>()
+    const second = deferred<api.FeatureIdea[]>()
     recommendFeatures
-      .mockImplementationOnce(
-        () => new Promise<api.FeatureIdea[]>(resolve => { resolveFirst = resolve }))
-      .mockImplementationOnce(
-        () => new Promise<api.FeatureIdea[]>(resolve => { resolveSecond = resolve }))
+      .mockImplementationOnce(() => first.promise)
+      .mockImplementationOnce(() => second.promise)
     render(<WorkbenchScreen />)
-    await userEvent.type(screen.getByLabelText('objective'), 'churn')
-    await userEvent.click(screen.getByRole('button', { name: /suggest features/i }))
-    await userEvent.click(screen.getByRole('button', { name: /suggest features/i }))
+    await userEvent.type(screen.getByLabelText('Prediction goal'), 'predict churn')
+    const generate = screen.getByRole('button', { name: 'Generate features' })
+    await userEvent.click(generate)
+    await userEvent.click(generate)
     await act(async () => {
-      resolveSecond([OTHER_IDEA])
+      second.resolve([OTHER_IDEA])
     })
     expect(await screen.findByText('txn_count')).toBeInTheDocument()
     // The stale first response resolves late and must not overwrite the newer round.
     await act(async () => {
-      resolveFirst([IDEA])
+      first.resolve([IDEA])
     })
     expect(screen.getByText('txn_count')).toBeInTheDocument()
     expect(screen.queryByText('avg_balance')).not.toBeInTheDocument()
   })
 
-  it('renders the recipe join path with a fan-out warning', async () => {
-    await buildRecipe([
+  it('shows the honest 503 notice when assist is unconfigured', async () => {
+    recommendFeatures.mockRejectedValue(new api.ApiError(503, 'not configured'))
+    render(<WorkbenchScreen />)
+    await userEvent.type(screen.getByLabelText('Prediction goal'), 'predict churn')
+    await userEvent.click(screen.getByRole('button', { name: 'Generate features' }))
+    const alert = await screen.findByRole('alert')
+    expect(alert).toHaveTextContent(/ai assist is not configured/i)
+  })
+
+  it('the example chip fills the goal input and enables the primary action', async () => {
+    render(<WorkbenchScreen />)
+    expect(screen.getByRole('button', { name: 'Generate features' })).toBeDisabled()
+    await userEvent.click(screen.getByRole('button', { name: 'predict churn' }))
+    expect(screen.getByLabelText('Prediction goal')).toHaveValue('predict churn')
+    expect(screen.getByRole('button', { name: 'Generate features' })).toBeEnabled()
+    expect(recommendFeatures).not.toHaveBeenCalled()
+  })
+})
+
+describe('selection and registration', () => {
+  it('registers a selected candidate only after the explicit confirm, with lineage from the backend pairs', async () => {
+    registerFeature.mockResolvedValue('feat_01')
+    featureFreshness.mockResolvedValue(FRESH)
+    await renderAndGenerate([IDEA], { source: 'deposits' })
+    // Lineage display comes from derives_pairs ('cards'), not the typed source ('deposits').
+    expect(await screen.findByText('cards:public.accounts.balance')).toBeInTheDocument()
+    await selectCandidate('avg_balance')
+    expect(screen.getByText('1 selected')).toBeInTheDocument()
+    await userEvent.click(screen.getByRole('button', { name: 'Register 1 feature' }))
+    expect(registerFeature).not.toHaveBeenCalled()
+    expect(
+      screen.getByText('This feature will enter the catalog registry with its lineage.'),
+    ).toBeInTheDocument()
+    await userEvent.click(screen.getByRole('button', { name: 'Confirm registration' }))
+    expect(registerFeature).toHaveBeenCalledWith(IDEA_SPEC)
+    expect(registerFeature).toHaveBeenCalledTimes(1)
+    expect(await screen.findByText(/registered/i)).toBeInTheDocument()
+    expect(screen.getByText('feat_01')).toBeInTheDocument()
+    expect(featureFreshness).toHaveBeenCalledWith('feat_01')
+    expect(screen.getByText('fresh')).toBeInTheDocument()
+    // The registered row swaps its checkbox for the ok state.
+    expect(screen.queryByRole('checkbox', { name: 'Select avg_balance' })).not.toBeInTheDocument()
+  })
+
+  it('sends exactly one register request when confirm is double-clicked in flight', async () => {
+    const pending = deferred<string>()
+    registerFeature.mockImplementation(() => pending.promise)
+    featureFreshness.mockResolvedValue(FRESH)
+    await renderAndGenerate([IDEA])
+    await selectCandidate('avg_balance')
+    await userEvent.click(screen.getByRole('button', { name: 'Register 1 feature' }))
+    const confirm = screen.getByRole('button', { name: 'Confirm registration' })
+    await userEvent.click(confirm)
+    await userEvent.click(confirm)
+    expect(registerFeature).toHaveBeenCalledTimes(1)
+    expect(confirm).toBeDisabled()
+    await act(async () => {
+      pending.resolve('feat_01')
+    })
+    expect(await screen.findByText('feat_01')).toBeInTheDocument()
+    expect(registerFeature).toHaveBeenCalledTimes(1)
+  })
+
+  it('registers a batch of two sequentially, in candidate order, one request each', async () => {
+    registerFeature.mockResolvedValueOnce('feat_01').mockResolvedValueOnce('feat_02')
+    featureFreshness.mockResolvedValue(FRESH)
+    await renderAndGenerate([IDEA, OTHER_IDEA])
+    await selectCandidate('avg_balance')
+    await selectCandidate('txn_count')
+    expect(screen.getByText('2 selected')).toBeInTheDocument()
+    await userEvent.click(screen.getByRole('button', { name: 'Register 2 features' }))
+    expect(
+      screen.getByText('These 2 features will enter the catalog registry with their lineage.'),
+    ).toBeInTheDocument()
+    await userEvent.click(screen.getByRole('button', { name: 'Confirm registration' }))
+    expect(await screen.findByText('feat_02')).toBeInTheDocument()
+    expect(screen.getByText('feat_01')).toBeInTheDocument()
+    expect(registerFeature).toHaveBeenCalledTimes(2)
+    expect(registerFeature).toHaveBeenNthCalledWith(1, IDEA_SPEC)
+    expect(registerFeature).toHaveBeenNthCalledWith(2, OTHER_IDEA_SPEC)
+    expect(screen.getAllByText('fresh')).toHaveLength(2)
+  })
+
+  it('continues the batch past a failure and keeps the failed candidate selected for retry', async () => {
+    registerFeature
+      .mockRejectedValueOnce(new api.ApiError(409, 'feature name already registered'))
+      .mockResolvedValueOnce('feat_02')
+      .mockResolvedValueOnce('feat_03')
+    featureFreshness.mockResolvedValue(FRESH)
+    await renderAndGenerate([IDEA, OTHER_IDEA])
+    await selectCandidate('avg_balance')
+    await selectCandidate('txn_count')
+    await registerSelection(2)
+    // First candidate failed inline; the second still registered.
+    expect(await screen.findByText('feature name already registered')).toBeInTheDocument()
+    expect(screen.getByText('feat_02')).toBeInTheDocument()
+    expect(registerFeature).toHaveBeenCalledTimes(2)
+    // The failed candidate stays selected, ready to retry.
+    expect(screen.getByRole('checkbox', { name: 'Select avg_balance' })).toBeChecked()
+    expect(screen.getByText('1 selected')).toBeInTheDocument()
+    await registerSelection(1)
+    expect(await screen.findByText('feat_03')).toBeInTheDocument()
+    expect(registerFeature).toHaveBeenCalledTimes(3)
+    expect(registerFeature).toHaveBeenNthCalledWith(3, IDEA_SPEC)
+    expect(screen.queryByText('feature name already registered')).not.toBeInTheDocument()
+  })
+
+  it('cancel backs out of the confirm step without registering', async () => {
+    await renderAndGenerate([IDEA])
+    await selectCandidate('avg_balance')
+    await userEvent.click(screen.getByRole('button', { name: 'Register 1 feature' }))
+    await userEvent.click(screen.getByRole('button', { name: 'Cancel' }))
+    expect(registerFeature).not.toHaveBeenCalled()
+    expect(screen.getByRole('button', { name: 'Register 1 feature' })).toBeInTheDocument()
+    expect(screen.getByRole('checkbox', { name: 'Select avg_balance' })).toBeChecked()
+  })
+
+  it('does not resurrect registered state when a regeneration reuses a name', async () => {
+    registerFeature.mockResolvedValue('feat_01')
+    featureFreshness.mockResolvedValue(FRESH)
+    await renderAndGenerate([IDEA])
+    await selectCandidate('avg_balance')
+    await registerSelection(1)
+    expect(await screen.findByText(/registered/i)).toBeInTheDocument()
+    // Second round returns a candidate with the same LLM-chosen name: it was never registered.
+    await userEvent.click(screen.getByRole('button', { name: 'Generate features' }))
+    const checkbox = await screen.findByRole('checkbox', { name: 'Select avg_balance' })
+    expect(checkbox).not.toBeChecked()
+    expect(screen.queryByText(/registered/i)).not.toBeInTheDocument()
+  })
+
+  it('marks a stale registration with its stale sources', async () => {
+    registerFeature.mockResolvedValue('feat_01')
+    featureFreshness.mockResolvedValue({ fresh: false, stale_sources: ['cards'] })
+    await renderAndGenerate([IDEA])
+    await selectCandidate('avg_balance')
+    await registerSelection(1)
+    expect(await screen.findByText('stale: cards')).toBeInTheDocument()
+    expect(screen.queryByText('fresh')).not.toBeInTheDocument()
+  })
+
+  it('omits the freshness chip silently when the freshness call fails', async () => {
+    registerFeature.mockResolvedValue('feat_01')
+    featureFreshness.mockRejectedValue(new api.ApiError(500, 'freshness unavailable'))
+    await renderAndGenerate([IDEA])
+    await selectCandidate('avg_balance')
+    await registerSelection(1)
+    expect(await screen.findByText(/registered/i)).toBeInTheDocument()
+    expect(screen.queryByText('fresh')).not.toBeInTheDocument()
+    expect(screen.queryByText(/stale:/)).not.toBeInTheDocument()
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+  })
+})
+
+describe('scope changes', () => {
+  it('editing the goal keeps candidates', async () => {
+    await renderAndGenerate([IDEA])
+    expect(await screen.findByText('avg_balance')).toBeInTheDocument()
+    await userEvent.type(screen.getByLabelText('Prediction goal'), ' next quarter')
+    expect(screen.getByText('avg_balance')).toBeInTheDocument()
+    expect(screen.queryByText(/scope changed/i)).not.toBeInTheDocument()
+  })
+
+  it('editing the catalog source clears generated candidates and drafts', async () => {
+    featureRecipe.mockResolvedValue(recipeWith([]))
+    await renderAndGenerate([IDEA], { source: 'deposits' })
+    await openDescribe()
+    await draftFeature('total spend per customer')
+    expect(await screen.findByText('total_spend_per_customer')).toBeInTheDocument()
+    expect(screen.getByText('avg_balance')).toBeInTheDocument()
+    // Drafts were snapshotted against the previous source: a source edit clears everything.
+    await userEvent.type(screen.getByLabelText('Catalog source'), 'x')
+    expect(screen.queryByText('avg_balance')).not.toBeInTheDocument()
+    expect(screen.queryByText('total_spend_per_customer')).not.toBeInTheDocument()
+    const status = screen.getByRole('status')
+    expect(status).toHaveTextContent('Scope changed. Regenerate to refresh candidates.')
+  })
+
+  it('editing the entity clears generated candidates but keeps drafts', async () => {
+    featureRecipe.mockResolvedValue(recipeWith([]))
+    await renderAndGenerate([IDEA], { source: 'deposits' })
+    await openDescribe()
+    await draftFeature('total spend per customer')
+    expect(await screen.findByText('total_spend_per_customer')).toBeInTheDocument()
+    await userEvent.type(screen.getByLabelText('Entity'), 'c')
+    expect(screen.queryByText('avg_balance')).not.toBeInTheDocument()
+    expect(screen.getByText('total_spend_per_customer')).toBeInTheDocument()
+    expect(screen.getByRole('status')).toHaveTextContent(/scope changed/i)
+  })
+
+  it('editing the target clears generated candidates and the screening note', async () => {
+    await renderAndGenerate([IDEA], { target: 'public.labels.churned' })
+    expect(await screen.findByText('avg_balance')).toBeInTheDocument()
+    expect(screen.getByText(/leaky candidates were rejected/i)).toBeInTheDocument()
+    // Candidates were screened against the previous target: any edit voids them.
+    await userEvent.type(screen.getByLabelText('Target column'), '2')
+    expect(screen.queryByText('avg_balance')).not.toBeInTheDocument()
+    expect(screen.queryByText(/leaky candidates were rejected/i)).not.toBeInTheDocument()
+    expect(screen.getByRole('status')).toHaveTextContent(/scope changed/i)
+  })
+
+  it('clears the selection when the scope changes', async () => {
+    await renderAndGenerate([IDEA, OTHER_IDEA])
+    await selectCandidate('avg_balance')
+    await selectCandidate('txn_count')
+    expect(screen.getByText('2 selected')).toBeInTheDocument()
+    await userEvent.type(screen.getByLabelText('Entity'), 'c')
+    expect(screen.queryByText('2 selected')).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Register 2 features' })).not.toBeInTheDocument()
+  })
+})
+
+describe('described drafts', () => {
+  it('drafts a candidate and registers it with the snapshot-source pairs', async () => {
+    registerFeature.mockResolvedValue('feat_09')
+    featureFreshness.mockResolvedValue(FRESH)
+    await renderAndDraft([
+      { from_ref: 'public.transactions.account_id', to_ref: 'public.accounts.id', cardinality: 'N:1' },
+    ])
+    expect(featureRecipe).toHaveBeenCalledWith('total spend per customer', 'deposits')
+    // The suggested name is a slug of the description, editable before selection.
+    expect(screen.getByLabelText('Name')).toHaveValue('total_spend_per_customer')
+    // Lineage display uses the drafted-against snapshot, not live context.
+    expect(screen.getByText('deposits:public.transactions.amount')).toBeInTheDocument()
+    await selectCandidate('total_spend_per_customer')
+    await registerSelection(1)
+    expect(registerFeature).toHaveBeenCalledWith({
+      name: 'total_spend_per_customer', description: 'total spend per customer',
+      grain_table: 'customers', aggregation: 'sum', as_of_column: null,
+      derives_from: [{ catalog_source: 'deposits', object_ref: 'public.transactions.amount' }],
+    })
+    expect(registerFeature).toHaveBeenCalledTimes(1)
+    expect(await screen.findByText('feat_09')).toBeInTheDocument()
+    expect(screen.getByText('fresh')).toBeInTheDocument()
+  })
+
+  it('requires a name before a draft can be selected, and registers under the edited name', async () => {
+    registerFeature.mockResolvedValue('feat_10')
+    featureFreshness.mockResolvedValue(FRESH)
+    await renderAndDraft()
+    await selectCandidate('total_spend_per_customer')
+    expect(screen.getByText('1 selected')).toBeInTheDocument()
+    // Blanking the name deselects the draft and blocks selection until it is named again.
+    await userEvent.clear(screen.getByLabelText('Name'))
+    expect(screen.queryByText('1 selected')).not.toBeInTheDocument()
+    const checkbox = screen.getByRole('checkbox', { name: 'Select unnamed draft' })
+    expect(checkbox).toBeDisabled()
+    expect(checkbox).not.toBeChecked()
+    expect(screen.getByText('Name this draft to select it for registration.')).toBeInTheDocument()
+    await userEvent.type(screen.getByLabelText('Name'), 'spend_90d')
+    await selectCandidate('spend_90d')
+    await registerSelection(1)
+    expect(registerFeature).toHaveBeenCalledWith(expect.objectContaining({ name: 'spend_90d' }))
+    expect(await screen.findByText('feat_10')).toBeInTheDocument()
+  })
+
+  it('disables drafting until a catalog source is set', async () => {
+    render(<WorkbenchScreen />)
+    await openDescribe()
+    await userEvent.type(
+      screen.getByLabelText('Describe the feature you want'), 'total spend per customer')
+    expect(screen.getByRole('button', { name: 'Draft candidate' })).toBeDisabled()
+    expect(screen.getByText(/set catalog source above/i)).toBeInTheDocument()
+    await userEvent.type(screen.getByLabelText('Catalog source'), 'deposits')
+    expect(screen.getByRole('button', { name: 'Draft candidate' })).toBeEnabled()
+    expect(featureRecipe).not.toHaveBeenCalled()
+  })
+
+  it('accumulates drafts so several described features register together', async () => {
+    featureRecipe.mockResolvedValue(recipeWith([]))
+    registerFeature.mockResolvedValueOnce('feat_11').mockResolvedValueOnce('feat_12')
+    featureFreshness.mockResolvedValue(FRESH)
+    render(<WorkbenchScreen />)
+    await userEvent.type(screen.getByLabelText('Catalog source'), 'deposits')
+    await openDescribe()
+    await draftFeature('total spend per customer')
+    await draftFeature('active days per customer')
+    expect(await screen.findByText('active_days_per_customer')).toBeInTheDocument()
+    expect(screen.getAllByText('Draft')).toHaveLength(2)
+    await selectCandidate('total_spend_per_customer')
+    await selectCandidate('active_days_per_customer')
+    await registerSelection(2)
+    expect(await screen.findByText('feat_11')).toBeInTheDocument()
+    expect(screen.getByText('feat_12')).toBeInTheDocument()
+    expect(registerFeature).toHaveBeenCalledTimes(2)
+  })
+
+  it('gates the describe path behind the same missing-provider notice', async () => {
+    featureRecipe.mockRejectedValue(new api.ApiError(503, 'not configured'))
+    render(<WorkbenchScreen />)
+    await userEvent.type(screen.getByLabelText('Catalog source'), 'deposits')
+    await openDescribe()
+    await draftFeature('total spend per customer')
+    const alert = await screen.findByRole('alert')
+    expect(alert).toHaveTextContent(/ai assist is not configured/i)
+    expect(screen.queryByText('Draft')).not.toBeInTheDocument()
+  })
+
+  it('renders the draft join path with a fan-out warning', async () => {
+    await renderAndDraft([
       { from_ref: 'public.customers.cust_id', to_ref: 'public.accounts.cust_id', cardinality: '1:N' },
       { from_ref: 'public.accounts.id', to_ref: 'public.transactions.account_id', cardinality: '1:N' },
     ])
-    expect(screen.getAllByRole('listitem')).toHaveLength(2)
+    expect(screen.getAllByText('(1:N)')).toHaveLength(2)
     expect(screen.getByText(/aggregate before joining/i)).toBeInTheDocument()
   })
 
   it('flags a lowercase 1:n hop as fan-out', async () => {
-    await buildRecipe([
+    await renderAndDraft([
       { from_ref: 'public.customers.cust_id', to_ref: 'public.accounts.cust_id', cardinality: '1:n' },
     ])
     expect(screen.getByText(/aggregate before joining/i)).toBeInTheDocument()
   })
 
   it('names unknown cardinality instead of rendering it as calm', async () => {
-    await buildRecipe([
+    await renderAndDraft([
       { from_ref: 'public.accounts.cust_id', to_ref: 'public.customers.cust_id', cardinality: 'N:1' },
       { from_ref: 'public.customers.cust_id', to_ref: 'public.segments.cust_id', cardinality: null },
     ])
@@ -275,70 +491,10 @@ describe('workbench screen', () => {
   })
 
   it('stays calm on an all-N:1 join path', async () => {
-    await buildRecipe([
+    await renderAndDraft([
       { from_ref: 'public.accounts.cust_id', to_ref: 'public.customers.cust_id', cardinality: 'N:1' },
     ])
     expect(screen.queryByText(/aggregate before joining/i)).not.toBeInTheDocument()
     expect(screen.queryByText(/cannot be ruled out/i)).not.toBeInTheDocument()
-  })
-
-  it('clears the recipe and shows the error when a rebuild fails', async () => {
-    featureRecipe
-      .mockResolvedValueOnce(recipeWith([
-        { from_ref: 'public.accounts.cust_id', to_ref: 'public.customers.cust_id', cardinality: 'N:1' },
-      ]))
-      .mockRejectedValueOnce(new api.ApiError(400, 'recipe failed'))
-    render(<WorkbenchScreen />)
-    await userEvent.type(screen.getByLabelText('catalog source'), 'deposits')
-    await userEvent.type(screen.getByLabelText('feature description'), 'total spend per customer')
-    await userEvent.click(screen.getByRole('button', { name: /build recipe/i }))
-    expect(await screen.findByRole('heading', { name: 'Recipe' })).toBeInTheDocument()
-    await userEvent.click(screen.getByRole('button', { name: /build recipe/i }))
-    expect(await screen.findByText('recipe failed')).toBeInTheDocument()
-    expect(screen.queryByRole('heading', { name: 'Recipe' })).not.toBeInTheDocument()
-  })
-
-  it('surfaces leakage warnings as a banner', async () => {
-    recommendFeatures.mockResolvedValue([IDEA])
-    leakageCheck.mockResolvedValue([
-      { object_ref: 'public.accounts.balance', reason: 'target-adjacent' }])
-    render(<WorkbenchScreen />)
-    await suggest()
-    await userEvent.type(screen.getByLabelText('target column'), 'public.labels.churned')
-    await userEvent.click(await screen.findByRole('button', { name: /check leakage/i }))
-    expect(await screen.findByText(/possible target leakage/i)).toBeInTheDocument()
-    expect(leakageCheck).toHaveBeenCalledWith(
-      ['public.accounts.balance'], 'public.labels.churned')
-    expect(screen.getByText(/target-adjacent/)).toBeInTheDocument()
-  })
-
-  it('invalidates leakage results when the target changes', async () => {
-    recommendFeatures.mockResolvedValue([IDEA])
-    leakageCheck.mockResolvedValue([
-      { object_ref: 'public.accounts.balance', reason: 'target-adjacent' }])
-    render(<WorkbenchScreen />)
-    await suggest()
-    await userEvent.type(screen.getByLabelText('target column'), 'public.labels.churned')
-    await userEvent.click(await screen.findByRole('button', { name: /check leakage/i }))
-    expect(await screen.findByText(/possible target leakage/i)).toBeInTheDocument()
-    // The result was computed for the old target: any edit voids it.
-    await userEvent.type(screen.getByLabelText('target column'), '2')
-    expect(screen.queryByText(/possible target leakage/i)).not.toBeInTheDocument()
-  })
-
-  it('clears stale leakage warnings when a re-check fails', async () => {
-    recommendFeatures.mockResolvedValue([IDEA])
-    leakageCheck
-      .mockResolvedValueOnce([
-        { object_ref: 'public.accounts.balance', reason: 'target-adjacent' }])
-      .mockRejectedValueOnce(new api.ApiError(400, 'unknown target'))
-    render(<WorkbenchScreen />)
-    await suggest()
-    await userEvent.type(screen.getByLabelText('target column'), 'public.labels.churned')
-    await userEvent.click(await screen.findByRole('button', { name: /check leakage/i }))
-    expect(await screen.findByText(/possible target leakage/i)).toBeInTheDocument()
-    await userEvent.click(screen.getByRole('button', { name: /check leakage/i }))
-    expect(await screen.findByText('unknown target')).toBeInTheDocument()
-    expect(screen.queryByText(/possible target leakage/i)).not.toBeInTheDocument()
   })
 })
