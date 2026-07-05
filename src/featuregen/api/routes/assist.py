@@ -41,7 +41,7 @@ class LeakageIn(BaseModel):
 @router.post("/features/recommend")
 def recommend(
     body: RecommendIn,
-    conn: Annotated[psycopg.Connection, Depends(get_conn)],
+    conn: Annotated[psycopg.Connection, Depends(get_conn, scope="function")],
     identity: Annotated[IdentityEnvelope, Depends(get_identity)],
     client: Annotated[LLMClient, Depends(get_llm)],
 ) -> dict[str, list[FeatureIdea]]:
@@ -53,7 +53,7 @@ def recommend(
 @router.post("/features/recipe")
 def recipe(
     body: RecipeIn,
-    conn: Annotated[psycopg.Connection, Depends(get_conn)],
+    conn: Annotated[psycopg.Connection, Depends(get_conn, scope="function")],
     identity: Annotated[IdentityEnvelope, Depends(get_identity)],
     client: Annotated[LLMClient, Depends(get_llm)],
 ) -> Recipe:
@@ -64,7 +64,7 @@ def recipe(
 @router.post("/features/leakage-check")
 def leakage(
     body: LeakageIn,
-    conn: Annotated[psycopg.Connection, Depends(get_conn)],
+    conn: Annotated[psycopg.Connection, Depends(get_conn, scope="function")],
     identity: Annotated[IdentityEnvelope, Depends(get_identity)],
     client: Annotated[LLMClient, Depends(get_llm)],
 ) -> dict[str, list[LeakageWarning]]:

@@ -15,7 +15,9 @@ from featuregen.intake.llm import LLMClient
 
 def get_conn() -> Iterator[psycopg.Connection]:
     """One connection + transaction per request: commit on success, rollback on any error.
-    Ingest stays all-or-nothing; reads never leave dangling transactions. Tests override this."""
+    Ingest stays all-or-nothing; reads never leave dangling transactions. Tests override this.
+    Routes must depend on this with ``scope="function"`` so the commit runs before the response is
+    sent — a failed commit must surface as a 500, never a silent 200 over pre-commit state."""
     dsn = get_settings().dsn
     if not dsn:
         raise HTTPException(status_code=503, detail="FEATUREGEN_DSN is not configured")
@@ -43,7 +45,7 @@ def get_identity(
     requires an authenticated actor: the event store records ``authenticated`` as data, and read
     scope derives from roles alone (verified by the identity + api suites). ``auth_method="stub"`` is
     deliberate honesty (allowed because ``validate_identity`` only runs on authenticated envelopes),
-    and the builder prepends the mandatory ``user:`` subject prefix.
+    and the caller supplies the mandatory ``user:`` subject prefix that the builder enforces.
 
     This dependency is the M6 seam — swap it for real session resolution without touching any
     endpoint. When the real IdP lands (handoff-spec build-step 5), the body becomes

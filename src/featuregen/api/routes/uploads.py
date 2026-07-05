@@ -30,7 +30,7 @@ def _read_rows(filename: str, data: bytes, source: str) -> list[CanonicalRow]:
 def create_upload(
     file: Annotated[UploadFile, File(...)],
     source: Annotated[str, Form(...)],
-    conn: Annotated[psycopg.Connection, Depends(get_conn)],
+    conn: Annotated[psycopg.Connection, Depends(get_conn, scope="function")],
     identity: Annotated[IdentityEnvelope, Depends(get_identity)],
     client: Annotated[LLMClient | None, Depends(get_llm_optional)],
 ) -> IngestResult:

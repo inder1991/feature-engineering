@@ -17,7 +17,7 @@ router = APIRouter()
 def joins_for_column(
     object_ref: str,
     source: str,
-    conn: Annotated[psycopg.Connection, Depends(get_conn)],
+    conn: Annotated[psycopg.Connection, Depends(get_conn, scope="function")],
     identity: Annotated[IdentityEnvelope, Depends(get_identity)],
 ) -> list[JoinEdge]:
     return column_joins(conn, source, object_ref)
@@ -28,7 +28,7 @@ def join_path(
     source: str,
     to: str,
     from_table: Annotated[str, Query(alias="from")],
-    conn: Annotated[psycopg.Connection, Depends(get_conn)],
+    conn: Annotated[psycopg.Connection, Depends(get_conn, scope="function")],
     identity: Annotated[IdentityEnvelope, Depends(get_identity)],
 ) -> list[JoinStep] | None:
     """Steps oriented to the traversal direction (a reverse N:1 hop reads 1:N — M7).

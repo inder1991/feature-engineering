@@ -51,6 +51,7 @@ describe('workbench screen', () => {
       grain_table: 'customers', aggregation: 'avg', as_of_column: null,
       derives_from: [{ catalog_source: 'deposits', object_ref: 'public.accounts.balance' }],
     })
+    expect(registerFeature).toHaveBeenCalledTimes(1)
     expect(await screen.findByText(/registered as/i)).toBeInTheDocument()
   })
 

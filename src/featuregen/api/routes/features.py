@@ -37,7 +37,7 @@ class FeatureSpecIn(BaseModel):
 @router.post("/features")
 def create_feature(
     body: FeatureSpecIn,
-    conn: Annotated[psycopg.Connection, Depends(get_conn)],
+    conn: Annotated[psycopg.Connection, Depends(get_conn, scope="function")],
     identity: Annotated[IdentityEnvelope, Depends(get_identity)],
 ) -> dict[str, str]:
     """Registration is the explicit-confirm step — suggestions only become features here."""
@@ -51,7 +51,7 @@ def create_feature(
 @router.get("/features/{feature_id}/freshness")
 def freshness(
     feature_id: str,
-    conn: Annotated[psycopg.Connection, Depends(get_conn)],
+    conn: Annotated[psycopg.Connection, Depends(get_conn, scope="function")],
     identity: Annotated[IdentityEnvelope, Depends(get_identity)],
 ) -> FeatureFreshness:
     row = conn.execute("SELECT 1 FROM feature WHERE feature_id = %s", (feature_id,)).fetchone()
@@ -64,7 +64,7 @@ def freshness(
 def feature_impact(
     object_ref: str,
     source: str,
-    conn: Annotated[psycopg.Connection, Depends(get_conn)],
+    conn: Annotated[psycopg.Connection, Depends(get_conn, scope="function")],
     identity: Annotated[IdentityEnvelope, Depends(get_identity)],
 ) -> dict[str, list[str]]:
     return {"feature_ids": features_affected_by(conn, source, object_ref)}

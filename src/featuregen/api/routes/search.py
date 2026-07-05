@@ -16,7 +16,7 @@ router = APIRouter()
 @router.get("/search")
 def search_catalog(
     q: str,
-    conn: Annotated[psycopg.Connection, Depends(get_conn)],
+    conn: Annotated[psycopg.Connection, Depends(get_conn, scope="function")],
     identity: Annotated[IdentityEnvelope, Depends(get_identity)],
     limit: Annotated[int, Query(ge=1, le=100)] = 20,
 ) -> list[SearchHit]:

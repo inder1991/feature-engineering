@@ -79,8 +79,9 @@ Read the full design and decisions:
 Environment:
 - `FEATUREGEN_DSN` (required) — PostgreSQL 15+ DSN; run `uv run python -m featuregen migrate` first.
 - `FEATUREGEN_AUDIT_HMAC_KEY` — required by security-audit paths elsewhere in the platform.
-- `FEATUREGEN_LLM_PROVIDER=anthropic` (optional) — enables the real Claude adapter: upload
-  enrichment (concept/domain/definition) and the feature-assist endpoints. Unset: uploads ingest
+- `FEATUREGEN_LLM_PROVIDER=anthropic` (optional) — wires the config-gated Claude adapter seam.
+  **Not yet operational**: the real-provider enrichment/assist plumb-through (SDK dependency,
+  model + output-schema wiring) is a tracked follow-on; leave unset for now. Unset: uploads ingest
   un-enriched and `/features/recommend|recipe|leakage-check` return **503** (no fake AI — D5).
 
 Auth is a development stub: send `X-User: <subject>` and `X-Roles: pii_reader,restricted_reader,…`.
