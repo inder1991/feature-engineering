@@ -72,5 +72,20 @@ Read the full design and decisions:
 | **C — Coverage** | LLM-SQL path, full validation, generation engine | SP-6, SP-7, SP-8, SP-12 |
 | **D — Hardening** | Governance, lifecycle/monitoring, security | SP-9, SP-10, SP-11 |
 
+## HTTP API
+
+`make api` serves the FastAPI layer on `http://localhost:8000` (OpenAPI docs at `/docs`).
+
+Environment:
+- `FEATUREGEN_DSN` (required) — PostgreSQL 15+ DSN; run `uv run python -m featuregen migrate` first.
+- `FEATUREGEN_AUDIT_HMAC_KEY` — required by security-audit paths elsewhere in the platform.
+- `FEATUREGEN_LLM_PROVIDER=anthropic` (optional) — enables the real Claude adapter: upload
+  enrichment (concept/domain/definition) and the feature-assist endpoints. Unset: uploads ingest
+  un-enriched and `/features/recommend|recipe|leakage-check` return **503** (no fake AI — D5).
+
+Auth is a development stub: send `X-User: <subject>` and `X-Roles: pii_reader,restricted_reader,…`.
+Roles gate read-scope (PII-tagged columns are hidden without `pii_reader`). The stub is the
+single seam (`featuregen.api.deps.get_identity`) to replace with real session auth.
+
 ## License
 Proprietary — see [LICENSE](LICENSE).
