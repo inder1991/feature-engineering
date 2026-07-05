@@ -67,11 +67,36 @@ def test_search_uses_llm_concept(db):
     _seal()
     now = datetime(2026, 7, 5, tzinfo=timezone.utc)
     rows = [CanonicalRow("deposits", "accounts", "bal", "numeric")]  # cryptic name, no definition
-    client = FakeLLM(script={"overlay.enrich.concept":
-                             FakeResponse(output={"concept": "monetary_amount"})})
+    client = FakeLLM(script={
+        "overlay.enrich.concept": FakeResponse(output={"concept": "monetary_amount"}),
+        "overlay.enrich.definition": FakeResponse(output={"definition": "ledger balance"}),
+        "overlay.enrich.domain": FakeResponse(output={"domain": "Deposits"}),
+    })
     assert ingest_upload(db, "deposits", rows, actor=_actor(), now=now,
                          client=client).status == "ingested"
     # 'monetary' finds the cryptic 'bal' column only via its LLM-assigned concept.
     hits = search(db, "monetary", now=now)
     assert any(h.column == "bal" for h in hits)
     assert next(h for h in hits if h.column == "bal").concept == "monetary_amount"
+
+
+def test_search_uses_llm_domain_and_drafted_definition(db):
+    from featuregen.intake.llm import FakeLLM, FakeResponse
+    _seal()
+    now = datetime(2026, 7, 5, tzinfo=timezone.utc)
+    rows = [CanonicalRow("deposits", "accounts", "bal", "numeric")]  # cryptic, no definition
+    client = FakeLLM(script={
+        "overlay.enrich.concept": FakeResponse(output={"concept": "monetary_amount"}),
+        "overlay.enrich.definition": FakeResponse(output={"definition": "the account ledger balance"}),
+        "overlay.enrich.domain": FakeResponse(output={"domain": "Deposits"}),
+    })
+    assert ingest_upload(db, "deposits", rows, actor=_actor(), now=now,
+                         client=client).status == "ingested"
+
+    # domain is searchable + surfaced on the hit
+    dom_hits = search(db, "deposits", now=now)
+    bal = next((h for h in dom_hits if h.column == "bal"), None)
+    assert bal is not None and bal.domain == "Deposits"
+
+    # the drafted definition made 'ledger' find the otherwise-cryptic column
+    assert any(h.column == "bal" for h in search(db, "ledger", now=now))

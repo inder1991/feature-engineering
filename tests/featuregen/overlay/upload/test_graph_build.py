@@ -54,3 +54,22 @@ def test_build_graph_writes_concept_into_node_and_search(db):
         "SELECT count(*) FROM graph_node WHERE object_ref='public.accounts.balance' "
         "AND search_doc @@ plainto_tsquery('english','monetary')").fetchone()[0]
     assert hit == 1
+
+
+def test_build_graph_folds_drafted_definition_and_domain(db):
+    from featuregen.overlay.upload.enrich import content_hash
+    rows = [CanonicalRow("deposits", "accounts", "bal", "numeric")]  # blank definition
+    build_graph(db, "deposits", rows,
+                definitions={content_hash(rows[0]): "the account ledger balance"},
+                domains={"accounts": "Deposits"})
+    row = db.execute(
+        "SELECT definition, domain FROM graph_node WHERE object_ref='public.accounts.bal'"
+    ).fetchone()
+    assert row[0] == "the account ledger balance"   # drafted def fills the blank
+    assert row[1] == "Deposits"
+    # both the drafted definition ('ledger') and the domain ('deposits') are searchable
+    for term in ("ledger", "deposits"):
+        hit = db.execute(
+            "SELECT count(*) FROM graph_node WHERE object_ref='public.accounts.bal' "
+            "AND search_doc @@ plainto_tsquery('english', %s)", (term,)).fetchone()[0]
+        assert hit == 1, term

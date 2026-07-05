@@ -7,7 +7,7 @@ from psycopg.rows import dict_row
 
 _SQL = """
 SELECT n.object_ref, n.table_name, n.column_name, n.kind, n.data_type, n.definition,
-       n.is_grain, n.is_as_of, n.catalog_source, n.concept,
+       n.is_grain, n.is_as_of, n.catalog_source, n.concept, n.domain,
        ts_rank_cd(n.search_doc, plainto_tsquery('english', %(q)s))
          + (CASE WHEN n.is_grain THEN 0.5 ELSE 0 END)
          + (CASE WHEN n.is_as_of THEN 0.3 ELSE 0 END) AS score
@@ -32,6 +32,7 @@ class SearchHit:
     is_as_of: bool
     catalog_source: str
     concept: str | None
+    domain: str | None
     score: float
 
 
@@ -45,4 +46,4 @@ def search(conn, query: str, *, now: datetime,
         object_ref=r["object_ref"], table=r["table_name"], column=r["column_name"],
         kind=r["kind"], data_type=r["data_type"], definition=r["definition"],
         is_grain=r["is_grain"], is_as_of=r["is_as_of"], catalog_source=r["catalog_source"],
-        concept=r["concept"], score=float(r["score"])) for r in rows]
+        concept=r["concept"], domain=r["domain"], score=float(r["score"])) for r in rows]
