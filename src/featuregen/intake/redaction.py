@@ -221,7 +221,6 @@ def current_intent_redactor() -> IntentRedactor:
     """Return the registered IntentRedactor; fail closed (RuntimeError) if none is registered."""
     if _INTENT_REDACTOR is None:
         raise RuntimeError(
-            "no IntentRedactor registered; call register_intent_redactor(...) "
-            "(register_sp2()/_wire does this)"
+            "no IntentRedactor registered; call register_intent_redactor(...)"
         )
     return _INTENT_REDACTOR

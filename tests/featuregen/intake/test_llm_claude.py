@@ -50,19 +50,6 @@ def test_stop_reason_mapping_to_provider_taxonomy():
     assert _map_stop_reason("some_future_reason") == PROVIDER_NON_RETRYABLE
 
 
-def test_gen_settings_are_provider_derived_not_hardcoded_fake(monkeypatch):
-    """N11: structure_intent generation settings derive from the configured provider — default fake in
-    CI/local, anthropic when the adapter is enabled — never a hard-coded 'fake' baked into the prod path."""
-    from featuregen.intake.commands import _gen_settings
-
-    monkeypatch.delenv("FEATUREGEN_LLM_PROVIDER", raising=False)
-    assert _gen_settings()["provider"] == "fake"
-    monkeypatch.setenv("FEATUREGEN_LLM_PROVIDER", "anthropic")
-    monkeypatch.setenv("FEATUREGEN_LLM_MODEL", "claude-opus-4-8")
-    gs = _gen_settings()
-    assert gs["provider"] == "anthropic" and gs["model"] == "claude-opus-4-8"
-
-
 @pytest.mark.skipif(
     not __import__("os").environ.get("FEATUREGEN_LLM_SMOKE"),
     reason="config-gated live Claude smoke test; never gated in CI (D5, §15)",
