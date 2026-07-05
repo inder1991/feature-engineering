@@ -1,4 +1,4 @@
-.PHONY: help setup lint format format-check typecheck test ci clean
+.PHONY: help setup lint format format-check typecheck test ci api frontend-dev frontend-test clean
 
 help:  ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | \
@@ -24,6 +24,15 @@ test:  ## Run the test suite (ephemeral Postgres, or set FEATUREGEN_TEST_DSN)
 	uv run pytest -q
 
 ci: lint format-check typecheck test  ## Everything CI runs
+
+api:  ## Serve the HTTP API on :8000 (needs FEATUREGEN_DSN)
+	uv run uvicorn --factory featuregen.api.app:create_app_from_env --reload --port 8000
+
+frontend-dev:  ## Vite dev server on :5173 (proxies API calls to :8000)
+	cd frontend && npm run dev
+
+frontend-test:  ## Frontend unit tests (vitest)
+	cd frontend && npm test
 
 clean:  ## Remove caches and build artifacts
 	rm -rf .pytest_cache .ruff_cache .mypy_cache src/*.egg-info

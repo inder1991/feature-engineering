@@ -72,5 +72,32 @@ Read the full design and decisions:
 | **C — Coverage** | LLM-SQL path, full validation, generation engine | SP-6, SP-7, SP-8, SP-12 |
 | **D — Hardening** | Governance, lifecycle/monitoring, security | SP-9, SP-10, SP-11 |
 
+## HTTP API
+
+`make api` serves the FastAPI layer on `http://localhost:8000` (OpenAPI docs at `/docs`).
+
+Environment:
+- `FEATUREGEN_DSN` (required) — PostgreSQL 15+ DSN; run `uv run python -m featuregen migrate` first.
+- `FEATUREGEN_AUDIT_HMAC_KEY` — required by security-audit paths elsewhere in the platform.
+- `FEATUREGEN_LLM_PROVIDER=anthropic` (optional) — wires the config-gated Claude adapter seam.
+  **Not yet operational**: the real-provider enrichment/assist plumb-through (SDK dependency,
+  model + output-schema wiring) is a tracked follow-on; leave unset for now. Unset: uploads ingest
+  un-enriched and `/features/recommend|recipe|leakage-check` return **503** (no fake AI — D5).
+
+Auth is a development stub: send `X-User: <subject>` and `X-Roles: pii_reader,restricted_reader,…`.
+Roles gate read-scope (PII-tagged columns are hidden without `pii_reader`). The stub is the
+single seam (`featuregen.api.deps.get_identity`) to replace with real session auth. The stub mints
+an unauthenticated dev principal (`user:<subject>`) through the fail-closed identity builder;
+authenticated envelopes only ever come from a registered verifier once the real IdP lands.
+
+## Frontend
+
+`make frontend-dev` serves the React app on `http://localhost:5173`, proxying API calls to the
+FastAPI server (`make api`). Dev loop: `make api` in one terminal, `make frontend-dev` in another,
+then upload `docs/examples/deposits.csv` as source `deposits` and search for “balance”.
+The session bar (top right) is stub auth — toggle `pii_reader` to see read-scope filtering live.
+Feature-assist panels show a “not configured” notice unless the API deployment sets
+`FEATUREGEN_LLM_PROVIDER=anthropic`.
+
 ## License
 Proprietary — see [LICENSE](LICENSE).
