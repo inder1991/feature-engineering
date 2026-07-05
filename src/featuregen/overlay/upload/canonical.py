@@ -15,6 +15,8 @@ class CanonicalRow:
     as_of: bool = False
     definition: str = ""
     sensitivity: str = ""
+    joins_to: str = ""        # target "table.column" (single-column join)
+    cardinality: str = ""     # N:1 | 1:1 | 1:N
 
 
 @dataclass(frozen=True, slots=True)
