@@ -11,10 +11,11 @@ endpoint contracts, the screens, and the honest guardrails are all here.
   `2026-07-05-upload-catalog-review-findings.md`).
 - One **UI mockup** exists as the visual anchor for the review-queue screen (the `quarantine-review`
   Artifact — standalone HTML, fake data; a design reference, not wired to anything).
-- **Honesty that shapes the API:** LLM enrichment (concept/domain/definition) is **`FakeLLM`-functional
-  only**. Against a real provider it *degrades gracefully to no-op* (it won't crash or poison), but it
-  does not yet *work* — the `call_llm`+schema-registration+redaction integration is a named follow-on.
-  **Do not build UI that promises live LLM enrichment/recommendation against a real model yet.**
+- **Enrichment now works against a real provider** (via `enrich_llm.audited_enrich_call` — attached
+  output-schema + reserved input keys + egress guard + audit record). It runs when a real `LLMClient` is
+  configured and passed in; with `client=None` it's simply skipped (concept/domain/definition absent).
+  So the UI can surface enrichment as real, but must still design for its **absence** when no provider is
+  configured, and treat every LLM output as **advisory** (suggestion, not fact).
 
 ## Two layers to build
 1. **API layer** (recommend **FastAPI** — same language, Pydantic contracts map 1:1 to the dataclasses,
@@ -72,9 +73,9 @@ the read-scope contract — M6).
 - **LLM = suggestion-then-confirm:** recommend/recipe/leakage return **proposals**. The UI presents them
   as such (with confidence where available) and only mutates state on explicit user action. A wrong
   suggestion must never become a registered feature without a click.
-- **Enrichment honesty:** until the real-provider follow-on, the upload endpoint runs with `client=None`
-  (no enrichment) or a `FakeLLM`. Don't build a "watch the AI classify your columns live" affordance yet;
-  concept/domain/definition may simply be absent. Design for their absence gracefully.
+- **Enrichment:** the upload endpoint enriches when passed a configured `LLMClient` (governed + audited),
+  or skips enrichment with `client=None`. Concept/domain/definition may be absent (no provider) — design
+  for that gracefully; and every LLM output stays advisory (correctable, never a load-bearing fact).
 - **Transactions:** ingest is one tx (all-or-nothing — a bad upload rolls back cleanly). Reads are
   read-only. Give each request its own connection/tx (a FastAPI dependency).
 

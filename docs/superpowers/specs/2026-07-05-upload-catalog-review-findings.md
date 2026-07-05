@@ -126,11 +126,17 @@ header-generator resume (no first-data-row consumption); CSV short/long rows via
 - **Minors fixed:** CSV BOM strip; `content_hash` JSON+source (collision + cross-source sharing);
   `IngestResult.flagged` first-upload gate; unknown-sensitivity quarantine.
 
+**Real-provider enrichment — now DONE (2026-07-05).** `enrich_llm.audited_enrich_call` composes the
+decoupled SP-2 building blocks (registered output-schema + reserved input keys + `assert_llm_safe` +
+`drive_structured_call` + `record_llm_call`) under an overlay run bucket — no `call_llm` feature-contract
+coupling. M2 fully closed (a fail-closed-without-schema provider now succeeds — proven by test), M4 fully
+closed (metadata-only + egress guard + audit record + cost). Enrichment now works against a real provider
+when one is configured (`client=None` skips it).
+
 **DEFERRED (low-value robustness, named):** quarantine-refresh-on-held (arguably correct; doc wording),
 multiple-`as_of` collapse, dedup-flag-loss, concurrency-truncation status downgrade, malformed-`joins_to`
 vs-pending distinction, `build_graph` per-source advisory lock, `field_map` last-alias-wins, Excel
-blank-row detection consistency. And the big documented follow-on: the **real-provider enrichment**
-(`call_llm` + schema registration + redaction) so enrichment works against Anthropic, not just `FakeLLM`.
+blank-row detection consistency.
 
 ## Priority / disposition
 - **Fix before ANY real use (silent-data + crash + PII):** B1, M1, M5, M6.

@@ -95,9 +95,9 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
 
     concepts = definitions = domains = None
     if client is not None:
-        concepts = enrich_concepts(conn, vr.good, client)
-        definitions = draft_definitions(conn, vr.good, client)
-        domains = classify_domains(conn, vr.good, client)
+        concepts = enrich_concepts(conn, vr.good, client, actor)
+        definitions = draft_definitions(conn, vr.good, client, actor)
+        domains = classify_domains(conn, vr.good, client, actor)
     build_graph(conn, catalog_source, vr.good, concepts, definitions, domains)
     persist_quarantine(conn, catalog_source, vr.quarantined)
     flagged = (f"first upload of '{catalog_source}' ({len(vr.good)} objects) — review recommended"
