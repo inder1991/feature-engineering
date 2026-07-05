@@ -17,6 +17,7 @@ _ALIASES: dict[str, set[str]] = {
     "type": {"type", "datatype", "sqltype"},
     "is_grain": {"isgrain", "grain"},
     "as_of": {"asof", "asofcolumn"},
+    "as_of_basis": {"asofbasis", "basis", "availabilitybasis"},
     "definition": {"definition", "description", "comment", "notes"},
     "sensitivity": {"sensitivity", "sensitive", "classification"},
     "joins_to": {"joinsto", "fk", "fktarget", "foreignkey", "references"},
@@ -30,7 +31,9 @@ _TRUE = {"y", "yes", "true", "1"}
 
 
 def _norm(h: str) -> str:
-    return h.strip().lower().replace(" ", "").replace("_", "")
+    # Strip a UTF-8 BOM too — Excel-exported CSVs prefix the first header with ﻿, which
+    # str.strip() does NOT remove, silently unmapping the first column.
+    return h.lstrip("﻿").strip().lower().replace(" ", "").replace("_", "")
 
 
 def field_map(headers: list[str]) -> dict[str, str]:
@@ -57,6 +60,7 @@ def build_row(fmap: Mapping[str, str], rowdict: Mapping[str, object], source: st
         source=cell("source") or source,
         table=cell("table"), column=cell("column"), type=cell("type"),
         is_grain=flag("is_grain"), as_of=flag("as_of"),
+        as_of_basis=cell("as_of_basis").lower(),
         definition=cell("definition"), sensitivity=cell("sensitivity").lower(),
         joins_to=cell("joins_to"), cardinality=cell("cardinality"),
         additivity=cell("additivity").lower(), unit=cell("unit"),

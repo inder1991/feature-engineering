@@ -23,6 +23,15 @@ def _table_of(object_ref: str) -> str:
     return parts[1] if len(parts) >= 2 else object_ref
 
 
+def _invert(cardinality: str | None) -> str | None:
+    """Flip fan direction for a reverse traversal. `1:1`/`None` are direction-agnostic."""
+    if cardinality == "N:1":
+        return "1:N"
+    if cardinality == "1:N":
+        return "N:1"
+    return cardinality
+
+
 def find_join_path(conn, catalog_source: str, from_table: str,
                    to_table: str) -> list[JoinStep] | None:
     """The shortest join path (list of steps) between two tables, or None if unreachable.
@@ -36,10 +45,14 @@ def find_join_path(conn, catalog_source: str, from_table: str,
 
     adj: dict[str, list[tuple[str, JoinStep]]] = {}
     for from_ref, to_ref, card in edges:
-        step = JoinStep(from_ref=from_ref, to_ref=to_ref, cardinality=card)
         ft, tt = _table_of(from_ref), _table_of(to_ref)
-        adj.setdefault(ft, []).append((tt, step))
-        adj.setdefault(tt, []).append((ft, step))   # undirected traversal
+        # Each step is ORIENTED to the traversal direction: the reverse edge swaps refs and inverts
+        # cardinality, so a returned step reads "from `_table_of(from_ref)` join to `_table_of(to_ref)`,
+        # fanning `cardinality` in that direction" (M7 — a reverse N:1 hop is really 1:N).
+        fwd = JoinStep(from_ref=from_ref, to_ref=to_ref, cardinality=card)
+        rev = JoinStep(from_ref=to_ref, to_ref=from_ref, cardinality=_invert(card))
+        adj.setdefault(ft, []).append((tt, fwd))
+        adj.setdefault(tt, []).append((ft, rev))
 
     queue: deque[tuple[str, list[JoinStep]]] = deque([(from_table, [])])
     seen = {from_table}

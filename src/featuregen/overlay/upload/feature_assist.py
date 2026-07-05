@@ -11,10 +11,12 @@ proposals only.
 """
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 
 from featuregen.intake.llm import LLMClient, LLMRequest
 from featuregen.overlay.upload.join_path import JoinStep, find_join_path
+from featuregen.overlay.upload.read_scope import allowed_sensitivities
 
 
 def _call_raw(client: LLMClient, task: str, prompt_id: str, schema_id: str, inputs: dict) -> dict:
@@ -26,10 +28,12 @@ def _call_raw(client: LLMClient, task: str, prompt_id: str, schema_id: str, inpu
     return out if isinstance(out, dict) else {}
 
 
-def _candidate_columns(conn, catalog_source: str | None) -> list[dict]:
+def _candidate_columns(conn, catalog_source: str | None, roles: Iterable[str]) -> list[dict]:
+    # Read-scope: never feed a sensitivity-tagged column the caller can't see to the LLM (M6).
     sql = ("SELECT catalog_source, object_ref, table_name, column_name, concept, domain, definition "
-           "FROM graph_node WHERE kind = 'column'")
-    params: list = []
+           "FROM graph_node WHERE kind = 'column' "
+           "AND (sensitivity IS NULL OR sensitivity = ANY(%s))")
+    params: list = [allowed_sensitivities(roles)]
     if catalog_source:
         sql += " AND catalog_source = %s"
         params.append(catalog_source)
@@ -52,8 +56,9 @@ class FeatureIdea:
 
 
 def recommend_features(conn, objective: str, client: LLMClient, *,
-                       catalog_source: str | None = None) -> list[FeatureIdea]:
-    cols = _candidate_columns(conn, catalog_source)
+                       catalog_source: str | None = None,
+                       roles: Iterable[str] = ()) -> list[FeatureIdea]:
+    cols = _candidate_columns(conn, catalog_source, roles)
     known = {c["object_ref"] for c in cols}
     out = _call_raw(client, "overlay.feature.recommend", "feature_recommend_v1", "feature_ideas",
                     {"objective": objective, "columns": _menu(cols)})
@@ -79,8 +84,9 @@ class Recipe:
     join_path: list[JoinStep] = field(default_factory=list)   # deterministic, real edges
 
 
-def feature_recipe(conn, nl_query: str, client: LLMClient, *, catalog_source: str) -> Recipe:
-    cols = _candidate_columns(conn, catalog_source)
+def feature_recipe(conn, nl_query: str, client: LLMClient, *, catalog_source: str,
+                   roles: Iterable[str] = ()) -> Recipe:
+    cols = _candidate_columns(conn, catalog_source, roles)
     known = {c["object_ref"] for c in cols}
     out = _call_raw(client, "overlay.feature.recipe", "feature_recipe_v1", "feature_recipe",
                     {"query": nl_query, "columns": _menu(cols)})
