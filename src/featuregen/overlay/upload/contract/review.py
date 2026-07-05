@@ -13,8 +13,8 @@ from datetime import datetime, timedelta
 
 from featuregen.intake.llm import LLMClient
 from featuregen.overlay.upload.contract.author import ContractDraft
-from featuregen.overlay.upload.enrich_llm import audited_enrich_call
-from featuregen.overlay.upload.feature_assist import _call_raw, _validate_idea
+from featuregen.overlay.upload.enrich_llm import audited_enrich_call, audited_structured_call
+from featuregen.overlay.upload.feature_assist import _validate_idea
 
 
 def _live_columns(conn, object_refs: list[str]) -> set[str]:
@@ -39,13 +39,20 @@ def validate_minimum(conn, draft: ContractDraft, *, target_ref: str | None = Non
     return (idea is not None, [] if idea is not None else [reason])
 
 
-def critique_contract(conn, draft: ContractDraft, client: LLMClient) -> list[str]:
+def critique_contract(conn, draft: ContractDraft, client: LLMClient, *, actor=None) -> list[str]:
     """Advisory adversarial review of the definition NARRATIVE (accuracy / completeness / undocumented
-    assumptions). Does NOT gate — the deterministic MCV does."""
-    out = _call_raw(client, "overlay.contract.critique", "contract_critique_v1", "contract_critique",
-                    {"feature": draft.feature_name, "definition": draft.definition,
-                     "aggregation": draft.aggregation, "derives_from": draft.derives_from})
-    return [str(f) for f in out.get("findings", []) if f]
+    assumptions). Routed through the AUDITED seam (egress guard + registered schema + llm_call record) —
+    M5. Does NOT gate — the deterministic MCV does."""
+    out = audited_structured_call(
+        conn, client, task="overlay.contract.critique", prompt_id="overlay_critique_v1",
+        schema_id="overlay_critique",
+        catalog_metadata={"feature": draft.feature_name, "definition": draft.definition,
+                          "aggregation": draft.aggregation or "",
+                          "derives_from": list(draft.derives_from)},
+        instruction="Adversarially review this feature definition for accuracy, completeness, and "
+                    "undocumented assumptions. Return findings; empty if clean. Metadata only.",
+        actor=actor)
+    return [str(f) for f in (out or {}).get("findings", []) if f]
 
 
 def refine_contract(conn, draft: ContractDraft, findings: list[str], client: LLMClient, *,
