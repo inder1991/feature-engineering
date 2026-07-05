@@ -38,10 +38,12 @@ Test `tests/featuregen/overlay/upload/contract/test_intake.py`.
 
 **Interfaces (Produces):**
 - `@dataclass Intent{ intent_id, hypothesis, definition, intake_mode, redacted_hypothesis, redacted_definition, classification }`
-- `submit_intent(conn, *, hypothesis: str, definition: str = "", actor) -> Intent` — **denies** (raises
-  `IntentValidationError`) when `hypothesis` is blank (no run created — resubmit, not a terminal reject);
-  fixes `intake_mode` = `definition` if `definition` else `hypothesis` (immutable); redacts+classifies BOTH
-  texts via the SP-2 redactor (`intake/redaction.py`); persists the intent (event or row).
+- `submit_intent(*, hypothesis: str, definition: str = "", actor, redactor=None) -> Intent` — **denies**
+  (raises `IntentValidationError`) when `hypothesis` is blank (no run created — resubmit, not a terminal
+  reject); fixes `intake_mode` = `definition` if `definition` else `hypothesis` (immutable);
+  redacts+classifies BOTH texts via the SP-2 redactor (`intake/redaction.py`), classified against its own
+  scanner. **Persistence deferred to Phase 2** — the intent is recorded together with the considered-set at
+  Gate #1, so Phase 1 stays a pure, DB-free intake unit (no `conn`).
 
 - [ ] **Step 1: Failing test** — `submit_intent` with no hypothesis raises `IntentValidationError`; with a
   hypothesis sets `intake_mode='hypothesis'`; with both sets `intake_mode='definition'` and both redacted
@@ -99,10 +101,18 @@ Test `.../contract/test_author.py`.
 - `critique_contract(conn, draft, client, *, actor) -> list[Finding]` — adversarial LLM review (leakage/
   unsafe-aggregation/wrong-grain/undocumented-assumption/drift-fragility); emits `CONTRACT_CRITIQUED`.
 - `refine_contract(conn, draft, findings, client, *, actor) -> ContractDraft` — emits `CONTRACT_REFINED`.
-- A bounded **critique→refine loop** (mirrors the feature loop: LLM proposes, code owns the loop).
 - `validate_minimum(conn, draft) -> (bool, reasons)` — **MCV = the deterministic gauntlet** (reuse
   `_validate_idea`'s checks: leakage/freshness/additivity/point-in-time/join-path); emits
   `MINIMUM_CONTRACT_VALIDATED` on pass.
+- A bounded **critique→refine loop**, symmetric with the feature loop: **the deterministic MCV runs
+  inside every pass** and its failures feed `refine` alongside the LLM critique — so refinement is driven
+  by deterministic defects, not just LLM opinion, and the LLM never gates alone:
+  ```
+  for _ in range(budget):
+      findings = critique_contract(draft) + validate_minimum(draft).reasons   # LLM + deterministic
+      if not findings: break
+      draft = refine_contract(draft, findings)
+  ```
 
 - [ ] Tasks: TDD each (critique flags a planted leak; refine clears it; MCV rejects an unsafe draft) →
   commit `feat(contract): critique→refine loop + deterministic MCV`.
