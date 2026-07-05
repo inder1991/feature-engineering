@@ -12,6 +12,7 @@ from featuregen.overlay.upload.brake import large_change_brake
 from featuregen.overlay.upload.canonical import CanonicalRow, validate_rows
 from featuregen.overlay.upload.enrich import classify_domains, draft_definitions, enrich_concepts
 from featuregen.overlay.upload.graph import build_graph
+from featuregen.overlay.upload.review_queue import persist_quarantine
 from featuregen.overlay.upload.upload_catalog import UploadCatalog, table_ref
 from featuregen.projections.runner import run_projection
 
@@ -84,4 +85,5 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
         definitions = draft_definitions(conn, vr.good, client)
         domains = classify_domains(conn, vr.good, client)
     build_graph(conn, catalog_source, vr.good, concepts, definitions, domains)
+    persist_quarantine(conn, catalog_source, vr.quarantined)
     return IngestResult("ingested", None, asserted, staled, len(vr.quarantined))
