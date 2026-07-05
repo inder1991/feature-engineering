@@ -611,3 +611,62 @@ def test_run_drift_scan_skips_and_cadence_gates(db):
     finally:
         _clear_catalog_adapter()
         _clear_overlay_config()
+
+
+def test_run_drift_scan_skips_when_overlay_projection_lags(db):
+    # deep-dive BLOCKER #1: a drift scan while the overlay projection LAGS would find zero dependents
+    # for a just-confirmed fact and launder the drop. It must skip (watermark un-advanced) until the
+    # projection catches up.
+    from datetime import UTC, datetime, timedelta
+
+    from featuregen.contracts import IdentityEnvelope
+    from featuregen.overlay import facts
+    from featuregen.overlay.catalog import (
+        FixtureCatalog,
+        _clear_catalog_adapter,
+        register_catalog_adapter,
+    )
+    from featuregen.overlay.catalog_changes import drift_watermark
+    from featuregen.overlay.config import (
+        OverlayConfig,
+        _clear_overlay_config,
+        register_overlay_config,
+    )
+    from featuregen.overlay.bootstrap import register_overlay
+    from featuregen.overlay.projection import OverlayProjection
+    from featuregen.overlay.store import append_overlay_event
+    from featuregen.projections.runner import run_projection
+    from featuregen.runtime.handlers import HandlerRegistry
+    from featuregen.runtime.worker import _run_drift_scan
+
+    now = datetime(2026, 6, 1, tzinfo=UTC)
+    register_overlay(HandlerRegistry())  # register overlay event schemas so the append validates
+    register_catalog_adapter(FixtureCatalog(catalog_source="pg:core"))
+    register_overlay_config(OverlayConfig(
+        ttl_default=timedelta(days=180), ttl_min=timedelta(days=30), ttl_max=timedelta(days=365),
+        ttl_jitter_fraction=0.0, renewal_grace=timedelta(days=14),
+        drift_scan_interval=timedelta(minutes=15), drift_freshness_sla=timedelta(minutes=60),
+        profiler_require_restricted_role=False,
+    ))
+    try:
+        # Append an overlay event but do NOT run the projection -> the overlay projection now lags.
+        append_overlay_event(
+            db, fact_key="fk-lag", type=facts.OVERLAY_FACT_PROPOSED,
+            actor=IdentityEnvelope(subject="user:o", actor_kind="human", authenticated=True,
+                                   auth_method="oidc", role_claims=("data_owner",)),
+            expected_version=0,
+            payload={"catalog_object_ref": {"catalog_source": "pg:core", "object_kind": "table",
+                                            "schema": "public", "table": "t"},
+                     "object_ref": "public.t", "fact_type": "grain",
+                     "proposed_value": {"columns": ["id"], "is_unique": True},
+                     "proposal_fingerprint": "fp", "proposed_by": "user:o"},
+        )
+        assert _run_drift_scan(db, now=now) == 0          # projection lags -> skip
+        assert drift_watermark(db, "pg:core") is None     # watermark NOT advanced
+
+        run_projection(db, OverlayProjection())           # projection catches up
+        _run_drift_scan(db, now=now)
+        assert drift_watermark(db, "pg:core") == now      # now the scan runs + advances
+    finally:
+        _clear_catalog_adapter()
+        _clear_overlay_config()

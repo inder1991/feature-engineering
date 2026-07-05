@@ -291,6 +291,15 @@ def _run_drift_scan(conn: psycopg.Connection, *, now: datetime) -> int:
     wm = drift_watermark(conn, csource)
     if wm is not None and (now - wm) < config.drift_scan_interval:
         return 0  # not due yet (slow cadence, not every tick)
+    # BLOCKER (deep-dive #1): drift finds dependents via the overlay projection's dependency index,
+    # which LAGS the event stream (the drift stage runs before the projection stage; the projection
+    # can also halt fail-closed on poison). Scanning while the projection is behind would find zero
+    # dependents for a just-confirmed fact, STALE nothing, and still advance the snapshot -> the drop
+    # is consumed and never re-detected (laundered for the full TTL). Skip until the overlay
+    # projection has applied every appended event; reads fail closed meanwhile via the aging watermark.
+    if projection_lag(conn, "overlay") > 0:
+        counters.incr("overlay.drift.skipped_projection_lag")
+        return 0
     return len(detect_catalog_changes(conn, adapter, actor=_drift_actor(), now=now))
 
 
