@@ -76,3 +76,18 @@ def test_confirm_gate1_records_choice_and_rejects_out_of_set(db):
         confirm_gate1(db, cs, chosen_source="alternative", chosen_option_id="ghost", actor="ds1")
     with pytest.raises(Gate1Error):        # 'anchor' source but not the anchor
         confirm_gate1(db, cs, chosen_source="anchor", chosen_option_id="not_the_anchor", actor="ds1")
+
+
+def test_confirm_gate1_validates_the_alternative_source(db):
+    # M2: an 'alternative' choice that is actually the anchor's name must be rejected
+    from featuregen.overlay.upload.contract.gate1 import ConsideredSet
+    from featuregen.overlay.upload.feature_assist import FeatureIdea, FeatureSet
+    _bank(db)
+    anchor = FeatureIdea("anchor_feat", "", ["public.accounts.balance"], "avg_90d", "accounts")
+    alt = FeatureSet("monetary",
+                     [FeatureIdea("alt_feat", "", ["public.accounts.balance"], "avg_90d", "accounts")])
+    cs = ConsideredSet("intent-x", anchor, [alt], None)
+    with pytest.raises(Gate1Error):
+        confirm_gate1(db, cs, chosen_source="alternative", chosen_option_id="anchor_feat", actor="ds1")
+    assert confirm_gate1(db, cs, chosen_source="alternative", chosen_option_id="alt_feat",
+                         actor="ds1") == "alt_feat"

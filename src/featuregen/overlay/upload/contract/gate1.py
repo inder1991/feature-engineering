@@ -55,8 +55,12 @@ def build_considered_set(conn, intent: Intent, client: LLMClient, *, entity: str
     return ConsideredSet(intent.intent_id, anchor, alternatives, recommendation)
 
 
+def _alternative_ids(cs: ConsideredSet) -> set[str]:
+    return {f.name for s in cs.alternatives for f in s.features}
+
+
 def _option_ids(cs: ConsideredSet) -> set[str]:
-    ids = {f.name for s in cs.alternatives for f in s.features}
+    ids = _alternative_ids(cs)
     if cs.anchor is not None:
         ids.add(cs.anchor.name)
     return ids
@@ -99,6 +103,8 @@ def confirm_gate1(conn, considered: ConsideredSet, *, chosen_source: str, chosen
     if chosen_source == "anchor" and (
             considered.anchor is None or considered.anchor.name != chosen_option_id):
         raise Gate1Error("chosen_source 'anchor' but the chosen option is not the anchor")
+    if chosen_source == "alternative" and chosen_option_id not in _alternative_ids(considered):
+        raise Gate1Error("chosen_source 'alternative' but the chosen option is not an alternative")
     conn.execute(
         "INSERT INTO contract_gate1_choice "
         "(intent_id, chosen_source, chosen_option_id, why, actor, considered) "

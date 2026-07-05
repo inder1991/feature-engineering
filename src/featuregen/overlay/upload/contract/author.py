@@ -8,11 +8,13 @@ it and Phase 5 persists the confirmed contract.
 """
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 
 from featuregen.intake.llm import LLMClient
 from featuregen.overlay.upload.enrich_llm import audited_enrich_call
 from featuregen.overlay.upload.feature_assist import FeatureIdea
+from featuregen.overlay.upload.read_scope import allowed_sensitivities
 
 
 @dataclass(frozen=True, slots=True)
@@ -34,23 +36,27 @@ def _as_of_column(conn, grain_table: str | None) -> str | None:
     return row[0] if row else None
 
 
-def _column_defs(conn, object_refs: list[str]) -> list[dict]:
+def _column_defs(conn, object_refs: list[str], roles: Iterable[str]) -> list[dict]:
+    # Read-scope (M1): never feed a sensitivity-tagged column the caller can't see to the LLM — same
+    # guard the discovery loop applies in _candidate_columns.
     if not object_refs:
         return []
     rows = conn.execute(
         "SELECT object_ref, column_name, concept, definition FROM graph_node "
-        "WHERE object_ref = ANY(%s)", (object_refs,)).fetchall()
+        "WHERE object_ref = ANY(%s) AND (sensitivity IS NULL OR sensitivity = ANY(%s))",
+        (object_refs, allowed_sensitivities(roles))).fetchall()
     return [{"object_ref": r[0], "column": r[1], "concept": r[2], "definition": r[3]} for r in rows]
 
 
-def draft_contract(conn, feature: FeatureIdea, client: LLMClient, *, actor=None) -> ContractDraft:
+def draft_contract(conn, feature: FeatureIdea, client: LLMClient, *, actor=None,
+                   roles: Iterable[str] = ()) -> ContractDraft:
     """Author a contract draft for the chosen feature. Structured facts deterministic; the definition
-    narrative LLM-authored via the audited seam (metadata only)."""
+    narrative LLM-authored via the audited seam (metadata only, read-scoped by roles)."""
     definition = audited_enrich_call(
         conn, client, task="overlay.contract.draft", prompt_id="overlay_contract_v1",
         schema_id="overlay_contract",
         catalog_metadata={"feature": feature.name, "aggregation": feature.aggregation or "",
-                          "columns": _column_defs(conn, feature.derives_from)},
+                          "columns": _column_defs(conn, feature.derives_from, roles)},
         out_key="definition",
         instruction="Write a concise business definition of this feature from its columns and "
                     "aggregation — what it measures and at what grain. Metadata only; no data values.",
