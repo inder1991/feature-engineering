@@ -73,6 +73,15 @@ def build_graph(conn, catalog_source: str, rows: list[CanonicalRow],
                 "VALUES (%s, 'joins', %s, %s, %s) ON CONFLICT DO NOTHING",
                 (catalog_source, c_ref, to_ref, r.cardinality or None))
 
+    # Re-apply human-confirmed entity tags (entity_suggestion). The graph was just rebuilt from the
+    # upload, which may not declare these; a confirmed tag must survive re-upload. Only fills a blank —
+    # a freshly-declared entity on the upload wins.
+    conn.execute(
+        "UPDATE graph_node n SET entity = s.suggested_entity FROM entity_suggestion s "
+        "WHERE s.catalog_source = n.catalog_source AND s.object_ref = n.object_ref "
+        "AND s.status = 'applied' AND n.catalog_source = %s AND n.entity IS NULL",
+        (catalog_source,))
+
 
 @dataclass(frozen=True, slots=True)
 class JoinEdge:
@@ -86,7 +95,9 @@ def column_joins(conn, catalog_source: str, object_ref: str) -> list[JoinEdge]:
     """The join edges out of a column — including ones whose target isn't loaded yet (pending)."""
     rows = conn.execute(
         "SELECT e.from_ref, e.to_ref, e.cardinality, "
-        "  EXISTS(SELECT 1 FROM graph_node n WHERE n.object_ref = e.to_ref) AS resolved "
+        # M5: scope by catalog — a cross-source target present in ANOTHER catalog is NOT resolved here.
+        "  EXISTS(SELECT 1 FROM graph_node n WHERE n.object_ref = e.to_ref "
+        "         AND n.catalog_source = e.catalog_source) AS resolved "
         "FROM graph_edge e "
         "WHERE e.catalog_source = %s AND e.kind = 'joins' AND e.from_ref = %s "
         "ORDER BY e.to_ref",

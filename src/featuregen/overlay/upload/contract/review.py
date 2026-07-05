@@ -39,7 +39,7 @@ def validate_minimum(conn, draft: ContractDraft, *, target_ref: str | None = Non
     for cs, ref in draft.derives_pairs:
         src_of.setdefault(ref, set()).add(cs)
     idea, reason = _validate_idea(conn, raw, known, src_of, target_ref, now, fresh_within)
-    return (idea is not None, [] if idea is not None else [reason])
+    return (idea is not None, [] if idea is not None else [reason.message])
 
 
 def critique_contract(conn, draft: ContractDraft, client: LLMClient, *, actor=None) -> list[str]:

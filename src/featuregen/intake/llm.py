@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from typing import Any, Protocol, runtime_checkable
@@ -18,22 +17,9 @@ from typing import Any, Protocol, runtime_checkable
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
-from featuregen.contracts import IdentityEnvelope, SchemaValidationError
+from featuregen.contracts import SchemaValidationError
 from featuregen.contracts.db import DbConn
-from featuregen.contracts.identity import identity_to_jsonb
-from featuregen.documents.registry import DocumentSchemaRegistry
 from featuregen.idgen import mint_id
-from featuregen.intake.events import LLM_CALL_RECORDED  # R17 — IMPORTED, never redeclared here
-from featuregen.intake.redaction import (
-    INPUT_KEY_REDACTION,
-    INPUT_KEY_REDACTION_VERSION,
-    EgressViolation,
-    assert_llm_safe,
-)
-from featuregen.intake.store import (
-    append_feature_contract_event,  # R1 — the ONE FC append seam (P1)
-)
-from featuregen.security.audit import record_security_event
 
 # ---- shared-contract shapes (overview §9.1) -------------------------------------------------
 
@@ -285,8 +271,7 @@ def current_llm_client() -> LLMClient:
     """Return the registered LLMClient; fail closed (RuntimeError) if none is registered."""
     if _LLM_CLIENT is None:
         raise RuntimeError(
-            "no LLMClient registered; call register_llm_client(...) "
-            "(register_sp2()/_wire does this)"
+            "no LLMClient registered; call register_llm_client(...)"
         )
     return _LLM_CLIENT
 
@@ -435,142 +420,3 @@ def find_llm_call(
             if rec.validation_result.get("result") in _REUSABLE_STATUSES:
                 return rec
     return None
-
-
-def _result_from_record(rec: LLMCallRecord) -> LLMResult:
-    """Rebuild the caller-facing LLMResult from a stored record (idempotent reuse — no new call)."""
-    return LLMResult(
-        output=dict(rec.raw_output.get("output", {})),
-        self_reported_scores=dict(rec.raw_output.get("self_reported_scores", {})),
-        call_ref=rec.llm_call_ref,
-        status=rec.validation_result.get("result", STATUS_FAILED),
-        cost_metadata=dict(rec.cost_metadata or {}),  # N9 — preserve captured cost on the reuse path
-    )
-
-
-# ---- the event-sourced wrapper (§9.1, §9.3) -------------------------------------------------
-# NOTE (R17): LLM_CALL_RECORDED is IMPORTED from featuregen.intake.events (P1) above — it is the
-# single source for the constant and is NEVER redeclared here.
-
-
-def call_llm(
-    conn: DbConn,
-    client: LLMClient,
-    request: LLMRequest,
-    *,
-    run_id: str,
-    actor: IdentityEnvelope,
-) -> LLMResult:
-    """The auditable-LLM entry point every SP-2 agent uses (§9.1). Egress-guards (hard-fails a
-    violation into the security-audit stream, no dispatch), dedups on the full call identity
-    (reuse ⟹ no new call/record/event), drives the §9.2 taxonomy validating against the registered
-    output-schema, records ONE immutable llm_call, and emits LLM_CALL_RECORDED on the
-    feature_contract aggregate. Returns the final LLMResult (STATUS_*) with the real call_ref."""
-    # 1. Egress hard-backstop (§9.4). A violation is a hard failure recorded in the security-audit
-    #    stream — never a value, never a warning; no payload is dispatched.
-    try:
-        assert_llm_safe(request)
-    except EgressViolation as exc:
-        record_security_event(
-            conn,
-            event_type="LLM_EGRESS_BLOCKED",
-            actor=actor,
-            attempted_action="call_llm",
-            decision="denied",
-            reason=str(exc),
-            aggregate="feature_contract",
-            aggregate_id=run_id,
-        )
-        raise
-
-    input_hash = compute_input_hash(request.inputs)
-    redaction_version = request.inputs.get(INPUT_KEY_REDACTION_VERSION, "unversioned")
-    input_redaction = request.inputs.get(INPUT_KEY_REDACTION, {})
-    gs = request.generation_settings
-
-    # 2. Idempotency: a truly identical retry reuses its record (no double-charge, §9.3).
-    existing = find_llm_call(
-        conn,
-        run_id=run_id, task=request.task, input_hash=input_hash,
-        provider=gs.get("provider"), model=gs.get("model"),
-        prompt_id=request.prompt_id, prompt_version=request.prompt_version,
-        output_schema_id=request.output_schema_id,
-        output_schema_version=request.output_schema_version,
-        redaction_version=redaction_version, generation_settings=gs,
-    )
-    if existing is not None:
-        return _result_from_record(existing)
-
-    # 3. Drive the structured call, validating the LLM output against the REGISTERED output-schema
-    #    (structural-only; server-compiled/cross-call-cached in the real adapter, §9.1).
-    doc_registry = DocumentSchemaRegistry(conn)
-
-    def validate_output(output: Mapping[str, Any]) -> None:
-        doc_registry.validate(request.output_schema_id, request.output_schema_version, output)
-
-    # N11 — attach the resolved structural output-schema so a provider adapter can ENFORCE structured
-    # output (output_config.format). Inputs-only identity/hash is unchanged; FakeLLM ignores it.
-    request = replace(
-        request,
-        output_schema=doc_registry.schema_for(request.output_schema_id, request.output_schema_version),
-    )
-    t0 = time.monotonic()
-    outcome = drive_structured_call(client, request, validate_output)
-    latency_ms = int((time.monotonic() - t0) * 1000)
-
-    # 4. Record the immutable, replayable llm_call (redacted input stored, not hash-only, §9.3).
-    call_ref = record_llm_call(
-        conn,
-        run_id=run_id, request=request, input_hash=input_hash,
-        redaction_version=redaction_version, input_redaction=input_redaction,
-        raw_output={"output": outcome.output, "self_reported_scores": outcome.self_reported_scores},
-        validation_result=outcome.validation_result, repair_attempts=list(outcome.repair_attempts),
-        latency_ms=latency_ms, cost_metadata=outcome.cost_metadata,
-        created_by=identity_to_jsonb(actor),
-    )
-
-    # 5. Auth failures are additionally security-audited (§9.2), never silently swallowed.
-    if outcome.security_audit_reason:
-        record_security_event(
-            conn,
-            event_type="LLM_PROVIDER_AUTH_FAILURE",
-            actor=actor,
-            attempted_action="call_llm",
-            decision="denied",
-            reason=outcome.security_audit_reason,
-            aggregate="feature_contract",
-            aggregate_id=run_id,
-        )
-
-    # 6. Emit LLM_CALL_RECORDED on the feature_contract aggregate via the R1 store seam.
-    #    append_feature_contract_event sets aggregate="feature_contract",
-    #    aggregate_id == feature_contract_id == run_id, and the run_id mirror column ALWAYS
-    #    populated (= run_id, non-null, for correlation) — feature_id ALWAYS NULL, request_id
-    #    optional (X3 one event-identity invariant, mirrors 0504's overlay branch). This is NEVER
-    #    appended on the `run` aggregate; call_llm never touches the low-level
-    #    featuregen.aggregates._append.append. The redacted body lives in the store (referenced by
-    #    call_ref), never inlined in the event. Payload is SEMANTIC-only (R2 — no id fields;
-    #    feature_contract_id/run_id ride the typed columns).
-    #    X4: LLM_CALL_RECORDED is a NON-lifecycle audit event — fold_feature_contract_state ignores
-    #    it and call_llm makes no fold-based decision here, so the append rides current head
-    #    (expected_version=None is correct) and is NOT subject to the folded-head CAS rule (that
-    #    rule governs the lifecycle-transition commands in P4/P5/P7/P8, not this audit append).
-    append_feature_contract_event(
-        conn,
-        run_id=run_id,
-        type=LLM_CALL_RECORDED,
-        payload={
-            "llm_call_ref": call_ref,
-            "task": request.task,
-            "status": outcome.status,
-            "validation_result": outcome.validation_result.get("result"),
-        },
-        actor=actor,
-    )
-
-    return LLMResult(
-        output=outcome.output,
-        self_reported_scores=outcome.self_reported_scores,
-        call_ref=call_ref,
-        status=outcome.status,
-    )

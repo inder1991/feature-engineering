@@ -7,6 +7,13 @@ from featuregen.api.app import create_app
 from featuregen.api.deps import get_conn
 
 
+@pytest.fixture(autouse=True)
+def _auth_stub(monkeypatch):
+    """API tests authenticate via the X-User/X-Roles stub; enable it (OFF by default in prod). Tests
+    that exercise real Bearer login/logout override this back to '0' explicitly."""
+    monkeypatch.setenv("FEATUREGEN_AUTH_STUB", "1")
+
+
 @pytest.fixture
 def make_client(conn):
     """Build a TestClient whose requests run on the suite's rolled-back connection.

@@ -11,19 +11,32 @@ proposals only.
 """
 from __future__ import annotations
 
+import logging
 import re
 from collections.abc import Iterable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 
-from featuregen.intake.llm import LLMClient, LLMRequest
+from featuregen.intake.llm import LLMClient
 from featuregen.overlay.catalog_changes import drift_watermark
+from featuregen.overlay.upload.enrich_llm import audited_structured_call
 from featuregen.overlay.upload.join_path import JoinStep, find_join_path
 from featuregen.overlay.upload.read_scope import allowed_sensitivities
 
-_WINDOW_RE = re.compile(r"\d+\s*[dwmy]\b")   # 90d, 30 d, 12m, 1y
+logger = logging.getLogger(__name__)
+
+# A number + a time unit, tolerating space/underscore separators: 90d, 30 d, 12m, "90 days",
+# "last_12_months", "1y". (`[\s_]*` so "12_months" matches; unit optionally pluralised.)
+_WINDOW_RE = re.compile(
+    r"\d+[\s_]*(?:d|w|m|y|h|day|week|month|year|hour|qtr|quarter)s?\b")
+# Time-window vocabulary that carries no digit. Widened after review (naming-based detection is
+# inherently incomplete — the real fix is structured aggregation metadata, tracked as a follow-up).
 _WINDOW_WORDS = ("trend", "rolling", "window", "velocity", "growth", "over_time", "all_time",
-                 "delta", "moving")
+                 "delta", "moving", "cumulative", "running", "ytd", "mtd", "qtd", "since",
+                 "lifetime", "recent", "lag", "daily", "weekly", "monthly", "quarterly",
+                 "annual", "yearly", "period")
+# Aggregations that sum values over rows/time — unsafe on a semi/non-additive measure.
+_UNSAFE_ADDITIVE_WORDS = ("sum", "total", "cumulative", "running", "net_", "aggregate")
 
 
 def _is_windowed(aggregation: str | None) -> bool:
@@ -31,12 +44,45 @@ def _is_windowed(aggregation: str | None) -> bool:
     return bool(_WINDOW_RE.search(a)) or any(w in a for w in _WINDOW_WORDS)
 
 
-def _call_raw(client: LLMClient, task: str, prompt_id: str, schema_id: str, inputs: dict) -> dict:
-    req = LLMRequest(
-        task=task, prompt_id=prompt_id, prompt_version=1, inputs=inputs,
-        output_schema_id=schema_id, output_schema_version=1,
-        generation_settings={"provider": "fake", "model": "test"})
-    out = client.call(req).output
+def _is_additive_unsafe(aggregation: str | None) -> bool:
+    a = (aggregation or "").lower()
+    return any(w in a for w in _UNSAFE_ADDITIVE_WORDS)
+
+
+class RejectCode:
+    """Machine-readable gauntlet rejection codes (SP-12 reserved single-scorer/rejection-enum hook).
+    Deterministic-gate codes plus the loop's quality codes (redundant / already-registered / critic)."""
+    UNGROUNDED = "UNGROUNDED"
+    AMBIGUOUS_CATALOG = "AMBIGUOUS_CATALOG"
+    UNKNOWN_COLUMN = "UNKNOWN_COLUMN"
+    LEAKAGE = "LEAKAGE"
+    STALE = "STALE"
+    ADDITIVITY = "ADDITIVITY"
+    MIXED_UNITS = "MIXED_UNITS"
+    MIXED_CURRENCY = "MIXED_CURRENCY"
+    NO_POINT_IN_TIME = "NO_POINT_IN_TIME"
+    REDUNDANT = "REDUNDANT"                 # near-duplicate of an already-accepted candidate (item 1a)
+    ALREADY_REGISTERED = "ALREADY_REGISTERED"   # duplicates a confirmed/registered feature (item 2)
+    CRITIC = "CRITIC"                       # LLM-2 critic flagged a quality/fit issue (item 5)
+
+
+@dataclass(frozen=True, slots=True)
+class Rejection:
+    code: str
+    message: str
+
+    def __str__(self) -> str:
+        return self.message
+
+
+def _call_raw(conn, client: LLMClient, task: str, prompt_id: str, schema_id: str,
+              instruction: str, catalog_metadata: dict) -> dict:
+    """Every feature-assist LLM call goes through the AUDITED seam (M6): the egress guard scans the
+    user text (`instruction`) + metadata before dispatch, and the call is recorded in llm_call. Was a
+    raw client.call() that skipped both — a real leak against a non-fake provider."""
+    out = audited_structured_call(
+        conn, client, task=task, prompt_id=prompt_id, schema_id=schema_id,
+        catalog_metadata=catalog_metadata, instruction=instruction)
     return out if isinstance(out, dict) else {}
 
 
@@ -74,15 +120,28 @@ class FeatureIdea:
     # B3: (catalog_source, object_ref) resolved at recommend time from the candidate context, so
     # downstream carries the catalog and never re-derives it ambiguously from the whole graph.
     derives_pairs: tuple[tuple[str, str], ...] = ()
+    # §14.5 honest verification stamp. In the no-DB world a gauntlet-passed candidate is DESIGN-CHECKED
+    # (structurally safe — leakage/freshness/additivity/point-in-time); predictive value is unverified
+    # until a downstream backtest (DATA-/USEFULNESS-CHECKED). Never a production-ready claim.
+    verification: str = "DESIGN-CHECKED"
+    # Residual ADVISORY note from the LLM-2 critic when it was still unsatisfied after the review cap —
+    # the feature goes forward to Gate #1 carrying it, and the HUMAN decides whether it's a fit.
+    critic_note: str = ""
 
 
-def _column_meta(conn, object_refs: list[str]) -> dict[str, dict]:
-    if not object_refs:
+def _column_meta(conn, pairs: list[tuple[str, str]]) -> dict[str, dict]:
+    """Additivity/catalog for each (catalog_source, object_ref) pair — scoped to the EXACT pair, so a
+    same-named column in another catalog cannot contaminate the reading (M3), and a fabricated pair is
+    simply absent from the result (used for the M4 existence check)."""
+    if not pairs:
         return {}
+    refs = [ref for _, ref in pairs]
     rows = conn.execute(
-        "SELECT object_ref, catalog_source, additivity FROM graph_node WHERE object_ref = ANY(%s)",
-        (object_refs,)).fetchall()
-    return {r[0]: {"catalog_source": r[1], "additivity": r[2]} for r in rows}
+        "SELECT catalog_source, object_ref, additivity, unit, currency FROM graph_node "
+        "WHERE kind = 'column' AND object_ref = ANY(%s)", (refs,)).fetchall()
+    wanted = set(pairs)
+    return {ref: {"catalog_source": cs, "additivity": add, "unit": unit, "currency": cur}
+            for cs, ref, add, unit, cur in rows if (cs, ref) in wanted}
 
 
 def _table_has_as_of(conn, catalog_source: str, table: str) -> bool:
@@ -100,36 +159,139 @@ def _validate_idea(conn, raw: dict, known: set[str], src_of: dict[str, set[str]]
     source(s) it lives in within the candidate context, used to resolve each derive's catalog (B3)."""
     derives = [d for d in raw.get("derives_from", []) if d in known]
     if not derives:
-        return None, "ungrounded"
+        return None, Rejection(RejectCode.UNGROUNDED, "ungrounded")
     # B3: resolve each derive to exactly one catalog_source from the candidate context. If a bare
     # object_ref maps to >1 catalog we cannot know which the LLM meant -> fail closed.
     pairs: list[tuple[str, str]] = []
     for d in derives:
         srcs = src_of.get(d, set())
         if len(srcs) != 1:
-            return None, f"ambiguous catalog for {d}"
+            return None, Rejection(RejectCode.AMBIGUOUS_CATALOG, f"ambiguous catalog for {d}")
         pairs.append((next(iter(srcs)), d))
+    # M4: verify each resolved (catalog_source, object_ref) pair actually EXISTS as a graph node.
+    # `src_of` may be client-supplied over HTTP (the MCV path) — a fabricated catalog must fail closed,
+    # not sail through freshness on a catalog the column doesn't live in. _column_meta is pair-scoped.
+    meta = _column_meta(conn, pairs)
+    for src, d in pairs:
+        if d not in meta or meta[d]["catalog_source"] != src:
+            return None, Rejection(RejectCode.UNKNOWN_COLUMN, f"unknown column {d} in catalog {src}")
     if target_ref and target_ref in derives:
-        return None, "leaks target"
+        return None, Rejection(RejectCode.LEAKAGE, "leaks target")
     if now is not None:   # freshness — every RESOLVED source must be fresh
         for src in {p[0] for p in pairs}:
             wm = drift_watermark(conn, src)
             if wm is None or wm < now - fresh_within:
-                return None, f"stale source: {src}"
-    meta = _column_meta(conn, derives)
-    if "sum" in (raw.get("aggregation") or "").lower():   # aggregation safety (additivity)
+                return None, Rejection(RejectCode.STALE, f"stale source: {src}")
+    if _is_additive_unsafe(raw.get("aggregation")):   # aggregation safety (additivity) — M2 widened
         for d in derives:
             if meta.get(d, {}).get("additivity") in ("semi_additive", "non_additive"):
-                return None, f"unsafe SUM of {d}"
+                return None, Rejection(RejectCode.ADDITIVITY, f"unsafe additive aggregation of {d}")
+    # unit/currency safety: combining columns of mixed scale (dollars vs cents) / currency is
+    # silently wrong (migration 0957). Reject when the derives span >1 distinct non-empty unit/currency.
+    units = {meta[d]["unit"] for d in derives if meta.get(d, {}).get("unit")}
+    currencies = {meta[d]["currency"] for d in derives if meta.get(d, {}).get("currency")}
+    if len(units) > 1:
+        return None, Rejection(RejectCode.MIXED_UNITS,
+                               f"mixed units {sorted(units)} — aggregation would be silently wrong")
+    if len(currencies) > 1:
+        return None, Rejection(RejectCode.MIXED_CURRENCY, f"mixed currencies {sorted(currencies)}")
     if _is_windowed(raw.get("aggregation")):   # point-in-time: a windowed feature needs an as-of column
         for src, d in pairs:
             # object_ref is "[catalog.]schema.table.column"; table is the second-to-last segment.
             if d.count(".") >= 2 and not _table_has_as_of(conn, src, d.split(".")[-2]):
-                return None, f"no point-in-time basis for {d} (future-leakage risk)"
+                return None, Rejection(RejectCode.NO_POINT_IN_TIME,
+                                       f"no point-in-time basis for {d} (future-leakage risk)")
     return FeatureIdea(
         name=str(raw.get("name", "")), description=str(raw.get("description", "")),
         derives_from=derives, aggregation=raw.get("aggregation"),
-        grain_table=raw.get("grain_table"), derives_pairs=tuple(pairs)), "ok"
+        grain_table=raw.get("grain_table"), derives_pairs=tuple(pairs)), None
+
+
+def _redundant_of(idea: FeatureIdea, accepted: list[FeatureIdea]) -> bool:
+    """A candidate is redundant if an already-accepted feature derives from the SAME columns with the
+    same aggregation — a re-proposal under a new name (`seen` only catches identical names). (item 1a)"""
+    sig = (frozenset(idea.derives_pairs), idea.aggregation)
+    return any((frozenset(a.derives_pairs), a.aggregation) == sig for a in accepted)
+
+
+def _registered_signatures(conn) -> set[tuple[frozenset, str | None]]:
+    """(frozenset of (catalog_source, object_ref), aggregation) for every REGISTERED feature — so the
+    loop skips a candidate that duplicates an already-confirmed feature (§7.5 full-space dedup, item 2)."""
+    rows = conn.execute(
+        "SELECT f.feature_id, f.aggregation, d.catalog_source, d.object_ref FROM feature f "
+        "LEFT JOIN feature_derives_from d ON d.feature_id = f.feature_id").fetchall()
+    by_feat: dict[tuple[str, str | None], set] = {}
+    for fid, agg, cs, ref in rows:
+        entry = by_feat.setdefault((fid, agg), set())
+        if cs and ref:
+            entry.add((cs, ref))
+    return {(frozenset(pairs), agg) for (fid, agg), pairs in by_feat.items()}
+
+
+def _critique_candidates(conn, client: LLMClient, objective: str,
+                         candidates: list[FeatureIdea]) -> dict[str, str]:
+    """LLM-2 critic (item 5): reviews the generator's gauntlet-passed candidates against the hypothesis
+    and returns {feature_name: issue} for any with a QUALITY/FIT problem the deterministic gauntlet
+    cannot express (weak hypothesis fit, semantic/proxy leakage, redundancy, vague grounding, wrong
+    grain). Its findings are fed back to the GENERATOR to fix. ADVISORY: fails OPEN — if the critic
+    provider errors or is absent, generation proceeds without it (never breaks the loop, like ingest
+    enrichment)."""
+    if not candidates:
+        return {}
+    summary = [{"name": f.name, "derives_from": f.derives_from, "aggregation": f.aggregation,
+                "grain_table": f.grain_table} for f in candidates]
+    try:
+        out = _call_raw(
+            conn, client, "overlay.feature.critique_candidates", "feature_candidate_critique_v1",
+            "feature_candidate_critique", objective, {"candidates": summary})
+    except Exception:  # noqa: BLE001 — the critic is advisory; its failure must not break generation
+        logger.warning("candidate critic unavailable; proceeding without it", exc_info=True)
+        return {}
+    return {str(i.get("name", "")): str(i.get("issue", ""))
+            for i in out.get("issues", [])
+            if isinstance(i, dict) and i.get("name") and i.get("issue")}
+
+
+def _vet(conn, raw: dict, known: set[str], src_of: dict[str, set[str]], registered: set,
+         accepted: list[FeatureIdea], seen: set[str], avoid: list[dict],
+         target_ref, now, fresh_within) -> FeatureIdea | None:
+    """Gauntlet + dedup for one raw candidate. Returns the FeatureIdea to accept, or None (recording a
+    structured rejection in `avoid`). Shared by the generation loop and the single critic-fix pass."""
+    idea, rej = _validate_idea(conn, raw, known, src_of, target_ref, now, fresh_within)
+    if rej is not None:
+        avoid.append({"name": raw.get("name", ""), "reason": rej.message, "code": rej.code})
+        return None
+    if idea.name in seen:
+        return None
+    if _redundant_of(idea, accepted):
+        avoid.append({"name": idea.name, "reason": "duplicates an accepted feature",
+                      "code": RejectCode.REDUNDANT})
+        return None
+    if (frozenset(idea.derives_pairs), idea.aggregation) in registered:
+        avoid.append({"name": idea.name, "reason": "already a registered feature",
+                      "code": RejectCode.ALREADY_REGISTERED})
+        return None
+    return idea
+
+
+def _fix_pass(conn, client: LLMClient, objective: str, accepted: list[FeatureIdea],
+              issues: dict[str, str], menu: list[dict], known: set[str],
+              src_of: dict[str, set[str]], registered: set,
+              target_ref, now, fresh_within) -> list[FeatureIdea]:
+    """One LLM-1 revision pass: keep the critic-clean features; ask LLM-1 to revise the flagged ones
+    given the critic's notes; gauntlet-validate the revisions. Returns the merged list."""
+    keep = [f for f in accepted if f.name not in issues]
+    seen = {f.name for f in keep}
+    fix_hints = [{"name": f.name, "derives_from": f.derives_from, "aggregation": f.aggregation,
+                  "issue": issues[f.name]} for f in accepted if f.name in issues]
+    out = _call_raw(conn, client, "overlay.feature.recommend", "feature_recommend_v1",
+                    "feature_ideas", objective, {"columns": menu, "fix": fix_hints})
+    for raw in out.get("features", []):
+        idea = _vet(conn, raw, known, src_of, registered, keep, seen, [], target_ref, now, fresh_within)
+        if idea is not None:
+            keep.append(idea)
+            seen.add(idea.name)
+    return keep
 
 
 def recommend_features(conn, objective: str, client: LLMClient, *,
@@ -137,33 +299,66 @@ def recommend_features(conn, objective: str, client: LLMClient, *,
                        entity: str | None = None,
                        target_ref: str | None = None, now: datetime | None = None,
                        fresh_within: timedelta = timedelta(hours=24),
-                       target: int = 5, budget: int = 3) -> list[FeatureIdea]:
-    """Bounded generate-validate-refine loop. Each round the LLM proposes; every candidate runs the
-    deterministic gauntlet; rejections feed back as `avoid` hints to the next round; stops at `target`
-    accepted or `budget` rounds. The LLM only proposes — code owns the loop, the checks are deterministic.
-    Pass `entity` to gather candidates CROSS-DOMAIN (every catalog containing that entity)."""
+                       target: int = 5, budget: int = 3, critic: bool = True,
+                       critic_reviews: int = 3) -> list[FeatureIdea]:
+    """Generate (LLM-1) → a BOUNDED critic loop (LLM-2), then forward to the human.
+
+      Phase 1 — GENERATION (LLM-1): a budget-bounded generate-validate loop. Each round LLM-1 proposes;
+        every candidate clears the deterministic gauntlet (the hard safety floor); survivors are
+        de-duplicated (vs this run — item 1a — and the registry — item 2). Stops at `target` or `budget`.
+      Phase 2 — CRITIC LOOP (LLM-2), AT MOST `critic_reviews` (default 3) reviews: the critic reviews the
+        candidates; if it flags any, LLM-1 revises them (one fix pass) and the critic reviews again —
+        UP TO the cap. The loop exits early the moment the critic is clean.
+      Phase 3 — FORWARD TO HUMAN: whatever LLM-1 produced after the review cap goes forward; a still-
+        flagged feature carries the critic's residual note as ADVISORY, and the HUMAN decides fit at
+        Gate #1. Nothing is dropped for a critic note alone — only the deterministic gauntlet can drop.
+
+    TERMINATION: the critic runs at most `critic_reviews` times and LLM-1 fixes at most `critic_reviews-1`
+    times — a hard cap, so there is never an unbounded LLM-1↔LLM-2 loop. `budget` bounds only Phase 1.
+
+    Pass `entity` to gather candidates CROSS-DOMAIN; `critic=False` skips the critic loop."""
     cols = _candidate_columns(conn, catalog_source, roles, entity)
     known = {c["object_ref"] for c in cols}
     src_of: dict[str, set[str]] = {}          # object_ref -> catalog_source(s) in the candidate context
     for c in cols:
         src_of.setdefault(c["object_ref"], set()).add(c["catalog_source"])
+    registered = _registered_signatures(conn)
+    menu = _menu(cols)
+
+    # ---- Phase 1: generation (LLM-1 only; deterministic refinement, budget-bounded) ----
     accepted: list[FeatureIdea] = []
     seen: set[str] = set()
     avoid: list[dict] = []
     for _ in range(budget):
         if len(accepted) >= target:
             break
-        out = _call_raw(client, "overlay.feature.recommend", "feature_recommend_v1", "feature_ideas",
-                        {"objective": objective, "columns": _menu(cols), "avoid": avoid})
-        for raw in out.get("features", []):
-            idea, reason = _validate_idea(conn, raw, known, src_of, target_ref, now, fresh_within)
-            if idea is None:
-                avoid.append({"name": raw.get("name", ""), "reason": reason})   # refine
-                continue
-            if idea.name in seen:
-                continue
-            accepted.append(idea)
-            seen.add(idea.name)
+        out = _call_raw(conn, client, "overlay.feature.recommend", "feature_recommend_v1",
+                        "feature_ideas", objective, {"columns": menu, "avoid": avoid})
+        proposed = out.get("features", [])
+        if not proposed:                       # stalled generator -> stop
+            break
+        for raw in proposed:
+            idea = _vet(conn, raw, known, src_of, registered, accepted, seen, avoid,
+                        target_ref, now, fresh_within)
+            if idea is not None:
+                accepted.append(idea)
+                seen.add(idea.name)
+
+    # ---- Phase 2: bounded critic loop (AT MOST `critic_reviews` reviews) ----
+    issues: dict[str, str] = {}
+    if critic:
+        for i in range(max(0, critic_reviews)):
+            issues = _critique_candidates(conn, client, objective, accepted)
+            if not issues:
+                break                          # critic satisfied — nothing to fix
+            if i < critic_reviews - 1:         # not the last allowed review -> let LLM-1 fix, re-review
+                accepted = _fix_pass(conn, client, objective, accepted, issues, menu, known, src_of,
+                                     registered, target_ref, now, fresh_within)
+
+    # ---- Phase 3: forward to the human; residual critic notes ride along as ADVISORY ----
+    if issues:
+        accepted = [f if f.name not in issues else replace(f, critic_note=issues[f.name])
+                    for f in accepted]
     return accepted[:target]
 
 
@@ -181,8 +376,8 @@ def feature_recipe(conn, nl_query: str, client: LLMClient, *, catalog_source: st
                    roles: Iterable[str] = ()) -> Recipe:
     cols = _candidate_columns(conn, catalog_source, roles)
     known = {c["object_ref"] for c in cols}
-    out = _call_raw(client, "overlay.feature.recipe", "feature_recipe_v1", "feature_recipe",
-                    {"query": nl_query, "columns": _menu(cols)})
+    out = _call_raw(conn, client, "overlay.feature.recipe", "feature_recipe_v1", "feature_recipe",
+                    nl_query, {"columns": _menu(cols)})
     derives = [d for d in out.get("derives_from", []) if d in known]
     grain = out.get("grain_table")
     join_table = out.get("join_table")
@@ -204,7 +399,8 @@ class LeakageWarning:
 def leakage_check(conn, derives_from: list[str], target_ref: str,
                   client: LLMClient) -> list[LeakageWarning]:
     used = set(derives_from)
-    out = _call_raw(client, "overlay.feature.leakage", "feature_leakage_v1", "leakage",
+    out = _call_raw(conn, client, "overlay.feature.leakage", "feature_leakage_v1", "leakage",
+                    "Flag columns that leak the prediction target.",
                     {"derives_from": list(derives_from), "target": target_ref})
     return [LeakageWarning(object_ref=w["object_ref"], reason=str(w.get("reason", "")))
             for w in out.get("leaks", [])
@@ -243,16 +439,33 @@ def recommend_feature_sets(conn, objective: str, client: LLMClient, *,
     ]
 
 
+def set_signals(conn, feature_set: FeatureSet) -> dict:
+    """Deterministic ranking signals for a set (item 1b) — computed WITHOUT data, BEFORE the LLM's
+    advisory fit pick: size, distinct source columns, and domain coverage (distinct domains the set's
+    features span). More domains covered + fewer duplicate columns = a broader, less redundant set."""
+    refs = {ref for f in feature_set.features for _, ref in f.derives_pairs}
+    domains: set[str] = set()
+    if refs:
+        rows = conn.execute(
+            "SELECT DISTINCT domain FROM graph_node WHERE object_ref = ANY(%s) AND domain IS NOT NULL",
+            (list(refs),)).fetchall()
+        domains = {r[0] for r in rows}
+    return {"size": len(feature_set.features), "distinct_columns": len(refs),
+            "domains_covered": len(domains), "domains": sorted(domains)}
+
+
 def recommend_set(conn, sets: list[FeatureSet], hypothesis: str,
                   client: LLMClient) -> SetRecommendation:
     """Advisory: the LLM reasons over the validated sets + the analyst's HYPOTHESIS (+ the metadata
     already in each feature) and recommends one, WITH reasons — a fit/coverage judgment, never a
     performance prediction (see SetRecommendation.caveat)."""
-    summary = [{"lens": s.lens,
+    # Deterministic signals FIRST (coverage/redundancy), so the LLM's advisory fit pick is informed by
+    # them rather than judging on prose alone (item 1b — "rank on deterministic signals first").
+    summary = [{"lens": s.lens, "signals": set_signals(conn, s),
                 "features": [{"name": f.name, "derives_from": f.derives_from,
                               "aggregation": f.aggregation} for f in s.features]} for s in sets]
-    out = _call_raw(client, "overlay.feature.recommend_set", "feature_set_v1", "feature_set_rec",
-                    {"hypothesis": hypothesis, "sets": summary})
+    out = _call_raw(conn, client, "overlay.feature.recommend_set", "feature_set_v1",
+                    "feature_set_rec", hypothesis, {"sets": summary})
     default = sets[0].lens if sets else ""
     return SetRecommendation(recommended_lens=str(out.get("recommended_lens", default)),
                              reasoning=str(out.get("reasoning", "")))

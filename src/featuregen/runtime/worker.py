@@ -127,9 +127,9 @@ def _park_run(conn: psycopg.Connection, *, run_id: str, actor, payload) -> None:
     Phase-06 aggregate (mirrors dispatch.py). Idempotent: never re-parks an already-parked run and
     never parks a terminal run (mirrors intake/commands.py's bounded-exhaustion auto-park guard)."""
     from featuregen.aggregates.run_lifecycle import park_command, run_is_terminal
-    from featuregen.intake.commands import _run_is_parked
+    from featuregen.runtime._park import run_is_parked
 
-    if run_is_terminal(conn, run_id) or _run_is_parked(conn, run_id):
+    if run_is_terminal(conn, run_id) or run_is_parked(conn, run_id):
         return
     park_command(
         conn,
@@ -496,8 +496,7 @@ def compose(conn: psycopg.Connection) -> tuple[object, list[Projection]]:
 
       * Phase-06 saga: event schemas, the §4.4 command catalog, and the `activate_version` handler
         (register_phase06_event_schemas + _ensure_phase06_commands + register_phase06_handlers).
-      * SP-2 intake: event-type schemas + command catalog (register_sp2) and the DB-backed authz
-        rows / contract-content schemas / PRIMARY_SELECTED wiring / checkpoints (seed_sp2_authz).
+      * (SP-2 intake retired 2026-07-05 — register_sp2 / seed_sp2_authz removed; see the retirement plan.)
       * SP-1 overlay: event-type schemas + command catalog (register_overlay) and its authz rows /
         checkpoint (seed_overlay_authz).
 
@@ -512,7 +511,6 @@ def compose(conn: psycopg.Connection) -> tuple[object, list[Projection]]:
     from featuregen.aggregates.activation import register_phase06_handlers
     from featuregen.aggregates.bootstrap import register_phase06_event_schemas
     from featuregen.documents.primary import StagePrimaryProjection
-    from featuregen.intake.bootstrap import register_sp2, seed_sp2_authz
     from featuregen.overlay.bootstrap import register_overlay, seed_overlay_authz
     from featuregen.overlay.projection import OverlayProjection
     from featuregen.runtime.handlers import HandlerRegistry
@@ -521,8 +519,8 @@ def compose(conn: psycopg.Connection) -> tuple[object, list[Projection]]:
     register_phase06_event_schemas()
     _ensure_phase06_commands()
     register_phase06_handlers(registry)
-    register_sp2(registry)
-    seed_sp2_authz(conn)
+    # SP-2 intake retired (2026-07-05) — register_sp2 / seed_sp2_authz removed; the upload catalog +
+    # overlay/upload/contract flow replace it. See docs/superpowers/plans/2026-07-05-sp2-retirement-plan.md
     register_overlay(registry)
     seed_overlay_authz(conn)
 

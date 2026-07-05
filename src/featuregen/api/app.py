@@ -9,8 +9,11 @@ from fastapi import FastAPI
 
 from featuregen.aggregates.bootstrap import register_phase06_event_schemas
 from featuregen.api.routes import (
+    admin,
     assist,
+    auth,
     contract,
+    entity,
     features,
     graph,
     quarantine,
@@ -39,6 +42,8 @@ def create_app(llm_client: LLMClient | None = None) -> FastAPI:
     app = FastAPI(title="FeatureGen API", lifespan=_lifespan)
     app.state.llm_client = llm_client
 
+    app.include_router(auth.router)
+    app.include_router(admin.router)
     app.include_router(uploads.router)
     app.include_router(search.router)
     app.include_router(quarantine.router)
@@ -46,6 +51,7 @@ def create_app(llm_client: LLMClient | None = None) -> FastAPI:
     app.include_router(features.router)
     app.include_router(assist.router)
     app.include_router(contract.router)
+    app.include_router(entity.router)
 
     @app.get("/health")
     def health() -> dict[str, str]:

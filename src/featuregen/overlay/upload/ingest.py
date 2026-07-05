@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -16,6 +17,17 @@ from featuregen.overlay.upload.graph import build_graph
 from featuregen.overlay.upload.review_queue import persist_quarantine
 from featuregen.overlay.upload.upload_catalog import UploadCatalog, table_ref
 from featuregen.projections.runner import run_projection
+
+logger = logging.getLogger(__name__)
+
+
+def _drain_projection(conn) -> None:
+    """Run the overlay projection until caught up. A single run_projection caps at 500 events and an
+    upload emits 2 per (re)asserted fact, so one pass on a large upload leaves the dependency index
+    stale when detect_catalog_changes reads it (false stale / missed drop). Each pass advances the
+    checkpoint, so this terminates (a partial batch = caught up or poison-halted)."""
+    while run_projection(conn, OverlayProjection()) >= 500:
+        pass
 
 
 @dataclass(frozen=True, slots=True)
@@ -81,6 +93,10 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
     upload = UploadCatalog(catalog_source, vr.good)
     brake = large_change_brake(conn, catalog_source, upload)
     if brake.held:
+        # persist the quarantine even when held, so a reviewer can see WHY this upload's rows failed
+        # (was: returned before persist_quarantine -> the queue still showed the previous upload).
+        persist_quarantine(conn, catalog_source, vr.quarantined)
+        logger.warning("upload of %r held by the large-change brake: %s", catalog_source, brake.reason)
         return IngestResult("held", brake.reason, 0, 0, len(vr.quarantined))
 
     asserted = 0
@@ -88,16 +104,22 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
         if _assert_fact(conn, catalog_source, table, fact_type, value, actor=actor):
             asserted += 1
 
-    run_projection(conn, OverlayProjection())
+    _drain_projection(conn)   # fully catch up BEFORE the diff reads the dependency index (>500-event uploads)
     changes = detect_catalog_changes(conn, upload, actor=actor, now=now, open_reverify=False)
-    run_projection(conn, OverlayProjection())
+    _drain_projection(conn)
     staled = sum(1 for c in changes if c.kind in ("drop", "type_change", "rename"))
 
     concepts = definitions = domains = None
     if client is not None:
-        concepts = enrich_concepts(conn, vr.good, client, actor)
-        definitions = draft_definitions(conn, vr.good, client, actor)
-        domains = classify_domains(conn, vr.good, client, actor)
+        try:
+            concepts = enrich_concepts(conn, vr.good, client, actor)
+            definitions = draft_definitions(conn, vr.good, client, actor)
+            domains = classify_domains(conn, vr.good, client, actor)
+        except Exception:  # noqa: BLE001 — enrichment is ADVISORY (migration 0950): a provider/network
+            # error must degrade search, NEVER abort the upload's facts. Proceed without enrichment.
+            logger.warning("enrichment failed for %r; proceeding without it", catalog_source,
+                           exc_info=True)
+            concepts = definitions = domains = None
     build_graph(conn, catalog_source, vr.good, concepts, definitions, domains)
     persist_quarantine(conn, catalog_source, vr.quarantined)
     flagged = (f"first upload of '{catalog_source}' ({len(vr.good)} objects) — review recommended"

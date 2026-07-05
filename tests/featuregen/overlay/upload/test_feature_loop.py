@@ -97,7 +97,8 @@ def test_cross_domain_gather_spans_catalogs(db):
 
     class _Capture:
         def call(self, request):
-            captured["refs"] = {c["object_ref"] for c in request.inputs["columns"]}
+            captured["refs"] = {c["object_ref"]
+                                for c in request.inputs["catalog_metadata"]["columns"]}
             from featuregen.intake.llm import LLMResult
             # propose a CROSS-DOMAIN feature: balance (deposits) + spend (cards)
             return LLMResult(output={"features": [{"name": "cross", "aggregation": "avg_90d",
@@ -188,3 +189,168 @@ def test_loop_rejects_ambiguous_cross_catalog_column(db):
         {"name": "ambig", "derives_from": ["public.accounts.val"], "aggregation": "avg_90d"}]})})
     out = recommend_features(db, "x", client, entity="Customer", now=NOW)
     assert out == []   # public.accounts.val is in c1 AND c2 -> ambiguous -> rejected
+
+
+def test_gauntlet_catches_windowed_names_without_digit_unit(db):
+    # M1: "avg_last_12_months" / "ytd" evade the old regex but ARE windowed -> need an as-of column
+    _bank_with_asof(db, as_of=False)   # table 't' has NO as-of column
+    for agg in ("avg_last_12_months", "ytd_total", "cumulative_balance", "monthly_avg"):
+        client = FakeLLM(script={"overlay.feature.recommend": FakeResponse(output={"features": [
+            {"name": f"f_{agg}", "derives_from": ["public.accounts.balance"], "aggregation": agg}]})})
+        assert recommend_features(db, "x", client, catalog_source="t", now=NOW) == [], agg
+
+
+def test_gauntlet_catches_additive_unsafe_names_without_sum(db):
+    # M2: "total_balance"/"running_total" sum a semi-additive balance but contain no "sum" substring
+    build_graph(db, "t", [
+        CanonicalRow("t", "accounts", "id", "integer", is_grain=True),
+        CanonicalRow("t", "accounts", "balance", "numeric", additivity="semi_additive"),
+        CanonicalRow("t", "accounts", "posted_at", "timestamp", as_of=True)])
+    _fresh_watermark(db, "t", NOW)
+    for agg in ("total_balance", "running_total", "cumulative"):
+        client = FakeLLM(script={"overlay.feature.recommend": FakeResponse(output={"features": [
+            {"name": f"f_{agg}", "derives_from": ["public.accounts.balance"], "aggregation": agg}]})})
+        assert recommend_features(db, "x", client, catalog_source="t", now=NOW) == [], agg
+
+
+def test_feature_assist_egress_guard_blocks_pii_objective(db):
+    # M6: raw user text is scanned before dispatch — a PII objective is blocked, not leaked to the LLM
+    _bank(db)
+    _fresh_watermark(db, "bank", NOW)
+    client = FakeLLM(script={"overlay.feature.recommend": FakeResponse(output={"features": [
+        {"name": "good", "derives_from": ["public.accounts.balance"], "aggregation": "avg_90d"}]})})
+    out = recommend_features(db, "predict churn for joe@bank.com", client,
+                             catalog_source="bank", now=NOW)
+    assert out == []   # egress guard raised on the email -> no dispatch -> no features
+
+
+def test_gauntlet_rejects_mixed_units(db):
+    # a feature combining dollars + cents is silently wrong -> rejected
+    build_graph(db, "t", [
+        CanonicalRow("t", "accounts", "id", "integer", is_grain=True),
+        CanonicalRow("t", "accounts", "balance", "numeric", unit="dollars"),
+        CanonicalRow("t", "accounts", "fee", "numeric", unit="cents"),
+        CanonicalRow("t", "accounts", "posted_at", "timestamp", as_of=True)])
+    _fresh_watermark(db, "t", NOW)
+    client = FakeLLM(script={"overlay.feature.recommend": FakeResponse(output={"features": [
+        {"name": "mixed", "derives_from": ["public.accounts.balance", "public.accounts.fee"],
+         "aggregation": "avg_90d"}]})})
+    assert recommend_features(db, "x", client, catalog_source="t", now=NOW) == []
+
+
+class _LoopLLM:
+    """Dispatches by task so a test can drive the LLM-1 (generator) <-> LLM-2 (critic) refine loop:
+    generate calls consume `gens` in order, critique calls consume `crits` in order (last repeats)."""
+    def __init__(self, gens, crits):
+        self._gens, self._crits, self._gi, self._ci = list(gens), list(crits), 0, 0
+
+    def call(self, request):
+        from featuregen.intake.llm import LLMResult
+        if request.task == "overlay.feature.recommend":
+            out = self._gens[min(self._gi, len(self._gens) - 1)]; self._gi += 1
+        elif request.task == "overlay.feature.critique_candidates":
+            out = self._crits[min(self._ci, len(self._crits) - 1)]; self._ci += 1
+        else:
+            out = {}
+        return LLMResult(output=out, self_reported_scores={}, call_ref="", status="ok")
+
+
+def test_critic_flags_then_generator_fixes(db):
+    # LLM-2 critic flags round 1's candidate -> fed back -> LLM-1 fixes it round 2 -> accepted.
+    _bank(db)
+    _fresh_watermark(db, "bank", NOW)
+    gens = [
+        {"features": [{"name": "weak", "derives_from": ["public.accounts.balance"],
+                       "aggregation": "avg_90d"}]},
+        {"features": [{"name": "fixed", "derives_from": ["public.accounts.balance"],
+                       "aggregation": "avg_30d"}]},
+    ]
+    crits = [{"issues": [{"name": "weak", "issue": "weak fit to the churn hypothesis"}]},
+             {"issues": []}]
+    out = recommend_features(db, "predict churn", _LoopLLM(gens, crits), catalog_source="bank",
+                             target_ref="public.accounts.churned", now=NOW, target=1, budget=3)
+    assert [f.name for f in out] == ["fixed"]   # weak held back by critic; fixed accepted
+
+
+def test_critic_capped_at_three_reviews_then_forwards_to_human(db):
+    # The critic loop is BOUNDED: at most 3 reviews. If never satisfied, LLM-1's output goes FORWARD
+    # to the human carrying the residual critic note (advisory) — nothing is dropped for a note alone.
+    _bank(db)
+    _fresh_watermark(db, "bank", NOW)
+    calls = {"gen": 0, "crit": 0}
+
+    class _AlwaysFlag:
+        def call(self, request):
+            from featuregen.intake.llm import LLMResult
+            if request.task == "overlay.feature.recommend":
+                calls["gen"] += 1
+                out = {"features": [{"name": "cand", "derives_from": ["public.accounts.balance"],
+                                     "aggregation": "avg_90d"}]}
+            elif request.task == "overlay.feature.critique_candidates":
+                calls["crit"] += 1
+                cands = request.inputs["catalog_metadata"]["candidates"]
+                out = {"issues": [{"name": c["name"], "issue": "still weak"} for c in cands]}
+            else:
+                out = {}
+            return LLMResult(output=out, self_reported_scores={}, call_ref="", status="ok")
+
+    out = recommend_features(db, "predict churn", _AlwaysFlag(), catalog_source="bank",
+                             target_ref="public.accounts.churned", now=NOW, target=1, budget=5)
+    assert calls["crit"] == 3                       # capped at 3 reviews, not budget=5
+    assert [f.name for f in out] == ["cand"]        # forwarded to the human, not dropped
+    assert out[0].critic_note == "still weak"       # carries the residual advisory note
+
+
+def test_gauntlet_returns_structured_rejection_codes(db):
+    from featuregen.overlay.upload.feature_assist import RejectCode, _validate_idea
+    _bank(db)
+    known = {"public.accounts.churned", "public.accounts.balance"}
+    src_of = {"public.accounts.churned": {"bank"}, "public.accounts.balance": {"bank"}}
+    _, rej = _validate_idea(db, {"name": "l", "derives_from": ["public.accounts.churned"]},
+                            known, src_of, "public.accounts.churned", None, timedelta(hours=24))
+    assert rej.code == RejectCode.LEAKAGE
+    _, rej = _validate_idea(db, {"name": "u", "derives_from": ["nope"]},
+                            known, src_of, None, None, timedelta(hours=24))
+    assert rej.code == RejectCode.UNGROUNDED
+
+
+def test_redundant_of_detects_same_derives_and_agg():
+    from featuregen.overlay.upload.feature_assist import FeatureIdea, _redundant_of
+    a = FeatureIdea("a", "", ["x"], "avg_90d", "t", derives_pairs=(("bank", "x"),))
+    b = FeatureIdea("b", "", ["x"], "avg_90d", "t", derives_pairs=(("bank", "x"),))   # dup, new name
+    c = FeatureIdea("c", "", ["y"], "avg_90d", "t", derives_pairs=(("bank", "y"),))
+    assert _redundant_of(b, [a]) is True
+    assert _redundant_of(c, [a]) is False
+
+
+def test_registry_dedup_skips_already_registered(db):
+    from featuregen.overlay.upload.features import FeatureSpec, register_feature
+    _bank(db)
+    _fresh_watermark(db, "bank", NOW)
+    register_feature(db, FeatureSpec(name="existing", aggregation="avg_90d",
+                                     derives_from=(("bank", "public.accounts.balance"),)))
+    client = FakeLLM(script={"overlay.feature.recommend": FakeResponse(output={"features": [
+        {"name": "dup", "derives_from": ["public.accounts.balance"], "aggregation": "avg_90d"}]})})
+    out = recommend_features(db, "x", client, catalog_source="bank", now=NOW, critic=False)
+    assert out == []   # duplicates a registered feature -> skipped
+
+
+def test_accepted_features_are_design_checked(db):
+    _bank(db)
+    _fresh_watermark(db, "bank", NOW)
+    client = FakeLLM(script={"overlay.feature.recommend": FakeResponse(output={"features": [
+        {"name": "g", "derives_from": ["public.accounts.balance"], "aggregation": "avg_90d"}]})})
+    out = recommend_features(db, "x", client, catalog_source="bank", now=NOW, critic=False)
+    assert out and out[0].verification == "DESIGN-CHECKED"
+
+
+def test_set_signals_counts_columns_and_size(db):
+    from featuregen.overlay.upload.feature_assist import FeatureIdea, FeatureSet, set_signals
+    _bank(db)
+    fs = FeatureSet("monetary", [
+        FeatureIdea("a", "", ["public.accounts.balance"], "avg_90d", "accounts",
+                    derives_pairs=(("bank", "public.accounts.balance"),)),
+        FeatureIdea("b", "", ["public.accounts.balance"], "avg_30d", "accounts",
+                    derives_pairs=(("bank", "public.accounts.balance"),))])
+    sig = set_signals(db, fs)
+    assert sig["size"] == 2 and sig["distinct_columns"] == 1   # both read the same column

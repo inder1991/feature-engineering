@@ -1,7 +1,13 @@
+from types import SimpleNamespace
+
 import pytest
 from fastapi import HTTPException
 
 from featuregen.api.deps import get_conn, get_identity
+
+
+def _req(auth: str | None = None) -> SimpleNamespace:
+    return SimpleNamespace(headers=({"authorization": auth} if auth else {}))
 
 
 def test_health(client):
@@ -12,14 +18,14 @@ def test_health(client):
 
 def test_identity_requires_user_header():
     with pytest.raises(HTTPException) as exc:
-        get_identity(x_user=None, x_roles="")
+        get_identity(_req(), None, x_user=None, x_roles="")
     assert exc.value.status_code == 401
 
 
 def test_identity_parses_subject_and_roles_unauthenticated_stub():
     # The stub asserts identity, it does not prove it (SP-0.5 trust boundary): the envelope is
     # authenticated=False until a real verifier proves a token.
-    ident = get_identity(x_user="ana", x_roles="pii_reader, data_owner")
+    ident = get_identity(_req(), None, x_user="ana", x_roles="pii_reader, data_owner")
     assert ident.subject == "user:ana"
     assert ident.role_claims == ("pii_reader", "data_owner")
     assert ident.authenticated is False

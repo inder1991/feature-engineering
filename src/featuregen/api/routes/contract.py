@@ -18,7 +18,12 @@ from featuregen.api.deps import get_conn, get_identity, get_llm
 from featuregen.contracts.envelopes import IdentityEnvelope
 from featuregen.intake.llm import LLMClient
 from featuregen.overlay.upload.contract.author import ContractDraft, draft_contract
-from featuregen.overlay.upload.contract.gate1 import build_considered_set
+from featuregen.overlay.upload.contract.gate1 import (
+    build_considered_set,
+    chosen_feature,
+    intent_target_ref,
+    record_gate1_choice,
+)
 from featuregen.overlay.upload.contract.govern import (
     Contract,
     ContractValidationError,
@@ -26,7 +31,6 @@ from featuregen.overlay.upload.contract.govern import (
 )
 from featuregen.overlay.upload.contract.intake import IntentValidationError, submit_intent
 from featuregen.overlay.upload.contract.review import author_contract
-from featuregen.overlay.upload.feature_assist import FeatureIdea
 
 router = APIRouter()
 
@@ -35,22 +39,8 @@ _Identity = Annotated[IdentityEnvelope, Depends(get_identity)]
 _LLM = Annotated[LLMClient, Depends(get_llm)]
 
 
-# ---- I/O models mirroring the domain dataclasses (JSON carries state between steps) --------------
-class FeatureIn(BaseModel):
-    name: str
-    description: str = ""
-    derives_from: list[str]
-    aggregation: str | None = None
-    grain_table: str | None = None
-    derives_pairs: list[tuple[str, str]] = []
-
-    def to_idea(self) -> FeatureIdea:
-        return FeatureIdea(
-            name=self.name, description=self.description, derives_from=self.derives_from,
-            aggregation=self.aggregation, grain_table=self.grain_table,
-            derives_pairs=tuple(tuple(p) for p in self.derives_pairs))
-
-
+# ---- I/O models. The security-critical state (target_ref, the chosen feature) lives SERVER-side,
+# keyed by intent_id — the client carries only the transient draft + its intent_id back to confirm. ----
 class DraftIn(BaseModel):
     feature_name: str
     definition: str
@@ -61,6 +51,7 @@ class DraftIn(BaseModel):
     target_ref: str | None = None
     derives_pairs: list[tuple[str, str]] = []
     join_path: list[dict] = []
+    intent_id: str | None = None   # server re-reads target_ref + links the contract via this
 
     def to_draft(self) -> ContractDraft:
         return ContractDraft(
@@ -80,8 +71,10 @@ class ConsideredSetIn(BaseModel):
 
 
 class DraftReqIn(BaseModel):
-    feature: FeatureIn
-    target_ref: str | None = None
+    intent_id: str
+    chosen_source: str            # "anchor" | "alternative"
+    chosen_option_id: str         # the chosen feature's name (from the considered set)
+    why: str = ""
 
 
 # ---- routes -------------------------------------------------------------------------------------
@@ -104,20 +97,33 @@ def considered_set(body: ConsideredSetIn, conn: _Conn, identity: _Identity, clie
 
 @router.post("/contract/draft")
 def draft(body: DraftReqIn, conn: _Conn, identity: _Identity, client: _LLM) -> dict:
-    """Author a contract draft for the chosen feature + run the bounded critique→refine loop (MCV each
-    pass). Returns the draft + any unresolved MCV reasons — read-scoped, target carried on the draft."""
-    feature = body.feature.to_idea()
-    d = draft_contract(conn, feature, client, roles=identity.role_claims,
-                       target_ref=body.target_ref, actor=identity)
+    """Gate #1 → author. The chosen feature is reconstructed from the SERVER-persisted considered set
+    (BLOCKER 1 — never an arbitrary client payload); the choice is recorded (audit); the leakage target
+    is read SERVER-side (BLOCKER 2). Then draft + the critique→refine loop (MCV each pass)."""
+    feature = chosen_feature(conn, body.intent_id, body.chosen_source, body.chosen_option_id)
+    if feature is None:
+        raise HTTPException(status_code=422,
+                            detail="chosen option is not in the recorded considered set for this intent")
+    record_gate1_choice(conn, body.intent_id, chosen_source=body.chosen_source,
+                        chosen_option_id=body.chosen_option_id, actor=identity.subject, why=body.why)
+    target = intent_target_ref(conn, body.intent_id)   # server truth, not client-supplied
+    d = draft_contract(conn, feature, client, roles=identity.role_claims, target_ref=target,
+                       actor=identity)
     d, unresolved = author_contract(conn, d, client, now=datetime.now(UTC), actor=identity)
-    return {"draft": d, "unresolved": unresolved}
+    return {"draft": d, "unresolved": unresolved, "intent_id": body.intent_id}
 
 
 @router.post("/contract/confirm")
 def confirm(body: DraftIn, conn: _Conn, identity: _Identity) -> Contract:
-    """The human gate: re-runs the MCV server-side and refuses to govern a leaky / stale / ungrounded /
-    empty draft; otherwise registers a versioned, drift-linked contract."""
+    """The human gate: re-runs the MCV server-side (leakage target re-read from the intent, not trusted
+    from the payload) and refuses to govern a leaky / stale / ungrounded / empty draft; otherwise
+    registers a versioned, drift-linked contract linked back to its intent."""
+    target = intent_target_ref(conn, body.intent_id) if body.intent_id else body.target_ref
     try:
-        return confirm_contract(conn, body.to_draft(), actor=identity.subject, now=datetime.now(UTC))
+        return confirm_contract(conn, body.to_draft(), actor=identity.subject,
+                                now=datetime.now(UTC), target_ref=target, intent_id=body.intent_id)
     except ContractValidationError as e:
         raise HTTPException(status_code=422, detail=str(e)) from e
+    except psycopg.errors.UniqueViolation as e:   # concurrent double-confirm -> conflict, not 500
+        raise HTTPException(status_code=409,
+                            detail="a contract version conflict occurred; re-fetch and retry") from e

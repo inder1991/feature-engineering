@@ -45,22 +45,43 @@ def test_blank_hypothesis_is_422(make_client):
     assert res.status_code == 422
 
 
+def _intent_id(client) -> str:
+    res = client.post("/contract/considered-set", json={
+        "hypothesis": "customers churn when their balance drops",
+        "definition": "90-day average balance per account",
+        "objective": "predict churn", "catalog_source": "deposits"}, headers=AUTH)
+    assert res.status_code == 200
+    return res.json()["intent_id"]
+
+
 def test_draft_then_confirm_registers_contract(make_client):
     client = make_client(_fake())
     upload_csv(client, "deposits", DEPOSITS_CSV)
-    feature = {"name": "avg_balance_90d", "derives_from": ["public.accounts.balance"],
-               "aggregation": "avg_90d", "grain_table": "accounts",
-               "derives_pairs": [["deposits", "public.accounts.balance"]]}
-    dr = client.post("/contract/draft", json={"feature": feature}, headers=AUTH)
+    intent_id = _intent_id(client)
+    # draft the human's CHOSEN option (reconstructed server-side from the considered set)
+    dr = client.post("/contract/draft", json={
+        "intent_id": intent_id, "chosen_source": "anchor",
+        "chosen_option_id": "avg_balance_90d", "why": "best fit"}, headers=AUTH)
     assert dr.status_code == 200
     draft = dr.json()["draft"]
+    draft["intent_id"] = dr.json()["intent_id"]
     assert draft["definition"].startswith("Average")
     assert dr.json()["unresolved"] == []
-    # the human confirms the draft -> a governed, versioned contract
     cr = client.post("/contract/confirm", json=draft, headers=AUTH)
     assert cr.status_code == 200
     assert cr.json()["version"] == 1
     assert cr.json()["feature_id"].startswith("feat")
+
+
+def test_draft_rejects_a_choice_not_in_the_considered_set_422(make_client):
+    # BLOCKER 1: a feature that was never offered cannot be drafted
+    client = make_client(_fake())
+    upload_csv(client, "deposits", DEPOSITS_CSV)
+    intent_id = _intent_id(client)
+    res = client.post("/contract/draft", json={
+        "intent_id": intent_id, "chosen_source": "alternative",
+        "chosen_option_id": "never_offered", "why": ""}, headers=AUTH)
+    assert res.status_code == 422
 
 
 def test_confirm_rejects_a_leaky_draft_422(make_client):
