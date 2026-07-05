@@ -10,6 +10,7 @@ from fastapi import FastAPI
 from featuregen.aggregates.bootstrap import register_phase06_event_schemas
 from featuregen.api.routes import (
     assist,
+    auth,
     contract,
     features,
     graph,
@@ -39,6 +40,7 @@ def create_app(llm_client: LLMClient | None = None) -> FastAPI:
     app = FastAPI(title="FeatureGen API", lifespan=_lifespan)
     app.state.llm_client = llm_client
 
+    app.include_router(auth.router)
     app.include_router(uploads.router)
     app.include_router(search.router)
     app.include_router(quarantine.router)

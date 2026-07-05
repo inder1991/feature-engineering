@@ -29,8 +29,12 @@ def validate_identity(env: IdentityEnvelope) -> None:
                 "not self-asserted"
             )
     elif env.actor_kind == "human":
-        if env.auth_method != "oidc":
-            raise IdentityError("human actor must authenticate via oidc")
+        # A human authenticates via an OIDC IdP, or via the local username/password store
+        # (identity/local_session.py) until an IdP lands. Both mint through the sealed trust
+        # capability, so admitting "password" doesn't weaken the control — an authenticated
+        # envelope is only producible by a verifier that proved the credential.
+        if env.auth_method not in ("oidc", "password"):
+            raise IdentityError("human actor must authenticate via oidc or password")
     else:
         raise IdentityError(f"unknown actor_kind: {env.actor_kind}")
 
