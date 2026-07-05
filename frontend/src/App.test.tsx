@@ -1,4 +1,4 @@
-import { render, screen } from '@testing-library/react'
+import { render, screen, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { beforeEach, describe, expect, it } from 'vitest'
 import App from './App'
@@ -9,10 +9,11 @@ beforeEach(() => setSession({ user: 'dev', roles: ['data_owner'] }))
 describe('app shell', () => {
   it('renders the four screens as tabs, search by default', () => {
     render(<App />)
+    const nav = within(screen.getByRole('navigation'))
     for (const t of ['Upload', 'Search', 'Review queue', 'Workbench']) {
-      expect(screen.getByRole('button', { name: t })).toBeInTheDocument()
+      expect(nav.getByRole('button', { name: t })).toBeInTheDocument()
     }
-    expect(screen.getByRole('heading', { name: 'Search' })).toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: /search the catalog/i })).toBeInTheDocument()
   })
 
   it('switches tabs', async () => {

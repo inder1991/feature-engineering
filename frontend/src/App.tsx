@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import { SessionBar } from './SessionBar'
+import { SearchScreen } from './screens/SearchScreen'
 import { UploadScreen } from './screens/UploadScreen'
 
 const TABS = ['Upload', 'Search', 'Review queue', 'Workbench'] as const
@@ -27,7 +28,7 @@ export default function App() {
       </header>
       <main>
         {tab === 'Upload' && <UploadScreen onReviewQueue={openReview} />}
-        {tab === 'Search' && <section><h2>Search</h2></section>}
+        {tab === 'Search' && <SearchScreen />}
         {tab === 'Review queue' && <section><h2>Review queue</h2><p>{reviewSource}</p></section>}
         {tab === 'Workbench' && <section><h2>Workbench</h2></section>}
       </main>
