@@ -1,6 +1,6 @@
 import pytest
-from tests.featuregen.intake._helpers import service_actor
 
+from featuregen.contracts import IdentityEnvelope
 from featuregen.contracts.identity import identity_to_jsonb
 from featuregen.idgen import new_run_id
 from featuregen.intake.llm import (
@@ -10,6 +10,13 @@ from featuregen.intake.llm import (
     read_llm_call,
     record_llm_call,
 )
+
+
+def service_actor() -> IdentityEnvelope:
+    """A service principal for llm_call records (relocated from the retired intake _helpers)."""
+    return IdentityEnvelope(
+        subject="service:overlay", actor_kind="service", authenticated=True, auth_method="mtls",
+        role_claims=("overlay",), source_of_authority="platform", attestation="overlay-service")
 
 
 def _req(gen=None):
