@@ -19,7 +19,7 @@ describe('app shell', () => {
   it('switches tabs', async () => {
     render(<App />)
     await userEvent.click(screen.getByRole('button', { name: 'Workbench' }))
-    expect(screen.getByRole('heading', { name: 'Workbench' })).toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: /feature workbench/i })).toBeInTheDocument()
   })
 
   it('session bar edits the stub session store', async () => {

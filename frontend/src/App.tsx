@@ -3,6 +3,7 @@ import { SessionBar } from './SessionBar'
 import { ReviewQueueScreen } from './screens/ReviewQueueScreen'
 import { SearchScreen } from './screens/SearchScreen'
 import { UploadScreen } from './screens/UploadScreen'
+import { WorkbenchScreen } from './screens/WorkbenchScreen'
 
 const TABS = ['Upload', 'Search', 'Review queue', 'Workbench'] as const
 export type Tab = (typeof TABS)[number]
@@ -31,7 +32,7 @@ export default function App() {
         {tab === 'Upload' && <UploadScreen onReviewQueue={openReview} />}
         {tab === 'Search' && <SearchScreen />}
         {tab === 'Review queue' && <ReviewQueueScreen initialSource={reviewSource} />}
-        {tab === 'Workbench' && <section><h2>Workbench</h2></section>}
+        {tab === 'Workbench' && <WorkbenchScreen />}
       </main>
     </div>
   )
