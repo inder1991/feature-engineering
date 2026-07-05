@@ -94,3 +94,13 @@ def test_critique_is_audited(db):
     after = db.execute("SELECT count(*) FROM llm_call WHERE run_id = 'overlay-enrichment'").fetchone()[0]
     assert findings == ["state the window"]
     assert after == before + 1
+
+
+def test_mcv_rejects_fabricated_catalog_pair(db):
+    # M4: a client-supplied derives_pairs catalog that the column doesn't live in must fail closed
+    _bank(db)   # 'bank' catalog has public.accounts.balance
+    draft = ContractDraft("f", "def", "accounts", "avg_90d", "posted_at",
+                          ["public.accounts.balance"],
+                          derives_pairs=(("fabricated_catalog", "public.accounts.balance"),))
+    ok, reasons = validate_minimum(db, draft, now=NOW)
+    assert not ok and "unknown column" in reasons[0]
