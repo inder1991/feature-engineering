@@ -104,9 +104,9 @@ def suggest_entity(conn, client, *, table: str, column: str, type: str, concept:
     return raw
 
 
-from collections import deque   # noqa: E402
+from collections import deque  # noqa: E402
 
-from featuregen.overlay.upload.join_path import _table_of   # noqa: E402
+from featuregen.overlay.upload.join_path import _table_of  # noqa: E402
 
 
 @dataclass(frozen=True, slots=True)

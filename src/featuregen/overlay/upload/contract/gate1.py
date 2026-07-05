@@ -69,7 +69,8 @@ def _option_ids(cs: ConsideredSet) -> set[str]:
 def _idea_json(f: FeatureIdea | None) -> dict | None:
     if f is None:
         return None
-    return {"name": f.name, "derives_from": f.derives_from, "aggregation": f.aggregation}
+    return {"name": f.name, "derives_from": f.derives_from, "aggregation": f.aggregation,
+            "grain_table": f.grain_table}   # keep grain — it disambiguates same-named options
 
 
 def _snapshot(cs: ConsideredSet) -> dict:
@@ -83,13 +84,15 @@ def _snapshot(cs: ConsideredSet) -> dict:
     }
 
 
-def _actor_json(actor) -> str:
+def _actor_json(actor) -> str | None:
+    if actor is None:
+        return None                            # -> SQL NULL ("unknown actor"), not the string "None"
     if isinstance(actor, str):
         return json.dumps(actor)
     try:
         return json.dumps(identity_to_jsonb(actor))
     except Exception:
-        return json.dumps(str(actor))
+        return json.dumps({"repr": str(actor)})   # structured, parseable JSON — not a repr string
 
 
 def confirm_gate1(conn, considered: ConsideredSet, *, chosen_source: str, chosen_option_id: str,

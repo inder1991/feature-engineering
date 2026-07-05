@@ -36,13 +36,15 @@ class Contract:
     version: int
 
 
-def _actor_json(actor) -> str:
+def _actor_json(actor) -> str | None:
+    if actor is None:
+        return None                            # -> SQL NULL ("unknown actor"), not the string "None"
     if isinstance(actor, str):
         return json.dumps(actor)
     try:
         return json.dumps(identity_to_jsonb(actor))
     except Exception:
-        return json.dumps(str(actor))
+        return json.dumps({"repr": str(actor)})   # structured, parseable JSON — not a repr string
 
 
 def _derives_pairs(conn, object_refs: list[str]) -> tuple[tuple[str, str], ...]:
@@ -70,7 +72,8 @@ def confirm_contract(conn, draft: ContractDraft, *, actor, target_ref: str | Non
     """The human gate. RE-RUNS the deterministic MCV (B1) and refuses to govern an invalid draft, then
     registers a versioned governed contract + wires its derives-from into the feature layer. Re-confirming
     the same feature bumps the version. A non-empty definition is required (no empty-narrative contract)."""
-    ok, reasons = validate_minimum(conn, draft, target_ref=target_ref, now=now)
+    tref = target_ref if target_ref is not None else draft.target_ref   # M3: fall back to the draft's
+    ok, reasons = validate_minimum(conn, draft, target_ref=tref, now=now)
     if not ok:
         raise ContractValidationError(f"contract failed MCV, not governed: {reasons}")
     if not (draft.definition or "").strip():

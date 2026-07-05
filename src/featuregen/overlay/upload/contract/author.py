@@ -25,6 +25,8 @@ class ContractDraft:
     aggregation: str | None       # deterministic
     as_of_column: str | None      # deterministic — the grain table's as-of column
     derives_from: list[str]       # deterministic — the columns the feature reads
+    target_ref: str | None = None  # M3: the prediction target travels WITH the draft, so the MCV
+    #                                leakage check at author/confirm can never silently no-op
 
 
 def _as_of_column(conn, grain_table: str | None) -> str | None:
@@ -49,9 +51,10 @@ def _column_defs(conn, object_refs: list[str], roles: Iterable[str]) -> list[dic
 
 
 def draft_contract(conn, feature: FeatureIdea, client: LLMClient, *, actor=None,
-                   roles: Iterable[str] = ()) -> ContractDraft:
+                   roles: Iterable[str] = (), target_ref: str | None = None) -> ContractDraft:
     """Author a contract draft for the chosen feature. Structured facts deterministic; the definition
-    narrative LLM-authored via the audited seam (metadata only, read-scoped by roles)."""
+    narrative LLM-authored via the audited seam (metadata only, read-scoped by roles). `target_ref`
+    (the prediction target) is carried on the draft so the downstream leakage check cannot no-op."""
     definition = audited_enrich_call(
         conn, client, task="overlay.contract.draft", prompt_id="overlay_contract_v1",
         schema_id="overlay_contract",
@@ -64,4 +67,4 @@ def draft_contract(conn, feature: FeatureIdea, client: LLMClient, *, actor=None,
     return ContractDraft(
         feature_name=feature.name, definition=definition, grain_table=feature.grain_table,
         aggregation=feature.aggregation, as_of_column=_as_of_column(conn, feature.grain_table),
-        derives_from=list(feature.derives_from))
+        derives_from=list(feature.derives_from), target_ref=target_ref)

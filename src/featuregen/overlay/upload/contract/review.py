@@ -74,14 +74,16 @@ def author_contract(conn, draft: ContractDraft, client: LLMClient, *, target_ref
                     now: datetime | None = None, budget: int = 2,
                     actor=None) -> tuple[ContractDraft, list[str]]:
     """Bounded critique→refine loop; MCV each pass. Returns (draft, unresolved_mcv_reasons) — an empty
-    list means the contract passed MCV and the critique is clean (or budget was spent with MCV clean)."""
+    list means the contract passed MCV and the critique is clean (or budget was spent with MCV clean).
+    `target_ref` falls back to the draft's own (M3), so the leakage check cannot silently no-op."""
+    tref = target_ref if target_ref is not None else draft.target_ref
     for _ in range(budget):
-        _, mcv = validate_minimum(conn, draft, target_ref=target_ref, now=now)
-        critique = critique_contract(conn, draft, client)
+        _, mcv = validate_minimum(conn, draft, target_ref=tref, now=now)
+        critique = critique_contract(conn, draft, client, actor=actor)
         if not mcv and not critique:
             return draft, []                       # clean
         if mcv and not critique:
             return draft, mcv                      # structural defect the LLM can't fix → surface
         draft = refine_contract(conn, draft, mcv + critique, client, actor=actor)
-    _, mcv = validate_minimum(conn, draft, target_ref=target_ref, now=now)
+    _, mcv = validate_minimum(conn, draft, target_ref=tref, now=now)
     return draft, mcv
