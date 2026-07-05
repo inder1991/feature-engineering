@@ -34,6 +34,8 @@ const IDEA: api.FeatureIdea = {
   name: 'avg_balance', description: 'average balance per customer',
   derives_from: ['public.accounts.balance'], aggregation: 'avg', grain_table: 'customers',
   derives_pairs: [['cards', 'public.accounts.balance']],
+  verification: 'DESIGN-CHECKED',
+  rationale: 'falling balances signal a customer preparing to leave',
 }
 
 const IDEA_SPEC: api.FeatureSpecIn = {
@@ -46,6 +48,8 @@ const OTHER_IDEA: api.FeatureIdea = {
   name: 'txn_count', description: 'transactions per customer',
   derives_from: ['public.transactions.id'], aggregation: 'count', grain_table: 'customers',
   derives_pairs: [['cards', 'public.transactions.id']],
+  // rationale left blank: the LLM omitted a causal note, so no Why line should render for it.
+  verification: 'DESIGN-CHECKED', rationale: '',
 }
 
 const OTHER_IDEA_SPEC: api.FeatureSpecIn = {
@@ -496,5 +500,45 @@ describe('described drafts', () => {
     ])
     expect(screen.queryByText(/aggregate before joining/i)).not.toBeInTheDocument()
     expect(screen.queryByText(/cannot be ruled out/i)).not.toBeInTheDocument()
+  })
+})
+
+describe('verification stamp and rationale', () => {
+  it('renders the causal rationale when present and omits it when the LLM left it blank', async () => {
+    await renderAndGenerate([IDEA, OTHER_IDEA])
+    expect(
+      await screen.findByText(/falling balances signal a customer preparing to leave/i),
+    ).toBeInTheDocument()
+    // OTHER_IDEA carries an empty rationale, so exactly one Why line renders across the list.
+    expect(screen.getAllByText(/^Why:/)).toHaveLength(1)
+  })
+
+  it('stamps generated candidates design-checked and shows the honest help line once', async () => {
+    await renderAndGenerate([IDEA, OTHER_IDEA])
+    expect(await screen.findByText('avg_balance')).toBeInTheDocument()
+    // One soft stamp per generated candidate, from the backend verification field (lowercased).
+    expect(screen.getAllByText('design-checked')).toHaveLength(2)
+    // The explanation is one help line for the whole list, not repeated per row.
+    expect(screen.getAllByText(/structurally safe against leakage/i)).toHaveLength(1)
+  })
+
+  it('never stamps drafts and hides the help line on a drafts-only list', async () => {
+    // renderAndDraft never generates, so no candidate passed the gauntlet.
+    await renderAndDraft()
+    expect(screen.getByText('Draft')).toBeInTheDocument()
+    expect(screen.queryByText('design-checked')).not.toBeInTheDocument()
+    expect(screen.queryByText(/structurally safe against leakage/i)).not.toBeInTheDocument()
+  })
+
+  it('leaves a described draft as DRAFT only alongside a stamped generated candidate', async () => {
+    featureRecipe.mockResolvedValue(recipeWith([]))
+    await renderAndGenerate([IDEA], { source: 'deposits' })
+    expect(await screen.findByText('avg_balance')).toBeInTheDocument()
+    await openDescribe()
+    await draftFeature('total spend per customer')
+    expect(await screen.findByText('total_spend_per_customer')).toBeInTheDocument()
+    // The generated candidate keeps its lone stamp; the draft carries none.
+    expect(screen.getAllByText('design-checked')).toHaveLength(1)
+    expect(screen.getByText('Draft')).toBeInTheDocument()
   })
 })

@@ -114,6 +114,12 @@ export interface FeatureIdea {
   // lineage MUST come from these, never from client-side source context: re-deriving the
   // catalog on the client would corrupt freshness and drift-impact for cross-catalog ideas.
   derives_pairs: [string, string][]
+  // Honest verification stamp (currently "DESIGN-CHECKED"): structurally safe against leakage,
+  // staleness, additivity, and point-in-time errors. Predictive value stays unverified until a
+  // downstream backtest, so this is never a production-ready claim.
+  verification: string
+  // One-line causal WHY this feature operationalizes the goal; "" when the LLM omitted it.
+  rationale: string
 }
 
 export interface Recipe {

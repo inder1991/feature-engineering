@@ -235,6 +235,9 @@ export function WorkbenchScreen() {
   const batchInFlight = useRef(false)
 
   const candidates: Candidate[] = [...(generated ?? []), ...drafts]
+  // Only generated candidates pass the design gauntlet, so the design-checked stamp and its one
+  // help line appear only when the list holds at least one generated candidate.
+  const hasGenerated = (generated?.length ?? 0) > 0
   // Selection is the intersection of the set and the live candidate list: keys from cleared
   // rounds are inert, and registered candidates can never re-enter a batch.
   const selectedCandidates = candidates.filter(c => selected.has(c.key) && !registered[c.key])
@@ -563,6 +566,12 @@ export function WorkbenchScreen() {
               {candidates.length === 1 ? 'candidate' : 'candidates'}
             </span>
           </div>
+          {hasGenerated && (
+            <p className="hint" style={{ marginTop: 4 }}>
+              Design-checked: structurally safe against leakage, staleness, and double-counting.
+              Predictive value is proven later by backtests.
+            </p>
+          )}
           {screenedTarget && (
             <p className="hint" style={{ marginTop: 4 }}>
               Screened against <span className="mono">{screenedTarget}</span>: leaky candidates
@@ -604,8 +613,16 @@ export function WorkbenchScreen() {
                       <span className="badge proposal">
                         {c.kind === 'generated' ? 'Proposal' : 'Draft'}
                       </span>
+                      {/* Honest stamp: soft (not solid) so it never outshouts the selection or
+                          registered states. Drafts skip the gauntlet, so they carry no stamp. */}
+                      {c.kind === 'generated' && c.idea.verification && (
+                        <span className="badge ok">{c.idea.verification.toLowerCase()}</span>
+                      )}
                     </div>
                     <p style={{ color: 'var(--ink-soft)' }}>{description}</p>
+                    {c.kind === 'generated' && c.idea.rationale && (
+                      <p style={{ color: 'var(--ink-soft)' }}>Why: {c.idea.rationale}</p>
+                    )}
                     <dl className="kv">
                       <div>
                         <dt>derives from</dt>
