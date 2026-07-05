@@ -7,6 +7,12 @@ tag (`Customer`, `Account`); this module reads that tag out of the graph to expo
 
 No new tables: entity membership is derived from `graph_node.entity`. Reads are read-scoped (an entity
 key column may itself be sensitive).
+
+STATUS: NOT YET WIRED into the live flow. The live cross-domain gather (`feature_assist._candidate_columns`
+with `entity=`) queries `graph_node.entity` directly; this module (`cross_join_via_entity`,
+`find_cross_catalog_path`, `suggest_entity`) is the scaffolding for the DEFERRED cross-catalog contract
+authoring / entity-resolution follow-up (see `contract/author.py` + the loop design spec). It is fully
+tested so it is ready to wire — it is NOT dead-by-accident.
 """
 from __future__ import annotations
 

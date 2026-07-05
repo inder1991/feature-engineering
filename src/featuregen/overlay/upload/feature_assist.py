@@ -16,8 +16,9 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
-from featuregen.intake.llm import LLMClient, LLMRequest
+from featuregen.intake.llm import LLMClient
 from featuregen.overlay.catalog_changes import drift_watermark
+from featuregen.overlay.upload.enrich_llm import audited_structured_call
 from featuregen.overlay.upload.join_path import JoinStep, find_join_path
 from featuregen.overlay.upload.read_scope import allowed_sensitivities
 
@@ -45,12 +46,14 @@ def _is_additive_unsafe(aggregation: str | None) -> bool:
     return any(w in a for w in _UNSAFE_ADDITIVE_WORDS)
 
 
-def _call_raw(client: LLMClient, task: str, prompt_id: str, schema_id: str, inputs: dict) -> dict:
-    req = LLMRequest(
-        task=task, prompt_id=prompt_id, prompt_version=1, inputs=inputs,
-        output_schema_id=schema_id, output_schema_version=1,
-        generation_settings={"provider": "fake", "model": "test"})
-    out = client.call(req).output
+def _call_raw(conn, client: LLMClient, task: str, prompt_id: str, schema_id: str,
+              instruction: str, catalog_metadata: dict) -> dict:
+    """Every feature-assist LLM call goes through the AUDITED seam (M6): the egress guard scans the
+    user text (`instruction`) + metadata before dispatch, and the call is recorded in llm_call. Was a
+    raw client.call() that skipped both — a real leak against a non-fake provider."""
+    out = audited_structured_call(
+        conn, client, task=task, prompt_id=prompt_id, schema_id=schema_id,
+        catalog_metadata=catalog_metadata, instruction=instruction)
     return out if isinstance(out, dict) else {}
 
 
@@ -98,11 +101,11 @@ def _column_meta(conn, pairs: list[tuple[str, str]]) -> dict[str, dict]:
         return {}
     refs = [ref for _, ref in pairs]
     rows = conn.execute(
-        "SELECT catalog_source, object_ref, additivity FROM graph_node "
+        "SELECT catalog_source, object_ref, additivity, unit, currency FROM graph_node "
         "WHERE kind = 'column' AND object_ref = ANY(%s)", (refs,)).fetchall()
     wanted = set(pairs)
-    return {ref: {"catalog_source": cs, "additivity": add}
-            for cs, ref, add in rows if (cs, ref) in wanted}
+    return {ref: {"catalog_source": cs, "additivity": add, "unit": unit, "currency": cur}
+            for cs, ref, add, unit, cur in rows if (cs, ref) in wanted}
 
 
 def _table_has_as_of(conn, catalog_source: str, table: str) -> bool:
@@ -147,6 +150,14 @@ def _validate_idea(conn, raw: dict, known: set[str], src_of: dict[str, set[str]]
         for d in derives:
             if meta.get(d, {}).get("additivity") in ("semi_additive", "non_additive"):
                 return None, f"unsafe additive aggregation of {d}"
+    # unit/currency safety: combining columns of mixed scale (dollars vs cents) / currency is
+    # silently wrong (migration 0957). Reject when the derives span >1 distinct non-empty unit/currency.
+    units = {meta[d]["unit"] for d in derives if meta.get(d, {}).get("unit")}
+    currencies = {meta[d]["currency"] for d in derives if meta.get(d, {}).get("currency")}
+    if len(units) > 1:
+        return None, f"mixed units {sorted(units)} — aggregation would be silently wrong"
+    if len(currencies) > 1:
+        return None, f"mixed currencies {sorted(currencies)}"
     if _is_windowed(raw.get("aggregation")):   # point-in-time: a windowed feature needs an as-of column
         for src, d in pairs:
             # object_ref is "[catalog.]schema.table.column"; table is the second-to-last segment.
@@ -179,8 +190,8 @@ def recommend_features(conn, objective: str, client: LLMClient, *,
     for _ in range(budget):
         if len(accepted) >= target:
             break
-        out = _call_raw(client, "overlay.feature.recommend", "feature_recommend_v1", "feature_ideas",
-                        {"objective": objective, "columns": _menu(cols), "avoid": avoid})
+        out = _call_raw(conn, client, "overlay.feature.recommend", "feature_recommend_v1",
+                        "feature_ideas", objective, {"columns": _menu(cols), "avoid": avoid})
         for raw in out.get("features", []):
             idea, reason = _validate_idea(conn, raw, known, src_of, target_ref, now, fresh_within)
             if idea is None:
@@ -207,8 +218,8 @@ def feature_recipe(conn, nl_query: str, client: LLMClient, *, catalog_source: st
                    roles: Iterable[str] = ()) -> Recipe:
     cols = _candidate_columns(conn, catalog_source, roles)
     known = {c["object_ref"] for c in cols}
-    out = _call_raw(client, "overlay.feature.recipe", "feature_recipe_v1", "feature_recipe",
-                    {"query": nl_query, "columns": _menu(cols)})
+    out = _call_raw(conn, client, "overlay.feature.recipe", "feature_recipe_v1", "feature_recipe",
+                    nl_query, {"columns": _menu(cols)})
     derives = [d for d in out.get("derives_from", []) if d in known]
     grain = out.get("grain_table")
     join_table = out.get("join_table")
@@ -230,7 +241,8 @@ class LeakageWarning:
 def leakage_check(conn, derives_from: list[str], target_ref: str,
                   client: LLMClient) -> list[LeakageWarning]:
     used = set(derives_from)
-    out = _call_raw(client, "overlay.feature.leakage", "feature_leakage_v1", "leakage",
+    out = _call_raw(conn, client, "overlay.feature.leakage", "feature_leakage_v1", "leakage",
+                    "Flag columns that leak the prediction target.",
                     {"derives_from": list(derives_from), "target": target_ref})
     return [LeakageWarning(object_ref=w["object_ref"], reason=str(w.get("reason", "")))
             for w in out.get("leaks", [])
@@ -277,8 +289,8 @@ def recommend_set(conn, sets: list[FeatureSet], hypothesis: str,
     summary = [{"lens": s.lens,
                 "features": [{"name": f.name, "derives_from": f.derives_from,
                               "aggregation": f.aggregation} for f in s.features]} for s in sets]
-    out = _call_raw(client, "overlay.feature.recommend_set", "feature_set_v1", "feature_set_rec",
-                    {"hypothesis": hypothesis, "sets": summary})
+    out = _call_raw(conn, client, "overlay.feature.recommend_set", "feature_set_v1",
+                    "feature_set_rec", hypothesis, {"sets": summary})
     default = sets[0].lens if sets else ""
     return SetRecommendation(recommended_lens=str(out.get("recommended_lens", default)),
                              reasoning=str(out.get("reasoning", "")))

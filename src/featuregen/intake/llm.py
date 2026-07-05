@@ -420,16 +420,3 @@ def find_llm_call(
             if rec.validation_result.get("result") in _REUSABLE_STATUSES:
                 return rec
     return None
-
-
-def _result_from_record(rec: LLMCallRecord) -> LLMResult:
-    """Rebuild the caller-facing LLMResult from a stored record (idempotent reuse — no new call)."""
-    return LLMResult(
-        output=dict(rec.raw_output.get("output", {})),
-        self_reported_scores=dict(rec.raw_output.get("self_reported_scores", {})),
-        call_ref=rec.llm_call_ref,
-        status=rec.validation_result.get("result", STATUS_FAILED),
-        cost_metadata=dict(rec.cost_metadata or {}),  # N9 — preserve captured cost on the reuse path
-    )
-
-

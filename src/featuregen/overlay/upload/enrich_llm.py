@@ -56,6 +56,14 @@ _SCHEMAS: dict[tuple[str, int], dict] = {
                               "properties": {"findings": {"type": "array",
                                                           "items": {"type": "string"}}},
                               "required": ["findings"]},
+    # Feature-assist output schemas (M6 — routed through the audited seam). Permissive object shapes:
+    # the value is the LLM's proposal that the deterministic layer then grounds/validates.
+    ("feature_ideas", 1): {"type": "object", "additionalProperties": True,
+                           "properties": {"features": {"type": "array"}}},
+    ("feature_recipe", 1): {"type": "object", "additionalProperties": True},
+    ("leakage", 1): {"type": "object", "additionalProperties": True,
+                     "properties": {"leaks": {"type": "array"}}},
+    ("feature_set_rec", 1): {"type": "object", "additionalProperties": True},
 }
 
 # Fallback service identity for when no real actor is threaded in. authenticated=False — a
