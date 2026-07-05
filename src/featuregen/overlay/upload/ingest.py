@@ -25,6 +25,7 @@ class IngestResult:
     asserted: int
     staled: int
     quarantined: int
+    flagged: str | None = None   # a soft-gate note (e.g. first upload — review recommended)
 
 
 def _table_facts(rows: list[CanonicalRow]):
@@ -99,4 +100,6 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
         domains = classify_domains(conn, vr.good, client)
     build_graph(conn, catalog_source, vr.good, concepts, definitions, domains)
     persist_quarantine(conn, catalog_source, vr.quarantined)
-    return IngestResult("ingested", None, asserted, staled, len(vr.quarantined))
+    flagged = (f"first upload of '{catalog_source}' ({len(vr.good)} objects) — review recommended"
+               if brake.is_first_upload else None)
+    return IngestResult("ingested", None, asserted, staled, len(vr.quarantined), flagged)

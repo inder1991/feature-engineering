@@ -31,7 +31,9 @@ _TRUE = {"y", "yes", "true", "1"}
 
 
 def _norm(h: str) -> str:
-    return h.strip().lower().replace(" ", "").replace("_", "")
+    # Strip a UTF-8 BOM too — Excel-exported CSVs prefix the first header with ﻿, which
+    # str.strip() does NOT remove, silently unmapping the first column.
+    return h.lstrip("﻿").strip().lower().replace(" ", "").replace("_", "")
 
 
 def field_map(headers: list[str]) -> dict[str, str]:

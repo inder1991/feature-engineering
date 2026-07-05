@@ -2,7 +2,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from featuregen.overlay.upload.read_scope import SENSITIVITY_ROLES
+
 _REQUIRED = ("source", "table", "column", "type")
+_VALID_SENSITIVITY = frozenset({"", *SENSITIVITY_ROLES})   # "" (none) + the recognized tags
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,6 +63,13 @@ def validate_rows(rows: list[CanonicalRow],
         if catalog_source is not None and r.source != catalog_source:
             quarantined.append(RowError(
                 i, f"row source '{r.source}' does not match upload source '{catalog_source}'", r))
+            continue
+        if r.sensitivity not in _VALID_SENSITIVITY:
+            # An unrecognized sensitivity would make the node invisible to EVERY role (fail-closed
+            # but silent). Quarantine it instead so the reviewer fixes/normalizes the value.
+            quarantined.append(RowError(
+                i, f"unrecognized sensitivity '{r.sensitivity}' "
+                f"(expected one of: {', '.join(sorted(_VALID_SENSITIVITY - {''}))})", r))
             continue
         key = (r.source, r.table, r.column)
         if key in seen:

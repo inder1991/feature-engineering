@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 
 from featuregen.intake.llm import PROVIDER_OK, LLMClient, LLMRequest
 from featuregen.overlay.upload.canonical import CanonicalRow
@@ -12,12 +13,14 @@ _DOMAIN_TASK = "overlay.enrich.domain"
 
 
 def content_hash(row: CanonicalRow) -> str:
-    raw = f"{row.table}|{row.column}|{row.type}|{row.definition}"
+    # JSON-encode (unambiguous — no delimiter collision) and INCLUDE source so a drafted definition
+    # for one source's column is never shown for another source's same-named column (M5/M6 minors).
+    raw = json.dumps([row.source, row.table, row.column, row.type, row.definition])
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
-def _table_content_hash(table: str, columns: list[str]) -> str:
-    raw = f"{table}|" + "|".join(sorted(columns))
+def _table_content_hash(source: str, table: str, columns: list[str]) -> str:
+    raw = json.dumps([source, table, sorted(columns)])
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
@@ -111,10 +114,11 @@ def draft_definitions(conn, rows: list[CanonicalRow], client: LLMClient) -> dict
 def classify_domains(conn, rows: list[CanonicalRow], client: LLMClient) -> dict[str, str]:
     """Classify each table's business domain (per-table), returning {table_name: domain}."""
     by_table: dict[str, list[str]] = {}
+    source = rows[0].source if rows else ""   # rows share one source (foreign ones are quarantined)
     for r in rows:
         by_table.setdefault(r.table, []).append(r.column)
 
-    hash_of_table = {t: _table_content_hash(t, cols) for t, cols in by_table.items()}
+    hash_of_table = {t: _table_content_hash(source, t, cols) for t, cols in by_table.items()}
     cached = _cache_get(conn, "enrichment_domain", list(hash_of_table.values()))
 
     result: dict[str, str] = {}

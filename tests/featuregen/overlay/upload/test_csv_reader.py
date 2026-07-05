@@ -24,3 +24,10 @@ def test_reads_definition_alias():
     text = "table,column,type,Description\naccounts,balance,numeric,Ledger balance\n"
     rows = read_csv_rows(text, source="deposits")
     assert rows[0].definition == "Ledger balance"
+
+
+def test_reads_headers_with_utf8_bom():
+    # Excel-exported UTF-8 CSVs prefix the first header with a BOM.
+    text = "﻿source,table,column,type\ncards,card_accounts,acct_id,integer\n"
+    rows = read_csv_rows(text, source="fallback")
+    assert rows[0].source == "cards" and rows[0].table == "card_accounts"

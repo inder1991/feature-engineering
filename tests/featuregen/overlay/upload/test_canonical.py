@@ -40,3 +40,11 @@ def test_duplicate_same_type_dedups_conflicting_type_quarantines():
 def test_row_carries_definition():
     r = CanonicalRow("deposits", "accounts", "balance", "numeric", definition="ledger balance")
     assert r.definition == "ledger balance"
+
+
+def test_unrecognized_sensitivity_is_quarantined():
+    rows = [_row(column="ssn", sensitivity="confidential")]   # not pii/restricted
+    result = validate_rows(rows)
+    assert result.good == []
+    assert len(result.quarantined) == 1
+    assert "sensitivity" in result.quarantined[0].message

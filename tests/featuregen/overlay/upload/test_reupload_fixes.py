@@ -93,3 +93,12 @@ def test_declared_as_of_basis_is_used(db):
     assert ingest_upload(db, src, rows, actor=_actor(), now=NOW).status == "ingested"
     av = resolve_fact(db, UploadCatalog(src, []), table_ref(src, "log"), "availability_time", now=NOW)
     assert av.value == {"column": "ingested_ts", "basis": "ingested_at"}
+
+
+def test_first_upload_is_flagged_then_not(db):
+    _seal()
+    rows = [CanonicalRow("newsrc", "t", "id", "integer", is_grain=True)]
+    r1 = ingest_upload(db, "newsrc", rows, actor=_actor(), now=NOW)
+    assert r1.flagged is not None and "first upload" in r1.flagged
+    r2 = ingest_upload(db, "newsrc", rows, actor=_actor(), now=NOW)
+    assert r2.flagged is None
