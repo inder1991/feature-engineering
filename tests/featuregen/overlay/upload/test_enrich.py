@@ -90,5 +90,9 @@ def test_concept_inputs_exclude_free_text_definition(db):
     rows = [CanonicalRow("deposits", "accounts", "bal", "numeric",
                          definition="holder SSN 123-45-6789")]   # PII in free text
     enrich_concepts(db, rows, _Capture())
-    assert "definition" not in captured["inputs"]
-    assert set(captured["inputs"]) == {"table", "column", "type"}
+    from featuregen.intake.redaction import INPUT_KEY_CATALOG
+    # Inputs are reserved-keyed; the LLM-visible catalog metadata is names/types only — the
+    # uploader's free-text definition (and its PII) is nowhere in the outbound payload.
+    assert captured["inputs"][INPUT_KEY_CATALOG] == {"table": "accounts", "column": "bal",
+                                                     "type": "numeric"}
+    assert "123-45-6789" not in str(captured["inputs"])

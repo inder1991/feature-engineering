@@ -3,9 +3,10 @@ from __future__ import annotations
 import hashlib
 import json
 
-from featuregen.intake.llm import PROVIDER_OK, LLMClient, LLMRequest
+from featuregen.intake.llm import LLMClient
 from featuregen.overlay.upload.canonical import CanonicalRow
 from featuregen.overlay.upload.concepts import UNCLASSIFIED, is_known_concept
+from featuregen.overlay.upload.enrich_llm import audited_enrich_call
 
 _TASK = "overlay.enrich.concept"
 _DEF_TASK = "overlay.enrich.definition"
@@ -50,23 +51,14 @@ def _cache_put(conn, cache_table: str, content_hash_: str, value: str) -> None:
         (content_hash_, value))
 
 
-def _call(client: LLMClient, task: str, prompt_id: str, schema_id: str, inputs: dict,
-          out_key: str) -> str | None:
-    """Return the trimmed string output, or None on ANY failure/empty. None means 'no answer this
-    time' — the caller must NOT cache it, so a transient provider failure never poisons the cache
-    permanently (M3). A real provider that fails closed (M2) also yields None -> enrichment simply
-    produces nothing until the full call_llm+redaction integration lands (documented follow-on)."""
-    req = LLMRequest(
-        task=task, prompt_id=prompt_id, prompt_version=1,
-        inputs=inputs,   # schema NAMES/types only — never free-text or data values (M4 egress)
-        output_schema_id=schema_id, output_schema_version=1,
-        generation_settings={"provider": "fake", "model": "test"},
-    )
-    result = client.call(req)
-    if result.status != PROVIDER_OK or not isinstance(result.output, dict):
-        return None
-    val = str(result.output.get(out_key, "")).strip()
-    return val or None
+def _call(conn, client: LLMClient, task: str, prompt_id: str, schema_id: str,
+          catalog_metadata: dict, out_key: str, instruction: str, actor) -> str | None:
+    """Run one GOVERNED enrichment call (attached schema, reserved keys, egress guard, audit record —
+    so a real provider works and PII can't leak). Returns None on any failure/empty so a transient
+    failure never poisons the cache (M3)."""
+    return audited_enrich_call(
+        conn, client, task=task, prompt_id=prompt_id, schema_id=schema_id,
+        catalog_metadata=catalog_metadata, out_key=out_key, instruction=instruction, actor=actor)
 
 
 def _bounded(val: str | None, max_len: int) -> str | None:
@@ -77,15 +69,17 @@ def _bounded(val: str | None, max_len: int) -> str | None:
     return val
 
 
-def enrich_concepts(conn, rows: list[CanonicalRow], client: LLMClient) -> dict[str, str]:
+def enrich_concepts(conn, rows: list[CanonicalRow], client: LLMClient,
+                    actor=None) -> dict[str, str]:
     by_hash: dict[str, CanonicalRow] = {content_hash(r): r for r in rows}
     result = _cache_get(conn, "enrichment_concept", list(by_hash))
     for h, row in by_hash.items():
         if h in result:
             continue
         # Metadata only (names/types) — NOT the uploader's free-text definition (M4 egress risk).
-        raw = _call(client, _TASK, "overlay_concept_v1", "overlay_concept",
-                    {"table": row.table, "column": row.column, "type": row.type}, "concept")
+        raw = _call(conn, client, _TASK, "overlay_concept_v1", "overlay_concept",
+                    {"table": row.table, "column": row.column, "type": row.type}, "concept",
+                    "Classify this column into the controlled concept vocabulary.", actor)
         if raw is None:
             continue   # failure/empty -> don't cache; retry next ingest (M3)
         concept = raw if is_known_concept(raw) else UNCLASSIFIED
@@ -94,16 +88,20 @@ def enrich_concepts(conn, rows: list[CanonicalRow], client: LLMClient) -> dict[s
     return result
 
 
-def draft_definitions(conn, rows: list[CanonicalRow], client: LLMClient) -> dict[str, str]:
+def draft_definitions(conn, rows: list[CanonicalRow], client: LLMClient,
+                      actor=None) -> dict[str, str]:
     """Draft a definition ONLY for columns with no declared one (R3: never overwrite a human's)."""
     blank = {content_hash(r): r for r in rows if not r.definition}
     result = _cache_get(conn, "enrichment_definition", list(blank))
     for h, row in blank.items():
         if h in result:
             continue
-        drafted = _bounded(_call(client, _DEF_TASK, "overlay_definition_v1", "overlay_definition",
+        drafted = _bounded(_call(conn, client, _DEF_TASK, "overlay_definition_v1",
+                                 "overlay_definition",
                                  {"table": row.table, "column": row.column, "type": row.type},
-                                 "definition"), 500)
+                                 "definition",
+                                 "Draft a one-line business definition for this column.",
+                                 actor), 500)
         if drafted is None:
             continue   # failure / empty / over-long / list-stringified -> don't cache (M3/M9)
         _cache_put(conn, "enrichment_definition", h, drafted)
@@ -111,7 +109,8 @@ def draft_definitions(conn, rows: list[CanonicalRow], client: LLMClient) -> dict
     return result
 
 
-def classify_domains(conn, rows: list[CanonicalRow], client: LLMClient) -> dict[str, str]:
+def classify_domains(conn, rows: list[CanonicalRow], client: LLMClient,
+                     actor=None) -> dict[str, str]:
     """Classify each table's business domain (per-table), returning {table_name: domain}."""
     by_table: dict[str, list[str]] = {}
     source = rows[0].source if rows else ""   # rows share one source (foreign ones are quarantined)
@@ -127,8 +126,9 @@ def classify_domains(conn, rows: list[CanonicalRow], client: LLMClient) -> dict[
         if h in cached:
             result[table] = cached[h]
             continue
-        domain = _bounded(_call(client, _DOMAIN_TASK, "overlay_domain_v1", "overlay_domain",
-                                {"table": table, "columns": sorted(cols)}, "domain"), 64)
+        domain = _bounded(_call(conn, client, _DOMAIN_TASK, "overlay_domain_v1", "overlay_domain",
+                                {"table": table, "columns": sorted(cols)}, "domain",
+                                "Classify this table's business domain.", actor), 64)
         if domain is None:
             continue   # failure / empty / over-long / list-stringified -> don't cache (M3/M9)
         _cache_put(conn, "enrichment_domain", h, domain)
