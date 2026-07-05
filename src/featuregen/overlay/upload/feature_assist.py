@@ -30,13 +30,19 @@ def _call_raw(client: LLMClient, task: str, prompt_id: str, schema_id: str, inpu
     return out if isinstance(out, dict) else {}
 
 
-def _candidate_columns(conn, catalog_source: str | None, roles: Iterable[str]) -> list[dict]:
+def _candidate_columns(conn, catalog_source: str | None, roles: Iterable[str],
+                       entity: str | None = None) -> list[dict]:
     # Read-scope: never feed a sensitivity-tagged column the caller can't see to the LLM (M6).
     sql = ("SELECT catalog_source, object_ref, table_name, column_name, concept, domain, definition "
            "FROM graph_node WHERE kind = 'column' "
            "AND (sensitivity IS NULL OR sensitivity = ANY(%s))")
     params: list = [allowed_sensitivities(roles)]
-    if catalog_source:
+    if entity:
+        # Cross-domain gather: candidates from EVERY catalog that contains this entity, not one source.
+        sql += (" AND catalog_source IN "
+                "(SELECT DISTINCT catalog_source FROM graph_node WHERE entity = %s)")
+        params.append(entity)
+    elif catalog_source:
         sql += " AND catalog_source = %s"
         params.append(catalog_source)
     rows = conn.execute(sql, params).fetchall()
@@ -93,13 +99,15 @@ def _validate_idea(conn, raw: dict, known: set[str], target_ref: str | None,
 
 def recommend_features(conn, objective: str, client: LLMClient, *,
                        catalog_source: str | None = None, roles: Iterable[str] = (),
+                       entity: str | None = None,
                        target_ref: str | None = None, now: datetime | None = None,
                        fresh_within: timedelta = timedelta(hours=24),
                        target: int = 5, budget: int = 3) -> list[FeatureIdea]:
     """Bounded generate-validate-refine loop. Each round the LLM proposes; every candidate runs the
     deterministic gauntlet; rejections feed back as `avoid` hints to the next round; stops at `target`
-    accepted or `budget` rounds. The LLM only proposes — code owns the loop, the checks are deterministic."""
-    cols = _candidate_columns(conn, catalog_source, roles)
+    accepted or `budget` rounds. The LLM only proposes — code owns the loop, the checks are deterministic.
+    Pass `entity` to gather candidates CROSS-DOMAIN (every catalog containing that entity)."""
+    cols = _candidate_columns(conn, catalog_source, roles, entity)
     known = {c["object_ref"] for c in cols}
     accepted: list[FeatureIdea] = []
     seen: set[str] = set()

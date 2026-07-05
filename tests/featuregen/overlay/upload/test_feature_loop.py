@@ -77,3 +77,33 @@ def test_loop_rejects_stale_source(db):
     out = recommend_features(db, "predict churn", client, catalog_source="bank",
                              target_ref="public.accounts.churned", now=NOW)
     assert out == []                            # the only candidate's source is stale
+
+
+def test_cross_domain_gather_spans_catalogs(db):
+    """With an entity anchor, the loop gathers candidates from EVERY catalog holding that entity."""
+    build_graph(db, "deposits", [
+        CanonicalRow("deposits", "accounts", "cust_ref", "integer", entity="Customer"),
+        CanonicalRow("deposits", "accounts", "balance", "numeric")])
+    build_graph(db, "cards", [
+        CanonicalRow("cards", "card_accounts", "cust_id", "integer", entity="Customer"),
+        CanonicalRow("cards", "card_accounts", "spend", "numeric")])
+    _fresh_watermark(db, "deposits", NOW)
+    _fresh_watermark(db, "cards", NOW)
+
+    captured = {}
+
+    class _Capture:
+        def call(self, request):
+            captured["refs"] = {c["object_ref"] for c in request.inputs["columns"]}
+            from featuregen.intake.llm import LLMResult
+            # propose a CROSS-DOMAIN feature: balance (deposits) + spend (cards)
+            return LLMResult(output={"features": [{"name": "cross", "aggregation": "avg_90d",
+                "derives_from": ["public.accounts.balance", "public.card_accounts.spend"]}]},
+                self_reported_scores={}, call_ref="", status="ok")
+
+    out = recommend_features(db, "predict churn", _Capture(), entity="Customer", now=NOW, target=1)
+    # the menu spanned both catalogs...
+    assert "public.accounts.balance" in captured["refs"]
+    assert "public.card_accounts.spend" in captured["refs"]
+    # ...and a cross-domain feature was accepted (both sources fresh, no leak/unsafe).
+    assert [f.name for f in out] == ["cross"]
