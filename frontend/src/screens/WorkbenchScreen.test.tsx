@@ -503,6 +503,84 @@ describe('described drafts', () => {
   })
 })
 
+describe('batch describe composer', () => {
+  const THREE_LINES =
+    'total spend per customer{Enter}days since last transaction{Enter}active accounts per customer'
+
+  async function typeDescribe(text: string) {
+    render(<WorkbenchScreen />)
+    await userEvent.type(screen.getByLabelText('Catalog source'), 'deposits')
+    await openDescribe()
+    await userEvent.type(screen.getByLabelText('Describe the feature you want'), text)
+  }
+
+  it('drafts one candidate per line, in line order, against the snapshot source', async () => {
+    featureRecipe.mockResolvedValue(recipeWith([]))
+    await typeDescribe(THREE_LINES)
+    // The live label counts the non-empty lines before submit.
+    expect(screen.getByRole('button', { name: 'Draft 3 candidates' })).toBeEnabled()
+    await userEvent.click(screen.getByRole('button', { name: 'Draft 3 candidates' }))
+    expect(await screen.findByText('active_accounts_per_customer')).toBeInTheDocument()
+    expect(featureRecipe).toHaveBeenCalledTimes(3)
+    expect(featureRecipe).toHaveBeenNthCalledWith(1, 'total spend per customer', 'deposits')
+    expect(featureRecipe).toHaveBeenNthCalledWith(2, 'days since last transaction', 'deposits')
+    expect(featureRecipe).toHaveBeenNthCalledWith(3, 'active accounts per customer', 'deposits')
+    expect(screen.getAllByText('Draft')).toHaveLength(3)
+    // Candidates append in line order.
+    const list = screen.getByRole('list').textContent ?? ''
+    expect(list.indexOf('total_spend_per_customer'))
+      .toBeLessThan(list.indexOf('days_since_last_transaction'))
+    expect(list.indexOf('days_since_last_transaction'))
+      .toBeLessThan(list.indexOf('active_accounts_per_customer'))
+    // A clean batch clears the textarea fully; the composer stays open.
+    expect(screen.getByLabelText('Describe the feature you want')).toHaveValue('')
+  })
+
+  it('isolates a failed line: the rest still draft and only the failed line stays to retry', async () => {
+    featureRecipe
+      .mockResolvedValueOnce(recipeWith([]))
+      .mockRejectedValueOnce(new api.ApiError(422, 'no column matches that description'))
+      .mockResolvedValueOnce(recipeWith([]))
+    await typeDescribe(THREE_LINES)
+    await userEvent.click(screen.getByRole('button', { name: 'Draft 3 candidates' }))
+    expect(await screen.findByText('active_accounts_per_customer')).toBeInTheDocument()
+    expect(screen.getByText('total_spend_per_customer')).toBeInTheDocument()
+    expect(screen.queryByText('days_since_last_transaction')).not.toBeInTheDocument()
+    expect(screen.getAllByText('Draft')).toHaveLength(2)
+    // The rejected line is called out inline and left in the textarea for a retry.
+    expect(screen.getByText('Line 2: no column matches that description')).toBeInTheDocument()
+    expect(screen.getByLabelText('Describe the feature you want'))
+      .toHaveValue('days since last transaction')
+  })
+
+  it('drafts each line once when the submit is double-clicked in flight', async () => {
+    const first = deferred<api.Recipe>()
+    const second = deferred<api.Recipe>()
+    featureRecipe
+      .mockImplementationOnce(() => first.promise)
+      .mockImplementationOnce(() => second.promise)
+    await typeDescribe('total spend per customer{Enter}days since last transaction')
+    const button = screen.getByRole('button', { name: 'Draft 2 candidates' })
+    await userEvent.click(button)
+    // Line 1's recipe is pending; the button is disabled and a second submit is a no-op.
+    expect(button).toBeDisabled()
+    expect(button).toHaveTextContent('Drafting')
+    await userEvent.click(button)
+    expect(featureRecipe).toHaveBeenCalledTimes(1)
+    await act(async () => {
+      first.resolve(recipeWith([]))
+    })
+    await act(async () => {
+      second.resolve(recipeWith([]))
+    })
+    expect(await screen.findByText('days_since_last_transaction')).toBeInTheDocument()
+    // Exactly one call per line: the in-flight double-submit never started a second batch.
+    expect(featureRecipe).toHaveBeenCalledTimes(2)
+    expect(featureRecipe).toHaveBeenNthCalledWith(1, 'total spend per customer', 'deposits')
+    expect(featureRecipe).toHaveBeenNthCalledWith(2, 'days since last transaction', 'deposits')
+  })
+})
+
 describe('verification stamp and rationale', () => {
   it('renders the causal rationale when present and omits it when the LLM left it blank', async () => {
     await renderAndGenerate([IDEA, OTHER_IDEA])

@@ -37,6 +37,10 @@ const TRAY_STYLE = {
 
 const EXAMPLE_GOAL = 'predict churn'
 
+// One definition per line. The newline-separated example teaches the batch shape at a glance.
+const DESCRIBE_PLACEHOLDER =
+  'One feature per line, e.g.\ntotal spend per customer over the last 90 days\ndays since last transaction'
+
 const WARN_GLYPH = 'M8 2.5 1.5 13.25h13L8 2.5ZM8 6.75v3M8 12v.01'
 
 function CalloutGlyph({ d }: { d: string }) {
@@ -222,6 +226,9 @@ export function WorkbenchScreen() {
   const [scopeChanged, setScopeChanged] = useState(false)
   const [describeOpen, setDescribeOpen] = useState(false)
   const [describeText, setDescribeText] = useState('')
+  // Per-line draft failures, "Line N: <detail>", shown in the composer while the successful
+  // lines still draft. Distinct from the top notice, which carries deployment-level facts.
+  const [draftErrors, setDraftErrors] = useState<string[]>([])
   const [generating, setGenerating] = useState(false)
   const [drafting, setDrafting] = useState(false)
   const [confirmingBatch, setConfirmingBatch] = useState(false)
@@ -230,11 +237,16 @@ export function WorkbenchScreen() {
   // Out-of-order guards: only the latest request per handler may apply its response.
   const generateSeq = useRef(0)
   const draftSeq = useRef(0)
+  // Reentry guard for the draft batch: a second submit while a batch is in flight is a no-op,
+  // so each line's recipe fires exactly once even before the disabled attribute lands.
+  const draftInFlight = useRef(false)
   // Reentry guard for the register batch: state updates are async, so a double click on
   // Confirm registration could otherwise start two batches before the disabled attribute lands.
   const batchInFlight = useRef(false)
 
   const candidates: Candidate[] = [...(generated ?? []), ...drafts]
+  // One definition per non-empty line: the button label and its gating read this directly.
+  const draftLines = describeText.split('\n').map(line => line.trim()).filter(Boolean)
   // Only generated candidates pass the design gauntlet, so the design-checked stamp and its one
   // help line appear only when the list holds at least one generated candidate.
   const hasGenerated = (generated?.length ?? 0) > 0
@@ -262,6 +274,7 @@ export function WorkbenchScreen() {
     setSelected(new Set())
     setRegistered({})
     setErrors({})
+    setDraftErrors([])
     setScreenedTarget(null)
     setConfirmingBatch(false)
     if (hadCandidates) setScopeChanged(true)
@@ -315,26 +328,54 @@ export function WorkbenchScreen() {
     }
   }
 
-  async function draftCandidate(e: FormEvent) {
+  async function draftCandidates(e: FormEvent) {
     e.preventDefault()
-    const query = describeText.trim()
+    if (draftInFlight.current) return
+    // Capture the source once for the whole batch: every recipe drafts against one snapshot,
+    // so a mid-batch scope edit cannot split the batch across sources.
     const snapshotSource = source.trim()
-    if (!query || !snapshotSource) return
+    const lines = describeText.split('\n').map(line => line.trim()).filter(Boolean)
+    if (lines.length === 0 || !snapshotSource) return
     const seq = ++draftSeq.current
+    draftInFlight.current = true
     setNotice('')
+    setDraftErrors([])
     setDrafting(true)
+    const fresh: DraftCandidate[] = []
+    const failedLines: string[] = []
+    const lineErrors: string[] = []
+    let providerErr: ApiError | null = null
     try {
-      const recipe = await featureRecipe(query, snapshotSource)
+      // Sequential, in line order: deterministic and kind to the backend. A rejected line is
+      // isolated; the surviving lines still draft.
+      for (let i = 0; i < lines.length; i++) {
+        const query = lines[i]
+        try {
+          const recipe = await featureRecipe(query, snapshotSource)
+          fresh.push({
+            kind: 'draft' as const, key: `d${seq}:${i}`, name: slugFrom(query),
+            description: query, recipe, snapshotSource,
+          })
+        } catch (err) {
+          failedLines.push(query)
+          if (err instanceof ApiError && err.status === 503) {
+            // A missing provider is a deployment fact, not a per-line problem: it surfaces as
+            // the one honest notice the generate path uses, never as N identical line errors.
+            providerErr = err
+          } else {
+            lineErrors.push(
+              `Line ${i + 1}: ${err instanceof ApiError ? err.detail : String(err)}`)
+          }
+        }
+      }
       if (seq !== draftSeq.current) return
-      setDrafts(prev => [...prev, {
-        kind: 'draft' as const, key: `d${seq}`, name: slugFrom(query), description: query,
-        recipe, snapshotSource,
-      }])
-      setDescribeText('')
-    } catch (err) {
-      if (seq !== draftSeq.current) return
-      fail(err)
+      if (fresh.length > 0) setDrafts(prev => [...prev, ...fresh])
+      // Keep only the failed lines so a retry is one click away; a clean batch clears fully.
+      setDescribeText(failedLines.join('\n'))
+      setDraftErrors(lineErrors)
+      if (providerErr) fail(providerErr)
     } finally {
+      draftInFlight.current = false
       if (seq === draftSeq.current) setDrafting(false)
     }
   }
@@ -520,25 +561,42 @@ export function WorkbenchScreen() {
 
       {describeOpen && (
         <div className="panel" id="wb-describe-panel">
-          <h2>Describe a feature</h2>
-          <form onSubmit={draftCandidate} style={{ display: 'grid', gap: 12, margin: 0 }}>
+          <h2>Describe features</h2>
+          <form onSubmit={draftCandidates} style={{ display: 'grid', gap: 12, margin: 0 }}>
             <div className="field" style={{ maxWidth: 640 }}>
               <label htmlFor="wb-describe">Describe the feature you want</label>
               <textarea
                 id="wb-describe"
-                rows={3}
+                rows={4}
                 value={describeText}
                 onChange={e => setDescribeText(e.target.value)}
-                placeholder="e.g. total spend per customer over the last 90 days"
+                placeholder={DESCRIBE_PLACEHOLDER}
               />
+              <p className="hint" style={HELP_STYLE}>
+                Write one definition per line. Each line becomes a draft candidate you can name,
+                adjust, and register together.
+              </p>
             </div>
+            {draftErrors.length > 0 && (
+              <div style={{ display: 'grid', gap: 4 }}>
+                {draftErrors.map(message => (
+                  <p key={message} className="error" role="alert">
+                    {message}
+                  </p>
+                ))}
+              </div>
+            )}
             <div style={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 12 }}>
               <button
                 type="submit"
                 className="btn"
-                disabled={!describeText.trim() || !source.trim() || drafting}
+                disabled={drafting || draftLines.length === 0 || !source.trim()}
               >
-                {drafting ? 'Drafting' : 'Draft candidate'}
+                {drafting
+                  ? 'Drafting…'
+                  : draftLines.length > 1
+                    ? `Draft ${draftLines.length} candidates`
+                    : 'Draft candidate'}
               </button>
               {!source.trim() && (
                 <p className="hint">
