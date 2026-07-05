@@ -83,3 +83,28 @@ def test_confirm_reruns_mcv_and_refuses_bad_drafts(db):
     ghost = ContractDraft("g", "def", "accounts", "avg_90d", "posted_at", ["public.accounts.vanished"])
     with pytest.raises(ContractValidationError):
         confirm_contract(db, ghost, actor="ds1", now=NOW)
+
+
+def test_reconfirm_reuses_one_feature_not_a_new_one(db):
+    # B4: re-confirm reuses + refreshes the SAME feature (no proliferation)
+    _bank(db)
+    c1 = confirm_contract(db, _draft(), actor="ds1", now=NOW)
+    c2 = confirm_contract(db, _draft(), actor="ds1", now=NOW)
+    assert c1.feature_id == c2.feature_id
+    assert c2.version == 2
+    assert db.execute("SELECT count(*) FROM feature WHERE name = 'avg_balance_90d'").fetchone()[0] == 1
+
+
+def test_ambiguous_multi_catalog_object_ref_is_refused(db):
+    # B3: the same object_ref in two catalogs is ambiguous -> fail closed, don't bind to both
+    from featuregen.overlay.upload.contract.govern import ContractValidationError
+    _bank(db)
+    build_graph(db, "bank2", [
+        CanonicalRow("bank2", "accounts", "balance", "numeric"),
+        CanonicalRow("bank2", "accounts", "posted_at", "timestamp", as_of=True)])
+    db.execute(
+        "INSERT INTO overlay_drift_watermark (catalog_source, last_completed_at, last_run_id, head_seq) "
+        "VALUES ('bank2', %s, 'r', 0) ON CONFLICT (catalog_source) DO UPDATE SET last_completed_at = %s",
+        (NOW, NOW))
+    with pytest.raises(ContractValidationError):
+        confirm_contract(db, _draft(), actor="ds1", now=NOW)

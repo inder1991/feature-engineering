@@ -46,13 +46,23 @@ def _actor_json(actor) -> str:
 
 
 def _derives_pairs(conn, object_refs: list[str]) -> tuple[tuple[str, str], ...]:
-    # map each grounded object_ref back to its catalog_source (the feature layer keys on the pair)
+    # Map each grounded object_ref back to its catalog_source. B3: object_ref is NOT catalog-qualified,
+    # so if one lives in >1 catalog we CANNOT know which the feature read — fail closed rather than bind
+    # the contract to catalogs it never used. (Full fix: carry catalog_source on FeatureIdea.derives_from.)
     if not object_refs:
         return ()
     rows = conn.execute(
-        "SELECT DISTINCT object_ref, catalog_source FROM graph_node WHERE object_ref = ANY(%s)",
-        (list(object_refs),)).fetchall()
-    return tuple((r[1], r[0]) for r in rows)
+        "SELECT object_ref, catalog_source FROM graph_node WHERE kind = 'column' "
+        "AND object_ref = ANY(%s)", (list(object_refs),)).fetchall()
+    by_ref: dict[str, set[str]] = {}
+    for ref, src in rows:
+        by_ref.setdefault(ref, set()).add(src)
+    ambiguous = sorted(ref for ref, srcs in by_ref.items() if len(srcs) > 1)
+    if ambiguous:
+        raise ContractValidationError(
+            f"ambiguous catalog_source for {ambiguous} — object_ref spans multiple catalogs; "
+            "catalog-qualified derives_from required (B3)")
+    return tuple((next(iter(srcs)), ref) for ref, srcs in by_ref.items())
 
 
 def confirm_contract(conn, draft: ContractDraft, *, actor, target_ref: str | None = None,
@@ -66,12 +76,26 @@ def confirm_contract(conn, draft: ContractDraft, *, actor, target_ref: str | Non
     if not (draft.definition or "").strip():
         raise ContractValidationError("contract has an empty definition, not governed")
     pairs = _derives_pairs(conn, draft.derives_from)
-    feature_id = register_feature(conn, FeatureSpec(
-        name=draft.feature_name, description=draft.definition, grain_table=draft.grain_table,
-        aggregation=draft.aggregation, as_of_column=draft.as_of_column, derives_from=pairs))
-    prev = conn.execute("SELECT COALESCE(MAX(version), 0) FROM contract WHERE feature_name = %s",
-                        (draft.feature_name,)).fetchone()
-    version = (prev[0] or 0) + 1
+    # B4: ONE feature per feature_name — re-confirm reuses + refreshes the feature (no proliferation),
+    # so drift impact/freshness point at a single live feature, not N duplicates.
+    prev = conn.execute("SELECT feature_id, version FROM contract WHERE feature_name = %s "
+                        "ORDER BY version DESC LIMIT 1", (draft.feature_name,)).fetchone()
+    if prev is not None:
+        feature_id, version = prev[0], prev[1] + 1
+        conn.execute(
+            "UPDATE feature SET description = %s, grain_table = %s, aggregation = %s, "
+            "as_of_column = %s WHERE feature_id = %s",
+            (draft.definition, draft.grain_table, draft.aggregation, draft.as_of_column, feature_id))
+        conn.execute("DELETE FROM feature_derives_from WHERE feature_id = %s", (feature_id,))
+        for catalog_source, object_ref in pairs:
+            conn.execute("INSERT INTO feature_derives_from (feature_id, catalog_source, object_ref) "
+                         "VALUES (%s, %s, %s) ON CONFLICT DO NOTHING",
+                         (feature_id, catalog_source, object_ref))
+    else:
+        feature_id = register_feature(conn, FeatureSpec(
+            name=draft.feature_name, description=draft.definition, grain_table=draft.grain_table,
+            aggregation=draft.aggregation, as_of_column=draft.as_of_column, derives_from=pairs))
+        version = 1
     contract_id = mint_id("contract")
     conn.execute(
         "INSERT INTO contract (contract_id, feature_id, feature_name, definition, version, actor) "
@@ -90,11 +114,13 @@ def contract_freshness(conn, contract_id: str, *, now: datetime) -> FeatureFresh
 
 
 def contracts_affected_by(conn, catalog_source: str, object_ref: str) -> list[str]:
-    """Drift impact: the contracts whose feature derives from a drifted column."""
+    """Drift impact: the CURRENT contract (max version) per feature that derives from a drifted column
+    — not every historical version (B4)."""
     feature_ids = features_affected_by(conn, catalog_source, object_ref)
     if not feature_ids:
         return []
     rows = conn.execute(
-        "SELECT contract_id FROM contract WHERE feature_id = ANY(%s) ORDER BY contract_id",
+        "SELECT DISTINCT ON (feature_name) contract_id FROM contract "
+        "WHERE feature_id = ANY(%s) ORDER BY feature_name, version DESC",
         (feature_ids,)).fetchall()
-    return [r[0] for r in rows]
+    return sorted(r[0] for r in rows)
