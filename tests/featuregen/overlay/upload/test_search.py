@@ -60,3 +60,18 @@ def test_stale_source_excluded(db):
     # Query far in the future -> the source's watermark is older than the 24h SLA -> excluded.
     later = now + timedelta(days=3)
     assert search(db, "balance", now=later) == []
+
+
+def test_search_uses_llm_concept(db):
+    from featuregen.intake.llm import FakeLLM, FakeResponse
+    _seal()
+    now = datetime(2026, 7, 5, tzinfo=timezone.utc)
+    rows = [CanonicalRow("deposits", "accounts", "bal", "numeric")]  # cryptic name, no definition
+    client = FakeLLM(script={"overlay.enrich.concept":
+                             FakeResponse(output={"concept": "monetary_amount"})})
+    assert ingest_upload(db, "deposits", rows, actor=_actor(), now=now,
+                         client=client).status == "ingested"
+    # 'monetary' finds the cryptic 'bal' column only via its LLM-assigned concept.
+    hits = search(db, "monetary", now=now)
+    assert any(h.column == "bal" for h in hits)
+    assert next(h for h in hits if h.column == "bal").concept == "monetary_amount"

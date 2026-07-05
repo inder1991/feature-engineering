@@ -39,3 +39,18 @@ def test_build_graph_is_idempotent_rebuild(db):
         "SELECT object_ref FROM graph_node WHERE catalog_source='deposits'").fetchall()}
     assert "public.accounts.old_col" not in refs
     assert "public.accounts.id" in refs
+
+
+def test_build_graph_writes_concept_into_node_and_search(db):
+    from featuregen.overlay.upload.enrich import content_hash
+    rows = [CanonicalRow("deposits", "accounts", "balance", "numeric")]
+    concepts = {content_hash(rows[0]): "monetary_amount"}
+    build_graph(db, "deposits", rows, concepts)
+    concept = db.execute(
+        "SELECT concept FROM graph_node WHERE object_ref='public.accounts.balance'").fetchone()[0]
+    assert concept == "monetary_amount"
+    # 'monetary' now matches the node via the folded concept text.
+    hit = db.execute(
+        "SELECT count(*) FROM graph_node WHERE object_ref='public.accounts.balance' "
+        "AND search_doc @@ plainto_tsquery('english','monetary')").fetchone()[0]
+    assert hit == 1

@@ -10,6 +10,7 @@ from featuregen.overlay.projection import OverlayProjection
 from featuregen.overlay.store import append_overlay_event, load_fact
 from featuregen.overlay.upload.brake import large_change_brake
 from featuregen.overlay.upload.canonical import CanonicalRow, validate_rows
+from featuregen.overlay.upload.enrich import enrich_concepts
 from featuregen.overlay.upload.graph import build_graph
 from featuregen.overlay.upload.upload_catalog import UploadCatalog, table_ref
 from featuregen.projections.runner import run_projection
@@ -57,7 +58,7 @@ def _assert_fact(conn, source: str, table: str, fact_type: str, value: dict, *, 
 
 
 def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
-                  actor, now: datetime | None = None) -> IngestResult:
+                  actor, now: datetime | None = None, client=None) -> IngestResult:
     vr = validate_rows(rows)
     if vr.structural_error:
         return IngestResult("rejected", vr.structural_error, 0, 0, len(vr.quarantined))
@@ -77,5 +78,6 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
     run_projection(conn, OverlayProjection())
     staled = sum(1 for c in changes if c.kind in ("drop", "type_change", "rename"))
 
-    build_graph(conn, catalog_source, vr.good)
+    concepts = enrich_concepts(conn, vr.good, client) if client is not None else None
+    build_graph(conn, catalog_source, vr.good, concepts)
     return IngestResult("ingested", None, asserted, staled, len(vr.quarantined))
