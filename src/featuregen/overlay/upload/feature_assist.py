@@ -64,6 +64,7 @@ class RejectCode:
     REDUNDANT = "REDUNDANT"                 # near-duplicate of an already-accepted candidate (item 1a)
     ALREADY_REGISTERED = "ALREADY_REGISTERED"   # duplicates a confirmed/registered feature (item 2)
     CRITIC = "CRITIC"                       # LLM-2 critic flagged a quality/fit issue (item 5)
+    NO_REVISION = "NO_REVISION"             # refine_idea: the model produced no revision to validate
 
 
 @dataclass(frozen=True, slots=True)
@@ -281,15 +282,20 @@ def _vet(conn, raw: dict, known: set[str], src_of: dict[str, set[str]], register
 def _fix_pass(conn, client: LLMClient, objective: str, accepted: list[FeatureIdea],
               issues: dict[str, str], menu: list[dict], known: set[str],
               src_of: dict[str, set[str]], registered: set,
-              target_ref, now, fresh_within) -> list[FeatureIdea]:
+              target_ref, now, fresh_within, feedback: str | None = None) -> list[FeatureIdea]:
     """One LLM-1 revision pass: keep the critic-clean features; ask LLM-1 to revise the flagged ones
-    given the critic's notes; gauntlet-validate the revisions. Returns the merged list."""
+    given the critic's notes; gauntlet-validate the revisions. Returns the merged list. `feedback`
+    is the HUMAN's round guidance (see recommend_features) and rides along here too, so a fix pass
+    revises under the same instruction as the rounds it repairs."""
     keep = [f for f in accepted if f.name not in issues]
     seen = {f.name for f in keep}
     fix_hints = [{"name": f.name, "derives_from": f.derives_from, "aggregation": f.aggregation,
                   "issue": issues[f.name]} for f in accepted if f.name in issues]
+    inputs: dict = {"columns": menu, "fix": fix_hints}
+    if feedback:
+        inputs["feedback"] = feedback
     out = _call_raw(conn, client, "overlay.feature.recommend", "feature_recommend_v1",
-                    "feature_ideas", objective, {"columns": menu, "fix": fix_hints})
+                    "feature_ideas", objective, inputs)
     for raw in out.get("features", []):
         idea = _vet(conn, raw, known, src_of, registered, keep, seen, [], target_ref, now, fresh_within)
         if idea is not None:
@@ -298,29 +304,18 @@ def _fix_pass(conn, client: LLMClient, objective: str, accepted: list[FeatureIde
     return keep
 
 
-def recommend_features(conn, objective: str, client: LLMClient, *,
-                       catalog_source: str | None = None, roles: Iterable[str] = (),
-                       entity: str | None = None,
-                       target_ref: str | None = None, now: datetime | None = None,
-                       fresh_within: timedelta = timedelta(hours=24),
-                       target: int = 5, budget: int = 3, critic: bool = True,
-                       critic_reviews: int = 3) -> list[FeatureIdea]:
-    """Generate (LLM-1) → a BOUNDED critic loop (LLM-2), then forward to the human.
-
-      Phase 1 — GENERATION (LLM-1): a budget-bounded generate-validate loop. Each round LLM-1 proposes;
-        every candidate clears the deterministic gauntlet (the hard safety floor); survivors are
-        de-duplicated (vs this run — item 1a — and the registry — item 2). Stops at `target` or `budget`.
-      Phase 2 — CRITIC LOOP (LLM-2), AT MOST `critic_reviews` (default 3) reviews: the critic reviews the
-        candidates; if it flags any, LLM-1 revises them (one fix pass) and the critic reviews again —
-        UP TO the cap. The loop exits early the moment the critic is clean.
-      Phase 3 — FORWARD TO HUMAN: whatever LLM-1 produced after the review cap goes forward; a still-
-        flagged feature carries the critic's residual note as ADVISORY, and the HUMAN decides fit at
-        Gate #1. Nothing is dropped for a critic note alone — only the deterministic gauntlet can drop.
-
-    TERMINATION: the critic runs at most `critic_reviews` times and LLM-1 fixes at most `critic_reviews-1`
-    times — a hard cap, so there is never an unbounded LLM-1↔LLM-2 loop. `budget` bounds only Phase 1.
-
-    Pass `entity` to gather candidates CROSS-DOMAIN; `critic=False` skips the critic loop."""
+def _generate(conn, objective: str, client: LLMClient, *,
+              catalog_source: str | None = None, roles: Iterable[str] = (),
+              entity: str | None = None,
+              target_ref: str | None = None, now: datetime | None = None,
+              fresh_within: timedelta = timedelta(hours=24),
+              target: int = 5, budget: int = 3, critic: bool = True,
+              critic_reviews: int = 3,
+              feedback: str | None = None) -> tuple[list[FeatureIdea], list[dict]]:
+    """The generate→critic loop body (phase docs on recommend_features). Returns BOTH the accepted
+    ideas AND the final `avoid` list — every structured rejection ({name, reason, code}) recorded
+    across the generation rounds — so callers can show the human WHAT was rejected and why.
+    recommend_features returns just the ideas; recommend_features_report exposes both."""
     cols = _candidate_columns(conn, catalog_source, roles, entity)
     known = {c["object_ref"] for c in cols}
     src_of: dict[str, set[str]] = {}          # object_ref -> catalog_source(s) in the candidate context
@@ -336,8 +331,13 @@ def recommend_features(conn, objective: str, client: LLMClient, *,
     for _ in range(budget):
         if len(accepted) >= target:
             break
+        # `avoid` is the loop's own machine feedback; `feedback` is HUMAN guidance for the whole
+        # round (Gate #3 "regenerate with feedback"). Omitted when unset so the call is unchanged.
+        inputs: dict = {"columns": menu, "avoid": avoid}
+        if feedback:
+            inputs["feedback"] = feedback
         out = _call_raw(conn, client, "overlay.feature.recommend", "feature_recommend_v1",
-                        "feature_ideas", objective, {"columns": menu, "avoid": avoid})
+                        "feature_ideas", objective, inputs)
         proposed = out.get("features", [])
         if not proposed:                       # stalled generator -> stop
             break
@@ -357,13 +357,119 @@ def recommend_features(conn, objective: str, client: LLMClient, *,
                 break                          # critic satisfied — nothing to fix
             if i < critic_reviews - 1:         # not the last allowed review -> let LLM-1 fix, re-review
                 accepted = _fix_pass(conn, client, objective, accepted, issues, menu, known, src_of,
-                                     registered, target_ref, now, fresh_within)
+                                     registered, target_ref, now, fresh_within, feedback)
 
     # ---- Phase 3: forward to the human; residual critic notes ride along as ADVISORY ----
     if issues:
         accepted = [f if f.name not in issues else replace(f, critic_note=issues[f.name])
                     for f in accepted]
-    return accepted[:target]
+    return accepted[:target], avoid
+
+
+def recommend_features(conn, objective: str, client: LLMClient, *,
+                       catalog_source: str | None = None, roles: Iterable[str] = (),
+                       entity: str | None = None,
+                       target_ref: str | None = None, now: datetime | None = None,
+                       fresh_within: timedelta = timedelta(hours=24),
+                       target: int = 5, budget: int = 3, critic: bool = True,
+                       critic_reviews: int = 3,
+                       feedback: str | None = None) -> list[FeatureIdea]:
+    """Generate (LLM-1) → a BOUNDED critic loop (LLM-2), then forward to the human.
+
+      Phase 1 — GENERATION (LLM-1): a budget-bounded generate-validate loop. Each round LLM-1 proposes;
+        every candidate clears the deterministic gauntlet (the hard safety floor); survivors are
+        de-duplicated (vs this run — item 1a — and the registry — item 2). Stops at `target` or `budget`.
+      Phase 2 — CRITIC LOOP (LLM-2), AT MOST `critic_reviews` (default 3) reviews: the critic reviews the
+        candidates; if it flags any, LLM-1 revises them (one fix pass) and the critic reviews again —
+        UP TO the cap. The loop exits early the moment the critic is clean.
+      Phase 3 — FORWARD TO HUMAN: whatever LLM-1 produced after the review cap goes forward; a still-
+        flagged feature carries the critic's residual note as ADVISORY, and the HUMAN decides fit at
+        Gate #1. Nothing is dropped for a critic note alone — only the deterministic gauntlet can drop.
+
+    TERMINATION: the critic runs at most `critic_reviews` times and LLM-1 fixes at most `critic_reviews-1`
+    times — a hard cap, so there is never an unbounded LLM-1↔LLM-2 loop. `budget` bounds only Phase 1.
+
+    Pass `entity` to gather candidates CROSS-DOMAIN; `critic=False` skips the critic loop.
+    `feedback` is HUMAN guidance for the round (never a data value): it is threaded into EVERY
+    generation round's inputs as "feedback" alongside the machine "avoid" list, and it only steers
+    what the LLM proposes — the gauntlet still validates every candidate exactly as without it."""
+    ideas, _ = _generate(
+        conn, objective, client, catalog_source=catalog_source, roles=roles, entity=entity,
+        target_ref=target_ref, now=now, fresh_within=fresh_within, target=target, budget=budget,
+        critic=critic, critic_reviews=critic_reviews, feedback=feedback)
+    return ideas
+
+
+@dataclass(frozen=True, slots=True)
+class RecommendReport:
+    """recommend_features plus the gauntlet's structured rejections — so the human sees WHAT was
+    rejected and why (rejection transparency at Gate #3), not just the survivors. Each rejection is
+    {"name", "reason", "code"} (code from RejectCode). Identical repeats from retry rounds are
+    collapsed: the same candidate rejected the same way across rounds appears once."""
+    ideas: list[FeatureIdea]
+    rejections: list[dict]
+
+
+def _dedupe_rejections(rejections: list[dict]) -> list[dict]:
+    seen: set[tuple] = set()
+    out: list[dict] = []
+    for r in rejections:
+        key = (r.get("name"), r.get("reason"), r.get("code"))
+        if key not in seen:
+            seen.add(key)
+            out.append(r)
+    return out
+
+
+def recommend_features_report(conn, objective: str, client: LLMClient, *,
+                              catalog_source: str | None = None, roles: Iterable[str] = (),
+                              entity: str | None = None,
+                              target_ref: str | None = None, now: datetime | None = None,
+                              fresh_within: timedelta = timedelta(hours=24),
+                              target: int = 5, budget: int = 3, critic: bool = True,
+                              critic_reviews: int = 3,
+                              feedback: str | None = None) -> RecommendReport:
+    """recommend_features with the same kwargs and semantics, returning a RecommendReport that also
+    carries the final avoid list as structured rejections. The API layer uses this so the UI can
+    show the rejected candidates honestly instead of silently omitting them."""
+    ideas, avoid = _generate(
+        conn, objective, client, catalog_source=catalog_source, roles=roles, entity=entity,
+        target_ref=target_ref, now=now, fresh_within=fresh_within, target=target, budget=budget,
+        critic=critic, critic_reviews=critic_reviews, feedback=feedback)
+    return RecommendReport(ideas=ideas, rejections=_dedupe_rejections(avoid))
+
+
+def refine_idea(conn, idea: dict, instruction: str, client: LLMClient, *,
+                catalog_source: str | None = None, roles: Iterable[str] = (),
+                entity: str | None = None, target_ref: str | None = None,
+                now: datetime | None = None,
+                fresh_within: timedelta = timedelta(hours=24),
+                ) -> tuple[FeatureIdea | None, dict | None]:
+    """One HUMAN-directed revision of a single candidate: the reviewer's `instruction` becomes a
+    fix hint (the same shape the critic loop uses), the model proposes ONE revision, and the
+    revision runs the full single-candidate gauntlet. Returns (revised_idea, None) on success or
+    (None, rejection_dict) when the revision fails — a rejection is DATA for the human, not an
+    error. The revision is still only a proposal: registering it remains a separate explicit
+    confirm. `instruction` is user text and goes through the audited egress-guarded seam like every
+    other feature-assist call; a blocked or empty model response returns code NO_REVISION."""
+    cols = _candidate_columns(conn, catalog_source, roles, entity)
+    known = {c["object_ref"] for c in cols}
+    src_of: dict[str, set[str]] = {}
+    for c in cols:
+        src_of.setdefault(c["object_ref"], set()).add(c["catalog_source"])
+    fix = [{"name": idea.get("name", ""), "derives_from": idea.get("derives_from", []),
+            "aggregation": idea.get("aggregation"), "issue": instruction}]
+    out = _call_raw(conn, client, "overlay.feature.recommend", "feature_recommend_v1",
+                    "feature_ideas", instruction, {"columns": _menu(cols), "fix": fix})
+    proposed = out.get("features", [])
+    if not proposed:
+        return None, {"name": str(idea.get("name", "")),
+                      "reason": "no revision was produced", "code": RejectCode.NO_REVISION}
+    raw = proposed[0] if isinstance(proposed[0], dict) else {}
+    revised, rej = _validate_idea(conn, raw, known, src_of, target_ref, now, fresh_within)
+    if rej is not None:
+        return None, {"name": str(raw.get("name", "")), "reason": rej.message, "code": rej.code}
+    return revised, None
 
 
 @dataclass(frozen=True, slots=True)
@@ -460,28 +566,59 @@ def route_strategies(conn, cols: list[dict]) -> list[tuple[str, str]]:
     return picks
 
 
+@dataclass(frozen=True, slots=True)
+class SetsReport:
+    """recommend_feature_sets plus the rejections aggregated across EVERY lens's loop (same
+    {"name", "reason", "code"} shape as RecommendReport, deduplicated across lenses) — the Gate #3
+    transparency the single-list report gives, for the multi-set flow."""
+    sets: list[FeatureSet]
+    rejections: list[dict]
+
+
+def recommend_feature_sets_report(conn, objective: str, client: LLMClient, *,
+                                  entity: str | None = None, catalog_source: str | None = None,
+                                  roles: Iterable[str] = (), target_ref: str | None = None,
+                                  now: datetime | None = None,
+                                  fresh_within: timedelta = timedelta(hours=24),
+                                  lenses: tuple[str, ...] | None = None,
+                                  per_set: int = 3, budget: int = 2,
+                                  feedback: str | None = None) -> SetsReport:
+    """recommend_feature_sets with the same kwargs and semantics, returning the sets AND the
+    rejections every lens's loop recorded (the same per-round avoid lists, deduplicated). `feedback`
+    is HUMAN guidance applied to every lens's generation rounds (see recommend_features)."""
+    if lenses is None:
+        strategies = route_strategies(conn, _candidate_columns(conn, catalog_source, roles, entity))
+    else:
+        strategies = [(lens, lens) for lens in lenses]
+    sets: list[FeatureSet] = []
+    rejections: list[dict] = []
+    for name, focus in strategies:
+        ideas, avoid = _generate(
+            conn, f"{objective} (focus: {focus})", client, entity=entity,
+            catalog_source=catalog_source, roles=roles, target_ref=target_ref, now=now,
+            fresh_within=fresh_within, target=per_set, budget=budget, feedback=feedback)
+        sets.append(FeatureSet(lens=name, features=ideas))
+        rejections.extend(avoid)
+    return SetsReport(sets=sets, rejections=_dedupe_rejections(rejections))
+
+
 def recommend_feature_sets(conn, objective: str, client: LLMClient, *,
                            entity: str | None = None, catalog_source: str | None = None,
                            roles: Iterable[str] = (), target_ref: str | None = None,
                            now: datetime | None = None, fresh_within: timedelta = timedelta(hours=24),
                            lenses: tuple[str, ...] | None = None,
-                           per_set: int = 3, budget: int = 2) -> list[FeatureSet]:
+                           per_set: int = 3, budget: int = 2,
+                           feedback: str | None = None) -> list[FeatureSet]:
     """Generate N DIVERSE, each-fully-validated feature sets — one per strategy — by running the loop
     once per strategy. When `lenses` is None (default) the §14.8 Router picks the APPLICABLE typed
     strategies from the data's shape (skipping e.g. temporal when there's no as-of column); pass explicit
     `lenses` to force a fixed set. Every feature in every set has passed the gauntlet, so the human only
-    ever curates among SAFE options."""
-    if lenses is None:
-        strategies = route_strategies(conn, _candidate_columns(conn, catalog_source, roles, entity))
-    else:
-        strategies = [(lens, lens) for lens in lenses]
-    return [
-        FeatureSet(lens=name, features=recommend_features(
-            conn, f"{objective} (focus: {focus})", client, entity=entity,
-            catalog_source=catalog_source, roles=roles, target_ref=target_ref, now=now,
-            fresh_within=fresh_within, target=per_set, budget=budget))
-        for name, focus in strategies
-    ]
+    ever curates among SAFE options. `feedback` is HUMAN guidance threaded into every lens's
+    generation rounds (see recommend_features)."""
+    return recommend_feature_sets_report(
+        conn, objective, client, entity=entity, catalog_source=catalog_source, roles=roles,
+        target_ref=target_ref, now=now, fresh_within=fresh_within, lenses=lenses,
+        per_set=per_set, budget=budget, feedback=feedback).sets
 
 
 def set_signals(conn, feature_set: FeatureSet) -> dict:
