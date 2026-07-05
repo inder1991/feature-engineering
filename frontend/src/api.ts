@@ -168,10 +168,12 @@ export async function featureImpact(objectRef: string, source: string): Promise<
 export async function recommendFeatures(
   objective: string,
   catalogSource: string | null,
+  targetRef: string | null = null,
 ): Promise<FeatureIdea[]> {
   const body = await post<{ proposals: FeatureIdea[] }>('/features/recommend', {
     objective,
     catalog_source: catalogSource,
+    target_ref: targetRef,
   })
   return body.proposals
 }

@@ -30,7 +30,8 @@ export function WorkbenchScreen() {
     e.preventDefault()
     setNotice('')
     try {
-      setProposals(await recommendFeatures(objective.trim(), source.trim() || null))
+      setProposals(await recommendFeatures(
+        objective.trim(), source.trim() || null, target.trim() || null))
     } catch (err) {
       setProposals(null)
       fail(err)
@@ -195,7 +196,11 @@ export function WorkbenchScreen() {
             placeholder="e.g. public.labels.churned"
           />
         </label>
-        <p className="hint">Set a target, then use “Check leakage” on a proposal.</p>
+        <p className="hint">
+          Set a target, then use “Check leakage” on a proposal.
+          {target.trim() &&
+            ' With a target set, new suggestions are also pre-screened against it server-side.'}
+        </p>
         {warnings?.length === 0 && <p className="empty">No leakage warnings.</p>}
         {warnings && warnings.length > 0 && (
           <div className="warning-banner" role="alert">

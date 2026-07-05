@@ -2,6 +2,7 @@
 separate explicit POST /features (suggestion-then-confirm, spec guardrail)."""
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from typing import Annotated
 
 import psycopg
@@ -26,6 +27,8 @@ router = APIRouter()
 class RecommendIn(BaseModel):
     objective: str = Field(min_length=1)
     catalog_source: str | None = None
+    target_ref: str | None = None
+    entity: str | None = None
 
 
 class RecipeIn(BaseModel):
@@ -45,8 +48,14 @@ def recommend(
     identity: Annotated[IdentityEnvelope, Depends(get_identity)],
     client: Annotated[LLMClient, Depends(get_llm)],
 ) -> dict[str, list[FeatureIdea]]:
+    # The gauntlet's target-leakage gate runs only when target_ref is passed and its freshness gate
+    # only when `now` is; over HTTP we ALWAYS pass the server clock (and forward optional
+    # target_ref/entity) so those gates are ON — omitting them would silently downgrade safety
+    # (review root-cause A).
     ideas = recommend_features(conn, body.objective, client,
-                               catalog_source=body.catalog_source, roles=identity.role_claims)
+                               catalog_source=body.catalog_source, roles=identity.role_claims,
+                               target_ref=body.target_ref, entity=body.entity,
+                               now=datetime.now(UTC))
     return {"proposals": ideas}
 
 

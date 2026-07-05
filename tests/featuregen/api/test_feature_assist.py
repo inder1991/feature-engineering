@@ -24,6 +24,20 @@ def _fake() -> FakeLLM:
     })
 
 
+def _leaky() -> FakeLLM:
+    # Same enrichment tasks as _fake (upload runs them first), plus a recommend response whose sole
+    # grounded derives-from IS the target column, so the leakage gate must reject it every pass.
+    return FakeLLM(script={
+        "overlay.enrich.concept": FakeResponse(output={"concept": "monetary_amount"}),
+        "overlay.enrich.definition": FakeResponse(output={"definition": "a business column"}),
+        "overlay.enrich.domain": FakeResponse(output={"domain": "Deposits"}),
+        "overlay.feature.recommend": FakeResponse(output={"features": [{
+            "name": "avg_balance", "description": "average balance per customer",
+            "derives_from": ["public.accounts.balance"],
+            "aggregation": "avg", "grain_table": "customers"}]}),
+    })
+
+
 def test_assist_unconfigured_is_503_not_broken(client):
     for path, body in [
         ("/features/recommend", {"objective": "churn"}),
@@ -44,6 +58,20 @@ def test_recommend_returns_grounded_proposals(make_client):
     assert len(proposals) == 1
     assert proposals[0]["name"] == "avg_balance"
     assert proposals[0]["derives_from"] == ["public.accounts.balance"]   # hallucination dropped
+
+
+def test_recommend_rejects_leaky_proposal_over_http(make_client):
+    # The route always forwards target_ref, so the deterministic gauntlet's leakage gate is ON over
+    # HTTP. A proposal deriving from the target column is rejected every pass; the loop retries to
+    # its budget with 'avoid' hints (the single-response script just repeats), so it exhausts the
+    # budget and returns nothing rather than the leaky feature.
+    client = make_client(llm_client=_leaky())
+    upload_csv(client, "deposits", DEPOSITS_CSV)
+    res = client.post("/features/recommend",
+                      json={"objective": "predict churn", "catalog_source": "deposits",
+                            "target_ref": "public.accounts.balance"},
+                      headers=AUTH)
+    assert res.json()["proposals"] == []
 
 
 def test_recipe_combines_llm_intent_with_deterministic_join_path(make_client):
