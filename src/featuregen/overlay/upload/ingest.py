@@ -7,6 +7,7 @@ from featuregen.overlay import facts
 from featuregen.overlay.catalog_changes import detect_catalog_changes
 from featuregen.overlay.identity import fact_key, proposal_fingerprint
 from featuregen.overlay.projection import OverlayProjection
+from featuregen.overlay.state import fold_overlay_state
 from featuregen.overlay.store import append_overlay_event, load_fact
 from featuregen.overlay.upload.brake import large_change_brake
 from featuregen.overlay.upload.canonical import CanonicalRow, validate_rows
@@ -41,18 +42,27 @@ def _table_facts(rows: list[CanonicalRow]):
 
 
 def _assert_fact(conn, source: str, table: str, fact_type: str, value: dict, *, actor) -> bool:
+    """Assert a fact, or RE-assert it when the upload changed its value or it is not currently
+    VERIFIED. Skipping only-on-existence (the original bug) served a stale value forever (B1) and
+    left a staled fact stuck unservable after the file was fixed (M1). We diff on the value: skip
+    only when the stream is already VERIFIED with the identical value."""
     fk = fact_key(table_ref(source, table), fact_type)
-    if load_fact(conn, fk):        # already asserted (slice: unchanged) -> skip (diff-append)
-        return False
+    stream = load_fact(conn, fk)
+    if stream:
+        state = fold_overlay_state(stream)
+        if state.status == "VERIFIED" and state.value == value:
+            return False   # genuinely unchanged -> skip (cheap re-upload)
+    # New fact, a changed value, or a non-VERIFIED (STALE/REVERIFY/REJECTED) stream -> (re)assert.
+    base = stream[-1].stream_version if stream else 0
     draft = append_overlay_event(conn, fact_key=fk, type=facts.OVERLAY_FACT_PROPOSED,
-        actor=actor, expected_version=0, payload={
+        actor=actor, expected_version=base, payload={
             "catalog_object_ref": {"catalog_source": source, "object_kind": "table",
                                    "schema": "public", "table": table},
             "object_ref": f"public.{table}", "fact_type": fact_type,
             "proposed_value": value, "proposal_fingerprint": proposal_fingerprint(value),
             "proposed_by": actor.subject})
     append_overlay_event(conn, fact_key=fk, type=facts.OVERLAY_FACT_CONFIRMED,
-        actor=actor, expected_version=1, payload={
+        actor=actor, expected_version=base + 1, payload={
             "value": value, "confirmers": [{"subject": actor.subject, "role": "data_owner"}],
             "expires_at": None, "confirms_event_id": draft.event_id})
     return True
