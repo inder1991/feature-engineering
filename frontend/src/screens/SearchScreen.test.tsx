@@ -1,4 +1,4 @@
-import { render, screen } from '@testing-library/react'
+import { act, render, screen } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import * as api from '../api'
@@ -6,12 +6,14 @@ import { SearchScreen } from './SearchScreen'
 
 vi.mock('../api', async importOriginal => {
   const actual = await importOriginal<typeof import('../api')>()
-  return { ...actual, searchCatalog: vi.fn() }
+  return { ...actual, searchCatalog: vi.fn(), featureImpact: vi.fn() }
 })
 const searchCatalog = vi.mocked(api.searchCatalog)
+const featureImpact = vi.mocked(api.featureImpact)
 
 beforeEach(() => {
   searchCatalog.mockReset()
+  featureImpact.mockReset()
 })
 
 const HIT: api.SearchHit = {
@@ -91,5 +93,118 @@ describe('search screen', () => {
     expect(screen.getByLabelText('Query')).toHaveValue('balance')
     expect(await screen.findByText('public.accounts.balance')).toBeInTheDocument()
     expect(screen.queryByText(/freshness-vouched catalog/i)).not.toBeInTheDocument()
+  })
+
+  // F19: error precedence — rejection shows role=alert, clears stale results,
+  // suppresses the zero-state, and the next success clears the alert.
+  it('replaces results with an alert on failure and recovers on the next success', async () => {
+    searchCatalog.mockResolvedValueOnce([HIT])
+    render(<SearchScreen />)
+    await search()
+    expect(await screen.findByText('public.accounts.balance')).toBeInTheDocument()
+
+    searchCatalog.mockRejectedValueOnce(new api.ApiError(500, 'search backend unavailable'))
+    await userEvent.click(screen.getByRole('button', { name: 'Search' }))
+    const alert = await screen.findByRole('alert')
+    expect(alert).toHaveTextContent('search backend unavailable')
+    // Prior results are gone: stale rows must not render below the error.
+    expect(screen.queryByText('public.accounts.balance')).not.toBeInTheDocument()
+    // Neither empty state renders alongside the alert.
+    expect(screen.queryByText(/freshness-vouched catalog/i)).not.toBeInTheDocument()
+    expect(screen.queryByText(/no fresh results/i)).not.toBeInTheDocument()
+
+    searchCatalog.mockResolvedValueOnce([HIT])
+    await userEvent.click(screen.getByRole('button', { name: 'Search' }))
+    expect(await screen.findByText('public.accounts.balance')).toBeInTheDocument()
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+  })
+
+  // F5: a late response from a superseded search must never overwrite newer results.
+  it('ignores a late response from a superseded search', async () => {
+    let resolveFirst!: (hits: api.SearchHit[]) => void
+    searchCatalog.mockImplementationOnce(
+      () =>
+        new Promise<api.SearchHit[]>(res => {
+          resolveFirst = res
+        }),
+    )
+    searchCatalog.mockResolvedValueOnce([{ ...HIT, object_ref: 'public.customers.email' }])
+    render(<SearchScreen />)
+    await search('balance')
+    await userEvent.clear(screen.getByLabelText('Query'))
+    await search('email')
+    expect(await screen.findByText('public.customers.email')).toBeInTheDocument()
+
+    // The older request resolves after the newer one already rendered.
+    await act(async () => {
+      resolveFirst([HIT])
+      await Promise.resolve()
+    })
+    expect(screen.getByText('public.customers.email')).toBeInTheDocument()
+    expect(screen.queryByText('public.accounts.balance')).not.toBeInTheDocument()
+  })
+
+  // F25: object_ref alone is not unique across catalog sources; keys must be composite.
+  it('renders the same object_ref from two catalog sources as distinct rows without duplicate keys', async () => {
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    try {
+      searchCatalog.mockResolvedValue([
+        { ...HIT, catalog_source: 'deposits' },
+        { ...HIT, catalog_source: 'deposits_eu' },
+      ])
+      render(<SearchScreen />)
+      await search()
+      expect(await screen.findAllByText('public.accounts.balance')).toHaveLength(2)
+      const duplicateKeyErrors = errorSpy.mock.calls.filter(args =>
+        String(args[0]).includes('same key'),
+      )
+      expect(duplicateKeyErrors).toEqual([])
+    } finally {
+      errorSpy.mockRestore()
+    }
+  })
+
+  // F10: drift-impact flow is reachable from each result row.
+  it('lists derived feature ids inline when Impact finds features', async () => {
+    searchCatalog.mockResolvedValue([HIT])
+    featureImpact.mockResolvedValue(['feat_01', 'feat_02'])
+    render(<SearchScreen />)
+    await search()
+    await userEvent.click(
+      await screen.findByRole('button', { name: 'Impact for public.accounts.balance' }),
+    )
+    expect(featureImpact).toHaveBeenCalledWith('public.accounts.balance', 'deposits')
+    expect(await screen.findByText('feat_01')).toBeInTheDocument()
+    expect(screen.getByText('feat_02')).toBeInTheDocument()
+    expect(screen.getByText('Derived features')).toBeInTheDocument()
+  })
+
+  it('states plainly when no features derive from the column', async () => {
+    searchCatalog.mockResolvedValue([HIT])
+    featureImpact.mockResolvedValue([])
+    render(<SearchScreen />)
+    await search()
+    await userEvent.click(
+      await screen.findByRole('button', { name: 'Impact for public.accounts.balance' }),
+    )
+    expect(
+      await screen.findByText('No features derive from this column.'),
+    ).toBeInTheDocument()
+    expect(screen.queryByText('Derived features')).not.toBeInTheDocument()
+  })
+
+  it('shows a small alert when the impact check fails', async () => {
+    searchCatalog.mockResolvedValue([HIT])
+    featureImpact.mockRejectedValue(new api.ApiError(503, 'graph unavailable'))
+    render(<SearchScreen />)
+    await search()
+    await userEvent.click(
+      await screen.findByRole('button', { name: 'Impact for public.accounts.balance' }),
+    )
+    const alert = await screen.findByRole('alert')
+    expect(alert).toHaveTextContent('Impact check failed: graph unavailable')
+    expect(screen.queryByText('Derived features')).not.toBeInTheDocument()
+    // The search results themselves stay on screen.
+    expect(screen.getByText('public.accounts.balance')).toBeInTheDocument()
   })
 })
