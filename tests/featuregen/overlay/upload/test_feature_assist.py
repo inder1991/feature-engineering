@@ -80,7 +80,7 @@ def test_recommend_and_recipe_respect_read_scope(db):
 
     class _CaptureLLM:
         def call(self, request):
-            captured["columns"] = request.inputs.get("columns", [])
+            captured["columns"] = request.inputs.get("catalog_metadata", {}).get("columns", [])
             from featuregen.intake.llm import LLMResult
             return LLMResult(output={"features": []}, self_reported_scores={}, call_ref="", status="ok")
 

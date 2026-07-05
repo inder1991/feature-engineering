@@ -97,7 +97,8 @@ def test_cross_domain_gather_spans_catalogs(db):
 
     class _Capture:
         def call(self, request):
-            captured["refs"] = {c["object_ref"] for c in request.inputs["columns"]}
+            captured["refs"] = {c["object_ref"]
+                                for c in request.inputs["catalog_metadata"]["columns"]}
             from featuregen.intake.llm import LLMResult
             # propose a CROSS-DOMAIN feature: balance (deposits) + spend (cards)
             return LLMResult(output={"features": [{"name": "cross", "aggregation": "avg_90d",
@@ -210,3 +211,14 @@ def test_gauntlet_catches_additive_unsafe_names_without_sum(db):
         client = FakeLLM(script={"overlay.feature.recommend": FakeResponse(output={"features": [
             {"name": f"f_{agg}", "derives_from": ["public.accounts.balance"], "aggregation": agg}]})})
         assert recommend_features(db, "x", client, catalog_source="t", now=NOW) == [], agg
+
+
+def test_feature_assist_egress_guard_blocks_pii_objective(db):
+    # M6: raw user text is scanned before dispatch — a PII objective is blocked, not leaked to the LLM
+    _bank(db)
+    _fresh_watermark(db, "bank", NOW)
+    client = FakeLLM(script={"overlay.feature.recommend": FakeResponse(output={"features": [
+        {"name": "good", "derives_from": ["public.accounts.balance"], "aggregation": "avg_90d"}]})})
+    out = recommend_features(db, "predict churn for joe@bank.com", client,
+                             catalog_source="bank", now=NOW)
+    assert out == []   # egress guard raised on the email -> no dispatch -> no features
