@@ -19,6 +19,7 @@ dependencies = [
     "jsonschema>=4.21",
     "python-ulid>=2.2",
     "PyJWT[crypto]>=2.8",
+    "openpyxl>=3.1",
 ]
 
 [project.scripts]
