@@ -147,9 +147,13 @@ def resolve_quarantine_row(conn, catalog_source: str, row_index: int, edits: dic
                            actor) -> tuple[bool, str]:
     """Apply a reviewer's inline fix to a quarantined row: merge the edits onto the raw row, RE-RUN the
     real deterministic validation (validate_rows — never the client mock), and, if it now passes and its
-    column isn't already in the catalog, add it to the source graph + assert its point-in-time fact and
-    drop it from the queue. Returns (resolved, reason). Like all quarantine state, a resolution holds
-    until the source is re-uploaded (the file stays the source of truth)."""
+    column isn't already in the catalog, add it to the source graph + reconcile its table's grain /
+    point-in-time facts and drop it from the queue. Returns (resolved, reason).
+
+    LIMITS (holds until the source is re-uploaded — the file stays the source of truth): a resolved
+    column is added incrementally, so it is NOT recorded in the drift snapshot and a subsequent
+    re-upload of the still-broken file rebuilds the graph WITHOUT it (the resolution is superseded).
+    Fix the source file for durability."""
     row = conn.execute(
         "SELECT raw FROM quarantine_row WHERE catalog_source = %s AND row_index = %s",
         (catalog_source, row_index)).fetchone()
@@ -165,6 +169,15 @@ def resolve_quarantine_row(conn, catalog_source: str, row_index: int, edits: dic
                     (catalog_source, c_ref)).fetchone() is not None:
         return False, f"{good.table}.{good.column} is already in the catalog"
     add_column_row(conn, catalog_source, good)
+    if good.is_grain:
+        # reconcile the table's grain fact with its FULL grain-column set (now incl. the added column),
+        # or the uniqueness key stays silently wrong (a grain column added to the graph but not the fact).
+        grain_cols = [r[0] for r in conn.execute(
+            "SELECT column_name FROM graph_node WHERE catalog_source = %s AND table_name = %s "
+            "AND kind = 'column' AND is_grain = true ORDER BY column_name",
+            (catalog_source, good.table)).fetchall()]
+        _assert_fact(conn, catalog_source, good.table, "grain",
+                     {"columns": grain_cols, "is_unique": True}, actor=actor)
     if good.as_of:
         basis = good.as_of_basis if good.as_of_basis in ("posted_at", "ingested_at") else "posted_at"
         _assert_fact(conn, catalog_source, good.table, "availability_time",

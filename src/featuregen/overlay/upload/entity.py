@@ -194,7 +194,7 @@ def dismiss_entity_suggestion(conn, catalog_source: str, object_ref: str) -> boo
 
 from collections import deque  # noqa: E402
 
-from featuregen.overlay.upload.join_path import _table_of  # noqa: E402
+from featuregen.overlay.upload.join_path import _invert, _table_of  # noqa: E402
 
 
 @dataclass(frozen=True, slots=True)
@@ -222,7 +222,9 @@ def _cross_adjacency(conn, roles: Iterable[str]) -> dict:
         if a == b:
             continue
         link(a, b, CrossStep("join", src, a[1], src, b[1], card or ""))
-        link(b, a, CrossStep("join", src, b[1], src, a[1], card or ""))
+        # the reverse hop INVERTS the fan (M7): a reverse N:1 is really 1:N — else a human confirms a
+        # cross-catalog path that claims a fan-out hop fans in safely (double-count hazard).
+        link(b, a, CrossStep("join", src, b[1], src, a[1], _invert(card) or ""))
 
     for entity in list_entities(conn):
         tables = sorted({(k.catalog_source, k.table) for k in entity_key_columns(conn, entity, roles=roles)})
