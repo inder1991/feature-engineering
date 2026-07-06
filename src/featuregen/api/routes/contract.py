@@ -21,6 +21,7 @@ from featuregen.overlay.upload.contract.author import ContractDraft, draft_contr
 from featuregen.overlay.upload.contract.gate1 import (
     build_considered_set,
     chosen_feature,
+    gate1_choice,
     intent_target_ref,
     record_gate1_choice,
 )
@@ -130,13 +131,33 @@ def get_governed_contract(contract_id: str, conn: _Conn, identity: _Identity) ->
 
 @router.post("/contract/confirm")
 def confirm(body: DraftIn, conn: _Conn, identity: _Identity) -> Contract:
-    """The human gate: re-runs the MCV server-side (leakage target re-read from the intent, not trusted
-    from the payload) and refuses to govern a leaky / stale / ungrounded / empty draft; otherwise
-    registers a versioned, drift-linked contract linked back to its intent."""
-    target = intent_target_ref(conn, body.intent_id) if body.intent_id else body.target_ref
+    """The human gate — the GOVERNING write. Server-stateful, no client trust (closes the two BLOCKERs
+    at the write, not just at /draft):
+      * intent_id is REQUIRED; a missing/forged one is rejected (no fall back to a client target_ref);
+      * the draft must correspond to the human's RECORDED Gate #1 choice reconstructed from the
+        server-persisted considered set — a feature never offered/chosen cannot be governed;
+      * target_ref is read SERVER-side from the intent with NO client fallback, so the leakage gate
+        cannot be disabled by omitting it.
+    Then confirm_contract re-runs the deterministic MCV and registers a versioned, drift-linked contract."""
+    if not body.intent_id:
+        raise HTTPException(status_code=422, detail="intent_id is required to govern a contract")
+    choice = gate1_choice(conn, body.intent_id)
+    if choice is None:
+        raise HTTPException(status_code=422,
+                            detail="no Gate #1 choice recorded for this intent — draft it first")
+    chosen = chosen_feature(conn, body.intent_id, choice["chosen_source"], choice["chosen_option_id"])
+    if chosen is None:
+        raise HTTPException(status_code=422,
+                            detail="the chosen feature is not in the recorded considered set")
+    draft = body.to_draft()
+    if (draft.feature_name != chosen.name
+            or frozenset(draft.derives_pairs) != frozenset(chosen.derives_pairs)
+            or (draft.aggregation or "") != (chosen.aggregation or "")):
+        raise HTTPException(status_code=422, detail="the draft does not match the chosen feature")
+    target = intent_target_ref(conn, body.intent_id)   # SERVER truth — never the client body
     try:
-        return confirm_contract(conn, body.to_draft(), actor=identity.subject,
-                                now=datetime.now(UTC), target_ref=target, intent_id=body.intent_id)
+        return confirm_contract(conn, draft, actor=identity.subject, now=datetime.now(UTC),
+                                target_ref=target, intent_id=body.intent_id)
     except ContractValidationError as e:
         raise HTTPException(status_code=422, detail=str(e)) from e
     except psycopg.errors.UniqueViolation as e:   # concurrent double-confirm -> conflict, not 500

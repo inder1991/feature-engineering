@@ -182,3 +182,12 @@ def record_gate1_choice(conn, intent_id: str, *, chosen_source: str, chosen_opti
         "chosen_option_id = EXCLUDED.chosen_option_id, why = EXCLUDED.why, actor = EXCLUDED.actor",
         (intent_id, chosen_source, chosen_option_id, why, _actor_json(actor),
          json.dumps(row[0] if row else {})))
+
+
+def gate1_choice(conn, intent_id: str) -> dict | None:
+    """The human's RECORDED Gate #1 choice for an intent, or None if none was recorded. Used by
+    /contract/confirm to prove a governed feature was actually chosen from the considered set."""
+    row = conn.execute(
+        "SELECT chosen_source, chosen_option_id FROM contract_gate1_choice WHERE intent_id = %s",
+        (intent_id,)).fetchone()
+    return {"chosen_source": row[0], "chosen_option_id": row[1]} if row else None
