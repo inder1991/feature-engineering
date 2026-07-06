@@ -135,6 +135,39 @@ def test_refine_returns_revised_candidate(make_client):
     assert revised["verification"] == "DESIGN-CHECKED"   # a revision is still only a proposal
 
 
+def test_refine_llm_call_is_attributed_to_the_human_caller(make_client, conn):
+    # IMPORTANT-3: every assist route threads the caller's IdentityEnvelope into the audited seam,
+    # so the llm_call audit row names the HUMAN who asked (user:...), never the fallback service
+    # enrichment actor.
+    client = make_client(llm_client=_refiner())
+    upload_csv(client, "deposits", DEPOSITS_CSV)
+    res = client.post("/features/refine", json={
+        "candidate": {"name": "avg_balance_90d", "derives_from": ["public.accounts.balance"],
+                      "aggregation": "avg_90d"},
+        "instruction": "use a 30 day window", "catalog_source": "deposits"}, headers=AUTH)
+    assert res.status_code == 200 and "revised" in res.json()
+    rows = conn.execute(
+        "SELECT created_by FROM llm_call WHERE task = 'overlay.feature.recommend'").fetchall()
+    assert rows                                            # the refine call was recorded
+    assert all(r[0]["subject"] == "user:tester" for r in rows)
+    assert all(r[0]["actor_kind"] == "human" for r in rows)
+
+
+def test_refine_forwards_the_objective_to_the_llm_inputs(make_client):
+    # Finding 9: the optional round goal in the request body reaches the model's inputs.
+    rec = _Recording(_refiner())
+    client = make_client(llm_client=rec)
+    upload_csv(client, "deposits", DEPOSITS_CSV)
+    res = client.post("/features/refine", json={
+        "candidate": {"name": "avg_balance_90d", "derives_from": ["public.accounts.balance"]},
+        "instruction": "use a 30 day window", "catalog_source": "deposits",
+        "objective": "predict churn"}, headers=AUTH)
+    assert res.status_code == 200
+    calls = [r for r in rec.requests if r.task == "overlay.feature.recommend"]
+    assert len(calls) == 1
+    assert calls[0].inputs["catalog_metadata"]["objective"] == "predict churn"
+
+
 def test_refine_gauntlet_rejection_is_data_not_an_error(make_client):
     # The scripted revision derives from the target column -> the gauntlet rejects it. That is a
     # 200 with a structured rejection the human reads, never a 4xx/5xx.

@@ -25,6 +25,9 @@
 //   same feature on purpose (strong signals earn their place in several theses), so it renders
 //   with an "In N sets" chip, selects globally, and registers once. Keys stay per-fetch
 //   (g{seq}:{name}) so a later round reusing a name never resurrects registered state.
+//   Accepted tradeoff: the backend does not GUARANTEE cross-lens name identity (two lenses could
+//   in principle propose different definitions under one name); the first set's definition wins
+//   the merge, and the row renders that one definition.
 // - Set theses are client-side copy keyed by the router's fixed lens vocabulary (the wire
 //   carries no set description); an unknown lens simply renders without a thesis line.
 //
@@ -46,10 +49,12 @@
 // - A refine revision is a SUGGESTION: it touches nothing until Approve revision, and even then
 //   only the local candidate; registration still requires the tray's explicit confirm.
 // - Simple mutual-exclusion rule with registration: while the tray is confirming or a register
-//   batch is in flight, both feedback channels are disabled.
+//   batch is in flight, both feedback channels are disabled, Approve revision / Revert to
+//   original are inert, and the generate path plus scope fields lock, so nothing can change a
+//   row or pull it out of view while its registration is being written.
 // - Scope edits bump the generation sequence so an in-flight round (generate or feedback) that
 //   resolves after the edit is discarded, never applied against the new scope.
-import { type FormEvent, type ReactNode, useRef, useState } from 'react'
+import { type FormEvent, type ReactNode, useEffect, useRef, useState } from 'react'
 import {
   ApiError, type FeatureFreshness, type FeatureIdea, type FeatureSpecIn, type JoinStep,
   type Recipe, type RefineRejection, type Rejection, type SetRecommendation, featureFreshness,
@@ -230,12 +235,18 @@ function RejectionsPanel({ rejections, open, onToggle }: {
           The safety gauntlet rejected {n} {n === 1 ? 'candidate' : 'candidates'} across all
           lenses: {tallyLine}.
         </span>
-        <button type="button" className="rej-toggle" aria-expanded={open} onClick={onToggle}>
+        <button
+          type="button"
+          className="rej-toggle"
+          aria-expanded={open}
+          aria-controls="wb-rej-list"
+          onClick={onToggle}
+        >
           {open ? 'Hide' : 'Show'}
         </button>
       </div>
       {open && (
-        <ul className="rej-list">
+        <ul className="rej-list" id="wb-rej-list">
           {rejections.map((r, i) => (
             <li key={`${i}:${r.name}`}>
               <code>{r.name}</code>
@@ -489,6 +500,10 @@ export function WorkbenchScreen() {
   // Reentry guard for the register batch: state updates are async, so a double click on
   // Confirm approval could otherwise start two batches before the disabled attribute lands.
   const batchInFlight = useRef(false)
+  // Element id to focus after the next render (house pattern from ReviewQueueScreen): Approve
+  // revision / Revert to original unmount the button that held focus, so without an explicit
+  // move keyboard focus falls back to <body>.
+  const focusTarget = useRef<string | null>(null)
   // Latest-state mirrors (assigned every render) so async arrivals decide against CURRENT
   // state, not their submit-time closure: feedback pins read the selection as it stands when
   // the response lands, and a refine result checks whether its row registered meanwhile.
@@ -498,6 +513,13 @@ export function WorkbenchScreen() {
   selectedRef.current = selected
   const registeredRef = useRef(registered)
   registeredRef.current = registered
+
+  useEffect(() => {
+    if (!focusTarget.current) return
+    const el = document.getElementById(focusTarget.current)
+    focusTarget.current = null
+    el?.focus()
+  })
 
   const multiSet = setLenses.length > 1
   // Every live candidate, across ALL sets plus drafts: selection and registration always work
@@ -528,8 +550,10 @@ export function WorkbenchScreen() {
   )]
 
   // The one mutual-exclusion rule between feedback and registration: while the tray is
-  // confirming approval or a register batch is in flight, both feedback channels disable.
-  // A revision must never race what the human is about to write into the registry.
+  // confirming approval or a register batch is in flight, both feedback channels disable,
+  // Approve revision / Revert to original are inert, the generate path locks, and scope edits
+  // are inert. A revision must never race what the human is about to write into the registry,
+  // and a registration must never complete invisibly after its row leaves view.
   const feedbackLocked = confirmingBatch || batchBusy
   const setFbExhausted = setFbRounds >= FEEDBACK_ROUNDS
 
@@ -628,6 +652,9 @@ export function WorkbenchScreen() {
     e.preventDefault()
     const objective = goal.trim()
     if (!objective) return
+    // A register batch is confirming or in flight: a new round would replace the rows the
+    // human is approving, letting their registrations complete out of view.
+    if (feedbackLocked) return
     const seq = ++generateSeq.current
     setNotice('')
     setScopeChanged(false)
@@ -715,12 +742,14 @@ export function WorkbenchScreen() {
       const byName = new Map<string, GeneratedCandidate>()
       const lenses: string[] = []
       for (const set of round.sets) {
-        if (set.features.length === 0) continue
+        // The pin wins a name collision: one row per name, and the human's kept candidate is
+        // never silently swapped for a regenerated variant. Filter FIRST: a set whose every
+        // candidate collided (or that arrived empty) must not render an empty card, and must
+        // never become the active or recommended-active view.
+        const freshIdeas = set.features.filter(idea => !pinnedNames.has(idea.name))
+        if (freshIdeas.length === 0) continue
         lenses.push(set.lens)
-        for (const idea of set.features) {
-          // The pin wins a name collision: one row per name, and the human's kept candidate is
-          // never silently swapped for a regenerated variant.
-          if (pinnedNames.has(idea.name)) continue
+        for (const idea of freshIdeas) {
           const existing = byName.get(idea.name)
           if (existing) {
             if (!existing.lenses.includes(set.lens)) existing.lenses.push(set.lens)
@@ -735,6 +764,11 @@ export function WorkbenchScreen() {
         ...pinned.map((c): GeneratedCandidate => ({ ...c, kept: true, lenses: [] })),
         ...byName.values(),
       ])
+      // Kept rows left the sets model, so their selection origins go neutral: a kept pick
+      // reads as kept in the tray, never as a pick from a set that no longer exists.
+      setSelected(prev => Object.fromEntries(
+        Object.entries(prev).map(([key, origin]) =>
+          pinnedKeys.has(key) ? [key, null] : [key, origin])))
       setSetLenses(lenses)
       setRecommendation(round.recommendation)
       setActiveLens(
@@ -795,6 +829,9 @@ export function WorkbenchScreen() {
         },
         instruction,
         source.trim() || null, entity.trim() || null, target.trim() || null,
+        // The current goal rides along so the engine revises against the objective, not the
+        // instruction alone.
+        goal.trim() || null,
       )
       // The row may have registered or been replaced while the engine ran: registered
       // candidates take no feedback, and a gone row has nothing to revise. Drop the result.
@@ -837,6 +874,9 @@ export function WorkbenchScreen() {
   // The human accepts the engine's revision: the candidate's data is replaced locally. The key
   // is stable, so selection state survives; registration still requires the tray's confirm.
   function approveRevision(key: string) {
+    // Inert under feedbackLocked (the buttons also disable): an approved revision must never
+    // diverge from the spec a confirming or in-flight register batch is writing.
+    if (feedbackLocked) return
     const pending = (refines[key] ?? EMPTY_REFINE).pending
     if (pending === null) return
     setGenerated(prev => prev === null
@@ -845,12 +885,16 @@ export function WorkbenchScreen() {
     patchRefine(key, prev => ({
       ...prev, pending: null, appliedRound: prev.pendingRound, open: false,
     }))
+    // The revision block (holding focus) unmounts: move focus to the candidate row.
+    focusTarget.current = `wb-row-${key}`
   }
 
   // The human declines: the revision is discarded, the candidate untouched. The consumed round
   // stays consumed; the engine ran.
   function revertRevision(key: string) {
+    if (feedbackLocked) return
     patchRefine(key, prev => ({ ...prev, pending: null }))
+    focusTarget.current = `wb-row-${key}`
   }
 
   async function draftCandidates(e: FormEvent) {
@@ -992,13 +1036,25 @@ export function WorkbenchScreen() {
     }
   }
 
-  // Tray mix note: where the picks came from, and the honest re-check note when they cross sets.
+  // Tray mix note: where the picks came from. Kept rows carry no lens claim (their origin sets
+  // were replaced), so they read as kept picks, never as picks from the currently-viewed set.
+  // Honest cross-set copy: each feature was safety-checked at generation within its own set;
+  // there is NO set-level re-check of the human's mix (tracked follow-up), so the note must not
+  // claim one.
+  const keptPicked = selectedCandidates
+    .filter(c => c.kind === 'generated' && c.kept === true).length
+  const lensNote = originLenses.length > 1
+    ? `mixed from ${originLenses.length} sets · each feature was safety-checked at generation; `
+      + 'your approval registers them individually'
+    : originLenses.length === 1 && originLenses[0] !== undefined
+      ? `from the ${lensLabel(originLenses[0])} set`
+      : null
   const mixNote = multiSet && selectedCount > 0
-    ? originLenses.length > 1
-      ? `mixed from ${originLenses.length} sets · your mix re-checks as one set before approval`
-      : originLenses.length === 1 && originLenses[0] !== undefined
-        ? `from the ${lensLabel(originLenses[0])} set`
-        : null
+    ? keptPicked > 0
+      ? lensNote !== null
+        ? `${lensNote} · ${keptPicked} kept from an earlier round`
+        : 'kept from an earlier round'
+      : lensNote
     : null
 
   return (
@@ -1065,11 +1121,14 @@ export function WorkbenchScreen() {
           <div style={{ display: 'flex', flexWrap: 'wrap', gap: 20 }}>
             <div className="field" style={{ flex: '1 1 220px' }}>
               <label htmlFor="wb-source">Catalog source</label>
+              {/* Scope edits clear candidates, so all three lock under feedbackLocked: a row
+                  must not leave view while its registration is being written. */}
               <input
                 id="wb-source"
                 value={source}
                 onChange={e => changeSource(e.target.value)}
                 placeholder="e.g. deposits"
+                disabled={feedbackLocked}
               />
               <p className="hint" style={HELP_STYLE}>
                 Optional. Scopes candidates to one upload source; blank searches every catalog.
@@ -1082,6 +1141,7 @@ export function WorkbenchScreen() {
                 value={entity}
                 onChange={e => changeEntity(e.target.value)}
                 placeholder="e.g. customer"
+                disabled={feedbackLocked}
               />
               <p className="hint" style={HELP_STYLE}>
                 Optional. Gathers from every catalog holding this entity, e.g. Customer.
@@ -1094,6 +1154,7 @@ export function WorkbenchScreen() {
                 value={target}
                 onChange={e => changeTarget(e.target.value)}
                 placeholder="e.g. public.labels.churned"
+                disabled={feedbackLocked}
               />
               <p className="hint" style={HELP_STYLE}>
                 What you are predicting. Candidates are screened against it server-side, so leaky
@@ -1105,7 +1166,7 @@ export function WorkbenchScreen() {
             <button
               type="submit"
               className="path path-generate"
-              disabled={!goal.trim() || generating}
+              disabled={!goal.trim() || generating || feedbackLocked}
             >
               <span className="k">Path 1 · The engine</span>
               <span className="t">
@@ -1326,7 +1387,13 @@ export function WorkbenchScreen() {
               const refine = refines[c.key] ?? EMPTY_REFINE
               const refineExhausted = refine.rounds >= FEEDBACK_ROUNDS
               return (
-                <li className="row" key={c.key} style={{ alignItems: 'flex-start' }}>
+                <li
+                  className="row"
+                  key={c.key}
+                  id={`wb-row-${c.key}`}
+                  tabIndex={-1}
+                  style={{ alignItems: 'flex-start' }}
+                >
                   {reg ? (
                     <CheckGlyph />
                   ) : (
@@ -1336,7 +1403,12 @@ export function WorkbenchScreen() {
                       checked={c.key in selected}
                       disabled={batchBusy || !canSelect}
                       onChange={() => toggleSelect(
-                        c.key, c.kind === 'generated' && multiSet ? activeLens : null)}
+                        // A kept row belongs to no current set: selecting it never stamps the
+                        // viewed lens; its neutral origin drives the tray mix note.
+                        c.key,
+                        c.kind === 'generated' && multiSet && c.kept !== true
+                          ? activeLens
+                          : null)}
                       style={{ width: 18, height: 18, margin: 10, flex: 'none' }}
                     />
                   )}
@@ -1489,7 +1561,7 @@ export function WorkbenchScreen() {
                           </p>
                         )}
                         {refine.pending && (
-                          <div className="revision">
+                          <div className="revision" role="status">
                             <div className="rev-meta">
                               <span className="badge revised">
                                 Revision · round {refine.pendingRound} of {FEEDBACK_ROUNDS}
@@ -1522,9 +1594,12 @@ export function WorkbenchScreen() {
                             </div>
                             <p className="recheck">Re-checked after revision</p>
                             <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginTop: 10 }}>
+                              {/* Inert while the tray is confirming or a batch is in flight:
+                                  the spec being written must not change under the approval. */}
                               <button
                                 type="button"
                                 className="btn btn--primary"
+                                disabled={feedbackLocked}
                                 onClick={() => approveRevision(c.key)}
                               >
                                 Approve revision
@@ -1532,6 +1607,7 @@ export function WorkbenchScreen() {
                               <button
                                 type="button"
                                 className="btn"
+                                disabled={feedbackLocked}
                                 onClick={() => revertRevision(c.key)}
                               >
                                 Revert to original

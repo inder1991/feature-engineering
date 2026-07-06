@@ -11,6 +11,7 @@ from featuregen.overlay.upload.feature_assist import (
     recommend_features_report,
     refine_idea,
 )
+from featuregen.overlay.upload.features import FeatureSpec, register_feature
 from featuregen.overlay.upload.graph import build_graph
 
 NOW = datetime(2026, 7, 5, tzinfo=UTC)
@@ -153,6 +154,47 @@ def test_refine_with_empty_model_output_returns_no_revision(db):
                                      catalog_source="bank", now=NOW)
     assert revised is None
     assert rejection is not None and rejection["code"] == RejectCode.NO_REVISION
+
+
+def test_refine_rejects_a_revision_that_duplicates_a_registered_feature(db):
+    # Dedup parity with the generation loop (_vet): a revision whose (derives_pairs, aggregation)
+    # signature matches an already-REGISTERED feature is rejected with ALREADY_REGISTERED, even
+    # under a new name. REDUNDANT-vs-current-round stays client-side (server is round-stateless).
+    _bank(db)
+    register_feature(db, FeatureSpec(
+        name="latest_balance", aggregation="latest",
+        derives_from=(("bank", "public.accounts.balance"),)))
+    client = FakeLLM(script={"overlay.feature.recommend": FakeResponse(output={"features": [
+        {"name": "balance_now", "derives_from": ["public.accounts.balance"],
+         "aggregation": "latest"}]})})
+    revised, rejection = refine_idea(
+        db, {"name": "orig", "derives_from": ["public.accounts.balance"]}, "rename it",
+        client, catalog_source="bank", now=NOW)
+    assert revised is None
+    assert rejection == {"name": "balance_now", "reason": "already a registered feature",
+                         "code": RejectCode.ALREADY_REGISTERED}
+
+
+def test_refine_objective_rides_in_the_llm_inputs_only_when_given(db):
+    # Finding 9: the round's goal travels with the fix hint (like `feedback` in the generation
+    # rounds) so the model revises against the objective, not the instruction alone. Absent, the
+    # inputs are unchanged.
+    _bank(db)
+    captured = {}
+
+    class _Client:
+        def call(self, request):
+            captured["metadata"] = request.inputs["catalog_metadata"]
+            return _result({"features": [{
+                "name": "rev", "derives_from": ["public.accounts.balance"],
+                "aggregation": "latest"}]})
+
+    refine_idea(db, {"name": "orig"}, "tighten it", _Client(), catalog_source="bank", now=NOW,
+                objective="predict churn")
+    assert captured["metadata"]["objective"] == "predict churn"
+    assert captured["metadata"]["fix"][0]["issue"] == "tighten it"
+    refine_idea(db, {"name": "orig"}, "tighten it", _Client(), catalog_source="bank", now=NOW)
+    assert "objective" not in captured["metadata"]
 
 
 def test_refine_egress_guard_blocks_pii_instruction(db):

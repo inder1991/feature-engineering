@@ -112,7 +112,7 @@ const IDEA: FeatureIdea = {
 }
 
 const CAVEAT =
-  'advisory only — a fit/coverage judgment over the metadata, not a performance prediction; '
+  'advisory only: a fit/coverage judgment over the metadata, not a performance prediction; '
   + 'confirm the winner with a backtest once features are computed'
 
 describe('feature assist client', () => {
@@ -199,8 +199,17 @@ describe('feature assist client', () => {
         aggregation: null, grain_table: null,
       },
       instruction: 'use a 30 day window',
-      catalog_source: 'deposits', entity: null, target_ref: null,
+      catalog_source: 'deposits', entity: null, target_ref: null, objective: null,
     })
+  })
+
+  it('refineCandidate carries the round objective when given', async () => {
+    fetchMock.mockImplementation(ok({ revised: IDEA }))
+    await refineCandidate(
+      { name: 'avg_balance_90d' }, 'use a 30 day window', 'deposits', null, null,
+      'predict churn')
+    const [, init] = fetchMock.mock.calls[0]
+    expect(JSON.parse(init.body).objective).toBe('predict churn')
   })
 
   it('refineCandidate sends the full candidate fields when the UI holds them', async () => {

@@ -290,6 +290,7 @@ export function refineCandidate(
   catalogSource: string | null = null,
   entity: string | null = null,
   targetRef: string | null = null,
+  objective: string | null = null,
 ): Promise<RefineResult> {
   return post('/features/refine', {
     // Defaults applied at the boundary so the wire always carries the full candidate shape
@@ -305,6 +306,9 @@ export function refineCandidate(
     catalog_source: catalogSource,
     entity,
     target_ref: targetRef,
+    // The round's prediction goal: the engine revises against the objective the candidate
+    // was generated for, not the instruction alone.
+    objective,
   })
 }
 

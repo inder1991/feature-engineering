@@ -100,7 +100,7 @@ const RATIO_ONLY = idea('balance_to_limit_ratio')
 const SHARED = idea('txn_count_shared')
 
 const CAVEAT =
-  'advisory only — a fit/coverage judgment over the metadata, not a performance prediction; '
+  'advisory only: a fit/coverage judgment over the metadata, not a performance prediction; '
   + 'confirm the winner with a backtest once features are computed'
 
 function multiSetRound(rejections: api.Rejection[] = []): api.FeatureSetsResult {
@@ -375,7 +375,10 @@ describe('multiple sets', () => {
     await selectCandidate('balance_to_limit_ratio')
     expect(screen.getByText('2 selected')).toBeInTheDocument()
     expect(
-      screen.getByText('mixed from 2 sets · your mix re-checks as one set before approval'),
+      screen.getByText(
+        'mixed from 2 sets · each feature was safety-checked at generation; your approval '
+        + 'registers them individually',
+      ),
     ).toBeInTheDocument()
     // Switching back leaves both picks intact.
     await userEvent.click(screen.getByRole('button', { name: /temporal set/i }))
@@ -491,8 +494,11 @@ describe('rejections panel', () => {
     expect(screen.queryByText('days_to_churn')).not.toBeInTheDocument()
     const toggle = screen.getByRole('button', { name: 'Show' })
     expect(toggle).toHaveAttribute('aria-expanded', 'false')
+    expect(toggle).toHaveAttribute('aria-controls', 'wb-rej-list')
     await userEvent.click(toggle)
     expect(screen.getByText('days_to_churn')).toBeInTheDocument()
+    expect(screen.getByText('days_to_churn').closest('ul'))
+      .toHaveAttribute('id', 'wb-rej-list')
     expect(
       screen.getByText('derives from the target column public.labels.churned'),
     ).toBeInTheDocument()
@@ -644,6 +650,31 @@ describe('selection and registration', () => {
     await registerSelection(1)
     expect(await screen.findByText('stale: cards')).toBeInTheDocument()
     expect(screen.queryByText('fresh')).not.toBeInTheDocument()
+  })
+
+  it('locks the generate path and scope fields while a batch is confirming or in flight', async () => {
+    const pending = deferred<string>()
+    registerFeature.mockImplementation(() => pending.promise)
+    featureFreshness.mockResolvedValue(FRESH)
+    await renderAndGenerate([IDEA])
+    await selectCandidate('avg_balance')
+    await userEvent.click(screen.getByRole('button', { name: 'Approve and register 1 feature' }))
+    // Confirm step: no new round and no scope edit can pull rows out from under the approval.
+    expect(screen.getByRole('button', { name: /generate candidate sets/i })).toBeDisabled()
+    expect(screen.getByLabelText('Catalog source')).toBeDisabled()
+    expect(screen.getByLabelText('Entity')).toBeDisabled()
+    expect(screen.getByLabelText('Target column')).toBeDisabled()
+    await userEvent.click(screen.getByRole('button', { name: 'Confirm approval' }))
+    // Still locked while the batch is in flight.
+    expect(screen.getByRole('button', { name: /generate candidate sets/i })).toBeDisabled()
+    expect(screen.getByLabelText('Catalog source')).toBeDisabled()
+    await act(async () => {
+      pending.resolve('feat_60')
+    })
+    expect(await screen.findByText('feat_60')).toBeInTheDocument()
+    // The lock releases with the batch.
+    expect(screen.getByRole('button', { name: /generate candidate sets/i })).toBeEnabled()
+    expect(screen.getByLabelText('Catalog source')).toBeEnabled()
   })
 
   it('omits the freshness chip silently when the freshness call fails', async () => {
@@ -1213,6 +1244,54 @@ describe('whole-round feedback', () => {
     expect(screen.queryByLabelText('Feedback on the whole round')).not.toBeInTheDocument()
   })
 
+  it('drops a set whose every candidate collided with pins instead of rendering an empty card', async () => {
+    const threeSets = (): api.FeatureSetsResult => ({
+      sets: [
+        { lens: 'temporal', features: [TEMPORAL_ONLY] },
+        { lens: 'ratio', features: [RATIO_ONLY] },
+        { lens: 'unary', features: [idea('flag_high_balance')] },
+      ],
+      recommendation: {
+        recommended_lens: 'temporal',
+        reasoning: 'recency signals move earliest for a churn horizon',
+        caveat: CAVEAT,
+      },
+      rejections: [],
+    })
+    await renderAndGenerateSets(threeSets())
+    await screen.findByText('Temporal set')
+    await selectCandidate('days_since_last_txn')
+    recommendFeatureSets.mockResolvedValueOnce(threeSets())
+    await submitSetFeedback('sharper signals')
+    await screen.findByText('Kept')
+    // The temporal set's only candidate collided with the pin: no empty card renders...
+    expect(screen.queryByText('Temporal set')).not.toBeInTheDocument()
+    expect(screen.getByText('Ratio set')).toBeInTheDocument()
+    expect(screen.getByText('Unary set')).toBeInTheDocument()
+    // ...and the recommended-but-emptied lens never becomes the active view.
+    expect(screen.getByRole('button', { name: /ratio set/i }))
+      .toHaveAttribute('aria-pressed', 'true')
+    // The kept pick stays visible in the surviving views.
+    expect(screen.getByText('days_since_last_txn')).toBeInTheDocument()
+  })
+
+  it('a kept row never claims the currently-viewed lens in the tray note', async () => {
+    await renderAndGenerateSets(multiSetRound())
+    await selectCandidate('days_since_last_txn')
+    expect(screen.getByText('from the Temporal set')).toBeInTheDocument()
+    recommendFeatureSets.mockResolvedValueOnce(multiSetRound())
+    await submitSetFeedback('sharper recency signals')
+    await screen.findByText('Kept')
+    // The pinned pick left the sets model: its origin is neutral, so the note reads kept.
+    expect(screen.getByText('kept from an earlier round')).toBeInTheDocument()
+    expect(screen.queryByText('from the Temporal set')).not.toBeInTheDocument()
+    // Reselecting the kept row while a set view shows must not stamp the viewed lens.
+    await userEvent.click(screen.getByRole('checkbox', { name: 'Select days_since_last_txn' }))
+    await userEvent.click(screen.getByRole('checkbox', { name: 'Select days_since_last_txn' }))
+    expect(screen.getByText('kept from an earlier round')).toBeInTheDocument()
+    expect(screen.queryByText(/from the (Temporal|Ratio) set/)).not.toBeInTheDocument()
+  })
+
   it('locks both feedback channels while the tray is confirming approval', async () => {
     await renderAndGenerate([IDEA, OTHER_IDEA])
     await selectCandidate('avg_balance')
@@ -1253,7 +1332,7 @@ describe('per-candidate feedback', () => {
         derives_from: ['public.accounts.balance'], aggregation: 'avg',
         grain_table: 'customers',
       },
-      'use a 30 day window', 'deposits', null, null)
+      'use a 30 day window', 'deposits', null, null, 'predict churn')
     expect(refineCandidate).toHaveBeenCalledTimes(1)
     // The revision is recorded and attributed.
     expect(
@@ -1311,6 +1390,72 @@ describe('per-candidate feedback', () => {
     expect(screen.getByRole('button', {
       name: 'Send feedback for one revision · round 2 of 3',
     })).toBeInTheDocument()
+  })
+
+  it('keeps Approve revision and Revert inert while a register batch is confirming or in flight', async () => {
+    refineCandidate.mockResolvedValue({ revised: REVISED })
+    const pending = deferred<string>()
+    registerFeature.mockImplementation(() => pending.promise)
+    featureFreshness.mockResolvedValue(FRESH)
+    await renderAndGenerate([IDEA])
+    await screen.findByText('avg_balance')
+    await selectCandidate('avg_balance')
+    await openRefineAndSend('use a 30 day window')
+    await screen.findByRole('button', { name: 'Approve revision' })
+    await userEvent.click(screen.getByRole('button', { name: 'Approve and register 1 feature' }))
+    // Confirm step: both revision actions lock with the feedback channels.
+    expect(screen.getByRole('button', { name: 'Approve revision' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Revert to original' })).toBeDisabled()
+    await userEvent.click(screen.getByRole('button', { name: 'Confirm approval' }))
+    // In flight: an Approve revision click is inert, even force-dispatched past the disabled
+    // attribute, so the batch writes the ORIGINAL spec.
+    const approve = screen.getByRole('button', { name: 'Approve revision' })
+    expect(approve).toBeDisabled()
+    await userEvent.click(approve)
+    fireEvent.click(approve)
+    await act(async () => {
+      pending.resolve('feat_50')
+    })
+    expect(await screen.findByText('feat_50')).toBeInTheDocument()
+    expect(registerFeature).toHaveBeenCalledTimes(1)
+    expect(registerFeature).toHaveBeenCalledWith(IDEA_SPEC)
+    // The registered row shows exactly what was written: the original, never the revision.
+    expect(screen.getByText('avg_balance')).toBeInTheDocument()
+    expect(screen.queryByText('avg_balance_30d')).not.toBeInTheDocument()
+    expect(screen.queryByText('Revised · R1')).not.toBeInTheDocument()
+  })
+
+  it('announces the pending revision block as a status region', async () => {
+    refineCandidate.mockResolvedValue({ revised: REVISED })
+    await renderAndGenerate([IDEA])
+    await screen.findByText('avg_balance')
+    await openRefineAndSend('use a 30 day window')
+    await screen.findByText('Re-checked after revision')
+    const status = screen.getAllByRole('status').find(el =>
+      el.textContent?.includes('Re-checked after revision'))
+    expect(status).toBeTruthy()
+  })
+
+  it('moves focus to the candidate row when Approve revision unmounts the block', async () => {
+    refineCandidate.mockResolvedValue({ revised: REVISED })
+    await renderAndGenerate([IDEA])
+    await screen.findByText('avg_balance')
+    await openRefineAndSend('use a 30 day window')
+    await userEvent.click(await screen.findByRole('button', { name: 'Approve revision' }))
+    const row = screen.getByText('avg_balance_30d').closest('li')
+    expect(row).not.toBeNull()
+    expect(row).toHaveFocus()
+  })
+
+  it('moves focus to the candidate row when Revert to original unmounts the block', async () => {
+    refineCandidate.mockResolvedValue({ revised: REVISED })
+    await renderAndGenerate([IDEA])
+    await screen.findByText('avg_balance')
+    await openRefineAndSend('use a 30 day window')
+    await userEvent.click(await screen.findByRole('button', { name: 'Revert to original' }))
+    const row = screen.getByText('avg_balance').closest('li')
+    expect(row).not.toBeNull()
+    expect(row).toHaveFocus()
   })
 
   it('renders a gauntlet rejection as a danger line, consuming the round, changing nothing', async () => {

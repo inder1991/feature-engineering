@@ -51,6 +51,9 @@ class RefineIn(BaseModel):
     catalog_source: str | None = None
     entity: str | None = None
     target_ref: str | None = None
+    # The round's prediction goal. Optional; when present the model revises against the goal the
+    # candidate was generated for, not the instruction alone.
+    objective: str | None = None
 
 
 class RecipeIn(BaseModel):
@@ -73,12 +76,14 @@ def recommend(
     # The gauntlet's target-leakage gate runs only when target_ref is passed and its freshness gate
     # only when `now` is; over HTTP we ALWAYS pass the server clock (and forward optional
     # target_ref/entity) so those gates are ON — omitting them would silently downgrade safety
-    # (review root-cause A).
+    # (review root-cause A). `actor=identity` so every llm_call this round records is attributed
+    # to the HUMAN who asked, not the fallback service enrichment identity.
     report = recommend_features_report(conn, body.objective, client,
                                        catalog_source=body.catalog_source,
                                        roles=identity.role_claims,
                                        target_ref=body.target_ref, entity=body.entity,
-                                       feedback=body.feedback, now=datetime.now(UTC))
+                                       feedback=body.feedback, now=datetime.now(UTC),
+                                       actor=identity)
     # Rejections are shown to the human, never hidden: {"name", "reason", "code"} per candidate.
     return {"proposals": report.ideas, "rejections": report.rejections}
 
@@ -96,7 +101,8 @@ def refine(
     revised, rejection = refine_idea(conn, body.candidate.model_dump(), body.instruction, client,
                                      catalog_source=body.catalog_source,
                                      roles=identity.role_claims, entity=body.entity,
-                                     target_ref=body.target_ref, now=datetime.now(UTC))
+                                     target_ref=body.target_ref, now=datetime.now(UTC),
+                                     objective=body.objective, actor=identity)
     if revised is not None:
         return {"revised": revised}
     rej = rejection or {}
@@ -117,10 +123,11 @@ def recommend_sets(
                                            catalog_source=body.catalog_source,
                                            roles=identity.role_claims,
                                            target_ref=body.target_ref, entity=body.entity,
-                                           feedback=body.feedback, now=datetime.now(UTC))
+                                           feedback=body.feedback, now=datetime.now(UTC),
+                                           actor=identity)
     # No recommendation over nothing: when every set came back empty there is nothing to advise on,
     # and we do not spend an LLM call to say so.
-    recommendation = (recommend_set(conn, report.sets, body.objective, client)
+    recommendation = (recommend_set(conn, report.sets, body.objective, client, actor=identity)
                       if any(s.features for s in report.sets) else None)
     return {"sets": report.sets, "recommendation": recommendation,
             "rejections": report.rejections}
@@ -134,7 +141,8 @@ def recipe(
     client: Annotated[LLMClient, Depends(get_llm)],
 ) -> Recipe:
     return feature_recipe(conn, body.query, client,
-                          catalog_source=body.catalog_source, roles=identity.role_claims)
+                          catalog_source=body.catalog_source, roles=identity.role_claims,
+                          actor=identity)
 
 
 @router.post("/features/leakage-check")
@@ -144,4 +152,5 @@ def leakage(
     identity: Annotated[IdentityEnvelope, Depends(get_identity)],
     client: Annotated[LLMClient, Depends(get_llm)],
 ) -> dict[str, list[LeakageWarning]]:
-    return {"warnings": leakage_check(conn, body.derives_from, body.target_ref, client)}
+    return {"warnings": leakage_check(conn, body.derives_from, body.target_ref, client,
+                                      actor=identity)}
