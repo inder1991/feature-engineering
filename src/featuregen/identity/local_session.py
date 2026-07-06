@@ -38,6 +38,11 @@ def verify_password(password: str, stored: str) -> bool:
     return hmac.compare_digest(dk.hex(), hash_hex)   # constant-time
 
 
+# A real full-cost (200k-round) hash to verify against on an unknown username, so the login timing of
+# "no such user" matches "wrong password" — no username-enumeration oracle (was a 1-round dummy).
+_DUMMY_HASH = hash_password(secrets.token_urlsafe(16))
+
+
 def _token_hash(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
@@ -83,10 +88,12 @@ def login(conn: DbConn, username: str, password: str, *, now: datetime,
     username / password / disabled account. A wrong username still runs a verify to avoid timing leaks."""
     row = conn.execute("SELECT user_id, password_hash, disabled FROM app_user WHERE username = %s",
                        (username,)).fetchone()
-    stored = row[1] if row else "pbkdf2_sha256$1$00$00"   # dummy verify on unknown user (timing)
+    stored = row[1] if row else _DUMMY_HASH   # full-cost verify on unknown user -> no timing oracle
     ok = verify_password(password, stored)
     if row is None or row[2] or not ok:
         return None
+    conn.execute("DELETE FROM app_session WHERE user_id = %s AND expires_at <= %s",
+                 (row[0], now))            # reap this user's expired sessions on a successful login
     token = secrets.token_urlsafe(32)
     conn.execute("INSERT INTO app_session (token_hash, user_id, expires_at) VALUES (%s, %s, %s)",
                  (_token_hash(token), row[0], now + ttl))
@@ -185,12 +192,35 @@ def user_count(conn: DbConn) -> int:
     return conn.execute("SELECT count(*) FROM app_user").fetchone()[0]
 
 
+def is_last_admin(conn: DbConn, user_id: str, *, admin_role: str = "admin") -> bool:
+    """True if removing/disabling this user would leave ZERO enabled admins (would lock out admin)."""
+    other = conn.execute(
+        "SELECT 1 FROM app_user_group ug JOIN app_group_role gr ON gr.group_id = ug.group_id "
+        "JOIN app_user u ON u.user_id = ug.user_id "
+        "WHERE gr.role = %s AND u.disabled = false AND ug.user_id <> %s LIMIT 1",
+        (admin_role, user_id)).fetchone()
+    if other is not None:
+        return False   # another enabled admin exists
+    me = conn.execute(
+        "SELECT 1 FROM app_user_group ug JOIN app_group_role gr ON gr.group_id = ug.group_id "
+        "JOIN app_user u ON u.user_id = ug.user_id "
+        "WHERE gr.role = %s AND u.disabled = false AND ug.user_id = %s LIMIT 1",
+        (admin_role, user_id)).fetchone()
+    return me is not None   # this user IS the only enabled admin
+
+
 def bootstrap_admin(conn: DbConn, username: str, password: str, *, admin_role: str = "admin") -> str | None:
     """Create the first admin (user + an 'admins' group granting the admin role) ONLY when there are
-    no users yet — a one-time, first-run action. Returns the new user_id, or None if users exist."""
+    no users yet — a one-time, first-run action. Returns the new user_id, or None if users exist.
+    Reuses an orphaned 'admins' group (e.g. left after a full user wipe) rather than conflicting on it."""
     if user_count(conn) > 0:
         return None
     uid = create_user(conn, username, password)
-    gid = create_group(conn, "admins", roles=(admin_role,))
+    row = conn.execute("SELECT group_id FROM app_group WHERE name = 'admins'").fetchone()
+    if row is not None:
+        gid = row[0]
+        grant_role(conn, gid, admin_role)          # ensure the reused group still grants admin
+    else:
+        gid = create_group(conn, "admins", roles=(admin_role,))
     add_user_to_group(conn, uid, gid)
     return uid

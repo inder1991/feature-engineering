@@ -18,6 +18,7 @@ from featuregen.identity.local_session import (
     delete_group,
     delete_user,
     grant_role,
+    is_last_admin,
     list_groups,
     list_users,
     remove_user_from_group,
@@ -31,7 +32,10 @@ _Conn = Annotated[psycopg.Connection, Depends(get_conn, scope="function")]
 
 
 def require_admin(identity: Annotated[IdentityEnvelope, Depends(get_identity)]) -> IdentityEnvelope:
-    if "admin" not in identity.role_claims:
+    # Require a PROVEN principal, not just self-asserted roles: an unauthenticated stub identity
+    # (X-Roles: admin) must NOT reach the admin control plane even if the stub is on. In prod (stub
+    # off) only a real Bearer session reaches here anyway; this is defense-in-depth against misconfig.
+    if not (identity.authenticated and "admin" in identity.role_claims):
         raise HTTPException(status_code=403, detail="admin role required")
     return identity
 
@@ -41,16 +45,16 @@ _Admin = Annotated[IdentityEnvelope, Depends(require_admin)]
 
 class BootstrapIn(BaseModel):
     username: str = Field(min_length=1)
-    password: str = Field(min_length=1)
+    password: str = Field(min_length=8)
 
 
 class UserIn(BaseModel):
     username: str = Field(min_length=1)
-    password: str = Field(min_length=1)
+    password: str = Field(min_length=8)
 
 
 class PasswordIn(BaseModel):
-    password: str = Field(min_length=1)
+    password: str = Field(min_length=8)
 
 
 class GroupIn(BaseModel):
@@ -69,7 +73,10 @@ class MemberIn(BaseModel):
 # ---- bootstrap (first run only) -----------------------------------------------------------------
 @router.post("/admin/bootstrap")
 def bootstrap(body: BootstrapIn, conn: _Conn) -> dict:
-    uid = bootstrap_admin(conn, body.username, body.password)
+    try:
+        uid = bootstrap_admin(conn, body.username, body.password)
+    except psycopg.errors.UniqueViolation as exc:   # e.g. a stale 'admins' group / username race
+        raise HTTPException(status_code=409, detail="bootstrap conflict; retry") from exc
     if uid is None:
         raise HTTPException(status_code=409, detail="users already exist; bootstrap is first-run only")
     return {"user_id": uid}
@@ -91,6 +98,8 @@ def post_user(body: UserIn, conn: _Conn, admin: _Admin) -> dict:
 
 @router.post("/admin/users/{user_id}/disable")
 def disable_user(user_id: str, conn: _Conn, admin: _Admin) -> dict:
+    if is_last_admin(conn, user_id):
+        raise HTTPException(status_code=409, detail="cannot disable the last admin")
     if not set_user_disabled(conn, user_id, True):
         raise HTTPException(status_code=404, detail="no such user")
     return {"disabled": True}
@@ -112,6 +121,8 @@ def reset_password(user_id: str, body: PasswordIn, conn: _Conn, admin: _Admin) -
 
 @router.delete("/admin/users/{user_id}")
 def remove_user(user_id: str, conn: _Conn, admin: _Admin) -> dict:
+    if is_last_admin(conn, user_id):
+        raise HTTPException(status_code=409, detail="cannot delete the last admin")
     if not delete_user(conn, user_id):
         raise HTTPException(status_code=404, detail="no such user")
     return {"deleted": True}
