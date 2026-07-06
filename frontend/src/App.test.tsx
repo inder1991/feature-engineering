@@ -38,12 +38,13 @@ function arriveAt(hash: string) {
 }
 
 describe('app shell', () => {
-  it('renders five nav items in order and lands on Overview by default', () => {
+  it('renders six nav items in order and lands on Overview by default', () => {
     render(<App />)
     const nav = within(screen.getByRole('navigation'))
     expect(nav.getAllByRole('button').map(b => b.textContent)).toEqual([
       'Overview',
       'Generate features',
+      'Registry',
       'Search',
       'Upload',
       'Review queue',
