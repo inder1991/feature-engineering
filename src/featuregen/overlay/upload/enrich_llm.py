@@ -13,6 +13,7 @@ uploader free text or data values — so it is classified `clean` and passes the
 from __future__ import annotations
 
 import logging
+import os
 
 from featuregen.contracts.envelopes import IdentityEnvelope
 from featuregen.contracts.identity import identity_to_jsonb
@@ -31,12 +32,39 @@ from featuregen.intake.redaction import (
     assert_llm_safe,
     build_llm_inputs,
 )
+from featuregen.security.audit import record_security_event
 
 logger = logging.getLogger(__name__)
 
 _OWNER = "featuregen-overlay"
 _RUN = "overlay-enrichment"          # the audit run bucket for catalog enrichment llm_call records
 _REDACTION_VERSION = "metadata-only"  # inputs are names/types only — nothing to redact
+
+
+def _generation_settings() -> dict:
+    """Provider/model for the audit record + idempotency key, read from the SAME env that configures
+    the client (ClaudeConfig.from_env). So a real ClaudeLLM is audited as anthropic/<model> and
+    requests its configured model — NOT the old hard-coded {"provider":"fake","model":"test"}, which
+    made a production Claude call request model "test". Defaults to fake/test with no provider set."""
+    provider = os.environ.get("FEATUREGEN_LLM_PROVIDER", "fake")
+    if provider == "anthropic":
+        return {"provider": "anthropic",
+                "model": os.environ.get("FEATUREGEN_LLM_MODEL", "claude-opus-4-8")}
+    return {"provider": "fake", "model": "test"}
+
+
+def _audit_egress_block(conn, *, task: str, actor, reason: str) -> None:
+    """A blocked egress is a security event (content was about to reach the LLM) — record it on the
+    tamper-evident chain, not just the log (the redaction contract requires hard failures be audited).
+    Best-effort: an audit failure (e.g. HMAC key unset) must never turn a safe block into a crash."""
+    if actor is None:
+        return
+    try:
+        record_security_event(conn, event_type="EGRESS_BLOCKED", actor=actor,
+                              attempted_action=f"llm.{task}", decision="DENIED",
+                              reason=reason or "egress guard blocked")
+    except Exception:  # noqa: BLE001 — never let an audit failure mask the (correct) egress block
+        logger.exception("failed to record EGRESS_BLOCKED security event for %s", task)
 
 # Structural output schemas for the three enrichment tasks (single string field each).
 _SCHEMAS: dict[tuple[str, int], dict] = {
@@ -106,13 +134,14 @@ def audited_structured_call(conn, client: LLMClient, *, task: str, prompt_id: st
     req = LLMRequest(
         task=task, prompt_id=prompt_id, prompt_version=1, inputs=inputs,
         output_schema_id=schema_id, output_schema_version=1,
-        generation_settings={"provider": "fake", "model": "test"},
+        generation_settings=_generation_settings(),   # from env — NOT a hard-coded fake/test
         output_schema=schema)
 
     try:
         assert_llm_safe(req)              # §9.4 egress backstop
-    except EgressViolation:
+    except EgressViolation as exc:
         logger.warning("egress guard blocked %s (schema %s); no dispatch", task, schema_id)
+        _audit_egress_block(conn, task=task, actor=actor, reason=str(exc))
         return None                       # hard fail closed — no dispatch, no cache
 
     outcome = drive_structured_call(
