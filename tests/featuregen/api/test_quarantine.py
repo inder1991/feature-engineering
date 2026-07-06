@@ -22,3 +22,26 @@ def test_unknown_source_empty_queue(client):
 
 def test_quarantine_requires_auth(client):
     assert client.get("/sources/deposits/quarantine").status_code == 401
+
+
+def test_resolve_endpoint_fixes_and_clears(client):
+    upload_csv(client, "deposits", DEPOSITS_CSV + "deposits,accounts,opened_at,\n")
+    r = client.post("/sources/deposits/quarantine/9/resolve",
+                    json={"edits": {"type": "timestamp"}}, headers=AUTH)
+    assert r.status_code == 200 and r.json()["resolved"] is True
+    assert client.get("/sources/deposits/quarantine", headers=AUTH).json() == []
+
+
+def test_resolve_endpoint_reports_still_invalid(client):
+    upload_csv(client, "deposits", DEPOSITS_CSV + "deposits,accounts,opened_at,\n")
+    r = client.post("/sources/deposits/quarantine/9/resolve",
+                    json={"edits": {"type": ""}}, headers=AUTH)   # still blank -> not resolved
+    assert r.status_code == 200 and r.json()["resolved"] is False and r.json()["reason"]
+    assert len(client.get("/sources/deposits/quarantine", headers=AUTH).json()) == 1
+
+
+def test_dismiss_endpoint(client):
+    upload_csv(client, "deposits", DEPOSITS_CSV + "deposits,accounts,opened_at,\n")
+    assert client.post("/sources/deposits/quarantine/9/dismiss", headers=AUTH).status_code == 200
+    assert client.get("/sources/deposits/quarantine", headers=AUTH).json() == []
+    assert client.post("/sources/deposits/quarantine/999/dismiss", headers=AUTH).status_code == 404

@@ -13,7 +13,7 @@ from featuregen.overlay.store import append_overlay_event, load_fact
 from featuregen.overlay.upload.brake import large_change_brake
 from featuregen.overlay.upload.canonical import CanonicalRow, validate_rows
 from featuregen.overlay.upload.enrich import classify_domains, draft_definitions, enrich_concepts
-from featuregen.overlay.upload.graph import build_graph
+from featuregen.overlay.upload.graph import add_column_row, build_graph
 from featuregen.overlay.upload.review_queue import persist_quarantine
 from featuregen.overlay.upload.upload_catalog import UploadCatalog, table_ref
 from featuregen.projections.runner import run_projection
@@ -125,3 +125,58 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
     flagged = (f"first upload of '{catalog_source}' ({len(vr.good)} objects) — review recommended"
                if brake.is_first_upload else None)
     return IngestResult("ingested", None, asserted, staled, len(vr.quarantined), flagged)
+
+
+def _bool(v) -> bool:
+    return v is True or (isinstance(v, str) and v.strip().lower() in ("true", "1", "yes"))
+
+
+def _row_from_raw(raw: dict, catalog_source: str) -> CanonicalRow:
+    """Rebuild a CanonicalRow from a quarantine `raw` dict merged with the reviewer's edits."""
+    def s(k: str) -> str:
+        return str(raw.get(k) or "")
+    return CanonicalRow(
+        source=s("source") or catalog_source, table=s("table"), column=s("column"), type=s("type"),
+        is_grain=_bool(raw.get("is_grain")), as_of=_bool(raw.get("as_of")),
+        as_of_basis=s("as_of_basis"), definition=s("definition"), sensitivity=s("sensitivity"),
+        joins_to=s("joins_to"), cardinality=s("cardinality"), additivity=s("additivity"),
+        unit=s("unit"), currency=s("currency"), entity=s("entity"))
+
+
+def resolve_quarantine_row(conn, catalog_source: str, row_index: int, edits: dict, *,
+                           actor) -> tuple[bool, str]:
+    """Apply a reviewer's inline fix to a quarantined row: merge the edits onto the raw row, RE-RUN the
+    real deterministic validation (validate_rows — never the client mock), and, if it now passes and its
+    column isn't already in the catalog, add it to the source graph + assert its point-in-time fact and
+    drop it from the queue. Returns (resolved, reason). Like all quarantine state, a resolution holds
+    until the source is re-uploaded (the file stays the source of truth)."""
+    row = conn.execute(
+        "SELECT raw FROM quarantine_row WHERE catalog_source = %s AND row_index = %s",
+        (catalog_source, row_index)).fetchone()
+    if row is None:
+        return False, "no such quarantined row"
+    merged = {**row[0], **(edits or {})}
+    vr = validate_rows([_row_from_raw(merged, catalog_source)], catalog_source)
+    if vr.structural_error or vr.quarantined:
+        return False, vr.structural_error or vr.quarantined[0].message   # still invalid — surface why
+    good = vr.good[0]
+    c_ref = f"public.{good.table}.{good.column}"
+    if conn.execute("SELECT 1 FROM graph_node WHERE catalog_source = %s AND object_ref = %s",
+                    (catalog_source, c_ref)).fetchone() is not None:
+        return False, f"{good.table}.{good.column} is already in the catalog"
+    add_column_row(conn, catalog_source, good)
+    if good.as_of:
+        basis = good.as_of_basis if good.as_of_basis in ("posted_at", "ingested_at") else "posted_at"
+        _assert_fact(conn, catalog_source, good.table, "availability_time",
+                     {"column": good.column, "basis": basis}, actor=actor)
+    conn.execute("DELETE FROM quarantine_row WHERE catalog_source = %s AND row_index = %s",
+                 (catalog_source, row_index))
+    return True, ""
+
+
+def dismiss_quarantine_row(conn, catalog_source: str, row_index: int) -> bool:
+    """Durably drop a quarantined row from the queue (holds until the source is re-uploaded)."""
+    row = conn.execute(
+        "DELETE FROM quarantine_row WHERE catalog_source = %s AND row_index = %s RETURNING row_index",
+        (catalog_source, row_index)).fetchone()
+    return row is not None

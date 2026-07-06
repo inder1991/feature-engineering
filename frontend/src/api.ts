@@ -223,6 +223,29 @@ export function listQuarantine(source: string): Promise<QuarantineItem[]> {
   return request(`/sources/${encodeURIComponent(source)}/quarantine`)
 }
 
+// A server-side quarantine fix. `resolved: false` + a `reason` means the corrected row still fails the
+// backend's authoritative validation (the browser preview is only a hint). A resolved row has left the
+// queue and entered the catalog; a dismissed one has left the queue. Both hold until the next re-upload.
+export interface QuarantineResolution {
+  resolved: boolean
+  reason: string
+}
+
+export function resolveQuarantineRow(
+  source: string,
+  rowIndex: number,
+  edits: Record<string, string>,
+): Promise<QuarantineResolution> {
+  return post(`/sources/${encodeURIComponent(source)}/quarantine/${rowIndex}/resolve`, { edits })
+}
+
+export function dismissQuarantineRow(
+  source: string,
+  rowIndex: number,
+): Promise<{ dismissed: boolean }> {
+  return post(`/sources/${encodeURIComponent(source)}/quarantine/${rowIndex}/dismiss`, {})
+}
+
 export function columnJoins(objectRef: string, source: string): Promise<JoinEdge[]> {
   return request(
     `/columns/${encodeURIComponent(objectRef)}/joins?source=${encodeURIComponent(source)}`)

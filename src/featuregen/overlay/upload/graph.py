@@ -83,6 +83,38 @@ def build_graph(conn, catalog_source: str, rows: list[CanonicalRow],
         (catalog_source,))
 
 
+def add_column_row(conn, catalog_source: str, r: CanonicalRow) -> None:
+    """Incrementally add ONE canonical column row to an EXISTING source graph — the quarantine-fix path
+    (a wholesale build_graph would wipe the source's other columns). No enrichment (concept/definition/
+    domain arrive with an upload; a fix carries only the declared row). Idempotent via ON CONFLICT."""
+    t_ref = _table_ref(r.table)
+    conn.execute(
+        "INSERT INTO graph_node (catalog_source, object_ref, kind, table_name, column_name, "
+        "data_type, definition, is_grain, is_as_of, concept, domain, search_doc) "
+        f"VALUES (%s, %s, 'table', %s, NULL, NULL, NULL, false, false, NULL, NULL, {_SEARCH_DOC}) "
+        "ON CONFLICT DO NOTHING",
+        (catalog_source, t_ref, r.table, r.table, "", r.table, "", ""))
+    c_ref = _column_ref(r.table, r.column)
+    definition = r.definition or None
+    conn.execute(
+        "INSERT INTO graph_node (catalog_source, object_ref, kind, table_name, column_name, "
+        "data_type, definition, is_grain, is_as_of, concept, domain, sensitivity, additivity, unit, "
+        f"currency, entity, search_doc) VALUES (%s, %s, 'column', %s, %s, %s, %s, %s, %s, NULL, NULL, "
+        f"%s, %s, %s, %s, %s, {_SEARCH_DOC}) ON CONFLICT DO NOTHING",
+        (catalog_source, c_ref, r.table, r.column, r.type, definition, r.is_grain, r.as_of,
+         r.sensitivity or None, r.additivity or None, r.unit or None, r.currency or None,
+         r.entity or None, r.column, definition or "", r.table, "", r.entity or ""))
+    conn.execute(
+        "INSERT INTO graph_edge (catalog_source, kind, from_ref, to_ref) "
+        "VALUES (%s, 'contains', %s, %s) ON CONFLICT DO NOTHING", (catalog_source, t_ref, c_ref))
+    if r.joins_to:
+        to_ref = f"{_SCHEMA}.{r.joins_to}" if r.joins_to.count(".") == 1 else r.joins_to
+        conn.execute(
+            "INSERT INTO graph_edge (catalog_source, kind, from_ref, to_ref, cardinality) "
+            "VALUES (%s, 'joins', %s, %s, %s) ON CONFLICT DO NOTHING",
+            (catalog_source, c_ref, to_ref, r.cardinality or None))
+
+
 @dataclass(frozen=True, slots=True)
 class JoinEdge:
     from_ref: str
