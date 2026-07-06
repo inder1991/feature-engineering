@@ -27,12 +27,35 @@
 //   (g{seq}:{name}) so a later round reusing a name never resurrects registered state.
 // - Set theses are client-side copy keyed by the router's fixed lens vocabulary (the wire
 //   carries no set description); an unknown lens simply renders without a thesis line.
+//
+// Feedback channels (Phase 3 decisions, documented for the record):
+// - Whole-round feedback re-calls /features/recommend-sets with the ROUND's original objective
+//   (snapshotted at generate time; a goal edit never silently rewrites what feedback runs
+//   against) plus the current scope, which cannot have drifted: scope edits invalidate the round.
+// - Pin semantics are client-side: candidates that are selected or registered stay (selected
+//   pins get a Kept chip; registered rows are already their own mark), everything else is
+//   replaced by the new response. A new candidate reusing a pinned name is dropped: the pin
+//   wins, one row per name. Kept candidates leave the sets model (lenses cleared) so new set
+//   cards count only their own features; kept rows stay visible in every set view. Drafts are
+//   not part of the engine round and pass through untouched.
+// - Both feedback channels stop at 3 rounds, then it is back in the human's hands. Scope edits
+//   reset the counters with everything else; a fresh generate starts a fresh allowance.
+// - Per-candidate feedback (refine) exists on generated rows only: a draft is the human's own
+//   definition, revised by editing its line, not by asking the engine. Registered rows take no
+//   feedback, and a revision that resolves after its candidate registered is dropped.
+// - A refine revision is a SUGGESTION: it touches nothing until Approve revision, and even then
+//   only the local candidate; registration still requires the tray's explicit confirm.
+// - Simple mutual-exclusion rule with registration: while the tray is confirming or a register
+//   batch is in flight, both feedback channels are disabled.
+// - Scope edits bump the generation sequence so an in-flight round (generate or feedback) that
+//   resolves after the edit is discarded, never applied against the new scope.
 import { type FormEvent, type ReactNode, useRef, useState } from 'react'
 import {
   ApiError, type FeatureFreshness, type FeatureIdea, type FeatureSpecIn, type JoinStep,
-  type Recipe, type Rejection, type SetRecommendation, featureFreshness, featureRecipe,
-  recommendFeatureSets, registerFeature,
+  type Recipe, type RefineRejection, type Rejection, type SetRecommendation, featureFreshness,
+  featureRecipe, recommendFeatureSets, refineCandidate, registerFeature,
 } from '../api'
+import { getSession } from '../session'
 
 const HELP_STYLE = { fontSize: 12 } as const
 // Solid ok chip (index.css has no fresh badge class; mirrors .badge.stale's solid treatment).
@@ -63,6 +86,9 @@ const LENS_THESES: Record<string, string> = {
   temporal: 'Point-in-time and recency signals; how behavior moves over time.',
   distributional: 'Position within the peer group; how this entity compares to its cohort.',
 }
+
+// Both feedback channels stop here: 3 rounds of guidance, then it is back in the human's hands.
+const FEEDBACK_ROUNDS = 3
 
 // Human labels for gauntlet rejection codes. STALE reads "stale source"; every other code
 // lowercases with spaces so even an unknown code from a newer backend reads as words.
@@ -258,6 +284,64 @@ interface GeneratedCandidate {
   // Every lens whose set holds this feature, in set order. Length > 1 renders the
   // "In N sets" chip.
   lenses: string[]
+  // Pinned through a whole-round feedback regeneration (it was selected or registered when the
+  // round replaced everything else). Kept rows show in every set view and leave the sets model.
+  kept?: boolean
+}
+
+// One recorded whole-round feedback submission: who asked, what they asked, what it did.
+interface SetFeedbackRecord {
+  round: number
+  user: string
+  instruction: string
+  // Selected (unregistered) pins that were kept; registered rows persist as their own record.
+  kept: number
+  replaced: number
+}
+
+// Per-candidate refine channel state, keyed by candidate key.
+interface RefineState {
+  open: boolean
+  instruction: string
+  busy: boolean
+  // Rounds consumed (a gauntlet rejection consumes its round too; a transport error does not).
+  rounds: number
+  // The engine's revision awaiting the human's Approve revision / Revert to original call.
+  pending: FeatureIdea | null
+  pendingRound: number
+  pendingInstruction: string
+  rejection: RefineRejection | null
+  error: string | null
+  // Round number of the last APPROVED revision; renders the "Revised · R<n>" chip.
+  appliedRound: number | null
+}
+
+const EMPTY_REFINE: RefineState = {
+  open: false, instruction: '', busy: false, rounds: 0, pending: null, pendingRound: 0,
+  pendingInstruction: '', rejection: null, error: null, appliedRound: null,
+}
+
+// Display form of backend-resolved lineage pairs; shared by the row facts and the refine diff.
+function fmtPairs(pairs: [string, string][]): string {
+  return pairs.map(([source, ref]) => `${source}:${ref}`).join(', ') || 'none'
+}
+
+// One field of the recorded revision diff: old struck through, new inserted, or the honest
+// "unchanged" marker. <del>/<ins> carry the change semantics for assistive tech; strikethrough
+// plus ordering keep the encoding non-color.
+function DiffLine({ label, before, after }: { label: string; before: string; after: string }) {
+  return (
+    <p className="diff-line">
+      <span className="diff-label">{label}</span>{' '}
+      {before === after ? (
+        <span className="diff-unchanged">unchanged</span>
+      ) : (
+        <>
+          <del>{before}</del> <span aria-hidden="true">→</span> <ins>{after}</ins>
+        </>
+      )}
+    </p>
+  )
 }
 
 // A described feature drafted through /features/recipe. Recipes are single-catalog by API
@@ -382,15 +466,38 @@ export function WorkbenchScreen() {
   const [confirmingBatch, setConfirmingBatch] = useState(false)
   const [batchBusy, setBatchBusy] = useState(false)
   const [notice, setNotice] = useState('')
+  // Whole-round feedback channel: the objective the round was generated for (feedback reruns
+  // THAT goal, not a since-edited input), the instruction being typed, rounds consumed, the
+  // recorded strips, and the in-flight flag.
+  const [roundObjective, setRoundObjective] = useState('')
+  const [setFbInstruction, setSetFbInstruction] = useState('')
+  const [setFbRounds, setSetFbRounds] = useState(0)
+  const [setFbRecords, setSetFbRecords] = useState<SetFeedbackRecord[]>([])
+  const [setFbBusy, setSetFbBusy] = useState(false)
+  // Per-candidate refine channel, keyed by candidate key (cleared with its candidates).
+  const [refines, setRefines] = useState<Record<string, RefineState>>({})
   // Out-of-order guards: only the latest request per handler may apply its response.
   const generateSeq = useRef(0)
   const draftSeq = useRef(0)
+  // Reentry guard for the whole-round feedback call (one flight at a time, exactly once).
+  const setFbInFlight = useRef(false)
+  // Reentry guard per candidate for refine calls.
+  const refineInFlight = useRef(new Set<string>())
   // Reentry guard for the draft batch: a second submit while a batch is in flight is a no-op,
   // so each line's recipe fires exactly once even before the disabled attribute lands.
   const draftInFlight = useRef(false)
   // Reentry guard for the register batch: state updates are async, so a double click on
   // Confirm approval could otherwise start two batches before the disabled attribute lands.
   const batchInFlight = useRef(false)
+  // Latest-state mirrors (assigned every render) so async arrivals decide against CURRENT
+  // state, not their submit-time closure: feedback pins read the selection as it stands when
+  // the response lands, and a refine result checks whether its row registered meanwhile.
+  const generatedRef = useRef(generated)
+  generatedRef.current = generated
+  const selectedRef = useRef(selected)
+  selectedRef.current = selected
+  const registeredRef = useRef(registered)
+  registeredRef.current = registered
 
   const multiSet = setLenses.length > 1
   // Every live candidate, across ALL sets plus drafts: selection and registration always work
@@ -398,9 +505,10 @@ export function WorkbenchScreen() {
   // when another set's view is showing.
   const allCandidates: Candidate[] = [...(generated ?? []), ...drafts]
   // What the one detail list shows: the active set's features (multi-set rounds) or every
-  // generated candidate (flat rounds), plus drafts in both cases.
+  // generated candidate (flat rounds), plus drafts in both cases. Kept pins belong to no new
+  // set, so they show in every view.
   const visibleGenerated = multiSet && activeLens !== null
-    ? (generated ?? []).filter(c => c.lenses.includes(activeLens))
+    ? (generated ?? []).filter(c => c.kept === true || c.lenses.includes(activeLens))
     : generated ?? []
   const listCandidates: Candidate[] = [...visibleGenerated, ...drafts]
   // One definition per non-empty line: the button label and its gating read this directly.
@@ -418,6 +526,12 @@ export function WorkbenchScreen() {
       .map(c => selected[c.key])
       .filter((lens): lens is string => typeof lens === 'string'),
   )]
+
+  // The one mutual-exclusion rule between feedback and registration: while the tray is
+  // confirming approval or a register batch is in flight, both feedback channels disable.
+  // A revision must never race what the human is about to write into the registry.
+  const feedbackLocked = confirmingBatch || batchBusy
+  const setFbExhausted = setFbRounds >= FEEDBACK_ROUNDS
 
   // Gates advance with real state, never decoratively.
   const goalDone = goal.trim() !== ''
@@ -448,11 +562,30 @@ export function WorkbenchScreen() {
     setRejectionsOpen(false)
   }
 
+  // Resets both feedback channels: round counters, recorded strips, typed instructions, and
+  // every per-candidate refine state. Runs with every path that replaces or clears the round.
+  function clearFeedback() {
+    setSetFbRounds(0)
+    setSetFbRecords([])
+    setSetFbInstruction('')
+    setSetFbBusy(false)
+    setRefines({})
+  }
+
+  // A scope edit voids any in-flight round (generate or whole-round feedback): bump the
+  // sequence so a late response is discarded instead of applying against the new scope, and
+  // release the busy flags the discarded flights can no longer clear.
+  function voidInFlightRounds() {
+    generateSeq.current += 1
+    setGenerating(false)
+  }
+
   function changeSource(value: string) {
     setSource(value)
     // Generated candidates were produced for the previous source context, and draft snapshots
     // no longer match it either: a source edit clears everything.
     const hadCandidates = allCandidates.length > 0
+    voidInFlightRounds()
     setGenerated(null)
     setDrafts([])
     setSelected({})
@@ -462,6 +595,7 @@ export function WorkbenchScreen() {
     setScreenedTarget(null)
     setConfirmingBatch(false)
     clearSets()
+    clearFeedback()
     if (hadCandidates) setScopeChanged(true)
   }
 
@@ -470,11 +604,13 @@ export function WorkbenchScreen() {
   // snapshot source is unchanged.
   function invalidateGenerated() {
     const hadGenerated = (generated?.length ?? 0) > 0
+    voidInFlightRounds()
     setGenerated(null)
     setSelected({})
     setScreenedTarget(null)
     setConfirmingBatch(false)
     clearSets()
+    clearFeedback()
     if (hadGenerated) setScopeChanged(true)
   }
 
@@ -534,15 +670,187 @@ export function WorkbenchScreen() {
       setRejectionsOpen(false)
       setScreenedTarget(target.trim() || null)
       setConfirmingBatch(false)
+      // A fresh engine round starts a fresh feedback cycle against ITS objective: whole-round
+      // feedback reruns this goal even if the input is edited later.
+      setRoundObjective(objective)
+      clearFeedback()
     } catch (err) {
       if (seq !== generateSeq.current) return
       setGenerated(null)
       setScreenedTarget(null)
       clearSets()
+      clearFeedback()
       fail(err)
     } finally {
       if (seq === generateSeq.current) setGenerating(false)
     }
+  }
+
+  // Whole-round feedback: rerun the round's objective under the human's guidance. Selected and
+  // registered candidates are pinned client-side; everything else is replaced by the response.
+  async function sendSetFeedback(e: FormEvent) {
+    e.preventDefault()
+    if (setFbInFlight.current) return
+    const instruction = setFbInstruction.trim()
+    if (!instruction || setFbRounds >= FEEDBACK_ROUNDS) return
+    if (feedbackLocked || generating) return
+    const seq = ++generateSeq.current
+    setFbInFlight.current = true
+    setNotice('')
+    setSetFbBusy(true)
+    try {
+      const round = await recommendFeatureSets(
+        roundObjective, source.trim() || null, target.trim() || null, entity.trim() || null,
+        instruction)
+      if (seq !== generateSeq.current) return
+      // Pins read the selection AS THE RESPONSE LANDS (the mirrors), not as it stood at submit.
+      const prev = generatedRef.current ?? []
+      const pinned = prev.filter(c =>
+        c.key in selectedRef.current || registeredRef.current[c.key] !== undefined)
+      const keptSelected = pinned
+        .filter(c => registeredRef.current[c.key] === undefined).length
+      const replaced = prev.length - pinned.length
+      const pinnedNames = new Set(pinned.map(c => c.idea.name))
+      const pinnedKeys = new Set(pinned.map(c => c.key))
+      const byName = new Map<string, GeneratedCandidate>()
+      const lenses: string[] = []
+      for (const set of round.sets) {
+        if (set.features.length === 0) continue
+        lenses.push(set.lens)
+        for (const idea of set.features) {
+          // The pin wins a name collision: one row per name, and the human's kept candidate is
+          // never silently swapped for a regenerated variant.
+          if (pinnedNames.has(idea.name)) continue
+          const existing = byName.get(idea.name)
+          if (existing) {
+            if (!existing.lenses.includes(set.lens)) existing.lenses.push(set.lens)
+          } else {
+            byName.set(idea.name, {
+              kind: 'generated', key: `g${seq}:${idea.name}`, idea, lenses: [set.lens],
+            })
+          }
+        }
+      }
+      setGenerated([
+        ...pinned.map((c): GeneratedCandidate => ({ ...c, kept: true, lenses: [] })),
+        ...byName.values(),
+      ])
+      setSetLenses(lenses)
+      setRecommendation(round.recommendation)
+      setActiveLens(
+        lenses.length > 1
+          ? round.recommendation !== null && lenses.includes(round.recommendation.recommended_lens)
+            ? round.recommendation.recommended_lens
+            : lenses[0]
+          : null)
+      setRejections(round.rejections)
+      setRejectionsOpen(false)
+      setConfirmingBatch(false)
+      setSetFbRounds(r => r + 1)
+      setSetFbRecords(records => [...records, {
+        round: records.length + 1, user: getSession().user, instruction,
+        kept: keptSelected, replaced,
+      }])
+      setSetFbInstruction('')
+      // Kept candidates keep their consumed refine rounds; replaced ones drop theirs.
+      setRefines(prevMap => Object.fromEntries(
+        Object.entries(prevMap).filter(([key]) => pinnedKeys.has(key))))
+    } catch (err) {
+      if (seq !== generateSeq.current) return
+      // The round never ran: candidates stay, no round is consumed.
+      fail(err)
+    } finally {
+      // Unconditional: only one feedback flight can exist (reentry ref), so no newer feedback
+      // owns the flag, and a scope edit or newer generate already reset it anyway.
+      setFbInFlight.current = false
+      setSetFbBusy(false)
+    }
+  }
+
+  function patchRefine(key: string, patch: (prev: RefineState) => RefineState) {
+    setRefines(prev => ({ ...prev, [key]: patch(prev[key] ?? EMPTY_REFINE) }))
+  }
+
+  function toggleRefine(key: string) {
+    patchRefine(key, prev => ({ ...prev, open: !prev.open }))
+  }
+
+  // Per-candidate feedback: one engine run, re-checked by the gauntlet, recorded under the
+  // session user. The result is a suggestion; the candidate changes only on Approve revision.
+  async function sendRefine(candidate: GeneratedCandidate) {
+    const { key, idea } = candidate
+    if (refineInFlight.current.has(key)) return
+    const state = refines[key] ?? EMPTY_REFINE
+    const instruction = state.instruction.trim()
+    if (!instruction || state.rounds >= FEEDBACK_ROUNDS) return
+    if (feedbackLocked) return
+    refineInFlight.current.add(key)
+    setNotice('')
+    patchRefine(key, prev => ({ ...prev, busy: true, rejection: null, error: null }))
+    try {
+      const result = await refineCandidate(
+        {
+          name: idea.name, description: idea.description, derives_from: idea.derives_from,
+          aggregation: idea.aggregation, grain_table: idea.grain_table,
+        },
+        instruction,
+        source.trim() || null, entity.trim() || null, target.trim() || null,
+      )
+      // The row may have registered or been replaced while the engine ran: registered
+      // candidates take no feedback, and a gone row has nothing to revise. Drop the result.
+      const live = (generatedRef.current ?? []).some(c => c.key === key)
+      if (!live || registeredRef.current[key] !== undefined) return
+      if ('revised' in result) {
+        const revised = result.revised
+        patchRefine(key, prev => ({
+          ...prev, rounds: prev.rounds + 1, pending: revised, pendingRound: prev.rounds + 1,
+          pendingInstruction: instruction, rejection: null, error: null, instruction: '',
+        }))
+      } else {
+        const rejected = result.rejected
+        // The gauntlet rejected the revision: the round is still consumed, and the candidate
+        // is unchanged. The typed instruction stays for the human to adjust.
+        patchRefine(key, prev => ({
+          ...prev, rounds: prev.rounds + 1, pending: null, rejection: rejected, error: null,
+        }))
+      }
+    } catch (err) {
+      const live = (generatedRef.current ?? []).some(c => c.key === key)
+      if (live && registeredRef.current[key] === undefined) {
+        if (err instanceof ApiError && err.status === 503) {
+          // A missing provider is a deployment fact: the one honest top notice, not a row error.
+          fail(err)
+        } else {
+          patchRefine(key, prev => ({
+            ...prev, error: err instanceof ApiError ? err.detail : String(err),
+          }))
+        }
+      }
+    } finally {
+      refineInFlight.current.delete(key)
+      setRefines(prev => key in prev
+        ? { ...prev, [key]: { ...prev[key], busy: false } }
+        : prev)
+    }
+  }
+
+  // The human accepts the engine's revision: the candidate's data is replaced locally. The key
+  // is stable, so selection state survives; registration still requires the tray's confirm.
+  function approveRevision(key: string) {
+    const pending = (refines[key] ?? EMPTY_REFINE).pending
+    if (pending === null) return
+    setGenerated(prev => prev === null
+      ? prev
+      : prev.map(c => (c.key === key ? { ...c, idea: pending } : c)))
+    patchRefine(key, prev => ({
+      ...prev, pending: null, appliedRound: prev.pendingRound, open: false,
+    }))
+  }
+
+  // The human declines: the revision is discarded, the candidate untouched. The consumed round
+  // stays consumed; the engine ran.
+  function revertRevision(key: string) {
+    patchRefine(key, prev => ({ ...prev, pending: null }))
   }
 
   async function draftCandidates(e: FormEvent) {
@@ -1013,8 +1321,10 @@ export function WorkbenchScreen() {
               const aggregation = c.kind === 'generated' ? c.idea.aggregation : c.recipe.aggregation
               const grain = c.kind === 'generated' ? c.idea.grain_table : c.recipe.grain_table
               const derives = c.kind === 'generated'
-                ? c.idea.derives_pairs.map(([s, ref]) => `${s}:${ref}`).join(', ') || 'none'
+                ? fmtPairs(c.idea.derives_pairs)
                 : c.recipe.derives_from.map(ref => `${c.snapshotSource}:${ref}`).join(', ') || 'none'
+              const refine = refines[c.key] ?? EMPTY_REFINE
+              const refineExhausted = refine.rounds >= FEEDBACK_ROUNDS
               return (
                 <li className="row" key={c.key} style={{ alignItems: 'flex-start' }}>
                   {reg ? (
@@ -1047,6 +1357,15 @@ export function WorkbenchScreen() {
                           theses. Soft chip; the row is one candidate either way. */}
                       {c.kind === 'generated' && c.lenses.length > 1 && (
                         <span className="badge">In {c.lenses.length} sets</span>
+                      )}
+                      {/* Pinned through a whole-round regeneration. Registered rows skip the
+                          chip: Registered is already their mark. */}
+                      {c.kind === 'generated' && c.kept === true && !reg && (
+                        <span className="badge">Kept</span>
+                      )}
+                      {/* The human approved an engine revision in round n. */}
+                      {c.kind === 'generated' && refine.appliedRound !== null && (
+                        <span className="badge revised">Revised · R{refine.appliedRound}</span>
                       )}
                     </div>
                     <p style={{ color: 'var(--ink-soft)' }}>{description}</p>
@@ -1097,6 +1416,130 @@ export function WorkbenchScreen() {
                       <p className="error" role="alert">
                         {error}
                       </p>
+                    )}
+                    {/* Per-candidate feedback: generated rows only (a draft is the human's own
+                        definition, revised by editing its line), never on registered rows. */}
+                    {c.kind === 'generated' && !reg && (
+                      <>
+                        <div>
+                          <button
+                            type="button"
+                            className="btn"
+                            aria-expanded={refine.open}
+                            aria-controls={`wb-refine-${c.key}`}
+                            disabled={feedbackLocked}
+                            onClick={() => toggleRefine(c.key)}
+                          >
+                            Give feedback
+                          </button>
+                        </div>
+                        {refine.open && (
+                          <form
+                            id={`wb-refine-${c.key}`}
+                            className="refine-box"
+                            onSubmit={e => {
+                              e.preventDefault()
+                              void sendRefine(c)
+                            }}
+                          >
+                            <div className="field">
+                              <label htmlFor={`wb-refine-input-${c.key}`}>
+                                What should change
+                              </label>
+                              <input
+                                id={`wb-refine-input-${c.key}`}
+                                value={refine.instruction}
+                                onChange={e => {
+                                  const value = e.target.value
+                                  patchRefine(c.key, prev => ({ ...prev, instruction: value }))
+                                }}
+                                disabled={refine.busy || refineExhausted || feedbackLocked}
+                                placeholder="e.g. use a 30 day window"
+                              />
+                              <p className="hint" style={HELP_STYLE}>
+                                Your feedback runs the engine once, re-checks safety, and is
+                                recorded under your name. 3 rounds per candidate, then it is
+                                back in your hands.
+                              </p>
+                            </div>
+                            <button
+                              type="submit"
+                              className="btn btn--primary"
+                              disabled={refine.busy || refineExhausted || feedbackLocked
+                                || !refine.instruction.trim()}
+                            >
+                              {refine.busy
+                                ? 'Requesting revision…'
+                                : refineExhausted
+                                  ? 'Rounds exhausted'
+                                  : `Send feedback for one revision · round ${refine.rounds + 1} of ${FEEDBACK_ROUNDS}`}
+                            </button>
+                          </form>
+                        )}
+                        {refine.error && (
+                          <p className="error" role="alert">
+                            {refine.error}
+                          </p>
+                        )}
+                        {refine.rejection && (
+                          <p className="error" role="alert">
+                            The safety gauntlet rejected this revision:{' '}
+                            {refine.rejection.reason} ({rejectLabel(refine.rejection.code)}).
+                            The round is consumed; the candidate is unchanged.
+                          </p>
+                        )}
+                        {refine.pending && (
+                          <div className="revision">
+                            <div className="rev-meta">
+                              <span className="badge revised">
+                                Revision · round {refine.pendingRound} of {FEEDBACK_ROUNDS}
+                              </span>
+                              <span className="rev-who">
+                                {`recorded · from user:${getSession().user} · "${refine.pendingInstruction}"`}
+                              </span>
+                            </div>
+                            <div className="diff">
+                              <DiffLine
+                                label="name"
+                                before={c.idea.name}
+                                after={refine.pending.name}
+                              />
+                              <DiffLine
+                                label="description"
+                                before={c.idea.description}
+                                after={refine.pending.description}
+                              />
+                              <DiffLine
+                                label="aggregation"
+                                before={c.idea.aggregation ?? 'none'}
+                                after={refine.pending.aggregation ?? 'none'}
+                              />
+                              <DiffLine
+                                label="derives"
+                                before={fmtPairs(c.idea.derives_pairs)}
+                                after={fmtPairs(refine.pending.derives_pairs)}
+                              />
+                            </div>
+                            <p className="recheck">Re-checked after revision</p>
+                            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginTop: 10 }}>
+                              <button
+                                type="button"
+                                className="btn btn--primary"
+                                onClick={() => approveRevision(c.key)}
+                              >
+                                Approve revision
+                              </button>
+                              <button
+                                type="button"
+                                className="btn"
+                                onClick={() => revertRevision(c.key)}
+                              >
+                                Revert to original
+                              </button>
+                            </div>
+                          </div>
+                        )}
+                      </>
                     )}
                     {reg && (
                       <p
@@ -1166,6 +1609,54 @@ export function WorkbenchScreen() {
               </li>
             )}
           </ul>
+          {/* Whole-round feedback: only an engine round can regenerate under guidance, so a
+              drafts-only list offers no panel. */}
+          {hasGenerated && (
+            <form className="setfb" onSubmit={sendSetFeedback}>
+              {setFbRecords.length > 0 && (
+                <div className="setfb-records" role="status">
+                  {setFbRecords.map(r => (
+                    <p key={r.round} className="setfb-record">
+                      {`Set feedback round ${r.round} of ${FEEDBACK_ROUNDS} · recorded · from user:${r.user} · "${r.instruction}" · kept ${r.kept} selected, replaced ${r.replaced}`}
+                    </p>
+                  ))}
+                </div>
+              )}
+              <div className="field">
+                <label htmlFor="wb-setfb">Feedback on the whole round</label>
+                <div className="setfb-row">
+                  <input
+                    id="wb-setfb"
+                    value={setFbInstruction}
+                    onChange={e => setSetFbInstruction(e.target.value)}
+                    disabled={setFbBusy || setFbExhausted || feedbackLocked}
+                    placeholder="e.g. more behavioral signals, fewer balance aggregates"
+                  />
+                  <button
+                    type="submit"
+                    className="btn btn--primary"
+                    disabled={setFbBusy || setFbExhausted || feedbackLocked || generating
+                      || !setFbInstruction.trim()}
+                  >
+                    {setFbBusy
+                      ? 'Regenerating…'
+                      : `Regenerate with feedback · round ${Math.min(setFbRounds + 1, FEEDBACK_ROUNDS)} of ${FEEDBACK_ROUNDS}`}
+                  </button>
+                </div>
+              </div>
+              {setFbExhausted ? (
+                <p className="hint" role="status">
+                  Rounds exhausted. Approve, edit by hand, or restate the goal.
+                </p>
+              ) : (
+                <p className="hint">
+                  Applies to all sets: approved and selected features are kept; the rest
+                  regenerate under your guidance. Recorded under your name. 3 rounds, then it
+                  is back in your hands.
+                </p>
+              )}
+            </form>
+          )}
         </>
       )}
     </section>

@@ -10,6 +10,7 @@ vi.mock('../api', async importOriginal => {
     ...actual,
     recommendFeatures: vi.fn(),
     recommendFeatureSets: vi.fn(),
+    refineCandidate: vi.fn(),
     featureRecipe: vi.fn(),
     leakageCheck: vi.fn(),
     registerFeature: vi.fn(),
@@ -18,6 +19,7 @@ vi.mock('../api', async importOriginal => {
 })
 const recommendFeatures = vi.mocked(api.recommendFeatures)
 const recommendFeatureSets = vi.mocked(api.recommendFeatureSets)
+const refineCandidate = vi.mocked(api.refineCandidate)
 const featureRecipe = vi.mocked(api.featureRecipe)
 const registerFeature = vi.mocked(api.registerFeature)
 const featureFreshness = vi.mocked(api.featureFreshness)
@@ -25,6 +27,7 @@ const featureFreshness = vi.mocked(api.featureFreshness)
 beforeEach(() => {
   recommendFeatures.mockReset()
   recommendFeatureSets.mockReset()
+  refineCandidate.mockReset()
   featureRecipe.mockReset()
   registerFeature.mockReset()
   featureFreshness.mockReset()
@@ -62,6 +65,16 @@ const OTHER_IDEA_SPEC: api.FeatureSpecIn = {
 }
 
 const FRESH: api.FeatureFreshness = { fresh: true, stale_sources: [] }
+
+// IDEA revised under 'use a 30 day window': name, description, and aggregation change; the
+// derives pairs stay identical, so the diff must mark that field unchanged.
+const REVISED: api.FeatureIdea = {
+  name: 'avg_balance_30d', description: '30 day average balance',
+  derives_from: ['public.accounts.balance'], aggregation: 'avg_30d', grain_table: 'customers',
+  derives_pairs: [['cards', 'public.accounts.balance']],
+  verification: 'DESIGN-CHECKED', critic_note: '',
+  rationale: 'a shorter window reacts faster',
+}
 
 function idea(name: string): api.FeatureIdea {
   return {
@@ -661,12 +674,24 @@ describe('approval vocabulary', () => {
     ).toBeInTheDocument()
   })
 
-  it('offers no per-candidate action this build: every rendered control works', async () => {
-    // The per-candidate Give feedback action arrives wired in the next build; rendering it
-    // disabled would be a dead control, so it is omitted entirely.
+  it('give feedback toggles the inline box with the mockup copy', async () => {
     await renderAndGenerate([IDEA])
-    expect(await screen.findByText('avg_balance')).toBeInTheDocument()
-    expect(screen.queryByRole('button', { name: /give feedback/i })).not.toBeInTheDocument()
+    const button = await screen.findByRole('button', { name: 'Give feedback' })
+    expect(button).toHaveAttribute('aria-expanded', 'false')
+    expect(screen.queryByLabelText('What should change')).not.toBeInTheDocument()
+    await userEvent.click(button)
+    expect(button).toHaveAttribute('aria-expanded', 'true')
+    expect(screen.getByLabelText('What should change')).toBeInTheDocument()
+    expect(screen.getByText(
+      'Your feedback runs the engine once, re-checks safety, and is recorded under your name. '
+      + '3 rounds per candidate, then it is back in your hands.',
+    )).toBeInTheDocument()
+    expect(
+      screen.getByRole('button', { name: 'Send feedback for one revision · round 1 of 3' }),
+    ).toBeInTheDocument()
+    await userEvent.click(button)
+    expect(screen.queryByLabelText('What should change')).not.toBeInTheDocument()
+    expect(refineCandidate).not.toHaveBeenCalled()
   })
 })
 
@@ -995,5 +1020,433 @@ describe('verification stamp and rationale', () => {
     // The generated candidate keeps its lone stamp; the draft carries none.
     expect(screen.getAllByText('design-checked')).toHaveLength(1)
     expect(screen.getByText('Draft')).toBeInTheDocument()
+  })
+})
+
+describe('whole-round feedback', () => {
+  async function submitSetFeedback(instruction: string, round = 1) {
+    await userEvent.type(screen.getByLabelText('Feedback on the whole round'), instruction)
+    await userEvent.click(screen.getByRole('button', {
+      name: `Regenerate with feedback · round ${round} of 3`,
+    }))
+  }
+
+  it('regenerates with the feedback and the original goal, pinning the selection', async () => {
+    await renderAndGenerate([IDEA, OTHER_IDEA], {
+      source: 'deposits', entity: 'customer', target: 'public.labels.churned',
+    })
+    await selectCandidate('avg_balance')
+    // The goal input is edited after the round: feedback still reruns the ROUND's objective.
+    await userEvent.type(screen.getByLabelText('Prediction goal'), ' fast')
+    recommendFeatureSets.mockResolvedValueOnce(singleSetRound([idea('inactivity_days')]))
+    await submitSetFeedback('more behavioral signals')
+    expect(await screen.findByText('inactivity_days')).toBeInTheDocument()
+    expect(recommendFeatureSets).toHaveBeenLastCalledWith(
+      'predict churn', 'deposits', 'public.labels.churned', 'customer',
+      'more behavioral signals')
+    // The selected candidate is pinned: kept, still selected. The unselected one is replaced.
+    expect(screen.getByText('avg_balance')).toBeInTheDocument()
+    expect(screen.getByText('Kept')).toBeInTheDocument()
+    expect(screen.getByRole('checkbox', { name: 'Select avg_balance' })).toBeChecked()
+    expect(screen.getByText('1 selected')).toBeInTheDocument()
+    expect(screen.queryByText('txn_count')).not.toBeInTheDocument()
+    // The action is recorded, attributed, and countable.
+    expect(screen.getByText(
+      'Set feedback round 1 of 3 · recorded · from user:dev · "more behavioral signals" · '
+      + 'kept 1 selected, replaced 1',
+    )).toBeInTheDocument()
+    // The counter advanced and the input cleared for the next instruction.
+    expect(screen.getByRole('button', {
+      name: 'Regenerate with feedback · round 2 of 3',
+    })).toBeInTheDocument()
+    expect(screen.getByLabelText('Feedback on the whole round')).toHaveValue('')
+  })
+
+  it('keeps registered rows through a round and counts only selected pins as kept', async () => {
+    registerFeature.mockResolvedValue('feat_01')
+    featureFreshness.mockResolvedValue(FRESH)
+    await renderAndGenerate([IDEA, OTHER_IDEA])
+    await selectCandidate('avg_balance')
+    await registerSelection(1)
+    expect(await screen.findByText('feat_01')).toBeInTheDocument()
+    recommendFeatureSets.mockResolvedValueOnce(singleSetRound([idea('inactivity_days')]))
+    await submitSetFeedback('fewer balance aggregates')
+    expect(await screen.findByText('inactivity_days')).toBeInTheDocument()
+    // The registered row survives untouched (its Registered state is its mark, no Kept chip);
+    // the unselected candidate was replaced; nothing re-registers.
+    expect(screen.getByText('feat_01')).toBeInTheDocument()
+    expect(screen.getByText('avg_balance')).toBeInTheDocument()
+    expect(screen.queryByText('Kept')).not.toBeInTheDocument()
+    expect(screen.queryByText('txn_count')).not.toBeInTheDocument()
+    expect(screen.getByText(/kept 0 selected, replaced 1/)).toBeInTheDocument()
+    expect(registerFeature).toHaveBeenCalledTimes(1)
+  })
+
+  it('keeps pinned candidates visible across set views after a multi-set round', async () => {
+    await renderAndGenerateSets(multiSetRound())
+    await selectCandidate('days_since_last_txn')
+    recommendFeatureSets.mockResolvedValueOnce(multiSetRound())
+    await submitSetFeedback('sharper recency signals')
+    expect(await screen.findByText('Kept')).toBeInTheDocument()
+    // Previous round held 3 candidates; the pin stayed, 2 were replaced.
+    expect(screen.getByText(/kept 1 selected, replaced 2/)).toBeInTheDocument()
+    // The kept row shows in the temporal view and after switching to the ratio view.
+    expect(screen.getByText('days_since_last_txn')).toBeInTheDocument()
+    await userEvent.click(screen.getByRole('button', { name: /ratio set/i }))
+    expect(screen.getByText('days_since_last_txn')).toBeInTheDocument()
+    expect(screen.getByRole('checkbox', { name: 'Select days_since_last_txn' })).toBeChecked()
+  })
+
+  it('disables the channel after three rounds with the exhausted note', async () => {
+    await renderAndGenerate([IDEA])
+    await screen.findByText('avg_balance')
+    for (let round = 1; round <= 3; round++) {
+      recommendFeatureSets.mockResolvedValueOnce(singleSetRound([idea(`signal_${round}`)]))
+      await submitSetFeedback(`round ${round} note`, round)
+      expect(await screen.findByText(`signal_${round}`)).toBeInTheDocument()
+    }
+    expect(screen.getByLabelText('Feedback on the whole round')).toBeDisabled()
+    expect(screen.getByRole('button', { name: /regenerate with feedback/i })).toBeDisabled()
+    expect(screen.getByText(
+      'Rounds exhausted. Approve, edit by hand, or restate the goal.',
+    )).toBeInTheDocument()
+    // All three rounds stay on the record.
+    expect(screen.getAllByText(/Set feedback round \d of 3 · recorded/)).toHaveLength(3)
+    // 1 generate + 3 feedback rounds, nothing further.
+    expect(recommendFeatureSets).toHaveBeenCalledTimes(4)
+  })
+
+  it('sends exactly one regenerate when the form is double-submitted in flight', async () => {
+    await renderAndGenerate([IDEA])
+    await screen.findByText('avg_balance')
+    const pending = deferred<api.FeatureSetsResult>()
+    recommendFeatureSets.mockImplementationOnce(() => pending.promise)
+    await submitSetFeedback('one note')
+    expect(screen.getByRole('button', { name: 'Regenerating…' })).toBeDisabled()
+    const form = screen.getByLabelText('Feedback on the whole round').closest('form')
+    if (!form) throw new Error('feedback form not found')
+    await act(async () => {
+      fireEvent.submit(form)
+    })
+    expect(recommendFeatureSets).toHaveBeenCalledTimes(2)
+    await act(async () => {
+      pending.resolve(singleSetRound([idea('inactivity_days')]))
+    })
+    expect(await screen.findByText('inactivity_days')).toBeInTheDocument()
+    expect(recommendFeatureSets).toHaveBeenCalledTimes(2)
+  })
+
+  it('a stale feedback response never overwrites a newer generation round', async () => {
+    await renderAndGenerate([IDEA])
+    await screen.findByText('avg_balance')
+    const pending = deferred<api.FeatureSetsResult>()
+    recommendFeatureSets.mockImplementationOnce(() => pending.promise)
+    await submitSetFeedback('one note')
+    // A fresh engine round outranks the in-flight feedback round.
+    recommendFeatureSets.mockResolvedValueOnce(singleSetRound([OTHER_IDEA]))
+    await userEvent.click(screen.getByRole('button', { name: /generate candidate sets/i }))
+    expect(await screen.findByText('txn_count')).toBeInTheDocument()
+    await act(async () => {
+      pending.resolve(singleSetRound([idea('stale_signal')]))
+    })
+    expect(screen.queryByText('stale_signal')).not.toBeInTheDocument()
+    expect(screen.getByText('txn_count')).toBeInTheDocument()
+    // The fresh round starts a fresh allowance with no record of the discarded round.
+    expect(screen.getByRole('button', {
+      name: 'Regenerate with feedback · round 1 of 3',
+    })).toBeInTheDocument()
+    expect(screen.queryByText(/Set feedback round/)).not.toBeInTheDocument()
+  })
+
+  it('discards a feedback round that resolves after a scope edit', async () => {
+    await renderAndGenerate([IDEA])
+    await screen.findByText('avg_balance')
+    const pending = deferred<api.FeatureSetsResult>()
+    recommendFeatureSets.mockImplementationOnce(() => pending.promise)
+    await submitSetFeedback('one note')
+    await userEvent.type(screen.getByLabelText('Entity'), 'c')
+    await act(async () => {
+      pending.resolve(singleSetRound([idea('stale_signal')]))
+    })
+    // The response was for the previous scope: nothing applies, nothing is recorded.
+    expect(screen.queryByText('stale_signal')).not.toBeInTheDocument()
+    expect(screen.queryByText(/Set feedback round/)).not.toBeInTheDocument()
+    expect(screen.getByRole('status')).toHaveTextContent(/scope changed/i)
+  })
+
+  it('a scope edit resets the round counter with everything else', async () => {
+    await renderAndGenerate([IDEA])
+    await screen.findByText('avg_balance')
+    recommendFeatureSets.mockResolvedValueOnce(singleSetRound([idea('signal_1')]))
+    await submitSetFeedback('one note')
+    expect(await screen.findByText('signal_1')).toBeInTheDocument()
+    expect(screen.getByRole('button', {
+      name: 'Regenerate with feedback · round 2 of 3',
+    })).toBeInTheDocument()
+    await userEvent.type(screen.getByLabelText('Entity'), 'c')
+    expect(screen.queryByLabelText('Feedback on the whole round')).not.toBeInTheDocument()
+    await userEvent.click(screen.getByRole('button', { name: /generate candidate sets/i }))
+    expect(await screen.findByText('avg_balance')).toBeInTheDocument()
+    expect(screen.getByRole('button', {
+      name: 'Regenerate with feedback · round 1 of 3',
+    })).toBeInTheDocument()
+    expect(screen.queryByText(/Set feedback round \d of 3 · recorded/)).not.toBeInTheDocument()
+  })
+
+  it('surfaces the missing-provider notice and consumes no round on failure', async () => {
+    await renderAndGenerate([IDEA])
+    await screen.findByText('avg_balance')
+    recommendFeatureSets.mockRejectedValueOnce(new api.ApiError(503, 'not configured'))
+    await submitSetFeedback('one note')
+    const alert = await screen.findByRole('alert')
+    expect(alert).toHaveTextContent(/ai assist is not configured/i)
+    // The round never ran: candidates stay, the counter holds, nothing is recorded.
+    expect(screen.getByText('avg_balance')).toBeInTheDocument()
+    expect(screen.getByRole('button', {
+      name: 'Regenerate with feedback · round 1 of 3',
+    })).toBeInTheDocument()
+    expect(screen.queryByText(/Set feedback round/)).not.toBeInTheDocument()
+  })
+
+  it('offers no whole-round feedback on a drafts-only list', async () => {
+    await renderAndDraft()
+    expect(screen.queryByLabelText('Feedback on the whole round')).not.toBeInTheDocument()
+  })
+
+  it('locks both feedback channels while the tray is confirming approval', async () => {
+    await renderAndGenerate([IDEA, OTHER_IDEA])
+    await selectCandidate('avg_balance')
+    await userEvent.type(screen.getByLabelText('Feedback on the whole round'), 'one note')
+    await userEvent.click(screen.getByRole('button', { name: 'Approve and register 1 feature' }))
+    expect(screen.getByRole('button', { name: /regenerate with feedback/i })).toBeDisabled()
+    for (const button of screen.getAllByRole('button', { name: 'Give feedback' })) {
+      expect(button).toBeDisabled()
+    }
+    await userEvent.click(screen.getByRole('button', { name: 'Cancel' }))
+    expect(screen.getByRole('button', { name: /regenerate with feedback/i })).toBeEnabled()
+    for (const button of screen.getAllByRole('button', { name: 'Give feedback' })) {
+      expect(button).toBeEnabled()
+    }
+    expect(recommendFeatureSets).toHaveBeenCalledTimes(1)
+    expect(registerFeature).not.toHaveBeenCalled()
+  })
+})
+
+describe('per-candidate feedback', () => {
+  async function openRefineAndSend(instruction: string, round = 1) {
+    await userEvent.click(screen.getByRole('button', { name: 'Give feedback' }))
+    await userEvent.type(screen.getByLabelText('What should change'), instruction)
+    await userEvent.click(screen.getByRole('button', {
+      name: `Send feedback for one revision · round ${round} of 3`,
+    }))
+  }
+
+  it('sends one revision request carrying the candidate, instruction, and scope', async () => {
+    refineCandidate.mockResolvedValue({ revised: REVISED })
+    await renderAndGenerate([IDEA], { source: 'deposits' })
+    await screen.findByText('avg_balance')
+    await openRefineAndSend('use a 30 day window')
+    expect(await screen.findByText('Re-checked after revision')).toBeInTheDocument()
+    expect(refineCandidate).toHaveBeenCalledWith(
+      {
+        name: 'avg_balance', description: 'average balance per customer',
+        derives_from: ['public.accounts.balance'], aggregation: 'avg',
+        grain_table: 'customers',
+      },
+      'use a 30 day window', 'deposits', null, null)
+    expect(refineCandidate).toHaveBeenCalledTimes(1)
+    // The revision is recorded and attributed.
+    expect(
+      screen.getByText('recorded · from user:dev · "use a 30 day window"'),
+    ).toBeInTheDocument()
+    // Field-level diff: changed fields old struck through, new inserted.
+    expect(screen.getByText('avg_balance', { selector: 'del' })).toBeInTheDocument()
+    expect(screen.getByText('avg_balance_30d', { selector: 'ins' })).toBeInTheDocument()
+    expect(screen.getByText('avg', { selector: 'del' })).toBeInTheDocument()
+    expect(screen.getByText('avg_30d', { selector: 'ins' })).toBeInTheDocument()
+    // The derives pairs are identical: marked unchanged, never silently omitted.
+    expect(screen.getAllByText('unchanged')).toHaveLength(1)
+    // A suggestion is never a registration, and the candidate itself is untouched so far.
+    expect(registerFeature).not.toHaveBeenCalled()
+    expect(screen.getByRole('checkbox', { name: 'Select avg_balance' })).toBeInTheDocument()
+  })
+
+  it('approve revision replaces the candidate, keeps selection, and registers the revised spec', async () => {
+    refineCandidate.mockResolvedValue({ revised: REVISED })
+    registerFeature.mockResolvedValue('feat_31')
+    featureFreshness.mockResolvedValue(FRESH)
+    await renderAndGenerate([IDEA])
+    await selectCandidate('avg_balance')
+    await openRefineAndSend('use a 30 day window')
+    await userEvent.click(await screen.findByRole('button', { name: 'Approve revision' }))
+    // The row now carries the revised data plus the chip; the selection survived.
+    expect(screen.getByText('avg_balance_30d')).toBeInTheDocument()
+    expect(screen.getByText('Revised · R1')).toBeInTheDocument()
+    expect(screen.getByText('1 selected')).toBeInTheDocument()
+    expect(screen.getByRole('checkbox', { name: 'Select avg_balance_30d' })).toBeChecked()
+    // Registration still takes the explicit confirm, and uses the REVISED spec with lineage
+    // from the revised backend pairs.
+    expect(registerFeature).not.toHaveBeenCalled()
+    await registerSelection(1)
+    expect(registerFeature).toHaveBeenCalledWith({
+      name: 'avg_balance_30d', description: '30 day average balance',
+      grain_table: 'customers', aggregation: 'avg_30d', as_of_column: null,
+      derives_from: [{ catalog_source: 'cards', object_ref: 'public.accounts.balance' }],
+    })
+    expect(registerFeature).toHaveBeenCalledTimes(1)
+    expect(await screen.findByText('feat_31')).toBeInTheDocument()
+  })
+
+  it('revert to original discards the revision but the round stays consumed', async () => {
+    refineCandidate.mockResolvedValue({ revised: REVISED })
+    await renderAndGenerate([IDEA])
+    await screen.findByText('avg_balance')
+    await openRefineAndSend('use a 30 day window')
+    await userEvent.click(await screen.findByRole('button', { name: 'Revert to original' }))
+    expect(screen.queryByText('avg_balance_30d')).not.toBeInTheDocument()
+    expect(screen.getByText('avg_balance')).toBeInTheDocument()
+    expect(screen.queryByText('Revised · R1')).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Approve revision' })).not.toBeInTheDocument()
+    // The engine ran: the round is consumed either way.
+    expect(screen.getByRole('button', {
+      name: 'Send feedback for one revision · round 2 of 3',
+    })).toBeInTheDocument()
+  })
+
+  it('renders a gauntlet rejection as a danger line, consuming the round, changing nothing', async () => {
+    refineCandidate.mockResolvedValue({
+      rejected: { reason: 'leaks target', code: 'LEAKAGE' },
+    })
+    await renderAndGenerate([IDEA])
+    await screen.findByText('avg_balance')
+    await openRefineAndSend('use the churn label')
+    expect(await screen.findByText(
+      /rejected this revision: leaks target \(leakage\)\. The round is consumed/,
+    )).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Approve revision' })).not.toBeInTheDocument()
+    expect(screen.getByText('avg_balance')).toBeInTheDocument()
+    expect(screen.getByRole('button', {
+      name: 'Send feedback for one revision · round 2 of 3',
+    })).toBeInTheDocument()
+  })
+
+  it('disables per-candidate feedback after three rounds', async () => {
+    refineCandidate.mockResolvedValue({
+      rejected: { reason: 'leaks target', code: 'LEAKAGE' },
+    })
+    await renderAndGenerate([IDEA])
+    await screen.findByText('avg_balance')
+    await userEvent.click(screen.getByRole('button', { name: 'Give feedback' }))
+    for (let round = 1; round <= 3; round++) {
+      const input = screen.getByLabelText('What should change')
+      await userEvent.clear(input)
+      await userEvent.type(input, `round ${round} note`)
+      await userEvent.click(screen.getByRole('button', {
+        name: `Send feedback for one revision · round ${round} of 3`,
+      }))
+      expect(await screen.findByText(/rejected this revision/)).toBeInTheDocument()
+    }
+    expect(screen.getByRole('button', { name: 'Rounds exhausted' })).toBeDisabled()
+    expect(screen.getByLabelText('What should change')).toBeDisabled()
+    expect(refineCandidate).toHaveBeenCalledTimes(3)
+  })
+
+  it('sends exactly one refine when the box is double-submitted in flight', async () => {
+    const pending = deferred<api.RefineResult>()
+    refineCandidate.mockImplementationOnce(() => pending.promise)
+    await renderAndGenerate([IDEA])
+    await screen.findByText('avg_balance')
+    await openRefineAndSend('use a 30 day window')
+    expect(screen.getByRole('button', { name: 'Requesting revision…' })).toBeDisabled()
+    const form = screen.getByLabelText('What should change').closest('form')
+    if (!form) throw new Error('refine form not found')
+    await act(async () => {
+      fireEvent.submit(form)
+    })
+    expect(refineCandidate).toHaveBeenCalledTimes(1)
+    await act(async () => {
+      pending.resolve({ revised: REVISED })
+    })
+    expect(await screen.findByText('Re-checked after revision')).toBeInTheDocument()
+    expect(refineCandidate).toHaveBeenCalledTimes(1)
+  })
+
+  it('registered rows take no feedback', async () => {
+    registerFeature.mockResolvedValue('feat_01')
+    featureFreshness.mockResolvedValue(FRESH)
+    await renderAndGenerate([IDEA, OTHER_IDEA])
+    await selectCandidate('avg_balance')
+    await registerSelection(1)
+    await screen.findByText('feat_01')
+    // Only the unregistered row still offers the action.
+    expect(screen.getAllByRole('button', { name: 'Give feedback' })).toHaveLength(1)
+    const registeredRow = screen.getByText('feat_01').closest('li')
+    if (!registeredRow) throw new Error('registered row not found')
+    expect(
+      within(registeredRow).queryByRole('button', { name: 'Give feedback' }),
+    ).not.toBeInTheDocument()
+  })
+
+  it('drafts offer no engine feedback: a draft is revised by editing its line', async () => {
+    await renderAndDraft()
+    expect(screen.queryByRole('button', { name: 'Give feedback' })).not.toBeInTheDocument()
+  })
+
+  it('drops a revision that arrives after its candidate registered', async () => {
+    const pending = deferred<api.RefineResult>()
+    refineCandidate.mockImplementationOnce(() => pending.promise)
+    registerFeature.mockResolvedValue('feat_40')
+    featureFreshness.mockResolvedValue(FRESH)
+    await renderAndGenerate([IDEA])
+    await screen.findByText('avg_balance')
+    await openRefineAndSend('use a 30 day window')
+    // The human registers the row while the engine is still revising it.
+    await selectCandidate('avg_balance')
+    await registerSelection(1)
+    expect(await screen.findByText('feat_40')).toBeInTheDocument()
+    await act(async () => {
+      pending.resolve({ revised: REVISED })
+    })
+    // The registered row is immutable: no revision block, no approve, the original data.
+    expect(screen.queryByRole('button', { name: 'Approve revision' })).not.toBeInTheDocument()
+    expect(screen.queryByText('avg_balance_30d')).not.toBeInTheDocument()
+    expect(screen.getByText('avg_balance')).toBeInTheDocument()
+    expect(registerFeature).toHaveBeenCalledTimes(1)
+    expect(registerFeature).toHaveBeenCalledWith(IDEA_SPEC)
+  })
+
+  it('surfaces the missing-provider notice on refine and consumes no round', async () => {
+    refineCandidate.mockRejectedValue(new api.ApiError(503, 'not configured'))
+    await renderAndGenerate([IDEA])
+    await screen.findByText('avg_balance')
+    await openRefineAndSend('use a 30 day window')
+    const alert = await screen.findByRole('alert')
+    expect(alert).toHaveTextContent(/ai assist is not configured/i)
+    expect(screen.getByRole('button', {
+      name: 'Send feedback for one revision · round 1 of 3',
+    })).toBeInTheDocument()
+  })
+
+  it('a kept candidate keeps its consumed refine rounds through a whole-round regeneration', async () => {
+    refineCandidate.mockResolvedValue({
+      rejected: { reason: 'leaks target', code: 'LEAKAGE' },
+    })
+    await renderAndGenerate([IDEA])
+    await screen.findByText('avg_balance')
+    await selectCandidate('avg_balance')
+    await openRefineAndSend('use the churn label')
+    expect(await screen.findByText(/rejected this revision/)).toBeInTheDocument()
+    recommendFeatureSets.mockResolvedValueOnce(singleSetRound([idea('inactivity_days')]))
+    await userEvent.type(
+      screen.getByLabelText('Feedback on the whole round'), 'more behavioral signals')
+    await userEvent.click(screen.getByRole('button', {
+      name: 'Regenerate with feedback · round 1 of 3',
+    }))
+    expect(await screen.findByText('inactivity_days')).toBeInTheDocument()
+    // The pinned row kept its refine counter: the next revision is round 2, not a reset.
+    expect(screen.getByText('Kept')).toBeInTheDocument()
+    expect(screen.getByRole('button', {
+      name: 'Send feedback for one revision · round 2 of 3',
+    })).toBeInTheDocument()
   })
 })

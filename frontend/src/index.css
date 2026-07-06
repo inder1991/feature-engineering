@@ -1462,3 +1462,123 @@ section > h2:first-child {
     border-top: 0;
   }
 }
+
+/* ---------------------------------------------------------------- workbench feedback (appended)
+   Phase 3: the whole-round feedback panel (regenerate under guidance, pins kept) and the
+   per-candidate refine box with its recorded revision diff. Existing tokens only; composes the
+   .badge / .btn / .field vocabulary. Nothing above this line is modified. */
+
+/* whole-round feedback panel: its own surface under the candidate list */
+.setfb {
+  margin-top: 14px;
+  border: 1px solid var(--line);
+  background: var(--surface);
+  border-radius: var(--radius-panel);
+  box-shadow: var(--shadow);
+  padding: 14px 16px;
+}
+
+.setfb-row {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.setfb-row input {
+  flex: 1 1 260px;
+}
+
+/* recorded strips: quiet log lines, one per consumed round */
+.setfb-records {
+  display: grid;
+  gap: 4px;
+  margin-bottom: 10px;
+}
+
+.setfb-record {
+  font-size: 12.5px;
+  color: var(--ink-soft);
+}
+
+/* per-candidate refine box: accent wash marks the human-input zone inside the row */
+.refine-box {
+  display: grid;
+  gap: 10px;
+  justify-items: start;
+  border: 1px solid var(--line);
+  background: var(--accent-soft);
+  border-radius: var(--radius);
+  padding: 12px 14px;
+}
+
+.refine-box input {
+  background: var(--surface);
+}
+
+/* the recorded revision: inset surface holding the diff and the approve/revert decision */
+.revision {
+  border: 1px solid var(--line);
+  background: var(--surface-2);
+  border-radius: var(--radius);
+  padding: 12px 14px;
+}
+
+.rev-meta {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
+}
+
+.rev-who {
+  font-size: 12px;
+  color: var(--ink-faint);
+}
+
+/* revised/revision chip: proposal-soft (the engine proposed it; the human decides) */
+.badge.revised {
+  background: var(--proposal-soft);
+  border-color: transparent;
+  color: var(--proposal);
+}
+
+/* field-level diff: del struck through (non-color cue), ins after the arrow; both on the
+   contrast-vetted soft washes already used by the rejected/ok badges */
+.diff {
+  display: grid;
+  gap: 4px;
+  font-size: 13px;
+}
+
+.diff-label {
+  color: var(--ink-faint);
+}
+
+.diff del {
+  color: var(--danger);
+  background: var(--danger-soft);
+  text-decoration: line-through;
+  border-radius: 3px;
+  padding: 0 3px;
+}
+
+.diff ins {
+  color: var(--ok);
+  background: var(--ok-soft);
+  text-decoration: none;
+  border-radius: 3px;
+  padding: 0 3px;
+}
+
+.diff-unchanged {
+  color: var(--ink-faint);
+}
+
+.recheck {
+  margin-top: 8px;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--ok);
+}
