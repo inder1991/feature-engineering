@@ -1,19 +1,37 @@
-// One guided feature-generation flow: a goal + scope hero with two peer paths (Generate
-// candidates through the engine, or Write definitions myself through the batch composer), one
-// shared candidate list, and a selection tray with an explicit confirm before anything registers.
+// One guided feature-generation flow: a gates strip naming who holds each step of the loop, a
+// goal + scope hero with two peer paths (Generate candidate sets through the engine, or Write
+// definitions myself through the batch composer), set summary cards to compare strategy lenses,
+// one shared candidate list, and a selection tray with an explicit approval confirm before
+// anything registers.
 //
 // Invariants carried over from the hardening campaign:
 // - Lineage comes ONLY from backend-resolved pairs (FeatureIdea.derives_pairs for generated
 //   candidates, the drafted-against source snapshot for drafts), never from typed context.
-// - registerFeature fires only after the explicit Confirm registration step, exactly once per
+// - registerFeature fires only after the explicit Confirm approval step, exactly once per
 //   candidate (batch in-flight ref + per-candidate registered state).
 // - Every fetch handler carries an out-of-order guard (monotonic sequence refs).
 // - Scope edits invalidate candidates: source edits clear everything (draft snapshots no longer
-//   match the context), entity/target edits clear generated candidates only.
+//   match the context), entity/target edits clear generated candidates, sets, and rejections.
+//
+// Multi-set model decisions (documented for the record):
+// - Generation always calls /features/recommend-sets. There is NO silent fallback to
+//   /features/recommend on a 503: that status means no LLM provider is configured on the
+//   deployment, so the plain endpoint would return the same 503; the honest notice renders
+//   instead (never fake capability).
+// - A response with one non-empty set renders the flat list exactly as before, no cards row.
+// - Sets that came back empty are dropped from the compare row (nothing to take or compare);
+//   their gauntlet rejections still show in the rejections panel.
+// - Candidate identity within a round is the feature name: the same name in several sets is the
+//   same feature on purpose (strong signals earn their place in several theses), so it renders
+//   with an "In N sets" chip, selects globally, and registers once. Keys stay per-fetch
+//   (g{seq}:{name}) so a later round reusing a name never resurrects registered state.
+// - Set theses are client-side copy keyed by the router's fixed lens vocabulary (the wire
+//   carries no set description); an unknown lens simply renders without a thesis line.
 import { type FormEvent, type ReactNode, useRef, useState } from 'react'
 import {
   ApiError, type FeatureFreshness, type FeatureIdea, type FeatureSpecIn, type JoinStep,
-  type Recipe, featureFreshness, featureRecipe, recommendFeatures, registerFeature,
+  type Recipe, type Rejection, type SetRecommendation, featureFreshness, featureRecipe,
+  recommendFeatureSets, registerFeature,
 } from '../api'
 
 const HELP_STYLE = { fontSize: 12 } as const
@@ -35,6 +53,29 @@ const DESCRIBE_PLACEHOLDER =
   'One feature per line, e.g.\ntotal spend per customer over the last 90 days\ndays since last transaction'
 
 const WARN_GLYPH = 'M8 2.5 1.5 13.25h13L8 2.5ZM8 6.75v3M8 12v.01'
+
+// Plain-English thesis per router lens. Client-side copy: the wire carries lens + features only,
+// and the lens vocabulary is fixed by the backend's deterministic router.
+const LENS_THESES: Record<string, string> = {
+  unary: 'Single-column transforms; flags, buckets, and scaled values of one column.',
+  ratio: 'Ratios between numeric columns; how quantities relate, not how large they are.',
+  aggregation: 'Aggregations over related rows via a join key; totals, counts, and averages.',
+  temporal: 'Point-in-time and recency signals; how behavior moves over time.',
+  distributional: 'Position within the peer group; how this entity compares to its cohort.',
+}
+
+// Human labels for gauntlet rejection codes. STALE reads "stale source"; every other code
+// lowercases with spaces so even an unknown code from a newer backend reads as words.
+const REJECT_LABELS: Record<string, string> = { STALE: 'stale source' }
+
+function rejectLabel(code: string): string {
+  return REJECT_LABELS[code] ?? code.toLowerCase().replace(/_/g, ' ')
+}
+
+// Display form of a router lens token: "temporal" -> "Temporal".
+function lensLabel(lens: string): string {
+  return lens.charAt(0).toUpperCase() + lens.slice(1)
+}
 
 function CalloutGlyph({ d }: { d: string }) {
   return (
@@ -103,6 +144,85 @@ function CheckGlyph() {
   )
 }
 
+// ---------------------------------------------------------------- gates strip
+
+type GateState = 'done' | 'active' | 'todo'
+
+// Text form of each gate state for assistive tech: the visual encoding (check glyph, wash,
+// dimming) never works alone.
+const GATE_STATE_WORDS: Record<GateState, string> = {
+  done: 'done', active: 'current step', todo: 'upcoming',
+}
+
+function Gate({ state, who, title, sub }: {
+  state: GateState
+  who: 'You' | 'Engine'
+  title: string
+  sub: string
+}) {
+  return (
+    <div
+      className="gate"
+      role="listitem"
+      data-state={state}
+      aria-current={state === 'active' ? 'step' : undefined}
+    >
+      <span className={who === 'You' ? 'gate-who you' : 'gate-who engine'}>{who}</span>
+      <div className="gate-title">
+        {title}
+        {state === 'done' && <span className="gate-check" aria-hidden="true">✓</span>}
+      </div>
+      <div className="gate-sub">{sub}</div>
+      <span className="visually-hidden">{GATE_STATE_WORDS[state]}</span>
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------- rejections panel
+
+function RejectionsPanel({ rejections, open, onToggle }: {
+  rejections: Rejection[]
+  open: boolean
+  onToggle: () => void
+}) {
+  const counts = new Map<string, number>()
+  for (const r of rejections) {
+    const label = rejectLabel(r.code)
+    counts.set(label, (counts.get(label) ?? 0) + 1)
+  }
+  // Largest tally first; ties keep first-seen order (stable sort).
+  const tallyLine = [...counts.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .map(([label, n]) => `${label} ${n}`)
+    .join(' · ')
+  const n = rejections.length
+  return (
+    <div className="rej-panel">
+      <div className="rej-line">
+        <span className="badge rej-count tabular-nums">{n} rejected</span>
+        <span>
+          The safety gauntlet rejected {n} {n === 1 ? 'candidate' : 'candidates'} across all
+          lenses: {tallyLine}.
+        </span>
+        <button type="button" className="rej-toggle" aria-expanded={open} onClick={onToggle}>
+          {open ? 'Hide' : 'Show'}
+        </button>
+      </div>
+      {open && (
+        <ul className="rej-list">
+          {rejections.map((r, i) => (
+            <li key={`${i}:${r.name}`}>
+              <code>{r.name}</code>
+              <span className="badge rejected">{rejectLabel(r.code)}</span>
+              <span className="rej-why">{r.reason}</span>
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  )
+}
+
 // Uploaded cardinality is unvalidated free text. Only a normalized N:1 or 1:1 hop is known-safe;
 // anything else ('1:N', '1:n', 'one_to_many', ...) can multiply rows, and a missing value means
 // fan-out cannot be ruled out.
@@ -127,13 +247,17 @@ function slugFrom(text: string): string {
     .slice(0, 63)
 }
 
-// Candidates carry per-fetch keys (sequence + index + name): LLM-chosen names are not unique
-// across rounds, so keying registered state by name alone would show phantom "Registered" on a
-// fresh, never-registered candidate that reuses an old name.
+// Candidate identity within a round is the feature name (the same name in several sets is the
+// same feature); keys carry the fetch sequence (g{seq}:{name}) because LLM-chosen names are not
+// unique across rounds, so keying registered state by name alone would show phantom "Registered"
+// on a fresh, never-registered candidate that reuses an old name.
 interface GeneratedCandidate {
   kind: 'generated'
   key: string
   idea: FeatureIdea
+  // Every lens whose set holds this feature, in set order. Length > 1 renders the
+  // "In N sets" chip.
+  lenses: string[]
 }
 
 // A described feature drafted through /features/recipe. Recipes are single-catalog by API
@@ -232,8 +356,18 @@ export function WorkbenchScreen() {
   const [entity, setEntity] = useState('')
   const [target, setTarget] = useState('')
   const [generated, setGenerated] = useState<GeneratedCandidate[] | null>(null)
+  // Ordered lenses of the last round's non-empty sets. Two or more render the compare cards;
+  // one (or zero) renders the flat single list exactly as before the sets model.
+  const [setLenses, setSetLenses] = useState<string[]>([])
+  const [recommendation, setRecommendation] = useState<SetRecommendation | null>(null)
+  const [rejections, setRejections] = useState<Rejection[]>([])
+  const [rejectionsOpen, setRejectionsOpen] = useState(false)
+  // Which set's features the one detail list shows (multi-set rounds only).
+  const [activeLens, setActiveLens] = useState<string | null>(null)
   const [drafts, setDrafts] = useState<DraftCandidate[]>([])
-  const [selected, setSelected] = useState<Set<string>>(new Set())
+  // GLOBAL selection across set views: candidate key -> the lens it was picked from (null for
+  // drafts and flat-list picks). Keys carry the fetch sequence, so cleared rounds stay inert.
+  const [selected, setSelected] = useState<Record<string, string | null>>({})
   const [registered, setRegistered] = useState<Record<string, Registration>>({})
   const [errors, setErrors] = useState<Record<string, string>>({})
   const [screenedTarget, setScreenedTarget] = useState<string | null>(null)
@@ -255,18 +389,46 @@ export function WorkbenchScreen() {
   // so each line's recipe fires exactly once even before the disabled attribute lands.
   const draftInFlight = useRef(false)
   // Reentry guard for the register batch: state updates are async, so a double click on
-  // Confirm registration could otherwise start two batches before the disabled attribute lands.
+  // Confirm approval could otherwise start two batches before the disabled attribute lands.
   const batchInFlight = useRef(false)
 
-  const candidates: Candidate[] = [...(generated ?? []), ...drafts]
+  const multiSet = setLenses.length > 1
+  // Every live candidate, across ALL sets plus drafts: selection and registration always work
+  // over this, so picks survive set switching and a batch registers whatever is selected even
+  // when another set's view is showing.
+  const allCandidates: Candidate[] = [...(generated ?? []), ...drafts]
+  // What the one detail list shows: the active set's features (multi-set rounds) or every
+  // generated candidate (flat rounds), plus drafts in both cases.
+  const visibleGenerated = multiSet && activeLens !== null
+    ? (generated ?? []).filter(c => c.lenses.includes(activeLens))
+    : generated ?? []
+  const listCandidates: Candidate[] = [...visibleGenerated, ...drafts]
   // One definition per non-empty line: the button label and its gating read this directly.
   const draftLines = describeText.split('\n').map(line => line.trim()).filter(Boolean)
-  // Only generated candidates pass the design gauntlet, so the design-checked stamp and its one
-  // help line appear only when the list holds at least one generated candidate.
+  // Only generated candidates pass the design gauntlet, so the design-checked explanation
+  // appears only when the list holds at least one generated candidate.
   const hasGenerated = (generated?.length ?? 0) > 0
-  // Selection is the intersection of the set and the live candidate list: keys from cleared
+  // Selection is the intersection of the map and the live candidate list: keys from cleared
   // rounds are inert, and registered candidates can never re-enter a batch.
-  const selectedCandidates = candidates.filter(c => selected.has(c.key) && !registered[c.key])
+  const selectedCandidates = allCandidates.filter(c => c.key in selected && !registered[c.key])
+  const selectedCount = selectedCandidates.length
+  // Distinct set origins of the current picks, for the tray's mix note.
+  const originLenses = [...new Set(
+    selectedCandidates
+      .map(c => selected[c.key])
+      .filter((lens): lens is string => typeof lens === 'string'),
+  )]
+
+  // Gates advance with real state, never decoratively.
+  const goalDone = goal.trim() !== ''
+  const haveCandidates = allCandidates.length > 0
+  const anyRegistered = allCandidates.some(c => registered[c.key] !== undefined)
+  const gate1: GateState = goalDone ? 'done' : 'active'
+  const gate2: GateState = haveCandidates ? 'done' : goalDone ? 'active' : 'todo'
+  const gate3: GateState = !haveCandidates
+    ? 'todo'
+    : selectedCount > 0 || anyRegistered ? 'done' : 'active'
+  const gate4: GateState = selectedCount > 0 ? 'active' : anyRegistered ? 'done' : 'todo'
 
   function fail(err: unknown) {
     setNotice(
@@ -278,30 +440,41 @@ export function WorkbenchScreen() {
     )
   }
 
+  function clearSets() {
+    setSetLenses([])
+    setRecommendation(null)
+    setActiveLens(null)
+    setRejections([])
+    setRejectionsOpen(false)
+  }
+
   function changeSource(value: string) {
     setSource(value)
     // Generated candidates were produced for the previous source context, and draft snapshots
     // no longer match it either: a source edit clears everything.
-    const hadCandidates = candidates.length > 0
+    const hadCandidates = allCandidates.length > 0
     setGenerated(null)
     setDrafts([])
-    setSelected(new Set())
+    setSelected({})
     setRegistered({})
     setErrors({})
     setDraftErrors([])
     setScreenedTarget(null)
     setConfirmingBatch(false)
+    clearSets()
     if (hadCandidates) setScopeChanged(true)
   }
 
-  // Entity and target edits invalidate generated candidates (they were gathered and screened
-  // for the previous scope). Drafts survive: their snapshot source is unchanged.
+  // Entity and target edits invalidate generated candidates and their round's sets and
+  // rejections (they were gathered and screened for the previous scope). Drafts survive: their
+  // snapshot source is unchanged.
   function invalidateGenerated() {
     const hadGenerated = (generated?.length ?? 0) > 0
     setGenerated(null)
-    setSelected(new Set())
+    setSelected({})
     setScreenedTarget(null)
     setConfirmingBatch(false)
+    clearSets()
     if (hadGenerated) setScopeChanged(true)
   }
 
@@ -324,18 +497,48 @@ export function WorkbenchScreen() {
     setScopeChanged(false)
     setGenerating(true)
     try {
-      const ideas = await recommendFeatures(
+      // Always the sets endpoint; no fallback to /features/recommend on 503 (both share the
+      // one provider, so the plain endpoint would fail identically — show the honest notice).
+      const round = await recommendFeatureSets(
         objective, source.trim() || null, target.trim() || null, entity.trim() || null)
       if (seq !== generateSeq.current) return
-      setGenerated(ideas.map((idea, i) => ({
-        kind: 'generated' as const, key: `g${seq}:${i}:${idea.name}`, idea,
-      })))
+      // Dedupe by name across sets: the same feature in several lenses is one candidate that
+      // knows every set it belongs to. Empty sets are dropped (nothing to compare or take).
+      const byName = new Map<string, GeneratedCandidate>()
+      const lenses: string[] = []
+      for (const set of round.sets) {
+        if (set.features.length === 0) continue
+        lenses.push(set.lens)
+        for (const idea of set.features) {
+          const existing = byName.get(idea.name)
+          if (existing) {
+            if (!existing.lenses.includes(set.lens)) existing.lenses.push(set.lens)
+          } else {
+            byName.set(idea.name, {
+              kind: 'generated', key: `g${seq}:${idea.name}`, idea, lenses: [set.lens],
+            })
+          }
+        }
+      }
+      setGenerated([...byName.values()])
+      setSetLenses(lenses)
+      setRecommendation(round.recommendation)
+      // The detail list opens on the advisory pick when there is one among the surviving sets.
+      setActiveLens(
+        lenses.length > 1
+          ? round.recommendation !== null && lenses.includes(round.recommendation.recommended_lens)
+            ? round.recommendation.recommended_lens
+            : lenses[0]
+          : null)
+      setRejections(round.rejections)
+      setRejectionsOpen(false)
       setScreenedTarget(target.trim() || null)
       setConfirmingBatch(false)
     } catch (err) {
       if (seq !== generateSeq.current) return
       setGenerated(null)
       setScreenedTarget(null)
+      clearSets()
       fail(err)
     } finally {
       if (seq === generateSeq.current) setGenerating(false)
@@ -394,29 +597,45 @@ export function WorkbenchScreen() {
     }
   }
 
-  function renameDraft(key: string, value: string) {
-    setDrafts(prev => prev.map(d => (d.key === key ? { ...d, name: value } : d)))
-    if (!value.trim()) {
-      // A draft without a name cannot be registered: drop it from the selection too.
-      setSelected(prev => {
-        if (!prev.has(key)) return prev
-        const next = new Set(prev)
-        next.delete(key)
-        return next
-      })
-    }
+  function deselect(key: string) {
+    setSelected(prev => {
+      if (!(key in prev)) return prev
+      const next = { ...prev }
+      delete next[key]
+      return next
+    })
   }
 
-  function toggleSelect(key: string) {
+  function renameDraft(key: string, value: string) {
+    setDrafts(prev => prev.map(d => (d.key === key ? { ...d, name: value } : d)))
+    // A draft without a name cannot be registered: drop it from the selection too.
+    if (!value.trim()) deselect(key)
+  }
+
+  function toggleSelect(key: string, origin: string | null) {
     // Changing the selection backs out of the confirm step: the confirm copy must always
     // describe exactly what will be registered.
     setConfirmingBatch(false)
     setSelected(prev => {
-      const next = new Set(prev)
-      if (next.has(key)) {
-        next.delete(key)
+      const next = { ...prev }
+      if (key in next) {
+        delete next[key]
       } else {
-        next.add(key)
+        next[key] = origin
+      }
+      return next
+    })
+  }
+
+  // Take this set: select every unregistered feature of the lens, stamping it as picked from
+  // that set. Picks made from other sets keep their own origins (a la carte mixing).
+  function takeSet(lens: string) {
+    setConfirmingBatch(false)
+    setActiveLens(lens)
+    setSelected(prev => {
+      const next = { ...prev }
+      for (const c of generated ?? []) {
+        if (c.lenses.includes(lens) && !registered[c.key]) next[c.key] = lens
       }
       return next
     })
@@ -424,8 +643,8 @@ export function WorkbenchScreen() {
 
   async function confirmRegistration() {
     if (batchInFlight.current) return
-    const batch = candidates.filter(c =>
-      selected.has(c.key) && !registered[c.key] && (c.kind === 'generated' || c.name.trim() !== ''))
+    const batch = allCandidates.filter(c =>
+      c.key in selected && !registered[c.key] && (c.kind === 'generated' || c.name.trim() !== ''))
     if (batch.length === 0) return
     batchInFlight.current = true
     setBatchBusy(true)
@@ -444,11 +663,7 @@ export function WorkbenchScreen() {
             // registration UI.
           }
           setRegistered(prev => ({ ...prev, [candidate.key]: { id, freshness } }))
-          setSelected(prev => {
-            const next = new Set(prev)
-            next.delete(candidate.key)
-            return next
-          })
+          deselect(candidate.key)
           setErrors(prev => {
             if (!(candidate.key in prev)) return prev
             const next = { ...prev }
@@ -469,10 +684,43 @@ export function WorkbenchScreen() {
     }
   }
 
-  const selectedCount = selectedCandidates.length
+  // Tray mix note: where the picks came from, and the honest re-check note when they cross sets.
+  const mixNote = multiSet && selectedCount > 0
+    ? originLenses.length > 1
+      ? `mixed from ${originLenses.length} sets · your mix re-checks as one set before approval`
+      : originLenses.length === 1 && originLenses[0] !== undefined
+        ? `from the ${lensLabel(originLenses[0])} set`
+        : null
+    : null
 
   return (
     <section>
+      <div className="gates" role="list" aria-label="Where you are in the loop">
+        <Gate
+          state={gate1}
+          who="You"
+          title="State the goal"
+          sub="Nothing generates without your intent."
+        />
+        <Gate
+          state={gate2}
+          who="Engine"
+          title="Propose in sets"
+          sub="One set per strategy lens, all safety-checked."
+        />
+        <Gate
+          state={gate3}
+          who="You"
+          title="Compare, mix, give feedback"
+          sub="Take a set or pick a la carte across sets."
+        />
+        <Gate
+          state={gate4}
+          who="You"
+          title="You approve"
+          sub="Nothing registers without your click, under your name."
+        />
+      </div>
       <div className="panel">
         {notice && (
           <div role="alert" className="callout callout--warn">
@@ -557,11 +805,10 @@ export function WorkbenchScreen() {
                   <circle cx="8" cy="8" r="6.2" />
                   <path d="M8 5v6M5 8h6" />
                 </PathGlyph>
-                {generating ? 'Generating' : 'Generate candidates'}
+                {generating ? 'Generating' : 'Generate candidate sets'}
               </span>
               <span className="d">
-                The engine proposes catalog-grounded, design-checked features for your goal, each
-                with its causal rationale.
+                One validated set per strategy lens, with causal rationales and an advisory pick.
               </span>
             </button>
             <button
@@ -643,35 +890,120 @@ export function WorkbenchScreen() {
       )}
 
       {generated?.length === 0 && (
-        <div className="empty" role="status">
-          <p>No grounded candidates for that goal.</p>
-          <p className="next">Rephrase the goal, or change the catalog source and generate again.</p>
-        </div>
+        <>
+          <div className="empty" role="status">
+            <p>No grounded candidates for that goal.</p>
+            <p className="next">Rephrase the goal, or change the catalog source and generate again.</p>
+          </div>
+          {/* An all-rejected round still shows WHY: rejections are never hidden. (When drafts
+              exist the candidates block below renders the panel instead.) */}
+          {rejections.length > 0 && allCandidates.length === 0 && (
+            <RejectionsPanel
+              rejections={rejections}
+              open={rejectionsOpen}
+              onToggle={() => setRejectionsOpen(open => !open)}
+            />
+          )}
+        </>
       )}
 
-      {candidates.length > 0 && (
+      {allCandidates.length > 0 && (
         <>
           <div style={{ display: 'flex', alignItems: 'baseline', gap: 12, marginTop: 32 }}>
-            <h2>Proposed features</h2>
+            <h2>{multiSet ? 'Proposed feature sets' : 'Proposed features'}</h2>
             <span className="micro-label tabular-nums">
-              <span style={{ color: 'var(--accent)' }}>{candidates.length}</span>{' '}
-              {candidates.length === 1 ? 'candidate' : 'candidates'}
+              {multiSet && generated !== null ? (
+                <>
+                  <span style={{ color: 'var(--accent)' }}>{setLenses.length}</span> sets ·{' '}
+                  <span style={{ color: 'var(--accent)' }}>{generated.length}</span>{' '}
+                  {generated.length === 1 ? 'feature' : 'features'}
+                </>
+              ) : (
+                <>
+                  <span style={{ color: 'var(--accent)' }}>{listCandidates.length}</span>{' '}
+                  {listCandidates.length === 1 ? 'candidate' : 'candidates'}
+                </>
+              )}
             </span>
           </div>
-          {hasGenerated && (
-            <p className="hint" style={{ marginTop: 4 }}>
-              Design-checked: structurally safe against leakage, staleness, and double-counting.
-              Predictive value is proven later by backtests.
-            </p>
-          )}
+          <p className="hint" style={{ marginTop: 4 }}>
+            <strong style={{ color: 'var(--ink)' }}>
+              Nothing below enters the catalog without your approval.
+            </strong>
+            {hasGenerated &&
+              ' Design-checked: structurally safe against leakage, staleness, and double-counting. Predictive value is proven later by backtests.'}
+          </p>
           {screenedTarget && (
             <p className="hint" style={{ marginTop: 4 }}>
               Screened against <span className="mono">{screenedTarget}</span>: leaky candidates
               were rejected before reaching you.
             </p>
           )}
+          {rejections.length > 0 && (
+            <RejectionsPanel
+              rejections={rejections}
+              open={rejectionsOpen}
+              onToggle={() => setRejectionsOpen(open => !open)}
+            />
+          )}
+          {multiSet && generated !== null && (
+            <>
+              <div className="sets">
+                {setLenses.map(lens => {
+                  const feats = generated.filter(c => c.lenses.includes(lens))
+                  const inTray = feats.filter(
+                    c => c.key in selected || registered[c.key] !== undefined).length
+                  const isActive = lens === activeLens
+                  const thesis = LENS_THESES[lens]
+                  return (
+                    <div key={lens} className="set-card" data-active={isActive || undefined}>
+                      <button
+                        type="button"
+                        className="set-card-view"
+                        aria-pressed={isActive}
+                        onClick={() => setActiveLens(lens)}
+                      >
+                        <span className="set-lens">
+                          Lens · {lensLabel(lens)}
+                          {recommendation?.recommended_lens === lens && (
+                            <span className="badge recommended">Recommended</span>
+                          )}
+                        </span>
+                        <span className="set-name">{lensLabel(lens)} set</span>
+                        {thesis !== undefined && <span className="set-thesis">{thesis}</span>}
+                        <span className="set-meta tabular-nums">
+                          {feats.length} {feats.length === 1 ? 'feature' : 'features'} · all
+                          design-checked
+                          {inTray > 0 ? ` · ${inTray} in your tray` : ''}
+                        </span>
+                      </button>
+                      <button
+                        type="button"
+                        className="btn set-take"
+                        aria-label={`Take this set (${lensLabel(lens)})`}
+                        onClick={() => takeSet(lens)}
+                      >
+                        Take this set
+                      </button>
+                    </div>
+                  )
+                })}
+              </div>
+              {recommendation !== null && (
+                <div className="advice">
+                  <p>
+                    <strong>
+                      Engine's pick: {lensLabel(recommendation.recommended_lens)}.
+                    </strong>{' '}
+                    {recommendation.reasoning}
+                  </p>
+                  <p className="advice-caveat">Caveat: {recommendation.caveat}</p>
+                </div>
+              )}
+            </>
+          )}
           <ul className="rows">
-            {candidates.map(c => {
+            {listCandidates.map(c => {
               const reg = registered[c.key]
               const error = errors[c.key]
               const rawName = c.kind === 'generated' ? c.idea.name : c.name
@@ -691,9 +1023,10 @@ export function WorkbenchScreen() {
                     <input
                       type="checkbox"
                       aria-label={`Select ${displayName}`}
-                      checked={selected.has(c.key)}
+                      checked={c.key in selected}
                       disabled={batchBusy || !canSelect}
-                      onChange={() => toggleSelect(c.key)}
+                      onChange={() => toggleSelect(
+                        c.key, c.kind === 'generated' && multiSet ? activeLens : null)}
                       style={{ width: 18, height: 18, margin: 10, flex: 'none' }}
                     />
                   )}
@@ -709,6 +1042,11 @@ export function WorkbenchScreen() {
                           registered states. Drafts skip the gauntlet, so they carry no stamp. */}
                       {c.kind === 'generated' && c.idea.verification && (
                         <span className="badge ok">{c.idea.verification.toLowerCase()}</span>
+                      )}
+                      {/* Overlap is on purpose: strong signals earn their place in several
+                          theses. Soft chip; the row is one candidate either way. */}
+                      {c.kind === 'generated' && c.lenses.length > 1 && (
+                        <span className="badge">In {c.lenses.length} sets</span>
                       )}
                     </div>
                     <p style={{ color: 'var(--ink-soft)' }}>{description}</p>
@@ -788,9 +1126,8 @@ export function WorkbenchScreen() {
                 {confirmingBatch ? (
                   <>
                     <p style={{ flex: '1 1 260px', fontWeight: 500 }}>
-                      {selectedCount === 1
-                        ? 'This feature will enter the catalog registry with its lineage.'
-                        : `These ${selectedCount} features will enter the catalog registry with their lineage.`}
+                      Your approval writes these features into the registry with their lineage,
+                      under your name.
                     </p>
                     <button
                       type="button"
@@ -798,7 +1135,7 @@ export function WorkbenchScreen() {
                       disabled={batchBusy}
                       onClick={() => void confirmRegistration()}
                     >
-                      Confirm registration
+                      Confirm approval
                     </button>
                     <button
                       type="button"
@@ -811,15 +1148,18 @@ export function WorkbenchScreen() {
                   </>
                 ) : (
                   <>
-                    <span className="tabular-nums" style={{ flex: '1 1 auto', fontWeight: 600 }}>
+                    <span className="tabular-nums" style={{ fontWeight: 600 }}>
                       {selectedCount} selected
                     </span>
+                    {mixNote !== null && <span className="hint">{mixNote}</span>}
+                    <span style={{ flex: '1 1 auto' }} aria-hidden="true" />
                     <button
                       type="button"
                       className="btn btn--primary"
                       onClick={() => setConfirmingBatch(true)}
                     >
-                      Register {selectedCount} {selectedCount === 1 ? 'feature' : 'features'}
+                      Approve and register {selectedCount}{' '}
+                      {selectedCount === 1 ? 'feature' : 'features'}
                     </button>
                   </>
                 )}

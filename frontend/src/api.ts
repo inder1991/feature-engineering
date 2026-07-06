@@ -120,7 +120,65 @@ export interface FeatureIdea {
   verification: string
   // One-line causal WHY this feature operationalizes the goal; "" when the LLM omitted it.
   rationale: string
+  // The critic's dissent note when it flagged but did not block the idea; "" when clean.
+  critic_note: string
 }
+
+// One gauntlet rejection, shown to the human, never hidden. `code` carries the backend's
+// RejectCode vocabulary (UNGROUNDED, AMBIGUOUS_CATALOG, UNKNOWN_COLUMN, LEAKAGE, STALE,
+// ADDITIVITY, MIXED_UNITS, MIXED_CURRENCY, NO_POINT_IN_TIME, REDUNDANT, ALREADY_REGISTERED,
+// CRITIC, NO_REVISION) but stays a plain string: an unknown code from a newer backend must
+// still render, never break the client.
+export interface Rejection {
+  name: string
+  reason: string
+  code: string
+}
+
+export interface RecommendResult {
+  proposals: FeatureIdea[]
+  rejections: Rejection[]
+}
+
+// One validated set per strategy lens from the backend's deterministic router (subset of:
+// unary, ratio, aggregation, temporal, distributional). Every feature ran the same gauntlet.
+export interface FeatureSet {
+  lens: string
+  features: FeatureIdea[]
+}
+
+// ADVISORY set pick: a fit/coverage judgment over the metadata, never a performance claim.
+// The caveat arrives from the backend and renders verbatim.
+export interface SetRecommendation {
+  recommended_lens: string
+  reasoning: string
+  caveat: string
+}
+
+export interface FeatureSetsResult {
+  sets: FeatureSet[]
+  // null when every set came back empty: the backend offers no recommendation over nothing.
+  recommendation: SetRecommendation | null
+  rejections: Rejection[]
+}
+
+// The candidate fields the backend's refine fix-hint needs, as the UI holds them.
+export interface RefineCandidate {
+  name: string
+  description?: string
+  derives_from?: string[]
+  aggregation?: string | null
+  grain_table?: string | null
+}
+
+export interface RefineRejection {
+  reason: string
+  code: string
+}
+
+// Both refine outcomes arrive as 200 data: a gauntlet rejection of the revision is something
+// the reviewer acts on, not a transport error. Narrow with `'revised' in result`.
+export type RefineResult = { revised: FeatureIdea } | { rejected: RefineRejection }
 
 export interface Recipe {
   intent: string
@@ -190,20 +248,64 @@ export async function featureImpact(objectRef: string, source: string): Promise<
   return body.feature_ids
 }
 
-export async function recommendFeatures(
+export function recommendFeatures(
   objective: string,
   catalogSource: string | null,
   targetRef: string | null = null,
   entity: string | null = null,
-): Promise<FeatureIdea[]> {
-  const body = await post<{ proposals: FeatureIdea[] }>('/features/recommend', {
+  feedback: string | null = null,
+): Promise<RecommendResult> {
+  return post('/features/recommend', {
     objective,
     catalog_source: catalogSource,
     target_ref: targetRef,
     // Entity-scoped gather: candidates come from every catalog holding this entity.
-    entity: entity ?? null,
+    entity,
+    // HUMAN guidance for the whole round; every candidate still runs the full gauntlet.
+    feedback,
   })
-  return body.proposals
+}
+
+export function recommendFeatureSets(
+  objective: string,
+  catalogSource: string | null,
+  targetRef: string | null = null,
+  entity: string | null = null,
+  feedback: string | null = null,
+): Promise<FeatureSetsResult> {
+  // Same request body as /features/recommend; the response groups proposals by strategy lens
+  // and adds the advisory pick plus the rejections aggregated across every lens's rounds.
+  return post('/features/recommend-sets', {
+    objective,
+    catalog_source: catalogSource,
+    target_ref: targetRef,
+    entity,
+    feedback,
+  })
+}
+
+export function refineCandidate(
+  candidate: RefineCandidate,
+  instruction: string,
+  catalogSource: string | null = null,
+  entity: string | null = null,
+  targetRef: string | null = null,
+): Promise<RefineResult> {
+  return post('/features/refine', {
+    // Defaults applied at the boundary so the wire always carries the full candidate shape
+    // the backend declares (description "", derives_from [], aggregation/grain_table null).
+    candidate: {
+      name: candidate.name,
+      description: candidate.description ?? '',
+      derives_from: candidate.derives_from ?? [],
+      aggregation: candidate.aggregation ?? null,
+      grain_table: candidate.grain_table ?? null,
+    },
+    instruction,
+    catalog_source: catalogSource,
+    entity,
+    target_ref: targetRef,
+  })
 }
 
 export function featureRecipe(query: string, catalogSource: string): Promise<Recipe> {

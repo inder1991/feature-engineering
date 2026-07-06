@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen } from '@testing-library/react'
+import { act, fireEvent, render, screen, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import * as api from '../api'
@@ -9,6 +9,7 @@ vi.mock('../api', async importOriginal => {
   return {
     ...actual,
     recommendFeatures: vi.fn(),
+    recommendFeatureSets: vi.fn(),
     featureRecipe: vi.fn(),
     leakageCheck: vi.fn(),
     registerFeature: vi.fn(),
@@ -16,12 +17,14 @@ vi.mock('../api', async importOriginal => {
   }
 })
 const recommendFeatures = vi.mocked(api.recommendFeatures)
+const recommendFeatureSets = vi.mocked(api.recommendFeatureSets)
 const featureRecipe = vi.mocked(api.featureRecipe)
 const registerFeature = vi.mocked(api.registerFeature)
 const featureFreshness = vi.mocked(api.featureFreshness)
 
 beforeEach(() => {
   recommendFeatures.mockReset()
+  recommendFeatureSets.mockReset()
   featureRecipe.mockReset()
   registerFeature.mockReset()
   featureFreshness.mockReset()
@@ -34,7 +37,7 @@ const IDEA: api.FeatureIdea = {
   name: 'avg_balance', description: 'average balance per customer',
   derives_from: ['public.accounts.balance'], aggregation: 'avg', grain_table: 'customers',
   derives_pairs: [['cards', 'public.accounts.balance']],
-  verification: 'DESIGN-CHECKED',
+  verification: 'DESIGN-CHECKED', critic_note: '',
   rationale: 'falling balances signal a customer preparing to leave',
 }
 
@@ -49,7 +52,7 @@ const OTHER_IDEA: api.FeatureIdea = {
   derives_from: ['public.transactions.id'], aggregation: 'count', grain_table: 'customers',
   derives_pairs: [['cards', 'public.transactions.id']],
   // rationale left blank: the LLM omitted a causal note, so no Why line should render for it.
-  verification: 'DESIGN-CHECKED', rationale: '',
+  verification: 'DESIGN-CHECKED', critic_note: '', rationale: '',
 }
 
 const OTHER_IDEA_SPEC: api.FeatureSpecIn = {
@@ -59,6 +62,48 @@ const OTHER_IDEA_SPEC: api.FeatureSpecIn = {
 }
 
 const FRESH: api.FeatureFreshness = { fresh: true, stale_sources: [] }
+
+function idea(name: string): api.FeatureIdea {
+  return {
+    name, description: `${name} per customer`,
+    derives_from: ['public.accounts.balance'], aggregation: 'avg', grain_table: 'customers',
+    derives_pairs: [['deposits', 'public.accounts.balance']],
+    verification: 'DESIGN-CHECKED', critic_note: '', rationale: '',
+  }
+}
+
+// A one-set response renders the flat list exactly as before the sets model.
+function singleSetRound(
+  ideas: api.FeatureIdea[],
+  rejections: api.Rejection[] = [],
+): api.FeatureSetsResult {
+  return { sets: [{ lens: 'temporal', features: ideas }], recommendation: null, rejections }
+}
+
+const TEMPORAL_ONLY = idea('days_since_last_txn')
+const RATIO_ONLY = idea('balance_to_limit_ratio')
+// The overlapping feature: present in both sets on purpose (strong signals earn their place in
+// several theses); it must render as ONE candidate with an In 2 sets chip.
+const SHARED = idea('txn_count_shared')
+
+const CAVEAT =
+  'advisory only — a fit/coverage judgment over the metadata, not a performance prediction; '
+  + 'confirm the winner with a backtest once features are computed'
+
+function multiSetRound(rejections: api.Rejection[] = []): api.FeatureSetsResult {
+  return {
+    sets: [
+      { lens: 'temporal', features: [TEMPORAL_ONLY, SHARED] },
+      { lens: 'ratio', features: [RATIO_ONLY, SHARED] },
+    ],
+    recommendation: {
+      recommended_lens: 'temporal',
+      reasoning: 'recency signals move earliest for a churn horizon',
+      caveat: CAVEAT,
+    },
+    rejections,
+  }
+}
 
 function recipeWith(joinPath: api.JoinStep[]): api.Recipe {
   return {
@@ -80,8 +125,12 @@ interface Scope {
   target?: string
 }
 
-async function renderAndGenerate(ideas: api.FeatureIdea[], scope: Scope = {}) {
-  recommendFeatures.mockResolvedValue(ideas)
+async function renderAndGenerate(
+  ideas: api.FeatureIdea[],
+  scope: Scope = {},
+  rejections: api.Rejection[] = [],
+) {
+  recommendFeatureSets.mockResolvedValue(singleSetRound(ideas, rejections))
   render(<WorkbenchScreen />)
   if (scope.source) {
     await userEvent.type(screen.getByLabelText('Catalog source'), scope.source)
@@ -93,7 +142,14 @@ async function renderAndGenerate(ideas: api.FeatureIdea[], scope: Scope = {}) {
     await userEvent.type(screen.getByLabelText('Target column'), scope.target)
   }
   await userEvent.type(screen.getByLabelText('Prediction goal'), 'predict churn')
-  await userEvent.click(screen.getByRole('button', { name: /generate candidates/i }))
+  await userEvent.click(screen.getByRole('button', { name: /generate candidate sets/i }))
+}
+
+async function renderAndGenerateSets(round: api.FeatureSetsResult) {
+  recommendFeatureSets.mockResolvedValue(round)
+  render(<WorkbenchScreen />)
+  await userEvent.type(screen.getByLabelText('Prediction goal'), 'predict churn')
+  await userEvent.click(screen.getByRole('button', { name: /generate candidate sets/i }))
 }
 
 async function selectCandidate(name: string) {
@@ -102,8 +158,9 @@ async function selectCandidate(name: string) {
 
 async function registerSelection(count: number) {
   const plural = count === 1 ? 'feature' : 'features'
-  await userEvent.click(screen.getByRole('button', { name: `Register ${count} ${plural}` }))
-  await userEvent.click(screen.getByRole('button', { name: 'Confirm registration' }))
+  await userEvent.click(
+    screen.getByRole('button', { name: `Approve and register ${count} ${plural}` }))
+  await userEvent.click(screen.getByRole('button', { name: 'Confirm approval' }))
 }
 
 async function openDescribe() {
@@ -124,38 +181,88 @@ async function renderAndDraft(joinPath: api.JoinStep[] = []) {
   expect(await screen.findByText('Draft')).toBeInTheDocument()
 }
 
+function gateState(title: string): string | null | undefined {
+  const strip = screen.getByRole('list', { name: 'Where you are in the loop' })
+  return within(strip).getByText(title).closest('[data-state]')?.getAttribute('data-state')
+}
+
+describe('gates strip', () => {
+  it('advances only with real state, from goal to approval', async () => {
+    registerFeature.mockResolvedValue('feat_01')
+    featureFreshness.mockResolvedValue(FRESH)
+    recommendFeatureSets.mockResolvedValue(singleSetRound([IDEA]))
+    render(<WorkbenchScreen />)
+    // No goal yet: stating it is the current step, everything downstream is upcoming.
+    expect(gateState('State the goal')).toBe('active')
+    expect(gateState('Propose in sets')).toBe('todo')
+    expect(gateState('Compare, mix, give feedback')).toBe('todo')
+    expect(gateState('You approve')).toBe('todo')
+    await userEvent.type(screen.getByLabelText('Prediction goal'), 'predict churn')
+    expect(gateState('State the goal')).toBe('done')
+    expect(gateState('Propose in sets')).toBe('active')
+    await userEvent.click(screen.getByRole('button', { name: /generate candidate sets/i }))
+    expect(await screen.findByText('avg_balance')).toBeInTheDocument()
+    expect(gateState('Propose in sets')).toBe('done')
+    expect(gateState('Compare, mix, give feedback')).toBe('active')
+    expect(gateState('You approve')).toBe('todo')
+    await selectCandidate('avg_balance')
+    expect(gateState('Compare, mix, give feedback')).toBe('done')
+    expect(gateState('You approve')).toBe('active')
+    await registerSelection(1)
+    expect(await screen.findByText('feat_01')).toBeInTheDocument()
+    expect(gateState('You approve')).toBe('done')
+  })
+
+  it('names the actor on every gate and keeps the mockup copy', () => {
+    render(<WorkbenchScreen />)
+    const strip = screen.getByRole('list', { name: 'Where you are in the loop' })
+    expect(within(strip).getAllByText('You')).toHaveLength(3)
+    expect(within(strip).getByText('Engine')).toBeInTheDocument()
+    expect(within(strip).getByText('Nothing generates without your intent.')).toBeInTheDocument()
+    expect(
+      within(strip).getByText('One set per strategy lens, all safety-checked.'),
+    ).toBeInTheDocument()
+    expect(
+      within(strip).getByText('Take a set or pick a la carte across sets.'),
+    ).toBeInTheDocument()
+    expect(
+      within(strip).getByText('Nothing registers without your click, under your name.'),
+    ).toBeInTheDocument()
+  })
+})
+
 describe('generation', () => {
-  it('passes the goal and every scope field through to the recommend call', async () => {
+  it('passes the goal and every scope field through to the sets call', async () => {
     await renderAndGenerate([], {
       source: 'deposits', entity: 'customer', target: 'public.labels.churned',
     })
-    expect(recommendFeatures).toHaveBeenCalledWith(
+    expect(recommendFeatureSets).toHaveBeenCalledWith(
       'predict churn', 'deposits', 'public.labels.churned', 'customer')
   })
 
   it('sends null for scope fields left blank', async () => {
     await renderAndGenerate([])
-    expect(recommendFeatures).toHaveBeenCalledWith('predict churn', null, null, null)
+    expect(recommendFeatureSets).toHaveBeenCalledWith('predict churn', null, null, null)
   })
 
   it('shows the empty note only after a generation round returns nothing', async () => {
-    recommendFeatures.mockResolvedValue([])
+    recommendFeatureSets.mockResolvedValue(singleSetRound([]))
     render(<WorkbenchScreen />)
     expect(screen.queryByText(/no grounded candidates/i)).not.toBeInTheDocument()
     await userEvent.type(screen.getByLabelText('Prediction goal'), 'predict churn')
-    await userEvent.click(screen.getByRole('button', { name: /generate candidates/i }))
+    await userEvent.click(screen.getByRole('button', { name: /generate candidate sets/i }))
     expect(await screen.findByText(/no grounded candidates for that goal/i)).toBeInTheDocument()
   })
 
   it('applies only the latest generation round when responses arrive out of order', async () => {
-    const first = deferred<api.FeatureIdea[]>()
-    const second = deferred<api.FeatureIdea[]>()
-    recommendFeatures
+    const first = deferred<api.FeatureSetsResult>()
+    const second = deferred<api.FeatureSetsResult>()
+    recommendFeatureSets
       .mockImplementationOnce(() => first.promise)
       .mockImplementationOnce(() => second.promise)
     const { container } = render(<WorkbenchScreen />)
     await userEvent.type(screen.getByLabelText('Prediction goal'), 'predict churn')
-    await userEvent.click(screen.getByRole('button', { name: /generate candidates/i }))
+    await userEvent.click(screen.getByRole('button', { name: /generate candidate sets/i }))
     // Round 1 is in flight: the path card swaps to Generating and disables (no casual re-submit).
     expect(screen.getByRole('button', { name: /generating/i })).toBeDisabled()
     // The disabled card blocks the button, so a second round can only arrive as a re-submit
@@ -166,38 +273,242 @@ describe('generation', () => {
       fireEvent.submit(form)
     })
     await act(async () => {
-      second.resolve([OTHER_IDEA])
+      second.resolve(singleSetRound([OTHER_IDEA]))
     })
     expect(await screen.findByText('txn_count')).toBeInTheDocument()
     // The stale first response resolves late and must not overwrite the newer round.
     await act(async () => {
-      first.resolve([IDEA])
+      first.resolve(singleSetRound([IDEA]))
     })
     expect(screen.getByText('txn_count')).toBeInTheDocument()
     expect(screen.queryByText('avg_balance')).not.toBeInTheDocument()
   })
 
-  it('shows the honest 503 notice when assist is unconfigured', async () => {
-    recommendFeatures.mockRejectedValue(new api.ApiError(503, 'not configured'))
+  it('shows the honest 503 notice and never falls back to the plain recommend endpoint', async () => {
+    // 503 means no LLM provider on the deployment: /features/recommend would fail identically,
+    // so a silent fallback would only fake capability.
+    recommendFeatureSets.mockRejectedValue(new api.ApiError(503, 'not configured'))
     render(<WorkbenchScreen />)
     await userEvent.type(screen.getByLabelText('Prediction goal'), 'predict churn')
-    await userEvent.click(screen.getByRole('button', { name: /generate candidates/i }))
+    await userEvent.click(screen.getByRole('button', { name: /generate candidate sets/i }))
     const alert = await screen.findByRole('alert')
     expect(alert).toHaveTextContent(/ai assist is not configured/i)
+    expect(recommendFeatures).not.toHaveBeenCalled()
   })
 
   it('the example chip fills the goal input and enables the primary action', async () => {
     render(<WorkbenchScreen />)
-    expect(screen.getByRole('button', { name: /generate candidates/i })).toBeDisabled()
+    expect(screen.getByRole('button', { name: /generate candidate sets/i })).toBeDisabled()
     await userEvent.click(screen.getByRole('button', { name: 'predict churn' }))
     expect(screen.getByLabelText('Prediction goal')).toHaveValue('predict churn')
-    expect(screen.getByRole('button', { name: /generate candidates/i })).toBeEnabled()
-    expect(recommendFeatures).not.toHaveBeenCalled()
+    expect(screen.getByRole('button', { name: /generate candidate sets/i })).toBeEnabled()
+    expect(recommendFeatureSets).not.toHaveBeenCalled()
+  })
+})
+
+describe('multiple sets', () => {
+  it('renders one summary card per set with the advisory pick and its caveat', async () => {
+    await renderAndGenerateSets(multiSetRound())
+    expect(await screen.findByText('Temporal set')).toBeInTheDocument()
+    expect(screen.getByText('Ratio set')).toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: 'Proposed feature sets' })).toBeInTheDocument()
+    // Exactly one Recommended chip, on the advisory pick.
+    expect(screen.getAllByText('Recommended')).toHaveLength(1)
+    // Both cards carry the honest all-design-checked meta line.
+    expect(screen.getAllByText(/2 features · all design-checked/)).toHaveLength(2)
+    // Advisory panel: the pick, the reasoning, and the backend caveat verbatim.
+    expect(screen.getByText(/Engine's pick: Temporal\./)).toBeInTheDocument()
+    expect(screen.getByText(/recency signals move earliest for a churn horizon/)).toBeInTheDocument()
+    expect(screen.getByText(new RegExp(CAVEAT.slice(0, 40)))).toBeInTheDocument()
+  })
+
+  it('opens on the recommended set and switches the detail list per card', async () => {
+    await renderAndGenerateSets(multiSetRound())
+    expect(await screen.findByText('days_since_last_txn')).toBeInTheDocument()
+    expect(screen.getByText('txn_count_shared')).toBeInTheDocument()
+    expect(screen.queryByText('balance_to_limit_ratio')).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /temporal set/i }))
+      .toHaveAttribute('aria-pressed', 'true')
+    await userEvent.click(screen.getByRole('button', { name: /ratio set/i }))
+    expect(screen.getByText('balance_to_limit_ratio')).toBeInTheDocument()
+    expect(screen.getByText('txn_count_shared')).toBeInTheDocument()
+    expect(screen.queryByText('days_since_last_txn')).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /ratio set/i }))
+      .toHaveAttribute('aria-pressed', 'true')
+    expect(screen.getByRole('button', { name: /temporal set/i }))
+      .toHaveAttribute('aria-pressed', 'false')
+  })
+
+  it('take this set selects every unregistered feature in it', async () => {
+    await renderAndGenerateSets(multiSetRound())
+    await screen.findByText('days_since_last_txn')
+    await userEvent.click(screen.getByRole('button', { name: 'Take this set (Temporal)' }))
+    expect(screen.getByText('2 selected')).toBeInTheDocument()
+    expect(screen.getByText('from the Temporal set')).toBeInTheDocument()
+    expect(screen.getByRole('checkbox', { name: 'Select days_since_last_txn' })).toBeChecked()
+    expect(screen.getByRole('checkbox', { name: 'Select txn_count_shared' })).toBeChecked()
+    // The card meta reflects the tray.
+    expect(screen.getByText(/2 in your tray/)).toBeInTheDocument()
+  })
+
+  it('mixes picks across sets: selection survives switching and the tray names the mix', async () => {
+    await renderAndGenerateSets(multiSetRound())
+    await selectCandidate('days_since_last_txn')
+    expect(screen.getByText('1 selected')).toBeInTheDocument()
+    expect(screen.getByText('from the Temporal set')).toBeInTheDocument()
+    await userEvent.click(screen.getByRole('button', { name: /ratio set/i }))
+    // The temporal pick is kept while another set is showing.
+    expect(screen.getByText('1 selected')).toBeInTheDocument()
+    await selectCandidate('balance_to_limit_ratio')
+    expect(screen.getByText('2 selected')).toBeInTheDocument()
+    expect(
+      screen.getByText('mixed from 2 sets · your mix re-checks as one set before approval'),
+    ).toBeInTheDocument()
+    // Switching back leaves both picks intact.
+    await userEvent.click(screen.getByRole('button', { name: /temporal set/i }))
+    expect(screen.getByRole('checkbox', { name: 'Select days_since_last_txn' })).toBeChecked()
+    expect(screen.getByText('2 selected')).toBeInTheDocument()
+  })
+
+  it('renders an overlapping feature as one candidate with the In N sets chip', async () => {
+    await renderAndGenerateSets(multiSetRound())
+    await screen.findByText('txn_count_shared')
+    // One chip in the temporal view; the set-only features carry none.
+    expect(screen.getAllByText('In 2 sets')).toHaveLength(1)
+    await selectCandidate('txn_count_shared')
+    await userEvent.click(screen.getByRole('button', { name: /ratio set/i }))
+    // Same candidate in the other view: still selected, still one selection.
+    expect(screen.getByRole('checkbox', { name: 'Select txn_count_shared' })).toBeChecked()
+    expect(screen.getByText('1 selected')).toBeInTheDocument()
+  })
+
+  it('registers an overlapping feature once and flips its row in every set view', async () => {
+    registerFeature.mockResolvedValue('feat_20')
+    featureFreshness.mockResolvedValue(FRESH)
+    await renderAndGenerateSets(multiSetRound())
+    await selectCandidate('txn_count_shared')
+    await registerSelection(1)
+    expect(await screen.findByText('feat_20')).toBeInTheDocument()
+    expect(registerFeature).toHaveBeenCalledTimes(1)
+    await userEvent.click(screen.getByRole('button', { name: /ratio set/i }))
+    expect(screen.getByText('feat_20')).toBeInTheDocument()
+    expect(
+      screen.queryByRole('checkbox', { name: 'Select txn_count_shared' }),
+    ).not.toBeInTheDocument()
+  })
+
+  it('registers a cross-set mix as one batch, whichever view is showing', async () => {
+    registerFeature.mockResolvedValueOnce('feat_21').mockResolvedValueOnce('feat_22')
+    featureFreshness.mockResolvedValue(FRESH)
+    await renderAndGenerateSets(multiSetRound())
+    await selectCandidate('days_since_last_txn')
+    await userEvent.click(screen.getByRole('button', { name: /ratio set/i }))
+    await selectCandidate('balance_to_limit_ratio')
+    await registerSelection(2)
+    // The ratio view shows its own registration; the temporal pick registered off-view.
+    expect(await screen.findByText('feat_22')).toBeInTheDocument()
+    expect(registerFeature).toHaveBeenCalledTimes(2)
+    await userEvent.click(screen.getByRole('button', { name: /temporal set/i }))
+    expect(screen.getByText('feat_21')).toBeInTheDocument()
+  })
+
+  it('drops empty sets from the compare row', async () => {
+    await renderAndGenerateSets({
+      sets: [
+        { lens: 'unary', features: [] },
+        { lens: 'temporal', features: [TEMPORAL_ONLY] },
+        { lens: 'ratio', features: [RATIO_ONLY] },
+      ],
+      recommendation: {
+        recommended_lens: 'temporal',
+        reasoning: 'recency signals move earliest for a churn horizon',
+        caveat: CAVEAT,
+      },
+      rejections: [],
+    })
+    expect(await screen.findByText('Temporal set')).toBeInTheDocument()
+    expect(screen.getByText('Ratio set')).toBeInTheDocument()
+    expect(screen.queryByText('Unary set')).not.toBeInTheDocument()
+  })
+
+  it('renders a single-set response as the flat list with no compare row', async () => {
+    await renderAndGenerate([IDEA, OTHER_IDEA])
+    expect(await screen.findByText('avg_balance')).toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: 'Proposed features' })).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /take this set/i })).not.toBeInTheDocument()
+    expect(screen.queryByText(/lens ·/i)).not.toBeInTheDocument()
+    expect(screen.queryByText(/engine's pick/i)).not.toBeInTheDocument()
+    expect(screen.queryByText(/in your tray/i)).not.toBeInTheDocument()
+  })
+
+  it('shows the empty note and the rejections when every set comes back empty', async () => {
+    recommendFeatureSets.mockResolvedValue({
+      sets: [{ lens: 'unary', features: [] }],
+      recommendation: null,
+      rejections: [
+        { name: 'nps_score_avg', reason: 'no such column exists in any catalog', code: 'UNGROUNDED' },
+      ],
+    })
+    render(<WorkbenchScreen />)
+    await userEvent.type(screen.getByLabelText('Prediction goal'), 'predict churn')
+    await userEvent.click(screen.getByRole('button', { name: /generate candidate sets/i }))
+    expect(await screen.findByText(/no grounded candidates for that goal/i)).toBeInTheDocument()
+    expect(screen.getByText('1 rejected')).toBeInTheDocument()
+    await userEvent.click(screen.getByRole('button', { name: 'Show' }))
+    expect(screen.getByText('nps_score_avg')).toBeInTheDocument()
+  })
+})
+
+describe('rejections panel', () => {
+  const REJECTIONS: api.Rejection[] = [
+    { name: 'days_to_churn', reason: 'derives from the target column public.labels.churned', code: 'LEAKAGE' },
+    { name: 'next_month_balance', reason: 'uses information from after the prediction time', code: 'LEAKAGE' },
+    { name: 'card_spend_total', reason: 'source cards has no fresh upload inside 24 hours', code: 'STALE' },
+    { name: 'nps_score_avg', reason: 'no such column exists in any catalog', code: 'UNGROUNDED' },
+  ]
+
+  it('summarizes the round with per-code tallies and reveals the rows on Show', async () => {
+    await renderAndGenerate([IDEA], {}, REJECTIONS)
+    expect(await screen.findByText('4 rejected')).toBeInTheDocument()
+    expect(screen.getByText(
+      'The safety gauntlet rejected 4 candidates across all lenses: '
+      + 'leakage 2 · stale source 1 · ungrounded 1.',
+    )).toBeInTheDocument()
+    // Rows stay hidden until asked for.
+    expect(screen.queryByText('days_to_churn')).not.toBeInTheDocument()
+    const toggle = screen.getByRole('button', { name: 'Show' })
+    expect(toggle).toHaveAttribute('aria-expanded', 'false')
+    await userEvent.click(toggle)
+    expect(screen.getByText('days_to_churn')).toBeInTheDocument()
+    expect(
+      screen.getByText('derives from the target column public.labels.churned'),
+    ).toBeInTheDocument()
+    // Per-row code chips, in words.
+    expect(screen.getAllByText('leakage')).toHaveLength(2)
+    expect(screen.getByText('stale source')).toBeInTheDocument()
+    expect(screen.getByText('ungrounded')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Hide' })).toHaveAttribute('aria-expanded', 'true')
+  })
+
+  it('words an unfamiliar rejection code instead of showing the enum token', async () => {
+    await renderAndGenerate([IDEA], {}, [
+      { name: 'avg_balance_2', reason: 'no revision was produced', code: 'NO_REVISION' },
+    ])
+    await userEvent.click(await screen.findByRole('button', { name: 'Show' }))
+    expect(screen.getByText('no revision')).toBeInTheDocument()
+    expect(screen.queryByText('NO_REVISION')).not.toBeInTheDocument()
+  })
+
+  it('omits the panel when the gauntlet rejected nothing', async () => {
+    await renderAndGenerate([IDEA])
+    expect(await screen.findByText('avg_balance')).toBeInTheDocument()
+    expect(screen.queryByText(/safety gauntlet/)).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Show' })).not.toBeInTheDocument()
   })
 })
 
 describe('selection and registration', () => {
-  it('registers a selected candidate only after the explicit confirm, with lineage from the backend pairs', async () => {
+  it('registers a selected candidate only after the explicit approval confirm, with lineage from the backend pairs', async () => {
     registerFeature.mockResolvedValue('feat_01')
     featureFreshness.mockResolvedValue(FRESH)
     await renderAndGenerate([IDEA], { source: 'deposits' })
@@ -205,12 +516,13 @@ describe('selection and registration', () => {
     expect(await screen.findByText('cards:public.accounts.balance')).toBeInTheDocument()
     await selectCandidate('avg_balance')
     expect(screen.getByText('1 selected')).toBeInTheDocument()
-    await userEvent.click(screen.getByRole('button', { name: 'Register 1 feature' }))
+    await userEvent.click(screen.getByRole('button', { name: 'Approve and register 1 feature' }))
     expect(registerFeature).not.toHaveBeenCalled()
-    expect(
-      screen.getByText('This feature will enter the catalog registry with its lineage.'),
-    ).toBeInTheDocument()
-    await userEvent.click(screen.getByRole('button', { name: 'Confirm registration' }))
+    expect(screen.getByText(
+      'Your approval writes these features into the registry with their lineage, under your '
+      + 'name.',
+    )).toBeInTheDocument()
+    await userEvent.click(screen.getByRole('button', { name: 'Confirm approval' }))
     expect(registerFeature).toHaveBeenCalledWith(IDEA_SPEC)
     expect(registerFeature).toHaveBeenCalledTimes(1)
     expect(await screen.findByText(/registered/i)).toBeInTheDocument()
@@ -227,8 +539,8 @@ describe('selection and registration', () => {
     featureFreshness.mockResolvedValue(FRESH)
     await renderAndGenerate([IDEA])
     await selectCandidate('avg_balance')
-    await userEvent.click(screen.getByRole('button', { name: 'Register 1 feature' }))
-    const confirm = screen.getByRole('button', { name: 'Confirm registration' })
+    await userEvent.click(screen.getByRole('button', { name: 'Approve and register 1 feature' }))
+    const confirm = screen.getByRole('button', { name: 'Confirm approval' })
     await userEvent.click(confirm)
     await userEvent.click(confirm)
     expect(registerFeature).toHaveBeenCalledTimes(1)
@@ -247,11 +559,12 @@ describe('selection and registration', () => {
     await selectCandidate('avg_balance')
     await selectCandidate('txn_count')
     expect(screen.getByText('2 selected')).toBeInTheDocument()
-    await userEvent.click(screen.getByRole('button', { name: 'Register 2 features' }))
-    expect(
-      screen.getByText('These 2 features will enter the catalog registry with their lineage.'),
-    ).toBeInTheDocument()
-    await userEvent.click(screen.getByRole('button', { name: 'Confirm registration' }))
+    await userEvent.click(screen.getByRole('button', { name: 'Approve and register 2 features' }))
+    expect(screen.getByText(
+      'Your approval writes these features into the registry with their lineage, under your '
+      + 'name.',
+    )).toBeInTheDocument()
+    await userEvent.click(screen.getByRole('button', { name: 'Confirm approval' }))
     expect(await screen.findByText('feat_02')).toBeInTheDocument()
     expect(screen.getByText('feat_01')).toBeInTheDocument()
     expect(registerFeature).toHaveBeenCalledTimes(2)
@@ -287,10 +600,12 @@ describe('selection and registration', () => {
   it('cancel backs out of the confirm step without registering', async () => {
     await renderAndGenerate([IDEA])
     await selectCandidate('avg_balance')
-    await userEvent.click(screen.getByRole('button', { name: 'Register 1 feature' }))
+    await userEvent.click(screen.getByRole('button', { name: 'Approve and register 1 feature' }))
     await userEvent.click(screen.getByRole('button', { name: 'Cancel' }))
     expect(registerFeature).not.toHaveBeenCalled()
-    expect(screen.getByRole('button', { name: 'Register 1 feature' })).toBeInTheDocument()
+    expect(
+      screen.getByRole('button', { name: 'Approve and register 1 feature' }),
+    ).toBeInTheDocument()
     expect(screen.getByRole('checkbox', { name: 'Select avg_balance' })).toBeChecked()
   })
 
@@ -302,7 +617,7 @@ describe('selection and registration', () => {
     await registerSelection(1)
     expect(await screen.findByText(/registered/i)).toBeInTheDocument()
     // Second round returns a candidate with the same LLM-chosen name: it was never registered.
-    await userEvent.click(screen.getByRole('button', { name: /generate candidates/i }))
+    await userEvent.click(screen.getByRole('button', { name: /generate candidate sets/i }))
     const checkbox = await screen.findByRole('checkbox', { name: 'Select avg_balance' })
     expect(checkbox).not.toBeChecked()
     expect(screen.queryByText(/registered/i)).not.toBeInTheDocument()
@@ -328,6 +643,30 @@ describe('selection and registration', () => {
     expect(screen.queryByText('fresh')).not.toBeInTheDocument()
     expect(screen.queryByText(/stale:/)).not.toBeInTheDocument()
     expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+  })
+})
+
+describe('approval vocabulary', () => {
+  it('opens the candidate section with the approval sentence', async () => {
+    await renderAndGenerate([IDEA])
+    expect(await screen.findByText(
+      'Nothing below enters the catalog without your approval.',
+    )).toBeInTheDocument()
+  })
+
+  it('keeps the approval sentence on a drafts-only list', async () => {
+    await renderAndDraft()
+    expect(
+      screen.getByText('Nothing below enters the catalog without your approval.'),
+    ).toBeInTheDocument()
+  })
+
+  it('offers no per-candidate action this build: every rendered control works', async () => {
+    // The per-candidate Give feedback action arrives wired in the next build; rendering it
+    // disabled would be a dead control, so it is omitted entirely.
+    await renderAndGenerate([IDEA])
+    expect(await screen.findByText('avg_balance')).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /give feedback/i })).not.toBeInTheDocument()
   })
 })
 
@@ -385,7 +724,22 @@ describe('scope changes', () => {
     expect(screen.getByText('2 selected')).toBeInTheDocument()
     await userEvent.type(screen.getByLabelText('Entity'), 'c')
     expect(screen.queryByText('2 selected')).not.toBeInTheDocument()
-    expect(screen.queryByRole('button', { name: 'Register 2 features' })).not.toBeInTheDocument()
+    expect(
+      screen.queryByRole('button', { name: 'Approve and register 2 features' }),
+    ).not.toBeInTheDocument()
+  })
+
+  it('editing the entity clears the sets row and the rejections panel too', async () => {
+    await renderAndGenerateSets(multiSetRound([
+      { name: 'days_to_churn', reason: 'derives from the target column', code: 'LEAKAGE' },
+    ]))
+    expect(await screen.findByText('Temporal set')).toBeInTheDocument()
+    expect(screen.getByText('1 rejected')).toBeInTheDocument()
+    await userEvent.type(screen.getByLabelText('Entity'), 'c')
+    expect(screen.queryByText('Temporal set')).not.toBeInTheDocument()
+    expect(screen.queryByText('1 rejected')).not.toBeInTheDocument()
+    expect(screen.queryByText(/engine's pick/i)).not.toBeInTheDocument()
+    expect(screen.getByRole('status')).toHaveTextContent(/scope changed/i)
   })
 })
 
@@ -546,8 +900,11 @@ describe('batch describe composer', () => {
     expect(featureRecipe).toHaveBeenNthCalledWith(2, 'days since last transaction', 'deposits')
     expect(featureRecipe).toHaveBeenNthCalledWith(3, 'active accounts per customer', 'deposits')
     expect(screen.getAllByText('Draft')).toHaveLength(3)
-    // Candidates append in line order.
-    const list = screen.getByRole('list').textContent ?? ''
+    // Candidates append in line order. The candidate list is the second list on the page
+    // (the gates strip is the first).
+    const list = screen.getAllByRole('list')
+      .map(el => el.textContent ?? '')
+      .find(text => text.includes('total_spend_per_customer')) ?? ''
     expect(list.indexOf('total_spend_per_customer'))
       .toBeLessThan(list.indexOf('days_since_last_transaction'))
     expect(list.indexOf('days_since_last_transaction'))
