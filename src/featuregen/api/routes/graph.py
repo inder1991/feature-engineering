@@ -20,7 +20,7 @@ def joins_for_column(
     conn: Annotated[psycopg.Connection, Depends(get_conn, scope="function")],
     identity: Annotated[IdentityEnvelope, Depends(get_identity)],
 ) -> list[JoinEdge]:
-    return column_joins(conn, source, object_ref)
+    return column_joins(conn, source, object_ref, roles=identity.role_claims)
 
 
 @router.get("/join-path")
@@ -33,4 +33,4 @@ def join_path(
 ) -> list[JoinStep] | None:
     """Steps oriented to the traversal direction (a reverse N:1 hop reads 1:N — M7).
     null = unreachable; [] = same table."""
-    return find_join_path(conn, source, from_table, to)
+    return find_join_path(conn, source, from_table, to, roles=identity.role_claims)

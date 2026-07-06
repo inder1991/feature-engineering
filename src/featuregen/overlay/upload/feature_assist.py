@@ -535,7 +535,7 @@ def feature_recipe(conn, nl_query: str, client: LLMClient, *, catalog_source: st
     # The LLM says WHAT to compute; the join PATH is found deterministically (real edges only).
     path: list[JoinStep] = []
     if grain and join_table and grain != join_table:
-        path = find_join_path(conn, catalog_source, grain, join_table) or []
+        path = find_join_path(conn, catalog_source, grain, join_table, roles=roles) or []
     return Recipe(intent=nl_query, grain_table=grain, derives_from=derives,
                   aggregation=out.get("aggregation"), as_of_column=out.get("as_of_column"),
                   join_path=path)

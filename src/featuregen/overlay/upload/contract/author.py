@@ -77,7 +77,7 @@ def _join_path(conn, grain_table: str | None, pairs: tuple[tuple[str, str], ...]
         catalog = next(iter(catalogs))
         for _, t in tables:
             if t != grain_table:
-                for s in (find_join_path(conn, catalog, grain_table, t) or []):
+                for s in (find_join_path(conn, catalog, grain_table, t, roles=roles) or []):
                     steps.append({"kind": "join", "from": s.from_ref, "to": s.to_ref,
                                   "cardinality": s.cardinality})
         return tuple(steps)

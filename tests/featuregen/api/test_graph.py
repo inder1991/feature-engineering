@@ -36,3 +36,17 @@ def test_join_path_unreachable_null_same_table_empty(client):
         headers=AUTH).json() is None
     assert client.get("/join-path", params={
         "source": "deposits", "from": "accounts", "to": "accounts"}, headers=AUTH).json() == []
+
+
+def test_column_joins_read_scopes_a_sensitive_target(client):
+    from tests.featuregen.api._helpers import PII_AUTH
+    csv_text = ("source,table,column,type,joins_to,cardinality,sensitivity\n"
+                "bank,orders,cust_ref,integer,customers.secret_id,N:1,\n"
+                "bank,customers,secret_id,integer,,,pii\n")
+    upload_csv(client, "bank", csv_text)
+    url = "/columns/public.orders.cust_ref/joins"
+    # data_owner (no pii_reader): the edge to the pii column is WITHHELD (can't walk the graph to it)
+    assert client.get(url, params={"source": "bank"}, headers=AUTH).json() == []
+    # pii_reader: the edge is visible
+    edges = client.get(url, params={"source": "bank"}, headers=PII_AUTH).json()
+    assert any(e["to_ref"] == "public.customers.secret_id" for e in edges)
