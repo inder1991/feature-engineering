@@ -248,6 +248,62 @@ export async function featureImpact(objectRef: string, source: string): Promise<
   return body.feature_ids
 }
 
+// One row of the registry inventory (GET /features).
+export interface FeatureListItem {
+  feature_id: string
+  name: string
+  grain_table: string | null
+  aggregation: string | null
+  as_of_column: string | null
+  verification: string
+  created_at: string
+}
+
+// One model/consumer registered against a feature.
+export interface FeatureConsumer {
+  model_ref: string
+  purpose: string
+  environment: string
+  registered_at: string
+}
+
+// The Feature 360 (GET /features/{id}): definition + verification + lineage + the HYPOTHESIS it was
+// born from + the models that consume it. `contract` and `hypothesis` are null for a feature that was
+// registered directly (not through the hypothesis-driven flow) — an honest absence, not an error.
+export interface FeatureDetail {
+  feature_id: string
+  name: string
+  description: string
+  grain_table: string | null
+  aggregation: string | null
+  as_of_column: string | null
+  verification: string
+  created_at: string
+  derives_from: { catalog_source: string; object_ref: string }[]
+  contract: {
+    contract_id: string
+    definition: string
+    version: number
+    verification: string
+    join_path: { from?: string; to?: string; kind?: string; cardinality?: string | null; via?: string }[]
+  } | null
+  hypothesis: {
+    hypothesis: string
+    definition: string
+    intake_mode: string
+    target_ref: string | null
+  } | null
+  consumers: FeatureConsumer[]
+}
+
+export function listFeatures(limit = 50): Promise<FeatureListItem[]> {
+  return request(`/features?limit=${limit}`)
+}
+
+export function featureDetail(featureId: string): Promise<FeatureDetail> {
+  return request(`/features/${encodeURIComponent(featureId)}`)
+}
+
 export function recommendFeatures(
   objective: string,
   catalogSource: string | null,

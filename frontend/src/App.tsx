@@ -3,6 +3,7 @@ import { useHashRoute } from './nav'
 import type { Route } from './nav'
 import { SessionBar } from './SessionBar'
 import { OverviewScreen } from './screens/OverviewScreen'
+import { RegistryScreen } from './screens/RegistryScreen'
 import { ReviewQueueScreen } from './screens/ReviewQueueScreen'
 import { SearchScreen } from './screens/SearchScreen'
 import { UploadScreen } from './screens/UploadScreen'
@@ -81,6 +82,15 @@ const ICONS: Record<Route, ReactElement> = {
       <path d="M8 5.5v5M5.5 8h5" />
     </NavIcon>
   ),
+  registry: (
+    // Four cells: the registered-feature inventory.
+    <NavIcon>
+      <rect x="2.75" y="2.75" width="4" height="4" rx="0.75" />
+      <rect x="9.25" y="2.75" width="4" height="4" rx="0.75" />
+      <rect x="2.75" y="9.25" width="4" height="4" rx="0.75" />
+      <rect x="9.25" y="9.25" width="4" height="4" rx="0.75" />
+    </NavIcon>
+  ),
 }
 
 const PAGES: { route: Route; label: string; eyebrow: string; title: string; description: string }[] = [
@@ -98,6 +108,13 @@ const PAGES: { route: Route; label: string; eyebrow: string; title: string; desc
     title: 'Feature generation',
     description:
       'State your goal, then take either path; both land in one candidate list you approve into the registry.',
+  },
+  {
+    route: 'registry',
+    label: 'Registry',
+    eyebrow: 'CATALOG · REGISTRY',
+    title: 'Feature registry',
+    description: 'Browse registered features — open one for its hypothesis, lineage, and consumers.',
   },
   {
     route: 'search',
@@ -168,6 +185,9 @@ export default function App() {
         {route === 'overview' && <OverviewScreen navigate={navigate} />}
         {route === 'upload' && <UploadScreen onReviewQueue={openReview} />}
         {route === 'search' && <SearchScreen />}
+        {route === 'registry' && (
+          <RegistryScreen featureId={params.get('id')} navigate={navigate} />
+        )}
         {route === 'review' && <ReviewQueueScreen initialSource={params.get('source') ?? ''} />}
         {route === 'workbench' && <WorkbenchScreen />}
       </main>
