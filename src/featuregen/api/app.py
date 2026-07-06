@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import logging
+import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
+import psycopg
 from fastapi import FastAPI
 
 from featuregen.aggregates.bootstrap import register_phase06_event_schemas
@@ -20,10 +23,41 @@ from featuregen.api.routes import (
     search,
     uploads,
 )
+from featuregen.config import get_settings
+from featuregen.db.migrations import apply_migrations, pending_migrations
 from featuregen.events.registry import event_registry
 from featuregen.intake.llm import LLMClient
 from featuregen.overlay.config import overlay_config_from_env, register_overlay_config
 from featuregen.overlay.facts import register_overlay_event_types
+
+logger = logging.getLogger(__name__)
+
+
+def _startup_migration_check() -> None:
+    """Guard against the long-lived-DB-drift footgun: a schema behind the code produces a confusing
+    runtime 500 (a missing column), not an obvious error. On startup, detect pending migrations against
+    the runtime DSN and EITHER auto-apply (FEATUREGEN_AUTO_MIGRATE=1, handy for dev/demo) or log a loud,
+    actionable warning. Read-only + fail-open: no DSN (e.g. tests override get_conn) or an unreachable DB
+    never blocks startup."""
+    dsn = get_settings().dsn
+    if not dsn:
+        return
+    try:
+        with psycopg.connect(dsn) as conn:
+            pending = pending_migrations(conn)
+            if not pending:
+                return
+            if os.environ.get("FEATUREGEN_AUTO_MIGRATE") == "1":
+                apply_migrations(conn)
+                logger.warning("auto-applied %d pending migration(s): %s",
+                               len(pending), ", ".join(pending))
+            else:
+                logger.warning(
+                    "DATABASE SCHEMA IS BEHIND THE CODE: %d migration(s) pending (%s). Run "
+                    "`python -m featuregen migrate` (or set FEATUREGEN_AUTO_MIGRATE=1) — endpoints "
+                    "touching the new schema will otherwise 500.", len(pending), ", ".join(pending[:8]))
+    except Exception:  # noqa: BLE001 — a startup DB check must never prevent the app from booting
+        logger.warning("could not check pending migrations at startup", exc_info=True)
 
 
 @asynccontextmanager
@@ -35,6 +69,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     register_phase06_event_schemas()
     register_overlay_event_types(event_registry())
     register_overlay_config(overlay_config_from_env())
+    _startup_migration_check()
     yield
 
 

@@ -266,6 +266,19 @@ def _sql_file_migrations() -> list[tuple[str, str]]:
     ]
 
 
+def pending_migrations(conn: DbConn) -> list[str]:
+    """Names of migrations not yet applied to this DB (empty = up to date). READ-ONLY — safe to call at
+    startup to detect a drifted long-lived database before it causes a confusing runtime error."""
+    all_names = [name for name, _ in [*MIGRATIONS, *_sql_file_migrations()]]
+    with conn.cursor() as cur:
+        cur.execute("SELECT to_regclass('schema_migrations')")   # NULL if the ledger doesn't exist yet
+        if cur.fetchone()[0] is None:
+            return all_names                                     # fresh DB — everything is pending
+        cur.execute("SELECT name FROM schema_migrations")
+        applied = {r[0] for r in cur.fetchall()}
+    return [n for n in all_names if n not in applied]
+
+
 def apply_migrations(conn: DbConn) -> None:
     """Apply all migrations once, ledgered (idempotent): core Python DDL then file-based 05xx_ SQL.
 
