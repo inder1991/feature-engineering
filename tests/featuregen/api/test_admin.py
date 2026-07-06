@@ -90,3 +90,30 @@ def test_bad_ids_return_404(make_client, conn):
     assert client.post("/admin/groups/nope/roles", json={"role": "admin"},
                        headers=hdr).status_code == 404
     assert client.delete("/admin/users/nope", headers=hdr).status_code == 404
+
+
+def _admins_gid(client, hdr):
+    return next(g["group_id"] for g in client.get("/admin/groups", headers=hdr).json()
+               if g["name"] == "admins")
+
+
+# One op per test: each gets a fresh rolled-back conn where root is the SOLE admin. (In prod the request
+# tx rolls the refused mutation back; a shared test conn doesn't, so all three can't share one test.)
+def test_cannot_remove_the_last_admin_from_its_group(make_client, conn):
+    client = make_client()
+    hdr = _admin(client)
+    assert client.delete(f"/admin/groups/{_admins_gid(client, hdr)}/members/{_root_id(client, hdr)}",
+                         headers=hdr).status_code == 409
+
+
+def test_cannot_revoke_the_last_admin_role(make_client, conn):
+    client = make_client()
+    hdr = _admin(client)
+    assert client.delete(f"/admin/groups/{_admins_gid(client, hdr)}/roles/admin",
+                         headers=hdr).status_code == 409
+
+
+def test_cannot_delete_the_last_admin_group(make_client, conn):
+    client = make_client()
+    hdr = _admin(client)
+    assert client.delete(f"/admin/groups/{_admins_gid(client, hdr)}", headers=hdr).status_code == 409

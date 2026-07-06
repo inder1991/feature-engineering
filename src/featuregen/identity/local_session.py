@@ -192,6 +192,17 @@ def user_count(conn: DbConn) -> int:
     return conn.execute("SELECT count(*) FROM app_user").fetchone()[0]
 
 
+def enabled_admin_count(conn: DbConn, *, admin_role: str = "admin") -> int:
+    """How many ENABLED users currently hold the admin role (via any group). Used as a post-mutation
+    guard on group ops (delete group / revoke role / remove member): if a change drops this to 0, the
+    route raises and the request transaction rolls the change back — no path can lock out all admins."""
+    return conn.execute(
+        "SELECT count(DISTINCT ug.user_id) FROM app_user_group ug "
+        "JOIN app_group_role gr ON gr.group_id = ug.group_id "
+        "JOIN app_user u ON u.user_id = ug.user_id "
+        "WHERE gr.role = %s AND u.disabled = false", (admin_role,)).fetchone()[0]
+
+
 def is_last_admin(conn: DbConn, user_id: str, *, admin_role: str = "admin") -> bool:
     """True if removing/disabling this user would leave ZERO enabled admins (would lock out admin)."""
     other = conn.execute(

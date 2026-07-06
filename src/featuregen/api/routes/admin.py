@@ -17,6 +17,7 @@ from featuregen.identity.local_session import (
     create_user,
     delete_group,
     delete_user,
+    enabled_admin_count,
     grant_role,
     is_last_admin,
     list_groups,
@@ -146,6 +147,8 @@ def post_group(body: GroupIn, conn: _Conn, admin: _Admin) -> dict:
 def remove_group(group_id: str, conn: _Conn, admin: _Admin) -> dict:
     if not delete_group(conn, group_id):
         raise HTTPException(status_code=404, detail="no such group")
+    if enabled_admin_count(conn) == 0:   # raise -> request tx rolls the delete back
+        raise HTTPException(status_code=409, detail="that group holds the last admin; cannot delete it")
     return {"deleted": True}
 
 
@@ -159,6 +162,8 @@ def add_role(group_id: str, body: RoleIn, conn: _Conn, admin: _Admin) -> dict:
 @router.delete("/admin/groups/{group_id}/roles/{role}")
 def remove_role(group_id: str, role: str, conn: _Conn, admin: _Admin) -> dict:
     revoke_role(conn, group_id, role)
+    if enabled_admin_count(conn) == 0:   # revoking 'admin' from the last admin-granting group -> rollback
+        raise HTTPException(status_code=409, detail="that would revoke the last admin role")
     return {"ok": True}
 
 
@@ -172,4 +177,6 @@ def add_member(group_id: str, body: MemberIn, conn: _Conn, admin: _Admin) -> dic
 @router.delete("/admin/groups/{group_id}/members/{user_id}")
 def remove_member(group_id: str, user_id: str, conn: _Conn, admin: _Admin) -> dict:
     remove_user_from_group(conn, user_id, group_id)
+    if enabled_admin_count(conn) == 0:   # removing the last admin from the admin group -> rollback
+        raise HTTPException(status_code=409, detail="that would remove the last admin")
     return {"ok": True}
