@@ -7,11 +7,13 @@ break when a column drifts). The LLM-assist (recommendation, NL->recipe, leakage
 """
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
 from featuregen.aggregates.ids import mint_id
 from featuregen.overlay.catalog_changes import drift_watermark
+from featuregen.overlay.upload.read_scope import allowed_sensitivities
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,16 +82,20 @@ def list_features(conn, *, limit: int = 50) -> list[dict]:
              "as_of_column": r[4], "verification": r[5], "created_at": r[6].isoformat()} for r in rows]
 
 
-def get_feature(conn, feature_id: str) -> dict | None:
-    """One registered feature + the source columns it derives from."""
+def get_feature(conn, feature_id: str, *, roles: Iterable[str] = ()) -> dict | None:
+    """One registered feature + the source columns it derives from. Lineage is READ-SCOPED: a derives
+    column whose sensitivity the caller's roles can't see is withheld (same control /search enforces),
+    so the registry can't be used to enumerate where restricted/PII columns live."""
     row = conn.execute(
         "SELECT feature_id, name, description, grain_table, aggregation, as_of_column, verification, "
         "created_at FROM feature WHERE feature_id = %s", (feature_id,)).fetchone()
     if row is None:
         return None
     derives = conn.execute(
-        "SELECT catalog_source, object_ref FROM feature_derives_from WHERE feature_id = %s "
-        "ORDER BY object_ref", (feature_id,)).fetchall()
+        "SELECT d.catalog_source, d.object_ref FROM feature_derives_from d "
+        "LEFT JOIN graph_node n ON n.catalog_source = d.catalog_source AND n.object_ref = d.object_ref "
+        "WHERE d.feature_id = %s AND (n.sensitivity IS NULL OR n.sensitivity = ANY(%s)) "
+        "ORDER BY d.object_ref", (feature_id, allowed_sensitivities(roles))).fetchall()
     return {"feature_id": row[0], "name": row[1], "description": row[2], "grain_table": row[3],
             "aggregation": row[4], "as_of_column": row[5], "verification": row[6],
             "created_at": row[7].isoformat(),

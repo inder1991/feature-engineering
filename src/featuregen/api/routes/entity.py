@@ -60,5 +60,6 @@ def apply(body: ResolveIn, conn: _Conn, identity: _Identity) -> dict:
 
 @router.post("/entity/dismiss")
 def dismiss(body: ResolveIn, conn: _Conn, identity: _Identity) -> dict:
-    dismiss_entity_suggestion(conn, body.catalog_source, body.object_ref)
+    if not dismiss_entity_suggestion(conn, body.catalog_source, body.object_ref):
+        raise HTTPException(status_code=404, detail="no pending suggestion for that column")
     return {"dismissed": True}

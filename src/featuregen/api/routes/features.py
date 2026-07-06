@@ -58,7 +58,10 @@ def create_feature(
         name=body.name, description=body.description, grain_table=body.grain_table,
         aggregation=body.aggregation, as_of_column=body.as_of_column,
         derives_from=tuple((d.catalog_source, d.object_ref) for d in body.derives_from))
-    return {"feature_id": register_feature(conn, spec)}
+    try:
+        return {"feature_id": register_feature(conn, spec)}
+    except psycopg.errors.UniqueViolation as exc:   # feature.name is unique (0970)
+        raise HTTPException(status_code=409, detail=f"a feature named {body.name!r} already exists") from exc
 
 
 @router.get("/features/{feature_id}/freshness")
@@ -92,7 +95,7 @@ def list_registered_features(conn: _Conn, identity: _Identity, limit: int = 50) 
 @router.get("/features/{feature_id}")
 def get_registered_feature(feature_id: str, conn: _Conn, identity: _Identity) -> dict:
     """Feature 360: definition + verification + lineage + the HYPOTHESIS it was born from + consumers."""
-    feat = feature_detail(conn, feature_id)
+    feat = feature_detail(conn, feature_id, roles=identity.role_claims)
     if feat is None:
         raise HTTPException(status_code=404, detail=f"unknown feature {feature_id!r}")
     return feat
