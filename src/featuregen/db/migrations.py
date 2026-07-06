@@ -11,6 +11,7 @@ from featuregen.state_machine.ddl import STATE_MACHINE_DDL
 # lexical order AFTER the core Python DDL above. Their 05xx_ prefix sorts them after the
 # core tables (events, documents, runtime, ...) they reference.
 _SQL_MIGRATIONS_DIR = Path(__file__).resolve().parent / "migrations"
+_MIGRATION_LOCK_KEY = 6157423001  # arbitrary fixed key for pg_advisory_xact_lock (deploy serialization)
 
 GLOBAL_SEQ = """
 CREATE SEQUENCE IF NOT EXISTS global_seq_seq AS bigint
@@ -299,6 +300,11 @@ def apply_migrations(conn: DbConn) -> None:
     All of it happens inside one committing transaction (as before).
     """
     with conn.cursor() as cur:
+        # Serialize concurrent deploys: a transaction-scoped advisory lock (auto-released on
+        # commit/rollback) so two processes can't both apply migrations at once — otherwise both read
+        # "not applied", both run the DDL, and a destructive migration could execute twice. The key is
+        # an arbitrary fixed constant unique to this app's migration runner.
+        cur.execute("SELECT pg_advisory_xact_lock(%s)", (_MIGRATION_LOCK_KEY,))
         cur.execute(SCHEMA_MIGRATIONS)
         for name, sql in [*MIGRATIONS, *_sql_file_migrations()]:
             checksum = hashlib.sha256(sql.encode()).hexdigest()
