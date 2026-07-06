@@ -75,44 +75,50 @@ const ICONS: Record<Route, ReactElement> = {
     </NavIcon>
   ),
   workbench: (
+    // Plus-in-circle: generation adds features to the catalog. Echoes the logomark's plus.
     <NavIcon>
-      <path d="M2.75 4.75h6M11.75 4.75h1.5M2.75 11.25h1.5M7.25 11.25h6" />
-      <circle cx="10.25" cy="4.75" r="1.5" />
-      <circle cx="5.75" cy="11.25" r="1.5" />
+      <circle cx="8" cy="8" r="6.25" />
+      <path d="M8 5.5v5M5.5 8h5" />
     </NavIcon>
   ),
 }
 
-const PAGES: { route: Route; label: string; title: string; description: string }[] = [
+const PAGES: { route: Route; label: string; eyebrow: string; title: string; description: string }[] = [
   {
     route: 'overview',
     label: 'Overview',
+    eyebrow: 'FEATUREGEN · START',
     title: 'Overview',
     description: 'What this platform is and where to start',
   },
   {
-    route: 'upload',
-    label: 'Upload',
-    title: 'Upload',
-    description: 'Bring a schema and facts file into the catalog',
+    route: 'workbench',
+    label: 'Generate features',
+    eyebrow: 'CATALOG · GENERATE',
+    title: 'Feature generation',
+    description:
+      'State your goal, then take either path; both land in one candidate list you approve into the registry.',
   },
   {
     route: 'search',
     label: 'Search',
+    eyebrow: 'CATALOG · SEARCH',
     title: 'Search',
     description: 'Find columns you can trust',
   },
   {
-    route: 'review',
-    label: 'Review queue',
-    title: 'Review queue',
-    description: 'Rows the catalog refused to trust',
+    route: 'upload',
+    label: 'Upload',
+    eyebrow: 'CATALOG · UPLOAD',
+    title: 'Upload',
+    description: 'Bring a schema and facts file into the catalog',
   },
   {
-    route: 'workbench',
-    label: 'Workbench',
-    title: 'Workbench',
-    description: 'Assemble features with checked suggestions',
+    route: 'review',
+    label: 'Review queue',
+    eyebrow: 'CATALOG · REVIEW QUEUE',
+    title: 'Review queue',
+    description: 'Rows the catalog refused to trust',
   },
 ]
 
@@ -155,9 +161,7 @@ export default function App() {
       </aside>
       <main>
         <header className="page-head">
-          <p className="page-head-eyebrow">
-            {route === 'overview' ? 'FEATUREGEN · START' : `CATALOG · ${page.label.toUpperCase()}`}
-          </p>
+          <p className="page-head-eyebrow">{page.eyebrow}</p>
           <h1>{page.title}</h1>
           <p>{page.description}</p>
         </header>

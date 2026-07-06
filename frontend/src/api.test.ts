@@ -1,5 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { ApiError, searchCatalog, uploadFile } from './api'
+import {
+  ApiError, type FeatureIdea, recommendFeatures, recommendFeatureSets, refineCandidate,
+  searchCatalog, uploadFile,
+} from './api'
 import { setSession } from './session'
 
 const fetchMock = vi.fn()
@@ -96,5 +99,148 @@ describe('api client', () => {
     expect(init.body).toBeInstanceOf(FormData)
     expect(init.body.get('source')).toBe('deposits')
     expect(init.headers['Content-Type']).toBeUndefined()
+  })
+})
+
+// The FeatureIdea shape exactly as the backend serializes it in every assist response.
+const IDEA: FeatureIdea = {
+  name: 'avg_balance_30d', description: '30 day average balance',
+  derives_from: ['public.accounts.balance'], aggregation: 'avg_30d', grain_table: 'customers',
+  derives_pairs: [['deposits', 'public.accounts.balance']],
+  verification: 'DESIGN-CHECKED', critic_note: '',
+  rationale: 'a shorter window reacts faster',
+}
+
+const CAVEAT =
+  'advisory only: a fit/coverage judgment over the metadata, not a performance prediction; '
+  + 'confirm the winner with a backtest once features are computed'
+
+describe('feature assist client', () => {
+  it('recommendFeatures posts the full round body and returns proposals with rejections', async () => {
+    const rejections = [{ name: 'avg_balance', reason: 'leaks target', code: 'LEAKAGE' }]
+    fetchMock.mockImplementation(ok({ proposals: [IDEA], rejections }))
+    const result = await recommendFeatures(
+      'predict customer churn in the next 90 days', 'deposits', 'public.labels.churned',
+      'customer', 'more behavioral signals, fewer balance aggregates')
+    expect(result).toEqual({ proposals: [IDEA], rejections })
+    const [url, init] = fetchMock.mock.calls[0]
+    expect(url).toBe('/features/recommend')
+    expect(init.method).toBe('POST')
+    expect(JSON.parse(init.body)).toEqual({
+      objective: 'predict customer churn in the next 90 days',
+      catalog_source: 'deposits',
+      target_ref: 'public.labels.churned',
+      entity: 'customer',
+      feedback: 'more behavioral signals, fewer balance aggregates',
+    })
+  })
+
+  it('recommendFeatures sends null for every optional field left out', async () => {
+    fetchMock.mockImplementation(ok({ proposals: [], rejections: [] }))
+    await recommendFeatures('predict churn', null)
+    const [, init] = fetchMock.mock.calls[0]
+    expect(JSON.parse(init.body)).toEqual({
+      objective: 'predict churn', catalog_source: null, target_ref: null,
+      entity: null, feedback: null,
+    })
+  })
+
+  it('recommendFeatureSets posts the same body to the sets endpoint and returns sets, recommendation, and rejections', async () => {
+    const payload = {
+      sets: [
+        { lens: 'temporal', features: [IDEA] },
+        { lens: 'unary', features: [] },
+      ],
+      recommendation: {
+        recommended_lens: 'temporal',
+        reasoning: 'recency signals move earliest for a churn horizon',
+        caveat: CAVEAT,
+      },
+      rejections: [
+        { name: 'days_to_churn', reason: 'derives from the target column', code: 'LEAKAGE' },
+      ],
+    }
+    fetchMock.mockImplementation(ok(payload))
+    const result = await recommendFeatureSets(
+      'predict customer churn in the next 90 days', 'deposits', 'public.labels.churned',
+      'customer')
+    expect(result).toEqual(payload)
+    const [url, init] = fetchMock.mock.calls[0]
+    expect(url).toBe('/features/recommend-sets')
+    expect(init.method).toBe('POST')
+    expect(JSON.parse(init.body)).toEqual({
+      objective: 'predict customer churn in the next 90 days',
+      catalog_source: 'deposits',
+      target_ref: 'public.labels.churned',
+      entity: 'customer',
+      feedback: null,
+    })
+  })
+
+  it('recommendFeatureSets passes a null recommendation through untouched', async () => {
+    // The backend sends null when every set came back empty: no recommendation over nothing.
+    fetchMock.mockImplementation(ok({
+      sets: [{ lens: 'unary', features: [] }], recommendation: null, rejections: [] }))
+    const result = await recommendFeatureSets('predict churn', null)
+    expect(result.recommendation).toBeNull()
+    expect(result.sets).toEqual([{ lens: 'unary', features: [] }])
+  })
+
+  it('refineCandidate fills the candidate defaults on the wire and returns the revised idea', async () => {
+    fetchMock.mockImplementation(ok({ revised: IDEA }))
+    const result = await refineCandidate(
+      { name: 'avg_balance_90d' }, 'use a 30 day window', 'deposits')
+    expect('revised' in result && result.revised).toEqual(IDEA)
+    const [url, init] = fetchMock.mock.calls[0]
+    expect(url).toBe('/features/refine')
+    expect(JSON.parse(init.body)).toEqual({
+      candidate: {
+        name: 'avg_balance_90d', description: '', derives_from: [],
+        aggregation: null, grain_table: null,
+      },
+      instruction: 'use a 30 day window',
+      catalog_source: 'deposits', entity: null, target_ref: null, objective: null,
+    })
+  })
+
+  it('refineCandidate carries the round objective when given', async () => {
+    fetchMock.mockImplementation(ok({ revised: IDEA }))
+    await refineCandidate(
+      { name: 'avg_balance_90d' }, 'use a 30 day window', 'deposits', null, null,
+      'predict churn')
+    const [, init] = fetchMock.mock.calls[0]
+    expect(JSON.parse(init.body).objective).toBe('predict churn')
+  })
+
+  it('refineCandidate sends the full candidate fields when the UI holds them', async () => {
+    fetchMock.mockImplementation(ok({ revised: IDEA }))
+    await refineCandidate({
+      name: 'avg_balance_90d', description: '90 day average balance',
+      derives_from: ['public.accounts.balance'], aggregation: 'avg_90d',
+      grain_table: 'customers',
+    }, 'use a 30 day window')
+    const [, init] = fetchMock.mock.calls[0]
+    expect(JSON.parse(init.body).candidate).toEqual({
+      name: 'avg_balance_90d', description: '90 day average balance',
+      derives_from: ['public.accounts.balance'], aggregation: 'avg_90d',
+      grain_table: 'customers',
+    })
+  })
+
+  it('refineCandidate surfaces a gauntlet rejection as 200 data, not an error', async () => {
+    fetchMock.mockImplementation(ok({
+      rejected: { reason: 'no revision was produced', code: 'NO_REVISION' } }))
+    const result = await refineCandidate({ name: 'avg_balance_90d' }, 'use a 30 day window')
+    expect('rejected' in result && result.rejected).toEqual({
+      reason: 'no revision was produced', code: 'NO_REVISION' })
+  })
+
+  it('maps the unconfigured-provider 503 to ApiError with the backend detail', async () => {
+    const detail = 'no LLM provider is configured on this deployment '
+      + '(set FEATUREGEN_LLM_PROVIDER=anthropic to enable feature-assist)'
+    fetchMock.mockImplementation(async () =>
+      new Response(JSON.stringify({ detail }), { status: 503 }))
+    await expect(recommendFeatureSets('predict churn', null)).rejects.toMatchObject({
+      status: 503, detail })
   })
 })

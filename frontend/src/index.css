@@ -1094,3 +1094,491 @@ section > h2:first-child {
   background: color-mix(in oklch, var(--accent) 16%, var(--surface));
   border-color: transparent;
 }
+
+/* ---------------------------------------------------------------- path cards (workbench hero)
+   Two equal peer entries below the goal + scope row: Generate candidates (the engine) and Write
+   definitions myself (the composer toggle). Both are real <button>s, so this section overrides
+   the global button chrome (32px height, horizontal padding, centering) to build a tall,
+   left-aligned card. Existing tokens only; appended additively, nothing above is modified.
+   Specificity note: .path (0,1,0) outranks the base `button:where(...)` rule (0,0,1); the
+   variant hovers (.path-*:hover, 0,2,0) outrank the base hover (0,1,1). */
+
+.paths {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 14px;
+  margin-top: 4px;
+}
+
+.path {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  justify-content: flex-start;
+  gap: 6px;
+  min-height: 104px;
+  height: auto;
+  padding: 16px;
+  border-radius: var(--radius-panel);
+  text-align: left;
+}
+
+/* micro-label: mono 10px caps, quieter than the body of the card */
+.path .k {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  opacity: 0.75;
+}
+
+.path .t {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.path .t svg {
+  flex: none;
+}
+
+.path .d {
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+/* Path 1: the committed primary. Accent fill + chip-ink text (mirrors .btn--primary). */
+.path-generate {
+  background: var(--accent);
+  border: 1px solid var(--accent);
+  color: var(--chip-ink);
+}
+
+.path-generate .d {
+  /* dimmed against the accent fill, still high-contrast light-on-petrol */
+  color: oklch(0.9 0.02 208);
+}
+
+.path-generate:hover {
+  background: var(--accent-hover);
+  border-color: var(--accent-hover);
+}
+
+/* Path 2: the quiet peer. Surface + hairline; accent border on hover; accent-soft fill when the
+   composer is open (aria-pressed=true carries the state, never color alone). */
+.path-describe {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  color: var(--ink);
+}
+
+.path-describe:hover {
+  background: var(--surface);
+  border-color: var(--accent);
+}
+
+.path-describe[aria-pressed='true'] {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+}
+
+@media (max-width: 900px) {
+  .paths {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* self-contained transition, gated on motion preference (DESIGN.md). The global reduce rule
+   already neutralizes the base button transition; this keeps the .path section explicit. */
+@media (prefers-reduced-motion: no-preference) {
+  .path {
+    transition: background-color var(--dur-fast) var(--ease-out-quart),
+      border-color var(--dur-fast) var(--ease-out-quart);
+  }
+}
+
+/* ---------------------------------------------------------------- workbench HITL (appended)
+   Gates strip (who holds each step of the loop), set summary cards (compare strategy lenses,
+   mix a la carte), and the gauntlet rejections panel. Existing tokens only; composes the .badge
+   / .btn / .rows vocabulary. Nothing above this line is modified. */
+
+/* four gates in one panel-shaped strip; state carried by data-state + a check glyph + hidden
+   text, never color alone */
+.gates {
+  display: flex;
+  align-items: stretch;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-panel);
+  box-shadow: var(--shadow);
+  margin-block: 16px 24px;
+  overflow: hidden;
+}
+
+.gate {
+  flex: 1;
+  padding: 12px 16px;
+  border-left: 1px solid var(--line);
+}
+
+.gate:first-child {
+  border-left: 0;
+}
+
+/* actor chip: YOU in accent, ENGINE quiet — the human/machine split is the point of the strip */
+.gate-who {
+  display: inline-block;
+  padding: 2px 7px;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  margin-bottom: 5px;
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  font-weight: 600;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.gate-who.you {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.gate-who.engine {
+  background: var(--surface-2);
+  border-color: var(--line);
+  color: var(--ink-faint);
+}
+
+.gate-title {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.gate-sub {
+  margin-top: 2px;
+  font-size: 12px;
+  color: var(--ink-faint);
+}
+
+.gate-check {
+  color: var(--ok);
+  font-weight: 700;
+}
+
+.gate[data-state='active'] {
+  background: var(--accent-soft);
+}
+
+.gate[data-state='todo'] {
+  opacity: 0.62;
+}
+
+/* rejections panel: inset surface; the count chip stays soft, only per-code chips go solid
+   (.badge.rejected), per DESIGN.md's strong-states rule */
+.rej-panel {
+  border: 1px solid var(--line);
+  background: var(--surface-2);
+  border-radius: var(--radius-panel);
+  padding: 10px 14px;
+  margin-block: 12px;
+  font-size: 13px;
+}
+
+.rej-line {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.badge.rej-count {
+  background: var(--danger-soft);
+  border-color: transparent;
+  color: var(--danger);
+}
+
+/* ghost toggle, quiet until hovered (mirrors .q-ghost) */
+.rej-toggle {
+  margin-left: auto;
+  border-color: transparent;
+  background: transparent;
+  color: var(--ink-soft);
+}
+
+.rej-toggle:hover {
+  border-color: var(--line);
+  background: var(--surface);
+  color: var(--ink);
+}
+
+.rej-list {
+  margin: 10px 0 2px;
+  padding: 0;
+  list-style: none;
+}
+
+.rej-list li {
+  display: flex;
+  gap: 10px;
+  align-items: baseline;
+  padding: 6px 0;
+  border-top: 1px solid var(--line);
+}
+
+.rej-why {
+  color: var(--ink-soft);
+  font-size: 12.5px;
+}
+
+/* set summary cards, side by side; the active card carries an accent border + wash and its
+   inner view button holds aria-pressed (state never color alone) */
+.sets {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 12px;
+  margin-block: 12px 10px;
+}
+
+.set-card {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-panel);
+  box-shadow: var(--shadow);
+  padding: 14px;
+}
+
+.set-card:hover {
+  border-color: var(--accent);
+}
+
+.set-card[data-active='true'] {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+/* the card body is a real button (switches the detail list); strip the global button chrome */
+.set-card-view {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 6px;
+  height: auto;
+  padding: 0;
+  border: 1px solid transparent;
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+}
+
+.set-card-view:hover {
+  background: transparent;
+  border-color: transparent;
+}
+
+.set-lens {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+}
+
+/* the advisory pick's chip: solid ok fill (a strong state), label text carries the meaning */
+.badge.recommended {
+  background: var(--ok-solid);
+  border-color: transparent;
+  color: var(--chip-ink);
+}
+
+.set-name {
+  font-size: 14.5px;
+  font-weight: 600;
+  color: var(--ink);
+}
+
+.set-thesis {
+  font-size: 12.5px;
+  line-height: 1.45;
+  color: var(--ink-soft);
+}
+
+.set-meta {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--ink-faint);
+}
+
+.set-take {
+  align-self: flex-start;
+  margin-top: 4px;
+}
+
+/* advisory panel under the cards: engine's pick plus the backend's honest caveat, verbatim */
+.advice {
+  display: grid;
+  gap: 4px;
+  border: 1px solid var(--line);
+  background: var(--surface-2);
+  border-radius: var(--radius-panel);
+  padding: 10px 14px;
+  margin-block: 0 14px;
+  font-size: 13px;
+  color: var(--ink-soft);
+}
+
+.advice strong {
+  color: var(--ink);
+}
+
+.advice-caveat {
+  color: var(--ink-faint);
+}
+
+@media (max-width: 900px) {
+  .gates {
+    flex-direction: column;
+  }
+
+  .gate {
+    border-left: 0;
+    border-top: 1px solid var(--line);
+  }
+
+  .gate:first-child {
+    border-top: 0;
+  }
+}
+
+/* ---------------------------------------------------------------- workbench feedback (appended)
+   Phase 3: the whole-round feedback panel (regenerate under guidance, pins kept) and the
+   per-candidate refine box with its recorded revision diff. Existing tokens only; composes the
+   .badge / .btn / .field vocabulary. Nothing above this line is modified. */
+
+/* whole-round feedback panel: its own surface under the candidate list */
+.setfb {
+  margin-top: 14px;
+  border: 1px solid var(--line);
+  background: var(--surface);
+  border-radius: var(--radius-panel);
+  box-shadow: var(--shadow);
+  padding: 14px 16px;
+}
+
+.setfb-row {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.setfb-row input {
+  flex: 1 1 260px;
+}
+
+/* recorded strips: quiet log lines, one per consumed round */
+.setfb-records {
+  display: grid;
+  gap: 4px;
+  margin-bottom: 10px;
+}
+
+.setfb-record {
+  font-size: 12.5px;
+  color: var(--ink-soft);
+}
+
+/* per-candidate refine box: accent wash marks the human-input zone inside the row */
+.refine-box {
+  display: grid;
+  gap: 10px;
+  justify-items: start;
+  border: 1px solid var(--line);
+  background: var(--accent-soft);
+  border-radius: var(--radius);
+  padding: 12px 14px;
+}
+
+.refine-box input {
+  background: var(--surface);
+}
+
+/* the recorded revision: inset surface holding the diff and the approve/revert decision */
+.revision {
+  border: 1px solid var(--line);
+  background: var(--surface-2);
+  border-radius: var(--radius);
+  padding: 12px 14px;
+}
+
+.rev-meta {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
+}
+
+.rev-who {
+  font-size: 12px;
+  color: var(--ink-faint);
+}
+
+/* revised/revision chip: proposal-soft (the engine proposed it; the human decides) */
+.badge.revised {
+  background: var(--proposal-soft);
+  border-color: transparent;
+  color: var(--proposal);
+}
+
+/* field-level diff: del struck through (non-color cue), ins after the arrow; both on the
+   contrast-vetted soft washes already used by the rejected/ok badges */
+.diff {
+  display: grid;
+  gap: 4px;
+  font-size: 13px;
+}
+
+.diff-label {
+  color: var(--ink-faint);
+}
+
+.diff del {
+  color: var(--danger);
+  background: var(--danger-soft);
+  text-decoration: line-through;
+  border-radius: 3px;
+  padding: 0 3px;
+}
+
+.diff ins {
+  color: var(--ok);
+  background: var(--ok-soft);
+  text-decoration: none;
+  border-radius: 3px;
+  padding: 0 3px;
+}
+
+.diff-unchanged {
+  color: var(--ink-faint);
+}
+
+.recheck {
+  margin-top: 8px;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--ok);
+}

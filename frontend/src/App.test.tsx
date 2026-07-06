@@ -38,23 +38,32 @@ function arriveAt(hash: string) {
 }
 
 describe('app shell', () => {
-  it('renders five nav items and lands on Overview by default', () => {
+  it('renders five nav items in order and lands on Overview by default', () => {
     render(<App />)
     const nav = within(screen.getByRole('navigation'))
-    for (const t of ['Overview', 'Upload', 'Search', 'Review queue', 'Workbench']) {
-      expect(nav.getByRole('button', { name: t })).toBeInTheDocument()
-    }
+    expect(nav.getAllByRole('button').map(b => b.textContent)).toEqual([
+      'Overview',
+      'Generate features',
+      'Search',
+      'Upload',
+      'Review queue',
+    ])
     expect(screen.getByRole('heading', { level: 1, name: 'Overview' })).toBeInTheDocument()
     expect(screen.getByRole('heading', { name: 'The loop' })).toBeInTheDocument()
+    expect(
+      screen.getByText(/once data is in, generate features is where the engine works for you/i),
+    ).toBeInTheDocument()
   })
 
   it('nav click navigates and updates location.hash', async () => {
     render(<App />)
     const nav = within(screen.getByRole('navigation'))
-    await userEvent.click(nav.getByRole('button', { name: 'Workbench' }))
+    await userEvent.click(nav.getByRole('button', { name: 'Generate features' }))
     expect(window.location.hash).toBe('#/workbench')
-    expect(screen.getByRole('heading', { level: 1, name: 'Workbench' })).toBeInTheDocument()
-    expect(screen.getByRole('heading', { name: /feature workbench/i })).toBeInTheDocument()
+    expect(
+      screen.getByRole('heading', { level: 1, name: /feature generation/i }),
+    ).toBeInTheDocument()
+    expect(screen.getByText('CATALOG · GENERATE')).toBeInTheDocument()
   })
 
   it('deep-links a screen from the hash', () => {
@@ -76,6 +85,15 @@ describe('app shell', () => {
     await userEvent.click(screen.getByRole('link', { name: 'Review queue' }))
     expect(window.location.hash).toBe('#/review')
     expect(screen.getByRole('heading', { level: 1, name: 'Review queue' })).toBeInTheDocument()
+  })
+
+  it('overview loop Generate features link navigates to the workbench route', async () => {
+    render(<App />)
+    await userEvent.click(screen.getByRole('link', { name: 'Generate features' }))
+    expect(window.location.hash).toBe('#/workbench')
+    expect(
+      screen.getByRole('heading', { level: 1, name: /feature generation/i }),
+    ).toBeInTheDocument()
   })
 
   it('session chips edit the stub session store', async () => {
