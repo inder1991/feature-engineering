@@ -1,5 +1,11 @@
 import { type FormEvent, useEffect, useRef, useState } from 'react'
-import { ApiError, type QuarantineItem, listQuarantine } from '../api'
+import {
+  ApiError,
+  type QuarantineItem,
+  dismissQuarantineRow,
+  listQuarantine,
+  resolveQuarantineRow,
+} from '../api'
 
 // --- Reason parsing -------------------------------------------------------------------------
 // Mirrors the exact backend quarantine messages from
@@ -92,12 +98,11 @@ interface Rule {
   rowIndexes: number[]
 }
 
-const REVALIDATED_NOTE =
-  'Revalidated locally. Not persisted: fix the source file and re-upload to clear it for real.'
-const DISMISSED_NOTE = 'Dismissed locally. Retained in the queue on the server.'
+const REVALIDATED_NOTE = 'Fixed and added to the catalog. Holds until the source is re-uploaded.'
+const DISMISSED_NOTE = 'Dismissed from the queue. Holds until the source is re-uploaded.'
 const HONESTY_NOTE =
-  'Inline fixes are a preview. Nothing is persisted yet; the durable fix is still correcting ' +
-  'the file and re-uploading. Persistence endpoints are a tracked follow-up.'
+  'Fixes are validated on the server and persist: a fixed row enters the catalog and a dismissed ' +
+  'row leaves the queue. The file stays the source of truth, so both hold until the next re-upload.'
 
 function InfoGlyph() {
   return (
@@ -133,8 +138,9 @@ export function ReviewQueueScreen({ initialSource }: { initialSource: string }) 
   // without an explicit move, keyboard focus falls back to <body>.
   const focusTarget = useRef<string | null>(null)
 
-  // Local, session-only mock state. Cleared on every (re)load — reloading resets resolutions, which
-  // is correct: the server never saw them.
+  // Session-only DISPLAY state for the "resolved this session" confirmations. The durable state lives
+  // on the server (a resolved row is gone from the queue), so clearing this on (re)load is correct:
+  // a reload refetches the queue, which no longer contains what was resolved.
   const [resolved, setResolved] = useState<Map<number, Resolution>>(new Map())
   const [editing, setEditing] = useState<number | null>(null)
   const [edits, setEdits] = useState<Record<string, string>>({})
@@ -210,53 +216,83 @@ export function ReviewQueueScreen({ initialSource }: { initialSource: string }) 
     setResolved(prev => new Map(prev).set(rowIndex, res))
   }
 
-  function revalidate(item: QuarantineItem, cls: Classification) {
-    const err = validate(mergedRecord(item, edits), cls, loadedSource)
-    if (err) {
-      setEditError(err)
+  async function revalidate(item: QuarantineItem, cls: Classification) {
+    const preview = validate(mergedRecord(item, edits), cls, loadedSource)   // fast client hint
+    if (preview) {
+      setEditError(preview)
       return
     }
-    resolve(item.row_index, { via: 'revalidate', note: REVALIDATED_NOTE })
-    closeEditor()
-    focusTarget.current = `q-resolved-${item.row_index}`
+    try {
+      const res = await resolveQuarantineRow(loadedSource, item.row_index, edits)
+      if (!res.resolved) {
+        setEditError(res.reason || 'The corrected row still failed validation.')   // backend is authoritative
+        return
+      }
+      resolve(item.row_index, { via: 'revalidate', note: REVALIDATED_NOTE })
+      closeEditor()
+      focusTarget.current = `q-resolved-${item.row_index}`
+    } catch (e) {
+      setEditError(e instanceof ApiError ? e.detail : String(e))
+    }
   }
 
-  function keepFirstSeen(item: QuarantineItem, cls: Extract<Classification, { kind: 'conflict' }>) {
-    // Backend is first-seen-wins: keeping value A is exactly what a clean re-upload would resolve to.
-    resolve(item.row_index, {
-      via: 'revalidate',
-      note: `Kept the first-seen type '${cls.kept}' locally. ${REVALIDATED_NOTE}`,
-    })
-    closeEditor()
-    focusTarget.current = `q-resolved-${item.row_index}`
+  async function keepFirstSeen(item: QuarantineItem, cls: Extract<Classification, { kind: 'conflict' }>) {
+    // The first-seen column is already in the catalog; the conflicting duplicate row is redundant, so
+    // "keep first-seen" is a dismissal of the duplicate — exactly what a clean re-upload resolves to.
+    try {
+      await dismissQuarantineRow(loadedSource, item.row_index)
+      resolve(item.row_index, {
+        via: 'dismiss',
+        note: `Kept the first-seen type '${cls.kept}'; the duplicate row was dismissed.`,
+      })
+      closeEditor()
+      focusTarget.current = `q-resolved-${item.row_index}`
+    } catch (e) {
+      setEditError(e instanceof ApiError ? e.detail : String(e))
+    }
   }
 
-  function dismiss(item: QuarantineItem) {
-    resolve(item.row_index, { via: 'dismiss', note: DISMISSED_NOTE })
-    if (editing === item.row_index) closeEditor()
-    focusTarget.current = `q-resolved-${item.row_index}`
+  async function dismiss(item: QuarantineItem) {
+    try {
+      await dismissQuarantineRow(loadedSource, item.row_index)
+      resolve(item.row_index, { via: 'dismiss', note: DISMISSED_NOTE })
+      if (editing === item.row_index) closeEditor()
+      focusTarget.current = `q-resolved-${item.row_index}`
+    } catch (e) {
+      setEditError(e instanceof ApiError ? e.detail : String(e))
+    }
   }
 
-  function applyRule(key: string, badValue: string, rows: QuarantineItem[]) {
+  async function applyRule(key: string, badValue: string, rows: QuarantineItem[]) {
     const replacement = (ruleDrafts[key] ?? '').trim()
-    const err = validateSensitivity(replacement)
+    const err = validateSensitivity(replacement)   // fast client hint; the backend is authoritative
     if (err) {
       setRuleErrors(prev => ({ ...prev, [key]: err }))
       return
     }
-    const rowIndexes = rows.map(r => r.row_index)
-    // The rule resolves these rows; an editor left open on one of them must not survive as
-    // stale state (it would pop back open, draft intact, if the rule is later removed).
-    if (editing !== null && rowIndexes.includes(editing)) closeEditor()
+    if (editing !== null && rows.some(r => r.row_index === editing)) closeEditor()
+    // Apply the mapping to every row in the group; each fix is validated + persisted server-side.
+    const results = await Promise.all(
+      rows.map(r =>
+        resolveQuarantineRow(loadedSource, r.row_index, { sensitivity: replacement })
+          .then(res => ({ idx: r.row_index, ok: res.resolved, reason: res.reason }))
+          .catch(e => ({ idx: r.row_index, ok: false, reason: e instanceof ApiError ? e.detail : String(e) })),
+      ),
+    )
+    const okIdx = results.filter(x => x.ok).map(x => x.idx)
+    if (okIdx.length === 0) {
+      setRuleErrors(prev => ({ ...prev, [key]: results[0]?.reason || 'Could not apply the rule.' }))
+      return
+    }
     const shown = replacement || 'blank'
-    setRules(prev => [...prev, { id: key, badValue, replacement, rowIndexes }])
+    setRules(prev => [...prev, { id: key, badValue, replacement, rowIndexes: okIdx }])
     setResolved(prev => {
       const next = new Map(prev)
-      for (const idx of rowIndexes) {
+      for (const idx of okIdx) {
         next.set(idx, {
           via: 'rule',
           ruleId: key,
-          note: `Resolved by a local mapping rule ('${badValue}' to '${shown}'). Not persisted: fix the source file and re-upload.`,
+          note: `Resolved by a mapping rule ('${badValue}' to '${shown}').`,
         })
       }
       return next
@@ -275,13 +311,8 @@ export function ReviewQueueScreen({ initialSource }: { initialSource: string }) 
   }
 
   function removeRule(rule: Rule) {
-    // Defensive: never let an editor reappear on a row this rule covered (see applyRule).
-    if (editing !== null && rule.rowIndexes.includes(editing)) closeEditor()
-    setResolved(prev => {
-      const next = new Map(prev)
-      for (const [idx, res] of prev) if (res.ruleId === rule.id) next.delete(idx)
-      return next
-    })
+    // Rows resolved by this rule are already persisted on the server — removing the rule only clears
+    // the strip chip; it does NOT un-resolve them (there is no server-side undo short of re-upload).
     setRules(prev => prev.filter(r => r.id !== rule.id))
     focusTarget.current = 'q-count'
   }
@@ -406,7 +437,7 @@ function QueueBody(props: QueueBodyProps) {
       )}
 
       <p className="tabular-nums" role="status" id="q-count" tabIndex={-1}>
-        {items.length} quarantined · {resolved.size} resolved this session (mock)
+        {items.length} quarantined · {resolved.size} resolved this session
       </p>
       <p className="hint">
         Correct rows in the source file and re-upload; a clean upload clears this queue for real.
@@ -414,7 +445,7 @@ function QueueBody(props: QueueBodyProps) {
 
       {rules.length > 0 && (
         <div className="q-rules" id="q-rules-strip" tabIndex={-1}>
-          <span className="micro-label">Mapping rules (mock)</span>
+          <span className="micro-label">Mapping rules</span>
           <ul className="q-chips">
             {rules.map(rule => (
               <li key={rule.id} className="q-chip">
@@ -481,7 +512,7 @@ function QueueBody(props: QueueBodyProps) {
               >
                 <div className="q-head">
                   <span className="badge rejected">row {item.row_index}</span>
-                  <span className="badge resolved">resolved · mock</span>
+                  <span className="badge resolved">resolved</span>
                   <span className="q-reason q-reason--muted">{item.reason}</span>
                 </div>
                 <p className="q-note">{res.note}</p>
