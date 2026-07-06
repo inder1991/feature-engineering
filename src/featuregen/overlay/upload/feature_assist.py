@@ -592,18 +592,24 @@ def route_strategies(conn, cols: list[dict]) -> list[tuple[str, str]]:
     (strategy_name, prompt_focus) pairs."""
     picks = [("unary", "single-column transforms — bucketing, flags, or log of one column")]
     refs = [c["object_ref"] for c in cols]
+    sources = [c["catalog_source"] for c in cols]
     if not refs:
         return picks
+    # Source-qualified: match the exact (catalog_source, object_ref) pairs, so a same-named column in
+    # ANOTHER catalog can't contaminate strategy selection (wrong type / as-of / entity).
     rows = conn.execute(
         "SELECT data_type, is_as_of, entity FROM graph_node WHERE kind = 'column' "
-        "AND object_ref = ANY(%s)", (refs,)).fetchall()
+        "AND (catalog_source, object_ref) IN (SELECT * FROM unnest(%s::text[], %s::text[]))",
+        (sources, refs)).fetchall()
     if sum(1 for dt, _, _ in rows if _is_numeric(dt)) >= 2:
         picks.append(("ratio", "ratios / cross-features between two numeric columns (e.g. utilization)"))
     # aggregation applies if a candidate column is a join key (from_ref) OR a candidate TABLE is the
-    # parent that children join to (to_ref) — the entity-grain "aggregate children up" case.
+    # parent that children join to (to_ref) — the entity-grain "aggregate children up" case. Scoped to
+    # the candidate catalogs so cross-catalog same-named refs don't spuriously enable it.
     tables = [f"public.{c['object_ref'].split('.')[-2]}" for c in cols if c["object_ref"].count(".") >= 2]
-    if conn.execute("SELECT 1 FROM graph_edge WHERE kind = 'joins' AND (from_ref = ANY(%s) "
-                    "OR to_ref = ANY(%s)) LIMIT 1", (refs, tables)).fetchone() is not None:
+    if conn.execute("SELECT 1 FROM graph_edge WHERE kind = 'joins' AND catalog_source = ANY(%s) "
+                    "AND (from_ref = ANY(%s) OR to_ref = ANY(%s)) LIMIT 1",
+                    (list(set(sources)), refs, tables)).fetchone() is not None:
         picks.append(("aggregation", "aggregations (count/sum/avg) over related child rows via a join key"))
     if any(a for _, a, _ in rows):
         picks.append(("temporal", "recency / trend / velocity over a point-in-time (as-of) column"))
@@ -675,14 +681,18 @@ def set_signals(conn, feature_set: FeatureSet) -> dict:
     """Deterministic ranking signals for a set (item 1b) — computed WITHOUT data, BEFORE the LLM's
     advisory fit pick: size, distinct source columns, and domain coverage (distinct domains the set's
     features span). More domains covered + fewer duplicate columns = a broader, less redundant set."""
-    refs = {ref for f in feature_set.features for _, ref in f.derives_pairs}
+    pairs = {(cs, ref) for f in feature_set.features for cs, ref in f.derives_pairs}
     domains: set[str] = set()
-    if refs:
+    if pairs:
+        sources = [cs for cs, _ in pairs]
+        refs = [ref for _, ref in pairs]
+        # Source-qualified: a same-named column in another catalog must not add a phantom domain.
         rows = conn.execute(
-            "SELECT DISTINCT domain FROM graph_node WHERE object_ref = ANY(%s) AND domain IS NOT NULL",
-            (list(refs),)).fetchall()
+            "SELECT DISTINCT domain FROM graph_node WHERE domain IS NOT NULL "
+            "AND (catalog_source, object_ref) IN (SELECT * FROM unnest(%s::text[], %s::text[]))",
+            (sources, refs)).fetchall()
         domains = {r[0] for r in rows}
-    return {"size": len(feature_set.features), "distinct_columns": len(refs),
+    return {"size": len(feature_set.features), "distinct_columns": len(pairs),
             "domains_covered": len(domains), "domains": sorted(domains)}
 
 
