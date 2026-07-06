@@ -23,6 +23,7 @@ class FeatureSpec:
     as_of_column: str | None = None
     # the source columns the feature reads: (catalog_source, object_ref)
     derives_from: tuple[tuple[str, str], ...] = ()
+    verification: str = "DESIGN-CHECKED"   # §14.5 honest stamp, persisted on the row (0968)
 
 
 @dataclass(frozen=True, slots=True)
@@ -34,10 +35,10 @@ class FeatureFreshness:
 def register_feature(conn, spec: FeatureSpec) -> str:
     feature_id = mint_id("feat")
     conn.execute(
-        "INSERT INTO feature (feature_id, name, description, grain_table, aggregation, as_of_column) "
-        "VALUES (%s, %s, %s, %s, %s, %s)",
+        "INSERT INTO feature (feature_id, name, description, grain_table, aggregation, as_of_column, "
+        "verification) VALUES (%s, %s, %s, %s, %s, %s, %s)",
         (feature_id, spec.name, spec.description, spec.grain_table, spec.aggregation,
-         spec.as_of_column))
+         spec.as_of_column, spec.verification))
     for catalog_source, object_ref in spec.derives_from:
         conn.execute(
             "INSERT INTO feature_derives_from (feature_id, catalog_source, object_ref) "
@@ -68,3 +69,61 @@ def feature_freshness(conn, feature_id: str, *, now: datetime,
         if wm is None or wm < cutoff:
             stale.append(src)
     return FeatureFreshness(fresh=not stale, stale_sources=stale)
+
+
+def list_features(conn, *, limit: int = 50) -> list[dict]:
+    """The registered-feature inventory (registry READ surface — the catalog was write-only)."""
+    rows = conn.execute(
+        "SELECT feature_id, name, grain_table, aggregation, as_of_column, verification, created_at "
+        "FROM feature ORDER BY created_at DESC LIMIT %s", (limit,)).fetchall()
+    return [{"feature_id": r[0], "name": r[1], "grain_table": r[2], "aggregation": r[3],
+             "as_of_column": r[4], "verification": r[5], "created_at": r[6].isoformat()} for r in rows]
+
+
+def get_feature(conn, feature_id: str) -> dict | None:
+    """One registered feature + the source columns it derives from."""
+    row = conn.execute(
+        "SELECT feature_id, name, description, grain_table, aggregation, as_of_column, verification, "
+        "created_at FROM feature WHERE feature_id = %s", (feature_id,)).fetchone()
+    if row is None:
+        return None
+    derives = conn.execute(
+        "SELECT catalog_source, object_ref FROM feature_derives_from WHERE feature_id = %s "
+        "ORDER BY object_ref", (feature_id,)).fetchall()
+    return {"feature_id": row[0], "name": row[1], "description": row[2], "grain_table": row[3],
+            "aggregation": row[4], "as_of_column": row[5], "verification": row[6],
+            "created_at": row[7].isoformat(),
+            "derives_from": [{"catalog_source": d[0], "object_ref": d[1]} for d in derives]}
+
+
+def register_consumer(conn, *, model_ref: str, feature_id: str, purpose: str = "",
+                      environment: str = "dev", actor: str = "") -> str | None:
+    """Register a model/consumer as a user of a feature (SP-14). Idempotent per (model, feature, env).
+    Returns the consumer_id, or None if the feature doesn't exist (checked first — no FK abort)."""
+    if conn.execute("SELECT 1 FROM feature WHERE feature_id = %s", (feature_id,)).fetchone() is None:
+        return None
+    row = conn.execute(
+        "INSERT INTO feature_consumer (consumer_id, model_ref, feature_id, purpose, environment, actor) "
+        "VALUES (%s, %s, %s, %s, %s, %s) "
+        "ON CONFLICT (model_ref, feature_id, environment) DO UPDATE SET purpose = EXCLUDED.purpose, "
+        "actor = EXCLUDED.actor RETURNING consumer_id",
+        (mint_id("cons"), model_ref, feature_id, purpose, environment, actor)).fetchone()
+    return row[0]
+
+
+def consumers_of_feature(conn, feature_id: str) -> list[dict]:
+    """Which models consume this feature — the change-impact / deprecation-scoping answer."""
+    rows = conn.execute(
+        "SELECT model_ref, purpose, environment, registered_at FROM feature_consumer "
+        "WHERE feature_id = %s ORDER BY model_ref, environment", (feature_id,)).fetchall()
+    return [{"model_ref": r[0], "purpose": r[1], "environment": r[2],
+             "registered_at": r[3].isoformat()} for r in rows]
+
+
+def features_for_consumer(conn, model_ref: str) -> list[dict]:
+    """Which features a model consumes."""
+    rows = conn.execute(
+        "SELECT fc.feature_id, f.name, fc.purpose, fc.environment FROM feature_consumer fc "
+        "JOIN feature f ON f.feature_id = fc.feature_id WHERE fc.model_ref = %s ORDER BY f.name",
+        (model_ref,)).fetchall()
+    return [{"feature_id": r[0], "name": r[1], "purpose": r[2], "environment": r[3]} for r in rows]

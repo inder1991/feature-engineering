@@ -28,6 +28,8 @@ from featuregen.overlay.upload.contract.govern import (
     Contract,
     ContractValidationError,
     confirm_contract,
+    get_contract_detail,
+    list_contracts,
 )
 from featuregen.overlay.upload.contract.intake import IntentValidationError, submit_intent
 from featuregen.overlay.upload.contract.review import author_contract
@@ -111,6 +113,19 @@ def draft(body: DraftReqIn, conn: _Conn, identity: _Identity, client: _LLM) -> d
                        actor=identity)
     d, unresolved = author_contract(conn, d, client, now=datetime.now(UTC), actor=identity)
     return {"draft": d, "unresolved": unresolved, "intent_id": body.intent_id}
+
+
+@router.get("/contracts")
+def list_governed_contracts(conn: _Conn, identity: _Identity, limit: int = 50) -> list[dict]:
+    return list_contracts(conn, limit=limit)
+
+
+@router.get("/contracts/{contract_id}")
+def get_governed_contract(contract_id: str, conn: _Conn, identity: _Identity) -> dict:
+    c = get_contract_detail(conn, contract_id)
+    if c is None:
+        raise HTTPException(status_code=404, detail=f"unknown contract {contract_id!r}")
+    return c
 
 
 @router.post("/contract/confirm")
