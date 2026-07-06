@@ -8,15 +8,14 @@ import {
 } from '../api'
 
 // --- Reason parsing -------------------------------------------------------------------------
-// Mirrors the exact backend quarantine messages from
-// src/featuregen/overlay/upload/canonical.py. Every inline fix below is a CLIENT-SIDE MOCK: it
-// re-runs these same rules in the browser and marks rows resolved locally. Nothing is persisted;
-// the durable fix is still correcting the source file and re-uploading.
+// Mirrors the exact backend quarantine messages from src/featuregen/overlay/upload/canonical.py. The
+// client `validate()` is a fast PREVIEW; the authoritative check + persistence is the backend
+// resolve/dismiss (a resolution enters the catalog, a dismissal leaves the queue).
 
 type Classification =
   | { kind: 'missing'; fields: string[] }
   | { kind: 'unrecognized'; fields: ['sensitivity']; badValue: string }
-  | { kind: 'conflict'; fields: ['type']; kept: string; incoming: string }
+  | { kind: 'conflict'; fields: [] } // metadata conflict: the first-seen column already won -> dismiss
   | { kind: 'mismatch'; fields: ['source']; expected: string }
   | { kind: 'other'; fields: [] }
 
@@ -25,8 +24,7 @@ function classify(reason: string): Classification {
   if (m) return { kind: 'missing', fields: m[1].split(',').map(s => s.trim()).filter(Boolean) }
   m = reason.match(/^unrecognized sensitivity '(.*)' \(expected one of: /)
   if (m) return { kind: 'unrecognized', fields: ['sensitivity'], badValue: m[1] }
-  m = reason.match(/^conflicting type for .+?: (.+) vs (.+)$/)
-  if (m) return { kind: 'conflict', fields: ['type'], kept: m[1].trim(), incoming: m[2].trim() }
+  if (reason.startsWith('conflicting metadata for ')) return { kind: 'conflict', fields: [] }
   m = reason.match(/^row source '(.*)' does not match upload source '(.*)'$/)
   if (m) return { kind: 'mismatch', fields: ['source'], expected: m[2] }
   return { kind: 'other', fields: [] }
@@ -65,13 +63,6 @@ function validate(
   }
   if (cls.kind === 'mismatch' && merged.source?.trim() !== cls.expected) {
     return `source must equal the upload source '${cls.expected}'.`
-  }
-  if (cls.kind === 'conflict' && merged.type?.trim() !== cls.kept) {
-    return (
-      `type must match the first-seen type '${cls.kept}' (first upload wins). ` +
-      `Keep '${cls.kept}', or this row stays quarantined until the source file is fixed ` +
-      'and re-uploaded.'
-    )
   }
   return ''
 }
@@ -145,6 +136,7 @@ export function ReviewQueueScreen({ initialSource }: { initialSource: string }) 
   const [editing, setEditing] = useState<number | null>(null)
   const [edits, setEdits] = useState<Record<string, string>>({})
   const [editError, setEditError] = useState('')
+  const [actionError, setActionError] = useState('')   // dismiss/resolve failure shown outside the editor
   const [rules, setRules] = useState<Rule[]>([])
   const [ruleDrafts, setRuleDrafts] = useState<Record<string, string>>({})
   const [ruleErrors, setRuleErrors] = useState<Record<string, string>>({})
@@ -154,6 +146,7 @@ export function ReviewQueueScreen({ initialSource }: { initialSource: string }) 
     setEditing(null)
     setEdits({})
     setEditError('')
+    setActionError('')
     setRules([])
     setRuleDrafts({})
     setRuleErrors({})
@@ -222,8 +215,10 @@ export function ReviewQueueScreen({ initialSource }: { initialSource: string }) 
       setEditError(preview)
       return
     }
+    const seq = loadSeq.current
     try {
       const res = await resolveQuarantineRow(loadedSource, item.row_index, edits)
+      if (seq !== loadSeq.current) return   // the queue reloaded mid-flight — drop this stale result
       if (!res.resolved) {
         setEditError(res.reason || 'The corrected row still failed validation.')   // backend is authoritative
         return
@@ -236,30 +231,17 @@ export function ReviewQueueScreen({ initialSource }: { initialSource: string }) 
     }
   }
 
-  async function keepFirstSeen(item: QuarantineItem, cls: Extract<Classification, { kind: 'conflict' }>) {
-    // The first-seen column is already in the catalog; the conflicting duplicate row is redundant, so
-    // "keep first-seen" is a dismissal of the duplicate — exactly what a clean re-upload resolves to.
-    try {
-      await dismissQuarantineRow(loadedSource, item.row_index)
-      resolve(item.row_index, {
-        via: 'dismiss',
-        note: `Kept the first-seen type '${cls.kept}'; the duplicate row was dismissed.`,
-      })
-      closeEditor()
-      focusTarget.current = `q-resolved-${item.row_index}`
-    } catch (e) {
-      setEditError(e instanceof ApiError ? e.detail : String(e))
-    }
-  }
-
   async function dismiss(item: QuarantineItem) {
+    const seq = loadSeq.current
+    setActionError('')
     try {
       await dismissQuarantineRow(loadedSource, item.row_index)
+      if (seq !== loadSeq.current) return   // the queue reloaded mid-flight — drop this stale result
       resolve(item.row_index, { via: 'dismiss', note: DISMISSED_NOTE })
       if (editing === item.row_index) closeEditor()
       focusTarget.current = `q-resolved-${item.row_index}`
     } catch (e) {
-      setEditError(e instanceof ApiError ? e.detail : String(e))
+      setActionError(e instanceof ApiError ? e.detail : String(e))   // visible outside the editor
     }
   }
 
@@ -338,6 +320,11 @@ export function ReviewQueueScreen({ initialSource }: { initialSource: string }) 
           {error}
         </p>
       )}
+      {actionError && (
+        <p role="alert" className="error">
+          {actionError}
+        </p>
+      )}
       {items?.length === 0 && (
         <p className="empty" role="status">
           Queue clear. No quarantined rows for this source.
@@ -357,7 +344,6 @@ export function ReviewQueueScreen({ initialSource }: { initialSource: string }) 
           ruleErrors={ruleErrors}
           onFixInline={openEditor}
           onRevalidate={revalidate}
-          onKeepFirstSeen={keepFirstSeen}
           onCancelEdit={closeEditor}
           onDismiss={dismiss}
           onApplyRule={applyRule}
@@ -381,7 +367,6 @@ interface QueueBodyProps {
   ruleErrors: Record<string, string>
   onFixInline: (item: QuarantineItem, cls: Classification) => void
   onRevalidate: (item: QuarantineItem, cls: Classification) => void
-  onKeepFirstSeen: (item: QuarantineItem, cls: Extract<Classification, { kind: 'conflict' }>) => void
   onCancelEdit: () => void
   onDismiss: (item: QuarantineItem) => void
   onApplyRule: (key: string, badValue: string, rows: QuarantineItem[]) => void
@@ -402,7 +387,6 @@ function QueueBody(props: QueueBodyProps) {
     ruleErrors,
     onFixInline,
     onRevalidate,
-    onKeepFirstSeen,
     onCancelEdit,
     onDismiss,
     onApplyRule,
@@ -539,7 +523,7 @@ function QueueBody(props: QueueBodyProps) {
                 <span className="badge rejected">row {item.row_index}</span>
                 <strong className="q-reason">{item.reason}</strong>
                 <div className="q-actions">
-                  {cls.kind !== 'other' && (
+                  {cls.fields.length > 0 && (
                     <button type="button" className="btn" onClick={() => onFixInline(item, cls)}>
                       Fix inline
                     </button>
@@ -561,13 +545,16 @@ function QueueBody(props: QueueBodyProps) {
                 ))}
               </dl>
 
-              {cls.kind === 'other' && (
+              {cls.fields.length === 0 && (
                 <p className="hint">
-                  No inline fix for this reason. Correct the value in the source file and re-upload.
+                  {cls.kind === 'conflict'
+                    ? 'Two rows for this column disagree; the first-seen version is in the catalog. ' +
+                      'Dismiss this duplicate, or fix the source file and re-upload.'
+                    : 'No inline fix for this reason. Correct the value in the source file and re-upload.'}
                 </p>
               )}
 
-              {editing === item.row_index && cls.kind !== 'other' && (
+              {editing === item.row_index && cls.fields.length > 0 && (
                 <div className="q-editor">
                   {cls.fields.map(f => (
                     <label key={f} className="q-editor-field">
@@ -581,15 +568,6 @@ function QueueBody(props: QueueBodyProps) {
                     </label>
                   ))}
                   <div className="q-editor-actions">
-                    {cls.kind === 'conflict' && (
-                      <button
-                        type="button"
-                        className="btn btn--primary"
-                        onClick={() => onKeepFirstSeen(item, cls)}
-                      >
-                        Keep {cls.kept}
-                      </button>
-                    )}
                     <button
                       type="button"
                       className="btn btn--primary"
