@@ -70,3 +70,20 @@ def test_reapply_skips_all_migrations(db_empty) -> None:
         count_after, applied_after = cur.fetchone()
     assert count_after == count_before
     assert applied_after == applied_before
+
+
+def test_sql_file_migrations_fails_loud_when_dir_missing(monkeypatch, tmp_path):
+    # A missing migrations dir means a broken build (wheel without package-data), NOT "no migrations".
+    # It must raise, never silently return [] (which would apply an empty set to a live DB).
+    import pytest
+
+    from featuregen.db import migrations
+    monkeypatch.setattr(migrations, "_SQL_MIGRATIONS_DIR", tmp_path / "does-not-exist")
+    with pytest.raises(RuntimeError, match="migration"):
+        migrations._sql_file_migrations()
+
+
+def test_sql_migrations_are_actually_present():
+    # Guards the packaging contract: the loader finds the shipped .sql files (non-empty).
+    from featuregen.db import migrations
+    assert len(migrations._sql_file_migrations()) >= 40

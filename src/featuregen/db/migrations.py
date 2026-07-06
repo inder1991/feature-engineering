@@ -257,13 +257,18 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 
 
 def _sql_file_migrations() -> list[tuple[str, str]]:
-    """Load db/migrations/*.sql in lexical order (Phase 05+ file-based migrations)."""
+    """Load db/migrations/*.sql in lexical order (Phase 05+ file-based migrations). The directory is
+    packaged runtime data — its absence means a BROKEN BUILD (wheel without package-data), never
+    "no migrations", so fail LOUD rather than silently applying an empty migration set to a live DB."""
     if not _SQL_MIGRATIONS_DIR.is_dir():
-        return []
-    return [
-        (path.stem, path.read_text(encoding="utf-8"))
-        for path in sorted(_SQL_MIGRATIONS_DIR.glob("*.sql"))
-    ]
+        raise RuntimeError(
+            f"SQL migrations directory not found at {_SQL_MIGRATIONS_DIR}. The package was built "
+            "without its migration data — verify [tool.setuptools.package-data] ships "
+            "db/migrations/*.sql. Refusing to run with an empty migration set.")
+    files = sorted(_SQL_MIGRATIONS_DIR.glob("*.sql"))
+    if not files:
+        raise RuntimeError(f"No .sql migrations found under {_SQL_MIGRATIONS_DIR} (broken build).")
+    return [(path.stem, path.read_text(encoding="utf-8")) for path in files]
 
 
 def pending_migrations(conn: DbConn) -> list[str]:

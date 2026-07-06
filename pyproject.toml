@@ -43,6 +43,11 @@ dev = [
 [tool.setuptools.packages.find]
 where = ["src"]
 
+# The SQL migrations are runtime data loaded from disk (db/migrations/*.sql) — WITHOUT this the wheel
+# ships zero migrations and an installed release silently applies nothing to the schema.
+[tool.setuptools.package-data]
+"featuregen.db" = ["migrations/*.sql"]
+
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["tests"]

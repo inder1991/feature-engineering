@@ -35,5 +35,5 @@ frontend-test:  ## Frontend unit tests (vitest)
 	cd frontend && npm test
 
 clean:  ## Remove caches and build artifacts
-	rm -rf .pytest_cache .ruff_cache .mypy_cache src/*.egg-info
+	rm -rf .pytest_cache .ruff_cache .mypy_cache src/*.egg-info build dist
 	find . -type d -name __pycache__ -not -path './.venv/*' -exec rm -rf {} +
