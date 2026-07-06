@@ -163,11 +163,19 @@ def chosen_feature(conn, intent_id: str, chosen_source: str,
     if chosen_source == "anchor":
         a = snap.get("anchor")
         return _idea_from_json(a) if a and a.get("name") == chosen_option_id else None
-    for s in snap.get("alternatives", []):
-        for f in s.get("features", []):
-            if f.get("name") == chosen_option_id:
-                return _idea_from_json(f)
-    return None
+    # Collect EVERY alternative matching the name. If two lenses emitted the same name with different
+    # structure (derives/aggregation), the choice is genuinely AMBIGUOUS — reconstructing the "first"
+    # would govern a feature the human may not have picked, so fail closed (caller -> 422).
+    matches = [f for s in snap.get("alternatives", []) for f in s.get("features", [])
+               if f.get("name") == chosen_option_id]
+    if not matches:
+        return None
+    first = matches[0]
+    key = (first.get("aggregation"), [tuple(p) for p in first.get("derives_pairs", [])])
+    if any((m.get("aggregation"), [tuple(p) for p in m.get("derives_pairs", [])]) != key
+           for m in matches[1:]):
+        return None   # ambiguous same-name options — cannot safely reconstruct
+    return _idea_from_json(first)
 
 
 def record_gate1_choice(conn, intent_id: str, *, chosen_source: str, chosen_option_id: str,
