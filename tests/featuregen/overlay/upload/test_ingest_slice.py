@@ -100,3 +100,26 @@ def test_drift_skipped_when_projection_lags(db, monkeypatch):
     assert res.status == "ingested"   # the upload's facts still assert
     assert res.staled == 0            # drift deferred
     assert called == []               # detect_catalog_changes was NOT run (laundering avoided)
+
+
+def test_safety_metadata_change_is_drift(db):
+    # A re-upload that reclassifies a column's SAFETY metadata (additive -> non_additive) is a
+    # type_change, so its dependents get staled — a data_type-only fingerprint would miss it.
+    _seal_config()
+    now = datetime(2026, 7, 5, tzinfo=UTC)
+    ingest_upload(db, "s", [CanonicalRow("s", "t", "amt", "numeric", additivity="additive")],
+                  actor=_actor(), now=now)
+    res = ingest_upload(db, "s", [CanonicalRow("s", "t", "amt", "numeric", additivity="non_additive")],
+                        actor=_actor(), now=now)
+    assert res.staled >= 1   # the additivity flip registered as a type_change
+
+
+def test_fingerprint_backward_compatible_without_safety():
+    # An adapter that supplies no safety metadata keeps the EXACT data_type-only fingerprint (no mass
+    # false-drift on existing snapshots for the non-upload catalog adapters).
+    import hashlib
+
+    from featuregen.overlay.catalog import CatalogObject
+    from featuregen.overlay.catalog_changes import _type_fingerprint
+    obj = CatalogObject("public.t.c", "column", "public", "t", "c", "numeric", None)
+    assert _type_fingerprint(obj) == hashlib.sha256(b"column|numeric").hexdigest()
