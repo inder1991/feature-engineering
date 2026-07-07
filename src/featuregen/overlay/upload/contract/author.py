@@ -85,10 +85,10 @@ def _join_path(conn, grain_table: str | None, pairs: tuple[tuple[str, str], ...]
     grain_catalog = next((cs for cs, t in tables if t == grain_table), tables[0][0])
     for cs, t in tables:
         if (cs, t) != (grain_catalog, grain_table):
-            for s in (find_cross_catalog_path(conn, grain_catalog, grain_table, cs, t,
-                                              roles=roles) or []):
-                steps.append({"kind": s.kind, "from": f"{s.from_source}.{s.from_table}",
-                              "to": f"{s.to_source}.{s.to_table}", "via": s.detail})
+            for xs in (find_cross_catalog_path(conn, grain_catalog, grain_table, cs, t,
+                                               roles=roles) or []):   # CrossStep, not JoinStep
+                steps.append({"kind": xs.kind, "from": f"{xs.from_source}.{xs.from_table}",
+                              "to": f"{xs.to_source}.{xs.to_table}", "via": xs.detail})
     return tuple(steps)
 
 

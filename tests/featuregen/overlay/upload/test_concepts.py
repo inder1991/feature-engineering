@@ -1,4 +1,4 @@
-from featuregen.overlay.upload.concepts import CONCEPTS, UNCLASSIFIED, is_known_concept, humanize
+from featuregen.overlay.upload.concepts import CONCEPTS, UNCLASSIFIED, humanize, is_known_concept
 
 
 def test_vocabulary_is_controlled():

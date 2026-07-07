@@ -1,4 +1,10 @@
-from featuregen.intake.llm import PROVIDER_NON_RETRYABLE, PROVIDER_OK, FakeLLM, FakeResponse, LLMResult
+from featuregen.intake.llm import (
+    PROVIDER_NON_RETRYABLE,
+    PROVIDER_OK,
+    FakeLLM,
+    FakeResponse,
+    LLMResult,
+)
 from featuregen.intake.redaction import INPUT_KEY_CATALOG, INPUT_KEY_INTENT
 from featuregen.overlay.upload.enrich_llm import audited_enrich_call, register_enrichment_schemas
 

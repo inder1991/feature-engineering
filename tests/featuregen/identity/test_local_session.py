@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from featuregen.identity.local_session import (
     add_user_to_group,
@@ -11,7 +11,7 @@ from featuregen.identity.local_session import (
     verify_password,
 )
 
-NOW = datetime(2026, 7, 5, tzinfo=timezone.utc)
+NOW = datetime(2026, 7, 5, tzinfo=UTC)
 
 
 def test_password_hash_roundtrip():

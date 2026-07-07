@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from featuregen.contracts.envelopes import IdentityEnvelope
 from featuregen.overlay.config import OverlayConfig, register_overlay_config
@@ -23,7 +23,7 @@ def _seal_config():
 
 def test_slice_ingest_serve_drift_and_brake(db):
     _seal_config()
-    now = datetime(2026, 7, 5, tzinfo=timezone.utc)
+    now = datetime(2026, 7, 5, tzinfo=UTC)
     source = "deposits"
 
     # Upload 1: accounts(id grain, posted_at as-of) + a second table so a later drop is small.
@@ -73,7 +73,7 @@ def test_slice_ingest_serve_drift_and_brake(db):
 
 def test_enrichment_failure_does_not_abort_ingest(db):
     _seal_config()
-    now = datetime(2026, 7, 5, tzinfo=timezone.utc)
+    now = datetime(2026, 7, 5, tzinfo=UTC)
 
     class _Boom:
         def call(self, request):

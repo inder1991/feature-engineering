@@ -1,6 +1,6 @@
 """User/group/role administration API — admin-gated via a REAL authenticated Bearer session (an
 unauthenticated stub principal, even with X-Roles: admin, is rejected)."""
-from ._helpers import AUTH   # data_owner stub — not an admin, and not authenticated
+from ._helpers import AUTH  # data_owner stub — not an admin, and not authenticated
 
 
 def _admin(client):

@@ -61,7 +61,8 @@ class DraftIn(BaseModel):
             feature_name=self.feature_name, definition=self.definition, grain_table=self.grain_table,
             aggregation=self.aggregation, as_of_column=self.as_of_column,
             derives_from=self.derives_from, target_ref=self.target_ref,
-            derives_pairs=tuple(tuple(p) for p in self.derives_pairs), join_path=tuple(self.join_path))
+            derives_pairs=tuple((p[0], p[1]) for p in self.derives_pairs),  # each is a (source, ref) pair
+            join_path=tuple(self.join_path))
 
 
 class ConsideredSetIn(BaseModel):

@@ -1,5 +1,5 @@
 """Phase 5 — confirm + govern: versioned, drift-linked contract."""
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -12,7 +12,7 @@ from featuregen.overlay.upload.contract.govern import (
 )
 from featuregen.overlay.upload.graph import build_graph
 
-NOW = datetime(2026, 7, 5, tzinfo=timezone.utc)
+NOW = datetime(2026, 7, 5, tzinfo=UTC)
 
 
 def _bank(db, watermark=NOW):

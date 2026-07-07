@@ -1,5 +1,5 @@
 """Regression tests for the review's BLOCKER (B1) and M1 — the value-change re-upload path."""
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from featuregen.contracts.envelopes import IdentityEnvelope
 from featuregen.overlay.config import OverlayConfig, register_overlay_config
@@ -22,7 +22,7 @@ def _seal():
         profiler_require_restricted_role=False))
 
 
-NOW = datetime(2026, 7, 5, tzinfo=timezone.utc)
+NOW = datetime(2026, 7, 5, tzinfo=UTC)
 
 
 def _grain(db, source, table, now=NOW):

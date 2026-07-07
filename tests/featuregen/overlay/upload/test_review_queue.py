@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from featuregen.contracts.envelopes import IdentityEnvelope
 from featuregen.overlay.config import OverlayConfig, register_overlay_config
@@ -26,7 +26,7 @@ def _seal():
 
 def test_quarantine_persisted_and_cleared_on_reupload(db):
     _seal()
-    now = datetime(2026, 7, 5, tzinfo=timezone.utc)
+    now = datetime(2026, 7, 5, tzinfo=UTC)
 
     # Upload 1: one good row + one bad (blank column) -> ingested, 1 quarantined + persisted.
     rows1 = [
@@ -53,7 +53,7 @@ def test_quarantine_persisted_and_cleared_on_reupload(db):
 
 def _quarantine_one_bad(db):
     _seal()
-    now = datetime(2026, 7, 5, tzinfo=timezone.utc)
+    now = datetime(2026, 7, 5, tzinfo=UTC)
     rows = [
         CanonicalRow("deposits", "accounts", "id", "integer", is_grain=True),
         CanonicalRow("deposits", "accounts", "", "text"),   # blank column -> quarantined
@@ -101,7 +101,7 @@ def test_resolve_grain_column_reconciles_the_grain_fact(db):
     from featuregen.overlay.store import load_fact
     from featuregen.overlay.upload.upload_catalog import table_ref
     _seal()
-    now = datetime(2026, 7, 5, tzinfo=timezone.utc)
+    now = datetime(2026, 7, 5, tzinfo=UTC)
     rows = [
         CanonicalRow("deposits", "accounts", "id", "integer", is_grain=True),
         CanonicalRow("deposits", "accounts", "cust_id", "", is_grain=True),   # blank type -> quarantined

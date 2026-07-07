@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from featuregen.contracts.envelopes import IdentityEnvelope
 from featuregen.overlay.config import OverlayConfig, register_overlay_config
@@ -41,7 +41,7 @@ def test_register_feature_and_drift_impact(db):
 
 def test_feature_freshness_follows_stalest_source(db):
     _seal()
-    now = datetime(2026, 7, 5, tzinfo=timezone.utc)
+    now = datetime(2026, 7, 5, tzinfo=UTC)
     rows = [CanonicalRow("deposits", "accounts", "balance", "numeric")]
     ingest_upload(db, "deposits", rows, actor=_actor(), now=now)   # writes a fresh watermark
     fid = register_feature(db, FeatureSpec(
