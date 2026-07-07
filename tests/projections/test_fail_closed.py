@@ -399,7 +399,7 @@ def test_unexpected_exception_fails_closed_with_degraded_marker(conn):
     """An UNEXPECTED apply exception must fail closed like a ProjectionApplyError — halt + a durable
     degraded marker keyed on the poison EVENT — not escape uncaught and crash the run with no marker."""
     event_registry().register_schema("E", 1, {"type": "object"}, owner="o")
-    e1 = _append(conn, "r_ue", 0, {})
+    _append(conn, "r_ue", 0, {})
     poison = _append(conn, "r_ue", 1, {})
     _append(conn, "r_ue", 2, {})
     proj = UnexpectedErrorProjection(poison_seq=poison.global_seq)

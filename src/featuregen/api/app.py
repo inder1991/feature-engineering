@@ -6,11 +6,13 @@ import logging
 import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from typing import Annotated
 
 import psycopg
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI
 
 from featuregen.aggregates.bootstrap import register_phase06_event_schemas
+from featuregen.api.deps import get_conn, get_identity
 from featuregen.api.routes import (
     admin,
     assist,
@@ -24,6 +26,7 @@ from featuregen.api.routes import (
     uploads,
 )
 from featuregen.config import get_settings
+from featuregen.contracts.envelopes import IdentityEnvelope
 from featuregen.db.migrations import apply_migrations, pending_migrations
 from featuregen.events.registry import event_registry
 from featuregen.intake.llm import LLMClient
@@ -100,6 +103,27 @@ def create_app(llm_client: LLMClient | None = None) -> FastAPI:
         if pending:
             return {"status": "degraded", "schema": "behind", "pending_migrations": len(pending)}
         return {"status": "ok"}
+
+    @app.get("/metrics")
+    def metrics(
+        conn: Annotated[psycopg.Connection, Depends(get_conn, scope="function")],
+        identity: Annotated[IdentityEnvelope, Depends(get_identity)],
+    ) -> dict:
+        """Operational snapshot for dashboards/alerts: in-process counters + projection lag + degraded
+        / skipped markers + pending-migration count. Identity-gated (no unauthenticated DB load).
+        Liveness/readiness stays on /health."""
+        from featuregen.projections.runner import projection_lag
+        from featuregen.runtime.observability import counters
+        lag = {n: projection_lag(conn, n) for n in ("overlay", "stage_primary")}
+        degraded = conn.execute("SELECT count(*) FROM projection_degraded").fetchone()[0]
+        skipped = conn.execute("SELECT count(*) FROM projection_skips").fetchone()[0]
+        return {
+            "counters": counters.snapshot().get("counters", {}),
+            "projection_lag": lag,
+            "degraded_markers": int(degraded),
+            "skipped_events": int(skipped),
+            "pending_migrations": len(getattr(app.state, "schema_pending", [])),
+        }
 
     return app
 
