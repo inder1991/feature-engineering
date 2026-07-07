@@ -1,6 +1,6 @@
 # Governed Feature-Contract Flow — Design
 
-**Status:** draft for review · **Date:** 2026-07-07
+**Status:** shape + decisions approved (2026-07-07) — ready for the implementation plan · **Date:** 2026-07-07
 
 ## 1. Problem
 
@@ -98,21 +98,19 @@ The human picks from the considered set; `confirm_contract` (hardened) governs t
 bindings, compilation/execution fields, "considered calculation methods" bookkeeping. The pivot cut the
 data plane; do not build storage for a compute engine that does not exist.
 
-### 5.1 Open decision A — store vs. assemble
-Most fields already live in `feature` + `contract_intent`. **Recommendation:** *assemble* the spec
-sheet as a read-time view over `feature` + `contract_intent` + `contract`, and *store* only the
-genuinely-new facts (`lookback_window`, explicit PIT-rule text, calc-method label, `approved_by` +
-timestamp). Rationale: don't duplicate grain/aggregation into two places where they can drift apart.
+### 5.1 Decision A — store vs. assemble → **ASSEMBLE** (decided 2026-07-07)
+The spec sheet is **assembled as a read-time view** over `feature` + `contract_intent` + `contract`.
+Only the genuinely-new facts are **stored** on the contract: `lookback_window`, explicit PIT-rule text,
+calculation-method label, `approved_by` + timestamp. Grain / aggregation / derives are **never
+duplicated** onto the contract — the view reads them from `feature`, so the two can't drift apart.
 
-## 6. Open decision B — same-approver vs. four-eyes
+## 6. Decision B — same-approver vs. four-eyes → **CONFIGURABLE, default same-approver** (decided 2026-07-07)
 
-Do the two gates require the **same person** (analyst writes the brief, generates, approves the
-features) or **different people** (four-eyes: analyst proposes, a lead approves at each gate)?
-
-**Recommendation:** make it **configurable**, default **same-approver** (the 2026-07-04 pivot
-deliberately retired heavy four-eyes), with a deployment flag to require a *distinct* approver at Gate 2
-for regulated installs. The approver identity is recorded either way, so the audit story holds in both
-modes. — *Needs your confirmation; it shapes the API + UI.*
+The two gates default to **same-approver** (analyst writes the brief, generates, approves the features —
+the 2026-07-04 pivot retired heavy four-eyes). A deployment flag (e.g. `FEATUREGEN_CONTRACT_FOUR_EYES=1`)
+turns on **four-eyes** for regulated installs: the Gate-2 confirmer must be a **distinct** identity from
+the Gate-1 brief actor, enforced server-side (a 4xx if the same subject tries both). The approver
+identity is recorded either way, so the audit trail holds in both modes.
 
 ## 7. UI (the integration — closes #3/#4/#5)
 
@@ -145,7 +143,7 @@ governed flow is the only path that earns `DESIGN-CHECKED`.
 - No runtime/proxy leakage detection (needs data) — only design-time direct-leakage (set membership).
 - No mapping/compilation/execution layer.
 
-## 10. Open decisions to resolve before the build plan
+## 10. Decisions (resolved 2026-07-07)
 
-- **A — store vs. assemble** the contract spec sheet (§5.1). *Rec: assemble + store-the-few.*
-- **B — same-approver vs. four-eyes** for the two gates (§6). *Rec: configurable, default same-approver.*
+- **A — store vs. assemble** the contract spec sheet → **assemble + store-the-few** (§5.1).
+- **B — same-approver vs. four-eyes** → **configurable, default same-approver** (§6).
