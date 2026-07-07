@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from featuregen.contracts.envelopes import IdentityEnvelope
 from featuregen.overlay.config import OverlayConfig, register_overlay_config
@@ -29,7 +29,7 @@ def test_allowed_sensitivities_maps_roles():
 
 def test_pii_node_hidden_without_role_visible_with_role(db):
     _seal()
-    now = datetime(2026, 7, 5, tzinfo=timezone.utc)
+    now = datetime(2026, 7, 5, tzinfo=UTC)
     rows = [
         CanonicalRow("deposits", "accounts", "ssn_hash", "text", sensitivity="pii"),
         CanonicalRow("deposits", "accounts", "balance", "numeric"),

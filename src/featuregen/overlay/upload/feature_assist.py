@@ -17,6 +17,8 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 
+import psycopg
+
 from featuregen.contracts.envelopes import IdentityEnvelope
 from featuregen.intake.llm import LLMClient
 from featuregen.overlay.catalog_changes import drift_watermark
@@ -216,16 +218,25 @@ def _validate_idea(conn, raw: dict, known: set[str], src_of: dict[str, set[str]]
         rationale=str(raw.get("rationale", ""))), None   # §14.2 one-line causal rationale (opportunistic)
 
 
+def _norm_agg(aggregation: str | None) -> str:
+    """Normalize an aggregation for dedup so 'SUM' / 'sum' / None / '' don't read as distinct."""
+    return (aggregation or "").strip().lower()
+
+
+def _sig(idea: FeatureIdea) -> tuple[frozenset, str]:
+    return (frozenset(idea.derives_pairs), _norm_agg(idea.aggregation))
+
+
 def _redundant_of(idea: FeatureIdea, accepted: list[FeatureIdea]) -> bool:
     """A candidate is redundant if an already-accepted feature derives from the SAME columns with the
     same aggregation — a re-proposal under a new name (`seen` only catches identical names). (item 1a)"""
-    sig = (frozenset(idea.derives_pairs), idea.aggregation)
-    return any((frozenset(a.derives_pairs), a.aggregation) == sig for a in accepted)
+    sig = _sig(idea)
+    return any(_sig(a) == sig for a in accepted)
 
 
-def _registered_signatures(conn) -> set[tuple[frozenset, str | None]]:
-    """(frozenset of (catalog_source, object_ref), aggregation) for every REGISTERED feature — so the
-    loop skips a candidate that duplicates an already-confirmed feature (§7.5 full-space dedup, item 2)."""
+def _registered_signatures(conn) -> set[tuple[frozenset, str]]:
+    """(frozenset of (catalog_source, object_ref), normalized aggregation) for every REGISTERED feature
+    — so the loop skips a candidate that duplicates an already-confirmed feature (§7.5 dedup, item 2)."""
     rows = conn.execute(
         "SELECT f.feature_id, f.aggregation, d.catalog_source, d.object_ref FROM feature f "
         "LEFT JOIN feature_derives_from d ON d.feature_id = f.feature_id").fetchall()
@@ -234,7 +245,7 @@ def _registered_signatures(conn) -> set[tuple[frozenset, str | None]]:
         entry = by_feat.setdefault((fid, agg), set())
         if cs and ref:
             entry.add((cs, ref))
-    return {(frozenset(pairs), agg) for (fid, agg), pairs in by_feat.items()}
+    return {(frozenset(pairs), _norm_agg(agg)) for (fid, agg), pairs in by_feat.items()}
 
 
 def _critique_candidates(conn, client: LLMClient, objective: str,
@@ -254,7 +265,9 @@ def _critique_candidates(conn, client: LLMClient, objective: str,
         out = _call_raw(
             conn, client, "overlay.feature.critique_candidates", "feature_candidate_critique_v1",
             "feature_candidate_critique", objective, {"candidates": summary}, actor=actor)
-    except Exception:  # noqa: BLE001 — the critic is advisory; its failure must not break generation
+    except psycopg.Error:
+        raise   # a DB error aborts the request tx — NEVER swallow it (would silently roll back writes)
+    except Exception:  # noqa: BLE001 — advisory; a provider/dispatch failure must not break generation
         logger.warning("candidate critic unavailable; proceeding without it", exc_info=True)
         return {}
     return {str(i.get("name", "")): str(i.get("issue", ""))
@@ -277,7 +290,7 @@ def _vet(conn, raw: dict, known: set[str], src_of: dict[str, set[str]], register
         avoid.append({"name": idea.name, "reason": "duplicates an accepted feature",
                       "code": RejectCode.REDUNDANT})
         return None
-    if (frozenset(idea.derives_pairs), idea.aggregation) in registered:
+    if _sig(idea) in registered:
         avoid.append({"name": idea.name, "reason": "already a registered feature",
                       "code": RejectCode.ALREADY_REGISTERED})
         return None
@@ -522,7 +535,7 @@ def feature_recipe(conn, nl_query: str, client: LLMClient, *, catalog_source: st
     # The LLM says WHAT to compute; the join PATH is found deterministically (real edges only).
     path: list[JoinStep] = []
     if grain and join_table and grain != join_table:
-        path = find_join_path(conn, catalog_source, grain, join_table) or []
+        path = find_join_path(conn, catalog_source, grain, join_table, roles=roles) or []
     return Recipe(intent=nl_query, grain_table=grain, derives_from=derives,
                   aggregation=out.get("aggregation"), as_of_column=out.get("as_of_column"),
                   join_path=path)
@@ -566,7 +579,8 @@ _NUMERIC_TYPES = ("numeric", "integer", "bigint", "int", "int4", "int8", "smalli
 
 
 def _is_numeric(data_type: str | None) -> bool:
-    return (data_type or "").lower() in _NUMERIC_TYPES
+    base = (data_type or "").lower().split("(")[0].strip()   # numeric(10,2) -> numeric
+    return base in _NUMERIC_TYPES
 
 
 def route_strategies(conn, cols: list[dict]) -> list[tuple[str, str]]:
@@ -578,15 +592,24 @@ def route_strategies(conn, cols: list[dict]) -> list[tuple[str, str]]:
     (strategy_name, prompt_focus) pairs."""
     picks = [("unary", "single-column transforms — bucketing, flags, or log of one column")]
     refs = [c["object_ref"] for c in cols]
+    sources = [c["catalog_source"] for c in cols]
     if not refs:
         return picks
+    # Source-qualified: match the exact (catalog_source, object_ref) pairs, so a same-named column in
+    # ANOTHER catalog can't contaminate strategy selection (wrong type / as-of / entity).
     rows = conn.execute(
         "SELECT data_type, is_as_of, entity FROM graph_node WHERE kind = 'column' "
-        "AND object_ref = ANY(%s)", (refs,)).fetchall()
+        "AND (catalog_source, object_ref) IN (SELECT * FROM unnest(%s::text[], %s::text[]))",
+        (sources, refs)).fetchall()
     if sum(1 for dt, _, _ in rows if _is_numeric(dt)) >= 2:
         picks.append(("ratio", "ratios / cross-features between two numeric columns (e.g. utilization)"))
-    if conn.execute("SELECT 1 FROM graph_edge WHERE kind = 'joins' AND from_ref = ANY(%s) LIMIT 1",
-                    (refs,)).fetchone() is not None:
+    # aggregation applies if a candidate column is a join key (from_ref) OR a candidate TABLE is the
+    # parent that children join to (to_ref) — the entity-grain "aggregate children up" case. Scoped to
+    # the candidate catalogs so cross-catalog same-named refs don't spuriously enable it.
+    tables = [f"public.{c['object_ref'].split('.')[-2]}" for c in cols if c["object_ref"].count(".") >= 2]
+    if conn.execute("SELECT 1 FROM graph_edge WHERE kind = 'joins' AND catalog_source = ANY(%s) "
+                    "AND (from_ref = ANY(%s) OR to_ref = ANY(%s)) LIMIT 1",
+                    (list(set(sources)), refs, tables)).fetchone() is not None:
         picks.append(("aggregation", "aggregations (count/sum/avg) over related child rows via a join key"))
     if any(a for _, a, _ in rows):
         picks.append(("temporal", "recency / trend / velocity over a point-in-time (as-of) column"))
@@ -658,14 +681,18 @@ def set_signals(conn, feature_set: FeatureSet) -> dict:
     """Deterministic ranking signals for a set (item 1b) — computed WITHOUT data, BEFORE the LLM's
     advisory fit pick: size, distinct source columns, and domain coverage (distinct domains the set's
     features span). More domains covered + fewer duplicate columns = a broader, less redundant set."""
-    refs = {ref for f in feature_set.features for _, ref in f.derives_pairs}
+    pairs = {(cs, ref) for f in feature_set.features for cs, ref in f.derives_pairs}
     domains: set[str] = set()
-    if refs:
+    if pairs:
+        sources = [cs for cs, _ in pairs]
+        refs = [ref for _, ref in pairs]
+        # Source-qualified: a same-named column in another catalog must not add a phantom domain.
         rows = conn.execute(
-            "SELECT DISTINCT domain FROM graph_node WHERE object_ref = ANY(%s) AND domain IS NOT NULL",
-            (list(refs),)).fetchall()
+            "SELECT DISTINCT domain FROM graph_node WHERE domain IS NOT NULL "
+            "AND (catalog_source, object_ref) IN (SELECT * FROM unnest(%s::text[], %s::text[]))",
+            (sources, refs)).fetchall()
         domains = {r[0] for r in rows}
-    return {"size": len(feature_set.features), "distinct_columns": len(refs),
+    return {"size": len(feature_set.features), "distinct_columns": len(pairs),
             "domains_covered": len(domains), "domains": sorted(domains)}
 
 

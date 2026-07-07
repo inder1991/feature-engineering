@@ -14,13 +14,20 @@ import psycopg
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
-from featuregen.api.deps import get_conn, get_identity, get_llm
+from featuregen.api.deps import (
+    get_conn,
+    get_identity,
+    get_llm,
+    require_feature_generate,
+    require_feature_read,
+)
 from featuregen.contracts.envelopes import IdentityEnvelope
 from featuregen.intake.llm import LLMClient
 from featuregen.overlay.upload.contract.author import ContractDraft, draft_contract
 from featuregen.overlay.upload.contract.gate1 import (
     build_considered_set,
     chosen_feature,
+    gate1_choice,
     intent_target_ref,
     record_gate1_choice,
 )
@@ -60,7 +67,8 @@ class DraftIn(BaseModel):
             feature_name=self.feature_name, definition=self.definition, grain_table=self.grain_table,
             aggregation=self.aggregation, as_of_column=self.as_of_column,
             derives_from=self.derives_from, target_ref=self.target_ref,
-            derives_pairs=tuple(tuple(p) for p in self.derives_pairs), join_path=tuple(self.join_path))
+            derives_pairs=tuple((p[0], p[1]) for p in self.derives_pairs),  # each is a (source, ref) pair
+            join_path=tuple(self.join_path))
 
 
 class ConsideredSetIn(BaseModel):
@@ -80,7 +88,7 @@ class DraftReqIn(BaseModel):
 
 
 # ---- routes -------------------------------------------------------------------------------------
-@router.post("/contract/considered-set")
+@router.post("/contract/considered-set", dependencies=[Depends(require_feature_generate)])
 def considered_set(body: ConsideredSetIn, conn: _Conn, identity: _Identity, client: _LLM) -> dict:
     """Intake (mandatory hypothesis + optional definition, redacted) → the validated considered set:
     the anchor (from the definition) + generated alternatives + an advisory recommendation. Persists
@@ -97,7 +105,7 @@ def considered_set(body: ConsideredSetIn, conn: _Conn, identity: _Identity, clie
             "alternatives": cs.alternatives, "recommendation": cs.recommendation}
 
 
-@router.post("/contract/draft")
+@router.post("/contract/draft", dependencies=[Depends(require_feature_generate)])
 def draft(body: DraftReqIn, conn: _Conn, identity: _Identity, client: _LLM) -> dict:
     """Gate #1 → author. The chosen feature is reconstructed from the SERVER-persisted considered set
     (BLOCKER 1 — never an arbitrary client payload); the choice is recorded (audit); the leakage target
@@ -115,12 +123,12 @@ def draft(body: DraftReqIn, conn: _Conn, identity: _Identity, client: _LLM) -> d
     return {"draft": d, "unresolved": unresolved, "intent_id": body.intent_id}
 
 
-@router.get("/contracts")
+@router.get("/contracts", dependencies=[Depends(require_feature_read)])
 def list_governed_contracts(conn: _Conn, identity: _Identity, limit: int = 50) -> list[dict]:
     return list_contracts(conn, limit=limit)
 
 
-@router.get("/contracts/{contract_id}")
+@router.get("/contracts/{contract_id}", dependencies=[Depends(require_feature_read)])
 def get_governed_contract(contract_id: str, conn: _Conn, identity: _Identity) -> dict:
     c = get_contract_detail(conn, contract_id)
     if c is None:
@@ -128,15 +136,35 @@ def get_governed_contract(contract_id: str, conn: _Conn, identity: _Identity) ->
     return c
 
 
-@router.post("/contract/confirm")
+@router.post("/contract/confirm", dependencies=[Depends(require_feature_generate)])
 def confirm(body: DraftIn, conn: _Conn, identity: _Identity) -> Contract:
-    """The human gate: re-runs the MCV server-side (leakage target re-read from the intent, not trusted
-    from the payload) and refuses to govern a leaky / stale / ungrounded / empty draft; otherwise
-    registers a versioned, drift-linked contract linked back to its intent."""
-    target = intent_target_ref(conn, body.intent_id) if body.intent_id else body.target_ref
+    """The human gate — the GOVERNING write. Server-stateful, no client trust (closes the two BLOCKERs
+    at the write, not just at /draft):
+      * intent_id is REQUIRED; a missing/forged one is rejected (no fall back to a client target_ref);
+      * the draft must correspond to the human's RECORDED Gate #1 choice reconstructed from the
+        server-persisted considered set — a feature never offered/chosen cannot be governed;
+      * target_ref is read SERVER-side from the intent with NO client fallback, so the leakage gate
+        cannot be disabled by omitting it.
+    Then confirm_contract re-runs the deterministic MCV and registers a versioned, drift-linked contract."""
+    if not body.intent_id:
+        raise HTTPException(status_code=422, detail="intent_id is required to govern a contract")
+    choice = gate1_choice(conn, body.intent_id)
+    if choice is None:
+        raise HTTPException(status_code=422,
+                            detail="no Gate #1 choice recorded for this intent — draft it first")
+    chosen = chosen_feature(conn, body.intent_id, choice["chosen_source"], choice["chosen_option_id"])
+    if chosen is None:
+        raise HTTPException(status_code=422,
+                            detail="the chosen feature is not in the recorded considered set")
+    draft = body.to_draft()
+    if (draft.feature_name != chosen.name
+            or frozenset(draft.derives_pairs) != frozenset(chosen.derives_pairs)
+            or (draft.aggregation or "") != (chosen.aggregation or "")):
+        raise HTTPException(status_code=422, detail="the draft does not match the chosen feature")
+    target = intent_target_ref(conn, body.intent_id)   # SERVER truth — never the client body
     try:
-        return confirm_contract(conn, body.to_draft(), actor=identity.subject,
-                                now=datetime.now(UTC), target_ref=target, intent_id=body.intent_id)
+        return confirm_contract(conn, draft, actor=identity.subject, now=datetime.now(UTC),
+                                target_ref=target, intent_id=body.intent_id)
     except ContractValidationError as e:
         raise HTTPException(status_code=422, detail=str(e)) from e
     except psycopg.errors.UniqueViolation as e:   # concurrent double-confirm -> conflict, not 500

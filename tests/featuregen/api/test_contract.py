@@ -112,3 +112,40 @@ def test_feature_360_shows_hypothesis_lineage_and_stamp(make_client):
     assert body["contract"]["definition"]              # the governed narrative
     assert body["verification"] == "DESIGN-CHECKED"
     assert body["derives_from"]                         # lineage present
+
+
+def test_confirm_requires_intent_id_no_bare_draft_can_govern(make_client):
+    # BLOCKER: a fully client-supplied draft with NO intent_id cannot govern (no provenance, and its
+    # leakage target could be omitted). It must be rejected before any governing write.
+    client = make_client(_fake())
+    upload_csv(client, "deposits", DEPOSITS_CSV)
+    bare = {"feature_name": "x", "definition": "d", "grain_table": "accounts", "aggregation": "avg_90d",
+            "as_of_column": "posted_at", "derives_from": ["public.accounts.balance"],
+            "derives_pairs": [["deposits", "public.accounts.balance"]], "join_path": []}
+    assert client.post("/contract/confirm", json=bare, headers=AUTH).status_code == 422
+
+
+def test_confirm_rejects_a_forged_intent_id(make_client):
+    client = make_client(_fake())
+    upload_csv(client, "deposits", DEPOSITS_CSV)
+    intent_id = _intent_id(client)
+    dr = client.post("/contract/draft", json={"intent_id": intent_id, "chosen_source": "anchor",
+                     "chosen_option_id": "avg_balance_90d", "why": ""}, headers=AUTH)
+    draft = dr.json()["draft"]
+    draft["intent_id"] = "forged_intent_does_not_exist"
+    assert client.post("/contract/confirm", json=draft, headers=AUTH).status_code == 422
+
+
+def test_confirm_rejects_a_draft_tampered_off_the_chosen_feature(make_client):
+    # BLOCKER: even with a valid intent_id, the confirmed draft must MATCH the human's recorded choice.
+    # Tampering the derives (here, to add the target column) is rejected — it doesn't match the chosen set.
+    client = make_client(_fake())
+    upload_csv(client, "deposits", DEPOSITS_CSV)
+    intent_id = _intent_id(client)
+    dr = client.post("/contract/draft", json={"intent_id": intent_id, "chosen_source": "anchor",
+                     "chosen_option_id": "avg_balance_90d", "why": ""}, headers=AUTH)
+    draft = dr.json()["draft"]
+    draft["intent_id"] = dr.json()["intent_id"]
+    draft["derives_from"] = [*draft["derives_from"], "public.accounts.churned"]
+    draft["derives_pairs"] = [*draft["derives_pairs"], ["deposits", "public.accounts.churned"]]
+    assert client.post("/contract/confirm", json=draft, headers=AUTH).status_code == 422

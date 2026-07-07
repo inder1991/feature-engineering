@@ -145,17 +145,19 @@ describe('review queue screen', () => {
     expect(document.activeElement).toHaveAttribute('id', 'q-resolved-4')
   })
 
-  it('resolves a conflict row with one-click keep-first-seen (dismisses the duplicate)', async () => {
+  it('a metadata-conflict row (real backend message) offers only Dismiss, no inline fix', async () => {
+    // The backend's conflict message carries no per-type detail; the first-seen column already won, so
+    // the only valid action is dismissing the redundant duplicate (a resolve would 409 already-in-catalog).
     listQuarantine.mockResolvedValue([{
       row_index: 2,
-      reason: "conflicting type for ('deposits', 'accounts', 'opened_at'): date vs timestamp",
+      reason: "conflicting metadata for ('deposits', 'accounts', 'opened_at') (rows for the same column disagree)",
       raw: { source: 'deposits', table: 'accounts', column: 'opened_at', type: 'timestamp' } }])
     render(<ReviewQueueScreen initialSource="deposits" />)
-    await userEvent.click(await screen.findByRole('button', { name: /fix inline/i }))
-    await userEvent.click(screen.getByRole('button', { name: 'Keep date' }))
-    expect(await screen.findByText(/kept the first-seen type 'date'; the duplicate row was dismissed/i))
-      .toBeInTheDocument()
+    expect(await screen.findByText(/two rows for this column disagree/i)).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /fix inline/i })).not.toBeInTheDocument()
+    await userEvent.click(screen.getByRole('button', { name: /dismiss/i }))
     expect(dismissQuarantineRow).toHaveBeenCalledWith('deposits', 2)
+    expect(await screen.findByText(/dismissed from the queue/i)).toBeInTheDocument()
   })
 
   it('applies a mapping rule for a repeated value across rows via the backend', async () => {

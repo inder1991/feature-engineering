@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from featuregen.contracts.envelopes import IdentityEnvelope
 from featuregen.overlay.config import OverlayConfig, register_overlay_config
@@ -32,7 +32,7 @@ def _ingest(db, now):
 
 def test_search_finds_by_name_and_definition(db):
     _seal()
-    now = datetime(2026, 7, 5, tzinfo=timezone.utc)
+    now = datetime(2026, 7, 5, tzinfo=UTC)
     _ingest(db, now)
 
     # 'balance' matches the column name.
@@ -46,7 +46,7 @@ def test_search_finds_by_name_and_definition(db):
 
 def test_grain_column_outranks_plain_on_name(db):
     _seal()
-    now = datetime(2026, 7, 5, tzinfo=timezone.utc)
+    now = datetime(2026, 7, 5, tzinfo=UTC)
     _ingest(db, now)
     hits = search(db, "id", now=now)
     assert hits and hits[0].object_ref == "public.accounts.id"
@@ -55,7 +55,7 @@ def test_grain_column_outranks_plain_on_name(db):
 
 def test_stale_source_excluded(db):
     _seal()
-    now = datetime(2026, 7, 5, tzinfo=timezone.utc)
+    now = datetime(2026, 7, 5, tzinfo=UTC)
     _ingest(db, now)
     # Query far in the future -> the source's watermark is older than the 24h SLA -> excluded.
     later = now + timedelta(days=3)
@@ -65,7 +65,7 @@ def test_stale_source_excluded(db):
 def test_search_uses_llm_concept(db):
     from featuregen.intake.llm import FakeLLM, FakeResponse
     _seal()
-    now = datetime(2026, 7, 5, tzinfo=timezone.utc)
+    now = datetime(2026, 7, 5, tzinfo=UTC)
     rows = [CanonicalRow("deposits", "accounts", "bal", "numeric")]  # cryptic name, no definition
     client = FakeLLM(script={
         "overlay.enrich.concept": FakeResponse(output={"concept": "monetary_amount"}),
@@ -83,7 +83,7 @@ def test_search_uses_llm_concept(db):
 def test_search_uses_llm_domain_and_drafted_definition(db):
     from featuregen.intake.llm import FakeLLM, FakeResponse
     _seal()
-    now = datetime(2026, 7, 5, tzinfo=timezone.utc)
+    now = datetime(2026, 7, 5, tzinfo=UTC)
     rows = [CanonicalRow("deposits", "accounts", "bal", "numeric")]  # cryptic, no definition
     client = FakeLLM(script={
         "overlay.enrich.concept": FakeResponse(output={"concept": "monetary_amount"}),

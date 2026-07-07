@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from featuregen.contracts.envelopes import IdentityEnvelope
 from featuregen.overlay.config import OverlayConfig, register_overlay_config
@@ -23,7 +23,7 @@ def _seal_config():
 
 def test_slice_ingest_serve_drift_and_brake(db):
     _seal_config()
-    now = datetime(2026, 7, 5, tzinfo=timezone.utc)
+    now = datetime(2026, 7, 5, tzinfo=UTC)
     source = "deposits"
 
     # Upload 1: accounts(id grain, posted_at as-of) + a second table so a later drop is small.
@@ -73,7 +73,7 @@ def test_slice_ingest_serve_drift_and_brake(db):
 
 def test_enrichment_failure_does_not_abort_ingest(db):
     _seal_config()
-    now = datetime(2026, 7, 5, tzinfo=timezone.utc)
+    now = datetime(2026, 7, 5, tzinfo=UTC)
 
     class _Boom:
         def call(self, request):
@@ -83,3 +83,43 @@ def test_enrichment_failure_does_not_abort_ingest(db):
     res = ingest_upload(db, "s", rows, actor=_actor(), now=now, client=_Boom())
     assert res.status == "ingested"   # advisory enrichment failure must not abort the upload's facts
     assert res.asserted >= 1
+
+
+def test_drift_skipped_when_projection_lags(db, monkeypatch):
+    # If the overlay projection is behind (poison-halted), the upload must NOT run drift detection —
+    # doing so would stale nothing yet advance the snapshot, laundering a dropped/changed column.
+    from featuregen.overlay.upload import ingest as ingest_mod
+    _seal_config()
+    now = datetime(2026, 7, 5, tzinfo=UTC)
+    called: list[bool] = []
+    monkeypatch.setattr(ingest_mod, "projection_lag", lambda conn, name: 1)          # pretend halted
+    monkeypatch.setattr(ingest_mod, "detect_catalog_changes",
+                        lambda *a, **k: called.append(True) or [])
+    rows = [CanonicalRow("deposits", "accounts", "id", "integer", is_grain=True)]
+    res = ingest_upload(db, "deposits", rows, actor=_actor(), now=now)
+    assert res.status == "ingested"   # the upload's facts still assert
+    assert res.staled == 0            # drift deferred
+    assert called == []               # detect_catalog_changes was NOT run (laundering avoided)
+
+
+def test_safety_metadata_change_is_drift(db):
+    # A re-upload that reclassifies a column's SAFETY metadata (additive -> non_additive) is a
+    # type_change, so its dependents get staled — a data_type-only fingerprint would miss it.
+    _seal_config()
+    now = datetime(2026, 7, 5, tzinfo=UTC)
+    ingest_upload(db, "s", [CanonicalRow("s", "t", "amt", "numeric", additivity="additive")],
+                  actor=_actor(), now=now)
+    res = ingest_upload(db, "s", [CanonicalRow("s", "t", "amt", "numeric", additivity="non_additive")],
+                        actor=_actor(), now=now)
+    assert res.staled >= 1   # the additivity flip registered as a type_change
+
+
+def test_fingerprint_backward_compatible_without_safety():
+    # An adapter that supplies no safety metadata keeps the EXACT data_type-only fingerprint (no mass
+    # false-drift on existing snapshots for the non-upload catalog adapters).
+    import hashlib
+
+    from featuregen.overlay.catalog import CatalogObject
+    from featuregen.overlay.catalog_changes import _type_fingerprint
+    obj = CatalogObject("public.t.c", "column", "public", "t", "c", "numeric", None)
+    assert _type_fingerprint(obj) == hashlib.sha256(b"column|numeric").hexdigest()

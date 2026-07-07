@@ -1,12 +1,12 @@
 """The validated generate-validate-refine loop for recommend_features."""
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from featuregen.intake.llm import FakeLLM, FakeResponse
 from featuregen.overlay.upload.canonical import CanonicalRow
 from featuregen.overlay.upload.feature_assist import recommend_features
 from featuregen.overlay.upload.graph import build_graph
 
-NOW = datetime(2026, 7, 5, tzinfo=timezone.utc)
+NOW = datetime(2026, 7, 5, tzinfo=UTC)
 
 
 def _bank(db):
@@ -247,9 +247,11 @@ class _LoopLLM:
     def call(self, request):
         from featuregen.intake.llm import LLMResult
         if request.task == "overlay.feature.recommend":
-            out = self._gens[min(self._gi, len(self._gens) - 1)]; self._gi += 1
+            out = self._gens[min(self._gi, len(self._gens) - 1)]
+            self._gi += 1
         elif request.task == "overlay.feature.critique_candidates":
-            out = self._crits[min(self._ci, len(self._crits) - 1)]; self._ci += 1
+            out = self._crits[min(self._ci, len(self._crits) - 1)]
+            self._ci += 1
         else:
             out = {}
         return LLMResult(output=out, self_reported_scores={}, call_ref="", status="ok")

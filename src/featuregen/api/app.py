@@ -6,11 +6,13 @@ import logging
 import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from typing import Annotated
 
 import psycopg
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI
 
 from featuregen.aggregates.bootstrap import register_phase06_event_schemas
+from featuregen.api.deps import get_conn, get_identity
 from featuregen.api.routes import (
     admin,
     assist,
@@ -24,6 +26,7 @@ from featuregen.api.routes import (
     uploads,
 )
 from featuregen.config import get_settings
+from featuregen.contracts.envelopes import IdentityEnvelope
 from featuregen.db.migrations import apply_migrations, pending_migrations
 from featuregen.events.registry import event_registry
 from featuregen.intake.llm import LLMClient
@@ -33,17 +36,19 @@ from featuregen.overlay.facts import register_overlay_event_types
 logger = logging.getLogger(__name__)
 
 
-def _startup_migration_check() -> None:
+def _startup_migration_check(app: FastAPI) -> None:
     """Guard against the long-lived-DB-drift footgun: a schema behind the code produces a confusing
     runtime 500 (a missing column), not an obvious error. On startup, detect pending migrations against
     the runtime DSN and EITHER auto-apply (FEATUREGEN_AUTO_MIGRATE=1, handy for dev/demo) or log a loud,
-    actionable warning. Read-only + fail-open: no DSN (e.g. tests override get_conn) or an unreachable DB
-    never blocks startup."""
+    actionable warning — and record the outcome on app.state so /health can report a degraded schema.
+    Read-only + fail-open: no DSN (e.g. tests override get_conn) or an unreachable DB never blocks
+    startup (a bounded connect_timeout keeps a black-holed DB from hanging boot)."""
+    app.state.schema_pending = []
     dsn = get_settings().dsn
     if not dsn:
         return
     try:
-        with psycopg.connect(dsn) as conn:
+        with psycopg.connect(dsn, connect_timeout=5) as conn:
             pending = pending_migrations(conn)
             if not pending:
                 return
@@ -52,6 +57,7 @@ def _startup_migration_check() -> None:
                 logger.warning("auto-applied %d pending migration(s): %s",
                                len(pending), ", ".join(pending))
             else:
+                app.state.schema_pending = pending
                 logger.warning(
                     "DATABASE SCHEMA IS BEHIND THE CODE: %d migration(s) pending (%s). Run "
                     "`python -m featuregen migrate` (or set FEATUREGEN_AUTO_MIGRATE=1) — endpoints "
@@ -69,7 +75,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     register_phase06_event_schemas()
     register_overlay_event_types(event_registry())
     register_overlay_config(overlay_config_from_env())
-    _startup_migration_check()
+    _startup_migration_check(app)
     yield
 
 
@@ -89,8 +95,35 @@ def create_app(llm_client: LLMClient | None = None) -> FastAPI:
     app.include_router(entity.router)
 
     @app.get("/health")
-    def health() -> dict[str, str]:
+    def health() -> dict:
+        # Reports the schema status captured at startup (no per-call DB churn): a schema behind the
+        # code is 'degraded', not a false 'ok' — so a readiness probe catches the broken-deploy /
+        # unpackaged-migrations footgun instead of letting endpoints 500 later.
+        pending = getattr(app.state, "schema_pending", [])
+        if pending:
+            return {"status": "degraded", "schema": "behind", "pending_migrations": len(pending)}
         return {"status": "ok"}
+
+    @app.get("/metrics")
+    def metrics(
+        conn: Annotated[psycopg.Connection, Depends(get_conn, scope="function")],
+        identity: Annotated[IdentityEnvelope, Depends(get_identity)],
+    ) -> dict:
+        """Operational snapshot for dashboards/alerts: in-process counters + projection lag + degraded
+        / skipped markers + pending-migration count. Identity-gated (no unauthenticated DB load).
+        Liveness/readiness stays on /health."""
+        from featuregen.projections.runner import projection_lag
+        from featuregen.runtime.observability import counters
+        lag = {n: projection_lag(conn, n) for n in ("overlay", "stage_primary")}
+        degraded = conn.execute("SELECT count(*) FROM projection_degraded").fetchone()[0]
+        skipped = conn.execute("SELECT count(*) FROM projection_skips").fetchone()[0]
+        return {
+            "counters": counters.snapshot().get("counters", {}),
+            "projection_lag": lag,
+            "degraded_markers": int(degraded),
+            "skipped_events": int(skipped),
+            "pending_migrations": len(getattr(app.state, "schema_pending", [])),
+        }
 
     return app
 

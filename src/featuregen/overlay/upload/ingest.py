@@ -16,7 +16,8 @@ from featuregen.overlay.upload.enrich import classify_domains, draft_definitions
 from featuregen.overlay.upload.graph import add_column_row, build_graph
 from featuregen.overlay.upload.review_queue import persist_quarantine
 from featuregen.overlay.upload.upload_catalog import UploadCatalog, table_ref
-from featuregen.projections.runner import run_projection
+from featuregen.projections.runner import projection_lag, run_projection
+from featuregen.runtime.observability import counters
 
 logger = logging.getLogger(__name__)
 
@@ -105,8 +106,18 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
             asserted += 1
 
     _drain_projection(conn)   # fully catch up BEFORE the diff reads the dependency index (>500-event uploads)
-    changes = detect_catalog_changes(conn, upload, actor=actor, now=now, open_reverify=False)
-    _drain_projection(conn)
+    if projection_lag(conn, "overlay") > 0:
+        # The drain reached a poison-HALT, not head: the dependency index is stale, so drift would
+        # stale NOTHING for a just-dropped/changed column yet still advance the snapshot — laundering
+        # the change for a full TTL. Skip drift this upload (same guard as the worker); it re-detects
+        # once the projection catches up. The upload's facts still assert; the snapshot is NOT advanced.
+        counters.incr("overlay.drift.skipped_projection_lag")
+        logger.warning("overlay projection lags after ingest of %r — skipping catalog-change detection "
+                       "to avoid laundering drift (re-runs when the projection catches up)", catalog_source)
+        changes = []
+    else:
+        changes = detect_catalog_changes(conn, upload, actor=actor, now=now, open_reverify=False)
+        _drain_projection(conn)
     staled = sum(1 for c in changes if c.kind in ("drop", "type_change", "rename"))
 
     concepts = definitions = domains = None
@@ -147,9 +158,13 @@ def resolve_quarantine_row(conn, catalog_source: str, row_index: int, edits: dic
                            actor) -> tuple[bool, str]:
     """Apply a reviewer's inline fix to a quarantined row: merge the edits onto the raw row, RE-RUN the
     real deterministic validation (validate_rows — never the client mock), and, if it now passes and its
-    column isn't already in the catalog, add it to the source graph + assert its point-in-time fact and
-    drop it from the queue. Returns (resolved, reason). Like all quarantine state, a resolution holds
-    until the source is re-uploaded (the file stays the source of truth)."""
+    column isn't already in the catalog, add it to the source graph + reconcile its table's grain /
+    point-in-time facts and drop it from the queue. Returns (resolved, reason).
+
+    LIMITS (holds until the source is re-uploaded — the file stays the source of truth): a resolved
+    column is added incrementally, so it is NOT recorded in the drift snapshot and a subsequent
+    re-upload of the still-broken file rebuilds the graph WITHOUT it (the resolution is superseded).
+    Fix the source file for durability."""
     row = conn.execute(
         "SELECT raw FROM quarantine_row WHERE catalog_source = %s AND row_index = %s",
         (catalog_source, row_index)).fetchone()
@@ -165,6 +180,15 @@ def resolve_quarantine_row(conn, catalog_source: str, row_index: int, edits: dic
                     (catalog_source, c_ref)).fetchone() is not None:
         return False, f"{good.table}.{good.column} is already in the catalog"
     add_column_row(conn, catalog_source, good)
+    if good.is_grain:
+        # reconcile the table's grain fact with its FULL grain-column set (now incl. the added column),
+        # or the uniqueness key stays silently wrong (a grain column added to the graph but not the fact).
+        grain_cols = [r[0] for r in conn.execute(
+            "SELECT column_name FROM graph_node WHERE catalog_source = %s AND table_name = %s "
+            "AND kind = 'column' AND is_grain = true ORDER BY column_name",
+            (catalog_source, good.table)).fetchall()]
+        _assert_fact(conn, catalog_source, good.table, "grain",
+                     {"columns": grain_cols, "is_unique": True}, actor=actor)
     if good.as_of:
         basis = good.as_of_basis if good.as_of_basis in ("posted_at", "ingested_at") else "posted_at"
         _assert_fact(conn, catalog_source, good.table, "availability_time",

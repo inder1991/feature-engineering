@@ -61,10 +61,15 @@ class Change:
 
 
 def _type_fingerprint(obj) -> str:
-    """Stable fingerprint of the structural shape that, if changed, stales dependents:
-    object kind + declared data type. A column's type change (text→varchar) flips this;
-    a rename does not (the type is unchanged), so renames are detected by oid, not here."""
-    return hashlib.sha256(f"{obj.object_kind}|{obj.data_type}".encode()).hexdigest()
+    """Stable fingerprint of the shape that, if changed, stales dependents: object kind + declared
+    data type + SAFETY metadata (sensitivity/additivity/unit/currency/cardinality/PIT-basis/grain,
+    via obj.safety_fingerprint). A type change (text→varchar) OR a safety reclassification (public→pii,
+    additive→non_additive) flips this; a rename does not (detected by oid, not here). Adapters that
+    don't supply safety_fingerprint keep the data_type-only fingerprint (backward compatible)."""
+    safety = getattr(obj, "safety_fingerprint", None)
+    basis = (f"{obj.object_kind}|{obj.data_type}" if safety is None
+             else f"{obj.object_kind}|{obj.data_type}|{safety}")   # None -> exact old fingerprint
+    return hashlib.sha256(basis.encode()).hexdigest()
 
 
 def _load_snapshot(conn: DbConn, catalog_source: str) -> dict[str, dict]:

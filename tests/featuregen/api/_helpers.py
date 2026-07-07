@@ -1,7 +1,15 @@
 """Stub-auth headers + a small deposits catalog CSV shared across the API tests."""
 
-AUTH = {"X-User": "tester", "X-Roles": "data_owner"}
-PII_AUTH = {"X-User": "tester", "X-Roles": "data_owner,pii_reader"}
+# Default caller: broad FUNCTIONAL access (all of catalog/feature/iam) but NO data-sensitivity role,
+# so read-scope tests still hide pii/restricted. platform_admin via the stub is authenticated=False,
+# so admin routes (which additionally require authenticated) still 403 under this header.
+AUTH = {"X-User": "tester", "X-Roles": "platform_admin"}
+PII_AUTH = {"X-User": "tester", "X-Roles": "platform_admin,pii_reader"}
+
+# Role-scoped stubs for authorization-boundary tests.
+VIEWER = {"X-User": "v", "X-Roles": "catalog_viewer"}      # read-only
+OWNER = {"X-User": "o", "X-Roles": "data_owner"}           # upload/curate, no feature workflow
+ENGINEER = {"X-User": "e", "X-Roles": "feature_engineer"}  # feature workflow, no upload
 
 DEPOSITS_CSV = """\
 source,table,column,type,is_grain,as_of,definition,sensitivity,joins_to,cardinality,additivity,unit,currency,entity

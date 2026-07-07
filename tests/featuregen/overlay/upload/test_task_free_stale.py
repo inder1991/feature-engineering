@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from featuregen.contracts.envelopes import IdentityEnvelope
 from featuregen.overlay import facts
@@ -35,7 +35,7 @@ def _assert_grain(db, source, table, cols):
 
 
 def test_stale_without_opening_task(db):
-    now = datetime(2026, 7, 5, tzinfo=timezone.utc)
+    now = datetime(2026, 7, 5, tzinfo=UTC)
     # Upload 1: table with a grain on 'id'; establish snapshot.
     rows1 = [CanonicalRow("deposits", "accounts", "id", "integer", is_grain=True)]
     fk = _assert_grain(db, "deposits", "accounts", ["id"])

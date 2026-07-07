@@ -59,8 +59,9 @@ def confirm_contract(conn, draft: ContractDraft, *, actor, target_ref: str | Non
         feature_id, version = prev[0], prev[1] + 1
         conn.execute(
             "UPDATE feature SET description = %s, grain_table = %s, aggregation = %s, "
-            "as_of_column = %s WHERE feature_id = %s",
-            (draft.definition, draft.grain_table, draft.aggregation, draft.as_of_column, feature_id))
+            "as_of_column = %s, verification = %s WHERE feature_id = %s",   # refresh the stamp too
+            (draft.definition, draft.grain_table, draft.aggregation, draft.as_of_column,
+             "DESIGN-CHECKED", feature_id))
         conn.execute("DELETE FROM feature_derives_from WHERE feature_id = %s", (feature_id,))
         for catalog_source, object_ref in pairs:
             conn.execute("INSERT INTO feature_derives_from (feature_id, catalog_source, object_ref) "
@@ -123,12 +124,12 @@ def get_contract_detail(conn, contract_id: str) -> dict | None:
             "created_at": row[7].isoformat()}
 
 
-def feature_detail(conn, feature_id: str) -> dict | None:
+def feature_detail(conn, feature_id: str, *, roles=()) -> dict | None:
     """Feature 360: everything about one feature in a single view — its definition + verification stamp
-    + lineage (from get_feature), the governed contract's narrative + join path, the HYPOTHESIS it was
-    born from (feature -> latest contract -> intent), and its consumers (which models use it). The
-    hypothesis is present only for features born through the hypothesis-driven flow (None otherwise)."""
-    feat = get_feature(conn, feature_id)
+    + lineage (from get_feature, READ-SCOPED by roles), the governed contract's narrative + join path,
+    the HYPOTHESIS it was born from (feature -> latest contract -> intent), and its consumers (which
+    models use it). The hypothesis is present only for features born through the hypothesis-driven flow."""
+    feat = get_feature(conn, feature_id, roles=roles)
     if feat is None:
         return None
     row = conn.execute(

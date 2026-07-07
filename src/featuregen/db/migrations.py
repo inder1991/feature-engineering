@@ -11,6 +11,7 @@ from featuregen.state_machine.ddl import STATE_MACHINE_DDL
 # lexical order AFTER the core Python DDL above. Their 05xx_ prefix sorts them after the
 # core tables (events, documents, runtime, ...) they reference.
 _SQL_MIGRATIONS_DIR = Path(__file__).resolve().parent / "migrations"
+_MIGRATION_LOCK_KEY = 6157423001  # arbitrary fixed key for pg_advisory_xact_lock (deploy serialization)
 
 GLOBAL_SEQ = """
 CREATE SEQUENCE IF NOT EXISTS global_seq_seq AS bigint
@@ -257,13 +258,18 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 
 
 def _sql_file_migrations() -> list[tuple[str, str]]:
-    """Load db/migrations/*.sql in lexical order (Phase 05+ file-based migrations)."""
+    """Load db/migrations/*.sql in lexical order (Phase 05+ file-based migrations). The directory is
+    packaged runtime data — its absence means a BROKEN BUILD (wheel without package-data), never
+    "no migrations", so fail LOUD rather than silently applying an empty migration set to a live DB."""
     if not _SQL_MIGRATIONS_DIR.is_dir():
-        return []
-    return [
-        (path.stem, path.read_text(encoding="utf-8"))
-        for path in sorted(_SQL_MIGRATIONS_DIR.glob("*.sql"))
-    ]
+        raise RuntimeError(
+            f"SQL migrations directory not found at {_SQL_MIGRATIONS_DIR}. The package was built "
+            "without its migration data — verify [tool.setuptools.package-data] ships "
+            "db/migrations/*.sql. Refusing to run with an empty migration set.")
+    files = sorted(_SQL_MIGRATIONS_DIR.glob("*.sql"))
+    if not files:
+        raise RuntimeError(f"No .sql migrations found under {_SQL_MIGRATIONS_DIR} (broken build).")
+    return [(path.stem, path.read_text(encoding="utf-8")) for path in files]
 
 
 def pending_migrations(conn: DbConn) -> list[str]:
@@ -294,6 +300,11 @@ def apply_migrations(conn: DbConn) -> None:
     All of it happens inside one committing transaction (as before).
     """
     with conn.cursor() as cur:
+        # Serialize concurrent deploys: a transaction-scoped advisory lock (auto-released on
+        # commit/rollback) so two processes can't both apply migrations at once — otherwise both read
+        # "not applied", both run the DDL, and a destructive migration could execute twice. The key is
+        # an arbitrary fixed constant unique to this app's migration runner.
+        cur.execute("SELECT pg_advisory_xact_lock(%s)", (_MIGRATION_LOCK_KEY,))
         cur.execute(SCHEMA_MIGRATIONS)
         for name, sql in [*MIGRATIONS, *_sql_file_migrations()]:
             checksum = hashlib.sha256(sql.encode()).hexdigest()

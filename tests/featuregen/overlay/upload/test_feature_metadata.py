@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from featuregen.contracts.envelopes import IdentityEnvelope
 from featuregen.overlay.config import OverlayConfig, register_overlay_config
@@ -22,7 +22,7 @@ def _seal():
 
 def test_feature_metadata_surfaced_and_entity_searchable(db):
     _seal()
-    now = datetime(2026, 7, 5, tzinfo=timezone.utc)
+    now = datetime(2026, 7, 5, tzinfo=UTC)
     rows = [
         CanonicalRow("deposits", "accounts", "balance", "numeric", definition="ledger balance",
                      additivity="semi_additive", unit="cents", currency="USD", entity="Account"),

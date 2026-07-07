@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from featuregen.identity.local_session import (
     add_user_to_group,
@@ -11,7 +11,7 @@ from featuregen.identity.local_session import (
     verify_password,
 )
 
-NOW = datetime(2026, 7, 5, tzinfo=timezone.utc)
+NOW = datetime(2026, 7, 5, tzinfo=UTC)
 
 
 def test_password_hash_roundtrip():
@@ -57,3 +57,27 @@ def test_logout_and_bogus_token_do_not_resolve(db):
     assert resolve_session(db, token, now=NOW) is None
     assert resolve_session(db, "bogus", now=NOW) is None
     assert resolve_session(db, None, now=NOW) is None
+
+
+def test_unknown_user_verify_is_full_cost_no_timing_oracle():
+    # the dummy hash the unknown-user path verifies against must use the SAME round count as real
+    # hashes, so "no such user" and "wrong password" take the same time (no enumeration oracle).
+    from featuregen.identity.local_session import _DUMMY_HASH, _PBKDF2_ROUNDS
+    assert _DUMMY_HASH.startswith(f"pbkdf2_sha256${_PBKDF2_ROUNDS}$")
+
+
+def test_last_admin_guard(db):
+    from featuregen.identity.local_session import (
+        add_user_to_group,
+        create_group,
+        create_user,
+        is_last_admin,
+    )
+    a = create_user(db, "a", "pw")
+    g = create_group(db, "admins", roles=("platform_admin",))   # grants iam:manage
+    add_user_to_group(db, a, g)
+    assert is_last_admin(db, a) is True                 # only IAM-manager
+    b = create_user(db, "b", "pw")
+    add_user_to_group(db, b, g)
+    assert is_last_admin(db, a) is False                # a second IAM-manager exists
+    assert is_last_admin(db, create_user(db, "c", "pw")) is False   # a non-admin is never "last admin"

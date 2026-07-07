@@ -160,12 +160,17 @@ def suggest_entities(conn, client, catalog_source: str, *, roles: Iterable[str] 
     return written
 
 
-def list_entity_suggestions(conn, catalog_source: str, *,
-                            status: str = "pending") -> list[EntitySuggestion]:
+def list_entity_suggestions(conn, catalog_source: str, *, status: str = "pending",
+                            roles: Iterable[str] = ()) -> list[EntitySuggestion]:
+    """Pending entity suggestions for a catalog, READ-SCOPED: a suggestion on a column whose
+    sensitivity the caller's roles can't see is withheld (consistent with search/graph)."""
     rows = conn.execute(
-        "SELECT object_ref, table_name, column_name, suggested_entity, status FROM entity_suggestion "
-        "WHERE catalog_source = %s AND status = %s ORDER BY object_ref",
-        (catalog_source, status)).fetchall()
+        "SELECT s.object_ref, s.table_name, s.column_name, s.suggested_entity, s.status "
+        "FROM entity_suggestion s "
+        "LEFT JOIN graph_node n ON n.object_ref = s.object_ref AND n.catalog_source = s.catalog_source "
+        "WHERE s.catalog_source = %s AND s.status = %s "
+        "  AND (n.sensitivity IS NULL OR n.sensitivity = ANY(%s)) ORDER BY s.object_ref",
+        (catalog_source, status, allowed_sensitivities(roles))).fetchall()
     return [EntitySuggestion(r[0], r[1], r[2], r[3], r[4]) for r in rows]
 
 
@@ -194,7 +199,7 @@ def dismiss_entity_suggestion(conn, catalog_source: str, object_ref: str) -> boo
 
 from collections import deque  # noqa: E402
 
-from featuregen.overlay.upload.join_path import _table_of  # noqa: E402
+from featuregen.overlay.upload.join_path import _invert, _table_of  # noqa: E402
 
 
 @dataclass(frozen=True, slots=True)
@@ -222,7 +227,9 @@ def _cross_adjacency(conn, roles: Iterable[str]) -> dict:
         if a == b:
             continue
         link(a, b, CrossStep("join", src, a[1], src, b[1], card or ""))
-        link(b, a, CrossStep("join", src, b[1], src, a[1], card or ""))
+        # the reverse hop INVERTS the fan (M7): a reverse N:1 is really 1:N — else a human confirms a
+        # cross-catalog path that claims a fan-out hop fans in safely (double-count hazard).
+        link(b, a, CrossStep("join", src, b[1], src, a[1], _invert(card) or ""))
 
     for entity in list_entities(conn):
         tables = sorted({(k.catalog_source, k.table) for k in entity_key_columns(conn, entity, roles=roles)})

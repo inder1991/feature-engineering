@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from featuregen.contracts.envelopes import IdentityEnvelope
 from featuregen.overlay.config import OverlayConfig, register_overlay_config
@@ -26,7 +26,7 @@ def _seal():
 
 def test_quarantine_persisted_and_cleared_on_reupload(db):
     _seal()
-    now = datetime(2026, 7, 5, tzinfo=timezone.utc)
+    now = datetime(2026, 7, 5, tzinfo=UTC)
 
     # Upload 1: one good row + one bad (blank column) -> ingested, 1 quarantined + persisted.
     rows1 = [
@@ -53,7 +53,7 @@ def test_quarantine_persisted_and_cleared_on_reupload(db):
 
 def _quarantine_one_bad(db):
     _seal()
-    now = datetime(2026, 7, 5, tzinfo=timezone.utc)
+    now = datetime(2026, 7, 5, tzinfo=UTC)
     rows = [
         CanonicalRow("deposits", "accounts", "id", "integer", is_grain=True),
         CanonicalRow("deposits", "accounts", "", "text"),   # blank column -> quarantined
@@ -93,3 +93,23 @@ def test_dismiss_quarantine_row(db):
     assert dismiss_quarantine_row(db, "deposits", idx) is True
     assert list_quarantine(db, "deposits") == []
     assert dismiss_quarantine_row(db, "deposits", 999) is False    # unknown row
+
+
+def test_resolve_grain_column_reconciles_the_grain_fact(db):
+    from featuregen.overlay.identity import fact_key
+    from featuregen.overlay.state import fold_overlay_state
+    from featuregen.overlay.store import load_fact
+    from featuregen.overlay.upload.upload_catalog import table_ref
+    _seal()
+    now = datetime(2026, 7, 5, tzinfo=UTC)
+    rows = [
+        CanonicalRow("deposits", "accounts", "id", "integer", is_grain=True),
+        CanonicalRow("deposits", "accounts", "cust_id", "", is_grain=True),   # blank type -> quarantined
+    ]
+    ingest_upload(db, "deposits", rows, actor=_actor(), now=now)
+    idx = list_quarantine(db, "deposits")[0].row_index
+    resolved, _ = resolve_quarantine_row(db, "deposits", idx, {"type": "integer"}, actor=_actor())
+    assert resolved
+    # the table's grain fact now covers BOTH grain columns, not just the one that ingested cleanly
+    state = fold_overlay_state(load_fact(db, fact_key(table_ref("deposits", "accounts"), "grain")))
+    assert set(state.value["columns"]) == {"id", "cust_id"}

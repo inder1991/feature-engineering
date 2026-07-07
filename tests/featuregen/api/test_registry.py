@@ -40,3 +40,18 @@ def test_feature_360_has_no_hypothesis_for_a_directly_registered_feature(make_cl
     assert body["hypothesis"] is None and body["contract"] is None   # not born from the hypothesis flow
     assert body["verification"] == "DESIGN-CHECKED"
     assert body["consumers"] == []
+
+
+def test_feature_360_read_scopes_the_lineage(make_client, conn):
+    from featuregen.overlay.upload.canonical import CanonicalRow
+    from featuregen.overlay.upload.graph import build_graph
+
+    from ._helpers import PII_AUTH
+    build_graph(conn, "bank", [CanonicalRow("bank", "accounts", "ssn", "text", sensitivity="pii")])
+    fid = register_feature(conn, FeatureSpec(name="uses_pii", aggregation="count",
+                                             derives_from=(("bank", "public.accounts.ssn"),)))
+    # data_owner (no pii_reader): the pii lineage is WITHHELD (can't enumerate where pii lives)
+    assert make_client().get(f"/features/{fid}", headers=AUTH).json()["derives_from"] == []
+    # pii_reader: sees the lineage
+    body = make_client().get(f"/features/{fid}", headers=PII_AUTH).json()
+    assert any(d["object_ref"] == "public.accounts.ssn" for d in body["derives_from"])

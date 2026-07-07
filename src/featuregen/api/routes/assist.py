@@ -9,7 +9,7 @@ import psycopg
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field
 
-from featuregen.api.deps import get_conn, get_identity, get_llm
+from featuregen.api.deps import get_conn, get_identity, get_llm, require_feature_generate
 from featuregen.contracts.envelopes import IdentityEnvelope
 from featuregen.intake.llm import LLMClient
 from featuregen.overlay.upload.feature_assist import (
@@ -66,7 +66,7 @@ class LeakageIn(BaseModel):
     target_ref: str
 
 
-@router.post("/features/recommend")
+@router.post("/features/recommend", dependencies=[Depends(require_feature_generate)])
 def recommend(
     body: RecommendIn,
     conn: Annotated[psycopg.Connection, Depends(get_conn, scope="function")],
@@ -88,7 +88,7 @@ def recommend(
     return {"proposals": report.ideas, "rejections": report.rejections}
 
 
-@router.post("/features/refine")
+@router.post("/features/refine", dependencies=[Depends(require_feature_generate)])
 def refine(
     body: RefineIn,
     conn: Annotated[psycopg.Connection, Depends(get_conn, scope="function")],
@@ -109,7 +109,7 @@ def refine(
     return {"rejected": {"reason": str(rej.get("reason", "")), "code": str(rej.get("code", ""))}}
 
 
-@router.post("/features/recommend-sets")
+@router.post("/features/recommend-sets", dependencies=[Depends(require_feature_generate)])
 def recommend_sets(
     body: RecommendIn,
     conn: Annotated[psycopg.Connection, Depends(get_conn, scope="function")],
@@ -133,7 +133,7 @@ def recommend_sets(
             "rejections": report.rejections}
 
 
-@router.post("/features/recipe")
+@router.post("/features/recipe", dependencies=[Depends(require_feature_generate)])
 def recipe(
     body: RecipeIn,
     conn: Annotated[psycopg.Connection, Depends(get_conn, scope="function")],
@@ -145,7 +145,7 @@ def recipe(
                           actor=identity)
 
 
-@router.post("/features/leakage-check")
+@router.post("/features/leakage-check", dependencies=[Depends(require_feature_generate)])
 def leakage(
     body: LeakageIn,
     conn: Annotated[psycopg.Connection, Depends(get_conn, scope="function")],

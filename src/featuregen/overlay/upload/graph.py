@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 
 from featuregen.overlay.upload.canonical import CanonicalRow
 from featuregen.overlay.upload.concepts import humanize
 from featuregen.overlay.upload.enrich import content_hash
+from featuregen.overlay.upload.read_scope import allowed_sensitivities
 
 _SCHEMA = "public"
 
@@ -123,15 +125,21 @@ class JoinEdge:
     resolved: bool   # whether to_ref is a known node (a pending/cross-source target is unresolved)
 
 
-def column_joins(conn, catalog_source: str, object_ref: str) -> list[JoinEdge]:
-    """The join edges out of a column — including ones whose target isn't loaded yet (pending)."""
+def column_joins(conn, catalog_source: str, object_ref: str, *,
+                 roles: Iterable[str] = ()) -> list[JoinEdge]:
+    """The join edges out of a column — including ones whose target isn't loaded yet (pending). READ-
+    SCOPED: an edge whose TARGET column has a sensitivity the caller's roles can't see is withheld, so
+    the graph can't be walked to enumerate restricted columns (a resolved target with unknown
+    sensitivity, e.g. a cross-source pending ref, is kept — nothing sensitive is known about it)."""
     rows = conn.execute(
         "SELECT e.from_ref, e.to_ref, e.cardinality, "
         # M5: scope by catalog — a cross-source target present in ANOTHER catalog is NOT resolved here.
         "  EXISTS(SELECT 1 FROM graph_node n WHERE n.object_ref = e.to_ref "
         "         AND n.catalog_source = e.catalog_source) AS resolved "
         "FROM graph_edge e "
+        "LEFT JOIN graph_node tn ON tn.object_ref = e.to_ref AND tn.catalog_source = e.catalog_source "
         "WHERE e.catalog_source = %s AND e.kind = 'joins' AND e.from_ref = %s "
+        "  AND (tn.sensitivity IS NULL OR tn.sensitivity = ANY(%s)) "
         "ORDER BY e.to_ref",
-        (catalog_source, object_ref)).fetchall()
+        (catalog_source, object_ref, allowed_sensitivities(roles))).fetchall()
     return [JoinEdge(from_ref=r[0], to_ref=r[1], cardinality=r[2], resolved=r[3]) for r in rows]

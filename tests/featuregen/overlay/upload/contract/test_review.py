@@ -1,12 +1,12 @@
 """Phase 4 — critique→refine loop + MCV."""
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from featuregen.overlay.upload.canonical import CanonicalRow
 from featuregen.overlay.upload.contract.author import ContractDraft
 from featuregen.overlay.upload.contract.review import author_contract, validate_minimum
 from featuregen.overlay.upload.graph import build_graph
 
-NOW = datetime(2026, 7, 5, tzinfo=timezone.utc)
+NOW = datetime(2026, 7, 5, tzinfo=UTC)
 
 
 def _bank(db):

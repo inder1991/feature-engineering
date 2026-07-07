@@ -28,6 +28,11 @@ class CatalogObject:
     column: str | None
     data_type: str | None
     native_oid: str | None
+    # Optional SAFETY-relevant metadata (sensitivity, additivity, unit/currency, cardinality, PIT
+    # basis, grain) folded into the drift fingerprint so a change to any of them stales dependents —
+    # a data_type-only fingerprint misses e.g. a public->pii or additive->non_additive reclassification.
+    # None (adapters that don't supply it) leaves the fingerprint == the data_type-only fingerprint.
+    safety_fingerprint: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

@@ -1,5 +1,5 @@
 """Phase 2 — Gate #1 bridge: considered-set from the loop + recorded human choice."""
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import pytest
 
@@ -13,7 +13,7 @@ from featuregen.overlay.upload.contract.gate1 import (
 from featuregen.overlay.upload.contract.intake import submit_intent
 from featuregen.overlay.upload.graph import build_graph
 
-NOW = datetime(2026, 7, 5, tzinfo=timezone.utc)
+NOW = datetime(2026, 7, 5, tzinfo=UTC)
 
 
 def _bank(db):

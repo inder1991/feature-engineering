@@ -621,6 +621,7 @@ def test_run_drift_scan_skips_when_overlay_projection_lags(db):
 
     from featuregen.contracts import IdentityEnvelope
     from featuregen.overlay import facts
+    from featuregen.overlay.bootstrap import register_overlay
     from featuregen.overlay.catalog import (
         FixtureCatalog,
         _clear_catalog_adapter,
@@ -632,7 +633,6 @@ def test_run_drift_scan_skips_when_overlay_projection_lags(db):
         _clear_overlay_config,
         register_overlay_config,
     )
-    from featuregen.overlay.bootstrap import register_overlay
     from featuregen.overlay.projection import OverlayProjection
     from featuregen.overlay.store import append_overlay_event
     from featuregen.projections.runner import run_projection

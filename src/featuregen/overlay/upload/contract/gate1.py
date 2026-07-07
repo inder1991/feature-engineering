@@ -163,11 +163,19 @@ def chosen_feature(conn, intent_id: str, chosen_source: str,
     if chosen_source == "anchor":
         a = snap.get("anchor")
         return _idea_from_json(a) if a and a.get("name") == chosen_option_id else None
-    for s in snap.get("alternatives", []):
-        for f in s.get("features", []):
-            if f.get("name") == chosen_option_id:
-                return _idea_from_json(f)
-    return None
+    # Collect EVERY alternative matching the name. If two lenses emitted the same name with different
+    # structure (derives/aggregation), the choice is genuinely AMBIGUOUS — reconstructing the "first"
+    # would govern a feature the human may not have picked, so fail closed (caller -> 422).
+    matches = [f for s in snap.get("alternatives", []) for f in s.get("features", [])
+               if f.get("name") == chosen_option_id]
+    if not matches:
+        return None
+    first = matches[0]
+    key = (first.get("aggregation"), [tuple(p) for p in first.get("derives_pairs", [])])
+    if any((m.get("aggregation"), [tuple(p) for p in m.get("derives_pairs", [])]) != key
+           for m in matches[1:]):
+        return None   # ambiguous same-name options — cannot safely reconstruct
+    return _idea_from_json(first)
 
 
 def record_gate1_choice(conn, intent_id: str, *, chosen_source: str, chosen_option_id: str,
@@ -182,3 +190,12 @@ def record_gate1_choice(conn, intent_id: str, *, chosen_source: str, chosen_opti
         "chosen_option_id = EXCLUDED.chosen_option_id, why = EXCLUDED.why, actor = EXCLUDED.actor",
         (intent_id, chosen_source, chosen_option_id, why, _actor_json(actor),
          json.dumps(row[0] if row else {})))
+
+
+def gate1_choice(conn, intent_id: str) -> dict | None:
+    """The human's RECORDED Gate #1 choice for an intent, or None if none was recorded. Used by
+    /contract/confirm to prove a governed feature was actually chosen from the considered set."""
+    row = conn.execute(
+        "SELECT chosen_source, chosen_option_id FROM contract_gate1_choice WHERE intent_id = %s",
+        (intent_id,)).fetchone()
+    return {"chosen_source": row[0], "chosen_option_id": row[1]} if row else None

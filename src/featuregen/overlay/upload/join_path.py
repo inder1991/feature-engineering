@@ -8,7 +8,10 @@ double-count. The LLM later *suggests* which path to use; this finds the paths t
 from __future__ import annotations
 
 from collections import deque
+from collections.abc import Iterable
 from dataclasses import dataclass
+
+from featuregen.overlay.upload.read_scope import allowed_sensitivities
 
 
 @dataclass(frozen=True, slots=True)
@@ -33,15 +36,22 @@ def _invert(cardinality: str | None) -> str | None:
 
 
 def find_join_path(conn, catalog_source: str, from_table: str,
-                   to_table: str) -> list[JoinStep] | None:
+                   to_table: str, *, roles: Iterable[str] = ()) -> list[JoinStep] | None:
     """The shortest join path (list of steps) between two tables, or None if unreachable.
-    [] when from_table == to_table. Edges are traversed undirected (you may join either way)."""
+    [] when from_table == to_table. Edges are traversed undirected (you may join either way). READ-
+    SCOPED: an edge whose from/to column has a sensitivity the caller's roles can't see is excluded, so
+    a path can't be walked THROUGH a restricted join key the caller isn't cleared to know about."""
     if from_table == to_table:
         return []
+    allowed = allowed_sensitivities(roles)
     edges = conn.execute(
-        "SELECT from_ref, to_ref, cardinality FROM graph_edge "
-        "WHERE catalog_source = %s AND kind = 'joins'",
-        (catalog_source,)).fetchall()
+        "SELECT e.from_ref, e.to_ref, e.cardinality FROM graph_edge e "
+        "LEFT JOIN graph_node fn ON fn.object_ref = e.from_ref AND fn.catalog_source = e.catalog_source "
+        "LEFT JOIN graph_node tn ON tn.object_ref = e.to_ref AND tn.catalog_source = e.catalog_source "
+        "WHERE e.catalog_source = %s AND e.kind = 'joins' "
+        "  AND (fn.sensitivity IS NULL OR fn.sensitivity = ANY(%s)) "
+        "  AND (tn.sensitivity IS NULL OR tn.sensitivity = ANY(%s))",
+        (catalog_source, allowed, allowed)).fetchall()
 
     adj: dict[str, list[tuple[str, JoinStep]]] = {}
     for from_ref, to_ref, card in edges:

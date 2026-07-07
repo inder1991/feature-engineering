@@ -7,7 +7,12 @@ import psycopg
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
-from featuregen.api.deps import get_conn, get_identity
+from featuregen.api.deps import (
+    get_conn,
+    get_identity,
+    require_feature_generate,
+    require_feature_read,
+)
 from featuregen.contracts.envelopes import IdentityEnvelope
 from featuregen.overlay.upload.contract.govern import feature_detail
 from featuregen.overlay.upload.features import (
@@ -47,7 +52,7 @@ class FeatureSpecIn(BaseModel):
     derives_from: list[DerivesFromIn] = []
 
 
-@router.post("/features")
+@router.post("/features", dependencies=[Depends(require_feature_generate)])
 def create_feature(
     body: FeatureSpecIn,
     conn: Annotated[psycopg.Connection, Depends(get_conn, scope="function")],
@@ -58,10 +63,13 @@ def create_feature(
         name=body.name, description=body.description, grain_table=body.grain_table,
         aggregation=body.aggregation, as_of_column=body.as_of_column,
         derives_from=tuple((d.catalog_source, d.object_ref) for d in body.derives_from))
-    return {"feature_id": register_feature(conn, spec)}
+    try:
+        return {"feature_id": register_feature(conn, spec)}
+    except psycopg.errors.UniqueViolation as exc:   # feature.name is unique (0970)
+        raise HTTPException(status_code=409, detail=f"a feature named {body.name!r} already exists") from exc
 
 
-@router.get("/features/{feature_id}/freshness")
+@router.get("/features/{feature_id}/freshness", dependencies=[Depends(require_feature_read)])
 def freshness(
     feature_id: str,
     conn: Annotated[psycopg.Connection, Depends(get_conn, scope="function")],
@@ -73,7 +81,7 @@ def freshness(
     return feature_freshness(conn, feature_id, now=datetime.now(UTC))
 
 
-@router.get("/columns/{object_ref}/feature-impact")
+@router.get("/columns/{object_ref}/feature-impact", dependencies=[Depends(require_feature_read)])
 def feature_impact(
     object_ref: str,
     source: str,
@@ -84,22 +92,22 @@ def feature_impact(
 
 
 # ---- registry read surface (the catalog was write-only) -----------------------------------------
-@router.get("/features")
+@router.get("/features", dependencies=[Depends(require_feature_read)])
 def list_registered_features(conn: _Conn, identity: _Identity, limit: int = 50) -> list[dict]:
     return list_features(conn, limit=limit)
 
 
-@router.get("/features/{feature_id}")
+@router.get("/features/{feature_id}", dependencies=[Depends(require_feature_read)])
 def get_registered_feature(feature_id: str, conn: _Conn, identity: _Identity) -> dict:
     """Feature 360: definition + verification + lineage + the HYPOTHESIS it was born from + consumers."""
-    feat = feature_detail(conn, feature_id)
+    feat = feature_detail(conn, feature_id, roles=identity.role_claims)
     if feat is None:
         raise HTTPException(status_code=404, detail=f"unknown feature {feature_id!r}")
     return feat
 
 
 # ---- model <-> feature consumer registration (SP-14) --------------------------------------------
-@router.post("/features/{feature_id}/consumers")
+@router.post("/features/{feature_id}/consumers", dependencies=[Depends(require_feature_generate)])
 def add_consumer(feature_id: str, body: ConsumerIn, conn: _Conn, identity: _Identity) -> dict:
     cid = register_consumer(conn, model_ref=body.model_ref, feature_id=feature_id,
                             purpose=body.purpose, environment=body.environment,
@@ -109,11 +117,11 @@ def add_consumer(feature_id: str, body: ConsumerIn, conn: _Conn, identity: _Iden
     return {"consumer_id": cid}
 
 
-@router.get("/features/{feature_id}/consumers")
+@router.get("/features/{feature_id}/consumers", dependencies=[Depends(require_feature_read)])
 def list_feature_consumers(feature_id: str, conn: _Conn, identity: _Identity) -> list[dict]:
     return consumers_of_feature(conn, feature_id)
 
 
-@router.get("/consumers/{model_ref}/features")
+@router.get("/consumers/{model_ref}/features", dependencies=[Depends(require_feature_read)])
 def list_consumer_features(model_ref: str, conn: _Conn, identity: _Identity) -> list[dict]:
     return features_for_consumer(conn, model_ref)

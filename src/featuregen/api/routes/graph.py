@@ -5,7 +5,7 @@ from typing import Annotated
 import psycopg
 from fastapi import APIRouter, Depends, Query
 
-from featuregen.api.deps import get_conn, get_identity
+from featuregen.api.deps import get_conn, get_identity, require_catalog_read
 from featuregen.contracts.envelopes import IdentityEnvelope
 from featuregen.overlay.upload.graph import JoinEdge, column_joins
 from featuregen.overlay.upload.join_path import JoinStep, find_join_path
@@ -13,17 +13,17 @@ from featuregen.overlay.upload.join_path import JoinStep, find_join_path
 router = APIRouter()
 
 
-@router.get("/columns/{object_ref}/joins")
+@router.get("/columns/{object_ref}/joins", dependencies=[Depends(require_catalog_read)])
 def joins_for_column(
     object_ref: str,
     source: str,
     conn: Annotated[psycopg.Connection, Depends(get_conn, scope="function")],
     identity: Annotated[IdentityEnvelope, Depends(get_identity)],
 ) -> list[JoinEdge]:
-    return column_joins(conn, source, object_ref)
+    return column_joins(conn, source, object_ref, roles=identity.role_claims)
 
 
-@router.get("/join-path")
+@router.get("/join-path", dependencies=[Depends(require_catalog_read)])
 def join_path(
     source: str,
     to: str,
@@ -33,4 +33,4 @@ def join_path(
 ) -> list[JoinStep] | None:
     """Steps oriented to the traversal direction (a reverse N:1 hop reads 1:N — M7).
     null = unreachable; [] = same table."""
-    return find_join_path(conn, source, from_table, to)
+    return find_join_path(conn, source, from_table, to, roles=identity.role_claims)
