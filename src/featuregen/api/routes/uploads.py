@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from datetime import UTC, datetime
 from typing import Annotated
 
@@ -15,6 +16,18 @@ from featuregen.overlay.upload.excel_reader import read_excel_rows
 from featuregen.overlay.upload.ingest import IngestResult, ingest_upload
 
 router = APIRouter()
+
+# A catalog upload is a SCHEMA export (column names/types/grain), not a data extract, so a modest cap
+# bounds the whole-file in-memory read + parse against an accidental or malicious oversized upload.
+_MAX_UPLOAD_BYTES = int(os.environ.get("FEATUREGEN_MAX_UPLOAD_BYTES", str(25 * 1024 * 1024)))
+
+
+def _read_capped(file: UploadFile) -> bytes:
+    data = file.file.read(_MAX_UPLOAD_BYTES + 1)   # read one past the cap to detect an over-limit file
+    if len(data) > _MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413,
+                            detail=f"upload exceeds the {_MAX_UPLOAD_BYTES // (1024 * 1024)} MiB limit")
+    return data
 
 
 def _read_rows(filename: str, data: bytes, source: str) -> list[CanonicalRow]:
@@ -35,7 +48,7 @@ def create_upload(
     client: Annotated[LLMClient | None, Depends(get_llm_optional)],
 ) -> IngestResult:
     try:
-        rows = _read_rows(file.filename or "", file.file.read(), source)
+        rows = _read_rows(file.filename or "", _read_capped(file), source)
     except HTTPException:
         raise
     except Exception as exc:   # a malformed file is a client error, not a 500

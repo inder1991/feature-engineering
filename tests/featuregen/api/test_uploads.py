@@ -96,3 +96,14 @@ def test_upload_enriches_via_configured_llm_client(make_client):
     res = upload_csv(client, "deposits", DEPOSITS_CSV)
     assert res.json()["status"] == "ingested"   # empty/invalid LLM output degrades gracefully
     assert recording.tasks                      # enrichment was attempted via the app's client
+
+
+def test_upload_rejects_oversized_file(client, monkeypatch):
+    import io
+
+    from featuregen.api.routes import uploads
+    monkeypatch.setattr(uploads, "_MAX_UPLOAD_BYTES", 100)   # tiny cap for the test
+    payload = b"source,table,column,type\n" + b"x" * 500
+    resp = client.post("/uploads", data={"source": "bank"},
+                       files={"file": ("big.csv", io.BytesIO(payload), "text/csv")}, headers=AUTH)
+    assert resp.status_code == 413
