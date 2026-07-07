@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from collections.abc import Iterator
 from datetime import UTC, datetime
@@ -22,6 +23,35 @@ from featuregen.identity.permissions import (
     has_permission,
 )
 from featuregen.intake.llm import LLMClient
+from featuregen.security.audit import record_security_event
+
+logger = logging.getLogger(__name__)
+
+
+def _write_denied_audit(conn, identity: IdentityEnvelope, action: str) -> None:
+    """Write one ACCESS_DENIED row to the tamper-evident security_audit chain (separated out so it can
+    be unit-tested against a normal connection)."""
+    record_security_event(conn, event_type="ACCESS_DENIED", actor=identity,
+                          attempted_action=action, decision="denied", reason=action)
+
+
+def audit_access_denied(identity: IdentityEnvelope, action: str) -> None:
+    """Record a denied access attempt on the tamper-evident chain, so blocked/probing attempts are
+    EVIDENCE, not a silent 403 (examiner proof + insider-threat + forensics). Written on a SEPARATE
+    connection because the 403 rolls the request transaction back — an audit on it would be lost. Only
+    in real-auth mode (stub OFF = production): with the dev stub on it is skipped, both because it is a
+    production control and because a separate committing connection would pollute the rolled-back test
+    DB. Best-effort — an audit failure never turns a correct 403 into a 500."""
+    if _auth_stub_enabled():
+        return
+    dsn = get_settings().dsn
+    if not dsn:
+        return
+    try:
+        with psycopg.connect(dsn) as conn:   # its own tx, committed on exit — survives the 403 rollback
+            _write_denied_audit(conn, identity, action)
+    except Exception:  # noqa: BLE001 — never let an audit failure mask the (correct) denial
+        logger.warning("failed to record ACCESS_DENIED for %s", action, exc_info=True)
 
 
 def require_permission(permission: str):
@@ -30,8 +60,10 @@ def require_permission(permission: str):
     so this is stub-compatible; production self-granting is blocked by the stub being OFF, and iam:manage
     additionally requires an authenticated principal (see require_admin)."""
 
-    def _dep(identity: Annotated[IdentityEnvelope, Depends(get_identity)]) -> IdentityEnvelope:
+    def _dep(request: Request,
+             identity: Annotated[IdentityEnvelope, Depends(get_identity)]) -> IdentityEnvelope:
         if not has_permission(identity.role_claims, permission):
+            audit_access_denied(identity, f"{permission} on {request.method} {request.url.path}")
             raise HTTPException(status_code=403, detail=f"missing permission: {permission}")
         return identity
 

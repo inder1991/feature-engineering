@@ -6,10 +6,10 @@ from __future__ import annotations
 from typing import Annotated
 
 import psycopg
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 
-from featuregen.api.deps import get_conn, get_identity
+from featuregen.api.deps import audit_access_denied, get_conn, get_identity
 from featuregen.contracts.envelopes import IdentityEnvelope
 from featuregen.identity.local_session import (
     add_user_to_group,
@@ -34,11 +34,13 @@ router = APIRouter()
 _Conn = Annotated[psycopg.Connection, Depends(get_conn, scope="function")]
 
 
-def require_admin(identity: Annotated[IdentityEnvelope, Depends(get_identity)]) -> IdentityEnvelope:
+def require_admin(request: Request,
+                  identity: Annotated[IdentityEnvelope, Depends(get_identity)]) -> IdentityEnvelope:
     # The crown jewel: require a PROVEN principal with the iam:manage permission (access_admin /
     # platform_admin), not just self-asserted roles. An unauthenticated stub identity must NOT reach
     # the admin control plane even if the stub is on — defense-in-depth on top of stub-off-in-prod.
     if not (identity.authenticated and has_permission(identity.role_claims, IAM_MANAGE)):
+        audit_access_denied(identity, f"{IAM_MANAGE} on {request.method} {request.url.path}")
         raise HTTPException(status_code=403, detail="iam:manage permission required")
     return identity
 

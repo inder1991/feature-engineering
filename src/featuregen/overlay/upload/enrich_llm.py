@@ -61,7 +61,7 @@ def _audit_egress_block(conn, *, task: str, actor, reason: str) -> None:
         return
     try:
         record_security_event(conn, event_type="EGRESS_BLOCKED", actor=actor,
-                              attempted_action=f"llm.{task}", decision="DENIED",
+                              attempted_action=f"llm.{task}", decision="denied",
                               reason=reason or "egress guard blocked")
     except Exception:  # noqa: BLE001 — never let an audit failure mask the (correct) egress block
         logger.exception("failed to record EGRESS_BLOCKED security event for %s", task)

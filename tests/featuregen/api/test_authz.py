@@ -55,3 +55,16 @@ def test_no_functional_role_is_denied(client):
     norole = {"X-User": "n", "X-Roles": ""}
     assert client.get("/search", params={"q": "x"}, headers=norole).status_code == 403
     assert upload_csv(client, "deposits", DEPOSITS_CSV, headers=norole).status_code == 403
+
+
+def test_write_denied_audit_records_a_tamper_evident_row(db):
+    # The denial-audit record: an ACCESS_DENIED row on the security_audit chain naming who + what.
+    from tests.featuregen._helpers import mint_test_identity
+
+    from featuregen.api.deps import _write_denied_audit
+    ident = mint_test_identity(subject="user:priya", role_claims=["catalog_viewer"])
+    _write_denied_audit(db, ident, "catalog:write on POST /uploads")
+    row = db.execute(
+        "SELECT event_type, decision, actor->>'subject', attempted_action "
+        "FROM security_audit WHERE event_type = 'ACCESS_DENIED'").fetchone()
+    assert row == ("ACCESS_DENIED", "denied", "user:priya", "catalog:write on POST /uploads")
