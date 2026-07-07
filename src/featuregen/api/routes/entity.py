@@ -10,7 +10,13 @@ import psycopg
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
-from featuregen.api.deps import get_conn, get_identity, get_llm
+from featuregen.api.deps import (
+    get_conn,
+    get_identity,
+    get_llm,
+    require_catalog_read,
+    require_catalog_write,
+)
 from featuregen.contracts.envelopes import IdentityEnvelope
 from featuregen.intake.llm import LLMClient
 from featuregen.overlay.upload.entity import (
@@ -35,7 +41,7 @@ class ResolveIn(BaseModel):
     object_ref: str = Field(min_length=1)
 
 
-@router.post("/entity/suggest")
+@router.post("/entity/suggest", dependencies=[Depends(require_catalog_write)])
 def suggest(body: SuggestIn, conn: _Conn, identity: _Identity, client: _LLM) -> dict:
     """Generate advisory entity suggestions for this catalog's un-tagged id-like columns (read-scoped)."""
     n = suggest_entities(conn, client, body.catalog_source, roles=identity.role_claims,
@@ -43,14 +49,14 @@ def suggest(body: SuggestIn, conn: _Conn, identity: _Identity, client: _LLM) -> 
     return {"suggested": n}
 
 
-@router.get("/entity/suggestions")
+@router.get("/entity/suggestions", dependencies=[Depends(require_catalog_read)])
 def suggestions(catalog_source: str, conn: _Conn, identity: _Identity) -> list[dict]:
     return [{"object_ref": s.object_ref, "table": s.table, "column": s.column,
              "suggested_entity": s.suggested_entity}
             for s in list_entity_suggestions(conn, catalog_source, roles=identity.role_claims)]
 
 
-@router.post("/entity/apply")
+@router.post("/entity/apply", dependencies=[Depends(require_catalog_write)])
 def apply(body: ResolveIn, conn: _Conn, identity: _Identity) -> dict:
     """The human confirms: write the suggested entity onto the column (durable across re-upload)."""
     if not apply_entity_suggestion(conn, body.catalog_source, body.object_ref, actor=identity):
@@ -58,7 +64,7 @@ def apply(body: ResolveIn, conn: _Conn, identity: _Identity) -> dict:
     return {"applied": True}
 
 
-@router.post("/entity/dismiss")
+@router.post("/entity/dismiss", dependencies=[Depends(require_catalog_write)])
 def dismiss(body: ResolveIn, conn: _Conn, identity: _Identity) -> dict:
     if not dismiss_entity_suggestion(conn, body.catalog_source, body.object_ref):
         raise HTTPException(status_code=404, detail="no pending suggestion for that column")

@@ -14,7 +14,13 @@ import psycopg
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
-from featuregen.api.deps import get_conn, get_identity, get_llm
+from featuregen.api.deps import (
+    get_conn,
+    get_identity,
+    get_llm,
+    require_feature_generate,
+    require_feature_read,
+)
 from featuregen.contracts.envelopes import IdentityEnvelope
 from featuregen.intake.llm import LLMClient
 from featuregen.overlay.upload.contract.author import ContractDraft, draft_contract
@@ -82,7 +88,7 @@ class DraftReqIn(BaseModel):
 
 
 # ---- routes -------------------------------------------------------------------------------------
-@router.post("/contract/considered-set")
+@router.post("/contract/considered-set", dependencies=[Depends(require_feature_generate)])
 def considered_set(body: ConsideredSetIn, conn: _Conn, identity: _Identity, client: _LLM) -> dict:
     """Intake (mandatory hypothesis + optional definition, redacted) → the validated considered set:
     the anchor (from the definition) + generated alternatives + an advisory recommendation. Persists
@@ -99,7 +105,7 @@ def considered_set(body: ConsideredSetIn, conn: _Conn, identity: _Identity, clie
             "alternatives": cs.alternatives, "recommendation": cs.recommendation}
 
 
-@router.post("/contract/draft")
+@router.post("/contract/draft", dependencies=[Depends(require_feature_generate)])
 def draft(body: DraftReqIn, conn: _Conn, identity: _Identity, client: _LLM) -> dict:
     """Gate #1 → author. The chosen feature is reconstructed from the SERVER-persisted considered set
     (BLOCKER 1 — never an arbitrary client payload); the choice is recorded (audit); the leakage target
@@ -117,12 +123,12 @@ def draft(body: DraftReqIn, conn: _Conn, identity: _Identity, client: _LLM) -> d
     return {"draft": d, "unresolved": unresolved, "intent_id": body.intent_id}
 
 
-@router.get("/contracts")
+@router.get("/contracts", dependencies=[Depends(require_feature_read)])
 def list_governed_contracts(conn: _Conn, identity: _Identity, limit: int = 50) -> list[dict]:
     return list_contracts(conn, limit=limit)
 
 
-@router.get("/contracts/{contract_id}")
+@router.get("/contracts/{contract_id}", dependencies=[Depends(require_feature_read)])
 def get_governed_contract(contract_id: str, conn: _Conn, identity: _Identity) -> dict:
     c = get_contract_detail(conn, contract_id)
     if c is None:
@@ -130,7 +136,7 @@ def get_governed_contract(contract_id: str, conn: _Conn, identity: _Identity) ->
     return c
 
 
-@router.post("/contract/confirm")
+@router.post("/contract/confirm", dependencies=[Depends(require_feature_generate)])
 def confirm(body: DraftIn, conn: _Conn, identity: _Identity) -> Contract:
     """The human gate — the GOVERNING write. Server-stateful, no client trust (closes the two BLOCKERs
     at the write, not just at /draft):

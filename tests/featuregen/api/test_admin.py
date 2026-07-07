@@ -39,7 +39,8 @@ def test_create_user_group_role_and_resolve_on_login(make_client, conn):
     hdr = _admin(client)
     uid = client.post("/admin/users", json={"username": "ana", "password": "anapass1"},
                       headers=hdr).json()["user_id"]
-    gid = client.post("/admin/groups", json={"name": "readers", "roles": ["pii_reader"]},
+    gid = client.post("/admin/groups",
+                      json={"name": "readers", "roles": ["catalog_viewer", "pii_reader"]},
                       headers=hdr).json()["group_id"]
     assert client.post(f"/admin/groups/{gid}/members", json={"user_id": uid},
                        headers=hdr).status_code == 200
@@ -109,7 +110,7 @@ def test_cannot_remove_the_last_admin_from_its_group(make_client, conn):
 def test_cannot_revoke_the_last_admin_role(make_client, conn):
     client = make_client()
     hdr = _admin(client)
-    assert client.delete(f"/admin/groups/{_admins_gid(client, hdr)}/roles/admin",
+    assert client.delete(f"/admin/groups/{_admins_gid(client, hdr)}/roles/platform_admin",
                          headers=hdr).status_code == 409
 
 

@@ -5,7 +5,7 @@ from typing import Annotated
 import psycopg
 from fastapi import APIRouter, Depends, Query
 
-from featuregen.api.deps import get_conn, get_identity
+from featuregen.api.deps import get_conn, get_identity, require_catalog_read
 from featuregen.contracts.envelopes import IdentityEnvelope
 from featuregen.overlay.upload.graph import JoinEdge, column_joins
 from featuregen.overlay.upload.join_path import JoinStep, find_join_path
@@ -13,7 +13,7 @@ from featuregen.overlay.upload.join_path import JoinStep, find_join_path
 router = APIRouter()
 
 
-@router.get("/columns/{object_ref}/joins")
+@router.get("/columns/{object_ref}/joins", dependencies=[Depends(require_catalog_read)])
 def joins_for_column(
     object_ref: str,
     source: str,
@@ -23,7 +23,7 @@ def joins_for_column(
     return column_joins(conn, source, object_ref, roles=identity.role_claims)
 
 
-@router.get("/join-path")
+@router.get("/join-path", dependencies=[Depends(require_catalog_read)])
 def join_path(
     source: str,
     to: str,

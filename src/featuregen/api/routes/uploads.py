@@ -7,7 +7,7 @@ from typing import Annotated
 import psycopg
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 
-from featuregen.api.deps import get_conn, get_identity, get_llm_optional
+from featuregen.api.deps import get_conn, get_identity, get_llm_optional, require_catalog_write
 from featuregen.contracts.envelopes import IdentityEnvelope
 from featuregen.intake.llm import LLMClient
 from featuregen.overlay.upload.canonical import CanonicalRow
@@ -39,7 +39,7 @@ def _read_rows(filename: str, data: bytes, source: str) -> list[CanonicalRow]:
     raise HTTPException(status_code=400, detail="unsupported file type (expected .csv or .xlsx)")
 
 
-@router.post("/uploads")
+@router.post("/uploads", dependencies=[Depends(require_catalog_write)])
 def create_upload(
     file: Annotated[UploadFile, File(...)],
     source: Annotated[str, Form(...)],

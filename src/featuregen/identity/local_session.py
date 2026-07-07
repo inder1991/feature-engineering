@@ -16,9 +16,11 @@ from datetime import datetime, timedelta
 from featuregen.contracts import DbConn, IdentityEnvelope
 from featuregen.identity._trust import _TRUST_CAPABILITY
 from featuregen.identity.build import build_human_identity
+from featuregen.identity.permissions import IAM_MANAGE, roles_granting
 
 _PBKDF2_ROUNDS = 200_000
 DEFAULT_SESSION_TTL = timedelta(hours=8)
+_IAM_ROLES = roles_granting(IAM_MANAGE)   # roles that can administer users/groups/roles (lockout guard)
 
 
 def hash_password(password: str) -> str:
@@ -192,35 +194,36 @@ def user_count(conn: DbConn) -> int:
     return conn.execute("SELECT count(*) FROM app_user").fetchone()[0]
 
 
-def enabled_admin_count(conn: DbConn, *, admin_role: str = "admin") -> int:
-    """How many ENABLED users currently hold the admin role (via any group). Used as a post-mutation
-    guard on group ops (delete group / revoke role / remove member): if a change drops this to 0, the
-    route raises and the request transaction rolls the change back — no path can lock out all admins."""
+def enabled_admin_count(conn: DbConn) -> int:
+    """How many ENABLED users currently hold an IAM-managing role (access_admin / platform_admin) via
+    any group. Post-mutation guard on group ops (delete group / revoke role / remove member): if a
+    change drops this to 0, the route raises and the request tx rolls it back — no path locks out IAM."""
     return conn.execute(
         "SELECT count(DISTINCT ug.user_id) FROM app_user_group ug "
         "JOIN app_group_role gr ON gr.group_id = ug.group_id "
         "JOIN app_user u ON u.user_id = ug.user_id "
-        "WHERE gr.role = %s AND u.disabled = false", (admin_role,)).fetchone()[0]
+        "WHERE gr.role = ANY(%s) AND u.disabled = false", (_IAM_ROLES,)).fetchone()[0]
 
 
-def is_last_admin(conn: DbConn, user_id: str, *, admin_role: str = "admin") -> bool:
-    """True if removing/disabling this user would leave ZERO enabled admins (would lock out admin)."""
+def is_last_admin(conn: DbConn, user_id: str) -> bool:
+    """True if removing/disabling this user would leave ZERO enabled IAM-managers (would lock out IAM)."""
     other = conn.execute(
         "SELECT 1 FROM app_user_group ug JOIN app_group_role gr ON gr.group_id = ug.group_id "
         "JOIN app_user u ON u.user_id = ug.user_id "
-        "WHERE gr.role = %s AND u.disabled = false AND ug.user_id <> %s LIMIT 1",
-        (admin_role, user_id)).fetchone()
+        "WHERE gr.role = ANY(%s) AND u.disabled = false AND ug.user_id <> %s LIMIT 1",
+        (_IAM_ROLES, user_id)).fetchone()
     if other is not None:
-        return False   # another enabled admin exists
+        return False   # another enabled IAM-manager exists
     me = conn.execute(
         "SELECT 1 FROM app_user_group ug JOIN app_group_role gr ON gr.group_id = ug.group_id "
         "JOIN app_user u ON u.user_id = ug.user_id "
-        "WHERE gr.role = %s AND u.disabled = false AND ug.user_id = %s LIMIT 1",
-        (admin_role, user_id)).fetchone()
-    return me is not None   # this user IS the only enabled admin
+        "WHERE gr.role = ANY(%s) AND u.disabled = false AND ug.user_id = %s LIMIT 1",
+        (_IAM_ROLES, user_id)).fetchone()
+    return me is not None   # this user IS the only enabled IAM-manager
 
 
-def bootstrap_admin(conn: DbConn, username: str, password: str, *, admin_role: str = "admin") -> str | None:
+def bootstrap_admin(conn: DbConn, username: str, password: str, *,
+                    admin_role: str = "platform_admin") -> str | None:
     """Create the first admin (user + an 'admins' group granting the admin role) ONLY when there are
     no users yet — a one-time, first-run action. Returns the new user_id, or None if users exist.
     Reuses an orphaned 'admins' group (e.g. left after a full user wipe) rather than conflicting on it."""

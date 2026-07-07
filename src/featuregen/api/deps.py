@@ -14,7 +14,36 @@ from featuregen.config import get_settings
 from featuregen.contracts.envelopes import IdentityEnvelope
 from featuregen.identity.build import IdentityError, build_human_identity
 from featuregen.identity.local_session import resolve_session
+from featuregen.identity.permissions import (
+    CATALOG_READ,
+    CATALOG_WRITE,
+    FEATURE_GENERATE,
+    FEATURE_READ,
+    has_permission,
+)
 from featuregen.intake.llm import LLMClient
+
+
+def require_permission(permission: str):
+    """A route dependency that 403s unless the caller's roles grant `permission`. Roles come from the
+    real Bearer session (prod) or the header stub (dev, stub-enabled) — the same source as read-scope,
+    so this is stub-compatible; production self-granting is blocked by the stub being OFF, and iam:manage
+    additionally requires an authenticated principal (see require_admin)."""
+
+    def _dep(identity: Annotated[IdentityEnvelope, Depends(get_identity)]) -> IdentityEnvelope:
+        if not has_permission(identity.role_claims, permission):
+            raise HTTPException(status_code=403, detail=f"missing permission: {permission}")
+        return identity
+
+    return _dep
+
+
+# Prebuilt route-level guards (used as `dependencies=[Depends(...)]` — the route still injects the
+# identity separately for read-scope, and FastAPI caches get_identity so it resolves once per request).
+require_catalog_read = require_permission(CATALOG_READ)
+require_catalog_write = require_permission(CATALOG_WRITE)
+require_feature_read = require_permission(FEATURE_READ)
+require_feature_generate = require_permission(FEATURE_GENERATE)
 
 
 def _auth_stub_enabled() -> bool:

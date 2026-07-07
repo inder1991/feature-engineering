@@ -6,14 +6,14 @@ from typing import Annotated
 import psycopg
 from fastapi import APIRouter, Depends, Query
 
-from featuregen.api.deps import get_conn, get_identity
+from featuregen.api.deps import get_conn, get_identity, require_catalog_read
 from featuregen.contracts.envelopes import IdentityEnvelope
 from featuregen.overlay.upload.search import SearchHit, search
 
 router = APIRouter()
 
 
-@router.get("/search")
+@router.get("/search", dependencies=[Depends(require_catalog_read)])
 def search_catalog(
     q: str,
     conn: Annotated[psycopg.Connection, Depends(get_conn, scope="function")],

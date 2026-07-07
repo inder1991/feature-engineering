@@ -74,10 +74,10 @@ def test_last_admin_guard(db):
         is_last_admin,
     )
     a = create_user(db, "a", "pw")
-    g = create_group(db, "admins", roles=("admin",))
+    g = create_group(db, "admins", roles=("platform_admin",))   # grants iam:manage
     add_user_to_group(db, a, g)
-    assert is_last_admin(db, a) is True                 # only admin
+    assert is_last_admin(db, a) is True                 # only IAM-manager
     b = create_user(db, "b", "pw")
     add_user_to_group(db, b, g)
-    assert is_last_admin(db, a) is False                # a second admin exists
+    assert is_last_admin(db, a) is False                # a second IAM-manager exists
     assert is_last_admin(db, create_user(db, "c", "pw")) is False   # a non-admin is never "last admin"

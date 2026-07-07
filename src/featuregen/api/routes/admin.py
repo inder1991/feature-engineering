@@ -1,5 +1,6 @@
-"""User / group / role administration. All endpoints require the 'admin' role, EXCEPT the one-time
-first-run /admin/bootstrap (works only while the user table is empty)."""
+"""User / group / role administration. All endpoints require the iam:manage permission (access_admin /
+platform_admin) AND an authenticated principal, EXCEPT the one-time first-run /admin/bootstrap (works
+only while the user table is empty)."""
 from __future__ import annotations
 
 from typing import Annotated
@@ -27,17 +28,18 @@ from featuregen.identity.local_session import (
     set_password,
     set_user_disabled,
 )
+from featuregen.identity.permissions import IAM_MANAGE, has_permission
 
 router = APIRouter()
 _Conn = Annotated[psycopg.Connection, Depends(get_conn, scope="function")]
 
 
 def require_admin(identity: Annotated[IdentityEnvelope, Depends(get_identity)]) -> IdentityEnvelope:
-    # Require a PROVEN principal, not just self-asserted roles: an unauthenticated stub identity
-    # (X-Roles: admin) must NOT reach the admin control plane even if the stub is on. In prod (stub
-    # off) only a real Bearer session reaches here anyway; this is defense-in-depth against misconfig.
-    if not (identity.authenticated and "admin" in identity.role_claims):
-        raise HTTPException(status_code=403, detail="admin role required")
+    # The crown jewel: require a PROVEN principal with the iam:manage permission (access_admin /
+    # platform_admin), not just self-asserted roles. An unauthenticated stub identity must NOT reach
+    # the admin control plane even if the stub is on — defense-in-depth on top of stub-off-in-prod.
+    if not (identity.authenticated and has_permission(identity.role_claims, IAM_MANAGE)):
+        raise HTTPException(status_code=403, detail="iam:manage permission required")
     return identity
 
 
