@@ -4,10 +4,12 @@
 implementation plan · **Date:** 2026-07-07
 
 > **v2 changelog** (from a 4-lens review — architect / product / data-scientist / critic):
-> - **Correctness:** the target is a *set of source columns*, not one column, and the leakage test runs
->   against that set (§5). Safety-critical fields are **snapshotted** onto the contract at confirm, not
->   assembled from a live table (§6.1). Four-eyes requires a `feature:approve` *authority*, not just a
->   distinct person (§7).
+> - **Correctness:** leakage is a **calibrated three-part control** (§5) — HARD-reject a feature that
+>   reads the target's *label* column, *flag* (don't reject) features that share the target's *source*
+>   columns, and let point-in-time do the real work. (A blanket source-column reject was too harsh — it
+>   would kill legitimate recency features.) Safety-critical fields are **snapshotted** onto the contract
+>   at confirm, not assembled from a live table (§6.1). Four-eyes requires a `feature:approve`
+>   *authority*, not just a distinct person (§7).
 > - **Paths added:** the `UNVERIFIED → governed` lifecycle + transition of existing features (§8), and
 >   the unhappy paths (confirm-failure, stale target/set) (§9). Batch approve + surfacing rejects (§4.3).
 
@@ -40,8 +42,9 @@ safety-critical target. Closes findings #3 (frontend auth on the real path), #4 
 
 1. **LLM proposes; deterministic code and humans dispose.** The LLM never has final authority over a
    safety control and never *validates* something that needs data.
-2. **The gauntlet stays deterministic.** Leakage / freshness / PIT are code checks. Leakage = a
-   **set-intersection** test: `derives ∩ target_source_columns ≠ ∅` (see §5 — *not* a single column).
+2. **The gauntlet stays deterministic** and **calibrated to not over-reject.** Leakage is a three-part
+   control (§5): HARD-reject a feature that reads the target's *label* column; *flag* (never auto-reject)
+   a feature that shares the target's *source* columns; point-in-time (as_of) is the real gate.
 3. **No predictiveness validation.** "Does this feature support the target" is empirical → needs data →
    **out of scope** (no data plane). LLM output stays an honestly-caveated fit suggestion, never a
    performance claim — **and the UI must say so**, so "governed" is never mistaken for "validated".
@@ -70,9 +73,10 @@ its contract is created — not a separate gate.
 The brief = `{hypothesis (mandatory), definition (optional anchor), target (§5), catalog scope}`.
 
 - **Assisted target resolution.** An LLM reads the **hypothesis** (not the feature definition — the
-  definition is the predictor, the hypothesis names the outcome) and **proposes the target's source
-  columns** (§5), grounded to columns that exist in the catalog. If ambiguous it offers options + states
-  uncertainty. **The human confirms.** The LLM is never the final authority on the safety anchor.
+  definition is the predictor, the hypothesis names the outcome) and **proposes the target's label
+  column (if one exists) + its source columns** (§5), grounded to columns that exist in the catalog. If
+  ambiguous it offers options + states uncertainty. **The human confirms.** The LLM is never the final
+  authority on the safety anchor.
 - The reviewer approves the brief (or returns feedback → the existing `feedback` param threads into
   generation). Approval + approver identity are recorded (audit).
 
@@ -92,21 +96,42 @@ reliably arms the leakage test for every candidate.
 - On confirm, `confirm_contract` (hardened) re-runs the MCV against the **live** graph and mints the
   contract, stamped `DESIGN-CHECKED` (earned). Failure paths in §9.
 
-## 5. The target is a SET of source columns (leakage correctness — must-fix #1)
+## 5. Leakage control — a calibrated three-part control (must-fix #1, revised)
 
 Real targets are usually *defined*, not a raw column: *"churn = **no transaction for 90 days** after
-as_of"* is computed from `transactions.date`, not a column named `churned`.
+as_of"* is worked out from `transactions.date`, not a column named `churned`. Two wrong extremes:
 
-- **Model:** the target is `{ name, definition_text, source_columns: [(catalog_source, object_ref), …] }`.
-  For a raw-column target the source set is just that one column; for a derived label it is every column
-  the definition reads.
-- **Leakage test (deterministic):** reject a feature if **any** of its derives is in the target's source
-  set — `derives ∩ target_source_columns ≠ ∅`. This catches the case the single-column test misses (a
-  feature reading `transactions.date`, which *defines* churn, would leak even though it never reads
-  `churned`).
-- **Assist:** the LLM proposes the source columns from the hypothesis; the human confirms the set.
-- **Honest limit:** still design-time / **direct** leakage only. Proxy leakage (a *different* column
-  statistically near-identical to the label) needs data and stays out of scope (§12).
+- the **single-column** check (v0) is too **narrow** — it misses that `transactions.date` *defines* the
+  target;
+- a **blanket source-column exclusion** (v1 of this spec) is too **broad** — it would reject
+  `days_since_last_transaction`, `num_transactions_30d`, and every recency feature, which are *classic,
+  legitimate, non-leaky* churn predictors.
+
+The real distinction is **time, not the column**: the target uses `transactions.date` in the **future**
+window (after as_of); a safe feature uses the **same column** in the **past** window (before as_of).
+Same column, different time. So the control is three calibrated parts:
+
+- **Target model:** `{ name, definition_text, label_column (optional), source_columns: [(source, ref), …] }`.
+  `label_column` is the materialized answer column *if one exists* (e.g. an actual `churned` column);
+  `source_columns` are the columns the definition reads (e.g. `transactions.date`). The LLM proposes
+  both from the hypothesis; **the human confirms** (never autonomous).
+
+1. **HARD reject (deterministic, narrow):** a feature whose derives include the target's `label_column`
+   — it reads the answer itself. Unambiguous; auto-reject. *(This is the original single-column check,
+   kept tight.)*
+2. **SOFT flag (surface, do NOT reject):** a feature that uses any of the target's `source_columns`. It
+   *could* leak (if it peeks at the future) but usually doesn't. Surface to the human: *"uses a column
+   that defines the target — confirm it only uses pre-as_of data."* The human disposes; nothing is
+   auto-killed, so no legitimate feature is lost.
+3. **Point-in-time does the real work:** the as_of discipline — a feature may only use data available
+   **before** the prediction date. This is the control that actually separates a safe past-window use
+   from a leaky future-window use of the *same* column. It operates on **time**, not columns, and the
+   existing gauntlet PIT check enforces it.
+
+**Honest ceiling (state it in the UI):** with no data plane we cannot *prove* the time window is
+respected — we check that a feature *declares* pre-as_of use and *flag* the rest for a human. Proxy
+leakage (a *different* column statistically near-identical to the label) needs data and is out of scope
+(§12).
 
 ## 6. The contract model — enrich to governance/safety fields only
 
@@ -114,7 +139,7 @@ as_of"* is computed from `transactions.date`, not a column named `churned`.
 
 | Field | Origin |
 |---|---|
-| `target` (name, definition, source columns) | Gate-1 confirmed target (§5) |
+| `target` (name, definition, label column, source columns) | Gate-1 confirmed target (§5) |
 | `feature_grain` | `feature` at confirm |
 | point-in-time rule + `as_of_column` | `feature.as_of_column` + explicit rule text |
 | `lookback_window` | new — captured at draft/confirm |
@@ -133,9 +158,11 @@ that does not exist.
 be point-in-time. If it assembled grain/derives from the *live* `feature` row, a later re-confirm (v2)
 would retroactively change what v1 claims. So:
 
-- **Snapshot at confirm** (frozen onto the contract row/JSON): `target` + source columns, `feature_grain`,
-  `as_of_column` + PIT rule, `lookback_window`, `calculation_method`, `derives_from`. These are the
-  fields a governance record must freeze.
+- **Snapshot at confirm** (frozen onto the contract row/JSON): `target` (label + source columns),
+  `feature_grain`, `as_of_column` + PIT rule, `lookback_window`, `calculation_method`, `derives_from`,
+  and any Gate-2 leakage **flags the human acknowledged** (§5, control 2 — the shared-source-column
+  warnings and the reviewer's confirmation they're point-in-time safe). These are the fields a
+  governance record must freeze.
 - **Assemble at read time** only truly-static reference data (e.g. the `hypothesis` text via `intent_id`,
   the human-readable feature name) — things that don't change the attestation's meaning.
 
@@ -205,8 +232,9 @@ only path that earns `DESIGN-CHECKED`.
 1. **Contract model + lifecycle** — snapshot fields at confirm (§6.1); verification vocabulary + `CHECK`;
    `POST /features` → `UNVERIFIED`; `confirm_contract` explicitly stamps `DESIGN-CHECKED`; the
    existing-feature re-stamp migration (§8).
-2. **Target as a source set + leakage** (§5) — the target model, grounded LLM proposal + confirm, and the
-   deterministic `derives ∩ target_source` test replacing the single-column check.
+2. **Target model + calibrated leakage control** (§5) — the target model (label + source columns),
+   grounded LLM proposal + human confirm, and the three-part control: HARD-reject a label read, *flag*
+   shared source columns, and enforce point-in-time. Do **not** auto-reject on shared source columns.
 3. **Gate 1 checkpoint + approval modes** (§4.1, §7) — record brief approval; `feature:approve` + the
    four-eyes flag.
 4. **UI** (§10) — the three screens on Bearer auth; batch approve + show rejects; demote direct-register.
@@ -227,6 +255,9 @@ only path that earns `DESIGN-CHECKED`.
   reference data** (§6.1). *(revised from v1's pure assemble — a versioned attestation must be frozen.)*
 - **B — same-approver vs. four-eyes** → **configurable, default same-approver**; four-eyes requires
   `feature:approve` + a distinct subject (§7).
-- **C — target shape** → **a set of source columns**, leakage tested by intersection (§5).
+- **C — target shape + leakage** → target = optional **label column** + **source columns**; leakage is
+  a calibrated **three-part control** — HARD-reject a label read, *flag* shared source columns (no
+  auto-reject), point-in-time does the real work (§5). *(revised: a blanket source-column reject was too
+  harsh — it would kill legitimate recency features.)*
 - **D — governance scope** → mandatory governance is *not* forced on every feature; `UNVERIFIED` fast
   path + promote-to-governed (§8).
