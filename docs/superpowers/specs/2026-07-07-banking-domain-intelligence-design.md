@@ -36,6 +36,10 @@ day-one bootstrap only.
 
 ## 3. Foundation 1 — the concept vocabulary (make it SOLID)
 
+> **The full, comprehensive lists** (≈50 concepts, ≈30+ entities, all 14 domains at universal-bank
+> scale) live in the companion **[Banking Taxonomy Reference](2026-07-07-banking-taxonomy-reference.md)**.
+> This section states the *design* of the vocabulary; that doc is the *content*.
+
 Replace the flat 11 with a **structured banking concept ontology**: richer concepts, each carrying its
 **behaviour** (additivity, point-in-time role, sensitivity/regulatory class, entity link) and related by
 **is-a** edges so reasoning can generalise.
