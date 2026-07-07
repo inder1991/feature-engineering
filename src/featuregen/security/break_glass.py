@@ -75,6 +75,12 @@ def invoke_break_glass(
     aggregate_id: str | None = None,
     sla: str = "1d",
 ) -> str:
+    # Require PROVEN identities, not just self-asserted role strings — a direct library caller must not
+    # break glass with a forged, unauthenticated envelope carrying role_claims={"platform-admin"}.
+    if not actor.authenticated:
+        raise BreakGlassError("break-glass invoker must be an authenticated identity")
+    if not co_signer.authenticated:
+        raise BreakGlassError("break-glass co-signer must be an authenticated identity")
     if "platform-admin" not in actor.role_claims:
         raise BreakGlassError("break-glass invoker must be platform-admin")
     if "platform-admin" not in co_signer.role_claims:

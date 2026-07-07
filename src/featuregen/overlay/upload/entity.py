@@ -160,12 +160,17 @@ def suggest_entities(conn, client, catalog_source: str, *, roles: Iterable[str] 
     return written
 
 
-def list_entity_suggestions(conn, catalog_source: str, *,
-                            status: str = "pending") -> list[EntitySuggestion]:
+def list_entity_suggestions(conn, catalog_source: str, *, status: str = "pending",
+                            roles: Iterable[str] = ()) -> list[EntitySuggestion]:
+    """Pending entity suggestions for a catalog, READ-SCOPED: a suggestion on a column whose
+    sensitivity the caller's roles can't see is withheld (consistent with search/graph)."""
     rows = conn.execute(
-        "SELECT object_ref, table_name, column_name, suggested_entity, status FROM entity_suggestion "
-        "WHERE catalog_source = %s AND status = %s ORDER BY object_ref",
-        (catalog_source, status)).fetchall()
+        "SELECT s.object_ref, s.table_name, s.column_name, s.suggested_entity, s.status "
+        "FROM entity_suggestion s "
+        "LEFT JOIN graph_node n ON n.object_ref = s.object_ref AND n.catalog_source = s.catalog_source "
+        "WHERE s.catalog_source = %s AND s.status = %s "
+        "  AND (n.sensitivity IS NULL OR n.sensitivity = ANY(%s)) ORDER BY s.object_ref",
+        (catalog_source, status, allowed_sensitivities(roles))).fetchall()
     return [EntitySuggestion(r[0], r[1], r[2], r[3], r[4]) for r in rows]
 
 

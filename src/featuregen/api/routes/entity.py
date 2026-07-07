@@ -47,7 +47,7 @@ def suggest(body: SuggestIn, conn: _Conn, identity: _Identity, client: _LLM) -> 
 def suggestions(catalog_source: str, conn: _Conn, identity: _Identity) -> list[dict]:
     return [{"object_ref": s.object_ref, "table": s.table, "column": s.column,
              "suggested_entity": s.suggested_entity}
-            for s in list_entity_suggestions(conn, catalog_source)]
+            for s in list_entity_suggestions(conn, catalog_source, roles=identity.role_claims)]
 
 
 @router.post("/entity/apply")
