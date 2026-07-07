@@ -375,3 +375,42 @@ def test_resolve_degraded_fails_closed_when_projection_not_registered(conn):
     assert conn.execute(
         "SELECT count(*) FROM projection_degraded WHERE aggregate_id='run_u'"
     ).fetchone()[0] == 1  # marker unchanged
+
+
+class UnexpectedErrorProjection:
+    """apply() raises a PLAIN exception (NOT ProjectionApplyError) on the poison event — models a
+    malformed event whose payload is missing a key the projection indexes directly."""
+
+    name = "ue"
+    is_analytics = False
+
+    def __init__(self, poison_seq: int) -> None:
+        self.poison_seq = poison_seq
+
+    def reset(self, conn) -> None:
+        pass
+
+    def apply(self, conn, event) -> None:
+        if event.global_seq == self.poison_seq:
+            raise KeyError("catalog_object_ref")  # unexpected, not a signalled ProjectionApplyError
+
+
+def test_unexpected_exception_fails_closed_with_degraded_marker(conn):
+    """An UNEXPECTED apply exception must fail closed like a ProjectionApplyError — halt + a durable
+    degraded marker keyed on the poison EVENT — not escape uncaught and crash the run with no marker."""
+    event_registry().register_schema("E", 1, {"type": "object"}, owner="o")
+    e1 = _append(conn, "r_ue", 0, {})
+    poison = _append(conn, "r_ue", 1, {})
+    _append(conn, "r_ue", 2, {})
+    proj = UnexpectedErrorProjection(poison_seq=poison.global_seq)
+    applied = run_projection(conn, proj)          # must NOT raise
+    assert applied == 1                           # only the pre-poison event; halted, did not advance
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute("SELECT aggregate, aggregate_id, reason, poison_seq FROM projection_degraded "
+                    "WHERE projection_name = 'ue'")
+        deg = cur.fetchone()
+    assert deg is not None
+    assert (deg["aggregate"], deg["aggregate_id"]) == ("run", "r_ue")   # from the poison EVENT
+    assert "KeyError" in deg["reason"]
+    assert deg["poison_seq"] == poison.global_seq
+    assert projection_lag(conn, "ue") > 0          # stuck, fail-closed

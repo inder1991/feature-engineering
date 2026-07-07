@@ -84,7 +84,19 @@ def run_projection(conn: DbConn, projection: Projection, *, batch: int = 500) ->
                 # statement (this marker persists), and HALT without advancing past the poison.
                 with conn.cursor() as cur:
                     cur.execute("ROLLBACK TO SAVEPOINT proj_apply")
-                _mark_degraded(conn, projection.name, exc, event)
+                _mark_degraded(conn, projection.name, aggregate=exc.aggregate,
+                               aggregate_id=exc.aggregate_id, reason=exc.reason, event=event)
+                break
+            except Exception as exc:  # noqa: BLE001 — an UNEXPECTED apply failure (e.g. a malformed
+                # event whose payload is missing a key the projection indexes) must fail closed the
+                # SAME way, not escape uncaught: that would crash the run past the poison leaving NO
+                # degraded marker. Roll back partial writes, mark the poison EVENT's aggregate degraded,
+                # and HALT. (ProjectionApplyError is the projection's SIGNALLED failure; this is the net.)
+                with conn.cursor() as cur:
+                    cur.execute("ROLLBACK TO SAVEPOINT proj_apply")
+                _mark_degraded(conn, projection.name, aggregate=event.aggregate,
+                               aggregate_id=event.aggregate_id,
+                               reason=f"unexpected {type(exc).__name__}: {exc}"[:500], event=event)
                 break
             with conn.cursor() as cur:
                 cur.execute("RELEASE SAVEPOINT proj_apply")
@@ -102,9 +114,11 @@ def run_projection(conn: DbConn, projection: Projection, *, batch: int = 500) ->
     return applied
 
 
-def _mark_degraded(conn: DbConn, projection_name: str, exc: ProjectionApplyError, event) -> None:
-    """Record the affected aggregate in the generic degraded ledger from the CARRIED
-    ProjectionApplyError payload (§3.6). Idempotent under re-runs of the same poison event."""
+def _mark_degraded(conn: DbConn, projection_name: str, *, aggregate: str, aggregate_id: str,
+                   reason: str, event) -> None:
+    """Record the affected aggregate in the generic degraded ledger (§3.6). Idempotent under re-runs
+    of the same poison event. aggregate/aggregate_id come from the carried ProjectionApplyError for a
+    typed failure, or from the poison EVENT itself for an unexpected exception."""
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -117,14 +131,7 @@ def _mark_degraded(conn: DbConn, projection_name: str, exc: ProjectionApplyError
                           poison_seq = EXCLUDED.poison_seq,
                           degraded_at = now()
             """,
-            (
-                projection_name,
-                exc.aggregate,
-                exc.aggregate_id,
-                exc.reason,
-                event.event_id,
-                event.global_seq,
-            ),
+            (projection_name, aggregate, aggregate_id, reason, event.event_id, event.global_seq),
         )
 
 
