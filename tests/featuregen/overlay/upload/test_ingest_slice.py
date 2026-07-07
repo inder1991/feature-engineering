@@ -83,3 +83,20 @@ def test_enrichment_failure_does_not_abort_ingest(db):
     res = ingest_upload(db, "s", rows, actor=_actor(), now=now, client=_Boom())
     assert res.status == "ingested"   # advisory enrichment failure must not abort the upload's facts
     assert res.asserted >= 1
+
+
+def test_drift_skipped_when_projection_lags(db, monkeypatch):
+    # If the overlay projection is behind (poison-halted), the upload must NOT run drift detection —
+    # doing so would stale nothing yet advance the snapshot, laundering a dropped/changed column.
+    from featuregen.overlay.upload import ingest as ingest_mod
+    _seal_config()
+    now = datetime(2026, 7, 5, tzinfo=UTC)
+    called: list[bool] = []
+    monkeypatch.setattr(ingest_mod, "projection_lag", lambda conn, name: 1)          # pretend halted
+    monkeypatch.setattr(ingest_mod, "detect_catalog_changes",
+                        lambda *a, **k: called.append(True) or [])
+    rows = [CanonicalRow("deposits", "accounts", "id", "integer", is_grain=True)]
+    res = ingest_upload(db, "deposits", rows, actor=_actor(), now=now)
+    assert res.status == "ingested"   # the upload's facts still assert
+    assert res.staled == 0            # drift deferred
+    assert called == []               # detect_catalog_changes was NOT run (laundering avoided)

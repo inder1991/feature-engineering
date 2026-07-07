@@ -16,7 +16,8 @@ from featuregen.overlay.upload.enrich import classify_domains, draft_definitions
 from featuregen.overlay.upload.graph import add_column_row, build_graph
 from featuregen.overlay.upload.review_queue import persist_quarantine
 from featuregen.overlay.upload.upload_catalog import UploadCatalog, table_ref
-from featuregen.projections.runner import run_projection
+from featuregen.projections.runner import projection_lag, run_projection
+from featuregen.runtime.observability import counters
 
 logger = logging.getLogger(__name__)
 
@@ -105,8 +106,18 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
             asserted += 1
 
     _drain_projection(conn)   # fully catch up BEFORE the diff reads the dependency index (>500-event uploads)
-    changes = detect_catalog_changes(conn, upload, actor=actor, now=now, open_reverify=False)
-    _drain_projection(conn)
+    if projection_lag(conn, "overlay") > 0:
+        # The drain reached a poison-HALT, not head: the dependency index is stale, so drift would
+        # stale NOTHING for a just-dropped/changed column yet still advance the snapshot — laundering
+        # the change for a full TTL. Skip drift this upload (same guard as the worker); it re-detects
+        # once the projection catches up. The upload's facts still assert; the snapshot is NOT advanced.
+        counters.incr("overlay.drift.skipped_projection_lag")
+        logger.warning("overlay projection lags after ingest of %r — skipping catalog-change detection "
+                       "to avoid laundering drift (re-runs when the projection catches up)", catalog_source)
+        changes = []
+    else:
+        changes = detect_catalog_changes(conn, upload, actor=actor, now=now, open_reverify=False)
+        _drain_projection(conn)
     staled = sum(1 for c in changes if c.kind in ("drop", "type_change", "rename"))
 
     concepts = definitions = domains = None
