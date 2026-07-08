@@ -14,9 +14,14 @@ entity link) so the reasoning layer can actually use them.
 ## 1. Entities (the nouns)
 
 ### 1.1 Party / customer side
-`customer` (retail individual) · `household` · `business_customer` (SME) · `corporate_entity` ·
-`legal_entity` (LEI-identified) · `counterparty` · `obligor` · `guarantor` · `beneficial_owner` ·
-`related_party` · `prospect` · `issuer` (markets) · `broker_dealer` · `correspondent_bank`
+`customer` (retail individual) · `household` (retail grouping) · `customer_group` (corporate ultimate
+parent) · `corporate_customer` · `business_customer` (SME sub-type) · `legal_entity` (LEI-identified) ·
+`ultimate_beneficial_owner` · `beneficial_owner` · `director_signatory` · `counterparty` · `obligor` ·
+`guarantor` · `related_party` · `prospect` · `issuer` (markets) · `broker_dealer` · `correspondent_bank`
+
+> **Retail vs. corporate:** a retail `customer` is one person, one id. A **corporate customer is a
+> hierarchy** (`customer_group → corporate_customer/subsidiary → legal_entity → account`), which is
+> modelled as **relationships**, not flat nouns — see §1.9.
 
 ### 1.2 Account / product / position side
 `account` (deposit/current/savings) · `loan_account` · `card_account` · `mortgage` · `credit_facility`
@@ -43,7 +48,8 @@ entity link) so the reasoning layer can actually use them.
 
 ### 1.7 Financial-crime / compliance side
 `case` (AML/fraud) · `alert` · `sar` / `str` · `watchlist_entry` · `sanctions_entry` · `pep_record` ·
-`kyc_profile` · `cdd_review` · `network_link` (transaction/ownership graph edge)
+`kyc_profile` (retail) · `kyb_profile` (know-your-business, corporate) · `cdd_review` / `edd_review` ·
+`ownership_chain` · `network_link` (transaction/ownership graph edge)
 
 ### 1.8 Servicing / interaction side
 `interaction` · `complaint` · `dispute` / `chargeback` · `claim` · `service_request` · `consent_record`
@@ -51,6 +57,40 @@ entity link) so the reasoning layer can actually use them.
 
 > **Design use:** identifiers in the vocabulary (§3.2) link to these entities; entities carry the
 > **grain** and the **join graph**; cross-catalog reasoning matches the same entity across sources.
+
+### 1.9 Entity relationships — the edges (model these, not just the nouns)
+
+Nouns alone can't express corporate/wholesale banking; the **relationships between entities** are
+first-class, because most wholesale value (and risk) lives in the edges.
+
+**Corporate hierarchy** (central to commercial + corporate & investment banking):
+```
+customer_group  (ultimate parent)
+   └─ part_of_group ─►  corporate_customer / subsidiary
+        └─ operates_as ─►  legal_entity (LEI)
+             └─ holds ─►  account / facility / position   (often across countries & currencies)
+```
+Edges: `parent_of` · `subsidiary_of` · `part_of_group` · `operates_as` · `holds`. These enable the key
+corporate feature pattern — **group-level aggregation**: consolidated **group exposure**, **group
+limit** utilisation, total **relationship value / revenue**, cross-subsidiary concentration. A flat
+entity list *cannot* express *"aggregate everything under this ultimate parent"*; the hierarchy edges
+are what make it possible.
+
+**Ownership / control** (KYB · AML · sanctions): `owns` · `controls` edges to
+`ultimate_beneficial_owner`, tracing the ownership chain through intermediate `legal_entity`s (often
+opaque, multi-jurisdiction). Powers UBO features, control-percentage, sanctions/PEP proximity.
+
+**Household** (retail): `member_of` edges grouping retail `customer`s → household-level features
+(household balance, products-per-household).
+
+**Counterparty / transaction network** (fraud · AML · markets): `transacts_with` · `shares_device` ·
+`shares_account` · `guarantees` edges → **network features** (degree, community, shortest-path to a
+flagged node, ring detection) — see §3.12 `relationship_edge`.
+
+> **Design use:** these edges add three things a flat catalog lacks — (1) **hierarchical grain** (a
+> feature computed *"per group"* aggregating all subsidiaries), (2) **graph features** (network
+> position), and (3) **regulatory reach** (UBO/ownership for KYB/sanctions). The reasoning layer must
+> treat relationships as groundable structure, not just tables.
 
 ---
 
@@ -201,7 +241,9 @@ flagged node.)*
 - **Concepts** drive deterministic reasoning: `monetary_stock` → *don't sum over time*; `currency_code`
   → *don't mix currencies*; `protected_attribute`/`geographic` → *block/flag for credit*; `outcome_label`
   → *leakage anchor*; identifiers → *joins + grain + entity*.
-- **Entities** carry grain + the join graph + cross-catalog matching.
+- **Entities + their relationships** carry grain, the join graph, cross-catalog matching, AND the
+  **hierarchy/graph** (§1.9) — enabling group-level aggregation (per-parent), network features, and
+  UBO/ownership reach that a flat noun list can't express.
 - **Domains/use-cases** provide the fast path (target + templates + regulatory rules), and the
   regulatory intensity scales by domain.
 - Everything is **ratifiable + extensible per bank** and **grows via learning + curation** — this
