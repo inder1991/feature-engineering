@@ -212,64 +212,94 @@ DISSATISFACTION → DISENGAGEMENT → FINANCIAL MIGRATION → UNBUNDLING → DEP
 > (2) **the bottom of the funnel is a leakage trap** — Stage-5 signals are *almost the label*; flag/reject
 > (the sharper cousin of the `days_since_last_txn` case).
 
-## B2. Credit risk (application, behavioural, IFRS9)
-- **`max_dpd_in_window`** — worst days-past-due. computes: `max({dpd} in window)`. explain: H. use:
-  behavioral PD, IFRS9 staging, early-warning.
-- **`delinquency_count`** — number of delinquent periods in window. use: PD, collections.
-- **`times_over_limit`** — count of over-limit events. use: card PD, early-warning.
-- **`worst_status_in_window`** — worst `lifecycle_state` reached. use: staging, PD.
-- **`utilisation_trend`** — `trend_slope` of utilisation (rising = stress). use: early-warning.
-- **`payment_ratio_avg`** — `payment_to_due_ratio` averaged. use: behavioral PD, cure probability.
-- **`income_volatility`** — `rolling_std` of income proxy. eligibility: income sensitive (credit-permitted).
-- **`bureau_recent_inquiries`** — count of credit inquiries in window (from `credit_bureau`). use:
-  application PD, application_fraud.
-- **`ltv_at_origination`** / **`dti_at_origination`** — snapshot ratios. use: origination PD, pricing.
+## B2. Credit risk — the DETERIORATION → DEFAULT funnel
+```
+HEALTHY → EARLY STRESS → EMERGING DISTRESS → DELINQUENCY → DEFAULT ⚠ → RECOVERY/LOSS
+```
+Maps to **IFRS9 staging** (Stage 1 performing → 2 SICR → 3 credit-impaired). Fair-lending: **no protected
+attributes**; income/geo flagged.
+- **Stage 0 — Origination baseline (static, at application):** `dti_at_origination`, `ltv_at_origination`,
+  bureau score, `bureau_recent_inquiries`, tenure-at-application. use: application PD, pricing.
+- **Stage 1 — Early stress (behavioural, leading):** `utilisation_trend` (rising), revolving-balance
+  growth, `cash_advance_usage` (classic distress), `income_volatility`, deposit-balance decline,
+  overdraft-usage rising.
+- **Stage 2 — Emerging distress (stronger):** first late payment, `payment_ratio_avg` falling,
+  `times_over_limit`, **cross-lender bureau deterioration** (new inquiries/delinquencies elsewhere),
+  `nsf_returned_payments` (failed DDs).
+- **Stage 3 — Delinquency (strong):** `max_dpd_in_window`, `delinquency_count`, consecutive misses,
+  `roll_rate_signal` (→ worse bucket), `worst_status_in_window`.
+- **Stage 4 — Default ⚠ (NEAR-LABEL):** 90+ DPD (**often IS the Basel default label** → leakage trap,
+  flag/reject), charge-off, `forbearance_restructure_flag` (also near-label).
+- **Stage 5 — Recovery/Loss:** `cure_probability` inputs, recovery rate, LGD/`downturn_lgd`.
+> Trap: Stage-4 (90+ DPD, forbearance) ≈ the default label — the 3-part leakage control must flag/reject.
 
-## B3. Fraud (card, account-takeover, application)
-- **`txn_velocity`** — count/amount in a very short window (mins/hours). params: window ∈ {1h,24h}.
-  explain: M. use: card_fraud_realtime, ATO.
-- **`amount_zscore`** — `zscore_vs_own_history` on transaction amount. use: card fraud.
-- **`new_beneficiary_flag`** — first payment to this payee. = `novelty_flag`. use: app_scam, ATO.
-- **`geo_velocity_impossible`** — two txns whose distance/time implies impossible travel. eligibility:
-  geolocation — fraud-permitted, flagged. use: card fraud, ATO.
-- **`device_change_flag`** — txn from a `novelty` device. use: ATO.
-- **`time_since_credential_change`** — recency of password/contact change before a high-risk action.
-  use: ATO, app_scam.
-- **`application_velocity`** — many applications sharing an attribute (email/phone/device) in window.
-  use: application_fraud, synthetic_identity.
+## B3. Fraud — the KILL-CHAIN (real-time; windows are minutes/hours, not weeks)
+```
+RECON → ACCESS/TAKEOVER → SETUP/STAGING → CASH-OUT ⚠
+```
+Types: card (CNP), account-takeover (ATO), application (synthetic-ID), first-party (bust-out).
+- **Stage 1 — Recon/targeting:** `failed_login_spike` (credential-stuffing), unusual profile lookups,
+  `application_velocity` (shared email/phone/device across apps → synthetic-ID).
+- **Stage 2 — Access/takeover:** `device_change_flag` (novel device), `geo_velocity_impossible`,
+  `time_since_credential_change` (password/contact just changed), MFA change, dormant-account reactivation.
+- **Stage 3 — Setup/staging:** `new_beneficiary_flag`, limit-increase request, payee added then a quiet
+  "aging" gap (the mule trick), contact-detail change before a payment.
+- **Stage 4 — Cash-out ⚠ (NEAR-LABEL):** `txn_velocity` spike, `amount_zscore` spike, rapid drain,
+  high-value transfer to a new beneficiary, mule-pattern outflow. **⚠ the fraudulent txn IS often the
+  label → flag.**
+> Note: fraud is **real-time** — `pit` windows are short; features must compute on the live pre-txn state.
 
-## B4. AML (typology-driven)
-- **`structuring_score`** — many transactions just under a reporting threshold. computes: `count(txn in
-  ({threshold}−δ, {threshold}) in window)`. params: threshold (jurisdiction). use: aml_txn_monitoring.
-- **`rapid_movement_ratio`** — funds in then out within N days. computes: `outflow within {N}d of
-  inflow / inflow`. use: layering, mule_detection.
-- **`round_amount_share`** — share of round-number transactions. use: TBML, structuring.
-- **`cash_intensity`** — cash share of volume. = `category_share(cash)`. use: aml risk rating.
-- **`network_degree`** — number of distinct counterparties (from `relationship_edge`). use: mule rings.
-- **`shortest_path_to_flagged`** — graph distance to a known-bad node. use: aml, sanctions proximity.
-- **`high_risk_geo_share`** — share of flows to/from high-risk jurisdictions. use: aml, sanctions.
+## B4. AML — the LAUNDERING cycle (typology-driven)
+```
+PLACEMENT → LAYERING → INTEGRATION
+```
+Labels are **SARs (suspicion, not proof)** — weak/noisy; a filed SAR is **near-label** (don't use as a
+feature). Geo/nationality are proxies → AML-permitted but bias-watched.
+- **Placement (dirty money enters):** `cash_intensity`, `structuring_score` (just under threshold),
+  rapid third-party deposits.
+- **Layering (obscure the trail):** `rapid_movement_ratio` (in-then-out), `round_amount_share`,
+  round-tripping, `network_degree` (mule rings), pass-through accounts, `high_risk_geo_share`.
+- **Integration (clean money returns):** asset purchase, business-income mixing, **TBML** (over/under-
+  invoicing), `shortest_path_to_flagged` (proximity to known-bad).
+> Cross-cutting: `zscore_vs_own_history` (out-of-pattern), velocity, network position.
 
-## B5. Cross-sell / propensity / CLV
-- **`product_gap_flag`** — eligible product not yet held (from `product_master` − held). use:
-  propensity_cross_sell, next_best_action.
-- **`channel_engagement`** — `event_frequency` per channel. use: propensity, NBA.
-- **`revenue_trend`** — `trend_slope` of fee+interest income. use: CLV, pricing.
-- **`life_event_proxy`** — pattern shift suggesting a life event (salary jump, large inflow). use:
-  cross-sell (mortgage/wealth). eligibility: no protected inference.
+## B5. Cross-sell / CLV — the GROWTH journey (the INVERSE of attrition)
+```
+ONBOARDING → ACTIVATION → DEEPENING → MATURITY → ADVOCACY
+```
+The **positive mirror of B1** — the *same* signals read in reverse (rising salary/breadth = growth;
+falling = attrition). Eligibility: **no protected-attribute inference** (can't infer pregnancy/health for
+targeting).
+- **Onboarding:** account funded, first salary credit (**primacy won**), early logins.
+- **Activation:** `direct_debit_setup` (sticky), card activated, digital enrolled, regular usage.
+- **Deepening (cross-sell windows):** `product_breadth` growing, `product_gap_flag`, `life_event_proxy`
+  (salary jump → mortgage; large inflow → wealth), `channel_engagement`.
+- **Maturity:** high `share_of_wallet_proxy`, multi-product, high `revenue_trend`/CLV, stable.
+- **Advocacy:** referrals, sustained high engagement.
 
-## B6. Collections & recoveries
-- **`roll_rate_signal`** — movement to a worse delinquency bucket vs prior period. use:
-  collections_prioritization, roll_rate.
-- **`promise_kept_ratio`** — kept payment promises / made (from interaction history). use: cure prob.
-- **`right_party_contact_rate`** — successful contacts / attempts. use: contactability.
-- **`balance_at_risk`** — `monetary_stock` outstanding × delinquency severity. add: semi. use: recovery.
+## B6. Collections & recoveries — the DELINQUENCY → RECOVERY journey
+```
+PRE-DELINQUENCY → EARLY (1–29 DPD) → MID (30–89) → LATE (90+) → RECOVERY / CHARGE-OFF
+```
+Optimise by **balance-at-risk × cure-probability × contactability**; segment self-curers from
+needs-intervention. Conduct: **vulnerability** flag (sensitive) → different handling.
+- **Pre-delinquency:** the B2 early-warning signals (predict who'll miss).
+- **Early (1–29):** first miss, `self_cure_likelihood`, `promise_to_pay` behaviour.
+- **Mid (30–89):** `roll_rate_signal`, `promise_kept_ratio`, `right_party_contact_rate`, partial payments.
+- **Late (90+):** severity, `balance_at_risk`, hardship indicators.
+- **Recovery/charge-off:** `cure_probability`, recovery rate, settlement propensity, legal/write-off.
 
-## B7. Deposit / liquidity / treasury (ALM)
-- **`deposit_beta_proxy`** — deposit-rate sensitivity: `pct_change(balance)` vs benchmark-rate change.
-  use: deposit_beta_modeling, pricing.
-- **`nmd_stability`** — `balance_volatility` of non-maturity deposits. use: nmd_behaviouralization, LCR.
-- **`net_flow_trend`** — `trend_slope` of `inflow_outflow_ratio`. use: liquidity projection.
-- **`concentration_by_depositor`** — `herfindahl_concentration` of balances. use: liquidity risk.
+## B7. Deposit / liquidity / treasury (ALM) — the STABILITY spectrum
+```
+STABLE CORE → RATE-SENSITIVE → SURGE / HOT MONEY → RUNOFF-PRONE → OUTFLOW ⚠
+```
+Not a customer funnel — a **deposit-behaviour spectrum** per depositor/segment; feeds LCR/NSFR, FTP, ALM.
+- **Stable core:** `nmd_stability` (low volatility, low beta), long tenure.
+- **Rate-sensitive:** `deposit_beta_proxy` (`pct_change(balance)` vs benchmark-rate change).
+- **Surge / hot money:** `surge_deposit_flag` (sudden large inflow, high beta), short expected life.
+- **Runoff-prone:** `net_flow_trend` negative, `concentration_by_depositor` (few big depositors),
+  correlated-withdrawal risk.
+> Ties to B1: a depositor sliding STABLE→OUTFLOW is also churning — the deposit-attrition overlap.
 
 ---
 
@@ -309,6 +339,13 @@ DISSATISFACTION → DISENGAGEMENT → FINANCIAL MIGRATION → UNBUNDLING → DEP
    false-neg initials/order/joint-accounts) → `explain: M`, declare method+threshold, and the feature's
    quality depends on the downstream matcher. (c) Name/beneficiary matching is **PII entity-resolution** →
    consent/purpose/residency eligibility REQUIRED, not optional.
+9. **The FUNNEL/journey meta-pattern (B1–B7).** Most banking targets are the end of a *process*, so signals
+   stage along a journey: **early = more lead-time but noisier; late = near-certain but too late.** Two
+   consequences hold in *every* domain: (a) **blend stages** — don't rely on one (a good model mixes
+   lead-time and strength); (b) **the bottom of every funnel is a leakage trap** — the last-stage signal
+   is *almost the label* (churn: CASS switch; credit: 90+ DPD; fraud: the cash-out txn; AML: a filed SAR;
+   collections: charge-off). The 3-part leakage control must **flag/reject** these. When authoring a new
+   use-case, **map its funnel first**, then place each template on it and mark the near-label tail.
 
 # PART E — Open / to-deepen
 Markets desk templates (greeks, XVA, PnL-attribution), insurance (lapse/claims), securities-services
