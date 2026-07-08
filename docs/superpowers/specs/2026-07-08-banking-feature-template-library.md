@@ -467,3 +467,103 @@ asset-management · B13 Islamic · B14 payments · B15 corporate/trade-SCF) plus
 signals into full parametric templates (`needs/params/pit/eligibility` schema, like §A9), starting with the
 pilot use-case (retail_churn) for B2 of the build. Coverage then grows per-domain via curation + the
 flywheel, not one big freeze.
+
+---
+
+# PART F — Appendix: `retail_churn` full parametric set (PILOT — feeds build C2 + engine B2)
+
+The pilot templates at **executable-spec depth** — what the template engine (B2) grounds and the SME (C2)
+ratifies. Each is groundable by concept-matching, safe-by-construction (PIT baked in), and carries a
+degrade path. Concept names match the taxonomy (§3). Templates that can't fully ground **degrade or skip**
+— never silently pass a partial.
+
+**Grounding requirements — a "churn-ready" retail catalog needs:**
+| Concept role | Typical column | Required by |
+|---|---|---|
+| `monetary_stock` + history | `accounts.balance` snapshots over time | balance_trend, volatility, days_below |
+| `as_of_date` | `accounts.snapshot_date` | every point-in-time feature |
+| `monetary_flow` (+ direction) | `transactions.amount` (+ dr/cr) | inflow_outflow, rfm, salary |
+| `event_timestamp` | `transactions.txn_date` | dormancy, frequency_trend, rfm |
+| `customer_identifier` (entity) | `customers.customer_id` | grain of every feature |
+| `category_code` (salary/DD tag) | `transactions.type` | salary_*, dd_cancellation (degrade if absent) |
+| `product_holding` + open/close | `holdings.*` | product_breadth/attrition |
+| `effective_date` (origination) | `customers.signup_date` | tenure |
+| `outcome_label` (target) | `customers.churned` | leakage anchor (never a feature input) |
+
+### 1 · `balance_trend_{window}` *(Stage 3 — headline drain signal)*
+- **computes:** OLS slope of `{stock_col}` vs time over trailing `{window}` days per `{entity}`;
+  `measure=normalized` divides slope by window-mean balance (scale-free).
+- **needs:** `monetary_stock {stock_col}` **with time history** · `as_of_date` · entity `{entity}`.
+- **params:** `window ∈ {30,60,90}` (def 90) · `measure ∈ {slope,normalized}` (def normalized).
+- **grain:** per `{entity}` per as_of. **pit:** rows in `({asof}−{window}, {asof}]`, strictly ≤ as_of.
+- **add:** n/a. **eligibility:** bind a `monetary_stock` (not flow); single currency (convert first).
+  **explain:** H. **degrade:** only a *current* balance (no history) → **skip** (no trend from one point).
+
+### 2 · `dormancy_days` *(baseline recency — ⚠ near-label)*
+- **computes:** `{asof} − max({event_ts})` over `{event_ts} ≤ {asof}`. **needs:** `event_timestamp` on
+  `{entity}`. **params:** `event_filter` (def: any txn). **grain/pit:** last event ≤ as_of. **add:** n/a.
+  **explain:** H. **⚠ leakage:** if churn = "no activity in N days," this ≈ the label → 3-part control
+  **flags** (confirm pre-as_of only, and window ≠ label window).
+
+### 3 · `txn_frequency_trend_{window}` *(Stage 2 — engagement decay)*
+- **computes:** `count(events in recent half of {window}) / count(prior half)`; `<1` = declining.
+- **needs:** `event_timestamp` on `{entity}`. **params:** `window ∈ {60,90,180}` · `measure ∈
+  {halves_ratio,slope}`. **grain/pit:** trailing ≤ as_of. **add:** n/a. **explain:** H.
+
+### 4 · `inflow_outflow_ratio_{window}` *(Stage 3 — net draining?)*
+- **computes:** `sum(debit {amount} in window)/sum(credit {amount} in window)`; `measure=net` →
+  `credits − debits`. **needs:** `monetary_flow {amount}` · a **direction** (dr/cr, or amount sign) ·
+  `event_timestamp` · `{entity}`. **params:** `window` · `measure ∈ {ratio,net}`. **grain/pit:** trailing.
+  **add:** `net` additive / `ratio` non-additive. **eligibility:** single currency (convert first).
+  **explain:** H. **degrade:** no dr/cr flag → infer from amount sign (declared derivation, §D.8).
+
+### 5 · `days_below_threshold_{window}` *(Stage 3 — near-empty)*
+- **computes:** `count(distinct days where {stock_col} < {threshold})` in trailing window. **needs:**
+  `monetary_stock` history · `as_of_date` · `{entity}`. **params:** `window` · `threshold` (absolute or a
+  percentile of own history). **grain/pit:** trailing. **add:** additive (day count). **explain:** H.
+
+### 6 · `salary_signal_{window}` *(Stage 3 — salary cessation/irregularity)*
+- **computes:** over salary-tagged credits — `cessation_flag` (no salary in `{window}` when previously
+  regular) · `gap_std` (std of inter-salary gaps) · `latest_gap` (days since last salary). **needs:**
+  `monetary_flow` credits · **salary tag** (`category_code`) · `event_timestamp` · `{entity}`. **params:**
+  `window` · `measure ∈ {cessation_flag,gap_std,latest_gap}`. **grain/pit:** trailing. **add:** n/a.
+  **eligibility:** income **sensitive** — churn-permitted, flagged. **explain:** H. **degrade:** no salary
+  tag → derive from recurring same-amount ~monthly credits (declared derivation §D.8; probabilistic, flag).
+
+### 7 · `product_breadth` / `product_attrition_{window}` *(Stage 4 — unbundling)*
+- **computes:** `breadth = count(distinct product_holding active at {asof})`; `attrition =
+  breadth({asof}) − breadth({asof}−{window})`. **needs:** `product_holding` · open/close `effective_date`s
+  · `{entity}`. **params:** `window`. **grain/pit:** products with open ≤ as_of < close. **add:** additive
+  (count). **explain:** H.
+
+### 8 · `tenure_days` *(context)*
+- **computes:** `{asof} − {origination_date}`. **needs:** `effective_date` (signup) · `as_of_date` ·
+  `{entity}`. **grain/pit:** origination ≤ as_of. **add:** n/a. **explain:** H.
+
+### 9 · `balance_volatility_{window}` *(Stage 3 — instability)*
+- **computes:** `std({stock_col} in window) / mean({stock_col} in window)` (coeff. of variation).
+  **needs:** `monetary_stock` history · `as_of_date` · `{entity}`. **params:** `window`. **grain/pit:**
+  trailing. **add:** n/a. **explain:** H.
+
+### 10 · `rfm_composite` *(baseline workhorse)*
+- **computes:** percentile-binned blend of `recency_days`, `txn_frequency({window})`,
+  `monetary_sum({window})`. **needs:** `event_timestamp` · `monetary_flow` · `{entity}`. **params:**
+  `window`. **grain/pit:** trailing. **add:** n/a. **explain:** H (components inspectable).
+
+### 11 · `dd_cancellation_rate_{window}` *(Stage 4 — sticky commitments leaving)*
+- **computes:** `count(DD mandates cancelled in window) / count(DDs active at window start)`. **needs:**
+  `direct_debit` mandate events (setup/cancel) · `event_timestamp` · `{entity}`. **params:** `window`.
+  **grain/pit:** trailing. **add:** non-additive (rate). **explain:** H. **degrade:** **skip** if no
+  DD/mandate data.
+
+### 12 · `external_own_transfer_trend` *(Stage 3 — primacy loss)*
+- Fully specified in **§A9** (own-account flag via `name_match`, downstream + PII). Included for banks with
+  beneficiary + name data; **degrade** to `external_outflow_growth` if no name to match.
+
+**Composite (optional, not MVP):** `relationship_erosion_score` blends 1–12 by lead-time × strength;
+`explain: H` (shows which fired).
+
+**Build note (C2/B2):** these 12 map 1:1 to the `templates.py` model — `needs`→grounding contract,
+`params`→parameter schema, `pit`→trailing-window guard, `degrade`→fallback. The pilot **golden set**
+(kick-off) should exercise each of 1–12 **plus** the `dormancy_days` near-label flag and the
+`dd_cancellation` / `external_own_transfer` degrade paths.
