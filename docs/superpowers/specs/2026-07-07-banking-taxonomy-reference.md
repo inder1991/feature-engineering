@@ -368,10 +368,15 @@ Capital: `risk_weight` · `rwa` · `capital_ratio` *(is-a ratio)* · `ccf` (cred
   UBO/ownership reach that a flat noun list can't express.
 - **Domains/use-cases** provide the fast path (target + templates + regulatory rules), and the
   regulatory intensity scales by domain.
-- **Four deterministic safety checks** gate every feature (not one): (1) **leakage** — `derives ∩
-  target_source`; (2) **point-in-time incl. bi-temporal** — `valid_time ≤ as_of` AND `system_time ≤
-  as_of` (§3.13); (3) **currency** — convert before aggregate (§3.14); (4) **eligibility** — consent /
-  purpose / residency / fair-lending / additivity (§3.15). All deterministic; the LLM never overrides.
+- **Safety checks — ENFORCED vs. DECLARED (be honest; no data plane).**
+  **Enforced on metadata (actually blocking, deterministic):** (1) **leakage** —
+  `(catalog_source,object_ref)` set-membership of the target's label/source columns in the derives; (2)
+  **eligibility** — the derives' consent/purpose/residency/fair-lending/`protected_attribute` tags
+  (§3.15); (3) **currency-mismatch** — derives carry different `currency_code` (§3.14); (4)
+  **additivity** — summing a `monetary_stock`/rate where invalid.
+  **Declared + flagged only (needs data we don't have — a *claim*, not a verified guarantee):**
+  **point-in-time / bi-temporal** restatement (§3.13) and runtime currency-value mixing. `DESIGN-CHECKED`
+  = *"passed the enforced + declared the rest."* The LLM never overrides an enforced check.
 - Everything is **ratifiable + extensible per bank** and **grows via learning + curation** — this
   reference is the *seed of the seed*, not a fixed constant.
 

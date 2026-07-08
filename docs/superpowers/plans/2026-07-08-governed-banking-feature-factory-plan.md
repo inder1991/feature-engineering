@@ -99,6 +99,16 @@ M0 walking skeleton  ──►  A1 A2 A3 A4 A5  (Governed Flow) ──┐
   Converge at B4. Halves calendar time vs. v1's serial chain.
 - **XL split done:** v1's Phase 3/4 are now B1/B2/B3a/B3b (each L/M).
 
+## 6a. Architecture fixes folded in (head-of-architect review) — where each lands
+
+| # | Fix (in the specs) | Increment |
+|---|---|---|
+| 1 | **Honest safety model** — enforced (leakage/eligibility/currency-tag/additivity) vs. declared-only (bi-temporal/runtime); `DESIGN-CHECKED` ≠ runtime guarantee | **A2** (+ contract/UI copy) |
+| 2 | **Drift stales contracts** — `contracts_affected_by` flags governed contracts; add **`NEEDS_REVIEW`** stamp; snapshot target/template versions | **A2/A5** (extend the drift path; A1 adds the stamp value) |
+| 3 | **Use-case is a safety input** — human-confirmed at Gate 1; **fail-to-strictest** on uncertainty | **B4** (+ A3 Gate-1 UI) |
+| 4 | **Unratified fails CLOSED** — block protected/sensitive by default + `NEEDS_REVIEW` until Compliance ratifies | **B3b** |
+| 5 | **Read-scope the snapshot** — filter frozen column refs by role at render (no PII side-channel) | **A1** |
+
 ## 7. Cross-cutting (apply throughout — the v1 gaps)
 
 - **Feature flags + backout:** every breaking/user-facing change flagged (M0, A1 re-stamp, A5 default-on,

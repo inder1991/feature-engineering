@@ -48,7 +48,19 @@ safety-critical target. Closes findings #3 (frontend auth on the real path), #4 
 3. **No predictiveness validation.** "Does this feature support the target" is empirical → needs data →
    **out of scope** (no data plane). LLM output stays an honestly-caveated fit suggestion, never a
    performance claim — **and the UI must say so**, so "governed" is never mistaken for "validated".
-4. **The seal must be earned.** `DESIGN-CHECKED` only ever comes from a path that ran the gauntlet.
+4. **The seal must be earned — and honest about what it guarantees.** `DESIGN-CHECKED` only ever comes
+   from a path that ran the gauntlet, and it means *"passed the ENFORCEABLE checks + DECLARED the rest"*
+   — **not a runtime guarantee.** Without a data plane the checks split in two (state both in the
+   contract + UI):
+   - **Enforced on metadata (actually blocking):** leakage (`(catalog_source,object_ref)` set-membership),
+     eligibility (consent/purpose/residency/fair-lending/`protected_attribute` tags), currency-mismatch
+     (derives carry different `currency_code`), additivity (summing a `monetary_stock`/rate where invalid).
+   - **Declared + flagged only (needs data we don't have):** point-in-time / **bi-temporal** restatement,
+     runtime currency-value mixing — recorded as the feature's *claim*, verified later where a data plane
+     exists. Never conflate the two.
+5. **The use-case is a SAFETY input, not a convenience.** Recognising the wrong use-case applies the wrong
+   regulatory rules (churn's laxity to a credit model), so the use-case is **human-confirmed** and, when
+   uncertain, the system **defaults to the STRICTEST** rules — never the laxest (§ Domain-Intelligence).
 
 ## 4. The flow (target)
 
@@ -169,6 +181,27 @@ would retroactively change what v1 claims. So:
 Net: the contract is a self-contained, immutable sheet; the *live* `feature` row can evolve without
 rewriting history.
 
+### 6.2 Contract lifecycle — drift can stale a signed contract (architecture fix)
+A contract snapshots safety *as-of signing* — but the underlying columns keep living and can be
+**dropped / retyped / re-tagged** (e.g. `sensitivity: public → pii`) afterward. Without a mechanism a
+`DESIGN-CHECKED` contract silently rots (points at a dropped column, or a now-PII input). So:
+- **Drift stales contracts.** Extend the existing `contracts_affected_by` so a drop / type-change /
+  rename / sensitivity-or-eligibility change on any *snapshotted* column **flags the governing contract**.
+- **A `NEEDS_REVIEW` verification state.** The stamp vocabulary becomes `UNVERIFIED` · `DESIGN-CHECKED` ·
+  **`NEEDS_REVIEW`** (was checked, but a dependency drifted). Re-confirming through the gates returns it
+  to `DESIGN-CHECKED`. A contract's safety is *as-of signing*; the system must track when the world
+  diverged from it.
+- **Snapshot the versions it depended on** (same immutability principle): freeze the `target-definition
+  version` and any `template version` used, so a later correction to a target/template does not silently
+  change what an existing contract claims.
+
+### 6.3 Read-scope applies to the snapshot too (security fix)
+The snapshot freezes the derives columns verbatim — so reading it could **bypass the live read-scope
+filter** and reveal that a feature derives from `customers.ssn` to a caller without `pii_reader`. The
+snapshot must be **read-scoped at render** (filter/redact the frozen column refs by the caller's roles,
+exactly as live `feature_detail` does) — a governance snapshot must never become a sensitivity
+side-channel.
+
 ## 7. Approval modes — same-approver vs. four-eyes (must-fix #3)
 
 Default **same-approver** (the 2026-07-04 pivot retired heavy four-eyes). `FEATUREGEN_CONTRACT_FOUR_EYES=1`
@@ -191,12 +224,14 @@ Full governance for *every* throwaway feature is too much friction — people wi
   registration, but stamps **`UNVERIFIED`** (never `DESIGN-CHECKED`). Fine for exploration.
 - **Promote to governed.** An `UNVERIFIED` feature can be taken **through the two gates** (brief → set →
   confirm) to earn `DESIGN-CHECKED` and a contract when it matters (e.g. before a model uses it).
-- **Verification vocabulary:** `UNVERIFIED` (default for direct registration) · `DESIGN-CHECKED`
-  (gauntlet passed via the governed flow). Add a `CHECK` constraint on the column so the set is closed.
+- **Verification vocabulary:** `UNVERIFIED` (direct registration) · `DESIGN-CHECKED` (gauntlet passed via
+  the governed flow) · **`NEEDS_REVIEW`** (was `DESIGN-CHECKED`, but a snapshotted dependency drifted —
+  §6.2; re-confirm restores it). Add a `CHECK` constraint so the set is closed.
 - **Transition of existing features (migration).** Every feature registered before this change is
   contract-less yet stamped `DESIGN-CHECKED` — a *false* attestation today. A one-time migration
   **re-stamps all contract-less features `UNVERIFIED`** (honest), leaving governed ones untouched. Users
-  promote what they still trust. Log the count re-stamped.
+  promote what they still trust. Log the count re-stamped, **and report the impacted `feature_consumer`
+  models** (a live model now shows an `UNVERIFIED` input) so owners can promote before it alarms.
 
 ## 9. Unhappy paths (path design)
 

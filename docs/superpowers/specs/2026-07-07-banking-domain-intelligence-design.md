@@ -157,6 +157,13 @@ Un-seeded requests fall through to **generalization**: the LLM proposes features
 ontology + generic parametric patterns; a **non-banking** request (no banking entity/concept) is
 rejected.
 
+> **The use-case is a SAFETY input — human-confirmed + fail-to-strict (arch fix #3).** Recognition is an
+> LLM *proposal*, and a wrong one applies the wrong regulatory rules (churn's laxity to a **credit**
+> model → protected attributes not blocked). So the recognised use-case is **shown for human
+> confirmation** at Gate 1, and when recognition is **uncertain/ambiguous the system defaults to the
+> STRICTEST applicable rules** (treat as regulated) until confirmed — never the laxest. The LLM never
+> sets a regulatory posture unchecked.
+
 ## 7. Learning + curation — the flywheel (gets stronger with use)
 
 - **Capture every human decision** at Gate 2 (approve/reject + why). This is recorded today and ignored;
@@ -174,10 +181,14 @@ rejected.
 
 1. **Ship the seed** as a starting template.
 2. **Load into a per-deployment, versioned, DB-backed store** on setup.
-3. **Ratify locally** — the bank's domain/risk owner confirms domain facts (target, templates, allowed
-   data); **Compliance confirms policy facts** (blocked data, regulatory flags). `compliance_confirmed`
-   flips true only then; **regulatory rules are NOT enforced as authoritative until ratified** (else a
-   vendor default becomes a compliance liability).
+3. **Ratify locally — and fail CLOSED until then (arch fix #4).** The bank's domain/risk owner confirms
+   domain facts (target, templates, allowed data); **Compliance confirms policy facts** (blocked data,
+   regulatory flags); `compliance_confirmed` flips true only then (a vendor default is never authority).
+   **But un-ratified must NOT mean un-enforced:** until ratified, the system treats the use-case
+   **conservatively** — it **blocks protected/sensitive data classes by default** and marks any feature
+   `NEEDS_REVIEW` — so the (possibly months-long) pre-ratification window fails **closed / safe**, not
+   open. *(v1 said "not enforced until ratified," which left protected attributes usable during that
+   window — the wrong default.)*
 4. **Grow at runtime** — onboard new banking use-cases with sign-off.
 5. **Version + audit** every change (it drives what data is blocked — a governance event).
 
