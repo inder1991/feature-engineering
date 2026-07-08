@@ -26,7 +26,9 @@ day-one bootstrap only.
    ratification → runtime growth → versioned/audited (§8).
 2. **Vocabulary + cases are the foundation and must be SOLID** — the reasoning is only as good as its
    grounding. We invest here first (§3, §4).
-3. **Templates are safe-by-construction** — parametric, groundable, point-in-time baked in (§5).
+3. **Templates are safe-by-construction AND a scaffold, not a cage** — parametric, groundable, PIT baked
+   in; they SEED the LLM but never restrict it (the LLM always proposes beyond them; un-templated
+   requests still work). Templates = priors; the LLM = adaptation. Both, always (§5, §5.1).
 4. **LLM proposes; deterministic code + humans dispose.** Unchanged. Regulatory/leakage stay
    deterministic; the LLM never validates predictiveness (no data plane).
 5. **Banking-scoped but open** — any *banking* request works (seeded or generalized); non-banking is
@@ -140,6 +142,26 @@ template rolling_balance_trend:
 run the gauntlet, and generate confidently — and the template *cannot* produce a leaky feature because
 the point-in-time constraint is part of its definition. Template generation for interpretable use-cases
 (credit/pricing) is the *symbolic/parametric synthesis* mode; template-only for the rest.
+
+### 5.1 Templates are a SCAFFOLD, not a CAGE (non-negotiable)
+
+The failure mode to avoid: templates become the *only* path → the system degrades to a rigid lookup
+table that's stuck on any un-templated request. That would make it **less** intelligent, not more. So:
+
+- **Seed, don't restrict.** Templates give the LLM a head-start ("known churn patterns"); the LLM may
+  always **propose beyond them**.
+- **Parametric = flexible.** A template is a *family* (blanks flex to the catalog), never one frozen
+  feature.
+- **The LLM adapts / combines / invents** — tweak a template, merge two, or use one as inspiration for a
+  novel variant.
+- **Generalization catches the rest.** A hypothesis matching no template still works via the from-scratch
+  LLM path (which exists today); only a **non-banking** request is refused.
+- **The library grows** — good novel patterns become templates (curation + flywheel); the cookbook is
+  never frozen.
+
+**Why this makes it smarter, not dumber:** intelligence = **priors + adaptation**, like an expert who
+knows the patterns *and* adapts them — not a junior improvising from nothing. Templates are the priors;
+the LLM is the adaptation. Both, always. **Templates must never be the only path.**
 
 ---
 
