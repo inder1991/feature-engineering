@@ -26,7 +26,34 @@ parent) · `corporate_customer` · `business_customer` (SME sub-type) · `legal_
 ### 1.2 Account / product / position side
 `account` (deposit/current/savings) · `loan_account` · `card_account` · `mortgage` · `credit_facility`
 / `line` · `sub_account` · `wallet` · `product` · `product_holding` · `position` (markets) ·
-`portfolio` · `book` (trading) · `collateral` · `lien` · `overdraft`
+`portfolio` · `book` (trading) · `collateral` · `lien` · `overdraft` · `facility` · `contingent_exposure`
+(LCs/guarantees) · `receivable` · `payable` · `leased_asset` · `pooling_structure` · `mandate` (capital
+markets) · `hedge`
+
+#### 1.2a Corporate / SME product families (the multi-product relationship)
+A retail customer holds a handful of products; a **corporate/SME customer holds a *portfolio* of
+products across families** — and that breadth *is* the relationship. Each product instance grounds to a
+facility / position / account / exposure entity.
+
+| Product family | Products | Grounds to |
+|---|---|---|
+| **Lending** | term loan · revolving credit facility (RCF) · overdraft · working-capital loan · asset-based lending · syndicated / bilateral loan · bridge · commercial real-estate finance · leveraged / acquisition finance | `facility` + `exposure` (+ `collateral`) |
+| **Trade finance** | documentary letter of credit · standby LC / bank guarantee · documentary collection · import/export loan · bill discounting | `contingent_exposure` / trade `instrument` |
+| **Supply-chain finance** | payables finance (reverse factoring) · receivables finance / factoring · invoice discounting · dynamic discounting · distributor/dealer finance | `facility` backed by `receivable` / `payable` |
+| **Cash management / transaction banking** | operating / collection / disbursement accounts · notional & physical **cash pooling** · sweeps · virtual accounts · bulk & cross-border payments · liquidity mgmt | `account` + `pooling_structure` |
+| **Markets / treasury (hedging & investment)** | FX (spot/forward/swap/option) · interest-rate derivatives (IRS/cap/floor) · commodity hedging · MM deposits · repo | `position` / `derivative` / `hedge` |
+| **Asset finance / leasing** | equipment finance · fleet / vehicle leasing · finance & operating lease · hire purchase | `facility` + `leased_asset` |
+| **Capital markets (larger corp)** | bond issuance (DCM) · equity issuance (ECM) · private placement · securitisation | `mandate` / markets `instrument` |
+| **Guarantees & contingent** | performance bond · bid bond · advance-payment guarantee | `contingent_exposure` |
+| **Merchant services** | card acquiring · payment gateway · POS | `merchant` account |
+
+> **SME lens:** even a *small* SME typically holds a bundle — business current account + overdraft +
+> business loan + **invoice finance** + **asset finance** + business cards + (if importing/exporting)
+> **trade finance** + **FX hedging**. So corporate/SME banking is inherently **multi-product per
+> relationship**, which drives its signature features: **product breadth**, **share of wallet**,
+> **combined cross-product exposure** (a group's true risk sums lending + trade + derivatives + SCF),
+> and **cross-sell propensity** (SMEs are the prime cross-sell segment). Combined exposure especially
+> must aggregate across product families *and* up the group hierarchy (§1.9).
 
 ### 1.3 Transaction / event side
 `transaction` · `payment` (ACH/wire/SEPA/RTP) · `card_transaction` · `authorization` · `settlement` ·
@@ -107,9 +134,12 @@ advisory · discretionary portfolio mgmt · trust & estate.
 `portfolio_drift_alert`.
 
 ### 2.3 Commercial / business banking (SME + mid-corp)
-business lending · cash management / treasury services · **trade finance** · merchant acquiring.
-*Use-cases:* `sme_credit_risk`, `working_capital_need`, `merchant_attrition`, `trade_finance_fraud`,
-`cash_flow_forecast`.
+business lending · **trade finance** · **supply-chain finance** · **asset finance / leasing** · cash
+management / transaction banking · treasury / FX · merchant acquiring.
+*Use-cases:* `sme_credit_risk` (cash-flow-based), `working_capital_need`, `invoice_finance_risk`,
+`supply_chain_finance_limit`, `trade_finance_fraud`, `product_breadth_cross_sell`,
+`combined_exposure_early_warning`, `covenant_breach_prediction`, `fx_hedging_propensity`,
+`asset_finance_default`, `merchant_attrition`, `cash_flow_forecast`.
 
 ### 2.4 Corporate & investment banking (wholesale)
 DCM/ECM origination · M&A advisory · syndicated lending · **prime brokerage** · securities services /
@@ -176,7 +206,8 @@ class**, **entity link**. `is-a` edges shown where they aid generalisation.
 ### 3.1 Monetary
 | Concept | Additivity | Examples |
 |---|---|---|
-| `monetary_stock` *(is-a monetary)* | **semi-additive** (sum across entities; latest over time) | balance, exposure, position value, collateral value, limit, AUM |
+| `monetary_stock` *(is-a monetary)* | **semi-additive** (sum across entities; latest over time) | balance, exposure, position value, collateral value, limit, AUM, receivable, payable |
+| `contingent_exposure` *(is-a monetary_stock)* | semi-additive; **off-balance-sheet** — converts on drawdown (credit-conversion-factor) | undrawn facility, LC / guarantee amount, committed line |
 | `monetary_flow` *(is-a monetary)* | **fully additive** | transaction amount, payment, fee, interest paid/earned, drawdown, repayment, P&L, revenue |
 | `monetary_rate` *(is-a monetary)* | **non-additive** | interest rate, coupon, APR, yield, spread |
 | `price` *(is-a monetary)* | non-additive | instrument price, strike, NAV |
