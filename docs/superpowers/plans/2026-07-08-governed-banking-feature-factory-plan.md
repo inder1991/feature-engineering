@@ -21,9 +21,14 @@ model-risk review. If we can't win that team, we stop and rethink — before bui
 ## 1. Global constraints (every increment)
 
 - **No data plane** — no compute/serving/training/predictiveness. Templates are *definitions*.
-- **LLM proposes; deterministic code + humans dispose.** The four safety checks are deterministic.
-- **Four safety checks** gate every governed feature: leakage (3-part) · point-in-time incl. bi-temporal
-  · currency · eligibility (consent/purpose/residency/fair-lending/additivity).
+- **LLM proposes; deterministic code + humans dispose.** The safety gate is deterministic.
+- **Safety gate — ENFORCED vs. DECLARED** (no data plane): *enforced on metadata* = leakage (3-part) ·
+  eligibility (consent/purpose/residency/fair-lending) · currency-tag · additivity; *declared + flagged
+  only* = bi-temporal restatement · runtime currency. `DESIGN-CHECKED` = "passed enforced + declared the
+  rest," never a runtime guarantee.
+- **Templates are a SCAFFOLD, not a cage** — they SEED generation; the LLM always proposes beyond them,
+  un-templated requests still work, only non-banking is refused (domain-intel §5.1/§5.2). Never build
+  templates as the only generation path.
 - **`DESIGN-CHECKED` is earned**; direct registration is `UNVERIFIED`.
 - **Every user-facing / breaking change is behind a feature flag** with a documented backout.
 - **RBAC-gated · TDD · frequent commits · migrations are new files** (0973+).
@@ -67,7 +72,7 @@ honest stamp** for churn, in the UI, logged-in, with the decision captured. Suit
 | # | Increment | Size | Key files | Done-when |
 |---|---|---|---|---|
 | **A1** | Contract model + honest lifecycle | **M** | `features.py` (default→UNVERIFIED), `govern.py` (snapshot@confirm + explicit DESIGN-CHECKED + assembled view), mig `0973` (CHECK + re-stamp existing, **flagged + backup**) | immutable snapshotted contracts; existing features re-stamped `UNVERIFIED`; #4 closed |
-| **A2** | The 4 deterministic safety checks | **L** | mig `0974` (target `{label,source_cols}`, `system_time`); `feature_assist.py` (3-part leakage + currency + eligibility); graph reads (bi-temporal `system_time≤as_of`) | each check deterministic + tested; `days_since_last_txn` passes, restated/cross-currency/ineligible caught |
+| **A2** | The safety gate (enforced + declared) | **L** | mig `0974` (target `{label,source_cols}`, `system_time`); `feature_assist.py` (3-part leakage + currency-tag + eligibility — **enforced**); graph reads carry bi-temporal `system_time≤as_of` as a **declared** claim | enforced checks block + tested (`days_since_last_txn` passes; cross-currency/ineligible caught); bi-temporal restatement recorded as a *declared* claim (not runtime-enforced — no data plane); **cross-catalog leakage keyed on `(catalog_source,object_ref)`** |
 | **A3** | Gate-1 checkpoint + four-eyes | **M** | `contract.py` (approve-brief), `permissions.py` (`feature:approve` + `FEATUREGEN_CONTRACT_FOUR_EYES`) | brief approval recorded; four-eyes rejects same-subject Gate-2 when on |
 | **A4** | UI hardening | **M** | new screens hardened: batch approve, **show rejects + "safe not proven" caveat**, confirm-failure→back, promote-to-governed | multi-approve mints N; rejects visible; unhappy paths land gracefully |
 | **A5** | Rollout + observability | **S–M** | flags default-on, deprecate old `POST /features` register path (window), metrics (adoption, gate pass/fail, rejection reasons) | flow is the default path; dashboards live; old path deprecated |
@@ -80,23 +85,58 @@ honest stamp** for churn, in the UI, logged-in, with the decision captured. Suit
 | **B2** | Parametric template engine + first set | **L** | new `templates.py` (model + deterministic engine, PIT baked in) + churn/credit templates | a template grounds to columns → a leakage-safe feature by construction; ungroundable skipped |
 | **B3a** | Governed knowledge store | **L** | mig `0975` (catalog tables, versioned/audited); new `domain/catalog.py` (load seed, query, onboard) | DB-backed catalog seeded from the JSON; onboard a new use-case |
 | **B3b** | Ratification + curation | **M** | ratify flow (owner + Compliance flip `compliance_confirmed`); RBAC curation routes | regulatory rules **inert until ratified**; edits versioned/audited |
-| **B4** | Reasoning wired into the flow *(← integration with A)* | **M** | `gate1.py`/`feature_assist.py` — use-case recognition, known-target proposal, template-seeded generation, regulatory filter | slice now recognises the use-case, proposes the known target, seeds from templates, blocks protected data — scored on the **golden set** |
+| **B4** | Reasoning + **selection pipeline** wired into the flow *(← integration with A)* | **M** | `gate1.py`/`feature_assist.py` — use-case recognition (human-confirmed, fail-to-strict), known-target proposal, **two-source generation** (templates ∪ **LLM-novel proposals**), regulatory filter | the **selection pipeline** runs: both sources → deterministic groundability + safety gate → **LLM shortlists 2–3 with rationale** → human finalises (can expand to full safe set); use-case recognised, known target proposed, protected data blocked; LLM ranks/proposes but never gates; **fail-safe** to deterministic ranking; scored on the **golden set** (§5.1/§5.2 of domain-intel) |
 | **B5** | Flywheel steering *(capture already live since M0)* | **M** | `feature_assist.py` steering; mig `0977` if needed | prior approvals measurably steer generation; curator can promote learned refinements |
 
 ---
+
+## 5b. Workstream C — Content authoring (domain-expert-owned, NOT engineering)
+
+The **single biggest investment** and a *distinct discipline* from building the engine: the knowledge is
+authored by a **banking domain expert / SME**, not developers. Sized + owned separately so it never hides
+inside B's engineering rows. Sources already drafted: **[taxonomy reference](../specs/2026-07-07-banking-taxonomy-reference.md)**
+and **[feature template library](../specs/2026-07-08-banking-feature-template-library.md)** (~70 templates).
+
+| # | Increment | Size | Owner | Content | Feeds |
+|---|---|---|---|---|---|
+| **C1** | Concept + entity vocabulary content | **M** | SME | finalise the ~70 concepts + ~60 entities (behaviour tags) from the taxonomy ref; old→new concept map | B1 |
+| **C2** | Template recipes (first domains) | **L** | SME | author the churn + credit template *definitions* from the library doc (or reverse-engineer the bank's existing features); **not "proven" — expert-curated, golden-set-gated** | B2 |
+| **C3** | Use-case case catalog (per-domain depth) | **L** | SME + Compliance | per-use-case target/templates/allowed-blocked-data/regulatory, ready for ratification | B3a/B3b |
+
+> Content grows continuously after launch via curation + the flywheel (B5) — C1–C3 are the *first
+> chapters*, not the finished book. Best source for C2 is the **bank's own existing model features**.
+
+## 5c. Edge-case acceptance notes (from the head-of-architect review — attach to each increment)
+
+Each must be handled + tested when its increment is expanded (they were found in review; recorded here so
+they are not lost):
+- **A2** — cross-catalog leakage keyed on `(catalog_source, object_ref)` (done-when above).
+- **A3** — **four-eyes deadlock**: a team with no distinct second approver needs an escalation/exception
+  path (or a min-approvers precondition), else a feature can never be governed.
+- **A4** — **batch-approval atomicity**: define per-item (govern the passing ones, report failures), not
+  all-or-nothing; **promote-reconciliation**: reject a promotion whose authored spec ≠ the live feature.
+- **B1** — **concept-migration backfill**: 11→~70 re-classifies existing columns (LLM cost + changed
+  tags); ship an old→new map so existing catalogs don't silently shift.
+- **B2** — **template grounding ambiguity**: a template needing "a monetary_stock" with 3 candidates →
+  disambiguate (human pick or heuristic), don't silently pick one.
+- **cross-cutting** — **duplicate intents/considered-sets** (uuid per submit) → a cleanup/dedup;
+  **golden-set drift** → assign a maintenance owner (it goes stale as vocab/templates evolve).
 
 ## 6. Convergence & critical path
 
 ```
 Kick-off (LLM · ratification · golden set)  ──┐
                                               ▼
-M0 walking skeleton  ──►  A1 A2 A3 A4 A5  (Governed Flow) ──┐
-                    └──►  B1 B2 B3a B3b     (Domain Intel)  ──►  B4 wire-in ──►  A5 default-on
+M0 walking skeleton  ──►  A1 A2 A3 A4 A5   (Governed Flow, eng) ──┐
+                    ├──►  B1 B2 B3a B3b     (Domain Intel, eng)  ──►  B4 wire-in ──►  A5 default-on
+                    └──►  C1 C2 C3          (Content, SME)  ──feeds──►  B1/B2/B3
 ```
-- **Critical path to real value:** M0 → **A2** (safety) + **B4** (reasoning, needs B1+B2+LLM) → A5
-  default-on. Everything else parallelises around it.
-- **Two teams:** Stream-A eng (governance/flow/UI) and Stream-B eng (vocabulary/templates/catalog).
-  Converge at B4. Halves calendar time vs. v1's serial chain.
+- **Critical path to real value:** M0 → **A2** (safety) + **B4** (reasoning + selection, needs
+  B1+B2+**C1/C2**+LLM) → A5 default-on. Everything else parallelises around it.
+- **Three streams:** Stream-A eng (governance/flow/UI) · Stream-B eng (vocabulary/template-engine/catalog
+  store) · **Stream-C SME (the content — concepts, template recipes, cases)**. B depends on C's content;
+  converge at B4. Halves calendar time vs. v1's serial chain — but **C is the long pole**, start it at
+  kick-off.
 - **XL split done:** v1's Phase 3/4 are now B1/B2/B3a/B3b (each L/M).
 
 ## 6a. Architecture fixes folded in (head-of-architect review) — where each lands
