@@ -163,6 +163,32 @@ table that's stuck on any un-templated request. That would make it **less** inte
 knows the patterns *and* adapts them — not a junior improvising from nothing. Templates are the priors;
 the LLM is the adaptation. Both, always. **Templates must never be the only path.**
 
+### 5.2 Template selection pipeline — deterministic gates → LLM ranks → human finalises
+
+How ~70 templates become the human's 2–3-item shortlist. **Safety is deterministic; relevance is the
+LLM's job; the choice is the human's.**
+
+1. **Use-case shortlist (deterministic).** Start from the use-case's `feature_templates` + the
+   cross-cutting families (a *prior*, not a limit).
+2. **Groundability (deterministic — the hard filter).** Keep only templates whose `needs` **concepts**
+   match concept-tagged columns in *this* catalog, then **bind** `{params}` to real columns. A template
+   that can't bind is dropped. This is **concept set-matching — no LLM.** *(Solid vocabulary is the
+   matching key — §3.)*
+3. **Safety + eligibility (deterministic).** Run the four checks + the use-case's `blocked_data_classes`
+   on each *bound* candidate; drop the unsafe/ineligible. → yields the **SAFE, GROUNDABLE set.**
+4. **LLM shortlist (proposes — the judgment step).** The LLM reads the *specific hypothesis* and picks the
+   **2–3 most relevant** from the safe set, **each with a rationale**; it may also **add novel candidates
+   beyond templates** (which re-enter at step 3's safety gate). **Flywheel-informed** (what this team
+   approves).
+5. **Human finalises (disposes).** Picks from the shortlist; can **expand to the full safe set**
+   (scaffold-not-cage — never hide valid options).
+
+**The boundary (non-negotiable): the LLM RANKS, it never GATES.** It shortlists *from an already-safe
+set*, so its judgment affects **relevance**, never **safety** — it can pick a less-useful template, never
+a leaky one. **Fail-safe:** if the LLM call fails, fall back to the deterministic ranking
+(use-case-recommended first) — the flow never blocks on the LLM. The rationale is **recorded in the
+contract's provenance** (auditable).
+
 ---
 
 ## 6. Reasoning — wired into the contract flow
