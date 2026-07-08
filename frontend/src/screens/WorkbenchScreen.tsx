@@ -58,8 +58,8 @@ import { type FormEvent, type ReactNode, useEffect, useRef, useState } from 'rea
 import {
   ApiError, type FeatureFreshness, type FeatureIdea, type FeatureSpecIn, type JoinStep,
   type Recipe, type RefineRejection, type Rejection, type SetRecommendation,
-  contractConsideredSet, featureFreshness, featureRecipe, recommendFeatureSets, refineCandidate,
-  registerFeature,
+  contractConfirm, contractConsideredSet, contractDraft, featureFreshness, featureRecipe,
+  recommendFeatureSets, refineCandidate, registerFeature,
 } from '../api'
 import { getSession } from '../session'
 
@@ -481,6 +481,11 @@ export function WorkbenchScreen() {
   const [drafting, setDrafting] = useState(false)
   const [confirmingBatch, setConfirmingBatch] = useState(false)
   const [batchBusy, setBatchBusy] = useState(false)
+  // Govern path, symmetric with register: which candidates minted a signed contract (contract
+  // id + version), whether the tray is confirming a govern, and whether a govern batch is running.
+  const [governed, setGoverned] = useState<Record<string, { contractId: string; version: number }>>({})
+  const [confirmingGovern, setConfirmingGovern] = useState(false)
+  const [governBusy, setGovernBusy] = useState(false)
   const [notice, setNotice] = useState('')
   // Whole-round feedback channel: the objective the round was generated for (feedback reruns
   // THAT goal, not a since-edited input), the instruction being typed, rounds consumed, the
@@ -505,6 +510,9 @@ export function WorkbenchScreen() {
   // Reentry guard for the register batch: state updates are async, so a double click on
   // Confirm approval could otherwise start two batches before the disabled attribute lands.
   const batchInFlight = useRef(false)
+  // Reentry guard for the govern batch, mirroring batchInFlight: a double click on Confirm
+  // govern must never mint two contracts for one candidate.
+  const governInFlight = useRef(false)
   // Element id to focus after the next render (house pattern from ReviewQueueScreen): Approve
   // revision / Revert to original unmount the button that held focus, so without an explicit
   // move keyboard focus falls back to <body>.
@@ -545,8 +553,12 @@ export function WorkbenchScreen() {
   const hasGenerated = (generated?.length ?? 0) > 0
   // Selection is the intersection of the map and the live candidate list: keys from cleared
   // rounds are inert, and registered candidates can never re-enter a batch.
-  const selectedCandidates = allCandidates.filter(c => c.key in selected && !registered[c.key])
+  const selectedCandidates = allCandidates.filter(
+    c => c.key in selected && !registered[c.key] && !governed[c.key])
   const selectedCount = selectedCandidates.length
+  // Only generated candidates are governable (they came through the considered set and are in
+  // its snapshot); a draft is the human's own definition and never governs into a contract.
+  const governableCount = selectedCandidates.filter(c => c.kind === 'generated').length
   // Distinct set origins of the current picks, for the tray's mix note.
   const originLenses = [...new Set(
     selectedCandidates
@@ -559,7 +571,7 @@ export function WorkbenchScreen() {
   // Approve revision / Revert to original are inert, the generate path locks, and scope edits
   // are inert. A revision must never race what the human is about to write into the registry,
   // and a registration must never complete invisibly after its row leaves view.
-  const feedbackLocked = confirmingBatch || batchBusy
+  const feedbackLocked = confirmingBatch || batchBusy || confirmingGovern || governBusy
   const setFbExhausted = setFbRounds >= FEEDBACK_ROUNDS
 
   // Gates advance with real state, never decoratively.
@@ -621,10 +633,12 @@ export function WorkbenchScreen() {
     setDrafts([])
     setSelected({})
     setRegistered({})
+    setGoverned({})
     setErrors({})
     setDraftErrors([])
     setScreenedTarget(null)
     setConfirmingBatch(false)
+    setConfirmingGovern(false)
     clearSets()
     clearFeedback()
     if (hadCandidates) setScopeChanged(true)
@@ -640,6 +654,7 @@ export function WorkbenchScreen() {
     setSelected({})
     setScreenedTarget(null)
     setConfirmingBatch(false)
+    setConfirmingGovern(false)
     clearSets()
     clearFeedback()
     if (hadGenerated) setScopeChanged(true)
@@ -715,6 +730,7 @@ export function WorkbenchScreen() {
       setRejectionsOpen(false)
       setScreenedTarget(target.trim() || null)
       setConfirmingBatch(false)
+      setConfirmingGovern(false)
       // A fresh engine round starts a fresh feedback cycle against ITS objective: whole-round
       // feedback reruns this goal even if the input is edited later.
       setRoundObjective(objective)
@@ -782,6 +798,10 @@ export function WorkbenchScreen() {
         ...pinned.map((c): GeneratedCandidate => ({ ...c, kept: true, lenses: [] })),
         ...byName.values(),
       ])
+      // Whole-round feedback replaced the displayed candidates; the new ones are NOT in the
+      // intent's considered-set snapshot, so drop the intent. Govern disables until the human
+      // regenerates through considered-set. (A later task routes feedback through it to lift this.)
+      setIntentId(null)
       // Kept rows left the sets model, so their selection origins go neutral: a kept pick
       // reads as kept in the tray, never as a pick from a set that no longer exists.
       setSelected(prev => Object.fromEntries(
@@ -798,6 +818,7 @@ export function WorkbenchScreen() {
       setRejections(round.rejections)
       setRejectionsOpen(false)
       setConfirmingBatch(false)
+      setConfirmingGovern(false)
       setSetFbRounds(r => r + 1)
       setSetFbRecords(records => [...records, {
         round: records.length + 1, user: getSession().user, instruction,
@@ -983,9 +1004,10 @@ export function WorkbenchScreen() {
   }
 
   function toggleSelect(key: string, origin: string | null) {
-    // Changing the selection backs out of the confirm step: the confirm copy must always
-    // describe exactly what will be registered.
+    // Changing the selection backs out of either confirm step: the confirm copy must always
+    // describe exactly what will be registered or governed.
     setConfirmingBatch(false)
+    setConfirmingGovern(false)
     setSelected(prev => {
       const next = { ...prev }
       if (key in next) {
@@ -1001,6 +1023,7 @@ export function WorkbenchScreen() {
   // that set. Picks made from other sets keep their own origins (a la carte mixing).
   function takeSet(lens: string) {
     setConfirmingBatch(false)
+    setConfirmingGovern(false)
     setActiveLens(lens)
     setSelected(prev => {
       const next = { ...prev }
@@ -1051,6 +1074,45 @@ export function WorkbenchScreen() {
       batchInFlight.current = false
       setBatchBusy(false)
       setConfirmingBatch(false)
+    }
+  }
+
+  // Govern the selected GENERATED candidates into signed contracts, mirroring confirmRegistration:
+  // sequential, one candidate at a time, per-candidate try/catch so a failure marks that candidate
+  // and the batch continues. Only generated candidates are in the intent's considered-set snapshot;
+  // chosenSource is always 'alternative' and chosenOptionId is the candidate's feature name.
+  async function confirmGovern() {
+    if (governInFlight.current) return
+    const iid = intentId
+    if (!iid) return
+    const batch = allCandidates.filter(
+      (c): c is GeneratedCandidate =>
+        c.key in selected && !governed[c.key] && c.kind === 'generated')
+    if (batch.length === 0) return
+    governInFlight.current = true
+    setGovernBusy(true)
+    setNotice('')
+    try {
+      for (const candidate of batch) {
+        try {
+          const d = await contractDraft(iid, 'alternative', candidate.idea.name)
+          const c = await contractConfirm(d.draft, iid)
+          setGoverned(prev => ({ ...prev,
+            [candidate.key]: { contractId: c.contract_id, version: c.version } }))
+          deselect(candidate.key)
+          setErrors(prev => {
+            if (!(candidate.key in prev)) return prev
+            const next = { ...prev }; delete next[candidate.key]; return next
+          })
+        } catch (err) {
+          setErrors(prev => ({ ...prev,
+            [candidate.key]: err instanceof ApiError ? err.detail : String(err) }))
+        }
+      }
+    } finally {
+      governInFlight.current = false
+      setGovernBusy(false)
+      setConfirmingGovern(false)
     }
   }
 
@@ -1404,6 +1466,7 @@ export function WorkbenchScreen() {
           <ul className="rows">
             {listCandidates.map(c => {
               const reg = registered[c.key]
+              const gov = governed[c.key]
               const error = errors[c.key]
               const rawName = c.kind === 'generated' ? c.idea.name : c.name
               const displayName = rawName.trim() || 'unnamed draft'
@@ -1424,7 +1487,7 @@ export function WorkbenchScreen() {
                   tabIndex={-1}
                   style={{ alignItems: 'flex-start' }}
                 >
-                  {reg ? (
+                  {reg || gov ? (
                     <CheckGlyph />
                   ) : (
                     <input
@@ -1462,7 +1525,7 @@ export function WorkbenchScreen() {
                       )}
                       {/* Pinned through a whole-round regeneration. Registered rows skip the
                           chip: Registered is already their mark. */}
-                      {c.kind === 'generated' && c.kept === true && !reg && (
+                      {c.kind === 'generated' && c.kept === true && !reg && !gov && (
                         <span className="badge">Kept</span>
                       )}
                       {/* The human approved an engine revision in round n. */}
@@ -1520,8 +1583,9 @@ export function WorkbenchScreen() {
                       </p>
                     )}
                     {/* Per-candidate feedback: generated rows only (a draft is the human's own
-                        definition, revised by editing its line), never on registered rows. */}
-                    {c.kind === 'generated' && !reg && (
+                        definition, revised by editing its line), never on registered or governed
+                        rows (a minted contract is finalized; feedback would diverge from it). */}
+                    {c.kind === 'generated' && !reg && !gov && (
                       <>
                         <div>
                           <button
@@ -1666,6 +1730,14 @@ export function WorkbenchScreen() {
                         ))}
                       </p>
                     )}
+                    {/* Governed mark, parallel to the registered one: a minted, versioned,
+                        design-checked contract. Its own state, so no checkbox and no feedback. */}
+                    {gov && (
+                      <p style={{ color: 'var(--ok)', fontWeight: 500 }}>
+                        Governed <span className="mono">{gov.contractId}</span> v{gov.version}
+                        {' · DESIGN-CHECKED'}
+                      </p>
+                    )}
                   </div>
                 </li>
               )
@@ -1695,6 +1767,29 @@ export function WorkbenchScreen() {
                       Cancel
                     </button>
                   </>
+                ) : confirmingGovern ? (
+                  <>
+                    <p style={{ flex: '1 1 260px', fontWeight: 500 }}>
+                      Governing runs the safety gauntlet and mints a signed contract per feature —
+                      a design check, not a proof it predicts well.
+                    </p>
+                    <button
+                      type="button"
+                      className="btn btn--primary"
+                      disabled={governBusy}
+                      onClick={() => void confirmGovern()}
+                    >
+                      Confirm govern
+                    </button>
+                    <button
+                      type="button"
+                      className="btn"
+                      disabled={governBusy}
+                      onClick={() => setConfirmingGovern(false)}
+                    >
+                      Cancel
+                    </button>
+                  </>
                 ) : (
                   <>
                     <span className="tabular-nums" style={{ fontWeight: 600 }}>
@@ -1702,6 +1797,18 @@ export function WorkbenchScreen() {
                     </span>
                     {mixNote !== null && <span className="hint">{mixNote}</span>}
                     <span style={{ flex: '1 1 auto' }} aria-hidden="true" />
+                    {/* Govern the generated picks into signed contracts through the two-gate flow.
+                        Shown only when a governing intent exists (from the last considered-set
+                        generate) and at least one selected candidate is generated (governable). */}
+                    {intentId !== null && governableCount > 0 && (
+                      <button
+                        type="button"
+                        className="btn"
+                        onClick={() => setConfirmingGovern(true)}
+                      >
+                        Govern {governableCount}
+                      </button>
+                    )}
                     <button
                       type="button"
                       className="btn btn--primary"

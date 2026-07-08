@@ -11,6 +11,8 @@ vi.mock('../api', async importOriginal => {
     recommendFeatures: vi.fn(),
     recommendFeatureSets: vi.fn(),
     contractConsideredSet: vi.fn(),
+    contractDraft: vi.fn(),
+    contractConfirm: vi.fn(),
     refineCandidate: vi.fn(),
     featureRecipe: vi.fn(),
     leakageCheck: vi.fn(),
@@ -21,6 +23,8 @@ vi.mock('../api', async importOriginal => {
 const recommendFeatures = vi.mocked(api.recommendFeatures)
 const recommendFeatureSets = vi.mocked(api.recommendFeatureSets)
 const contractConsideredSet = vi.mocked(api.contractConsideredSet)
+const contractDraft = vi.mocked(api.contractDraft)
+const contractConfirm = vi.mocked(api.contractConfirm)
 const refineCandidate = vi.mocked(api.refineCandidate)
 const featureRecipe = vi.mocked(api.featureRecipe)
 const registerFeature = vi.mocked(api.registerFeature)
@@ -30,6 +34,8 @@ beforeEach(() => {
   recommendFeatures.mockReset()
   recommendFeatureSets.mockReset()
   contractConsideredSet.mockReset()
+  contractDraft.mockReset()
+  contractConfirm.mockReset()
   refineCandidate.mockReset()
   featureRecipe.mockReset()
   registerFeature.mockReset()
@@ -1629,5 +1635,85 @@ describe('per-candidate feedback', () => {
     expect(screen.getByRole('button', {
       name: 'Send feedback for one revision · round 2 of 3',
     })).toBeInTheDocument()
+  })
+})
+
+describe('govern', () => {
+  // A ContractDraft for avg_balance, mirroring IDEA. contractDraft returns it wrapped; the
+  // server-side intent from the considered-set mock is 'int_1' (see `considered`).
+  const AVG_DRAFT: api.ContractDraft = {
+    feature_name: 'avg_balance', definition: 'average balance per customer',
+    grain_table: 'customers', aggregation: 'avg', as_of_column: null,
+    derives_from: ['public.accounts.balance'], target_ref: null,
+    derives_pairs: [['cards', 'public.accounts.balance']], join_path: [],
+  }
+
+  it('governs a selected generated candidate through draft + confirm into a signed contract', async () => {
+    contractDraft.mockResolvedValue({ draft: AVG_DRAFT, unresolved: [], intent_id: 'int_1' })
+    contractConfirm.mockResolvedValue({
+      contract_id: 'contract_1', feature_id: 'feat_1', feature_name: 'avg_balance', version: 1,
+    })
+    await renderAndGenerate([IDEA])
+    await screen.findByText('avg_balance')
+    await selectCandidate('avg_balance')
+    // Govern is offered because a governing intent exists and the pick is generated.
+    await userEvent.click(screen.getByRole('button', { name: 'Govern 1' }))
+    expect(screen.getByText(
+      'Governing runs the safety gauntlet and mints a signed contract per feature — a design '
+      + 'check, not a proof it predicts well.',
+    )).toBeInTheDocument()
+    await userEvent.click(screen.getByRole('button', { name: 'Confirm govern' }))
+    // The row shows the minted contract; the two-gate flow ran with the intent from generate.
+    expect(await screen.findByText(/governed/i)).toBeInTheDocument()
+    expect(screen.getByText('contract_1')).toBeInTheDocument()
+    expect(contractDraft).toHaveBeenCalledWith('int_1', 'alternative', 'avg_balance')
+    expect(contractConfirm).toHaveBeenCalledWith(
+      expect.objectContaining({ feature_name: 'avg_balance' }), 'int_1')
+    expect(contractDraft).toHaveBeenCalledTimes(1)
+    expect(contractConfirm).toHaveBeenCalledTimes(1)
+    // Govern is a parallel path: it never registers, and the governed row is done (no checkbox).
+    expect(registerFeature).not.toHaveBeenCalled()
+    expect(screen.queryByRole('checkbox', { name: 'Select avg_balance' })).not.toBeInTheDocument()
+  })
+
+  it('has no Govern action after a whole-round feedback clears the intent, while register stays', async () => {
+    await renderAndGenerate([IDEA, OTHER_IDEA])
+    await selectCandidate('avg_balance')
+    // Before feedback: the governing intent from generate makes Govern available.
+    expect(screen.getByRole('button', { name: 'Govern 1' })).toBeInTheDocument()
+    recommendFeatureSets.mockResolvedValueOnce(singleSetRound([idea('inactivity_days')]))
+    await userEvent.type(
+      screen.getByLabelText('Feedback on the whole round'), 'more behavioral signals')
+    await userEvent.click(screen.getByRole('button', {
+      name: 'Regenerate with feedback · round 1 of 3',
+    }))
+    expect(await screen.findByText('inactivity_days')).toBeInTheDocument()
+    // The pinned pick keeps the tray up, but the intent is gone: no Govern, register unaffected.
+    expect(screen.getByText('avg_balance')).toBeInTheDocument()
+    expect(screen.getByText('1 selected')).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /^Govern/ })).not.toBeInTheDocument()
+    expect(
+      screen.getByRole('button', { name: 'Approve and register 1 feature' }),
+    ).toBeInTheDocument()
+    expect(contractDraft).not.toHaveBeenCalled()
+  })
+
+  it('marks the candidate with the failure and does not govern it when confirm rejects', async () => {
+    contractDraft.mockResolvedValue({ draft: AVG_DRAFT, unresolved: [], intent_id: 'int_1' })
+    contractConfirm.mockRejectedValue(
+      new api.ApiError(422, 'the safety gauntlet rejected the contract'))
+    await renderAndGenerate([IDEA])
+    await screen.findByText('avg_balance')
+    await selectCandidate('avg_balance')
+    await userEvent.click(screen.getByRole('button', { name: 'Govern 1' }))
+    await userEvent.click(screen.getByRole('button', { name: 'Confirm govern' }))
+    // The failure surfaces on the candidate row; it is never marked governed and stays selectable.
+    expect(
+      await screen.findByText('the safety gauntlet rejected the contract'),
+    ).toBeInTheDocument()
+    expect(screen.queryByText(/governed/i)).not.toBeInTheDocument()
+    expect(screen.getByRole('checkbox', { name: 'Select avg_balance' })).toBeInTheDocument()
+    // The failed candidate stays selected, so Govern is offered again for a retry.
+    expect(screen.getByRole('button', { name: 'Govern 1' })).toBeInTheDocument()
   })
 })
