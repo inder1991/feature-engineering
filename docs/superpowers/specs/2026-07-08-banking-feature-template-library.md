@@ -355,6 +355,64 @@ credit proxy**.
 - **Greenwashing / SLL:** `green_proceeds_deviation` (green-bond proceeds not actually green),
   `sll_kpi_trend` / `sll_kpi_breach_flag` (triggers a margin ratchet), `esg_claim_vs_data_gap`.
 
+## B12. Asset management (buy-side) — the REDEMPTION funnel + mandate compliance
+Funds/mandates, driven by **relative performance + liquidity**. Regulatory: IMA/mandate compliance,
+open-ended fund liquidity.
+- **Investor-flow / redemption funnel (mirrors churn):** `INVESTED → DISENGAGEMENT (reduced allocation) →
+  REDEMPTION-RISK (underperformance, partial redemptions) → REDEMPTION NOTICE ⚠ → REDEEMED`. Signals:
+  `fund_flow_trend` (net subs − redemptions), `relative_performance` (vs benchmark — underperformance
+  drives outflows), `investor_concentration` (few big investors = run risk), `distribution_partner_flow`
+  (platform/advisor flows), `redemption_notice_flag` (near-label).
+- **Mandate / portfolio risk:** `mandate_breach_proximity` (drift toward a sector/issuer/rating limit),
+  `style_drift` (portfolio vs stated style), `tracking_error`, `fund_liquidity_coverage` (liquid assets ÷
+  expected redemptions — the run-risk mismatch), `concentration_vs_limit`.
+
+## B13. Islamic banking — conventional funnels + the SHARIA-COMPLIANCE overlay
+Most B1–B7 funnels APPLY (churn/credit/deposits), reframed: **profit-rate, not interest**. The
+distinctive layer is **Sharia compliance = a hard eligibility gate** (like a regulatory rule), ratified
+by the **Sharia board** (a domain-specific ratification, cf. Compliance).
+- **Sharia-compliance features:** `sharia_compliance_flag`, `prohibited_activity_exposure` (haram-sector
+  screen — alcohol/gambling/conventional-interest), `purification_amount` (non-compliant income to
+  purify), `profit_rate` (replaces interest in all rate features).
+- **Product-specific behavioural:** Murabaha `installment_payment_behavior` (= credit B2); Ijara
+  `lease_utilisation` + residual-value risk; Mudaraba/Musharaka `profit_share_volatility` (partner
+  performance); Sukuk = bond features; Takaful = insurance (B9 lapse/claims).
+- **Deposit attrition:** `islamic_deposit_beta` (profit-rate sensitivity) + Sharia-compliance-concern
+  churn (a distinctive driver). eligibility: Sharia non-compliance is a **HARD block**.
+
+## B14. Payments-as-a-business (beyond cards)
+RTP/instant, correspondent banking, cross-border/remittance, open banking, merchant acquiring.
+- **RTP / instant-payment fraud (real-time, like B3):** `app_scam_pattern` (authorised push payment —
+  victim tricked: new payee + high value + urgency), `mule_inflow_pattern` (receiving side — in-then-
+  straight-out), `payment_velocity`, `beneficiary_risk`. Near-label: the scam/fraud payment.
+- **Correspondent banking:** `correspondent_exposure`, `nested_correspondent_flag` (respondent serving
+  other banks — AML), `unusual_corridor_flow`, `sanctions_corridor_exposure`.
+- **Cross-border / remittance AML:** `corridor_risk` (high-risk corridor), `structuring_remittance`,
+  `agent_velocity`, `sender_receiver_network`.
+- **Open banking / TPP:** `tpp_consent_anomaly`, `aggregator_scraping_flag`, `consent_scope_creep`.
+  eligibility: **data-governance heavy** (consent/purpose).
+- **Merchant acquiring (a churn+credit funnel):** `merchant_txn_decline` (attrition), `chargeback_rate`
+  (fraud/credit), `merchant_bust_out_risk` (volume spike then vanish), `settlement_delay_risk`,
+  `merchant_credit_risk` (for merchant cash advance).
+
+## B15. Corporate / SME — trade & supply-chain finance (multi-product, GROUP-level)
+Corporate is **multi-product + hierarchical** — features aggregate across product families AND up the
+group (§A6 `group_exposure_sum`). Cash-flow / trade-flow-based, not just financials.
+- **Trade finance (LC/guarantee):** `trade_cycle_length` (issue→settlement — lengthening = stress),
+  `document_discrepancy_rate`, `contingent_utilisation` (undrawn LCs being drawn = stress),
+  `trade_counterparty_concentration`.
+- **Invoice / receivables finance:** `invoice_dilution_rate` (unpaid/credit-noted), `debtor_concentration`,
+  `dso_trend` (days-sales-outstanding rising = cash stress), `invoice_verification_gap` (fake-invoice fraud).
+- **Supply-chain finance:** `anchor_buyer_dependence` (SCF program hinges on the anchor's health),
+  `payment_term_extension` (buyer extending terms = stress), `program_utilisation_trend`.
+- **Working capital / facility:** `facility_utilisation_trend`, `covenant_headroom` (proximity to breach),
+  `overdraft_persistence` (hardcore overdraft never clearing).
+- **Corporate deterioration funnel (mirrors credit, at GROUP level):** `HEALTHY → EARLY STRESS
+  (utilisation↑, DSO↑, term extension) → COVENANT PRESSURE (headroom↓) → BREACH ⚠ → DEFAULT/RESTRUCTURE`.
+  Signals: `combined_exposure_trend` (across products + subsidiaries), `cross_product_stress_count` (#
+  product lines simultaneously stressed — a strong early-warning), `trade_flow_decline` (business slowing).
+  Near-label: covenant breach for a breach-prediction target.
+
 ---
 
 # PART C — Coverage matrix (family × use-case)
@@ -402,9 +460,10 @@ credit proxy**.
    use-case, **map its funnel first**, then place each template on it and mark the near-label tail.
 
 # PART E — Open / to-deepen
-Markets (§B8), insurance (§B9), custody/securities-services (§B10), ESG (§B11) are now **drafted** at
-funnel/family level. Still to deepen: (a) expand each stage's compact signals into full parametric
-templates (`needs/params/pit` schema, like §A9); (b) further business lines — asset management (fund
-redemption/flows), Islamic banking (Sharia-compliant profit-rate/Sukuk), payments-as-business (RTP fraud,
-correspondent risk), corporate/SME trade & supply-chain finance (trade-cycle risk, facility utilisation,
-covenant drift). Coverage grows per-domain via curation, not one big freeze.
+**All 15 business lines are now drafted** at funnel/family level (B1 churn · B2 credit · B3 fraud · B4 AML ·
+B5 cross-sell · B6 collections · B7 treasury · B8 markets · B9 insurance · B10 custody · B11 ESG · B12
+asset-management · B13 Islamic · B14 payments · B15 corporate/trade-SCF) plus 8 cross-cutting families
+(A1–A8) + relationship-outflow (A9). Remaining work is **depth, not breadth**: expand each stage's compact
+signals into full parametric templates (`needs/params/pit/eligibility` schema, like §A9), starting with the
+pilot use-case (retail_churn) for B2 of the build. Coverage then grows per-domain via curation + the
+flywheel, not one big freeze.
