@@ -23,7 +23,7 @@ def _attrs(**over):
 
 
 def test_vocabularies_match_ddl_check_constraints():
-    assert VERIFICATION_STAMPS == ("DESIGN-CHECKED", "DATA-CHECKED", "USEFULNESS-CHECKED")
+    assert VERIFICATION_STAMPS == ("UNVERIFIED", "DESIGN-CHECKED", "DATA-CHECKED", "USEFULNESS-CHECKED")
     assert APPROVAL_TYPES == ("EXPERIMENTAL", "PRODUCTION")
 
 

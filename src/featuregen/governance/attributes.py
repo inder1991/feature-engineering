@@ -6,7 +6,7 @@ from datetime import datetime
 
 from psycopg.types.json import Json
 
-VERIFICATION_STAMPS: tuple[str, ...] = ("DESIGN-CHECKED", "DATA-CHECKED", "USEFULNESS-CHECKED")
+VERIFICATION_STAMPS: tuple[str, ...] = ("UNVERIFIED", "DESIGN-CHECKED", "DATA-CHECKED", "USEFULNESS-CHECKED")
 APPROVAL_TYPES: tuple[str, ...] = ("EXPERIMENTAL", "PRODUCTION")
 
 
@@ -22,7 +22,7 @@ class GovernanceAttributes:
     feature_version_id: str
     feature_id: str
     produced_by_run: str
-    verification_stamp: str  # DESIGN-CHECKED | DATA-CHECKED | USEFULNESS-CHECKED
+    verification_stamp: str  # UNVERIFIED | DESIGN-CHECKED | DATA-CHECKED | USEFULNESS-CHECKED
     risk_tier: str  # free string; ordering/ceiling is policy
     approval_type: str  # EXPERIMENTAL | PRODUCTION
     base_feature_version_id: str | None = None

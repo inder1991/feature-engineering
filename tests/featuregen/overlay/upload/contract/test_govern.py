@@ -49,6 +49,37 @@ def test_confirm_registers_versioned_contract_and_wires_feature(db):
     assert c2.version == 2
 
 
+def test_confirm_stamps_both_feature_and_contract_design_checked(db):
+    # The governed path EARNS DESIGN-CHECKED: the confirm re-runs the MCV, so BOTH the feature row and
+    # the contract row it registers must be stamped DESIGN-CHECKED (not the UNVERIFIED default). Guards
+    # the first-confirm register_feature(..., verification="DESIGN-CHECKED") fix.
+    _bank(db)
+    c = confirm_contract(db, _draft(), actor="ds1")
+    feat_stamp = db.execute("SELECT verification FROM feature WHERE feature_id = %s",
+                            (c.feature_id,)).fetchone()[0]
+    contract_stamp = db.execute("SELECT verification FROM contract WHERE contract_id = %s",
+                                (c.contract_id,)).fetchone()[0]
+    assert feat_stamp == "DESIGN-CHECKED"
+    assert contract_stamp == "DESIGN-CHECKED"
+
+
+def test_restamp_update_flips_only_contract_less_features(db):
+    # Validates the 0973 re-stamp UPDATE directly: a legacy contract-less feature stamped DESIGN-CHECKED
+    # gets honestly demoted to UNVERIFIED, while a governed feature (a contract exists) keeps its earned
+    # DESIGN-CHECKED. (The migration runs on an empty test schema, so exercise its UPDATE here.)
+    from featuregen.overlay.upload.features import FeatureSpec, register_feature
+    _bank(db)
+    legacy = register_feature(db, FeatureSpec(name="legacy", verification="DESIGN-CHECKED"))  # no contract
+    governed = confirm_contract(db, _draft(), actor="ds1").feature_id                          # has a contract
+    db.execute("UPDATE feature SET verification = 'UNVERIFIED' "
+               "WHERE verification = 'DESIGN-CHECKED' "
+               "AND feature_id NOT IN (SELECT feature_id FROM contract)")
+    assert db.execute("SELECT verification FROM feature WHERE feature_id = %s",
+                      (legacy,)).fetchone()[0] == "UNVERIFIED"
+    assert db.execute("SELECT verification FROM feature WHERE feature_id = %s",
+                      (governed,)).fetchone()[0] == "DESIGN-CHECKED"
+
+
 def test_contract_freshness_follows_source_drift(db):
     _bank(db, watermark=NOW)                          # fresh
     c = confirm_contract(db, _draft(), actor="ds1")

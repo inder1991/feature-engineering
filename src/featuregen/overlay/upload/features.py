@@ -25,7 +25,9 @@ class FeatureSpec:
     as_of_column: str | None = None
     # the source columns the feature reads: (catalog_source, object_ref)
     derives_from: tuple[tuple[str, str], ...] = ()
-    verification: str = "DESIGN-CHECKED"   # §14.5 honest stamp, persisted on the row (0968)
+    # §14.5 honest stamp, persisted on the row (0968/0973): direct registration is UNVERIFIED;
+    # DESIGN-CHECKED is EARNED only via the governed contract flow (confirm_contract re-runs the MCV).
+    verification: str = "UNVERIFIED"
 
 
 @dataclass(frozen=True, slots=True)

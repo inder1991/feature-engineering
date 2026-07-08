@@ -110,7 +110,9 @@ def test_feature_360_shows_hypothesis_lineage_and_stamp(make_client):
     body = client.get(f"/features/{fid}", headers=AUTH).json()
     assert body["hypothesis"]["hypothesis"].startswith("customers churn")
     assert body["contract"]["definition"]              # the governed narrative
+    # governed via confirm_contract => BOTH the feature row and the contract row EARN DESIGN-CHECKED
     assert body["verification"] == "DESIGN-CHECKED"
+    assert body["contract"]["verification"] == "DESIGN-CHECKED"
     assert body["derives_from"]                         # lineage present
 
 

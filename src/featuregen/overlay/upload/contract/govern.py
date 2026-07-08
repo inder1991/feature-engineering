@@ -70,7 +70,8 @@ def confirm_contract(conn, draft: ContractDraft, *, actor, target_ref: str | Non
     else:
         feature_id = register_feature(conn, FeatureSpec(
             name=draft.feature_name, description=draft.definition, grain_table=draft.grain_table,
-            aggregation=draft.aggregation, as_of_column=draft.as_of_column, derives_from=pairs))
+            aggregation=draft.aggregation, as_of_column=draft.as_of_column, derives_from=pairs,
+            verification="DESIGN-CHECKED"))   # governed => EARNS DESIGN-CHECKED (default is UNVERIFIED)
         version = 1
     contract_id = mint_id("contract")
     conn.execute(
