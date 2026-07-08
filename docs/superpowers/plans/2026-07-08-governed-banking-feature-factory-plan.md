@@ -1,171 +1,131 @@
-# Governed, Banking-Intelligent Feature Factory — Phased Build Plan
+# Governed, Banking-Intelligent Feature Factory — Phased Build Plan (v2)
 
-> **For agentic workers:** each phase is an independently shippable, testable slice. When a phase
-> starts, expand it into bite-sized task-by-task steps (superpowers:writing-plans) — this doc is the
-> program roadmap, not the per-task detail.
+> **v2 restructure** (after a senior-EM critique of v1): vertical-slice-first (value in weeks, not
+> quarters) · two parallel workstreams · T-shirt sized · feature-flagged rollout · a golden-set quality
+> bar · early flywheel capture · an explicit value statement. v1 was horizontal layers with back-loaded
+> value and no sizing.
 
-**Goal:** turn the orphaned contract engine into the real product flow — a two-gate human-approval flow,
-four deterministic banking-safety checks, a banking-intelligent generation engine, and a bank-grade
-knowledge base.
+## 0. Value statement & first user (read first)
 
-**Architecture:** a governance *skeleton* (the contract flow) with a domain-intelligence *brain* that
-plugs into it at Gate 1 / generation / Gate 2, over a structured banking *knowledge base*.
+**What this delivers (no data plane — be honest):** not computed feature values, but **(1) trustworthy
+governance** — every model feature has a human-approved, versioned contract with its target, safety
+checks, and approver (examiner-ready provenance); and **(2) accelerated, de-risked feature *definition*
+** — banking knowledge proposes safe features and blocks leaky/ineligible ones *before* an engineer
+wastes a modelling cycle.
 
-**Design sources:** `governed-feature-contract-flow-design.md` · `banking-domain-intelligence-design.md`
-· `banking-taxonomy-reference.md` · `banking-taxonomy-sme-review.md`.
+**First user (pilot):** the model-development team building the **retail-churn** model. They author
+feature definitions, get a banking-aware assist, and walk away with a governed audit trail. Success =
+that team prefers this flow to hand-registering features, and their contracts pass an internal
+model-risk review. If we can't win that team, we stop and rethink — before building the long tail.
 
-## Global constraints (apply to every phase)
+## 1. Global constraints (every increment)
 
-- **No data plane** — no compute/serving/training-sets/predictiveness. Templates are *definitions*.
+- **No data plane** — no compute/serving/training/predictiveness. Templates are *definitions*.
 - **LLM proposes; deterministic code + humans dispose.** The four safety checks are deterministic.
-- **The four safety checks** gate every governed feature: leakage (3-part) · point-in-time incl.
-  bi-temporal · currency · eligibility (consent/purpose/residency/fair-lending/additivity).
-- **`DESIGN-CHECKED` is earned** (gauntlet ran); direct registration is `UNVERIFIED`.
-- **RBAC-gated** (permissions layer already merged); every new route gates on a permission.
-- **TDD, frequent commits, migrations are new files** (runner checksum-guards applied ones).
-- **Backend:** `uv run pytest -q`, `uv run ruff check src tests`. **Frontend:** `tsc -b`, `vitest`.
+- **Four safety checks** gate every governed feature: leakage (3-part) · point-in-time incl. bi-temporal
+  · currency · eligibility (consent/purpose/residency/fair-lending/additivity).
+- **`DESIGN-CHECKED` is earned**; direct registration is `UNVERIFIED`.
+- **Every user-facing / breaking change is behind a feature flag** with a documented backout.
+- **RBAC-gated · TDD · frequent commits · migrations are new files** (0973+).
+- **Backend:** `uv run pytest -q`, `ruff check src tests`. **Frontend:** `tsc -b`, `vitest`.
+- **Sizes:** S ≈ days · M ≈ 1–2 wks · L ≈ 3–5 wks · XL ≈ 6+ wks (always split).
 
-## Migration numbering
-Continue from `0972`. Reserve: `0973` (verification vocab), `0974` (target model), `0975` (domain-catalog
-store), `0976` (approval/gate1), `0977` (flywheel signals). Adjust as phases land.
+## 2. Kick off NOW (parallel to M0 — external/long-lead, not on eng's critical path)
 
----
-
-## Phase 1 — Contract model + honest lifecycle  *(closes finding #4)*
-
-**Goal:** the signed contract is immutable + complete; stamps are honest.
-**Files:**
-- `src/featuregen/overlay/upload/features.py` — `FeatureSpec.verification` default → `"UNVERIFIED"`.
-- `src/featuregen/overlay/upload/contract/govern.py` — `confirm_contract` **snapshots** the safety-critical
-  fields onto the contract (target, grain, as_of/PIT rule, lookback, calc-method, derives) + explicitly
-  stamps `DESIGN-CHECKED`; add the `feature_detail` assembled view over the snapshot + `contract_intent`.
-- `src/featuregen/api/routes/features.py` — `POST /features` keeps `UNVERIFIED` (no change beyond default).
-- **Migration `0973`** — `feature.verification` / `contract.verification` `CHECK IN ('UNVERIFIED',
-  'DESIGN-CHECKED')`; **re-stamp** all contract-less features `UNVERIFIED` (honest); the new snapshot
-  columns/JSON on `contract`.
-**Tasks (TDD):** verification-vocab CHECK + backfill test → snapshot-at-confirm test (re-confirm doesn't
-mutate v1) → `POST /features` → `UNVERIFIED` test → assembled `feature_detail` view test.
-**Tests:** `tests/.../contract/test_govern.py`, `test_features_registry.py`, `tests/.../db/test_migrations.py`.
-**Deliverable / done-when:** a governed feature has an immutable snapshotted contract stamped
-`DESIGN-CHECKED`; direct registration is `UNVERIFIED`; existing features re-stamped; suite green.
-
-## Phase 2 — Target model + the four deterministic safety checks
-
-**Goal:** the safety spine — the leakage/PIT/currency/eligibility checks — deterministic and testable.
-**Files:**
-- **Migration `0974`** — `contract_intent.target` becomes `{name, definition, label_column,
-  source_columns[]}` (JSON); `system_time` capture on the fact/graph rows (bi-temporal).
-- `src/featuregen/overlay/upload/contract/gate1.py` — store/read the structured target.
-- `src/featuregen/overlay/upload/feature_assist.py` — the **calibrated 3-part leakage** (`_validate_idea`:
-  HARD-reject `label_column` in derives; SOFT-flag `source_columns`; keep PIT as the real gate);
-  **currency** check (no cross-currency aggregate without base + fx); **eligibility** check
-  (consent/purpose/residency/fair-lending/additivity — reads the column metadata).
-- `src/featuregen/overlay/upload/join_path.py` / graph reads — bi-temporal `system_time ≤ as_of` filter.
-**Tasks (TDD):** target-model round-trip → 3-part leakage (label hard-reject; shared-col flag not reject;
-`days_since_last_txn` passes) → bi-temporal filter drops a restated value → cross-currency aggregate
-rejected → protected-attribute/consent ineligible feature rejected.
-**Tests:** `test_feature_loop.py`, new `test_safety_checks.py`, `test_gate1.py`.
-**Deliverable / done-when:** all four checks deterministic + tested; a shared-source-column feature is
-flagged (not killed); a restated/cross-currency/ineligible feature is caught.
-
-## Phase 3 — Solid vocabulary + parametric template engine
-
-**Goal:** the structured concept ontology and safe-by-construction templates.
-**Files:**
-- `src/featuregen/overlay/upload/concepts.py` — replace the flat 11 with the ~70 structured concepts
-  (behaviour: additivity/PIT-role/sensitivity/entity-link; is-a edges). Classifier maps to nearest +
-  `unclassified`.
-- **New** `src/featuregen/overlay/upload/templates.py` — the parametric template model + a small
-  deterministic **template engine** (ground `{params}` to real columns; PIT baked in) + a first real set
-  for the seeded domains (churn/credit).
-- `src/featuregen/overlay/upload/enrich.py` — enrichment writes the richer concept + behaviour.
-**Tasks (TDD):** concept behaviour drives a check (a `monetary_stock` can't be summed over time) →
-is-a generalisation test → a template grounds to columns + produces a leakage-safe feature by
-construction → an ungroundable template is skipped.
-**Tests:** `test_concepts.py`, new `test_templates.py`.
-**Deliverable / done-when:** concepts carry behaviour + relate; templates are groundable, parametric, and
-safe-by-construction; suite green.
-
-## Phase 4 — Domain case catalog + governed knowledge store
-
-**Goal:** the living, ratifiable banking knowledge base (not a shipped constant).
-**Files:**
-- **Migration `0975`** — `domain_use_case`, `domain_template`, `domain_concept`, `domain_entity`,
-  `domain_ratification` (versioned, audited); `compliance_confirmed` per use-case.
-- **New** `src/featuregen/overlay/domain/catalog.py` — load `banking-domain-catalog.seed.json` into the
-  store on setup; read/query; **onboard** a new use-case; **ratify** (owner + Compliance flip
-  `compliance_confirmed`); regulatory rules NOT authoritative until ratified.
-- Admin/curation routes (RBAC-gated) to edit the catalog.
-**Tasks (TDD):** seed loads → query by use-case → onboard new banking use-case → ratification gate (rules
-inert until confirmed) → version/audit on change.
-**Tests:** new `tests/.../domain/test_catalog.py`.
-**Deliverable / done-when:** a DB-backed, versioned, ratifiable catalog seeded from the JSON; unratified
-regulatory rules do not enforce; suite green.
-
-## Phase 5 — Gate 1 checkpoint + approval modes + reasoning wired in
-
-**Goal:** the two-gate governed flow that reasons in banking (backend).
-**Files:**
-- `src/featuregen/api/routes/contract.py` — Gate 1 **approve-brief** checkpoint; record approval + actor.
-- `src/featuregen/identity/permissions.py` — add `feature:approve`; **four-eyes** flag
-  (`FEATUREGEN_CONTRACT_FOUR_EYES`): Gate-2 approver must hold `feature:approve` **and** differ from Gate-1
-  actor (server-enforced).
-- `src/featuregen/overlay/upload/contract/gate1.py` + `feature_assist.py` — wire **use-case recognition**,
-  **known-target proposal** (from the catalog), **template-seeded generation**, **regulatory filter**
-  (block/flag data classes for the use-case).
-**Tasks (TDD):** brief-approval recorded → four-eyes rejects same-subject Gate-2 (flag on) / allows (off)
-→ use-case recognised → known target proposed + confirmed → generation seeded from templates → a
-protected-attribute feature blocked for a credit use-case.
-**Tests:** `test_contract.py`, `test_admin.py`/authz, `test_feature_loop.py`.
-**Deliverable / done-when:** end-to-end backend flow — approve brief → banking-reasoned considered set →
-approve → contract; four-eyes enforced when configured; suite green.
-
-## Phase 6 — UI  *(closes findings #3 + #5-frontend)*
-
-**Goal:** the usable governed flow on real auth; retire the fake fast-stamp path in the Workbench.
-**Files (frontend):**
-- `frontend/src/api.ts` — wire `/contract/considered-set`, `/draft`, `/confirm`, `/contracts` on the
-  **real Bearer session**.
-- **New screens** — Brief (hypothesis + assisted-target picker + scope), Considered-set (safe candidates
-  + **rejects with reasons** + "safe, not proven" caveat + multi-select/**batch**), Confirm (snapshot
-  sheet review → Gate 2).
-- `frontend/src/screens/WorkbenchScreen.tsx` — demote direct `POST /features` to the labelled
-  `UNVERIFIED` fast path; add the "promote to governed" entry.
-**Tasks (TDD, vitest):** brief screen → target confirm; considered-set renders safe + rejects + caveat;
-batch approve mints N contracts; confirm-failure returns to the set with the reason; Bearer-auth path.
-**Tests:** new screen `.test.tsx` files; `tsc -b`.
-**Deliverable / done-when:** a human can drive the whole two-gate flow in the UI on real login; direct
-register is honestly `UNVERIFIED`; frontend green.
-
-## Phase 7 — Learning + curation flywheel  *(gets smarter with use)*
-
-**Goal:** the system improves from every human decision and grows the knowledge base.
-**Files:**
-- **Migration `0977`** — persist Gate-2 approve/reject signals per use-case + team.
-- `src/featuregen/overlay/upload/feature_assist.py` — steer generation toward approved patterns; demote
-  repeatedly-rejected ones.
-- Curation admin surface (routes + UI) to edit vocabulary/cases/templates (versioned, audited).
-**Tasks (TDD):** decision captured → generation steered by prior approvals → curator edit versioned +
-audited → learned target refinement proposed (human ratifies).
-**Tests:** new `test_flywheel.py`; curation route tests.
-**Deliverable / done-when:** repeated use measurably steers generation; the knowledge base is
-curator-editable + audited; suite green.
+- **LLM enablement** — wire + validate the real `ClaudeLLM` seam (today's default is the fake). *Gate
+  for all intelligence.* Owner: platform. **[S–M]**
+- **Compliance/domain-owner ratification** for the pilot use-case's regulatory defaults (the catalog is
+  inert until ratified — §Workstream B3). *Org dependency, long lead.* Owner: product + a bank sponsor.
+- **Golden set v0** — ~20 expert-curated churn hypotheses with expected/【approved】 features + known
+  leaky traps. This is the **quality bar** for the intelligence (there's no data, so human eval is it).
+  Owner: a domain SME. **[S]**
 
 ---
 
-## Sequencing & risks
+## 3. M0 — Walking skeleton (the vertical slice) · **[M]** · *the first shippable increment*
 
-- **Order is dependency-driven:** 1→2 (safety spine needs the contract) → 3→4 (brain content) → 5 (wire
-  reasoning) → 6 (UI) → 7 (learning). Each ships working software; ship + review between phases.
-- **Biggest-value early:** Phases 1–2 alone close findings #4 + the leakage-safety gaps and make stamps
-  honest — worth landing first even if the rest waits.
-- **Biggest effort:** Phase 3–4 (real templates + the governed catalog) — the domain-intelligence content;
-  ship a thin first set, grow via curation (Phase 7).
-- **Riskiest:** Phase 2 bi-temporal (`system_time`) — requires capturing knowledge-time on ingest; if the
-  upload doesn't carry it, default `system_time = ingest_time` and document the limitation.
-- **Reversibility:** each migration is a new file; the `UNVERIFIED` re-stamp (Phase 1) is the one
-  data-touching step — log the count, it's reversible by re-confirming.
+**Goal:** a data scientist drives the **whole two-gate flow end-to-end for `retail_churn`, in a minimal
+UI, on real login** — thin on depth, complete on shape. Behind a flag, shipped to the pilot team for
+feedback. This de-risks the architecture and delivers value in weeks.
 
-## Execution
-Each phase → expand to bite-sized TDD tasks (writing-plans) at its start, own branch, merge-and-review
-between phases. Start with **Phase 1** (small, high-value, closes #4).
+**Deliberately thin (deepened later):** uses the *existing* gauntlet (full 4 checks come in A2); the
+churn target is proposed by a *hardcoded* rule, not the catalog (real recognition in B4); no template
+seeding yet; 3 bare-bones screens.
+
+**Slices touched:** honest stamp (thin) · the existing `/contract/*` endpoints · 3 minimal screens ·
+Bearer auth · **flywheel capture from day one** (record every approve/reject — cheap, compounds).
+
+**Done-when:** the pilot DS completes brief → considered set → approve → **governed contract with an
+honest stamp** for churn, in the UI, logged-in, with the decision captured. Suite + frontend green.
+
+**After M0, the two workstreams run in parallel and deepen behind this working slice.**
+
+---
+
+## 4. Workstream A — Governed Flow (harden the skeleton)
+
+| # | Increment | Size | Key files | Done-when |
+|---|---|---|---|---|
+| **A1** | Contract model + honest lifecycle | **M** | `features.py` (default→UNVERIFIED), `govern.py` (snapshot@confirm + explicit DESIGN-CHECKED + assembled view), mig `0973` (CHECK + re-stamp existing, **flagged + backup**) | immutable snapshotted contracts; existing features re-stamped `UNVERIFIED`; #4 closed |
+| **A2** | The 4 deterministic safety checks | **L** | mig `0974` (target `{label,source_cols}`, `system_time`); `feature_assist.py` (3-part leakage + currency + eligibility); graph reads (bi-temporal `system_time≤as_of`) | each check deterministic + tested; `days_since_last_txn` passes, restated/cross-currency/ineligible caught |
+| **A3** | Gate-1 checkpoint + four-eyes | **M** | `contract.py` (approve-brief), `permissions.py` (`feature:approve` + `FEATUREGEN_CONTRACT_FOUR_EYES`) | brief approval recorded; four-eyes rejects same-subject Gate-2 when on |
+| **A4** | UI hardening | **M** | new screens hardened: batch approve, **show rejects + "safe not proven" caveat**, confirm-failure→back, promote-to-governed | multi-approve mints N; rejects visible; unhappy paths land gracefully |
+| **A5** | Rollout + observability | **S–M** | flags default-on, deprecate old `POST /features` register path (window), metrics (adoption, gate pass/fail, rejection reasons) | flow is the default path; dashboards live; old path deprecated |
+
+## 5. Workstream B — Domain Intelligence (brain + content)  *(parallel to A; integrates at B4)*
+
+| # | Increment | Size | Key files | Done-when |
+|---|---|---|---|---|
+| **B1** | Solid vocabulary | **L** | `concepts.py` (11→~70 structured concepts + behaviour + is-a); `enrich.py` | concepts carry additivity/PIT/sensitivity/entity-link; behaviour drives a check |
+| **B2** | Parametric template engine + first set | **L** | new `templates.py` (model + deterministic engine, PIT baked in) + churn/credit templates | a template grounds to columns → a leakage-safe feature by construction; ungroundable skipped |
+| **B3a** | Governed knowledge store | **L** | mig `0975` (catalog tables, versioned/audited); new `domain/catalog.py` (load seed, query, onboard) | DB-backed catalog seeded from the JSON; onboard a new use-case |
+| **B3b** | Ratification + curation | **M** | ratify flow (owner + Compliance flip `compliance_confirmed`); RBAC curation routes | regulatory rules **inert until ratified**; edits versioned/audited |
+| **B4** | Reasoning wired into the flow *(← integration with A)* | **M** | `gate1.py`/`feature_assist.py` — use-case recognition, known-target proposal, template-seeded generation, regulatory filter | slice now recognises the use-case, proposes the known target, seeds from templates, blocks protected data — scored on the **golden set** |
+| **B5** | Flywheel steering *(capture already live since M0)* | **M** | `feature_assist.py` steering; mig `0977` if needed | prior approvals measurably steer generation; curator can promote learned refinements |
+
+---
+
+## 6. Convergence & critical path
+
+```
+Kick-off (LLM · ratification · golden set)  ──┐
+                                              ▼
+M0 walking skeleton  ──►  A1 A2 A3 A4 A5  (Governed Flow) ──┐
+                    └──►  B1 B2 B3a B3b     (Domain Intel)  ──►  B4 wire-in ──►  A5 default-on
+```
+- **Critical path to real value:** M0 → **A2** (safety) + **B4** (reasoning, needs B1+B2+LLM) → A5
+  default-on. Everything else parallelises around it.
+- **Two teams:** Stream-A eng (governance/flow/UI) and Stream-B eng (vocabulary/templates/catalog).
+  Converge at B4. Halves calendar time vs. v1's serial chain.
+- **XL split done:** v1's Phase 3/4 are now B1/B2/B3a/B3b (each L/M).
+
+## 7. Cross-cutting (apply throughout — the v1 gaps)
+
+- **Feature flags + backout:** every breaking/user-facing change flagged (M0, A1 re-stamp, A5 default-on,
+  old-path deprecation). The re-stamp is the only data-touching step → backup + reversible-by-reconfirm.
+- **Quality bar = the golden set:** B4 (and every generation change) is scored against the expert golden
+  set each release — the only quality signal available without data. Ship gate: no regression on it.
+- **Early flywheel capture:** the approve/reject signal is captured from **M0** (cheap), so steering (B5)
+  has months of data when it lands. Don't wait.
+- **Observability (A5):** adoption, gate pass/fail rates, rejection reasons, contract mint rate, LLM
+  latency/cost. A dashboard is a phase deliverable, not an afterthought.
+- **UAT / acceptance:** each user-facing increment (M0, A4) has explicit pilot-user acceptance criteria —
+  "suite green" is a code bar, not product sign-off.
+- **Performance budget:** LLM latency + the gauntlet over large catalogs; set a budget in A2/B4.
+- **Docs/runbooks:** the ratification workflow (B3b) and knowledge-base curation need operator docs.
+
+## 8. Sequencing, risk, and the honest checkpoint
+
+- **Land M0 + A1 first** — a working governed slice with honest stamps (closes #4, real value, pilot
+  feedback) in ~3–4 weeks.
+- **Riskiest:** A2 bi-temporal `system_time` (if uploads don't carry knowledge-time, default to
+  ingest-time + document); B2 real templates + B4 quality (mitigated by the golden set).
+- **Org risk:** B3b ratification depends on a bank Compliance sponsor — start at kick-off; if it stalls,
+  the flow still works unratified (regulatory rules simply don't enforce).
+- **Go/no-go after M0:** if the pilot team won't adopt the slice, **stop and rethink the value** before
+  funding Streams A+B. This is the plan's built-in kill-switch (the value statement, §0, is the test).
+
+## 9. Execution
+Each increment → expand to bite-sized TDD tasks (writing-plans) at its start, own branch,
+merge-and-review. **Start with M0** (the walking skeleton) — smallest thing that proves the shape and
+puts value in a user's hands.
