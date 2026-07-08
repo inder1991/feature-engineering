@@ -6,7 +6,12 @@ from datetime import datetime
 
 from psycopg.types.json import Json
 
-VERIFICATION_STAMPS: tuple[str, ...] = ("UNVERIFIED", "DESIGN-CHECKED", "DATA-CHECKED", "USEFULNESS-CHECKED")
+# SP-0 feature_versions vocabulary — a MINTED version is at least gauntlet-passed, so the ladder starts
+# at DESIGN-CHECKED (the feature_versions DDL CHECK in 0060 matches this). This is DISTINCT from the
+# overlay feature/contract vocabulary, which additionally has UNVERIFIED for direct registration and is
+# enforced by the migration-0973 CHECK on those tables — do NOT add UNVERIFIED here (it would allow an
+# unverified *mint*, contradicting the semantics and mismatching the 0060 CHECK).
+VERIFICATION_STAMPS: tuple[str, ...] = ("DESIGN-CHECKED", "DATA-CHECKED", "USEFULNESS-CHECKED")
 APPROVAL_TYPES: tuple[str, ...] = ("EXPERIMENTAL", "PRODUCTION")
 
 
@@ -22,7 +27,7 @@ class GovernanceAttributes:
     feature_version_id: str
     feature_id: str
     produced_by_run: str
-    verification_stamp: str  # UNVERIFIED | DESIGN-CHECKED | DATA-CHECKED | USEFULNESS-CHECKED
+    verification_stamp: str  # DESIGN-CHECKED | DATA-CHECKED | USEFULNESS-CHECKED (a mint is never UNVERIFIED)
     risk_tier: str  # free string; ordering/ceiling is policy
     approval_type: str  # EXPERIMENTAL | PRODUCTION
     base_feature_version_id: str | None = None

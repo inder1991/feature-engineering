@@ -559,11 +559,13 @@ export function WorkbenchScreen() {
   const selectedCandidates = allCandidates.filter(
     c => c.key in selected && !registered[c.key] && !governed[c.key])
   const selectedCount = selectedCandidates.length
-  // Only fresh generated candidates are governable: they came through the CURRENT intent's
-  // considered set. A draft is the human's own definition, and a KEPT candidate was pinned from a
-  // PRIOR generation (not in the new intent's snapshot), so neither governs into a contract.
+  // Only fresh, unrefined generated candidates are governable: they came through the CURRENT intent's
+  // considered set AND still match its persisted snapshot. A draft is the human's own definition; a
+  // KEPT candidate was pinned from a PRIOR generation; and a REFINED candidate's idea was mutated in
+  // place (approveRevision) so it no longer matches the snapshot the server reconstructs the choice
+  // from — governing it would 422 or silently mint a contract from the pre-refine data. None govern.
   const governableCount = selectedCandidates.filter(
-    c => c.kind === 'generated' && !c.kept).length
+    c => c.kind === 'generated' && !c.kept && (refines[c.key]?.appliedRound ?? null) === null).length
   // Distinct set origins of the current picks, for the tray's mix note.
   const originLenses = [...new Set(
     selectedCandidates
@@ -579,8 +581,10 @@ export function WorkbenchScreen() {
   const feedbackLocked = confirmingBatch || batchBusy || confirmingGovern || governBusy
   const setFbExhausted = setFbRounds >= FEEDBACK_ROUNDS
 
-  // Gates advance with real state, never decoratively.
-  const goalDone = goal.trim() !== ''
+  // Gates advance with real state, never decoratively. The brief needs BOTH the hypothesis and the
+  // goal (generate() requires both), so the gate must not flip to 'done' — and cascade gate2 to
+  // 'active' — while a required field is still empty.
+  const goalDone = goal.trim() !== '' && hypothesis.trim() !== ''
   const haveCandidates = allCandidates.length > 0
   const anyRegistered = allCandidates.some(c => registered[c.key] !== undefined)
   const gate1: GateState = goalDone ? 'done' : 'active'
@@ -1103,7 +1107,8 @@ export function WorkbenchScreen() {
     if (!iid) return
     const batch = allCandidates.filter(
       (c): c is GeneratedCandidate =>
-        c.key in selected && !governed[c.key] && c.kind === 'generated' && !c.kept)
+        c.key in selected && !governed[c.key] && c.kind === 'generated' && !c.kept
+        && (refines[c.key]?.appliedRound ?? null) === null)   // refined => diverges from the snapshot
     if (batch.length === 0) return
     governInFlight.current = true
     setGovernBusy(true)
@@ -1274,7 +1279,7 @@ export function WorkbenchScreen() {
             <button
               type="submit"
               className="path path-generate"
-              disabled={!goal.trim() || generating || feedbackLocked}
+              disabled={!hypothesis.trim() || !goal.trim() || generating || feedbackLocked}
             >
               <span className="k">Path 1 · The engine</span>
               <span className="t">

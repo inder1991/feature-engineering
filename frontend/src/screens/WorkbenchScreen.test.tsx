@@ -234,9 +234,12 @@ describe('gates strip', () => {
     expect(gateState('Compare, mix, give feedback')).toBe('todo')
     expect(gateState('You approve')).toBe('todo')
     await userEvent.type(screen.getByLabelText('Prediction goal'), 'predict churn')
+    // Goal alone is not the whole brief: the gate stays active until the hypothesis is given too
+    // (else it would falsely promise the next step while Generate silently no-ops — bug_004).
+    expect(gateState('State the goal')).toBe('active')
+    await userEvent.type(screen.getByLabelText('Hypothesis'), HYPOTHESIS)
     expect(gateState('State the goal')).toBe('done')
     expect(gateState('Propose in sets')).toBe('active')
-    await userEvent.type(screen.getByLabelText('Hypothesis'), HYPOTHESIS)
     await userEvent.click(screen.getByRole('button', { name: /generate candidate sets/i }))
     expect(await screen.findByText('avg_balance')).toBeInTheDocument()
     expect(gateState('Propose in sets')).toBe('done')
@@ -339,11 +342,15 @@ describe('generation', () => {
     expect(recommendFeatures).not.toHaveBeenCalled()
   })
 
-  it('the example chip fills the goal input and enables the primary action', async () => {
+  it('the example chip fills the goal, but Generate stays disabled until a hypothesis is given', async () => {
     render(<WorkbenchScreen />)
     expect(screen.getByRole('button', { name: /generate candidate sets/i })).toBeDisabled()
     await userEvent.click(screen.getByRole('button', { name: 'predict churn' }))
     expect(screen.getByLabelText('Prediction goal')).toHaveValue('predict churn')
+    // Goal alone must NOT enable Generate: generate() also requires a hypothesis, so an enabled
+    // button here would be a silent no-op on click (bug_004). It enables only once both are present.
+    expect(screen.getByRole('button', { name: /generate candidate sets/i })).toBeDisabled()
+    await userEvent.type(screen.getByLabelText('Hypothesis'), 'balance drains then they leave')
     expect(screen.getByRole('button', { name: /generate candidate sets/i })).toBeEnabled()
     expect(contractConsideredSet).not.toHaveBeenCalled()
   })
@@ -1636,6 +1643,27 @@ describe('per-candidate feedback', () => {
     expect(screen.getByRole('button', {
       name: 'Send feedback for one revision · round 2 of 3',
     })).toBeInTheDocument()
+  })
+
+  it('a refined candidate is not governable (its idea diverged from the persisted snapshot)', async () => {
+    refineCandidate.mockResolvedValue({ revised: REVISED })
+    await renderAndGenerate([IDEA])
+    await selectCandidate('avg_balance')
+    // Fresh, the candidate is governable.
+    expect(screen.getByRole('button', { name: 'Govern 1' })).toBeInTheDocument()
+    // Approve a revision: approveRevision mutates the idea IN PLACE, so it no longer matches the
+    // considered-set snapshot the server reconstructs the choice from. Governing it would 422 (name
+    // changed) or silently mint pre-refine data (name kept) — bug_001. It must drop out of Govern.
+    await openRefineAndSend('use a 30 day window')
+    await userEvent.click(await screen.findByRole('button', { name: 'Approve revision' }))
+    expect(screen.getByText('Revised · R1')).toBeInTheDocument()
+    expect(screen.getByText('1 selected')).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /^Govern/ })).not.toBeInTheDocument()
+    // Register stays available (it uses the revised spec directly, no snapshot reconstruction).
+    expect(
+      screen.getByRole('button', { name: 'Approve and register 1 feature' }),
+    ).toBeInTheDocument()
+    expect(contractDraft).not.toHaveBeenCalled()
   })
 })
 
