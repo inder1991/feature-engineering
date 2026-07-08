@@ -330,23 +330,14 @@ export function featureDetail(featureId: string): Promise<FeatureDetail> {
 // ---- Governed feature-contract flow (the two-gate flow: brief -> considered set -> confirm) --------
 // The backend flow is stateless over HTTP: the client carries intent_id + the transient draft between
 // steps, and the server re-validates (MCV) at draft and confirm, so a tampered payload can never govern.
-export interface Idea {
-  name: string
-  description: string
-  derives_from: string[]
-  aggregation: string | null
-  grain_table: string | null
-  derives_pairs: [string, string][]
-  verification: string
-  critic_note: string
-  rationale: string
-}
-
+// Reuses FeatureIdea / FeatureSet / SetRecommendation / Rejection (defined above) — considered-set is a
+// superset of recommend-sets, so its alternatives + rejections are the same shapes the Workbench renders.
 export interface ConsideredSetResp {
   intent_id: string
-  anchor: Idea | null
-  alternatives: { lens: string; features: Idea[] }[]
-  recommendation: { recommended_lens: string; reasoning: string; caveat: string } | null
+  anchor: FeatureIdea | null
+  alternatives: FeatureSet[]
+  recommendation: SetRecommendation | null
+  rejections: Rejection[]
 }
 
 export interface ContractDraft {

@@ -4,7 +4,7 @@ import {
   type ConsideredSetResp,
   type Contract,
   type DraftResp,
-  type Idea,
+  type FeatureIdea,
   contractConfirm,
   contractConsideredSet,
   contractDraft,
@@ -209,7 +209,7 @@ export function ContractScreen(): ReactElement {
 }
 
 function OptionRow({ idea, source, choice, onSelect }: {
-  idea: Idea
+  idea: FeatureIdea
   source: 'anchor' | 'alternative'
   choice: Choice | null
   onSelect: (c: Choice) => void

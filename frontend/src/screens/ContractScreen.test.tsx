@@ -17,7 +17,7 @@ const contractConsideredSet = vi.mocked(api.contractConsideredSet)
 const contractDraft = vi.mocked(api.contractDraft)
 const contractConfirm = vi.mocked(api.contractConfirm)
 
-const idea = (name: string): api.Idea => ({
+const idea = (name: string): api.FeatureIdea => ({
   name,
   description: `desc of ${name}`,
   derives_from: ['balance_gbp'],
@@ -59,6 +59,7 @@ describe('ContractScreen — the governed two-gate flow', () => {
       alternatives: [{ lens: 'behavioral', features: [idea('dormancy_days')] }],
       recommendation: { recommended_lens: 'behavioral', reasoning: 'fits the drain',
         caveat: 'advisory only, not a performance prediction' },
+      rejections: [],
     })
     contractDraft.mockResolvedValue(draftResp())
     contractConfirm.mockResolvedValue({
