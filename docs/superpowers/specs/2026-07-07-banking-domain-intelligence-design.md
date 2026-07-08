@@ -163,31 +163,37 @@ table that's stuck on any un-templated request. That would make it **less** inte
 knows the patterns *and* adapts them — not a junior improvising from nothing. Templates are the priors;
 the LLM is the adaptation. Both, always. **Templates must never be the only path.**
 
-### 5.2 Template selection pipeline — deterministic gates → LLM ranks → human finalises
+### 5.2 Selection pipeline — TWO candidate sources → one safety gate → LLM ranks → human finalises
 
-How ~70 templates become the human's 2–3-item shortlist. **Safety is deterministic; relevance is the
-LLM's job; the choice is the human's.**
+Candidates come from **two first-class sources**; **both** pass the *same* deterministic safety gate
+before a human sees them. **Safety is deterministic; coverage + relevance are the LLM's; the choice is
+the human's.**
 
-1. **Use-case shortlist (deterministic).** Start from the use-case's `feature_templates` + the
-   cross-cutting families (a *prior*, not a limit).
-2. **Groundability (deterministic — the hard filter).** Keep only templates whose `needs` **concepts**
-   match concept-tagged columns in *this* catalog, then **bind** `{params}` to real columns. A template
-   that can't bind is dropped. This is **concept set-matching — no LLM.** *(Solid vocabulary is the
-   matching key — §3.)*
-3. **Safety + eligibility (deterministic).** Run the four checks + the use-case's `blocked_data_classes`
-   on each *bound* candidate; drop the unsafe/ineligible. → yields the **SAFE, GROUNDABLE set.**
-4. **LLM shortlist (proposes — the judgment step).** The LLM reads the *specific hypothesis* and picks the
-   **2–3 most relevant** from the safe set, **each with a rationale**; it may also **add novel candidates
-   beyond templates** (which re-enter at step 3's safety gate). **Flywheel-informed** (what this team
-   approves).
+- **Source 1 — Templates (priors):** the use-case's `feature_templates` + cross-cutting families,
+  grounded to *this* catalog by concept-matching (§3).
+- **Source 2 — LLM novel proposals (creativity/adaptation, first-class — NOT a footnote):** the LLM
+  proposes features **beyond any template**, from the hypothesis + the catalog's actual columns + its
+  banking knowledge. This is how the **long tail** works (un-templated use-cases, clever
+  situation-specific combinations, features tailored to *this bank's* columns) and what keeps the system
+  from being a rigid cookbook. Templates cover the *known well*; the LLM covers *everything else + adapts*.
+
+The pipeline:
+1. **Generate from BOTH sources** — grounded templates ∪ LLM novel proposals.
+2. **Groundability (deterministic).** Every candidate must bind to real, concept-matched columns; drop
+   the ungroundable. (Templates bind `{params}`; a novel proposal must reference columns that exist.)
+3. **Safety + eligibility (deterministic).** The four checks + `blocked_data_classes` on **every**
+   candidate → the **SAFE set** (templates AND novel, uniformly filtered — a novel feature is *never*
+   trusted to be safe just because the LLM proposed it).
+4. **LLM shortlist (proposes).** From the safe set, pick the **2–3 most relevant** to *this* hypothesis,
+   **each with a rationale**; flywheel-informed.
 5. **Human finalises (disposes).** Picks from the shortlist; can **expand to the full safe set**
    (scaffold-not-cage — never hide valid options).
 
-**The boundary (non-negotiable): the LLM RANKS, it never GATES.** It shortlists *from an already-safe
-set*, so its judgment affects **relevance**, never **safety** — it can pick a less-useful template, never
-a leaky one. **Fail-safe:** if the LLM call fails, fall back to the deterministic ranking
-(use-case-recommended first) — the flow never blocks on the LLM. The rationale is **recorded in the
-contract's provenance** (auditable).
+**The boundary (non-negotiable): the LLM PROPOSES + RANKS, but never GATES.** Its novel proposals *and*
+its shortlist pass the *same* deterministic groundability + safety gate as templates — so the LLM affects
+**coverage and relevance**, never **safety**. A novel LLM feature that leaks or binds a protected
+attribute is dropped exactly like a template would be. Rationale recorded in the contract provenance;
+**fail-safe** to the deterministic ranking if the LLM call fails (the flow never blocks on the LLM).
 
 ---
 
