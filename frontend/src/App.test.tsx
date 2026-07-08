@@ -38,13 +38,12 @@ function arriveAt(hash: string) {
 }
 
 describe('app shell', () => {
-  it('renders seven nav items in order and lands on Overview by default', () => {
+  it('renders six nav items in order and lands on Overview by default', () => {
     render(<App />)
     const nav = within(screen.getByRole('navigation'))
     expect(nav.getAllByRole('button').map(b => b.textContent)).toEqual([
       'Overview',
       'Generate features',
-      'Govern a feature',
       'Registry',
       'Search',
       'Upload',
@@ -66,15 +65,6 @@ describe('app shell', () => {
       screen.getByRole('heading', { level: 1, name: /feature generation/i }),
     ).toBeInTheDocument()
     expect(screen.getByText('CATALOG · GENERATE')).toBeInTheDocument()
-  })
-
-  it('nav click routes to the govern-a-feature screen', async () => {
-    render(<App />)
-    const nav = within(screen.getByRole('navigation'))
-    await userEvent.click(nav.getByRole('button', { name: 'Govern a feature' }))
-    expect(window.location.hash).toBe('#/contract')
-    expect(screen.getByRole('heading', { level: 1, name: 'Govern a feature' })).toBeInTheDocument()
-    expect(screen.getByText('CATALOG · GOVERN')).toBeInTheDocument()
   })
 
   it('deep-links a screen from the hash', () => {
