@@ -138,6 +138,26 @@ use           primary use-cases
 - **`novelty_flag`** — first-seen {attribute} for this entity (new merchant/country/device). use: fraud,
   AML. eligibility: geolocation is a proxy — flag, don't use as a credit input.
 
+## A9. Primacy / relationship-outflow (money moving to a competitor) — needs a DERIVED intermediate
+
+Signals that a customer is quietly relocating their primary relationship — a top-tier pre-attrition
+indicator. **Distinctive because the key flag is not in the data — it must be derived** (see Part D.8).
+
+- **`external_own_transfer_trend`** — rising transfers of the customer's OWN money to their accounts at
+  OTHER banks. **derive:** `is_own_external_transfer := name_match(customer.name, beneficiary_name) ≥
+  {threshold} AND beneficiary_bank ≠ home_bank` *(computed **downstream** — no data plane here)*.
+  **computes:** growth of {amount|count} of `is_own_external_transfer`, recent window vs baseline.
+  needs: `transactions.beneficiary_name` + `beneficiary_bank` + amount + timestamp; `customer.name`;
+  {customer}. params: window · baseline · measure · `match_method ∈ {exact,token,fuzzy}` ·
+  `match_threshold`. pit: trailing. add: n/a. **eligibility:** uses `customer_name` + `beneficiary_name`
+  → PII entity-resolution — consent/purpose/residency REQUIRED. **match-risk:** probabilistic — false-pos
+  (same name), false-neg (initials/order/joint accounts) → DECLARE method+threshold; `explain: M`.
+  use: retail_churn, deposit_attrition, primacy_loss, wealth_outflow.
+- **`external_outflow_growth`** *(fallback when no name to match)* — growth of ALL external outflows.
+  Weaker + **FLAGGED** (includes third-party payments — noisier). use: same, as a proxy.
+- **`salary_diversion_flag`** — inbound salary credit stops/shrinks while an external own-transfer rises.
+  use: primacy_loss (the strongest variant — losing the salary is losing the relationship).
+
 ---
 
 # PART B — Domain-specific templates
@@ -239,6 +259,14 @@ use           primary use-cases
    un-templated requests. Grow the library from curated + flywheel-approved patterns.
 7. **Not proven** — these are expert-curated/conventional patterns; quality is gated by the golden set,
    never claimed as data-validated.
+8. **Derived intermediates + no-data-plane matching.** Some features need a flag the raw catalog does
+   NOT contain and that must be **derived** — e.g. an *own-account* flag from `name_match(customer.name,
+   beneficiary_name)` (§A9). Rules: (a) the template **specifies** the derivation (method + threshold) but
+   the platform **cannot run it** (no data plane) — the match executes **downstream**; here it is a
+   *declared* step. (b) Such derivations are **probabilistic** (entity resolution: false-pos same-name,
+   false-neg initials/order/joint-accounts) → `explain: M`, declare method+threshold, and the feature's
+   quality depends on the downstream matcher. (c) Name/beneficiary matching is **PII entity-resolution** →
+   consent/purpose/residency eligibility REQUIRED, not optional.
 
 # PART E — Open / to-deepen
 Markets desk templates (greeks, XVA, PnL-attribution), insurance (lapse/claims), securities-services
