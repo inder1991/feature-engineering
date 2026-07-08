@@ -90,11 +90,14 @@ that the sign-off (`confirm`) requires. `recommend-sets` becomes redundant.
 - ✅ **I4 — cleanup** (`de9e33c`): retired `ContractScreen` + the nav item.
 - ✅ **I3 — honest lifecycle** (`78391d5`): direct registration stamps `UNVERIFIED`; `DESIGN-CHECKED` is
   earned only via the governed flow. Migration 0973 (re-stamp + CHECK). Closes finding #4.
-- ⬜ **I2b — feedback via `considered-set`** (remaining): route whole-round feedback through
-  `considered-set` (small backend add for a `feedback` param) so post-feedback candidates are governable
-  too — lifts the stale-intent guard I2 added.
+- ✅ **I2b — feedback via `considered-set`** (backend `8148061`, frontend `93e344b`): whole-round
+  feedback re-runs considered-set (new `feedback` param) and REFRESHES the intent each round, so
+  post-feedback candidates are governable (kept/pinned candidates excluded — they're from a prior
+  snapshot). The I2 stale-intent guard is removed; `recommendFeatureSets` is now unused in the Workbench.
 
-**Two open items:** I2b (above) + a **live end-to-end run** (all verification so far is unit/component
-level with mocked/test data). **Repo note:** `mypy src` has a **pre-existing 131-error baseline** (in
-`attributes.py`/`expiry.py`/… — unrelated to this work; confirmed via stash-compare). Worth a separate
-cleanup; the mypy "gate" is not actually clean today.
+**The integration is complete.** One open item: a **live end-to-end run** (all verification so far is
+unit/component level with mocked/test data) — stand up the backend + a seeded churn catalog + LLM and
+drive Generate→Govern. **Repo note:** `mypy src` has a **pre-existing 131-error baseline** (in
+`attributes.py`/`expiry.py`/… — unrelated to this work; confirmed via stash-compare). The mypy "gate" is
+not clean today; worth a separate cleanup. **Follow-up:** deprecate/remove the now-unused
+`recommendFeatureSets` API surface.
