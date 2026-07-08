@@ -162,13 +162,55 @@ indicator. **Distinctive because the key flag is not in the data — it must be 
 
 # PART B — Domain-specific templates
 
-## B1. Churn / attrition
-- **`dormancy_days`** — recency of any financial activity (the churn signal). = `recency_days` on
-  transactions. use: retail_churn, deposit_attrition.
-- **`balance_decline_slope`** — `balance_trend` over 90d (declining = churn risk). use: churn.
-- **`engagement_decay`** — `event_recency_trend` on logins/txns. use: churn, advisor_churn.
-- **`salary_irregularity`** — `inter_event_gap_std` on salary-credit events. use: retail_churn.
-- **`product_attrition`** — drop in `product_breadth` vs prior period. use: churn, share-of-wallet.
+## B1. Churn / attrition — the attrition FUNNEL
+
+Attrition is a process, not an event. Signals sit at stages: **earlier = more lead-time but noisier;
+later = near-certain but too late (and near-label → leakage risk).** A good model blends stages.
+
+```
+DISSATISFACTION → DISENGAGEMENT → FINANCIAL MIGRATION → UNBUNDLING → DEPARTURE ⚠near-label
+```
+
+**Stage 1 — Dissatisfaction (leading, weak, most lead-time)**
+- `complaint_recent_flag` — a complaint filed in window. needs: complaint/interaction records.
+- `fee_reversal_then_balance_drop` — fee dispute followed by balance decline. needs: fee events+balance.
+- `dispute_unresolved_count` — open disputes. `failed_contact_rate` — unresolved service contacts.
+
+**Stage 2 — Disengagement (behavioural, early)**
+- `digital_login_decline` — `trend_slope` of logins (falling). needs: session events.
+- `channel_abandonment` — stopped using a previously-used channel. needs: channel-tagged activity.
+- `comms_disengagement` — stopped opening statements / unsubscribed. needs: comms open events.
+- `engagement_decay` — `event_recency_trend` on logins/txns. `product_usage_decline` — fewer features used.
+
+**Stage 3 — Financial migration (mid, STRONG — the money is moving)**
+- `salary_cessation_flag` / `salary_decline_trend` — inbound salary stops/shrinks. needs: credit txns +
+  salary tag. eligibility: income sensitive. `salary_irregularity` — `inter_event_gap_std` on salary.
+- `external_own_transfer_trend` — own money → competitor (§A9). PII entity-resolution.
+- `card_spend_decline_trend` — `trend_slope` of card volume. needs: card txns.
+- `share_of_spend_decline` — this bank's spend ÷ total known spend. needs: external spend view.
+- `net_inflow_decline` — total credits falling. `deposit_runoff` — term deposits maturing, not renewed.
+- `balance_decline_slope` — `balance_trend` over 90d (the core drain signal).
+
+**Stage 4 — Unbundling (late, STRONG — dismantling the relationship)**
+- `direct_debit_cancellation_rate` — DDs (utilities/mortgage) cancelled. needs: DD/mandate data. *(strong
+  — sticky "furniture" leaving.)*
+- `standing_order_redirection` — SOs redirected external. needs: SO data + beneficiary. PII.
+- `product_closure_count` — products closed. `tier_downgrade_flag` — premium→basic.
+- `product_attrition` — drop in `product_breadth`. `mortgage_redemption_signal` — early redemption
+  (remortgage elsewhere?).
+
+**Stage 5 — Departure ⚠ (NEAR-LABEL — high leakage risk, usually FLAG/REJECT)**
+- `account_switch_service_flag` (CASS) — a formal switch request. **⚠ almost the outcome itself → the
+  3-part leakage control must flag/reject** (else the model predicts churn using churn).
+- `full_balance_withdrawal_flag` — account emptied. **⚠ near-label — flag.**
+
+**Composite**
+- `relationship_erosion_score` — weighted blend, **weighted by lead-time × strength**; keep inspectable
+  (`explain: H`) so a human sees which stage fired. `dormancy_days` = `recency_days` (the baseline signal).
+
+> **Two funnel rules:** (1) **lead-time vs strength is a trade-off** — blend stages, don't rely on one;
+> (2) **the bottom of the funnel is a leakage trap** — Stage-5 signals are *almost the label*; flag/reject
+> (the sharper cousin of the `days_since_last_txn` case).
 
 ## B2. Credit risk (application, behavioural, IFRS9)
 - **`max_dpd_in_window`** — worst days-past-due. computes: `max({dpd} in window)`. explain: H. use:
