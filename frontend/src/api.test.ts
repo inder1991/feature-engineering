@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
-  ApiError, type FeatureIdea, recommendFeatures, recommendFeatureSets, refineCandidate,
+  ApiError, type ContractDraft, contractConfirm, contractConsideredSet, contractDraft,
+  type FeatureIdea, listContracts, recommendFeatures, recommendFeatureSets, refineCandidate,
   searchCatalog, uploadFile,
 } from './api'
 import { setSession } from './session'
@@ -242,5 +243,53 @@ describe('feature assist client', () => {
       new Response(JSON.stringify({ detail }), { status: 503 }))
     await expect(recommendFeatureSets('predict churn', null)).rejects.toMatchObject({
       status: 503, detail })
+  })
+})
+
+describe('governed contract flow client', () => {
+  it('contractConsideredSet posts the brief to /contract/considered-set', async () => {
+    fetchMock.mockImplementation(ok({ intent_id: 'int_1', anchor: null, alternatives: [],
+      recommendation: null }))
+    await contractConsideredSet('balance drains then they leave', 'predict retail churn',
+      { entity: 'customer' })
+    const [url, init] = fetchMock.mock.calls[0]
+    expect(url).toBe('/contract/considered-set')
+    expect(init.method).toBe('POST')
+    expect(JSON.parse(init.body)).toMatchObject({
+      hypothesis: 'balance drains then they leave', objective: 'predict retail churn',
+      entity: 'customer' })
+  })
+
+  it('contractDraft posts the Gate-1 choice to /contract/draft', async () => {
+    fetchMock.mockImplementation(ok({ draft: {}, unresolved: [], intent_id: 'int_1' }))
+    await contractDraft('int_1', 'anchor', 'balance_trend_90d', 'best fit')
+    const [url, init] = fetchMock.mock.calls[0]
+    expect(url).toBe('/contract/draft')
+    expect(JSON.parse(init.body)).toEqual({
+      intent_id: 'int_1', chosen_source: 'anchor', chosen_option_id: 'balance_trend_90d',
+      why: 'best fit' })
+  })
+
+  it('contractConfirm merges the draft with the intent_id', async () => {
+    fetchMock.mockImplementation(ok({ contract_id: 'c1', feature_id: 'f1',
+      feature_name: 'balance_trend_90d', version: 1 }))
+    const draft: ContractDraft = { feature_name: 'balance_trend_90d', definition: 'slope of balance',
+      grain_table: 'accounts', aggregation: 'trend', as_of_column: 'snapshot_date',
+      derives_from: ['balance_gbp'], target_ref: 'churned',
+      derives_pairs: [['retail_core', 'balance_gbp']], join_path: [] }
+    const c = await contractConfirm(draft, 'int_1')
+    const [url, init] = fetchMock.mock.calls[0]
+    expect(url).toBe('/contract/confirm')
+    expect(init.method).toBe('POST')
+    expect(JSON.parse(init.body)).toMatchObject({ feature_name: 'balance_trend_90d',
+      intent_id: 'int_1', derives_pairs: [['retail_core', 'balance_gbp']] })
+    expect(c.contract_id).toBe('c1')
+  })
+
+  it('listContracts GETs the governed inventory', async () => {
+    fetchMock.mockImplementation(ok([]))
+    await listContracts(25)
+    const [url] = fetchMock.mock.calls[0]
+    expect(url).toBe('/contracts?limit=25')
   })
 })

@@ -327,6 +327,114 @@ export function featureDetail(featureId: string): Promise<FeatureDetail> {
   return request(`/features/${encodeURIComponent(featureId)}`)
 }
 
+// ---- Governed feature-contract flow (the two-gate flow: brief -> considered set -> confirm) --------
+// The backend flow is stateless over HTTP: the client carries intent_id + the transient draft between
+// steps, and the server re-validates (MCV) at draft and confirm, so a tampered payload can never govern.
+export interface Idea {
+  name: string
+  description: string
+  derives_from: string[]
+  aggregation: string | null
+  grain_table: string | null
+  derives_pairs: [string, string][]
+  verification: string
+  critic_note: string
+  rationale: string
+}
+
+export interface ConsideredSetResp {
+  intent_id: string
+  anchor: Idea | null
+  alternatives: { lens: string; features: Idea[] }[]
+  recommendation: { recommended_lens: string; reasoning: string; caveat: string } | null
+}
+
+export interface ContractDraft {
+  feature_name: string
+  definition: string
+  grain_table: string | null
+  aggregation: string | null
+  as_of_column: string | null
+  derives_from: string[]
+  target_ref: string | null
+  derives_pairs: [string, string][]
+  join_path: Record<string, unknown>[]
+}
+
+export interface DraftResp {
+  draft: ContractDraft
+  unresolved: unknown[]
+  intent_id: string
+}
+
+export interface Contract {
+  contract_id: string
+  feature_id: string
+  feature_name: string
+  version: number
+}
+
+export interface ContractSummary {
+  contract_id: string
+  feature_id: string
+  feature_name: string
+  version: number
+  verification: string
+  created_at: string
+}
+
+export interface ContractDetail extends ContractSummary {
+  definition: string
+  intent_id: string | null
+}
+
+// Gate #1 intake: mandatory hypothesis + objective; the server persists the intent and returns the
+// gauntlet-validated considered set (anchor + generated alternatives + an advisory recommendation).
+export function contractConsideredSet(
+  hypothesis: string,
+  objective: string,
+  opts: { definition?: string; catalogSource?: string; entity?: string; targetRef?: string } = {},
+): Promise<ConsideredSetResp> {
+  return post('/contract/considered-set', {
+    hypothesis,
+    objective,
+    definition: opts.definition ?? '',
+    catalog_source: opts.catalogSource ?? null,
+    entity: opts.entity ?? null,
+    target_ref: opts.targetRef ?? null,
+  })
+}
+
+// Record the human's Gate #1 choice (server reconstructs the feature from the persisted set) and author
+// the draft. chosen_option_id is the chosen feature's name from the considered set.
+export function contractDraft(
+  intentId: string,
+  chosenSource: 'anchor' | 'alternative',
+  chosenOptionId: string,
+  why = '',
+): Promise<DraftResp> {
+  return post('/contract/draft', {
+    intent_id: intentId,
+    chosen_source: chosenSource,
+    chosen_option_id: chosenOptionId,
+    why,
+  })
+}
+
+// Gate #2 — the governing write. The draft (from contractDraft) is sent back with its intent_id; the
+// server re-runs the MCV and mints a versioned, DESIGN-CHECKED contract.
+export function contractConfirm(draft: ContractDraft, intentId: string): Promise<Contract> {
+  return post('/contract/confirm', { ...draft, intent_id: intentId })
+}
+
+export function listContracts(limit = 50): Promise<ContractSummary[]> {
+  return request(`/contracts?limit=${limit}`)
+}
+
+export function getContract(contractId: string): Promise<ContractDetail> {
+  return request(`/contracts/${encodeURIComponent(contractId)}`)
+}
+
 export function recommendFeatures(
   objective: string,
   catalogSource: string | null,
