@@ -119,6 +119,35 @@ flagged node, ring detection) — see §3.12 `relationship_edge`.
 > position), and (3) **regulatory reach** (UBO/ownership for KYB/sanctions). The reasoning layer must
 > treat relationships as groundable structure, not just tables.
 
+### 1.10 Insurance / bancassurance
+`policy` · `claim` · `premium` · `beneficiary` · `underwriting_case` · `reinsurance_treaty` ·
+`lapse_surrender_event` · `annuity`
+
+### 1.11 Custody & securities services (asset servicing)
+`custody_holding` · `safekeeping_account` · `corporate_action` · `settlement_instruction` · `fund` ·
+`nav_record` · `securities_loan`
+
+### 1.12 Regulatory / finance / accounting
+`gl_account` (general ledger) · `cost_center` · `rwa_bucket` · `capital_component` (CET1/AT1/T2) ·
+`provision_stage` (IFRS9 stage 1/2/3) · `impairment` · `regulatory_report` · `stress_scenario`
+
+### 1.13 Reference / market data & tax
+`instrument_reference` · `product_master` · `index_benchmark` · `rating_agency` · `fx_rate` ·
+`curve` (have) · `tax_lot` · `withholding` · `fatca_crs_classification`
+
+### 1.14 Data governance & fee/billing
+`consent` (extends `consent_record`) · `data_sharing_agreement` · `purpose` · `source_system` (lineage)
+· `data_quality_flag` · `fee_schedule` · `pricing_tier` · `rebate`
+
+### 1.15 Two cross-cutting entity dimensions
+- **Lifecycle state** — every product/account/facility carries a `lifecycle_state`
+  (origination → active → delinquent → default → restructured → closed/written-off). Features condition
+  on it; targets often *are* transitions between states (e.g. active → default).
+- **Reference vs. transactional** — banking separates slowly-changing **reference/master** data
+  (`product_master`, `instrument_reference`, customer static) from time-stamped **event/transactional**
+  data. Different point-in-time semantics: a reference value is *"current as-of"* (bi-temporal, §3.13);
+  an event is dated at occurrence.
+
 ---
 
 ## 2. Domains / business lines (the where) + representative use-cases
@@ -175,6 +204,9 @@ AML · KYC/CDD/EDD · sanctions · anti-bribery · fraud (application / transact
 takeover** / first-party / synthetic-identity / authorized-push-payment).
 *Use-cases:* `aml_transaction_monitoring`, `kyc_risk_rating`, `sanctions_screening_support`,
 `sar_prioritization`, `application_fraud`, `account_takeover`, `app_scam_detection`, `mule_detection`.
+*Typologies (the real `outcome_label`s):* AML — `structuring`/smurfing, `layering`,
+`trade_based_ml`, `rapid_movement`, `round_tripping`; Fraud — `app_scam` (authorized push payment),
+`synthetic_identity`, `first_party_fraud`, `mule_account`, `card_not_present`, `friendly_fraud`.
 
 ### 2.11 Marketing / CRM / customer analytics
 *Use-cases:* `churn`, `clv/ltv`, `segmentation`, `propensity/cross-sell/up-sell`, `campaign_response`,
@@ -191,6 +223,37 @@ takeover** / first-party / synthetic-identity / authorized-push-payment).
 ### 2.14 Servicing / operations
 *Use-cases:* `complaint_prediction`, `dispute_outcome`, `contact_center_routing`, `call_deflection`,
 `document_classification`, `nsf_prediction`.
+
+### 2.15 Insurance / bancassurance
+life · general (P&C) · credit protection · annuities.
+*Use-cases:* `lapse_surrender_prediction`, `persistency`, `claims_fraud`, `underwriting_risk`,
+`protection_cross_sell`.
+
+### 2.16 Custody & securities services (asset servicing)
+custody · fund administration · corporate actions · securities lending.
+*Use-cases:* `settlement_fail_prediction`, `corporate_action_risk`, `securities_lending_demand`,
+`nav_error_detection`.
+
+### 2.17 Asset management (buy-side)
+*Use-cases:* `fund_redemption`, `flow_forecast`, `mandate_compliance_breach`, `style_drift`.
+
+### 2.18 Islamic banking
+Sharia-compliant parallel products (Murabaha, Ijara, Mudaraba, Sukuk, Takaful).
+*Use-cases:* `sharia_compliance_check`, `profit_rate_pricing`, `islamic_deposit_attrition`.
+
+### 2.19 ESG / sustainable finance
+green bonds · sustainability-linked loans (SLL) · climate & ESG risk.
+*Use-cases:* `esg_scoring`, `greenwashing_risk`, `climate_transition_risk`, `physical_climate_risk`,
+`sll_kpi_tracking`.
+
+### 2.20 Payments as a business (beyond cards)
+real-time/instant payments · correspondent banking · cross-border / remittance · open banking / BaaS.
+*Use-cases:* `rtp_fraud`, `correspondent_risk`, `remittance_aml`, `open_banking_tpp_risk`.
+
+> **Depth notes.** Credit-risk (§2.8) is a **lifecycle** (origination → behavioural → early-warning →
+> collections → recovery → write-off) over the **Basel/IFRS9** apparatus (PD/LGD/EAD/RWA, staging, IRB,
+> stress CCAR/EBA — §3.16). Markets (§2.5) adds `xva` (CVA/DVA/FVA), `greeks`, `settlement_fail`,
+> `margin` depth.
 
 > **Design use:** each use-case entry (Domain Intelligence spec §4) carries its precise `target`,
 > `feature_templates`, `allowed/blocked_data_classes`, and `regulatory` flags — regulatory intensity
@@ -265,6 +328,34 @@ from these (or from their defining source columns; §5-leakage of the contract-f
 / shared-account rings (fraud/AML). *(Enables network features: degree, community, shortest-path to a
 flagged node.)*
 
+### 3.13 Bi-temporal time (P0 — correctness)
+Every fact has **two** time axes: `valid_time` (the date it's *about* — as_of/effective) and
+`system_time` (the date it was *recorded/known* — a.k.a. knowledge/transaction time). Plus `value_date`,
+`booking_date`, `business_day_convention`, `reporting_period`.
+**Rule:** a leakage-safe feature uses only rows where **both** `valid_time ≤ as_of` **and**
+`system_time ≤ as_of` — the second condition drops values *restated later*, which you did not actually
+know at prediction time. Today the taxonomy has only valid-time; `system_time` is the missing axis.
+
+### 3.14 Currency / FX consistency (P0 — correctness)
+`currency_code` (unit) · `base_currency` vs `local_currency` · `fx_conversion_rate` · `cross_rate`.
+**Rule (like additivity):** never aggregate across currencies without first converting to a base
+currency via a **point-in-time** fx_rate. Mixing USD + EUR in one sum is a wrong number.
+
+### 3.15 Data eligibility (P0 — compliance)
+Beyond `pii`/`protected_attribute`: `data_purpose` · `consent_status` · `retention_class` ·
+`data_residency` · `special_category` (GDPR: health/biometric).
+**Rule:** a feature is *eligible* only if every input satisfies consent + purpose + residency +
+retention — a first-class check **alongside** leakage and fair-lending, not a substitute.
+
+### 3.16 Regulatory capital & accounting (P0 — the spine)
+Capital: `risk_weight` · `rwa` · `capital_ratio` *(is-a ratio)* · `ccf` (credit-conversion-factor) ·
+`pd_ttc` / `pd_pit` · `downturn_lgd`. Accounting: `fair_value` · `amortised_cost` · `impairment_stage`
+(IFRS9 1/2/3) · `accrual` · `provision_amount`. Rates/curves: `benchmark_rate` (SOFR/SONIA/€STR) ·
+`tenor` · `discount_factor` · `haircut` · `advance_rate`.
+
+### 3.17 ESG & compliance flags
+`esg_score` · `carbon_intensity` · `green_flag` · `sharia_compliant_flag`.
+
 ---
 
 ## 4. How this foundation is used (recap)
@@ -277,6 +368,10 @@ flagged node.)*
   UBO/ownership reach that a flat noun list can't express.
 - **Domains/use-cases** provide the fast path (target + templates + regulatory rules), and the
   regulatory intensity scales by domain.
+- **Four deterministic safety checks** gate every feature (not one): (1) **leakage** — `derives ∩
+  target_source`; (2) **point-in-time incl. bi-temporal** — `valid_time ≤ as_of` AND `system_time ≤
+  as_of` (§3.13); (3) **currency** — convert before aggregate (§3.14); (4) **eligibility** — consent /
+  purpose / residency / fair-lending / additivity (§3.15). All deterministic; the LLM never overrides.
 - Everything is **ratifiable + extensible per bank** and **grows via learning + curation** — this
   reference is the *seed of the seed*, not a fixed constant.
 

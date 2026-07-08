@@ -5,6 +5,16 @@
 **Date:** 2026-07-08 · **Verdict:** strong breadth, uneven depth — five whole business lines missing,
 the regulatory/capital + time + data-eligibility dimensions under-modelled. Fixable; prioritised below.
 
+> **Status: ALL findings (P0 + P1 + P2) applied to `banking-taxonomy-reference.md`.** Entities: added
+> insurance (§1.10), custody/securities services (§1.11), regulatory/finance/accounting (§1.12),
+> reference/market-data & tax (§1.13), data-governance & fee (§1.14), lifecycle + reference-vs-
+> transactional dimensions (§1.15). Domains: added insurance (§2.15), custody (§2.16), asset management
+> (§2.17), Islamic banking (§2.18), ESG (§2.19), payments-as-business (§2.20); deepened financial-crime
+> typologies (§2.10) + credit/markets depth notes. Vocabulary: added bi-temporal time (§3.13), currency/
+> FX (§3.14), data-eligibility (§3.15), regulatory-capital & accounting spine (§3.16), ESG flags (§3.17).
+> Four deterministic safety checks now named in §4 (leakage · point-in-time incl. bi-temporal · currency
+> · eligibility).
+
 ---
 
 ## 1. Executive summary
