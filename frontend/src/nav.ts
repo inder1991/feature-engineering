@@ -2,9 +2,11 @@
 // resolves to 'overview' so every entry point lands on the orientation screen.
 import { useCallback, useMemo, useSyncExternalStore } from 'react'
 
-export type Route = 'overview' | 'upload' | 'search' | 'review' | 'workbench' | 'registry'
+export type Route =
+  'overview' | 'upload' | 'search' | 'review' | 'workbench' | 'contract' | 'registry'
 
-const ROUTES: readonly string[] = ['overview', 'upload', 'search', 'review', 'workbench', 'registry']
+const ROUTES: readonly string[] =
+  ['overview', 'upload', 'search', 'review', 'workbench', 'contract', 'registry']
 
 export function parseHash(hash: string): { route: Route; params: URLSearchParams } {
   const raw = hash.replace(/^#\/?/, '')

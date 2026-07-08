@@ -2,6 +2,7 @@ import type { ReactElement } from 'react'
 import { useHashRoute } from './nav'
 import type { Route } from './nav'
 import { SessionBar } from './SessionBar'
+import { ContractScreen } from './screens/ContractScreen'
 import { OverviewScreen } from './screens/OverviewScreen'
 import { RegistryScreen } from './screens/RegistryScreen'
 import { ReviewQueueScreen } from './screens/ReviewQueueScreen'
@@ -82,6 +83,13 @@ const ICONS: Record<Route, ReactElement> = {
       <path d="M8 5.5v5M5.5 8h5" />
     </NavIcon>
   ),
+  contract: (
+    // Document with a check: a signed, governed contract.
+    <NavIcon>
+      <path d="M4 2.75h5.5L12 5.25v8c0 .55-.45 1-1 1H4c-.55 0-1-.45-1-1v-9.5c0-.55.45-1 1-1z" />
+      <path d="M5.75 8.5 7.25 10l3-3.25" />
+    </NavIcon>
+  ),
   registry: (
     // Four cells: the registered-feature inventory.
     <NavIcon>
@@ -108,6 +116,14 @@ const PAGES: { route: Route; label: string; eyebrow: string; title: string; desc
     title: 'Feature generation',
     description:
       'State your goal, then take either path; both land in one candidate list you approve into the registry.',
+  },
+  {
+    route: 'contract',
+    label: 'Govern a feature',
+    eyebrow: 'CATALOG · GOVERN',
+    title: 'Govern a feature',
+    description:
+      'State a hypothesis, review the safe considered set, and approve one into a signed contract.',
   },
   {
     route: 'registry',
@@ -190,6 +206,7 @@ export default function App() {
         )}
         {route === 'review' && <ReviewQueueScreen initialSource={params.get('source') ?? ''} />}
         {route === 'workbench' && <WorkbenchScreen />}
+        {route === 'contract' && <ContractScreen />}
       </main>
     </div>
   )

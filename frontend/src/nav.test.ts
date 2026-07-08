@@ -25,6 +25,12 @@ describe('useHashRoute', () => {
     expect(result.current.params.get('source')).toBe('deposits')
   })
 
+  it('parses the contract route', () => {
+    window.location.hash = '#/contract'
+    const { result } = renderHook(() => useHashRoute())
+    expect(result.current.route).toBe('contract')
+  })
+
   it('reacts to hashchange events', () => {
     const { result } = renderHook(() => useHashRoute())
     expect(result.current.route).toBe('overview')
