@@ -102,7 +102,8 @@ def considered_set(body: ConsideredSetIn, conn: _Conn, identity: _Identity, clie
         conn, intent, client, entity=body.entity, catalog_source=body.catalog_source,
         roles=identity.role_claims, target_ref=body.target_ref, now=datetime.now(UTC))
     return {"intent_id": intent.intent_id, "anchor": cs.anchor,
-            "alternatives": cs.alternatives, "recommendation": cs.recommendation}
+            "alternatives": cs.alternatives, "recommendation": cs.recommendation,
+            "rejections": cs.rejections}
 
 
 @router.post("/contract/draft", dependencies=[Depends(require_feature_generate)])

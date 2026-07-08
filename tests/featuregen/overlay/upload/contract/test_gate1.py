@@ -50,6 +50,27 @@ def test_considered_set_has_anchor_alternatives_and_advisory(db):
     assert "backtest" in cs.recommendation.caveat                           # advisory, caveated
 
 
+def test_considered_set_carries_gauntlet_rejections(db):
+    # The considered set surfaces WHAT the gauntlet threw out and why (the Gate-#3 transparency the
+    # Workbench renders) — a leaky candidate (derives from the target) is rejected, not silently dropped.
+    _bank(db)
+    client = FakeLLM(script={
+        "overlay.feature.recommend": FakeResponse(output={"features": [
+            {"name": "avg_balance_90d", "derives_from": ["public.accounts.balance"],
+             "aggregation": "avg_90d"},
+            {"name": "reads_the_answer", "derives_from": ["public.accounts.churned"],
+             "aggregation": "max"}]}),
+        "overlay.feature.recommend_set": FakeResponse(output={
+            "recommended_lens": "monetary", "reasoning": "fits"}),
+        "overlay.feature.critique_candidates": FakeResponse(output={"issues": []}),
+    })
+    intent = submit_intent(hypothesis="customers churn when their balance drops", actor="ds1")
+    cs = build_considered_set(db, intent, client, catalog_source="bank",
+                              target_ref="public.accounts.churned", now=NOW)
+    assert isinstance(cs.rejections, list)
+    assert any(r.get("code") == "LEAKAGE" for r in cs.rejections)   # the leaky candidate is surfaced
+
+
 def test_hypothesis_only_has_no_anchor(db):
     _bank(db)
     intent = submit_intent(hypothesis="customers churn when their balance drops", actor="ds1")

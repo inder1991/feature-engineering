@@ -9,7 +9,7 @@ without a recorded choice here**, in both definition and hypothesis-only modes.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from featuregen.intake.llm import LLMClient
 from featuregen.overlay.upload.contract._serial import actor_json as _actor_json
@@ -18,7 +18,7 @@ from featuregen.overlay.upload.feature_assist import (
     FeatureIdea,
     FeatureSet,
     SetRecommendation,
-    recommend_feature_sets,
+    recommend_feature_sets_report,
     recommend_features,
     recommend_set,
     set_signals,
@@ -35,6 +35,8 @@ class ConsideredSet:
     anchor: FeatureIdea | None                    # the requester's definition, validated (definition mode)
     alternatives: list[FeatureSet]                # generated, each fully gauntlet-validated
     recommendation: SetRecommendation | None      # advisory — fit vs hypothesis, not a performance claim
+    rejections: list[dict] = field(default_factory=list)   # what the gauntlet threw out + why (Gate-#3
+    #                                                        transparency the Workbench renders)
 
 
 def persist_intent(conn, intent: Intent, target_ref: str | None = None) -> None:
@@ -65,9 +67,10 @@ def build_considered_set(conn, intent: Intent, client: LLMClient, *, entity: str
     Persists the intent + target_ref (M6, BLOCKER 2) and the considered-set snapshot (BLOCKER 1) when the
     flow reaches Gate #1."""
     persist_intent(conn, intent, target_ref)
-    alternatives = recommend_feature_sets(
+    report = recommend_feature_sets_report(
         conn, intent.redacted_hypothesis, client, entity=entity, catalog_source=catalog_source,
         roles=roles, target_ref=target_ref, now=now)
+    alternatives = report.sets
     anchor: FeatureIdea | None = None
     if intent.intake_mode == "definition":
         ideas = recommend_features(
@@ -76,7 +79,7 @@ def build_considered_set(conn, intent: Intent, client: LLMClient, *, entity: str
         anchor = ideas[0] if ideas else None
     recommendation = (recommend_set(conn, alternatives, intent.redacted_hypothesis, client)
                       if any(s.features for s in alternatives) else None)
-    cs = ConsideredSet(intent.intent_id, anchor, alternatives, recommendation)
+    cs = ConsideredSet(intent.intent_id, anchor, alternatives, recommendation, report.rejections)
     conn.execute(   # persist the validated set so /contract/draft reconstructs the chosen feature here
         "INSERT INTO contract_considered (intent_id, considered) VALUES (%s, %s::jsonb) "
         "ON CONFLICT (intent_id) DO UPDATE SET considered = EXCLUDED.considered",

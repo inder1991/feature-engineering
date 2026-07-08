@@ -68,4 +68,31 @@ GET /contracts → [{ contract_id, feature_id, feature_name, version, verificati
 ## Done-when
 A user navigates to the Contract screen, submits a churn hypothesis, sees the considered set, approves a
 feature, and gets a governed `DESIGN-CHECKED` contract — all in the UI, on the app session. Frontend
-suite + typecheck green.
+suite + typecheck green. ✅ **Tasks 1–3 done** (commits 04bf3c0, fcac3a0, 7bb3be6).
+
+---
+
+## REVISED — fold governance INTO the "Generate features" (Workbench) screen (user decision, 2026-07-08)
+
+**Decision:** the separate "Govern a feature" screen created a confusing two-door state; the Generate
+screen is the better home. Governance becomes a step *inside* the Workbench, not a standalone screen.
+**Generation path:** use **`considered-set`** as the single path — it's a strict superset of
+`recommend-sets` (calls it internally) and is the only one that carries the persisted intent + snapshot
+that the sign-off (`confirm`) requires. `recommend-sets` becomes redundant.
+
+**Kept from M0:** the `api.ts` contract client (proven wiring). **Retired (at the end):** the separate
+`ContractScreen` + the "Govern a feature" nav item.
+
+**Integration task sequence:**
+- **I1 — Workbench generates via `considered-set`.** Add a one-line hypothesis input; "Generate" calls
+  `contractConsideredSet` (keeps the objective + scope); render the returned anchor + alternatives +
+  advisory recommendation in the existing candidate UI. The generation is now governance-ready.
+- **I2 — draft-vs-govern at approval.** The approval tray gains: **Save as draft** (quick) vs **Govern**
+  (`contractDraft` → `contractConfirm` → a signed contract). Show the "safe, not proven" caveat + the
+  minted contract id.
+- **I3 — A1 honest lifecycle.** "Save as draft" stamps honest **`UNVERIFIED`** (introduce the rung,
+  flip the `FeatureSpec` default, CHECK constraint, re-stamp migration + consumer-impact report).
+- **I4 — cleanup.** Retire `ContractScreen` + the nav item; deprecate `recommend-sets`.
+
+**Dependency:** I2's "Govern" works on today's backend; I2's "Save as draft" is honest only after I3.
+Order: I1 → I2 (govern half) → I3 (honest draft) → I4.
