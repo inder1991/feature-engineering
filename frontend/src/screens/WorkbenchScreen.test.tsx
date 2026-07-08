@@ -9,7 +9,6 @@ vi.mock('../api', async importOriginal => {
   return {
     ...actual,
     recommendFeatures: vi.fn(),
-    recommendFeatureSets: vi.fn(),
     contractConsideredSet: vi.fn(),
     contractDraft: vi.fn(),
     contractConfirm: vi.fn(),
@@ -21,7 +20,6 @@ vi.mock('../api', async importOriginal => {
   }
 })
 const recommendFeatures = vi.mocked(api.recommendFeatures)
-const recommendFeatureSets = vi.mocked(api.recommendFeatureSets)
 const contractConsideredSet = vi.mocked(api.contractConsideredSet)
 const contractDraft = vi.mocked(api.contractDraft)
 const contractConfirm = vi.mocked(api.contractConfirm)
@@ -32,7 +30,6 @@ const featureFreshness = vi.mocked(api.featureFreshness)
 
 beforeEach(() => {
   recommendFeatures.mockReset()
-  recommendFeatureSets.mockReset()
   contractConsideredSet.mockReset()
   contractDraft.mockReset()
   contractConfirm.mockReset()
@@ -151,10 +148,10 @@ interface Scope {
 // hypothesis the tests type, asserted back in the call.
 const HYPOTHESIS = 'balance draining precedes churn'
 
-// Wrap a recommend-sets result as the considered-set response the governed generate path returns:
-// the same validated sets as `alternatives`, plus a server-side intent_id. Whole-round feedback
-// still calls recommendFeatureSets (raw FeatureSetsResult), so the round helpers keep that shape
-// and only the generate path is wrapped here.
+// Wrap a recommend-sets-shaped round as the considered-set response the governed paths return:
+// the same validated sets as `alternatives`, plus a server-side intent_id. BOTH the initial
+// generate AND whole-round feedback now call contractConsideredSet, so a feedback round wraps its
+// response through this helper too (the round-shape helpers stay reusable for either path).
 function considered(round: api.FeatureSetsResult): api.ConsideredSetResp {
   return {
     intent_id: 'int_1', anchor: null, alternatives: round.sets,
@@ -1103,12 +1100,16 @@ describe('whole-round feedback', () => {
     await selectCandidate('avg_balance')
     // The goal input is edited after the round: feedback still reruns the ROUND's objective.
     await userEvent.type(screen.getByLabelText('Prediction goal'), ' fast')
-    recommendFeatureSets.mockResolvedValueOnce(singleSetRound([idea('inactivity_days')]))
+    contractConsideredSet.mockResolvedValueOnce(
+      considered(singleSetRound([idea('inactivity_days')])))
     await submitSetFeedback('more behavioral signals')
     expect(await screen.findByText('inactivity_days')).toBeInTheDocument()
-    expect(recommendFeatureSets).toHaveBeenLastCalledWith(
-      'predict churn', 'deposits', 'public.labels.churned', 'customer',
-      'more behavioral signals')
+    // Feedback routes through considered-set with the ROUND's snapshotted hypothesis + objective
+    // (the goal input now reads 'predict churn fast') plus the instruction as `feedback`.
+    expect(contractConsideredSet).toHaveBeenLastCalledWith(HYPOTHESIS, 'predict churn', {
+      catalogSource: 'deposits', entity: 'customer', targetRef: 'public.labels.churned',
+      feedback: 'more behavioral signals',
+    })
     // The selected candidate is pinned: kept, still selected. The unselected one is replaced.
     expect(screen.getByText('avg_balance')).toBeInTheDocument()
     expect(screen.getByText('Kept')).toBeInTheDocument()
@@ -1134,7 +1135,8 @@ describe('whole-round feedback', () => {
     await selectCandidate('avg_balance')
     await registerSelection(1)
     expect(await screen.findByText('feat_01')).toBeInTheDocument()
-    recommendFeatureSets.mockResolvedValueOnce(singleSetRound([idea('inactivity_days')]))
+    contractConsideredSet.mockResolvedValueOnce(
+      considered(singleSetRound([idea('inactivity_days')])))
     await submitSetFeedback('fewer balance aggregates')
     expect(await screen.findByText('inactivity_days')).toBeInTheDocument()
     // The registered row survives untouched (its Registered state is its mark, no Kept chip);
@@ -1150,7 +1152,7 @@ describe('whole-round feedback', () => {
   it('keeps pinned candidates visible across set views after a multi-set round', async () => {
     await renderAndGenerateSets(multiSetRound())
     await selectCandidate('days_since_last_txn')
-    recommendFeatureSets.mockResolvedValueOnce(multiSetRound())
+    contractConsideredSet.mockResolvedValueOnce(considered(multiSetRound()))
     await submitSetFeedback('sharper recency signals')
     expect(await screen.findByText('Kept')).toBeInTheDocument()
     // Previous round held 3 candidates; the pin stayed, 2 were replaced.
@@ -1166,7 +1168,8 @@ describe('whole-round feedback', () => {
     await renderAndGenerate([IDEA])
     await screen.findByText('avg_balance')
     for (let round = 1; round <= 3; round++) {
-      recommendFeatureSets.mockResolvedValueOnce(singleSetRound([idea(`signal_${round}`)]))
+      contractConsideredSet.mockResolvedValueOnce(
+        considered(singleSetRound([idea(`signal_${round}`)])))
       await submitSetFeedback(`round ${round} note`, round)
       expect(await screen.findByText(`signal_${round}`)).toBeInTheDocument()
     }
@@ -1177,17 +1180,15 @@ describe('whole-round feedback', () => {
     )).toBeInTheDocument()
     // All three rounds stay on the record.
     expect(screen.getAllByText(/Set feedback round \d of 3 · recorded/)).toHaveLength(3)
-    // The initial generate is the governed considered-set call; recommendFeatureSets runs the
-    // 3 feedback rounds, nothing further.
-    expect(contractConsideredSet).toHaveBeenCalledTimes(1)
-    expect(recommendFeatureSets).toHaveBeenCalledTimes(3)
+    // The initial generate plus 3 feedback rounds all run through considered-set: 4 calls.
+    expect(contractConsideredSet).toHaveBeenCalledTimes(4)
   })
 
   it('sends exactly one regenerate when the form is double-submitted in flight', async () => {
     await renderAndGenerate([IDEA])
     await screen.findByText('avg_balance')
-    const pending = deferred<api.FeatureSetsResult>()
-    recommendFeatureSets.mockImplementationOnce(() => pending.promise)
+    const pending = deferred<api.ConsideredSetResp>()
+    contractConsideredSet.mockImplementationOnce(() => pending.promise)
     await submitSetFeedback('one note')
     expect(screen.getByRole('button', { name: 'Regenerating…' })).toBeDisabled()
     const form = screen.getByLabelText('Feedback on the whole round').closest('form')
@@ -1195,29 +1196,29 @@ describe('whole-round feedback', () => {
     await act(async () => {
       fireEvent.submit(form)
     })
-    // The initial generate ran on contractConsideredSet, so recommendFeatureSets carries only
-    // the one feedback flight; the in-flight double-submit added nothing.
-    expect(recommendFeatureSets).toHaveBeenCalledTimes(1)
+    // 1 generate + 1 feedback flight = 2 considered-set calls; the in-flight double-submit
+    // added nothing.
+    expect(contractConsideredSet).toHaveBeenCalledTimes(2)
     await act(async () => {
-      pending.resolve(singleSetRound([idea('inactivity_days')]))
+      pending.resolve(considered(singleSetRound([idea('inactivity_days')])))
     })
     expect(await screen.findByText('inactivity_days')).toBeInTheDocument()
-    expect(recommendFeatureSets).toHaveBeenCalledTimes(1)
+    expect(contractConsideredSet).toHaveBeenCalledTimes(2)
   })
 
   it('a stale feedback response never overwrites a newer generation round', async () => {
     await renderAndGenerate([IDEA])
     await screen.findByText('avg_balance')
-    const pending = deferred<api.FeatureSetsResult>()
-    recommendFeatureSets.mockImplementationOnce(() => pending.promise)
+    const pending = deferred<api.ConsideredSetResp>()
+    contractConsideredSet.mockImplementationOnce(() => pending.promise)
     await submitSetFeedback('one note')
-    // A fresh engine round outranks the in-flight feedback round. The fresh generate runs on
-    // the governed considered-set endpoint; the stale feedback is still on recommendFeatureSets.
+    // A fresh engine round outranks the in-flight feedback round. Both run through considered-set;
+    // the fresh generate's response is queued next and the stale feedback resolves afterward.
     contractConsideredSet.mockResolvedValueOnce(considered(singleSetRound([OTHER_IDEA])))
     await userEvent.click(screen.getByRole('button', { name: /generate candidate sets/i }))
     expect(await screen.findByText('txn_count')).toBeInTheDocument()
     await act(async () => {
-      pending.resolve(singleSetRound([idea('stale_signal')]))
+      pending.resolve(considered(singleSetRound([idea('stale_signal')])))
     })
     expect(screen.queryByText('stale_signal')).not.toBeInTheDocument()
     expect(screen.getByText('txn_count')).toBeInTheDocument()
@@ -1231,12 +1232,12 @@ describe('whole-round feedback', () => {
   it('discards a feedback round that resolves after a scope edit', async () => {
     await renderAndGenerate([IDEA])
     await screen.findByText('avg_balance')
-    const pending = deferred<api.FeatureSetsResult>()
-    recommendFeatureSets.mockImplementationOnce(() => pending.promise)
+    const pending = deferred<api.ConsideredSetResp>()
+    contractConsideredSet.mockImplementationOnce(() => pending.promise)
     await submitSetFeedback('one note')
     await userEvent.type(screen.getByLabelText('Entity'), 'c')
     await act(async () => {
-      pending.resolve(singleSetRound([idea('stale_signal')]))
+      pending.resolve(considered(singleSetRound([idea('stale_signal')])))
     })
     // The response was for the previous scope: nothing applies, nothing is recorded.
     expect(screen.queryByText('stale_signal')).not.toBeInTheDocument()
@@ -1247,7 +1248,7 @@ describe('whole-round feedback', () => {
   it('a scope edit resets the round counter with everything else', async () => {
     await renderAndGenerate([IDEA])
     await screen.findByText('avg_balance')
-    recommendFeatureSets.mockResolvedValueOnce(singleSetRound([idea('signal_1')]))
+    contractConsideredSet.mockResolvedValueOnce(considered(singleSetRound([idea('signal_1')])))
     await submitSetFeedback('one note')
     expect(await screen.findByText('signal_1')).toBeInTheDocument()
     expect(screen.getByRole('button', {
@@ -1266,7 +1267,7 @@ describe('whole-round feedback', () => {
   it('surfaces the missing-provider notice and consumes no round on failure', async () => {
     await renderAndGenerate([IDEA])
     await screen.findByText('avg_balance')
-    recommendFeatureSets.mockRejectedValueOnce(new api.ApiError(503, 'not configured'))
+    contractConsideredSet.mockRejectedValueOnce(new api.ApiError(503, 'not configured'))
     await submitSetFeedback('one note')
     const alert = await screen.findByRole('alert')
     expect(alert).toHaveTextContent(/ai assist is not configured/i)
@@ -1300,7 +1301,7 @@ describe('whole-round feedback', () => {
     await renderAndGenerateSets(threeSets())
     await screen.findByText('Temporal set')
     await selectCandidate('days_since_last_txn')
-    recommendFeatureSets.mockResolvedValueOnce(threeSets())
+    contractConsideredSet.mockResolvedValueOnce(considered(threeSets()))
     await submitSetFeedback('sharper signals')
     await screen.findByText('Kept')
     // The temporal set's only candidate collided with the pin: no empty card renders...
@@ -1318,7 +1319,7 @@ describe('whole-round feedback', () => {
     await renderAndGenerateSets(multiSetRound())
     await selectCandidate('days_since_last_txn')
     expect(screen.getByText('from the Temporal set')).toBeInTheDocument()
-    recommendFeatureSets.mockResolvedValueOnce(multiSetRound())
+    contractConsideredSet.mockResolvedValueOnce(considered(multiSetRound()))
     await submitSetFeedback('sharper recency signals')
     await screen.findByText('Kept')
     // The pinned pick left the sets model: its origin is neutral, so the note reads kept.
@@ -1345,10 +1346,9 @@ describe('whole-round feedback', () => {
     for (const button of screen.getAllByRole('button', { name: 'Give feedback' })) {
       expect(button).toBeEnabled()
     }
-    // The initial generate ran on contractConsideredSet; the locked channel means no feedback
-    // round ever fired on recommendFeatureSets.
+    // The initial generate ran on considered-set; the locked channel means no feedback round
+    // ever fired, so considered-set was called exactly once.
     expect(contractConsideredSet).toHaveBeenCalledTimes(1)
-    expect(recommendFeatureSets).not.toHaveBeenCalled()
     expect(registerFeature).not.toHaveBeenCalled()
   })
 })
@@ -1623,7 +1623,8 @@ describe('per-candidate feedback', () => {
     await selectCandidate('avg_balance')
     await openRefineAndSend('use the churn label')
     expect(await screen.findByText(/rejected this revision/)).toBeInTheDocument()
-    recommendFeatureSets.mockResolvedValueOnce(singleSetRound([idea('inactivity_days')]))
+    contractConsideredSet.mockResolvedValueOnce(
+      considered(singleSetRound([idea('inactivity_days')])))
     await userEvent.type(
       screen.getByLabelText('Feedback on the whole round'), 'more behavioral signals')
     await userEvent.click(screen.getByRole('button', {
@@ -1676,26 +1677,46 @@ describe('govern', () => {
     expect(screen.queryByRole('checkbox', { name: 'Select avg_balance' })).not.toBeInTheDocument()
   })
 
-  it('has no Govern action after a whole-round feedback clears the intent, while register stays', async () => {
+  it('a whole-round feedback refreshes the intent; kept candidates are not governable, fresh ones are', async () => {
+    contractDraft.mockResolvedValue({ draft: AVG_DRAFT, unresolved: [], intent_id: 'int_1' })
+    contractConfirm.mockResolvedValue({
+      contract_id: 'contract_2', feature_id: 'feat_2', feature_name: 'inactivity_days', version: 1,
+    })
     await renderAndGenerate([IDEA, OTHER_IDEA])
     await selectCandidate('avg_balance')
     // Before feedback: the governing intent from generate makes Govern available.
     expect(screen.getByRole('button', { name: 'Govern 1' })).toBeInTheDocument()
-    recommendFeatureSets.mockResolvedValueOnce(singleSetRound([idea('inactivity_days')]))
+    // Feedback routes through considered-set and mints a FRESH intent ('int_1') over the guided set.
+    contractConsideredSet.mockResolvedValueOnce(
+      considered(singleSetRound([idea('inactivity_days')])))
     await userEvent.type(
       screen.getByLabelText('Feedback on the whole round'), 'more behavioral signals')
     await userEvent.click(screen.getByRole('button', {
       name: 'Regenerate with feedback · round 1 of 3',
     }))
     expect(await screen.findByText('inactivity_days')).toBeInTheDocument()
-    // The pinned pick keeps the tray up, but the intent is gone: no Govern, register unaffected.
+    // The kept pin (avg_balance) came from the PRIOR generation, so it is NOT in the new intent's
+    // snapshot: with only the kept candidate selected, Govern is absent. Register is unaffected.
     expect(screen.getByText('avg_balance')).toBeInTheDocument()
+    expect(screen.getByText('Kept')).toBeInTheDocument()
     expect(screen.getByText('1 selected')).toBeInTheDocument()
     expect(screen.queryByRole('button', { name: /^Govern/ })).not.toBeInTheDocument()
     expect(
       screen.getByRole('button', { name: 'Approve and register 1 feature' }),
     ).toBeInTheDocument()
-    expect(contractDraft).not.toHaveBeenCalled()
+    // Selecting a FRESH post-feedback candidate DOES offer Govern over the refreshed intent: only
+    // the fresh one is governable (the kept one is not), so the button reads Govern 1.
+    await selectCandidate('inactivity_days')
+    expect(screen.getByText('2 selected')).toBeInTheDocument()
+    await userEvent.click(screen.getByRole('button', { name: 'Govern 1' }))
+    await userEvent.click(screen.getByRole('button', { name: 'Confirm govern' }))
+    expect(await screen.findByText(/governed/i)).toBeInTheDocument()
+    expect(screen.getByText('contract_2')).toBeInTheDocument()
+    // The two-gate flow ran with the FRESH intent from the feedback round, for the fresh candidate.
+    expect(contractDraft).toHaveBeenCalledWith('int_1', 'alternative', 'inactivity_days')
+    expect(contractConfirm).toHaveBeenCalledWith(AVG_DRAFT, 'int_1')
+    expect(contractDraft).toHaveBeenCalledTimes(1)
+    expect(contractConfirm).toHaveBeenCalledTimes(1)
   })
 
   it('marks the candidate with the failure and does not govern it when confirm rejects', async () => {

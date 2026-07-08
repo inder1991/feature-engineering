@@ -32,9 +32,11 @@
 //   carries no set description); an unknown lens simply renders without a thesis line.
 //
 // Feedback channels (Phase 3 decisions, documented for the record):
-// - Whole-round feedback re-calls /features/recommend-sets with the ROUND's original objective
-//   (snapshotted at generate time; a goal edit never silently rewrites what feedback runs
-//   against) plus the current scope, which cannot have drifted: scope edits invalidate the round.
+// - Whole-round feedback re-calls /contract/considered-set with the ROUND's original hypothesis
+//   and objective (both snapshotted at generate time; a later edit never silently rewrites what
+//   feedback runs against) plus the current scope, which cannot have drifted (scope edits
+//   invalidate the round), and the human's instruction as `feedback`. It mints a FRESH governing
+//   intent over the guided set, so post-feedback candidates stay governable.
 // - Pin semantics are client-side: candidates that are selected or registered stay (selected
 //   pins get a Kept chip; registered rows are already their own mark), everything else is
 //   replaced by the new response. A new candidate reusing a pinned name is dropped: the pin
@@ -59,7 +61,7 @@ import {
   ApiError, type FeatureFreshness, type FeatureIdea, type FeatureSpecIn, type JoinStep,
   type Recipe, type RefineRejection, type Rejection, type SetRecommendation,
   contractConfirm, contractConsideredSet, contractDraft, featureFreshness, featureRecipe,
-  recommendFeatureSets, refineCandidate, registerFeature,
+  refineCandidate, registerFeature,
 } from '../api'
 import { getSession } from '../session'
 
@@ -487,9 +489,10 @@ export function WorkbenchScreen() {
   const [confirmingGovern, setConfirmingGovern] = useState(false)
   const [governBusy, setGovernBusy] = useState(false)
   const [notice, setNotice] = useState('')
-  // Whole-round feedback channel: the objective the round was generated for (feedback reruns
-  // THAT goal, not a since-edited input), the instruction being typed, rounds consumed, the
-  // recorded strips, and the in-flight flag.
+  // Whole-round feedback channel: the hypothesis and objective the round was generated for
+  // (feedback reruns THOSE, not a since-edited input), the instruction being typed, rounds
+  // consumed, the recorded strips, and the in-flight flag.
+  const [roundHypothesis, setRoundHypothesis] = useState('')
   const [roundObjective, setRoundObjective] = useState('')
   const [setFbInstruction, setSetFbInstruction] = useState('')
   const [setFbRounds, setSetFbRounds] = useState(0)
@@ -556,9 +559,11 @@ export function WorkbenchScreen() {
   const selectedCandidates = allCandidates.filter(
     c => c.key in selected && !registered[c.key] && !governed[c.key])
   const selectedCount = selectedCandidates.length
-  // Only generated candidates are governable (they came through the considered set and are in
-  // its snapshot); a draft is the human's own definition and never governs into a contract.
-  const governableCount = selectedCandidates.filter(c => c.kind === 'generated').length
+  // Only fresh generated candidates are governable: they came through the CURRENT intent's
+  // considered set. A draft is the human's own definition, and a KEPT candidate was pinned from a
+  // PRIOR generation (not in the new intent's snapshot), so neither governs into a contract.
+  const governableCount = selectedCandidates.filter(
+    c => c.kind === 'generated' && !c.kept).length
   // Distinct set origins of the current picks, for the tray's mix note.
   const originLenses = [...new Set(
     selectedCandidates
@@ -731,8 +736,9 @@ export function WorkbenchScreen() {
       setScreenedTarget(target.trim() || null)
       setConfirmingBatch(false)
       setConfirmingGovern(false)
-      // A fresh engine round starts a fresh feedback cycle against ITS objective: whole-round
-      // feedback reruns this goal even if the input is edited later.
+      // A fresh engine round starts a fresh feedback cycle against ITS hypothesis and objective:
+      // whole-round feedback reruns these even if the inputs are edited later.
+      setRoundHypothesis(hypothesis.trim())
       setRoundObjective(objective)
       clearFeedback()
     } catch (err) {
@@ -747,8 +753,9 @@ export function WorkbenchScreen() {
     }
   }
 
-  // Whole-round feedback: rerun the round's objective under the human's guidance. Selected and
-  // registered candidates are pinned client-side; everything else is replaced by the response.
+  // Whole-round feedback: rerun the round's hypothesis + objective under the human's guidance
+  // through considered-set (minting a fresh governing intent). Selected and registered candidates
+  // are pinned client-side; everything else is replaced by the response.
   async function sendSetFeedback(e: FormEvent) {
     e.preventDefault()
     if (setFbInFlight.current) return
@@ -760,10 +767,21 @@ export function WorkbenchScreen() {
     setNotice('')
     setSetFbBusy(true)
     try {
-      const round = await recommendFeatureSets(
-        roundObjective, source.trim() || null, target.trim() || null, entity.trim() || null,
-        instruction)
+      // Feedback routes through the governed considered-set endpoint so the round mints a FRESH
+      // intent over the guided set: post-feedback candidates become governable (the stale-intent
+      // guard is lifted). The ROUND's snapshotted hypothesis + objective run, never a since-edited
+      // input; scope cannot have drifted (a scope edit voids the round).
+      const cs = await contractConsideredSet(roundHypothesis, roundObjective, {
+        catalogSource: source.trim() || undefined,
+        entity: entity.trim() || undefined,
+        targetRef: target.trim() || undefined,
+        feedback: instruction,
+      })
       if (seq !== generateSeq.current) return
+      const round = {
+        sets: cs.alternatives, recommendation: cs.recommendation, rejections: cs.rejections,
+      }
+      setIntentId(cs.intent_id)
       // Pins read the selection AS THE RESPONSE LANDS (the mirrors), not as it stood at submit.
       const prev = generatedRef.current ?? []
       const pinned = prev.filter(c =>
@@ -798,10 +816,8 @@ export function WorkbenchScreen() {
         ...pinned.map((c): GeneratedCandidate => ({ ...c, kept: true, lenses: [] })),
         ...byName.values(),
       ])
-      // Whole-round feedback replaced the displayed candidates; the new ones are NOT in the
-      // intent's considered-set snapshot, so drop the intent. Govern disables until the human
-      // regenerates through considered-set. (A later task routes feedback through it to lift this.)
-      setIntentId(null)
+      // The intent was refreshed above (setIntentId(cs.intent_id)) so the FRESH candidates are
+      // governable; the kept pins came from a prior generation and are excluded by governableCount.
       // Kept rows left the sets model, so their selection origins go neutral: a kept pick
       // reads as kept in the tray, never as a pick from a set that no longer exists.
       setSelected(prev => Object.fromEntries(
@@ -1079,15 +1095,15 @@ export function WorkbenchScreen() {
 
   // Govern the selected GENERATED candidates into signed contracts, mirroring confirmRegistration:
   // sequential, one candidate at a time, per-candidate try/catch so a failure marks that candidate
-  // and the batch continues. Only generated candidates are in the intent's considered-set snapshot;
-  // chosenSource is always 'alternative' and chosenOptionId is the candidate's feature name.
+  // and the batch continues. Only fresh (non-kept) generated candidates are in the current intent's
+  // considered-set snapshot; chosenSource is always 'alternative' and chosenOptionId is the name.
   async function confirmGovern() {
     if (governInFlight.current) return
     const iid = intentId
     if (!iid) return
     const batch = allCandidates.filter(
       (c): c is GeneratedCandidate =>
-        c.key in selected && !governed[c.key] && c.kind === 'generated')
+        c.key in selected && !governed[c.key] && c.kind === 'generated' && !c.kept)
     if (batch.length === 0) return
     governInFlight.current = true
     setGovernBusy(true)
@@ -1799,7 +1815,8 @@ export function WorkbenchScreen() {
                     <span style={{ flex: '1 1 auto' }} aria-hidden="true" />
                     {/* Govern the generated picks into signed contracts through the two-gate flow.
                         Shown only when a governing intent exists (from the last considered-set
-                        generate) and at least one selected candidate is generated (governable). */}
+                        call — generate or feedback) and at least one selected candidate is a
+                        fresh generated one (governable). */}
                     {intentId !== null && governableCount > 0 && (
                       <button
                         type="button"

@@ -384,7 +384,10 @@ export interface ContractDetail extends ContractSummary {
 export function contractConsideredSet(
   hypothesis: string,
   objective: string,
-  opts: { definition?: string; catalogSource?: string; entity?: string; targetRef?: string } = {},
+  opts: {
+    definition?: string; catalogSource?: string; entity?: string; targetRef?: string
+    feedback?: string
+  } = {},
 ): Promise<ConsideredSetResp> {
   return post('/contract/considered-set', {
     hypothesis,
@@ -393,6 +396,9 @@ export function contractConsideredSet(
     catalog_source: opts.catalogSource ?? null,
     entity: opts.entity ?? null,
     target_ref: opts.targetRef ?? null,
+    // HUMAN guidance for a whole-round feedback re-run; mints a FRESH governing intent over the
+    // guided set. null on the initial generate (no feedback yet).
+    feedback: opts.feedback ?? null,
   })
 }
 
