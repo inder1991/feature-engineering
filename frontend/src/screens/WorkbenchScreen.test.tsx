@@ -10,6 +10,7 @@ vi.mock('../api', async importOriginal => {
     ...actual,
     recommendFeatures: vi.fn(),
     recommendFeatureSets: vi.fn(),
+    contractConsideredSet: vi.fn(),
     refineCandidate: vi.fn(),
     featureRecipe: vi.fn(),
     leakageCheck: vi.fn(),
@@ -19,6 +20,7 @@ vi.mock('../api', async importOriginal => {
 })
 const recommendFeatures = vi.mocked(api.recommendFeatures)
 const recommendFeatureSets = vi.mocked(api.recommendFeatureSets)
+const contractConsideredSet = vi.mocked(api.contractConsideredSet)
 const refineCandidate = vi.mocked(api.refineCandidate)
 const featureRecipe = vi.mocked(api.featureRecipe)
 const registerFeature = vi.mocked(api.registerFeature)
@@ -27,6 +29,7 @@ const featureFreshness = vi.mocked(api.featureFreshness)
 beforeEach(() => {
   recommendFeatures.mockReset()
   recommendFeatureSets.mockReset()
+  contractConsideredSet.mockReset()
   refineCandidate.mockReset()
   featureRecipe.mockReset()
   registerFeature.mockReset()
@@ -138,12 +141,27 @@ interface Scope {
   target?: string
 }
 
+// The governed generate path types a hypothesis and calls contractConsideredSet; this is the
+// hypothesis the tests type, asserted back in the call.
+const HYPOTHESIS = 'balance draining precedes churn'
+
+// Wrap a recommend-sets result as the considered-set response the governed generate path returns:
+// the same validated sets as `alternatives`, plus a server-side intent_id. Whole-round feedback
+// still calls recommendFeatureSets (raw FeatureSetsResult), so the round helpers keep that shape
+// and only the generate path is wrapped here.
+function considered(round: api.FeatureSetsResult): api.ConsideredSetResp {
+  return {
+    intent_id: 'int_1', anchor: null, alternatives: round.sets,
+    recommendation: round.recommendation, rejections: round.rejections,
+  }
+}
+
 async function renderAndGenerate(
   ideas: api.FeatureIdea[],
   scope: Scope = {},
   rejections: api.Rejection[] = [],
 ) {
-  recommendFeatureSets.mockResolvedValue(singleSetRound(ideas, rejections))
+  contractConsideredSet.mockResolvedValue(considered(singleSetRound(ideas, rejections)))
   render(<WorkbenchScreen />)
   if (scope.source) {
     await userEvent.type(screen.getByLabelText('Catalog source'), scope.source)
@@ -154,13 +172,15 @@ async function renderAndGenerate(
   if (scope.target) {
     await userEvent.type(screen.getByLabelText('Target column'), scope.target)
   }
+  await userEvent.type(screen.getByLabelText('Hypothesis'), HYPOTHESIS)
   await userEvent.type(screen.getByLabelText('Prediction goal'), 'predict churn')
   await userEvent.click(screen.getByRole('button', { name: /generate candidate sets/i }))
 }
 
 async function renderAndGenerateSets(round: api.FeatureSetsResult) {
-  recommendFeatureSets.mockResolvedValue(round)
+  contractConsideredSet.mockResolvedValue(considered(round))
   render(<WorkbenchScreen />)
+  await userEvent.type(screen.getByLabelText('Hypothesis'), HYPOTHESIS)
   await userEvent.type(screen.getByLabelText('Prediction goal'), 'predict churn')
   await userEvent.click(screen.getByRole('button', { name: /generate candidate sets/i }))
 }
@@ -203,7 +223,7 @@ describe('gates strip', () => {
   it('advances only with real state, from goal to approval', async () => {
     registerFeature.mockResolvedValue('feat_01')
     featureFreshness.mockResolvedValue(FRESH)
-    recommendFeatureSets.mockResolvedValue(singleSetRound([IDEA]))
+    contractConsideredSet.mockResolvedValue(considered(singleSetRound([IDEA])))
     render(<WorkbenchScreen />)
     // No goal yet: stating it is the current step, everything downstream is upcoming.
     expect(gateState('State the goal')).toBe('active')
@@ -213,6 +233,7 @@ describe('gates strip', () => {
     await userEvent.type(screen.getByLabelText('Prediction goal'), 'predict churn')
     expect(gateState('State the goal')).toBe('done')
     expect(gateState('Propose in sets')).toBe('active')
+    await userEvent.type(screen.getByLabelText('Hypothesis'), HYPOTHESIS)
     await userEvent.click(screen.getByRole('button', { name: /generate candidate sets/i }))
     expect(await screen.findByText('avg_balance')).toBeInTheDocument()
     expect(gateState('Propose in sets')).toBe('done')
@@ -245,35 +266,40 @@ describe('gates strip', () => {
 })
 
 describe('generation', () => {
-  it('passes the goal and every scope field through to the sets call', async () => {
+  it('passes the hypothesis, goal, and every scope field through to the considered-set call', async () => {
     await renderAndGenerate([], {
       source: 'deposits', entity: 'customer', target: 'public.labels.churned',
     })
-    expect(recommendFeatureSets).toHaveBeenCalledWith(
-      'predict churn', 'deposits', 'public.labels.churned', 'customer')
+    expect(contractConsideredSet).toHaveBeenCalledWith(HYPOTHESIS, 'predict churn', {
+      catalogSource: 'deposits', entity: 'customer', targetRef: 'public.labels.churned',
+    })
   })
 
-  it('sends null for scope fields left blank', async () => {
+  it('leaves blank scope fields undefined in the considered-set call', async () => {
     await renderAndGenerate([])
-    expect(recommendFeatureSets).toHaveBeenCalledWith('predict churn', null, null, null)
+    expect(contractConsideredSet).toHaveBeenCalledWith(HYPOTHESIS, 'predict churn', {
+      catalogSource: undefined, entity: undefined, targetRef: undefined,
+    })
   })
 
   it('shows the empty note only after a generation round returns nothing', async () => {
-    recommendFeatureSets.mockResolvedValue(singleSetRound([]))
+    contractConsideredSet.mockResolvedValue(considered(singleSetRound([])))
     render(<WorkbenchScreen />)
     expect(screen.queryByText(/no grounded candidates/i)).not.toBeInTheDocument()
+    await userEvent.type(screen.getByLabelText('Hypothesis'), HYPOTHESIS)
     await userEvent.type(screen.getByLabelText('Prediction goal'), 'predict churn')
     await userEvent.click(screen.getByRole('button', { name: /generate candidate sets/i }))
     expect(await screen.findByText(/no grounded candidates for that goal/i)).toBeInTheDocument()
   })
 
   it('applies only the latest generation round when responses arrive out of order', async () => {
-    const first = deferred<api.FeatureSetsResult>()
-    const second = deferred<api.FeatureSetsResult>()
-    recommendFeatureSets
+    const first = deferred<api.ConsideredSetResp>()
+    const second = deferred<api.ConsideredSetResp>()
+    contractConsideredSet
       .mockImplementationOnce(() => first.promise)
       .mockImplementationOnce(() => second.promise)
     const { container } = render(<WorkbenchScreen />)
+    await userEvent.type(screen.getByLabelText('Hypothesis'), HYPOTHESIS)
     await userEvent.type(screen.getByLabelText('Prediction goal'), 'predict churn')
     await userEvent.click(screen.getByRole('button', { name: /generate candidate sets/i }))
     // Round 1 is in flight: the path card swaps to Generating and disables (no casual re-submit).
@@ -286,12 +312,12 @@ describe('generation', () => {
       fireEvent.submit(form)
     })
     await act(async () => {
-      second.resolve(singleSetRound([OTHER_IDEA]))
+      second.resolve(considered(singleSetRound([OTHER_IDEA])))
     })
     expect(await screen.findByText('txn_count')).toBeInTheDocument()
     // The stale first response resolves late and must not overwrite the newer round.
     await act(async () => {
-      first.resolve(singleSetRound([IDEA]))
+      first.resolve(considered(singleSetRound([IDEA])))
     })
     expect(screen.getByText('txn_count')).toBeInTheDocument()
     expect(screen.queryByText('avg_balance')).not.toBeInTheDocument()
@@ -300,8 +326,9 @@ describe('generation', () => {
   it('shows the honest 503 notice and never falls back to the plain recommend endpoint', async () => {
     // 503 means no LLM provider on the deployment: /features/recommend would fail identically,
     // so a silent fallback would only fake capability.
-    recommendFeatureSets.mockRejectedValue(new api.ApiError(503, 'not configured'))
+    contractConsideredSet.mockRejectedValue(new api.ApiError(503, 'not configured'))
     render(<WorkbenchScreen />)
+    await userEvent.type(screen.getByLabelText('Hypothesis'), HYPOTHESIS)
     await userEvent.type(screen.getByLabelText('Prediction goal'), 'predict churn')
     await userEvent.click(screen.getByRole('button', { name: /generate candidate sets/i }))
     const alert = await screen.findByRole('alert')
@@ -315,7 +342,7 @@ describe('generation', () => {
     await userEvent.click(screen.getByRole('button', { name: 'predict churn' }))
     expect(screen.getByLabelText('Prediction goal')).toHaveValue('predict churn')
     expect(screen.getByRole('button', { name: /generate candidate sets/i })).toBeEnabled()
-    expect(recommendFeatureSets).not.toHaveBeenCalled()
+    expect(contractConsideredSet).not.toHaveBeenCalled()
   })
 })
 
@@ -458,14 +485,15 @@ describe('multiple sets', () => {
   })
 
   it('shows the empty note and the rejections when every set comes back empty', async () => {
-    recommendFeatureSets.mockResolvedValue({
+    contractConsideredSet.mockResolvedValue(considered({
       sets: [{ lens: 'unary', features: [] }],
       recommendation: null,
       rejections: [
         { name: 'nps_score_avg', reason: 'no such column exists in any catalog', code: 'UNGROUNDED' },
       ],
-    })
+    }))
     render(<WorkbenchScreen />)
+    await userEvent.type(screen.getByLabelText('Hypothesis'), HYPOTHESIS)
     await userEvent.type(screen.getByLabelText('Prediction goal'), 'predict churn')
     await userEvent.click(screen.getByRole('button', { name: /generate candidate sets/i }))
     expect(await screen.findByText(/no grounded candidates for that goal/i)).toBeInTheDocument()
@@ -1143,8 +1171,10 @@ describe('whole-round feedback', () => {
     )).toBeInTheDocument()
     // All three rounds stay on the record.
     expect(screen.getAllByText(/Set feedback round \d of 3 · recorded/)).toHaveLength(3)
-    // 1 generate + 3 feedback rounds, nothing further.
-    expect(recommendFeatureSets).toHaveBeenCalledTimes(4)
+    // The initial generate is the governed considered-set call; recommendFeatureSets runs the
+    // 3 feedback rounds, nothing further.
+    expect(contractConsideredSet).toHaveBeenCalledTimes(1)
+    expect(recommendFeatureSets).toHaveBeenCalledTimes(3)
   })
 
   it('sends exactly one regenerate when the form is double-submitted in flight', async () => {
@@ -1159,12 +1189,14 @@ describe('whole-round feedback', () => {
     await act(async () => {
       fireEvent.submit(form)
     })
-    expect(recommendFeatureSets).toHaveBeenCalledTimes(2)
+    // The initial generate ran on contractConsideredSet, so recommendFeatureSets carries only
+    // the one feedback flight; the in-flight double-submit added nothing.
+    expect(recommendFeatureSets).toHaveBeenCalledTimes(1)
     await act(async () => {
       pending.resolve(singleSetRound([idea('inactivity_days')]))
     })
     expect(await screen.findByText('inactivity_days')).toBeInTheDocument()
-    expect(recommendFeatureSets).toHaveBeenCalledTimes(2)
+    expect(recommendFeatureSets).toHaveBeenCalledTimes(1)
   })
 
   it('a stale feedback response never overwrites a newer generation round', async () => {
@@ -1173,8 +1205,9 @@ describe('whole-round feedback', () => {
     const pending = deferred<api.FeatureSetsResult>()
     recommendFeatureSets.mockImplementationOnce(() => pending.promise)
     await submitSetFeedback('one note')
-    // A fresh engine round outranks the in-flight feedback round.
-    recommendFeatureSets.mockResolvedValueOnce(singleSetRound([OTHER_IDEA]))
+    // A fresh engine round outranks the in-flight feedback round. The fresh generate runs on
+    // the governed considered-set endpoint; the stale feedback is still on recommendFeatureSets.
+    contractConsideredSet.mockResolvedValueOnce(considered(singleSetRound([OTHER_IDEA])))
     await userEvent.click(screen.getByRole('button', { name: /generate candidate sets/i }))
     expect(await screen.findByText('txn_count')).toBeInTheDocument()
     await act(async () => {
@@ -1306,7 +1339,10 @@ describe('whole-round feedback', () => {
     for (const button of screen.getAllByRole('button', { name: 'Give feedback' })) {
       expect(button).toBeEnabled()
     }
-    expect(recommendFeatureSets).toHaveBeenCalledTimes(1)
+    // The initial generate ran on contractConsideredSet; the locked channel means no feedback
+    // round ever fired on recommendFeatureSets.
+    expect(contractConsideredSet).toHaveBeenCalledTimes(1)
+    expect(recommendFeatureSets).not.toHaveBeenCalled()
     expect(registerFeature).not.toHaveBeenCalled()
   })
 })

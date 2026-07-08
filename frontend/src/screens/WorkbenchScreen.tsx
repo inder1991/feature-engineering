@@ -57,8 +57,9 @@
 import { type FormEvent, type ReactNode, useEffect, useRef, useState } from 'react'
 import {
   ApiError, type FeatureFreshness, type FeatureIdea, type FeatureSpecIn, type JoinStep,
-  type Recipe, type RefineRejection, type Rejection, type SetRecommendation, featureFreshness,
-  featureRecipe, recommendFeatureSets, refineCandidate, registerFeature,
+  type Recipe, type RefineRejection, type Rejection, type SetRecommendation,
+  contractConsideredSet, featureFreshness, featureRecipe, recommendFeatureSets, refineCandidate,
+  registerFeature,
 } from '../api'
 import { getSession } from '../session'
 
@@ -447,6 +448,10 @@ function JoinPathDetails({ steps }: { steps: JoinStep[] }) {
 
 export function WorkbenchScreen() {
   const [goal, setGoal] = useState('')
+  const [hypothesis, setHypothesis] = useState('')
+  // The server-side intent that will later govern these candidates into a signed contract. Set
+  // on a successful generate; dropped by clearSets on any invalidation (scope edit or error).
+  const [intentId, setIntentId] = useState<string | null>(null)
   const [source, setSource] = useState('')
   const [entity, setEntity] = useState('')
   const [target, setTarget] = useState('')
@@ -584,6 +589,8 @@ export function WorkbenchScreen() {
     setActiveLens(null)
     setRejections([])
     setRejectionsOpen(false)
+    // Drop any stale governance intent: the candidates it governed no longer exist.
+    setIntentId(null)
   }
 
   // Resets both feedback channels: round counters, recorded strips, typed instructions, and
@@ -651,7 +658,9 @@ export function WorkbenchScreen() {
   async function generate(e: FormEvent) {
     e.preventDefault()
     const objective = goal.trim()
-    if (!objective) return
+    // Both the hypothesis and the objective are required: the considered-set intake governs
+    // against a stated hypothesis. Same early-return style as the objective check.
+    if (!hypothesis.trim() || !objective) return
     // A register batch is confirming or in flight: a new round would replace the rows the
     // human is approving, letting their registrations complete out of view.
     if (feedbackLocked) return
@@ -660,11 +669,20 @@ export function WorkbenchScreen() {
     setScopeChanged(false)
     setGenerating(true)
     try {
-      // Always the sets endpoint; no fallback to /features/recommend on 503 (both share the
-      // one provider, so the plain endpoint would fail identically — show the honest notice).
-      const round = await recommendFeatureSets(
-        objective, source.trim() || null, target.trim() || null, entity.trim() || null)
+      // The governed considered-set endpoint: same gauntlet-validated FeatureSet[] as
+      // recommend-sets, returned as `alternatives`, plus a server-side intent_id that later
+      // governs these candidates into a signed contract. No fallback to a plain endpoint on 503
+      // (one provider, identical failure — show the honest notice).
+      const cs = await contractConsideredSet(hypothesis.trim(), objective, {
+        catalogSource: source.trim() || undefined,
+        entity: entity.trim() || undefined,
+        targetRef: target.trim() || undefined,
+      })
       if (seq !== generateSeq.current) return
+      const round = {
+        sets: cs.alternatives, recommendation: cs.recommendation, rejections: cs.rejections,
+      }
+      setIntentId(cs.intent_id)
       // Dedupe by name across sets: the same feature in several lenses is one candidate that
       // knows every set it belongs to. Empty sets are dropped (nothing to compare or take).
       const byName = new Map<string, GeneratedCandidate>()
@@ -1058,7 +1076,9 @@ export function WorkbenchScreen() {
     : null
 
   return (
-    <section>
+    // Carry the current round's governing intent on the DOM so a later task can govern these
+    // candidates into a signed contract; undefined until the first successful generate.
+    <section data-intent-id={intentId ?? undefined}>
       <div className="gates" role="list" aria-label="Where you are in the loop">
         <Gate
           state={gate1}
@@ -1095,6 +1115,16 @@ export function WorkbenchScreen() {
           </div>
         )}
         <form onSubmit={generate} style={{ display: 'grid', gap: 16, margin: 0 }}>
+          <div className="field" style={{ maxWidth: 640 }}>
+            <label htmlFor="wb-hypothesis">Hypothesis</label>
+            <input
+              id="wb-hypothesis"
+              value={hypothesis}
+              onChange={e => setHypothesis(e.target.value)}
+              placeholder="e.g. customers whose balance is draining are about to leave"
+              style={{ height: 40 }}
+            />
+          </div>
           <div className="field" style={{ maxWidth: 640 }}>
             <label htmlFor="wb-goal">Prediction goal</label>
             <input
