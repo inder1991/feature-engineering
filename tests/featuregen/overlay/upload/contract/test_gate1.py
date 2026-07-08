@@ -71,6 +71,17 @@ def test_considered_set_carries_gauntlet_rejections(db):
     assert any(r.get("code") == "LEAKAGE" for r in cs.rejections)   # the leaky candidate is surfaced
 
 
+def test_considered_set_threads_the_objective(db):
+    # bug_003: the prediction goal was required-but-ignored. It now enriches the generation prompt
+    # (redacted with the same discipline as the hypothesis) and still yields a valid, governable set.
+    _bank(db)
+    intent = submit_intent(hypothesis="customers churn when their balance drops", actor="ds1")
+    cs = build_considered_set(db, intent, _client(), catalog_source="bank",
+                              target_ref="public.accounts.churned",
+                              objective="predict 90-day retail churn", now=NOW)
+    assert cs.alternatives
+
+
 def test_considered_set_threads_feedback(db):
     # A whole-round feedback re-runs the considered set under the human's instruction and still produces
     # a valid, governable set (its own intent + persisted snapshot) — this is what makes post-feedback

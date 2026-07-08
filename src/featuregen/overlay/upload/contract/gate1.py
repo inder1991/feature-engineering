@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 
 from featuregen.intake.llm import LLMClient
 from featuregen.overlay.upload.contract._serial import actor_json as _actor_json
-from featuregen.overlay.upload.contract.intake import Intent
+from featuregen.overlay.upload.contract.intake import Intent, redact_free_text
 from featuregen.overlay.upload.feature_assist import (
     FeatureIdea,
     FeatureSet,
@@ -61,14 +61,20 @@ def intent_target_ref(conn, intent_id: str) -> str | None:
 
 def build_considered_set(conn, intent: Intent, client: LLMClient, *, entity: str | None = None,
                          catalog_source: str | None = None, roles=(), target_ref: str | None = None,
-                         feedback: str | None = None, now=None) -> ConsideredSet:
+                         objective: str = "", feedback: str | None = None, now=None) -> ConsideredSet:
     """Discovery loop → validated alternatives; the anchor is the requester's definition run through the
     same validated loop (definition mode only). Every option shown to the human has passed the gauntlet.
     Persists the intent + target_ref (M6, BLOCKER 2) and the considered-set snapshot (BLOCKER 1) when the
     flow reaches Gate #1."""
     persist_intent(conn, intent, target_ref)
+    # The prediction goal enriches the generation prompt (hypothesis = the causal premise; goal = what
+    # we're predicting). Redacted with the same discipline as the hypothesis before it reaches the LLM,
+    # so a required-but-ignored field (bug_003) now actually shapes generation.
+    redacted_goal = redact_free_text(objective, label="prediction goal")
+    gen_objective = (f"{intent.redacted_hypothesis}\n\nprediction goal: {redacted_goal}"
+                     if redacted_goal else intent.redacted_hypothesis)
     report = recommend_feature_sets_report(
-        conn, intent.redacted_hypothesis, client, entity=entity, catalog_source=catalog_source,
+        conn, gen_objective, client, entity=entity, catalog_source=catalog_source,
         roles=roles, target_ref=target_ref, feedback=feedback, now=now)
     alternatives = report.sets
     anchor: FeatureIdea | None = None

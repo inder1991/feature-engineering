@@ -42,6 +42,16 @@ def _redact_or_deny(redactor: IntentRedactor, label: str, text: str) -> str:
     return result.text
 
 
+def redact_free_text(text: str, *, label: str = "text",
+                     redactor: IntentRedactor | None = None) -> str:
+    """Redact an ancillary free-text field (e.g. the prediction goal) with the SAME discipline as the
+    hypothesis before it can flow to the LLM — denies (IntentValidationError) if it can't be safely
+    redacted. Empty in, empty out."""
+    if not (text or "").strip():
+        return ""
+    return _redact_or_deny(redactor or DefaultIntentRedactor(), label, text)
+
+
 def submit_intent(*, hypothesis: str, definition: str = "", actor,
                   redactor: IntentRedactor | None = None) -> Intent:
     """Intake a feature request. Denies (no run) when the hypothesis is blank. Fixes `intake_mode`
