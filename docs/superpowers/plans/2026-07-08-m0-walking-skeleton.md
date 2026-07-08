@@ -84,15 +84,17 @@ that the sign-off (`confirm`) requires. `recommend-sets` becomes redundant.
 `ContractScreen` + the "Govern a feature" nav item.
 
 **Integration task sequence:**
-- **I1 — Workbench generates via `considered-set`.** Add a one-line hypothesis input; "Generate" calls
-  `contractConsideredSet` (keeps the objective + scope); render the returned anchor + alternatives +
-  advisory recommendation in the existing candidate UI. The generation is now governance-ready.
-- **I2 — draft-vs-govern at approval.** The approval tray gains: **Save as draft** (quick) vs **Govern**
-  (`contractDraft` → `contractConfirm` → a signed contract). Show the "safe, not proven" caveat + the
-  minted contract id.
-- **I3 — A1 honest lifecycle.** "Save as draft" stamps honest **`UNVERIFIED`** (introduce the rung,
-  flip the `FeatureSpec` default, CHECK constraint, re-stamp migration + consumer-impact report).
-- **I4 — cleanup.** Retire `ContractScreen` + the nav item; deprecate `recommend-sets`.
+- ✅ **I1 — Workbench generates via `considered-set`** (I1a backend rejections `35f77c6`; I1b `a2cb1f6`).
+- ✅ **I2 — draft-vs-govern at approval** (`78a90c9`). Tray: Approve-and-register (draft) vs Govern
+  (`contractDraft` → `contractConfirm` → signed contract), with the "design check, not a proof" caveat.
+- ✅ **I4 — cleanup** (`de9e33c`): retired `ContractScreen` + the nav item.
+- ✅ **I3 — honest lifecycle** (`78391d5`): direct registration stamps `UNVERIFIED`; `DESIGN-CHECKED` is
+  earned only via the governed flow. Migration 0973 (re-stamp + CHECK). Closes finding #4.
+- ⬜ **I2b — feedback via `considered-set`** (remaining): route whole-round feedback through
+  `considered-set` (small backend add for a `feedback` param) so post-feedback candidates are governable
+  too — lifts the stale-intent guard I2 added.
 
-**Dependency:** I2's "Govern" works on today's backend; I2's "Save as draft" is honest only after I3.
-Order: I1 → I2 (govern half) → I3 (honest draft) → I4.
+**Two open items:** I2b (above) + a **live end-to-end run** (all verification so far is unit/component
+level with mocked/test data). **Repo note:** `mypy src` has a **pre-existing 131-error baseline** (in
+`attributes.py`/`expiry.py`/… — unrelated to this work; confirmed via stash-compare). Worth a separate
+cleanup; the mypy "gate" is not actually clean today.
