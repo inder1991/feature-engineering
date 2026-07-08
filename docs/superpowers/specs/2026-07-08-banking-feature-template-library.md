@@ -301,6 +301,60 @@ Not a customer funnel — a **deposit-behaviour spectrum** per depositor/segment
   correlated-withdrawal risk.
 > Ties to B1: a depositor sliding STABLE→OUTFLOW is also churning — the deposit-attrition overlap.
 
+## B8. Markets / trading — risk families + the COUNTERPARTY-RISK funnel
+Positions/instruments, not customers. **High MRM tier** (VaR/XVA models heavily governed); MNPI /
+Chinese-wall aware. Time-scale: intraday→daily.
+- **Sensitivity families (point-in-time):** `greek_exposure` — delta/gamma/vega/theta/rho per
+  position/book (params: greek; add: additive across a book per greek; explain: H). `position_concentration`
+  — HHI of exposure by issuer/sector.
+- **Risk metrics:** `var_1d` / `expected_shortfall` (tail loss over horizon; explain: M), `stress_pnl`
+  (P&L under a {scenario} — CCAR/EBA).
+- **XVA / counterparty exposure:** `expected_exposure` (EPE) / `potential_future_exposure` (PFE) —
+  exposure profile over time; `cva` (expected counterparty-default loss); `wrong_way_risk`
+  (corr(exposure, counterparty PD); explain: M).
+- **PnL & control:** `pnl_daily`, `pnl_volatility`, `pnl_attribution` (decompose delta/gamma/vega/carry/
+  residual), `unexplained_pnl` (the residual — large ⇒ booking/model issue; a **control** signal).
+- **Counterparty-risk funnel (mirrors credit):** `HEALTHY → MARGIN PRESSURE (rising PFE, margin calls) →
+  DISPUTE (collateral shortfall) → CLOSE-OUT ⚠ (default)`. Trap: close-out ≈ the default label.
+- **Settlement/execution:** `settlement_fail_rate`; `slippage` / `market_impact` (TCA); `fill_ratio`.
+
+## B9. Insurance / bancassurance — the LAPSE funnel + the CLAIMS-FRAUD journey
+Two journeys. **Health/mortality data = special-category** → heavy consent, restricted use.
+- **Lapse / persistency funnel (mirrors churn):** `ACTIVE → DISENGAGEMENT → ARREARS → SURRENDER REQUEST ⚠
+  → LAPSED`. Signals: `premium_payment_regularity` (= `inter_event_gap_std` on premiums),
+  `premium_arrears_flag`, `payment_method_failure`, `policy_tenure`, `surrender_value_ratio` (surrender
+  value ÷ premiums — the incentive to surrender), `lapse_risk_score`. Near-label: surrender request.
+- **Claims-fraud journey:** `INCEPTION → CLAIM EVENT → FILED → INVESTIGATION → SETTLE/DENY`. Signals:
+  `early_claim_flag` (claim soon after inception — red flag), `claim_frequency`, `claim_amount_zscore`,
+  `prior_claims_count`, `claim_network_degree` (staged-accident rings), `claim_inconsistency_score`
+  (NLP over the claim narrative — derived downstream, §D.8). Near-label: confirmed-fraud/repudiation.
+- **Underwriting:** `sum_assured_to_income`, `medical_disclosure_flag`, `mortality_morbidity_proxy`
+  (age/health — **special-category, restricted**).
+
+## B10. Custody & securities services — the SETTLEMENT-FAIL funnel
+Operational / asset-servicing; institutional; operational-risk governed. Less PII.
+- **Settlement-fail funnel:** `TRADE BOOKED → MATCHING (unmatched/mismatch) → PRE-SETTLEMENT
+  (inventory/cash shortfall) → SETTLEMENT DATE → FAIL ⚠ → FAIL-AGING → BUY-IN`. Signals:
+  `matching_break_rate`, `inventory_shortfall_flag`, `counterparty_fail_history`, `cutoff_proximity`
+  (market/ccy cut-off), `settlement_fail_rate`, `fail_aging_days`. Near-label: the fail itself.
+- **Corporate-action risk:** `ca_election_deadline_proximity`, `ca_complexity`, `missed_election_history`
+  (missing an election = client loss).
+- **Securities lending:** `sec_lending_utilisation` / `specials_demand`, `recall_risk`.
+- **Fund admin / NAV:** `nav_error_rate`, `pricing_exception_count`, `reconciliation_break_rate`.
+
+## B11. ESG / sustainable finance — scoring + the TRANSITION-RISK journey
+**ESG data is often EXTERNAL** (ratings vendors, emissions disclosures) — availability/quality caveats;
+an `esg_score` is itself a model output (a derived tag, §D.8). Geographic is climate-legitimate, **not a
+credit proxy**.
+- **Scoring:** `esg_score` (E/S/G pillars), `esg_trend` (improving/deteriorating), `controversy_flag`.
+- **Transition-risk journey:** `ALIGNED → LAGGING → HIGH-RISK → STRANDED`. Signals: `carbon_intensity`
+  (emissions ÷ revenue), `sector_transition_risk` (high-carbon exposure), `transition_alignment` (vs
+  net-zero pathway), `stranded_asset_exposure`.
+- **Physical climate risk:** `physical_hazard_exposure` (flood/wildfire/heat of collateral/operations by
+  geography). eligibility: geographic — climate-legitimate.
+- **Greenwashing / SLL:** `green_proceeds_deviation` (green-bond proceeds not actually green),
+  `sll_kpi_trend` / `sll_kpi_breach_flag` (triggers a margin ratchet), `esg_claim_vs_data_gap`.
+
 ---
 
 # PART C — Coverage matrix (family × use-case)
@@ -348,6 +402,9 @@ Not a customer funnel — a **deposit-behaviour spectrum** per depositor/segment
    use-case, **map its funnel first**, then place each template on it and mark the near-label tail.
 
 # PART E — Open / to-deepen
-Markets desk templates (greeks, XVA, PnL-attribution), insurance (lapse/claims), securities-services
-(settlement-fail), ESG (carbon-intensity trend) — named here, to be authored as those domains are
-prioritised. Coverage grows per-domain via curation, not one big freeze.
+Markets (§B8), insurance (§B9), custody/securities-services (§B10), ESG (§B11) are now **drafted** at
+funnel/family level. Still to deepen: (a) expand each stage's compact signals into full parametric
+templates (`needs/params/pit` schema, like §A9); (b) further business lines — asset management (fund
+redemption/flows), Islamic banking (Sharia-compliant profit-rate/Sukuk), payments-as-business (RTP fraud,
+correspondent risk), corporate/SME trade & supply-chain finance (trade-cycle risk, facility utilisation,
+covenant drift). Coverage grows per-domain via curation, not one big freeze.
