@@ -61,7 +61,7 @@ def intent_target_ref(conn, intent_id: str) -> str | None:
 
 def build_considered_set(conn, intent: Intent, client: LLMClient, *, entity: str | None = None,
                          catalog_source: str | None = None, roles=(), target_ref: str | None = None,
-                         now=None) -> ConsideredSet:
+                         feedback: str | None = None, now=None) -> ConsideredSet:
     """Discovery loop → validated alternatives; the anchor is the requester's definition run through the
     same validated loop (definition mode only). Every option shown to the human has passed the gauntlet.
     Persists the intent + target_ref (M6, BLOCKER 2) and the considered-set snapshot (BLOCKER 1) when the
@@ -69,7 +69,7 @@ def build_considered_set(conn, intent: Intent, client: LLMClient, *, entity: str
     persist_intent(conn, intent, target_ref)
     report = recommend_feature_sets_report(
         conn, intent.redacted_hypothesis, client, entity=entity, catalog_source=catalog_source,
-        roles=roles, target_ref=target_ref, now=now)
+        roles=roles, target_ref=target_ref, feedback=feedback, now=now)
     alternatives = report.sets
     anchor: FeatureIdea | None = None
     if intent.intake_mode == "definition":

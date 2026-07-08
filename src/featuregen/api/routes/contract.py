@@ -78,6 +78,8 @@ class ConsideredSetIn(BaseModel):
     catalog_source: str | None = None
     entity: str | None = None
     target_ref: str | None = None
+    feedback: str | None = None   # whole-round human guidance: a feedback round re-runs the considered
+    #                               set under this instruction, minting a FRESH governable intent
 
 
 class DraftReqIn(BaseModel):
@@ -100,7 +102,8 @@ def considered_set(body: ConsideredSetIn, conn: _Conn, identity: _Identity, clie
         raise HTTPException(status_code=422, detail=str(e)) from e
     cs = build_considered_set(
         conn, intent, client, entity=body.entity, catalog_source=body.catalog_source,
-        roles=identity.role_claims, target_ref=body.target_ref, now=datetime.now(UTC))
+        roles=identity.role_claims, target_ref=body.target_ref, feedback=body.feedback,
+        now=datetime.now(UTC))
     return {"intent_id": intent.intent_id, "anchor": cs.anchor,
             "alternatives": cs.alternatives, "recommendation": cs.recommendation,
             "rejections": cs.rejections}

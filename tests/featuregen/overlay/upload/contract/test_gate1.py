@@ -71,6 +71,19 @@ def test_considered_set_carries_gauntlet_rejections(db):
     assert any(r.get("code") == "LEAKAGE" for r in cs.rejections)   # the leaky candidate is surfaced
 
 
+def test_considered_set_threads_feedback(db):
+    # A whole-round feedback re-runs the considered set under the human's instruction and still produces
+    # a valid, governable set (its own intent + persisted snapshot) — this is what makes post-feedback
+    # candidates governable (I2b), lifting the stale-intent guard.
+    _bank(db)
+    intent = submit_intent(hypothesis="customers churn when their balance drops", actor="ds1")
+    cs = build_considered_set(db, intent, _client(), catalog_source="bank",
+                              target_ref="public.accounts.churned",
+                              feedback="focus on behavioral signals", now=NOW)
+    assert cs.intent_id == intent.intent_id
+    assert cs.alternatives            # feedback round still yields a validated, governable set
+
+
 def test_hypothesis_only_has_no_anchor(db):
     _bank(db)
     intent = submit_intent(hypothesis="customers churn when their balance drops", actor="ds1")
