@@ -250,6 +250,8 @@ Types: card (CNP), account-takeover (ATO), application (synthetic-ID), first-par
   high-value transfer to a new beneficiary, mule-pattern outflow. **⚠ the fraudulent txn IS often the
   label → flag.**
 > Note: fraud is **real-time** — `pit` windows are short; features must compute on the live pre-txn state.
+> **Full parametric set:** the 11 grounded recipes implementing this kill-chain are in **§PART H** (the
+> fraud + AML appendix) ↔ `templates.py::FRAUD_TEMPLATES`.
 
 ## B4. AML — the LAUNDERING cycle (typology-driven)
 ```
@@ -264,6 +266,8 @@ feature). Geo/nationality are proxies → AML-permitted but bias-watched.
 - **Integration (clean money returns):** asset purchase, business-income mixing, **TBML** (over/under-
   invoicing), `shortest_path_to_flagged` (proximity to known-bad).
 > Cross-cutting: `zscore_vs_own_history` (out-of-pattern), velocity, network position.
+> **Full parametric set:** the 11 grounded recipes implementing this cycle are in **§PART H** (the
+> fraud + AML appendix) ↔ `templates.py::AML_TEMPLATES`.
 
 ## B5. Cross-sell / CLV — the GROWTH journey (the INVERSE of attrition)
 ```
@@ -692,3 +696,180 @@ contract, `params`→parameter schema, `pit`→trailing-window/state guard, `deg
 `days_past_due_max`, `delinquency_bucket_dynamics`, `stage_migration`, `forbearance_in_window`,
 `sicr_onset`, `dscr_covenant_headroom`. Routing is verified by `test_templates_credit.py` (the family
 grounds nothing on the churn catalog; `ALL_TEMPLATES` on churn yields exactly the churn lens).
+
+---
+
+# PART H — Appendix: fraud + AML full parametric sets (implements §B3 + §B4)
+
+The §B3 **fraud KILL-CHAIN** (11 recipes, `templates.py::FRAUD_TEMPLATES`) and the §B4 **AML LAUNDERING
+cycle** (11 recipes, `templates.py::AML_TEMPLATES`) authored to Part-F/G depth — the recipes the template
+engine grounds; both families join `ALL_TEMPLATES`, which gate1 grounds. Each is groundable by
+concept-matching, safe-by-construction (PIT baked in), and carries a degrade path. Concept names match the
+taxonomy (§3).
+
+**Routing discipline (the load-bearing rule — sharper than §B2's).** Grounding is the router, so a family
+surfaces ONLY where the catalog carries its crime signals. But an *entity* concept (`card_id`,
+`merchant_id`, `counterparty_id`, `alert_id`, `case_id`, `wallet_address`) gets **structural `is_grain`
+credit** in the engine's matcher — it would bind ANY grain column, cross-surfacing the family onto a plain
+churn catalog. So every recipe REQUIRES at least one crime-distinctive **NON-STRUCTURAL** concept — a
+categorical signal (`payment_rail`/`scheme`/`corridor`/`country_code`/`mcc`/`iso20022_purpose_code`/
+`debit_credit_indicator`/`nostro_vostro`), a pii behavioural (`device_fingerprint`/`geolocation`), or a
+screening flag (`pep_flag`/`sanctions_hit_flag`/`adverse_media_flag`/`watchlist_hit_flag`) — that binds
+**only by exact concept match**. This holds the locked invariant, asserted by `test_templates_crime.py` +
+`test_templates_credit.py`: **`ALL_TEMPLATES` grounded on the churn `_CATALOG` yields EXACTLY the churn
+lens** (the churn catalog even carries generic `beneficiary_name`/`beneficiary_bank`, so those are NOT
+sufficient anchors). No recipe ever `Need`s the `fraud_flag` leakage anchor; the engine refuses it by
+construction.
+
+**Leakage / near-label discipline.** A monitoring feature is built from the **BEHAVIOUR** (velocity,
+geo-impossibility, structuring, cash intensity), NEVER from the alert outcome. Fraud recipes are therefore
+NOT near-label (the fraudulent txn *is* often the label, but the velocity/anomaly is observed strictly
+pre-decision). The near-label tail lives in AML: a **screening-exposure** or **prior-alert** recipe borders
+the label → `near_label=True` + a ⚠ note — observe the exposure **strictly before** the alert; a filed SAR
+/ confirmed screening hit is the LABEL, never an input. **PII:** `device_fingerprint`, `geolocation`,
+`pep_flag`, `sanctions_hit_flag`, `adverse_media_flag`, `wallet_address` are pii → read-scoped (need the
+pii role) + consent/purpose/residency. **Proxy:** `corridor`/`country_code` are national-origin proxies
+(fair-lending) — AML-permitted but bias-watched, never a credit input. **Fair-lending:** no recipe binds a
+`protected_attribute` (engine-enforced).
+
+**Fraud is REAL-TIME.** Windows are MINUTES/HOURS (a `window_min` param, NOT a trailing-days `window` — the
+`_{window}d` naming would mis-label minutes as days), computed on the live PRE-transaction state; the
+declaration is design-time (there is no data plane, and a batch trailing-window model cannot honour
+real-time settlement-finality timing). AML windows are trailing DAYS/weeks (typology cadence, a `window`
+param). No data plane enforces either PIT rule — the declaration travels with the candidate.
+
+**Grounding requirements — a "crime-ready" transaction-monitoring catalog needs:**
+| Concept role | Typical column | Required by |
+|---|---|---|
+| `customer_id`/`card_id`/`merchant_id` (grain) | `customers.customer_id` / `cards.card_id` / `merchants.merchant_id` | grain of every feature |
+| `monetary_flow` + `event_timestamp` | `txns.amount` + `.txn_ts` | every velocity / amount / structuring feature |
+| `device_fingerprint` / `geolocation` (pii) | `txns.device_fp` / `.geo` | device_sharing, new_device, geo_velocity_impossible |
+| `payment_rail` / `scheme` | `txns.rail` | card_testing, txn_velocity, cross_rail, first_time_payee, just_under_limit |
+| `mcc` | `txns.mcc` | merchant_risk_anomaly |
+| `corridor` / `country_code` (proxy) | `txns.corridor` | cross_border_burst, high_risk_corridor_exposure |
+| `beneficiary_bank` | `txns.beneficiary_bank` | first_time_payee_high_value, rapid_movement (opt) |
+| `debit_credit_indicator` | `txns.dr_cr` | structuring, rapid_movement, fan_in_fan_out, dormant_reactivation |
+| `iso20022_purpose_code` | `txns.purpose` | cash_intensity_ratio, round_amount_ratio |
+| `counterparty_id` | `txns.counterparty_id` | fan_in_fan_out |
+| `nostro_vostro`/`swift_message_type`/`nested_correspondent_flag` | `correspondent.*` | nested_correspondent_flow |
+| `on_chain_txn`/`wallet_address`/`stablecoin` | `crypto.*` | crypto_offramp_exposure |
+| `pep_flag`/`sanctions_hit_flag`/`adverse_media_flag`/`watchlist_hit_flag` | `kyc.*` | screening_exposure, prior_alert_recidivism |
+| `fraud_flag` (target) | `txns.fraud_flag` | leakage anchor (never a feature input) |
+
+## Fraud — the KILL-CHAIN (`FRAUD_TEMPLATES`)
+
+### RECON / targeting — Stage 1
+1. **`card_testing_velocity`** — count of small-value auths on a card in a short window (validating stolen
+   cards). **needs:** `payment_rail` · `card_id` · `monetary_flow` · `event_timestamp`. **params:**
+   `window_min∈{60,15,1440}` · `amount_pctile∈{10,5,25}`. **add:** additive. **explain:** H. **degrade:**
+   no card rail/grain → **skip**. *anchor `payment_rail`.*
+2. **`device_sharing_velocity`** — one `device_fingerprint` across an abnormal number of distinct
+   customers/accounts (synthetic-ID / credential-stuffing ring). **needs:** `device_fingerprint` (pii) ·
+   `event_timestamp` · `customer_id`. **add:** non_additive. **explain:** M. *anchor `device_fingerprint`
+   (pii — needs the pii role).*
+
+### ACCESS / TAKEOVER — Stage 2
+3. **`new_device_flag`** — first-seen `device_fingerprint` for this entity (ATO access marker). **needs:**
+   `device_fingerprint` (pii) · `event_timestamp` · `customer_id`. **add:** n/a. **explain:** H.
+4. **`geo_velocity_impossible`** — impossible travel: two txns farther apart than physical travel allows
+   in the elapsed time. **needs:** `geolocation` (pii) · `event_timestamp` · `customer_id`. **params:**
+   `measure∈{impossible_flag,max_implied_kmh}`. **add:** n/a. **explain:** M. **derived:** `implied_kmh :=
+   haversine/Δt` downstream.
+
+### SETUP / STAGING — Stage 3
+5. **`first_time_payee_high_value`** — high-value payment to a `beneficiary_bank` not previously paid
+   (mule staging). **needs:** `payment_rail` · `beneficiary_bank` · `monetary_flow` · `event_timestamp` ·
+   `customer_id`. **params:** `amount_pctile∈{95,90,99}`. **add:** n/a. **explain:** H. *anchor
+   `payment_rail` — `beneficiary_bank` alone exists on a churn catalog, so it can't be the sole anchor.*
+6. **`merchant_risk_anomaly`** — off-pattern MCC / first-seen merchant. **needs:** `mcc` · `merchant_id` ·
+   `monetary_flow` · `event_timestamp`. **params:** `measure∈{high_risk_mcc_share,novel_merchant_flag}`.
+   **add:** non_additive (share; the flag is n/a). **explain:** M. *anchor `mcc`.*
+
+### CASH-OUT — Stage 4 (built from behaviour, NOT the `fraud_flag`)
+7. **`txn_velocity_spike`** — count/amount in a short window vs the entity's own baseline. **needs:**
+   `payment_rail` · `card_id` · `monetary_flow` · `event_timestamp`. **params:**
+   `baseline∈{prior_equal_window,own_history}` · `measure∈{count_ratio,amount_ratio}`. **add:**
+   non_additive (velocity ratio). **explain:** H.
+8. **`amount_zscore_spike`** — z-score of an amount vs the entity's own mean/std. **needs:**
+   `payment_rail` · `card_id` · `monetary_flow` · `event_timestamp`. **add:** n/a. **explain:** M.
+9. **`cross_channel_rail_anomaly`** — first use of a `payment_rail`/`scheme` the entity never uses.
+   **needs:** `payment_rail` · `scheme` (opt) · `event_timestamp` · `customer_id`. **add:** n/a.
+10. **`cross_border_burst`** — short-window count of payments into new/high-risk corridors. **needs:**
+    `corridor` · `country_code` (opt) · `event_timestamp` · `customer_id`. **add:** additive (count).
+    *anchor `corridor` (proxy — bias-watched).*
+11. **`amount_just_under_limit`** — share of payments just below a rail's reporting/SCA threshold. **needs:**
+    `payment_rail` · `monetary_flow` · `event_timestamp` · `customer_id`. **params:** `band_pct∈{5,2,10}`.
+    **add:** non_additive (share). **explain:** H.
+
+## AML — the LAUNDERING cycle (`AML_TEMPLATES`, typology-driven)
+
+### PLACEMENT (dirty money enters)
+1. **`structuring_smurfing`** — count of sub-threshold CREDITS just below a reporting threshold (smurfing).
+   **needs:** `debit_credit_indicator` · `iso20022_purpose_code` (opt) · `monetary_flow` ·
+   `event_timestamp` · `customer_id`. **params:** `window∈{30,7,90}` · `band_pct∈{10,5,20}`. **add:**
+   additive (count). **explain:** H. *anchor `debit_credit_indicator`.*
+2. **`cash_intensity_ratio`** — share of inflow value carrying a CASH `iso20022_purpose_code`. **needs:**
+   `iso20022_purpose_code` · `monetary_flow` · `event_timestamp` · `customer_id`. **params:**
+   `measure∈{value_share,count_share}`. **add:** non_additive (share). **explain:** H.
+
+### LAYERING (obscure the trail)
+3. **`rapid_movement_passthrough`** — inflow ≈ outflow within a short dwell (pass-through / funnel).
+   **needs:** `debit_credit_indicator` · `beneficiary_bank` (opt) · `monetary_flow` · `event_timestamp` ·
+   `customer_id`. **params:** `measure∈{in_out_ratio,dwell_hours}`. **add:** non_additive. **explain:** H.
+4. **`round_amount_ratio`** — share of suspiciously round (whole-thousand) amounts. **needs:**
+   `iso20022_purpose_code` · `monetary_flow` · `event_timestamp` · `customer_id`. **params:**
+   `round_base∈{1000,100,500}`. **add:** non_additive (share). **explain:** H. **derived:** `is_round :=
+   amount mod {round_base} == 0`.
+5. **`fan_in_fan_out`** — abnormal number of distinct counterparties in→out (mule ring / network hub).
+   **needs:** `counterparty_id` · `debit_credit_indicator` · `beneficiary_name` (opt, pii) ·
+   `event_timestamp` · `customer_id`. **params:** `measure∈{fan_in_degree,fan_out_degree,fan_ratio}`.
+   **add:** non_additive (degree). **explain:** M. *anchor `debit_credit_indicator` — `counterparty_id` is
+   an ENTITY concept (would structurally bind any grain), so it can't be the sole anchor.*
+6. **`high_risk_corridor_exposure`** — value/share of cross-border flow into high-risk corridors. **needs:**
+   `corridor` · `country_code` (opt) · `monetary_flow` · `event_timestamp` · `customer_id`. **params:**
+   `measure∈{value_share,amount}`. **add:** non_additive (share; amount=additive). **explain:** H. *anchor
+   `corridor` (proxy — bias-watched).*
+7. **`nested_correspondent_flow`** — payments cleared via a nested downstream correspondent (FATF/Wolfsberg
+   visibility-gap typology). **needs:** `nostro_vostro` · `nested_correspondent_flag` (opt) ·
+   `swift_message_type` (opt) · `monetary_flow` · `event_timestamp`. **params:**
+   `measure∈{nested_share,occurred_flag}`. **add:** n/a. **explain:** M. **degrade:** no correspondent data
+   → **skip**.
+8. **`crypto_offramp_exposure`** — share of flow crossing into on-chain wallets / stablecoins (fiat↔crypto
+   ramps). **needs:** `on_chain_txn` · `wallet_address` (opt, pii) · `stablecoin` (opt) · `monetary_flow` ·
+   `event_timestamp` · `customer_id`. **add:** non_additive (share; count=additive). **explain:** M.
+   *`wallet_address` is FATF travel-rule PERSONAL data — read-scoped when bound.*
+
+### INTEGRATION (clean money returns) + cross-cutting screening
+9. **`dormant_reactivation`** — long-dormant account suddenly receiving large credits (parked mule/shell).
+   **needs:** `debit_credit_indicator` · `monetary_flow` · `event_timestamp` · `customer_id`. **params:**
+   `dormancy_days∈{90,60,180}`. **add:** n/a. **explain:** H. **derived:** `is_reactivation := no activity
+   ≥{dormancy_days}d then a large credit`.
+10. **`screening_exposure`** ⚠ **near-label** — PEP/sanctions/adverse-media exposure over the customer +
+    counterparties. **needs:** `pep_flag` (pii) · `sanctions_hit_flag` (opt) · `adverse_media_flag` (opt) ·
+    `watchlist_hit_flag` (opt) · `customer_id`. **params:** `measure∈{exposed_flag,exposure_share}`.
+    **add:** n/a. **explain:** H. **⚠ near-label + PII:** observe strictly pre-alert; a filed SAR /
+    confirmed hit is the LABEL, never an input; read-scoped (pii role).
+11. **`prior_alert_recidivism`** ⚠ **near-label** — count/recency of PRIOR monitoring alerts that hit a
+    watchlist on this entity. **needs:** `watchlist_hit_flag` · `alert_id` (opt) · `case_id` (opt) ·
+    `event_timestamp` · `customer_id`. **params:** `measure∈{prior_alert_count,days_since_last}`. **add:**
+    additive (count). **explain:** M. **⚠ near-label:** only the FACT/TIMING of a prior alert — the
+    SAR/filing OUTCOME is never an input. *anchor `watchlist_hit_flag` — `alert_id`/`case_id` are ENTITY
+    concepts (would structurally bind any grain), so they are optional, not the routing anchor.*
+
+**Concept substitutions (vs the §B3/§B4 designs).** None invented — every `Need` binds a real §3 concept.
+Notable design-forced choices, noted on each template: (a) fraud windows use a `window_min` param (not
+`window`) so the engine's `_{window}d` naming does not mis-label minutes as days; (b) recipes whose natural
+signal is an *entity* concept (`card_testing`/`txn_velocity`/`merchant_risk`/`fan_in_fan_out`/
+`prior_alert_recidivism`) additionally REQUIRE a non-structural anchor (`payment_rail`/`mcc`/
+`debit_credit_indicator`/`watchlist_hit_flag`) to route correctly; (c) `merchant_risk_anomaly` anchors on
+`mcc` (the §B3 "MCC-anomaly" signal) rather than a bare `merchant_id`; (d) `dormant_reactivation` anchors on
+`debit_credit_indicator` (to see the inbound credit) because bare dormancy is generic event/entity and would
+cross-surface.
+
+**Build note (B3/B4).** These 22 map 1:1 to the `templates.py` model exactly like §PART F/G — `needs`→
+grounding contract, `params`→parameter schema, `pit`→trailing-window/real-time guard, `degrade`→fallback,
+`near_label`→the 3-part leakage flag. The near-label subset the golden set must exercise: `screening_exposure`,
+`prior_alert_recidivism`. Routing + safety are verified by `test_templates_crime.py`: both families ground a
+healthy subset of a crime-shaped catalog (with the pii role for the pii-anchored recipes), the engine NEVER
+binds `fraud_flag` or a protected column, and neither family grounds anything on the churn catalog
+(`ALL_TEMPLATES` on churn still yields exactly the churn lens).

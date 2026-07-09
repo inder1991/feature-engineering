@@ -870,12 +870,519 @@ CREDIT_RISK_TEMPLATES: tuple[Template, ...] = (
 
 
 # ──────────────────────────────────────────────────────────────────────────────────────────────────
+# The fraud templates — the §B3 KILL-CHAIN authored to Part-F depth (Phase-3 Pass-2).
+#
+# Kill-chain (§B3): RECON → ACCESS/TAKEOVER → SETUP/STAGING → CASH-OUT ⚠. Fraud is REAL-TIME: windows are
+# MINUTES/HOURS (a ``window_min`` param, NEVER a trailing-days ``window`` — the ``_{window}d`` naming
+# convention would mis-label minutes as days), computed on the live PRE-transaction state. Two authoring
+# disciplines are load-bearing (mirroring credit_risk):
+#   • ROUTING — every recipe REQUIRES at least one crime-distinctive, NON-STRUCTURAL concept (a categorical
+#     signal like payment_rail / corridor / mcc, or a pii behavioural like device_fingerprint / geolocation
+#     — NOT an entity/as_of concept, which the engine's structural is_grain/is_as_of scoring would bind onto
+#     ANY grain/as-of column, cross-surfacing the family). Grounding is the router: the family surfaces ONLY
+#     where the catalog carries these fraud signals; a churn catalog with only generic monetary_flow +
+#     event_timestamp + customer_id grounds NOTHING here (the locked invariant asserted by the credit +
+#     crime routing tests: ALL_TEMPLATES on the churn _CATALOG = EXACTLY the churn lens).
+#   • LEAKAGE — a monitoring feature is built from the BEHAVIOUR (velocity, geo-impossibility, structuring),
+#     NEVER from the alert outcome. No recipe Needs the fraud_flag leakage anchor (the engine refuses it by
+#     construction). Fair-lending: no recipe binds a protected_attribute (engine-enforced); corridor /
+#     country_code are national-origin PROXIES — flagged.
+# The Part-H appendix in docs/…/2026-07-08-banking-feature-template-library.md is the doc source of record.
+# ──────────────────────────────────────────────────────────────────────────────────────────────────
+_FRAUD_PIT_REALTIME = (
+    "real-time trailing window (t − {window_min}min, t] computed on the live PRE-transaction state — "
+    "values knowable STRICTLY before the authorization/decision point, never after. DESIGN-TIME "
+    "declaration: there is NO data plane; a batch trailing-window model cannot honour real-time "
+    "settlement-finality timing (§B3 — fraud is real-time).")
+_PII_ONLINE_ELIGIBILITY = (
+    "⚠ PII: an online identifier (device_fingerprint / precise geolocation) is GDPR personal data — "
+    "read-scoped (needs the pii role); consent / purpose / residency REQUIRED.")
+_CORRIDOR_PROXY = ("⚠ corridor / country_code are national-origin PROXIES (fair-lending) — proxy-flagged; "
+                   "AML-permitted but bias-watched, NEVER a credit input.")
+_FRAUD_BEHAVIOUR = "built from transaction BEHAVIOUR, never the fraud outcome (fraud_flag is a leakage anchor)."
+
+FRAUD_TEMPLATES: tuple[Template, ...] = (
+    # ── RECON / targeting (§B3 Stage 1) ─────────────────────────────────────────────────────────────
+    # F.1 — card_testing_velocity (validating stolen card numbers)
+    Template(
+        id="card_testing_velocity", family="recon_targeting",
+        intent="Card-testing — a burst of many small-value authorizations on one card in a short window "
+               "(a fraudster validating stolen card numbers before the real cash-out).",
+        needs=(Need("rail", "payment_rail"), Need("card", "card_id"),
+               Need("flow_col", "monetary_flow"), Need("event_ts", "event_timestamp")),
+        params={"window_min": (60, 15, 1440), "amount_pctile": (10, 5, 25)},
+        aggregation="card_testing_count", additivity="additive", explain="H",
+        use_cases=("fraud", "card_fraud", "transaction_monitoring", "financial_crime"),
+        pit=_FRAUD_PIT_REALTIME,
+        degrade="no card rail / card grain -> SKIP (this is a card-present/CNP pattern).",
+        stage="1-recon",
+        eligibility=_FRAUD_BEHAVIOUR,
+        derived=("is_small := amount ≤ {amount_pctile}th pctile of the card's own auth history — computed "
+                 "DOWNSTREAM (no data plane).",),
+        notes=("anchor: 'payment_rail' (crime-distinctive, non-structural) routes this off a churn catalog.",
+               "a count of small auths — additive."),
+    ),
+    # F.2 — device_sharing_velocity (synthetic-ID / credential-stuffing ring)
+    Template(
+        id="device_sharing_velocity", family="recon_targeting",
+        intent="Synthetic-ID / credential-stuffing recon — one device_fingerprint transacting across an "
+               "abnormal number of distinct customers/accounts in a window (a shared-device ring).",
+        needs=(Need("device", "device_fingerprint"), Need("event_ts", "event_timestamp"),
+               Need("entity", "customer_id")),
+        params={"window_min": (1440, 60, 10080)},
+        aggregation="device_sharing_velocity", additivity="non_additive", explain="M",
+        use_cases=("fraud", "account_takeover", "synthetic_id", "transaction_monitoring", "financial_crime"),
+        pit=_FRAUD_PIT_REALTIME,
+        degrade="no device_fingerprint -> SKIP.",
+        stage="1-recon",
+        eligibility=_PII_ONLINE_ELIGIBILITY + " " + _FRAUD_BEHAVIOUR,
+        notes=("anchor: 'device_fingerprint' (crime-distinctive, pii, non-structural) routes this off a "
+               "churn catalog and needs the pii role.",
+               "a distinct-account-per-device velocity — non-additive; compute per device, never sum."),
+    ),
+    # ── ACCESS / TAKEOVER (§B3 Stage 2) ─────────────────────────────────────────────────────────────
+    # F.3 — new_device_flag (novel device for this entity)
+    Template(
+        id="new_device_flag", family="access_takeover",
+        intent="Novel-device / device-change — this entity is transacting from a device_fingerprint not "
+               "seen in its trailing history (an account-takeover access marker).",
+        needs=(Need("device", "device_fingerprint"), Need("event_ts", "event_timestamp"),
+               Need("entity", "customer_id")),
+        params={"window_min": (43200, 10080, 129600)},
+        aggregation="new_device_flag", additivity="n/a", explain="H",
+        use_cases=("fraud", "account_takeover", "transaction_monitoring", "financial_crime"),
+        pit=_FRAUD_PIT_REALTIME,
+        degrade="no device_fingerprint -> SKIP.",
+        stage="2-access-takeover",
+        eligibility=_PII_ONLINE_ELIGIBILITY + " " + _FRAUD_BEHAVIOUR,
+        notes=("anchor: 'device_fingerprint' (crime-distinctive, pii, non-structural).",
+               "first-seen device for this entity — a flag; n/a."),
+    ),
+    # F.4 — geo_velocity_impossible (impossible travel)
+    Template(
+        id="geo_velocity_impossible", family="access_takeover",
+        intent="Impossible travel — two transactions whose geolocations are farther apart than any "
+               "physical travel could cover in the elapsed time (a classic account-takeover signal).",
+        needs=(Need("geo", "geolocation"), Need("event_ts", "event_timestamp"),
+               Need("entity", "customer_id")),
+        params={"window_min": (720, 60, 1440), "measure": ("impossible_flag", "max_implied_kmh")},
+        aggregation="geo_velocity", additivity="n/a", explain="M",
+        use_cases=("fraud", "account_takeover", "transaction_monitoring", "financial_crime"),
+        pit=_FRAUD_PIT_REALTIME,
+        degrade="no geolocation -> SKIP; a coarse country-hop is a weaker fallback (FLAG).",
+        stage="2-access-takeover",
+        eligibility=_PII_ONLINE_ELIGIBILITY + " " + _FRAUD_BEHAVIOUR,
+        derived=("implied_kmh := haversine(geo_i, geo_j) / Δt between consecutive txns — computed "
+                 "DOWNSTREAM (no data plane); impossible_flag := implied_kmh > a plausible_max.",),
+        notes=("anchor: 'geolocation' (crime-distinctive, pii, non-structural) routes this off a churn "
+               "catalog and needs the pii role.",
+               "a flag / max implied speed — n/a (not summable)."),
+    ),
+    # ── SETUP / STAGING (§B3 Stage 3) ───────────────────────────────────────────────────────────────
+    # F.5 — first_time_payee_high_value (mule-account staging)
+    Template(
+        id="first_time_payee_high_value", family="setup_staging",
+        intent="A high-value payment to a FIRST-TIME payee (a beneficiary_bank not previously paid) — the "
+               "mule-account staging move (payee added, then drained).",
+        needs=(Need("rail", "payment_rail"), Need("beneficiary_bank", "beneficiary_bank"),
+               Need("flow_col", "monetary_flow"), Need("event_ts", "event_timestamp"),
+               Need("entity", "customer_id")),
+        params={"window_min": (1440, 60, 10080), "amount_pctile": (95, 90, 99)},
+        aggregation="first_time_payee_high_value", additivity="n/a", explain="H",
+        use_cases=("fraud", "app_scam", "authorised_push_payment", "transaction_monitoring",
+                   "financial_crime"),
+        pit=_FRAUD_PIT_REALTIME,
+        degrade="no payment rail -> SKIP; without beneficiary history the 'first-time' test degrades to "
+                "'high-value payment' only (weaker + FLAGGED).",
+        stage="3-setup-staging",
+        eligibility=_FRAUD_BEHAVIOUR,
+        derived=("is_first_time_payee := beneficiary_bank not in the entity's prior-paid set — computed "
+                 "DOWNSTREAM (no data plane).",),
+        notes=("anchor: 'payment_rail' (crime-distinctive, non-structural) routes this off a churn catalog "
+               "(beneficiary_bank ALSO exists on a churn catalog, so it cannot be the sole anchor).",
+               "high-value ≈ above the {amount_pctile}th pctile of the entity's own history; a flag — n/a."),
+    ),
+    # F.6 — merchant_risk_anomaly (high-risk / novel MCC)
+    Template(
+        id="merchant_risk_anomaly", family="setup_staging",
+        intent="Spending anomaly at a high-risk / novel merchant category — an off-pattern MCC or a "
+               "first-seen merchant for this entity (card-fraud staging / testing the waters).",
+        needs=(Need("mcc", "mcc"), Need("merchant", "merchant_id"),
+               Need("flow_col", "monetary_flow"), Need("event_ts", "event_timestamp")),
+        params={"window_min": (1440, 60, 10080), "measure": ("high_risk_mcc_share", "novel_merchant_flag")},
+        aggregation="merchant_risk_anomaly", additivity="non_additive", explain="M",
+        use_cases=("fraud", "card_fraud", "transaction_monitoring", "financial_crime"),
+        pit=_FRAUD_PIT_REALTIME,
+        degrade="no mcc -> SKIP; a merchant_id-only novelty flag is a weaker fallback.",
+        stage="3-setup-staging",
+        eligibility=_FRAUD_BEHAVIOUR,
+        notes=("anchor: 'mcc' (crime-distinctive, non-structural) routes this off a churn catalog.",
+               "OUTPUT additivity is measure-dependent: high_risk_mcc_share is a non-additive ratio; "
+               "novel_merchant_flag is n/a — the default carries the ratio case."),
+    ),
+    # ── CASH-OUT (§B3 Stage 4) — built from behaviour, NOT the fraud outcome ─────────────────────────
+    # F.7 — txn_velocity_spike (the cash-out ramp)
+    Template(
+        id="txn_velocity_spike", family="cash_out",
+        intent="Transaction-velocity spike — count (or amount) of transactions in a short window vs the "
+               "entity's own trailing baseline; a sudden ramp is the cash-out signature.",
+        needs=(Need("rail", "payment_rail"), Need("card", "card_id"),
+               Need("flow_col", "monetary_flow"), Need("event_ts", "event_timestamp")),
+        params={"window_min": (60, 15, 1440), "baseline": ("prior_equal_window", "own_history"),
+                "measure": ("count_ratio", "amount_ratio")},
+        aggregation="txn_velocity_spike", additivity="non_additive", explain="H",
+        use_cases=("fraud", "card_fraud", "account_takeover", "transaction_monitoring", "financial_crime"),
+        pit=_FRAUD_PIT_REALTIME,
+        degrade="no card rail / card grain -> anchor on customer_id + payment_rail (account-level velocity).",
+        stage="4-cash-out",
+        eligibility=_FRAUD_BEHAVIOUR,
+        notes=("anchor: 'payment_rail' (crime-distinctive, non-structural) routes this off a churn catalog.",
+               "a velocity RATIO (recent vs baseline) — non-additive; compute per entity, never sum."),
+    ),
+    # F.8 — amount_zscore_spike (out-of-pattern high-value drain)
+    Template(
+        id="amount_zscore_spike", family="cash_out",
+        intent="Amount anomaly — z-score of a transaction amount vs the entity's own trailing mean/std; a "
+               "large positive z is an out-of-pattern high-value drain.",
+        needs=(Need("rail", "payment_rail"), Need("card", "card_id"),
+               Need("flow_col", "monetary_flow"), Need("event_ts", "event_timestamp")),
+        params={"window_min": (43200, 10080, 129600)},
+        aggregation="amount_zscore", additivity="n/a", explain="M",
+        use_cases=("fraud", "card_fraud", "transaction_monitoring", "financial_crime"),
+        pit=_FRAUD_PIT_REALTIME,
+        degrade="no card rail / card grain -> compute at customer_id grain.",
+        stage="4-cash-out",
+        eligibility=_FRAUD_BEHAVIOUR,
+        derived=("amount_z := (amount − rolling_mean) / rolling_std over the entity's own history — "
+                 "computed DOWNSTREAM (no data plane).",),
+        notes=("anchor: 'payment_rail' (crime-distinctive, non-structural) routes this off a churn catalog.",
+               "a z-score — n/a (not summable)."),
+    ),
+    # F.9 — cross_channel_rail_anomaly (first use of an unusual rail)
+    Template(
+        id="cross_channel_rail_anomaly", family="cash_out",
+        intent="Cross-channel / cross-rail anomaly — the entity suddenly using a payment_rail (or scheme) "
+               "it never uses (e.g. first CHAPS/wire after only card spend) at cash-out.",
+        needs=(Need("rail", "payment_rail"), Need("scheme", "scheme", optional=True),
+               Need("event_ts", "event_timestamp"), Need("entity", "customer_id")),
+        params={"window_min": (1440, 60, 10080)},
+        aggregation="cross_rail_anomaly", additivity="n/a", explain="H",
+        use_cases=("fraud", "account_takeover", "transaction_monitoring", "financial_crime"),
+        pit=_FRAUD_PIT_REALTIME,
+        degrade="no payment rail -> SKIP.",
+        stage="4-cash-out",
+        eligibility=_FRAUD_BEHAVIOUR,
+        notes=("anchor: 'payment_rail' (crime-distinctive, non-structural) routes this off a churn catalog.",
+               "a first-seen-rail flag — n/a."),
+    ),
+    # F.10 — cross_border_burst (rapid offshore movement)
+    Template(
+        id="cross_border_burst", family="cash_out",
+        intent="Cross-border burst — a short-window count of payments into new/high-risk corridors "
+               "(rapid offshore movement of the drained funds).",
+        needs=(Need("corridor", "corridor"), Need("country", "country_code", optional=True),
+               Need("event_ts", "event_timestamp"), Need("entity", "customer_id")),
+        params={"window_min": (1440, 60, 10080)},
+        aggregation="cross_border_burst", additivity="additive", explain="H",
+        use_cases=("fraud", "aml", "transaction_monitoring", "financial_crime"),
+        pit=_FRAUD_PIT_REALTIME,
+        degrade="no corridor -> SKIP.",
+        stage="4-cash-out",
+        eligibility=_CORRIDOR_PROXY + " " + _FRAUD_BEHAVIOUR,
+        notes=("anchor: 'corridor' (crime-distinctive, non-structural) routes this off a churn catalog.",
+               "a count of cross-border txns in the burst window — additive."),
+    ),
+    # F.11 — amount_just_under_limit (structuring at authorization)
+    Template(
+        id="amount_just_under_limit", family="cash_out",
+        intent="Just-under-limit structuring at authorization — the share of payments sitting just below a "
+               "reporting / step-up / SCA threshold on a rail (deliberately dodging a control).",
+        needs=(Need("rail", "payment_rail"), Need("flow_col", "monetary_flow"),
+               Need("event_ts", "event_timestamp"), Need("entity", "customer_id")),
+        params={"window_min": (10080, 1440, 43200), "band_pct": (5, 2, 10)},
+        aggregation="just_under_limit_share", additivity="non_additive", explain="H",
+        use_cases=("fraud", "aml", "structuring", "transaction_monitoring", "financial_crime"),
+        pit=_FRAUD_PIT_REALTIME,
+        degrade="no payment rail (so no per-rail threshold) -> SKIP.",
+        stage="4-cash-out",
+        eligibility=_FRAUD_BEHAVIOUR,
+        derived=("is_just_under := threshold × (1 − {band_pct}%) ≤ amount < threshold, per the rail's "
+                 "reporting/SCA limit — computed DOWNSTREAM (no data plane).",),
+        notes=("anchor: 'payment_rail' (crime-distinctive, non-structural) — the rail defines the limit.",
+               "a share/ratio — non-additive; compute per entity, never sum."),
+    ),
+)
+
+
+# ──────────────────────────────────────────────────────────────────────────────────────────────────
+# The AML templates — the §B4 LAUNDERING cycle authored to Part-F depth, typology-driven (Phase-3 Pass-2).
+#
+# Cycle (§B4): PLACEMENT → LAYERING → INTEGRATION. Labels are SARs (suspicion, not proof) — a filed SAR /
+# screening hit is NEAR-LABEL. AML windows are trailing DAYS/weeks (typology cadence, a ``window`` param).
+# Same two disciplines as fraud/credit:
+#   • ROUTING — every recipe REQUIRES a crime-distinctive, NON-STRUCTURAL concept (debit_credit_indicator /
+#     iso20022_purpose_code / corridor / nostro_vostro / on_chain_txn / pep_flag / watchlist_hit_flag —
+#     NEVER an entity concept like counterparty_id / alert_id / case_id, which the engine's structural
+#     is_grain scoring would bind onto any grain column). Grounding is the router; a churn catalog grounds
+#     NOTHING here (the locked invariant: ALL_TEMPLATES on the churn _CATALOG = exactly the churn lens).
+#   • LEAKAGE / NEAR-LABEL — a screening-exposure or prior-alert recipe BORDERS the label: near_label=True +
+#     a ⚠ note (observe strictly BEFORE the alert; the SAR/filing OUTCOME is never an input). PII: pep /
+#     sanctions / adverse-media are read-scoped (pii role). Proxy: corridor / country_code are flagged.
+# The Part-H appendix in docs/…/2026-07-08-banking-feature-template-library.md is the doc source of record.
+# ──────────────────────────────────────────────────────────────────────────────────────────────────
+_AML_PIT_TRAILING = (
+    "trailing typology window (as_of − {window}, as_of], observed STRICTLY ≤ as_of; never forward. "
+    "DESIGN-TIME declaration — no data plane enforces runtime PIT.")
+_AML_NEAR_LABEL_PREFIX = (
+    "⚠ NEAR-LABEL: observe the exposure STRICTLY before the alert/label — the screening hit / filed SAR "
+    "OUTCOME is NEVER an input (window ≠ the label window); the 3-part leakage control must FLAG it. ")
+_SCREENING_PII = ("⚠ PII: pep / sanctions / adverse-media screening data is read-scoped (needs the pii "
+                  "role) under an AML lawful basis; residency + purpose gated.")
+_AML_BEHAVIOUR = "built from transaction BEHAVIOUR, never a SAR/alert outcome."
+
+AML_TEMPLATES: tuple[Template, ...] = (
+    # ── PLACEMENT (dirty money enters) ──────────────────────────────────────────────────────────────
+    # A.1 — structuring_smurfing (sub-threshold deposits)
+    Template(
+        id="structuring_smurfing", family="placement",
+        intent="Structuring / smurfing — a count of sub-threshold CREDITS (cash-ins / deposits) that sit "
+               "just below a reporting threshold, deliberately fragmenting a larger sum.",
+        needs=(Need("direction", "debit_credit_indicator"),
+               Need("purpose", "iso20022_purpose_code", optional=True),
+               Need("flow_col", "monetary_flow"), Need("event_ts", "event_timestamp"),
+               Need("entity", "customer_id")),
+        params={"window": (30, 7, 90), "band_pct": (10, 5, 20)},
+        aggregation="structuring_count", additivity="additive", explain="H",
+        use_cases=("aml", "structuring", "transaction_monitoring", "financial_crime"),
+        pit=_AML_PIT_TRAILING,
+        degrade="no dr/cr indicator -> infer credit direction from the amount sign (declared derivation "
+                "§D.8; FLAG). No cash purpose code -> count all sub-threshold credits (noisier).",
+        stage="placement",
+        eligibility=_AML_BEHAVIOUR,
+        derived=("is_sub_threshold := threshold × (1 − {band_pct}%) ≤ amount < threshold, over credits — "
+                 "computed DOWNSTREAM (no data plane).",),
+        notes=("anchor: 'debit_credit_indicator' (crime-distinctive, non-structural) routes this off a "
+               "churn catalog (the churn fixture deliberately omits dr/cr).",
+               "a count of sub-threshold deposits — additive."),
+    ),
+    # A.2 — cash_intensity_ratio (cash placement)
+    Template(
+        id="cash_intensity_ratio", family="placement",
+        intent="Cash intensity — the share of a customer's inflow value carrying a CASH purpose code "
+               "(ATM/branch cash-in) vs total credits; high cash intensity is a placement red flag.",
+        needs=(Need("purpose", "iso20022_purpose_code"), Need("flow_col", "monetary_flow"),
+               Need("event_ts", "event_timestamp"), Need("entity", "customer_id")),
+        params={"window": (90, 30, 180), "measure": ("value_share", "count_share")},
+        aggregation="cash_intensity", additivity="non_additive", explain="H",
+        use_cases=("aml", "transaction_monitoring", "financial_crime"),
+        pit=_AML_PIT_TRAILING,
+        degrade="no purpose code -> derive a cash proxy from channel/category (declared derivation §D.8; "
+                "FLAG).",
+        stage="placement",
+        eligibility=_AML_BEHAVIOUR,
+        notes=("anchor: 'iso20022_purpose_code' (crime-distinctive, non-structural) routes this off a "
+               "churn catalog.",
+               "a share/ratio — non-additive; compute per entity, never sum."),
+    ),
+    # ── LAYERING (obscure the trail) ────────────────────────────────────────────────────────────────
+    # A.3 — rapid_movement_passthrough (in ≈ out, short dwell)
+    Template(
+        id="rapid_movement_passthrough", family="layering",
+        intent="Rapid movement of funds / pass-through — inflow ≈ outflow within a short dwell time (money "
+               "in then straight out); a funnel/mule pass-through account.",
+        needs=(Need("direction", "debit_credit_indicator"),
+               Need("beneficiary_bank", "beneficiary_bank", optional=True),
+               Need("flow_col", "monetary_flow"), Need("event_ts", "event_timestamp"),
+               Need("entity", "customer_id")),
+        params={"window": (7, 1, 30), "measure": ("in_out_ratio", "dwell_hours")},
+        aggregation="rapid_movement", additivity="non_additive", explain="H",
+        use_cases=("aml", "transaction_monitoring", "financial_crime"),
+        pit=_AML_PIT_TRAILING,
+        degrade="no dr/cr indicator -> infer direction from amount sign (declared derivation §D.8; FLAG).",
+        stage="layering",
+        eligibility=_AML_BEHAVIOUR,
+        notes=("anchor: 'debit_credit_indicator' (crime-distinctive, non-structural) routes this off a "
+               "churn catalog.",
+               "an in/out ratio (or dwell time) — non-additive; compute per entity, never sum."),
+    ),
+    # A.4 — round_amount_ratio (manufactured layering flows)
+    Template(
+        id="round_amount_ratio", family="layering",
+        intent="Round-amount ratio — the share of a customer's payments that are suspiciously round "
+               "(whole thousands) vs organic amounts; round numbers signal manufactured layering flows.",
+        needs=(Need("purpose", "iso20022_purpose_code"), Need("flow_col", "monetary_flow"),
+               Need("event_ts", "event_timestamp"), Need("entity", "customer_id")),
+        params={"window": (90, 30, 180), "round_base": (1000, 100, 500)},
+        aggregation="round_amount_ratio", additivity="non_additive", explain="H",
+        use_cases=("aml", "transaction_monitoring", "financial_crime"),
+        pit=_AML_PIT_TRAILING,
+        degrade="",
+        stage="layering",
+        eligibility=_AML_BEHAVIOUR,
+        derived=("is_round := amount mod {round_base} == 0 — computed DOWNSTREAM (no data plane).",),
+        notes=("anchor: 'iso20022_purpose_code' (crime-distinctive, non-structural) — the payment-context "
+               "anchor that routes this off a churn catalog.",
+               "a share/ratio — non-additive; compute per entity, never sum."),
+    ),
+    # A.5 — fan_in_fan_out (mule ring / smurfing network hub)
+    Template(
+        id="fan_in_fan_out", family="layering",
+        intent="Fan-in / fan-out — an abnormal number of distinct counterparties paying INTO then OUT OF "
+               "an account in a window (a mule ring / smurfing network hub).",
+        needs=(Need("counterparty", "counterparty_id"), Need("direction", "debit_credit_indicator"),
+               Need("beneficiary_name", "beneficiary_name", optional=True),
+               Need("event_ts", "event_timestamp"), Need("entity", "customer_id")),
+        params={"window": (30, 7, 90), "measure": ("fan_in_degree", "fan_out_degree", "fan_ratio")},
+        aggregation="fan_in_fan_out", additivity="non_additive", explain="M",
+        use_cases=("aml", "transaction_monitoring", "financial_crime"),
+        pit=_AML_PIT_TRAILING,
+        degrade="no counterparty id -> approximate degree from distinct beneficiary_name (PII; FLAG).",
+        stage="layering",
+        eligibility=_AML_BEHAVIOUR,
+        notes=("anchor: 'debit_credit_indicator' (crime-distinctive, non-structural) routes this off a "
+               "churn catalog (counterparty_id is an ENTITY concept — it would structurally bind ANY "
+               "grain column, so it cannot be the sole routing anchor).",
+               "a distinct-counterparty degree/ratio — non-additive."),
+    ),
+    # A.6 — high_risk_corridor_exposure (cross-border layering)
+    Template(
+        id="high_risk_corridor_exposure", family="layering",
+        intent="High-risk-corridor exposure — the value (or share) of a customer's cross-border flow into "
+               "high-risk / sanctioned corridors over the window.",
+        needs=(Need("corridor", "corridor"), Need("country", "country_code", optional=True),
+               Need("flow_col", "monetary_flow"), Need("event_ts", "event_timestamp"),
+               Need("entity", "customer_id")),
+        params={"window": (90, 30, 180), "measure": ("value_share", "amount")},
+        aggregation="high_risk_corridor", additivity="non_additive", explain="H",
+        use_cases=("aml", "sanctions", "transaction_monitoring", "financial_crime"),
+        pit=_AML_PIT_TRAILING,
+        degrade="no corridor -> SKIP.",
+        stage="layering",
+        eligibility=_CORRIDOR_PROXY + " " + _AML_BEHAVIOUR,
+        notes=("anchor: 'corridor' (crime-distinctive, non-structural) routes this off a churn catalog.",
+               "OUTPUT additivity is measure-dependent: value_share is a non-additive ratio; the raw "
+               "'amount' sum is additive — the default carries the ratio case."),
+    ),
+    # A.7 — nested_correspondent_flow (correspondent-banking visibility gap)
+    Template(
+        id="nested_correspondent_flow", family="layering",
+        intent="Nested-correspondent / nostro-vostro flow — payments cleared through a nested downstream "
+               "correspondent (a bank clearing for another bank's clients); a visibility-gap AML typology "
+               "(FATF/Wolfsberg).",
+        needs=(Need("nostro_vostro", "nostro_vostro"),
+               Need("nested_flag", "nested_correspondent_flag", optional=True),
+               Need("swift_mt", "swift_message_type", optional=True),
+               Need("flow_col", "monetary_flow"), Need("event_ts", "event_timestamp")),
+        params={"window": (90, 30, 180), "measure": ("nested_share", "occurred_flag")},
+        aggregation="nested_correspondent", additivity="n/a", explain="M",
+        use_cases=("aml", "correspondent_banking", "transaction_monitoring", "financial_crime"),
+        pit=_AML_PIT_TRAILING,
+        degrade="no nostro/vostro correspondent data -> SKIP.",
+        stage="layering",
+        eligibility=_AML_BEHAVIOUR,
+        notes=("anchor: 'nostro_vostro' (crime-distinctive, non-structural) routes this off a churn "
+               "catalog (correspondent-banking data is absent from a retail catalog).",
+               "a nested-share / occurred flag — n/a."),
+    ),
+    # A.8 — crypto_offramp_exposure (fiat↔crypto ramps)
+    Template(
+        id="crypto_offramp_exposure", family="layering",
+        intent="Crypto on/off-ramp exposure — the share of flow crossing into on-chain wallets / "
+               "stablecoins (fiat↔crypto ramps), a chain-hop layering route.",
+        needs=(Need("on_chain", "on_chain_txn"), Need("wallet", "wallet_address", optional=True),
+               Need("stablecoin", "stablecoin", optional=True),
+               Need("flow_col", "monetary_flow"), Need("event_ts", "event_timestamp"),
+               Need("entity", "customer_id")),
+        params={"window": (90, 30, 180), "measure": ("value_share", "count")},
+        aggregation="crypto_offramp", additivity="non_additive", explain="M",
+        use_cases=("aml", "crypto", "transaction_monitoring", "financial_crime"),
+        pit=_AML_PIT_TRAILING,
+        degrade="no on-chain / wallet data -> SKIP.",
+        stage="layering",
+        eligibility="⚠ PII: wallet_address is pseudonymous-but-linkable PERSONAL data (FATF travel-rule) "
+                    "— read-scoped (pii role) when a wallet is bound. " + _AML_BEHAVIOUR,
+        notes=("anchor: 'on_chain_txn' (crime-distinctive, non-structural) routes this off a churn catalog.",
+               "OUTPUT additivity is measure-dependent: value_share is a non-additive ratio; the count "
+               "alternate is additive — the default carries the ratio case."),
+    ),
+    # ── INTEGRATION (clean money returns) + cross-cutting screening ──────────────────────────────────
+    # A.9 — dormant_reactivation (parked mule/shell reactivating)
+    Template(
+        id="dormant_reactivation", family="integration",
+        intent="Dormant-then-active reactivation — an account dormant for a long spell then suddenly "
+               "receiving large credits (a previously-parked mule/shell reactivating for integration).",
+        needs=(Need("direction", "debit_credit_indicator"), Need("flow_col", "monetary_flow"),
+               Need("event_ts", "event_timestamp"), Need("entity", "customer_id")),
+        params={"window": (180, 90, 365), "dormancy_days": (90, 60, 180)},
+        aggregation="dormant_reactivation", additivity="n/a", explain="H",
+        use_cases=("aml", "transaction_monitoring", "financial_crime"),
+        pit=_AML_PIT_TRAILING,
+        degrade="no dr/cr indicator -> infer credit direction from amount sign (declared derivation §D.8; "
+                "FLAG).",
+        stage="integration",
+        eligibility=_AML_BEHAVIOUR,
+        derived=("is_reactivation := no activity for ≥ {dormancy_days}d then a large credit — computed "
+                 "DOWNSTREAM (no data plane); dr/cr identifies the inbound credit.",),
+        notes=("anchor: 'debit_credit_indicator' (crime-distinctive, non-structural) routes this off a "
+               "churn catalog (dormancy alone is generic event/entity — it would cross-surface).",
+               "a reactivation flag — n/a."),
+    ),
+    # A.10 — screening_exposure (PEP / sanctions / adverse-media) — NEAR-LABEL + PII
+    Template(
+        id="screening_exposure", family="integration",
+        intent="PEP / sanctions / adverse-media exposure over the customer and its counterparties — the "
+               "share/severity of screened-risky relationships (a KYC/CDD financial-crime marker).",
+        needs=(Need("pep", "pep_flag"), Need("sanctions", "sanctions_hit_flag", optional=True),
+               Need("adverse_media", "adverse_media_flag", optional=True),
+               Need("watchlist", "watchlist_hit_flag", optional=True),
+               Need("entity", "customer_id")),
+        params={"window": (365, 180, 90), "measure": ("exposed_flag", "exposure_share")},
+        aggregation="screening_exposure", additivity="n/a", explain="H",
+        use_cases=("aml", "sanctions", "kyc", "transaction_monitoring", "financial_crime"),
+        pit=_AML_PIT_TRAILING,
+        degrade="no screening flags at all -> SKIP.",
+        stage="integration",
+        near_label=True,
+        eligibility=_AML_NEAR_LABEL_PREFIX + _SCREENING_PII,
+        notes=("anchor: 'pep_flag' (crime-distinctive, pii, non-structural) routes this off a churn "
+               "catalog and needs the pii role.",
+               "sanctions_hit_flag / adverse_media_flag / watchlist_hit_flag are NEAR-LABEL screening "
+               "concepts (optional here); a filed SAR / confirmed hit is the LABEL, never an input.",
+               "a flag / share — n/a."),
+    ),
+    # A.11 — prior_alert_recidivism (repeat-suspicion history) — NEAR-LABEL
+    Template(
+        id="prior_alert_recidivism", family="integration",
+        intent="Prior-alert recidivism — the count/recency of PRIOR monitoring alerts that resulted in a "
+               "watchlist hit on this entity (a repeat-suspicion history feature).",
+        needs=(Need("watchlist", "watchlist_hit_flag"), Need("alert", "alert_id", optional=True),
+               Need("case", "case_id", optional=True), Need("event_ts", "event_timestamp"),
+               Need("entity", "customer_id")),
+        params={"window": (365, 180, 90), "measure": ("prior_alert_count", "days_since_last")},
+        aggregation="prior_alert_recidivism", additivity="additive", explain="M",
+        use_cases=("aml", "transaction_monitoring", "financial_crime"),
+        pit=_AML_PIT_TRAILING,
+        degrade="no watchlist/alert history -> SKIP.",
+        stage="integration",
+        near_label=True,
+        eligibility=_AML_NEAR_LABEL_PREFIX + "a prior-alert history BORDERS the label — the SAR/filing "
+                    "OUTCOME of any alert is NEVER an input, only the fact/timing of a prior alert.",
+        notes=("anchor: 'watchlist_hit_flag' (crime-distinctive, near-label, non-structural) routes this "
+               "off a churn catalog (alert_id / case_id are ENTITY concepts — they would structurally "
+               "bind ANY grain column, so they are optional, not the routing anchor).",
+               "a count of prior alerts — additive; days_since_last is a recency (n/a)."),
+    ),
+)
+
+
+# ──────────────────────────────────────────────────────────────────────────────────────────────────
 # The full template REGISTRY — every family, in author order. Future template passes (fraud, AML,
 # collections, …) EXTEND this tuple; gate1 grounds ALL_TEMPLATES so a family surfaces only where its
 # distinctive concepts exist in the catalog (grounding is the router). RETAIL_CHURN_TEMPLATES stays a
 # standalone name because gate1 + the pilot tests still import it directly.
 # ──────────────────────────────────────────────────────────────────────────────────────────────────
-ALL_TEMPLATES: tuple[Template, ...] = RETAIL_CHURN_TEMPLATES + CREDIT_RISK_TEMPLATES
+ALL_TEMPLATES: tuple[Template, ...] = (
+    RETAIL_CHURN_TEMPLATES + CREDIT_RISK_TEMPLATES + FRAUD_TEMPLATES + AML_TEMPLATES)
 
 
 def _validate_family(templates: tuple[Template, ...], label: str, seen_ids: set[str]) -> None:
@@ -897,10 +1404,14 @@ def _validate_family(templates: tuple[Template, ...], label: str, seen_ids: set[
 def _validate_registry() -> None:
     """Fail fast at import if a template drifts from the concept registry / schema invariants.
 
-    Two passes: (1) the churn pilot on its own (kept intact — gate1 + tests import it directly); (2) the
-    combined ALL_TEMPLATES registry with a GLOBAL id-uniqueness check — no two templates in ANY family may
-    share an id — plus the same per-need concept-existence + param-shape checks for every family."""
+    Two passes: (1) each family on its own (kept intact — gate1 + the family tests import them directly);
+    (2) the combined ALL_TEMPLATES registry with a GLOBAL id-uniqueness check — no two templates in ANY
+    family may share an id — plus the same per-need concept-existence + param-shape checks for every
+    family."""
     _validate_family(RETAIL_CHURN_TEMPLATES, "RETAIL_CHURN_TEMPLATES", set())
+    _validate_family(CREDIT_RISK_TEMPLATES, "CREDIT_RISK_TEMPLATES", set())
+    _validate_family(FRAUD_TEMPLATES, "FRAUD_TEMPLATES", set())
+    _validate_family(AML_TEMPLATES, "AML_TEMPLATES", set())
     _validate_family(ALL_TEMPLATES, "ALL_TEMPLATES", set())
 
 
