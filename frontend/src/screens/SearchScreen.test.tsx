@@ -2,6 +2,7 @@ import { act, render, screen, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import * as api from '../api'
+import './lineage-test-setup' // SearchScreen's graph view mounts the xyflow LineageView canvas
 import { SearchScreen } from './SearchScreen'
 
 vi.mock('../api', async importOriginal => {
@@ -252,9 +253,11 @@ describe('search screen', () => {
     expect(within(toggle).getByRole('button', { name: 'Graph' })).toHaveAttribute(
       'aria-pressed', 'true',
     )
-    expect(lineageGraph).toHaveBeenCalledWith('public.accounts.balance', 'deposits', {
-      direction: 'both', depth: 1,
-    })
+    expect(lineageGraph).toHaveBeenCalledWith(
+      'public.accounts.balance', 'deposits',
+      // objectContaining: LineageView also threads an AbortController `signal` we do not pin.
+      expect.objectContaining({ direction: 'both', depth: 1 }),
+    )
     // the canvas replaces the rows; the layers panel marks the graph view
     expect(await screen.findByText('Layers')).toBeInTheDocument()
     expect(
@@ -275,9 +278,10 @@ describe('search screen', () => {
     await userEvent.click(
       await screen.findByRole('button', { name: 'Graph for public.accounts.opened_at' }),
     )
-    expect(lineageGraph).toHaveBeenCalledWith('public.accounts.opened_at', 'deposits', {
-      direction: 'both', depth: 1,
-    })
+    expect(lineageGraph).toHaveBeenCalledWith(
+      'public.accounts.opened_at', 'deposits',
+      expect.objectContaining({ direction: 'both', depth: 1 }),
+    )
     expect(await screen.findByText('Layers')).toBeInTheDocument()
   })
 

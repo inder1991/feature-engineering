@@ -320,7 +320,14 @@ export interface LineageGraph {
 export function lineageGraph(
   ref: string,
   source: string,
-  opts: { direction?: LineageDirection; depth?: number; layers?: readonly LineageLayer[] } = {},
+  opts: {
+    direction?: LineageDirection
+    depth?: number
+    layers?: readonly LineageLayer[]
+    // Aborted by the view when the anchor changes or the component unmounts, so a superseded
+    // or orphaned fetch is cancelled at the transport instead of running to completion.
+    signal?: AbortSignal
+  } = {},
 ): Promise<LineageGraph> {
   const direction = opts.direction ?? 'both'
   const depth = opts.depth ?? 1
@@ -330,6 +337,7 @@ export function lineageGraph(
   return request(
     `/graph/lineage?ref=${encodeURIComponent(ref)}&source=${encodeURIComponent(source)}` +
       `&direction=${direction}&depth=${depth}&layers=${layers.join(',')}`,
+    opts.signal ? { signal: opts.signal } : undefined,
   )
 }
 

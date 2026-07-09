@@ -21,9 +21,10 @@ import {
   type Edge,
   type Node,
   type NodeProps,
+  type ReactFlowInstance,
 } from '@xyflow/react'
 import '@xyflow/react/dist/style.css'
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   ApiError,
   lineageGraph,
@@ -57,25 +58,24 @@ function dedupeKey(e: LineageEdge): string {
   return `${e.kind}|${ends[0]}|${ends[1]}`
 }
 
-// Merge a lazily fetched depth-1 graph into the accumulated one. Nodes dedupe by id (first
-// wins, matching the backend's first-BFS-discovery orientation rule); edges dedupe by kind +
-// endpoints, unordered for the symmetric kinds so a re-fetch from the other side cannot
-// duplicate a join. `grew` reports whether anything new arrived.
+// Merge a lazily fetched depth-1 graph into the accumulated one. Node PAYLOADS are last-wins: a
+// re-fetch may carry fresher flags (a source that went stale between fetches), so the newer node
+// replaces the stored one IN PLACE (order preserved via the Map), while `grew` counts only NEW
+// ids so a same-shape re-fetch of known nodes still reports no growth. Edges dedupe by kind +
+// endpoints, unordered for the symmetric kinds (first orientation wins, matching the backend's
+// first-BFS-discovery rule) so a re-fetch from the other side cannot duplicate a join. `grew`
+// reports whether anything new arrived.
 function mergeGraph(
   base: LineageGraph,
   add: LineageGraph,
 ): { graph: LineageGraph; grew: boolean } {
-  const ids = new Set(base.nodes.map(n => n.id))
+  const nodeIndex = new Map(base.nodes.map(n => [n.id, n] as const))
   const keys = new Set(base.edges.map(dedupeKey))
-  const nodes = [...base.nodes]
   const edges = [...base.edges]
   let grew = false
   for (const n of add.nodes) {
-    if (!ids.has(n.id)) {
-      ids.add(n.id)
-      nodes.push(n)
-      grew = true
-    }
+    if (!nodeIndex.has(n.id)) grew = true
+    nodeIndex.set(n.id, n) // last-wins on payload; Map.set keeps the original slot for known ids
   }
   for (const e of add.edges) {
     const k = dedupeKey(e)
@@ -85,7 +85,10 @@ function mergeGraph(
       grew = true
     }
   }
-  return { graph: { nodes, edges, truncated: base.truncated || add.truncated }, grew }
+  return {
+    graph: { nodes: [...nodeIndex.values()], edges, truncated: base.truncated || add.truncated },
+    grew,
+  }
 }
 
 // ---- custom node data ----------------------------------------------------------------------
@@ -111,6 +114,18 @@ type TableNT = Node<TableData, 'lnTable'>
 type StubNT = Node<StubData, 'lnStub'>
 type FeatureNT = Node<FeatureData, 'lnFeature'>
 type ConsumerNT = Node<ConsumerData, 'lnConsumer'>
+
+// A node after dagre has placed it: geometry only (position + size + its column rows). The cheap
+// `flow` memo turns these into xyflow nodes with the interaction-dependent data on top.
+type PlacedNode = {
+  node: LineageNode
+  type: 'lnTable' | 'lnStub' | 'lnFeature' | 'lnConsumer'
+  x: number
+  y: number
+  w: number
+  h: number
+  cols: LineageNode[]
+}
 
 function Ports() {
   // Default (id-less) handles: edges that anchor on the unit itself, or on a collapsed
@@ -151,8 +166,10 @@ function TableNode({ data }: NodeProps<TableNT>) {
         {node.stale ? <Flag tone="stale">stale</Flag> : <span className="ln-fresh">fresh</span>}
       </div>
       {node.stale && (
+        // Generic phrasing (no source name) so the fixed-height note never clips: the source is
+        // named on the src line right above, and the drawer carries the fully named guidance.
         <div className="ln-note">
-          Not currently vouched. Re-upload the {node.catalog_source} source to serve its facts.
+          Not currently vouched. Re-upload this source to serve its facts.
         </div>
       )}
       {!collapsed && (
@@ -321,12 +338,21 @@ export function LineageView({ anchor }: { anchor: SearchHit }) {
   // order their responses land, never clobbering each other.
   const seq = useRef(0)
   const graphRef = useRef<LineageGraph | null>(null)
+  // In-flight expansion fetches, aborted on unmount so an orphaned promise never resolves into
+  // setState on a gone component. The anchor fetch owns its own controller (aborted on re-anchor).
+  const expandCtrls = useRef<Set<AbortController>>(new Set())
+  const rf = useRef<ReactFlowInstance | null>(null)
 
   useEffect(() => {
     const id = ++seq.current
+    const ctrl = new AbortController()
     setLoading(true)
     setError('')
-    lineageGraph(anchor.object_ref, anchor.catalog_source, { direction: DIRECTION, depth: 1 })
+    lineageGraph(anchor.object_ref, anchor.catalog_source, {
+      direction: DIRECTION,
+      depth: 1,
+      signal: ctrl.signal,
+    })
       .then(g => {
         if (id !== seq.current) return
         graphRef.current = g
@@ -334,11 +360,16 @@ export function LineageView({ anchor }: { anchor: SearchHit }) {
         setLoading(false)
       })
       .catch((err: unknown) => {
-        if (id !== seq.current) return
+        if (id !== seq.current || ctrl.signal.aborted) return
         setError(err instanceof ApiError ? err.detail : String(err))
         setLoading(false)
       })
+    return () => ctrl.abort()
   }, [anchor.object_ref, anchor.catalog_source])
+
+  useEffect(() => () => {
+    for (const c of expandCtrls.current) c.abort()
+  }, [])
 
   // The anchor's own units: its table (already expanded by the initial depth-1 fetch) and,
   // when the hit is a column, the column row to highlight as the match.
@@ -432,6 +463,8 @@ export function LineageView({ anchor }: { anchor: SearchHit }) {
   function openNode(n: LineageNode) {
     setDrawerId(n.id)
   }
+  // Stable so the drawer's Escape-key listener subscribes once, not on every parent render.
+  const closeDrawer = useCallback(() => setDrawerId(null), [])
   function toggleTable(id: string) {
     setCollapsed(prev => {
       const next = new Set(prev)
@@ -444,6 +477,8 @@ export function LineageView({ anchor }: { anchor: SearchHit }) {
   async function expand(n: LineageNode) {
     if (!n.object_ref || !n.catalog_source || expanding.has(n.id)) return
     const startSeq = seq.current
+    const ctrl = new AbortController()
+    expandCtrls.current.add(ctrl)
     setExpanding(prev => new Set(prev).add(n.id))
     setExpandError('')
     setNote('')
@@ -451,6 +486,7 @@ export function LineageView({ anchor }: { anchor: SearchHit }) {
       const more = await lineageGraph(n.object_ref, n.catalog_source, {
         direction: DIRECTION,
         depth: 1,
+        signal: ctrl.signal,
       })
       if (startSeq !== seq.current || !graphRef.current) return
       const { graph: merged, grew } = mergeGraph(graphRef.current, more)
@@ -462,10 +498,10 @@ export function LineageView({ anchor }: { anchor: SearchHit }) {
         setNote(`No further neighbors around ${n.table}.`)
       }
     } catch (err) {
-      if (startSeq === seq.current) {
-        setExpandError(err instanceof ApiError ? err.detail : String(err))
-      }
+      if (ctrl.signal.aborted || startSeq !== seq.current) return
+      setExpandError(err instanceof ApiError ? err.detail : String(err))
     } finally {
+      expandCtrls.current.delete(ctrl)
       setExpanding(prev => {
         const next = new Set(prev)
         next.delete(n.id)
@@ -474,9 +510,12 @@ export function LineageView({ anchor }: { anchor: SearchHit }) {
     }
   }
 
-  // ---- build the canvas: units, sizes, dagre layout, xyflow nodes and edges ----------------
-  const flow = useMemo(() => {
-    if (!graph) return { nodes: [] as Node[], edges: [] as Edge[] }
+  // ---- geometry: sizes + dagre layout (the EXPENSIVE step) ---------------------------------
+  // Keyed only on what changes SHAPE — the graph, the visible units/edges, and collapse (which
+  // resizes cards). Trace clicks, expander-flag flips, and match highlighting do NOT re-run
+  // dagre; they restyle the cheap `flow` memo below, which reuses these positions.
+  const layout = useMemo(() => {
+    if (!graph) return { placed: [] as PlacedNode[] }
     const columnsOf = new Map<string, LineageNode[]>()
     for (const n of graph.nodes) {
       if (n.kind === 'column' && n.resolved) {
@@ -484,35 +523,69 @@ export function LineageView({ anchor }: { anchor: SearchHit }) {
         if (unit !== n.id) columnsOf.set(unit, [...(columnsOf.get(unit) ?? []), n])
       }
     }
-    const consumerReads = new Map<string, number>()
-    for (const e of visibleEdges) {
-      if (e.kind === 'consumes') consumerReads.set(e.to, (consumerReads.get(e.to) ?? 0) + 1)
-    }
-
-    const nodes: Node[] = []
-    const dims = new Map<string, { w: number; h: number }>()
+    const placed: PlacedNode[] = []
     for (const n of graph.nodes) {
       if (!visibleUnits.has(n.id)) continue
       if (n.kind === 'table') {
         const cols = columnsOf.get(n.id) ?? []
-        const isCollapsed = collapsed.has(n.id)
         const h =
           HEAD_H +
           SRC_H +
           (n.stale ? NOTE_H : 0) +
-          (isCollapsed ? 0 : cols.length * ROW_H + PAD_H)
-        dims.set(n.id, { w: W_TABLE, h })
-        nodes.push({
-          id: n.id,
+          (collapsed.has(n.id) ? 0 : cols.length * ROW_H + PAD_H)
+        placed.push({ node: n, type: 'lnTable', x: 0, y: 0, w: W_TABLE, h, cols })
+      } else if (n.kind === 'column' && !n.resolved) {
+        placed.push({ node: n, type: 'lnStub', x: 0, y: 0, w: W_TABLE, h: HEAD_H + 64, cols: [] })
+      } else if (n.kind === 'feature') {
+        placed.push({
+          node: n, type: 'lnFeature', x: 0, y: 0, w: W_FEATURE, h: HEAD_H + SRC_H + PAD_H, cols: [],
+        })
+      } else if (n.kind === 'consumer') {
+        placed.push({ node: n, type: 'lnConsumer', x: 0, y: 0, w: W_CONSUMER, h: HEAD_H + 30, cols: [] })
+      }
+    }
+
+    const g = new dagre.graphlib.Graph()
+    g.setGraph({ rankdir: 'LR', nodesep: 36, ranksep: 110, marginx: 24, marginy: 24 })
+    g.setDefaultEdgeLabel(() => ({}))
+    for (const p of placed) g.setNode(p.node.id, { width: p.w, height: p.h })
+    for (const e of visibleEdges) {
+      const a = unitOf(e.from)
+      const b = unitOf(e.to)
+      if (a !== b) g.setEdge(a, b)
+    }
+    dagre.layout(g)
+    for (const p of placed) {
+      const gp = g.node(p.node.id)
+      p.x = gp.x - p.w / 2
+      p.y = gp.y - p.h / 2
+    }
+    return { placed }
+  }, [graph, visibleEdges, visibleUnits, collapsed, unitOf])
+
+  // ---- styling: turn placed geometry into xyflow nodes/edges (the CHEAP, per-interaction step)
+  const flow = useMemo(() => {
+    const consumerReads = new Map<string, number>()
+    for (const e of visibleEdges) {
+      if (e.kind === 'consumes') consumerReads.set(e.to, (consumerReads.get(e.to) ?? 0) + 1)
+    }
+    const nodes: Node[] = layout.placed.map(p => {
+      const n = p.node
+      const base = {
+        id: n.id,
+        position: { x: p.x, y: p.y },
+        width: p.w,
+        height: p.h,
+        draggable: false,
+      }
+      if (p.type === 'lnTable') {
+        return {
+          ...base,
           type: 'lnTable',
-          position: { x: 0, y: 0 },
-          width: W_TABLE,
-          height: h,
-          draggable: false,
           data: {
             node: n,
-            columns: cols,
-            collapsed: isCollapsed,
+            columns: p.cols,
+            collapsed: collapsed.has(n.id),
             matchId,
             traceId,
             expandable:
@@ -522,67 +595,26 @@ export function LineageView({ anchor }: { anchor: SearchHit }) {
             onColumn: openColumn,
             onExpand: expand,
           } satisfies TableData,
-        })
-      } else if (n.kind === 'column' && !n.resolved) {
-        dims.set(n.id, { w: W_TABLE, h: HEAD_H + 64 })
-        nodes.push({
-          id: n.id,
-          type: 'lnStub',
-          position: { x: 0, y: 0 },
-          width: W_TABLE,
-          height: HEAD_H + 64,
-          draggable: false,
-          data: { node: n } satisfies StubData,
-        })
-      } else if (n.kind === 'feature') {
-        dims.set(n.id, { w: W_FEATURE, h: HEAD_H + SRC_H + PAD_H })
-        nodes.push({
-          id: n.id,
-          type: 'lnFeature',
-          position: { x: 0, y: 0 },
-          width: W_FEATURE,
-          height: HEAD_H + SRC_H + PAD_H,
-          draggable: false,
-          data: { node: n, onOpen: openNode } satisfies FeatureData,
-        })
-      } else if (n.kind === 'consumer') {
-        dims.set(n.id, { w: W_CONSUMER, h: HEAD_H + 30 })
-        nodes.push({
-          id: n.id,
-          type: 'lnConsumer',
-          position: { x: 0, y: 0 },
-          width: W_CONSUMER,
-          height: HEAD_H + 30,
-          draggable: false,
-          data: { node: n, reads: consumerReads.get(n.id) ?? 0, onOpen: openNode } satisfies ConsumerData,
-        })
+        }
       }
-    }
-
-    const g = new dagre.graphlib.Graph()
-    g.setGraph({ rankdir: 'LR', nodesep: 36, ranksep: 110, marginx: 24, marginy: 24 })
-    g.setDefaultEdgeLabel(() => ({}))
-    for (const n of nodes) {
-      const d = dims.get(n.id) as { w: number; h: number }
-      g.setNode(n.id, { width: d.w, height: d.h })
-    }
-    for (const e of visibleEdges) {
-      const a = unitOf(e.from)
-      const b = unitOf(e.to)
-      if (a !== b) g.setEdge(a, b)
-    }
-    dagre.layout(g)
-    for (const n of nodes) {
-      const p = g.node(n.id)
-      const d = dims.get(n.id) as { w: number; h: number }
-      n.position = { x: p.x - d.w / 2, y: p.y - d.h / 2 }
-    }
+      if (p.type === 'lnStub') {
+        return { ...base, type: 'lnStub', data: { node: n } satisfies StubData }
+      }
+      if (p.type === 'lnFeature') {
+        return { ...base, type: 'lnFeature', data: { node: n, onOpen: openNode } satisfies FeatureData }
+      }
+      return {
+        ...base,
+        type: 'lnConsumer',
+        data: { node: n, reads: consumerReads.get(n.id) ?? 0, onOpen: openNode } satisfies ConsumerData,
+      }
+    })
 
     const edges: Edge[] = visibleEdges.map(e => {
       const sourceUnit = unitOf(e.from)
       const targetUnit = unitOf(e.to)
       const isTrace = traced.keys.has(dedupeKey(e))
-      let stroke = 'var(--line-strong)'
+      let stroke = 'var(--ln-join)'
       let label: string
       if (e.kind === 'join') {
         label = e.resolved
@@ -618,9 +650,8 @@ export function LineageView({ anchor }: { anchor: SearchHit }) {
     return { nodes, edges }
     // eslint-disable-next-line react-hooks/exhaustive-deps -- handlers are stable per render
   }, [
-    graph,
+    layout,
     visibleEdges,
-    visibleUnits,
     collapsed,
     traced,
     matchId,
@@ -632,6 +663,14 @@ export function LineageView({ anchor }: { anchor: SearchHit }) {
     unitOf,
     byId,
   ])
+
+  // Refit after the visible node set changes: an expansion merge (or a layer toggle) can leave
+  // freshly placed nodes off-screen, and the `fitView` prop only fires on the first render.
+  // duration 0 keeps it reduced-motion safe, matching the static (never-animated) edges.
+  const nodeCount = flow.nodes.length
+  useEffect(() => {
+    rf.current?.fitView({ duration: 0 })
+  }, [nodeCount])
 
   const drawerNode = drawerId ? byId.get(drawerId) : undefined
 
@@ -667,6 +706,9 @@ export function LineageView({ anchor }: { anchor: SearchHit }) {
           nodes={flow.nodes}
           edges={flow.edges}
           nodeTypes={NODE_TYPES}
+          onInit={inst => {
+            rf.current = inst
+          }}
           fitView
           minZoom={0.3}
           maxZoom={2}
@@ -681,7 +723,7 @@ export function LineageView({ anchor }: { anchor: SearchHit }) {
               <legend className="micro-label">Layers</legend>
               {(
                 [
-                  ['joins', 'Joins', 'var(--line-strong)'],
+                  ['joins', 'Joins', 'var(--ln-join)'],
                   ['entity', 'Entity bridges', 'var(--warn)'],
                   ['features', 'Feature lineage', 'var(--proposal)'],
                 ] as const
@@ -716,7 +758,7 @@ export function LineageView({ anchor }: { anchor: SearchHit }) {
             anchorColId={matchId}
             traceId={traceId}
             traced={traced}
-            onClose={() => setDrawerId(null)}
+            onClose={closeDrawer}
           />
         )}
       </div>
@@ -779,9 +821,24 @@ function Drawer({
   onClose: () => void
 }) {
   const closeRef = useRef<HTMLButtonElement>(null)
+  // Capture the button that opened the drawer once, and return focus to it on close so keyboard
+  // users are not dumped at the top of the document (WCAG 2.4.3). Runs before the focus-move
+  // effect below, so document.activeElement is still the invoking column/node button.
+  useEffect(() => {
+    const invoker = document.activeElement as HTMLElement | null
+    return () => invoker?.focus?.()
+  }, [])
   useEffect(() => {
     closeRef.current?.focus()
   }, [node.id])
+  // Escape closes the drawer, the standard dismissal for a transient detail panel.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') onClose()
+    }
+    document.addEventListener('keydown', onKey)
+    return () => document.removeEventListener('keydown', onKey)
+  }, [onClose])
 
   const isAnchorCol = node.id === anchorColId
   const showTrace = traceId === node.id && traced.features.length > 0

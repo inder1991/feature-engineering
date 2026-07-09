@@ -17,6 +17,10 @@
   --ink-faint:    oklch(0.50 0.015 220);
   --line:         oklch(0.86 0.012 212);
   --line-strong:  oklch(0.76 0.018 212);
+  /* lineage join-edge stroke: --line-strong is 2.1:1 on --surface (<3:1, fails non-text
+     WCAG 1.4.11); this darker line clears it (3.85:1 on surface, 3.43:1 on ground). The
+     entity (--warn 5.3:1) and feature (--proposal 7.4:1) strokes already conform. */
+  --ln-join:      oklch(0.60 0.03 212);
   --shadow:       0 1px 2px oklch(0.25 0.025 225 / 0.05), 0 6px 20px oklch(0.25 0.025 225 / 0.07);
 
   /* the rail: a committed dark petrol surface (identity lives here) */
@@ -1828,10 +1832,12 @@ section > h2:first-child {
   color: var(--chip-ink);
 }
 
-/* node states: stale greys (marker + guidance carry the meaning, never opacity alone),
-   pending stubs dash, features take the proposal accent, consumers sit on surface-2 */
+/* node states carry meaning WITHOUT fading text (WCAG AA: a faded card dropped the "stale"
+   copy and column rows to ~2.5:1 — and stale is exactly the state a user must read carefully).
+   State reads from the warn wash + a warn border + the STALE flag/guidance, all at full
+   opacity; pending stubs use the dashed border + DECLARED label. Color is never alone. */
 .ln-card--stale {
-  opacity: 0.68;
+  border-color: var(--warn);
 }
 
 .ln-card--stale .ln-head {
@@ -1840,7 +1846,6 @@ section > h2:first-child {
 
 .ln-card--pending {
   border-style: dashed;
-  opacity: 0.75;
 }
 
 .ln-card--feature {
@@ -1887,7 +1892,10 @@ section > h2:first-child {
 }
 
 /* edges: hairline beziers with mono micro-labels; trace/entity/feature colors come from the
-   per-edge inline style, the label chrome from here */
+   per-edge inline style, the label chrome from here. Label text is --ink-faint on the
+   --surface textbg = 5.89:1, comfortably over the 4.5:1 floor (--ink-faint is L 0.50 now; an
+   earlier review measured ~4.3:1 against a lighter L 0.58 value that has since been darkened),
+   so both the 10px edge labels and the 9px .ln-kind micro-labels conform without change. */
 .ln-wrap .react-flow__edge-text {
   font-family: var(--font-mono);
   font-size: 10px;

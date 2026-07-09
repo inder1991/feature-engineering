@@ -27,7 +27,16 @@ Two deliberate stances relative to /search:
     returns None, indistinguishable from a nonexistent one.
 
 The response is bounded: expansion stops at `max_nodes`, table units stay atomic (a table is
-never shown with a partial column list), and `truncated` reports that the map was cut.
+never shown with a partial column list), and `truncated` reports that the map was cut. One
+caveat by design: the ANCHOR unit installs complete even past the cap (a table is never shown
+partial), so a single pathologically wide anchor table can exceed max_nodes with truncated=false
+when it has no edges — acceptable under upload governance, where table widths are bounded.
+
+After BFS a CLOSING pass emits join/entity edges between two units the map already shows but
+the frontier never queried (both endpoints entered at the depth boundary, so neither was
+expanded). It installs no new nodes — edges only, between already-visible units — so two
+visible tables never look unrelated when a join or entity bridge is declared. The map may be
+cut at the frontier, but never quietly wrong.
 """
 from __future__ import annotations
 
@@ -130,6 +139,32 @@ class _Builder:
                     seen.add(neighbor)
                     queue.append((neighbor, d + 1))
                 self._add_edge(edge)
+        self._close_frontier(seen)
+
+    def _close_frontier(self, seen: set[_Unit]) -> None:
+        """Emit join/entity edges BETWEEN two units the map already shows but BFS never queried.
+
+        A join whose BOTH endpoint tables entered at the depth boundary is otherwise silently
+        dropped: neither table is expanded (`d >= depth` skips it), so the declared edge is
+        never emitted and two visible tables look unrelated. This pass re-runs the SAME
+        read-scoped join/entity expansions over every installed table unit and keeps only the
+        edges whose other endpoint is ALSO already installed (a real unit in `seen`, or a stub
+        BFS already placed). It installs NOTHING new — edges only — so the response stays
+        bounded while the map stops lying by omission. Dedup (`_add_edge`) drops the edges BFS
+        already emitted, so re-running over already-expanded units is a no-op, not a doubling.
+        """
+        for unit in [u for u in seen if u[0] == "table"]:
+            frontier: list[tuple[_Unit | None, dict | None, dict]] = []
+            if "joins" in self.layers:
+                frontier += self._expand_joins(unit)
+            if "entity" in self.layers:
+                frontier += self._expand_entity(unit)
+            for neighbor, stub, edge in frontier:
+                if stub is not None:
+                    if stub["id"] in self.nodes:   # a stub BFS already placed: close the edge to it
+                        self._add_edge(edge)
+                elif neighbor in seen:
+                    self._add_edge(edge)
 
     def _expand(self, unit: _Unit) -> list[tuple[_Unit | None, dict | None, dict]]:
         out: list[tuple[_Unit | None, dict | None, dict]] = []

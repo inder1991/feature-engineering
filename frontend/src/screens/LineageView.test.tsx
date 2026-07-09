@@ -2,6 +2,7 @@ import { render, screen, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import * as api from '../api'
+import './lineage-test-setup' // scoped xyflow offsetWidth/offsetHeight shim (this suite only)
 import { LineageView } from './LineageView'
 
 vi.mock('../api', async importOriginal => {
@@ -130,9 +131,11 @@ describe('lineage view', () => {
     lineageGraph.mockResolvedValue(BASE)
     render(<LineageView anchor={ANCHOR} />)
     expect(await screen.findByText('accounts')).toBeInTheDocument()
-    expect(lineageGraph).toHaveBeenCalledWith('public.accounts.balance', 'deposits', {
-      direction: 'both', depth: 1,
-    })
+    expect(lineageGraph).toHaveBeenCalledWith(
+      'public.accounts.balance', 'deposits',
+      // objectContaining: the view also threads a `signal` (AbortController) we do not pin here.
+      expect.objectContaining({ direction: 'both', depth: 1 }),
+    )
     expect(screen.getByText('customers')).toBeInTheDocument()
     expect(screen.getByText('transactions')).toBeInTheDocument()
     // fresh sources say so on every card
@@ -158,8 +161,9 @@ describe('lineage view', () => {
     const { container } = render(<LineageView anchor={ANCHOR} />)
     expect(await screen.findByText('card_holders')).toBeInTheDocument()
     expect(screen.getByText('stale')).toBeInTheDocument()
+    // Card note is generic (fixed height, never clips); the source name lives on the src line.
     expect(
-      screen.getByText(/not currently vouched\. re-upload the cards source/i),
+      screen.getByText(/not currently vouched\. re-upload this source/i),
     ).toBeInTheDocument()
     expect(container.querySelector('.ln-card--stale')).not.toBeNull()
   })
@@ -249,9 +253,10 @@ describe('lineage view', () => {
 
     await userEvent.click(screen.getByRole('button', { name: 'Expand neighbors of customers' }))
     expect(await screen.findByText('card_holders')).toBeInTheDocument()
-    expect(lineageGraph).toHaveBeenLastCalledWith('public.customers', 'deposits', {
-      direction: 'both', depth: 1,
-    })
+    expect(lineageGraph).toHaveBeenLastCalledWith(
+      'public.customers', 'deposits',
+      expect.objectContaining({ direction: 'both', depth: 1 }),
+    )
     // the fetched-around table loses its chip; the new frontier table gains one
     expect(
       screen.queryByRole('button', { name: 'Expand neighbors of customers' }),
@@ -304,6 +309,20 @@ describe('lineage view', () => {
       'avg_eod_balance_30d is read by churn_risk_model · consumer',
       'customers is Customer entity bridge to cards.card_holders · declared, not value-verified',
     ])
+  })
+
+  it('closes the drawer on Escape and returns focus to the opening column button', async () => {
+    lineageGraph.mockResolvedValue(BASE)
+    render(<LineageView anchor={ANCHOR} />)
+    await screen.findByText('accounts')
+    const balance = screen.getByRole('button', { name: 'balance' })
+    await userEvent.click(balance)
+    expect(screen.getByRole('complementary', { name: 'Details' })).toBeInTheDocument()
+
+    await userEvent.keyboard('{Escape}')
+    expect(screen.queryByRole('complementary', { name: 'Details' })).not.toBeInTheDocument()
+    // focus returns to the invoking button, not the top of the document (WCAG 2.4.3)
+    expect(balance).toHaveFocus()
   })
 
   it('opens the feature drawer with a registry link from the node payload alone', async () => {

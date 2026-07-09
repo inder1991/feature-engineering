@@ -61,6 +61,42 @@ def test_anchor_column_depth1_returns_table_and_joined_tables(client):
     assert rev["cardinality"] == "1:N"
 
 
+def test_frontier_join_between_two_boundary_tables_is_not_omitted(client):
+    # Map honesty (IMPORTANT 1): a.x->b.x, a.y->c.y, b.z->c.z. Depth=1 anchored on a.x installs
+    # b and c at the depth boundary; BFS never expands either, so the declared b<->c join would
+    # be silently dropped and two visible tables would look unrelated. The closing pass emits it.
+    upload_csv(client, "probe",
+               "source,table,column,type,joins_to,cardinality\n"
+               "probe,a,x,integer,b.x,N:1\n"
+               "probe,a,y,integer,c.y,N:1\n"
+               "probe,b,x,integer,,\n"
+               "probe,b,z,integer,c.z,N:1\n"
+               "probe,c,y,integer,,\n"
+               "probe,c,z,integer,,\n")
+    body = client.get("/graph/lineage", params={
+        "ref": "public.a.x", "source": "probe", "depth": 1}, headers=AUTH).json()
+    ids = _ids(body)
+    assert "probe:public.b" in ids and "probe:public.c" in ids
+    joins = {tuple(sorted((e["from"], e["to"]))) for e in body["edges"] if e["kind"] == "join"}
+    assert tuple(sorted(("probe:public.b.z", "probe:public.c.z"))) in joins  # the b<->c edge
+    assert body["truncated"] is False   # the closing pass installs edges only, never nodes
+
+
+def test_same_catalog_join_cycle_terminates_without_duplicate_edges(client):
+    # MINOR 9: a true same-catalog cycle a->b->c->a. The seen-set must halt traversal and the
+    # symmetric-edge dedup must keep each declared join once, whichever side reaches it first.
+    upload_csv(client, "ring",
+               "source,table,column,type,joins_to,cardinality\n"
+               "ring,a,id,integer,b.id,N:1\n"
+               "ring,b,id,integer,c.id,N:1\n"
+               "ring,c,id,integer,a.id,N:1\n")
+    body = client.get("/graph/lineage", params={
+        "ref": "public.a.id", "source": "ring", "depth": 3}, headers=AUTH).json()
+    assert _ids(body) >= {"ring:public.a", "ring:public.b", "ring:public.c"}
+    joins = [tuple(sorted((e["from"], e["to"]))) for e in body["edges"] if e["kind"] == "join"]
+    assert len(joins) == len(set(joins)) == 3    # each of a-b, b-c, c-a exactly once, no dupes
+
+
 def test_depth_two_reaches_customers_from_transactions(client):
     upload_csv(client, "deposits", DEPOSITS_CSV)
     d1 = _lineage(client, ref="public.transactions.amount").json()

@@ -104,6 +104,17 @@ describe('app shell', () => {
     await userEvent.click(screen.getByRole('checkbox', { name: 'data_owner' }))
     expect(getSession().roles).not.toContain('data_owner')
   })
+
+  it('exposes the functional RBAC roles that grant feature:read (feature lineage + registry)', async () => {
+    render(<App />)
+    // catalog_viewer and feature_engineer both grant feature:read, so the live UI can exercise
+    // the feature-lineage layer and the Registry (the sensitivity-only chips could not).
+    for (const role of ['catalog_viewer', 'feature_engineer', 'pii_reader', 'restricted_reader']) {
+      expect(screen.getByRole('checkbox', { name: role })).toBeInTheDocument()
+    }
+    await userEvent.click(screen.getByRole('checkbox', { name: 'feature_engineer' }))
+    expect(getSession().roles).toContain('feature_engineer')
+  })
 })
 
 describe('review ?source= deep-linking', () => {

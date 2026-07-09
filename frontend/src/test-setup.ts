@@ -8,12 +8,13 @@ import { afterEach } from 'vitest'
 afterEach(cleanup)
 
 // ---- @xyflow/react under jsdom (LineageView tests) ----------------------------------------
-// React Flow measures nodes and the viewport with browser APIs jsdom does not implement.
+// React Flow measures nodes and the viewport with browser APIs jsdom does not implement. These
+// stubs ADD the missing APIs globally (harmless — jsdom provides none of them). The one shim that
+// OVERRIDES an existing DOM contract (offsetWidth/offsetHeight) is scoped to the xyflow suite in
+// src/screens/lineage-test-setup.ts, so it does not alter what other suites measure.
 // These are the mocks from the xyflow testing guide (reactflow.dev/learn/advanced-use/testing):
 //  * ResizeObserver: fires the callback once on observe so nodes report as measured.
 //  * DOMMatrixReadOnly: the zoom pane reads m22 for the current scale.
-//  * offsetWidth/offsetHeight: derived from the inline style LineageView sets on every node
-//    (falling back to 1 so nothing measures as zero).
 //  * SVGElement.getBBox: edge label placement.
 class ResizeObserverStub {
   callback: ResizeObserverCallback
@@ -46,19 +47,6 @@ class DOMMatrixReadOnlyStub {
   }
 }
 globalThis.DOMMatrixReadOnly = DOMMatrixReadOnlyStub as unknown as typeof DOMMatrixReadOnly
-
-Object.defineProperties(HTMLElement.prototype, {
-  offsetHeight: {
-    get(this: HTMLElement) {
-      return parseFloat(this.style.height) || 1
-    },
-  },
-  offsetWidth: {
-    get(this: HTMLElement) {
-      return parseFloat(this.style.width) || 1
-    },
-  },
-})
 
 ;(SVGElement.prototype as unknown as { getBBox: () => DOMRect }).getBBox = () =>
   ({ x: 0, y: 0, width: 0, height: 0 }) as DOMRect
