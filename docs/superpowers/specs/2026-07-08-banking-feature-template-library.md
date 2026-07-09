@@ -162,6 +162,12 @@ indicator. **Distinctive because the key flag is not in the data — it must be 
 
 # PART B — Domain-specific templates
 
+> **Library complete — all 15 families now have full parametric recipes** (`templates.py`, grounded by the
+> engine): the appendices **§PART F–L** implement every B-family (F churn · G credit · H fraud+AML · I
+> collections+deposits+payments · J markets+custody+asset-mgmt · K insurance+islamic+esg · **L cross-sell/CLV
+> + corporate-trade/SCF**). `ALL_TEMPLATES` is the 15-family union; grounding is the router (the locked
+> churn=churn-lens invariant holds — each family surfaces only where its distinctive concepts exist).
+
 ## B1. Churn / attrition — the attrition FUNNEL
 
 Attrition is a process, not an event. Signals sit at stages: **earlier = more lead-time but noisier;
@@ -282,6 +288,13 @@ targeting).
   (salary jump → mortgage; large inflow → wealth), `channel_engagement`.
 - **Maturity:** high `share_of_wallet_proxy`, multi-product, high `revenue_trend`/CLV, stable.
 - **Advocacy:** referrals, sustained high engagement.
+> **Full parametric set:** the 10 grounded recipes covering the growth journey (channel adoption, product-gap
+> whitespace, next-best-product propensity, relationship-deepening breadth GROWTH, campaign response, CLV /
+> revenue trajectory, share-of-wallet growth, peer-relative penetration, household/RM aggregation, tenure
+> upsell readiness) — all built from PRE-purchase BEHAVIOUR, NEVER the conversion label — are in **§PART L** ↔
+> `templates.py::CROSS_SELL_TEMPLATES`. ⚠ CLV is the INVERSE of churn and shares its generic concepts, so
+> every recipe additionally anchors on a NON-STRUCTURAL distinctive concept (`product_type`/`segment`/
+> `peer_group`/`channel`) to hold the churn=churn-lens invariant; CLV is a declared projection.
 
 ## B6. Collections & recoveries — the DELINQUENCY → RECOVERY journey
 ```
@@ -463,6 +476,16 @@ group (§A6 `group_exposure_sum`). Cash-flow / trade-flow-based, not just financ
   Signals: `combined_exposure_trend` (across products + subsidiaries), `cross_product_stress_count` (#
   product lines simultaneously stressed — a strong early-warning), `trade_flow_decline` (business slowing).
   Near-label: covenant breach for a breach-prediction target.
+> **Full parametric set:** the 11 grounded recipes covering trade finance (facility utilisation & headroom,
+> LC/guarantee usage & rollover), invoice/receivables finance (DSO / dilution / debtor concentration),
+> supply-chain finance (anchor-buyer dependence, term extension, program utilisation), the covenant-headroom
+> breach path (near-label), syndication concentration, group-exposure aggregation & single-obligor
+> concentration, guarantor reliance, trade-cycle / working-capital gap, pooling-structure utilisation, and
+> the cross-product stress count (early-warning) are in **§PART L** ↔ `templates.py::CORPORATE_TRADE_TEMPLATES`.
+> Every recipe anchors on a NON-STRUCTURAL corporate-distinctive concept (`limit`/`limit_type`/
+> `contingent_exposure`/`covenant`/`syndication_share`/`collateral_type`/`ownership_percentage`); entity
+> concepts (`invoice_id`/`obligor_id`/`guarantor_id`/`pooling_structure_id`) ride as the grain, never the
+> sole anchor. DSO / trade-cycle / working-capital gap are declared projections; covenant is the near-label.
 
 ---
 
@@ -1515,3 +1538,193 @@ Routing + safety are verified by `test_templates_specialist.py`: each family gro
 catalog, the engine NEVER binds a leakage anchor (headline: lapse prediction never reads `lapsed`/
 `surrendered`) or a protected column, near-label recipes carry `near_label=True`, and none of the three
 families grounds anything on the churn catalog (`ALL_TEMPLATES` on churn still yields exactly the churn lens).
+
+# PART L — Appendix: cross-sell/clv + corporate-trade full parametric sets (implements §B5 + §B15)
+
+The §B5 **cross-sell / CLV GROWTH journey** (10 recipes, `templates.py::CROSS_SELL_TEMPLATES`) and the §B15
+**corporate / SME trade & supply-chain-finance** set (11 recipes, `templates.py::CORPORATE_TRADE_TEMPLATES`)
+authored to Part-F/G/H/I/J/K depth — the recipes the template engine grounds. These two families are the
+FINAL breadth pass: both join `ALL_TEMPLATES` (now the **fifteen-family** union — the complete library),
+which gate1 grounds. Each is groundable by concept-matching, safe-by-construction (PIT baked in), and carries
+a degrade path. Concept names match the taxonomy (§3) — no concept was invented.
+
+**Routing discipline (the load-bearing rule — the locked churn=churn-lens invariant; ⚠ CLV is the HARDEST
+case).** Grounding is the router, so a family surfaces ONLY where its distinctive concepts exist. An *entity*
+concept (`product_id`, `campaign_id`, `household_id`, `relationship_manager_id`, `invoice_id`, `obligor_id`,
+`guarantor_id`, `pooling_structure_id`) gets **structural `is_grain` credit** in the matcher — it would bind
+ANY grain column, cross-surfacing onto a plain churn catalog. Cross-sell/CLV is the **INVERSE of churn and
+SHARES its generic concepts** (`monetary_flow` / `event_timestamp` / `customer_id`) — a CLV recipe needing
+ONLY those would cross-surface and BREAK the invariant. So every recipe REQUIRES at least one domain-
+distinctive **NON-STRUCTURAL** concept that binds only by exact concept match:
+- **cross-sell / CLV:** `product_type` / `segment` / `peer_group` / `channel` (all four exist — no
+  substitution needed; the entity concepts ride as the grain / an optional link, never the sole anchor);
+- **corporate / trade & SCF:** `limit` / `limit_type` / `contingent_exposure` / `covenant` /
+  `syndication_share` / `collateral_type` / `ownership_percentage` (the entity concepts `invoice_id` /
+  `obligor_id` / `guarantor_id` / `pooling_structure_id` ride as the grain / aggregation link).
+
+This holds the locked invariant, asserted by `test_templates_growth_trade.py`: **`ALL_TEMPLATES` grounded on
+the churn `_CATALOG` yields EXACTLY the churn lens** (each new family grounds nothing there — the CLV test
+specifically proves the inverse-of-churn family does not cross-surface despite sharing churn's generics). No
+recipe ever `Need`s a leakage anchor (`outcome_label` = the purchased/converted label for cross-sell;
+`default_flag` / `outcome_label` for corporate); the engine refuses them by construction.
+
+**Near-label / leakage discipline (safety by construction).**
+- **cross-sell propensity** is built from PRE-purchase BEHAVIOUR (product gaps, engagement, campaign
+  exposure) — NEVER the conversion / purchased `outcome_label` (the HEADLINE: a next-best-product propensity
+  must not read the conversion label). The growth journey carries **no near-label** — "conversion" is a HARD
+  leakage anchor, not a bordering near-label. **CLV** is a DECLARED PROJECTION (no data plane computes the
+  forward lifetime value). Fair-lending: no protected-attribute inference for targeting (engine-blocked).
+- **corporate** carries ONE near-label: `covenant_headroom_breach` — a covenant breach BORDERS the group
+  default / restructure label → `near_label=True` + a ⚠ note (observe strictly pre-breach). **DSO /
+  trade-cycle length / working-capital gap** are DECLARED PROJECTIONS over the invoice + flow history.
+  Additivity is honest per measure: exposures/contingents semi_additive (STOCKS), utilisation/concentration/
+  DSO non_additive (ratios), counts additive; group exposures aggregate UP the ownership hierarchy
+  (`ownership_percentage` is the consolidation weight, §A6 `group_exposure_sum`).
+
+## Cross-sell / CLV — the GROWTH journey (`CROSS_SELL_TEMPLATES`)
+
+**Grounding requirements — a "cross-sell-ready" catalog needs:** `customer_id` (grain) · `as_of_date` ·
+`event_timestamp` · `effective_date` (holdings open/close, origination) · a `monetary_flow` (revenue/spend) ·
+`product_type` · `segment` · `peer_group` · `channel` · plus the entity links `product_id` · `campaign_id` ·
+`household_id` · `relationship_manager_id`, plus the `outcome_label` target (the purchased/converted label —
+a leakage anchor, never a feature input). Additivity: counts/revenue additive, ratios/share-of-wallet
+non_additive, propensity n/a.
+
+### ONBOARDING / ACTIVATION
+1. **`channel_adoption_depth_{window}`** — distinct servicing channels + digital-led share / adoption trend
+   (`measure=digital_share/distinct_channels/adoption_trend`). **needs:** `channel` · `event_timestamp` ·
+   `customer_id`. **add:** non_additive. *anchor `channel` (exists — no substitution).*
+
+### DEEPENING (cross-sell windows)
+2. **`product_gap_whitespace_{window}`** — count of products the SEGMENT holds that this customer lacks
+   (`measure=gap_count/whitespace_flag`). **needs:** `product_type` · `segment` · `effective_date` ·
+   `customer_id`. **add:** additive (count). *anchor `product_type`+`segment`.*
+3. **`next_best_product_propensity_{window}`** — pre-purchase blend of gaps + engagement + spend that ranks
+   the next product (`measure=propensity_signal/gap_engagement_score`). **needs:** `product_type` ·
+   `product_id` (opt) · `monetary_flow` · `event_timestamp` · `customer_id`. **add:** n/a. **explain:** M.
+   *built from BEHAVIOUR, NEVER the conversion label.*
+4. **`relationship_deepening_breadth_{window}`** — product-breadth GROWTH (`measure=breadth/breadth_growth`),
+   the positive INVERSE of churn's product_attrition. **needs:** `product_type` · `effective_date` ·
+   `customer_id`. **add:** additive. *DISTINCT id from churn's `product_breadth`.*
+5. **`campaign_response_recency_{window}`** — response rate / recency / count over product-cross-sell
+   campaigns (`measure=response_rate/days_since_last_response/response_count`). **needs:** `product_type` ·
+   `campaign_id` · `event_timestamp` · `customer_id`. **add:** non_additive. *anchor `product_type`
+   (`campaign_id` is an ENTITY concept — not the sole anchor); built from response BEHAVIOUR.*
+
+### MATURITY
+6. **`clv_revenue_trajectory_{window}`** — revenue by product / trend / forward CLV projection
+   (`measure=revenue/revenue_trend/clv_projection`). **needs:** `monetary_flow` · `product_type` ·
+   `product_id` (opt) · `event_timestamp` · `customer_id`. **add:** additive (revenue). *anchor
+   `product_type` (monetary_flow + event_ts + customer_id are SHARED with churn — product_type is load-
+   bearing for routing); CLV is a DECLARED projection (no data plane).*
+7. **`share_of_wallet_growth_{window}`** — held products/revenue as a share of the eligible catalog + its
+   growth (`measure=sow_level/sow_growth`). **needs:** `product_type` · `monetary_flow` (opt) · `as_of_date` ·
+   `customer_id`. **add:** non_additive (a share).
+8. **`segment_relative_penetration_{window}`** — under-penetration vs the PEER GROUP (`measure=penetration_
+   gap/relative_holding_index`). **needs:** `peer_group` · `product_type` (opt) · `as_of_date` ·
+   `customer_id`. **add:** non_additive. *anchor `peer_group`.*
+
+### AGGREGATION
+9. **`household_relationship_value_{window}`** — product breadth / revenue / share summed across a HOUSEHOLD
+   (or an RM book) (`measure=household_breadth/household_revenue/household_revenue_share`). **needs:**
+   `product_type` · `household_id` (grain) · `relationship_manager_id` (opt) · `as_of_date`. **add:** additive
+   (rollup). *anchor `product_type` (`household_id`/`relationship_manager_id` are the aggregation grain).*
+
+### DEEPENING (readiness)
+10. **`tenure_upsell_readiness_{window}`** — relationship tenure × held product mix → upsell-readiness score
+    (`measure=upsell_ready_flag/tenure_gap_score`). **needs:** `product_type` · `effective_date` (origination)
+    · `as_of_date` · `customer_id`. **add:** n/a. *anchor `product_type` (tenure alone is generic — would
+    cross-surface).*
+
+## Corporate / SME — trade & supply-chain finance (`CORPORATE_TRADE_TEMPLATES`)
+
+**Grounding requirements — a "corporate-ready" catalog needs:** `facility_id` (grain) + `obligor_id` ·
+`as_of_date` · `event_timestamp` · `limit` · `limit_type` · `contingent_exposure` · a drawn `monetary_stock`
+· an invoice `monetary_flow` · `covenant` · `syndication_share` · `collateral_type` · `ownership_percentage` ·
+the entity links `invoice_id` · `guarantor_id` · `pooling_structure_id`, plus the `default_flag` /
+`outcome_label` target (leakage anchor — never a feature input). Additivity: exposures/contingents
+semi_additive (STOCKS), utilisation/concentration/DSO non_additive, counts additive.
+
+### WORKING CAPITAL / FACILITY
+11. **`facility_utilisation_headroom_{window}`** — drawn ÷ limit / headroom / undrawn share
+    (`measure=utilisation/headroom/undrawn_share`). **needs:** `limit` · `contingent_exposure` (opt) ·
+    `monetary_stock` (opt) · `as_of_date` · `facility_id`. **add:** non_additive. *anchor `limit` (nested
+    sub-limits — never naively sum).*
+
+### TRADE FINANCE (LC / guarantee)
+12. **`lc_guarantee_rollover_{window}`** — contingent (LC/guarantee) level / utilisation / rollover rate
+    (`measure=contingent_level/utilisation/rollover_rate`). **needs:** `contingent_exposure` ·
+    `event_timestamp` (opt) · `as_of_date` · `facility_id`. **add:** semi_additive (the contingent stock).
+    *anchor `contingent_exposure` (an LC/guarantee/committed line; converts on drawdown via the ccf).*
+
+### INVOICE / RECEIVABLES FINANCE
+13. **`invoice_finance_dynamics_{window}`** — DSO / dilution / debtor concentration over the financed
+    receivables pool (`measure=dso/dilution_rate/debtor_concentration_hhi`). **needs:** `collateral_type` ·
+    `invoice_id` · `monetary_flow` · `event_timestamp` · `obligor_id`. **add:** non_additive. *anchor
+    `collateral_type` (receivables ARE a collateral_type; `invoice_id` is the receivables grain); DSO /
+    dilution are DECLARED projections.*
+
+### SUPPLY-CHAIN FINANCE
+14. **`supply_chain_finance_dynamics_{window}`** — anchor-buyer dependence / payment-term extension / program
+    utilisation over the committed SCF program (`measure=anchor_buyer_dependence/payment_term_extension/
+    program_utilisation`). **needs:** `contingent_exposure` · `monetary_flow` (opt) · `event_timestamp` (opt)
+    · `as_of_date` · `obligor_id`. **add:** non_additive. *anchor `contingent_exposure` (the committed
+    program line).*
+
+### COVENANT PRESSURE (near-label)
+15. **`covenant_headroom_breach_{window}`** ⚠ **near-label** — leverage/DSCR/ICR headroom / breach proximity /
+    breached flag / trend (`measure=headroom/breach_proximity/breached_flag/trend`). **needs:** `covenant` ·
+    `as_of_date` · `obligor_id`. **add:** non_additive. **⚠ near-label:** a covenant breach borders the group
+    default/restructure label — observe strictly pre-breach.
+
+### SYNDICATION / GROUP / CREDIT MITIGATION
+16. **`syndication_concentration_{window}`** — lender's syndication share / book concentration HHI / top-deal
+    share (`measure=share_level/concentration_hhi/top_deal_share`). **needs:** `syndication_share` ·
+    `as_of_date` · `facility_id`. **add:** non_additive. **explain:** M. *anchor `syndication_share`.*
+17. **`group_exposure_aggregation_{window}`** — combined exposure summed UP the ownership hierarchy /
+    single-obligor share / group concentration HHI (`measure=group_exposure/single_obligor_share/group_
+    concentration_hhi`). **needs:** `ownership_percentage` · `monetary_stock` (opt) · `as_of_date` ·
+    `obligor_id`. **add:** semi_additive (the group exposure stock). *anchor `ownership_percentage` (the group
+    consolidation weight, §A6).*
+18. **`guarantor_reliance_{window}`** — guaranteed share / guarantor concentration / heavy-reliance flag
+    (`measure=guaranteed_share/guarantor_concentration/reliance_flag`). **needs:** `collateral_type` ·
+    `guarantor_id` · `contingent_exposure` (opt) · `as_of_date` · `obligor_id`. **add:** non_additive. *anchor
+    `collateral_type` (a guarantee IS a collateral_type; `guarantor_id` is the guarantor grain).*
+
+### WORKING CAPITAL / CASH MANAGEMENT
+19. **`trade_cycle_working_capital_{window}`** — working-capital gap (DSO+DIO−DPO) / trade-cycle length /
+    trend, scoped to the trade/WC facility by its limit_type (`measure=working_capital_gap/trade_cycle_length/
+    wc_gap_trend`). **needs:** `limit_type` · `limit` (opt) · `monetary_flow` (opt) · `event_timestamp` (opt) ·
+    `as_of_date` · `obligor_id`. **add:** non_additive. *anchor `limit_type`; WC gap / trade cycle are
+    DECLARED projections.*
+20. **`pooling_structure_utilisation_{window}`** — cash-pool utilisation vs the pool limit / notional-pooling
+    benefit / intraday-peak share (`measure=pool_utilisation/notional_pool_benefit/intraday_peak_share`).
+    **needs:** `limit` · `monetary_stock` (opt) · `as_of_date` · `pooling_structure_id`. **add:**
+    non_additive. **explain:** M. *anchor `limit` (`pooling_structure_id` is the pool grain).*
+
+### CORPORATE DETERIORATION FUNNEL (early-warning)
+21. **`cross_product_stress_count_{window}`** — # product lines simultaneously stressed across a group /
+    combined exposure trend / trade-flow decline (`measure=stressed_line_count/combined_exposure_trend/
+    trade_flow_decline`). **needs:** `limit` · `contingent_exposure` (opt) · `as_of_date` · `obligor_id`.
+    **add:** additive (count). *anchor `limit` — an early-warning (counts stress BEFORE any breach), NOT
+    near-label.*
+
+**Concept substitutions (vs the §B5/§B15 designs).** None invented — every `Need` binds a real §3 concept.
+Noted on each template: (a) cross-sell — `channel` exists (no substitution); the whitespace / share-of-wallet
+comparisons (segment basket, eligible catalog, estimated wallet) and the CLV projection are DECLARED
+downstream derivations (§D.8); (b) corporate — no dedicated DSO / dilution / working-capital / trade-cycle
+concept → `invoice_finance_dynamics` binds `collateral_type=receivables` + `invoice_id` and declares DSO /
+dilution downstream, `trade_cycle_working_capital` scopes on `limit_type` and declares the WC gap / cycle
+length; a guarantee binds `collateral_type=guarantee` (`guarantor_reliance`); the group consolidation is a
+declared `Σ exposure × ownership_percentage` up the hierarchy.
+
+**Build note (B5/B15).** These 21 map 1:1 to the `templates.py` model exactly like §PART F–K — `needs`→
+grounding contract, `params`→parameter schema, `pit`→trailing-window/state guard, `degrade`→fallback,
+`near_label`→the 3-part leakage flag. The near-label subset the golden set must exercise: `covenant_headroom_
+breach` (corporate); cross-sell carries none but the HEADLINE leakage guard is exercised on every cross-sell
+recipe (a propensity must not read the conversion `outcome_label`). Routing + safety are verified by
+`test_templates_growth_trade.py`: each family grounds its whole domain-shaped catalog, the engine NEVER binds
+a leakage anchor (headline: cross-sell propensity never reads the purchased/converted label) or a protected
+column, the near-label covenant recipe carries `near_label=True`, and neither family grounds anything on the
+churn catalog (`ALL_TEMPLATES` on churn still yields exactly the churn lens — the CLV test proves the
+inverse-of-churn family does not cross-surface despite sharing churn's generic concepts).

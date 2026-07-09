@@ -30,7 +30,9 @@ from featuregen.overlay.upload.templates import (
     AML_TEMPLATES,
     ASSET_MGMT_TEMPLATES,
     COLLECTIONS_TEMPLATES,
+    CORPORATE_TRADE_TEMPLATES,
     CREDIT_RISK_TEMPLATES,
+    CROSS_SELL_TEMPLATES,
     CUSTODY_TEMPLATES,
     DEPOSITS_TEMPLATES,
     ESG_TEMPLATES,
@@ -339,8 +341,8 @@ def test_all_templates_on_a_churn_catalog_still_yields_only_the_churn_lens(db):
     assert not (combined & (_ALL_COLL_IDS | _ALL_DEP_IDS | _ALL_PAY_IDS))
 
 
-# ══ registry: ALL_TEMPLATES is the THIRTEEN-family union, globally id-unique ═════════════════════════
-def test_all_templates_registry_is_the_thirteen_family_union():
+# ══ registry: ALL_TEMPLATES is the FIFTEEN-family union (the complete library), globally id-unique ═══
+def test_all_templates_registry_is_the_fifteen_family_union():
     ids = [t.id for t in ALL_TEMPLATES]
     assert len(ids) == len(set(ids))                      # no duplicate id across families
     assert set(ids) == (
@@ -350,23 +352,31 @@ def test_all_templates_registry_is_the_thirteen_family_union():
         | {t.id for t in MARKETS_TEMPLATES} | {t.id for t in CUSTODY_TEMPLATES}
         | {t.id for t in ASSET_MGMT_TEMPLATES}
         | {t.id for t in INSURANCE_TEMPLATES} | {t.id for t in ISLAMIC_TEMPLATES}
-        | {t.id for t in ESG_TEMPLATES})
+        | {t.id for t in ESG_TEMPLATES}
+        | {t.id for t in CROSS_SELL_TEMPLATES} | {t.id for t in CORPORATE_TRADE_TEMPLATES})
     assert len(ALL_TEMPLATES) == (
         len(RETAIL_CHURN_TEMPLATES) + len(CREDIT_RISK_TEMPLATES) + len(FRAUD_TEMPLATES)
         + len(AML_TEMPLATES) + len(COLLECTIONS_TEMPLATES) + len(DEPOSITS_TEMPLATES)
         + len(PAYMENTS_TEMPLATES) + len(MARKETS_TEMPLATES) + len(CUSTODY_TEMPLATES)
         + len(ASSET_MGMT_TEMPLATES) + len(INSURANCE_TEMPLATES) + len(ISLAMIC_TEMPLATES)
-        + len(ESG_TEMPLATES))
+        + len(ESG_TEMPLATES) + len(CROSS_SELL_TEMPLATES) + len(CORPORATE_TRADE_TEMPLATES))
     # the three core-3 families do not collide ids with each other or the four existing families
     assert not (_ALL_COLL_IDS & _ALL_DEP_IDS) and not (_ALL_DEP_IDS & _ALL_PAY_IDS)
     assert not (_ALL_COLL_IDS & _ALL_PAY_IDS)
     existing = ({t.id for t in RETAIL_CHURN_TEMPLATES} | {t.id for t in CREDIT_RISK_TEMPLATES}
                 | {t.id for t in FRAUD_TEMPLATES} | {t.id for t in AML_TEMPLATES})
     assert not ((_ALL_COLL_IDS | _ALL_DEP_IDS | _ALL_PAY_IDS) & existing)
-    # …nor with the breadth families (markets / custody / asset-mgmt) or the specialist-lines families
-    # (insurance / islamic / esg — the three new families completing the thirteen-family union).
+    # …nor with the breadth families (markets / custody / asset-mgmt), the specialist-lines families
+    # (insurance / islamic / esg), or the two growth/trade families (cross-sell / corporate-trade — the
+    # final two families completing the FIFTEEN-family library).
     breadth = ({t.id for t in MARKETS_TEMPLATES} | {t.id for t in CUSTODY_TEMPLATES}
                | {t.id for t in ASSET_MGMT_TEMPLATES})
     specialist = ({t.id for t in INSURANCE_TEMPLATES} | {t.id for t in ISLAMIC_TEMPLATES}
                   | {t.id for t in ESG_TEMPLATES})
-    assert not ((_ALL_COLL_IDS | _ALL_DEP_IDS | _ALL_PAY_IDS | existing) & (breadth | specialist))
+    growth_trade = ({t.id for t in CROSS_SELL_TEMPLATES} | {t.id for t in CORPORATE_TRADE_TEMPLATES})
+    assert not ((_ALL_COLL_IDS | _ALL_DEP_IDS | _ALL_PAY_IDS | existing)
+                & (breadth | specialist | growth_trade))
+    # the two growth/trade families collide no id with each other or any other family in the library.
+    assert not ({t.id for t in CROSS_SELL_TEMPLATES} & {t.id for t in CORPORATE_TRADE_TEMPLATES})
+    assert not (growth_trade & (existing | _ALL_COLL_IDS | _ALL_DEP_IDS | _ALL_PAY_IDS
+                                | breadth | specialist))

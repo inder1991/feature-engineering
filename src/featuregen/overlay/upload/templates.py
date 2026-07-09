@@ -3451,6 +3451,592 @@ ESG_TEMPLATES: tuple[Template, ...] = (
 
 
 # ──────────────────────────────────────────────────────────────────────────────────────────────────
+# The cross-sell / CLV templates — the §B5 GROWTH journey (the INVERSE of attrition) authored to Part-F
+# depth (Phase-3 Pass-6, the FINAL breadth pass — completes the 15-family library).
+#
+# The positive mirror of B1 churn: the SAME signals read in reverse (rising breadth/salary = growth,
+# falling = attrition). Journey (§B5): ONBOARDING → ACTIVATION → DEEPENING → MATURITY → ADVOCACY. Two
+# authoring disciplines are load-bearing:
+#   • ROUTING (⚠ the HARDEST case in the library) — cross-sell/CLV is the INVERSE of churn and SHARES its
+#     generic concepts (monetary_flow, event_timestamp, customer_id). A CLV recipe needing ONLY those would
+#     CROSS-SURFACE onto the churn catalog and break the locked churn=churn-lens invariant. So every recipe
+#     ADDITIONALLY REQUIRES a NON-STRUCTURAL distinctive concept absent from churn — product_type / segment /
+#     peer_group / channel (all four exist in the taxonomy — no substitution needed). An ENTITY concept
+#     (product_id / campaign_id / household_id / relationship_manager_id) gets structural is_grain credit in
+#     _match and would bind ANY churn grain column, so it is NEVER a sole anchor — it rides as the grain or
+#     an optional link. Grounding is the router; a churn catalog (monetary_flow + event_ts + customer_id, NO
+#     product_type/segment/peer_group/channel) grounds NOTHING here.
+#   • LEAKAGE (safety by construction) — a cross-sell PROPENSITY is built from the PRE-purchase BEHAVIOUR
+#     (product gaps, engagement, campaign exposure), NEVER the conversion / purchased outcome_label (a
+#     leakage anchor the engine refuses). No recipe is near-label — the growth journey's "conversion" is a
+#     HARD leakage anchor, not a bordering near-label. CLV is a DECLARED PROJECTION (no data plane computes
+#     the forward lifetime value). Fair-lending: no protected-attribute inference for targeting (engine-
+#     blocked). Additivity: counts / revenue additive, ratios / share-of-wallet non_additive, propensity n/a.
+# The Part-L appendix in docs/…/2026-07-08-banking-feature-template-library.md is the doc source of record.
+# ──────────────────────────────────────────────────────────────────────────────────────────────────
+_CROSS_SELL_PIT_STATE = ("point-in-time cross-sell / relationship STATE observed as-of: product holdings / "
+                         "share-of-wallet / penetration within (as_of − {window}, as_of], knowable strictly "
+                         "≤ as_of, never forward. DESIGN-TIME declaration — no data plane enforces runtime PIT.")
+_CLV_PROJECTION = ("CLV / forward revenue is a DECLARED PROJECTION — no data plane computes the lifetime "
+                   "value here; the forward projection is a downstream derivation (§D.8), not a bound fact.")
+_CROSS_SELL_NO_LABEL = ("built from PRE-purchase BEHAVIOUR (product gaps, engagement, campaign exposure), "
+                        "NEVER the conversion / purchased outcome (outcome_label is a leakage anchor the "
+                        "engine refuses by construction) — a propensity, not the label.")
+
+CROSS_SELL_TEMPLATES: tuple[Template, ...] = (
+    # ── ONBOARDING / ACTIVATION — channel adoption / digital engagement ─────────────────────────────
+    # L.1 — channel_adoption_depth (digital / channel engagement)
+    Template(
+        id="channel_adoption_depth", family="channel_engagement",
+        intent="Channel-adoption depth / digital engagement — the distinct servicing channels a customer "
+               "uses and how digital-led the mix is (measure=digital_share / distinct_channels / "
+               "adoption_trend); an activated, digitally-engaged customer is cross-sell-ready.",
+        needs=(Need("channel", "channel"), Need("event_ts", "event_timestamp"),
+               Need("entity", "customer_id")),
+        params={"window": (90, 180, 365), "measure": ("digital_share", "distinct_channels", "adoption_trend")},
+        aggregation="channel_adoption", additivity="non_additive", explain="H",
+        use_cases=("cross_sell", "engagement", "next_best_action"),
+        pit=_PIT_TRAILING,
+        degrade="no channel tag -> SKIP (channel adoption needs an origination/servicing channel).",
+        stage="1-activation",
+        eligibility=_CROSS_SELL_NO_LABEL,
+        notes=("anchor: 'channel' (cross-sell-distinctive, non-structural) routes this off a churn catalog "
+               "(channel exists in the taxonomy — no substitution needed).",
+               "OUTPUT additivity is measure-dependent: digital_share is a non-additive ratio; "
+               "distinct_channels is a mix/diversity (n/a); adoption_trend is n/a — the default carries "
+               "the ratio case."),
+    ),
+    # ── DEEPENING (cross-sell windows) — whitespace, next-best-product, breadth growth, campaigns ─────
+    # L.2 — product_gap_whitespace (products the segment holds that this customer lacks)
+    Template(
+        id="product_gap_whitespace", family="whitespace",
+        intent="Product-gap / whitespace — the count of products the customer's SEGMENT typically holds "
+               "that THIS customer lacks (measure=gap_count / whitespace_flag); the headline cross-sell "
+               "opportunity signal. Compares held product_type vs the segment's typical basket.",
+        needs=(Need("product", "product_type"), Need("segment", "segment"),
+               Need("open_close", "effective_date"), Need("entity", "customer_id")),
+        params={"window": (365, 180, 90), "measure": ("gap_count", "whitespace_flag")},
+        aggregation="product_gap", additivity="additive", explain="H",
+        use_cases=("cross_sell", "next_best_action", "whitespace"),
+        pit=_CROSS_SELL_PIT_STATE,
+        degrade="no segment tag -> compute the gap vs the WHOLE eligible product catalog (weaker; FLAG the "
+                "loss of the peer-basket comparison).",
+        stage="3-deepening",
+        eligibility=_CROSS_SELL_NO_LABEL,
+        derived=("segment_basket := the product_type set the segment typically holds; gap := basket − held "
+                 "— computed DOWNSTREAM (no data plane); whitespace_flag := gap_count > 0.",),
+        notes=("anchor: 'product_type' + 'segment' (both cross-sell-distinctive, non-structural) route "
+               "this off a churn catalog.",
+               "OUTPUT additivity is measure-dependent: gap_count is an additive count; whitespace_flag is "
+               "n/a — the default carries the additive count."),
+    ),
+    # L.3 — next_best_product_propensity (pre-purchase behaviour, NEVER the conversion label)
+    Template(
+        id="next_best_product_propensity", family="next_best_product",
+        intent="Next-best-product propensity signals — a pre-purchase blend of product gaps, engagement "
+               "and spend intensity that ranks the next product a customer is likely to take "
+               "(measure=propensity_signal / gap_engagement_score). Built from BEHAVIOUR, NEVER the "
+               "purchased outcome.",
+        needs=(Need("product", "product_type"), Need("next_product", "product_id", optional=True),
+               Need("flow_col", "monetary_flow"), Need("event_ts", "event_timestamp"),
+               Need("entity", "customer_id")),
+        params={"window": (180, 90, 365), "measure": ("propensity_signal", "gap_engagement_score")},
+        aggregation="next_best_product", additivity="n/a", explain="M",
+        use_cases=("cross_sell", "next_best_action", "clv"),
+        pit=_PIT_TRAILING,
+        degrade="no product-holding data -> SKIP (a next-best-product signal needs the held product_type).",
+        stage="3-deepening",
+        eligibility=_CROSS_SELL_NO_LABEL,
+        derived=("propensity_signal := f(product gaps, engagement recency/frequency, spend intensity) — a "
+                 "RANKING signal computed DOWNSTREAM (no data plane); the conversion label is NEVER read.",),
+        notes=("anchor: 'product_type' (cross-sell-distinctive, non-structural) routes this off a churn "
+               "catalog ('product_id' names the candidate next product — optional).",
+               "a propensity signal — n/a (a ranking score, not summable); explain M (a blended derived "
+               "signal, not a single monotone measure)."),
+    ),
+    # L.4 — relationship_deepening_breadth (product-breadth GROWTH — the inverse of churn's product_attrition)
+    Template(
+        id="relationship_deepening_breadth", family="relationship_deepening",
+        intent="Relationship-deepening / product-breadth GROWTH — breadth = count(distinct products held) "
+               "and its GROWTH over the window (measure=breadth / breadth_growth); the positive inverse of "
+               "churn's product_attrition (a DISTINCT recipe from churn's product_breadth).",
+        needs=(Need("product", "product_type"), Need("open_close", "effective_date"),
+               Need("entity", "customer_id")),
+        params={"window": (365, 180, 90), "measure": ("breadth", "breadth_growth")},
+        aggregation="relationship_deepening", additivity="additive", explain="H",
+        use_cases=("cross_sell", "share_of_wallet", "clv"),
+        pit=_CROSS_SELL_PIT_STATE,
+        degrade="no product-holding data -> SKIP.",
+        stage="3-deepening",
+        eligibility=_CROSS_SELL_NO_LABEL,
+        notes=("anchor: 'product_type' (cross-sell-distinctive, non-structural) routes this off a churn "
+               "catalog.",
+               "distinct id from churn's 'product_breadth' — this is the GROWTH direction (breadth_growth "
+               "= breadth(as_of) − breadth(as_of−window)), the inverse of the unbundling attrition signal.",
+               "a breadth count / its growth — additive."),
+    ),
+    # L.5 — campaign_response_recency (campaign exposure/response BEHAVIOUR, NEVER the conversion label)
+    Template(
+        id="campaign_response_recency", family="campaign_response",
+        intent="Campaign response / recency — a customer's response rate, recency or count over exposure "
+               "to product-cross-sell campaigns (measure=response_rate / days_since_last_response / "
+               "response_count). Built from response BEHAVIOUR, NEVER the conversion outcome.",
+        needs=(Need("product", "product_type"), Need("campaign", "campaign_id"),
+               Need("event_ts", "event_timestamp"), Need("entity", "customer_id")),
+        params={"window": (90, 180, 365),
+                "measure": ("response_rate", "days_since_last_response", "response_count")},
+        aggregation="campaign_response", additivity="non_additive", explain="H",
+        use_cases=("cross_sell", "next_best_action", "campaign_analytics"),
+        pit=_PIT_TRAILING,
+        degrade="no campaign-exposure data -> SKIP (campaign response needs campaign touch events).",
+        stage="3-deepening",
+        eligibility=_CROSS_SELL_NO_LABEL,
+        notes=("anchor: 'product_type' (cross-sell-distinctive, non-structural — the promoted product) "
+               "routes this off a churn catalog ('campaign_id' is an ENTITY concept — it would "
+               "structurally bind ANY grain column, so it cannot be the sole anchor).",
+               "OUTPUT additivity is measure-dependent: response_rate is a non-additive ratio; "
+               "days_since_last_response is a recency (n/a); response_count is additive — the default "
+               "carries the ratio case."),
+    ),
+    # ── MATURITY — CLV / revenue trajectory, share-of-wallet growth, peer-relative penetration ────────
+    # L.6 — clv_revenue_trajectory (monetary_flow + product_type; CLV is a DECLARED PROJECTION)
+    Template(
+        id="clv_revenue_trajectory", family="clv_revenue",
+        intent="CLV / revenue trajectory by product — customer revenue summed by product_type "
+               "(measure=revenue), its trailing trend (measure=revenue_trend) or a forward CLV projection "
+               "(measure=clv_projection). Revenue is additive; the CLV is a declared forward projection.",
+        needs=(Need("flow_col", "monetary_flow"), Need("product", "product_type"),
+               Need("next_product", "product_id", optional=True), Need("event_ts", "event_timestamp"),
+               Need("entity", "customer_id")),
+        params={"window": (365, 180, 90), "measure": ("revenue", "revenue_trend", "clv_projection")},
+        aggregation="clv_revenue", additivity="additive", explain="H",
+        use_cases=("clv", "cross_sell", "pricing"),
+        pit=_PIT_TRAILING,
+        degrade="only a single revenue snapshot (no history) -> report the by-product revenue sum (no "
+                "trend / projection).",
+        stage="4-maturity",
+        eligibility="single currency — convert to base first. " + _CROSS_SELL_NO_LABEL,
+        derived=("clv_projection := a forward customer-lifetime-value projection from the revenue "
+                 "trajectory — computed DOWNSTREAM (no data plane); a DECLARED projection, not a fact.",),
+        notes=("anchor: 'product_type' (cross-sell-distinctive, non-structural) routes this off a churn "
+               "catalog (monetary_flow + event_ts + customer_id are SHARED with churn — product_type is "
+               "load-bearing for routing).",
+               _CLV_PROJECTION,
+               "OUTPUT additivity is measure-dependent: the by-product revenue SUM is additive; a "
+               "revenue_trend is n/a; a clv_projection is n/a (a projection) — the default carries the "
+               "additive revenue."),
+    ),
+    # L.7 — share_of_wallet_growth (held products vs the eligible catalog — a growing share)
+    Template(
+        id="share_of_wallet_growth", family="share_of_wallet",
+        intent="Share-of-wallet growth — held products (or revenue) as a share of the customer's eligible "
+               "product catalog / estimated total wallet, and its GROWTH over the window (measure=sow_level "
+               "/ sow_growth); a rising share-of-wallet is relationship maturity.",
+        needs=(Need("product", "product_type"), Need("flow_col", "monetary_flow", optional=True),
+               Need("asof", "as_of_date"), Need("entity", "customer_id")),
+        params={"window": (365, 180, 90), "measure": ("sow_level", "sow_growth")},
+        aggregation="share_of_wallet", additivity="non_additive", explain="H",
+        use_cases=("cross_sell", "share_of_wallet", "clv"),
+        pit=_CROSS_SELL_PIT_STATE,
+        degrade="no revenue for a value-weighted wallet -> compute a product-count share of the eligible "
+                "catalog (weaker; FLAG the count-vs-value scope).",
+        stage="4-maturity",
+        eligibility=_CROSS_SELL_NO_LABEL,
+        derived=("share_of_wallet := held products (or revenue) ÷ the eligible product catalog / estimated "
+                 "total wallet — the estimated wallet is a DECLARED downstream derivation (§D.8).",),
+        notes=("anchor: 'product_type' (cross-sell-distinctive, non-structural) routes this off a churn "
+               "catalog.",
+               "a share-of-wallet ratio (or its growth) — non-additive; compute per customer, never sum."),
+    ),
+    # L.8 — segment_relative_penetration (peer_group under-penetration)
+    Template(
+        id="segment_relative_penetration", family="peer_penetration",
+        intent="Segment-relative under-penetration — how a customer's product holding / revenue compares "
+               "to their PEER GROUP (measure=penetration_gap / relative_holding_index); a customer "
+               "under-penetrated vs peers is a cross-sell target.",
+        needs=(Need("peer", "peer_group"), Need("product", "product_type", optional=True),
+               Need("asof", "as_of_date"), Need("entity", "customer_id")),
+        params={"window": (365, 180, 90), "measure": ("penetration_gap", "relative_holding_index")},
+        aggregation="peer_penetration", additivity="non_additive", explain="H",
+        use_cases=("cross_sell", "next_best_action", "whitespace"),
+        pit=_CROSS_SELL_PIT_STATE,
+        degrade="no product breakdown -> report the peer-relative revenue index only (no per-product gap).",
+        stage="4-maturity",
+        eligibility=_CROSS_SELL_NO_LABEL,
+        notes=("anchor: 'peer_group' (cross-sell-distinctive, non-structural — the benchmarking cohort) "
+               "routes this off a churn catalog.",
+               "a peer-relative penetration gap / index — non-additive (a benchmarked ratio)."),
+    ),
+    # ── AGGREGATION — household / relationship-manager rollup ─────────────────────────────────────────
+    # L.9 — household_relationship_value (household / RM aggregation grain)
+    Template(
+        id="household_relationship_value", family="relationship_aggregation",
+        intent="Household / relationship aggregation — product breadth, revenue or revenue-share summed "
+               "across a HOUSEHOLD (or a relationship-manager's book) (measure=household_breadth / "
+               "household_revenue / household_revenue_share); the relationship-primacy rollup grain.",
+        needs=(Need("product", "product_type"), Need("entity", "household_id"),
+               Need("rm", "relationship_manager_id", optional=True), Need("asof", "as_of_date")),
+        params={"window": (365, 180, 90),
+                "measure": ("household_breadth", "household_revenue", "household_revenue_share")},
+        aggregation="relationship_aggregation", additivity="additive", explain="H",
+        use_cases=("cross_sell", "share_of_wallet", "clv"),
+        pit=_CROSS_SELL_PIT_STATE,
+        degrade="no household grain -> aggregate on the relationship_manager's book instead (a coarser "
+                "advisor-level rollup; FLAG the changed grain).",
+        stage="aggregation",
+        eligibility=_CROSS_SELL_NO_LABEL,
+        notes=("anchor: 'product_type' (cross-sell-distinctive, non-structural) routes this off a churn "
+               "catalog ('household_id' / 'relationship_manager_id' are ENTITY concepts — the aggregation "
+               "grain, not the routing anchor).",
+               "OUTPUT additivity is measure-dependent: household_breadth / household_revenue are additive "
+               "(counts / a revenue flow); a household_revenue_share is non-additive — the default carries "
+               "the additive rollup."),
+    ),
+    # ── DEEPENING (readiness) — tenure-based upsell readiness ─────────────────────────────────────────
+    # L.10 — tenure_upsell_readiness (product_type + tenure)
+    Template(
+        id="tenure_upsell_readiness", family="upsell_readiness",
+        intent="Tenure-based upsell readiness — combines relationship tenure (as_of − origination) with "
+               "the held product_type to score whether a customer is seasoned enough for a next-product "
+               "upsell (measure=upsell_ready_flag / tenure_gap_score); a seasoning-gated cross-sell signal.",
+        needs=(Need("product", "product_type"), Need("origination", "effective_date"),
+               Need("asof", "as_of_date"), Need("entity", "customer_id")),
+        params={"window": (365, 180, 90), "measure": ("upsell_ready_flag", "tenure_gap_score")},
+        aggregation="upsell_readiness", additivity="n/a", explain="H",
+        use_cases=("cross_sell", "next_best_action", "pricing"),
+        pit=_CROSS_SELL_PIT_STATE,
+        degrade="no product-holding data -> SKIP (readiness is scoped to the held product mix).",
+        stage="3-deepening",
+        eligibility=_CROSS_SELL_NO_LABEL,
+        derived=("upsell_ready := tenure ≥ a product-specific seasoning threshold AND a whitespace gap "
+                 "exists — computed DOWNSTREAM (no data plane).",),
+        notes=("anchor: 'product_type' (cross-sell-distinctive, non-structural) routes this off a churn "
+               "catalog (tenure alone — effective_date + as_of — is generic and would cross-surface).",
+               "a readiness flag / tenure-gap score — n/a (not summable)."),
+    ),
+)
+
+
+# ──────────────────────────────────────────────────────────────────────────────────────────────────
+# The corporate / SME trade & supply-chain-finance templates — the §B15 multi-product, GROUP-level set
+# authored to Part-F depth (Phase-3 Pass-6, the FINAL breadth pass — completes the 15-family library).
+#
+# Corporate is MULTI-PRODUCT + HIERARCHICAL — features aggregate across product families AND up the group
+# (§A6 group_exposure_sum); cash-flow / trade-flow-based, not just financials. Coverage (§B15): trade
+# finance (LC/guarantee), invoice / receivables finance, supply-chain finance, working-capital / facility,
+# and the corporate deterioration funnel (mirrors credit at GROUP level): HEALTHY → EARLY STRESS
+# (utilisation↑, DSO↑, term extension) → COVENANT PRESSURE (headroom↓) → BREACH ⚠ → DEFAULT/RESTRUCTURE.
+# Two authoring disciplines are load-bearing:
+#   • ROUTING — every recipe REQUIRES a corporate-distinctive, NON-STRUCTURAL concept (limit / limit_type /
+#     contingent_exposure / covenant / syndication_share / collateral_type / ownership_percentage — that
+#     binds only by exact concept match). An ENTITY concept (invoice_id / obligor_id / guarantor_id /
+#     pooling_structure_id / facility_id) gets structural is_grain credit in _match and would bind ANY grain
+#     column, so it is NEVER a sole anchor — it rides as the grain / an aggregation link. Grounding is the
+#     router; a churn catalog (with none of these corporate concepts) grounds NOTHING here (the locked
+#     invariant: ALL_TEMPLATES on the churn _CATALOG = exactly the churn lens).
+#   • NEAR-LABEL — a covenant headroom / breach-proximity BORDERS the group default/restructure label
+#     (covenant is a near_label concept) -> near_label=True + a ⚠ note (observe strictly pre-breach; the
+#     default_flag / outcome_label leakage anchors are NEVER an input — the engine refuses them). DSO /
+#     trade-cycle length / working-capital gap are DECLARED PROJECTIONS (no data plane computes them).
+#     Additivity: exposures / contingents semi_additive (STOCKS — latest over time, never summed across
+#     dates), utilisation / concentration / DSO non_additive (ratios), counts additive. Group exposures
+#     aggregate UP the ownership hierarchy (ownership_percentage is the consolidation weight).
+# The Part-L appendix in docs/…/2026-07-08-banking-feature-template-library.md is the doc source of record.
+# ──────────────────────────────────────────────────────────────────────────────────────────────────
+_CORP_PIT_STATE = ("point-in-time corporate / group-exposure STATE observed as-of: the latest exposure / "
+                   "limit / covenant / utilisation within (as_of − {window}, as_of], knowable strictly ≤ "
+                   "as_of, never forward. DESIGN-TIME declaration — no data plane enforces runtime PIT.")
+_CORP_NEAR_LABEL_PREFIX = ("⚠ NEAR-LABEL: observe the covenant-headroom / breach signal STRICTLY before the "
+                           "group default / restructure (never on/after it; window ≠ the label window); the "
+                           "3-part leakage control must FLAG it. ")
+_CORP_DSO_PROJECTION = ("DSO / trade-cycle length / working-capital gap is a DECLARED PROJECTION over the "
+                        "invoice + flow history — no data plane computes it here (a downstream derivation, "
+                        "§D.8), not a bound fact.")
+_CORP_GROUP = ("GROUP-level: exposures aggregate UP the ownership hierarchy (ownership_percentage is the "
+               "consolidation weight) — a subsidiary's risk needs the group total (§A6 group_exposure_sum).")
+_CORP_SINGLE_CCY = ("single currency — convert to base first; an exposure / contingent STOCK takes the "
+                    "LATEST over time (never summed across dates).")
+
+CORPORATE_TRADE_TEMPLATES: tuple[Template, ...] = (
+    # ── WORKING CAPITAL / FACILITY — utilisation & headroom (limit + contingent) ─────────────────────
+    # L.11 — facility_utilisation_headroom
+    Template(
+        id="facility_utilisation_headroom", family="facility_utilisation",
+        intent="Facility utilisation & headroom — drawn exposure ÷ limit (measure=utilisation), the "
+               "remaining headroom, or the undrawn (contingent) share; rising utilisation into a shrinking "
+               "headroom is the classic corporate early-stress signal.",
+        needs=(Need("limit_col", "limit"), Need("contingent_col", "contingent_exposure", optional=True),
+               Need("drawn_col", "monetary_stock", optional=True), Need("asof", "as_of_date"),
+               Need("entity", "facility_id")),
+        params={"window": (90, 180, 365), "measure": ("utilisation", "headroom", "undrawn_share")},
+        aggregation="facility_utilisation", additivity="non_additive", explain="H",
+        use_cases=("trade_finance", "working_capital", "limit_management"),
+        pit=_CORP_PIT_STATE,
+        degrade="no drawn balance -> size utilisation against the contingent (committed) line only (FLAG "
+                "the drawn-vs-committed scope).",
+        stage="1-early-stress",
+        eligibility=_CORP_SINGLE_CCY,
+        notes=("anchor: 'limit' (corporate-distinctive ceiling, non-structural) routes this off a churn "
+               "catalog (nested sub-limits — never naively sum a nested limit; §E limit-vs-balance).",
+               "a utilisation ratio / headroom — non-additive; compute per facility, never sum."),
+    ),
+    # ── TRADE FINANCE (LC / guarantee) — contingent usage & rollover ─────────────────────────────────
+    # L.12 — lc_guarantee_rollover
+    Template(
+        id="lc_guarantee_rollover", family="trade_finance_contingent",
+        intent="Letter-of-credit / guarantee usage & rollover — the contingent (LC / guarantee) exposure "
+               "level (measure=contingent_level), its utilisation, or the rollover rate of expiring "
+               "instruments; drawdowns on undrawn LCs are a stress signal (contingent converting on-BS).",
+        needs=(Need("contingent_col", "contingent_exposure"), Need("event_ts", "event_timestamp", optional=True),
+               Need("asof", "as_of_date"), Need("entity", "facility_id")),
+        params={"window": (90, 180, 365), "measure": ("contingent_level", "utilisation", "rollover_rate")},
+        aggregation="lc_guarantee", additivity="semi_additive", explain="H",
+        use_cases=("trade_finance", "supply_chain_finance", "limit_management"),
+        pit=_CORP_PIT_STATE,
+        degrade="only a single contingent snapshot (no history) -> report the contingent level (no "
+                "rollover / utilisation trend).",
+        stage="trade-finance",
+        eligibility=_CORP_SINGLE_CCY,
+        notes=("anchor: 'contingent_exposure' (corporate-distinctive — an LC / guarantee / committed line, "
+               "non-structural) routes this off a churn catalog.",
+               "OUTPUT additivity is measure-dependent: the contingent LEVEL is a semi-additive stock (sum "
+               "across instruments, latest over time — converts on drawdown via the ccf); utilisation / "
+               "rollover_rate are non-additive ratios — the default carries the semi-additive stock."),
+    ),
+    # ── INVOICE / RECEIVABLES FINANCE — DSO / dilution / debtor concentration ─────────────────────────
+    # L.13 — invoice_finance_dynamics
+    Template(
+        id="invoice_finance_dynamics", family="invoice_finance",
+        intent="Invoice / receivables-finance behaviour — days-sales-outstanding (measure=dso), invoice "
+               "dilution (unpaid / credit-noted) rate (measure=dilution_rate) or debtor concentration "
+               "(measure=debtor_concentration_hhi) over the financed receivables pool; rising DSO / "
+               "dilution is corporate cash stress.",
+        needs=(Need("collateral_col", "collateral_type"), Need("invoice", "invoice_id"),
+               Need("flow_col", "monetary_flow"), Need("event_ts", "event_timestamp"),
+               Need("entity", "obligor_id")),
+        params={"window": (90, 180, 365), "measure": ("dso", "dilution_rate", "debtor_concentration_hhi")},
+        aggregation="invoice_finance", additivity="non_additive", explain="H",
+        use_cases=("trade_finance", "working_capital", "receivables_finance"),
+        pit=_CORP_PIT_STATE,
+        degrade="no receivables-collateral tag -> compute DSO / dilution over ALL invoices (weaker; FLAG "
+                "the loss of the financed-pool scope).",
+        stage="1-early-stress",
+        eligibility=_CORP_SINGLE_CCY + " " + _CORP_DSO_PROJECTION,
+        derived=("dso := mean(payment_date − invoice_date) over the financed invoices; dilution_rate := "
+                 "credit-noted / unpaid ÷ invoiced — DECLARED downstream projections (no data plane).",),
+        notes=("anchor: 'collateral_type' (corporate-distinctive — receivables ARE a collateral_type, "
+               "non-structural) routes this off a churn catalog ('invoice_id' is an ENTITY concept — the "
+               "receivables grain, not the routing anchor).",
+               "concept sub: no dedicated DSO / dilution / receivables-finance concept — the receivables "
+               "pool binds on collateral_type=receivables + invoice_id, and DSO / dilution are declared "
+               "downstream projections.",
+               "DSO / dilution / debtor concentration — non-additive (a duration / ratio / index)."),
+    ),
+    # ── SUPPLY-CHAIN FINANCE — anchor-buyer dependence, payment-term extension, program utilisation ────
+    # L.14 — supply_chain_finance_dynamics
+    Template(
+        id="supply_chain_finance_dynamics", family="supply_chain_finance",
+        intent="Supply-chain-finance (payables / receivables) dynamics — anchor-buyer dependence (the SCF "
+               "program hinging on one anchor's health), buyer payment-term extension (extending terms = "
+               "stress), or program utilisation (measure=anchor_buyer_dependence / payment_term_extension "
+               "/ program_utilisation) over the committed SCF program.",
+        needs=(Need("contingent_col", "contingent_exposure"), Need("flow_col", "monetary_flow", optional=True),
+               Need("event_ts", "event_timestamp", optional=True), Need("asof", "as_of_date"),
+               Need("entity", "obligor_id")),
+        params={"window": (90, 180, 365),
+                "measure": ("anchor_buyer_dependence", "payment_term_extension", "program_utilisation")},
+        aggregation="supply_chain_finance", additivity="non_additive", explain="H",
+        use_cases=("supply_chain_finance", "trade_finance", "working_capital"),
+        pit=_CORP_PIT_STATE,
+        degrade="no committed-program (contingent) line -> SKIP (an SCF signal needs the program exposure).",
+        stage="1-early-stress",
+        eligibility=_CORP_SINGLE_CCY,
+        derived=("anchor_buyer_dependence := the anchor buyer's share of the program's financed flow; "
+                 "payment_term_extension := Δ(buyer payment terms) — DECLARED downstream (no data plane).",),
+        notes=("anchor: 'contingent_exposure' (corporate-distinctive — the committed SCF program line, "
+               "non-structural) routes this off a churn catalog.",
+               "anchor-buyer dependence / term extension / program utilisation — non-additive (shares / "
+               "ratios); compute per program/obligor, never sum."),
+    ),
+    # ── COVENANT PRESSURE — headroom & breach proximity (NEAR-LABEL) ──────────────────────────────────
+    # L.15 — covenant_headroom_breach
+    Template(
+        id="covenant_headroom_breach", family="covenant",
+        intent="Covenant headroom & breach proximity — the margin between a covenant's actual and its "
+               "threshold (leverage / DSCR / ICR), its proximity to a breach, or a breached flag / trend "
+               "(measure=headroom / breach_proximity / breached_flag / trend); a shrinking or negative "
+               "headroom is the corporate breach path.",
+        needs=(Need("covenant_col", "covenant"), Need("asof", "as_of_date"),
+               Need("entity", "obligor_id")),
+        params={"window": (90, 180, 365), "measure": ("headroom", "breach_proximity", "breached_flag", "trend")},
+        aggregation="covenant_headroom", additivity="non_additive", explain="H",
+        use_cases=("trade_finance", "working_capital", "early_warning"),
+        pit=_CORP_PIT_STATE,
+        stage="2-covenant-pressure",
+        near_label=True,
+        eligibility=_CORP_NEAR_LABEL_PREFIX + "a covenant breach borders the group default / restructure "
+                    "label; income / affordability inputs are SENSITIVE. " + _CORP_GROUP,
+        notes=("anchor: 'covenant' (near-label, corporate-distinctive, non-structural) — leverage / DSCR / "
+               "ICR headroom — routes this off a churn catalog.",
+               "OUTPUT additivity is measure-dependent: headroom / breach_proximity / DSCR are "
+               "non-additive ratios; breached_flag is n/a — the default carries the ratio case.",
+               "borders the group default / restructure label — observe strictly pre-breach."),
+    ),
+    # ── SYNDICATION — share concentration ────────────────────────────────────────────────────────────
+    # L.16 — syndication_concentration
+    Template(
+        id="syndication_concentration", family="syndication",
+        intent="Syndication-share concentration — the lender's share (%) of a syndicated facility "
+               "(measure=share_level), the concentration of the book across syndicated deals (an HHI, "
+               "measure=concentration_hhi), or the top-deal share; a book concentrated in a few "
+               "syndications is fragile.",
+        needs=(Need("syndication_col", "syndication_share"), Need("asof", "as_of_date"),
+               Need("entity", "facility_id")),
+        params={"window": (365, 180, 90), "measure": ("share_level", "concentration_hhi", "top_deal_share")},
+        aggregation="syndication_concentration", additivity="non_additive", explain="M",
+        use_cases=("trade_finance", "concentration_risk", "limit_management"),
+        pit=_CORP_PIT_STATE,
+        degrade="only a single deal's share -> report the syndication share level (no book concentration).",
+        stage="concentration",
+        eligibility=_CORP_SINGLE_CCY,
+        notes=("anchor: 'syndication_share' (corporate-distinctive, non-structural) routes this off a "
+               "churn catalog (shares sum to 100% within a deal — a constraint, not an aggregation).",
+               "a share / concentration index (HHI / top-share) — non-additive."),
+    ),
+    # ── GROUP STRUCTURE — group-exposure aggregation & single-obligor concentration ──────────────────
+    # L.17 — group_exposure_aggregation
+    Template(
+        id="group_exposure_aggregation", family="group_exposure",
+        intent="Group-exposure aggregation & single-obligor concentration — combined exposure summed UP "
+               "the ownership hierarchy (measure=group_exposure), the single-obligor share of the group "
+               "(measure=single_obligor_share) or a group concentration HHI; a subsidiary's risk needs the "
+               "GROUP total (§A6 group_exposure_sum).",
+        needs=(Need("ownership_col", "ownership_percentage"), Need("exposure_col", "monetary_stock", optional=True),
+               Need("asof", "as_of_date"), Need("entity", "obligor_id")),
+        params={"window": (365, 180, 90),
+                "measure": ("group_exposure", "single_obligor_share", "group_concentration_hhi")},
+        aggregation="group_exposure", additivity="semi_additive", explain="H",
+        use_cases=("trade_finance", "concentration_risk", "limit_management"),
+        pit=_CORP_PIT_STATE,
+        degrade="no exposure stock to aggregate -> report the ownership-weighted concentration only (no "
+                "group exposure amount).",
+        stage="group-aggregation",
+        eligibility=_CORP_SINGLE_CCY + " " + _CORP_GROUP,
+        derived=("group_exposure := Σ (exposure × ownership_percentage) UP the ownership hierarchy — a "
+                 "DECLARED consolidation (no data plane); single_obligor_share := obligor ÷ group total.",),
+        notes=("anchor: 'ownership_percentage' (corporate-distinctive — the group consolidation weight, "
+               "non-structural) routes this off a churn catalog ('obligor_id' is an ENTITY concept — the "
+               "group grain, not the routing anchor).",
+               "OUTPUT additivity is measure-dependent: a group_exposure amount is a semi-additive stock "
+               "(sum across the group, latest over time); a share / HHI is non-additive — the default "
+               "carries the semi-additive group stock."),
+    ),
+    # ── CREDIT MITIGATION — guarantor reliance ───────────────────────────────────────────────────────
+    # L.18 — guarantor_reliance
+    Template(
+        id="guarantor_reliance", family="guarantor_support",
+        intent="Guarantor reliance — the share of exposure covered by a guarantee (measure=guaranteed_"
+               "share), the concentration of reliance on a few guarantors (measure=guarantor_concentration)"
+               " or a heavy-reliance flag; heavy reliance on one guarantor is credit-mitigation fragility.",
+        needs=(Need("collateral_col", "collateral_type"), Need("guarantor", "guarantor_id"),
+               Need("contingent_col", "contingent_exposure", optional=True), Need("asof", "as_of_date"),
+               Need("entity", "obligor_id")),
+        params={"window": (365, 180, 90),
+                "measure": ("guaranteed_share", "guarantor_concentration", "reliance_flag")},
+        aggregation="guarantor_reliance", additivity="non_additive", explain="H",
+        use_cases=("trade_finance", "concentration_risk", "credit_mitigation"),
+        pit=_CORP_PIT_STATE,
+        degrade="no guaranteed (contingent) amount -> report the distinct-guarantor count / flag only (no "
+                "guaranteed share).",
+        stage="credit-mitigation",
+        eligibility=_CORP_SINGLE_CCY,
+        notes=("anchor: 'collateral_type' (corporate-distinctive — a guarantee IS a collateral_type, "
+               "non-structural) routes this off a churn catalog ('guarantor_id' is an ENTITY concept — the "
+               "guarantor grain, not the routing anchor).",
+               "a guaranteed share / guarantor concentration — non-additive (a ratio / index)."),
+    ),
+    # ── WORKING CAPITAL — trade-cycle / working-capital gap (DECLARED PROJECTION) ─────────────────────
+    # L.19 — trade_cycle_working_capital
+    Template(
+        id="trade_cycle_working_capital", family="working_capital",
+        intent="Trade-cycle / working-capital gap — the working-capital gap (DSO + DIO − DPO, "
+               "measure=working_capital_gap), the trade-cycle length (issue→settlement — lengthening = "
+               "stress, measure=trade_cycle_length) or its trend, scoped to the trade / working-capital "
+               "facility by its limit_type; a widening gap is cash stress.",
+        needs=(Need("limit_type_col", "limit_type"), Need("limit_col", "limit", optional=True),
+               Need("flow_col", "monetary_flow", optional=True), Need("event_ts", "event_timestamp", optional=True),
+               Need("asof", "as_of_date"), Need("entity", "obligor_id")),
+        params={"window": (90, 180, 365),
+                "measure": ("working_capital_gap", "trade_cycle_length", "wc_gap_trend")},
+        aggregation="trade_cycle", additivity="non_additive", explain="H",
+        use_cases=("working_capital", "trade_finance", "early_warning"),
+        pit=_CORP_PIT_STATE,
+        degrade="no trade / working-capital limit_type -> SKIP (the gap is scoped to a trade-finance "
+                "facility).",
+        stage="working-capital",
+        eligibility=_CORP_SINGLE_CCY + " " + _CORP_DSO_PROJECTION,
+        derived=("working_capital_gap := DSO + DIO − DPO; trade_cycle_length := settlement − issue — "
+                 "DECLARED downstream projections over the trade flows (no data plane).",),
+        notes=("anchor: 'limit_type' (corporate-distinctive — the trade / working-capital facility type, "
+               "non-structural) routes this off a churn catalog.",
+               "OUTPUT additivity is measure-dependent: working_capital_gap is a non-additive amount/ratio;"
+               " trade_cycle_length is a duration (n/a) — the default carries the non-additive gap."),
+    ),
+    # ── CASH MANAGEMENT — pooling-structure utilisation ──────────────────────────────────────────────
+    # L.20 — pooling_structure_utilisation
+    Template(
+        id="pooling_structure_utilisation", family="cash_pooling",
+        intent="Pooling-structure utilisation — the utilisation of a cash-pooling (notional / zero-"
+               "balancing) structure against its pool limit (measure=pool_utilisation), the notional-"
+               "pooling funding benefit, or an intraday-peak share; a pool running hard against its limit "
+               "is liquidity stress.",
+        needs=(Need("limit_col", "limit"), Need("balance_col", "monetary_stock", optional=True),
+               Need("asof", "as_of_date"), Need("entity", "pooling_structure_id")),
+        params={"window": (90, 180, 365),
+                "measure": ("pool_utilisation", "notional_pool_benefit", "intraday_peak_share")},
+        aggregation="pool_utilisation", additivity="non_additive", explain="M",
+        use_cases=("working_capital", "cash_management", "liquidity_risk"),
+        pit=_CORP_PIT_STATE,
+        degrade="no pooled balance -> report the pool limit / headroom only (utilisation undefined; FLAG).",
+        stage="cash-management",
+        eligibility=_CORP_SINGLE_CCY,
+        notes=("anchor: 'limit' (corporate-distinctive pool ceiling, non-structural) routes this off a "
+               "churn catalog ('pooling_structure_id' is an ENTITY concept — the pool grain, not the "
+               "routing anchor).",
+               "a pool utilisation / benefit / peak share — non-additive; compute per pool, never sum."),
+    ),
+    # ── CORPORATE DETERIORATION FUNNEL — cross-product stress count (a strong early-warning) ──────────
+    # L.21 — cross_product_stress_count
+    Template(
+        id="cross_product_stress_count", family="cross_product_stress",
+        intent="Cross-product stress count — the number of product lines simultaneously stressed "
+               "(utilisation↑ across facilities) across a group (measure=stressed_line_count), the combined "
+               "exposure trend, or a trade-flow decline; multiple lines stressed at once is a strong "
+               "corporate early-warning.",
+        needs=(Need("limit_col", "limit"), Need("contingent_col", "contingent_exposure", optional=True),
+               Need("asof", "as_of_date"), Need("entity", "obligor_id")),
+        params={"window": (90, 180, 365),
+                "measure": ("stressed_line_count", "combined_exposure_trend", "trade_flow_decline")},
+        aggregation="cross_product_stress", additivity="additive", explain="H",
+        use_cases=("trade_finance", "working_capital", "early_warning"),
+        pit=_CORP_PIT_STATE,
+        degrade="only a single facility -> report that line's utilisation (no cross-product count).",
+        stage="3-deterioration",
+        eligibility=_CORP_SINGLE_CCY + " " + _CORP_GROUP,
+        derived=("stressed_line := a facility whose utilisation exceeds a stress threshold; "
+                 "stressed_line_count := Σ stressed lines across the group — DECLARED downstream (no data "
+                 "plane).",),
+        notes=("anchor: 'limit' (corporate-distinctive — utilisation across product lines, non-structural) "
+               "routes this off a churn catalog (an early-warning, NOT near-label — it counts stress "
+               "BEFORE any breach/default).",
+               "OUTPUT additivity is measure-dependent: stressed_line_count is an additive count; a "
+               "combined_exposure_trend / trade_flow_decline is n/a (a slope) — the default carries the "
+               "additive count."),
+    ),
+)
+
+
+# ──────────────────────────────────────────────────────────────────────────────────────────────────
 # The full template REGISTRY — every family, in author order. Future template passes EXTEND this tuple;
 # gate1 grounds ALL_TEMPLATES so a family surfaces only where its distinctive concepts exist in the
 # catalog (grounding is the router). RETAIL_CHURN_TEMPLATES stays a standalone name because gate1 + the
@@ -3460,7 +4046,8 @@ ALL_TEMPLATES: tuple[Template, ...] = (
     RETAIL_CHURN_TEMPLATES + CREDIT_RISK_TEMPLATES + FRAUD_TEMPLATES + AML_TEMPLATES
     + COLLECTIONS_TEMPLATES + DEPOSITS_TEMPLATES + PAYMENTS_TEMPLATES
     + MARKETS_TEMPLATES + CUSTODY_TEMPLATES + ASSET_MGMT_TEMPLATES
-    + INSURANCE_TEMPLATES + ISLAMIC_TEMPLATES + ESG_TEMPLATES)
+    + INSURANCE_TEMPLATES + ISLAMIC_TEMPLATES + ESG_TEMPLATES
+    + CROSS_SELL_TEMPLATES + CORPORATE_TRADE_TEMPLATES)
 
 
 def _validate_family(templates: tuple[Template, ...], label: str, seen_ids: set[str]) -> None:
@@ -3499,6 +4086,8 @@ def _validate_registry() -> None:
     _validate_family(INSURANCE_TEMPLATES, "INSURANCE_TEMPLATES", set())
     _validate_family(ISLAMIC_TEMPLATES, "ISLAMIC_TEMPLATES", set())
     _validate_family(ESG_TEMPLATES, "ESG_TEMPLATES", set())
+    _validate_family(CROSS_SELL_TEMPLATES, "CROSS_SELL_TEMPLATES", set())
+    _validate_family(CORPORATE_TRADE_TEMPLATES, "CORPORATE_TRADE_TEMPLATES", set())
     _validate_family(ALL_TEMPLATES, "ALL_TEMPLATES", set())
 
 

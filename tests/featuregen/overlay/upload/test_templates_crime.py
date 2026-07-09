@@ -26,7 +26,9 @@ from featuregen.overlay.upload.templates import (
     AML_TEMPLATES,
     ASSET_MGMT_TEMPLATES,
     COLLECTIONS_TEMPLATES,
+    CORPORATE_TRADE_TEMPLATES,
     CREDIT_RISK_TEMPLATES,
+    CROSS_SELL_TEMPLATES,
     CUSTODY_TEMPLATES,
     DEPOSITS_TEMPLATES,
     ESG_TEMPLATES,
@@ -244,7 +246,7 @@ def test_all_templates_on_a_churn_catalog_still_yields_only_the_churn_lens(db):
     assert not (combined & (_ALL_FRAUD_IDS | set(AML)))
 
 
-# ── registry: ALL_TEMPLATES is the union of all THIRTEEN families, globally id-unique ──────────────
+# ── registry: ALL_TEMPLATES is the union of all FIFTEEN families, globally id-unique ───────────────
 def test_all_templates_registry_is_globally_unique_with_crime_families():
     ids = [t.id for t in ALL_TEMPLATES]
     assert len(ids) == len(set(ids))                      # no duplicate id across families
@@ -255,18 +257,21 @@ def test_all_templates_registry_is_globally_unique_with_crime_families():
         | {t.id for t in PAYMENTS_TEMPLATES} | {t.id for t in MARKETS_TEMPLATES}
         | {t.id for t in CUSTODY_TEMPLATES} | {t.id for t in ASSET_MGMT_TEMPLATES}
         | {t.id for t in INSURANCE_TEMPLATES} | {t.id for t in ISLAMIC_TEMPLATES}
-        | {t.id for t in ESG_TEMPLATES})
+        | {t.id for t in ESG_TEMPLATES}
+        | {t.id for t in CROSS_SELL_TEMPLATES} | {t.id for t in CORPORATE_TRADE_TEMPLATES})
     assert len(ALL_TEMPLATES) == (
         len(RETAIL_CHURN_TEMPLATES) + len(CREDIT_RISK_TEMPLATES) + len(FRAUD_TEMPLATES)
         + len(AML_TEMPLATES) + len(COLLECTIONS_TEMPLATES) + len(DEPOSITS_TEMPLATES)
         + len(PAYMENTS_TEMPLATES) + len(MARKETS_TEMPLATES) + len(CUSTODY_TEMPLATES)
         + len(ASSET_MGMT_TEMPLATES) + len(INSURANCE_TEMPLATES) + len(ISLAMIC_TEMPLATES)
-        + len(ESG_TEMPLATES))
-    # the crime families collide no id with the core-3, the breadth (markets/custody/asset-mgmt) or the
-    # specialist-lines families (insurance/islamic/esg — completing the thirteen-family union).
+        + len(ESG_TEMPLATES) + len(CROSS_SELL_TEMPLATES) + len(CORPORATE_TRADE_TEMPLATES))
+    # the crime families collide no id with the core-3, the breadth (markets/custody/asset-mgmt), the
+    # specialist-lines families (insurance/islamic/esg) or the growth/trade families (cross-sell/
+    # corporate-trade — completing the FIFTEEN-family library).
     assert not ((_ALL_FRAUD_IDS | set(AML)) & (
         {t.id for t in COLLECTIONS_TEMPLATES} | {t.id for t in DEPOSITS_TEMPLATES}
         | {t.id for t in PAYMENTS_TEMPLATES} | {t.id for t in MARKETS_TEMPLATES}
         | {t.id for t in CUSTODY_TEMPLATES} | {t.id for t in ASSET_MGMT_TEMPLATES}
         | {t.id for t in INSURANCE_TEMPLATES} | {t.id for t in ISLAMIC_TEMPLATES}
-        | {t.id for t in ESG_TEMPLATES}))
+        | {t.id for t in ESG_TEMPLATES}
+        | {t.id for t in CROSS_SELL_TEMPLATES} | {t.id for t in CORPORATE_TRADE_TEMPLATES}))
