@@ -9,9 +9,8 @@ from __future__ import annotations
 
 from collections import Counter
 
-from tests.featuregen.overlay.upload.taxonomy import gold_recognition
-from tests.featuregen.overlay.upload.taxonomy.gold_recognition import GOLD
-
+from featuregen.overlay.upload.taxonomy import gold_recognition
+from featuregen.overlay.upload.taxonomy.gold_recognition import GOLD
 from featuregen.overlay.upload.taxonomy.use_cases import selectable_leaves
 from featuregen.overlay.upload.templates import ALL_TEMPLATES
 
