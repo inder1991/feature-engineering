@@ -2123,3 +2123,212 @@ section > h2:first-child {
   color: var(--ink-soft);
   overflow-wrap: anywhere;
 }
+
+/* ---------------------------------------------------------------- ingest: connector path (appended)
+   The Ingest screen's second path (OpenMetadata connector): path cards, connection form grid,
+   preview stat strip, tag-map panel, tables diff with quarantine sublines, and the approval
+   tray. Existing tokens only; composes the .panel / .badge / .rows / .callout / .gates
+   vocabulary. Nothing above this line is modified. */
+
+/* path cards: the file card is the quiet peer, the connector card the committed one (mirrors
+   the Workbench's path pair). Selection is carried by aria-pressed + the revealed panel below,
+   never color alone. */
+.path-file {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  color: var(--ink);
+}
+
+.path-file:hover {
+  border-color: var(--accent);
+}
+
+.path-file[aria-pressed='true'] {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+}
+
+.path-conn {
+  background: var(--accent);
+  border: 1px solid var(--accent);
+  color: var(--chip-ink);
+}
+
+.path-conn .d {
+  /* dimmed against the accent fill, still high-contrast light-on-petrol */
+  color: oklch(0.9 0.02 208);
+}
+
+.path-conn:hover {
+  background: var(--accent-hover);
+  border-color: var(--accent-hover);
+}
+
+.path-conn[aria-pressed='true'] {
+  background: var(--accent-hover);
+  border-color: var(--accent-deep);
+  box-shadow: inset 0 0 0 2px var(--rail-accent);
+}
+
+/* connection form: a compact 3-across grid of the config fields (name/url/source, the three
+   scope filters, naming + token reference), footer spans the full width */
+.conn-form {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px 14px;
+  align-items: start;
+  margin-block: 12px;
+}
+
+.conn-form-foot {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+@media (max-width: 900px) {
+  .conn-form {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* preview summary stat strip; tones color the NUMBER only, the label always sits beside it */
+.stats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-block: 12px 16px;
+}
+
+.stat {
+  border: 1px solid var(--line);
+  background: var(--surface);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  padding: 8px 14px;
+  font-size: 12.5px;
+  color: var(--ink-soft);
+}
+
+.stat b {
+  display: block;
+  font-family: var(--font-mono);
+  font-size: 17px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  color: var(--ink);
+}
+
+.stat b.tone-ok {
+  color: var(--ok);
+}
+
+.stat b.tone-warn {
+  color: var(--warn);
+}
+
+.stat b.tone-danger {
+  color: var(--danger);
+}
+
+/* diff/status chips: strong states are solid per DESIGN.md; labels always present */
+.badge.new {
+  background: var(--ok-solid);
+  border-color: transparent;
+  color: var(--chip-ink);
+}
+
+.badge.changed {
+  background: var(--warn-solid);
+  border-color: transparent;
+  color: var(--chip-ink);
+}
+
+.badge.unmapped,
+.badge.quarantine {
+  background: var(--danger-solid);
+  border-color: transparent;
+  color: var(--chip-ink);
+}
+
+.conn-tagmap {
+  padding: 6px 8px;
+}
+
+/* tables diff: each table is a row plus optional change lines and quarantine sublines, so the
+   hairline moves to the wrapper (the .row + .row rule cannot see across wrappers) */
+.conn-table + .conn-table {
+  border-top: 1px solid var(--line);
+}
+
+.conn-changes {
+  margin: 0;
+  padding: 0 16px 10px 44px;
+  list-style: disc;
+}
+
+.conn-changes li {
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  color: var(--ink-soft);
+  padding: 1.5px 0;
+}
+
+.conn-qcount {
+  color: var(--warn);
+  font-weight: 600;
+  font-size: 12.5px;
+}
+
+.qline {
+  display: flex;
+  gap: 10px;
+  align-items: baseline;
+  flex-wrap: wrap;
+  border: 1px solid color-mix(in oklch, var(--danger) 40%, var(--line));
+  background: var(--danger-soft);
+  border-radius: var(--radius);
+  padding: 8px 12px;
+  margin: 0 16px 12px;
+  font-size: 12.5px;
+}
+
+.qline code {
+  font-size: 12px;
+}
+
+.conn-asof {
+  font-size: 12.5px;
+  color: var(--ink-soft);
+  margin-block: 12px;
+}
+
+/* approval tray: the human gate. One line of approval vocabulary, the confirm cluster on the
+   right. */
+.tray {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  flex-wrap: wrap;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-panel);
+  box-shadow: var(--shadow);
+  padding: 14px 18px;
+  margin-block: 18px;
+}
+
+.tray-line {
+  font-weight: 600;
+}
+
+.tray-note {
+  color: var(--ink-soft);
+  font-size: 12.5px;
+}
+
+.tray-spacer {
+  flex: 1;
+}

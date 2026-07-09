@@ -124,11 +124,13 @@ const PAGES: { route: Route; label: string; eyebrow: string; title: string; desc
     description: 'Find columns you can trust',
   },
   {
+    // The route stays 'upload' (#/upload unchanged — deep links keep working); only the words
+    // change: the screen now holds two peer ingest paths (file upload + OpenMetadata connector).
     route: 'upload',
-    label: 'Upload',
-    eyebrow: 'CATALOG · UPLOAD',
-    title: 'Upload',
-    description: 'Bring a schema and facts file into the catalog',
+    label: 'Ingest',
+    eyebrow: 'CATALOG · INGEST',
+    title: 'Ingest',
+    description: 'Bring data maps into the catalog: upload a file, or connect a metadata service.',
   },
   {
     route: 'review',

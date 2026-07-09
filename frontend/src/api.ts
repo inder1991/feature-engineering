@@ -410,6 +410,130 @@ export function featureDetail(featureId: string): Promise<FeatureDetail> {
   return request(`/features/${encodeURIComponent(featureId)}`)
 }
 
+// ---- OpenMetadata connector (connectors CRUD + preview/import) ---------------------------
+//
+// The connector is a third reader into the UNCHANGED ingest pipeline: preview never writes,
+// import runs ingest_upload in one transaction under the approving human's session identity.
+// The bot token VALUE never crosses this client in either direction: config rows carry only an
+// env-var REFERENCE (token_env), the create endpoint rejects any extra field (422) so a
+// plaintext `token` cannot ride along, and no response ever contains the secret.
+
+export type TableNaming = 'table' | 'schema_table'
+
+// A configured connection as the wire returns it. `token_present` says whether the referenced
+// environment variable is set on the server — the value itself is never serialized anywhere.
+export interface Connector {
+  connector_id: string
+  name: string
+  base_url: string
+  target_source: string
+  tag_map: Record<string, string>
+  filters: Record<string, string>
+  table_naming: TableNaming
+  token_env: string
+  token_present: boolean
+  created_by: string
+  created_at: string
+}
+
+export interface ConnectorSpec {
+  name: string
+  base_url: string
+  target_source: string
+  tag_map: Record<string, string>
+  // keys limited server-side to service / database / schema (400 otherwise)
+  filters: Record<string, string>
+  table_naming: TableNaming
+  // env-var REFERENCE, never a token; the server defaults it to FEATUREGEN_OM_TOKEN__<NAME>
+  token_env?: string
+}
+
+export function listConnectors(): Promise<Connector[]> {
+  return request('/connectors')
+}
+
+export function createConnector(spec: ConnectorSpec): Promise<Connector> {
+  // token_env is included only when the caller names a reference, so the server's
+  // name-derived default applies otherwise. The body carries exactly the declared config
+  // fields — extra fields are forbidden (422) precisely to keep secrets out of config rows.
+  const body: Record<string, unknown> = {
+    name: spec.name,
+    base_url: spec.base_url,
+    target_source: spec.target_source,
+    tag_map: spec.tag_map,
+    filters: spec.filters,
+    table_naming: spec.table_naming,
+  }
+  if (spec.token_env) body.token_env = spec.token_env
+  return post('/connectors', body)
+}
+
+export function deleteConnector(connectorId: string): Promise<{ deleted: boolean }> {
+  return request(`/connectors/${encodeURIComponent(connectorId)}`, { method: 'DELETE' })
+}
+
+export interface TagMapEntry {
+  om_tag: string
+  mapped_to: string
+  unmapped: boolean
+  count: number
+}
+
+export interface PreviewTable {
+  table: string
+  status: 'new' | 'changed' | 'unchanged'
+  columns: number
+  quarantine: { column: string; reason: string }[]
+  changes: string[]
+}
+
+export interface AsOfSuggestion {
+  table: string
+  column: string
+  hint: string
+}
+
+// The dry run a human approves. `snapshot_hash` is the honesty anchor: import must present it
+// back, and the server answers 409 if OpenMetadata moved since this preview was taken.
+export interface ConnectorPreview {
+  summary: {
+    tables: number
+    columns: number
+    new: number
+    changed: number
+    unchanged: number
+    would_quarantine: number
+    semantics_pending: number
+  }
+  tag_map: TagMapEntry[]
+  tables: PreviewTable[]
+  brake: { would_hold: boolean; reason: string | null }
+  as_of_suggestions: AsOfSuggestion[]
+  snapshot_hash: string
+}
+
+export function previewConnector(connectorId: string): Promise<ConnectorPreview> {
+  return post('/connectors/openmetadata/preview', { connector_id: connectorId })
+}
+
+// Import wraps the standard IngestResult (same pipeline, same shape) with the audit record id
+// and the review-queue handoff counts.
+export interface ConnectorImportResult {
+  result: IngestResult
+  import_id: string
+  review_queue: { quarantined: number; semantics_pending: number }
+}
+
+export function importConnector(
+  connectorId: string,
+  snapshotHash: string,
+): Promise<ConnectorImportResult> {
+  return post('/connectors/openmetadata/import', {
+    connector_id: connectorId,
+    snapshot_hash: snapshotHash,
+  })
+}
+
 export function recommendFeatures(
   objective: string,
   catalogSource: string | null,

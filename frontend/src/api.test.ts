@@ -1,7 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
-  ApiError, type FeatureIdea, type LineageGraph, lineageGraph, recommendFeatures,
-  recommendFeatureSets, refineCandidate, searchCatalog, uploadFile,
+  ApiError, type Connector, type ConnectorPreview, createConnector, deleteConnector,
+  type FeatureIdea, importConnector, type LineageGraph, lineageGraph, listConnectors,
+  previewConnector, recommendFeatures, recommendFeatureSets, refineCandidate, searchCatalog,
+  uploadFile,
 } from './api'
 import { setSession } from './session'
 
@@ -155,6 +157,166 @@ describe('lineage client', () => {
         { status: 404 }))
     await expect(lineageGraph('public.x', 'deposits')).rejects.toMatchObject({
       status: 404, detail: "unknown object 'public.x' in source 'deposits'" })
+  })
+})
+
+// A configured connection exactly as the wire returns it: the token env-var REFERENCE plus
+// whether it is set — never the token value itself.
+const CONNECTOR: Connector = {
+  connector_id: 'conn_01HZXAAAAAAAAAAAAAAAAAAAAA',
+  name: 'cards om',
+  base_url: 'https://om.internal.test',
+  target_source: 'cards',
+  tag_map: { 'PII.Sensitive': 'pii' },
+  filters: { service: 'mysql_*', database: 'cards_db', schema: 'public' },
+  table_naming: 'table',
+  token_env: 'FEATUREGEN_OM_TOKEN__CARDS_OM',
+  token_present: true,
+  created_by: 'user:o',
+  created_at: '2026-07-09T12:00:00+00:00',
+}
+
+const SNAPSHOT_HASH = 'ab'.repeat(32)
+
+const CONNECTOR_PREVIEW: ConnectorPreview = {
+  summary: {
+    tables: 3, columns: 14, new: 3, changed: 0, unchanged: 0,
+    would_quarantine: 1, semantics_pending: 13,
+  },
+  tag_map: [
+    { om_tag: 'Confidential.Internal', mapped_to: '', unmapped: true, count: 1 },
+    { om_tag: 'PII.Sensitive', mapped_to: 'pii', unmapped: false, count: 1 },
+  ],
+  tables: [
+    {
+      table: 'accounts', status: 'new', columns: 4,
+      quarantine: [{
+        column: 'ssn',
+        reason: "unrecognized sensitivity 'Confidential.Internal' (expected one of: pii, restricted)",
+      }],
+      changes: [],
+    },
+    { table: 'cards', status: 'new', columns: 4, quarantine: [], changes: [] },
+    { table: 'transactions', status: 'new', columns: 6, quarantine: [], changes: [] },
+  ],
+  brake: { would_hold: false, reason: null },
+  as_of_suggestions: [
+    { table: 'accounts', column: 'opened_on', hint: 'partition column (TIME-UNIT)' },
+    { table: 'transactions', column: 'posted_at', hint: 'timestamp column named like a time axis' },
+  ],
+  snapshot_hash: SNAPSHOT_HASH,
+}
+
+describe('connector client', () => {
+  it('createConnector posts the exact config body — never a token field', async () => {
+    fetchMock.mockImplementation(ok(CONNECTOR))
+    const result = await createConnector({
+      name: 'cards om',
+      base_url: 'https://om.internal.test',
+      target_source: 'cards',
+      tag_map: { 'PII.Sensitive': 'pii' },
+      filters: { service: 'mysql_*', database: 'cards_db', schema: 'public' },
+      table_naming: 'table',
+    })
+    expect(result).toEqual(CONNECTOR)
+    const [url, init] = fetchMock.mock.calls[0]
+    expect(url).toBe('/connectors')
+    expect(init.method).toBe('POST')
+    // Pinned byte-for-byte: exactly the declared config fields (the server 422s any extra field,
+    // precisely so a plaintext token can never ride along), and token_env omitted when the
+    // caller names no reference (the server derives FEATUREGEN_OM_TOKEN__<NAME>).
+    expect(JSON.parse(init.body)).toEqual({
+      name: 'cards om',
+      base_url: 'https://om.internal.test',
+      target_source: 'cards',
+      tag_map: { 'PII.Sensitive': 'pii' },
+      filters: { service: 'mysql_*', database: 'cards_db', schema: 'public' },
+      table_naming: 'table',
+    })
+    expect(init.body).not.toMatch(/"token"/)
+  })
+
+  it('createConnector carries token_env only when the caller names a reference', async () => {
+    fetchMock.mockImplementation(ok(CONNECTOR))
+    await createConnector({
+      name: 'cards om', base_url: 'https://om.internal.test', target_source: 'cards',
+      tag_map: {}, filters: {}, table_naming: 'schema_table',
+      token_env: 'FEATUREGEN_OM_TOKEN__SHARED',
+    })
+    const [, init] = fetchMock.mock.calls[0]
+    expect(JSON.parse(init.body)).toEqual({
+      name: 'cards om', base_url: 'https://om.internal.test', target_source: 'cards',
+      tag_map: {}, filters: {}, table_naming: 'schema_table',
+      token_env: 'FEATUREGEN_OM_TOKEN__SHARED',
+    })
+  })
+
+  it('listConnectors GETs /connectors and the rows carry no token value, only the reference', async () => {
+    fetchMock.mockImplementation(ok([CONNECTOR]))
+    const result = await listConnectors()
+    expect(result).toEqual([CONNECTOR])
+    const [url, init] = fetchMock.mock.calls[0]
+    expect(url).toBe('/connectors')
+    expect(init.method).toBeUndefined()
+    expect(Object.keys(result[0])).not.toContain('token')
+  })
+
+  it('deleteConnector issues DELETE with the id percent-encoded', async () => {
+    fetchMock.mockImplementation(ok({ deleted: true }))
+    const result = await deleteConnector('conn a/b')
+    expect(result).toEqual({ deleted: true })
+    const [url, init] = fetchMock.mock.calls[0]
+    expect(url).toBe('/connectors/conn%20a%2Fb')
+    expect(init.method).toBe('DELETE')
+  })
+
+  it('previewConnector posts only the connector id and returns the dry run untouched', async () => {
+    fetchMock.mockImplementation(ok(CONNECTOR_PREVIEW))
+    const result = await previewConnector(CONNECTOR.connector_id)
+    expect(result).toEqual(CONNECTOR_PREVIEW)
+    const [url, init] = fetchMock.mock.calls[0]
+    expect(url).toBe('/connectors/openmetadata/preview')
+    expect(init.method).toBe('POST')
+    expect(JSON.parse(init.body)).toEqual({ connector_id: CONNECTOR.connector_id })
+  })
+
+  it('importConnector posts the exact connector id + previewed snapshot hash pair', async () => {
+    fetchMock.mockImplementation(ok({
+      result: {
+        status: 'ingested', reason: null, asserted: 3, staled: 0, quarantined: 1,
+        flagged: null,
+      },
+      import_id: 'omimp_01HZY',
+      review_queue: { quarantined: 1, semantics_pending: 13 },
+    }))
+    const result = await importConnector(CONNECTOR.connector_id, SNAPSHOT_HASH)
+    expect(result.import_id).toBe('omimp_01HZY')
+    expect(result.review_queue).toEqual({ quarantined: 1, semantics_pending: 13 })
+    const [url, init] = fetchMock.mock.calls[0]
+    expect(url).toBe('/connectors/openmetadata/import')
+    expect(init.method).toBe('POST')
+    expect(JSON.parse(init.body)).toEqual({
+      connector_id: CONNECTOR.connector_id,
+      snapshot_hash: SNAPSHOT_HASH,
+    })
+  })
+
+  it('surfaces the snapshot-mismatch 409 with the backend re-preview guidance', async () => {
+    const detail = 'OpenMetadata changed since this preview (snapshot hash mismatch). '
+      + 'Run preview again and approve the fresh dry run.'
+    fetchMock.mockImplementation(async () =>
+      new Response(JSON.stringify({ detail }), { status: 409 }))
+    await expect(importConnector(CONNECTOR.connector_id, SNAPSHOT_HASH)).rejects.toMatchObject({
+      status: 409, detail })
+  })
+
+  it('surfaces the unconfigured-token 400 with the env-var instruction', async () => {
+    const detail = 'connector token is not configured: set the FEATUREGEN_OM_TOKEN__CARDS_OM '
+      + 'environment variable'
+    fetchMock.mockImplementation(async () =>
+      new Response(JSON.stringify({ detail }), { status: 400 }))
+    await expect(previewConnector(CONNECTOR.connector_id)).rejects.toMatchObject({
+      status: 400, detail })
   })
 })
 

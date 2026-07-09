@@ -46,7 +46,7 @@ describe('app shell', () => {
       'Generate features',
       'Registry',
       'Search',
-      'Upload',
+      'Ingest',
       'Review queue',
     ])
     expect(screen.getByRole('heading', { level: 1, name: 'Overview' })).toBeInTheDocument()
@@ -74,11 +74,26 @@ describe('app shell', () => {
     expect(screen.getByRole('heading', { name: /search the catalog/i })).toBeInTheDocument()
   })
 
-  it('overview start-here button navigates to Upload', async () => {
+  it('overview start-here button navigates to Ingest (the route hash stays #/upload)', async () => {
     render(<App />)
     await userEvent.click(screen.getByRole('button', { name: 'Go to Upload' }))
     expect(window.location.hash).toBe('#/upload')
-    expect(screen.getByRole('heading', { level: 1, name: 'Upload' })).toBeInTheDocument()
+    expect(screen.getByRole('heading', { level: 1, name: 'Ingest' })).toBeInTheDocument()
+  })
+
+  it('deep-links #/upload to the Ingest screen: two paths, connector gates, mockup copy', () => {
+    window.location.hash = '#/upload'
+    render(<App />)
+    expect(screen.getByText('CATALOG · INGEST')).toBeInTheDocument()
+    expect(screen.getByRole('heading', { level: 1, name: 'Ingest' })).toBeInTheDocument()
+    expect(
+      screen.getByText('Bring data maps into the catalog: upload a file, or connect a metadata service.'),
+    ).toBeInTheDocument()
+    expect(
+      screen.getByRole('button', { name: /upload a schema and facts file/i }),
+    ).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /connect openmetadata/i })).toBeInTheDocument()
+    expect(screen.getByRole('list', { name: /connector path/i })).toBeInTheDocument()
   })
 
   it('overview loop links navigate to their screens', async () => {
@@ -135,7 +150,7 @@ describe('review ?source= deep-linking', () => {
     render(<App />)
     const nav = within(screen.getByRole('navigation'))
     const main = within(screen.getByRole('main'))
-    await userEvent.click(nav.getByRole('button', { name: 'Upload' }))
+    await userEvent.click(nav.getByRole('button', { name: 'Ingest' }))
     await userEvent.type(screen.getByLabelText(/source name/i), 'deposits')
     await userEvent.upload(
       screen.getByLabelText(/file/i), new File(['x'], 'd.csv', { type: 'text/csv' }))
