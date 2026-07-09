@@ -155,7 +155,7 @@ const CONNECTOR: api.Connector = {
 
 const PREVIEW: api.ConnectorPreview = {
   summary: {
-    tables: 1, columns: 3, new: 1, changed: 0, unchanged: 0,
+    tables: 1, columns: 3, new: 1, changed: 0, unchanged: 0, removed: 0,
     would_quarantine: 0, semantics_pending: 3,
   },
   tag_map: [],

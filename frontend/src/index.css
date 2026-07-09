@@ -2247,7 +2247,8 @@ section > h2:first-child {
 }
 
 .badge.unmapped,
-.badge.quarantine {
+.badge.quarantine,
+.badge.removed {
   background: var(--danger-solid);
   border-color: transparent;
   color: var(--chip-ink);

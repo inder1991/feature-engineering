@@ -8,6 +8,9 @@ the connector adds no new write path.
 RBAC (permissions, never role strings): configuring a connector and confirming imports require
 ``catalog:write`` (held by data_owner / platform_admin); preview and listing require
 ``catalog:read`` (held by catalog_viewer and up). Denials are audited by ``require_permission``.
+The spec names ``data_owner ON THE TARGET SOURCE``, but the platform has no per-source ownership
+axis (uploads gate the same global ``catalog:write``), so this matches existing reality rather
+than the spec's per-source language — any ``catalog:write`` holder can import into any source.
 
 Identity (documented choice): the spec names a ``service:openmetadata-connector`` identity, but an
 authenticated service envelope is only mintable via the sealed trust capability
@@ -19,6 +22,22 @@ connector as the vehicle (``vehicle='openmetadata-connector'``) — honest attri
 Secrets (documented choice): the KMS module exposes only a destroy/rotate Protocol, so the bot
 token is an ENV-VAR REFERENCE (``FEATUREGEN_OM_TOKEN__<NAME>``); rows store the reference, the
 request model REJECTS a plaintext token field, and no response ever carries the token value.
+
+Egress + token namespace (SECURITY, fail-closed): two guards keep a merely-``catalog:write`` user
+from turning the connector into a secret-exfiltration or SSRF primitive.
+  1. ``token_env`` is constrained to the connector-token namespace
+     (``^FEATUREGEN_OM_TOKEN__[A-Z0-9_]+$``) — a config row can only ever reference a bot-token
+     env var, never an arbitrary process secret (a DSN, a cloud/KMS key). ``token_present`` then
+     reveals only whether a connector-token var is set, an acceptable oracle.
+  2. ``base_url`` must resolve to a host on the ops-controlled allowlist
+     (``FEATUREGEN_OM_ALLOWED_HOSTS``, comma-separated ``host`` / ``host:port`` entries; a bare
+     host matches only the scheme's default port). This is deployment-controlled egress: ops names
+     the legitimate internal OM hosts, so private-IP targets are fine WHEN allowlisted and
+     SSRF-by-config is dead for everyone below ops. The allowlist is enforced on connector CREATE
+     AND on every pull (preview/import) — a row that predates the allowlist still cannot pull off
+     it. When the env is unset/empty, create and pull both fail 400 (fail-closed, never fail-open).
+     The transport also refuses to follow redirects, so a 3xx to an off-allowlist host can't slip
+     the guard.
 """
 from __future__ import annotations
 
@@ -27,6 +46,7 @@ import re
 from dataclasses import asdict
 from datetime import UTC, datetime
 from typing import Annotated, Any, Literal
+from urllib.parse import urlsplit
 
 import psycopg
 from fastapi import APIRouter, Depends, HTTPException
@@ -49,12 +69,10 @@ from featuregen.connectors.openmetadata import (
     fetch_tables,
     httpx_fetch,
     read_openmetadata,
-    semantics_pending_count,
     snapshot_hash,
 )
 from featuregen.contracts.envelopes import IdentityEnvelope
 from featuregen.intake.llm import LLMClient
-from featuregen.overlay.upload.canonical import validate_rows
 from featuregen.overlay.upload.ingest import ingest_upload
 from featuregen.overlay.upload.read_scope import SENSITIVITY_ROLES
 
@@ -67,6 +85,52 @@ _build_fetch = httpx_fetch
 
 _VALID_SENSITIVITIES = frozenset({"", *SENSITIVITY_ROLES})
 _VALID_FILTER_KEYS = frozenset({"service", "database", "schema"})
+
+# A stored token reference may ONLY name the connector-token namespace: this is what stops a
+# config row from pointing at an arbitrary process secret (a DSN, a KMS/cloud key) and having it
+# egress as a Bearer header. Kept in sync with `_default_token_env` below.
+_TOKEN_ENV_RE = re.compile(r"FEATUREGEN_OM_TOKEN__[A-Z0-9_]+\Z")
+
+_NO_ALLOWLIST_DETAIL = "no OpenMetadata hosts are allowlisted: set FEATUREGEN_OM_ALLOWED_HOSTS"
+_DEFAULT_PORTS = {"https": 443, "http": 80}
+
+
+def _allowlisted_hosts() -> set[str]:
+    """Ops-controlled egress allowlist from ``FEATUREGEN_OM_ALLOWED_HOSTS`` (comma-separated
+    ``host`` / ``host:port`` entries), lowercased. Empty set means fail-closed."""
+    raw = os.environ.get("FEATUREGEN_OM_ALLOWED_HOSTS", "")
+    return {entry.strip().lower() for entry in raw.split(",") if entry.strip()}
+
+
+def _url_authorities(base_url: str) -> set[str]:
+    """The forms of a URL's authority to match against the allowlist: ``host:port`` with the
+    scheme's default port filled in, plus the bare ``host`` when the URL uses that default port
+    (so an ``host`` entry matches ``https://host`` but NOT ``https://host:8443``)."""
+    parsed = urlsplit(base_url)
+    host = (parsed.hostname or "").lower()
+    default = _DEFAULT_PORTS.get(parsed.scheme.lower())
+    try:
+        port = parsed.port if parsed.port is not None else default
+    except ValueError:
+        return set()   # a non-numeric port is unparseable -> matches nothing -> fail closed (400)
+    forms = {f"{host}:{port}"}
+    if port is not None and port == default:
+        forms.add(host)
+    return forms
+
+
+def _enforce_egress_allowlist(base_url: str) -> None:
+    """Fail-closed host allowlist check, enforced on connector CREATE and on every pull. Raises
+    400 when the allowlist is unset/empty or the URL's host:port is not on it."""
+    allowed = _allowlisted_hosts()
+    if not allowed:
+        raise HTTPException(status_code=400, detail=_NO_ALLOWLIST_DETAIL)
+    if not (_url_authorities(base_url) & allowed):
+        host = urlsplit(base_url).hostname or base_url
+        raise HTTPException(
+            status_code=400,
+            detail=f"OpenMetadata host '{host}' is not allowlisted "
+                   "(set FEATUREGEN_OM_ALLOWED_HOSTS); ask ops to add it")
 
 
 class ConnectorIn(BaseModel):
@@ -101,6 +165,11 @@ def _validate_config(body: ConnectorIn) -> None:
         raise HTTPException(status_code=400, detail="connector name is required")
     if not body.base_url.startswith(("http://", "https://")):
         raise HTTPException(status_code=400, detail="base_url must be an http(s) URL")
+    if body.token_env is not None and not _TOKEN_ENV_RE.match(body.token_env):
+        raise HTTPException(
+            status_code=400,
+            detail="token_env must name the connector-token namespace "
+                   "(match ^FEATUREGEN_OM_TOKEN__[A-Z0-9_]+$, e.g. FEATUREGEN_OM_TOKEN__CARDS)")
     if not body.target_source.strip():
         raise HTTPException(status_code=400, detail="target_source is required")
     bad = sorted(v for v in body.tag_map.values() if v not in _VALID_SENSITIVITIES)
@@ -131,6 +200,7 @@ def get_connectors(conn: _Conn, identity: _Identity) -> list[dict]:
 @router.post("/connectors", dependencies=[Depends(require_catalog_write)])
 def create_connector(body: ConnectorIn, conn: _Conn, identity: _Identity) -> dict:
     _validate_config(body)
+    _enforce_egress_allowlist(body.base_url)
     if store.name_exists(conn, body.name):
         raise HTTPException(status_code=409, detail=f"connector '{body.name}' already exists")
     cfg = store.create_connector(
@@ -155,9 +225,12 @@ def _get_config(conn: psycopg.Connection, connector_id: str) -> dict[str, Any]:
 
 
 def _pull(cfg: dict[str, Any]) -> tuple[OMConfig, Translation]:
-    """Pull + translate one configured connection. Clean failure surface per the spec: missing
-    token reference -> 400, OM auth rejected -> 401, OM unreachable / bad pages -> 502. A page
-    failure inside fetch_tables fails the WHOLE pull; nothing is ever partially translated."""
+    """Pull + translate one configured connection. Clean failure surface per the spec: off-
+    allowlist / no allowlist -> 400, missing token reference -> 400, OM auth rejected -> 401, OM
+    unreachable / bad pages -> 502. A page failure inside fetch_tables fails the WHOLE pull; nothing
+    is ever partially translated. The egress allowlist is re-checked here (not only at create) so a
+    row that predates the allowlist can never pull off an unlisted host."""
+    _enforce_egress_allowlist(cfg["base_url"])
     token = os.environ.get(cfg["token_env"], "")
     if not token:
         raise HTTPException(
@@ -211,8 +284,11 @@ def import_connector(body: ImportIn, conn: _Conn, identity: _Identity,
                                     approved_by=identity.subject, result=asdict(result))
     pending = 0
     if result.status == "ingested":
-        vr = validate_rows(list(translation.rows), cfg["target_source"])
-        pending = semantics_pending_count(vr.good)
+        # Every OM row arrives semantics-blank — the translator never sets as-of/additivity/unit/
+        # currency/entity (see test_semantics_arrive_blank_and_pending) — so every row that WASN'T
+        # quarantined is semantics-pending. Derive that from the pipeline's own quarantine count
+        # rather than re-running validate_rows a second time over the same rows.
+        pending = len(translation.rows) - result.quarantined
     return {
         "result": asdict(result),
         "import_id": import_id,

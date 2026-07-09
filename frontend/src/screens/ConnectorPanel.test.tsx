@@ -49,7 +49,7 @@ const SNAPSHOT_HASH = 'ab'.repeat(32)
 // the full review surface from a single canned dry run.
 const PREVIEW: api.ConnectorPreview = {
   summary: {
-    tables: 3, columns: 14, new: 1, changed: 1, unchanged: 1,
+    tables: 3, columns: 14, new: 1, changed: 1, unchanged: 1, removed: 0,
     would_quarantine: 1, semantics_pending: 13,
   },
   tag_map: [
@@ -235,6 +235,42 @@ describe('preview rendering', () => {
     expect(screen.getByText(/routed to the review queue for owner confirmation/)).toBeInTheDocument()
 
     expect(screen.getByText(/approve import of 14 columns into source/i)).toBeInTheDocument()
+  })
+
+  it('surfaces a whole-table removal so the human sees the drop before approving', async () => {
+    listConnectors.mockResolvedValue([CONNECTOR])
+    previewConnector.mockResolvedValue({
+      ...PREVIEW,
+      summary: { ...PREVIEW.summary, removed: 1 },
+      tables: [
+        ...PREVIEW.tables,
+        {
+          table: 'promotions', status: 'removed', columns: 2, quarantine: [],
+          changes: ['no longer in the pull; import will drop this table and stale its 2 columns'],
+        },
+      ],
+    })
+    renderPanel()
+    await userEvent.click(await screen.findByRole('button', { name: 'Preview import' }))
+    const stats = await screen.findByRole('group', { name: 'Preview summary' })
+    expect(stats).toHaveTextContent('1 removed')
+    const removed = screen.getByText('promotions').closest('li')
+    if (!removed) throw new Error('promotions row not found')
+    expect(within(removed).getByText('removed')).toBeInTheDocument()
+    expect(removed).toHaveTextContent('import will drop this table and stale its 2 columns')
+  })
+
+  it('renders a fail-closed egress 400 calmly on the save form', async () => {
+    listConnectors.mockResolvedValue([])
+    createConnector.mockRejectedValue(new api.ApiError(400,
+      'no OpenMetadata hosts are allowlisted: set FEATUREGEN_OM_ALLOWED_HOSTS'))
+    renderPanel()
+    await userEvent.type(screen.getByLabelText('Connection name'), 'cards om')
+    await userEvent.type(screen.getByLabelText('OpenMetadata URL'), 'https://om.internal.test')
+    await userEvent.type(screen.getByLabelText('Target source'), 'cards')
+    await userEvent.click(screen.getByRole('button', { name: 'Save connection' }))
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'no OpenMetadata hosts are allowlisted: set FEATUREGEN_OM_ALLOWED_HOSTS')
   })
 
   it('renders the would-hold brake with its reason', async () => {

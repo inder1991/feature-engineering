@@ -180,7 +180,7 @@ const SNAPSHOT_HASH = 'ab'.repeat(32)
 
 const CONNECTOR_PREVIEW: ConnectorPreview = {
   summary: {
-    tables: 3, columns: 14, new: 3, changed: 0, unchanged: 0,
+    tables: 3, columns: 14, new: 3, changed: 0, unchanged: 0, removed: 0,
     would_quarantine: 1, semantics_pending: 13,
   },
   tag_map: [

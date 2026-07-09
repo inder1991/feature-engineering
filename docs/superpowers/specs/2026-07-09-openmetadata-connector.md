@@ -72,11 +72,27 @@ in plaintext**: sealed via the existing KMS envelope (`featuregen.privacy.kms`) 
 from environment (`FEATUREGEN_OM_TOKEN__<name>`) per deployment preference; config rows store
 only the reference + key id.
 
+**Egress + token namespace (fail-closed, security).** Two guards keep a merely-`catalog:write`
+user from turning the connector into a secret-exfiltration or SSRF primitive:
+
+- `token_env` is constrained to the connector-token namespace (`^FEATUREGEN_OM_TOKEN__[A-Z0-9_]+$`);
+  anything else is rejected 400. A config row can therefore only ever reference a bot-token env
+  var, never an arbitrary process secret (a DSN, a cloud/KMS key), so nothing else can egress as a
+  Bearer header. `token_present` then reveals only whether a connector-token var is set.
+- `base_url` must resolve to a host on an ops-controlled allowlist, `FEATUREGEN_OM_ALLOWED_HOSTS`
+  (comma-separated `host` / `host:port` entries; a bare host matches only the scheme's default
+  port). This is deployment-controlled egress: ops names the legitimate internal OM hosts, so
+  private-IP targets are fine **when allowlisted** and SSRF-by-config is dead for everyone below
+  ops. Enforced on connector CREATE **and on every pull** (a row that predates the allowlist still
+  cannot pull off it). When the env is unset/empty, create and pull both fail 400 with
+  `no OpenMetadata hosts are allowlisted: set FEATUREGEN_OM_ALLOWED_HOSTS`. The HTTP transport does
+  not follow redirects, so a 3xx to an off-allowlist host cannot slip the guard.
+
 ## API surface (additive)
 
 | Endpoint | Behavior |
 |---|---|
-| `POST /connectors/openmetadata/preview` | body: config (or configured connector id). Pulls + translates WITHOUT ingesting; returns the dry-run: `{summary:{tables,columns,new,changed,unchanged,would_quarantine,semantics_pending}, tag_map:[{om_tag,mapped_to,unmapped:bool,count}], tables:[{table,status:new|changed|unchanged,columns,quarantine:[...],changes:[...]}], brake:{would_hold:bool,reason?}}` |
+| `POST /connectors/openmetadata/preview` | body: config (or configured connector id). Pulls + translates WITHOUT ingesting; returns the dry-run: `{summary:{tables,columns,new,changed,unchanged,removed,would_quarantine,semantics_pending}, tag_map:[{om_tag,mapped_to,unmapped:bool,count}], tables:[{table,status:new|changed|unchanged|removed,columns,quarantine:[...],changes:[...]}], brake:{would_hold:bool,reason?}}` (`removed` = a table in the current catalog the pull no longer includes; import DELETE-then-rebuilds the source, so it is surfaced, never silently dropped) |
 | `POST /connectors/openmetadata/import` | body: connector id + the previewed snapshot hash (stale-preview protection: if OM moved since preview, 409 with re-preview guidance). Runs the translation into `ingest_upload` in ONE transaction per source. Returns the standard `IngestResult` + import record id. |
 | `GET /connectors` / `POST /connectors` / `DELETE /connectors/{id}` | manage configured connections (RBAC-gated). |
 

@@ -76,7 +76,7 @@ describe('app shell', () => {
 
   it('overview start-here button navigates to Ingest (the route hash stays #/upload)', async () => {
     render(<App />)
-    await userEvent.click(screen.getByRole('button', { name: 'Go to Upload' }))
+    await userEvent.click(screen.getByRole('button', { name: 'Go to Ingest' }))
     expect(window.location.hash).toBe('#/upload')
     expect(screen.getByRole('heading', { level: 1, name: 'Ingest' })).toBeInTheDocument()
   })

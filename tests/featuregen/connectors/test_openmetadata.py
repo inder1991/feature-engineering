@@ -206,6 +206,20 @@ def test_httpx_fetch_maps_connect_error_to_unreachable():
         _transport_fetch(handler)("/api/v1/tables", {})
 
 
+def test_httpx_fetch_refuses_to_follow_redirects():
+    """A 3xx to an off-allowlist host would bypass the egress allowlist. follow_redirects is OFF,
+    so the redirect target is never requested and the 3xx surfaces as a clean failure."""
+    calls: list[str] = []
+
+    def handler(request):
+        calls.append(str(request.url))
+        return httpx.Response(302, headers={"location": "https://evil.example/api/v1/tables"})
+
+    with pytest.raises(OMUnreachable, match="redirect"):
+        _transport_fetch(handler)("/api/v1/tables", {})
+    assert calls == ["https://om.test/api/v1/tables"]   # the Location was never chased
+
+
 # ---- Preview dry run (DB-backed) --------------------------------------------------------------
 
 
@@ -233,7 +247,8 @@ def _existing_cards_rows() -> list[CanonicalRow]:
 def test_preview_against_empty_catalog_is_all_new(conn):
     preview = build_preview(conn, CARDS_CONFIG, _rows())
     assert preview["summary"] == {"tables": 3, "columns": 14, "new": 3, "changed": 0,
-                                  "unchanged": 0, "would_quarantine": 1, "semantics_pending": 13}
+                                  "unchanged": 0, "removed": 0, "would_quarantine": 1,
+                                  "semantics_pending": 13}
     assert preview["brake"] == {"would_hold": False, "reason": None}
     assert len(preview["snapshot_hash"]) == 64
     # preview never writes
@@ -258,6 +273,28 @@ def test_preview_diffs_against_current_catalog(conn):
         {"column": "ssn",
          "reason": "unrecognized sensitivity 'Confidential.Internal' "
                    "(expected one of: pii, restricted)"}]
+
+
+def test_preview_flags_whole_table_removal(conn):
+    """A table in the current catalog that the pull no longer includes is surfaced as 'removed' —
+    import DELETE-then-rebuilds the source, so the human must see the drop before approving."""
+    actor = make_actor(subject="user:owner", roles=("data_owner",))
+    existing = [
+        *_existing_cards_rows(),
+        CanonicalRow(source="cards", table="promotions", column="promo_id", type="bigint",
+                     is_grain=True, definition="promotion key"),
+        CanonicalRow(source="cards", table="promotions", column="discount", type="numeric",
+                     definition="discount amount"),
+    ]
+    assert ingest_upload(conn, "cards", existing, actor=actor).status == "ingested"
+
+    preview = build_preview(conn, CARDS_CONFIG, _rows())
+    assert preview["summary"]["removed"] == 1
+    assert preview["summary"]["tables"] == 3          # 'tables' still counts only the pull
+    removed = {t["table"]: t for t in preview["tables"]}["promotions"]
+    assert removed["status"] == "removed"
+    assert removed["columns"] == 2
+    assert "drop this table" in removed["changes"][0]
 
 
 def test_preview_predicts_brake_hold_on_shrunken_pull(conn):

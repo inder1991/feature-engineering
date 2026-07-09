@@ -16,10 +16,12 @@ TOKEN_VALUE = "secret-bot-token-v-9"
 
 @pytest.fixture(autouse=True)
 def _om_seam(monkeypatch):
-    """Fixture-backed transport + a configured token env var for every test in this module."""
+    """Fixture-backed transport + a configured token env var + the egress allowlist that every
+    happy-path test needs (the connector base_url is https://om.internal.test)."""
     from featuregen.api.routes import connectors as routes
 
     monkeypatch.setenv(TOKEN_ENV, TOKEN_VALUE)
+    monkeypatch.setenv("FEATUREGEN_OM_ALLOWED_HOSTS", "om.internal.test, om.other.test:8585")
     monkeypatch.setattr(routes, "_build_fetch", lambda base_url, token: fixture_fetch())
 
 
@@ -72,6 +74,59 @@ def test_invalid_filter_key_rejected(client):
     assert _create(client, filters={"cluster": "x"}).status_code == 400
 
 
+# ---- CRITICAL: egress allowlist + token namespace --------------------------------------------
+
+
+def test_token_env_outside_namespace_rejected(client):
+    """A token reference MUST name the connector-token namespace — otherwise a catalog:write user
+    could point a config row at an arbitrary secret (a DSN, a KMS key) and egress it as a Bearer
+    header. The prefix is named in the 400 so the operator knows the rule."""
+    res = _create(client, token_env="FEATUREGEN_DSN")
+    assert res.status_code == 400
+    assert "FEATUREGEN_OM_TOKEN__" in res.json()["detail"]
+    # the derived default (no token_env supplied) is always in-namespace and accepted
+    assert _create(client).status_code == 200
+
+
+def test_create_fails_closed_when_no_hosts_allowlisted(client, monkeypatch):
+    monkeypatch.delenv("FEATUREGEN_OM_ALLOWED_HOSTS")
+    res = _create(client)
+    assert res.status_code == 400
+    assert res.json()["detail"] == \
+        "no OpenMetadata hosts are allowlisted: set FEATUREGEN_OM_ALLOWED_HOSTS"
+
+
+def test_create_rejects_host_not_on_allowlist(client):
+    res = _create(client, base_url="https://attacker.example")
+    assert res.status_code == 400
+    assert "not allowlisted" in res.json()["detail"]
+    assert "attacker.example" in res.json()["detail"]
+
+
+def test_preview_fails_closed_when_allowlist_removed_after_create(client, monkeypatch):
+    """The allowlist is re-checked on every pull, not just at create: a row that predates the
+    allowlist (or one created before it was tightened) still cannot pull off an unlisted host."""
+    cfg = _create(client).json()
+    monkeypatch.delenv("FEATUREGEN_OM_ALLOWED_HOSTS")
+    res = _preview(client, cfg["connector_id"])
+    assert res.status_code == 400
+    assert res.json()["detail"] == \
+        "no OpenMetadata hosts are allowlisted: set FEATUREGEN_OM_ALLOWED_HOSTS"
+
+
+def test_allowlisted_host_with_explicit_port_works(client):
+    """host:port entries match exactly; om.other.test:8585 is on the allowlist."""
+    res = _create(client, name="other om", base_url="https://om.other.test:8585")
+    assert res.status_code == 200
+
+
+def test_malformed_port_fails_closed_not_500(client):
+    """A non-numeric port must not blow up port parsing into a 500 — it matches nothing (400)."""
+    res = _create(client, base_url="https://om.internal.test:abc")
+    assert res.status_code == 400
+    assert "not allowlisted" in res.json()["detail"]
+
+
 def test_rbac_config_requires_catalog_write(client):
     assert _create(client, headers=VIEWER).status_code == 403
     assert _create(client, headers=ENGINEER).status_code == 403
@@ -95,7 +150,8 @@ def test_preview_dry_run_shape_and_verdicts(client, conn):
     assert set(preview) == {"summary", "tag_map", "tables", "brake", "as_of_suggestions",
                             "snapshot_hash"}
     assert preview["summary"] == {"tables": 3, "columns": 14, "new": 3, "changed": 0,
-                                  "unchanged": 0, "would_quarantine": 1, "semantics_pending": 13}
+                                  "unchanged": 0, "removed": 0, "would_quarantine": 1,
+                                  "semantics_pending": 13}
     assert preview["tag_map"] == [
         {"om_tag": "Confidential.Internal", "mapped_to": "", "unmapped": True, "count": 1},
         {"om_tag": "PII.Sensitive", "mapped_to": "pii", "unmapped": False, "count": 1},

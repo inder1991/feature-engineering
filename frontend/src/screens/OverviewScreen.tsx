@@ -2,7 +2,14 @@ import type { MouseEvent } from 'react'
 import type { Route } from '../nav'
 
 const LOOP: { route: Route; name: string; line: string }[] = [
-  { route: 'upload', name: 'Upload', line: 'Upload a schema+facts file per source.' },
+  // The nav labels this screen 'Ingest' (route hash stays #/upload); the action label matches.
+  // The line still names uploading a file honestly — it is the primary path — and now also names
+  // the connector, since Ingest offers two peer paths into the same pipeline.
+  {
+    route: 'upload',
+    name: 'Ingest',
+    line: 'Upload a schema+facts file, or connect a metadata service, per source.',
+  },
   { route: 'search', name: 'Search', line: 'Search the freshness-vouched catalog.' },
   { route: 'review', name: 'Review queue', line: 'Review what the catalog refused to trust.' },
   {
@@ -71,7 +78,7 @@ export function OverviewScreen({
             engine works for you.
           </p>
           <button type="button" className="btn btn--primary" onClick={() => navigate('upload')}>
-            Go to Upload
+            Go to Ingest
           </button>
         </div>
       </div>

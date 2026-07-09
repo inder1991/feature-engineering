@@ -627,6 +627,7 @@ function SummaryStats({ summary }: { summary: ConnectorPreview['summary'] }) {
       <Stat n={summary.new} label="new tables" tone="ok" />
       <Stat n={summary.changed} label="changed" tone="warn" />
       <Stat n={summary.unchanged} label="unchanged" />
+      <Stat n={summary.removed} label="removed" tone="danger" />
       <Stat n={summary.would_quarantine} label="would quarantine" tone="danger" />
       <Stat n={summary.semantics_pending} label="semantics pending" tone="warn" />
     </div>
@@ -767,6 +768,7 @@ const STATUS_BADGE: Record<PreviewTable['status'], string> = {
   new: 'badge new',
   changed: 'badge changed',
   unchanged: 'badge',
+  removed: 'badge removed',
 }
 
 function TablesPanel({ tables }: { tables: PreviewTable[] }) {

@@ -480,8 +480,11 @@ export interface TagMapEntry {
 }
 
 export interface PreviewTable {
+  // 'removed': a table in the current catalog the pull no longer includes — import DELETE-then-
+  // rebuilds the source, so it would be dropped and its facts staled. Surfaced so the human never
+  // approves a loss the dry run didn't show.
   table: string
-  status: 'new' | 'changed' | 'unchanged'
+  status: 'new' | 'changed' | 'unchanged' | 'removed'
   columns: number
   quarantine: { column: string; reason: string }[]
   changes: string[]
@@ -502,6 +505,7 @@ export interface ConnectorPreview {
     new: number
     changed: number
     unchanged: number
+    removed: number
     would_quarantine: number
     semantics_pending: number
   }

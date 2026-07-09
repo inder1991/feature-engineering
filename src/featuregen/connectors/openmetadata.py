@@ -74,7 +74,11 @@ def httpx_fetch(base_url: str, token: str, *, timeout: float = 10.0,
 
     def fetch(path: str, params: dict[str, Any]) -> dict[str, Any]:
         try:
+            # follow_redirects is OFF (also httpx's default, pinned here for security): a redirect
+            # to an off-allowlist host would bypass the caller's egress allowlist, so a 3xx is
+            # refused below rather than chased.
             with httpx.Client(base_url=base, timeout=timeout, transport=transport,
+                              follow_redirects=False,
                               headers={"Authorization": f"Bearer {token}"}) as client:
                 resp = client.get(path, params=params)
         except httpx.HTTPError as exc:
@@ -82,6 +86,10 @@ def httpx_fetch(base_url: str, token: str, *, timeout: float = 10.0,
         if resp.status_code in (401, 403):
             raise OMAuthRejected(
                 f"OpenMetadata rejected the connector token (HTTP {resp.status_code})")
+        if 300 <= resp.status_code < 400:
+            raise OMUnreachable(
+                f"OpenMetadata attempted a redirect (HTTP {resp.status_code}); refusing to "
+                "follow it (egress allowlist)")
         if resp.status_code >= 400:
             raise OMUnreachable(f"OpenMetadata returned HTTP {resp.status_code}")
         try:
@@ -388,16 +396,33 @@ def build_preview(conn: Any, config: OMConfig, translation: Translation) -> dict
             "changes": changes,
         })
 
+    # Whole-table removals: a table in the CURRENT catalog that the new pull does not include at
+    # all. build_graph does DELETE-then-rebuild per source, so on import these tables are dropped
+    # and their facts staled — the human must see that in the dry run, or they'd approve a loss the
+    # preview never showed. (The brake still weighs it; a removal under the 30% threshold clears the
+    # brake, which is exactly the case this line exists to keep honest.)
+    for table in sorted(set(existing) - set(pulled_by_table)):
+        dropped = len(existing[table])
+        tables.append({
+            "table": table,
+            "status": "removed",
+            "columns": dropped,
+            "quarantine": [],
+            "changes": [f"no longer in the pull; import will drop this table and stale its "
+                        f"{dropped} column{'' if dropped == 1 else 's'}"],
+        })
+
     brake = large_change_brake(conn, config.target_source,
                                UploadCatalog(config.target_source, vr.good))
     statuses = [t["status"] for t in tables]
     return {
         "summary": {
-            "tables": len(tables),
+            "tables": len(pulled_by_table),   # tables in the PULL; removed ones are counted below
             "columns": len(translation.rows),
             "new": statuses.count("new"),
             "changed": statuses.count("changed"),
             "unchanged": statuses.count("unchanged"),
+            "removed": statuses.count("removed"),
             "would_quarantine": len(vr.quarantined),
             "semantics_pending": semantics_pending_count(vr.good),
         },
