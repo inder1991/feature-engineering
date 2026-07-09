@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
+from datetime import timedelta
 
 from featuregen.intake.llm import LLMClient
 from featuregen.overlay.upload.contract._serial import actor_json as _actor_json
@@ -18,10 +19,18 @@ from featuregen.overlay.upload.feature_assist import (
     FeatureIdea,
     FeatureSet,
     SetRecommendation,
+    _candidate_columns,
+    _validate_idea,
     recommend_feature_sets_report,
     recommend_features,
     recommend_set,
     set_signals,
+)
+from featuregen.overlay.upload.templates import (
+    RETAIL_CHURN_TEMPLATES,
+    GroundedFeature,
+    Template,
+    ground_all,
 )
 
 
@@ -59,6 +68,60 @@ def intent_target_ref(conn, intent_id: str) -> str | None:
     return row[0] if row else None
 
 
+# ── B4: parametric templates as a second candidate source ─────────────────────────────────────────
+# The grounded churn templates enter the considered set as an ALTERNATIVE lens, alongside the LLM's
+# proposals — the two-source model (templates ∪ LLM). Grounding is deterministic (no LLM); each grounded
+# candidate is run through the SAME per-idea gauntlet the LLM candidates cleared, so both sources are
+# judged identically. Use-case recognition / regulatory filtering is B3 (out of scope here): the source
+# is fixed to RETAIL_CHURN_TEMPLATES, which only surface where the catalog grounds them.
+_MAX_RATIONALE = 200
+
+
+def _idea_from_grounded(gf: GroundedFeature, template: Template) -> FeatureIdea:
+    """A B2 GroundedFeature -> a Gate-1 FeatureIdea in the SAME shape the LLM proposes, so both sources
+    run the identical gauntlet and snapshot identically. Carries the transient DESIGN-CHECKED
+    verification stamp the LLM candidates also carry (structurally safe; predictive value unverified)."""
+    rationale = f"template {gf.template_id}: {template.intent}".strip()[:_MAX_RATIONALE]
+    return FeatureIdea(
+        name=gf.name, description=template.intent,
+        derives_from=[ref for _src, ref in gf.derives_pairs],
+        aggregation=gf.aggregation, grain_table=gf.grain_table,
+        derives_pairs=gf.derives_pairs, verification="DESIGN-CHECKED",
+        critic_note="", rationale=rationale)
+
+
+def _template_candidates(conn, *, catalog_source: str, roles, target_ref: str | None, now,
+                         fresh_within: timedelta = timedelta(hours=24),
+                         ) -> tuple[list[FeatureIdea], list[dict]]:
+    """Ground RETAIL_CHURN_TEMPLATES on this catalog and gauntlet-check each grounded candidate the SAME
+    way LLM candidates are (feature_assist._validate_idea, over the identical read-scoped candidate
+    universe). Grounding refuses tagged leakage anchors by construction, but the intent's SPECIFIC
+    target_ref may not be a tagged anchor — the reused gauntlet still rejects any candidate that binds it
+    (plus freshness / additivity / PIT / units). Returns (surviving ideas, {name, reason, code} rejects)."""
+    grounded = ground_all(conn, RETAIL_CHURN_TEMPLATES, catalog_source=catalog_source, roles=roles)
+    if not grounded:
+        return [], []
+    by_id = {t.id: t for t in RETAIL_CHURN_TEMPLATES}
+    cols = _candidate_columns(conn, catalog_source, roles)   # the SAME candidate universe the LLM saw
+    known = {c["object_ref"] for c in cols}
+    src_of: dict[str, set[str]] = {}
+    for c in cols:
+        src_of.setdefault(c["object_ref"], set()).add(c["catalog_source"])
+    ideas: list[FeatureIdea] = []
+    rejections: list[dict] = []
+    for gf in grounded:
+        idea = _idea_from_grounded(gf, by_id[gf.template_id])
+        raw = {"name": idea.name, "description": idea.description,
+               "derives_from": list(idea.derives_from), "aggregation": idea.aggregation,
+               "grain_table": idea.grain_table, "rationale": idea.rationale}
+        _, rej = _validate_idea(conn, raw, known, src_of, target_ref, now, fresh_within)
+        if rej is None:
+            ideas.append(idea)   # keep the converted idea (identical to the gauntlet's rebuild)
+        else:
+            rejections.append({"name": idea.name, "reason": rej.message, "code": rej.code})
+    return ideas, rejections
+
+
 def build_considered_set(conn, intent: Intent, client: LLMClient, *, entity: str | None = None,
                          catalog_source: str | None = None, roles=(), target_ref: str | None = None,
                          objective: str = "", feedback: str | None = None, now=None) -> ConsideredSet:
@@ -76,7 +139,19 @@ def build_considered_set(conn, intent: Intent, client: LLMClient, *, entity: str
     report = recommend_feature_sets_report(
         conn, gen_objective, client, entity=entity, catalog_source=catalog_source,
         roles=roles, target_ref=target_ref, feedback=feedback, now=now)
-    alternatives = report.sets
+    alternatives = list(report.sets)
+    rejections = list(report.rejections)
+    # B4 two-source model: seed the considered set with grounded parametric templates alongside the LLM
+    # alternatives — but only where a single catalog is in scope to ground them (an entity-only,
+    # cross-catalog run has no one source to ground on). A template that clears the SAME gauntlet joins
+    # as its own "templates" lens; one that fails (e.g. it binds the intent's target_ref -> leakage) is
+    # surfaced in the rejections, not silently dropped. Everything downstream treats it as one more lens.
+    if catalog_source is not None:
+        template_ideas, template_rejections = _template_candidates(
+            conn, catalog_source=catalog_source, roles=roles, target_ref=target_ref, now=now)
+        if template_ideas:
+            alternatives.append(FeatureSet(lens="templates", features=template_ideas))
+        rejections.extend(template_rejections)
     anchor: FeatureIdea | None = None
     if intent.intake_mode == "definition":
         ideas = recommend_features(
@@ -85,7 +160,7 @@ def build_considered_set(conn, intent: Intent, client: LLMClient, *, entity: str
         anchor = ideas[0] if ideas else None
     recommendation = (recommend_set(conn, alternatives, intent.redacted_hypothesis, client)
                       if any(s.features for s in alternatives) else None)
-    cs = ConsideredSet(intent.intent_id, anchor, alternatives, recommendation, report.rejections)
+    cs = ConsideredSet(intent.intent_id, anchor, alternatives, recommendation, rejections)
     conn.execute(   # persist the validated set so /contract/draft reconstructs the chosen feature here
         "INSERT INTO contract_considered (intent_id, considered) VALUES (%s, %s::jsonb) "
         "ON CONFLICT (intent_id) DO UPDATE SET considered = EXCLUDED.considered",

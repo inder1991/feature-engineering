@@ -8,9 +8,11 @@ from featuregen.overlay.upload.canonical import CanonicalRow
 from featuregen.overlay.upload.contract.gate1 import (
     Gate1Error,
     build_considered_set,
+    chosen_feature,
     confirm_gate1,
 )
 from featuregen.overlay.upload.contract.intake import submit_intent
+from featuregen.overlay.upload.enrich import content_hash
 from featuregen.overlay.upload.graph import build_graph
 
 NOW = datetime(2026, 7, 5, tzinfo=UTC)
@@ -22,6 +24,33 @@ def _bank(db):
         CanonicalRow("bank", "accounts", "balance", "numeric", additivity="semi_additive"),
         CanonicalRow("bank", "accounts", "posted_at", "timestamp", as_of=True),
         CanonicalRow("bank", "accounts", "churned", "boolean")])
+    db.execute(
+        "INSERT INTO overlay_drift_watermark (catalog_source, last_completed_at, last_run_id, head_seq) "
+        "VALUES ('bank', %s, 'r', 0) ON CONFLICT (catalog_source) DO UPDATE SET last_completed_at = %s",
+        (NOW, NOW))
+
+
+def _bank_churn(db):
+    # A _bank-style catalog carrying the concept-tagged columns the retail_churn templates need to
+    # ground: a monetary_stock balance, an as_of_date, a customer_id grain, a monetary_flow amount and
+    # an event_timestamp — plus the churn outcome_label (a leakage anchor grounding refuses by
+    # construction). Concepts are applied via build_graph's concepts dict (keyed on content_hash),
+    # exactly like an enriched upload. The LLM's `avg_balance_90d` still grounds on `accounts.balance`,
+    # so the two-source model (templates ∪ LLM) is exercised end to end.
+    catalog = [
+        (CanonicalRow("bank", "accounts", "customer_id", "integer", is_grain=True, entity="Customer"),
+         "customer_id"),
+        (CanonicalRow("bank", "accounts", "balance", "numeric", additivity="semi_additive",
+                      currency="USD"), "monetary_stock"),
+        (CanonicalRow("bank", "accounts", "as_of_date", "timestamp", as_of=True), "as_of_date"),
+        (CanonicalRow("bank", "accounts", "amount", "numeric", additivity="additive", currency="USD"),
+         "monetary_flow"),
+        (CanonicalRow("bank", "accounts", "event_ts", "timestamp"), "event_timestamp"),
+        (CanonicalRow("bank", "accounts", "churned", "boolean"), "outcome_label"),
+    ]
+    rows = [r for r, _ in catalog]
+    concepts = {content_hash(r): c for r, c in catalog}
+    build_graph(db, "bank", rows, concepts=concepts)
     db.execute(
         "INSERT INTO overlay_drift_watermark (catalog_source, last_completed_at, last_run_id, head_seq) "
         "VALUES ('bank', %s, 'r', 0) ON CONFLICT (catalog_source) DO UPDATE SET last_completed_at = %s",
@@ -149,3 +178,61 @@ def test_intent_is_persisted_at_gate1(db):
                      "WHERE intent_id = %s", (intent.intent_id,)).fetchone()
     assert row == ("customers churn when their balance drops",
                    "90-day average balance per customer", "definition")
+
+
+# ── B4: parametric templates seed the considered set as a second source ───────────────────────────
+def test_grounded_templates_seed_a_templates_lens(db):
+    # The two-source model (templates ∪ LLM): grounded churn templates enter the considered set as a
+    # "templates" lens ALONGSIDE the LLM's proposals, each judged by the same gauntlet.
+    _bank_churn(db)
+    intent = submit_intent(hypothesis="customers churn when their balance drops", actor="ds1")
+    cs = build_considered_set(db, intent, _client(), catalog_source="bank",
+                              target_ref="public.accounts.churned", now=NOW)
+    template_sets = [s for s in cs.alternatives if s.lens == "templates"]
+    assert len(template_sets) == 1                                    # exactly one templates lens
+    names = {f.name for f in template_sets[0].features}
+    assert "balance_trend_90d" in names                              # the headline template grounded
+    assert all(f.verification == "DESIGN-CHECKED" for f in template_sets[0].features)
+    # both sources present: the LLM proposal survives its gauntlet alongside the templates lens.
+    assert any(f.name == "avg_balance_90d" for s in cs.alternatives for f in s.features)
+
+
+def test_template_binding_the_target_ref_is_rejected_for_leakage(db):
+    # A template is safe-by-construction against tagged leakage ANCHORS, but the intent's SPECIFIC
+    # target_ref may be an untagged column a template binds (here `balance`). The reused gauntlet must
+    # still reject it — it surfaces in rejections, never in the templates set or any candidate's derives.
+    _bank_churn(db)
+    intent = submit_intent(hypothesis="predict the closing balance", actor="ds1")
+    cs = build_considered_set(db, intent, _client(), catalog_source="bank",
+                              target_ref="public.accounts.balance", now=NOW)   # a col templates bind
+    template_feats = [f for s in cs.alternatives if s.lens == "templates" for f in s.features]
+    assert "balance_trend_90d" not in {f.name for f in template_feats}          # binds target -> out
+    assert any(r.get("code") == "LEAKAGE" and r.get("name") == "balance_trend_90d"
+               for r in cs.rejections)                                          # surfaced, not dropped
+    # the resolved target never appears in ANY surviving template candidate's inputs.
+    assert all("public.accounts.balance" not in f.derives_from for f in template_feats)
+
+
+def test_template_pick_round_trips_through_the_snapshot(db):
+    # A template pick is reconstructable from the SERVER-persisted considered set — the snapshot
+    # round-trips a template candidate as chosen_source="alternative" (draft is authored from HERE).
+    _bank_churn(db)
+    intent = submit_intent(hypothesis="customers churn when their balance drops", actor="ds1")
+    cs = build_considered_set(db, intent, _client(), catalog_source="bank",
+                              target_ref="public.accounts.churned", now=NOW)
+    assert confirm_gate1(db, cs, chosen_source="alternative", chosen_option_id="balance_trend_90d",
+                         actor="ds1", why="grounded template fits") == "balance_trend_90d"
+    feat = chosen_feature(db, intent.intent_id, "alternative", "balance_trend_90d")
+    assert feat is not None and feat.name == "balance_trend_90d"
+    assert feat.aggregation == "trend_90d"
+    assert "public.accounts.balance" in feat.derives_from                       # the grounded stock
+
+
+def test_no_templates_lens_when_catalog_grounds_nothing(db):
+    # The plain _bank catalog has no concept-tagged churn columns, so nothing grounds -> no empty lens.
+    _bank(db)
+    intent = submit_intent(hypothesis="customers churn when their balance drops", actor="ds1")
+    cs = build_considered_set(db, intent, _client(), catalog_source="bank",
+                              target_ref="public.accounts.churned", now=NOW)
+    assert all(s.lens != "templates" for s in cs.alternatives)                  # no template grounded
+    assert cs.alternatives                                                      # LLM lenses still there
