@@ -73,6 +73,11 @@ def scope_from_recognition(result: RecognitionResult) -> ConfirmedScope:
 
     primary = next(
         (c.use_case_id for c in result.candidates if c.relationship == "primary"), None)
+    if primary is None:
+        # No confident primary objective (e.g. an AMBIGUOUS result carrying only alternatives). Do NOT
+        # narrow on it — relevance-uncertain fails OPEN to full grounding (the plan's fail-open asymmetry),
+        # never to a primary-less scope that would ground nothing.
+        return ConfirmedScope(primary=None, unscoped=True)
     secondary = tuple(c.use_case_id for c in result.candidates if c.relationship == "secondary")
     return ConfirmedScope(primary=primary, secondary=secondary, expansion=ScopeExpansion.EXACT)
 
@@ -97,6 +102,8 @@ def in_scope_recipes(scope: ConfirmedScope) -> tuple[set[str], set[str]]:
         return all_ids, set()
 
     confirmed: set[str] = {uid for uid in (scope.primary, *scope.secondary) if uid is not None}
+    if not confirmed:                    # defense: an empty scope fails OPEN — never scopes to nothing
+        return all_ids, set()
     expand = scope.expansion is ScopeExpansion.INCLUDE_DESCENDANTS
     descendant_ids: set[str] = set()
     if expand:

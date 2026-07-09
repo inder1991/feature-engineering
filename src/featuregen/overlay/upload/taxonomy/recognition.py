@@ -24,10 +24,22 @@ from enum import StrEnum
 from typing import Any, Literal
 
 from featuregen.contracts import SchemaValidationError
-from featuregen.overlay.upload.taxonomy.use_cases import USE_CASE_REGISTRY, use_case
+from featuregen.overlay.upload.taxonomy.use_cases import (
+    USE_CASE_REGISTRY,
+    selectable_leaves,
+    use_case,
+)
 
-# The current taxonomy version — stamped on every recognition result (the version quintet).
+# The version quintet stamped on every recognition result (governance §3). taxonomy_version +
+# applicability_mapping_version (bumps when recipe_applicability changes) + recipe_registry_version are
+# the three the *result* carries; the recognizer adds recognizer_model_id + prompt_version.
 TAXONOMY_VERSION = "1.0.0"
+APPLICABILITY_MAPPING_VERSION = "1.0.0"
+RECIPE_REGISTRY_VERSION = "1.0.0"
+
+# The selectable LEAVES (terminal objectives). A primary MUST be one of these — the applicability layer
+# scopes on leaves, so a non-leaf selectable parent (e.g. "customer", "credit") would scope to zero recipes.
+_SELECTABLE_LEAVES: frozenset[str] = frozenset(selectable_leaves())
 
 # Closed classification bands. A candidate that drifts from either is malformed structure.
 _RELATIONSHIPS: frozenset[str] = frozenset({"primary", "secondary"})
@@ -78,6 +90,8 @@ class RecognitionResult:
     taxonomy_version: str
     recognizer_model_id: str
     prompt_version: str
+    applicability_mapping_version: str = APPLICABILITY_MAPPING_VERSION
+    recipe_registry_version: str = RECIPE_REGISTRY_VERSION
 
 
 def _validate_candidate(candidate: Any, index: int) -> str:
@@ -99,10 +113,11 @@ def _validate_candidate(candidate: Any, index: int) -> str:
             f"recognition candidate #{index} relationship {relationship!r} not in "
             f"{sorted(_RELATIONSHIPS)}")
 
-    # A primary must be a selectable objective — never the non-selectable financial_crime domain parent.
-    if relationship == "primary" and not node.selectable:
+    # A primary must be a selectable LEAF objective — never a domain parent (financial_crime) and never
+    # a non-leaf selectable parent (customer, credit, insurance.lapse), which would scope to zero recipes.
+    if relationship == "primary" and uid not in _SELECTABLE_LEAVES:
         raise SchemaValidationError(
-            f"recognition candidate #{index} primary {uid!r} is not a selectable objective")
+            f"recognition candidate #{index} primary {uid!r} is not a selectable leaf objective")
 
     confidence = candidate.get("confidence")
     if confidence not in _CONFIDENCE_BANDS:
@@ -145,10 +160,15 @@ def validate_recognition_output(output: Mapping[str, Any]) -> None:
         raise SchemaValidationError(
             f"recognition candidates must be a list, got {type(candidates).__name__}")
 
+    seen_ids: set[str] = set()
     n_primary = 0
     n_secondary = 0
     for index, candidate in enumerate(candidates):
         relationship = _validate_candidate(candidate, index)
+        uid = candidate["use_case_id"]
+        if uid in seen_ids:                       # a secondary duplicating the primary, or a repeated id
+            raise SchemaValidationError(f"recognition has a duplicate candidate id {uid!r}")
+        seen_ids.add(uid)
         if relationship == "primary":
             n_primary += 1
         else:
@@ -167,6 +187,11 @@ def validate_recognition_output(output: Mapping[str, Any]) -> None:
     if status in _CANDIDATE_BEARING and not candidates:
         raise SchemaValidationError(
             f"recognition status {status!r} requires at least one candidate")
+    # A CLASSIFIED result asserts a single objective — it MUST carry exactly one primary. (AMBIGUOUS may
+    # carry only alternatives with no designated primary; scope_from_recognition treats that as unscoped.)
+    if status == RecognitionStatus.CLASSIFIED.value and n_primary != _MAX_PRIMARY:
+        raise SchemaValidationError(
+            f"recognition status 'classified' requires exactly one primary candidate, got {n_primary}")
 
 
 def unscoped_result(

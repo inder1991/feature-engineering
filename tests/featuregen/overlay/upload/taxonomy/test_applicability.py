@@ -108,3 +108,25 @@ def test_scope_from_recognition_classified_maps_primary_and_secondary() -> None:
     # And the confirmed churn primary grounds the churn recipes.
     primary, _supporting = in_scope_recipes(scope)
     assert "balance_trend" in primary
+
+
+# ── review fix: fail-open on a primary-less / empty scope (never scope to zero recipes) ──────────────
+def test_ambiguous_result_without_primary_fails_open():
+    # An AMBIGUOUS result carrying only secondary alternatives has no confident primary -> unscoped.
+    ambiguous = RecognitionResult(
+        status=RecognitionStatus.AMBIGUOUS,
+        candidates=(UseCaseCandidate(
+            use_case_id="credit.early_warning", relationship="secondary",
+            confidence="low", evidence_spans=("x",), rationale="r"),),
+        ambiguity_note="spans two objectives", taxonomy_version=TAXONOMY_VERSION,
+        recognizer_model_id="m", prompt_version="1")
+    scope = scope_from_recognition(ambiguous)
+    assert scope.unscoped is True and scope.primary is None
+    primary_scoped, supporting = in_scope_recipes(scope)
+    assert primary_scoped == ALL_IDS and supporting == set()
+
+
+def test_empty_scope_fails_open_to_all():
+    # Defense-in-depth: a hand-built primary-less, secondary-less, non-unscoped scope still grounds all.
+    primary_scoped, supporting = in_scope_recipes(ConfirmedScope(primary=None, secondary=()))
+    assert primary_scoped == ALL_IDS and supporting == set()
