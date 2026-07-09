@@ -85,6 +85,22 @@ def test_relevant_recipes_are_unique_within_a_case():
         assert len(recipes) == len(set(recipes)), (c.id, "duplicate relevant recipe")
 
 
+def test_expected_recipes_are_reachable_from_the_ideal_scope():
+    # Consistency guard: every expert-relevant recipe MUST be reachable from the case's ideal scope
+    # (expected_primary + permitted_secondary). Otherwise even a perfect recognizer would false-narrow
+    # on this case, and the eval harness would report a defect that is really a gold-set defect.
+    from featuregen.overlay.upload.taxonomy.applicability import ConfirmedScope, in_scope_recipes
+
+    for c in GOLD:
+        if c.expected_primary is None:
+            continue
+        scope = ConfirmedScope(primary=c.expected_primary, secondary=c.permitted_secondary)
+        primary_scoped, supporting_scoped = in_scope_recipes(scope)
+        reachable = primary_scoped | supporting_scoped
+        unreachable = [r for r in c.expected_relevant_recipes if r not in reachable]
+        assert not unreachable, (c.id, "expected recipes unreachable from ideal scope", unreachable)
+
+
 def test_module_marks_the_set_as_authored_pending_expert_review():
     doc = (gold_recognition.__doc__ or "").upper()
     assert "AUTHORED" in doc and "PENDING EXPERT REVIEW" in doc
