@@ -27,7 +27,7 @@ from featuregen.overlay.upload.feature_assist import (
     set_signals,
 )
 from featuregen.overlay.upload.templates import (
-    RETAIL_CHURN_TEMPLATES,
+    ALL_TEMPLATES,
     GroundedFeature,
     Template,
     ground_all,
@@ -69,11 +69,12 @@ def intent_target_ref(conn, intent_id: str) -> str | None:
 
 
 # ── B4: parametric templates as a second candidate source ─────────────────────────────────────────
-# The grounded churn templates enter the considered set as an ALTERNATIVE lens, alongside the LLM's
-# proposals — the two-source model (templates ∪ LLM). Grounding is deterministic (no LLM); each grounded
-# candidate is run through the SAME per-idea gauntlet the LLM candidates cleared, so both sources are
-# judged identically. Use-case recognition / regulatory filtering is B3 (out of scope here): the source
-# is fixed to RETAIL_CHURN_TEMPLATES, which only surface where the catalog grounds them.
+# The grounded templates enter the considered set as an ALTERNATIVE lens, alongside the LLM's proposals
+# — the two-source model (templates ∪ LLM). Grounding is deterministic (no LLM); each grounded candidate
+# is run through the SAME per-idea gauntlet the LLM candidates cleared, so both sources are judged
+# identically. Use-case recognition / regulatory filtering is B3 (out of scope here): the source is the
+# whole ALL_TEMPLATES registry (every family), and grounding is the router — a family surfaces ONLY where
+# its distinctive concepts exist in the catalog (a churn-shaped catalog yields exactly the churn lens).
 _MAX_RATIONALE = 200
 
 
@@ -93,15 +94,17 @@ def _idea_from_grounded(gf: GroundedFeature, template: Template) -> FeatureIdea:
 def _template_candidates(conn, *, catalog_source: str, roles, target_ref: str | None, now,
                          fresh_within: timedelta = timedelta(hours=24),
                          ) -> tuple[list[FeatureIdea], list[dict]]:
-    """Ground RETAIL_CHURN_TEMPLATES on this catalog and gauntlet-check each grounded candidate the SAME
-    way LLM candidates are (feature_assist._validate_idea, over the identical read-scoped candidate
-    universe). Grounding refuses tagged leakage anchors by construction, but the intent's SPECIFIC
-    target_ref may not be a tagged anchor — the reused gauntlet still rejects any candidate that binds it
-    (plus freshness / additivity / PIT / units). Returns (surviving ideas, {name, reason, code} rejects)."""
-    grounded = ground_all(conn, RETAIL_CHURN_TEMPLATES, catalog_source=catalog_source, roles=roles)
+    """Ground ALL_TEMPLATES on this catalog and gauntlet-check each grounded candidate the SAME way LLM
+    candidates are (feature_assist._validate_idea, over the identical read-scoped candidate universe).
+    Grounding is the router — a template family surfaces only where its distinctive concepts exist, so a
+    churn-shaped catalog yields exactly the churn lens. Grounding refuses tagged leakage anchors by
+    construction, but the intent's SPECIFIC target_ref may not be a tagged anchor — the reused gauntlet
+    still rejects any candidate that binds it (plus freshness / additivity / PIT / units). Returns
+    (surviving ideas, {name, reason, code} rejects)."""
+    grounded = ground_all(conn, ALL_TEMPLATES, catalog_source=catalog_source, roles=roles)
     if not grounded:
         return [], []
-    by_id = {t.id: t for t in RETAIL_CHURN_TEMPLATES}
+    by_id = {t.id: t for t in ALL_TEMPLATES}
     cols = _candidate_columns(conn, catalog_source, roles)   # the SAME candidate universe the LLM saw
     known = {c["object_ref"] for c in cols}
     src_of: dict[str, set[str]] = {}

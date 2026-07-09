@@ -232,6 +232,8 @@ attributes**; income/geo flagged.
   flag/reject), charge-off, `forbearance_restructure_flag` (also near-label).
 - **Stage 5 — Recovery/Loss:** `cure_probability` inputs, recovery rate, LGD/`downturn_lgd`.
 > Trap: Stage-4 (90+ DPD, forbearance) ≈ the default label — the 3-part leakage control must flag/reject.
+> **Full parametric set:** the 16 grounded recipes implementing this funnel are in **§PART G** (the
+> `credit_risk` appendix) ↔ `templates.py::CREDIT_RISK_TEMPLATES`.
 
 ## B3. Fraud — the KILL-CHAIN (real-time; windows are minutes/hours, not weeks)
 ```
@@ -567,3 +569,126 @@ degrade path. Concept names match the taxonomy (§3). Templates that can't fully
 `params`→parameter schema, `pit`→trailing-window guard, `degrade`→fallback. The pilot **golden set**
 (kick-off) should exercise each of 1–12 **plus** the `dormancy_days` near-label flag and the
 `dd_cancellation` / `external_own_transfer` degrade paths.
+
+---
+
+# PART G — Appendix: `credit_risk` full parametric set (implements §B2)
+
+The §B2 **deterioration → default** funnel authored to Part-F depth — the 16 recipes the template engine
+(B2) grounds, in `templates.py::CREDIT_RISK_TEMPLATES` (the family joins `ALL_TEMPLATES`, the registry
+gate1 grounds). Each is groundable by concept-matching, safe-by-construction (PIT baked in), and carries a
+degrade path. Concept names match the taxonomy (§3).
+
+**Routing discipline (the load-bearing rule):** every recipe **requires ≥1 credit-distinctive concept**
+(`limit`/`ead`/`dpd`/`delinquency_bucket`/`ecl`/`impairment_stage`/`collateral_value`/`bureau_*`/
+`trade_line`/`restructured_flag`/`sicr_flag`/`covenant`/`scheduled_amount`), so **grounding is the router**
+— the family surfaces ONLY where the catalog carries credit signals; a churn/deposit catalog grounds
+**nothing** here. No recipe ever `Need`s a leakage anchor (`default_flag`/`delinquency_flag`); the engine
+refuses them by construction.
+
+**Near-label discipline:** a recipe that binds a near-label concept (or a DPD level / covenant breach that
+borders the default event) sets `near_label=True` + a ⚠ eligibility note — the deterioration must be
+observed **strictly pre-default** (window ≠ the label window) and the 3-part leakage control must **flag**
+it. **Fair-lending:** no recipe binds a `protected_attribute` (engine-enforced); income/geo flagged.
+
+**Grounding requirements — a "credit-ready" facility catalog needs:**
+| Concept role | Typical column | Required by |
+|---|---|---|
+| `facility_id` (grain) / `customer_id` | `facilities.facility_id` / `.customer_id` | grain of every feature; bureau on customer |
+| `as_of_date` | `facilities.as_of_dt` | every point-in-time state feature |
+| `limit` + `monetary_stock` (drawn) | `facilities.credit_limit` + `.drawn_balance` | credit_utilisation, payment_ratio, min_payment_only |
+| `ead` (exposure) | `facilities.ead` | exposure_trend (+ LTV numerator alt) |
+| `dpd` / `delinquency_bucket` | `facilities.dpd` / `.delinquency_bucket` | days_past_due_max / delinquency_bucket_dynamics |
+| `ecl` / `impairment_stage` | `facilities.ecl` / `.impairment_stage` | ecl_provision_trend / stage_migration |
+| `collateral_value` | `facilities.collateral_value` | loan_to_value |
+| `scheduled_amount` + `monetary_flow` | `payments.scheduled_amount` + `.amount` | missed_partial_payment_count, payment_ratio |
+| `event_timestamp` | `payments.payment_ts` | repayment + bureau-velocity windows |
+| `bureau_score`/`bureau_inquiry`/`trade_line` | `bureau.*` (FCRA external) | bureau_score_delta / inquiry_velocity / new_tradeline |
+| `restructured_flag`/`sicr_flag`/`covenant` | `facilities.*` | forbearance / sicr_onset / dscr_covenant_headroom |
+| `default_flag` (target) | `facilities.default_flag` | leakage anchor (never a feature input) |
+
+### Utilisation & exposure — Stage 1 (early stress)
+1. **`credit_utilisation_{window}`** — drawn / `limit` (`measure=level`) or its trailing OLS trend
+   (`measure=trend`). **needs:** `limit` · `monetary_stock` (drawn) · `as_of_date` · `facility_id`.
+   **params:** `window∈{90,60,30}` · `measure∈{level,trend}`. **add:** non_additive (level=ratio;
+   trend=n/a). **explain:** H. **degrade:** no limit → **skip** (use `exposure_trend`).
+2. **`exposure_trend_{window}`** — OLS slope of `ead` over the window (limit-free; term loans + committed
+   lines). **needs:** `ead` · `as_of_date` · `facility_id`. **params:** `window∈{180,90,365}` ·
+   `measure∈{normalized,slope}`. **add:** n/a. **explain:** H. **degrade:** single snapshot → **skip**.
+   *`contingent_exposure` is an alternate for the undrawn line.*
+
+### Arrears / DPD dynamics — Stage 3 (delinquency) ⚠ near-label
+3. **`days_past_due_max_{window}`** — `max(dpd)` in the window. **needs:** `dpd` · `as_of_date` ·
+   `facility_id`. **params:** `window∈{90,60,30}` · `measure∈{max,latest}`. **add:** n/a. **explain:** H.
+   **⚠ near-label:** a max DPD → 90+ IS the Basel default backstop; observe strictly pre-default.
+4. **`delinquency_bucket_dynamics_{window}`** — worst bucket reached (`measure=worst_bucket`) or forward
+   roll (`measure=roll_rate`). **needs:** `delinquency_bucket` · `as_of_date` · `facility_id`.
+   **params:** `window∈{90,60,30}` · `measure∈{worst_bucket,roll_rate}`. **add:** n/a (worst_bucket
+   ordinal; roll_rate=non-additive). **explain:** H. **⚠ near-label** (90+ bucket = default backstop).
+
+### Repayment behaviour — Stage 2 (emerging distress)
+5. **`payment_ratio_{window}`** — Σ(repayment) / drawn (`measure=to_balance`) or / `limit`
+   (`measure=to_limit`); falling = distress. **needs:** `monetary_flow` · `monetary_stock` · `limit` ·
+   `event_timestamp` · `facility_id`. **params:** `window∈{90,60,180}` · `measure∈{to_balance,to_limit}`.
+   **add:** non_additive (ratio). **explain:** H. **degrade:** no limit → **skip**.
+6. **`min_payment_only_streak_{window}`** — consecutive periods paying only ~the minimum (≈`{min_pct}`% of
+   balance/limit). **needs:** `monetary_flow` · `limit` · `event_timestamp` · `facility_id`. **params:**
+   `window∈{180,90,365}` · `min_pct∈{3,5,2}`. **add:** additive (period count). **explain:** H.
+   **derived:** `is_min_only := payment ≤ min_due` — declared downstream (§D.8), probabilistic → FLAG.
+7. **`missed_partial_payment_count_{window}`** — count of installments where paid < due. **needs:**
+   `scheduled_amount` · `monetary_flow` (paid) · `event_timestamp` · `facility_id`. **params:**
+   `window∈{180,90,365}` · `tolerance_pct∈{5,0,10}`. **add:** additive (count). **explain:** H.
+   **degrade:** revolving product (no schedule) → **skip** (use `payment_ratio`). *anchor `scheduled_amount`
+   is lending-specific (not on the §B2 distinctive list) — absent from a deposit/churn catalog, so it
+   still routes.*
+
+### Exposure & provisioning drift — Stage 2 (staging is ⚠ near-label)
+8. **`ecl_provision_trend_{window}`** — trend in the IFRS9 ECL provision. **needs:** `ecl` · `as_of_date` ·
+   `facility_id`. **params:** `window∈{180,90,365}` · `measure∈{slope,pct_change}`. **add:** n/a.
+   **explain:** H. **degrade:** single snapshot → **skip**. *`provision_amount` is an alternate.*
+9. **`stage_migration_{window}`** — IFRS9 stage worse at as_of than at window start (`measure=worsened_flag
+   /stage_delta`). **needs:** `impairment_stage` · `as_of_date` · `facility_id`. **params:**
+   `window∈{180,90,365}` · `measure∈{worsened_flag,stage_delta}`. **add:** n/a. **explain:** H.
+   **⚠ near-label:** stage 3 = credit-impaired ≈ the default label.
+
+### Collateral — Stage 1 (early stress)
+10. **`loan_to_value_{window}`** — exposure / `collateral_value` (`ltv`), inverse (`coverage`), or uncovered
+    `shortfall`. **needs:** `monetary_stock` (exposure) · `collateral_value` · `as_of_date` · `facility_id`.
+    **params:** `window∈{90,180,365}` · `measure∈{ltv,coverage,shortfall}`. **add:** non_additive
+    (ltv/coverage=ratio; shortfall=amount). **explain:** H. **degrade:** unsecured → **skip**. *apply
+    haircut/advance_rate first; `ead` is an alternate numerator.*
+
+### Bureau / external — Stage 2 (FCRA external, provenance-flagged)
+11. **`bureau_score_delta_{window}`** — change in external bureau score. **needs:** `bureau_score` ·
+    `as_of_date` · `customer_id`. **params:** `window∈{90,180,365}` · `measure∈{delta,slope}`. **add:** n/a.
+    **explain:** H. **eligibility:** FCRA external + **MODEL OUTPUT → leakage-risk, flag**. **degrade:**
+    single pull → **skip**.
+12. **`bureau_inquiry_velocity_{window}`** — count of HARD inquiries. **needs:** `bureau_inquiry` ·
+    `event_timestamp` · `customer_id`. **params:** `window∈{90,180,30}` · `inquiry_kind∈{hard,all}`.
+    **add:** additive (count). **explain:** H. **eligibility:** FCRA external.
+13. **`new_trade_line_count_{window}`** — new tradelines opened (external leverage). **needs:** `trade_line`
+    · `event_timestamp` · `customer_id`. **params:** `window∈{180,90,365}`. **add:** additive (count).
+    **explain:** H. **eligibility:** FCRA external.
+
+### Forbearance / SICR — Stage 2-4 ⚠ near-label
+14. **`forbearance_in_window_{window}`** — a restructure/concession occurred (`measure=occurred_flag/
+    count`). **needs:** `restructured_flag` · `as_of_date` · `facility_id`. **params:** `window∈{365,180,
+    90}` · `measure∈{occurred_flag,count}`. **add:** n/a (flag; count=additive). **explain:** H.
+    **⚠ near-label:** forbearance ≈ the impaired/default label (IFRS9 Stage-3 trigger).
+15. **`sicr_onset_{window}`** — an IFRS9 SICR trigger fired (Stage 1→2). **needs:** `sicr_flag` ·
+    `as_of_date` · `facility_id`. **params:** `window∈{180,90,365}`. **add:** n/a. **explain:** H.
+    **⚠ near-label:** the staging trigger borders the default funnel.
+
+### Affordability — covenant / DSCR ⚠ near-label
+16. **`dscr_covenant_headroom_{window}`** — margin between a covenant's actual and threshold (DSCR/ICR/
+    leverage); shrinking/negative = breach path (`measure=headroom/breached_flag/trend`). **needs:**
+    `covenant` · `as_of_date` · `facility_id`. **params:** `window∈{90,180,365}` · `measure∈{headroom,
+    breached_flag,trend}`. **add:** non_additive (headroom=ratio; breached_flag=n/a). **explain:** H.
+    **⚠ near-label:** a breach borders the default/forbearance label; income inputs are SENSITIVE.
+
+**Build note (B2):** these 16 map 1:1 to the `templates.py` model exactly like §PART F — `needs`→grounding
+contract, `params`→parameter schema, `pit`→trailing-window/state guard, `degrade`→fallback,
+`near_label`→the 3-part leakage flag. The near-label subset the golden set must exercise:
+`days_past_due_max`, `delinquency_bucket_dynamics`, `stage_migration`, `forbearance_in_window`,
+`sicr_onset`, `dscr_covenant_headroom`. Routing is verified by `test_templates_credit.py` (the family
+grounds nothing on the churn catalog; `ALL_TEMPLATES` on churn yields exactly the churn lens).

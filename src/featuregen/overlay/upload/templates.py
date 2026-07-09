@@ -10,8 +10,11 @@ Three things live here, standalone (NOT wired into the considered-set / generati
    template's abstract ``needs`` to a catalog's concept-tagged ``graph_node`` columns (read-scoped by
    sensitivity like the rest of the overlay) and yields a safe candidate :class:`GroundedFeature`, or
    degrades / skips when a required need can't ground.
-3. :data:`RETAIL_CHURN_TEMPLATES` — the 12 pilot recipes authored faithfully from the SME library,
-   ``docs/superpowers/specs/2026-07-08-banking-feature-template-library.md`` §PART F.
+3. The recipe FAMILIES, authored faithfully from the SME library
+   (``docs/superpowers/specs/2026-07-08-banking-feature-template-library.md``): :data:`RETAIL_CHURN_TEMPLATES`
+   (the 12 pilot recipes, §PART F) and :data:`CREDIT_RISK_TEMPLATES` (the §B2 deterioration→default funnel,
+   §PART G). :data:`ALL_TEMPLATES` is the combined registry future passes extend; grounding is the router,
+   so a family surfaces only where its distinctive concepts exist in the catalog.
 
 **Safety by construction.** Grounding refuses, structurally, to bind any column that is a *leakage
 anchor* (a target / target-defining column — §3.10/§3.7 of the taxonomy) or a *protected_attribute* /
@@ -527,12 +530,360 @@ RETAIL_CHURN_TEMPLATES: tuple[Template, ...] = (
 )
 
 
-def _validate_registry() -> None:
-    """Fail fast at import if a template drifts from the concept registry / schema invariants."""
-    seen_ids: set[str] = set()
-    for t in RETAIL_CHURN_TEMPLATES:
+# ──────────────────────────────────────────────────────────────────────────────────────────────────
+# The credit_risk templates — the §B2 DETERIORATION → DEFAULT funnel authored to Part-F depth.
+#
+# Funnel (§B2): HEALTHY → EARLY STRESS → EMERGING DISTRESS → DELINQUENCY → DEFAULT ⚠ → RECOVERY/LOSS,
+# mapped onto IFRS9 staging (Stage 1 performing → 2 SICR → 3 credit-impaired). Two authoring disciplines
+# are load-bearing here:
+#   • ROUTING — every recipe REQUIRES at least one credit-distinctive concept (limit / ead / dpd /
+#     delinquency_bucket / ecl / impairment_stage / collateral_value / bureau_* / trade_line /
+#     restructured_flag / sicr_flag / covenant / scheduled_amount), so grounding surfaces the family ONLY
+#     where the catalog actually carries credit signals — a churn/deposit catalog yields NOTHING here.
+#   • NEAR-LABEL — a recipe that binds a near-label concept (delinquency_bucket ≈ 90+ DPD, impairment_stage
+#     stage-3 = credit-impaired, restructured_flag/sicr_flag, or a DPD level / covenant breach that borders
+#     the default event) sets near_label=True + a ⚠ eligibility note; the deterioration must be observed
+#     STRICTLY pre-default and the 3-part leakage control must FLAG it (there is no data plane to enforce
+#     it — see the module docstring). Fair-lending: no recipe binds a protected_attribute (engine-enforced).
+#
+# The Part-G appendix in docs/…/2026-07-08-banking-feature-template-library.md is the doc source of record.
+# ──────────────────────────────────────────────────────────────────────────────────────────────────
+_CREDIT_PIT_STATE = ("point-in-time credit STATE observed as-of: value knowable strictly ≤ as_of; the "
+                     "latest snapshot within (as_of − {window}, as_of], never forward. DESIGN-TIME "
+                     "declaration — no data plane enforces runtime PIT.")
+_NEAR_LABEL_PREFIX = ("⚠ NEAR-LABEL: observe the deterioration signal STRICTLY pre-default (never on/after "
+                      "the default event; window ≠ the label window); the 3-part leakage control must "
+                      "FLAG it. ")
+_EXTERNAL_FCRA = ("EXTERNAL credit-bureau data — FCRA/GDPR regime, heavily lagged/restated (honour "
+                  "system_time to avoid restated-data leakage); provenance=external.")
+_FAIR_LENDING = "fair-lending: NEVER bind a protected_attribute (engine-enforced); income/geo flagged."
+
+CREDIT_RISK_TEMPLATES: tuple[Template, ...] = (
+    # ── Utilisation & exposure (§B2 Stage 0-1 — early stress) ──────────────────────────────────────
+    # C.1 — credit_utilisation (level + trend)
+    Template(
+        id="credit_utilisation", family="utilisation_exposure",
+        intent="Credit-limit utilisation — drawn exposure / limit (measure=level) or its trailing OLS "
+               "trend (measure=trend); rising utilisation is the classic early-deterioration signal.",
+        needs=(Need("limit_col", "limit"), Need("drawn_col", "monetary_stock"),
+               Need("asof", "as_of_date"), Need("entity", "facility_id")),
+        params={"window": (90, 60, 30), "measure": ("level", "trend")},
+        aggregation="utilisation", additivity="non_additive", explain="H",
+        use_cases=("credit_risk", "early_warning", "limit_management"),
+        pit=_CREDIT_PIT_STATE,
+        degrade="no limit (e.g. a term loan with no ceiling) -> SKIP; use exposure_trend instead.",
+        stage="1-early-stress",
+        eligibility="bind a monetary_stock drawn balance (never a flow) against its limit; single "
+                    "currency — convert to base first. " + _FAIR_LENDING,
+        notes=("anchor: 'limit' (credit-distinctive) routes this off a deposit/churn catalog.",
+               "OUTPUT additivity is measure-dependent: measure=level is a non-additive ratio, "
+               "measure=trend is n/a (a slope) — the default carries the ratio case.",
+               "'ead' is an acceptable alternate for the drawn amount where exposure-at-default is "
+               "reported instead of a ledger balance."),
+    ),
+    # C.2 — exposure_trend (raw EAD drift, limit-free)
+    Template(
+        id="exposure_trend", family="utilisation_exposure",
+        intent="OLS slope of exposure-at-default over a trailing window — rising absolute exposure into "
+               "stress, independent of any limit (covers term loans + drawing on committed lines).",
+        needs=(Need("exposure_col", "ead"), Need("asof", "as_of_date"),
+               Need("entity", "facility_id")),
+        params={"window": (180, 90, 365), "measure": ("normalized", "slope")},
+        aggregation="exposure_trend", additivity="n/a", explain="H",
+        use_cases=("credit_risk", "early_warning", "limit_management"),
+        pit=_PIT_TRAILING,
+        degrade="only a single exposure snapshot (no history) -> SKIP (no trend from one point).",
+        stage="1-early-stress",
+        eligibility="bind an 'ead' exposure STOCK (semi-additive) — never sum across dates; single "
+                    "currency. " + _FAIR_LENDING,
+        notes=("anchor: 'ead' (credit-distinctive) routes this off a churn catalog.",
+               "'contingent_exposure' (undrawn commitment) is an acceptable alternate where a facility "
+               "reports the off-balance-sheet line separately."),
+    ),
+    # ── Arrears / DPD dynamics (§B2 Stage 3 — delinquency; NEAR-LABEL) ──────────────────────────────
+    # C.3 — days_past_due_max
+    Template(
+        id="days_past_due_max", family="arrears_dpd",
+        intent="Worst days-past-due reached in the trailing window: max(dpd) — the headline arrears-"
+               "severity signal.",
+        needs=(Need("dpd_col", "dpd"), Need("asof", "as_of_date"), Need("entity", "facility_id")),
+        params={"window": (90, 60, 30), "measure": ("max", "latest")},
+        aggregation="dpd_max", additivity="n/a", explain="H",
+        use_cases=("credit_risk", "collections", "early_warning"),
+        pit=_CREDIT_PIT_STATE,
+        stage="3-delinquency",
+        near_label=True,
+        eligibility=_NEAR_LABEL_PREFIX + "a max DPD approaching 90+ IS the Basel default backstop. "
+                    + _FAIR_LENDING,
+        notes=("anchor: 'dpd' (credit-distinctive) routes this off a churn catalog.",
+               "borders the default label — the deterioration must be observed strictly pre-default."),
+    ),
+    # C.4 — delinquency_bucket_dynamics (worst bucket + roll-rate)
+    Template(
+        id="delinquency_bucket_dynamics", family="arrears_dpd",
+        intent="Delinquency-bucket dynamics: worst (highest) bucket reached in the window "
+               "(measure=worst_bucket) or forward roll — did the bucket migrate WORSE vs window start "
+               "(measure=roll_rate).",
+        needs=(Need("bucket_col", "delinquency_bucket"), Need("asof", "as_of_date"),
+               Need("entity", "facility_id")),
+        params={"window": (90, 60, 30), "measure": ("worst_bucket", "roll_rate")},
+        aggregation="delinquency_bucket", additivity="n/a", explain="H",
+        use_cases=("credit_risk", "collections", "ifrs9_staging"),
+        pit=_CREDIT_PIT_STATE,
+        stage="3-delinquency",
+        near_label=True,
+        eligibility=_NEAR_LABEL_PREFIX + "the 90+ bucket is a default backstop. " + _FAIR_LENDING,
+        notes=("anchor: 'delinquency_bucket' (near-label, credit-distinctive).",
+               "OUTPUT additivity is measure-dependent: worst_bucket is an ordinal max (n/a); a "
+               "portfolio roll_rate is non-additive (a proportion) — the default carries the ordinal case.",
+               "borders the default label — observe strictly pre-default."),
+    ),
+    # ── Repayment behaviour (§B2 Stage 2 — emerging distress) ───────────────────────────────────────
+    # C.5 — payment_ratio
+    Template(
+        id="payment_ratio", family="repayment_behaviour",
+        intent="Repayment coverage — sum(repayment flow in window) / drawn balance (measure=to_balance) "
+               "or / limit (measure=to_limit); a falling ratio is emerging distress.",
+        needs=(Need("payment_col", "monetary_flow"), Need("balance_col", "monetary_stock"),
+               Need("limit_col", "limit"), Need("event_ts", "event_timestamp"),
+               Need("entity", "facility_id")),
+        params={"window": (90, 60, 180), "measure": ("to_balance", "to_limit")},
+        aggregation="payment_ratio", additivity="non_additive", explain="H",
+        use_cases=("credit_risk", "early_warning", "affordability"),
+        pit=_PIT_TRAILING,
+        degrade="no limit (a term loan) -> SKIP; use missed_partial_payment_count on the schedule.",
+        stage="2-emerging-distress",
+        eligibility="single currency — convert to base first. " + _FAIR_LENDING,
+        notes=("anchor: 'limit' (credit-distinctive) routes this off a churn catalog.",
+               "a ratio — non-additive; compute per facility, never sum."),
+    ),
+    # C.6 — min_payment_only_streak
+    Template(
+        id="min_payment_only_streak", family="repayment_behaviour",
+        intent="Consecutive billing periods paying only ~the contractual minimum (min ≈ a small % of "
+               "limit/balance) — a persistent revolver-in-distress signal.",
+        needs=(Need("payment_col", "monetary_flow"), Need("limit_col", "limit"),
+               Need("event_ts", "event_timestamp"), Need("entity", "facility_id")),
+        params={"window": (180, 90, 365), "min_pct": (3, 5, 2)},
+        aggregation="min_only_streak", additivity="additive", explain="H",
+        use_cases=("credit_risk", "early_warning"),
+        pit=_PIT_TRAILING,
+        degrade="no per-period statement minimum -> derive min ≈ {min_pct}% of the period balance "
+                "(declared downstream derivation §D.8; probabilistic — FLAG).",
+        stage="2-emerging-distress",
+        eligibility="single currency. " + _FAIR_LENDING,
+        derived=("is_min_only := period_payment ≤ min_due(≈{min_pct}% of balance/limit) — declared "
+                 "downstream (no data plane); the streak counts consecutive is_min_only periods.",),
+        notes=("anchor: 'limit' (credit-distinctive) routes this off a churn catalog.",
+               "a count of periods — additive."),
+    ),
+    # C.7 — missed_partial_payment_count
+    Template(
+        id="missed_partial_payment_count", family="repayment_behaviour",
+        intent="Count of scheduled installments in the window where the amount PAID fell short of the "
+               "amount DUE (missed or partial) — arrears = scheduled − paid.",
+        needs=(Need("scheduled_col", "scheduled_amount"), Need("paid_col", "monetary_flow"),
+               Need("event_ts", "event_timestamp"), Need("entity", "facility_id")),
+        params={"window": (180, 90, 365), "tolerance_pct": (5, 0, 10)},
+        aggregation="missed_partial_count", additivity="additive", explain="H",
+        use_cases=("credit_risk", "early_warning", "collections"),
+        pit=_PIT_TRAILING,
+        degrade="no contractual installment schedule (revolving product) -> SKIP; use payment_ratio.",
+        stage="2-emerging-distress",
+        eligibility="single currency. " + _FAIR_LENDING,
+        derived=("is_short := paid < scheduled × (1 − {tolerance_pct}%) — a shortfall vs the "
+                 "contractual due, counted per installment date.",),
+        notes=("anchor: 'scheduled_amount' — the contractual installment DUE, an installment-lending "
+               "concept absent from a deposit/churn catalog, routes this off a churn catalog (it is not "
+               "on the §B2 credit-distinctive list but is lending-specific by construction).",
+               "a count of shortfall periods — additive."),
+    ),
+    # ── Exposure & provisioning drift (§B2 Stage 2 — emerging distress; staging is NEAR-LABEL) ──────
+    # C.8 — ecl_provision_trend
+    Template(
+        id="ecl_provision_trend", family="exposure_provisioning",
+        intent="Trend in the IFRS9 expected-credit-loss provision over a trailing window — rising ECL is "
+               "provisioning drift into distress.",
+        needs=(Need("ecl_col", "ecl"), Need("asof", "as_of_date"), Need("entity", "facility_id")),
+        params={"window": (180, 90, 365), "measure": ("slope", "pct_change")},
+        aggregation="ecl_trend", additivity="n/a", explain="H",
+        use_cases=("credit_risk", "ifrs9_staging"),
+        pit=_PIT_TRAILING,
+        degrade="only a single ECL snapshot (no history) -> SKIP.",
+        stage="2-emerging-distress",
+        eligibility="bind an 'ecl' provision STOCK (semi-additive) — never sum across dates; single "
+                    "currency. " + _FAIR_LENDING,
+        notes=("anchor: 'ecl' (credit-distinctive) routes this off a churn catalog.",
+               "'provision_amount' is an acceptable alternate for banks reporting a loan-loss provision "
+               "rather than an IFRS9 ECL."),
+    ),
+    # C.9 — stage_migration (IFRS9 impairment stage worsening — NEAR-LABEL)
+    Template(
+        id="stage_migration", family="exposure_provisioning",
+        intent="IFRS9 impairment-stage migration: is the stage at as_of WORSE (higher) than at window "
+               "start? measure=worsened_flag / stage_delta.",
+        needs=(Need("stage_col", "impairment_stage"), Need("asof", "as_of_date"),
+               Need("entity", "facility_id")),
+        params={"window": (180, 90, 365), "measure": ("worsened_flag", "stage_delta")},
+        aggregation="stage_migration", additivity="n/a", explain="H",
+        use_cases=("credit_risk", "ifrs9_staging", "early_warning"),
+        pit=_CREDIT_PIT_STATE,
+        stage="2-emerging-distress",
+        near_label=True,
+        eligibility=_NEAR_LABEL_PREFIX + "IFRS9 stage 3 is credit-impaired ≈ the default label. "
+                    + _FAIR_LENDING,
+        notes=("anchor: 'impairment_stage' (near-label, credit-distinctive).",
+               "borders the default label — observe strictly pre-default."),
+    ),
+    # ── Collateral (§B2 Stage 1 — early stress; non-additive ratio) ─────────────────────────────────
+    # C.10 — loan_to_value (LTV / coverage / shortfall)
+    Template(
+        id="loan_to_value", family="collateral",
+        intent="Loan-to-value / collateral coverage — outstanding exposure / collateral_value "
+               "(measure=ltv), its inverse (measure=coverage), or the uncovered shortfall "
+               "max(exposure − collateral, 0) (measure=shortfall).",
+        needs=(Need("exposure_col", "monetary_stock"), Need("collateral_col", "collateral_value"),
+               Need("asof", "as_of_date"), Need("entity", "facility_id")),
+        params={"window": (90, 180, 365), "measure": ("ltv", "coverage", "shortfall")},
+        aggregation="loan_to_value", additivity="non_additive", explain="H",
+        use_cases=("credit_risk", "limit_management", "ifrs9_staging"),
+        pit=_CREDIT_PIT_STATE,
+        degrade="no collateral (unsecured) -> SKIP (LTV undefined).",
+        stage="1-early-stress",
+        eligibility="apply the collateral haircut / advance_rate before the ratio; single currency. "
+                    + _FAIR_LENDING,
+        notes=("anchor: 'collateral_value' (credit-distinctive) routes this off a churn catalog.",
+               "OUTPUT additivity is measure-dependent: ltv/coverage are non-additive ratios; a "
+               "shortfall is a monetary amount — the default carries the ratio case.",
+               "'ead' is an acceptable alternate for the exposure numerator."),
+    ),
+    # ── Bureau / external (§B2 Stage 2 — emerging distress; FCRA external, provenance-flagged) ───────
+    # C.11 — bureau_score_delta
+    Template(
+        id="bureau_score_delta", family="bureau_external",
+        intent="Change in the external credit-bureau score over a trailing window — a falling bureau "
+               "score is cross-lender deterioration.",
+        needs=(Need("score_col", "bureau_score"), Need("asof", "as_of_date"),
+               Need("entity", "customer_id")),
+        params={"window": (90, 180, 365), "measure": ("delta", "slope")},
+        aggregation="bureau_score_delta", additivity="n/a", explain="H",
+        use_cases=("credit_risk", "early_warning"),
+        pit=_CREDIT_PIT_STATE,
+        degrade="only a single bureau pull (no history) -> SKIP.",
+        stage="2-emerging-distress",
+        eligibility=_EXTERNAL_FCRA + " a bureau score is a MODEL OUTPUT — leakage-risk when its target "
+                    "overlaps the feature target; flag before use. " + _FAIR_LENDING,
+        notes=("anchor: 'bureau_score' (external, credit-distinctive) routes this off a churn catalog.",
+               "provenance=external (FCRA)."),
+    ),
+    # C.12 — bureau_inquiry_velocity
+    Template(
+        id="bureau_inquiry_velocity", family="bureau_external",
+        intent="Count of HARD credit-bureau inquiries in the window — rising inquiry velocity is credit-"
+               "hungry behaviour (shopping for credit under stress).",
+        needs=(Need("inquiry_col", "bureau_inquiry"), Need("event_ts", "event_timestamp"),
+               Need("entity", "customer_id")),
+        params={"window": (90, 180, 30), "inquiry_kind": ("hard", "all")},
+        aggregation="bureau_inquiry_velocity", additivity="additive", explain="H",
+        use_cases=("credit_risk", "early_warning"),
+        pit=_PIT_TRAILING,
+        stage="2-emerging-distress",
+        eligibility=_EXTERNAL_FCRA + " " + _FAIR_LENDING,
+        notes=("anchor: 'bureau_inquiry' (external, credit-distinctive) routes this off a churn catalog.",
+               "a count of inquiry events — additive; provenance=external (FCRA)."),
+    ),
+    # C.13 — new_trade_line_count
+    Template(
+        id="new_trade_line_count", family="bureau_external",
+        intent="Count of NEW credit-bureau tradelines opened in the window — rising external leverage "
+               "(new borrowing elsewhere) ahead of distress.",
+        needs=(Need("tradeline_col", "trade_line"), Need("event_ts", "event_timestamp"),
+               Need("entity", "customer_id")),
+        params={"window": (180, 90, 365)},
+        aggregation="new_tradeline_count", additivity="additive", explain="H",
+        use_cases=("credit_risk", "early_warning"),
+        pit=_PIT_TRAILING,
+        stage="2-emerging-distress",
+        eligibility=_EXTERNAL_FCRA + " " + _FAIR_LENDING,
+        notes=("anchor: 'trade_line' (external, credit-distinctive) routes this off a churn catalog.",
+               "a count of newly-opened tradelines — additive; provenance=external (FCRA)."),
+    ),
+    # ── Forbearance / SICR (§B2 Stage 2-4 — NEAR-LABEL staging triggers) ────────────────────────────
+    # C.14 — forbearance_in_window
+    Template(
+        id="forbearance_in_window", family="forbearance_sicr",
+        intent="Did a forbearance / restructure event occur in the window? measure=occurred_flag / count "
+               "— concessions granted are a strong pre-default distress marker.",
+        needs=(Need("restructured_col", "restructured_flag"), Need("asof", "as_of_date"),
+               Need("entity", "facility_id")),
+        params={"window": (365, 180, 90), "measure": ("occurred_flag", "count")},
+        aggregation="forbearance", additivity="n/a", explain="H",
+        use_cases=("credit_risk", "ifrs9_staging", "early_warning"),
+        pit=_CREDIT_PIT_STATE,
+        stage="4-default-adjacent",
+        near_label=True,
+        eligibility=_NEAR_LABEL_PREFIX + "forbearance ≈ the default/impaired label (IFRS9 Stage-3 "
+                    "trigger). " + _FAIR_LENDING,
+        notes=("anchor: 'restructured_flag' (near-label, credit-distinctive).",
+               "OUTPUT additivity is measure-dependent: occurred_flag is n/a; a count is additive.",
+               "borders the default label — observe strictly pre-default."),
+    ),
+    # C.15 — sicr_onset
+    Template(
+        id="sicr_onset", family="forbearance_sicr",
+        intent="Did an IFRS9 Significant-Increase-in-Credit-Risk (SICR) trigger fire in the window "
+               "(Stage 1 -> 2)? The staging-onset marker.",
+        needs=(Need("sicr_col", "sicr_flag"), Need("asof", "as_of_date"),
+               Need("entity", "facility_id")),
+        params={"window": (180, 90, 365)},
+        aggregation="sicr_onset", additivity="n/a", explain="H",
+        use_cases=("credit_risk", "ifrs9_staging"),
+        pit=_CREDIT_PIT_STATE,
+        stage="2-emerging-distress",
+        near_label=True,
+        eligibility=_NEAR_LABEL_PREFIX + "the SICR trigger borders the default funnel. " + _FAIR_LENDING,
+        notes=("anchor: 'sicr_flag' (near-label, credit-distinctive).",
+               "borders the default label — observe strictly pre-default."),
+    ),
+    # ── Affordability (§B2 covenant / DSCR — NEAR-LABEL breach path) ────────────────────────────────
+    # C.16 — dscr_covenant_headroom
+    Template(
+        id="dscr_covenant_headroom", family="affordability",
+        intent="Debt-service / covenant headroom — the margin between a covenant's actual and its "
+               "threshold (DSCR/ICR/leverage); a shrinking or negative headroom is a breach path.",
+        needs=(Need("covenant_col", "covenant"), Need("asof", "as_of_date"),
+               Need("entity", "facility_id")),
+        params={"window": (90, 180, 365), "measure": ("headroom", "breached_flag", "trend")},
+        aggregation="covenant_headroom", additivity="non_additive", explain="H",
+        use_cases=("credit_risk", "affordability", "early_warning"),
+        pit=_CREDIT_PIT_STATE,
+        stage="2-emerging-distress",
+        near_label=True,
+        eligibility=_NEAR_LABEL_PREFIX + "a covenant breach borders the default/forbearance label; "
+                    "income/affordability inputs are SENSITIVE. " + _FAIR_LENDING,
+        notes=("anchor: 'covenant' (near-label, credit-distinctive) — DSCR/ICR/leverage headroom.",
+               "OUTPUT additivity is measure-dependent: headroom/DSCR is a non-additive ratio; "
+               "breached_flag is n/a — the default carries the ratio case.",
+               "borders the default label — observe strictly pre-default."),
+    ),
+)
+
+
+# ──────────────────────────────────────────────────────────────────────────────────────────────────
+# The full template REGISTRY — every family, in author order. Future template passes (fraud, AML,
+# collections, …) EXTEND this tuple; gate1 grounds ALL_TEMPLATES so a family surfaces only where its
+# distinctive concepts exist in the catalog (grounding is the router). RETAIL_CHURN_TEMPLATES stays a
+# standalone name because gate1 + the pilot tests still import it directly.
+# ──────────────────────────────────────────────────────────────────────────────────────────────────
+ALL_TEMPLATES: tuple[Template, ...] = RETAIL_CHURN_TEMPLATES + CREDIT_RISK_TEMPLATES
+
+
+def _validate_family(templates: tuple[Template, ...], label: str, seen_ids: set[str]) -> None:
+    """Per-need concept-existence + param-shape checks for one family, accumulating each id into
+    ``seen_ids`` so the caller can enforce id-uniqueness at whatever scope it passes the set."""
+    for t in templates:
         if t.id in seen_ids:
-            raise ValueError(f"duplicate template id {t.id!r} in RETAIL_CHURN_TEMPLATES")
+            raise ValueError(f"duplicate template id {t.id!r} (checking {label})")
         seen_ids.add(t.id)
         for need in t.needs:
             if need.concept not in CONCEPT_REGISTRY:
@@ -541,6 +892,16 @@ def _validate_registry() -> None:
         for key, allowed in t.params.items():
             if not isinstance(allowed, tuple) or not allowed:
                 raise ValueError(f"template {t.id!r} param {key!r} must be a non-empty tuple")
+
+
+def _validate_registry() -> None:
+    """Fail fast at import if a template drifts from the concept registry / schema invariants.
+
+    Two passes: (1) the churn pilot on its own (kept intact — gate1 + tests import it directly); (2) the
+    combined ALL_TEMPLATES registry with a GLOBAL id-uniqueness check — no two templates in ANY family may
+    share an id — plus the same per-need concept-existence + param-shape checks for every family."""
+    _validate_family(RETAIL_CHURN_TEMPLATES, "RETAIL_CHURN_TEMPLATES", set())
+    _validate_family(ALL_TEMPLATES, "ALL_TEMPLATES", set())
 
 
 _validate_registry()
