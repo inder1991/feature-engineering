@@ -271,6 +271,89 @@ export async function featureImpact(objectRef: string, source: string): Promise<
   return body.feature_ids
 }
 
+// ---- catalog lineage graph (GET /graph/lineage) ------------------------------------------
+
+export type LineageLayer = 'joins' | 'entity' | 'features'
+export type LineageDirection = 'up' | 'down' | 'both'
+
+export const LINEAGE_LAYERS: readonly LineageLayer[] = ['joins', 'entity', 'features']
+
+// One node of the lineage map. Optional keys are OMITTED by the wire when absent, never null:
+// a pending stub (resolved=false) carries NO catalog_source (its declaring source is only the
+// id prefix), and feature/consumer nodes carry name/feature_id instead of object_ref/table.
+// Node ids: "{catalog_source}:{object_ref}" | "feature:{feature_id}" | "consumer:{model_ref}".
+export interface LineageNode {
+  id: string
+  kind: 'table' | 'column' | 'feature' | 'consumer'
+  object_ref?: string
+  table?: string
+  column?: string
+  catalog_source?: string
+  feature_id?: string
+  name?: string
+  grain: boolean
+  as_of: boolean
+  sensitivity?: string
+  entity?: string
+  // column enrichment (omitted when null): controlled concept, business domain, and — only on the
+  // table's as-of column — the availability basis (posted_at | ingested_at) from its as-of fact.
+  concept?: string
+  domain?: string
+  as_of_basis?: string
+  // feature stamps (omitted when absent): the honest verification stamp (e.g. DESIGN-CHECKED) and
+  // the causal WHY it was born (its hypothesis); rationale is absent for directly-registered features.
+  verification?: string
+  rationale?: string
+  // table provenance: ISO8601 of the source's last drift-vouch (omitted when never scanned) and the
+  // count of this table's rows still in the review queue (omitted when zero).
+  last_vouched_at?: string
+  quarantine_pending?: number
+  stale: boolean
+  resolved: boolean
+}
+
+// Edge orientation for symmetric kinds (join, entity_bridge) points away from the anchor.
+// `cardinality` is omitted when the declared edge has none; entity bridges never carry one.
+// kind 'contains' (table -> column) is structural and always emitted regardless of layers.
+export interface LineageEdge {
+  from: string
+  to: string
+  layer: LineageLayer
+  kind: 'contains' | 'join' | 'entity_bridge' | 'derives' | 'consumes'
+  cardinality?: string
+  resolved: boolean
+}
+
+export interface LineageGraph {
+  nodes: LineageNode[]
+  edges: LineageEdge[]
+  truncated: boolean
+}
+
+export function lineageGraph(
+  ref: string,
+  source: string,
+  opts: {
+    direction?: LineageDirection
+    depth?: number
+    layers?: readonly LineageLayer[]
+    // Aborted by the view when the anchor changes or the component unmounts, so a superseded
+    // or orphaned fetch is cancelled at the transport instead of running to completion.
+    signal?: AbortSignal
+  } = {},
+): Promise<LineageGraph> {
+  const direction = opts.direction ?? 'both'
+  const depth = opts.depth ?? 1
+  const layers = opts.layers ?? LINEAGE_LAYERS
+  // Hand-built query string: URLSearchParams would percent-encode the commas in `layers`,
+  // and the wire contract pins the exact URL shape (layers=joins,entity,features).
+  return request(
+    `/graph/lineage?ref=${encodeURIComponent(ref)}&source=${encodeURIComponent(source)}` +
+      `&direction=${direction}&depth=${depth}&layers=${layers.join(',')}`,
+    opts.signal ? { signal: opts.signal } : undefined,
+  )
+}
+
 // One row of the registry inventory (GET /features).
 export interface FeatureListItem {
   feature_id: string

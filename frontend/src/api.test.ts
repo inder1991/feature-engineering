@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
-  ApiError, type FeatureIdea, recommendFeatures, recommendFeatureSets, refineCandidate,
-  searchCatalog, uploadFile,
+  ApiError, type FeatureIdea, type LineageGraph, lineageGraph, recommendFeatures,
+  recommendFeatureSets, refineCandidate, searchCatalog, uploadFile,
 } from './api'
 import { setSession } from './session'
 
@@ -99,6 +99,62 @@ describe('api client', () => {
     expect(init.body).toBeInstanceOf(FormData)
     expect(init.body.get('source')).toBe('deposits')
     expect(init.headers['Content-Type']).toBeUndefined()
+  })
+})
+
+describe('lineage client', () => {
+  const GRAPH: LineageGraph = {
+    nodes: [
+      {
+        id: 'deposits:public.accounts', kind: 'table', object_ref: 'public.accounts',
+        table: 'accounts', catalog_source: 'deposits', grain: false, as_of: false,
+        stale: false, resolved: true,
+      },
+    ],
+    edges: [],
+    truncated: false,
+  }
+
+  it('requests the exact contract URL with the documented defaults', async () => {
+    fetchMock.mockImplementation(ok(GRAPH))
+    const result = await lineageGraph('public.accounts.balance', 'deposits')
+    expect(result).toEqual(GRAPH)
+    const [url] = fetchMock.mock.calls[0]
+    // Pinned byte-for-byte: direction=both, depth=1, all three layers, commas unencoded.
+    expect(url).toBe(
+      '/graph/lineage?ref=public.accounts.balance&source=deposits'
+        + '&direction=both&depth=1&layers=joins,entity,features',
+    )
+  })
+
+  it('carries direction, depth, and a layers subset when given', async () => {
+    fetchMock.mockImplementation(ok(GRAPH))
+    await lineageGraph('public.accounts', 'deposits', {
+      direction: 'up', depth: 3, layers: ['joins', 'features'],
+    })
+    const [url] = fetchMock.mock.calls[0]
+    expect(url).toBe(
+      '/graph/lineage?ref=public.accounts&source=deposits'
+        + '&direction=up&depth=3&layers=joins,features',
+    )
+  })
+
+  it('percent-encodes hostile ref and source values', async () => {
+    fetchMock.mockImplementation(ok(GRAPH))
+    await lineageGraph('public.a&b', 'dep osits')
+    const [url] = fetchMock.mock.calls[0]
+    expect(url).toBe(
+      '/graph/lineage?ref=public.a%26b&source=dep%20osits'
+        + '&direction=both&depth=1&layers=joins,entity,features',
+    )
+  })
+
+  it('surfaces the 404 for unknown or read-scope-hidden anchors as ApiError', async () => {
+    fetchMock.mockImplementation(async () =>
+      new Response(JSON.stringify({ detail: "unknown object 'public.x' in source 'deposits'" }),
+        { status: 404 }))
+    await expect(lineageGraph('public.x', 'deposits')).rejects.toMatchObject({
+      status: 404, detail: "unknown object 'public.x' in source 'deposits'" })
   })
 })
 
