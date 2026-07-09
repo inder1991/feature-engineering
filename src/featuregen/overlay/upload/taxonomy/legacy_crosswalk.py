@@ -212,9 +212,14 @@ def _validate_crosswalk() -> None:
         if not target:
             raise ValueError(f"crosswalk tag {tag!r} has an empty target")
         if dimension == "use_case":
-            if target not in USE_CASE_REGISTRY:
+            node = USE_CASE_REGISTRY.get(target)
+            if node is None:
                 raise ValueError(
                     f"crosswalk tag {tag!r} use_case target {target!r} is not a registered use-case")
+            if node.intentionally_empty:                            # defense-in-depth (review finding)
+                raise ValueError(
+                    f"crosswalk tag {tag!r} targets intentionally-empty leaf {target!r}: "
+                    "no legacy tag may route a recipe onto a declared-future objective")
         elif dimension == "metadata":
             continue                                                # free-form ownership/state id
         elif not dimensions.is_known(dimension, target):

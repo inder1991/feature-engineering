@@ -5,7 +5,7 @@ answer, per leaf, *which recipes name it as their primary objective* (and, separ
 It is the human-readable audit behind the Phase-0 exit criteria and is read-only — nothing here touches
 ``templates.py`` or grounding.
 
-Key framing (the corrected Phase-0 gate): the 153 recipes populate only a **subset** of the 85
+Key framing (the corrected Phase-0 gate): the 153 recipes populate only a **subset** of the 88
 selectable leaves. A selectable leaf with no authored recipe is normal — many governed objectives simply
 have no recipe yet — so an *unpopulated non-intentional* leaf is **informational, not a failure**. The
 one hard rule the report enforces is that an :attr:`UseCase.intentionally_empty` leaf (a declared-future

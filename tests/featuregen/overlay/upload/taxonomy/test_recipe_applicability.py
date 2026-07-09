@@ -113,3 +113,38 @@ def test_four_settlement_recipes_map_to_settlement_failure_risk():
                 "settlement_fail_rate", "fail_ageing_buckets"):
         assert (_spec(rid).primary
                 == "securities_services.custody.settlement_failure_risk"), rid
+
+
+# ── adversarial-review fix: family-aware derivation (a foreign generic-tag leaf must NOT be primary) ──
+def test_cross_domain_review_corrections():
+    # Each of these previously landed on a FOREIGN family's leaf (or the wrong same-family leaf).
+    assert _spec("policy_loan_utilisation").primary == "insurance.lapse.surrender"        # was credit.collections.hardship
+    assert _spec("trading_limit_utilisation").primary == "markets.market_risk.portfolio"  # was credit.monitoring.limit_management
+    assert _spec("dscr_covenant_headroom").primary == "credit.early_warning"              # was credit.underwriting.affordability
+    assert _spec("rail_scheme_diversity").primary == "payments.behaviour"                 # was customer.segmentation
+    assert _spec("purpose_code_diversity").primary == "payments.behaviour"                # was customer.segmentation
+
+
+def test_no_unexpected_cross_domain_primary():
+    # Domain-consistency guard: a derived/fallback primary MUST live under the recipe's own family root.
+    # Only the audited _PRIMARY_OVERRIDE / _ORPHAN_PRIMARY tables may home a recipe cross-domain
+    # (the counterparty recipes authored in the markets tuple; the cross-cutting concentration recipes).
+    from featuregen.overlay.upload.taxonomy.recipe_applicability import (
+        _FAMILY_ROOT,
+        _ID_TO_FAMILY,
+        _ORPHAN_PRIMARY,
+        _PRIMARY_OVERRIDE,
+    )
+    from featuregen.overlay.upload.taxonomy.use_cases import ancestors
+
+    violations: list[tuple[str, str | None, str]] = []
+    for t in ALL_TEMPLATES:
+        if t.id in _PRIMARY_OVERRIDE or t.id in _ORPHAN_PRIMARY:
+            continue                                              # intentional, audited cross-domain homes
+        primary = recipe_applicability(t).primary
+        family_root = _FAMILY_ROOT.get(_ID_TO_FAMILY.get(t.id, ""))
+        in_family = family_root is not None and (
+            primary == family_root or family_root in ancestors(primary))
+        if not in_family:
+            violations.append((t.id, family_root, primary))
+    assert not violations, f"cross-domain primaries outside the override/orphan tables: {violations}"

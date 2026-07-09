@@ -1,7 +1,7 @@
 """Phase-0 exit criteria (G1-G3) for the governed taxonomy.
 
 The plan's original "every selectable leaf has >= 1 recipe" is **wrong**: the 153 recipes populate only
-a subset of the 85 selectable leaves, so an unpopulated *non-intentional* leaf is informational, not a
+a subset of the 88 selectable leaves, so an unpopulated *non-intentional* leaf is informational, not a
 failure. The real pass/fail gates asserted here are:
 
 * **G1** — every recipe's derived ``primary`` is a selectable leaf.

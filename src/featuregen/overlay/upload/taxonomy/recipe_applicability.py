@@ -37,7 +37,7 @@ from dataclasses import dataclass
 
 from featuregen.overlay.upload import templates
 from featuregen.overlay.upload.taxonomy.legacy_crosswalk import crosswalk
-from featuregen.overlay.upload.taxonomy.use_cases import selectable_leaves
+from featuregen.overlay.upload.taxonomy.use_cases import ancestors, selectable_leaves
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,6 +86,14 @@ _PRIMARY_OVERRIDE: dict[str, str] = {
     "notional_netting_exposure": "counterparty_risk.exposure_monitoring",
     "margin_call_intensity": "counterparty_risk.margin_call_risk",
     "benchmark_basis_dislocation": "markets.market_risk.basis_risk",
+    # Adversarial-review corrections: a FOREIGN generic-tag leaf (hardship/limit_management -> credit)
+    # was beating the recipe's own family, or the wrong SAME-family leaf won on tag order. Pin each to
+    # its true objective (the family-aware rule below also prevents the foreign-leaf class in general).
+    "policy_loan_utilisation": "insurance.lapse.surrender",         # insurance pre-lapse, NOT credit hardship
+    "trading_limit_utilisation": "markets.market_risk.portfolio",   # markets book limit, NOT credit facility limit
+    "dscr_covenant_headroom": "credit.early_warning",               # covenant-headroom EWI, NOT origination affordability
+    "rail_scheme_diversity": "payments.behaviour",                  # payment-behaviour mix, NOT customer segmentation
+    "purpose_code_diversity": "payments.behaviour",                 # payment-behaviour mix, NOT customer segmentation
 }
 
 # ── Step 3: per-recipe orphan homes (derivation yields no leaf; the family default is the wrong leaf) ─
@@ -118,17 +126,48 @@ _LEAF_MIGRATIONS: dict[str, tuple[str, str, str]] = {
         "assets-under-custody holdings dynamics is a stock objective, not settlement-fail risk"),
 }
 
-# ── Step 4: family fallback — the family's default leaf when a recipe's tags only hit non-leaf parents ─
+# ── Step 4: family fallback — the family's default leaf when a recipe has no IN-FAMILY derivable leaf ─
+# Every family maps to a real selectable leaf, so a recipe whose own-domain tags only hit parents (or
+# whose only derivable leaf is FOREIGN) lands on a domain-appropriate default instead of leaking to
+# another family's leaf. All targets are verified selectable leaves by the Task-4 test.
 _FAMILY_FALLBACK_LEAF: dict[str, str] = {
-    # Spec-mandated (Task-4 family fallback):
+    "RETAIL_CHURN_TEMPLATES": "customer.relationship_attrition.churn",
+    "CREDIT_RISK_TEMPLATES": "credit.early_warning",              # IFRS9 SICR/ECL/delinquency deterioration
     "FRAUD_TEMPLATES": "fraud.transaction_fraud_detection",
     "AML_TEMPLATES": "aml_cft.suspicious_transaction_monitoring",
-    # Gap-closing defaults (recipes whose tags resolve only to non-leaf parents):
-    "CREDIT_RISK_TEMPLATES": "credit.early_warning",              # IFRS9 SICR/ECL/delinquency deterioration
+    "COLLECTIONS_TEMPLATES": "credit.collections.recoveries",
+    "DEPOSITS_TEMPLATES": "treasury_alm.deposit_stability",
     "PAYMENTS_TEMPLATES": "payments.operations",                  # chargeback / dispute processing quality
     "MARKETS_TEMPLATES": "markets.market_risk.portfolio",         # VaR/ES & book-level greek sensitivities
     "CUSTODY_TEMPLATES": "securities_services.custody.settlement_failure_risk",  # custody-book fail anchor
     "ASSET_MGMT_TEMPLATES": "asset_management.redemption.fund_flows",  # share-class flow mix / TER-driven flows
+    "INSURANCE_TEMPLATES": "insurance.lapse.surrender",
+    "ISLAMIC_TEMPLATES": "islamic.sharia_compliance",
+    "ESG_TEMPLATES": "esg.scoring",
+    "CROSS_SELL_TEMPLATES": "customer.cross_sell.next_best_action",
+    "CORPORATE_TRADE_TEMPLATES": "corporate_trade.trade_finance",
+}
+
+# Each family's top-level use-case root (the subtree a recipe's primary should live in). A derived or
+# fallback primary MUST sit under its family root; only the audited _PRIMARY_OVERRIDE / _ORPHAN_PRIMARY
+# tables may home a recipe cross-domain (e.g. a counterparty recipe authored in the markets tuple, or a
+# cross-cutting concentration recipe -> portfolio_risk). Enforced by the domain-consistency test.
+_FAMILY_ROOT: dict[str, str] = {
+    "RETAIL_CHURN_TEMPLATES": "customer",
+    "CREDIT_RISK_TEMPLATES": "credit",
+    "FRAUD_TEMPLATES": "fraud",
+    "AML_TEMPLATES": "aml_cft",
+    "COLLECTIONS_TEMPLATES": "credit",
+    "DEPOSITS_TEMPLATES": "treasury_alm",
+    "PAYMENTS_TEMPLATES": "payments",
+    "MARKETS_TEMPLATES": "markets",
+    "CUSTODY_TEMPLATES": "securities_services",
+    "ASSET_MGMT_TEMPLATES": "asset_management",
+    "INSURANCE_TEMPLATES": "insurance",
+    "ISLAMIC_TEMPLATES": "islamic",
+    "ESG_TEMPLATES": "esg",
+    "CROSS_SELL_TEMPLATES": "customer",
+    "CORPORATE_TRADE_TEMPLATES": "corporate_trade",
 }
 
 # Ordered (name, tuple) family membership — used to resolve a recipe id to its family fallback leaf.
@@ -220,21 +259,34 @@ def recipe_applicability(template: templates.Template) -> ApplicabilitySpec:
             dim_values[dimension].append(target)
         # modelling_context / measure / metadata -> ignored (not applicability fields)
 
-    # ── primary: override > derivation > orphan home > family fallback ──
+    # ── primary: override > IN-FAMILY derived leaf > orphan home > family fallback ──
+    # Family-aware (adversarial-review fix): a foreign-family generic-tag leaf (e.g. a markets recipe's
+    # `limit_management` tag hitting the CREDIT limit leaf) must NEVER become the primary — the recipe's
+    # objective belongs to its own domain. So derivation only accepts a leaf inside the family's subtree;
+    # a recipe with no in-family leaf falls to its orphan home / family fallback, not a foreign leaf.
+    family = _ID_TO_FAMILY.get(template.id)
+    family_root = _FAMILY_ROOT.get(family) if family is not None else None
+
+    def _in_family(leaf: str) -> bool:
+        return family_root is not None and (leaf == family_root or family_root in ancestors(leaf))
+
+    in_family_leaves = [leaf for leaf in leaf_targets if _in_family(leaf)]
     if template.id in _PRIMARY_OVERRIDE:
         primary = _PRIMARY_OVERRIDE[template.id]
-    elif leaf_targets:
-        primary = leaf_targets[0]
+    elif in_family_leaves:
+        primary = in_family_leaves[0]
     elif template.id in _ORPHAN_PRIMARY:
         primary = _ORPHAN_PRIMARY[template.id]
     else:
-        family = _ID_TO_FAMILY.get(template.id)
         fallback = _FAMILY_FALLBACK_LEAF.get(family) if family is not None else None
-        if fallback is None:
+        if fallback is not None:
+            primary = fallback
+        elif leaf_targets:                       # last resort only (every family has a fallback today)
+            primary = leaf_targets[0]
+        else:
             raise ValueError(
                 f"recipe {template.id!r} (family {family!r}) has no selectable-leaf primary: "
-                "no override, no derivable leaf, no orphan home, and no family fallback")
-        primary = fallback
+                "no override, no in-family leaf, no orphan home, and no family fallback")
 
     # secondary: the other distinct selectable-leaf objectives (excluding primary), in tag order,
     # then any explicitly-added secondaries — deduped, and never containing the primary.
