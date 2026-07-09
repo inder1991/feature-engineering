@@ -35,6 +35,9 @@ class Concept:
     entity_link: str | None = None  # identifiers only: the entity it links (e.g. "customer","account")
     is_a: str | None = None         # parent concept name (is-a edge), else None
     leakage_anchor: bool = False    # True for outcome_label + the target-defining flags (§3.10/§3.7)
+    near_label: bool = False        # True for funnel-tail signals that BORDER the label (forbearance,
+    #                                 stage-3 impairment, 90+ DPD, CASS switch, filed SAR) — the 3-part
+    #                                 leakage control must FLAG these (softer than leakage_anchor).
     description: str = ""
 
 
@@ -57,8 +60,10 @@ _ALL: tuple[Concept, ...] = (
                         "average naively across notionals."),
     Concept("price", "monetary", additivity="non_additive",
             description="Instrument price, strike, NAV. Non-additive."),
-    Concept("notional", "monetary", additivity="additive",
-            description="Derivative notional. Additive gross; may be netted within a netting set."),
+    Concept("notional", "monetary", additivity="semi_additive", is_a="monetary_stock",
+            description="Derivative notional — a position attribute. Semi-additive: additive GROSS "
+                        "across positions (netted within a netting set), latest over time — never sum a "
+                        "notional across snapshots."),
 
     # ── §3.2 Identifiers → entity links (join key + grain + entity) ───────────────────────────────
     Concept("customer_id", "identifier", entity_link="customer", description="Links to the customer entity."),
@@ -99,8 +104,10 @@ _ALL: tuple[Concept, ...] = (
     # ── §3.4 Quantities & risk metrics ────────────────────────────────────────────────────────────
     Concept("count", "quantity_risk", additivity="additive",
             description="num_transactions, logins, etc. Fully additive."),
-    Concept("quantity_units", "quantity_risk", additivity="additive",
-            description="Shares, contracts, units. Additive within one instrument/unit."),
+    Concept("quantity_units", "quantity_risk", additivity="semi_additive",
+            description="Shares, contracts, units — a position quantity. Semi-additive (latest over "
+                        "time); NEVER sum across different instruments/units (a unit-mixing error, "
+                        "like mixing currencies — needs a unit guard)."),
     Concept("score_probability", "quantity_risk", additivity="non_additive",
             description="credit_score, PD, risk_score. Non-additive. LEAKAGE-RISK when it is a model "
                         "output whose target overlaps the feature target — flag before use."),
@@ -108,10 +115,12 @@ _ALL: tuple[Concept, ...] = (
             description="Percentile / rank. Non-additive."),
     Concept("lgd", "quantity_risk", additivity="non_additive",
             description="Loss given default (a ratio). Non-additive; aggregate exposure-weighted."),
-    Concept("ead", "quantity_risk", additivity="additive",
-            description="Exposure at default — a monetary amount. Additive across exposures."),
-    Concept("ecl", "quantity_risk", additivity="additive",
-            description="Expected credit loss (IFRS9) — a monetary amount. Additive across exposures."),
+    Concept("ead", "quantity_risk", additivity="semi_additive", is_a="monetary_stock",
+            description="Exposure at default — a monetary STOCK. Semi-additive: sum across exposures, "
+                        "but take the latest over time — never sum across reporting dates."),
+    Concept("ecl", "quantity_risk", additivity="semi_additive", is_a="monetary_stock",
+            description="Expected credit loss (IFRS9) — a provision STOCK. Semi-additive: sum across "
+                        "exposures, latest over time — never sum across reporting dates."),
     Concept("var", "quantity_risk", additivity="non_additive",
             description="Value-at-risk. Non-additive (sub-additive with diversification) — never sum across books."),
     Concept("sensitivity_greek", "quantity_risk", additivity="non_additive",
@@ -132,8 +141,23 @@ _ALL: tuple[Concept, ...] = (
     Concept("product_type", "categorical", description="Product classification."),
     Concept("account_type", "categorical", description="Account classification (current/savings/loan/…)."),
     Concept("transaction_type", "categorical", description="Transaction classification."),
+    Concept("direct_debit", "categorical",
+            description="Direct-debit mandate + its lifecycle events (setup / amend / cancel). Distinct "
+                        "from a one-off transaction — cancellation is a Stage-4 churn signal "
+                        "(§B1 / PART F dd_cancellation_rate)."),
+    Concept("standing_order", "categorical",
+            description="Standing-order mandate + events (setup / redirect / cancel). Redirection to an "
+                        "external bank is a primacy-loss signal (§A9)."),
+    Concept("debit_credit_indicator", "categorical",
+            description="Flow DIRECTION on a transaction (debit vs credit / dr-cr / sign). Required by "
+                        "every cash-flow feature (inflow_outflow_ratio §A4) — distinct from boolean_flag."),
+    Concept("beneficiary_bank", "categorical",
+            description="The payee's destination bank / sort-code / scheme, with an internal-vs-EXTERNAL "
+                        "flag. Powers the own-money-to-a-competitor primacy signal (§A9)."),
     Concept("channel", "categorical", description="Origination/servicing channel (mobile/web/branch/call-center)."),
-    Concept("country_code", "categorical", description="ISO country code."),
+    Concept("country_code", "categorical", sensitivity="proxy",
+            description="ISO country code. When it encodes nationality/residence it is a national-"
+                        "origin PROXY (ECOA/fair-lending) — proxy-flagged; use-case-gate for credit."),
     Concept("industry_code", "categorical", description="Industry classification (NAICS/SIC)."),
     Concept("mcc", "categorical", description="Merchant category code."),
     Concept("instrument_type", "categorical", description="Instrument classification."),
@@ -154,10 +178,15 @@ _ALL: tuple[Concept, ...] = (
             description="Default indicator. LEAKAGE ANCHOR — is the target for PD/default models."),
     Concept("fraud_flag", "flag", leakage_anchor=True,
             description="Fraud indicator. LEAKAGE ANCHOR — is the target for fraud models."),
-    Concept("restructured_flag", "flag",
-            description="Restructure / forbearance indicator (not itself the target here)."),
-    Concept("sanctions_hit_flag", "flag", description="Sanctions-screening hit indicator."),
-    Concept("pep_flag", "flag", description="Politically-exposed-person indicator."),
+    Concept("restructured_flag", "flag", near_label=True,
+            description="Restructure / forbearance indicator. NEAR-LABEL: forbearance ≈ the default "
+                        "label (§B2 Stage-4) — the 3-part leakage control must flag it."),
+    Concept("sanctions_hit_flag", "flag", sensitivity="pii", near_label=True,
+            description="Sanctions-screening hit — sensitive (read-scoped, AML-lawful-basis; not fair-"
+                        "lending-blocked). NEAR-LABEL: a filed hit ≈ the sanctions-model target."),
+    Concept("pep_flag", "flag", sensitivity="pii",
+            description="Politically-exposed-person indicator — GDPR-sensitive (political); read-scoped "
+                        "and AML-lawful-basis. Tagged pii (usable for AML), NOT special_category-blocked."),
 
     # ── §3.8 Sensitive / regulatory ───────────────────────────────────────────────────────────────
     Concept("pii", "sensitive", sensitivity="pii",
@@ -169,13 +198,19 @@ _ALL: tuple[Concept, ...] = (
             description="Health, biometric (GDPR special category). Read-scoped + eligibility-gated."),
     Concept("kyc_document", "sensitive", sensitivity="pii",
             description="KYC identity document — carries PII; read-scoped."),
+    Concept("beneficiary_name", "sensitive", sensitivity="pii", entity_link="beneficiary",
+            description="Payee name on a transfer — PII, read-scoped. Name-matched against the customer "
+                        "name to DERIVE the own-account flag downstream (§A9 external_own_transfer_trend; "
+                        "§D.8 derived intermediate — probabilistic PII entity-resolution)."),
 
     # ── §3.9 Text & documents ─────────────────────────────────────────────────────────────────────
-    Concept("free_text", "text",
-            description="Memo, notes, complaint text. May incidentally carry PII — screen on egress."),
+    Concept("free_text", "text", sensitivity="pii",
+            description="Memo, notes, complaint text. Tagged pii: may carry PII — read-scoped + screen "
+                        "on egress (a deterministic gate, not just a prose warning)."),
     Concept("document_reference", "text", description="Reference/pointer to a stored document."),
-    Concept("unstructured_doc", "text",
-            description="Loan/KYC document body. May carry PII/special-category content — screen on egress."),
+    Concept("unstructured_doc", "text", sensitivity="pii",
+            description="Loan/KYC document body. Tagged pii: may carry PII/special-category content — "
+                        "read-scoped + screen on egress."),
 
     # ── §3.10 Labels / outcomes (the leakage anchor) ──────────────────────────────────────────────
     Concept("outcome_label", "label", leakage_anchor=True,
@@ -188,9 +223,12 @@ _ALL: tuple[Concept, ...] = (
     Concept("session", "behavioural", description="Session grouping of digital activity."),
     Concept("clickstream", "behavioural", description="Sequence of page/app interactions."),
     Concept("channel_usage", "behavioural", description="Usage intensity by channel."),
-    Concept("device_fingerprint", "behavioural", description="Device identifier/fingerprint (fraud signal)."),
-    Concept("geolocation", "behavioural",
-            description="Digital geolocation (distinct from geographic §3.6). Can be sensitive — flag."),
+    Concept("device_fingerprint", "behavioural", sensitivity="pii",
+            description="Device identifier/fingerprint (fraud signal) — an online identifier = GDPR "
+                        "personal data; read-scoped (a deterministic gate, not just a fraud note)."),
+    Concept("geolocation", "behavioural", sensitivity="pii",
+            description="Digital geolocation (distinct from geographic §3.6) — precise location is "
+                        "personal data; read-scoped. (Also a protected-class proxy for credit/pricing.)"),
     Concept("login_event", "behavioural", description="Login/authentication event."),
     Concept("page_app_event", "behavioural", description="Page-view / app-event."),
 
@@ -234,8 +272,9 @@ _ALL: tuple[Concept, ...] = (
     # ── §3.16 Regulatory capital & accounting (the spine) ─────────────────────────────────────────
     Concept("risk_weight", "regulatory_capital", additivity="non_additive",
             description="Basel risk weight (%). Non-additive."),
-    Concept("rwa", "regulatory_capital", additivity="additive",
-            description="Risk-weighted assets — a monetary amount. Additive across exposures."),
+    Concept("rwa", "regulatory_capital", additivity="semi_additive", is_a="monetary_stock",
+            description="Risk-weighted assets — a monetary STOCK. Semi-additive: sum across exposures, "
+                        "latest over time — never sum monthly RWA snapshots."),
     Concept("capital_ratio", "regulatory_capital", additivity="non_additive",
             description="Capital ratio (CET1/Tier-1/total). Is-a ratio — non-additive."),
     Concept("ccf", "regulatory_capital", additivity="non_additive",
@@ -250,12 +289,15 @@ _ALL: tuple[Concept, ...] = (
             description="Fair-value carrying amount (a valuation stock). Semi-additive (latest over time)."),
     Concept("amortised_cost", "accounting", additivity="semi_additive",
             description="Amortised-cost carrying amount (a balance). Semi-additive (latest over time)."),
-    Concept("impairment_stage", "accounting",
-            description="IFRS9 stage 1/2/3 (ordinal). Not aggregatable — condition on it."),
+    Concept("impairment_stage", "accounting", near_label=True,
+            description="IFRS9 stage 1/2/3 (ordinal). Not aggregatable — condition on it. NEAR-LABEL: "
+                        "stage 3 (credit-impaired) ≈ the default label — the 3-part leakage control "
+                        "must flag it."),
     Concept("accrual", "accounting", additivity="additive",
             description="Accrued interest/amount over a period (flow-like). Additive over the period."),
-    Concept("provision_amount", "accounting", additivity="additive",
-            description="Loan-loss provision — a monetary amount. Additive across exposures."),
+    Concept("provision_amount", "accounting", additivity="semi_additive", is_a="monetary_stock",
+            description="Loan-loss provision — a provision STOCK. Semi-additive: sum across exposures, "
+                        "latest over time — never sum across reporting dates."),
     Concept("benchmark_rate", "monetary", additivity="non_additive", is_a="monetary_rate",
             description="Reference rate (SOFR/SONIA/€STR). Non-additive."),
     Concept("tenor", "temporal", additivity="non_additive",

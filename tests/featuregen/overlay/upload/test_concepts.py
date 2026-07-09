@@ -51,7 +51,8 @@ def test_monetary_additivity_behaviour():
     assert concept("monetary_flow").additivity == "additive"
     assert concept("monetary_rate").additivity == "non_additive"
     assert concept("price").additivity == "non_additive"
-    assert concept("notional").additivity == "additive"
+    # notional is a position attribute -> semi_additive (never summed across snapshots) — gap-review A1.
+    assert concept("notional").additivity == "semi_additive"
     # contingent_exposure is-a monetary_stock, semi-additive.
     ce = concept("contingent_exposure")
     assert ce.additivity == "semi_additive"
@@ -106,10 +107,11 @@ def test_currency_code_is_the_unit():
 
 
 def test_regulatory_capital_and_esg_additivity():
-    assert concept("rwa").additivity == "additive"
-    assert concept("ead").additivity == "additive"
-    assert concept("ecl").additivity == "additive"
-    assert concept("provision_amount").additivity == "additive"
+    # gap-review A1 correctness fix: these are STOCKS (balances/snapshots), so semi_additive — summing a
+    # stock across reporting dates is a wrong number (was wrongly tagged additive). is_a monetary_stock.
+    for stock in ("rwa", "ead", "ecl", "provision_amount"):
+        assert concept(stock).additivity == "semi_additive", stock
+        assert concept(stock).is_a == "monetary_stock", stock
     assert concept("pd_ttc").additivity == "non_additive"
     assert concept("pd_pit").additivity == "non_additive"
     assert concept("risk_weight").additivity == "non_additive"
@@ -143,3 +145,18 @@ def test_classification_vocabulary_offers_rich_concepts_excludes_legacy():
     assert "unclassified" not in names
     ms = next(v for v in vocab if v["name"] == "monetary_stock")
     assert ms["group"] == "monetary" and ms["hint"]                       # name + group + short hint
+
+
+def test_gap_review_phase1_fixes():
+    # A2 — personal/proxy data no longer 'public', so the eligibility/read-scope gate can fire.
+    for pii_c in ("geolocation", "device_fingerprint", "free_text", "unstructured_doc", "pep_flag",
+                  "sanctions_hit_flag", "beneficiary_name"):
+        assert concept(pii_c).sensitivity == "pii", pii_c
+    assert concept("country_code").sensitivity == "proxy"                 # national-origin proxy
+    # A3 — near-label: funnel-tail signals that border the target (must be flagged, not hard-blocked).
+    for nl in ("restructured_flag", "impairment_stage", "sanctions_hit_flag"):
+        assert concept(nl).near_label is True, nl
+    # B — pilot-unblocking concepts now exist (churn Stage-4 unbundling + primacy + cash-flow direction).
+    for c in ("direct_debit", "standing_order", "beneficiary_name", "beneficiary_bank",
+              "debit_credit_indicator"):
+        assert concept(c) is not None, c

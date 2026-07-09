@@ -35,10 +35,11 @@ _CATALOG = [
     (CanonicalRow(SOURCE, "transactions", "amount", "numeric", additivity="additive", currency="USD"),
      "monetary_flow"),
     (CanonicalRow(SOURCE, "transactions", "txn_ts", "timestamp"), "event_timestamp"),
-    (CanonicalRow(SOURCE, "transactions", "beneficiary_name", "text", sensitivity="pii"), "pii"),
-    (CanonicalRow(SOURCE, "transactions", "beneficiary_bank", "text"), "counterparty_id"),
+    (CanonicalRow(SOURCE, "transactions", "beneficiary_name", "text", sensitivity="pii"),
+     "beneficiary_name"),
+    (CanonicalRow(SOURCE, "transactions", "beneficiary_bank", "text"), "beneficiary_bank"),
 ]
-# Deliberately ABSENT: transaction_type (dr/cr + DD), category_code (salary tag), product_type
+# Deliberately ABSENT: direct_debit + debit_credit_indicator, category_code (salary tag), product_type
 # (holdings) — so their templates degrade / skip.
 
 
@@ -205,7 +206,7 @@ def test_ground_all_skips_ungroundable(db):
     assert grounded == {
         "balance_trend", "dormancy_days", "txn_frequency_trend", "inflow_outflow_ratio",
         "days_below_threshold", "salary_signal", "tenure_days", "balance_volatility", "rfm_composite"}
-    # skipped: product_breadth (no product_type), dd_cancellation_rate (no transaction_type),
+    # skipped: product_breadth (no product_type), dd_cancellation_rate (no direct_debit),
     # external_own_transfer_trend (pii names hidden without the role).
     assert "product_breadth" not in grounded
     assert "dd_cancellation_rate" not in grounded

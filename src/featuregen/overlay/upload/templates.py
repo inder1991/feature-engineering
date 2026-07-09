@@ -309,14 +309,13 @@ def ground_all(conn, templates: Iterable[Template], *, catalog_source: str,
 # The 12 retail_churn templates — authored from Part F (§F.1–§F.12) of the SME library.
 #
 # Concept substitutions (the taxonomy §3 registry has no dedicated concept for a few Part-F roles — the
-# closest registry concept is used and NOTED on the template, per the B2 brief):
+# closest registry concept is used and NOTED on the template). NOTE: the Phase-1 gap fix added dedicated
+# concepts for direct_debit, debit_credit_indicator, beneficiary_bank and beneficiary_name, so those
+# roles now ground on their OWN concepts; the remaining substitutions are:
 #   • entity {customer}         -> customer_id      (Part F table says "customer_identifier"; §3 canonical)
 #   • salary tag                -> category_code    (Part F: transactions.type; optional -> degrade)
-#   • dr/cr direction           -> transaction_type (optional -> degrade to amount-sign, §D.8)
-#   • direct-debit mandate event-> transaction_type (no "direct_debit" concept; skip if absent)
 #   • product_holding           -> product_type     (no "product_holding" concept)
-#   • beneficiary_bank          -> counterparty_id  (the receiving bank as a counterparty)
-#   • customer_name / beneficiary_name -> pii        (a name is PII; read-scoped + consent-gated)
+#   • customer_name             -> pii              (a name is PII; read-scoped + consent-gated)
 # ──────────────────────────────────────────────────────────────────────────────────────────────────
 _SUB_ENTITY = "concept sub: entity uses 'customer_id' (Part F: customer_identifier)"
 _PIT_TRAILING = ("trailing window (as_of − {window}, as_of], values knowable strictly ≤ as_of; "
@@ -374,18 +373,18 @@ RETAIL_CHURN_TEMPLATES: tuple[Template, ...] = (
     Template(
         id="inflow_outflow_ratio", family="cashflow_ratio",
         intent="Debits vs credits in a window — is the account net-draining? measure=net -> credits−debits.",
-        needs=(Need("flow_col", "monetary_flow"), Need("direction", "transaction_type", optional=True),
+        needs=(Need("flow_col", "monetary_flow"),
+               Need("direction", "debit_credit_indicator", optional=True),
                Need("event_ts", "event_timestamp"), Need("entity", "customer_id")),
         params={"window": (90, 30, 60, 180), "measure": ("ratio", "net")},
         aggregation="inflow_outflow", additivity="non_additive", explain="H",
         use_cases=("retail_churn", "sme_credit", "cashflow"),
         pit=_PIT_TRAILING,
-        degrade="no dr/cr flag -> infer direction from the amount sign (declared derivation, §D.8).",
+        degrade="no dr/cr indicator -> infer direction from the amount sign (declared derivation, §D.8).",
         stage="3-financial-migration",
         eligibility="single currency — convert to base first.",
         derived=("is_debit := amount_sign(amount) < 0 — declared downstream when no dr/cr column exists.",),
         notes=(_SUB_ENTITY,
-               "concept sub: direction uses 'transaction_type' (a dr/cr code); optional -> degrade.",
                "OUTPUT additivity is measure-dependent: measure=net is additive, measure=ratio is "
                "non-additive (default carries the ratio case)."),
     ),
@@ -488,7 +487,7 @@ RETAIL_CHURN_TEMPLATES: tuple[Template, ...] = (
         id="dd_cancellation_rate", family="unbundling",
         intent="count(DD mandates cancelled in window) / count(DDs active at window start) — utilities / "
                "mortgage direct debits leaving is sticky 'furniture' departing.",
-        needs=(Need("dd_event", "transaction_type"), Need("event_ts", "event_timestamp"),
+        needs=(Need("dd_event", "direct_debit"), Need("event_ts", "event_timestamp"),
                Need("entity", "customer_id")),
         params={"window": (90, 180, 365)},
         aggregation="dd_cancellation_rate", additivity="non_additive", explain="H",
@@ -496,17 +495,15 @@ RETAIL_CHURN_TEMPLATES: tuple[Template, ...] = (
         pit=_PIT_TRAILING,
         degrade="SKIP if no direct-debit / mandate data.",
         stage="4-unbundling",
-        notes=(_SUB_ENTITY,
-               "concept sub: DD mandate events use 'transaction_type' (no direct_debit concept in §3) — "
-               "skip if absent."),
+        notes=(_SUB_ENTITY,),
     ),
     # F.12 — external_own_transfer_trend (Stage 3, primacy loss; §A9 derived intermediate + PII)
     Template(
         id="external_own_transfer_trend", family="primacy_outflow",
         intent="Rising transfers of the customer's OWN money to their accounts at OTHER banks — a "
                "top-tier pre-attrition (primacy-loss) signal.",
-        needs=(Need("customer_name", "pii"), Need("beneficiary_name", "pii"),
-               Need("beneficiary_bank", "counterparty_id"), Need("flow_col", "monetary_flow"),
+        needs=(Need("customer_name", "pii"), Need("beneficiary_name", "beneficiary_name"),
+               Need("beneficiary_bank", "beneficiary_bank"), Need("flow_col", "monetary_flow"),
                Need("event_ts", "event_timestamp"), Need("entity", "customer_id")),
         params={"window": (90, 180), "baseline": ("prior_equal_window",),
                 "measure": ("amount", "count"), "match_method": ("token", "exact", "fuzzy"),
@@ -524,7 +521,8 @@ RETAIL_CHURN_TEMPLATES: tuple[Template, ...] = (
                  "{match_threshold} AND beneficiary_bank ≠ home_bank — computed DOWNSTREAM (no data "
                  "plane here); declare method + threshold (§A9/§D.8).",),
         notes=(_SUB_ENTITY,
-               "concept sub: names use 'pii'; beneficiary_bank uses 'counterparty_id'."),
+               "customer_name uses the generic 'pii' concept (no dedicated customer-name concept); "
+               "beneficiary_name / beneficiary_bank now ground on their own concepts."),
     ),
 )
 
