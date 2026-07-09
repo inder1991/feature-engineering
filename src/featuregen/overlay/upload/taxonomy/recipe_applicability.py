@@ -17,7 +17,8 @@ Resolution order for the ``primary`` (first hit wins):
    ``financial_crime``, ``credit.collections`` …) is a domain, not an objective — skipped.
 3. **Orphan home** (:data:`_ORPHAN_PRIMARY`) — a per-recipe default for the handful of recipes whose
    family default would be the *wrong* leaf (a counterparty recipe in the markets family; the two
-   insurance actuarial recipes that have no clean insurance-underwriting leaf).
+   insurance actuarial/underwriting recipes and the custody holdings recipe, each now pinned to its
+   precise governed leaf — see :data:`_LEAF_MIGRATIONS` for the old→new closest-fit corrections).
 4. **Family fallback** (:data:`_FAMILY_FALLBACK_LEAF`) — the family's default leaf, keyed by which
    ``templates.*_TEMPLATES`` tuple the recipe belongs to, for recipes whose tags only ever hit non-leaf
    parents (the IFRS9 deterioration recipes, ``chargeback_dispute_rate``, VaR/greek book-risk, …).
@@ -91,11 +92,30 @@ _PRIMARY_OVERRIDE: dict[str, str] = {
 _ORPHAN_PRIMARY: dict[str, str] = {
     # EPE/PFE counterparty exposure sitting in the markets family — sibling of notional_netting_exposure.
     "counterparty_exposure_trend": "counterparty_risk.exposure_monitoring",
-    # Actuarial insurance recipes with no clean insurance-underwriting leaf — assigned the closest
-    # selectable insurance leaf (the only claims leaf / the mortality-risk home). Imperfect by design;
-    # a genuine insurance.claims / underwriting leaf can be promoted in a later taxonomy revision.
-    "claims_frequency_severity": "insurance.claims.claims_fraud",
-    "mortality_morbidity_loading": "insurance.reinsurance",
+    # Three recipes now on their PRECISE governed home (taxonomy patch — see _LEAF_MIGRATIONS). Each is a
+    # distinct objective the tree previously lacked a leaf for; the old closest-fit is an audit record
+    # only (never a secondary), per the owner's ruling.
+    "claims_frequency_severity": "insurance.actuarial.claims_cost_modelling",
+    "mortality_morbidity_loading": "insurance.underwriting.mortality_morbidity_risk_assessment",
+    "custody_holding_dynamics": "securities_services.custody.holdings_dynamics",
+}
+
+# ── Leaf-migration audit record (owner-approved MINOR corrections) ───────────────────────────────────
+# Three recipes previously sat on a *documented closest-fit* leaf because the tree lacked a precise home;
+# the taxonomy owner promoted three precise leaves (+ renamed the custody settlement leaf) and remapped
+# each recipe onto its true objective. This dict keeps the old→new correction ONLY as a legacy audit
+# record — the old id is NEVER carried as a secondary applicability (owner's ruling).
+_LEAF_MIGRATIONS: dict[str, tuple[str, str, str]] = {
+    # recipe id: (old closest-fit leaf, new precise leaf, reason)
+    "claims_frequency_severity": (
+        "insurance.claims.claims_fraud", "insurance.actuarial.claims_cost_modelling",
+        "expected claims cost (frequency × severity) is an actuarial objective, not fraud detection"),
+    "mortality_morbidity_loading": (
+        "insurance.reinsurance", "insurance.underwriting.mortality_morbidity_risk_assessment",
+        "applicant mortality/morbidity risk assessment is underwriting, not ceded-risk reinsurance"),
+    "custody_holding_dynamics": (
+        "securities_services.custody.settlement", "securities_services.custody.holdings_dynamics",
+        "assets-under-custody holdings dynamics is a stock objective, not settlement-fail risk"),
 }
 
 # ── Step 4: family fallback — the family's default leaf when a recipe's tags only hit non-leaf parents ─
@@ -107,7 +127,7 @@ _FAMILY_FALLBACK_LEAF: dict[str, str] = {
     "CREDIT_RISK_TEMPLATES": "credit.early_warning",              # IFRS9 SICR/ECL/delinquency deterioration
     "PAYMENTS_TEMPLATES": "payments.operations",                  # chargeback / dispute processing quality
     "MARKETS_TEMPLATES": "markets.market_risk.portfolio",         # VaR/ES & book-level greek sensitivities
-    "CUSTODY_TEMPLATES": "securities_services.custody.settlement",# custody-book anchor (holdings dynamics)
+    "CUSTODY_TEMPLATES": "securities_services.custody.settlement_failure_risk",  # custody-book fail anchor
     "ASSET_MGMT_TEMPLATES": "asset_management.redemption.fund_flows",  # share-class flow mix / TER-driven flows
 }
 
@@ -142,6 +162,9 @@ _SECONDARY_ADD: dict[str, tuple[str, ...]] = {
 }
 _PRODUCT_CONTEXT_ADD: dict[str, tuple[str, ...]] = {
     "crypto_offramp_exposure": ("crypto_assets",),
+    # Insurance product-line context for the two remapped actuarial/underwriting recipes.
+    "claims_frequency_severity": ("insurance",),
+    "mortality_morbidity_loading": ("life_insurance", "health_insurance"),
 }
 _TYPOLOGY_ADD: dict[str, tuple[str, ...]] = {
     "crypto_offramp_exposure": ("crypto_asset_laundering",),

@@ -59,3 +59,9 @@ def test_authorised_push_payment_is_merged():
 
 def test_crosswalk_lookup_returns_none_for_unknown_tag():
     assert crosswalk("not_a_real_tag") is None
+
+
+def test_settlement_risk_tag_points_at_renamed_failure_risk_leaf():
+    entry = crosswalk("settlement_risk")
+    assert entry is not None and entry["dimension"] == "use_case"
+    assert entry["target"] == "securities_services.custody.settlement_failure_risk"

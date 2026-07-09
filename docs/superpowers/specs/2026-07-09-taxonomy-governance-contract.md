@@ -49,9 +49,9 @@ A leaf may be declared (`intentionally_empty: True`) ahead of any recipe — gov
 
 ## 7. Known open items (carried from Phase-0 execution)
 
-Three recipes currently sit on closest-fit leaves because the tree lacks a precise home — candidates for a MINOR taxonomy addition, pending owner sign-off:
-- `claims_frequency_severity` → an `insurance.claims.frequency_severity` (actuarial claims-cost) leaf.
-- `mortality_morbidity_loading` → an `insurance.underwriting` (or `insurance.mortality_morbidity`) leaf.
-- `custody_holding_dynamics` → a `securities_services.custody.holdings` leaf.
+**RESOLVED** (MINOR taxonomy addition, owner sign-off applied — leaves added, recipes remapped). Three recipes previously sat on closest-fit leaves because the tree lacked a precise home; the owner promoted three precise leaves (and renamed the custody settlement leaf), and each recipe now maps to its true objective:
+- `claims_frequency_severity` → **resolved**: new selectable leaf `insurance.actuarial.claims_cost_modelling` (was closest-fit `insurance.claims.claims_fraud`).
+- `mortality_morbidity_loading` → **resolved**: new selectable leaf `insurance.underwriting.mortality_morbidity_risk_assessment` (was closest-fit `insurance.reinsurance`).
+- `custody_holding_dynamics` → **resolved**: new selectable leaf `securities_services.custody.holdings_dynamics` (was closest-fit `securities_services.custody.settlement`, since renamed to `securities_services.custody.settlement_failure_risk`).
 
-Until promoted, their applicability primary is documented in `recipe_applicability.py` as interim.
+The old closest-fit mappings are retained only as a legacy audit record (`_LEAF_MIGRATIONS` in `recipe_applicability.py`), never as secondary applicability.

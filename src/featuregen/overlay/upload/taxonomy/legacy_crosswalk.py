@@ -122,7 +122,7 @@ LEGACY_TAG_CROSSWALK: dict[str, CrosswalkEntry] = {
     # ── securities_services ───────────────────────────────────────────────────────────────────────
     "securities_services": _uc("securities_services"),              # broad family → parent
     "custody": _uc("securities_services.custody"),
-    "settlement_risk": _uc("securities_services.custody.settlement"),
+    "settlement_risk": _uc("securities_services.custody.settlement_failure_risk"),
     "corporate_actions": _uc("securities_services.custody.corporate_actions"),
     "securities_lending": _uc("securities_services.securities_lending"),
     "fund_administration": _uc("securities_services.fund_administration"),

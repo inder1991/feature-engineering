@@ -80,3 +80,36 @@ def test_primary_is_never_in_secondary():
     for t in ALL_TEMPLATES:
         spec = recipe_applicability(t)
         assert spec.primary not in spec.secondary, t.id
+
+
+# ── taxonomy patch: three recipes remapped onto precise leaves; the old closest-fit is gone ─────────
+def test_three_recipes_remapped_to_precise_primaries():
+    assert _spec("claims_frequency_severity").primary == "insurance.actuarial.claims_cost_modelling"
+    assert (_spec("mortality_morbidity_loading").primary
+            == "insurance.underwriting.mortality_morbidity_risk_assessment")
+    assert _spec("custody_holding_dynamics").primary == "securities_services.custody.holdings_dynamics"
+
+
+def test_remapped_recipes_carry_insurance_product_context():
+    assert _spec("claims_frequency_severity").product_context == ("insurance",)
+    mm = _spec("mortality_morbidity_loading").product_context
+    assert "life_insurance" in mm and "health_insurance" in mm
+
+
+def test_old_closest_fit_is_gone_not_a_secondary():
+    # The owner's ruling: the old closest-fit is an audit record only — never primary AND never secondary.
+    claims = _spec("claims_frequency_severity")
+    assert "insurance.claims.claims_fraud" not in (claims.primary, *claims.secondary)
+    mm = _spec("mortality_morbidity_loading")
+    assert "insurance.reinsurance" not in (mm.primary, *mm.secondary)
+    holdings = _spec("custody_holding_dynamics")
+    for old in ("securities_services.custody.settlement",
+                "securities_services.custody.settlement_failure_risk"):
+        assert old not in (holdings.primary, *holdings.secondary)
+
+
+def test_four_settlement_recipes_map_to_settlement_failure_risk():
+    for rid in ("matching_break_rate", "pre_settlement_aging",
+                "settlement_fail_rate", "fail_ageing_buckets"):
+        assert (_spec(rid).primary
+                == "securities_services.custody.settlement_failure_risk"), rid

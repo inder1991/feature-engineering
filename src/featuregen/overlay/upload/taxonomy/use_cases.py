@@ -353,9 +353,26 @@ _ALL: tuple[UseCase, ...] = (
                 "Card fraud (fraud.card_fraud).",
             )),
     UseCase("securities_services.custody", "securities_services", "Custody",
-            "Custody objectives — settlement and corporate actions."),
-    UseCase("securities_services.custody.settlement", "securities_services.custody", "Settlement",
-            "Settlement-fail / matching-break prediction (the 4 custody settlement recipes — D7)."),
+            "Custody objectives — settlement-failure risk, holdings dynamics and corporate actions."),
+    UseCase("securities_services.custody.settlement_failure_risk", "securities_services.custody",
+            "Settlement Failure Risk",
+            "Settlement-fail / matching-break risk prediction (the 4 custody settlement recipes — D7); "
+            "the objective is the FAIL outcome, not the stock of assets held."),
+    UseCase("securities_services.custody.holdings_dynamics", "securities_services.custody",
+            "Holdings Dynamics",
+            "Assets / positions held under custody — growth/decline of the holdings level, concentration "
+            "(HHI) and turnover; the custody-book stock-stability objective (distinct from settlement).",
+            include_examples=(
+                "Track the growth/decline of an account's assets-under-custody holdings over a window.",
+                "Measure holdings concentration (HHI) and turnover across custodied positions.",
+                "Flag a custody book draining assets to another custodian.",
+            ),
+            exclude_examples=(
+                "Predict settlement fails or matching breaks "
+                "(securities_services.custody.settlement_failure_risk) — that is the settlement "
+                "objective, not the holdings stock-dynamics objective.",
+                "Process a corporate action (securities_services.custody.corporate_actions).",
+            )),
     UseCase("securities_services.custody.corporate_actions", "securities_services.custody",
             "Corporate Actions",
             "Corporate-action processing objectives."),
@@ -386,6 +403,41 @@ _ALL: tuple[UseCase, ...] = (
             "Claims objectives — including claims fraud."),
     UseCase("insurance.claims.claims_fraud", "insurance.claims", "Claims Fraud",
             "Fraudulent-claim detection."),
+    UseCase("insurance.actuarial", "insurance", "Actuarial",
+            "Actuarial cost / risk objectives — the honest expected-loss view (not fraud, not price)."),
+    UseCase("insurance.actuarial.claims_cost_modelling", "insurance.actuarial",
+            "Claims Cost Modelling",
+            "Expected claims cost from claim frequency × severity (or loss ratio) — the actuarial "
+            "claims-cost signal consumed by pricing, reserving, reinsurance and capital; the objective "
+            "is the expected cost itself, not detecting fraud and not setting the price.",
+            include_examples=(
+                "Model expected claims cost from claim frequency and severity for a motor book.",
+                "Project incurred claims cost per policy to feed reserving and reinsurance.",
+                "Estimate a loss ratio vs earned premium as the actuarial cost view.",
+            ),
+            exclude_examples=(
+                "Detect fraudulent claims (insurance.claims.claims_fraud) — this leaf models the honest "
+                "expected cost, it is NOT fraud detection.",
+                "Set the premium / rate itself (pricing) — claims-cost modelling feeds pricing but the "
+                "price is not this objective's target.",
+            )),
+    UseCase("insurance.underwriting", "insurance", "Underwriting",
+            "New-business insurance underwriting — assessing applicant risk to decide eligibility, "
+            "rating and loading (distinct from ceded-risk reinsurance)."),
+    UseCase("insurance.underwriting.mortality_morbidity_risk_assessment", "insurance.underwriting",
+            "Mortality / Morbidity Risk Assessment",
+            "Assess an applicant's mortality / morbidity risk (rate level or loading vs the standard "
+            "table) to drive eligibility, rating and underwriting loading; the objective is the "
+            "applicant risk assessment, not reinsurance treaty economics.",
+            include_examples=(
+                "Assess a life applicant's mortality risk to set eligibility and a rating loading.",
+                "Score morbidity risk on a protection policy for an underwriting loading factor.",
+            ),
+            exclude_examples=(
+                "Structure ceded / retained risk with a reinsurer (insurance.reinsurance) — that is "
+                "treaty economics, not the applicant's own risk assessment.",
+                "Detect fraudulent claims (insurance.claims.claims_fraud).",
+            )),
     UseCase("insurance.reinsurance", "insurance", "Reinsurance",
             "Reinsurance / ceded-risk objectives."),
     UseCase("insurance.bancassurance", "insurance", "Bancassurance",

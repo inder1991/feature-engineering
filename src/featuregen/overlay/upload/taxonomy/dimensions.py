@@ -33,9 +33,12 @@ MODELLING_CONTEXTS: frozenset[str] = frozenset(
 # An output quantity, not an objective — kept its own dimension so it never masquerades as a use-case.
 MEASURES: frozenset[str] = frozenset({"tracking_error", "data_quality"})
 
-# Product / asset / channel context (e.g. crypto is context, not a use-case — D4).
+# Product / asset / channel context (e.g. crypto is context, not a use-case — D4). The insurance
+# product lines ("insurance" / "life_insurance" / "health_insurance") are product context, NOT
+# objectives — the insurance *objectives* are the use-case leaves (claims-cost, mortality risk, …).
 PRODUCT_CONTEXTS: frozenset[str] = frozenset(
-    {"deposits", "credit_cards", "mortgages", "crypto_assets", "derivatives"})
+    {"deposits", "credit_cards", "mortgages", "crypto_assets", "derivatives",
+     "insurance", "life_insurance", "health_insurance"})
 
 # A specific pattern within a use-case (the "how", not the objective).
 TYPOLOGIES: frozenset[str] = frozenset({

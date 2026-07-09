@@ -86,3 +86,39 @@ def test_selectable_leaves_excludes_domain_and_includes_a_real_leaf():
     assert "customer.relationship_attrition" not in leaves
     # Intentionally-empty leaves are still selectable, choosable leaves.
     assert "pricing.fee_pricing" in leaves
+
+
+# ── taxonomy patch: three precise leaves + a rename ─────────────────────────────────────────────────
+_NEW_PRECISE_LEAVES = (
+    "insurance.actuarial.claims_cost_modelling",
+    "insurance.underwriting.mortality_morbidity_risk_assessment",
+    "securities_services.custody.holdings_dynamics",
+)
+
+
+def test_three_new_precise_leaves_exist_and_are_selectable():
+    leaves = set(selectable_leaves())
+    for leaf in _NEW_PRECISE_LEAVES:
+        node = use_case(leaf)
+        assert node is not None and node.selectable is True, leaf
+        assert leaf in leaves, leaf
+        # Each authors disambiguating examples (the exclude example pushes off the wrong-objective).
+        assert node.include_examples and node.exclude_examples, leaf
+
+
+def test_new_parents_resolve_and_are_selectable_non_leaves():
+    leaves = set(selectable_leaves())
+    for parent in ("insurance.actuarial", "insurance.underwriting"):
+        node = use_case(parent)
+        assert node is not None and node.selectable is True, parent
+        assert parent not in leaves, parent          # a parent with a selectable child is not a leaf
+    assert ancestors("insurance.actuarial.claims_cost_modelling") == ("insurance", "insurance.actuarial")
+
+
+def test_custody_settlement_leaf_renamed():
+    # The old id is gone; the renamed failure-risk leaf resolves and is a selectable sibling of holdings.
+    assert use_case("securities_services.custody.settlement") is None
+    renamed = use_case("securities_services.custody.settlement_failure_risk")
+    assert renamed is not None and renamed.selectable is True
+    assert renamed.parent == "securities_services.custody"
+    assert "securities_services.custody.holdings_dynamics" in selectable_leaves()
