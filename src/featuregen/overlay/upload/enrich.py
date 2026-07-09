@@ -5,12 +5,20 @@ import json
 
 from featuregen.intake.llm import LLMClient
 from featuregen.overlay.upload.canonical import CanonicalRow
-from featuregen.overlay.upload.concepts import UNCLASSIFIED, is_known_concept
+from featuregen.overlay.upload.concepts import (
+    UNCLASSIFIED,
+    classification_vocabulary,
+    is_known_concept,
+)
 from featuregen.overlay.upload.enrich_llm import audited_enrich_call
 
 _TASK = "overlay.enrich.concept"
 _DEF_TASK = "overlay.enrich.definition"
 _DOMAIN_TASK = "overlay.enrich.domain"
+
+# B1b: the controlled vocabulary the classifier chooses from, handed to the LLM so it classifies into
+# the full structured concept set (B1a) rather than a hardcoded subset. Static — built once.
+_CONCEPT_VOCABULARY: list[dict] = list(classification_vocabulary())
 
 
 def content_hash(row: CanonicalRow) -> str:
@@ -78,8 +86,10 @@ def enrich_concepts(conn, rows: list[CanonicalRow], client: LLMClient,
             continue
         # Metadata only (names/types) — NOT the uploader's free-text definition (M4 egress risk).
         raw = _call(conn, client, _TASK, "overlay_concept_v1", "overlay_concept",
-                    {"table": row.table, "column": row.column, "type": row.type}, "concept",
-                    "Classify this column into the controlled concept vocabulary.", actor)
+                    {"table": row.table, "column": row.column, "type": row.type,
+                     "vocabulary": _CONCEPT_VOCABULARY}, "concept",
+                    "Classify this column into the provided controlled concept vocabulary — choose the "
+                    "single best-fitting concept name, or 'unclassified' if none fits.", actor)
         if raw is None:
             continue   # failure/empty -> don't cache; retry next ingest (M3)
         concept = raw if is_known_concept(raw) else UNCLASSIFIED

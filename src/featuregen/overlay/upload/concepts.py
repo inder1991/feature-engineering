@@ -312,3 +312,20 @@ def humanize(c: str) -> str:
 def concept(name: str) -> Concept | None:
     """The full behaviour record for a concept name, or None if it isn't in the registry."""
     return CONCEPT_REGISTRY.get(name)
+
+
+# The 5 legacy aliases are retained so already-enriched data + the pre-B1b classifier are never orphaned,
+# but they are NOT classification targets — the classifier should choose the richer §3 concept instead.
+_LEGACY_ALIASES: frozenset[str] = frozenset({
+    "monetary_amount", "account_identifier", "customer_identifier", "timestamp", "rate_or_ratio",
+})
+
+
+def classification_vocabulary() -> tuple[dict, ...]:
+    """The vocabulary the enrichment classifier chooses from — each concept's ``name``, ``group`` and a
+    short ``hint`` (first clause of its description), EXCLUDING the legacy aliases. Passed to the LLM
+    (B1b) so it classifies into the full structured vocabulary rather than a hardcoded subset; an
+    unrecognised answer still falls back to ``unclassified`` at the caller."""
+    return tuple(
+        {"name": c.name, "group": c.group, "hint": c.description.split(".")[0].strip()[:120]}
+        for c in _ALL if c.name not in _LEGACY_ALIASES)

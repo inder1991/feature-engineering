@@ -27,6 +27,26 @@ def test_unknown_concept_falls_back_to_unclassified(db):
     assert out[content_hash(rows[0])] == "unclassified"
 
 
+class _CapturingFake(FakeLLM):
+    def call(self, request):
+        self.last = request
+        return super().call(request)
+
+
+def test_b1b_hands_the_full_vocabulary_to_the_classifier_and_accepts_a_rich_concept(db):
+    # B1b: the classifier is handed the full structured vocabulary (so it can classify into the ~116
+    # concepts, not a hardcoded subset), and a rich concept it returns is accepted end-to-end.
+    from featuregen.intake.redaction import INPUT_KEY_CATALOG
+    rows = [CanonicalRow("deposits", "accounts", "balance", "numeric")]
+    client = _CapturingFake(script={_TASK: FakeResponse(output={"concept": "monetary_stock"})})
+    out = enrich_concepts(db, rows, client)
+    vocab = client.last.inputs[INPUT_KEY_CATALOG]["vocabulary"]
+    names = {v["name"] for v in vocab}
+    assert "monetary_stock" in names and "outcome_label" in names   # rich §3 concepts offered
+    assert "monetary_amount" not in names                           # legacy alias excluded as a target
+    assert out[content_hash(rows[0])] == "monetary_stock"           # accepted, not coerced to unclassified
+
+
 def test_drafts_definition_only_when_blank(db):
     from featuregen.overlay.upload.enrich import draft_definitions
     rows = [
@@ -91,8 +111,11 @@ def test_concept_inputs_exclude_free_text_definition(db):
                          definition="holder SSN 123-45-6789")]   # PII in free text
     enrich_concepts(db, rows, _Capture())
     from featuregen.intake.redaction import INPUT_KEY_CATALOG
-    # Inputs are reserved-keyed; the LLM-visible catalog metadata is names/types only — the
-    # uploader's free-text definition (and its PII) is nowhere in the outbound payload.
-    assert captured["inputs"][INPUT_KEY_CATALOG] == {"table": "accounts", "column": "bal",
-                                                     "type": "numeric"}
-    assert "123-45-6789" not in str(captured["inputs"])
+    # Inputs are reserved-keyed; the LLM-visible catalog metadata is names/types + the static
+    # classification vocabulary (B1b) only — the uploader's free-text definition (and its PII) is
+    # nowhere in the outbound payload.
+    catalog = captured["inputs"][INPUT_KEY_CATALOG]
+    assert catalog["table"] == "accounts" and catalog["column"] == "bal" and catalog["type"] == "numeric"
+    assert "definition" not in catalog                        # the free-text definition is excluded (M4)
+    assert set(catalog) == {"table", "column", "type", "vocabulary"}   # nothing else is sent
+    assert "123-45-6789" not in str(captured["inputs"])       # the PII never reaches the payload

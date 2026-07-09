@@ -132,3 +132,14 @@ def test_registry_is_meaningfully_expanded():
         "eligibility", "regulatory_capital", "accounting", "esg",
     }
     assert {c.group for c in CONCEPT_REGISTRY.values()} <= allowed_groups
+
+
+def test_classification_vocabulary_offers_rich_concepts_excludes_legacy():
+    from featuregen.overlay.upload.concepts import classification_vocabulary
+    vocab = classification_vocabulary()
+    names = {v["name"] for v in vocab}
+    assert "monetary_stock" in names and "outcome_label" in names        # rich §3 concepts are targets
+    assert "monetary_amount" not in names and "rate_or_ratio" not in names  # legacy aliases are not
+    assert "unclassified" not in names
+    ms = next(v for v in vocab if v["name"] == "monetary_stock")
+    assert ms["group"] == "monetary" and ms["hint"]                       # name + group + short hint
