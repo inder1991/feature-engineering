@@ -2090,6 +2090,658 @@ PAYMENTS_TEMPLATES: tuple[Template, ...] = (
 
 
 # ──────────────────────────────────────────────────────────────────────────────────────────────────
+# The markets / trading templates — the §B8 risk families + the COUNTERPARTY-RISK funnel authored to
+# Part-F depth (Phase-3 Pass-4, breadth).
+#
+# Positions/instruments, NOT customers. Two authoring disciplines are load-bearing (mirroring credit):
+#   • ROUTING — every recipe REQUIRES a markets-distinctive, NON-STRUCTURAL concept (var / expected_shortfall
+#     / pv01 / dv01 / implied_volatility / notional / expected_exposure / potential_future_exposure /
+#     margin / limit / benchmark_rate / price / watchlist_hit_flag — NOT an entity concept like
+#     instrument_id / book_id / netting_set_id / counterparty_id, which the engine's structural is_grain
+#     scoring would bind onto ANY grain column, cross-surfacing the family). Grounding is the router; a
+#     churn catalog with only generic monetary_stock/flow + as_of + customer_id grounds NOTHING here
+#     (the locked invariant: ALL_TEMPLATES on the churn _CATALOG = exactly the churn lens).
+#   • NON-ADDITIVE RISK + NEAR-LABEL — a VaR/ES/greek/PFE is a QUANTILE/greek: non-additive (sub-additive
+#     with diversification), NEVER summed across books/netting sets; a notional is semi-additive (gross-
+#     additive across positions, netted within a netting set); counts are additive. The counterparty-risk
+#     funnel mirrors credit (HEALTHY → MARGIN PRESSURE → DISPUTE → CLOSE-OUT ⚠); a counterparty watchlist
+#     hit BORDERS the close-out/default tail -> near_label=True + a ⚠ note (observe strictly pre-close-out;
+#     no recipe ever Needs the default_flag/outcome_label leakage anchor — the engine refuses them).
+# Markets data is MNPI / Chinese-wall aware (high model-risk tier for VaR/XVA). The Part-J appendix in
+# docs/…/2026-07-08-banking-feature-template-library.md is the doc source of record.
+# ──────────────────────────────────────────────────────────────────────────────────────────────────
+_MARKETS_PIT_STATE = ("point-in-time market / counterparty-risk STATE observed as-of: the latest metric "
+                      "within (as_of − {window}, as_of], knowable strictly ≤ as_of, never forward. "
+                      "DESIGN-TIME declaration — no data plane enforces runtime PIT.")
+_MARKETS_NEAR_LABEL_PREFIX = ("⚠ NEAR-LABEL: observe the deterioration signal STRICTLY before the "
+                              "counterparty close-out / default (never on/after it; window ≠ the label "
+                              "window); the 3-part leakage control must FLAG it. ")
+_MARKETS_MNPI = ("markets data is MNPI / Chinese-wall aware (high model-risk tier for VaR/XVA models) — "
+                 "read-scoped by desk / information barrier where applicable.")
+
+MARKETS_TEMPLATES: tuple[Template, ...] = (
+    # ── Market-risk measures (§B8 point-in-time risk families) ──────────────────────────────────────
+    # B8.1 — position_var_risk (VaR / ES level & trend)
+    Template(
+        id="position_var_risk", family="market_risk_measures",
+        intent="Value-at-risk / expected-shortfall level or trailing trend for a trading book — the "
+               "headline market-risk measure; a rising VaR/ES is escalating market risk.",
+        needs=(Need("var_col", "var"), Need("es_col", "expected_shortfall", optional=True),
+               Need("asof", "as_of_date"), Need("entity", "book_id")),
+        params={"window": (90, 60, 30), "measure": ("level", "trend")},
+        aggregation="var_risk", additivity="non_additive", explain="M",
+        use_cases=("market_risk", "trading_risk", "frtb"),
+        pit=_MARKETS_PIT_STATE,
+        degrade="only a single VaR snapshot (no history) -> report the level only (no trend).",
+        stage="risk-measures",
+        eligibility="a VaR/ES is a QUANTILE — non-additive (sub-additive with diversification); never "
+                    "sum across books/netting sets. " + _MARKETS_MNPI,
+        notes=("anchor: 'var' (markets-distinctive, non-structural) routes this off a churn catalog.",
+               "OUTPUT additivity is non_additive: a VaR quantile (or its slope) is never summed across "
+               "books; 'expected_shortfall' is the FRTB twin (an acceptable alternate)."),
+    ),
+    # B8.2 — greek_sensitivity_exposure (PV01/DV01/vega)
+    Template(
+        id="greek_sensitivity_exposure", family="sensitivities_greeks",
+        intent="Sensitivity / greek exposure (PV01 / DV01 / vega on implied-vol) for a book — the "
+               "point-in-time market-sensitivity level or its trailing trend.",
+        needs=(Need("pv01_col", "pv01"), Need("dv01_col", "dv01", optional=True),
+               Need("vol_col", "implied_volatility", optional=True),
+               Need("asof", "as_of_date"), Need("entity", "book_id")),
+        params={"window": (90, 60, 30), "greek": ("pv01", "dv01", "vega"), "measure": ("level", "trend")},
+        aggregation="greek_exposure", additivity="non_additive", explain="H",
+        use_cases=("market_risk", "trading_risk", "irrbb"),
+        pit=_MARKETS_PIT_STATE,
+        degrade="only a single greek snapshot (no history) -> report the level only (no trend).",
+        stage="risk-measures",
+        eligibility="a greek is position-additive only WITHIN one risk factor — non-additive across "
+                    "curves/tenors/underlyings; never sum naively. " + _MARKETS_MNPI,
+        notes=("anchor: 'pv01' (markets-distinctive sensitivity, non-structural) routes this off a churn "
+               "catalog.",
+               "'dv01' is the dollar-sensitivity twin; 'implied_volatility' anchors a vega/vol-risk "
+               "measure — non-additive across strikes/expiries."),
+    ),
+    # B8.3 — notional_netting_exposure (gross vs net notional by netting set)
+    Template(
+        id="notional_netting_exposure", family="notional_exposure",
+        intent="Gross vs net notional exposure by netting set — signed notional netted within an ISDA "
+               "netting set (measure=net_notional) or the gross sum across positions "
+               "(measure=gross_notional).",
+        needs=(Need("notional_col", "notional"), Need("direction", "position_direction", optional=True),
+               Need("asof", "as_of_date"), Need("entity", "netting_set_id")),
+        params={"window": (90, 180, 365), "measure": ("gross_notional", "net_notional")},
+        aggregation="notional_exposure", additivity="semi_additive", explain="H",
+        use_cases=("market_risk", "counterparty_risk", "exposure_management"),
+        pit=_MARKETS_PIT_STATE,
+        degrade="no position_direction -> gross notional only (cannot net long vs short; FLAG).",
+        stage="exposure",
+        eligibility="notional is SEMI-ADDITIVE: gross-additive across positions, NETTED within a netting "
+                    "set, latest over snapshots — never sum a notional across dates. " + _MARKETS_MNPI,
+        derived=("signed_notional := notional × sign(position_direction), netted within the "
+                 "netting_set_id for measure=net_notional — computed DOWNSTREAM (no data plane).",),
+        notes=("anchor: 'notional' (markets-distinctive, non-structural) routes this off a churn catalog "
+               "(netting_set_id is an ENTITY concept — it would structurally bind any grain column, so it "
+               "cannot be the sole anchor).",
+               "semi_additive — gross-additive across positions, latest over time."),
+    ),
+    # ── Counterparty-risk funnel (§B8 — mirrors credit: MARGIN PRESSURE → DISPUTE → CLOSE-OUT ⚠) ─────
+    # B8.4 — counterparty_exposure_trend (EPE / PFE)
+    Template(
+        id="counterparty_exposure_trend", family="counterparty_exposure",
+        intent="Counterparty credit-exposure profile trend — expected (positive) exposure EPE or "
+               "potential future exposure PFE over a trailing window; a rising profile is counterparty "
+               "margin pressure.",
+        needs=(Need("epe_col", "expected_exposure"),
+               Need("pfe_col", "potential_future_exposure", optional=True),
+               Need("asof", "as_of_date"), Need("entity", "netting_set_id")),
+        params={"window": (180, 90, 365), "measure": ("epe_trend", "epe_level", "pfe_level")},
+        aggregation="counterparty_exposure", additivity="non_additive", explain="M",
+        use_cases=("counterparty_risk", "xva", "market_risk"),
+        pit=_MARKETS_PIT_STATE,
+        degrade="only a single exposure snapshot (no history) -> report the level only (no trend).",
+        stage="1-margin-pressure",
+        eligibility="EPE aggregates across netting sets SUB-additively and PFE is a QUANTILE — "
+                    "non-additive; never sum EE/PFE naively across netting sets (like var). "
+                    + _MARKETS_MNPI,
+        notes=("anchor: 'expected_exposure' (markets-distinctive EPE, non-structural) routes this off a "
+               "churn catalog.",
+               "OUTPUT additivity is measure-dependent: a raw EPE level is a semi-additive exposure "
+               "stock, a PFE level is a non-additive quantile, a trend is n/a — the default carries the "
+               "non-additive case (never sum a counterparty quantile across netting sets)."),
+    ),
+    # B8.5 — margin_call_intensity (margin / collateral call intensity)
+    Template(
+        id="margin_call_intensity", family="margin_collateral",
+        intent="Margin / collateral call intensity — the rate (or count) of variation/initial-margin "
+               "calls on a netting set over the window, or the posted-margin level; rising calls are "
+               "margin pressure into a dispute.",
+        needs=(Need("margin_col", "margin"), Need("event_ts", "event_timestamp", optional=True),
+               Need("asof", "as_of_date"), Need("entity", "netting_set_id")),
+        params={"window": (90, 60, 30), "measure": ("call_intensity", "call_count", "im_level")},
+        aggregation="margin_call_intensity", additivity="non_additive", explain="H",
+        use_cases=("counterparty_risk", "margin", "market_risk"),
+        pit=_MARKETS_PIT_STATE,
+        degrade="no margin-call event stream -> report the posted-margin (im) level only.",
+        stage="1-margin-pressure",
+        eligibility="posted margin is a semi-additive collateral STOCK (sum across counterparties, "
+                    "latest over time). " + _MARKETS_MNPI,
+        notes=("anchor: 'margin' (markets-distinctive collateral stock, non-structural) routes this off "
+               "a churn catalog.",
+               "OUTPUT additivity is measure-dependent: call_intensity is a non-additive rate; a "
+               "call_count is additive; an im_level is a semi-additive stock — the default carries the "
+               "rate case."),
+    ),
+    # B8.6 — trading_limit_utilisation (limit-utilisation on trading limits)
+    Template(
+        id="trading_limit_utilisation", family="trading_limits",
+        intent="Trading-limit utilisation — used exposure (notional) against a trading limit "
+               "(measure=utilisation), the headroom, or proximity to a breach; rising utilisation is a "
+               "limit-management early warning.",
+        needs=(Need("limit_col", "limit"), Need("used_col", "notional", optional=True),
+               Need("asof", "as_of_date"), Need("entity", "book_id")),
+        params={"window": (90, 60, 30), "measure": ("utilisation", "headroom", "breach_proximity")},
+        aggregation="limit_utilisation", additivity="non_additive", explain="H",
+        use_cases=("market_risk", "trading_risk", "limit_management"),
+        pit=_MARKETS_PIT_STATE,
+        degrade="no used-exposure numerator (notional) -> report the limit level only (utilisation "
+                "undefined; FLAG).",
+        stage="risk-measures",
+        eligibility="a utilisation ratio is non-additive; trading limits NEST (sub-limits under a "
+                    "master) — never naively sum nested limits. " + _MARKETS_MNPI,
+        notes=("anchor: 'limit' (markets/credit-distinctive ceiling, non-structural) routes this off a "
+               "churn catalog.",
+               "a utilisation ratio — non-additive; compute per book/limit, never sum."),
+    ),
+    # B8.7 — book_desk_concentration (concentration by book/desk)
+    Template(
+        id="book_desk_concentration", family="concentration",
+        intent="Concentration of exposure by book / desk — an HHI (or top-share) of notional exposure "
+               "across books/desks; a book concentrated in one risk is fragile.",
+        needs=(Need("notional_col", "notional"), Need("desk", "desk_id", optional=True),
+               Need("asof", "as_of_date"), Need("entity", "book_id")),
+        params={"window": (90, 180, 365), "measure": ("book_hhi", "top_book_share")},
+        aggregation="book_concentration", additivity="non_additive", explain="M",
+        use_cases=("market_risk", "concentration_risk"),
+        pit=_MARKETS_PIT_STATE,
+        degrade="no desk breakdown -> compute book-level concentration only.",
+        stage="risk-measures",
+        eligibility=_MARKETS_MNPI,
+        notes=("anchor: 'notional' (markets-distinctive exposure, non-structural) routes this off a "
+               "churn catalog.",
+               "a concentration index (HHI / top-share) — non-additive."),
+    ),
+    # B8.8 — benchmark_basis_dislocation (benchmark / tracking dislocation)
+    Template(
+        id="benchmark_basis_dislocation", family="benchmark_tracking",
+        intent="Benchmark / basis dislocation — the spread of an instrument price or funding vs its "
+               "reference benchmark_rate (SOFR/SONIA/€STR) and its trailing trend; a widening basis is "
+               "market dislocation / tracking risk.",
+        needs=(Need("benchmark_col", "benchmark_rate"), Need("price_col", "price", optional=True),
+               Need("asof", "as_of_date"), Need("entity", "book_id")),
+        params={"window": (90, 60, 180), "measure": ("basis_level", "basis_trend")},
+        aggregation="benchmark_basis", additivity="non_additive", explain="M",
+        use_cases=("market_risk", "trading_risk", "basis_risk"),
+        pit=_MARKETS_PIT_STATE,
+        degrade="only a single observation (no history) -> report the basis level only (no trend).",
+        stage="risk-measures",
+        eligibility=_MARKETS_MNPI,
+        notes=("anchor: 'benchmark_rate' (markets-distinctive reference rate, non-structural) routes "
+               "this off a churn catalog — distinct from the asset-management 'benchmark' INDEX and the "
+               "deposit deposit_beta use of the same rate.",
+               "a basis / spread vs the reference rate — non-additive."),
+    ),
+    # B8.9 — counterparty_deterioration_ewi (counterparty-deterioration early-warning — NEAR-LABEL)
+    Template(
+        id="counterparty_deterioration_ewi", family="counterparty_deterioration",
+        intent="Counterparty-deterioration early-warning — a credit-watchlist (or adverse-media) hit on "
+               "a trading counterparty and its recency; watchlisting borders the close-out / default "
+               "tail of the counterparty-risk funnel.",
+        needs=(Need("watchlist_col", "watchlist_hit_flag"),
+               Need("adverse_media", "adverse_media_flag", optional=True),
+               Need("asof", "as_of_date"), Need("entity", "counterparty_id")),
+        params={"window": (365, 180, 90), "measure": ("watchlisted_flag", "days_since_watchlist")},
+        aggregation="counterparty_deterioration", additivity="n/a", explain="H",
+        use_cases=("counterparty_risk", "early_warning", "credit_risk"),
+        pit=_MARKETS_PIT_STATE,
+        degrade="no watchlist signal -> SKIP.",
+        stage="3-close-out-adjacent",
+        near_label=True,
+        eligibility=_MARKETS_NEAR_LABEL_PREFIX + "a counterparty watchlist hit borders the close-out / "
+                    "default label (the counterparty-risk funnel mirrors credit); adverse_media is pii "
+                    "(read-scoped). " + _MARKETS_MNPI,
+        notes=("anchor: 'watchlist_hit_flag' (near-label, markets-distinctive, non-structural) routes "
+               "this off a churn catalog.",
+               "borders the counterparty close-out/default outcome — observe strictly pre-close-out.",
+               "a watchlist flag / recency — n/a."),
+    ),
+)
+
+
+# ──────────────────────────────────────────────────────────────────────────────────────────────────
+# The custody & securities-services templates — the §B10 SETTLEMENT-FAIL funnel authored to Part-F depth
+# (Phase-3 Pass-4, breadth).
+#
+# Operational / asset-servicing; institutional; less PII. Funnel (§B10): TRADE BOOKED → MATCHING
+# (unmatched) → PRE-SETTLEMENT (inventory/cash shortfall) → SETTLEMENT DATE → FAIL ⚠ → FAIL-AGING → BUY-IN.
+# Two authoring disciplines are load-bearing:
+#   • ROUTING — every recipe REQUIRES a custody-distinctive, NON-STRUCTURAL concept (settlement_status /
+#     settlement_cycle / corporate_action / securities_loan / nav / custody_holding — NOT an entity
+#     concept like account_id / instrument_id, which the engine's structural is_grain scoring would bind
+#     onto any grain column). Grounding is the router; a churn catalog grounds NOTHING here (the locked
+#     invariant: ALL_TEMPLATES on the churn _CATALOG = exactly the churn lens).
+#   • SAFETY BY CONSTRUCTION — a settlement-fail-PREDICTION recipe is built from PRE-fail signals
+#     (settlement_status pending/failed HISTORY, settlement_cycle T+n length, corporate_action
+#     complexity), NEVER the ``settlement_fail`` outcome (a leakage anchor the engine refuses). A trailing
+#     fail RATE and (harder) a POST-fail fail-ageing signal BORDER the fail outcome -> near_label=True + a
+#     ⚠ note (observe strictly pre-outcome / on prior instructions). PIT-CRITICAL: a fail is not KNOWABLE
+#     until T+n (settlement_cycle) — honour system_time. The Part-J appendix in
+#     docs/…/2026-07-08-banking-feature-template-library.md is the doc source of record.
+# ──────────────────────────────────────────────────────────────────────────────────────────────────
+_CUSTODY_PIT_STATE = ("point-in-time custody / settlement STATE observed as-of: the latest status / "
+                      "holding within (as_of − {window}, as_of], knowable strictly ≤ as_of, never "
+                      "forward. PIT-CRITICAL: a settlement outcome is not KNOWABLE until T+n "
+                      "(settlement_cycle) — honour system_time. DESIGN-TIME declaration — no data plane "
+                      "enforces runtime PIT.")
+_CUSTODY_NEAR_LABEL_PREFIX = ("⚠ NEAR-LABEL: build the signal from PRE-fail observations STRICTLY before "
+                              "the predicted instruction's settlement outcome (never the settlement_fail "
+                              "label itself — the engine refuses it; window ≠ the label window); the "
+                              "3-part leakage control must FLAG it. ")
+_CUSTODY_PREFAIL = ("built from PRE-fail signals (settlement_status pending/failed history, "
+                    "settlement_cycle length), NEVER the settlement_fail outcome (a leakage anchor the "
+                    "engine refuses by construction).")
+
+CUSTODY_TEMPLATES: tuple[Template, ...] = (
+    # ── PRE-SETTLEMENT — matching + inventory aging (pre-fail signals) ───────────────────────────────
+    # B10.1 — matching_break_rate (unmatched / mismatched at the matching stage)
+    Template(
+        id="matching_break_rate", family="matching",
+        intent="Matching-break rate — the trailing share of instructions that were UNMATCHED / "
+               "mismatched at the matching stage (read from settlement_status), an early pre-settlement "
+               "break signal.",
+        needs=(Need("status_col", "settlement_status"), Need("event_ts", "event_timestamp"),
+               Need("entity", "account_id")),
+        params={"window": (90, 30, 180), "measure": ("break_rate", "break_count")},
+        aggregation="matching_break_rate", additivity="non_additive", explain="H",
+        use_cases=("settlement_risk", "custody", "securities_services"),
+        pit=_CUSTODY_PIT_STATE,
+        degrade="no settlement_status (matching state) -> SKIP.",
+        stage="matching",
+        eligibility=_CUSTODY_PREFAIL,
+        notes=("anchor: 'settlement_status' (custody-distinctive, non-structural) routes this off a "
+               "churn catalog.",
+               "concept sub: the taxonomy has no dedicated matching_status concept — settlement_status "
+               "carries the unmatched/mismatched value.",
+               "OUTPUT additivity is measure-dependent: break_rate is a non-additive ratio; a "
+               "break_count is additive — the default carries the rate case."),
+    ),
+    # B10.2 — pre_settlement_aging (pending instructions aging vs the T+n settlement_cycle)
+    Template(
+        id="pre_settlement_aging", family="pre_settlement",
+        intent="Pre-settlement aging — how long unsettled/pending instructions have aged against their "
+               "T+n settlement_cycle convention (a pre-fail inventory/cash-shortfall signal); a "
+               "lengthening pending age is fail risk BEFORE the settlement date.",
+        needs=(Need("cycle_col", "settlement_cycle"),
+               Need("status_col", "settlement_status", optional=True),
+               Need("event_ts", "event_timestamp"), Need("entity", "account_id")),
+        params={"window": (30, 90, 180), "measure": ("mean_pending_age", "overdue_share")},
+        aggregation="pre_settlement_aging", additivity="n/a", explain="H",
+        use_cases=("settlement_risk", "custody", "securities_services"),
+        pit=_CUSTODY_PIT_STATE,
+        degrade="no settlement_cycle convention -> SKIP (cannot age against T+n).",
+        stage="pre-settlement",
+        eligibility=_CUSTODY_PREFAIL,
+        notes=("anchor: 'settlement_cycle' (custody-distinctive T+n convention, non-structural) routes "
+               "this off a churn catalog.",
+               "OUTPUT additivity is measure-dependent: mean_pending_age is a duration (n/a); an "
+               "overdue_share is a non-additive ratio — the default carries the duration case."),
+    ),
+    # ── SETTLEMENT DATE → FAIL ⚠ — the fail rate (NEAR-LABEL; pre-fail history, never settlement_fail) ─
+    # B10.3 — settlement_fail_rate (the headline safety recipe)
+    Template(
+        id="settlement_fail_rate", family="settlement_fail",
+        intent="Settlement-fail rate — the trailing share of an account's / counterparty's instructions "
+               "that reached a FAILED settlement_status vs settled, built from historical status (a "
+               "pre-fail predictor for a NEW instruction); NEVER the settlement_fail label itself.",
+        needs=(Need("status_col", "settlement_status"),
+               Need("cycle_col", "settlement_cycle", optional=True),
+               Need("event_ts", "event_timestamp"), Need("entity", "account_id")),
+        params={"window": (90, 180, 365), "measure": ("fail_rate", "fail_count")},
+        aggregation="settlement_fail_rate", additivity="non_additive", explain="H",
+        use_cases=("settlement_risk", "custody", "securities_services"),
+        pit=_CUSTODY_PIT_STATE,
+        degrade="no settlement_status history -> SKIP (cannot compute a fail rate).",
+        stage="fail",
+        near_label=True,
+        eligibility=_CUSTODY_NEAR_LABEL_PREFIX + _CUSTODY_PREFAIL,
+        notes=("anchor: 'settlement_status' (custody-distinctive; the historical status distribution, "
+               "NOT the settlement_fail label) routes this off a churn catalog.",
+               "the settlement_fail outcome is NEVER an input — the engine refuses the leakage anchor; "
+               "the fail RATE is a pre-observation over PRIOR instructions.",
+               "OUTPUT additivity is measure-dependent: fail_rate is a non-additive ratio; a fail_count "
+               "is additive — the default carries the rate case."),
+    ),
+    # B10.4 — fail_ageing_buckets (POST-fail aging on the fail→buy-in tail — NEAR-LABEL)
+    Template(
+        id="fail_ageing_buckets", family="fail_ageing",
+        intent="Fail-ageing buckets — how long already-FAILED instructions have been aging "
+               "(measure=aged_fail_share in buckets, or mean fail_age_days), a POST-fail asset-servicing "
+               "signal on the fail → buy-in tail.",
+        needs=(Need("status_col", "settlement_status"),
+               Need("cycle_col", "settlement_cycle", optional=True),
+               Need("event_ts", "event_timestamp"), Need("entity", "account_id")),
+        params={"window": (90, 180, 30), "measure": ("aged_fail_share", "mean_fail_age_days")},
+        aggregation="fail_ageing", additivity="non_additive", explain="H",
+        use_cases=("settlement_risk", "custody", "securities_services"),
+        pit=_CUSTODY_PIT_STATE,
+        degrade="no settlement_status fail history -> SKIP.",
+        stage="fail-ageing",
+        near_label=True,
+        eligibility=_CUSTODY_NEAR_LABEL_PREFIX + "fail-ageing is a POST-fail signal (the fail → buy-in "
+                    "tail) — for a fail-PREDICTION model observe it on PRIOR/other instructions, never "
+                    "the target instruction's own post-fail age. " + _CUSTODY_PREFAIL,
+        notes=("anchor: 'settlement_status' (custody-distinctive; the failed-status aging, NOT the "
+               "settlement_fail label) routes this off a churn catalog.",
+               "borders/reads the fail outcome (POST-fail) — like a collections post-charge-off signal; "
+               "observe strictly on pre-label observations for a prediction model.",
+               "OUTPUT additivity is measure-dependent: aged_fail_share is a non-additive ratio; "
+               "mean_fail_age_days is a duration (n/a) — the default carries the ratio case."),
+    ),
+    # ── ASSET-SERVICING — corporate actions, securities lending, NAV, custody holdings ───────────────
+    # B10.5 — corporate_action_complexity (volume / complexity)
+    Template(
+        id="corporate_action_complexity", family="corporate_actions",
+        intent="Corporate-action volume / complexity — the count of corporate-action events an account "
+               "must service (measure=ca_volume) or a complexity / elective-deadline-proximity score "
+               "(measure=complexity_score); elective/complex CAs drive asset-servicing risk.",
+        needs=(Need("ca_col", "corporate_action"), Need("pay_date", "pay_date", optional=True),
+               Need("event_ts", "event_timestamp"), Need("entity", "account_id")),
+        params={"window": (90, 180, 365), "measure": ("ca_volume", "complexity_score")},
+        aggregation="corporate_action_complexity", additivity="additive", explain="H",
+        use_cases=("custody", "securities_services", "corporate_actions"),
+        pit=_CUSTODY_PIT_STATE,
+        degrade="no corporate_action data -> SKIP.",
+        stage="asset-servicing",
+        eligibility="entitlement is fixed at record_date, priced at ex_date, paid at pay_date — honour "
+                    "the corporate-action PIT (system_time for restated terms).",
+        notes=("anchor: 'corporate_action' (custody-distinctive, non-structural) routes this off a churn "
+               "catalog.",
+               "OUTPUT additivity is measure-dependent: ca_volume is an additive count; a "
+               "complexity_score is non-additive — the default carries the additive count."),
+    ),
+    # B10.6 — sec_lending_utilisation (securities-lending utilisation / specials)
+    Template(
+        id="sec_lending_utilisation", family="securities_lending",
+        intent="Securities-lending utilisation — on-loan securities (securities_loan) vs the lendable "
+               "custody inventory (measure=utilisation), or the on-loan amount / specials demand; high "
+               "utilisation signals recall risk.",
+        needs=(Need("loan_col", "securities_loan"), Need("holding_col", "custody_holding", optional=True),
+               Need("asof", "as_of_date"), Need("entity", "instrument_id")),
+        params={"window": (90, 180, 365), "measure": ("utilisation", "on_loan_amount")},
+        aggregation="sec_lending_utilisation", additivity="non_additive", explain="H",
+        use_cases=("securities_services", "securities_lending", "custody"),
+        pit=_CUSTODY_PIT_STATE,
+        degrade="no lendable-inventory base (custody_holding) -> report the on_loan_amount "
+                "(semi-additive stock) only.",
+        stage="asset-servicing",
+        eligibility="single currency; a securities-loan position is a semi-additive STOCK (latest over "
+                    "time).",
+        notes=("anchor: 'securities_loan' (custody-distinctive SFT position, non-structural) routes this "
+               "off a churn catalog.",
+               "OUTPUT additivity is measure-dependent: utilisation is a non-additive ratio; the "
+               "on_loan_amount is a semi-additive stock — the default carries the ratio case."),
+    ),
+    # B10.7 — nav_strike_timeliness (fund-admin NAV striking — PIT on record/pay dates)
+    Template(
+        id="nav_strike_timeliness", family="fund_admin_nav",
+        intent="NAV-strike timeliness / exception rate — whether fund NAVs are struck on time and clean "
+               "(measure=exception_rate / late_share), read against the corporate-action record/pay PIT; "
+               "a rising NAV-exception rate is a fund-admin quality signal.",
+        needs=(Need("nav_col", "nav"), Need("record_date", "record_date", optional=True),
+               Need("pay_date", "pay_date", optional=True), Need("event_ts", "event_timestamp"),
+               Need("entity", "account_id")),
+        params={"window": (90, 30, 180), "measure": ("exception_rate", "late_share")},
+        aggregation="nav_strike_timeliness", additivity="non_additive", explain="H",
+        use_cases=("securities_services", "fund_administration", "custody"),
+        pit=_CUSTODY_PIT_STATE,
+        degrade="no nav strike history -> SKIP.",
+        stage="fund-admin",
+        eligibility="honour the corporate-action PIT (entitlement fixed at record_date, priced at "
+                    "ex_date, paid at pay_date) so a NAV is struck on knowable data.",
+        notes=("anchor: 'nav' (custody/fund-admin-distinctive price, non-structural) routes this off a "
+               "churn catalog.",
+               "a NAV-exception / late-strike RATE — non-additive; compute per fund/account, never sum."),
+    ),
+    # B10.8 — custody_holding_dynamics (custody-holding turnover / concentration)
+    Template(
+        id="custody_holding_dynamics", family="custody_holdings",
+        intent="Custody-holding dynamics — assets-under-custody holding level / trend "
+               "(measure=holding_trend), turnover (traded value / holdings) or concentration (HHI across "
+               "holdings); the custody-book stability signal.",
+        needs=(Need("holding_col", "custody_holding"), Need("instrument", "instrument_id", optional=True),
+               Need("asof", "as_of_date"), Need("entity", "account_id")),
+        params={"window": (90, 180, 365), "measure": ("holding_trend", "turnover", "concentration_hhi")},
+        aggregation="custody_holding_dynamics", additivity="semi_additive", explain="M",
+        use_cases=("custody", "securities_services"),
+        pit=_CUSTODY_PIT_STATE,
+        degrade="no instrument breakdown -> account-level holding level/trend only (no concentration).",
+        stage="asset-servicing",
+        eligibility="single currency; a custody holding is a semi-additive STOCK (sum across accounts, "
+                    "latest over time — never sum across dates).",
+        notes=("anchor: 'custody_holding' (custody-distinctive AUC stock, non-structural) routes this "
+               "off a churn catalog.",
+               "OUTPUT additivity is measure-dependent: a holding level/trend is a semi-additive stock; "
+               "turnover / concentration_hhi are non-additive — the default carries the semi-additive "
+               "holding case."),
+    ),
+)
+
+
+# ──────────────────────────────────────────────────────────────────────────────────────────────────
+# The asset-management (buy-side) templates — the §B12 REDEMPTION funnel + mandate compliance authored
+# to Part-F depth (Phase-3 Pass-4, breadth).
+#
+# Funds/mandates, driven by RELATIVE PERFORMANCE + LIQUIDITY. Funnel (§B12, mirrors churn): INVESTED →
+# DISENGAGEMENT → REDEMPTION-RISK (underperformance, partial redemptions) → REDEMPTION NOTICE ⚠ → REDEEMED.
+# Two authoring disciplines are load-bearing:
+#   • ROUTING — every recipe REQUIRES an asset-management-distinctive, NON-STRUCTURAL concept (fund_flow /
+#     benchmark / tracking_error / expense_ratio / mandate / nav — NOT an entity concept like fund /
+#     share_class, which the engine's structural is_grain scoring would bind onto any grain column).
+#     Grounding is the router; a churn catalog grounds NOTHING here (the locked invariant).
+#   • SAFETY BY CONSTRUCTION — a redemption recipe is built from fund_flow / performance / tracking-error
+#     PRE-signals, NEVER the ``redeemed`` outcome (a leakage anchor the engine refuses). The NEAR-LABEL tail
+#     is mandate compliance: a mandate-breach headroom and a tracking-error-limit proximity BORDER the
+#     mandate/IMA-breach label -> near_label=True + a ⚠ note (observe strictly pre-breach). Distinguish
+#     'mandate' (the INVESTMENT mandate / IMA) from a PAYMENT mandate (direct_debit / standing_order), and
+#     'benchmark' (a performance INDEX) from 'benchmark_rate' (a reference INTEREST rate). The Part-J
+#     appendix in docs/…/2026-07-08-banking-feature-template-library.md is the doc source of record.
+# ──────────────────────────────────────────────────────────────────────────────────────────────────
+_AM_PIT_STATE = ("point-in-time asset-management STATE observed as-of: the latest performance / ratio "
+                 "within (as_of − {window}, as_of], knowable strictly ≤ as_of, never forward. "
+                 "DESIGN-TIME declaration — no data plane enforces runtime PIT.")
+_AM_PIT_TRAILING = ("trailing window (as_of − {window}, as_of], values knowable strictly ≤ as_of; never "
+                    "forward. DESIGN-TIME declaration — no data plane enforces runtime PIT.")
+_AM_NEAR_LABEL_PREFIX = ("⚠ NEAR-LABEL: observe the pre-breach signal STRICTLY before the "
+                         "mandate / tracking-error breach label (never on/after it; window ≠ the label "
+                         "window); the 3-part leakage control must FLAG it. ")
+_AM_NOT_REDEEMED = ("built from fund_flow / performance / tracking-error PRE-signals, NEVER the "
+                    "'redeemed' outcome (a leakage anchor the engine refuses by construction).")
+
+ASSET_MGMT_TEMPLATES: tuple[Template, ...] = (
+    # ── Investor-flow / redemption funnel (§B12 — mirrors churn) ─────────────────────────────────────
+    # B12.1 — net_fund_flow_trend (net flow & redemption pressure — from fund_flow, NEVER redeemed)
+    Template(
+        id="net_fund_flow_trend", family="redemption_flow",
+        intent="Net fund-flow trend & redemption pressure — cumulative net flow (subscriptions − "
+               "redemptions), its trailing trend, or a redemption-pressure ratio (gross redemptions / "
+               "AUM); sustained net outflows are the buy-side attrition signal. Built from fund_flow, "
+               "NEVER 'redeemed'.",
+        needs=(Need("flow_col", "fund_flow"), Need("event_ts", "event_timestamp"),
+               Need("entity", "fund")),
+        params={"window": (90, 180, 365),
+                "measure": ("cumulative_net_flow", "net_flow_trend", "redemption_pressure")},
+        aggregation="net_fund_flow", additivity="additive", explain="H",
+        use_cases=("redemption_risk", "fund_flows", "asset_management"),
+        pit=_AM_PIT_TRAILING,
+        degrade="only a single flow snapshot (no history) -> report the cumulative net flow (no trend).",
+        stage="2-disengagement",
+        eligibility="single currency — convert to base first. " + _AM_NOT_REDEEMED,
+        notes=("anchor: 'fund_flow' (asset-management-distinctive net-flow, non-structural) routes this "
+               "off a churn catalog.",
+               "OUTPUT additivity is measure-dependent: the cumulative net flow is an additive flow; a "
+               "trend is n/a; a redemption_pressure ratio is non-additive — the default carries the "
+               "additive flow (the safe pre-redemption signal, NOT the 'redeemed' label)."),
+    ),
+    # B12.2 — performance_vs_benchmark (relative performance dispersion drives outflows)
+    Template(
+        id="performance_vs_benchmark", family="relative_performance",
+        intent="Relative performance vs benchmark — active return / return dispersion of a fund vs its "
+               "benchmark index (measure=relative_return / return_dispersion / underperformance_flag); "
+               "underperformance vs benchmark drives outflows.",
+        needs=(Need("benchmark_col", "benchmark"), Need("te_col", "tracking_error", optional=True),
+               Need("nav_col", "nav", optional=True), Need("asof", "as_of_date"),
+               Need("entity", "fund")),
+        params={"window": (365, 180, 90),
+                "measure": ("relative_return", "return_dispersion", "underperformance_flag")},
+        aggregation="relative_performance", additivity="non_additive", explain="H",
+        use_cases=("redemption_risk", "fund_performance", "asset_management"),
+        pit=_AM_PIT_STATE,
+        degrade="no benchmark series -> SKIP (relative performance undefined).",
+        stage="3-redemption-risk",
+        eligibility=_AM_NOT_REDEEMED,
+        notes=("anchor: 'benchmark' (asset-management-distinctive INDEX — NOT the markets benchmark_rate "
+               "reference rate — non-structural) routes this off a churn catalog.",
+               "a relative return / dispersion — non-additive; compute per fund/share-class, never sum."),
+    ),
+    # B12.3 — share_class_flow_mix (flow mix across share classes / distribution)
+    Template(
+        id="share_class_flow_mix", family="distribution_mix",
+        intent="Share-class flow mix — how a fund's net flows split across share classes / distribution "
+               "(institutional vs retail vs platform) and how concentrated the mix is "
+               "(measure=institutional_flow_share / flow_hhi); a flighty distribution mix is run risk.",
+        needs=(Need("flow_col", "fund_flow"), Need("share_class", "share_class"),
+               Need("event_ts", "event_timestamp")),
+        params={"window": (90, 180, 365), "measure": ("institutional_flow_share", "flow_hhi")},
+        aggregation="share_class_flow_mix", additivity="non_additive", explain="M",
+        use_cases=("redemption_risk", "distribution", "asset_management"),
+        pit=_AM_PIT_TRAILING,
+        degrade="no share-class breakdown -> fund-level net flow only (no mix).",
+        stage="2-disengagement",
+        eligibility="single currency. " + _AM_NOT_REDEEMED,
+        notes=("anchor: 'fund_flow' (asset-management-distinctive flow, non-structural) routes this off a "
+               "churn catalog (share_class is an ENTITY concept — it would structurally bind any grain "
+               "column, so it cannot be the sole anchor).",
+               "a flow mix / concentration (share / HHI) — non-additive; the underlying flows are "
+               "additive."),
+    ),
+    # B12.4 — redemption_liquidity_coverage (open-ended-fund run-risk mismatch — from fund_flow)
+    Template(
+        id="redemption_liquidity_coverage", family="liquidity_coverage",
+        intent="Redemption liquidity coverage — liquid assets vs trailing / expected redemptions "
+               "(measure=coverage_ratio), or redemption velocity; a coverage mismatch is open-ended-fund "
+               "run risk. Built from fund_flow, NEVER 'redeemed'.",
+        needs=(Need("flow_col", "fund_flow"), Need("liquid_col", "monetary_stock", optional=True),
+               Need("asof", "as_of_date"), Need("event_ts", "event_timestamp", optional=True),
+               Need("entity", "fund")),
+        params={"window": (90, 30, 180), "measure": ("coverage_ratio", "redemption_velocity")},
+        aggregation="redemption_liquidity_coverage", additivity="non_additive", explain="M",
+        use_cases=("redemption_risk", "fund_liquidity", "asset_management"),
+        pit=_AM_PIT_STATE,
+        degrade="no liquid-asset base -> report the redemption velocity only (no coverage ratio).",
+        stage="3-redemption-risk",
+        eligibility="single currency. " + _AM_NOT_REDEEMED,
+        notes=("anchor: 'fund_flow' (asset-management-distinctive redemption flow, non-structural) routes "
+               "this off a churn catalog.",
+               "a coverage ratio / velocity — non-additive; the underlying redemption flow is additive."),
+    ),
+    # B12.5 — aum_stability (AUM level / trend / volatility — nav)
+    Template(
+        id="aum_stability", family="aum_stability",
+        intent="AUM stability — fund assets-under-management (NAV × units, or a fund AUM stock) level / "
+               "trend / volatility over the window (measure=aum_level / aum_trend / aum_volatility); an "
+               "unstable AUM base is redemption/liquidity risk.",
+        needs=(Need("nav_col", "nav"), Need("aum_col", "monetary_stock", optional=True),
+               Need("asof", "as_of_date"), Need("entity", "fund")),
+        params={"window": (365, 180, 90), "measure": ("aum_level", "aum_trend", "aum_volatility")},
+        aggregation="aum_stability", additivity="semi_additive", explain="M",
+        use_cases=("redemption_risk", "aum_stability", "asset_management"),
+        pit=_AM_PIT_STATE,
+        degrade="only a single NAV/AUM snapshot (no history) -> report the AUM level (no trend/vol).",
+        stage="1-invested",
+        eligibility="single currency; a fund AUM is a semi-additive STOCK (sum across funds, latest over "
+                    "time — never sum across dates). " + _AM_NOT_REDEEMED,
+        notes=("anchor: 'nav' (asset-management-distinctive net asset value, non-structural) routes this "
+               "off a churn catalog.",
+               "OUTPUT additivity is measure-dependent: a fund AUM level is a semi-additive stock; a "
+               "trend is n/a; volatility is non-additive — the default carries the semi-additive AUM "
+               "stock."),
+    ),
+    # ── Mandate / portfolio compliance (§B12 — NEAR-LABEL breach paths) ──────────────────────────────
+    # B12.6 — tracking_error_breach_proximity (active-risk vs the TE limit — NEAR-LABEL)
+    Template(
+        id="tracking_error_breach_proximity", family="tracking_error",
+        intent="Tracking-error breach proximity — the active-risk (tracking_error) level and its "
+               "proximity to the mandate's tracking-error limit (measure=te_level / breach_proximity / "
+               "breach_flag); a rising TE toward its cap borders a mandate breach.",
+        needs=(Need("te_col", "tracking_error"), Need("asof", "as_of_date"), Need("entity", "fund")),
+        params={"window": (365, 180, 90), "measure": ("te_level", "breach_proximity", "breach_flag")},
+        aggregation="tracking_error", additivity="non_additive", explain="H",
+        use_cases=("mandate_compliance", "tracking_error", "asset_management"),
+        pit=_AM_PIT_STATE,
+        stage="3-redemption-risk",
+        near_label=True,
+        eligibility=_AM_NEAR_LABEL_PREFIX + "a tracking-error-limit breach borders the mandate / IMA "
+                    "breach label. " + _AM_NOT_REDEEMED,
+        notes=("anchor: 'tracking_error' (asset-management-distinctive active risk, non-structural) "
+               "routes this off a churn catalog.",
+               "OUTPUT additivity is measure-dependent: te_level / breach_proximity are non-additive; "
+               "breach_flag is n/a — the default carries the non-additive case.",
+               "borders the tracking-error/mandate breach label — observe strictly pre-breach."),
+    ),
+    # B12.7 — mandate_breach_proximity (pre-breach headroom to an IMA limit — NEAR-LABEL)
+    Template(
+        id="mandate_breach_proximity", family="mandate_compliance",
+        intent="Mandate-breach proximity — the headroom to a fund's investment-mandate (IMA) limit "
+               "(sector/issuer/rating/concentration) and its trend (measure=headroom / breach_proximity "
+               "/ breached_flag); a shrinking headroom is a pre-breach compliance signal.",
+        needs=(Need("mandate_col", "mandate"), Need("asof", "as_of_date"), Need("entity", "fund")),
+        params={"window": (90, 180, 365), "measure": ("headroom", "breach_proximity", "breached_flag")},
+        aggregation="mandate_headroom", additivity="non_additive", explain="H",
+        use_cases=("mandate_compliance", "portfolio_risk", "asset_management"),
+        pit=_AM_PIT_STATE,
+        stage="mandate-compliance",
+        near_label=True,
+        eligibility=_AM_NEAR_LABEL_PREFIX + "a shrinking headroom borders the mandate-breach label. "
+                    + _AM_NOT_REDEEMED,
+        notes=("anchor: 'mandate' (asset-management-distinctive IMA — the INVESTMENT mandate, NOT a "
+               "PAYMENT mandate like direct_debit/standing_order — non-structural) routes this off a "
+               "churn catalog.",
+               "OUTPUT additivity is measure-dependent: headroom / breach_proximity are non-additive; "
+               "breached_flag is n/a — the default carries the non-additive case.",
+               "borders the mandate-breach label — observe strictly pre-breach."),
+    ),
+    # B12.8 — expense_ratio_competitiveness (fee competitiveness vs peers)
+    Template(
+        id="expense_ratio_competitiveness", family="fee_competitiveness",
+        intent="Expense-ratio competitiveness — the fund's expense ratio (TER/OCF) level, its trend, or "
+               "its gap vs a peer group (measure=ter_level / ter_trend / ter_vs_peer); an uncompetitive "
+               "TER drives redemptions.",
+        needs=(Need("ter_col", "expense_ratio"), Need("peer", "peer_group", optional=True),
+               Need("asof", "as_of_date"), Need("entity", "fund")),
+        params={"window": (365, 180, 90), "measure": ("ter_level", "ter_trend", "ter_vs_peer")},
+        aggregation="expense_ratio", additivity="non_additive", explain="H",
+        use_cases=("redemption_risk", "pricing", "asset_management"),
+        pit=_AM_PIT_STATE,
+        degrade="no peer group -> report the TER level / trend only (no peer gap).",
+        stage="2-disengagement",
+        eligibility=_AM_NOT_REDEEMED,
+        notes=("anchor: 'expense_ratio' (asset-management-distinctive TER/OCF, non-structural) routes "
+               "this off a churn catalog.",
+               "a TER ratio (or its trend / peer-gap) — non-additive; never sum across funds."),
+    ),
+)
+
+
+# ──────────────────────────────────────────────────────────────────────────────────────────────────
 # The full template REGISTRY — every family, in author order. Future template passes EXTEND this tuple;
 # gate1 grounds ALL_TEMPLATES so a family surfaces only where its distinctive concepts exist in the
 # catalog (grounding is the router). RETAIL_CHURN_TEMPLATES stays a standalone name because gate1 + the
@@ -2097,7 +2749,8 @@ PAYMENTS_TEMPLATES: tuple[Template, ...] = (
 # ──────────────────────────────────────────────────────────────────────────────────────────────────
 ALL_TEMPLATES: tuple[Template, ...] = (
     RETAIL_CHURN_TEMPLATES + CREDIT_RISK_TEMPLATES + FRAUD_TEMPLATES + AML_TEMPLATES
-    + COLLECTIONS_TEMPLATES + DEPOSITS_TEMPLATES + PAYMENTS_TEMPLATES)
+    + COLLECTIONS_TEMPLATES + DEPOSITS_TEMPLATES + PAYMENTS_TEMPLATES
+    + MARKETS_TEMPLATES + CUSTODY_TEMPLATES + ASSET_MGMT_TEMPLATES)
 
 
 def _validate_family(templates: tuple[Template, ...], label: str, seen_ids: set[str]) -> None:
@@ -2130,6 +2783,9 @@ def _validate_registry() -> None:
     _validate_family(COLLECTIONS_TEMPLATES, "COLLECTIONS_TEMPLATES", set())
     _validate_family(DEPOSITS_TEMPLATES, "DEPOSITS_TEMPLATES", set())
     _validate_family(PAYMENTS_TEMPLATES, "PAYMENTS_TEMPLATES", set())
+    _validate_family(MARKETS_TEMPLATES, "MARKETS_TEMPLATES", set())
+    _validate_family(CUSTODY_TEMPLATES, "CUSTODY_TEMPLATES", set())
+    _validate_family(ASSET_MGMT_TEMPLATES, "ASSET_MGMT_TEMPLATES", set())
     _validate_family(ALL_TEMPLATES, "ALL_TEMPLATES", set())
 
 

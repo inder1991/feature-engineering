@@ -332,6 +332,10 @@ Chinese-wall aware. Time-scale: intraday→daily.
 - **Counterparty-risk funnel (mirrors credit):** `HEALTHY → MARGIN PRESSURE (rising PFE, margin calls) →
   DISPUTE (collateral shortfall) → CLOSE-OUT ⚠ (default)`. Trap: close-out ≈ the default label.
 - **Settlement/execution:** `settlement_fail_rate`; `slippage` / `market_impact` (TCA); `fill_ratio`.
+> **Full parametric set:** the 9 grounded recipes covering the market-risk measures (VaR/ES, greeks,
+> notional netting, book/desk concentration, benchmark basis, trading-limit utilisation) and the
+> counterparty-risk funnel (EPE/PFE trend, margin-call intensity, counterparty-deterioration EWI) are in
+> **§PART J** ↔ `templates.py::MARKETS_TEMPLATES`.
 
 ## B9. Insurance / bancassurance — the LAPSE funnel + the CLAIMS-FRAUD journey
 Two journeys. **Health/mortality data = special-category** → heavy consent, restricted use.
@@ -356,6 +360,10 @@ Operational / asset-servicing; institutional; operational-risk governed. Less PI
   (missing an election = client loss).
 - **Securities lending:** `sec_lending_utilisation` / `specials_demand`, `recall_risk`.
 - **Fund admin / NAV:** `nav_error_rate`, `pricing_exception_count`, `reconciliation_break_rate`.
+> **Full parametric set:** the 8 grounded recipes covering the settlement-fail funnel (matching-break,
+> pre-settlement aging, fail rate, fail-ageing) built from PRE-fail signals (never `settlement_fail`),
+> plus corporate-action complexity, securities-lending utilisation, NAV-strike timeliness and
+> custody-holding dynamics are in **§PART J** ↔ `templates.py::CUSTODY_TEMPLATES`.
 
 ## B11. ESG / sustainable finance — scoring + the TRANSITION-RISK journey
 **ESG data is often EXTERNAL** (ratings vendors, emissions disclosures) — availability/quality caveats;
@@ -381,6 +389,11 @@ open-ended fund liquidity.
 - **Mandate / portfolio risk:** `mandate_breach_proximity` (drift toward a sector/issuer/rating limit),
   `style_drift` (portfolio vs stated style), `tracking_error`, `fund_liquidity_coverage` (liquid assets ÷
   expected redemptions — the run-risk mismatch), `concentration_vs_limit`.
+> **Full parametric set:** the 8 grounded recipes covering the redemption funnel (net fund-flow trend,
+> relative performance, share-class flow mix, redemption liquidity coverage, AUM stability) built from
+> `fund_flow`/performance PRE-signals (never `redeemed`), plus the mandate-compliance near-label pair
+> (tracking-error + mandate breach proximity) and expense-ratio competitiveness are in **§PART J** ↔
+> `templates.py::ASSET_MGMT_TEMPLATES`.
 
 ## B13. Islamic banking — conventional funnels + the SHARIA-COMPLIANCE overlay
 Most B1–B7 funnels APPLY (churn/credit/deposits), reframed: **profit-rate, not interest**. The
@@ -1094,3 +1107,192 @@ POST-default pair) `recovery_rate`, `write_off_severity`. Routing + safety are v
 `test_templates_core3.py`: each family grounds its whole domain-shaped catalog, the engine NEVER binds a
 leakage anchor or a protected column, near-label recipes carry `near_label=True`, and none of the three
 families grounds anything on the churn catalog (`ALL_TEMPLATES` on churn still yields exactly the churn lens).
+
+
+# PART J — Appendix: markets + custody + asset-management full parametric sets (implements §B8 + §B10 + §B12)
+
+The §B8 **markets/trading risk families + counterparty-risk funnel** (9 recipes, `templates.py::
+MARKETS_TEMPLATES`), the §B10 **custody settlement-fail funnel** (8 recipes, `templates.py::
+CUSTODY_TEMPLATES`) and the §B12 **asset-management redemption funnel + mandate compliance** (8 recipes,
+`templates.py::ASSET_MGMT_TEMPLATES`) authored to Part-F/G/H/I depth — the recipes the template engine
+grounds; all three families join `ALL_TEMPLATES` (now the **ten-family** union), which gate1 grounds. This
+begins the BREADTH pass (core areas — churn · credit · fraud · AML · collections · deposits · payments —
+were completed at full parametric depth in §PART F–I). Each is groundable by concept-matching, safe-by-
+construction (PIT baked in), and carries a degrade path. Concept names match the taxonomy (§3).
+
+**Routing discipline (the load-bearing rule — the locked churn=churn-lens invariant).** Grounding is the
+router, so a family surfaces ONLY where its distinctive concepts exist. An *entity* concept (`instrument_id`,
+`book_id`, `netting_set_id`, `account_id`, `fund`, `share_class`) gets **structural `is_grain` credit** in the
+matcher — it would bind ANY grain column, cross-surfacing onto a plain churn catalog. So every recipe REQUIRES
+at least one domain-distinctive **NON-STRUCTURAL** concept that binds only by exact concept match:
+- **markets:** `var` / `expected_shortfall` / `pv01` / `dv01` / `implied_volatility` / `notional` /
+  `expected_exposure` / `potential_future_exposure` / `margin` / `limit` / `benchmark_rate` / `price` /
+  `watchlist_hit_flag`;
+- **custody:** `settlement_status` / `settlement_cycle` / `corporate_action` / `securities_loan` / `nav` /
+  `custody_holding` (NOT the `settlement_fail` label — a leakage anchor);
+- **asset-mgmt:** `fund_flow` / `benchmark` / `tracking_error` / `expense_ratio` / `mandate` / `nav` (NOT the
+  `redeemed` label — a leakage anchor).
+
+This holds the locked invariant, asserted by `test_templates_markets.py`: **`ALL_TEMPLATES` grounded on the
+churn `_CATALOG` yields EXACTLY the churn lens** (each new family grounds nothing there). No recipe ever
+`Need`s a leakage anchor (`default_flag` / `settlement_fail` / `redeemed` / `outcome_label`); the engine
+refuses them by construction.
+
+**Near-label / leakage discipline (safety by construction — CRITICAL for these funnels).** The two specialist
+funnels are built from PRE-outcome signals, never their outcome flag:
+- **settlement-fail prediction** is built from `settlement_status` (pending/failed HISTORY), `settlement_cycle`
+  (T+n length) and `corporate_action` complexity — NEVER `settlement_fail`. A trailing fail RATE and (harder)
+  the POST-fail `fail_ageing_buckets` BORDER the fail outcome → `near_label=True` + a ⚠ note (observe strictly
+  pre-outcome / on prior instructions). PIT-CRITICAL: a fail is not knowable until T+n — honour `system_time`.
+- **redemption** is built from `fund_flow` / relative performance / `tracking_error` — NEVER `redeemed`. The
+  mandate-compliance tail (`tracking_error_breach_proximity`, `mandate_breach_proximity`) BORDERS the
+  mandate/IMA-breach label → `near_label=True` + a ⚠ note (observe strictly pre-breach).
+- **counterparty-risk funnel** (markets) mirrors credit; a counterparty `watchlist_hit_flag`
+  (`counterparty_deterioration_ewi`) borders the close-out/default tail → `near_label=True`.
+
+The market-risk MEASURES, the pre-fail custody signals and the flow/performance AM signals are NOT near-label
+(they do not border their funnel outcome). Fair-lending: no recipe binds a `protected_attribute`
+(engine-enforced). Markets data is MNPI / Chinese-wall aware (high model-risk tier for VaR/XVA).
+
+## Markets / trading — risk families + the COUNTERPARTY-RISK funnel (`MARKETS_TEMPLATES`)
+
+**Grounding requirements — a "trading-ready" catalog needs:** `instrument_id` (grain) + `book_id` /
+`netting_set_id` / `counterparty_id` / `desk_id` entities · `as_of_date` · the risk anchors `var` /
+`expected_shortfall` · `pv01` / `dv01` / `implied_volatility` · `notional` / `position_direction` ·
+`expected_exposure` / `potential_future_exposure` · `margin` · `limit` · `benchmark_rate` / `price` ·
+`watchlist_hit_flag` / `adverse_media_flag` · plus the `default_flag` target (leakage anchor — never a
+feature input). Additivity: VaR/ES/greeks/PFE non_additive (a quantile/greek — never summed across
+books/netting sets), notional semi_additive, counts additive.
+
+### Market-risk measures — point-in-time risk families
+1. **`position_var_risk_{window}`** — VaR / expected-shortfall level or trend for a book (`measure=level/
+   trend`). **needs:** `var` · `expected_shortfall` (opt) · `as_of_date` · `book_id`. **add:** non_additive.
+   **explain:** M. *anchor `var`.*
+2. **`greek_sensitivity_exposure_{window}`** — PV01/DV01/vega greek exposure level or trend (`greek∈{pv01,
+   dv01,vega}`). **needs:** `pv01` · `dv01` (opt) · `implied_volatility` (opt) · `as_of_date` · `book_id`.
+   **add:** non_additive. **explain:** H. *anchor `pv01` — position-additive only within one risk factor.*
+3. **`notional_netting_exposure_{window}`** — gross vs net notional by netting set (`measure=gross_notional/
+   net_notional`). **needs:** `notional` · `position_direction` (opt) · `as_of_date` · `netting_set_id`.
+   **add:** semi_additive (gross-additive across positions, netted within a set, latest over time). **explain:** H.
+7. **`book_desk_concentration_{window}`** — HHI / top-share of notional exposure by book/desk (`measure=book_hhi/
+   top_book_share`). **needs:** `notional` · `desk_id` (opt) · `as_of_date` · `book_id`. **add:** non_additive.
+8. **`benchmark_basis_dislocation_{window}`** — spread of price/funding vs a reference `benchmark_rate` and its
+   trend (`measure=basis_level/basis_trend`). **needs:** `benchmark_rate` · `price` (opt) · `as_of_date` ·
+   `book_id`. **add:** non_additive. *distinct from the AM `benchmark` INDEX + the deposit deposit_beta use.*
+6. **`trading_limit_utilisation_{window}`** — used exposure (notional) vs a trading limit (`measure=utilisation/
+   headroom/breach_proximity`). **needs:** `limit` · `notional` (opt) · `as_of_date` · `book_id`. **add:**
+   non_additive (nested sub-limits never naively summed).
+
+### Counterparty-risk funnel (mirrors credit: MARGIN PRESSURE → DISPUTE → CLOSE-OUT ⚠)
+4. **`counterparty_exposure_trend_{window}`** — EPE / PFE exposure-profile trend (`measure=epe_trend/epe_level/
+   pfe_level`). **needs:** `expected_exposure` · `potential_future_exposure` (opt) · `as_of_date` ·
+   `netting_set_id`. **add:** non_additive (EE sub-additive, PFE a quantile — never summed across netting sets).
+   **explain:** M.
+5. **`margin_call_intensity_{window}`** — rate/count of VM/IM margin calls, or the posted-margin level
+   (`measure=call_intensity/call_count/im_level`). **needs:** `margin` · `event_timestamp` (opt) · `as_of_date`
+   · `netting_set_id`. **add:** non_additive (rate; count=additive; im=semi). **explain:** H.
+9. **`counterparty_deterioration_ewi_{window}`** ⚠ **near-label** — a counterparty credit-watchlist (or
+   adverse-media) hit + recency (`measure=watchlisted_flag/days_since_watchlist`). **needs:**
+   `watchlist_hit_flag` · `adverse_media_flag` (opt, pii) · `as_of_date` · `counterparty_id`. **add:** n/a.
+   **⚠ near-label:** watchlisting borders the close-out/default tail — observe strictly pre-close-out.
+
+## Custody & securities services — the SETTLEMENT-FAIL funnel (`CUSTODY_TEMPLATES`)
+
+**Grounding requirements — a "custody-ready" catalog needs:** `account_id` (grain) + `instrument_id` ·
+`as_of_date` · `event_timestamp` · `settlement_status` / `settlement_cycle` (the PRE-fail lifecycle) ·
+`corporate_action` · `record_date` / `pay_date` · `securities_loan` · `nav` · `custody_holding` · plus the
+`settlement_fail` target (leakage anchor — never a feature input). Additivity: rates non_additive, holdings
+semi_additive (stock), counts additive. **PIT-CRITICAL:** a fail is not knowable until T+n (`settlement_cycle`)
+— honour `system_time`.
+
+### PRE-SETTLEMENT — matching + inventory aging (pre-fail signals)
+1. **`matching_break_rate_{window}`** — trailing share of instructions UNMATCHED/mismatched at matching
+   (`measure=break_rate/break_count`). **needs:** `settlement_status` · `event_timestamp` · `account_id`.
+   **add:** non_additive (rate; count=additive). *concept sub: no matching_status concept — settlement_status
+   carries the unmatched value.*
+2. **`pre_settlement_aging_{window}`** — pending instructions aging vs their T+n `settlement_cycle`
+   (`measure=mean_pending_age/overdue_share`). **needs:** `settlement_cycle` · `settlement_status` (opt) ·
+   `event_timestamp` · `account_id`. **add:** n/a (duration; overdue_share=non-additive). *anchor `settlement_cycle`.*
+
+### SETTLEMENT DATE → FAIL ⚠ — the fail rate + fail-ageing (NEAR-LABEL; pre-fail history, never `settlement_fail`)
+3. **`settlement_fail_rate_{window}`** ⚠ **near-label** (the headline safety recipe) — trailing share of an
+   account's/counterparty's instructions that reached a FAILED `settlement_status` vs settled, from historical
+   status (a pre-fail predictor for a NEW instruction). **needs:** `settlement_status` · `settlement_cycle`
+   (opt) · `event_timestamp` · `account_id`. **add:** non_additive (rate; count=additive). **⚠ the
+   `settlement_fail` label is NEVER an input — the engine refuses the leakage anchor.**
+4. **`fail_ageing_buckets_{window}`** ⚠ **near-label** — how long already-FAILED instructions have aged
+   (`measure=aged_fail_share/mean_fail_age_days`), a POST-fail fail→buy-in tail signal. **needs:**
+   `settlement_status` · `settlement_cycle` (opt) · `event_timestamp` · `account_id`. **add:** non_additive
+   (share; age=n/a). **⚠ POST-fail** (like a collections post-charge-off signal) — observe on PRIOR/other
+   instructions for a fail-prediction model, never the target's own post-fail age.
+
+### ASSET-SERVICING — corporate actions, securities lending, NAV, custody holdings
+5. **`corporate_action_complexity_{window}`** — count of corporate-action events / a complexity /
+   elective-deadline-proximity score (`measure=ca_volume/complexity_score`). **needs:** `corporate_action` ·
+   `pay_date` (opt) · `event_timestamp` · `account_id`. **add:** additive (count; complexity=non-additive).
+6. **`sec_lending_utilisation_{window}`** — on-loan securities vs lendable inventory (`measure=utilisation/
+   on_loan_amount`). **needs:** `securities_loan` · `custody_holding` (opt) · `as_of_date` · `instrument_id`.
+   **add:** non_additive (ratio; on_loan_amount=semi). **explain:** H.
+7. **`nav_strike_timeliness_{window}`** — NAV-strike exception / late rate, read against the record/pay PIT
+   (`measure=exception_rate/late_share`). **needs:** `nav` · `record_date` (opt) · `pay_date` (opt) ·
+   `event_timestamp` · `account_id`. **add:** non_additive (rate).
+8. **`custody_holding_dynamics_{window}`** — AUC holding level/trend, turnover or concentration
+   (`measure=holding_trend/turnover/concentration_hhi`). **needs:** `custody_holding` · `instrument_id` (opt) ·
+   `as_of_date` · `account_id`. **add:** semi_additive (holding stock; turnover/concentration=non-additive).
+
+## Asset management (buy-side) — the REDEMPTION funnel + mandate compliance (`ASSET_MGMT_TEMPLATES`)
+
+**Grounding requirements — an "asset-mgmt-ready" catalog needs:** `fund` (grain) + `share_class` ·
+`as_of_date` · `event_timestamp` · `fund_flow` (net subs − redemptions) · `benchmark` (a performance INDEX) ·
+`tracking_error` · `expense_ratio` · `nav` · a `monetary_stock` (AUM / liquid assets) · `mandate` (the IMA) ·
+`peer_group` · plus the `redeemed` target (leakage anchor — never a feature input). Additivity: flows additive,
+ratios/dispersion non_additive, AUM semi_additive. Distinguish `mandate` (the INVESTMENT mandate) from a
+PAYMENT mandate (`direct_debit`/`standing_order`), and `benchmark` (an INDEX) from `benchmark_rate` (a rate).
+
+### Investor-flow / redemption funnel (mirrors churn — built from `fund_flow`, NEVER `redeemed`)
+1. **`net_fund_flow_trend_{window}`** — cumulative net flow / its trend / a redemption-pressure ratio
+   (`measure=cumulative_net_flow/net_flow_trend/redemption_pressure`). **needs:** `fund_flow` ·
+   `event_timestamp` · `fund`. **add:** additive (flow; trend=n/a; pressure=non-additive). *the safe
+   pre-redemption signal, NOT the `redeemed` label.*
+2. **`performance_vs_benchmark_{window}`** — relative return / return dispersion vs the `benchmark` index
+   (`measure=relative_return/return_dispersion/underperformance_flag`). **needs:** `benchmark` ·
+   `tracking_error` (opt) · `nav` (opt) · `as_of_date` · `fund`. **add:** non_additive. **explain:** H.
+3. **`share_class_flow_mix_{window}`** — flow split/concentration across share classes / distribution
+   (`measure=institutional_flow_share/flow_hhi`). **needs:** `fund_flow` · `share_class` · `event_timestamp`.
+   **add:** non_additive (mix; underlying flows additive). *anchor `fund_flow` (share_class is an entity — not
+   the sole anchor).*
+4. **`redemption_liquidity_coverage_{window}`** — liquid assets vs trailing/expected redemptions, or
+   redemption velocity (`measure=coverage_ratio/redemption_velocity`). **needs:** `fund_flow` ·
+   `monetary_stock` (opt) · `as_of_date` · `event_timestamp` (opt) · `fund`. **add:** non_additive.
+5. **`aum_stability_{window}`** — fund AUM level / trend / volatility (`measure=aum_level/aum_trend/
+   aum_volatility`). **needs:** `nav` · `monetary_stock` (opt AUM) · `as_of_date` · `fund`. **add:**
+   semi_additive (AUM stock; trend=n/a; volatility=non-additive).
+
+### Mandate / portfolio compliance (⚠ near-label breach paths)
+6. **`tracking_error_breach_proximity_{window}`** ⚠ **near-label** — active-risk (`tracking_error`) level +
+   proximity to the mandate's TE limit (`measure=te_level/breach_proximity/breach_flag`). **needs:**
+   `tracking_error` · `as_of_date` · `fund`. **add:** non_additive (flag=n/a). **⚠ near-label:** a TE-limit
+   breach borders the mandate/IMA-breach label — observe strictly pre-breach.
+7. **`mandate_breach_proximity_{window}`** ⚠ **near-label** — headroom to an IMA limit
+   (sector/issuer/rating/concentration) + trend (`measure=headroom/breach_proximity/breached_flag`). **needs:**
+   `mandate` · `as_of_date` · `fund`. **add:** non_additive (flag=n/a). **⚠ near-label:** a shrinking headroom
+   borders the mandate-breach label — observe strictly pre-breach.
+8. **`expense_ratio_competitiveness_{window}`** — TER/OCF level / trend / peer gap (`measure=ter_level/ter_trend/
+   ter_vs_peer`). **needs:** `expense_ratio` · `peer_group` (opt) · `as_of_date` · `fund`. **add:** non_additive.
+
+**Concept substitutions (vs the §B8/§B10/§B12 designs).** None invented — every `Need` binds a real §3
+concept. Noted on each template: (a) custody has no *matching_status* concept → `matching_break_rate` reads the
+unmatched value of `settlement_status`; (b) markets `benchmark_basis_dislocation` uses `benchmark_rate` (the
+reference INTEREST rate), distinct from the AM `benchmark` INDEX; (c) the settlement-fail funnel is built from
+`settlement_status`/`settlement_cycle` PRE-fail signals — the `settlement_fail` label is never a `Need`; (d) the
+redemption funnel is built from `fund_flow`/performance PRE-signals — the `redeemed` label is never a `Need`.
+
+**Build note (B8/B10/B12).** These 25 map 1:1 to the `templates.py` model exactly like §PART F–I — `needs`→
+grounding contract, `params`→parameter schema, `pit`→trailing-window/state guard, `degrade`→fallback,
+`near_label`→the 3-part leakage flag. The near-label subset the golden set must exercise:
+`counterparty_deterioration_ewi` (markets), `settlement_fail_rate` + `fail_ageing_buckets` (custody), and
+`tracking_error_breach_proximity` + `mandate_breach_proximity` (asset-mgmt). Routing + safety are verified by
+`test_templates_markets.py`: each family grounds its whole domain-shaped catalog, the engine NEVER binds a
+leakage anchor (headline: settlement-fail prediction never reads `settlement_fail`; redemption never reads
+`redeemed`) or a protected column, near-label recipes carry `near_label=True`, and none of the three families
+grounds anything on the churn catalog (`ALL_TEMPLATES` on churn still yields exactly the churn lens).
