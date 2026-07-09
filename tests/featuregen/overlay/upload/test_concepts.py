@@ -131,7 +131,7 @@ def test_registry_is_meaningfully_expanded():
     allowed_groups = {
         "monetary", "identifier", "temporal", "quantity_risk", "categorical", "geographic", "flag",
         "sensitive", "text", "label", "behavioural", "network", "bitemporal", "currency",
-        "eligibility", "regulatory_capital", "accounting", "esg",
+        "eligibility", "regulatory_capital", "accounting", "esg", "crypto",
     }
     assert {c.group for c in CONCEPT_REGISTRY.values()} <= allowed_groups
 
@@ -160,3 +160,96 @@ def test_gap_review_phase1_fixes():
     for c in ("direct_debit", "standing_order", "beneficiary_name", "beneficiary_bank",
               "debit_credit_indicator"):
         assert concept(c) is not None, c
+
+
+def test_gap_review_phase2_additive_expansion():
+    # ADDITIVE Phase-2 growth: sample one concept from each new cluster (each must ground).
+    cluster_samples = [
+        # wholesale / markets
+        "limit", "limit_type", "covenant", "collateral_type", "lien_seniority", "netting_set_id",
+        "margin", "syndication_share", "lcr", "nsfr", "hqla", "pv01", "dv01", "repricing_gap",
+        "ftp_rate", "invoice_id", "implied_volatility", "position_direction", "expected_exposure",
+        "potential_future_exposure", "expected_shortfall",
+        # risk & credit
+        "macro_variable", "scenario_id", "scenario_weight", "recovery_amount", "write_off_amount",
+        "cost_to_collect", "bureau_score", "bureau_inquiry", "trade_line", "sicr_flag",
+        "delinquency_bucket", "exposure_class", "customer_risk_rating", "expected_loss",
+        "lifetime_pd", "effective_maturity", "npe_flag", "watchlist_hit_flag", "adverse_media_flag",
+        "collateral_value", "ownership_percentage", "model_tier",
+        # insurance / custody / asset-mgmt
+        "premium", "claim_reserve", "sum_assured", "surrender_value", "reinsurance_recoverable",
+        "mortality_morbidity", "nav", "settlement_status", "settlement_cycle", "corporate_action",
+        "record_date", "ex_date", "pay_date", "securities_loan", "custody_holding", "fund",
+        "share_class", "fund_flow", "mandate", "benchmark", "tracking_error", "expense_ratio",
+        # islamic / esg / payments
+        "profit_rate", "profit_share_ratio", "purification_amount", "prohibited_activity_exposure",
+        "sukuk", "takaful_contribution", "scope_1_emissions", "scope_2_emissions",
+        "scope_3_emissions", "financed_emissions", "taxonomy_alignment", "emissions_data_quality",
+        "physical_hazard_score", "transition_alignment", "sll_kpi", "payment_rail", "scheme",
+        "interchange", "merchant_discount_rate", "corridor", "settlement_finality", "nostro_vostro",
+        "iso20022_purpose_code",
+        # cross-cutting
+        "reference_data", "model_output", "data_quality_flag", "source_system", "segment",
+        "peer_group", "scheduled_amount", "unit_of_measure", "vulnerability_flag", "household_id",
+        "portfolio_id", "book_id", "desk_id", "bureau_provenance", "collateral_id", "policy_id",
+        "claim_id", "case_id", "alert_id", "campaign_id", "relationship_manager_id", "gl_account",
+        "obligor_id", "guarantor_id",
+        # specialist near-labels
+        "lapsed", "surrendered", "settlement_fail", "redeemed",
+        # still-missing areas
+        "regulatory_report_line", "anacredit_attribute", "finrep_corep_line",
+        "mifir_transaction_report", "emir_report", "fatca_crs_classification", "consent_token",
+        "tpp_id", "aisp_pisp_flag", "api_call_event", "digital_asset", "wallet_address",
+        "stablecoin", "on_chain_txn", "cbdc", "tranche", "spv_id", "waterfall_position",
+        "credit_enhancement", "contribution", "annuity_factor", "vesting", "decumulation",
+        "loss_event", "loss_amount", "risk_control_id", "near_miss_flag", "withholding_amount",
+        "tax_lot", "taxable_flag", "alternative_data", "thin_file_flag",
+        "cashflow_underwriting_signal", "tlac_mrel", "wholesale_funding", "resolution_group",
+        "complaint_event", "redress_amount", "root_cause_code", "swift_message_type",
+        "nested_correspondent_flag", "biodiversity_impact", "deforestation_flag",
+    ]
+    for name in cluster_samples:
+        assert concept(name) is not None, name
+
+    # limit is a CEILING, not a balance: not naively additive, and NOT is_a monetary_stock (§B/§E).
+    lim = concept("limit")
+    assert lim.additivity != "additive"
+    assert lim.is_a is None
+
+    # premium: the written-vs-earned additivity trap must be annotated on the concept.
+    pdesc = concept("premium").description.lower()
+    assert "written" in pdesc and "earned" in pdesc
+
+    # ESG emissions: the cross-scope / cross-entity double-count trap is annotated.
+    assert "double-count" in concept("scope_3_emissions").description.lower()
+
+    # vulnerability_flag is sensitive (FCA Consumer Duty) so the read-scope/eligibility gate can fire.
+    assert concept("vulnerability_flag").sensitivity != "public"
+
+    # New entity_links resolve (identifiers do not aggregate).
+    assert concept("netting_set_id").entity_link == "netting_set"
+    assert concept("household_id").entity_link == "household"
+    assert concept("obligor_id").entity_link == "obligor"
+    assert concept("netting_set_id").additivity == "n/a"
+
+    # Islamic profit_rate is deliberately NOT is_a monetary_rate (interest) — a compliance distinction.
+    assert concept("profit_rate").is_a is None
+    assert "interest" in concept("profit_rate").description.lower()
+
+    # Score lineage: an external bureau score is_a the abstract score concept.
+    assert concept("bureau_score").is_a == "score_probability"
+
+    # New group 'crypto' is used and stays within the controlled set (asserted elsewhere).
+    assert concept("digital_asset").group == "crypto"
+
+    # Specialist near-label outcomes are leakage anchors that generalise to outcome_label.
+    for nl in ("lapsed", "surrendered", "settlement_fail", "redeemed"):
+        assert concept(nl).leakage_anchor is True, nl
+        assert concept(nl).is_a == "outcome_label", nl
+
+
+def test_all_is_a_edges_resolve():
+    # Every is_a must point at a real concept (also enforced at import by _validate_registry).
+    for c in CONCEPT_REGISTRY.values():
+        if c.is_a is not None:
+            assert c.is_a in CONCEPT_REGISTRY, (c.name, c.is_a)
