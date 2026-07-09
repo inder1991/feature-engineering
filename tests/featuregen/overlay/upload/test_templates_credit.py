@@ -29,7 +29,10 @@ from featuregen.overlay.upload.templates import (
     CREDIT_RISK_TEMPLATES,
     CUSTODY_TEMPLATES,
     DEPOSITS_TEMPLATES,
+    ESG_TEMPLATES,
     FRAUD_TEMPLATES,
+    INSURANCE_TEMPLATES,
+    ISLAMIC_TEMPLATES,
     MARKETS_TEMPLATES,
     PAYMENTS_TEMPLATES,
     RETAIL_CHURN_TEMPLATES,
@@ -218,22 +221,28 @@ def test_all_templates_registry_is_globally_unique():
     ids = [t.id for t in ALL_TEMPLATES]
     assert len(ids) == len(set(ids))                      # no duplicate id across families
     # ALL_TEMPLATES is the union of every authored family (churn + credit + fraud + AML + collections +
-    # deposits + payments + markets + custody + asset-mgmt — the full TEN-family union). The credit
-    # family stays globally id-unique within it; extending the registry must not collide an id.
+    # deposits + payments + markets + custody + asset-mgmt + insurance + islamic + esg — the full
+    # THIRTEEN-family union). The credit family stays globally id-unique within it; extending the
+    # registry must not collide an id.
     assert set(ids) == (
         {t.id for t in RETAIL_CHURN_TEMPLATES} | _ALL_CREDIT_IDS
         | {t.id for t in FRAUD_TEMPLATES} | {t.id for t in AML_TEMPLATES}
         | {t.id for t in COLLECTIONS_TEMPLATES} | {t.id for t in DEPOSITS_TEMPLATES}
         | {t.id for t in PAYMENTS_TEMPLATES} | {t.id for t in MARKETS_TEMPLATES}
-        | {t.id for t in CUSTODY_TEMPLATES} | {t.id for t in ASSET_MGMT_TEMPLATES})
+        | {t.id for t in CUSTODY_TEMPLATES} | {t.id for t in ASSET_MGMT_TEMPLATES}
+        | {t.id for t in INSURANCE_TEMPLATES} | {t.id for t in ISLAMIC_TEMPLATES}
+        | {t.id for t in ESG_TEMPLATES})
     assert len(ALL_TEMPLATES) == (
         len(RETAIL_CHURN_TEMPLATES) + len(CREDIT_RISK_TEMPLATES) + len(FRAUD_TEMPLATES)
         + len(AML_TEMPLATES) + len(COLLECTIONS_TEMPLATES) + len(DEPOSITS_TEMPLATES)
         + len(PAYMENTS_TEMPLATES) + len(MARKETS_TEMPLATES) + len(CUSTODY_TEMPLATES)
-        + len(ASSET_MGMT_TEMPLATES))
-    # the credit family collides no id with any other family in the full ten-family union.
+        + len(ASSET_MGMT_TEMPLATES) + len(INSURANCE_TEMPLATES) + len(ISLAMIC_TEMPLATES)
+        + len(ESG_TEMPLATES))
+    # the credit family collides no id with any other family in the full thirteen-family union.
     assert not (_ALL_CREDIT_IDS & (
         {t.id for t in FRAUD_TEMPLATES} | {t.id for t in AML_TEMPLATES}
         | {t.id for t in COLLECTIONS_TEMPLATES} | {t.id for t in DEPOSITS_TEMPLATES}
         | {t.id for t in PAYMENTS_TEMPLATES} | {t.id for t in MARKETS_TEMPLATES}
-        | {t.id for t in CUSTODY_TEMPLATES} | {t.id for t in ASSET_MGMT_TEMPLATES}))
+        | {t.id for t in CUSTODY_TEMPLATES} | {t.id for t in ASSET_MGMT_TEMPLATES}
+        | {t.id for t in INSURANCE_TEMPLATES} | {t.id for t in ISLAMIC_TEMPLATES}
+        | {t.id for t in ESG_TEMPLATES}))

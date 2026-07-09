@@ -349,6 +349,13 @@ Two journeys. **Health/mortality data = special-category** → heavy consent, re
   (NLP over the claim narrative — derived downstream, §D.8). Near-label: confirmed-fraud/repudiation.
 - **Underwriting:** `sum_assured_to_income`, `medical_disclosure_flag`, `mortality_morbidity_proxy`
   (age/health — **special-category, restricted**).
+> **Full parametric set:** the 10 grounded recipes covering the lapse/persistency funnel (premium-payment
+> irregularity, missed-premium streak, surrender-value trajectory, policy-loan utilisation) built from
+> PRE-lapse signals (never `lapsed`/`surrendered`), the claims journey (frequency/severity + the
+> near-label claims-fraud typology built from claim BEHAVIOUR, never `fraud_flag`), and reinsurance-
+> recoverable concentration, sum-assured adequacy, bancassurance cross-hold + mortality/morbidity loading
+> (the actuarial RATE — a health-STATUS special_category column stays engine-blocked) are in **§PART K** ↔
+> `templates.py::INSURANCE_TEMPLATES`.
 
 ## B10. Custody & securities services — the SETTLEMENT-FAIL funnel
 Operational / asset-servicing; institutional; operational-risk governed. Less PII.
@@ -377,6 +384,12 @@ credit proxy**.
   geography). eligibility: geographic — climate-legitimate.
 - **Greenwashing / SLL:** `green_proceeds_deviation` (green-bond proceeds not actually green),
   `sll_kpi_trend` / `sll_kpi_breach_flag` (triggers a margin ratchet), `esg_claim_vs_data_gap`.
+> **Full parametric set:** the 9 grounded recipes covering scoring/emissions (per-scope absolute+intensity
+> trend with the cross-scope double-count GUARD, carbon-intensity trajectory, PCAF financed-emissions
+> attribution [attributed → additive], emissions-data-quality reliance [provenance], Scope-3 value-chain
+> exposure with the cross-ENTITY double-count guard) and the transition-risk journey (taxonomy alignment,
+> transition/pathway gap, physical-hazard exposure [geographic is climate-legit, not a credit proxy],
+> SLL/KPI achievement) are in **§PART K** ↔ `templates.py::ESG_TEMPLATES`.
 
 ## B12. Asset management (buy-side) — the REDEMPTION funnel + mandate compliance
 Funds/mandates, driven by **relative performance + liquidity**. Regulatory: IMA/mandate compliance,
@@ -407,6 +420,12 @@ by the **Sharia board** (a domain-specific ratification, cf. Compliance).
   performance); Sukuk = bond features; Takaful = insurance (B9 lapse/claims).
 - **Deposit attrition:** `islamic_deposit_beta` (profit-rate sensitivity) + Sharia-compliance-concern
   churn (a distinctive driver). eligibility: Sharia non-compliance is a **HARD block**.
+> **Full parametric set:** the 8 grounded recipes covering the Sharia-compliance overlay (profit-rate
+> exposure, profit-sharing [Mudaraba/Musharaka] split behaviour, purification ratio, prohibited-activity
+> exposure share [near-label to the compliance-breach determination], Sukuk concentration, Takaful
+> contribution behaviour) and the conventional funnels reframed (Islamic deposit beta, Murabaha
+> installment behaviour) — **profit-rate, not interest** — are in **§PART K** ↔
+> `templates.py::ISLAMIC_TEMPLATES`.
 
 ## B14. Payments-as-a-business (beyond cards)
 RTP/instant, correspondent banking, cross-border/remittance, open banking, merchant acquiring.
@@ -1296,3 +1315,203 @@ grounding contract, `params`→parameter schema, `pit`→trailing-window/state g
 leakage anchor (headline: settlement-fail prediction never reads `settlement_fail`; redemption never reads
 `redeemed`) or a protected column, near-label recipes carry `near_label=True`, and none of the three families
 grounds anything on the churn catalog (`ALL_TEMPLATES` on churn still yields exactly the churn lens).
+
+# PART K — Appendix: insurance + islamic + esg full parametric sets (implements §B9 + §B13 + §B11)
+
+The §B9 **insurance/bancassurance lapse funnel + claims-fraud journey** (10 recipes, `templates.py::
+INSURANCE_TEMPLATES`), the §B13 **Islamic-banking conventional funnels + Sharia-compliance overlay** (8
+recipes, `templates.py::ISLAMIC_TEMPLATES`) and the §B11 **ESG / sustainable-finance scoring + transition-
+risk journey** (9 recipes, `templates.py::ESG_TEMPLATES`) authored to Part-F/G/H/I/J depth — the recipes the
+template engine grounds; all three families join `ALL_TEMPLATES` (now the **thirteen-family** union), which
+gate1 grounds. This continues the BREADTH pass alongside §PART J (markets · custody · asset-management). Each
+is groundable by concept-matching, safe-by-construction (PIT baked in), and carries a degrade path. Concept
+names match the taxonomy (§3).
+
+**Routing discipline (the load-bearing rule — the locked churn=churn-lens invariant).** Grounding is the
+router, so a family surfaces ONLY where its distinctive concepts exist. An *entity* concept (`policy_id`,
+`claim_id`, `customer_id`, `counterparty_id`) gets **structural `is_grain` credit** in the matcher — it would
+bind ANY grain column, cross-surfacing onto a plain churn catalog. So every recipe REQUIRES at least one
+domain-distinctive **NON-STRUCTURAL** concept that binds only by exact concept match:
+- **insurance:** `premium` / `surrender_value` / `claim_reserve` / `sum_assured` / `reinsurance_recoverable` /
+  `mortality_morbidity` (NOT the `lapsed` / `surrendered` labels — leakage anchors);
+- **islamic:** `profit_rate` / `profit_share_ratio` / `purification_amount` / `prohibited_activity_exposure` /
+  `sukuk` / `takaful_contribution` (`profit_rate` is deliberately NOT `is_a monetary_rate` — a Sharia +
+  modelling distinction, so it binds only by exact concept match);
+- **esg:** `scope_1/2/3_emissions` / `financed_emissions` / `carbon_intensity` / `taxonomy_alignment` /
+  `transition_alignment` / `physical_hazard_score` / `emissions_data_quality` / `sll_kpi`.
+
+This holds the locked invariant, asserted by `test_templates_specialist.py`: **`ALL_TEMPLATES` grounded on the
+churn `_CATALOG` yields EXACTLY the churn lens** (each new family grounds nothing there). No recipe ever
+`Need`s a leakage anchor (`lapsed` / `surrendered` / `fraud_flag` / `outcome_label`); the engine refuses them
+by construction.
+
+**Near-label / leakage discipline (safety by construction — CRITICAL for these funnels).**
+- **lapse / surrender prediction** is built from PRE-lapse signals (`premium` payment irregularity,
+  missed-premium streak, `surrender_value` trend, policy-loan utilisation) — NEVER `lapsed` / `surrendered`.
+  The **claims-fraud typology** (`claims_fraud_typology`) is built from claim BEHAVIOUR (early-claim /
+  over-servicing) and BORDERS the SIU/confirmed-fraud label → `near_label=True` + a ⚠ note (observe strictly
+  pre-label; `fraud_flag` is never an input).
+- **Islamic** reframes conventional funnels on **profit-rate, not interest**; the Sharia-compliance overlay's
+  `prohibited_activity_exposure_share` crossing a 5%/33% screen BORDERS the compliance-breach determination →
+  `near_label=True` + a ⚠ note (observe strictly pre-breach). Sharia compliance is a HARD eligibility gate.
+- **ESG** carries no near-label recipe (an ESG/climate signal does not border a customer outcome), but the
+  **additivity double-count GUARD** is load-bearing: GHG scopes are additive WITHIN a scope, a naive scope
+  1+2+3 total DOUBLE-COUNTS the value chain, Scope 3 is not summable across a PORTFOLIO (cross-entity
+  double-count), `financed_emissions` is PCAF-ATTRIBUTED (additive across the book), `carbon_intensity` is a
+  ratio (non_additive). Each recipe picks additivity honestly and annotates the trap in `notes`.
+
+Sensitivity: `mortality_morbidity` is the actuarial RATE (bindable, public) — an individual's health STATUS
+is `special_category` (the engine BLOCKS binding it). Fair-lending: no recipe binds a `protected_attribute`
+(engine-enforced); `geographic` in `physical_hazard_exposure` is CLIMATE-legitimate, NOT a credit proxy.
+
+## Insurance / bancassurance — the LAPSE funnel + CLAIMS-FRAUD journey (`INSURANCE_TEMPLATES`)
+
+**Grounding requirements — an "insurance-ready" catalog needs:** `policy_id` (grain) + `customer_id` ·
+`as_of_date` · `event_timestamp` · `effective_date` (inception) · `premium` · `surrender_value` ·
+`claim_reserve` · `sum_assured` · `reinsurance_recoverable` · `mortality_morbidity` · a `monetary_stock`
+(policy loan) · `scheduled_amount` (premium due) · `product_type` · a `monetary_flow` (income) · plus the
+`lapsed` / `surrendered` targets (leakage anchors — never a feature input). Additivity: premiums/claim-counts
+additive (mind the WRITTEN-vs-EARNED trap), reserves/sum-assured/recoverable semi_additive (stocks), rates/
+ratios non_additive.
+
+### LAPSE / persistency funnel (mirrors churn — PRE-lapse, never `lapsed`/`surrendered`)
+1. **`premium_payment_irregularity_{window}`** — premium inter-payment gap std / regularity
+   (`measure=gap_std/latest_gap/regularity`). **needs:** `premium` · `event_timestamp` · `policy_id`.
+   **add:** n/a. *anchor `premium`.*
+2. **`missed_premium_streak_{window}`** — consecutive short/missed premium periods vs the premium DUE
+   (`tolerance_pct`). **needs:** `premium` · `scheduled_amount` (opt) · `event_timestamp` · `policy_id`.
+   **add:** additive (a streak count). *concept sub: premium-due uses `scheduled_amount`.*
+3. **`surrender_value_trajectory_{window}`** — surrender-value trend + surrender-value-to-premium ratio
+   (`measure=surrender_ratio/value_trend/surrender_pressure`). **needs:** `surrender_value` · `premium` (opt) ·
+   `as_of_date` · `policy_id`. **add:** non_additive (ratio; raw value semi).
+4. **`policy_loan_utilisation_{window}`** — policy loan drawn ÷ surrender value (`measure=utilisation/
+   loan_trend`). **needs:** `surrender_value` · `monetary_stock` (loan) · `as_of_date` · `policy_id`. **add:**
+   non_additive. *concept sub: no policy_loan concept — the loan uses `monetary_stock`.*
+
+### CLAIMS journey — frequency/severity + the claims-fraud typology (behaviour, near-label ⚠)
+5. **`claims_frequency_severity_{window}`** — claim frequency / severity (incurred `claim_reserve`) / loss
+   ratio (`measure=frequency/severity/loss_ratio`). **needs:** `claim_reserve` · `premium` (opt) ·
+   `event_timestamp` · `policy_id`. **add:** additive (count; severity semi; loss_ratio non-additive).
+6. **`claims_fraud_typology_{window}`** ⚠ **near-label** — early-claim / over-servicing / claim-amount
+   anomaly from claim BEHAVIOUR (`measure=early_claim_flag/over_servicing_score/claim_amount_zscore`).
+   **needs:** `claim_reserve` · `effective_date` (inception) · `event_timestamp` · `policy_id`. **add:** n/a.
+   **⚠ near-label:** borders the SIU/confirmed-fraud label — never `fraud_flag`. **explain:** M.
+
+### REINSURANCE / UNDERWRITING / BANCASSURANCE
+7. **`reinsurance_recoverable_concentration_{window}`** — recoverable concentration HHI / recoverable share /
+   raw amount (`measure=concentration_hhi/recoverable_share/recoverable_amount`). **needs:**
+   `reinsurance_recoverable` · `claim_reserve` (opt) · `as_of_date` · `policy_id`. **add:** non_additive
+   (raw amount semi). **explain:** M.
+8. **`sum_assured_adequacy_{window}`** — sum assured ÷ an income/needs proxy / underinsurance flag / raw
+   exposure (`measure=adequacy_ratio/underinsurance_flag/sum_assured_amount`). **needs:** `sum_assured` ·
+   `monetary_flow` (income, opt) · `as_of_date` · `policy_id`. **add:** non_additive (raw semi). *income
+   SENSITIVE — flagged; concept sub: needs proxy uses `monetary_flow`.*
+9. **`bancassurance_cross_hold_{window}`** — count of premium-paying policies alongside banking products /
+   cross-hold flag / premium share (`measure=policy_count/cross_hold_flag/premium_share`). **needs:**
+   `premium` · `product_type` (opt) · `as_of_date` · `customer_id`. **add:** additive (count). *concept sub:
+   no product_holding concept — banking side uses `product_type`.*
+10. **`mortality_morbidity_loading_{window}`** — actuarial mortality/morbidity RATE level / underwriting
+    loading (`measure=rate_level/loading_factor`). **needs:** `mortality_morbidity` · `as_of_date` ·
+    `policy_id`. **add:** non_additive. **⚠ HEALTH-ADJACENT:** the RATE is bindable; a health-STATUS
+    `special_category` column is engine-blocked; consent/purpose eligibility on the underlying medical data.
+
+## Islamic banking — conventional funnels reframed + the SHARIA-COMPLIANCE overlay (`ISLAMIC_TEMPLATES`)
+
+**Grounding requirements — an "islamic-ready" catalog needs:** `customer_id` (grain) · `as_of_date` ·
+`event_timestamp` · `profit_rate` · `benchmark_rate` · `profit_share_ratio` · `purification_amount` ·
+`prohibited_activity_exposure` · `sukuk` · `takaful_contribution` · a `monetary_stock` (balance/holding) · a
+`monetary_flow` (income/paid) · `scheduled_amount` (installment due) · plus the `outcome_label` target
+(leakage anchor). Additivity: contributions/amounts additive, ratios/shares/rates non_additive, holdings/
+exposures semi_additive (stocks). **`profit_rate` is a PROFIT rate, NOT interest (riba).**
+
+### SHARIA-COMPLIANCE overlay
+1. **`profit_rate_exposure_{window}`** — profit-rate level / spread vs a benchmark / trend
+   (`measure=rate_level/benchmark_spread/trend`). **needs:** `profit_rate` · `benchmark_rate` (opt) ·
+   `as_of_date` · `customer_id`. **add:** non_additive. *anchor `profit_rate` — not `is_a monetary_rate`.*
+2. **`profit_sharing_split_behaviour_{window}`** — Mudaraba/Musharaka PSR level + realised-profit volatility
+   (`measure=psr_level/psr_volatility`). **needs:** `profit_share_ratio` · `as_of_date` · `customer_id`.
+   **add:** non_additive.
+3. **`purification_ratio_{window}`** — non-compliant income to purify ÷ income / raw amount
+   (`measure=purification_ratio/purification_amount`). **needs:** `purification_amount` · `monetary_flow`
+   (income, opt) · `event_timestamp` · `customer_id`. **add:** non_additive (raw amount additive).
+4. **`prohibited_activity_exposure_share_{window}`** ⚠ **near-label** — haram-sector exposure share /
+   screen-breach flag (5%/33%) / raw exposure (`measure=exposure_share/breach_flag/exposure_amount`).
+   **needs:** `prohibited_activity_exposure` · `monetary_stock` (opt) · `as_of_date` · `customer_id`.
+   **add:** non_additive (raw semi). **⚠ near-label:** borders the compliance-breach determination.
+5. **`sukuk_concentration_{window}`** — Sukuk holding concentration HHI / share / amount
+   (`measure=concentration_hhi/holding_share/holding_amount`). **needs:** `sukuk` · `monetary_stock` (opt) ·
+   `as_of_date` · `customer_id`. **add:** non_additive (raw semi). *a Sukuk is asset-backed, NOT a bond.*
+6. **`takaful_contribution_behaviour_{window}`** — cumulative Takaful contribution / regularity / payment gap
+   (`measure=cumulative_contribution/contribution_regularity/payment_gap`). **needs:** `takaful_contribution`
+   · `event_timestamp` · `customer_id`. **add:** additive (a tabarru' donation, NOT interest/premium).
+
+### CONVENTIONAL funnels reframed (profit-rate, not interest)
+7. **`islamic_deposit_beta_{window}`** — profit-rate sensitivity of a Sharia deposit (`measure=rate_beta/
+   balance_beta`). **needs:** `profit_rate` · `monetary_stock` (balance) · `as_of_date` · `customer_id`.
+   **add:** non_additive. *the profit-rate analogue of the deposits `deposit_beta`.*
+8. **`murabaha_installment_behaviour_{window}`** — Murabaha (disclosed profit_rate) missed-installment count /
+   payment ratio (`tolerance_pct`; `measure=missed_installment_count/payment_ratio`). **needs:** `profit_rate`
+   · `scheduled_amount` (opt) · `monetary_flow` (paid) · `event_timestamp` · `customer_id`. **add:** additive
+   (count). *the Islamic analogue of the credit-B2 repayment signal.*
+
+## ESG / sustainable finance — SCORING + the TRANSITION-RISK journey (`ESG_TEMPLATES`)
+
+**Grounding requirements — an "esg-ready" catalog needs:** `counterparty_id` (grain) · `as_of_date` ·
+`scope_1/2/3_emissions` · `financed_emissions` · `carbon_intensity` · `emissions_data_quality` ·
+`taxonomy_alignment` · `transition_alignment` · `physical_hazard_score` · `sll_kpi` · `geographic` (climate-
+legit) · a `monetary_stock` (exposure) · plus the `outcome_label` target (leakage anchor). **Additivity GUARD:**
+per-scope emissions additive WITHIN a scope (never a naive scope 1+2+3 total — value-chain double-count; Scope
+3 not summable across a PORTFOLIO — cross-entity double-count); `financed_emissions` PCAF-ATTRIBUTED (additive
+across the book); `carbon_intensity` a ratio (non_additive).
+
+### SCORING / EMISSIONS — absolute & intensity by scope (the additivity double-count guard)
+1. **`emissions_trend_by_scope_{window}`** — per-scope absolute level / trend or a carbon-intensity trend
+   (`measure=absolute_level/absolute_trend/intensity_trend`). **needs:** `scope_1_emissions` ·
+   `scope_2_emissions` (opt) · `scope_3_emissions` (opt) · `carbon_intensity` (opt) · `as_of_date` ·
+   `counterparty_id`. **add:** additive WITHIN a scope (intensity non-additive). **⚠ never a naive cross-scope
+   sum.** **explain:** H.
+2. **`carbon_intensity_trajectory_{window}`** — emissions ÷ revenue level / trend (`measure=level/trend`).
+   **needs:** `carbon_intensity` · `as_of_date` · `counterparty_id`. **add:** non_additive (a ratio).
+3. **`financed_emissions_attribution_{window}`** — PCAF financed emissions absolute / intensity / trend
+   (`measure=absolute/intensity/trend`). **needs:** `financed_emissions` · `monetary_stock` (exposure, opt) ·
+   `as_of_date` · `counterparty_id`. **add:** additive (attributed — avoids the cross-entity double-count).
+4. **`emissions_data_quality_reliance_{window}`** — PCAF data-quality score / estimated-share provenance
+   (`measure=avg_data_quality/estimated_share`). **needs:** `emissions_data_quality` · `as_of_date` ·
+   `counterparty_id`. **add:** non_additive (ordinal). *high estimated-share = low confidence.*
+9. **`scope3_value_chain_exposure_{window}`** — Scope-3 (15-category) absolute / trend, the ESTIMATED tail
+   (`measure=absolute/trend`). **needs:** `scope_3_emissions` · `emissions_data_quality` (opt) · `as_of_date` ·
+   `counterparty_id`. **add:** additive WITHIN one firm; **NOT summable across a PORTFOLIO** (cross-entity
+   double-count — use `financed_emissions`) and never summed with Scope 1/2. **explain:** M.
+
+### TRANSITION-RISK journey (ALIGNED → LAGGING → HIGH-RISK → STRANDED)
+5. **`taxonomy_alignment_share_{window}`** — EU-Taxonomy aligned / eligible share / trend
+   (`measure=aligned_share/eligible_share/trend`). **needs:** `taxonomy_alignment` · `as_of_date` ·
+   `counterparty_id`. **add:** non_additive (a ratio).
+6. **`transition_alignment_gap_{window}`** — net-zero pathway gap / implied temp rise level / trend
+   (`measure=alignment_level/pathway_gap/trend`). **needs:** `transition_alignment` · `as_of_date` ·
+   `counterparty_id`. **add:** non_additive.
+7. **`physical_hazard_exposure_{window}`** — flood/heat/wildfire hazard score / high-hazard share
+   (`measure=hazard_score/high_hazard_share`). **needs:** `physical_hazard_score` · `geographic` (opt) ·
+   `as_of_date` · `counterparty_id`. **add:** non_additive. *`geographic` is CLIMATE-legit, NOT a credit proxy.*
+8. **`sll_kpi_achievement_{window}`** — SLL/bond KPI vs the SPT (margin-ratchet) achievement / breach flag /
+   trend (`measure=achievement/breach_flag/trend`). **needs:** `sll_kpi` · `as_of_date` · `counterparty_id`.
+   **add:** non_additive (breach_flag n/a).
+
+**Concept substitutions (vs the §B9/§B13/§B11 designs).** None invented — every `Need` binds a real §3
+concept. Noted on each template: (a) insurance has no policy-loan / premium-due / income concept →
+`policy_loan_utilisation` sizes a `monetary_stock` against `surrender_value`, `missed_premium_streak` reads the
+premium DUE off `scheduled_amount`, `sum_assured_adequacy` uses a `monetary_flow` income proxy; (b)
+bancassurance has no product_holding concept → `product_type`; (c) Islamic `profit_rate` (deliberately not
+`is_a monetary_rate`) replaces interest in every rate feature and `murabaha_installment_behaviour` reads the
+installment DUE off `scheduled_amount`; (d) the lapse funnel is built from `premium`/`surrender_value` PRE-
+signals — the `lapsed`/`surrendered` labels are never a `Need`.
+
+**Build note (B9/B13/B11).** These 27 map 1:1 to the `templates.py` model exactly like §PART F–J — `needs`→
+grounding contract, `params`→parameter schema, `pit`→trailing-window/state guard, `degrade`→fallback,
+`near_label`→the 3-part leakage flag. The near-label subset the golden set must exercise:
+`claims_fraud_typology` (insurance) and `prohibited_activity_exposure_share` (islamic); ESG carries none but
+the additivity double-count GUARD is exercised on `emissions_trend_by_scope` + `scope3_value_chain_exposure`.
+Routing + safety are verified by `test_templates_specialist.py`: each family grounds its whole domain-shaped
+catalog, the engine NEVER binds a leakage anchor (headline: lapse prediction never reads `lapsed`/
+`surrendered`) or a protected column, near-label recipes carry `near_label=True`, and none of the three
+families grounds anything on the churn catalog (`ALL_TEMPLATES` on churn still yields exactly the churn lens).

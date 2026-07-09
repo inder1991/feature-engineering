@@ -2742,6 +2742,715 @@ ASSET_MGMT_TEMPLATES: tuple[Template, ...] = (
 
 
 # ──────────────────────────────────────────────────────────────────────────────────────────────────
+# The insurance / bancassurance templates — the §B9 LAPSE funnel + CLAIMS-FRAUD journey authored to
+# Part-F depth (Phase-3 Pass-5, breadth).
+#
+# Two journeys. Lapse/persistency funnel (mirrors churn): ACTIVE → DISENGAGEMENT → ARREARS → SURRENDER
+# REQUEST ⚠ → LAPSED. Claims-fraud journey: INCEPTION → CLAIM EVENT → FILED → INVESTIGATION → SETTLE/DENY.
+# Two authoring disciplines are load-bearing (mirroring credit):
+#   • ROUTING — every recipe REQUIRES an insurance-distinctive, NON-STRUCTURAL concept (premium /
+#     surrender_value / claim_reserve / sum_assured / reinsurance_recoverable / mortality_morbidity — NOT
+#     an entity concept like policy_id / claim_id / customer_id, which the engine's structural is_grain
+#     scoring would bind onto ANY grain column, cross-surfacing the family). Grounding is the router; a
+#     churn catalog with only generic monetary_stock/flow + as_of + customer_id grounds NOTHING here (the
+#     locked invariant: ALL_TEMPLATES on the churn _CATALOG = exactly the churn lens).
+#   • SAFETY BY CONSTRUCTION — a LAPSE / SURRENDER-prediction recipe is built from PRE-lapse signals
+#     (premium-payment irregularity, missed-premium streak, surrender-value trend), NEVER the ``lapsed`` /
+#     ``surrendered`` outcome (leakage anchors the engine refuses by construction). A claims-fraud typology
+#     is built from claim BEHAVIOUR (early-claim, over-servicing), NEVER ``fraud_flag`` — and because it
+#     BORDERS the SIU/confirmed-fraud label it is near_label=True + a ⚠ note. Sensitivity: mortality_
+#     morbidity is health-ADJACENT (the actuarial RATE is bindable; an individual's health STATUS is a
+#     special_category column the engine blocks). The Part-K appendix in
+#     docs/…/2026-07-08-banking-feature-template-library.md is the doc source of record.
+# ──────────────────────────────────────────────────────────────────────────────────────────────────
+_INSURANCE_PIT_STATE = ("point-in-time policy STATE observed as-of: the latest reserve / value / rate "
+                        "within (as_of − {window}, as_of], knowable strictly ≤ as_of, never forward. "
+                        "DESIGN-TIME declaration — no data plane enforces runtime PIT.")
+_INSURANCE_SINGLE_CCY = ("single currency — convert to base first; a reserve / sum-assured / recoverable "
+                         "is a STOCK (latest over time, never summed across dates).")
+_PREMIUM_WRITTEN_EARNED = ("premiums are additive but mind the WRITTEN-vs-EARNED trap (never sum written "
+                           "AND earned for one period — UPR bridges them; see the 'premium' concept note).")
+_LAPSE_PRELAPSE = ("built from PRE-lapse signals (premium-payment irregularity, missed-premium streak, "
+                   "surrender-value trend), NEVER the 'lapsed' / 'surrendered' outcome (leakage anchors "
+                   "the engine refuses by construction).")
+_CLAIMS_NEAR_LABEL_PREFIX = ("⚠ NEAR-LABEL: build the claims-fraud typology from claim BEHAVIOUR observed "
+                             "STRICTLY before the SIU / confirmed-fraud (repudiation) label (never the "
+                             "fraud_flag outcome — the engine refuses it; window ≠ the label window); the "
+                             "3-part leakage control must FLAG it. ")
+
+INSURANCE_TEMPLATES: tuple[Template, ...] = (
+    # ── LAPSE / PERSISTENCY funnel (mirrors churn — PRE-lapse, never 'lapsed'/'surrendered') ──────────
+    # B9.1 — premium_payment_irregularity (premium regularity — the disengagement signal)
+    Template(
+        id="premium_payment_irregularity", family="persistency",
+        intent="Premium-payment regularity / irregularity — the inter-payment gap std (or a latest-gap) "
+               "over premium credits; a lengthening / erratic premium cadence is a pre-lapse "
+               "disengagement signal. Built from premium behaviour, NEVER the 'lapsed' outcome.",
+        needs=(Need("premium_col", "premium"), Need("event_ts", "event_timestamp"),
+               Need("entity", "policy_id")),
+        params={"window": (365, 180, 90), "measure": ("gap_std", "latest_gap", "regularity")},
+        aggregation="premium_regularity", additivity="n/a", explain="H",
+        use_cases=("lapse_risk", "persistency", "insurance"),
+        pit=_PIT_TRAILING,
+        degrade="only a single premium (no cadence history) -> SKIP (no regularity from one point).",
+        stage="2-disengagement",
+        eligibility=_LAPSE_PRELAPSE,
+        notes=("anchor: 'premium' (insurance-distinctive, non-structural) routes this off a churn catalog "
+               "(policy_id is an ENTITY concept — it would structurally bind any grain column, so it "
+               "cannot be the sole anchor).",
+               "a gap std / latest gap — n/a (not summable)."),
+    ),
+    # B9.2 — missed_premium_streak (arrears — consecutive short/missed premiums)
+    Template(
+        id="missed_premium_streak", family="persistency",
+        intent="Missed-premium / arrears streak — consecutive billing periods where the premium PAID fell "
+               "short of the premium DUE (missed or partial); a persistent arrears streak precedes lapse. "
+               "Built from premium arrears, NEVER the 'lapsed' outcome.",
+        needs=(Need("premium_col", "premium"), Need("scheduled_col", "scheduled_amount", optional=True),
+               Need("event_ts", "event_timestamp"), Need("entity", "policy_id")),
+        params={"window": (365, 180, 90), "tolerance_pct": (5, 0, 10)},
+        aggregation="missed_premium_streak", additivity="additive", explain="H",
+        use_cases=("lapse_risk", "persistency", "insurance"),
+        pit=_PIT_TRAILING,
+        degrade="no contractual premium schedule -> derive the due premium from the recurring premium "
+                "cadence (declared derivation §D.8; probabilistic — FLAG).",
+        stage="3-arrears",
+        eligibility=_INSURANCE_SINGLE_CCY + " " + _LAPSE_PRELAPSE,
+        derived=("is_short := premium_paid < premium_due × (1 − {tolerance_pct}%) — a shortfall per "
+                 "billing period; the streak counts consecutive short periods (computed DOWNSTREAM).",),
+        notes=("anchor: 'premium' (insurance-distinctive, non-structural) routes this off a churn catalog.",
+               "concept sub: the premium DUE uses 'scheduled_amount' (no dedicated premium-due concept).",
+               "a count of consecutive missed/short periods — additive."),
+    ),
+    # B9.3 — surrender_value_trajectory (surrender pressure — value trend + surrender-value-to-premium)
+    Template(
+        id="surrender_value_trajectory", family="surrender_pressure",
+        intent="Surrender-value trajectory & surrender pressure — the cash-surrender-value trend and its "
+               "ratio to cumulative premiums paid (the incentive to surrender); a rising surrender value "
+               "with disengagement is surrender pressure. Built PRE-surrender, NEVER 'surrendered'.",
+        needs=(Need("surrender_col", "surrender_value"), Need("premium_col", "premium", optional=True),
+               Need("asof", "as_of_date"), Need("entity", "policy_id")),
+        params={"window": (365, 180, 90), "measure": ("surrender_ratio", "value_trend", "surrender_pressure")},
+        aggregation="surrender_trajectory", additivity="non_additive", explain="H",
+        use_cases=("lapse_risk", "surrender", "persistency", "insurance"),
+        pit=_INSURANCE_PIT_STATE,
+        degrade="no premium history for the ratio -> report the surrender-value trend only (FLAG the "
+                "narrower scope).",
+        stage="3-arrears",
+        eligibility=_INSURANCE_SINGLE_CCY + " " + _LAPSE_PRELAPSE,
+        notes=("anchor: 'surrender_value' (insurance-distinctive stock, non-structural) routes this off a "
+               "churn catalog.",
+               "OUTPUT additivity is measure-dependent: surrender_ratio / surrender_pressure are "
+               "non-additive ratios; value_trend is n/a; the raw surrender_value is a semi-additive stock "
+               "— the default carries the ratio case."),
+    ),
+    # B9.4 — policy_loan_utilisation (financial-stress signal — loan against the policy)
+    Template(
+        id="policy_loan_utilisation", family="surrender_pressure",
+        intent="Policy-loan utilisation — the outstanding policy loan drawn against the policy's cash / "
+               "surrender value (loan ÷ surrender_value); high utilisation is a policyholder-liquidity-"
+               "stress + pre-lapse signal.",
+        needs=(Need("surrender_col", "surrender_value"), Need("loan_col", "monetary_stock"),
+               Need("asof", "as_of_date"), Need("entity", "policy_id")),
+        params={"window": (365, 180, 90), "measure": ("utilisation", "loan_trend")},
+        aggregation="policy_loan_utilisation", additivity="non_additive", explain="H",
+        use_cases=("lapse_risk", "insurance", "hardship"),
+        pit=_INSURANCE_PIT_STATE,
+        degrade="no policy-loan balance -> SKIP (no loan to size against the surrender value).",
+        stage="3-arrears",
+        eligibility=_INSURANCE_SINGLE_CCY + " " + _LAPSE_PRELAPSE,
+        notes=("anchor: 'surrender_value' (insurance-distinctive — the loan's collateral base) routes "
+               "this off a churn catalog.",
+               "concept sub: no dedicated policy_loan concept — the loan balance uses 'monetary_stock', "
+               "sized against the surrender_value.",
+               "OUTPUT additivity is measure-dependent: utilisation is a non-additive ratio; loan_trend "
+               "is n/a — the default carries the ratio case."),
+    ),
+    # ── CLAIMS journey — frequency/severity + the claims-fraud typology (behaviour, near-label) ───────
+    # B9.5 — claims_frequency_severity (claim behaviour over the window)
+    Template(
+        id="claims_frequency_severity", family="claims",
+        intent="Claims frequency / severity — the count of claims (frequency) and the incurred claim "
+               "reserve per claim (severity), or a loss ratio vs premiums earned, over a trailing window; "
+               "the core claims-cost signal.",
+        needs=(Need("reserve_col", "claim_reserve"), Need("premium_col", "premium", optional=True),
+               Need("event_ts", "event_timestamp"), Need("entity", "policy_id")),
+        params={"window": (365, 180, 720), "measure": ("frequency", "severity", "loss_ratio")},
+        aggregation="claims_frequency_severity", additivity="additive", explain="H",
+        use_cases=("claims", "insurance", "pricing"),
+        pit=_PIT_TRAILING,
+        degrade="no premium base for the loss ratio -> report frequency + severity only.",
+        stage="claims",
+        eligibility=_INSURANCE_SINGLE_CCY + " " + _PREMIUM_WRITTEN_EARNED,
+        notes=("anchor: 'claim_reserve' (insurance-distinctive, non-structural) routes this off a churn "
+               "catalog.",
+               "OUTPUT additivity is measure-dependent: frequency is an additive count; severity via "
+               "claim_reserve is a semi-additive STOCK; a loss_ratio is non-additive — the default "
+               "carries the additive count."),
+    ),
+    # B9.6 — claims_fraud_typology (early-claim / over-servicing — BEHAVIOUR, NEAR-LABEL ⚠)
+    Template(
+        id="claims_fraud_typology", family="claims_fraud",
+        intent="Claims-fraud typology — early-claim (a claim soon after inception), claim-amount anomaly "
+               "or over-servicing frequency, read from claim BEHAVIOUR (measure=early_claim_flag / "
+               "over_servicing_score / claim_amount_zscore); a red-flag typology that BORDERS the SIU "
+               "label. Built from behaviour, NEVER 'fraud_flag'.",
+        needs=(Need("reserve_col", "claim_reserve"), Need("inception", "effective_date"),
+               Need("event_ts", "event_timestamp"), Need("entity", "policy_id")),
+        params={"window": (720, 365, 180),
+                "measure": ("early_claim_flag", "over_servicing_score", "claim_amount_zscore")},
+        aggregation="claims_fraud_typology", additivity="n/a", explain="M",
+        use_cases=("claims", "claims_fraud", "insurance", "financial_crime"),
+        pit=_PIT_TRAILING,
+        degrade="no policy-inception date -> the early-claim measure degrades to a claim-amount anomaly "
+                "only (weaker + FLAGGED).",
+        stage="claims-investigation",
+        near_label=True,
+        eligibility=_CLAIMS_NEAR_LABEL_PREFIX + "a claims-fraud typology built over prior-claim / adverse "
+                    "behaviour borders the confirmed-fraud/repudiation label. " + _INSURANCE_SINGLE_CCY,
+        derived=("is_early_claim := claim_event within a short spell after effective_date (inception) — "
+                 "computed DOWNSTREAM (no data plane); the SIU/fraud_flag OUTCOME is NEVER an input.",),
+        notes=("anchor: 'claim_reserve' (insurance-distinctive claim behaviour, non-structural) routes "
+               "this off a churn catalog.",
+               "borders the SIU/confirmed-fraud label — observe strictly pre-label; fraud_flag is a "
+               "leakage anchor the engine refuses.",
+               "a flag / score / z-score — n/a (not summable)."),
+    ),
+    # ── REINSURANCE / UNDERWRITING / BANCASSURANCE ───────────────────────────────────────────────────
+    # B9.7 — reinsurance_recoverable_concentration (ceded-reserve recoverable concentration)
+    Template(
+        id="reinsurance_recoverable_concentration", family="reinsurance",
+        intent="Reinsurance-recoverable concentration — how concentrated the amount recoverable from "
+               "reinsurers on ceded reserves is (an HHI across reinsurers), or the recoverable ÷ gross "
+               "reserve share; a concentrated recoverable is reinsurer counterparty risk.",
+        needs=(Need("recoverable_col", "reinsurance_recoverable"),
+               Need("reserve_col", "claim_reserve", optional=True),
+               Need("asof", "as_of_date"), Need("entity", "policy_id")),
+        params={"window": (365, 180, 90), "measure": ("concentration_hhi", "recoverable_share", "recoverable_amount")},
+        aggregation="reinsurance_recoverable", additivity="non_additive", explain="M",
+        use_cases=("reinsurance", "insurance", "counterparty_risk"),
+        pit=_INSURANCE_PIT_STATE,
+        degrade="no gross-reserve base for the share -> report the recoverable concentration HHI only.",
+        stage="reinsurance",
+        eligibility=_INSURANCE_SINGLE_CCY,
+        notes=("anchor: 'reinsurance_recoverable' (insurance-distinctive stock, non-structural) routes "
+               "this off a churn catalog.",
+               "OUTPUT additivity is measure-dependent: concentration_hhi / recoverable_share are "
+               "non-additive; the raw recoverable_amount is a semi-additive STOCK (an ESTIMATED "
+               "reinsurance asset) — the default carries the non-additive case."),
+    ),
+    # B9.8 — sum_assured_adequacy (underinsurance vs a needs proxy)
+    Template(
+        id="sum_assured_adequacy", family="underwriting",
+        intent="Sum-assured adequacy / underinsurance — the sum assured (face amount) vs a needs / income "
+               "proxy (measure=adequacy_ratio = sum_assured ÷ income), an underinsurance flag, or the raw "
+               "sum-assured exposure; a low ratio flags underinsurance (and cross-sell headroom).",
+        needs=(Need("sum_assured_col", "sum_assured"), Need("income_col", "monetary_flow", optional=True),
+               Need("asof", "as_of_date"), Need("entity", "policy_id")),
+        params={"window": (365, 180, 90), "measure": ("adequacy_ratio", "underinsurance_flag", "sum_assured_amount")},
+        aggregation="sum_assured_adequacy", additivity="non_additive", explain="H",
+        use_cases=("underwriting", "insurance", "bancassurance"),
+        pit=_INSURANCE_PIT_STATE,
+        degrade="no income / needs proxy -> report the raw sum-assured exposure (a semi-additive stock).",
+        stage="underwriting",
+        eligibility=_INSURANCE_SINGLE_CCY + " income is SENSITIVE — flagged.",
+        notes=("anchor: 'sum_assured' (insurance-distinctive stock, non-structural) routes this off a "
+               "churn catalog.",
+               "concept sub: no dedicated income concept — the needs proxy uses 'monetary_flow' (a salary "
+               "credit).",
+               "OUTPUT additivity is measure-dependent: adequacy_ratio is a non-additive ratio; "
+               "underinsurance_flag is n/a; the raw sum_assured is a semi-additive STOCK — the default "
+               "carries the ratio case."),
+    ),
+    # B9.9 — bancassurance_cross_hold (insurance held alongside banking — share of wallet)
+    Template(
+        id="bancassurance_cross_hold", family="bancassurance",
+        intent="Bancassurance cross-hold — the count of premium-paying insurance policies a customer "
+               "holds alongside their banking products (measure=policy_count / cross_hold_flag / "
+               "premium_share); a bancassurance share-of-wallet + stickiness signal.",
+        needs=(Need("premium_col", "premium"), Need("product", "product_type", optional=True),
+               Need("asof", "as_of_date"), Need("entity", "customer_id")),
+        params={"window": (365, 180, 90), "measure": ("policy_count", "cross_hold_flag", "premium_share")},
+        aggregation="bancassurance_cross_hold", additivity="additive", explain="H",
+        use_cases=("bancassurance", "insurance", "cross_sell", "share_of_wallet"),
+        pit=_INSURANCE_PIT_STATE,
+        degrade="no banking product-holding data -> report the insurance policy_count only (no cross-hold "
+                "ratio).",
+        stage="bancassurance",
+        eligibility=_INSURANCE_SINGLE_CCY,
+        notes=("anchor: 'premium' (insurance-distinctive — a premium-paying policy held) routes this off "
+               "a churn catalog (customer_id is an ENTITY concept — not the sole anchor).",
+               "concept sub: no product_holding concept — the banking side uses 'product_type'.",
+               "OUTPUT additivity is measure-dependent: policy_count is an additive count; "
+               "cross_hold_flag is n/a; premium_share is a non-additive ratio — the default carries the "
+               "additive count."),
+    ),
+    # B9.10 — mortality_morbidity_loading (underwriting risk-loading — health-ADJACENT sensitivity)
+    Template(
+        id="mortality_morbidity_loading", family="underwriting",
+        intent="Mortality / morbidity loading — the actuarial mortality/morbidity RATE (from a table) "
+               "applied to a policy, its level or an underwriting loading factor vs the standard table; "
+               "an underwriting risk signal.",
+        needs=(Need("rate_col", "mortality_morbidity"), Need("asof", "as_of_date"),
+               Need("entity", "policy_id")),
+        params={"window": (365, 180, 90), "measure": ("rate_level", "loading_factor")},
+        aggregation="mortality_morbidity_loading", additivity="non_additive", explain="M",
+        use_cases=("underwriting", "insurance", "pricing"),
+        pit=_INSURANCE_PIT_STATE,
+        degrade="no mortality/morbidity assumption reported -> SKIP.",
+        stage="underwriting",
+        eligibility="⚠ HEALTH-ADJACENT: mortality_morbidity is the actuarial RATE (bindable), but an "
+                    "individual's health STATUS is special_category (GDPR) — the engine BLOCKS binding a "
+                    "special_category column; consent / purpose eligibility applies to the underlying "
+                    "medical data.",
+        notes=("anchor: 'mortality_morbidity' (insurance-distinctive rate, non-structural) routes this "
+               "off a churn catalog.",
+               "a mortality/morbidity RATE (or its loading) — non-additive; never sum across policies.",
+               "do NOT anchor on a special_category health-status column — the engine refuses it."),
+    ),
+)
+
+
+# ──────────────────────────────────────────────────────────────────────────────────────────────────
+# The Islamic-banking templates — the §B13 conventional funnels reframed + the SHARIA-COMPLIANCE overlay
+# authored to Part-F depth (Phase-3 Pass-5, breadth).
+#
+# Most B1–B7 funnels APPLY, reframed: PROFIT-rate, not interest. The distinctive layer is Sharia
+# compliance — a HARD eligibility gate (ratified by the Sharia board), plus product-specific behavioural
+# signals (Murabaha installments, Mudaraba/Musharaka profit-sharing, Sukuk, Takaful). Two disciplines:
+#   • ROUTING — every recipe REQUIRES an Islamic-distinctive, NON-STRUCTURAL concept (profit_rate /
+#     profit_share_ratio / purification_amount / prohibited_activity_exposure / sukuk / takaful_
+#     contribution — NOT an entity concept like customer_id, which is structural). Grounding is the
+#     router; a churn catalog grounds NOTHING here (the locked invariant). 'profit_rate' is DELIBERATELY
+#     not is_a monetary_rate (a Sharia + modelling distinction), so it binds only by exact concept match.
+#   • COMPLIANCE / NEAR-LABEL — a prohibited-activity exposure crossing the 5%/33% Sharia screen BORDERS
+#     the compliance-breach determination (the sharia_compliant_flag) -> near_label=True + a ⚠ note. No
+#     recipe models profit as guaranteed interest (riba). The Part-K appendix in
+#     docs/…/2026-07-08-banking-feature-template-library.md is the doc source of record.
+# ──────────────────────────────────────────────────────────────────────────────────────────────────
+_ISLAMIC_PIT_STATE = ("point-in-time Islamic-account STATE observed as-of: the latest profit-rate / "
+                      "ratio / exposure within (as_of − {window}, as_of], knowable strictly ≤ as_of, "
+                      "never forward. DESIGN-TIME declaration — no data plane enforces runtime PIT.")
+_PROFIT_NOT_INTEREST = ("Sharia: 'profit_rate' is a PROFIT rate (Murabaha mark-up / Mudaraba expected "
+                        "profit), NOT interest (riba) — never model it as a guaranteed conventional rate.")
+_SHARIA_GATE = ("Sharia compliance is a HARD eligibility gate (ratified by the Sharia board) — non-"
+                "compliance BLOCKS the product, not merely flags it.")
+_ISLAMIC_NEAR_LABEL_PREFIX = ("⚠ NEAR-LABEL: a prohibited-activity exposure crossing the 5%/33% Sharia "
+                              "screen BORDERS the compliance-breach determination (the sharia_compliant_"
+                              "flag) — observe the exposure STRICTLY before the breach is declared; the "
+                              "3-part leakage control must FLAG it. ")
+
+ISLAMIC_TEMPLATES: tuple[Template, ...] = (
+    # ── SHARIA-COMPLIANCE overlay — profit-rate, profit-sharing, purification, prohibited-activity ────
+    # B13.1 — profit_rate_exposure (Murabaha mark-up / expected profit vs a benchmark)
+    Template(
+        id="profit_rate_exposure", family="sharia_profit_rate",
+        intent="Profit-rate exposure — the Islamic PROFIT rate (Murabaha mark-up / Mudaraba expected "
+               "profit) level, its spread vs a reference benchmark, or its trend (measure=rate_level / "
+               "benchmark_spread / trend); the Islamic analogue of a rate-exposure feature — NOT interest.",
+        needs=(Need("profit_col", "profit_rate"), Need("benchmark_col", "benchmark_rate", optional=True),
+               Need("asof", "as_of_date"), Need("entity", "customer_id")),
+        params={"window": (365, 180, 90), "measure": ("rate_level", "benchmark_spread", "trend")},
+        aggregation="profit_rate_exposure", additivity="non_additive", explain="H",
+        use_cases=("sharia_compliance", "islamic_banking", "pricing"),
+        pit=_ISLAMIC_PIT_STATE,
+        degrade="no benchmark series -> report the profit-rate level / trend only (no spread).",
+        stage="sharia-compliance",
+        eligibility=_PROFIT_NOT_INTEREST + " " + _SHARIA_GATE,
+        notes=("anchor: 'profit_rate' (Islamic-distinctive, non-structural — deliberately NOT is_a "
+               "monetary_rate) routes this off a churn catalog.",
+               "a profit RATE (or spread / trend) — non-additive; never sum or naively average across "
+               "notionals."),
+    ),
+    # B13.2 — profit_sharing_split_behaviour (Mudaraba/Musharaka PSR + partner-performance volatility)
+    Template(
+        id="profit_sharing_split_behaviour", family="sharia_profit_sharing",
+        intent="Profit-sharing (Mudaraba/Musharaka) split behaviour — the pre-agreed profit-sharing ratio "
+               "(PSR) level and its realised-profit volatility (partner performance); measure=psr_level / "
+               "psr_volatility. A distinctive Islamic partnership-performance signal (not a guaranteed "
+               "return).",
+        needs=(Need("psr_col", "profit_share_ratio"), Need("asof", "as_of_date"),
+               Need("entity", "customer_id")),
+        params={"window": (365, 180, 90), "measure": ("psr_level", "psr_volatility")},
+        aggregation="profit_sharing_split", additivity="non_additive", explain="M",
+        use_cases=("sharia_compliance", "islamic_banking"),
+        pit=_ISLAMIC_PIT_STATE,
+        degrade="only a single PSR snapshot (no history) -> report the PSR level only (no volatility).",
+        stage="sharia-compliance",
+        eligibility=_PROFIT_NOT_INTEREST + " " + _SHARIA_GATE,
+        notes=("anchor: 'profit_share_ratio' (Islamic-distinctive, non-structural) routes this off a "
+               "churn catalog.",
+               "a PSR ratio / its volatility — non-additive (a pre-agreed split, not an aggregation)."),
+    ),
+    # B13.3 — purification_ratio (non-compliant income to purify — a Sharia flow)
+    Template(
+        id="purification_ratio", family="sharia_purification",
+        intent="Income-purification ratio — the non-compliant income to be purified (donated to charity) "
+               "vs total income (measure=purification_ratio), or the raw purification amount; a rising "
+               "purification ratio flags creeping Sharia non-compliance in the income mix.",
+        needs=(Need("purification_col", "purification_amount"),
+               Need("income_col", "monetary_flow", optional=True),
+               Need("event_ts", "event_timestamp"), Need("entity", "customer_id")),
+        params={"window": (365, 180, 90), "measure": ("purification_ratio", "purification_amount")},
+        aggregation="purification_ratio", additivity="non_additive", explain="H",
+        use_cases=("sharia_compliance", "islamic_banking"),
+        pit=_PIT_TRAILING,
+        degrade="no total-income base -> report the raw purification amount (an additive flow) not the "
+                "ratio.",
+        stage="sharia-compliance",
+        eligibility=_SHARIA_GATE,
+        notes=("anchor: 'purification_amount' (Islamic-distinctive flow, non-structural) routes this off "
+               "a churn catalog.",
+               "OUTPUT additivity is measure-dependent: purification_ratio is a non-additive ratio; the "
+               "raw purification_amount is an additive flow — the default carries the ratio case."),
+    ),
+    # B13.4 — prohibited_activity_exposure_share (haram-sector screen — NEAR-LABEL to the compliance flag)
+    Template(
+        id="prohibited_activity_exposure_share", family="sharia_screening",
+        intent="Prohibited-activity exposure share — the share of exposure in Sharia-prohibited sectors "
+               "(alcohol / gambling / conventional finance) vs total exposure (measure=exposure_share), a "
+               "screen-breach flag (5%/33% thresholds), or the raw exposure; a Sharia-screening signal.",
+        needs=(Need("prohibited_col", "prohibited_activity_exposure"),
+               Need("total_col", "monetary_stock", optional=True),
+               Need("asof", "as_of_date"), Need("entity", "customer_id")),
+        params={"window": (365, 180, 90), "measure": ("exposure_share", "breach_flag", "exposure_amount")},
+        aggregation="prohibited_activity_exposure", additivity="non_additive", explain="H",
+        use_cases=("sharia_compliance", "islamic_banking", "screening"),
+        pit=_ISLAMIC_PIT_STATE,
+        degrade="no total-exposure base -> report the raw prohibited-activity exposure (a semi-additive "
+                "stock) not the share.",
+        stage="sharia-compliance",
+        near_label=True,
+        eligibility=_ISLAMIC_NEAR_LABEL_PREFIX + _SHARIA_GATE,
+        notes=("anchor: 'prohibited_activity_exposure' (Islamic-distinctive screening stock, "
+               "non-structural) routes this off a churn catalog.",
+               "borders the sharia-compliance-breach determination — observe strictly pre-breach.",
+               "OUTPUT additivity is measure-dependent: exposure_share is a non-additive ratio; "
+               "breach_flag is n/a; the raw exposure is a semi-additive STOCK — the default carries the "
+               "ratio case."),
+    ),
+    # B13.5 — sukuk_concentration (Sharia-compliant certificate holdings — NOT a conventional bond)
+    Template(
+        id="sukuk_concentration", family="sukuk",
+        intent="Sukuk holding / concentration — how concentrated a customer's Sukuk (Sharia-compliant "
+               "asset-backed certificate) holdings are (an HHI across issuers), the holding share, or the "
+               "on-book amount; a Sharia-compliant-instrument concentration signal.",
+        needs=(Need("sukuk_col", "sukuk"), Need("holding_col", "monetary_stock", optional=True),
+               Need("asof", "as_of_date"), Need("entity", "customer_id")),
+        params={"window": (365, 180, 90), "measure": ("concentration_hhi", "holding_share", "holding_amount")},
+        aggregation="sukuk_concentration", additivity="non_additive", explain="M",
+        use_cases=("sharia_compliance", "islamic_banking", "concentration_risk"),
+        pit=_ISLAMIC_PIT_STATE,
+        degrade="no per-issuer holding values -> report the distinct-issuer count only (weaker; FLAG).",
+        stage="sharia-compliance",
+        eligibility=_SHARIA_GATE,
+        notes=("anchor: 'sukuk' (Islamic-distinctive instrument classification, non-structural) routes "
+               "this off a churn catalog — a Sukuk is asset-backed, NOT a conventional interest-bearing "
+               "bond.",
+               "OUTPUT additivity is measure-dependent: concentration_hhi / holding_share are "
+               "non-additive; the raw holding_amount is a semi-additive STOCK — the default carries the "
+               "non-additive case."),
+    ),
+    # B13.6 — takaful_contribution_behaviour (the Islamic insurance analogue of premium)
+    Template(
+        id="takaful_contribution_behaviour", family="takaful",
+        intent="Takaful contribution behaviour — the cumulative Takaful contribution (tabarru' — a "
+               "cooperative donation, the Islamic analogue of a premium), its regularity, or a payment "
+               "gap; an erratic contribution cadence is a Takaful pre-lapse signal (like B9).",
+        needs=(Need("contribution_col", "takaful_contribution"), Need("event_ts", "event_timestamp"),
+               Need("entity", "customer_id")),
+        params={"window": (365, 180, 90), "measure": ("cumulative_contribution", "contribution_regularity", "payment_gap")},
+        aggregation="takaful_contribution", additivity="additive", explain="H",
+        use_cases=("sharia_compliance", "islamic_banking", "lapse_risk"),
+        pit=_PIT_TRAILING,
+        degrade="only a single contribution (no cadence history) -> report the cumulative contribution "
+                "only (no regularity).",
+        stage="sharia-compliance",
+        eligibility=_SHARIA_GATE + " a Takaful contribution is NOT interest/premium (a tabarru' "
+                    "donation).",
+        notes=("anchor: 'takaful_contribution' (Islamic-distinctive flow, non-structural) routes this "
+               "off a churn catalog.",
+               "OUTPUT additivity is measure-dependent: the cumulative contribution is an additive flow; "
+               "contribution_regularity / payment_gap are n/a — the default carries the additive flow."),
+    ),
+    # ── CONVENTIONAL funnels reframed — deposit beta + Murabaha installment behaviour (profit_rate) ───
+    # B13.7 — islamic_deposit_beta (profit-rate sensitivity — deposit attrition reframed)
+    Template(
+        id="islamic_deposit_beta", family="sharia_profit_rate",
+        intent="Islamic deposit beta — how much a Sharia deposit's paid PROFIT rate (or its balance) "
+               "responds to a move in the profit-rate environment (Δ paid profit / Δ profit_rate) over "
+               "the window; the Islamic-deposit rate-sensitivity signal — profit_rate, not interest.",
+        needs=(Need("profit_col", "profit_rate"), Need("balance_col", "monetary_stock"),
+               Need("asof", "as_of_date"), Need("entity", "customer_id")),
+        params={"window": (365, 180, 90), "measure": ("rate_beta", "balance_beta")},
+        aggregation="islamic_deposit_beta", additivity="non_additive", explain="H",
+        use_cases=("sharia_compliance", "islamic_banking", "deposit_stability", "alm"),
+        pit=_ISLAMIC_PIT_STATE,
+        degrade="only a single rate snapshot (no history) -> SKIP (no beta from one point).",
+        stage="deposit-attrition",
+        eligibility=_PROFIT_NOT_INTEREST + " " + _SHARIA_GATE + " single currency.",
+        notes=("anchor: 'profit_rate' (Islamic-distinctive, non-structural) routes this off a churn "
+               "catalog — the profit-rate analogue of the deposits 'deposit_beta' (which uses "
+               "benchmark_rate).",
+               "a beta (a ratio) — non-additive; compute per depositor/segment, never sum."),
+    ),
+    # B13.8 — murabaha_installment_behaviour (Murabaha cost-plus installment behaviour — credit reframed)
+    Template(
+        id="murabaha_installment_behaviour", family="murabaha",
+        intent="Murabaha installment behaviour — over a cost-plus (Murabaha, disclosed profit_rate) "
+               "financing, the count of scheduled installments where the amount PAID fell short of the "
+               "amount DUE, or the payment ratio; the Islamic analogue of the credit-B2 repayment signal.",
+        needs=(Need("profit_col", "profit_rate"), Need("scheduled_col", "scheduled_amount", optional=True),
+               Need("paid_col", "monetary_flow"), Need("event_ts", "event_timestamp"),
+               Need("entity", "customer_id")),
+        params={"window": (365, 180, 90), "tolerance_pct": (5, 0, 10),
+                "measure": ("missed_installment_count", "payment_ratio")},
+        aggregation="murabaha_installment", additivity="additive", explain="H",
+        use_cases=("sharia_compliance", "islamic_banking", "credit_risk"),
+        pit=_PIT_TRAILING,
+        degrade="no contractual installment schedule -> derive the due from the recurring installment "
+                "cadence (declared derivation §D.8; probabilistic — FLAG).",
+        stage="installment-behaviour",
+        eligibility=_PROFIT_NOT_INTEREST + " " + _SHARIA_GATE + " single currency.",
+        derived=("is_short := paid < scheduled × (1 − {tolerance_pct}%) per installment — a shortfall vs "
+                 "the contractual due, counted per date (computed DOWNSTREAM).",),
+        notes=("anchor: 'profit_rate' (Islamic-distinctive — a Murabaha discloses a profit mark-up, not "
+               "interest) routes this off a churn catalog.",
+               "concept sub: the installment DUE uses 'scheduled_amount' (no dedicated Murabaha concept).",
+               "OUTPUT additivity is measure-dependent: missed_installment_count is an additive count; "
+               "payment_ratio is non-additive — the default carries the additive count."),
+    ),
+)
+
+
+# ──────────────────────────────────────────────────────────────────────────────────────────────────
+# The ESG / sustainable-finance templates — the §B11 SCORING + TRANSITION-RISK journey authored to
+# Part-F depth (Phase-3 Pass-5, breadth).
+#
+# ESG data is often EXTERNAL (ratings vendors / emissions disclosures) + heavily ESTIMATED and RESTATED;
+# an esg_score is itself a model output. Two authoring disciplines are load-bearing:
+#   • ROUTING — every recipe REQUIRES an ESG-distinctive, NON-STRUCTURAL concept (scope_1/2/3_emissions /
+#     financed_emissions / carbon_intensity / taxonomy_alignment / transition_alignment / physical_hazard_
+#     score / emissions_data_quality / sll_kpi — NOT an entity concept like counterparty_id, which is
+#     structural). Grounding is the router; a churn catalog grounds NOTHING here (the locked invariant).
+#   • ADDITIVITY GUARD (the load-bearing correctness rule) — GHG scopes are additive WITHIN a scope, but a
+#     naive scope 1+2+3 total DOUBLE-COUNTS across the value chain (one firm's Scope 1 is another's Scope
+#     3), and Scope 3 is NOT summable across a PORTFOLIO (cross-entity double-count); financed_emissions is
+#     PCAF-ATTRIBUTED (additive across the book — attribution avoids the double-count); carbon_intensity is
+#     a ratio → non_additive. Each recipe picks additivity honestly and annotates the trap in notes. No
+#     recipe is near-label (an ESG/climate signal does not border a customer outcome). geographic is
+#     CLIMATE-legitimate here (physical hazard), NOT a fair-lending credit proxy. The Part-K appendix in
+#     docs/…/2026-07-08-banking-feature-template-library.md is the doc source of record.
+# ──────────────────────────────────────────────────────────────────────────────────────────────────
+_ESG_PIT_STATE = ("point-in-time ESG / climate STATE observed as-of: the latest emissions / alignment / "
+                  "score within (as_of − {window}, as_of], knowable strictly ≤ as_of, never forward. ESG "
+                  "data is EXTERNAL + heavily ESTIMATED and RESTATED — honour system_time to avoid "
+                  "restated-data leakage. DESIGN-TIME declaration — no data plane enforces runtime PIT.")
+_ESG_EXTERNAL = ("ESG data is largely EXTERNAL (ratings vendors / disclosures) + ESTIMATED — an esg_score "
+                 "is itself a model output; availability/quality caveats apply (provenance-flagged).")
+_ESG_SCOPE_GUARD = ("ADDITIVITY GUARD: GHG scopes are additive WITHIN a scope, but a naive scope 1+2+3 "
+                    "total DOUBLE-COUNTS across the value chain (one firm's Scope 1 is another's Scope 3) "
+                    "— a cross-scope total is a GUARDED downstream derivation, not a naive sum. "
+                    "carbon_intensity is a ratio (non_additive); financed_emissions is PCAF-ATTRIBUTED "
+                    "(additive across the book).")
+
+ESG_TEMPLATES: tuple[Template, ...] = (
+    # ── SCORING / EMISSIONS — absolute & intensity by scope (the additivity double-count guard) ──────
+    # B11.1 — emissions_trend_by_scope (per-scope absolute + intensity; GUARD the cross-scope total)
+    Template(
+        id="emissions_trend_by_scope", family="emissions",
+        intent="Absolute & intensity emissions trend BY SCOPE — the per-scope GHG level (Scope 1 direct, "
+               "Scope 2 purchased-energy, Scope 3 value-chain) and its trend, or a carbon-intensity "
+               "trend (measure=absolute_level / absolute_trend / intensity_trend). GUARD: never naively "
+               "sum across scopes (double-counts the value chain).",
+        needs=(Need("scope1_col", "scope_1_emissions"),
+               Need("scope2_col", "scope_2_emissions", optional=True),
+               Need("scope3_col", "scope_3_emissions", optional=True),
+               Need("intensity_col", "carbon_intensity", optional=True),
+               Need("asof", "as_of_date"), Need("entity", "counterparty_id")),
+        params={"window": (365, 180, 90), "measure": ("absolute_level", "absolute_trend", "intensity_trend")},
+        aggregation="emissions_by_scope", additivity="additive", explain="H",
+        use_cases=("esg_scoring", "transition_risk", "climate_risk"),
+        pit=_ESG_PIT_STATE,
+        degrade="only a single emissions snapshot (no history) -> report the per-scope level (no trend).",
+        stage="scoring",
+        eligibility=_ESG_EXTERNAL,
+        notes=("anchor: 'scope_1_emissions' (ESG-distinctive, non-structural) routes this off a churn "
+               "catalog.",
+               _ESG_SCOPE_GUARD,
+               "OUTPUT additivity: a per-scope absolute level is ADDITIVE WITHIN that scope; the "
+               "intensity_trend measure (carbon_intensity) is non-additive — the default carries the "
+               "additive per-scope level."),
+    ),
+    # B11.2 — carbon_intensity_trajectory (emissions ÷ revenue level & trend)
+    Template(
+        id="carbon_intensity_trajectory", family="emissions",
+        intent="Carbon-intensity trajectory — emissions per unit of activity/revenue (carbon_intensity) "
+               "level and its trailing trend (measure=level / trend); a rising intensity is transition "
+               "deterioration.",
+        needs=(Need("intensity_col", "carbon_intensity"), Need("asof", "as_of_date"),
+               Need("entity", "counterparty_id")),
+        params={"window": (365, 180, 90), "measure": ("level", "trend")},
+        aggregation="carbon_intensity", additivity="non_additive", explain="H",
+        use_cases=("esg_scoring", "transition_risk", "climate_risk"),
+        pit=_ESG_PIT_STATE,
+        degrade="only a single intensity snapshot (no history) -> report the level only (no trend).",
+        stage="transition-risk",
+        eligibility=_ESG_EXTERNAL,
+        notes=("anchor: 'carbon_intensity' (ESG-distinctive, non-structural) routes this off a churn "
+               "catalog.",
+               "carbon_intensity is a RATIO (emissions ÷ revenue) — non-additive; never sum across "
+               "entities."),
+    ),
+    # B11.3 — financed_emissions_attribution (PCAF — attributed to loans/investments, additive)
+    Template(
+        id="financed_emissions_attribution", family="financed_emissions",
+        intent="Financed-emissions attribution (PCAF) — the emissions ATTRIBUTED to a loan/investment "
+               "book (measure=absolute), or a financed-emissions intensity vs the exposure "
+               "(measure=intensity); the portfolio-decarbonisation signal. Heavily ESTIMATED.",
+        needs=(Need("financed_col", "financed_emissions"), Need("exposure_col", "monetary_stock", optional=True),
+               Need("asof", "as_of_date"), Need("entity", "counterparty_id")),
+        params={"window": (365, 180, 90), "measure": ("absolute", "intensity", "trend")},
+        aggregation="financed_emissions", additivity="additive", explain="H",
+        use_cases=("esg_scoring", "transition_risk", "climate_risk"),
+        pit=_ESG_PIT_STATE,
+        degrade="no exposure base for the intensity -> report the absolute financed emissions only.",
+        stage="scoring",
+        eligibility=_ESG_EXTERNAL,
+        notes=("anchor: 'financed_emissions' (ESG-distinctive, non-structural) routes this off a churn "
+               "catalog.",
+               "financed_emissions is PCAF-ATTRIBUTED — ADDITIVE across the book (attribution AVOIDS the "
+               "cross-entity double-count that a raw Scope-3 sum would hit); heavily ESTIMATED.",
+               "OUTPUT additivity is measure-dependent: absolute is additive; intensity is a non-additive "
+               "ratio; a trend is n/a — the default carries the additive attribution."),
+    ),
+    # B11.4 — emissions_data_quality_reliance (provenance — PCAF data-quality / estimation reliance)
+    Template(
+        id="emissions_data_quality_reliance", family="data_quality",
+        intent="Emissions data-quality / estimation reliance — the PCAF data-quality score (1 measured → "
+               "5 estimated) or the estimated-share of an entity's emissions (measure=avg_data_quality / "
+               "estimated_share); a PROVENANCE feature — high estimated-share = low confidence.",
+        needs=(Need("dq_col", "emissions_data_quality"), Need("asof", "as_of_date"),
+               Need("entity", "counterparty_id")),
+        params={"window": (365, 180, 90), "measure": ("avg_data_quality", "estimated_share")},
+        aggregation="emissions_data_quality", additivity="non_additive", explain="H",
+        use_cases=("esg_scoring", "climate_risk", "data_quality"),
+        pit=_ESG_PIT_STATE,
+        degrade="no PCAF data-quality score reported -> SKIP.",
+        stage="scoring",
+        eligibility=_ESG_EXTERNAL,
+        notes=("anchor: 'emissions_data_quality' (ESG-distinctive provenance score, non-structural) "
+               "routes this off a churn catalog.",
+               "a PCAF data-quality ORDINAL (or estimated-share) — non-additive; a provenance / "
+               "confidence feature, high estimated-share = low confidence in the emissions figure."),
+    ),
+    # ── TRANSITION-RISK journey — taxonomy alignment, pathway gap, physical hazard, SLL KPI ──────────
+    # B11.5 — taxonomy_alignment_share (EU-taxonomy % revenue/capex aligned)
+    Template(
+        id="taxonomy_alignment_share", family="taxonomy",
+        intent="EU-Taxonomy alignment share — the % of an entity's revenue/capex/opex that is Taxonomy-"
+               "eligible AND aligned, its trend, or an eligible-share (measure=aligned_share / "
+               "eligible_share / trend); a green-revenue signal.",
+        needs=(Need("taxonomy_col", "taxonomy_alignment"), Need("asof", "as_of_date"),
+               Need("entity", "counterparty_id")),
+        params={"window": (365, 180, 90), "measure": ("aligned_share", "eligible_share", "trend")},
+        aggregation="taxonomy_alignment", additivity="non_additive", explain="H",
+        use_cases=("esg_scoring", "transition_risk", "climate_risk"),
+        pit=_ESG_PIT_STATE,
+        degrade="only a single disclosure (no history) -> report the aligned share only (no trend).",
+        stage="transition-risk",
+        eligibility=_ESG_EXTERNAL,
+        notes=("anchor: 'taxonomy_alignment' (ESG-distinctive, non-structural) routes this off a churn "
+               "catalog.",
+               "a Taxonomy-aligned SHARE (% of revenue/capex) — non-additive (a ratio)."),
+    ),
+    # B11.6 — transition_alignment_gap (net-zero pathway gap / implied temperature rise)
+    Template(
+        id="transition_alignment_gap", family="transition",
+        intent="Transition / net-zero alignment gap — the entity's transition-alignment (implied "
+               "temperature rise / SBTi alignment) level and its gap vs a net-zero pathway "
+               "(measure=alignment_level / pathway_gap / trend); a widening gap is transition risk "
+               "(ALIGNED → LAGGING → HIGH-RISK → STRANDED).",
+        needs=(Need("transition_col", "transition_alignment"), Need("asof", "as_of_date"),
+               Need("entity", "counterparty_id")),
+        params={"window": (365, 180, 90), "measure": ("alignment_level", "pathway_gap", "trend")},
+        aggregation="transition_alignment", additivity="non_additive", explain="H",
+        use_cases=("esg_scoring", "transition_risk", "climate_risk"),
+        pit=_ESG_PIT_STATE,
+        degrade="only a single alignment snapshot (no history) -> report the level only (no gap trend).",
+        stage="transition-risk",
+        eligibility=_ESG_EXTERNAL,
+        notes=("anchor: 'transition_alignment' (ESG-distinctive, non-structural) routes this off a churn "
+               "catalog.",
+               "an alignment level / pathway gap (implied temp rise) — non-additive."),
+    ),
+    # B11.7 — physical_hazard_exposure (flood/heat/wildfire, location-based — climate-legit geographic)
+    Template(
+        id="physical_hazard_exposure", family="physical_risk",
+        intent="Physical-hazard exposure — the physical climate-risk hazard score (flood / heat / "
+               "wildfire, location-based, scenario-dependent) of an entity's collateral/operations, its "
+               "level or the high-hazard share (measure=hazard_score / high_hazard_share).",
+        needs=(Need("hazard_col", "physical_hazard_score"), Need("geo", "geographic", optional=True),
+               Need("asof", "as_of_date"), Need("entity", "counterparty_id")),
+        params={"window": (365, 180, 90), "measure": ("hazard_score", "high_hazard_share")},
+        aggregation="physical_hazard", additivity="non_additive", explain="H",
+        use_cases=("esg_scoring", "climate_risk", "physical_risk"),
+        pit=_ESG_PIT_STATE,
+        degrade="no location granularity -> report the entity-level hazard score only (no location mix).",
+        stage="physical-risk",
+        eligibility="geographic here is CLIMATE-legitimate (physical-hazard location), NOT a fair-lending "
+                    "credit proxy — use-case-scoped to climate risk. " + _ESG_EXTERNAL,
+        notes=("anchor: 'physical_hazard_score' (ESG-distinctive, non-structural) routes this off a churn "
+               "catalog.",
+               "a hazard score (scenario-dependent) / high-hazard share — non-additive."),
+    ),
+    # B11.8 — sll_kpi_achievement (sustainability-linked-loan/bond KPI vs the SPT — margin ratchet)
+    Template(
+        id="sll_kpi_achievement", family="sustainability_linked",
+        intent="SLL / KPI achievement — the sustainability-linked-loan/bond KPI vs its target (SPT the "
+               "margin ratchet keys off): achievement level, a breach flag, or the trend "
+               "(measure=achievement / breach_flag / trend); a greenwashing / performance signal.",
+        needs=(Need("kpi_col", "sll_kpi"), Need("asof", "as_of_date"),
+               Need("entity", "counterparty_id")),
+        params={"window": (365, 180, 90), "measure": ("achievement", "breach_flag", "trend")},
+        aggregation="sll_kpi_achievement", additivity="non_additive", explain="H",
+        use_cases=("esg_scoring", "transition_risk", "sustainable_finance"),
+        pit=_ESG_PIT_STATE,
+        degrade="only a single KPI reading (no history) -> report the achievement level only (no trend).",
+        stage="transition-risk",
+        eligibility=_ESG_EXTERNAL,
+        notes=("anchor: 'sll_kpi' (ESG-distinctive, non-structural) routes this off a churn catalog.",
+               "OUTPUT additivity is measure-dependent: achievement / trend are non-additive; breach_flag "
+               "is n/a — the default carries the non-additive case."),
+    ),
+    # B11.9 — scope3_value_chain_exposure (Scope-3 specifically — additive WITHIN a firm, not a portfolio)
+    Template(
+        id="scope3_value_chain_exposure", family="emissions",
+        intent="Scope-3 value-chain exposure — the entity's Scope-3 (15-category value-chain) emissions "
+               "level and trend (measure=absolute / trend), the ESTIMATED category most banks miss; "
+               "additive WITHIN one firm but NEVER summable across a portfolio (cross-entity "
+               "double-count).",
+        needs=(Need("scope3_col", "scope_3_emissions"),
+               Need("dq_col", "emissions_data_quality", optional=True),
+               Need("asof", "as_of_date"), Need("entity", "counterparty_id")),
+        params={"window": (365, 180, 90), "measure": ("absolute", "trend")},
+        aggregation="scope3_value_chain", additivity="additive", explain="M",
+        use_cases=("esg_scoring", "transition_risk", "climate_risk"),
+        pit=_ESG_PIT_STATE,
+        degrade="only a single Scope-3 snapshot (no history) -> report the absolute level (no trend).",
+        stage="scoring",
+        eligibility=_ESG_EXTERNAL,
+        notes=("anchor: 'scope_3_emissions' (ESG-distinctive, non-structural) routes this off a churn "
+               "catalog.",
+               _ESG_SCOPE_GUARD,
+               "OUTPUT additivity: Scope 3 is ADDITIVE WITHIN one firm; it is NOT summable across a "
+               "PORTFOLIO (a cross-entity double-count — use financed_emissions for the book) and never "
+               "summed with Scope 1/2. Heavily ESTIMATED — pair with emissions_data_quality."),
+    ),
+)
+
+
+# ──────────────────────────────────────────────────────────────────────────────────────────────────
 # The full template REGISTRY — every family, in author order. Future template passes EXTEND this tuple;
 # gate1 grounds ALL_TEMPLATES so a family surfaces only where its distinctive concepts exist in the
 # catalog (grounding is the router). RETAIL_CHURN_TEMPLATES stays a standalone name because gate1 + the
@@ -2750,7 +3459,8 @@ ASSET_MGMT_TEMPLATES: tuple[Template, ...] = (
 ALL_TEMPLATES: tuple[Template, ...] = (
     RETAIL_CHURN_TEMPLATES + CREDIT_RISK_TEMPLATES + FRAUD_TEMPLATES + AML_TEMPLATES
     + COLLECTIONS_TEMPLATES + DEPOSITS_TEMPLATES + PAYMENTS_TEMPLATES
-    + MARKETS_TEMPLATES + CUSTODY_TEMPLATES + ASSET_MGMT_TEMPLATES)
+    + MARKETS_TEMPLATES + CUSTODY_TEMPLATES + ASSET_MGMT_TEMPLATES
+    + INSURANCE_TEMPLATES + ISLAMIC_TEMPLATES + ESG_TEMPLATES)
 
 
 def _validate_family(templates: tuple[Template, ...], label: str, seen_ids: set[str]) -> None:
@@ -2786,6 +3496,9 @@ def _validate_registry() -> None:
     _validate_family(MARKETS_TEMPLATES, "MARKETS_TEMPLATES", set())
     _validate_family(CUSTODY_TEMPLATES, "CUSTODY_TEMPLATES", set())
     _validate_family(ASSET_MGMT_TEMPLATES, "ASSET_MGMT_TEMPLATES", set())
+    _validate_family(INSURANCE_TEMPLATES, "INSURANCE_TEMPLATES", set())
+    _validate_family(ISLAMIC_TEMPLATES, "ISLAMIC_TEMPLATES", set())
+    _validate_family(ESG_TEMPLATES, "ESG_TEMPLATES", set())
     _validate_family(ALL_TEMPLATES, "ALL_TEMPLATES", set())
 
 
