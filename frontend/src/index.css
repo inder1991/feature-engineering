@@ -1694,6 +1694,38 @@ section > h2:first-child {
   cursor: default;
 }
 
+/* table head splits into a title button (opens the details drawer) and a caret button (collapse),
+   sharing the 40px head; both are full-height for a comfortable hit target */
+.ln-head-btn {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  flex: 1 1 auto;
+  min-width: 0;
+  height: 100%;
+  padding: 0;
+  border: none;
+  border-radius: 0;
+  background: transparent;
+  text-align: left;
+  justify-content: flex-start;
+}
+
+.ln-caret-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  width: 28px;
+  height: 100%;
+  min-height: 0;
+  margin-right: -4px;
+  padding: 0;
+  border: none;
+  border-radius: 0;
+  background: transparent;
+}
+
 .ln-kind {
   font-family: var(--font-mono);
   font-size: 9px;
@@ -1704,17 +1736,22 @@ section > h2:first-child {
   flex: none;
 }
 
+/* Node titles are single-line: a long feature name like `days_since_last_posting` wrapped mid-word
+   inside the fixed-height head and clipped. Truncate with an ellipsis instead and carry the full
+   name in a `title` (hover) + the accessible edge list, so nothing is lost. Chosen over
+   wrap-at-underscore: CSS cannot break on `_`, and a fixed 40px head has no room for two lines. */
 .ln-name {
   font-family: var(--font-mono);
   font-size: 13px;
   font-weight: 600;
   color: var(--ink);
-  overflow-wrap: anywhere;
   min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
 }
 
 .ln-caret {
-  margin-left: auto;
   color: var(--ink-faint);
   font-size: 11px;
   flex: none;
@@ -1829,6 +1866,18 @@ section > h2:first-child {
 
 .ln-flag--feat {
   background: var(--proposal-solid);
+  color: var(--chip-ink);
+}
+
+/* soft ok chip: the feature verification stamp (checked, not a production claim) — quiet, like as-of */
+.ln-flag--ok {
+  background: var(--ok-soft);
+  color: var(--ok);
+}
+
+/* solid warn chip: the table's quarantine-pending count — operational state, at the stale weight */
+.ln-flag--warn {
+  background: var(--warn-solid);
   color: var(--chip-ink);
 }
 

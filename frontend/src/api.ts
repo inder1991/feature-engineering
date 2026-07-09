@@ -295,6 +295,19 @@ export interface LineageNode {
   as_of: boolean
   sensitivity?: string
   entity?: string
+  // column enrichment (omitted when null): controlled concept, business domain, and — only on the
+  // table's as-of column — the availability basis (posted_at | ingested_at) from its as-of fact.
+  concept?: string
+  domain?: string
+  as_of_basis?: string
+  // feature stamps (omitted when absent): the honest verification stamp (e.g. DESIGN-CHECKED) and
+  // the causal WHY it was born (its hypothesis); rationale is absent for directly-registered features.
+  verification?: string
+  rationale?: string
+  // table provenance: ISO8601 of the source's last drift-vouch (omitted when never scanned) and the
+  // count of this table's rows still in the review queue (omitted when zero).
+  last_vouched_at?: string
+  quarantine_pending?: number
   stale: boolean
   resolved: boolean
 }

@@ -353,4 +353,108 @@ describe('lineage view', () => {
     await screen.findByText('accounts')
     expect(screen.getByText(/cut at the node limit/i)).toBeInTheDocument()
   })
+
+  // ---- node metadata completeness --------------------------------------------------------
+  it('renders column enrichment (concept, domain, as-of basis) in the drawer when present', async () => {
+    const META: api.LineageGraph = {
+      nodes: [
+        tbl('deposits', 'accounts'),
+        col('deposits', 'accounts', 'balance', { concept: 'money_amount', domain: 'ledger' }),
+        col('deposits', 'accounts', 'load_ts', { as_of: true, as_of_basis: 'ingested_at' }),
+      ],
+      edges: [
+        contains('deposits', 'accounts', 'balance'),
+        contains('deposits', 'accounts', 'load_ts'),
+      ],
+      truncated: false,
+    }
+    lineageGraph.mockResolvedValue(META)
+    render(<LineageView anchor={ANCHOR} />)
+    await screen.findByText('accounts')
+    await userEvent.click(screen.getByRole('button', { name: 'balance' }))
+    const drawer = screen.getByRole('complementary', { name: 'Details' })
+    expect(within(drawer).getByText('concept')).toBeInTheDocument()
+    expect(within(drawer).getByText('money_amount')).toBeInTheDocument()
+    expect(within(drawer).getByText('domain')).toBeInTheDocument()
+    expect(within(drawer).getByText('ledger')).toBeInTheDocument()
+    // the as-of column carries its availability basis from the availability_time fact
+    await userEvent.click(screen.getByRole('button', { name: /load_ts/ }))
+    const drawer2 = screen.getByRole('complementary', { name: 'Details' })
+    expect(within(drawer2).getByText('as-of basis')).toBeInTheDocument()
+    expect(within(drawer2).getByText('ingested_at')).toBeInTheDocument()
+  })
+
+  it('shows the feature verification stamp as a soft ok chip and the Why rationale', async () => {
+    const stamped: api.LineageGraph = {
+      nodes: BASE.nodes.map(n =>
+        n.id === 'feature:feat_01HZX'
+          ? { ...n, verification: 'DESIGN-CHECKED', rationale: 'sharp balance drops precede churn' }
+          : n,
+      ),
+      edges: BASE.edges,
+      truncated: false,
+    }
+    lineageGraph.mockResolvedValue(stamped)
+    render(<LineageView anchor={ANCHOR} />)
+    await screen.findByText('accounts')
+    await userEvent.click(screen.getByRole('button', { name: /avg_eod_balance_30d/ }))
+    const drawer = screen.getByRole('complementary', { name: 'Details' })
+    expect(within(drawer).getByText('DESIGN-CHECKED')).toBeInTheDocument()
+    expect(within(drawer).getByText(/Why: sharp balance drops precede churn/)).toBeInTheDocument()
+  })
+
+  it('surfaces table provenance: a queue chip on the card and last-vouched + queue in the drawer', async () => {
+    const vouched = '2020-01-02T03:04:05.000Z'
+    const prov: api.LineageGraph = {
+      nodes: [
+        { ...tbl('deposits', 'accounts'), last_vouched_at: vouched, quarantine_pending: 3 },
+        col('deposits', 'accounts', 'balance'),
+      ],
+      edges: [contains('deposits', 'accounts', 'balance')],
+      truncated: false,
+    }
+    lineageGraph.mockResolvedValue(prov)
+    render(<LineageView anchor={ANCHOR} />)
+    await screen.findByText('accounts')
+    // the header chip shows the pending count at a glance (label carries the number, not color alone)
+    expect(screen.getByText('3 queued')).toBeInTheDocument()
+    // the table's details drawer (opened from the title) carries the provenance
+    await userEvent.click(screen.getByText('accounts').closest('button') as HTMLElement)
+    const drawer = screen.getByRole('complementary', { name: 'Details' })
+    expect(within(drawer).getByText(/Last vouched:/)).toBeInTheDocument()
+    expect(within(drawer).getByText(/3 rows in the review queue/)).toBeInTheDocument()
+    expect(drawer.querySelector('time')).toHaveAttribute('datetime', vouched)
+  })
+
+  // ---- self-join sanity ------------------------------------------------------------------
+  it('renders a declared self-join without crashing (a well-formed loop)', async () => {
+    const self: api.LineageGraph = {
+      nodes: [
+        tbl('hr', 'employees'),
+        col('hr', 'employees', 'id', { grain: true }),
+        col('hr', 'employees', 'manager_id'),
+      ],
+      edges: [
+        contains('hr', 'employees', 'id'),
+        contains('hr', 'employees', 'manager_id'),
+        {
+          from: 'hr:public.employees.manager_id', to: 'hr:public.employees.id',
+          layer: 'joins', kind: 'join', cardinality: 'N:1', resolved: true,
+        },
+      ],
+      truncated: false,
+    }
+    lineageGraph.mockResolvedValue(self)
+    const selfAnchor: api.SearchHit = {
+      ...ANCHOR, object_ref: 'public.employees.id', table: 'employees', column: 'id',
+      catalog_source: 'hr',
+    }
+    render(<LineageView anchor={selfAnchor} />)
+    expect(await screen.findByText('employees')).toBeInTheDocument()
+    // the self-join lands in the accessible edge list, both ends named, one table unit — no crash
+    const list = screen.getByRole('region', { name: 'Edges as text' })
+    expect(
+      within(list).getByText(/employees\.manager_id joins employees\.id · N:1 · verified/),
+    ).toBeInTheDocument()
+  })
 })

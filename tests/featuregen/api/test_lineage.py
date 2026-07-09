@@ -285,3 +285,82 @@ def test_node_cap_truncates_but_keeps_units_atomic(client, conn):
                    "deposits:public.accounts.posted_at", "deposits:public.accounts.balance",
                    "deposits:public.accounts.cust_id"}
     assert {e["kind"] for e in g["edges"]} == {"contains"}         # no dangling join edges
+
+
+# ---- node metadata completeness (enrichment, provenance, quarantine, feature stamps) --------
+def test_column_nodes_carry_concept_domain_and_as_of_basis(client, conn):
+    upload_csv(client, "deposits", DEPOSITS_CSV)
+    # concept/domain arrive from LLM enrichment (off in tests); set them directly to prove the wire
+    # carries them when present and omits them when null.
+    conn.execute("UPDATE graph_node SET concept = %s, domain = %s WHERE catalog_source = 'deposits' "
+                 "AND object_ref = 'public.accounts.balance'", ("money_amount", "ledger"))
+    by_id = {n["id"]: n for n in _lineage(client).json()["nodes"]}
+    bal = by_id["deposits:public.accounts.balance"]
+    assert bal["concept"] == "money_amount" and bal["domain"] == "ledger"
+    assert "as_of_basis" not in bal                                 # not an as-of column
+    assert "concept" not in by_id["deposits:public.accounts.id"]    # omitted when null
+    # the as-of column carries the basis from the table's availability_time fact (default posted_at)
+    posted = by_id["deposits:public.accounts.posted_at"]
+    assert posted["as_of"] is True and posted["as_of_basis"] == "posted_at"
+
+
+def test_table_node_carries_last_vouched_and_quarantine_pending(client):
+    upload_csv(client, "q",
+               "source,table,column,type,sensitivity\n"
+               "q,orders,id,integer,\n"
+               "q,orders,secret,text,bogus_level\n")               # bad sensitivity -> quarantined
+    body = client.get("/graph/lineage", params={
+        "ref": "public.orders.id", "source": "q"}, headers=AUTH).json()
+    orders = next(n for n in body["nodes"] if n["id"] == "q:public.orders")
+    assert "T" in orders["last_vouched_at"]                         # ISO8601 drift-vouch after upload
+    assert orders["quarantine_pending"] == 1                        # the bogus-sensitivity row
+    # a clean table vouches but omits the count entirely
+    upload_csv(client, "deposits", DEPOSITS_CSV)
+    clean = client.get("/graph/lineage", params={
+        "ref": "public.accounts.id", "source": "deposits"}, headers=AUTH).json()
+    acc = next(n for n in clean["nodes"] if n["id"] == "deposits:public.accounts")
+    assert acc["last_vouched_at"] and "quarantine_pending" not in acc
+
+
+def test_feature_node_carries_verification_and_omits_empty_rationale(client):
+    upload_csv(client, "deposits", DEPOSITS_CSV)
+    fid = _register_feature(client)
+    feat = next(n for n in _lineage(client, direction="down", depth=2).json()["nodes"]
+                if n["id"] == f"feature:{fid}")
+    assert feat["verification"] == "DESIGN-CHECKED"
+    assert "rationale" not in feat                                  # no hypothesis -> omitted
+
+
+def test_feature_node_carries_rationale_from_its_hypothesis(client, conn):
+    upload_csv(client, "deposits", DEPOSITS_CSV)
+    fid = _register_feature(client)
+    # A feature born from a hypothesis: feature -> latest contract -> contract_intent (Feature 360).
+    conn.execute("INSERT INTO contract_intent (intent_id, hypothesis, intake_mode) "
+                 "VALUES (%s, %s, %s)", ("int_x", "sharp balance drops precede churn", "hypothesis"))
+    conn.execute("INSERT INTO contract (contract_id, feature_id, feature_name, version, intent_id) "
+                 "VALUES (%s, %s, %s, %s, %s)", ("con_x", fid, "avg_balance", 1, "int_x"))
+    feat = next(n for n in _lineage(client, direction="down", depth=2).json()["nodes"]
+                if n["id"] == f"feature:{fid}")
+    assert feat["rationale"] == "sharp balance drops precede churn"
+
+
+# ---- self-join sanity ----------------------------------------------------------------------
+def test_declared_self_join_is_well_formed_edge(client):
+    # A self-referential join (employees.manager_id -> employees.id): one table unit, both endpoint
+    # columns under it, from != to at column level, and no BFS pathology (edge kept exactly once).
+    upload_csv(client, "hr",
+               "source,table,column,type,joins_to,cardinality\n"
+               "hr,employees,id,integer,,\n"
+               "hr,employees,manager_id,integer,employees.id,N:1\n")
+    body = client.get("/graph/lineage", params={
+        "ref": "public.employees.id", "source": "hr", "depth": 3}, headers=AUTH).json()
+    assert _ids(body) >= {"hr:public.employees", "hr:public.employees.id",
+                          "hr:public.employees.manager_id"}
+    joins = [e for e in body["edges"] if e["kind"] == "join"]
+    assert len(joins) == 1                                          # kept once, no BFS doubling
+    edge = joins[0]
+    assert edge["from"] != edge["to"]                              # well-formed at column level
+    assert {edge["from"], edge["to"]} == {
+        "hr:public.employees.id", "hr:public.employees.manager_id"}
+    assert edge["resolved"] is True and edge["cardinality"] == "N:1"
+    assert body["truncated"] is False

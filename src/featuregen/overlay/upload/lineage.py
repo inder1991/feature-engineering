@@ -111,7 +111,8 @@ class _Builder:
         self.edges: list[dict] = []
         self.truncated = False
         self._edge_keys: set[tuple] = set()
-        self._stale: dict[str, bool] = {}                       # per-source watermark verdict
+        self._wm: dict[str, datetime | None] = {}               # per-source drift watermark (cached)
+        self._as_of: dict[tuple[str, str], tuple[str | None, str | None]] = {}  # (source, table) -> (as-of col, basis)
         self._table_cols: dict[tuple[str, str], list[str]] = {}  # (source, table) -> visible col refs
 
     # ---- traversal -------------------------------------------------------------------------
@@ -207,30 +208,47 @@ class _Builder:
     def _unit_nodes(self, unit: _Unit) -> list[dict]:
         if unit[0] == "table":
             _, source, table = unit
-            stale = self._source_stale(source)
+            wm = self._watermark(source)
+            stale = wm is None or wm < self.now - self.fresh_within
+            # Rows this table couldn't ingest, still sitting in the review queue (quarantine_row keys
+            # the table name inside its raw jsonb). Surfaced so the map shows operational state.
+            pending = self.conn.execute(
+                "SELECT count(*) FROM quarantine_row WHERE catalog_source = %s "
+                "AND raw->>'table' = %s", (source, table)).fetchone()[0]
             out = [_prune({"id": f"{source}:{_SCHEMA}.{table}", "kind": "table",
                            "object_ref": f"{_SCHEMA}.{table}", "table": table,
                            "catalog_source": source, "grain": False, "as_of": False,
-                           "stale": stale, "resolved": True})]
+                           "stale": stale, "resolved": True,
+                           # the source's last drift-vouch; omitted when it has never been scanned
+                           "last_vouched_at": wm.isoformat() if wm is not None else None,
+                           "quarantine_pending": pending or None})]   # omit when nothing pending
+            as_of_col, basis = self._as_of_basis(source, table)
             cols = self.conn.execute(
-                "SELECT object_ref, column_name, is_grain, is_as_of, sensitivity, entity "
-                "FROM graph_node WHERE catalog_source = %s AND kind = 'column' "
+                "SELECT object_ref, column_name, is_grain, is_as_of, sensitivity, entity, "
+                "concept, domain FROM graph_node WHERE catalog_source = %s AND kind = 'column' "
                 "AND table_name = %s AND (sensitivity IS NULL OR sensitivity = ANY(%s)) "
                 "ORDER BY object_ref",
                 (source, table, self.allowed)).fetchall()
             self._table_cols[(source, table)] = [c[0] for c in cols]
-            for c_ref, column, is_grain, is_as_of, sensitivity, entity in cols:
+            for c_ref, column, is_grain, is_as_of, sensitivity, entity, concept, domain in cols:
                 out.append(_prune({"id": f"{source}:{c_ref}", "kind": "column",
                                    "object_ref": c_ref, "table": table, "column": column,
                                    "catalog_source": source, "grain": is_grain,
                                    "as_of": is_as_of, "sensitivity": sensitivity,
-                                   "entity": entity, "stale": stale, "resolved": True}))
+                                   "entity": entity, "concept": concept, "domain": domain,
+                                   # as-of BASIS lives only in the availability_time fact, keyed on
+                                   # the table's as-of column; attach it to that column alone
+                                   "as_of_basis": basis if (is_as_of and column == as_of_col)
+                                   else None,
+                                   "stale": stale, "resolved": True}))
             return out
         if unit[0] == "feature":
             _, feature_id, name = unit
-            return [{"id": f"feature:{feature_id}", "kind": "feature", "feature_id": feature_id,
-                     "name": name, "grain": False, "as_of": False,
-                     "stale": self._feature_stale(feature_id), "resolved": True}]
+            verification, rationale = self._feature_stamp(feature_id)
+            return [_prune({"id": f"feature:{feature_id}", "kind": "feature",
+                            "feature_id": feature_id, "name": name, "grain": False, "as_of": False,
+                            "verification": verification, "rationale": rationale,
+                            "stale": self._feature_stale(feature_id), "resolved": True})]
         _, model_ref = unit
         return [{"id": f"consumer:{model_ref}", "kind": "consumer", "name": model_ref,
                  "grain": False, "as_of": False, "stale": False, "resolved": True}]
@@ -379,12 +397,48 @@ class _Builder:
                   "layer": "features", "kind": "consumes", "resolved": True})
                 for fid, name in rows]
 
+    # ---- as-of basis + feature stamp (metadata the map surfaces) ----------------------------
+    def _as_of_basis(self, source: str, table: str) -> tuple[str | None, str | None]:
+        """(as-of column, availability basis) for a table, from its VERIFIED availability_time fact.
+        The BASIS (posted_at | ingested_at | event_time_plus_lag) lives ONLY in the fact stream —
+        graph_node carries just the is_as_of flag — so we read the projected read model
+        (overlay_fact_state) resolve_fact serves from, by the same (catalog_source, object_ref,
+        fact_type) key. This is a DESCRIPTIVE label, so we read the VERIFIED value directly rather
+        than re-run resolve_fact's adapter/config-gated expiry+drift machinery; node staleness is
+        surfaced separately via the `stale` flag. (None, None) when no VERIFIED fact exists."""
+        if (source, table) not in self._as_of:
+            row = self.conn.execute(
+                "SELECT value->>'column', value->>'basis' FROM overlay_fact_state "
+                "WHERE catalog_source = %s AND object_ref = %s "
+                "AND fact_type = 'availability_time' AND status = 'VERIFIED'",
+                (source, f"{_SCHEMA}.{table}")).fetchone()
+            self._as_of[(source, table)] = (row[0], row[1]) if row else (None, None)
+        return self._as_of[(source, table)]
+
+    def _feature_stamp(self, feature_id: str) -> tuple[str | None, str | None]:
+        """The feature's registered verification stamp (0968 — e.g. DESIGN-CHECKED) and the causal
+        WHY it was born: the hypothesis behind its latest governed contract (feature -> latest
+        contract -> contract_intent), the same chain Feature 360 reads. rationale is None for a
+        directly-registered feature (no hypothesis-driven contract) and is dropped by _prune."""
+        row = self.conn.execute(
+            "SELECT f.verification, "
+            "  (SELECT ci.hypothesis FROM contract c "
+            "     LEFT JOIN contract_intent ci ON ci.intent_id = c.intent_id "
+            "   WHERE c.feature_id = f.feature_id ORDER BY c.version DESC LIMIT 1) "
+            "FROM feature f WHERE f.feature_id = %s", (feature_id,)).fetchone()
+        if row is None:
+            return None, None
+        return row[0], (row[1] or None)
+
     # ---- freshness (drift watermark vs 24h, same rule as search/feature_freshness) ----------
+    def _watermark(self, source: str) -> datetime | None:
+        """The source's last successful drift-scan completion (its vouch time), cached per source."""
+        if source not in self._wm:
+            self._wm[source] = drift_watermark(self.conn, source)
+        return self._wm[source]
+
     def _source_stale(self, source: str) -> bool:
-        if source not in self._stale:
-            wm = drift_watermark(self.conn, source)
-            self._stale[source] = wm is None or wm < self.now - self.fresh_within
-        return self._stale[source]
+        return (wm := self._watermark(source)) is None or wm < self.now - self.fresh_within
 
     def _feature_stale(self, feature_id: str) -> bool:
         """A feature is stale if ANY source it derives from is (feature_freshness semantics)."""

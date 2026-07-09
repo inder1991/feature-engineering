@@ -104,6 +104,7 @@ type TableData = {
   expanding: boolean
   onToggle: (id: string) => void
   onColumn: (col: LineageNode) => void
+  onOpen: (node: LineageNode) => void
   onExpand: (node: LineageNode) => void
 }
 type StubData = { node: LineageNode }
@@ -149,18 +150,45 @@ function TableNode({ data }: NodeProps<TableNT>) {
   return (
     <div className={`ln-card nopan${node.stale ? ' ln-card--stale' : ''}`}>
       <Ports />
-      <button
-        type="button"
-        className="ln-head"
-        aria-expanded={!collapsed}
-        onClick={() => data.onToggle(node.id)}
-      >
-        <span className="ln-kind">table</span>
-        <span className="ln-name">{node.table}</span>
-        <span className="ln-caret" aria-hidden="true">
-          {collapsed ? '▸' : '▾'}
-        </span>
-      </button>
+      {/* Two controls share the head: the title opens the details drawer (table provenance), the
+          caret collapses the column list. Split (not one button) so both are reachable without
+          nesting buttons — the title used to only toggle, leaving the table drawer unreachable. */}
+      <div className="ln-head">
+        <button
+          type="button"
+          className="ln-head-btn"
+          onClick={() => data.onOpen(node)}
+        >
+          <span className="ln-kind">table</span>
+          <span className="ln-name" title={node.table}>
+            {node.table}
+          </span>
+        </button>
+        {node.quarantine_pending ? (
+          // Operational state at a glance: rows this table couldn't ingest, still in the review
+          // queue. Label carries the count so color is never the only signal (WCAG); the drawer
+          // spells it out. A solid warn chip, matching the stale flag's weight.
+          <span
+            className="ln-flag ln-flag--warn"
+            title={`${node.quarantine_pending} ${
+              node.quarantine_pending === 1 ? 'row' : 'rows'
+            } in the review queue`}
+          >
+            {node.quarantine_pending} queued
+          </span>
+        ) : null}
+        <button
+          type="button"
+          className="ln-caret-btn"
+          aria-expanded={!collapsed}
+          aria-label={`${collapsed ? 'Show' : 'Hide'} ${node.table} columns`}
+          onClick={() => data.onToggle(node.id)}
+        >
+          <span className="ln-caret" aria-hidden="true">
+            {collapsed ? '▸' : '▾'}
+          </span>
+        </button>
+      </div>
       <div className="ln-src">
         {node.catalog_source} ·{' '}
         {node.stale ? <Flag tone="stale">stale</Flag> : <span className="ln-fresh">fresh</span>}
@@ -229,7 +257,9 @@ function StubNode({ data }: NodeProps<StubNT>) {
       <Ports />
       <div className="ln-head ln-head--static">
         <span className="ln-kind">declared</span>
-        <span className="ln-name">{data.node.object_ref}</span>
+        <span className="ln-name" title={data.node.object_ref}>
+          {data.node.object_ref}
+        </span>
       </div>
       <div className="ln-body">
         Declared join target; not uploaded yet. The edge activates when its source arrives.
@@ -245,7 +275,9 @@ function FeatureNode({ data }: NodeProps<FeatureNT>) {
       <Ports />
       <button type="button" className="ln-head" onClick={() => data.onOpen(node)}>
         <span className="ln-kind">feature</span>
-        <span className="ln-name">{node.name}</span>
+        <span className="ln-name" title={node.name}>
+          {node.name}
+        </span>
       </button>
       <div className="ln-src">
         registered <Flag tone="feat">feature</Flag>
@@ -262,7 +294,9 @@ function ConsumerNode({ data }: NodeProps<ConsumerNT>) {
       <Ports />
       <button type="button" className="ln-head" onClick={() => data.onOpen(node)}>
         <span className="ln-kind">consumer</span>
-        <span className="ln-name">{node.name}</span>
+        <span className="ln-name" title={node.name}>
+          {node.name}
+        </span>
       </button>
       <div className="ln-body">
         reads {reads} {reads === 1 ? 'feature' : 'features'} in view
@@ -284,6 +318,22 @@ function idSource(id: string): string {
   // "gl:public.batches.batch_id" -> "gl" (a stub's declaring source lives only in its id).
   const i = id.indexOf(':')
   return i === -1 ? id : id.slice(0, i)
+}
+
+// A drift-vouch timestamp as a short relative phrase for the drawer; the exact instant rides along
+// in the <time dateTime> attribute, so nothing is lost. Pure given Date.now() — it never invents
+// precision (an unparseable value is echoed verbatim).
+function relativeVouched(iso: string): string {
+  const then = new Date(iso).getTime()
+  if (Number.isNaN(then)) return iso
+  const secs = Math.max(0, Math.round((Date.now() - then) / 1000))
+  if (secs < 60) return 'just now'
+  const mins = Math.round(secs / 60)
+  if (mins < 60) return `${mins} minute${mins === 1 ? '' : 's'} ago`
+  const hours = Math.round(mins / 60)
+  if (hours < 24) return `${hours} hour${hours === 1 ? '' : 's'} ago`
+  const days = Math.round(hours / 24)
+  return `${days} day${days === 1 ? '' : 's'} ago`
 }
 
 function shortRef(n: LineageNode | undefined, id: string): string {
@@ -593,6 +643,7 @@ export function LineageView({ anchor }: { anchor: SearchHit }) {
             expanding: expanding.has(n.id),
             onToggle: toggleTable,
             onColumn: openColumn,
+            onOpen: openNode,
             onExpand: expand,
           } satisfies TableData,
         }
@@ -882,6 +933,24 @@ function Drawer({
                 <dd>{node.entity}</dd>
               </>
             )}
+            {node.concept && (
+              <>
+                <dt>concept</dt>
+                <dd>{node.concept}</dd>
+              </>
+            )}
+            {node.domain && (
+              <>
+                <dt>domain</dt>
+                <dd>{node.domain}</dd>
+              </>
+            )}
+            {node.as_of_basis && (
+              <>
+                <dt>as-of basis</dt>
+                <dd>{node.as_of_basis}</dd>
+              </>
+            )}
             {isAnchorCol && anchor.data_type && (
               <>
                 <dt>type</dt>
@@ -930,6 +999,9 @@ function Drawer({
           <p className="ln-drawer-sub">registered feature</p>
           <div className="ln-drawer-chips">
             <Flag tone="feat">feature</Flag>
+            {/* the honest verification stamp: gauntlet-passed, NOT a production-value claim — a soft
+                ok chip, quieter than the solid state chips (predictive value stays unverified) */}
+            {node.verification && <Flag tone="ok">{node.verification}</Flag>}
             {node.stale && <Flag tone="stale">stale</Flag>}
           </div>
           <dl className="ln-drawer-kv">
@@ -938,6 +1010,10 @@ function Drawer({
             <dt>freshness</dt>
             <dd>{node.stale ? 'stale' : 'fresh'}</dd>
           </dl>
+          {node.rationale && (
+            // the causal WHY it was born (its hypothesis); absent for directly-registered features
+            <p className="ln-drawer-extra">Why: {node.rationale}</p>
+          )}
           <p>
             <a href={`#/registry?id=${encodeURIComponent(node.feature_id ?? '')}`}>
               View in registry
@@ -955,6 +1031,20 @@ function Drawer({
         <>
           <h3 className="ln-drawer-title">{node.object_ref}</h3>
           <p className="ln-drawer-sub">{node.catalog_source}</p>
+          {node.last_vouched_at && (
+            <p className="ln-drawer-sub">
+              Last vouched:{' '}
+              <time dateTime={node.last_vouched_at}>
+                {relativeVouched(node.last_vouched_at)}
+              </time>
+            </p>
+          )}
+          {node.quarantine_pending ? (
+            <p className="ln-drawer-note">
+              {node.quarantine_pending} {node.quarantine_pending === 1 ? 'row' : 'rows'} in the
+              review queue. Fix the source file and re-upload to clear them.
+            </p>
+          ) : null}
           {node.stale && (
             <p className="ln-drawer-note">
               Not currently vouched. Re-upload the {node.catalog_source} source to serve its
