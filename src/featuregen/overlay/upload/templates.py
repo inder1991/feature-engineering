@@ -1376,13 +1376,728 @@ AML_TEMPLATES: tuple[Template, ...] = (
 
 
 # ──────────────────────────────────────────────────────────────────────────────────────────────────
-# The full template REGISTRY — every family, in author order. Future template passes (fraud, AML,
-# collections, …) EXTEND this tuple; gate1 grounds ALL_TEMPLATES so a family surfaces only where its
-# distinctive concepts exist in the catalog (grounding is the router). RETAIL_CHURN_TEMPLATES stays a
-# standalone name because gate1 + the pilot tests still import it directly.
+# The collections & recoveries templates — the §B6 DELINQUENCY → RECOVERY journey authored to Part-F
+# depth (Phase-3 Pass-3).
+#
+# Journey (§B6): PRE-DELINQUENCY → EARLY (1-29 DPD) → MID (30-89) → LATE (90+) → RECOVERY / CHARGE-OFF.
+# Two authoring disciplines are load-bearing (mirroring credit_risk):
+#   • ROUTING — every recipe REQUIRES at least one collections-distinctive, NON-STRUCTURAL concept
+#     (delinquency_bucket / dpd / scheduled_amount / cost_to_collect / restructured_flag /
+#     recovery_amount / write_off_amount — NOT an entity/as_of concept, which the engine's structural
+#     is_grain/is_as_of scoring would bind onto ANY grain/as-of column, cross-surfacing the family).
+#     Grounding is the router: the family surfaces ONLY where the catalog carries collections signals; a
+#     churn catalog with only generic monetary_stock/flow + as_of + customer_id grounds NOTHING here
+#     (the locked invariant: ALL_TEMPLATES on the churn _CATALOG = exactly the churn lens).
+#   • NEAR-LABEL — a recipe binding a bucket/DPD roll, a forbearance concession, or (⚠⚠ hardest) a
+#     POST-charge-off recovery_amount / write_off_amount BORDERS the cure/recovery/charge-off OUTCOME:
+#     near_label=True + a ⚠ note (observe strictly BEFORE the labelled outcome). The recovery/write-off
+#     recipes carry an EXTRA hard flag — those amounts ARE ~the recovery label, so a model predicting
+#     cure/recovery must NEVER read them as an input (bind only for a downstream post-default LGD study).
+# The Part-I appendix in docs/…/2026-07-08-banking-feature-template-library.md is the doc source of record.
+# ──────────────────────────────────────────────────────────────────────────────────────────────────
+_COLLECTIONS_PIT_STATE = ("point-in-time collections STATE observed as-of: the latest bucket / DPD / flag "
+                          "within (as_of − {window}, as_of], knowable strictly ≤ as_of, never forward. "
+                          "DESIGN-TIME declaration — no data plane enforces runtime PIT.")
+_COLLECTIONS_NEAR_LABEL_PREFIX = (
+    "⚠ NEAR-LABEL: observe the collections signal STRICTLY before the cure / recovery / charge-off "
+    "outcome (never on/after it; window ≠ the label window); the 3-part leakage control must FLAG it. ")
+_RECOVERY_POST_DEFAULT = (
+    "⚠⚠ POST-DEFAULT RECOVERY-OUTCOME: recovery_amount / write_off_amount are booked AFTER charge-off — "
+    "a model predicting cure/recovery MUST NOT read them as an INPUT (they ARE ~the recovery label). "
+    "Bind ONLY for a downstream LGD / recovery-severity study observed strictly after the default event. ")
+_COLLECTIONS_VULNERABILITY = (
+    "conduct: a vulnerable-customer (FCA Consumer-Duty) flag drives supportive handling — vulnerability_"
+    "flag is special-category (engine-blocked as a feature input); segment on it downstream under a gate.")
+
+COLLECTIONS_TEMPLATES: tuple[Template, ...] = (
+    # ── EARLY (1-29 DPD) — promise / arrangement behaviour ──────────────────────────────────────────
+    # K.1 — promise_to_pay_adherence
+    Template(
+        id="promise_to_pay_adherence", family="promise_to_pay",
+        intent="Promise-to-pay adherence — share of the scheduled/promised amount actually PAID while "
+               "delinquent (payments vs scheduled_amount); a broken promise is a needs-intervention signal.",
+        needs=(Need("scheduled_col", "scheduled_amount"), Need("paid_col", "monetary_flow"),
+               Need("dpd_col", "dpd", optional=True), Need("event_ts", "event_timestamp"),
+               Need("entity", "customer_id")),
+        params={"window": (90, 60, 180), "tolerance_pct": (5, 0, 10)},
+        aggregation="ptp_adherence", additivity="non_additive", explain="H",
+        use_cases=("collections", "recoveries", "self_cure"),
+        pit=_PIT_TRAILING,
+        degrade="no delinquency (dpd) context -> compute adherence over ALL scheduled installments "
+                "(weaker + FLAGGED — not collections-scoped).",
+        stage="early-1-29-dpd",
+        eligibility="single currency — convert to base first. " + _COLLECTIONS_VULNERABILITY,
+        derived=("kept := paid ≥ scheduled × (1 − {tolerance_pct}%) — a promise-kept test per "
+                 "installment, computed DOWNSTREAM (no data plane).",),
+        notes=("anchor: 'scheduled_amount' (collections-distinctive — the promised installment DUE, "
+               "absent from a churn catalog) routes this off a churn catalog.",
+               "concept sub: no dedicated promise_to_pay concept — scheduled_amount is the promised due.",
+               "an adherence ratio — non-additive; compute per entity, never sum."),
+    ),
+    # K.2 — payment_plan_adherence
+    Template(
+        id="payment_plan_adherence", family="payment_plan",
+        intent="Payment-plan adherence — count of consecutive scheduled arrangement installments met on "
+               "time (a kept-plan streak); a broken plan flips a self-curer to needs-intervention.",
+        needs=(Need("scheduled_col", "scheduled_amount"), Need("paid_col", "monetary_flow"),
+               Need("event_ts", "event_timestamp"), Need("entity", "customer_id")),
+        params={"window": (180, 90, 365), "tolerance_pct": (5, 0, 10)},
+        aggregation="plan_adherence_streak", additivity="additive", explain="H",
+        use_cases=("collections", "recoveries", "self_cure"),
+        pit=_PIT_TRAILING,
+        degrade="no arrangement schedule -> SKIP (use promise_to_pay_adherence on ad-hoc promises).",
+        stage="early-1-29-dpd",
+        eligibility="single currency. " + _COLLECTIONS_VULNERABILITY,
+        derived=("is_met := paid ≥ scheduled × (1 − {tolerance_pct}%) per arrangement installment — the "
+                 "streak counts consecutive met installments; computed DOWNSTREAM (no data plane).",),
+        notes=("anchor: 'scheduled_amount' (collections-distinctive — the arrangement installment DUE) "
+               "routes this off a churn catalog.",
+               "a count of met installments — additive."),
+    ),
+    # ── MID (30-89 DPD) — roll dynamics + contactability ────────────────────────────────────────────
+    # K.3 — cure_reage_dynamics (bucket roll-BACK, NEAR-LABEL)
+    Template(
+        id="cure_reage_dynamics", family="cure_reage",
+        intent="Cure / re-age dynamics — did the delinquency_bucket roll BACK toward current in the "
+               "window (a self-cure / re-age)? measure=cure_flag / bucket_improvement.",
+        needs=(Need("bucket_col", "delinquency_bucket"), Need("asof", "as_of_date"),
+               Need("entity", "customer_id")),
+        params={"window": (90, 60, 180), "measure": ("cure_flag", "bucket_improvement")},
+        aggregation="cure_reage", additivity="n/a", explain="H",
+        use_cases=("collections", "recoveries", "self_cure"),
+        pit=_COLLECTIONS_PIT_STATE,
+        stage="mid-30-89-dpd",
+        near_label=True,
+        eligibility=_COLLECTIONS_NEAR_LABEL_PREFIX + "a cure/re-age IS the collections OUTCOME state — "
+                    "observe the roll-back strictly before the labelled cure. " + _COLLECTIONS_VULNERABILITY,
+        notes=("anchor: 'delinquency_bucket' (near-label, collections-distinctive) routes this off a "
+               "churn catalog.",
+               "a cure flag / bucket improvement — n/a (not summable).",
+               "borders the cure/roll label — observe strictly pre-outcome."),
+    ),
+    # K.4 — roll_forward_severity (DPD worsening, NEAR-LABEL)
+    Template(
+        id="roll_forward_severity", family="roll_rate",
+        intent="Roll-forward severity — did days-past-due WORSEN over the window (max(dpd) vs dpd at "
+               "window start)? measure=roll_forward_flag / dpd_delta; a forward roll is escalating.",
+        needs=(Need("dpd_col", "dpd"), Need("asof", "as_of_date"), Need("entity", "customer_id")),
+        params={"window": (90, 60, 180), "measure": ("roll_forward_flag", "dpd_delta")},
+        aggregation="roll_forward", additivity="n/a", explain="H",
+        use_cases=("collections", "recoveries", "early_warning"),
+        pit=_COLLECTIONS_PIT_STATE,
+        stage="mid-30-89-dpd",
+        near_label=True,
+        eligibility=_COLLECTIONS_NEAR_LABEL_PREFIX + "a DPD rolling to 90+ IS the charge-off backstop. "
+                    + _COLLECTIONS_VULNERABILITY,
+        notes=("anchor: 'dpd' (collections-distinctive; a max DPD borders the charge-off label) routes "
+               "this off a churn catalog.",
+               "a forward-roll flag / DPD delta — n/a (not summable).",
+               "borders the charge-off label — observe strictly pre-outcome."),
+    ),
+    # K.5 — right_party_contact_intensity (contactability — no contact-event concept -> substitution)
+    Template(
+        id="right_party_contact_intensity", family="contactability",
+        intent="Right-party-contact intensity — the rate/volume of successful collections contacts while "
+               "the account is worked (contactability drives cure); measure=rpc_rate / attempt_count.",
+        needs=(Need("cost_col", "cost_to_collect"), Need("event_ts", "event_timestamp"),
+               Need("entity", "customer_id")),
+        params={"window": (90, 30, 180), "measure": ("rpc_rate", "attempt_count")},
+        aggregation="rpc_intensity", additivity="non_additive", explain="M",
+        use_cases=("collections", "recoveries", "contactability"),
+        pit=_PIT_TRAILING,
+        degrade="no contact-event concept in the taxonomy -> approximate contact attempts from "
+                "cost_to_collect activity / a channel event downstream (declared derivation §D.8; FLAG).",
+        stage="mid-30-89-dpd",
+        eligibility="cost_to_collect only exists for delinquent/worked accounts (survivorship — FLAG). "
+                    + _COLLECTIONS_VULNERABILITY,
+        derived=("contact_attempt := a right-party / attempted-contact event — DERIVED downstream (no "
+                 "data plane); rpc_rate := right_party_contacts / attempts.",),
+        notes=("anchor: 'cost_to_collect' (collections-distinctive, NOT near-label — an operational "
+               "cost, not an outcome) routes this off a churn catalog.",
+               "concept sub: the taxonomy has NO contact-event / right-party-contact concept — the "
+               "collections cost_to_collect is the distinctive anchor and the contact event is a "
+               "declared downstream derivation.",
+               "OUTPUT additivity is measure-dependent: rpc_rate is a non-additive ratio; attempt_count "
+               "is additive — the default carries the ratio case."),
+    ),
+    # ── LATE (90+ DPD) — tenure, hardship, cost ─────────────────────────────────────────────────────
+    # K.6 — days_in_collection (NEAR-LABEL — the charge-off tail)
+    Template(
+        id="days_in_collection", family="collection_tenure",
+        intent="Days-in-collection — as_of − the date the account first entered a delinquent "
+               "delinquency_bucket (how long it has been worked); a long spell lowers cure probability.",
+        needs=(Need("bucket_col", "delinquency_bucket"), Need("asof", "as_of_date"),
+               Need("entity", "customer_id")),
+        params={"window": (365, 180, 90)},
+        aggregation="days_in_collection", additivity="n/a", explain="H",
+        use_cases=("collections", "recoveries"),
+        pit=_COLLECTIONS_PIT_STATE,
+        stage="late-90-plus-dpd",
+        near_label=True,
+        eligibility=_COLLECTIONS_NEAR_LABEL_PREFIX + "a lengthening collection spell borders the "
+                    "charge-off tail. " + _COLLECTIONS_VULNERABILITY,
+        notes=("anchor: 'delinquency_bucket' (near-label, collections-distinctive) — the entry into a "
+               "non-current bucket marks the collection-start clock; routes this off a churn catalog "
+               "(the collection-start date is a DESIGN-TIME declaration over bucket history).",
+               "a duration since collection-start — n/a."),
+    ),
+    # K.7 — hardship_forbearance_in_collection (restructured_flag, NEAR-LABEL)
+    Template(
+        id="hardship_forbearance_in_collection", family="forbearance",
+        intent="Hardship / forbearance-in-collection — did a concession (payment holiday / re-age / "
+               "restructure) occur while delinquent? measure=occurred_flag / count.",
+        needs=(Need("restructured_col", "restructured_flag"), Need("asof", "as_of_date"),
+               Need("entity", "customer_id")),
+        params={"window": (365, 180, 90), "measure": ("occurred_flag", "count")},
+        aggregation="hardship_forbearance", additivity="n/a", explain="H",
+        use_cases=("collections", "recoveries", "hardship"),
+        pit=_COLLECTIONS_PIT_STATE,
+        stage="late-90-plus-dpd",
+        near_label=True,
+        eligibility=_COLLECTIONS_NEAR_LABEL_PREFIX + "a forbearance concession ≈ the impaired/roll label "
+                    "(IFRS9 Stage-3 trigger). " + _COLLECTIONS_VULNERABILITY,
+        notes=("anchor: 'restructured_flag' (near-label, collections-distinctive) routes this off a "
+               "churn catalog.",
+               "OUTPUT additivity is measure-dependent: occurred_flag is n/a; a count is additive.",
+               "borders the impaired/roll label — observe strictly pre-outcome."),
+    ),
+    # K.8 — cost_to_collect_ratio (cost efficiency; NOT near-label)
+    Template(
+        id="cost_to_collect_ratio", family="cost_to_collect",
+        intent="Cost-to-collect ratio — collections/workout cost vs the balance-at-risk over the window "
+               "(cost efficiency); a high ratio flags an uneconomic-to-work account.",
+        needs=(Need("cost_col", "cost_to_collect"), Need("balance_col", "monetary_stock"),
+               Need("asof", "as_of_date"), Need("entity", "customer_id")),
+        params={"window": (365, 180, 90), "measure": ("to_balance", "absolute")},
+        aggregation="cost_to_collect_ratio", additivity="non_additive", explain="H",
+        use_cases=("collections", "recoveries", "cost_efficiency"),
+        pit=_PIT_TRAILING,
+        degrade="no balance-at-risk stock -> report the absolute cost_to_collect (additive) not the ratio.",
+        stage="late-90-plus-dpd",
+        eligibility="cost_to_collect only exists for delinquent/defaulted accounts (survivorship + "
+                    "leakage-risk — FLAG); single currency. " + _COLLECTIONS_VULNERABILITY,
+        notes=("anchor: 'cost_to_collect' (collections-distinctive, NOT near-label) routes this off a "
+               "churn catalog.",
+               "OUTPUT additivity is measure-dependent: to_balance is a non-additive ratio; the absolute "
+               "cost is an additive flow — the default carries the ratio case."),
+    ),
+    # ── RECOVERY / CHARGE-OFF — ⚠⚠ POST-DEFAULT recovery-outcome (NEAR-LABEL, hard flag) ─────────────
+    # K.9 — recovery_rate (recovery_amount — POST-charge-off, NEAR-LABEL ⚠⚠)
+    Template(
+        id="recovery_rate", family="recovery",
+        intent="Recovery rate — post-charge-off recovery_amount collected vs the defaulted/charged-off "
+               "balance (the LGD complement); measure=to_defaulted_balance / cumulative_amount.",
+        needs=(Need("recovery_col", "recovery_amount"), Need("balance_col", "monetary_stock"),
+               Need("asof", "as_of_date"), Need("entity", "customer_id")),
+        params={"window": (365, 180, 720), "measure": ("to_defaulted_balance", "cumulative_amount")},
+        aggregation="recovery_rate", additivity="non_additive", explain="H",
+        use_cases=("recoveries", "lgd", "workout"),
+        pit=_PIT_TRAILING,
+        degrade="no charged-off balance base -> report cumulative recovery_amount (additive) not the rate.",
+        stage="recovery-charge-off",
+        near_label=True,
+        eligibility=_RECOVERY_POST_DEFAULT + _COLLECTIONS_NEAR_LABEL_PREFIX + "single currency. "
+                    + _COLLECTIONS_VULNERABILITY,
+        notes=("anchor: 'recovery_amount' (near-label, POST-default — the LGD numerator) routes this off "
+               "a churn catalog.",
+               "⚠⚠ a recovery/cure model must NEVER read recovery_amount as an INPUT — it IS ~the "
+               "recovery label; bind ONLY for a downstream post-default LGD / severity study observed "
+               "strictly after the default event.",
+               "OUTPUT additivity is measure-dependent: to_defaulted_balance is a non-additive ratio; "
+               "the cumulative amount is an additive flow — the default carries the ratio case."),
+    ),
+    # K.10 — write_off_severity (write_off_amount — the charge-off IS an outcome, NEAR-LABEL ⚠⚠)
+    Template(
+        id="write_off_severity", family="charge_off",
+        intent="Write-off / charge-off severity — the write_off_amount charged off vs the exposure at "
+               "charge-off (loss severity); measure=to_exposure / amount.",
+        needs=(Need("write_off_col", "write_off_amount"), Need("exposure_col", "monetary_stock"),
+               Need("asof", "as_of_date"), Need("entity", "customer_id")),
+        params={"window": (365, 180, 720), "measure": ("to_exposure", "amount")},
+        aggregation="write_off_severity", additivity="non_additive", explain="H",
+        use_cases=("recoveries", "lgd", "workout"),
+        pit=_PIT_TRAILING,
+        degrade="no exposure base -> report the write_off_amount (additive) not the severity ratio.",
+        stage="recovery-charge-off",
+        near_label=True,
+        eligibility=_RECOVERY_POST_DEFAULT + _COLLECTIONS_NEAR_LABEL_PREFIX + "single currency. "
+                    + _COLLECTIONS_VULNERABILITY,
+        notes=("anchor: 'write_off_amount' (near-label — the charge-off IS an outcome) routes this off a "
+               "churn catalog.",
+               "⚠⚠ the charge-off IS the label event — features from write_off_amount leak it; bind ONLY "
+               "for a downstream post-charge-off loss study.",
+               "OUTPUT additivity is measure-dependent: to_exposure is a non-additive ratio; the raw "
+               "write_off_amount is an additive flow — the default carries the ratio case."),
+    ),
+)
+
+
+# ──────────────────────────────────────────────────────────────────────────────────────────────────
+# The deposit / liquidity / treasury (ALM) templates — the §B7 STABILITY spectrum authored to Part-F
+# depth (Phase-3 Pass-3).
+#
+# Spectrum (§B7): STABLE CORE → RATE-SENSITIVE → SURGE / HOT MONEY → RUNOFF-PRONE → OUTFLOW ⚠. This is
+# NOT a customer funnel but a deposit-behaviour spectrum feeding LCR/NSFR, FTP and ALM. The load-bearing
+# discipline here is ROUTING-BY-VALUE-ADD: churn ALREADY owns plain balance behaviour (balance_trend /
+# balance_volatility / days_below_threshold), so this family deliberately does NOT re-author a balance
+# stability/trend feature. Every recipe anchors on an ALM-DISTINCTIVE, NON-STRUCTURAL treasury concept a
+# plain balance catalog CANNOT ground (benchmark_rate / ftp_rate / wholesale_funding / maturity_date /
+# tenor / hqla / lcr / nsfr / repricing_gap / beta) — that binds only by exact concept match, so a churn
+# catalog with monetary_stock + as_of + customer_id grounds NOTHING here (the locked churn=churn-lens
+# invariant). A PLAIN balance concentration WOULD cross-surface, so rate_sensitive_concentration weights
+# by deposit 'beta' precisely to keep its anchor distinctive. No recipe is near-label (treasury signals
+# do not border a customer outcome). The Part-I appendix is the doc source of record.
+# ──────────────────────────────────────────────────────────────────────────────────────────────────
+_DEPOSIT_PIT_STATE = ("point-in-time deposit-behaviour STATE observed as-of: the latest balance / rate / "
+                      "ratio within (as_of − {window}, as_of], knowable strictly ≤ as_of, never forward. "
+                      "DESIGN-TIME declaration — no data plane enforces runtime PIT.")
+_DEPOSIT_NOT_A_REHASH = ("NOT a balance re-hash: an ALM/treasury signal a plain balance catalog cannot "
+                         "ground (churn already owns balance_trend / balance_volatility / days_below).")
+_ALM_SINGLE_CCY = ("single currency — convert to base first; a stock takes the LATEST over time "
+                   "(never summed across dates).")
+
+DEPOSITS_TEMPLATES: tuple[Template, ...] = (
+    # ── STABLE CORE — sticky funding + liquidity contribution ───────────────────────────────────────
+    # T.1 — nmd_stickiness (non-maturity-deposit behavioural life via FTP)
+    Template(
+        id="nmd_stickiness", family="nmd_stability",
+        intent="Non-maturity-deposit stickiness / decay — the assumed behavioural life of a non-maturity "
+               "balance priced by its funds-transfer-pricing (ftp_rate) curve; a longer FTP tenor = a "
+               "stickier core, a shorter one = decay-prone.",
+        needs=(Need("ftp_col", "ftp_rate"), Need("balance_col", "monetary_stock"),
+               Need("asof", "as_of_date"), Need("entity", "customer_id")),
+        params={"window": (365, 180, 90), "measure": ("ftp_tenor_proxy", "decay_rate")},
+        aggregation="nmd_stickiness", additivity="non_additive", explain="M",
+        use_cases=("deposit_stability", "alm", "ftp"),
+        pit=_DEPOSIT_PIT_STATE,
+        degrade="no FTP curve -> derive a decay rate from the balance's own runoff downstream (declared "
+                "derivation §D.8; probabilistic — FLAG).",
+        stage="stable-core",
+        eligibility=_ALM_SINGLE_CCY,
+        derived=("behavioural_life := the FTP-implied tenor of the NMD pool — DERIVED downstream from the "
+                 "ftp_rate curve (no data plane).",),
+        notes=("anchor: 'ftp_rate' (ALM-distinctive — the internal funds-transfer price encodes "
+               "behavioural life) routes this off a churn catalog.",
+               _DEPOSIT_NOT_A_REHASH,
+               "a decay rate / tenor proxy — non-additive."),
+    ),
+    # T.2 — hqla_eligibility_contribution (HQLA / LCR buffer contribution)
+    Template(
+        id="hqla_eligibility_contribution", family="lcr_liquidity",
+        intent="HQLA / LCR contribution — the High-Quality-Liquid-Asset amount a deposit relationship "
+               "backs (or the net cash outflow it drives against the LCR buffer) over the window.",
+        needs=(Need("hqla_col", "hqla"), Need("lcr_col", "lcr", optional=True),
+               Need("balance_col", "monetary_stock"), Need("asof", "as_of_date"),
+               Need("entity", "customer_id")),
+        params={"window": (90, 30, 180), "measure": ("hqla_amount", "net_outflow_contribution")},
+        aggregation="hqla_contribution", additivity="semi_additive", explain="H",
+        use_cases=("liquidity_risk", "alm", "lcr"),
+        pit=_DEPOSIT_PIT_STATE,
+        degrade="no HQLA buffer reported -> SKIP.",
+        stage="stable-core",
+        eligibility=_ALM_SINGLE_CCY,
+        notes=("anchor: 'hqla' (ALM-distinctive — the Basel-III LCR buffer stock) routes this off a "
+               "churn catalog.",
+               _DEPOSIT_NOT_A_REHASH,
+               "an HQLA / outflow AMOUNT — semi-additive: sum across the buffer, latest over time (never "
+               "sum daily snapshots)."),
+    ),
+    # T.3 — nsfr_asf_contribution (NSFR available-stable-funding contribution)
+    Template(
+        id="nsfr_asf_contribution", family="nsfr_funding",
+        intent="NSFR available-stable-funding contribution — the structural funding stability a deposit "
+               "provides under the Net-Stable-Funding-Ratio (its ASF factor × balance); "
+               "measure=nsfr_ratio / asf_amount.",
+        needs=(Need("nsfr_col", "nsfr"), Need("balance_col", "monetary_stock"),
+               Need("asof", "as_of_date"), Need("entity", "customer_id")),
+        params={"window": (365, 180, 90), "measure": ("nsfr_ratio", "asf_amount")},
+        aggregation="nsfr_asf", additivity="non_additive", explain="H",
+        use_cases=("liquidity_risk", "alm", "nsfr"),
+        pit=_DEPOSIT_PIT_STATE,
+        degrade="no NSFR / ASF factor -> SKIP.",
+        stage="stable-core",
+        eligibility=_ALM_SINGLE_CCY,
+        notes=("anchor: 'nsfr' (ALM-distinctive — the Basel-III Net Stable Funding Ratio) routes this "
+               "off a churn catalog.",
+               _DEPOSIT_NOT_A_REHASH,
+               "OUTPUT additivity is measure-dependent: nsfr_ratio is a non-additive ratio; asf_amount "
+               "is a semi-additive stock — the default carries the ratio case."),
+    ),
+    # ── RATE-SENSITIVE — deposit beta, LCR outflow weight, repricing gap ────────────────────────────
+    # T.4 — deposit_beta (rate sensitivity vs a benchmark reference rate)
+    Template(
+        id="deposit_beta", family="rate_sensitivity",
+        intent="Deposit beta / rate-sensitivity — how much the deposit rate (or balance) responds to a "
+               "move in a reference benchmark_rate: Δ(paid rate)/Δ(benchmark) over the window; high beta "
+               "= rate-sensitive, run-prone funding.",
+        needs=(Need("benchmark_col", "benchmark_rate"), Need("balance_col", "monetary_stock"),
+               Need("asof", "as_of_date"), Need("entity", "customer_id")),
+        params={"window": (365, 180, 90), "measure": ("rate_beta", "balance_beta")},
+        aggregation="deposit_beta", additivity="non_additive", explain="H",
+        use_cases=("deposit_stability", "alm", "liquidity_risk", "ftp"),
+        pit=_DEPOSIT_PIT_STATE,
+        degrade="only a single rate snapshot (no history) -> SKIP (no beta from one point).",
+        stage="rate-sensitive",
+        eligibility=_ALM_SINGLE_CCY,
+        notes=("anchor: 'benchmark_rate' (ALM-distinctive reference rate — SOFR/SONIA/€STR) routes this "
+               "off a churn catalog.",
+               _DEPOSIT_NOT_A_REHASH,
+               "a beta (a ratio) — non-additive; compute per depositor/segment, never sum."),
+    ),
+    # T.5 — lcr_outflow_weight (modelled 30-day net-cash-outflow rate)
+    Template(
+        id="lcr_outflow_weight", family="lcr_liquidity",
+        intent="LCR outflow weight — the deposit's modelled 30-day net-cash-outflow RATE (the LCR runoff "
+               "factor applied to the balance); a higher weight = less LCR-friendly funding.",
+        needs=(Need("lcr_col", "lcr"), Need("balance_col", "monetary_stock"),
+               Need("asof", "as_of_date"), Need("entity", "customer_id")),
+        params={"window": (90, 30, 180)},
+        aggregation="lcr_outflow_weight", additivity="non_additive", explain="H",
+        use_cases=("liquidity_risk", "alm", "lcr"),
+        pit=_DEPOSIT_PIT_STATE,
+        degrade="no LCR runoff factor -> SKIP.",
+        stage="rate-sensitive",
+        eligibility=_ALM_SINGLE_CCY,
+        notes=("anchor: 'lcr' (ALM-distinctive — the Basel-III Liquidity Coverage Ratio) routes this off "
+               "a churn catalog.",
+               _DEPOSIT_NOT_A_REHASH,
+               "an outflow-weight RATIO — non-additive; compute per depositor/segment, never sum."),
+    ),
+    # T.6 — repricing_gap_exposure (IRRBB repricing/maturity gap)
+    Template(
+        id="repricing_gap_exposure", family="irrbb_repricing",
+        intent="Repricing-gap exposure — the net IRRBB repricing/maturity gap (assets less liabilities "
+               "repricing in a time bucket) the deposit book carries; a large signed gap is rate-risk "
+               "exposure.",
+        needs=(Need("gap_col", "repricing_gap"), Need("asof", "as_of_date"),
+               Need("entity", "customer_id")),
+        params={"window": (90, 180, 365), "measure": ("gap_level", "gap_trend")},
+        aggregation="repricing_gap", additivity="non_additive", explain="H",
+        use_cases=("liquidity_risk", "alm", "irrbb"),
+        pit=_DEPOSIT_PIT_STATE,
+        degrade="no repricing-bucket gap reported -> SKIP.",
+        stage="rate-sensitive",
+        eligibility="the gap NETS within a snapshot (assets − liabilities) — never sum across dates.",
+        notes=("anchor: 'repricing_gap' (ALM-distinctive — the IRRBB gap) routes this off a churn "
+               "catalog.",
+               _DEPOSIT_NOT_A_REHASH,
+               "a signed gap that nets within a snapshot — non-additive; never summed across dates."),
+    ),
+    # ── SURGE / HOT MONEY — non-core funding share + concentration ───────────────────────────────────
+    # T.7 — hot_money_share (non-core wholesale funding share)
+    Template(
+        id="hot_money_share", family="hot_money",
+        intent="Hot-money / surge share — the share of the funding base that is non-core wholesale/market "
+               "funding (wholesale_funding) vs sticky retail deposits; high hot-money share = surge/run "
+               "risk.",
+        needs=(Need("wholesale_col", "wholesale_funding"), Need("balance_col", "monetary_stock"),
+               Need("asof", "as_of_date"), Need("entity", "customer_id")),
+        params={"window": (90, 180, 365), "measure": ("value_share", "surge_flag")},
+        aggregation="hot_money_share", additivity="non_additive", explain="H",
+        use_cases=("deposit_stability", "alm", "liquidity_risk"),
+        pit=_DEPOSIT_PIT_STATE,
+        degrade="no wholesale-funding split -> SKIP (a plain balance can't separate core vs hot money).",
+        stage="surge-hot-money",
+        eligibility=_ALM_SINGLE_CCY,
+        notes=("anchor: 'wholesale_funding' (ALM-distinctive — non-core funding, a run-off-risk stock) "
+               "routes this off a churn catalog.",
+               _DEPOSIT_NOT_A_REHASH,
+               "OUTPUT additivity is measure-dependent: value_share is a non-additive ratio; surge_flag "
+               "is n/a — the default carries the ratio case."),
+    ),
+    # T.8 — rate_sensitive_concentration (funding concentration WEIGHTED by deposit beta)
+    Template(
+        id="rate_sensitive_concentration", family="funding_concentration",
+        intent="Rate-sensitive funding concentration — how concentrated the funding base is in high-beta "
+               "/ hot depositors (an HHI of balance weighted by deposit beta); a book concentrated in "
+               "rate-sensitive money is run-prone.",
+        needs=(Need("beta_col", "beta"), Need("balance_col", "monetary_stock"),
+               Need("asof", "as_of_date"), Need("entity", "customer_id")),
+        params={"window": (365, 180, 90), "measure": ("beta_weighted_hhi", "top_depositor_share")},
+        aggregation="rate_sensitive_concentration", additivity="non_additive", explain="M",
+        use_cases=("deposit_stability", "alm", "liquidity_risk", "concentration_risk"),
+        pit=_DEPOSIT_PIT_STATE,
+        degrade="no per-depositor deposit beta -> approximate with a plain balance HHI (weaker; FLAG — "
+                "loses the rate-sensitivity weighting).",
+        stage="surge-hot-money",
+        eligibility=_ALM_SINGLE_CCY,
+        notes=("anchor: 'beta' (ALM-distinctive deposit beta) routes this off a churn catalog — a PLAIN "
+               "balance concentration WOULD cross-surface (monetary_stock + customer_id exist on churn), "
+               "so the beta weighting is load-bearing for routing, not just economics.",
+               _DEPOSIT_NOT_A_REHASH,
+               "a concentration index (HHI / top-share) — non-additive."),
+    ),
+    # ── RUNOFF-PRONE — maturity laddering + early-break behaviour ────────────────────────────────────
+    # T.9 — maturity_ladder_runoff (term deposits maturing in a horizon bucket)
+    Template(
+        id="maturity_ladder_runoff", family="runoff_ladder",
+        intent="Runoff / maturity laddering — the balance (or share) of term deposits maturing inside a "
+               "horizon bucket keyed on maturity_date; a lumpy near-dated ladder is refinancing/runoff "
+               "risk.",
+        needs=(Need("maturity_col", "maturity_date"), Need("balance_col", "monetary_stock"),
+               Need("asof", "as_of_date"), Need("entity", "customer_id")),
+        params={"horizon_days": (30, 90, 365), "measure": ("runoff_share", "runoff_amount")},
+        aggregation="maturity_runoff", additivity="non_additive", explain="H",
+        use_cases=("deposit_stability", "alm", "liquidity_risk"),
+        pit=_DEPOSIT_PIT_STATE,
+        degrade="no maturity_date (a non-maturity deposit) -> SKIP; use nmd_stickiness for NMDs.",
+        stage="runoff-prone",
+        eligibility=_ALM_SINGLE_CCY,
+        notes=("anchor: 'maturity_date' (ALM-distinctive — the contractual runoff clock) routes this off "
+               "a churn catalog.",
+               _DEPOSIT_NOT_A_REHASH,
+               "OUTPUT additivity is measure-dependent: runoff_amount is a semi-additive stock (latest "
+               "over time); runoff_share is a non-additive ratio — the default carries the ratio case."),
+    ),
+    # T.10 — early_withdrawal_break (term deposits broken before their contractual term)
+    Template(
+        id="early_withdrawal_break", family="break_behaviour",
+        intent="Early-withdrawal / break behaviour — the rate at which term deposits are broken BEFORE "
+               "their contractual term (tenor) elapses; measure=break_rate / break_count. Early breaks "
+               "shorten effective funding life.",
+        needs=(Need("tenor_col", "tenor"), Need("balance_col", "monetary_stock"),
+               Need("asof", "as_of_date"), Need("entity", "customer_id")),
+        params={"window": (365, 180, 90), "measure": ("break_rate", "break_count")},
+        aggregation="early_break", additivity="non_additive", explain="H",
+        use_cases=("deposit_stability", "alm", "liquidity_risk"),
+        pit=_DEPOSIT_PIT_STATE,
+        degrade="no term (tenor) -> SKIP (a non-maturity deposit cannot be 'broken' early).",
+        stage="runoff-prone",
+        eligibility="single currency; a notice-period deposit substitutes its notice term for 'tenor'.",
+        derived=("is_early_break := a withdrawal before the contractual term elapses — a break EVENT "
+                 "DERIVED downstream (no data plane); break_rate := early breaks / active term deposits.",),
+        notes=("anchor: 'tenor' (ALM-distinctive — the contractual term) routes this off a churn catalog.",
+               "concept sub: no dedicated notice_period concept — a notice-period deposit substitutes its "
+               "notice term for 'tenor'.",
+               _DEPOSIT_NOT_A_REHASH,
+               "OUTPUT additivity is measure-dependent: break_rate is a non-additive ratio; break_count "
+               "is additive — the default carries the ratio case."),
+    ),
+)
+
+
+# ──────────────────────────────────────────────────────────────────────────────────────────────────
+# The payments-as-a-business templates — the §B14 payments beyond cards, authored to Part-F depth
+# (Phase-3 Pass-3).
+#
+# Coverage (§B14): rail/scheme throughput + mix, interchange/MDR economics, settlement quality
+# (authorisation / chargeback / returns / timing), corridor/cross-border mix, and payment-purpose mix.
+# The load-bearing discipline is ROUTING: every recipe REQUIRES a payments-distinctive, NON-STRUCTURAL
+# concept (payment_rail / scheme / interchange / merchant_discount_rate / settlement_status /
+# settlement_cycle / direct_debit / corridor / iso20022_purpose_code — that binds only by exact concept
+# match). Grounding is the router; a churn catalog (which even carries beneficiary_bank but NO
+# payment_rail / dr-cr / rail signals) grounds NOTHING here — the locked churn=churn-lens invariant.
+# These payments recipes DO also ground on the fraud/AML crime catalog (which carries payment_rail /
+# scheme / corridor / dr-cr) — that is expected overlap and breaks no crime test (those assert per-family
+# grounding, never that ALL_TEMPLATES on the crime catalog is only fraud+AML). Additivity: economics
+# amounts (interchange / value) additive, rates non-additive, mix/diversity n/a. No recipe is near-label
+# (a payments-throughput/economics signal does not border a customer outcome). Part-I is the doc source.
+# ──────────────────────────────────────────────────────────────────────────────────────────────────
+_PAYMENTS_CORRIDOR_PROXY = (
+    "⚠ corridor / country_code are national-origin PROXIES (fair-lending) — proxy-flagged; payments/AML-"
+    "permitted but bias-watched, NEVER a credit input.")
+
+PAYMENTS_TEMPLATES: tuple[Template, ...] = (
+    # ── THROUGHPUT & MIX — volume/value by rail, rail/scheme diversity, purpose mix ─────────────────
+    # Y.1 — rail_volume_value
+    Template(
+        id="rail_volume_value", family="rail_mix",
+        intent="Payment volume / value by rail — count (or summed value) of payments on a given "
+               "payment_rail (FPS/BACS/CHAPS/SEPA/ACH/card) over the window; the base throughput signal.",
+        needs=(Need("rail", "payment_rail"), Need("flow_col", "monetary_flow"),
+               Need("event_ts", "event_timestamp"), Need("entity", "customer_id")),
+        params={"window": (90, 30, 180), "measure": ("value", "count")},
+        aggregation="rail_volume", additivity="additive", explain="H",
+        use_cases=("payments", "payments_ops", "merchant_analytics"),
+        pit=_PIT_TRAILING,
+        degrade="no payment_rail -> SKIP (this is a rail-segmented throughput signal).",
+        stage="throughput",
+        eligibility="single currency for the value measure — convert to base first.",
+        notes=("anchor: 'payment_rail' (payments-distinctive) routes this off a churn catalog.",
+               "a count / summed value — additive across entities and time."),
+    ),
+    # Y.2 — rail_scheme_diversity
+    Template(
+        id="rail_scheme_diversity", family="rail_mix",
+        intent="Rail / scheme mix & diversity — the number of distinct payment_rails (and card schemes) a "
+               "customer uses and how concentrated the mix is (HHI); measure=distinct_count / hhi.",
+        needs=(Need("rail", "payment_rail"), Need("scheme", "scheme", optional=True),
+               Need("event_ts", "event_timestamp"), Need("entity", "customer_id")),
+        params={"window": (90, 180, 365), "measure": ("distinct_count", "hhi")},
+        aggregation="rail_scheme_diversity", additivity="n/a", explain="H",
+        use_cases=("payments", "merchant_analytics", "segmentation"),
+        pit=_PIT_TRAILING,
+        degrade="no scheme tag -> compute rail-only diversity (still valid; note the narrower scope).",
+        stage="mix",
+        notes=("anchor: 'payment_rail' (payments-distinctive) routes this off a churn catalog.",
+               "a mix / diversity index (distinct-count or HHI) — n/a (not summable)."),
+    ),
+    # Y.3 — purpose_code_diversity
+    Template(
+        id="purpose_code_diversity", family="purpose_mix",
+        intent="Payment-purpose mix & diversity — the distinct ISO-20022 purpose codes (SALA/SUPP/…) a "
+               "customer's payments carry and their concentration (HHI); a structured payments-context "
+               "signal for analytics/segmentation.",
+        needs=(Need("purpose_col", "iso20022_purpose_code"), Need("event_ts", "event_timestamp"),
+               Need("entity", "customer_id")),
+        params={"window": (90, 180, 365), "measure": ("distinct_count", "hhi")},
+        aggregation="purpose_diversity", additivity="n/a", explain="H",
+        use_cases=("payments", "merchant_analytics", "segmentation"),
+        pit=_PIT_TRAILING,
+        degrade="no iso20022_purpose_code -> SKIP.",
+        stage="mix",
+        notes=("anchor: 'iso20022_purpose_code' (payments-distinctive structured purpose) routes this off "
+               "a churn catalog.",
+               "a mix / diversity index — n/a (not summable)."),
+    ),
+    # ── ECONOMICS — interchange revenue + merchant discount rate ─────────────────────────────────────
+    # Y.4 — interchange_revenue
+    Template(
+        id="interchange_revenue", family="economics",
+        intent="Interchange economics — issuer interchange revenue earned on a customer's card "
+               "transactions over the window (an additive economics flow).",
+        needs=(Need("interchange_col", "interchange"), Need("event_ts", "event_timestamp"),
+               Need("entity", "customer_id")),
+        params={"window": (90, 30, 180), "measure": ("sum", "avg_per_txn")},
+        aggregation="interchange_revenue", additivity="additive", explain="H",
+        use_cases=("payments", "interchange_optimisation", "merchant_analytics"),
+        pit=_PIT_TRAILING,
+        degrade="no interchange flow -> SKIP.",
+        stage="economics",
+        eligibility="single currency — convert to base first.",
+        notes=("anchor: 'interchange' (payments-distinctive economics flow) routes this off a churn "
+               "catalog.",
+               "OUTPUT additivity is measure-dependent: the interchange SUM is an additive flow; "
+               "avg_per_txn is n/a — the default carries the additive sum."),
+    ),
+    # Y.5 — merchant_discount_economics
+    Template(
+        id="merchant_discount_economics", family="economics",
+        intent="Merchant-discount economics — the effective merchant_discount_rate (MDR, the acquiring "
+               "fee %) a merchant is charged, and its trend over the window; the acquiring-margin signal.",
+        needs=(Need("mdr_col", "merchant_discount_rate"), Need("flow_col", "monetary_flow", optional=True),
+               Need("event_ts", "event_timestamp"), Need("entity", "customer_id")),
+        params={"window": (90, 180, 365), "measure": ("level", "trend")},
+        aggregation="mdr_economics", additivity="non_additive", explain="H",
+        use_cases=("payments", "merchant_analytics", "interchange_optimisation"),
+        pit=_PIT_TRAILING,
+        degrade="no MDR reported -> SKIP.",
+        stage="economics",
+        notes=("anchor: 'merchant_discount_rate' (payments-distinctive) routes this off a churn catalog.",
+               "an MDR RATE (or its trend) — non-additive; never sum or naively average across notionals."),
+    ),
+    # ── SETTLEMENT QUALITY — authorisation / chargeback / returns / timing ──────────────────────────
+    # Y.6 — authorisation_decline_rate
+    Template(
+        id="authorisation_decline_rate", family="settlement_quality",
+        intent="Authorisation / decline rate — the share of payment attempts that settle vs are "
+               "declined/failed, read from settlement_status (pending/settled/failed/partial); a rising "
+               "decline rate is a friction / risk signal.",
+        needs=(Need("status_col", "settlement_status"), Need("event_ts", "event_timestamp"),
+               Need("entity", "customer_id")),
+        params={"window": (90, 30, 180), "measure": ("decline_rate", "approval_rate")},
+        aggregation="auth_decline_rate", additivity="non_additive", explain="H",
+        use_cases=("payments", "payments_ops", "merchant_analytics"),
+        pit=_PIT_TRAILING,
+        degrade="no settlement_status -> SKIP.",
+        stage="settlement",
+        notes=("anchor: 'settlement_status' (payments-distinctive) routes this off a churn catalog.",
+               "an approval / decline RATE — non-additive; compute per entity, never sum."),
+    ),
+    # Y.7 — chargeback_dispute_rate (no chargeback concept -> scheme anchor + substitution)
+    Template(
+        id="chargeback_dispute_rate", family="settlement_quality",
+        intent="Chargeback / dispute rate — the share of a merchant's (or cardholder's) card "
+               "transactions that are charged back or disputed under the card scheme's rules over the "
+               "window.",
+        needs=(Need("scheme", "scheme"), Need("flow_col", "monetary_flow", optional=True),
+               Need("event_ts", "event_timestamp"), Need("entity", "customer_id")),
+        params={"window": (180, 90, 365), "measure": ("count_rate", "value_rate")},
+        aggregation="chargeback_rate", additivity="non_additive", explain="H",
+        use_cases=("payments", "merchant_analytics", "fraud"),
+        pit=_PIT_TRAILING,
+        degrade="no card scheme -> SKIP (chargebacks are a card-scheme construct).",
+        stage="settlement",
+        derived=("is_chargeback := a scheme dispute / chargeback on the transaction — DERIVED downstream "
+                 "(no data plane); the taxonomy has no dedicated chargeback concept.",),
+        notes=("anchor: 'scheme' (payments-distinctive — card chargebacks are scheme-governed) routes "
+               "this off a churn catalog.",
+               "concept sub: no dedicated chargeback concept — the dispute/chargeback event is a "
+               "declared downstream derivation scoped by the card scheme.",
+               "a chargeback RATE — non-additive; compute per entity, never sum."),
+    ),
+    # Y.8 — return_payment_rate (direct-debit returns / standing-order failures)
+    Template(
+        id="return_payment_rate", family="settlement_quality",
+        intent="Return / failed-payment rate — the share of direct-debit collections (or standing "
+               "orders) that are RETURNED unpaid (NSF / mandate cancelled / no funds) over the window; a "
+               "rising return rate is credit + operational stress.",
+        needs=(Need("dd_col", "direct_debit"), Need("so_col", "standing_order", optional=True),
+               Need("event_ts", "event_timestamp"), Need("entity", "customer_id")),
+        params={"window": (90, 180, 365), "measure": ("return_rate", "return_count")},
+        aggregation="return_payment_rate", additivity="non_additive", explain="H",
+        use_cases=("payments", "payments_ops", "collections"),
+        pit=_PIT_TRAILING,
+        degrade="no direct-debit / standing-order data -> SKIP.",
+        stage="settlement",
+        notes=("anchor: 'direct_debit' (payments-distinctive mandate + its return events) routes this off "
+               "a churn catalog.",
+               "OUTPUT additivity is measure-dependent: return_rate is a non-additive ratio; "
+               "return_count is additive — the default carries the ratio case."),
+    ),
+    # Y.9 — settlement_lag (timing vs the T+n settlement_cycle convention)
+    Template(
+        id="settlement_lag", family="settlement_timing",
+        intent="Settlement timing / lag — the mean settlement lag vs the rail's settlement_cycle "
+               "convention (T+0/T+1/T+2) and the share settling late; PIT-critical (a fail is not "
+               "knowable until T+n).",
+        needs=(Need("cycle_col", "settlement_cycle"), Need("event_ts", "event_timestamp"),
+               Need("entity", "customer_id")),
+        params={"window": (90, 30, 180), "measure": ("mean_lag_days", "late_share")},
+        aggregation="settlement_lag", additivity="n/a", explain="H",
+        use_cases=("payments", "payments_ops"),
+        pit=("trailing window (as_of − {window}, as_of]; PIT-CRITICAL — a settlement outcome is not "
+             "KNOWABLE until T+n (settlement_cycle), so honour system_time. DESIGN-TIME declaration — "
+             "no data plane enforces it."),
+        degrade="no settlement_cycle convention -> SKIP.",
+        stage="settlement",
+        notes=("anchor: 'settlement_cycle' (payments-distinctive T+n convention) routes this off a churn "
+               "catalog.",
+               "OUTPUT additivity is measure-dependent: mean_lag_days is n/a (a duration); late_share is "
+               "a non-additive ratio — the default carries the duration case."),
+    ),
+    # ── CROSS-BORDER — corridor mix + cross-border share (PROXY) ─────────────────────────────────────
+    # Y.10 — corridor_cross_border_share
+    Template(
+        id="corridor_cross_border_share", family="corridor_mix",
+        intent="Corridor mix / cross-border share — the share of a customer's payment value flowing "
+               "through cross-border corridors (and the mix across them) over the window.",
+        needs=(Need("corridor", "corridor"), Need("country", "country_code", optional=True),
+               Need("flow_col", "monetary_flow"), Need("event_ts", "event_timestamp"),
+               Need("entity", "customer_id")),
+        params={"window": (90, 180, 365), "measure": ("cross_border_share", "corridor_hhi")},
+        aggregation="corridor_cross_border", additivity="non_additive", explain="H",
+        use_cases=("payments", "cross_border", "merchant_analytics"),
+        pit=_PIT_TRAILING,
+        degrade="no corridor -> SKIP.",
+        stage="cross-border",
+        eligibility=_PAYMENTS_CORRIDOR_PROXY,
+        notes=("anchor: 'corridor' (payments-distinctive, PROXY) routes this off a churn catalog.",
+               "OUTPUT additivity is measure-dependent: cross_border_share / corridor_hhi are "
+               "non-additive ratios — compute per entity, never sum."),
+    ),
+)
+
+
+# ──────────────────────────────────────────────────────────────────────────────────────────────────
+# The full template REGISTRY — every family, in author order. Future template passes EXTEND this tuple;
+# gate1 grounds ALL_TEMPLATES so a family surfaces only where its distinctive concepts exist in the
+# catalog (grounding is the router). RETAIL_CHURN_TEMPLATES stays a standalone name because gate1 + the
+# pilot tests still import it directly.
 # ──────────────────────────────────────────────────────────────────────────────────────────────────
 ALL_TEMPLATES: tuple[Template, ...] = (
-    RETAIL_CHURN_TEMPLATES + CREDIT_RISK_TEMPLATES + FRAUD_TEMPLATES + AML_TEMPLATES)
+    RETAIL_CHURN_TEMPLATES + CREDIT_RISK_TEMPLATES + FRAUD_TEMPLATES + AML_TEMPLATES
+    + COLLECTIONS_TEMPLATES + DEPOSITS_TEMPLATES + PAYMENTS_TEMPLATES)
 
 
 def _validate_family(templates: tuple[Template, ...], label: str, seen_ids: set[str]) -> None:
@@ -1412,6 +2127,9 @@ def _validate_registry() -> None:
     _validate_family(CREDIT_RISK_TEMPLATES, "CREDIT_RISK_TEMPLATES", set())
     _validate_family(FRAUD_TEMPLATES, "FRAUD_TEMPLATES", set())
     _validate_family(AML_TEMPLATES, "AML_TEMPLATES", set())
+    _validate_family(COLLECTIONS_TEMPLATES, "COLLECTIONS_TEMPLATES", set())
+    _validate_family(DEPOSITS_TEMPLATES, "DEPOSITS_TEMPLATES", set())
+    _validate_family(PAYMENTS_TEMPLATES, "PAYMENTS_TEMPLATES", set())
     _validate_family(ALL_TEMPLATES, "ALL_TEMPLATES", set())
 
 

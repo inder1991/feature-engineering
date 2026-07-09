@@ -24,8 +24,11 @@ from featuregen.overlay.upload.graph import build_graph
 from featuregen.overlay.upload.templates import (
     ALL_TEMPLATES,
     AML_TEMPLATES,
+    COLLECTIONS_TEMPLATES,
     CREDIT_RISK_TEMPLATES,
+    DEPOSITS_TEMPLATES,
     FRAUD_TEMPLATES,
+    PAYMENTS_TEMPLATES,
     RETAIL_CHURN_TEMPLATES,
     GroundedFeature,
     ground_all,
@@ -235,12 +238,20 @@ def test_all_templates_on_a_churn_catalog_still_yields_only_the_churn_lens(db):
     assert not (combined & (_ALL_FRAUD_IDS | set(AML)))
 
 
-# ── registry: ALL_TEMPLATES is the union of all four families, globally id-unique ──────────────────
+# ── registry: ALL_TEMPLATES is the union of all seven families, globally id-unique ─────────────────
 def test_all_templates_registry_is_globally_unique_with_crime_families():
     ids = [t.id for t in ALL_TEMPLATES]
     assert len(ids) == len(set(ids))                      # no duplicate id across families
     assert set(ids) == (
         {t.id for t in RETAIL_CHURN_TEMPLATES} | {t.id for t in CREDIT_RISK_TEMPLATES}
-        | _ALL_FRAUD_IDS | set(AML))
+        | _ALL_FRAUD_IDS | set(AML)
+        | {t.id for t in COLLECTIONS_TEMPLATES} | {t.id for t in DEPOSITS_TEMPLATES}
+        | {t.id for t in PAYMENTS_TEMPLATES})
     assert len(ALL_TEMPLATES) == (
-        len(RETAIL_CHURN_TEMPLATES) + len(CREDIT_RISK_TEMPLATES) + len(FRAUD_TEMPLATES) + len(AML_TEMPLATES))
+        len(RETAIL_CHURN_TEMPLATES) + len(CREDIT_RISK_TEMPLATES) + len(FRAUD_TEMPLATES)
+        + len(AML_TEMPLATES) + len(COLLECTIONS_TEMPLATES) + len(DEPOSITS_TEMPLATES)
+        + len(PAYMENTS_TEMPLATES))
+    # the crime families collide no id with the three new core-3 families.
+    assert not ((_ALL_FRAUD_IDS | set(AML)) & (
+        {t.id for t in COLLECTIONS_TEMPLATES} | {t.id for t in DEPOSITS_TEMPLATES}
+        | {t.id for t in PAYMENTS_TEMPLATES}))

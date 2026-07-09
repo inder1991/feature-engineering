@@ -24,8 +24,11 @@ from featuregen.overlay.upload.graph import build_graph
 from featuregen.overlay.upload.templates import (
     ALL_TEMPLATES,
     AML_TEMPLATES,
+    COLLECTIONS_TEMPLATES,
     CREDIT_RISK_TEMPLATES,
+    DEPOSITS_TEMPLATES,
     FRAUD_TEMPLATES,
+    PAYMENTS_TEMPLATES,
     RETAIL_CHURN_TEMPLATES,
     GroundedFeature,
     ground_all,
@@ -211,10 +214,20 @@ def test_all_templates_on_a_churn_catalog_yields_only_the_churn_lens(db):
 def test_all_templates_registry_is_globally_unique():
     ids = [t.id for t in ALL_TEMPLATES]
     assert len(ids) == len(set(ids))                      # no duplicate id across families
-    # ALL_TEMPLATES is the union of every authored family (churn + credit + fraud + AML). The credit
-    # family stays globally id-unique within it; extending the registry must not collide an id.
-    assert set(ids) == ({t.id for t in RETAIL_CHURN_TEMPLATES} | _ALL_CREDIT_IDS
-                        | {t.id for t in FRAUD_TEMPLATES} | {t.id for t in AML_TEMPLATES})
-    assert len(ALL_TEMPLATES) == (len(RETAIL_CHURN_TEMPLATES) + len(CREDIT_RISK_TEMPLATES)
-                                  + len(FRAUD_TEMPLATES) + len(AML_TEMPLATES))
-    assert not (_ALL_CREDIT_IDS & ({t.id for t in FRAUD_TEMPLATES} | {t.id for t in AML_TEMPLATES}))
+    # ALL_TEMPLATES is the union of every authored family (churn + credit + fraud + AML + collections +
+    # deposits + payments — the full seven-family union). The credit family stays globally id-unique
+    # within it; extending the registry must not collide an id.
+    assert set(ids) == (
+        {t.id for t in RETAIL_CHURN_TEMPLATES} | _ALL_CREDIT_IDS
+        | {t.id for t in FRAUD_TEMPLATES} | {t.id for t in AML_TEMPLATES}
+        | {t.id for t in COLLECTIONS_TEMPLATES} | {t.id for t in DEPOSITS_TEMPLATES}
+        | {t.id for t in PAYMENTS_TEMPLATES})
+    assert len(ALL_TEMPLATES) == (
+        len(RETAIL_CHURN_TEMPLATES) + len(CREDIT_RISK_TEMPLATES) + len(FRAUD_TEMPLATES)
+        + len(AML_TEMPLATES) + len(COLLECTIONS_TEMPLATES) + len(DEPOSITS_TEMPLATES)
+        + len(PAYMENTS_TEMPLATES))
+    # the credit family collides no id with any other family in the full union.
+    assert not (_ALL_CREDIT_IDS & (
+        {t.id for t in FRAUD_TEMPLATES} | {t.id for t in AML_TEMPLATES}
+        | {t.id for t in COLLECTIONS_TEMPLATES} | {t.id for t in DEPOSITS_TEMPLATES}
+        | {t.id for t in PAYMENTS_TEMPLATES}))

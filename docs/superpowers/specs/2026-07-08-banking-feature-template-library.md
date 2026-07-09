@@ -294,6 +294,10 @@ needs-intervention. Conduct: **vulnerability** flag (sensitive) → different ha
 - **Mid (30–89):** `roll_rate_signal`, `promise_kept_ratio`, `right_party_contact_rate`, partial payments.
 - **Late (90+):** severity, `balance_at_risk`, hardship indicators.
 - **Recovery/charge-off:** `cure_probability`, recovery rate, settlement propensity, legal/write-off.
+> Trap: the recovery/charge-off tail is the leakage trap — `recovery_amount`/`write_off_amount` are
+> POST-default and ARE ~the recovery label; a cure/recovery model must never read them as inputs.
+> **Full parametric set:** the 10 grounded recipes implementing this journey are in **§PART I** (the
+> collections + deposits/ALM + payments appendix) ↔ `templates.py::COLLECTIONS_TEMPLATES`.
 
 ## B7. Deposit / liquidity / treasury (ALM) — the STABILITY spectrum
 ```
@@ -306,6 +310,11 @@ Not a customer funnel — a **deposit-behaviour spectrum** per depositor/segment
 - **Runoff-prone:** `net_flow_trend` negative, `concentration_by_depositor` (few big depositors),
   correlated-withdrawal risk.
 > Ties to B1: a depositor sliding STABLE→OUTFLOW is also churning — the deposit-attrition overlap.
+> **NOT a balance re-hash:** churn already owns plain balance behaviour (`balance_trend`/
+> `balance_volatility`/`days_below_threshold`) — this family's value is the ALM-distinctive treasury
+> features a plain balance catalog can't ground (deposit beta, FTP/NMD life, HQLA/LCR/NSFR, repricing
+> gap, maturity runoff). **Full parametric set:** the 10 grounded recipes are in **§PART I** ↔
+> `templates.py::DEPOSITS_TEMPLATES`.
 
 ## B8. Markets / trading — risk families + the COUNTERPARTY-RISK funnel
 Positions/instruments, not customers. **High MRM tier** (VaR/XVA models heavily governed); MNPI /
@@ -400,6 +409,10 @@ RTP/instant, correspondent banking, cross-border/remittance, open banking, merch
 - **Merchant acquiring (a churn+credit funnel):** `merchant_txn_decline` (attrition), `chargeback_rate`
   (fraud/credit), `merchant_bust_out_risk` (volume spike then vanish), `settlement_delay_risk`,
   `merchant_credit_risk` (for merchant cash advance).
+> **Full parametric set:** the 10 grounded recipes covering rail/scheme throughput + mix, interchange/MDR
+> economics, settlement quality (auth / chargeback / returns / timing) and corridor/cross-border are in
+> **§PART I** ↔ `templates.py::PAYMENTS_TEMPLATES`. (Real-time RTP/APP-scam fraud lives in the fraud
+> kill-chain §PART H; this set is the payments-as-a-business economics + operations layer.)
 
 ## B15. Corporate / SME — trade & supply-chain finance (multi-product, GROUP-level)
 Corporate is **multi-product + hierarchical** — features aggregate across product families AND up the
@@ -873,3 +886,211 @@ grounding contract, `params`→parameter schema, `pit`→trailing-window/real-ti
 healthy subset of a crime-shaped catalog (with the pii role for the pii-anchored recipes), the engine NEVER
 binds `fraud_flag` or a protected column, and neither family grounds anything on the churn catalog
 (`ALL_TEMPLATES` on churn still yields exactly the churn lens).
+
+---
+
+# PART I — Appendix: collections + deposits/ALM + payments full parametric sets (implements §B6 + §B7 + §B14)
+
+The §B6 **collections/recoveries journey** (10 recipes, `templates.py::COLLECTIONS_TEMPLATES`), the §B7
+**deposit/liquidity/treasury ALM stability spectrum** (10 recipes, `templates.py::DEPOSITS_TEMPLATES`) and
+the §B14 **payments-as-a-business** set (10 recipes, `templates.py::PAYMENTS_TEMPLATES`) authored to
+Part-F/G/H depth — the recipes the template engine grounds; all three families join `ALL_TEMPLATES`, which
+gate1 grounds. This completes the core-areas-first mandate (churn · credit · fraud · AML · **collections ·
+deposits · payments** now at full parametric depth). Each is groundable by concept-matching, safe-by-
+construction (PIT baked in), and carries a degrade path. Concept names match the taxonomy (§3).
+
+**Routing discipline (the load-bearing rule — the locked churn=churn-lens invariant).** Grounding is the
+router, so a family surfaces ONLY where its distinctive concepts exist. An *entity* concept (`customer_id`,
+`case_id`, `merchant_id`) gets **structural `is_grain` credit** in the matcher — it would bind ANY grain
+column, cross-surfacing onto a plain churn catalog. So every recipe REQUIRES at least one domain-distinctive
+**NON-STRUCTURAL** concept that binds only by exact concept match:
+- **collections:** `delinquency_bucket` / `dpd` / `scheduled_amount` / `cost_to_collect` /
+  `restructured_flag` / `recovery_amount` / `write_off_amount`;
+- **deposits/ALM:** `benchmark_rate` / `ftp_rate` / `wholesale_funding` / `maturity_date` / `tenor` /
+  `hqla` / `lcr` / `nsfr` / `repricing_gap` / `beta` (NOT plain `monetary_stock` — churn already owns
+  balance behaviour, and a plain balance concentration WOULD cross-surface, so `rate_sensitive_concentration`
+  weights by deposit `beta` precisely to keep its anchor distinctive);
+- **payments:** `payment_rail` / `scheme` / `interchange` / `merchant_discount_rate` / `settlement_status`
+  / `settlement_cycle` / `direct_debit` / `corridor` / `iso20022_purpose_code`.
+
+This holds the locked invariant, asserted by `test_templates_core3.py`: **`ALL_TEMPLATES` grounded on the
+churn `_CATALOG` yields EXACTLY the churn lens** (each new family grounds nothing there). Payments recipes
+DO also ground on the fraud/AML crime catalog (shared `payment_rail`/`corridor`/`scheme`) — expected overlap
+that breaks no crime test (those assert per-family grounding, never that `ALL_TEMPLATES` on the crime catalog
+is only fraud+AML). No recipe ever `Need`s a leakage anchor (`default_flag`/`outcome_label`/`fraud_flag`);
+the engine refuses them by construction.
+
+**Near-label / leakage discipline.** Collections carries the near-label tail (bucket/DPD rolls, forbearance,
+and — hardest — POST-charge-off recoveries): `near_label=True` + a ⚠ note (observe strictly BEFORE the
+cure/recovery/charge-off outcome). The **recovery/write-off** recipes carry an EXTRA hard flag —
+`recovery_amount`/`write_off_amount` are POST-default and ARE ~the recovery label, so a cure/recovery model
+must NEVER read them as an input (bind ONLY for a downstream post-default LGD/severity study). Deposits and
+payments are NOT near-label (a treasury signal / a payments-throughput/economics signal does not border a
+customer outcome). **Conduct:** collections flags the FCA Consumer-Duty `vulnerability_flag`
+(special-category, engine-blocked as a feature input — segment on it downstream under an eligibility gate).
+**Proxy:** payments `corridor`/`country_code` are national-origin proxies (fair-lending) — payments/AML-
+permitted but bias-watched, never a credit input.
+
+## Collections & recoveries — the DELINQUENCY → RECOVERY journey (`COLLECTIONS_TEMPLATES`)
+
+**Grounding requirements — a "collections-ready" catalog needs:** `customer_id` (grain) · `as_of_date` ·
+`monetary_stock` (balance-at-risk) · `monetary_flow` (paid) + `event_timestamp` · `scheduled_amount`
+(installment DUE) · `dpd` / `delinquency_bucket` (arrears) · `restructured_flag` (forbearance) ·
+`cost_to_collect` · `recovery_amount` / `write_off_amount` (post-charge-off) · plus the `outcome_label`
+target (leakage anchor — never a feature input).
+
+### EARLY (1–29 DPD) — promise / arrangement behaviour
+1. **`promise_to_pay_adherence_{window}`** — share of the promised/scheduled amount PAID while delinquent.
+   **needs:** `scheduled_amount` · `monetary_flow` (paid) · `dpd` (opt) · `event_timestamp` · `customer_id`.
+   **params:** `window∈{90,60,180}` · `tolerance_pct∈{5,0,10}`. **add:** non_additive (ratio). **explain:** H.
+   *anchor `scheduled_amount`; concept sub: no promise_to_pay concept — scheduled_amount is the promised due.*
+2. **`payment_plan_adherence_{window}`** — consecutive arrangement installments met on time (kept-plan
+   streak). **needs:** `scheduled_amount` · `monetary_flow` · `event_timestamp` · `customer_id`. **params:**
+   `window∈{180,90,365}` · `tolerance_pct∈{5,0,10}`. **add:** additive (count). **explain:** H.
+
+### MID (30–89 DPD) — roll dynamics + contactability
+3. **`cure_reage_dynamics_{window}`** ⚠ **near-label** — did the `delinquency_bucket` roll BACK (self-cure /
+   re-age)? `measure=cure_flag/bucket_improvement`. **needs:** `delinquency_bucket` · `as_of_date` ·
+   `customer_id`. **add:** n/a. **explain:** H. **⚠ near-label:** a cure IS the collections outcome state.
+4. **`roll_forward_severity_{window}`** ⚠ **near-label** — did DPD WORSEN (`max(dpd)` vs window start)?
+   `measure=roll_forward_flag/dpd_delta`. **needs:** `dpd` · `as_of_date` · `customer_id`. **add:** n/a.
+   **⚠ near-label:** a DPD rolling to 90+ IS the charge-off backstop.
+5. **`right_party_contact_intensity_{window}`** — rate/volume of successful collections contacts.
+   **needs:** `cost_to_collect` · `event_timestamp` · `customer_id`. **params:** `measure∈{rpc_rate,
+   attempt_count}`. **add:** non_additive (rate; count=additive). **explain:** M. *anchor `cost_to_collect`;
+   **concept sub:** the taxonomy has NO contact-event / right-party-contact concept — cost_to_collect is the
+   distinctive anchor and the contact event is a declared downstream derivation.*
+
+### LATE (90+ DPD) — tenure, hardship, cost
+6. **`days_in_collection_{window}`** ⚠ **near-label** — `as_of − first-delinquent-bucket date` (how long
+   worked). **needs:** `delinquency_bucket` · `as_of_date` · `customer_id`. **add:** n/a. **explain:** H.
+7. **`hardship_forbearance_in_collection_{window}`** ⚠ **near-label** — a concession (holiday / re-age /
+   restructure) while delinquent (`measure=occurred_flag/count`). **needs:** `restructured_flag` ·
+   `as_of_date` · `customer_id`. **add:** n/a (flag; count=additive). **explain:** H.
+8. **`cost_to_collect_ratio_{window}`** — collections cost vs balance-at-risk (`measure=to_balance/absolute`).
+   **needs:** `cost_to_collect` · `monetary_stock` · `as_of_date` · `customer_id`. **add:** non_additive
+   (ratio; absolute=additive). **explain:** H. *survivorship — cost_to_collect only exists for worked accounts.*
+
+### RECOVERY / CHARGE-OFF ⚠⚠ POST-DEFAULT (hard leakage flag)
+9. **`recovery_rate_{window}`** ⚠⚠ **near-label** — post-charge-off `recovery_amount` vs the defaulted
+   balance (the LGD complement; `measure=to_defaulted_balance/cumulative_amount`). **needs:**
+   `recovery_amount` · `monetary_stock` · `as_of_date` · `customer_id`. **add:** non_additive (ratio;
+   cumulative=additive). **⚠⚠ a cure/recovery model must NEVER read recovery_amount as an INPUT — it IS
+   ~the recovery label;** bind ONLY for a downstream post-default LGD/severity study.
+10. **`write_off_severity_{window}`** ⚠⚠ **near-label** — `write_off_amount` charged off vs exposure at
+    charge-off (`measure=to_exposure/amount`). **needs:** `write_off_amount` · `monetary_stock` ·
+    `as_of_date` · `customer_id`. **add:** non_additive (ratio; amount=additive). **⚠⚠ the charge-off IS
+    the label event — features from write_off_amount leak it;** bind ONLY for a downstream loss study.
+
+## Deposit / liquidity / treasury ALM — the STABILITY spectrum (`DEPOSITS_TEMPLATES`)
+
+**NOT a balance re-hash** — churn already owns `balance_trend`/`balance_volatility`/`days_below_threshold`;
+this family's value is the ALM-distinctive treasury features a plain balance catalog cannot ground.
+**Grounding requirements — a "treasury-ready" catalog needs:** `customer_id` (depositor grain) ·
+`as_of_date` · `monetary_stock` (balance) · the ALM anchors `benchmark_rate` · `ftp_rate` ·
+`wholesale_funding` · `maturity_date` · `tenor` · `hqla` · `lcr` · `nsfr` · `repricing_gap` · `beta`.
+
+### STABLE CORE — sticky funding + liquidity contribution
+1. **`nmd_stickiness_{window}`** — non-maturity-deposit behavioural life priced by its `ftp_rate` curve
+   (`measure=ftp_tenor_proxy/decay_rate`). **needs:** `ftp_rate` · `monetary_stock` · `as_of_date` ·
+   `customer_id`. **add:** non_additive. **explain:** M. *anchor `ftp_rate`.*
+2. **`hqla_eligibility_contribution_{window}`** — the HQLA amount a deposit backs / its net outflow against
+   the LCR buffer (`measure=hqla_amount/net_outflow_contribution`). **needs:** `hqla` · `lcr` (opt) ·
+   `monetary_stock` · `as_of_date` · `customer_id`. **add:** semi_additive (amount stock). **explain:** H.
+3. **`nsfr_asf_contribution_{window}`** — the available-stable-funding a deposit provides (ASF factor ×
+   balance; `measure=nsfr_ratio/asf_amount`). **needs:** `nsfr` · `monetary_stock` · `as_of_date` ·
+   `customer_id`. **add:** non_additive (ratio; asf_amount=semi). **explain:** H.
+
+### RATE-SENSITIVE — deposit beta, LCR outflow weight, repricing gap
+4. **`deposit_beta_{window}`** — balance/rate response vs a reference `benchmark_rate` (`measure=rate_beta/
+   balance_beta`). **needs:** `benchmark_rate` · `monetary_stock` · `as_of_date` · `customer_id`. **params:**
+   `window∈{365,180,90}`. **add:** non_additive (beta). **explain:** H. **degrade:** single snapshot → skip.
+5. **`lcr_outflow_weight_{window}`** — the deposit's modelled 30-day net-cash-outflow RATE (LCR runoff
+   factor). **needs:** `lcr` · `monetary_stock` · `as_of_date` · `customer_id`. **add:** non_additive (ratio).
+6. **`repricing_gap_exposure_{window}`** — the net IRRBB repricing/maturity gap the book carries
+   (`measure=gap_level/gap_trend`). **needs:** `repricing_gap` · `as_of_date` · `customer_id`. **add:**
+   non_additive (nets within a snapshot; never sum across dates). **explain:** H.
+
+### SURGE / HOT MONEY — non-core funding share + concentration
+7. **`hot_money_share_{window}`** — share of the funding base that is non-core `wholesale_funding`
+   (`measure=value_share/surge_flag`). **needs:** `wholesale_funding` · `monetary_stock` · `as_of_date` ·
+   `customer_id`. **add:** non_additive (share; flag=n/a). **explain:** H.
+8. **`rate_sensitive_concentration_{window}`** — HHI of balance WEIGHTED by deposit `beta`
+   (`measure=beta_weighted_hhi/top_depositor_share`). **needs:** `beta` · `monetary_stock` · `as_of_date` ·
+   `customer_id`. **add:** non_additive. **explain:** M. *the beta weighting is load-bearing for routing — a
+   plain balance concentration WOULD cross-surface (monetary_stock + customer_id exist on churn).*
+
+### RUNOFF-PRONE — maturity laddering + early-break behaviour
+9. **`maturity_ladder_runoff`** — term-deposit balance/share maturing inside a `horizon_days` bucket keyed on
+   `maturity_date` (`measure=runoff_share/runoff_amount`). **needs:** `maturity_date` · `monetary_stock` ·
+   `as_of_date` · `customer_id`. **params:** `horizon_days∈{30,90,365}`. **add:** non_additive (share;
+   amount=semi). **explain:** H.
+10. **`early_withdrawal_break_{window}`** — rate at which term deposits are broken before their contractual
+    `tenor` (`measure=break_rate/break_count`). **needs:** `tenor` · `monetary_stock` · `as_of_date` ·
+    `customer_id`. **add:** non_additive (rate; count=additive). *concept sub: no notice_period concept — a
+    notice-period deposit substitutes its notice term for `tenor`.*
+
+## Payments-as-a-business (`PAYMENTS_TEMPLATES`)
+
+Rail/scheme throughput + mix, interchange/MDR economics, settlement quality and corridor/cross-border — the
+economics + operations layer (real-time RTP/APP-scam fraud lives in the §PART H kill-chain). Additivity:
+economics amounts additive, rates non-additive, mix/diversity n/a. **Grounding requirements — a
+"payments-ready" catalog needs:** `customer_id` (grain) · `monetary_flow` + `event_timestamp` ·
+`payment_rail` · `scheme` · `interchange` · `merchant_discount_rate` · `settlement_status` ·
+`settlement_cycle` · `direct_debit` / `standing_order` · `corridor` / `country_code` ·
+`iso20022_purpose_code` · plus the `fraud_flag` target (leakage anchor — never a feature input).
+
+### THROUGHPUT & MIX
+1. **`rail_volume_value_{window}`** — count/summed value of payments by `payment_rail` (`measure=value/
+   count`). **needs:** `payment_rail` · `monetary_flow` · `event_timestamp` · `customer_id`. **add:** additive.
+2. **`rail_scheme_diversity_{window}`** — distinct rails/schemes used + mix concentration (`measure=
+   distinct_count/hhi`). **needs:** `payment_rail` · `scheme` (opt) · `event_timestamp` · `customer_id`.
+   **add:** n/a.
+3. **`purpose_code_diversity_{window}`** — distinct ISO-20022 purpose codes + HHI (`measure=distinct_count/
+   hhi`). **needs:** `iso20022_purpose_code` · `event_timestamp` · `customer_id`. **add:** n/a.
+
+### ECONOMICS
+4. **`interchange_revenue_{window}`** — issuer interchange earned (`measure=sum/avg_per_txn`). **needs:**
+   `interchange` · `event_timestamp` · `customer_id`. **add:** additive (sum; avg=n/a). *economics flow.*
+5. **`merchant_discount_economics_{window}`** — effective `merchant_discount_rate` (MDR) + trend
+   (`measure=level/trend`). **needs:** `merchant_discount_rate` · `monetary_flow` (opt) · `event_timestamp` ·
+   `customer_id`. **add:** non_additive (rate).
+
+### SETTLEMENT QUALITY
+6. **`authorisation_decline_rate_{window}`** — share settling vs declined/failed from `settlement_status`
+   (`measure=decline_rate/approval_rate`). **needs:** `settlement_status` · `event_timestamp` ·
+   `customer_id`. **add:** non_additive (rate).
+7. **`chargeback_dispute_rate_{window}`** — share of card txns charged back/disputed under the `scheme`'s
+   rules (`measure=count_rate/value_rate`). **needs:** `scheme` · `monetary_flow` (opt) · `event_timestamp` ·
+   `customer_id`. **add:** non_additive. *concept sub: no chargeback concept — the dispute event is a declared
+   downstream derivation scoped by the card scheme.*
+8. **`return_payment_rate_{window}`** — share of `direct_debit` collections (or standing orders) RETURNED
+   unpaid (`measure=return_rate/return_count`). **needs:** `direct_debit` · `standing_order` (opt) ·
+   `event_timestamp` · `customer_id`. **add:** non_additive (rate; count=additive).
+9. **`settlement_lag_{window}`** — mean settlement lag vs the `settlement_cycle` (T+n) convention + late
+   share (`measure=mean_lag_days/late_share`). **needs:** `settlement_cycle` · `event_timestamp` ·
+   `customer_id`. **add:** n/a (lag=duration; late_share=non-additive). **PIT-critical:** a fail is not
+   knowable until T+n — honour system_time.
+
+### CROSS-BORDER (PROXY)
+10. **`corridor_cross_border_share_{window}`** — share of value flowing through cross-border `corridor`s + mix
+    (`measure=cross_border_share/corridor_hhi`). **needs:** `corridor` · `country_code` (opt) ·
+    `monetary_flow` · `event_timestamp` · `customer_id`. **add:** non_additive. **eligibility:** corridor /
+    country_code are national-origin PROXIES — payments/AML-permitted, bias-watched, NEVER a credit input.
+
+**Concept substitutions (vs the §B6/§B7/§B14 designs).** None invented — every `Need` binds a real §3
+concept. Noted on each template: (a) collections has no *contact-event / right-party-contact* concept →
+`right_party_contact_intensity` anchors on `cost_to_collect` (the operational collections signal) with the
+contact event a declared downstream derivation; (b) no *promise_to_pay* concept → `scheduled_amount` is the
+promised due; (c) no *notice_period* concept → a notice-period deposit substitutes its notice term for
+`tenor`; (d) no *chargeback* concept → the dispute/chargeback event is a declared derivation scoped by the
+card `scheme`.
+
+**Build note (B6/B7/B14).** These 30 map 1:1 to the `templates.py` model exactly like §PART F/G/H — `needs`→
+grounding contract, `params`→parameter schema, `pit`→trailing-window/state guard, `degrade`→fallback,
+`near_label`→the 3-part leakage flag. The near-label subset the golden set must exercise: `cure_reage_
+dynamics`, `roll_forward_severity`, `days_in_collection`, `hardship_forbearance_in_collection`, and (the hard
+POST-default pair) `recovery_rate`, `write_off_severity`. Routing + safety are verified by
+`test_templates_core3.py`: each family grounds its whole domain-shaped catalog, the engine NEVER binds a
+leakage anchor or a protected column, near-label recipes carry `near_label=True`, and none of the three
+families grounds anything on the churn catalog (`ALL_TEMPLATES` on churn still yields exactly the churn lens).
