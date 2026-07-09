@@ -1,0 +1,66 @@
+{
+  "data": [
+    {
+      "id": "8f7a1c2e-0003-4b1e-9e6a-om-transactions",
+      "name": "transactions",
+      "fullyQualifiedName": "mysql_prod.cards_db.public.transactions",
+      "description": "Card transactions",
+      "service": {"name": "mysql_prod", "type": "databaseService"},
+      "database": {"name": "cards_db", "type": "database"},
+      "databaseSchema": {"name": "public", "type": "databaseSchema"},
+      "columns": [
+        {
+          "name": "txn_id",
+          "dataType": "BIGINT",
+          "dataTypeDisplay": "bigint",
+          "description": "transaction primary key",
+          "tags": []
+        },
+        {
+          "name": "account_id",
+          "dataType": "BIGINT",
+          "dataTypeDisplay": "bigint",
+          "description": "posting account",
+          "tags": []
+        },
+        {
+          "name": "amount",
+          "dataType": "DECIMAL",
+          "dataTypeDisplay": "decimal(18,2)",
+          "description": "signed transaction amount",
+          "tags": []
+        },
+        {
+          "name": "posted_at",
+          "dataType": "TIMESTAMP",
+          "dataTypeDisplay": "timestamp",
+          "description": "posting time",
+          "tags": []
+        },
+        {
+          "name": "metadata",
+          "dataType": "JSON",
+          "dataTypeDisplay": "json",
+          "description": "processor metadata blob",
+          "tags": []
+        },
+        {
+          "name": "is_disputed",
+          "dataType": "BOOLEAN",
+          "dataTypeDisplay": "boolean",
+          "description": "dispute flag",
+          "tags": []
+        }
+      ],
+      "tableConstraints": [
+        {"constraintType": "PRIMARY_KEY", "columns": ["txn_id"]},
+        {
+          "constraintType": "FOREIGN_KEY",
+          "columns": ["account_id"],
+          "referredColumns": ["mysql_prod.cards_db.public.accounts.account_id"]
+        }
+      ]
+    }
+  ],
+  "paging": {"total": 3}
+}
