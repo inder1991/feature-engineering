@@ -9,6 +9,8 @@ without a recorded choice here**, in both definition and hypothesis-only modes.
 from __future__ import annotations
 
 import json
+import logging
+import os
 from dataclasses import dataclass, field
 from datetime import timedelta
 
@@ -26,12 +28,19 @@ from featuregen.overlay.upload.feature_assist import (
     recommend_set,
     set_signals,
 )
+from featuregen.overlay.upload.taxonomy.applicability import (
+    in_scope_recipes,
+    scope_from_recognition,
+)
+from featuregen.overlay.upload.taxonomy.recognizer import recognize
 from featuregen.overlay.upload.templates import (
     ALL_TEMPLATES,
     GroundedFeature,
     Template,
     ground_all,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class Gate1Error(Exception):
@@ -168,7 +177,56 @@ def build_considered_set(conn, intent: Intent, client: LLMClient, *, entity: str
         "INSERT INTO contract_considered (intent_id, considered) VALUES (%s, %s::jsonb) "
         "ON CONFLICT (intent_id) DO UPDATE SET considered = EXCLUDED.considered",
         (intent.intent_id, json.dumps(_snapshot(conn, cs))))
+    _shadow_recognition(client, intent, redacted_goal, cs)   # flag-gated, LOG-ONLY; never filters cs
     return cs
+
+
+# ── Phase-1A: in-flow shadow recognizer (flag-gated, log-only) ─────────────────────────────────────
+# When FEATUREGEN_INTENT_RECOGNITION_SHADOW=1, run the LLM-only use-case recognizer over the SAME
+# redacted hypothesis/goal that drove generation and LOG what it WOULD scope to — the proposed
+# primary/secondary objectives + the would-be in-scope recipe count vs the templates actually grounded.
+# It is behaviour-neutral by construction: default OFF (recognize is never called, no extra LLM call,
+# zero behaviour change), and even when ON it only logs — it NEVER filters or alters `cs`, never
+# persists (that is Phase 1B), and never raises (any error is logged and swallowed so shadow can't
+# break generation). See docs/superpowers/plans/2026-07-09-phase1a-shadow-recognizer.md Task 6.
+def _intent_recognition_shadow_enabled() -> bool:
+    """The in-flow shadow recognizer is OFF by default — grounding is untouched unless a deployment
+    opts in with FEATUREGEN_INTENT_RECOGNITION_SHADOW=1 (dev/measurement only)."""
+    return os.environ.get("FEATUREGEN_INTENT_RECOGNITION_SHADOW", "0") == "1"
+
+
+def _grounded_template_count(cs: ConsideredSet) -> int:
+    """The number of grounded parametric-template candidates that actually reached the considered set
+    (the "templates" lens features) — the shadow log's real-world comparison point for the recognizer's
+    would-be in-scope recipe count. Read-only; never mutates `cs`."""
+    return sum(len(s.features) for s in cs.alternatives if s.lens == "templates")
+
+
+def _shadow_recognition(client: LLMClient, intent: Intent, redacted_goal: str,
+                        cs: ConsideredSet) -> None:
+    """Flag-gated, LOG-ONLY shadow recognition. When the flag is OFF (default) this is a true no-op —
+    `recognize` is NOT called, so there is no extra LLM call and zero behaviour change. When ON, it
+    recognises the SAME redacted hypothesis/goal that drove generation, maps the result to a would-be
+    in-scope recipe set, and logs the proposed scope alongside the grounded-template count. It NEVER
+    uses the result to filter `cs`, NEVER persists, and NEVER raises — the whole block is wrapped so an
+    unexpected error is logged and swallowed rather than breaking generation."""
+    if not _intent_recognition_shadow_enabled():
+        return
+    try:
+        result = recognize(
+            client, redacted_hypothesis=intent.redacted_hypothesis,
+            redacted_goal=redacted_goal or None)
+        scope = scope_from_recognition(result)
+        primary_scoped, _ = in_scope_recipes(scope)
+        logger.info(
+            "intent-recognition shadow: intent_id=%s status=%s primary=%s secondary=%s "
+            "in_scope_recipes=%d grounded_templates=%d (log-only; grounding unchanged)",
+            intent.intent_id, result.status.value, scope.primary, list(scope.secondary),
+            len(primary_scoped), _grounded_template_count(cs))
+    except Exception:   # shadow must never break generation — log and swallow
+        logger.exception(
+            "intent-recognition shadow failed (swallowed; grounding unaffected) for intent_id=%s",
+            intent.intent_id)
 
 
 def _alternative_ids(cs: ConsideredSet) -> set[str]:
