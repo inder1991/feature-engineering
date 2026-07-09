@@ -1,269 +1,131 @@
-# Use-Case Taxonomy & 107-Tag Crosswalk — DRAFT for review
+# Use-Case Taxonomy & 107-Tag Crosswalk — v2 (final calls locked)
 
-**Status:** Draft (Phase-0 artifact; domain review requested before it becomes code)
-**Input:** the 107 distinct `use_cases` tags currently on the 153 recipes
-**Purpose:** classify every legacy tag into the *right dimension* (not just use-case-vs-framework), and propose the governed use-case hierarchy the recognizer + applicability evaluator depend on.
-**Related:** `2026-07-09-intent-aware-recipe-selection-plan.md` (§6 Phase 0)
-
-> This reclassifies category errors rather than moving them around. Nothing here is final — the contentious calls in §5 are the ones I want your judgment on.
+**Status:** Agreed with domain owner. Authoritative input to the Phase-0 implementation.
+**Supersedes:** the v1 draft (this file's prior version).
+**Related:** `2026-07-09-intent-aware-recipe-selection-plan.md`
 
 ---
 
-## 1. Dimension summary (107 tags)
+## 0. Governing principle (the classification rule)
 
-| Dimension | Meaning | Count |
+**The taxonomy encodes modelling objectives and governed decisions — NOT the organisational chart.** Team ownership lives in metadata (`governance_owner`, `operating_owner`), so the tree survives Fraud/AML/Wealth re-orgs unchanged.
+
+**Promotion test — a tag earns a use-case *leaf* only if it has a distinct:** prediction target, business decision, success measure, **or** policy regime.
+Otherwise it is **context or metadata**, when it merely describes: a product/channel, a regulatory framework, a stage in a journey, a potential consumer, a feature theme, or an organisational owner.
+
+---
+
+## 1. Dimensions (each a separate, closed vocabulary)
+
+| Dimension | Role | Members (seed) |
 |---|---|---|
-| **use_case** (leaf) | a business objective you can model | ~84 |
-| **use_case** (parent/domain) | a grouping node (e.g. `financial_crime`) | ~3 |
-| **modelling_context** | a regulatory framework/regime shaping feature semantics | 6 |
-| **measure** | an analytical/risk output quantity, not an objective | 4 |
-| **deprecated / merge** | redundant or a funnel-stage signal → folded into a parent | 7 |
-| **flagged** | genuinely ambiguous — needs your call (§5) | 3 |
-
-The headline: **~17 of the 107 tags are NOT use-cases** and must leave the use-case dimension, or the recognizer will "classify" a request as `frtb` or `lgd`.
+| **use_case** | the objective — **the only dimension applicability narrows on** | the tree in §3 |
+| **modelling_context** | regulatory framework/regime | `ifrs9`, `frtb`, `xva`, `lcr`, `nsfr`, `lgd`, `irrbb`, `ftp` |
+| **measure** | an output quantity, not an objective | `tracking_error`, `data_quality` |
+| **product_context** | product/asset/channel | `deposits`, `credit_cards`, `mortgages`, `crypto_assets`, `derivatives` |
+| **typology** | a specific pattern within a use-case | `app_scam`, `mule_account`, `synthetic_id`, `account_takeover`, `crypto_asset_laundering`, `trade_based_money_laundering` |
+| **journey_stage** | position in a broader journey | `disengagement`, `unbundling`, `primacy_erosion`, `outflow`, `closure` |
+| **business_outcome** | the benefit, not the target | `revenue_growth`, `cost_efficiency`, `loss_reduction` |
+| **metadata** | ownership & capability | `governance_owner`, `operating_owner`, `consumers`, `capabilities` (`transaction_monitoring`, `anomaly_detection`, `network_analysis`) |
 
 ---
 
-## 2. Proposed use-case hierarchy
+## 2. The seven locked decisions (with concrete recipe remap)
+
+**D1 — `financial_crime` is a non-selectable domain parent.** `fraud` and `aml_cft` are independently selectable branches (they share signals but have distinct governed outcomes, regulatory regimes, action latency and workflows). The recognizer may return `financial_crime` **only** as an ambiguity `domain_hint`, never as a scoping result.
+
+**D2 — `deposit_attrition` is a customer objective, not an ALM one.** → `customer.relationship_attrition.deposit_attrition`. The separate treasury objective is `treasury_alm.deposit_runoff_forecasting` (portfolio/segment/time-bucket grain). Classification follows the *target and decision*, not the feature ingredients or the downstream consumer — Treasury as a consumer is metadata (`consumers: [treasury_alm]`).
+
+**D3 — Split `transaction_monitoring` by governed objective; keep the bare term only as a capability tag.** Deterministic by family:
+- 11 **fraud**-family recipes → `fraud.transaction_fraud_detection` (primary): `card_testing_velocity, device_sharing_velocity, new_device_flag, geo_velocity_impossible, first_time_payee_high_value, merchant_risk_anomaly, txn_velocity_spike, amount_zscore_spike, cross_channel_rail_anomaly, cross_border_burst, amount_just_under_limit`.
+- 11 **aml**-family recipes → `aml_cft.suspicious_transaction_monitoring` (primary): `structuring_smurfing, cash_intensity_ratio, rapid_movement_passthrough, round_amount_ratio, fan_in_fan_out, high_risk_corridor_exposure, nested_correspondent_flow, crypto_offramp_exposure, dormant_reactivation, screening_exposure, prior_alert_recidivism`.
+- Cross-applicable velocity/network recipes may carry the other branch as **secondary**; recipes are not duplicated.
+
+**D4 — Crypto is context, not a use-case.** The one recipe (`crypto_offramp_exposure`, aml) → `aml_cft.suspicious_transaction_monitoring` (primary) + `product_context: crypto_assets` + `typology: crypto_asset_laundering`. No crypto top-level.
+
+**D5 — Pricing is a real family only where price/rate/fee is the target; `cost_efficiency` is a business-outcome.**
+- `pricing` leaves (`credit_risk_based_pricing`, `deposit_rate_optimisation`, `fee_pricing`, `relationship_pricing`) are **declared but currently empty** — none of the 153 recipes are *primarily* pricing. The 7 recipes tagged `pricing` (`tenure_days`, `expense_ratio_competitiveness`, `claims_frequency_severity`, `mortality_morbidity_loading`, `profit_rate_exposure`, `clv_revenue_trajectory`, `tenure_upsell_readiness`) keep their real primary; `pricing` demotes to **secondary/consumer**. Bare `pricing` deprecated.
+- `cost_efficiency` → `business_outcome` metadata. The one recipe (`cost_to_collect_ratio`, collections) stays `credit.collections` primary. An `operations` family (`process_cost_forecasting`, `workload_forecasting`, `manual_review_optimisation`) is **declared for future** genuine operational targets (no recipes yet).
+
+**D6 — Promote `primacy_loss` + `wealth`; fold `unbundling` + `contactability`; split `cashflow` by objective.**
+- `primacy_loss` → **promoted** leaf `customer.relationship_attrition.primacy_loss`. Recipes `salary_signal`, `external_own_transfer_trend` carry it as **secondary** (primary `customer.churn`).
+- `wealth` → **promoted** family: `wealth.asset_outflow`, `wealth.client_attrition`. `external_own_transfer_trend` also maps to `wealth.asset_outflow` (secondary). `wealth.client_attrition` is declared-empty.
+- `unbundling` → `journey_stage` metadata; `dd_cancellation_rate` stays `customer.churn` primary.
+- `contactability` → `customer_state` metadata; `right_party_contact_intensity` stays `credit.collections` primary.
+- `cashflow` / `cashflow_risk` → deprecated; `inflow_outflow_ratio` and `balance_volatility` keep `customer.churn` primary (each may carry a `treasury_alm`/`affordability` secondary per its semantics).
+
+**D7 — Cross-cutting risk tags get precise homes, not a forced Credit/Markets fit.**
+- `concentration_risk` → `portfolio_risk.concentration` (cross-cutting), with `risk_context` metadata. The 6 recipes (`rate_sensitive_concentration` [funding], `book_desk_concentration` [market], `sukuk_concentration`, `syndication_concentration`, `group_exposure_aggregation`, `guarantor_reliance` [credit]) all land here with the right `risk_context`.
+- `counterparty_risk` → **promoted to top-level**: `exposure_monitoring` (← `notional_netting_exposure`, from generic `exposure_management`), `margin_call_risk` (← `margin_call_intensity`, from generic `margin`), `settlement_exposure` (declared-empty), plus the 5 `counterparty_risk`-tagged markets recipes.
+- `basis_risk` → `markets.market_risk.basis_risk` (← `benchmark_basis_dislocation`); a `treasury_alm.irrbb.basis_risk` leaf is declared for banking-book basis recipes (none yet).
+- Settlement stays `securities_services.custody.settlement` (the 4 custody recipes: `matching_break_rate, pre_settlement_aging, settlement_fail_rate, fail_ageing_buckets`).
+- Generic `exposure_management`, `basis_risk`, `margin` deprecated.
+
+---
+
+## 3. Resulting use-case hierarchy
 
 ```text
-customer                      (retail relationship lifecycle)
-├── customer.churn            ← retail_churn  [folds: unbundling, primacy_loss]
-├── customer.deposit_attrition← deposit_attrition  [folds: wealth_outflow]
-├── customer.engagement       ← engagement
-├── customer.overdraft_propensity ← overdraft_propensity
-├── customer.cross_sell       ← cross_sell
-│   ├── .next_best_action     ← next_best_action
-│   ├── .share_of_wallet      ← share_of_wallet
-│   └── .whitespace           ← whitespace
-├── customer.clv              ← clv
-├── customer.segmentation     ← segmentation
-└── customer.campaign         ← campaign_analytics
+customer
+├── relationship_attrition {churn, deposit_attrition, primacy_loss}
+├── cross_sell {next_best_action, share_of_wallet, whitespace}
+├── clv
+├── engagement
+├── segmentation
+├── campaign
+└── overdraft_propensity
 
-credit                        (credit-risk lifecycle)   ← credit_risk (parent)
-├── credit.underwriting       ← underwriting
-│   ├── .affordability        ← affordability  [folds: cashflow]
-│   ├── .seasoning            ← credit_seasoning
-│   └── .sme                  ← sme_credit
-├── credit.early_warning      ← early_warning
-├── credit.monitoring
-│   ├── .limit_management     ← limit_management
-│   ├── .exposure_management  ← exposure_management
-│   ├── .concentration        ← concentration_risk
-│   └── .credit_mitigation    ← credit_mitigation
-└── credit.collections        ← collections
-    ├── .recoveries           ← recoveries
-    ├── .hardship             ← hardship  [folds: contactability]
-    ├── .self_cure            ← self_cure
-    └── .workout              ← workout
+wealth {asset_outflow, client_attrition*}
 
-financial_crime               (PARENT / domain — not a leaf)
-├── financial_crime.transaction_monitoring ← transaction_monitoring (shared)
-├── financial_crime.fraud     ← fraud
-│   ├── .card_fraud           ← card_fraud
-│   ├── .account_takeover     ← account_takeover
-│   ├── .app_scam             ← app_scam  [merge: authorised_push_payment]
-│   └── .synthetic_id         ← synthetic_id
-└── financial_crime.aml       ← aml
-    ├── .structuring          ← structuring
-    ├── .sanctions            ← sanctions
-    ├── .screening            ← screening
-    ├── .kyc                  ← kyc
-    └── .correspondent        ← correspondent_banking
+credit
+├── underwriting {affordability, seasoning, sme}
+├── early_warning
+├── monitoring {limit_management, exposure_management→obligor, credit_mitigation}
+└── collections {recoveries, hardship, self_cure, workout}
 
-deposits_alm                  (balance-sheet / treasury)  ← alm (parent)
-├── deposits_alm.deposit_stability ← deposit_stability
-├── deposits_alm.liquidity    ← liquidity_risk  [folds: cashflow_risk]
-├── deposits_alm.irrbb        ← (objective; irrbb tag → modelling_context)
-├── deposits_alm.basis_risk   ← basis_risk
-└── deposits_alm.cash_management ← cash_management
+financial_crime                               # non-selectable domain
+├── fraud {transaction_fraud_detection, card_fraud, account_takeover, app_scam, synthetic_id, merchant_fraud}
+└── aml_cft {suspicious_transaction_monitoring, structuring, sanctions, screening, kyc, correspondent, mule_account*, tbml*}
 
-markets                       (trading / capital markets)
-├── markets.market_risk       ← market_risk  [folds: trading_risk, portfolio_risk]
-└── markets.counterparty_risk ← counterparty_risk  [folds: margin]
-
-payments
-├── payments.behaviour        ← payments
-├── payments.operations       ← payments_ops
-├── payments.merchant         ← merchant_analytics
-│   └── .interchange          ← interchange_optimisation
-└── payments.cross_border     ← cross_border
-
-securities_services           (custody / post-trade)  ← securities_services (parent)
-├── securities_services.custody ← custody
-│   ├── .settlement           ← settlement_risk
-│   └── .corporate_actions    ← corporate_actions
-├── securities_services.securities_lending ← securities_lending
-└── securities_services.fund_administration ← fund_administration
-
-insurance
-├── insurance.lapse           ← lapse_risk  [folds: persistency, surrender]
-├── insurance.claims          ← claims
-│   └── .claims_fraud         ← claims_fraud  (x-ref financial_crime)
-├── insurance.reinsurance     ← reinsurance
-└── insurance.bancassurance   ← bancassurance
-
-asset_management              (buy-side)
-├── asset_management.redemption ← redemption_risk  [folds: fund_flows, fund_liquidity, aum_stability]
-├── asset_management.mandate_compliance ← mandate_compliance
-└── asset_management.performance ← fund_performance
-
-islamic
-├── islamic.banking           ← islamic_banking
-└── islamic.sharia_compliance ← sharia_compliance
-
-esg                           (sustainable finance)
-├── esg.scoring               ← esg_scoring  [folds: sustainable_finance]
-└── esg.climate
-    ├── .transition           ← transition_risk  [folds: climate_risk]
-    └── .physical             ← physical_risk
-
-corporate_trade               (corporate/SME trade & supply-chain)
-├── corporate_trade.trade_finance ← trade_finance
-├── corporate_trade.supply_chain_finance ← supply_chain_finance
-├── corporate_trade.working_capital ← working_capital
-└── corporate_trade.receivables_finance ← receivables_finance
-
-pricing                       (cross-cutting)  ← pricing
+treasury_alm {deposit_stability, deposit_runoff_forecasting, liquidity, net_interest_margin, irrbb{basis_risk*}, cash_management}
+portfolio_risk {concentration}
+counterparty_risk {exposure_monitoring, settlement_exposure*, margin_call_risk}
+markets {market_risk{basis_risk, portfolio}}
+payments {behaviour, operations, merchant{interchange}, cross_border}
+securities_services {custody{settlement, corporate_actions}, securities_lending, fund_administration}
+insurance {lapse{surrender, persistency}, claims{claims_fraud}, reinsurance, bancassurance}
+asset_management {redemption{fund_flows, fund_liquidity, aum_stability}, mandate_compliance, performance}
+islamic {banking, sharia_compliance}
+esg {scoring, climate{transition, physical}}
+corporate_trade {trade_finance, supply_chain_finance, working_capital, receivables_finance}
+pricing {credit_risk_based_pricing*, deposit_rate_optimisation*, fee_pricing*, relationship_pricing*}
+operations {process_cost_forecasting*, workload_forecasting*, manual_review_optimisation*}
+profitability {margin_forecasting*}
 ```
 
----
-
-## 3. Reclassified OUT of the use-case dimension
-
-**modelling_context (6)** — a framework/regime, recognised as a *separate* dimension:
-`ifrs9_staging`, `frtb`, `irrbb`, `lcr`, `nsfr`, `ftp`
-
-**measure (4)** — an output quantity, not an objective:
-`xva` (→ markets.counterparty_risk), `lgd` (→ credit), `tracking_error` (→ asset_management.performance), `data_quality` (a quality measure over any recipe)
-
-**deprecated / merge (7)** — redundant or a funnel-stage *signal* folded into a parent use-case as stage metadata, not a standalone use-case:
-`authorised_push_payment`→`app_scam`; `unbundling`→`customer.churn`; `primacy_loss`→`customer.churn`; `wealth_outflow`→`customer.deposit_attrition`; `contactability`→`credit.collections`; `cashflow`→`credit.underwriting.affordability`; `sustainable_finance`→`esg.scoring`
+`*` = **intentionally-empty (declared-future) leaf** — governed structure ahead of content; Phase-0 coverage validation marks these "no authored recipe yet (intentional)" so the zero-recipe check passes with an explanation.
 
 ---
 
-## 4. Full 107-tag crosswalk (compact)
+## 4. Ownership metadata model (separate from the tree)
 
-Format: `tag (recipe-count) → dimension : target`
-
-```text
-financial_crime(23)        → use_case(parent) : financial_crime
-transaction_monitoring(22) → use_case : financial_crime.transaction_monitoring
-credit_risk(18)            → use_case(parent) : credit
-early_warning(18)          → use_case : credit.early_warning
-cross_sell(14)             → use_case : customer.cross_sell
-aml(13)                    → use_case(parent) : financial_crime.aml
-collections(13)            → use_case : credit.collections
-fraud(12)                  → use_case(parent) : financial_crime.fraud
-retail_churn(12)           → use_case : customer.churn
-alm(11)                    → use_case(parent) : deposits_alm
-insurance(10)              → use_case(parent) : insurance
-liquidity_risk(10)         → use_case : deposits_alm.liquidity
-payments(10)               → use_case : payments.behaviour
-recoveries(10)             → use_case : credit.collections.recoveries
-trade_finance(10)          → use_case : corporate_trade.trade_finance
-esg_scoring(9)             → use_case : esg.scoring
-asset_management(8)        → use_case(parent) : asset_management
-climate_risk(8)            → use_case : esg.climate.transition [merge]
-custody(8)                 → use_case : securities_services.custody
-islamic_banking(8)         → use_case : islamic.banking
-limit_management(8)        → use_case : credit.monitoring.limit_management
-market_risk(8)             → use_case : markets.market_risk
-merchant_analytics(8)      → use_case : payments.merchant
-securities_services(8)     → use_case(parent) : securities_services
-sharia_compliance(8)       → use_case : islamic.sharia_compliance
-deposit_stability(7)       → use_case : deposits_alm.deposit_stability
-pricing(7)                 → use_case : pricing            [FLAG §5]
-transition_risk(7)         → use_case : esg.climate.transition
-working_capital(7)         → use_case : corporate_trade.working_capital
-clv(6)                     → use_case : customer.clv
-concentration_risk(6)      → use_case : credit.monitoring.concentration [x-cut markets]
-ifrs9_staging(6)           → modelling_context : framework.ifrs9
-next_best_action(6)        → use_case : customer.cross_sell.next_best_action
-redemption_risk(6)         → use_case : asset_management.redemption
-account_takeover(5)        → use_case : financial_crime.fraud.account_takeover
-counterparty_risk(5)       → use_case : markets.counterparty_risk
-lapse_risk(5)              → use_case : insurance.lapse
-share_of_wallet(5)         → use_case : customer.cross_sell.share_of_wallet
-card_fraud(4)              → use_case : financial_crime.fraud.card_fraud
-payments_ops(4)            → use_case : payments.operations
-settlement_risk(4)         → use_case : securities_services.custody.settlement [x-cut payments]
-trading_risk(4)            → use_case : markets.market_risk [merge]
-affordability(3)           → use_case : credit.underwriting.affordability
-engagement(3)              → use_case : customer.engagement
-hardship(3)                → use_case : credit.collections.hardship
-persistency(3)             → use_case : insurance.lapse [merge]
-segmentation(3)            → use_case : customer.segmentation
-self_cure(3)               → use_case : credit.collections.self_cure
-bancassurance(2)           → use_case : insurance.bancassurance
-claims(2)                  → use_case : insurance.claims
-deposit_attrition(2)       → use_case : customer.deposit_attrition [FLAG §5]
-ftp(2)                     → modelling_context : framework.ftp
-interchange_optimisation(2)→ use_case : payments.merchant.interchange
-irrbb(2)                   → modelling_context : framework.irrbb
-lcr(2)                     → modelling_context : framework.lcr
-lgd(2)                     → measure : lgd
-mandate_compliance(2)      → use_case : asset_management.mandate_compliance
-primacy_loss(2)            → deprecated : customer.churn (stage)
-sanctions(2)               → use_case : financial_crime.aml.sanctions
-sme_credit(2)              → use_case : credit.underwriting.sme
-structuring(2)             → use_case : financial_crime.aml.structuring
-supply_chain_finance(2)    → use_case : corporate_trade.supply_chain_finance
-underwriting(2)            → use_case : credit.underwriting
-whitespace(2)              → use_case : customer.cross_sell.whitespace
-workout(2)                 → use_case : credit.collections.workout
-app_scam(1)                → use_case : financial_crime.fraud.app_scam
-aum_stability(1)           → use_case : asset_management.redemption.aum_stability
-authorised_push_payment(1) → deprecated : financial_crime.fraud.app_scam (merge)
-basis_risk(1)              → use_case : deposits_alm.basis_risk [x-cut markets]
-campaign_analytics(1)      → use_case : customer.campaign
-cash_management(1)         → use_case : deposits_alm.cash_management [x-cut corporate]
-cashflow(1)                → deprecated : credit.underwriting.affordability
-cashflow_risk(1)           → use_case : deposits_alm.liquidity.cashflow_risk
-claims_fraud(1)            → use_case : insurance.claims.claims_fraud
-contactability(1)          → deprecated : credit.collections (signal)
-corporate_actions(1)       → use_case : securities_services.custody.corporate_actions
-correspondent_banking(1)   → use_case : financial_crime.aml.correspondent
-cost_efficiency(1)         → flagged : ? (operational)      [FLAG §5]
-credit_mitigation(1)       → use_case : credit.monitoring.credit_mitigation
-credit_seasoning(1)        → use_case : credit.underwriting.seasoning
-cross_border(1)            → use_case : payments.cross_border
-crypto(1)                  → flagged : financial_crime.aml.crypto? [FLAG §5]
-data_quality(1)            → measure : data_quality
-distribution(1)            → flagged : customer.campaign? insurance? [FLAG §5]
-exposure_management(1)     → use_case : credit.monitoring.exposure_management [x-cut markets]
-frtb(1)                    → modelling_context : framework.frtb
-fund_administration(1)     → use_case : securities_services.fund_administration
-fund_flows(1)              → use_case : asset_management.redemption.fund_flows
-fund_liquidity(1)          → use_case : asset_management.redemption.fund_liquidity
-fund_performance(1)        → use_case : asset_management.performance
-kyc(1)                     → use_case : financial_crime.aml.kyc
-margin(1)                  → use_case : markets.counterparty_risk.margin
-nsfr(1)                    → modelling_context : framework.nsfr
-overdraft_propensity(1)    → use_case : customer.overdraft_propensity
-physical_risk(1)           → use_case : esg.climate.physical
-portfolio_risk(1)          → use_case : markets.market_risk.portfolio [merge]
-receivables_finance(1)     → use_case : corporate_trade.receivables_finance
-reinsurance(1)             → use_case : insurance.reinsurance
-screening(1)               → use_case : financial_crime.aml.screening
-securities_lending(1)      → use_case : securities_services.securities_lending
-surrender(1)               → use_case : insurance.lapse.surrender [merge]
-sustainable_finance(1)     → deprecated : esg.scoring (merge)
-synthetic_id(1)            → use_case : financial_crime.fraud.synthetic_id
-tracking_error(1)          → measure : tracking_error
-unbundling(1)              → deprecated : customer.churn (stage)
-wealth_outflow(1)          → deprecated : customer.deposit_attrition
-xva(1)                     → measure : xva
+```yaml
+id: aml_cft.suspicious_transaction_monitoring
+domain: financial_crime
+governance_owner: group_financial_crime_compliance
+operating_owner: aml_operations
+consumers: [aml_operations, regulatory_reporting]
+capabilities: [transaction_monitoring, anomaly_detection, network_analysis]
 ```
 
+Whether Fraud and AML "share a roof" changes `governance_owner`/`operating_owner` — never taxonomy identity.
+
 ---
 
-## 5. Contentious calls — your domain judgment, please
+## 5. Remap execution note (input to Phase-0)
 
-1. **`financial_crime` as a parent domain** (fraud + aml + transaction_monitoring under it) vs. `fraud` and `aml` as two independent top-level families. I chose the parent because "financial crime" is a real org unit and it lets `transaction_monitoring` sit above both — but you may run fraud and AML as entirely separate books.
-2. **`deposit_attrition` under `customer`** (a customer-behaviour objective) vs. under `deposits_alm` (a balance-sheet objective). I put it with churn because the *feature* is customer behaviour; the *consumer* may be treasury.
-3. **`transaction_monitoring` as one shared leaf** vs. split into `fraud.monitoring` + `aml.monitoring`. It genuinely spans both; one node keeps it simple but blurs which regime governs.
-4. **`crypto`** — AML crypto-laundering (`financial_crime.aml.crypto`) vs. a markets/product crypto family vs. its own top-level. Only one recipe carries it, so low stakes, but the placement signals intent.
-5. **`pricing` and `cost_efficiency`** — is `pricing` a first-class use-case family, or is it really a *modelling context/lens* applied across retail/credit/payments? And is `cost_efficiency` a modelling objective at all, or an operational metric that shouldn't be a use-case?
-6. **The deprecations** (`primacy_loss`, `unbundling`, `wealth_outflow`, `contactability`, `cashflow`) — I'm folding these into parent use-cases as *funnel-stage/signal* metadata rather than keeping them as selectable use-cases. Confirm that's right, or name any you want promoted to real leaves.
-7. **Cross-cutting risk tags** (`concentration_risk`, `exposure_management`, `basis_risk`, `margin`) straddle credit and markets. I assigned each a *primary* home; the crosswalk can also record a secondary. Confirm the primaries or move them.
+- **~84 tags remap 1:1** to a use-case leaf (mechanical — the v1 compact crosswalk, adjusted for the D1–D7 renames).
+- **The ~20 hard tags are resolved above** to concrete recipes — no per-recipe archaeology remains except confirming secondaries.
+- **`transaction_monitoring` (22)** splits deterministically by family (11 fraud / 11 aml) — listed in D3.
+- **Reclassified out of use_case:** `ifrs9_staging, frtb, irrbb, lcr, nsfr, ftp` (modelling_context); `xva, lgd` (modelling_context per owner); `tracking_error, data_quality` (measure); `crypto`→product_context+typology; `unbundling, contactability`→journey_stage/customer_state; `cost_efficiency`→business_outcome; `authorised_push_payment`→merge `app_scam`; `sustainable_finance`→merge `esg.scoring`.
+- **Deprecated generic tags** (split by objective, not folded): `exposure_management, basis_risk, margin, cashflow, cashflow_risk, pricing`.
