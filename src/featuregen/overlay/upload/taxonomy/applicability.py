@@ -52,12 +52,20 @@ class ScopeExpansion(StrEnum):
 class ConfirmedScope:
     """A confirmed use-case scope: the ``primary`` objective, the ``secondary`` objectives, the
     ``expansion`` mode, and the ``unscoped`` fail-open flag. When ``unscoped`` is set, ``primary`` is
-    ``None`` and :func:`in_scope_recipes` grounds every recipe."""
+    ``None`` and :func:`in_scope_recipes` grounds every recipe.
+
+    Phase-2B adds the two human-confirmed intent DIMENSIONS the recognizer proposes and the human
+    confirms at Gate #1 — ``modelling_contexts`` (0+ confirmed regulatory framework/regime ids) and a
+    single soft ``target_entity`` (the confirmed prediction grain). Both default empty so every
+    Phase-1 caller and a dimension-free scope are unchanged; the dimensions never affect
+    :func:`in_scope_recipes` (applicability narrows only on the use-case tree)."""
 
     primary: str | None
     secondary: tuple[str, ...] = ()
     expansion: ScopeExpansion = ScopeExpansion.EXACT
     unscoped: bool = False
+    modelling_contexts: tuple[str, ...] = ()
+    target_entity: str | None = None
 
 
 def scope_from_recognition(result: RecognitionResult) -> ConfirmedScope:

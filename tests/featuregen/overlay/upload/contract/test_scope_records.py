@@ -11,6 +11,7 @@ import psycopg
 import pytest
 
 from featuregen.overlay.upload.contract.scope_records import (
+    confirmation_delta,
     record_confirmed_scope,
     record_recognition_attempt,
     scope_for_run,
@@ -213,3 +214,95 @@ def test_duplicate_generation_run_id_scope_is_rejected(db) -> None:
         record_confirmed_scope(
             db, intent_id="intent_4", generation_run_id="run_4", recognition_id=None, scope=scope,
             use_case_origins={}, confirmation_source="user_confirmed", confirmed_by="ds1")
+
+
+def _dim_result() -> RecognitionResult:
+    """A CLASSIFIED result whose recognizer PROPOSED two modelling contexts (``ifrs9``/``frtb``) and a
+    soft ``target_entity`` (``account``) — the proposed half the confirmation delta reconciles against."""
+    return RecognitionResult(
+        status=RecognitionStatus.CLASSIFIED,
+        candidates=(UseCaseCandidate(use_case_id=PRIMARY, relationship="primary", confidence="high",
+                                     evidence_spans=("balance dropped",), rationale="churn signal"),),
+        ambiguity_note=None,
+        taxonomy_version="tax_v9", recognizer_model_id="model_v9", prompt_version="prompt_v9",
+        applicability_mapping_version="map_v9", recipe_registry_version="reg_v9",
+        modelling_contexts=("ifrs9", "frtb"),
+        target_entity="account",
+    )
+
+
+def test_confirmed_dimensions_persist_provenance_round_trip_and_delta(db) -> None:
+    """The recognizer proposes contexts ifrs9/frtb + entity account; the human accepts ifrs9, rejects
+    frtb, adds lcr, and replaces the entity account->customer. The dimension child rows carry the right
+    provenance, scope_for_run rebuilds the confirmed dimensions, and confirmation_delta reconstructs the
+    proposed-vs-confirmed delta."""
+    rid = record_recognition_attempt(
+        db, intent_id="intent_dimscope", input_hash="hash_dimscope", result=_dim_result(), actor="ds1")
+
+    scope = ConfirmedScope(
+        primary=PRIMARY, secondary=(), expansion=ScopeExpansion.EXACT, unscoped=False,
+        modelling_contexts=("ifrs9", "lcr"),   # ifrs9 accepted, frtb rejected (dropped), lcr added
+        target_entity="customer")              # replaces the proposed account
+    scope_id = record_confirmed_scope(
+        db, intent_id="intent_dimscope", generation_run_id="run_dimscope", recognition_id=rid,
+        scope=scope, use_case_origins={},
+        dimension_sources={"lcr": "user_added", "customer": "user_replacement"},
+        replaces={"customer": "account"},
+        confirmation_source="user_confirmed", confirmed_by="ds1")
+
+    # The dimension child rows carry dimension / value / source / replaces_value.
+    rows = db.execute(
+        "SELECT dimension, value, source, replaces_value, display_order "
+        "FROM confirmed_scope_dimension WHERE scope_id = %s ORDER BY dimension, display_order",
+        (scope_id,)).fetchall()
+    assert rows == [
+        ("modelling_context", "ifrs9", "accepted_llm_proposal", None, 0),  # accepted, default source
+        ("modelling_context", "lcr", "user_added", None, 1),               # user added
+        ("target_entity", "customer", "user_replacement", "account", 0),   # replaces account
+    ]
+
+    # scope_for_run rebuilds the confirmed dimensions verbatim (ordered contexts + single entity).
+    reconstructed = scope_for_run(db, "run_dimscope")
+    assert reconstructed == scope
+    assert reconstructed.modelling_contexts == ("ifrs9", "lcr")
+    assert reconstructed.target_entity == "customer"
+
+    # The proposed-vs-confirmed delta reconstructs from the attempt proposals + confirmed child rows.
+    delta = confirmation_delta(db, "run_dimscope")
+    assert delta["accepted"] == ["ifrs9"]                 # proposed AND confirmed
+    assert delta["rejected"] == ["frtb"]                  # proposed, dropped (account is REPLACED, not here)
+    assert set(delta["added"]) == {"lcr", "customer"}     # confirmed, not proposed (lcr + the entity change)
+    assert delta["replaced"] == [{"from": "account", "to": "customer"}]
+
+
+def test_unscoped_scope_writes_no_dimension_rows(db) -> None:
+    # An unscoped scope confirms no dimensions -> ZERO confirmed_scope_dimension rows, even if a stray
+    # modelling_context/target_entity rode in on the value object (mirrors the use-case-children guard).
+    scope = ConfirmedScope(
+        primary=None, unscoped=True, modelling_contexts=("ifrs9",), target_entity="customer")
+    scope_id = record_confirmed_scope(
+        db, intent_id="intent_undim", generation_run_id="run_undim", recognition_id=None, scope=scope,
+        use_case_origins={}, confirmation_source="user_broadened", confirmed_by="ds1")
+
+    n_dims = db.execute(
+        "SELECT count(*) FROM confirmed_scope_dimension WHERE scope_id = %s", (scope_id,)).fetchone()[0]
+    assert n_dims == 0
+    assert scope_for_run(db, "run_undim") == ConfirmedScope(primary=None, secondary=(), unscoped=True)
+
+
+def test_scope_with_no_dimensions_round_trips_as_empty(db) -> None:
+    # Backward-compat: a scope confirming no dimensions round-trips as ()/None (Phase-1B-identical).
+    scope = ConfirmedScope(primary=PRIMARY, secondary=(SECONDARY,), unscoped=False)
+    record_confirmed_scope(
+        db, intent_id="intent_nodimscope", generation_run_id="run_nodimscope", recognition_id=None,
+        scope=scope, use_case_origins={}, confirmation_source="user_confirmed", confirmed_by="ds1")
+
+    reconstructed = scope_for_run(db, "run_nodimscope")
+    assert reconstructed == scope
+    assert reconstructed.modelling_contexts == ()
+    assert reconstructed.target_entity is None
+
+
+def test_confirmation_delta_unknown_run_is_empty(db) -> None:
+    assert confirmation_delta(db, "no_such_run") == {
+        "accepted": [], "rejected": [], "added": [], "replaced": []}
