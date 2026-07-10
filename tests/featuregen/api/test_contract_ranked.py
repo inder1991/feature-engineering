@@ -347,3 +347,33 @@ def test_bogus_modelling_context_is_dropped_at_the_boundary(make_client, conn, m
     assert [c[0] for c in contexts] == ["ifrs9"]
     # The kept ifrs9 still drives the ifrs9-tagged recipe to REQUIRED_MATCH (no conflict warning).
     assert "modelling_context_conflict" not in mixed["signal_warnings"].get(IFRS9_RECIPE, [])
+
+
+# ── Phase-3A Task 3A.5: the graph-backed grain resolver leaks NO provenance to the wire ────────────────
+def _all_keys(obj):
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            yield k
+            yield from _all_keys(v)
+    elif isinstance(obj, list):
+        for item in obj:
+            yield from _all_keys(item)
+
+
+def test_scoped_ranking_response_leaks_no_entity_graph_metadata(make_client, conn, monkeypatch):
+    """A REAL scoped run that produces a DERIVABLE grain (facility -> obligor — the B3
+    entity_grain_mismatch case above, now resolved by the 3A entity graph) must carry NONE of the graph
+    provenance fields anywhere in its serialized response tree. This is the stronger, wire-level neutrality
+    guard: the graph resolver DID run (proven by the mismatch warning), yet its graph_version / paths /
+    reason-code provenance stays entirely internal to the ranking adapter."""
+    monkeypatch.setenv(SCOPE_FLAG, "1")
+    monkeypatch.setenv(RANK_FLAG, "1")
+    _bank_ifrs9(conn)
+
+    body = _post_unscoped(make_client(_fake()), target_entity="obligor")
+
+    # Non-vacuous: this really is the DERIVABLE path — the graph resolver ran and surfaced the roll-up.
+    assert "entity_grain_mismatch" in body["signal_warnings"].get(GENERIC_CREDIT_RECIPE, [])
+    # …yet none of the 3A entity-graph provenance appears ANYWHERE in the response JSON.
+    keys = set(_all_keys(body))
+    assert not (keys & {"graph_version", "paths", "paths_truncated", "relationship_version"})

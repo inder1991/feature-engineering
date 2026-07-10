@@ -38,6 +38,11 @@ from __future__ import annotations
 from enum import StrEnum
 
 from featuregen.overlay.upload.concepts import concept
+from featuregen.overlay.upload.taxonomy.entity_graph import (
+    ENTITY_GRAPH,
+    resolve_entity_compatibility,
+)
+from featuregen.overlay.upload.taxonomy.entity_relationships import EntityCompatibility
 from featuregen.overlay.upload.taxonomy.legacy_crosswalk import crosswalk
 from featuregen.overlay.upload.templates import GroundedFeature, Template
 
@@ -186,32 +191,9 @@ def modelling_context_fit(
 
 
 # ──────────────────────────────────────────────────────────────────────────────────────────────────
-# EntityCompatibility — Phase-2A stub (Task B3 supplies the real grain logic)
+# EntityCompatibility — Phase-3A: the grain relationship is resolved by the governed entity graph
+# (``EntityCompatibility`` is imported from ``entity_relationships`` + re-exported here for callers).
 # ──────────────────────────────────────────────────────────────────────────────────────────────────
-class EntityCompatibility(StrEnum):
-    """Soft grain fit of a recipe to a confirmed ``target_entity``. ``EXACT`` = the recipe's grain is the
-    target entity; ``DERIVABLE`` = it can be rolled up/down to it; ``UNKNOWN`` = no target entity, or the
-    grain relationship is not known. There is deliberately **no** ``INCOMPATIBLE`` — a hard entity reject
-    is deferred to Phase 3; ``target_entity`` is only ever a soft grain nudge."""
-
-    EXACT = "exact"
-    DERIVABLE = "derivable"
-    UNKNOWN = "unknown"
-
-
-# A small, CONSERVATIVE roll-up map: a child grain that can be aggregated UP to a coarser parent entity
-# WITHOUT needing join semantics we don't have yet. Deliberately tiny — only the roll-ups we can assert
-# by declaration (the full relational grain graph, and any hard INCOMPATIBLE reject, are Phase-3 work).
-# Chains compose transitively (``transaction -> account -> customer``); :func:`_rolls_up_to` walks them.
-_ENTITY_ROLLUP: dict[str, str] = {
-    "account": "customer",
-    "card_account": "customer",
-    "transaction": "account",
-    "facility": "obligor",
-    "policy": "customer",
-}
-
-
 def _grain_entity(t: Template) -> str | None:
     """The recipe's GRAIN entity: the ``entity_link`` of the concept of the recipe's entity-role need
     (the FIRST need whose concept carries an ``entity_link`` — e.g. a ``customer_id`` need fixes the
@@ -224,42 +206,19 @@ def _grain_entity(t: Template) -> str | None:
     return None
 
 
-def _rolls_up_to(grain: str, target: str) -> bool:
-    """True iff ``grain`` rolls up to ``target`` along the declared roll-up chain (transitively, with a
-    cycle guard). ``account`` rolls up to ``customer`` directly; ``transaction`` rolls up to ``customer``
-    via ``account``. A grain that only rolls DOWN to (never UP to) the target does not match."""
-    seen: set[str] = set()
-    cur: str | None = grain
-    while cur is not None and cur not in seen:
-        seen.add(cur)
-        cur = _ENTITY_ROLLUP.get(cur)
-        if cur == target:
-            return True
-    return False
-
-
 def entity_compatibility(t: Template, target_entity: str | None = None) -> EntityCompatibility:
-    """The SOFT grain fit of the recipe to a confirmed ``target_entity``. A grain/groundability signal —
-    a low rank tie-break and (on ``DERIVABLE``) a grain warning — NEVER an applicability reject.
-
-    * ``target_entity is None`` → ``UNKNOWN`` (no target confirmed; ranking is unaffected);
-    * the recipe's grain == ``target_entity`` → ``EXACT`` (the recipe already predicts at the target grain);
-    * the recipe's grain rolls up to ``target_entity`` via the declared roll-up map → ``DERIVABLE`` (a real
-      grain mismatch that a roll-up can bridge — e.g. an ``account``-grain recipe under ``customer``);
-    * otherwise → ``UNKNOWN`` (no known grain relationship, or the recipe declares no grain).
-
-    There is deliberately **no** ``INCOMPATIBLE`` — a hard entity reject is Phase-3 work; a grain that
-    does not roll up to the target is ``UNKNOWN`` (soft), never a rejection."""
+    """The SOFT grain fit of the recipe to a confirmed ``target_entity`` — a grain/groundability signal
+    (a low rank tie-break + an ``entity_grain_mismatch`` warning on ``DERIVABLE``), NEVER an
+    applicability reject. Phase-3A: the grain relationship is resolved by the governed entity graph
+    (:func:`resolve_entity_compatibility` over :data:`ENTITY_GRAPH`) instead of a hardcoded map — the
+    seed is regression-equivalent, so outputs match the old map exactly. ``target_entity is None`` or a recipe
+    with no derivable grain → ``UNKNOWN``."""
     if target_entity is None:
         return EntityCompatibility.UNKNOWN
-    grain = _grain_entity(t)
-    if grain is None:
+    source = _grain_entity(t)
+    if source is None:
         return EntityCompatibility.UNKNOWN
-    if grain == target_entity:
-        return EntityCompatibility.EXACT
-    if _rolls_up_to(grain, target_entity):
-        return EntityCompatibility.DERIVABLE
-    return EntityCompatibility.UNKNOWN
+    return resolve_entity_compatibility(source, target_entity, ENTITY_GRAPH).status
 
 
 # ──────────────────────────────────────────────────────────────────────────────────────────────────
