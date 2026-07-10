@@ -30,10 +30,10 @@ def test_feature_metadata_surfaced_and_entity_searchable(db):
     assert ingest_upload(db, "deposits", rows, actor=_actor(), now=now).status == "ingested"
 
     # metadata surfaces on the search hit (feature-building needs it to aggregate correctly)
-    hit = next(h for h in search(db, "balance", now=now) if h.column == "balance")
+    hit = next(h for h in search(db, "balance", now=now).hits if h.column == "balance")
     assert hit.additivity == "semi_additive"   # do not SUM a balance over time
     assert hit.unit == "cents" and hit.currency == "USD"
     assert hit.entity == "Account"
 
     # the entity is searchable
-    assert any(h.column == "balance" for h in search(db, "account", now=now))
+    assert any(h.column == "balance" for h in search(db, "account", now=now).hits)

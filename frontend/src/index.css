@@ -2524,3 +2524,224 @@ section > h2:first-child {
     grid-template-columns: 1fr;
   }
 }
+
+/* ---------------------------------------------------------------- faceted search
+   The Search screen's two-column faceted layout: a full-width query row + List|Graph toggle,
+   a removable active-filter chip row, then a sticky facet sidebar beside the results. Composes
+   the existing .btn / .badge / .rows / .empty / .viewtoggle vocabulary; only the facet sidebar,
+   chips, and search bar are new. */
+
+.search-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  margin-block: 4px 14px;
+}
+
+.search-input {
+  flex: 1 1 320px;
+  min-width: 0;
+  height: 40px;
+  padding: 0 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: var(--ink);
+  font-size: 14px;
+}
+
+.search-submit {
+  height: 40px;
+}
+
+/* active-filter chips: removable tokens between the query row and the results */
+.active-filters {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  min-height: 26px;
+  margin-block: 0 14px;
+}
+
+.active-filters-label {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+}
+
+.filter-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 6px 3px 10px;
+  border: 1px solid var(--accent-line);
+  border-radius: 999px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+
+/* pii chip: a danger wash. Color never works alone — the "sensitivity: pii" text carries it. */
+.filter-chip--pii {
+  border-color: oklch(0.8 0.08 25);
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+
+.filter-chip button {
+  height: auto;
+  min-height: 0;
+  padding: 0 2px;
+  border: 0;
+  background: none;
+  color: inherit;
+  font-family: var(--font-mono);
+  font-size: 14px;
+  font-weight: 700;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.filter-chip button:hover {
+  background: none;
+  border: 0;
+}
+
+.clear-filters {
+  height: auto;
+  min-height: 0;
+  padding: 0 2px;
+  border: 0;
+  background: none;
+  color: var(--accent);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.clear-filters:hover {
+  background: none;
+  border: 0;
+  color: var(--accent-hover);
+}
+
+/* the two-column body: sticky facet sidebar + results */
+.facet-cols {
+  display: grid;
+  grid-template-columns: 224px minmax(0, 1fr);
+  gap: 22px;
+  align-items: start;
+}
+
+.facet-panel {
+  position: sticky;
+  top: 20px;
+  display: flex;
+  flex-direction: column;
+}
+
+.facet-group {
+  margin: 0;
+  padding: 10px 2px 12px;
+  border: 0;
+  border-bottom: 1px solid var(--line);
+  min-width: 0;
+}
+
+.facet-group:first-child {
+  padding-top: 0;
+}
+
+.facet-group-title {
+  padding: 0;
+  margin-bottom: 8px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+}
+
+.facet-option {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 3px 4px;
+  border-radius: 6px;
+  font-size: 13px;
+  font-weight: 400;
+  color: var(--ink);
+  cursor: pointer;
+}
+
+.facet-option:hover {
+  background: var(--surface-2);
+}
+
+.facet-option input {
+  width: 15px;
+  height: 15px;
+  flex: none;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+
+.facet-option--disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.facet-option--disabled input {
+  cursor: not-allowed;
+}
+
+.facet-name {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.facet-count {
+  margin-left: auto;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--ink-faint);
+}
+
+/* the danger dot beside a pii facet value; the 'pii' label beside it carries the meaning */
+.facet-pii-dot {
+  width: 7px;
+  height: 7px;
+  flex: none;
+  border-radius: 999px;
+  background: var(--danger-solid);
+}
+
+.result-count {
+  margin-block: 2px 10px;
+  color: var(--accent);
+}
+
+.result-count-note {
+  color: var(--ink-faint);
+  font-weight: 400;
+}
+
+/* narrow viewports: the sidebar unsticks and stacks above the results */
+@media (max-width: 900px) {
+  .facet-cols {
+    grid-template-columns: 1fr;
+  }
+
+  .facet-panel {
+    position: static;
+  }
+}

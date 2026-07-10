@@ -59,4 +59,19 @@ describe('useHashRoute', () => {
     expect(window.location.hash).toBe('#/workbench')
     expect(result.current.route).toBe('workbench')
   })
+
+  it('navigate accepts a URLSearchParams with repeated values for faceted deep links', () => {
+    const { result } = renderHook(() => useHashRoute())
+    act(() => {
+      const p = new URLSearchParams()
+      p.set('q', 'balance')
+      p.append('source', 'deposits')
+      p.append('source', 'cards')
+      result.current.navigate('search', p)
+    })
+    expect(window.location.hash).toBe('#/search?q=balance&source=deposits&source=cards')
+    expect(result.current.route).toBe('search')
+    expect(result.current.params.getAll('source')).toEqual(['deposits', 'cards'])
+    expect(result.current.params.get('q')).toBe('balance')
+  })
 })
