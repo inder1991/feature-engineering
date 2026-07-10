@@ -2426,13 +2426,6 @@ section > h2:first-child {
   gap: 8px;
 }
 
-/* host-allowlist chip: an accent-soft badge (distinct from the ok/held sensitivity chips) */
-.badge.host {
-  background: var(--accent-soft);
-  border-color: transparent;
-  color: var(--accent);
-}
-
 /* tier 2: the services + syncs zone inside a card */
 .services {
   border-top: 1px solid var(--line);

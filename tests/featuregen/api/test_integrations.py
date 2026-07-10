@@ -347,6 +347,9 @@ def test_rbac_sync_writes_require_catalog_write(client):
     assert _create_sync(client, iid, headers=VIEWER).status_code == 403
     assert _create_sync(client, iid, headers=ENGINEER).status_code == 403
     sid = _create_sync(client, iid).json()["sync_id"]
+    # PATCH is a write too: a catalog_viewer-only identity cannot edit a sync.
+    assert client.patch(f"/integrations/{iid}/syncs/{sid}",
+                        json={"target_source": "cards2"}, headers=VIEWER).status_code == 403
     assert client.delete(f"/integrations/{iid}/syncs/{sid}", headers=VIEWER).status_code == 403
 
 
@@ -529,6 +532,9 @@ def test_import_held_by_brake_is_recorded_honestly(client, conn):
     # the attempt is still audited
     assert conn.execute("SELECT result->>'status' FROM integration_import WHERE sync_id = %s",
                         (sid,)).fetchone()[0] == "held"
+    # HONESTY: a held import wrote nothing, so it must NOT advance last_import_at
+    got = client.get(f"/integrations/{iid}/syncs/{sid}", headers=VIEWER).json()
+    assert got["last_import_at"] is None
 
 
 def test_import_rbac_requires_catalog_write(client):

@@ -157,7 +157,7 @@ class OMConfig:
     base_url: str
     target_source: str                                  # the FeatureGen catalog source
     tag_map: Mapping[str, str] = field(default_factory=dict)   # OM tagFQN -> sensitivity ('' = ignore)
-    filters: Mapping[str, str] = field(default_factory=dict)   # service|database|schema -> fnmatch pattern
+    filters: Mapping[str, str] = field(default_factory=dict)   # service = EXACT bind; database|schema = fnmatch
     table_naming: str = "table"                         # 'table' | 'schema_table'
 
 
@@ -198,8 +198,18 @@ def _fqn_parts(t: dict[str, Any]) -> dict[str, str]:
 
 
 def _in_scope(parts: Mapping[str, str], filters: Mapping[str, str]) -> bool:
-    return all(fnmatch(parts.get(key, ""), pattern)
-               for key, pattern in filters.items() if pattern)
+    """A sync's SERVICE is an EXACT bind, not a glob: it is matched literally so a service whose
+    name contains fnmatch metacharacters (``svc[1]``, or a service literally named ``*``) binds
+    only itself and never wildcard-pulls the whole instance. Database/schema filters ARE patterns
+    and keep fnmatch semantics."""
+    for key, pattern in filters.items():
+        if not pattern:
+            continue
+        value = parts.get(key, "")
+        matched = value == pattern if key == "service" else fnmatch(value, pattern)
+        if not matched:
+            return False
+    return True
 
 
 def _fold_table(name: str, schema: str, table_naming: str) -> str:

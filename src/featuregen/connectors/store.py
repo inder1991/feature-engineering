@@ -16,9 +16,33 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
+import psycopg
 from psycopg.types.json import Jsonb
 
 from featuregen.idgen import mint_id
+
+# ---- Uniqueness conflicts (concurrent-insert loser) ------------------------------------------
+#
+# The routes pre-check uniqueness (integration name, one sync per service) and 409 on the common
+# path. But a read-then-insert races: two callers can both pass the pre-check, and the DB UNIQUE
+# constraint then fails ONE of the inserts with a psycopg UniqueViolation — which, left raw, FastAPI
+# turns into a 500. The create_* functions catch that violation and re-raise it as one of these
+# clean DOMAIN errors, which the route maps to the SAME 409 its pre-check returns; the aborted
+# request transaction is then rolled back by the caller (``get_conn`` in prod). Race and common
+# path converge on one verdict.
+
+
+class ConnectorConflict(Exception):
+    """Base: a store-level uniqueness conflict (a concurrent-insert loser)."""
+
+
+class IntegrationNameConflict(ConnectorConflict):
+    """An integration ``name`` already exists (the UNIQUE(name) constraint fired)."""
+
+
+class SyncServiceConflict(ConnectorConflict):
+    """A sync for this ``(integration_id, service_name)`` already exists (the UNIQUE constraint)."""
+
 
 # ---- Integration (tier 1) --------------------------------------------------------------------
 
@@ -40,10 +64,14 @@ def _integration_to_dict(row: tuple) -> dict[str, Any]:
 def create_integration(conn: Any, *, name: str, base_url: str, token_env: str,
                        tag_map: dict[str, str], created_by: str) -> dict[str, Any]:
     integration_id = mint_id("intg")
-    conn.execute(
-        "INSERT INTO integration (integration_id, name, base_url, token_env, tag_map, created_by) "
-        "VALUES (%s, %s, %s, %s, %s, %s)",
-        (integration_id, name, base_url, token_env, Jsonb(tag_map), created_by))
+    try:
+        conn.execute(
+            "INSERT INTO integration "
+            "(integration_id, name, base_url, token_env, tag_map, created_by) "
+            "VALUES (%s, %s, %s, %s, %s, %s)",
+            (integration_id, name, base_url, token_env, Jsonb(tag_map), created_by))
+    except psycopg.errors.UniqueViolation as exc:   # lost a UNIQUE(name) race -> clean 409, not 500
+        raise IntegrationNameConflict(name) from exc
     got = get_integration(conn, integration_id)
     assert got is not None
     return got
@@ -123,13 +151,16 @@ def create_sync(conn: Any, *, integration_id: str, service_name: str,
                 tag_map_override: dict[str, str] | None, table_naming: str,
                 created_by: str) -> dict[str, Any]:
     sync_id = mint_id("sync")
-    conn.execute(
-        "INSERT INTO integration_sync (sync_id, integration_id, service_name, database_filter, "
-        "schema_filter, target_source, tag_map_override, table_naming, created_by) "
-        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
-        (sync_id, integration_id, service_name, database_filter, schema_filter, target_source,
-         Jsonb(tag_map_override) if tag_map_override is not None else None, table_naming,
-         created_by))
+    try:
+        conn.execute(
+            "INSERT INTO integration_sync (sync_id, integration_id, service_name, "
+            "database_filter, schema_filter, target_source, tag_map_override, table_naming, "
+            "created_by) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
+            (sync_id, integration_id, service_name, database_filter, schema_filter,
+             target_source, Jsonb(tag_map_override) if tag_map_override is not None else None,
+             table_naming, created_by))
+    except psycopg.errors.UniqueViolation as exc:   # lost a UNIQUE(service) race -> clean 409
+        raise SyncServiceConflict(service_name) from exc
     got = get_sync(conn, sync_id)
     assert got is not None
     return got

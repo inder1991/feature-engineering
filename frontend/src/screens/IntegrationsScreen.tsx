@@ -460,7 +460,6 @@ function IntegrationCard({
         ) : (
           <span className="badge held">token not set</span>
         )}
-        <span className="badge host">host allowlisted</span>
         <div className="integration-acts">
           <button type="button" className="btn" onClick={() => setEditing(v => !v)}>
             Edit

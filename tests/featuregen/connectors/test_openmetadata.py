@@ -173,9 +173,45 @@ def test_scope_filters_exclude_and_include():
     tables = fetch_tables(fixture_fetch())
     none = read_openmetadata(tables, replace(CARDS_CONFIG, filters={"schema": "private"}))
     assert none.rows == []
-    some = read_openmetadata(tables, replace(CARDS_CONFIG, filters={"service": "mysql_*",
-                                                                    "database": "cards_db"}))
+    # service is an EXACT bind (mysql_prod); database/schema stay fnmatch patterns (cards_*).
+    some = read_openmetadata(tables, replace(CARDS_CONFIG, filters={"service": "mysql_prod",
+                                                                    "database": "cards_*"}))
     assert len(some.rows) == 14
+
+
+def _svc_table(service: str) -> dict:
+    """A minimal table entity under `service`, named so each service maps to a distinct table."""
+    return {"name": f"t_{service}", "service": {"name": service},
+            "databaseSchema": {"name": "public"},
+            "columns": [{"name": "c", "dataType": "TEXT"}]}
+
+
+def test_service_filter_is_exact_bind_not_a_glob():
+    """A sync's service_name is an EXACT bind, not a glob: a bracket like 'svc[1]' must bind only
+    the service literally named 'svc[1]', never 'svc1' (which fnmatch would treat as a match)."""
+    tables = [_svc_table("svc[1]"), _svc_table("svc1"), _svc_table("svcX")]
+    got = read_openmetadata(tables, replace(CARDS_CONFIG, filters={"service": "svc[1]"}))
+    assert {r.table for r in got.rows} == {"t_svc[1]"}
+
+
+def test_literal_star_service_does_not_wildcard_every_service():
+    """A service_name of '*' must bind ONLY a service literally named '*' — never wildcard-pull
+    every service in the instance."""
+    tables = [_svc_table("*"), _svc_table("mysql_prod"), _svc_table("snowflake")]
+    got = read_openmetadata(tables, replace(CARDS_CONFIG, filters={"service": "*"}))
+    assert {r.table for r in got.rows} == {"t_*"}
+
+
+def test_database_filter_stays_a_glob():
+    """database/schema filters ARE patterns: a glob on database keeps fnmatch semantics."""
+    tables = [_svc_table("s")]
+    tables[0]["database"] = {"name": "cards_db"}
+    matched = read_openmetadata(tables, replace(CARDS_CONFIG,
+                                                filters={"service": "s", "database": "cards_*"}))
+    assert {r.table for r in matched.rows} == {"t_s"}
+    missed = read_openmetadata(tables, replace(CARDS_CONFIG,
+                                               filters={"service": "s", "database": "loans_*"}))
+    assert missed.rows == []
 
 
 # ---- Snapshot hash ----------------------------------------------------------------------------
@@ -339,3 +375,35 @@ def test_preview_of_empty_pull_raises_value_error(conn):
     with pytest.raises(ValueError, match="nothing to import"):
         build_preview(conn, CARDS_CONFIG,
                       read_openmetadata([], CARDS_CONFIG))
+
+
+# ---- Store uniqueness (concurrent-insert loser) ----------------------------------------------
+#
+# The route pre-checks uniqueness and 409s on the common path, but a read-then-insert can lose a
+# race to a concurrent writer; the DB UNIQUE constraint then fails the insert. The store catches
+# that psycopg UniqueViolation and re-raises a clean DOMAIN error (not a raw IntegrityError) so the
+# route can map it to the SAME 409. These assert the domain-error type on a direct duplicate insert.
+
+
+def test_store_duplicate_integration_name_raises_domain_error(conn):
+    from featuregen.connectors import store
+
+    store.create_integration(conn, name="dup", base_url="https://om.x",
+                             token_env="FEATUREGEN_OM_TOKEN__X", tag_map={}, created_by="user:o")
+    with pytest.raises(store.IntegrationNameConflict):
+        store.create_integration(conn, name="dup", base_url="https://om.y",
+                                 token_env="FEATUREGEN_OM_TOKEN__Y", tag_map={},
+                                 created_by="user:o")
+
+
+def test_store_duplicate_sync_service_raises_domain_error(conn):
+    from featuregen.connectors import store
+
+    iid = store.create_integration(conn, name="i1", base_url="https://om.x",
+                                   token_env="FEATUREGEN_OM_TOKEN__X", tag_map={},
+                                   created_by="user:o")["integration_id"]
+    kw = dict(integration_id=iid, service_name="svc", database_filter=None, schema_filter=None,
+              tag_map_override=None, table_naming="table", created_by="user:o")
+    store.create_sync(conn, target_source="src", **kw)
+    with pytest.raises(store.SyncServiceConflict):
+        store.create_sync(conn, target_source="src2", **kw)

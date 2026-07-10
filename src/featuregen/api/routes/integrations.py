@@ -249,9 +249,13 @@ def create_integration(body: IntegrationIn, conn: _Conn, identity: _Identity) ->
     _enforce_egress_allowlist(body.base_url)
     if store.integration_name_exists(conn, body.name):
         raise HTTPException(status_code=409, detail=f"integration '{body.name}' already exists")
-    integ = store.create_integration(
-        conn, name=body.name, base_url=body.base_url, token_env=token_env,
-        tag_map=body.tag_map, created_by=identity.subject)
+    try:
+        integ = store.create_integration(
+            conn, name=body.name, base_url=body.base_url, token_env=token_env,
+            tag_map=body.tag_map, created_by=identity.subject)
+    except store.IntegrationNameConflict as exc:   # lost the race after the pre-check passed
+        raise HTTPException(
+            status_code=409, detail=f"integration '{body.name}' already exists") from exc
     return _serialize_integration(integ)
 
 
@@ -372,11 +376,17 @@ def create_sync(integration_id: str, body: SyncIn, conn: _Conn, identity: _Ident
         raise HTTPException(
             status_code=409,
             detail=f"a sync for service '{body.service_name}' already exists on this integration")
-    sync = store.create_sync(
-        conn, integration_id=integration_id, service_name=body.service_name,
-        database_filter=body.database_filter, schema_filter=body.schema_filter,
-        target_source=body.target_source, tag_map_override=body.tag_map_override,
-        table_naming=body.table_naming, created_by=identity.subject)
+    try:
+        sync = store.create_sync(
+            conn, integration_id=integration_id, service_name=body.service_name,
+            database_filter=body.database_filter, schema_filter=body.schema_filter,
+            target_source=body.target_source, tag_map_override=body.tag_map_override,
+            table_naming=body.table_naming, created_by=identity.subject)
+    except store.SyncServiceConflict as exc:   # lost the race after the pre-check passed
+        raise HTTPException(
+            status_code=409,
+            detail=f"a sync for service '{body.service_name}' already exists on this "
+                   "integration") from exc
     return sync
 
 
@@ -461,7 +471,9 @@ def _effective_tag_map(integ: dict[str, Any], sync: dict[str, Any]) -> dict[str,
 
 
 def _sync_filters(sync: dict[str, Any]) -> dict[str, str]:
-    """The scope filters a sync narrows to: always its service, plus optional database/schema."""
+    """The scope filters a sync narrows to: always its service (an EXACT bind — ``_in_scope``
+    matches the service literally, never as a glob), plus optional database/schema fnmatch
+    patterns."""
     filters: dict[str, str] = {"service": sync["service_name"]}
     if sync["database_filter"]:
         filters["database"] = sync["database_filter"]
@@ -519,7 +531,8 @@ def import_sync(sync_id: str, body: ImportIn, conn: _Conn, identity: _Identity,
     """Confirmed import: re-pull, re-translate, verify the previewed snapshot hash, then run the
     UNCHANGED ingest pipeline in this request's one transaction. Suggestion is never ingestion:
     as-of hints from the preview are NOT applied here — rows carry blank semantics. Records
-    integration_import and stamps the sync's last_import_at."""
+    integration_import for every attempt (audit), but stamps last_import_at ONLY when rows
+    actually landed (status 'ingested') — a brake-held / rejected attempt wrote nothing."""
     sync, integ = _resolve_sync(conn, sync_id)
     _, translation = _pull(sync, integ)
     current_hash = snapshot_hash(translation.rows)
@@ -533,9 +546,12 @@ def import_sync(sync_id: str, body: ImportIn, conn: _Conn, identity: _Identity,
     import_id = store.record_import(
         conn, sync=sync, integration_id=integ["integration_id"], snapshot_hash=current_hash,
         approved_by=identity.subject, result=asdict(result))
-    store.touch_sync_last_import(conn, sync["sync_id"], datetime.now(UTC))
     pending = 0
     if result.status == "ingested":
+        # Only a real ingest lands rows, so only 'ingested' advances last_import_at: stamping a
+        # brake-HELD / REJECTED attempt (which wrote nothing) would falsely claim a synced source.
+        # The attempt itself is still audited by record_import above.
+        store.touch_sync_last_import(conn, sync["sync_id"], datetime.now(UTC))
         # Every OM row arrives semantics-blank — the translator never sets as-of/additivity/unit/
         # currency/entity — so every row that WASN'T quarantined is semantics-pending. Derive that
         # from the pipeline's own quarantine count rather than re-running validate_rows.

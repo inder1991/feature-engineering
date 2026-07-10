@@ -77,7 +77,7 @@ async function cardFor(name: string): Promise<HTMLElement> {
 }
 
 describe('integrations list', () => {
-  it('lists an instance with the sealed token + host chips; the token value is never in the DOM', async () => {
+  it('lists an instance with the sealed token chip; the token value is never in the DOM', async () => {
     listIntegrations.mockResolvedValue([INTEGRATION])
     render(<IntegrationsScreen />)
     const card = await cardFor('Corporate OpenMetadata')
@@ -86,7 +86,9 @@ describe('integrations list', () => {
     expect(card).toHaveTextContent('https://om.internal.test')
     expect(card).toHaveTextContent('FEATUREGEN_OM_TOKEN__CORP')
     expect(within(card).getByText('token sealed')).toBeInTheDocument()
-    expect(within(card).getByText('host allowlisted')).toBeInTheDocument()
+    // No "host allowlisted" chip: the client cannot verify the allowlist (ops could remove the
+    // host later), so the card must not assert a fact it does not know.
+    expect(within(card).queryByText('host allowlisted')).toBeNull()
     // No password/secret input anywhere on the screen.
     expect(document.querySelector('input[type="password"]')).toBeNull()
   })
