@@ -23,6 +23,7 @@ from featuregen.api.deps import (
     require_feature_read,
 )
 from featuregen.contracts.envelopes import IdentityEnvelope
+from featuregen.idgen import mint_id
 from featuregen.intake.llm import LLMClient, compute_input_hash
 from featuregen.overlay.upload.contract.author import ContractDraft, draft_contract
 from featuregen.overlay.upload.contract.gate1 import (
@@ -46,10 +47,22 @@ from featuregen.overlay.upload.contract.intake import (
     submit_intent,
 )
 from featuregen.overlay.upload.contract.review import author_contract
-from featuregen.overlay.upload.contract.scope_records import record_recognition_attempt
-from featuregen.overlay.upload.taxonomy.recognition import RecognitionStatus
+from featuregen.overlay.upload.contract.scope_records import (
+    record_confirmed_scope,
+    record_recognition_attempt,
+)
+from featuregen.overlay.upload.taxonomy.applicability import (
+    ConfirmedScope,
+    ScopeExpansion,
+    applicability_result,
+)
+from featuregen.overlay.upload.taxonomy.disposition import RecipeEvaluation, evaluate_dispositions
+from featuregen.overlay.upload.taxonomy.recognition import (
+    APPLICABILITY_MAPPING_VERSION,
+    RecognitionStatus,
+)
 from featuregen.overlay.upload.taxonomy.recognizer import recognize
-from featuregen.overlay.upload.taxonomy.use_cases import use_case
+from featuregen.overlay.upload.taxonomy.use_cases import selectable_leaves, use_case
 
 router = APIRouter()
 
@@ -81,6 +94,19 @@ class DraftIn(BaseModel):
             join_path=tuple(self.join_path))
 
 
+class ConfirmedScopeIn(BaseModel):
+    """The human-confirmed Gate #1 scope (Phase-1B). ``unscoped=true`` fails open to full grounding and
+    needs no ids; otherwise ``primary`` (if set) and every ``secondary`` must be a selectable taxonomy
+    leaf. ``use_case_origins`` maps a use-case id to its provenance (``llm_proposed``/``user_added``/
+    ``user_overridden``) for the proposed-vs-accepted audit delta."""
+    primary: str | None = None
+    secondary: list[str] = []
+    expansion: str = ScopeExpansion.EXACT.value
+    unscoped: bool = False
+    use_case_origins: dict[str, str] = {}
+    confirmation_source: str = "user_confirmed"
+
+
 class ConsideredSetIn(BaseModel):
     hypothesis: str = Field(min_length=1)
     definition: str = ""
@@ -90,6 +116,12 @@ class ConsideredSetIn(BaseModel):
     target_ref: str | None = None
     feedback: str | None = None   # whole-round human guidance: a feedback round re-runs the considered
     #                               set under this instruction, minting a FRESH governable intent
+    # ── Phase-1B (Task 7): present ⇒ mint a generation run, persist the confirmed scope BEFORE the
+    # builder, scope grounding, and attach a per-recipe disposition lens. Absent ⇒ today's path exactly.
+    intent_id: str | None = None          # reuse a prior recognition's immutable intent (else submit)
+    recognition_id: str | None = None     # the recognition attempt this scope confirms (lineage)
+    confirmed_scope: ConfirmedScopeIn | None = None
+    supersedes_scope_id: str | None = None   # broaden lineage: the scope this run's scope supersedes
 
 
 class DraftReqIn(BaseModel):
@@ -105,11 +137,99 @@ class RecognitionIn(BaseModel):
 
 
 # ---- routes -------------------------------------------------------------------------------------
+def _considered_set_response(intent, cs) -> dict:
+    """Today's considered-set response body — the anchor + alternatives + recommendation + rejections.
+    The scoped (Phase-1B) path returns this SAME shape plus the disposition lens; the no-scope path
+    returns it verbatim (byte-unchanged vs pre-1B)."""
+    return {"intent_id": intent.intent_id, "anchor": cs.anchor,
+            "alternatives": cs.alternatives, "recommendation": cs.recommendation,
+            "rejections": cs.rejections}
+
+
+def _disposition_json(ev: RecipeEvaluation) -> dict:
+    """One recipe's per-stage disposition for the Gate-#1 lens: the rolled-up ``final_disposition``, the
+    applicability ``relevance_tier``, and each stage's ``{status, reason_codes}``."""
+    def _stage(s) -> dict:
+        return {"status": s.status.value, "reason_codes": list(s.reason_codes)}
+
+    return {"recipe_id": ev.recipe_id, "final_disposition": ev.final_disposition.value,
+            "relevance_tier": ev.relevance_tier, "applicability": _stage(ev.applicability),
+            "grounding": _stage(ev.grounding), "safety": _stage(ev.safety)}
+
+
+def _scoped_considered_set(body: ConsideredSetIn, conn: _Conn, identity: _Identity,
+                           client: _LLM) -> dict:
+    """Phase-1B (Task 7) — the confirmed-scope path. Validates the confirmed scope, MINTS the generation
+    run, PERSISTS the confirmed scope in the API layer BEFORE the builder (the canonical run→scope
+    linkage; scope persistence is never the builder's job), computes the ONE ``ApplicabilityResult``,
+    scopes grounding through it, and returns the considered set PLUS a per-recipe disposition lens and
+    the applicability-owned in-scope count. **Broaden** is this same path re-called with
+    ``unscoped=true``, a NEW server-minted run, and ``supersedes_scope_id`` set — a fresh unscoped run
+    that supersedes the prior scope (both are retained)."""
+    cscope = body.confirmed_scope
+    assert cscope is not None   # caller only routes here when a confirmed scope is present
+    # 1. Every confirmed id must be a selectable taxonomy leaf. ``unscoped`` needs no ids (fail-open).
+    confirmed_ids = ([cscope.primary] if cscope.primary else []) + list(cscope.secondary)
+    leaves = selectable_leaves()
+    for uid in confirmed_ids:
+        if use_case(uid) is None or uid not in leaves:
+            raise HTTPException(status_code=422,
+                                detail=f"{uid!r} is not a selectable use-case leaf")
+    # 2. The confirmed-scope value object (an unknown expansion string → 422, not a 500).
+    try:
+        scope = ConfirmedScope(
+            primary=cscope.primary, secondary=tuple(cscope.secondary),
+            expansion=ScopeExpansion(cscope.expansion), unscoped=cscope.unscoped)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e)) from e
+    # 3. Reuse the recognition's immutable intent if given, else submit a fresh (redacted) one.
+    try:
+        intent = submit_intent(hypothesis=body.hypothesis, definition=body.definition,
+                               actor=identity.subject)
+    except IntentValidationError as e:
+        raise HTTPException(status_code=422, detail=str(e)) from e
+    if body.intent_id:
+        intent = replace(intent, intent_id=body.intent_id)
+    # 4. Mint the generation run — the run is born only NOW, when the human commits to generate.
+    generation_run_id = mint_id("grun")
+    # 5. Persist the confirmed scope in the API layer, BEFORE the builder (the run→scope linkage exists
+    # before any generation). The intent is durably recorded first so the lineage reads intent→run→scope.
+    persist_intent(conn, intent, body.target_ref)
+    scope_id = record_confirmed_scope(
+        conn, intent_id=intent.intent_id, generation_run_id=generation_run_id,
+        recognition_id=body.recognition_id, scope=scope,
+        use_case_origins=cscope.use_case_origins, confirmation_source=cscope.confirmation_source,
+        confirmed_by=identity.subject, supersedes_scope_id=body.supersedes_scope_id)
+    # 6. Compute applicability ONCE — grounding AND the disposition lens consume this single object.
+    applicability = applicability_result(scope)
+    now = datetime.now(UTC)
+    cs = build_considered_set(
+        conn, intent, client, entity=body.entity, catalog_source=body.catalog_source,
+        roles=identity.role_claims, target_ref=body.target_ref, objective=body.objective,
+        feedback=body.feedback, now=now, applicability=applicability)
+    # 7. The per-stage disposition lens over the SAME applicability + this run's grounding outcome.
+    dispositions = evaluate_dispositions(
+        applicability, cs.grounded_template_ids, cs.rejected_template_ids,
+        evaluation_version=APPLICABILITY_MAPPING_VERSION, now=now)
+    # 8. Applicability OWNS the in-scope recipe count (never recognition).
+    return {**_considered_set_response(intent, cs),
+            "generation_run_id": generation_run_id, "scope_id": scope_id,
+            "dispositions": [_disposition_json(d) for d in dispositions],
+            "in_scope_count": len(applicability.eligible_ids)}
+
+
 @router.post("/contract/considered-set", dependencies=[Depends(require_feature_generate)])
 def considered_set(body: ConsideredSetIn, conn: _Conn, identity: _Identity, client: _LLM) -> dict:
     """Intake (mandatory hypothesis + optional definition, redacted) → the validated considered set:
     the anchor (from the definition) + generated alternatives + an advisory recommendation. Persists
-    the intent. Every option shown has passed the gauntlet."""
+    the intent. Every option shown has passed the gauntlet.
+
+    Phase-1B: when ``confirmed_scope`` is present the request mints a generation run, persists the
+    confirmed scope BEFORE the builder, scopes grounding through a single ``ApplicabilityResult`` and
+    attaches a per-recipe disposition lens (see :func:`_scoped_considered_set`). Absent → today's exact
+    path (no run, no scope row, no dispositions)."""
+    if body.confirmed_scope is not None:
+        return _scoped_considered_set(body, conn, identity, client)
     try:
         intent = submit_intent(hypothesis=body.hypothesis, definition=body.definition,
                                actor=identity.subject)
@@ -119,9 +239,7 @@ def considered_set(body: ConsideredSetIn, conn: _Conn, identity: _Identity, clie
         conn, intent, client, entity=body.entity, catalog_source=body.catalog_source,
         roles=identity.role_claims, target_ref=body.target_ref, objective=body.objective,
         feedback=body.feedback, now=datetime.now(UTC))
-    return {"intent_id": intent.intent_id, "anchor": cs.anchor,
-            "alternatives": cs.alternatives, "recommendation": cs.recommendation,
-            "rejections": cs.rejections}
+    return _considered_set_response(intent, cs)
 
 
 @router.post("/contract/recognitions", dependencies=[Depends(require_feature_generate)])

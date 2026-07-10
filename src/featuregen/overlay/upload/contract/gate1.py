@@ -52,6 +52,10 @@ class ConsideredSet:
     applicability: ApplicabilityResult | None = None       # the ONE applicability decision that scoped
     #   grounding (Task 4), carried through so Task 5's disposition stage consumes the SAME object — not
     #   persisted here (the API layer owns scope-record lifecycle, Task 7).
+    grounded_template_ids: frozenset[str] = field(default_factory=frozenset)   # template ids whose
+    #   grounded candidate SURVIVED the gauntlet (the `ideas`) — the disposition stage's `grounded_ids`.
+    rejected_template_ids: dict[str, tuple[str, ...]] = field(default_factory=dict)   # template id ->
+    #   the gauntlet reject codes for candidates it REFUSED (safety/leakage/units) — feeds `rejected`.
 
 
 def persist_intent(conn, intent: Intent, target_ref: str | None = None) -> None:
@@ -100,7 +104,8 @@ def _idea_from_grounded(gf: GroundedFeature, template: Template) -> FeatureIdea:
 def _template_candidates(conn, *, catalog_source: str, roles, target_ref: str | None, now,
                          templates: Sequence[Template] = ALL_TEMPLATES,
                          fresh_within: timedelta = timedelta(hours=24),
-                         ) -> tuple[list[FeatureIdea], list[dict]]:
+                         ) -> tuple[list[FeatureIdea], list[dict],
+                                    frozenset[str], dict[str, tuple[str, ...]]]:
     """Ground ``templates`` on this catalog and gauntlet-check each grounded candidate the SAME way LLM
     candidates are (feature_assist._validate_idea, over the identical read-scoped candidate universe).
     ``templates`` defaults to the whole ``ALL_TEMPLATES`` registry (today's behaviour); Phase-1B scoped
@@ -109,10 +114,13 @@ def _template_candidates(conn, *, catalog_source: str, roles, target_ref: str | 
     concepts exist, so a churn-shaped catalog yields exactly the churn lens. Grounding refuses tagged
     leakage anchors by construction, but the intent's SPECIFIC target_ref may not be a tagged anchor —
     the reused gauntlet still rejects any candidate that binds it (plus freshness / additivity / PIT /
-    units). Returns (surviving ideas, {name, reason, code} rejects)."""
+    units). Returns (surviving ideas, {name, reason, code} rejects, grounded template ids, rejected
+    template ids -> reject codes). ``ground_all`` yields at most one grounded candidate per template, so
+    every ``gf.template_id`` lands in exactly one of the two id collections — the disposition stage
+    (Task 5) consumes them as its ``grounded_ids`` / ``rejected`` inputs."""
     grounded = ground_all(conn, templates, catalog_source=catalog_source, roles=roles)
     if not grounded:
-        return [], []
+        return [], [], frozenset(), {}
     by_id = {t.id: t for t in templates}
     cols = _candidate_columns(conn, catalog_source, roles)   # the SAME candidate universe the LLM saw
     known = {c["object_ref"] for c in cols}
@@ -121,6 +129,8 @@ def _template_candidates(conn, *, catalog_source: str, roles, target_ref: str | 
         src_of.setdefault(c["object_ref"], set()).add(c["catalog_source"])
     ideas: list[FeatureIdea] = []
     rejections: list[dict] = []
+    grounded_ids: set[str] = set()                       # templates whose candidate SURVIVED the gauntlet
+    rejected_ids: dict[str, tuple[str, ...]] = {}        # templates the gauntlet REFUSED -> its code
     for gf in grounded:
         idea = _idea_from_grounded(gf, by_id[gf.template_id])
         raw = {"name": idea.name, "description": idea.description,
@@ -129,9 +139,11 @@ def _template_candidates(conn, *, catalog_source: str, roles, target_ref: str | 
         _, rej = _validate_idea(conn, raw, known, src_of, target_ref, now, fresh_within)
         if rej is None:
             ideas.append(idea)   # keep the converted idea (identical to the gauntlet's rebuild)
+            grounded_ids.add(gf.template_id)
         else:
             rejections.append({"name": idea.name, "reason": rej.message, "code": rej.code})
-    return ideas, rejections
+            rejected_ids[gf.template_id] = (rej.code,)
+    return ideas, rejections, frozenset(grounded_ids), rejected_ids
 
 
 # ── Phase-1B Task 4: scoped grounding (flag-gated, default off) ─────────────────────────────────────
@@ -188,6 +200,8 @@ def build_considered_set(conn, intent: Intent, client: LLMClient, *, entity: str
         roles=roles, target_ref=target_ref, feedback=feedback, now=now)
     alternatives = list(report.sets)
     rejections = list(report.rejections)
+    grounded_template_ids: frozenset[str] = frozenset()   # per-template grounding outcome for Task 5's
+    rejected_template_ids: dict[str, tuple[str, ...]] = {}   # disposition stage (empty on a no-catalog run)
     # B4 two-source model: seed the considered set with grounded parametric templates alongside the LLM
     # alternatives — but only where a single catalog is in scope to ground them (an entity-only,
     # cross-catalog run has no one source to ground on). A template that clears the SAME gauntlet joins
@@ -196,9 +210,10 @@ def build_considered_set(conn, intent: Intent, client: LLMClient, *, entity: str
     if catalog_source is not None:
         # Phase-1B scoped grounding: ground only the eligible recipe subset when scoping is on (else the
         # whole registry — byte-identical to today). Definition-mode + unscoped results bypass here.
-        template_ideas, template_rejections = _template_candidates(
-            conn, catalog_source=catalog_source, roles=roles, target_ref=target_ref, now=now,
-            templates=_templates_to_ground(intent, applicability))
+        template_ideas, template_rejections, grounded_template_ids, rejected_template_ids = (
+            _template_candidates(
+                conn, catalog_source=catalog_source, roles=roles, target_ref=target_ref, now=now,
+                templates=_templates_to_ground(intent, applicability)))
         if template_ideas:
             alternatives.append(FeatureSet(lens="templates", features=template_ideas))
         rejections.extend(template_rejections)
@@ -211,7 +226,9 @@ def build_considered_set(conn, intent: Intent, client: LLMClient, *, entity: str
     recommendation = (recommend_set(conn, alternatives, intent.redacted_hypothesis, client)
                       if any(s.features for s in alternatives) else None)
     cs = ConsideredSet(intent.intent_id, anchor, alternatives, recommendation, rejections,
-                       applicability=applicability)
+                       applicability=applicability,
+                       grounded_template_ids=grounded_template_ids,
+                       rejected_template_ids=rejected_template_ids)
     conn.execute(   # persist the validated set so /contract/draft reconstructs the chosen feature here
         "INSERT INTO contract_considered (intent_id, considered) VALUES (%s, %s::jsonb) "
         "ON CONFLICT (intent_id) DO UPDATE SET considered = EXCLUDED.considered",
