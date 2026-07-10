@@ -1,8 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
-  ApiError, type ContractDraft, contractConfirm, contractConsideredSet, contractDraft,
-  type FeatureIdea, listContracts, recommendFeatures, recommendFeatureSets, refineCandidate,
-  searchCatalog, uploadFile,
+  ApiError, contractConfirm, contractConsideredSet, contractDraft, type ContractDraft,
+  createIntegration, createSync, deleteIntegration, deleteSync, discoverServices,
+  type DiscoveredService, type FeatureIdea, getIntegration, getSync, importSync,
+  type Integration, type LineageGraph, lineageGraph, listContracts, listIntegrations,
+  listSyncs, patchIntegration, patchSync, previewSync, recommendFeatures, recommendFeatureSets,
+  refineCandidate, searchCatalog, type Sync, type SyncPreview, uploadFile,
 } from './api'
 import { setSession } from './session'
 
@@ -100,6 +103,363 @@ describe('api client', () => {
     expect(init.body).toBeInstanceOf(FormData)
     expect(init.body.get('source')).toBe('deposits')
     expect(init.headers['Content-Type']).toBeUndefined()
+  })
+})
+
+describe('lineage client', () => {
+  const GRAPH: LineageGraph = {
+    nodes: [
+      {
+        id: 'deposits:public.accounts', kind: 'table', object_ref: 'public.accounts',
+        table: 'accounts', catalog_source: 'deposits', grain: false, as_of: false,
+        stale: false, resolved: true,
+      },
+    ],
+    edges: [],
+    truncated: false,
+  }
+
+  it('requests the exact contract URL with the documented defaults', async () => {
+    fetchMock.mockImplementation(ok(GRAPH))
+    const result = await lineageGraph('public.accounts.balance', 'deposits')
+    expect(result).toEqual(GRAPH)
+    const [url] = fetchMock.mock.calls[0]
+    // Pinned byte-for-byte: direction=both, depth=1, all three layers, commas unencoded.
+    expect(url).toBe(
+      '/graph/lineage?ref=public.accounts.balance&source=deposits'
+        + '&direction=both&depth=1&layers=joins,entity,features',
+    )
+  })
+
+  it('carries direction, depth, and a layers subset when given', async () => {
+    fetchMock.mockImplementation(ok(GRAPH))
+    await lineageGraph('public.accounts', 'deposits', {
+      direction: 'up', depth: 3, layers: ['joins', 'features'],
+    })
+    const [url] = fetchMock.mock.calls[0]
+    expect(url).toBe(
+      '/graph/lineage?ref=public.accounts&source=deposits'
+        + '&direction=up&depth=3&layers=joins,features',
+    )
+  })
+
+  it('percent-encodes hostile ref and source values', async () => {
+    fetchMock.mockImplementation(ok(GRAPH))
+    await lineageGraph('public.a&b', 'dep osits')
+    const [url] = fetchMock.mock.calls[0]
+    expect(url).toBe(
+      '/graph/lineage?ref=public.a%26b&source=dep%20osits'
+        + '&direction=both&depth=1&layers=joins,entity,features',
+    )
+  })
+
+  it('surfaces the 404 for unknown or read-scope-hidden anchors as ApiError', async () => {
+    fetchMock.mockImplementation(async () =>
+      new Response(JSON.stringify({ detail: "unknown object 'public.x' in source 'deposits'" }),
+        { status: 404 }))
+    await expect(lineageGraph('public.x', 'deposits')).rejects.toMatchObject({
+      status: 404, detail: "unknown object 'public.x' in source 'deposits'" })
+  })
+})
+
+// One OpenMetadata instance exactly as the wire returns it: the token env-var REFERENCE plus
+// whether it is set — never the token value itself.
+const INTEGRATION: Integration = {
+  integration_id: 'intg_01HZXAAAAAAAAAAAAAAAAAAAAA',
+  name: 'Corporate OpenMetadata',
+  base_url: 'https://om.internal.test',
+  token_env: 'FEATUREGEN_OM_TOKEN__CORP',
+  tag_map: { 'PII.Sensitive': 'pii' },
+  created_by: 'user:o',
+  created_at: '2026-07-09T12:00:00+00:00',
+  token_present: true,
+}
+
+const SYNC: Sync = {
+  sync_id: 'sync_01HZYBBBBBBBBBBBBBBBBBBBBB',
+  integration_id: INTEGRATION.integration_id,
+  service_name: 'mysql_prod',
+  database_filter: 'cards_db',
+  schema_filter: 'public',
+  target_source: 'cards',
+  tag_map_override: { 'Confidential.Internal': 'restricted' },
+  table_naming: 'table',
+  created_by: 'user:o',
+  created_at: '2026-07-09T12:05:00+00:00',
+  last_import_at: null,
+}
+
+const SNAPSHOT_HASH = 'ab'.repeat(32)
+
+const SYNC_PREVIEW: SyncPreview = {
+  summary: {
+    tables: 3, columns: 14, new: 3, changed: 0, unchanged: 0, removed: 0,
+    would_quarantine: 1, semantics_pending: 13,
+  },
+  tag_map: [
+    { om_tag: 'Confidential.Internal', mapped_to: '', unmapped: true, count: 1 },
+    { om_tag: 'PII.Sensitive', mapped_to: 'pii', unmapped: false, count: 1 },
+  ],
+  tables: [
+    {
+      table: 'accounts', status: 'new', columns: 4,
+      quarantine: [{
+        column: 'ssn',
+        reason: "unrecognized sensitivity 'Confidential.Internal' (expected one of: pii, restricted)",
+      }],
+      changes: [],
+    },
+    { table: 'cards', status: 'new', columns: 4, quarantine: [], changes: [] },
+    { table: 'transactions', status: 'new', columns: 6, quarantine: [], changes: [] },
+  ],
+  brake: { would_hold: false, reason: null },
+  as_of_suggestions: [
+    { table: 'accounts', column: 'opened_on', hint: 'partition column (TIME-UNIT)' },
+    { table: 'transactions', column: 'posted_at', hint: 'timestamp column named like a time axis' },
+  ],
+  snapshot_hash: SNAPSHOT_HASH,
+}
+
+describe('integration client (tier 1)', () => {
+  it('listIntegrations GETs /integrations and the rows carry no token value, only the reference', async () => {
+    fetchMock.mockImplementation(ok([INTEGRATION]))
+    const result = await listIntegrations()
+    expect(result).toEqual([INTEGRATION])
+    const [url, init] = fetchMock.mock.calls[0]
+    expect(url).toBe('/integrations')
+    expect(init.method).toBeUndefined()
+    expect(Object.keys(result[0])).not.toContain('token')
+  })
+
+  it('getIntegration GETs /integrations/{id} with the id percent-encoded', async () => {
+    fetchMock.mockImplementation(ok(INTEGRATION))
+    await getIntegration('intg a/b')
+    const [url, init] = fetchMock.mock.calls[0]
+    expect(url).toBe('/integrations/intg%20a%2Fb')
+    expect(init.method).toBeUndefined()
+  })
+
+  it('createIntegration posts exactly name+base_url+tag_map — never a token field, token_env derived server-side', async () => {
+    fetchMock.mockImplementation(ok(INTEGRATION))
+    const result = await createIntegration({
+      name: 'Corporate OpenMetadata',
+      base_url: 'https://om.internal.test',
+      tag_map: { 'PII.Sensitive': 'pii' },
+    })
+    expect(result).toEqual(INTEGRATION)
+    const [url, init] = fetchMock.mock.calls[0]
+    expect(url).toBe('/integrations')
+    expect(init.method).toBe('POST')
+    // Pinned byte-for-byte: the declared fields only (the server 422s any extra field, precisely
+    // so a plaintext token can never ride along), token_env omitted so the server derives it.
+    expect(JSON.parse(init.body)).toEqual({
+      name: 'Corporate OpenMetadata',
+      base_url: 'https://om.internal.test',
+      tag_map: { 'PII.Sensitive': 'pii' },
+    })
+    expect(init.body).not.toMatch(/"token"/)
+  })
+
+  it('createIntegration defaults tag_map to {} and carries token_env only when named', async () => {
+    fetchMock.mockImplementation(ok(INTEGRATION))
+    await createIntegration({
+      name: 'Corporate OpenMetadata', base_url: 'https://om.internal.test',
+      token_env: 'FEATUREGEN_OM_TOKEN__CORP',
+    })
+    const [, init] = fetchMock.mock.calls[0]
+    expect(JSON.parse(init.body)).toEqual({
+      name: 'Corporate OpenMetadata', base_url: 'https://om.internal.test', tag_map: {},
+      token_env: 'FEATUREGEN_OM_TOKEN__CORP',
+    })
+  })
+
+  it('patchIntegration PATCHes only the fields the caller changed', async () => {
+    fetchMock.mockImplementation(ok(INTEGRATION))
+    await patchIntegration(INTEGRATION.integration_id, { base_url: 'https://om2.internal.test' })
+    const [url, init] = fetchMock.mock.calls[0]
+    expect(url).toBe(`/integrations/${INTEGRATION.integration_id}`)
+    expect(init.method).toBe('PATCH')
+    // Undefined keys are dropped: the server merges each provided field over the current row and
+    // re-validates the whole result.
+    expect(JSON.parse(init.body)).toEqual({ base_url: 'https://om2.internal.test' })
+  })
+
+  it('deleteIntegration issues DELETE with the id percent-encoded', async () => {
+    fetchMock.mockImplementation(ok({ deleted: true }))
+    const result = await deleteIntegration('intg a/b')
+    expect(result).toEqual({ deleted: true })
+    const [url, init] = fetchMock.mock.calls[0]
+    expect(url).toBe('/integrations/intg%20a%2Fb')
+    expect(init.method).toBe('DELETE')
+  })
+
+  it('surfaces a duplicate-name 409 as ApiError', async () => {
+    const detail = "integration 'Corporate OpenMetadata' already exists"
+    fetchMock.mockImplementation(async () =>
+      new Response(JSON.stringify({ detail }), { status: 409 }))
+    await expect(createIntegration({
+      name: 'Corporate OpenMetadata', base_url: 'https://om.internal.test',
+    })).rejects.toMatchObject({ status: 409, detail })
+  })
+})
+
+describe('service discovery', () => {
+  it('discoverServices GETs the live-OM services list flagged with sync bindings', async () => {
+    const services: DiscoveredService[] = [
+      {
+        service_name: 'mysql_prod', service_type: 'Mysql', fqn: 'mysql_prod',
+        synced: true, sync_id: SYNC.sync_id,
+      },
+      {
+        service_name: 'bq_marketing', service_type: 'BigQuery', fqn: 'bq_marketing',
+        synced: false, sync_id: null,
+      },
+    ]
+    fetchMock.mockImplementation(ok(services))
+    const result = await discoverServices(INTEGRATION.integration_id)
+    expect(result).toEqual(services)
+    const [url, init] = fetchMock.mock.calls[0]
+    expect(url).toBe(`/integrations/${INTEGRATION.integration_id}/services`)
+    expect(init.method).toBeUndefined()
+  })
+
+  it('surfaces an OM-unreachable 502 on discovery as ApiError', async () => {
+    fetchMock.mockImplementation(async () =>
+      new Response(JSON.stringify({ detail: 'OpenMetadata request failed: connect timeout' }),
+        { status: 502 }))
+    await expect(discoverServices(INTEGRATION.integration_id)).rejects.toMatchObject({
+      status: 502 })
+  })
+})
+
+describe('sync client (tier 2)', () => {
+  it('listSyncs GETs the integration-scoped syncs', async () => {
+    fetchMock.mockImplementation(ok([SYNC]))
+    const result = await listSyncs(INTEGRATION.integration_id)
+    expect(result).toEqual([SYNC])
+    const [url, init] = fetchMock.mock.calls[0]
+    expect(url).toBe(`/integrations/${INTEGRATION.integration_id}/syncs`)
+    expect(init.method).toBeUndefined()
+  })
+
+  it('getSync GETs the nested sync path with both ids percent-encoded', async () => {
+    fetchMock.mockImplementation(ok(SYNC))
+    await getSync('intg a', 'sync b')
+    const [url] = fetchMock.mock.calls[0]
+    expect(url).toBe('/integrations/intg%20a/syncs/sync%20b')
+  })
+
+  it('createSync posts the full declared sync body with optional-field defaults filled in', async () => {
+    fetchMock.mockImplementation(ok(SYNC))
+    const result = await createSync(INTEGRATION.integration_id, {
+      service_name: 'mysql_prod',
+      target_source: 'cards',
+      database_filter: 'cards_db',
+      schema_filter: 'public',
+      tag_map_override: { 'Confidential.Internal': 'restricted' },
+    })
+    expect(result).toEqual(SYNC)
+    const [url, init] = fetchMock.mock.calls[0]
+    expect(url).toBe(`/integrations/${INTEGRATION.integration_id}/syncs`)
+    expect(init.method).toBe('POST')
+    expect(JSON.parse(init.body)).toEqual({
+      service_name: 'mysql_prod',
+      target_source: 'cards',
+      database_filter: 'cards_db',
+      schema_filter: 'public',
+      tag_map_override: { 'Confidential.Internal': 'restricted' },
+      table_naming: 'table',
+    })
+  })
+
+  it('createSync defaults optional scope, override, and table naming', async () => {
+    fetchMock.mockImplementation(ok(SYNC))
+    await createSync(INTEGRATION.integration_id, {
+      service_name: 'bq_marketing', target_source: 'marketing',
+    })
+    const [, init] = fetchMock.mock.calls[0]
+    expect(JSON.parse(init.body)).toEqual({
+      service_name: 'bq_marketing', target_source: 'marketing',
+      database_filter: null, schema_filter: null, tag_map_override: null, table_naming: 'table',
+    })
+  })
+
+  it('patchSync PATCHes only the changed fields on the nested path', async () => {
+    fetchMock.mockImplementation(ok(SYNC))
+    await patchSync(INTEGRATION.integration_id, SYNC.sync_id, {
+      tag_map_override: { 'Confidential.Internal': 'restricted', 'Tier.Tier1': '' },
+    })
+    const [url, init] = fetchMock.mock.calls[0]
+    expect(url).toBe(`/integrations/${INTEGRATION.integration_id}/syncs/${SYNC.sync_id}`)
+    expect(init.method).toBe('PATCH')
+    expect(JSON.parse(init.body)).toEqual({
+      tag_map_override: { 'Confidential.Internal': 'restricted', 'Tier.Tier1': '' },
+    })
+  })
+
+  it('deleteSync issues DELETE on the nested path', async () => {
+    fetchMock.mockImplementation(ok({ deleted: true }))
+    const result = await deleteSync(INTEGRATION.integration_id, SYNC.sync_id)
+    expect(result).toEqual({ deleted: true })
+    const [url, init] = fetchMock.mock.calls[0]
+    expect(url).toBe(`/integrations/${INTEGRATION.integration_id}/syncs/${SYNC.sync_id}`)
+    expect(init.method).toBe('DELETE')
+  })
+
+  it('surfaces the one-per-service 409 as ApiError', async () => {
+    const detail = "a sync for service 'mysql_prod' already exists on this integration"
+    fetchMock.mockImplementation(async () =>
+      new Response(JSON.stringify({ detail }), { status: 409 }))
+    await expect(createSync(INTEGRATION.integration_id, {
+      service_name: 'mysql_prod', target_source: 'cards',
+    })).rejects.toMatchObject({ status: 409, detail })
+  })
+})
+
+describe('sync preview/import client', () => {
+  it('previewSync POSTs /syncs/{id}/preview with NO body and returns the dry run untouched', async () => {
+    fetchMock.mockImplementation(ok(SYNC_PREVIEW))
+    const result = await previewSync(SYNC.sync_id)
+    expect(result).toEqual(SYNC_PREVIEW)
+    const [url, init] = fetchMock.mock.calls[0]
+    expect(url).toBe(`/syncs/${SYNC.sync_id}/preview`)
+    expect(init.method).toBe('POST')
+    // No request body: the sync and its integration carry URL, token, scope, and effective map.
+    expect(init.body).toBeUndefined()
+  })
+
+  it('importSync POSTs the previewed snapshot hash to /syncs/{id}/import', async () => {
+    fetchMock.mockImplementation(ok({
+      result: {
+        status: 'ingested', reason: null, asserted: 3, staled: 0, quarantined: 1, flagged: null,
+      },
+      import_id: 'omimp_01HZY',
+      review_queue: { quarantined: 1, semantics_pending: 13 },
+    }))
+    const result = await importSync(SYNC.sync_id, SNAPSHOT_HASH)
+    expect(result.import_id).toBe('omimp_01HZY')
+    expect(result.review_queue).toEqual({ quarantined: 1, semantics_pending: 13 })
+    const [url, init] = fetchMock.mock.calls[0]
+    expect(url).toBe(`/syncs/${SYNC.sync_id}/import`)
+    expect(init.method).toBe('POST')
+    expect(JSON.parse(init.body)).toEqual({ snapshot_hash: SNAPSHOT_HASH })
+  })
+
+  it('surfaces the snapshot-mismatch 409 with the backend re-preview guidance', async () => {
+    const detail = 'OpenMetadata changed since this preview (snapshot hash mismatch). '
+      + 'Run preview again and approve the fresh dry run.'
+    fetchMock.mockImplementation(async () =>
+      new Response(JSON.stringify({ detail }), { status: 409 }))
+    await expect(importSync(SYNC.sync_id, SNAPSHOT_HASH)).rejects.toMatchObject({
+      status: 409, detail })
+  })
+
+  it('surfaces the unconfigured-token 400 with the env-var instruction', async () => {
+    const detail = 'integration token is not configured: set the FEATUREGEN_OM_TOKEN__CORP '
+      + 'environment variable'
+    fetchMock.mockImplementation(async () =>
+      new Response(JSON.stringify({ detail }), { status: 400 }))
+    await expect(previewSync(SYNC.sync_id)).rejects.toMatchObject({ status: 400, detail })
   })
 })
 

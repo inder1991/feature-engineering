@@ -7,16 +7,19 @@ import { getSession, setSession } from './session'
 
 vi.mock('./api', async importOriginal => {
   const actual = await importOriginal<typeof import('./api')>()
-  return { ...actual, listQuarantine: vi.fn(), uploadFile: vi.fn() }
+  return { ...actual, listQuarantine: vi.fn(), uploadFile: vi.fn(), listIntegrations: vi.fn() }
 })
 const listQuarantine = vi.mocked(api.listQuarantine)
 const uploadFile = vi.mocked(api.uploadFile)
+const listIntegrations = vi.mocked(api.listIntegrations)
 
 beforeEach(() => {
   setSession({ user: 'dev', roles: ['data_owner'] })
   window.location.hash = ''
   listQuarantine.mockReset()
   uploadFile.mockReset()
+  listIntegrations.mockReset()
+  listIntegrations.mockResolvedValue([])
 })
 
 const ingest = (over: Partial<api.IngestResult>): api.IngestResult => ({
@@ -38,7 +41,7 @@ function arriveAt(hash: string) {
 }
 
 describe('app shell', () => {
-  it('renders six nav items in order and lands on Overview by default', () => {
+  it('renders seven nav items in order (Integrations after Ingest) and lands on Overview by default', () => {
     render(<App />)
     const nav = within(screen.getByRole('navigation'))
     expect(nav.getAllByRole('button').map(b => b.textContent)).toEqual([
@@ -46,7 +49,8 @@ describe('app shell', () => {
       'Generate features',
       'Registry',
       'Search',
-      'Upload',
+      'Ingest',
+      'Integrations',
       'Review queue',
     ])
     expect(screen.getByRole('heading', { level: 1, name: 'Overview' })).toBeInTheDocument()
@@ -74,11 +78,41 @@ describe('app shell', () => {
     expect(screen.getByRole('heading', { name: /search the catalog/i })).toBeInTheDocument()
   })
 
-  it('overview start-here button navigates to Upload', async () => {
+  it('overview start-here button navigates to Ingest (the route hash stays #/upload)', async () => {
     render(<App />)
-    await userEvent.click(screen.getByRole('button', { name: 'Go to Upload' }))
+    await userEvent.click(screen.getByRole('button', { name: 'Go to Ingest' }))
     expect(window.location.hash).toBe('#/upload')
-    expect(screen.getByRole('heading', { level: 1, name: 'Upload' })).toBeInTheDocument()
+    expect(screen.getByRole('heading', { level: 1, name: 'Ingest' })).toBeInTheDocument()
+  })
+
+  it('deep-links #/upload to the Ingest screen: two paths, connector gates, mockup copy', () => {
+    window.location.hash = '#/upload'
+    render(<App />)
+    expect(screen.getByText('CATALOG · INGEST')).toBeInTheDocument()
+    expect(screen.getByRole('heading', { level: 1, name: 'Ingest' })).toBeInTheDocument()
+    expect(
+      screen.getByText('Bring data maps into the catalog: upload a file, or pull from a configured sync.'),
+    ).toBeInTheDocument()
+    expect(
+      screen.getByRole('button', { name: /upload a schema and facts file/i }),
+    ).toBeInTheDocument()
+    expect(
+      screen.getByRole('button', { name: /pull from a metadata service/i }),
+    ).toBeInTheDocument()
+    expect(screen.getByRole('list', { name: /connector path/i })).toBeInTheDocument()
+  })
+
+  it('Integrations nav item routes to #/integrations and renders the Integrations screen', async () => {
+    render(<App />)
+    const nav = within(screen.getByRole('navigation'))
+    await userEvent.click(nav.getByRole('button', { name: 'Integrations' }))
+    expect(window.location.hash).toBe('#/integrations')
+    expect(screen.getByRole('heading', { level: 1, name: 'Integrations' })).toBeInTheDocument()
+    expect(screen.getByText('CATALOG · INTEGRATIONS')).toBeInTheDocument()
+    expect(
+      await screen.findByRole('heading', { name: 'OpenMetadata instances' }),
+    ).toBeInTheDocument()
+    expect(listIntegrations).toHaveBeenCalled()
   })
 
   it('overview loop links navigate to their screens', async () => {
@@ -104,6 +138,17 @@ describe('app shell', () => {
     await userEvent.click(screen.getByRole('checkbox', { name: 'data_owner' }))
     expect(getSession().roles).not.toContain('data_owner')
   })
+
+  it('exposes the functional RBAC roles that grant feature:read (feature lineage + registry)', async () => {
+    render(<App />)
+    // catalog_viewer and feature_engineer both grant feature:read, so the live UI can exercise
+    // the feature-lineage layer and the Registry (the sensitivity-only chips could not).
+    for (const role of ['catalog_viewer', 'feature_engineer', 'pii_reader', 'restricted_reader']) {
+      expect(screen.getByRole('checkbox', { name: role })).toBeInTheDocument()
+    }
+    await userEvent.click(screen.getByRole('checkbox', { name: 'feature_engineer' }))
+    expect(getSession().roles).toContain('feature_engineer')
+  })
 })
 
 describe('review ?source= deep-linking', () => {
@@ -124,7 +169,7 @@ describe('review ?source= deep-linking', () => {
     render(<App />)
     const nav = within(screen.getByRole('navigation'))
     const main = within(screen.getByRole('main'))
-    await userEvent.click(nav.getByRole('button', { name: 'Upload' }))
+    await userEvent.click(nav.getByRole('button', { name: 'Ingest' }))
     await userEvent.type(screen.getByLabelText(/source name/i), 'deposits')
     await userEvent.upload(
       screen.getByLabelText(/file/i), new File(['x'], 'd.csv', { type: 'text/csv' }))

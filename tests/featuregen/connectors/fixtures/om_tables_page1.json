@@ -1,0 +1,97 @@
+{
+  "data": [
+    {
+      "id": "8f7a1c2e-0001-4b1e-9e6a-om-customers",
+      "name": "customers",
+      "fullyQualifiedName": "mysql_prod.cards_db.public.customers",
+      "description": "Card customers master",
+      "service": {"name": "mysql_prod", "type": "databaseService"},
+      "database": {"name": "cards_db", "type": "database"},
+      "databaseSchema": {"name": "public", "type": "databaseSchema"},
+      "columns": [
+        {
+          "name": "cust_id",
+          "dataType": "BIGINT",
+          "dataTypeDisplay": "bigint",
+          "description": "customer primary key",
+          "tags": []
+        },
+        {
+          "name": "email",
+          "dataType": "VARCHAR",
+          "dataLength": 255,
+          "dataTypeDisplay": "varchar(255)",
+          "description": "customer contact email",
+          "tags": [{"tagFQN": "PII.Sensitive", "labelType": "Manual", "state": "Confirmed"}]
+        },
+        {
+          "name": "ssn",
+          "dataType": "VARCHAR",
+          "dataLength": 16,
+          "dataTypeDisplay": "varchar(16)",
+          "description": "social security number",
+          "tags": [{"tagFQN": "Confidential.Internal", "labelType": "Manual", "state": "Confirmed"}]
+        },
+        {
+          "name": "created_at",
+          "dataType": "TIMESTAMP",
+          "dataTypeDisplay": "timestamp",
+          "description": "row creation time",
+          "tags": []
+        }
+      ],
+      "tableConstraints": [
+        {"constraintType": "PRIMARY_KEY", "columns": ["cust_id"]}
+      ]
+    },
+    {
+      "id": "8f7a1c2e-0002-4b1e-9e6a-om-accounts",
+      "name": "accounts",
+      "fullyQualifiedName": "mysql_prod.cards_db.public.accounts",
+      "description": "Card accounts",
+      "service": {"name": "mysql_prod", "type": "databaseService"},
+      "database": {"name": "cards_db", "type": "database"},
+      "databaseSchema": {"name": "public", "type": "databaseSchema"},
+      "columns": [
+        {
+          "name": "account_id",
+          "dataType": "BIGINT",
+          "dataTypeDisplay": "bigint",
+          "description": "account primary key",
+          "constraint": "PRIMARY_KEY",
+          "tags": []
+        },
+        {
+          "name": "cust_id",
+          "dataType": "BIGINT",
+          "dataTypeDisplay": "bigint",
+          "description": "owning customer",
+          "tags": []
+        },
+        {
+          "name": "balance",
+          "dataType": "DECIMAL",
+          "dataTypeDisplay": "decimal(18,2)",
+          "description": "current ledger balance",
+          "tags": []
+        },
+        {
+          "name": "opened_on",
+          "dataType": "DATE",
+          "dataTypeDisplay": "date",
+          "description": "account opening date",
+          "tags": []
+        }
+      ],
+      "tableConstraints": [
+        {
+          "constraintType": "FOREIGN_KEY",
+          "columns": ["cust_id"],
+          "referredColumns": ["mysql_prod.cards_db.public.customers.cust_id"]
+        }
+      ],
+      "tablePartition": {"columns": ["opened_on"], "intervalType": "TIME-UNIT", "interval": "1"}
+    }
+  ],
+  "paging": {"after": "eyJjdXJzb3IiOiJwYWdlLTIifQ==", "total": 3}
+}

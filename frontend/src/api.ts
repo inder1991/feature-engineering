@@ -56,6 +56,16 @@ function post<T>(path: string, body: unknown): Promise<T> {
   })
 }
 
+function patch<T>(path: string, body: unknown): Promise<T> {
+  // JSON.stringify drops undefined keys, so a partial patch carries exactly the fields the
+  // caller set — the server merges each over the current row and re-validates the whole result.
+  return request(path, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+}
+
 export interface IngestResult {
   status: 'ingested' | 'held' | 'rejected'
   reason: string | null
@@ -269,6 +279,89 @@ export async function featureImpact(objectRef: string, source: string): Promise<
   const body = await request<{ feature_ids: string[] }>(
     `/columns/${encodeURIComponent(objectRef)}/feature-impact?source=${encodeURIComponent(source)}`)
   return body.feature_ids
+}
+
+// ---- catalog lineage graph (GET /graph/lineage) ------------------------------------------
+
+export type LineageLayer = 'joins' | 'entity' | 'features'
+export type LineageDirection = 'up' | 'down' | 'both'
+
+export const LINEAGE_LAYERS: readonly LineageLayer[] = ['joins', 'entity', 'features']
+
+// One node of the lineage map. Optional keys are OMITTED by the wire when absent, never null:
+// a pending stub (resolved=false) carries NO catalog_source (its declaring source is only the
+// id prefix), and feature/consumer nodes carry name/feature_id instead of object_ref/table.
+// Node ids: "{catalog_source}:{object_ref}" | "feature:{feature_id}" | "consumer:{model_ref}".
+export interface LineageNode {
+  id: string
+  kind: 'table' | 'column' | 'feature' | 'consumer'
+  object_ref?: string
+  table?: string
+  column?: string
+  catalog_source?: string
+  feature_id?: string
+  name?: string
+  grain: boolean
+  as_of: boolean
+  sensitivity?: string
+  entity?: string
+  // column enrichment (omitted when null): controlled concept, business domain, and — only on the
+  // table's as-of column — the availability basis (posted_at | ingested_at) from its as-of fact.
+  concept?: string
+  domain?: string
+  as_of_basis?: string
+  // feature stamps (omitted when absent): the honest verification stamp (e.g. DESIGN-CHECKED) and
+  // the causal WHY it was born (its hypothesis); rationale is absent for directly-registered features.
+  verification?: string
+  rationale?: string
+  // table provenance: ISO8601 of the source's last drift-vouch (omitted when never scanned) and the
+  // count of this table's rows still in the review queue (omitted when zero).
+  last_vouched_at?: string
+  quarantine_pending?: number
+  stale: boolean
+  resolved: boolean
+}
+
+// Edge orientation for symmetric kinds (join, entity_bridge) points away from the anchor.
+// `cardinality` is omitted when the declared edge has none; entity bridges never carry one.
+// kind 'contains' (table -> column) is structural and always emitted regardless of layers.
+export interface LineageEdge {
+  from: string
+  to: string
+  layer: LineageLayer
+  kind: 'contains' | 'join' | 'entity_bridge' | 'derives' | 'consumes'
+  cardinality?: string
+  resolved: boolean
+}
+
+export interface LineageGraph {
+  nodes: LineageNode[]
+  edges: LineageEdge[]
+  truncated: boolean
+}
+
+export function lineageGraph(
+  ref: string,
+  source: string,
+  opts: {
+    direction?: LineageDirection
+    depth?: number
+    layers?: readonly LineageLayer[]
+    // Aborted by the view when the anchor changes or the component unmounts, so a superseded
+    // or orphaned fetch is cancelled at the transport instead of running to completion.
+    signal?: AbortSignal
+  } = {},
+): Promise<LineageGraph> {
+  const direction = opts.direction ?? 'both'
+  const depth = opts.depth ?? 1
+  const layers = opts.layers ?? LINEAGE_LAYERS
+  // Hand-built query string: URLSearchParams would percent-encode the commas in `layers`,
+  // and the wire contract pins the exact URL shape (layers=joins,entity,features).
+  return request(
+    `/graph/lineage?ref=${encodeURIComponent(ref)}&source=${encodeURIComponent(source)}` +
+      `&direction=${direction}&depth=${depth}&layers=${layers.join(',')}`,
+    opts.signal ? { signal: opts.signal } : undefined,
+  )
 }
 
 // One row of the registry inventory (GET /features).
@@ -573,6 +666,234 @@ export function listContracts(limit = 50): Promise<ContractSummary[]> {
 
 export function getContract(contractId: string): Promise<ContractDetail> {
   return request(`/contracts/${encodeURIComponent(contractId)}`)
+}
+
+// ---- OpenMetadata connector, two-tier (integration + sync + discovery + preview/import) ----
+//
+// Grounded in OpenMetadata's own model — hierarchy DatabaseService -> Database -> Schema ->
+// Table, and one bot JWT authenticates to the WHOLE instance (it sees every DatabaseService) —
+// the connection splits in two:
+//
+//   INTEGRATION = one OpenMetadata instance (one base_url + one sealed token_env + a default
+//                 tag_map). Generic; sees all services. Many syncs hang off it.
+//   SYNC        = one DatabaseService (optionally narrowed by database/schema) -> one FeatureGen
+//                 catalog source, with a tag-map override + table naming. The per-source binding.
+//
+// Ingest pulls from a SYNC (by sync_id), never a flat connector. Preview never writes; import
+// runs ingest_upload in one transaction under the approving human's session identity.
+//
+// The bot token VALUE never crosses this client in either direction: rows carry only an env-var
+// REFERENCE (token_env), create/patch reject any extra field (422) so a plaintext token cannot
+// ride along, and no response ever contains the secret — only token_present (whether the
+// referenced env var is set on the server).
+
+export type TableNaming = 'table' | 'schema_table'
+
+// One OpenMetadata instance as the wire returns it. `token_present` says whether the referenced
+// environment variable is set on the server — the value itself is never serialized anywhere.
+export interface Integration {
+  integration_id: string
+  name: string
+  base_url: string
+  token_env: string
+  tag_map: Record<string, string>
+  created_by: string
+  created_at: string
+  token_present: boolean
+}
+
+export interface IntegrationSpec {
+  name: string
+  base_url: string
+  tag_map?: Record<string, string>
+  // env-var REFERENCE, never a token; the server defaults it to FEATUREGEN_OM_TOKEN__<NAME>
+  token_env?: string
+}
+
+// Every field optional: the server merges each provided field over the current row, then
+// re-validates the whole result (so a patch can never leave a row off-namespace or off-allowlist).
+export interface IntegrationPatch {
+  name?: string
+  base_url?: string
+  tag_map?: Record<string, string>
+  token_env?: string
+}
+
+export function listIntegrations(): Promise<Integration[]> {
+  return request('/integrations')
+}
+
+export function getIntegration(integrationId: string): Promise<Integration> {
+  return request(`/integrations/${encodeURIComponent(integrationId)}`)
+}
+
+export function createIntegration(spec: IntegrationSpec): Promise<Integration> {
+  // token_env is carried only when the caller names a reference, so the server's name-derived
+  // default (FEATUREGEN_OM_TOKEN__<NAME>) applies otherwise. Exactly the declared fields ride the
+  // wire — extra fields are forbidden (422), precisely so a plaintext token can never ride along.
+  const body: Record<string, unknown> = { name: spec.name, base_url: spec.base_url, tag_map: spec.tag_map ?? {} }
+  if (spec.token_env) body.token_env = spec.token_env
+  return post('/integrations', body)
+}
+
+export function patchIntegration(
+  integrationId: string,
+  changes: IntegrationPatch,
+): Promise<Integration> {
+  return patch(`/integrations/${encodeURIComponent(integrationId)}`, changes)
+}
+
+export function deleteIntegration(integrationId: string): Promise<{ deleted: boolean }> {
+  return request(`/integrations/${encodeURIComponent(integrationId)}`, { method: 'DELETE' })
+}
+
+// One DatabaseService the integration's bot token can see (live from OM), flagged with whether a
+// sync already binds it. Discovery is a convenience — the sync-create path never needs it, so an
+// OM outage degrades gracefully (the caller can still add a sync by typing a service name).
+export interface DiscoveredService {
+  service_name: string
+  service_type: string
+  fqn: string
+  synced: boolean
+  sync_id: string | null
+}
+
+export function discoverServices(integrationId: string): Promise<DiscoveredService[]> {
+  return request(`/integrations/${encodeURIComponent(integrationId)}/services`)
+}
+
+// One sync as the wire returns it: a service (optionally narrowed) bound to a catalog source.
+export interface Sync {
+  sync_id: string
+  integration_id: string
+  service_name: string
+  database_filter: string | null
+  schema_filter: string | null
+  target_source: string
+  tag_map_override: Record<string, string> | null
+  table_naming: TableNaming
+  created_by: string
+  created_at: string
+  last_import_at: string | null
+}
+
+export interface SyncSpec {
+  service_name: string
+  target_source: string
+  database_filter?: string | null
+  schema_filter?: string | null
+  // null (or omitted) inherits the integration's tag_map wholesale; a map OVERRIDES it per tag.
+  tag_map_override?: Record<string, string> | null
+  table_naming?: TableNaming
+}
+
+export interface SyncPatch {
+  service_name?: string
+  target_source?: string
+  database_filter?: string | null
+  schema_filter?: string | null
+  tag_map_override?: Record<string, string> | null
+  table_naming?: TableNaming
+}
+
+export function listSyncs(integrationId: string): Promise<Sync[]> {
+  return request(`/integrations/${encodeURIComponent(integrationId)}/syncs`)
+}
+
+export function getSync(integrationId: string, syncId: string): Promise<Sync> {
+  return request(
+    `/integrations/${encodeURIComponent(integrationId)}/syncs/${encodeURIComponent(syncId)}`)
+}
+
+export function createSync(integrationId: string, spec: SyncSpec): Promise<Sync> {
+  // Every declared field rides the wire (server model forbids extras, 422). Optional scope and
+  // override default to null; table naming defaults to bare table name.
+  return post(`/integrations/${encodeURIComponent(integrationId)}/syncs`, {
+    service_name: spec.service_name,
+    target_source: spec.target_source,
+    database_filter: spec.database_filter ?? null,
+    schema_filter: spec.schema_filter ?? null,
+    tag_map_override: spec.tag_map_override ?? null,
+    table_naming: spec.table_naming ?? 'table',
+  })
+}
+
+export function patchSync(
+  integrationId: string,
+  syncId: string,
+  changes: SyncPatch,
+): Promise<Sync> {
+  return patch(
+    `/integrations/${encodeURIComponent(integrationId)}/syncs/${encodeURIComponent(syncId)}`,
+    changes)
+}
+
+export function deleteSync(integrationId: string, syncId: string): Promise<{ deleted: boolean }> {
+  return request(
+    `/integrations/${encodeURIComponent(integrationId)}/syncs/${encodeURIComponent(syncId)}`,
+    { method: 'DELETE' })
+}
+
+export interface TagMapEntry {
+  om_tag: string
+  mapped_to: string
+  unmapped: boolean
+  count: number
+}
+
+export interface PreviewTable {
+  // 'removed': a table in the current catalog the pull no longer includes — import DELETE-then-
+  // rebuilds the source, so it would be dropped and its facts staled. Surfaced so the human never
+  // approves a loss the dry run didn't show.
+  table: string
+  status: 'new' | 'changed' | 'unchanged' | 'removed'
+  columns: number
+  quarantine: { column: string; reason: string }[]
+  changes: string[]
+}
+
+export interface AsOfSuggestion {
+  table: string
+  column: string
+  hint: string
+}
+
+// The dry run a human approves. `snapshot_hash` is the honesty anchor: import must present it
+// back, and the server answers 409 if OpenMetadata moved since this preview was taken. The tag
+// map shown here is the EFFECTIVE map: integration.tag_map merged with the sync's override.
+export interface SyncPreview {
+  summary: {
+    tables: number
+    columns: number
+    new: number
+    changed: number
+    unchanged: number
+    removed: number
+    would_quarantine: number
+    semantics_pending: number
+  }
+  tag_map: TagMapEntry[]
+  tables: PreviewTable[]
+  brake: { would_hold: boolean; reason: string | null }
+  as_of_suggestions: AsOfSuggestion[]
+  snapshot_hash: string
+}
+
+export function previewSync(syncId: string): Promise<SyncPreview> {
+  // No body: the sync and its integration carry the URL, token, scope, and effective tag map.
+  return request(`/syncs/${encodeURIComponent(syncId)}/preview`, { method: 'POST' })
+}
+
+// Import wraps the standard IngestResult (same pipeline, same shape) with the audit record id
+// and the review-queue handoff counts.
+export interface SyncImportResult {
+  result: IngestResult
+  import_id: string
+  review_queue: { quarantined: number; semantics_pending: number }
+}
+
+export function importSync(syncId: string, snapshotHash: string): Promise<SyncImportResult> {
+  return post(`/syncs/${encodeURIComponent(syncId)}/import`, { snapshot_hash: snapshotHash })
 }
 
 export function recommendFeatures(

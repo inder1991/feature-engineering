@@ -1,19 +1,44 @@
-import { act, render, screen } from '@testing-library/react'
+import { act, render, screen, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import * as api from '../api'
+import './lineage-test-setup' // SearchScreen's graph view mounts the xyflow LineageView canvas
 import { SearchScreen } from './SearchScreen'
 
 vi.mock('../api', async importOriginal => {
   const actual = await importOriginal<typeof import('../api')>()
-  return { ...actual, searchCatalog: vi.fn(), featureImpact: vi.fn() }
+  return { ...actual, searchCatalog: vi.fn(), featureImpact: vi.fn(), lineageGraph: vi.fn() }
 })
 const searchCatalog = vi.mocked(api.searchCatalog)
 const featureImpact = vi.mocked(api.featureImpact)
+const lineageGraph = vi.mocked(api.lineageGraph)
 
 beforeEach(() => {
   searchCatalog.mockReset()
   featureImpact.mockReset()
+  lineageGraph.mockReset()
+  // Minimal wire graph so the graph view can always resolve when a test flips to it.
+  lineageGraph.mockResolvedValue({
+    nodes: [
+      {
+        id: 'deposits:public.accounts', kind: 'table', object_ref: 'public.accounts',
+        table: 'accounts', catalog_source: 'deposits', grain: false, as_of: false,
+        stale: false, resolved: true,
+      },
+      {
+        id: 'deposits:public.accounts.balance', kind: 'column',
+        object_ref: 'public.accounts.balance', table: 'accounts', column: 'balance',
+        catalog_source: 'deposits', grain: false, as_of: false, stale: false, resolved: true,
+      },
+    ],
+    edges: [
+      {
+        from: 'deposits:public.accounts', to: 'deposits:public.accounts.balance',
+        layer: 'joins', kind: 'contains', resolved: true,
+      },
+    ],
+    truncated: false,
+  })
 })
 
 const HIT: api.SearchHit = {
@@ -191,6 +216,73 @@ describe('search screen', () => {
       await screen.findByText('No features derive from this column.'),
     ).toBeInTheDocument()
     expect(screen.queryByText('Derived features')).not.toBeInTheDocument()
+  })
+
+  // The List | Graph toggle: list is unchanged behavior; graph maps lineage around a hit.
+  it('disables the view toggle with a hint until results exist', async () => {
+    searchCatalog.mockResolvedValue([HIT])
+    render(<SearchScreen />)
+    const toggle = screen.getByRole('group', { name: 'Result view' })
+    expect(within(toggle).getByRole('button', { name: 'List' })).toBeDisabled()
+    expect(within(toggle).getByRole('button', { name: 'Graph' })).toBeDisabled()
+    expect(screen.getByText('Run a search to map lineage.')).toBeInTheDocument()
+
+    await search()
+    expect(within(toggle).getByRole('button', { name: 'Graph' })).toBeEnabled()
+    expect(screen.queryByText('Run a search to map lineage.')).not.toBeInTheDocument()
+  })
+
+  it('keeps the toggle disabled when a search returns nothing', async () => {
+    searchCatalog.mockResolvedValue([])
+    render(<SearchScreen />)
+    await search()
+    expect(await screen.findByText(/no fresh results/i)).toBeInTheDocument()
+    const toggle = screen.getByRole('group', { name: 'Result view' })
+    expect(within(toggle).getByRole('button', { name: 'Graph' })).toBeDisabled()
+    expect(screen.getByText('Run a search to map lineage.')).toBeInTheDocument()
+  })
+
+  it('flips to the graph view anchored on the first hit, and back to the unchanged list', async () => {
+    searchCatalog.mockResolvedValue([HIT, { ...HIT, object_ref: 'public.accounts.opened_at' }])
+    render(<SearchScreen />)
+    await search()
+    await screen.findByText('public.accounts.balance')
+
+    const toggle = screen.getByRole('group', { name: 'Result view' })
+    await userEvent.click(within(toggle).getByRole('button', { name: 'Graph' }))
+    expect(within(toggle).getByRole('button', { name: 'Graph' })).toHaveAttribute(
+      'aria-pressed', 'true',
+    )
+    expect(lineageGraph).toHaveBeenCalledWith(
+      'public.accounts.balance', 'deposits',
+      // objectContaining: LineageView also threads an AbortController `signal` we do not pin.
+      expect.objectContaining({ direction: 'both', depth: 1 }),
+    )
+    // the canvas replaces the rows; the layers panel marks the graph view
+    expect(await screen.findByText('Layers')).toBeInTheDocument()
+    expect(
+      screen.queryByRole('button', { name: 'Impact for public.accounts.balance' }),
+    ).not.toBeInTheDocument()
+
+    await userEvent.click(within(toggle).getByRole('button', { name: 'List' }))
+    expect(
+      await screen.findByRole('button', { name: 'Impact for public.accounts.balance' }),
+    ).toBeInTheDocument()
+    expect(screen.queryByText('Layers')).not.toBeInTheDocument()
+  })
+
+  it('jumps to the graph anchored on the row whose Graph action was clicked', async () => {
+    searchCatalog.mockResolvedValue([HIT, { ...HIT, object_ref: 'public.accounts.opened_at', column: 'opened_at' }])
+    render(<SearchScreen />)
+    await search()
+    await userEvent.click(
+      await screen.findByRole('button', { name: 'Graph for public.accounts.opened_at' }),
+    )
+    expect(lineageGraph).toHaveBeenCalledWith(
+      'public.accounts.opened_at', 'deposits',
+      expect.objectContaining({ direction: 'both', depth: 1 }),
+    )
+    expect(await screen.findByText('Layers')).toBeInTheDocument()
   })
 
   it('shows a small alert when the impact check fails', async () => {

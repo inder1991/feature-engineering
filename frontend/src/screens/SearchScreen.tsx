@@ -1,5 +1,6 @@
 import { type FormEvent, useRef, useState } from 'react'
 import { ApiError, type SearchHit, featureImpact, searchCatalog } from '../api'
+import { LineageView } from './LineageView'
 
 const SUGGESTIONS = ['balance', 'customer', 'email']
 
@@ -7,6 +8,10 @@ export function SearchScreen() {
   const [q, setQ] = useState('')
   const [hits, setHits] = useState<SearchHit[] | null>(null)
   const [error, setError] = useState('')
+  // List is today's behavior unchanged; Graph maps lineage around one hit. The anchor is the
+  // row the user jumped from, or the first hit when they just flip the toggle.
+  const [view, setView] = useState<'list' | 'graph'>('list')
+  const [anchor, setAnchor] = useState<SearchHit | null>(null)
   // Monotonic request id: a resolved search only applies if it is still the latest,
   // so a slow older response can never overwrite newer results.
   const seq = useRef(0)
@@ -20,9 +25,11 @@ export function SearchScreen() {
       const results = await searchCatalog(query)
       if (id !== seq.current) return
       setHits(results)
+      setAnchor(null) // a new result set re-anchors the graph on its first hit
     } catch (err) {
       if (id !== seq.current) return
       setHits(null)
+      setAnchor(null)
       setError(err instanceof ApiError ? err.detail : String(err))
     }
   }
@@ -36,6 +43,17 @@ export function SearchScreen() {
     setQ(term)
     void runSearch(term)
   }
+
+  function jumpToGraph(hit: SearchHit) {
+    setAnchor(hit)
+    setView('graph')
+  }
+
+  const hasHits = hits !== null && hits.length > 0
+  // With no results there is nothing to anchor a graph on: fall back to list behavior
+  // (empty states, alerts) and disable the toggle.
+  const effectiveView = hasHits ? view : 'list'
+  const graphAnchor = hasHits ? (anchor ?? hits[0]) : null
 
   return (
     <section>
@@ -54,6 +72,34 @@ export function SearchScreen() {
         <button type="submit" className="btn btn--primary" style={{ height: 40 }}>
           Search
         </button>
+        <div
+          className="viewtoggle"
+          role="group"
+          aria-label="Result view"
+          aria-describedby={hasHits ? undefined : 'viewtoggle-hint'}
+        >
+          <button
+            type="button"
+            aria-pressed={effectiveView === 'list'}
+            disabled={!hasHits}
+            onClick={() => setView('list')}
+          >
+            List
+          </button>
+          <button
+            type="button"
+            aria-pressed={effectiveView === 'graph'}
+            disabled={!hasHits}
+            onClick={() => setView('graph')}
+          >
+            Graph
+          </button>
+        </div>
+        {!hasHits && (
+          <span id="viewtoggle-hint" className="hint">
+            Run a search to map lineage.
+          </span>
+        )}
       </form>
 
       {error && (
@@ -94,24 +140,38 @@ export function SearchScreen() {
         </div>
       )}
 
-      {hits && hits.length > 0 && (
-        <>
-          <p className="micro-label tabular-nums" role="status">
-            <span style={{ color: 'var(--accent)', fontWeight: 600 }}>{hits.length}</span>{' '}
-            {hits.length === 1 ? 'column' : 'columns'}
-          </p>
-          <ul className="rows">
-            {hits.map(hit => (
-              <HitRow key={`${hit.catalog_source}:${hit.object_ref}`} hit={hit} />
-            ))}
-          </ul>
-        </>
+      {hasHits && (
+        <p className="micro-label tabular-nums" role="status">
+          <span style={{ color: 'var(--accent)', fontWeight: 600 }}>{hits.length}</span>{' '}
+          {hits.length === 1 ? 'column' : 'columns'}
+        </p>
+      )}
+
+      {hasHits && effectiveView === 'list' && (
+        <ul className="rows">
+          {hits.map(hit => (
+            <HitRow
+              key={`${hit.catalog_source}:${hit.object_ref}`}
+              hit={hit}
+              onGraph={jumpToGraph}
+            />
+          ))}
+        </ul>
+      )}
+
+      {effectiveView === 'graph' && graphAnchor && (
+        // Keyed on the anchor: a new anchor remounts the view, resetting expansion, trace,
+        // and drawer state cleanly.
+        <LineageView
+          key={`${graphAnchor.catalog_source}:${graphAnchor.object_ref}`}
+          anchor={graphAnchor}
+        />
       )}
     </section>
   )
 }
 
-function HitRow({ hit }: { hit: SearchHit }) {
+function HitRow({ hit, onGraph }: { hit: SearchHit; onGraph: (hit: SearchHit) => void }) {
   const [impact, setImpact] = useState<string[] | null>(null)
   const [impactError, setImpactError] = useState('')
   const [checking, setChecking] = useState(false)
@@ -177,6 +237,14 @@ function HitRow({ hit }: { hit: SearchHit }) {
           </div>
         )}
       </div>
+      <button
+        type="button"
+        className="btn btn--ghost"
+        aria-label={`Graph for ${hit.object_ref}`}
+        onClick={() => onGraph(hit)}
+      >
+        Graph
+      </button>
       <button
         type="button"
         className="btn"
