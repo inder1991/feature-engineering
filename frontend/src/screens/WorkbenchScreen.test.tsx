@@ -1940,3 +1940,118 @@ describe('Gate #1 scope confirmation', () => {
       }))
   })
 })
+
+// ------------------------------------------------------ Phase 2A: deterministic ranking (VITE_INTENT_RANKING)
+describe('Phase 2A ranking', () => {
+  // Three ranked eligible recipes, deliberately supplied OUT of canonical order to prove the UI
+  // orders by canonical_rank. Two are in the initial view (ranks 1, 2); rank 3 is held back with a
+  // distinct initial_view reason. The two reason streams stay separate: rank_reasons vs
+  // initial_view_reasons.
+  const RANKING: api.RankedRecipe[] = [
+    {
+      recipe_id: 'balance_trend_30d', canonical_rank: 3, selected_for_initial_view: false,
+      rank_reasons: ['low_binding_quality'],
+      initial_view_reasons: ['duplicate_variant_not_in_initial_view'],
+    },
+    {
+      recipe_id: 'recency_since_event', canonical_rank: 1, selected_for_initial_view: true,
+      rank_reasons: ['primary_use_case_match', 'exact_binding'],
+      initial_view_reasons: ['selected_initial_view'],
+    },
+    {
+      recipe_id: 'balance_trend_90d', canonical_rank: 2, selected_for_initial_view: true,
+      rank_reasons: ['supporting_match'],
+      initial_view_reasons: ['selected_initial_view'],
+    },
+  ]
+
+  // A scoped considered-set carrying the deterministic ranking (Task A3) alongside a single-set
+  // alternatives list + the LLM recommendation. A single set keeps the multi-set advice panel out,
+  // so the only "Recommended starting set" band on the page is the ranking panel's own.
+  function rankedConsidered(): api.ConsideredSetResp {
+    return {
+      intent_id: 'int_1', anchor: null,
+      alternatives: [{ lens: 'temporal', features: [IDEA] }],
+      recommendation: {
+        recommended_lens: 'temporal',
+        reasoning: 'recency signals move earliest for a churn horizon',
+        caveat: CAVEAT,
+      },
+      rejections: [],
+      generation_run_id: 'run_1', scope_id: 'scope_1', in_scope_count: 3,
+      ranking: RANKING, ranking_version: 'applicability@1',
+    }
+  }
+
+  async function generateRanked() {
+    render(<WorkbenchScreen />)
+    await userEvent.type(screen.getByLabelText('Hypothesis'), HYPOTHESIS)
+    await userEvent.type(screen.getByLabelText('Prediction goal'), 'predict churn')
+    await userEvent.click(screen.getByRole('button', { name: /generate candidate sets/i }))
+  }
+
+  function rankingPanel(): HTMLElement {
+    const panel = document.getElementById('wb-ranking')
+    if (!panel) throw new Error('ranking panel not found')
+    return panel
+  }
+
+  it('flag OFF: a response carrying ranking renders the pre-2A way (no rank panel or affordances)', async () => {
+    // No env stub → VITE_INTENT_RANKING defaults off. The response DOES carry ranking, but the flag
+    // gate means none of the 2A affordances render and the candidate list is unchanged.
+    contractConsideredSet.mockResolvedValue(rankedConsidered())
+    await generateRanked()
+    expect(await screen.findByText('avg_balance')).toBeInTheDocument()
+    expect(screen.queryByRole('heading', { name: /recipes by priority/i })).toBeNull()
+    expect(screen.queryByText(/recommended starting set/i)).toBeNull()
+    expect(screen.queryByText('Why here')).toBeNull()
+    expect(screen.queryByText('recency_since_event')).toBeNull()
+    expect(screen.queryByRole('button', { name: /show all .* recipes/i })).toBeNull()
+  })
+
+  it('flag ON: orders eligible recipes by canonical_rank, shows the initial view + a Show all expander', async () => {
+    vi.stubEnv('VITE_INTENT_RANKING', '1')
+    contractConsideredSet.mockResolvedValue(rankedConsidered())
+    await generateRanked()
+    // The ranked panel renders (a distinct presentation from the candidate cards).
+    expect(await screen.findByRole('heading', { name: /recipes by priority/i })).toBeInTheDocument()
+    const panel = rankingPanel()
+    // The initial-view subset (ranks 1, 2) shows first, in canonical order — even though the response
+    // array was shuffled (rank 3 came first). The held-back rank-3 recipe is hidden until Show all.
+    expect(within(panel).getByText('recency_since_event')).toBeInTheDocument()
+    expect(within(panel).getByText('balance_trend_90d')).toBeInTheDocument()
+    expect(within(panel).queryByText('balance_trend_30d')).toBeNull()
+    const text = panel.textContent ?? ''
+    expect(text.indexOf('recency_since_event')).toBeLessThan(text.indexOf('balance_trend_90d'))
+    // A rank_reasons CODE renders as its frontend-mapped display text (never the raw enum token).
+    expect(within(panel).getByText('Matches your primary use case')).toBeInTheDocument()
+    expect(within(panel).queryByText('primary_use_case_match')).toBeNull()
+    // The LLM "recommended starting set" is present AND visually separate from the ranked list: it
+    // lives in its own labelled band, which holds no ranked recipe rows.
+    const band = panel.querySelector('[data-band="recommended-starting-set"]') as HTMLElement
+    expect(band).not.toBeNull()
+    expect(within(band).getByText(/Recommended starting set: Temporal\./)).toBeInTheDocument()
+    expect(within(band).queryByText('recency_since_event')).toBeNull()
+    // Show all reveals the held-back recipe.
+    await userEvent.click(screen.getByRole('button', { name: 'Show all 3 recipes' }))
+    expect(within(panel).getByText('balance_trend_30d')).toBeInTheDocument()
+  })
+
+  it('flag ON: a non-initial recipe carries a distinct "why not shown initially" reason stream', async () => {
+    vi.stubEnv('VITE_INTENT_RANKING', '1')
+    contractConsideredSet.mockResolvedValue(rankedConsidered())
+    await generateRanked()
+    await screen.findByRole('heading', { name: /recipes by priority/i })
+    await userEvent.click(screen.getByRole('button', { name: 'Show all 3 recipes' }))
+    const panel = rankingPanel()
+    const row = within(panel).getByText('balance_trend_30d').closest('li') as HTMLElement
+    // The "why not shown initially" stream maps initial_view_reasons → text, kept DISTINCT from the
+    // "why here" (rank_reasons) stream — two separately-labelled disclosures on the same row.
+    expect(within(row).getByText('Why not shown initially')).toBeInTheDocument()
+    expect(within(row).getByText('A similar variant is already shown')).toBeInTheDocument()
+    expect(within(row).getByText('Why here')).toBeInTheDocument()
+    expect(within(row).getByText('Weaker column binding')).toBeInTheDocument()
+    // The two streams never merge: the rank-reason text is not the initial-view reason text.
+    expect(within(row).queryByText('duplicate_variant_not_in_initial_view')).toBeNull()
+  })
+})

@@ -332,6 +332,22 @@ export function featureDetail(featureId: string): Promise<FeatureDetail> {
 // steps, and the server re-validates (MCV) at draft and confirm, so a tampered payload can never govern.
 // Reuses FeatureIdea / FeatureSet / SetRecommendation / Rejection (defined above) — considered-set is a
 // superset of recommend-sets, so its alternatives + rejections are the same shapes the Workbench renders.
+// Phase 2A — one recipe's two ranking projections. Present on a scoped response ONLY when the
+// backend's FEATUREGEN_INTENT_RANKING flag is on (additive; the flag-off scoped response is
+// byte-identical to Phase 1B). `canonical_rank` is a dense, 1-based presentation priority — never a
+// predictive-utility claim. `selected_for_initial_view` is a SEPARATE projection (the initial-view
+// subset); diversity affects it ONLY and never rewrites `canonical_rank`. The two reason streams stay
+// distinct: `rank_reasons` (positive AND negative codes) explains the canonical position;
+// `initial_view_reasons` explains initial-view membership (why a non-initial recipe was held back).
+// Codes are stable enum tokens the FRONTEND maps to display text — never render backend text here.
+export interface RankedRecipe {
+  recipe_id: string
+  canonical_rank: number
+  selected_for_initial_view: boolean
+  rank_reasons: string[]
+  initial_view_reasons: string[]
+}
+
 export interface ConsideredSetResp {
   intent_id: string
   anchor: FeatureIdea | null
@@ -345,6 +361,12 @@ export interface ConsideredSetResp {
   scope_id?: string
   in_scope_count?: number
   dispositions?: RecipeDisposition[]
+  // Phase 2A — deterministic presentation-priority ranking of the ELIGIBLE recipes, present ONLY
+  // when the backend ranking flag is on. Distinct from `recommendation` (the LLM starting-set pick)
+  // and from `dispositions` (the per-recipe lens). `ranking_version` stamps the mapping/taxonomy
+  // version the ranking was computed under (provenance; a bump never mutates a prior projection).
+  ranking?: RankedRecipe[]
+  ranking_version?: string
 }
 
 export interface ContractDraft {

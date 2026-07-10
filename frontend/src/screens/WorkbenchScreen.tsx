@@ -59,7 +59,7 @@
 import { type FormEvent, type ReactNode, useEffect, useRef, useState } from 'react'
 import {
   ApiError, type ConsideredSetResp, type FeatureFreshness, type FeatureIdea, type FeatureSpecIn,
-  type JoinStep, type Recipe, type RecipeDisposition, type RecognitionCandidate,
+  type JoinStep, type RankedRecipe, type Recipe, type RecipeDisposition, type RecognitionCandidate,
   type RecognitionResp, type RefineRejection, type Rejection, type SetRecommendation,
   contractConfirm, contractConsideredSet, contractDraft, contractRecognitions, featureFreshness,
   featureRecipe, refineCandidate, registerFeature,
@@ -79,6 +79,45 @@ function confirmationUiEnabled(): boolean {
 }
 function dispositionLensEnabled(): boolean {
   return import.meta.env.VITE_INTENT_DISPOSITION_LENS === '1'
+}
+// Phase 2A (independent of the confirmation/lens flags): render the deterministic presentation-
+// priority ranking when a scoped response carries it. Default OFF → the ranked panel never renders
+// and the screen is byte-identical to Phase 1B, even when a response happens to carry `ranking`.
+function rankingEnabled(): boolean {
+  return import.meta.env.VITE_INTENT_RANKING === '1'
+}
+
+// Display text for the ranker's structured reason codes, mapped IN THE FRONTEND (never relying on
+// backend text). Two SEPARATE streams that must stay visually distinct: RANK_REASON_TEXT explains a
+// recipe's canonical position (positive AND negative factors); INITIAL_VIEW_REASON_TEXT explains its
+// initial-view membership (why a non-initial recipe was held back). Mirrors the RejectCode pattern:
+// an unknown code from a newer backend still renders as words, never breaks the client.
+const RANK_REASON_TEXT: Record<string, string> = {
+  primary_use_case_match: 'Matches your primary use case',
+  supporting_match: 'Supports your use case',
+  required_context_match: 'Matches the required modelling context',
+  exact_binding: 'Binds exactly to your columns',
+  pit_complete: 'Point-in-time complete',
+  high_explainability: 'Highly explainable',
+  low_binding_quality: 'Weaker column binding',
+  pit_metadata_incomplete: 'Point-in-time metadata incomplete',
+  entity_grain_unknown: 'Entity grain unknown',
+}
+const INITIAL_VIEW_REASON_TEXT: Record<string, string> = {
+  selected_initial_view: 'Shown in the starting view',
+  duplicate_variant_not_in_initial_view: 'A similar variant is already shown',
+  family_cap_not_in_initial_view: 'Its recipe family is already well represented',
+  ambiguous_binding_not_in_initial_view: 'Its column binding is ambiguous',
+  stage_diversity: 'Held back to keep the starting view diverse',
+}
+function humanizeCode(code: string): string {
+  return code.replace(/_/g, ' ')
+}
+function rankReasonText(code: string): string {
+  return RANK_REASON_TEXT[code] ?? humanizeCode(code)
+}
+function initialViewReasonText(code: string): string {
+  return INITIAL_VIEW_REASON_TEXT[code] ?? humanizeCode(code)
 }
 
 // The disposition lens, in render order: each final_disposition mapped to its human heading.
@@ -487,6 +526,47 @@ function JoinPathDetails({ steps }: { steps: JoinStep[] }) {
   )
 }
 
+// Phase 2A: one recipe in the deterministic ranked eligible set — its canonical rank + recipe id, a
+// "Why here" disclosure over the mapped `rank_reasons`, and (for a non-initial recipe) a SEPARATE
+// "Why not shown initially" disclosure over `initial_view_reasons`. The two reason streams are kept
+// visually distinct (two separately-labelled disclosures), never merged into one list.
+function RankedRecipeRow({ recipe }: { recipe: RankedRecipe }) {
+  return (
+    <li className="row" style={{ alignItems: 'flex-start', gap: 10 }}>
+      <span className="micro-label tabular-nums" style={{ fontWeight: 600, marginTop: 6 }}>
+        #{recipe.canonical_rank}
+      </span>
+      <div style={{ display: 'grid', gap: 6, flex: 1, minWidth: 0, padding: '6px 0' }}>
+        <span className="mono" style={{ fontWeight: 600 }}>{recipe.recipe_id}</span>
+        <details className="rank-why">
+          <summary style={{ cursor: 'pointer', color: 'var(--ink-soft)' }}>Why here</summary>
+          <ul style={{ margin: '6px 0 0', paddingLeft: 18 }}>
+            {recipe.rank_reasons.map(code => (
+              <li key={code} style={{ color: 'var(--ink-soft)' }}>{rankReasonText(code)}</li>
+            ))}
+          </ul>
+        </details>
+        {/* Held-back recipes carry a DISTINCT stream: why they were not promoted into the initial
+            view. Never merged with the rank reasons above. */}
+        {!recipe.selected_for_initial_view && (
+          <details className="rank-why-not">
+            <summary style={{ cursor: 'pointer', color: 'var(--ink-soft)' }}>
+              Why not shown initially
+            </summary>
+            <ul style={{ margin: '6px 0 0', paddingLeft: 18 }}>
+              {recipe.initial_view_reasons.map(code => (
+                <li key={code} style={{ color: 'var(--ink-soft)' }}>
+                  {initialViewReasonText(code)}
+                </li>
+              ))}
+            </ul>
+          </details>
+        )}
+      </div>
+    </li>
+  )
+}
+
 export function WorkbenchScreen() {
   const [goal, setGoal] = useState('')
   const [hypothesis, setHypothesis] = useState('')
@@ -541,6 +621,12 @@ export function WorkbenchScreen() {
   // run was governed by — the prior scope a broaden supersedes. Both null on the unscoped path.
   const [dispositions, setDispositions] = useState<RecipeDisposition[] | null>(null)
   const [lastScopeId, setLastScopeId] = useState<string | null>(null)
+  // Phase 2A: the deterministic presentation-priority ranking of the eligible recipes (+ its version
+  // stamp), present only on a scoped response when the backend ranking flag is on (null otherwise).
+  // `showAllRanked` toggles the initial-view "Show all" disclosure; it resets with each new round.
+  const [ranking, setRanking] = useState<RankedRecipe[] | null>(null)
+  const [rankingVersion, setRankingVersion] = useState<string | null>(null)
+  const [showAllRanked, setShowAllRanked] = useState(false)
   // Whole-round feedback channel: the hypothesis and objective the round was generated for
   // (feedback reruns THOSE, not a since-edited input), the instruction being typed, rounds
   // consumed, the recorded strips, and the in-flight flag.
@@ -592,6 +678,15 @@ export function WorkbenchScreen() {
   // Phase 1B flags, read each render so a test can flip them with vi.stubEnv. Default OFF → today.
   const confirmationUi = confirmationUiEnabled()
   const dispositionLens = dispositionLensEnabled()
+  const rankingUi = rankingEnabled()
+  // Phase 2A: the ranked eligible set for render — the initial-view subset first, the rest behind
+  // "Show all". The backend already emits a dense canonical order, but sort defensively by
+  // canonical_rank so the projection is stable regardless of the response array's order.
+  const rankedOrder = ranking !== null
+    ? [...ranking].sort((a, b) => a.canonical_rank - b.canonical_rank)
+    : []
+  const rankedInitial = rankedOrder.filter(r => r.selected_for_initial_view)
+  const rankedRest = rankedOrder.filter(r => !r.selected_for_initial_view)
   // The recognizer's proposals as the working scope holds them: the chosen primary and the kept
   // secondaries, resolved back to their candidate records for display (name/confidence/evidence).
   const primaryCandidate =
@@ -697,6 +792,8 @@ export function WorkbenchScreen() {
     // recognised scope was for the previous scope context. (Both no-ops when the flags are off.)
     setRecognition(null)
     setDispositions(null)
+    // The deterministic ranking was for the previous scope too; drop it (no-op when the flag is off).
+    setRanking(null)
   }
 
   function changeSource(value: string) {
@@ -791,6 +888,11 @@ export function WorkbenchScreen() {
     // supersedes. Both null on the unscoped/one-shot path (the response omits them).
     setDispositions(cs.dispositions ?? null)
     setLastScopeId(cs.scope_id ?? null)
+    // Phase 2A: carry the deterministic ranking (+ version) when the backend put it on the response;
+    // reset the "Show all" disclosure for the new round. Absent → null (ranking flag off / unscoped).
+    setRanking(cs.ranking ?? null)
+    setRankingVersion(cs.ranking_version ?? null)
+    setShowAllRanked(false)
     // A fresh engine round starts a fresh feedback cycle against ITS hypothesis and objective:
     // whole-round feedback reruns these even if the inputs are edited later.
     setRoundHypothesis(roundHyp)
@@ -809,6 +911,7 @@ export function WorkbenchScreen() {
     // The confirm step shows only the proposed scope: clear any prior round's candidates + lens.
     setGenerated(null)
     setDispositions(null)
+    setRanking(null)
     clearSets()
     clearFeedback()
     try {
@@ -1743,6 +1846,68 @@ export function WorkbenchScreen() {
               Show all buildable recipes
             </button>
           </div>
+        </div>
+      )}
+
+      {/* Phase 2A: the deterministic presentation-priority ranking of the eligible recipes. Rendered
+          only behind VITE_INTENT_RANKING, when a scoped response carried `ranking`. A DISTINCT
+          presentation from the candidate cards: canonical order, an initial-view subset with a
+          "Show all" expander, per-recipe rank reasons and (for held-back recipes) a separate
+          "why not shown initially" stream, and the LLM recommendation as its own labelled band. */}
+      {rankingUi && ranking !== null && (
+        <div className="panel" id="wb-ranking">
+          <div style={{ display: 'flex', alignItems: 'baseline', gap: 12, flexWrap: 'wrap' }}>
+            <h2>Recipes by priority</h2>
+            <span className="micro-label tabular-nums">
+              <span style={{ color: 'var(--accent)' }}>{rankedOrder.length}</span>{' '}
+              {rankedOrder.length === 1 ? 'recipe' : 'recipes'}
+            </span>
+            {rankingVersion && <span className="micro-label">ranking {rankingVersion}</span>}
+          </div>
+          <p className="hint" style={{ marginTop: 4 }}>
+            A deterministic presentation priority over the eligible recipes — a stable ordering, never
+            a prediction of predictive value.
+          </p>
+          {/* The LLM "recommended starting set" is a SEPARATE band from the deterministic ranking: an
+              advisory lens pick, clearly labelled and visually distinct, never merged into the ranked
+              list below. Its own reasoning + caveat, verbatim from the backend. */}
+          {recommendation !== null && (
+            <div
+              className="advice"
+              data-band="recommended-starting-set"
+              style={{ marginTop: 12 }}
+            >
+              <p>
+                <strong>
+                  Recommended starting set: {lensLabel(recommendation.recommended_lens)}.
+                </strong>{' '}
+                {recommendation.reasoning}
+              </p>
+              <p className="advice-caveat">Caveat: {recommendation.caveat}</p>
+            </div>
+          )}
+          {/* The deterministic ranked list: the initial-view subset first. */}
+          <ul className="rows">
+            {rankedInitial.map(r => <RankedRecipeRow key={r.recipe_id} recipe={r} />)}
+          </ul>
+          {rankedRest.length > 0 && (
+            <>
+              <button
+                type="button"
+                className="btn"
+                aria-expanded={showAllRanked}
+                aria-controls="wb-ranking-rest"
+                onClick={() => setShowAllRanked(open => !open)}
+              >
+                {showAllRanked ? 'Show fewer' : `Show all ${rankedOrder.length} recipes`}
+              </button>
+              {showAllRanked && (
+                <ul className="rows" id="wb-ranking-rest">
+                  {rankedRest.map(r => <RankedRecipeRow key={r.recipe_id} recipe={r} />)}
+                </ul>
+              )}
+            </>
+          )}
         </div>
       )}
 
