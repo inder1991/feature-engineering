@@ -95,6 +95,39 @@ export interface SearchHit {
   score: number
 }
 
+// One faceted value with its live count over the read-scoped, freshness-gated set. The count is
+// exclude-own-facet (what you would get if you added this value), computed by the backend; NULL
+// facet values arrive as value:"(none)". sensitivity never lists a class the caller cannot read.
+export interface FacetBucket {
+  value: string
+  count: number
+}
+
+// The repeated-value facet groups, in the order they ride the /search query string. AND across
+// groups, OR within one. grain/as_of are boolean flags carried separately (=true restricts).
+export const SEARCH_FACET_KEYS = [
+  'source', 'domain', 'sensitivity', 'additivity', 'entity', 'kind',
+] as const
+export type SearchFacetKey = (typeof SEARCH_FACET_KEYS)[number]
+
+// The selected filter state a search carries. Each facet is a repeated param; grain/as_of ride
+// only when true.
+export type SearchFilters = {
+  [K in SearchFacetKey]?: string[]
+} & {
+  grain?: boolean
+  as_of?: boolean
+}
+
+// GET /search response. `facets` is keyed by group name (the six above plus grain/as_of, which
+// always emit a single "true" bucket that may be count 0); each list is capped 50, count desc.
+// `total` counts tables AND columns (kind is a facet), so render honest "N result(s)" copy.
+export interface SearchResult {
+  hits: SearchHit[]
+  facets: Record<string, FacetBucket[]>
+  total: number
+}
+
 export interface QuarantineItem {
   row_index: number
   raw: Record<string, unknown>
@@ -225,8 +258,23 @@ export function uploadFile(file: File, source: string): Promise<IngestResult> {
   return request('/uploads', { method: 'POST', body: form })
 }
 
-export function searchCatalog(q: string, limit = 20): Promise<SearchHit[]> {
-  return request(`/search?q=${encodeURIComponent(q)}&limit=${limit}`)
+export function searchCatalog(
+  q: string,
+  filters: SearchFilters = {},
+  limit = 20,
+): Promise<SearchResult> {
+  // Repeated params per multi-value facet (?source=deposits&source=cards): AND across groups,
+  // OR within one. grain/as_of ride only when true, as the backend reads =true as restrict-to-
+  // flag. A filtered search is therefore a shareable URL; the empty q browses the whole set.
+  const params = new URLSearchParams()
+  params.set('q', q)
+  for (const key of SEARCH_FACET_KEYS) {
+    for (const value of filters[key] ?? []) params.append(key, value)
+  }
+  if (filters.grain) params.append('grain', 'true')
+  if (filters.as_of) params.append('as_of', 'true')
+  params.set('limit', String(limit))
+  return request(`/search?${params}`)
 }
 
 export function listQuarantine(source: string): Promise<QuarantineItem[]> {

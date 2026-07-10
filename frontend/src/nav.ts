@@ -28,12 +28,17 @@ function readHash(): string {
 
 export function useHashRoute(): {
   route: Route
-  navigate: (r: Route, params?: Record<string, string>) => void
+  // Accepts a plain record OR a URLSearchParams: the latter carries repeated params
+  // (?source=a&source=b) that a Record cannot express, for faceted-search deep links. Reads use
+  // params.getAll(key) for the repeated groups.
+  navigate: (r: Route, params?: Record<string, string> | URLSearchParams) => void
   params: URLSearchParams
 } {
   const hash = useSyncExternalStore(subscribeToHash, readHash)
   const { route, params } = useMemo(() => parseHash(hash), [hash])
-  const navigate = useCallback((r: Route, next?: Record<string, string>) => {
+  const navigate = useCallback((r: Route, next?: Record<string, string> | URLSearchParams) => {
+    // new URLSearchParams(next) copies a passed URLSearchParams verbatim (duplicates preserved)
+    // and builds one from a record; toString() keeps insertion order for a stable, shareable hash.
     const query = next ? new URLSearchParams(next).toString() : ''
     window.location.hash = `#/${r}${query ? `?${query}` : ''}`
     // Browsers fire hashchange asynchronously (and not at all if the hash is unchanged);

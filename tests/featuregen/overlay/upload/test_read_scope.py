@@ -37,13 +37,13 @@ def test_pii_node_hidden_without_role_visible_with_role(db):
     assert ingest_upload(db, "deposits", rows, actor=_actor(), now=now).status == "ingested"
 
     # No role -> the PII column is excluded from search entirely.
-    open_hits = {h.object_ref for h in search(db, "ssn_hash", now=now)}
+    open_hits = {h.object_ref for h in search(db, "ssn_hash", now=now).hits}
     assert "public.accounts.ssn_hash" not in open_hits
 
     # With the pii_reader role -> visible, and its sensitivity is surfaced.
-    priv = search(db, "ssn_hash", now=now, roles={"pii_reader"})
+    priv = search(db, "ssn_hash", now=now, roles={"pii_reader"}).hits
     hit = next(h for h in priv if h.object_ref == "public.accounts.ssn_hash")
     assert hit.sensitivity == "pii"
 
     # A non-sensitive column is visible either way.
-    assert any(h.column == "balance" for h in search(db, "balance", now=now))
+    assert any(h.column == "balance" for h in search(db, "balance", now=now).hits)
