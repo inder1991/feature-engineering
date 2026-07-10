@@ -883,7 +883,10 @@ export function WorkbenchScreen() {
         catalogSource: source.trim() || undefined,
         entity: entity.trim() || undefined,
         targetRef: target.trim() || undefined,
-        intentId: rec?.intent_id,
+        // Prefer the committed intentId: from the disposition-lens broaden (~post-generation) `rec` is
+        // already cleared, so falling back to `rec?.intent_id` alone would mint a FRESH intent and orphan
+        // the run/scope lineage. `intentId` holds the confirmed round's intent (set by applyConsideredRound).
+        intentId: intentId ?? rec?.intent_id,
         recognitionId: rec?.recognition_id,
         confirmedScope: {
           primary: null,

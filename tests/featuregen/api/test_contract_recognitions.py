@@ -99,3 +99,25 @@ def test_recognitions_idempotent_intent_and_single_attempt(make_client, conn):
         "SELECT count(*) FROM intent_recognition_attempt WHERE intent_id = %s",
         (a.json()["intent_id"],)).fetchone()[0]
     assert n == 1
+
+
+def test_recognitions_dedup_is_per_actor(make_client, conn):
+    # The intent-dedup is scoped to the REQUESTING actor: two different identities typing the SAME
+    # hypothesis must get DIFFERENT immutable intents — actor A's intent is never reused for actor B
+    # (which would merge attribution + clobber the considered set + inherit A's target_ref leakage gate).
+    client = make_client(_llm(_CLASSIFIED))
+    payload = {"hypothesis": "customers churn when their balance drops"}
+    alice = {"X-User": "alice", "X-Roles": "platform_admin"}
+    bob = {"X-User": "bob", "X-Roles": "platform_admin"}
+    a = client.post("/contract/recognitions", json=payload, headers=alice)
+    b = client.post("/contract/recognitions", json=payload, headers=bob)
+    assert a.status_code == 200 and b.status_code == 200, (a.text, b.text)
+    assert a.json()["intent_id"] != b.json()["intent_id"]   # cross-actor: separate intents
+    # Each actor's OWN re-recognition still reuses its own intent (idempotent per-actor, unchanged).
+    a2 = client.post("/contract/recognitions", json=payload, headers=alice)
+    assert a2.json()["intent_id"] == a.json()["intent_id"]
+    # Exactly two intent rows for this hypothesis — one per actor.
+    n = conn.execute(
+        "SELECT count(*) FROM contract_intent WHERE hypothesis = %s",
+        (payload["hypothesis"],)).fetchone()[0]
+    assert n == 2

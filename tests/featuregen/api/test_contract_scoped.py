@@ -8,6 +8,8 @@ builder, and ``scope_for_run(run)`` reconstructs the governing scope by run id. 
 path re-called with ``unscoped=true``, a NEW run, and ``supersedes_scope_id``. The no-scope path stays
 byte-identical to pre-1B.
 """
+from datetime import datetime
+
 from tests.featuregen.api._helpers import AUTH
 
 from featuregen.intake.llm import FakeLLM, FakeResponse
@@ -19,6 +21,8 @@ from featuregen.overlay.upload.taxonomy.applicability import (
     ConfirmedScope,
     applicability_result,
 )
+from featuregen.overlay.upload.taxonomy.recognition import APPLICABILITY_MAPPING_VERSION
+from featuregen.overlay.upload.taxonomy.recognizer import RECOGNIZER_TASK
 from featuregen.overlay.upload.templates import ALL_TEMPLATES
 
 FLAG = "FEATUREGEN_INTENT_SCOPED_APPLICABILITY"
@@ -204,3 +208,65 @@ def test_invalid_primary_is_422(make_client, conn):
         "confirmed_scope": {"primary": "not_a_real_use_case"}}, headers=AUTH)
     assert res2.status_code == 422, res2.text
     assert conn.execute("SELECT count(*) FROM confirmed_generation_scope").fetchone()[0] == 0
+
+
+# ── Fix 3: a colliding id set (primary ∈ secondary, or a dup secondary) → 422, not a PK-violation 500 ──
+def test_primary_in_secondary_and_dup_secondary_are_422(make_client, conn):
+    _bank_multi(conn)
+    client = make_client(_fake())
+    # CHURN as BOTH primary and secondary would violate the confirmed_scope_use_case PK downstream → 422.
+    res = client.post("/contract/considered-set", json={
+        "hypothesis": HYPOTHESIS, "objective": "predict churn", "catalog_source": "bank",
+        "confirmed_scope": {"primary": CHURN, "secondary": [CHURN]}}, headers=AUTH)
+    assert res.status_code == 422, res.text
+    # A duplicated secondary is likewise rejected (same PK collision).
+    res2 = client.post("/contract/considered-set", json={
+        "hypothesis": HYPOTHESIS, "objective": "predict churn", "catalog_source": "bank",
+        "confirmed_scope": {"secondary": [CHURN, CHURN]}}, headers=AUTH)
+    assert res2.status_code == 422, res2.text
+    assert conn.execute("SELECT count(*) FROM confirmed_generation_scope").fetchone()[0] == 0
+
+
+# ── Fix 1B: a crafted intent_id belonging to ANOTHER actor → 404 (no run/scope minted) ────────────────
+def test_scoped_call_with_foreign_intent_id_is_404(make_client, conn):
+    _bank_multi(conn)
+    alice = {"X-User": "alice", "X-Roles": "platform_admin"}
+    bob = {"X-User": "bob", "X-Roles": "platform_admin"}
+    # Actor A mints an intent via the recognition endpoint (persists contract_intent for actor A).
+    rec_client = make_client(FakeLLM(script={RECOGNIZER_TASK: FakeResponse(output={
+        "status": "unscoped", "candidates": [], "ambiguity_note": None})}))
+    rec = rec_client.post("/contract/recognitions", json={"hypothesis": HYPOTHESIS}, headers=alice)
+    assert rec.status_code == 200, rec.text
+    alice_intent = rec.json()["intent_id"]
+
+    # Actor B tries to confirm a scope against A's intent_id → 404; nothing minted/persisted.
+    client = make_client(_fake())
+    res = client.post("/contract/considered-set", json={
+        "hypothesis": HYPOTHESIS, "objective": "predict churn", "catalog_source": "bank",
+        "target_ref": TARGET, "intent_id": alice_intent,
+        "confirmed_scope": {"primary": CHURN, "confirmation_source": "user_confirmed"}}, headers=bob)
+    assert res.status_code == 404, res.text
+    assert conn.execute("SELECT count(*) FROM confirmed_generation_scope").fetchone()[0] == 0
+
+    # The SAME actor supplying their OWN intent_id is accepted (legitimate reuse still works).
+    ok = make_client(_fake()).post("/contract/considered-set", json={
+        "hypothesis": HYPOTHESIS, "objective": "predict churn", "catalog_source": "bank",
+        "target_ref": TARGET, "intent_id": alice_intent,
+        "confirmed_scope": {"primary": CHURN, "confirmation_source": "user_confirmed"}}, headers=alice)
+    assert ok.status_code == 200, ok.text
+    assert ok.json()["intent_id"] == alice_intent
+
+
+# ── Fix 5: every disposition stage carries the replay stamps (evaluation_version + evaluated_at) ───────
+def test_dispositions_carry_replay_stamps(make_client, conn, monkeypatch):
+    monkeypatch.setenv(FLAG, "1")
+    _bank_multi(conn)
+    scoped = _post(make_client(_fake()),
+                   confirmed_scope={"primary": CHURN, "confirmation_source": "user_confirmed"})
+    assert scoped["dispositions"]
+    for d in scoped["dispositions"]:
+        for stage in ("applicability", "grounding", "safety"):
+            s = d[stage]
+            assert s["evaluation_version"] == APPLICABILITY_MAPPING_VERSION
+            assert isinstance(s["evaluated_at"], str) and s["evaluated_at"]
+            datetime.fromisoformat(s["evaluated_at"])   # ISO-8601, round-trippable for replay

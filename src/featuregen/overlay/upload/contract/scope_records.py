@@ -114,10 +114,15 @@ def record_confirmed_scope(
          confirmation_source, confirmed_by))
 
     children: list[tuple[str, str, int]] = []
-    if scope.primary is not None:
-        children.append((scope.primary, "primary", 0))
-    for order, use_case_id in enumerate(scope.secondary, start=1):
-        children.append((use_case_id, "secondary", order))
+    if not scope.unscoped:
+        # An unscoped scope grounds every recipe (fail-open) and confirms no use-cases → ZERO child rows,
+        # even if a stray primary/secondary rode in on the value object (see docstring). Guarding here
+        # keeps the persisted rows consistent with ``scope_mode='unscoped'`` and with ``scope_for_run``,
+        # which rebuilds an unscoped scope as ``ConfirmedScope(primary=None, secondary=(), unscoped=True)``.
+        if scope.primary is not None:
+            children.append((scope.primary, "primary", 0))
+        for order, use_case_id in enumerate(scope.secondary, start=1):
+            children.append((use_case_id, "secondary", order))
 
     for use_case_id, relationship, display_order in children:
         conn.execute(

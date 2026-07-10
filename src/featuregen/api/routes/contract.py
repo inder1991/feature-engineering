@@ -25,6 +25,7 @@ from featuregen.api.deps import (
 from featuregen.contracts.envelopes import IdentityEnvelope
 from featuregen.idgen import mint_id
 from featuregen.intake.llm import LLMClient, compute_input_hash
+from featuregen.overlay.upload.contract._serial import actor_json as _actor_json
 from featuregen.overlay.upload.contract.author import ContractDraft, draft_contract
 from featuregen.overlay.upload.contract.gate1 import (
     build_considered_set,
@@ -56,7 +57,11 @@ from featuregen.overlay.upload.taxonomy.applicability import (
     ScopeExpansion,
     applicability_result,
 )
-from featuregen.overlay.upload.taxonomy.disposition import RecipeEvaluation, evaluate_dispositions
+from featuregen.overlay.upload.taxonomy.disposition import (
+    RecipeEvaluation,
+    StageEvaluation,
+    evaluate_dispositions,
+)
 from featuregen.overlay.upload.taxonomy.recognition import (
     APPLICABILITY_MAPPING_VERSION,
     RecognitionStatus,
@@ -148,9 +153,14 @@ def _considered_set_response(intent, cs) -> dict:
 
 def _disposition_json(ev: RecipeEvaluation) -> dict:
     """One recipe's per-stage disposition for the Gate-#1 lens: the rolled-up ``final_disposition``, the
-    applicability ``relevance_tier``, and each stage's ``{status, reason_codes}``."""
-    def _stage(s) -> dict:
-        return {"status": s.status.value, "reason_codes": list(s.reason_codes)}
+    applicability ``relevance_tier``, and each stage's ``{status, reason_codes, evaluation_version,
+    evaluated_at}`` — the version + server-clock stamps the model computes so a disposition is replayable."""
+    def _stage(s: StageEvaluation) -> dict:
+        evaluated_at = s.evaluated_at
+        return {"status": s.status.value, "reason_codes": list(s.reason_codes),
+                "evaluation_version": s.evaluation_version,
+                "evaluated_at": (evaluated_at.isoformat()
+                                 if isinstance(evaluated_at, datetime) else evaluated_at)}
 
     return {"recipe_id": ev.recipe_id, "final_disposition": ev.final_disposition.value,
             "relevance_tier": ev.relevance_tier, "applicability": _stage(ev.applicability),
@@ -168,27 +178,49 @@ def _scoped_considered_set(body: ConsideredSetIn, conn: _Conn, identity: _Identi
     that supersedes the prior scope (both are retained)."""
     cscope = body.confirmed_scope
     assert cscope is not None   # caller only routes here when a confirmed scope is present
-    # 1. Every confirmed id must be a selectable taxonomy leaf. ``unscoped`` needs no ids (fail-open).
-    confirmed_ids = ([cscope.primary] if cscope.primary else []) + list(cscope.secondary)
-    leaves = selectable_leaves()
-    for uid in confirmed_ids:
-        if use_case(uid) is None or uid not in leaves:
+    # 1. Build the confirmed-scope value object. ``unscoped`` fails OPEN to full grounding: it needs no
+    #    ids, so any stray ``primary``/``secondary`` is IGNORED (never validated — a broaden must never
+    #    422 on a leftover id). Otherwise every confirmed id must be a selectable taxonomy leaf and the
+    #    id set must be collision-free.
+    if cscope.unscoped:
+        scope = ConfirmedScope(primary=None, secondary=(), unscoped=True)
+    else:
+        # A ``primary`` that also appears in ``secondary`` (or a duplicated ``secondary``) would collide
+        # on the ``confirmed_scope_use_case`` PK downstream → UniqueViolation → 500; reject it as a 422.
+        if cscope.primary is not None and cscope.primary in cscope.secondary:
             raise HTTPException(status_code=422,
-                                detail=f"{uid!r} is not a selectable use-case leaf")
-    # 2. The confirmed-scope value object (an unknown expansion string → 422, not a 500).
-    try:
-        scope = ConfirmedScope(
-            primary=cscope.primary, secondary=tuple(cscope.secondary),
-            expansion=ScopeExpansion(cscope.expansion), unscoped=cscope.unscoped)
-    except ValueError as e:
-        raise HTTPException(status_code=422, detail=str(e)) from e
-    # 3. Reuse the recognition's immutable intent if given, else submit a fresh (redacted) one.
+                                detail="primary use-case must not also appear in secondary")
+        if len(cscope.secondary) != len(set(cscope.secondary)):
+            raise HTTPException(status_code=422, detail="secondary use-cases must be unique")
+        confirmed_ids = ([cscope.primary] if cscope.primary else []) + list(cscope.secondary)
+        leaves = selectable_leaves()
+        for uid in confirmed_ids:
+            if use_case(uid) is None or uid not in leaves:
+                raise HTTPException(status_code=422,
+                                    detail=f"{uid!r} is not a selectable use-case leaf")
+        # The confirmed-scope value object (an unknown expansion string → 422, not a 500).
+        try:
+            scope = ConfirmedScope(
+                primary=cscope.primary, secondary=tuple(cscope.secondary),
+                expansion=ScopeExpansion(cscope.expansion), unscoped=False)
+        except ValueError as e:
+            raise HTTPException(status_code=422, detail=str(e)) from e
+    # 2. Reuse the recognition's immutable intent if given, else submit a fresh (redacted) one.
     try:
         intent = submit_intent(hypothesis=body.hypothesis, definition=body.definition,
                                actor=identity.subject)
     except IntentValidationError as e:
         raise HTTPException(status_code=422, detail=str(e)) from e
     if body.intent_id:
+        # A client-supplied intent_id must belong to the REQUESTING actor — otherwise a crafted id could
+        # clobber another user's intent (inheriting its considered set + target_ref leakage gate). The
+        # 404 is opaque whether the id is unknown or owned by someone else; no run is minted and no scope
+        # is persisted (this precedes the mint/persist below). Same jsonb-string actor form the dedup uses.
+        owned = conn.execute(
+            "SELECT 1 FROM contract_intent WHERE intent_id = %s AND actor = %s::jsonb",
+            (body.intent_id, _actor_json(intent.actor))).fetchone()
+        if owned is None:
+            raise HTTPException(status_code=404, detail="unknown intent")
         intent = replace(intent, intent_id=body.intent_id)
     # 4. Mint the generation run — the run is born only NOW, when the human commits to generate.
     generation_run_id = mint_id("grun")
@@ -256,13 +288,17 @@ def recognitions(body: RecognitionIn, conn: _Conn, identity: _Identity, client: 
         redacted_goal = redact_free_text(body.objective) if body.objective else None
     except IntentValidationError as e:   # a free-text field that cannot be safely redacted -> denial
         raise HTTPException(status_code=422, detail=str(e)) from e
-    # Idempotent intent: submit_intent mints a fresh id each call, so reuse the EARLIEST intent already
-    # recorded for this exact (hypothesis, mode) — re-recognising the same objective is free and never
-    # forks the immutable intent. persist_intent is itself ON CONFLICT (intent_id) DO NOTHING.
+    # Idempotent intent, PER ACTOR: submit_intent mints a fresh id each call, so reuse the EARLIEST intent
+    # already recorded for this exact (actor, hypothesis, mode) — re-recognising the same objective is free
+    # and never forks the immutable intent. The actor filter is essential: WITHOUT it, user B typing user
+    # A's hypothesis would reuse A's intent (attribution merge + considered-set clobber + inherited
+    # target_ref → wrong leakage gate). The ``actor`` column is a jsonb STRING scalar (identity.subject,
+    # e.g. "user:tester"), so compare on the exact serialized form _actor_json/persist_intent store — an
+    # ``actor->>'subject'`` path would be NULL here. persist_intent is itself ON CONFLICT (intent_id) DO NOTHING.
     prior = conn.execute(
         "SELECT intent_id FROM contract_intent WHERE hypothesis = %s AND intake_mode = %s "
-        "ORDER BY created_at ASC LIMIT 1",
-        (intent.hypothesis, intent.intake_mode)).fetchone()
+        "AND actor = %s::jsonb ORDER BY created_at ASC LIMIT 1",
+        (intent.hypothesis, intent.intake_mode, _actor_json(intent.actor))).fetchone()
     if prior is not None:
         intent = replace(intent, intent_id=prior[0])
     persist_intent(conn, intent)

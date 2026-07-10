@@ -1917,4 +1917,26 @@ describe('Gate #1 scope confirmation', () => {
       }))
     expect(await screen.findByText('avg_balance')).toBeInTheDocument()
   })
+
+  it('flag ON + lens: broaden FROM the lens reuses the committed intentId (recognition cleared)', async () => {
+    vi.stubEnv('VITE_INTENT_CONFIRMATION_UI', '1')
+    vi.stubEnv('VITE_INTENT_DISPOSITION_LENS', '1')
+    contractRecognitions.mockResolvedValue(RECOGNITION)
+    // Confirm → a scoped response (with dispositions) that CLEARS `recognition` and commits intentId
+    // 'int_1'; then the lens's broaden re-runs. If broaden read only `rec?.intent_id` it would send
+    // undefined here (rec is null) and orphan the run/scope lineage — it must send the committed intentId.
+    contractConsideredSet
+      .mockResolvedValueOnce(scopedConsidered())
+      .mockResolvedValueOnce(considered(singleSetRound([IDEA])))
+    await generateFlagOn()
+    await userEvent.click(await screen.findByRole('button', { name: /confirm scope and generate/i }))
+    // The disposition lens rendered; the proposed-scope panel is gone (recognition cleared).
+    await screen.findByRole('heading', { name: /how your scope dispositioned/i })
+    await userEvent.click(screen.getByRole('button', { name: /show all buildable recipes/i }))
+    expect(contractConsideredSet).toHaveBeenLastCalledWith(HYPOTHESIS, 'predict churn',
+      expect.objectContaining({
+        intentId: 'int_1',
+        confirmedScope: expect.objectContaining({ unscoped: true }),
+      }))
+  })
 })

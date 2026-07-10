@@ -120,6 +120,21 @@ def test_unscoped_scope_has_no_children_and_round_trips(db) -> None:
     assert reconstructed.primary is None and reconstructed.unscoped is True
 
 
+def test_unscoped_scope_ignores_stray_primary_and_writes_no_children(db) -> None:
+    # A defensive guard (Fix 4): an unscoped scope that inconsistently still carries a primary/secondary
+    # must write ZERO child rows — the child-insert loop is skipped when scope.unscoped, so the persisted
+    # rows stay consistent with scope_mode='unscoped' and with scope_for_run's reconstruction.
+    scope = ConfirmedScope(primary=PRIMARY, secondary=(SECONDARY,), unscoped=True)
+    scope_id = record_confirmed_scope(
+        db, intent_id="intent_5", generation_run_id="run_5", recognition_id=None, scope=scope,
+        use_case_origins={}, confirmation_source="user_broadened", confirmed_by="ds1")
+
+    n_children = db.execute(
+        "SELECT count(*) FROM confirmed_scope_use_case WHERE scope_id = %s", (scope_id,)).fetchone()[0]
+    assert n_children == 0   # stray primary/secondary ignored on an unscoped scope
+    assert scope_for_run(db, "run_5") == ConfirmedScope(primary=None, secondary=(), unscoped=True)
+
+
 def test_scope_for_run_returns_none_for_unknown_run(db) -> None:
     assert scope_for_run(db, "no_such_run") is None
 
