@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Replace the hardcoded 5-entry `_ENTITY_ROLLUP` map with a curated, versioned, **acyclic** global semantic entity-relationship graph, and rewire `entity_compatibility` to traverse it — byte-identically — while locking stable, *validated* (but inactive) contracts for the later cross-catalog edge classes.
+**Goal:** Replace the hardcoded 5-entry `_ENTITY_ROLLUP` map with a curated, versioned, **acyclic** global semantic entity-relationship graph, and rewire `entity_compatibility` to traverse it — **regression-equivalently** (same outputs for every existing pair) — while locking stable, *validated* (but inactive) contracts for the later cross-catalog edge classes.
 
 **Architecture:** A new pure, DB-free module trio under `taxonomy/`: `entity_relationships.py` (frozen-dataclass contracts + enums + per-contract validators), `entity_registry.py` (the curated `ENTITY_RELATIONSHIPS_V1` seed = the 5 roll-ups + `GRAPH_VERSION`), and `entity_graph.py` (an immutable, cycle-rejecting graph builder that carries the closed entity vocabulary + a bounded `resolve_entity_compatibility` traversal returning a path-bearing result). `ranking_signals.entity_compatibility` becomes a thin adapter over the resolver; the old map is deleted. Only `EntityRelationshipDefinitionV1` is an *active* graph edge — the other three contracts are defined, validated, and feasibility-tested against the **real** production `JoinEdge`/`EntityBridge` shapes, but never populated or traversed.
 
@@ -10,7 +10,7 @@
 
 ## Global Constraints
 
-- **Behaviour-neutral, no flag.** For every entity pair in the *entire* `known_entities()` vocabulary, the new graph-backed result must equal the old `_ENTITY_ROLLUP` result. Ranking order, rank reasons, grain-warning responses, and the serialized considered-set/ranking API response are byte-identical — no new key (e.g. `graph_version`) leaks to any external response.
+- **Behaviour-neutral, no flag.** For every entity pair in the *entire* `known_entities()` vocabulary, the new graph-backed result must equal the old `_ENTITY_ROLLUP` result. Ranking order, rank reasons, grain-warning responses, and the considered-set/ranking API response are **semantically/schema-identical** (parsed-JSON equal, not byte-equal) — no new key (e.g. `graph_version`) leaks to any external response.
 - **Seed = EXACTLY the five roll-ups:** `account→customer`, `card_account→customer`, `transaction→account`, `facility→obligor`, `policy→customer`. Acyclic, each source out-degree ≤1, so `AMBIGUOUS` is provably unreachable from the seed. Do NOT add a sixth relationship in 3A.
 - **`AMBIGUOUS` is reserved capability:** enum member + traversal support, exercised by synthetic multi-path fixtures ONLY.
 - **Only `EntityRelationshipDefinitionV1` is active.** The other three contracts are defined, **structurally validated**, and feasibility-tested, but never built into the graph or traversed.
@@ -18,7 +18,10 @@
 - **Delete the old map** (`_ENTITY_ROLLUP`, `_rolls_up_to`) — no fallback.
 - **No DB migration, no governance UI.** The registry is in-code.
 - **Closed entity vocabulary:** every relationship endpoint (and every bridge/proposal entity) must be in `known_entities()`; the resolver returns `UNKNOWN` for out-of-vocabulary entities (never `EXACT`).
-- **The curated semantic graph is acyclic and forward-only:** the builder rejects cycles, non-`FORWARD` active edges, and duplicate semantic edges.
+- **The curated semantic graph is acyclic and forward-only:** the builder rejects cycles, non-`FORWARD` active edges, and duplicate semantic edges. Cycle detection must accept a converging DAG (a shared descendant is not a back edge).
+- **Active-only validation:** the builder validates + indexes only `ACTIVE` definitions; deprecated definitions are archived, neither validated nor traversed (documented, deliberate).
+- **Production graphs come only from `build_entity_graph`.** Direct `EntityGraph(...)` construction bypasses all invariants and is test-only (a `_unsafe_graph_for_test` helper).
+- **Immutable for a process lifetime:** the graph + entity vocabulary are built once at import from the in-code registries and rebuilt only on redeploy — no runtime hot-reload.
 - Commit messages end with: `Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>`. Branch `feature/phase3-cross-catalog` is already checked out.
 
 ## File Structure
@@ -41,7 +44,7 @@ Import DAG (no cycles): `entity_relationships` ← `entity_registry` ← `entity
 
 **Interfaces:**
 - Consumes: `from featuregen.overlay.upload.taxonomy.dimensions import known_entities`.
-- Produces: the enums above; the dataclasses `EntityRelationshipDefinitionV1`, `CatalogEntityRelationshipV1`, `EntityBridgeV1`, `EntityRelationshipProposalV1`, `EntityRelationshipRefV1`, `EntitySemanticPathV1`, `EntityCompatibilityResultV1`; and `validate_relationship_definition(defn, *, known)`, `validate_catalog_relationship(real)`, `validate_entity_bridge(bridge, *, known)`, `validate_relationship_proposal(prop, *, known)` (all raise `ValueError`).
+- Produces: the enums above; the dataclasses `EntityRelationshipDefinitionV1`, `CatalogEntityRelationshipV1`, `EntityBridgeV1`, `EntityRelationshipProposalV1`, `EntityRelationshipRefV1`, `EntitySemanticPathV1`, `EntityCompatibilityResultV1`; and `validate_relationship_definition(defn, *, known)`, `validate_catalog_relationship(real, *, known)`, `validate_entity_bridge(bridge, *, known)`, `validate_relationship_proposal(prop, *, known)` (all raise `ValueError`).
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -141,6 +144,7 @@ def _catalog(**overrides) -> CatalogEntityRelationshipV1:
         realization_id="core_accounts:accounts.account_id->accounts.customer_id",
         relationship_id="account_to_customer", catalog_source="core_accounts",
         from_object_ref="accounts.account_id", to_object_ref="accounts.customer_id",
+        resolved_from_entity="account", resolved_to_entity="customer",
         declared_cardinality=Cardinality.MANY_TO_ONE, adapter_id="core_banking_adapter",
         authority=GraphEdgeAuthority.CATALOG_DECLARED, status=RelationshipStatus.ACTIVE)
     base.update(overrides)
@@ -148,13 +152,17 @@ def _catalog(**overrides) -> CatalogEntityRelationshipV1:
 
 
 def test_catalog_relationship_validation():
-    validate_catalog_relationship(_catalog())
+    validate_catalog_relationship(_catalog(), known=KNOWN)
     with pytest.raises(ValueError, match="empty"):
-        validate_catalog_relationship(_catalog(catalog_source=""))
+        validate_catalog_relationship(_catalog(catalog_source=""), known=KNOWN)
+    with pytest.raises(ValueError, match="empty"):        # whitespace-only is empty
+        validate_catalog_relationship(_catalog(adapter_id="   "), known=KNOWN)
     with pytest.raises(ValueError, match="identical"):
-        validate_catalog_relationship(_catalog(to_object_ref="accounts.account_id"))
+        validate_catalog_relationship(_catalog(to_object_ref="accounts.account_id"), known=KNOWN)
+    with pytest.raises(ValueError, match="unknown entity"):
+        validate_catalog_relationship(_catalog(resolved_to_entity="not_an_entity"), known=KNOWN)
     with pytest.raises(ValueError, match="authority"):
-        validate_catalog_relationship(_catalog(authority=GraphEdgeAuthority.ENTITY_BRIDGE))
+        validate_catalog_relationship(_catalog(authority=GraphEdgeAuthority.ENTITY_BRIDGE), known=KNOWN)
 
 
 def _bridge(**overrides) -> EntityBridgeV1:
@@ -191,6 +199,8 @@ def test_relationship_proposal_validation():
     validate_relationship_proposal(_proposal(), known=KNOWN)
     with pytest.raises(ValueError, match="unknown entity"):
         validate_relationship_proposal(_proposal(proposed_to_entity="not_an_entity"), known=KNOWN)
+    with pytest.raises(ValueError, match="self-relationship proposal"):
+        validate_relationship_proposal(_proposal(proposed_to_entity="account"), known=KNOWN)
     with pytest.raises(ValueError, match="evidence"):
         validate_relationship_proposal(_proposal(evidence_refs=()), known=KNOWN)
 ```
@@ -222,6 +232,11 @@ from dataclasses import dataclass
 from enum import StrEnum
 
 _SEMVER = re.compile(r"^\d+\.\d+\.\d+$")
+
+
+def is_semver(value: str) -> bool:
+    """Shared N.N.N check (used by the definition validator AND the graph builder)."""
+    return bool(_SEMVER.match(value))
 
 
 class EntityCompatibility(StrEnum):
@@ -304,14 +319,19 @@ class EntityRelationshipDefinitionV1:
 
 @dataclass(frozen=True, slots=True)
 class CatalogEntityRelationshipV1:
-    """CONTRACT ONLY in 3A. How one catalog physically realizes a global relationship (two object refs).
-    Populated + cross-checked against the global model in Phase 3B."""
+    """CONTRACT ONLY in 3A. How one catalog physically realizes a global relationship: the two object
+    refs AND the entity each endpoint resolved to (persisted so Phase 3B can diagnose a realization-vs-
+    global entity conflict — e.g. 'this upload resolved the to-endpoint as account, but the global
+    relationship expects customer' — without re-querying endpoint metadata). Cross-checked against the
+    global model in Phase 3B; 3A validates it structurally only."""
 
     realization_id: str
     relationship_id: str
     catalog_source: str
     from_object_ref: str
     to_object_ref: str
+    resolved_from_entity: str
+    resolved_to_entity: str
     declared_cardinality: Cardinality
     adapter_id: str
     authority: GraphEdgeAuthority = GraphEdgeAuthority.CATALOG_DECLARED
@@ -321,7 +341,9 @@ class CatalogEntityRelationshipV1:
 @dataclass(frozen=True, slots=True)
 class EntityBridgeV1:
     """CONTRACT ONLY in 3A. A sanctioned cross-catalog identity link: two catalog-local representations
-    of the SAME entity. Governed activation is Phase 3B (today bridges are computed permissively)."""
+    of the SAME entity. Bridge IDENTITY is UNORDERED — ``(A:x ↔ B:y)`` and ``(B:y ↔ A:x)`` denote the
+    same bridge; Phase 3B canonicalizes endpoints for duplicate detection. Governed activation is Phase
+    3B (today bridges are computed permissively)."""
 
     bridge_id: str
     entity_id: str
@@ -384,7 +406,7 @@ class EntityCompatibilityResultV1:
 
 def _nonempty(**fields: str) -> None:
     for name, value in fields.items():
-        if not value:
+        if not value or not value.strip():
             raise ValueError(f"empty {name}")
 
 
@@ -409,17 +431,25 @@ def validate_relationship_definition(
     applicable = defn.aggregation_strategy is not AggregationStrategy.NOT_APPLICABLE
     if required != applicable:
         raise ValueError("aggregation_required must match a non-NOT_APPLICABLE aggregation_strategy")
-    if not _SEMVER.match(defn.version):
+    if not is_semver(defn.version):
         raise ValueError(f"invalid version: {defn.version!r} (expected N.N.N)")
 
 
-def validate_catalog_relationship(real: CatalogEntityRelationshipV1) -> None:
-    """Structural guard. No global-registry cross-check (that is Phase 3B)."""
+def validate_catalog_relationship(real: CatalogEntityRelationshipV1, *, known: frozenset[str]) -> None:
+    """Structural guard: non-empty fields, distinct object refs, both resolved endpoints in the closed
+    vocabulary, fixed authority. It does NOT cross-check the resolved entities against the global
+    relationship's endpoints — that (and the realization↔global conflict decision) is Phase 3B."""
     _nonempty(realization_id=real.realization_id, relationship_id=real.relationship_id,
               catalog_source=real.catalog_source, adapter_id=real.adapter_id,
-              from_object_ref=real.from_object_ref, to_object_ref=real.to_object_ref)
+              from_object_ref=real.from_object_ref, to_object_ref=real.to_object_ref,
+              resolved_from_entity=real.resolved_from_entity,
+              resolved_to_entity=real.resolved_to_entity)
     if real.from_object_ref == real.to_object_ref:
         raise ValueError("catalog realization endpoints are identical")
+    if real.resolved_from_entity not in known:
+        raise ValueError(f"unknown entity: {real.resolved_from_entity!r}")
+    if real.resolved_to_entity not in known:
+        raise ValueError(f"unknown entity: {real.resolved_to_entity!r}")
     if real.authority is not GraphEdgeAuthority.CATALOG_DECLARED:
         raise ValueError("catalog realization authority must be CATALOG_DECLARED")
 
@@ -440,11 +470,14 @@ def validate_entity_bridge(bridge: EntityBridgeV1, *, known: frozenset[str]) -> 
 def validate_relationship_proposal(
     prop: EntityRelationshipProposalV1, *, known: frozenset[str]) -> None:
     _nonempty(proposal_id=prop.proposal_id, source_catalog=prop.source_catalog,
-              inferred_by=prop.inferred_by)
+              inferred_by=prop.inferred_by, proposed_from_entity=prop.proposed_from_entity,
+              proposed_to_entity=prop.proposed_to_entity)
     if prop.proposed_from_entity not in known:
         raise ValueError(f"unknown entity: {prop.proposed_from_entity!r}")
     if prop.proposed_to_entity not in known:
         raise ValueError(f"unknown entity: {prop.proposed_to_entity!r}")
+    if prop.proposed_from_entity == prop.proposed_to_entity:
+        raise ValueError("self-relationship proposal is not allowed; use an entity-bridge proposal")
     if not prop.evidence_refs:
         raise ValueError("a proposal needs at least one evidence ref")
 ```
@@ -529,7 +562,17 @@ Seeded with EXACTLY the five roll-ups Phase-2B's ``_ENTITY_ROLLUP`` expressed �
 out-degree <=1, so the graph is regression-equivalent and never emits ``AMBIGUOUS``. Each roll-up
 requires aggregation whose function the RECIPE declares in Phase 3B (``RECIPE_DECLARED``) — the
 relationship never over-declares a measure-specific aggregation list. In-code + version-controlled; no
-DB in 3A. New relationships that could create a second path for an existing pair are a Phase-3D concern."""
+DB in 3A. New relationships that could create a second path for an existing pair are a Phase-3D concern.
+
+These five definitions encode the semantic ASSUMPTIONS already embedded in ``_ENTITY_ROLLUP``; they are
+compatibility-preserving DEFAULTS, not proof that every catalog physically realizes the relationship
+with the declared ``MANY_TO_ONE`` cardinality. Real-world exceptions (joint accounts, multi-policyholder
+policies, facilities with several obligors) are catalog-realization concerns that Phase 3B validates and
+FAILS CLOSED on — 3A does not assert these cardinalities as universal banking truths.
+
+NOTE (deferred, Phase-3B/growth): a content fingerprint (sha256 over canonicalized definitions) paired
+with ``GRAPH_VERSION`` would catch a definition change made without bumping the version. Omitted for a
+five-entry seed; add it when the registry grows."""
 from __future__ import annotations
 
 from featuregen.overlay.upload.taxonomy.entity_relationships import (
@@ -640,12 +683,19 @@ def test_inactive_edges_excluded():
 
 def test_outgoing_sorted_by_relationship_id():
     g = build_entity_graph(
-        (_e("z_edge", "account", "customer"), _e("a_edge", "transaction", "account")),
-        version="1.0.0", known=KNOWN)
-    g2 = build_entity_graph(
         (_e("z2", "transaction", "account"), _e("a2", "transaction", "obligor")),
         version="1.0.0", known=KNOWN)
-    assert [d.relationship_id for d in g2.outgoing("transaction")] == ["a2", "z2"]
+    assert [d.relationship_id for d in g.outgoing("transaction")] == ["a2", "z2"]
+
+
+def test_converging_dag_is_not_treated_as_cycle():
+    # transaction -> account -> customer AND transaction -> card_account -> customer share the descendant
+    # `customer`; a converging DAG is acyclic and MUST build (the AMBIGUOUS test depends on this).
+    g = build_entity_graph(
+        (_e("t_a", "transaction", "account"), _e("a_c", "account", "customer"),
+         _e("t_ca", "transaction", "card_account"), _e("ca_c", "card_account", "customer")),
+        version="1.0.0", known=KNOWN)
+    assert [d.relationship_id for d in g.outgoing("transaction")] == ["t_a", "t_ca"]
 
 
 def test_duplicate_relationship_id_rejected():
@@ -707,7 +757,6 @@ The closed entity vocabulary is carried on the graph so the resolver can fail ou
 UNKNOWN (never EXACT)."""
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Mapping
@@ -716,16 +765,17 @@ from featuregen.overlay.upload.taxonomy.entity_relationships import (
     EntityRelationshipDefinitionV1,
     RelationshipStatus,
     TraversalDirection,
+    is_semver,
     validate_relationship_definition,
 )
-
-_SEMVER = re.compile(r"^\d+\.\d+\.\d+$")
 
 
 @dataclass(frozen=True, slots=True)
 class EntityGraph:
     """An immutable adjacency of active semantic relationships + the closed entity vocabulary it was built
-    over. ``outgoing(entity)`` returns the entity's active outgoing edges, sorted by ``relationship_id``."""
+    over. ``outgoing(entity)`` returns the entity's active outgoing edges, sorted by ``relationship_id``.
+    PRODUCTION GRAPHS MUST come from :func:`build_entity_graph` — direct construction bypasses every
+    invariant (cycle/duplicate/direction/vocabulary) and is test-only."""
 
     version: str
     known_entities: frozenset[str]
@@ -736,52 +786,44 @@ class EntityGraph:
 
 
 def _reject_cycles(adjacency: Mapping[str, tuple[EntityRelationshipDefinitionV1, ...]]) -> None:
-    """Raise ``ValueError`` on any directed cycle among active edges (iterative DFS 3-colour walk)."""
-    WHITE, GREY, BLACK = 0, 1, 2
-    colour: dict[str, int] = {}
+    """Raise ``ValueError`` on any directed cycle among active edges. Recursive three-colour DFS: a node
+    on the ACTIVE recursion path (``visiting``) reached again is a back edge → a cycle; a fully-explored
+    node (``visited``) reached again is a shared descendant of a converging DAG → NOT a cycle. The curated
+    graph is tiny, so recursion depth is trivial."""
+    visiting: set[str] = set()
+    visited: set[str] = set()
 
-    def visit(start: str) -> None:
-        stack: list[tuple[str, int]] = [(start, 0)]
-        order: list[str] = []
-        while stack:
-            node, idx = stack.pop()
-            if idx == 0:
-                if colour.get(node, WHITE) == BLACK:
-                    continue
-                colour[node] = GREY
-                order.append(node)
-            edges = adjacency.get(node, ())
-            if idx < len(edges):
-                stack.append((node, idx + 1))
-                nxt = edges[idx].to_entity
-                c = colour.get(nxt, WHITE)
-                if c == GREY:
-                    raise ValueError(f"semantic cycle through {nxt!r}")
-                if c == WHITE:
-                    stack.append((nxt, 0))
-            else:
-                colour[node] = BLACK
+    def visit(node: str) -> None:
+        if node in visiting:
+            raise ValueError(f"semantic cycle through {node!r}")
+        if node in visited:
+            return
+        visiting.add(node)
+        for edge in adjacency.get(node, ()):
+            visit(edge.to_entity)
+        visiting.discard(node)
+        visited.add(node)
 
-    for src in adjacency:
-        if colour.get(src, WHITE) == WHITE:
-            visit(src)
+    for node in sorted(adjacency):
+        visit(node)
 
 
 def build_entity_graph(
     defs: tuple[EntityRelationshipDefinitionV1, ...], *, version: str, known: frozenset[str],
 ) -> EntityGraph:
-    """Validate every definition; reject duplicate active ids, duplicate active semantic edges
-    ``(from, to, type, direction)``, non-FORWARD active edges, and directed cycles; index active edges by
-    ``from_entity`` (sorted). Deprecated edges are excluded. Fails fast at import for the seed."""
-    if not _SEMVER.match(version):
+    """Validate + index only ACTIVE definitions (deprecated ones are archived, neither validated nor
+    traversed — a deliberate active-only model). Reject duplicate active ids, duplicate active semantic
+    edges ``(from, to, type, direction)``, non-FORWARD active edges, and directed cycles; index by
+    ``from_entity`` (sorted). Fails fast at import for the seed."""
+    if not is_semver(version):
         raise ValueError(f"invalid graph version: {version!r} (expected N.N.N)")
     seen_ids: set[str] = set()
     seen_semantic: set[tuple[str, str, str, str]] = set()
     by_source: dict[str, list[EntityRelationshipDefinitionV1]] = {}
     for d in defs:
-        validate_relationship_definition(d, known=known)
         if d.status is not RelationshipStatus.ACTIVE:
-            continue
+            continue                                    # archived; not validated or indexed in 3A
+        validate_relationship_definition(d, known=known)
         if d.traversal_direction is not TraversalDirection.FORWARD:
             raise ValueError(f"only FORWARD active edges supported in 3A: {d.relationship_id!r}")
         if d.relationship_id in seen_ids:
@@ -825,7 +867,7 @@ Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>"
 - Test: append to `tests/featuregen/overlay/upload/taxonomy/test_entity_graph.py`
 
 **Interfaces:**
-- Produces: `resolve_entity_compatibility(source, target, graph, *, max_paths=2) -> EntityCompatibilityResultV1`; module singleton `ENTITY_GRAPH: EntityGraph`.
+- Produces: `resolve_entity_compatibility(source, target, graph) -> EntityCompatibilityResultV1` (path bound is the internal `_MAX_COMPATIBILITY_PATHS`, not a parameter); module singleton `ENTITY_GRAPH: EntityGraph`.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -878,24 +920,41 @@ def test_seed_never_emits_ambiguous():
                 is not EntityCompatibility.AMBIGUOUS
 
 
-def test_ambiguous_on_synthetic_two_path_graph():
+def test_ambiguous_two_paths_is_not_truncated():
     g = build_entity_graph(
         (_e("t_a", "transaction", "account"), _e("a_c", "account", "customer"),
          _e("t_ca", "transaction", "card_account"), _e("ca_c", "card_account", "customer")),
         version="1.0.0", known=KNOWN)
     r = resolve_entity_compatibility("transaction", "customer", g)
     assert r.status is EntityCompatibility.AMBIGUOUS
-    assert len(r.paths) == 2 and r.paths_truncated is True   # both surfaced, bound hit
+    assert len(r.paths) == 2 and r.paths_truncated is False   # exactly two — nothing truncated
+
+
+def test_ambiguous_three_paths_is_truncated():
+    g = build_entity_graph(
+        (_e("t_a", "transaction", "account"), _e("a_c", "account", "customer"),
+         _e("t_ca", "transaction", "card_account"), _e("ca_c", "card_account", "customer"),
+         _e("t_p", "transaction", "policy"), _e("p_c", "policy", "customer")),
+        version="1.0.0", known=KNOWN)
+    r = resolve_entity_compatibility("transaction", "customer", g)
+    assert r.status is EntityCompatibility.AMBIGUOUS
+    assert len(r.paths) == 2 and r.paths_truncated is True    # visible capped; a third path exists
+
+
+def _unsafe_graph_for_test(edges: dict) -> object:
+    # Direct construction bypasses build_entity_graph invariants — TEST-ONLY, to exercise traversal
+    # defense against a malformed graph the builder would have rejected. Production graphs come only
+    # from build_entity_graph.
+    from types import MappingProxyType
+
+    from featuregen.overlay.upload.taxonomy.entity_graph import EntityGraph
+    return EntityGraph(version="1.0.0", known_entities=KNOWN, _adjacency=MappingProxyType(edges))
 
 
 def test_traversal_visited_guard_defends_a_malformed_cyclic_graph():
-    # Bypass the builder's cycle rejection by hand-constructing a cyclic EntityGraph — traversal MUST
-    # still terminate (defense in depth).
-    from types import MappingProxyType
-    edges = {"account": (_e("a_c", "account", "customer"),),
-             "customer": (_e("c_a", "customer", "account"),)}
-    from featuregen.overlay.upload.taxonomy.entity_graph import EntityGraph
-    cyclic = EntityGraph(version="1.0.0", known_entities=KNOWN, _adjacency=MappingProxyType(edges))
+    cyclic = _unsafe_graph_for_test({
+        "account": (_e("a_c", "account", "customer"),),
+        "customer": (_e("c_a", "customer", "account"),)})
     assert resolve_entity_compatibility("account", "customer", cyclic).status \
         is EntityCompatibility.DERIVABLE
 ```
@@ -930,13 +989,16 @@ def _ref(d: EntityRelationshipDefinitionV1) -> EntityRelationshipRefV1:
         aggregation_strategy=d.aggregation_strategy)
 
 
+# Enough paths to classify DERIVABLE vs AMBIGUOUS. Not a public knob — no consumer configures it.
+_MAX_COMPATIBILITY_PATHS = 2
+
+
 def _bounded_simple_paths(
     graph: EntityGraph, source: str, target: str, *, limit: int,
-) -> tuple[list[tuple[EntityRelationshipDefinitionV1, ...]], bool]:
-    """Up to ``limit`` distinct simple directed paths ``source → target`` over active forward edges.
-    Cycle-safe via a visited set (defense in depth — the builder already rejects cycles); deterministic
-    because outgoing edges are pre-sorted. Returns (paths, truncated) where ``truncated`` is True iff the
-    ``limit`` was reached (there may be more — enough to classify AMBIGUOUS)."""
+) -> list[tuple[EntityRelationshipDefinitionV1, ...]]:
+    """Up to ``limit`` simple directed paths ``source → target`` over active forward edges. Cycle-safe via
+    a visited set (defense in depth — the builder already rejects cycles); deterministic because outgoing
+    edges are pre-sorted. Stops once ``limit`` paths are found."""
     results: list[tuple[EntityRelationshipDefinitionV1, ...]] = []
 
     def _walk(node: str, path: tuple[EntityRelationshipDefinitionV1, ...], visited: frozenset[str]) -> None:
@@ -954,14 +1016,23 @@ def _bounded_simple_paths(
             _walk(nxt, (*path, edge), visited | {nxt})
 
     _walk(source, (), frozenset({source}))
-    return results, len(results) >= limit
+    return results
+
+
+def _path_identity(path: tuple[EntityRelationshipDefinitionV1, ...]) -> tuple[str, ...]:
+    """Two paths are DISTINCT iff their ordered relationship-ids differ. (With simple-path enumeration +
+    the builder's duplicate-edge rejection this is already 1:1 with the edge sequence; the dedup is an
+    explicit, defensive statement of the equivalence contract.)"""
+    return tuple(edge.relationship_id for edge in path)
 
 
 def resolve_entity_compatibility(
-    source: str, target: str, graph: EntityGraph, *, max_paths: int = 2) -> EntityCompatibilityResultV1:
+    source: str, target: str, graph: EntityGraph) -> EntityCompatibilityResultV1:
     """Graph-backed grain compatibility. Out-of-vocabulary ``source``/``target`` → UNKNOWN (NEVER EXACT).
-    ``source == target`` (both known) → EXACT; exactly one directed path → DERIVABLE; ``max_paths`` (≥2)
-    distinct paths → AMBIGUOUS (surfaced, never a shortest-path pick); no path → UNKNOWN. Never raises."""
+    ``source == target`` (both known) → EXACT; exactly one directed path → DERIVABLE; ≥2 distinct paths →
+    AMBIGUOUS (surfaced, never a shortest-path pick); no path → UNKNOWN. Enumeration is bounded to
+    ``_MAX_COMPATIBILITY_PATHS + 1`` so ``paths_truncated`` reports whether MORE than the visible paths
+    exist (exactly two paths → not truncated; three-plus → truncated). Never raises."""
     def _unknown(*codes: str) -> EntityCompatibilityResultV1:
         return EntityCompatibilityResultV1(
             status=EntityCompatibility.UNKNOWN, source_entity=source, target_entity=target,
@@ -975,8 +1046,18 @@ def resolve_entity_compatibility(
         return EntityCompatibilityResultV1(
             status=EntityCompatibility.EXACT, source_entity=source, target_entity=target,
             paths=(), reason_codes=(), graph_version=graph.version)
-    raw, truncated = _bounded_simple_paths(graph, source, target, limit=max(2, max_paths))
-    paths = tuple(EntitySemanticPathV1(hops=tuple(_ref(e) for e in p)) for p in raw)
+    raw = _bounded_simple_paths(graph, source, target, limit=_MAX_COMPATIBILITY_PATHS + 1)
+    seen: set[tuple[str, ...]] = set()
+    distinct: list[tuple[EntityRelationshipDefinitionV1, ...]] = []
+    for p in raw:
+        ident = _path_identity(p)
+        if ident in seen:
+            continue
+        seen.add(ident)
+        distinct.append(p)
+    truncated = len(distinct) > _MAX_COMPATIBILITY_PATHS
+    visible = distinct[:_MAX_COMPATIBILITY_PATHS]
+    paths = tuple(EntitySemanticPathV1(hops=tuple(_ref(e) for e in p)) for p in visible)
     if not paths:
         return _unknown("no_entity_path")
     if len(paths) == 1:
@@ -998,7 +1079,12 @@ ENTITY_GRAPH: EntityGraph = build_entity_graph(
 - [ ] **Step 4: Run to verify it passes**
 
 Run: `uv run pytest tests/featuregen/overlay/upload/taxonomy/test_entity_graph.py -q`
-Expected: PASS (16 tests).
+Expected: PASS (all builder + traversal tests green).
+
+Also verify the module singleton builds OUTSIDE pytest (catches an import-time registry defect):
+
+Run: `uv run python -c "from featuregen.overlay.upload.taxonomy.entity_graph import ENTITY_GRAPH; print(ENTITY_GRAPH.version)"`
+Expected: prints `1.0.0`.
 
 - [ ] **Step 5: Lint + type-check + commit**
 
@@ -1013,7 +1099,7 @@ Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>"
 
 ---
 
-### Task 5 (3A.5): Rewire `entity_compatibility` (byte-identical) + delete the old map
+### Task 5 (3A.5): Rewire `entity_compatibility` (regression-equivalent) + delete the old map
 
 **Files:**
 - Modify: `src/featuregen/overlay/upload/taxonomy/ranking_signals.py`
@@ -1099,7 +1185,7 @@ def entity_compatibility(t: Template, target_entity: str | None = None) -> Entit
     (a low rank tie-break + an ``entity_grain_mismatch`` warning on ``DERIVABLE``), NEVER an
     applicability reject. Phase-3A: the grain relationship is resolved by the governed entity graph
     (:func:`resolve_entity_compatibility` over :data:`ENTITY_GRAPH`) instead of a hardcoded map — the
-    seed is regression-equivalent, so outputs are byte-identical. ``target_entity is None`` or a recipe
+    seed is regression-equivalent, so outputs match the old map exactly. ``target_entity is None`` or a recipe
     with no derivable grain → ``UNKNOWN``."""
     if target_entity is None:
         return EntityCompatibility.UNKNOWN
@@ -1109,10 +1195,10 @@ def entity_compatibility(t: Template, target_entity: str | None = None) -> Entit
     return resolve_entity_compatibility(source, target_entity, ENTITY_GRAPH).status
 ```
 
-- [ ] **Step 4: Prove byte-identical — run the full existing ranking/route suites + a no-leak guard**
+- [ ] **Step 4: Prove regression-equivalent — run the full existing ranking/route suites + a no-leak guard**
 
 Run: `uv run pytest tests/featuregen/overlay/upload/taxonomy/test_ranking_signals.py tests/featuregen/overlay/upload/taxonomy/test_entity_compatibility_regression.py tests/featuregen/api/test_contract_ranked.py -q`
-Expected: PASS — every existing `test_ranking_signals.py` entity-compatibility test green UNCHANGED (adapter byte-identical), the regression green, route-ranking green. If any existing test fails, the rewire changed behaviour — stop and diagnose (do NOT edit the existing tests to match).
+Expected: PASS — every existing `test_ranking_signals.py` entity-compatibility test green UNCHANGED (adapter output unchanged), the regression green, route-ranking green. If any existing test fails, the rewire changed behaviour — stop and diagnose (do NOT edit the existing tests to match).
 
 Then add a no-leak guard to `test_entity_compatibility_regression.py` (asserts 3A added no graph provenance to the route-facing signal bundle — the real leak surface, and non-vacuous):
 
@@ -1146,12 +1232,36 @@ def test_adapter_still_returns_the_bare_enum_reexported_from_ranking_signals():
 Run: `uv run pytest tests/featuregen/overlay/upload/taxonomy/test_entity_compatibility_regression.py -q`
 Expected: PASS. (If `Template`'s required fields differ, mirror the factory in `test_ranking_signals.py` — the assertion that matters is the bare-enum return + no graph field in `RankSignals`.)
 
+Then add a **route-level** neutrality scan to `tests/featuregen/api/test_contract_ranked.py` — a recursive scan of a REAL scoped considered-set response proves no graph metadata reaches the wire (stronger than the dataclass-field check). Reuse the file's existing scoped-call setup (the same catalog upload + `POST /contract/considered-set` with a `confirmed_scope` carrying a `target_entity` that yields a `DERIVABLE` grain — e.g. an account-grain recipe under `target_entity="customer"`, exactly the B3 `entity_grain_mismatch` case already exercised in this file):
+
+```python
+def _all_keys(obj):
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            yield k
+            yield from _all_keys(v)
+    elif isinstance(obj, list):
+        for item in obj:
+            yield from _all_keys(item)
+
+
+def test_scoped_ranking_response_leaks_no_entity_graph_metadata(client):
+    # Mirror an existing scoped-ranking test in this file that produces a DERIVABLE target_entity, then
+    # assert the serialized response carries NONE of the 3A graph fields anywhere in its tree.
+    response = _scoped_considered_set_with_target_entity(client, target_entity="customer")  # existing helper/pattern
+    keys = set(_all_keys(response))
+    assert not (keys & {"graph_version", "paths", "paths_truncated", "relationship_version"})
+```
+
+Run: `uv run pytest tests/featuregen/api/test_contract_ranked.py -q`
+Expected: PASS. (Wire `_scoped_considered_set_with_target_entity` to the file's existing scoped-call helper — the assertion is what's load-bearing: no graph field appears in the response JSON.)
+
 - [ ] **Step 5: Lint + type-check + commit**
 
 ```bash
 uv run ruff check src/featuregen/overlay/upload/taxonomy/ranking_signals.py tests/featuregen/overlay/upload/taxonomy/test_entity_compatibility_regression.py
 uv run mypy src/featuregen/overlay/upload/taxonomy/ranking_signals.py
-git add src/featuregen/overlay/upload/taxonomy/ranking_signals.py tests/featuregen/overlay/upload/taxonomy/test_entity_compatibility_regression.py
+git add src/featuregen/overlay/upload/taxonomy/ranking_signals.py tests/featuregen/overlay/upload/taxonomy/test_entity_compatibility_regression.py tests/featuregen/api/test_contract_ranked.py
 git commit -m "feat(3a): rewire entity_compatibility onto the graph, delete _ENTITY_ROLLUP (task 3A.5)
 
 Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>"
@@ -1198,14 +1308,17 @@ _CARDINALITY = {"N:1": Cardinality.MANY_TO_ONE, "1:1": Cardinality.ONE_TO_ONE,
 
 def catalog_relationship_from_join_edge(
     edge: JoinEdge, *, catalog_source: str, relationship_id: str, adapter_id: str,
+    from_entity: str, to_entity: str,
 ) -> CatalogEntityRelationshipV1:
-    """A real per-catalog JoinEdge → a CatalogEntityRelationshipV1 (physical realization). Endpoint→entity
-    resolution + binding to a global relationship_id is 3B's job; here we prove the CONTRACT carries the
-    join's physical facts from the REAL type."""
+    """A real WITHIN-catalog JoinEdge → a CatalogEntityRelationshipV1 (physical realization). Endpoint→
+    entity resolution (``from_entity``/``to_entity``) + binding to a global relationship_id is 3B's job;
+    here they are SUPPLIED to prove the CONTRACT carries the join's physical facts + resolved entities
+    from the REAL JoinEdge type."""
     return CatalogEntityRelationshipV1(
         realization_id=f"{catalog_source}:{edge.from_ref}->{edge.to_ref}",
         relationship_id=relationship_id, catalog_source=catalog_source,
         from_object_ref=edge.from_ref, to_object_ref=edge.to_ref,
+        resolved_from_entity=from_entity, resolved_to_entity=to_entity,
         declared_cardinality=_CARDINALITY[edge.cardinality or "N:1"], adapter_id=adapter_id,
         authority=GraphEdgeAuthority.CATALOG_DECLARED, status=RelationshipStatus.ACTIVE)
 
@@ -1221,19 +1334,22 @@ def bridge_v1_from_entity_bridge(
 
 
 def test_real_join_edges_map_to_valid_catalog_realizations():
+    # Within-catalog roll-up realizations (a cross-catalog SAME-entity join is a bridge, tested below).
     cases = [
-        JoinEdge(from_ref="transactions.account_id", to_ref="accounts.account_id",
-                 cardinality="N:1", resolved=True),
-        JoinEdge(from_ref="accounts.customer_id", to_ref="customer_master.customer_id",
-                 cardinality="N:1", resolved=True),
-        JoinEdge(from_ref="facilities.borrower_id", to_ref="borrowers.borrower_id",
-                 cardinality="N:1", resolved=True),
+        (JoinEdge(from_ref="accounts.account_id", to_ref="accounts.customer_id",
+                  cardinality="N:1", resolved=True), "account", "customer"),
+        (JoinEdge(from_ref="cards.card_account_id", to_ref="cards.customer_id",
+                  cardinality="N:1", resolved=True), "card_account", "customer"),
+        (JoinEdge(from_ref="facilities.facility_id", to_ref="facilities.obligor_id",
+                  cardinality="N:1", resolved=True), "facility", "obligor"),
     ]
-    for i, edge in enumerate(cases):
+    for i, (edge, from_entity, to_entity) in enumerate(cases):
         real = catalog_relationship_from_join_edge(
-            edge, catalog_source="core", relationship_id=f"rel_{i}", adapter_id="core_adapter")
-        validate_catalog_relationship(real)                       # the contract is self-consistent
+            edge, catalog_source="core", relationship_id=f"rel_{i}", adapter_id="core_adapter",
+            from_entity=from_entity, to_entity=to_entity)
+        validate_catalog_relationship(real, known=known_entities())   # the contract is self-consistent
         assert real.from_object_ref == edge.from_ref
+        assert real.resolved_from_entity == from_entity and real.resolved_to_entity == to_entity
         assert real.declared_cardinality is Cardinality.MANY_TO_ONE
 
 
@@ -1279,7 +1395,7 @@ Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>"
 | 3 | Ranking + grain-warning responses unchanged | Task 5 Step 4 (`test_contract_ranked.py` green + no-leak guard) |
 | 4 | Old map removed, not a fallback | Task 5 Step 3(c) deletes `_ENTITY_ROLLUP`/`_rolls_up_to` |
 | 5 | Traversal cycle-safe + deterministic | Task 3 `test_semantic_cycle_rejected` (builder) + Task 4 `test_traversal_visited_guard...` (traversal) + sorted adjacency |
-| 6 | AMBIGUOUS synthetic-only | Task 4 `test_seed_never_emits_ambiguous` + `test_ambiguous_on_synthetic_two_path_graph`; Task 5 `test_no_pair_produces_ambiguous` |
+| 6 | AMBIGUOUS synthetic-only | Task 4 `test_seed_never_emits_ambiguous` + `test_ambiguous_two_paths_is_not_truncated` + `test_ambiguous_three_paths_is_truncated`; Task 5 `test_no_pair_produces_ambiguous` |
 | 7 | Aggregation metadata preserved in paths | Task 4 `test_derivable_direct_and_transitive` (asserts `relationship_version`; ref carries `aggregation_required`/`aggregation_strategy`) |
 | 8 | Graph version stable + observable | Task 4 (`result.graph_version`), Task 3 `test_invalid_graph_version_rejected` |
 | 9 | Catalog joins representable by `CatalogEntityRelationshipV1` | Task 6 `test_real_join_edges_map_to_valid_catalog_realizations` (REAL `JoinEdge`) |
@@ -1289,7 +1405,10 @@ Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>"
 
 ## Self-review notes
 
-- **Behaviour-neutrality proven two ways** (full-vocabulary resolver regression + untouched existing `test_ranking_signals.py`/`test_contract_ranked.py`) plus a **no-leak guard** (no `graph_version`/`paths_truncated` in the serialized ranking response).
+- **Behaviour-neutrality proven three ways:** the full-vocabulary resolver regression (`old == new` over every `known_entities()` pair), the untouched existing `test_ranking_signals.py`/`test_contract_ranked.py`, and a **route-level recursive scan** of a real scoped response confirming no graph key (`graph_version`/`paths`/`paths_truncated`/`relationship_version`) reaches the wire. The invariant is *semantic/schema equality* (parsed JSON), not byte equality.
+- **Converging DAGs build:** `_reject_cycles` is a recursive three-colour DFS that distinguishes a back edge (node on the active path) from a shared descendant (fully-visited) — `test_converging_dag_is_not_treated_as_cycle` guards it, and the AMBIGUOUS tests depend on it.
+- **`paths_truncated` is honest:** enumeration goes to `_MAX_COMPATIBILITY_PATHS + 1`, so exactly-two paths → `False`, three-plus → `True`.
+- **Active-only validation:** deprecated definitions are archived (never validated or indexed) — a deliberate, documented model.
 - **`AMBIGUOUS` additive-safety:** `entity_compatibility` feeds only the ranker reason stream (`is UNKNOWN`) and `signal_warnings` (`is DERIVABLE`) — no exhaustive `match`; the seed (acyclic, out-degree ≤1) never emits it.
 - **Closed-vocabulary invariant** is enforced at the resolver (unknown source/target → UNKNOWN before the EXACT short-circuit), not just at the registry.
 - **Curated graph correctness:** cycles, non-FORWARD active edges, duplicate ids, and duplicate semantic edges are all rejected at build; traversal keeps an independent visited-guard for a hand-built malformed graph.
