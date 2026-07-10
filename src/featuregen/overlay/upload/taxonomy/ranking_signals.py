@@ -18,11 +18,17 @@ Four signals + a grouping key:
   in the authored library bakes in a trailing-window / as-of PIT rule, so all resolve ``COMPLETE`` today;
   ``NOT_APPLICABLE`` (a non-time-dependent recipe), ``PARTIAL`` and ``UNKNOWN`` are reachable states a
   future or mis-authored recipe can land in.
-* :class:`ModellingContextFit` — Phase-2A stub: always ``NEUTRAL`` (no confirmed modelling context is
-  wired yet). Task B3 supplies the real ``REQUIRED_MATCH``/``COMPATIBLE``/``CONFLICT`` derivation.
-* :class:`EntityCompatibility` — Phase-2A stub: always ``UNKNOWN`` (no confirmed target entity yet). Task
-  B3 supplies the real grain logic. There is deliberately **no** ``INCOMPATIBLE`` — a hard entity reject
-  is deferred to Phase 3; ``target_entity`` is only ever a soft grain nudge.
+* :class:`ModellingContextFit` — the fit of a recipe to the human-confirmed modelling context(s). Task B3
+  derives it from the recipe's OWN modelling contexts (the ``modelling_context``-dimension targets of its
+  ``use_cases`` tags, via the legacy crosswalk) vs the confirmed set: an overlap is ``REQUIRED_MATCH``, a
+  context-free (generic) recipe is ``COMPATIBLE``, a recipe declaring only disjoint contexts is
+  ``CONFLICT`` (a warning, NEVER a hard reject in Phase 2), and no confirmed context is ``NEUTRAL``.
+* :class:`EntityCompatibility` — the SOFT grain fit of a recipe to the confirmed ``target_entity``. Task B3
+  derives the recipe's grain (the ``entity_link`` of its entity-role need) and compares it to the target:
+  equal is ``EXACT``, a declared roll-up (child grain -> coarser parent) is ``DERIVABLE``, and anything
+  else (incl. no target) is ``UNKNOWN``. There is deliberately **no** ``INCOMPATIBLE`` — a hard entity
+  reject is deferred to Phase 3; ``target_entity`` is only ever a soft grain nudge + a grain warning, and
+  is NEVER used to reject a recipe anywhere.
 
 ``semantic_group`` is the near-duplicate key: the source template id, which every grounded variant of a
 template carries. Behaviour-neutral, read-only — nothing here touches grounding or the considered-set.
@@ -31,6 +37,8 @@ from __future__ import annotations
 
 from enum import StrEnum
 
+from featuregen.overlay.upload.concepts import concept
+from featuregen.overlay.upload.taxonomy.legacy_crosswalk import crosswalk
 from featuregen.overlay.upload.templates import GroundedFeature, Template
 
 
@@ -140,15 +148,40 @@ class ModellingContextFit(StrEnum):
     CONFLICT = "conflict"
 
 
+def _own_modelling_contexts(t: Template) -> frozenset[str]:
+    """The recipe's OWN modelling contexts: the ``modelling_context``-dimension targets of its legacy
+    ``use_cases`` tags (via :func:`crosswalk`). A recipe carrying ``ifrs9_staging`` declares ``ifrs9``;
+    ``frtb`` declares ``frtb``; a recipe with no framework tag is *generic* (an empty set). Unknown tags
+    and tags that route to any other dimension (a real use-case leaf, a measure, a journey stage …)
+    contribute nothing — only a genuine regulatory-framework/regime tag counts."""
+    return frozenset(
+        entry["target"] for tag in t.use_cases
+        if (entry := crosswalk(tag)) is not None and entry["dimension"] == "modelling_context")
+
+
 def modelling_context_fit(
     t: Template, confirmed_contexts: tuple[str, ...] = ()) -> ModellingContextFit:
-    """Phase-2A: always ``NEUTRAL`` — no confirmed modelling context is wired into ranking yet, so this
-    axis is a no-op in the ranker. Task B3 replaces the body with the real derivation from
-    ``t.use_cases`` vs ``confirmed_contexts`` (``REQUIRED_MATCH``/``COMPATIBLE``/``CONFLICT``)."""
+    """Fit the recipe to the human-confirmed modelling context(s) — a rank signal for Task A2 and (on
+    ``CONFLICT``) a surfaced warning, NEVER a hard reject in Phase 2.
+
+    * no ``confirmed_contexts`` → ``NEUTRAL`` (nothing to fit; 2A ranking is unaffected);
+    * a confirmed context IS one of the recipe's own contexts → ``REQUIRED_MATCH`` (the recipe is
+      specific to a confirmed framework — e.g. an ``ifrs9_staging`` recipe under confirmed ``ifrs9``);
+    * the recipe declares NO modelling context (generic) → ``COMPATIBLE`` (it works under any context);
+    * the recipe declares only context(s) DISJOINT from the confirmed set → ``CONFLICT`` (e.g. an
+      ``frtb``-only recipe under confirmed ``ifrs9``) — a warning, not a rejection;
+    * else → ``NEUTRAL`` (a total, defensive fallback).
+    """
     if not confirmed_contexts:
         return ModellingContextFit.NEUTRAL
-    # Task B3 replaces the line below with the real fit derivation; until then a confirmed context is
-    # still NEUTRAL so 2A ranking is byte-identical whether or not a caller passes contexts.
+    own = _own_modelling_contexts(t)
+    confirmed = set(confirmed_contexts)
+    if own & confirmed:
+        return ModellingContextFit.REQUIRED_MATCH
+    if not own:
+        return ModellingContextFit.COMPATIBLE
+    if own.isdisjoint(confirmed):
+        return ModellingContextFit.CONFLICT
     return ModellingContextFit.NEUTRAL
 
 
@@ -166,14 +199,66 @@ class EntityCompatibility(StrEnum):
     UNKNOWN = "unknown"
 
 
+# A small, CONSERVATIVE roll-up map: a child grain that can be aggregated UP to a coarser parent entity
+# WITHOUT needing join semantics we don't have yet. Deliberately tiny — only the roll-ups we can assert
+# by declaration (the full relational grain graph, and any hard INCOMPATIBLE reject, are Phase-3 work).
+# Chains compose transitively (``transaction -> account -> customer``); :func:`_rolls_up_to` walks them.
+_ENTITY_ROLLUP: dict[str, str] = {
+    "account": "customer",
+    "card_account": "customer",
+    "transaction": "account",
+    "facility": "obligor",
+    "policy": "customer",
+}
+
+
+def _grain_entity(t: Template) -> str | None:
+    """The recipe's GRAIN entity: the ``entity_link`` of the concept of the recipe's entity-role need
+    (the FIRST need whose concept carries an ``entity_link`` — e.g. a ``customer_id`` need fixes the
+    grain at ``customer``, a ``facility_id`` need at ``facility``). A recipe with no entity-linking need
+    has no derivable grain → ``None``."""
+    for need in t.needs:
+        c = concept(need.concept)
+        if c is not None and c.entity_link is not None:
+            return c.entity_link
+    return None
+
+
+def _rolls_up_to(grain: str, target: str) -> bool:
+    """True iff ``grain`` rolls up to ``target`` along the declared roll-up chain (transitively, with a
+    cycle guard). ``account`` rolls up to ``customer`` directly; ``transaction`` rolls up to ``customer``
+    via ``account``. A grain that only rolls DOWN to (never UP to) the target does not match."""
+    seen: set[str] = set()
+    cur: str | None = grain
+    while cur is not None and cur not in seen:
+        seen.add(cur)
+        cur = _ENTITY_ROLLUP.get(cur)
+        if cur == target:
+            return True
+    return False
+
+
 def entity_compatibility(t: Template, target_entity: str | None = None) -> EntityCompatibility:
-    """Phase-2A: always ``UNKNOWN`` — no confirmed target entity is wired into ranking yet. Task B3
-    replaces the body with the real grain logic (``EXACT``/``DERIVABLE`` from the recipe's declared
-    grain vs the soft ``target_entity``)."""
+    """The SOFT grain fit of the recipe to a confirmed ``target_entity``. A grain/groundability signal —
+    a low rank tie-break and (on ``DERIVABLE``) a grain warning — NEVER an applicability reject.
+
+    * ``target_entity is None`` → ``UNKNOWN`` (no target confirmed; ranking is unaffected);
+    * the recipe's grain == ``target_entity`` → ``EXACT`` (the recipe already predicts at the target grain);
+    * the recipe's grain rolls up to ``target_entity`` via the declared roll-up map → ``DERIVABLE`` (a real
+      grain mismatch that a roll-up can bridge — e.g. an ``account``-grain recipe under ``customer``);
+    * otherwise → ``UNKNOWN`` (no known grain relationship, or the recipe declares no grain).
+
+    There is deliberately **no** ``INCOMPATIBLE`` — a hard entity reject is Phase-3 work; a grain that
+    does not roll up to the target is ``UNKNOWN`` (soft), never a rejection."""
     if target_entity is None:
         return EntityCompatibility.UNKNOWN
-    # Task B3 replaces the line below with the real grain derivation; until then any target entity is
-    # still UNKNOWN so 2A ranking is unaffected.
+    grain = _grain_entity(t)
+    if grain is None:
+        return EntityCompatibility.UNKNOWN
+    if grain == target_entity:
+        return EntityCompatibility.EXACT
+    if _rolls_up_to(grain, target_entity):
+        return EntityCompatibility.DERIVABLE
     return EntityCompatibility.UNKNOWN
 
 

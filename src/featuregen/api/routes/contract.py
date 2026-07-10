@@ -74,6 +74,8 @@ from featuregen.overlay.upload.taxonomy.ranking_signals import (
     BindingQuality,
     EntityCompatibility,
     ModellingContextFit,
+    entity_compatibility,
+    modelling_context_fit,
     pit_completeness,
     semantic_group,
 )
@@ -126,6 +128,12 @@ class ConfirmedScopeIn(BaseModel):
     unscoped: bool = False
     use_case_origins: dict[str, str] = {}
     confirmation_source: str = "user_confirmed"
+    # ── Phase-2B (Task B3): the two human-confirmed intent DIMENSIONS. Both SOFT — they never narrow
+    # applicability (``by_recipe``/``out_of_scope`` are untouched); they only feed the ranker and surface
+    # per-recipe grain/context warnings. ``target_entity`` is a grain nudge (never a reject); an unknown
+    # value simply yields UNKNOWN/COMPATIBLE. Default empty so every dimension-free caller is unchanged.
+    modelling_contexts: list[str] = []
+    target_entity: str | None = None
 
 
 class ConsideredSetIn(BaseModel):
@@ -210,13 +218,15 @@ def rankable_recipe_ids(dispositions: list[RecipeEvaluation]) -> list[str]:
 
 
 def _rank_signals(rankable_ids: list[str], dispositions: list[RecipeEvaluation],
-                  cs) -> dict[str, RankSignals]:
-    """Assemble the typed :class:`RankSignals` per rankable recipe from three already-computed sources:
-    the disposition (``relevance_tier``), this run's grounding (``binding_quality``), and the template's
+                  cs, scope: ConfirmedScope) -> dict[str, RankSignals]:
+    """Assemble the typed :class:`RankSignals` per rankable recipe from four already-computed sources:
+    the disposition (``relevance_tier``), this run's grounding (``binding_quality``), the template's
     design-time metadata (``pit_completeness`` / ``family`` / ``explainability`` / journey / semantic
-    group). ``modelling_context_fit`` and ``entity_compatibility`` are the Phase-2A stubs (NEUTRAL /
-    UNKNOWN) — Task B3 supplies the real derivations. A rankable id with no known template is skipped
-    (the ranker then deterministically drops it — it cannot be ordered without a signal bundle)."""
+    group), and the confirmed-scope DIMENSIONS (Task B3): ``modelling_context_fit`` from
+    ``scope.modelling_contexts`` and the soft ``entity_compatibility`` from ``scope.target_entity``. A
+    dimension-free scope leaves those two at NEUTRAL / UNKNOWN (2A ranking is unaffected). A rankable id
+    with no known template is skipped (the ranker then deterministically drops it — it cannot be ordered
+    without a signal bundle)."""
     tier_by_id = {ev.recipe_id: ev.relevance_tier for ev in dispositions}
     signals: dict[str, RankSignals] = {}
     for rid in rankable_ids:
@@ -228,16 +238,39 @@ def _rank_signals(rankable_ids: list[str], dispositions: list[RecipeEvaluation],
             relevance_tier=tier_by_id.get(rid) or "supporting",   # ELIGIBLE => a real in-scope tier
             binding_quality=BindingQuality(
                 cs.binding_quality_by_template.get(rid, BindingQuality.ACCEPTABLE.value)),
-            modelling_context_fit=ModellingContextFit.NEUTRAL,    # 2A stub (Task B3 supplies the fit)
+            # Task B3: the confirmed modelling-context fit (NEUTRAL when none confirmed).
+            modelling_context_fit=modelling_context_fit(t, scope.modelling_contexts),
             pit_completeness=pit_completeness(t),
             explainability=t.explain,
             family=t.family,
             journey_model_id=journey.journey_model_id,
             journey_stage_id=journey.journey_stage_id,
             semantic_group=semantic_group(t),
-            entity_compatibility=EntityCompatibility.UNKNOWN,     # 2A stub (Task B3 supplies the grain)
+            # Task B3: the SOFT grain fit (UNKNOWN when no target_entity confirmed) — never a reject.
+            entity_compatibility=entity_compatibility(t, scope.target_entity),
         )
     return signals
+
+
+def _signal_warnings(signals: dict[str, RankSignals]) -> dict[str, list[str]]:
+    """The SOFT per-recipe dimension warnings surfaced alongside the ranking — presentation metadata,
+    NEVER an applicability decision (``by_recipe``/``dispositions`` are untouched; nothing is rejected).
+
+    A recipe whose grain only DERIVES the confirmed ``target_entity`` (a real grain mismatch a roll-up
+    can bridge) carries ``entity_grain_mismatch``; one whose declared modelling context CONFLICTS with
+    the confirmed context carries ``modelling_context_conflict``. An ``EXACT``/``UNKNOWN`` grain and a
+    ``NEUTRAL``/``COMPATIBLE``/``REQUIRED_MATCH`` context carry nothing. Only recipes with a warning
+    appear in the map (keyed by recipe id)."""
+    warnings: dict[str, list[str]] = {}
+    for rid, s in signals.items():
+        codes: list[str] = []
+        if s.entity_compatibility is EntityCompatibility.DERIVABLE:
+            codes.append("entity_grain_mismatch")
+        if s.modelling_context_fit is ModellingContextFit.CONFLICT:
+            codes.append("modelling_context_conflict")
+        if codes:
+            warnings[rid] = codes
+    return warnings
 
 
 def _ranking_json(r: RankedRecipe) -> dict:
@@ -265,7 +298,9 @@ def _scoped_considered_set(body: ConsideredSetIn, conn: _Conn, identity: _Identi
     #    422 on a leftover id). Otherwise every confirmed id must be a selectable taxonomy leaf and the
     #    id set must be collision-free.
     if cscope.unscoped:
-        scope = ConfirmedScope(primary=None, secondary=(), unscoped=True)
+        scope = ConfirmedScope(
+            primary=None, secondary=(), unscoped=True,
+            modelling_contexts=tuple(cscope.modelling_contexts), target_entity=cscope.target_entity)
     else:
         # A ``primary`` that also appears in ``secondary`` (or a duplicated ``secondary``) would collide
         # on the ``confirmed_scope_use_case`` PK downstream → UniqueViolation → 500; reject it as a 422.
@@ -284,7 +319,9 @@ def _scoped_considered_set(body: ConsideredSetIn, conn: _Conn, identity: _Identi
         try:
             scope = ConfirmedScope(
                 primary=cscope.primary, secondary=tuple(cscope.secondary),
-                expansion=ScopeExpansion(cscope.expansion), unscoped=False)
+                expansion=ScopeExpansion(cscope.expansion), unscoped=False,
+                modelling_contexts=tuple(cscope.modelling_contexts),
+                target_entity=cscope.target_entity)
         except ValueError as e:
             raise HTTPException(status_code=422, detail=str(e)) from e
     # 2. Reuse the recognition's immutable intent if given, else submit a fresh (redacted) one.
@@ -337,11 +374,14 @@ def _scoped_considered_set(body: ConsideredSetIn, conn: _Conn, identity: _Identi
     # SEPARATE from the LLM ``recommendation`` and the human's Gate-#1 choice — three distinct layers.
     if _intent_ranking_enabled():
         rankable_ids = rankable_recipe_ids(dispositions)
-        signals = _rank_signals(rankable_ids, dispositions, cs)
+        signals = _rank_signals(rankable_ids, dispositions, cs, scope)
         ranking_version = APPLICABILITY_MAPPING_VERSION   # pinned BEFORE the ranker is called
         ranked = rank_eligible(rankable_ids, signals, ranking_version=ranking_version)
         response["ranking"] = [_ranking_json(r) for r in ranked]
         response["ranking_version"] = ranking_version
+        # Task B3: the SOFT dimension warnings (grain mismatch / context conflict) surfaced per recipe.
+        # This NEVER changes dispositions — a warned recipe stays exactly as eligible as it was.
+        response["signal_warnings"] = _signal_warnings(signals)
     return response
 
 

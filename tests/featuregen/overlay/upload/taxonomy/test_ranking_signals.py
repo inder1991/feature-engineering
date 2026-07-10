@@ -12,7 +12,7 @@ from featuregen.overlay.upload.taxonomy.ranking_signals import (
     pit_completeness,
     semantic_group,
 )
-from featuregen.overlay.upload.templates import ALL_TEMPLATES, GroundedFeature, Template
+from featuregen.overlay.upload.templates import ALL_TEMPLATES, GroundedFeature, Need, Template
 
 
 # ── factories ───────────────────────────────────────────────────────────────────────────────────
@@ -106,31 +106,98 @@ def test_pit_completeness_partial_for_marker_less_declaration():
     assert pit_completeness(_template(pit="rolling 90-day count")) is PITCompleteness.PARTIAL
 
 
-# ── ModellingContextFit (2A stub) ─────────────────────────────────────────────────────────────────
+# ── ModellingContextFit (Task B3 — real fit vs the confirmed context) ───────────────────────────────
 def test_modelling_context_fit_neutral_without_context_total():
+    # No confirmed context -> NEUTRAL for every recipe (2A ranking is byte-identical).
     for t in ALL_TEMPLATES:
         assert modelling_context_fit(t) is ModellingContextFit.NEUTRAL
 
 
-def test_modelling_context_fit_neutral_even_with_context_in_2a():
-    # 2A is a no-op on this axis: even a passed context resolves NEUTRAL until Task B3.
-    assert modelling_context_fit(_template(), confirmed_contexts=("ifrs9",)) \
-        is ModellingContextFit.NEUTRAL
+def test_modelling_context_fit_required_match_on_own_context():
+    # A recipe carrying the ifrs9_staging framework tag, confirmed ifrs9 -> REQUIRED_MATCH.
+    t = _template(use_cases=("credit_risk", "ifrs9_staging"))
+    assert modelling_context_fit(t, confirmed_contexts=("ifrs9",)) is ModellingContextFit.REQUIRED_MATCH
 
 
-# ── EntityCompatibility (2A stub) ─────────────────────────────────────────────────────────────────
+def test_modelling_context_fit_compatible_for_generic_recipe():
+    # A generic recipe (no modelling_context tag) is COMPATIBLE under any confirmed context.
+    t = _template(use_cases=("retail_churn",))
+    assert modelling_context_fit(t, confirmed_contexts=("ifrs9",)) is ModellingContextFit.COMPATIBLE
+
+
+def test_modelling_context_fit_conflict_for_disjoint_context():
+    # An frtb-only recipe under confirmed ifrs9 -> CONFLICT (a surfaced warning, NEVER a hard reject).
+    t = _template(use_cases=("market_risk", "frtb"))
+    assert modelling_context_fit(t, confirmed_contexts=("ifrs9",)) is ModellingContextFit.CONFLICT
+
+
+def test_modelling_context_fit_empty_confirmed_is_neutral():
+    # An explicit empty confirmed set is still NEUTRAL, even on a framework-tagged recipe.
+    t = _template(use_cases=("credit_risk", "ifrs9_staging"))
+    assert modelling_context_fit(t, confirmed_contexts=()) is ModellingContextFit.NEUTRAL
+
+
+def test_modelling_context_fit_total_over_all_templates():
+    # Derivation is total: every recipe under a confirmed context yields a valid member.
+    for t in ALL_TEMPLATES:
+        assert isinstance(modelling_context_fit(t, confirmed_contexts=("ifrs9",)), ModellingContextFit)
+
+
+# ── EntityCompatibility (Task B3 — the SOFT grain signal; never a hard reject) ──────────────────────
+def _customer_grain(**overrides: object) -> Template:
+    """A customer-grain recipe: its entity-role need links the customer entity (customer_id)."""
+    return _template(needs=(Need("entity", "customer_id"),), **overrides)
+
+
+def _account_grain(**overrides: object) -> Template:
+    """An account-grain recipe: its entity-role need links the account entity (account_id)."""
+    return _template(needs=(Need("entity", "account_id"),), **overrides)
+
+
 def test_entity_compatibility_unknown_without_entity_total():
+    # No confirmed target_entity -> UNKNOWN for every recipe (the axis is a no-op in ranking).
     for t in ALL_TEMPLATES:
         assert entity_compatibility(t) is EntityCompatibility.UNKNOWN
 
 
-def test_entity_compatibility_unknown_even_with_entity_in_2a():
-    assert entity_compatibility(_template(), target_entity="account") is EntityCompatibility.UNKNOWN
+def test_entity_compatibility_exact_when_grain_is_target():
+    # A customer-grain recipe under target_entity="customer" already predicts at the target grain.
+    assert entity_compatibility(_customer_grain(), target_entity="customer") is EntityCompatibility.EXACT
+
+
+def test_entity_compatibility_unknown_when_no_rollup_to_target():
+    # customer does NOT roll up to account -> UNKNOWN (a soft no-op), NEVER INCOMPATIBLE.
+    assert entity_compatibility(_customer_grain(), target_entity="account") \
+        is EntityCompatibility.UNKNOWN
+
+
+def test_entity_compatibility_derivable_via_rollup():
+    # An account-grain recipe rolls up to customer (account -> customer) -> DERIVABLE.
+    assert entity_compatibility(_account_grain(), target_entity="customer") \
+        is EntityCompatibility.DERIVABLE
+
+
+def test_entity_compatibility_derivable_transitively():
+    # A transaction-grain recipe rolls up to customer via account (transaction -> account -> customer).
+    txn = _template(needs=(Need("entity", "transaction_id"),))
+    assert entity_compatibility(txn, target_entity="customer") is EntityCompatibility.DERIVABLE
+
+
+def test_entity_compatibility_none_target_is_unknown():
+    assert entity_compatibility(_customer_grain(), target_entity=None) is EntityCompatibility.UNKNOWN
 
 
 def test_entity_compatibility_has_no_incompatible_member():
     # Hard entity rejection is deferred to Phase 3 — the member must not exist.
     assert not hasattr(EntityCompatibility, "INCOMPATIBLE")
+
+
+def test_entity_compatibility_never_returns_a_reject():
+    # No (recipe, target) combination ever yields anything but EXACT / DERIVABLE / UNKNOWN.
+    ok = (EntityCompatibility.EXACT, EntityCompatibility.DERIVABLE, EntityCompatibility.UNKNOWN)
+    for target in ("customer", "account", "facility", "obligor", "nonsense", None):
+        for t in (_customer_grain(), _account_grain(), _template(), *ALL_TEMPLATES[:10]):
+            assert entity_compatibility(t, target_entity=target) in ok
 
 
 # ── semantic_group ────────────────────────────────────────────────────────────────────────────────
