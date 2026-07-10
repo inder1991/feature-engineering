@@ -10,8 +10,10 @@ capped, and an ``unscoped`` scope fails open to every recipe. See
 from __future__ import annotations
 
 from featuregen.overlay.upload.taxonomy.applicability import (
+    ApplicabilityResult,
     ConfirmedScope,
     ScopeExpansion,
+    applicability_result,
     in_scope_recipes,
     scope_from_recognition,
 )
@@ -130,3 +132,54 @@ def test_empty_scope_fails_open_to_all():
     # Defense-in-depth: a hand-built primary-less, secondary-less, non-unscoped scope still grounds all.
     primary_scoped, supporting = in_scope_recipes(ConfirmedScope(primary=None, secondary=()))
     assert primary_scoped == ALL_IDS and supporting == set()
+
+
+# ── Phase-1B Task 3: applicability_result — exactly one decision per recipe ──────────────────────────
+def test_applicability_result_classifies_every_recipe_exactly_once() -> None:
+    result = applicability_result(ConfirmedScope(primary=CHURN))
+    assert isinstance(result, ApplicabilityResult)
+    # EVERY recipe appears exactly once (dict keys are unique, so equality of key-set == exactly-once).
+    assert set(result.by_recipe) == ALL_IDS
+    assert len(result.by_recipe) == 153
+    # The confirmed churn objective's recipes are primary...
+    assert result.by_recipe["balance_trend"] == "primary"
+    assert result.by_recipe["dormancy_days"] == "primary"
+    # ...and a credit recipe and a fraud recipe fall out of scope.
+    assert result.by_recipe["credit_utilisation"] == "out_of_scope"
+    assert result.by_recipe["txn_velocity_spike"] == "out_of_scope"
+    # Every classification is one of the three allowed relationships.
+    assert set(result.by_recipe.values()) <= {"primary", "supporting", "out_of_scope"}
+
+
+def test_applicability_result_eligible_ids_match_in_scope_recipes() -> None:
+    scope = ConfirmedScope(primary=CHURN)
+    primary_scoped, supporting_scoped = in_scope_recipes(scope)
+    result = applicability_result(scope)
+    assert result.eligible_ids == frozenset(primary_scoped | supporting_scoped)
+    # And eligible_ids is exactly the non-out_of_scope recipes.
+    assert result.eligible_ids == frozenset(
+        rid for rid, rel in result.by_recipe.items() if rel != "out_of_scope")
+
+
+def test_applicability_result_unscoped_is_all_primary() -> None:
+    result = applicability_result(ConfirmedScope(primary=None, unscoped=True))
+    assert set(result.by_recipe.values()) == {"primary"}
+    assert all(rel == "primary" for rel in result.by_recipe.values())
+    assert "out_of_scope" not in result.by_recipe.values()
+    assert result.eligible_ids == frozenset(ALL_IDS)
+    assert len(result.eligible_ids) == 153
+
+
+def test_applicability_result_secondary_match_is_supporting() -> None:
+    # external_own_transfer_trend carries primacy_loss as a SECONDARY (its own primary is churn).
+    result = applicability_result(ConfirmedScope(primary=PRIMACY))
+    assert result.by_recipe["external_own_transfer_trend"] == "supporting"
+    # Its reason code reflects the secondary (supporting) match.
+    assert result.reason_codes["external_own_transfer_trend"] == ("secondary_match",)
+
+
+def test_applicability_result_reason_codes_cover_every_recipe() -> None:
+    result = applicability_result(ConfirmedScope(primary=CHURN))
+    assert set(result.reason_codes) == ALL_IDS
+    assert result.reason_codes["balance_trend"] == ("primary_match",)
+    assert result.reason_codes["credit_utilisation"] == ("no_confirmed_use_case_match",)

@@ -120,3 +120,76 @@ def in_scope_recipes(scope: ConfirmedScope) -> tuple[set[str], set[str]]:
             supporting_scoped.add(template.id)
 
     return primary_scoped, supporting_scoped
+
+
+# Reason codes stamped per recipe on the single applicability decision. One tuple per relationship so a
+# downstream disposition lens (Phase-1B Task 5) can explain *why* a recipe was placed where it was.
+_PRIMARY_REASON: tuple[str, ...] = ("primary_match",)
+_SUPPORTING_REASON: tuple[str, ...] = ("secondary_match",)
+_OUT_OF_SCOPE_REASON: tuple[str, ...] = ("no_confirmed_use_case_match",)
+
+
+@dataclass(frozen=True, slots=True)
+class ApplicabilityResult:
+    """The one-and-only applicability decision for a confirmed scope (Phase-1B Task 3).
+
+    Computed *once* per generation run and consumed by both grounding and the disposition lens, so the
+    library is never rescanned to re-ask "is this applicable?" (the scale story as it grows past 153).
+
+    * ``by_recipe`` — EVERY recipe id in :data:`ALL_TEMPLATES` mapped to exactly one relationship:
+      ``"primary"``, ``"supporting"``, or ``"out_of_scope"``. The exactly-one invariant is enforced at
+      construction by :func:`applicability_result`.
+    * ``eligible_ids`` — the ``primary`` ∪ ``supporting`` ids (the non-``out_of_scope`` recipes that
+      grounding evaluates).
+    * ``reason_codes`` — a reason tuple per recipe explaining its placement.
+    """
+
+    by_recipe: dict[str, str]
+    eligible_ids: frozenset[str]
+    reason_codes: dict[str, tuple[str, ...]]
+
+
+def applicability_result(scope: ConfirmedScope) -> ApplicabilityResult:
+    """Compute the single :class:`ApplicabilityResult` for a confirmed scope.
+
+    Calls :func:`in_scope_recipes` **exactly once** to get ``(primary_scoped, supporting_scoped)`` and
+    classifies every recipe in :data:`ALL_TEMPLATES` into exactly one relationship: in ``primary_scoped``
+    -> ``"primary"``; else in ``supporting_scoped`` -> ``"supporting"``; else ``"out_of_scope"``. An
+    ``unscoped`` scope therefore classifies every recipe as ``"primary"`` (fail open).
+
+    Enforces the exactly-one invariant as an internal contract (not user input): the classified id-set
+    must equal the full registry and the primary/supporting sets must be disjoint. A violation means
+    ``in_scope_recipes`` or the registry drifted and is raised, not swallowed.
+    """
+    primary_scoped, supporting_scoped = in_scope_recipes(scope)
+
+    overlap = primary_scoped & supporting_scoped
+    if overlap:
+        raise ValueError(
+            f"applicability invariant violated: recipes classified as BOTH primary and supporting: "
+            f"{sorted(overlap)}")
+
+    by_recipe: dict[str, str] = {}
+    reason_codes: dict[str, tuple[str, ...]] = {}
+    for template in ALL_TEMPLATES:
+        rid = template.id
+        if rid in primary_scoped:
+            by_recipe[rid] = "primary"
+            reason_codes[rid] = _PRIMARY_REASON
+        elif rid in supporting_scoped:
+            by_recipe[rid] = "supporting"
+            reason_codes[rid] = _SUPPORTING_REASON
+        else:
+            by_recipe[rid] = "out_of_scope"
+            reason_codes[rid] = _OUT_OF_SCOPE_REASON
+
+    all_ids = {t.id for t in ALL_TEMPLATES}
+    if set(by_recipe) != all_ids:
+        raise AssertionError(
+            "applicability invariant violated: by_recipe must classify every recipe exactly once")
+
+    return ApplicabilityResult(
+        by_recipe=by_recipe,
+        eligible_ids=frozenset(primary_scoped | supporting_scoped),
+        reason_codes=reason_codes,
+    )
