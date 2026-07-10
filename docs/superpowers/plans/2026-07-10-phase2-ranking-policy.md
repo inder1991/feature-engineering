@@ -1,135 +1,164 @@
-# Phase 2 — Ranking + Dimensions + Contextual Policy — Implementation Plan
+# Phase 2 — Ranking, Confirmed Dimensions, Contextual Policy — Implementation Plan (v2)
 
 > **For agentic workers:** REQUIRED SUB-SKILL: subagent-driven-development. Steps use `- [ ]` checkboxes.
+> v2 folds in the Head-of-Architecture review: **split into four independently-shippable sub-phases** (2A ranking → 2B confirmed dimensions → 2C policy *shadow* → 2D policy enforcement), soft entity handling, event-sourced policy lifecycle, a closed predicate DSL, split justify/approve with authority, and "shadow-before-enforce" for policy.
 
-**Goal:** Once recipes are scoped to the objective (Phase 1B), (A) **rank** the eligible set so the most relevant, most explainable recipes lead; wire the two deferred **dimensions** (`modelling_context`, `entity_context`) that Phase 1B recognised-but-didn't-use; and (C) add a **contextual policy** layer that can warn / require-approval / exclude a structurally-safe recipe that is *inappropriate* for a governed context — one locally-ratified rule proven end-to-end. All flag-gated default-off, additive over universal safety.
+**Goal:** On top of Phase-1B scoping, deliver — in de-risked order — (2A) deterministic **presentation-priority ranking** of the eligible set; (2B) two **human-confirmed** intent dimensions (`modelling_context`, `target_entity`, the latter *soft* until Phase 3); (2C) a **contextual-policy** foundation run in **shadow**; (2D) policy **enforcement + a governed approval workflow**.
 
-**Architecture:** Phase-1B pipeline is `applicability → grounding → safety → disposition`. Phase 2 inserts **policy** after safety (a structurally-safe recipe may still be context-inappropriate) and **ranking** over the eligible set (presentation-priority only). The recognizer gains two more closed dimensions in the SAME call; `entity_context` becomes a hard-incompatibility reject in applicability; `modelling_context` becomes a ranking-boost + a policy predicate.
+**Architecture / final pipeline (once all sub-phases land):**
+```
+applicability → grounding → universal safety → contextual policy → rank(eligible only) → present
+```
+Policy sits *after* safety (additive-only; never rescues a safety-rejected recipe) and *before* ranking (a policy-blocked recipe never receives a rank). The recognizer gains two closed dimensions in one call; `target_entity` is a *soft* grain signal in Phase 2 (hard entity rejection needs Phase-3 join semantics).
 
-**Tech stack:** Python 3.11 / FastAPI, psycopg + SQL migrations, React (`WorkbenchScreen.tsx`, `api.ts`). Builds on Phase-1B `ApplicabilityResult`, `RecipeEvaluation`/`FinalDisposition`, `evaluate_dispositions`, the recognizer, `contract/scope_records.py`, the disposition lens.
+**Tech stack:** Python 3.11 / FastAPI, psycopg + SQL migrations, React. Builds on Phase-1B `ApplicabilityResult`, `RecipeEvaluation`/`FinalDisposition`, `evaluate_dispositions`, the recognizer, `scope_records`, the disposition lens.
 
-**Gating precondition:** Phase 1B enabled and its shadow-run exit bar cleared (scoping must be live and trusted before ranking/policy sit on top of it).
+**Gating precondition:** Phase 1B live and trusted (its shadow-run bar cleared). Each sub-phase is separately flag-gated and shippable; 2D depends on a 2C shadow review by compliance.
 
-## Global Constraints
+## Global Constraints (bind every task)
 
-- **Flags default OFF → Phase-1B behaviour exactly.** New flags: `FEATUREGEN_INTENT_RANKING`, `FEATUREGEN_INTENT_CONTEXTUAL_POLICY` (backend); `VITE_INTENT_RANKING`, `VITE_INTENT_POLICY` (frontend). Off → the eligible set is unordered-as-today and no policy stage runs. Prove flag-off neutrality.
-- **Ranking is PRESENTATION PRIORITY, never measured predictive utility** (no data plane). Start **tiered** (primary > secondary > supporting, then explainability, then binding quality) with deterministic, stable tie-breaks. Any weighted score is **derived from evaluation data, not asserted** — do NOT hardcode magic weights. Ranking is an *attribute* of an eligible recipe, NEVER a disposition.
-- **Policy is additive-only over universal safety.** The policy stage can only ADD restrictions to an already-safe candidate; it NEVER relaxes `_safe_to_bind`. Every policy rule is **locally ratified before it enforces** (the LLM may *draft* a rule; a human ratifies; only a ratified bundle evaluates). No execution-implying actions (no fairness-test/block-export — there is no training/export plane).
-- **Deterministic action → disposition.** `allow`→`ELIGIBLE`; `warn`→`ELIGIBLE` + a policy-warning reason code; `require_justification`/`require_approval`→`POLICY_REVIEW_REQUIRED`; `exclude`→`POLICY_BLOCKED`. The policy stage **retains the original action** even after an approval (`action=require_approval, approval_status=approved`) — an approval doesn't erase that approval was needed.
-- **Predicates over a versioned `PolicyContext`**, not a hard-coded key. Phase-2B populates only use-cases + modelling-contexts + jurisdiction + decision-purpose; the schema leaves room for legal-entity/product/lifecycle/automation-level (empty for now).
-- **The LLM proposes; deterministic code + humans dispose.** Recogniser proposes the extra dimensions (human-confirmed at Gate #1); ranking is deterministic; policy rules are human-ratified.
-- **Version the evidence.** Persist `ranking_version` + `policy_bundle_version` on the generation run; each policy decision stamps the ratified rule id + bundle version it fired under (replay).
-- **Transparency.** A policy-blocked / review-required / down-ranked recipe stays visible in the disposition lens with its reason; nothing disappears silently.
+**Neutrality & rollout**
+- Flags default OFF → Phase-1B behaviour, byte-identical; prove it per sub-phase. Flags: `FEATUREGEN_INTENT_RANKING`, `FEATUREGEN_INTENT_CONTEXTUAL_POLICY` (backend) + `VITE_INTENT_RANKING`, `VITE_INTENT_POLICY` (frontend). Multi-dimension recognition rides the existing recognizer flag.
+- **Shadow before enforce.** Contextual policy is evaluated and measured against compliance-reviewed expectations (2C) BEFORE it can change any disposition (2D) — the same discipline used for recognition (shadow-before-filter).
 
----
+**Ranking = presentation priority**
+- NEVER measured predictive utility (no data plane). Deterministic **tiered** order: relevance tier → exact modelling-context match → **binding quality → PIT-completeness** → explainability → stable id. No magic weights; any learned weight is derived from eval data, never asserted. If a signal (e.g. `pit_declared`) is in the contract it MUST be used or removed.
+- Ranking is an **attribute** of an eligible recipe, NEVER a disposition.
+- **Diversity affects `selected_for_initial_view` ONLY — it never rewrites `canonical_rank`.**
+- Ranking runs **after policy, over the final eligible set only** (`POLICY_BLOCKED`/`POLICY_REVIEW_REQUIRED`/`OUT_OF_SCOPE`/`UNBUILDABLE` get no canonical rank).
+- Rank reasons are **structured codes** (`RankReasonCode`), not hand-authored text; the UI maps codes → display.
 
-# Part A — Ranking (presentation priority)
+**Dimensions**
+- The recognizer PROPOSES `modelling_context`/`target_entity`; the human CONFIRMS at Gate #1. No recognized dimension becomes a constraint before confirmation — extend `ConfirmedScope` + `confirmed_generation_scope` + the Gate-#1 UI, retaining proposed-vs-confirmed (the 1B delta discipline).
+- **`target_entity` is SOFT in Phase 2.** It's a *grain/groundability* signal, not a *relevance* one: `EntityCompatibility ∈ {EXACT, DERIVABLE, UNKNOWN}` → a rank nudge or a grain-mismatch WARNING, surfaced with a distinct reason (`entity_grain_mismatch`) — NEVER `OUT_OF_SCOPE`. A hard `INCOMPATIBLE` reject needs Phase-3 entity-graph join semantics and is **deferred to Phase 3**.
 
-## Task 1: Deterministic ranker
+**Policy is a governed decision system, not a filter**
+- **Missing/incomplete context never means unrestricted.** `PolicyContextStatus ∈ {COMPLETE, NOT_REQUIRED, INCOMPLETE, CONFLICTING}`. The trigger for review is a **policy-relevant bound concept** (e.g. `proxy`/sensitive), not the presence of context: incomplete context + a sensitive concept → `POLICY_REVIEW_REQUIRED (POLICY_CONTEXT_INCOMPLETE)`; incomplete context + no sensitive concept → `ELIGIBLE`.
+- **Additive-only over universal safety** — policy can only ADD restrictions to an already-safe candidate; it never relaxes `_safe_to_bind` or rescues a `SAFETY_REJECTED` recipe.
+- **Locally ratified before enforced.** Ship rules as **inactive draft templates**; a ratified rule exists only as a **test fixture** or via a local ratification event by an authorized authority. NEVER ship a production migration that marks a compliance rule ratified.
+- **Event-sourced, immutable lifecycle.** Immutable `policy_rule_version` + append-only `policy_rule_event` (drafted/submitted/ratified/activated/suspended/retired); active-state is DERIVED, not a mutable column. First-class `policy_bundle_version`; a generation run **pins exactly one `policy_bundle_version_id`**; `active_rules` never infers "latest".
+- **Closed predicate DSL** — enumerated fields + operators (`eq, in, contains, intersects, exists, not_exists, all, any, not`); NO arbitrary/executable/model-generated logic. The ratification UI shows both human-readable meaning and the normalized predicate.
+- **Keep ALL matching rules** on the decision (`matched_rules`); `effective_action` = strongest (`exclude > require_approval > require_justification > warn > allow`) but the full set is auditable.
+- **`review_due_at` ≠ `effective_until`.** Past `review_due_at` → **keep enforcing + emit a governance alert**; only `effective_until` expires a rule. Never silently disable an overdue-review rule.
+- **Justify ≠ approve.** A justification may come from the feature author; an **approval requires an actor with the rule's authority** (role/authority check, no self-approval, separation-of-duties). Approvals are append-only and **bound to a decision fingerprint** (recipe id + binding-plan hash + rule-version + policy-context hash + catalog snapshot) so they can't be reused after anything changes.
+- **Approval → an append-only evaluation revision + deterministic rerank.** Never patch a persisted disposition/snapshot in place; produce a new projection tied to the approval event and re-rank the (now larger) eligible set.
 
-**Files:** Create `src/featuregen/overlay/upload/taxonomy/ranking.py`; Test `test_ranking.py`.
-
-**Interfaces — Produces:**
-- `@dataclass(frozen=True) class RankSignals: relevance_tier: str; explainability: str; binding_quality: str; pit_declared: bool; family: str; funnel_stage: str; modelling_context_match: bool`
-- `@dataclass(frozen=True) class RankedRecipe: recipe_id: str; canonical_rank: int; selected_for_initial_view: bool; rank_reasons: tuple[str,...]`
-- `def rank_eligible(evaluations: list[RecipeEvaluation], signals: dict[str, RankSignals], *, ranking_version: str, initial_view_size: int = 15, per_family_cap: int = 3) -> list[RankedRecipe]` — order the `ELIGIBLE` recipes by **tier** (primary→supporting), then explainability (H>M>L), then `modelling_context_match`, then binding quality, then a stable id tie-break; assign `canonical_rank` (1-based); run a **diversity pass** for `selected_for_initial_view` (at most `per_family_cap` from one family in the first `initial_view_size`; prefer covering distinct funnel stages; drop near-duplicates that differ only by a minor window param). No magic weights — pure ordered tiers + tie-breaks.
-
-- [ ] **Step 1: Failing test** — a primary-tier eligible recipe ranks above a supporting-tier one; within a tier a high-explainability recipe ranks above a low one; the diversity pass never puts >`per_family_cap` recipes of one family in the initial view and prefers distinct funnel stages; `rank_reasons` explains each (e.g. `("primary_match","high_explainability","covers balance-runoff stage")`); ranking is deterministic (same input → same order). Non-eligible recipes are NOT ranked.
-- [ ] **Step 2–4:** implement to green.
-- [ ] **Step 5: Gates + commit** `feat(2a): deterministic presentation-priority ranker (task 1)`.
-
-## Task 2: Wire ranking into the considered-set + keep the three layers separate
-
-**Files:** Modify `contract.py` (the scoped considered-set route) + a signals helper (from the grounded features' template metadata + disposition); Test `test_contract_ranked.py`.
-
-**Interfaces:** when `FEATUREGEN_INTENT_RANKING` is on and a scoped response exists, compute `RankSignals` per eligible recipe (relevance_tier from the disposition; explainability/family/funnel_stage from the `Template`; `modelling_context_match` from the confirmed modelling-context, Part B) and attach `ranking: [{recipe_id, canonical_rank, selected_for_initial_view, rank_reasons}]` + `ranking_version` to the response. Persist the three layers **separately**: `deterministic_rank` (this), the existing LLM `recommendation` (`SetRecommendation`), and the human Gate-#1 choice — never conflate them.
-
-- [ ] **Step 1: Failing test** — flag off → response has no `ranking` key (Phase-1B-identical); flag on → `ranking` orders the eligible recipes, `selected_for_initial_view` respects the family cap, and the LLM `recommendation` is still present and distinct from `deterministic_rank`.
-- [ ] **Step 2–4:** implement to green (full suite for neutrality).
-- [ ] **Step 5: Gates + commit** `feat(2a): rank the eligible set in considered-set (task 2)`.
-
-## Task 3: (UI) ranked order + recommended set + rank explanation
-
-**Files:** Modify `frontend/src/api.ts`, `WorkbenchScreen.tsx`; Test `WorkbenchScreen.test.tsx`.
-
-- [ ] Behind `VITE_INTENT_RANKING`: render the eligible recipes in `canonical_rank` order, show the "initial view" (the `selected_for_initial_view` set) with a "show all" expander, a small "why ranked here" popover from `rank_reasons`, and the LLM "recommended starting set" as a SEPARATE labelled band. Flag off → unordered as Phase 1B. Tests: order rendered; recommended band distinct; flag-off unchanged. Gates: typecheck/vitest/lint. Commit `feat(2a): ranked order + recommended set UI (task 3)`.
+**Reproducibility**
+- Pin `ranking_version` + `policy_bundle_version_id` on the run **before** evaluating (not "evaluate active, then record"). Persist per-policy-decision fingerprints (context/binding/concept-set hashes) for exact replay.
 
 ---
 
-# Part B — The two deferred dimensions
+# Phase 2A — Deterministic presentation priority (ranking)
 
-## Task 4: Multi-dimension recognition (modelling_context + target_entity)
+## Task A1: Controlled ranking metadata (journey-stage + semantic-group)
+**Files:** `src/featuregen/overlay/upload/taxonomy/journey_stages.py` (new); tests.
+- A per-family **controlled journey-stage vocabulary** mapping each template's existing free-form `stage` string → a controlled `journey_stage_id` under a `journey_model_id` (churn: engagement_decline/unbundling/primacy_loss/attrition; credit: early_stress/deterioration/delinquency/default; …). A `semantic_group` for near-duplicate detection: for parameter variants this is **just the recipe's `template_id`** (free — variants of `balance_trend` share it); a cross-recipe `semantic_group` tag is optional and left for later.
+- **Test:** every template's `stage` resolves to a controlled journey stage; variants group by `template_id`.
+- Commit `feat(2a): controlled journey-stage + semantic-group metadata (task A1)`.
 
-**Files:** Modify `taxonomy/recognition.py` (contract + validator), `recognizer.py` (+ prompt), `enrich_llm.py` (schema), `scope_records.py` (persist); Test extends `test_recognition_contract.py`, `test_recognizer.py`.
+## Task A2: Deterministic ranker
+**Files:** `taxonomy/ranking.py` (new); tests.
+- `class RankReasonCode(StrEnum)`; `RankSignals{relevance_tier, explainability, binding_quality, pit_declared, family, journey_stage_id, semantic_group, modelling_context_match}`; `RankedRecipe{recipe_id, canonical_rank, selected_for_initial_view, rank_reasons: tuple[RankReasonCode,...]}`.
+- `rank_eligible(eligible: list[RecipeEvaluation], signals, *, ranking_version, initial_view_size=15, per_family_cap=3) -> list[RankedRecipe]`: order by **relevance_tier → modelling_context_match → binding_quality → pit_declared → explainability → stable id**; assign 1-based `canonical_rank`. A SEPARATE diversity pass sets `selected_for_initial_view` (≤ `per_family_cap` per family in the first `initial_view_size`; prefer distinct `journey_stage_id`s; one initial-view representative per `semantic_group`) — **it never changes `canonical_rank`**. Only `ELIGIBLE` recipes are ranked.
+- **Test:** the ordering invariants (incl. binding-quality above explainability; `pit_declared` used); canonical rank immutable under diversity (a capped-out family recipe keeps its canonical rank); one initial-view rep per semantic_group with all variants retained in the full list; reasons are codes; deterministic; non-eligible unranked.
+- Commit `feat(2a): deterministic presentation-priority ranker (task A2)`.
 
-**Interfaces:** extend `RecognitionResult` with `modelling_contexts: tuple[str,...]` and `target_entity: str | None`; the recognizer prompt + JSON schema gain those closed dimensions (validated against `dimensions.MODELLING_CONTEXTS` and the entity vocabulary); the recognition attempt persists them (add columns to migration — a new `0975` migration). One LLM call, still fail-open, still redacted-input-only.
+## Task A3: Wire ranking into considered-set (over the final eligible set)
+**Files:** `api/routes/contract.py` + a signals helper; tests.
+- Behind `FEATUREGEN_INTENT_RANKING`: after dispositions, build `RankSignals` per `ELIGIBLE` recipe (tier from disposition; explainability/binding_quality/pit/family/journey_stage from the Template; `modelling_context_match` = false in 2A, enriched in 2B), `rank_eligible`, attach `ranking` + `ranking_version` (pinned before ranking). Keep the **three layers separate**: `deterministic_rank` (this), the LLM `recommendation`, the human choice.
+- **Test:** flag off → no `ranking` key (Phase-1B-identical); on → eligible ordered, initial-view respects the cap, LLM recommendation still present + distinct.
+- Commit `feat(2a): rank the eligible set in considered-set (task A3)`.
 
-- [ ] **Step 1: Failing test** — a body naming an IFRS9 framing → `modelling_contexts` contains `"ifrs9"`; a customer-vs-account framing → `target_entity` set; unknown context/entity → validation rejects (fail-open to unscoped for those dims); the recognition attempt row stores both. Backward-compat: a body without them still validates.
-- [ ] **Step 2–4:** implement to green.
-- [ ] **Step 5: Gates + commit** `feat(2b-dim): multi-dimension recognition (task 4)`.
-
-## Task 5: Wire target_entity (hard reject) + modelling_context (rank boost)
-
-**Files:** Modify `taxonomy/applicability.py` (entity incompatibility), pass `modelling_contexts` into the Task-1 `RankSignals`; Test extends `test_applicability.py`.
-
-**Interfaces:** `applicability_result(scope, *, target_entity=None)` — when `target_entity` is set, a recipe whose grain/entity is **incompatible** with it (a recipe that can only be built at a different, non-joinable entity) is forced `out_of_scope` with reason `("entity_incompatible",)` — a HARD reject, distinct from "no use-case match". `modelling_context_match` in `RankSignals` is true when a recipe declares a `required_modelling_context` (or `use_cases` framework tag) matching a confirmed context → a rank boost (Task 1), never a hard filter.
-
-- [ ] **Step 1: Failing test** — a scope with `target_entity="account"` forces a customer-only recipe `out_of_scope` with the `entity_incompatible` reason; with `target_entity=None` nothing changes (backward-compat); a recipe matching a confirmed `modelling_context` gets `modelling_context_match=True` and ranks above an equal-tier non-matching one (Task 1 consumes it). Entity reject is NOT applied under `unscoped` (fail-open).
-- [ ] **Step 2–4:** implement to green.
-- [ ] **Step 5: Gates + commit** `feat(2b-dim): entity hard-reject + modelling-context boost (task 5)`.
+## Task A4: (UI) ranked order + recommended band + reasons
+**Files:** `frontend/src/api.ts`, `WorkbenchScreen.tsx`, test.
+- Behind `VITE_INTENT_RANKING`: render eligible recipes in `canonical_rank` order; show the initial-view set + "show all"; a "why here" popover mapping `RankReasonCode`→text; the LLM "recommended starting set" as a separate labelled band. Flag off → unchanged.
+- Gates: typecheck/vitest/lint. Commit `feat(2a): ranked order + recommended set UI (task A4)`.
 
 ---
 
-# Part C — Contextual policy (one ratified rule end-to-end)
+# Phase 2B — Confirmed multi-dimensional intent
 
-## Task 6: PolicyContext + ratified policy-bundle model
+## Task B1: Multi-dimension recognition
+**Files:** `taxonomy/recognition.py`, `recognizer.py` (+prompt), `enrich_llm.py` (schema), migration `0975` (attempt columns), `scope_records.py`; tests.
+- Extend `RecognitionResult` with `modelling_contexts: tuple[str,...]` + `target_entity: str | None`; recognizer prompt + JSON schema gain both closed dimensions (validated vs `dimensions.MODELLING_CONTEXTS` + the entity vocabulary); one LLM call, fail-open, redacted-input-only; persist both on the recognition attempt.
+- **Test:** an IFRS9 framing → `modelling_contexts` has `ifrs9`; entity framing → `target_entity`; unknown value rejected (that dim fails open); a body without them still validates.
+- Commit `feat(2b): multi-dimension recognition (task B1)`.
 
-**Files:** Create `src/featuregen/db/migrations/0976_policy_bundles.sql`, `src/featuregen/overlay/upload/policy/bundles.py`; Test `test_policy_bundles.py`.
+## Task B2: Confirmed-scope carries the dimensions (human-confirmed)
+**Files:** `taxonomy/applicability.py` (`ConfirmedScope` +fields), migration `0976` (`confirmed_generation_scope` + `confirmed_scope_dimension` child), `scope_records.py`; tests.
+- `ConfirmedScope` gains `modelling_contexts: tuple[str,...]` + `target_entity: str | None`. Persist confirmed dimensions (a normalized `confirmed_scope_dimension` child with `origin` `llm_proposed`/`user_added`/`user_overridden`) — proposed-vs-confirmed retained via `recognition_id`. `scope_for_run` rebuilds them.
+- **Test:** round-trip a scope with a confirmed modelling-context + target-entity + origins; proposed-vs-confirmed delta derivable.
+- Commit `feat(2b): confirmed-scope dimensions + persistence (task B2)`.
 
-**Interfaces — Produces:**
-- `@dataclass PolicyContext: use_cases: tuple[str,...]; modelling_contexts: tuple[str,...]; jurisdictions: tuple[str,...]; decision_purpose: str | None` (+ reserved-but-empty legal_entity/product/lifecycle/automation_level).
-- DB: `policy_rule` (rule_id, bundle_id, predicate jsonb, action, reason_code, message, status, effective_from, review_date, references, version) and `policy_ratification` (append-only: rule_id, ratified_by, ratified_at, authority) — a rule only EVALUATES when it has a ratification row and `status='active'`. WORM grants per 0971.
-- `def active_rules(conn, bundle_version) -> list[PolicyRule]` — only ratified + active + effective rules.
-- `def draft_rule(...)` (LLM-proposed candidate, status `draft`, NOT evaluated) vs `def ratify_rule(conn, rule_id, *, authority, ratified_by)` (writes the ratification → active).
+## Task B3: Soft entity (grain) signal + modelling-context rank boost
+**Files:** `taxonomy/applicability.py`, ranking signals; tests.
+- `class EntityCompatibility(StrEnum): EXACT; DERIVABLE; UNKNOWN` (NO `INCOMPATIBLE` in Phase 2). `entity_compatibility(recipe, target_entity) -> EntityCompatibility` using ONLY the recipe's declared grain vs the target (exact match → EXACT; a declared roll-up/derivable grain → DERIVABLE; otherwise UNKNOWN). It is a **grain signal, NOT applicability**: it never changes `by_recipe`/`out_of_scope`; instead it produces a `entity_grain_mismatch` warning reason and a rank nudge (EXACT ≥ DERIVABLE ≥ UNKNOWN as a tie-break BELOW relevance). `modelling_context_match` (recipe's framework tag ∈ confirmed contexts) feeds the Task-A2 ranker as a boost.
+- **Test:** a customer-only recipe under `target_entity="account"` stays IN scope (not out_of_scope) but carries `entity_grain_mismatch` + a lower rank nudge; `target_entity=None` → no effect; a modelling-context match ranks above an equal-tier non-match; NO recipe is hard-rejected on entity in Phase 2.
+- Commit `feat(2b): soft entity grain signal + modelling-context boost (task B3)`.
 
-- [ ] **Step 1: Failing test** — a `draft` rule is NOT returned by `active_rules`; after `ratify_rule` it is; the ratification is append-only + WORM-protected; a rule past `review_date`/before `effective_from` is excluded.
-- [ ] **Step 2–4:** implement to green.
-- [ ] **Step 5: Gates + commit** `feat(2b): PolicyContext + ratified policy-bundle model (task 6)`.
+## Task B4: (UI) confirm/override the dimensions at Gate #1
+**Files:** `api.ts`, `WorkbenchScreen.tsx`, test.
+- The confirm panel lets the user remove/add/replace a modelling-context, correct or **clear** the target-entity, and see which recipes carry a grain-mismatch warning. Confirmed dimensions flow into the scoped considered-set. Flag off → unchanged.
+- Gates: typecheck/vitest/lint. Commit `feat(2b): Gate #1 dimension confirmation UI (task B4)`.
 
-## Task 7: The policy evaluation stage
+---
 
-**Files:** Modify `taxonomy/disposition.py` (extend enum + a policy stage), create `policy/evaluate.py`; Test `test_policy_evaluate.py` + `test_disposition.py`.
+# Phase 2C — Contextual policy foundation, in SHADOW
 
-**Interfaces — Produces:**
-- Extend `FinalDisposition` with `POLICY_BLOCKED`, `POLICY_REVIEW_REQUIRED` (and represent `warn` as `ELIGIBLE` + a `policy_warning` reason code).
-- `def evaluate_policy(candidate_concepts: dict[str, frozenset[str]], context: PolicyContext, rules: list[PolicyRule], *, now) -> dict[str, PolicyDecision]` — per eligible recipe, match ratified rules whose predicate holds over `(the recipe's bound concepts' sensitivities, context)`; the STRONGEST action wins (`exclude` > `require_approval` > `require_justification` > `warn` > `allow`); returns `PolicyDecision{action, rule_id, bundle_version, approval_status}`.
-- Extend `evaluate_dispositions` to run policy AFTER safety, BEFORE the final ELIGIBLE: a `SAFETY_REJECTED`/`OUT_OF_SCOPE`/`UNBUILDABLE` recipe skips policy (`NOT_EVALUATED`); an otherwise-eligible recipe's `final_disposition` comes from the policy action mapping. **Additive-only:** a safety-rejected recipe is never rescued to eligible by policy.
+## Task C1: Closed predicate DSL + PolicyContext
+**Files:** `overlay/upload/policy/predicate.py`, `policy/context.py` (new); tests.
+- `PolicyContext{use_cases, modelling_contexts, jurisdictions, decision_purpose}` (+ reserved-empty legal_entity/product/lifecycle/automation_level) and `PolicyContextStatus{COMPLETE, NOT_REQUIRED, INCOMPLETE, CONFLICTING}` with `resolve_status(context, required_fields)`.
+- A **closed predicate DSL**: `{all|any|not: [...]}` of leaf `{field, operator, value}` over an ENUMERATED field set (`context.jurisdictions`, `context.decision_purpose`, `candidate.concept_sensitivities`, `candidate.concepts`, …) + operators (`eq,in,contains,intersects,exists,not_exists`). `validate_predicate(p)` (reject unknown field/operator/shape) + `evaluate_predicate(p, context, candidate) -> bool`. No executable/model code.
+- **Test:** the DSL evaluates the US+underwriting+proxy predicate correctly; `validate_predicate` rejects an unknown field/operator; `resolve_status` returns INCOMPLETE when jurisdiction/decision_purpose absent.
+- Commit `feat(2c): closed policy predicate DSL + PolicyContext (task C1)`.
 
-- [ ] **Step 1: Failing test** — a recipe binding a `proxy`-sensitivity concept under `(jurisdiction=US, decision_purpose=underwriting)` with the ratified proxy rule → `POLICY_REVIEW_REQUIRED`, stamping the rule id + bundle version + `approval_status='pending'`; the same recipe with NO ratified rule / different context → `ELIGIBLE`; an `exclude` rule → `POLICY_BLOCKED`; a safety-rejected recipe stays `SAFETY_REJECTED` (policy `NOT_EVALUATED`); a warn rule → `ELIGIBLE` + `policy_warning`; the original action is retained after an approval.
-- [ ] **Step 2–4:** implement to green.
-- [ ] **Step 5: Gates + commit** `feat(2b): contextual policy evaluation stage (task 7)`.
+## Task C2: Event-sourced policy model (rules, lifecycle, bundles)
+**Files:** migration `0977_policy_model.sql`, `policy/model.py`; tests.
+- Immutable `policy_rule_version` (rule_version_id, rule_id, bundle_id, predicate jsonb [DSL], action, reason_code, message, effective_from, **effective_until**, **review_due_at**, authored_by/at, version). Append-only `policy_rule_event` (event_id, rule_version_id, event_type ∈ drafted/submitted/ratified/activated/suspended/retired, actor, authority, occurred_at, reason). `policy_bundle_version` (bundle_version_id, bundle_id, version, effective_from/until). WORM grants per 0971.
+- `draft_rule(...)` → a `drafted` event (NOT active). `ratify_rule(conn, rule_version_id, *, authority, actor)` → a `ratified`+`activated` event. `active_rules(conn, bundle_version_id, *, now)` → rules whose DERIVED state is active AND `effective_from ≤ now < effective_until` — **past `review_due_at` still returns the rule** (enforcing) and flags it for a governance alert; never infers "latest bundle".
+- **Test:** a drafted rule is not active; after ratify it is; a rule past `review_due_at` (but before `effective_until`) is STILL active (with a review-overdue flag); a rule past `effective_until` is not; active-state is derived from events (no mutable status column).
+- Commit `feat(2c): event-sourced policy rule/bundle model (task C2)`.
 
-## Task 8: Proof rule end-to-end + approval flow (API)
+## Task C3: Policy evaluation (shadow — computes, does not change dispositions)
+**Files:** `policy/evaluate.py`; tests.
+- `PolicyDecision{matched_rules: tuple[MatchedRule,...], effective_action, effective_reason_codes, context_status, context_hash, binding_fingerprint, concept_set_hash, bundle_version_id}`; `MatchedRule{rule_version_id, bundle_version_id, action, reason_code, message}`.
+- `evaluate_policy(candidate_concepts_by_recipe, context, rules, *, now) -> dict[str, PolicyDecision]`: match ALL ratified rules whose predicate holds over `(candidate concept sensitivities, context)`; `effective_action` = strongest; **context asymmetry** — if `context_status == INCOMPLETE` AND the candidate binds a policy-relevant (sensitive/proxy) concept AND no rule already decides it → synthesize a `require_approval`-equivalent with reason `POLICY_CONTEXT_INCOMPLETE`; a non-sensitive candidate with incomplete context → `allow`. Fingerprints stamped.
+- **Test:** the proxy+US+underwriting recipe → strongest action `require_approval`, all matched rules retained; a recipe matching two rules keeps both, effective = strongest; incomplete-context + sensitive concept → `require_approval (POLICY_CONTEXT_INCOMPLETE)`; incomplete-context + non-sensitive → `allow`; fingerprints present.
+- Commit `feat(2c): policy evaluation + context asymmetry (task C3)`.
 
-**Files:** Modify `contract.py` (thread `PolicyContext` from the confirmed scope + the modelling-context/jurisdiction/decision-purpose; run policy in the scoped path; add an approval endpoint), a ratified proof-rule seed; Test `test_contract_policy.py`.
+## Task C4: Shadow run — persist + compare to expectations (no UX change)
+**Files:** `policy/shadow.py`, migration `0978_policy_shadow_decision.sql`; a policy-expectation fixture; tests.
+- In the scoped considered-set path, when a policy shadow flag is on, compute `evaluate_policy` and **persist the decisions** (append-only `policy_shadow_decision`, pinned bundle_version + fingerprints) — but DO NOT change dispositions or the response's user-visible fields. A `compare_to_expectations(decisions, expected)` helper + a compliance-review fixture (like the recognizer gold set) measures false-block / false-allow before enforcement.
+- **Test:** shadow decisions persisted with versions/fingerprints; the considered-set response is byte-identical to 2A/2B (no disposition change); the comparison flags a mismatch.
+- Commit `feat(2c): policy shadow persistence + expectation comparison (task C4)`.
 
-**Interfaces:** the scoped considered-set builds a `PolicyContext` (use-cases + modelling-contexts from the scope; jurisdiction + decision_purpose from the request/project config) and, when `FEATUREGEN_INTENT_CONTEXTUAL_POLICY` is on, runs `evaluate_policy` → the dispositions carry the policy outcome + `in_scope_count`/counts by disposition. `POST /contract/policy/approve` (body: generation_run_id, recipe_id, justification) records an approval (append-only) → the recipe's disposition flips `POLICY_REVIEW_REQUIRED`→`ELIGIBLE` while the stage retains `action=require_approval, approval_status=approved`. Seed ONE ratified proof rule (`fair_lending_us_v1`: US + underwriting + proxy-sensitivity → `require_approval`).
+---
 
-- [ ] **Step 1: Failing test** — flag off → no policy in the response (Phase-1B/2A-identical); flag on + the proof rule ratified + a US-underwriting context + a proxy-binding recipe → that recipe is `policy_review_required` in the dispositions with the rule id; `POST /contract/policy/approve` → it becomes `eligible` (action retained); a run without the context → all `eligible`.
-- [ ] **Step 2–4:** implement to green (full suite for neutrality).
-- [ ] **Step 5: Gates + commit** `feat(2b): policy proof rule + approval endpoint (task 8)`.
+# Phase 2D — Policy enforcement + governed approval
 
-## Task 9: (UI) policy dispositions + approval + minimal ratification surface
+## Task D1: Fold policy into the disposition pipeline (after safety, before rank)
+**Files:** `taxonomy/disposition.py` (+enum), `api/routes/contract.py`; tests.
+- Extend `FinalDisposition` with `POLICY_BLOCKED`, `POLICY_REVIEW_REQUIRED` (`warn` → `ELIGIBLE` + a `policy_warning` reason). Behind `FEATUREGEN_INTENT_CONTEXTUAL_POLICY`: run `evaluate_policy` AFTER safety, map action→disposition; **additive-only** (a `SAFETY_REJECTED`/`OUT_OF_SCOPE`/`UNBUILDABLE` recipe skips policy → `NOT_EVALUATED`). Pin `policy_bundle_version_id` on the run BEFORE evaluating. **Ranking (2A) now runs over the POST-policy eligible set** — blocked/review-required recipes get NO canonical rank.
+- **Test:** flag off → 2A/2B-identical; on + ratified proxy rule + US-underwriting context → the proxy recipe `POLICY_REVIEW_REQUIRED` (with rule id + bundle version) and NOT ranked; an `exclude` rule → `POLICY_BLOCKED`, unranked; safety-rejected stays safety-rejected; incomplete-context asymmetry enforced.
+- Commit `feat(2d): policy enforcement in the disposition pipeline (task D1)`.
 
-**Files:** Modify `api.ts`, `WorkbenchScreen.tsx` (+ optionally a small admin view); Test `WorkbenchScreen.test.tsx`.
+## Task D2: Justify + authorized approve (append-only revision + rerank)
+**Files:** `api/routes/contract.py`, migration `0979_policy_approval.sql`, `policy/approval.py`; tests.
+- `POST /contract/policy/justify` (author supplies a justification for `require_justification`) — append-only. `POST /contract/policy/approvals` (an **authorized** actor for `require_approval`): checks role/authority for the rule, **no self-approval**, separation-of-duties; records an append-only `policy_approval{approval_id, generation_run_id, recipe_id, rule_version_id, decision_fingerprint, requested_by, decided_by, decision, rationale, decided_at}` bound to the **decision fingerprint** (recipe+binding+rule-version+context+snapshot). An approval whose fingerprint no longer matches the current decision is rejected (stale).
+- Approval → an **append-only evaluation revision** (a new projection referencing the approval; the original decision + snapshot are NOT mutated); the eligible set is **re-ranked deterministically** (the approved recipe enters, canonical ranks/initial-view recompute). The stage retains `action=require_approval, approval_status=approved`.
+- **Test:** the author cannot self-approve (403); an authorized approver flips the recipe to `ELIGIBLE` via a NEW revision (original snapshot intact) and the eligible set re-ranks; a stale-fingerprint approval is rejected; the retained action is visible.
+- Commit `feat(2d): justify + authorized approval, append-only revision + rerank (task D2)`.
 
-- [ ] Behind `VITE_INTENT_POLICY`: the disposition lens gains *Blocked by policy* and *Needs approval* groups (each with the rule message + reason), an **approve** action (calls `/contract/policy/approve` with a justification) that moves the recipe to eligible, and a policy-warning badge on warned recipes. Flag off → no policy groups. (Ratification itself is an admin/governance action — a minimal read-only "active policy rules" panel is enough for the proof.) Tests: review-required renders + approve flips it; flag-off unchanged. Gates: typecheck/vitest/lint. Commit `feat(2b): policy dispositions + approval UI (task 9)`.
+## Task D3: (UI) policy dispositions + role-aware approval
+**Files:** `api.ts`, `WorkbenchScreen.tsx` (+ read-only rules panel), test.
+- Behind `VITE_INTENT_POLICY`: the lens gains *Blocked by policy* and *Needs approval* groups (rule message + reason); the author sees **Request approval / Justify**, an actor with authority sees **Approve / Reject** (role-gated render); a policy-warning badge on warned recipes; a read-only "active policy rules" panel (human-readable + normalized predicate). Approval renders the new reranked revision. Flag off → no policy groups.
+- Gates: typecheck/vitest/lint. Commit `feat(2d): policy dispositions + role-aware approval UI (task D3)`.
 
 ---
 
 ## Self-review
-- **Ranking:** presentation-priority only (Task 1 asserts non-eligible are unranked; tiers + tie-breaks, no magic weights); three layers persisted separately (Task 2).
-- **Dimensions:** one recognizer call (Task 4); `target_entity` is a hard reject, `modelling_context` a soft boost (Task 5); both fail-open under `unscoped`.
-- **Policy:** ratified-before-enforced (Task 6); additive-only over universal safety, deterministic action→disposition, original action retained after approval (Task 7); ONE proof rule end-to-end (Task 8).
-- **Neutrality/fail-open/immutability** hold; all four flags default off; the no-scope and flag-off paths stay Phase-1B-identical.
-- **Deferred to Phase 3 (stated, not built):** cross-catalog grounding + the richer recipe `needs` contract.
+- **Sequencing/shadow:** 2A→2B→2C(shadow)→2D(enforce) — policy is measured against compliance expectations before it blocks anything (shadow-before-enforce), matching recognition's discipline.
+- **Ranking:** presentation-priority only; canonical rank immutable under diversity; runs after policy over the eligible set; structured reason codes; binding-quality/PIT ordered above explainability; `pit_declared` used.
+- **Dimensions:** recognizer proposes, human confirms (scope + persistence + UI); `target_entity` is SOFT (grain warning + rank nudge, never out_of_scope); hard entity reject deferred to Phase 3.
+- **Policy:** context-incomplete never = unrestricted (sensitive-concept trigger); additive-only over safety; ratified-before-enforced with draft templates (never shipped ratified); event-sourced immutable rule/bundle versions with derived state; closed predicate DSL; all matched rules retained; `review_due_at` ≠ `effective_until`; justify ≠ authorized approve; approvals fingerprint-bound + append-only revision + rerank; versions pinned before evaluation + fingerprints persisted for replay.
+- **Deferred to Phase 3 (stated, not built):** cross-catalog grounding, the richer recipe `needs` contract, and the hard `INCOMPATIBLE` entity reject.
