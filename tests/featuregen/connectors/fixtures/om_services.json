@@ -1,0 +1,26 @@
+{
+  "data": [
+    {
+      "id": "svc-0001-mysql",
+      "name": "mysql_prod",
+      "serviceType": "Mysql",
+      "fullyQualifiedName": "mysql_prod",
+      "description": "Cards MySQL production"
+    },
+    {
+      "id": "svc-0002-snowflake",
+      "name": "snowflake_dwh",
+      "serviceType": "Snowflake",
+      "fullyQualifiedName": "snowflake_dwh",
+      "description": "Deposits Snowflake warehouse"
+    },
+    {
+      "id": "svc-0003-bigquery",
+      "name": "bq_marketing",
+      "serviceType": "BigQuery",
+      "fullyQualifiedName": "bq_marketing",
+      "description": "Marketing BigQuery"
+    }
+  ],
+  "paging": {"total": 3}
+}

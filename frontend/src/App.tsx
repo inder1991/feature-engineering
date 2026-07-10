@@ -2,6 +2,7 @@ import type { ReactElement } from 'react'
 import { useHashRoute } from './nav'
 import type { Route } from './nav'
 import { SessionBar } from './SessionBar'
+import { IntegrationsScreen } from './screens/IntegrationsScreen'
 import { OverviewScreen } from './screens/OverviewScreen'
 import { RegistryScreen } from './screens/RegistryScreen'
 import { ReviewQueueScreen } from './screens/ReviewQueueScreen'
@@ -91,6 +92,15 @@ const ICONS: Record<Route, ReactElement> = {
       <rect x="9.25" y="9.25" width="4" height="4" rx="0.75" />
     </NavIcon>
   ),
+  integrations: (
+    // Linked nodes: one instance (top) linking out to its services (below). A connection graph.
+    <NavIcon>
+      <circle cx="8" cy="3.75" r="1.75" />
+      <circle cx="3.75" cy="12.25" r="1.75" />
+      <circle cx="12.25" cy="12.25" r="1.75" />
+      <path d="M6.9 5.15 4.6 10.6M9.1 5.15l2.3 5.45M5.5 12.25h5" />
+    </NavIcon>
+  ),
 }
 
 const PAGES: { route: Route; label: string; eyebrow: string; title: string; description: string }[] = [
@@ -124,11 +134,21 @@ const PAGES: { route: Route; label: string; eyebrow: string; title: string; desc
     description: 'Find columns you can trust',
   },
   {
+    // The route stays 'upload' (#/upload unchanged — deep links keep working); only the words
+    // change: the screen now holds two peer ingest paths (file upload + OpenMetadata connector).
     route: 'upload',
-    label: 'Upload',
-    eyebrow: 'CATALOG · UPLOAD',
-    title: 'Upload',
-    description: 'Bring a schema and facts file into the catalog',
+    label: 'Ingest',
+    eyebrow: 'CATALOG · INGEST',
+    title: 'Ingest',
+    description: 'Bring data maps into the catalog: upload a file, or pull from a configured sync.',
+  },
+  {
+    route: 'integrations',
+    label: 'Integrations',
+    eyebrow: 'CATALOG · INTEGRATIONS',
+    title: 'Integrations',
+    description:
+      'Metadata services FeatureGen connects to. An integration is one OpenMetadata instance; under it, each service you sync maps to a catalog source.',
   },
   {
     route: 'review',
@@ -183,7 +203,13 @@ export default function App() {
           <p>{page.description}</p>
         </header>
         {route === 'overview' && <OverviewScreen navigate={navigate} />}
-        {route === 'upload' && <UploadScreen onReviewQueue={openReview} />}
+        {route === 'upload' && (
+          <UploadScreen
+            onReviewQueue={openReview}
+            onManageIntegrations={() => navigate('integrations')}
+          />
+        )}
+        {route === 'integrations' && <IntegrationsScreen />}
         {route === 'search' && <SearchScreen />}
         {route === 'registry' && (
           <RegistryScreen featureId={params.get('id')} navigate={navigate} />
