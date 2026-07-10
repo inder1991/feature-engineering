@@ -36,11 +36,11 @@ def test_search_finds_by_name_and_definition(db):
     _ingest(db, now)
 
     # 'balance' matches the column name.
-    hits = search(db, "balance", now=now)
+    hits = search(db, "balance", now=now).hits
     assert any(h.object_ref == "public.accounts.balance" for h in hits)
 
     # 'customer' matches only the definition of balance.
-    hits2 = search(db, "customer", now=now)
+    hits2 = search(db, "customer", now=now).hits
     assert any(h.column == "balance" for h in hits2)
 
 
@@ -48,7 +48,7 @@ def test_grain_column_outranks_plain_on_name(db):
     _seal()
     now = datetime(2026, 7, 5, tzinfo=UTC)
     _ingest(db, now)
-    hits = search(db, "id", now=now)
+    hits = search(db, "id", now=now).hits
     assert hits and hits[0].object_ref == "public.accounts.id"
     assert hits[0].is_grain is True
 
@@ -59,7 +59,7 @@ def test_stale_source_excluded(db):
     _ingest(db, now)
     # Query far in the future -> the source's watermark is older than the 24h SLA -> excluded.
     later = now + timedelta(days=3)
-    assert search(db, "balance", now=later) == []
+    assert search(db, "balance", now=later).hits == []
 
 
 def test_search_uses_llm_concept(db):
@@ -75,7 +75,7 @@ def test_search_uses_llm_concept(db):
     assert ingest_upload(db, "deposits", rows, actor=_actor(), now=now,
                          client=client).status == "ingested"
     # 'monetary' finds the cryptic 'bal' column only via its LLM-assigned concept.
-    hits = search(db, "monetary", now=now)
+    hits = search(db, "monetary", now=now).hits
     assert any(h.column == "bal" for h in hits)
     assert next(h for h in hits if h.column == "bal").concept == "monetary_amount"
 
@@ -94,9 +94,9 @@ def test_search_uses_llm_domain_and_drafted_definition(db):
                          client=client).status == "ingested"
 
     # domain is searchable + surfaced on the hit
-    dom_hits = search(db, "deposits", now=now)
+    dom_hits = search(db, "deposits", now=now).hits
     bal = next((h for h in dom_hits if h.column == "bal"), None)
     assert bal is not None and bal.domain == "Deposits"
 
     # the drafted definition made 'ledger' find the otherwise-cryptic column
-    assert any(h.column == "bal" for h in search(db, "ledger", now=now))
+    assert any(h.column == "bal" for h in search(db, "ledger", now=now).hits)
