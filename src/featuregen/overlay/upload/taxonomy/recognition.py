@@ -24,6 +24,7 @@ from enum import StrEnum
 from typing import Any, Literal
 
 from featuregen.contracts import SchemaValidationError
+from featuregen.overlay.upload.taxonomy.dimensions import MODELLING_CONTEXTS, known_entities
 from featuregen.overlay.upload.taxonomy.use_cases import (
     USE_CASE_REGISTRY,
     selectable_leaves,
@@ -49,6 +50,13 @@ _CONFIDENCE_BANDS: frozenset[str] = frozenset({"high", "medium", "low"})
 _MAX_PRIMARY = 1
 _MAX_SECONDARY = 2
 _MAX_CANDIDATES = 3
+
+# Per-dimension warning codes (Phase-2B). The optional intent dimensions (``modelling_context`` /
+# ``target_entity``) are validated PER-DIMENSION and NON-FATALLY: an invalid value is dropped/cleared
+# and one of these codes is stamped on the result's ``warnings`` — it NEVER invalidates a valid
+# use-case recognition (see ``normalize_dimensions``).
+UNKNOWN_MODELLING_CONTEXT = "UNKNOWN_MODELLING_CONTEXT"
+UNKNOWN_TARGET_ENTITY = "UNKNOWN_TARGET_ENTITY"
 
 
 class RecognitionStatus(StrEnum):
@@ -82,7 +90,12 @@ class UseCaseCandidate:
 @dataclass(frozen=True, slots=True)
 class RecognitionResult:
     """The immutable recognition outcome, stamped with the version quintet fields this phase owns
-    (taxonomy_version, recognizer_model_id, prompt_version)."""
+    (taxonomy_version, recognizer_model_id, prompt_version).
+
+    Phase-2B adds the two optional, human-confirmable intent DIMENSIONS the recognizer PROPOSES —
+    ``modelling_contexts`` (0+ regulatory framework/regime ids) and a single soft ``target_entity``
+    (the prediction grain) — plus non-fatal per-dimension ``warnings``. They default empty so a
+    dimension-free recognition (and every Phase-1 caller) is unchanged."""
 
     status: RecognitionStatus
     candidates: tuple[UseCaseCandidate, ...]
@@ -92,6 +105,9 @@ class RecognitionResult:
     prompt_version: str
     applicability_mapping_version: str = APPLICABILITY_MAPPING_VERSION
     recipe_registry_version: str = RECIPE_REGISTRY_VERSION
+    modelling_contexts: tuple[str, ...] = ()
+    target_entity: str | None = None
+    warnings: tuple[str, ...] = ()
 
 
 def _validate_candidate(candidate: Any, index: int) -> str:
@@ -192,6 +208,48 @@ def validate_recognition_output(output: Mapping[str, Any]) -> None:
     if status == RecognitionStatus.CLASSIFIED.value and n_primary != _MAX_PRIMARY:
         raise SchemaValidationError(
             f"recognition status 'classified' requires exactly one primary candidate, got {n_primary}")
+
+
+def normalize_dimensions(
+    output: Mapping[str, Any],
+) -> tuple[tuple[str, ...], str | None, tuple[str, ...]]:
+    """Validate the OPTIONAL recognition dimensions PER-DIMENSION and NON-FATALLY, returning the cleaned
+    ``(modelling_contexts, target_entity, warnings)``.
+
+    Unlike :func:`validate_recognition_output` — which fails the WHOLE recognition on a malformed core
+    (status/candidates) or an invalid primary use-case — a bad dimension NEVER fails the recognition:
+
+    * drops any ``modelling_context`` outside :data:`MODELLING_CONTEXTS` (warns ``UNKNOWN_MODELLING_CONTEXT``),
+      keeping every valid one in order (deduplicated);
+    * clears a ``target_entity`` outside :func:`known_entities` (warns ``UNKNOWN_TARGET_ENTITY``); an
+      absent/``null`` ``target_entity`` is clean — the model simply proposed no grain (no warning).
+
+    A drift so gross the value is not even the declared JSON type (e.g. a non-list ``modelling_contexts``)
+    is treated as an unknown value and dropped with a warning — the whole recognition still survives."""
+    warnings: list[str] = []
+
+    raw_contexts = output.get("modelling_contexts")
+    contexts: list[str] = []
+    if isinstance(raw_contexts, (list, tuple)):
+        for value in raw_contexts:
+            if isinstance(value, str) and value in MODELLING_CONTEXTS:
+                if value not in contexts:          # dedupe, preserving first-seen order
+                    contexts.append(value)
+            elif UNKNOWN_MODELLING_CONTEXT not in warnings:
+                warnings.append(UNKNOWN_MODELLING_CONTEXT)
+    elif raw_contexts:                             # a present-but-non-list value is itself a drift
+        warnings.append(UNKNOWN_MODELLING_CONTEXT)
+
+    raw_entity = output.get("target_entity")
+    target_entity: str | None = None
+    if isinstance(raw_entity, str) and raw_entity:
+        if raw_entity in known_entities():
+            target_entity = raw_entity
+        else:
+            warnings.append(UNKNOWN_TARGET_ENTITY)
+    # A None/absent target_entity (no proposed grain) is clean — no warning.
+
+    return tuple(contexts), target_entity, tuple(warnings)
 
 
 def unscoped_result(

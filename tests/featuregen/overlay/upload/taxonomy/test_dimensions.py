@@ -12,6 +12,7 @@ from featuregen.overlay.upload.taxonomy.dimensions import (
     PRODUCT_CONTEXTS,
     TYPOLOGIES,
     is_known,
+    known_entities,
 )
 
 
@@ -54,3 +55,17 @@ def test_vocabularies_are_pairwise_disjoint():
 def test_no_dimension_is_empty():
     for name, members in DIMENSIONS.items():
         assert members, name
+
+
+# ── the closed target-entity vocabulary (sourced from Concept.entity_link) ────────────────────────
+def test_known_entities_is_the_entity_link_vocabulary():
+    entities = known_entities()
+    # The prediction-grain vocabulary the recognizer's target_entity is validated against.
+    assert "customer" in entities
+    assert "account" in entities
+    # A representative sample of other entity_link grains is present.
+    assert {"transaction", "facility", "merchant", "counterparty", "instrument", "policy",
+            "claim", "household", "obligor"} <= entities
+    # It is a CLOSED vocabulary of entities — a non-identifier concept name is never an entity.
+    assert "monetary_flow" not in entities
+    assert "ifrs9" not in entities

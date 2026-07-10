@@ -117,3 +117,76 @@ def test_prompt_lists_selectable_ids_not_financial_crime() -> None:
     assert "credit.early_warning" in prompt
     # financial_crime is the non-selectable domain parent — never offered as a selectable choice.
     assert "financial_crime" not in prompt
+
+
+def test_prompt_enumerates_dimension_vocabularies() -> None:
+    prompt = build_recognition_prompt()
+    # The model is asked to ALSO return the two optional dimensions, from their closed lists.
+    assert "modelling_contexts" in prompt
+    assert "target_entity" in prompt
+    assert "ifrs9" in prompt        # a modelling-context regime is enumerated
+    assert "customer" in prompt     # a target-entity grain is enumerated
+
+
+# ── per-dimension failure semantics through the full fail-open recognizer ─────────────────────────
+def test_valid_dimensions_are_stamped_on_the_result(db) -> None:
+    output = {
+        "status": "classified",
+        "candidates": [_candidate(CHURN, relationship="primary")],
+        "ambiguity_note": None,
+        "modelling_contexts": ["ifrs9"],
+        "target_entity": "customer",
+    }
+    result = recognize(db, _fake(output), redacted_hypothesis="ifrs9 ecl per customer")
+    assert result.status is RecognitionStatus.CLASSIFIED
+    assert result.modelling_contexts == ("ifrs9",)
+    assert result.target_entity == "customer"
+    assert result.warnings == ()
+
+
+def test_invalid_modelling_context_does_not_invalidate_use_case(db) -> None:
+    # THE core guarantee: an invalid OPTIONAL dimension never invalidates a valid use-case recognition.
+    output = {
+        "status": "classified",
+        "candidates": [_candidate(CHURN, relationship="primary")],
+        "ambiguity_note": None,
+        "modelling_contexts": ["invented"],
+        "target_entity": "customer",
+    }
+    result = recognize(db, _fake(output), redacted_hypothesis="will they churn?")
+    assert result.status is RecognitionStatus.CLASSIFIED
+    assert [c.use_case_id for c in result.candidates if c.relationship == "primary"] == [CHURN]
+    assert result.modelling_contexts == ()                    # the invalid context is dropped
+    assert "UNKNOWN_MODELLING_CONTEXT" in result.warnings
+    assert result.target_entity == "customer"                 # the valid entity is untouched
+
+
+def test_invalid_target_entity_cleared_use_case_preserved(db) -> None:
+    output = {
+        "status": "classified",
+        "candidates": [_candidate(CHURN, relationship="primary")],
+        "ambiguity_note": None,
+        "modelling_contexts": ["ifrs9"],
+        "target_entity": "not_an_entity",
+    }
+    result = recognize(db, _fake(output), redacted_hypothesis="will they churn?")
+    assert result.status is RecognitionStatus.CLASSIFIED
+    assert result.modelling_contexts == ("ifrs9",)            # the valid context is untouched
+    assert result.target_entity is None                       # the invalid entity is cleared
+    assert "UNKNOWN_TARGET_ENTITY" in result.warnings
+
+
+def test_invalid_primary_still_fails_even_with_valid_dimensions(db) -> None:
+    # A valid optional dimension does NOT rescue an INVALID primary use-case — the whole recognition
+    # is unscoped, carrying no confirmed dimensions.
+    output = {
+        "status": "classified",
+        "candidates": [_candidate("customer.not_a_real_leaf", relationship="primary")],
+        "modelling_contexts": ["ifrs9"],
+        "target_entity": "customer",
+    }
+    result = recognize(db, _fake(output), redacted_hypothesis="unmapped and vague")
+    assert result.status in (RecognitionStatus.TECHNICAL_FAILURE, RecognitionStatus.UNSCOPED)
+    assert result.candidates == ()
+    assert result.modelling_contexts == ()
+    assert result.target_entity is None

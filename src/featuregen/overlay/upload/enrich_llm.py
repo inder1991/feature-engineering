@@ -112,6 +112,11 @@ _SCHEMAS: dict[tuple[str, int], dict] = {
                     "rationale": {"type": "string"}},
                 "required": ["use_case_id", "relationship", "confidence", "evidence_spans",
                              "rationale"]}},
+            # Phase-2B optional intent dimensions. STRUCTURAL only (array-of-string / string|null) —
+            # the closed-vocabulary semantics are a per-dimension, non-fatal post-pass
+            # (recognition.normalize_dimensions), so a value outside the vocab never fails the call.
+            "modelling_contexts": {"type": "array", "items": {"type": "string"}},
+            "target_entity": {"type": ["string", "null"]},
             "ambiguity_note": {"type": ["string", "null"]}},
         "required": ["status", "candidates"]},
 }

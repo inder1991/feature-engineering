@@ -26,6 +26,8 @@ from __future__ import annotations
 
 from itertools import combinations
 
+from featuregen.overlay.upload.concepts import CONCEPT_REGISTRY
+
 # Regulatory framework / regime a model is built under (xva, lgd included per owner — §5).
 MODELLING_CONTEXTS: frozenset[str] = frozenset(
     {"ifrs9", "frtb", "xva", "lcr", "nsfr", "lgd", "irrbb", "ftp"})
@@ -90,3 +92,18 @@ def is_known(dimension: str, value: str) -> bool:
     """True iff ``value`` is a governed member of ``dimension``'s closed vocabulary. An unknown
     dimension resolves to the empty set, so it returns False rather than raising."""
     return value in DIMENSIONS.get(dimension, frozenset())
+
+
+# The closed TARGET-ENTITY vocabulary — the distinct entities an identifier concept LINKS
+# (``Concept.entity_link``: customer, account, facility, transaction, merchant, counterparty,
+# instrument, policy, claim, household, obligor, …). This is the closed set the recognizer's
+# soft ``target_entity`` (the prediction grain, Phase-2B) is validated against. Sourced from the
+# concept registry so the vocabulary can never drift from the entities the catalog can actually link.
+_KNOWN_ENTITIES: frozenset[str] = frozenset(
+    c.entity_link for c in CONCEPT_REGISTRY.values() if c.entity_link is not None)
+
+
+def known_entities() -> frozenset[str]:
+    """The closed target-entity vocabulary: every distinct non-``None`` ``Concept.entity_link`` in the
+    concept registry. A recognised ``target_entity`` outside this set is unknown (cleared, non-fatally)."""
+    return _KNOWN_ENTITIES

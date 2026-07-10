@@ -59,8 +59,9 @@ def record_recognition_attempt(
     result: RecognitionResult,
     actor: Any,
 ) -> str:
-    """Persist the recognizer's proposal for ``intent_id`` (append-only), stamping the version quintet
-    and the candidate PROPOSALS from ``result``. Idempotent on ``(intent_id, input_hash)``: a repeat
+    """Persist the recognizer's proposal for ``intent_id`` (append-only), stamping the version quintet,
+    the candidate PROPOSALS, and the optional intent DIMENSIONS (``modelling_contexts`` / ``target_entity``)
+    + per-dimension ``warnings`` from ``result``. Idempotent on ``(intent_id, input_hash)``: a repeat
     ``INSERT`` is a no-op and the EXISTING ``recognition_id`` is returned, so the same intent + redacted
     input always resolves to the same attempt (never a second row)."""
     recognition_id = mint_id("rcg")
@@ -69,12 +70,13 @@ def record_recognition_attempt(
         "INSERT INTO intent_recognition_attempt "
         "(recognition_id, intent_id, input_hash, status, candidates, ambiguity_note, "
         "taxonomy_version, applicability_mapping_version, recognizer_model_id, prompt_version, "
-        "recipe_registry_version, created_by) "
-        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
+        "recipe_registry_version, modelling_contexts, target_entity, warnings, created_by) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
         "ON CONFLICT (intent_id, input_hash) DO NOTHING",
         (recognition_id, intent_id, input_hash, result.status.value, Jsonb(candidates),
          result.ambiguity_note, result.taxonomy_version, result.applicability_mapping_version,
          result.recognizer_model_id, result.prompt_version, result.recipe_registry_version,
+         Jsonb(list(result.modelling_contexts)), result.target_entity, Jsonb(list(result.warnings)),
          Jsonb(_actor_dict(actor))))
     # Read back the governing id for this (intent, input) — the one just inserted, or the pre-existing
     # one when the INSERT hit ON CONFLICT DO NOTHING. Either way a repeat returns the SAME id.

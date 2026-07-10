@@ -77,6 +77,42 @@ def test_recognition_attempt_is_idempotent_and_stamps_quintet(db) -> None:
     assert created_by == {"subject": "ds1"}
 
 
+def test_recognition_attempt_round_trips_dimensions(db) -> None:
+    # The optional confirmed-intent dimensions (modelling_contexts / target_entity) + the per-dimension
+    # warnings persist verbatim on the attempt alongside the version quintet.
+    result = RecognitionResult(
+        status=RecognitionStatus.CLASSIFIED,
+        candidates=(UseCaseCandidate(use_case_id=PRIMARY, relationship="primary", confidence="high",
+                                     evidence_spans=("balance dropped",), rationale="churn signal"),),
+        ambiguity_note=None,
+        taxonomy_version="tax_v9", recognizer_model_id="model_v9", prompt_version="prompt_v9",
+        applicability_mapping_version="map_v9", recipe_registry_version="reg_v9",
+        modelling_contexts=("ifrs9", "frtb"),
+        target_entity="customer",
+        warnings=("UNKNOWN_TARGET_ENTITY",),
+    )
+    rid = record_recognition_attempt(
+        db, intent_id="intent_dim", input_hash="hash_dim", result=result, actor="ds1")
+
+    row = db.execute(
+        "SELECT modelling_contexts, target_entity, warnings FROM intent_recognition_attempt "
+        "WHERE recognition_id = %s", (rid,)).fetchone()
+    contexts, entity, warnings = row
+    assert contexts == ["ifrs9", "frtb"]
+    assert entity == "customer"
+    assert warnings == ["UNKNOWN_TARGET_ENTITY"]
+
+
+def test_recognition_attempt_defaults_empty_dimensions(db) -> None:
+    # A result with no confirmed dimensions persists the additive columns at their empty defaults.
+    rid = record_recognition_attempt(
+        db, intent_id="intent_nodim", input_hash="hash_nodim", result=_result(), actor="ds1")
+    row = db.execute(
+        "SELECT modelling_contexts, target_entity, warnings FROM intent_recognition_attempt "
+        "WHERE recognition_id = %s", (rid,)).fetchone()
+    assert row == ([], None, [])
+
+
 def test_confirmed_scope_writes_children_and_round_trips(db) -> None:
     rid = record_recognition_attempt(
         db, intent_id="intent_1", input_hash="hash_1", result=_result(), actor="ds1")

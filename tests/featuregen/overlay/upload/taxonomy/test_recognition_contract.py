@@ -14,7 +14,10 @@ import pytest
 from featuregen.contracts import SchemaValidationError
 from featuregen.overlay.upload.taxonomy.recognition import (
     TAXONOMY_VERSION,
+    UNKNOWN_MODELLING_CONTEXT,
+    UNKNOWN_TARGET_ENTITY,
     RecognitionStatus,
+    normalize_dimensions,
     unscoped_result,
     validate_recognition_output,
 )
@@ -147,3 +150,67 @@ def test_unscoped_result_technical_flag():
     result = unscoped_result("provider refused", model_id="m", prompt_version="1", technical=True)
     assert result.status is RecognitionStatus.TECHNICAL_FAILURE
     assert result.candidates == ()
+
+
+def test_recognition_result_dimension_defaults():
+    # A recognition carries no confirmed dimensions by default (they are optional, human-confirmed).
+    result = unscoped_result("x", model_id="m", prompt_version="1")
+    assert result.modelling_contexts == ()
+    assert result.target_entity is None
+    assert result.warnings == ()
+
+
+# ── per-dimension normalization (non-fatal: never fails the whole recognition) ────────────────────
+def test_normalize_dimensions_valid_values_preserved():
+    contexts, entity, warnings = normalize_dimensions(
+        {"modelling_contexts": ["ifrs9", "frtb"], "target_entity": "customer"})
+    assert contexts == ("ifrs9", "frtb")
+    assert entity == "customer"
+    assert warnings == ()
+
+
+def test_normalize_dimensions_drops_unknown_context_keeps_valid():
+    contexts, entity, warnings = normalize_dimensions(
+        {"modelling_contexts": ["ifrs9", "invented"], "target_entity": "customer"})
+    assert contexts == ("ifrs9",)                      # unknown dropped, valid kept
+    assert entity == "customer"                        # the OTHER dimension is untouched
+    assert UNKNOWN_MODELLING_CONTEXT in warnings
+
+
+def test_normalize_dimensions_clears_unknown_entity_keeps_context():
+    contexts, entity, warnings = normalize_dimensions(
+        {"modelling_contexts": ["ifrs9"], "target_entity": "not_an_entity"})
+    assert contexts == ("ifrs9",)                      # the OTHER dimension is untouched
+    assert entity is None                              # unknown entity cleared
+    assert UNKNOWN_TARGET_ENTITY in warnings
+
+
+def test_normalize_dimensions_absent_is_empty_no_warnings():
+    # Backward-compat: a body with NO dimensions normalizes to empties with no warnings.
+    contexts, entity, warnings = normalize_dimensions({"status": "classified"})
+    assert contexts == ()
+    assert entity is None
+    assert warnings == ()
+
+
+def test_normalize_dimensions_null_entity_is_not_a_warning():
+    # An explicit null target_entity (the model declined to pick a grain) is clean, not a warning.
+    contexts, entity, warnings = normalize_dimensions(
+        {"modelling_contexts": [], "target_entity": None})
+    assert contexts == ()
+    assert entity is None
+    assert warnings == ()
+
+
+def test_validate_output_is_structural_for_core_only_ignores_dimensions():
+    # An invalid OPTIONAL dimension NEVER fails the core structural validation (dimensions are
+    # validated per-dimension, non-fatally, elsewhere) — but an invalid PRIMARY still fails hard.
+    body = _classified([_candidate(CHURN, relationship="primary")])
+    body["modelling_contexts"] = ["invented"]
+    body["target_entity"] = "not_an_entity"
+    assert validate_recognition_output(body) is None   # core still valid despite bad dimensions
+
+    bad_primary = _classified([_candidate("customer.not_a_real_leaf")])
+    bad_primary["modelling_contexts"] = ["ifrs9"]      # a valid dim does not rescue an invalid primary
+    with pytest.raises(SchemaValidationError):
+        validate_recognition_output(bad_primary)

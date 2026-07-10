@@ -31,6 +31,7 @@ from featuregen.overlay.upload.taxonomy.recognition import (
     RecognitionResult,
     RecognitionStatus,
     UseCaseCandidate,
+    normalize_dimensions,
     unscoped_result,
     validate_recognition_output,
 )
@@ -52,7 +53,10 @@ _OUTPUT_SCHEMA_VERSION = 1
 def _result_from_output(output: Mapping[str, Any], *, model_id: str) -> RecognitionResult:
     """Map a validated recognition body to a ``RecognitionResult``. ``output`` has already passed
     ``validate_recognition_output`` (a valid enum ``status``; closed-taxonomy ids; banded
-    ``relationship``/``confidence``; the shape caps), so this mapping is total."""
+    ``relationship``/``confidence``; the shape caps), so the CORE mapping is total. The optional
+    DIMENSIONS are cleaned per-dimension (non-fatally) via ``normalize_dimensions`` — an invalid
+    ``modelling_context``/``target_entity`` is dropped/cleared and recorded in ``warnings``, and NEVER
+    invalidates the (already valid) use-case recognition."""
     status = RecognitionStatus(str(output["status"]))
     candidates = tuple(
         UseCaseCandidate(
@@ -64,6 +68,7 @@ def _result_from_output(output: Mapping[str, Any], *, model_id: str) -> Recognit
         )
         for candidate in (output.get("candidates") or ())
     )
+    modelling_contexts, target_entity, warnings = normalize_dimensions(output)
     return RecognitionResult(
         status=status,
         candidates=candidates,
@@ -71,6 +76,9 @@ def _result_from_output(output: Mapping[str, Any], *, model_id: str) -> Recognit
         taxonomy_version=TAXONOMY_VERSION,
         recognizer_model_id=model_id,
         prompt_version=PROMPT_VERSION,
+        modelling_contexts=modelling_contexts,
+        target_entity=target_entity,
+        warnings=warnings,
     )
 
 
