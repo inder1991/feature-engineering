@@ -338,6 +338,13 @@ export interface ConsideredSetResp {
   alternatives: FeatureSet[]
   recommendation: SetRecommendation | null
   rejections: Rejection[]
+  // Phase 1B — present ONLY on a scoped response (the caller sent a confirmed_scope). The run this
+  // considered set was minted under, the governing scope, how many recipes were in scope (from
+  // applicability, not recognition), and the per-recipe disposition lens.
+  generation_run_id?: string
+  scope_id?: string
+  in_scope_count?: number
+  dispositions?: RecipeDisposition[]
 }
 
 export interface ContractDraft {
@@ -379,14 +386,92 @@ export interface ContractDetail extends ContractSummary {
   intent_id: string | null
 }
 
+// ---- Phase 1B: scoped grounding (recognition → human confirmation → scoped considered set) ------
+// One recognised use-case the recognizer proposed for the objective. `relationship` is the
+// recognizer's role for it (the primary use-case vs a secondary one); `confidence` and the
+// `evidence_spans` (verbatim phrases from the hypothesis/objective) justify the proposal to the
+// human at Gate #1. Recognition NEVER sees catalog columns — this is use-case reasoning only.
+export interface RecognitionCandidate {
+  use_case_id: string
+  display_name: string
+  relationship: 'primary' | 'secondary'
+  confidence: 'high' | 'medium' | 'low'
+  evidence_spans: string[]
+}
+
+// POST /contract/recognitions result. `status` is the recognizer's verdict; `unscoped` (fail-open)
+// means it could not scope the objective, so generation should ground everything. Carries NO
+// generation_run_id and NO recipe count: recognition precedes generation, and applicability owns
+// any recipe count (computed later, on the considered-set call).
+export interface RecognitionResp {
+  intent_id: string
+  recognition_id: string
+  status: 'classified' | 'ambiguous' | 'unscoped' | 'technical_failure'
+  unscoped: boolean
+  candidates: RecognitionCandidate[]
+}
+
+// The human's confirmed Gate #1 scope, in the shape the UI holds it (camelCase). `primary` /
+// `secondary` are use-case ids; `expansion` maps the "include all sub-use-cases?" toggle
+// (exact ↔ include_descendants); `unscoped` true is a BROADEN (ground all buildable recipes);
+// `useCaseOrigins` records each confirmed use-case's provenance (llm_proposed / user_added) so the
+// proposed-vs-accepted delta stays queryable; `confirmationSource` names how it was confirmed.
+export interface ConfirmedScopeInput {
+  primary: string | null
+  secondary: string[]
+  expansion: 'exact' | 'include_descendants'
+  unscoped: boolean
+  useCaseOrigins: Record<string, string>
+  confirmationSource: string
+}
+
+// One stage evaluation on a recipe's disposition. `reason_codes` carry the WHY the UI renders;
+// `evaluation_version` / `evaluated_at` stamp the mapping/taxonomy version and server clock for
+// replay. An out-of-scope recipe leaves downstream stages NOT_EVALUATED (never a bare null).
+export interface DispositionStage {
+  status: string
+  reason_codes: string[]
+  evaluation_version?: string
+  evaluated_at?: string
+}
+
+// One recipe's final disposition, computed once from the ApplicabilityResult + grounding + safety.
+// The lens groups recipes by `final_disposition`; `relevance_tier` is the applicability role for an
+// eligible recipe (primary/supporting), null for a recipe that never reached grounding.
+export interface RecipeDisposition {
+  recipe_id: string
+  final_disposition: 'eligible' | 'unbuildable' | 'safety_rejected' | 'out_of_scope'
+  relevance_tier: 'primary' | 'supporting' | null
+  applicability: DispositionStage
+  grounding: DispositionStage
+  safety: DispositionStage
+}
+
+// Run the recognizer over the objective and persist an append-only attempt (no generation run yet).
+// Fail-open: the endpoint never returns 5xx; a recognizer failure comes back as status
+// 'technical_failure' with unscoped semantics, so the caller can still generate over everything.
+export function contractRecognitions(
+  hypothesis: string,
+  objective: string,
+): Promise<RecognitionResp> {
+  return post('/contract/recognitions', { hypothesis, objective })
+}
+
 // Gate #1 intake: mandatory hypothesis + objective; the server persists the intent and returns the
 // gauntlet-validated considered set (anchor + generated alternatives + an advisory recommendation).
+// Phase 1B: when `confirmedScope` is supplied (the human confirmed/broadened the recognised scope),
+// the server ALSO mints a generation run, persists the scope, grounds only the in-scope recipe
+// subset, and attaches per-recipe `dispositions` + an `in_scope_count`. When it is absent, this is
+// byte-identical to today's one-shot generate.
 export function contractConsideredSet(
   hypothesis: string,
   objective: string,
   opts: {
     definition?: string; catalogSource?: string; entity?: string; targetRef?: string
     feedback?: string
+    intentId?: string; recognitionId?: string
+    confirmedScope?: ConfirmedScopeInput
+    supersedesScopeId?: string
   } = {},
 ): Promise<ConsideredSetResp> {
   return post('/contract/considered-set', {
@@ -399,6 +484,23 @@ export function contractConsideredSet(
     // HUMAN guidance for a whole-round feedback re-run; mints a FRESH governing intent over the
     // guided set. null on the initial generate (no feedback yet).
     feedback: opts.feedback ?? null,
+    // Phase 1B scoped-grounding fields. All null on the flag-off one-shot path → the server takes
+    // today's ground-everything route (recognition/applicability never engage).
+    intent_id: opts.intentId ?? null,
+    recognition_id: opts.recognitionId ?? null,
+    confirmed_scope: opts.confirmedScope
+      ? {
+          primary: opts.confirmedScope.primary,
+          secondary: opts.confirmedScope.secondary,
+          expansion: opts.confirmedScope.expansion,
+          unscoped: opts.confirmedScope.unscoped,
+          use_case_origins: opts.confirmedScope.useCaseOrigins,
+          confirmation_source: opts.confirmedScope.confirmationSource,
+        }
+      : null,
+    // Lineage/history only for a broaden: the prior scope this run supersedes. Never used to
+    // derive the governing scope (that is generation_run → scope_id).
+    supersedes_scope_id: opts.supersedesScopeId ?? null,
   })
 }
 

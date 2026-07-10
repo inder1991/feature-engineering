@@ -10,6 +10,7 @@ vi.mock('../api', async importOriginal => {
     ...actual,
     recommendFeatures: vi.fn(),
     contractConsideredSet: vi.fn(),
+    contractRecognitions: vi.fn(),
     contractDraft: vi.fn(),
     contractConfirm: vi.fn(),
     refineCandidate: vi.fn(),
@@ -21,6 +22,7 @@ vi.mock('../api', async importOriginal => {
 })
 const recommendFeatures = vi.mocked(api.recommendFeatures)
 const contractConsideredSet = vi.mocked(api.contractConsideredSet)
+const contractRecognitions = vi.mocked(api.contractRecognitions)
 const contractDraft = vi.mocked(api.contractDraft)
 const contractConfirm = vi.mocked(api.contractConfirm)
 const refineCandidate = vi.mocked(api.refineCandidate)
@@ -31,12 +33,16 @@ const featureFreshness = vi.mocked(api.featureFreshness)
 beforeEach(() => {
   recommendFeatures.mockReset()
   contractConsideredSet.mockReset()
+  contractRecognitions.mockReset()
   contractDraft.mockReset()
   contractConfirm.mockReset()
   refineCandidate.mockReset()
   featureRecipe.mockReset()
   registerFeature.mockReset()
   featureFreshness.mockReset()
+  // Phase 1B flags default OFF unless a test stubs them; clear any prior test's stub so the
+  // flag-off assertions (today's one-shot behaviour) run without leakage.
+  vi.unstubAllEnvs()
 })
 
 // derives_pairs deliberately names a catalog ('cards') that differs from the source the tests
@@ -1764,5 +1770,151 @@ describe('govern', () => {
     expect(screen.getByRole('checkbox', { name: 'Select avg_balance' })).toBeInTheDocument()
     // The failed candidate stays selected, so Govern is offered again for a retry.
     expect(screen.getByRole('button', { name: 'Govern 1' })).toBeInTheDocument()
+  })
+})
+
+// ------------------------------------------------------ Phase 1B: Gate #1 confirmation + lens ----
+describe('Gate #1 scope confirmation', () => {
+  // A classified recognition with a primary + one secondary, each carrying an evidence span.
+  const RECOGNITION: api.RecognitionResp = {
+    intent_id: 'int_1', recognition_id: 'rec_1', status: 'classified', unscoped: false,
+    candidates: [
+      {
+        use_case_id: 'churn', display_name: 'Customer churn',
+        relationship: 'primary', confidence: 'high', evidence_spans: ['about to leave'],
+      },
+      {
+        use_case_id: 'engagement', display_name: 'Engagement decline',
+        relationship: 'secondary', confidence: 'medium', evidence_spans: ['balance is draining'],
+      },
+    ],
+  }
+
+  // A scoped considered-set response: one eligible recipe + one out-of-scope recipe for the lens.
+  function scopedConsidered(): api.ConsideredSetResp {
+    return {
+      intent_id: 'int_1', anchor: null, alternatives: [{ lens: 'temporal', features: [IDEA] }],
+      recommendation: null, rejections: [],
+      generation_run_id: 'run_1', scope_id: 'scope_1', in_scope_count: 1,
+      dispositions: [
+        {
+          recipe_id: 'recency_since_event', final_disposition: 'eligible', relevance_tier: 'primary',
+          applicability: { status: 'COMPLETED', reason_codes: ['in_scope'] },
+          grounding: { status: 'COMPLETED', reason_codes: [] },
+          safety: { status: 'COMPLETED', reason_codes: [] },
+        },
+        {
+          recipe_id: 'fraud_ring_score', final_disposition: 'out_of_scope', relevance_tier: null,
+          applicability: { status: 'COMPLETED', reason_codes: ['not_in_use_case'] },
+          grounding: { status: 'NOT_EVALUATED', reason_codes: [] },
+          safety: { status: 'NOT_EVALUATED', reason_codes: [] },
+        },
+      ],
+    }
+  }
+
+  async function generateFlagOn() {
+    render(<WorkbenchScreen />)
+    await userEvent.type(screen.getByLabelText('Hypothesis'), HYPOTHESIS)
+    await userEvent.type(screen.getByLabelText('Prediction goal'), 'predict churn')
+    await userEvent.click(screen.getByRole('button', { name: /generate candidate sets/i }))
+  }
+
+  function dispositionGroup(heading: RegExp): HTMLElement {
+    const h3 = screen.getByRole('heading', { level: 3, name: heading })
+    return h3.closest('.disposition-group') as HTMLElement
+  }
+
+  it('flag OFF: generate calls considered-set once and never recognitions (today’s flow)', async () => {
+    // No env stub → intent_confirmation_ui defaults off.
+    await renderAndGenerate([IDEA])
+    expect(await screen.findByText('avg_balance')).toBeInTheDocument()
+    expect(contractConsideredSet).toHaveBeenCalledTimes(1)
+    expect(contractConsideredSet).toHaveBeenCalledWith(HYPOTHESIS, 'predict churn', {
+      catalogSource: undefined, entity: undefined, targetRef: undefined,
+    })
+    expect(contractRecognitions).not.toHaveBeenCalled()
+    // No confirm step and no lens render when the flags are off.
+    expect(screen.queryByRole('button', { name: /confirm scope and generate/i })).toBeNull()
+    expect(screen.queryByText(/how your scope dispositioned/i)).toBeNull()
+  })
+
+  it('flag ON: generate recognises first, renders the proposed scope, and confirm sends the scope', async () => {
+    vi.stubEnv('VITE_INTENT_CONFIRMATION_UI', '1')
+    contractRecognitions.mockResolvedValue(RECOGNITION)
+    contractConsideredSet.mockResolvedValue(scopedConsidered())
+    await generateFlagOn()
+    // Recognition ran; considered-set has NOT fired yet (scope unconfirmed).
+    expect(contractRecognitions).toHaveBeenCalledWith(HYPOTHESIS, 'predict churn')
+    expect(contractConsideredSet).not.toHaveBeenCalled()
+    // The proposed primary + one evidence span render.
+    expect(await screen.findByText('Customer churn')).toBeInTheDocument()
+    expect(screen.getByText(/about to leave/)).toBeInTheDocument()
+    // Confirm → considered-set with a confirmedScope carrying the recognised primary + secondary.
+    await userEvent.click(screen.getByRole('button', { name: /confirm scope and generate/i }))
+    expect(contractConsideredSet).toHaveBeenCalledWith(HYPOTHESIS, 'predict churn',
+      expect.objectContaining({
+        intentId: 'int_1', recognitionId: 'rec_1',
+        confirmedScope: expect.objectContaining({
+          primary: 'churn', secondary: ['engagement'], expansion: 'exact', unscoped: false,
+          useCaseOrigins: { churn: 'llm_proposed', engagement: 'llm_proposed' },
+        }),
+      }))
+    expect(await screen.findByText('avg_balance')).toBeInTheDocument()
+  })
+
+  it('flag ON: removing a secondary drops it from the confirmed scope', async () => {
+    vi.stubEnv('VITE_INTENT_CONFIRMATION_UI', '1')
+    contractRecognitions.mockResolvedValue(RECOGNITION)
+    contractConsideredSet.mockResolvedValue(scopedConsidered())
+    await generateFlagOn()
+    await userEvent.click(await screen.findByRole('button', { name: 'Remove Engagement decline' }))
+    await userEvent.click(screen.getByRole('button', { name: /confirm scope and generate/i }))
+    expect(contractConsideredSet).toHaveBeenCalledWith(HYPOTHESIS, 'predict churn',
+      expect.objectContaining({
+        confirmedScope: expect.objectContaining({ primary: 'churn', secondary: [] }),
+      }))
+  })
+
+  it('flag ON + lens: groups an eligible and an out-of-scope recipe under their headings', async () => {
+    vi.stubEnv('VITE_INTENT_CONFIRMATION_UI', '1')
+    vi.stubEnv('VITE_INTENT_DISPOSITION_LENS', '1')
+    contractRecognitions.mockResolvedValue(RECOGNITION)
+    contractConsideredSet.mockResolvedValue(scopedConsidered())
+    await generateFlagOn()
+    await userEvent.click(await screen.findByRole('button', { name: /confirm scope and generate/i }))
+    // The lens renders and each recipe sits under the right disposition heading.
+    await screen.findByRole('heading', { name: /how your scope dispositioned/i })
+    expect(within(dispositionGroup(/Recommended/)).getByText('recency_since_event'))
+      .toBeInTheDocument()
+    expect(within(dispositionGroup(/Outside confirmed scope/)).getByText('fraud_ring_score'))
+      .toBeInTheDocument()
+    // The out-of-scope recipe never appears under the eligible heading.
+    expect(within(dispositionGroup(/Recommended/)).queryByText('fraud_ring_score')).toBeNull()
+  })
+
+  it('flag ON, lens OFF: a scoped response renders no disposition lens', async () => {
+    vi.stubEnv('VITE_INTENT_CONFIRMATION_UI', '1')
+    // intent_disposition_lens left off.
+    contractRecognitions.mockResolvedValue(RECOGNITION)
+    contractConsideredSet.mockResolvedValue(scopedConsidered())
+    await generateFlagOn()
+    await userEvent.click(await screen.findByRole('button', { name: /confirm scope and generate/i }))
+    expect(await screen.findByText('avg_balance')).toBeInTheDocument()
+    expect(screen.queryByText(/how your scope dispositioned/i)).toBeNull()
+  })
+
+  it('flag ON: broaden ("show all buildable recipes") re-runs unscoped', async () => {
+    vi.stubEnv('VITE_INTENT_CONFIRMATION_UI', '1')
+    contractRecognitions.mockResolvedValue(RECOGNITION)
+    contractConsideredSet.mockResolvedValue(considered(singleSetRound([IDEA])))
+    await generateFlagOn()
+    await userEvent.click(
+      await screen.findByRole('button', { name: /show all buildable recipes/i }))
+    expect(contractConsideredSet).toHaveBeenCalledWith(HYPOTHESIS, 'predict churn',
+      expect.objectContaining({
+        confirmedScope: expect.objectContaining({ unscoped: true }),
+      }))
+    expect(await screen.findByText('avg_balance')).toBeInTheDocument()
   })
 })

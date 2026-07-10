@@ -58,12 +58,51 @@
 //   resolves after the edit is discarded, never applied against the new scope.
 import { type FormEvent, type ReactNode, useEffect, useRef, useState } from 'react'
 import {
-  ApiError, type FeatureFreshness, type FeatureIdea, type FeatureSpecIn, type JoinStep,
-  type Recipe, type RefineRejection, type Rejection, type SetRecommendation,
-  contractConfirm, contractConsideredSet, contractDraft, featureFreshness, featureRecipe,
-  refineCandidate, registerFeature,
+  ApiError, type ConsideredSetResp, type FeatureFreshness, type FeatureIdea, type FeatureSpecIn,
+  type JoinStep, type Recipe, type RecipeDisposition, type RecognitionCandidate,
+  type RecognitionResp, type RefineRejection, type Rejection, type SetRecommendation,
+  contractConfirm, contractConsideredSet, contractDraft, contractRecognitions, featureFreshness,
+  featureRecipe, refineCandidate, registerFeature,
 } from '../api'
 import { getSession } from '../session'
+
+// ---- Phase 1B feature flags -------------------------------------------------------------------
+// Two independent UI flags, read via Vite's env idiom and default OFF: with both off the screen
+// behaves EXACTLY as today (one-shot generate, no recognition call, no disposition lens). Read at
+// call time (not cached at module scope) so tests can flip them with vi.stubEnv.
+// - intent_confirmation_ui: on Generate, first recognise the objective and let the human
+//   confirm/override/broaden the scope BEFORE the considered set is generated.
+// - intent_disposition_lens: when a scoped response carries dispositions, group recipes by their
+//   final disposition (only meaningful with the confirmation UI on).
+function confirmationUiEnabled(): boolean {
+  return import.meta.env.VITE_INTENT_CONFIRMATION_UI === '1'
+}
+function dispositionLensEnabled(): boolean {
+  return import.meta.env.VITE_INTENT_DISPOSITION_LENS === '1'
+}
+
+// The disposition lens, in render order: each final_disposition mapped to its human heading.
+const DISPOSITION_GROUPS: { key: RecipeDisposition['final_disposition']; heading: string }[] = [
+  { key: 'eligible', heading: 'Recommended' },
+  { key: 'unbuildable', heading: 'Relevant but missing data' },
+  { key: 'safety_rejected', heading: 'Rejected by safety' },
+  { key: 'out_of_scope', heading: 'Outside confirmed scope' },
+]
+
+// The reason a recipe landed in its group: the eligible tier, or the reason_codes of the stage
+// that decided it (applicability for out-of-scope, grounding for unbuildable, safety for rejected).
+function dispositionReason(d: RecipeDisposition): string {
+  if (d.final_disposition === 'eligible') {
+    return d.relevance_tier ? `${d.relevance_tier} relevance` : 'eligible'
+  }
+  const stage = d.final_disposition === 'out_of_scope'
+    ? d.applicability
+    : d.final_disposition === 'unbuildable'
+      ? d.grounding
+      : d.safety
+  const codes = stage?.reason_codes ?? []
+  return codes.length > 0 ? codes.join(', ') : d.final_disposition.replace(/_/g, ' ')
+}
 
 const HELP_STYLE = { fontSize: 12 } as const
 // Solid ok chip (index.css has no fresh badge class; mirrors .badge.stale's solid treatment).
@@ -489,6 +528,19 @@ export function WorkbenchScreen() {
   const [confirmingGovern, setConfirmingGovern] = useState(false)
   const [governBusy, setGovernBusy] = useState(false)
   const [notice, setNotice] = useState('')
+  // ---- Phase 1B: Gate #1 scope confirmation (behind intent_confirmation_ui) ----
+  // The recognizer's attempt for the current round: non-null puts the screen in the confirm step
+  // (proposed scope shown, no candidates yet), null means today's flow. The working scope the human
+  // edits before confirming: the chosen primary use-case, the kept secondaries, and whether to
+  // include descendant sub-use-cases (exact ↔ include_descendants).
+  const [recognition, setRecognition] = useState<RecognitionResp | null>(null)
+  const [scopePrimary, setScopePrimary] = useState<string | null>(null)
+  const [scopeSecondary, setScopeSecondary] = useState<string[]>([])
+  const [scopeExpansion, setScopeExpansion] = useState<'exact' | 'include_descendants'>('exact')
+  // The scoped considered-set's per-recipe dispositions (the lens) and the scope id the last scoped
+  // run was governed by — the prior scope a broaden supersedes. Both null on the unscoped path.
+  const [dispositions, setDispositions] = useState<RecipeDisposition[] | null>(null)
+  const [lastScopeId, setLastScopeId] = useState<string | null>(null)
   // Whole-round feedback channel: the hypothesis and objective the round was generated for
   // (feedback reruns THOSE, not a since-edited input), the instruction being typed, rounds
   // consumed, the recorded strips, and the in-flight flag.
@@ -536,6 +588,17 @@ export function WorkbenchScreen() {
     focusTarget.current = null
     el?.focus()
   })
+
+  // Phase 1B flags, read each render so a test can flip them with vi.stubEnv. Default OFF → today.
+  const confirmationUi = confirmationUiEnabled()
+  const dispositionLens = dispositionLensEnabled()
+  // The recognizer's proposals as the working scope holds them: the chosen primary and the kept
+  // secondaries, resolved back to their candidate records for display (name/confidence/evidence).
+  const primaryCandidate =
+    recognition?.candidates.find(c => c.use_case_id === scopePrimary) ?? null
+  const secondaryCandidates: RecognitionCandidate[] = scopeSecondary
+    .map(id => recognition?.candidates.find(c => c.use_case_id === id))
+    .filter((c): c is RecognitionCandidate => c != null)
 
   const multiSet = setLenses.length > 1
   // Every live candidate, across ALL sets plus drafts: selection and registration always work
@@ -630,6 +693,10 @@ export function WorkbenchScreen() {
   function voidInFlightRounds() {
     generateSeq.current += 1
     setGenerating(false)
+    // A scope edit also drops the Gate #1 confirm step and any scoped disposition lens: the
+    // recognised scope was for the previous scope context. (Both no-ops when the flags are off.)
+    setRecognition(null)
+    setDispositions(null)
   }
 
   function changeSource(value: string) {
@@ -679,6 +746,182 @@ export function WorkbenchScreen() {
     invalidateGenerated()
   }
 
+  // Apply a considered-set response as the current round: dedupe candidates by name across sets,
+  // open the detail list on the advisory pick, and reset the feedback cycle against THIS round's
+  // hypothesis/objective. Shared by the one-shot generate (flag off) and the confirmed/broadened
+  // scoped generate (flag on). Callers run the out-of-order guard BEFORE calling.
+  function applyConsideredRound(
+    cs: ConsideredSetResp, seq: number, roundHyp: string, roundObj: string,
+  ) {
+    setIntentId(cs.intent_id)
+    // Dedupe by name across sets: the same feature in several lenses is one candidate that
+    // knows every set it belongs to. Empty sets are dropped (nothing to compare or take).
+    const byName = new Map<string, GeneratedCandidate>()
+    const lenses: string[] = []
+    for (const set of cs.alternatives) {
+      if (set.features.length === 0) continue
+      lenses.push(set.lens)
+      for (const idea of set.features) {
+        const existing = byName.get(idea.name)
+        if (existing) {
+          if (!existing.lenses.includes(set.lens)) existing.lenses.push(set.lens)
+        } else {
+          byName.set(idea.name, {
+            kind: 'generated', key: `g${seq}:${idea.name}`, idea, lenses: [set.lens],
+          })
+        }
+      }
+    }
+    setGenerated([...byName.values()])
+    setSetLenses(lenses)
+    setRecommendation(cs.recommendation)
+    // The detail list opens on the advisory pick when there is one among the surviving sets.
+    setActiveLens(
+      lenses.length > 1
+        ? cs.recommendation !== null && lenses.includes(cs.recommendation.recommended_lens)
+          ? cs.recommendation.recommended_lens
+          : lenses[0]
+        : null)
+    setRejections(cs.rejections)
+    setRejectionsOpen(false)
+    setScreenedTarget(target.trim() || null)
+    setConfirmingBatch(false)
+    setConfirmingGovern(false)
+    // Phase 1B: carry the scoped disposition lens + the governing scope id a later broaden
+    // supersedes. Both null on the unscoped/one-shot path (the response omits them).
+    setDispositions(cs.dispositions ?? null)
+    setLastScopeId(cs.scope_id ?? null)
+    // A fresh engine round starts a fresh feedback cycle against ITS hypothesis and objective:
+    // whole-round feedback reruns these even if the inputs are edited later.
+    setRoundHypothesis(roundHyp)
+    setRoundObjective(roundObj)
+    clearFeedback()
+  }
+
+  // Phase 1B (intent_confirmation_ui): recognise the objective and enter the confirm step. NO
+  // considered-set call yet — the human confirms/overrides/broadens the proposed scope first.
+  // Fail-open: the endpoint never 5xxs, so a technical failure still lands as a recognition here.
+  async function recognize(objective: string) {
+    const seq = ++generateSeq.current
+    setNotice('')
+    setScopeChanged(false)
+    setGenerating(true)
+    // The confirm step shows only the proposed scope: clear any prior round's candidates + lens.
+    setGenerated(null)
+    setDispositions(null)
+    clearSets()
+    clearFeedback()
+    try {
+      const rec = await contractRecognitions(hypothesis.trim(), objective)
+      if (seq !== generateSeq.current) return
+      setRoundHypothesis(hypothesis.trim())
+      setRoundObjective(objective)
+      setRecognition(rec)
+      setScopePrimary(rec.candidates.find(c => c.relationship === 'primary')?.use_case_id ?? null)
+      setScopeSecondary(
+        rec.candidates.filter(c => c.relationship === 'secondary').map(c => c.use_case_id))
+      setScopeExpansion('exact')
+    } catch (err) {
+      if (seq !== generateSeq.current) return
+      setRecognition(null)
+      fail(err)
+    } finally {
+      if (seq === generateSeq.current) setGenerating(false)
+    }
+  }
+
+  // The human confirmed the recognised scope: mint the run, persist the scope, and ground only the
+  // in-scope subset. Reuses the round's snapshotted hypothesis/objective (set at recognise time).
+  async function confirmScope() {
+    const rec = recognition
+    if (!rec || feedbackLocked) return
+    const seq = ++generateSeq.current
+    setNotice('')
+    setGenerating(true)
+    try {
+      const ids = [scopePrimary, ...scopeSecondary].filter((id): id is string => id !== null)
+      // Every confirmed use-case is llm_proposed here: the controls re-role the recognizer's
+      // proposals (confirm/remove/change-primary), there is no free-text add, so the
+      // proposed-vs-accepted delta the backend stores is purely re-roling.
+      const useCaseOrigins = Object.fromEntries(ids.map(id => [id, 'llm_proposed']))
+      const cs = await contractConsideredSet(roundHypothesis, roundObjective, {
+        catalogSource: source.trim() || undefined,
+        entity: entity.trim() || undefined,
+        targetRef: target.trim() || undefined,
+        intentId: rec.intent_id,
+        recognitionId: rec.recognition_id,
+        confirmedScope: {
+          primary: scopePrimary,
+          secondary: scopeSecondary,
+          expansion: scopeExpansion,
+          unscoped: false,
+          useCaseOrigins,
+          confirmationSource: 'user_confirmed',
+        },
+      })
+      if (seq !== generateSeq.current) return
+      applyConsideredRound(cs, seq, roundHypothesis, roundObjective)
+      setRecognition(null)
+    } catch (err) {
+      if (seq !== generateSeq.current) return
+      fail(err)
+    } finally {
+      if (seq === generateSeq.current) setGenerating(false)
+    }
+  }
+
+  // Broaden ("show all buildable recipes"): re-run UNSCOPED under a fresh run, superseding the prior
+  // scope (lineage only). Available from the proposed-scope panel and from the disposition lens.
+  async function broadenScope() {
+    if (feedbackLocked) return
+    const rec = recognition
+    const seq = ++generateSeq.current
+    setNotice('')
+    setGenerating(true)
+    try {
+      const cs = await contractConsideredSet(roundHypothesis, roundObjective, {
+        catalogSource: source.trim() || undefined,
+        entity: entity.trim() || undefined,
+        targetRef: target.trim() || undefined,
+        intentId: rec?.intent_id,
+        recognitionId: rec?.recognition_id,
+        confirmedScope: {
+          primary: null,
+          secondary: [],
+          expansion: 'exact',
+          unscoped: true,
+          useCaseOrigins: {},
+          confirmationSource: 'broaden',
+        },
+        supersedesScopeId: lastScopeId ?? undefined,
+      })
+      if (seq !== generateSeq.current) return
+      applyConsideredRound(cs, seq, roundHypothesis, roundObjective)
+      setRecognition(null)
+    } catch (err) {
+      if (seq !== generateSeq.current) return
+      fail(err)
+    } finally {
+      if (seq === generateSeq.current) setGenerating(false)
+    }
+  }
+
+  // Change the primary to another candidate: promote the chosen use-case, demote the old primary
+  // into the secondaries (both stay llm_proposed — the recognizer proposed them, we re-role).
+  function makePrimary(useCaseId: string) {
+    setScopeSecondary(prev => {
+      const withoutChosen = prev.filter(id => id !== useCaseId)
+      return scopePrimary !== null && scopePrimary !== useCaseId
+        ? [...withoutChosen, scopePrimary]
+        : withoutChosen
+    })
+    setScopePrimary(useCaseId)
+  }
+
+  function removeSecondary(useCaseId: string) {
+    setScopeSecondary(prev => prev.filter(id => id !== useCaseId))
+  }
+
   async function generate(e: FormEvent) {
     e.preventDefault()
     const objective = goal.trim()
@@ -688,6 +931,13 @@ export function WorkbenchScreen() {
     // A register batch is confirming or in flight: a new round would replace the rows the
     // human is approving, letting their registrations complete out of view.
     if (feedbackLocked) return
+    // Phase 1B (intent_confirmation_ui): Generate first RECOGNISES the objective and hands the
+    // proposed scope to the human. Nothing is generated until they confirm/broaden. Flag off →
+    // fall straight through to today's one-shot considered-set call below.
+    if (confirmationUi) {
+      void recognize(objective)
+      return
+    }
     const seq = ++generateSeq.current
     setNotice('')
     setScopeChanged(false)
@@ -703,48 +953,7 @@ export function WorkbenchScreen() {
         targetRef: target.trim() || undefined,
       })
       if (seq !== generateSeq.current) return
-      const round = {
-        sets: cs.alternatives, recommendation: cs.recommendation, rejections: cs.rejections,
-      }
-      setIntentId(cs.intent_id)
-      // Dedupe by name across sets: the same feature in several lenses is one candidate that
-      // knows every set it belongs to. Empty sets are dropped (nothing to compare or take).
-      const byName = new Map<string, GeneratedCandidate>()
-      const lenses: string[] = []
-      for (const set of round.sets) {
-        if (set.features.length === 0) continue
-        lenses.push(set.lens)
-        for (const idea of set.features) {
-          const existing = byName.get(idea.name)
-          if (existing) {
-            if (!existing.lenses.includes(set.lens)) existing.lenses.push(set.lens)
-          } else {
-            byName.set(idea.name, {
-              kind: 'generated', key: `g${seq}:${idea.name}`, idea, lenses: [set.lens],
-            })
-          }
-        }
-      }
-      setGenerated([...byName.values()])
-      setSetLenses(lenses)
-      setRecommendation(round.recommendation)
-      // The detail list opens on the advisory pick when there is one among the surviving sets.
-      setActiveLens(
-        lenses.length > 1
-          ? round.recommendation !== null && lenses.includes(round.recommendation.recommended_lens)
-            ? round.recommendation.recommended_lens
-            : lenses[0]
-          : null)
-      setRejections(round.rejections)
-      setRejectionsOpen(false)
-      setScreenedTarget(target.trim() || null)
-      setConfirmingBatch(false)
-      setConfirmingGovern(false)
-      // A fresh engine round starts a fresh feedback cycle against ITS hypothesis and objective:
-      // whole-round feedback reruns these even if the inputs are edited later.
-      setRoundHypothesis(hypothesis.trim())
-      setRoundObjective(objective)
-      clearFeedback()
+      applyConsideredRound(cs, seq, hypothesis.trim(), objective)
     } catch (err) {
       if (seq !== generateSeq.current) return
       setGenerated(null)
@@ -1316,6 +1525,125 @@ export function WorkbenchScreen() {
         </form>
       </div>
 
+      {/* Phase 1B Gate #1: the human confirms/overrides/broadens the recognised scope BEFORE the
+          considered set is generated. Only rendered behind intent_confirmation_ui, after a
+          recognition has landed and before it is confirmed. */}
+      {confirmationUi && recognition !== null && (
+        <div className="panel" id="wb-scope-panel">
+          <h2>Confirm the scope</h2>
+          <p className="hint" style={{ marginTop: 4 }}>
+            We recognised what you're building. Confirm it, adjust it, or show every buildable
+            recipe. Nothing generates until you confirm.
+          </p>
+          {recognition.status === 'ambiguous' && (
+            <p className="hint" role="status">
+              The objective read as ambiguous — check the primary before confirming.
+            </p>
+          )}
+          {primaryCandidate === null ? (
+            <p role="status">
+              No use-case was recognised for this objective. Show all buildable recipes to generate
+              over everything.
+            </p>
+          ) : (
+            <>
+              <div className="scope-primary" data-role="primary">
+                <div style={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 8 }}>
+                  <span className="badge recommended">Primary</span>
+                  <span style={{ fontWeight: 600 }}>{primaryCandidate.display_name}</span>
+                  <span className="badge">{primaryCandidate.confidence} confidence</span>
+                </div>
+                {primaryCandidate.evidence_spans.length > 0 && (
+                  <ul className="scope-evidence" style={{ margin: '6px 0 0', paddingLeft: 18 }}>
+                    {primaryCandidate.evidence_spans.map(span => (
+                      <li key={span} style={{ color: 'var(--ink-soft)' }}>“{span}”</li>
+                    ))}
+                  </ul>
+                )}
+              </div>
+              {secondaryCandidates.length > 0 && (
+                <div style={{ marginTop: 12 }}>
+                  <h3 style={{ margin: '0 0 8px' }}>Also in scope</h3>
+                  <ul className="rows">
+                    {secondaryCandidates.map(cand => (
+                      <li
+                        key={cand.use_case_id}
+                        className="row"
+                        style={{ alignItems: 'flex-start', gap: 10 }}
+                      >
+                        <div style={{ display: 'grid', gap: 6, flex: 1, minWidth: 0 }}>
+                          <div style={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 8 }}>
+                            <span className="badge">Secondary</span>
+                            <span style={{ fontWeight: 600 }}>{cand.display_name}</span>
+                            <span className="badge">{cand.confidence} confidence</span>
+                          </div>
+                          {cand.evidence_spans.length > 0 && (
+                            <ul className="scope-evidence" style={{ margin: 0, paddingLeft: 18 }}>
+                              {cand.evidence_spans.map(span => (
+                                <li key={span} style={{ color: 'var(--ink-soft)' }}>“{span}”</li>
+                              ))}
+                            </ul>
+                          )}
+                        </div>
+                        <button
+                          type="button"
+                          className="btn"
+                          onClick={() => makePrimary(cand.use_case_id)}
+                        >
+                          Make primary
+                        </button>
+                        <button
+                          type="button"
+                          className="btn"
+                          aria-label={`Remove ${cand.display_name}`}
+                          onClick={() => removeSecondary(cand.use_case_id)}
+                        >
+                          Remove
+                        </button>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+              <label
+                htmlFor="wb-scope-descendants"
+                style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 12 }}
+              >
+                <input
+                  id="wb-scope-descendants"
+                  type="checkbox"
+                  checked={scopeExpansion === 'include_descendants'}
+                  onChange={e =>
+                    setScopeExpansion(e.target.checked ? 'include_descendants' : 'exact')}
+                  style={{ width: 18, height: 18 }}
+                />
+                Include all sub-use-cases?
+              </label>
+            </>
+          )}
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginTop: 16 }}>
+            {primaryCandidate !== null && (
+              <button
+                type="button"
+                className="btn btn--primary"
+                disabled={generating}
+                onClick={() => void confirmScope()}
+              >
+                Confirm scope and generate
+              </button>
+            )}
+            <button
+              type="button"
+              className="btn"
+              disabled={generating}
+              onClick={() => void broadenScope()}
+            >
+              Show all buildable recipes
+            </button>
+          </div>
+        </div>
+      )}
+
       {scopeChanged && (
         <p role="status" className="hint">
           Scope changed. Regenerate to refresh candidates.
@@ -1368,6 +1696,50 @@ export function WorkbenchScreen() {
               )}
             </div>
           </form>
+        </div>
+      )}
+
+      {/* Phase 1B disposition lens: only when a SCOPED response carried dispositions and the
+          intent_disposition_lens flag is on. Groups the recipe library by how the confirmed scope
+          dispositioned each recipe, and keeps "show all buildable recipes" one click away. */}
+      {dispositionLens && dispositions !== null && (
+        <div className="panel" id="wb-disposition-lens">
+          <div style={{ display: 'flex', alignItems: 'baseline', gap: 12 }}>
+            <h2>How your scope dispositioned the recipes</h2>
+            <span className="micro-label tabular-nums">
+              <span style={{ color: 'var(--accent)' }}>{dispositions.length}</span> recipes
+            </span>
+          </div>
+          {DISPOSITION_GROUPS.map(group => {
+            const recipes = dispositions.filter(d => d.final_disposition === group.key)
+            if (recipes.length === 0) return null
+            return (
+              <div key={group.key} className="disposition-group" style={{ marginTop: 12 }}>
+                <h3 style={{ margin: '0 0 8px' }}>
+                  {group.heading}{' '}
+                  <span className="micro-label tabular-nums">{recipes.length}</span>
+                </h3>
+                <ul className="rows">
+                  {recipes.map(d => (
+                    <li key={d.recipe_id} className="row" style={{ gap: 10, alignItems: 'baseline' }}>
+                      <span className="mono" style={{ fontWeight: 600 }}>{d.recipe_id}</span>
+                      <span className="hint">{dispositionReason(d)}</span>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )
+          })}
+          <div style={{ marginTop: 12 }}>
+            <button
+              type="button"
+              className="btn"
+              disabled={generating}
+              onClick={() => void broadenScope()}
+            >
+              Show all buildable recipes
+            </button>
+          </div>
         </div>
       )}
 
