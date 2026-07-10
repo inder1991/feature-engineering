@@ -16,6 +16,7 @@ from __future__ import annotations
 from typing import Any
 
 from featuregen.intake.llm import PROVIDER_OK, LLMRequest, LLMResult
+from featuregen.intake.redaction import INPUT_KEY_INTENT
 from featuregen.overlay.upload.taxonomy.gold_recognition import GOLD, GoldCase
 from featuregen.overlay.upload.taxonomy.recognition_eval import evaluate
 
@@ -65,9 +66,15 @@ class _ScriptedStub:
         self._script = script
 
     def call(self, request: LLMRequest) -> LLMResult:
-        hypothesis = request.inputs["hypothesis"]
+        # The recognizer routes through the audited seam, so the hypothesis rides INSIDE the reserved
+        # redacted-intent text (the instruction), not a bare "hypothesis" key. Match on the scripted
+        # hypothesis embedded in that instruction (each gold hypothesis is a unique string).
+        intent = str(request.inputs.get(INPUT_KEY_INTENT, ""))
+        body = next((b for hyp, b in self._script.items() if hyp in intent), None)
+        if body is None:
+            raise KeyError(f"no scripted recognition for intent: {intent[:80]!r}")
         return LLMResult(
-            output=dict(self._script[hypothesis]),
+            output=dict(body),
             self_reported_scores={},
             call_ref="",
             status=PROVIDER_OK,
@@ -93,8 +100,8 @@ def _oracle_stub(subset: tuple[GoldCase, ...]) -> _ScriptedStub:
 _ORACLE_SUBSET = (_case("G01"), _case("G03"), _case("G04"), _case("G05"))
 
 
-def test_oracle_reports_no_false_narrowing_and_full_recall() -> None:
-    report = evaluate(_oracle_stub(_ORACLE_SUBSET), gold=_ORACLE_SUBSET)
+def test_oracle_reports_no_false_narrowing_and_full_recall(db) -> None:
+    report = evaluate(db, _oracle_stub(_ORACLE_SUBSET), gold=_ORACLE_SUBSET)
 
     assert report.false_narrowing_count == 0
     assert report.false_narrowing_regulated == 0
@@ -122,7 +129,7 @@ _G24_DROPPED = (
 )
 
 
-def test_over_narrow_scope_is_detected_as_false_narrowing() -> None:
+def test_over_narrow_scope_is_detected_as_false_narrowing(db) -> None:
     subset = (_case("G01"), _G24)
     # G01 correct; G24 over-narrowed to its primary leaf only (drops the secondary-leaf recipes).
     stub = _ScriptedStub(
@@ -132,7 +139,7 @@ def test_over_narrow_scope_is_detected_as_false_narrowing() -> None:
         }
     )
 
-    report = evaluate(stub, gold=subset)
+    report = evaluate(db, stub, gold=subset)
 
     # The harness flags exactly the one narrowed case.
     assert report.false_narrowing_count == 1
@@ -153,7 +160,7 @@ def test_over_narrow_scope_is_detected_as_false_narrowing() -> None:
 # ── abstention precision: crediting only truly-unscoped abstentions ───────────────────────────────
 
 
-def test_abstention_precision_penalises_abstaining_on_a_scoped_case() -> None:
+def test_abstention_precision_penalises_abstaining_on_a_scoped_case(db) -> None:
     subset = (_case("G18"), _case("G01"))  # G18 is unscoped; G01 is a scoped straightforward case.
 
     # Abstains ONLY on the truly-unscoped G18, classifies G01 correctly → every abstention was right.
@@ -163,7 +170,7 @@ def test_abstention_precision_penalises_abstaining_on_a_scoped_case() -> None:
             _case("G01").hypothesis: _classified(_case("G01").expected_primary),  # type: ignore[arg-type]
         }
     )
-    assert evaluate(right, gold=subset).abstention_precision == 1.0
+    assert evaluate(db, right, gold=subset).abstention_precision == 1.0
 
     # Abstains on BOTH — including the scoped G01 — so only half the abstentions were warranted.
     over_abstain = _ScriptedStub(
@@ -172,4 +179,4 @@ def test_abstention_precision_penalises_abstaining_on_a_scoped_case() -> None:
             _case("G01").hypothesis: dict(_UNSCOPED_BODY),
         }
     )
-    assert evaluate(over_abstain, gold=subset).abstention_precision == 0.5
+    assert evaluate(db, over_abstain, gold=subset).abstention_precision == 0.5

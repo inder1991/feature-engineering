@@ -95,6 +95,25 @@ _SCHEMAS: dict[tuple[str, int], dict] = {
     # LLM-2 candidate critic (SP-12 item 5): {"issues": [{"name","issue"}]} — advisory quality/fit notes.
     ("feature_candidate_critique", 1): {"type": "object", "additionalProperties": True,
                                         "properties": {"issues": {"type": "array"}}},
+    # Intent-recognition (Phase-1A): the closed-shape recognition body. Structure only — the closed-
+    # taxonomy semantics (id in registry, primary is a leaf) are a post-pass in recognizer.recognize.
+    ("use_case_recognition", 1): {
+        "type": "object", "additionalProperties": False,
+        "properties": {
+            "status": {"type": "string",
+                       "enum": ["classified", "ambiguous", "unscoped", "technical_failure"]},
+            "candidates": {"type": "array", "items": {
+                "type": "object", "additionalProperties": False,
+                "properties": {
+                    "use_case_id": {"type": "string"},
+                    "relationship": {"type": "string", "enum": ["primary", "secondary"]},
+                    "confidence": {"type": "string", "enum": ["high", "medium", "low"]},
+                    "evidence_spans": {"type": "array", "items": {"type": "string"}},
+                    "rationale": {"type": "string"}},
+                "required": ["use_case_id", "relationship", "confidence", "evidence_spans",
+                             "rationale"]}},
+            "ambiguity_note": {"type": ["string", "null"]}},
+        "required": ["status", "candidates"]},
 }
 
 # Fallback service identity for when no real actor is threaded in. authenticated=False — a

@@ -81,7 +81,7 @@ def _scope_signature(scope: ConfirmedScope) -> tuple[str | None, tuple[str, ...]
     return (scope.primary, tuple(sorted(scope.secondary)), scope.unscoped)
 
 
-def evaluate(client: LLMClient, gold: tuple[GoldCase, ...] = GOLD) -> EvalReport:
+def evaluate(conn, client: LLMClient, gold: tuple[GoldCase, ...] = GOLD) -> EvalReport:
     """Recognise every gold case, map each recognised scope to in-scope recipe ids, and score the run.
 
     For each case: ``recognize`` -> ``scope_from_recognition`` -> ``in_scope_recipes``; ``retained``
@@ -116,7 +116,7 @@ def evaluate(client: LLMClient, gold: tuple[GoldCase, ...] = GOLD) -> EvalReport
 
     for case in gold:
         result = recognize(
-            client, redacted_hypothesis=case.hypothesis, redacted_goal=case.prediction_goal)
+            conn, client, redacted_hypothesis=case.hypothesis, redacted_goal=case.prediction_goal)
         scope = scope_from_recognition(result)
         primary_scoped, supporting_scoped = in_scope_recipes(scope)
         retained = primary_scoped | supporting_scoped
@@ -148,7 +148,8 @@ def evaluate(client: LLMClient, gold: tuple[GoldCase, ...] = GOLD) -> EvalReport
         # Stability: an identical scope on an independent second recognition of the same input.
         scope_again = scope_from_recognition(
             recognize(
-                client, redacted_hypothesis=case.hypothesis, redacted_goal=case.prediction_goal))
+                conn, client, redacted_hypothesis=case.hypothesis,
+                redacted_goal=case.prediction_goal))
         if _scope_signature(scope) == _scope_signature(scope_again):
             stable_count += 1
 
@@ -203,12 +204,24 @@ def format_report(report: EvalReport) -> str:
 
 
 def main() -> None:
-    """Run the recognizer over the gold set with the process-wide ``LLMClient`` and print the report.
+    """Run the recognizer over the gold set against the process-wide ``LLMClient`` + a real DB
+    connection, and print the report.
 
     This is the runnable REAL-LLM shadow run — its applicability-recall / false-narrowing results
-    (together with expert review of the gold set) gate Phase 1B. Requires a registered client
-    (``register_llm_client``); ``current_llm_client`` fails closed with a clear error otherwise."""
-    print(format_report(evaluate(current_llm_client())))
+    (with expert review of the gold set) gate Phase 1B. Requires: a registered client
+    (``register_llm_client`` / ``FEATUREGEN_LLM_PROVIDER=anthropic``) and a DB DSN in
+    ``FEATUREGEN_DB_DSN`` (falls back to ``FEATUREGEN_TEST_DSN``) — the recognizer audits each call to
+    ``llm_call``, so a connection is required. Fails closed with a clear error if either is missing."""
+    import os
+
+    import psycopg
+
+    dsn = os.environ.get("FEATUREGEN_DB_DSN") or os.environ.get("FEATUREGEN_TEST_DSN")
+    if not dsn:
+        raise RuntimeError(
+            "shadow run needs a DB DSN in FEATUREGEN_DB_DSN (or FEATUREGEN_TEST_DSN)")
+    with psycopg.connect(dsn) as conn:
+        print(format_report(evaluate(conn, current_llm_client())))
 
 
 if __name__ == "__main__":

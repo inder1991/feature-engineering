@@ -177,7 +177,7 @@ def build_considered_set(conn, intent: Intent, client: LLMClient, *, entity: str
         "INSERT INTO contract_considered (intent_id, considered) VALUES (%s, %s::jsonb) "
         "ON CONFLICT (intent_id) DO UPDATE SET considered = EXCLUDED.considered",
         (intent.intent_id, json.dumps(_snapshot(conn, cs))))
-    _shadow_recognition(client, intent, redacted_goal, cs)   # flag-gated, LOG-ONLY; never filters cs
+    _shadow_recognition(conn, client, intent, redacted_goal, cs)  # flag-gated, LOG-ONLY; never filters cs
     return cs
 
 
@@ -202,7 +202,7 @@ def _grounded_template_count(cs: ConsideredSet) -> int:
     return sum(len(s.features) for s in cs.alternatives if s.lens == "templates")
 
 
-def _shadow_recognition(client: LLMClient, intent: Intent, redacted_goal: str,
+def _shadow_recognition(conn, client: LLMClient, intent: Intent, redacted_goal: str,
                         cs: ConsideredSet) -> None:
     """Flag-gated, LOG-ONLY shadow recognition. When the flag is OFF (default) this is a true no-op —
     `recognize` is NOT called, so there is no extra LLM call and zero behaviour change. When ON, it
@@ -214,7 +214,7 @@ def _shadow_recognition(client: LLMClient, intent: Intent, redacted_goal: str,
         return
     try:
         result = recognize(
-            client, redacted_hypothesis=intent.redacted_hypothesis,
+            conn, client, redacted_hypothesis=intent.redacted_hypothesis,
             redacted_goal=redacted_goal or None)
         scope = scope_from_recognition(result)
         primary_scoped, _ = in_scope_recipes(scope)

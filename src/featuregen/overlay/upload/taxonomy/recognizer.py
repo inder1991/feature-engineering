@@ -18,15 +18,14 @@ touches ``templates.py``. See ``docs/superpowers/plans/2026-07-09-phase1a-shadow
 from __future__ import annotations
 
 import logging
+import os
 from collections.abc import Mapping
 from typing import Any
 
-from featuregen.intake.llm import (
-    STATUS_FAILED,
-    LLMClient,
-    LLMRequest,
-    drive_structured_call,
-)
+from featuregen.contracts import SchemaValidationError
+from featuregen.contracts.envelopes import IdentityEnvelope
+from featuregen.intake.llm import LLMClient
+from featuregen.overlay.upload.enrich_llm import audited_structured_call
 from featuregen.overlay.upload.taxonomy.recognition import (
     TAXONOMY_VERSION,
     RecognitionResult,
@@ -35,7 +34,11 @@ from featuregen.overlay.upload.taxonomy.recognition import (
     unscoped_result,
     validate_recognition_output,
 )
-from featuregen.overlay.upload.taxonomy.recognizer_prompt import PROMPT_ID, PROMPT_VERSION
+from featuregen.overlay.upload.taxonomy.recognizer_prompt import (
+    PROMPT_ID,
+    PROMPT_VERSION,
+    build_recognition_prompt,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -71,50 +74,61 @@ def _result_from_output(output: Mapping[str, Any], *, model_id: str) -> Recognit
     )
 
 
+def _recognition_instruction(redacted_hypothesis: str, redacted_goal: str | None) -> str:
+    """The model-facing text: the closed-taxonomy prompt + the redacted request. This is passed as the
+    audited seam's ``instruction`` (the reserved ``redacted_intent`` the adapter renders to the model);
+    it carries ONLY the already-redacted hypothesis/goal — never catalog columns."""
+    lines = [build_recognition_prompt(), "", "=== REQUEST TO CLASSIFY ===",
+             f"HYPOTHESIS: {redacted_hypothesis}"]
+    if redacted_goal:
+        lines.append(f"PREDICTION GOAL: {redacted_goal}")
+    return "\n".join(lines)
+
+
 def recognize(
+    conn,
     client: LLMClient,
     *,
     redacted_hypothesis: str,
     redacted_goal: str | None = None,
-    model_id: str = "claude-opus-4-8",
+    model_id: str | None = None,
+    actor: IdentityEnvelope | None = None,
 ) -> RecognitionResult:
     """Recognise the governed use-case scope of a *redacted* request. LLM-only and FAIL-OPEN: never
-    raises to its caller. Any technical failure (provider failure/refusal, validation budget
-    exhausted, dispatch/mapping error) folds to a candidate-free ``TECHNICAL_FAILURE``; a well-formed
-    ``unscoped`` body folds to ``UNSCOPED``. The input carries only the redacted hypothesis and
-    prediction goal — never catalog columns."""
-    request = LLMRequest(
-        task=RECOGNIZER_TASK,
-        prompt_id=PROMPT_ID,
-        prompt_version=int(PROMPT_VERSION),
-        inputs={"hypothesis": redacted_hypothesis, "prediction_goal": redacted_goal},
-        output_schema_id=_OUTPUT_SCHEMA_ID,
-        output_schema_version=_OUTPUT_SCHEMA_VERSION,
-        generation_settings={"provider": "anthropic", "model": model_id},
-        output_schema=None,
-    )
+    raises to its caller. Routes through the platform's AUDITED seam (``audited_structured_call``) so a
+    real provider gets the registered output-schema (never fails closed for lack of one), the egress
+    guard scans the text, and the call is recorded in ``llm_call``. Any failure (egress block, provider
+    failure/refusal, invalid body, dispatch/mapping error) folds to a candidate-free
+    ``TECHNICAL_FAILURE``; a well-formed ``unscoped`` body folds to ``UNSCOPED``. The input carries only
+    the redacted hypothesis + prediction goal (``catalog_metadata`` is empty — recognition never sees
+    columns). ``model_id`` defaults to the env-configured model (matching the wired client)."""
+    model = model_id or os.environ.get("FEATUREGEN_LLM_MODEL", "claude-opus-4-8")
+    instruction = _recognition_instruction(redacted_hypothesis, redacted_goal)
 
     try:
-        outcome = drive_structured_call(client, request, validate_recognition_output)
+        output = audited_structured_call(
+            conn, client, task=RECOGNIZER_TASK, prompt_id=PROMPT_ID,
+            schema_id=_OUTPUT_SCHEMA_ID, catalog_metadata={}, instruction=instruction, actor=actor)
     except Exception:
-        # Fail-open: a dispatch-time error (e.g. provider transport, misconfigured client) must never
-        # propagate — recognition is shadow and must never block generation.
         logger.exception("recognition dispatch raised; failing open to technical_failure")
         return unscoped_result(
-            "recognition dispatch error", model_id=model_id, prompt_version=PROMPT_VERSION,
-            technical=True)
+            "recognition dispatch error", model_id=model, prompt_version=PROMPT_VERSION, technical=True)
 
-    if outcome.status == STATUS_FAILED:
-        reason = outcome.validation_result.get("reason", "recognition failed")
+    if not output:                              # egress block / provider failure / empty body
         return unscoped_result(
-            reason, model_id=model_id, prompt_version=PROMPT_VERSION, technical=True)
+            "recognition failed or egress-blocked", model_id=model, prompt_version=PROMPT_VERSION,
+            technical=True)
 
     try:
-        return _result_from_output(outcome.output, model_id=model_id)
+        validate_recognition_output(output)     # closed-taxonomy semantics (id in registry, primary leaf)
+    except SchemaValidationError as exc:
+        return unscoped_result(
+            f"recognition output invalid: {exc}", model_id=model, prompt_version=PROMPT_VERSION,
+            technical=True)
+
+    try:
+        return _result_from_output(output, model_id=model)
     except Exception:
-        # The output is already validated, so this should not happen; guard anyway to honour the
-        # never-raise contract if the body drifts in a way validation did not cover.
         logger.exception("recognition output mapping raised; failing open to technical_failure")
         return unscoped_result(
-            "recognition mapping error", model_id=model_id, prompt_version=PROMPT_VERSION,
-            technical=True)
+            "recognition mapping error", model_id=model, prompt_version=PROMPT_VERSION, technical=True)

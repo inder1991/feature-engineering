@@ -57,7 +57,7 @@ def _fake(output: dict[str, Any], *, provider_status: str = PROVIDER_OK) -> Fake
     return FakeLLM(script={RECOGNIZER_TASK: FakeResponse(output=output, provider_status=provider_status)})
 
 
-def test_classified_output_maps_to_classified_result() -> None:
+def test_classified_output_maps_to_classified_result(db) -> None:
     output = {
         "status": "classified",
         "candidates": [
@@ -67,7 +67,8 @@ def test_classified_output_maps_to_classified_result() -> None:
         "ambiguity_note": None,
     }
     result = recognize(
-        _fake(output), redacted_hypothesis="will this customer close their current account next quarter?")
+        db, _fake(output),
+        redacted_hypothesis="will this customer close their current account next quarter?")
 
     assert result.status is RecognitionStatus.CLASSIFIED
     primaries = [c for c in result.candidates if c.relationship == "primary"]
@@ -81,30 +82,30 @@ def test_classified_output_maps_to_classified_result() -> None:
     assert result.prompt_version == PROMPT_VERSION
 
 
-def test_unknown_use_case_id_fails_open_never_invalid() -> None:
-    # An unknown id fails validation on every attempt; FakeLLM repeats the last response, so the
-    # bounded repair budget exhausts -> STATUS_FAILED -> fail-open. Never an invalid id, never raises.
+def test_unknown_use_case_id_fails_open_never_invalid(db) -> None:
+    # An unknown id is structurally valid (passes the JSON schema) but fails the closed-taxonomy
+    # semantic post-pass (validate_recognition_output) -> fail-open. Never an invalid id, never raises.
     output = {
         "status": "classified",
         "candidates": [_candidate("customer.not_a_real_leaf", relationship="primary")],
     }
-    result = recognize(_fake(output), redacted_hypothesis="something vague and unmapped")
+    result = recognize(db, _fake(output), redacted_hypothesis="something vague and unmapped")
 
     assert result.status in (RecognitionStatus.TECHNICAL_FAILURE, RecognitionStatus.UNSCOPED)
     assert result.candidates == ()
     assert all(c.use_case_id != "customer.not_a_real_leaf" for c in result.candidates)
 
 
-def test_provider_refusal_is_technical_failure() -> None:
+def test_provider_refusal_is_technical_failure(db) -> None:
     result = recognize(
-        _fake({}, provider_status=PROVIDER_REFUSAL), redacted_hypothesis="anything at all")
+        db, _fake({}, provider_status=PROVIDER_REFUSAL), redacted_hypothesis="anything at all")
     assert result.status is RecognitionStatus.TECHNICAL_FAILURE
     assert result.candidates == ()
 
 
-def test_unscoped_output_maps_to_unscoped() -> None:
+def test_unscoped_output_maps_to_unscoped(db) -> None:
     result = recognize(
-        _fake({"status": "unscoped", "candidates": []}),
+        db, _fake({"status": "unscoped", "candidates": []}),
         redacted_hypothesis="let's explore what is interesting in the data")
     assert result.status is RecognitionStatus.UNSCOPED
     assert result.candidates == ()
