@@ -7,6 +7,7 @@ threaded — omitting them would silently downgrade safety (review root-cause A)
 """
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime
 from typing import Annotated
 
@@ -22,13 +23,14 @@ from featuregen.api.deps import (
     require_feature_read,
 )
 from featuregen.contracts.envelopes import IdentityEnvelope
-from featuregen.intake.llm import LLMClient
+from featuregen.intake.llm import LLMClient, compute_input_hash
 from featuregen.overlay.upload.contract.author import ContractDraft, draft_contract
 from featuregen.overlay.upload.contract.gate1 import (
     build_considered_set,
     chosen_feature,
     gate1_choice,
     intent_target_ref,
+    persist_intent,
     record_gate1_choice,
 )
 from featuregen.overlay.upload.contract.govern import (
@@ -38,8 +40,16 @@ from featuregen.overlay.upload.contract.govern import (
     get_contract_detail,
     list_contracts,
 )
-from featuregen.overlay.upload.contract.intake import IntentValidationError, submit_intent
+from featuregen.overlay.upload.contract.intake import (
+    IntentValidationError,
+    redact_free_text,
+    submit_intent,
+)
 from featuregen.overlay.upload.contract.review import author_contract
+from featuregen.overlay.upload.contract.scope_records import record_recognition_attempt
+from featuregen.overlay.upload.taxonomy.recognition import RecognitionStatus
+from featuregen.overlay.upload.taxonomy.recognizer import recognize
+from featuregen.overlay.upload.taxonomy.use_cases import use_case
 
 router = APIRouter()
 
@@ -89,6 +99,11 @@ class DraftReqIn(BaseModel):
     why: str = ""
 
 
+class RecognitionIn(BaseModel):
+    hypothesis: str = Field(min_length=1)
+    objective: str = ""           # optional prediction goal; redacted before it can reach the LLM
+
+
 # ---- routes -------------------------------------------------------------------------------------
 @router.post("/contract/considered-set", dependencies=[Depends(require_feature_generate)])
 def considered_set(body: ConsideredSetIn, conn: _Conn, identity: _Identity, client: _LLM) -> dict:
@@ -107,6 +122,51 @@ def considered_set(body: ConsideredSetIn, conn: _Conn, identity: _Identity, clie
     return {"intent_id": intent.intent_id, "anchor": cs.anchor,
             "alternatives": cs.alternatives, "recommendation": cs.recommendation,
             "rejections": cs.rejections}
+
+
+@router.post("/contract/recognitions", dependencies=[Depends(require_feature_generate)])
+def recognitions(body: RecognitionIn, conn: _Conn, identity: _Identity, client: _LLM) -> dict:
+    """Phase-1B Gate #1 recognition: classify the objective's governed use-case scope from the
+    REDACTED hypothesis/goal (recognition NEVER sees catalog columns) and persist an append-only
+    recognition attempt — BEFORE any generation run exists. Decoupled from generation: no
+    ``generation_run_id`` is minted here and no recipe/applicability count is returned (applicability
+    owns any recipe count, computed later once the human commits to generate). FAIL-OPEN: ``recognize``
+    never raises, so a provider failure/refusal folds to ``status='technical_failure'`` at HTTP 200 —
+    recognition never blocks generation and never 5xxs."""
+    try:
+        intent = submit_intent(hypothesis=body.hypothesis, actor=identity.subject)
+        redacted_goal = redact_free_text(body.objective) if body.objective else None
+    except IntentValidationError as e:   # a free-text field that cannot be safely redacted -> denial
+        raise HTTPException(status_code=422, detail=str(e)) from e
+    # Idempotent intent: submit_intent mints a fresh id each call, so reuse the EARLIEST intent already
+    # recorded for this exact (hypothesis, mode) — re-recognising the same objective is free and never
+    # forks the immutable intent. persist_intent is itself ON CONFLICT (intent_id) DO NOTHING.
+    prior = conn.execute(
+        "SELECT intent_id FROM contract_intent WHERE hypothesis = %s AND intake_mode = %s "
+        "ORDER BY created_at ASC LIMIT 1",
+        (intent.hypothesis, intent.intake_mode)).fetchone()
+    if prior is not None:
+        intent = replace(intent, intent_id=prior[0])
+    persist_intent(conn, intent)
+
+    input_hash = compute_input_hash({"hypothesis": intent.redacted_hypothesis, "goal": redacted_goal})
+    result = recognize(conn, client, redacted_hypothesis=intent.redacted_hypothesis,
+                       redacted_goal=redacted_goal, actor=identity)
+    recognition_id = record_recognition_attempt(
+        conn, intent_id=intent.intent_id, input_hash=input_hash, result=result,
+        actor=identity.subject)
+    # Fail-open asymmetry: unscoped / technical_failure -> full grounding downstream (recognition never
+    # narrows on doubt). The recipe count is NOT here — applicability computes it after generate.
+    unscoped = result.status in (RecognitionStatus.UNSCOPED, RecognitionStatus.TECHNICAL_FAILURE)
+    candidates = [{
+        "use_case_id": c.use_case_id,
+        "display_name": (uc.display_name if (uc := use_case(c.use_case_id)) else c.use_case_id),
+        "relationship": c.relationship,
+        "confidence": c.confidence,
+        "evidence_spans": list(c.evidence_spans),
+    } for c in result.candidates]
+    return {"intent_id": intent.intent_id, "recognition_id": recognition_id,
+            "status": result.status.value, "unscoped": unscoped, "candidates": candidates}
 
 
 @router.post("/contract/draft", dependencies=[Depends(require_feature_generate)])
