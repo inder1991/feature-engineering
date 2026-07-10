@@ -5,9 +5,15 @@ defined + STRUCTURALLY validated here (no global-registry cross-check — that i
 stable, self-consistent types."""
 from __future__ import annotations
 
+from collections import Counter
+
 import pytest
 
 from featuregen.overlay.upload.taxonomy.dimensions import known_entities
+from featuregen.overlay.upload.taxonomy.entity_registry import (
+    ENTITY_RELATIONSHIPS_V1,
+    GRAPH_VERSION,
+)
 from featuregen.overlay.upload.taxonomy.entity_relationships import (
     AggregationStrategy,
     Cardinality,
@@ -150,3 +156,27 @@ def test_relationship_proposal_validation():
         validate_relationship_proposal(_proposal(proposed_to_entity="account"), known=KNOWN)
     with pytest.raises(ValueError, match="evidence"):
         validate_relationship_proposal(_proposal(evidence_refs=()), known=KNOWN)
+
+
+def test_registry_is_exactly_the_five_seed_rollups_and_valid():
+    edges = {(d.from_entity, d.to_entity) for d in ENTITY_RELATIONSHIPS_V1}
+    assert edges == {
+        ("account", "customer"), ("card_account", "customer"), ("transaction", "account"),
+        ("facility", "obligor"), ("policy", "customer")}
+    for d in ENTITY_RELATIONSHIPS_V1:
+        validate_relationship_definition(d, known=KNOWN)
+        assert d.aggregation_required is True
+        assert d.aggregation_strategy is AggregationStrategy.RECIPE_DECLARED  # never a blanket agg list
+    assert GRAPH_VERSION == "1.0.0"
+
+
+def test_registry_out_degree_at_most_one():
+    # Out-degree <=1 prevents branching; acyclicity is enforced by the builder (Task 3).
+    out_degree = Counter(
+        d.from_entity for d in ENTITY_RELATIONSHIPS_V1 if d.status is RelationshipStatus.ACTIVE)
+    assert all(n <= 1 for n in out_degree.values())
+
+
+def test_registry_relationship_ids_unique():
+    ids = [d.relationship_id for d in ENTITY_RELATIONSHIPS_V1]
+    assert len(ids) == len(set(ids))
