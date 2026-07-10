@@ -96,3 +96,88 @@ def test_builder_validates_endpoints():
 def test_invalid_graph_version_rejected():
     with pytest.raises(ValueError, match="version"):
         build_entity_graph((_e("a_c", "account", "customer"),), version="v1", known=KNOWN)
+
+
+from featuregen.overlay.upload.taxonomy.entity_graph import (
+    ENTITY_GRAPH,
+    resolve_entity_compatibility,
+)
+from featuregen.overlay.upload.taxonomy.entity_relationships import EntityCompatibility
+
+
+def test_unknown_entities_never_exact():
+    # THE closed-vocab guard: two identical out-of-vocab strings must NOT be EXACT.
+    r = resolve_entity_compatibility("not_an_entity", "not_an_entity", ENTITY_GRAPH)
+    assert r.status is EntityCompatibility.UNKNOWN
+    assert "unknown_source_entity" in r.reason_codes
+    assert resolve_entity_compatibility("account", "not_an_entity", ENTITY_GRAPH).reason_codes \
+        == ("unknown_target_entity",)
+    assert resolve_entity_compatibility("", "", ENTITY_GRAPH).status is EntityCompatibility.UNKNOWN
+
+
+def test_exact_when_known_source_equals_target():
+    r = resolve_entity_compatibility("customer", "customer", ENTITY_GRAPH)
+    assert r.status is EntityCompatibility.EXACT
+    assert r.paths == () and r.graph_version == ENTITY_GRAPH.version
+
+
+def test_derivable_direct_and_transitive():
+    direct = resolve_entity_compatibility("account", "customer", ENTITY_GRAPH)
+    assert direct.status is EntityCompatibility.DERIVABLE
+    assert [h.relationship_id for h in direct.paths[0].hops] == ["account_to_customer"]
+    assert direct.paths[0].hops[0].relationship_version == "1.0.0"
+    assert direct.paths_truncated is False
+    trans = resolve_entity_compatibility("transaction", "customer", ENTITY_GRAPH)
+    assert [h.to_entity for h in trans.paths[0].hops] == ["account", "customer"]
+
+
+def test_unknown_when_no_path():
+    assert resolve_entity_compatibility("customer", "account", ENTITY_GRAPH).status \
+        is EntityCompatibility.UNKNOWN
+
+
+def test_seed_never_emits_ambiguous():
+    ents = ("customer", "account", "card_account", "transaction", "facility", "obligor", "policy")
+    for s in ents:
+        for t in ents:
+            assert resolve_entity_compatibility(s, t, ENTITY_GRAPH).status \
+                is not EntityCompatibility.AMBIGUOUS
+
+
+def test_ambiguous_two_paths_is_not_truncated():
+    g = build_entity_graph(
+        (_e("t_a", "transaction", "account"), _e("a_c", "account", "customer"),
+         _e("t_ca", "transaction", "card_account"), _e("ca_c", "card_account", "customer")),
+        version="1.0.0", known=KNOWN)
+    r = resolve_entity_compatibility("transaction", "customer", g)
+    assert r.status is EntityCompatibility.AMBIGUOUS
+    assert len(r.paths) == 2 and r.paths_truncated is False   # exactly two — nothing truncated
+
+
+def test_ambiguous_three_paths_is_truncated():
+    g = build_entity_graph(
+        (_e("t_a", "transaction", "account"), _e("a_c", "account", "customer"),
+         _e("t_ca", "transaction", "card_account"), _e("ca_c", "card_account", "customer"),
+         _e("t_p", "transaction", "policy"), _e("p_c", "policy", "customer")),
+        version="1.0.0", known=KNOWN)
+    r = resolve_entity_compatibility("transaction", "customer", g)
+    assert r.status is EntityCompatibility.AMBIGUOUS
+    assert len(r.paths) == 2 and r.paths_truncated is True    # visible capped; a third path exists
+
+
+def _unsafe_graph_for_test(edges: dict) -> object:
+    # Direct construction bypasses build_entity_graph invariants — TEST-ONLY, to exercise traversal
+    # defense against a malformed graph the builder would have rejected. Production graphs come only
+    # from build_entity_graph.
+    from types import MappingProxyType
+
+    from featuregen.overlay.upload.taxonomy.entity_graph import EntityGraph
+    return EntityGraph(version="1.0.0", known_entities=KNOWN, _adjacency=MappingProxyType(edges))
+
+
+def test_traversal_visited_guard_defends_a_malformed_cyclic_graph():
+    cyclic = _unsafe_graph_for_test({
+        "account": (_e("a_c", "account", "customer"),),
+        "customer": (_e("c_a", "customer", "account"),)})
+    assert resolve_entity_compatibility("account", "customer", cyclic).status \
+        is EntityCompatibility.DERIVABLE
