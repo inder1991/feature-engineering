@@ -147,7 +147,9 @@ def search(conn, query: str = "", *, now: datetime, roles: Iterable[str] = (),
         # Hits: every facet applied, score-ordered, limit-capped.
         cur.execute(
             f"SELECT {_SELECT_HIT} {_FROM} WHERE {where_all} "
-            "ORDER BY score DESC, n.object_ref LIMIT %(limit)s", params)
+            # object_ref is not unique across catalog_source, so tiebreak on both for a
+            # deterministic order at the limit boundary (review Minor 1).
+            "ORDER BY score DESC, n.object_ref, n.catalog_source LIMIT %(limit)s", params)
         hits = [_hit(r) for r in cur.fetchall()]
 
         # Total: every facet applied, no limit (may exceed len(hits)).
