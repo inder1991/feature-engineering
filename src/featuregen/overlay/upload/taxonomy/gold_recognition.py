@@ -24,6 +24,16 @@ sibling), so it is a defensible member of the case's in-scope set.
    acting as a banking SME. It has **not** yet been validated by an independent human expert. Treat
    the labels as provisional until that review lands; the recognizer's measured accuracy against this
    set is only as trustworthy as the labels themselves.
+
+   A first SME-review pass HAS been applied (grounded against the actual recipe→objective mappings):
+   G24 was corrected (it is a CORPORATE-lending case, so two trading-book recipes —
+   ``trading_limit_utilisation`` / ``book_desk_concentration`` — were replaced with a corporate
+   concentration recipe). Two THIN-LEAF cases are retained deliberately: G22 (``credit.underwriting.
+   affordability``) and G23 (``aml_cft.sanctions``) have **no primary recipes** in the current library
+   — they are populated only by *secondary* relevance (sanctions specifically because the D3 owner
+   ruling routes every AML recipe to the ``suspicious_transaction_monitoring`` leaf). They therefore
+   test the supporting-scope retention path against a thinly-populated objective, and also document a
+   library-coverage gap for a later expert to weigh.
 """
 from __future__ import annotations
 
@@ -404,9 +414,12 @@ GOLD: tuple[GoldCase, ...] = (
         prediction_goal="Early-warning deterioration score, feeding limit monitoring and concentration watch.",
         expected_primary="credit.early_warning",
         permitted_secondary=("credit.monitoring.limit_management", "portfolio_risk.concentration"),
+        # SME-review fix: this is a CORPORATE-LENDING case (name/sector concentration), so the concentration
+        # + limit recipes must be credit/corporate, NOT trading-book (trading_limit_utilisation /
+        # book_desk_concentration are markets recipes and were dropped as off-domain).
         expected_relevant_recipes=(
             "credit_utilisation", "exposure_trend", "covenant_headroom_breach",
-            "trading_limit_utilisation", "loan_to_value", "group_exposure_aggregation", "book_desk_concentration",
+            "loan_to_value", "group_exposure_aggregation", "syndication_concentration",
         ),
         category="multi_use_case",
     ),

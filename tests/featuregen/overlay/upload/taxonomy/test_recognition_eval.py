@@ -122,10 +122,9 @@ def test_oracle_reports_no_false_narrowing_and_full_recall(db) -> None:
 # primary ALONE retains only the early-warning recipes and drops the rest — a false narrowing.
 _G24 = _case("G24")
 _G24_DROPPED = (
-    "trading_limit_utilisation",
     "loan_to_value",
     "group_exposure_aggregation",
-    "book_desk_concentration",
+    "syndication_concentration",
 )
 
 
