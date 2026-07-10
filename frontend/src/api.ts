@@ -367,6 +367,11 @@ export interface ConsideredSetResp {
   // version the ranking was computed under (provenance; a bump never mutates a prior projection).
   ranking?: RankedRecipe[]
   ranking_version?: string
+  // Phase-2B — per-recipe SOFT-dimension signal warnings, present ONLY when the ranking flag is on.
+  // Maps a recipe_id to its warning codes (e.g. `entity_grain_mismatch` / `modelling_context_conflict`).
+  // Presentation-only: a warning NEVER rejects a recipe or changes its disposition — it is a nudge the
+  // ranker already applied plus a badge the human sees. The FRONTEND maps each code to display text.
+  signal_warnings?: Record<string, string[]>
 }
 
 export interface ContractDraft {
@@ -431,6 +436,13 @@ export interface RecognitionResp {
   status: 'classified' | 'ambiguous' | 'unscoped' | 'technical_failure'
   unscoped: boolean
   candidates: RecognitionCandidate[]
+  // Phase-2B SOFT intent dimensions the recognizer proposed (additive; empty/null when none). NEVER
+  // a rejection — the human confirms/overrides them at Gate #1 and they act as ranking nudges only.
+  // `modelling_contexts` are governed context ids; `target_entity` is the proposed prediction grain;
+  // `warnings` are the recognizer's non-fatal per-dimension notes (a value it could not map).
+  modelling_contexts: string[]
+  target_entity: string | null
+  warnings: string[]
 }
 
 // The human's confirmed Gate #1 scope, in the shape the UI holds it (camelCase). `primary` /
@@ -445,6 +457,11 @@ export interface ConfirmedScopeInput {
   unscoped: boolean
   useCaseOrigins: Record<string, string>
   confirmationSource: string
+  // Phase-2B SOFT dimensions the human confirmed/overrode: governed modelling context ids and the
+  // proposed prediction grain. They flow into the scoped considered-set as ranking nudges (never a
+  // scope-narrowing filter). `targetEntity` is null when the human proposed/kept no grain.
+  modellingContexts: string[]
+  targetEntity: string | null
 }
 
 // One stage evaluation on a recipe's disposition. `reason_codes` carry the WHY the UI renders;
@@ -518,6 +535,8 @@ export function contractConsideredSet(
           unscoped: opts.confirmedScope.unscoped,
           use_case_origins: opts.confirmedScope.useCaseOrigins,
           confirmation_source: opts.confirmedScope.confirmationSource,
+          modelling_contexts: opts.confirmedScope.modellingContexts,
+          target_entity: opts.confirmedScope.targetEntity,
         }
       : null,
     // Lineage/history only for a broaden: the prior scope this run supersedes. Never used to

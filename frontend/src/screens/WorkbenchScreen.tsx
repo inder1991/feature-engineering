@@ -120,6 +120,21 @@ function initialViewReasonText(code: string): string {
   return INITIAL_VIEW_REASON_TEXT[code] ?? humanizeCode(code)
 }
 
+// Phase-2B: the CLOSED modelling-context vocabulary the human may confirm/add at Gate #1. Hardcoded
+// FRONTEND-side (mirrors RANK_REASON_TEXT), tracking the backend's stable 8-member MODELLING_CONTEXTS
+// set. A SOFT dimension: these are ranking nudges only — nothing here narrows scope or rejects a recipe.
+const MODELLING_CONTEXT_OPTIONS = ['ifrs9', 'frtb', 'xva', 'lcr', 'nsfr', 'lgd', 'irrbb', 'ftp'] as const
+// Display text for the ranker's per-recipe SOFT-dimension signal warnings, mapped IN THE FRONTEND
+// (never backend text). A warning is presentation-only — a badge the human sees, never a rejection.
+// An unknown code from a newer backend still renders as words (humanizeCode), never breaks the client.
+const SIGNAL_WARNING_TEXT: Record<string, string> = {
+  entity_grain_mismatch: 'Built at a different grain — derivable by roll-up',
+  modelling_context_conflict: 'Declares a different modelling context',
+}
+function signalWarningText(code: string): string {
+  return SIGNAL_WARNING_TEXT[code] ?? humanizeCode(code)
+}
+
 // The disposition lens, in render order: each final_disposition mapped to its human heading.
 const DISPOSITION_GROUPS: { key: RecipeDisposition['final_disposition']; heading: string }[] = [
   { key: 'eligible', heading: 'Recommended' },
@@ -530,14 +545,20 @@ function JoinPathDetails({ steps }: { steps: JoinStep[] }) {
 // "Why here" disclosure over the mapped `rank_reasons`, and (for a non-initial recipe) a SEPARATE
 // "Why not shown initially" disclosure over `initial_view_reasons`. The two reason streams are kept
 // visually distinct (two separately-labelled disclosures), never merged into one list.
-function RankedRecipeRow({ recipe }: { recipe: RankedRecipe }) {
+function RankedRecipeRow({ recipe, warnings }: { recipe: RankedRecipe; warnings?: string[] }) {
   return (
     <li className="row" style={{ alignItems: 'flex-start', gap: 10 }}>
       <span className="micro-label tabular-nums" style={{ fontWeight: 600, marginTop: 6 }}>
         #{recipe.canonical_rank}
       </span>
       <div style={{ display: 'grid', gap: 6, flex: 1, minWidth: 0, padding: '6px 0' }}>
-        <span className="mono" style={{ fontWeight: 600 }}>{recipe.recipe_id}</span>
+        <span className="row" style={{ gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
+          <span className="mono" style={{ fontWeight: 600 }}>{recipe.recipe_id}</span>
+          {/* Phase-2B SOFT-dimension warnings: presentation-only badges — never a rejection. */}
+          {(warnings ?? []).map(code => (
+            <span key={code} className="badge">{signalWarningText(code)}</span>
+          ))}
+        </span>
         <details className="rank-why">
           <summary style={{ cursor: 'pointer', color: 'var(--ink-soft)' }}>Why here</summary>
           <ul style={{ margin: '6px 0 0', paddingLeft: 18 }}>
@@ -617,6 +638,14 @@ export function WorkbenchScreen() {
   const [scopePrimary, setScopePrimary] = useState<string | null>(null)
   const [scopeSecondary, setScopeSecondary] = useState<string[]>([])
   const [scopeExpansion, setScopeExpansion] = useState<'exact' | 'include_descendants'>('exact')
+  // Phase-2B SOFT intent dimensions the human confirms/overrides at Gate #1: the confirmed governed
+  // modelling contexts and the proposed prediction grain (target entity, null for none). Seeded from
+  // the recognizer's proposal, editable, and threaded into BOTH confirm and broaden as ranking nudges
+  // (never a scope-narrowing filter). `signalWarnings` is the scoped response's per-recipe warning map
+  // (recipe_id -> codes), present only when the ranking flag is on; presentation-only, never a rejection.
+  const [scopeContexts, setScopeContexts] = useState<string[]>([])
+  const [scopeEntity, setScopeEntity] = useState<string | null>(null)
+  const [signalWarnings, setSignalWarnings] = useState<Record<string, string[]> | null>(null)
   // The scoped considered-set's per-recipe dispositions (the lens) and the scope id the last scoped
   // run was governed by — the prior scope a broaden supersedes. Both null on the unscoped path.
   const [dispositions, setDispositions] = useState<RecipeDisposition[] | null>(null)
@@ -794,6 +823,8 @@ export function WorkbenchScreen() {
     setDispositions(null)
     // The deterministic ranking was for the previous scope too; drop it (no-op when the flag is off).
     setRanking(null)
+    // The per-recipe SOFT-dimension warnings belonged to that ranking too (no-op when the flag is off).
+    setSignalWarnings(null)
   }
 
   function changeSource(value: string) {
@@ -892,6 +923,9 @@ export function WorkbenchScreen() {
     // reset the "Show all" disclosure for the new round. Absent → null (ranking flag off / unscoped).
     setRanking(cs.ranking ?? null)
     setRankingVersion(cs.ranking_version ?? null)
+    // Phase 2B: the per-recipe SOFT-dimension warning map, present only with the ranking flag on
+    // (absent → null). Presentation-only badges — never a rejection or a disposition change.
+    setSignalWarnings(cs.signal_warnings ?? null)
     setShowAllRanked(false)
     // A fresh engine round starts a fresh feedback cycle against ITS hypothesis and objective:
     // whole-round feedback reruns these even if the inputs are edited later.
@@ -912,6 +946,7 @@ export function WorkbenchScreen() {
     setGenerated(null)
     setDispositions(null)
     setRanking(null)
+    setSignalWarnings(null)
     clearSets()
     clearFeedback()
     try {
@@ -924,6 +959,10 @@ export function WorkbenchScreen() {
       setScopeSecondary(
         rec.candidates.filter(c => c.relationship === 'secondary').map(c => c.use_case_id))
       setScopeExpansion('exact')
+      // Phase-2B: seed the SOFT dimensions from the recognizer's proposal — the human confirms or
+      // overrides them below before confirm/broaden. Empty/null when the recognizer proposed none.
+      setScopeContexts(rec.modelling_contexts)
+      setScopeEntity(rec.target_entity)
     } catch (err) {
       if (seq !== generateSeq.current) return
       setRecognition(null)
@@ -960,6 +999,9 @@ export function WorkbenchScreen() {
           unscoped: false,
           useCaseOrigins,
           confirmationSource: 'user_confirmed',
+          // SOFT dimensions the human confirmed/overrode: ranking nudges only, never a scope filter.
+          modellingContexts: scopeContexts,
+          targetEntity: scopeEntity,
         },
       })
       if (seq !== generateSeq.current) return
@@ -998,6 +1040,9 @@ export function WorkbenchScreen() {
           unscoped: true,
           useCaseOrigins: {},
           confirmationSource: 'broaden',
+          // Dimensions are SOFT ranking nudges that still apply to the broadened (unscoped) set.
+          modellingContexts: scopeContexts,
+          targetEntity: scopeEntity,
         },
         supersedesScopeId: lastScopeId ?? undefined,
       })
@@ -1727,6 +1772,67 @@ export function WorkbenchScreen() {
               </label>
             </>
           )}
+          {/* Phase-2B SOFT dimensions (modelling context + prediction grain). Rendered whenever a
+              recognition has landed — dimensions can be proposed WITHOUT a use-case — so it lives
+              OUTSIDE the primary/no-primary branch. These are ranking nudges ONLY: editing them
+              never narrows the scope and never rejects a recipe. */}
+          <div className="scope-dimensions" style={{ marginTop: 16 }}>
+            <h3 style={{ margin: '0 0 8px' }}>Modelling context &amp; entity (optional)</h3>
+            <div style={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 8 }}>
+              {scopeContexts.map(ctx => (
+                <span
+                  key={ctx}
+                  className="badge"
+                  style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}
+                >
+                  {ctx}
+                  <button
+                    type="button"
+                    className="btn"
+                    aria-label={`Remove context ${ctx}`}
+                    onClick={() => setScopeContexts(prev => prev.filter(c => c !== ctx))}
+                  >
+                    Remove
+                  </button>
+                </span>
+              ))}
+              <select
+                aria-label="Add modelling context"
+                value=""
+                onChange={e => {
+                  const ctx = e.target.value
+                  if (ctx) setScopeContexts(prev => (prev.includes(ctx) ? prev : [...prev, ctx]))
+                }}
+              >
+                <option value="">Add context…</option>
+                {MODELLING_CONTEXT_OPTIONS.filter(o => !scopeContexts.includes(o)).map(o => (
+                  <option key={o} value={o}>{o}</option>
+                ))}
+              </select>
+            </div>
+            <div className="field" style={{ marginTop: 12, maxWidth: 320 }}>
+              <label htmlFor="wb-scope-entity">Target entity</label>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                <input
+                  id="wb-scope-entity"
+                  type="text"
+                  value={scopeEntity ?? ''}
+                  onChange={e => {
+                    const v = e.target.value.trim()
+                    setScopeEntity(v === '' ? null : v)
+                  }}
+                />
+                <button type="button" className="btn" onClick={() => setScopeEntity(null)}>
+                  Clear entity
+                </button>
+              </div>
+            </div>
+            {recognition.warnings.length > 0 && (
+              <p className="hint" role="status" style={{ marginTop: 8 }}>
+                We couldn't map part of what you described to a known context or entity.
+              </p>
+            )}
+          </div>
           <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginTop: 16 }}>
             {primaryCandidate !== null && (
               <button
@@ -1888,7 +1994,9 @@ export function WorkbenchScreen() {
           )}
           {/* The deterministic ranked list: the initial-view subset first. */}
           <ul className="rows">
-            {rankedInitial.map(r => <RankedRecipeRow key={r.recipe_id} recipe={r} />)}
+            {rankedInitial.map(r => (
+              <RankedRecipeRow key={r.recipe_id} recipe={r} warnings={signalWarnings?.[r.recipe_id]} />
+            ))}
           </ul>
           {rankedRest.length > 0 && (
             <>
@@ -1903,7 +2011,9 @@ export function WorkbenchScreen() {
               </button>
               {showAllRanked && (
                 <ul className="rows" id="wb-ranking-rest">
-                  {rankedRest.map(r => <RankedRecipeRow key={r.recipe_id} recipe={r} />)}
+                  {rankedRest.map(r => (
+                    <RankedRecipeRow key={r.recipe_id} recipe={r} warnings={signalWarnings?.[r.recipe_id]} />
+                  ))}
                 </ul>
               )}
             </>

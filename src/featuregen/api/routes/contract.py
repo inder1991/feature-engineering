@@ -455,7 +455,10 @@ def recognitions(body: RecognitionIn, conn: _Conn, identity: _Identity, client: 
         "evidence_spans": list(c.evidence_spans),
     } for c in result.candidates]
     return {"intent_id": intent.intent_id, "recognition_id": recognition_id,
-            "status": result.status.value, "unscoped": unscoped, "candidates": candidates}
+            "status": result.status.value, "unscoped": unscoped, "candidates": candidates,
+            "modelling_contexts": list(result.modelling_contexts),
+            "target_entity": result.target_entity,
+            "warnings": list(result.warnings)}
 
 
 @router.post("/contract/draft", dependencies=[Depends(require_feature_generate)])

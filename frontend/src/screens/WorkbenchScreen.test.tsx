@@ -1788,6 +1788,8 @@ describe('Gate #1 scope confirmation', () => {
         relationship: 'secondary', confidence: 'medium', evidence_spans: ['balance is draining'],
       },
     ],
+    // Phase-2B SOFT dimensions the recognizer proposed — surfaced for confirm/override at Gate #1.
+    modelling_contexts: ['ifrs9'], target_entity: 'customer', warnings: [],
   }
 
   // A scoped considered-set response: one eligible recipe + one out-of-scope recipe for the lens.
@@ -1874,6 +1876,75 @@ describe('Gate #1 scope confirmation', () => {
       expect.objectContaining({
         confirmedScope: expect.objectContaining({ primary: 'churn', secondary: [] }),
       }))
+  })
+
+  it('flag ON: shows the proposed dimensions and confirm sends them', async () => {
+    vi.stubEnv('VITE_INTENT_CONFIRMATION_UI', '1')
+    contractRecognitions.mockResolvedValue(RECOGNITION)
+    contractConsideredSet.mockResolvedValue(scopedConsidered())
+    await generateFlagOn()
+    // The proposed context chip + the proposed target entity render for confirm/override.
+    expect(await screen.findByText('ifrs9')).toBeInTheDocument()
+    expect(screen.getByLabelText('Target entity')).toHaveValue('customer')
+    await userEvent.click(screen.getByRole('button', { name: /confirm scope and generate/i }))
+    expect(contractConsideredSet).toHaveBeenCalledWith(HYPOTHESIS, 'predict churn',
+      expect.objectContaining({
+        confirmedScope: expect.objectContaining({
+          modellingContexts: ['ifrs9'], targetEntity: 'customer',
+        }),
+      }))
+    expect(await screen.findByText('avg_balance')).toBeInTheDocument()
+  })
+
+  it('flag ON: removing the context chip drops it from the confirmed dimensions', async () => {
+    vi.stubEnv('VITE_INTENT_CONFIRMATION_UI', '1')
+    contractRecognitions.mockResolvedValue(RECOGNITION)
+    contractConsideredSet.mockResolvedValue(scopedConsidered())
+    await generateFlagOn()
+    await userEvent.click(await screen.findByRole('button', { name: 'Remove context ifrs9' }))
+    await userEvent.click(screen.getByRole('button', { name: /confirm scope and generate/i }))
+    expect(contractConsideredSet).toHaveBeenCalledWith(HYPOTHESIS, 'predict churn',
+      expect.objectContaining({
+        confirmedScope: expect.objectContaining({ modellingContexts: [] }),
+      }))
+  })
+
+  it('flag ON: clearing the entity sends a null target entity', async () => {
+    vi.stubEnv('VITE_INTENT_CONFIRMATION_UI', '1')
+    contractRecognitions.mockResolvedValue(RECOGNITION)
+    contractConsideredSet.mockResolvedValue(scopedConsidered())
+    await generateFlagOn()
+    await userEvent.click(await screen.findByRole('button', { name: 'Clear entity' }))
+    await userEvent.click(screen.getByRole('button', { name: /confirm scope and generate/i }))
+    expect(contractConsideredSet).toHaveBeenCalledWith(HYPOTHESIS, 'predict churn',
+      expect.objectContaining({
+        confirmedScope: expect.objectContaining({ targetEntity: null }),
+      }))
+  })
+
+  it('flag ON: adding a context via the select threads it into the confirmed dimensions', async () => {
+    vi.stubEnv('VITE_INTENT_CONFIRMATION_UI', '1')
+    contractRecognitions.mockResolvedValue(RECOGNITION)
+    contractConsideredSet.mockResolvedValue(scopedConsidered())
+    await generateFlagOn()
+    await userEvent.selectOptions(
+      await screen.findByLabelText('Add modelling context'), 'frtb')
+    await userEvent.click(screen.getByRole('button', { name: /confirm scope and generate/i }))
+    expect(contractConsideredSet).toHaveBeenCalledWith(HYPOTHESIS, 'predict churn',
+      expect.objectContaining({
+        confirmedScope: expect.objectContaining({
+          modellingContexts: expect.arrayContaining(['frtb']),
+        }),
+      }))
+  })
+
+  it('flag ON: a recognizer dimension warning renders a non-fatal hint', async () => {
+    vi.stubEnv('VITE_INTENT_CONFIRMATION_UI', '1')
+    contractRecognitions.mockResolvedValue({ ...RECOGNITION, warnings: ['UNKNOWN_TARGET_ENTITY'] })
+    contractConsideredSet.mockResolvedValue(scopedConsidered())
+    await generateFlagOn()
+    expect(await screen.findByText(
+      /couldn.t map part of what you described to a known context or entity/i)).toBeInTheDocument()
   })
 
   it('flag ON + lens: groups an eligible and an out-of-scope recipe under their headings', async () => {
@@ -2053,5 +2124,35 @@ describe('Phase 2A ranking', () => {
     expect(within(row).getByText('Weaker column binding')).toBeInTheDocument()
     // The two streams never merge: the rank-reason text is not the initial-view reason text.
     expect(within(row).queryByText('duplicate_variant_not_in_initial_view')).toBeNull()
+  })
+
+  // A minimal classified recognition so the confirm flow (VITE_INTENT_CONFIRMATION_UI) can mint the
+  // scoped considered-set that carries the per-recipe SOFT-dimension signal warnings.
+  const REC: api.RecognitionResp = {
+    intent_id: 'int_1', recognition_id: 'rec_1', status: 'classified', unscoped: false,
+    candidates: [{
+      use_case_id: 'churn', display_name: 'Customer churn',
+      relationship: 'primary', confidence: 'high', evidence_spans: [],
+    }],
+    modelling_contexts: [], target_entity: null, warnings: [],
+  }
+
+  it('flags ON: a per-recipe SOFT-dimension warning renders its mapped text on the ranked row', async () => {
+    vi.stubEnv('VITE_INTENT_CONFIRMATION_UI', '1')
+    vi.stubEnv('VITE_INTENT_RANKING', '1')
+    contractRecognitions.mockResolvedValue(REC)
+    contractConsideredSet.mockResolvedValue({
+      ...rankedConsidered(),
+      signal_warnings: { balance_trend_30d: ['entity_grain_mismatch'] },
+    })
+    await generateRanked()
+    await userEvent.click(await screen.findByRole('button', { name: /confirm scope and generate/i }))
+    await screen.findByRole('heading', { name: /recipes by priority/i })
+    // balance_trend_30d is held back — reveal it, then its warning code renders as mapped text.
+    await userEvent.click(screen.getByRole('button', { name: 'Show all 3 recipes' }))
+    const panel = rankingPanel()
+    const row = within(panel).getByText('balance_trend_30d').closest('li') as HTMLElement
+    expect(within(row).getByText('Built at a different grain — derivable by roll-up'))
+      .toBeInTheDocument()
   })
 })

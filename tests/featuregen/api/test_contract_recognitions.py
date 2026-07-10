@@ -19,6 +19,8 @@ _CLASSIFIED = FakeResponse(output={
     "candidates": [{
         "use_case_id": CHURN, "relationship": "primary", "confidence": "high",
         "evidence_spans": ["churn"], "rationale": "the hypothesis is about customers leaving"}],
+    # Phase-2B SOFT dimensions: a governed modelling context + prediction grain the recognizer proposed.
+    "modelling_contexts": ["ifrs9"], "target_entity": "customer",
     "ambiguity_note": None})
 
 _UNSCOPED = FakeResponse(output={
@@ -53,6 +55,10 @@ def test_recognitions_classified_returns_candidate_and_writes_attempt(make_clien
     assert cand["relationship"] == "primary"
     assert cand["confidence"] == "high"
     assert cand["evidence_spans"] == ["churn"]
+    # Phase-2B SOFT dimensions surface on the response (proposed to the human at Gate #1, never rejected).
+    assert body["modelling_contexts"] == ["ifrs9"]
+    assert body["target_entity"] == "customer"
+    assert body["warnings"] == []
     # Recognition is decoupled from generation: NO run id, NO recipe/applicability count in the response.
     assert "generation_run_id" not in body
     assert not any(("count" in k) or ("recipe" in k) for k in body)
@@ -84,6 +90,10 @@ def test_recognitions_recognizer_failure_is_fail_open_200(make_client):
     assert body["status"] == "technical_failure"
     assert body["unscoped"] is True
     assert body["candidates"] == []
+    # Fail-open surfaces empty dimensions: no context, no proposed grain, no dimension warnings.
+    assert body["modelling_contexts"] == []
+    assert body["target_entity"] is None
+    assert body["warnings"] == []
 
 
 def test_recognitions_idempotent_intent_and_single_attempt(make_client, conn):
