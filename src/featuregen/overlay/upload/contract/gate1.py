@@ -9,8 +9,8 @@ without a recorded choice here**, in both definition and hypothesis-only modes.
 from __future__ import annotations
 
 import json
-import logging
 import os
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import timedelta
 
@@ -28,19 +28,13 @@ from featuregen.overlay.upload.feature_assist import (
     recommend_set,
     set_signals,
 )
-from featuregen.overlay.upload.taxonomy.applicability import (
-    in_scope_recipes,
-    scope_from_recognition,
-)
-from featuregen.overlay.upload.taxonomy.recognizer import recognize
+from featuregen.overlay.upload.taxonomy.applicability import ApplicabilityResult
 from featuregen.overlay.upload.templates import (
     ALL_TEMPLATES,
     GroundedFeature,
     Template,
     ground_all,
 )
-
-logger = logging.getLogger(__name__)
 
 
 class Gate1Error(Exception):
@@ -55,6 +49,9 @@ class ConsideredSet:
     recommendation: SetRecommendation | None      # advisory — fit vs hypothesis, not a performance claim
     rejections: list[dict] = field(default_factory=list)   # what the gauntlet threw out + why (Gate-#3
     #                                                        transparency the Workbench renders)
+    applicability: ApplicabilityResult | None = None       # the ONE applicability decision that scoped
+    #   grounding (Task 4), carried through so Task 5's disposition stage consumes the SAME object — not
+    #   persisted here (the API layer owns scope-record lifecycle, Task 7).
 
 
 def persist_intent(conn, intent: Intent, target_ref: str | None = None) -> None:
@@ -101,19 +98,22 @@ def _idea_from_grounded(gf: GroundedFeature, template: Template) -> FeatureIdea:
 
 
 def _template_candidates(conn, *, catalog_source: str, roles, target_ref: str | None, now,
+                         templates: Sequence[Template] = ALL_TEMPLATES,
                          fresh_within: timedelta = timedelta(hours=24),
                          ) -> tuple[list[FeatureIdea], list[dict]]:
-    """Ground ALL_TEMPLATES on this catalog and gauntlet-check each grounded candidate the SAME way LLM
+    """Ground ``templates`` on this catalog and gauntlet-check each grounded candidate the SAME way LLM
     candidates are (feature_assist._validate_idea, over the identical read-scoped candidate universe).
-    Grounding is the router — a template family surfaces only where its distinctive concepts exist, so a
-    churn-shaped catalog yields exactly the churn lens. Grounding refuses tagged leakage anchors by
-    construction, but the intent's SPECIFIC target_ref may not be a tagged anchor — the reused gauntlet
-    still rejects any candidate that binds it (plus freshness / additivity / PIT / units). Returns
-    (surviving ideas, {name, reason, code} rejects)."""
-    grounded = ground_all(conn, ALL_TEMPLATES, catalog_source=catalog_source, roles=roles)
+    ``templates`` defaults to the whole ``ALL_TEMPLATES`` registry (today's behaviour); Phase-1B scoped
+    grounding passes a pre-narrowed eligible subset instead (never widening — the subset is always ⊆
+    ALL_TEMPLATES). Grounding is the router — a template family surfaces only where its distinctive
+    concepts exist, so a churn-shaped catalog yields exactly the churn lens. Grounding refuses tagged
+    leakage anchors by construction, but the intent's SPECIFIC target_ref may not be a tagged anchor —
+    the reused gauntlet still rejects any candidate that binds it (plus freshness / additivity / PIT /
+    units). Returns (surviving ideas, {name, reason, code} rejects)."""
+    grounded = ground_all(conn, templates, catalog_source=catalog_source, roles=roles)
     if not grounded:
         return [], []
-    by_id = {t.id: t for t in ALL_TEMPLATES}
+    by_id = {t.id: t for t in templates}
     cols = _candidate_columns(conn, catalog_source, roles)   # the SAME candidate universe the LLM saw
     known = {c["object_ref"] for c in cols}
     src_of: dict[str, set[str]] = {}
@@ -134,13 +134,48 @@ def _template_candidates(conn, *, catalog_source: str, roles, target_ref: str | 
     return ideas, rejections
 
 
+# ── Phase-1B Task 4: scoped grounding (flag-gated, default off) ─────────────────────────────────────
+# When FEATUREGEN_INTENT_SCOPED_APPLICABILITY=1, a supplied ApplicabilityResult narrows the template
+# universe grounding evaluates to the eligible recipe subset. The flag defaults OFF → grounding sees the
+# whole ALL_TEMPLATES registry, byte-identical to today. The narrowing NEVER widens (the eligible set is
+# ⊆ ALL_TEMPLATES) and NEVER relaxes safety (grounding still refuses leakage/protected columns by
+# construction). Recognition/applicability is computed once in the API layer (Tasks 6/7); the builder is
+# a pure consumer here. See docs/superpowers/plans/2026-07-10-phase1b-scoped-grounding.md Task 4.
+def _intent_scoped_applicability_enabled() -> bool:
+    """Scoped grounding is OFF by default — ``build_considered_set`` grounds ``ALL_TEMPLATES`` unchanged
+    unless a deployment opts in with ``FEATUREGEN_INTENT_SCOPED_APPLICABILITY=1``."""
+    return os.environ.get("FEATUREGEN_INTENT_SCOPED_APPLICABILITY", "0") == "1"
+
+
+def _templates_to_ground(intent: Intent,
+                         applicability: ApplicabilityResult | None) -> Sequence[Template]:
+    """The template subset grounding evaluates for this run. Grounds only the applicability's
+    ``eligible_ids`` when ALL of: the scoped-applicability flag is on; an ``applicability`` is supplied;
+    the intent is NOT definition-mode (definition bypasses recognition/applicability, never grounding);
+    and the applicability GENUINELY NARROWS — its eligible set is strictly smaller than the full registry
+    (an unscoped/all-eligible result is not a narrowing and fails open to full grounding). Otherwise
+    returns ``ALL_TEMPLATES`` — today's behaviour, byte-identical."""
+    if (_intent_scoped_applicability_enabled()
+            and applicability is not None
+            and intent.intake_mode != "definition"
+            and len(applicability.eligible_ids) < len(ALL_TEMPLATES)):
+        return tuple(t for t in ALL_TEMPLATES if t.id in applicability.eligible_ids)
+    return ALL_TEMPLATES
+
+
 def build_considered_set(conn, intent: Intent, client: LLMClient, *, entity: str | None = None,
                          catalog_source: str | None = None, roles=(), target_ref: str | None = None,
-                         objective: str = "", feedback: str | None = None, now=None) -> ConsideredSet:
+                         objective: str = "", feedback: str | None = None, now=None,
+                         applicability: ApplicabilityResult | None = None) -> ConsideredSet:
     """Discovery loop → validated alternatives; the anchor is the requester's definition run through the
     same validated loop (definition mode only). Every option shown to the human has passed the gauntlet.
     Persists the intent + target_ref (M6, BLOCKER 2) and the considered-set snapshot (BLOCKER 1) when the
-    flow reaches Gate #1."""
+    flow reaches Gate #1.
+
+    ``applicability`` is the ONE applicability decision (computed once in the API layer, Task 7). When
+    scoped grounding is enabled it narrows the template lens to the eligible recipe subset; either way it
+    is carried through on the returned :class:`ConsideredSet` for the disposition stage (Task 5). The
+    builder is computation-only — it NEVER persists the confirmed scope (the API layer owns that)."""
     persist_intent(conn, intent, target_ref)
     # The prediction goal enriches the generation prompt (hypothesis = the causal premise; goal = what
     # we're predicting). Redacted with the same discipline as the hypothesis before it reaches the LLM,
@@ -159,8 +194,11 @@ def build_considered_set(conn, intent: Intent, client: LLMClient, *, entity: str
     # as its own "templates" lens; one that fails (e.g. it binds the intent's target_ref -> leakage) is
     # surfaced in the rejections, not silently dropped. Everything downstream treats it as one more lens.
     if catalog_source is not None:
+        # Phase-1B scoped grounding: ground only the eligible recipe subset when scoping is on (else the
+        # whole registry — byte-identical to today). Definition-mode + unscoped results bypass here.
         template_ideas, template_rejections = _template_candidates(
-            conn, catalog_source=catalog_source, roles=roles, target_ref=target_ref, now=now)
+            conn, catalog_source=catalog_source, roles=roles, target_ref=target_ref, now=now,
+            templates=_templates_to_ground(intent, applicability))
         if template_ideas:
             alternatives.append(FeatureSet(lens="templates", features=template_ideas))
         rejections.extend(template_rejections)
@@ -172,61 +210,13 @@ def build_considered_set(conn, intent: Intent, client: LLMClient, *, entity: str
         anchor = ideas[0] if ideas else None
     recommendation = (recommend_set(conn, alternatives, intent.redacted_hypothesis, client)
                       if any(s.features for s in alternatives) else None)
-    cs = ConsideredSet(intent.intent_id, anchor, alternatives, recommendation, rejections)
+    cs = ConsideredSet(intent.intent_id, anchor, alternatives, recommendation, rejections,
+                       applicability=applicability)
     conn.execute(   # persist the validated set so /contract/draft reconstructs the chosen feature here
         "INSERT INTO contract_considered (intent_id, considered) VALUES (%s, %s::jsonb) "
         "ON CONFLICT (intent_id) DO UPDATE SET considered = EXCLUDED.considered",
         (intent.intent_id, json.dumps(_snapshot(conn, cs))))
-    _shadow_recognition(conn, client, intent, redacted_goal, cs)  # flag-gated, LOG-ONLY; never filters cs
     return cs
-
-
-# ── Phase-1A: in-flow shadow recognizer (flag-gated, log-only) ─────────────────────────────────────
-# When FEATUREGEN_INTENT_RECOGNITION_SHADOW=1, run the LLM-only use-case recognizer over the SAME
-# redacted hypothesis/goal that drove generation and LOG what it WOULD scope to — the proposed
-# primary/secondary objectives + the would-be in-scope recipe count vs the templates actually grounded.
-# It is behaviour-neutral by construction: default OFF (recognize is never called, no extra LLM call,
-# zero behaviour change), and even when ON it only logs — it NEVER filters or alters `cs`, never
-# persists (that is Phase 1B), and never raises (any error is logged and swallowed so shadow can't
-# break generation). See docs/superpowers/plans/2026-07-09-phase1a-shadow-recognizer.md Task 6.
-def _intent_recognition_shadow_enabled() -> bool:
-    """The in-flow shadow recognizer is OFF by default — grounding is untouched unless a deployment
-    opts in with FEATUREGEN_INTENT_RECOGNITION_SHADOW=1 (dev/measurement only)."""
-    return os.environ.get("FEATUREGEN_INTENT_RECOGNITION_SHADOW", "0") == "1"
-
-
-def _grounded_template_count(cs: ConsideredSet) -> int:
-    """The number of grounded parametric-template candidates that actually reached the considered set
-    (the "templates" lens features) — the shadow log's real-world comparison point for the recognizer's
-    would-be in-scope recipe count. Read-only; never mutates `cs`."""
-    return sum(len(s.features) for s in cs.alternatives if s.lens == "templates")
-
-
-def _shadow_recognition(conn, client: LLMClient, intent: Intent, redacted_goal: str,
-                        cs: ConsideredSet) -> None:
-    """Flag-gated, LOG-ONLY shadow recognition. When the flag is OFF (default) this is a true no-op —
-    `recognize` is NOT called, so there is no extra LLM call and zero behaviour change. When ON, it
-    recognises the SAME redacted hypothesis/goal that drove generation, maps the result to a would-be
-    in-scope recipe set, and logs the proposed scope alongside the grounded-template count. It NEVER
-    uses the result to filter `cs`, NEVER persists, and NEVER raises — the whole block is wrapped so an
-    unexpected error is logged and swallowed rather than breaking generation."""
-    if not _intent_recognition_shadow_enabled():
-        return
-    try:
-        result = recognize(
-            conn, client, redacted_hypothesis=intent.redacted_hypothesis,
-            redacted_goal=redacted_goal or None)
-        scope = scope_from_recognition(result)
-        primary_scoped, _ = in_scope_recipes(scope)
-        logger.info(
-            "intent-recognition shadow: intent_id=%s status=%s primary=%s secondary=%s "
-            "in_scope_recipes=%d grounded_templates=%d (log-only; grounding unchanged)",
-            intent.intent_id, result.status.value, scope.primary, list(scope.secondary),
-            len(primary_scoped), _grounded_template_count(cs))
-    except Exception:   # shadow must never break generation — log and swallow
-        logger.exception(
-            "intent-recognition shadow failed (swallowed; grounding unaffected) for intent_id=%s",
-            intent.intent_id)
 
 
 def _alternative_ids(cs: ConsideredSet) -> set[str]:
