@@ -20,6 +20,7 @@ from featuregen.connectors.openmetadata import (
     OMAuthRejected,
     OMUnreachable,
     build_preview,
+    fetch_services,
     fetch_tables,
     httpx_fetch,
     read_openmetadata,
@@ -60,6 +61,27 @@ def test_repeated_cursor_raises_instead_of_looping():
 def test_page_without_data_list_fails_whole_pull():
     with pytest.raises(OMUnreachable, match="no 'data' list"):
         fetch_tables(lambda path, params: {"paging": {}})
+
+
+# ---- Service discovery ------------------------------------------------------------------------
+
+
+def test_fetch_services_lists_every_service_with_type_and_fqn():
+    services = fetch_services(fixture_fetch())
+    assert [(s["name"], s["serviceType"]) for s in services] == [
+        ("mysql_prod", "Mysql"), ("snowflake_dwh", "Snowflake"), ("bq_marketing", "BigQuery")]
+    assert services[0]["fullyQualifiedName"] == "mysql_prod"
+
+
+def test_fetch_services_follows_the_services_path():
+    seen: list[str] = []
+
+    def fetch(path, params):
+        seen.append(path)
+        return {"data": [], "paging": {}}
+
+    assert fetch_services(fetch) == []
+    assert seen == ["/api/v1/services/databaseServices"]
 
 
 # ---- Mapping table ----------------------------------------------------------------------------

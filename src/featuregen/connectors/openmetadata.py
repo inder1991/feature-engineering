@@ -45,6 +45,7 @@ from featuregen.overlay.upload.upload_catalog import UploadCatalog
 FetchPage = Callable[[str, dict[str, Any]], dict[str, Any]]
 
 _TABLES_PATH = "/api/v1/tables"
+_SERVICES_PATH = "/api/v1/services/databaseServices"
 _FIELDS = "columns,tags,tableConstraints"
 
 
@@ -103,32 +104,45 @@ def httpx_fetch(base_url: str, token: str, *, timeout: float = 10.0,
     return fetch
 
 
-def fetch_tables(fetch: FetchPage, *, page_size: int = 100) -> list[dict[str, Any]]:
-    """Pull every table entity in scope, following the cursor ('after') pagination.
+def _fetch_all(fetch: FetchPage, path: str, base_params: dict[str, Any], *,
+               page_size: int = 100) -> list[dict[str, Any]]:
+    """Follow the OM cursor ('after') pagination and assemble every 'data' entity.
 
-    Any page failure raises and fails the WHOLE pull — preview fails whole and import never sees
-    a partial pull (spec failure mode). A repeated cursor (a misbehaving server) raises instead
-    of looping forever.
+    Any page failure raises and fails the WHOLE pull — preview fails whole and import never sees a
+    partial pull (spec failure mode). A repeated cursor (a misbehaving server) raises instead of
+    looping forever.
     """
-    tables: list[dict[str, Any]] = []
+    items: list[dict[str, Any]] = []
     after: str | None = None
     seen_cursors: set[str] = set()
     while True:
-        params: dict[str, Any] = {"fields": _FIELDS, "limit": page_size}
+        params: dict[str, Any] = {**base_params, "limit": page_size}
         if after:
             params["after"] = after
-        page = fetch(_TABLES_PATH, params)
+        page = fetch(path, params)
         data = page.get("data")
         if not isinstance(data, list):
             raise OMUnreachable("OpenMetadata page has no 'data' list")
-        tables.extend(data)
+        items.extend(data)
         paging = page.get("paging") or {}
         after = paging.get("after") if isinstance(paging, dict) else None
         if not after:
-            return tables
+            return items
         if after in seen_cursors:
             raise OMUnreachable("OpenMetadata pagination repeated a cursor")
         seen_cursors.add(after)
+
+
+def fetch_tables(fetch: FetchPage, *, page_size: int = 100) -> list[dict[str, Any]]:
+    """Pull every table entity in scope (columns + tags + constraints), following cursor pagination."""
+    return _fetch_all(fetch, _TABLES_PATH, {"fields": _FIELDS}, page_size=page_size)
+
+
+def fetch_services(fetch: FetchPage, *, page_size: int = 100) -> list[dict[str, Any]]:
+    """List every DatabaseService the bot token can see. A bot JWT authenticates to the WHOLE
+    OpenMetadata instance, so this returns EVERY service (name, serviceType, fullyQualifiedName) —
+    the raw material for the sync-discovery screen. Same fail-whole pagination as fetch_tables."""
+    return _fetch_all(fetch, _SERVICES_PATH, {}, page_size=page_size)
 
 
 # ---- Translator -----------------------------------------------------------------------------
@@ -136,7 +150,9 @@ def fetch_tables(fetch: FetchPage, *, page_size: int = 100) -> list[dict[str, An
 
 @dataclass(frozen=True, slots=True)
 class OMConfig:
-    """One configured connection's translation scope (stored in connector_config)."""
+    """One sync's resolved translation scope: built at pull time from its integration (base_url +
+    default tag_map) and the sync itself (service/db/schema filters, target_source, tag-map
+    override, table naming). Not persisted as one row — assembled in the route's ``_pull``."""
 
     base_url: str
     target_source: str                                  # the FeatureGen catalog source
