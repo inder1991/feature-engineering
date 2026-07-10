@@ -42,6 +42,15 @@ def test_inactive_edges_excluded():
     assert g.outgoing("account") == ()
 
 
+def test_deprecated_def_with_bad_endpoint_does_not_block_build():
+    # Active-only validation: a DEPRECATED def is archived (skipped BEFORE validation), so an unknown
+    # endpoint on it must NOT break the build.
+    g = build_entity_graph(
+        (_e("bad", "account", "not_an_entity", status=RelationshipStatus.DEPRECATED),),
+        version="1.0.0", known=KNOWN)
+    assert g.outgoing("account") == ()
+
+
 def test_outgoing_sorted_by_relationship_id():
     g = build_entity_graph(
         (_e("z2", "transaction", "account"), _e("a2", "transaction", "obligor")),

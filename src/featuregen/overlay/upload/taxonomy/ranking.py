@@ -207,6 +207,8 @@ def _rank_reasons(s: RankSignals) -> tuple[RankReasonCode, ...]:
     if s.explainability == "H":
         reasons.append(RankReasonCode.HIGH_EXPLAINABILITY)
 
+    # NOTE: EntityCompatibility.AMBIGUOUS is reserved (the Phase-3A seed never emits it). When a future
+    # registry gains a multi-path edge, AMBIGUOUS must be handled here (today it falls through as no penalty).
     if s.entity_compatibility is EntityCompatibility.UNKNOWN:
         reasons.append(RankReasonCode.ENTITY_GRAIN_UNKNOWN)
 

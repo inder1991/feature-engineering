@@ -24,11 +24,13 @@ Four signals + a grouping key:
   context-free (generic) recipe is ``COMPATIBLE``, a recipe declaring only disjoint contexts is
   ``CONFLICT`` (a warning, NEVER a hard reject in Phase 2), and no confirmed context is ``NEUTRAL``.
 * :class:`EntityCompatibility` — the SOFT grain fit of a recipe to the confirmed ``target_entity``. Task B3
-  derives the recipe's grain (the ``entity_link`` of its entity-role need) and compares it to the target:
-  equal is ``EXACT``, a declared roll-up (child grain -> coarser parent) is ``DERIVABLE``, and anything
-  else (incl. no target) is ``UNKNOWN``. There is deliberately **no** ``INCOMPATIBLE`` — a hard entity
-  reject is deferred to Phase 3; ``target_entity`` is only ever a soft grain nudge + a grain warning, and
-  is NEVER used to reject a recipe anywhere.
+  derives the recipe's grain (the ``entity_link`` of its entity-role need); the grain *relationship* to the
+  target is now resolved by the governed entity graph (:func:`resolve_entity_compatibility` over
+  :data:`ENTITY_GRAPH`, Phase 3A — seed regression-equivalent) rather than a hardcoded roll-up map: equal is
+  ``EXACT``, a graph-derivable roll-up (child grain -> coarser parent) is ``DERIVABLE``, and anything else
+  (incl. no target) is ``UNKNOWN``. There is deliberately **no** ``INCOMPATIBLE`` — a hard entity reject is
+  deferred to Phase 3; ``target_entity`` is only ever a soft grain nudge + a grain warning, and is NEVER
+  used to reject a recipe anywhere.
 
 ``semantic_group`` is the near-duplicate key: the source template id, which every grounded variant of a
 template carries. Behaviour-neutral, read-only — nothing here touches grounding or the considered-set.

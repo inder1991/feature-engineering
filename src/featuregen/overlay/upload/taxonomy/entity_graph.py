@@ -85,7 +85,7 @@ def build_entity_graph(
             continue                                    # archived; not validated or indexed in 3A
         validate_relationship_definition(d, known=known)
         if d.traversal_direction is not TraversalDirection.FORWARD:
-            raise ValueError(f"only FORWARD active edges supported in 3A: {d.relationship_id!r}")
+            raise ValueError(f"only forward active edges supported in 3A: {d.relationship_id!r}")
         if d.relationship_id in seen_ids:
             raise ValueError(f"duplicate active relationship id: {d.relationship_id!r}")
         seen_ids.add(d.relationship_id)

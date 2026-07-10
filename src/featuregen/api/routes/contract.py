@@ -266,6 +266,8 @@ def _signal_warnings(signals: dict[str, RankSignals]) -> dict[str, list[str]]:
     warnings: dict[str, list[str]] = {}
     for rid, s in signals.items():
         codes: list[str] = []
+        # NOTE: EntityCompatibility.AMBIGUOUS is reserved (seed never emits it). A future multi-path
+        # registry edge would need an AMBIGUOUS warning here.
         if s.entity_compatibility is EntityCompatibility.DERIVABLE:
             codes.append("entity_grain_mismatch")
         if s.modelling_context_fit is ModellingContextFit.CONFLICT:
