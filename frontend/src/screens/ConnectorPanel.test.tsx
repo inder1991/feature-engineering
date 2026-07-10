@@ -8,46 +8,59 @@ vi.mock('../api', async importOriginal => {
   const actual = await importOriginal<typeof import('../api')>()
   return {
     ...actual,
-    listConnectors: vi.fn(),
-    createConnector: vi.fn(),
-    deleteConnector: vi.fn(),
-    previewConnector: vi.fn(),
-    importConnector: vi.fn(),
+    listIntegrations: vi.fn(),
+    listSyncs: vi.fn(),
+    previewSync: vi.fn(),
+    importSync: vi.fn(),
+    patchSync: vi.fn(),
   }
 })
-const listConnectors = vi.mocked(api.listConnectors)
-const createConnector = vi.mocked(api.createConnector)
-const deleteConnector = vi.mocked(api.deleteConnector)
-const previewConnector = vi.mocked(api.previewConnector)
-const importConnector = vi.mocked(api.importConnector)
+const listIntegrations = vi.mocked(api.listIntegrations)
+const listSyncs = vi.mocked(api.listSyncs)
+const previewSync = vi.mocked(api.previewSync)
+const importSync = vi.mocked(api.importSync)
+const patchSync = vi.mocked(api.patchSync)
 
 beforeEach(() => {
-  listConnectors.mockReset()
-  createConnector.mockReset()
-  deleteConnector.mockReset()
-  previewConnector.mockReset()
-  importConnector.mockReset()
+  listIntegrations.mockReset()
+  listSyncs.mockReset()
+  previewSync.mockReset()
+  importSync.mockReset()
+  patchSync.mockReset()
+  listIntegrations.mockResolvedValue([])
+  listSyncs.mockResolvedValue([])
 })
 
-const CONNECTOR: api.Connector = {
-  connector_id: 'conn_01HZXAAAAAAAAAAAAAAAAAAAAA',
-  name: 'cards om',
+const INTEGRATION: api.Integration = {
+  integration_id: 'intg_01HZXAAAAAAAAAAAAAAAAAAAAA',
+  name: 'Corporate OpenMetadata',
   base_url: 'https://om.internal.test',
-  target_source: 'cards',
+  token_env: 'FEATUREGEN_OM_TOKEN__CORP',
   tag_map: { 'PII.Sensitive': 'pii' },
-  filters: { service: 'mysql_*', database: 'cards_db', schema: 'public' },
-  table_naming: 'table',
-  token_env: 'FEATUREGEN_OM_TOKEN__CARDS_OM',
-  token_present: true,
   created_by: 'user:o',
   created_at: '2026-07-09T12:00:00+00:00',
+  token_present: true,
+}
+
+const SYNC: api.Sync = {
+  sync_id: 'sync_01HZYBBBBBBBBBBBBBBBBBBBBB',
+  integration_id: INTEGRATION.integration_id,
+  service_name: 'mysql_prod',
+  database_filter: 'cards_db',
+  schema_filter: 'public',
+  target_source: 'cards',
+  tag_map_override: null,
+  table_naming: 'table',
+  created_by: 'user:o',
+  created_at: '2026-07-09T12:05:00+00:00',
+  last_import_at: null,
 }
 
 const SNAPSHOT_HASH = 'ab'.repeat(32)
 
 // One of each table status, one quarantine subline, one unmapped + one mapped + one ignored tag:
 // the full review surface from a single canned dry run.
-const PREVIEW: api.ConnectorPreview = {
+const PREVIEW: api.SyncPreview = {
   summary: {
     tables: 3, columns: 14, new: 1, changed: 1, unchanged: 1, removed: 0,
     would_quarantine: 1, semantics_pending: 13,
@@ -80,7 +93,7 @@ const PREVIEW: api.ConnectorPreview = {
   snapshot_hash: SNAPSHOT_HASH,
 }
 
-const IMPORT_OK: api.ConnectorImportResult = {
+const IMPORT_OK: api.SyncImportResult = {
   result: {
     status: 'ingested', reason: null, asserted: 3, staled: 0, quarantined: 1,
     flagged: "first upload of 'cards' (13 objects) — review recommended",
@@ -89,102 +102,70 @@ const IMPORT_OK: api.ConnectorImportResult = {
   review_queue: { quarantined: 1, semantics_pending: 13 },
 }
 
-function renderPanel(over: { onReviewQueue?: (s: string) => void; onStage?: (s: string) => void } = {}) {
+function renderPanel(over: {
+  onReviewQueue?: (s: string) => void
+  onStage?: (s: string) => void
+  onManageIntegrations?: () => void
+} = {}) {
   render(
     <ConnectorPanel
       onReviewQueue={over.onReviewQueue ?? (() => {})}
       onStage={over.onStage ?? (() => {})}
+      onManageIntegrations={over.onManageIntegrations ?? (() => {})}
     />,
   )
 }
 
-// Arranges the mocks BEFORE render (the panel lists connections on mount), then walks to a
-// rendered preview.
+// Arranges the mocks BEFORE render (the panel lists integrations + syncs on mount), then walks to
+// a rendered preview of the first (auto-selected) sync.
 async function renderWithPreview(over: { onReviewQueue?: (s: string) => void } = {}) {
-  listConnectors.mockResolvedValue([CONNECTOR])
-  previewConnector.mockResolvedValue(PREVIEW)
+  listIntegrations.mockResolvedValue([INTEGRATION])
+  listSyncs.mockResolvedValue([SYNC])
+  previewSync.mockResolvedValue(PREVIEW)
   renderPanel(over)
   await userEvent.click(await screen.findByRole('button', { name: 'Preview import' }))
-  await screen.findByRole('heading', { name: 'Preview: cards om into source cards' })
+  await screen.findByRole('heading', { name: 'Preview: mysql_prod into source cards' })
 }
 
-describe('configured connections', () => {
-  it('lists connections with the sealed token state — the token value is never anywhere', async () => {
-    listConnectors.mockResolvedValue([CONNECTOR])
+describe('sync picker', () => {
+  it('groups syncs under their integration and previews the auto-selected one', async () => {
+    listIntegrations.mockResolvedValue([INTEGRATION])
+    listSyncs.mockResolvedValue([SYNC])
+    previewSync.mockResolvedValue(PREVIEW)
     renderPanel()
-    const row = (await screen.findByText('cards om')).closest('li')
-    if (!row) throw new Error('connection row not found')
-    expect(row).toHaveTextContent('https://om.internal.test')
-    expect(row).toHaveTextContent('mysql_*.cards_db.public')
-    expect(row).toHaveTextContent('into cards')
-    // The wire carries only the env-var reference + a presence flag; the row renders "sealed",
-    // never a value (there is no value client-side to leak — api.test pins the response shape).
-    expect(within(row).getByText('token sealed')).toBeInTheDocument()
-    expect(within(row).getByRole('button', { name: 'Preview import' })).toBeInTheDocument()
+
+    // The optgroup carries the integration name; the option names the service and target source.
+    expect(await screen.findByRole('group', { name: 'Corporate OpenMetadata' })).toBeInTheDocument()
+    expect(
+      screen.getByRole('option', { name: 'mysql_prod (cards_db.public) → source cards' }),
+    ).toBeInTheDocument()
+
+    await userEvent.click(screen.getByRole('button', { name: 'Preview import' }))
+    await screen.findByRole('heading', { name: 'Preview: mysql_prod into source cards' })
+    expect(previewSync).toHaveBeenCalledExactlyOnceWith(SYNC.sync_id)
   })
 
-  it('names the not-set token state so the operator knows what to fix', async () => {
-    listConnectors.mockResolvedValue([{ ...CONNECTOR, token_present: false }])
-    renderPanel()
-    expect(await screen.findByText('token not set')).toBeInTheDocument()
+  it('shows an empty state with a link to Integrations when no syncs are configured', async () => {
+    const onManageIntegrations = vi.fn()
+    listIntegrations.mockResolvedValue([])
+    renderPanel({ onManageIntegrations })
+    expect(await screen.findByText('No syncs configured.')).toBeInTheDocument()
+    await userEvent.click(screen.getByRole('button', { name: 'Go to Integrations' }))
+    expect(onManageIntegrations).toHaveBeenCalledTimes(1)
   })
 
-  it('saves a new connection with exactly the config fields — no token ever leaves the form', async () => {
-    listConnectors.mockResolvedValue([])
-    createConnector.mockResolvedValue(CONNECTOR)
-    renderPanel()
-    await userEvent.type(screen.getByLabelText('Connection name'), 'cards om')
-    await userEvent.type(screen.getByLabelText('OpenMetadata URL'), 'https://om.internal.test')
-    await userEvent.type(screen.getByLabelText('Target source'), 'cards')
-    await userEvent.type(screen.getByLabelText('Service filter'), 'mysql_*')
-    await userEvent.type(screen.getByLabelText('Database filter'), 'cards_db')
-    await userEvent.type(screen.getByLabelText('Schema filter'), 'public')
-    await userEvent.click(screen.getByRole('button', { name: 'Save connection' }))
-    expect(await screen.findByText('token sealed')).toBeInTheDocument()
-    expect(createConnector).toHaveBeenCalledExactlyOnceWith({
-      name: 'cards om',
-      base_url: 'https://om.internal.test',
-      target_source: 'cards',
-      tag_map: {},
-      filters: { service: 'mysql_*', database: 'cards_db', schema: 'public' },
-      table_naming: 'table',
-    })
-    const spec = createConnector.mock.calls[0][0]
-    expect(Object.keys(spec)).not.toContain('token')
-  })
-
-  it('derives the token env-var reference from the name, mirroring the server default', async () => {
-    listConnectors.mockResolvedValue([])
-    renderPanel()
-    await userEvent.type(screen.getByLabelText('Connection name'), 'cards om')
-    expect(screen.getByText('FEATUREGEN_OM_TOKEN__CARDS_OM')).toBeInTheDocument()
-  })
-
-  it('surfaces a duplicate-name 409 calmly on the form', async () => {
-    listConnectors.mockResolvedValue([])
-    createConnector.mockRejectedValue(new api.ApiError(409, "connector 'cards om' already exists"))
-    renderPanel()
-    await userEvent.type(screen.getByLabelText('Connection name'), 'cards om')
-    await userEvent.type(screen.getByLabelText('OpenMetadata URL'), 'https://om.internal.test')
-    await userEvent.type(screen.getByLabelText('Target source'), 'cards')
-    await userEvent.click(screen.getByRole('button', { name: 'Save connection' }))
-    expect(await screen.findByRole('alert')).toHaveTextContent("connector 'cards om' already exists")
-  })
-
-  it('removes a connection', async () => {
-    listConnectors.mockResolvedValue([CONNECTOR])
-    deleteConnector.mockResolvedValue({ deleted: true })
-    renderPanel()
-    await userEvent.click(await screen.findByRole('button', { name: 'Remove' }))
-    expect(deleteConnector).toHaveBeenCalledExactlyOnceWith(CONNECTOR.connector_id)
-    expect(screen.queryByText('cards om')).not.toBeInTheDocument()
+  it('the inline Integrations link also navigates to the integrations screen', async () => {
+    const onManageIntegrations = vi.fn()
+    renderPanel({ onManageIntegrations })
+    await userEvent.click(await screen.findByRole('button', { name: 'Integrations' }))
+    expect(onManageIntegrations).toHaveBeenCalledTimes(1)
   })
 })
 
 describe('preview rendering', () => {
   it('renders the full dry run: stats, brake, tag map, tables, quarantine, as-of, pending', async () => {
     await renderWithPreview()
-    expect(previewConnector).toHaveBeenCalledExactlyOnceWith(CONNECTOR.connector_id)
+    expect(previewSync).toHaveBeenCalledExactlyOnceWith(SYNC.sync_id)
 
     const stats = screen.getByRole('group', { name: 'Preview summary' })
     expect(stats).toHaveTextContent('3 tables')
@@ -238,8 +219,9 @@ describe('preview rendering', () => {
   })
 
   it('surfaces a whole-table removal so the human sees the drop before approving', async () => {
-    listConnectors.mockResolvedValue([CONNECTOR])
-    previewConnector.mockResolvedValue({
+    listIntegrations.mockResolvedValue([INTEGRATION])
+    listSyncs.mockResolvedValue([SYNC])
+    previewSync.mockResolvedValue({
       ...PREVIEW,
       summary: { ...PREVIEW.summary, removed: 1 },
       tables: [
@@ -260,22 +242,10 @@ describe('preview rendering', () => {
     expect(removed).toHaveTextContent('import will drop this table and stale its 2 columns')
   })
 
-  it('renders a fail-closed egress 400 calmly on the save form', async () => {
-    listConnectors.mockResolvedValue([])
-    createConnector.mockRejectedValue(new api.ApiError(400,
-      'no OpenMetadata hosts are allowlisted: set FEATUREGEN_OM_ALLOWED_HOSTS'))
-    renderPanel()
-    await userEvent.type(screen.getByLabelText('Connection name'), 'cards om')
-    await userEvent.type(screen.getByLabelText('OpenMetadata URL'), 'https://om.internal.test')
-    await userEvent.type(screen.getByLabelText('Target source'), 'cards')
-    await userEvent.click(screen.getByRole('button', { name: 'Save connection' }))
-    expect(await screen.findByRole('alert')).toHaveTextContent(
-      'no OpenMetadata hosts are allowlisted: set FEATUREGEN_OM_ALLOWED_HOSTS')
-  })
-
   it('renders the would-hold brake with its reason', async () => {
-    listConnectors.mockResolvedValue([CONNECTOR])
-    previewConnector.mockResolvedValue({
+    listIntegrations.mockResolvedValue([INTEGRATION])
+    listSyncs.mockResolvedValue([SYNC])
+    previewSync.mockResolvedValue({
       ...PREVIEW,
       brake: { would_hold: true, reason: 'sync removes 8 of 10 known objects (80% > 30%)' },
     })
@@ -286,25 +256,27 @@ describe('preview rendering', () => {
   })
 
   it('guards against double preview: the button disables while the pull is in flight', async () => {
-    listConnectors.mockResolvedValue([CONNECTOR])
-    let release: (p: api.ConnectorPreview) => void = () => {}
-    previewConnector.mockImplementation(
-      () => new Promise<api.ConnectorPreview>(resolve => { release = resolve }))
+    listIntegrations.mockResolvedValue([INTEGRATION])
+    listSyncs.mockResolvedValue([SYNC])
+    let release: (p: api.SyncPreview) => void = () => {}
+    previewSync.mockImplementation(
+      () => new Promise<api.SyncPreview>(resolve => { release = resolve }))
     renderPanel()
     const button = await screen.findByRole('button', { name: 'Preview import' })
     await userEvent.click(button)
     expect(screen.getByRole('status')).toHaveTextContent(/running the dry run/i)
     expect(button).toBeDisabled()
     await userEvent.click(button)
-    expect(previewConnector).toHaveBeenCalledTimes(1)
+    expect(previewSync).toHaveBeenCalledTimes(1)
     release(PREVIEW)
-    await screen.findByRole('heading', { name: 'Preview: cards om into source cards' })
+    await screen.findByRole('heading', { name: 'Preview: mysql_prod into source cards' })
     expect(button).toBeEnabled()
   })
 
   it('renders OM-unreachable calmly and touches nothing', async () => {
-    listConnectors.mockResolvedValue([CONNECTOR])
-    previewConnector.mockRejectedValue(
+    listIntegrations.mockResolvedValue([INTEGRATION])
+    listSyncs.mockResolvedValue([SYNC])
+    previewSync.mockRejectedValue(
       new api.ApiError(502, 'OpenMetadata request failed: connect timeout'))
     renderPanel()
     await userEvent.click(await screen.findByRole('button', { name: 'Preview import' }))
@@ -314,8 +286,9 @@ describe('preview rendering', () => {
   })
 
   it('renders a rejected token as an auth problem, not a crash', async () => {
-    listConnectors.mockResolvedValue([CONNECTOR])
-    previewConnector.mockRejectedValue(
+    listIntegrations.mockResolvedValue([INTEGRATION])
+    listSyncs.mockResolvedValue([SYNC])
+    previewSync.mockRejectedValue(
       new api.ApiError(401, 'OpenMetadata rejected the bot token (401)'))
     renderPanel()
     await userEvent.click(await screen.findByRole('button', { name: 'Preview import' }))
@@ -324,27 +297,26 @@ describe('preview rendering', () => {
   })
 
   it('renders the unconfigured-token 400 with the env-var instruction', async () => {
-    listConnectors.mockResolvedValue([CONNECTOR])
-    previewConnector.mockRejectedValue(new api.ApiError(400,
-      'connector token is not configured: set the FEATUREGEN_OM_TOKEN__CARDS_OM environment variable'))
+    listIntegrations.mockResolvedValue([INTEGRATION])
+    listSyncs.mockResolvedValue([SYNC])
+    previewSync.mockRejectedValue(new api.ApiError(400,
+      'integration token is not configured: set the FEATUREGEN_OM_TOKEN__CORP environment variable'))
     renderPanel()
     await userEvent.click(await screen.findByRole('button', { name: 'Preview import' }))
     expect(await screen.findByRole('alert')).toHaveTextContent(
-      'set the FEATUREGEN_OM_TOKEN__CARDS_OM environment variable')
+      'set the FEATUREGEN_OM_TOKEN__CORP environment variable')
   })
 })
 
 describe('remap', () => {
-  it('a remap updates the config server-side and re-previews — never edits the payload client-side', async () => {
-    const next: api.Connector = {
-      ...CONNECTOR,
-      connector_id: 'conn_01NEWCCCCCCCCCCCCCCCCCCCCC',
-      tag_map: { 'PII.Sensitive': 'pii', 'Confidential.Internal': 'restricted' },
+  it('a remap PATCHes the sync override and re-previews — never edits the payload client-side', async () => {
+    const updated: api.Sync = {
+      ...SYNC,
+      tag_map_override: { 'Confidential.Internal': 'restricted' },
     }
     await renderWithPreview()
-    deleteConnector.mockResolvedValue({ deleted: true })
-    createConnector.mockResolvedValue(next)
-    previewConnector.mockResolvedValue({
+    patchSync.mockResolvedValue(updated)
+    previewSync.mockResolvedValue({
       ...PREVIEW,
       summary: { ...PREVIEW.summary, would_quarantine: 0 },
       tag_map: [
@@ -357,36 +329,27 @@ describe('remap', () => {
     await userEvent.selectOptions(
       screen.getByLabelText('Map Confidential.Internal'), 'restricted')
 
-    // Config replaced (delete + recreate: v1 has no update endpoint), then the fresh dry run:
-    // the remap select is gone because the fresh preview has no unmapped tag left.
+    // Override PATCHed, then the fresh dry run: the remap select is gone because the fresh preview
+    // has no unmapped tag left.
     await waitFor(() =>
       expect(screen.queryByLabelText('Map Confidential.Internal')).not.toBeInTheDocument())
     const tagRow = screen.getByText('Confidential.Internal').closest('tr')
     if (!tagRow) throw new Error('tag row not found')
     expect(within(tagRow).getByText('restricted')).toBeInTheDocument()
     expect(within(tagRow).getByText('mapped')).toBeInTheDocument()
-    expect(deleteConnector).toHaveBeenCalledExactlyOnceWith(CONNECTOR.connector_id)
-    expect(createConnector).toHaveBeenCalledExactlyOnceWith({
-      name: 'cards om',
-      base_url: 'https://om.internal.test',
-      target_source: 'cards',
-      tag_map: { 'PII.Sensitive': 'pii', 'Confidential.Internal': 'restricted' },
-      filters: { service: 'mysql_*', database: 'cards_db', schema: 'public' },
-      table_naming: 'table',
-      token_env: 'FEATUREGEN_OM_TOKEN__CARDS_OM',
-    })
-    expect(previewConnector).toHaveBeenLastCalledWith(next.connector_id)
+    expect(patchSync).toHaveBeenCalledExactlyOnceWith(
+      INTEGRATION.integration_id, SYNC.sync_id,
+      { tag_map_override: { 'Confidential.Internal': 'restricted' } })
+    expect(previewSync).toHaveBeenLastCalledWith(updated.sync_id)
   })
 
   it('remap to ignore sends the empty mapping', async () => {
     await renderWithPreview()
-    deleteConnector.mockResolvedValue({ deleted: true })
-    createConnector.mockResolvedValue(CONNECTOR)
+    patchSync.mockResolvedValue({ ...SYNC, tag_map_override: { 'Confidential.Internal': '' } })
     await userEvent.selectOptions(screen.getByLabelText('Map Confidential.Internal'), 'ignore')
-    await waitFor(() => expect(createConnector).toHaveBeenCalled())
-    expect(createConnector.mock.calls[0][0].tag_map).toEqual({
-      'PII.Sensitive': 'pii',
-      'Confidential.Internal': '',
+    await waitFor(() => expect(patchSync).toHaveBeenCalled())
+    expect(patchSync.mock.calls[0][2]).toEqual({
+      tag_map_override: { 'Confidential.Internal': '' },
     })
   })
 })
@@ -395,16 +358,16 @@ describe('approve flow', () => {
   it('approval demands an explicit confirm; cancel backs out without importing', async () => {
     await renderWithPreview()
     await userEvent.click(screen.getByRole('button', { name: 'Approve import' }))
-    expect(importConnector).not.toHaveBeenCalled()
+    expect(importSync).not.toHaveBeenCalled()
     expect(screen.getByText(/will enter the catalog in one transaction/i)).toBeInTheDocument()
     await userEvent.click(screen.getByRole('button', { name: 'Cancel' }))
     expect(screen.getByRole('button', { name: 'Approve import' })).toBeInTheDocument()
-    expect(importConnector).not.toHaveBeenCalled()
+    expect(importSync).not.toHaveBeenCalled()
   })
 
   it('confirm imports the exact previewed snapshot and hands off to the review queue', async () => {
     const onReviewQueue = vi.fn()
-    importConnector.mockResolvedValue(IMPORT_OK)
+    importSync.mockResolvedValue(IMPORT_OK)
     await renderWithPreview({ onReviewQueue })
     await userEvent.click(screen.getByRole('button', { name: 'Approve import' }))
     await userEvent.click(screen.getByRole('button', { name: 'Confirm approval' }))
@@ -413,8 +376,7 @@ describe('approve flow', () => {
     expect(status).toHaveTextContent('Ingested.')
     expect(status).toHaveTextContent('3 facts asserted, 0 staled, 1 quarantined')
     expect(status).toHaveTextContent(/first upload of 'cards'/)
-    expect(importConnector).toHaveBeenCalledExactlyOnceWith(
-      CONNECTOR.connector_id, SNAPSHOT_HASH)
+    expect(importSync).toHaveBeenCalledExactlyOnceWith(SYNC.sync_id, SNAPSHOT_HASH)
 
     expect(screen.getByText('omimp_01HZYBBBBBBBBBBBBBBBBBBBBB')).toBeInTheDocument()
     expect(screen.getByText(/14 items now in the review queue for cards/i)).toBeInTheDocument()
@@ -428,8 +390,8 @@ describe('approve flow', () => {
     expect(screen.getByRole('button', { name: 'Imported' })).toBeDisabled()
   })
 
-  it('renders a held import with the connector-shaped advice, not file wording', async () => {
-    importConnector.mockResolvedValue({
+  it('renders a held import with the sync-shaped advice, not file wording', async () => {
+    importSync.mockResolvedValue({
       result: {
         status: 'held', reason: 'overlap 20% < 60% (possible wrong source)',
         asserted: 0, staled: 0, quarantined: 0, flagged: null,
@@ -443,12 +405,12 @@ describe('approve flow', () => {
     const held = await screen.findByRole('status')
     expect(held).toHaveTextContent(/held: this change removes too much/i)
     expect(held).toHaveTextContent(/overlap 20%/)
-    expect(held).toHaveTextContent(/narrow the connector scope/i)
+    expect(held).toHaveTextContent(/narrow the sync scope/i)
     expect(held).not.toHaveTextContent(/adjust the file/i)
   })
 
   it('a 409 renders the honest stale-preview notice and re-previews on request', async () => {
-    importConnector.mockRejectedValue(new api.ApiError(409,
+    importSync.mockRejectedValue(new api.ApiError(409,
       'OpenMetadata changed since this preview (snapshot hash mismatch). '
         + 'Run preview again and approve the fresh dry run.'))
     await renderWithPreview()
@@ -462,22 +424,22 @@ describe('approve flow', () => {
     // The stale dry run is no longer approvable; only a fresh preview reopens the gate.
     expect(screen.getByRole('button', { name: 'Approve import' })).toBeDisabled()
 
-    previewConnector.mockResolvedValue({ ...PREVIEW, snapshot_hash: 'ef'.repeat(32) })
+    previewSync.mockResolvedValue({ ...PREVIEW, snapshot_hash: 'ef'.repeat(32) })
     await userEvent.click(screen.getByRole('button', { name: 'Run preview again' }))
-    await screen.findByRole('heading', { name: 'Preview: cards om into source cards' })
-    expect(previewConnector).toHaveBeenCalledTimes(2)
+    await screen.findByRole('heading', { name: 'Preview: mysql_prod into source cards' })
+    expect(previewSync).toHaveBeenCalledTimes(2)
     expect(screen.getByRole('button', { name: 'Approve import' })).toBeEnabled()
   })
 
   it('shows a non-409 import failure calmly and keeps the preview', async () => {
-    importConnector.mockRejectedValue(
+    importSync.mockRejectedValue(
       new api.ApiError(502, 'OpenMetadata request failed: gateway timeout'))
     await renderWithPreview()
     await userEvent.click(screen.getByRole('button', { name: 'Approve import' }))
     await userEvent.click(screen.getByRole('button', { name: 'Confirm approval' }))
     expect(await screen.findByRole('alert')).toHaveTextContent('OpenMetadata is unreachable.')
     expect(
-      screen.getByRole('heading', { name: 'Preview: cards om into source cards' }),
+      screen.getByRole('heading', { name: 'Preview: mysql_prod into source cards' }),
     ).toBeInTheDocument()
   })
 })

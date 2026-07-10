@@ -7,16 +7,19 @@ import { getSession, setSession } from './session'
 
 vi.mock('./api', async importOriginal => {
   const actual = await importOriginal<typeof import('./api')>()
-  return { ...actual, listQuarantine: vi.fn(), uploadFile: vi.fn() }
+  return { ...actual, listQuarantine: vi.fn(), uploadFile: vi.fn(), listIntegrations: vi.fn() }
 })
 const listQuarantine = vi.mocked(api.listQuarantine)
 const uploadFile = vi.mocked(api.uploadFile)
+const listIntegrations = vi.mocked(api.listIntegrations)
 
 beforeEach(() => {
   setSession({ user: 'dev', roles: ['data_owner'] })
   window.location.hash = ''
   listQuarantine.mockReset()
   uploadFile.mockReset()
+  listIntegrations.mockReset()
+  listIntegrations.mockResolvedValue([])
 })
 
 const ingest = (over: Partial<api.IngestResult>): api.IngestResult => ({
@@ -38,7 +41,7 @@ function arriveAt(hash: string) {
 }
 
 describe('app shell', () => {
-  it('renders six nav items in order and lands on Overview by default', () => {
+  it('renders seven nav items in order (Integrations after Ingest) and lands on Overview by default', () => {
     render(<App />)
     const nav = within(screen.getByRole('navigation'))
     expect(nav.getAllByRole('button').map(b => b.textContent)).toEqual([
@@ -47,6 +50,7 @@ describe('app shell', () => {
       'Registry',
       'Search',
       'Ingest',
+      'Integrations',
       'Review queue',
     ])
     expect(screen.getByRole('heading', { level: 1, name: 'Overview' })).toBeInTheDocument()
@@ -87,13 +91,28 @@ describe('app shell', () => {
     expect(screen.getByText('CATALOG · INGEST')).toBeInTheDocument()
     expect(screen.getByRole('heading', { level: 1, name: 'Ingest' })).toBeInTheDocument()
     expect(
-      screen.getByText('Bring data maps into the catalog: upload a file, or connect a metadata service.'),
+      screen.getByText('Bring data maps into the catalog: upload a file, or pull from a configured sync.'),
     ).toBeInTheDocument()
     expect(
       screen.getByRole('button', { name: /upload a schema and facts file/i }),
     ).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: /connect openmetadata/i })).toBeInTheDocument()
+    expect(
+      screen.getByRole('button', { name: /pull from a metadata service/i }),
+    ).toBeInTheDocument()
     expect(screen.getByRole('list', { name: /connector path/i })).toBeInTheDocument()
+  })
+
+  it('Integrations nav item routes to #/integrations and renders the Integrations screen', async () => {
+    render(<App />)
+    const nav = within(screen.getByRole('navigation'))
+    await userEvent.click(nav.getByRole('button', { name: 'Integrations' }))
+    expect(window.location.hash).toBe('#/integrations')
+    expect(screen.getByRole('heading', { level: 1, name: 'Integrations' })).toBeInTheDocument()
+    expect(screen.getByText('CATALOG · INTEGRATIONS')).toBeInTheDocument()
+    expect(
+      await screen.findByRole('heading', { name: 'OpenMetadata instances' }),
+    ).toBeInTheDocument()
+    expect(listIntegrations).toHaveBeenCalled()
   })
 
   it('overview loop links navigate to their screens', async () => {

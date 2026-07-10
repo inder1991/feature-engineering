@@ -1,7 +1,8 @@
 // The Ingest screen: two peer paths into the same pipeline. Path 1 uploads a schema+facts file
-// (today's flow, unchanged); Path 2 connects OpenMetadata (preview -> review -> approve). The
-// gates strip at the top names who holds each step of the CONNECTOR path only — the file path's
-// single-shot flow is untouched and needs no strip.
+// (today's flow, unchanged); Path 2 pulls from a configured sync (preview -> review -> approve).
+// The connection itself (URL, token, scope) is configured upstream in Integrations, so this path
+// is now just a sync picker. The gates strip at the top names who holds each step of the sync
+// path only — the file path's single-shot flow is untouched and needs no strip.
 import { useState } from 'react'
 import type { CSSProperties, DragEvent, FormEvent } from 'react'
 import { ApiError, uploadFile } from '../api'
@@ -37,11 +38,13 @@ const GATE_STATE_WORDS: Record<GateState, string> = {
   todo: 'upcoming',
 }
 
+// Four gates. Configuration moved upstream to Integrations, so the first gate is now "Pick a
+// sync" (not "Configure the connection"): the human chooses which configured sync to pull from.
 const GATES: { who: 'You' | 'Connector'; title: string; sub: string }[] = [
   {
     who: 'You',
-    title: 'Configure the connection',
-    sub: 'Where to pull from, and into which source.',
+    title: 'Pick a sync',
+    sub: 'Which configured sync to pull from.',
   },
   { who: 'Connector', title: 'Preview the import', sub: 'A dry run: nothing enters the catalog.' },
   { who: 'You', title: 'Review mappings', sub: 'Tags, diffs, quarantine, pending semantics.' },
@@ -90,7 +93,13 @@ function GatesStrip({ stage }: { stage: ConnectorStage }) {
 
 // ---------------------------------------------------------------- the Ingest screen
 
-export function UploadScreen({ onReviewQueue }: { onReviewQueue: (source: string) => void }) {
+export function UploadScreen({
+  onReviewQueue,
+  onManageIntegrations,
+}: {
+  onReviewQueue: (source: string) => void
+  onManageIntegrations: () => void
+}) {
   const [path, setPath] = useState<'file' | 'connector'>('file')
   // Mounted on first visit and kept mounted (hidden) afterwards, so toggling paths never
   // destroys an in-flight preview. Lazy so the file-only flow issues no connector requests.
@@ -120,10 +129,10 @@ export function UploadScreen({ onReviewQueue }: { onReviewQueue: (source: string
             setConnectorMounted(true)
           }}
         >
-          <span className="k">Path 2 · A metadata service</span>
-          <span className="t">Connect OpenMetadata</span>
+          <span className="k">Path 2 · A sync</span>
+          <span className="t">Pull from a metadata service</span>
           <span className="d">
-            Pull tables and columns directly; same validation, brake, and quarantine as an upload.
+            Preview and approve an import from a sync you configured under an integration.
           </span>
         </button>
       </div>
@@ -132,7 +141,11 @@ export function UploadScreen({ onReviewQueue }: { onReviewQueue: (source: string
       </div>
       {connectorMounted && (
         <div hidden={path !== 'connector'}>
-          <ConnectorPanel onReviewQueue={onReviewQueue} onStage={setStage} />
+          <ConnectorPanel
+            onReviewQueue={onReviewQueue}
+            onStage={setStage}
+            onManageIntegrations={onManageIntegrations}
+          />
         </div>
       )}
     </section>

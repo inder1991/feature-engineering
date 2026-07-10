@@ -2333,3 +2333,201 @@ section > h2:first-child {
 .tray-spacer {
   flex: 1;
 }
+
+/* ---------------------------------------------------------------- integrations (two-tier connector)
+   Tier 1 is one OpenMetadata INSTANCE (one URL + one sealed token); tier 2 is a per-service SYNC
+   into a catalog source. Additive: composes the existing .panel / .badge / .btn / .field / .empty
+   vocabulary with existing tokens only. Nothing above this line is modified. */
+
+/* a header row: a heading on the left, a primary action pushed to the right (reuses .tray-spacer) */
+.row-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-block: 4px 12px;
+}
+
+.row-head h2 {
+  margin: 0;
+}
+
+/* an inline, link-styled button (e.g. "Integrations" inside a sentence): a button for behavior,
+   a link in appearance, so it sits in running text without a box */
+.btn--link {
+  display: inline;
+  height: auto;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--accent);
+  font: inherit;
+  text-decoration: underline;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 2px;
+  cursor: pointer;
+}
+
+.btn--link:hover {
+  color: var(--accent-hover);
+  background: none;
+  border: 0;
+}
+
+/* tier 1: the instance card */
+.integration {
+  background: var(--surface);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-panel);
+  box-shadow: var(--shadow);
+  margin-block: 16px;
+  overflow: hidden;
+}
+
+.integration-top {
+  display: flex;
+  gap: 14px;
+  align-items: center;
+  flex-wrap: wrap;
+  padding: 16px 18px;
+}
+
+.integration-ic {
+  width: 38px;
+  height: 38px;
+  border-radius: 9px;
+  background: var(--rail-bg);
+  color: var(--rail-accent);
+  display: grid;
+  place-items: center;
+  flex: none;
+  font-family: var(--font-mono);
+  font-weight: 700;
+  font-size: 12px;
+}
+
+.integration-id {
+  min-width: 0;
+}
+
+.integration-nm {
+  font-weight: 600;
+  font-size: 15px;
+}
+
+.integration-meta {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--ink-faint);
+  overflow-wrap: anywhere;
+}
+
+.integration-acts {
+  display: flex;
+  gap: 8px;
+}
+
+/* host-allowlist chip: an accent-soft badge (distinct from the ok/held sensitivity chips) */
+.badge.host {
+  background: var(--accent-soft);
+  border-color: transparent;
+  color: var(--accent);
+}
+
+/* tier 2: the services + syncs zone inside a card */
+.services {
+  border-top: 1px solid var(--line);
+  background: var(--surface-2);
+  padding: 6px 8px 10px;
+}
+
+.svc-head {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+  padding: 8px 12px 4px;
+}
+
+.svc {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  flex-wrap: wrap;
+  padding: 10px 12px;
+  margin: 4px 6px;
+  border-radius: var(--radius);
+  background: var(--surface);
+  border: 1px solid var(--line);
+}
+
+.svc-name {
+  font-family: var(--font-mono);
+  font-weight: 600;
+  font-size: 13px;
+}
+
+.svc-kind {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--ink-faint);
+}
+
+.svc-map {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--ink-soft);
+}
+
+/* the add/edit forms (integration and sync) render as an inset card, not the flat global form */
+.integration-form,
+.sync-form {
+  display: grid;
+  gap: 12px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  padding: 16px;
+  margin-block: 12px;
+}
+
+.sync-form {
+  background: var(--surface-2);
+  box-shadow: none;
+  margin: 4px 6px;
+}
+
+.form-grid-3 {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px 14px;
+}
+
+.form-foot {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+/* the Ingest sync picker: the select grows, the primary action sits at its baseline */
+.picker-row {
+  display: flex;
+  gap: 12px;
+  align-items: end;
+  flex-wrap: wrap;
+  margin-block: 12px;
+}
+
+.picker-row .field {
+  flex: 1;
+  min-width: 240px;
+}
+
+@media (max-width: 900px) {
+  .form-grid-3 {
+    grid-template-columns: 1fr;
+  }
+}

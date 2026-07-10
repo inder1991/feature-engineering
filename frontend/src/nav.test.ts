@@ -25,6 +25,12 @@ describe('useHashRoute', () => {
     expect(result.current.params.get('source')).toBe('deposits')
   })
 
+  it('resolves the integrations route', () => {
+    window.location.hash = '#/integrations'
+    const { result } = renderHook(() => useHashRoute())
+    expect(result.current.route).toBe('integrations')
+  })
+
   it('reacts to hashchange events', () => {
     const { result } = renderHook(() => useHashRoute())
     expect(result.current.route).toBe('overview')
