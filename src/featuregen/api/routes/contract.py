@@ -7,6 +7,7 @@ threaded — omitting them would silently downgrade safety (review root-cause A)
 """
 from __future__ import annotations
 
+import os
 from dataclasses import replace
 from datetime import UTC, datetime
 from typing import Annotated
@@ -58,9 +59,23 @@ from featuregen.overlay.upload.taxonomy.applicability import (
     applicability_result,
 )
 from featuregen.overlay.upload.taxonomy.disposition import (
+    FinalDisposition,
     RecipeEvaluation,
     StageEvaluation,
     evaluate_dispositions,
+)
+from featuregen.overlay.upload.taxonomy.journey_stages import journey_metadata
+from featuregen.overlay.upload.taxonomy.ranking import (
+    RankedRecipe,
+    RankSignals,
+    rank_eligible,
+)
+from featuregen.overlay.upload.taxonomy.ranking_signals import (
+    BindingQuality,
+    EntityCompatibility,
+    ModellingContextFit,
+    pit_completeness,
+    semantic_group,
 )
 from featuregen.overlay.upload.taxonomy.recognition import (
     APPLICABILITY_MAPPING_VERSION,
@@ -68,6 +83,7 @@ from featuregen.overlay.upload.taxonomy.recognition import (
 )
 from featuregen.overlay.upload.taxonomy.recognizer import recognize
 from featuregen.overlay.upload.taxonomy.use_cases import selectable_leaves, use_case
+from featuregen.overlay.upload.templates import ALL_TEMPLATES
 
 router = APIRouter()
 
@@ -167,6 +183,72 @@ def _disposition_json(ev: RecipeEvaluation) -> dict:
             "grounding": _stage(ev.grounding), "safety": _stage(ev.safety)}
 
 
+# ── Phase-2A Task A3: rank the eligible set (flag-gated, default off) ────────────────────────────────
+# The ranker consumes a PRECOMPUTED rankable set; it never reads FinalDisposition itself. This route is
+# the ONE place FinalDisposition is read for ranking (``rankable_recipe_ids``), so the ranker stays
+# disposition-agnostic and survives the future policy initiative untouched. The three presentation layers
+# stay separate: the deterministic ``ranking`` here, the LLM ``recommendation``, and the human choice.
+_TEMPLATES_BY_ID = {t.id: t for t in ALL_TEMPLATES}
+
+
+def _intent_ranking_enabled() -> bool:
+    """Deterministic ranking is OFF by default — the scoped considered-set omits ``ranking`` /
+    ``ranking_version`` entirely (Phase-1B/Task-7 byte-identical) unless a deployment opts in with
+    ``FEATUREGEN_INTENT_RANKING=1``."""
+    return os.environ.get("FEATUREGEN_INTENT_RANKING", "0") == "1"
+
+
+def rankable_recipe_ids(dispositions: list[RecipeEvaluation]) -> list[str]:
+    """The precomputed rankable set: the recipe ids whose rolled-up disposition is ``ELIGIBLE``.
+
+    This is the ONLY place :class:`FinalDisposition` is read for ranking — the ranker itself is handed
+    this already-decided set and never inspects dispositions, so it is stable across the future policy
+    initiative (today rankable == Phase-1B ``ELIGIBLE``; post-policy == the post-policy eligible ids).
+    """
+    return [ev.recipe_id for ev in dispositions
+            if ev.final_disposition is FinalDisposition.ELIGIBLE]
+
+
+def _rank_signals(rankable_ids: list[str], dispositions: list[RecipeEvaluation],
+                  cs) -> dict[str, RankSignals]:
+    """Assemble the typed :class:`RankSignals` per rankable recipe from three already-computed sources:
+    the disposition (``relevance_tier``), this run's grounding (``binding_quality``), and the template's
+    design-time metadata (``pit_completeness`` / ``family`` / ``explainability`` / journey / semantic
+    group). ``modelling_context_fit`` and ``entity_compatibility`` are the Phase-2A stubs (NEUTRAL /
+    UNKNOWN) — Task B3 supplies the real derivations. A rankable id with no known template is skipped
+    (the ranker then deterministically drops it — it cannot be ordered without a signal bundle)."""
+    tier_by_id = {ev.recipe_id: ev.relevance_tier for ev in dispositions}
+    signals: dict[str, RankSignals] = {}
+    for rid in rankable_ids:
+        t = _TEMPLATES_BY_ID.get(rid)
+        if t is None:
+            continue
+        journey = journey_metadata(t)
+        signals[rid] = RankSignals(
+            relevance_tier=tier_by_id.get(rid) or "supporting",   # ELIGIBLE => a real in-scope tier
+            binding_quality=BindingQuality(
+                cs.binding_quality_by_template.get(rid, BindingQuality.ACCEPTABLE.value)),
+            modelling_context_fit=ModellingContextFit.NEUTRAL,    # 2A stub (Task B3 supplies the fit)
+            pit_completeness=pit_completeness(t),
+            explainability=t.explain,
+            family=t.family,
+            journey_model_id=journey.journey_model_id,
+            journey_stage_id=journey.journey_stage_id,
+            semantic_group=semantic_group(t),
+            entity_compatibility=EntityCompatibility.UNKNOWN,     # 2A stub (Task B3 supplies the grain)
+        )
+    return signals
+
+
+def _ranking_json(r: RankedRecipe) -> dict:
+    """One recipe's two ranking projections for the response — the canonical rank + the separate
+    initial-view decision, each with its OWN structured reason stream (never merged)."""
+    return {"recipe_id": r.recipe_id, "canonical_rank": r.canonical_rank,
+            "selected_for_initial_view": r.selected_for_initial_view,
+            "rank_reasons": [c.value for c in r.rank_reasons],
+            "initial_view_reasons": [c.value for c in r.initial_view_reasons]}
+
+
 def _scoped_considered_set(body: ConsideredSetIn, conn: _Conn, identity: _Identity,
                            client: _LLM) -> dict:
     """Phase-1B (Task 7) — the confirmed-scope path. Validates the confirmed scope, MINTS the generation
@@ -244,10 +326,23 @@ def _scoped_considered_set(body: ConsideredSetIn, conn: _Conn, identity: _Identi
         applicability, cs.grounded_template_ids, cs.rejected_template_ids,
         evaluation_version=APPLICABILITY_MAPPING_VERSION, now=now)
     # 8. Applicability OWNS the in-scope recipe count (never recognition).
-    return {**_considered_set_response(intent, cs),
-            "generation_run_id": generation_run_id, "scope_id": scope_id,
-            "dispositions": [_disposition_json(d) for d in dispositions],
-            "in_scope_count": len(applicability.eligible_ids)}
+    response = {**_considered_set_response(intent, cs),
+                "generation_run_id": generation_run_id, "scope_id": scope_id,
+                "dispositions": [_disposition_json(d) for d in dispositions],
+                "in_scope_count": len(applicability.eligible_ids)}
+    # 9. Phase-2A: deterministic presentation-priority ranking over the PRECOMPUTED rankable set. The
+    # rankable set (the ONLY FinalDisposition read) is decided first; the ranker then orders it, staying
+    # disposition-agnostic. ``ranking_version`` is pinned BEFORE ranking (provenance, never an ordering
+    # input). Flag off => neither key is present (Task-7/1B byte-identical). The ranking is deliberately
+    # SEPARATE from the LLM ``recommendation`` and the human's Gate-#1 choice — three distinct layers.
+    if _intent_ranking_enabled():
+        rankable_ids = rankable_recipe_ids(dispositions)
+        signals = _rank_signals(rankable_ids, dispositions, cs)
+        ranking_version = APPLICABILITY_MAPPING_VERSION   # pinned BEFORE the ranker is called
+        ranked = rank_eligible(rankable_ids, signals, ranking_version=ranking_version)
+        response["ranking"] = [_ranking_json(r) for r in ranked]
+        response["ranking_version"] = ranking_version
+    return response
 
 
 @router.post("/contract/considered-set", dependencies=[Depends(require_feature_generate)])

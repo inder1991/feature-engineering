@@ -29,6 +29,7 @@ from featuregen.overlay.upload.feature_assist import (
     set_signals,
 )
 from featuregen.overlay.upload.taxonomy.applicability import ApplicabilityResult
+from featuregen.overlay.upload.taxonomy.ranking_signals import binding_quality
 from featuregen.overlay.upload.templates import (
     ALL_TEMPLATES,
     GroundedFeature,
@@ -56,6 +57,10 @@ class ConsideredSet:
     #   grounded candidate SURVIVED the gauntlet (the `ideas`) — the disposition stage's `grounded_ids`.
     rejected_template_ids: dict[str, tuple[str, ...]] = field(default_factory=dict)   # template id ->
     #   the gauntlet reject codes for candidates it REFUSED (safety/leakage/units) — feeds `rejected`.
+    binding_quality_by_template: dict[str, str] = field(default_factory=dict)   # template id ->
+    #   BindingQuality.value for each SURVIVING grounded candidate (Task A3 Part A) — the ranker's
+    #   binding-quality signal. Additive + read-only: grounding behaviour is unchanged and nothing else
+    #   reads it (the ranker consumes it in the API layer only when FEATUREGEN_INTENT_RANKING is on).
 
 
 def persist_intent(conn, intent: Intent, target_ref: str | None = None) -> None:
@@ -105,7 +110,7 @@ def _template_candidates(conn, *, catalog_source: str, roles, target_ref: str | 
                          templates: Sequence[Template] = ALL_TEMPLATES,
                          fresh_within: timedelta = timedelta(hours=24),
                          ) -> tuple[list[FeatureIdea], list[dict],
-                                    frozenset[str], dict[str, tuple[str, ...]]]:
+                                    frozenset[str], dict[str, tuple[str, ...]], dict[str, str]]:
     """Ground ``templates`` on this catalog and gauntlet-check each grounded candidate the SAME way LLM
     candidates are (feature_assist._validate_idea, over the identical read-scoped candidate universe).
     ``templates`` defaults to the whole ``ALL_TEMPLATES`` registry (today's behaviour); Phase-1B scoped
@@ -117,10 +122,12 @@ def _template_candidates(conn, *, catalog_source: str, roles, target_ref: str | 
     units). Returns (surviving ideas, {name, reason, code} rejects, grounded template ids, rejected
     template ids -> reject codes). ``ground_all`` yields at most one grounded candidate per template, so
     every ``gf.template_id`` lands in exactly one of the two id collections — the disposition stage
-    (Task 5) consumes them as its ``grounded_ids`` / ``rejected`` inputs."""
+    (Task 5) consumes them as its ``grounded_ids`` / ``rejected`` inputs. Additionally returns the
+    per-SURVIVING-template ``binding_quality`` value (Task A3 Part A) — a read-only presentation signal
+    the ranker consumes; grounding behaviour is unchanged by computing it."""
     grounded = ground_all(conn, templates, catalog_source=catalog_source, roles=roles)
     if not grounded:
-        return [], [], frozenset(), {}
+        return [], [], frozenset(), {}, {}
     by_id = {t.id: t for t in templates}
     cols = _candidate_columns(conn, catalog_source, roles)   # the SAME candidate universe the LLM saw
     known = {c["object_ref"] for c in cols}
@@ -131,6 +138,7 @@ def _template_candidates(conn, *, catalog_source: str, roles, target_ref: str | 
     rejections: list[dict] = []
     grounded_ids: set[str] = set()                       # templates whose candidate SURVIVED the gauntlet
     rejected_ids: dict[str, tuple[str, ...]] = {}        # templates the gauntlet REFUSED -> its code
+    binding_by_id: dict[str, str] = {}                   # SURVIVING template -> BindingQuality.value
     for gf in grounded:
         idea = _idea_from_grounded(gf, by_id[gf.template_id])
         raw = {"name": idea.name, "description": idea.description,
@@ -140,10 +148,11 @@ def _template_candidates(conn, *, catalog_source: str, roles, target_ref: str | 
         if rej is None:
             ideas.append(idea)   # keep the converted idea (identical to the gauntlet's rebuild)
             grounded_ids.add(gf.template_id)
+            binding_by_id[gf.template_id] = binding_quality(gf).value   # ranker's binding signal
         else:
             rejections.append({"name": idea.name, "reason": rej.message, "code": rej.code})
             rejected_ids[gf.template_id] = (rej.code,)
-    return ideas, rejections, frozenset(grounded_ids), rejected_ids
+    return ideas, rejections, frozenset(grounded_ids), rejected_ids, binding_by_id
 
 
 # ── Phase-1B Task 4: scoped grounding (flag-gated, default off) ─────────────────────────────────────
@@ -202,6 +211,7 @@ def build_considered_set(conn, intent: Intent, client: LLMClient, *, entity: str
     rejections = list(report.rejections)
     grounded_template_ids: frozenset[str] = frozenset()   # per-template grounding outcome for Task 5's
     rejected_template_ids: dict[str, tuple[str, ...]] = {}   # disposition stage (empty on a no-catalog run)
+    binding_quality_by_template: dict[str, str] = {}   # per-template binding signal for the ranker (A3)
     # B4 two-source model: seed the considered set with grounded parametric templates alongside the LLM
     # alternatives — but only where a single catalog is in scope to ground them (an entity-only,
     # cross-catalog run has no one source to ground on). A template that clears the SAME gauntlet joins
@@ -210,7 +220,8 @@ def build_considered_set(conn, intent: Intent, client: LLMClient, *, entity: str
     if catalog_source is not None:
         # Phase-1B scoped grounding: ground only the eligible recipe subset when scoping is on (else the
         # whole registry — byte-identical to today). Definition-mode + unscoped results bypass here.
-        template_ideas, template_rejections, grounded_template_ids, rejected_template_ids = (
+        (template_ideas, template_rejections, grounded_template_ids, rejected_template_ids,
+         binding_quality_by_template) = (
             _template_candidates(
                 conn, catalog_source=catalog_source, roles=roles, target_ref=target_ref, now=now,
                 templates=_templates_to_ground(intent, applicability)))
@@ -228,7 +239,8 @@ def build_considered_set(conn, intent: Intent, client: LLMClient, *, entity: str
     cs = ConsideredSet(intent.intent_id, anchor, alternatives, recommendation, rejections,
                        applicability=applicability,
                        grounded_template_ids=grounded_template_ids,
-                       rejected_template_ids=rejected_template_ids)
+                       rejected_template_ids=rejected_template_ids,
+                       binding_quality_by_template=binding_quality_by_template)
     conn.execute(   # persist the validated set so /contract/draft reconstructs the chosen feature here
         "INSERT INTO contract_considered (intent_id, considered) VALUES (%s, %s::jsonb) "
         "ON CONFLICT (intent_id) DO UPDATE SET considered = EXCLUDED.considered",
