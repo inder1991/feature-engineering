@@ -1,75 +1,205 @@
-import { type FormEvent, useRef, useState } from 'react'
-import { ApiError, type SearchHit, featureImpact, searchCatalog } from '../api'
+import { type FormEvent, useCallback, useEffect, useRef, useState } from 'react'
+import {
+  ApiError,
+  SEARCH_FACET_KEYS,
+  type SearchFacetKey,
+  type SearchFilters,
+  type SearchHit,
+  type SearchResult,
+  featureImpact,
+  searchCatalog,
+} from '../api'
+import { useHashRoute } from '../nav'
 import { LineageView } from './LineageView'
 
-const SUGGESTIONS = ['balance', 'customer', 'email']
+const FACET_GROUPS: { key: SearchFacetKey; label: string }[] = [
+  { key: 'source', label: 'Source' },
+  { key: 'domain', label: 'Domain' },
+  { key: 'sensitivity', label: 'Sensitivity' },
+  { key: 'additivity', label: 'Additivity' },
+  { key: 'entity', label: 'Entity' },
+  { key: 'kind', label: 'Kind' },
+]
+
+const FLAG_OPTIONS: { key: 'grain' | 'as_of'; label: string }[] = [
+  { key: 'grain', label: 'Grain' },
+  { key: 'as_of', label: 'As-of' },
+]
+
+function paramsToFilters(params: URLSearchParams): SearchFilters {
+  const filters: SearchFilters = {}
+  for (const key of SEARCH_FACET_KEYS) {
+    const values = params.getAll(key)
+    if (values.length > 0) filters[key] = values
+  }
+  if (params.get('grain') === 'true') filters.grain = true
+  if (params.get('as_of') === 'true') filters.as_of = true
+  return filters
+}
+
+// Canonical query string for a search state — the same ordering searchCatalog uses on the wire,
+// so the hash mirrors the request (minus limit) and is a shareable link.
+function buildSearchHash(q: string, filters: SearchFilters): string {
+  const params = new URLSearchParams()
+  if (q) params.set('q', q)
+  for (const key of SEARCH_FACET_KEYS) {
+    for (const value of filters[key] ?? []) params.append(key, value)
+  }
+  if (filters.grain) params.set('grain', 'true')
+  if (filters.as_of) params.set('as_of', 'true')
+  return params.toString()
+}
+
+// Normalize whatever the hash holds (any order) to the canonical form above, so the own-write
+// guard compares apples to apples regardless of how a pasted deep link was ordered.
+function canonicalHash(params: URLSearchParams): string {
+  return buildSearchHash(params.get('q') ?? '', paramsToFilters(params))
+}
 
 export function SearchScreen() {
-  const [q, setQ] = useState('')
-  const [hits, setHits] = useState<SearchHit[] | null>(null)
+  const { params, navigate } = useHashRoute()
+  // Committed search state lives in React; the hash mirrors it (a shareable output) and seeds it
+  // (on mount and on external navigation). `draft` is the live input; `q` is the searched term.
+  const [draft, setDraft] = useState(() => params.get('q') ?? '')
+  const [q, setQ] = useState(() => params.get('q') ?? '')
+  const [filters, setFilters] = useState<SearchFilters>(() => paramsToFilters(params))
+  const [result, setResult] = useState<SearchResult | null>(null)
   const [error, setError] = useState('')
-  // List is today's behavior unchanged; Graph maps lineage around one hit. The anchor is the
-  // row the user jumped from, or the first hit when they just flip the toggle.
+  // List is today's behavior unchanged; Graph maps lineage around one hit. The anchor is the row
+  // the user jumped from, or the first hit of the current (facet-narrowed) set otherwise.
   const [view, setView] = useState<'list' | 'graph'>('list')
   const [anchor, setAnchor] = useState<SearchHit | null>(null)
-  // Monotonic request id: a resolved search only applies if it is still the latest,
-  // so a slow older response can never overwrite newer results.
+  // Monotonic request id: a resolved search only applies if it is still the latest, so a slow
+  // older response can never overwrite newer results.
   const seq = useRef(0)
+  // The hash we last originated. Guards the sync-from-hash effect from reacting to our own writes.
+  const appliedHash = useRef<string | null>(null)
 
-  async function runSearch(term: string) {
-    const query = term.trim()
-    if (!query) return
+  const runSearch = useCallback((nextQ: string, nextFilters: SearchFilters) => {
     const id = ++seq.current
     setError('')
-    try {
-      const results = await searchCatalog(query)
-      if (id !== seq.current) return
-      setHits(results)
-      setAnchor(null) // a new result set re-anchors the graph on its first hit
-    } catch (err) {
-      if (id !== seq.current) return
-      setHits(null)
-      setAnchor(null)
-      setError(err instanceof ApiError ? err.detail : String(err))
-    }
-  }
+    searchCatalog(nextQ, nextFilters)
+      .then(res => {
+        if (id !== seq.current) return
+        setResult(res)
+        setAnchor(null) // a new result set re-anchors the graph on its first hit
+      })
+      .catch(err => {
+        if (id !== seq.current) return
+        setResult(null)
+        setAnchor(null)
+        setError(err instanceof ApiError ? err.detail : String(err))
+      })
+  }, [])
+
+  // Commit a search: reflect it in state, mirror it to the hash (shareable), and fetch. Facet
+  // toggles keep the committed query; submit commits the draft.
+  const apply = useCallback(
+    (nextQ: string, nextFilters: SearchFilters) => {
+      const hash = buildSearchHash(nextQ, nextFilters)
+      appliedHash.current = hash
+      setQ(nextQ)
+      setDraft(nextQ)
+      setFilters(nextFilters)
+      runSearch(nextQ, nextFilters)
+      navigate('search', new URLSearchParams(hash))
+    },
+    [navigate, runSearch],
+  )
+
+  // Mount + external navigation (deep-link paste, back/forward): adopt the hash and search. Our
+  // own apply() sets appliedHash before navigating, so this skips writes we originated. The empty
+  // hash browses the whole read-scoped set.
+  const currentHash = canonicalHash(params)
+  useEffect(() => {
+    if (appliedHash.current === currentHash) return
+    appliedHash.current = currentHash
+    const parsed = new URLSearchParams(currentHash)
+    const parsedQ = parsed.get('q') ?? ''
+    const parsedFilters = paramsToFilters(parsed)
+    setQ(parsedQ)
+    setDraft(parsedQ)
+    setFilters(parsedFilters)
+    runSearch(parsedQ, parsedFilters)
+  }, [currentHash, runSearch])
 
   function submit(e: FormEvent) {
     e.preventDefault()
-    void runSearch(q)
+    apply(draft.trim(), filters)
   }
 
-  function suggest(term: string) {
-    setQ(term)
-    void runSearch(term)
+  function toggleFacet(key: SearchFacetKey, value: string) {
+    const current = filters[key] ?? []
+    const nextValues = current.includes(value)
+      ? current.filter(v => v !== value)
+      : [...current, value]
+    const next: SearchFilters = { ...filters }
+    if (nextValues.length > 0) next[key] = nextValues
+    else delete next[key]
+    apply(q, next)
   }
+
+  function toggleFlag(key: 'grain' | 'as_of') {
+    const next: SearchFilters = { ...filters }
+    if (filters[key]) delete next[key]
+    else next[key] = true
+    apply(q, next)
+  }
+
+  function clearAll() {
+    apply(q, {})
+  }
+
+  const hasHits = result !== null && result.hits.length > 0
+  // With no results there is nothing to anchor a graph on: fall back to list behavior (empty
+  // states, alerts) and disable the toggle.
+  const effectiveView = hasHits ? view : 'list'
+  const graphAnchor = hasHits ? (anchor ?? result.hits[0]) : null
 
   function jumpToGraph(hit: SearchHit) {
     setAnchor(hit)
     setView('graph')
   }
 
-  const hasHits = hits !== null && hits.length > 0
-  // With no results there is nothing to anchor a graph on: fall back to list behavior
-  // (empty states, alerts) and disable the toggle.
-  const effectiveView = hasHits ? view : 'list'
-  const graphAnchor = hasHits ? (anchor ?? hits[0]) : null
+  // Active-filter chips, in facet-group order, then flags.
+  const chips: { id: string; label: string; pii: boolean; remove: () => void }[] = []
+  for (const group of FACET_GROUPS) {
+    for (const value of filters[group.key] ?? []) {
+      chips.push({
+        id: `${group.key}:${value}`,
+        label: `${group.label.toLowerCase()}: ${value}`,
+        pii: group.key === 'sensitivity' && value === 'pii',
+        remove: () => toggleFacet(group.key, value),
+      })
+    }
+  }
+  if (filters.grain) {
+    chips.push({ id: 'grain', label: 'grain', pii: false, remove: () => toggleFlag('grain') })
+  }
+  if (filters.as_of) {
+    chips.push({ id: 'as_of', label: 'as-of', pii: false, remove: () => toggleFlag('as_of') })
+  }
+  const hasFilters = chips.length > 0
+
+  const flagBuckets = result
+    ? { grain: result.facets.grain?.[0], as_of: result.facets.as_of?.[0] }
+    : null
+  const showFlags = Boolean(flagBuckets && (flagBuckets.grain || flagBuckets.as_of))
 
   return (
-    <section>
-      <h2>Search the catalog</h2>
-      <form onSubmit={submit} role="search">
-        <div className="field" style={{ flex: '1 1 320px' }}>
-          <label htmlFor="search-query">Query</label>
-          <input
-            id="search-query"
-            value={q}
-            onChange={e => setQ(e.target.value)}
-            placeholder="Column, table, or concept"
-            style={{ height: 40 }}
-          />
-        </div>
-        <button type="submit" className="btn btn--primary" style={{ height: 40 }}>
+    <section className="search-screen">
+      {/* Section landmark for assistive tech; the visible page title lives in the app page-head,
+          so the mockup's layout stays clean (no repeated visible heading). */}
+      <h2 className="visually-hidden">Search the catalog</h2>
+      <form onSubmit={submit} role="search" className="search-bar">
+        <input
+          aria-label="Query"
+          className="search-input"
+          value={draft}
+          onChange={e => setDraft(e.target.value)}
+          placeholder="Column, table, or concept"
+        />
+        <button type="submit" className="btn btn--primary search-submit">
           Search
         </button>
         <div
@@ -102,71 +232,135 @@ export function SearchScreen() {
         )}
       </form>
 
-      {error && (
-        <p role="alert" className="error">
-          {error}
-        </p>
-      )}
-
-      {hits === null && !error && (
-        <div className="empty">
-          <p>Search the freshness-vouched catalog by column, table, or concept.</p>
-          <div
-            className="next"
-            style={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 8 }}
+      <div className="active-filters">
+        <span className="active-filters-label">{hasFilters ? 'Filters' : 'No filters'}</span>
+        {chips.map(chip => (
+          <span
+            key={chip.id}
+            className={chip.pii ? 'filter-chip filter-chip--pii' : 'filter-chip'}
           >
-            <span>Try</span>
-            {SUGGESTIONS.map(term => (
-              <button
-                key={term}
-                type="button"
-                className="role-chip"
-                onClick={() => suggest(term)}
-              >
-                {term}
-              </button>
-            ))}
-          </div>
-        </div>
-      )}
+            {chip.label}
+            <button type="button" aria-label={`Remove ${chip.label}`} onClick={chip.remove}>
+              ×
+            </button>
+          </span>
+        ))}
+        {hasFilters && (
+          <button type="button" className="clear-filters" onClick={clearAll}>
+            Clear all
+          </button>
+        )}
+      </div>
 
-      {hits?.length === 0 && (
-        <div className="empty" role="status">
-          <p>No fresh results.</p>
-          <p className="next">
-            Columns your roles cannot see are hidden, and a stale source is not served until it is
-            re-uploaded and re-vouched. Nothing is shown that cannot be trusted.
-          </p>
-        </div>
-      )}
+      <div className="facet-cols">
+        <aside className="facet-panel" aria-label="Filters">
+          {FACET_GROUPS.map(group => {
+            const buckets = result?.facets[group.key] ?? []
+            if (buckets.length === 0) return null
+            return (
+              <fieldset className="facet-group" key={group.key}>
+                <legend className="facet-group-title">{group.label}</legend>
+                {buckets.map(bucket => {
+                  const checked = (filters[group.key] ?? []).includes(bucket.value)
+                  const isPii = group.key === 'sensitivity' && bucket.value === 'pii'
+                  return (
+                    <label className="facet-option" key={bucket.value}>
+                      <input
+                        type="checkbox"
+                        checked={checked}
+                        onChange={() => toggleFacet(group.key, bucket.value)}
+                      />
+                      {isPii && <span className="facet-pii-dot" aria-hidden="true" />}
+                      <span className="facet-name">{bucket.value}</span>{' '}
+                      <span className="facet-count tabular-nums">{bucket.count}</span>
+                    </label>
+                  )
+                })}
+              </fieldset>
+            )
+          })}
+          {showFlags && (
+            <fieldset className="facet-group">
+              <legend className="facet-group-title">Flags</legend>
+              {FLAG_OPTIONS.map(flag => {
+                const count = flagBuckets?.[flag.key]?.count ?? 0
+                const checked = Boolean(filters[flag.key])
+                // A flag with no matching rows and not already picked cannot narrow further.
+                const disabled = count === 0 && !checked
+                return (
+                  <label
+                    className={disabled ? 'facet-option facet-option--disabled' : 'facet-option'}
+                    key={flag.key}
+                  >
+                    <input
+                      type="checkbox"
+                      checked={checked}
+                      disabled={disabled}
+                      onChange={() => toggleFlag(flag.key)}
+                    />
+                    <span className="facet-name">{flag.label}</span>{' '}
+                    <span className="facet-count tabular-nums">{count}</span>
+                  </label>
+                )
+              })}
+            </fieldset>
+          )}
+        </aside>
 
-      {hasHits && (
-        <p className="micro-label tabular-nums" role="status">
-          <span style={{ color: 'var(--accent)', fontWeight: 600 }}>{hits.length}</span>{' '}
-          {hits.length === 1 ? 'column' : 'columns'}
-        </p>
-      )}
+        <div className="search-results">
+          {error && (
+            <p role="alert" className="error">
+              {error}
+            </p>
+          )}
 
-      {hasHits && effectiveView === 'list' && (
-        <ul className="rows">
-          {hits.map(hit => (
-            <HitRow
-              key={`${hit.catalog_source}:${hit.object_ref}`}
-              hit={hit}
-              onGraph={jumpToGraph}
+          {!error && !result && (
+            <p className="hint">Searching the catalog…</p>
+          )}
+
+          {!error && result && result.hits.length === 0 && (
+            <div className="empty" role="status">
+              <p>No results match these filters.</p>
+              <p className="next">
+                Loosen or clear a facet. A stale source is withheld until it is re-uploaded and
+                re-vouched, and columns your roles cannot see are never shown. Nothing is shown that
+                cannot be trusted.
+              </p>
+            </div>
+          )}
+
+          {!error && hasHits && (
+            <p className="micro-label tabular-nums result-count" role="status">
+              <span style={{ color: 'var(--accent)', fontWeight: 600 }}>{result.total}</span>{' '}
+              {result.total === 1 ? 'result' : 'results'}
+              {result.total > result.hits.length && (
+                <span className="result-count-note"> · showing the first {result.hits.length}</span>
+              )}
+            </p>
+          )}
+
+          {!error && hasHits && effectiveView === 'list' && (
+            <ul className="rows">
+              {result.hits.map(hit => (
+                <HitRow
+                  key={`${hit.catalog_source}:${hit.object_ref}`}
+                  hit={hit}
+                  onGraph={jumpToGraph}
+                />
+              ))}
+            </ul>
+          )}
+
+          {effectiveView === 'graph' && graphAnchor && (
+            // Keyed on the anchor: a new anchor remounts the view, resetting expansion, trace, and
+            // drawer state cleanly. Facets narrow the hit set; the graph anchors on its first hit.
+            <LineageView
+              key={`${graphAnchor.catalog_source}:${graphAnchor.object_ref}`}
+              anchor={graphAnchor}
             />
-          ))}
-        </ul>
-      )}
-
-      {effectiveView === 'graph' && graphAnchor && (
-        // Keyed on the anchor: a new anchor remounts the view, resetting expansion, trace,
-        // and drawer state cleanly.
-        <LineageView
-          key={`${graphAnchor.catalog_source}:${graphAnchor.object_ref}`}
-          anchor={graphAnchor}
-        />
-      )}
+          )}
+        </div>
+      </div>
     </section>
   )
 }

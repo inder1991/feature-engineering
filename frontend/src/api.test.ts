@@ -30,6 +30,46 @@ describe('api client', () => {
     expect(init.headers['X-Roles']).toBe('data_owner,pii_reader')
   })
 
+  it('builds /search with repeated facet params + boolean flags, session headers attached', async () => {
+    fetchMock.mockImplementation(ok({ hits: [], facets: {}, total: 0 }))
+    await searchCatalog('balance', {
+      source: ['deposits', 'cards'],
+      additivity: ['semi_additive'],
+      grain: true,
+    })
+    const [url, init] = fetchMock.mock.calls[0]
+    // Pinned byte-for-byte: q, then each facet group in contract order with values REPEATED
+    // (AND across groups, OR within one), then grain=true, then limit. A filtered search is a URL.
+    expect(url).toBe(
+      '/search?q=balance&source=deposits&source=cards&additivity=semi_additive&grain=true&limit=20',
+    )
+    expect(init.headers['X-User']).toBe('ana')
+    expect(init.headers['X-Roles']).toBe('data_owner,pii_reader')
+  })
+
+  it('omits empty facet groups and unset flags, and honors a custom limit and empty q', async () => {
+    fetchMock.mockImplementation(ok({ hits: [], facets: {}, total: 0 }))
+    // Empty q browses all; an empty facet array and an unset flag never reach the wire.
+    await searchCatalog('', { source: [], grain: false, as_of: true }, 50)
+    const [url] = fetchMock.mock.calls[0]
+    expect(url).toBe('/search?q=&as_of=true&limit=50')
+  })
+
+  it('returns the SearchResult shape (hits, facets, total) untouched', async () => {
+    const payload = {
+      hits: [], total: 3,
+      facets: {
+        source: [{ value: 'deposits', count: 2 }, { value: 'cards', count: 1 }],
+        sensitivity: [{ value: '(none)', count: 3 }],
+        grain: [{ value: 'true', count: 0 }],
+        as_of: [{ value: 'true', count: 1 }],
+      },
+    }
+    fetchMock.mockImplementation(ok(payload))
+    const result = await searchCatalog('balance')
+    expect(result).toEqual(payload)
+  })
+
   it('percent-encodes the session user so non-Latin-1 names cannot break fetch', async () => {
     // fetch header values must be ISO-8859-1; a raw name like this throws a TypeError before
     // any request is sent. The dev stub accepts the percent-encoded form.
