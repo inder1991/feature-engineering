@@ -315,3 +315,35 @@ def test_confirmed_context_conflict_is_a_warning_not_a_reject(make_client, conn,
     assert "modelling_context_conflict" in body["signal_warnings"].get(IFRS9_RECIPE, [])
     # The generic recipe is COMPATIBLE under frtb — no conflict warning.
     assert "modelling_context_conflict" not in body["signal_warnings"].get(GENERIC_CREDIT_RECIPE, [])
+
+
+# ── Fix 5: a bogus modelling_context is CLEANED at the route boundary (dropped, never a reject) ────────
+def test_bogus_modelling_context_is_dropped_at_the_boundary(make_client, conn, monkeypatch):
+    """A hand-crafted bogus modelling_context is non-fatally CLEANED at the route boundary — dropped
+    BEFORE ranking / warnings / persistence, so it raises no spurious modelling_context_conflict and
+    writes no dimension row; a valid context alongside it is kept."""
+    monkeypatch.setenv(SCOPE_FLAG, "1")
+    monkeypatch.setenv(RANK_FLAG, "1")
+    _bank_ifrs9(conn)
+
+    # A BOGUS-ONLY confirmed set: without cleaning it would clean to (), the ifrs9-tagged recipe's own
+    # {ifrs9} would be disjoint from {not_a_framework} -> CONFLICT -> a SPURIOUS modelling_context_conflict.
+    bogus = _post_unscoped(make_client(_fake()), modelling_contexts=("not_a_framework",))
+    warnings = bogus["signal_warnings"]
+    assert all("modelling_context_conflict" not in codes for codes in warnings.values())
+    # NOTHING was written to the immutable dimension table for the bogus value.
+    n = conn.execute(
+        "SELECT count(*) FROM confirmed_scope_dimension WHERE scope_id = %s",
+        (bogus["scope_id"],)).fetchone()[0]
+    assert n == 0
+
+    # A valid context ALONGSIDE a bogus one: the valid ifrs9 is kept + persisted, the bogus is dropped.
+    mixed = _post_unscoped(make_client(_fake()),
+                           modelling_contexts=("ifrs9", "not_a_framework"))
+    contexts = conn.execute(
+        "SELECT value FROM confirmed_scope_dimension "
+        "WHERE scope_id = %s AND dimension = 'modelling_context' ORDER BY display_order",
+        (mixed["scope_id"],)).fetchall()
+    assert [c[0] for c in contexts] == ["ifrs9"]
+    # The kept ifrs9 still drives the ifrs9-tagged recipe to REQUIRED_MATCH (no conflict warning).
+    assert "modelling_context_conflict" not in mixed["signal_warnings"].get(IFRS9_RECIPE, [])

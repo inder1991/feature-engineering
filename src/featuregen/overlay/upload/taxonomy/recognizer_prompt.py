@@ -18,7 +18,10 @@ from featuregen.overlay.upload.taxonomy.dimensions import MODELLING_CONTEXTS, kn
 from featuregen.overlay.upload.taxonomy.use_cases import selectable_leaves, use_case
 
 PROMPT_ID = "use_case_recognition"
-PROMPT_VERSION = "1"
+# Bumped to "2" for Phase-2B/B1: the prompt now enumerates the two dimension vocabularies (modelling
+# contexts + target entities), their classification rules, and the extended output shape — a material
+# change to what every intent_recognition_attempt was produced under, so replay must not read it as "1".
+PROMPT_VERSION = "2"
 
 
 def _taxonomy_lines() -> list[str]:

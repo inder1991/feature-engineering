@@ -12,6 +12,7 @@ import pytest
 
 from featuregen.overlay.upload.contract.scope_records import (
     confirmation_delta,
+    dimension_provenance,
     record_confirmed_scope,
     record_recognition_attempt,
     scope_for_run,
@@ -275,19 +276,33 @@ def test_confirmed_dimensions_persist_provenance_round_trip_and_delta(db) -> Non
     assert delta["replaced"] == [{"from": "account", "to": "customer"}]
 
 
-def test_unscoped_scope_writes_no_dimension_rows(db) -> None:
-    # An unscoped scope confirms no dimensions -> ZERO confirmed_scope_dimension rows, even if a stray
-    # modelling_context/target_entity rode in on the value object (mirrors the use-case-children guard).
+def test_unscoped_scope_persists_and_rebuilds_dimension_rows(db) -> None:
+    # Fix 1: the confirmed dimensions are DATA orthogonal to use-case scoping — an unscoped broaden
+    # ("show all buildable recipes") does NOT forget the confirmed IFRS9 context. So an UNSCOPED scope
+    # PERSISTS its dimension rows (unlike the use-case children) and scope_for_run rebuilds them, while
+    # still writing ZERO use-case child rows.
     scope = ConfirmedScope(
         primary=None, unscoped=True, modelling_contexts=("ifrs9",), target_entity="customer")
     scope_id = record_confirmed_scope(
         db, intent_id="intent_undim", generation_run_id="run_undim", recognition_id=None, scope=scope,
         use_case_origins={}, confirmation_source="user_broadened", confirmed_by="ds1")
 
-    n_dims = db.execute(
-        "SELECT count(*) FROM confirmed_scope_dimension WHERE scope_id = %s", (scope_id,)).fetchone()[0]
-    assert n_dims == 0
-    assert scope_for_run(db, "run_undim") == ConfirmedScope(primary=None, secondary=(), unscoped=True)
+    # ZERO use-case child rows (a broaden confirms no use-cases) …
+    n_children = db.execute(
+        "SELECT count(*) FROM confirmed_scope_use_case WHERE scope_id = %s", (scope_id,)).fetchone()[0]
+    assert n_children == 0
+    # … but the confirmed DIMENSION rows DO persist for the unscoped scope.
+    dims = db.execute(
+        "SELECT dimension, value FROM confirmed_scope_dimension WHERE scope_id = %s "
+        "ORDER BY dimension, display_order", (scope_id,)).fetchall()
+    assert dims == [("modelling_context", "ifrs9"), ("target_entity", "customer")]
+
+    # scope_for_run rebuilds an unscoped scope that STILL carries its confirmed dimensions (round-trip).
+    reconstructed = scope_for_run(db, "run_undim")
+    assert reconstructed == scope
+    assert reconstructed.unscoped is True
+    assert reconstructed.modelling_contexts == ("ifrs9",)
+    assert reconstructed.target_entity == "customer"
 
 
 def test_scope_with_no_dimensions_round_trips_as_empty(db) -> None:
@@ -306,3 +321,90 @@ def test_scope_with_no_dimensions_round_trips_as_empty(db) -> None:
 def test_confirmation_delta_unknown_run_is_empty(db) -> None:
     assert confirmation_delta(db, "no_such_run") == {
         "accepted": [], "rejected": [], "added": [], "replaced": []}
+
+
+# ── Fix 2: server-side dimension provenance is derived from the IMMUTABLE attempt, never the client ────
+def test_dimension_provenance_derives_mixed_sources_from_the_attempt(db) -> None:
+    # The recognizer PROPOSED contexts ifrs9/frtb + entity account. The human keeps ifrs9 (accepted),
+    # adds lcr (never proposed), and corrects the entity account -> customer. Provenance is reconstructed
+    # from the stored attempt, not from any client claim.
+    rid = record_recognition_attempt(
+        db, intent_id="intent_prov", input_hash="hash_prov", result=_dim_result(), actor="ds1")
+    scope = ConfirmedScope(
+        primary=PRIMARY, secondary=(), unscoped=False,
+        modelling_contexts=("ifrs9", "lcr"), target_entity="customer")
+
+    sources, replaces = dimension_provenance(db, rid, scope)
+    assert sources["ifrs9"] == "accepted_llm_proposal"    # proposed AND confirmed
+    assert sources["lcr"] == "user_added"                 # confirmed, never proposed
+    assert sources["customer"] == "user_replacement"      # a DIFFERENT entity (account) was proposed
+    assert replaces == {"customer": "account"}            # supersedes the proposed account
+
+
+def test_dimension_provenance_accepted_entity_and_contexts(db) -> None:
+    # The human keeps EXACTLY what the recognizer proposed (ifrs9/frtb + account) -> all accepted.
+    rid = record_recognition_attempt(
+        db, intent_id="intent_prov_acc", input_hash="hash_prov_acc", result=_dim_result(), actor="ds1")
+    scope = ConfirmedScope(
+        primary=PRIMARY, unscoped=False, modelling_contexts=("ifrs9", "frtb"), target_entity="account")
+    sources, replaces = dimension_provenance(db, rid, scope)
+    assert sources == {"ifrs9": "accepted_llm_proposal", "frtb": "accepted_llm_proposal",
+                       "account": "accepted_llm_proposal"}
+    assert replaces == {}
+
+
+def test_dimension_provenance_entity_added_when_none_proposed(db) -> None:
+    # The recognizer proposed NO target_entity -> a human-set entity is user_added, not a replacement.
+    result = RecognitionResult(
+        status=RecognitionStatus.CLASSIFIED,
+        candidates=(UseCaseCandidate(use_case_id=PRIMARY, relationship="primary", confidence="high",
+                                     evidence_spans=("x",), rationale="y"),),
+        ambiguity_note=None, taxonomy_version="t", recognizer_model_id="m", prompt_version="p",
+        applicability_mapping_version="a", recipe_registry_version="r",
+        modelling_contexts=("ifrs9",), target_entity=None)
+    rid = record_recognition_attempt(
+        db, intent_id="intent_prov_add", input_hash="hash_prov_add", result=result, actor="ds1")
+    scope = ConfirmedScope(primary=PRIMARY, unscoped=False, target_entity="customer")
+
+    sources, replaces = dimension_provenance(db, rid, scope)
+    assert sources["customer"] == "user_added"
+    assert replaces == {}
+
+
+def test_dimension_provenance_no_recognition_is_all_user_added(db) -> None:
+    # No linked recognition (recognition_id=None) -> no proposals -> every confirmed value is user_added.
+    scope = ConfirmedScope(
+        primary=PRIMARY, unscoped=False, modelling_contexts=("ifrs9",), target_entity="customer")
+    sources, replaces = dimension_provenance(db, None, scope)
+    assert sources == {"ifrs9": "user_added", "customer": "user_added"}
+    assert replaces == {}
+
+
+def test_provenance_wired_into_record_yields_truthful_delta(db) -> None:
+    # Fix 2 end-to-end (the route's wiring): derive provenance from the attempt, feed it into
+    # record_confirmed_scope, and confirmation_delta reads a TRUTHFUL accepted/rejected/added/replaced
+    # split — with NO hand-supplied provenance.
+    rid = record_recognition_attempt(
+        db, intent_id="intent_wire", input_hash="hash_wire", result=_dim_result(), actor="ds1")
+    scope = ConfirmedScope(
+        primary=PRIMARY, secondary=(), unscoped=False,
+        modelling_contexts=("ifrs9", "lcr"), target_entity="customer")
+    sources, replaces = dimension_provenance(db, rid, scope)
+    scope_id = record_confirmed_scope(
+        db, intent_id="intent_wire", generation_run_id="run_wire", recognition_id=rid, scope=scope,
+        use_case_origins={}, dimension_sources=sources, replaces=replaces,
+        confirmation_source="user_confirmed", confirmed_by="ds1")
+
+    rows = db.execute(
+        "SELECT dimension, value, source, replaces_value FROM confirmed_scope_dimension "
+        "WHERE scope_id = %s ORDER BY dimension, display_order", (scope_id,)).fetchall()
+    assert rows == [
+        ("modelling_context", "ifrs9", "accepted_llm_proposal", None),
+        ("modelling_context", "lcr", "user_added", None),
+        ("target_entity", "customer", "user_replacement", "account")]
+
+    delta = confirmation_delta(db, "run_wire")
+    assert delta["accepted"] == ["ifrs9"]                 # proposed AND confirmed
+    assert delta["rejected"] == ["frtb"]                  # proposed, dropped (account is REPLACED, not here)
+    assert set(delta["added"]) == {"lcr", "customer"}     # confirmed, not proposed
+    assert delta["replaced"] == [{"from": "account", "to": "customer"}]

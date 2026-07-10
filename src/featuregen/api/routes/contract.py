@@ -50,6 +50,7 @@ from featuregen.overlay.upload.contract.intake import (
 )
 from featuregen.overlay.upload.contract.review import author_contract
 from featuregen.overlay.upload.contract.scope_records import (
+    dimension_provenance,
     record_confirmed_scope,
     record_recognition_attempt,
 )
@@ -58,6 +59,7 @@ from featuregen.overlay.upload.taxonomy.applicability import (
     ScopeExpansion,
     applicability_result,
 )
+from featuregen.overlay.upload.taxonomy.dimensions import MODELLING_CONTEXTS, known_entities
 from featuregen.overlay.upload.taxonomy.disposition import (
     FinalDisposition,
     RecipeEvaluation,
@@ -293,6 +295,15 @@ def _scoped_considered_set(body: ConsideredSetIn, conn: _Conn, identity: _Identi
     that supersedes the prior scope (both are retained)."""
     cscope = body.confirmed_scope
     assert cscope is not None   # caller only routes here when a confirmed scope is present
+    # 0. Non-fatally CLEAN the confirmed dimensions against the closed vocab at the boundary (mirror
+    #    ``recognition.normalize_dimensions`` — DROP unknowns, NEVER reject). A hand-crafted request could
+    #    otherwise send a bogus ``modelling_context`` that makes every framework-tagged recipe CONFLICT
+    #    (a spurious ``modelling_context_conflict`` warning, contradicting the field's own "unknown value
+    #    yields COMPATIBLE" contract) and writes garbage to the immutable table. Cleaned BEFORE the scope
+    #    is built, so ranking, warnings, AND the persisted rows all see the cleaned set. Dimensions stay
+    #    SOFT — this narrows nothing (applicability is untouched); it only discards ungoverned values.
+    clean_contexts = tuple(c for c in cscope.modelling_contexts if c in MODELLING_CONTEXTS)
+    clean_entity = cscope.target_entity if cscope.target_entity in known_entities() else None
     # 1. Build the confirmed-scope value object. ``unscoped`` fails OPEN to full grounding: it needs no
     #    ids, so any stray ``primary``/``secondary`` is IGNORED (never validated — a broaden must never
     #    422 on a leftover id). Otherwise every confirmed id must be a selectable taxonomy leaf and the
@@ -300,7 +311,7 @@ def _scoped_considered_set(body: ConsideredSetIn, conn: _Conn, identity: _Identi
     if cscope.unscoped:
         scope = ConfirmedScope(
             primary=None, secondary=(), unscoped=True,
-            modelling_contexts=tuple(cscope.modelling_contexts), target_entity=cscope.target_entity)
+            modelling_contexts=clean_contexts, target_entity=clean_entity)
     else:
         # A ``primary`` that also appears in ``secondary`` (or a duplicated ``secondary``) would collide
         # on the ``confirmed_scope_use_case`` PK downstream → UniqueViolation → 500; reject it as a 422.
@@ -320,8 +331,8 @@ def _scoped_considered_set(body: ConsideredSetIn, conn: _Conn, identity: _Identi
             scope = ConfirmedScope(
                 primary=cscope.primary, secondary=tuple(cscope.secondary),
                 expansion=ScopeExpansion(cscope.expansion), unscoped=False,
-                modelling_contexts=tuple(cscope.modelling_contexts),
-                target_entity=cscope.target_entity)
+                modelling_contexts=clean_contexts,
+                target_entity=clean_entity)
         except ValueError as e:
             raise HTTPException(status_code=422, detail=str(e)) from e
     # 2. Reuse the recognition's immutable intent if given, else submit a fresh (redacted) one.
@@ -346,11 +357,16 @@ def _scoped_considered_set(body: ConsideredSetIn, conn: _Conn, identity: _Identi
     # 5. Persist the confirmed scope in the API layer, BEFORE the builder (the run→scope linkage exists
     # before any generation). The intent is durably recorded first so the lineage reads intent→run→scope.
     persist_intent(conn, intent, body.target_ref)
+    # Reconstruct each confirmed dimension's provenance from the IMMUTABLE recognition attempt (never the
+    # client): a value the recognizer proposed is ``accepted_llm_proposal``, one the human introduced is
+    # ``user_added``, and a corrected entity is a ``user_replacement`` recording what it superseded.
+    dim_sources, dim_replaces = dimension_provenance(conn, body.recognition_id, scope)
     scope_id = record_confirmed_scope(
         conn, intent_id=intent.intent_id, generation_run_id=generation_run_id,
         recognition_id=body.recognition_id, scope=scope,
         use_case_origins=cscope.use_case_origins, confirmation_source=cscope.confirmation_source,
-        confirmed_by=identity.subject, supersedes_scope_id=body.supersedes_scope_id)
+        confirmed_by=identity.subject, supersedes_scope_id=body.supersedes_scope_id,
+        dimension_sources=dim_sources, replaces=dim_replaces)
     # 6. Compute applicability ONCE — grounding AND the disposition lens consume this single object.
     applicability = applicability_result(scope)
     now = datetime.now(UTC)

@@ -169,8 +169,7 @@ def modelling_context_fit(
       specific to a confirmed framework — e.g. an ``ifrs9_staging`` recipe under confirmed ``ifrs9``);
     * the recipe declares NO modelling context (generic) → ``COMPATIBLE`` (it works under any context);
     * the recipe declares only context(s) DISJOINT from the confirmed set → ``CONFLICT`` (e.g. an
-      ``frtb``-only recipe under confirmed ``ifrs9``) — a warning, not a rejection;
-    * else → ``NEUTRAL`` (a total, defensive fallback).
+      ``frtb``-only recipe under confirmed ``ifrs9``) — a warning, not a rejection.
     """
     if not confirmed_contexts:
         return ModellingContextFit.NEUTRAL
@@ -180,9 +179,10 @@ def modelling_context_fit(
         return ModellingContextFit.REQUIRED_MATCH
     if not own:
         return ModellingContextFit.COMPATIBLE
-    if own.isdisjoint(confirmed):
-        return ModellingContextFit.CONFLICT
-    return ModellingContextFit.NEUTRAL
+    # The only remaining state is necessarily DISJOINT: ``own`` is non-empty (the COMPATIBLE check above
+    # returned for an empty ``own``) AND ``own & confirmed`` is empty (the REQUIRED_MATCH check returned
+    # on any overlap), so the recipe declares only contexts the confirmed set does not contain → CONFLICT.
+    return ModellingContextFit.CONFLICT
 
 
 # ──────────────────────────────────────────────────────────────────────────────────────────────────

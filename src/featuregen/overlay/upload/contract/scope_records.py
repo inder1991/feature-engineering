@@ -117,8 +117,10 @@ def record_confirmed_scope(
     ``dimension_sources`` (value -> one of ``accepted_llm_proposal`` / ``user_added`` /
     ``user_replacement`` / ``project_default`` / ``organization_default``; default
     ``'accepted_llm_proposal'``) and, for a ``user_replacement``, the value it superseded from
-    ``replaces`` (value -> replaced value). Like the use-case children, an ``unscoped`` scope writes
-    zero dimension rows."""
+    ``replaces`` (value -> replaced value). UNLIKE the use-case children, the confirmed dimensions
+    persist for BOTH scoped and unscoped scopes: they are confirmed DATA orthogonal to use-case
+    scoping, so a broaden (an ``unscoped`` "show all buildable recipes") does NOT forget the confirmed
+    context — ``scope_for_run`` rebuilds them either way."""
     scope_id = mint_id("scp")
     conn.execute(
         "INSERT INTO confirmed_generation_scope "
@@ -148,29 +150,78 @@ def record_confirmed_scope(
             (scope_id, use_case_id, relationship,
              use_case_origins.get(use_case_id, "llm_proposed"), display_order))
 
-    # Confirmed intent dimensions (Phase-2B), each a normalized child with rich provenance. Skipped for
-    # an unscoped scope (no confirmed dimensions), consistent with the use-case children and with
-    # scope_for_run rebuilding an unscoped scope as ``()``/``None`` dimensions.
-    if not scope.unscoped:
-        sources = dimension_sources or {}
-        replaced = replaces or {}
-        dimension_rows: list[tuple[str, str, str, str | None, int]] = [
-            ("modelling_context", context, sources.get(context, "accepted_llm_proposal"),
-             replaced.get(context), order)
-            for order, context in enumerate(scope.modelling_contexts)
-        ]
-        if scope.target_entity is not None:
-            dimension_rows.append((
-                "target_entity", scope.target_entity,
-                sources.get(scope.target_entity, "accepted_llm_proposal"),
-                replaced.get(scope.target_entity), 0))
-        for dimension, value, source, replaces_value, display_order in dimension_rows:
-            conn.execute(
-                "INSERT INTO confirmed_scope_dimension "
-                "(scope_id, dimension, value, source, replaces_value, display_order) "
-                "VALUES (%s, %s, %s, %s, %s, %s)",
-                (scope_id, dimension, value, source, replaces_value, display_order))
+    # Confirmed intent DIMENSIONS (Phase-2B), each a normalized child with rich provenance. UNLIKE the
+    # use-case children, these persist for BOTH scoped and unscoped scopes: the confirmed dimensions are
+    # data orthogonal to use-case scoping, so a broaden ("show all buildable recipes") does NOT forget
+    # the confirmed context — B3's ranker + signal_warnings are genuinely shaped by it, so the durable
+    # record must be able to reproduce the presentation. scope_for_run rebuilds them unconditionally.
+    sources = dimension_sources or {}
+    replaced = replaces or {}
+    dimension_rows: list[tuple[str, str, str, str | None, int]] = [
+        ("modelling_context", context, sources.get(context, "accepted_llm_proposal"),
+         replaced.get(context), order)
+        for order, context in enumerate(scope.modelling_contexts)
+    ]
+    if scope.target_entity is not None:
+        dimension_rows.append((
+            "target_entity", scope.target_entity,
+            sources.get(scope.target_entity, "accepted_llm_proposal"),
+            replaced.get(scope.target_entity), 0))
+    for dimension, value, source, replaces_value, display_order in dimension_rows:
+        conn.execute(
+            "INSERT INTO confirmed_scope_dimension "
+            "(scope_id, dimension, value, source, replaces_value, display_order) "
+            "VALUES (%s, %s, %s, %s, %s, %s)",
+            (scope_id, dimension, value, source, replaces_value, display_order))
     return scope_id
+
+
+def dimension_provenance(
+    conn, recognition_id: str | None, scope: ConfirmedScope,
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Reconstruct the confirmed dimensions' PROVENANCE from the IMMUTABLE recognition attempt — never
+    from the client (governance cannot trust a client's provenance claims). Returns ``(sources,
+    replaces)`` keyed by dimension VALUE, ready to pass straight into :func:`record_confirmed_scope`.
+
+    Loads the recognizer's PROPOSED ``modelling_contexts`` (jsonb) + ``target_entity`` (text) from
+    ``intent_recognition_attempt`` by ``recognition_id`` (``((), None)`` when ``recognition_id`` is
+    ``None`` or no row exists), then stamps each CONFIRMED value:
+
+    * a confirmed ``modelling_context`` → ``accepted_llm_proposal`` if the recognizer proposed it, else
+      ``user_added``;
+    * the confirmed ``target_entity`` (if set) → ``accepted_llm_proposal`` if it equals the proposed
+      entity; ``user_replacement`` (with ``replaces[value] = proposed_entity``) if a DIFFERENT entity
+      was proposed; ``user_added`` if no entity was proposed.
+
+    Contexts and entities are disjoint vocabularies, so the value-keyed dicts never collide. Only the
+    first three of the ``source`` CHECK values are ever emitted (the two ``*_default`` sources are not
+    a recognition-vs-human distinction)."""
+    proposed_contexts: tuple[str, ...] = ()
+    proposed_entity: str | None = None
+    if recognition_id is not None:
+        row = conn.execute(
+            "SELECT modelling_contexts, target_entity FROM intent_recognition_attempt "
+            "WHERE recognition_id = %s", (recognition_id,)).fetchone()
+        if row is not None:
+            proposed_contexts = tuple(row[0] or ())
+            proposed_entity = row[1]
+    proposed_context_set = set(proposed_contexts)
+
+    sources: dict[str, str] = {}
+    replaces: dict[str, str] = {}
+    for context in scope.modelling_contexts:
+        sources[context] = (
+            "accepted_llm_proposal" if context in proposed_context_set else "user_added")
+    entity = scope.target_entity
+    if entity is not None:
+        if entity == proposed_entity:
+            sources[entity] = "accepted_llm_proposal"
+        elif proposed_entity:
+            sources[entity] = "user_replacement"
+            replaces[entity] = proposed_entity
+        else:
+            sources[entity] = "user_added"
+    return sources, replaces
 
 
 def scope_for_run(conn, generation_run_id: str) -> ConfirmedScope | None:
