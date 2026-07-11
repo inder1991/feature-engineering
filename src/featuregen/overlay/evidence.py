@@ -15,11 +15,17 @@ from featuregen.contracts import DbConn
 class EvidenceProducer(str, Enum):
     """WHO produced an evidence record (§3.1). ``LEGACY`` labels evidence that predates the axis
     (or a caller whose producer is not yet classified); ``PROFILER`` is the profiling substrate that
-    every pre-existing caller writes through — see the Step-0 caller audit."""
+    every pre-existing caller writes through — see the Step-0 caller audit.
+    ``STRUCTURAL_CONNECTOR`` is a DB/OpenMetadata connector attesting structure (governed joins);
+    ``PARSER`` is deterministic sample-value/prose parsing; ``TAXONOMY`` is concept-registry-derived
+    evidence."""
 
-    PROFILER = "profiler"
-    LLM = "llm"
     SOURCE = "source"
+    STRUCTURAL_CONNECTOR = "structural_connector"
+    PARSER = "parser"
+    LLM = "llm"
+    PROFILER = "profiler"
+    TAXONOMY = "taxonomy"
     HUMAN = "human"
     LEGACY = "legacy"
 

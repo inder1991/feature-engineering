@@ -30,3 +30,9 @@ def test_legacy_write_defaults(db):
 def test_assertion_strength_has_all_four_members():
     from featuregen.overlay.evidence import AssertionStrength
     assert [s.value for s in AssertionStrength] == ["proposed", "supported", "attested", "confirmed"]
+
+
+def test_evidence_producer_has_all_eight_members():
+    from featuregen.overlay.evidence import EvidenceProducer
+    assert {p.value for p in EvidenceProducer} == {
+        "source", "structural_connector", "parser", "llm", "profiler", "taxonomy", "human", "legacy"}
