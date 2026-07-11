@@ -17,6 +17,85 @@ A first-time 144-column, 8-table upload with no declared definitions is ~296 pro
 and the concept prompt re-sends the ~281-term controlled vocabulary on every one of the 144 concept
 calls. That resent vocabulary is the dominant token cost, and it is pure waste.
 
+## Current design (as-is, with code)
+
+The call site is advisory and fail-soft (`ingest.py`): a provider error degrades search, never the
+facts.
+
+```python
+# ingest.py — enrichment is optional and non-fatal
+concepts = definitions = domains = None
+if client is not None:
+    try:
+        concepts    = enrich_concepts(conn, vr.good, client, actor)
+        definitions = draft_definitions(conn, vr.good, client, actor)
+        domains     = classify_domains(conn, vr.good, client, actor)
+    except Exception:                      # ADVISORY — degrade search, never abort the upload's facts
+        concepts = definitions = domains = None
+build_graph(conn, catalog_source, vr.good, concepts, definitions, domains)
+```
+
+Each enrichment function is a **cache-first, one-call-per-item loop** (`enrich.py`). The concept
+loop is representative — note the two cost drivers marked inline:
+
+```python
+def enrich_concepts(conn, rows, client, actor=None) -> dict[str, str]:
+    by_hash = {content_hash(r): r for r in rows}
+    result  = _cache_get(conn, "enrichment_concept", list(by_hash))   # skip already-cached
+    for h, row in by_hash.items():                                    # (A) ONE LLM CALL PER COLUMN
+        if h in result:
+            continue
+        raw = _call(conn, client, _TASK, "overlay_concept_v1", "overlay_concept",
+                    {"table": row.table, "column": row.column, "type": row.type,
+                     "vocabulary": _CONCEPT_VOCABULARY},              # (B) VOCAB RESENT EVERY CALL
+                    "concept", "Classify this column into the controlled vocabulary ...", actor)
+        if raw is None:
+            continue                                                  # failure -> don't cache (M3)
+        concept = raw if is_known_concept(raw) else UNCLASSIFIED      # per-item grounding validator
+        _cache_put(conn, "enrichment_concept", h, concept)
+        result[h] = concept
+    return result
+```
+
+The governed single-item seam (`enrich_llm.py`) returns one string, validated against a
+single-field output schema:
+
+```python
+def audited_enrich_call(conn, client, *, task, prompt_id, schema_id,
+                        catalog_metadata, out_key, instruction, actor=None) -> str | None:
+    out = audited_structured_call(conn, client, task=task, prompt_id=prompt_id, schema_id=schema_id,
+                                  catalog_metadata=catalog_metadata, instruction=instruction,
+                                  actor=actor)                        # egress guard + audit record
+    if not out:
+        return None
+    return str(out.get(out_key, "")).strip() or None
+
+# _SCHEMAS (enrich_llm.py) — a single-value object per call
+("overlay_concept", 1): {"type": "object", "additionalProperties": False,
+                         "properties": {"concept": {"type": "string"}}, "required": ["concept"]}
+```
+
+`draft_definitions` and `classify_domains` are the same shape (definition per blank-def column;
+domain per table). So: **calls = distinct uncached columns (concept) + distinct uncached blank-def
+columns (definition) + distinct uncached tables (domain)**, each a separate round-trip, each
+resending its fixed prompt context.
+
+## Current vs proposed at a glance
+
+| Aspect | Current (as-is) | Proposed (batched) |
+|---|---|---|
+| LLM calls, 144 cols / 8 tables / no declared defs | ~296 | ~17 |
+| Concept-vocabulary sends | 144 | 4 (once per batch) |
+| Call granularity | 1 per column (concept, def) / 1 per table (domain) | chunk of `K_task` items per call |
+| Cache-first dedup | yes | yes (unchanged; only the uncached remainder is batched) |
+| Per-item validation | `is_known_concept` / `_bounded` per call | same validators, applied per item in the batch |
+| Failure unit | one column skipped, retried next ingest | one item skipped (partial salvage), retried next ingest |
+| Cross-item contamination | impossible (1 item/call) | impossible (each item carries a `ref`, matched back by key) |
+| Audit (`llm_call`) rows | 1 per column | 1 per batch, recording covered refs |
+| Quality control | inherent to single-item | per-task `K` + measured eval gate + fallback-to-single |
+| Kill switch | n/a | `K_task = 1` reproduces today's exact per-item behavior |
+| Structural graph (nodes/edges/joins/grain) | deterministic, untouched | deterministic, untouched |
+
 ## Principle: batch the uncached remainder, quality-preserving by construction
 
 Everything load-bearing stays exactly as it is; only the transport changes.
@@ -101,19 +180,65 @@ Classification tasks (concept, domain) pin low temperature to minimise variance;
 marginally more but stay low. `generation_settings` are pinned on the request so the audit record
 and idempotency key are stable.
 
-## What changes in code
+## Proposed design (with code)
 
-- `enrich.py`: the three per-item loops become "collect uncached items -> chunk by `K_task` ->
-  batched call -> validate + salvage -> cache." The chunking and salvage live here; the cache
-  helpers (`_cache_get`/`_cache_put`) and validators (`is_known_concept`, `_bounded`) are reused
-  unchanged.
-- `enrich_llm.py`: a new `audited_batch_call(conn, client, *, task, items, schema_id, ...)` beside
-  `audited_enrich_call`, running the same governed seam (attached output-schema, reserved input
-  keys, `assert_llm_safe`, `record_llm_call`) but with an ARRAY output schema and per-item
-  validation returning `{ref: value}` for the valid items only. One `llm_call` audit row per batch,
-  recording the covered refs + cost.
-- New registered output schemas: `overlay_concept_batch_v1`, `overlay_definition_batch_v1`,
-  `overlay_domain_batch_v1` — each `{results: [{ref, <value>}]}`, `additionalProperties: false`.
+The per-item loop becomes "compute the uncached remainder -> chunk by `K_task` -> one batched call
+per chunk -> validate + salvage per item -> cache." Everything else in the function is unchanged.
+
+```python
+def enrich_concepts(conn, rows, client, actor=None) -> dict[str, str]:
+    by_hash = {content_hash(r): r for r in rows}
+    result  = _cache_get(conn, "enrichment_concept", list(by_hash))   # SAME cache-first
+    todo    = [(h, r) for h, r in by_hash.items() if h not in result] # uncached remainder only
+    for chunk in _chunks(todo, K_CONCEPT):                            # (A') BATCHED, not per-column
+        items = [{"ref": h, "table": r.table, "column": r.column, "type": r.type} for h, r in chunk]
+        got = _call_batch(conn, client, _TASK, "overlay_concept_batch_v1", "overlay_concept_batch",
+                          items, {"vocabulary": _CONCEPT_VOCABULARY},  # (B') VOCAB ONCE PER BATCH
+                          "concept", "Classify EACH column independently ...", actor)  # -> {ref: concept}
+        for h, row in chunk:
+            raw = got.get(h)                                          # missing ref -> skip (salvage)
+            if raw is None:
+                continue
+            concept = raw if is_known_concept(raw) else UNCLASSIFIED  # SAME per-item validator
+            _cache_put(conn, "enrichment_concept", h, concept)
+            result[h] = concept
+    return result
+```
+
+The new governed batched seam mirrors `audited_enrich_call` but returns `{ref: value}` for the
+valid items only, over an ARRAY output schema:
+
+```python
+def audited_batch_call(conn, client, *, task, prompt_id, schema_id,
+                       items, extra_metadata, out_key, instruction, actor=None) -> dict[str, str]:
+    """Governed batch: same egress guard + audit + attached schema as the single call; one llm_call
+    row per batch. Returns {ref: value} for the items that passed validation."""
+    out = audited_structured_call(conn, client, task=task, prompt_id=prompt_id, schema_id=schema_id,
+                                  catalog_metadata={"items": items, **extra_metadata},
+                                  instruction=instruction, actor=actor)
+    got = {}
+    for entry in (out or {}).get("results", []):
+        ref = entry.get("ref"); val = str(entry.get(out_key, "")).strip()
+        if ref and val:                       # extra/mis-ordered/blank ref -> dropped, never misattributed
+            got[ref] = val
+    return got
+
+# _SCHEMAS gains the array variant — additionalProperties:false, ref required per item
+("overlay_concept_batch", 1): {"type": "object", "additionalProperties": False, "required": ["results"],
+    "properties": {"results": {"type": "array", "items": {
+        "type": "object", "additionalProperties": False, "required": ["ref", "concept"],
+        "properties": {"ref": {"type": "string"}, "concept": {"type": "string"}}}}}}
+```
+
+### Files touched
+- `enrich.py`: the three loops adopt the chunk-and-salvage shape above; add `_chunks` + `_call_batch`
+  wrappers and the fallback-to-single branch. Cache helpers (`_cache_get`/`_cache_put`) and
+  validators (`is_known_concept`, `_bounded`) are reused unchanged.
+- `enrich_llm.py`: add `audited_batch_call`; add `overlay_concept_batch_v1` /
+  `overlay_definition_batch_v1` / `overlay_domain_batch_v1` to `_SCHEMAS` (each `{results:[{ref,
+  <value>}]}`, `additionalProperties:false`). `register_enrichment_schemas` picks them up unchanged.
+- `ingest.py`: the call site does not change — it already calls the three functions and stays
+  fail-soft.
 - Config: `OVERLAY_ENRICH_BATCH_CONCEPT` (40), `_DEFINITION` (12), `_DOMAIN` (20),
   `OVERLAY_ENRICH_SINGLE_FALLBACK_THRESHOLD` (3). Setting a K to 1 disables batching for that task
   (exact current behavior) — a safe kill-switch.
