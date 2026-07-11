@@ -22,6 +22,27 @@
 
 ---
 
+## Ingest persistence — orientation (what this work does and does NOT touch)
+
+An upload is a **catalog description**: each row = one column's schema + governance facts (definition,
+grain, as-of, sensitivity, joins-to, additivity, entity). The platform never stores the source
+system's actual data records. `ingest_upload` persists to these stores (all Postgres, one database):
+
+| Store | Table(s) | Role | Touched by this work? |
+|---|---|---|---|
+| Event log (**source of truth**) | `events` (aggregate `overlay_fact`) | Immutable `OVERLAY_FACT_PROPOSED`/`CONFIRMED` per fact, streamed by `fact_key` | **No** |
+| Folded fact state (read model) | `overlay_fact_state` (+ `overlay_proposal`/`overlay_evidence`/`overlay_fact_dependency`/`overlay_catalog_object`, mig 0507) | Current VERIFIED/STALE value per fact stream | **No** |
+| **Catalog graph** (queryable projection) | `graph_node`, `graph_edge` (mig 0945; +`concept` 0951, +`sensitivity` 0954, +`additivity/unit/currency/entity` 0957, +edge `cardinality` 0956) | One node per table/column; `build_graph` writes declared facts **and** the advisory `concept`/`domain`/`definition` into `graph_node` columns in the same `INSERT … ON CONFLICT`. Search & Lineage read this. | **No** (still written by `build_graph` from the same return dicts) |
+| Review queue | `quarantine_row` (mig 0955) | Rows that failed validation | **No** |
+| Enrichment cache (advisory) | `enrichment_concept/definition/domain` (mig 0950/52/53) | Content-hash-keyed LLM suggestions | **Yes** — gains `cache_version` (mig 0977) |
+| LLM audit | `llm_call` (mig 0510) | Immutable record of each provider call | **Yes** — batch adds a per-item outcome summary inside the existing `cost_metadata` JSON |
+
+Key invariant this buys us: `graph_node` is a **projection**, rebuilt from the uploaded rows every
+ingest — the durable truth is the `events` log. So re-running enrichment or bumping `cache_version`
+is low-risk: it only changes advisory columns on a rebuildable projection, never a fact.
+
+---
+
 ## File Structure
 
 - Create `src/featuregen/overlay/upload/enrich_config.py` — env-driven knobs: `mode`, `max_items`, `max_input_tokens`, `budget`. One responsibility: read rollout config, nothing else.
