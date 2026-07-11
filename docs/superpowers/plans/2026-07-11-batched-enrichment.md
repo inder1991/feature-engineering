@@ -1029,38 +1029,46 @@ git commit -m "feat(enrich): concept batch path — invalid!=UNCLASSIFIED, versi
 
 **Files:**
 - Modify: `src/featuregen/overlay/upload/ingest.py:123-134`
-- Test: `tests/featuregen/overlay/upload/test_ingest.py` (add a test; file exists)
+- Test: `tests/featuregen/overlay/upload/test_ingest_slice.py` (append; this file already exists and already imports `ingest_upload`, defines `_actor()`, and has an existing whole-enrichment fail-soft test using a `_Boom()` client at line ~83 — that test stays green under the new per-task blocks).
 
 **Interfaces:**
-- Consumes: `enrich_concepts`, `draft_definitions`, `classify_domains` (unchanged signatures, except `draft_definitions` gains an optional `concepts` arg in Task 10 — pass it here now as a keyword so Task 10 is a drop-in).
+- Consumes: `enrich_concepts`, `draft_definitions`, `classify_domains` (unchanged signatures, except `draft_definitions` gains an optional `concepts` kwarg in Task 10 — Task 8 lands the plain call and Task 10 flips it to `concepts=concepts`, so no broken intermediate).
 
 - [ ] **Step 1: Write the failing test**
 
 ```python
-# tests/featuregen/overlay/upload/test_ingest.py  (append; import ingest_upload + FakeLLM as the file already does)
+# tests/featuregen/overlay/upload/test_ingest_slice.py  (append)
+# Existing imports at the top of this file already provide: datetime, UTC, CanonicalRow,
+# ingest_upload, and the _actor() helper. Add FakeLLM/FakeResponse to the imports.
+from featuregen.intake.llm import FakeLLM, FakeResponse
+
+
 def test_domain_failure_does_not_discard_concepts(db, monkeypatch):
-    # A domain enrichment blow-up must not null out concepts/definitions (spec C1). We stub
+    # A domain enrichment blow-up must not null out concepts/definitions (spec C1). Stub
     # classify_domains to raise and assert the concept enrichment still reached the graph.
     from featuregen.overlay.upload import ingest as ing
-    monkeypatch.setattr(ing, "classify_domains", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
-    captured = {}
+    monkeypatch.setattr(ing, "classify_domains",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+    captured: dict = {}
     real_build = ing.build_graph
+
     def spy(conn, src, rows, concepts, definitions, domains):
         captured.update(concepts=concepts, domains=domains)
         return real_build(conn, src, rows, concepts, definitions, domains)
+
     monkeypatch.setattr(ing, "build_graph", spy)
     rows = [CanonicalRow("deposits", "accounts", "balance", "numeric")]
-    client = FakeLLM(script={"overlay.enrich.concept": FakeResponse(output={"concept": "monetary_stock"}),
-                             "overlay.enrich.definition": FakeResponse(output={"definition": "the balance"})})
-    ing.ingest_upload(db, "deposits", rows, actor=None, now=_NOW, client=client)
+    client = FakeLLM(script={
+        "overlay.enrich.concept": FakeResponse(output={"concept": "monetary_stock"}),
+        "overlay.enrich.definition": FakeResponse(output={"definition": "the balance"})})
+    now = datetime(2026, 7, 5, tzinfo=UTC)
+    ing.ingest_upload(db, "deposits", rows, actor=_actor(), now=now, client=client)
     assert captured["concepts"] and captured["domains"] is None   # concepts survived; only domains lost
 ```
 
-(Use the test module's existing `_NOW`/actor fixtures; if absent, construct a `datetime.now(UTC)` and the module's standard actor as other tests in the file do.)
-
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `pytest tests/featuregen/overlay/upload/test_ingest.py::test_domain_failure_does_not_discard_concepts -q`
+Run: `pytest tests/featuregen/overlay/upload/test_ingest_slice.py::test_domain_failure_does_not_discard_concepts -q`
 Expected: FAIL — today's single `try` nulls all three, so `captured["concepts"]` is falsy.
 
 - [ ] **Step 3: Replace lines 123-134 in `ingest.py`**
@@ -1089,13 +1097,13 @@ Note: `draft_definitions(..., concepts=concepts)` — the `concepts` keyword is 
 
 - [ ] **Step 4: Run tests**
 
-Run: `pytest tests/featuregen/overlay/upload/test_ingest.py -q`
-Expected: PASS — the new isolation test + all existing ingest tests.
+Run: `pytest tests/featuregen/overlay/upload/test_ingest_slice.py -q`
+Expected: PASS — the new isolation test + the existing `_Boom()` whole-enrichment fail-soft test + all other ingest-slice tests.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/featuregen/overlay/upload/ingest.py tests/featuregen/overlay/upload/test_ingest.py
+git add src/featuregen/overlay/upload/ingest.py tests/featuregen/overlay/upload/test_ingest_slice.py
 git commit -m "fix(enrich): independent per-task fail-soft for advisory enrichment (C1)"
 ```
 
