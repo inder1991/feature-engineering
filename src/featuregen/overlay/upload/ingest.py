@@ -122,15 +122,20 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
 
     concepts = definitions = domains = None
     if client is not None:
+        # Three INDEPENDENT advisory failure domains (spec C1): a failure in one task must not
+        # discard another's already-computed enrichment. Each degrades search, never the facts.
         try:
             concepts = enrich_concepts(conn, vr.good, client, actor)
+        except Exception:  # noqa: BLE001
+            logger.warning("advisory concept enrichment failed for %r", catalog_source, exc_info=True)
+        try:
             definitions = draft_definitions(conn, vr.good, client, actor)
+        except Exception:  # noqa: BLE001
+            logger.warning("advisory definition enrichment failed for %r", catalog_source, exc_info=True)
+        try:
             domains = classify_domains(conn, vr.good, client, actor)
-        except Exception:  # noqa: BLE001 — enrichment is ADVISORY (migration 0950): a provider/network
-            # error must degrade search, NEVER abort the upload's facts. Proceed without enrichment.
-            logger.warning("enrichment failed for %r; proceeding without it", catalog_source,
-                           exc_info=True)
-            concepts = definitions = domains = None
+        except Exception:  # noqa: BLE001
+            logger.warning("advisory domain enrichment failed for %r", catalog_source, exc_info=True)
     build_graph(conn, catalog_source, vr.good, concepts, definitions, domains)
     persist_quarantine(conn, catalog_source, vr.quarantined)
     flagged = (f"first upload of '{catalog_source}' ({len(vr.good)} objects) — review recommended"
