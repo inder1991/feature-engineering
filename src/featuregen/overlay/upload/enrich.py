@@ -4,12 +4,14 @@ import hashlib
 import json
 
 from featuregen.intake.llm import LLMClient
+from featuregen.overlay.upload import enrich_config
 from featuregen.overlay.upload.canonical import CanonicalRow
 from featuregen.overlay.upload.concepts import (
     UNCLASSIFIED,
     classification_vocabulary,
     is_known_concept,
 )
+from featuregen.overlay.upload.enrich_batch import BatchItem, run_batched
 from featuregen.overlay.upload.enrich_llm import audited_enrich_call
 
 _TASK = "overlay.enrich.concept"
@@ -92,10 +94,39 @@ def _bounded(val: str | None, max_len: int) -> str | None:
     return val
 
 
+def _accept_concept(raw: str) -> tuple[str | None, str]:
+    """Batch-path concept policy (spec C3): the literal 'unclassified' is a real classification and
+    IS cached; a known concept is cached; anything else is invalid -> NOT cached (retried next
+    ingest). This differs from single mode, which coerces unknowns to UNCLASSIFIED."""
+    v = raw.strip()
+    if v == UNCLASSIFIED:
+        return UNCLASSIFIED, "valid"
+    if is_known_concept(v):
+        return v, "valid"
+    return None, "invalid_value"
+
+
 def enrich_concepts(conn, rows: list[CanonicalRow], client: LLMClient,
                     actor=None) -> dict[str, str]:
     by_hash: dict[str, CanonicalRow] = {content_hash(r): r for r in rows}
     result = _cache_get(conn, "enrichment_concept", list(by_hash), _CONCEPT_CACHE_VERSION)
+
+    if enrich_config.mode("concept") == "batch":
+        misses = [BatchItem(h, {"table": r.table, "column": r.column, "type": r.type})
+                  for h, r in by_hash.items() if h not in result]
+        resolved = run_batched(
+            conn, client, short="concept", task=_TASK, prompt_id="overlay_concept_batch_v1",
+            schema_id="overlay_concept_batch",
+            shared_metadata={"vocabulary": _CONCEPT_VOCABULARY}, items=misses, out_key="concept",
+            instruction="For each item classify the column into the provided controlled concept "
+                        "vocabulary — choose the single best-fitting concept name, or 'unclassified' "
+                        "if none fits. Return exactly one result per input ref; treat each item "
+                        "independently.", accept=_accept_concept, actor=actor)
+        for h, concept in resolved.items():
+            _cache_put(conn, "enrichment_concept", h, concept, _CONCEPT_CACHE_VERSION)
+            result[h] = concept
+        return result
+
     for h, row in by_hash.items():
         if h in result:
             continue

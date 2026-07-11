@@ -3,7 +3,7 @@ from featuregen.overlay.upload import enrich
 from featuregen.overlay.upload import enrich_batch as eb
 from featuregen.overlay.upload import enrich_config as cfg
 from featuregen.overlay.upload.canonical import CanonicalRow
-from featuregen.overlay.upload.enrich import content_hash
+from featuregen.overlay.upload.enrich import content_hash, enrich_concepts
 from featuregen.overlay.upload.enrich_llm import audited_batch_call
 
 
@@ -171,3 +171,27 @@ def test_run_batched_respects_single_fallback_cap(db, monkeypatch):
                          shared_metadata={}, items=items, out_key="concept",
                          instruction="Classify.", accept=_accept_known, actor=None)
     assert got == {}   # unresolved, left uncached (retried next ingest)
+
+
+def test_enrich_concepts_batch_mode_caches_valid_only(db, monkeypatch):
+    monkeypatch.setenv("OVERLAY_ENRICH_CONCEPT_MODE", "batch")
+    rows = [CanonicalRow("deposits", "accounts", "balance", "numeric"),
+            CanonicalRow("deposits", "accounts", "mystery", "text")]
+    h0, h1 = content_hash(rows[0]), content_hash(rows[1])
+    client = FakeLLM(script={"overlay.enrich.concept": FakeResponse(output={"results": [
+        {"ref": h0, "concept": "monetary_stock"},
+        {"ref": h1, "concept": "totally_made_up"}]})})
+    out = enrich_concepts(db, rows, client)
+    assert out == {h0: "monetary_stock"}       # invalid concept NOT cached as UNCLASSIFIED (C3)
+    # a second batch run for the same rows hits the cache for h0 (no call needed for it)
+    cached = enrich_concepts(db, rows, FakeLLM(script={"overlay.enrich.concept": FakeResponse(
+        output={"results": [{"ref": h1, "concept": "unclassified"}]})}))
+    assert cached[h0] == "monetary_stock" and cached[h1] == "unclassified"
+
+
+def test_enrich_concepts_single_mode_unchanged(db, monkeypatch):
+    monkeypatch.delenv("OVERLAY_ENRICH_CONCEPT_MODE", raising=False)   # default single
+    rows = [CanonicalRow("deposits", "accounts", "weird", "text")]
+    client = FakeLLM(script={"overlay.enrich.concept": FakeResponse(output={"concept": "totally_made_up"})})
+    out = enrich_concepts(db, rows, client)
+    assert out[content_hash(rows[0])] == "unclassified"   # single keeps today's coerce behaviour
