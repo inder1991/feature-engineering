@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import csv
+import io
 import os
 from datetime import UTC, datetime
 from typing import Annotated
@@ -13,7 +15,12 @@ from featuregen.intake.llm import LLMClient
 from featuregen.overlay.upload.canonical import CanonicalRow
 from featuregen.overlay.upload.csv_reader import read_csv_rows
 from featuregen.overlay.upload.excel_reader import read_excel_rows
+from featuregen.overlay.upload.glossary_reader import is_glossary_csv, read_glossary
 from featuregen.overlay.upload.ingest import IngestResult, ingest_upload
+from featuregen.overlay.upload.source_profile import (
+    FTR_GLOSSARY_PROFILE,
+    SourceCapabilityProfile,
+)
 
 router = APIRouter()
 
@@ -30,12 +37,25 @@ def _read_capped(file: UploadFile) -> bytes:
     return data
 
 
-def _read_rows(filename: str, data: bytes, source: str) -> list[CanonicalRow]:
+def _peek_headers(text: str) -> list[str]:
+    """The first (header) row of a CSV, without consuming the reader used to parse the rows."""
+    return next(csv.reader(io.StringIO(text)), [])
+
+
+def _read_rows(
+    filename: str, data: bytes, source: str
+) -> tuple[list[CanonicalRow], SourceCapabilityProfile | None]:
+    """Read an upload into rows + the source profile that governs validation (spec §U). A glossary-shaped
+    CSV takes the glossary path and carries ``FTR_GLOSSARY_PROFILE`` (so its ``type="unknown"`` rows
+    validate); every other upload keeps its existing, byte-for-byte-unchanged path with no profile."""
     name = filename.lower()
     if name.endswith((".xlsx", ".xlsm")):
-        return read_excel_rows(data, source=source)
+        return read_excel_rows(data, source=source), None
     if name.endswith(".csv"):
-        return read_csv_rows(data.decode("utf-8-sig"), source=source)
+        text = data.decode("utf-8-sig")
+        if is_glossary_csv(_peek_headers(text)):
+            return read_glossary(text, source=source).rows, FTR_GLOSSARY_PROFILE
+        return read_csv_rows(text, source=source), None
     raise HTTPException(status_code=400, detail="unsupported file type (expected .csv or .xlsx)")
 
 
@@ -48,12 +68,13 @@ def create_upload(
     client: Annotated[LLMClient | None, Depends(get_llm_optional)],
 ) -> IngestResult:
     try:
-        rows = _read_rows(file.filename or "", _read_capped(file), source)
+        rows, profile = _read_rows(file.filename or "", _read_capped(file), source)
     except HTTPException:
         raise
     except Exception as exc:   # a malformed file is a client error, not a 500
         raise HTTPException(status_code=400, detail=f"could not parse upload: {exc}") from exc
     # client=None (no provider configured) -> enrichment is skipped; a configured client runs the
     # governed, audited enrichment path (M2/M4). Either way the upload itself succeeds or brakes.
+    # `profile` carries the glossary-vs-technical decision so validation is profile-aware (spec §U).
     return ingest_upload(conn, source, rows, actor=identity,
-                         now=datetime.now(UTC), client=client)
+                         now=datetime.now(UTC), client=client, profile=profile)

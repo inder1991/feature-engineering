@@ -21,6 +21,7 @@ from featuregen.overlay.upload.graph import (
     parse_join_ref,
 )
 from featuregen.overlay.upload.review_queue import persist_quarantine
+from featuregen.overlay.upload.source_profile import SourceCapabilityProfile
 from featuregen.overlay.upload.upload_catalog import UploadCatalog, table_ref
 from featuregen.projections.runner import projection_lag, run_projection
 from featuregen.runtime.observability import counters
@@ -152,8 +153,11 @@ def _propose_governed_joins(conn, rows: list[CanonicalRow], *, actor) -> None:
 
 
 def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
-                  actor, now: datetime | None = None, client=None) -> IngestResult:
-    vr = validate_rows(rows, catalog_source)
+                  actor, now: datetime | None = None, client=None,
+                  profile: SourceCapabilityProfile | None = None) -> IngestResult:
+    # `profile` (spec §U) makes validation profile-aware: a glossary upload's `type="unknown"` rows
+    # pass, while a technical upload (or the default `profile=None`) still requires a real type.
+    vr = validate_rows(rows, catalog_source, profile=profile)
     if vr.structural_error:
         return IngestResult("rejected", vr.structural_error, 0, 0, len(vr.quarantined))
 
