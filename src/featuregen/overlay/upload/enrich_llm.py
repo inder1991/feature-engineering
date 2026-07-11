@@ -32,6 +32,13 @@ from featuregen.intake.redaction import (
     assert_llm_safe,
     build_llm_inputs,
 )
+from featuregen.overlay.upload.enrich_batch import (
+    EGRESS,
+    BatchCallResult,
+    BatchItem,
+    BatchItemOutcome,
+    validate_batch_results,
+)
 from featuregen.security.audit import record_security_event
 
 logger = logging.getLogger(__name__)
@@ -84,6 +91,32 @@ _SCHEMAS: dict[tuple[str, int], dict] = {
                               "properties": {"findings": {"type": "array",
                                                           "items": {"type": "string"}}},
                               "required": ["findings"]},
+    # Batch array output-schemas (spec C18 — bounded arrays; `maxItems` is a generous backstop, app
+    # validation enforces the real per-batch cap). One {ref, <out_key>} object per requested item.
+    ("overlay_concept_batch", 1): {
+        "type": "object", "additionalProperties": False,
+        "properties": {"results": {"type": "array", "minItems": 0, "maxItems": 256,
+            "items": {"type": "object", "additionalProperties": False,
+                      "properties": {"ref": {"type": "string", "maxLength": 128},
+                                     "concept": {"type": "string", "maxLength": 128}},
+                      "required": ["ref", "concept"]}}},
+        "required": ["results"]},
+    ("overlay_definition_batch", 1): {
+        "type": "object", "additionalProperties": False,
+        "properties": {"results": {"type": "array", "minItems": 0, "maxItems": 256,
+            "items": {"type": "object", "additionalProperties": False,
+                      "properties": {"ref": {"type": "string", "maxLength": 128},
+                                     "definition": {"type": "string", "maxLength": 500}},
+                      "required": ["ref", "definition"]}}},
+        "required": ["results"]},
+    ("overlay_domain_batch", 1): {
+        "type": "object", "additionalProperties": False,
+        "properties": {"results": {"type": "array", "minItems": 0, "maxItems": 256,
+            "items": {"type": "object", "additionalProperties": False,
+                      "properties": {"ref": {"type": "string", "maxLength": 256},
+                                     "domain": {"type": "string", "maxLength": 64}},
+                      "required": ["ref", "domain"]}}},
+        "required": ["results"]},
     # Feature-assist output schemas (M6 — routed through the audited seam). Permissive object shapes:
     # the value is the LLM's proposal that the deterministic layer then grounds/validates.
     ("feature_ideas", 1): {"type": "object", "additionalProperties": True,
@@ -196,3 +229,86 @@ def audited_enrich_call(conn, client: LLMClient, *, task: str, prompt_id: str, s
         return None
     val = str(out.get(out_key, "")).strip()
     return val or None
+
+
+# Only metadata may egress per item (Global Constraint). Any other key (e.g. a free-text definition
+# or a data value) means the item is excluded pre-egress and audited (spec C9 per-item egress).
+_ITEM_META_ALLOWED = frozenset({"table", "column", "type", "columns", "concept"})
+
+
+def _item_egress_ok(metadata: dict) -> bool:
+    if any(k not in _ITEM_META_ALLOWED for k in metadata):
+        return False
+    for v in metadata.values():
+        if isinstance(v, list):
+            if not all(isinstance(x, str) and len(x) <= 200 for x in v):
+                return False
+        elif not isinstance(v, str) or len(v) > 200:
+            return False
+    return True
+
+
+def audited_batch_call(conn, client: LLMClient, *, task: str, prompt_id: str, schema_id: str,
+                       shared_metadata: dict, items: list[BatchItem], out_key: str, instruction: str,
+                       accept, actor: IdentityEnvelope | None = None) -> BatchCallResult:
+    """One GOVERNED batch call (spec C4/C9): per-item egress filter -> batch-level egress guard ->
+    schema-validated array call -> one immutable llm_call with a per-item outcome summary. Returns a
+    BatchCallResult whose outcomes classify every requested ref (via validate_batch_results)."""
+    actor = actor or _ENRICH_ACTOR
+    excluded = [it for it in items if not _item_egress_ok(it.metadata)]
+    included = [it for it in items if _item_egress_ok(it.metadata)]
+    egress_outcomes = [BatchItemOutcome(it.ref, EGRESS, None, (EGRESS,)) for it in excluded]
+    for _it in excluded:
+        _audit_egress_block(conn, task=task, actor=actor, reason="item metadata not metadata-only")
+
+    if not included:
+        return BatchCallResult(tuple(egress_outcomes), 0, 0, 0)
+
+    reg = DocumentSchemaRegistry(conn)
+    schema = reg.schema_for(schema_id, 1)
+    if schema is None:
+        register_enrichment_schemas(conn)
+        schema = reg.schema_for(schema_id, 1)
+
+    catalog_metadata = {**shared_metadata,
+                        "items": [{"ref": it.ref, **it.metadata} for it in included]}
+    redaction = RedactionResult(text=instruction, redaction_version=_REDACTION_VERSION,
+                                redacted_spans=(), disposition="ok")
+    inputs = build_llm_inputs(redaction, catalog_metadata=catalog_metadata,
+                              raw_input_classification="clean")
+    req = LLMRequest(task=task, prompt_id=prompt_id, prompt_version=1, inputs=inputs,
+                     output_schema_id=schema_id, output_schema_version=1,
+                     generation_settings=_generation_settings(), output_schema=schema)
+
+    try:
+        assert_llm_safe(req)                      # batch-level egress backstop (spec C9)
+    except EgressViolation as exc:
+        logger.warning("egress guard blocked batch %s (schema %s); no dispatch", task, schema_id)
+        _audit_egress_block(conn, task=task, actor=actor, reason=str(exc))
+        missing = validate_batch_results(included, [], out_key, accept)
+        return BatchCallResult(tuple(egress_outcomes) + tuple(missing), 0, 0, 0)
+
+    outcome = drive_structured_call(client, req, lambda o: reg.validate(schema_id, 1, o))
+    # A repair-exhausted / truncated batch (STATUS_FAILED) carries an UNVERIFIED body — do not harvest
+    # it. Treat it as empty so validate_batch_results marks every requested ref MISSING and the
+    # orchestrator's fallback ladder recovers it. Mirrors audited_structured_call returning None on
+    # STATUS_FAILED: otherwise a truncated definition/domain value (validated only by `accept`) would
+    # be cached durably and never retried (whole-branch review, BLOCKING).
+    results = (outcome.output.get("results", [])
+               if outcome.status != STATUS_FAILED and isinstance(outcome.output, dict) else [])
+    item_outcomes = validate_batch_results(included, results, out_key, accept)
+
+    summary = {"requested": [it.ref for it in included],
+               "outcomes": {o.ref: o.status for o in item_outcomes}}
+    cost = dict(outcome.cost_metadata or {})
+    record_llm_call(conn, run_id=_RUN, request=req, input_hash=compute_input_hash(req.inputs),
+                    redaction_version=_REDACTION_VERSION, input_redaction={},
+                    raw_output={"output": outcome.output,
+                                "self_reported_scores": outcome.self_reported_scores},
+                    validation_result=outcome.validation_result,
+                    repair_attempts=list(outcome.repair_attempts), latency_ms=None,
+                    cost_metadata={**cost, "batch": summary}, created_by=identity_to_jsonb(actor))
+
+    return BatchCallResult(
+        outcomes=tuple(egress_outcomes) + tuple(item_outcomes), provider_calls=1,
+        input_tokens=int(cost.get("input_tokens", 0)), output_tokens=int(cost.get("output_tokens", 0)))

@@ -1,6 +1,7 @@
 from datetime import UTC, datetime, timedelta
 
 from featuregen.contracts.envelopes import IdentityEnvelope
+from featuregen.intake.llm import FakeLLM, FakeResponse
 from featuregen.overlay.config import OverlayConfig, register_overlay_config
 from featuregen.overlay.resolve import resolve_fact
 from featuregen.overlay.upload.canonical import CanonicalRow
@@ -123,3 +124,26 @@ def test_fingerprint_backward_compatible_without_safety():
     from featuregen.overlay.catalog_changes import _type_fingerprint
     obj = CatalogObject("public.t.c", "column", "public", "t", "c", "numeric", None)
     assert _type_fingerprint(obj) == hashlib.sha256(b"column|numeric").hexdigest()
+
+
+def test_domain_failure_does_not_discard_concepts(db, monkeypatch):
+    # A domain enrichment blow-up must not null out concepts/definitions (spec C1). Stub
+    # classify_domains to raise and assert the concept enrichment still reached the graph.
+    from featuregen.overlay.upload import ingest as ing
+    monkeypatch.setattr(ing, "classify_domains",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+    captured: dict = {}
+    real_build = ing.build_graph
+
+    def spy(conn, src, rows, concepts, definitions, domains):
+        captured.update(concepts=concepts, domains=domains)
+        return real_build(conn, src, rows, concepts, definitions, domains)
+
+    monkeypatch.setattr(ing, "build_graph", spy)
+    rows = [CanonicalRow("deposits", "accounts", "balance", "numeric")]
+    client = FakeLLM(script={
+        "overlay.enrich.concept": FakeResponse(output={"concept": "monetary_stock"}),
+        "overlay.enrich.definition": FakeResponse(output={"definition": "the balance"})})
+    now = datetime(2026, 7, 5, tzinfo=UTC)
+    ing.ingest_upload(db, "deposits", rows, actor=_actor(), now=now, client=client)
+    assert captured["concepts"] and captured["domains"] is None   # concepts survived; only domains lost
