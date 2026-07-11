@@ -152,7 +152,11 @@ def run_batched(conn, client, *, short: str, task: str, prompt_id: str, schema_i
         for o in res.outcomes:
             if o.status in (VALID,) and o.value is not None:
                 resolved[o.ref] = o.value
-        unresolved = [it for it in chunk if it.ref not in resolved]
+        # An EGRESS-excluded item (C9 per-item exclusion) is TERMINAL — it must never be retried,
+        # split, or fallback-called this run (that would re-send its metadata through the single seam).
+        # Drop it from `unresolved` so the ladder skips it; it stays uncached and is retried next ingest.
+        egress_refs = {o.ref for o in res.outcomes if o.status == EGRESS}
+        unresolved = [it for it in chunk if it.ref not in resolved and it.ref not in egress_refs]
         if not unresolved:
             return
         valid_ratio = 1 - len(unresolved) / len(chunk)

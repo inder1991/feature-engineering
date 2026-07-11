@@ -289,7 +289,13 @@ def audited_batch_call(conn, client: LLMClient, *, task: str, prompt_id: str, sc
         return BatchCallResult(tuple(egress_outcomes) + tuple(missing), 0, 0, 0)
 
     outcome = drive_structured_call(client, req, lambda o: reg.validate(schema_id, 1, o))
-    results = outcome.output.get("results", []) if isinstance(outcome.output, dict) else []
+    # A repair-exhausted / truncated batch (STATUS_FAILED) carries an UNVERIFIED body — do not harvest
+    # it. Treat it as empty so validate_batch_results marks every requested ref MISSING and the
+    # orchestrator's fallback ladder recovers it. Mirrors audited_structured_call returning None on
+    # STATUS_FAILED: otherwise a truncated definition/domain value (validated only by `accept`) would
+    # be cached durably and never retried (whole-branch review, BLOCKING).
+    results = (outcome.output.get("results", [])
+               if outcome.status != STATUS_FAILED and isinstance(outcome.output, dict) else [])
     item_outcomes = validate_batch_results(included, results, out_key, accept)
 
     summary = {"requested": [it.ref for it in included],

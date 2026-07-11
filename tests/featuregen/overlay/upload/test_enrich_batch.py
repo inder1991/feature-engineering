@@ -1,4 +1,4 @@
-from featuregen.intake.llm import FakeLLM, FakeResponse
+from featuregen.intake.llm import PROVIDER_MAX_TOKENS, FakeLLM, FakeResponse
 from featuregen.overlay.upload import enrich
 from featuregen.overlay.upload import enrich_batch as eb
 from featuregen.overlay.upload import enrich_config as cfg
@@ -113,6 +113,35 @@ def test_audited_batch_call_excludes_unsafe_item_before_egress(db):
     assert by["h1"].status == eb.VALID
 
 
+_DTASK = "overlay.enrich.definition"
+
+
+def _accept_any(raw):
+    return (raw, "valid") if raw else (None, "blank")
+
+
+def test_audited_batch_call_failed_batch_is_missing_not_cached(db):
+    # A repair-exhausted / truncated batch (STATUS_FAILED) whose body still LOOKS well-formed must
+    # NOT be harvested — its results are unverified. Every requested ref must classify MISSING (not
+    # VALID) so the fallback ladder recovers it, mirroring audited_structured_call returning None.
+    #
+    # Producing STATUS_FAILED: a single FakeResponse with provider_status=max_tokens is a RETRYABLE
+    # outcome; FakeLLM repeats it, so drive_structured_call retries until its retry budget (2) is
+    # exhausted, then fails closed — carrying that last (well-formed) body through as outcome.output.
+    items = [eb.BatchItem("h1", {"table": "accounts", "column": "balance", "type": "numeric"})]
+    client = FakeLLM(script={_DTASK: FakeResponse(
+        provider_status=PROVIDER_MAX_TOKENS,
+        output={"results": [{"ref": "h1", "definition": "the account ledger balance"}]})})
+    res = audited_batch_call(db, client, task=_DTASK, prompt_id="overlay_definition_batch_v1",
+                             schema_id="overlay_definition_batch", shared_metadata={},
+                             items=items, out_key="definition",
+                             instruction="Draft each definition.", accept=_accept_any)
+    by = {o.ref: o for o in res.outcomes}
+    assert by["h1"].status == eb.MISSING   # failed batch harvested nothing (STATUS_FAILED guard)
+    assert by["h1"].status != eb.VALID
+    assert by["h1"].value is None          # nothing cacheable — retried next ingest
+
+
 def test_chunk_respects_item_count():
     items = [eb.BatchItem(f"r{i}", {"column": "c"}) for i in range(25)]
     chunks = eb.chunk_items(items, max_items=10, max_input_tokens=10_000)
@@ -159,6 +188,27 @@ def test_run_batched_falls_back_to_single_for_missing(db, monkeypatch):
                          shared_metadata={}, items=items, out_key="concept",
                          instruction="Classify.", accept=_accept_known, actor=None)
     assert got == {"h1": "monetary_stock", "h2": "monetary_stock"}
+
+
+def test_run_batched_does_not_fall_back_egress_excluded_item(db, monkeypatch):
+    # An item the batch seam excluded for egress (C9) is TERMINAL — it must never be re-sent this
+    # run via single fallback. h2 carries a disallowed free-text key so it is egress-excluded; h1
+    # resolves in the batch. The FakeLLM is scripted ONLY for the batch prompt_id, so any single
+    # fallback attempt on h2 (single prompt_id) would raise a FakeLLM KeyError — proving no fallback.
+    monkeypatch.setenv("OVERLAY_ENRICH_CONCEPT_MODE", "batch")
+    items = [eb.BatchItem("h1", {"table": "t", "column": "balance", "type": "numeric"}),
+             eb.BatchItem("h2", {"table": "t", "column": "ssn", "type": "text",
+                                 "definition": "secret"})]
+    client = FakeLLM()
+    client.script(task=_CTASK, prompt_id="overlay_concept_batch_v1",
+                  responses=[FakeResponse(output={"results": [
+                      {"ref": "h1", "concept": "monetary_stock"}]})])
+    got = eb.run_batched(db, client, short="concept", task=_CTASK,
+                         prompt_id="overlay_concept_batch_v1", schema_id="overlay_concept_batch",
+                         shared_metadata={}, items=items, out_key="concept",
+                         instruction="Classify.", accept=_accept_known, actor=None)
+    assert got == {"h1": "monetary_stock"}   # h1 resolved; h2 excluded, NOT fallback-called
+    assert "h2" not in got
 
 
 def test_run_batched_respects_single_fallback_cap(db, monkeypatch):
