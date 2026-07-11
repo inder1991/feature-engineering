@@ -1,8 +1,10 @@
-# Evidence-Authority Ingestion — Design Spec (v3)
+# Evidence-Authority Ingestion — Design Spec (v4)
 
-Date: 2026-07-11. Status: DESIGNED — architecture APPROVED; v3 is the contract-tightening pass so Phase 0
-task-level planning can begin. Supersedes the scope of `2026-07-11-batched-enrichment.md` (merged to main
-`6345296`) — that batching work is **Pass A transport**.
+Date: 2026-07-11. Status: DESIGNED — architecture APPROVED. v3 tightened the contracts; **v4 adds §0, the
+reuse map** — a code-grounded reconciliation showing that ~60% of the "Phase 0 kernel" ALREADY EXISTS as
+the overlay event-sourced fact substrate, so Phase 0 is an **extension**, not a greenfield build.
+Supersedes the scope of `2026-07-11-batched-enrichment.md` (merged to main `6345296`) — that batching work
+is **Pass A transport**.
 
 ## The one-sentence architecture (unchanged, affirmed twice)
 
@@ -33,6 +35,34 @@ Permanent invariants: **provenance ≠ authority; confidence ≠ permission.**
 14. Human confirmations carry **scope + expiry + revalidation** (§11).
 15. Pass B outputs have an explicit **destination mapping** (§15.2).
 16. The field matrix uses three influence tiers — **DISPLAY / RECOMMENDATION / OPERATIONAL** (§4.2, §16).
+
+---
+
+## 0. Reuse map — Phase 0 is an EXTENSION of the overlay fact substrate [v4]
+
+A read of `src/featuregen/overlay/` shows a mature event-sourced *propose → confirm → fold → resolve*
+substrate. The spec's new contract NAMES must reconcile to it rather than spawn a parallel governance
+system (which the review explicitly warned against). Mapping each Phase-0 contract to what exists:
+
+| Contract | Status | Existing home / gap |
+|---|---|---|
+| Field-decision events (append-only, replayable) | **REUSE** | The 6 `OVERLAY_FACT_*` events (`facts.py`) + `fold_overlay_state` (`state.py`) + `OverlayProjection` + `resolve_fact` (`resolve.py`) ARE this log — supersession (`confirms_event_id`, `target_event_id`), `evidence_ref` linkage present. `FieldDecisionEventV1` = a payload/status extension of this, not a new store. |
+| Typed-fact vs generic resolution | **REUSE** | `DATA_FACT_TYPES`/`POLICY_FACT_TYPES` + per-type `FACT_VALUE_SCHEMAS` + `resolve_fact`. Caveat: there is **no untyped field channel** — every field must be a registered `fact_type`, so new advisory fields (concept/logical_type/…) need registering as fact types. |
+| Human confirm w/ scope, expiry, revalidation | **REUSE** | `confirm_fact`/`enter_fact` + `resolve_ttl` + `schedule_expiry` + `fire_due_overlay_expiries` + `detect_catalog_changes` stale-on-source-change. Scope/expiry already modeled via `expires_at` + use_case. |
+| Object identity + provider binding | **EXTEND** | `CatalogObjectRef`/`ApprovedJoinRef`/`fact_key` + `CatalogAdapter` native-oid rename detection exist; **add** the `exact/aliased/ambiguous/unresolved` status + the no-attach-when-ambiguous rule. |
+| Authority policy | **EXTEND** | `resolve_authority` gives WHO-confirms (four-eyes, dual-owner, governance queue); **add** the WHAT-authority-a-value-has layer over (producer, strength) for advisory fields. |
+| Disqualifiers | **EXTEND** | `resolve_fact` read-time guards (drift/stale/expiry/referent-gap) exist as reason strings; **add** "active conflict" + "ambiguous identity" and reify as a policy-driven set. |
+| Assertion-strength axis | **NEW (small)** | Lifecycle exists (DRAFT/VERIFIED/STALE/REVERIFY/REJECTED); **add** producer + proposed/supported/attested/confirmed strength onto the existing `overlay_evidence` record. |
+| Safety-override authority | **NEW** | Only a compliance-gated `policy_tag` exists; **add** a sensitivity floor + governed below-floor downgrade (governance authority + rationale + scope). |
+| Conflict-review lifecycle | **NEW** | Quarantine + STALE/REVERIFY are not it; **add** a conflict record + fingerprint + OPEN→…→REOPENED. |
+| Readiness scope model | **NEW — but DEFERRED out of Phase 0** | Nothing exists. It depends on resolved facts/fields and is a feature-gen-time concern → moved to **Phase 2/feature-gen**, not the kernel. |
+| Governed `joins_to` | **NEW wiring** | Bypass confirmed: declared `joins_to` writes `graph_edge 'joins'` directly (no `kind` CHECK, no event). The governed `approved_join` dual-owner path (`propose_fact` → `join_confirmation`) exists; **wire** declared joins into it and gate the raw edge. |
+
+**Net Phase-0 new surface (reuse-first):** (a) strength axis on `overlay_evidence`; (b) identity-status
+enum + no-attach-when-ambiguous; (c) field-authority policy over (producer, strength) + reified
+disqualifiers; (d) safety-override authority + sensitivity floor; (e) conflict-review lifecycle;
+(f) governed-`joins_to` wiring. Everything else is extension of named existing modules. Readiness scope
+is deferred. This is the scope the Phase 0 plan builds to.
 
 ---
 
@@ -495,11 +525,13 @@ only (contradictions / islands / unresolved entities / review priorities) — **
 
 ## 17. Sequencing + approval gates
 
-### Phase 0 — Authority kernel (before any new enrichment)
-Identity + binding (§2); `field_evidence` (+ configuration hash) + item-level `llm_call` linkage;
-`FieldPolicy` registry + `AuthorityPredicate` evaluator + disqualifiers; strength propagation; per-field
-conflict lattices; the two-output resolver; `field_decision_events`; staleness; conflict-review lifecycle;
-**`joins_to` bypass retirement** (§12.1).
+### Phase 0 — Authority kernel (EXTENSION of the overlay substrate; before any new enrichment)
+Per §0, this **extends** the existing event/fold/resolve/authority/confirmation machinery rather than
+rebuilding it. New surface only: (a) strength axis on `overlay_evidence`; (b) `ObjectIdentityStatus` +
+no-attach-when-ambiguous; (c) field-authority policy over (producer, strength) + reified disqualifiers;
+(d) safety-override authority + sensitivity floor; (e) conflict-review lifecycle; (f) governed-`joins_to`
+wiring (§12.1). The decision log, typed-vs-generic resolution, and confirm/expiry/revalidation are reused
+as-is. **Readiness scope (contract 8) is deferred to Phase 2/feature-gen.**
 
 **Phase 0 may proceed once these 10 contracts are finalized:** (1) authority-predicate semantics; (2)
 assertion-strength vs evidence-lifecycle; (3) field-decision event schema; (4) object identity/binding;
