@@ -48,7 +48,9 @@ def find_join_path(conn, catalog_source: str, from_table: str,
         "SELECT e.from_ref, e.to_ref, e.cardinality FROM graph_edge e "
         "LEFT JOIN graph_node fn ON fn.object_ref = e.from_ref AND fn.catalog_source = e.catalog_source "
         "LEFT JOIN graph_node tn ON tn.object_ref = e.to_ref AND tn.catalog_source = e.catalog_source "
-        "WHERE e.catalog_source = %s AND e.kind = 'joins' "
+        # authority='operational' (Task 7): a governed-seam display-only edge is excluded from
+        # feature-construction join paths — feature-use reads the confirmed approved_join fact.
+        "WHERE e.catalog_source = %s AND e.kind = 'joins' AND e.authority = 'operational' "
         "  AND (fn.sensitivity IS NULL OR fn.sensitivity = ANY(%s)) "
         "  AND (tn.sensitivity IS NULL OR tn.sensitivity = ANY(%s))",
         (catalog_source, allowed, allowed)).fetchall()

@@ -1,0 +1,13 @@
+-- src/featuregen/db/migrations/0982_graph_edge_authority.sql
+-- Task 7 (Phase-0 Authority Kernel §12.1): governed `joins_to` seam.
+--
+-- A declared join today writes a `graph_edge kind='joins'` row DIRECTLY in build_graph — ungoverned
+-- (no event, no dual-owner authority). The governed path is the `approved_join` fact. This column
+-- lets a raw join edge be marked DISPLAY-ONLY when the governed seam (OVERLAY_GOVERNED_JOINS=1) is on,
+-- so feature-construction reads (find_join_path / _cross_adjacency / feature_assist strategy pick)
+-- filter to `authority='operational'` and never build features off an ungoverned display edge.
+--
+-- Default 'operational' preserves today's behaviour exactly when the flag is OFF (every existing and
+-- newly-written edge stays operational). Retirement deadline (end of Phase 3): raw 'joins' becomes
+-- display-only UNCONDITIONALLY and feature-use reads the confirmed approved_join projection.
+ALTER TABLE graph_edge ADD COLUMN IF NOT EXISTS authority text NOT NULL DEFAULT 'operational';
