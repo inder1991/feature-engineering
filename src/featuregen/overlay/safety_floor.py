@@ -163,7 +163,12 @@ def record_safety_override(
     """Persist one governed below-floor downgrade as an immutable `safety_override` row and return
     its minted `sfo_` id. Write-once: each call mints a fresh id and INSERTs — there is no update
     path (the migration installs a no-mutation trigger). `created_by` is a Mapping persisted as
-    jsonb — callers pass `identity_to_jsonb(actor)`, never a raw IdentityEnvelope."""
+    jsonb — callers pass `identity_to_jsonb(actor)`, never a raw IdentityEnvelope.
+
+    The `fact_key` param must equal `override.fact_key`: persisting the param while ignoring the
+    object's field would silently drop it on round-trip, so a divergent pair fails closed."""
+    if fact_key != override.fact_key:
+        raise ValueError(f"fact_key {fact_key!r} != override.fact_key {override.fact_key!r}")
     override_id = mint_id("sfo")
     conn.execute(
         """

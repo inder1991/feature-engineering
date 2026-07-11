@@ -231,10 +231,17 @@ def _select(
         top_values = {e.value for e in evidence if _STRENGTH_RANK[e.strength] == top}
         return next(iter(top_values)) if len(top_values) == 1 else _CONFLICT
     if strategy is ConflictStrategy.MOST_RESTRICTIVE:
+        if not severity_order:
+            # Fail CLOSED: refuse to guess restrictiveness. A lexicographic max is wrong
+            # ("restricted" < "prohibited" alphabetically), so a severity_order is REQUIRED.
+            raise ValueError("MOST_RESTRICTIVE requires a severity_order")
+        # An UNKNOWN value (not in severity_order) ranks as MOST restrictive — strictly above every
+        # known value (`len(severity_order)`), not `-1` — so an unrecognized label wins (fail CLOSED).
         distinct = set(values)
-        if severity_order:
-            return max(distinct, key=lambda v: severity_order.index(v) if v in severity_order else -1)
-        return max(distinct)  # Phase 0: a simple ordered (lexicographic) compare
+        return max(
+            distinct,
+            key=lambda v: severity_order.index(v) if v in severity_order else len(severity_order),
+        )
     if strategy is ConflictStrategy.UNION_CLASSES:
         return ",".join(sorted(set(values)))  # multi-valued: sorted union, never conflicts
     # UNRESOLVED_ON_CONFLICT

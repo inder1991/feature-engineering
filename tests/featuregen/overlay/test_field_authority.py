@@ -128,3 +128,33 @@ def test_specialized_fact_mode_never_load_bearing():
     r = resolve_field_authority([_ev(P.HUMAN, S.CONFIRMED, "grain")],
                                 _pol(resolution_mode=ResolutionMode.SPECIALIZED_FACT), frozenset())
     assert r.load_bearing_value is None and r.unresolved_reason == "specialized_fact"
+
+
+# ---------------------------------------------------------------------------
+# WBR fix: MOST_RESTRICTIVE must fail CLOSED (whole-branch review, Fix 1)
+# ---------------------------------------------------------------------------
+
+_SENSITIVITY = ("public", "internal", "confidential", "restricted", "prohibited")
+
+
+def test_most_restrictive_picks_most_severe_known_value():
+    pol = _pol(conflict_strategy=ConflictStrategy.MOST_RESTRICTIVE, severity_order=_SENSITIVITY)
+    ev = [_ev(P.HUMAN, S.CONFIRMED, "internal"), _ev(P.HUMAN, S.CONFIRMED, "restricted")]
+    r = resolve_field_authority(ev, pol, frozenset())
+    assert r.load_bearing_value == "restricted"
+
+
+def test_most_restrictive_unknown_value_wins_fail_closed():
+    # An unknown label (not in severity_order) must rank ABOVE every known value — fail CLOSED —
+    # so the unrecognized value wins the most-restrictive selection rather than losing it.
+    pol = _pol(conflict_strategy=ConflictStrategy.MOST_RESTRICTIVE, severity_order=_SENSITIVITY)
+    ev = [_ev(P.HUMAN, S.CONFIRMED, "internal"), _ev(P.HUMAN, S.CONFIRMED, "top_secret")]
+    r = resolve_field_authority(ev, pol, frozenset())
+    assert r.load_bearing_value == "top_secret"
+
+
+def test_most_restrictive_without_severity_order_raises():
+    # No severity_order → we refuse to guess restrictiveness (no lexicographic max). Fail closed.
+    pol = _pol(conflict_strategy=ConflictStrategy.MOST_RESTRICTIVE)  # severity_order defaults to ()
+    with pytest.raises(ValueError):
+        resolve_field_authority([_ev(P.HUMAN, S.CONFIRMED, "internal")], pol, frozenset())

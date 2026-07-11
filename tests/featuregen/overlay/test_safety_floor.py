@@ -188,3 +188,22 @@ def test_record_and_read_safety_override_round_trips(db):
 def test_read_unknown_override_raises_keyerror(db):
     with pytest.raises(KeyError):
         read_safety_override(db, "sfo_does_not_exist")
+
+
+def test_record_safety_override_rejects_divergent_fact_key(db):
+    # WBR fix 2: the passed fact_key must equal override.fact_key, else the object's field is
+    # silently dropped on round-trip. A divergent pair must fail closed.
+    ovr = _ovr("internal")  # override.fact_key == "fk"
+    with pytest.raises(ValueError):
+        record_safety_override(
+            db, fact_key="different-key", override=ovr, created_by={"subject": "x"}
+        )
+
+
+def test_record_safety_override_matching_fact_key_round_trips(db):
+    # WBR fix 2: a matching pair still round-trips cleanly (guard is equality, not a new constraint).
+    ovr = _ovr("internal")  # override.fact_key == "fk"
+    oid = record_safety_override(db, fact_key="fk", override=ovr, created_by={"subject": "x"})
+    rec = read_safety_override(db, oid)
+    assert rec.override.fact_key == "fk"
+    assert rec.override == ovr
