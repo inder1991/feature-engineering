@@ -55,7 +55,9 @@ def _bank_multi(conn) -> None:
     the direct, non-trivial 'fewer template candidates' signal. Mirrors test_gate1_scoped's churn
     catalog for the accounts half."""
     from datetime import UTC, datetime
-    now = datetime(2026, 7, 10, tzinfo=UTC)
+    # Watermark the catalog as fresh AS OF THE TEST RUN — the route grounds against the real wall clock
+    # (datetime.now), so a hardcoded past date would rot the freshness gate once that date passes.
+    now = datetime.now(UTC)
     catalog = [
         # ── accounts → the retail_churn recipes ──
         (CanonicalRow("bank", "accounts", "customer_id", "integer", is_grain=True, entity="Customer"),

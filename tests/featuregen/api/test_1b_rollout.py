@@ -72,7 +72,9 @@ def _bank_multi(conn) -> None:
     ``facilities`` table (a credit-limit grain) the credit recipes ground on. A full (unscoped) grounding
     surfaces BOTH families; a churn-scoped grounding surfaces only the churn recipes — the direct 'fewer
     template candidates' signal. Mirrors test_contract_scoped's catalog."""
-    now = datetime(2026, 7, 10, tzinfo=UTC)
+    # Fresh as of the test run — the route grounds against the real wall clock, so a hardcoded past
+    # date rots the freshness gate once that date passes.
+    now = datetime.now(UTC)
     catalog = [
         # ── accounts → the retail_churn recipes ──
         (CanonicalRow("bank", "accounts", "customer_id", "integer", is_grain=True, entity="Customer"),

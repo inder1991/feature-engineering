@@ -55,7 +55,9 @@ def _bank_multi(conn) -> None:
     ``facilities`` table the credit recipes ground on — so a churn narrowing leaves the credit/fraud
     families out of scope. Mirrors test_contract_scoped's catalog."""
     from datetime import UTC, datetime
-    now = datetime(2026, 7, 10, tzinfo=UTC)
+    # Fresh as of the test run — the route grounds against the real wall clock, so a hardcoded past
+    # date rots the freshness gate once that date passes.
+    now = datetime.now(UTC)
     catalog = [
         (CanonicalRow("bank", "accounts", "customer_id", "integer", is_grain=True, entity="Customer"),
          "customer_id"),
@@ -209,7 +211,9 @@ def _bank_ifrs9(conn) -> None:
     (REQUIRED_MATCH under confirmed ifrs9) alongside the generic ``credit_utilisation`` (COMPATIBLE),
     both at facility grain."""
     from datetime import UTC, datetime
-    now = datetime(2026, 7, 10, tzinfo=UTC)
+    # Fresh as of the test run — the route grounds against the real wall clock, so a hardcoded past
+    # date rots the freshness gate once that date passes.
+    now = datetime.now(UTC)
     catalog = [
         (CanonicalRow("bank", "accounts", "customer_id", "integer", is_grain=True, entity="Customer"),
          "customer_id"),
