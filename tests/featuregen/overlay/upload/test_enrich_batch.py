@@ -111,3 +111,22 @@ def test_audited_batch_call_excludes_unsafe_item_before_egress(db):
     by = {o.ref: o for o in res.outcomes}
     assert by["h2"].status == eb.EGRESS
     assert by["h1"].status == eb.VALID
+
+
+def test_chunk_respects_item_count():
+    items = [eb.BatchItem(f"r{i}", {"column": "c"}) for i in range(25)]
+    chunks = eb.chunk_items(items, max_items=10, max_input_tokens=10_000)
+    assert [len(c) for c in chunks] == [10, 10, 5]
+
+
+def test_chunk_respects_token_budget():
+    big = "x" * 400   # ~100 tokens each
+    items = [eb.BatchItem(f"r{i}", {"column": big}) for i in range(10)]
+    chunks = eb.chunk_items(items, max_items=100, max_input_tokens=250)
+    assert all(len(c) <= 3 for c in chunks) and sum(len(c) for c in chunks) == 10
+
+
+def test_chunk_never_drops_an_oversized_singleton():
+    items = [eb.BatchItem("r0", {"column": "x" * 10_000})]
+    chunks = eb.chunk_items(items, max_items=10, max_input_tokens=10)
+    assert chunks == [[items[0]]]   # one item always survives as its own chunk

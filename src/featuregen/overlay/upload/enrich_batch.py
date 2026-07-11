@@ -3,6 +3,7 @@ Pure helpers here (validation, chunking); the governed provider call lives in en
 degradation ladder in run_batched (Task 6)."""
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -69,3 +70,27 @@ def validate_batch_results(items: list[BatchItem], results: list[dict], out_key:
     for ref in expected - seen:
         outcomes.append(BatchItemOutcome(ref, MISSING, None, (MISSING,)))
     return outcomes
+
+
+def estimate_tokens(item: BatchItem) -> int:
+    """Cheap upper-ish estimate: ~4 chars/token over the item's metadata JSON, floor 8."""
+    return max(8, len(json.dumps(item.metadata, default=str)) // 4)
+
+
+def chunk_items(items: list[BatchItem], *, max_items: int,
+                max_input_tokens: int) -> list[list[BatchItem]]:
+    """Split into chunks bounded by BOTH item count and estimated input tokens (spec C5). A single
+    item that alone exceeds the token budget still forms its own chunk (never dropped)."""
+    chunks: list[list[BatchItem]] = []
+    cur: list[BatchItem] = []
+    tok = 0
+    for it in items:
+        t = estimate_tokens(it)
+        if cur and (len(cur) >= max_items or tok + t > max_input_tokens):
+            chunks.append(cur)
+            cur, tok = [], 0
+        cur.append(it)
+        tok += t
+    if cur:
+        chunks.append(cur)
+    return chunks
