@@ -511,6 +511,7 @@ RETAIL_CHURN_TEMPLATES: tuple[Template, ...] = (
     # F.12 — external_own_transfer_trend (Stage 3, primacy loss; §A9 derived intermediate + PII)
     Template(
         id="external_own_transfer_trend", family="primacy_outflow",
+        source_entity_need_role="entity",   # 3B.1: customer is the source grain (beneficiary is related)
         intent="Rising transfers of the customer's OWN money to their accounts at OTHER banks — a "
                "top-tier pre-attrition (primacy-loss) signal.",
         needs=(Need("customer_name", "pii"), Need("beneficiary_name", "beneficiary_name"),
@@ -1235,6 +1236,7 @@ AML_TEMPLATES: tuple[Template, ...] = (
     # A.5 — fan_in_fan_out (mule ring / smurfing network hub)
     Template(
         id="fan_in_fan_out", family="layering",
+        source_entity_need_role="entity",   # 3B.1: customer is the source grain (counterparty/beneficiary related)
         intent="Fan-in / fan-out — an abnormal number of distinct counterparties paying INTO then OUT OF "
                "an account in a window (a mule ring / smurfing network hub).",
         needs=(Need("counterparty", "counterparty_id"), Need("direction", "debit_credit_indicator"),
@@ -1295,6 +1297,7 @@ AML_TEMPLATES: tuple[Template, ...] = (
     # A.8 — crypto_offramp_exposure (fiat↔crypto ramps)
     Template(
         id="crypto_offramp_exposure", family="layering",
+        source_entity_need_role="entity",   # 3B.1: customer is the source grain (wallet is related)
         intent="Crypto on/off-ramp exposure — the share of flow crossing into on-chain wallets / "
                "stablecoins (fiat↔crypto ramps), a chain-hop layering route.",
         needs=(Need("on_chain", "on_chain_txn"), Need("wallet", "wallet_address", optional=True),
@@ -1361,6 +1364,7 @@ AML_TEMPLATES: tuple[Template, ...] = (
     # A.11 — prior_alert_recidivism (repeat-suspicion history) — NEAR-LABEL
     Template(
         id="prior_alert_recidivism", family="integration",
+        source_entity_need_role="entity",   # 3B.1: customer is the source grain (alert/case are related)
         intent="Prior-alert recidivism — the count/recency of PRIOR monitoring alerts that resulted in a "
                "watchlist hit on this entity (a repeat-suspicion history feature).",
         needs=(Need("watchlist", "watchlist_hit_flag"), Need("alert", "alert_id", optional=True),
@@ -2263,6 +2267,7 @@ MARKETS_TEMPLATES: tuple[Template, ...] = (
     # B8.7 — book_desk_concentration (concentration by book/desk)
     Template(
         id="book_desk_concentration", family="concentration",
+        source_entity_need_role="entity",   # 3B.1: book is the source grain (desk is related)
         intent="Concentration of exposure by book / desk — an HHI (or top-share) of notional exposure "
                "across books/desks; a book concentrated in one risk is fragile.",
         needs=(Need("notional_col", "notional"), Need("desk", "desk_id", optional=True),
@@ -2522,6 +2527,7 @@ CUSTODY_TEMPLATES: tuple[Template, ...] = (
     # B10.8 — custody_holding_dynamics (custody-holding turnover / concentration)
     Template(
         id="custody_holding_dynamics", family="custody_holdings",
+        source_entity_need_role="entity",   # 3B.1: account is the source grain (instrument is related)
         intent="Custody-holding dynamics — assets-under-custody holding level / trend "
                "(measure=holding_trend), turnover (traded value / holdings) or concentration (HHI across "
                "holdings); the custody-book stability signal.",
@@ -3541,6 +3547,7 @@ CROSS_SELL_TEMPLATES: tuple[Template, ...] = (
     # L.3 — next_best_product_propensity (pre-purchase behaviour, NEVER the conversion label)
     Template(
         id="next_best_product_propensity", family="next_best_product",
+        source_entity_need_role="entity",   # 3B.1: customer is the source grain (product is related)
         intent="Next-best-product propensity signals — a pre-purchase blend of product gaps, engagement "
                "and spend intensity that ranks the next product a customer is likely to take "
                "(measure=propensity_signal / gap_engagement_score). Built from BEHAVIOUR, NEVER the "
@@ -3586,6 +3593,7 @@ CROSS_SELL_TEMPLATES: tuple[Template, ...] = (
     # L.5 — campaign_response_recency (campaign exposure/response BEHAVIOUR, NEVER the conversion label)
     Template(
         id="campaign_response_recency", family="campaign_response",
+        source_entity_need_role="entity",   # 3B.1: customer is the source grain (campaign is related)
         intent="Campaign response / recency — a customer's response rate, recency or count over exposure "
                "to product-cross-sell campaigns (measure=response_rate / days_since_last_response / "
                "response_count). Built from response BEHAVIOUR, NEVER the conversion outcome.",
@@ -3610,6 +3618,7 @@ CROSS_SELL_TEMPLATES: tuple[Template, ...] = (
     # L.6 — clv_revenue_trajectory (monetary_flow + product_type; CLV is a DECLARED PROJECTION)
     Template(
         id="clv_revenue_trajectory", family="clv_revenue",
+        source_entity_need_role="entity",   # 3B.1: customer is the source grain (product is related)
         intent="CLV / revenue trajectory by product — customer revenue summed by product_type "
                "(measure=revenue), its trailing trend (measure=revenue_trend) or a forward CLV projection "
                "(measure=clv_projection). Revenue is additive; the CLV is a declared forward projection.",
@@ -3679,6 +3688,7 @@ CROSS_SELL_TEMPLATES: tuple[Template, ...] = (
     # L.9 — household_relationship_value (household / RM aggregation grain)
     Template(
         id="household_relationship_value", family="relationship_aggregation",
+        source_entity_need_role="entity",   # 3B.1: household is the source grain (relationship_manager is related)
         intent="Household / relationship aggregation — product breadth, revenue or revenue-share summed "
                "across a HOUSEHOLD (or a relationship-manager's book) (measure=household_breadth / "
                "household_revenue / household_revenue_share); the relationship-primacy rollup grain.",
@@ -3815,6 +3825,7 @@ CORPORATE_TRADE_TEMPLATES: tuple[Template, ...] = (
     # L.13 — invoice_finance_dynamics
     Template(
         id="invoice_finance_dynamics", family="invoice_finance",
+        source_entity_need_role="entity",   # 3B.1: obligor is the source grain (invoice is related)
         intent="Invoice / receivables-finance behaviour — days-sales-outstanding (measure=dso), invoice "
                "dilution (unpaid / credit-noted) rate (measure=dilution_rate) or debtor concentration "
                "(measure=debtor_concentration_hhi) over the financed receivables pool; rising DSO / "
@@ -3943,6 +3954,7 @@ CORPORATE_TRADE_TEMPLATES: tuple[Template, ...] = (
     # L.18 — guarantor_reliance
     Template(
         id="guarantor_reliance", family="guarantor_support",
+        source_entity_need_role="entity",   # 3B.1: obligor is the source grain (guarantor is related)
         intent="Guarantor reliance — the share of exposure covered by a guarantee (measure=guaranteed_"
                "share), the concentration of reliance on a few guarantors (measure=guarantor_concentration)"
                " or a heavy-reliance flag; heavy reliance on one guarantor is credit-mitigation fragility.",

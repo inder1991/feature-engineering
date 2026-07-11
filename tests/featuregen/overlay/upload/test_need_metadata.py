@@ -81,3 +81,38 @@ def test_explicit_field_overrides_win():
     (m,) = derive_need_metadata(t)
     assert m.allowed_source_grains == ("account",) and m.grain_source == "explicit_recipe"
     assert m.temporal_role is TemporalRole.AS_OF_TIME and m.temporal_role_source == "explicit_recipe"
+
+
+from featuregen.overlay.upload.need_metadata import (
+    NEED_METADATA_VERSION,
+    RESOLVED_NEED_METADATA,
+    derivation_report,
+)
+from featuregen.overlay.upload.templates import ALL_TEMPLATES
+
+
+def test_every_recipe_resolves_and_validates():
+    # the load-bearing coverage gate: all 153 recipes have resolved metadata for every need.
+    assert set(RESOLVED_NEED_METADATA) == {t.id for t in ALL_TEMPLATES}
+    for t in ALL_TEMPLATES:
+        assert len(RESOLVED_NEED_METADATA[t.id]) == len(t.needs)
+
+
+def test_exactly_one_source_anchor_per_recipe_at_most():
+    # a recipe with entity needs resolves at most one SOURCE_ENTITY_KEY (never several via tuple position).
+    for tid, metas in RESOLVED_NEED_METADATA.items():
+        anchors = [m for m in metas if m.join_role.value == "source_entity_key"]
+        assert len(anchors) <= 1, f"{tid} has {len(anchors)} source anchors"
+
+
+def test_derivation_report_covers_every_need_with_a_source():
+    rows = derivation_report()
+    assert len(rows) == sum(len(t.needs) for t in ALL_TEMPLATES)
+    for row in rows:
+        assert row["grain_source"] in ("explicit_recipe", "concept_registry", "template_default")
+        assert row["join_role_source"] in ("explicit_recipe", "concept_registry", "template_default")
+        assert row["temporal_role_source"] in ("explicit_recipe", "concept_registry", "template_default")
+
+
+def test_version_stamped():
+    assert NEED_METADATA_VERSION == "1.0.0"

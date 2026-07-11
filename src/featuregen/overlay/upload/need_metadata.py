@@ -11,7 +11,7 @@ from typing import Literal
 
 from featuregen.overlay.upload.binding_roles import JoinRole, TemporalRole
 from featuregen.overlay.upload.concepts import concept
-from featuregen.overlay.upload.templates import Need, Template
+from featuregen.overlay.upload.templates import ALL_TEMPLATES, Need, Template
 
 NEED_METADATA_VERSION = "1.0.0"
 
@@ -119,3 +119,20 @@ def derive_need_metadata(template: Template) -> tuple[ResolvedNeedMetadataV1, ..
     validate_template_anchor(template)
     anchor = _source_anchor_role(template)
     return tuple(_derive_one(template, n, anchor) for n in template.needs)
+
+
+# Resolved ONCE at import over the whole recipe corpus — the immutable registry the 3B.3 planner reads.
+# Fails FAST (at import) if any recipe's source anchor is ambiguous.
+RESOLVED_NEED_METADATA: dict[str, tuple[ResolvedNeedMetadataV1, ...]] = {
+    t.id: derive_need_metadata(t) for t in ALL_TEMPLATES}
+
+
+def derivation_report() -> tuple[dict[str, object], ...]:
+    """One row per (template, need): the resolved fields + where each came from — for inspection/audit."""
+    return tuple(
+        {"template": tid, "role": m.role, "concept": m.concept,
+         "allowed_source_grains": m.allowed_source_grains,
+         "join_role": m.join_role.value, "temporal_role": m.temporal_role.value,
+         "grain_source": m.grain_source, "join_role_source": m.join_role_source,
+         "temporal_role_source": m.temporal_role_source}
+        for tid, metas in RESOLVED_NEED_METADATA.items() for m in metas)
