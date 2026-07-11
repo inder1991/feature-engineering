@@ -21,6 +21,20 @@ _DOMAIN_TASK = "overlay.enrich.domain"
 _CONCEPT_VOCABULARY: list[dict] = list(classification_vocabulary())
 
 
+def _vocab_fingerprint() -> str:
+    """Short, stable fingerprint of the concept vocabulary (names only) — bumps the concept cache
+    version whenever the classification targets change (spec C6)."""
+    raw = json.dumps([c["name"] for c in _CONCEPT_VOCABULARY])
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:12]
+
+
+# Cache versions fold prompt/schema/vocabulary identity into the cache key (spec C6). Bump the vN
+# literal on any prompt or schema change to a task; the concept version also tracks the vocabulary.
+_CONCEPT_CACHE_VERSION = f"concept:v1:{_vocab_fingerprint()}"
+_DEFINITION_CACHE_VERSION = "definition:v1"
+_DOMAIN_CACHE_VERSION = "domain:v1"
+
+
 def content_hash(row: CanonicalRow) -> str:
     # JSON-encode (unambiguous — no delimiter collision) and INCLUDE source so a drafted definition
     # for one source's column is never shown for another source's same-named column (M5/M6 minors).
@@ -41,22 +55,23 @@ _CACHES = {
 }
 
 
-def _cache_get(conn, cache_table: str, hashes: list[str]) -> dict[str, str]:
+def _cache_get(conn, cache_table: str, hashes: list[str], cache_version: str) -> dict[str, str]:
     if not hashes:
         return {}
     col = _CACHES[cache_table]
     rows = conn.execute(
-        f"SELECT content_hash, {col} FROM {cache_table} WHERE content_hash = ANY(%s)",
-        (hashes,)).fetchall()
+        f"SELECT content_hash, {col} FROM {cache_table} "
+        "WHERE content_hash = ANY(%s) AND cache_version = %s",
+        (hashes, cache_version)).fetchall()
     return {r[0]: r[1] for r in rows}
 
 
-def _cache_put(conn, cache_table: str, content_hash_: str, value: str) -> None:
+def _cache_put(conn, cache_table: str, content_hash_: str, value: str, cache_version: str) -> None:
     col = _CACHES[cache_table]
     conn.execute(
-        f"INSERT INTO {cache_table} (content_hash, {col}) VALUES (%s, %s) "
-        "ON CONFLICT (content_hash) DO NOTHING",
-        (content_hash_, value))
+        f"INSERT INTO {cache_table} (content_hash, cache_version, {col}) VALUES (%s, %s, %s) "
+        "ON CONFLICT (content_hash, cache_version) DO NOTHING",
+        (content_hash_, cache_version, value))
 
 
 def _call(conn, client: LLMClient, task: str, prompt_id: str, schema_id: str,
@@ -80,7 +95,7 @@ def _bounded(val: str | None, max_len: int) -> str | None:
 def enrich_concepts(conn, rows: list[CanonicalRow], client: LLMClient,
                     actor=None) -> dict[str, str]:
     by_hash: dict[str, CanonicalRow] = {content_hash(r): r for r in rows}
-    result = _cache_get(conn, "enrichment_concept", list(by_hash))
+    result = _cache_get(conn, "enrichment_concept", list(by_hash), _CONCEPT_CACHE_VERSION)
     for h, row in by_hash.items():
         if h in result:
             continue
@@ -93,7 +108,7 @@ def enrich_concepts(conn, rows: list[CanonicalRow], client: LLMClient,
         if raw is None:
             continue   # failure/empty -> don't cache; retry next ingest (M3)
         concept = raw if is_known_concept(raw) else UNCLASSIFIED
-        _cache_put(conn, "enrichment_concept", h, concept)
+        _cache_put(conn, "enrichment_concept", h, concept, _CONCEPT_CACHE_VERSION)
         result[h] = concept
     return result
 
@@ -102,7 +117,7 @@ def draft_definitions(conn, rows: list[CanonicalRow], client: LLMClient,
                       actor=None) -> dict[str, str]:
     """Draft a definition ONLY for columns with no declared one (R3: never overwrite a human's)."""
     blank = {content_hash(r): r for r in rows if not r.definition}
-    result = _cache_get(conn, "enrichment_definition", list(blank))
+    result = _cache_get(conn, "enrichment_definition", list(blank), _DEFINITION_CACHE_VERSION)
     for h, row in blank.items():
         if h in result:
             continue
@@ -114,7 +129,7 @@ def draft_definitions(conn, rows: list[CanonicalRow], client: LLMClient,
                                  actor), 500)
         if drafted is None:
             continue   # failure / empty / over-long / list-stringified -> don't cache (M3/M9)
-        _cache_put(conn, "enrichment_definition", h, drafted)
+        _cache_put(conn, "enrichment_definition", h, drafted, _DEFINITION_CACHE_VERSION)
         result[h] = drafted
     return result
 
@@ -128,7 +143,7 @@ def classify_domains(conn, rows: list[CanonicalRow], client: LLMClient,
         by_table.setdefault(r.table, []).append(r.column)
 
     hash_of_table = {t: _table_content_hash(source, t, cols) for t, cols in by_table.items()}
-    cached = _cache_get(conn, "enrichment_domain", list(hash_of_table.values()))
+    cached = _cache_get(conn, "enrichment_domain", list(hash_of_table.values()), _DOMAIN_CACHE_VERSION)
 
     result: dict[str, str] = {}
     for table, cols in by_table.items():
@@ -141,6 +156,6 @@ def classify_domains(conn, rows: list[CanonicalRow], client: LLMClient,
                                 "Classify this table's business domain.", actor), 64)
         if domain is None:
             continue   # failure / empty / over-long / list-stringified -> don't cache (M3/M9)
-        _cache_put(conn, "enrichment_domain", h, domain)
+        _cache_put(conn, "enrichment_domain", h, domain, _DOMAIN_CACHE_VERSION)
         result[table] = domain
     return result
