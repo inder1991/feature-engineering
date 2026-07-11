@@ -67,6 +67,14 @@ def test_anchor_role_must_name_an_entity_need():
         validate_template_anchor(t)
 
 
+def test_explicit_anchor_naming_non_entity_need_rejected_even_single_entity():
+    # a single-entity (or measure-only) template with an anchor pointing at a NON-entity need must raise
+    t = _t([Need("entity", "customer_id"), Need("stock", "monetary_stock")],
+           source_entity_need_role="stock")
+    with pytest.raises(ValueError, match="not an entity-linked need"):
+        validate_template_anchor(t)
+
+
 def test_explicit_field_overrides_win():
     t = _t([Need("entity", "customer_id",
                  allowed_source_grains=("account",), temporal_role=TemporalRole.AS_OF_TIME)])

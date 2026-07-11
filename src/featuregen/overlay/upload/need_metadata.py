@@ -49,21 +49,21 @@ def _entity_of(need: Need) -> str | None:
 
 
 def validate_template_anchor(template: Template) -> None:
-    """Raise ``ValueError`` on an ambiguous source anchor: >1 DISTINCT entity-linked need and no explicit
-    ``source_entity_need_role`` (0 or 1 distinct entity key is unambiguous). If the anchor role is set, it
-    must name an entity-linked need."""
+    """Raise ``ValueError`` on an ambiguous or invalid source anchor. If ``source_entity_need_role`` is
+    set it MUST name an entity-linked need (checked unconditionally). Otherwise >1 DISTINCT entity-linked
+    need with no explicit anchor is ambiguous (0 or 1 distinct entity key is fine)."""
     entity_needs = [n for n in template.needs if _entity_of(n) is not None]
-    distinct = {_entity_of(n) for n in entity_needs}
-    if len(distinct) <= 1:
+    if template.source_entity_need_role is not None:
+        if template.source_entity_need_role not in {n.role for n in entity_needs}:
+            raise ValueError(
+                f"template {template.id!r}: source_entity_need_role "
+                f"{template.source_entity_need_role!r} is not an entity-linked need")
         return
-    if template.source_entity_need_role is None:
+    distinct = {_entity_of(n) for n in entity_needs}
+    if len(distinct) > 1:
         raise ValueError(
             f"template {template.id!r}: {len(distinct)} distinct entity keys "
             f"({sorted(str(e) for e in distinct)}) but no source_entity_need_role")
-    if template.source_entity_need_role not in {n.role for n in entity_needs}:
-        raise ValueError(
-            f"template {template.id!r}: source_entity_need_role "
-            f"{template.source_entity_need_role!r} is not an entity-linked need")
 
 
 def _source_anchor_role(template: Template) -> str | None:
