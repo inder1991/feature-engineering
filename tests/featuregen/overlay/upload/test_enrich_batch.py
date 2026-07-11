@@ -195,3 +195,17 @@ def test_enrich_concepts_single_mode_unchanged(db, monkeypatch):
     client = FakeLLM(script={"overlay.enrich.concept": FakeResponse(output={"concept": "totally_made_up"})})
     out = enrich_concepts(db, rows, client)
     assert out[content_hash(rows[0])] == "unclassified"   # single keeps today's coerce behaviour
+
+
+from featuregen.overlay.upload.enrich import classify_domains
+
+
+def test_classify_domains_batch_mode(db, monkeypatch):
+    monkeypatch.setenv("OVERLAY_ENRICH_DOMAIN_MODE", "batch")
+    rows = [CanonicalRow("deposits", "accounts", "id", "integer"),
+            CanonicalRow("deposits", "loans", "principal", "numeric")]
+    client = FakeLLM(script={"overlay.enrich.domain": FakeResponse(output={"results": [
+        {"ref": "accounts", "domain": "Deposits"},
+        {"ref": "loans", "domain": "Lending"}]})})
+    out = classify_domains(db, rows, client)
+    assert out == {"accounts": "Deposits", "loans": "Lending"}

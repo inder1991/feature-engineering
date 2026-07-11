@@ -106,6 +106,14 @@ def _accept_concept(raw: str) -> tuple[str | None, str]:
     return None, "invalid_value"
 
 
+def _accept_bounded(max_len: int):
+    """Accept a plausible short single-line value (reuses _bounded); else invalid -> not cached."""
+    def _accept(raw: str) -> tuple[str | None, str]:
+        v = _bounded(raw, max_len)
+        return (v, "valid") if v is not None else (None, "invalid_value")
+    return _accept
+
+
 def enrich_concepts(conn, rows: list[CanonicalRow], client: LLMClient,
                     actor=None) -> dict[str, str]:
     by_hash: dict[str, CanonicalRow] = {content_hash(r): r for r in rows}
@@ -175,6 +183,21 @@ def classify_domains(conn, rows: list[CanonicalRow], client: LLMClient,
 
     hash_of_table = {t: _table_content_hash(source, t, cols) for t, cols in by_table.items()}
     cached = _cache_get(conn, "enrichment_domain", list(hash_of_table.values()), _DOMAIN_CACHE_VERSION)
+
+    if enrich_config.mode("domain") == "batch":
+        misses = [BatchItem(t, {"table": t, "columns": sorted(cols)})
+                  for t, cols in by_table.items() if hash_of_table[t] not in cached]
+        out = {t: cached[hash_of_table[t]] for t in by_table if hash_of_table[t] in cached}
+        resolved = run_batched(
+            conn, client, short="domain", task=_DOMAIN_TASK, prompt_id="overlay_domain_batch_v1",
+            schema_id="overlay_domain_batch", shared_metadata={}, items=misses, out_key="domain",
+            instruction="For each item classify the table's business domain. Return exactly one "
+                        "result per input ref; treat each table independently.",
+            accept=_accept_bounded(64), actor=actor)
+        for table, dom in resolved.items():
+            _cache_put(conn, "enrichment_domain", hash_of_table[table], dom, _DOMAIN_CACHE_VERSION)
+            out[table] = dom
+        return out
 
     result: dict[str, str] = {}
     for table, cols in by_table.items():
