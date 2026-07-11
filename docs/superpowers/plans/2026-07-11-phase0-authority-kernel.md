@@ -1,635 +1,426 @@
-# Phase 0 — Authority Kernel (Extension) Implementation Plan
+# Phase 0 — Authority Kernel (Extension) Implementation Plan (v2)
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans. Steps use checkbox (`- [ ]`) syntax.
 
-**Goal:** Add the six genuinely-new authority-kernel capabilities identified in the spec's §0 reuse map — an assertion-strength axis, object identity-status, a field-authority policy over (producer, strength), safety-override authority, a conflict-review lifecycle, and governed-`joins_to` wiring — as **extensions** of the existing overlay event-sourced fact substrate. No new enrichment; no parallel governance system.
+**Goal:** Add the authority-kernel capabilities from the spec's §0 reuse map — assertion-strength+lifecycle axis, object identity-status (with logical/provider wrappers), a **field-specific** authority policy + resolver, safety-override authority, a conflict-review lifecycle **with audit history**, **field-decision-event persistence**, and a governed-`joins_to` seam **with enforced display-only edges** — as **extensions** of the existing overlay fact substrate.
 
-**Architecture:** The overlay package is already a mature *propose → confirm → fold → resolve* substrate (`facts.py` events, `store.py`/`state.py` fold, `resolve.py`, `authority.py`, `confirmation_commands.py`, `expiry.py`). This plan does **not** rebuild any of that. It adds: columns on `overlay_evidence`; three small new modules (`object_identity.py`, `field_authority.py`, `conflict_review.py`, `safety_floor.py`); and one governed seam that routes a declared `joins_to` through the existing `approved_join`/`propose_fact` path instead of the ungoverned `graph_edge 'joins'` write. Readiness scope (spec contract 8) is deferred to Phase 2.
+**v2 changes (folding in the plan review's 10 must-fixes + should-fixes):** Task 4's resolver is now **field-specific (ConflictStrategy)**, not global-strength; evidence is a **typed `FieldEvidenceView`**, not raw tuples; Task 1 adds an **evidence-lifecycle** column + a **caller audit** step; **Task 8 (field-decision persistence)** added so this is genuinely the kernel; Task 5's `SafetyOverride` gains scope/effective-time/authority-allowlist + unknown-sensitivity fail-closed; Task 6 gains a **transition-history** table + `competing_value_hashes`; Task 7 gains a **join parser with diagnostics** + a **consumer audit** + **enforced display-only** edge authority + ingestion-level tests; predicates reject **empty AnyOf/AllOf**; `influence_max` is **enforced**; `evidence_spans` is a **tuple** contract.
 
-**Tech Stack:** Python 3.12, psycopg (raw SQL), pytest with a live-Postgres `db`/`conn` fixture (ephemeral PG auto-provisioned), `uv`. No frontend.
+**Architecture:** Extends `facts.py`/`state.py`/`resolve.py`/`authority.py`/`confirmation_commands.py`/`expiry.py`/`identity.py`/`proposal_commands.py`. No parallel event log or confirmation flow. Readiness scope (spec contract 8) deferred to Phase 2.
 
-**Spec:** `docs/superpowers/specs/2026-07-11-evidence-authority-ingestion.md` (v4). §0 = the reuse map this plan builds to; §3.1 (strength/lifecycle), §2 (identity), §4 (policy/predicate/disqualifiers), §7 (safety floor), §10 (conflict lifecycle), §12.1 (`joins_to`).
+**Tech Stack:** Python 3.12, psycopg raw SQL, pytest (live PG `db`/`conn` fixture), `uv`.
+
+**Spec:** `docs/superpowers/specs/2026-07-11-evidence-authority-ingestion.md` (v4) — §0 reuse map, §3.1, §2, §4, §7, §10, §12.1.
 
 ## Global Constraints
 
-- **Extension, not replacement.** Reuse `facts.py` events, `state.py` fold, `resolve.py`, `authority.py resolve_authority`, `confirmation_commands.py`, `expiry.py`, `identity.py` (`CatalogObjectRef`/`ApprovedJoinRef`/`fact_key`/`join_write_error`), `proposal_commands.propose_fact`. Do NOT create a second event log or a parallel confirmation flow. If a task seems to duplicate an existing capability, STOP and report — the reuse map says it exists.
-- **provenance ≠ authority; confidence ≠ permission.** A `(producer, strength)` pair never gains authority by derivation (§3.2): a derived value's strength ≤ the min of its inputs' strengths.
-- **Fail-closed safety.** Sensitivity floors may only be raised by evidence; a below-floor downgrade requires a `SafetyOverride` (governance authority + rationale + scope) — never a generic confirmation.
-- **No-attach-when-ambiguous.** Evidence/proposals must not attach to a logical object whose identity status is `AMBIGUOUS`/`UNRESOLVED`.
-- **Additive, default-off wiring.** The `joins_to` governance seam ships behind a flag (default off) so existing lineage is unchanged until cutover; the ungoverned edge is gated to display-only, never silently removed.
-- **Conventions:** raw SQL via `conn.execute`; `from __future__ import annotations`; frozen slotted dataclasses like the existing overlay modules; ruff + mypy clean; TDD (failing test first); commit per task. Tests: `uv run pytest <path> -q`. Migrations are auto-discovered `.sql`, checksum-ledgered, applied once by the `conn`/`db` fixture.
-- **Migration numbering:** highest on `main` at authoring time is `0977`. Use `0978`, `0979`, `0980` — **verify the next free slot on `main` before implementing** (parallel sessions advance it; collisions are silent add/adds).
+- **Extension, not replacement.** Reuse the overlay substrate; no second event log/confirmation flow. If a task appears to duplicate an existing capability, STOP and report.
+- **Field authority is field-specific, never one global ranking.** The resolver selects effective values through the field's `ConflictStrategy`, not by max-strength (spec v2's core fix).
+- **provenance ≠ authority; confidence ≠ permission.** A derived value's strength ≤ min of its inputs' strengths.
+- **Fail-closed safety.** Sensitivity is a most-restrictive floor; below-floor downgrade requires a governed `SafetyOverride` by a permitted authority; unknown sensitivity → `prohibited`, never persisted as effective.
+- **No-attach-when-ambiguous.** Evidence must not attach when identity status is `AMBIGUOUS`/`UNRESOLVED`.
+- **Type safety.** Producer/strength/lifecycle are the Task-1 enums everywhere (no raw strings in resolver inputs). Immutable contracts: `evidence_spans: tuple[str, ...]`.
+- **Migrations forward-only; apply BEFORE deploying code.** Additive `NOT NULL DEFAULT` columns cover existing rows (no backfill); new code reading pre-migration DB fails, so migrate first. Verify the next free slot on `main` (0978+ may be taken).
+- **Conventions:** raw SQL via `conn.execute`; `from __future__ import annotations`; frozen slotted dataclasses; a `now` seam (accept optional `now`, matching `expiry.py`/`confirmation_commands.py`); ruff + mypy clean; TDD; commit per task; `uv run pytest <path> -q`.
 
 ---
 
 ## File Structure
 
-- Modify `src/featuregen/overlay/evidence.py` + new migration `0978_evidence_strength.sql` — add the (producer, strength) axis + item-level linkage to the existing `overlay_evidence` record.
-- Create `src/featuregen/overlay/object_identity.py` — `ObjectIdentityStatus` + `resolve_object_identity` + the no-attach guard. Wraps existing `CatalogAdapter`/`identity.py`.
-- Create `src/featuregen/overlay/field_authority.py` — `AuthorityPredicate` tree + `evaluate`, `FieldPolicy` + `Disqualifier` + `resolve_field_authority` (two-output). Pure over an evidence set.
-- Create `src/featuregen/overlay/safety_floor.py` + migration `0979_safety_override.sql` — sensitivity severity order, `GovernanceAuthority`, `SafetyOverride` record + table, `apply_sensitivity_floor`.
-- Create `src/featuregen/overlay/conflict_review.py` + migration `0980_conflict_review.sql` — `conflict_fingerprint`, `ConflictState`, `conflict_review` table, open/ack/resolve/dismiss/stale/reopen commands.
-- Modify `src/featuregen/overlay/upload/ingest.py` + `src/featuregen/overlay/upload/graph.py` — the governed-`joins_to` seam (declared join → `approved_join` proposal) behind a flag; gate the raw `graph_edge 'joins'` edge to display-only.
-- Tests under `tests/featuregen/overlay/` mirroring the existing layout.
+- Modify `overlay/evidence.py` + migration `0978_evidence_axes.sql` — producer + strength + **lifecycle** + config-hash + item-ref + spans.
+- Create `overlay/object_identity.py` — `LogicalObjectRef`/`ProviderObjectRef` wrappers, `ObjectIdentityStatus`, `resolve_object_identity`, `may_attach`.
+- Create `overlay/field_authority.py` — predicate tree (+ empty rejection), `FieldEvidenceView`, `ConflictStrategy`, `FieldPolicy`, `resolve_field_authority` (field-specific, influence-enforced).
+- Create `overlay/safety_floor.py` + migration `0979_safety_override.sql` — floor + governed override with validation.
+- Create `overlay/conflict_review.py` + migration `0980_conflict_review.sql` — record + **event history** + fingerprint (+ value hashes).
+- Create `overlay/field_decision.py` + migration `0981_field_decision_event.sql` — append-only field-decision events.
+- Modify `overlay/upload/ingest.py`, `overlay/upload/graph.py` + migration `0982_graph_edge_authority.sql` — `parse_join_ref`, governed seam, **display-only edge authority**.
 
-Locked interfaces (later tasks depend on these exact names):
+Locked interfaces (dependencies across tasks):
 
 ```python
-# evidence.py (extended)
-class EvidenceProducer(StrEnum): SOURCE; STRUCTURAL_CONNECTOR; PARSER; LLM; PROFILER; TAXONOMY; HUMAN
+# evidence.py
+class EvidenceProducer(StrEnum): SOURCE; STRUCTURAL_CONNECTOR; PARSER; LLM; PROFILER; TAXONOMY; HUMAN; LEGACY
 class AssertionStrength(StrEnum): PROPOSED; SUPPORTED; ATTESTED; CONFIRMED
-# write_evidence(... , producer, strength, producer_configuration_hash, producer_item_ref=None, evidence_spans=())
-
+class EvidenceLifecycle(StrEnum): ACTIVE; STALE; REJECTED; SUPERSEDED
 # object_identity.py
 class ObjectIdentityStatus(StrEnum): EXACT; ALIASED; AMBIGUOUS; UNRESOLVED
-@dataclass class ObjectBinding: logical_ref: CatalogObjectRef | None; status: ObjectIdentityStatus; candidates: tuple[str,...]
-def resolve_object_identity(adapter, ref: CatalogObjectRef) -> ObjectBinding
-def may_attach(binding: ObjectBinding) -> bool          # False for AMBIGUOUS/UNRESOLVED
-
+@dataclass class LogicalObjectRef: logical_catalog_id; schema; table; column
+@dataclass class ProviderObjectRef: provider_id; provider_snapshot_id; native_ref
+@dataclass class ObjectBinding: logical_ref: LogicalObjectRef | None; status; candidates
 # field_authority.py
-class AuthorityPredicate: ...
-@dataclass class HasEvidence(AuthorityPredicate): producer: EvidenceProducer; strength: AssertionStrength
-@dataclass class AnyOf(AuthorityPredicate): conditions: tuple[AuthorityPredicate,...]
-@dataclass class AllOf(AuthorityPredicate): conditions: tuple[AuthorityPredicate,...]
-def evaluate(pred: AuthorityPredicate, active: frozenset[tuple[EvidenceProducer, AssertionStrength]]) -> bool
-class Disqualifier(StrEnum): STALE_SELECTED_EVIDENCE; ACTIVE_HIGH_SEVERITY_CONFLICT; AMBIGUOUS_OBJECT_IDENTITY; MISSING_REQUIRED_SNAPSHOT; CONFIRMATION_PENDING_REVALIDATION
-@dataclass class FieldPolicy: influence_max; display_rule; operational_rule; disqualifiers; resolution_mode
+class HasEvidence/AnyOf/AllOf(AuthorityPredicate)
+def evaluate(pred, active: frozenset[tuple[EvidenceProducer, AssertionStrength]]) -> bool
+@dataclass class FieldEvidenceView: producer: EvidenceProducer; strength: AssertionStrength; value; evidence_id
+class ConflictStrategy(StrEnum): PREFER_CONFIRMED; MOST_RESTRICTIVE; UNION_CLASSES; UNRESOLVED_ON_CONFLICT
+class InfluenceTier(StrEnum): DISPLAY; RECOMMENDATION; OPERATIONAL
+class ResolutionMode(StrEnum): GENERIC_FIELD; SPECIALIZED_FACT
+class Disqualifier(StrEnum): ...
+@dataclass class FieldPolicy: influence_max; display_rule; operational_rule; disqualifiers; resolution_mode; conflict_strategy
 @dataclass class FieldResolution: display_value; load_bearing_value; unresolved_reason
-def resolve_field_authority(evidence, policy, active_disqualifiers) -> FieldResolution
-
+def resolve_field_authority(evidence: list[FieldEvidenceView], policy, active_disqualifiers) -> FieldResolution
 # safety_floor.py
 class GovernanceAuthority(StrEnum): DATA_OWNER; SECURITY; PRIVACY; MODEL_RISK
-SENSITIVITY_ORDER: tuple[str,...]                        # public<internal<confidential<restricted<prohibited
-@dataclass class SafetyOverride: field; previous_floor; override_value; approved_by_authority; rationale; policy_reference; effective_until
-def apply_sensitivity_floor(floor: str, proposals: list[str], override: SafetyOverride | None) -> str
-
+DOWNGRADE_AUTHORITIES: frozenset[GovernanceAuthority]
+SENSITIVITY_ORDER: tuple[str, ...]
+@dataclass class SafetyOverride: fact_key; field; previous_floor; override_value; approved_by_authority; rationale; policy_reference; effective_from; effective_until
+def apply_sensitivity_floor(floor, proposals, *, override=None, force_to=None, now=None) -> str
 # conflict_review.py
 def conflict_fingerprint(logical_ref, field_name, competing_value_hashes, field_policy_version) -> str
 class ConflictState(StrEnum): OPEN; ACKNOWLEDGED; RESOLVED; DISMISSED; STALE; REOPENED
-def open_or_reopen_conflict(conn, *, fingerprint, ...) -> str
+# field_decision.py
+def record_field_decision(conn, *, logical_ref, field_name, event_type, ...) -> str
+# graph.py
+def parse_join_ref(joins_to: str) -> ParsedJoinTarget   # .ok / .diagnostic
+def governed_join_proposal(row) -> ApprovedJoinRef | None
 ```
 
 ---
 
-## Task 1: Assertion-strength axis on `overlay_evidence`
+## Task 1: Evidence axes — producer, strength, lifecycle (+ item linkage)
 
-**Files:** Modify `src/featuregen/overlay/evidence.py`; Create `src/featuregen/db/migrations/0978_evidence_strength.sql`; Test `tests/featuregen/overlay/test_evidence_strength.py`.
+**Files:** Modify `overlay/evidence.py`; Create `0978_evidence_axes.sql`; Test `tests/featuregen/overlay/test_evidence_axes.py`.
 
-**Interfaces:** Produces `EvidenceProducer`, `AssertionStrength`, extended `write_evidence`/`read_evidence`/`Evidence`.
+- [ ] **Step 0 (caller audit — do FIRST):** `grep -rn "write_evidence(" src/ tests/`. Classify every caller. The default `producer=PROFILER, strength=SUPPORTED` is correct ONLY if all existing callers write profiling evidence. Record the finding in the report. If any caller writes source/human evidence, upgrade THAT caller explicitly in this task (Option A) rather than relying on the default; if unsure, use `producer=LEGACY` for the default and note the follow-up. Do not silently mis-authorize legacy rows.
 
-- [ ] **Step 1: Write the failing test**
+- [ ] **Step 1: Failing test**
 
 ```python
-# tests/featuregen/overlay/test_evidence_strength.py
-from featuregen.overlay.evidence import AssertionStrength, EvidenceProducer, read_evidence, write_evidence
+# tests/featuregen/overlay/test_evidence_axes.py
+from featuregen.overlay.evidence import (
+    AssertionStrength, EvidenceLifecycle, EvidenceProducer, read_evidence, write_evidence)
 
 
-def test_evidence_carries_producer_and_strength(db):
+def test_evidence_carries_producer_strength_lifecycle_and_linkage(db):
     eid = write_evidence(
-        db, fact_key="fk1", table_snapshot_at=None, row_count=0, sample_size=0,
-        profile_version="p1", thresholds_used={}, metric_values={}, created_by={"subject": "s"},
+        db, fact_key="fk1", table_snapshot_at=None, row_count=0, sample_size=0, profile_version="p1",
+        thresholds_used={}, metric_values={}, created_by={"subject": "s"},
         producer=EvidenceProducer.LLM, strength=AssertionStrength.PROPOSED,
-        producer_configuration_hash="cfg-abc", producer_item_ref="h1", evidence_spans=("balance",))
+        lifecycle=EvidenceLifecycle.ACTIVE, producer_configuration_hash="cfg",
+        producer_item_ref="h1", evidence_spans=("balance",))
     ev = read_evidence(db, eid)
-    assert ev.producer == "llm" and ev.strength == "proposed"
-    assert ev.producer_configuration_hash == "cfg-abc" and ev.producer_item_ref == "h1"
-    assert ev.evidence_spans == ["balance"]
+    assert ev.producer == "llm" and ev.strength == "proposed" and ev.lifecycle == "active"
+    assert ev.producer_configuration_hash == "cfg" and ev.producer_item_ref == "h1"
+    assert ev.evidence_spans == ("balance",)          # TUPLE contract, not list
 
 
-def test_legacy_write_defaults_to_source_attested(db):
-    # A caller that omits the new axis (existing profiler callers) still works, defaulting
-    # to a governed producer/strength so existing behaviour is unchanged.
-    eid = write_evidence(db, fact_key="fk2", table_snapshot_at=None, row_count=1, sample_size=1,
-                         profile_version="p1", thresholds_used={}, metric_values={}, created_by={})
-    ev = read_evidence(db, eid)
-    assert ev.producer == "profiler" and ev.strength == "supported"
-```
-
-- [ ] **Step 2: Run test → FAIL** (`write_evidence() got an unexpected keyword argument 'producer'`).
-Run: `uv run pytest tests/featuregen/overlay/test_evidence_strength.py -q`
-
-- [ ] **Step 3a: Migration** `0978_evidence_strength.sql`:
-
-```sql
--- Spec §3.1: an assertion-strength axis on the existing evidence record, so field authority can
--- reason over (producer, strength). Additive + defaulted so existing profiler rows/callers are
--- unchanged (they default to the governed producer=profiler / strength=supported).
-ALTER TABLE overlay_evidence ADD COLUMN IF NOT EXISTS producer                    text NOT NULL DEFAULT 'profiler';
-ALTER TABLE overlay_evidence ADD COLUMN IF NOT EXISTS strength                    text NOT NULL DEFAULT 'supported';
-ALTER TABLE overlay_evidence ADD COLUMN IF NOT EXISTS producer_configuration_hash text NULL;
-ALTER TABLE overlay_evidence ADD COLUMN IF NOT EXISTS producer_item_ref           text NULL;
-ALTER TABLE overlay_evidence ADD COLUMN IF NOT EXISTS evidence_spans              jsonb NOT NULL DEFAULT '[]';
-```
-
-- [ ] **Step 3b: Extend `evidence.py`** — add the enums, the dataclass fields, and the `write_evidence`/`read_evidence` params:
-
-```python
-from enum import StrEnum
-
-class EvidenceProducer(StrEnum):
-    SOURCE = "source"; STRUCTURAL_CONNECTOR = "structural_connector"; PARSER = "parser"
-    LLM = "llm"; PROFILER = "profiler"; TAXONOMY = "taxonomy"; HUMAN = "human"
-
-class AssertionStrength(StrEnum):
-    PROPOSED = "proposed"; SUPPORTED = "supported"; ATTESTED = "attested"; CONFIRMED = "confirmed"
-```
-
-Add to `Evidence` (frozen dataclass): `producer: str`, `strength: str`, `producer_configuration_hash: str | None`, `producer_item_ref: str | None`, `evidence_spans: list`. Extend `write_evidence(...)` with keyword-only `producer: EvidenceProducer = EvidenceProducer.PROFILER, strength: AssertionStrength = AssertionStrength.SUPPORTED, producer_configuration_hash: str | None = None, producer_item_ref: str | None = None, evidence_spans: tuple[str, ...] = ()` and include them in the INSERT (spans via `Jsonb(list(evidence_spans))`). Extend `read_evidence` to select/return them. Keep the defaults so existing callers (the profiler) are unchanged.
-
-- [ ] **Step 4: Run test → PASS.**
-- [ ] **Step 5: Commit** `feat(overlay): assertion-strength axis on evidence (spec §3.1)`.
-
----
-
-## Task 2: Object identity status + no-attach guard
-
-**Files:** Create `src/featuregen/overlay/object_identity.py`; Test `tests/featuregen/overlay/test_object_identity.py`.
-
-**Interfaces:** Consumes `CatalogAdapter` (`overlay/catalog.py`), `CatalogObjectRef` (`overlay/identity.py`). Produces `ObjectIdentityStatus`, `ObjectBinding`, `resolve_object_identity`, `may_attach`.
-
-- [ ] **Step 1: Failing test**
-
-```python
-# tests/featuregen/overlay/test_object_identity.py
-from featuregen.overlay.identity import CatalogObjectRef
-from featuregen.overlay.object_identity import (
-    ObjectIdentityStatus, may_attach, resolve_object_identity)
-
-
-class _FakeAdapter:
-    def __init__(self, by_name): self._by_name = by_name   # display -> [native_id,...]
-    def native_ids_for(self, ref): return self._by_name.get((ref.schema, ref.table, ref.column), [])
-
-
-def _ref(c): return CatalogObjectRef("s", "column", "public", "accounts", c)
-
-
-def test_exact_single_match_may_attach():
-    b = resolve_object_identity(_FakeAdapter({("public","accounts","balance"): ["oid:1"]}), _ref("balance"))
-    assert b.status == ObjectIdentityStatus.EXACT and may_attach(b)
-
-
-def test_ambiguous_multi_match_blocks_attach():
-    b = resolve_object_identity(_FakeAdapter({("public","accounts","amt"): ["oid:1","oid:2"]}), _ref("amt"))
-    assert b.status == ObjectIdentityStatus.AMBIGUOUS and not may_attach(b)
-
-
-def test_unresolved_no_match_blocks_attach():
-    b = resolve_object_identity(_FakeAdapter({}), _ref("ghost"))
-    assert b.status == ObjectIdentityStatus.UNRESOLVED and not may_attach(b)
-```
-
-- [ ] **Step 2: Run → FAIL** (module missing).
-
-- [ ] **Step 3: Implement** `object_identity.py`:
-
-```python
-"""Spec §2: resolve a provider's native ref to a stable logical object, with an explicit status.
-Evidence/proposals must NOT attach when identity is AMBIGUOUS/UNRESOLVED (else evidence from unrelated
-physical objects merges). Wraps the existing CatalogAdapter's native-id lookup — it does NOT replace
-identity.py's fact_key/ref model."""
-from __future__ import annotations
-from dataclasses import dataclass
-from enum import StrEnum
-from featuregen.overlay.identity import CatalogObjectRef
-
-class ObjectIdentityStatus(StrEnum):
-    EXACT = "exact"; ALIASED = "aliased"; AMBIGUOUS = "ambiguous"; UNRESOLVED = "unresolved"
-
-@dataclass(frozen=True, slots=True)
-class ObjectBinding:
-    logical_ref: CatalogObjectRef | None
-    status: ObjectIdentityStatus
-    candidates: tuple[str, ...]
-
-def resolve_object_identity(adapter, ref: CatalogObjectRef) -> ObjectBinding:
-    native = tuple(adapter.native_ids_for(ref))
-    if len(native) == 1:
-        return ObjectBinding(ref, ObjectIdentityStatus.EXACT, native)
-    if len(native) == 0:
-        return ObjectBinding(None, ObjectIdentityStatus.UNRESOLVED, ())
-    return ObjectBinding(None, ObjectIdentityStatus.AMBIGUOUS, native)
-
-def may_attach(binding: ObjectBinding) -> bool:
-    return binding.status in (ObjectIdentityStatus.EXACT, ObjectIdentityStatus.ALIASED)
-```
-
-(NOTE for the implementer: verify `CatalogAdapter`'s real method name for native-id lookup in `overlay/catalog.py` — the fake uses `native_ids_for`; if the real adapter exposes a different lookup (e.g. `owner_of`/`resolve`), adapt `resolve_object_identity` to the real method and update the fake to match. `ALIASED` is produced later when a confirmed rename mapping exists — leave the branch documented but exercised only by a mapping fixture.)
-
-- [ ] **Step 4: Run → PASS.**
-- [ ] **Step 5: Commit** `feat(overlay): object identity status + no-attach-when-ambiguous (spec §2)`.
-
----
-
-## Task 3: Authority predicate tree + evaluator (pure)
-
-**Files:** Create `src/featuregen/overlay/field_authority.py` (predicate half); Test `tests/featuregen/overlay/test_field_authority.py`.
-
-**Interfaces:** Produces `AuthorityPredicate`, `HasEvidence`, `AnyOf`, `AllOf`, `evaluate`.
-
-- [ ] **Step 1: Failing test**
-
-```python
-# tests/featuregen/overlay/test_field_authority.py
-from featuregen.overlay.evidence import AssertionStrength as S, EvidenceProducer as P
-from featuregen.overlay.field_authority import AllOf, AnyOf, HasEvidence, evaluate
-
-STRUCT_ATTESTED = HasEvidence(P.STRUCTURAL_CONNECTOR, S.ATTESTED)
-HUMAN_CONFIRMED = HasEvidence(P.HUMAN, S.CONFIRMED)
-
-
-def test_any_of_satisfied_by_one():
-    active = frozenset({(P.HUMAN, S.CONFIRMED)})
-    assert evaluate(AnyOf((STRUCT_ATTESTED, HUMAN_CONFIRMED)), active)
-
-
-def test_all_of_requires_every_condition():
-    grain_review = AllOf((HasEvidence(P.LLM, S.PROPOSED), HasEvidence(P.PROFILER, S.SUPPORTED)))
-    assert not evaluate(grain_review, frozenset({(P.LLM, S.PROPOSED)}))
-    assert evaluate(grain_review, frozenset({(P.LLM, S.PROPOSED), (P.PROFILER, S.SUPPORTED)}))
-
-
-def test_llm_proposed_never_satisfies_structural_rule():
-    assert not evaluate(AnyOf((STRUCT_ATTESTED, HUMAN_CONFIRMED)), frozenset({(P.LLM, S.PROPOSED)}))
+def test_legacy_write_defaults(db):
+    ev = read_evidence(db, write_evidence(
+        db, fact_key="fk2", table_snapshot_at=None, row_count=1, sample_size=1, profile_version="p1",
+        thresholds_used={}, metric_values={}, created_by={}))
+    assert ev.producer == "profiler" and ev.strength == "supported" and ev.lifecycle == "active"
 ```
 
 - [ ] **Step 2: Run → FAIL.**
-
-- [ ] **Step 3: Implement** the predicate half of `field_authority.py`:
-
-```python
-"""Spec §4.1: the authority predicate language over (producer, strength). Pure — evaluated against the
-set of ACTIVE evidence (producer, strength) pairs for a (logical_ref, field). This is the WHAT-authority
-layer; it does NOT replace authority.py's WHO-confirms resolution."""
-from __future__ import annotations
-from dataclasses import dataclass
-from featuregen.overlay.evidence import AssertionStrength, EvidenceProducer
-
-class AuthorityPredicate: ...
-
-@dataclass(frozen=True, slots=True)
-class HasEvidence(AuthorityPredicate):
-    producer: EvidenceProducer; strength: AssertionStrength
-
-@dataclass(frozen=True, slots=True)
-class AnyOf(AuthorityPredicate):
-    conditions: tuple[AuthorityPredicate, ...]
-
-@dataclass(frozen=True, slots=True)
-class AllOf(AuthorityPredicate):
-    conditions: tuple[AuthorityPredicate, ...]
-
-def evaluate(pred: AuthorityPredicate, active: frozenset[tuple[EvidenceProducer, AssertionStrength]]) -> bool:
-    if isinstance(pred, HasEvidence):
-        return (pred.producer, pred.strength) in active
-    if isinstance(pred, AnyOf):
-        return any(evaluate(c, active) for c in pred.conditions)
-    if isinstance(pred, AllOf):
-        return all(evaluate(c, active) for c in pred.conditions)
-    raise TypeError(f"unknown predicate {type(pred).__name__}")
-```
-
-- [ ] **Step 4: Run → PASS.**
-- [ ] **Step 5: Commit** `feat(overlay): field authority predicate tree + evaluator (spec §4.1)`.
+- [ ] **Step 3a: Migration** `0978_evidence_axes.sql` — `ALTER TABLE overlay_evidence ADD COLUMN IF NOT EXISTS` for `producer text NOT NULL DEFAULT 'profiler'`, `strength text NOT NULL DEFAULT 'supported'`, `lifecycle text NOT NULL DEFAULT 'active'`, `producer_configuration_hash text NULL`, `producer_item_ref text NULL`, `evidence_spans jsonb NOT NULL DEFAULT '[]'`.
+- [ ] **Step 3b:** Add the three enums (incl. `EvidenceLifecycle`, and `LEGACY` on producer). Extend `Evidence` with `producer/strength/lifecycle/producer_configuration_hash/producer_item_ref/evidence_spans` (spans typed `tuple[str, ...]` — convert the JSON list to a tuple in `read_evidence`). Extend `write_evidence` with the keyword-only params (defaults per Step 0) and INSERT them (`Jsonb(list(evidence_spans))`).
+- [ ] **Step 4: Run → PASS.**  **Step 5: Commit** `feat(overlay): evidence producer/strength/lifecycle axes (spec §3.1)`.
 
 ---
 
-## Task 4: FieldPolicy + disqualifiers + two-output resolution (pure)
+## Task 2: Object identity — logical/provider wrappers + status + no-attach guard
 
-**Files:** Modify `src/featuregen/overlay/field_authority.py`; Test append to `test_field_authority.py`.
+**Files:** Create `overlay/object_identity.py`; Test `tests/featuregen/overlay/test_object_identity.py`.
 
-**Interfaces:** Consumes Task 3 `evaluate`. Produces `Disqualifier`, `InfluenceTier`, `ResolutionMode`, `FieldPolicy`, `FieldResolution`, `resolve_field_authority`.
+**Framing (honest):** This is a **compatibility layer** over the existing `CatalogObjectRef`/`CatalogAdapter`, introducing the spec's Layer-0 wrappers so later phases have the identity seam. It does NOT yet implement full alias/rename-mapping resolution — that is a documented follow-up.
 
-- [ ] **Step 1: Failing test**
-
-```python
-# append to test_field_authority.py
-from featuregen.overlay.field_authority import (
-    Disqualifier, FieldPolicy, InfluenceTier, ResolutionMode, resolve_field_authority)
-
-_POLICY = FieldPolicy(
-    influence_max=InfluenceTier.OPERATIONAL,
-    display_rule=HasEvidence(P.LLM, S.PROPOSED),
-    operational_rule=AnyOf((HasEvidence(P.HUMAN, S.CONFIRMED),)),
-    disqualifiers=(Disqualifier.AMBIGUOUS_OBJECT_IDENTITY, Disqualifier.STALE_SELECTED_EVIDENCE),
-    resolution_mode=ResolutionMode.GENERIC_FIELD)
-
-
-def test_display_shows_proposal_but_operational_unresolved():
-    ev = [("llm", "proposed", "monetary_flow", "e1")]
-    r = resolve_field_authority(ev, _POLICY, active_disqualifiers=frozenset())
-    assert r.display_value == "monetary_flow" and r.load_bearing_value is None
-    assert r.unresolved_reason == "authority_insufficient"
-
-
-def test_human_confirmed_becomes_load_bearing():
-    ev = [("llm","proposed","monetary_flow","e1"), ("human","confirmed","monetary_flow","e2")]
-    r = resolve_field_authority(ev, _POLICY, active_disqualifiers=frozenset())
-    assert r.load_bearing_value == "monetary_flow"
-
-
-def test_disqualifier_blocks_even_when_rule_satisfied():
-    ev = [("human","confirmed","monetary_flow","e2")]
-    r = resolve_field_authority(ev, _POLICY, active_disqualifiers=frozenset({Disqualifier.STALE_SELECTED_EVIDENCE}))
-    assert r.load_bearing_value is None and r.unresolved_reason == "disqualified:stale_selected_evidence"
-```
-
-- [ ] **Step 2: Run → FAIL.**
-
-- [ ] **Step 3: Implement** — append to `field_authority.py`:
+- [ ] **Step 1: Failing test** (as v1, plus:)
 
 ```python
-from enum import StrEnum
-
-class InfluenceTier(StrEnum):
-    DISPLAY = "display"; RECOMMENDATION = "recommendation"; OPERATIONAL = "operational"
-
-class ResolutionMode(StrEnum):
-    GENERIC_FIELD = "generic_field"; SPECIALIZED_FACT = "specialized_fact"
-
-class Disqualifier(StrEnum):
-    STALE_SELECTED_EVIDENCE = "stale_selected_evidence"
-    ACTIVE_HIGH_SEVERITY_CONFLICT = "active_high_severity_conflict"
-    AMBIGUOUS_OBJECT_IDENTITY = "ambiguous_object_identity"
-    MISSING_REQUIRED_SNAPSHOT = "missing_required_snapshot"
-    CONFIRMATION_PENDING_REVALIDATION = "confirmation_pending_revalidation"
-
-@dataclass(frozen=True, slots=True)
-class FieldPolicy:
-    influence_max: InfluenceTier
-    display_rule: AuthorityPredicate
-    operational_rule: AuthorityPredicate | None
-    disqualifiers: tuple[Disqualifier, ...]
-    resolution_mode: ResolutionMode
-
-@dataclass(frozen=True, slots=True)
-class FieldResolution:
-    display_value: object | None
-    load_bearing_value: object | None
-    unresolved_reason: str | None
-
-def _strongest(evidence: list[tuple[str, str, object, str]]) -> object | None:
-    # evidence rows: (producer, strength, value, evidence_id); pick the value of the highest-strength row
-    order = {"proposed": 0, "supported": 1, "attested": 2, "confirmed": 3}
-    active = [e for e in evidence if e[1] in order]
-    return max(active, key=lambda e: order[e[1]])[2] if active else None
-
-def resolve_field_authority(evidence, policy: FieldPolicy,
-                            active_disqualifiers: frozenset[Disqualifier]) -> FieldResolution:
-    active_pairs = frozenset((e[0], e[1]) for e in evidence)
-    display = _strongest(evidence) if evaluate(policy.display_rule, active_pairs) else None
-    fired = active_disqualifiers & set(policy.disqualifiers)
-    if fired:
-        return FieldResolution(display, None, f"disqualified:{sorted(fired)[0]}")
-    if policy.operational_rule is not None and evaluate(policy.operational_rule, active_pairs):
-        return FieldResolution(display, _strongest(evidence), None)
-    return FieldResolution(display, None, "authority_insufficient")
+def test_logical_and_provider_wrappers_roundtrip():
+    from featuregen.overlay.object_identity import LogicalObjectRef, ProviderObjectRef
+    lr = LogicalObjectRef("cat1", "public", "accounts", "balance")
+    pr = ProviderObjectRef("ftr_glossary", "snap1", "public.accounts.balance")
+    assert lr.column == "balance" and pr.provider_id == "ftr_glossary"
 ```
 
-(NOTE: `resolve_field_authority` is the GENERIC_FIELD resolver. For `resolution_mode == SPECIALIZED_FACT`, load-bearing value comes exclusively from the specialized fact projection (`resolve_fact`), and this function returns only the display candidate — the specialized-fact wiring is Phase 2; here just honor the mode by never emitting a load-bearing value for it. Add a test asserting a SPECIALIZED_FACT policy yields `load_bearing_value is None` regardless of evidence.)
-
-- [ ] **Step 4: Run → PASS.**
-- [ ] **Step 5: Commit** `feat(overlay): FieldPolicy + disqualifiers + two-output field resolution (spec §4.2-4.4)`.
+- [ ] **Step 3: Implement** — add `LogicalObjectRef` + `ProviderObjectRef` frozen dataclasses; `ObjectIdentityStatus`; `ObjectBinding(logical_ref: LogicalObjectRef | None, status, candidates)`; `resolve_object_identity(adapter, ref) -> ObjectBinding` (1 native id → EXACT with a LogicalObjectRef built from the ref; 0 → UNRESOLVED; >1 → AMBIGUOUS); `may_attach`. **VERIFY** the adapter's real native-id method in `overlay/catalog.py` before finalizing (the fake uses `native_ids_for`). Document that `ALIASED` + rename-mapping resolution is a follow-up (not built here).
+- [ ] **Steps 2/4/5** as standard. Commit `feat(overlay): object identity status + logical/provider wrappers (spec §2)`.
 
 ---
 
-## Task 5: Safety-override authority + sensitivity floor
+## Task 3: Authority predicate tree + evaluator (empty-safe)
 
-**Files:** Create `src/featuregen/overlay/safety_floor.py`; Migration `0979_safety_override.sql`; Test `tests/featuregen/overlay/test_safety_floor.py`.
+**Files:** Create `overlay/field_authority.py` (predicate half); Test `tests/featuregen/overlay/test_field_authority.py`.
 
-**Interfaces:** Produces `GovernanceAuthority`, `SENSITIVITY_ORDER`, `SafetyOverride`, `apply_sensitivity_floor`, `record_safety_override`/`read_safety_override`.
-
-- [ ] **Step 1: Failing test**
+- [ ] **Step 1: Failing test** (v1 tests, plus:)
 
 ```python
-# tests/featuregen/overlay/test_safety_floor.py
 import pytest
+from featuregen.overlay.field_authority import AllOf, AnyOf
+
+def test_empty_predicates_are_rejected():
+    with pytest.raises(ValueError): AllOf(())    # all([]) == True would authorize everything
+    with pytest.raises(ValueError): AnyOf(())
+```
+
+- [ ] **Step 3: Implement** `HasEvidence/AnyOf/AllOf` + `evaluate` as v1, but `AnyOf`/`AllOf` raise `ValueError` in `__post_init__` when `conditions` is empty.
+- [ ] Standard steps. Commit `feat(overlay): authority predicate tree + evaluator, empty-safe (spec §4.1)`.
+
+---
+
+## Task 4: Field authority resolver — typed, field-specific, influence-enforced
+
+**Files:** Modify `overlay/field_authority.py`; Test append.
+
+**This is the load-bearing task.** It must NOT pick by global strength.
+
+- [ ] **Step 1: Failing test**
+
+```python
+from featuregen.overlay.evidence import AssertionStrength as S, EvidenceProducer as P
+from featuregen.overlay.field_authority import (
+    AnyOf, ConflictStrategy, Disqualifier, FieldEvidenceView, FieldPolicy, HasEvidence,
+    InfluenceTier, ResolutionMode, resolve_field_authority)
+
+def _pol(**kw):
+    base = dict(influence_max=InfluenceTier.OPERATIONAL, display_rule=HasEvidence(P.LLM, S.PROPOSED),
+                operational_rule=AnyOf((HasEvidence(P.HUMAN, S.CONFIRMED),)),
+                disqualifiers=(Disqualifier.STALE_SELECTED_EVIDENCE,),
+                resolution_mode=ResolutionMode.GENERIC_FIELD,
+                conflict_strategy=ConflictStrategy.PREFER_CONFIRMED)
+    base.update(kw); return FieldPolicy(**base)
+
+def _ev(p, s, v): return FieldEvidenceView(p, s, v, f"e-{v}")
+
+def test_display_proposal_operational_unresolved():
+    r = resolve_field_authority([_ev(P.LLM, S.PROPOSED, "monetary_flow")], _pol(), frozenset())
+    assert r.display_value == "monetary_flow" and r.load_bearing_value is None
+
+def test_prefer_confirmed_selects_confirmed_value_not_highest_only():
+    ev = [_ev(P.LLM, S.PROPOSED, "monetary_flow"), _ev(P.HUMAN, S.CONFIRMED, "monetary_stock")]
+    r = resolve_field_authority(ev, _pol(), frozenset())
+    assert r.load_bearing_value == "monetary_stock"        # confirmed value, chosen by strategy
+
+def test_unresolved_on_conflict_blocks_when_values_disagree():
+    pol = _pol(conflict_strategy=ConflictStrategy.UNRESOLVED_ON_CONFLICT,
+               operational_rule=AnyOf((HasEvidence(P.STRUCTURAL_CONNECTOR, S.ATTESTED),
+                                       HasEvidence(P.HUMAN, S.CONFIRMED))))
+    ev = [_ev(P.HUMAN, S.CONFIRMED, "account"), _ev(P.STRUCTURAL_CONNECTOR, S.ATTESTED, "transaction")]
+    r = resolve_field_authority(ev, pol, frozenset())
+    assert r.load_bearing_value is None and r.unresolved_reason == "conflict"
+
+def test_influence_max_below_operational_never_load_bearing():
+    r = resolve_field_authority([_ev(P.HUMAN, S.CONFIRMED, "x")],
+                                _pol(influence_max=InfluenceTier.RECOMMENDATION), frozenset())
+    assert r.load_bearing_value is None and r.unresolved_reason == "influence_not_operational"
+
+def test_disqualifier_blocks_even_when_satisfied():
+    r = resolve_field_authority([_ev(P.HUMAN, S.CONFIRMED, "x")], _pol(),
+                                frozenset({Disqualifier.STALE_SELECTED_EVIDENCE}))
+    assert r.load_bearing_value is None and r.unresolved_reason.startswith("disqualified:")
+
+def test_specialized_fact_mode_never_load_bearing():
+    r = resolve_field_authority([_ev(P.HUMAN, S.CONFIRMED, "grain")],
+                                _pol(resolution_mode=ResolutionMode.SPECIALIZED_FACT), frozenset())
+    assert r.load_bearing_value is None and r.unresolved_reason == "specialized_fact"
+```
+
+- [ ] **Step 3: Implement** — the resolver docstring MUST state: *evidence passed here is already lifecycle-filtered to ACTIVE; stale/rejected/superseded excluded or supplied as disqualifiers.* Logic order:
+  1. `active_pairs = frozenset((e.producer, e.strength) for e in evidence)`.
+  2. `display = _select(evidence, ConflictStrategy.PREFER_CONFIRMED)` if `evaluate(display_rule, active_pairs)` else None. (Display always uses a lenient strategy.)
+  3. If `resolution_mode == SPECIALIZED_FACT`: return `FieldResolution(display, None, "specialized_fact")` (operational truth comes from the specialized fact projection, not here).
+  4. If `influence_max != OPERATIONAL`: return `FieldResolution(display, None, "influence_not_operational")`.
+  5. `fired = active_disqualifiers & set(policy.disqualifiers)`; if fired → `FieldResolution(display, None, f"disqualified:{sorted(fired)[0]}")`.
+  6. If `operational_rule` is None or not `evaluate(...)` → `FieldResolution(display, None, "authority_insufficient")`.
+  7. Otherwise `lb = _select(evidence, policy.conflict_strategy)`; if `lb is _CONFLICT` → `FieldResolution(display, None, "conflict")`; else `FieldResolution(display, lb, None)`.
+
+  `_select(evidence, strategy)` implements the field-specific merge:
+  - `PREFER_CONFIRMED`: among values, prefer the one backed by the highest strength (confirmed > attested > supported > proposed); ties on distinct values → treat as conflict.
+  - `MOST_RESTRICTIVE`: for ordered fields (sensitivity) return the max by the field's severity order (the caller supplies the order; for Phase 0 accept an optional `severity_order` on the policy or delegate to `safety_floor`).
+  - `UNION_CLASSES`: return the sorted union of all values (multi-valued fields like sensitivity_classes).
+  - `UNRESOLVED_ON_CONFLICT`: if all active values are equal → that value; else the sentinel `_CONFLICT`.
+
+- [ ] Standard steps. Commit `feat(overlay): field-specific authority resolver (typed, conflict-strategy, influence-enforced) (spec §4.2-4.4, §6.2)`.
+
+---
+
+## Task 5: Safety-override authority + sensitivity floor (validated)
+
+**Files:** Create `overlay/safety_floor.py`; Migration `0979_safety_override.sql`; Test `tests/featuregen/overlay/test_safety_floor.py`.
+
+- [ ] **Step 1: Failing test**
+
+```python
+import pytest
+from datetime import UTC, datetime
 from featuregen.overlay.safety_floor import (
     GovernanceAuthority, SafetyOverride, apply_sensitivity_floor)
 
-
-def _ovr(val): return SafetyOverride(
-    field="sensitivity", previous_floor="restricted", override_value=val,
-    approved_by_authority=GovernanceAuthority.PRIVACY, rationale="tokenized", policy_reference="POL-1",
-    effective_until=None)
-
+def _ovr(val, auth=GovernanceAuthority.PRIVACY, until=None):
+    return SafetyOverride(fact_key="fk", field="sensitivity", previous_floor="restricted",
+        override_value=val, approved_by_authority=auth, rationale="tokenized",
+        policy_reference="POL-1", effective_from=None, effective_until=until)
 
 def test_floor_holds_and_evidence_can_only_raise():
-    # taxonomy floor restricted; an LLM/source proposal of a LOWER level cannot lower it
-    assert apply_sensitivity_floor("restricted", ["public", "internal"], override=None) == "restricted"
-    # a HIGHER proposal raises it
-    assert apply_sensitivity_floor("internal", ["restricted"], override=None) == "restricted"
+    assert apply_sensitivity_floor("restricted", ["public", "internal"]) == "restricted"
+    assert apply_sensitivity_floor("internal", ["restricted"]) == "restricted"
 
+def test_unknown_sensitivity_is_prohibited_not_persisted_verbatim():
+    assert apply_sensitivity_floor("internal", ["top_secret"]) == "prohibited"
 
-def test_below_floor_downgrade_requires_a_governed_override():
+def test_below_floor_downgrade_requires_permitted_authority():
     with pytest.raises(PermissionError):
-        # no override -> cannot go below floor even if a proposal says public
         apply_sensitivity_floor("restricted", ["public"], override=None, force_to="public")
-    # with a governed override, the downgrade is permitted and audited by the caller
-    assert apply_sensitivity_floor("restricted", ["public"], override=_ovr("internal"), force_to="internal") == "internal"
+    with pytest.raises(PermissionError):  # DATA_OWNER not permitted to downgrade
+        apply_sensitivity_floor("restricted", ["public"],
+                                override=_ovr("internal", GovernanceAuthority.DATA_OWNER), force_to="internal")
+    assert apply_sensitivity_floor("restricted", ["public"], override=_ovr("internal"),
+                                   force_to="internal") == "internal"
+
+def test_expired_override_is_rejected():
+    past = datetime(2020, 1, 1, tzinfo=UTC)
+    with pytest.raises(PermissionError):
+        apply_sensitivity_floor("restricted", ["public"], override=_ovr("internal", until=past),
+                                force_to="internal", now=datetime(2026, 7, 11, tzinfo=UTC))
 ```
 
-- [ ] **Step 2: Run → FAIL.**
-
-- [ ] **Step 3a: Migration** `0979_safety_override.sql`:
-
-```sql
--- Spec §7: a governed below-floor sensitivity downgrade. Append-only, write-once — a downgrade is a
--- deliberate governance act requiring a specific authority + rationale + scope, never a generic confirm.
-CREATE TABLE IF NOT EXISTS safety_override (
-    override_id           text        PRIMARY KEY,
-    fact_key              text        NOT NULL,
-    field                 text        NOT NULL,
-    previous_floor        text        NOT NULL,
-    override_value        text        NOT NULL,
-    approved_by_authority text        NOT NULL,   -- data_owner|security|privacy|model_risk
-    rationale             text        NOT NULL,
-    policy_reference      text        NOT NULL,
-    effective_until       timestamptz NULL,
-    created_by            jsonb       NOT NULL,
-    created_at            timestamptz NOT NULL DEFAULT now()
-);
-```
-
-- [ ] **Step 3b: Implement** `safety_floor.py`:
-
-```python
-"""Spec §7: sensitivity is a most-restrictive floor. Evidence may only RAISE it; a below-floor
-downgrade requires a governed SafetyOverride (authority + rationale + scope). Distinct from the existing
-compliance-gated policy_tag (a free-text basis) — this is a structured, authority-scoped downgrade."""
-from __future__ import annotations
-from dataclasses import dataclass
-from datetime import datetime
-from enum import StrEnum
-
-SENSITIVITY_ORDER: tuple[str, ...] = ("public", "internal", "confidential", "restricted", "prohibited")
-
-class GovernanceAuthority(StrEnum):
-    DATA_OWNER = "data_owner"; SECURITY = "security"; PRIVACY = "privacy"; MODEL_RISK = "model_risk"
-
-@dataclass(frozen=True, slots=True)
-class SafetyOverride:
-    field: str; previous_floor: str; override_value: str
-    approved_by_authority: GovernanceAuthority; rationale: str; policy_reference: str
-    effective_until: datetime | None
-
-def _rank(v: str) -> int:
-    try: return SENSITIVITY_ORDER.index(v)
-    except ValueError: return len(SENSITIVITY_ORDER)  # unknown -> most restrictive (fail closed)
-
-def apply_sensitivity_floor(floor: str, proposals: list[str], *, override: SafetyOverride | None = None,
-                            force_to: str | None = None) -> str:
-    effective = max([floor, *proposals], key=_rank)          # evidence can only RAISE
-    if force_to is None or _rank(force_to) >= _rank(effective):
-        return effective
-    # force_to is BELOW the effective floor -> only a governed override permits it
-    if override is None or _rank(override.override_value) != _rank(force_to):
-        raise PermissionError(f"below-floor downgrade to {force_to!r} requires a SafetyOverride")
-    return force_to
-```
-
-Add `record_safety_override(conn, *, fact_key, override, created_by) -> str` (mint `sfo_` id, INSERT) and `read_safety_override(conn, override_id)`. Add a DB test for the round-trip.
-
-- [ ] **Step 4: Run → PASS.**
-- [ ] **Step 5: Commit** `feat(overlay): safety-override authority + sensitivity floor (spec §7)`.
+- [ ] **Step 3:** `SENSITIVITY_ORDER`; `GovernanceAuthority`; `DOWNGRADE_AUTHORITIES = frozenset({PRIVACY, SECURITY})`; `SafetyOverride` (with `fact_key`, `effective_from/until`); `apply_sensitivity_floor(floor, proposals, *, override=None, force_to=None, now=None)` that: normalizes unknown values → `prohibited`; raises floor by evidence; on a below-floor `force_to`, requires an override whose `field=="sensitivity"`, `previous_floor==floor`, `override_value==force_to`, `approved_by_authority in DOWNGRADE_AUTHORITIES`, and is currently effective (`now` within `[effective_from, effective_until]`). Add `record_safety_override`/`read_safety_override` + a DB round-trip test. Migration `0979` = the `safety_override` table (write-once).
+- [ ] Standard steps. Commit `feat(overlay): safety-override authority + validated sensitivity floor (spec §7)`.
 
 ---
 
-## Task 6: Conflict-review lifecycle
+## Task 6: Conflict-review lifecycle + audit history
 
-**Files:** Create `src/featuregen/overlay/conflict_review.py`; Migration `0980_conflict_review.sql`; Test `tests/featuregen/overlay/test_conflict_review.py`.
+**Files:** Create `overlay/conflict_review.py`; Migration `0980_conflict_review.sql`; Test `tests/featuregen/overlay/test_conflict_review.py`.
 
-**Interfaces:** Produces `conflict_fingerprint`, `ConflictState`, `open_or_reopen_conflict`, `transition_conflict`, `read_conflict`.
-
-- [ ] **Step 1: Failing test**
+- [ ] **Step 1: Failing test** (v1 idempotency + reopen tests, plus:)
 
 ```python
-# tests/featuregen/overlay/test_conflict_review.py
-from featuregen.overlay.conflict_review import (
-    ConflictState, conflict_fingerprint, open_or_reopen_conflict, read_conflict, transition_conflict)
-
-
-def _fp(): return conflict_fingerprint("public.accounts.balance", "sensitivity",
-                                       ("hash_public", "hash_restricted"), "policy-v1")
-
-
-def test_open_is_idempotent_on_fingerprint(db):
-    a = open_or_reopen_conflict(db, fingerprint=_fp(), logical_ref="public.accounts.balance",
-                                field_name="sensitivity", severity="high", competing_evidence_ids=("e1","e2"))
-    b = open_or_reopen_conflict(db, fingerprint=_fp(), logical_ref="public.accounts.balance",
-                                field_name="sensitivity", severity="high", competing_evidence_ids=("e1","e2"))
-    assert a == b                                   # same fingerprint -> same conflict, not a duplicate
-    assert read_conflict(db, a).state == ConflictState.OPEN
-
-
-def test_resolved_then_same_fingerprint_reopens(db):
-    cid = open_or_reopen_conflict(db, fingerprint=_fp(), logical_ref="r", field_name="sensitivity",
-                                  severity="high", competing_evidence_ids=("e1",))
-    transition_conflict(db, cid, ConflictState.RESOLVED, actor="u")
-    again = open_or_reopen_conflict(db, fingerprint=_fp(), logical_ref="r", field_name="sensitivity",
-                                    severity="high", competing_evidence_ids=("e1",))
-    assert again == cid and read_conflict(db, cid).state == ConflictState.REOPENED
+def test_transitions_are_recorded_in_history(db):
+    from featuregen.overlay.conflict_review import (
+        ConflictState, conflict_events, open_or_reopen_conflict, transition_conflict)
+    cid = open_or_reopen_conflict(db, fingerprint="fp", logical_ref="r", field_name="sensitivity",
+        severity="high", competing_evidence_ids=("e1",), competing_value_hashes=("h1","h2"))
+    transition_conflict(db, cid, ConflictState.ACKNOWLEDGED, actor="alice", reason="reviewing")
+    transition_conflict(db, cid, ConflictState.RESOLVED, actor="bob", reason="tokenized")
+    hist = conflict_events(db, cid)
+    assert [(h.to_state, h.actor) for h in hist][-2:] == [("acknowledged","alice"),("resolved","bob")]
 ```
 
-- [ ] **Step 2: Run → FAIL.**
-
-- [ ] **Step 3a: Migration** `0980_conflict_review.sql`:
+- [ ] **Step 3a: Migration** `0980_conflict_review.sql` — the `conflict_review` table (as v1) **plus `competing_value_hashes jsonb NOT NULL DEFAULT '[]'`**, and a child audit table:
 
 ```sql
--- Spec §10: a conflict record with a STABLE fingerprint so a re-upload updates/reopens rather than
--- duplicating. Distinct from quarantine (validation rows) and STALE/REVERIFY (per-fact re-verify).
-CREATE TABLE IF NOT EXISTS conflict_review (
-    conflict_id           text        PRIMARY KEY,
-    fingerprint           text        NOT NULL UNIQUE,      -- reopen key
-    logical_ref           text        NOT NULL,
-    field_name            text        NOT NULL,
-    severity              text        NOT NULL,
-    competing_evidence_ids jsonb      NOT NULL DEFAULT '[]',
-    state                 text        NOT NULL,             -- open|acknowledged|resolved|dismissed|stale|reopened
-    owner                 text        NULL,
-    created_at            timestamptz NOT NULL DEFAULT now(),
-    updated_at            timestamptz NOT NULL DEFAULT now()
+CREATE TABLE IF NOT EXISTS conflict_review_event (
+    event_id     text        PRIMARY KEY,
+    conflict_id  text        NOT NULL REFERENCES conflict_review(conflict_id),
+    from_state   text        NULL,
+    to_state     text        NOT NULL,
+    actor        text        NOT NULL,
+    reason       text        NULL,
+    created_at   timestamptz NOT NULL DEFAULT now()
 );
 ```
 
-- [ ] **Step 3b: Implement** `conflict_review.py`: `conflict_fingerprint(...)` = `sha256(json([logical_ref, field_name, sorted(competing_value_hashes), field_policy_version]))`; `ConflictState(StrEnum)`; `open_or_reopen_conflict` = `INSERT ... ON CONFLICT (fingerprint) DO UPDATE SET state = CASE WHEN conflict_review.state IN ('resolved','dismissed','stale') THEN 'reopened' ELSE conflict_review.state END, updated_at = now() RETURNING conflict_id` (mint `cfl_` id on first insert; on conflict return the existing id — use `ON CONFLICT ... DO UPDATE ... RETURNING conflict_id` which returns the row's id either way; the minted id is only used on a true insert); `transition_conflict(conn, conflict_id, new_state, *, actor)`; `read_conflict`. Provide a `now` seam consistent with the codebase (do not call `datetime.now` inline in a way tests can't control — accept an optional `now`, matching the overlay modules' pattern).
-
-- [ ] **Step 4: Run → PASS.**
-- [ ] **Step 5: Commit** `feat(overlay): conflict-review lifecycle with stable fingerprint (spec §10)`.
+- [ ] **Step 3b:** `conflict_fingerprint(...)` (over value hashes + policy version); `open_or_reopen_conflict(... , competing_value_hashes)` writing the value hashes and emitting an initial `conflict_review_event` (to_state OPEN/REOPENED); `transition_conflict(conn, cid, new_state, *, actor, reason=None, now=None)` updating `conflict_review.state` AND appending a `conflict_review_event`; `conflict_events(conn, cid)`; `read_conflict`.
+- [ ] Standard steps. Commit `feat(overlay): conflict-review lifecycle with audit history + value-hash fingerprint (spec §10)`.
 
 ---
 
-## Task 7: Governed `joins_to` seam (declared join → approved_join proposal), flag-gated
+## Task 7: Governed `joins_to` seam — parser + display-only edge + ingestion tests
 
-**Files:** Modify `src/featuregen/overlay/upload/ingest.py`, `src/featuregen/overlay/upload/graph.py`; Test `tests/featuregen/overlay/upload/test_governed_joins.py`.
+**Files:** Modify `overlay/upload/graph.py`, `overlay/upload/ingest.py`; Migration `0982_graph_edge_authority.sql`; Test `tests/featuregen/overlay/upload/test_governed_joins.py`.
 
-**Interfaces:** Consumes `ApprovedJoinRef`/`ColumnPair`/`CatalogObjectRef` (`identity.py`), `join_write_error`, `propose_fact` (`proposal_commands.py`), the `approved_join` fact schema (`facts.py`). Produces `governed_join_proposal(row) -> ApprovedJoinRef | None` + a flag `OVERLAY_GOVERNED_JOINS`.
-
-**Interfaces (consumes):** `build_graph`'s current ungoverned write at `graph.py:70-76` (and `112-117`).
+- [ ] **Step 0 (consumer audit — do FIRST):** `grep -rn "'joins'|\"joins\"|kind = 'joins'|column_joins" src/featuregen/` to enumerate every reader of `graph_edge 'joins'`. Record in the report whether any **feature-construction / operational** code reads it (vs search/lineage display). This decides Step 3c's enforcement.
 
 - [ ] **Step 1: Failing test**
 
 ```python
 # tests/featuregen/overlay/upload/test_governed_joins.py
-# When OVERLAY_GOVERNED_JOINS=1, a declared joins_to yields an approved_join PROPOSAL (governed path),
-# not just an ungoverned graph_edge. Default OFF preserves today's behaviour.
-from featuregen.overlay.upload.graph import governed_join_proposal
 from featuregen.overlay.upload.canonical import CanonicalRow
+from featuregen.overlay.upload.graph import governed_join_proposal, parse_join_ref
 
 
-def test_declared_join_builds_an_approved_join_ref():
-    row = CanonicalRow("deposits", "transactions", "account_id", "integer",
-                       joins_to="accounts.id", cardinality="N:1")
-    ref = governed_join_proposal(row)
-    assert ref is not None
+def test_parse_table_column_and_schema_qualified():
+    assert parse_join_ref("accounts.id").ok and parse_join_ref("accounts.id").to_table == "accounts"
+    q = parse_join_ref("public.accounts.id"); assert q.ok and q.to_table == "accounts" and q.to_col == "id"
+
+def test_malformed_join_yields_diagnostic_not_silent_none():
+    bad = parse_join_ref("accounts")            # no column
+    assert not bad.ok and bad.diagnostic        # a reason, not a silent drop
+
+def test_declared_join_builds_approved_join_ref():
+    ref = governed_join_proposal(CanonicalRow("deposits","transactions","account_id","integer",
+                                              joins_to="accounts.id", cardinality="N:1"))
     assert ref.from_ref.table == "transactions" and ref.to_ref.table == "accounts"
     assert ref.cardinality == "N:1" and ref.column_pairs[0].from_col == "account_id"
-
-
-def test_no_join_yields_none():
-    assert governed_join_proposal(CanonicalRow("d", "t", "c", "text")) is None
 ```
 
-- [ ] **Step 2: Run → FAIL** (`governed_join_proposal` undefined).
+- [ ] **Step 3a:** `parse_join_ref(joins_to) -> ParsedJoinTarget` (frozen dataclass `ok: bool`, `to_table`, `to_col`, `diagnostic: str | None`): supports `table.column` AND `schema.table.column`; rejects empty table/column with a diagnostic; a malformed join returns `ok=False` with a reason (the caller raises a quarantine/review diagnostic — do NOT silently drop). `governed_join_proposal(row)` builds the `ApprovedJoinRef` from a well-formed parse (else None).
+- [ ] **Step 3b:** In `ingest.py`, behind `os.environ.get("OVERLAY_GOVERNED_JOINS")=="1"`, route each declared join via the existing `propose_fact` (`approved_join`), guarded by `join_write_error` (reuse). Advisory/fail-soft. **VERIFY** `propose_fact`'s `Command`/`current_catalog_adapter()` construction against `test_join_confirmation`/`proposal_commands` tests before wiring. A malformed join → a quarantine diagnostic, not a crash.
+- [ ] **Step 3c:** Migration `0982_graph_edge_authority.sql` = `ALTER TABLE graph_edge ADD COLUMN IF NOT EXISTS authority text NOT NULL DEFAULT 'operational'`. When the flag is on, the `'joins'` edge is written with `authority='display_only'`. **If Step 0 found operational consumers**, update those queries to `AND authority='operational'` so a display-only edge is not used for feature construction (a code comment is NOT sufficient — the review's point). Record the retirement deadline (end of Phase 3): raw `'joins'` becomes display-only unconditionally, feature-use reads the `approved_join` projection.
+- [ ] **Step 4:** Tests: the pure builder/parser tests above, PLUS an **ingestion-level** test (using `test_ingest_slice.py` scaffolding + a catalog adapter as the join tests do): flag OFF → today's behaviour (operational edge, no proposal); flag ON → an `approved_join` proposal exists AND the edge is `display_only` AND the upload still succeeds.
+- [ ] **Step 5: Commit** `feat(overlay): governed joins_to seam — parser+diagnostics, approved_join proposal, display-only edge (spec §12.1)`.
 
-- [ ] **Step 3a: Add `governed_join_proposal`** to `graph.py` — pure builder from a `CanonicalRow`'s declared `joins_to` (`"table.column"`) into an `ApprovedJoinRef`:
+---
+
+## Task 8: Field-decision-event persistence
+
+**Files:** Create `overlay/field_decision.py`; Migration `0981_field_decision_event.sql`; Test `tests/featuregen/overlay/test_field_decision.py`.
+
+Makes this genuinely the kernel (the review's issue 5): the resolver's outputs are persisted as append-only, replayable decisions.
+
+- [ ] **Step 1: Failing test**
 
 ```python
-def governed_join_proposal(r):
-    if not r.joins_to:
-        return None
-    to_table, _, to_col = r.joins_to.partition(".")
-    if not to_col:
-        return None
-    frm = CatalogObjectRef(r.source, "column", _SCHEMA, r.table, r.column)
-    to = CatalogObjectRef(r.source, "column", _SCHEMA, to_table, to_col)
-    return ApprovedJoinRef(from_ref=frm, to_ref=to,
-                           column_pairs=(ColumnPair(from_col=r.column, to_col=to_col),),
-                           cardinality=(r.cardinality or "N:1"))
+# tests/featuregen/overlay/test_field_decision.py
+from featuregen.overlay.field_decision import read_field_decisions, record_field_decision
+
+def test_field_decision_is_append_only_and_replayable(db):
+    e1 = record_field_decision(db, logical_ref="public.accounts.balance", field_name="concept",
+        event_type="resolved", selected_evidence_ids=("e1",), evidence_set_hash="es1",
+        display_value_hash="dh", load_bearing_value_hash=None, conflict_status="none",
+        reason_codes=("authority_insufficient",), field_policy_version="v1", resolver_version="r1",
+        actor_ref=None, supersedes_event_id=None)
+    e2 = record_field_decision(db, logical_ref="public.accounts.balance", field_name="concept",
+        event_type="confirmed", selected_evidence_ids=("e1","e2"), evidence_set_hash="es2",
+        display_value_hash="dh", load_bearing_value_hash="lh", conflict_status="none",
+        reason_codes=(), field_policy_version="v1", resolver_version="r1", actor_ref="alice",
+        supersedes_event_id=e1)
+    rows = read_field_decisions(db, "public.accounts.balance", "concept")
+    assert [r.event_type for r in rows] == ["resolved", "confirmed"]
+    assert rows[-1].supersedes_event_id == e1 and rows[-1].load_bearing_value_hash == "lh"
 ```
 
-(Import `ApprovedJoinRef`, `ColumnPair`, `CatalogObjectRef` from `overlay.identity`. `_SCHEMA` already exists in graph.py.)
+- [ ] **Step 3a: Migration** `0981_field_decision_event.sql`:
 
-- [ ] **Step 3b: Flag-gated governed routing in ingest.** In `ingest.py`, after `build_graph`, when `os.environ.get("OVERLAY_GOVERNED_JOINS") == "1"`, for each `vr.good` row with a declared join, build `governed_join_proposal(row)` and submit it via the existing `propose_fact` command path (fact_type `approved_join`), guarded by `join_write_error` (reuse — do NOT reimplement). Advisory/fail-soft: a proposal failure logs and never aborts the upload. Default (flag unset) = today's behaviour, unchanged.
+```sql
+-- Spec §5.2: append-only, replayable field-decision events (the generic-field decision log; typed
+-- facts stay in the OVERLAY_FACT_* events). Write-once — a supersession is a NEW row, never an update.
+CREATE TABLE IF NOT EXISTS field_decision_event (
+    decision_event_id       text        PRIMARY KEY,
+    logical_ref             text        NOT NULL,
+    field_name              text        NOT NULL,
+    event_type              text        NOT NULL,   -- resolved|confirmed|rejected|staled|superseded
+    selected_evidence_ids   jsonb       NOT NULL DEFAULT '[]',
+    evidence_set_hash       text        NOT NULL,
+    display_value_hash      text        NULL,
+    load_bearing_value_hash text        NULL,
+    conflict_status         text        NOT NULL,
+    reason_codes            jsonb       NOT NULL DEFAULT '[]',
+    field_policy_version    text        NOT NULL,
+    resolver_version        text        NOT NULL,
+    actor_ref               text        NULL,
+    supersedes_event_id     text        NULL,
+    created_at              timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS field_decision_event_object_idx
+    ON field_decision_event (logical_ref, field_name, created_at);
+```
 
-- [ ] **Step 3c: Gate the raw edge to display-only.** In `graph.py`, when the governed flag is on, keep writing the `graph_edge 'joins'` row (search/lineage still show it) but the plan's follow-on (Phase 3) makes feature-use read the governed `approved_join` projection, not the raw edge. Add a code comment + a `docs` note recording the **retirement deadline** (end of Phase 3): the raw edge becomes display-only, feature-use goes through `approved_join`.
-
-- [ ] **Step 4: Run → PASS** (plus an ingest-level test with the flag on asserting a proposal is recorded and the upload still succeeds; use the existing `test_ingest_slice.py` scaffolding + a catalog adapter as `test_join_confirmation`/`propose_fact` tests do — inspect those for the fixture pattern).
-
-- [ ] **Step 5: Commit** `feat(overlay): governed joins_to seam via approved_join proposal, flag-gated (spec §12.1)`.
+- [ ] **Step 3b:** `record_field_decision(conn, *, ...) -> decision_event_id` (mint `fde_` id, INSERT); `read_field_decisions(conn, logical_ref, field_name)` (ordered by created_at). Frozen `FieldDecisionEvent` dataclass. NOTE: this task creates the persistence primitive only; wiring the resolver (Task 4) to emit these on each resolution is Phase 1 (when producers actually write evidence) — documented, not built here.
+- [ ] Standard steps. Commit `feat(overlay): field-decision-event persistence (spec §5.2)`.
 
 ---
 
 ## Self-Review
 
-**Spec coverage (§0 new surface):** (a) strength axis → Task 1; (b) identity status → Task 2; (c) field-authority policy + disqualifiers → Tasks 3-4; (d) safety override → Task 5; (e) conflict lifecycle → Task 6; (f) governed joins_to → Task 7. Readiness scope (contract 8) intentionally **deferred to Phase 2** (noted in spec §0/§17). Assertion-strength *propagation* (§3.2) is a resolver rule exercised once evidence carries strength (Task 1) + the policy evaluator (Tasks 3-4) — a dedicated propagation helper is a small Phase-1 addition when taxonomy-derived evidence is first written; noted, not built here (no producer emits derived evidence yet in Phase 0).
+**Review coverage:** issue 1 (field-specific resolver) → Task 4 `ConflictStrategy`; 2 (typed evidence) → `FieldEvidenceView`; 3 (legacy default) → Task 1 Step 0 caller audit + `LEGACY` producer; 4 (lifecycle) → Task 1 `EvidenceLifecycle` + Task 4 active-set docstring; 5 (field-decision persistence) → new Task 8; 6 (identity thin) → Task 2 logical/provider wrappers + honest framing; 7 (safety override scope/authority/effective/unknown) → Task 5; 9 (conflict history) → Task 6 child table; 10 (fingerprint value hashes) → Task 6 `competing_value_hashes`; 11 (join parser diagnostics) → Task 7 `parse_join_ref`; 12/13 (join ordering + display-only) → Task 7 Step 0 consumer audit + `authority` column enforcement; 14 (migration ordering) → Global Constraints; 15 (empty predicates) → Task 3; 16 (specialized-fact test) → Task 4 required test; 17 (influence_max) → Task 4 enforcement; 18 (spans tuple) → Task 1.
 
-**Reuse guardrails:** No task creates a second event log or confirmation flow. Task 7 explicitly reuses `propose_fact` + `join_write_error` + `approved_join` rather than a new join authority. Tasks 3-4 add the WHAT-authority layer *alongside* `resolve_authority` (WHO-confirms), not replacing it. If an implementer finds an existing module already provides a task's capability, that's a STOP-and-report (the reuse map may be more complete than assumed).
+**Reuse guardrails:** No parallel event log/confirmation flow. Task 7 reuses `propose_fact`+`join_write_error`; Tasks 3-4 add the WHAT-authority layer alongside `resolve_authority`. Task 8's `field_decision_event` is the generic-field decision log; typed facts stay in `OVERLAY_FACT_*`.
 
-**Verification-before-build flags for the implementer:** (1) confirm the next free migration slot on `main` (0978+ may be taken); (2) confirm `CatalogAdapter`'s real native-id lookup method (Task 2 fake assumes `native_ids_for`); (3) confirm `propose_fact`'s `Command`/`current_catalog_adapter()` construction from the existing `test_join_confirmation`/`proposal_commands` tests before wiring Task 7; (4) the `now` seam convention in overlay modules (Task 6) — match `expiry.py`/`confirmation_commands.py`.
+**Verify-before-build (implementer):** free migration slot on `main` (0978-0982 may be taken); `CatalogAdapter` native-id method (Task 2); `propose_fact` `Command`/adapter construction (Task 7); the `now` seam convention (Tasks 5/6); every `graph_edge 'joins'` consumer (Task 7 Step 0); every `write_evidence` caller (Task 1 Step 0).
 
-**Type consistency:** `EvidenceProducer`/`AssertionStrength` defined in Task 1 are imported by Tasks 3-4 and 7's evidence; `AuthorityPredicate`/`evaluate` from Task 3 are consumed by Task 4's `resolve_field_authority`; `ObjectIdentityStatus` (Task 2) feeds the `AMBIGUOUS_OBJECT_IDENTITY` disqualifier (Task 4). Migration numbers 0978/0979/0980 are distinct.
+**Type consistency:** Task-1 enums used everywhere (no raw strings in resolver inputs); `evidence_spans: tuple`; migrations 0978-0982 distinct; `ConflictStrategy` used by Task 4; `EvidenceLifecycle` filters the active set feeding Task 4.
 
 ## Execution Handoff
-
-After saving, two execution options: **(1) Subagent-Driven (recommended)** — fresh subagent per task + two-stage review; **(2) Inline Execution** — batched with checkpoints. NOTE: Tasks 2 and 7 carry real "verify the existing signature first" risk (catalog adapter method; propose_fact command construction) — an implementer should read the named existing tests before those tasks rather than trust the fakes verbatim.
+Two options: **(1) Subagent-Driven (recommended)** — fresh subagent per task + two-stage review; **(2) Inline** — batched w/ checkpoints. Tasks 4, 5, and 7 carry the most judgment; Tasks 2 and 7 carry real "verify the existing signature first" risk — read the named existing tests before those.
