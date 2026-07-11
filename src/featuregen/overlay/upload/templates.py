@@ -61,10 +61,13 @@ class Need:
 
 @dataclass(frozen=True, slots=True)
 class Template:
-    """A parametric, safe-by-construction feature recipe. The first four extra fields beyond the
+    """A parametric, safe-by-construction feature recipe. The five authored-extension fields beyond the
     core schema (``stage``…``notes``) carry SME authoring metadata (funnel stage, eligibility note,
     near-label flag, declared downstream derivations, concept-substitution notes); all default so the
-    core positional schema is unchanged."""
+    core positional schema is unchanged. Two further 3B.1 fields carry the source anchor:
+    ``source_entity`` is RESERVED for Phase 3B.3 (the planner will read it — it is neither set nor read
+    yet), and ``source_entity_need_role`` names the need carrying the source grain key, required only when
+    a recipe has >1 distinct entity key."""
     id: str                          # e.g. "balance_trend"
     family: str                      # e.g. "balance_stock"
     intent: str                      # one-line business meaning

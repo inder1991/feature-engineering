@@ -6,7 +6,9 @@ template's EXPLICIT anchor) — never a column name or a need's tuple position. 
 so a plan replays exactly. Behaviour-neutral: nothing consumes this until the 3B.3 planner."""
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import Literal
 
 from featuregen.overlay.upload.binding_roles import JoinRole, TemporalRole
@@ -67,7 +69,12 @@ def validate_template_anchor(template: Template) -> None:
 
 
 def _source_anchor_role(template: Template) -> str | None:
-    """The need role carrying the source grain: the explicit override, else the single entity-linked need."""
+    """The need role carrying the source grain: the explicit override, else the single entity-linked need.
+
+    A VALIDATED template resolves 0 or 1 ``SOURCE_ENTITY_KEY`` (never more) — the 3B.3 planner must not
+    assume exactly one. (``validate_template_anchor`` counts DISTINCT entity keys while this counts entity
+    NEEDS, so ≥2 needs on the SAME entity with no explicit anchor would validate yet return None here → 0
+    anchors; ``test_exactly_one_source_anchor_per_recipe_at_most`` asserts the ≤1 bound.)"""
     if template.source_entity_need_role is not None:
         return template.source_entity_need_role
     entity_needs = [n for n in template.needs if _entity_of(n) is not None]
@@ -122,9 +129,11 @@ def derive_need_metadata(template: Template) -> tuple[ResolvedNeedMetadataV1, ..
 
 
 # Resolved ONCE at import over the whole recipe corpus — the immutable registry the 3B.3 planner reads.
-# Fails FAST (at import) if any recipe's source anchor is ambiguous.
-RESOLVED_NEED_METADATA: dict[str, tuple[ResolvedNeedMetadataV1, ...]] = {
-    t.id: derive_need_metadata(t) for t in ALL_TEMPLATES}
+# Fails FAST (at import) if any recipe's source anchor is ambiguous. Each entry resolves 0 or 1
+# SOURCE_ENTITY_KEY (never more; see _source_anchor_role) — the planner must not assume exactly one.
+# Wrapped in MappingProxyType so the mapping itself is read-only (values are already immutable tuples).
+RESOLVED_NEED_METADATA: Mapping[str, tuple[ResolvedNeedMetadataV1, ...]] = MappingProxyType(
+    {t.id: derive_need_metadata(t) for t in ALL_TEMPLATES})
 
 
 def derivation_report() -> tuple[dict[str, object], ...]:
