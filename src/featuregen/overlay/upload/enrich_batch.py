@@ -4,8 +4,17 @@ degradation ladder in run_batched (Task 6)."""
 from __future__ import annotations
 
 import json
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
+
+from featuregen.overlay.upload import enrich_config
+from featuregen.runtime.observability import counters
+
+# NOTE: `audited_batch_call` / `audited_enrich_call` are imported LAZILY inside run_batched /
+# _single_fallback (not at module top) to break the enrich_batch <-> enrich_llm import cycle:
+# enrich_llm imports names from this module at its own top, so a module-level import back into
+# enrich_llm here fails at collection (partially initialized module).
 
 VALID = "valid"
 MISSING = "missing"
@@ -94,3 +103,90 @@ def chunk_items(items: list[BatchItem], *, max_items: int,
     if cur:
         chunks.append(cur)
     return chunks
+
+
+def _single_fallback(conn, client, *, task, out_key, instruction, item: BatchItem, shared_metadata,
+                     accept, actor) -> tuple[str | None, str]:
+    """One per-item fallback through the existing single seam. Returns (value|None, status)."""
+    from featuregen.overlay.upload.enrich_llm import audited_enrich_call  # lazy (import cycle)
+    single_prompt = task.rsplit(".", 1)[-1]   # concept|definition|domain
+    raw = audited_enrich_call(
+        conn, client, task=task, prompt_id=f"overlay_{single_prompt}_v1",
+        schema_id=f"overlay_{single_prompt}", out_key=out_key,
+        catalog_metadata={**shared_metadata, **item.metadata}, instruction=instruction, actor=actor)
+    if raw is None:
+        return None, FALLBACK_FAILED
+    value, _reason = accept(raw)
+    return (value, FALLBACK_VALID) if value is not None else (None, FALLBACK_FAILED)
+
+
+def run_batched(conn, client, *, short: str, task: str, prompt_id: str, schema_id: str,
+                shared_metadata: dict, items: list[BatchItem], out_key: str, instruction: str,
+                accept: Accept, actor) -> dict[str, str]:
+    """Chunk `items`, call the governed batch seam, and walk the bounded degradation ladder
+    (spec C4): salvage valid -> retry a failed chunk -> adaptive split -> capped single fallback ->
+    leave remainder uncached. Returns {ref: accepted_value} for items resolved this run."""
+    from featuregen.overlay.upload.enrich_llm import audited_batch_call  # lazy (import cycle)
+    b = enrich_config.budget(short)
+    max_items = enrich_config.max_items(short)
+    max_tokens = enrich_config.max_input_tokens(short)
+    started = time.monotonic()
+    calls = 0
+    resolved: dict[str, str] = {}
+    fallback_used = 0
+
+    def over_budget() -> bool:
+        return (calls >= b.max_provider_calls
+                or (time.monotonic() - started) * 1000 >= b.wallclock_budget_ms)
+
+    def process(chunk: list[BatchItem], attempt: int) -> None:
+        nonlocal calls, fallback_used
+        if not chunk or over_budget():
+            counters.incr(f"overlay.enrich.{short}.batch.budget_exhausted") if chunk else None
+            return
+        res = audited_batch_call(conn, client, task=task, prompt_id=prompt_id, schema_id=schema_id,
+                                 shared_metadata=shared_metadata, items=chunk, out_key=out_key,
+                                 instruction=instruction, accept=accept, actor=actor)
+        calls += res.provider_calls
+        counters.incr(f"overlay.enrich.{short}.batch.calls")
+        for o in res.outcomes:
+            if o.status in (VALID,) and o.value is not None:
+                resolved[o.ref] = o.value
+        unresolved = [it for it in chunk if it.ref not in resolved]
+        if not unresolved:
+            return
+        valid_ratio = 1 - len(unresolved) / len(chunk)
+        if valid_ratio >= b.keep_threshold:
+            _fallback(unresolved)                      # salvage the bulk; fallback only the few
+            return
+        if attempt < b.max_batch_attempts and not over_budget():
+            counters.incr(f"overlay.enrich.{short}.batch.retry")
+            process(unresolved, attempt + 1)           # retry the unresolved as a chunk
+            return
+        if len(unresolved) > b.min_split and not over_budget():
+            counters.incr(f"overlay.enrich.{short}.batch.split")
+            mid = len(unresolved) // 2
+            process(unresolved[:mid], 0)
+            process(unresolved[mid:], 0)
+            return
+        _fallback(unresolved)
+
+    def _fallback(unresolved: list[BatchItem]) -> None:
+        nonlocal calls, fallback_used
+        for it in unresolved:
+            if fallback_used >= b.max_single_fallback or over_budget():
+                counters.incr(f"overlay.enrich.{short}.batch.left_uncached")
+                continue
+            fallback_used += 1
+            calls += 1
+            counters.incr(f"overlay.enrich.{short}.batch.single_fallback")
+            value, status = _single_fallback(conn, client, task=task, out_key=out_key,
+                                              instruction=instruction, item=it,
+                                              shared_metadata=shared_metadata, accept=accept,
+                                              actor=actor)
+            if value is not None:
+                resolved[it.ref] = value
+
+    for chunk in chunk_items(items, max_items=max_items, max_input_tokens=max_tokens):
+        process(chunk, 0)
+    return resolved

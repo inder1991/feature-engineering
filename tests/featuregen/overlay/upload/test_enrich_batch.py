@@ -130,3 +130,44 @@ def test_chunk_never_drops_an_oversized_singleton():
     items = [eb.BatchItem("r0", {"column": "x" * 10_000})]
     chunks = eb.chunk_items(items, max_items=10, max_input_tokens=10)
     assert chunks == [[items[0]]]   # one item always survives as its own chunk
+
+
+def test_run_batched_salvages_valid_and_leaves_invalid_uncached(db, monkeypatch):
+    monkeypatch.setenv("OVERLAY_ENRICH_CONCEPT_MODE", "batch")
+    items = [eb.BatchItem("h1", {"table": "t", "column": "balance", "type": "numeric"}),
+             eb.BatchItem("h2", {"table": "t", "column": "mystery", "type": "text"})]
+    client = FakeLLM(script={_CTASK: FakeResponse(output={"results": [
+        {"ref": "h1", "concept": "monetary_stock"},
+        {"ref": "h2", "concept": "made_up"}]})})
+    got = eb.run_batched(db, client, short="concept", task=_CTASK,
+                         prompt_id="overlay_concept_batch_v1", schema_id="overlay_concept_batch",
+                         shared_metadata={}, items=items, out_key="concept",
+                         instruction="Classify.", accept=_accept_known, actor=None)
+    assert got == {"h1": "monetary_stock"}     # invalid h2 not returned, not cached (spec C3/C4)
+
+
+def test_run_batched_falls_back_to_single_for_missing(db, monkeypatch):
+    # Batch omits h2 entirely (missing); bounded single fallback recovers it.
+    monkeypatch.setenv("OVERLAY_ENRICH_CONCEPT_MODE", "batch")
+    items = [eb.BatchItem("h1", {"table": "t", "column": "balance", "type": "numeric"}),
+             eb.BatchItem("h2", {"table": "t", "column": "bal2", "type": "numeric"})]
+    client = FakeLLM(script={_CTASK: [
+        FakeResponse(output={"results": [{"ref": "h1", "concept": "monetary_stock"}]}),  # batch: h2 missing
+        FakeResponse(output={"concept": "monetary_stock"})]})                            # single fallback for h2
+    got = eb.run_batched(db, client, short="concept", task=_CTASK,
+                         prompt_id="overlay_concept_batch_v1", schema_id="overlay_concept_batch",
+                         shared_metadata={}, items=items, out_key="concept",
+                         instruction="Classify.", accept=_accept_known, actor=None)
+    assert got == {"h1": "monetary_stock", "h2": "monetary_stock"}
+
+
+def test_run_batched_respects_single_fallback_cap(db, monkeypatch):
+    monkeypatch.setenv("OVERLAY_ENRICH_CONCEPT_MODE", "batch")
+    monkeypatch.setenv("OVERLAY_ENRICH_MAX_SINGLE_FALLBACK", "0")   # no fallback allowed
+    items = [eb.BatchItem("h1", {"table": "t", "column": "c", "type": "text"})]
+    client = FakeLLM(script={_CTASK: FakeResponse(output={"results": []})})   # batch returns nothing
+    got = eb.run_batched(db, client, short="concept", task=_CTASK,
+                         prompt_id="overlay_concept_batch_v1", schema_id="overlay_concept_batch",
+                         shared_metadata={}, items=items, out_key="concept",
+                         instruction="Classify.", accept=_accept_known, actor=None)
+    assert got == {}   # unresolved, left uncached (retried next ingest)
