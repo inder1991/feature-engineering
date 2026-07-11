@@ -1,14 +1,82 @@
 from __future__ import annotations
 
+import os
 from collections.abc import Iterable
 from dataclasses import dataclass
 
+from featuregen.overlay.identity import ApprovedJoinRef, CatalogObjectRef, ColumnPair
 from featuregen.overlay.upload.canonical import CanonicalRow
 from featuregen.overlay.upload.concepts import humanize
 from featuregen.overlay.upload.enrich import content_hash
 from featuregen.overlay.upload.read_scope import allowed_sensitivities
 
 _SCHEMA = "public"
+
+
+def governed_joins_enabled() -> bool:
+    """The governed `joins_to` seam (Task 7 / §12.1), default OFF. When ON, a declared join's raw
+    'joins' edge is written DISPLAY-ONLY (authority='display_only') and routed into the governed
+    approved_join path via propose_fact; feature-construction reads filter to authority='operational'
+    so an ungoverned display edge is never used to build features."""
+    return os.environ.get("OVERLAY_GOVERNED_JOINS") == "1"
+
+
+def _join_edge_authority() -> str:
+    """The `authority` a freshly-written 'joins' edge carries: 'display_only' under the governed seam
+    (the governed approved_join fact is the operational source of truth), else 'operational' (today's
+    behaviour — the raw edge IS the join feature-construction uses)."""
+    return "display_only" if governed_joins_enabled() else "operational"
+
+
+@dataclass(frozen=True, slots=True)
+class ParsedJoinTarget:
+    """The parse of a declared `joins_to` string. `ok=False` ALWAYS carries a `diagnostic` (a review
+    reason) — a malformed join is surfaced, never silently dropped to a None."""
+    ok: bool
+    to_table: str | None
+    to_col: str | None
+    diagnostic: str | None
+
+
+def parse_join_ref(joins_to: str) -> ParsedJoinTarget:
+    """Parse a declared `joins_to` into its target (table, column).
+
+    Supports `table.column` (2-part -> to_table, to_col) AND `schema.table.column` (3-part -> middle
+    is the table, last is the column). Empty input, an empty table/column component, or an
+    unparseable shape returns `ok=False` WITH a diagnostic (never a silent None), so the caller can
+    raise a quarantine/review note rather than drop a declared relationship on the floor."""
+    raw = (joins_to or "").strip()
+    if not raw:
+        return ParsedJoinTarget(False, None, None, "empty joins_to")
+    parts = [p.strip() for p in raw.split(".")]
+    if len(parts) == 2:
+        to_table, to_col = parts[0], parts[1]
+    elif len(parts) == 3:
+        to_table, to_col = parts[1], parts[2]   # schema.table.column -> table is the middle segment
+    else:
+        return ParsedJoinTarget(
+            False, None, None,
+            f"unparseable joins_to {joins_to!r}: expected 'table.column' or 'schema.table.column'")
+    if not to_table or not to_col:
+        return ParsedJoinTarget(
+            False, None, None, f"joins_to {joins_to!r} has an empty table or column component")
+    return ParsedJoinTarget(True, to_table, to_col, None)
+
+
+def governed_join_proposal(row: CanonicalRow) -> ApprovedJoinRef | None:
+    """Build the governed `ApprovedJoinRef` a declared join maps to, or None when the row has no join
+    or a malformed one (parse_join_ref not ok). Both endpoints are same-source column refs; the single
+    declared column pair is (this column -> target column); cardinality defaults to 'N:1' (a child
+    row referencing a parent — the safe-fan default) when the upload left it blank."""
+    parsed = parse_join_ref(row.joins_to)
+    if not parsed.ok:
+        return None
+    assert parsed.to_table is not None and parsed.to_col is not None   # ok=True guarantees both
+    return ApprovedJoinRef(
+        from_ref=CatalogObjectRef(row.source, "column", _SCHEMA, row.table, row.column),
+        to_ref=CatalogObjectRef(row.source, "column", _SCHEMA, parsed.to_table, parsed.to_col),
+        column_pairs=(ColumnPair(row.column, parsed.to_col),),
+        cardinality=row.cardinality or "N:1")
 
 # Weighted tsvector: column name (A) > definition (B) > table/concept/domain (C).
 _SEARCH_DOC = (
@@ -69,11 +137,13 @@ def build_graph(conn, catalog_source: str, rows: list[CanonicalRow],
             (catalog_source, _table_ref(r.table), c_ref))
         if r.joins_to:
             # Single-column join: this column -> target "table.column" (may be not-yet-loaded).
+            # Under the governed seam the raw edge is DISPLAY-ONLY (authority='display_only') — the
+            # confirmed approved_join fact becomes feature-construction's source of truth.
             to_ref = f"{_SCHEMA}.{r.joins_to}" if r.joins_to.count(".") == 1 else r.joins_to
             conn.execute(
-                "INSERT INTO graph_edge (catalog_source, kind, from_ref, to_ref, cardinality) "
-                "VALUES (%s, 'joins', %s, %s, %s) ON CONFLICT DO NOTHING",
-                (catalog_source, c_ref, to_ref, r.cardinality or None))
+                "INSERT INTO graph_edge (catalog_source, kind, from_ref, to_ref, cardinality, "
+                "authority) VALUES (%s, 'joins', %s, %s, %s, %s) ON CONFLICT DO NOTHING",
+                (catalog_source, c_ref, to_ref, r.cardinality or None, _join_edge_authority()))
 
     # Re-apply human-confirmed entity tags (entity_suggestion). The graph was just rebuilt from the
     # upload, which may not declare these; a confirmed tag must survive re-upload. Only fills a blank —
@@ -112,9 +182,9 @@ def add_column_row(conn, catalog_source: str, r: CanonicalRow) -> None:
     if r.joins_to:
         to_ref = f"{_SCHEMA}.{r.joins_to}" if r.joins_to.count(".") == 1 else r.joins_to
         conn.execute(
-            "INSERT INTO graph_edge (catalog_source, kind, from_ref, to_ref, cardinality) "
-            "VALUES (%s, 'joins', %s, %s, %s) ON CONFLICT DO NOTHING",
-            (catalog_source, c_ref, to_ref, r.cardinality or None))
+            "INSERT INTO graph_edge (catalog_source, kind, from_ref, to_ref, cardinality, authority) "
+            "VALUES (%s, 'joins', %s, %s, %s, %s) ON CONFLICT DO NOTHING",
+            (catalog_source, c_ref, to_ref, r.cardinality or None, _join_edge_authority()))
 
 
 @dataclass(frozen=True, slots=True)

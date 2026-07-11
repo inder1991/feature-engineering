@@ -607,7 +607,10 @@ def route_strategies(conn, cols: list[dict]) -> list[tuple[str, str]]:
     # parent that children join to (to_ref) — the entity-grain "aggregate children up" case. Scoped to
     # the candidate catalogs so cross-catalog same-named refs don't spuriously enable it.
     tables = [f"public.{c['object_ref'].split('.')[-2]}" for c in cols if c["object_ref"].count(".") >= 2]
-    if conn.execute("SELECT 1 FROM graph_edge WHERE kind = 'joins' AND catalog_source = ANY(%s) "
+    # authority='operational' (Task 7): a governed-seam display-only edge must NOT enable a feature
+    # strategy — the confirmed approved_join fact is the source of truth once the seam is on.
+    if conn.execute("SELECT 1 FROM graph_edge WHERE kind = 'joins' AND authority = 'operational' "
+                    "AND catalog_source = ANY(%s) "
                     "AND (from_ref = ANY(%s) OR to_ref = ANY(%s)) LIMIT 1",
                     (list(set(sources)), refs, tables)).fetchone() is not None:
         picks.append(("aggregation", "aggregations (count/sum/avg) over related child rows via a join key"))

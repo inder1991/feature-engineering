@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime
 
 from featuregen.overlay import facts
@@ -13,7 +13,13 @@ from featuregen.overlay.store import append_overlay_event, load_fact
 from featuregen.overlay.upload.brake import large_change_brake
 from featuregen.overlay.upload.canonical import CanonicalRow, validate_rows
 from featuregen.overlay.upload.enrich import classify_domains, draft_definitions, enrich_concepts
-from featuregen.overlay.upload.graph import add_column_row, build_graph
+from featuregen.overlay.upload.graph import (
+    add_column_row,
+    build_graph,
+    governed_join_proposal,
+    governed_joins_enabled,
+    parse_join_ref,
+)
 from featuregen.overlay.upload.review_queue import persist_quarantine
 from featuregen.overlay.upload.upload_catalog import UploadCatalog, table_ref
 from featuregen.projections.runner import projection_lag, run_projection
@@ -85,6 +91,66 @@ def _assert_fact(conn, source: str, table: str, fact_type: str, value: dict, *, 
     return True
 
 
+def _propose_governed_joins(conn, rows: list[CanonicalRow], *, actor) -> None:
+    """Route each declared `joins_to` into the governed approved_join path via `propose_fact`, behind
+    OVERLAY_GOVERNED_JOINS=1 (the caller gates on `governed_joins_enabled()`).
+
+    ADVISORY / fail-soft (spec §12.1): this NEVER aborts the upload. A malformed `joins_to` is
+    skipped-loud with its parse diagnostic; a `propose_fact` failure is logged and counted.
+
+    ADAPTER-GATED (Phase-1 dependency): `propose_fact` resolves `current_catalog_adapter()`, which the
+    UPLOAD request path does not yet register (only the worker/deployment does). When no adapter is
+    wired we skip-loud rather than crash — the display-only edge marking (graph.py) still happens, so
+    turning the flag on is safe today; the actual proposal dispatch activates once the upload-context
+    adapter lands. The flag is default-OFF, so production behaviour is unchanged."""
+    # Imported lazily: propose_fact -> proposal_commands resolves the catalog adapter at import-use
+    # time, and the pure builder/parser tests must import graph.py without pulling the command stack.
+    from featuregen.contracts.envelopes import Command
+    from featuregen.overlay.catalog import current_catalog_adapter
+    from featuregen.overlay.commands import propose_fact
+
+    try:
+        current_catalog_adapter()
+    except RuntimeError:
+        counters.incr("overlay.governed_joins.skipped_no_adapter")
+        logger.warning("OVERLAY_GOVERNED_JOINS is on but no catalog adapter is registered in the "
+                       "upload flow — skipping approved_join proposals (Phase-1: wire the "
+                       "upload-context adapter). Display-only edges are still marked.")
+        return
+
+    for r in rows:
+        if not r.joins_to:
+            continue
+        ref = governed_join_proposal(r)
+        if ref is None:
+            counters.incr("overlay.governed_joins.skipped_malformed")
+            logger.warning("skipping governed join for %s.%s: %s", r.table, r.column,
+                           parse_join_ref(r.joins_to).diagnostic)
+            continue
+        value = {
+            "from_ref": asdict(ref.from_ref),
+            "to_ref": asdict(ref.to_ref),
+            "column_pairs": [{"from_col": p.from_col, "to_col": p.to_col} for p in ref.column_pairs],
+            "cardinality": ref.cardinality,
+        }
+        try:
+            result = propose_fact(conn, Command(
+                "propose_fact", "overlay_fact", None,
+                {"ref": ref, "fact_type": "approved_join", "proposed_value": value},
+                actor, proposal_fingerprint(value)))
+        except Exception:  # noqa: BLE001 — advisory: a proposal failure must never fail an upload
+            counters.incr("overlay.governed_joins.propose_error")
+            logger.warning("advisory governed-join proposal raised for %s.%s -> %s",
+                           r.table, r.column, r.joins_to, exc_info=True)
+            continue
+        if not result.accepted:
+            # A deny (e.g. a duplicate of an already-pending/verified join) is expected on re-upload —
+            # advisory, not an error. Counted so the seam's activity is observable.
+            counters.incr("overlay.governed_joins.propose_denied")
+            logger.info("governed-join proposal for %s.%s not accepted: %s", r.table, r.column,
+                        result.denied_reason)
+
+
 def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
                   actor, now: datetime | None = None, client=None) -> IngestResult:
     vr = validate_rows(rows, catalog_source)
@@ -137,6 +203,10 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
         except Exception:  # noqa: BLE001
             logger.warning("advisory domain enrichment failed for %r", catalog_source, exc_info=True)
     build_graph(conn, catalog_source, vr.good, concepts, definitions, domains)
+    if governed_joins_enabled():
+        # Governed seam (Task 7 / §12.1): the raw 'joins' edges just written are display-only; route
+        # each declared join into the governed approved_join path. Advisory/fail-soft + adapter-gated.
+        _propose_governed_joins(conn, vr.good, actor=actor)
     persist_quarantine(conn, catalog_source, vr.quarantined)
     flagged = (f"first upload of '{catalog_source}' ({len(vr.good)} objects) — review recommended"
                if brake.is_first_upload else None)

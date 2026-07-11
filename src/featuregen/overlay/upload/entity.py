@@ -221,8 +221,10 @@ def _cross_adjacency(conn, roles: Iterable[str]) -> dict:
         adj.setdefault(a, []).append((b, step))
 
     for src, fr, to, card in conn.execute(
+            # authority='operational' (Task 7): a governed-seam display-only edge is excluded from
+            # cross-catalog feature-construction adjacency (the confirmed approved_join fact governs).
             "SELECT catalog_source, from_ref, to_ref, cardinality FROM graph_edge "
-            "WHERE kind = 'joins'").fetchall():
+            "WHERE kind = 'joins' AND authority = 'operational'").fetchall():
         a, b = (src, _table_of(fr)), (src, _table_of(to))
         if a == b:
             continue
