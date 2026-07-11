@@ -1,10 +1,10 @@
-# Evidence-Authority Ingestion — Design Spec (v2)
+# Evidence-Authority Ingestion — Design Spec (v3)
 
-Date: 2026-07-11. Status: DESIGNED, revised after architectural review (verdict: conditionally approve
-after revision; v2 resolves all 12 load-bearing items). Supersedes the scope of
-`2026-07-11-batched-enrichment.md` — that batching work (merged to main `6345296`) is **Pass A**.
+Date: 2026-07-11. Status: DESIGNED — architecture APPROVED; v3 is the contract-tightening pass so Phase 0
+task-level planning can begin. Supersedes the scope of `2026-07-11-batched-enrichment.md` (merged to main
+`6345296`) — that batching work is **Pass A transport**.
 
-## The one-sentence architecture (unchanged — the review affirmed it)
+## The one-sentence architecture (unchanged, affirmed twice)
 
 > Multiple evidence producers propose graph attributes; a **field-specific authority policy** decides
 > what may become operational. The graph projection exposes the strongest currently-accepted value; the
@@ -12,405 +12,530 @@ after revision; v2 resolves all 12 load-bearing items). Supersedes the scope of
 
 Permanent invariants: **provenance ≠ authority; confidence ≠ permission.**
 
-## What v2 changed (the review's 12 load-bearing corrections)
+## What v3 tightened (the review's 16 contract items)
 
-v1 modelled authority as a flat enum ranked by `min()`, treated `llm_call` as the whole evidence store,
-put the semantic ingestion phase before the policy/resolver kernel it depends on, and overclaimed that
-the ingestion core is untouched. v2 fixes each:
-
-1. Authority is a **field-specific (producer × status) rule model**, not a flat enum ranking (§3).
-2. **Source trust is per (source, field)**, not a global `SOURCE_DECLARED` (§3.3).
-3. Field decisions reuse the event framework via **typed field-evidence + field-decision records +
-   specialized fact keys** — not an untyped JSON blob (§5).
-4. `graph_field_evidence` + item-level `llm_call` linkage are **first-class and load-bearing** (§5).
-5. A **Phase 0 authority kernel** ships before any semantic ingestion (§9).
-6. **Relationship proposals removed from Phase 1** (Pass C is Phase 3) (§9).
-7. Readiness is **blockers/requirements first, percentages second** (§7).
-8. **Field-specific conflict lattices** replace a generic `max()` (§6.2).
-9. **Evidence staleness** via snapshot + input-hash + producer-version (§6.3).
-10. **Logical-vs-provider object identity** defined up front (§2).
-11. A **producer × mutation matrix** fixes what each producer may change (§4.1).
-12. The **"core untouched" claim is corrected** to an accurate insertion invariant (§10).
+1. `AuthorityRule(any_of, all_of)` → a closed **AuthorityPredicate tree** (§4.1).
+2. Split conflated `EvidenceStatus` into **AssertionStrength** + **EvidenceLifecycle** (§3.1).
+3. `FieldDecisionRecord` → append-only **FieldDecisionEventV1** with replay/supersession fields (§5.2).
+4. **Object identity resolution** contract — `ObjectIdentityStatus` + `ProviderObjectBinding`; no attach
+   when ambiguous (§2).
+5. Field policy gains **disqualifiers** (stale/conflict/ambiguous/pending-revalidation) (§4.3).
+6. Safety-floor downgrades require a distinct **GovernanceAuthority + SafetyOverride**, not generic human
+   confirmation (§7).
+7. Concept split into **advisory vs operational** use; operational authority scales with derived-field
+   blast radius (§8).
+8. Pass A: **transport shipped, evidence schema to extend** + a legacy-cache migration plan (§15.1).
+9. Readiness is **scoped**; the load-bearing decision is **recipe/run-scoped** (§9).
+10. Precise **typed-fact vs field-decision boundary** via `resolution_mode` (§4.4, §5.3).
+11. The ungoverned `joins_to` shortcut is a **Phase 0/1 hardening** item with a retirement plan (§12.1).
+12. Replay needs a **producer_configuration_hash**, not just a version (§5.1).
+13. **Conflict-review lifecycle** with a stable fingerprint (§10).
+14. Human confirmations carry **scope + expiry + revalidation** (§11).
+15. Pass B outputs have an explicit **destination mapping** (§15.2).
+16. The field matrix uses three influence tiers — **DISPLAY / RECOMMENDATION / OPERATIONAL** (§4.2, §16).
 
 ---
 
 ## 1. Why (unchanged, condensed)
 
 Real-world uploads are **business glossaries** (BIAN/FIBO term maps like the FTR
-`FTR_Column_Mapping.csv`), not technical schema+facts catalogs. Uploaded as-is they fully quarantine (no
-`table/column/type` headers) → empty graph. Even reshaped, a glossary carries meaning but not the
-structural facts (joins, grain, as-of) features need. No single source has everything; the architecture
-fuses partial sources and must never let a confident guess about a load-bearing field pose as an attested
-fact.
+`FTR_Column_Mapping.csv`), not technical schema+facts catalogs — uploaded as-is they fully quarantine
+(empty graph). Even reshaped, a glossary carries meaning but not structural facts (joins, grain, as-of).
+No single source has everything; fuse partial sources, and never let a confident guess about a
+load-bearing field pose as an attested fact.
 
 ---
 
-## 2. Layer 0 — object identity (define before anything attaches to it) [item 10]
+## 2. Object identity — resolution before attachment [item 4]
 
-Structural fusion is a **provider-fusion problem from day one**, not a later ad-hoc merge. Evidence
-attaches to a **logical** object and retains its **provider** origin:
+Evidence attaches to a **logical** object and retains **provider** origin:
 
 ```python
 @dataclass(frozen=True)
-class LogicalObjectRef:      # the stable identity evidence hangs on
-    logical_catalog_id: str; schema: str; table: str; column: str | None
-
+class LogicalObjectRef: logical_catalog_id: str; schema: str; table: str; column: str | None
 @dataclass(frozen=True)
-class ProviderObjectRef:     # where a given assertion physically came from
-    provider_id: str; provider_snapshot_id: str; native_ref: str   # e.g. FTR row, OM FQN, DDL line
+class ProviderObjectRef: provider_id: str; provider_snapshot_id: str; native_ref: str
 ```
 
-A glossary and a later OpenMetadata/DDL snapshot are two **providers** describing the same
-`LogicalObjectRef`. Keying evidence on the logical ref now prevents a Phase-3 identity redesign when the
-structural source arrives. (v1 keyed on `source+table+column`, which would have forced that migration.)
+But logical identity is **resolved, not assumed** — ingestion meets renames, case/alias variants,
+one-term-to-many-columns, many-rows-to-one-column, schema/table moves. A binding step runs first:
+
+```python
+class ObjectIdentityStatus(StrEnum):
+    EXACT = "exact"; ALIASED = "aliased"; AMBIGUOUS = "ambiguous"; UNRESOLVED = "unresolved"
+
+@dataclass(frozen=True)
+class ProviderObjectBinding:
+    provider_ref: ProviderObjectRef; logical_ref: LogicalObjectRef | None
+    status: ObjectIdentityStatus; evidence_refs: tuple[str, ...]; confirmed_by: str | None
+```
+
+**Evidence MUST NOT attach to a logical object while identity is `AMBIGUOUS`/`UNRESOLVED`** — an
+incorrect FQN match would merge evidence from unrelated physical objects. `ALIASED` bindings require a
+recorded (eventually human-confirmed) mapping; ambiguous ones become review items, not silent merges.
 
 ---
 
-## 3. The authority model — a (producer × status) lattice, field-evaluated [items 1, 2]
+## 3. The authority model — producer × (strength, lifecycle), field-evaluated
 
-Authority is **not** one total order like `LLM < parser < source < human`. Whether a
-`STRUCTURAL_SOURCE@attested` beats a `PROFILE_SUPPORTED`, or whether profile-uniqueness suffices, depends
-on the **field**. So separate the two axes and let the field policy judge combinations.
+Authority is not one total order. Separate the axes and let field policy judge combinations.
 
-### 3.1 Producer and status (the two axes)
+### 3.1 Three axes: producer, assertion strength, evidence lifecycle [item 2]
 
 ```python
 class EvidenceProducer(StrEnum):
     SOURCE = "source"; STRUCTURAL_CONNECTOR = "structural_connector"; PARSER = "parser"
     LLM = "llm"; PROFILER = "profiler"; TAXONOMY = "taxonomy"; HUMAN = "human"
 
-class EvidenceStatus(StrEnum):
-    PROPOSED = "proposed"; SUPPORTED = "supported"; ATTESTED = "attested"
-    CONFIRMED = "confirmed"; REJECTED = "rejected"; STALE = "stale"
+class AssertionStrength(StrEnum):     # how strongly THIS producer asserts the value
+    PROPOSED = "proposed"; SUPPORTED = "supported"; ATTESTED = "attested"; CONFIRMED = "confirmed"
+
+class EvidenceLifecycle(StrEnum):     # the record's own lifecycle (orthogonal to strength)
+    ACTIVE = "active"; REJECTED = "rejected"; STALE = "stale"; SUPERSEDED = "superseded"
 ```
 
-An assertion is a `(producer, status)` pair (e.g. `(profiler, supported)`, `(human, confirmed)`), plus
-its value and evidence. There is no global ranking of these pairs.
+An assertion is `(producer, strength, lifecycle)` + value + evidence. Typical strengths: profiler →
+`supported`, structural connector → `attested`, human → `confirmed`, LLM → `proposed`. **Human acceptance
+of an LLM value creates a NEW human `confirmed` evidence row and a decision event — it never rewrites the
+LLM row's producer/strength** (provenance stays honest). `rejected`/`stale`/`superseded` are lifecycle
+transitions, never producer strengths.
 
-### 3.2 Authority propagation (status-based, not `min(enum)`) [corrected]
+### 3.2 Status propagation (not `min(enum)`)
 
-> A derived value **cannot carry a stronger assertion status than any required input**, and its
-> usability is re-evaluated by the **target field's** policy — not by a scalar minimum.
+A derived value cannot carry a stronger **assertion strength** than any required input; its **usability**
+is re-judged by the target field's policy. `additivity = registry(concept)` with `concept @ (llm,
+proposed)` yields `additivity @ (taxonomy, proposed)`; the additivity policy then decides whether a
+*proposed* taxonomy derivation may gate a sum (it may not — §8). Governed mapping makes the *rule* sound;
+it cannot lift the *input's* strength.
 
-So `additivity = registry(concept)` where the input `concept` is `(llm, proposed)` yields
-`additivity @ (taxonomy-derived, proposed)`; the additivity field's policy then decides whether a
-proposed taxonomy derivation may gate a sum (it may not — §8). The governed mapping makes the *rule*
-sound; it cannot lift the *input's* status. This closes the concept back-door (`monetary_flow` vs
-`monetary_stock`) without pretending statuses form one ladder.
+### 3.3 Source trust per (source, field)
 
-### 3.3 Source trust is per (source, field) [item 2]
-
-`SOURCE_DECLARED` is not automatically governed. A glossary curates definitions/domain/BIAN but its
-`sensitivity=public` or prose-embedded type hint must **not** override a taxonomy floor or structural
-restriction. Each reader declares a capability profile:
+A reader declares which fields it can authoritatively assert; unverified fields enter as *proposals*:
 
 ```python
 @dataclass(frozen=True)
 class SourceCapabilityProfile:
-    source_type: str                              # "ftr_glossary"
-    governed_fields: frozenset[str]               # asserted at ATTESTED status  (business_term, definition, domain, bian_path, fibo_path)
-    declared_unverified_fields: frozenset[str]    # asserted at PROPOSED status  (sample_profile, sensitivity, logical_type_hint)
-    structural_fields: frozenset[str]             # none for a glossary
+    source_type: str
+    attested_fields: frozenset[str]              # governed → enters at strength=attested
+    proposed_fields: frozenset[str]              # declared-but-unverified → enters at strength=proposed
+    structural_fields: frozenset[str]            # none for a glossary
 ```
 
-Authority is granted per (source, field): a governed field enters at `attested`; an unverified field
-enters at `proposed`, subject to the field policy like any other proposal.
+A glossary's `sensitivity=public` or prose type-hint enters as a *proposal*, never overriding a taxonomy
+floor or structural restriction.
 
 ---
 
-## 4. Field policy contract — a policy *language*, not an allowlist [item 1]
+## 4. Policy — an expression language, not an allowlist
 
-v1's `frozenset[...] min_authority` was mislabelled (a set is an allowlist, and it can't express "LLM
-proposal **plus** profile support qualifies as review-ready"). v2 uses rules with `any_of` / `all_of`:
+### 4.1 Authority predicate tree [item 1]
+
+`any_of`/`all_of` as two fields is ambiguous (does a rule with both mean AND-of-OR or OR?). Use a closed,
+composable predicate:
 
 ```python
+class AuthorityPredicate: ...
 @dataclass(frozen=True)
-class Condition:
-    producer: EvidenceProducer; status: EvidenceStatus
+class HasEvidence(AuthorityPredicate): producer: EvidenceProducer; strength: AssertionStrength
+@dataclass(frozen=True)
+class AnyOf(AuthorityPredicate): conditions: tuple[AuthorityPredicate, ...]
+@dataclass(frozen=True)
+class AllOf(AuthorityPredicate): conditions: tuple[AuthorityPredicate, ...]
+```
 
-@dataclass(frozen=True)
-class AuthorityRule:
-    any_of: tuple[Condition, ...] = ()      # any single condition satisfies
-    all_of: tuple[Condition, ...] = ()      # a combination is required
+```python
+operational = AnyOf((HasEvidence("structural_connector","attested"),
+                     HasEvidence("human","confirmed")))
+grain_review = AllOf((HasEvidence("llm","proposed"), HasEvidence("profiler","supported")))
+```
+
+Predicates evaluate only over `lifecycle == ACTIVE` evidence.
+
+### 4.2 Three influence tiers [item 16]
+
+"May gate feature-gen" is too binary — domain/feature_role *influence* generation without determining
+buildability or safety. Every field declares its highest tier:
+
+```python
+class InfluenceTier(StrEnum):
+    DISPLAY = "display"              # search / UI only
+    RECOMMENDATION = "recommendation"  # ranking / routing / applicability
+    OPERATIONAL = "operational"     # binding / joins / PIT / safety / computation
+```
+
+Policy carries a predicate per tier a field participates in.
+
+### 4.3 Disqualifiers [item 5]
+
+Positive rules aren't enough — an old human confirmation could still satisfy a rule after the source
+changed. Evaluation is `satisfies(positive) AND NOT any(disqualifier)`:
+
+```python
+class Disqualifier(StrEnum):
+    STALE_SELECTED_EVIDENCE = "stale_selected_evidence"
+    ACTIVE_HIGH_SEVERITY_CONFLICT = "active_high_severity_conflict"
+    AMBIGUOUS_OBJECT_IDENTITY = "ambiguous_object_identity"
+    MISSING_REQUIRED_SNAPSHOT = "missing_required_snapshot"
+    CONFIRMATION_PENDING_REVALIDATION = "confirmation_pending_revalidation"
+```
+
+### 4.4 Resolution mode [item 10]
+
+Advisory fields resolve through the generic resolver; load-bearing typed facts resolve through their
+specialized fact projection (§5.3). The policy states which:
+
+```python
+class ResolutionMode(StrEnum):
+    GENERIC_FIELD = "generic_field"; SPECIALIZED_FACT = "specialized_fact"
 
 @dataclass(frozen=True)
 class FieldPolicy:
-    risk_class: FieldRiskClass                     # ADVISORY | STRUCTURAL | SAFETY_CRITICAL
-    display_rules: tuple[AuthorityRule, ...]       # may appear in the (search/display) projection
-    operational_rules: tuple[AuthorityRule, ...]   # may GATE feature construction
-    conflict_strategy: ConflictStrategy            # per-field algebra (§6.2)
-    reupload_strategy: ReuploadStrategy            # §6.3
-    unresolved_behavior: UnresolvedBehavior        # what "load-bearing effective" is when unmet
+    influence_max: InfluenceTier
+    display_rule: AuthorityPredicate
+    recommendation_rule: AuthorityPredicate | None
+    operational_rule: AuthorityPredicate | None
+    disqualifiers: tuple[Disqualifier, ...]
+    conflict_strategy: ConflictStrategy          # §6.2
+    reupload_strategy: ReuploadStrategy          # §6.3
+    resolution_mode: ResolutionMode              # §5.3
+    unresolved_behavior: UnresolvedBehavior
 ```
 
-Examples:
-
-```python
-# join: usable only when structurally attested or human-confirmed
-operational_rules=(AuthorityRule(any_of=(Condition("structural_connector","attested"),
-                                         Condition("human","confirmed"))),)
-# grain: LLM+profile is a review-ready proposal; only structural/human/profile+human is load-bearing
-display_rules=(AuthorityRule(all_of=(Condition("llm","proposed"),Condition("profiler","supported"))),)
-```
-
-### 4.1 Producer × mutation matrix [item 11]
-
-Each producer's allowed effects are fixed so "proposal" can't be reinterpreted per phase:
+### 4.5 Producer × mutation matrix (unchanged)
 
 | Producer | Write evidence | Emit proposed event | Display projection | Feature gating |
 |---|---|---|---|---|
-| Glossary reader | yes | governed fields → yes | yes | field-policy dependent |
-| Parser (sample values) | yes | derived only | yes | limited (corroboration) |
-| LLM | yes | yes | yes | advisory fields only |
+| Glossary reader | yes | attested fields → yes | yes | field-policy dependent |
+| Parser | yes | derived only | yes | limited (corroboration) |
+| LLM | yes | yes | yes | advisory tiers only |
 | Profiler | yes | yes | yes | never alone for joins/entity |
-| Taxonomy | derived evidence | no new human event | yes | authority-propagated (§3.2) |
+| Taxonomy | derived evidence | no human event | yes | strength-propagated |
 | Human | yes | confirmation event | yes | yes |
 
 ---
 
-## 5. Evidence & decision persistence [items 3, 4]
+## 5. Persistence — evidence, decisions, typed facts
 
-Reuse **one** event/authority framework, but do not force every field into a generic JSON `OVERLAY_FACT`.
-Three record kinds + the existing specialized facts:
-
-- **`events`** — the universal append-only lifecycle (unchanged).
-- **`field_evidence`** — every producer claim, item-level (the load-bearing evidence index; `llm_call`
-  stays the immutable *raw* audit):
-
-  ```python
-  @dataclass(frozen=True)
-  class FieldEvidenceRecord:
-      evidence_id: str; logical_ref: LogicalObjectRef; field_name: str
-      proposed_value: object; proposed_value_hash: str
-      producer: EvidenceProducer; producer_ref: str            # llm_call_ref / parser_run / profile_run / event_id
-      producer_item_ref: str | None                            # the BATCH ITEM ref within an llm_call (Pass A)
-      evidence_spans: tuple[str, ...]; confidence_band: str | None
-      source_snapshot_id: str; object_identity: str; input_hash: str; producer_version: str
-      created_at: datetime
-  ```
-- **`field_decision_events`** — the proposed/confirmed/rejected/staled lifecycle of a field's effective
-  value:
-
-  ```python
-  @dataclass(frozen=True)
-  class FieldDecisionRecord:
-      decision_id: str; logical_ref: LogicalObjectRef; field_name: str
-      selected_evidence_ids: tuple[str, ...]; effective_value: object; effective_value_hash: str
-      authority_state: tuple[Condition, ...]; decision_rule_version: str
-  ```
-- **Specialized typed facts stay typed:** `grain`, `availability_time`, and `approved_join` keep their
-  existing keys/validators (`approved_join`'s two-endpoint `ApprovedJoinRef` + dual-owner
-  `join_confirmation` is exactly the relationship confirmation path — §... ). New load-bearing table
-  facts (grain candidate → confirmed grain) flow through the existing PROPOSED→CONFIRMED events, not a
-  JSON blob.
-
-Rule of thumb: **advisory/soft fields** live as `field_evidence` + a `field_decision`; **load-bearing
-facts with established typed schemas** (grain, availability, joins) reuse the specialized fact events.
-The graph tables stay flat; a `graph_field_evidence` view links each effective node/edge property to its
-decision + evidence for provenance queries.
-
----
-
-## 6. The resolver — one function, two outputs, field-specific merge
-
-### 6.1 Two projections from one resolver
-
-A single resolver reads all `field_evidence` for a `(logical_ref, field)` and emits **both**:
-`display_effective` (strongest accepted proposal, satisfies `display_rules`) and `load_bearing_effective`
-(satisfies `operational_rules`, else `unresolved`). Never two code paths — they would drift.
-
-### 6.2 Conflict lattices are field-specific [item 8]
-
-No generic `max(values)`. Each safety/structural field declares its algebra:
-
-- **Ordered severity (a floor):** `sensitivity` severity `public < internal < confidential < restricted
-  < prohibited` — take the most restrictive; taxonomy supplies a **minimum floor** only (§8), never a
-  ceiling.
-- **Accumulated set:** `sensitivity_classes` (`personal_data`, `financial_data`, `health_data`,
-  `protected_attribute`) — **union** of all non-rejected evidence; these are incomparable, not collapsed.
-- **Boolean safety flags** (`leakage_anchor`): `true` dominates `false`.
-- **Grain / join conflict:** disagreement → **unresolved, no winner** (surface a review item).
-
-### 6.3 Staleness & re-upload merge [item 9, item 12]
-
-Every evidence record carries `source_snapshot_id + object_identity + input_hash + producer_version`.
-On re-upload the resolver does NOT blindly re-apply "current LLM proposals by object ref":
-
-```text
-same logical object + same relevant input_hash   -> evidence reusable
-same object + changed input                       -> old evidence STALE (must be re-produced)
-renamed object with a CONFIRMED identity mapping  -> evidence migrated explicitly
-removed object                                    -> evidence inactive
-```
-
-Human-confirmed overrides survive (generalize `entity_suggestion status='applied'`) but **revalidate**
-if the underlying object materially changes — a confirmed value on a column whose type/definition moved
-becomes a review item, not a silent carry-over. `build_graph` order: build source → taxonomy derivations
-(status-propagated) → reusable+fresh proposals → confirmed overrides (revalidated) → per-field conflict
-merge.
-
----
-
-## 7. Feature readiness — blockers first, percentages second [item 7]
-
-A percentage misleads ("82% safety complete" can hide one unclassified PII column). Compute from explicit
-requirements; gate features on **blockers**, not scores:
+### 5.1 field_evidence (item-level; llm_call stays raw audit) [items 4, 12]
 
 ```python
 @dataclass(frozen=True)
+class FieldEvidenceRecord:
+    evidence_id: str; logical_ref: LogicalObjectRef; field_name: str
+    proposed_value: object; proposed_value_hash: str
+    producer: EvidenceProducer; strength: AssertionStrength; lifecycle: EvidenceLifecycle
+    producer_ref: str                     # llm_call_ref / parser_run / profile_run / event_id
+    producer_item_ref: str | None         # BATCH ITEM ref within an llm_call (Pass A)
+    producer_configuration_hash: str      # replay: model+prompt+schema+gen-settings | parser rules+registry+locale
+    evidence_spans: tuple[str, ...]; confidence_band: str | None
+    source_snapshot_id: str; object_identity: str; input_hash: str; producer_version: str
+    created_at: datetime
+```
+
+`producer_configuration_hash` makes replay deterministic — for the LLM it fingerprints
+model/prompt/schema/generation-settings; for a parser/taxonomy it fingerprints the rule-set + concept
+registry snapshot + locale + normalization. `producer_ref` must resolve the raw record (e.g. `llm_call`).
+
+### 5.2 field_decision_events (append-only, replayable) [item 3]
+
+```python
+@dataclass(frozen=True)
+class FieldDecisionEventV1:
+    decision_event_id: str; logical_ref: LogicalObjectRef; field_name: str
+    event_type: Literal["resolved","confirmed","rejected","staled","superseded"]
+    selected_evidence_ids: tuple[str, ...]; evidence_set_hash: str
+    display_effective_value: object | None
+    load_bearing_effective_value: object | None       # None when authority insufficient
+    conflict_status: str; reason_codes: tuple[str, ...]
+    field_policy_version: str; resolver_version: str
+    actor_ref: str | None; supersedes_event_id: str | None; created_at: datetime
+```
+
+The two-output resolver persists **both** effective values in one event (same evidence set + policy
+version). Supersession chains give replay; nothing is mutated in place.
+
+### 5.3 Typed-fact boundary [item 10]
+
+For `resolution_mode == SPECIALIZED_FACT` (grain, availability, join):
+
+```text
+field_evidence            -> PROPOSAL evidence only (a grain candidate, a join proposal)
+specialized fact event    -> references the evidence_ids; is the OPERATIONAL truth
+graph projection          -> reads the specialized fact projection for the load-bearing value
+```
+
+The generic resolver may still emit a **display** candidate (`grain_candidate = transaction`), but the
+**load-bearing** value comes *exclusively* from the specialized fact projection — there is **no**
+independent load-bearing `FieldDecisionEvent` for a specialized field. Rejecting a grain proposal marks
+its evidence `rejected` and emits no grain fact.
+
+### 5.4 events + graph
+`events` = the universal append-only lifecycle. `grain`, `availability_time`, `approved_join` keep their
+typed schemas. `graph_node`/`graph_edge` stay flat for search/lineage; a `graph_field_evidence` view
+links each effective property → its decision event + evidence for provenance queries.
+
+---
+
+## 6. Resolver — two outputs, field-specific merge, staleness
+
+### 6.1 One resolver, two outputs
+Reads all `ACTIVE` evidence for `(logical_ref, field)`; emits `display_effective` (satisfies the display
+predicate) and `load_bearing_effective` (satisfies the operational predicate AND no disqualifier fires,
+else `unresolved`). One function — the outputs never drift.
+
+### 6.2 Conflict lattices are field-specific [no generic max()]
+- **Ordered severity floor:** `sensitivity` `public < internal < confidential < restricted < prohibited`
+  — most restrictive wins; taxonomy is a floor only (§7).
+- **Accumulated set:** `sensitivity_classes` (personal/financial/health/protected) — union of non-rejected
+  evidence.
+- **Boolean safety flags** (`leakage_anchor`): `true` dominates.
+- **Grain/join conflict:** disagreement → unresolved, no winner → review item (§10).
+
+### 6.3 Staleness & re-upload [items 9-context]
+Evidence carries `source_snapshot_id + object_identity + input_hash + producer_configuration_hash`. On
+re-upload: same object + same input_hash → reusable; changed input → `STALE`; renamed with a confirmed
+identity mapping → migrated; removed → inactive. Confirmed overrides survive but **revalidate** on
+material change (→ `CONFIRMATION_PENDING_REVALIDATION` disqualifier until re-confirmed). Resolver order:
+source → taxonomy derivations (strength-propagated) → reusable-fresh proposals → confirmed overrides
+(revalidated) → per-field conflict merge → disqualifier check.
+
+---
+
+## 7. Safety floor + governed override [item 6]
+
+Concept-registry sensitivity is a **baseline minimum restriction floor**. It may only be made *more*
+restrictive by source/human evidence. A downgrade **below** the floor is not a normal confirmation — a
+data owner asserting `RESTRICTED → PUBLIC` must not silently win. It requires a distinct governance act:
+
+```python
+class GovernanceAuthority(StrEnum):
+    DATA_OWNER = "data_owner"; SECURITY = "security"; PRIVACY = "privacy"; MODEL_RISK = "model_risk"
+
+@dataclass(frozen=True)
+class SafetyOverride:
+    field: str; previous_floor: str; override_value: str
+    approved_by_authority: GovernanceAuthority; rationale: str
+    policy_reference: str; effective_until: datetime | None
+```
+
+A reduction below a safety floor requires the specific authority + explicit reason + scoped effective
+period + policy reference. Absent a `SafetyOverride`, the floor holds (fail-closed).
+
+---
+
+## 8. Concept — advisory vs operational [item 7]
+
+"Registry-valid" only proves the value *exists* in the taxonomy, not that it's *correct* — a valid but
+wrong `monetary_flow` must not silently authorize an additive aggregation. Split the uses:
+
+| Concept use | Requirement |
+|---|---|
+| **Advisory** (search, retrieval, candidate recipe matching) | registry-valid LLM proposal |
+| **Operational** (derives additivity / sensitivity / leakage / PIT / entity / join semantics) | source-attested, human-confirmed, or *permitted calibrated auto-promotion for low-risk concepts* |
+
+There is no single operational concept rule — the required authority scales with the **blast radius of
+what the concept derives**. A concept feeding a safety derivation inherits that field's stricter bar.
+
+---
+
+## 9. Feature readiness — scoped; load-bearing is recipe/run-scoped [item 9]
+
+Catalog-wide readiness misleads (one unresolved sensitivity on an unused archive table must not block all
+generation). Readiness is computed at multiple scopes; the **gating** decision is recipe/run-scoped:
+
+```python
+class ReadinessScopeType(StrEnum):
+    CATALOG = "catalog"; TABLE = "table"; GENERATION_RUN = "generation_run"; RECIPE = "recipe"
+
+@dataclass(frozen=True)
 class ReadinessRequirement:
-    requirement_id: str                      # "table.grain", "column.sensitivity"
+    requirement_id: str; scope: ReadinessScopeType
     status: Literal["confirmed","proposed","missing","conflicting"]
-    blocking: bool; authority_required: tuple[Condition, ...]
+    blocking: bool; authority_required: AuthorityPredicate
 
 @dataclass(frozen=True)
 class FeatureReadiness:
-    operational_status: Literal["ready","blocked"]
+    scope: ReadinessScopeType; operational_status: Literal["ready","blocked"]
     blocking_requirements: tuple[ReadinessRequirement, ...]
     review_requirements: tuple[ReadinessRequirement, ...]
-    advisory_gaps: tuple[str, ...]
-    summary_scores: dict[str, float]          # DISPLAY only, derived from the requirements
+    advisory_gaps: tuple[str, ...]; summary_scores: dict[str, float]   # DISPLAY only
 ```
 
-Feature generation reads `blocking_requirements`; the percentages are a dashboard convenience derived
-from the same requirement list.
+Feature generation asks: *are all fields actually used by THIS plan sufficiently authoritative?* Catalog
+readiness is for planning/UI; percentages are derived from the requirement list, never the gate.
 
 ---
 
-## 8. Safety defaults — taxonomy is a floor, not the final word [item 10]
+## 10. Conflict-review lifecycle [item 13]
 
-Concept-registry sensitivity (`customer_identifier → sensitive`) is a **baseline minimum restriction
-floor**. Source/human evidence may make it **more** restrictive; nothing (including a confident LLM or a
-`sensitivity=public` glossary cell) may make it **less** restrictive without an explicit governed
-override. `taxonomy=INTERNAL` + `source=RESTRICTED` → `RESTRICTED`; `taxonomy=RESTRICTED` + `llm=PUBLIC`
-→ `RESTRICTED`. Fail-closed. (Real sensitivity also depends on jurisdiction, masking, direct-vs-derived,
-column combinations, purpose — so the taxonomy value is deliberately only the floor.)
+Conflicts (esp. human-confirmed-vs-new-source) need a stable identity so a re-upload doesn't spam
+duplicates:
 
----
+```python
+conflict_fingerprint = hash(logical_ref, field_name, sorted(competing_value_hashes), field_policy_version)
 
-## 9. Relationship promotion (Pass C) — evidence matrix, into the existing lifecycle
+class ConflictState(StrEnum):
+    OPEN="open"; ACKNOWLEDGED="acknowledged"; RESOLVED="resolved"
+    DISMISSED="dismissed"; STALE="stale"; REOPENED="reopened"
+```
 
-Semantic similarity is never authority. Two `ACCOUNT_ID`s may be different namespaces (customer vs
-counterparty). Promotion uses the join evidence matrix (LLM-only → proposal; +profile overlap/cardinality
-→ review candidate; declared FK / approved catalog join → usable; human-confirmed → usable). **Default
-banking posture: source or human authority required to *use* a join.** Proposals flow through the
-existing `approved_join` two-endpoint fact + dual-owner `join_confirmation` lifecycle — no new edge
-authority system. Profiling **supports** grain/join/cardinality candidates but **cannot** establish
-semantic entity identity alone [item 11] — entity promotion needs source / governed identifier namespace
-/ taxonomy-backed / human evidence, expressed as `all_of` rules.
+A conflict record carries the fingerprint, competing evidence ids, severity, owner, and lifecycle;
+re-detecting the same fingerprint reopens/updates rather than duplicates.
 
 ---
 
-## 10. Type model + the corrected "core" invariant [item 12]
+## 11. Human confirmation — scope + expiry + revalidation [item 14]
 
-Three type layers: `physical_type` (DB source), `logical_type` (representation, e.g. `numeric_string`),
-`semantic_type` (role, e.g. `identifier`). Never label a prose-derived type as a database type.
+Not every confirmation lives forever. Confirmation records carry:
 
-**Corrected invariant** (v1 overclaimed "the core is untouched"):
+```python
+effective_from: datetime; effective_until: datetime | None
+scope: str                 # column / table / recipe / global
+review_due_at: datetime | None
+```
 
-> The existing ingestion lifecycle remains the orchestration backbone. New evidence, authority
-> resolution, and merge stages are **inserted** without weakening validation, the append-only fact
-> history, drift handling, quarantine, or rebuildability. Reader output, evidence persistence, the graph
-> projection, re-upload merge, field resolution, review diagnostics, and possibly some fact types **do**
-> change.
-
----
-
-## 11. Calibration — policy-gated, never authority-granting [item 16]
-
-Auto-promotion requires **both**: the field policy explicitly permits calibrated auto-promotion **and**
-the calibrated reliability threshold passes. Calibration never creates authority for a safety/structural
-field (definition/domain may auto-promote; concept is advisory-validated; grain/join/sensitivity are
-never sole-authority auto-promoted). Store `model_reported_confidence` and `calibrated_reliability`
-separately; calibration governs the **advisory** tier where the decision is "auto-promote vs review."
-Reuse the batched-enrichment gold-set harness; per-field gates (sensitivity: zero false-negative on the
-critical set; join: zero false-confirmed; grain: zero incorrect auto-promotions). Gate controls
-promotion, not proposal generation.
+Re-upload revalidation distinguishes: still-valid / stale (input changed) / expired (`effective_until`
+passed) / conflicts (new source disagrees). A grain confirmation may be durable; a sensitivity override
+may need annual review; a join approval may be schema-version-bound.
 
 ---
 
-## 12. Hierarchical LLM batching (unchanged shape; Pass A shipped)
+## 12. Relationships (Pass C) — evidence matrix, governed lifecycle
 
-- **Pass A — column semantics** (SHIPPED = the merged batching engine): concept, logical-type proposal,
-  role/sensitivity *proposals*, normalized definition/domain — 20–40 cols/call, focused retry.
-- **Pass B — table synthesis:** entity, grain candidate + key candidates, event-vs-snapshot, time cols.
-- **Pass C — relationships:** deterministic candidate **blocking** first, then §9 evidence; hard caps
-  (O(tables²)); `relationship_search_truncated=true` when a cap hits — never claim full coverage silently.
-- **Pass D — reconciliation:** contradictions / islands / unresolved entities / review priorities →
-  **worklist only, no graph-writing authority.**
+Semantic similarity is never authority (two `ACCOUNT_ID`s may be different namespaces). Promotion uses
+the join evidence matrix (LLM-only → proposal; +profile overlap/cardinality → review candidate; declared
+FK / approved catalog join → usable; human-confirmed → usable). Default banking posture: source or human
+authority required to *use* a join. Proposals flow through the existing `approved_join` two-endpoint fact
++ dual-owner `join_confirmation` lifecycle. Profiling **supports** grain/join/cardinality candidates but
+**cannot** promote semantic entity identity alone (needs source / governed namespace / taxonomy / human,
+expressed as `AllOf`).
 
----
-
-## 13. Field policy matrix (corrected)
-
-| Field | LLM may propose | Aids search now | May gate feature-gen | Load-bearing rule (operational) |
-|---|---|---|---|---|
-| definition | yes | yes | not directly | LLM proposed allowed |
-| domain | yes | yes | advisory routing only | LLM proposed allowed |
-| concept | yes | yes | yes (registry-validated) | validated controlled concept |
-| feature_role | yes | yes | ranking only | LLM proposed allowed |
-| logical_type | yes | yes | limited | parser corroboration or source attested |
-| additivity | fallback only | yes | yes | taxonomy-derived **from a confirmed concept**, or confirmed |
-| temporal_role | fallback only | yes | yes | taxonomy(confirmed concept) / source / human |
-| sensitivity | yes, conservative | yes | yes | source / taxonomy-floor / human; most-restrictive |
-| leakage_anchor | proposal only | yes | yes | governed taxonomy / human |
-| entity | yes | yes | soft until confirmed | source / human / (profile **+** taxonomy/namespace) |
-| grain | yes | display only | no | structural or human (profile supports, not alone) |
-| as_of / availability | yes | display only | no | structural or human confirmation |
-| join | yes | display only | no | approved structural or human confirmation |
-| cardinality | yes | display only | no | structural / (profile-supported **+** confirmation) |
-
-("profile-supported alone" is removed as a sole authority for `entity`; additivity/temporal_role now
-require a **confirmed** concept, per §3.2 propagation.)
+### 12.1 Retire the ungoverned `joins_to` bypass — Phase 0/1 hardening [item 11]
+Today a declared `joins_to` writes a directly-usable `graph_edge 'joins'` with no event — a **bypass of
+the entire authority model**. This is not a Phase-3 cleanup. Required, dated:
+```text
+declared joins_to  ->  source evidence (strength=attested per source capability)
+                   ->  approved_join PROPOSED/ATTESTED event
+                   ->  governed projection (display now; feature-use per join policy)
+```
+No direct operational edge write. Migrate existing declared joins into attested fact records; keep
+rendering them in the display graph; gate feature use through the join policy. Retirement deadline set in
+the Phase 0/1 plan.
 
 ---
 
-## 14. Revised sequencing [items 5, 6] — kernel first
+## 13. Type model + corrected invariant
+Three type layers — `physical_type` (DB source), `logical_type` (`numeric_string`), `semantic_type`
+(`identifier`). Never label a prose-derived type as a database type.
 
-### Phase 0 — Authority kernel (ships before any new enrichment)
-Logical/provider identity (§2); `field_evidence` + item-level `llm_call` linkage; `FieldPolicy` registry;
-the `AuthorityRule` evaluator; status propagation; per-field conflict lattices; the two-output resolver;
-evidence staleness rules; `field_decision_events`. No new LLM enrichment yet. This is the minimum safe
-foundation everything else stands on.
+**Corrected invariant:** the existing ingestion lifecycle remains the orchestration backbone; new
+evidence, authority resolution, and merge stages are **inserted** without weakening validation, the
+append-only fact history, drift, quarantine, or rebuildability. Reader output, evidence persistence, the
+graph projection, re-upload merge, field resolution, review diagnostics, and some fact types **do** change.
 
-### Phase 1 — FTR semantic front door (no joins, no grain promotion) [item 6]
-Glossary reader (+ rich BIAN/FIBO sidecar as provenance); deterministic sample-value parser; Pass A
-proposals; concept normalization; taxonomy derivation (status-propagated); flat graph projection with
-provenance via the resolver; source-capability + blocker-based readiness diagnostics. Proves
-`glossary row → column evidence → field authority resolution → rich searchable node`.
+## 14. Calibration — policy-gated, never authority-granting
+Auto-promotion requires the field policy to *permit* calibrated auto-promotion **and** the calibrated
+threshold to pass; calibration never creates authority for a safety/structural field. Store
+`model_reported_confidence` and `calibrated_reliability` separately. Reuse the batched-enrichment gold-set
+harness; per-field gates (sensitivity: zero false-negative on the critical set; join: zero false-confirmed;
+grain: zero incorrect auto-promotions). Gate controls promotion, not proposal generation.
+
+---
+
+## 15. Passes — honest status + destinations
+
+### 15.1 Pass A — transport shipped, evidence schema to extend [item 8]
+- **Shipped:** the batched-enrichment *transport + degradation substrate* (governed batch seam, ref-set
+  validation, chunking, degradation ladder, per-item audit, kill switch) — and it currently returns
+  `concept / definition / domain` only.
+- **To extend for Phase 1:** logical/semantic type, identifier/temporal roles, evidence spans, per-field
+  confidence, `source_snapshot_id`, `input_hash`, `producer_configuration_hash`, and **item-level
+  FieldEvidenceRecords**. Phase 1 is not "wire in an existing Pass A" — it extends Pass A's evidence schema.
+- **Legacy-cache migration:** existing `enrichment_*` rows → backfill producer/version where possible;
+  **do not invent evidence spans retrospectively**; mark legacy concept values **display-only** unless
+  they meet the operational concept bar (§8).
+
+### 15.2 Pass B — table synthesis destinations [item 15]
+| Pass B output | Destination |
+|---|---|
+| Table role | advisory field evidence |
+| Primary entity | field evidence / confirmation |
+| Grain candidate | typed **grain** fact proposal (`resolution_mode=specialized_fact`) |
+| As-of candidate | typed **availability** fact proposal |
+| Event/snapshot classification | advisory or structural per use |
+| Time columns | evidence linked to the availability proposal |
+
+### 15.3 Pass C / Pass D
+Pass C = §12 (blocked candidates → join evidence → governed proposals). Pass D = reconciliation worklist
+only (contradictions / islands / unresolved entities / review priorities) — **no graph-writing authority.**
+
+---
+
+## 16. Field policy matrix (three-tier)
+
+| Field | Producers that may propose | Max influence tier | Operational rule (if OPERATIONAL) |
+|---|---|---|---|
+| definition | llm, source | RECOMMENDATION | — |
+| domain | llm, source | RECOMMENDATION | — |
+| concept (advisory) | llm | RECOMMENDATION | registry-valid |
+| concept (operational) | llm→confirm, source, human | OPERATIONAL | source-attested / human-confirmed / low-risk calibrated |
+| feature_role | llm | RECOMMENDATION | — |
+| logical_type | llm, parser, source | OPERATIONAL (limited) | parser corroboration or source attested |
+| additivity | taxonomy(confirmed concept), human | OPERATIONAL | taxonomy from a **confirmed** concept, or confirmed |
+| temporal_role | taxonomy(confirmed concept), source, human | OPERATIONAL | taxonomy(confirmed) / source / human |
+| sensitivity | taxonomy(floor), source, human, governance | OPERATIONAL | floor + most-restrictive; downgrade needs SafetyOverride |
+| leakage_anchor | taxonomy, human | OPERATIONAL | governed taxonomy / human |
+| entity | llm, source, human, (profiler+taxonomy) | OPERATIONAL | source / human / (profile **AND** namespace/taxonomy) |
+| grain | llm, profiler, structural, human | OPERATIONAL (specialized_fact) | structural or human (profile supports, not alone) |
+| as_of / availability | structural, human | OPERATIONAL (specialized_fact) | structural or human |
+| join | llm, profiler, structural, human | OPERATIONAL (specialized_fact) | approved structural or human |
+| cardinality | profiler, structural, human | OPERATIONAL | structural / (profile-supported AND confirmation) |
+
+---
+
+## 17. Sequencing + approval gates
+
+### Phase 0 — Authority kernel (before any new enrichment)
+Identity + binding (§2); `field_evidence` (+ configuration hash) + item-level `llm_call` linkage;
+`FieldPolicy` registry + `AuthorityPredicate` evaluator + disqualifiers; strength propagation; per-field
+conflict lattices; the two-output resolver; `field_decision_events`; staleness; conflict-review lifecycle;
+**`joins_to` bypass retirement** (§12.1).
+
+**Phase 0 may proceed once these 10 contracts are finalized:** (1) authority-predicate semantics; (2)
+assertion-strength vs evidence-lifecycle; (3) field-decision event schema; (4) object identity/binding;
+(5) disqualifier semantics; (6) safety-override authority; (7) generic-field vs specialized-fact
+resolution mode; (8) readiness scope model; (9) conflict-review lifecycle; (10) `joins_to` retirement.
+
+### Phase 1 — FTR semantic front door (no joins, no grain promotion)
+Glossary reader (+ BIAN/FIBO provenance sidecar); deterministic sample-value parser; **Pass A evidence
+extension**; concept normalization; taxonomy derivation (strength-propagated); flat projection with
+provenance via the resolver; scoped readiness diagnostics.
+
+**Phase 1 must prove:** FTR row → stable logical object; rich context reaches the LLM; Pass A writes
+item-level evidence; display projection shows proposals; operational projection stays `unresolved` where
+authority is insufficient; **no safety/structural field becomes load-bearing from LLM evidence alone**;
+re-upload stales changed proposals; human-confirmed values survive but revalidate.
 
 ### Phase 2 — Table facts
-Pass B; grain / availability candidates; event/snapshot classification; a review queue for load-bearing
-table facts; human confirmation persistence (revalidated on re-upload).
+Pass B (destinations §15.2); grain/availability candidates → typed fact proposals; review queue; human
+confirmation persistence (scoped/expiring).
 
 ### Phase 3 — Structural provider fusion + relationships
-The logical-catalog/provider model in anger; OpenMetadata/DDL pairing by `LogicalObjectRef`; profiling
-evidence; deterministic relationship candidate blocking; Pass C; `approved_join` proposals + evidence-based
-confirmation.
+Logical/provider model in anger; OpenMetadata/DDL pairing by `LogicalObjectRef`; profiling evidence;
+deterministic candidate blocking; Pass C; `approved_join` proposals + confirmation.
 
 ### Phase 4 — Reconciliation & operating model
-Pass D; calibration; prioritized HITL (risk × feature-unlock × evidence strength × reuse) with
-feature-unlock analysis; conflict-resolution workflows; operational dashboards.
+Pass D; calibration; prioritized HITL (risk × feature-unlock × evidence strength × reuse) with unlock
+analysis; conflict-resolution workflows; dashboards.
 
 ---
 
-## 15. What stays invariant
-The corrected §10 statement. Enrichment/evidence stays advisory + fail-soft; governed egress + audit on
-every LLM call; the graph is a rebuildable projection; `events` / `field_evidence` / `field_decision_events`
-/ `llm_call` / the typed facts are the truth.
-
-## 16. Open dependencies
-- Availability of a structural source (governs Phase 3 effort).
-- Confirming the `approved_join` envelope carries every relationship dimension (direction, cardinality,
-  namespace, evidence, effective-time, supersession) — extend if not.
-- Reconciling the ungoverned declared-`joins_to` shortcut with the governed `approved_join` path (treat a
-  declared join as `(source, attested)`).
-- Migration of the existing flat `graph_node`/`graph_edge` to carry decision/evidence links without
-  regressing search/lineage query performance.
-
-## 17. Readiness
-Architecture: approved. Spec: ready for task-level planning once Phase 0's kernel contracts (identity,
-field_evidence, FieldPolicy, AuthorityRule evaluator, resolver, staleness) are the acceptance criteria —
-they now are. The honest guarantee: aggressively LLM-driven proposals, with deterministic validation and
-human confirmation as the only paths by which a value acquires operational authority over features,
-safety, point-in-time correctness, or joins.
+## 18. Invariants, open dependencies, readiness
+Enrichment/evidence stays advisory + fail-soft; governed egress + audit on every LLM call; the graph is a
+rebuildable projection; `events` / `field_evidence` / `field_decision_events` / `llm_call` / typed facts
+are the truth. Open deps: structural-source availability (governs Phase 3); confirming the `approved_join`
+envelope carries every relationship dimension; the flat-graph → decision/evidence-link migration without
+regressing search/lineage. **Architecture: approved. Spec: ready for Phase 0 planning once the 10 Phase-0
+contracts above are the acceptance criteria — they now are.** The guarantee: aggressive LLM proposals,
+with deterministic validation or human confirmation the only path by which a value acquires operational
+authority over features, safety, point-in-time correctness, or joins.
