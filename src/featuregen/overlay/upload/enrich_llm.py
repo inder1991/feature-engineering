@@ -44,7 +44,11 @@ from featuregen.security.audit import record_security_event
 logger = logging.getLogger(__name__)
 
 _OWNER = "featuregen-overlay"
-_RUN = "overlay-enrichment"          # the audit run bucket for catalog enrichment llm_call records
+# The audit run bucket for catalog enrichment llm_call records. Exposed as ENRICHMENT_RUN_ID so the
+# evidence layer can use it as the `producer_ref` on Pass A field_evidence — tying each proposal back
+# to the immutable llm_call records recorded under this same run bucket.
+ENRICHMENT_RUN_ID = "overlay-enrichment"
+_RUN = ENRICHMENT_RUN_ID
 _REDACTION_VERSION = "metadata-only"  # inputs are names/types only — nothing to redact
 
 
@@ -231,9 +235,19 @@ def audited_enrich_call(conn, client: LLMClient, *, task: str, prompt_id: str, s
     return val or None
 
 
-# Only metadata may egress per item (Global Constraint). Any other key (e.g. a free-text definition
-# or a data value) means the item is excluded pre-egress and audited (spec C9 per-item egress).
-_ITEM_META_ALLOWED = frozenset({"table", "column", "type", "columns", "concept"})
+# Only metadata may egress per item (Global Constraint). Any other key (e.g. a data value, or a
+# TECHNICAL upload's uploader-authored `definition` free text — M4 PII risk) means the item is
+# excluded pre-egress and audited (spec C9 per-item egress). Besides the structural keys
+# (table/column/type/columns/concept), a GLOSSARY column carries curated business-semantic metadata
+# from its sidecar — the business term, its curated business definition, synonyms/aliases, data
+# domain, and BIAN/FIBO taxonomy paths. These are MEANING (semantics about the column), not raw data
+# values, so they pass the per-item egress filter under DISTINCT keys — deliberately NOT the plain
+# `definition` key (which stays forbidden, so a technical free-text definition can never ride through
+# this seam). The batch-level `assert_llm_safe` PII scan still applies on top.
+_ITEM_META_ALLOWED = frozenset({
+    "table", "column", "type", "columns", "concept",
+    "term_name", "business_definition", "synonyms", "data_domain", "bian_path", "fibo_path",
+})
 
 
 def _item_egress_ok(metadata: dict) -> bool:

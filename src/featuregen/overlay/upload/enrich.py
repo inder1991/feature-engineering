@@ -2,8 +2,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 
 from featuregen.intake.llm import LLMClient
+from featuregen.overlay.evidence import AssertionStrength, EvidenceProducer
+from featuregen.overlay.field_evidence import field_input_hash, record_field_evidence
+from featuregen.overlay.object_identity import ObjectBinding, may_attach
 from featuregen.overlay.upload import enrich_config
 from featuregen.overlay.upload.canonical import CanonicalRow
 from featuregen.overlay.upload.concepts import (
@@ -12,9 +16,18 @@ from featuregen.overlay.upload.concepts import (
     is_known_concept,
 )
 from featuregen.overlay.upload.enrich_batch import BatchItem, run_batched
-from featuregen.overlay.upload.enrich_llm import audited_enrich_call
+from featuregen.overlay.upload.enrich_llm import ENRICHMENT_RUN_ID, audited_enrich_call
+from featuregen.overlay.upload.glossary_reader import GlossaryRecord, GlossaryUpload
+from featuregen.overlay.upload.object_ref import normalize_ref, parse_ref
+
+logger = logging.getLogger(__name__)
 
 _TASK = "overlay.enrich.concept"
+
+# Cap on any single glossary-sidecar metadata value placed in an LLM request. Matches the per-value
+# bound the metadata-only egress filter (`enrich_llm._item_egress_ok`) enforces, so a long business
+# definition is trimmed to its leading meaning rather than silently excluding the whole column.
+_MAX_META_LEN = 200
 _DEF_TASK = "overlay.enrich.definition"
 _DOMAIN_TASK = "overlay.enrich.domain"
 
@@ -121,14 +134,114 @@ def _accept_bounded(max_len: int):
     return _accept
 
 
-def enrich_concepts(conn, rows: list[CanonicalRow], client: LLMClient,
-                    actor=None) -> dict[str, str]:
+def _norm(value: str) -> str:
+    """Strip + lower-case, matching ``object_ref._norm`` — so a row's (table, column) matches a
+    glossary record's normalized identity regardless of the source's casing."""
+    return value.strip().lower()
+
+
+def _records_by_tc(glossary: GlossaryUpload) -> dict[tuple[str, str], GlossaryRecord]:
+    """Index a glossary's COLUMN sidecars by normalized (table, column). The flat ``CanonicalRow`` is
+    schema-dropped (``public``-scoped), while ``GlossaryRecord.logical_ref`` is schema-PRESERVING, so
+    a row cannot join a record on the ref string; (table, column) is the stable bridge. Table-level
+    terms (no column) carry no per-column concept and are excluded."""
+    out: dict[tuple[str, str], GlossaryRecord] = {}
+    for rec in glossary.records:
+        if rec.is_table:
+            continue
+        try:
+            _source, _schema, table, column = parse_ref(rec.logical_ref)
+        except ValueError:
+            continue
+        if column is None:
+            continue
+        out[(table, column)] = rec   # ref components are already normalized (lower-cased)
+    return out
+
+
+def _concept_metadata(row: CanonicalRow, rec: GlossaryRecord | None) -> dict:
+    """The metadata-only concept-enrichment input for a column. Always names/types (M4: NEVER the
+    uploader's free-text definition on a technical row). For a GLOSSARY column (``rec`` present) it
+    ALSO carries the business-semantic sidecar — term, business definition, synonyms/aliases, data
+    domain, BIAN/FIBO paths — so the classifier reasons over meaning, not just the physical name.
+    Free-text values are bounded to ``_MAX_META_LEN`` to stay within the metadata-only egress filter."""
+    meta: dict = {"table": row.table, "column": row.column, "type": row.type}
+    if rec is not None:
+        # `business_definition` (NOT `definition`) is deliberate: the plain `definition` key stays
+        # forbidden by the egress filter so a technical upload's free text can never egress (M4); the
+        # curated glossary definition rides through under this distinct, unambiguous key.
+        for key, val in (("term_name", rec.term_name), ("business_definition", rec.definition),
+                         ("data_domain", rec.domain), ("bian_path", rec.bian_path),
+                         ("fibo_path", rec.fibo_path)):
+            if val:
+                meta[key] = val[:_MAX_META_LEN]
+        if rec.synonyms:
+            meta["synonyms"] = [s[:_MAX_META_LEN] for s in rec.synonyms]
+    return meta
+
+
+def _write_concept_evidence(conn, *, resolved: dict[str, str], by_hash: dict[str, CanonicalRow],
+                            meta_by_hash: dict[str, dict],
+                            rec_by_tc: dict[tuple[str, str], GlossaryRecord],
+                            bindings: dict[str, ObjectBinding] | None,
+                            source_snapshot_id: str) -> None:
+    """Write one ``field_evidence`` proposal per glossary column classified THIS run (spec §5.1).
+
+    ``producer=LLM`` / ``strength=PROPOSED``; ``producer_ref`` is the enrichment run bucket (ties the
+    proposal to its immutable llm_call records), ``producer_item_ref`` the batch item ref (content
+    hash), ``producer_configuration_hash`` the vocabulary fingerprint. C3: an ``unclassified`` (or any
+    non-known) value is NOT a proposal — no evidence. Only ATTACHABLE columns (``may_attach`` on the
+    Task-2 binding, when supplied) get evidence. Fail-soft + txn-safe: each write is savepointed so a
+    single failure logs and is contained, never aborting enrichment or poisoning the caller's txn."""
+    for h, concept in resolved.items():
+        if concept == UNCLASSIFIED or not is_known_concept(concept):
+            continue   # C3: unclassified / invalid is not a proposal
+        row = by_hash[h]
+        rec = rec_by_tc.get((_norm(row.table), _norm(row.column)))
+        if rec is None:
+            continue   # not a glossary column term — no schema-preserving identity to key on
+        if bindings is not None:
+            binding = bindings.get(normalize_ref(row.source, None, row.table, row.column))
+            if binding is None or not may_attach(binding):
+                continue   # attachable columns only
+        material = meta_by_hash.get(h, {"table": row.table, "column": row.column, "type": row.type})
+        try:
+            with conn.transaction():   # savepoint: contain a failed write without poisoning the txn
+                record_field_evidence(
+                    conn, logical_ref=rec.logical_ref, field_name="concept",
+                    proposed_value=concept, producer=EvidenceProducer.LLM,
+                    strength=AssertionStrength.PROPOSED, producer_ref=ENRICHMENT_RUN_ID,
+                    producer_item_ref=h, producer_configuration_hash=_vocab_fingerprint(),
+                    source_snapshot_id=source_snapshot_id,
+                    input_hash=field_input_hash(logical_ref=rec.logical_ref, field_name="concept",
+                                                material=material))
+        except Exception:  # noqa: BLE001 — advisory: an evidence-write failure never aborts enrichment
+            logger.warning("advisory concept field_evidence write failed for %s", rec.logical_ref,
+                           exc_info=True)
+
+
+def enrich_concepts(conn, rows: list[CanonicalRow], client: LLMClient, actor=None, *,
+                    glossary: GlossaryUpload | None = None,
+                    bindings: dict[str, ObjectBinding] | None = None,
+                    source_snapshot_id: str | None = None) -> dict[str, str]:
+    """Classify each column into a controlled concept; returns {content_hash: concept} (unchanged).
+
+    Glossary carry-forward (guarded — non-glossary uploads are UNCHANGED): when ``glossary`` is given,
+    each glossary column's concept input ALSO carries its business-semantic sidecar (see
+    ``_concept_metadata``), and — in batch mode — each newly-classified attachable glossary column
+    writes an item-level ``concept`` ``field_evidence`` proposal (see ``_write_concept_evidence``).
+    ``source_snapshot_id`` is required to write evidence (a NOT-NULL column); absent it, enrichment
+    still runs and returns concepts, just without the evidence side-effect."""
     by_hash: dict[str, CanonicalRow] = {content_hash(r): r for r in rows}
     result = _cache_get(conn, "enrichment_concept", list(by_hash), _CONCEPT_CACHE_VERSION)
+    rec_by_tc = _records_by_tc(glossary) if glossary is not None else {}
+
+    def _meta(row: CanonicalRow) -> dict:
+        return _concept_metadata(row, rec_by_tc.get((_norm(row.table), _norm(row.column))))
 
     if enrich_config.mode("concept") == "batch":
-        misses = [BatchItem(h, {"table": r.table, "column": r.column, "type": r.type})
-                  for h, r in by_hash.items() if h not in result]
+        meta_by_hash = {h: _meta(r) for h, r in by_hash.items() if h not in result}
+        misses = [BatchItem(h, meta_by_hash[h]) for h in meta_by_hash]
         resolved = run_batched(
             conn, client, short="concept", task=_TASK, prompt_id="overlay_concept_batch_v1",
             schema_id="overlay_concept_batch",
@@ -140,15 +253,19 @@ def enrich_concepts(conn, rows: list[CanonicalRow], client: LLMClient,
         for h, concept in resolved.items():
             _cache_put(conn, "enrichment_concept", h, concept, _CONCEPT_CACHE_VERSION)
             result[h] = concept
+        if glossary is not None and source_snapshot_id is not None:
+            _write_concept_evidence(
+                conn, resolved=resolved, by_hash=by_hash, meta_by_hash=meta_by_hash,
+                rec_by_tc=rec_by_tc, bindings=bindings, source_snapshot_id=source_snapshot_id)
         return result
 
     for h, row in by_hash.items():
         if h in result:
             continue
-        # Metadata only (names/types) — NOT the uploader's free-text definition (M4 egress risk).
+        # Metadata only (names/types + the glossary sidecar for a glossary column) — NEVER the
+        # uploader's free-text definition on a technical row (M4 egress risk).
         raw = _call(conn, client, _TASK, "overlay_concept_v1", "overlay_concept",
-                    {"table": row.table, "column": row.column, "type": row.type,
-                     "vocabulary": _CONCEPT_VOCABULARY}, "concept",
+                    {**_meta(row), "vocabulary": _CONCEPT_VOCABULARY}, "concept",
                     "Classify this column into the provided controlled concept vocabulary — choose the "
                     "single best-fitting concept name, or 'unclassified' if none fits.", actor)
         if raw is None:
