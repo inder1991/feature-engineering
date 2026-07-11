@@ -1,4 +1,5 @@
 from featuregen.overlay.upload import enrich
+from featuregen.overlay.upload import enrich_batch as eb
 from featuregen.overlay.upload import enrich_config as cfg
 from featuregen.overlay.upload.canonical import CanonicalRow
 from featuregen.overlay.upload.enrich import content_hash
@@ -37,3 +38,34 @@ def test_cache_is_version_scoped(db):
 def test_vocab_fingerprint_is_stable_and_short():
     fp = enrich._vocab_fingerprint()
     assert len(fp) == 12 and fp == enrich._vocab_fingerprint()
+
+
+def _accept_known(raw):
+    known = {"monetary_stock", "unclassified"}
+    if raw == "unclassified":
+        return "unclassified", "valid"
+    return (raw, "valid") if raw in known else (None, "invalid_value")
+
+
+def test_validate_classifies_every_return():
+    items = [eb.BatchItem("r1", {}), eb.BatchItem("r2", {}), eb.BatchItem("r3", {})]
+    results = [
+        {"ref": "r1", "concept": "monetary_stock"},   # valid
+        {"ref": "r2", "concept": "made_up"},           # invalid_value -> not cacheable
+        {"ref": "r2", "concept": "monetary_stock"},    # duplicate ref
+        {"ref": "rX", "concept": "monetary_stock"},    # extra (not requested)
+        {"ref": "r4", "concept": ""},                  # extra (not requested) + blank value
+    ]
+    # A ref may yield multiple outcomes (primary + duplicate); collapse to each ref's PRIMARY
+    # classification (duplicates are asserted distinctly below). Plain last-wins would let the
+    # trailing DUPLICATE(r2) shadow its INVALID(r2) primary.
+    out = {o.ref: o for o in eb.validate_batch_results(items, results, "concept", _accept_known)
+           if o.status != eb.DUPLICATE}
+    assert out["r1"].status == eb.VALID and out["r1"].value == "monetary_stock"
+    assert out["r2"].status == eb.INVALID and out["r2"].value is None
+    assert out["rX"].status == eb.EXTRA
+    assert out["r3"].status == eb.MISSING   # never returned
+    # the second r2 entry is a duplicate; recorded distinctly
+    dups = [o for o in eb.validate_batch_results(items, results, "concept", _accept_known)
+            if o.status == eb.DUPLICATE]
+    assert len(dups) == 1 and dups[0].ref == "r2"
