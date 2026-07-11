@@ -33,6 +33,7 @@ from __future__ import annotations
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 
+from featuregen.overlay.upload.binding_roles import JoinRole, TemporalRole
 from featuregen.overlay.upload.concepts import CONCEPT_REGISTRY, concept
 from featuregen.overlay.upload.read_scope import allowed_sensitivities
 
@@ -52,6 +53,10 @@ class Need:
     role: str            # binding slot, e.g. "stock_col", "asof", "entity", "flow_col", "event_ts"
     concept: str         # required concept NAME (must exist in CONCEPT_REGISTRY)
     optional: bool = False
+    # ── 3B.1 cross-catalog binding metadata (optional; need_metadata derives the unset ones) ──
+    allowed_source_grains: tuple[str, ...] = ()   # acceptable source grains; () = unconstrained
+    join_role: JoinRole | None = None             # explicit override; None -> derived (NEVER tuple position)
+    temporal_role: TemporalRole | None = None     # explicit override; None -> derived from concept.pit_role
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,6 +82,9 @@ class Template:
     near_label: bool = False         # borders the outcome label -> the 3-part leakage control must flag it
     derived: tuple[str, ...] = ()    # declared DOWNSTREAM derivations (no data plane runs them here, §D.8)
     notes: tuple[str, ...] = ()      # authoring notes (e.g. concept substitutions vs Part F)
+    # ── 3B.1 explicit source anchor (optional; needed only when >1 distinct entity-linked need) ──
+    source_entity: str | None = None            # the recipe's source grain entity (derived when unambiguous)
+    source_entity_need_role: str | None = None   # which need carries the source key
 
 
 @dataclass(frozen=True, slots=True)
