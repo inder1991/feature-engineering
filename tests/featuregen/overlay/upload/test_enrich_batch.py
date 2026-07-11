@@ -1,8 +1,10 @@
+from featuregen.intake.llm import FakeLLM, FakeResponse
 from featuregen.overlay.upload import enrich
 from featuregen.overlay.upload import enrich_batch as eb
 from featuregen.overlay.upload import enrich_config as cfg
 from featuregen.overlay.upload.canonical import CanonicalRow
 from featuregen.overlay.upload.enrich import content_hash
+from featuregen.overlay.upload.enrich_llm import audited_batch_call
 
 
 def test_mode_defaults_single_and_reads_env(monkeypatch):
@@ -69,3 +71,43 @@ def test_validate_classifies_every_return():
     dups = [o for o in eb.validate_batch_results(items, results, "concept", _accept_known)
             if o.status == eb.DUPLICATE]
     assert len(dups) == 1 and dups[0].ref == "r2"
+
+
+_CTASK = "overlay.enrich.concept"
+
+
+def test_audited_batch_call_returns_per_item_outcomes(db):
+    items = [eb.BatchItem("h1", {"table": "accounts", "column": "balance", "type": "numeric"}),
+             eb.BatchItem("h2", {"table": "accounts", "column": "mystery", "type": "text"})]
+    client = FakeLLM(script={_CTASK: FakeResponse(output={"results": [
+        {"ref": "h1", "concept": "monetary_stock"},
+        {"ref": "h2", "concept": "made_up"}]})})
+    res = audited_batch_call(db, client, task=_CTASK, prompt_id="overlay_concept_batch_v1",
+                             schema_id="overlay_concept_batch",
+                             shared_metadata={"vocabulary": [{"name": "monetary_stock"}]},
+                             items=items, out_key="concept", instruction="Classify each column.",
+                             accept=_accept_known)
+    by = {o.ref: o for o in res.outcomes}
+    assert by["h1"].status == eb.VALID and by["h1"].value == "monetary_stock"
+    assert by["h2"].status == eb.INVALID
+    assert res.provider_calls == 1
+    # one immutable llm_call row was written for the batch (item summary in cost_metadata)
+    n = db.execute("SELECT count(*) FROM llm_call WHERE task = %s", (_CTASK,)).fetchone()[0]
+    assert n == 1
+
+
+def test_audited_batch_call_excludes_unsafe_item_before_egress(db):
+    # An item whose metadata carries a disallowed key (free-text definition) is excluded, audited,
+    # and the remainder still batched (spec C9 exclude-and-proceed).
+    items = [eb.BatchItem("h1", {"table": "accounts", "column": "balance", "type": "numeric"}),
+             eb.BatchItem("h2", {"table": "accounts", "column": "ssn", "type": "text",
+                                 "definition": "customer social security number"})]
+    client = FakeLLM(script={_CTASK: FakeResponse(output={"results": [
+        {"ref": "h1", "concept": "monetary_stock"}]})})
+    res = audited_batch_call(db, client, task=_CTASK, prompt_id="overlay_concept_batch_v1",
+                             schema_id="overlay_concept_batch", shared_metadata={},
+                             items=items, out_key="concept", instruction="Classify each column.",
+                             accept=_accept_known)
+    by = {o.ref: o for o in res.outcomes}
+    assert by["h2"].status == eb.EGRESS
+    assert by["h1"].status == eb.VALID
