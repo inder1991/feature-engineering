@@ -26,7 +26,7 @@
 
 - Create `src/featuregen/overlay/upload/enrich_config.py` — env-driven knobs: `mode`, `max_items`, `max_input_tokens`, `budget`. One responsibility: read rollout config, nothing else.
 - Create `src/featuregen/overlay/upload/enrich_batch.py` — batch primitives: `BatchItem`, `BatchItemOutcome`, `BatchCallResult`, `validate_batch_results`, `chunk_items`, `run_batched`. The task-agnostic engine.
-- Create `src/featuregen/db/migrations/0954_enrichment_cache_versioning.sql` — add `cache_version` to the three cache tables.
+- Create `src/featuregen/db/migrations/0977_enrichment_cache_versioning.sql` — add `cache_version` to the three cache tables.
 - Modify `src/featuregen/overlay/upload/enrich_llm.py` — add batch array schemas + `audited_batch_call`.
 - Modify `src/featuregen/overlay/upload/enrich.py` — versioned cache helpers; a batch path in each `enrich_*`; C3 accept policy; concept-dependent definition key.
 - Modify `src/featuregen/overlay/upload/ingest.py:123-134` — independent per-task fail-soft; pass `concepts` into `draft_definitions`.
@@ -190,7 +190,7 @@ git commit -m "feat(enrich): batched-enrichment rollout config + kill switch (C1
 ## Task 2: Cache versioning migration + versioned cache helpers
 
 **Files:**
-- Create: `src/featuregen/db/migrations/0954_enrichment_cache_versioning.sql`
+- Create: `src/featuregen/db/migrations/0977_enrichment_cache_versioning.sql`
 - Modify: `src/featuregen/overlay/upload/enrich.py` (`_cache_get`, `_cache_put`, the three `enrich_*` single-mode loops, version constants)
 - Test: `tests/featuregen/overlay/upload/test_enrich_batch.py`, existing `tests/featuregen/overlay/upload/test_enrich.py`
 
@@ -228,7 +228,7 @@ Expected: FAIL — `_cache_get()` takes 3 positional args, not 4 (`cache_version
 - [ ] **Step 3a: Write the migration**
 
 ```sql
--- src/featuregen/db/migrations/0954_enrichment_cache_versioning.sql
+-- src/featuregen/db/migrations/0977_enrichment_cache_versioning.sql
 -- Spec C6: the enrichment caches keyed on content_hash alone served stale values after the
 -- vocabulary / prompt / schema changed. Add a cache_version dimension so a version bump invalidates
 -- cleanly. Existing rows are stamped 'legacy' (a distinct version), so the first ingest under the
@@ -303,7 +303,7 @@ Expected: PASS — existing enrich tests still green (single mode unchanged beha
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/featuregen/db/migrations/0954_enrichment_cache_versioning.sql src/featuregen/overlay/upload/enrich.py tests/featuregen/overlay/upload/test_enrich_batch.py
+git add src/featuregen/db/migrations/0977_enrichment_cache_versioning.sql src/featuregen/overlay/upload/enrich.py tests/featuregen/overlay/upload/test_enrich_batch.py
 git commit -m "feat(enrich): version-scoped enrichment cache (C6) — vocab/prompt fingerprint in key"
 ```
 
