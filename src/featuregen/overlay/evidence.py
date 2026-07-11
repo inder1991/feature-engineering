@@ -25,11 +25,14 @@ class EvidenceProducer(str, Enum):
 
 
 class AssertionStrength(str, Enum):
-    """HOW strongly a producer asserts its evidence (§3.1). ``SUPPORTED`` is measured/observed
-    evidence (the profiler default); ``PROPOSED`` is a candidate awaiting confirmation."""
+    """HOW strongly a producer asserts its evidence (§3.1), weakest → strongest. ``PROPOSED`` is a
+    candidate awaiting confirmation; ``SUPPORTED`` is measured/observed evidence (e.g. the profiler,
+    the default); ``ATTESTED`` is vouched for by a structural source; ``CONFIRMED`` is human-confirmed."""
 
-    SUPPORTED = "supported"
     PROPOSED = "proposed"
+    SUPPORTED = "supported"
+    ATTESTED = "attested"
+    CONFIRMED = "confirmed"
 
 
 class EvidenceLifecycle(str, Enum):

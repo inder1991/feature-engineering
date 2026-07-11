@@ -25,3 +25,8 @@ def test_legacy_write_defaults(db):
         db, fact_key="fk2", table_snapshot_at=None, row_count=1, sample_size=1, profile_version="p1",
         thresholds_used={}, metric_values={}, created_by={}))
     assert ev.producer == "profiler" and ev.strength == "supported" and ev.lifecycle == "active"
+
+
+def test_assertion_strength_has_all_four_members():
+    from featuregen.overlay.evidence import AssertionStrength
+    assert [s.value for s in AssertionStrength] == ["proposed", "supported", "attested", "confirmed"]
