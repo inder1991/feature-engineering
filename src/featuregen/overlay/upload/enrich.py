@@ -49,6 +49,13 @@ def _table_content_hash(source: str, table: str, columns: list[str]) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
+def _def_cache_key(row_hash: str, concept: str) -> str:
+    """Definition cache key (spec C6): a definition can depend on the assigned concept, so fold the
+    concept into the key. Empty concept -> concept-independent key."""
+    raw = json.dumps([row_hash, concept or ""])
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
 # Cache tables all share the shape (content_hash PK, <value> text). _CACHES maps the value column name.
 _CACHES = {
     "enrichment_concept": "concept",
@@ -152,12 +159,37 @@ def enrich_concepts(conn, rows: list[CanonicalRow], client: LLMClient,
     return result
 
 
-def draft_definitions(conn, rows: list[CanonicalRow], client: LLMClient,
-                      actor=None) -> dict[str, str]:
-    """Draft a definition ONLY for columns with no declared one (R3: never overwrite a human's)."""
+def draft_definitions(conn, rows: list[CanonicalRow], client: LLMClient, actor=None,
+                      *, concepts: dict[str, str] | None = None) -> dict[str, str]:
+    """Draft a definition ONLY for columns with no declared one (R3). Keyed by (content_hash,
+    assigned concept) so a concept change re-drafts (spec C6). Returns {content_hash: definition}."""
+    concepts = concepts or {}
     blank = {content_hash(r): r for r in rows if not r.definition}
-    result = _cache_get(conn, "enrichment_definition", list(blank), _DEFINITION_CACHE_VERSION)
-    for h, row in blank.items():
+    key_of = {h: _def_cache_key(h, concepts.get(h, "")) for h in blank}
+    cached = _cache_get(conn, "enrichment_definition", list(key_of.values()), _DEFINITION_CACHE_VERSION)
+    result = {h: cached[key_of[h]] for h in blank if key_of[h] in cached}
+
+    if enrich_config.mode("definition") == "batch":
+        # Group by table so table context is sent once; the prompt isolates items (anti-contamination).
+        misses = [h for h in blank if h not in result]
+        misses.sort(key=lambda h: (blank[h].table, h))
+        items = [BatchItem(h, {"table": blank[h].table, "column": blank[h].column,
+                               "type": blank[h].type, **({"concept": concepts[h]} if concepts.get(h) else {})})
+                 for h in misses]
+        resolved = run_batched(
+            conn, client, short="definition", task=_DEF_TASK,
+            prompt_id="overlay_definition_batch_v1", schema_id="overlay_definition_batch",
+            shared_metadata={}, items=items, out_key="definition",
+            instruction="Draft a one-line business definition for EACH column. Treat each item "
+                        "independently: use only that item's table/column/type/concept; do not infer "
+                        "relationships between items; do not reuse another item's facts; return "
+                        "exactly one result per input ref.", accept=_accept_bounded(500), actor=actor)
+        for h, def_text in resolved.items():
+            _cache_put(conn, "enrichment_definition", key_of[h], def_text, _DEFINITION_CACHE_VERSION)
+            result[h] = def_text
+        return result
+
+    for h, row in blank.items():                      # single mode — today's exact behaviour
         if h in result:
             continue
         drafted = _bounded(_call(conn, client, _DEF_TASK, "overlay_definition_v1",
@@ -168,7 +200,7 @@ def draft_definitions(conn, rows: list[CanonicalRow], client: LLMClient,
                                  actor), 500)
         if drafted is None:
             continue   # failure / empty / over-long / list-stringified -> don't cache (M3/M9)
-        _cache_put(conn, "enrichment_definition", h, drafted, _DEFINITION_CACHE_VERSION)
+        _cache_put(conn, "enrichment_definition", key_of[h], drafted, _DEFINITION_CACHE_VERSION)
         result[h] = drafted
     return result
 

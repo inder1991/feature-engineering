@@ -129,7 +129,7 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
         except Exception:  # noqa: BLE001
             logger.warning("advisory concept enrichment failed for %r", catalog_source, exc_info=True)
         try:
-            definitions = draft_definitions(conn, vr.good, client, actor)
+            definitions = draft_definitions(conn, vr.good, client, actor, concepts=concepts)
         except Exception:  # noqa: BLE001
             logger.warning("advisory definition enrichment failed for %r", catalog_source, exc_info=True)
         try:

@@ -209,3 +209,24 @@ def test_classify_domains_batch_mode(db, monkeypatch):
         {"ref": "loans", "domain": "Lending"}]})})
     out = classify_domains(db, rows, client)
     assert out == {"accounts": "Deposits", "loans": "Lending"}
+
+
+from featuregen.overlay.upload.enrich import draft_definitions
+
+
+def test_draft_definitions_batch_grouped_by_table(db, monkeypatch):
+    monkeypatch.setenv("OVERLAY_ENRICH_DEFINITION_MODE", "batch")
+    rows = [CanonicalRow("deposits", "accounts", "bal", "numeric"),                    # blank -> drafted
+            CanonicalRow("deposits", "accounts", "id", "integer", definition="acct id")]  # declared -> skipped
+    h0 = content_hash(rows[0])
+    client = FakeLLM(script={"overlay.enrich.definition": FakeResponse(output={"results": [
+        {"ref": h0, "definition": "the account ledger balance"}]})})
+    out = draft_definitions(db, rows, client, concepts={h0: "monetary_stock"})
+    assert out == {h0: "the account ledger balance"}
+    assert content_hash(rows[1]) not in out          # declared definition never overwritten (R3)
+
+
+def test_definition_cache_key_includes_concept(db):
+    from featuregen.overlay.upload.enrich import _def_cache_key
+    row = CanonicalRow("deposits", "accounts", "bal", "numeric")
+    assert _def_cache_key(content_hash(row), "monetary_stock") != _def_cache_key(content_hash(row), "")
