@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
+from featuregen.contracts.envelopes import IdentityEnvelope
 from featuregen.overlay.catalog import current_catalog_adapter
 from featuregen.overlay.resolve import resolve_fact
 from featuregen.overlay.upload.upload_catalog import table_ref
@@ -59,3 +60,36 @@ def project_table_facts(conn, *, source: str, tables, now: datetime | None = Non
     """Project every table's confirmed grain/availability. Idempotent per table (clear-then-set)."""
     for table in tables:
         project_table_facts_for_ref(conn, source=source, table=table, now=now)
+
+
+_TABLE_FACT_TYPES = ("grain", "availability_time")
+
+# The worklist reads platform-admin governance-queue tasks (grain/availability route there because
+# UploadContextAdapter.owner_of -> None). get_task_proposal authorizes on role_claims, so the reader
+# MUST hold platform-admin or every read is denied. Subject-less system reader.
+_WORKLIST_READER = IdentityEnvelope(
+    subject="system:table-fact-worklist", actor_kind="service", authenticated=True,
+    auth_method="internal", role_claims=("platform-admin",))
+
+
+def list_open_table_fact_proposals(conn) -> list[dict]:
+    """Open grain/availability proposals awaiting human confirmation — a READ MODEL over the existing
+    human_tasks gate tasks (not a new queue). get_task_proposal returns a TaskProposal TypedDict, so
+    access its fields by KEY, not attribute."""
+    from featuregen.overlay.task_read import get_task_proposal
+    rows = conn.execute(
+        "SELECT task_id FROM human_tasks WHERE status = 'open' ORDER BY created_at DESC"
+    ).fetchall()
+    out: list[dict] = []
+    for (task_id,) in rows:
+        try:
+            p = get_task_proposal(conn, task_id, _WORKLIST_READER)
+        except Exception:   # noqa: BLE001 — a task the reader can't see is simply skipped
+            continue
+        if p["fact_type"] in _TABLE_FACT_TYPES:
+            out.append({"task_id": task_id, "fact_type": p["fact_type"],
+                        "object_ref": p["object_ref"], "proposed_value": p["proposed_value"],
+                        "target_event_id": p["target_event_id"],
+                        # origin so a reviewer sees this is an unprofiled LLM proposal, not proof:
+                        "uniqueness_basis": "llm_proposed_not_profiled"})
+    return out
