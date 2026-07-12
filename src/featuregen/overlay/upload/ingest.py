@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import asdict, dataclass
 from datetime import datetime
 
@@ -42,18 +43,31 @@ from featuregen.overlay.upload.object_ref import normalize_ref, parse_ref
 from featuregen.overlay.upload.readiness import ReadinessScopeType, compute_readiness
 from featuregen.overlay.upload.review_queue import persist_quarantine
 from featuregen.overlay.upload.sample_parser import parse_sample_profile
+from featuregen.overlay.upload.table_fact_projection import project_table_facts
 from featuregen.overlay.upload.source_profile import (
     FTR_GLOSSARY_PROFILE,
     SourceCapabilityProfile,
     strength_for,
 )
 from featuregen.overlay.upload.taxonomy_evidence import derive_concept_evidence
-from featuregen.overlay.upload.upload_catalog import UploadCatalog, table_ref
+from featuregen.overlay.upload.upload_catalog import (
+    UploadCatalog,
+    ensure_upload_catalog_adapter,
+    table_ref,
+)
 from featuregen.overlay.upload.upload_identity import MetadataConflict, classify_upload
 from featuregen.projections.runner import projection_lag, run_projection
 from featuregen.runtime.observability import counters
 
 logger = logging.getLogger(__name__)
+
+
+def table_synth_enabled() -> bool:
+    """Feature switch for Pass B / table synthesis (default OFF). Orthogonal to the batch MODE
+    (OVERLAY_ENRICH_TABLE_SYNTH_MODE), which only selects batch-vs-single execution WHEN the feature
+    is on. Feature-off means Pass B never runs; mode=single does NOT mean the feature is off. Task 7
+    gates the ingest call on this; Task 2 owns the definition so it exists before any consumer."""
+    return os.environ.get("OVERLAY_TABLE_SYNTH", "0") == "1"
 
 
 def _drain_projection(conn) -> None:
@@ -212,6 +226,25 @@ def _lc(value: str) -> str:
     """Strip + lower-case a ref component (matches object_ref._norm) so a public-scoped CanonicalRow's
     (table, column) matches a schema-preserving logical_ref's already-normalized components."""
     return value.strip().lower()
+
+
+def _schema_by_table(glossary: GlossaryUpload | None) -> dict[str, str]:
+    """Map each glossary table's NORMALIZED name to the real (non-public) schema its column decisions
+    are keyed under (``parse_ref(rec.logical_ref)[1]``). Pass B keys its advisory table ref +
+    ``resolve_and_project`` refs under this schema so ``readiness`` (schema-aware) sees ONE
+    ``(schema, table)`` pair per physical table instead of a phantom public twin that double-counts
+    the structural requirements. Empty for a non-glossary upload -> ``normalize_ref`` falls back to
+    ``public`` (correct: technical columns are public and write no glossary column decisions)."""
+    out: dict[str, str] = {}
+    if glossary is None:
+        return out
+    for rec in glossary.records:
+        try:
+            _src, schema, table, _col = parse_ref(rec.logical_ref)
+        except ValueError:
+            continue
+        out.setdefault(table, schema)
+    return out
 
 
 def _schema_preserving_ref_map(glossary: GlossaryUpload) -> dict[str, str]:
@@ -516,6 +549,7 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
                   actor, now: datetime | None = None, client=None,
                   profile: SourceCapabilityProfile | None = None,
                   glossary: GlossaryUpload | None = None) -> IngestResult:
+    ensure_upload_catalog_adapter()   # governed fact lifecycle needs an adapter (owner_of->None)
     # `profile` (spec §U) makes validation profile-aware: a glossary upload's `type="unknown"` rows
     # pass, while a technical upload (or the default `profile=None`) still requires a real type. A
     # glossary sidecar IMPLIES the glossary profile (a glossary attests no physical type), so default
@@ -618,6 +652,53 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
         # each declared join into the governed approved_join path. Advisory/fail-soft + adapter-gated.
         _propose_governed_joins(conn, vr.good, actor=actor)
 
+    if table_synth_enabled() and client is not None:
+        # Pass B (spec §15): governed table synthesis — grain/availability as PROPOSED-only,
+        # human-gated facts; table_role/primary_entity/event_or_snapshot as advisory evidence.
+        from featuregen.overlay.upload.enrich_llm import _ENRICH_ACTOR
+        from featuregen.overlay.upload.table_synth import (
+            _propose_table_facts,
+            assemble_table_items,
+            synthesize_tables,
+        )
+        try:
+            # TWO savepoints (exactly like the Pass A stages above — NOT like
+            # _propose_governed_joins, which has no savepoint): a DB abort inside either must not
+            # poison the request tx and roll back Pass A facts + the quarantine. The try/except
+            # makes Pass B strictly advisory. The FIRST savepoint contains the LLM egress + its
+            # IMMUTABLE record_llm_call security audit, RELEASED before the advisory stage starts —
+            # so an advisory-stage failure can never roll back the record of what egressed. The
+            # SECOND contains the advisory propose/projection writes.
+            with conn.transaction():
+                synth_snapshot = snapshot_id or mint_id("tsy")  # non-glossary uploads have snapshot_id=None
+                items = assemble_table_items(vr.good, concepts=concepts, definitions=definitions)
+                cols = {t: {r.column for r in vr.good if r.table == t}
+                        for t in {r.table for r in vr.good}}
+                syntheses = synthesize_tables(conn, client, items, columns_by_table=cols,
+                                              actor=actor)     # LLM-call attribution only
+            with conn.transaction():
+                # Key the advisory table ref + its projection under the SAME schema the glossary
+                # columns use (a non-public schema for an FTR glossary; public for a technical
+                # upload) so readiness sees ONE (schema, table) pair per physical table.
+                schema_by_table = _schema_by_table(glossary)
+                # Propose under the SERVICE actor so a human confirmer later satisfies four-eyes:
+                _propose_table_facts(conn, catalog_source, syntheses, actor=_ENRICH_ACTOR,
+                                     source_snapshot_id=synth_snapshot,
+                                     schema_by_table=schema_by_table)
+                # Project the advisory table fields' DISPLAY. resolve_and_project is otherwise
+                # called ONLY over glossary COLUMN refs (_ingest_glossary_evidence); table refs need
+                # this explicit call or table_role/primary_entity/event_or_snapshot never project
+                # (a no-op until Task 8 registers their FieldPolicies).
+                pass_b_table_refs = [
+                    normalize_ref(catalog_source, schema_by_table.get(t.strip().lower()), t)
+                    for t in sorted({r.table for r in vr.good})]
+                resolve_and_project(conn, source=catalog_source, logical_refs=pass_b_table_refs,
+                                    now=now)
+        except Exception:  # noqa: BLE001 — advisory: Pass B never fails an upload; Pass A facts hold
+            counters.incr("overlay.table_synth.error")
+            logger.warning("advisory Pass B table synthesis failed for %r — Pass A facts + graph "
+                           "intact", catalog_source, exc_info=True)
+
     if glossary is not None and bindings is not None and snapshot_id is not None:
         # Attach per-field evidence + revalidation + resolve/readiness on top of the built graph.
         # Belt-and-braces fail-soft: the helper savepoints every stage, and this outer guard makes a
@@ -628,6 +709,41 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
                 bindings=bindings, concepts=concepts, snapshot_id=snapshot_id, now=now)
         except Exception:  # noqa: BLE001
             logger.warning("advisory glossary evidence wiring failed for %r — facts + graph intact",
+                           catalog_source, exc_info=True)
+
+    # SPECIALIZED_FACT bridge (Task 9): build_graph just wiped graph_node, so re-project any
+    # already-CONFIRMED grain/as-of facts onto the fresh column nodes. UNCONDITIONAL (not
+    # flag-gated) — a grain confirmed in a PRIOR cycle must survive a rebuild even when
+    # OVERLAY_TABLE_SYNTH is off. The clear-then-set SPARES the columns THIS upload declares (their
+    # file-declared is_grain/is_as_of is final and must survive a drift-STALEd governed fact, which
+    # would otherwise resolve None and wipe a just-declared grain — a flag-off byte-for-byte break).
+    declared_grain: dict[str, set[str]] = {}
+    declared_as_of: dict[str, set[str]] = {}
+    for r in vr.good:
+        if r.is_grain:
+            declared_grain.setdefault(r.table, set()).add(r.column)
+        if r.as_of:
+            declared_as_of.setdefault(r.table, set()).add(r.column)
+    if projection_lag(conn, "overlay") > 0:
+        # Under projection lag the overlay_fact_state read model resolve_fact reads is stale: the
+        # clear-then-set could wipe a just-declared grain (a not-yet-projected confirm) or persist a
+        # should-be-stale one. Skip entirely (mirrors the drift path above); build_graph's declared
+        # flags stand and re-project once the projection catches up.
+        counters.incr("overlay.table_fact_projection.skipped_projection_lag")
+        logger.warning("overlay projection lags after ingest of %r — skipping grain/as-of "
+                       "re-projection (re-runs when the projection catches up)", catalog_source)
+    else:
+        # Savepoint + except: a projection DB fault must never poison the request tx or roll back
+        # facts/quarantine (this path must not be able to 500 a flag-off upload).
+        try:
+            with conn.transaction():   # savepoint: a projection fault must not roll back facts
+                project_table_facts(conn, source=catalog_source,
+                                    tables=sorted({r.table for r in vr.good}),
+                                    declared_grain=declared_grain, declared_as_of=declared_as_of,
+                                    now=now)
+        except Exception:  # noqa: BLE001 — advisory: re-projection never fails an upload
+            counters.incr("overlay.table_fact_projection.error")
+            logger.warning("advisory grain/as-of re-projection failed for %r — facts intact",
                            catalog_source, exc_info=True)
 
     persist_quarantine(conn, catalog_source, vr.quarantined)

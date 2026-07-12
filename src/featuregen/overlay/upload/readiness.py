@@ -75,11 +75,57 @@ _CONFLICT_MARKER = "conflict"
 _LOW_CONFIDENCE = frozenset({"low"})
 
 # The structural facts Phase 1 does NOT promote (spec §9 / §16). Each in-scope table gets one
-# requirement per fact, labelled not_promoted_in_phase1 — a blocker by the gate, but EXPECTED.
+# requirement per fact. Phase 2: grain/availability now READ the table's overlay fact state (Pass B
+# proposes them as DRAFT facts; a human confirm makes them VERIFIED), so their requirement flips
+# missing -> proposed -> confirmed instead of staying hard-coded missing. `join` stays static —
+# Phase 3 owns approved_join state.
 _PHASE1_UNPROMOTED: tuple[tuple[str, str], ...] = (
     ("grain", "structural_or_human"),
+    ("availability", "structural_or_human"),   # Phase 2 addition
     ("join", "approved_join"),
 )
+
+# Requirement name -> the overlay fact_type Pass B proposes under (table_synth). A requirement not
+# in this map (join) has no readable fact stream yet and stays a static missing/not-promoted.
+_FACT_TYPE_BY_REQUIREMENT = {"grain": "grain", "availability": "availability_time"}
+
+# Granular causes for the non-terminal lifecycle states (must not collapse to "missing"). The
+# STATUS stays in the 4-value vocabulary (confirmed/proposed/missing/conflicting) the type allows;
+# the CAUSE distinguishes WHY so the diagnostic is honest. Only VERIFIED is feature-ready.
+CAUSE_FACT_EXPIRED = "fact_expired_awaiting_reverify"
+CAUSE_FACT_STALE = "fact_staled_awaiting_reverify"
+CAUSE_FACT_REJECTED = "proposal_rejected"
+
+
+def _table_fact_status(conn, source, table, requirement) -> tuple[str, str]:
+    """Map the table's overlay fact stream to (readiness_status, cause). readiness_status is one of
+    the 4 allowed values; cause carries the granular lifecycle reason. Only VERIFIED is ready."""
+    from featuregen.overlay.identity import fact_key
+    from featuregen.overlay.state import fold_overlay_state
+    from featuregen.overlay.store import load_fact
+    from featuregen.overlay.upload.upload_catalog import table_ref
+    fact_type = _FACT_TYPE_BY_REQUIREMENT.get(requirement)
+    if fact_type is None:
+        return "missing", CAUSE_NOT_PROMOTED
+    stream = load_fact(conn, fact_key(table_ref(source, table), fact_type))
+    if not stream:
+        return "missing", CAUSE_NOT_PROMOTED
+    status = fold_overlay_state(stream).status
+    # NOTE: the folded pending-proposal status literal is "DRAFT" (state.py), NOT "PROPOSED" (that
+    # is the EVENT type OVERLAY_FACT_PROPOSED). Verified in Task 7. Use "DRAFT" here.
+    if status == "VERIFIED":
+        return "confirmed", CAUSE_NOT_PROMOTED           # satisfied; not a blocker
+    if status in ("DRAFT", "PARTIALLY_CONFIRMED"):
+        return "proposed", CAUSE_PROPOSED_UNCONFIRMED     # in the review queue
+    if status == "REJECTED":
+        return "missing", CAUSE_FACT_REJECTED             # NOT ready; distinct from never-proposed
+    # fold_overlay_state NEVER yields the literal "EXPIRED": OVERLAY_FACT_EXPIRED folds to
+    # "REVERIFY" and OVERLAY_FACT_STALED folds to "STALE" (state.py). Branch on those two.
+    if status == "REVERIFY":
+        return "proposed", CAUSE_FACT_EXPIRED             # prior confirmation lapsed -> re-verify
+    if status == "STALE":
+        return "proposed", CAUSE_FACT_STALE               # drift -> awaiting re-confirm
+    return "proposed", CAUSE_PROPOSED_UNCONFIRMED
 
 
 class ReadinessScopeType(StrEnum):
@@ -315,16 +361,21 @@ def compute_readiness(
             summary_scores=_summary_scores([not_found]),
         )
 
-    # 1. Structural facts Phase 1 does not promote — one blocker per in-scope table, EXPECTED.
+    # 1. Structural facts — one requirement per in-scope table. Phase 2: grain/availability READ
+    #    the table's overlay fact state (missing -> proposed -> confirmed); only a `missing` fact
+    #    (never proposed, or proposal rejected — the cause distinguishes them) blocks. A confirmed
+    #    fact is satisfied; a proposed one is a non-blocking review ask (the `blocking` partition
+    #    below routes it into review_requirements). `join` stays static-missing (Phase 3).
     for schema, table in _tables_of(refs):
         for fact_name, authority in _PHASE1_UNPROMOTED:
+            fact_status, fact_cause = _table_fact_status(conn, source, table, fact_name)
             all_reqs.append(
                 ReadinessRequirement(
                     requirement_id=f"{fact_name}:{source}.{schema}.{table}",
                     scope=ReadinessScopeType.TABLE,
-                    status="missing",
-                    blocking=True,
-                    cause=CAUSE_NOT_PROMOTED,
+                    status=fact_status,
+                    blocking=fact_status == "missing",
+                    cause=fact_cause,
                     authority_required=authority,
                 )
             )

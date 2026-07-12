@@ -8,8 +8,9 @@ Two layers under test:
         no approved_join proposal is written.
       - flag ON + a registered catalog adapter -> the raw edge is authority='display_only' AND an
         approved_join proposal exists AND the upload still succeeds.
-      - flag ON + NO adapter -> the edge is still marked display_only, the upload still succeeds, and
-        the proposal is skipped-loud (the upload-context adapter is a Phase-1 dependency).
+      - flag ON, caller cleared the adapter -> Phase-2 Task 1 wired `ensure_upload_catalog_adapter()`
+        as the first line of `ingest_upload`, so the upload-context adapter is ALWAYS re-ensured at
+        the ingest chokepoint (the Phase-1 dependency is now satisfied) and the proposal IS written.
 """
 from __future__ import annotations
 
@@ -141,12 +142,19 @@ def test_flag_on_with_adapter_marks_display_only_and_proposes(db, monkeypatch, c
     assert any(e.type == "OVERLAY_FACT_PROPOSED" for e in events)   # governed proposal exists
 
 
-def test_flag_on_without_adapter_is_fail_soft(db, monkeypatch):
+def test_flag_on_ingest_reensures_adapter_and_proposes(db, monkeypatch):
+    # Phase-2 Task 1: even when the caller cleared the process adapter, ingest_upload re-ensures the
+    # UploadContextAdapter on its first line, so the governed-join proposal is now written (this is
+    # the un-gating of the Phase-1-deferred _propose_governed_joins).
     monkeypatch.setenv("OVERLAY_GOVERNED_JOINS", "1")
-    _clear_catalog_adapter()                                    # no upload-context adapter (Phase-1)
+    _clear_catalog_adapter()                                    # ingest_upload re-ensures it (Task 1)
     _seal_config()
-    res = ingest_upload(db, "deposits", _join_rows(), actor=_actor(), now=_NOW)
-    assert res.status == "ingested"                             # never aborts the upload
-    assert _edge_authority(db, "deposits", "public.transactions.acct_id") == "display_only"
-    ref = governed_join_proposal(_join_rows()[0])
-    assert load_fact(db, fact_key(ref, "approved_join")) == []  # proposal skipped-loud, not written
+    try:
+        res = ingest_upload(db, "deposits", _join_rows(), actor=_actor(), now=_NOW)
+        assert res.status == "ingested"                         # never aborts the upload
+        assert _edge_authority(db, "deposits", "public.transactions.acct_id") == "display_only"
+        ref = governed_join_proposal(_join_rows()[0])
+        events = load_fact(db, fact_key(ref, "approved_join"))
+        assert any(e.type == "OVERLAY_FACT_PROPOSED" for e in events)  # proposal written, not skipped
+    finally:
+        _clear_catalog_adapter()   # don't leak the ensured process adapter into later tests

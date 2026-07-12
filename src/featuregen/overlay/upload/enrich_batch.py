@@ -52,15 +52,24 @@ class BatchCallResult:
 
 
 def validate_batch_results(items: list[BatchItem], results: list[dict], out_key: str,
-                           accept: Accept) -> list[BatchItemOutcome]:
+                           accept: Accept, *, extract=None, ref_aware: bool = False
+                           ) -> list[BatchItemOutcome]:
     """Classify every returned entry against the expected ref-set (spec C2): valid / invalid_value /
-    blank / duplicate / extra, and every unreturned ref as missing. Nothing is silently collapsed."""
+    blank / duplicate / extra, and every unreturned ref as missing. Nothing is silently collapsed.
+
+    ``extract(entry) -> str`` overrides scalar out-key extraction so a STRUCTURED per-item result
+    (e.g. a nested ``synthesis`` object) can be serialized to a canonical string. When
+    ``ref_aware`` is set, ``accept`` is called as ``accept(raw, ref)`` so per-item validation that
+    depends on the item's identity (e.g. "grain columns must be columns OF THIS table") is done
+    HERE and yields a proper ``INVALID`` outcome — never accepted-then-post-filtered. Defaults keep
+    the scalar ``accept(raw)`` path byte-for-byte for Pass A."""
     expected = {it.ref for it in items}
     seen: set[str] = set()
     outcomes: list[BatchItemOutcome] = []
     for entry in results:
         ref = entry.get("ref")
-        raw = str(entry.get(out_key, "")).strip()
+        raw = (extract(entry) if extract is not None
+               else str(entry.get(out_key, "")).strip())
         if ref not in expected:
             outcomes.append(BatchItemOutcome(str(ref), EXTRA, None, (EXTRA,)))
             continue
@@ -71,7 +80,7 @@ def validate_batch_results(items: list[BatchItem], results: list[dict], out_key:
         if not raw:
             outcomes.append(BatchItemOutcome(ref, BLANK, None, (BLANK,)))
             continue
-        value, reason = accept(raw)
+        value, reason = accept(raw, ref) if ref_aware else accept(raw)
         if value is None:
             outcomes.append(BatchItemOutcome(ref, INVALID, None, (reason,)))
         else:
@@ -106,8 +115,14 @@ def chunk_items(items: list[BatchItem], *, max_items: int,
 
 
 def _single_fallback(conn, client, *, task, out_key, instruction, item: BatchItem, shared_metadata,
-                     accept, actor) -> tuple[str | None, str]:
-    """One per-item fallback through the existing single seam. Returns (value|None, status)."""
+                     accept, actor, ref_aware: bool = False) -> tuple[str | None, str]:
+    """One per-item fallback through the existing single seam. Returns (value|None, status).
+
+    A ``ref_aware`` (structured) task has NO single-call fallback in Phase 2: the flat single schema
+    carries no ``synthesis`` wrapper and the ref-aware ``accept`` needs ``(raw, ref)``, so the item is
+    simply left unresolved (MISSING) — never re-sent through the mismatched flat seam."""
+    if ref_aware:
+        return None, MISSING
     from featuregen.overlay.upload.enrich_llm import audited_enrich_call  # lazy (import cycle)
     single_prompt = task.rsplit(".", 1)[-1]   # concept|definition|domain
     raw = audited_enrich_call(
@@ -122,7 +137,7 @@ def _single_fallback(conn, client, *, task, out_key, instruction, item: BatchIte
 
 def run_batched(conn, client, *, short: str, task: str, prompt_id: str, schema_id: str,
                 shared_metadata: dict, items: list[BatchItem], out_key: str, instruction: str,
-                accept: Accept, actor) -> dict[str, str]:
+                accept: Accept, actor, extract=None, ref_aware: bool = False) -> dict[str, str]:
     """Chunk `items`, call the governed batch seam, and walk the bounded degradation ladder
     (spec C4): salvage valid -> retry a failed chunk -> adaptive split -> capped single fallback ->
     leave remainder uncached. Returns {ref: accepted_value} for items resolved this run."""
@@ -146,7 +161,8 @@ def run_batched(conn, client, *, short: str, task: str, prompt_id: str, schema_i
             return
         res = audited_batch_call(conn, client, task=task, prompt_id=prompt_id, schema_id=schema_id,
                                  shared_metadata=shared_metadata, items=chunk, out_key=out_key,
-                                 instruction=instruction, accept=accept, actor=actor)
+                                 instruction=instruction, accept=accept, actor=actor,
+                                 extract=extract, ref_aware=ref_aware)
         calls += res.provider_calls
         counters.incr(f"overlay.enrich.{short}.batch.calls")
         for o in res.outcomes:
@@ -177,6 +193,13 @@ def run_batched(conn, client, *, short: str, task: str, prompt_id: str, schema_i
 
     def _fallback(unresolved: list[BatchItem]) -> None:
         nonlocal calls, fallback_used
+        # A ref_aware (structured) task has NO single-call fallback (see _single_fallback): each item
+        # would resolve to (None, MISSING) WITHOUT a provider call. Skip the loop entirely so a no-op
+        # fallback never inflates `calls`/`fallback_used` — on a >max_items multi-chunk Pass B run the
+        # spurious increments could trip over_budget() early — nor emits a bogus single_fallback
+        # counter. (Task 4 carry-forward: the increments previously ran before the ref_aware skip.)
+        if ref_aware:
+            return
         for it in unresolved:
             if fallback_used >= b.max_single_fallback or over_budget():
                 counters.incr(f"overlay.enrich.{short}.batch.left_uncached")
@@ -187,7 +210,7 @@ def run_batched(conn, client, *, short: str, task: str, prompt_id: str, schema_i
             value, status = _single_fallback(conn, client, task=task, out_key=out_key,
                                               instruction=instruction, item=it,
                                               shared_metadata=shared_metadata, accept=accept,
-                                              actor=actor)
+                                              actor=actor, ref_aware=ref_aware)
             if value is not None:
                 resolved[it.ref] = value
 
