@@ -1,209 +1,340 @@
-# Phase 3 / Pass C — Governed Relationship Discovery (CSV-only) — Design
+# Phase 3 / Pass C — Governed Relationship Discovery (CSV-only) — Design (v2)
 
-**Status:** design, ready for review → implementation plan.
-**Goal:** Deterministically discover *join candidates* between catalog columns from the uploaded glossary alone, file each as a governed `approved_join` **proposal**, and let a human confirm it — so table-to-table relationships become known, trustworthy, and load-bearing, and cross-table features become possible. No OpenMetadata, no profiling, no LLM-authored joins.
+**Status:** design, review round 2 (v1 review folded in). Ready for review → implementation plan.
+**Goal:** Deterministically discover *join candidates* between catalog columns from the uploaded glossary alone, file each as a governed `approved_join` **proposal**, let a human confirm it, and project a confirmed join into an operational graph edge — so table-to-table relationships become known, trustworthy, and traversable by the feature planner. No OpenMetadata, no profiling, no LLM-authored joins.
+
+**The one principle to protect above all:**
+> Pass C may *discover and explain* candidate relationships, but the only operational join path is **`approved_join VERIFIED → operational graph edge → feature-planner traversal`**.
 
 ---
 
 ## 1. Context & the problem
 
-Phase 1 gave us **meaning** (the FTR glossary: `txn.cust_id` *means* "customer identifier"). Phase 2 lets a human confirm **per-table facts** (grain, availability). Phase 3 is about **relationships between tables** — the one place the LLM must stay out of the authority loop.
+Phase 1 gave us **meaning**; Phase 2 lets a human confirm **per-table facts** (grain, availability). Phase 3 is about **relationships between tables** — the one place the LLM must stay out of the authority loop. A wrong grain is recoverable; a **wrong join is a leakage bomb** (wrong customer linkage, many-to-many explosion, point-in-time leakage, PII propagation, false aggregation). A join can never be *guessed* — it needs **explainable, reproducible evidence** plus **human confirmation**.
 
-A wrong grain is recoverable. A **wrong join is a leakage bomb**: join `txn` to the wrong `customer` table (or the wrong *namespace* of a same-named id) and every downstream feature is quietly poisoned — wrong customer linkage, many-to-many explosion, point-in-time leakage, PII propagation, false aggregation. So a join can never be *guessed*; it needs **explainable, reproducible evidence** plus **human confirmation**.
+**Constraint (decided):** built from **only the uploaded glossary CSV** — no live OpenMetadata, no data profiling. Profiling / declared FKs from a structural source become *additional evidence producers* in a later phase; out of scope here.
 
-**The constraint (decided):** Phase 3 is built from **only the information in the uploaded glossary CSV** — no live OpenMetadata, no data profiling. The FTR CSV carries: `schema.table.column` (physical identity), `term_name`, `description_business_definition`, `data_domain`, `bian_level_1..4`, `fibo_level_1`, `related_terms`, `synonyms_aliases`, business-process levels. That is enough to *discover and propose* candidate joins — it is **not** enough to *prove* one (the CSV has no data, so it cannot verify that `txn.cust_id`'s values actually live in `customer.cust_id`, nor that two same-named ids share a namespace). Therefore **the only path to an operational join in Phase 3 is human confirmation.** (Profiling / declared FKs from a structural source become *additional* evidence producers in a later phase; they are out of scope here.)
+### 1.1 What the FTR CSV actually gives (verified against the 127-row sample)
+
+Columns: `schema.table.column`, `term_name`, `description_business_definition`, `data_domain`, `term_type`, `related_terms`, `synonyms_aliases`, `bian_level_1..4`, `fibo_level_1`, business-process levels. Empirically:
+
+- **`term_type`** ∈ {Business Term (81), Dimension (27), Code Value (9), Measure (6), Reference Data (3), Regulatory Term (1)} — a usable structural hint: `Measure` → never a key; `Dimension`/`Reference Data`/`Code Value` → key-eligible when the name is id-like.
+- **`related_terms` is a *broad* relation, not a key link.** It points a column at its parent table concept (`TRAN_DATE → "Financial Transaction Record"`) or a table at business processes, and is **blank on the actual identifier columns** (`FORACID`, `CIF_ID`, `TRAN_ID`, `REF_NUM`). It means "associated with," not "same identifier."
+- **`bian_level_4` is coarse and namespace-mixing.** 6 leaves / 127 rows; 14 columns share **`"Customer and Counterparty Identification"`** — one leaf covering *both* customer and counterparty ids. Same-leaf ≠ same key.
+- **The precise identifier concept lives in `term_name`.** `CIF_ID` = "Customer Information File Identifier" vs `FORACID` = "Customer Account Number" — same BIAN leaf, **different keys**. This is the real discriminator.
+
+**Design consequence:** the primary same-key signal is the **normalized identifier concept (from `term_name` + column name + synonyms)**; BIAN/FIBO are **coarse priors, never sufficient**; `related_terms` is **gated** (fires only when it links two id-like columns by concept); a **mixed BIAN leaf defaults the namespace to AMBIGUOUS**; and the **namespace-compatibility gate** (§7) does the heavy lifting.
 
 ## 2. Core invariants
 
-1. **Deterministic-first.** The authoritative candidate stream is generated by rules + scoring over glossary signals — never by an LLM. Candidate generation is explainable, reproducible, cheap to rerun, and bounded. (Exploration mode — flagged, off by default — may add a *separate*, clearly-labelled `LLM_SUGGESTED` stream that is review-only and can never become operational; see §7.)
-2. **The LLM is monotonic toward caution.** In Pass C the LLM may only **explain, challenge, flag a namespace mismatch, or suggest a bridge** — it can *weaken or annotate* a candidate, **never** strengthen it toward operational. Its worst-case failure is suppressing a real join (recoverable by a human), never inventing a false one that goes live.
-3. **No operational join without confirmation.** A candidate is a **proposal**. Only human confirmation (or, later, structural evidence) makes an `approved_join` `VERIFIED`, and only a `VERIFIED` join becomes a traversable operational edge. `provenance ≠ authority; confidence ≠ permission.`
-4. **Everything explains itself.** Every candidate carries a human-readable "proposed because…" — the explanation is more valuable to the reviewer than the score.
+1. **Deterministic-first.** The authoritative candidate stream is rules + scoring over glossary signals — never an LLM. (Exploration mode — flagged, off by default — may add a separate, clearly-labelled `LLM_SUGGESTED`, review-only stream; §12.)
+2. **The LLM is monotonic toward caution.** It may only explain / adjudicate a weak signal / flag a namespace mismatch / suggest a bridge — it can *lower a score or annotate*, never raise a score, mint a candidate, or promote to operational.
+3. **No operational join without confirmation.** A candidate is a proposal; only human confirmation makes an `approved_join` `VERIFIED`, and only a `VERIFIED` join projects to an operational edge. `provenance ≠ authority; confidence ≠ permission.`
+4. **Governed source of truth.** In governed mode, the feature planner's operational join traversal requires a `VERIFIED approved_join`. The pre-existing permissive shared-entity traversal is demoted to candidate-only (§13.1).
+5. **Everything explains itself and is versioned** (§10, §19).
 
-## 3. Scope
+## 3. Scope & sequencing
 
-**In scope (the done-line):**
+**In scope — the done-line:**
 ```
-candidate discovered (deterministic)
-  → scored + self-explaining evidence attached
-  → [optional] LLM challenger annotates / demotes
+candidate discovered (deterministic)  → scored, namespace-typed, self-explaining evidence
+  → [3B, optional] LLM challenger annotates / demotes
   → approved_join PROPOSED (governed)
   → human confirms/rejects (direction + cardinality)
   → approved_join VERIFIED
-  → projected to an operational graph edge feature-gen can traverse
-  → relationship readiness status updates
+  → projected to an operational graph edge (find_join_path traverses)
+  → relationship readiness = confirmed
 ```
-Phase 3 delivers **trustworthy governed joins in the catalog graph**, a **relationship-readiness** signal, and **one small proof** that a confirmed join is visible to the feature planner (`find_join_path`).
 
-**Out of scope (deliberate):**
-- **End-to-end feature construction** (join → "90-day spend"). That is the recipe/realization work stream — different risks, tests, acceptance. Phase 3 stops at *joins are known and governed*.
-- **OpenMetadata / structural-connector evidence, data profiling, cross-provider fusion, F4 cross-catalog relaxation, a real ownership registry.** All become *additional evidence producers / later phases*; the `approved_join` lifecycle is designed to absorb them without change.
-- **Join calibration / any threshold auto-promotion.** Phase 4. Phase 3's only paths to operational authority are structural evidence (later) or human confirmation.
+**Implementation sequencing (decided — v1-review Issue 4):**
+- **Phase 3A (the load-bearing spine):** deterministic blocker/scorer → governed proposal → human confirmation → reverse projection → relationship readiness + the `find_join_path` proof. **No LLM client required.**
+- **Phase 3B (additive):** the LLM challenger/explainer (demotion/bridge notes, bounded audited egress) and exploration mode.
+
+Both ship in this one design; the *plan* builds 3A first and proves the join lifecycle before adding 3B.
+
+**Out of scope (deliberate):** end-to-end feature construction (recipe stream); OpenMetadata/structural-connector evidence, profiling, cross-provider fusion, F4 relaxation, real ownership registry; join calibration / any threshold auto-promotion (Phase 4); composite-key discovery (§17); self-joins (§18, default off).
 
 ## 4. Reuse map — the join governance spine already exists (~85%)
 
-Verified in code (worktree `worktree-batched-enrichment`). Pass C **reuses these verbatim**; it only adds a new *candidate producer* in front and a *projector* behind.
+Verified in code. Pass C reuses these **verbatim**; it adds a candidate producer in front and a projector behind.
 
 | Capability | Status | Home |
 |---|---|---|
-| `approved_join` fact + value schema (`from_ref`/`to_ref`/ordered `column_pairs`/cardinality; composite supported) | REUSE | `overlay/facts.py:79-106`; `ApprovedJoinRef`/`ColumnPair` `overlay/identity.py:24`; `fact_key` sorts pairs as units so distinct joins never alias |
-| Propose a governed join (validates value, F4/consistency checks, mints evidence, opens **one gate task per owner side**) | REUSE | `overlay/proposal_commands.py:34-161` — Pass C calls the *same* `propose_fact` with a candidate-evidence payload |
-| **Dual-owner confirmation** lifecycle (`PARTIALLY_CONFIRMED→VERIFIED`, one distinct confirmer per side, four-eyes, side coverage, referent-gap gates, expiry armed) | REUSE | `overlay/join_confirmation.py:58-183`; `overlay/confirmation_commands.py:47-181`; self-confirm guard blocks single-party assertion |
-| Per-side owner resolution (`owner_of(from)`/`owner_of(to)`; **governance queue if unknown**; one task per side) | REUSE | `overlay/authority.py:92-137` + `Authority.task_assignees:56-89` |
-| Join drift / expiry / re-verification (both sides staled on referent change, one reverify task per side) | REUSE | `overlay/expiry.py:125`; `catalog_changes.py:230`; `reverify_tasks.py` |
-| Feature-gen consumes **only VERIFIED** joins, fail-closed (`find_join_path` traverses `authority='operational'` only) | REUSE | `overlay/resolve.py:183-308`; `overlay/join_path.py:38,53`; `feature_assist.py:610`, `entity.py:224` filter `kind='joins' AND authority='operational'` |
-| Governed joins_to seam (display-only raw edge vs operational edge; env-gated) | REUSE | `overlay/upload/graph.py:16` `governed_joins_enabled` / `:24` `_join_edge_authority`; `OVERLAY_GOVERNED_JOINS` |
-| **Id-like-column detector + entity tagging** (LLM-advisory + human-confirmed entity TAG, survives re-upload) | REUSE | `entity.py:112` `_is_id_like`; `entity.py:93` `suggest_entity` / `:177` `apply_entity_suggestion` (persists via `graph.py:151`) |
-| Global entity-relationship registry + directed grain-pair lookup | REUSE | `entity_registry.py:41` `ENTITY_RELATIONSHIPS_V1` / `global_relationship_for:50`; `entity_relationships.py` |
-| Per-candidate fail-soft dispatch loop (adapter-gated, counters, dedup pre-flight) | REUSE/EXTEND | `overlay/upload/ingest.py:136-179` `_propose_governed_joins` (adapter now live at `:552`) — Pass C is a parallel loop that adds the evidence arg |
-| Governed `ApprovedJoinRef` builder | EXTEND | `graph.py:66` `governed_join_proposal(row)` is `CanonicalRow`-coupled; Pass C needs a sibling that builds a ref from a *candidate pair* |
+| `approved_join` fact + value schema (`from_ref`/`to_ref`/ordered `column_pairs`/cardinality; composite supported) | REUSE | `overlay/facts.py:79-106`; `ApprovedJoinRef`/`ColumnPair` `identity.py:24`; `fact_key` sorts pairs as units |
+| Propose a governed join (validates, F4/consistency, mints evidence, one gate task per owner side) | REUSE | `overlay/proposal_commands.py:34-161` — Pass C calls the same `propose_fact` with a candidate-evidence payload |
+| Dual-owner confirmation lifecycle (`PARTIALLY_CONFIRMED→VERIFIED`, four-eyes, side coverage, referent-gap, expiry) | REUSE | `overlay/join_confirmation.py:58-183`; `confirmation_commands.py:47-181` |
+| Per-side owner resolution (governance queue if unknown; one task per side) | REUSE | `overlay/authority.py:92-137` |
+| Join drift / expiry / re-verify (both sides staled on referent change) | REUSE | `overlay/expiry.py:125`; `catalog_changes.py:230`; `reverify_tasks.py` |
+| Feature-gen consumes **only VERIFIED** joins, fail-closed | REUSE | `overlay/resolve.py:183-308`; `overlay/join_path.py:38,53` (`authority='operational'` only) |
+| Governed joins_to seam (display-only vs operational edge; env-gated) | REUSE | `overlay/upload/graph.py:16,24`; `OVERLAY_GOVERNED_JOINS` |
+| Id-like detector + entity tagging (human-confirmed, survives re-upload) | REUSE | `entity.py:112` `_is_id_like`; `:93` `suggest_entity` / `:177` `apply_entity_suggestion` |
+| Entity-relationship registry + directed grain-pair lookup | REUSE | `entity_registry.py:41`; `entity_relationships.py` |
+| `ApprovedJoinRef` builder + fail-soft per-item dispatch loop | EXTEND | `graph.py:66` `governed_join_proposal`; `ingest.py:136-179` `_propose_governed_joins` — Pass C is a sibling that adds the evidence arg |
 
-## 5. The new surface (small)
+## 5. New surface
 
-1. **Deterministic candidate blocker + scorer** (NEW) — reads `graph_node` (column name / type / concept / entity from Phase-1/2) + the glossary sidecar fields (`related_terms`, `synonyms_aliases`, `bian_/fibo_level_*`, `term_name`), enumerates *identifier-like* column pairs that plausibly share an entity, scores them, and buckets them (strong / weak / suppress). Reuses `_is_id_like` and confirmed entity tags as blocking keys — no blind name matching.
-2. **Optional LLM challenger/explainer** (NEW, advisory) — for strong/borderline candidates only: generate the reviewer explanation, adjudicate weak signals, **flag namespace mismatches** (demotion), and **suggest a bridge** when a direct join is wrong. Bounded egress (only the small candidate set, metadata-only), and strictly non-authoritative (§7).
-3. **Propose wiring** (NEW glue, reuse `propose_fact`) — turns a surfaced candidate into an `approved_join` PROPOSED with the scoring breakdown + annotations as its evidence; fail-soft, adapter-gated, default-OFF, runs at ingest like Pass A/B.
-4. **Reverse projector** (NEW, small) — a VERIFIED `approved_join` → an `authority='operational'` `graph_edge` that `find_join_path` traverses. Closes the loop (§10).
-5. **Relationship readiness** (EXTEND Phase-2 readiness) — a per-table "relationships" status (candidate / proposed / confirmed / none) mirroring the grain/availability readiness dimension.
+1. **Deterministic candidate blocker + scorer** (NEW, pure) — §6/§7.
+2. **Candidate evidence + persistence** (NEW) — §10.
+3. **Dedupe / re-ingest lifecycle** (NEW) — §11.
+4. **Propose wiring** (NEW glue, reuse `propose_fact`) — §13.
+5. **Reverse projector** (NEW, small) — §14.
+6. **Relationship readiness** (EXTEND Phase-2 readiness) — §16.
+7. **LLM challenger** (NEW, Phase 3B, advisory) — §12.
 
 ## 6. The deterministic candidate model
 
 **Hard gates** (a pair is considered only if *all* hold):
-- both columns are **identifier-like** (`_is_id_like` + concept/semantic-type says identifier/reference);
-- a **same/compatible entity namespace is plausible** (same confirmed entity tag, or same BIAN leaf + supporting name/`related_terms`) — see the namespace note below;
-- **neither column is a measure/date/free-text/sensitivity-only field**;
-- **not the same table** (self-joins allowed only when explicitly enabled).
+- both columns are **identifier-like** (`_is_id_like` AND `term_type ∉ {Measure}` AND concept/semantic-type is identifier/reference);
+- **namespace compatibility ∈ {COMPATIBLE, POSSIBLE}** (§7);
+- **neither is a measure/date/free-text/sensitivity-only field** (negative filter below);
+- **not the same table** (self-join only when explicitly enabled, §18).
 
-**Negative filters (hard `NEVER`, even on an exact name match).** A column is disqualified as a join key if its concept / semantic type is: `amount, balance, rate, date, timestamp, description, name, status, free_text, address, phone, email, currency, flag, score`. (`customer_name ↔ customer_name` is **not** a join.)
+**Negative filters (hard `NEVER` a key, even on exact name match).** Disqualified if concept / semantic-type / `term_type`=`Measure` maps to any of: `amount, balance, rate, date, timestamp, description, name, status, free_text, address, phone, email, currency, flag, score`. (`CUST_NAME ↔ CUST_NAME` is not a join.)
 
-**Positive signals (weighted — v1 defaults, configurable):**
+**Positive signals (weighted v1 defaults — configurable, §19). Order reflects the FTR finding:**
 
-| Signal | Score |
-|---|--:|
-| Same curated `related_terms` / synonym-group link | **+50** |
-| Same normalized identifier **concept** | +35 |
-| Same canonical **column name** | +30 |
-| Same **`term_name`** (normalized) | +25 |
-| Same **BIAN leaf** | +20 |
-| Same **FIBO leaf** | +15 |
-| Compatible **Phase-2 table entities** | +15 |
-| One side has **confirmed grain** | +10 |
-| Compatible source / `data_domain` / process hierarchy | +10 |
+| Signal | Score | Note |
+|---|--:|---|
+| Same normalized **identifier concept** (from `term_name`+name+synonyms) | **+40** | the real same-key signal |
+| Same curated `related_terms` link **that ties two id-like columns by concept** | +50 | gated (§8); rarely fires in FTR |
+| Same canonical **column name** | +30 | e.g. `FORACID↔FORACID` |
+| Same **`term_name`** (normalized) | +25 | |
+| Confirmed **entity tag** match (`entity.py`) | +25 | high-confidence when present |
+| Same **BIAN leaf** (coarse prior) | +10 | never sufficient; capped by namespace status |
+| Same **FIBO leaf** | +10 | |
+| Compatible **Phase-2 table entities** | +15 | |
+| One side has **confirmed grain** (directional support) | +10 | |
+| Compatible source / `data_domain` / process hierarchy | +10 | |
 
 **Suppression:**
 
 | Condition | Score |
 |---|--:|
-| Non-identifier semantic type | **−100** |
-| Measure / date / free-text field | **−100** |
-| Incompatible entity namespace (incl. an LLM-challenger namespace-mismatch flag) | −50 |
-| Ambiguous generic `reference_id` with no context | −40 |
+| Non-identifier semantic type / negative-filter field | **−100** |
+| Namespace **INCOMPATIBLE** (incl. LLM-challenger mismatch flag) | **−50** |
+| Namespace **AMBIGUOUS** (e.g. a mixed BIAN leaf, generic `reference_id` with no concept) | −40 |
 | Both sides are grains of *different* entities with no bridge semantics | −30 |
 
-**Buckets:** `score ≥ 80` → **strong** (worklist); `50–79` → **weak** (low-priority, hidden by default); `< 50` → **suppress**.
+**Buckets:** `≥ 80` → **strong** (propose); `50–79` → **weak** (readiness diagnostic, no proposal by default; §15); `< 50` → **suppress** (telemetry only). A candidate whose namespace is only **POSSIBLE** is **capped at weak** unless reinforced by a confirmed entity tag or a gated `related_terms` link.
 
-**Signal-priority principle (locks the design):** `related_terms` (curated intent) > identifier concept/name/alias > **BIAN/FIBO (supporting, never sufficient)** > Phase-2 entity context > name-alone. **BIAN/FIBO strengthen a candidate; they never *prove* joinability** — BIAN is a business-capability taxonomy, not a physical-identifier namespace registry.
+**Every candidate self-explains** — a `SignalEvidence` list + the namespace status + a human sentence (§10). The explanation is worth more to the reviewer than the number.
 
-**Namespace note (the `account_id` trap).** "Namespace compatibility" *cannot be proven from the CSV* (customer account vs. counterparty/beneficiary account can share a name). Deterministically it is a **plausibility gate** (entity tag + `related_terms` + concept) — **necessary, not sufficient**. The **LLM challenger** and the **human** are the real namespace judges; the challenger's mismatch flag feeds the `−50` suppressor.
+## 7. Namespace compatibility (the load-bearing gate)
 
-**Self-explaining candidate (required output):**
+Because "same-looking id, different namespace" is the hardest banking bug (`account_id`=customer vs counterparty; `party_id`=customer vs beneficiary; the FTR leaf *"Customer and Counterparty Identification"* itself), namespace compatibility is an explicit, auditable status — **necessary but not sufficient**, and *not provable from the CSV*.
+
+```python
+class NamespaceCompatibility(StrEnum):
+    COMPATIBLE   = "compatible"    # same confirmed entity tag, OR same normalized identifier concept + reinforcement
+    POSSIBLE     = "possible"      # id-like + same specific concept, but no entity-tag/related_terms reinforcement
+    AMBIGUOUS    = "ambiguous"     # mixed BIAN leaf, generic reference_id w/o concept, or conflicting signals
+    INCOMPATIBLE = "incompatible"  # different confirmed entities, or an LLM-challenger namespace-mismatch flag
 ```
-Proposed because:
-- both columns normalize to `customer_id`
-- both are identifier-like
-- related_terms links them to "Customer Reference"
-- right table customer.cust_id is confirmed grain (Phase 2)
-Score: 95 (strong)
+
+Deterministic derivation (from the CSV alone): **COMPATIBLE** = same confirmed entity tag, or same normalized identifier concept with a corroborating signal (name/synonym/related_terms). **POSSIBLE** = same specific identifier concept but nothing corroborating. **AMBIGUOUS** = same *coarse BIAN leaf only* / a leaf flagged "mixed" (e.g. customer+counterparty) / a generic `reference_id` with no distinguishing concept. **INCOMPATIBLE** = different confirmed entities, or (3B) a challenger mismatch flag.
+
+Gate/bucket interaction: gate admits `COMPATIBLE|POSSIBLE`; `COMPATIBLE` is strong-eligible; `POSSIBLE` caps at weak unless reinforced; `AMBIGUOUS` → reviewer-only/suppress (−40); `INCOMPATIBLE` → suppress (−50).
+
+**Reason codes** on every candidate (auditable): `same_confirmed_entity`, `same_identifier_concept`, `related_terms_link`, `same_bian_leaf_only`, `mixed_bian_leaf`, `generic_reference_without_context`, `counterparty_namespace_detected`, `different_confirmed_entity`.
+
+## 8. `related_terms` & synonym semantics
+
+The FTR data shows `related_terms` is a broad relation (parent/associated), not a key link, and blank on ids. Treatment (v1-review Issue 2):
+- `related_terms` scores as a **strong** signal **only** when **both columns are identifier-like AND the related-term text normalizes to the other column's `term_name`/name/concept**. A bare `related_terms` overlap (e.g. two columns both related to "Financial Transaction Record") is **supporting, not sufficient** (and usually blocked because one side isn't id-like).
+- `synonyms_aliases` feed the **normalized identifier concept** (e.g. `CIF_ID`↔`CIF`), not a standalone signal.
+- If a future glossary encodes typed relations (`same_as_identifier`, `foreign_key_to`, `alias_of`, `business_related_to`, `parent_child`), Pass C consumes the type directly; absent a type (FTR), it uses the normalize-and-require-id-like rule above.
+
+## 9. Direction & cardinality
+
+Inferred from **Phase-2 grain**, with an explicit status and full case coverage (v1-review Issue 5):
+
+```python
+class CardinalityInferenceStatus(StrEnum):
+    INFERRED_FROM_CONFIRMED_GRAIN = "inferred_from_confirmed_grain"
+    MISSING_GRAIN                 = "missing_grain"
+    AMBIGUOUS_BOTH_GRAINS         = "ambiguous_both_grains"
+    MANY_TO_MANY_RISK             = "many_to_many_risk"
 ```
-This breakdown is carried as the proposal's **evidence** so `get_task_proposal` shows the reviewer *why*.
 
-## 7. The LLM challenger contract (advisory, monotonic toward caution)
+| Left grain? | Right grain? | Proposed | Status |
+|---|---|---|---|
+| no | yes | `left → right` N:1 | `INFERRED_FROM_CONFIRMED_GRAIN` |
+| yes | no | `right → left` N:1 (1:N stated) | `INFERRED_FROM_CONFIRMED_GRAIN` |
+| yes | yes | 1:1 / dimension-dimension — **caution** | `AMBIGUOUS_BOTH_GRAINS` |
+| no | no | many-to-many risk / bridge needed | `MANY_TO_MANY_RISK` (confidence lowered, gap surfaced) |
+| unknown | known | lower confidence | `MISSING_GRAIN` on the unknown side |
 
-The LLM never generates candidates and never influences join authority. On the bounded, deterministic candidate set it may do exactly four things, each producing an **annotation on an existing candidate**, never a new operational fact:
-1. **Explain** — render the deterministic evidence as a reviewer-readable rationale.
-2. **Adjudicate a weak signal** — classify a borderline candidate (`same identifier / different identifier / bridge needed / insufficient evidence`); result stays `LLM_PROPOSED`.
-3. **Namespace disambiguation (challenge)** — detect that two similar columns are different namespaces; a mismatch flag *demotes* the candidate (`−50`).
-4. **Bridge suggestion** — "these need an `account → customer` bridge, don't join directly"; demotes the direct-join candidate and surfaces a note for the reviewer.
+A **missing grain is visible** in the worklist and recorded as a **separate** confirmation (grain via the Phase-2 grain lifecycle; join via the `approved_join` lifecycle). The proposed value always **explains what it assumed**.
 
-**Guarantee:** an LLM annotation can only lower a score, add a caution, or explain — it can never raise a score, create a candidate, or promote to operational. **Egress is bounded** (only the small surfaced candidate set, metadata-only, same governed audited seam Pass A/B use) so the mass-column-dump anti-pattern ("ask the LLM which joins exist") is structurally impossible.
+**Correction path (v1-review Issue 13).** The reviewer may adjust **cardinality** at confirm (a value override — the plan verifies `confirm_fact` accepts a `value` override, as Phase 2's does). A **direction/endpoint** error (wrong `from_ref`/`to_ref`) is **reject-with-reason → re-propose the corrected candidate**, because the endpoints participate in the `fact_key`. The spec does **not** promise in-place endpoint mutation at confirm.
 
-**Two modes:**
-- **Default (banking) mode:** deterministic candidates + optional LLM explain/challenge + human confirm.
-- **Exploration mode (flagged, off by default):** the LLM may *suggest additional weak candidates*, clearly labelled `LLM_SUGGESTED`, never auto-promoted, never operational.
+## 10. Candidate evidence payload (attached to every proposal)
 
-## 8. Direction & cardinality
+A reviewer must confirm/reject without reverse-engineering the score. Every proposal carries:
 
-Direction/cardinality come from **Phase-2 grain**, not guesswork: if `customer.cust_id` is a confirmed grain (a primary key) and `txn.cust_id` is not, then `txn → customer` is **many-to-one** automatically; the human confirms or flips it. When **grain is missing**, the candidate's confidence is **lowered** and the gap is made **visible** in the worklist:
+```python
+@dataclass(frozen=True)
+class SignalEvidence:
+    signal_name: str            # e.g. "same_identifier_concept"
+    score_delta: int
+    evidence_refs: tuple[str, ...]   # e.g. ("...txn.cif_id", "...customer.cif_id")
+    explanation: str
+
+@dataclass(frozen=True)
+class JoinCandidateEvidenceV1:
+    candidate_id: str
+    from_ref: str
+    to_ref: str
+    column_pairs: tuple[ColumnPair, ...]
+    proposed_direction: str | None
+    proposed_cardinality: str | None
+    cardinality_status: CardinalityInferenceStatus
+    bucket: Literal["strong", "weak", "suppressed"]
+    score: int
+    positive_signals: tuple[SignalEvidence, ...]
+    negative_signals: tuple[SignalEvidence, ...]
+    namespace_compatibility: NamespaceCompatibility
+    namespace_reason_codes: tuple[str, ...]
+    grain_evidence: tuple[str, ...]
+    missing_requirements: tuple[str, ...]        # e.g. ("grain: customer.cif_id",)
+    llm_annotations: tuple[str, ...]             # 3B only; demotions/notes
+    explanation: str                             # the human "proposed because…"
+    producer: Literal["deterministic_pass_c"]
+    config_version: str
+    candidate_algorithm_version: str
+    source_snapshot_id: str
 ```
-Join candidate requires grain confirmation:
-- customer.cust_id grain: missing
-- txn.cust_id grain: missing
+
+This object is passed to `propose_fact` as the proposal evidence, persisted with the fact, and surfaced through `get_task_proposal`.
+
+## 11. Candidate fingerprint, dedupe & re-ingest lifecycle
+
+Pass C runs at ingest; re-ingesting the same glossary must **not** create duplicate proposals. Fingerprint = `(source, from_ref, to_ref, ordered column_pairs, candidate_algorithm_version)`. Per run, keyed on the current folded state of the candidate's `approved_join` fact:
+
+| Existing state | Same candidate (same fingerprint) | Different candidate (same pair, new direction/pairs/evidence) |
+|---|---|---|
+| none | **propose** | propose |
+| PROPOSED (`DRAFT`) | update evidence in place / skip if identical | **conflict → review item** |
+| VERIFIED | **skip** | conflict if contradictory (do not silently supersede) |
+| REJECTED | do **not** reopen unless evidence *materially* changed (score bucket or namespace status changed) | may propose |
+| STALE / REVERIFY / EXPIRED | allow re-proposal | may propose |
+| display-only raw edge (from a declared `joins_to`) | attach candidate evidence; **do not** operationalize (only confirmation does) | — |
+
+Reuses Phase-2's folded-state discipline (skip-quiet on active/VERIFIED; let `propose_fact` adjudicate sticky-rejected). "Materially changed" = a change in `bucket` or `namespace_compatibility`, not a cosmetic score delta.
+
+## 12. The LLM challenger contract (Phase 3B, advisory, monotonic toward caution)
+
+On the bounded deterministic candidate set only, the LLM may produce **annotations on existing candidates** — never new operational facts:
+1. **Explain** the deterministic evidence.
+2. **Adjudicate a weak signal** (`same/different identifier / bridge needed / insufficient`) — result stays `LLM_PROPOSED`.
+3. **Namespace mismatch (challenge)** → sets `NamespaceCompatibility=INCOMPATIBLE` (demotion `−50`).
+4. **Bridge suggestion** ("needs `account → customer` bridge") → demotes the direct candidate + a reviewer note. *Building* a bridge is a reviewer action / future.
+
+**Guarantee:** an LLM annotation can only *lower a score, add a caution, or explain* — never raise, create, or promote. Egress is bounded (only the surfaced candidate set, metadata-only, via the existing audited enrich seam) so the mass-column-dump anti-pattern is structurally impossible.
+
+**Flags:** `OVERLAY_PASS_C` (feature, default 0) · `OVERLAY_PASS_C_LLM_CHALLENGER` (default 0) · `OVERLAY_PASS_C_EXPLORATION` (default 0). Deterministic candidate generation runs with **no LLM client**; the challenger/exploration modes are strictly additive. Exploration mode may surface `LLM_SUGGESTED` weak candidates to a review-only worklist, never operational.
+
+## 13. Confirmation & authority
+
+### 13.1 Governed source of truth (v1-review Issue 9 — decided)
+
+In **governed mode** (`OVERLAY_PASS_C` on), the feature planner's **operational** join traversal requires a `VERIFIED approved_join`. The pre-existing permissive shared-entity traversal (`entity.py` `cross_join_via_entity` / runtime `EntityBridge`) is **demoted to candidate-only** — it may *feed* Pass C candidates but is **not itself operational**. With the flag **off**, current behaviour is preserved byte-for-byte (transition safety). The plan wires the feature-planner's governed-mode filter and treats the permissive path's retirement as the §12.1 governed-joins retirement milestone.
+
+### 13.2 CSV-only confirmation mode (v1-review Issue 10 — reconciled)
+
+`owner_of → None` for both endpoints ⇒ both sides resolve to the **platform-admin governance queue**. Because both sides share the same governance owner, `Authority.dual` collapses to **False**, so confirmation takes the **single-confirmer** path; four-eyes is satisfied because the **proposer is the Pass C service actor**, distinct from the human confirmer. Labelled honestly on the proposal:
 ```
-The reviewer may **confirm join only**, or **confirm grain + join together** — recorded as **separate** confirmations (the grain confirmation flows through the Phase-2 grain lifecycle; the join through the `approved_join` lifecycle).
-
-## 9. Confirmation & authority
-
-With no per-table owners in a CSV-only world, a proposed join routes to the **platform-admin governance queue** (a single confirmer), exactly as Phase 2's facts do (`owner_of → None`). This is labelled **honestly** on the proposal:
+owner_resolution   = unavailable
+confirmation_mode  = governance_fallback_single_confirmer
+four_eyes          = satisfied_by_service_proposer  (dual-owner enforced once ownership exists)
 ```
-confirmation_authority = platform_governance_fallback
-owner_resolution       = unavailable
+(The plan verifies `Authority.dual` collapses to False for same-governance-both-sides; the two-party path is otherwise unchanged and re-activates automatically when a real ownership registry supplies distinct `owner_of`.)
+
+## 14. Reverse projection — close the loop (idempotent, fail-closed)
+
+A `VERIFIED approved_join` projects to an `authority='operational'` `joins` edge; **anything else demotes it**. The projector is **clear-then-apply idempotent** (like Phase 2's grain projector), not upgrade-only.
+
+**Promotion:** on `VERIFIED`, set the pair's `joins` edge to `operational` with links back to the fact.
+**Demotion triggers (all):** `approved_join` `REJECTED` / `EXPIRED` / `STALE` (referent drift) / superseded by a different join / an endpoint column removed / an endpoint identity AMBIGUOUS. Any of these → the edge reverts to `display_only`.
+
+**Edge fields (new — mirror migration 0984's node decision-links):** `authority`, `approved_join_fact_key`, `approved_join_event_id`, `approved_join_status`, `authority_updated_at`. Operational traversal filters:
 ```
-The **dual-owner two-party path is preserved unchanged** — when a real ownership registry lands, the same `approved_join` lifecycle enforces owner-specific / two-party confirmation with no rework.
+kind='joins' AND authority='operational' AND approved_join_status='VERIFIED'
+```
+**Wrinkle:** the `graph_edge` PK `(catalog_source, kind, from_ref, to_ref)` (0945) forbids a display+operational row for one pair — the projector **upgrades authority in place** (single row), never inserts a second. Idempotent: clear/normalize the pair's authority, then apply the current fact state.
 
-## 10. Reverse projection — close the loop
+## 15. Weak / suppressed candidate behaviour (v1-review Issue 12)
 
-Today a confirmed `approved_join` **fact** does not automatically become a traversable **edge**: `find_join_path` reads `authority='operational'` `graph_edge`s, and nothing projects a confirmed fact into one. Without closing this, confirmed joins would do nothing. Phase 3 adds a **projector**: on `VERIFIED`, write (or upgrade) an `authority='operational'` `joins` edge for the pair.
+- **strong (≥80)** → propose an `approved_join` (governed queue).
+- **weak (50–79)** → **persist as a candidate/readiness diagnostic; NO proposal** by default (keeps the governed queue from flooding). Surfaced in the relationship-readiness view as "possible relationships, unconfirmed."
+- **suppressed (<50)** → **telemetry/counters only** (reason codes), not persisted as candidates.
+- **exploration mode** → `weak + LLM_SUGGESTED` may go to a **review-only** worklist, clearly labelled, never operational without explicit promotion.
 
-**Known wrinkle (for the plan):** the `graph_edge` primary key `(catalog_source, kind, from_ref, to_ref)` (0945) blocks a `display_only` and an `operational` edge coexisting for one pair. The projector must **upgrade the existing edge's authority in place** (not insert a second row), and add an **edge → `approved_join` fact/decision link** (mirroring migration 0984's node decision-links) so an edge's operational authority is queryable back to its confirming fact. Idempotent and drift-safe (a re-verify/expiry demotes the edge back to display-only).
+## 16. Relationship readiness
 
-## 11. Relationship readiness
+Extend the Phase-2 readiness machinery with a per-table **relationships** dimension: `no_candidates / candidate_proposed / weak_candidates_only / confirmed / conflicting`, cause-labelled. This is the **done-line proof**: after a human confirms a join, readiness flips to `confirmed` and `find_join_path` traverses it.
 
-Extend the Phase-2 readiness machinery with a per-table **relationships** dimension: `no_candidates / candidate_proposed / confirmed / conflicting`, cause-labelled like the grain/availability requirements. This is the **done-line proof**: after a human confirms a join, readiness flips to `confirmed` and `find_join_path` can traverse it — demonstrating end-to-end that a governed relationship is now available to the feature planner (without Phase 3 building the feature itself).
+## 17. Composite joins — explicitly deferred (v1-review Issue 6)
 
-## 12. Data flow (end to end)
+`ApprovedJoinRef` supports composite `column_pairs`, but **Phase 3A candidate generation is single-column-pair only.** Composite-key discovery (`country_code + customer_id`, `source_system + account_id`, `as_of_date + id`) is deferred to the structural/profiling phase (where inclusion-dependency evidence can validate a composite). The `approved_join` schema's composite support is preserved untouched. (A future heuristic — "multiple strong id candidates on one table pair → possible composite, review-only" — is noted, not built.)
+
+## 18. Self-joins — deferred, default off (v1-review Issue 15)
+
+Same-table joins (`employee.manager_id → employee.employee_id`, `account.parent_account_id → account.account_id`) are **excluded by default**; the hard gate has an explicit `allow_self_join` switch (off) for a future need.
+
+## 19. Versioning (v1-review Issue 14)
+
+Every `JoinCandidateEvidenceV1` carries `config_version` (the scoring-weights/threshold config) and `candidate_algorithm_version` (the blocker/scorer logic). Replays and audits explain why old candidates differ from new ones; calibration (Phase 4) bumps the config version, not code.
+
+## 20. Data flow (end to end)
 
 ```
 ingest_upload (glossary) — flag OVERLAY_PASS_C, default OFF
   Pass A/B run as today
-  ─ Pass C ─────────────────────────────────────────────
-  1. block:   enumerate identifier-like pairs sharing a plausible entity
-  2. score:   hard gates + negative filters + weighted signals → strong/weak/suppress
-  3. [opt]    LLM challenger: explain / adjudicate / namespace-flag / bridge  (demote-only)
-  4. propose: strong (and, in exploration mode, weak) → propose_fact(approved_join,
-              evidence = scoring breakdown + annotations)  [fail-soft, savepointed]
-  5. readiness: relationships status = candidate_proposed
+  ─ Pass C (3A) ─────────────────────────────────────────
+  1. block:   identifier-like pairs; namespace ∈ {COMPATIBLE,POSSIBLE}; negative filters
+  2. score:   signals → score + bucket + namespace status + self-explanation
+  3. persist: strong → propose_fact(approved_join, evidence=JoinCandidateEvidenceV1)  [fail-soft, savepointed, deduped §11]
+              weak   → readiness diagnostic (no proposal);   suppressed → telemetry
+  4. [3B, opt] LLM challenger: explain/adjudicate/namespace-flag/bridge  (demote-only)
+  5. readiness: relationships = candidate_proposed / weak_candidates_only
   ───────────────────────────────────────────────────────
-(later, async — a human)
-  6. confirm: approved_join PROPOSED → VERIFIED (direction + cardinality; governance fallback)
-  7. project: VERIFIED fact → operational graph_edge (in-place authority upgrade + fact link)
-  8. readiness: relationships status = confirmed;  find_join_path can now traverse it
+(later, async — a human, governance fallback)
+  6. confirm: PROPOSED → VERIFIED (cardinality override ok; wrong endpoints → reject+re-propose)
+  7. project: VERIFIED → operational edge (in-place authority upgrade + fact link);  non-VERIFIED → demote
+  8. readiness: relationships = confirmed;  find_join_path traverses it
 ```
 
-## 13. Module / file structure (units with clear boundaries)
+## 21. Module / file structure
 
-- `overlay/upload/passc/candidates.py` — **blocker + scorer** (pure): `block_candidates(graph, glossary) -> [Candidate]`, `score(candidate) -> ScoredCandidate` with hard gates, negative filters, weighted signals, bucket, and the self-explaining evidence. No I/O, no LLM. Fully unit-testable.
-- `overlay/upload/passc/challenger.py` — the **optional LLM challenger** (advisory): `challenge(scored_candidates) -> annotations`, monotonic-toward-caution, bounded/audited egress via the existing enrich seam. Default-off unless a client is present.
-- `overlay/upload/passc/propose.py` — **propose wiring**: build the `ApprovedJoinRef`, call `propose_fact` with the candidate evidence, fail-soft/adapter-gated/counters (sibling to `_propose_governed_joins`).
-- `overlay/upload/passc/projection.py` — the **reverse projector** (VERIFIED fact → operational edge, in-place upgrade + fact link, idempotent, drift-safe).
-- `overlay/upload/readiness.py` — EXTEND with the **relationships** dimension.
-- `overlay/upload/ingest.py` — wire Pass C at the existing seam (behind `OVERLAY_PASS_C`, default OFF; savepointed fail-soft like Pass B).
-- Migration — `graph_edge` fact/decision-link column (mirror 0984).
-- Tests under `tests/featuregen/overlay/upload/passc/`.
+- `overlay/upload/passc/candidates.py` — blocker + scorer + namespace classifier (pure; no I/O/LLM). `block(...)→[Candidate]`, `score(...)→JoinCandidateEvidenceV1`.
+- `overlay/upload/passc/lifecycle.py` — fingerprint + dedupe/re-ingest state machine (§11).
+- `overlay/upload/passc/propose.py` — build `ApprovedJoinRef`, `propose_fact` with evidence; fail-soft/adapter-gated/counters.
+- `overlay/upload/passc/projection.py` — reverse projector (clear-then-apply, promote/demote, fact link).
+- `overlay/upload/passc/challenger.py` — Phase 3B LLM challenger (advisory, bounded egress, default-off).
+- `overlay/upload/readiness.py` — EXTEND: relationships dimension.
+- `overlay/upload/ingest.py` — wire Pass C at the governed-joins seam (behind `OVERLAY_PASS_C`, savepointed fail-soft).
+- migrations — `graph_edge` fact/decision-link columns (§14).
+- config — one object holding weights/thresholds/negative-filter list/buckets (v1 defaults; `config_version`).
+- tests under `tests/featuregen/overlay/upload/passc/`.
 
-**Configuration:** the scoring weights, thresholds, negative-filter list, and buckets live in one config object (v1 defaults above), so calibration (Phase 4) tunes data, not code.
+## 22. Testing
 
-## 14. Testing
+- **Blocker/scorer (pure):** negative filters suppress (`Measure`/date/`CUST_NAME` never candidate even on exact name match); same identifier concept → strong; same BIAN leaf **alone** → weak, and a **mixed leaf → AMBIGUOUS**; `related_terms` fires strong **only** when it links two id-like columns by concept; self-join excluded; every candidate carries a non-empty explanation + reason codes; namespace enum derivation for COMPATIBLE/POSSIBLE/AMBIGUOUS/INCOMPATIBLE.
+- **Dedupe/lifecycle:** re-ingest of an identical glossary creates **no** duplicate proposal; a rejected candidate does **not** reopen unless bucket/namespace changed; a VERIFIED candidate is skipped.
+- **Challenger (3B):** a namespace-mismatch flag demotes; a bridge suggestion demotes + annotates; the LLM can never raise a score or mint a fact (assert monotonicity); egress bounded/metadata-only.
+- **Propose:** strong → `approved_join` PROPOSED (not confirmed); evidence carries the breakdown; fail-soft; default-OFF byte-for-byte.
+- **Confirm + project (integration) — the authority proof (v1-review Issue 11), both directions:**
+  - strong candidate proposed → a display edge may exist → `find_join_path` does **not** traverse it (fail-closed);
+  - human confirms → projector upgrades the edge → `find_join_path` **traverses** it → readiness = `confirmed`;
+  - fact expires/reverify-stale/rejected → projector **demotes** the edge → `find_join_path` **no longer** traverses.
+- **Grain interaction:** grain-missing lowers confidence + surfaces the gap; join-only vs grain+join are separate confirmations; cardinality-status cases (§9) covered.
+- **Governed source of truth:** with the flag on, the permissive shared-entity path is not operational; with the flag off, current feature-gen behaviour is unchanged.
 
-- **Blocker/scorer** — pure unit tests: negative filters suppress (`amount`/`date`/`name` never candidate even on exact name match); `related_terms` link → strong; BIAN-leaf-alone → weak (not strong); id-like gate; self-join excluded; every candidate carries a non-empty explanation.
-- **Challenger** — a namespace-mismatch flag demotes; a bridge suggestion demotes + annotates; the LLM can never raise a score or mint a fact (assert monotonicity); egress is bounded/metadata-only (reuse Phase-1/2 egress assertions).
-- **Propose** — a strong candidate becomes `approved_join` PROPOSED (not confirmed); evidence carries the breakdown; fail-soft (a propose error never aborts the upload); default-OFF byte-for-byte.
-- **Confirm + project (integration)** — propose → human confirm (governance fallback) → `VERIFIED` → operational edge exists → `find_join_path` traverses it → relationship readiness = `confirmed`. Plus: a re-verify/expiry demotes the edge back to display-only.
-- **Grain interaction** — grain-missing lowers confidence + surfaces the gap; join-only vs grain+join are separate confirmations.
+## 23. Out of scope / deferred / open
 
-## 15. Out of scope / deferred / open items
-
-- **Structural evidence** (OM structural-connector facts, data profiling / value-overlap, composite FKs, cross-provider fusion, F4 relaxation, real ownership registry): later phases; the lifecycle absorbs them as new producers without rework.
-- **Feature construction / recipe realization**: separate stream. Phase 3 proves availability only.
-- **Join calibration / auto-promotion**: Phase 4.
-- **Reconcile the permissive runtime `EntityBridge`** (`entity.py` `cross_join_via_entity`) **with the governed `approved_join`**: today feature-gen can also join via a shared entity tag *without* formal join confirmation. Direction (to be confirmed in the plan): make the governed confirmed-join the source of truth and treat the permissive path as candidate-only / fold it in. Flagged as a design decision for the implementation plan, not a Phase-3 blocker.
-- **Bridge tables** (multi-hop `account → customer`): the LLM may *suggest* one and demote the direct candidate; *building* a bridge relationship is a reviewer action / future.
+- **Structural evidence** (OM structural-connector facts, profiling/value-overlap, composite FKs, cross-provider fusion, F4 relaxation, real ownership registry): later phases; the lifecycle absorbs them as new producers without rework.
+- **Feature construction / recipe realization:** separate stream.
+- **Join calibration / auto-promotion:** Phase 4.
+- **Composite & self-joins:** §17/§18.
+- **Bridge tables:** the LLM may *suggest* one and demote a direct candidate; *building* a bridge relationship is future.
