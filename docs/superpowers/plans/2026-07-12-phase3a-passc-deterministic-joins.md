@@ -28,7 +28,10 @@ v1 was reviewed against the real code; v2 fixes ~13 confirmed defects. Load-bear
 - **No operational join without TWO distinct human confirmations.** Pass C only appends `OVERLAY_FACT_PROPOSED`; two distinct platform-admins reach `VERIFIED`; only a `VERIFIED` fact projects to an operational edge.
 - **Default-OFF (`OVERLAY_PASS_C`, default `0`). Flag-off ⇒ `ingest_upload` byte-for-byte.** The projector is declared-spare; governed-mode edge-authority changes fire only under the flag.
 - **Fail-soft.** The Pass C discovery+propose block runs in **its own `with conn.transaction():` savepoint + `except`** (mirror the Pass A enrichment stages `ingest.py:627-648`, NOT the bare-except identity block at 596-614 and NOT `_propose_governed_joins` which has no savepoint). `propose_fact` does un-savepointed appends, so the savepoint must be at the Pass C call site.
-- **Migration slot `0987`** (last used `0986`). No other migration (weak candidates are recomputed, not stored).
+- **Migrations `0987`** (graph_edge fact-link columns) **and `0988`** (`pass_c_candidate_evidence` — the durable Pass-C candidate ledger for ALL buckets: reviewer evidence, weak-candidate persistence, and re-ingest dedup). Last used `0986`.
+- **Propose-eligibility is grain-gated:** ONLY a candidate whose `cardinality_status == INFERRED_FROM_CONFIRMED_GRAIN` (one side is a confirmed grain, the other is not → `N:1`) is strong-eligible and proposed. **Both-grain (`AMBIGUOUS_BOTH_GRAINS`, would be `1:1`) and neither-grain (`MANY_TO_MANY_RISK`) are forced to `weak` — diagnostic only, never an `approved_join`** (two unique columns are not necessarily 1:1 business-equivalent; `account.account_id`≠`card.card_id`).
+- **`entity_tag` is split into `table_entity` (the table's primary entity) and `column_entity` (the column's identifier namespace).** Namespace compatibility keys on `column_entity` (a `transactions.customer_id → customer.customer_id` join has *different table entities* but the *same column identifier entity* `customer`). A different `column_entity` → INCOMPATIBLE; a different `table_entity` is **not** by itself incompatible.
+- **Graph join edges are COLUMN-keyed** (`from_ref`/`to_ref` = `public.table.column`), so multiple joins between the same table pair on different columns coexist. Conflict detection and projector matching operate on the **unordered COLUMN-ref pair**, never the table pair.
 - **Cardinality enum `1:1|1:N|N:1`** (`facts.py:103`); it is part of the `fact_key` (`identity.py:71-81`). No `N:M`; no confirm-time override.
 - Reuse types verbatim: `ApprovedJoinRef(from_ref, to_ref, column_pairs: tuple[ColumnPair,...], cardinality: str)`, `ColumnPair(from_col, to_col)`, `CatalogObjectRef(catalog_source, object_kind, schema, table, column=None)`. Join value `{from_ref: asdict, to_ref: asdict, column_pairs: [{from_col,to_col}], cardinality}`.
 - Reviewer evidence channel: `write_evidence(...)` (`overlay/evidence.py:75`) with `metric_values` carrying the candidate breakdown, `producer=EvidenceProducer.STRUCTURAL_CONNECTOR`, `strength=AssertionStrength.PROPOSED`; pass the returned `evidence_ref` into the `propose_fact` `args`.
@@ -70,7 +73,7 @@ Unchanged from v1 except: `PassCConfig.weights` **drops** `namespace_ambiguous`/
 
 **Files:** Create `.../passc/identifiers.py`; Test `test_identifiers.py`.
 
-**Interfaces:** `ColMeta(object_ref, table, column, data_type, term_name, term_type, concept, synonyms, bian_leaf, fibo_leaf, entity_tag, data_domain, is_grain)`; `is_join_key_eligible(col, cfg=DEFAULT_CONFIG) -> bool`; `normalized_identifier_concept(col) -> str | None` (**folds synonyms**).
+**Interfaces:** `ColMeta(object_ref, table, column, data_type, term_name, term_type, concept, synonyms, bian_leaf, fibo_leaf, table_entity, column_entity, data_domain, is_grain)` — **`entity_tag` is split**: `table_entity` (the table's primary business entity) vs `column_entity` (this column's identifier namespace, e.g. a `customer_id` column in a `transaction` table has `table_entity="transaction"`, `column_entity="customer"`). `is_join_key_eligible(col, cfg=DEFAULT_CONFIG) -> bool`; `normalized_identifier_concept(col) -> str | None` (**folds synonyms**).
 
 - [ ] **Step 1: Failing test**
 ```python
@@ -104,16 +107,26 @@ def test_concept_normalization_folds_synonyms():
 
 **Files:** Create `.../passc/namespace.py`; Test `test_namespace.py`.
 
-- [ ] **Step 1: Failing test** — same entity_tag → COMPATIBLE; different entity_tag → INCOMPATIBLE; **same concept + synonyms → COMPATIBLE**; **same concept ALONE (no synonyms/related_terms) → POSSIBLE**; mixed BIAN leaf → AMBIGUOUS; same BIAN leaf only → AMBIGUOUS.
-- [ ] **Step 3: Implement** — entity-tag branch first (COMPATIBLE if equal / INCOMPATIBLE if differ); then `same_concept` via `normalized_identifier_concept`; **reinforcement is an INDEPENDENT corroborator** — `synonyms` present on either side, or a gated `related_terms` key-link — **NOT** `term_name`/`column` equality (which are identical whenever concepts match, so they can't distinguish COMPATIBLE from POSSIBLE):
+- [ ] **Step 1: Failing test** — same `column_entity` → COMPATIBLE; **different `column_entity` → INCOMPATIBLE** (different `table_entity` alone does NOT → INCOMPATIBLE); same concept **+ same canonical column name** → COMPATIBLE; same concept **with a DIFFERENT column name and no synonyms** → **POSSIBLE** (reachable); mixed BIAN leaf → AMBIGUOUS; same BIAN leaf only → AMBIGUOUS.
+- [ ] **Step 3: Implement** — key on **`column_entity`**, not `table_entity`:
 ```python
-if same_concept:
-    reasons.append("same_identifier_concept")
-    if a.synonyms or b.synonyms:            # (or a gated related_terms key-link)
-        reasons.append("synonym_corroboration"); return N.COMPATIBLE, tuple(reasons)
-    return N.POSSIBLE, tuple(reasons)
-if mixed:  reasons.append("mixed_bian_leaf"); return N.AMBIGUOUS, tuple(reasons)
-if la and la==lb: reasons.append("same_bian_leaf_only"); return N.AMBIGUOUS, tuple(reasons)
+ea, eb = (a.column_entity or "").lower(), (b.column_entity or "").lower()
+if ea and eb:
+    return (N.COMPATIBLE, ("same_column_entity",)) if ea == eb else (N.INCOMPATIBLE, ("different_column_entity",))
+ca, cb = normalized_identifier_concept(a), normalized_identifier_concept(b)
+if ca and cb and ca == cb:
+    reasons = ["same_identifier_concept"]
+    # COMPATIBLE = same concept + a corroborator (same canonical column name, synonyms, or a gated
+    # related_terms key-link). Namespace safety for a wrong same-name/same-concept pair is the
+    # DUAL-HUMAN confirm gate, not this classifier — COMPATIBLE only makes it PROPOSABLE.
+    same_name = _canon(a.column) == _canon(b.column)
+    if same_name or a.synonyms or b.synonyms:
+        reasons.append("same_column_name" if same_name else "synonym_corroboration")
+        return N.COMPATIBLE, tuple(reasons)
+    return N.POSSIBLE, tuple(reasons)     # same concept, different name, no synonyms → reachable POSSIBLE
+la, lb = (a.bian_leaf or "").lower(), (b.bian_leaf or "").lower()
+if la and la == lb:
+    return N.AMBIGUOUS, ("mixed_bian_leaf",) if la in cfg.mixed_bian_leaves else ("same_bian_leaf_only",)
 return N.AMBIGUOUS, ("generic_reference_without_context",)
 ```
 - [ ] Fail→pass→commit.
@@ -133,9 +146,9 @@ return N.AMBIGUOUS, ("generic_reference_without_context",)
 
 **Files:** Add `score(...)` to `.../passc/candidates.py`; Test `test_score.py`.
 
-- [ ] `score(pair, *, source_snapshot_id, cfg=DEFAULT_CONFIG) -> JoinCandidateEvidenceV1` — weighted signals → score; **bucket rules (in order):** (1) if `namespace == POSSIBLE` **and** no `related_terms_key_link` signal fired → cap at `weak`; (2) **if `cardinality_status == MANY_TO_MANY_RISK` or `proposed_cardinality is None` → force `weak`** (regardless of score) and put both grains in `missing_requirements`; (3) else `strong` if `≥80`, `weak` if `≥50`, `suppressed` if `<50`. Drop the vacuous `same_entity_tag` cap-exception (a same-entity pair is COMPATIBLE, never POSSIBLE).
-- [ ] **Direction/cardinality:** right grain only → `from=a→to=b`, `N:1`, `INFERRED_FROM_CONFIRMED_GRAIN`; left grain only → `from=b→to=a`, `N:1`; both grain → `1:1`, `AMBIGUOUS_BOTH_GRAINS`; neither → `proposed_cardinality=None`, `MANY_TO_MANY_RISK` (→ forced weak by rule 2).
-- [ ] Tests: same-concept+synonyms → `strong`, COMPATIBLE; same-concept-only → capped `weak`, POSSIBLE; **neither-grain high-score → `weak` + both grains in `missing_requirements`** (never strong, never None cardinality proposed); right-grain → `N:1` `from=a`; every result has a non-empty `explanation`. Fail→pass→commit.
+- [ ] `score(pair, *, source_snapshot_id, cfg=DEFAULT_CONFIG) -> JoinCandidateEvidenceV1` — weighted signals → score; **bucket rules (in order):** (1) **only a `cardinality_status == INFERRED_FROM_CONFIRMED_GRAIN` candidate is strong-eligible** — every other status (`AMBIGUOUS_BOTH_GRAINS`, `MANY_TO_MANY_RISK`) is **forced to `weak`** (a proposable join needs an inferable `N:1`; two unique columns are not necessarily 1:1, and neither-grain is many-to-many risk) with both grains in `missing_requirements`; (2) a `POSSIBLE` namespace caps at `weak` unless a `related_terms_key_link` fired; (3) else `strong` if `≥80`, `weak` if `≥50`, `suppressed` if `<50`.
+- [ ] **Direction/cardinality:** right grain only → `from=a→to=b`, `N:1`, `INFERRED_FROM_CONFIRMED_GRAIN`; left grain only → `from=b→to=a`, `N:1`; both grain → `1:1`, `AMBIGUOUS_BOTH_GRAINS` (→ forced weak); neither → `proposed_cardinality=None`, `MANY_TO_MANY_RISK` (→ forced weak).
+- [ ] Tests: same-concept+same-name+one-side-grain → `strong`, COMPATIBLE; same-concept-only (diff name) → capped `weak`, POSSIBLE; **both-grain → `weak`** (1:1 not auto-proposed); **neither-grain high-score → `weak` + both grains in `missing_requirements`**; right-grain → `N:1` `from=a`; every result has a non-empty `explanation`. Fail→pass→commit.
 
 ---
 
@@ -143,12 +156,34 @@ return N.AMBIGUOUS, ("generic_reference_without_context",)
 
 **Why first-DB-task:** Task 6 is the first task that touches the DB, so it authors the shared `passc` conftest that Tasks 7-11 consume.
 
-**Files:** Create `tests/featuregen/overlay/upload/passc/conftest.py`, `.../passc/lifecycle.py`; Test `test_lifecycle.py`.
+**Files:** Create `db/migrations/0988_pass_c_candidate_evidence.sql`, `tests/featuregen/overlay/upload/passc/conftest.py`, `.../passc/lifecycle.py`; Test `test_lifecycle.py`.
+
+- [ ] **Migration 0988 — the Pass-C candidate ledger** (durable home for reviewer evidence + weak persistence + re-ingest dedup):
+```sql
+CREATE TABLE IF NOT EXISTS pass_c_candidate_evidence (
+    catalog_source        text NOT NULL,
+    candidate_id          text NOT NULL,
+    candidate_fingerprint text NOT NULL,
+    from_ref              text NOT NULL,      -- unordered column-ref pair (store sorted)
+    to_ref                text NOT NULL,
+    fact_key              text,               -- set once proposed
+    proposed_event_id     text,
+    bucket                text NOT NULL,      -- strong | weak
+    namespace_compatibility text NOT NULL,
+    lifecycle             text NOT NULL,      -- proposed | weak | superseded | rejected
+    evidence_json         jsonb NOT NULL,     -- asdict(JoinCandidateEvidenceV1)
+    source_snapshot_id    text NOT NULL,
+    config_version        text NOT NULL,
+    candidate_algorithm_version text NOT NULL,
+    updated_at            timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (catalog_source, from_ref, to_ref)   -- one row per unordered column pair
+);
+```
 
 - [ ] **Step 0: Author `passc/conftest.py`** — `passc_conn(db)` (`ensure_upload_catalog_adapter()` + yield `db`); `service_actor` = reuse `_ENRICH_ACTOR`; **`human_admin_1` and `human_admin_2`** = two DISTINCT `mint_test_identity(subject=…, role_claims=("platform-admin",))`; `_propose_join(conn, ref, evidence, *, actor=service_actor)`; **`_confirm_join(conn, ref, *, admin1, admin2)`** — reads the two open governance-queue gate tasks for the join, `admin1` confirms one side (→ `PARTIALLY_CONFIRMED`, re-read state), `admin2` (distinct) confirms the other (→ `VERIFIED`), then `run_projection(conn, OverlayProjection())`; `_reject_join(conn, ref, *, admin)` (only valid pre-VERIFIED); a `_expire_join(conn, ref)` helper driving `fire_due_overlay_expiries` for the VERIFIED-demotion path.
   > **Implementer note (verify):** confirm the two-task/side model — `authority.task_assignees` opens two side-labelled platform-admin tasks; each confirm targets `args['target_event_id'] = _cas_target(state)` at that moment; re-read `fold_overlay_state` between the two confirms. Confirm `mint_test_identity` path (`tests/featuregen/_helpers.py`).
-- [ ] **Step 1: Failing test** — absent → PROPOSE; a DRAFT same-fingerprint → SKIP_ACTIVE; a VERIFIED → SKIP_ACTIVE; an ACTIVE fact for the SAME UNORDERED PAIR with a DIFFERENT `fact_key` (different direction/cardinality) → **CONFLICT**.
-- [ ] **Step 3: Implement `lifecycle.py`** — `candidate_fingerprint(evidence)`; `build_join_ref(evidence, source) -> ApprovedJoinRef`; `Action ∈ {PROPOSE, SKIP_ACTIVE, CONFLICT, REPROPOSE}`; `decide_action(conn, ref, evidence)` adjudicates against **ALL `approved_join` facts touching the unordered table pair `{from_table, to_table}`** (enumerate via the source's `approved_join` gate tasks / overlay read-model), not a single `fact_key`: a same-`fact_key` active fact → SKIP_ACTIVE; a different-`fact_key` ACTIVE fact for the pair → CONFLICT; a terminal `REJECTED`/`STALE`/`REVERIFY` same key with a materially-changed bucket/namespace → REPROPOSE; none → PROPOSE. **Do not reference an `"EXPIRED"` folded status** (it folds to `REVERIFY`).
+- [ ] **Step 1: Failing test** — absent → PROPOSE; a DRAFT same-fingerprint → SKIP_ACTIVE; a VERIFIED → SKIP_ACTIVE; an ACTIVE fact for the SAME UNORDERED **COLUMN** PAIR with a DIFFERENT `fact_key` (different direction/cardinality) → **CONFLICT**; a fact for a DIFFERENT column pair between the *same tables* → NOT a conflict (legitimate second join) → PROPOSE.
+- [ ] **Step 3: Implement `lifecycle.py`** — `candidate_fingerprint(evidence)`; `build_join_ref(evidence, source) -> ApprovedJoinRef`; `Action ∈ {PROPOSE, SKIP_ACTIVE, CONFLICT, REPROPOSE}`; `decide_action(conn, ref, evidence)` adjudicates against the `pass_c_candidate_evidence` ledger + `approved_join` facts for the **unordered COLUMN-ref pair** `{from_col_ref, to_col_ref}` (NOT the table pair — two joins on different columns between the same tables are legitimate): a same-`fact_key` active fact → SKIP_ACTIVE; a DIFFERENT-`fact_key` ACTIVE fact for the **same column pair** (different direction/cardinality) → CONFLICT; a terminal `REJECTED`/`STALE`/`REVERIFY` same key whose prior ledger `bucket`/`namespace_compatibility` materially changed → REPROPOSE; none → PROPOSE. Read the prior `bucket`/`namespace`/`fingerprint` from the ledger (Task 10 writes it). **Do not reference an `"EXPIRED"` folded status** (folds to `REVERIFY`).
 - [ ] Fail→pass→commit.
 
 ---
@@ -171,9 +206,9 @@ return N.AMBIGUOUS, ("generic_reference_without_context",)
 - [ ] **Migration 0987:** `ALTER TABLE graph_edge ADD COLUMN IF NOT EXISTS approved_join_fact_key text; … approved_join_event_id text; … approved_join_status text; … authority_updated_at timestamptz;`
 - [ ] **Governed edge filter** (spec §14, flag-off-safe): in `find_join_path` (`join_path.py:53`), `entity.py:224`, `feature_assist.py:~612`, add `AND (e.approved_join_fact_key IS NULL OR e.approved_join_status='VERIFIED')` — a flag-off declared edge (NULL link) still traverses byte-for-byte; a governed edge traverses only when VERIFIED.
 - [ ] **`project_confirmed_joins(conn, *, source, pairs, now=None)`** — DECLARED-SPARE, orientation/scope-safe, idempotent:
-  - Enumerate `pairs` **from the source's `approved_join` gate tasks / facts** (never from raw `graph_edge` rows).
-  - For each pair, render endpoints in **public** graph scope: `from_ref/to_ref = f"public.{table}.{column}"` (match `graph_node.object_ref`, NOT the `src::public.…` evidence form).
-  - `resolve_fact` (VERIFIED-only, `now=now`). **VERIFIED** → **DELETE any `joins` edge for the unordered pair in either orientation**, then INSERT exactly one operational edge in the confirmed direction with `cardinality`, `approved_join_fact_key`, `approved_join_event_id=.provenance['confirmed_event_id']`, `approved_join_status='VERIFIED'`, `authority_updated_at=now`. **Non-VERIFIED** → set `authority='display_only'` + clear fact links for **both** orientations, but **ONLY for edges whose `approved_join_fact_key IS NOT NULL`** (never demote a file-declared edge).
+  - Enumerate `pairs` **from the source's `approved_join` gate tasks / facts** (never from raw `graph_edge` rows). Each pair is a **column-ref pair**.
+  - Render endpoints in **public** graph scope: `from_ref/to_ref = f"public.{table}.{column}"` (match `graph_node.object_ref`, NOT the `src::public.…` evidence form). Edges are **column-keyed**, so different columns between the same tables are distinct edges — only this specific column pair is touched.
+  - `resolve_fact` (VERIFIED-only, `now=now`). **VERIFIED** → **DELETE any `joins` edge for THIS unordered COLUMN pair in either orientation** (both `(fromref,toref)` and `(toref,fromref)`), then INSERT exactly one operational edge in the confirmed direction with `cardinality`, `approved_join_fact_key`, `approved_join_event_id=.provenance['confirmed_event_id']`, `approved_join_status='VERIFIED'`, `authority_updated_at=now`. **Non-VERIFIED** → set `authority='display_only'` + clear fact links for **both** orientations of this column pair, but **ONLY for edges whose `approved_join_fact_key IS NOT NULL`** (never demote a file-declared edge, and never touch a different column pair's edge).
 - [ ] **Async demotion hook:** when an `approved_join` leaves VERIFIED — in `reject_fact` (pre-VERIFIED reject is a no-op on an operational edge; but a REVERIFY/STALE via) and in `fire_due_overlay_expiries`/`_apply_expiry` — `UPDATE graph_edge SET authority='display_only', approved_join_status=<new>, authority_updated_at=now WHERE approved_join_fact_key=<key>`. This closes the ingest-latency window (a rejected/expired join stops traversing immediately, not at next upload).
 - [ ] **Tests:** VERIFIED join → operational edge (public-scope, single row, fact links) → `find_join_path` traverses; a **confirmed direction that reverses the declared display edge** → exactly ONE operational row, no stale duplicate; a **flag-off declared operational edge (fact_key NULL) is NEVER demoted** by the projector; a fact taken to STALE via `fire_due_overlay_expiries` → the async hook demotes → `find_join_path` no longer traverses (no re-ingest).
 - [ ] Fail→pass→commit.
@@ -184,7 +219,8 @@ return N.AMBIGUOUS, ("generic_reference_without_context",)
 
 **Files:** Modify `overlay/upload/readiness.py`; Test `test_readiness_relationships.py`.
 
-- [ ] Add a **distinct** per-table relationships dimension — its own status enum `RelationshipStatus ∈ {no_candidates, candidate_proposed, weak_candidates_only, confirmed, conflicting}` on a new `RelationshipReadiness` view (do NOT overload the 4-value `ReadinessRequirement.status` Literal). Derivation: fold the table's `approved_join` facts (VERIFIED→`confirmed`; DRAFT/PARTIALLY→`candidate_proposed`; a pair CONFLICT→`conflicting`) **and recompute weak candidates on read** (`block_candidates`→`score` over the table's `ColMeta`; any weak, non-proposed pair → `weak_candidates_only` when there are no stronger). Pass C is pure/deterministic, so recomputation is stable — no store needed. State the scorer + `ColMeta`-assembly dependency.
+- [ ] Add a **distinct** per-table relationships dimension — its own status enum `RelationshipStatus ∈ {no_candidates, candidate_proposed, weak_candidates_only, confirmed, conflicting}` on a new `RelationshipReadiness` view (do NOT overload the 4-value `ReadinessRequirement.status` Literal). Derivation: fold the table's `approved_join` facts (VERIFIED→`confirmed`; DRAFT/PARTIALLY→`candidate_proposed`; a same-column-pair CONFLICT→`conflicting`) + **read the `pass_c_candidate_evidence` ledger** for weak rows touching the table (`weak_candidates_only` when a table has weak but no proposed/confirmed). Weak candidates persist in the ledger (Task 10 writes them), so readiness reads, not recomputes.
+- [ ] **AMBIGUOUS diagnostic policy:** `same_bian_leaf_only` and `mixed_bian_leaf` → persisted as **weak** ledger rows (surfaced as `weak_candidates_only`, so a reviewer sees "possible but unconfirmed"); `generic_reference_without_context` → **suppressed** (telemetry counter only, not persisted — too noisy).
 - [ ] Tests: proposed → `candidate_proposed`; two admins confirm → `confirmed`; only weak → `weak_candidates_only`; none → `no_candidates`. Fail→pass→commit.
 
 ---
@@ -195,7 +231,7 @@ return N.AMBIGUOUS, ("generic_reference_without_context",)
 
 - [ ] `pass_c_enabled()` → `os.environ.get("OVERLAY_PASS_C","0")=="1"`.
 - [ ] **Governed mode (pin it, don't leave soft):** in `graph.py`, make the governed predicate also fire under Pass C by reading the env directly (avoid an import cycle — `graph.py` must NOT import `pass_c_enabled`): `def governed_joins_enabled(): return os.environ.get("OVERLAY_GOVERNED_JOINS")=="1" or os.environ.get("OVERLAY_PASS_C")=="1"`. This is read inside `build_graph` (before the seam), so under `OVERLAY_PASS_C` declared `joins_to` edges are written `display_only`. Widen the `_propose_governed_joins` gate at `ingest.py:~616` to `if governed_joins_enabled() or pass_c_enabled():` so declared joins are ROUTED to `approved_join` proposals (not stranded display-only).
-- [ ] **Pass C block** (behind `pass_c_enabled()`), in **its own `with conn.transaction(): … except Exception: counters+logger`** (NOT the bare-except of `_propose_governed_joins`): assemble `ColMeta` for the upload's columns from `graph_node` + Phase-1/2 evidence (concept/entity/bian/is_grain); `block_candidates`→`score`; **strong+grain → `propose_join_candidates`** (weak/None-cardinality are diagnostics, recomputed by Task 9, not proposed here). Proposer = `_ENRICH_ACTOR`. Mint `mint_id("psc")` for the evidence snapshot.
+- [ ] **Pass C block** (behind `pass_c_enabled()`), in **its own `with conn.transaction(): … except Exception: counters+logger`** (NOT the bare-except of `_propose_governed_joins`): assemble `ColMeta` for the upload's columns from `graph_node` + Phase-1/2 evidence (concept/`table_entity`/`column_entity`/bian/is_grain); `block_candidates`→`score`; **clear-then-write this cycle's candidates to `pass_c_candidate_evidence`** (strong rows with `bucket='strong'`, weak rows with `bucket='weak'`; `generic_reference` suppressed → counter only, not written); then **strong candidates → `propose_join_candidates`** (which stamps `fact_key`/`proposed_event_id` back onto the ledger row). Proposer = `_ENRICH_ACTOR`. Mint `mint_id("psc")` for the snapshot.
 - [ ] **End-of-ingest projector** (declared-spare, so unconditional is safe): inside a `with conn.transaction(): … except`, gated on `projection_lag(conn,"overlay")==0` (mirror Phase 2), call `project_confirmed_joins(conn, source=catalog_source, pairs=<from approved_join facts/tasks>)`. Because the projector only touches fact-linked edges, a flag-off pure-declared catalog is a no-op → byte-for-byte.
 - [ ] Tests: `OVERLAY_PASS_C` unset → ingest byte-for-byte (spy: no candidates, no facts, no edge changes); set → a declared `joins_to` becomes `display_only` **and** routed to an `approved_join` proposal, `find_join_path` returns None pre-confirm; a concept-shared pair → strong candidate proposed. Fail→pass→commit.
 
@@ -209,6 +245,8 @@ return N.AMBIGUOUS, ("generic_reference_without_context",)
   1. strong candidate proposed (`approved_join` `DRAFT`); `find_join_path(txn, customer)` → **None** (fail-closed);
   2. **`_confirm_join(admin1, admin2)`** (two distinct platform-admins) → `PARTIALLY_CONFIRMED` → `VERIFIED`; `project_confirmed_joins` → `find_join_path` **traverses**; relationships readiness = `confirmed`;
   3. **demote via the PRODUCTION path** — `_expire_join` (drive `fire_due_overlay_expiries`) → the async hook demotes the edge → `find_join_path` → None (no re-ingest). Separately, a pre-VERIFIED `_reject_join(admin1)` on a fresh candidate → never operationalized.
+  4. **MANDATORY governed-bypass test:** shared `column_entity` tags exist between two tables but NO `VERIFIED approved_join`, `OVERLAY_PASS_C=1` → the feature planner **cannot** traverse (`find_join_path` AND `cross_join_via_entity`/`find_cross_catalog_path` return no path). This is the second-most-important safety test after "proposed-not-traversable."
+- [ ] **Acceptance criteria (all must pass):** (1) same concept + same column name + one-side grain → proposed; (2) `FORACID ↔ CIF_ID` under the mixed "Customer and Counterparty Identification" leaf → no proposal (INCOMPATIBLE via different `column_entity`, or AMBIGUOUS); (3) missing/both-grain → diagnostic only, no proposal; (4) proposed → not traversable; (5) two-admin VERIFIED → traversable; (6) reject/expire/stale → demoted; (7) entity-bridge bypass disabled in governed mode; (8) re-ingest duplicate → no duplicate proposal (ledger dedup); (9) `get_task_proposal` surfaces score/signals/namespace/grain-status/explanation.
 - [ ] Run `tests/featuregen/overlay/upload/ -q` + `tests/featuregen/overlay/ -q` — all green; flag-off byte-for-byte holds.
 - [ ] Commit.
 

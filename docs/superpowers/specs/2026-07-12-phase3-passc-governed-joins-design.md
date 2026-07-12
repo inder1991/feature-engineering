@@ -131,7 +131,9 @@ class NamespaceCompatibility(StrEnum):
     INCOMPATIBLE = "incompatible"  # different confirmed entities, or an LLM-challenger namespace-mismatch flag
 ```
 
-Deterministic derivation (from the CSV alone): **COMPATIBLE** = same confirmed entity tag, or same normalized identifier concept with a corroborating signal (name/synonym/related_terms). **POSSIBLE** = same specific identifier concept but nothing corroborating. **AMBIGUOUS** = same *coarse BIAN leaf only* / a leaf flagged "mixed" (e.g. customer+counterparty) / a generic `reference_id` with no distinguishing concept. **INCOMPATIBLE** = different confirmed entities, or (3B) a challenger mismatch flag.
+**Entity is column-level, not table-level.** An id column carries a `column_entity` (its identifier namespace) distinct from its table's `table_entity` — `transactions.customer_id → customer.customer_id` has *different table entities* (transaction vs customer) but the *same `column_entity`* (customer). Namespace compatibility keys on **`column_entity`**; a different `table_entity` alone is **not** incompatible.
+
+Deterministic derivation (from the CSV alone): **COMPATIBLE** = same `column_entity`, OR same normalized identifier concept **+ a corroborator (same canonical column name, synonyms, or a gated `related_terms` key-link)** — safe because a COMPATIBLE candidate is only ever *proposed*; the **dual-human confirm gate is the namespace safety net** for a wrong same-name/same-concept pair. **POSSIBLE** = same identifier concept with a *different* column name and no corroborator (reachable). **AMBIGUOUS** = same coarse BIAN leaf only / a "mixed" leaf (customer+counterparty) / a generic `reference_id` with no distinguishing concept. **INCOMPATIBLE** = different `column_entity`, or (3B) a challenger mismatch flag.
 
 Gate/bucket interaction: gate admits `COMPATIBLE|POSSIBLE`; `COMPATIBLE` is strong-eligible; `POSSIBLE` caps at weak unless reinforced; `AMBIGUOUS` → reviewer-only/suppress (−40); `INCOMPATIBLE` → suppress (−50).
 
@@ -164,7 +166,7 @@ class CardinalityInferenceStatus(StrEnum):
 | no | no | many-to-many risk / bridge needed | `MANY_TO_MANY_RISK` (confidence lowered, gap surfaced) |
 | unknown | known | lower confidence | `MISSING_GRAIN` on the unknown side |
 
-A **missing grain is visible** in the worklist and recorded as a **separate** confirmation (grain via the Phase-2 grain lifecycle; join via the `approved_join` lifecycle). The proposed value always **explains what it assumed**.
+**Only `INFERRED_FROM_CONFIRMED_GRAIN` is proposable.** A join value *requires* a `1:1|1:N|N:1` cardinality, and two unique columns are not necessarily 1:1 business-equivalent (`account.account_id`≠`card.card_id`). So **both-grain (`AMBIGUOUS_BOTH_GRAINS`, would be 1:1) and neither-grain (`MANY_TO_MANY_RISK`) are forced to `weak` — a readiness diagnostic, never an `approved_join` proposal.** Only a one-side-confirmed-grain candidate (an inferable `N:1`) is proposed. A **missing grain is visible** in the worklist and recorded as a **separate** confirmation (grain via the Phase-2 grain lifecycle; join via the `approved_join` lifecycle). The proposed value always **explains what it assumed**.
 
 **Correction path (v1-review Issue 13; corrected in v2 after code review).** For `approved_join`, **the entire value — endpoints, `column_pairs`, AND `cardinality` — participates in the `fact_key`** (`identity.py:71-81`), and the dual-owner confirm path derives the confirmed value from the proposal and ignores an `args['value']` override. So there is **no confirm-time value override** for a join (unlike a Phase-2 grain, whose overridable field is *not* in its key). Any correction — wrong cardinality, direction, or endpoints — is **reject-with-reason → re-propose the corrected candidate** (a new `fact_key`). `_confirm_join`'s cardinality argument is used only to reconstruct the *identical* proposed value for confirmation, never as an edit.
 
@@ -205,7 +207,7 @@ class JoinCandidateEvidenceV1:
     source_snapshot_id: str
 ```
 
-This object is passed to `propose_fact` as the proposal evidence, persisted with the fact, and surfaced through `get_task_proposal`.
+**Durable storage (two homes, by purpose):** (1) every candidate of *every* bucket is written to a durable **`pass_c_candidate_evidence`** ledger (keyed by the unordered column-ref pair) — this is the home for weak-candidate persistence, re-ingest dedup (prior fingerprint/bucket/namespace), and audit. (2) For a *proposed* candidate, the evidence also rides the reuse-verbatim **`evidence_ref`** channel (a pre-minted `write_evidence` row with the breakdown in `metric_values`), so `get_task_proposal` surfaces score / reason codes / explanation to the reviewer with no change to the propose/read spine. The closed `approved_join` value schema (`additionalProperties:false`) means the evidence cannot ride `proposed_value`.
 
 ## 11. Candidate fingerprint, dedupe & re-ingest lifecycle
 
@@ -257,11 +259,11 @@ A `VERIFIED approved_join` projects to an `authority='operational'` `joins` edge
 **Promotion:** on `VERIFIED`, set the pair's `joins` edge to `operational` with links back to the fact.
 **Demotion triggers (all):** `approved_join` `REJECTED` / `EXPIRED` / `STALE` (referent drift) / superseded by a different join / an endpoint column removed / an endpoint identity AMBIGUOUS. Any of these → the edge reverts to `display_only`.
 
-**Edge fields (new — mirror migration 0984's node decision-links):** `authority`, `approved_join_fact_key`, `approved_join_event_id`, `approved_join_status`, `authority_updated_at`. Operational traversal filters:
+**Edge fields (new — mirror migration 0984's node decision-links):** `authority`, `approved_join_fact_key`, `approved_join_event_id`, `approved_join_status`, `authority_updated_at`. Operational traversal filters, flag-off-safe (a declared edge has a NULL link and still traverses):
 ```
-kind='joins' AND authority='operational' AND approved_join_status='VERIFIED'
+kind='joins' AND (approved_join_fact_key IS NULL OR approved_join_status='VERIFIED')
 ```
-**Wrinkle:** the `graph_edge` PK `(catalog_source, kind, from_ref, to_ref)` (0945) forbids a display+operational row for one pair — the projector **upgrades authority in place** (single row), never inserts a second. Idempotent: clear/normalize the pair's authority, then apply the current fact state.
+**Edges are COLUMN-keyed** (`from_ref`/`to_ref` = `public.table.column`), so multiple joins between one table pair (on different columns) coexist; the projector and conflict logic operate on the **unordered COLUMN-ref pair**, not the table pair. **Orientation-safe:** the confirmed (grain-derived) direction may differ from a declared display edge — the projector **deletes any edge for that column pair in either orientation and writes exactly one operational row** in the confirmed direction (never a duplicate); demotion clears **both** orientations. **Scope-safe:** endpoints render in the **public** graph scope (`public.t.c`), matching `graph_node.object_ref`, not the `src::public.…` evidence form. **Declared-spare:** the projector only ever demotes edges whose `approved_join_fact_key IS NOT NULL`, so a file-declared edge is byte-for-byte untouched (the flag-off guarantee). **Async demotion:** a reject/expiry taking a join out of VERIFIED demotes its linked edge immediately (not only at next ingest).
 
 ## 15. Weak / suppressed candidate behaviour (v1-review Issue 12)
 
