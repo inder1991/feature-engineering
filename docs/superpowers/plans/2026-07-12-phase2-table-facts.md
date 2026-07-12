@@ -8,9 +8,11 @@
 
 **Tech Stack:** Python 3.12, `uv`, psycopg 3, PostgreSQL (ephemeral PG auto-provisioned by `postgresql_proc` in tests), pytest. Event-sourced overlay fact substrate; JSON-Schema-validated LLM output via `DocumentSchemaRegistry`.
 
-## Revision log (v2 — architectural review folded in)
+## Revision log (v2 architectural + v3 code-verified review folded in)
 
-v2 revises v1 per a full architectural review. Load-bearing changes an implementer must not miss:
+**v3** adds fixes from a code-verified adversarial review (34 confirmed defects). The load-bearing v3 corrections: `extract`/`ref_aware` threaded through the REAL chain `run_batched → audited_batch_call → validate_batch_results` (v1 missed the `audited_batch_call` intermediary → Pass B would've emitted zero proposals); `Command(...)` built with all 6 fields (not `Command(actor=,args=)`); advisory evidence via `_write_producer_field` (the v1 `record_field_evidence` call omitted two required NOT-NULL args); `UploadContextAdapter.catalog_source` sentinel (else the worker drift poller AttributeErrors every tick); the Task 5 egress leak closed (never egress `r.definition`, only the curated `definition`); Task 11 worklist fixed (`task_id` column, dict-key access, platform-admin reader); `event_time_plus_lag` dropped; fail-soft savepoints around the LLM call + the end-of-ingest projection; four-eyes (propose under `_ENRICH_ACTOR`); the confirm authority is the **platform-admin governance queue** and the `_confirm_grain` helper must **drain the projection** after confirm; **tests live under `tests/featuregen/overlay/upload/`** with a new conftest authoring all fixtures/helpers (Task 7 Step 0); `IngestResult.status == "ingested"`; `compute_readiness(..., scope=...)`.
+
+**v2** revises v1 per a full architectural review. Load-bearing changes an implementer must not miss:
 - **Task 9 projection is now idempotent** — clears every prior `is_grain`/`is_as_of` on the table's columns before re-applying verified facts (v1 only ever set `true`, leaving stale flags after a grain changed/expired/was rejected). **[must-fix #1]**
 - **Task 7 skip logic reads folded fact state, not raw stream existence** — v1's `_fact_stream_absent` skipped *forever* once any stream existed (even `REJECTED`/`EXPIRED`). v2 skips quietly only when `VERIFIED` (respect stronger source/declared evidence) and otherwise lets `propose_fact` adjudicate — it already handles pending-duplicate, sticky-rejected, and re-propose-after-terminal. Denials are logged as conflict diagnostics. **[must-fix #2, #12]**
 - **Task 4/6 structured validation happens *inside* the batch harness** (ref-aware `accept(raw, ref)`), so a grain naming a non-existent column is classified `INVALID` by `validate_batch_results` — not accepted-then-silently-dropped. **[must-fix #3]**
@@ -19,7 +21,7 @@ v2 revises v1 per a full architectural review. Load-bearing changes an implement
 - **`event_or_snapshot` is now projected** as a third advisory field (Task 8), not captured-and-dropped. **[must-fix #8]**
 - **Readiness reflects the full fact lifecycle** (rejected/expired/stale/pending-reverify), mapped onto the 4 status values + distinct causes; only `VERIFIED` reads ready. **[must-fix #7]**
 - Assembler enriched with column identifier/temporal/semantic/entity roles + table-level domain/BIAN/FIBO context (bounded, sample-stripped) for better grain proposals **[should-fix]**; `UploadCatalog` vs `UploadContextAdapter` distinction made explicit + fallback telemetry **[Task 1 clarity]**; single-table `project_table_facts_for_ref` helper for a future confirm hook; ownership-fallback limitation documented.
-- **NOT changed — `availability_time.basis` enum** stays `posted_at|ingested_at|event_time_plus_lag`: this is the *exact* live `FACT_VALUE_SCHEMAS.AVAILABILITY_TIME` enum (facts.py:39-54); a different vocabulary would fail `validate_fact_value`. Expanding it is a separate fact-schema migration, out of Phase 2 scope.
+- **`availability_time.basis`** — the underlying `FACT_VALUE_SCHEMAS.AVAILABILITY_TIME` fact schema is UNCHANGED (`posted_at|ingested_at|event_time_plus_lag`; facts.py:39-54; a different vocabulary would fail `validate_fact_value`). But **Pass B only proposes the two lag-free bases** (`posted_at|ingested_at`): `event_time_plus_lag` requires a `lag_hours` (facts.py:52) that Pass B cannot infer, so offering it would guarantee a `validate_fact_value` denial. It is dropped from the synthesis schema/accept/instruction (v3 review fix). Carrying a lag end-to-end is out of Phase 2 scope.
 
 ## Global Constraints
 
@@ -31,7 +33,7 @@ v2 revises v1 per a full architectural review. Load-bearing changes an implement
 - **Reuse the shared identity helper.** Pass B, `_assert_fact`, and readiness MUST key a table's grain fact via the *same* `table_ref(catalog_source, table)` (`overlay/upload/upload_catalog.py:10`) so `fact_key(...)` is identical across producer, reader, and confirmer. Never hand-build a table `CatalogObjectRef`.
 - **Grain/availability facts prohibit `use_case`** (`validate_fact_value` enforces this). Always pass `use_case=None`.
 - **display ≠ authority.** Advisory Pass B fields (`table_role`, `primary_entity`) use a RECOMMENDATION influence ceiling → structurally impossible to become load-bearing. The load-bearing grain/as-of value comes *exclusively* from the specialized-fact projection (spec §5.3), never from the field resolver.
-- **Tests:** `uv run pytest <path> -q`. New tests live under `tests/overlay/upload/` mirroring the existing layout.
+- **Tests:** `uv run pytest <path> -q`. New tests live under `tests/featuregen/overlay/upload/` mirroring the existing layout.
 
 ---
 
@@ -42,7 +44,7 @@ v2 revises v1 per a full architectural review. Load-bearing changes an implement
 | PROPOSED-only typed fact + human gate task | REUSE | `propose_fact(conn, cmd)` `overlay/proposal_commands.py:34` — appends ONLY `OVERLAY_FACT_PROPOSED`, opens one gate task per authority side |
 | PROPOSED not load-bearing until VERIFIED | REUSE | `resolve_fact(conn, adapter, ref, fact_type, use_case)` `overlay/resolve.py:183` — serves a value only on `VERIFIED` |
 | grain / availability_time value schemas | REUSE | `FACT_VALUE_SCHEMAS` `overlay/facts.py:38` — `GRAIN={columns[],is_unique}`, `AVAILABILITY_TIME={column,basis,lag_hours?}` |
-| Human confirm PROPOSED → VERIFIED (+ arms expiry) | REUSE | `confirm_fact(conn, cmd)` `overlay/confirmation_commands.py:47` — human-only; four-eyes satisfied by a service proposer; single-confirmer `data_owner` path for grain |
+| Human confirm PROPOSED → VERIFIED (+ arms expiry) | REUSE | `confirm_fact(conn, cmd)` `overlay/confirmation_commands.py:47` — human-only; four-eyes satisfied by the service proposer; single-confirmer. **Authority = platform-admin governance queue** (owner_of→None routes there); the confirmer MUST hold `platform-admin` role_claims. Data-owner-subject routing arrives only with a richer adapter (Phase 3/4). |
 | Reject a proposal | REUSE | `reject_fact` `overlay/confirmation_commands.py:184` |
 | Reviewer reads a proposal | REUSE | `get_task_proposal(conn, task_id, actor)` `overlay/task_read.py:17` — adapter-free; free-form `proposed_value` carries the structured candidate |
 | Confirmations expiring/scoped + reverify + renewal | REUSE | `schedule_expiry` / `fire_due_overlay_expiries` / `fire_due_overlay_renewals` / `open_reverify_task` `overlay/expiry.py`, `overlay/reverify_tasks.py` |
@@ -66,7 +68,7 @@ v2 revises v1 per a full architectural review. Load-bearing changes an implement
 - `src/featuregen/overlay/upload/table_synth.py` — Pass B: input assembler, synthesis driver, dict-shaped validator, `_propose_table_facts` emission. One responsibility: derive per-table fact *proposals* from Pass A output.
 - `src/featuregen/overlay/upload/table_fact_projection.py` — the SPECIALIZED_FACT bridge: read VERIFIED grain/availability → land on `graph_node`; the pending-proposal worklist reader.
 - `src/featuregen/db/migrations/0986_graph_node_table_fields.sql` — advisory `table_role`/`primary_entity` columns + their decision-link + grain/as-of provenance link on `graph_node`.
-- Test files mirroring each under `tests/overlay/upload/`.
+- Test files mirroring each under `tests/featuregen/overlay/upload/`.
 
 **Modified files:**
 - `src/featuregen/overlay/upload/enrich_llm.py` — `_SCHEMAS` (add two schemas), `_item_egress_ok` (admit bounded column-descriptor list).
@@ -101,7 +103,7 @@ The per-upload `UploadCatalog` cannot be the registered adapter: confirm/expiry 
 - Create: `src/featuregen/overlay/upload/upload_catalog.py` — add `UploadContextAdapter` + `ensure_upload_catalog_adapter()` (append to the existing file).
 - Modify: `src/featuregen/overlay/upload/ingest.py` — call `ensure_upload_catalog_adapter()` at the top of `ingest_upload` (before any fact write).
 - Modify: `src/featuregen/runtime/worker.py:524` — call it beside `register_overlay(registry)`.
-- Test: `tests/overlay/upload/test_upload_context_adapter.py`
+- Test: `tests/featuregen/overlay/upload/test_upload_context_adapter.py`
 
 **Interfaces:**
 - Consumes: `register_catalog_adapter`, `current_catalog_adapter`, `CatalogAdapter` from `overlay/catalog.py`; `CatalogObjectRef` from `overlay/identity.py`.
@@ -110,7 +112,7 @@ The per-upload `UploadCatalog` cannot be the registered adapter: confirm/expiry 
 - [ ] **Step 1: Write the failing test**
 
 ```python
-# tests/overlay/upload/test_upload_context_adapter.py
+# tests/featuregen/overlay/upload/test_upload_context_adapter.py
 import pytest
 from featuregen.overlay.catalog import (
     current_catalog_adapter, register_catalog_adapter, _clear_catalog_adapter,
@@ -150,7 +152,7 @@ def test_ensure_is_idempotent_and_yields_to_existing():
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `uv run pytest tests/overlay/upload/test_upload_context_adapter.py -q`
+Run: `uv run pytest tests/featuregen/overlay/upload/test_upload_context_adapter.py -q`
 Expected: FAIL — `ImportError: cannot import name 'UploadContextAdapter'`.
 
 - [ ] **Step 3: Implement the adapter + idempotent ensure**
@@ -173,6 +175,13 @@ class UploadContextAdapter(CatalogAdapter):
     ``fingerprint`` are unused on the propose/confirm/expiry path, so they are empty here; the
     per-upload ``UploadCatalog`` still owns drift fingerprinting. Stateless ⇒ safe to register once
     process-wide with no clobber hazard."""
+
+    # REQUIRED protocol member (catalog.py:48). Registering this adapter at worker startup un-skips
+    # the drift poller (_run_drift_scan reads adapter.catalog_source every tick); without this it
+    # would AttributeError each tick. A reserved sentinel source that no real UploadCatalog uses +
+    # an empty fingerprint() means detect_catalog_changes diffs {} against an equally-empty prior
+    # snapshot → zero changes → drift is INERT (no false stales, no per-tick error).
+    catalog_source = "upload:context"
 
     def list_objects(self):
         return []
@@ -209,7 +218,7 @@ def ensure_upload_catalog_adapter() -> None:
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `uv run pytest tests/overlay/upload/test_upload_context_adapter.py -q`
+Run: `uv run pytest tests/featuregen/overlay/upload/test_upload_context_adapter.py -q`
 Expected: PASS (3 passed).
 
 - [ ] **Step 5: Wire it at both process entry points**
@@ -241,13 +250,13 @@ In `src/featuregen/runtime/worker.py`, beside line 524:
 
 - [ ] **Step 6: Run the surrounding suites to confirm no regression**
 
-Run: `uv run pytest tests/overlay/upload/test_ingest.py tests/overlay/upload/test_upload_context_adapter.py -q`
+Run: `uv run pytest tests/featuregen/overlay/upload/test_ingest.py tests/featuregen/overlay/upload/test_upload_context_adapter.py -q`
 Expected: PASS (existing ingest behaviour unchanged; adapter now registered).
 
 - [ ] **Step 7: Commit**
 
 ```bash
-git add src/featuregen/overlay/upload/upload_catalog.py src/featuregen/overlay/upload/ingest.py src/featuregen/runtime/worker.py tests/overlay/upload/test_upload_context_adapter.py
+git add src/featuregen/overlay/upload/upload_catalog.py src/featuregen/overlay/upload/ingest.py src/featuregen/runtime/worker.py tests/featuregen/overlay/upload/test_upload_context_adapter.py
 git commit -m "feat(overlay): register upload-context catalog adapter (un-gates governed fact lifecycle)"
 ```
 
@@ -258,7 +267,7 @@ git commit -m "feat(overlay): register upload-context catalog adapter (un-gates 
 **Files:**
 - Modify: `src/featuregen/overlay/upload/enrich_llm.py:81` — add two `_SCHEMAS` entries.
 - Modify: `src/featuregen/overlay/upload/enrich_config.py:8-9` — add `table_synth` caps.
-- Test: `tests/overlay/upload/test_table_synth_schema.py`
+- Test: `tests/featuregen/overlay/upload/test_table_synth_schema.py`
 
 **Interfaces:**
 - Consumes: `_SCHEMAS`, `register_enrichment_schemas`, `DocumentSchemaRegistry` (`enrich_llm.py`); `_DEFAULT_MAX_ITEMS`, `_DEFAULT_MAX_INPUT_TOKENS`, `mode` (`enrich_config.py`).
@@ -267,7 +276,7 @@ git commit -m "feat(overlay): register upload-context catalog adapter (un-gates 
 - [ ] **Step 1: Write the failing test**
 
 ```python
-# tests/overlay/upload/test_table_synth_schema.py
+# tests/featuregen/overlay/upload/test_table_synth_schema.py
 from featuregen.overlay.upload.enrich_config import max_items, max_input_tokens, mode
 from featuregen.overlay.upload.enrich_llm import _SCHEMAS
 
@@ -300,7 +309,7 @@ def test_two_independent_switches(monkeypatch):
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `uv run pytest tests/overlay/upload/test_table_synth_schema.py -q`
+Run: `uv run pytest tests/featuregen/overlay/upload/test_table_synth_schema.py -q`
 Expected: FAIL — `KeyError: ('overlay_table_synth_batch', 1)`.
 
 - [ ] **Step 3: Add the schemas**
@@ -320,8 +329,7 @@ In `src/featuregen/overlay/upload/enrich_llm.py`, add to `_SCHEMAS` (after the e
                                               "items": {"type": "string", "maxLength": 128}},
                             "as_of_column": {"type": ["string", "null"], "maxLength": 128},
                             "as_of_basis": {"type": ["string", "null"],
-                                            "enum": ["posted_at", "ingested_at",
-                                                     "event_time_plus_lag", None]},
+                                            "enum": ["posted_at", "ingested_at", None]},
                             "primary_entity": {"type": ["string", "null"], "maxLength": 128},
                             "table_role": {"type": ["string", "null"], "maxLength": 64},
                             "event_or_snapshot": {"type": ["string", "null"],
@@ -336,12 +344,17 @@ In `src/featuregen/overlay/upload/enrich_llm.py`, add to `_SCHEMAS` (after the e
                               "items": {"type": "string", "maxLength": 128}},
             "as_of_column": {"type": ["string", "null"], "maxLength": 128},
             "as_of_basis": {"type": ["string", "null"],
-                            "enum": ["posted_at", "ingested_at", "event_time_plus_lag", None]},
+                            "enum": ["posted_at", "ingested_at", None]},
             "primary_entity": {"type": ["string", "null"], "maxLength": 128},
             "table_role": {"type": ["string", "null"], "maxLength": 64},
             "event_or_snapshot": {"type": ["string", "null"],
                                   "enum": ["event", "snapshot", None]},
         }, "required": ["grain_columns"]},
+
+# NOTE: `event_time_plus_lag` is intentionally EXCLUDED from as_of_basis. FACT_VALUE_SCHEMAS mandates
+# a `lag_hours` when basis == event_time_plus_lag (facts.py:52), and Pass B has no way to infer a lag,
+# so such a proposal would always be denied by validate_fact_value. Phase 2 offers only the two
+# lag-free bases; adding event_time_plus_lag would require a lag_hours field end-to-end (out of scope).
 ```
 
 - [ ] **Step 4: Add the config caps**
@@ -372,13 +385,13 @@ Task 7 wires the ingest call behind this helper; Task 2 owns its definition so i
 
 - [ ] **Step 5: Run test to verify it passes**
 
-Run: `uv run pytest tests/overlay/upload/test_table_synth_schema.py -q`
+Run: `uv run pytest tests/featuregen/overlay/upload/test_table_synth_schema.py -q`
 Expected: PASS (2 passed).
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add src/featuregen/overlay/upload/enrich_llm.py src/featuregen/overlay/upload/enrich_config.py tests/overlay/upload/test_table_synth_schema.py
+git add src/featuregen/overlay/upload/enrich_llm.py src/featuregen/overlay/upload/enrich_config.py tests/featuregen/overlay/upload/test_table_synth_schema.py
 git commit -m "feat(overlay): table_synth output schemas + rollout config (default off)"
 ```
 
@@ -390,7 +403,7 @@ git commit -m "feat(overlay): table_synth output schemas + rollout config (defau
 
 **Files:**
 - Modify: `src/featuregen/overlay/upload/enrich_llm.py:247-262` — `_ITEM_META_ALLOWED` + `_item_egress_ok`.
-- Test: `tests/overlay/upload/test_item_egress_table.py`
+- Test: `tests/featuregen/overlay/upload/test_item_egress_table.py`
 
 **Interfaces:**
 - Consumes: nothing new.
@@ -399,7 +412,7 @@ git commit -m "feat(overlay): table_synth output schemas + rollout config (defau
 - [ ] **Step 1: Write the failing test**
 
 ```python
-# tests/overlay/upload/test_item_egress_table.py
+# tests/featuregen/overlay/upload/test_item_egress_table.py
 from featuregen.overlay.upload.enrich_llm import _item_egress_ok
 
 
@@ -438,7 +451,7 @@ def test_existing_scalar_and_list_of_str_still_pass():
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `uv run pytest tests/overlay/upload/test_item_egress_table.py -q`
+Run: `uv run pytest tests/featuregen/overlay/upload/test_item_egress_table.py -q`
 Expected: FAIL — `test_table_item_with_column_profiles_passes` returns `False` (list-of-dict rejected).
 
 - [ ] **Step 3: Implement the extension**
@@ -491,18 +504,18 @@ def _item_egress_ok(metadata: dict) -> bool:
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `uv run pytest tests/overlay/upload/test_item_egress_table.py -q`
+Run: `uv run pytest tests/featuregen/overlay/upload/test_item_egress_table.py -q`
 Expected: PASS (6 passed).
 
 - [ ] **Step 5: Run the enrich egress regression suite**
 
-Run: `uv run pytest tests/overlay/upload/ -q -k "egress or enrich_llm"`
+Run: `uv run pytest tests/featuregen/overlay/upload/ -q -k "egress or enrich_llm"`
 Expected: PASS (existing per-item egress behaviour preserved).
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add src/featuregen/overlay/upload/enrich_llm.py tests/overlay/upload/test_item_egress_table.py
+git add src/featuregen/overlay/upload/enrich_llm.py tests/featuregen/overlay/upload/test_item_egress_table.py
 git commit -m "feat(overlay): admit bounded column-descriptor list in per-item egress filter"
 ```
 
@@ -510,11 +523,14 @@ git commit -m "feat(overlay): admit bounded column-descriptor list in per-item e
 
 ## Task 4: Structured (serialize-through) batch accept
 
-**Why:** The batch harness is string-typed (`validate_batch_results` extracts one scalar `str(entry.get(out_key,""))`). A table synthesis result is a structured object. Keep the harness string-typed (smallest change): add an optional `extract(entry) -> str` hook so Pass B can serialize the whole per-item `synthesis` object to canonical JSON, which its dict-shaped `accept` then validates and returns as a canonical JSON string. `run_batched`/`BatchItemOutcome`/`BatchCallResult` stay pure reuse.
+**Why:** The batch harness is string-typed (`validate_batch_results` extracts one scalar `str(entry.get(out_key,""))`). A table synthesis result is a structured object. Keep the harness string-typed at the OUTCOME level (`BatchItemOutcome`/`BatchCallResult` unchanged), but add an `extract(entry) -> str` hook (serialize the per-item `synthesis` object to canonical JSON) and a `ref_aware` flag (call `accept(raw, ref)` so per-table column validation runs in the harness). Both `validate_batch_results` **and** its two callers in the chain — `audited_batch_call` (enrich_llm.py) and `run_batched` (enrich_batch.py) — gain and forward these two kwargs; defaults keep Pass A byte-for-byte. `run_batched` is therefore NOT pure reuse (its signature grows two defaulted kwargs) — see the call graph in Files.
 
 **Files:**
-- Modify: `src/featuregen/overlay/upload/enrich_batch.py:54` — `validate_batch_results` gains an optional keyword `extract`.
-- Test: `tests/overlay/upload/test_validate_batch_structured.py`
+- Modify: `src/featuregen/overlay/upload/enrich_batch.py` — `validate_batch_results` gains `extract`/`ref_aware`; `run_batched` (`:123`) forwards them; `_single_fallback` (`:108`) skips ref_aware tasks.
+- Modify: `src/featuregen/overlay/upload/enrich_llm.py:265` — `audited_batch_call` (the REAL intermediary; `run_batched` calls it, not `validate_batch_results` directly) gains + forwards `extract`/`ref_aware`.
+- Test: `tests/featuregen/overlay/upload/test_validate_batch_structured.py`
+
+**Call graph (verify before editing):** `run_batched` (enrich_batch.py:123) → `audited_batch_call` (enrich_llm.py:265) → `validate_batch_results` (called at enrich_llm.py:302 and :313). `run_batched` does NOT call `validate_batch_results` directly. So the kwargs must be threaded through `audited_batch_call` — this is the load-bearing wiring the v1 plan missed. All three signature changes default to `extract=None, ref_aware=False`, keeping Pass A byte-for-byte.
 
 **Interfaces:**
 - Consumes: `Accept`, `BatchItemOutcome`, the `EXTRA/DUPLICATE/BLANK/MISSING/VALID/INVALID` markers.
@@ -523,7 +539,7 @@ git commit -m "feat(overlay): admit bounded column-descriptor list in per-item e
 - [ ] **Step 1: Write the failing test**
 
 ```python
-# tests/overlay/upload/test_validate_batch_structured.py
+# tests/featuregen/overlay/upload/test_validate_batch_structured.py
 import json
 from featuregen.overlay.upload.enrich_batch import BatchItem, validate_batch_results
 
@@ -565,7 +581,7 @@ def test_default_scalar_path_unchanged():
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `uv run pytest tests/overlay/upload/test_validate_batch_structured.py -q`
+Run: `uv run pytest tests/featuregen/overlay/upload/test_validate_batch_structured.py -q`
 Expected: FAIL — `TypeError: validate_batch_results() got an unexpected keyword argument 'extract'`.
 
 - [ ] **Step 3: Implement the `extract` hook**
@@ -612,22 +628,48 @@ def validate_batch_results(items: list[BatchItem], results: list[dict], out_key:
     return outcomes
 ```
 
-> **`run_batched` must forward `extract`/`ref_aware`.** Read `run_batched` (`enrich_batch.py:123`) and `_single_fallback` (`:108`): both call `validate_batch_results`/`accept`. Thread the two new keywords through `run_batched`'s signature (default `extract=None, ref_aware=False` → Pass A unchanged) down to `validate_batch_results`, and in `_single_fallback` call `accept(raw, ref)` when `ref_aware`. This is what lets Pass B's column-validation run inside the harness with no post-filter.
+- [ ] **Step 3b: Thread `extract`/`ref_aware` through `audited_batch_call` and `run_batched`**
+
+The kwargs are useless unless they reach `validate_batch_results`. The real caller is `audited_batch_call`, NOT `run_batched` directly.
+
+In `enrich_llm.py`, `audited_batch_call` (`:265`) — add `*, ..., extract=None, ref_aware=False` to the signature and forward to BOTH `validate_batch_results` calls:
+
+```python
+def audited_batch_call(conn, client, *, task, prompt_id, schema_id, shared_metadata, items,
+                       out_key, instruction, accept, actor=None, extract=None, ref_aware=False):
+    ...
+    if not included:
+        return BatchCallResult(tuple(egress_outcomes), 0, 0, 0)   # (the [] branch, ~:302 — no results to validate)
+    ...
+    outcomes = validate_batch_results(included, results, out_key, accept,
+                                      extract=extract, ref_aware=ref_aware)   # ~:313
+```
+
+In `enrich_batch.py`, `run_batched` (`:123`) — add `extract=None, ref_aware=False` to the signature and forward them at the `audited_batch_call` invocation (~:147). In `_single_fallback` (`:108`), the flat single schema has no `synthesis` wrapper and the ref-aware accept needs `(raw, ref)`; the simplest safe fix is to **skip the single-fallback path for ref_aware tasks** (return the MISSING outcomes unchanged) so Pass A behaviour is untouched and Pass B never hits the mismatched flat path:
+
+```python
+def _single_fallback(conn, client, *, ..., accept, ref_aware=False, ...):
+    if ref_aware:
+        return leftovers_as_missing   # structured tasks: no single-call fallback in Phase 2
+    ...  # existing Pass A path unchanged
+```
+
+> Defaults (`extract=None, ref_aware=False`) keep every Pass A call byte-for-byte. Add a test that drives `run_batched` end-to-end with a fake client returning a nested `{"results":[{"ref":"txn","synthesis":{...}}]}` and asserts the extractor is actually invoked (a canonical JSON string, not `str(dict)`, reaches the accept).
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `uv run pytest tests/overlay/upload/test_validate_batch_structured.py -q`
+Run: `uv run pytest tests/featuregen/overlay/upload/test_validate_batch_structured.py -q`
 Expected: PASS (3 passed).
 
 - [ ] **Step 5: Run the batch harness regression suite**
 
-Run: `uv run pytest tests/overlay/upload/test_enrich_batch.py -q`
+Run: `uv run pytest tests/featuregen/overlay/upload/test_enrich_batch.py -q`
 Expected: PASS (default scalar path unchanged).
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add src/featuregen/overlay/upload/enrich_batch.py tests/overlay/upload/test_validate_batch_structured.py
+git add src/featuregen/overlay/upload/enrich_batch.py tests/featuregen/overlay/upload/test_validate_batch_structured.py
 git commit -m "feat(overlay): optional structured extractor in validate_batch_results"
 ```
 
@@ -639,7 +681,7 @@ git commit -m "feat(overlay): optional structured extractor in validate_batch_re
 
 **Files:**
 - Create: `src/featuregen/overlay/upload/table_synth.py` — `assemble_table_items(...)`.
-- Test: `tests/overlay/upload/test_table_synth_assemble.py`
+- Test: `tests/featuregen/overlay/upload/test_table_synth_assemble.py`
 
 **Interfaces:**
 - Consumes: `BatchItem` (`enrich_batch.py`); `content_hash` (`overlay/upload/enrich.py` / wherever Pass A keys — same helper `build_graph` uses at ingest.py:120); `strip_sample_values` (`sample_parser.py`); `CanonicalRow` (`canonical.py`).
@@ -648,7 +690,7 @@ git commit -m "feat(overlay): optional structured extractor in validate_batch_re
 - [ ] **Step 1: Write the failing test**
 
 ```python
-# tests/overlay/upload/test_table_synth_assemble.py
+# tests/featuregen/overlay/upload/test_table_synth_assemble.py
 from featuregen.overlay.upload.canonical import CanonicalRow
 from featuregen.overlay.upload.enrich_llm import _item_egress_ok
 from featuregen.overlay.upload.table_synth import assemble_table_items
@@ -674,17 +716,28 @@ def test_one_item_per_table_egress_admissible():
     assert _item_egress_ok(txn.metadata) is True   # <-- the egress contract from Task 3
 
 
-def test_business_definition_is_sample_stripped():
-    # a glossary-style definition embedding a raw representative value must never ride raw
-    rows = [_row("txn", "acct", definition="account number, e.g. 3708484836801")]
-    items = assemble_table_items(rows, concepts={}, definitions={})
+def test_curated_definition_is_sample_stripped():
+    # the CURATED definition (from the sidecar/draft) rides as business_definition, sample-stripped
+    rows = [_row("txn", "acct")]
+    curated = {content_hash(rows[0]):
+               "account number; sample profile is NUMERIC, representative values such as 3708484836801"}
+    items = assemble_table_items(rows, concepts={}, definitions=curated)
     desc = items[0].metadata["column_profiles"][0]
-    assert "3708484836801" not in desc.get("business_definition", "")
+    assert "3708484836801" not in desc.get("business_definition", "")   # stripped
+
+
+def test_uploader_raw_definition_never_egresses():
+    # a TECHNICAL row's raw r.definition free-text (a name, a bare id) must NEVER reach the LLM (M4).
+    rows = [_row("txn", "cust", definition="belongs to John Q. Public, ssn 123456789")]
+    items = assemble_table_items(rows, concepts={}, definitions={})   # no curated definition
+    desc = items[0].metadata["column_profiles"][0]
+    assert "business_definition" not in desc                          # r.definition dropped entirely
+    assert "123456789" not in str(desc) and "John" not in str(desc)
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `uv run pytest tests/overlay/upload/test_table_synth_assemble.py -q`
+Run: `uv run pytest tests/featuregen/overlay/upload/test_table_synth_assemble.py -q`
 Expected: FAIL — `ModuleNotFoundError: ...table_synth`.
 
 - [ ] **Step 3: Implement the assembler**
@@ -706,19 +759,24 @@ def _descriptor(r: CanonicalRow, concept: str | None, definition: str | None) ->
     desc: dict = {"column": r.column, "type": r.type or ""}
     if concept:
         desc["concept"] = concept
-    # Curated meaning rides as business_definition (NEVER `definition`), sample-values stripped so a
-    # representative value embedded in glossary text can never reach the LLM (Phase-1 leak fix).
-    text = r.definition or definition or ""
-    if text:
-        cleaned = strip_sample_values(text)
+    # CRITICAL (M4 egress rule): source business_definition ONLY from the CURATED `definition` (the
+    # glossary sidecar meaning / Pass A draft) — NEVER from `r.definition`, the uploader's raw
+    # free-text cell. enrich.py:_concept_metadata forbids egressing a technical row's r.definition;
+    # we mirror that exactly. Even the curated text is sample-value-stripped as defence-in-depth.
+    if definition:
+        cleaned = strip_sample_values(definition)
         if cleaned:
             desc["business_definition"] = cleaned[:200]
     return desc
 
 
-def assemble_table_items(rows: list[CanonicalRow], *, concepts: dict[str, str],
-                         definitions: dict[str, str]) -> list[BatchItem]:
+def assemble_table_items(rows: list[CanonicalRow], *, concepts: dict[str, str] | None,
+                         definitions: dict[str, str] | None) -> list[BatchItem]:
     """One BatchItem per table; metadata carries each column's enriched, egress-safe descriptor."""
+    # Pass A stages are savepointed and may fail, leaving concepts/definitions None (ingest.py:581).
+    # Degrade to empty enrichment rather than AttributeError on None.get(...).
+    concepts = concepts or {}
+    definitions = definitions or {}
     by_table: dict[str, list[CanonicalRow]] = {}
     for r in rows:
         by_table.setdefault(r.table, []).append(r)
@@ -738,13 +796,13 @@ def assemble_table_items(rows: list[CanonicalRow], *, concepts: dict[str, str],
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `uv run pytest tests/overlay/upload/test_table_synth_assemble.py -q`
+Run: `uv run pytest tests/featuregen/overlay/upload/test_table_synth_assemble.py -q`
 Expected: PASS (2 passed).
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/featuregen/overlay/upload/table_synth.py tests/overlay/upload/test_table_synth_assemble.py
+git add src/featuregen/overlay/upload/table_synth.py tests/featuregen/overlay/upload/test_table_synth_assemble.py
 git commit -m "feat(overlay): Pass B per-table input assembler (egress-safe descriptors)"
 ```
 
@@ -755,19 +813,19 @@ git commit -m "feat(overlay): Pass B per-table input assembler (egress-safe desc
 **Why:** Drive the governed batch call (`run_batched(short="table_synth", ...)`) over the assembled table items and validate each structured result into a canonical grain/availability candidate mapped to the fact value shapes. All LLM-proposed grain columns must be real columns of the table; `as_of_column` must be a real column; `as_of_basis` must be in the enum. Anything else → INVALID (dropped, counted — never a bad proposal).
 
 **Files:**
-- Modify: `src/featuregen/overlay/upload/table_synth.py` — add `make_accept(...)` + `synthesize_tables(...)`.
-- Test: `tests/overlay/upload/test_table_synth_driver.py`
+- Modify: `src/featuregen/overlay/upload/table_synth.py` — add `make_ref_accept(...)` + `synthesize_tables(...)`.
+- Test: `tests/featuregen/overlay/upload/test_table_synth_driver.py`
 
 **Interfaces:**
 - Consumes: `run_batched` (`enrich_batch.py`), `mode`/`budget`/`max_items`/`max_input_tokens` (`enrich_config.py`), `ENRICHMENT_RUN_ID`/`_ENRICH_ACTOR` (`enrich_llm.py`).
 - Produces:
-  - `make_accept(columns_by_table) -> Callable[[str],tuple[str|None,str]]` — validates a serialized `synthesis` JSON against the table's real columns; returns canonical JSON string or `(None, reason)`.
-  - `synthesize_tables(conn, client, items, *, columns_by_table, actor) -> dict[str, dict]` — returns `{table: synthesis_dict}` for every VALID result. `synthesis_dict` = `{"grain": {...}|None, "availability_time": {...}|None, "table_role": str|None, "primary_entity": str|None}`, where `grain`/`availability_time` are already in `FACT_VALUE_SCHEMAS` shape (`{columns, is_unique}` / `{column, basis}`).
+  - `make_ref_accept(columns_by_table) -> Callable[[str, str], tuple[str|None, str]]` — a **ref-aware** accept (`accept(raw, ref)`, `ref`=table) validating a serialized `synthesis` JSON against that table's real columns; returns canonical JSON string or `(None, reason)`. Used via `validate_batch_results(..., ref_aware=True)`.
+  - `synthesize_tables(conn, client, items, *, columns_by_table, actor) -> dict[str, dict]` — returns `{table: synthesis_dict}` for every VALID result. `synthesis_dict` = `{"grain": {...}|None, "availability_time": {...}|None, "table_role": str|None, "primary_entity": str|None, "event_or_snapshot": str|None}`, where `grain`/`availability_time` are already in `FACT_VALUE_SCHEMAS` shape (`{columns, is_unique}` / `{column, basis}`). Passes `extract=`/`ref_aware=True` into `run_batched`.
 
 - [ ] **Step 1: Write the failing test**
 
 ```python
-# tests/overlay/upload/test_table_synth_driver.py
+# tests/featuregen/overlay/upload/test_table_synth_driver.py
 import json
 from featuregen.overlay.upload.table_synth import make_ref_accept
 
@@ -810,10 +868,10 @@ def test_abstention_empty_grain_is_skipped_not_guessed():
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `uv run pytest tests/overlay/upload/test_table_synth_driver.py -q`
-Expected: FAIL — `ImportError: cannot import name 'make_accept'`.
+Run: `uv run pytest tests/featuregen/overlay/upload/test_table_synth_driver.py -q`
+Expected: FAIL — `ImportError: cannot import name 'make_ref_accept'`.
 
-- [ ] **Step 3: Implement `make_accept` + `synthesize_tables`**
+- [ ] **Step 3: Implement `make_ref_accept` + `synthesize_tables`**
 
 Append to `src/featuregen/overlay/upload/table_synth.py`. The accept is **ref-aware** (`accept(raw, ref)`, `ref`=table name) so column validation runs *inside* the batch harness — a grain naming a non-existent column becomes an `INVALID` outcome, never accepted-then-dropped:
 
@@ -822,7 +880,7 @@ import json
 
 from featuregen.overlay.upload.enrich_batch import BatchItem, run_batched
 
-_VALID_BASIS = {"posted_at", "ingested_at", "event_time_plus_lag"}  # == FACT_VALUE_SCHEMAS enum
+_VALID_BASIS = {"posted_at", "ingested_at"}  # lag-free bases only (event_time_plus_lag needs lag_hours)
 
 
 def make_ref_accept(columns_by_table: dict[str, set[str]]):
@@ -880,7 +938,7 @@ def synthesize_tables(conn, client, items: list[BatchItem], *, columns_by_table,
 _INSTRUCTION = (
     "For each table, identify: the grain (the minimal set of columns whose combination uniquely "
     "identifies one row) — RETURN AN EMPTY grain_columns list if you cannot determine it, do not "
-    "guess; the as-of/availability column and its basis (posted_at|ingested_at|event_time_plus_lag); "
+    "guess; the as-of/availability column and its basis (posted_at|ingested_at); "
     "the primary business entity; the table role; and whether it is an event or snapshot table. "
     "Only name columns that appear in the provided column list."
 )
@@ -892,7 +950,7 @@ _INSTRUCTION = (
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `uv run pytest tests/overlay/upload/test_table_synth_driver.py -q`
+Run: `uv run pytest tests/featuregen/overlay/upload/test_table_synth_driver.py -q`
 Expected: PASS (4 passed).
 
 - [ ] **Step 5: Add and run the end-to-end driver test (fake client)**
@@ -902,7 +960,7 @@ Write `test_synthesize_tables_end_to_end` using a fake LLM client returning a ca
 - [ ] **Step 6: Commit**
 
 ```bash
-git add src/featuregen/overlay/upload/table_synth.py tests/overlay/upload/test_table_synth_driver.py
+git add src/featuregen/overlay/upload/table_synth.py tests/featuregen/overlay/upload/test_table_synth_driver.py
 git commit -m "feat(overlay): Pass B synthesis driver + column-validated accept"
 ```
 
@@ -915,16 +973,90 @@ git commit -m "feat(overlay): Pass B synthesis driver + column-validated accept"
 **Files:**
 - Modify: `src/featuregen/overlay/upload/table_synth.py` — add `_propose_table_facts(...)`.
 - Modify: `src/featuregen/overlay/upload/ingest.py:~619` — call it beside `_propose_governed_joins`, behind the flag.
-- Test: `tests/overlay/upload/test_table_synth_propose.py`
+- Test: `tests/featuregen/overlay/upload/test_table_synth_propose.py`
 
 **Interfaces:**
-- Consumes: `propose_fact` + `Command` (`overlay/commands.py` / `contracts`), `table_ref` (`upload_catalog.py`), `fact_key`/`load_fact`/`fold_overlay_state` (`overlay/identity.py`,`store.py`,`state.py`), `record_field_evidence` (`field_evidence.py`), `normalize_ref` (`object_ref.py`), `EvidenceProducer`/`AssertionStrength` (`evidence.py`), `ENRICHMENT_RUN_ID` (`enrich_llm.py`), `table_synth_enabled()` (new, mirrors `governed_joins_enabled`).
-- Produces: `_propose_table_facts(conn, source, syntheses, *, actor) -> None` — fail-soft; proposes grain/availability only when no fact stream exists for the key; records advisory table-field evidence unconditionally (producer-scoped staleness via the existing `record_field_evidence` path).
+- Consumes: `propose_fact` + `Command` (`overlay/commands.py` / `contracts.envelopes` — Command needs all 6 fields), `proposal_fingerprint` (`overlay/identity.py`), `table_ref` (`upload_catalog.py`), `fact_key`/`load_fact`/`fold_overlay_state` (`overlay/identity.py`,`store.py`,`state.py`), `_write_producer_field` (`overlay/upload/ingest.py` — the SAME producer-scoped-staleness helper Pass A uses), `normalize_ref` (`object_ref.py`), `EvidenceProducer`/`AssertionStrength` (`evidence.py`), `ENRICHMENT_RUN_ID`/`_ENRICH_ACTOR` (`enrich_llm.py`), `mint_id` (`overlay/identity.py`), `table_synth_enabled()` (Task 2).
+- Produces: `_propose_table_facts(conn, source, syntheses, *, actor, source_snapshot_id) -> None` — fail-soft; proposes grain/availability, skipping QUIETLY only when the folded state is VERIFIED/pending; records advisory table-field evidence via `_write_producer_field` (producer-scoped staleness + snapshot reuse). `actor` must be the service `_ENRICH_ACTOR`.
+
+- [ ] **Step 0: Author the shared test conftest + fixtures (first consumer)**
+
+The tests across Tasks 7/9/10/11/12 depend on fixtures/helpers that DO NOT EXIST yet. Create `tests/featuregen/overlay/upload/conftest.py` now (it sits under the existing `tests/featuregen/overlay/conftest.py`, which autoregisters overlay commands/event types + the `catalog` fixture). Author:
+
+```python
+# tests/featuregen/overlay/upload/conftest.py
+import pytest
+from featuregen.contracts.envelopes import IdentityEnvelope
+from featuregen.overlay.projection import OverlayProjection
+from featuregen.projections.runner import run_projection
+from featuregen.overlay.upload.upload_catalog import ensure_upload_catalog_adapter
+# NOTE: confirm import paths — mint_test_identity in tests/featuregen/_helpers.py;
+# confirm_fact/reject_fact commands; get open task via human_tasks SELECT.
+
+@pytest.fixture
+def overlay_conn(db):
+    # `db` is the ephemeral-PG connection fixture (tests/featuregen/conftest.py). Register the
+    # upload-context adapter so propose/confirm/expiry resolve one (else they RuntimeError/skip).
+    ensure_upload_catalog_adapter()
+    return db
+
+@pytest.fixture
+def service_actor():
+    # a non-human service proposer (mirrors _ENRICH_ACTOR) so four-eyes holds vs a human confirmer
+    return IdentityEnvelope(subject="featuregen-overlay-enrichment", actor_kind="service",
+                            authenticated=True, auth_method="internal", role_claims=())
+
+@pytest.fixture
+def human_actor():
+    # MUST hold platform-admin: grain/availability route to the platform-admin governance queue
+    # (UploadContextAdapter.owner_of -> None), so a data_owner confirmer would be DENIED.
+    from tests.featuregen._helpers import mint_test_identity
+    return mint_test_identity(subject="user:admin", role_claims=("platform-admin",))
+
+@pytest.fixture
+def seeded_graph(db):
+    # source "src", table "txn", columns id/amt (+ txn_id for the integration test), is_grain=false
+    for col in ("id", "amt", "txn_id"):
+        db.execute("INSERT INTO graph_node (catalog_source, object_ref, kind, table_name, "
+                   "column_name, is_grain, is_as_of) VALUES ('src', %s, 'column', 'txn', %s, "
+                   "false, false)", (f"public.txn.{col}", col))
+    return db
+
+def _open_grain_task(conn, source, table):
+    # the gate task propose_fact opened for this table's grain (carries target_event_id)
+    from featuregen.overlay.task_read import get_task_proposal
+    ...  # SELECT task_id FROM human_tasks WHERE status='open'; match fact_type=='grain' & object_ref
+
+def _confirm_grain(conn, source, table, columns, *, actor):
+    from featuregen.contracts.envelopes import Command
+    from featuregen.overlay.commands import confirm_fact  # confirm import path
+    task_id, target_event_id, ref = _open_grain_task(conn, source, table)
+    confirm_fact(conn, Command("confirm_fact", "overlay_fact", None,
+        {"ref": ref, "fact_type": "grain", "target_event_id": target_event_id,
+         "value": {"columns": columns, "is_unique": True}}, actor, f"confirm-{target_event_id}"))
+    run_projection(conn, OverlayProjection())   # CRITICAL: resolve_fact reads the projected read model
+
+def _reject_grain(conn, source, table, *, actor):
+    from featuregen.contracts.envelopes import Command
+    from featuregen.overlay.commands import reject_fact
+    task_id, target_event_id, ref = _open_grain_task(conn, source, table)
+    reject_fact(conn, Command("reject_fact", "overlay_fact", None,
+        {"ref": ref, "fact_type": "grain", "target_event_id": target_event_id}, actor,
+        f"reject-{target_event_id}"))
+    run_projection(conn, OverlayProjection())
+
+def _reconfirm_grain(conn, source, table, columns, *, actor):
+    # drive a VERIFIED fact to a NEW VERIFIED value (expiry/reverify override path). Read
+    # confirmation_commands.py for the reverify value-override; then run_projection.
+    ...
+```
+
+> **Implementer note:** this conftest is a Task-7 deliverable but consumed by Tasks 9–12. Confirm every import/signature against the real code before writing (the `Command` shape for confirm/reject; `mint_test_identity`'s params; the `db` fixture name; `human_tasks` columns `task_id`/`status`; `get_task_proposal`'s TypedDict). `fake_synth_client`/`glossary_rows`/`technical_rows` are authored in Task 6 (driver e2e) and Task 12 respectively; move them here if an earlier task needs them. Every `_confirm_grain`/`_reconfirm_grain`/`_reject_grain` MUST end with `run_projection(conn, OverlayProjection())` so `resolve_fact` (which reads `overlay_fact_state`, populated only by the projection) sees VERIFIED.
 
 - [ ] **Step 1: Write the failing test**
 
 ```python
-# tests/overlay/upload/test_table_synth_propose.py
+# tests/featuregen/overlay/upload/test_table_synth_propose.py
 # Uses the overlay conftest (ephemeral PG + registered test adapter/commands).
 from featuregen.overlay.identity import fact_key
 from featuregen.overlay.store import load_fact
@@ -936,7 +1068,7 @@ from featuregen.overlay.upload.table_synth import _propose_table_facts
 def test_grain_is_proposed_not_confirmed(overlay_conn, service_actor):
     syn = {"txn": {"grain": {"columns": ["id"], "is_unique": True},
                    "availability_time": None, "table_role": "fact", "primary_entity": "account"}}
-    _propose_table_facts(overlay_conn, "src", syn, actor=service_actor)
+    _propose_table_facts(overlay_conn, "src", syn, actor=service_actor, source_snapshot_id="snap-test")
     state = fold_overlay_state(load_fact(overlay_conn, fact_key(table_ref("src", "txn"), "grain")))
     assert state.status == "PROPOSED"   # never auto-confirmed
 
@@ -948,7 +1080,7 @@ def test_existing_verified_grain_is_not_overwritten(overlay_conn, service_actor,
                  {"columns": ["id"], "is_unique": True}, actor=human_actor)
     syn = {"txn": {"grain": {"columns": ["other"], "is_unique": True},
                    "availability_time": None, "table_role": None, "primary_entity": None}}
-    _propose_table_facts(overlay_conn, "src", syn, actor=service_actor)
+    _propose_table_facts(overlay_conn, "src", syn, actor=service_actor, source_snapshot_id="snap-test")
     state = fold_overlay_state(load_fact(overlay_conn, fact_key(table_ref("src", "txn"), "grain")))
     assert state.status == "VERIFIED" and state.value["columns"] == ["id"]  # untouched
 
@@ -958,7 +1090,7 @@ def test_advisory_table_role_recorded_as_evidence(overlay_conn, service_actor):
     from featuregen.overlay.upload.object_ref import normalize_ref
     syn = {"txn": {"grain": None, "availability_time": None,
                    "table_role": "fact", "primary_entity": "account"}}
-    _propose_table_facts(overlay_conn, "src", syn, actor=service_actor)
+    _propose_table_facts(overlay_conn, "src", syn, actor=service_actor, source_snapshot_id="snap-test")
     ref = normalize_ref("src", None, "txn")
     ev = read_active_field_evidence(overlay_conn, ref, "table_role")
     assert any(e.proposed_value == "fact" for e in ev)
@@ -966,7 +1098,7 @@ def test_advisory_table_role_recorded_as_evidence(overlay_conn, service_actor):
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `uv run pytest tests/overlay/upload/test_table_synth_propose.py -q`
+Run: `uv run pytest tests/featuregen/overlay/upload/test_table_synth_propose.py -q`
 Expected: FAIL — `ImportError: cannot import name '_propose_table_facts'`.
 
 - [ ] **Step 3: Implement `_propose_table_facts`**
@@ -997,17 +1129,23 @@ def _active_skip_state(conn, ref, fact_type) -> str | None:
     return status if status in _SKIP_QUIET_STATES else None
 
 
-def _propose_table_facts(conn, source: str, syntheses: dict[str, dict], *, actor) -> None:
+def _propose_table_facts(conn, source: str, syntheses: dict[str, dict], *, actor,
+                         source_snapshot_id: str) -> None:
     """Route Pass B grain/availability candidates into governed PROPOSED-only facts and advisory
     table-field evidence. Fail-soft (never aborts the upload). Skips QUIETLY only when a stronger
     active claim governs the key (VERIFIED / pending proposal); otherwise lets propose_fact
-    adjudicate re-proposal after a terminal state, logging any denial as a conflict diagnostic."""
+    adjudicate re-proposal after a terminal state, logging any denial as a conflict diagnostic.
+
+    ``actor`` MUST be the service actor (``_ENRICH_ACTOR``) so a human confirmer later satisfies
+    four-eyes. ``source_snapshot_id`` keys producer-scoped staleness for the advisory evidence (a
+    NOT-NULL column)."""
     from featuregen.contracts.envelopes import Command
     from featuregen.overlay.catalog import current_catalog_adapter
     from featuregen.overlay.commands import propose_fact
     from featuregen.overlay.evidence import AssertionStrength, EvidenceProducer
-    from featuregen.overlay.field_evidence import record_field_evidence
+    from featuregen.overlay.identity import proposal_fingerprint
     from featuregen.overlay.upload.enrich_llm import ENRICHMENT_RUN_ID
+    from featuregen.overlay.upload.ingest import _write_producer_field
     from featuregen.overlay.upload.object_ref import normalize_ref
     from featuregen.overlay.upload.upload_catalog import table_ref
 
@@ -1030,8 +1168,11 @@ def _propose_table_facts(conn, source: str, syntheses: dict[str, dict], *, actor
                 counters.incr(f"overlay.table_synth.{fact_type}.skipped_{skip_state.lower()}")
                 continue
             try:
-                result = propose_fact(conn, Command(actor=actor, args={
-                    "ref": ref, "fact_type": fact_type, "proposed_value": value}))
+                # Command needs ALL 6 fields (envelopes.py); mirror _propose_governed_joins exactly.
+                result = propose_fact(conn, Command(
+                    "propose_fact", "overlay_fact", None,
+                    {"ref": ref, "fact_type": fact_type, "proposed_value": value},
+                    actor, proposal_fingerprint(value)))
                 if result.accepted:
                     counters.incr(f"overlay.table_synth.{fact_type}.proposed")
                 else:
@@ -1043,22 +1184,25 @@ def _propose_table_facts(conn, source: str, syntheses: dict[str, dict], *, actor
             except Exception:   # noqa: BLE001 — advisory: a proposal error never fails an upload
                 counters.incr(f"overlay.table_synth.{fact_type}.error")
                 logger.exception("table_synth %s proposal errored for %s.%s", fact_type, source, table)
-        # advisory table fields -> field evidence (RECOMMENDATION-ceilinged in Task 8)
+        # advisory table fields -> field evidence via the SAME helper Pass A uses (_write_producer_field:
+        # producer-scoped staleness + snapshot reuse + all required args incl. source_snapshot_id/input_hash).
+        # RECOMMENDATION-ceilinged in Task 8. _write_producer_field is INSERT-guarded internally; a write
+        # error here is still contained by the Step-5 savepoint+except.
         logical_ref = normalize_ref(source, None, table)
         for field_name in ("table_role", "primary_entity", "event_or_snapshot"):
             v = syn.get(field_name)
             if v:
-                record_field_evidence(
-                    conn, logical_ref=logical_ref, field_name=field_name, proposed_value=v,
+                _write_producer_field(
+                    conn, logical_ref=logical_ref, field_name=field_name, value=v,
                     producer=EvidenceProducer.LLM, strength=AssertionStrength.PROPOSED,
-                    producer_ref=ENRICHMENT_RUN_ID)
+                    producer_ref=ENRICHMENT_RUN_ID, snapshot_id=source_snapshot_id, material=v)
 ```
 
 > **Implementer note:** confirm the exact `record_field_evidence` signature and the `Command` import path by reading `field_evidence.py` and the Pass A item-level evidence call in `enrich.py`; match them verbatim (the Phase-1 call already writes item-level concept evidence with producer-scoped staleness — reuse that exact call shape). Confirm `counters`/`logger` import path from `ingest.py`.
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `uv run pytest tests/overlay/upload/test_table_synth_propose.py -q`
+Run: `uv run pytest tests/featuregen/overlay/upload/test_table_synth_propose.py -q`
 Expected: PASS (3 passed).
 
 - [ ] **Step 5: Wire the ingest call behind the (Task 2) feature switch**
@@ -1067,27 +1211,47 @@ Expected: PASS (3 passed).
 
 ```python
         if table_synth_enabled() and client is not None:
+            from featuregen.overlay.upload.enrich_llm import _ENRICH_ACTOR
+            from featuregen.overlay.upload.object_ref import normalize_ref
             from featuregen.overlay.upload.table_synth import (
                 assemble_table_items, synthesize_tables, _propose_table_facts)
-            items = assemble_table_items(vr.good, concepts=concepts, definitions=definitions)
-            cols = {t: {r.column for r in vr.good if r.table == t}
-                    for t in {r.table for r in vr.good}}
-            syntheses = synthesize_tables(conn, client, items, columns_by_table=cols, actor=actor)
-            with conn.transaction():   # savepoint: a Pass B failure must not lose Pass A facts
-                _propose_table_facts(conn, catalog_source, syntheses, actor=actor)
+            try:
+                # The savepoint CONTAINS the LLM + security-audit writes (exactly like the Pass A
+                # stages above). A DB abort inside synthesize_tables/propose must not poison the tx and
+                # roll back Pass A facts + the quarantine. try/except makes Pass B strictly advisory.
+                with conn.transaction():
+                    synth_snapshot = snapshot_id or mint_id("tsy")  # tech uploads have snapshot_id=None
+                    items = assemble_table_items(vr.good, concepts=concepts, definitions=definitions)
+                    cols = {t: {r.column for r in vr.good if r.table == t}
+                            for t in {r.table for r in vr.good}}
+                    syntheses = synthesize_tables(conn, client, items, columns_by_table=cols,
+                                                  actor=actor)   # LLM-call attribution only
+                    # Propose under the SERVICE actor so a human confirmer later satisfies four-eyes:
+                    _propose_table_facts(conn, catalog_source, syntheses, actor=_ENRICH_ACTOR,
+                                         source_snapshot_id=synth_snapshot)
+                    # Project the advisory table fields' DISPLAY. resolve_and_project is otherwise
+                    # called ONLY over glossary COLUMN refs (ingest.py:496); table refs need this
+                    # explicit call or table_role/primary_entity/event_or_snapshot stay NULL forever.
+                    table_refs = [normalize_ref(catalog_source, None, t)
+                                  for t in sorted({r.table for r in vr.good})]
+                    resolve_and_project(conn, source=catalog_source, logical_refs=table_refs, now=now)
+            except Exception:  # noqa: BLE001 — advisory: Pass B never fails an upload; Pass A facts hold
+                counters.incr("overlay.table_synth.error")
+                logger.warning("advisory Pass B table synthesis failed for %r — Pass A facts + graph "
+                               "intact", catalog_source, exc_info=True)
 ```
 
-> **Implementer note:** confirm `concepts` and `definitions` are in scope at that point in `ingest_upload` (they are produced by the Pass A stages `enrich_concepts`/`draft_definitions` earlier at ~597/607 — read the exact variable names and reuse them; do NOT re-run Pass A). Wrap the whole Pass B block in the same fail-soft posture as `_propose_governed_joins` if any stage can raise. Use `_ENRICH_ACTOR` as the proposer `actor` (the service actor — so four-eyes is satisfied when a human later confirms).
+> **Implementer note:** `concepts`/`definitions`/`snapshot_id`/`now`/`mint_id`/`resolve_and_project` are all already in scope at this point in `ingest_upload` (Pass A stages at ~597/607; `snapshot_id` at :562; `resolve_and_project` imported at :31; `mint_id` used at :562) — reuse them, do NOT re-run Pass A. The fail-soft model is the **enrichment-stage pattern** (`try: with conn.transaction(): <stage> except Exception: log`, ingest.py:596-614) — NOT `_propose_governed_joins`, which has per-item try/except but **no savepoint** and would let a DB abort poison the tx. The LLM+audit call (`synthesize_tables`) MUST be inside the savepoint. Propose under `_ENRICH_ACTOR` (service actor → four-eyes holds when a human confirms). Confirm the exact `mint_id` import (`featuregen.overlay.identity` or wherever ingest.py:562 gets it).
 
 - [ ] **Step 6: Run the propose + ingest suites**
 
-Run: `uv run pytest tests/overlay/upload/test_table_synth_propose.py tests/overlay/upload/test_ingest.py -q`
+Run: `uv run pytest tests/featuregen/overlay/upload/test_table_synth_propose.py tests/featuregen/overlay/upload/test_ingest.py -q`
 Expected: PASS (flag default-off ⇒ ingest unchanged; propose path proven).
 
 - [ ] **Step 7: Commit**
 
 ```bash
-git add src/featuregen/overlay/upload/table_synth.py src/featuregen/overlay/upload/ingest.py tests/overlay/upload/test_table_synth_propose.py
+git add src/featuregen/overlay/upload/table_synth.py src/featuregen/overlay/upload/ingest.py tests/featuregen/overlay/upload/test_table_synth_propose.py
 git commit -m "feat(overlay): Pass B propose-only table facts + fail-soft ingest wiring (default off)"
 ```
 
@@ -1101,7 +1265,7 @@ git commit -m "feat(overlay): Pass B propose-only table facts + fail-soft ingest
 - Create: `src/featuregen/db/migrations/0986_graph_node_table_fields.sql`
 - Modify: `src/featuregen/overlay/upload/field_policies.py` — add two `_POLICIES` entries.
 - Modify: `src/featuregen/overlay/upload/field_resolution.py:86-102` — add to `_DISPLAY_COLUMN` + `_DECISION_LINK_COLUMN`.
-- Test: `tests/overlay/upload/test_table_advisory_fields.py`
+- Test: `tests/featuregen/overlay/upload/test_table_advisory_fields.py`
 
 **Interfaces:**
 - Consumes: `_recommendation` helper (`field_policies.py:58`), `resolve_and_project` (`field_resolution.py:302`).
@@ -1127,7 +1291,7 @@ ALTER TABLE graph_node ADD COLUMN IF NOT EXISTS availability_fact_event_id text;
 - [ ] **Step 2: Write the failing test**
 
 ```python
-# tests/overlay/upload/test_table_advisory_fields.py
+# tests/featuregen/overlay/upload/test_table_advisory_fields.py
 from featuregen.overlay.field_authority import InfluenceTier, ResolutionMode
 from featuregen.overlay.upload.field_policies import policy_for
 
@@ -1146,7 +1310,7 @@ def test_primary_entity_is_recommendation_ceilinged():
 
 - [ ] **Step 3: Run test to verify it fails**
 
-Run: `uv run pytest tests/overlay/upload/test_table_advisory_fields.py -q`
+Run: `uv run pytest tests/featuregen/overlay/upload/test_table_advisory_fields.py -q`
 Expected: FAIL — `policy_for("table_role")` returns `None`.
 
 - [ ] **Step 4: Register the policies + display columns**
@@ -1185,7 +1349,7 @@ _DECISION_LINK_COLUMN: dict[str, str] = {
 
 - [ ] **Step 5: Run tests to verify they pass**
 
-Run: `uv run pytest tests/overlay/upload/test_table_advisory_fields.py -q`
+Run: `uv run pytest tests/featuregen/overlay/upload/test_table_advisory_fields.py -q`
 Expected: PASS (2 passed).
 
 - [ ] **Step 6: Add a projection integration test**
@@ -1195,7 +1359,7 @@ Write a test that records `table_role="fact"` evidence for a table logical_ref, 
 - [ ] **Step 7: Commit**
 
 ```bash
-git add src/featuregen/db/migrations/0986_graph_node_table_fields.sql src/featuregen/overlay/upload/field_policies.py src/featuregen/overlay/upload/field_resolution.py tests/overlay/upload/test_table_advisory_fields.py
+git add src/featuregen/db/migrations/0986_graph_node_table_fields.sql src/featuregen/overlay/upload/field_policies.py src/featuregen/overlay/upload/field_resolution.py tests/featuregen/overlay/upload/test_table_advisory_fields.py
 git commit -m "feat(overlay): advisory table_role/primary_entity fields (display-only) + migration 0986"
 ```
 
@@ -1208,7 +1372,7 @@ git commit -m "feat(overlay): advisory table_role/primary_entity fields (display
 **Files:**
 - Create: `src/featuregen/overlay/upload/table_fact_projection.py` — `project_table_facts(...)`.
 - Modify: `src/featuregen/overlay/upload/ingest.py` — call `project_table_facts` at end of `ingest_upload`.
-- Test: `tests/overlay/upload/test_table_fact_projection.py`
+- Test: `tests/featuregen/overlay/upload/test_table_fact_projection.py`
 
 **Interfaces:**
 - Consumes: `resolve_fact` (`resolve.py:183`), `current_catalog_adapter` (`catalog.py`), `table_ref` (`upload_catalog.py`).
@@ -1217,7 +1381,7 @@ git commit -m "feat(overlay): advisory table_role/primary_entity fields (display
 - [ ] **Step 1: Write the failing test**
 
 ```python
-# tests/overlay/upload/test_table_fact_projection.py
+# tests/featuregen/overlay/upload/test_table_fact_projection.py
 from featuregen.overlay.upload.table_fact_projection import project_table_facts
 
 
@@ -1238,7 +1402,7 @@ def test_proposed_but_unconfirmed_grain_projects_nothing(overlay_conn, service_a
                          {"txn": {"grain": {"columns": ["id"], "is_unique": True},
                                   "availability_time": None,
                                   "table_role": None, "primary_entity": None}},
-                         actor=service_actor)
+                         actor=service_actor, source_snapshot_id="snap-test")
     project_table_facts(overlay_conn, source="src", tables=["txn"])
     rows = overlay_conn.execute(
         "SELECT is_grain FROM graph_node WHERE catalog_source='src' AND table_name='txn' "
@@ -1262,7 +1426,7 @@ def test_reprojection_clears_stale_grain_flags(overlay_conn, human_actor, seeded
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `uv run pytest tests/overlay/upload/test_table_fact_projection.py -q`
+Run: `uv run pytest tests/featuregen/overlay/upload/test_table_fact_projection.py -q`
 Expected: FAIL — `ModuleNotFoundError: ...table_fact_projection`.
 
 - [ ] **Step 3: Implement the bridge**
@@ -1304,11 +1468,14 @@ def project_table_facts_for_ref(conn, *, source: str, table: str,
     grain = resolve_fact(conn, adapter, ref, "grain")
     if grain and grain.value is not None:
         cols = grain.value.get("columns", [])
+        # ResolvedFact has NO confirmed_event_id attribute; a VERIFIED overlay fact carries it in
+        # .provenance['confirmed_event_id'] (resolve.py _overlay_verified). getattr(...) would silently
+        # write NULL — read provenance so the audit-link column is actually populated.
         conn.execute(
             "UPDATE graph_node SET is_grain = true, grain_fact_event_id = %s "
             "WHERE catalog_source = %s AND table_name = %s AND kind = 'column' "
             "AND column_name = ANY(%s)",
-            (getattr(grain, "confirmed_event_id", None), source, table, list(cols)))
+            ((grain.provenance or {}).get("confirmed_event_id"), source, table, list(cols)))
     # 3. Apply the CONFIRMED availability.
     avail = resolve_fact(conn, adapter, ref, "availability_time")
     if avail and avail.value is not None:
@@ -1317,7 +1484,7 @@ def project_table_facts_for_ref(conn, *, source: str, table: str,
             "UPDATE graph_node SET is_as_of = true, availability_fact_event_id = %s "
             "WHERE catalog_source = %s AND table_name = %s AND kind = 'column' "
             "AND column_name = %s",
-            (getattr(avail, "confirmed_event_id", None), source, table, col))
+            ((avail.provenance or {}).get("confirmed_event_id"), source, table, col))
 
 
 def project_table_facts(conn, *, source: str, tables, now: datetime | None = None) -> None:
@@ -1326,33 +1493,39 @@ def project_table_facts(conn, *, source: str, tables, now: datetime | None = Non
         project_table_facts_for_ref(conn, source=source, table=table, now=now)
 ```
 
-> **Implementer note:** read `resolve_fact` (`resolve.py:183`) to confirm the exact return type and how it exposes the value + the confirmed event id (it "serves a value only on VERIFIED"; a PROPOSED/absent fact returns a blocked/`value=None` result). Match the attribute names exactly (`.value`, and whatever carries the confirmed event id — adjust the `getattr` fallbacks). If `resolve_fact` requires a `use_case` positional, pass `None`. Note the table-node's own `is_grain`/`is_as_of` are hard-coded false at `graph.py:115` and stay so — the grain lives on the COLUMN nodes, which is what feature-gen reads.
+> **Implementer note:** read `resolve_fact` (`resolve.py:183`): it serves a value ONLY on `VERIFIED`, and it reads the **`overlay_fact_state` read model** — which is written by `OverlayProjection`, NOT by `confirm_fact` (confirm only appends the event + arms expiry). So a test that does `_confirm_grain → project_table_facts` with no projection run sees `value=None` and projects nothing. **The `_confirm_grain`/`_reconfirm_grain` conftest helpers MUST drain the projection after `confirm_fact`** (`run_projection(conn, OverlayProjection())`, mirroring `tests/featuregen/overlay/_helpers.py`). Do NOT rewrite `project_table_facts` to fold the event stream — keeping it on `resolve_fact` preserves the VERIFIED-only/expiry-guarded semantics; the drain belongs in the confirm helper. If a synchronous confirm-then-project is ever wired in-process, a `run_projection` must precede `project_table_facts` there too. The confirmed event id lives in `resolve_fact(...).provenance['confirmed_event_id']` (NOT an attribute). `use_case` is `None` for grain/availability. The table-node's own `is_grain`/`is_as_of` stay hard-coded false at `graph.py:115` — grain lives on the COLUMN nodes, which is what feature-gen reads.
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `uv run pytest tests/overlay/upload/test_table_fact_projection.py -q`
+Run: `uv run pytest tests/featuregen/overlay/upload/test_table_fact_projection.py -q`
 Expected: PASS (2 passed).
 
 - [ ] **Step 5: Call the bridge at end-of-ingest (re-apply on every upload)**
 
-In `ingest_upload`, after the graph is built and Pass B has run (near the end, before `return IngestResult(...)`), re-project any already-confirmed facts onto the fresh graph_node:
+In `ingest_upload`, after the graph is built and Pass B has run (near the end, before `return IngestResult(...)`), re-project any already-confirmed facts onto the fresh graph_node — inside a **savepoint + except** so a projection DB fault can never poison the tx and roll back facts/quarantine (this runs even when the feature flag is off, so it must not be able to newly 500 a flag-off upload):
 
 ```python
-        project_table_facts(conn, source=catalog_source,
-                            tables=sorted({r.table for r in vr.good}))
+        try:
+            with conn.transaction():   # savepoint: a projection fault must not roll back facts
+                project_table_facts(conn, source=catalog_source,
+                                    tables=sorted({r.table for r in vr.good}))
+        except Exception:  # noqa: BLE001 — advisory: re-projection never fails an upload
+            counters.incr("overlay.table_fact_projection.error")
+            logger.warning("advisory grain/as-of re-projection failed for %r — facts intact",
+                           catalog_source, exc_info=True)
 ```
 
-Import at top: `from featuregen.overlay.upload.table_fact_projection import project_table_facts`. This is unconditional (not flag-gated): a grain confirmed in a *prior* cycle must survive a `build_graph` rebuild even if `OVERLAY_TABLE_SYNTH` is off.
+Import at top: `from featuregen.overlay.upload.table_fact_projection import project_table_facts`. This is unconditional (not flag-gated): a grain confirmed in a *prior* cycle must survive a `build_graph` rebuild even if `OVERLAY_TABLE_SYNTH` is off. `project_table_facts` itself resolves `current_catalog_adapter()`, which `ensure_upload_catalog_adapter()` (Task 1) registered at the top of `ingest_upload` — so it is always available here.
 
 - [ ] **Step 6: Run the ingest + projection suites**
 
-Run: `uv run pytest tests/overlay/upload/test_table_fact_projection.py tests/overlay/upload/test_ingest.py -q`
+Run: `uv run pytest tests/featuregen/overlay/upload/test_table_fact_projection.py tests/featuregen/overlay/upload/test_ingest.py -q`
 Expected: PASS.
 
 - [ ] **Step 7: Commit**
 
 ```bash
-git add src/featuregen/overlay/upload/table_fact_projection.py src/featuregen/overlay/upload/ingest.py tests/overlay/upload/test_table_fact_projection.py
+git add src/featuregen/overlay/upload/table_fact_projection.py src/featuregen/overlay/upload/ingest.py tests/featuregen/overlay/upload/test_table_fact_projection.py
 git commit -m "feat(overlay): SPECIALIZED_FACT bridge — confirmed grain/as-of -> graph_node, re-applied at ingest"
 ```
 
@@ -1364,7 +1537,7 @@ git commit -m "feat(overlay): SPECIALIZED_FACT bridge — confirmed grain/as-of 
 
 **Files:**
 - Modify: `src/featuregen/overlay/upload/readiness.py` — add `availability` to `_PHASE1_UNPROMOTED`; add `_table_fact_status(...)`; use it where the grain/availability requirement status is set.
-- Test: `tests/overlay/upload/test_readiness_table_facts.py`
+- Test: `tests/featuregen/overlay/upload/test_readiness_table_facts.py`
 
 **Interfaces:**
 - Consumes: `fact_key` (`identity.py`), `load_fact` (`store.py`), `fold_overlay_state` (`state.py`), `table_ref` (`upload_catalog.py`), `CAUSE_NOT_PROMOTED`/`CAUSE_PROPOSED_UNCONFIRMED`.
@@ -1373,7 +1546,7 @@ git commit -m "feat(overlay): SPECIALIZED_FACT bridge — confirmed grain/as-of 
 - [ ] **Step 1: Write the failing test**
 
 ```python
-# tests/overlay/upload/test_readiness_table_facts.py
+# tests/featuregen/overlay/upload/test_readiness_table_facts.py
 from featuregen.overlay.upload.readiness import _table_fact_status
 
 
@@ -1387,7 +1560,7 @@ def test_proposed_grain_is_proposed(overlay_conn, service_actor):
                          {"txn": {"grain": {"columns": ["id"], "is_unique": True},
                                   "availability_time": None,
                                   "table_role": None, "primary_entity": None}},
-                         actor=service_actor)
+                         actor=service_actor, source_snapshot_id="snap-test")
     status, cause = _table_fact_status(overlay_conn, "src", "txn", "grain")
     assert status == "proposed" and cause == "proposed_unconfirmed"
 
@@ -1404,7 +1577,7 @@ def test_rejected_grain_is_missing_but_distinct_cause(overlay_conn, service_acto
                          {"txn": {"grain": {"columns": ["id"], "is_unique": True},
                                   "availability_time": None,
                                   "table_role": None, "primary_entity": None}},
-                         actor=service_actor)
+                         actor=service_actor, source_snapshot_id="snap-test")
     _reject_grain(overlay_conn, "src", "txn", actor=human_actor)   # helper -> REJECTED
     status, cause = _table_fact_status(overlay_conn, "src", "txn", "grain")
     assert status == "missing" and cause == CAUSE_FACT_REJECTED   # not "never proposed"
@@ -1412,7 +1585,7 @@ def test_rejected_grain_is_missing_but_distinct_cause(overlay_conn, service_acto
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `uv run pytest tests/overlay/upload/test_readiness_table_facts.py -q`
+Run: `uv run pytest tests/featuregen/overlay/upload/test_readiness_table_facts.py -q`
 Expected: FAIL — `ImportError: cannot import name '_table_fact_status'`.
 
 - [ ] **Step 3: Implement `_table_fact_status` + wire it**
@@ -1474,18 +1647,18 @@ Only a `confirmed` (VERIFIED) fact is feature-ready; every other state is non-re
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `uv run pytest tests/overlay/upload/test_readiness_table_facts.py -q`
+Run: `uv run pytest tests/featuregen/overlay/upload/test_readiness_table_facts.py -q`
 Expected: PASS (3 passed).
 
 - [ ] **Step 5: Run the full readiness suite**
 
-Run: `uv run pytest tests/overlay/upload/test_readiness.py -q`
+Run: `uv run pytest tests/featuregen/overlay/upload/test_readiness.py -q`
 Expected: PASS (existing diagnostics intact; grain no longer hard-coded missing).
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add src/featuregen/overlay/upload/readiness.py tests/overlay/upload/test_readiness_table_facts.py
+git add src/featuregen/overlay/upload/readiness.py tests/featuregen/overlay/upload/test_readiness_table_facts.py
 git commit -m "feat(overlay): readiness reads grain/availability fact state (missing->proposed->confirmed)"
 ```
 
@@ -1497,7 +1670,7 @@ git commit -m "feat(overlay): readiness reads grain/availability fact state (mis
 
 **Files:**
 - Modify: `src/featuregen/overlay/upload/table_fact_projection.py` — add `list_open_table_fact_proposals(conn)`.
-- Test: `tests/overlay/upload/test_table_fact_worklist.py`
+- Test: `tests/featuregen/overlay/upload/test_table_fact_worklist.py`
 
 **Interfaces:**
 - Consumes: the `human_tasks` table (mirror the inline SELECTs at `expiry.py:126`), `get_task_proposal` (`task_read.py`).
@@ -1506,7 +1679,7 @@ git commit -m "feat(overlay): readiness reads grain/availability fact state (mis
 - [ ] **Step 1: Write the failing test**
 
 ```python
-# tests/overlay/upload/test_table_fact_worklist.py
+# tests/featuregen/overlay/upload/test_table_fact_worklist.py
 from featuregen.overlay.upload.table_synth import _propose_table_facts
 from featuregen.overlay.upload.table_fact_projection import list_open_table_fact_proposals
 
@@ -1516,7 +1689,7 @@ def test_open_grain_proposal_appears(overlay_conn, service_actor):
                          {"txn": {"grain": {"columns": ["id"], "is_unique": True},
                                   "availability_time": None,
                                   "table_role": None, "primary_entity": None}},
-                         actor=service_actor)
+                         actor=service_actor, source_snapshot_id="snap-test")
     work = list_open_table_fact_proposals(overlay_conn)
     assert any(w["fact_type"] == "grain" and w["proposed_value"]["columns"] == ["id"]
                for w in work)
@@ -1530,7 +1703,7 @@ def test_confirmed_proposal_drops_off(overlay_conn, human_actor):
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `uv run pytest tests/overlay/upload/test_table_fact_worklist.py -q`
+Run: `uv run pytest tests/featuregen/overlay/upload/test_table_fact_worklist.py -q`
 Expected: FAIL — `ImportError: cannot import name 'list_open_table_fact_proposals'`.
 
 - [ ] **Step 3: Implement the worklist reader**
@@ -1538,14 +1711,25 @@ Expected: FAIL — `ImportError: cannot import name 'list_open_table_fact_propos
 Append to `table_fact_projection.py`:
 
 ```python
+from featuregen.contracts.envelopes import IdentityEnvelope
+
 _TABLE_FACT_TYPES = ("grain", "availability_time")
+
+# The worklist reads platform-admin governance-queue tasks (grain/availability route there because
+# UploadContextAdapter.owner_of -> None). get_task_proposal authorizes on role_claims, so the reader
+# MUST hold platform-admin or every read is denied. Subject-less system reader.
+_WORKLIST_READER = IdentityEnvelope(
+    subject="system:table-fact-worklist", actor_kind="service", authenticated=True,
+    auth_method="internal", role_claims=("platform-admin",))
 
 
 def list_open_table_fact_proposals(conn) -> list[dict]:
-    """Open grain/availability proposals awaiting human confirmation (the review worklist)."""
+    """Open grain/availability proposals awaiting human confirmation — a READ MODEL over the existing
+    human_tasks gate tasks (not a new queue). get_task_proposal returns a TaskProposal TypedDict, so
+    access its fields by KEY, not attribute."""
     from featuregen.overlay.task_read import get_task_proposal
     rows = conn.execute(
-        "SELECT id FROM human_tasks WHERE status = 'open' ORDER BY created_at DESC"
+        "SELECT task_id FROM human_tasks WHERE status = 'open' ORDER BY created_at DESC"
     ).fetchall()
     out: list[dict] = []
     for (task_id,) in rows:
@@ -1553,27 +1737,26 @@ def list_open_table_fact_proposals(conn) -> list[dict]:
             p = get_task_proposal(conn, task_id, _WORKLIST_READER)
         except Exception:   # noqa: BLE001 — a task the reader can't see is simply skipped
             continue
-        if p.fact_type in _TABLE_FACT_TYPES:
-            out.append({"task_id": task_id, "fact_type": p.fact_type,
-                        "object_ref": p.object_ref, "proposed_value": p.proposed_value,
-                        "target_event_id": p.target_event_id,
+        if p["fact_type"] in _TABLE_FACT_TYPES:
+            out.append({"task_id": task_id, "fact_type": p["fact_type"],
+                        "object_ref": p["object_ref"], "proposed_value": p["proposed_value"],
+                        "target_event_id": p["target_event_id"],
                         # origin so a reviewer sees this is an unprofiled LLM proposal, not proof:
-                        "proposed_by": getattr(p, "proposed_by", None),
                         "uniqueness_basis": "llm_proposed_not_profiled"})
     return out
 ```
 
-> **Implementer note:** read `human_tasks` schema + `get_task_proposal` (`task_read.py:17`) for the exact column names (`id`/`status`/`created_at`) and the `TaskProposal` attribute names (`fact_type`/`object_ref`/`proposed_value`/`target_event_id`). `get_task_proposal` authorizes the task's assignee — resolve the correct reader actor/authority (mirror how a governance-queue task is read; a platform-admin reader). If filtering by `fact_type` at the SQL layer is cleaner (a `fact_type` column on `human_tasks` or a join to the fact stream), prefer that over per-row `get_task_proposal` for scale. Keep the return contract identical.
+> **Implementer note:** `human_tasks` PK is **`task_id`** (not `id`) — verify against `0070_identity_authz_gates.sql`. `get_task_proposal` (`task_read.py:17`) returns a **`TaskProposal` TypedDict** (a plain dict) — access `p["fact_type"]`/`p["object_ref"]`/`p["proposed_value"]`/`p["target_event_id"]` by KEY, never attribute. It authorizes on `role_claims`, and grain/availability route to the platform-admin governance queue (owner_of→None), so `_WORKLIST_READER` MUST carry `("platform-admin",)` or every read is denied. Confirm the `IdentityEnvelope` field names (`actor_kind`/`authenticated`/`auth_method`/`role_claims`) against `contracts/envelopes.py`. If a `fact_type` column exists on `human_tasks` (or a cheap join), filter in SQL for scale; keep the return contract identical.
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `uv run pytest tests/overlay/upload/test_table_fact_worklist.py -q`
+Run: `uv run pytest tests/featuregen/overlay/upload/test_table_fact_worklist.py -q`
 Expected: PASS (2 passed).
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/featuregen/overlay/upload/table_fact_projection.py tests/overlay/upload/test_table_fact_worklist.py
+git add src/featuregen/overlay/upload/table_fact_projection.py tests/featuregen/overlay/upload/test_table_fact_worklist.py
 git commit -m "feat(overlay): pending grain/availability proposal worklist reader"
 ```
 
@@ -1584,24 +1767,24 @@ git commit -m "feat(overlay): pending grain/availability proposal worklist reade
 **Why:** Prove the full Pass B loop on a realistic multi-table glossary upload: Pass B proposes a grain, readiness reports it proposed, a human confirms, and re-ingest projects it load-bearing.
 
 **Files:**
-- Test: `tests/overlay/upload/test_phase2_integration.py`
+- Test: `tests/featuregen/overlay/upload/test_phase2_integration.py`
 
 - [ ] **Step 1: Write the integration test**
 
 ```python
-# tests/overlay/upload/test_phase2_integration.py
+# tests/featuregen/overlay/upload/test_phase2_integration.py
 # Uses a fake LLM client that returns a canned table_synth batch. OVERLAY_TABLE_SYNTH=1.
 def test_glossary_upload_proposes_then_confirms_grain(overlay_conn, human_actor, monkeypatch,
                                                       fake_synth_client, glossary_rows):
     monkeypatch.setenv("OVERLAY_TABLE_SYNTH", "1")
     from featuregen.overlay.upload.ingest import ingest_upload
-    from featuregen.overlay.upload.readiness import compute_readiness  # exact name per readiness.py
+    from featuregen.overlay.upload.readiness import compute_readiness, ReadinessScopeType
 
     r1 = ingest_upload(overlay_conn, "src", glossary_rows, actor=human_actor,
                        client=fake_synth_client)
-    assert r1.status == "ok"
+    assert r1.status == "ingested"    # IngestResult.status ∈ {ingested, held, rejected}
     # readiness: grain proposed, not confirmed
-    rd = compute_readiness(overlay_conn, source="src", subset="txn")
+    rd = compute_readiness(overlay_conn, source="src", scope=ReadinessScopeType.TABLE, subset="txn")
     assert any(x.status == "proposed" and "grain" in x.requirement_id
                for x in rd.review_requirements)
 
@@ -1613,7 +1796,7 @@ def test_glossary_upload_proposes_then_confirms_grain(overlay_conn, human_actor,
         "SELECT is_grain FROM graph_node WHERE catalog_source='src' AND table_name='txn' "
         "AND column_name='txn_id' AND kind='column'").fetchone()
     assert row[0] is True
-    rd2 = compute_readiness(overlay_conn, source="src", subset="txn")
+    rd2 = compute_readiness(overlay_conn, source="src", scope=ReadinessScopeType.TABLE, subset="txn")
     assert any(x.status == "confirmed" and "grain" in x.requirement_id
                for x in (rd2.review_requirements + rd2.blocking_requirements)
                ) or all("grain" not in x.requirement_id for x in rd2.blocking_requirements)
@@ -1636,22 +1819,22 @@ def test_declared_structural_grain_beats_pass_b_proposal(overlay_conn, human_act
     assert state.value["columns"] == ["id"]           # Pass B did NOT overwrite it
 ```
 
-> **Implementer note:** author the shared conftest helpers ONCE in `tests/overlay/upload/conftest.py` — they are consumed across Tasks 7/9/10/11/12, so if executing tasks in order, put them in the conftest as part of Task 7 (the first consumer), not Task 12: `_confirm_grain(conn, source, table, columns, *, actor)` (read the open grain gate task, take its `target_event_id`, dispatch `confirm_fact` with the human actor + `value={"columns":columns,"is_unique":True}`); `_reconfirm_grain(...)` (drive a VERIFIED fact to a new VERIFIED value via the expiry/reverify override path — read `confirmation_commands.py:110-123`); `_reject_grain(conn, source, table, *, actor)` (dispatch `reject_fact` against the open task). Also confirm the exact `compute_readiness` entry name/signature and `IngestResult.status` value (`"ok"`), and build `glossary_rows`/`technical_rows` via the existing Phase-1 glossary + technical-CSV fixtures.
+> **Implementer note:** `IngestResult.status` success value is `"ingested"` (∈ {ingested, held, rejected}), never "ok". Build `glossary_rows`/`technical_rows` from the existing Phase-1 glossary + technical-CSV row builders. The shared conftest (below) is authored in **Task 7** (first consumer), not here.
 
 - [ ] **Step 2: Run it**
 
-Run: `uv run pytest tests/overlay/upload/test_phase2_integration.py -q`
+Run: `uv run pytest tests/featuregen/overlay/upload/test_phase2_integration.py -q`
 Expected: PASS.
 
 - [ ] **Step 3: Run the full overlay upload suite**
 
-Run: `uv run pytest tests/overlay/upload/ -q`
+Run: `uv run pytest tests/featuregen/overlay/upload/ -q`
 Expected: PASS (whole slice green; flag-off paths unchanged).
 
 - [ ] **Step 4: Commit**
 
 ```bash
-git add tests/overlay/upload/test_phase2_integration.py tests/overlay/upload/conftest.py
+git add tests/featuregen/overlay/upload/test_phase2_integration.py tests/featuregen/overlay/upload/conftest.py
 git commit -m "test(overlay): Phase 2 end-to-end — propose -> confirm -> project grain"
 ```
 
