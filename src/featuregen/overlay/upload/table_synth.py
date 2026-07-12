@@ -114,7 +114,13 @@ def synthesize_tables(conn, client, items: list[BatchItem], *, columns_by_table,
                       ) -> dict[str, dict]:
     """Run the governed batch synthesis; return {table: synthesis_dict} for VALID results only.
     Validation is done INSIDE run_batched via the ref-aware accept — this function does no
-    post-filtering (an INVALID synthesis never reaches here)."""
+    post-filtering (an INVALID synthesis never reaches here).
+
+    NOTE: the batch-mode config (``OVERLAY_ENRICH_TABLE_SYNTH_MODE`` / ``mode("table_synth")``) is
+    intentionally NOT consulted here. Pass B is BATCH-ONLY: a ref_aware task has no single-call
+    seam (run_batched skips the single fallback for ref_aware), so there is no "single" execution
+    path a mode switch could select. Only the FEATURE switch (``OVERLAY_TABLE_SYNTH``,
+    ``ingest.table_synth_enabled``) gates Pass B."""
     accept = make_ref_accept(columns_by_table)
     resolved = run_batched(
         conn, client, short="table_synth", task="table_synth",
