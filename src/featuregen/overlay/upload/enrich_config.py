@@ -5,8 +5,9 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 
-_DEFAULT_MAX_ITEMS = {"concept": 40, "definition": 12, "domain": 20}
-_DEFAULT_MAX_INPUT_TOKENS = {"concept": 14000, "definition": 8000, "domain": 8000}
+_DEFAULT_MAX_ITEMS = {"concept": 40, "definition": 12, "domain": 20, "table_synth": 8}
+_DEFAULT_MAX_INPUT_TOKENS = {"concept": 14000, "definition": 8000, "domain": 8000,
+                             "table_synth": 6000}
 
 
 def mode(short: str) -> str:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import asdict, dataclass
 from datetime import datetime
 
@@ -58,6 +59,14 @@ from featuregen.projections.runner import projection_lag, run_projection
 from featuregen.runtime.observability import counters
 
 logger = logging.getLogger(__name__)
+
+
+def table_synth_enabled() -> bool:
+    """Feature switch for Pass B / table synthesis (default OFF). Orthogonal to the batch MODE
+    (OVERLAY_ENRICH_TABLE_SYNTH_MODE), which only selects batch-vs-single execution WHEN the feature
+    is on. Feature-off means Pass B never runs; mode=single does NOT mean the feature is off. Task 7
+    gates the ingest call on this; Task 2 owns the definition so it exists before any consumer."""
+    return os.environ.get("OVERLAY_TABLE_SYNTH", "0") == "1"
 
 
 def _drain_projection(conn) -> None:

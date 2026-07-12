@@ -121,6 +121,46 @@ _SCHEMAS: dict[tuple[str, int], dict] = {
                                      "domain": {"type": "string", "maxLength": 64}},
                       "required": ["ref", "domain"]}}},
         "required": ["results"]},
+    # Table-synthesis (Pass B) output schemas. `_batch` is an array of per-item {ref, synthesis}
+    # objects (batch harness treats `synthesis` as one structured out-key); the flat sibling is the
+    # `_single_fallback` shape. `event_time_plus_lag` is intentionally EXCLUDED from as_of_basis:
+    # FACT_VALUE_SCHEMAS mandates a `lag_hours` when basis == event_time_plus_lag (facts.py), and
+    # Pass B has no way to infer a lag, so such a proposal would always be denied by
+    # validate_fact_value. Phase 2 offers only the two lag-free bases; adding event_time_plus_lag
+    # would require a lag_hours field end-to-end (out of scope).
+    ("overlay_table_synth_batch", 1): {
+        "type": "object", "additionalProperties": False,
+        "properties": {"results": {"type": "array", "minItems": 0, "maxItems": 256,
+            "items": {"type": "object", "additionalProperties": False,
+                "properties": {
+                    "ref": {"type": "string", "maxLength": 256},
+                    "synthesis": {"type": "object", "additionalProperties": False,
+                        "properties": {
+                            "grain_columns": {"type": "array", "maxItems": 16,
+                                              "items": {"type": "string", "maxLength": 128}},
+                            "as_of_column": {"type": ["string", "null"], "maxLength": 128},
+                            "as_of_basis": {"type": ["string", "null"],
+                                            "enum": ["posted_at", "ingested_at", None]},
+                            "primary_entity": {"type": ["string", "null"], "maxLength": 128},
+                            "table_role": {"type": ["string", "null"], "maxLength": 64},
+                            "event_or_snapshot": {"type": ["string", "null"],
+                                                  "enum": ["event", "snapshot", None]},
+                        }, "required": ["grain_columns"]}},
+                "required": ["ref", "synthesis"]}}},
+        "required": ["results"]},
+    ("overlay_table_synth", 1): {
+        "type": "object", "additionalProperties": False,
+        "properties": {
+            "grain_columns": {"type": "array", "maxItems": 16,
+                              "items": {"type": "string", "maxLength": 128}},
+            "as_of_column": {"type": ["string", "null"], "maxLength": 128},
+            "as_of_basis": {"type": ["string", "null"],
+                            "enum": ["posted_at", "ingested_at", None]},
+            "primary_entity": {"type": ["string", "null"], "maxLength": 128},
+            "table_role": {"type": ["string", "null"], "maxLength": 64},
+            "event_or_snapshot": {"type": ["string", "null"],
+                                  "enum": ["event", "snapshot", None]},
+        }, "required": ["grain_columns"]},
     # Feature-assist output schemas (M6 — routed through the audited seam). Permissive object shapes:
     # the value is the LLM's proposal that the deterministic layer then grounds/validates.
     ("feature_ideas", 1): {"type": "object", "additionalProperties": True,
