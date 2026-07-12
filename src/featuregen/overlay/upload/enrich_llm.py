@@ -329,7 +329,8 @@ def _item_egress_ok(metadata: dict) -> bool:
 
 def audited_batch_call(conn, client: LLMClient, *, task: str, prompt_id: str, schema_id: str,
                        shared_metadata: dict, items: list[BatchItem], out_key: str, instruction: str,
-                       accept, actor: IdentityEnvelope | None = None) -> BatchCallResult:
+                       accept, actor: IdentityEnvelope | None = None,
+                       extract=None, ref_aware: bool = False) -> BatchCallResult:
     """One GOVERNED batch call (spec C4/C9): per-item egress filter -> batch-level egress guard ->
     schema-validated array call -> one immutable llm_call with a per-item outcome summary. Returns a
     BatchCallResult whose outcomes classify every requested ref (via validate_batch_results)."""
@@ -364,7 +365,8 @@ def audited_batch_call(conn, client: LLMClient, *, task: str, prompt_id: str, sc
     except EgressViolation as exc:
         logger.warning("egress guard blocked batch %s (schema %s); no dispatch", task, schema_id)
         _audit_egress_block(conn, task=task, actor=actor, reason=str(exc))
-        missing = validate_batch_results(included, [], out_key, accept)
+        missing = validate_batch_results(included, [], out_key, accept,
+                                         extract=extract, ref_aware=ref_aware)
         return BatchCallResult(tuple(egress_outcomes) + tuple(missing), 0, 0, 0)
 
     outcome = drive_structured_call(client, req, lambda o: reg.validate(schema_id, 1, o))
@@ -375,7 +377,8 @@ def audited_batch_call(conn, client: LLMClient, *, task: str, prompt_id: str, sc
     # be cached durably and never retried (whole-branch review, BLOCKING).
     results = (outcome.output.get("results", [])
                if outcome.status != STATUS_FAILED and isinstance(outcome.output, dict) else [])
-    item_outcomes = validate_batch_results(included, results, out_key, accept)
+    item_outcomes = validate_batch_results(included, results, out_key, accept,
+                                           extract=extract, ref_aware=ref_aware)
 
     summary = {"requested": [it.ref for it in included],
                "outcomes": {o.ref: o.status for o in item_outcomes}}
