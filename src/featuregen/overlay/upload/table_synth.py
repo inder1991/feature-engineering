@@ -10,11 +10,15 @@ only — no driver, no propose logic (YAGNI).
 from __future__ import annotations
 
 import json
+import logging
 
 from featuregen.overlay.upload.canonical import CanonicalRow
 from featuregen.overlay.upload.enrich import content_hash
 from featuregen.overlay.upload.enrich_batch import BatchItem, run_batched
 from featuregen.overlay.upload.sample_parser import strip_sample_values
+from featuregen.runtime.observability import counters
+
+logger = logging.getLogger(__name__)
 
 
 def _descriptor(r: CanonicalRow, concept: str | None, definition: str | None) -> dict:
@@ -121,3 +125,103 @@ _INSTRUCTION = (
     "the primary business entity; the table role; and whether it is an event or snapshot table. "
     "Only name columns that appear in the provided column list."
 )
+
+
+# The folded fact states in which a Pass B proposal is SKIPPED QUIETLY — a stronger/active claim
+# already governs this key: VERIFIED (a declared/structural or human-confirmed fact — Pass B must
+# never contest it), or a still-pending proposal/partial (DRAFT / PARTIALLY_CONFIRMED — already in
+# the queue; DRAFT is the folded literal for a pending proposal, state.py). All OTHER states
+# (REJECTED / REVERIFY / STALE / empty) are handed to propose_fact, which adjudicates: it duplicate-
+# denies an identical pending fingerprint, sticky-denies a re-proposed rejected fingerprint, and
+# ALLOWS a genuinely new value after a terminal state. We never skip on raw stream existence (that
+# would suppress every future proposal once a stream existed, even after rejection/expiry).
+_SKIP_QUIET_STATES = frozenset({"VERIFIED", "DRAFT", "PARTIALLY_CONFIRMED"})
+
+# The advisory table-level fields Pass B records as LLM field evidence (never governed facts).
+_ADVISORY_TABLE_FIELDS = ("table_role", "primary_entity", "event_or_snapshot")
+
+
+def _active_skip_state(conn, ref, fact_type) -> str | None:
+    from featuregen.overlay.identity import fact_key
+    from featuregen.overlay.state import fold_overlay_state
+    from featuregen.overlay.store import load_fact
+
+    stream = load_fact(conn, fact_key(ref, fact_type))
+    if not stream:
+        return None
+    status = fold_overlay_state(stream).status
+    return status if status in _SKIP_QUIET_STATES else None
+
+
+def _propose_table_facts(conn, source: str, syntheses: dict[str, dict], *, actor,
+                         source_snapshot_id: str) -> None:
+    """Route Pass B grain/availability candidates into governed PROPOSED-only facts and advisory
+    table-field evidence. Fail-soft (never aborts the upload). Skips QUIETLY only when a stronger
+    active claim governs the key (VERIFIED / a pending proposal); otherwise lets propose_fact
+    adjudicate re-proposal after a terminal state, logging any denial as a conflict diagnostic.
+
+    ``actor`` MUST be the service actor (``_ENRICH_ACTOR``) so a human confirmer later satisfies
+    four-eyes. ``source_snapshot_id`` keys producer-scoped staleness for the advisory evidence (a
+    NOT-NULL column)."""
+    # Imported lazily (mirrors _propose_governed_joins): propose_fact resolves the catalog adapter
+    # at import-use time, and the pure assembler/accept tests must import this module without
+    # pulling the command stack (or ingest, which imports table_synth lazily in the Pass B block).
+    from featuregen.contracts.envelopes import Command
+    from featuregen.overlay.catalog import current_catalog_adapter
+    from featuregen.overlay.commands import propose_fact
+    from featuregen.overlay.evidence import AssertionStrength, EvidenceProducer
+    from featuregen.overlay.identity import proposal_fingerprint
+    from featuregen.overlay.upload.enrich_llm import ENRICHMENT_RUN_ID
+    from featuregen.overlay.upload.ingest import _write_producer_field
+    from featuregen.overlay.upload.object_ref import normalize_ref
+    from featuregen.overlay.upload.upload_catalog import table_ref
+
+    try:
+        current_catalog_adapter()
+    except RuntimeError:
+        counters.incr("overlay.table_synth.skipped_no_adapter")
+        logger.warning("OVERLAY_TABLE_SYNTH on but no catalog adapter registered — skipping.")
+        return
+
+    for table, syn in syntheses.items():
+        ref = table_ref(source, table)
+        for fact_type in ("grain", "availability_time"):
+            value = syn.get(fact_type)
+            if value is None:
+                continue
+            skip_state = _active_skip_state(conn, ref, fact_type)
+            if skip_state is not None:
+                # a stronger/active claim governs this key — Pass B does not contest it
+                counters.incr(f"overlay.table_synth.{fact_type}.skipped_{skip_state.lower()}")
+                continue
+            try:
+                # Command needs ALL 6 fields (envelopes.py); mirror _propose_governed_joins exactly.
+                result = propose_fact(conn, Command(
+                    "propose_fact", "overlay_fact", None,
+                    {"ref": ref, "fact_type": fact_type, "proposed_value": value},
+                    actor, proposal_fingerprint(value)))
+                if result.accepted:
+                    counters.incr(f"overlay.table_synth.{fact_type}.proposed")
+                else:
+                    # propose_fact adjudicated a deny (duplicate fingerprint, sticky-rejected, or a
+                    # non-terminal race) — a conflict DIAGNOSTIC, not a silent drop.
+                    counters.incr(f"overlay.table_synth.{fact_type}.denied")
+                    logger.info("table_synth %s proposal denied for %s.%s: %s",
+                                fact_type, source, table, result.denied_reason)
+            except Exception:   # noqa: BLE001 — advisory: a proposal error never fails an upload
+                counters.incr(f"overlay.table_synth.{fact_type}.error")
+                logger.exception("table_synth %s proposal errored for %s.%s",
+                                 fact_type, source, table)
+        # Advisory table fields -> field evidence via the SAME helper Pass A uses
+        # (_write_producer_field: producer-scoped staleness + snapshot reuse + the required
+        # source_snapshot_id/input_hash args a bare record_field_evidence would miss).
+        # RECOMMENDATION-ceilinged in Task 8. A write error here is contained by the caller's
+        # Pass B savepoint+except (ingest wiring).
+        logical_ref = normalize_ref(source, None, table)
+        for field_name in _ADVISORY_TABLE_FIELDS:
+            v = syn.get(field_name)
+            if v:
+                _write_producer_field(
+                    conn, logical_ref=logical_ref, field_name=field_name, value=v,
+                    producer=EvidenceProducer.LLM, strength=AssertionStrength.PROPOSED,
+                    producer_ref=ENRICHMENT_RUN_ID, snapshot_id=source_snapshot_id, material=v)
