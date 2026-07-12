@@ -70,3 +70,52 @@ def test_normalize_no_global_relationship_is_local():
         from_object_grain="account", to_object_grain="account",
         declared=Cardinality.ONE_TO_ONE, global_rel=None)
     assert out is None      # unmapped grain pair -> caller records a catalog_local_relationship + proposal
+
+
+from featuregen.overlay.upload.canonical import CanonicalRow
+from featuregen.overlay.upload.catalog_realizations import (
+    key_entity,
+    object_grain,
+    table_of,
+)
+from featuregen.overlay.upload.enrich import content_hash
+from featuregen.overlay.upload.graph import build_graph
+
+
+def _accounts_customer_catalog(conn) -> None:
+    # accounts: grain = account (account_id is_grain), plus a customer_id FK column; customer_master:
+    # grain = customer. A join accounts.customer_id -> customer_master.customer_id (N:1).
+    catalog = [
+        (CanonicalRow("core", "accounts", "account_id", "integer", is_grain=True), "account_id"),
+        (CanonicalRow("core", "accounts", "customer_id", "integer",
+                      joins_to="customer_master.customer_id", cardinality="N:1"), "customer_id"),
+        (CanonicalRow("core", "customer_master", "customer_id", "integer", is_grain=True), "customer_id"),
+        (CanonicalRow("core", "customer_master", "segment", "text"), "categorical"),
+    ]
+    rows = [r for r, _ in catalog]
+    concepts = {content_hash(r): c for r, c in catalog}
+    build_graph(conn, "core", rows, concepts=concepts)
+
+
+def test_table_of_strips_column():
+    assert table_of("public.accounts.customer_id") == "public.accounts"
+
+
+def test_object_grain_is_the_grain_column_entity(db):
+    _accounts_customer_catalog(db)
+    # accounts' grain column is account_id -> entity account; customer_master's is customer_id -> customer
+    assert object_grain(db, "core", "public.accounts") == "account"
+    assert object_grain(db, "core", "public.customer_master") == "customer"
+
+
+def test_key_entity_is_the_join_column_concept_entity(db):
+    _accounts_customer_catalog(db)
+    # the join key column accounts.customer_id has concept customer_id -> entity customer (NOT account)
+    assert key_entity(db, "core", "public.accounts.customer_id") == "customer"
+
+
+def test_object_grain_none_when_no_grain_column(db):
+    from featuregen.overlay.upload.canonical import CanonicalRow as CR
+    rows = [CR("x", "t", "c", "text")]
+    build_graph(db, "x", rows, concepts={content_hash(rows[0]): "categorical"})
+    assert object_grain(db, "x", "public.t") is None

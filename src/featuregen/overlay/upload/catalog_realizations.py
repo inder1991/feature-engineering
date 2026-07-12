@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from featuregen.overlay.upload.concepts import concept
 from featuregen.overlay.upload.taxonomy.entity_relationships import (
     Cardinality,
     EntityRelationshipDefinitionV1,
@@ -69,3 +70,39 @@ def normalize_realization(
     return NormalizedRealization(
         relationship_id=global_rel.relationship_id, declared_cardinality=oriented,
         conflict=oriented is not global_rel.cardinality, reversed_authoring=reversed_)
+
+
+_SCHEMA = "public"
+
+
+def table_of(column_object_ref: str) -> str:
+    """The table object_ref of a column object_ref: ``public.accounts.customer_id`` -> ``public.accounts``."""
+    return column_object_ref.rsplit(".", 1)[0]
+
+
+def _entity_of_concept(concept_name: str | None) -> str | None:
+    if not concept_name:
+        return None
+    c = concept(concept_name)
+    return c.entity_link if c is not None else None
+
+
+def object_grain(conn, catalog_source: str, table_object_ref: str) -> str | None:
+    """The OBJECT GRAIN of a table: the ``entity_link`` of the concept of the table's ``is_grain`` column.
+    ``None`` when the table has no grain column or its grain concept links no entity. This is the table's
+    grain — NOT a join-key column's entity."""
+    row = conn.execute(
+        "SELECT concept FROM graph_node WHERE catalog_source = %s AND kind = 'column' "
+        "AND table_name = %s AND is_grain = true "
+        "AND object_ref LIKE %s ORDER BY object_ref LIMIT 1",
+        (catalog_source, table_object_ref.rsplit(".", 1)[-1], table_object_ref + ".%")).fetchone()
+    return _entity_of_concept(row[0]) if row is not None else None
+
+
+def key_entity(conn, catalog_source: str, column_object_ref: str) -> str | None:
+    """The join-KEY entity of a column: its concept's ``entity_link`` (governed). ``None`` when the
+    column has no concept or its concept links no entity."""
+    row = conn.execute(
+        "SELECT concept FROM graph_node WHERE catalog_source = %s AND object_ref = %s AND kind = 'column'",
+        (catalog_source, column_object_ref)).fetchone()
+    return _entity_of_concept(row[0]) if row is not None else None
