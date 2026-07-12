@@ -149,3 +149,80 @@ def _reconfirm_grain(conn, source, table, columns, *, actor):
     assert res.accepted, res.denied_reason
     _drain(conn)
     return res
+
+
+# ── Task 12 fixtures: the whole-phase integration inputs (glossary + technical uploads and the
+# fake LLM client that serves EVERY task ingest_upload can dispatch when a client is passed). ──
+
+# A Phase-1-shaped FTR glossary whose txn table carries a REAL txn_id column — the column the canned
+# Pass B synthesis proposes as the grain (make_ref_accept rejects a grain column the table lacks).
+_GLOSSARY_CSV = (
+    "physical_name,business_term,description_business_definition,data_domain,bian_path,fibo_path\n"
+    "public.txn.txn_id,Transaction ID,Unique identifier assigned to each posted transaction.,"
+    "Payments,Payment/Transaction,fibo-fbc:TransactionIdentifier\n"
+    "public.txn.amt,Transaction Amount,The monetary amount of the posted transaction.,"
+    "Payments,Payment/Transaction,fibo-fbc:MonetaryAmount\n")
+
+
+@pytest.fixture
+def glossary_rows():
+    """The glossary upload for the Phase-2 integration test, built by the REAL Phase-1 reader
+    (``read_glossary``). Returns the ``GlossaryUpload``: pass ``.rows`` as the ingest rows AND the
+    object itself as ``glossary=`` — a glossary's ``type=unknown`` rows only pass validation under
+    the glossary profile, which ``ingest_upload`` selects from the sidecar."""
+    from featuregen.overlay.upload.glossary_reader import read_glossary
+    return read_glossary(_GLOSSARY_CSV, source="src")
+
+
+@pytest.fixture
+def technical_rows():
+    """A TECHNICAL upload declaring ``is_grain`` on ``id`` — a legitimate SOURCE attestation (§16)
+    that ``_assert_fact`` auto-confirms VERIFIED at ingest. It ALSO carries a ``txn_id`` column so
+    the canned Pass B synthesis (grain=["txn_id"]) is a REAL-but-DIFFERENT column: it passes
+    ``make_ref_accept`` and reaches ``_propose_table_facts``, where the VERIFIED fact must win."""
+    from featuregen.overlay.upload.canonical import CanonicalRow
+    return [CanonicalRow("src", "txn", "id", "integer", is_grain=True),
+            CanonicalRow("src", "txn", "txn_id", "varchar"),
+            CanonicalRow("src", "txn", "amt", "numeric")]
+
+
+@pytest.fixture
+def fake_synth_client(glossary_rows, technical_rows):
+    """A FakeLLM that answers EVERY task ``ingest_upload`` dispatches with a client: the Pass A
+    stages (concept / definition / domain) in BOTH execution modes, and the Pass B ``table_synth``
+    batch. Pass A must get schema-valid responses or its savepointed stages log+skip (fail-soft) —
+    the integration must exercise the REAL loop, not the degraded one.
+
+    * Constructor task-key entries serve the BATCH shapes (``{"results": [{"ref", <out_key>}]}``,
+      refs = the rows' content hashes / table names) — matched when a ``*_MODE=batch`` env selects
+      the batch seam. Extra refs are classified EXTRA and ignored, so one script covers both
+      fixtures' row sets.
+    * Finer ``.script(task, prompt_id)`` entries serve the SINGLE (default-mode) flat shapes — the
+      FakeLLM resolves these BEFORE the task-key fallback, so each mode sees its own valid shape.
+
+    The Pass B synthesis proposes grain=["txn_id"] and ABSTAINS on as-of (an as_of column absent
+    from the table would invalidate the WHOLE synthesis in make_ref_accept, silently dropping the
+    grain proposal too)."""
+    from featuregen.intake.llm import FakeLLM, FakeResponse
+    from featuregen.overlay.upload.enrich import content_hash
+
+    hashes = [content_hash(r) for r in [*glossary_rows.rows, *technical_rows]]
+    synthesis = {"grain_columns": ["txn_id"], "as_of_column": None, "as_of_basis": None,
+                 "table_role": "fact", "primary_entity": "transaction",
+                 "event_or_snapshot": "event"}
+    client = FakeLLM(script={
+        "table_synth": FakeResponse(output={"results": [{"ref": "txn", "synthesis": synthesis}]}),
+        "overlay.enrich.concept": FakeResponse(output={"results": [
+            {"ref": h, "concept": "monetary_stock"} for h in hashes]}),
+        "overlay.enrich.definition": FakeResponse(output={"results": [
+            {"ref": h, "definition": "A one-line business definition."} for h in hashes]}),
+        "overlay.enrich.domain": FakeResponse(output={"results": [
+            {"ref": "txn", "domain": "payments"}]}),
+    })
+    client.script(task="overlay.enrich.concept", prompt_id="overlay_concept_v1",
+                  responses=[FakeResponse(output={"concept": "monetary_stock"})])
+    client.script(task="overlay.enrich.definition", prompt_id="overlay_definition_v1",
+                  responses=[FakeResponse(output={"definition": "A one-line business definition."})])
+    client.script(task="overlay.enrich.domain", prompt_id="overlay_domain_v1",
+                  responses=[FakeResponse(output={"domain": "payments"})])
+    return client
