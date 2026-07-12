@@ -1,10 +1,11 @@
-# Evidence-Authority Ingestion — Design Spec (v4)
+# Evidence-Authority Ingestion — Design Spec (v5)
 
-Date: 2026-07-11. Status: DESIGNED — architecture APPROVED. v3 tightened the contracts; **v4 adds §0, the
-reuse map** — a code-grounded reconciliation showing that ~60% of the "Phase 0 kernel" ALREADY EXISTS as
-the overlay event-sourced fact substrate, so Phase 0 is an **extension**, not a greenfield build.
-Supersedes the scope of `2026-07-11-batched-enrichment.md` (merged to main `6345296`) — that batching work
-is **Pass A transport**.
+Date: 2026-07-11. Status: DESIGNED — architecture APPROVED. v3 tightened the contracts; v4 added the §0
+reuse map (Phase 0 is an extension, not greenfield); **v5 adds §U — this IS the unified file-ingestion
+pattern**: every file upload (technical CSV, glossary CSV, Excel) flows through this one evidence→authority
+flow as a *source profile*; the only other pattern is the OpenMetadata connector. The existing technical
+upload pipeline is **reused as the shared spine**, not frozen as a parallel path. Supersedes the scope of
+`2026-07-11-batched-enrichment.md` (merged to main `6345296`) — that batching work is **Pass A transport**.
 
 ## The one-sentence architecture (unchanged, affirmed twice)
 
@@ -35,6 +36,60 @@ Permanent invariants: **provenance ≠ authority; confidence ≠ permission.**
 14. Human confirmations carry **scope + expiry + revalidation** (§11).
 15. Pass B outputs have an explicit **destination mapping** (§15.2).
 16. The field matrix uses three influence tiers — **DISPLAY / RECOMMENDATION / OPERATIONAL** (§4.2, §16).
+
+---
+
+## U. Unified ingestion — this IS the file-ingestion pattern [v5]
+
+The platform has exactly **two ingestion patterns**: (1) **file ingestion** — CSV / Excel / glossary,
+all through this one evidence→authority→resolution→graph flow; (2) the **OpenMetadata connector** — a
+structural source that is a *producer into* the same flow. There is no third, legacy path: the existing
+technical-CSV pipeline is **reused as the shared spine**, and the technical CSV is just one **source
+profile** within the unified flow — not a frozen parallel branch.
+
+### U.1 One flow, many source profiles
+Every upload reduces to `(rows, SourceCapabilityProfile)` (§3.3). The profile — not the code path — is
+what differs:
+- **Technical CSV** — attests structure + facts: `type/grain/joins_to/sensitivity/additivity` enter as
+  `source/attested` (high strength, fast to load-bearing). *Structure-vouched.*
+- **Glossary CSV** — attests semantics, proposes structure: `definition/BIAN/FIBO` attested;
+  `domain/type-hint/sensitivity` proposed. *Semantics-vouched, structure-incomplete.*
+- **OpenMetadata** — a `structural_connector` profile: `type/joins` attested from the real catalog.
+
+The FTR glossary and a technical CSV are therefore the **same kind of thing** — sources with different
+capability profiles — resolved by the same field-authority policies into the same `graph_node`.
+
+### U.2 Reuse map for the existing upload pipeline (the shared spine)
+| Existing component | Role in the unified pattern |
+|---|---|
+| `read_csv_rows`/`read_excel_rows`/`_headers.py` | the technical/Excel readers — each tagged with a profile |
+| `CanonicalRow` | the common funnel shape (already true for CSV/Excel/OM) |
+| `validate_rows` | reused, made **profile-aware**: a field is required only when the profile attests it (technical → `type` required; glossary → `type="unknown"` is a readiness gap, not a quarantine) |
+| the fact/event substrate (`append_overlay_event`, `OVERLAY_FACT_*`, `resolve_fact`, `propose_fact`/`confirm_fact`, `approved_join`, expiry) | reused — **declared** facts and **inferred** facts both become evidence/proposals here (§U.3) |
+| `build_graph` (`graph_node`/`graph_edge`) | reused as the projection of **resolved** values from any source |
+| quarantine / Review Queue | reused — conflicts + revalidation become review items |
+| Pass A batching, Phase 0 kernel, OM connector | reused as-is |
+
+Net-new is only what it always was: `field_evidence`, the producers (parser, taxonomy, glossary reader),
+the field-policy registry + resolve-and-project, the source profiles, readiness.
+
+### U.3 The declared-fact reconciliation (reuse, don't fork)
+Today the technical path has a shortcut: a **declared** fact is written straight as a CONFIRMED overlay
+fact. Under the unified model a declared fact is `source/attested` evidence that **resolves per policy**.
+Reconcile by reuse: route declared facts through the **same** `propose_fact`/resolution plumbing (not a
+parallel write), and make "auto-confirm on declare" a **profile policy**, not a hardcoded shortcut. A
+trusted technical upload can still fast-path (its profile grants attested strength + an auto-confirm
+policy for declared structure) — preserving today's behaviour — while flowing through the *same*
+evidence/authority machinery, so it is uniform and auditable next to glossary/LLM evidence. Interpretation:
+**the current technical-CSV path already IS an evidence-authority pattern with an implicit
+all-source-attested-auto-confirmed profile**; making that profile explicit is what unifies the two.
+
+### U.4 Sequencing note
+This is a **framing + reuse** change, not new kernel scope. Phase 1 stands up the unified entry (profiles
++ profile-aware validation) and proves the glossary vertical through it; the technical CSV runs the same
+entry with its profile (its existing fact-assertion + `build_graph` reused **unchanged**). Fully routing
+declared facts as source-attested evidence (§U.3) is an explicit, staged convergence — not a big-bang —
+so the working technical path is never destabilized.
 
 ---
 

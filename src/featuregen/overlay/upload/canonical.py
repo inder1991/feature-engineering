@@ -1,11 +1,22 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 from featuregen.overlay.upload.read_scope import SENSITIVITY_ROLES
 
+if TYPE_CHECKING:
+    from featuregen.overlay.upload.source_profile import SourceCapabilityProfile
+
 _REQUIRED = ("source", "table", "column", "type")
+_REQUIRED_NO_TYPE = ("source", "table", "column")   # `type` dropped for a profile that doesn't attest it
 _VALID_SENSITIVITY = frozenset({"", *SENSITIVITY_ROLES})   # "" (none) + the recognized tags
+
+# The glossary sentinel for a physical type the source declares but does NOT attest (spec §U). A
+# glossary carries meaning, not structure, so its rows are emitted with `type=UNKNOWN_TYPE` — never
+# `""` (which quarantines). Under a type-attesting profile (technical, or the no-profile default) this
+# sentinel is treated as a missing type; under a glossary profile it passes (a readiness gap, Task 9).
+UNKNOWN_TYPE = "unknown"
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,14 +60,28 @@ def _material(r: CanonicalRow) -> tuple:
 
 
 def validate_rows(rows: list[CanonicalRow],
-                  catalog_source: str | None = None) -> ValidationResult:
+                  catalog_source: str | None = None,
+                  *, profile: SourceCapabilityProfile | None = None) -> ValidationResult:
     """Validate rows for one upload. When `catalog_source` is given (the upload's source), any row
     declaring a DIFFERENT source is quarantined — the upload is single-source (T3), and downstream
-    (facts, graph) key object identity on this one source, so a foreign-source row would collide."""
+    (facts, graph) key object identity on this one source, so a foreign-source row would collide.
+
+    `profile` (spec §U) makes the ONE validator profile-aware — it is NOT a second, forked validator.
+    A physical `type` is required only when the profile ATTESTS it: a technical CSV (or the default
+    `profile=None` = today's behaviour) requires a NON-EMPTY type; a glossary profile does not attest
+    `type`, so an absent/`unknown` type passes as a readiness gap (Task 9), never a quarantine. The
+    `UNKNOWN_TYPE` sentinel is interpreted as "no type attested" ONLY under a glossary profile; under a
+    type-attesting profile or `profile=None`, a literal `"unknown"` is just a present type value
+    (MINOR-6 technical-path parity). EVERY other check — identity present, source-mismatch, sensitivity
+    validity, dedup/conflict — is identical across profiles."""
     if not rows:
         return ValidationResult(structural_error="empty upload: no rows")
     if all(not r.source for r in rows):
         return ValidationResult(structural_error="no row has a source")
+
+    # `type` is a hard requirement unless the profile explicitly does not attest it (a glossary).
+    type_required = profile is None or profile.attests("type")
+    required = _REQUIRED if type_required else _REQUIRED_NO_TYPE
 
     good: list[CanonicalRow] = []
     quarantined: list[RowError] = []
@@ -64,7 +89,12 @@ def validate_rows(rows: list[CanonicalRow],
     conflicted: set[tuple[str, str, str]] = set()
 
     for i, r in enumerate(rows):
-        missing = [f for f in _REQUIRED if not getattr(r, f)]
+        # A physical `type` is missing when the profile requires it AND the cell is empty. The
+        # `UNKNOWN_TYPE` sentinel is meaningful ONLY under a non-type-attesting (glossary) profile —
+        # where `type` is not required at all and the sentinel passes as a readiness gap. Under a
+        # type-attesting profile (technical) OR the default `profile=None`, a literal `"unknown"` is a
+        # PRESENT type value like any other (MINOR-6: do not quarantine it — pre-branch behaviour).
+        missing = [f for f in required if not getattr(r, f)]
         if missing:
             quarantined.append(RowError(i, f"missing required field(s): {', '.join(missing)}", r))
             continue

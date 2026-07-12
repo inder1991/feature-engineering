@@ -4,15 +4,33 @@ import logging
 from dataclasses import asdict, dataclass
 from datetime import datetime
 
+from featuregen.aggregates.ids import mint_id
 from featuregen.overlay import facts
 from featuregen.overlay.catalog_changes import detect_catalog_changes
+from featuregen.overlay.conflict_review import conflict_fingerprint, open_or_reopen_conflict
+from featuregen.overlay.evidence import AssertionStrength, EvidenceProducer
+from featuregen.overlay.field_evidence import (
+    field_input_hash,
+    read_active_field_evidence,
+    record_field_evidence,
+    stale_source_evidence,
+)
 from featuregen.overlay.identity import fact_key, proposal_fingerprint
+from featuregen.overlay.object_identity import ObjectBinding, may_attach
 from featuregen.overlay.projection import OverlayProjection
 from featuregen.overlay.state import fold_overlay_state
 from featuregen.overlay.store import append_overlay_event, load_fact
 from featuregen.overlay.upload.brake import large_change_brake
 from featuregen.overlay.upload.canonical import CanonicalRow, validate_rows
-from featuregen.overlay.upload.enrich import classify_domains, draft_definitions, enrich_concepts
+from featuregen.overlay.upload.enrich import (
+    classify_domains,
+    content_hash,
+    draft_definitions,
+    enrich_concepts,
+)
+from featuregen.overlay.upload.field_resolution import FIELD_POLICY_VERSION, resolve_and_project
+from featuregen.overlay.upload.field_revalidation import flag_pending_revalidation
+from featuregen.overlay.upload.glossary_reader import GlossaryRecord, GlossaryUpload
 from featuregen.overlay.upload.graph import (
     add_column_row,
     build_graph,
@@ -20,8 +38,18 @@ from featuregen.overlay.upload.graph import (
     governed_joins_enabled,
     parse_join_ref,
 )
+from featuregen.overlay.upload.object_ref import normalize_ref, parse_ref
+from featuregen.overlay.upload.readiness import ReadinessScopeType, compute_readiness
 from featuregen.overlay.upload.review_queue import persist_quarantine
+from featuregen.overlay.upload.sample_parser import parse_sample_profile
+from featuregen.overlay.upload.source_profile import (
+    FTR_GLOSSARY_PROFILE,
+    SourceCapabilityProfile,
+    strength_for,
+)
+from featuregen.overlay.upload.taxonomy_evidence import derive_concept_evidence
 from featuregen.overlay.upload.upload_catalog import UploadCatalog, table_ref
+from featuregen.overlay.upload.upload_identity import MetadataConflict, classify_upload
 from featuregen.projections.runner import projection_lag, run_projection
 from featuregen.runtime.observability import counters
 
@@ -151,9 +179,350 @@ def _propose_governed_joins(conn, rows: list[CanonicalRow], *, actor) -> None:
                         result.denied_reason)
 
 
+# ── Glossary ingest wiring (spec §6.3 / §U). GUARDED: only runs for a glossary upload (a `glossary`
+# sidecar is passed in); a non-glossary upload takes none of this and is byte-for-byte unchanged. ──
+
+# The severity a glossary metadata disagreement (review #12 MetadataConflict) opens a conflict at.
+_GLOSSARY_CONFLICT_SEVERITY = "metadata_conflict"
+
+# The SOURCE fields whose change on a re-upload is MATERIAL enough to invalidate a prior human
+# confirmation (spec §6.3). A glossary attests no physical type, so `definition` is its material axis.
+_MATERIAL_FIELDS = frozenset({"definition"})
+
+# The full set of fields each producer can assert for a glossary column. On a re-upload we reconcile
+# these against the fields the NEW upload actually provides: a field the new upload NO LONGER asserts
+# (present->absent) must have its prior ACTIVE rows STALED, else a dropped value stays load-bearing
+# (Task-10 Important-3). Kept in sync with `_write_glossary_source_evidence` / `_parser_evidence`.
+_SOURCE_FIELDS: tuple[str, ...] = ("definition", "domain", "business_term", "bian_path", "fibo_path")
+_PARSER_FIELDS: tuple[str, ...] = ("logical_representation", "semantic_type")
+# The full set of behavioural fields TAXONOMY can DERIVE from a concept (see `derive_concept_evidence`).
+# `additivity` is conditional (skipped for an `n/a` concept), so a reclassification to a non-additive
+# concept emits no additivity — its prior ACTIVE row must be reconciled present->absent (Important-3).
+_TAXONOMY_FIELDS: tuple[str, ...] = (
+    "additivity", "temporal_role", "sensitivity_floor", "leakage_anchor")
+
+# A `keep_input_hash` that can never equal a real per-field input hash (always a 64-char sha256 hex
+# digest — this contains non-hex chars), so `stale_source_evidence(..., keep_input_hash=_STALE_ALL)`
+# stales EVERY active row for the given producer+field — used to retire a field the new upload dropped
+# entirely (absent->stale). Plain ASCII (PostgreSQL text rejects NUL bytes in a bound parameter).
+_STALE_ALL = "__field_absent_from_upload__"
+
+
+def _lc(value: str) -> str:
+    """Strip + lower-case a ref component (matches object_ref._norm) so a public-scoped CanonicalRow's
+    (table, column) matches a schema-preserving logical_ref's already-normalized components."""
+    return value.strip().lower()
+
+
+def _schema_preserving_ref_map(glossary: GlossaryUpload) -> dict[str, str]:
+    """Map each column record's PUBLIC-FLATTENED ref (the key ``classify_upload`` emits conflicts under,
+    via ``normalize_ref(source, None, table, column)``) to its SCHEMA-PRESERVING ``rec.logical_ref``
+    (the key evidence/decisions use). Lets ``_open_glossary_conflicts`` open a conflict under the SAME
+    identity the object's evidence uses instead of the schema-forced-public row key (Task-10 Minor-5)."""
+    out: dict[str, str] = {}
+    for rec in glossary.records:
+        if rec.is_table:
+            continue
+        try:
+            rec_source, _schema, table, column = parse_ref(rec.logical_ref)
+        except ValueError:
+            continue
+        if column is None:
+            continue
+        out[normalize_ref(rec_source, None, table, column)] = rec.logical_ref
+    return out
+
+
+def _open_glossary_conflicts(
+    conn, conflicts: list[MetadataConflict], *, ref_map: dict[str, str], now: datetime | None
+) -> None:
+    """Open (or reopen) one ``conflict_review`` item per metadata disagreement (review #12). Fail-soft
+    + savepointed: a conflict-open failure logs and is contained, never aborting the upload.
+
+    ``ref_map`` reconciles each conflict's public-flattened ``logical_ref`` to the schema-preserving one
+    the same object's evidence/decisions key on (Task-10 Minor-5), so the conflict and its evidence
+    never diverge on identity. A ref with no sidecar record falls back to the row key unchanged."""
+    for c in conflicts:
+        logical_ref = ref_map.get(c.logical_ref, c.logical_ref)
+        try:
+            with conn.transaction():
+                fingerprint = conflict_fingerprint(
+                    logical_ref, c.field, c.competing_value_hashes, FIELD_POLICY_VERSION
+                )
+                open_or_reopen_conflict(
+                    conn, fingerprint=fingerprint, logical_ref=logical_ref, field_name=c.field,
+                    severity=_GLOSSARY_CONFLICT_SEVERITY, competing_evidence_ids=(),
+                    competing_value_hashes=c.competing_value_hashes, now=now,
+                )
+        except Exception:  # noqa: BLE001 — advisory: a conflict-open failure never aborts the upload
+            logger.warning("advisory conflict-review open failed for %s.%s",
+                           logical_ref, c.field, exc_info=True)
+
+
+def _write_producer_field(conn, *, logical_ref: str, field_name: str, value: object,
+                          producer: EvidenceProducer, strength: AssertionStrength,
+                          producer_ref: str, snapshot_id: str, material: object) -> int:
+    """Write ONE per-field proposal with PRODUCER-SCOPED staleness + snapshot reuse (spec §5.1, review
+    must-fix #7). Returns the number of the producer's prior ACTIVE rows this staled (a differing input
+    superseded). NEVER touches other producers' rows — in particular a source/parser/taxonomy write can
+    never stale HUMAN evidence.
+
+    * stale the producer's own ACTIVE rows for the field whose ``input_hash`` differs from this upload's
+      (a CHANGED input supersedes -> STALE);
+    * an UNCHANGED input (an ACTIVE row with the same ``input_hash`` already exists) is REUSED — not
+      re-written — even though ``source_snapshot_id`` advanced."""
+    input_hash = field_input_hash(logical_ref=logical_ref, field_name=field_name, material=material)
+    staled = stale_source_evidence(
+        conn, logical_ref=logical_ref, field_name=field_name,
+        producer=producer, keep_input_hash=input_hash,
+    )
+    reused = any(
+        e.producer == EvidenceProducer(producer).value and e.input_hash == input_hash
+        for e in read_active_field_evidence(conn, logical_ref, field_name)
+    )
+    if not reused:
+        record_field_evidence(
+            conn, logical_ref=logical_ref, field_name=field_name, proposed_value=value,
+            producer=producer, strength=strength, producer_ref=producer_ref,
+            source_snapshot_id=snapshot_id, input_hash=input_hash,
+        )
+    return staled
+
+
+def _stale_absent_fields(
+    conn, *, logical_ref: str, producer: EvidenceProducer, all_fields: tuple[str, ...],
+    present: set[str],
+) -> set[str]:
+    """Stale a producer's prior ACTIVE rows for every field the NEW upload NO LONGER asserts
+    (``all_fields - present``) — a present->absent field must not leave a load-bearing value behind
+    (Task-10 Important-3). PRODUCER-SCOPED (never touches human/taxonomy evidence). Returns the set of
+    fields that actually had ≥1 row staled (so the caller can treat a dropped MATERIAL field as a change)."""
+    staled_fields: set[str] = set()
+    for field_name in all_fields:
+        if field_name in present:
+            continue
+        n = stale_source_evidence(
+            conn, logical_ref=logical_ref, field_name=field_name,
+            producer=producer, keep_input_hash=_STALE_ALL,
+        )
+        if n > 0:
+            staled_fields.add(field_name)
+    return staled_fields
+
+
+def _write_glossary_source_evidence(
+    conn, *, logical_ref: str, rec: GlossaryRecord, snapshot_id: str
+) -> bool:
+    """Write SOURCE evidence for a glossary column at the profile's per-field strength (definition +
+    bian/fibo/term ATTESTED, domain PROPOSED). Returns whether the column's MATERIAL changed vs the
+    prior upload — a material field whose prior source proposal was staled EITHER because its value
+    changed (present->present) OR because the new upload dropped it entirely (present->absent)."""
+    material_changed = False
+    present: set[str] = set()
+    for field_name, value in (("definition", rec.definition), ("domain", rec.domain),
+                              ("business_term", rec.term_name), ("bian_path", rec.bian_path),
+                              ("fibo_path", rec.fibo_path)):
+        if not value:
+            continue
+        present.add(field_name)
+        staled = _write_producer_field(
+            conn, logical_ref=logical_ref, field_name=field_name, value=value,
+            producer=EvidenceProducer.SOURCE,
+            strength=strength_for(FTR_GLOSSARY_PROFILE, field_name),
+            producer_ref=snapshot_id, snapshot_id=snapshot_id, material=value,
+        )
+        if field_name in _MATERIAL_FIELDS and staled > 0:
+            material_changed = True
+    # Reconcile absent fields: a field the prior upload asserted but this one dropped is staled here;
+    # a MATERIAL field going present->absent is itself a material change (clearing a definition must
+    # flag a prior human confirmation pending-revalidation, not silently keep it load-bearing).
+    dropped = _stale_absent_fields(
+        conn, logical_ref=logical_ref, producer=EvidenceProducer.SOURCE,
+        all_fields=_SOURCE_FIELDS, present=present,
+    )
+    if dropped & _MATERIAL_FIELDS:
+        material_changed = True
+    return material_changed
+
+
+def _write_glossary_parser_evidence(
+    conn, *, logical_ref: str, description: str, snapshot_id: str
+) -> None:
+    """Write PARSER evidence (logical_representation / semantic_type @ parser:supported) from the
+    deterministic sample-value parser. No profile in the description -> a diagnostic, then continue
+    (failure class: parser no-profile is a gap, never a failure)."""
+    parsed = parse_sample_profile(description or "")
+    present: set[str] = set()
+    for field_name, value in (("logical_representation", parsed.logical_representation),
+                              ("semantic_type", parsed.semantic_type)):
+        if value is None:
+            continue
+        present.add(field_name)
+        _write_producer_field(
+            conn, logical_ref=logical_ref, field_name=field_name, value=value,
+            producer=EvidenceProducer.PARSER, strength=AssertionStrength.SUPPORTED,
+            producer_ref=snapshot_id, snapshot_id=snapshot_id, material=description or "",
+        )
+    # Reconcile absent parser fields: an edited description that drops its sample-profile phrase leaves
+    # the prior logical_representation/semantic_type ACTIVE + load-bearing unless we stale it here.
+    _stale_absent_fields(
+        conn, logical_ref=logical_ref, producer=EvidenceProducer.PARSER,
+        all_fields=_PARSER_FIELDS, present=present,
+    )
+    if not present and parsed.diagnostic:
+        logger.info("glossary parser found no profile for %s: %s", logical_ref, parsed.diagnostic)
+
+
+def _write_glossary_taxonomy_evidence(
+    conn, *, logical_ref: str, row: CanonicalRow, concepts: dict[str, str], snapshot_id: str
+) -> None:
+    """Write TAXONOMY-derived behavioural evidence for a column whose concept was classified this run
+    (§3.2 strength propagation: derived at PROPOSED from the llm/proposed concept). An unknown /
+    unclassified concept derives nothing.
+
+    Present->absent reconciliation (Important-3): after writing the derived triples, stale the
+    TAXONOMY producer's prior ACTIVE rows for every derivable field this run did NOT emit — a re-upload
+    reclassifying an additive concept to a non-additive one emits no ``additivity``, so the prior
+    ``additivity='additive'`` row must be STALED, else ``resolve_and_project`` re-projects the wrong
+    aggregation semantics. Mirrors the SOURCE/PARSER reconciliation; PRODUCER-SCOPED (taxonomy only)."""
+    concept = concepts.get(content_hash(row))
+    present: set[str] = set()
+    if concept:
+        for field_name, value, strength in derive_concept_evidence(
+                concept, AssertionStrength.PROPOSED):
+            present.add(field_name)
+            _write_producer_field(
+                conn, logical_ref=logical_ref, field_name=field_name, value=value,
+                producer=EvidenceProducer.TAXONOMY, strength=strength,
+                producer_ref=snapshot_id, snapshot_id=snapshot_id, material=concept,
+            )
+    _stale_absent_fields(
+        conn, logical_ref=logical_ref, producer=EvidenceProducer.TAXONOMY,
+        all_fields=_TAXONOMY_FIELDS, present=present,
+    )
+
+
+def _flag_human_confirmed_revalidation(conn, *, logical_ref: str, snapshot_id: str,
+                                       now: datetime | None) -> None:
+    """When a column's MATERIAL changed, flag every field carrying HUMAN-confirmed evidence PENDING
+    revalidation (spec §6.3). The human evidence is NOT staled — the flag blocks its load-bearing
+    effect (via active_disqualifiers_for) until a human re-confirms."""
+    rows = conn.execute(
+        "SELECT DISTINCT field_name FROM field_evidence "
+        "WHERE logical_ref = %s AND producer = 'human' AND strength = 'confirmed' "
+        "AND lifecycle = 'active'",
+        (logical_ref,),
+    ).fetchall()
+    for (field_name,) in rows:
+        flag_pending_revalidation(
+            conn, logical_ref=logical_ref, field_name=field_name,
+            reason="source re-upload changed the column's material (definition/type); the human "
+                   "confirmation must be revalidated",
+            source_snapshot_id=snapshot_id, now=now,
+        )
+
+
+def _ingest_glossary_evidence(conn, *, source: str, rows: list[CanonicalRow],
+                              glossary: GlossaryUpload, bindings: dict[str, ObjectBinding],
+                              concepts: dict[str, str] | None, snapshot_id: str,
+                              now: datetime | None) -> None:
+    """Attach the glossary's per-field evidence (source / parser / taxonomy), flag human-confirmation
+    revalidation on a material change, then resolve-and-project + a readiness diagnostic (spec §6.3).
+
+    GUARDED to ATTACHABLE columns only (Task-2 ``may_attach`` binding). Every stage is savepointed and
+    fail-soft by the failure-class table: a per-column / per-stage failure logs a warning and is
+    contained; the upload's FACTS (already asserted) and raw graph are never rolled back. LLM concept
+    evidence is written INSIDE ``enrich_concepts`` (Task 6); this never re-writes it."""
+    rows_by_tc = {(_lc(r.table), _lc(r.column)): r for r in rows}
+    attachable_refs: list[str] = []
+    for rec in glossary.records:
+        if rec.is_table:
+            continue
+        try:
+            rec_source, _schema, table, column = parse_ref(rec.logical_ref)
+        except ValueError:
+            continue
+        if column is None:
+            continue
+        # Attachability is decided on the PUBLIC-scoped binding key classify_upload emits (the flat
+        # graph is public-scoped); evidence is keyed by the schema-preserving logical_ref (as Task 6).
+        binding = bindings.get(normalize_ref(rec_source, None, table, column))
+        if binding is None or not may_attach(binding):
+            continue
+        row = rows_by_tc.get((table, column))
+        if row is None:
+            continue  # deduped / quarantined out of the validated set -> no evidence to attach
+        logical_ref = rec.logical_ref
+
+        material_changed = False
+        try:
+            with conn.transaction():
+                material_changed = _write_glossary_source_evidence(
+                    conn, logical_ref=logical_ref, rec=rec, snapshot_id=snapshot_id)
+        except Exception:  # noqa: BLE001 — evidence-write failure: warn + continue (facts intact)
+            logger.warning("advisory glossary SOURCE evidence failed for %s", logical_ref,
+                           exc_info=True)
+        try:
+            with conn.transaction():
+                _write_glossary_parser_evidence(
+                    conn, logical_ref=logical_ref, description=rec.definition,
+                    snapshot_id=snapshot_id)
+        except Exception:  # noqa: BLE001
+            logger.warning("advisory glossary PARSER evidence failed for %s", logical_ref,
+                           exc_info=True)
+        if concepts is not None:
+            try:
+                with conn.transaction():
+                    _write_glossary_taxonomy_evidence(
+                        conn, logical_ref=logical_ref, row=row, concepts=concepts,
+                        snapshot_id=snapshot_id)
+            except Exception:  # noqa: BLE001
+                logger.warning("advisory glossary TAXONOMY evidence failed for %s", logical_ref,
+                               exc_info=True)
+        if material_changed:
+            try:
+                with conn.transaction():
+                    _flag_human_confirmed_revalidation(
+                        conn, logical_ref=logical_ref, snapshot_id=snapshot_id, now=now)
+            except Exception:  # noqa: BLE001
+                logger.warning("advisory revalidation flag failed for %s", logical_ref,
+                               exc_info=True)
+        attachable_refs.append(logical_ref)
+
+    if not attachable_refs:
+        return
+    try:
+        with conn.transaction():
+            resolve_and_project(conn, source=source, logical_refs=attachable_refs, now=now)
+    except Exception:  # noqa: BLE001 — resolver failure: continue with the raw graph (degraded)
+        logger.warning("advisory resolve_and_project failed for %r — graph left with raw nodes "
+                       "(degraded)", source, exc_info=True)
+    try:
+        # SAVEPOINTED (mirrors resolve_and_project above): a DB-level error inside compute_readiness
+        # aborts the request transaction, and the bare except alone would swallow the Python error yet
+        # leave the tx poisoned — the next unconditional statement (persist_quarantine's DELETE) would
+        # then raise InFailedSqlTransaction and roll back the WHOLE upload (facts + graph lost, 500).
+        # The savepoint contains the abort so this advisory diagnostic can never fail the upload.
+        with conn.transaction():
+            readiness = compute_readiness(conn, source=source, scope=ReadinessScopeType.CATALOG)
+            logger.info("glossary ingest readiness for %r: status=%s blocking=%d review=%d",
+                        source, readiness.operational_status, len(readiness.blocking_requirements),
+                        len(readiness.review_requirements))
+    except Exception:  # noqa: BLE001
+        logger.warning("advisory readiness diagnostic failed for %r", source, exc_info=True)
+
+
 def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
-                  actor, now: datetime | None = None, client=None) -> IngestResult:
-    vr = validate_rows(rows, catalog_source)
+                  actor, now: datetime | None = None, client=None,
+                  profile: SourceCapabilityProfile | None = None,
+                  glossary: GlossaryUpload | None = None) -> IngestResult:
+    # `profile` (spec §U) makes validation profile-aware: a glossary upload's `type="unknown"` rows
+    # pass, while a technical upload (or the default `profile=None`) still requires a real type. A
+    # glossary sidecar IMPLIES the glossary profile (a glossary attests no physical type), so default
+    # it — otherwise the `unknown`-type rows would all quarantine and no evidence could attach.
+    if glossary is not None and profile is None:
+        profile = FTR_GLOSSARY_PROFILE
+    vr = validate_rows(rows, catalog_source, profile=profile)
     if vr.structural_error:
         return IngestResult("rejected", vr.structural_error, 0, 0, len(vr.quarantined))
 
@@ -186,20 +555,61 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
         _drain_projection(conn)
     staled = sum(1 for c in changes if c.kind in ("drop", "type_change", "rename"))
 
+    # ── Glossary path (GUARDED): a glossary upload passes its semantic sidecar; a non-glossary upload
+    # (glossary=None) skips ALL of the below and is byte-for-byte unchanged. The ingestion-run id is
+    # the source_snapshot_id that keys per-field evidence + staleness for THIS upload (review #5). ──
+    is_glossary = glossary is not None
+    snapshot_id = mint_id("ing") if is_glossary else None
+    bindings: dict[str, ObjectBinding] | None = None
+    if glossary is not None:
+        try:
+            # Classify the RAW rows (not vr.good): validate_rows DEDUPs same-FQN rows that differ only
+            # in the advisory `definition`, so a definition CONFLICT is invisible in vr.good. The raw
+            # rows carry the disagreement classify_upload surfaces as a MetadataConflict (review #12).
+            # Filter identity-less rows (glossary_reader emits table=""/column="" for an unresolvable
+            # FQN): they collapse to `source::public.` and would manufacture a bogus definition
+            # conflict against a ref that never gets evidence or a node (Task-10 Minor-4).
+            identified = [r for r in rows if r.table and r.column]
+            bindings, conflicts = classify_upload(identified)
+            _open_glossary_conflicts(
+                conn, conflicts, ref_map=_schema_preserving_ref_map(glossary), now=now)
+        except Exception:  # noqa: BLE001 — advisory: identity/conflict classification never aborts
+            logger.warning("advisory glossary identity/conflict classification failed for %r",
+                           catalog_source, exc_info=True)
+            bindings = {}
+
     concepts = definitions = domains = None
     if client is not None:
         # Three INDEPENDENT advisory failure domains (spec C1): a failure in one task must not
         # discard another's already-computed enrichment. Each degrades search, never the facts.
+        #
+        # SAVEPOINTED (Important-4, same class as the Task-10 compute_readiness fix ~l.489): each
+        # enrichment call does UN-savepointed writes (cache put/get, llm_call + security-audit
+        # records). A DB-class fault (serialization failure / timeout / constraint) is swallowed as a
+        # Python exception by the bare except, yet leaves the REQUEST tx aborted — and the very next
+        # UNGUARDED statement (`build_graph`'s `DELETE FROM graph_edge`) would then raise
+        # InFailedSqlTransaction and roll back the already-asserted FACTS. The savepoint contains the
+        # abort so a poisoned enrichment tx can never reach build_graph — enrichment degrades, facts hold.
         try:
-            concepts = enrich_concepts(conn, vr.good, client, actor)
+            # Glossary carry-forward (Task 6): thread the sidecar + bindings + snapshot so Pass A
+            # writes item-level LLM concept evidence. Non-glossary keeps the exact original call.
+            with conn.transaction():
+                concepts = (
+                    enrich_concepts(conn, vr.good, client, actor, glossary=glossary,
+                                    bindings=bindings, source_snapshot_id=snapshot_id)
+                    if is_glossary
+                    else enrich_concepts(conn, vr.good, client, actor)
+                )
         except Exception:  # noqa: BLE001
             logger.warning("advisory concept enrichment failed for %r", catalog_source, exc_info=True)
         try:
-            definitions = draft_definitions(conn, vr.good, client, actor, concepts=concepts)
+            with conn.transaction():
+                definitions = draft_definitions(conn, vr.good, client, actor, concepts=concepts)
         except Exception:  # noqa: BLE001
             logger.warning("advisory definition enrichment failed for %r", catalog_source, exc_info=True)
         try:
-            domains = classify_domains(conn, vr.good, client, actor)
+            with conn.transaction():
+                domains = classify_domains(conn, vr.good, client, actor)
         except Exception:  # noqa: BLE001
             logger.warning("advisory domain enrichment failed for %r", catalog_source, exc_info=True)
     build_graph(conn, catalog_source, vr.good, concepts, definitions, domains)
@@ -207,6 +617,19 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
         # Governed seam (Task 7 / §12.1): the raw 'joins' edges just written are display-only; route
         # each declared join into the governed approved_join path. Advisory/fail-soft + adapter-gated.
         _propose_governed_joins(conn, vr.good, actor=actor)
+
+    if glossary is not None and bindings is not None and snapshot_id is not None:
+        # Attach per-field evidence + revalidation + resolve/readiness on top of the built graph.
+        # Belt-and-braces fail-soft: the helper savepoints every stage, and this outer guard makes a
+        # stray failure a warning rather than a rollback of the already-committed facts + graph.
+        try:
+            _ingest_glossary_evidence(
+                conn, source=catalog_source, rows=vr.good, glossary=glossary,
+                bindings=bindings, concepts=concepts, snapshot_id=snapshot_id, now=now)
+        except Exception:  # noqa: BLE001
+            logger.warning("advisory glossary evidence wiring failed for %r — facts + graph intact",
+                           catalog_source, exc_info=True)
+
     persist_quarantine(conn, catalog_source, vr.quarantined)
     flagged = (f"first upload of '{catalog_source}' ({len(vr.good)} objects) — review recommended"
                if brake.is_first_upload else None)
