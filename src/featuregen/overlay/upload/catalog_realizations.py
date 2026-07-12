@@ -4,12 +4,23 @@ join realizes is its OBJECT-GRAIN pair (each = the entity of the table's is_grai
 join-key entity. Behaviour-neutral: nothing consumes this until the 3B.3 planner."""
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import dataclass
 
 from featuregen.overlay.upload.concepts import concept
+from featuregen.overlay.upload.taxonomy.entity_registry import (
+    GRAPH_VERSION,
+    global_relationship_for,
+)
 from featuregen.overlay.upload.taxonomy.entity_relationships import (
     Cardinality,
+    CatalogEntityRelationshipV1,
     EntityRelationshipDefinitionV1,
+    EntityRelationshipProposalV1,
+    RealizationAuthority,
+    RelationshipProposalStatus,
+    RelationshipStatus,
 )
 
 REALIZATION_DERIVATION_VERSION = "1.0.0"
@@ -106,3 +117,98 @@ def key_entity(conn, catalog_source: str, column_object_ref: str) -> str | None:
         "SELECT concept FROM graph_node WHERE catalog_source = %s AND object_ref = %s AND kind = 'column'",
         (catalog_source, column_object_ref)).fetchone()
     return _entity_of_concept(row[0]) if row is not None else None
+
+
+CONCEPT_REGISTRY_FOR_REALIZATION = "concepts@1"   # a version tag for the concept vocabulary
+
+
+@dataclass(frozen=True, slots=True)
+class CatalogRealizationResult:
+    catalog_source: str
+    realizations: tuple[CatalogEntityRelationshipV1, ...]        # bound to a global relationship, VALID
+    conflicts: tuple[CatalogEntityRelationshipV1, ...]           # cardinality conflict (fail-closed)
+    local_relationships: tuple[CatalogEntityRelationshipV1, ...]  # unmapped grain pair, intra-catalog-only
+    proposals: tuple[EntityRelationshipProposalV1, ...]          # governance proposals for the unmapped
+    fingerprint: str
+
+
+def _catalog_schema_fingerprint(conn, catalog_source: str) -> str:
+    """A deterministic hash of the catalog's schema-relevant metadata (columns + grain/entity/concept +
+    join edges) — so the derivation's cache key changes iff the catalog's declared structure changes."""
+    nodes = conn.execute(
+        "SELECT object_ref, kind, table_name, is_grain, concept FROM graph_node "
+        "WHERE catalog_source = %s ORDER BY object_ref", (catalog_source,)).fetchall()
+    edges = conn.execute(
+        "SELECT from_ref, to_ref, cardinality FROM graph_edge "
+        "WHERE catalog_source = %s AND kind = 'joins' ORDER BY from_ref, to_ref", (catalog_source,)).fetchall()
+    blob = json.dumps({"nodes": [list(n) for n in nodes], "edges": [list(e) for e in edges]},
+                      sort_keys=True, default=str)
+    return hashlib.sha256(blob.encode()).hexdigest()
+
+
+def realization_fingerprint(conn, catalog_source: str) -> str:
+    """The composite immutable key — catalog schema fingerprint + global-graph version + concept-registry
+    version + derivation version — NOT the mutable catalog_source name alone."""
+    parts = "|".join((_catalog_schema_fingerprint(conn, catalog_source), GRAPH_VERSION,
+                      CONCEPT_REGISTRY_FOR_REALIZATION, REALIZATION_DERIVATION_VERSION))
+    return hashlib.sha256(parts.encode()).hexdigest()
+
+
+def _join_edges(conn, catalog_source: str):
+    """Intra-catalog declared join edges (both endpoints in THIS catalog — a cross-source target is a
+    3B.2B bridge concern, not a realization)."""
+    return conn.execute(
+        "SELECT e.from_ref, e.to_ref, e.cardinality FROM graph_edge e "
+        "WHERE e.catalog_source = %s AND e.kind = 'joins' "
+        "  AND EXISTS(SELECT 1 FROM graph_node n WHERE n.catalog_source = e.catalog_source "
+        "             AND n.object_ref = e.to_ref) "
+        "ORDER BY e.from_ref, e.to_ref", (catalog_source,)).fetchall()
+
+
+def derive_catalog_realizations(conn, catalog_source: str) -> CatalogRealizationResult:
+    """Derive this catalog's physical realizations from its declared joins. Deterministic, read-only.
+    Each intra-catalog join whose object-grain pair matches a global relationship becomes a bound
+    realization (a cardinality contradiction -> a conflict bucket); an unmapped grain pair -> a
+    catalog-local relationship + a governance proposal. Object grain = the table's is_grain column
+    entity, distinct from the join-key entity."""
+    realizations: list[CatalogEntityRelationshipV1] = []
+    conflicts: list[CatalogEntityRelationshipV1] = []
+    local: list[CatalogEntityRelationshipV1] = []
+    proposals: list[EntityRelationshipProposalV1] = []
+
+    for from_key, to_key, card_token in _join_edges(conn, catalog_source):
+        from_table, to_table = table_of(from_key), table_of(to_key)
+        fg, tg = object_grain(conn, catalog_source, from_table), object_grain(conn, catalog_source, to_table)
+        fke, tke = key_entity(conn, catalog_source, from_key), key_entity(conn, catalog_source, to_key)
+        if fg is None or tg is None or fke is None or tke is None:
+            continue                                            # unresolvable grain/key -> not derivable
+        declared = cardinality_from_token(card_token)
+        # try forward, then reverse orientation against the global model
+        norm = normalize_realization(from_object_grain=fg, to_object_grain=tg,
+                                     declared=declared, global_rel=global_relationship_for(fg, tg)) \
+            or normalize_realization(from_object_grain=fg, to_object_grain=tg,
+                                     declared=declared, global_rel=global_relationship_for(tg, fg))
+        rid = f"{catalog_source}:{from_key}->{to_key}"
+        rel = CatalogEntityRelationshipV1(
+            realization_id=rid, relationship_id=(norm.relationship_id if norm else ""),
+            catalog_source=catalog_source,
+            from_object_ref=from_table, from_object_grain=fg, to_object_ref=to_table, to_object_grain=tg,
+            from_key_ref=from_key, from_key_entity=fke, to_key_ref=to_key, to_key_entity=tke,
+            declared_cardinality=(norm.declared_cardinality if norm else declared),
+            authority=RealizationAuthority.DECLARED_JOIN, status=RelationshipStatus.ACTIVE)
+        if norm is None:
+            local.append(rel)
+            proposals.append(EntityRelationshipProposalV1(
+                proposal_id=f"prop:{rid}", proposed_from_entity=fg, proposed_to_entity=tg,
+                proposed_cardinality=declared, evidence_refs=(from_key, to_key),
+                source_catalog=catalog_source, inferred_by="catalog_realization_derivation@1",
+                status=RelationshipProposalStatus.PENDING))
+        elif norm.conflict:
+            conflicts.append(rel)
+        else:
+            realizations.append(rel)
+
+    return CatalogRealizationResult(
+        catalog_source=catalog_source, realizations=tuple(realizations), conflicts=tuple(conflicts),
+        local_relationships=tuple(local), proposals=tuple(proposals),
+        fingerprint=realization_fingerprint(conn, catalog_source))
