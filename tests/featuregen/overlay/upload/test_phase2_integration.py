@@ -46,6 +46,27 @@ def test_glossary_upload_proposes_then_confirms_grain(overlay_conn, human_actor,
                ) or all("grain" not in x.requirement_id for x in rd2.blocking_requirements)
 
 
+def test_advisory_propose_failure_keeps_the_egress_audit(overlay_conn, human_actor, monkeypatch,
+                                                         fake_synth_client, glossary_rows):
+    """The immutable record_llm_call egress audit (Pass B savepoint 1) must SURVIVE an
+    advisory-stage failure (savepoint 2): the upload stays ingested (fail-soft), and the record of
+    WHAT EGRESSED to the provider is never rolled back with the advisory propose/projection writes."""
+    monkeypatch.setenv("OVERLAY_TABLE_SYNTH", "1")
+    import featuregen.overlay.upload.table_synth as ts
+    from featuregen.overlay.upload.ingest import ingest_upload
+
+    def _boom(*_a, **_k):
+        raise RuntimeError("advisory boom")
+
+    monkeypatch.setattr(ts, "_propose_table_facts", _boom)  # ingest imports it lazily at call time
+    r = ingest_upload(overlay_conn, "src", glossary_rows.rows, actor=human_actor,
+                      client=fake_synth_client, glossary=glossary_rows)
+    assert r.status == "ingested"       # Pass B stays strictly advisory
+    n = overlay_conn.execute(
+        "SELECT count(*) FROM llm_call WHERE task = 'table_synth'").fetchone()[0]
+    assert n >= 1                       # the egress audit committed before the advisory stage
+
+
 def test_declared_structural_grain_beats_pass_b_proposal(overlay_conn, human_actor, monkeypatch,
                                                          fake_synth_client, technical_rows):
     # technical_rows: a TECHNICAL csv declaring is_grain on `id` -> _assert_fact auto-confirms it

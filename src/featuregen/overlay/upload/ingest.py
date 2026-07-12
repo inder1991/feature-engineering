@@ -662,10 +662,13 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
             synthesize_tables,
         )
         try:
-            # The savepoint CONTAINS the LLM + security-audit writes (exactly like the Pass A stages
-            # above — NOT like _propose_governed_joins, which has no savepoint): a DB abort inside
-            # synthesize_tables/propose must not poison the request tx and roll back Pass A facts +
-            # the quarantine. The try/except makes Pass B strictly advisory.
+            # TWO savepoints (exactly like the Pass A stages above — NOT like
+            # _propose_governed_joins, which has no savepoint): a DB abort inside either must not
+            # poison the request tx and roll back Pass A facts + the quarantine. The try/except
+            # makes Pass B strictly advisory. The FIRST savepoint contains the LLM egress + its
+            # IMMUTABLE record_llm_call security audit, RELEASED before the advisory stage starts —
+            # so an advisory-stage failure can never roll back the record of what egressed. The
+            # SECOND contains the advisory propose/projection writes.
             with conn.transaction():
                 synth_snapshot = snapshot_id or mint_id("tsy")  # non-glossary uploads have snapshot_id=None
                 items = assemble_table_items(vr.good, concepts=concepts, definitions=definitions)
@@ -673,6 +676,7 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
                         for t in {r.table for r in vr.good}}
                 syntheses = synthesize_tables(conn, client, items, columns_by_table=cols,
                                               actor=actor)     # LLM-call attribution only
+            with conn.transaction():
                 # Key the advisory table ref + its projection under the SAME schema the glossary
                 # columns use (a non-public schema for an FTR glossary; public for a technical
                 # upload) so readiness sees ONE (schema, table) pair per physical table.
