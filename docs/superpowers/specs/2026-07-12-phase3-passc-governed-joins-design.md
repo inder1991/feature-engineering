@@ -166,7 +166,7 @@ class CardinalityInferenceStatus(StrEnum):
 
 A **missing grain is visible** in the worklist and recorded as a **separate** confirmation (grain via the Phase-2 grain lifecycle; join via the `approved_join` lifecycle). The proposed value always **explains what it assumed**.
 
-**Correction path (v1-review Issue 13).** The reviewer may adjust **cardinality** at confirm (a value override — the plan verifies `confirm_fact` accepts a `value` override, as Phase 2's does). A **direction/endpoint** error (wrong `from_ref`/`to_ref`) is **reject-with-reason → re-propose the corrected candidate**, because the endpoints participate in the `fact_key`. The spec does **not** promise in-place endpoint mutation at confirm.
+**Correction path (v1-review Issue 13; corrected in v2 after code review).** For `approved_join`, **the entire value — endpoints, `column_pairs`, AND `cardinality` — participates in the `fact_key`** (`identity.py:71-81`), and the dual-owner confirm path derives the confirmed value from the proposal and ignores an `args['value']` override. So there is **no confirm-time value override** for a join (unlike a Phase-2 grain, whose overridable field is *not* in its key). Any correction — wrong cardinality, direction, or endpoints — is **reject-with-reason → re-propose the corrected candidate** (a new `fact_key`). `_confirm_join`'s cardinality argument is used only to reconstruct the *identical* proposed value for confirmation, never as an edit.
 
 ## 10. Candidate evidence payload (attached to every proposal)
 
@@ -240,15 +240,15 @@ On the bounded deterministic candidate set only, the LLM may produce **annotatio
 
 In **governed mode** (`OVERLAY_PASS_C` on), the feature planner's **operational** join traversal requires a `VERIFIED approved_join`. The pre-existing permissive shared-entity traversal (`entity.py` `cross_join_via_entity` / runtime `EntityBridge`) is **demoted to candidate-only** — it may *feed* Pass C candidates but is **not itself operational**. With the flag **off**, current behaviour is preserved byte-for-byte (transition safety). The plan wires the feature-planner's governed-mode filter and treats the permissive path's retirement as the §12.1 governed-joins retirement milestone.
 
-### 13.2 CSV-only confirmation mode (v1-review Issue 10 — reconciled)
+### 13.2 CSV-only confirmation mode (v1-review Issue 10 — corrected in v2 after code review)
 
-`owner_of → None` for both endpoints ⇒ both sides resolve to the **platform-admin governance queue**. Because both sides share the same governance owner, `Authority.dual` collapses to **False**, so confirmation takes the **single-confirmer** path; four-eyes is satisfied because the **proposer is the Pass C service actor**, distinct from the human confirmer. Labelled honestly on the proposal:
+**An `approved_join` with both owners unknown is DUAL, not single-confirmer.** `owner_of → None` for both endpoints ⇒ `resolve_authority` sets `same_owner = False` ⇒ **`Authority.dual = True`** and `governance_queue = True` (`authority.py:118-124` — the docstring is explicit: "both-unknown is still dual (two distinct governance approvals)"). So the join opens **two side-labelled platform-admin gate tasks** and requires **two DISTINCT platform-admin confirmations**: the first appends `PARTIALLY_CONFIRMED`, a second *distinct* platform-admin appends `VERIFIED` (`join_confirmation.py:97-120`). A single confirmer can never reach VERIFIED. Labelled honestly:
 ```
 owner_resolution   = unavailable
-confirmation_mode  = governance_fallback_single_confirmer
-four_eyes          = satisfied_by_service_proposer  (dual-owner enforced once ownership exists)
+confirmation_mode  = governance_fallback_dual_confirmer   (two distinct platform-admins)
+four_eyes          = service proposer ≠ each confirmer, AND the two confirmers ≠ each other
 ```
-(The plan verifies `Authority.dual` collapses to False for same-governance-both-sides; the two-party path is otherwise unchanged and re-activates automatically when a real ownership registry supplies distinct `owner_of`.)
+This is stronger, not weaker, than single-confirmer — two-party accountability holds even under the governance fallback. When a real ownership registry supplies distinct `owner_of`, the same path routes to the two real table stewards with no change.
 
 ## 14. Reverse projection — close the loop (idempotent, fail-closed)
 
@@ -299,9 +299,11 @@ ingest_upload (glossary) — flag OVERLAY_PASS_C, default OFF
   4. [3B, opt] LLM challenger: explain/adjudicate/namespace-flag/bridge  (demote-only)
   5. readiness: relationships = candidate_proposed / weak_candidates_only
   ───────────────────────────────────────────────────────
-(later, async — a human, governance fallback)
-  6. confirm: PROPOSED → VERIFIED (cardinality override ok; wrong endpoints → reject+re-propose)
-  7. project: VERIFIED → operational edge (in-place authority upgrade + fact link);  non-VERIFIED → demote
+(later, async — TWO distinct platform-admins, governance fallback)
+  6. confirm: PROPOSED → PARTIALLY_CONFIRMED (admin #1) → VERIFIED (distinct admin #2)
+             (any correction — cardinality/direction/endpoints — is reject → re-propose; no in-place edit)
+  7. project: VERIFIED → operational edge (declared-spare, unordered-pair, public-scope; + fact link);
+             non-VERIFIED / async reject / expiry → demote to display_only (async hook + at ingest)
   8. readiness: relationships = confirmed;  find_join_path traverses it
 ```
 
@@ -320,7 +322,7 @@ ingest_upload (glossary) — flag OVERLAY_PASS_C, default OFF
 
 ## 22. Testing
 
-- **Blocker/scorer (pure):** negative filters suppress (`Measure`/date/`CUST_NAME` never candidate even on exact name match); same identifier concept → strong; same BIAN leaf **alone** → weak, and a **mixed leaf → AMBIGUOUS**; `related_terms` fires strong **only** when it links two id-like columns by concept; self-join excluded; every candidate carries a non-empty explanation + reason codes; namespace enum derivation for COMPATIBLE/POSSIBLE/AMBIGUOUS/INCOMPATIBLE.
+- **Blocker/scorer (pure):** negative filters suppress (`Measure`/date/`CUST_NAME` never candidate even on exact name match — word-boundary match so `"Mandate Reference"` is *not* tripped by `"date"`); same identifier concept **+ an independent corroborator (synonyms / gated `related_terms`)** → COMPATIBLE/strong-eligible, same concept **alone** → POSSIBLE (capped at weak); same BIAN leaf **alone → AMBIGUOUS → excluded from proposals** (surfaced only as a weak/telemetry diagnostic, never a scored strong candidate); a **mixed leaf → AMBIGUOUS**; a **neither-grain (`MANY_TO_MANY_RISK`) candidate is forced to weak** (never proposed); `related_terms` fires strong **only** when it links two id-like columns by concept; self-join excluded; every candidate carries a non-empty explanation + reason codes.
 - **Dedupe/lifecycle:** re-ingest of an identical glossary creates **no** duplicate proposal; a rejected candidate does **not** reopen unless bucket/namespace changed; a VERIFIED candidate is skipped.
 - **Challenger (3B):** a namespace-mismatch flag demotes; a bridge suggestion demotes + annotates; the LLM can never raise a score or mint a fact (assert monotonicity); egress bounded/metadata-only.
 - **Propose:** strong → `approved_join` PROPOSED (not confirmed); evidence carries the breakdown; fail-soft; default-OFF byte-for-byte.
