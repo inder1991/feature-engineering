@@ -287,14 +287,39 @@ def audited_enrich_call(conn, client: LLMClient, *, task: str, prompt_id: str, s
 _ITEM_META_ALLOWED = frozenset({
     "table", "column", "type", "columns", "concept",
     "term_name", "business_definition", "synonyms", "data_domain", "bian_path", "fibo_path",
+    "column_profiles",
 })
+
+# The ONLY keys a per-column descriptor may carry, each a short scalar. `definition` is deliberately
+# ABSENT — a technical free-text definition can never ride this seam; a curated meaning rides as
+# `business_definition` (already stripped of sample values upstream). The role fields
+# (identifier_role/temporal_role/semantic_type/entity) come from Pass A evidence and sharpen grain
+# proposals (an identifier-role column is grain-eligible; a temporal-role column is as-of-eligible).
+_COLUMN_PROFILE_KEYS = frozenset({
+    "column", "type", "concept", "business_definition",
+    "identifier_role", "temporal_role", "semantic_type", "entity",
+})
+_MAX_COLUMN_PROFILES = 64
+
+
+def _column_profile_ok(desc: object) -> bool:
+    if not isinstance(desc, dict):
+        return False
+    if any(k not in _COLUMN_PROFILE_KEYS for k in desc):
+        return False
+    return all(isinstance(v, str) and len(v) <= 200 for v in desc.values())
 
 
 def _item_egress_ok(metadata: dict) -> bool:
     if any(k not in _ITEM_META_ALLOWED for k in metadata):
         return False
-    for v in metadata.values():
-        if isinstance(v, list):
+    for k, v in metadata.items():
+        if k == "column_profiles":
+            if not isinstance(v, list) or len(v) > _MAX_COLUMN_PROFILES:
+                return False
+            if not all(_column_profile_ok(d) for d in v):
+                return False
+        elif isinstance(v, list):
             if not all(isinstance(x, str) and len(x) <= 200 for x in v):
                 return False
         elif not isinstance(v, str) or len(v) > 200:
