@@ -81,6 +81,17 @@ class GraphEdgeAuthority(StrEnum):
     ENTITY_BRIDGE = "entity_bridge"
 
 
+class RealizationAuthority(StrEnum):
+    """The authority behind a catalog realization. ``APPROVED_JOIN`` = an attested approved_join fact;
+    ``DECLARED_JOIN`` = an uploaded ``graph_edge`` join (what existing single-catalog grounding uses);
+    ``INFERRED_JOIN`` = metadata-inferred. Stamped in 3B; which levels are VALID-capable is enforced in
+    3C — 3B never blocks on it."""
+
+    APPROVED_JOIN = "approved_join"
+    DECLARED_JOIN = "declared_join"
+    INFERRED_JOIN = "inferred_join"
+
+
 @dataclass(frozen=True, slots=True)
 class EntityRelationshipDefinitionV1:
     """A GLOBAL semantic entity relationship — the only edge class the 3A graph traverses. Answers 'is
@@ -102,22 +113,25 @@ class EntityRelationshipDefinitionV1:
 
 @dataclass(frozen=True, slots=True)
 class CatalogEntityRelationshipV1:
-    """CONTRACT ONLY in 3A. How one catalog physically realizes a global relationship: the two object
-    refs AND the entity each endpoint resolved to (persisted so Phase 3B can diagnose a realization-vs-
-    global entity conflict — e.g. 'this upload resolved the to-endpoint as account, but the global
-    relationship expects customer' — without re-querying endpoint metadata). Cross-checked against the
-    global model in Phase 3B; 3A validates it structurally only."""
+    """How one catalog physically realizes a global relationship. The semantic hop it realizes is
+    ``from_object_grain -> to_object_grain`` (each = the entity of its table's is_grain column), realized
+    by the join KEY (``from_key_ref``/``to_key_ref`` + their entities). Object grain and join-key entity
+    are DISTINCT (a join on ``customer_id`` can realize ``account -> customer``). Derived from declared
+    joins in Phase 3B.2A; nothing populated it in 3A (safe to extend)."""
 
     realization_id: str
     relationship_id: str
     catalog_source: str
     from_object_ref: str
+    from_object_grain: str
     to_object_ref: str
-    resolved_from_entity: str
-    resolved_to_entity: str
+    to_object_grain: str
+    from_key_ref: str
+    from_key_entity: str
+    to_key_ref: str
+    to_key_entity: str
     declared_cardinality: Cardinality
-    adapter_id: str
-    authority: GraphEdgeAuthority = GraphEdgeAuthority.CATALOG_DECLARED
+    authority: RealizationAuthority = RealizationAuthority.DECLARED_JOIN
     status: RelationshipStatus = RelationshipStatus.ACTIVE
 
 
@@ -219,22 +233,21 @@ def validate_relationship_definition(
 
 
 def validate_catalog_relationship(real: CatalogEntityRelationshipV1, *, known: frozenset[str]) -> None:
-    """Structural guard: non-empty fields, distinct object refs, both resolved endpoints in the closed
-    vocabulary, fixed authority. It does NOT cross-check the resolved entities against the global
-    relationship's endpoints — that (and the realization↔global conflict decision) is Phase 3B."""
+    """Structural guard: non-empty refs, distinct object endpoints, and every resolved entity (both
+    object grains + both key entities) in the closed vocabulary. It does NOT cross-check the realization
+    against the global relationship (that is the derivation's job in 3B.2A)."""
     _nonempty(realization_id=real.realization_id, relationship_id=real.relationship_id,
-              catalog_source=real.catalog_source, adapter_id=real.adapter_id,
-              from_object_ref=real.from_object_ref, to_object_ref=real.to_object_ref,
-              resolved_from_entity=real.resolved_from_entity,
-              resolved_to_entity=real.resolved_to_entity)
+              catalog_source=real.catalog_source, from_object_ref=real.from_object_ref,
+              to_object_ref=real.to_object_ref, from_key_ref=real.from_key_ref,
+              to_key_ref=real.to_key_ref)
     if real.from_object_ref == real.to_object_ref:
-        raise ValueError("catalog realization endpoints are identical")
-    if real.resolved_from_entity not in known:
-        raise ValueError(f"unknown entity: {real.resolved_from_entity!r}")
-    if real.resolved_to_entity not in known:
-        raise ValueError(f"unknown entity: {real.resolved_to_entity!r}")
-    if real.authority is not GraphEdgeAuthority.CATALOG_DECLARED:
-        raise ValueError("catalog realization authority must be CATALOG_DECLARED")
+        raise ValueError("catalog realization object endpoints are identical")
+    for label, ent in (("from_object_grain", real.from_object_grain),
+                       ("to_object_grain", real.to_object_grain),
+                       ("from_key_entity", real.from_key_entity),
+                       ("to_key_entity", real.to_key_entity)):
+        if ent not in known:
+            raise ValueError(f"unknown entity ({label}): {ent!r}")
 
 
 def validate_entity_bridge(bridge: EntityBridgeV1, *, known: frozenset[str]) -> None:
