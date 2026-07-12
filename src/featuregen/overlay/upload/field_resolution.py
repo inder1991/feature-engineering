@@ -23,11 +23,16 @@ from the CONCEPT vocab into ``safety_floor.SENSITIVITY_ORDER`` and run through
 floor RESTRICTS but does not CERTIFY, so ``classification_status`` stays ``proposed`` until a
 source/human sensitivity confirms.
 
-SCHEMA IDENTITY (review #14): ``field_evidence.logical_ref`` is the case-folded
-``overlay.upload.object_ref.normalize_ref`` (``source::schema.table.column``), while ``graph_node`` is
-keyed ``(catalog_source, object_ref="schema.table.column")``. We reconcile by parsing the logical_ref
-back to its components and matching ``graph_node.object_ref`` case-insensitively — the SAME normalized
-identity, never a mismatch.
+SCHEMA IDENTITY (review #14, Task-10 Important-2): ``field_evidence.logical_ref`` is the case-folded
+``overlay.upload.object_ref.normalize_ref`` (``source::schema.table.column``) and is SCHEMA-PRESERVING —
+every evidence/decision store keys on it. ``graph_node``, however, is built by ``graph.build_graph`` from
+schema-less glossary ``CanonicalRow``s, so its column nodes are stored PUBLIC-FLATTENED
+(``public.table.column``) regardless of the glossary's real schema. To make the DISPLAY projection
+actually land for a non-``public``-schema glossary (the FTR norm), :func:`_graph_key` derives the SAME
+public-flattened ``public.table.column`` key ``build_graph`` used — NOT the schema-preserving one. Evidence
+and decisions stay keyed on the schema-preserving ``logical_ref``; the two are bridged by ``(table,
+column)``, which is unique within a single-schema upload (FTR). Full multi-schema graph identity is a
+Phase-3 structural-fusion concern.
 """
 from __future__ import annotations
 
@@ -58,6 +63,11 @@ RESOLVER_VERSION = "upload-resolve-and-project-v1"
 
 _SENSITIVITY_FIELD = "sensitivity"
 _SENSITIVITY_FLOOR_FIELD = "sensitivity_floor"
+
+# The schema ``graph.build_graph`` flattens every glossary column node under (schema-less CanonicalRows
+# carry no schema, so the legacy flat graph is public-scoped). The graph-projection key MUST match it,
+# even when the glossary's schema-preserving logical_ref names a different schema (Task-10 Important-2).
+_GRAPH_SCHEMA = "public"
 
 # CONCEPT sensitivity vocab -> safety_floor.SENSITIVITY_ORDER. A concept-registry floor speaks the
 # concept vocab (public|pii|protected_attribute|special_category|proxy); the safety floor speaks
@@ -95,11 +105,16 @@ _DECISION_LINK_COLUMN: dict[str, str] = {
 def _graph_key(source: str, logical_ref: str) -> tuple[str, str]:
     """The ``(catalog_source, object_ref_lowercased)`` graph_node key for a ``logical_ref``.
 
-    Parses the logical_ref back to its (already case-folded) ``schema.table.column`` and joins it the
-    way ``graph.build_graph`` keys column nodes. ``catalog_source`` is the caller's ``source`` (the
-    same string ``build_graph`` was called with)."""
-    _ref_source, schema, table, column = parse_ref(logical_ref)
-    object_ref = ".".join(p for p in (schema, table, column) if p is not None)
+    Parses the logical_ref back to its (already case-folded) components and re-keys them the way
+    ``graph.build_graph`` actually stored the node: PUBLIC-FLATTENED (``public.table[.column]``),
+    DROPPING the schema. ``build_graph`` builds column nodes from schema-less glossary ``CanonicalRow``s,
+    so a non-``public``-schema glossary's node still lives under ``public.table.column`` — keying the
+    UPDATE on the schema-preserving ``schema.table.column`` would match ZERO rows and the display
+    projection would silently never land (Task-10 Important-2). Evidence/decisions stay schema-preserving;
+    only this graph key is flattened. ``catalog_source`` is the caller's ``source``."""
+    _ref_source, _schema, table, column = parse_ref(logical_ref)
+    parts = [_GRAPH_SCHEMA, table, *([column] if column is not None else [])]
+    object_ref = ".".join(parts)
     return source, object_ref.lower()
 
 
@@ -158,7 +173,8 @@ def _project_display(
 ) -> None:
     """Write the DISPLAY value into the flat ``graph_node`` column (when one exists) AND set the
     companion ``*_decision_id`` link. A field with only a link column (``logical_representation``) sets
-    the link without touching a display column. Case-insensitive object_ref match (schema identity)."""
+    the link without touching a display column. Case-insensitive match on the public-flattened
+    object_ref :func:`_graph_key` derives (see its note on the schema bridge)."""
     catalog_source, object_ref_lc = _graph_key(source, logical_ref)
     display_col = _DISPLAY_COLUMN.get(field_name)
     link_col = _DECISION_LINK_COLUMN.get(field_name)

@@ -189,6 +189,19 @@ _GLOSSARY_CONFLICT_SEVERITY = "metadata_conflict"
 # confirmation (spec §6.3). A glossary attests no physical type, so `definition` is its material axis.
 _MATERIAL_FIELDS = frozenset({"definition"})
 
+# The full set of fields each producer can assert for a glossary column. On a re-upload we reconcile
+# these against the fields the NEW upload actually provides: a field the new upload NO LONGER asserts
+# (present->absent) must have its prior ACTIVE rows STALED, else a dropped value stays load-bearing
+# (Task-10 Important-3). Kept in sync with `_write_glossary_source_evidence` / `_parser_evidence`.
+_SOURCE_FIELDS: tuple[str, ...] = ("definition", "domain", "business_term", "bian_path", "fibo_path")
+_PARSER_FIELDS: tuple[str, ...] = ("logical_representation", "semantic_type")
+
+# A `keep_input_hash` that can never equal a real per-field input hash (always a 64-char sha256 hex
+# digest — this contains non-hex chars), so `stale_source_evidence(..., keep_input_hash=_STALE_ALL)`
+# stales EVERY active row for the given producer+field — used to retire a field the new upload dropped
+# entirely (absent->stale). Plain ASCII (PostgreSQL text rejects NUL bytes in a bound parameter).
+_STALE_ALL = "__field_absent_from_upload__"
+
 
 def _lc(value: str) -> str:
     """Strip + lower-case a ref component (matches object_ref._norm) so a public-scoped CanonicalRow's
@@ -196,25 +209,49 @@ def _lc(value: str) -> str:
     return value.strip().lower()
 
 
+def _schema_preserving_ref_map(glossary: GlossaryUpload) -> dict[str, str]:
+    """Map each column record's PUBLIC-FLATTENED ref (the key ``classify_upload`` emits conflicts under,
+    via ``normalize_ref(source, None, table, column)``) to its SCHEMA-PRESERVING ``rec.logical_ref``
+    (the key evidence/decisions use). Lets ``_open_glossary_conflicts`` open a conflict under the SAME
+    identity the object's evidence uses instead of the schema-forced-public row key (Task-10 Minor-5)."""
+    out: dict[str, str] = {}
+    for rec in glossary.records:
+        if rec.is_table:
+            continue
+        try:
+            rec_source, _schema, table, column = parse_ref(rec.logical_ref)
+        except ValueError:
+            continue
+        if column is None:
+            continue
+        out[normalize_ref(rec_source, None, table, column)] = rec.logical_ref
+    return out
+
+
 def _open_glossary_conflicts(
-    conn, conflicts: list[MetadataConflict], *, now: datetime | None
+    conn, conflicts: list[MetadataConflict], *, ref_map: dict[str, str], now: datetime | None
 ) -> None:
     """Open (or reopen) one ``conflict_review`` item per metadata disagreement (review #12). Fail-soft
-    + savepointed: a conflict-open failure logs and is contained, never aborting the upload."""
+    + savepointed: a conflict-open failure logs and is contained, never aborting the upload.
+
+    ``ref_map`` reconciles each conflict's public-flattened ``logical_ref`` to the schema-preserving one
+    the same object's evidence/decisions key on (Task-10 Minor-5), so the conflict and its evidence
+    never diverge on identity. A ref with no sidecar record falls back to the row key unchanged."""
     for c in conflicts:
+        logical_ref = ref_map.get(c.logical_ref, c.logical_ref)
         try:
             with conn.transaction():
                 fingerprint = conflict_fingerprint(
-                    c.logical_ref, c.field, c.competing_value_hashes, FIELD_POLICY_VERSION
+                    logical_ref, c.field, c.competing_value_hashes, FIELD_POLICY_VERSION
                 )
                 open_or_reopen_conflict(
-                    conn, fingerprint=fingerprint, logical_ref=c.logical_ref, field_name=c.field,
+                    conn, fingerprint=fingerprint, logical_ref=logical_ref, field_name=c.field,
                     severity=_GLOSSARY_CONFLICT_SEVERITY, competing_evidence_ids=(),
                     competing_value_hashes=c.competing_value_hashes, now=now,
                 )
         except Exception:  # noqa: BLE001 — advisory: a conflict-open failure never aborts the upload
             logger.warning("advisory conflict-review open failed for %s.%s",
-                           c.logical_ref, c.field, exc_info=True)
+                           logical_ref, c.field, exc_info=True)
 
 
 def _write_producer_field(conn, *, logical_ref: str, field_name: str, value: object,
@@ -247,18 +284,42 @@ def _write_producer_field(conn, *, logical_ref: str, field_name: str, value: obj
     return staled
 
 
+def _stale_absent_fields(
+    conn, *, logical_ref: str, producer: EvidenceProducer, all_fields: tuple[str, ...],
+    present: set[str],
+) -> set[str]:
+    """Stale a producer's prior ACTIVE rows for every field the NEW upload NO LONGER asserts
+    (``all_fields - present``) — a present->absent field must not leave a load-bearing value behind
+    (Task-10 Important-3). PRODUCER-SCOPED (never touches human/taxonomy evidence). Returns the set of
+    fields that actually had ≥1 row staled (so the caller can treat a dropped MATERIAL field as a change)."""
+    staled_fields: set[str] = set()
+    for field_name in all_fields:
+        if field_name in present:
+            continue
+        n = stale_source_evidence(
+            conn, logical_ref=logical_ref, field_name=field_name,
+            producer=producer, keep_input_hash=_STALE_ALL,
+        )
+        if n > 0:
+            staled_fields.add(field_name)
+    return staled_fields
+
+
 def _write_glossary_source_evidence(
     conn, *, logical_ref: str, rec: GlossaryRecord, snapshot_id: str
 ) -> bool:
     """Write SOURCE evidence for a glossary column at the profile's per-field strength (definition +
     bian/fibo/term ATTESTED, domain PROPOSED). Returns whether the column's MATERIAL changed vs the
-    prior upload (a differing prior source proposal for a material field was staled)."""
+    prior upload — a material field whose prior source proposal was staled EITHER because its value
+    changed (present->present) OR because the new upload dropped it entirely (present->absent)."""
     material_changed = False
+    present: set[str] = set()
     for field_name, value in (("definition", rec.definition), ("domain", rec.domain),
                               ("business_term", rec.term_name), ("bian_path", rec.bian_path),
                               ("fibo_path", rec.fibo_path)):
         if not value:
             continue
+        present.add(field_name)
         staled = _write_producer_field(
             conn, logical_ref=logical_ref, field_name=field_name, value=value,
             producer=EvidenceProducer.SOURCE,
@@ -267,6 +328,15 @@ def _write_glossary_source_evidence(
         )
         if field_name in _MATERIAL_FIELDS and staled > 0:
             material_changed = True
+    # Reconcile absent fields: a field the prior upload asserted but this one dropped is staled here;
+    # a MATERIAL field going present->absent is itself a material change (clearing a definition must
+    # flag a prior human confirmation pending-revalidation, not silently keep it load-bearing).
+    dropped = _stale_absent_fields(
+        conn, logical_ref=logical_ref, producer=EvidenceProducer.SOURCE,
+        all_fields=_SOURCE_FIELDS, present=present,
+    )
+    if dropped & _MATERIAL_FIELDS:
+        material_changed = True
     return material_changed
 
 
@@ -277,18 +347,24 @@ def _write_glossary_parser_evidence(
     deterministic sample-value parser. No profile in the description -> a diagnostic, then continue
     (failure class: parser no-profile is a gap, never a failure)."""
     parsed = parse_sample_profile(description or "")
-    wrote = False
+    present: set[str] = set()
     for field_name, value in (("logical_representation", parsed.logical_representation),
                               ("semantic_type", parsed.semantic_type)):
         if value is None:
             continue
+        present.add(field_name)
         _write_producer_field(
             conn, logical_ref=logical_ref, field_name=field_name, value=value,
             producer=EvidenceProducer.PARSER, strength=AssertionStrength.SUPPORTED,
             producer_ref=snapshot_id, snapshot_id=snapshot_id, material=description or "",
         )
-        wrote = True
-    if not wrote and parsed.diagnostic:
+    # Reconcile absent parser fields: an edited description that drops its sample-profile phrase leaves
+    # the prior logical_representation/semantic_type ACTIVE + load-bearing unless we stale it here.
+    _stale_absent_fields(
+        conn, logical_ref=logical_ref, producer=EvidenceProducer.PARSER,
+        all_fields=_PARSER_FIELDS, present=present,
+    )
+    if not present and parsed.diagnostic:
         logger.info("glossary parser found no profile for %s: %s", logical_ref, parsed.diagnostic)
 
 
@@ -405,10 +481,16 @@ def _ingest_glossary_evidence(conn, *, source: str, rows: list[CanonicalRow],
         logger.warning("advisory resolve_and_project failed for %r — graph left with raw nodes "
                        "(degraded)", source, exc_info=True)
     try:
-        readiness = compute_readiness(conn, source=source, scope=ReadinessScopeType.CATALOG)
-        logger.info("glossary ingest readiness for %r: status=%s blocking=%d review=%d",
-                    source, readiness.operational_status, len(readiness.blocking_requirements),
-                    len(readiness.review_requirements))
+        # SAVEPOINTED (mirrors resolve_and_project above): a DB-level error inside compute_readiness
+        # aborts the request transaction, and the bare except alone would swallow the Python error yet
+        # leave the tx poisoned — the next unconditional statement (persist_quarantine's DELETE) would
+        # then raise InFailedSqlTransaction and roll back the WHOLE upload (facts + graph lost, 500).
+        # The savepoint contains the abort so this advisory diagnostic can never fail the upload.
+        with conn.transaction():
+            readiness = compute_readiness(conn, source=source, scope=ReadinessScopeType.CATALOG)
+            logger.info("glossary ingest readiness for %r: status=%s blocking=%d review=%d",
+                        source, readiness.operational_status, len(readiness.blocking_requirements),
+                        len(readiness.review_requirements))
     except Exception:  # noqa: BLE001
         logger.warning("advisory readiness diagnostic failed for %r", source, exc_info=True)
 
@@ -462,13 +544,18 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
     is_glossary = glossary is not None
     snapshot_id = mint_id("ing") if is_glossary else None
     bindings: dict[str, ObjectBinding] | None = None
-    if is_glossary:
+    if glossary is not None:
         try:
             # Classify the RAW rows (not vr.good): validate_rows DEDUPs same-FQN rows that differ only
             # in the advisory `definition`, so a definition CONFLICT is invisible in vr.good. The raw
             # rows carry the disagreement classify_upload surfaces as a MetadataConflict (review #12).
-            bindings, conflicts = classify_upload(rows)
-            _open_glossary_conflicts(conn, conflicts, now=now)
+            # Filter identity-less rows (glossary_reader emits table=""/column="" for an unresolvable
+            # FQN): they collapse to `source::public.` and would manufacture a bogus definition
+            # conflict against a ref that never gets evidence or a node (Task-10 Minor-4).
+            identified = [r for r in rows if r.table and r.column]
+            bindings, conflicts = classify_upload(identified)
+            _open_glossary_conflicts(
+                conn, conflicts, ref_map=_schema_preserving_ref_map(glossary), now=now)
         except Exception:  # noqa: BLE001 — advisory: identity/conflict classification never aborts
             logger.warning("advisory glossary identity/conflict classification failed for %r",
                            catalog_source, exc_info=True)

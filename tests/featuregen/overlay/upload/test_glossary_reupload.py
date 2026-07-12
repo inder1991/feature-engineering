@@ -29,7 +29,10 @@ from featuregen.overlay.field_evidence import (
 )
 from featuregen.overlay.upload.canonical import CanonicalRow
 from featuregen.overlay.upload.field_resolution import is_feature_eligible, resolve_and_project
-from featuregen.overlay.upload.field_revalidation import active_disqualifiers_for
+from featuregen.overlay.upload.field_revalidation import (
+    active_disqualifiers_for,
+    flag_pending_revalidation,
+)
 from featuregen.overlay.upload.glossary_reader import read_glossary
 from featuregen.overlay.upload.ingest import ingest_upload
 from featuregen.overlay.upload.object_ref import normalize_ref
@@ -183,3 +186,145 @@ def test_non_glossary_upload_writes_no_evidence_revalidation_or_conflict(db):
     assert db.execute("SELECT count(*) FROM field_revalidation").fetchone()[0] == 0
     assert db.execute("SELECT count(*) FROM conflict_review").fetchone()[0] == 0
     assert db.execute("SELECT count(*) FROM field_decision_event").fetchone()[0] == 0
+
+
+# ── Task-10 Important-1: the readiness diagnostic is ADVISORY — a DB-level error inside it must not
+# abort the upload (was: it poisoned the request tx and the next persist_quarantine DELETE 500'd,
+# rolling back the already-asserted facts + graph). ──
+def test_readiness_db_error_does_not_abort_glossary_upload(db, monkeypatch):
+    _seal()
+    from featuregen.overlay.upload import ingest as ingest_mod
+
+    def _boom(conn, **kw):
+        # Simulate a DB-level failure INSIDE compute_readiness: this aborts the request transaction.
+        conn.execute("SELECT 1 FROM a_table_that_does_not_exist_xyz")
+
+    monkeypatch.setattr(ingest_mod, "compute_readiness", _boom)
+
+    upload = read_glossary(_glossary_csv("The ledger balance."), source=_SOURCE)
+    res = ingest_upload(db, _SOURCE, upload.rows, actor=_actor(), now=NOW, client=None,
+                        glossary=upload)
+
+    # The advisory diagnostic's DB error was contained by the savepoint: the upload STILL succeeded
+    # (no exception propagated out of ingest_upload) and nothing was rolled back.
+    assert res.status == "ingested"
+    assert read_active_field_evidence(db, _BAL_REF, "definition")    # the glossary evidence survived
+    assert db.execute(                                              # the built graph survived too
+        "SELECT count(*) FROM graph_node WHERE catalog_source = %s AND object_ref = %s",
+        (_SOURCE, "public.accounts.balance")).fetchone()[0] == 1
+
+
+# ── Task-10 Important-3(a): a re-upload that drops the sample-profile phrase must STALE the prior
+# PARSER logical_representation/semantic_type — a present->absent field can't stay load-bearing. ──
+_PROFILED_DEF = ("The ledger balance. The sample profile is NUMERIC, with representative values such "
+                 "as 1250.00; 9.99; 42.50, which supports interpretation.")
+
+
+def _parser_lifecycles(db, ref: str, field: str) -> set[str]:
+    return {lc for (lc,) in db.execute(
+        "SELECT lifecycle FROM field_evidence WHERE logical_ref = %s AND field_name = %s "
+        "AND producer = 'parser'", (ref, field)).fetchall()}
+
+
+def test_reupload_dropping_sample_profile_stales_prior_parser_evidence(db):
+    _seal()
+    _ingest(db, _glossary_csv(_PROFILED_DEF), NOW)
+
+    active1 = read_active_field_evidence(db, _BAL_REF, "logical_representation")
+    assert len(active1) == 1 and active1[0].producer == "parser"    # parser certified a shape
+
+    # Re-upload: the edited definition NO LONGER carries a sample-profile phrase -> parser asserts nothing.
+    _ingest(db, _glossary_csv("The ledger balance (revised, no sample profile)."), NOW)
+
+    # The prior parser evidence is STALE (present->absent), nothing ACTIVE remains to stay load-bearing.
+    assert read_active_field_evidence(db, _BAL_REF, "logical_representation") == []
+    assert read_active_field_evidence(db, _BAL_REF, "semantic_type") == []
+    assert _parser_lifecycles(db, _BAL_REF, "logical_representation") == {"stale"}
+
+
+# ── Task-10 Important-3(b): CLEARING a definition on a human-confirmed column is a material change even
+# though no present value staled — the human confirmation must be flagged pending-revalidation (blocked),
+# NOT staled. ──
+def test_clearing_definition_flags_human_confirmed_column_pending_revalidation(db):
+    _seal()
+    _ingest(db, _glossary_csv("The ledger balance."), NOW)
+
+    record_field_evidence(
+        db, logical_ref=_BAL_REF, field_name="sensitivity", proposed_value="restricted",
+        producer=EvidenceProducer.HUMAN, strength=AssertionStrength.CONFIRMED,
+        producer_ref="human-review", source_snapshot_id="human-1",
+        input_hash=field_input_hash(logical_ref=_BAL_REF, field_name="sensitivity",
+                                    material="restricted"))
+    human_id = read_active_field_evidence(db, _BAL_REF, "sensitivity")[0].evidence_id
+
+    # Re-upload CLEARING the balance definition (empty cell) — a material field present->absent.
+    _ingest(db, _glossary_csv(""), NOW)
+
+    # The prior source definition itself was staled (present->absent), leaving no ACTIVE definition.
+    assert read_active_field_evidence(db, _BAL_REF, "definition") == []
+
+    # The human-confirmed sensitivity is flagged PENDING revalidation and the disqualifier is active.
+    pending = db.execute(
+        "SELECT count(*) FROM field_revalidation WHERE logical_ref = %s AND field_name = 'sensitivity' "
+        "AND status = 'pending'", (_BAL_REF,)).fetchone()[0]
+    assert pending == 1
+    assert active_disqualifiers_for(db, _BAL_REF, "sensitivity") == frozenset(
+        {Disqualifier.CONFIRMATION_PENDING_REVALIDATION})
+
+    # The human evidence SURVIVED — a source re-upload never stales human evidence.
+    assert [e.evidence_id for e in read_active_field_evidence(db, _BAL_REF, "sensitivity")] == [human_id]
+    assert is_feature_eligible(db, _BAL_REF, "sensitivity") is False
+
+
+# ── Task-10 Minor-4: an unresolvable (identity-less) glossary row must not manufacture a bogus conflict
+# against the empty ref `source::public.`. ──
+def test_identity_less_rows_do_not_open_bogus_conflicts(db):
+    _seal()
+    # Two unresolvable 1-part FQNs with DIFFERENT definitions -> glossary_reader emits identity-less
+    # rows (table=""/column=""); they must NOT collapse to `source::public.` and open a definition conflict.
+    csv_text = (_HEADER
+                + "no_dots_here,Term A,Definition ONE.,Deposits,,\n"
+                + "also_no_dots,Term B,Definition TWO.,Deposits,,\n")
+    upload = read_glossary(csv_text, source=_SOURCE)
+    res = ingest_upload(db, _SOURCE, upload.rows, actor=_actor(), now=NOW, client=None,
+                        glossary=upload)
+
+    assert res.status == "ingested"                                 # the rows quarantine; upload still ok
+    assert db.execute("SELECT count(*) FROM conflict_review").fetchone()[0] == 0
+
+
+# ── Task-10 Minor-5: a glossary conflict must open under the SAME schema-preserving logical_ref the
+# object's evidence/decisions use — not the schema-forced-public row key. ──
+def test_conflict_opens_under_schema_preserving_ref(db):
+    _seal()
+    schema_ref = normalize_ref(_SOURCE, "dpl_eib_compliance", "accounts", "balance")
+    public_ref = normalize_ref(_SOURCE, None, "accounts", "balance")
+    assert schema_ref != public_ref                                 # they diverge for a non-public schema
+    csv_text = (
+        _HEADER
+        + "dpl_eib_compliance.accounts.balance,Account Balance,The ledger balance.,Deposits,,\n"
+        + "dpl_eib_compliance.accounts.balance,Account Balance,A DIFFERENT definition.,Deposits,,\n")
+    upload = read_glossary(csv_text, source=_SOURCE)
+    res = ingest_upload(db, _SOURCE, upload.rows, actor=_actor(), now=NOW, client=None,
+                        glossary=upload)
+    assert res.status == "ingested"
+
+    conflict = db.execute(
+        "SELECT logical_ref, field_name FROM conflict_review").fetchone()
+    assert conflict is not None
+    assert conflict[0] == schema_ref                                # schema-preserving, NOT flattened
+    assert conflict[1] == "definition"
+
+
+# ── Task-10 Minor-6: flag_pending_revalidation is idempotent per (logical_ref, field_name, pending). ──
+def test_flag_pending_revalidation_is_idempotent(db):
+    id1 = flag_pending_revalidation(db, logical_ref=_BAL_REF, field_name="sensitivity",
+                                    reason="first flag", source_snapshot_id="snap-1", now=NOW)
+    id2 = flag_pending_revalidation(db, logical_ref=_BAL_REF, field_name="sensitivity",
+                                    reason="second flag", source_snapshot_id="snap-2", now=NOW)
+
+    assert id1 == id2                                               # the same pending flag, not a dup
+    n = db.execute(
+        "SELECT count(*) FROM field_revalidation WHERE logical_ref = %s AND field_name = 'sensitivity' "
+        "AND status = 'pending'", (_BAL_REF,)).fetchone()[0]
+    assert n == 1

@@ -38,8 +38,20 @@ def flag_pending_revalidation(
     stales human evidence — that guard lives in :func:`overlay.field_evidence.stale_source_evidence`,
     which is producer-scoped); instead the load-bearing value is blocked until a human re-confirms.
     The block is enforced by :func:`active_disqualifiers_for` returning
-    ``CONFIRMATION_PENDING_REVALIDATION``, which the field's policy honours."""
+    ``CONFIRMATION_PENDING_REVALIDATION``, which the field's policy honours.
+
+    IDEMPOTENT per ``(logical_ref, field_name, status='pending')`` (Task-10 Minor-6): a repeated
+    material-changed re-upload re-flagging the same field must not accumulate duplicate pending rows.
+    An existing pending flag is returned as-is (``active_disqualifiers_for`` already blocks on it), so
+    the flag stays a single row until a human clears it."""
     now = now or datetime.now(UTC)
+    existing = conn.execute(
+        "SELECT revalidation_id FROM field_revalidation "
+        "WHERE logical_ref = %s AND field_name = %s AND status = 'pending' LIMIT 1",
+        (logical_ref, field_name),
+    ).fetchone()
+    if existing is not None:
+        return existing[0]   # already pending — idempotent, don't mint a duplicate
     revalidation_id = mint_id("frv")
     conn.execute(
         """

@@ -108,3 +108,48 @@ def test_glossary_ingest_end_to_end(db, monkeypatch):
     assert readiness.operational_status == "blocked"                # grain/join are not promoted in Phase 1
     assert all(r.cause for r in readiness.blocking_requirements)    # every blocker carries a cause
     assert CAUSE_NOT_PROMOTED in {r.cause for r in readiness.blocking_requirements}
+
+
+# ── Task-10 Important-2: a NON-public-schema glossary (the FTR norm, e.g. DPL_EIB_COMPLIANCE.…) still
+# projects its DISPLAY values + decision links into graph_node. Evidence is keyed schema-preserving,
+# but build_graph stores the column node PUBLIC-FLATTENED; the projection key must match the flat node,
+# or the UPDATE matches ZERO rows and the projection silently never lands. ──
+_SCHEMA_SOURCE = "gloss_ftr"
+_SCHEMA_REF = normalize_ref(_SCHEMA_SOURCE, "dpl_eib_compliance", "accounts", "balance")
+
+
+def test_non_public_schema_glossary_projects_into_graph_node(db, monkeypatch):
+    _seal()
+    monkeypatch.setenv("OVERLAY_ENRICH_CONCEPT_MODE", "batch")
+    csv_text = (
+        "physical_name,business_term,description_business_definition,data_domain,bian_path,fibo_path\n"
+        f"dpl_eib_compliance.accounts.balance,Account Balance,{_BAL_DEF},Deposits,"
+        "Product/CurrentAccount,fibo-fbc:Balance\n")
+    upload = read_glossary(csv_text, source=_SCHEMA_SOURCE)
+    (bal_row,) = upload.rows
+    client = FakeLLM(script={
+        _CONCEPT_TASK: FakeResponse(
+            output={"results": [{"ref": content_hash(bal_row), "concept": "monetary_stock"}]}),
+        _DOMAIN_TASK: FakeResponse(output={"domain": "deposits"}),
+    })
+
+    res = ingest_upload(db, _SCHEMA_SOURCE, upload.rows, actor=_actor(), now=NOW, client=client,
+                        glossary=upload)
+    assert res.status == "ingested"
+
+    # Evidence landed under the SCHEMA-PRESERVING ref.
+    assert read_active_field_evidence(db, _SCHEMA_REF, "definition")
+
+    # The graph node is PUBLIC-FLATTENED; the projection must still reach it. The `*_decision_id` link
+    # columns are written ONLY by resolve-and-project (build_graph never sets them), so they are the
+    # true proof the projection landed — before the fix they were NULL (key matched zero rows).
+    row = db.execute(
+        "SELECT concept, definition, concept_decision_id, definition_decision_id FROM graph_node "
+        "WHERE catalog_source = %s AND object_ref = 'public.accounts.balance'",
+        (_SCHEMA_SOURCE,)).fetchone()
+    assert row is not None
+    concept, definition, concept_decision_id, definition_decision_id = row
+    assert concept == "monetary_stock"                              # DISPLAY concept projected
+    assert definition.startswith("The ledger balance of the account.")
+    assert concept_decision_id is not None                         # display ≠ authority link landed
+    assert definition_decision_id is not None
