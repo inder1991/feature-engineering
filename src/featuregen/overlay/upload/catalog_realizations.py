@@ -83,11 +83,9 @@ def normalize_realization(
         conflict=oriented is not global_rel.cardinality, reversed_authoring=reversed_)
 
 
-_SCHEMA = "public"
-
-
 def table_of(column_object_ref: str) -> str:
-    """The table object_ref of a column object_ref: ``public.accounts.customer_id`` -> ``public.accounts``."""
+    """The table object_ref of a column object_ref: ``public.accounts.customer_id`` -> ``public.accounts``.
+    Precondition: expects a COLUMN object_ref (``public.<table>.<column>``); a bare table ref is over-stripped."""
     return column_object_ref.rsplit(".", 1)[0]
 
 
@@ -154,7 +152,7 @@ def realization_fingerprint(conn, catalog_source: str) -> str:
     return hashlib.sha256(parts.encode()).hexdigest()
 
 
-def _join_edges(conn, catalog_source: str):
+def _join_edges(conn, catalog_source: str) -> list[tuple[str, str, str | None]]:
     """Intra-catalog declared join edges (both endpoints in THIS catalog — a cross-source target is a
     3B.2B bridge concern, not a realization)."""
     return conn.execute(
@@ -194,7 +192,8 @@ def derive_catalog_realizations(conn, catalog_source: str) -> CatalogRealization
             catalog_source=catalog_source,
             from_object_ref=from_table, from_object_grain=fg, to_object_ref=to_table, to_object_grain=tg,
             from_key_ref=from_key, from_key_entity=fke, to_key_ref=to_key, to_key_entity=tke,
-            declared_cardinality=(norm.declared_cardinality if norm else declared),
+            declared_cardinality=declared,
+            reversed_authoring=(norm.reversed_authoring if norm else False),
             authority=RealizationAuthority.DECLARED_JOIN, status=RelationshipStatus.ACTIVE)
         if norm is None:
             local.append(rel)

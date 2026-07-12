@@ -139,8 +139,31 @@ def test_derive_binds_the_accounts_customer_realization(db):
     assert (r.from_key_entity, r.to_key_entity) == ("customer", "customer")      # join-KEY entity
     assert r.from_object_ref == "public.accounts" and r.to_object_ref == "public.customer_master"
     assert r.declared_cardinality is Cardinality.MANY_TO_ONE
+    assert r.reversed_authoring is False
     assert r.authority is RealizationAuthority.DECLARED_JOIN
     assert result.conflicts == () and result.local_relationships == ()
+
+
+def test_reverse_authored_realization_is_physically_consistent(db):
+    # A join authored FROM a customer-grain table TO an account-grain table (physical 1:N: one customer,
+    # many accounts). It binds to the account_to_customer global via the REVERSE lookup — the stored record
+    # must stay in the physical orientation (grains customer->account, declared 1:N) with reversed_authoring
+    # True, NOT re-oriented to the global's many_to_one.
+    catalog = [
+        (CanonicalRow("rev", "customers", "customer_id", "integer", is_grain=True), "customer_id"),
+        (CanonicalRow("rev", "customers", "acct_id", "integer",
+                      joins_to="accounts.account_id", cardinality="1:N"), "account_id"),
+        (CanonicalRow("rev", "accounts", "account_id", "integer", is_grain=True), "account_id"),
+    ]
+    rows = [r for r, _ in catalog]
+    build_graph(db, "rev", rows, concepts={content_hash(r): c for r, c in catalog})
+    result = derive_catalog_realizations(db, "rev")
+    assert len(result.realizations) == 1 and result.conflicts == () and result.local_relationships == ()
+    r = result.realizations[0]
+    assert r.relationship_id == "account_to_customer"
+    assert (r.from_object_grain, r.to_object_grain) == ("customer", "account")   # PHYSICAL, not re-oriented
+    assert r.declared_cardinality is Cardinality.ONE_TO_MANY                       # physical fanout, not inverted
+    assert r.reversed_authoring is True                                            # reverse vs relationship_id
 
 
 def test_cardinality_conflict_is_surfaced_not_bound(db):

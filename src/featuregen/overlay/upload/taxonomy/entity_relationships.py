@@ -117,7 +117,12 @@ class CatalogEntityRelationshipV1:
     ``from_object_grain -> to_object_grain`` (each = the entity of its table's is_grain column), realized
     by the join KEY (``from_key_ref``/``to_key_ref`` + their entities). Object grain and join-key entity
     are DISTINCT (a join on ``customer_id`` can realize ``account -> customer``). Derived from declared
-    joins in Phase 3B.2A; nothing populated it in 3A (safe to extend)."""
+    joins in Phase 3B.2A; nothing populated it in 3A (safe to extend).
+
+    ``declared_cardinality`` is in the PHYSICAL (authored) orientation — the fanout of
+    ``from_object_grain -> to_object_grain``, matching the stored key refs. ``reversed_authoring=True``
+    means that physical orientation is the REVERSE of ``relationship_id``'s canonical orientation (so the
+    canonical relationship's own cardinality is ``invert_cardinality(declared_cardinality)``)."""
 
     realization_id: str
     relationship_id: str
@@ -133,6 +138,7 @@ class CatalogEntityRelationshipV1:
     declared_cardinality: Cardinality
     authority: RealizationAuthority = RealizationAuthority.DECLARED_JOIN
     status: RelationshipStatus = RelationshipStatus.ACTIVE
+    reversed_authoring: bool = False
 
 
 @dataclass(frozen=True, slots=True)
