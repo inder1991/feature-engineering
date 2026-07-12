@@ -1623,9 +1623,11 @@ def _table_fact_status(conn, source, table, requirement) -> tuple[str, str]:
     if not stream:
         return "missing", CAUSE_NOT_PROMOTED
     status = fold_overlay_state(stream).status
+    # NOTE: the folded pending-proposal status literal is "DRAFT" (state.py), NOT "PROPOSED" (that
+    # is the EVENT type OVERLAY_FACT_PROPOSED). Verified in Task 7. Use "DRAFT" here.
     if status == "VERIFIED":
         return "confirmed", CAUSE_NOT_PROMOTED           # satisfied; not a blocker
-    if status in ("PROPOSED", "PARTIALLY_CONFIRMED"):
+    if status in ("DRAFT", "PARTIALLY_CONFIRMED"):
         return "proposed", CAUSE_PROPOSED_UNCONFIRMED     # in the review queue
     if status == "REJECTED":
         return "missing", CAUSE_FACT_REJECTED             # NOT ready; distinct from never-proposed
