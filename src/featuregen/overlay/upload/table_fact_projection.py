@@ -12,6 +12,8 @@ from featuregen.overlay.upload.upload_catalog import table_ref
 
 
 def project_table_facts_for_ref(conn, *, source: str, table: str,
+                                declared_grain: set[str] | None = None,
+                                declared_as_of: set[str] | None = None,
                                 now: datetime | None = None) -> None:
     """Project the CURRENT verified grain/availability for ONE table onto graph_node — IDEMPOTENTLY.
 
@@ -20,14 +22,30 @@ def project_table_facts_for_ref(conn, *, source: str, table: str,
     changed columns, expired, was rejected, or was replaced on re-verify would leave STALE true flags
     on old columns — a silent correctness rot. Set-only projection is not rebuild-safe; clear-then-set
     is. This single-table entry point is also what a future confirm-time hook calls (there is no
-    confirm API today; see the scope boundary)."""
+    confirm API today; see the scope boundary).
+
+    ``declared_grain`` / ``declared_as_of`` are the columns THIS upload declares as grain / as-of (a
+    file/source attestation ``build_graph`` just wrote is_grain/is_as_of=true for). The clear SPARES
+    them: a file-declared flag is byte-for-byte final (pre-Phase-2 behaviour) and must survive even
+    when the governed grain/availability fact drift-STALEs (resolve_fact then serves None). The clear
+    still resets NON-declared columns, so a prior-cycle CONFIRMED grain on an undeclared column (the
+    bridge's real purpose) still re-projects."""
     adapter = current_catalog_adapter()
-    # 1. Clear this table's specialized-fact projection (rebuild-safe reset).
+    declared_grain = declared_grain or set()
+    declared_as_of = declared_as_of or set()
+    # 1. Clear this table's specialized-fact projection (rebuild-safe reset), EXCLUDING the columns
+    #    this upload declares (their file-declared flag is final and must not be wiped by a staled
+    #    governed fact). Two scoped UPDATEs because is_grain and is_as_of are independent flags.
     conn.execute(
-        "UPDATE graph_node SET is_grain = false, grain_fact_event_id = NULL, "
-        "is_as_of = false, availability_fact_event_id = NULL "
-        "WHERE catalog_source = %s AND table_name = %s AND kind = 'column'",
-        (source, table))
+        "UPDATE graph_node SET is_grain = false, grain_fact_event_id = NULL "
+        "WHERE catalog_source = %s AND table_name = %s AND kind = 'column' "
+        "AND NOT (column_name = ANY(%s))",
+        (source, table, list(declared_grain)))
+    conn.execute(
+        "UPDATE graph_node SET is_as_of = false, availability_fact_event_id = NULL "
+        "WHERE catalog_source = %s AND table_name = %s AND kind = 'column' "
+        "AND NOT (column_name = ANY(%s))",
+        (source, table, list(declared_as_of)))
     ref = table_ref(source, table)
     # 2. Apply the CONFIRMED grain (VERIFIED only; PROPOSED/absent -> value None -> nothing set).
     # `now` MUST be forwarded: resolve_fact's expiry + drift-freshness guards compare against it,
@@ -56,10 +74,22 @@ def project_table_facts_for_ref(conn, *, source: str, table: str,
             ((avail.provenance or {}).get("confirmed_event_id"), source, table, col))
 
 
-def project_table_facts(conn, *, source: str, tables, now: datetime | None = None) -> None:
-    """Project every table's confirmed grain/availability. Idempotent per table (clear-then-set)."""
+def project_table_facts(conn, *, source: str, tables,
+                        declared_grain: dict[str, set[str]] | None = None,
+                        declared_as_of: dict[str, set[str]] | None = None,
+                        now: datetime | None = None) -> None:
+    """Project every table's confirmed grain/availability. Idempotent per table (clear-then-set).
+
+    ``declared_grain`` / ``declared_as_of`` map a table to the columns the current upload declares as
+    grain / as-of; those columns' file-declared flags are SPARED from the clear (see
+    :func:`project_table_facts_for_ref`)."""
+    declared_grain = declared_grain or {}
+    declared_as_of = declared_as_of or {}
     for table in tables:
-        project_table_facts_for_ref(conn, source=source, table=table, now=now)
+        project_table_facts_for_ref(
+            conn, source=source, table=table,
+            declared_grain=declared_grain.get(table), declared_as_of=declared_as_of.get(table),
+            now=now)
 
 
 _TABLE_FACT_TYPES = ("grain", "availability_time")

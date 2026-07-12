@@ -710,16 +710,37 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
     # SPECIALIZED_FACT bridge (Task 9): build_graph just wiped graph_node, so re-project any
     # already-CONFIRMED grain/as-of facts onto the fresh column nodes. UNCONDITIONAL (not
     # flag-gated) — a grain confirmed in a PRIOR cycle must survive a rebuild even when
-    # OVERLAY_TABLE_SYNTH is off. Savepoint + except: a projection DB fault must never poison the
-    # request tx or roll back facts/quarantine (this path must not be able to 500 a flag-off upload).
-    try:
-        with conn.transaction():   # savepoint: a projection fault must not roll back facts
-            project_table_facts(conn, source=catalog_source,
-                                tables=sorted({r.table for r in vr.good}), now=now)
-    except Exception:  # noqa: BLE001 — advisory: re-projection never fails an upload
-        counters.incr("overlay.table_fact_projection.error")
-        logger.warning("advisory grain/as-of re-projection failed for %r — facts intact",
-                       catalog_source, exc_info=True)
+    # OVERLAY_TABLE_SYNTH is off. The clear-then-set SPARES the columns THIS upload declares (their
+    # file-declared is_grain/is_as_of is final and must survive a drift-STALEd governed fact, which
+    # would otherwise resolve None and wipe a just-declared grain — a flag-off byte-for-byte break).
+    declared_grain: dict[str, set[str]] = {}
+    declared_as_of: dict[str, set[str]] = {}
+    for r in vr.good:
+        if r.is_grain:
+            declared_grain.setdefault(r.table, set()).add(r.column)
+        if r.as_of:
+            declared_as_of.setdefault(r.table, set()).add(r.column)
+    if projection_lag(conn, "overlay") > 0:
+        # Under projection lag the overlay_fact_state read model resolve_fact reads is stale: the
+        # clear-then-set could wipe a just-declared grain (a not-yet-projected confirm) or persist a
+        # should-be-stale one. Skip entirely (mirrors the drift path above); build_graph's declared
+        # flags stand and re-project once the projection catches up.
+        counters.incr("overlay.table_fact_projection.skipped_projection_lag")
+        logger.warning("overlay projection lags after ingest of %r — skipping grain/as-of "
+                       "re-projection (re-runs when the projection catches up)", catalog_source)
+    else:
+        # Savepoint + except: a projection DB fault must never poison the request tx or roll back
+        # facts/quarantine (this path must not be able to 500 a flag-off upload).
+        try:
+            with conn.transaction():   # savepoint: a projection fault must not roll back facts
+                project_table_facts(conn, source=catalog_source,
+                                    tables=sorted({r.table for r in vr.good}),
+                                    declared_grain=declared_grain, declared_as_of=declared_as_of,
+                                    now=now)
+        except Exception:  # noqa: BLE001 — advisory: re-projection never fails an upload
+            counters.incr("overlay.table_fact_projection.error")
+            logger.warning("advisory grain/as-of re-projection failed for %r — facts intact",
+                           catalog_source, exc_info=True)
 
     persist_quarantine(conn, catalog_source, vr.quarantined)
     flagged = (f"first upload of '{catalog_source}' ({len(vr.good)} objects) — review recommended"
