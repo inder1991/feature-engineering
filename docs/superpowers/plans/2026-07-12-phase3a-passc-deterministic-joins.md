@@ -63,9 +63,72 @@ v1 was reviewed against the real code; v2 fixes ~13 confirmed defects. Load-bear
 
 ## Task 1: Types + scoring config
 
-Unchanged from v1 except: `PassCConfig.weights` **drops** `namespace_ambiguous`/`namespace_incompatible` (AMBIGUOUS/INCOMPATIBLE never enter scoring — the blocker gates them out); keep `NamespaceCompatibility`, `CardinalityInferenceStatus`, `SignalEvidence`, `JoinCandidateEvidenceV1`, `DEFAULT_CONFIG` (weights: `same_identifier_concept=40`, `related_terms_key_link=50`, `same_column_name=30`, `same_term_name=25`, `same_entity_tag=25`, `same_bian_leaf=10`, `same_fibo_leaf=10`, `compatible_phase2_entity=15`, `one_side_confirmed_grain=10`, `compatible_domain=10`), `negative_concepts`, `mixed_bian_leaves`, thresholds 80/50, `CONFIG_VERSION`, `ALGORITHM_VERSION`.
+**Files:** Create `src/featuregen/overlay/upload/passc/__init__.py`, `.../passc/types.py`; Test `tests/featuregen/overlay/upload/passc/test_types.py`.
 
-- [ ] Tests: enums + config defaults + `JoinCandidateEvidenceV1` `asdict` round-trip. Implement `types.py`. Fail→pass→commit. (See v1 code; delete the two dead namespace weights.)
+**Interfaces — Produces:** `NamespaceCompatibility`, `CardinalityInferenceStatus` (StrEnum); `SignalEvidence`, `JoinCandidateEvidenceV1` (frozen dataclasses); `PassCConfig` + `DEFAULT_CONFIG`, `CONFIG_VERSION`, `ALGORITHM_VERSION`.
+
+- [ ] **Step 1: Failing test**
+```python
+from featuregen.overlay.upload.passc.types import (
+    NamespaceCompatibility, CardinalityInferenceStatus, SignalEvidence,
+    JoinCandidateEvidenceV1, DEFAULT_CONFIG, CONFIG_VERSION, ALGORITHM_VERSION)
+def test_enums_and_config_defaults():
+    assert NamespaceCompatibility.COMPATIBLE == "compatible"
+    assert set(NamespaceCompatibility) >= {NamespaceCompatibility.COMPATIBLE, NamespaceCompatibility.POSSIBLE,
+        NamespaceCompatibility.AMBIGUOUS, NamespaceCompatibility.INCOMPATIBLE}
+    assert DEFAULT_CONFIG.strong_threshold == 80 and DEFAULT_CONFIG.weak_threshold == 50
+    assert "amount" in DEFAULT_CONFIG.negative_concepts and "date" in DEFAULT_CONFIG.negative_concepts
+    assert DEFAULT_CONFIG.weights["same_identifier_concept"] == 40
+    assert "namespace_ambiguous" not in DEFAULT_CONFIG.weights   # AMBIGUOUS/INCOMPATIBLE are gated out, not scored
+    assert CONFIG_VERSION and ALGORITHM_VERSION
+def test_evidence_asdict_round_trip():
+    import dataclasses
+    ev = JoinCandidateEvidenceV1(candidate_id="c1", from_ref="a", to_ref="b", column_pairs=(("cif_id","cif_id"),),
+        proposed_direction="N:1", proposed_cardinality="N:1",
+        cardinality_status=CardinalityInferenceStatus.INFERRED_FROM_CONFIRMED_GRAIN, bucket="strong", score=95,
+        positive_signals=(), negative_signals=(), namespace_compatibility=NamespaceCompatibility.COMPATIBLE,
+        namespace_reason_codes=("same_column_entity",), grain_evidence=(), missing_requirements=(),
+        llm_annotations=(), explanation="…", producer="deterministic_pass_c", config_version=CONFIG_VERSION,
+        candidate_algorithm_version=ALGORITHM_VERSION, source_snapshot_id="snap")
+    assert dataclasses.asdict(ev)["score"] == 95
+```
+- [ ] **Step 3: Implement `types.py`**
+```python
+from __future__ import annotations
+from dataclasses import dataclass
+from enum import StrEnum
+CONFIG_VERSION = "passc-config-v1"
+ALGORITHM_VERSION = "passc-algo-v1"
+class NamespaceCompatibility(StrEnum):
+    COMPATIBLE = "compatible"; POSSIBLE = "possible"; AMBIGUOUS = "ambiguous"; INCOMPATIBLE = "incompatible"
+class CardinalityInferenceStatus(StrEnum):
+    INFERRED_FROM_CONFIRMED_GRAIN = "inferred_from_confirmed_grain"; MISSING_GRAIN = "missing_grain"
+    AMBIGUOUS_BOTH_GRAINS = "ambiguous_both_grains"; MANY_TO_MANY_RISK = "many_to_many_risk"
+@dataclass(frozen=True, slots=True)
+class SignalEvidence:
+    signal_name: str; score_delta: int; evidence_refs: tuple[str, ...]; explanation: str
+@dataclass(frozen=True, slots=True)
+class JoinCandidateEvidenceV1:
+    candidate_id: str; from_ref: str; to_ref: str; column_pairs: tuple[tuple[str, str], ...]
+    proposed_direction: str | None; proposed_cardinality: str | None
+    cardinality_status: CardinalityInferenceStatus; bucket: str; score: int
+    positive_signals: tuple[SignalEvidence, ...]; negative_signals: tuple[SignalEvidence, ...]
+    namespace_compatibility: NamespaceCompatibility; namespace_reason_codes: tuple[str, ...]
+    grain_evidence: tuple[str, ...]; missing_requirements: tuple[str, ...]; llm_annotations: tuple[str, ...]
+    explanation: str; producer: str; config_version: str; candidate_algorithm_version: str; source_snapshot_id: str
+@dataclass(frozen=True, slots=True)
+class PassCConfig:
+    weights: dict[str, int]; negative_concepts: frozenset[str]
+    strong_threshold: int = 80; weak_threshold: int = 50
+    mixed_bian_leaves: frozenset[str] = frozenset({"customer and counterparty identification"})
+DEFAULT_CONFIG = PassCConfig(
+    weights={"same_identifier_concept": 40, "related_terms_key_link": 50, "same_column_name": 30,
+             "same_term_name": 25, "same_column_entity": 25, "same_bian_leaf": 10, "same_fibo_leaf": 10,
+             "compatible_phase2_entity": 15, "one_side_confirmed_grain": 10, "compatible_domain": 10},
+    negative_concepts=frozenset({"amount", "balance", "rate", "date", "timestamp", "description", "name",
+        "status", "free_text", "address", "phone", "email", "currency", "flag", "score"}))
+```
+- [ ] **Step 2/4: Run fail (ImportError) → pass. Step 5: Commit.**
 
 ---
 
@@ -138,6 +201,7 @@ return N.AMBIGUOUS, ("generic_reference_without_context",)
 **Files:** Add `block_candidates` to `.../passc/candidates.py`; Test `test_block.py`.
 
 - [ ] `block_candidates(columns, *, allow_self_join=False) -> [CandidatePair]` — distinct-table pairs of `is_join_key_eligible` columns where `classify_namespace ∈ {COMPATIBLE, POSSIBLE}`; deterministic (sort by `object_ref`). **AMBIGUOUS/INCOMPATIBLE are excluded here** (they never reach `score`/`propose`); AMBIGUOUS pairs are surfaced only as weak diagnostics by Task 9 (recomputed), so there is exactly one story: gate=COMPATIBLE|POSSIBLE.
+- [ ] Implement: `CandidatePair(a: ColMeta, b: ColMeta, namespace, namespace_reasons)` frozen dataclass; `block_candidates` sorts `columns` by `object_ref`, then double-loops `i<j` over `is_join_key_eligible` columns with `a.table != b.table` (unless `allow_self_join`), calls `classify_namespace(a,b)`, and yields a `CandidatePair` when the namespace ∈ {COMPATIBLE, POSSIBLE}. Deterministic (sorted).
 - [ ] Tests: two `cif_id` across tables → paired; `cust_name`/amount never paired; a mixed-leaf/INCOMPATIBLE pair excluded; self-table excluded; stable order. Do NOT assert "same-BIAN-leaf → weak" (it's AMBIGUOUS → excluded here). Fail→pass→commit.
 
 ---
