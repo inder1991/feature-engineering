@@ -23,6 +23,7 @@ from featuregen.overlay.upload.taxonomy.entity_relationships import (
     EntityRelationshipDefinitionV1,
     EntityRelationshipProposalV1,
     GraphEdgeAuthority,
+    RealizationAuthority,
     RelationshipProposalStatus,
     RelationshipStatus,
     RelationshipType,
@@ -94,12 +95,14 @@ def test_invalid_version_rejected():
 
 def _catalog(**overrides) -> CatalogEntityRelationshipV1:
     base = dict(
-        realization_id="core_accounts:accounts.account_id->accounts.customer_id",
-        relationship_id="account_to_customer", catalog_source="core_accounts",
-        from_object_ref="accounts.account_id", to_object_ref="accounts.customer_id",
-        resolved_from_entity="account", resolved_to_entity="customer",
-        declared_cardinality=Cardinality.MANY_TO_ONE, adapter_id="core_banking_adapter",
-        authority=GraphEdgeAuthority.CATALOG_DECLARED, status=RelationshipStatus.ACTIVE)
+        realization_id="core:public.accounts->public.customer_master",
+        relationship_id="account_to_customer", catalog_source="core",
+        from_object_ref="public.accounts", from_object_grain="account",
+        to_object_ref="public.customer_master", to_object_grain="customer",
+        from_key_ref="public.accounts.customer_id", from_key_entity="customer",
+        to_key_ref="public.customer_master.customer_id", to_key_entity="customer",
+        declared_cardinality=Cardinality.MANY_TO_ONE,
+        authority=RealizationAuthority.DECLARED_JOIN, status=RelationshipStatus.ACTIVE)
     base.update(overrides)
     return CatalogEntityRelationshipV1(**base)
 
@@ -108,14 +111,14 @@ def test_catalog_relationship_validation():
     validate_catalog_relationship(_catalog(), known=KNOWN)
     with pytest.raises(ValueError, match="empty"):
         validate_catalog_relationship(_catalog(catalog_source=""), known=KNOWN)
-    with pytest.raises(ValueError, match="empty"):        # whitespace-only is empty
-        validate_catalog_relationship(_catalog(adapter_id="   "), known=KNOWN)
-    with pytest.raises(ValueError, match="identical"):
-        validate_catalog_relationship(_catalog(to_object_ref="accounts.account_id"), known=KNOWN)
+    with pytest.raises(ValueError, match="empty"):
+        validate_catalog_relationship(_catalog(from_key_ref="  "), known=KNOWN)
     with pytest.raises(ValueError, match="unknown entity"):
-        validate_catalog_relationship(_catalog(resolved_to_entity="not_an_entity"), known=KNOWN)
-    with pytest.raises(ValueError, match="authority"):
-        validate_catalog_relationship(_catalog(authority=GraphEdgeAuthority.ENTITY_BRIDGE), known=KNOWN)
+        validate_catalog_relationship(_catalog(to_object_grain="not_an_entity"), known=KNOWN)
+    with pytest.raises(ValueError, match="unknown entity"):
+        validate_catalog_relationship(_catalog(from_key_entity="not_an_entity"), known=KNOWN)
+    with pytest.raises(ValueError, match="identical"):
+        validate_catalog_relationship(_catalog(to_object_ref="public.accounts"), known=KNOWN)
 
 
 def _bridge(**overrides) -> EntityBridgeV1:
