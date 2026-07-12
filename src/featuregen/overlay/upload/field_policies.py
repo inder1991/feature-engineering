@@ -121,6 +121,15 @@ _BEHAVIOURAL = FieldPolicy(
 )
 
 
+# table_role / primary_entity / event_or_snapshot — advisory TABLE-level fields (Phase 2 Pass B).
+# SHOWN on the table graph_node, NEVER load-bearing: the RECOMMENDATION ceiling structurally bars a
+# load-bearing value however strong the evidence (display ≠ authority, must-prove #4/#5).
+_TABLE_ADVISORY = _recommendation(
+    display_rule=AnyOf((_LLM_PROPOSED, _SOURCE_PROPOSED, _SOURCE_ATTESTED, _HUMAN_CONFIRMED)),
+    operational_rule=_SOURCE_OR_HUMAN,
+)
+
+
 # The registry: object-field name -> its policy. Keyed by the field_name written to field_evidence.
 _POLICIES: dict[str, FieldPolicy] = {
     "concept": _CONCEPT,
@@ -132,6 +141,9 @@ _POLICIES: dict[str, FieldPolicy] = {
     "sensitivity": _SENSITIVITY,
     "additivity": _BEHAVIOURAL,
     "temporal_role": _BEHAVIOURAL,
+    "table_role": _TABLE_ADVISORY,
+    "primary_entity": _TABLE_ADVISORY,
+    "event_or_snapshot": _TABLE_ADVISORY,   # advisory: informs modelling, never load-bearing
 }
 
 

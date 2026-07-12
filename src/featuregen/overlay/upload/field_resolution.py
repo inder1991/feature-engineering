@@ -88,6 +88,9 @@ _DISPLAY_COLUMN: dict[str, str] = {
     "definition": "definition",
     "domain": "domain",
     "additivity": "additivity",
+    "table_role": "table_role",
+    "primary_entity": "primary_entity",
+    "event_or_snapshot": "event_or_snapshot",
 }
 
 # The companion *_decision_id link column per projected field (the display ≠ authority pointer).
@@ -99,6 +102,9 @@ _DECISION_LINK_COLUMN: dict[str, str] = {
     "domain": "domain_decision_id",
     "additivity": "additivity_decision_id",
     "logical_representation": "logical_type_decision_id",
+    "table_role": "table_role_decision_id",
+    "primary_entity": "primary_entity_decision_id",
+    "event_or_snapshot": "event_or_snapshot_decision_id",
 }
 
 
