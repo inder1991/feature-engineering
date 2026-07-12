@@ -195,6 +195,11 @@ _MATERIAL_FIELDS = frozenset({"definition"})
 # (Task-10 Important-3). Kept in sync with `_write_glossary_source_evidence` / `_parser_evidence`.
 _SOURCE_FIELDS: tuple[str, ...] = ("definition", "domain", "business_term", "bian_path", "fibo_path")
 _PARSER_FIELDS: tuple[str, ...] = ("logical_representation", "semantic_type")
+# The full set of behavioural fields TAXONOMY can DERIVE from a concept (see `derive_concept_evidence`).
+# `additivity` is conditional (skipped for an `n/a` concept), so a reclassification to a non-additive
+# concept emits no additivity — its prior ACTIVE row must be reconciled present->absent (Important-3).
+_TAXONOMY_FIELDS: tuple[str, ...] = (
+    "additivity", "temporal_role", "sensitivity_floor", "leakage_anchor")
 
 # A `keep_input_hash` that can never equal a real per-field input hash (always a 64-char sha256 hex
 # digest — this contains non-hex chars), so `stale_source_evidence(..., keep_input_hash=_STALE_ALL)`
@@ -373,16 +378,28 @@ def _write_glossary_taxonomy_evidence(
 ) -> None:
     """Write TAXONOMY-derived behavioural evidence for a column whose concept was classified this run
     (§3.2 strength propagation: derived at PROPOSED from the llm/proposed concept). An unknown /
-    unclassified concept derives nothing."""
+    unclassified concept derives nothing.
+
+    Present->absent reconciliation (Important-3): after writing the derived triples, stale the
+    TAXONOMY producer's prior ACTIVE rows for every derivable field this run did NOT emit — a re-upload
+    reclassifying an additive concept to a non-additive one emits no ``additivity``, so the prior
+    ``additivity='additive'`` row must be STALED, else ``resolve_and_project`` re-projects the wrong
+    aggregation semantics. Mirrors the SOURCE/PARSER reconciliation; PRODUCER-SCOPED (taxonomy only)."""
     concept = concepts.get(content_hash(row))
-    if not concept:
-        return
-    for field_name, value, strength in derive_concept_evidence(concept, AssertionStrength.PROPOSED):
-        _write_producer_field(
-            conn, logical_ref=logical_ref, field_name=field_name, value=value,
-            producer=EvidenceProducer.TAXONOMY, strength=strength,
-            producer_ref=snapshot_id, snapshot_id=snapshot_id, material=concept,
-        )
+    present: set[str] = set()
+    if concept:
+        for field_name, value, strength in derive_concept_evidence(
+                concept, AssertionStrength.PROPOSED):
+            present.add(field_name)
+            _write_producer_field(
+                conn, logical_ref=logical_ref, field_name=field_name, value=value,
+                producer=EvidenceProducer.TAXONOMY, strength=strength,
+                producer_ref=snapshot_id, snapshot_id=snapshot_id, material=concept,
+            )
+    _stale_absent_fields(
+        conn, logical_ref=logical_ref, producer=EvidenceProducer.TAXONOMY,
+        all_fields=_TAXONOMY_FIELDS, present=present,
+    )
 
 
 def _flag_human_confirmed_revalidation(conn, *, logical_ref: str, snapshot_id: str,
@@ -565,23 +582,34 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
     if client is not None:
         # Three INDEPENDENT advisory failure domains (spec C1): a failure in one task must not
         # discard another's already-computed enrichment. Each degrades search, never the facts.
+        #
+        # SAVEPOINTED (Important-4, same class as the Task-10 compute_readiness fix ~l.489): each
+        # enrichment call does UN-savepointed writes (cache put/get, llm_call + security-audit
+        # records). A DB-class fault (serialization failure / timeout / constraint) is swallowed as a
+        # Python exception by the bare except, yet leaves the REQUEST tx aborted — and the very next
+        # UNGUARDED statement (`build_graph`'s `DELETE FROM graph_edge`) would then raise
+        # InFailedSqlTransaction and roll back the already-asserted FACTS. The savepoint contains the
+        # abort so a poisoned enrichment tx can never reach build_graph — enrichment degrades, facts hold.
         try:
             # Glossary carry-forward (Task 6): thread the sidecar + bindings + snapshot so Pass A
             # writes item-level LLM concept evidence. Non-glossary keeps the exact original call.
-            concepts = (
-                enrich_concepts(conn, vr.good, client, actor, glossary=glossary,
-                                bindings=bindings, source_snapshot_id=snapshot_id)
-                if is_glossary
-                else enrich_concepts(conn, vr.good, client, actor)
-            )
+            with conn.transaction():
+                concepts = (
+                    enrich_concepts(conn, vr.good, client, actor, glossary=glossary,
+                                    bindings=bindings, source_snapshot_id=snapshot_id)
+                    if is_glossary
+                    else enrich_concepts(conn, vr.good, client, actor)
+                )
         except Exception:  # noqa: BLE001
             logger.warning("advisory concept enrichment failed for %r", catalog_source, exc_info=True)
         try:
-            definitions = draft_definitions(conn, vr.good, client, actor, concepts=concepts)
+            with conn.transaction():
+                definitions = draft_definitions(conn, vr.good, client, actor, concepts=concepts)
         except Exception:  # noqa: BLE001
             logger.warning("advisory definition enrichment failed for %r", catalog_source, exc_info=True)
         try:
-            domains = classify_domains(conn, vr.good, client, actor)
+            with conn.transaction():
+                domains = classify_domains(conn, vr.good, client, actor)
         except Exception:  # noqa: BLE001
             logger.warning("advisory domain enrichment failed for %r", catalog_source, exc_info=True)
     build_graph(conn, catalog_source, vr.good, concepts, definitions, domains)

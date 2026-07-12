@@ -68,10 +68,12 @@ def validate_rows(rows: list[CanonicalRow],
 
     `profile` (spec §U) makes the ONE validator profile-aware — it is NOT a second, forked validator.
     A physical `type` is required only when the profile ATTESTS it: a technical CSV (or the default
-    `profile=None` = today's behaviour) requires a real type, and the glossary sentinel `UNKNOWN_TYPE`
-    counts as missing; a glossary profile does not attest `type`, so an `unknown`/absent type passes as
-    a readiness gap (Task 9), never a quarantine. EVERY other check — identity present, source-mismatch,
-    sensitivity validity, dedup/conflict — is identical across profiles."""
+    `profile=None` = today's behaviour) requires a NON-EMPTY type; a glossary profile does not attest
+    `type`, so an absent/`unknown` type passes as a readiness gap (Task 9), never a quarantine. The
+    `UNKNOWN_TYPE` sentinel is interpreted as "no type attested" ONLY under a glossary profile; under a
+    type-attesting profile or `profile=None`, a literal `"unknown"` is just a present type value
+    (MINOR-6 technical-path parity). EVERY other check — identity present, source-mismatch, sensitivity
+    validity, dedup/conflict — is identical across profiles."""
     if not rows:
         return ValidationResult(structural_error="empty upload: no rows")
     if all(not r.source for r in rows):
@@ -87,11 +89,12 @@ def validate_rows(rows: list[CanonicalRow],
     conflicted: set[tuple[str, str, str]] = set()
 
     for i, r in enumerate(rows):
+        # A physical `type` is missing when the profile requires it AND the cell is empty. The
+        # `UNKNOWN_TYPE` sentinel is meaningful ONLY under a non-type-attesting (glossary) profile —
+        # where `type` is not required at all and the sentinel passes as a readiness gap. Under a
+        # type-attesting profile (technical) OR the default `profile=None`, a literal `"unknown"` is a
+        # PRESENT type value like any other (MINOR-6: do not quarantine it — pre-branch behaviour).
         missing = [f for f in required if not getattr(r, f)]
-        if type_required and r.type == UNKNOWN_TYPE:
-            # `unknown` is a non-empty sentinel, so the presence check above accepts it; but under a
-            # type-attesting profile it is NOT a real physical type — treat it as a missing type.
-            missing.append("type")
         if missing:
             quarantined.append(RowError(i, f"missing required field(s): {', '.join(missing)}", r))
             continue

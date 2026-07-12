@@ -19,6 +19,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 
 from featuregen.contracts.envelopes import IdentityEnvelope
+from featuregen.intake.llm import FakeLLM, FakeResponse
 from featuregen.overlay.config import OverlayConfig, register_overlay_config
 from featuregen.overlay.evidence import AssertionStrength, EvidenceProducer
 from featuregen.overlay.field_authority import Disqualifier
@@ -28,6 +29,7 @@ from featuregen.overlay.field_evidence import (
     record_field_evidence,
 )
 from featuregen.overlay.upload.canonical import CanonicalRow
+from featuregen.overlay.upload.enrich import content_hash
 from featuregen.overlay.upload.field_resolution import is_feature_eligible, resolve_and_project
 from featuregen.overlay.upload.field_revalidation import (
     active_disqualifiers_for,
@@ -314,6 +316,132 @@ def test_conflict_opens_under_schema_preserving_ref(db):
     assert conflict is not None
     assert conflict[0] == schema_ref                                # schema-preserving, NOT flattened
     assert conflict[1] == "definition"
+
+
+# ── Whole-branch review IMPORTANT-2: the LLM concept producer must route through producer-scoped
+# staleness (like SOURCE/PARSER/TAXONOMY), AND must write concept evidence in BOTH single and batch
+# modes (single is the default). ──
+def _ingest_llm(db, csv_text: str, *, concept: str, now: datetime, batch: bool) -> None:
+    """Ingest a glossary through the REAL pipeline with an LLM classifying every column as ``concept``."""
+    upload = read_glossary(csv_text, source=_SOURCE)
+    if batch:
+        results = [{"ref": content_hash(r), "concept": concept}
+                   for r in upload.rows if r.table and r.column]
+        concept_resp = FakeResponse(output={"results": results})
+    else:
+        concept_resp = FakeResponse(output={"concept": concept})
+    client = FakeLLM(script={
+        "overlay.enrich.concept": concept_resp,
+        "overlay.enrich.domain": FakeResponse(output={"domain": "Deposits"})})
+    res = ingest_upload(db, _SOURCE, upload.rows, actor=_actor(), now=now, client=client,
+                        glossary=upload)
+    assert res.status == "ingested"
+
+
+def _graph_concept(db, object_ref: str):
+    return db.execute(
+        "SELECT concept FROM graph_node WHERE catalog_source = %s AND object_ref = %s",
+        (_SOURCE, object_ref)).fetchone()[0]
+
+
+def test_reclassifying_reupload_stales_prior_llm_concept(db, monkeypatch):
+    """(a) A reclassifying re-upload STALEs the prior LLM concept row (only ONE active concept remains)
+    and graph_node.concept shows the NEW concept — not NULLed by a two-live-rows resolver conflict."""
+    _seal()
+    monkeypatch.setenv("OVERLAY_ENRICH_CONCEPT_MODE", "batch")
+    _ingest_llm(db, _glossary_csv("The ledger balance."), concept="monetary_flow", now=NOW, batch=True)
+    ev1 = read_active_field_evidence(db, _BAL_REF, "concept")
+    assert [e.proposed_value for e in ev1] == ["monetary_flow"]
+    assert ev1[0].producer == "llm"
+
+    # Re-upload: CHANGED definition -> the column is reclassified to a different concept.
+    _ingest_llm(db, _glossary_csv("The account number (revised)."),
+                concept="account_identifier", now=NOW, batch=True)
+
+    active = read_active_field_evidence(db, _BAL_REF, "concept")
+    assert [e.proposed_value for e in active] == ["account_identifier"]   # exactly ONE active row
+    assert _graph_concept(db, "public.accounts.balance") == "account_identifier"  # not NULLed
+
+
+def test_single_mode_glossary_writes_concept_evidence(db):
+    """(b) SINGLE-mode (the default) glossary enrichment writes a concept field_evidence row — before
+    the fix, concept evidence was written ONLY in batch mode, so the default flow wrote none."""
+    _seal()
+    _ingest_llm(db, _glossary_csv("The ledger balance."), concept="monetary_flow", now=NOW,
+                batch=False)
+
+    ev = read_active_field_evidence(db, _BAL_REF, "concept")
+    assert len(ev) == 1
+    assert ev[0].proposed_value == "monetary_flow"
+    assert ev[0].producer == "llm" and ev[0].strength == "proposed"
+
+
+# ── Whole-branch review IMPORTANT-3: TAXONOMY evidence needs present->absent staleness. A re-upload
+# reclassifying an ADDITIVE concept to a non-additive one emits no additivity -> the prior
+# additivity@taxonomy row must be STALED, not left live. ──
+def test_reupload_reclassifying_additive_to_identifier_stales_taxonomy_additivity(db, monkeypatch):
+    _seal()
+    monkeypatch.setenv("OVERLAY_ENRICH_CONCEPT_MODE", "batch")
+    # Upload 1: monetary_flow is ADDITIVE -> a taxonomy additivity='additive' row is derived.
+    _ingest_llm(db, _glossary_csv("The ledger balance."), concept="monetary_flow", now=NOW, batch=True)
+    add1 = read_active_field_evidence(db, _BAL_REF, "additivity")
+    assert [e.proposed_value for e in add1] == ["additive"]
+    assert add1[0].producer == "taxonomy"
+
+    # Re-upload: reclassified to account_identifier (additivity='n/a') -> NO additivity is emitted.
+    _ingest_llm(db, _glossary_csv("The account number (revised)."),
+                concept="account_identifier", now=NOW, batch=True)
+
+    # The prior additivity@taxonomy row is STALED (present->absent), nothing ACTIVE remains.
+    assert read_active_field_evidence(db, _BAL_REF, "additivity") == []
+    lifecycles = {lc for (lc,) in db.execute(
+        "SELECT lifecycle FROM field_evidence WHERE logical_ref = %s AND field_name = 'additivity' "
+        "AND producer = 'taxonomy'", (_BAL_REF,)).fetchall()}
+    assert lifecycles == {"stale"}
+
+
+# ── Whole-branch review IMPORTANT-4: an enrichment stage that hits a DB-class error must NOT abort the
+# upload's already-asserted FACTS. Un-savepointed, the poisoned request tx reaches build_graph's
+# unguarded DELETE and 500s, rolling everything back. Each enrichment call is now savepointed. ──
+def _boom_domains(conn, *a, **k):
+    conn.execute("SELECT 1 FROM a_table_that_does_not_exist_xyz")   # DB error -> aborts the request tx
+
+
+def test_enrichment_db_error_does_not_abort_facts_glossary(db, monkeypatch):
+    _seal()
+    from featuregen.overlay.upload import ingest as ingest_mod
+    monkeypatch.setattr(ingest_mod, "classify_domains", _boom_domains)
+
+    upload = read_glossary(_glossary_csv("The ledger balance."), source=_SOURCE)
+    client = FakeLLM(script={
+        "overlay.enrich.concept": FakeResponse(output={"concept": "monetary_flow"})})
+    res = ingest_upload(db, _SOURCE, upload.rows, actor=_actor(), now=NOW, client=client,
+                        glossary=upload)
+
+    assert res.status == "ingested"                          # NOT a 500; enrichment degraded only
+    assert db.execute(                                       # the built graph (facts) survived
+        "SELECT count(*) FROM graph_node WHERE catalog_source = %s AND object_ref = %s",
+        (_SOURCE, "public.accounts.balance")).fetchone()[0] == 1
+    assert db.execute("SELECT 1").fetchone()[0] == 1         # the request tx is still usable
+
+
+def test_enrichment_db_error_does_not_abort_facts_technical(db, monkeypatch):
+    """The technical (non-glossary) path takes the SAME enrichment span — a DB fault there must not
+    roll back its facts either."""
+    _seal()
+    from featuregen.overlay.upload import ingest as ingest_mod
+    monkeypatch.setattr(ingest_mod, "classify_domains", _boom_domains)
+
+    rows = [CanonicalRow("deposits", "accounts", "id", "integer", is_grain=True, definition="the id"),
+            CanonicalRow("deposits", "accounts", "balance", "numeric", definition="the balance")]
+    client = FakeLLM(script={
+        "overlay.enrich.concept": FakeResponse(output={"concept": "monetary_flow"})})
+    res = ingest_upload(db, "deposits", rows, actor=_actor(), now=NOW, client=client)
+
+    assert res.status == "ingested" and res.asserted >= 1    # facts asserted, not rolled back
+    assert db.execute(
+        "SELECT count(*) FROM graph_node WHERE catalog_source = %s AND object_ref = %s",
+        ("deposits", "public.accounts.balance")).fetchone()[0] == 1
 
 
 # ── Task-10 Minor-6: flag_pending_revalidation is idempotent per (logical_ref, field_name, pending). ──

@@ -6,7 +6,12 @@ import logging
 
 from featuregen.intake.llm import LLMClient
 from featuregen.overlay.evidence import AssertionStrength, EvidenceProducer
-from featuregen.overlay.field_evidence import field_input_hash, record_field_evidence
+from featuregen.overlay.field_evidence import (
+    field_input_hash,
+    read_active_field_evidence,
+    record_field_evidence,
+    stale_source_evidence,
+)
 from featuregen.overlay.object_identity import ObjectBinding, may_attach
 from featuregen.overlay.upload import enrich_config
 from featuregen.overlay.upload.canonical import CanonicalRow
@@ -19,6 +24,7 @@ from featuregen.overlay.upload.enrich_batch import BatchItem, run_batched
 from featuregen.overlay.upload.enrich_llm import ENRICHMENT_RUN_ID, audited_enrich_call
 from featuregen.overlay.upload.glossary_reader import GlossaryRecord, GlossaryUpload
 from featuregen.overlay.upload.object_ref import normalize_ref, parse_ref
+from featuregen.overlay.upload.sample_parser import strip_sample_values
 
 logger = logging.getLogger(__name__)
 
@@ -170,7 +176,13 @@ def _concept_metadata(row: CanonicalRow, rec: GlossaryRecord | None) -> dict:
         # `business_definition` (NOT `definition`) is deliberate: the plain `definition` key stays
         # forbidden by the egress filter so a technical upload's free text can never egress (M4); the
         # curated glossary definition rides through under this distinct, unambiguous key.
-        for key, val in (("term_name", rec.term_name), ("business_definition", rec.definition),
+        #
+        # DATA-LEAK BACKSTOP (whole-branch review CRITICAL): an FTR business definition EMBEDS raw
+        # customer sample VALUES in prose ("...representative values such as 3708484836801; 15:07:08
+        # ..."). `strip_sample_values` EXCISES that clause before it egresses, so the classifier sees
+        # the business meaning but never a raw value (the redaction PII backstop misses most of them).
+        for key, val in (("term_name", rec.term_name),
+                         ("business_definition", strip_sample_values(rec.definition)),
                          ("data_domain", rec.domain), ("bian_path", rec.bian_path),
                          ("fibo_path", rec.fibo_path)):
             if val:
@@ -185,14 +197,22 @@ def _write_concept_evidence(conn, *, resolved: dict[str, str], by_hash: dict[str
                             rec_by_tc: dict[tuple[str, str], GlossaryRecord],
                             bindings: dict[str, ObjectBinding] | None,
                             source_snapshot_id: str) -> None:
-    """Write one ``field_evidence`` proposal per glossary column classified THIS run (spec §5.1).
+    """Write one ``field_evidence`` proposal per glossary column classified THIS run (spec §5.1),
+    ROUTED THROUGH producer-scoped staleness + snapshot reuse (whole-branch review Important-2 — the
+    LLM producer must not bypass the machinery every other producer goes through).
 
     ``producer=LLM`` / ``strength=PROPOSED``; ``producer_ref`` is the enrichment run bucket (ties the
     proposal to its immutable llm_call records), ``producer_item_ref`` the batch item ref (content
     hash), ``producer_configuration_hash`` the vocabulary fingerprint. C3: an ``unclassified`` (or any
     non-known) value is NOT a proposal — no evidence. Only ATTACHABLE columns (``may_attach`` on the
-    Task-2 binding, when supplied) get evidence. Fail-soft + txn-safe: each write is savepointed so a
-    single failure logs and is contained, never aborting enrichment or poisoning the caller's txn."""
+    Task-2 binding, when supplied) get evidence.
+
+    Producer-scoped staleness (mirrors ``ingest._write_producer_field``): before writing, the LLM's OWN
+    prior ACTIVE ``concept`` rows whose ``input_hash`` differs from this run's are STALED (a reclassifying
+    re-upload supersedes the old row instead of accumulating a second live one -> no resolver
+    ``_CONFLICT`` NULLing the concept); an UNCHANGED input (same ``input_hash`` already ACTIVE) is REUSED,
+    not re-written. NEVER touches another producer's rows. Fail-soft + txn-safe: each item is savepointed
+    so a single failure logs and is contained, never aborting enrichment or poisoning the caller's txn."""
     for h, concept in resolved.items():
         if concept == UNCLASSIFIED or not is_known_concept(concept):
             continue   # C3: unclassified / invalid is not a proposal
@@ -205,16 +225,25 @@ def _write_concept_evidence(conn, *, resolved: dict[str, str], by_hash: dict[str
             if binding is None or not may_attach(binding):
                 continue   # attachable columns only
         material = meta_by_hash.get(h, {"table": row.table, "column": row.column, "type": row.type})
+        input_hash = field_input_hash(logical_ref=rec.logical_ref, field_name="concept",
+                                      material=material)
         try:
             with conn.transaction():   # savepoint: contain a failed write without poisoning the txn
-                record_field_evidence(
+                # Stale the LLM's own prior ACTIVE concept rows with a DIFFERENT input (a reclassify),
+                # keeping any row that matches this run's input (unchanged -> reuse).
+                stale_source_evidence(
                     conn, logical_ref=rec.logical_ref, field_name="concept",
-                    proposed_value=concept, producer=EvidenceProducer.LLM,
-                    strength=AssertionStrength.PROPOSED, producer_ref=ENRICHMENT_RUN_ID,
-                    producer_item_ref=h, producer_configuration_hash=_vocab_fingerprint(),
-                    source_snapshot_id=source_snapshot_id,
-                    input_hash=field_input_hash(logical_ref=rec.logical_ref, field_name="concept",
-                                                material=material))
+                    producer=EvidenceProducer.LLM, keep_input_hash=input_hash)
+                reused = any(
+                    e.producer == EvidenceProducer.LLM.value and e.input_hash == input_hash
+                    for e in read_active_field_evidence(conn, rec.logical_ref, "concept"))
+                if not reused:
+                    record_field_evidence(
+                        conn, logical_ref=rec.logical_ref, field_name="concept",
+                        proposed_value=concept, producer=EvidenceProducer.LLM,
+                        strength=AssertionStrength.PROPOSED, producer_ref=ENRICHMENT_RUN_ID,
+                        producer_item_ref=h, producer_configuration_hash=_vocab_fingerprint(),
+                        source_snapshot_id=source_snapshot_id, input_hash=input_hash)
         except Exception:  # noqa: BLE001 — advisory: an evidence-write failure never aborts enrichment
             logger.warning("advisory concept field_evidence write failed for %s", rec.logical_ref,
                            exc_info=True)
@@ -228,8 +257,9 @@ def enrich_concepts(conn, rows: list[CanonicalRow], client: LLMClient, actor=Non
 
     Glossary carry-forward (guarded — non-glossary uploads are UNCHANGED): when ``glossary`` is given,
     each glossary column's concept input ALSO carries its business-semantic sidecar (see
-    ``_concept_metadata``), and — in batch mode — each newly-classified attachable glossary column
-    writes an item-level ``concept`` ``field_evidence`` proposal (see ``_write_concept_evidence``).
+    ``_concept_metadata``), and — in BOTH single and batch modes (Important-2: single is the default)
+    — each newly-classified attachable glossary column writes an item-level ``concept``
+    ``field_evidence`` proposal through producer-scoped staleness (see ``_write_concept_evidence``).
     ``source_snapshot_id`` is required to write evidence (a NOT-NULL column); absent it, enrichment
     still runs and returns concepts, just without the evidence side-effect."""
     by_hash: dict[str, CanonicalRow] = {content_hash(r): r for r in rows}
@@ -239,8 +269,11 @@ def enrich_concepts(conn, rows: list[CanonicalRow], client: LLMClient, actor=Non
     def _meta(row: CanonicalRow) -> dict:
         return _concept_metadata(row, rec_by_tc.get((_norm(row.table), _norm(row.column))))
 
+    # Metadata for every cache-MISS row — the LLM input AND (glossary) the evidence input material.
+    meta_by_hash = {h: _meta(r) for h, r in by_hash.items() if h not in result}
+    resolved: dict[str, str] = {}   # {content_hash: concept} classified THIS run (the evidence set)
+
     if enrich_config.mode("concept") == "batch":
-        meta_by_hash = {h: _meta(r) for h, r in by_hash.items() if h not in result}
         misses = [BatchItem(h, meta_by_hash[h]) for h in meta_by_hash]
         resolved = run_batched(
             conn, client, short="concept", task=_TASK, prompt_id="overlay_concept_batch_v1",
@@ -253,26 +286,26 @@ def enrich_concepts(conn, rows: list[CanonicalRow], client: LLMClient, actor=Non
         for h, concept in resolved.items():
             _cache_put(conn, "enrichment_concept", h, concept, _CONCEPT_CACHE_VERSION)
             result[h] = concept
-        if glossary is not None and source_snapshot_id is not None:
-            _write_concept_evidence(
-                conn, resolved=resolved, by_hash=by_hash, meta_by_hash=meta_by_hash,
-                rec_by_tc=rec_by_tc, bindings=bindings, source_snapshot_id=source_snapshot_id)
-        return result
+    else:
+        for h in meta_by_hash:                            # single mode — today's exact behaviour
+            # Metadata only (names/types + the glossary sidecar for a glossary column) — NEVER the
+            # uploader's free-text definition on a technical row (M4 egress risk).
+            raw = _call(conn, client, _TASK, "overlay_concept_v1", "overlay_concept",
+                        {**meta_by_hash[h], "vocabulary": _CONCEPT_VOCABULARY}, "concept",
+                        "Classify this column into the provided controlled concept vocabulary — choose "
+                        "the single best-fitting concept name, or 'unclassified' if none fits.", actor)
+            if raw is None:
+                continue   # failure/empty -> don't cache; retry next ingest (M3)
+            concept = raw if is_known_concept(raw) else UNCLASSIFIED
+            _cache_put(conn, "enrichment_concept", h, concept, _CONCEPT_CACHE_VERSION)
+            result[h] = concept
+            resolved[h] = concept
 
-    for h, row in by_hash.items():
-        if h in result:
-            continue
-        # Metadata only (names/types + the glossary sidecar for a glossary column) — NEVER the
-        # uploader's free-text definition on a technical row (M4 egress risk).
-        raw = _call(conn, client, _TASK, "overlay_concept_v1", "overlay_concept",
-                    {**_meta(row), "vocabulary": _CONCEPT_VOCABULARY}, "concept",
-                    "Classify this column into the provided controlled concept vocabulary — choose the "
-                    "single best-fitting concept name, or 'unclassified' if none fits.", actor)
-        if raw is None:
-            continue   # failure/empty -> don't cache; retry next ingest (M3)
-        concept = raw if is_known_concept(raw) else UNCLASSIFIED
-        _cache_put(conn, "enrichment_concept", h, concept, _CONCEPT_CACHE_VERSION)
-        result[h] = concept
+    # Item-level LLM concept evidence (glossary only) — written in BOTH modes now (Important-2).
+    if glossary is not None and source_snapshot_id is not None:
+        _write_concept_evidence(
+            conn, resolved=resolved, by_hash=by_hash, meta_by_hash=meta_by_hash,
+            rec_by_tc=rec_by_tc, bindings=bindings, source_snapshot_id=source_snapshot_id)
     return result
 
 

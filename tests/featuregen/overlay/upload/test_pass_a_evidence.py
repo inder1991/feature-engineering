@@ -154,6 +154,46 @@ def test_non_glossary_upload_is_unchanged(db, monkeypatch):
     assert n == 0                                              # no evidence for a non-glossary upload
 
 
+# ── Whole-branch review CRITICAL (data leak): a glossary business definition EMBEDS raw customer
+# sample values in prose; those must NEVER egress to the LLM under `business_definition`. The concept
+# payload builder sanitizes the definition (strip_sample_values) before it egresses. These values
+# (a decimal, a time, an 8-digit code) bypass the redaction PII backstop entirely — proving the leak
+# is real and the sanitizer, not the backstop, is what contains it. ──
+_LEAKY_GLOSSARY_CSV = (
+    "physical_name,business_term,description_business_definition,data_domain,"
+    "synonyms,bian_path,fibo_path\n"
+    "DPL_EIB_COMPLIANCE.COMP_REPOS_DLY.POST_AMT,Posting Amount,"
+    "Financial transaction record amount for the customer. The sample profile is NUMERIC with "
+    "representative values such as 84848368; 1250.00; 15:07:08, which supports interpretation.,"
+    "Deposits,Amount,Product/CurrentAccount,fibo-fbc:MonetaryAmount\n"
+)
+_AMT_REF = normalize_ref("ftr", "DPL_EIB_COMPLIANCE", "COMP_REPOS_DLY", "POST_AMT")
+
+
+def test_concept_enrichment_does_not_egress_raw_sample_values(db, monkeypatch):
+    """CRITICAL: the raw sample values embedded in the glossary definition do NOT reach the LLM, yet
+    the business meaning still rides through under `business_definition`."""
+    monkeypatch.setenv("OVERLAY_ENRICH_CONCEPT_MODE", "batch")
+    upload = read_glossary(_LEAKY_GLOSSARY_CSV, source="ftr")
+    bindings, _ = classify_upload(upload.rows)
+    rows = _rows_by_col(upload)
+    h_amt = content_hash(rows["POST_AMT"])
+    client = _CapturingFake(script={_TASK: FakeResponse(output={"results": [
+        {"ref": h_amt, "concept": "monetary_stock"}]})})
+
+    enrich_concepts(db, upload.rows, client, glossary=upload, bindings=bindings,
+                    source_snapshot_id="snap-1")
+
+    payload = str(client.last.inputs)
+    for value in ("84848368", "1250.00", "15:07:08"):
+        assert value not in payload            # raw customer sample values never egress
+    item = {it["ref"]: it for it in client.last.inputs[INPUT_KEY_CATALOG]["items"]}[h_amt]
+    bd = item["business_definition"]
+    assert "financial transaction record" in bd.lower()   # business meaning survives...
+    assert "customer" in bd.lower()
+    assert "84848368" not in bd and "1250.00" not in bd    # ...without the raw values
+
+
 def test_evidence_write_failure_is_fail_soft(db, monkeypatch):
     """A field_evidence write failure logs and is contained — enrichment still returns its concepts."""
     monkeypatch.setenv("OVERLAY_ENRICH_CONCEPT_MODE", "batch")

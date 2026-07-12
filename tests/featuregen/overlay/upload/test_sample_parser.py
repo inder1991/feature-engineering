@@ -10,7 +10,11 @@ import dataclasses
 
 import pytest
 
-from featuregen.overlay.upload.sample_parser import ParsedProfile, parse_sample_profile
+from featuregen.overlay.upload.sample_parser import (
+    ParsedProfile,
+    parse_sample_profile,
+    strip_sample_values,
+)
 
 # ── FTR-shaped descriptions (real phrasings; inline fixtures). ────────────────────────────────────
 
@@ -206,3 +210,47 @@ def test_parsed_profile_is_constructible():
         logical_representation="text", semantic_type="text", computational_type=None,
         sample_values=("a", "b"), diagnostic=None)
     assert p.sample_values == ("a", "b")
+
+
+# ── Whole-branch review CRITICAL: strip_sample_values excises the embedded sample-value clause so no
+# raw customer DATA VALUE can egress to the LLM as `business_definition`, while the business meaning
+# stays intact. Mirrors the anchors parse_sample_profile reads. ──
+
+# A realistic FTR glossary definition: business meaning FOLLOWED by the embedded sample-profile clause
+# that carries raw customer values (an account number, a time, a decimal amount, a short code).
+_LEAKY_DEF = (
+    "Financial transaction record identifying the customer's posting. The sample profile is NUMERIC, "
+    "with representative values such as 3708484836801; 15:07:08; 1250.00; 84848368, which supports "
+    "interpretation of the field. It is used for reconciliation."
+)
+
+
+def test_strip_sample_values_excises_values_and_keeps_meaning():
+    out = strip_sample_values(_LEAKY_DEF)
+    # every raw sample value is gone (account number, time, decimal, short code)...
+    for value in ("3708484836801", "15:07:08", "1250.00", "84848368"):
+        assert value not in out
+    # ...and the sample-profile scaffolding is gone too (no dangling "representative values" / "which")
+    assert "representative values" not in out
+    assert "sample profile" not in out.lower()
+    # ...but the surrounding business meaning survives
+    assert "financial transaction record" in out.lower()
+    assert "customer" in out.lower()
+    assert "reconciliation" in out.lower()          # prose AFTER the excised clause is preserved
+
+
+def test_strip_sample_values_handles_values_running_to_end_of_string():
+    # No trailing ", which ..." clause — the values list runs to the end of the string.
+    out = strip_sample_values("Ledger amount. The sample profile is NUMERIC, with representative "
+                              "values such as 1250.00; 9.99; 42.50")
+    assert "1250.00" not in out and "9.99" not in out and "42.50" not in out
+    assert "ledger amount" in out.lower()
+
+
+def test_strip_sample_values_leaves_a_plain_business_definition_unchanged():
+    plain = "The legal name of the customer as registered."
+    assert strip_sample_values(plain) == plain
+
+
+def test_strip_sample_values_tolerates_empty():
+    assert strip_sample_values("") == ""

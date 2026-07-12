@@ -22,19 +22,21 @@ def test_glossary_unknown_type_passes_under_glossary_profile():
     assert vr.quarantined == []
 
 
-def test_same_unknown_type_row_quarantines_under_technical_profile():
-    # The technical profile ATTESTS `type`, so the `unknown` sentinel is a missing physical type.
+def test_literal_unknown_type_validates_under_technical_profile():
+    # MINOR-6 (technical-path parity): the `UNKNOWN_TYPE` sentinel is meaningful ONLY under a
+    # non-type-attesting (glossary) profile. Under a type-attesting profile a literal "unknown" is a
+    # PRESENT type value (pre-branch behaviour) — it validates, it does NOT quarantine.
     vr = validate_rows([_glossary_row()], "ftr", profile=TECHNICAL_CSV_PROFILE)
-    assert vr.good == []
-    assert len(vr.quarantined) == 1
-    assert "type" in vr.quarantined[0].message
+    assert len(vr.good) == 1
+    assert vr.quarantined == []
 
 
-def test_same_unknown_type_row_quarantines_with_no_profile():
-    # No profile == today's default: `type` is required and `unknown` is not a real type.
+def test_literal_unknown_type_validates_with_no_profile():
+    # MINOR-6: no profile == today's default. A technical row literally carrying `type="unknown"`
+    # validates (pre-branch behaviour); only an EMPTY type is a real missing type.
     vr = validate_rows([_glossary_row()], "ftr")
-    assert vr.good == []
-    assert "type" in vr.quarantined[0].message
+    assert len(vr.good) == 1
+    assert vr.quarantined == []
 
 
 def test_technical_row_with_empty_type_still_quarantines():

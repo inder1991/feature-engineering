@@ -68,6 +68,54 @@ class ParsedProfile:
     diagnostic: str | None
 
 
+# The remainder of the FTR ", which ..." interpretation clause. ``_VALUES_RE``'s match ENDS just after
+# the word "which", so `strip_sample_values` consumes what follows (prose, up to the sentence period)
+# too — else a dangling "supports interpretation ..." fragment is left behind. Prose only (no data
+# values after "which"), so bounding by the next '.' is safe here.
+_INTERP_TAIL_RE = re.compile(r"[^.]*\.?")
+
+# A leading article ("The "/"the ") that introduces the excised sample-profile sentence — consumed so
+# the excision leaves "<meaning>. <rest>" rather than "<meaning>. The . <rest>".
+_LEAD_ARTICLE_RE = re.compile(r"\bthe\s+$", re.IGNORECASE)
+
+
+def strip_sample_values(description: str) -> str:
+    """Excise the embedded "[the ]sample profile is X ... representative values such as A; B; C[, which
+    ...]" clause from a glossary ``description``, leaving the surrounding business meaning intact.
+
+    **Data-leak backstop (whole-branch review CRITICAL).** An FTR glossary business definition EMBEDS
+    raw customer sample VALUES in prose (account numbers, times like ``15:07:08``, decimals ``1250.00``,
+    short codes). If that definition egresses verbatim as ``business_definition`` those values reach the
+    external LLM — and the deterministic PII backstop (``intake.redaction``) only catches PAN-like runs,
+    missing the rest. This removes EXACTLY the span :func:`parse_sample_profile` reads (same anchors), so
+    the concept classifier still sees the business prose but never a raw value.
+
+    Fail-safe: a description with no representative-values clause is returned unchanged (nothing to
+    strip); ``None``/empty returns ``""``.
+    """
+    text = description or ""
+    values_m = _VALUES_RE.search(text)
+    if values_m is None:
+        return text   # no representative-values clause -> only business prose, nothing to strip
+    token_m = _TOKEN_RE.search(text)
+    start = values_m.start()
+    if token_m is not None and token_m.start() < start:
+        start = token_m.start()   # extend back over the "sample profile is X, with ..." lead-in
+    # Drop a leading article ("The ") introducing the excised sentence, so no "The ." stub remains.
+    lead = _LEAD_ARTICLE_RE.search(text, 0, start)
+    if lead is not None:
+        start = lead.start()
+    end = values_m.end()          # ``_VALUES_RE`` ends just after "which" (or at end-of-string)
+    if values_m.group(0).rstrip().lower().endswith("which"):
+        # It stopped at the ", which" boundary — consume the rest of that interpretation clause
+        # (prose, up to and including the next sentence period).
+        tail = _INTERP_TAIL_RE.match(text, end)
+        if tail is not None:
+            end = tail.end()
+    excised = (text[:start].rstrip() + " " + text[end:].lstrip()).strip()
+    return re.sub(r"\s+([.,;])", r"\1", excised)   # tidy any space left before punctuation
+
+
 def parse_sample_profile(description: str) -> ParsedProfile:
     """Parse a glossary ``description`` into a :class:`ParsedProfile` (see the module docstring)."""
     text = description or ""
