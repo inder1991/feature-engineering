@@ -52,6 +52,15 @@ CAUSE_INGESTION_ERROR = "ingestion_error"
 # A non-blocking review requirement's cause: a shown-but-unconfirmed proposal a human could promote.
 CAUSE_PROPOSED_UNCONFIRMED = "proposed_unconfirmed"
 
+# A non-None subset (a TABLE name or an explicit ref list) that resolves to ZERO in-scope refs — a
+# typo'd / unknown table, or an empty ref list. Surfaced as a blocker (review-#13 Task-9 fix) so an
+# unknown subset never reads as a false "ready" indistinguishable from a genuinely clean table.
+CAUSE_SUBSET_NOT_FOUND = "subset_not_found"
+
+# The schema/table qualifier in a string ``subset`` — mirrors object_ref's path separator so a TABLE
+# subset may be written schema-qualified ("schema.table") to disambiguate a name shared across schemas.
+_SUBSET_QUALIFIER = "."
+
 # Decision lifecycle events that RETIRE a decision (mirrors field_resolution._RETIRED_EVENTS): a
 # retired latest decision confers nothing, so the field reads as if it had no resolved value.
 _RETIRED_EVENTS = frozenset({"rejected", "staled", "superseded"})
@@ -135,18 +144,54 @@ def _scoped_refs(
     """The in-scope ``logical_ref`` set — the universe readiness reports on (the refs Task 8 recorded
     decisions for), filtered to this ``source`` and narrowed by ``subset``.
 
-    ``subset`` is ``None`` (the whole catalog source), a table NAME (str → that table's refs), or an
-    explicit sequence of logical_refs (a TABLE call the caller already resolved to refs)."""
+    ``subset`` is ``None`` (the whole catalog source), a TABLE selector string, or an explicit
+    sequence of logical_refs (a TABLE call the caller already resolved to refs).
+
+    A string TABLE selector is SCHEMA-AWARE (Task-9 review fix — matching on the table name alone
+    over-reported across two same-named tables in different schemas). It may be written:
+
+    * schema-qualified — ``"schema.table"`` — matching EXACTLY the refs whose ``(schema, table)``
+      equals that pair; or
+    * a bare table name — ``"table"`` — matching that table WITHIN A SINGLE schema. If the bare name
+      is shared across MORE THAN ONE schema it is ambiguous and raises ``ValueError`` (qualify it as
+      ``schema.table``) rather than silently matching two distinct objects."""
     norm_source = source.strip().lower()
     rows = conn.execute("SELECT DISTINCT logical_ref FROM field_decision_event").fetchall()
     refs = [r[0] for r in rows if parse_ref(r[0])[0] == norm_source]
     if subset is None:
         return sorted(refs)
     if isinstance(subset, str):
-        table = subset.strip().lower()
-        return sorted(r for r in refs if parse_ref(r)[2] == table)
+        parts = subset.strip().lower().split(_SUBSET_QUALIFIER)
+        if len(parts) > 2:
+            raise ValueError(
+                f"invalid TABLE subset {subset!r}: expected 'table' or 'schema.table'"
+            )
+        matches: list[str] = []
+        matched_schemas: set[str] = set()
+        for r in refs:
+            _src, schema, table, _col = parse_ref(r)
+            if len(parts) == 2:
+                if (schema, table) == (parts[0], parts[1]):
+                    matches.append(r)
+            elif table == parts[0]:  # bare table name
+                matches.append(r)
+                matched_schemas.add(schema)
+        if len(parts) == 1 and len(matched_schemas) > 1:
+            raise ValueError(
+                f"ambiguous TABLE subset {subset!r}: table {parts[0]!r} exists in schemas "
+                f"{sorted(matched_schemas)} — qualify it as 'schema.table'"
+            )
+        return sorted(matches)
     wanted = set(subset)
     return sorted(r for r in refs if r in wanted)
+
+
+def _subset_label(subset: str | Sequence[str]) -> str:
+    """A compact, human-readable rendering of a ``subset`` for a ``subset_not_found`` requirement_id
+    (a TABLE selector string, or the joined explicit ref list; an empty list renders ``<empty>``)."""
+    if isinstance(subset, str):
+        return subset.strip().lower()
+    return ",".join(sorted(subset)) or "<empty>"
 
 
 def _tables_of(refs: Sequence[str]) -> list[tuple[str, str]]:
@@ -238,13 +283,37 @@ def compute_readiness(
     * ``advisory_gaps`` — soft, non-actionable notes (e.g. a low-confidence domain proposal).
     * ``summary_scores`` — DISPLAY-ONLY percentages derived from the requirement list.
 
-    ``scope`` CATALOG reports the whole source; TABLE narrows to one table via ``subset`` (a table
-    name or an explicit logical_ref list). GENERATION_RUN / RECIPE gating is Phase 2+ and is stamped
-    on the verdict but computed with the same catalog/table diagnostic here."""
+    ``scope`` CATALOG reports the whole source; TABLE narrows to one table via ``subset`` — a
+    SCHEMA-AWARE selector (``"schema.table"``, or a bare ``"table"`` when unambiguous within a single
+    schema; see :func:`_scoped_refs`) or an explicit logical_ref list. A non-None ``subset`` that
+    matches NOTHING yields a single ``subset_not_found`` blocker (never a false "ready"). GENERATION_RUN
+    / RECIPE gating is Phase 2+ and is stamped on the verdict but computed with the same diagnostic."""
     refs = _scoped_refs(conn, source=source, subset=subset)
 
     all_reqs: list[ReadinessRequirement] = []
     advisory: list[str] = []
+
+    # 0. A non-None subset that resolves to ZERO refs is NOT "clean" (review-#13 Task-9 fix): a
+    #    typo'd / unknown table (or an empty ref list) must surface as a blocker, never read as a
+    #    false "ready" indistinguishable from a genuinely clean table. (An empty CATALOG source —
+    #    subset is None — stays trivially ready: the gate is blocker-based.)
+    if subset is not None and not refs:
+        not_found = ReadinessRequirement(
+            requirement_id=f"subset_not_found:{source.strip().lower()}:{_subset_label(subset)}",
+            scope=scope,
+            status="missing",
+            blocking=True,
+            cause=CAUSE_SUBSET_NOT_FOUND,
+            authority_required="none",
+        )
+        return FeatureReadiness(
+            scope=scope,
+            operational_status="blocked",
+            blocking_requirements=(not_found,),
+            review_requirements=(),
+            advisory_gaps=(),
+            summary_scores=_summary_scores([not_found]),
+        )
 
     # 1. Structural facts Phase 1 does not promote — one blocker per in-scope table, EXPECTED.
     for schema, table in _tables_of(refs):

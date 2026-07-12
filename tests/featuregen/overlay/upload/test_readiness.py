@@ -179,6 +179,70 @@ def test_conflicting_evidence_is_labelled_ingestion_error(db):
     assert rep.operational_status == "blocked"
 
 
+def test_table_subset_is_schema_aware(db):
+    """Two schemas in one source share the table name 'accounts'. A schema-qualified TABLE subset
+    must cover ONLY the intended (schema, table) — never both objects.
+
+    Task-9 review: ``_scoped_refs`` matched on the table name ALONE (``parse_ref(r)[2]``), so a bare
+    ``subset='accounts'`` matched two distinct objects across two schemas, over-reporting blockers.
+    """
+    sales = normalize_ref(_SOURCE, "sales", "accounts", "balance")
+    risk = normalize_ref(_SOURCE, "risk", "accounts", "balance")
+    for ref in (sales, risk):
+        _seed(
+            db, ref, "additivity", "semi_additive",
+            EvidenceProducer.TAXONOMY, AssertionStrength.PROPOSED,
+        )
+    resolve_and_project(db, source=_SOURCE, logical_refs=[sales, risk])
+
+    rep = compute_readiness(
+        db, source=_SOURCE, scope=ReadinessScopeType.TABLE, subset="sales.accounts"
+    )
+    ids = {r.requirement_id for r in rep.blocking_requirements} | {
+        r.requirement_id for r in rep.review_requirements
+    }
+    assert ids, "expected requirements for the in-scope (sales.accounts) object"
+    # covers the sales.accounts object (fields AND its structural facts)...
+    assert any("sales.accounts" in i for i in ids)
+    assert any(i.startswith("grain:") and "sales.accounts" in i for i in ids)
+    assert any(i.endswith(":additivity") and "sales.accounts" in i for i in ids)
+    # ...never the same-named table in the OTHER (risk) schema.
+    assert not any("risk" in i for i in ids)
+
+    # A BARE table name is ambiguous across the two schemas -> a clear error, never a silent
+    # over-match of both objects.
+    with pytest.raises(ValueError, match="ambiguous"):
+        compute_readiness(
+            db, source=_SOURCE, scope=ReadinessScopeType.TABLE, subset="accounts"
+        )
+
+
+def test_unknown_subset_surfaces_not_ready(resolved):
+    """A misspelled / unknown TABLE subset must NOT read as a clean 'ready' — it surfaces a
+    ``subset_not_found`` blocker (Task-9 review: an empty ref set emitted zero requirements, so a
+    typo was indistinguishable from a genuinely clean table)."""
+    db, _balance, _region = resolved
+    rep = compute_readiness(
+        db, source=_SOURCE, scope=ReadinessScopeType.TABLE, subset="accountz"  # typo
+    )
+    assert rep.operational_status == "blocked"
+    assert rep.summary_scores["ready_fraction"] != 1.0
+    causes = {r.cause for r in rep.blocking_requirements}
+    assert "subset_not_found" in causes
+    assert not rep.review_requirements
+
+
+def test_empty_explicit_subset_is_not_ready(resolved):
+    """An explicit but empty logical_ref subset (``subset=[]``) matches nothing — also surfaced as
+    ``subset_not_found``, never a false 'ready'."""
+    db, _balance, _region = resolved
+    rep = compute_readiness(
+        db, source=_SOURCE, scope=ReadinessScopeType.TABLE, subset=[]
+    )
+    assert rep.operational_status == "blocked"
+    assert any(r.cause == "subset_not_found" for r in rep.blocking_requirements)
+
+
 def test_empty_source_is_ready_with_no_requirements(db):
     # A source with nothing resolved yet is trivially "ready" (no blocking requirements) — the gate
     # is blocker-based, so an empty requirement list is not a failure.
