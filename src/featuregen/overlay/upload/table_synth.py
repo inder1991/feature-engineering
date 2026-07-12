@@ -154,7 +154,8 @@ def _active_skip_state(conn, ref, fact_type) -> str | None:
 
 
 def _propose_table_facts(conn, source: str, syntheses: dict[str, dict], *, actor,
-                         source_snapshot_id: str) -> None:
+                         source_snapshot_id: str,
+                         schema_by_table: dict[str, str] | None = None) -> None:
     """Route Pass B grain/availability candidates into governed PROPOSED-only facts and advisory
     table-field evidence. Fail-soft (never aborts the upload). Skips QUIETLY only when a stronger
     active claim governs the key (VERIFIED / a pending proposal); otherwise lets propose_fact
@@ -162,7 +163,17 @@ def _propose_table_facts(conn, source: str, syntheses: dict[str, dict], *, actor
 
     ``actor`` MUST be the service actor (``_ENRICH_ACTOR``) so a human confirmer later satisfies
     four-eyes. ``source_snapshot_id`` keys producer-scoped staleness for the advisory evidence (a
-    NOT-NULL column)."""
+    NOT-NULL column).
+
+    ``schema_by_table`` maps a NORMALIZED table name to the real (non-public) schema its glossary
+    column decisions are keyed under. The advisory table-field evidence MUST be keyed under that SAME
+    schema so ``readiness`` (schema-aware) sees ONE ``(schema, table)`` pair per physical table — a
+    schema-forced-public advisory ref otherwise manufactures a phantom ``(public, table)`` twin that
+    double-counts the grain/availability/join requirements and makes a bare TABLE subset ambiguous.
+    Empty / absent (a non-glossary technical upload) falls back to ``public``, which is correct —
+    technical columns are public and write no glossary column decisions. NOTE: the grain/availability
+    FACT stays keyed under the always-public ``table_ref`` (below); only the advisory field evidence
+    ref is schema-aligned."""
     # Imported lazily (mirrors _propose_governed_joins): propose_fact resolves the catalog adapter
     # at import-use time, and the pure assembler/accept tests must import this module without
     # pulling the command stack (or ingest, which imports table_synth lazily in the Pass B block).
@@ -217,7 +228,8 @@ def _propose_table_facts(conn, source: str, syntheses: dict[str, dict], *, actor
         # source_snapshot_id/input_hash args a bare record_field_evidence would miss).
         # RECOMMENDATION-ceilinged in Task 8. A write error here is contained by the caller's
         # Pass B savepoint+except (ingest wiring).
-        logical_ref = normalize_ref(source, None, table)
+        schema = (schema_by_table or {}).get(table.strip().lower())
+        logical_ref = normalize_ref(source, schema, table)
         for field_name in _ADVISORY_TABLE_FIELDS:
             v = syn.get(field_name)
             if v:

@@ -228,6 +228,25 @@ def _lc(value: str) -> str:
     return value.strip().lower()
 
 
+def _schema_by_table(glossary: GlossaryUpload | None) -> dict[str, str]:
+    """Map each glossary table's NORMALIZED name to the real (non-public) schema its column decisions
+    are keyed under (``parse_ref(rec.logical_ref)[1]``). Pass B keys its advisory table ref +
+    ``resolve_and_project`` refs under this schema so ``readiness`` (schema-aware) sees ONE
+    ``(schema, table)`` pair per physical table instead of a phantom public twin that double-counts
+    the structural requirements. Empty for a non-glossary upload -> ``normalize_ref`` falls back to
+    ``public`` (correct: technical columns are public and write no glossary column decisions)."""
+    out: dict[str, str] = {}
+    if glossary is None:
+        return out
+    for rec in glossary.records:
+        try:
+            _src, schema, table, _col = parse_ref(rec.logical_ref)
+        except ValueError:
+            continue
+        out.setdefault(table, schema)
+    return out
+
+
 def _schema_preserving_ref_map(glossary: GlossaryUpload) -> dict[str, str]:
     """Map each column record's PUBLIC-FLATTENED ref (the key ``classify_upload`` emits conflicts under,
     via ``normalize_ref(source, None, table, column)``) to its SCHEMA-PRESERVING ``rec.logical_ref``
@@ -654,15 +673,21 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
                         for t in {r.table for r in vr.good}}
                 syntheses = synthesize_tables(conn, client, items, columns_by_table=cols,
                                               actor=actor)     # LLM-call attribution only
+                # Key the advisory table ref + its projection under the SAME schema the glossary
+                # columns use (a non-public schema for an FTR glossary; public for a technical
+                # upload) so readiness sees ONE (schema, table) pair per physical table.
+                schema_by_table = _schema_by_table(glossary)
                 # Propose under the SERVICE actor so a human confirmer later satisfies four-eyes:
                 _propose_table_facts(conn, catalog_source, syntheses, actor=_ENRICH_ACTOR,
-                                     source_snapshot_id=synth_snapshot)
+                                     source_snapshot_id=synth_snapshot,
+                                     schema_by_table=schema_by_table)
                 # Project the advisory table fields' DISPLAY. resolve_and_project is otherwise
                 # called ONLY over glossary COLUMN refs (_ingest_glossary_evidence); table refs need
                 # this explicit call or table_role/primary_entity/event_or_snapshot never project
                 # (a no-op until Task 8 registers their FieldPolicies).
-                pass_b_table_refs = [normalize_ref(catalog_source, None, t)
-                                     for t in sorted({r.table for r in vr.good})]
+                pass_b_table_refs = [
+                    normalize_ref(catalog_source, schema_by_table.get(t.strip().lower()), t)
+                    for t in sorted({r.table for r in vr.good})]
                 resolve_and_project(conn, source=catalog_source, logical_refs=pass_b_table_refs,
                                     now=now)
         except Exception:  # noqa: BLE001 — advisory: Pass B never fails an upload; Pass A facts hold
