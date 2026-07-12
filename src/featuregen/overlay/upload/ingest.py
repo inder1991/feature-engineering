@@ -632,6 +632,43 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
         # each declared join into the governed approved_join path. Advisory/fail-soft + adapter-gated.
         _propose_governed_joins(conn, vr.good, actor=actor)
 
+    if table_synth_enabled() and client is not None:
+        # Pass B (spec §15): governed table synthesis — grain/availability as PROPOSED-only,
+        # human-gated facts; table_role/primary_entity/event_or_snapshot as advisory evidence.
+        from featuregen.overlay.upload.enrich_llm import _ENRICH_ACTOR
+        from featuregen.overlay.upload.table_synth import (
+            _propose_table_facts,
+            assemble_table_items,
+            synthesize_tables,
+        )
+        try:
+            # The savepoint CONTAINS the LLM + security-audit writes (exactly like the Pass A stages
+            # above — NOT like _propose_governed_joins, which has no savepoint): a DB abort inside
+            # synthesize_tables/propose must not poison the request tx and roll back Pass A facts +
+            # the quarantine. The try/except makes Pass B strictly advisory.
+            with conn.transaction():
+                synth_snapshot = snapshot_id or mint_id("tsy")  # non-glossary uploads have snapshot_id=None
+                items = assemble_table_items(vr.good, concepts=concepts, definitions=definitions)
+                cols = {t: {r.column for r in vr.good if r.table == t}
+                        for t in {r.table for r in vr.good}}
+                syntheses = synthesize_tables(conn, client, items, columns_by_table=cols,
+                                              actor=actor)     # LLM-call attribution only
+                # Propose under the SERVICE actor so a human confirmer later satisfies four-eyes:
+                _propose_table_facts(conn, catalog_source, syntheses, actor=_ENRICH_ACTOR,
+                                     source_snapshot_id=synth_snapshot)
+                # Project the advisory table fields' DISPLAY. resolve_and_project is otherwise
+                # called ONLY over glossary COLUMN refs (_ingest_glossary_evidence); table refs need
+                # this explicit call or table_role/primary_entity/event_or_snapshot never project
+                # (a no-op until Task 8 registers their FieldPolicies).
+                pass_b_table_refs = [normalize_ref(catalog_source, None, t)
+                                     for t in sorted({r.table for r in vr.good})]
+                resolve_and_project(conn, source=catalog_source, logical_refs=pass_b_table_refs,
+                                    now=now)
+        except Exception:  # noqa: BLE001 — advisory: Pass B never fails an upload; Pass A facts hold
+            counters.incr("overlay.table_synth.error")
+            logger.warning("advisory Pass B table synthesis failed for %r — Pass A facts + graph "
+                           "intact", catalog_source, exc_info=True)
+
     if glossary is not None and bindings is not None and snapshot_id is not None:
         # Attach per-field evidence + revalidation + resolve/readiness on top of the built graph.
         # Belt-and-braces fail-soft: the helper savepoints every stage, and this outer guard makes a
