@@ -49,6 +49,7 @@ from featuregen.overlay.field_evidence import (
 )
 from featuregen.overlay.safety_floor import apply_sensitivity_floor
 from featuregen.overlay.upload.field_policies import policy_for
+from featuregen.overlay.upload.field_revalidation import active_disqualifiers_for
 from featuregen.overlay.upload.object_ref import parse_ref
 
 # Bumped when the policy set or the resolver's projection contract changes (recorded on each decision).
@@ -188,7 +189,8 @@ def _resolve_generic_field(
         return
     evidence = read_active_field_evidence(conn, logical_ref, field_name)
     resolution: FieldResolution = resolve_field_authority(
-        [to_view(e) for e in evidence], policy, active_disqualifiers=frozenset()
+        [to_view(e) for e in evidence], policy,
+        active_disqualifiers=active_disqualifiers_for(conn, logical_ref, field_name),
     )
     reason_codes = [resolution.unresolved_reason] if resolution.unresolved_reason else []
     conflict_status = resolution.unresolved_reason or "resolved"
@@ -241,7 +243,8 @@ def _resolve_sensitivity(
     assert sensitivity_policy is not None  # the sensitivity field always has a registered policy
     class_views = [to_view(e) for e in class_evidence]
     classification = resolve_field_authority(
-        class_views, sensitivity_policy, active_disqualifiers=frozenset()
+        class_views, sensitivity_policy,
+        active_disqualifiers=active_disqualifiers_for(conn, logical_ref, _SENSITIVITY_FIELD),
     )
     proposals = [_to_restriction(v.value) for v in class_views]
     effective_restriction = apply_sensitivity_floor(floor, proposals, now=now)

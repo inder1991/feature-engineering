@@ -153,12 +153,15 @@ class Disqualifier(str, Enum):
 
     The lifecycle-derived disqualifiers cover evidence the caller kept in the active set but which a
     later lifecycle transition has compromised (drifted inputs, a gate rejection, a superseding record);
-    ``OPEN_CONFLICT_REVIEW`` blocks while a conflict is under human review."""
+    ``OPEN_CONFLICT_REVIEW`` blocks while a conflict is under human review;
+    ``CONFIRMATION_PENDING_REVALIDATION`` blocks a human-confirmed value whose column's MATERIAL
+    (definition/type) changed on a source re-upload, until a human re-confirms (spec §6.3, Task 10)."""
 
     STALE_SELECTED_EVIDENCE = "stale_selected_evidence"
     REJECTED_SELECTED_EVIDENCE = "rejected_selected_evidence"
     SUPERSEDED_SELECTED_EVIDENCE = "superseded_selected_evidence"
     OPEN_CONFLICT_REVIEW = "open_conflict_review"
+    CONFIRMATION_PENDING_REVALIDATION = "confirmation_pending_revalidation"
 
 
 @dataclass(frozen=True, slots=True)

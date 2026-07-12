@@ -27,12 +27,20 @@ from featuregen.overlay.evidence import AssertionStrength, EvidenceProducer
 from featuregen.overlay.field_authority import (
     AnyOf,
     ConflictStrategy,
+    Disqualifier,
     FieldPolicy,
     HasEvidence,
     InfluenceTier,
     ResolutionMode,
 )
 from featuregen.overlay.safety_floor import SENSITIVITY_ORDER
+
+# The disqualifiers an OPERATIONAL, human-confirmable field honours: a source re-upload that changed
+# the column's MATERIAL flags the field PENDING revalidation (overlay.upload.field_revalidation), and
+# that flag must BLOCK the load-bearing value until a human re-confirms (spec §6.3, Task 10).
+_OPERATIONAL_DISQUALIFIERS: tuple[Disqualifier, ...] = (
+    Disqualifier.CONFIRMATION_PENDING_REVALIDATION,
+)
 
 # Short leaf aliases (producer, strength) for readable rules below.
 _LLM_PROPOSED = HasEvidence(EvidenceProducer.LLM, AssertionStrength.PROPOSED)
@@ -82,7 +90,7 @@ _LOGICAL_REPRESENTATION = FieldPolicy(
     influence_max=InfluenceTier.OPERATIONAL,
     display_rule=AnyOf((_PARSER_SUPPORTED, _SOURCE_ATTESTED, _SOURCE_PROPOSED)),
     operational_rule=AnyOf((_PARSER_SUPPORTED, _SOURCE_ATTESTED)),
-    disqualifiers=(),
+    disqualifiers=_OPERATIONAL_DISQUALIFIERS,
     resolution_mode=ResolutionMode.GENERIC_FIELD,
     conflict_strategy=ConflictStrategy.PREFER_CONFIRMED,
 )
@@ -94,7 +102,7 @@ _SENSITIVITY = FieldPolicy(
     influence_max=InfluenceTier.OPERATIONAL,
     display_rule=_SOURCE_OR_HUMAN,
     operational_rule=_SOURCE_OR_HUMAN,
-    disqualifiers=(),
+    disqualifiers=_OPERATIONAL_DISQUALIFIERS,
     resolution_mode=ResolutionMode.GENERIC_FIELD,
     conflict_strategy=ConflictStrategy.MOST_RESTRICTIVE,
     severity_order=SENSITIVITY_ORDER,
@@ -107,7 +115,7 @@ _BEHAVIOURAL = FieldPolicy(
     influence_max=InfluenceTier.OPERATIONAL,
     display_rule=AnyOf((_TAXONOMY_PROPOSED, _TAXONOMY_CONFIRMED, _SOURCE_ATTESTED, _HUMAN_CONFIRMED)),
     operational_rule=AnyOf((_TAXONOMY_CONFIRMED, _SOURCE_ATTESTED, _HUMAN_CONFIRMED)),
-    disqualifiers=(),
+    disqualifiers=_OPERATIONAL_DISQUALIFIERS,
     resolution_mode=ResolutionMode.GENERIC_FIELD,
     conflict_strategy=ConflictStrategy.PREFER_CONFIRMED,
 )
