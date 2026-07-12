@@ -86,13 +86,19 @@ def make_ref_accept(columns_by_table: dict[str, set[str]]):
         # The fact schema {columns,is_unique} forbids a caveat field, so origin is surfaced via the
         # worklist, not the value. An empty grain_columns == the model ABSTAINING (skip, not error).
         grain = {"columns": grain_cols, "is_unique": True} if grain_cols else None
+        # Availability is DECOUPLED from grain: a bad as-of (a column the table lacks, or a basis
+        # outside the lag-free enum) drops ONLY the availability — it must NEVER discard an otherwise
+        # VALID grain proposal. Coupling them silently lost a real grain to a single hallucinated
+        # as-of column; the grain still proposes and the bad as-of is logged/counted, not returned as
+        # a whole-item rejection. Both absent still abstains (empty_synthesis) below.
         availability = None
         if as_of_col is not None:
-            if as_of_col not in cols:
-                return None, "as_of_col_not_in_table"
-            if as_of_basis not in _VALID_BASIS:
-                return None, "as_of_basis_invalid"
-            availability = {"column": as_of_col, "basis": as_of_basis}
+            if as_of_col in cols and as_of_basis in _VALID_BASIS:
+                availability = {"column": as_of_col, "basis": as_of_basis}
+            else:
+                counters.incr("overlay.table_synth.availability.dropped_bad_as_of")
+                logger.info("table_synth dropped a bad as-of for %r (col=%r basis=%r) — keeping grain",
+                            ref, as_of_col, as_of_basis)
         if grain is None and availability is None:
             return None, "empty_synthesis"    # abstention / nothing proposed -> skipped-loud
         out = {"grain": grain, "availability_time": availability,

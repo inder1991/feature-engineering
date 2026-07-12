@@ -38,11 +38,35 @@ def test_grain_column_not_in_table_is_rejected():
     assert val is None and reason == "grain_col_not_in_table"
 
 
-def test_as_of_column_not_in_table_is_rejected():
+def test_bad_as_of_col_keeps_a_valid_grain():
+    # Whole-branch fix #3: a bad as-of (column not on the table) must drop ONLY the availability —
+    # a VALID grain must still come through, not be discarded with the hallucinated as-of.
     accept = make_ref_accept({"txn": {"id"}})
     val, reason = accept(_syn(grain_columns=["id"], as_of_column="ghost", as_of_basis="posted_at"),
                          "txn")
-    assert val is None and reason == "as_of_col_not_in_table"
+    assert reason == "valid"
+    out = json.loads(val)
+    assert out["grain"] == {"columns": ["id"], "is_unique": True}   # grain survives
+    assert out["availability_time"] is None                         # the bad as-of is dropped
+
+
+def test_bad_as_of_basis_keeps_a_valid_grain():
+    # Same decoupling for an invalid basis (a real column, but a non-lag-free basis).
+    accept = make_ref_accept({"txn": {"id", "posted_at"}})
+    val, reason = accept(_syn(grain_columns=["id"], as_of_column="posted_at",
+                              as_of_basis="event_time_plus_lag"), "txn")
+    assert reason == "valid"
+    out = json.loads(val)
+    assert out["grain"] == {"columns": ["id"], "is_unique": True}
+    assert out["availability_time"] is None
+
+
+def test_bad_as_of_with_no_grain_is_empty_synthesis():
+    # Decoupling does NOT resurrect a nothing-proposal: a bad as-of AND no grain -> both absent ->
+    # still an abstention (skipped-loud), never a guessed grain.
+    accept = make_ref_accept({"txn": {"id"}})
+    val, reason = accept(_syn(grain_columns=[], as_of_column="ghost", as_of_basis="posted_at"), "txn")
+    assert val is None and reason == "empty_synthesis"
 
 
 def test_abstention_empty_grain_is_skipped_not_guessed():
