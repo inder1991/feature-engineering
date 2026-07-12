@@ -45,3 +45,14 @@ ENTITY_RELATIONSHIPS_V1: tuple[EntityRelationshipDefinitionV1, ...] = (
     _rollup("facility_to_obligor", "facility", "obligor"),
     _rollup("policy_to_customer", "policy", "customer"),
 )
+
+
+def global_relationship_for(
+    from_entity: str, to_entity: str) -> EntityRelationshipDefinitionV1 | None:
+    """The active global relationship for a directed grain pair, or None. Directed: ``account->customer``
+    is a relationship; ``customer->account`` is not (the reverse must be handled by the caller)."""
+    for d in ENTITY_RELATIONSHIPS_V1:
+        if d.status is RelationshipStatus.ACTIVE \
+                and d.from_entity == from_entity and d.to_entity == to_entity:
+            return d
+    return None
