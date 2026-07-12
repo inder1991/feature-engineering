@@ -48,7 +48,11 @@ from featuregen.overlay.upload.source_profile import (
     strength_for,
 )
 from featuregen.overlay.upload.taxonomy_evidence import derive_concept_evidence
-from featuregen.overlay.upload.upload_catalog import UploadCatalog, table_ref
+from featuregen.overlay.upload.upload_catalog import (
+    UploadCatalog,
+    ensure_upload_catalog_adapter,
+    table_ref,
+)
 from featuregen.overlay.upload.upload_identity import MetadataConflict, classify_upload
 from featuregen.projections.runner import projection_lag, run_projection
 from featuregen.runtime.observability import counters
@@ -516,6 +520,7 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
                   actor, now: datetime | None = None, client=None,
                   profile: SourceCapabilityProfile | None = None,
                   glossary: GlossaryUpload | None = None) -> IngestResult:
+    ensure_upload_catalog_adapter()   # governed fact lifecycle needs an adapter (owner_of->None)
     # `profile` (spec §U) makes validation profile-aware: a glossary upload's `type="unknown"` rows
     # pass, while a technical upload (or the default `profile=None`) still requires a real type. A
     # glossary sidecar IMPLIES the glossary profile (a glossary attests no physical type), so default

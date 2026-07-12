@@ -522,6 +522,8 @@ def compose(conn: psycopg.Connection) -> tuple[object, list[Projection]]:
     # SP-2 intake retired (2026-07-05) — register_sp2 / seed_sp2_authz removed; the upload catalog +
     # overlay/upload/contract flow replace it. See docs/superpowers/plans/2026-07-05-sp2-retirement-plan.md
     register_overlay(registry)
+    from featuregen.overlay.upload.upload_catalog import ensure_upload_catalog_adapter
+    ensure_upload_catalog_adapter()   # expiry/renewal pollers resolve grain/availability authority
     seed_overlay_authz(conn)
 
     projections: list[Projection] = [StagePrimaryProjection(), OverlayProjection()]
