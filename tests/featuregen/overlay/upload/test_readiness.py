@@ -96,9 +96,13 @@ def test_catalog_readiness_labels_blockers_by_cause(resolved):
     assert additivity[0].cause == "unresolved_authority"
     assert additivity[0].status == "proposed"
 
-    # grain/join blockers are labelled not_promoted_in_phase1 (expected), never ingestion_error.
+    # grain/availability/join blockers are labelled not_promoted_in_phase1 (expected), never
+    # ingestion_error. (Phase 2: grain/availability now read the table's fact state — with no
+    # Pass B proposal in this scenario they are still missing/not-promoted blockers.)
     structural = [r for r in rep.blocking_requirements if r.cause == "not_promoted_in_phase1"]
-    assert {r.requirement_id.split(":")[0] for r in structural} == {"grain", "join"}
+    assert {r.requirement_id.split(":")[0] for r in structural} == {
+        "grain", "availability", "join"
+    }
     assert all(r.status == "missing" for r in structural)
 
     # A proposed-unconfirmed concept -> a REVIEW requirement (non-blocking), never a blocker.
