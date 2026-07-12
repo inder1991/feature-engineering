@@ -9,9 +9,11 @@ only — no driver, no propose logic (YAGNI).
 """
 from __future__ import annotations
 
+import json
+
 from featuregen.overlay.upload.canonical import CanonicalRow
 from featuregen.overlay.upload.enrich import content_hash
-from featuregen.overlay.upload.enrich_batch import BatchItem
+from featuregen.overlay.upload.enrich_batch import BatchItem, run_batched
 from featuregen.overlay.upload.sample_parser import strip_sample_values
 
 
@@ -54,3 +56,68 @@ def assemble_table_items(rows: list[CanonicalRow], *, concepts: dict[str, str] |
         ]
         items.append(BatchItem(ref=table, metadata={"table": table, "column_profiles": profiles}))
     return items
+
+
+_VALID_BASIS = {"posted_at", "ingested_at"}  # lag-free bases only (event_time_plus_lag needs lag_hours)
+
+
+def make_ref_accept(columns_by_table: dict[str, set[str]]):
+    """A ref-aware accept for `validate_batch_results(..., ref_aware=True)`. `ref` is the table name;
+    validate the serialized `synthesis` against THAT table's real columns and map a valid result onto
+    the FACT_VALUE_SCHEMAS shapes (grain `{columns, is_unique}` / availability `{column, basis}`)."""
+    def accept(raw: str, ref: str) -> tuple[str | None, str]:
+        cols = columns_by_table.get(ref, set())
+        try:
+            s = json.loads(raw)
+        except (ValueError, TypeError):
+            return None, "unparseable"
+        grain_cols = [c for c in (s.get("grain_columns") or []) if isinstance(c, str)]
+        if any(c not in cols for c in grain_cols):
+            return None, "grain_col_not_in_table"
+        as_of_col = s.get("as_of_column")
+        as_of_basis = s.get("as_of_basis")
+        # `is_unique=True` is the CLAIM being proposed (these columns are asserted to identify a row),
+        # NOT empirical proof — there is no profiling in Phase 2. Human confirmation IS the uniqueness
+        # attestation; the proposal's LLM origin (proposed_by=service actor) is what a reviewer sees.
+        # The fact schema {columns,is_unique} forbids a caveat field, so origin is surfaced via the
+        # worklist, not the value. An empty grain_columns == the model ABSTAINING (skip, not error).
+        grain = {"columns": grain_cols, "is_unique": True} if grain_cols else None
+        availability = None
+        if as_of_col is not None:
+            if as_of_col not in cols:
+                return None, "as_of_col_not_in_table"
+            if as_of_basis not in _VALID_BASIS:
+                return None, "as_of_basis_invalid"
+            availability = {"column": as_of_col, "basis": as_of_basis}
+        if grain is None and availability is None:
+            return None, "empty_synthesis"    # abstention / nothing proposed -> skipped-loud
+        out = {"grain": grain, "availability_time": availability,
+               "table_role": s.get("table_role"), "primary_entity": s.get("primary_entity"),
+               "event_or_snapshot": s.get("event_or_snapshot")}
+        return json.dumps(out, sort_keys=True), "valid"
+    return accept
+
+
+def synthesize_tables(conn, client, items: list[BatchItem], *, columns_by_table, actor
+                      ) -> dict[str, dict]:
+    """Run the governed batch synthesis; return {table: synthesis_dict} for VALID results only.
+    Validation is done INSIDE run_batched via the ref-aware accept — this function does no
+    post-filtering (an INVALID synthesis never reaches here)."""
+    accept = make_ref_accept(columns_by_table)
+    resolved = run_batched(
+        conn, client, short="table_synth", task="table_synth",
+        prompt_id="overlay_table_synth_v1", schema_id="overlay_table_synth_batch",
+        shared_metadata={}, items=items, out_key="synthesis",
+        instruction=_INSTRUCTION, accept=accept, actor=actor,
+        extract=lambda e: json.dumps(e.get("synthesis"), sort_keys=True), ref_aware=True,
+    )
+    return {table: json.loads(raw) for table, raw in resolved.items()}
+
+
+_INSTRUCTION = (
+    "For each table, identify: the grain (the minimal set of columns whose combination uniquely "
+    "identifies one row) — RETURN AN EMPTY grain_columns list if you cannot determine it, do not "
+    "guess; the as-of/availability column and its basis (posted_at|ingested_at); "
+    "the primary business entity; the table role; and whether it is an event or snapshot table. "
+    "Only name columns that appear in the provided column list."
+)

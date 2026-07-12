@@ -193,6 +193,13 @@ def run_batched(conn, client, *, short: str, task: str, prompt_id: str, schema_i
 
     def _fallback(unresolved: list[BatchItem]) -> None:
         nonlocal calls, fallback_used
+        # A ref_aware (structured) task has NO single-call fallback (see _single_fallback): each item
+        # would resolve to (None, MISSING) WITHOUT a provider call. Skip the loop entirely so a no-op
+        # fallback never inflates `calls`/`fallback_used` — on a >max_items multi-chunk Pass B run the
+        # spurious increments could trip over_budget() early — nor emits a bogus single_fallback
+        # counter. (Task 4 carry-forward: the increments previously ran before the ref_aware skip.)
+        if ref_aware:
+            return
         for it in unresolved:
             if fallback_used >= b.max_single_fallback or over_budget():
                 counters.incr(f"overlay.enrich.{short}.batch.left_uncached")
