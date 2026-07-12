@@ -119,10 +119,12 @@ def _table_fact_status(conn, source, table, requirement) -> tuple[str, str]:
         return "proposed", CAUSE_PROPOSED_UNCONFIRMED     # in the review queue
     if status == "REJECTED":
         return "missing", CAUSE_FACT_REJECTED             # NOT ready; distinct from never-proposed
-    if status == "EXPIRED":
+    # fold_overlay_state NEVER yields the literal "EXPIRED": OVERLAY_FACT_EXPIRED folds to
+    # "REVERIFY" and OVERLAY_FACT_STALED folds to "STALE" (state.py). Branch on those two.
+    if status == "REVERIFY":
         return "proposed", CAUSE_FACT_EXPIRED             # prior confirmation lapsed -> re-verify
-    if status in ("STALE", "REVERIFY"):
-        return "proposed", CAUSE_FACT_STALE               # drift/expiry -> awaiting re-confirm
+    if status == "STALE":
+        return "proposed", CAUSE_FACT_STALE               # drift -> awaiting re-confirm
     return "proposed", CAUSE_PROPOSED_UNCONFIRMED
 
 
