@@ -75,6 +75,8 @@ def make_ref_accept(columns_by_table: dict[str, set[str]]):
             s = json.loads(raw)
         except (ValueError, TypeError):
             return None, "unparseable"
+        if not isinstance(s, dict):
+            return None, "not_object"   # "null"/"[]"/"\"x\"" parse fine but can't .get(...)
         grain_cols = [c for c in (s.get("grain_columns") or []) if isinstance(c, str)]
         if any(c not in cols for c in grain_cols):
             return None, "grain_col_not_in_table"
@@ -193,6 +195,8 @@ def _propose_table_facts(conn, source: str, syntheses: dict[str, dict], *, actor
     from featuregen.overlay.upload.object_ref import normalize_ref
     from featuregen.overlay.upload.upload_catalog import table_ref
 
+    # defense-in-depth: ingest_upload self-ensures the adapter (ensure_upload_catalog_adapter at
+    # entry), so this is unreachable in the normal flow — it fail-softs a direct/future caller.
     try:
         current_catalog_adapter()
     except RuntimeError:

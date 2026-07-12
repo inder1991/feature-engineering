@@ -38,6 +38,15 @@ def test_grain_column_not_in_table_is_rejected():
     assert val is None and reason == "grain_col_not_in_table"
 
 
+def test_parseable_non_object_json_is_rejected_not_object():
+    # "null" / "[]" / "\"x\"" PARSE fine but are not JSON objects — the accept must reject them
+    # (`not_object`), never AttributeError on `s.get(...)` inside the validation harness.
+    accept = make_ref_accept({"txn": {"id"}})
+    assert accept("null", "txn") == (None, "not_object")
+    assert accept("[]", "txn") == (None, "not_object")
+    assert accept('"x"', "txn") == (None, "not_object")
+
+
 def test_bad_as_of_col_keeps_a_valid_grain():
     # Whole-branch fix #3: a bad as-of (column not on the table) must drop ONLY the availability —
     # a VALID grain must still come through, not be discarded with the hallucinated as-of.
