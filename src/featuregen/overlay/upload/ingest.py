@@ -43,6 +43,7 @@ from featuregen.overlay.upload.object_ref import normalize_ref, parse_ref
 from featuregen.overlay.upload.readiness import ReadinessScopeType, compute_readiness
 from featuregen.overlay.upload.review_queue import persist_quarantine
 from featuregen.overlay.upload.sample_parser import parse_sample_profile
+from featuregen.overlay.upload.table_fact_projection import project_table_facts
 from featuregen.overlay.upload.source_profile import (
     FTR_GLOSSARY_PROFILE,
     SourceCapabilityProfile,
@@ -680,6 +681,20 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
         except Exception:  # noqa: BLE001
             logger.warning("advisory glossary evidence wiring failed for %r — facts + graph intact",
                            catalog_source, exc_info=True)
+
+    # SPECIALIZED_FACT bridge (Task 9): build_graph just wiped graph_node, so re-project any
+    # already-CONFIRMED grain/as-of facts onto the fresh column nodes. UNCONDITIONAL (not
+    # flag-gated) — a grain confirmed in a PRIOR cycle must survive a rebuild even when
+    # OVERLAY_TABLE_SYNTH is off. Savepoint + except: a projection DB fault must never poison the
+    # request tx or roll back facts/quarantine (this path must not be able to 500 a flag-off upload).
+    try:
+        with conn.transaction():   # savepoint: a projection fault must not roll back facts
+            project_table_facts(conn, source=catalog_source,
+                                tables=sorted({r.table for r in vr.good}), now=now)
+    except Exception:  # noqa: BLE001 — advisory: re-projection never fails an upload
+        counters.incr("overlay.table_fact_projection.error")
+        logger.warning("advisory grain/as-of re-projection failed for %r — facts intact",
+                       catalog_source, exc_info=True)
 
     persist_quarantine(conn, catalog_source, vr.quarantined)
     flagged = (f"first upload of '{catalog_source}' ({len(vr.good)} objects) — review recommended"
