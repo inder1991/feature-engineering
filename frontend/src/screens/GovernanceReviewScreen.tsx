@@ -375,12 +375,16 @@ function JoinCard({ proposal: p, onDecided, onConflict }: JoinCardProps) {
       )}
 
       <div className="gj-approve-area">
-        <input
-          aria-label="Note for the next approver (optional)"
-          placeholder="Note for the 2nd approver (optional) — what you checked, what to watch"
-          value={noteDraft}
-          onChange={e => setNoteDraft(e.target.value)}
-        />
+        {p.status === 'PROPOSED' && (
+          // Only the FIRST approver leaves a note "for the next approver" — once this (second)
+          // approval VERIFIES the join there is no next reader, so the partial card omits it.
+          <input
+            aria-label="Note for the next approver (optional)"
+            placeholder="Note for the 2nd approver (optional) — what you checked, what to watch"
+            value={noteDraft}
+            onChange={e => setNoteDraft(e.target.value)}
+          />
+        )}
         <div className="gj-actions">
           <button
             type="button"

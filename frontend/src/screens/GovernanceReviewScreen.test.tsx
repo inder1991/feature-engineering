@@ -139,6 +139,30 @@ describe('governance review screen', () => {
     expect(await screen.findByText(/a\.rahman approved/i)).toBeInTheDocument()
     expect(screen.getByText(/"Check the account namespace\."/)).toBeInTheDocument()
     expect(screen.getByRole('button', { name: /approve as 2nd approver/i })).toBeDisabled()
+    // No note input on the second-approver card: this approval VERIFIES the join — a note "for
+    // the next approver" would have no next reader. Only the PROPOSED card offers it.
+    expect(screen.queryByLabelText(/note for the next approver/i)).not.toBeInTheDocument()
+  })
+
+  it('with missing evidence still renders the 4 baseline checklist items and keeps Approve gateable', async () => {
+    // The "gate stays gateable" property: an absent/unreadable evidence record must neither
+    // auto-enable Approve (an ungated approval) nor permanently disable it (an unapprovable
+    // proposal) — the 4 BASELINE items still render and still gate, with no derived signal items.
+    listJoinProposals.mockResolvedValue({
+      source: 'compliance',
+      proposals: [{ ...PROPOSAL, evidence: {}, evidence_version: null, evidence_parse_status: 'missing' }],
+      next_cursor: null,
+    })
+    await loadQueue()
+    const approveBtn = await screen.findByRole('button', { name: /^approve$/i })
+    expect(approveBtn).toBeDisabled() // never auto-enabled
+    expect(screen.getByText(/score unavailable \(missing\)/i)).toBeInTheDocument()
+    const boxes = screen.getAllByRole('checkbox')
+    expect(boxes).toHaveLength(4) // exactly the baseline — no signal items without parsed evidence
+    for (const box of boxes.slice(0, -1)) await userEvent.click(box)
+    expect(approveBtn).toBeDisabled() // one still unticked -> still gated
+    await userEvent.click(boxes[boxes.length - 1])
+    expect(approveBtn).toBeEnabled() // never permanently disabled
   })
 
   it('on a 409 conflict shows the server detail and reloads the list, never blind-retrying', async () => {
