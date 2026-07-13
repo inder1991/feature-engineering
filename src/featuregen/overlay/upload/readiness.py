@@ -443,3 +443,223 @@ def compute_readiness(
         advisory_gaps=tuple(advisory),
         summary_scores=_summary_scores(all_reqs),
     )
+
+
+# ═══ Relationship readiness (Phase 3A Task 9, spec §16) — a DISTINCT per-table dimension ══════════
+#
+# NOT part of the 4-value ReadinessRequirement.status vocabulary above (the static `join`
+# requirement in _PHASE1_UNPROMOTED is untouched): relationships get their OWN five-value enum and
+# view. Read-only — this dimension never writes.
+
+
+class RelationshipStatus(StrEnum):
+    """The state of a table's join relationships (spec §16). Precedence when a table has pairs in
+    several states: CONFLICTING > CONFIRMED > CANDIDATE_PROPOSED > WEAK_CANDIDATES_ONLY >
+    NO_CANDIDATES — an irreconcilable claim always surfaces; one verified pair outranks any number
+    of pending/weak ones; anything pending outranks weak-only."""
+
+    NO_CANDIDATES = "no_candidates"
+    CANDIDATE_PROPOSED = "candidate_proposed"
+    WEAK_CANDIDATES_ONLY = "weak_candidates_only"
+    CONFIRMED = "confirmed"
+    CONFLICTING = "conflicting"
+
+
+@dataclass(frozen=True)
+class RelationshipReadiness:
+    """One table's relationship diagnostic. ``status`` is the precedence-folded verdict; the four
+    pair tuples are the per-category detail (each pair rendered ``"lo <-> hi"`` from its sorted
+    evidence column refs) — DISJOINT: a pair is listed once, under its own highest category."""
+
+    scope: ReadinessScopeType
+    source: str
+    schema: str
+    table: str
+    status: RelationshipStatus
+    confirmed_pairs: tuple[str, ...]
+    proposed_pairs: tuple[str, ...]
+    weak_pairs: tuple[str, ...]
+    conflicting_pairs: tuple[str, ...]
+
+
+# Folded fact statuses that count as a PENDING candidate (candidate_proposed). REVERIFY (a lapsed
+# confirmation) and STALE (drift-demoted) map here — mirroring _table_fact_status, which reports
+# both as "proposed": the relationship is awaiting a (re-)confirmation, not absent. REJECTED and
+# a missing stream confer nothing.
+_REL_PENDING = frozenset({"DRAFT", "PARTIALLY_CONFIRMED", "REVERIFY", "STALE"})
+
+
+def _pair_label(pair: tuple[str, str]) -> str:
+    return f"{pair[0]} <-> {pair[1]}"
+
+
+def _relationship_candidates(
+    conn: DbConn, norm_source: str
+) -> tuple[dict[str, tuple[tuple[str, str], set[tuple[str, str]]]],
+           dict[tuple[str, str], set[tuple[str, str]]]]:
+    """The source's join candidates, from both stores.
+
+    Returns ``(facts, weak)``:
+
+    * ``facts`` — ``fact_key -> (pair, endpoint_tables)`` for every ``approved_join`` fact touching
+      the source, UNIONED from the ``overlay_proposal`` read model (covers joins proposed outside
+      Pass C) and the ledger's fact-bearing rows (covers a Pass-C join the projection has not
+      processed yet). Status is NOT read here — the caller folds the event log per key, so a
+      ledger ``lifecycle`` or a lagging read-model status is never trusted for liveness.
+    * ``weak`` — ``pair -> endpoint_tables`` for the ledger's weak rows (``bucket='weak' AND
+      lifecycle='weak'`` — the only home for weak candidates; ``fact_key`` is NULL). Weak is READ,
+      never recomputed: the AMBIGUOUS policy ran upstream at write-time.
+
+    A ``pair`` is the UNORDERED (sorted) tuple of the two normalized evidence column refs
+    (``source::schema.table.column`` — rebuilt via :func:`normalize_ref` so read-model and ledger
+    spellings of the same endpoint always compare equal); ``endpoint_tables`` are the normalized
+    ``(schema, table)`` pairs the candidate touches."""
+    from featuregen.overlay.upload.object_ref import normalize_ref
+    from featuregen.overlay.upload.passc.lifecycle import _column_ref
+
+    def endpoint(source: str, schema: str, table: str, column: str) -> tuple[str, tuple[str, str]]:
+        ref = normalize_ref(source, schema, table, column)
+        _src, n_schema, n_table, _col = parse_ref(ref)
+        return ref, (n_schema, n_table)
+
+    facts: dict[str, tuple[tuple[str, str], set[tuple[str, str]]]] = {}
+
+    # (a) The overlay read model: every approved_join proposal ever projected for this source.
+    #     proposed_value is schema-pinned to {from_ref, to_ref, column_pairs, cardinality}.
+    for fk, csource, value in conn.execute(
+        "SELECT fact_key, catalog_source, proposed_value FROM overlay_proposal "
+        "WHERE fact_type = 'approved_join'"
+    ).fetchall():
+        if csource.strip().lower() != norm_source:
+            continue
+        sides = [
+            endpoint(d["catalog_source"], d["schema"], d["table"], d["column"])
+            for d in (value["from_ref"], value["to_ref"])
+        ]
+        pair = tuple(sorted(ref for ref, _tab in sides))
+        facts[fk] = (pair, {tab for _ref, tab in sides})  # type: ignore[assignment]
+
+    # (b) The ledger's fact-bearing rows — the Pass-C enumeration bridge (from_ref/to_ref are the
+    #     sorted evidence column refs, `source::schema.table.column`).
+    for csource, lo, hi, fk in conn.execute(
+        "SELECT catalog_source, from_ref, to_ref, fact_key FROM pass_c_candidate_evidence "
+        "WHERE fact_key IS NOT NULL"
+    ).fetchall():
+        if csource.strip().lower() != norm_source or fk in facts:
+            continue
+        sides = []
+        for raw in (lo, hi):
+            col = _column_ref(raw, csource)  # tolerates source::/bare spellings
+            sides.append(endpoint(col.catalog_source, col.schema, col.table, col.column))
+        pair = tuple(sorted(ref for ref, _tab in sides))
+        facts[fk] = (pair, {tab for _ref, tab in sides})  # type: ignore[assignment]
+
+    # (c) The ledger's weak rows — persisted diagnostics that never became proposals.
+    weak: dict[tuple[str, str], set[tuple[str, str]]] = {}
+    for csource, lo, hi in conn.execute(
+        "SELECT catalog_source, from_ref, to_ref FROM pass_c_candidate_evidence "
+        "WHERE bucket = 'weak' AND lifecycle = 'weak'"
+    ).fetchall():
+        if csource.strip().lower() != norm_source:
+            continue
+        sides = []
+        for raw in (lo, hi):
+            col = _column_ref(raw, csource)
+            sides.append(endpoint(col.catalog_source, col.schema, col.table, col.column))
+        pair = tuple(sorted(ref for ref, _tab in sides))
+        weak[pair] = {tab for _ref, tab in sides}  # type: ignore[index]
+
+    return facts, weak
+
+
+def compute_relationship_readiness(
+    conn: DbConn,
+    *,
+    source: str,
+    subset: str | Sequence[str] | None = None,
+) -> tuple[RelationshipReadiness, ...]:
+    """The per-table RELATIONSHIP readiness diagnostic for ``source`` (spec §16) — READ-ONLY.
+
+    One :class:`RelationshipReadiness` per in-scope table, sorted by ``(schema, table)``. The table
+    universe and ``subset`` semantics are :func:`_scoped_refs`'s (the decided refs; a schema-aware
+    ``"schema.table"`` / unambiguous bare ``"table"`` selector, or an explicit ref list). A subset
+    matching NO decided refs returns ``()`` — this view has no blocker vocabulary; use
+    :func:`compute_readiness` for the gate-shaped subset_not_found diagnostic.
+
+    Derivation per table, from the two candidate stores (:func:`_relationship_candidates`):
+
+    * every ``approved_join`` fact touching the table gets its LIVE status folded from the event
+      log (:func:`~featuregen.overlay.state.fold_overlay_state`) — VERIFIED confirms its pair;
+      DRAFT / PARTIALLY_CONFIRMED / REVERIFY / STALE leave it pending; REJECTED confers nothing;
+    * a pair claimed by TWO OR MORE distinct ACTIVE fact_keys (the ``decide_action`` conflict
+      grain: same unordered column pair, different direction/cardinality key) is CONFLICTING;
+    * a ledger weak row is a weak pair, unless a fact already claims that pair.
+
+    Status precedence: conflicting > confirmed > candidate_proposed > weak_candidates_only >
+    no_candidates."""
+    from featuregen.overlay.state import fold_overlay_state
+    from featuregen.overlay.store import load_fact
+    from featuregen.overlay.upload.passc.lifecycle import _ACTIVE
+
+    tables = _tables_of(_scoped_refs(conn, source=source, subset=subset))
+    if not tables:
+        return ()
+    norm_source = source.strip().lower()
+    facts, weak = _relationship_candidates(conn, norm_source)
+    status_of_key = {
+        fk: fold_overlay_state(load_fact(conn, fk)).status for fk in facts
+    }
+
+    results: list[RelationshipReadiness] = []
+    for schema, table in sorted(tables):
+        here = (schema, table)
+        # Fold this table's facts pair-by-pair: which keys are live, and what each pair holds.
+        active_keys: dict[tuple[str, str], set[str]] = {}
+        verified: set[tuple[str, str]] = set()
+        pending: set[tuple[str, str]] = set()
+        claimed: set[tuple[str, str]] = set()
+        for fk, (pair, endpoint_tables) in facts.items():
+            if here not in endpoint_tables:
+                continue
+            status = status_of_key[fk]
+            if status is None:
+                continue  # ledger points at a fact with no event stream — nothing to report
+            claimed.add(pair)
+            if status in _ACTIVE:
+                active_keys.setdefault(pair, set()).add(fk)
+            if status == "VERIFIED":
+                verified.add(pair)
+            elif status in _REL_PENDING:
+                pending.add(pair)
+
+        conflicting = {pair for pair, keys in active_keys.items() if len(keys) >= 2}
+        confirmed = verified - conflicting
+        proposed = pending - conflicting - confirmed
+        weak_here = {
+            pair for pair, endpoint_tables in weak.items()
+            if here in endpoint_tables and pair not in claimed
+        }
+
+        if conflicting:
+            status = RelationshipStatus.CONFLICTING
+        elif confirmed:
+            status = RelationshipStatus.CONFIRMED
+        elif proposed:
+            status = RelationshipStatus.CANDIDATE_PROPOSED
+        elif weak_here:
+            status = RelationshipStatus.WEAK_CANDIDATES_ONLY
+        else:
+            status = RelationshipStatus.NO_CANDIDATES
+
+        results.append(RelationshipReadiness(
+            scope=ReadinessScopeType.TABLE,
+            source=norm_source,
+            schema=schema,
+            table=table,
+            status=status,
+            confirmed_pairs=tuple(_pair_label(p) for p in sorted(confirmed)),
+            proposed_pairs=tuple(_pair_label(p) for p in sorted(proposed)),
+            weak_pairs=tuple(_pair_label(p) for p in sorted(weak_here)),
+            conflicting_pairs=tuple(_pair_label(p) for p in sorted(conflicting)),
+        ))
+    return tuple(results)
