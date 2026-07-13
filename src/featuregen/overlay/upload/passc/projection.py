@@ -28,13 +28,39 @@ from collections.abc import Iterable
 from datetime import UTC, datetime
 
 from featuregen.overlay.catalog import current_catalog_adapter
-from featuregen.overlay.identity import ApprovedJoinRef, CatalogObjectRef, _norm, fact_key
+from featuregen.overlay.identity import (
+    ApprovedJoinRef,
+    CatalogObjectRef,
+    _norm,
+    _ref_from_payload,
+    fact_key,
+)
 from featuregen.overlay.resolve import resolve_fact
 
 
 def _endpoint(ref: CatalogObjectRef) -> str:
     """A join endpoint in PUBLIC graph scope — the `graph_node.object_ref` rendering."""
     return f"public.{ref.table}.{ref.column}"
+
+
+def list_approved_join_refs(conn, source: str) -> list[ApprovedJoinRef]:
+    """Every `approved_join` ref ever proposed for `source`, rebuilt from the `overlay_proposal`
+    read model's schema-pinned payloads (`_ref_from_payload`) — the FACT-side enumeration
+    `project_confirmed_joins` requires (never `graph_edge`: self-referential, and build_graph just
+    wiped it; never the Pass-C ledger: Task 10 clears+rewrites it every cycle, while a prior-cycle
+    VERIFIED join lives on only in its fact). Mirrors the Task-9 readiness enumeration
+    (`_relationship_candidates` store (a)); callers gate on `projection_lag == 0` so the read model
+    is at head. Passing EVERY ref — VERIFIED or not — is safe: the projector resolves each one and
+    non-VERIFIED resolutions become declared-spare demotions/no-ops."""
+    norm_source = _norm(source)
+    refs: list[ApprovedJoinRef] = []
+    for csource, value in conn.execute(
+            "SELECT catalog_source, proposed_value FROM overlay_proposal"
+            " WHERE fact_type = 'approved_join'").fetchall():
+        if _norm(csource) != norm_source:
+            continue
+        refs.append(_ref_from_payload(value))
+    return refs
 
 
 def demote_join_edges(conn, *, fact_key: str, status: str, now: datetime | None = None) -> int:

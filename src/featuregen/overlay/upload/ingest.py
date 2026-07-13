@@ -42,15 +42,19 @@ from featuregen.overlay.upload.graph import (
     parse_join_ref,
 )
 from featuregen.overlay.upload.object_ref import normalize_ref, parse_ref
+from featuregen.overlay.upload.passc.projection import (
+    list_approved_join_refs,
+    project_confirmed_joins,
+)
 from featuregen.overlay.upload.readiness import ReadinessScopeType, compute_readiness
 from featuregen.overlay.upload.review_queue import persist_quarantine
 from featuregen.overlay.upload.sample_parser import parse_sample_profile
-from featuregen.overlay.upload.table_fact_projection import project_table_facts
 from featuregen.overlay.upload.source_profile import (
     FTR_GLOSSARY_PROFILE,
     SourceCapabilityProfile,
     strength_for,
 )
+from featuregen.overlay.upload.table_fact_projection import project_table_facts
 from featuregen.overlay.upload.taxonomy_evidence import derive_concept_evidence
 from featuregen.overlay.upload.upload_catalog import (
     UploadCatalog,
@@ -881,6 +885,29 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
         except Exception:  # noqa: BLE001 — advisory: re-projection never fails an upload
             counters.incr("overlay.table_fact_projection.error")
             logger.warning("advisory grain/as-of re-projection failed for %r — facts intact",
+                           catalog_source, exc_info=True)
+
+    # approved_join re-projection (Pass C Task 10, closing Task 8's loop): build_graph wiped EVERY
+    # edge for this source, so a join VERIFIED in a PRIOR cycle must be re-projected from its FACT
+    # (enumerated off the overlay substrate — NEVER the Pass-C ledger, which this cycle just
+    # cleared, and never graph_edge itself). UNCONDITIONAL (not flag-gated), and byte-for-byte safe
+    # when flag-off: the projector is DECLARED-SPARE (it only deletes/demotes fact-linked edges)
+    # and a pure-declared catalog has zero approved_join facts, so it enumerates nothing and writes
+    # nothing. Same projection-lag guard as the grain/as-of block above: resolve_fact reads the
+    # overlay_fact_state read model, and a lagging model could serve a stale status — skip and let
+    # the next caught-up ingest re-project (the async demotion hook covers reject/expiry latency).
+    if projection_lag(conn, "overlay") > 0:
+        counters.incr("overlay.passc.join_projection.skipped_projection_lag")
+        logger.warning("overlay projection lags after ingest of %r — skipping approved-join "
+                       "re-projection (re-runs when the projection catches up)", catalog_source)
+    else:
+        try:
+            with conn.transaction():   # savepoint: a projection fault must not roll back facts
+                project_confirmed_joins(conn, source=catalog_source,
+                                        pairs=list_approved_join_refs(conn, catalog_source))
+        except Exception:  # noqa: BLE001 — advisory: join re-projection never fails an upload
+            counters.incr("overlay.passc.join_projection.error")
+            logger.warning("advisory approved-join re-projection failed for %r — facts intact",
                            catalog_source, exc_info=True)
 
     persist_quarantine(conn, catalog_source, vr.quarantined)
