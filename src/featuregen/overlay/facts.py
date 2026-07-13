@@ -188,7 +188,9 @@ OVERLAY_EVENT_SCHEMAS: dict[str, dict] = {
         ],
     ),
     OVERLAY_FACT_PARTIALLY_CONFIRMED: _evt(
-        {"by_owner": _STR, "role": _STR, "draft_event_id": _STR},
+        # `note` (optional, nullable): the confirmer's free-text note for the OTHER approver
+        # (confirmation surface). NOT required — pre-existing events lack the key entirely.
+        {"by_owner": _STR, "role": _STR, "draft_event_id": _STR, "note": _NSTR},
         ["by_owner", "role", "draft_event_id"],
     ),
     OVERLAY_FACT_CONFIRMED: _evt(
@@ -197,6 +199,7 @@ OVERLAY_EVENT_SCHEMAS: dict[str, dict] = {
             "confirmers": {"type": "array", "items": _CONFIRMER},
             "expires_at": _NSTR,
             "confirms_event_id": _STR,
+            "note": _NSTR,  # optional approver note (confirmation surface); absent pre-feature
         },
         ["value", "confirmers", "confirms_event_id"],
     ),

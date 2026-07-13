@@ -167,6 +167,7 @@ def confirm_fact(conn: DbConn, cmd: Command) -> CommandResult:
             "confirmers": confirmers,
             "expires_at": expires_at.isoformat(),
             "confirms_event_id": args["target_event_id"],
+            "note": args.get("note"),
         },
         actor=cmd.actor,
         caused_by=args["target_event_id"],
