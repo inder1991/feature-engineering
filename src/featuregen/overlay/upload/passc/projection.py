@@ -43,6 +43,14 @@ def _endpoint(ref: CatalogObjectRef) -> str:
     return f"public.{ref.table}.{ref.column}"
 
 
+def _pair_key(ref: ApprovedJoinRef) -> tuple[str, str]:
+    """The UNORDERED column-pair key — the sorted pair of public-scope endpoints, i.e. exactly the
+    span the projector's both-orientation SQL (`(a,b) OR (b,a)`) touches. Two approved_join facts
+    with the same `_pair_key` are RIVALS for the same operational edge (the reject→re-propose
+    correction path makes that reachable), so outcomes must be decided per key, not per ref."""
+    return tuple(sorted((_endpoint(ref.from_ref), _endpoint(ref.to_ref))))
+
+
 def list_approved_join_refs(conn, source: str) -> list[ApprovedJoinRef]:
     """Every `approved_join` ref ever proposed for `source`, rebuilt from the `overlay_proposal`
     read model's schema-pinned payloads (`_ref_from_payload`) — the FACT-side enumeration
@@ -50,8 +58,11 @@ def list_approved_join_refs(conn, source: str) -> list[ApprovedJoinRef]:
     wiped it; never the Pass-C ledger: Task 10 clears+rewrites it every cycle, while a prior-cycle
     VERIFIED join lives on only in its fact). Mirrors the Task-9 readiness enumeration
     (`_relationship_candidates` store (a)); callers gate on `projection_lag == 0` so the read model
-    is at head. Passing EVERY ref — VERIFIED or not — is safe: the projector resolves each one and
-    non-VERIFIED resolutions become declared-spare demotions/no-ops."""
+    is at head. Passing EVERY ref — VERIFIED or not — is safe: the projector groups refs by
+    unordered column pair and resolves each one, so a non-VERIFIED sibling can never clobber the
+    pair's VERIFIED projection, and an all-non-VERIFIED pair becomes ONE declared-spare
+    demotion/no-op. Enumeration is DETERMINISTIC (sorted by unordered pair key, then fact_key) so
+    any caller iterating the refs directly is reproducible too."""
     norm_source = _norm(source)
     refs: list[ApprovedJoinRef] = []
     for csource, value in conn.execute(
@@ -60,6 +71,7 @@ def list_approved_join_refs(conn, source: str) -> list[ApprovedJoinRef]:
         if _norm(csource) != norm_source:
             continue
         refs.append(_ref_from_payload(value))
+    refs.sort(key=lambda r: (_pair_key(r), fact_key(r, "approved_join")))
     return refs
 
 
@@ -93,15 +105,37 @@ def project_confirmed_joins(conn, *, source: str, pairs: Iterable[ApprovedJoinRe
     * **anything else** — demote to display_only and CLEAR the fact links, for BOTH orientations,
       but ONLY on edges whose `approved_join_fact_key IS NOT NULL`: a file-declared edge is never
       demoted (THE flag-off byte-for-byte guarantee), and no other column pair is touched.
+
+    ORDER-INDEPENDENT + VERIFIED-WINS (Task 10 review fix): refs are GROUPED by their unordered
+    column pair (`_pair_key` — the exact span the both-orientation SQL touches) and each pair's
+    outcome is decided ONCE. Two distinct approved_join fact_keys CAN share a pair — reject→
+    re-propose is the correction path (a REJECTED `A→B` sibling plus a VERIFIED `B→A`) — and the
+    demote branch matches by column pair, fact_key-agnostically, so without grouping a
+    non-VERIFIED sibling processed AFTER the VERIFIED ref would clobber the just-written
+    operational edge back to display_only. Per pair: ANY VERIFIED ref wins (project it; no
+    sibling demote runs); NONE verified → ONE declared-spare demotion. Should two VERIFIED refs
+    ever share a pair (impossible under the Pass-C ledger's one-row-per-unordered-pair
+    invariant), the lexicographically-smallest fact_key is projected, deterministically.
     """
     now = now or datetime.now(UTC)
     adapter = current_catalog_adapter()
+    groups: dict[tuple[str, str], list[ApprovedJoinRef]] = {}
     for ref in pairs:
         if _norm(ref.from_ref.catalog_source) != _norm(source):
             continue    # defensive: a foreign-source ref must never touch THIS source's edges
-        a, b = _endpoint(ref.from_ref), _endpoint(ref.to_ref)
-        resolved = resolve_fact(conn, adapter, ref, "approved_join", now=now)
-        if resolved.status == "VERIFIED" and resolved.value is not None:
+        groups.setdefault(_pair_key(ref), []).append(ref)
+    for group in groups.values():
+        verified = [
+            (fact_key(ref, "approved_join"), ref, resolved)
+            for ref in group
+            for resolved in (resolve_fact(conn, adapter, ref, "approved_join", now=now),)
+            if resolved.status == "VERIFIED" and resolved.value is not None
+        ]
+        if verified:
+            # Deterministic pick: smallest fact_key (key= keeps a duplicate-ref tie from ever
+            # comparing ApprovedJoinRef dataclasses, which define no ordering).
+            key, ref, resolved = min(verified, key=lambda entry: entry[0])
+            a, b = _endpoint(ref.from_ref), _endpoint(ref.to_ref)
             conn.execute(
                 "DELETE FROM graph_edge WHERE catalog_source = %s AND kind = 'joins' AND"
                 " ((from_ref = %s AND to_ref = %s) OR (from_ref = %s AND to_ref = %s))",
@@ -111,9 +145,10 @@ def project_confirmed_joins(conn, *, source: str, pairs: Iterable[ApprovedJoinRe
                 " authority, approved_join_fact_key, approved_join_event_id,"
                 " approved_join_status, authority_updated_at)"
                 " VALUES (%s, 'joins', %s, %s, %s, 'operational', %s, %s, 'VERIFIED', %s)",
-                (source, a, b, resolved.value["cardinality"], fact_key(ref, "approved_join"),
+                (source, a, b, resolved.value["cardinality"], key,
                  (resolved.provenance or {}).get("confirmed_event_id"), now))
         else:
+            a, b = _endpoint(group[0].from_ref), _endpoint(group[0].to_ref)
             conn.execute(
                 "UPDATE graph_edge SET authority = 'display_only', approved_join_fact_key = NULL,"
                 " approved_join_event_id = NULL, approved_join_status = NULL,"

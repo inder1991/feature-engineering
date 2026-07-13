@@ -16,6 +16,7 @@ traverses. Three safety properties under test:
 """
 from __future__ import annotations
 
+import pytest
 from tests.featuregen.overlay.upload.passc.conftest import (
     _confirm_join,
     _expire_join,
@@ -24,7 +25,7 @@ from tests.featuregen.overlay.upload.passc.conftest import (
 )
 
 from featuregen.overlay.catalog_changes import detect_catalog_changes
-from featuregen.overlay.identity import fact_key
+from featuregen.overlay.identity import ApprovedJoinRef, ColumnPair, fact_key
 from featuregen.overlay.state import fold_overlay_state
 from featuregen.overlay.store import load_fact
 from featuregen.overlay.upload.canonical import CanonicalRow
@@ -208,6 +209,51 @@ def test_projector_is_idempotent(passc_conn, human_admin_1, human_admin_2):
     again = _edge_rows(passc_conn)
     assert set(again) == set(first) == {(_FROM, _TO)}
     assert again[(_FROM, _TO)]["fact_key"] == first[(_FROM, _TO)]["fact_key"]
+
+
+def _reversed_rival(ref):
+    """The SAME unordered column pair proposed in the OPPOSITE direction — a DISTINCT fact_key
+    (from/to swapped, cardinality inverted). This is the reject→re-propose correction path's
+    rejected sibling: reject the wrong-direction proposal, re-propose the corrected one."""
+    return ApprovedJoinRef(
+        from_ref=ref.to_ref, to_ref=ref.from_ref,
+        column_pairs=tuple(ColumnPair(p.to_col, p.from_col) for p in ref.column_pairs),
+        cardinality="1:N")
+
+
+@pytest.mark.parametrize("verified_first", [True, False],
+                         ids=["verified-then-rejected", "rejected-then-verified"])
+def test_same_pair_rival_facts_project_order_independently(
+        passc_conn, human_admin_1, human_admin_2, verified_first):
+    # Task 10 review fix: TWO approved_join fact_keys on the SAME unordered column pair — a
+    # REJECTED customers->transactions sibling plus the VERIFIED transactions->customers
+    # correction. The demote branch matches edges by COLUMN PAIR (fact_key-agnostically), so
+    # without same-pair grouping the final edge state depended on iteration order: projecting
+    # the VERIFIED ref first let the rejected sibling's demote clobber the just-written
+    # operational edge back to display_only. VERIFIED must win in BOTH orders.
+    verified_ref = build_join_ref(_strong_evidence(), "src")
+    rejected_ref = _reversed_rival(verified_ref)
+    assert fact_key(rejected_ref, "approved_join") != fact_key(verified_ref, "approved_join")
+
+    _propose_join(passc_conn, rejected_ref)                       # the wrong-direction proposal
+    _reject_join(passc_conn, rejected_ref, admin=human_admin_1)   # rejected on review
+    _propose_join(passc_conn, verified_ref)                       # the corrected re-proposal
+    _confirm_join(passc_conn, verified_ref, admin1=human_admin_1, admin2=human_admin_2)
+
+    pairs = ([verified_ref, rejected_ref] if verified_first
+             else [rejected_ref, verified_ref])
+    project_confirmed_joins(passc_conn, source="src", pairs=pairs)
+
+    rows = _edge_rows(passc_conn)
+    assert set(rows) == {(_FROM, _TO)}, \
+        "exactly ONE edge, in the VERIFIED confirmed direction, regardless of iteration order"
+    edge = rows[(_FROM, _TO)]
+    assert edge["authority"] == "operational"
+    assert edge["fact_key"] == fact_key(verified_ref, "approved_join")
+    assert edge["status"] == "VERIFIED" and edge["cardinality"] == "N:1"
+    assert edge["event_id"] is not None and edge["updated_at"] is not None
+    assert find_join_path(passc_conn, "src", "transactions", "customers") \
+        == [JoinStep(_FROM, _TO, "N:1")]
 
 
 # ── The async demotion hook (no re-ingest, no projector run) ─────────────────────────────────────
