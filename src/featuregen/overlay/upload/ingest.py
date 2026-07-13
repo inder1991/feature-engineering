@@ -70,6 +70,14 @@ def table_synth_enabled() -> bool:
     return os.environ.get("OVERLAY_TABLE_SYNTH", "0") == "1"
 
 
+def pass_c_enabled() -> bool:
+    """Feature switch for Pass C — deterministic governed join candidates (Phase 3A), default OFF.
+    ON also implies the governed `joins_to` seam (`graph.governed_joins_enabled` reads this env
+    directly to avoid an import cycle), so a declared join's raw edge is written display_only AND
+    routed to an approved_join proposal — never stranded display-only."""
+    return os.environ.get("OVERLAY_PASS_C", "0") == "1"
+
+
 def _drain_projection(conn) -> None:
     """Run the overlay projection until caught up. A single run_projection caps at 500 events and an
     upload emits 2 per (re)asserted fact, so one pass on a large upload leaves the dependency index
@@ -647,9 +655,11 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
         except Exception:  # noqa: BLE001
             logger.warning("advisory domain enrichment failed for %r", catalog_source, exc_info=True)
     build_graph(conn, catalog_source, vr.good, concepts, definitions, domains)
-    if governed_joins_enabled():
-        # Governed seam (Task 7 / §12.1): the raw 'joins' edges just written are display-only; route
-        # each declared join into the governed approved_join path. Advisory/fail-soft + adapter-gated.
+    if governed_joins_enabled() or pass_c_enabled():
+        # Governed seam (Task 7 / §12.1) — Pass C (Task 10) implies it: the raw 'joins' edges just
+        # written are display-only; route each declared join into the governed approved_join path so
+        # it is never stranded display-only. Advisory/fail-soft + adapter-gated. (The `or` is
+        # belt-and-braces: governed_joins_enabled already fires under OVERLAY_PASS_C.)
         _propose_governed_joins(conn, vr.good, actor=actor)
 
     if table_synth_enabled() and client is not None:

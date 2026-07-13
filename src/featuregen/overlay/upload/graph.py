@@ -17,8 +17,13 @@ def governed_joins_enabled() -> bool:
     """The governed `joins_to` seam (Task 7 / §12.1), default OFF. When ON, a declared join's raw
     'joins' edge is written DISPLAY-ONLY (authority='display_only') and routed into the governed
     approved_join path via propose_fact; feature-construction reads filter to authority='operational'
-    so an ungoverned display edge is never used to build features."""
-    return os.environ.get("OVERLAY_GOVERNED_JOINS") == "1"
+    so an ungoverned display edge is never used to build features.
+
+    Pass C (OVERLAY_PASS_C, Phase 3A Task 10) IMPLIES governed mode: under Pass C every declared
+    join must route through the governed approved_join path, so its env var is read DIRECTLY here —
+    graph.py must NOT import ingest.pass_c_enabled (import cycle)."""
+    return (os.environ.get("OVERLAY_GOVERNED_JOINS") == "1"
+            or os.environ.get("OVERLAY_PASS_C") == "1")
 
 
 def _join_edge_authority() -> str:
