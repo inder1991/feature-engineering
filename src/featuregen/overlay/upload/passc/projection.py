@@ -1,0 +1,98 @@
+"""Pass C — the REVERSE projector (Phase 3A Task 8): VERIFIED `approved_join` fact -> operational
+`graph_edge`, plus the async demotion applied the moment a fact leaves VERIFIED.
+
+The load-bearing truth is the fact stream; the `joins` graph_edge is its operational projection —
+what `find_join_path` / `_cross_adjacency` / `route_strategies` actually traverse. Safety
+properties (each one is a reviewed invariant):
+
+* **DECLARED-SPARE** — demotion touches ONLY fact-linked edges (`approved_join_fact_key IS NOT
+  NULL`). A file-declared edge (NULL link) is never demoted, so a flag-off pure-declared catalog
+  is byte-for-byte untouched by a projector run.
+* **Orientation-safe** — a VERIFIED fact replaces BOTH orientations of its unordered column pair
+  with exactly ONE edge in the confirmed direction (a declared reverse row would otherwise
+  survive as a stale duplicate with an inverted fan).
+* **Scope-safe** — edges are COLUMN-keyed; only THE candidate's column pair is touched, rendered
+  in PUBLIC graph scope (``public.{table}.{column}``, matching ``graph_node.object_ref`` — never
+  the ``src::public.…`` evidence form), and only within the projected `source`.
+* **Fail-closed** — anything other than a currently-servable VERIFIED resolution (DRAFT,
+  PARTIALLY_CONFIRMED, REJECTED, REVERIFY, STALE, read-time expiry) demotes the pair's governed
+  edge instead of projecting one.
+
+`pairs` MUST be enumerated from the source's `approved_join` facts / gate tasks (e.g.
+`_ref_from_payload` over the proposal payloads) — NEVER from raw `graph_edge` rows, which would
+make the projection self-referential and unable to recover a dropped edge.
+"""
+from __future__ import annotations
+
+from collections.abc import Iterable
+from datetime import UTC, datetime
+
+from featuregen.overlay.catalog import current_catalog_adapter
+from featuregen.overlay.identity import ApprovedJoinRef, CatalogObjectRef, _norm, fact_key
+from featuregen.overlay.resolve import resolve_fact
+
+
+def _endpoint(ref: CatalogObjectRef) -> str:
+    """A join endpoint in PUBLIC graph scope — the `graph_node.object_ref` rendering."""
+    return f"public.{ref.table}.{ref.column}"
+
+
+def demote_join_edges(conn, *, fact_key: str, status: str, now: datetime | None = None) -> int:
+    """ASYNC demotion (the ingest-latency closer): flip every graph_edge LINKED to `fact_key` to
+    display_only and stamp the fact's new folded status, the moment it leaves VERIFIED (reject /
+    expiry) — traversal stops immediately, not at the next upload's projector run. KEEPS the fact
+    link (unlike the projector's demotion, which clears it): the link is what lets the next
+    projector run — and any auditor — trace the demoted edge back to its fact. Declared-spare by
+    construction: a declared edge has a NULL link and can never match. Returns rows updated."""
+    now = now or datetime.now(UTC)
+    rows = conn.execute(
+        "UPDATE graph_edge SET authority = 'display_only', approved_join_status = %s,"
+        " authority_updated_at = %s WHERE approved_join_fact_key = %s RETURNING 1",
+        (status, now, fact_key)).fetchall()
+    return len(rows)
+
+
+def project_confirmed_joins(conn, *, source: str, pairs: Iterable[ApprovedJoinRef],
+                            now: datetime | None = None) -> None:
+    """Project each pair's CURRENT `approved_join` resolution onto `graph_edge` — IDEMPOTENTLY.
+
+    Per pair: `resolve_fact` (VERIFIED-only serving; `now` forwarded so ingest keeps ONE clock
+    basis for the read-time expiry guard).
+
+    * **VERIFIED** — DELETE any `joins` edge for THIS unordered column pair in EITHER orientation
+      (a declared reverse/duplicate row included — it is being *replaced* by the governed truth,
+      not demoted), then INSERT exactly ONE operational edge in the confirmed direction carrying
+      the confirmed cardinality + the fact links (`approved_join_fact_key`, the confirming
+      event id, status 'VERIFIED', `authority_updated_at`).
+    * **anything else** — demote to display_only and CLEAR the fact links, for BOTH orientations,
+      but ONLY on edges whose `approved_join_fact_key IS NOT NULL`: a file-declared edge is never
+      demoted (THE flag-off byte-for-byte guarantee), and no other column pair is touched.
+    """
+    now = now or datetime.now(UTC)
+    adapter = current_catalog_adapter()
+    for ref in pairs:
+        if _norm(ref.from_ref.catalog_source) != _norm(source):
+            continue    # defensive: a foreign-source ref must never touch THIS source's edges
+        a, b = _endpoint(ref.from_ref), _endpoint(ref.to_ref)
+        resolved = resolve_fact(conn, adapter, ref, "approved_join", now=now)
+        if resolved.status == "VERIFIED" and resolved.value is not None:
+            conn.execute(
+                "DELETE FROM graph_edge WHERE catalog_source = %s AND kind = 'joins' AND"
+                " ((from_ref = %s AND to_ref = %s) OR (from_ref = %s AND to_ref = %s))",
+                (source, a, b, b, a))
+            conn.execute(
+                "INSERT INTO graph_edge (catalog_source, kind, from_ref, to_ref, cardinality,"
+                " authority, approved_join_fact_key, approved_join_event_id,"
+                " approved_join_status, authority_updated_at)"
+                " VALUES (%s, 'joins', %s, %s, %s, 'operational', %s, %s, 'VERIFIED', %s)",
+                (source, a, b, resolved.value["cardinality"], fact_key(ref, "approved_join"),
+                 (resolved.provenance or {}).get("confirmed_event_id"), now))
+        else:
+            conn.execute(
+                "UPDATE graph_edge SET authority = 'display_only', approved_join_fact_key = NULL,"
+                " approved_join_event_id = NULL, approved_join_status = NULL,"
+                " authority_updated_at = %s"
+                " WHERE catalog_source = %s AND kind = 'joins'"
+                " AND approved_join_fact_key IS NOT NULL AND"
+                " ((from_ref = %s AND to_ref = %s) OR (from_ref = %s AND to_ref = %s))",
+                (now, source, a, b, b, a))

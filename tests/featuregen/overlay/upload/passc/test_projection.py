@@ -16,11 +16,22 @@ traverses. Three safety properties under test:
 """
 from __future__ import annotations
 
+from tests.featuregen.overlay.upload.passc.conftest import (
+    _confirm_join,
+    _expire_join,
+    _propose_join,
+)
+
+from featuregen.overlay.identity import fact_key
+from featuregen.overlay.state import fold_overlay_state
+from featuregen.overlay.store import load_fact
 from featuregen.overlay.upload.entity import find_cross_catalog_path
 from featuregen.overlay.upload.feature_assist import route_strategies
 from featuregen.overlay.upload.join_path import JoinStep, find_join_path
 from featuregen.overlay.upload.passc.candidates import block_candidates, score
 from featuregen.overlay.upload.passc.identifiers import ColMeta
+from featuregen.overlay.upload.passc.lifecycle import build_join_ref
+from featuregen.overlay.upload.passc.projection import project_confirmed_joins
 
 _CIF_TERM = "Customer Information File Identifier"
 
@@ -97,3 +108,99 @@ def test_linked_edge_traverses_only_when_verified(passc_conn):
     assert find_cross_catalog_path(passc_conn, "src", "transactions", "src", "customers") is None
     picks = route_strategies(passc_conn, [{"object_ref": _FROM, "catalog_source": "src"}])
     assert "aggregation" not in {name for name, _ in picks}
+
+
+# ── The reverse projector ────────────────────────────────────────────────────────────────────────
+
+
+def _verified_projected(conn, *, admin1, admin2):
+    """Drive the full governed flow: propose -> dual confirm -> project. Returns the ref."""
+    ref = build_join_ref(_strong_evidence(), "src")
+    _propose_join(conn, ref)
+    _confirm_join(conn, ref, admin1=admin1, admin2=admin2)
+    project_confirmed_joins(conn, source="src", pairs=[ref])
+    return ref
+
+
+def test_verified_join_projects_one_operational_edge_that_traverses(
+        passc_conn, human_admin_1, human_admin_2):
+    ref = _verified_projected(passc_conn, admin1=human_admin_1, admin2=human_admin_2)
+    key = fact_key(ref, "approved_join")
+    confirmed_id = fold_overlay_state(load_fact(passc_conn, key)).confirmed_event_id
+
+    rows = _edge_rows(passc_conn)
+    assert set(rows) == {(_FROM, _TO)}, "exactly ONE edge, PUBLIC graph scope, confirmed direction"
+    edge = rows[(_FROM, _TO)]
+    assert edge["cardinality"] == "N:1" and edge["authority"] == "operational"
+    assert edge["fact_key"] == key and edge["status"] == "VERIFIED"
+    assert edge["event_id"] == confirmed_id and edge["event_id"] is not None
+    assert edge["updated_at"] is not None
+
+    assert find_join_path(passc_conn, "src", "transactions", "customers") \
+        == [JoinStep(_FROM, _TO, "N:1")]
+
+
+def test_confirmed_direction_reversing_declared_edge_leaves_one_row(
+        passc_conn, human_admin_1, human_admin_2):
+    # The upload declared the join in the OPPOSITE orientation (display-only under the governed
+    # seam). The confirmed fact points transactions -> customers: the projector must delete the
+    # reversed declared row and leave EXACTLY ONE operational edge — no stale duplicate that
+    # find_join_path could traverse with an inverted fan.
+    _edge(passc_conn, _TO, _FROM, cardinality="1:N", authority="display_only")
+    ref = _verified_projected(passc_conn, admin1=human_admin_1, admin2=human_admin_2)
+
+    rows = _edge_rows(passc_conn)
+    assert set(rows) == {(_FROM, _TO)}
+    assert rows[(_FROM, _TO)]["authority"] == "operational"
+    assert rows[(_FROM, _TO)]["fact_key"] == fact_key(ref, "approved_join")
+
+
+def test_projector_never_demotes_declared_edge(passc_conn):
+    # THE flag-off byte-for-byte guarantee: a DRAFT (non-VERIFIED) fact for the same column pair
+    # must not touch a file-declared operational edge — its fact_key is NULL, and only
+    # fact-LINKED edges are the projector's to demote.
+    _edge(passc_conn, _FROM, _TO)
+    before = _edge_rows(passc_conn)
+    ref = build_join_ref(_strong_evidence(), "src")
+    _propose_join(passc_conn, ref)                      # DRAFT — never confirmed
+
+    project_confirmed_joins(passc_conn, source="src", pairs=[ref])
+
+    assert _edge_rows(passc_conn) == before             # byte-for-byte: untouched
+    assert find_join_path(passc_conn, "src", "transactions", "customers") \
+        == [JoinStep(_FROM, _TO, "N:1")]
+
+
+def test_projector_demotion_is_scoped_to_the_column_pair(
+        passc_conn, human_admin_1, human_admin_2):
+    # Edges are COLUMN-keyed: demoting the cif_id pair must not touch (a) a governed edge on a
+    # DIFFERENT column pair between the same tables, nor (b) a declared edge on a third pair.
+    ref = _verified_projected(passc_conn, admin1=human_admin_1, admin2=human_admin_2)
+    other_gov = ("public.transactions.branch_id", "public.customers.branch_id")
+    other_decl = ("public.transactions.acct_no", "public.customers.acct_no")
+    _edge(passc_conn, *other_gov, link_key="other-key", link_status="VERIFIED")
+    _edge(passc_conn, *other_decl)
+
+    _expire_join(passc_conn, ref)                       # VERIFIED -> REVERIFY
+    project_confirmed_joins(passc_conn, source="src", pairs=[ref])
+
+    rows = _edge_rows(passc_conn)
+    demoted = rows[(_FROM, _TO)]
+    assert demoted["authority"] == "display_only"
+    # The projector CLEARS the fact links on demotion (the edge reverts to a plain display row).
+    assert demoted["fact_key"] is None and demoted["event_id"] is None
+    assert demoted["status"] is None and demoted["updated_at"] is not None
+    # Scope-safety: the other pairs are untouched.
+    assert rows[other_gov]["authority"] == "operational"
+    assert rows[other_gov]["fact_key"] == "other-key"
+    assert rows[other_decl]["authority"] == "operational"
+    assert rows[other_decl]["fact_key"] is None
+
+
+def test_projector_is_idempotent(passc_conn, human_admin_1, human_admin_2):
+    ref = _verified_projected(passc_conn, admin1=human_admin_1, admin2=human_admin_2)
+    first = _edge_rows(passc_conn)
+    project_confirmed_joins(passc_conn, source="src", pairs=[ref, ref])   # re-run, duplicate pair
+    again = _edge_rows(passc_conn)
+    assert set(again) == set(first) == {(_FROM, _TO)}
+    assert again[(_FROM, _TO)]["fact_key"] == first[(_FROM, _TO)]["fact_key"]
