@@ -2745,3 +2745,290 @@ section > h2:first-child {
     position: static;
   }
 }
+
+/* ---------------------------------------------------------------- governance review (joins)
+   Appended for GovernanceReviewScreen: evidence-forward join cards with a checklist-gated
+   Approve and a structured Reject. Composes the existing .rows/.row/.q-item/.badge/.btn
+   vocabulary and the token palette; nothing above this line is modified. */
+
+/* status chips: strong states are solid per DESIGN.md; proposed takes the accent */
+.badge.gj-proposed {
+  background: var(--accent);
+  border-color: transparent;
+  color: var(--chip-ink);
+}
+
+.badge.gj-partial {
+  background: var(--warn-solid);
+  border-color: transparent;
+  color: var(--chip-ink);
+}
+
+.badge.gj-verified {
+  background: var(--ok-solid);
+  border-color: transparent;
+  color: var(--chip-ink);
+}
+
+.badge.gj-rejected {
+  background: var(--danger-solid);
+  border-color: transparent;
+  color: var(--chip-ink);
+}
+
+.gj-kind {
+  font-weight: 600;
+  font-size: 13px;
+}
+
+/* the match score, demoted to a small muted advisory pill on the card's far right */
+.gj-score {
+  margin-left: auto;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--ink-faint);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 1px 9px;
+  background: var(--surface-2);
+  white-space: nowrap;
+}
+
+.gj-score b {
+  color: var(--ink-soft);
+  font-weight: 600;
+}
+
+/* from -> to join strip: two endpoints around the cardinality arrow */
+.gj-join {
+  display: flex;
+  align-items: stretch;
+  gap: 1px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  overflow: hidden;
+  background: var(--line);
+}
+
+.gj-endp {
+  flex: 1;
+  min-width: 0;
+  background: var(--surface-2);
+  padding: 8px 12px;
+}
+
+.gj-endp .k {
+  display: block;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+  margin-bottom: 2px;
+}
+
+.gj-endp .tbl {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--ink-soft);
+  overflow-wrap: anywhere;
+}
+
+.gj-endp .col {
+  display: block;
+  font-family: var(--font-mono);
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ink);
+  overflow-wrap: anywhere;
+}
+
+.gj-arrow {
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  background: var(--surface-2);
+  padding: 0 12px;
+}
+
+.gj-arrow .g {
+  font-family: var(--font-mono);
+  font-size: 15px;
+  color: var(--accent);
+  line-height: 1;
+}
+
+.gj-arrow .cr {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--ink-faint);
+  letter-spacing: 0.05em;
+  margin-top: 2px;
+  white-space: nowrap;
+}
+
+/* consequence (blast radius) line */
+.gj-consequence {
+  font-size: 12.5px;
+  color: var(--ink-soft);
+  line-height: 1.5;
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 8px 11px;
+}
+
+.gj-consequence b {
+  color: var(--ink);
+}
+
+.gj-consequence .gj-risk {
+  color: var(--danger);
+}
+
+.gj-consequence .gj-risk b {
+  color: var(--danger);
+}
+
+/* matched-on-metadata honesty line */
+.gj-caution {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--warn);
+  line-height: 1.4;
+  margin: 0;
+}
+
+/* first approver's note, shown to the second approver */
+.gj-prior {
+  font-size: 12.5px;
+  line-height: 1.5;
+  background: var(--warn-soft);
+  border: 1px solid color-mix(in oklch, var(--warn) 40%, var(--line));
+  border-radius: var(--radius);
+  padding: 8px 11px;
+}
+
+.gj-prior .who {
+  font-weight: 600;
+}
+
+.gj-prior .q {
+  color: var(--ink-soft);
+  font-style: italic;
+}
+
+/* what-to-verify checklist: gates Approve */
+.gj-verify-h {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+  margin-bottom: 4px;
+}
+
+.gj-check {
+  display: flex;
+  gap: 9px;
+  align-items: flex-start;
+  padding: 4px 2px;
+  border-radius: 6px;
+  font-size: 13px;
+  color: var(--ink);
+  line-height: 1.45;
+  cursor: pointer;
+}
+
+.gj-check:hover {
+  background: var(--surface-2);
+}
+
+.gj-check input {
+  width: 15px;
+  height: 15px;
+  margin-top: 2px;
+  flex: none;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+
+.gj-signal-w {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--ink-faint);
+}
+
+.gj-approvals {
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  color: var(--ink-soft);
+  margin: 0;
+}
+
+.gj-approve-area {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.gj-approve-area > input {
+  width: 100%;
+}
+
+.gj-actions {
+  display: flex;
+  gap: 9px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.gj-gate-hint {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--ink-faint);
+}
+
+/* structured reject: category chips + optional note */
+.gj-rejectbox {
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+  padding: 11px;
+  border: 1px solid color-mix(in oklch, var(--danger) 40%, var(--line));
+  border-radius: var(--radius);
+  background: var(--danger-soft);
+}
+
+.gj-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+}
+
+.gj-chip,
+button.gj-chip {
+  height: auto;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--line-strong);
+  background: var(--surface);
+  color: var(--ink-soft);
+}
+
+.gj-chip--on,
+button.gj-chip--on {
+  background: var(--danger);
+  border-color: var(--danger);
+  color: var(--chip-ink);
+}
+
+button.gj-chip--on:hover {
+  background: var(--danger);
+  border-color: var(--danger);
+}
