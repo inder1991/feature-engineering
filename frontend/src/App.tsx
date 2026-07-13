@@ -2,6 +2,7 @@ import type { ReactElement } from 'react'
 import { useHashRoute } from './nav'
 import type { Route } from './nav'
 import { SessionBar } from './SessionBar'
+import { GovernanceReviewScreen } from './screens/GovernanceReviewScreen'
 import { IntegrationsScreen } from './screens/IntegrationsScreen'
 import { OverviewScreen } from './screens/OverviewScreen'
 import { RegistryScreen } from './screens/RegistryScreen'
@@ -101,6 +102,13 @@ const ICONS: Record<Route, ReactElement> = {
       <path d="M6.9 5.15 4.6 10.6M9.1 5.15l2.3 5.45M5.5 12.25h5" />
     </NavIcon>
   ),
+  governance: (
+    // Shield with a check: joins go live only after the two-admin confirmation.
+    <NavIcon>
+      <path d="M8 2.5 12.75 4.25v3.4c0 2.95-1.95 5.15-4.75 5.85-2.8-.7-4.75-2.9-4.75-5.85v-3.4z" />
+      <path d="m6.25 8 1.25 1.25L10 6.5" />
+    </NavIcon>
+  ),
 }
 
 const PAGES: { route: Route; label: string; eyebrow: string; title: string; description: string }[] = [
@@ -157,6 +165,13 @@ const PAGES: { route: Route; label: string; eyebrow: string; title: string; desc
     eyebrow: 'CATALOG · REVIEW QUEUE',
     title: 'Review queue',
     description: 'Rows the catalog refused to trust',
+  },
+  {
+    route: 'governance',
+    label: 'Governance',
+    eyebrow: 'CATALOG · GOVERNANCE REVIEW',
+    title: 'Discovered joins',
+    description: 'Approve or reject the joins Pass C found.',
   },
 ]
 
@@ -216,6 +231,7 @@ export default function App() {
           <RegistryScreen featureId={params.get('id')} navigate={navigate} />
         )}
         {route === 'review' && <ReviewQueueScreen initialSource={params.get('source') ?? ''} />}
+        {route === 'governance' && <GovernanceReviewScreen />}
         {route === 'workbench' && <WorkbenchScreen />}
       </main>
     </div>

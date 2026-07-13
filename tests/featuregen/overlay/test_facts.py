@@ -143,3 +143,29 @@ def test_confirmed_event_schema_rejects_missing_required_field():
             facts.OVERLAY_EVENT_SCHEMA_VERSION,
             {"confirmers": [], "expires_at": None, "confirms_event_id": "evt_1"},  # no `value`
         )
+
+
+def test_rejected_event_schema_category_optional():
+    """Task 5 addendum: `category` is a first-class OPTIONAL nullable property on REJECTED —
+    a reliable analytics key alongside the polymorphic free-text `reason`. NOT required:
+    pre-existing REJECTED events without the key still validate (backward-compat)."""
+    reg = event_registry()
+    base = {
+        "rejected_by": "u",
+        "reason": "free text",
+        "target_event_id": "evt_1",
+        "retired_fingerprint": None,
+    }
+    # backward-compat: an event with NO `category` key at all still validates
+    reg.validate(facts.OVERLAY_FACT_REJECTED, facts.OVERLAY_EVENT_SCHEMA_VERSION, base)
+    # new shape: `category` present as a string, or explicitly null
+    reg.validate(
+        facts.OVERLAY_FACT_REJECTED,
+        facts.OVERLAY_EVENT_SCHEMA_VERSION,
+        {**base, "category": "different_entity"},
+    )
+    reg.validate(
+        facts.OVERLAY_FACT_REJECTED,
+        facts.OVERLAY_EVENT_SCHEMA_VERSION,
+        {**base, "category": None},
+    )

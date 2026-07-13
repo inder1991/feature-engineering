@@ -4,9 +4,11 @@ import { useCallback, useMemo, useSyncExternalStore } from 'react'
 
 export type Route =
   | 'overview' | 'upload' | 'search' | 'review' | 'workbench' | 'registry' | 'integrations'
+  | 'governance'
 
 const ROUTES: readonly string[] =
-  ['overview', 'upload', 'search', 'review', 'workbench', 'registry', 'integrations']
+  ['overview', 'upload', 'search', 'review', 'workbench', 'registry', 'integrations',
+    'governance']
 
 export function parseHash(hash: string): { route: Route; params: URLSearchParams } {
   const raw = hash.replace(/^#\/?/, '')

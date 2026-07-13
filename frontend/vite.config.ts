@@ -5,9 +5,10 @@ const API = 'http://localhost:8000'
 // Dev proxy: forward the API surface to the backend. The two-tier connector lives at
 // /integrations (instances + their syncs + service discovery) and /syncs (preview + import) —
 // the flat /connectors path was removed in the two-tier restructure. /contract(s) is the governed
-// feature-contract flow; /graph is the lineage graph.
+// feature-contract flow; /graph is the lineage graph; /governance is the join confirm/reject
+// surface (the list rides /sources/{source}/governance/joins, already covered by /sources).
 const API_PATHS = ['/uploads', '/search', '/sources', '/columns', '/join-path', '/features',
-  '/contract', '/contracts', '/graph', '/health', '/integrations', '/syncs']
+  '/contract', '/contracts', '/graph', '/health', '/integrations', '/syncs', '/governance']
 
 export default defineConfig({
   plugins: [react()],

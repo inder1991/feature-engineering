@@ -16,7 +16,6 @@ from featuregen.overlay._lifecycle import (
     _close_fact_tasks,
     _deny_audited,
     _latest_proposed,
-    referent_gap,
     resolve_ttl,
 )
 from featuregen.overlay._types import JoinSide
@@ -91,7 +90,17 @@ def _confirm_approved_join(conn, cmd, key, stream, state, authority):
                 else (proposed.payload["proposed_value"] if proposed else None)
             )
             ref = _ref_from_payload(stream[0].payload["catalog_object_ref"])
-            gap = referent_gap(current_catalog_adapter(), ref, "approved_join", check_value)
+            # Task 0 (sealed-runtime fix, whole-branch review FIX 1): the SAME dispatcher as the
+            # second-confirm gate below and the single-path STALE/REVERIFY gate — graph_node
+            # answers existence under the sentinel UploadContextAdapter (whose empty fingerprint
+            # fail-closed EVERY real join: a drift-STALEd join could never re-verify in a sealed
+            # deployment), referent_gap for a real adapter. Lazy import: overlay -> overlay/upload
+            # at module load would cycle (mirrors expiry.py's passc import).
+            from featuregen.overlay.upload.join_referents import check_referents_exist
+
+            gap = check_referents_exist(
+                conn, current_catalog_adapter(), ref, "approved_join", check_value
+            )
             if gap is not None:
                 return _deny_audited(conn, cmd, key, f"stale re-confirm blocked: {gap}")
     if not partial:
@@ -103,6 +112,7 @@ def _confirm_approved_join(conn, cmd, key, stream, state, authority):
                 "by_owner": actor.subject,
                 "role": f"data_owner_{_join_side(authority, actor.subject)}",
                 "draft_event_id": state.draft_event_id,
+                "note": cmd.args.get("note"),
             },
             actor=actor,
             caused_by=state.draft_event_id,
@@ -150,7 +160,14 @@ def _confirm_approved_join(conn, cmd, key, stream, state, authority):
     except RuntimeError:
         pass  # no OverlayConfig sealed -> hardening off (backward-compat)
     else:
-        gap = referent_gap(
+        # Task 0 (sealed-runtime fix): route existence to the mode's authoritative structural
+        # source — graph_node under the sentinel UploadContextAdapter (whose empty fingerprint
+        # fail-closed EVERY real join in a sealed deployment), referent_gap otherwise. Lazy import:
+        # overlay -> overlay/upload at module load would cycle (mirrors expiry.py's passc import).
+        from featuregen.overlay.upload.join_referents import check_referents_exist
+
+        gap = check_referents_exist(
+            conn,
             current_catalog_adapter(),
             _ref_from_payload(stream[0].payload["catalog_object_ref"]),
             "approved_join",
@@ -173,6 +190,7 @@ def _confirm_approved_join(conn, cmd, key, stream, state, authority):
             "confirmers": _join_confirmers(authority, first, actor.subject),
             "expires_at": expires_at.isoformat(),
             "confirms_event_id": confirms_event_id,
+            "note": cmd.args.get("note"),
         },
         actor=actor,
         caused_by=confirms_event_id,

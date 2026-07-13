@@ -304,6 +304,101 @@ export function dismissQuarantineRow(
   return post(`/sources/${encodeURIComponent(source)}/quarantine/${rowIndex}/dismiss`, {})
 }
 
+// ---- join governance (confirmation surface): list / confirm / reject discovered joins -------
+// Pass C proposes joins from metadata only; each needs TWO distinct admins before it projects to
+// an operational graph edge. The score is advisory — approval is gated on the human checklist.
+
+// One Pass C signal as the evidence record serializes it (asdict of SignalEvidence).
+export interface JoinSignal {
+  signal_name: string
+  score_delta: number
+  evidence_refs?: string[]
+  explanation?: string
+}
+
+// Shaped evidence from the read model. Every field can be defaulted (parse status "partial") or
+// the whole object empty (status "missing"/"invalid") — render defensively, never assume.
+export interface JoinEvidence {
+  score?: number | null
+  positive_signals?: JoinSignal[]
+  negative_signals?: JoinSignal[]
+  namespace_compatibility?: string | null
+  namespace_reason_codes?: string[]
+  grain_status?: string | null
+  grain_evidence?: string[]
+  explanation?: string
+  warnings?: string[]
+}
+
+export interface JoinApproval {
+  subject: string | null
+  display_name: string | null
+  role: string | null
+  note: string | null
+  confirmed_at: string | null
+}
+
+export interface JoinTask {
+  task_id: string
+  side: string | null
+  status: string
+}
+
+export interface JoinProposal {
+  fact_key: string
+  tasks: JoinTask[]
+  from: { table: string; column: string }
+  to: { table: string; column: string }
+  cardinality: string | null
+  proposed_direction: string
+  status: 'PROPOSED' | 'PARTIALLY_CONFIRMED'
+  approvals: JoinApproval[]
+  evidence: JoinEvidence
+  evidence_version: string | null
+  evidence_parse_status: 'parsed' | 'partial' | 'missing' | 'invalid'
+}
+
+// Structured rejection vocabulary — mirrors the backend's Literal exactly; the category is a
+// first-class analytics key fed back to re-proposal, the note is free text.
+export const REJECT_CATEGORIES = [
+  'wrong_direction', 'wrong_cardinality', 'different_entity', 'not_a_real_key',
+  'needs_data_check',
+] as const
+export type RejectCategory = (typeof REJECT_CATEGORIES)[number]
+
+export interface JoinConfirmResult {
+  // PARTIALLY_CONFIRMED after the first approval; VERIFIED after the second.
+  governance_status: string
+  // 'projected' | 'pending' | 'not_applicable' — pending defers to the next caught-up ingest.
+  operational_projection: string
+  approvals: JoinApproval[]
+}
+
+export function listJoinProposals(
+  source: string,
+): Promise<{ source: string; proposals: JoinProposal[]; next_cursor: string | null }> {
+  return request(`/sources/${encodeURIComponent(source)}/governance/joins`)
+}
+
+export function confirmJoin(
+  factKey: string,
+  body: { note?: string },
+): Promise<JoinConfirmResult> {
+  return post(`/governance/joins/${encodeURIComponent(factKey)}/confirm`, {
+    note: body.note ?? null,
+  })
+}
+
+export function rejectJoin(
+  factKey: string,
+  body: { category: RejectCategory; note?: string },
+): Promise<{ governance_status: string; category: string }> {
+  return post(`/governance/joins/${encodeURIComponent(factKey)}/reject`, {
+    category: body.category,
+    note: body.note ?? null,
+  })
+}
+
 export function columnJoins(objectRef: string, source: string): Promise<JoinEdge[]> {
   return request(
     `/columns/${encodeURIComponent(objectRef)}/joins?source=${encodeURIComponent(source)}`)
