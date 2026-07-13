@@ -19,7 +19,6 @@ from featuregen.overlay._lifecycle import (
     _close_fact_tasks,
     _deny_audited,
     _latest_proposed,
-    referent_gap,
     resolve_ttl,
     within_renewal_grace,
 )
@@ -143,7 +142,13 @@ def confirm_fact(conn: DbConn, cmd: Command) -> CommandResult:
         except RuntimeError:
             pass  # no OverlayConfig sealed -> hardening off (backward-compat)
         else:
-            gap = referent_gap(adapter, ref, fact_type, value)
+            # Task 0 (sealed-runtime fix): same dispatcher as the dual-join second confirm — the
+            # graph answers existence under the sentinel UploadContextAdapter, referent_gap for a
+            # real adapter (byte-for-byte the prior behavior). Lazy import: overlay ->
+            # overlay/upload at module load would cycle (mirrors expiry.py's passc import).
+            from featuregen.overlay.upload.join_referents import check_referents_exist
+
+            gap = check_referents_exist(conn, adapter, ref, fact_type, value)
             if gap is not None:
                 return _deny_audited(conn, cmd, key, f"stale re-confirm blocked: {gap}")
     confirmers: list[Confirmer]
