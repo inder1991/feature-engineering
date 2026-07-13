@@ -8,6 +8,7 @@ from featuregen.contracts.db import DbConn
 from featuregen.contracts.errors import ConcurrencyError
 from featuregen.idgen import mint_id
 from featuregen.overlay.authority import resolve_authority
+from featuregen.overlay.expiry import demote_projected_join_edges
 from featuregen.overlay.facts import OVERLAY_FACT_STALED
 from featuregen.overlay.identity import _ref_from_payload
 from featuregen.overlay.projection import dependents_of
@@ -206,6 +207,12 @@ def _stale_one(
         # change is re-detected next scan, instead of laundering it (the fact would stay VERIFIED
         # referencing a dropped/retyped object until TTL).
         raise
+    if state.fact_type == "approved_join":
+        # Async demotion hook (Phase 3A Task 8 addendum): drift-staling is the THIRD exit from
+        # VERIFIED (besides reject/expiry) — the projected edge (if any) stops traversing
+        # immediately, without waiting for a re-ingest. Fail-soft (savepointed inside the hook):
+        # a hook fault never breaks the stale append that just succeeded.
+        demote_projected_join_edges(conn, fact_key, "STALE")
     if open_reverify:
         # Governance path: route the stale to the data owner(s). The upload-catalog ingest
         # (no owners) passes open_reverify=False — the fact still STALEs via the append above,

@@ -23,9 +23,11 @@ from tests.featuregen.overlay.upload.passc.conftest import (
     _reject_join,
 )
 
+from featuregen.overlay.catalog_changes import detect_catalog_changes
 from featuregen.overlay.identity import fact_key
 from featuregen.overlay.state import fold_overlay_state
 from featuregen.overlay.store import load_fact
+from featuregen.overlay.upload.canonical import CanonicalRow
 from featuregen.overlay.upload.entity import find_cross_catalog_path
 from featuregen.overlay.upload.feature_assist import route_strategies
 from featuregen.overlay.upload.join_path import JoinStep, find_join_path
@@ -33,6 +35,7 @@ from featuregen.overlay.upload.passc.candidates import block_candidates, score
 from featuregen.overlay.upload.passc.identifiers import ColMeta
 from featuregen.overlay.upload.passc.lifecycle import build_join_ref
 from featuregen.overlay.upload.passc.projection import project_confirmed_joins
+from featuregen.overlay.upload.upload_catalog import UploadCatalog
 
 _CIF_TERM = "Customer Information File Identifier"
 
@@ -235,6 +238,37 @@ def test_reject_hook_stamps_rejected_status(passc_conn, human_admin_1, human_adm
 
     edge = _edge_rows(passc_conn)[(_FROM, _TO)]
     assert edge["authority"] == "display_only" and edge["status"] == "REJECTED"
+    assert find_join_path(passc_conn, "src", "transactions", "customers") is None
+
+
+def test_drift_stale_hook_demotes_edge_without_reingest(
+        passc_conn, human_admin_1, human_admin_2, service_actor):
+    # The THIRD exit path from VERIFIED (Task 8 addendum): schema drift. _stale_one
+    # (detect_catalog_changes -> _stale_dependents) takes the fact VERIFIED -> STALE entirely
+    # outside _apply_expiry/reject_fact, so without the hook the projected edge stays
+    # operational/VERIFIED and find_join_path keeps traversing until the next re-ingest.
+    # Trigger drift EXACTLY the way the production upload path does (ingest.py):
+    # detect_catalog_changes(conn, UploadCatalog(...), open_reverify=False).
+    ref = _verified_projected(passc_conn, admin1=human_admin_1, admin2=human_admin_2)
+    assert find_join_path(passc_conn, "src", "transactions", "customers") is not None
+
+    rows1 = [CanonicalRow("src", "transactions", "cif_id", "text"),
+             CanonicalRow("src", "customers", "cif_id", "text", is_grain=True)]
+    detect_catalog_changes(passc_conn, UploadCatalog("src", rows1), actor=service_actor,
+                           open_reverify=False)          # establish the snapshot (adds only)
+    rows2 = [CanonicalRow("src", "transactions", "txn_id", "text"),
+             CanonicalRow("src", "customers", "cif_id", "text", is_grain=True)]
+    changes = detect_catalog_changes(passc_conn, UploadCatalog("src", rows2), actor=service_actor,
+                                     open_reverify=False)  # cif_id dropped -> dependents STALE
+    assert any(c.kind == "drop" and c.object_ref == "public.transactions.cif_id" for c in changes)
+
+    key = fact_key(ref, "approved_join")
+    assert fold_overlay_state(load_fact(passc_conn, key)).status == "STALE"
+    # NO re-ingest, NO project_confirmed_joins run: the async hook alone must have flipped the edge.
+    edge = _edge_rows(passc_conn)[(_FROM, _TO)]
+    assert edge["authority"] == "display_only" and edge["status"] == "STALE"
+    assert edge["fact_key"] == key                       # link KEPT (audit/re-project)
+    assert edge["updated_at"] is not None
     assert find_join_path(passc_conn, "src", "transactions", "customers") is None
 
 
