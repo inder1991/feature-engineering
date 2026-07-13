@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 import logging
 import os
+import re
 from dataclasses import asdict, dataclass
 from datetime import datetime
 
@@ -199,6 +201,116 @@ def _propose_governed_joins(conn, rows: list[CanonicalRow], *, actor) -> None:
             counters.incr("overlay.governed_joins.propose_denied")
             logger.info("governed-join proposal for %s.%s not accepted: %s", r.table, r.column,
                         result.denied_reason)
+
+
+# ── Pass C ingest wiring (Phase 3A Task 10, spec §7/§12): deterministic join candidates from
+# upload metadata alone — NO LLM. Behind OVERLAY_PASS_C (default OFF); the caller savepoints. ──
+
+def _taxonomy_leaf(path: str) -> str:
+    """The LAST segment of a taxonomy path ('Customer Management/Customer Reference' ->
+    'Customer Reference'). Comparisons downstream are case-insensitive; extraction is verbatim."""
+    segments = [s.strip() for s in re.split(r"[/>]", path or "") if s.strip()]
+    return segments[-1] if segments else ""
+
+
+def _pass_c_columns(conn, catalog_source: str, rows: list[CanonicalRow], *,
+                    concepts: dict[str, str] | None, glossary: GlossaryUpload | None) -> list:
+    """Assemble one `ColMeta` per canonical row for Pass C blocking/scoring.
+
+    Sourcing (spec §7): `object_ref` is the PUBLIC graph-node ref (`public.{table}.{column}` —
+    build_graph flattens the graph to public scope, and `entity_of` reads graph_node by this key).
+    `column_entity` is THE namespace gate: the graph entity first (`entity_of` — build_graph wrote
+    the declared entity and re-applied human-CONFIRMED entity_suggestions moments ago), else the
+    declared row entity, else "" (empty falls back to the same-identifier-concept + corroborator
+    namespace path — safe). `table_entity` is LOW-STAKES (a different table_entity alone is never
+    incompatible): the table's declared grain-column entity, else the table name. Glossary sidecar
+    fields (term_name/synonyms/BIAN/FIBO leaves/domain) come from the `GlossaryRecord` matched by
+    normalized (table, column); a technical upload (glossary=None) leaves them "" — Pass C still
+    runs on name/concept/entity signals. The sidecar carries no term-type facet, so term_type=""."""
+    from featuregen.overlay.upload.entity import entity_of
+    from featuregen.overlay.upload.passc.identifiers import ColMeta
+
+    concepts = concepts or {}
+    records: dict[tuple[str, str], GlossaryRecord] = {}
+    if glossary is not None:
+        for rec in glossary.records:
+            if rec.is_table:
+                continue
+            try:
+                _src, _schema, table, column = parse_ref(rec.logical_ref)
+            except ValueError:
+                continue
+            if column is None:
+                continue
+            records.setdefault((table, column), rec)   # parse_ref components are normalized
+
+    grain_entity: dict[str, str] = {}
+    for r in rows:
+        if r.is_grain and r.entity:
+            grain_entity.setdefault(r.table, r.entity)
+
+    out = []
+    for r in rows:
+        object_ref = f"public.{r.table}.{r.column}"   # graph_node.object_ref rendering
+        rec = records.get((_lc(r.table), _lc(r.column)))
+        out.append(ColMeta(
+            object_ref=object_ref, table=r.table, column=r.column, data_type=r.type,
+            term_name=rec.term_name if rec else "",
+            term_type="",
+            concept=concepts.get(content_hash(r)) or "",
+            synonyms="|".join(rec.synonyms) if rec else "",
+            bian_leaf=_taxonomy_leaf(rec.bian_path) if rec else "",
+            fibo_leaf=_taxonomy_leaf(rec.fibo_path) if rec else "",
+            table_entity=grain_entity.get(r.table) or r.table,
+            column_entity=entity_of(conn, catalog_source, object_ref) or r.entity or "",
+            data_domain=rec.domain if rec else "",
+            is_grain=r.is_grain))
+    return out
+
+
+def _run_pass_c(conn, catalog_source: str, rows: list[CanonicalRow], *,
+                concepts: dict[str, str] | None, glossary: GlossaryUpload | None) -> None:
+    """Pass C: block + score this upload's columns, OWN THE CYCLE in the candidate ledger
+    (clear-then-write: DELETE this source's rows, INSERT this cycle's strong + weak rows — a
+    suppressed bucket is counted, never persisted), then propose the strong bucket through the
+    governed approved_join path (`propose_join_candidates` grain-gates internally and stamps
+    fact_key/proposed_event_id back onto the just-written ledger rows). Runs for glossary AND
+    technical uploads. The caller wraps this in a savepoint + except (fail-soft)."""
+    from featuregen.overlay.upload.enrich_llm import _ENRICH_ACTOR
+    from featuregen.overlay.upload.passc.candidates import block_candidates, score
+    from featuregen.overlay.upload.passc.lifecycle import candidate_fingerprint, unordered_pair
+    from featuregen.overlay.upload.passc.propose import propose_join_candidates
+
+    cols = _pass_c_columns(conn, catalog_source, rows, concepts=concepts, glossary=glossary)
+    snap = mint_id("psc")
+    evidences = [score(pair, source_snapshot_id=snap) for pair in block_candidates(cols)]
+
+    # Clear-then-write: a stale prior candidate must not linger past the cycle that stopped
+    # producing it. The PROJECTOR never reads this ledger — facts survive the clear.
+    conn.execute("DELETE FROM pass_c_candidate_evidence WHERE catalog_source = %s",
+                 (catalog_source,))
+    strong = []
+    for ev in evidences:
+        if ev.bucket == "suppressed":
+            counters.incr("overlay.passc.candidates.suppressed")
+            continue
+        lo, hi = unordered_pair(ev)
+        conn.execute(
+            "INSERT INTO pass_c_candidate_evidence (catalog_source, candidate_id,"
+            " candidate_fingerprint, from_ref, to_ref, fact_key, proposed_event_id, bucket,"
+            " namespace_compatibility, lifecycle, evidence_json, source_snapshot_id,"
+            " config_version, candidate_algorithm_version)"
+            " VALUES (%s, %s, %s, %s, %s, NULL, NULL, %s, %s, 'weak', %s, %s, %s, %s)",
+            (catalog_source, ev.candidate_id, candidate_fingerprint(ev), lo, hi, ev.bucket,
+             ev.namespace_compatibility.value, json.dumps(asdict(ev)), ev.source_snapshot_id,
+             ev.config_version, ev.candidate_algorithm_version))
+        counters.incr(f"overlay.passc.candidates.{ev.bucket}")
+        if ev.bucket == "strong":
+            strong.append(ev)
+
+    if strong:
+        # Service proposer (four-eyes holds against the two human confirmers). Fail-soft inside.
+        propose_join_candidates(conn, catalog_source, strong, actor=_ENRICH_ACTOR)
 
 
 # ── Glossary ingest wiring (spec §6.3 / §U). GUARDED: only runs for a glossary upload (a `glossary`
@@ -661,6 +773,21 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
         # it is never stranded display-only. Advisory/fail-soft + adapter-gated. (The `or` is
         # belt-and-braces: governed_joins_enabled already fires under OVERLAY_PASS_C.)
         _propose_governed_joins(conn, vr.good, actor=actor)
+
+    if pass_c_enabled():
+        # Pass C (Phase 3A Task 10): deterministic join-candidate discovery — blocking/scoring from
+        # upload metadata alone (NO LLM/client needed), the durable candidate ledger, and governed
+        # approved_join proposals for the strong bucket. Runs for technical AND glossary uploads.
+        # OWN savepoint + except (the Pass B pattern above): a DB abort in here must never poison
+        # the request tx and roll back Pass A facts + the graph — Pass C degrades to a warning and
+        # the upload always ingests.
+        try:
+            with conn.transaction():
+                _run_pass_c(conn, catalog_source, vr.good, concepts=concepts, glossary=glossary)
+        except Exception:  # noqa: BLE001 — advisory: Pass C never fails an upload
+            counters.incr("overlay.passc.error")
+            logger.warning("advisory Pass C join-candidate pass failed for %r — Pass A facts + "
+                           "graph intact", catalog_source, exc_info=True)
 
     if table_synth_enabled() and client is not None:
         # Pass B (spec §15): governed table synthesis — grain/availability as PROPOSED-only,
