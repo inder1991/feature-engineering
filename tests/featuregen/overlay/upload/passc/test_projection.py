@@ -20,6 +20,7 @@ from tests.featuregen.overlay.upload.passc.conftest import (
     _confirm_join,
     _expire_join,
     _propose_join,
+    _reject_join,
 )
 
 from featuregen.overlay.identity import fact_key
@@ -204,3 +205,45 @@ def test_projector_is_idempotent(passc_conn, human_admin_1, human_admin_2):
     again = _edge_rows(passc_conn)
     assert set(again) == set(first) == {(_FROM, _TO)}
     assert again[(_FROM, _TO)]["fact_key"] == first[(_FROM, _TO)]["fact_key"]
+
+
+# ── The async demotion hook (no re-ingest, no projector run) ─────────────────────────────────────
+
+
+def test_expiry_hook_demotes_edge_without_reingest(passc_conn, human_admin_1, human_admin_2):
+    # The ingest-latency closer: the fact expires (VERIFIED -> REVERIFY via the PRODUCTION
+    # fire_due_overlay_expiries poller) and the edge stops traversing IMMEDIATELY — no re-upload,
+    # no project_confirmed_joins run.
+    ref = _verified_projected(passc_conn, admin1=human_admin_1, admin2=human_admin_2)
+    assert find_join_path(passc_conn, "src", "transactions", "customers") is not None
+
+    _expire_join(passc_conn, ref)
+
+    edge = _edge_rows(passc_conn)[(_FROM, _TO)]
+    assert edge["authority"] == "display_only" and edge["status"] == "REVERIFY"
+    assert edge["fact_key"] == fact_key(ref, "approved_join")   # link KEPT (audit/re-project)
+    assert edge["updated_at"] is not None
+    assert find_join_path(passc_conn, "src", "transactions", "customers") is None
+
+
+def test_reject_hook_stamps_rejected_status(passc_conn, human_admin_1, human_admin_2):
+    # A REVERIFY fact is awaiting confirmation again, so a human may REJECT it outright — the
+    # hook re-stamps the already-demoted edge with the terminal status.
+    ref = _verified_projected(passc_conn, admin1=human_admin_1, admin2=human_admin_2)
+    _expire_join(passc_conn, ref)
+    _reject_join(passc_conn, ref, admin=human_admin_1)
+
+    edge = _edge_rows(passc_conn)[(_FROM, _TO)]
+    assert edge["authority"] == "display_only" and edge["status"] == "REJECTED"
+    assert find_join_path(passc_conn, "src", "transactions", "customers") is None
+
+
+def test_pre_verified_reject_is_a_noop_on_edges(passc_conn, human_admin_1):
+    # A DRAFT that never verified has no projected edge; rejecting it must not create or touch
+    # any graph_edge row (the hook's UPDATE simply matches nothing).
+    _edge(passc_conn, _FROM, _TO)                       # unrelated declared edge stays untouched
+    before = _edge_rows(passc_conn)
+    ref = build_join_ref(_strong_evidence(), "src")
+    _propose_join(passc_conn, ref)
+    _reject_join(passc_conn, ref, admin=human_admin_1)
+    assert _edge_rows(passc_conn) == before

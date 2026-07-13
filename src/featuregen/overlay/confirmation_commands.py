@@ -31,7 +31,7 @@ from featuregen.overlay.authority import (
 )
 from featuregen.overlay.catalog import current_catalog_adapter
 from featuregen.overlay.config import current_overlay_config
-from featuregen.overlay.expiry import schedule_expiry
+from featuregen.overlay.expiry import demote_projected_join_edges, schedule_expiry
 from featuregen.overlay.facts import FactValidationError, validate_fact_value
 from featuregen.overlay.identity import (
     display_object_ref,
@@ -242,6 +242,10 @@ def reject_fact(conn: DbConn, cmd: Command) -> CommandResult:
         # Pin OCC to the folded head: stops a confirm-vs-reject lost-update on the same head.
         expected_version=stream[-1].stream_version,
     )
+    if fact_type == "approved_join":
+        # Async demotion hook (Phase 3A Task 8): a pre-VERIFIED reject has no projected edge (the
+        # UPDATE matches nothing); a REVERIFY/STALE reject re-stamps the demoted edge REJECTED.
+        demote_projected_join_edges(conn, key, "REJECTED")
     _close_fact_tasks(conn, key, reason="fact rejected")
     return CommandResult(accepted=True, aggregate_id=key, produced_event_ids=(rejected.event_id,))
 
