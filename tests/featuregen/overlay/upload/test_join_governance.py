@@ -18,9 +18,11 @@ Seeding mirrors `passc/propose.py::_propose_one`: pre-mint the evidence row
 # which ruff sees as redefinitions of the imports.
 from __future__ import annotations
 
+import logging
 from dataclasses import asdict
 from datetime import UTC, datetime
 
+from psycopg.types.json import Json
 from tests.featuregen.overlay.upload.passc.conftest import (  # noqa: F401 — pytest fixtures
     SERVICE_ACTOR,
     _join_value,
@@ -34,6 +36,7 @@ from featuregen.contracts import GateTaskSpec
 from featuregen.contracts.envelopes import Command
 from featuregen.contracts.identity import identity_to_jsonb
 from featuregen.gates.tasks import open_task
+from featuregen.overlay import facts
 from featuregen.overlay._lifecycle import _cas_target
 from featuregen.overlay.commands import confirm_fact, propose_fact
 from featuregen.overlay.evidence import AssertionStrength, EvidenceProducer, write_evidence
@@ -46,6 +49,7 @@ from featuregen.overlay.identity import (
 )
 from featuregen.overlay.state import fold_overlay_state
 from featuregen.overlay.store import append_overlay_event, load_fact
+from featuregen.overlay.upload import join_governance
 from featuregen.overlay.upload.join_governance import (
     list_open_approved_join_proposals,
     read_join_approvals,
@@ -54,6 +58,7 @@ from featuregen.overlay.upload.passc.candidates import block_candidates, score
 from featuregen.overlay.upload.passc.identifiers import ColMeta
 from featuregen.overlay.upload.passc.lifecycle import build_join_ref
 from featuregen.overlay.upload.passc.types import ALGORITHM_VERSION
+from featuregen.runtime.observability import counters
 
 _CIF_TERM = "Customer Information File Identifier"
 
@@ -263,6 +268,72 @@ def test_corrupt_ref_skipped_without_breaking_queue(passc_conn):
     ref, good_key = _seed_join_with_evidence(passc_conn)
     out = list_open_approved_join_proposals(passc_conn, "src")
     assert [p["fact_key"] for p in out] == [good_key]
+
+
+def _open_synthetic_task(conn, key, eligible, fingerprint):
+    """Append a minimal valid DRAFT for `key` and open ONE gate task on it with the given
+    `eligible_assignees` — the seed for the isolation tests below."""
+    draft = append_overlay_event(
+        conn, fact_key=key, type="OVERLAY_FACT_PROPOSED",
+        payload={
+            "catalog_object_ref": asdict(CatalogObjectRef("src", "table", "public", "orphans")),
+            "object_ref": "public.orphans", "fact_type": "approved_join", "use_case": None,
+            "proposed_value": _join_value(_bare_ref("x1", "x2", "id")),
+            "proposal_fingerprint": fingerprint, "evidence_ref": None,
+            "proposed_by": SERVICE_ACTOR.subject},
+        actor=SERVICE_ACTOR, expected_version=0)
+    return open_task(conn, GateTaskSpec(
+        gate="OVERLAY_DATA_OWNER", required_inputs=("proposed_value",),
+        eligible_assignees=eligible, allowed_responses=("confirm", "reject"),
+        fact_key=key, draft_event_id=draft.event_id, target_event_id=draft.event_id),
+        SERVICE_ACTOR)
+
+
+def test_non_dict_eligible_assignees_does_not_abort_queue(passc_conn):
+    """A human_tasks row whose eligible_assignees JSONB is a LIST (not an object) is read when
+    the {task_id, side, status} row is built — it must corrupt only its OWN task, never
+    AttributeError the whole list (Task 3 review FIX 2)."""
+    task_id = _open_synthetic_task(passc_conn, "corrupt-eligible-fact-key",
+                                   {"role": "platform-admin"}, "fp-bad-eligible")
+    passc_conn.execute("UPDATE human_tasks SET eligible_assignees = %s WHERE task_id = %s",
+                       (Json(["not", "a", "mapping"]), task_id))
+
+    _, good_key = _seed_join_with_evidence(passc_conn)
+    out = list_open_approved_join_proposals(passc_conn, "src")
+    assert [p["fact_key"] for p in out] == [good_key]
+
+
+def test_authz_denied_task_is_a_benign_skip_not_corruption(passc_conn, caplog):
+    """A subject-scoped (data-owner) task the subject-less governance reader is not bound to is
+    a NORMAL "not my task" in a mixed-catalog DB — it must skip at DEBUG without the warning or
+    the `task_unreadable` corruption counter (those stay reserved for genuinely unreadable
+    tasks) and must not disturb the listing (Task 3 review FIX 1)."""
+    _open_synthetic_task(passc_conn, "subject-scoped-fact-key",
+                         {"role": "data_owner", "subject": "user:someone-else"}, "fp-subject")
+
+    _, good_key = _seed_join_with_evidence(passc_conn)
+    counter = "overlay.join_governance.task_unreadable"
+    before = counters.snapshot()["counters"].get(counter, 0)
+    with caplog.at_level(logging.DEBUG, logger="featuregen.overlay.upload.join_governance"):
+        out = list_open_approved_join_proposals(passc_conn, "src")
+    assert [p["fact_key"] for p in out] == [good_key]
+    assert counters.snapshot()["counters"].get(counter, 0) == before
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert any(r.levelno == logging.DEBUG and "governance reader" in r.getMessage()
+               for r in caplog.records)
+
+
+def test_read_join_approvals_is_best_effort_on_malformed_event(monkeypatch):
+    """Standalone (the Task-5 confirm response body), a malformed event on the stream must yield
+    a best-effort [] rather than raising — inside the list it is already per-task guarded
+    (Task 3 review FIX 3). The store's schema validation blocks APPENDING such an event, so the
+    corrupt stream is stubbed at the exact load_fact boundary the guard protects."""
+    class _MalformedEvent:
+        type = facts.OVERLAY_FACT_PARTIALLY_CONFIRMED
+        payload = ["not", "a", "mapping"]   # .get() on a list -> AttributeError
+
+    monkeypatch.setattr(join_governance, "load_fact", lambda conn, key: [_MalformedEvent()])
+    assert read_join_approvals(object(), "any-key") == []
 
 
 def test_limit_is_clamped_and_bounds_proposals(passc_conn):

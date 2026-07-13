@@ -156,8 +156,16 @@ def _approvals_from_stream(stream) -> list[dict]:
 def read_join_approvals(conn: DbConn, fact_key: str) -> list[dict]:
     """Approvals recorded on `fact_key`'s stream (current cycle): a list of
     ``{subject, display_name, role, note, confirmed_at}``. Used by the open-proposal list and by
-    the confirm routes for their response bodies (Task 5)."""
-    return _approvals_from_stream(load_fact(conn, fact_key))
+    the confirm routes for their response bodies (Task 5). Called STANDALONE by the API layer
+    (outside the list's per-task guard), so it shares the module's fail-soft posture: a
+    malformed/unexpected event yields a best-effort ``[]`` (warned + counted), never a raise."""
+    try:
+        return _approvals_from_stream(load_fact(conn, fact_key))
+    except Exception:  # noqa: BLE001 — approvals are display data; never break a confirm response
+        counters.incr("overlay.join_governance.approvals_unreadable")
+        logger.warning("join governance: approvals for fact %s unreadable — returning []",
+                       fact_key, exc_info=True)
+        return []
 
 
 def _build_view(conn, key: str, proposal: Mapping, want_source: str) -> dict | None:
@@ -213,6 +221,7 @@ def list_open_approved_join_proposals(conn: DbConn, source: str, *, limit: int =
     ``evidence``/``evidence_version``/``evidence_parse_status`` (see :func:`_shape_evidence`).
     ``limit`` bounds the number of PROPOSALS (clamped to 1..500). Bad data on one task is
     skipped — it never aborts the list."""
+    from featuregen.overlay._lifecycle import OverlayCommandError
     from featuregen.overlay.task_read import get_task_proposal  # mirrors table_fact_projection
 
     limit = max(1, min(limit, _LIMIT_MAX))
@@ -225,13 +234,28 @@ def list_open_approved_join_proposals(conn: DbConn, source: str, *, limit: int =
     for task_id, key, eligible, task_status in rows:
         if key is None or key in skipped:
             continue
-        task_row = {"task_id": task_id, "side": (eligible or {}).get("side"),
+        # A non-dict eligible_assignees JSONB (a list/string) must corrupt ONE task, not the
+        # whole loop — this read sits OUTSIDE the per-task guard, so coerce before access.
+        eligible = eligible if isinstance(eligible, Mapping) else {}
+        task_row = {"task_id": task_id, "side": eligible.get("side"),
                     "status": task_status}
         if key in views:
             views[key]["tasks"].append(task_row)  # the dual join's OTHER side task — dedup
             continue
         try:
             proposal = get_task_proposal(conn, task_id, _READER)
+        except OverlayCommandError as exc:
+            # get_task_proposal's authz denial (task_read.py: a subject-scoped data-owner task
+            # the subject-less governance reader is not bound to) is a NORMAL "not my task" in
+            # a mixed-catalog DB — a benign skip, NOT corruption: debug, no counter.
+            if "not authorized" in str(exc):
+                logger.debug("join governance: task %s not readable by the governance reader "
+                             "— skipped", task_id)
+                continue
+            counters.incr("overlay.join_governance.task_unreadable")
+            logger.warning("join governance: task %s unreadable — skipped", task_id,
+                           exc_info=True)
+            continue
         except Exception:  # noqa: BLE001 — a task the reader can't read is skipped, never fatal
             counters.incr("overlay.join_governance.task_unreadable")
             logger.warning("join governance: task %s unreadable — skipped", task_id,
