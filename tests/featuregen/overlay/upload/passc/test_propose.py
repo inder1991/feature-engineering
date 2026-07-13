@@ -214,3 +214,38 @@ def test_error_on_one_candidate_does_not_stop_the_next(passc_conn, service_actor
     assert _counter("overlay.passc.propose.error") == before + 1
     key = fact_key(build_join_ref(good, "src"), "approved_join")
     assert fold_overlay_state(load_fact(passc_conn, key)).status == "DRAFT"
+
+
+class _SavepointSpy:
+    """Delegating conn wrapper that records every SAVEPOINT-family statement."""
+
+    def __init__(self, conn):
+        self._conn = conn
+        self.statements: list[str] = []
+
+    def execute(self, sql, *args, **kwargs):
+        if isinstance(sql, str) and "SAVEPOINT" in sql:
+            self.statements.append(sql.strip())
+        return self._conn.execute(sql, *args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+
+def test_failed_candidate_releases_its_savepoint(passc_conn, service_actor, monkeypatch):
+    """Depth hygiene (whole-branch review, Minor): the fail-soft path must ROLLBACK TO **and
+    RELEASE** the per-candidate savepoint. `ROLLBACK TO SAVEPOINT` keeps the savepoint alive, and
+    re-issuing `SAVEPOINT passc_propose` only MASKS the prior one — so without the RELEASE a
+    mass-fail ingest stacks one subtransaction per failed candidate toward PostgreSQL's
+    suboverflow cliff. Every failed candidate must pair its SAVEPOINT with exactly one RELEASE."""
+    def boom(conn, cmd):
+        raise RuntimeError("propose exploded")
+    monkeypatch.setattr("featuregen.overlay.upload.passc.propose.propose_fact", boom)
+
+    spy = _SavepointSpy(passc_conn)
+    evidences = [_strong_evidence(), _strong_evidence(from_table="loans")]
+    propose_join_candidates(spy, "src", evidences, actor=service_actor)   # both candidates fail
+
+    assert spy.statements.count("SAVEPOINT passc_propose") == 2
+    assert spy.statements.count("ROLLBACK TO SAVEPOINT passc_propose") == 2
+    assert spy.statements.count("RELEASE SAVEPOINT passc_propose") == 2   # depth stays flat

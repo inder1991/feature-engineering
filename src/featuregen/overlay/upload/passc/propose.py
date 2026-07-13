@@ -114,6 +114,9 @@ def propose_join_candidates(
                            ev.candidate_id, ev.from_ref, ev.to_ref, exc_info=True)
             try:
                 conn.execute("ROLLBACK TO SAVEPOINT passc_propose")
+                # ROLLBACK TO keeps the savepoint alive: RELEASE it so a mass-fail ingest does
+                # not stack one masked savepoint per failed candidate (PostgreSQL suboverflow).
+                conn.execute("RELEASE SAVEPOINT passc_propose")
             except Exception:  # noqa: BLE001 — the tx/connection itself is unusable
                 logger.warning("Pass C propose: savepoint rollback failed — abandoning the "
                                "candidate loop (connection unusable)", exc_info=True)
