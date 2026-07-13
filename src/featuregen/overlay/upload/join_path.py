@@ -51,6 +51,10 @@ def find_join_path(conn, catalog_source: str, from_table: str,
         # authority='operational' (Task 7): a governed-seam display-only edge is excluded from
         # feature-construction join paths — feature-use reads the confirmed approved_join fact.
         "WHERE e.catalog_source = %s AND e.kind = 'joins' AND e.authority = 'operational' "
+        # Governed edge filter (Pass C Task 8, flag-off-safe): a fact-LINKED edge traverses only
+        # while its approved_join fact is VERIFIED — the independent second gate for the async
+        # ingest-latency window. A declared edge (fact_key NULL) traverses byte-for-byte.
+        "  AND (e.approved_join_fact_key IS NULL OR e.approved_join_status = 'VERIFIED') "
         "  AND (fn.sensitivity IS NULL OR fn.sensitivity = ANY(%s)) "
         "  AND (tn.sensitivity IS NULL OR tn.sensitivity = ANY(%s))",
         (catalog_source, allowed, allowed)).fetchall()
