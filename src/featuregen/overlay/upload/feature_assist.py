@@ -609,7 +609,10 @@ def route_strategies(conn, cols: list[dict]) -> list[tuple[str, str]]:
     tables = [f"public.{c['object_ref'].split('.')[-2]}" for c in cols if c["object_ref"].count(".") >= 2]
     # authority='operational' (Task 7): a governed-seam display-only edge must NOT enable a feature
     # strategy — the confirmed approved_join fact is the source of truth once the seam is on.
+    # Governed edge filter (Pass C Task 8): a fact-LINKED edge enables a strategy only while its
+    # approved_join fact is VERIFIED; a declared edge (fact_key NULL) is untouched.
     if conn.execute("SELECT 1 FROM graph_edge WHERE kind = 'joins' AND authority = 'operational' "
+                    "AND (approved_join_fact_key IS NULL OR approved_join_status = 'VERIFIED') "
                     "AND catalog_source = ANY(%s) "
                     "AND (from_ref = ANY(%s) OR to_ref = ANY(%s)) LIMIT 1",
                     (list(set(sources)), refs, tables)).fetchone() is not None:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from datetime import datetime
 
 from psycopg.rows import dict_row
@@ -16,6 +17,24 @@ from featuregen.overlay.reverify_tasks import open_reverify_task
 from featuregen.overlay.state import fold_overlay_state
 from featuregen.overlay.store import append_overlay_event, load_fact
 from featuregen.runtime.timers import schedule_timer
+
+logger = logging.getLogger(__name__)
+
+
+def demote_projected_join_edges(conn: DbConn, fact_key: str, status: str) -> None:
+    """FAIL-SOFT async demotion of any graph_edge projected from this `approved_join` (Phase 3A
+    Task 8): the fact just left VERIFIED, so a linked operational edge must stop
+    feature-construction traversal NOW — not at the next upload's projector run (the
+    ingest-latency window). Shared by `reject_fact` and `_apply_expiry`. Savepointed
+    (`conn.transaction()`) so a DB fault can neither poison the surrounding command/poller
+    transaction nor undo the just-appended lifecycle event; the governed edge filter
+    (`approved_join_status='VERIFIED'`) remains the independent second gate if this hook is lost."""
+    try:
+        with conn.transaction():
+            from featuregen.overlay.upload.passc.projection import demote_join_edges
+            demote_join_edges(conn, fact_key=fact_key, status=status)
+    except Exception:  # noqa: BLE001 — advisory: edge demotion never blocks the command/poller
+        logger.warning("approved_join edge demotion failed for %s", fact_key, exc_info=True)
 
 
 def schedule_expiry(
@@ -77,6 +96,10 @@ def _apply_expiry(conn: DbConn, adapter, *, fact_key: str, confirmed_event_id: s
     except ConcurrencyError:
         # a concurrent confirm advanced the stream between fold and append → stale timer
         return False
+    if state.fact_type == "approved_join":
+        # Async demotion hook (Phase 3A Task 8): EXPIRED folds to REVERIFY — the projected edge
+        # (if any) stops traversing immediately, without waiting for a re-ingest.
+        demote_projected_join_edges(conn, fact_key, "REVERIFY")
     ref = _ref_from_payload(stream[0].payload["catalog_object_ref"])
     authority = resolve_authority(conn, adapter, ref, state.fact_type)
     open_reverify_task(

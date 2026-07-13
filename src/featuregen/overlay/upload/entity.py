@@ -223,8 +223,11 @@ def _cross_adjacency(conn, roles: Iterable[str]) -> dict:
     for src, fr, to, card in conn.execute(
             # authority='operational' (Task 7): a governed-seam display-only edge is excluded from
             # cross-catalog feature-construction adjacency (the confirmed approved_join fact governs).
+            # Governed edge filter (Pass C Task 8): a fact-LINKED edge is adjacent only while its
+            # approved_join fact is VERIFIED; a declared edge (fact_key NULL) is untouched.
             "SELECT catalog_source, from_ref, to_ref, cardinality FROM graph_edge "
-            "WHERE kind = 'joins' AND authority = 'operational'").fetchall():
+            "WHERE kind = 'joins' AND authority = 'operational' "
+            "AND (approved_join_fact_key IS NULL OR approved_join_status = 'VERIFIED')").fetchall():
         a, b = (src, _table_of(fr)), (src, _table_of(to))
         if a == b:
             continue
