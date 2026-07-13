@@ -7,10 +7,12 @@ reduces to the same ``(rows, SourceCapabilityProfile)`` as a technical CSV — t
 (``FTR_GLOSSARY_PROFILE``), not a special pipeline, is what differs. This reader turns a glossary CSV
 into two things fed to the SAME validate → graph spine as a technical upload:
 
-- ``rows: list[CanonicalRow]`` — one per COLUMN-level term (a 3-part ``schema.table.column`` FQN),
-  emitted with ``type=UNKNOWN_TYPE`` because the glossary does not attest a physical type (profile-aware
-  ``validate_rows`` accepts that under the glossary profile; a 2-part table term is NOT emitted as a
-  column, and an unresolvable FQN yields an identity-less row so validation quarantines it).
+- ``rows: list[CanonicalRow]`` — one per COLUMN-level term (a 3-part ``schema.table.column`` FQN). A
+  glossary declares no physical type by default, so the row's ``type`` is ``UNKNOWN_TYPE`` UNLESS the
+  file supplies an optional ``data_type`` column — a DECLARED (not attested) value, since a structural
+  source (OpenMetadata / DDL) stays the stronger authority. Profile-aware ``validate_rows`` accepts
+  either under the glossary profile; a 2-part table term is NOT emitted as a column, and an unresolvable
+  FQN yields an identity-less row so validation quarantines it.
 - ``records: list[GlossaryRecord]`` — a semantic sidecar per resolvable term, keyed by the
   schema-preserving ``normalize_ref`` (spec §5.1), carrying the meaning fields the evidence machinery
   attaches in a later task. Schema is preserved HERE (the flat ``CanonicalRow``/legacy graph is
@@ -49,6 +51,11 @@ _ALIASES: dict[str, set[str]] = {
     "synonyms": {"synonyms", "synonym", "aliases", "alias", "alsoknownas"},
     "bian_path": {"bianpath", "bian"},
     "fibo_path": {"fibopath", "fibo"},
+    # Optional physical type: a glossary MAY declare the source column's SQL type. It is a DECLARED
+    # (not attested) structural value — used when present, else UNKNOWN_TYPE — so a structural source
+    # (OpenMetadata / DDL) stays the stronger authority and reconciles on drift. Header names mirror
+    # the technical reader's `type` aliases so the same column name works in either file kind.
+    "data_type": {"datatype", "type", "sqltype", "physicaltype", "columntype"},
 }
 
 # Synonyms/aliases arrive as a single cell holding several terms. The CSV parser already consumed the
@@ -130,6 +137,8 @@ def read_glossary(text: str, *, source: str) -> GlossaryUpload:
     for raw in reader:
         fqn = _cell(fmap, raw, "fqn")
         definition = _cell(fmap, raw, "definition")
+        # Optional declared physical type; blank/absent -> UNKNOWN_TYPE (the historical default).
+        declared_type = _cell(fmap, raw, "data_type").lower() or UNKNOWN_TYPE
         schema, table, column = _split_fqn(fqn)
 
         if table is None:
@@ -148,6 +157,6 @@ def read_glossary(text: str, *, source: str) -> GlossaryUpload:
 
         if column is not None:   # a 2-part table term is a record only, never a CanonicalRow
             rows.append(CanonicalRow(source=source, table=table, column=column,
-                                     type=UNKNOWN_TYPE, definition=definition))
+                                     type=declared_type, definition=definition))
 
     return GlossaryUpload(rows=rows, records=records)

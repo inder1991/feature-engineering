@@ -108,3 +108,56 @@ def test_read_glossary_rows_all_pass_under_glossary_profile():
     vr = validate_rows(up.rows, "ftr", profile=FTR_GLOSSARY_PROFILE)
     assert len(vr.good) == 2                                  # both column terms accepted
     assert vr.quarantined == []
+
+
+# --- optional declared physical type (`data_type` column) ----------------------------------------
+# A glossary MAY carry the source column's SQL type; used when present (lowercased), else UNKNOWN_TYPE.
+# It is a DECLARED value — a structural source (OpenMetadata/DDL) stays the stronger authority.
+_GLOSSARY_CSV_WITH_TYPE = (
+    "physical_name,business_term,description_business_definition,data_domain,"
+    "synonyms,bian_path,fibo_path,data_type\n"
+    "DPL_EIB_COMPLIANCE.COMP_REPOS_DLY.FORACID,Customer Account Number,"
+    "The account-level identifier.,Compliance,"
+    "Account Number,Payments/TransactionRecord,fibo-fbc:Account,VARCHAR\n"
+    "DPL_EIB_COMPLIANCE.COMP_REPOS_DLY.TRAN_DATE,Transaction Date,"
+    "The date of the transaction.,Compliance,"
+    ",Payments/TransactionRecord,fibo-fbc:Date,NUMBER\n"
+    "DPL_EIB_COMPLIANCE.COMP_REPOS_DLY.NOTE_TXT,Note Text,"
+    "A free-text note.,Compliance,"
+    ",Payments/TransactionRecord,fibo-fbc:Text,\n"           # data_type cell left BLANK
+)
+
+_GLOSSARY_HEADERS_WITH_TYPE = _GLOSSARY_HEADERS + ["data_type"]
+
+
+def test_declared_data_type_is_read_and_lowercased():
+    up = read_glossary(_GLOSSARY_CSV_WITH_TYPE, source="ftr")
+    foracid = next(r for r in up.rows if r.column == "FORACID")
+    tran = next(r for r in up.rows if r.column == "TRAN_DATE")
+    assert foracid.type == "varchar"                         # VARCHAR declared -> lowercased
+    assert tran.type == "number"
+
+
+def test_blank_data_type_cell_falls_back_to_unknown():
+    up = read_glossary(_GLOSSARY_CSV_WITH_TYPE, source="ftr")
+    note = next(r for r in up.rows if r.column == "NOTE_TXT")
+    assert note.type == UNKNOWN_TYPE                          # column present, cell blank -> default
+
+
+def test_absent_data_type_column_stays_unknown():
+    # The original fixture has NO data_type column: every row keeps the unknown sentinel (back-compat).
+    up = read_glossary(_GLOSSARY_CSV, source="ftr")
+    assert all(r.type == UNKNOWN_TYPE for r in up.rows)
+
+
+def test_data_type_column_does_not_flip_the_glossary_profile():
+    # Detection keys on business-term/BIAN/FIBO presence + table/column ABSENCE, not on a type column,
+    # so adding data_type must NOT reclassify a glossary as a technical CSV.
+    assert is_glossary_csv(_GLOSSARY_HEADERS_WITH_TYPE) is True
+
+
+def test_declared_type_rows_still_pass_under_glossary_profile():
+    up = read_glossary(_GLOSSARY_CSV_WITH_TYPE, source="ftr")
+    vr = validate_rows(up.rows, "ftr", profile=FTR_GLOSSARY_PROFILE)
+    assert len(vr.good) == 3                                  # a declared type is accepted, not rejected
+    assert vr.quarantined == []
