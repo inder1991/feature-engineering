@@ -18,8 +18,14 @@ CATALOG_WRITE = "catalog:write"        # publish/curate the data catalogue: uplo
 FEATURE_READ = "feature:read"          # browse the feature + hypothesis catalogue (registry, Feature 360)
 FEATURE_GENERATE = "feature:generate"  # run the feature-generation workflow + govern contracts
 IAM_MANAGE = "iam:manage"              # administer users / groups / roles
+# Confirm/reject discovered joins on the governance queue. NOTE: the route gate (require_confirmer)
+# does NOT rely on this yet — it checks the raw `platform-admin` role claim directly, matching the
+# overlay's dual-owner confirm. This constant exists for future reconciliation of that gate into the
+# permission model.
+GOVERNANCE_CONFIRM = "governance:confirm"
 
-ALL_PERMISSIONS = frozenset({CATALOG_READ, CATALOG_WRITE, FEATURE_READ, FEATURE_GENERATE, IAM_MANAGE})
+ALL_PERMISSIONS = frozenset({CATALOG_READ, CATALOG_WRITE, FEATURE_READ, FEATURE_GENERATE, IAM_MANAGE,
+                             GOVERNANCE_CONFIRM})
 
 # ---- Roles (bundles) ----------------------------------------------------------------------------
 ROLE_PERMISSIONS: dict[str, frozenset[str]] = {

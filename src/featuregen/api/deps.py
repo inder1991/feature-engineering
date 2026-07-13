@@ -78,6 +78,19 @@ require_feature_read = require_permission(FEATURE_READ)
 require_feature_generate = require_permission(FEATURE_GENERATE)
 
 
+def require_confirmer(
+    request: Request,
+    identity: Annotated[IdentityEnvelope, Depends(get_identity)],
+) -> IdentityEnvelope:
+    """Governance confirmer gate: the caller must carry the raw `platform-admin` role CLAIM — the exact
+    claim the overlay's dual-owner confirm authorizes on (join_confirmation.py:68). Deliberately NOT the
+    `platform_admin` permission bundle, to avoid a route-passes-but-overlay-denies mismatch."""
+    if "platform-admin" not in identity.role_claims:
+        audit_access_denied(identity, f"platform-admin claim on {request.method} {request.url.path}")
+        raise HTTPException(status_code=403, detail="requires the platform-admin role")
+    return identity
+
+
 def _auth_stub_enabled() -> bool:
     """The header stub (X-User/X-Roles -> authenticated=False) is OFF by default — secure in prod, where
     only a real Bearer session authenticates. Dev/tests set FEATUREGEN_AUTH_STUB=1 to keep it."""
