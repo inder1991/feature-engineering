@@ -207,6 +207,10 @@ OVERLAY_EVENT_SCHEMAS: dict[str, dict] = {
         {
             "rejected_by": _STR,
             "reason": _NSTR,
+            # `category` (optional, nullable): first-class structured reject category (Task 5
+            # review) — a reliable analytics key, unlike the polymorphic free-text `reason`.
+            # NOT required — pre-existing REJECTED events lack the key entirely.
+            "category": _NSTR,
             "target_event_id": _STR,
             "retired_fingerprint": _NSTR,
         },

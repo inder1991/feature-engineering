@@ -173,14 +173,16 @@ def test_non_join_fact_404s_without_writing_events(client, overlay_env):
 def test_reject_records_category(client, seeded_join, conn):
     _ref, key = seeded_join
     r = client.post(f"/governance/joins/{key}/reject",
-                    json={"category": "wrong_direction", "note": "customers own the key"},
+                    json={"category": "different_entity", "note": "watchlist CIF"},
                     headers=_h("priya"))
     assert r.status_code == 200, r.text
-    assert r.json() == {"governance_status": "REJECTED", "category": "wrong_direction"}
+    assert r.json() == {"governance_status": "REJECTED", "category": "different_entity"}
     assert fold_overlay_state(load_fact(conn, key)).status == "REJECTED"
-    # the event's schema-typed string reason keeps the category machine-extractable as the prefix
+    # `category` is a first-class payload field (reliable analytics key); `reason` carries
+    # ONLY the free-text note — NOT the old "category: note" serialization.
     rejected = [e for e in load_fact(conn, key) if e.type == "OVERLAY_FACT_REJECTED"]
-    assert rejected[-1].payload["reason"] == "wrong_direction: customers own the key"
+    assert rejected[-1].payload["category"] == "different_entity"
+    assert rejected[-1].payload["reason"] == "watchlist CIF"
     # a rejected join is no longer an open proposal
     r = client.get("/sources/src/governance/joins", headers=_h("priya"))
     assert r.json()["proposals"] == []
@@ -197,6 +199,10 @@ def test_partial_confirm_then_reject_is_terminal(client, seeded_join, conn):
     assert r.status_code == 200, r.text
     assert r.json() == {"governance_status": "REJECTED", "category": "needs_data_check"}
     assert fold_overlay_state(load_fact(conn, key)).status == "REJECTED"
+    # no note -> reason is None (NOT the category string); category stands alone
+    rejected = [e for e in load_fact(conn, key) if e.type == "OVERLAY_FACT_REJECTED"]
+    assert rejected[-1].payload["category"] == "needs_data_check"
+    assert rejected[-1].payload["reason"] is None
 
 
 # ── (5) authz: a non-admin is 403'd on all three routes ─────────────────────────────────────────

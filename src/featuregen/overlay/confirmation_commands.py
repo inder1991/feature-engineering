@@ -240,6 +240,7 @@ def reject_fact(conn: DbConn, cmd: Command) -> CommandResult:
         payload={
             "rejected_by": cmd.actor.subject,
             "reason": args.get("reason"),
+            "category": args.get("category"),
             "target_event_id": args["target_event_id"],
             "retired_fingerprint": retired_fp,
         },

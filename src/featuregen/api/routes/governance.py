@@ -117,15 +117,13 @@ def confirm_join(fact_key: str, body: ConfirmJoinRequest, conn: _Conn,
 def reject_join(fact_key: str, body: RejectJoinRequest, conn: _Conn,
                 identity: _Identity) -> dict:
     ctx = _load_context_or_404(conn, fact_key)
-    # The OVERLAY_FACT_REJECTED payload's `reason` is schema-typed string|null (facts.py) — a
-    # {category, note} object would fail append-time validation. Serialize "category: note"
-    # (category first, so it stays machine-extractable as the prefix).
-    note = _clean(body.note)
-    reason = body.category if note is None else f"{body.category}: {note}"
+    # `category` is a first-class field on OVERLAY_FACT_REJECTED (Task 5 review): a reliable
+    # analytics key. `reason` carries ONLY the free-text note (or None).
     cmd = Command(
         action="reject_fact", aggregate="overlay_fact", aggregate_id=fact_key,
         args={"ref": ctx["ref"], "fact_type": "approved_join", "use_case": ctx["use_case"],
-              "target_event_id": ctx["target_event_id"], "reason": reason},
+              "target_event_id": ctx["target_event_id"], "reason": _clean(body.note),
+              "category": body.category},
         actor=identity, idempotency_key=f"reject:{fact_key}:{identity.subject}",
         expected_version=None)
     result = reject_fact(conn, cmd)
