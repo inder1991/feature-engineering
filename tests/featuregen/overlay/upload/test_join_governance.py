@@ -496,6 +496,38 @@ def test_project_verified_join_projects_within_the_confirming_request(
         == [JoinStep(_FROM, _TO, "N:1")]
 
 
+def test_project_verified_join_pending_when_drift_watermark_stale(
+        passc_conn, human_admin_1, human_admin_2):
+    """HONEST REPORTING under the drift-freshness guard (the common governance case: an admin
+    approves a queued proposal hours/days after the upload). The join is VERIFIED, but the
+    source's drift watermark is STALE (older than `drift_freshness_sla`), so `resolve_fact`
+    refuses to serve the fact and `project_confirmed_joins` writes NO operational edge — the
+    refusal is CORRECT and must stand. `project_verified_join` must then report "pending", not
+    "projected": the planner cannot traverse an edge that was never written. Pre-fix this
+    returned "projected" with zero edges (a mis-report the UI would display as live)."""
+    from datetime import timedelta
+
+    from featuregen.overlay.catalog_changes import _write_watermark
+    from featuregen.overlay.config import OverlayConfig, register_overlay_config
+
+    ref, _key = _seed_join_with_evidence(passc_conn)
+    _confirm_join(passc_conn, ref, admin1=human_admin_1, admin2=human_admin_2)   # VERIFIED, drained
+    # Seal a config (the drift guard's opt-in — mirrors test_source_qualified's guard tests) and
+    # stamp the source's watermark 2h in the past against a 60m SLA: resolve_fact fails closed.
+    register_overlay_config(OverlayConfig(
+        ttl_default=timedelta(days=180), ttl_min=timedelta(days=30), ttl_max=timedelta(days=365),
+        ttl_jitter_fraction=0.0, renewal_grace=timedelta(days=14),
+        drift_scan_interval=timedelta(minutes=15), drift_freshness_sla=timedelta(minutes=60),
+        profiler_require_restricted_role=False))
+    now = datetime.now(UTC)
+    _write_watermark(passc_conn, "src", now - timedelta(hours=2))
+
+    assert project_verified_join(passc_conn, "src", ref, now=now) == "pending"
+    assert passc_conn.execute(
+        "SELECT count(*) FROM graph_edge WHERE kind = 'joins'"
+        " AND authority = 'operational'").fetchone()[0] == 0
+
+
 def test_project_verified_join_pending_when_projection_cannot_drain(passc_conn, monkeypatch):
     """The residual-lag fallback: when the drain cannot reach head (a poison-HALTED projection —
     `run_projection` stops advancing while events remain), `resolve_fact` could read a stale

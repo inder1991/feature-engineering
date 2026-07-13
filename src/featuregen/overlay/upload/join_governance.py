@@ -34,7 +34,7 @@ from featuregen.overlay.identity import ApprovedJoinRef, _ref_from_payload
 from featuregen.overlay.projection import OverlayProjection
 from featuregen.overlay.state import fold_overlay_state
 from featuregen.overlay.store import load_fact
-from featuregen.overlay.upload.passc.projection import project_confirmed_joins
+from featuregen.overlay.upload.passc.projection import _endpoint, project_confirmed_joins
 from featuregen.projections.runner import projection_lag, run_projection
 from featuregen.runtime.observability import counters
 
@@ -341,7 +341,15 @@ def project_verified_join(conn: DbConn, source: str, ref, *, now: datetime | Non
     model to head inside the request transaction; the residual lag check then only fires when the
     drain poison-HALTED short of head (same guard as ingest), where projecting could serve a
     stale status — defer instead of projecting a lie. Everything runs inside a savepoint so a
-    fault cannot poison the caller's transaction, and any exception is fail-soft."""
+    fault cannot poison the caller's transaction, and any exception is fail-soft.
+
+    HONEST REPORTING (whole-branch follow-on): "projected" is claimed ONLY when an operational
+    `graph_edge` row actually exists for the ref's unordered column pair after the projector ran.
+    `project_confirmed_joins` -> `resolve_fact` can CORRECTLY refuse to serve the just-VERIFIED
+    fact — most commonly the drift-freshness guard on a stale source watermark (an admin approving
+    hours after the upload) — in which case it demotes/no-ops and writes NO edge. That refusal
+    must stand (never launder the watermark); the return value reports the deferral honestly:
+    the next fresh-watermark ingest re-projection makes the join operational."""
     try:
         with conn.transaction():   # savepoint: a projection fault must not roll back the confirm
             while run_projection(conn, OverlayProjection()) >= 500:
@@ -354,6 +362,22 @@ def project_verified_join(conn: DbConn, source: str, ref, *, now: datetime | Non
                                source)
                 return "pending"
             project_confirmed_joins(conn, source=source, pairs=[ref], now=now)
+            # The Task-4/Task-8 edge-existence shape: ONE operational, fact-linked VERIFIED edge
+            # for this unordered column pair (either orientation), in PUBLIC graph scope.
+            a, b = _endpoint(ref.from_ref), _endpoint(ref.to_ref)
+            edge = conn.execute(
+                "SELECT 1 FROM graph_edge WHERE catalog_source = %s AND kind = 'joins'"
+                " AND authority = 'operational' AND approved_join_status = 'VERIFIED'"
+                " AND approved_join_fact_key IS NOT NULL"
+                " AND ((from_ref = %s AND to_ref = %s) OR (from_ref = %s AND to_ref = %s))",
+                (source, a, b, b, a)).fetchone()
+        if edge is None:
+            # resolve_fact refused to serve the fact (stale drift watermark, demotion, expiry):
+            # no edge was written, so the join is NOT operational — report it honestly.
+            counters.incr("overlay.join_governance.projection_deferred_unserved")
+            logger.warning("join governance: verified join in %r not servable at projection time "
+                           "(no operational edge written) — returning pending", source)
+            return "pending"
         return "projected"
     except Exception:  # noqa: BLE001 — fail-soft: the fact stays VERIFIED; ingest re-projects
         counters.incr("overlay.join_governance.projection_error")
