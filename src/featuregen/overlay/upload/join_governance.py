@@ -17,8 +17,8 @@ never raised. A single poisoned row must not take down the whole governance queu
 Task 4 adds the confirm/reject bridge: `load_join_confirmation_context` turns a fact_key back into
 the typed command args a confirm/reject route dispatches (fact_type-VALIDATED — a non-join
 fact_key raises `JoinGovernanceNotFound`, closing the generic-approval hole), and
-`project_verified_join` makes a just-VERIFIED join operational SYNCHRONOUSLY (lag-guarded,
-fail-soft) instead of waiting for the next re-upload's projector run.
+`project_verified_join` makes a just-VERIFIED join operational SYNCHRONOUSLY (drain-then-project
+on the request conn, fail-soft) instead of waiting for the next re-upload's projector run.
 """
 from __future__ import annotations
 
@@ -31,10 +31,11 @@ from featuregen.contracts.envelopes import IdentityEnvelope
 from featuregen.overlay import facts
 from featuregen.overlay._lifecycle import _cas_target
 from featuregen.overlay.identity import ApprovedJoinRef, _ref_from_payload
+from featuregen.overlay.projection import OverlayProjection
 from featuregen.overlay.state import fold_overlay_state
 from featuregen.overlay.store import load_fact
 from featuregen.overlay.upload.passc.projection import project_confirmed_joins
-from featuregen.projections.runner import projection_lag
+from featuregen.projections.runner import projection_lag, run_projection
 from featuregen.runtime.observability import counters
 
 logger = logging.getLogger(__name__)
@@ -331,17 +332,27 @@ def project_verified_join(conn: DbConn, source: str, ref, *, now: datetime | Non
     no-re-upload-needed step. Returns ``"projected"`` (ran) or ``"pending"`` (deferred to the next
     caught-up ingest re-projection). NEVER raises — the fact stream stays VERIFIED regardless.
 
-    Mirrors the ingest re-projection guards (ingest.py): `resolve_fact` reads the
-    `overlay_fact_state` read model, so a lagging overlay projection could serve a stale status —
-    defer instead of projecting a lie. The projector runs inside a savepoint so a fault cannot
-    poison the caller's transaction, and any exception (lag check included) is fail-soft."""
+    DRAIN-then-project, mirroring the ingest path (ingest.py `_drain_projection` before
+    `project_confirmed_joins`): the caller's `confirm_fact` has JUST appended
+    OVERLAY_FACT_CONFIRMED in the SAME uncommitted request transaction, so the async projector's
+    checkpoint is ALWAYS behind head here (`projection_lag >= 1`) and `resolve_fact`'s
+    `overlay_fact_state` read model lacks the just-VERIFIED row — a bare lag guard deferred EVERY
+    request-time projection (whole-branch review FIX 2). Draining on THIS conn brings the read
+    model to head inside the request transaction; the residual lag check then only fires when the
+    drain poison-HALTED short of head (same guard as ingest), where projecting could serve a
+    stale status — defer instead of projecting a lie. Everything runs inside a savepoint so a
+    fault cannot poison the caller's transaction, and any exception is fail-soft."""
     try:
-        if projection_lag(conn, "overlay") != 0:
-            counters.incr("overlay.join_governance.projection_skipped_lag")
-            logger.warning("join governance: overlay projection lags — deferring projection of a "
-                           "verified join in %r to the next caught-up ingest", source)
-            return "pending"
         with conn.transaction():   # savepoint: a projection fault must not roll back the confirm
+            while run_projection(conn, OverlayProjection()) >= 500:
+                pass               # one pass caps at 500 events — loop until caught up
+            if projection_lag(conn, "overlay") != 0:
+                # The drain reached a poison-HALT, not head: the read model may still be stale.
+                counters.incr("overlay.join_governance.projection_skipped_lag")
+                logger.warning("join governance: overlay projection lags after drain — deferring "
+                               "projection of a verified join in %r to the next caught-up ingest",
+                               source)
+                return "pending"
             project_confirmed_joins(conn, source=source, pairs=[ref], now=now)
         return "projected"
     except Exception:  # noqa: BLE001 — fail-soft: the fact stays VERIFIED; ingest re-projects

@@ -412,6 +412,28 @@ def test_context_rejects_unknown_fact_key(passc_conn):
         load_join_confirmation_context(passc_conn, "no-such-fact-key")
 
 
+def test_context_rejects_ref_whose_decode_throws(passc_conn):
+    """The decode-EXCEPTION branch (whole-branch review, Minor): a `catalog_object_ref` payload
+    that is present and schema-valid (an object) but genuinely UNDECODABLE — `_ref_from_payload`
+    raises building the dataclasses — must surface as JoinGovernanceNotFound (the routes' 404),
+    never a 500. Distinct from the isinstance/non-join case below, which decodes fine."""
+    bad_key = "ctx-undecodable-join-fact-key"
+    append_overlay_event(
+        passc_conn, fact_key=bad_key, type="OVERLAY_FACT_PROPOSED",
+        payload={
+            # "column_pairs" routes _ref_from_payload down the ApprovedJoinRef arm, where
+            # CatalogObjectRef(**{"bogus": ...}) raises TypeError — a real decode exception.
+            "catalog_object_ref": {"column_pairs": [], "cardinality": "N:1",
+                                   "from_ref": {"bogus": 1}, "to_ref": {"bogus": 2}},
+            "object_ref": "public.orphans", "fact_type": "approved_join", "use_case": None,
+            "proposed_value": _join_value(_bare_ref("x1", "x2", "id")),
+            "proposal_fingerprint": "fp-ctx-undecodable", "evidence_ref": None,
+            "proposed_by": SERVICE_ACTOR.subject},
+        actor=SERVICE_ACTOR, expected_version=0)
+    with pytest.raises(JoinGovernanceNotFound):
+        load_join_confirmation_context(passc_conn, bad_key)
+
+
 def test_context_rejects_undecodable_ref(passc_conn):
     """A DRAFT that CLAIMS fact_type approved_join but whose ref decodes to a plain table
     CatalogObjectRef (no column_pairs) is not a typed join ref — raises, never returned."""
@@ -450,10 +472,36 @@ def test_project_verified_join_creates_operational_edge(passc_conn, human_admin_
         == [JoinStep(_FROM, _TO, "N:1")]
 
 
-def test_project_verified_join_pending_when_projection_lags(passc_conn):
-    """Lag-guarded: `resolve_fact` reads the overlay read model — projecting against a lagging
-    model could serve a stale status, so the helper defers ("pending") and writes NO edge."""
-    ref, _key = _seed_join_with_evidence(passc_conn)   # the propose appended events; NOT drained
+def test_project_verified_join_projects_within_the_confirming_request(
+        passc_conn, human_admin_1, human_admin_2):
+    """THE route-path shape (whole-branch review, FIX 2): `confirm_fact` has JUST appended
+    OVERLAY_FACT_CONFIRMED on this same uncommitted connection and NOTHING drained the overlay
+    projection (unlike `_confirm_join`), so `projection_lag(conn, "overlay")` >= 1 when
+    `project_verified_join` runs. The helper must DRAIN on this conn (mirroring the ingest path's
+    drain-before-project) and then project — the operational edge exists and `find_join_path`
+    traverses it IMMEDIATELY, no re-ingest. Pre-fix this always returned "pending" (edge absent
+    until a future re-upload)."""
+    ref, key = _seed_join_with_evidence(passc_conn)
+    _confirm_once(passc_conn, ref, key, human_admin_1, "side one")
+    _confirm_once(passc_conn, ref, key, human_admin_2, "side two")   # VERIFIED — no drain ran
+    assert fold_overlay_state(load_fact(passc_conn, key)).status == "VERIFIED"
+
+    status = project_verified_join(passc_conn, ref.from_ref.catalog_source, ref, now=None)
+    assert status == "projected"
+    rows = passc_conn.execute(
+        "SELECT authority, approved_join_fact_key, approved_join_status FROM graph_edge"
+        " WHERE kind = 'joins' AND catalog_source = 'src'").fetchall()
+    assert rows == [("operational", key, "VERIFIED")]
+    assert find_join_path(passc_conn, "src", "transactions", "customers") \
+        == [JoinStep(_FROM, _TO, "N:1")]
+
+
+def test_project_verified_join_pending_when_projection_cannot_drain(passc_conn, monkeypatch):
+    """The residual-lag fallback: when the drain cannot reach head (a poison-HALTED projection —
+    `run_projection` stops advancing while events remain), `resolve_fact` could read a stale
+    read model, so the helper defers ("pending") and writes NO edge."""
+    ref, _key = _seed_join_with_evidence(passc_conn)   # the propose appended events; halted below
+    monkeypatch.setattr(join_governance, "run_projection", lambda conn, projection: 0)
     assert project_verified_join(passc_conn, "src", ref, now=None) == "pending"
     assert passc_conn.execute(
         "SELECT count(*) FROM graph_edge WHERE kind = 'joins'").fetchone()[0] == 0

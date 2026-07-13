@@ -21,6 +21,7 @@ only once the client exists), so the seeding fixture registers them itself.
 from __future__ import annotations
 
 import pytest
+from tests.featuregen.overlay.upload.passc.conftest import SERVICE_ACTOR
 from tests.featuregen.overlay.upload.passc.test_sealed_join_confirm_referents import (
     _seed_graph_nodes,
 )
@@ -31,6 +32,7 @@ from tests.featuregen.overlay.upload.test_join_governance import (
 
 from featuregen.events.registry import event_registry
 from featuregen.overlay.catalog import _clear_catalog_adapter
+from featuregen.overlay.catalog_changes import detect_catalog_changes
 from featuregen.overlay.config import (
     _clear_overlay_config,
     overlay_config_from_env,
@@ -39,7 +41,12 @@ from featuregen.overlay.config import (
 from featuregen.overlay.facts import register_overlay_event_types
 from featuregen.overlay.state import fold_overlay_state
 from featuregen.overlay.store import load_fact
-from featuregen.overlay.upload.upload_catalog import ensure_upload_catalog_adapter
+from featuregen.overlay.upload.canonical import CanonicalRow
+from featuregen.overlay.upload.join_path import JoinStep, find_join_path
+from featuregen.overlay.upload.upload_catalog import (
+    UploadCatalog,
+    ensure_upload_catalog_adapter,
+)
 
 
 def _h(user: str, roles: str = "platform-admin") -> dict:
@@ -119,6 +126,14 @@ def test_dual_admin_confirm_reaches_verified_under_sealed_config(
         client, sealed_config, seeded_join, conn):
     _ref, key = seeded_join
     _seed_graph_nodes(conn)   # BOTH endpoints must exist in graph_node for the sealed referent gate
+    # Sealed config also arms resolve_fact's read-time DRIFT-FRESHNESS guard, which the synchronous
+    # post-VERIFIED projection resolves through: seed the drift watermark the way production does —
+    # the upload that produced this proposal ran detect_catalog_changes (ingest.py) before Pass C.
+    detect_catalog_changes(
+        conn,
+        UploadCatalog("src", [CanonicalRow("src", "transactions", "cif_id", "text"),
+                              CanonicalRow("src", "customers", "cif_id", "text", is_grain=True)]),
+        actor=SERVICE_ACTOR, open_reverify=False)
 
     # admin1 confirms with a note -> PARTIALLY_CONFIRMED, no projection yet
     r = client.post(f"/governance/joins/{key}/confirm", json={"note": "cif ok"},
@@ -141,14 +156,25 @@ def test_dual_admin_confirm_reaches_verified_under_sealed_config(
     assert p["status"] == "PARTIALLY_CONFIRMED"
     assert p["approvals"][0]["note"] == "cif ok"
 
-    # a DISTINCT admin2 confirms -> VERIFIED + a projection outcome
+    # a DISTINCT admin2 confirms -> VERIFIED, and the join is made operational IN THIS REQUEST
+    # (whole-branch review, FIX 2): the confirm appended OVERLAY_FACT_CONFIRMED on the SAME
+    # uncommitted connection, so project_verified_join must drain the overlay projection on that
+    # conn before projecting — pre-fix projection_lag was always >= 1 here, the helper returned
+    # "pending" unconditionally, and no edge existed until a future re-ingest.
     r = client.post(f"/governance/joins/{key}/confirm", json={}, headers=_h("rahman"))
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["governance_status"] == "VERIFIED"
-    assert body["operational_projection"] in ("projected", "pending")
+    assert body["operational_projection"] == "projected"
     assert len(body["approvals"]) == 2
     assert fold_overlay_state(load_fact(conn, key)).status == "VERIFIED"
+    # the operational graph_edge exists NOW and the planner traverses it — no re-ingest
+    rows = conn.execute(
+        "SELECT authority, approved_join_fact_key, approved_join_status FROM graph_edge"
+        " WHERE kind = 'joins' AND catalog_source = 'src'").fetchall()
+    assert rows == [("operational", key, "VERIFIED")]
+    assert find_join_path(conn, "src", "transactions", "customers") == \
+        [JoinStep("public.transactions.cif_id", "public.customers.cif_id", "N:1")]
 
 
 # ── (3) fact_type gate: a non-join fact_key 404s on BOTH mutation routes, no event written ──────
