@@ -16,11 +16,12 @@ them (public-flattened `object_ref` = 'public.table[.column]', kind 'table'|'col
 from __future__ import annotations
 
 import pytest
-from tests.featuregen.overlay.upload.passc.conftest import _join_value
+from tests.featuregen.overlay.upload.passc.conftest import SERVICE_ACTOR, _drain, _join_value
 from tests.featuregen.overlay.upload.test_join_governance import _seed_join_with_evidence
 
 from featuregen.contracts.envelopes import Command
 from featuregen.overlay._lifecycle import _cas_target
+from featuregen.overlay.catalog_changes import detect_catalog_changes
 from featuregen.overlay.commands import confirm_fact
 from featuregen.overlay.config import (
     _clear_overlay_config,
@@ -30,10 +31,12 @@ from featuregen.overlay.config import (
 from featuregen.overlay.identity import ApprovedJoinRef, CatalogObjectRef, ColumnPair
 from featuregen.overlay.state import fold_overlay_state
 from featuregen.overlay.store import load_fact
+from featuregen.overlay.upload.canonical import CanonicalRow
 from featuregen.overlay.upload.join_referents import (
     check_referents_exist,
     graph_referent_gap,
 )
+from featuregen.overlay.upload.upload_catalog import UploadCatalog
 
 # ── Sealed deployment posture ─────────────────────────────────────────────────────────────────────
 
@@ -211,3 +214,71 @@ def test_normal_adapter_empty_fingerprint_keeps_original_denial(db):
     gap = check_referents_exist(
         db, _FingerprintAdapter("src", set()), ref, "approved_join", _join_value(ref))
     assert gap is not None and gap.startswith("referent no longer in catalog:")
+
+
+# ── 6/7. The MISSED third gate (whole-branch review): the drift-STALE first-partial re-confirm ────
+
+
+def _verify_join(conn, ref, key, admin1, admin2) -> None:
+    """Drive the seeded join to VERIFIED under the sealed config (graph_node must be seeded)."""
+    first = _confirm(conn, ref, key, admin1)
+    assert first.accepted, first.denied_reason
+    second = _confirm(conn, ref, key, admin2)
+    assert second.accepted, second.denied_reason
+    assert _status(conn, key) == "VERIFIED"
+
+
+def _drift_stale_join(conn, key) -> None:
+    """STALE the VERIFIED join EXACTLY the way production does (ingest.py's drift path):
+    `detect_catalog_changes` over a re-upload that TYPE-CHANGES the from-endpoint but keeps every
+    endpoint PRESENT. The dependency index the drift scan reads is an overlay-projection read
+    model, so drain first (ingest drains before the diff, same reason)."""
+    _drain(conn)
+    rows_v1 = [CanonicalRow("src", "transactions", "cif_id", "text"),
+               CanonicalRow("src", "customers", "cif_id", "text", is_grain=True)]
+    detect_catalog_changes(conn, UploadCatalog("src", rows_v1), actor=SERVICE_ACTOR,
+                           open_reverify=False)            # establish the snapshot (adds only)
+    rows_v2 = [CanonicalRow("src", "transactions", "cif_id", "varchar"),
+               CanonicalRow("src", "customers", "cif_id", "text", is_grain=True)]
+    changes = detect_catalog_changes(conn, UploadCatalog("src", rows_v2), actor=SERVICE_ACTOR,
+                                     open_reverify=False)  # type change -> dependents STALE
+    assert any(c.kind == "type_change" and c.object_ref == _FROM_COL for c in changes)
+    assert _status(conn, key) == "STALE"
+
+
+def test_drift_staled_join_reconfirm_reaches_partially_confirmed(
+    passc_conn, sealed_config, human_admin_1, human_admin_2
+):
+    """THE production hole at join_confirmation.py:94 (whole-branch review, FIX 1): a VERIFIED
+    dual join drift-STALEs (type change — every endpoint STILL in graph_node), then a
+    platform-admin re-confirms. The `state.status == "STALE"` first-partial gate must route
+    existence through `check_referents_exist` like the other two sentinel-affected sites; the raw
+    `referent_gap(sentinel, ...)` denies with "referent catalog_source 'src' is not served by this
+    adapter" — the drift-STALEd join could NEVER re-verify in a sealed deployment."""
+    ref, key = _seed_join_with_evidence(passc_conn)
+    _seed_graph_nodes(passc_conn)
+    _verify_join(passc_conn, ref, key, human_admin_1, human_admin_2)
+    _drift_stale_join(passc_conn, key)
+
+    res = _confirm(passc_conn, ref, key, human_admin_1)    # a STALE cycle starts with no partials
+    assert res.accepted, res.denied_reason
+    assert _status(passc_conn, key) == "PARTIALLY_CONFIRMED"
+
+
+def test_drift_staled_join_reconfirm_still_denied_when_endpoint_missing(
+    passc_conn, sealed_config, human_admin_1, human_admin_2
+):
+    """The guard is PRESERVED, only its structural source changed: the same drift-STALEd join
+    whose from-endpoint is MISSING from graph_node is still denied at the first re-confirm, with
+    the graph-based reason naming the exact missing endpoint."""
+    ref, key = _seed_join_with_evidence(passc_conn)
+    _seed_graph_nodes(passc_conn)
+    _verify_join(passc_conn, ref, key, human_admin_1, human_admin_2)
+    _drift_stale_join(passc_conn, key)
+    _delete_graph_column(passc_conn, _FROM_COL)
+
+    res = _confirm(passc_conn, ref, key, human_admin_1)
+    assert not res.accepted
+    assert "stale re-confirm blocked" in res.denied_reason
+    assert f"join referent missing from graph: src.{_FROM_COL}" in res.denied_reason
+    assert _status(passc_conn, key) == "STALE"
