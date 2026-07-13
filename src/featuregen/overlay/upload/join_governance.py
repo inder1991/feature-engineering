@@ -1,4 +1,4 @@
-"""Join-governance read model + approval-stream reader (confirmation surface, Task 3).
+"""Join-governance read model + approval-stream reader (confirmation surface, Tasks 3+4).
 
 `list_open_approved_join_proposals` is a READ MODEL over the existing `human_tasks` gate rows and
 the `overlay_fact` event stream (not a new queue) — it lists one view PER `fact_key` of a source's
@@ -13,21 +13,38 @@ evidence is shaped TOLERANTLY out of the pre-minted Pass C evidence row
 FAILURE ISOLATION IS LOAD-BEARING: one task whose proposal is unreadable, whose ref will not
 decode, is not an `ApprovedJoinRef`, or has no source is SKIPPED with a warning + counter —
 never raised. A single poisoned row must not take down the whole governance queue.
+
+Task 4 adds the confirm/reject bridge: `load_join_confirmation_context` turns a fact_key back into
+the typed command args a confirm/reject route dispatches (fact_type-VALIDATED — a non-join
+fact_key raises `JoinGovernanceNotFound`, closing the generic-approval hole), and
+`project_verified_join` makes a just-VERIFIED join operational SYNCHRONOUSLY (lag-guarded,
+fail-soft) instead of waiting for the next re-upload's projector run.
 """
 from __future__ import annotations
 
 import logging
 from collections.abc import Mapping
+from datetime import datetime
 
 from featuregen.contracts import DbConn
 from featuregen.contracts.envelopes import IdentityEnvelope
 from featuregen.overlay import facts
+from featuregen.overlay._lifecycle import _cas_target
 from featuregen.overlay.identity import ApprovedJoinRef, _ref_from_payload
 from featuregen.overlay.state import fold_overlay_state
 from featuregen.overlay.store import load_fact
+from featuregen.overlay.upload.passc.projection import project_confirmed_joins
+from featuregen.projections.runner import projection_lag
 from featuregen.runtime.observability import counters
 
 logger = logging.getLogger(__name__)
+
+
+class JoinGovernanceNotFound(Exception):
+    """`fact_key` does not name a loadable approved_join proposal: its stream is empty, its DRAFT
+    ref will not decode to a typed `ApprovedJoinRef`, or its `fact_type` is not "approved_join".
+    The confirm/reject routes (Task 5) map this to 404 — critically, BEFORE any event is written,
+    so the join surface can never be used to approve an arbitrary (grain/as-of/policy) fact."""
 
 # Mirrors table_fact_projection._WORKLIST_READER: both sides of an upload-context join route to
 # the platform-admin governance queue (UploadContextAdapter.owner_of -> None), and
@@ -277,3 +294,58 @@ def list_open_approved_join_proposals(conn: DbConn, source: str, *, limit: int =
         view["tasks"].append(task_row)
         views[key] = view
     return list(views.values())[:limit]
+
+
+def load_join_confirmation_context(conn: DbConn, fact_key: str) -> dict:
+    """The typed confirm/reject command args for `fact_key`'s approved_join proposal:
+    ``{ref, fact_type, use_case, target_event_id}`` (``use_case`` is always None — approved_join
+    is a data fact). Raises :class:`JoinGovernanceNotFound` when the stream is empty, the DRAFT
+    ref will not decode to an `ApprovedJoinRef`, or the fact is not an approved_join.
+
+    ``target_event_id`` is `_cas_target(state)` — the EXACT id `confirm_fact`/`reject_fact` CAS
+    against (confirmation_commands.py) — never a raw stream head: for a re-verify cycle's second
+    confirmer the CAS target is the cycle-stable prior `confirmed_event_id`, not the latest event,
+    so guessing `stream[-1].event_id` would 409 every second re-confirm."""
+    stream = load_fact(conn, fact_key)
+    if not stream:
+        raise JoinGovernanceNotFound(f"no fact stream for {fact_key!r}")
+    payload = stream[0].payload
+    if payload.get("fact_type") != "approved_join":
+        raise JoinGovernanceNotFound(f"fact {fact_key!r} is not an approved_join")
+    try:
+        ref = _ref_from_payload(payload["catalog_object_ref"])
+    except Exception as exc:  # noqa: BLE001 — a corrupt DRAFT payload is a 404, never a 500
+        raise JoinGovernanceNotFound(f"fact {fact_key!r} ref undecodable") from exc
+    if not isinstance(ref, ApprovedJoinRef):
+        raise JoinGovernanceNotFound(f"fact {fact_key!r} ref is not a typed join ref")
+    return {
+        "ref": ref,
+        "fact_type": "approved_join",
+        "use_case": None,
+        "target_event_id": _cas_target(fold_overlay_state(stream)),
+    }
+
+
+def project_verified_join(conn: DbConn, source: str, ref, *, now: datetime | None) -> str:
+    """SYNCHRONOUSLY project a just-VERIFIED join onto `graph_edge` — the confirm route's
+    no-re-upload-needed step. Returns ``"projected"`` (ran) or ``"pending"`` (deferred to the next
+    caught-up ingest re-projection). NEVER raises — the fact stream stays VERIFIED regardless.
+
+    Mirrors the ingest re-projection guards (ingest.py): `resolve_fact` reads the
+    `overlay_fact_state` read model, so a lagging overlay projection could serve a stale status —
+    defer instead of projecting a lie. The projector runs inside a savepoint so a fault cannot
+    poison the caller's transaction, and any exception (lag check included) is fail-soft."""
+    try:
+        if projection_lag(conn, "overlay") != 0:
+            counters.incr("overlay.join_governance.projection_skipped_lag")
+            logger.warning("join governance: overlay projection lags — deferring projection of a "
+                           "verified join in %r to the next caught-up ingest", source)
+            return "pending"
+        with conn.transaction():   # savepoint: a projection fault must not roll back the confirm
+            project_confirmed_joins(conn, source=source, pairs=[ref], now=now)
+        return "projected"
+    except Exception:  # noqa: BLE001 — fail-soft: the fact stays VERIFIED; ingest re-projects
+        counters.incr("overlay.join_governance.projection_error")
+        logger.warning("join governance: synchronous verified-join projection failed for %r — "
+                       "fact intact, returning pending", source, exc_info=True)
+        return "pending"

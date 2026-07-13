@@ -22,9 +22,11 @@ import logging
 from dataclasses import asdict
 from datetime import UTC, datetime
 
+import pytest
 from psycopg.types.json import Json
 from tests.featuregen.overlay.upload.passc.conftest import (  # noqa: F401 — pytest fixtures
     SERVICE_ACTOR,
+    _confirm_join,
     _join_value,
     _propose_join,
     human_admin_1,
@@ -51,13 +53,18 @@ from featuregen.overlay.state import fold_overlay_state
 from featuregen.overlay.store import append_overlay_event, load_fact
 from featuregen.overlay.upload import join_governance
 from featuregen.overlay.upload.join_governance import (
+    JoinGovernanceNotFound,
     list_open_approved_join_proposals,
+    load_join_confirmation_context,
+    project_verified_join,
     read_join_approvals,
 )
+from featuregen.overlay.upload.join_path import JoinStep, find_join_path
 from featuregen.overlay.upload.passc.candidates import block_candidates, score
 from featuregen.overlay.upload.passc.identifiers import ColMeta
 from featuregen.overlay.upload.passc.lifecycle import build_join_ref
 from featuregen.overlay.upload.passc.types import ALGORITHM_VERSION
+from featuregen.overlay.upload.upload_catalog import table_ref
 from featuregen.runtime.observability import counters
 
 _CIF_TERM = "Customer Information File Identifier"
@@ -343,3 +350,125 @@ def test_limit_is_clamped_and_bounds_proposals(passc_conn):
     assert len(list_open_approved_join_proposals(passc_conn, "src", limit=1)) == 1
     assert len(list_open_approved_join_proposals(passc_conn, "src", limit=0)) == 1   # clamped up
     assert len(list_open_approved_join_proposals(passc_conn, "src", limit=9999)) == 2
+
+
+# ── Task 4: confirm/reject context bridge ────────────────────────────────────────────────────────
+
+
+def _seed_grain_fact(passc_conn) -> str:
+    """A NON-join fact seeded through the real table-fact propose path — the generic-approval-hole
+    probe: its fact_key must NEVER load as a join confirmation context."""
+    ref = table_ref("src", "txn")
+    value = {"columns": ["id"], "is_unique": True}
+    res = propose_fact(passc_conn, Command(
+        "propose_fact", "overlay_fact", None,
+        {"ref": ref, "fact_type": "grain", "proposed_value": value},
+        SERVICE_ACTOR, proposal_fingerprint(value)))
+    assert res.accepted, res.denied_reason
+    return fact_key(ref, "grain")
+
+
+def test_context_returns_typed_ref_and_a_target_a_real_confirm_accepts(
+        passc_conn, human_admin_1, human_admin_2):
+    """THE load-bearing wiring: the returned target_event_id must be the exact CAS target
+    `confirm_fact` accepts — proven by driving BOTH stages of the dual confirm with a freshly
+    loaded context each time (DRAFT head, then the PARTIALLY_CONFIRMED cycle-stable target)."""
+    ref, key = _seed_join_with_evidence(passc_conn)
+    ctx = load_join_confirmation_context(passc_conn, key)
+    assert ctx["fact_type"] == "approved_join"
+    assert ctx["use_case"] is None
+    assert isinstance(ctx["ref"], ApprovedJoinRef)
+    assert ctx["ref"].from_ref.column == ref.from_ref.column
+    assert ctx["ref"].to_ref.table == ref.to_ref.table
+    assert ctx["target_event_id"]                          # the current head
+
+    first = confirm_fact(passc_conn, Command(
+        "confirm_fact", "overlay_fact", None,
+        {"ref": ctx["ref"], "fact_type": ctx["fact_type"], "use_case": ctx["use_case"],
+         "target_event_id": ctx["target_event_id"], "note": "via context"},
+        human_admin_1, f"ctx-confirm-1-{ctx['target_event_id']}"))
+    assert first.accepted, first.denied_reason
+
+    ctx2 = load_join_confirmation_context(passc_conn, key)  # PARTIALLY_CONFIRMED re-read
+    second = confirm_fact(passc_conn, Command(
+        "confirm_fact", "overlay_fact", None,
+        {"ref": ctx2["ref"], "fact_type": ctx2["fact_type"], "use_case": ctx2["use_case"],
+         "target_event_id": ctx2["target_event_id"], "note": "second side"},
+        human_admin_2, f"ctx-confirm-2-{ctx2['target_event_id']}"))
+    assert second.accepted, second.denied_reason
+    assert fold_overlay_state(load_fact(passc_conn, key)).status == "VERIFIED"
+
+
+def test_context_rejects_non_join_fact(passc_conn):
+    """The fact_type gate: a grain fact_key must raise (Task 5 maps to 404) — the join confirm
+    surface can never become a generic approval endpoint."""
+    grain_key = _seed_grain_fact(passc_conn)
+    with pytest.raises(JoinGovernanceNotFound):
+        load_join_confirmation_context(passc_conn, grain_key)
+
+
+def test_context_rejects_unknown_fact_key(passc_conn):
+    with pytest.raises(JoinGovernanceNotFound):
+        load_join_confirmation_context(passc_conn, "no-such-fact-key")
+
+
+def test_context_rejects_undecodable_ref(passc_conn):
+    """A DRAFT that CLAIMS fact_type approved_join but whose ref decodes to a plain table
+    CatalogObjectRef (no column_pairs) is not a typed join ref — raises, never returned."""
+    bad_key = "ctx-corrupt-join-fact-key"
+    append_overlay_event(
+        passc_conn, fact_key=bad_key, type="OVERLAY_FACT_PROPOSED",
+        payload={
+            "catalog_object_ref": asdict(CatalogObjectRef("src", "table", "public", "orphans")),
+            "object_ref": "public.orphans", "fact_type": "approved_join", "use_case": None,
+            "proposed_value": _join_value(_bare_ref("x1", "x2", "id")),
+            "proposal_fingerprint": "fp-ctx-corrupt", "evidence_ref": None,
+            "proposed_by": SERVICE_ACTOR.subject},
+        actor=SERVICE_ACTOR, expected_version=0)
+    with pytest.raises(JoinGovernanceNotFound):
+        load_join_confirmation_context(passc_conn, bad_key)
+
+
+# ── Task 4: synchronous verified-join projection ─────────────────────────────────────────────────
+
+# The seeded candidate's endpoints in PUBLIC graph scope (graph_node.object_ref form).
+_FROM = "public.transactions.cif_id"
+_TO = "public.customers.cif_id"
+
+
+def test_project_verified_join_creates_operational_edge(passc_conn, human_admin_1, human_admin_2):
+    """A just-VERIFIED join becomes operational SYNCHRONOUSLY — find_join_path traverses without
+    waiting for a re-upload (`_confirm_join` drains the overlay READ-MODEL projection but never
+    projects graph edges, so the edge here is created by `project_verified_join` alone)."""
+    ref, _key = _seed_join_with_evidence(passc_conn)
+    _confirm_join(passc_conn, ref, admin1=human_admin_1, admin2=human_admin_2)
+    assert find_join_path(passc_conn, "src", "transactions", "customers") is None
+
+    status = project_verified_join(passc_conn, ref.from_ref.catalog_source, ref, now=None)
+    assert status == "projected"
+    assert find_join_path(passc_conn, "src", "transactions", "customers") \
+        == [JoinStep(_FROM, _TO, "N:1")]
+
+
+def test_project_verified_join_pending_when_projection_lags(passc_conn):
+    """Lag-guarded: `resolve_fact` reads the overlay read model — projecting against a lagging
+    model could serve a stale status, so the helper defers ("pending") and writes NO edge."""
+    ref, _key = _seed_join_with_evidence(passc_conn)   # the propose appended events; NOT drained
+    assert project_verified_join(passc_conn, "src", ref, now=None) == "pending"
+    assert passc_conn.execute(
+        "SELECT count(*) FROM graph_edge WHERE kind = 'joins'").fetchone()[0] == 0
+
+
+def test_project_verified_join_is_fail_soft(
+        passc_conn, human_admin_1, human_admin_2, monkeypatch):
+    """A projector fault must NEVER raise out of the confirm response — "pending" is returned and
+    the fact stays VERIFIED (the next caught-up ingest re-projects it)."""
+    ref, key = _seed_join_with_evidence(passc_conn)
+    _confirm_join(passc_conn, ref, admin1=human_admin_1, admin2=human_admin_2)   # lag drained to 0
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("projector exploded")
+
+    monkeypatch.setattr(join_governance, "project_confirmed_joins", _boom)
+    assert project_verified_join(passc_conn, "src", ref, now=None) == "pending"
+    assert fold_overlay_state(load_fact(passc_conn, key)).status == "VERIFIED"
