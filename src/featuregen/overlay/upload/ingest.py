@@ -289,6 +289,19 @@ def _run_pass_c(conn, catalog_source: str, rows: list[CanonicalRow], *,
     snap = mint_id("psc")
     evidences = [score(pair, source_snapshot_id=snap) for pair in block_candidates(cols)]
 
+    # SNAPSHOT each already-claimed pair's governed identity BEFORE the clear: `decide_action`'s
+    # cross-cycle checks read the ledger row's PRIOR fact_key, so wiping it to NULL would make a
+    # rival direction/cardinality on the SAME unordered pair invisible — a second contradictory
+    # DRAFT instead of CONFLICT (whole-branch review, Important-1). Keyed by the ledger's PK form:
+    # the SORTED (from_ref, to_ref) pair, exactly what `unordered_pair` yields.
+    prior_claims: dict[tuple[str, str], tuple[str, str | None]] = {
+        (row[0], row[1]): (row[2], row[3])
+        for row in conn.execute(
+            "SELECT from_ref, to_ref, fact_key, proposed_event_id"
+            " FROM pass_c_candidate_evidence"
+            " WHERE catalog_source = %s AND fact_key IS NOT NULL",
+            (catalog_source,)).fetchall()}
+
     # Clear-then-write: a stale prior candidate must not linger past the cycle that stopped
     # producing it. The PROJECTOR never reads this ledger — facts survive the clear.
     conn.execute("DELETE FROM pass_c_candidate_evidence WHERE catalog_source = %s",
@@ -299,15 +312,18 @@ def _run_pass_c(conn, catalog_source: str, rows: list[CanonicalRow], *,
             counters.incr("overlay.passc.candidates.suppressed")
             continue
         lo, hi = unordered_pair(ev)
+        # A pair that existed before carries its prior fact_key/proposed_event_id forward (the
+        # pair's governing claim survives the cycle); a brand-new pair starts unclaimed (NULL).
+        prior_key, prior_event = prior_claims.get((lo, hi), (None, None))
         conn.execute(
             "INSERT INTO pass_c_candidate_evidence (catalog_source, candidate_id,"
             " candidate_fingerprint, from_ref, to_ref, fact_key, proposed_event_id, bucket,"
             " namespace_compatibility, lifecycle, evidence_json, source_snapshot_id,"
             " config_version, candidate_algorithm_version)"
-            " VALUES (%s, %s, %s, %s, %s, NULL, NULL, %s, %s, 'weak', %s, %s, %s, %s)",
-            (catalog_source, ev.candidate_id, candidate_fingerprint(ev), lo, hi, ev.bucket,
-             ev.namespace_compatibility.value, json.dumps(asdict(ev)), ev.source_snapshot_id,
-             ev.config_version, ev.candidate_algorithm_version))
+            " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'weak', %s, %s, %s, %s)",
+            (catalog_source, ev.candidate_id, candidate_fingerprint(ev), lo, hi, prior_key,
+             prior_event, ev.bucket, ev.namespace_compatibility.value, json.dumps(asdict(ev)),
+             ev.source_snapshot_id, ev.config_version, ev.candidate_algorithm_version))
         counters.incr(f"overlay.passc.candidates.{ev.bucket}")
         if ev.bucket == "strong":
             strong.append(ev)
