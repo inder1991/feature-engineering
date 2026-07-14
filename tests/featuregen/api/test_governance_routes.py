@@ -5,6 +5,13 @@ open-proposal queue), `POST /governance/joins/{fact_key}/confirm` and `.../rejec
 the REAL overlay `confirm_fact`/`reject_fact` commands). All three are gated by
 `require_confirmer` (raw `platform-admin` role claim).
 
+Pass B confirm surface (Task 2) adds the table-fact siblings on the SAME router:
+`GET /sources/{source}/governance/table-facts` + `POST /governance/table-facts/{fact_key}/confirm`
+and `.../reject` — SINGLE-confirmer (one platform-admin -> VERIFIED directly; four-eyes holds
+because the proposer is the service enrichment actor), with the synchronous drain-then-project
+`project_verified_table_fact` reporting `operational_projection` honestly ("projected" only when
+the graph_node flag actually landed; a stale drift watermark's correct refusal is "pending").
+
 THE HAPPY PATH RUNS UNDER A SEALED OVERLAY CONFIG (`register_overlay_config`) — the deployed
 posture (api/app.py seals one at startup), which arms the SP-1.5 referent gate at the dual-join
 SECOND confirm. That gate validates the join's endpoints against `graph_node` under the sentinel
@@ -20,6 +27,8 @@ only once the client exists), so the seeding fixture registers them itself.
 """
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
+
 import pytest
 from tests.featuregen.overlay.upload.passc.conftest import SERVICE_ACTOR
 from tests.featuregen.overlay.upload.passc.test_sealed_join_confirm_referents import (
@@ -29,10 +38,16 @@ from tests.featuregen.overlay.upload.test_join_governance import (
     _seed_grain_fact,
     _seed_join_with_evidence,
 )
+from tests.featuregen.overlay.upload.test_table_fact_governance import (
+    _seed_grain,
+)
+from tests.featuregen.overlay.upload.test_table_fact_governance import (
+    _seed_graph_nodes as _seed_table_graph_nodes,
+)
 
 from featuregen.events.registry import event_registry
 from featuregen.overlay.catalog import _clear_catalog_adapter
-from featuregen.overlay.catalog_changes import detect_catalog_changes
+from featuregen.overlay.catalog_changes import _write_watermark, detect_catalog_changes
 from featuregen.overlay.config import (
     _clear_overlay_config,
     overlay_config_from_env,
@@ -277,4 +292,180 @@ def test_unknown_fact_key_404(client):
     assert r.status_code == 404
     r = client.post("/governance/joins/no-such-fact-key/reject",
                     json={"category": "wrong_direction"}, headers=_h("priya"))
+    assert r.status_code == 404
+
+
+# ═════════════════════════════ Table-fact routes (Pass B confirm surface, Task 2) ════════════════
+
+
+@pytest.fixture
+def seeded_grain(overlay_env):
+    """One open grain proposal (table 't', columns ['cif_id'], source 'src') seeded through the
+    REAL Pass B propose path (`propose_fact` from the service enrichment actor — opens the
+    platform-admin gate task)."""
+    ref, key = _seed_grain(overlay_env)
+    return ref, key
+
+
+def _grain_flags(conn, source="src", table="t"):
+    return {c: (g, e) for c, g, e in conn.execute(
+        "SELECT column_name, is_grain, grain_fact_event_id FROM graph_node "
+        "WHERE catalog_source = %s AND table_name = %s AND kind = 'column'",
+        (source, table)).fetchall()}
+
+
+# ── (1) GET lists the open table-fact proposal ───────────────────────────────────────────────────
+
+
+def test_table_fact_get_lists_open_grain_proposal(client, seeded_grain):
+    _ref, key = seeded_grain
+    r = client.get("/sources/src/governance/table-facts", headers=_h("priya"))
+    assert r.status_code == 200
+    body = r.json()
+    assert body["source"] == "src"
+    assert body["next_cursor"] is None
+    (p,) = body["proposals"]
+    assert p["fact_key"] == key
+    assert p["status"] == "PROPOSED"
+    assert p["fact_type"] == "grain"
+    assert p["proposed_value"] == {"columns": ["cif_id"], "is_unique": True}
+    assert p["origin"] == "llm_proposed_not_profiled"
+
+
+def test_table_fact_get_excludes_other_sources(client, seeded_grain):
+    r = client.get("/sources/some-other-source/governance/table-facts", headers=_h("priya"))
+    assert r.status_code == 200
+    assert r.json()["proposals"] == []
+
+
+# ── (2) SINGLE-admin happy path — sealed config + graph_node rows + FRESH watermark ─────────────
+
+
+def test_table_fact_single_admin_confirm_verifies_and_projects(
+        client, sealed_config, seeded_grain, conn):
+    _ref, key = seeded_grain
+    _seed_table_graph_nodes(conn)   # column nodes for table 't' — the projection's target rows
+    # Sealed config arms resolve_fact's read-time drift-freshness guard: a FRESH watermark
+    # (within the default 60m SLA) lets the synchronous post-VERIFIED projection actually land.
+    _write_watermark(conn, "src", datetime.now(UTC))
+
+    r = client.post(f"/governance/table-facts/{key}/confirm", json={"note": "grain looks right"},
+                    headers=_h("priya"))
+    assert r.status_code == 200, r.text
+    body = r.json()
+    # ONE platform-admin confirm -> VERIFIED directly (single-confirmer path: proposer is the
+    # service actor, so four-eyes holds) — no PARTIALLY_CONFIRMED, no approvals array.
+    assert body["governance_status"] == "VERIFIED"
+    assert body["operational_projection"] == "projected"
+    assert "approvals" not in body
+    assert fold_overlay_state(load_fact(conn, key)).status == "VERIFIED"
+    # the grain flag landed on graph_node IN THIS REQUEST, with fact-event provenance
+    flags = _grain_flags(conn)
+    assert flags["cif_id"][0] is True and flags["cif_id"][1] is not None
+    assert flags["amt"][0] is False
+    # a verified fact leaves the open queue
+    r = client.get("/sources/src/governance/table-facts", headers=_h("priya"))
+    assert r.json()["proposals"] == []
+
+
+# ── (3) stale watermark: VERIFIED but the projection honestly defers ─────────────────────────────
+
+
+def test_table_fact_confirm_stale_watermark_verified_but_pending(
+        client, sealed_config, seeded_grain, conn):
+    _ref, key = seeded_grain
+    _seed_table_graph_nodes(conn)
+    _write_watermark(conn, "src", datetime.now(UTC) - timedelta(hours=2))  # stale vs the 60m SLA
+
+    r = client.post(f"/governance/table-facts/{key}/confirm", json={}, headers=_h("priya"))
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["governance_status"] == "VERIFIED"
+    assert body["operational_projection"] == "pending"
+    assert fold_overlay_state(load_fact(conn, key)).status == "VERIFIED"
+    # resolve_fact correctly refused to serve under a stale watermark — NO flag landed
+    assert not any(g for g, _e in _grain_flags(conn).values())
+
+
+# ── (4) fact_type gate: a join fact_key 404s on BOTH mutation routes, no event written ───────────
+
+
+def test_table_fact_routes_404_on_join_fact_without_writing_events(client, seeded_join, conn):
+    _ref, join_key = seeded_join
+    before = len(load_fact(conn, join_key))
+
+    r = client.post(f"/governance/table-facts/{join_key}/confirm", json={}, headers=_h("priya"))
+    assert r.status_code == 404
+    r = client.post(f"/governance/table-facts/{join_key}/reject",
+                    json={"category": "wrong_grain_columns"}, headers=_h("priya"))
+    assert r.status_code == 404
+    # the 404 fires BEFORE any command dispatch — the join stream is untouched
+    assert len(load_fact(conn, join_key)) == before
+
+
+# ── (5) reject: {category, note} -> REJECTED with category on the event payload ─────────────────
+
+
+def test_table_fact_reject_records_category(client, seeded_grain, conn):
+    _ref, key = seeded_grain
+    r = client.post(f"/governance/table-facts/{key}/reject",
+                    json={"category": "wrong_grain_columns", "note": "grain is (cif_id, dt)"},
+                    headers=_h("priya"))
+    assert r.status_code == 200, r.text
+    assert r.json() == {"governance_status": "REJECTED", "category": "wrong_grain_columns"}
+    assert fold_overlay_state(load_fact(conn, key)).status == "REJECTED"
+    # `category` is a first-class payload field; `reason` carries ONLY the free-text note
+    rejected = [e for e in load_fact(conn, key) if e.type == "OVERLAY_FACT_REJECTED"]
+    assert rejected[-1].payload["category"] == "wrong_grain_columns"
+    assert rejected[-1].payload["reason"] == "grain is (cif_id, dt)"
+    # a rejected fact is no longer an open proposal
+    r = client.get("/sources/src/governance/table-facts", headers=_h("priya"))
+    assert r.json()["proposals"] == []
+
+
+# ── (6) authz: a non-admin is 403'd on all three routes ──────────────────────────────────────────
+
+
+def test_table_fact_non_admin_403_on_all_three_routes(client):
+    viewer = _h("priya", roles="catalog_viewer")
+    assert client.get("/sources/src/governance/table-facts", headers=viewer).status_code == 403
+    assert client.post("/governance/table-facts/any-key/confirm", json={},
+                       headers=viewer).status_code == 403
+    assert client.post("/governance/table-facts/any-key/reject",
+                       json={"category": "wrong_grain_columns"},
+                       headers=viewer).status_code == 403
+
+
+# ── (7) request validation + unknown fact_key ────────────────────────────────────────────────────
+
+
+def test_table_fact_bad_category_422(client):
+    # "wrong_direction" is a valid JOIN category — the table-fact enum must not accept it
+    r = client.post("/governance/table-facts/any-key/reject",
+                    json={"category": "wrong_direction"}, headers=_h("priya"))
+    assert r.status_code == 422
+
+
+def test_table_fact_over_length_note_422(client):
+    long_note = "x" * 1001
+    r = client.post("/governance/table-facts/any-key/confirm", json={"note": long_note},
+                    headers=_h("priya"))
+    assert r.status_code == 422
+    r = client.post("/governance/table-facts/any-key/reject",
+                    json={"category": "not_unique", "note": long_note}, headers=_h("priya"))
+    assert r.status_code == 422
+
+
+def test_table_fact_list_limit_bounds_422(client):
+    assert client.get("/sources/src/governance/table-facts?limit=0",
+                      headers=_h("priya")).status_code == 422
+    assert client.get("/sources/src/governance/table-facts?limit=501",
+                      headers=_h("priya")).status_code == 422
+
+
+def test_table_fact_unknown_fact_key_404(client):
+    r = client.post("/governance/table-facts/no-such-key/confirm", json={}, headers=_h("priya"))
+    assert r.status_code == 404
+    r = client.post("/governance/table-facts/no-such-key/reject",
+                    json={"category": "needs_data_check"}, headers=_h("priya"))
     assert r.status_code == 404

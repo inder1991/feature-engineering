@@ -16,6 +16,15 @@ Each handler self-ensures the upload-context catalog adapter: an API-only proces
 adapter at startup (the worker does), and `resolve_authority` inside confirm/reject fails closed
 without one. `ensure_upload_catalog_adapter` is idempotent and never clobbers a richer adapter
 (same pattern as ingest.py).
+
+The Pass B confirm surface (table-fact Task 2) adds the SINGLE-confirmer siblings for the
+governed `grain`/`availability_time` facts Pass B proposes: `GET
+/sources/{source}/governance/table-facts` + `POST /governance/table-facts/{fact_key}/confirm`
+and `.../reject`, over the Task 1 domain functions (`table_fact_governance`). One platform-admin
+confirm reaches VERIFIED directly (four-eyes holds: the proposer is the service enrichment
+actor), then `project_verified_table_fact` makes the fact operational synchronously —
+`operational_projection` reports "projected" only when the graph_node flag actually landed;
+a stale drift watermark's correct refusal reports "pending".
 """
 from __future__ import annotations
 
@@ -37,6 +46,12 @@ from featuregen.overlay.upload.join_governance import (
     project_verified_join,
     read_join_approvals,
 )
+from featuregen.overlay.upload.table_fact_governance import (
+    TableFactGovernanceNotFound,
+    list_open_table_fact_proposals_governance,
+    load_table_fact_confirmation_context,
+    project_verified_table_fact,
+)
 from featuregen.overlay.upload.upload_catalog import ensure_upload_catalog_adapter
 
 router = APIRouter()
@@ -51,6 +66,16 @@ class ConfirmJoinRequest(BaseModel):
 class RejectJoinRequest(BaseModel):
     category: Literal["wrong_direction", "wrong_cardinality", "different_entity",
                       "not_a_real_key", "needs_data_check"]
+    note: str | None = Field(default=None, max_length=1000)
+
+
+class ConfirmTableFactRequest(BaseModel):
+    note: str | None = Field(default=None, max_length=1000)
+
+
+class RejectTableFactRequest(BaseModel):
+    category: Literal["wrong_grain_columns", "wrong_as_of_column", "not_unique",
+                      "needs_data_check"]
     note: str | None = Field(default=None, max_length=1000)
 
 
@@ -122,6 +147,77 @@ def reject_join(fact_key: str, body: RejectJoinRequest, conn: _Conn,
     cmd = Command(
         action="reject_fact", aggregate="overlay_fact", aggregate_id=fact_key,
         args={"ref": ctx["ref"], "fact_type": "approved_join", "use_case": ctx["use_case"],
+              "target_event_id": ctx["target_event_id"], "reason": _clean(body.note),
+              "category": body.category},
+        actor=identity, idempotency_key=f"reject:{fact_key}:{identity.subject}",
+        expected_version=None)
+    result = reject_fact(conn, cmd)
+    if not result.accepted:
+        raise HTTPException(status_code=409, detail=_deny_to_detail(result.denied_reason))
+    return {"governance_status": "REJECTED", "category": body.category}
+
+
+# ── Table-fact routes (Pass B confirm surface, Task 2) ───────────────────────────────────────────
+
+
+def _load_table_fact_context_or_404(conn: psycopg.Connection, fact_key: str) -> dict:
+    """The fact_type-VALIDATED context bridge: a fact_key that is not a loadable
+    grain/availability_time proposal 404s BEFORE any command dispatch, so this surface can never
+    be used to approve a join/policy fact."""
+    ensure_upload_catalog_adapter()
+    try:
+        return load_table_fact_confirmation_context(conn, fact_key)
+    except TableFactGovernanceNotFound:
+        raise HTTPException(status_code=404, detail="No such table-fact proposal.") from None
+
+
+@router.get("/sources/{source}/governance/table-facts",
+            dependencies=[Depends(require_confirmer)])
+def list_table_facts(source: str, conn: _Conn,
+                     limit: int = Query(default=100, ge=1, le=500)) -> dict:
+    ensure_upload_catalog_adapter()
+    proposals = list_open_table_fact_proposals_governance(conn, source, limit=limit)
+    return {"source": source.strip().lower(), "proposals": proposals, "next_cursor": None}
+
+
+@router.post("/governance/table-facts/{fact_key}/confirm",
+             dependencies=[Depends(require_confirmer)])
+def confirm_table_fact(fact_key: str, body: ConfirmTableFactRequest, conn: _Conn,
+                       identity: _Identity) -> dict:
+    """SINGLE-confirmer: one platform-admin confirm reaches VERIFIED directly (grain/availability
+    is a data fact on one table — no dual-owner split; four-eyes holds because the proposer is
+    the service enrichment actor, never the confirmer). No approvals array in the response."""
+    ctx = _load_table_fact_context_or_404(conn, fact_key)
+    cmd = Command(
+        action="confirm_fact", aggregate="overlay_fact", aggregate_id=fact_key,
+        args={"ref": ctx["ref"], "fact_type": ctx["fact_type"], "use_case": ctx["use_case"],
+              "target_event_id": ctx["target_event_id"], "note": _clean(body.note)},
+        actor=identity, idempotency_key=f"confirm:{fact_key}:{identity.subject}",
+        expected_version=None)
+    result = confirm_fact(conn, cmd)
+    if not result.accepted:
+        raise HTTPException(status_code=409, detail=_deny_to_detail(result.denied_reason))
+    status = fold_overlay_state(load_fact(conn, fact_key)).status
+    projection = "not_applicable"
+    if status == "VERIFIED":
+        # The confirm just VERIFIED the fact — make it operational NOW (drain-then-project,
+        # fail-soft; "pending" defers to the next caught-up ingest re-projection, e.g. when the
+        # drift watermark is stale and resolve_fact correctly refuses to serve).
+        projection = project_verified_table_fact(
+            conn, ctx["ref"].catalog_source, ctx["ref"], ctx["fact_type"], now=None)
+    return {"governance_status": status, "operational_projection": projection}
+
+
+@router.post("/governance/table-facts/{fact_key}/reject",
+             dependencies=[Depends(require_confirmer)])
+def reject_table_fact(fact_key: str, body: RejectTableFactRequest, conn: _Conn,
+                      identity: _Identity) -> dict:
+    ctx = _load_table_fact_context_or_404(conn, fact_key)
+    # `category` is a first-class field on OVERLAY_FACT_REJECTED (a reliable analytics key);
+    # `reason` carries ONLY the free-text note (or None) — same shape as the join reject.
+    cmd = Command(
+        action="reject_fact", aggregate="overlay_fact", aggregate_id=fact_key,
+        args={"ref": ctx["ref"], "fact_type": ctx["fact_type"], "use_case": ctx["use_case"],
               "target_event_id": ctx["target_event_id"], "reason": _clean(body.note),
               "category": body.category},
         actor=identity, idempotency_key=f"reject:{fact_key}:{identity.subject}",
