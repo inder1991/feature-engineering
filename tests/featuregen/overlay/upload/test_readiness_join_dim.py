@@ -187,6 +187,73 @@ def test_weak_join_is_review_not_blocking(passc_conn):
     assert jr.cause == CAUSE_PROPOSED_UNCONFIRMED
 
 
+# ── PERF (whole-branch review): the relationship fold must run ONCE per compute_readiness ────────
+#
+# compute_relationship_readiness folds SOURCE-WIDE candidate stores (three full scans of
+# overlay_proposal + pass_c_candidate_evidence, plus one load_fact round-trip per approved_join
+# fact) regardless of its subset — the subset only narrows the RESULT. Calling it once per table
+# from the requirement loop therefore did O(T x F) DB work for a T-table catalog with F facts.
+# The fix hoists it: ONE call per compute_readiness, indexed by (schema, table). The spy wraps
+# the module global both the pre-fix helper and the post-fix hoist resolve at call time.
+
+
+def _spy_relationship_fold(monkeypatch):
+    """Wrap readiness.compute_relationship_readiness with a call counter (delegating to the
+    real implementation, so results — and thus behavior assertions — are untouched)."""
+    import featuregen.overlay.upload.readiness as readiness_mod
+
+    calls: list[tuple] = []
+    real = readiness_mod.compute_relationship_readiness
+
+    def counting(*args, **kwargs):
+        calls.append((args, kwargs))
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(readiness_mod, "compute_relationship_readiness", counting)
+    return calls
+
+
+def test_catalog_readiness_folds_relationships_once(passc_conn, service_actor, monkeypatch):
+    """A CATALOG compute_readiness over MULTIPLE tables must call the source-wide relationship
+    fold exactly ONCE — not once per table (pre-fix: len(calls) == number of tables)."""
+    for table in ("orphans", "transactions", "customers"):
+        _seed_table(passc_conn, table, "cif_id")
+    _propose_join(passc_conn, _bare_ref("transactions", "customers", "cif_id"),
+                  actor=service_actor)
+    _drain(passc_conn)
+
+    calls = _spy_relationship_fold(monkeypatch)
+    fr = compute_readiness(passc_conn, source="src", scope=ReadinessScopeType.CATALOG,
+                           subset=None)
+    assert len(calls) == 1, f"expected ONE source-wide relationship fold, got {len(calls)}"
+
+    # Behavior is byte-identical to the per-table calls: the DRAFT join is a review ask on BOTH
+    # endpoint tables; the orphan (NO_CANDIDATES) is satisfied; nothing join-blocks.
+    assert _join_blocking(fr) == []
+    assert sorted(r.requirement_id for r in _join_review(fr)) == [
+        "join:src.public.customers",
+        "join:src.public.transactions",
+    ]
+
+
+def test_table_subset_readiness_folds_relationships_once(passc_conn, service_actor, monkeypatch):
+    """A TABLE-subset compute_readiness threads its OWN subset into the single fold — one call,
+    scoped to the one table, same status as before the hoist."""
+    _seed_table(passc_conn, "transactions", "cif_id")
+    _seed_table(passc_conn, "customers", "cif_id")
+    _propose_join(passc_conn, _bare_ref("transactions", "customers", "cif_id"),
+                  actor=service_actor)
+    _drain(passc_conn)
+
+    calls = _spy_relationship_fold(monkeypatch)
+    fr = _readiness(passc_conn, "transactions")
+    assert len(calls) == 1
+    assert calls[0][1].get("subset") == "transactions"  # compute_readiness's own subset, threaded
+    (jr,) = _join_review(fr)
+    assert jr.status == "proposed"
+    assert jr.cause == CAUSE_PROPOSED_UNCONFIRMED
+
+
 def test_conflicting_join_blocks(passc_conn, service_actor):
     """The ONE join state that blocks: two active fact_keys claiming the SAME unordered column
     pair (N:1 vs 1:1 hash to different keys) -> status "conflicting", cause ingestion_error."""

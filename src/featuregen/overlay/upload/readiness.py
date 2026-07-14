@@ -131,17 +131,18 @@ def _table_fact_status(conn, source, table, requirement) -> tuple[str, str]:
     return "proposed", CAUSE_PROPOSED_UNCONFIRMED
 
 
-def _join_requirement_status(conn, source, schema, table) -> tuple[str, str]:
+def _join_requirement_status(status: RelationshipStatus) -> tuple[str, str]:
     """The "join" requirement's (readiness_status, cause), wired to REAL approved_join state
     (Phase 3A follow-up — pre-fix this was a static ("missing", not_promoted) on EVERY table).
 
-    Delegates to :func:`compute_relationship_readiness` — the ONE source of truth folding the
-    table's approved_join facts + weak ledger rows into a :class:`RelationshipStatus` — and
-    coarsens its five-value verdict into the 4-value requirement vocabulary. Only a real
-    CONFLICTING relationship blocks; every other state is satisfied or a review ask, so a table
-    is never falsely "blocked on joins"."""
-    rows = compute_relationship_readiness(conn, source=source, subset=f"{schema}.{table}")
-    status = rows[0].status if rows else RelationshipStatus.NO_CANDIDATES
+    ``status`` is the table's :class:`RelationshipStatus` verdict, PRE-COMPUTED by the caller —
+    :func:`compute_readiness` runs :func:`compute_relationship_readiness` (the ONE source of
+    truth folding approved_join facts + weak ledger rows) ONCE for its whole scope and indexes
+    the results by table, because that fold scans the SOURCE-WIDE candidate stores regardless
+    of subset (calling it per table was O(tables x facts) DB work; whole-branch review). This
+    helper only coarsens the five-value verdict into the 4-value requirement vocabulary. Only a
+    real CONFLICTING relationship blocks; every other state is satisfied or a review ask, so a
+    table is never falsely "blocked on joins"."""
     if status is RelationshipStatus.CONFLICTING:
         # Two active fact_keys claiming one column pair — a genuine failure a human reconciles.
         return "conflicting", CAUSE_INGESTION_ERROR
@@ -397,10 +398,28 @@ def compute_readiness(
     #    below routes it into review_requirements). Phase 3A follow-up: `join` reads the table's
     #    LIVE relationship state (_join_requirement_status) — "conflicting" is its one blocking
     #    status; grain/availability never yield "conflicting", so their gate is unchanged.
-    for schema, table in _tables_of(refs):
+    #
+    #    PERF (whole-branch review): the relationship fold is hoisted OUT of the table loop.
+    #    compute_relationship_readiness scans the SOURCE-WIDE candidate stores and folds every
+    #    approved_join fact's event log no matter how narrow its subset (the subset only trims
+    #    the RESULT), so calling it once per table did O(tables x facts) DB round-trips. One
+    #    call with THIS scope's own `subset` (None -> whole source; a TABLE selector / ref list
+    #    -> just those tables) computes the identical per-table verdicts once; the loop then
+    #    reads the (schema, table) index. A table absent from the index has no relationship
+    #    rows at all -> NO_CANDIDATES, exactly the pre-hoist empty-result handling.
+    tables = _tables_of(refs)
+    rel_by_table: dict[tuple[str, str], RelationshipStatus] = {}
+    if tables:
+        rel_by_table = {
+            (r.schema, r.table): r.status
+            for r in compute_relationship_readiness(conn, source=source, subset=subset)
+        }
+    for schema, table in tables:
         for fact_name, authority in _PHASE1_UNPROMOTED:
             if fact_name == "join":
-                fact_status, fact_cause = _join_requirement_status(conn, source, schema, table)
+                fact_status, fact_cause = _join_requirement_status(
+                    rel_by_table.get((schema, table), RelationshipStatus.NO_CANDIDATES)
+                )
             else:
                 fact_status, fact_cause = _table_fact_status(conn, source, table, fact_name)
             all_reqs.append(
