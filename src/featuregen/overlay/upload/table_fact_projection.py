@@ -113,7 +113,9 @@ _TABLE_FACT_TYPES = ("grain", "availability_time")
 # The governance worklist reads platform-admin governance-queue tasks (grain/availability route
 # there because UploadContextAdapter.owner_of -> None). get_task_proposal authorizes on role_claims,
 # so the reader MUST hold platform-admin or every read is denied. Subject-less system reader —
-# consumed by table_fact_governance.list_open_table_fact_proposals_governance.
+# consumed by table_fact_governance.list_open_table_fact_proposals_governance. authenticated=False:
+# get_task_proposal authorizes on role_claims (never .authenticated), and a fabricated authenticated
+# identity is forbidden outside the sanctioned trust roots (mirrors enrich_llm._ENRICH_ACTOR).
 _WORKLIST_READER = IdentityEnvelope(
-    subject="system:table-fact-worklist", actor_kind="service", authenticated=True,
+    subject="system:table-fact-worklist", actor_kind="service", authenticated=False,
     auth_method="internal", role_claims=("platform-admin",))
