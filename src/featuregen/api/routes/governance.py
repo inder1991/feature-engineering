@@ -28,13 +28,15 @@ a stale drift watermark's correct refusal reports "pending".
 """
 from __future__ import annotations
 
+import logging
 from typing import Annotated, Literal
 
 import psycopg
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
-from featuregen.api.deps import get_conn, get_identity, require_confirmer
+from featuregen.api.deps import _auth_stub_enabled, get_conn, get_identity, require_confirmer
+from featuregen.config import get_settings
 from featuregen.contracts.envelopes import Command, IdentityEnvelope
 from featuregen.overlay.confirmation_commands import confirm_fact, reject_fact
 from featuregen.overlay.state import fold_overlay_state
@@ -53,6 +55,9 @@ from featuregen.overlay.upload.table_fact_governance import (
     project_verified_table_fact,
 )
 from featuregen.overlay.upload.upload_catalog import ensure_upload_catalog_adapter
+from featuregen.security.audit import record_security_event
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 _Conn = Annotated[psycopg.Connection, Depends(get_conn, scope="function")]
@@ -83,6 +88,30 @@ def _clean(s: str | None) -> str | None:
     """Strip; an empty/whitespace-only note becomes None (absent, not '')."""
     s = (s or "").strip()
     return s or None
+
+
+def _audit_governance_denial(identity: IdentityEnvelope, action: str,
+                             reason: str | None) -> None:
+    """Durably record a governance denial (same-subject re-confirm, four-eyes, not-owner, stale
+    CAS...). The overlay already wrote a COMMAND_DENIED row via `_deny_audited` — but on the
+    REQUEST connection, and the 409 the route raises next makes `get_conn` roll that back, so a
+    denied SoD-bypass probe would leave ZERO durable trace. Mirror `deps.audit_access_denied`
+    (the 403 path): write on a SEPARATE committing connection that survives the request rollback.
+    Best-effort — an audit failure must never turn a correct 409 into a 500 — and skipped under
+    the dev auth stub (a production control; a separate committing connection would pollute the
+    rolled-back test DB)."""
+    if _auth_stub_enabled():
+        return
+    dsn = get_settings().dsn
+    if not dsn:
+        return
+    try:
+        with psycopg.connect(dsn) as conn:   # own tx, committed on exit — survives the 409 rollback
+            record_security_event(conn, event_type="COMMAND_DENIED", actor=identity,
+                                  attempted_action=action, decision="denied", reason=reason,
+                                  aggregate="overlay_fact")
+    except Exception:  # noqa: BLE001 — never let an audit failure mask the (correct) denial
+        logger.warning("failed to durably record governance denial for %s", action, exc_info=True)
 
 
 def _deny_to_detail(reason: str | None) -> str:
@@ -126,6 +155,10 @@ def confirm_join(fact_key: str, body: ConfirmJoinRequest, conn: _Conn,
         expected_version=None)
     result = confirm_fact(conn, cmd)
     if not result.accepted:
+        # Durable BEFORE the 409: the overlay's own denial audit rides the request tx, which
+        # the 409 rolls back (get_conn) — re-record on a separate committing connection.
+        _audit_governance_denial(identity, f"confirm_fact approved_join {fact_key}",
+                                 result.denied_reason)
         raise HTTPException(status_code=409, detail=_deny_to_detail(result.denied_reason))
     status = fold_overlay_state(load_fact(conn, fact_key)).status
     projection = "not_applicable"
@@ -153,6 +186,9 @@ def reject_join(fact_key: str, body: RejectJoinRequest, conn: _Conn,
         expected_version=None)
     result = reject_fact(conn, cmd)
     if not result.accepted:
+        # Durable BEFORE the 409 — see _audit_governance_denial (the request tx rolls back).
+        _audit_governance_denial(identity, f"reject_fact approved_join {fact_key}",
+                                 result.denied_reason)
         raise HTTPException(status_code=409, detail=_deny_to_detail(result.denied_reason))
     return {"governance_status": "REJECTED", "category": body.category}
 
@@ -196,6 +232,9 @@ def confirm_table_fact(fact_key: str, body: ConfirmTableFactRequest, conn: _Conn
         expected_version=None)
     result = confirm_fact(conn, cmd)
     if not result.accepted:
+        # Durable BEFORE the 409 — see _audit_governance_denial (the request tx rolls back).
+        _audit_governance_denial(identity, f"confirm_fact {ctx['fact_type']} {fact_key}",
+                                 result.denied_reason)
         raise HTTPException(status_code=409, detail=_deny_to_detail(result.denied_reason))
     status = fold_overlay_state(load_fact(conn, fact_key)).status
     projection = "not_applicable"
@@ -224,5 +263,8 @@ def reject_table_fact(fact_key: str, body: RejectTableFactRequest, conn: _Conn,
         expected_version=None)
     result = reject_fact(conn, cmd)
     if not result.accepted:
+        # Durable BEFORE the 409 — see _audit_governance_denial (the request tx rolls back).
+        _audit_governance_denial(identity, f"reject_fact {ctx['fact_type']} {fact_key}",
+                                 result.denied_reason)
         raise HTTPException(status_code=409, detail=_deny_to_detail(result.denied_reason))
     return {"governance_status": "REJECTED", "category": body.category}
