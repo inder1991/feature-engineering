@@ -42,6 +42,14 @@ class OverlayProjection:
         payload = event.payload
 
         if event.type == facts.OVERLAY_FACT_PROPOSED:
+            # 3B.2B: an entity_bridge fact is two-source; the single-catalog_source overlay read models
+            # (overlay_proposal/_state/_dependency) don't model it and _catalog_source would KeyError on
+            # its {entity_id,left_ref,right_ref} ref. The bridge lifecycle uses a direct fold
+            # (bridge_projection), not this projection; later bridge events (CONFIRMED/EXPIRED/…) are
+            # inherently no-ops here (no proposal/state row is ever created). Bridge drift/expire/stale
+            # integration is deferred to 3B.3.
+            if payload.get("fact_type") == "entity_bridge":
+                return
             conn.execute(
                 """
                 INSERT INTO overlay_proposal

@@ -29,10 +29,24 @@ class ApprovedJoinRef:
     cardinality: str
 
 
+@dataclass(frozen=True, slots=True)
+class EntityBridgeRef:
+    """A cross-catalog entity bridge: the SAME entity_id via an identifier column in two DISTINCT
+    catalogs. Bridge identity is UNORDERED — (left, right) and (right, left) denote the same bridge, so
+    fact_key canonicalizes the endpoints."""
+    entity_id: str
+    left_ref: CatalogObjectRef
+    right_ref: CatalogObjectRef
+
+
 def _ref_from_payload(d):
     """Rebuild the typed ref stored on OVERLAY_FACT_PROPOSED.payload['catalog_object_ref']
     (an asdict() of CatalogObjectRef, or of ApprovedJoinRef for approved_join). Shared decoder
     used by both freshness pollers (fire_due_overlay_expiries / detect_catalog_changes)."""
+    if "entity_id" in d and "left_ref" in d and "right_ref" in d:
+        return EntityBridgeRef(entity_id=d["entity_id"],
+                               left_ref=CatalogObjectRef(**d["left_ref"]),
+                               right_ref=CatalogObjectRef(**d["right_ref"]))
     if "column_pairs" in d:
         return ApprovedJoinRef(
             from_ref=CatalogObjectRef(**d["from_ref"]),
@@ -63,11 +77,19 @@ def _digest(canonical: object) -> str:
 
 
 def fact_key(
-    ref: CatalogObjectRef | ApprovedJoinRef, fact_type: str, use_case: str | None = None
+    ref: CatalogObjectRef | ApprovedJoinRef | EntityBridgeRef,
+    fact_type: str,
+    use_case: str | None = None,
 ) -> str:
     """Stable sha256 hex over the normalized identity tuple (§3.1). For an ApprovedJoinRef the
     column pairs are sorted AS UNITS (never the two column lists independently) so distinct joins
     can never alias."""
+    if isinstance(ref, EntityBridgeRef):
+        endpoints = sorted([_ref_tuple(ref.left_ref), _ref_tuple(ref.right_ref)])
+        bridge_canonical = {"kind": "bridge", "entity_id": _norm(ref.entity_id),
+                            "endpoints": endpoints, "fact_type": _norm(fact_type),
+                            "use_case": _norm(use_case)}
+        return _digest(bridge_canonical)
     if isinstance(ref, ApprovedJoinRef):
         pairs = sorted([_norm(p.from_col), _norm(p.to_col)] for p in ref.column_pairs)
         canonical = {
@@ -89,14 +111,32 @@ def fact_key(
     return _digest(canonical)
 
 
-def display_object_ref(ref: CatalogObjectRef | ApprovedJoinRef) -> str:
+def display_object_ref(ref: CatalogObjectRef | ApprovedJoinRef | EntityBridgeRef) -> str:
     """Human-readable dotted reference carried alongside the hashed key for display/audit (§3.1)."""
+    if isinstance(ref, EntityBridgeRef):
+        # unordered bridge — '<->' (a join's '->' is directional)
+        return (f"{ref.entity_id}: {display_object_ref(ref.left_ref)}"
+                f" <-> {display_object_ref(ref.right_ref)}")
     if isinstance(ref, ApprovedJoinRef):
         return f"{display_object_ref(ref.from_ref)} -> {display_object_ref(ref.to_ref)}"
     parts = [ref.schema, ref.table]
     if ref.column:
         parts.append(ref.column)
     return ".".join(parts)
+
+
+def _bridge_write_error(ref, value) -> str | None:
+    if not isinstance(ref, EntityBridgeRef):
+        return "entity_bridge requires an EntityBridgeRef"
+    if _norm(ref.left_ref.catalog_source) == _norm(ref.right_ref.catalog_source):
+        return ("entity_bridge requires two distinct catalog sources "
+                f"(left={ref.left_ref.catalog_source}, right={ref.right_ref.catalog_source})")
+    value_ref = _ref_from_payload(value)
+    if not isinstance(value_ref, EntityBridgeRef):
+        return "entity_bridge proposed_value is not a bridge ref"
+    if fact_key(value_ref, "entity_bridge") != fact_key(ref, "entity_bridge"):
+        return "entity_bridge proposed_value does not match ref"
+    return None
 
 
 def join_write_error(ref, fact_type: str, value: Mapping, use_case: str | None = None) -> str | None:
@@ -107,6 +147,8 @@ def join_write_error(ref, fact_type: str, value: Mapping, use_case: str | None =
       * ref/value consistency — authority + fact_key derive from `ref` while the stored value is what
         consumers read; reject if the proposed_value describes a DIFFERENT join than `ref` (else the
         wrong owners could attest a join whose value points at other tables)."""
+    if fact_type == "entity_bridge":
+        return _bridge_write_error(ref, value)
     if fact_type != "approved_join":
         return None
     if not isinstance(ref, ApprovedJoinRef):

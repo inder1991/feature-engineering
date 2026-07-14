@@ -16,9 +16,10 @@ AVAILABILITY_TIME = "availability_time"
 GRAIN = "grain"
 SCD_EFFECTIVE_DATING = "scd_effective_dating"
 APPROVED_JOIN = "approved_join"
+ENTITY_BRIDGE = "entity_bridge"
 POLICY_TAG = "policy_tag"
 
-DATA_FACT_TYPES = frozenset({AVAILABILITY_TIME, GRAIN, SCD_EFFECTIVE_DATING, APPROVED_JOIN})
+DATA_FACT_TYPES = frozenset({AVAILABILITY_TIME, GRAIN, SCD_EFFECTIVE_DATING, APPROVED_JOIN, ENTITY_BRIDGE})
 POLICY_FACT_TYPES = frozenset({POLICY_TAG})
 
 _CATALOG_OBJECT_REF_SCHEMA = {
@@ -101,6 +102,18 @@ FACT_VALUE_SCHEMAS: dict[str, dict] = {
                 },
             },
             "cardinality": {"type": "string", "enum": ["1:1", "1:N", "N:1"]},
+        },
+        "additionalProperties": False,
+    },
+    ENTITY_BRIDGE: {
+        # A cross-catalog identity bridge: the SAME entity via an identifier column in two DISTINCT
+        # catalogs. Symmetric in (left_ref, right_ref); cross-catalog is enforced in the write gate.
+        "type": "object",
+        "required": ["entity_id", "left_ref", "right_ref"],
+        "properties": {
+            "entity_id": {"type": "string"},
+            "left_ref": _CATALOG_OBJECT_REF_SCHEMA,
+            "right_ref": _CATALOG_OBJECT_REF_SCHEMA,
         },
         "additionalProperties": False,
     },
