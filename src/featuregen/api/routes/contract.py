@@ -7,6 +7,7 @@ threaded — omitting them would silently downgrade safety (review root-cause A)
 """
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -54,6 +55,7 @@ from featuregen.overlay.upload.contract.scope_records import (
     record_confirmed_scope,
     record_recognition_attempt,
 )
+from featuregen.overlay.upload.planner.shadow import run_shadow_planner
 from featuregen.overlay.upload.taxonomy.applicability import (
     ConfirmedScope,
     ScopeExpansion,
@@ -88,6 +90,8 @@ from featuregen.overlay.upload.taxonomy.recognition import (
 from featuregen.overlay.upload.taxonomy.recognizer import recognize
 from featuregen.overlay.upload.taxonomy.use_cases import selectable_leaves, use_case
 from featuregen.overlay.upload.templates import ALL_TEMPLATES
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -400,6 +404,15 @@ def _scoped_considered_set(body: ConsideredSetIn, conn: _Conn, identity: _Identi
         # Task B3: the SOFT dimension warnings (grain mismatch / context conflict) surfaced per recipe.
         # This NEVER changes dispositions — a warned recipe stays exactly as eligible as it was.
         response["signal_warnings"] = _signal_warnings(signals)
+    # 3B.3a shadow: on an entity-scoped run (no single catalog to ground on) compute + LOG single-catalog
+    # binding plans for the eligible recipes. Log-only — the response is UNCHANGED.
+    if body.catalog_source is None and scope.target_entity is not None:
+        try:
+            run_shadow_planner(conn, eligible_recipe_ids=applicability.eligible_ids,
+                               target_entity=scope.target_entity, roles=identity.role_claims,
+                               run_id=generation_run_id, now=now)
+        except Exception:                    # shadow must NEVER affect the live response
+            logger.exception("shadow planner dispatch failed")
     return response
 
 
