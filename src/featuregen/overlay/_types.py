@@ -46,6 +46,7 @@ FactType = Literal[
     "availability_time",
     "scd_effective_dating",
     "approved_join",
+    "entity_bridge",
     "policy_tag",
 ]
 
