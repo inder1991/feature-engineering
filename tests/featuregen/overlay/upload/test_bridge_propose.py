@@ -42,3 +42,14 @@ def test_propose_opens_one_governance_gate_task(db):
     # single-confirmer -> exactly one open human task (platform-admin governance), not two
     n = db.execute("SELECT count(*) FROM human_tasks WHERE status = 'open'").fetchone()[0]
     assert n == 1
+
+
+def test_reproposing_same_candidate_is_idempotent(db):
+    key1 = _propose(db)
+    # a second propose of the SAME candidate must NOT raise, must return the same fact_key,
+    # and must not open a second gate task or a second ledger row.
+    cand = derive_bridge_candidates(db)[0]
+    key2 = propose_bridge(db, cand, actor=_ENRICH_ACTOR, now=_T0)
+    assert key2 == key1
+    assert db.execute("SELECT count(*) FROM human_tasks WHERE status = 'open'").fetchone()[0] == 1
+    assert db.execute("SELECT count(*) FROM entity_bridge_candidate_evidence").fetchone()[0] == 1

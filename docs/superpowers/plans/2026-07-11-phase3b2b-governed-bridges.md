@@ -563,7 +563,7 @@ def test_propose_stamps_the_candidate_ledger(db):
 def test_propose_opens_one_governance_gate_task(db):
     _propose(db)
     # single-confirmer -> exactly one open human task (platform-admin governance), not two
-    n = db.execute("SELECT count(*) FROM human_tasks WHERE status = 'OPEN'").fetchone()[0]
+    n = db.execute("SELECT count(*) FROM human_tasks WHERE status = 'open'").fetchone()[0]
     assert n == 1
 ```
 
@@ -619,7 +619,7 @@ def propose_bridge(conn, candidate: BridgeCandidateV1, *, actor, now=None) -> st
         actor, proposal_fingerprint(value)))
     if not res.accepted:
         raise RuntimeError(f"bridge proposal denied: {res.denied_reason}")
-    proposed_event_id = res.event_id if hasattr(res, "event_id") else None
+    proposed_event_id = res.produced_event_ids[0] if res.produced_event_ids else None
     conn.execute(
         "INSERT INTO entity_bridge_candidate_evidence ("
         "  entity_id, left_catalog_source, left_object_ref, right_catalog_source, right_object_ref,"
@@ -636,7 +636,7 @@ def propose_bridge(conn, candidate: BridgeCandidateV1, *, actor, now=None) -> st
     return key
 ```
 
-> **Implementer note:** `res.event_id` — confirm the field name on `CommandResult` for the PROPOSED event id (grep `class CommandResult`); if the proposed event id is exposed under a different attribute, use that. If `CommandResult` exposes no event id, drop `proposed_event_id` from the INSERT (it is nullable) and stamp it via `fold_overlay_state(load_fact(conn, key)).draft_event_id` after the propose. Replace the inline `__import__("json")` with a top-of-file `import json` (E402).
+> **Implementer note:** `CommandResult.produced_event_ids: tuple[str, ...]` (verified — the propose command produces the single `OVERLAY_FACT_PROPOSED` event, so `[0]` is its id; empty-guarded). Replace the inline `__import__("json")` with a top-of-file `import json` (E402 — src is not test-exempt).
 
 - [ ] **Step 6: Run to verify it passes** — Run: `uv run pytest tests/featuregen/overlay/upload/test_bridge_propose.py -q` → PASS (3 passed).
 

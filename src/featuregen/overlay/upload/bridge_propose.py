@@ -7,6 +7,7 @@ ledger with the resolved fact_key + proposed event id."""
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import asdict
 from datetime import UTC, datetime
 
@@ -16,6 +17,8 @@ from featuregen.overlay.commands import propose_fact
 from featuregen.overlay.evidence import AssertionStrength, EvidenceProducer, write_evidence
 from featuregen.overlay.identity import EntityBridgeRef, fact_key, proposal_fingerprint
 from featuregen.overlay.upload.bridge_candidates import BRIDGE_DERIVATION_VERSION, BridgeCandidateV1
+
+logger = logging.getLogger(__name__)
 
 
 def _object_ref_str(ref) -> str:
@@ -45,7 +48,12 @@ def propose_bridge(conn, candidate: BridgeCandidateV1, *, actor, now=None) -> st
          "evidence_ref": evidence_ref},
         actor, proposal_fingerprint(value)))
     if not res.accepted:
-        raise RuntimeError(f"bridge proposal denied: {res.denied_reason}")
+        # Expected benign denial: the overlay spine dedups on the deterministic fact_key/fingerprint,
+        # so a re-derived / re-uploaded candidate whose fact already exists (pending or sticky-rejected)
+        # is denied. This is a no-op, NOT an error — never raise out of a batch derivation cycle
+        # (mirrors passc/propose.py::_propose_one). The ledger row was stamped on the first propose.
+        logger.debug("bridge propose no-op (already governed): %s (%s)", key, res.denied_reason)
+        return key
     proposed_event_id = res.produced_event_ids[0] if res.produced_event_ids else None
     conn.execute(
         "INSERT INTO entity_bridge_candidate_evidence ("
