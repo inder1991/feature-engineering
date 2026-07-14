@@ -1,4 +1,5 @@
-"""The general dependency index (§8): which catalog objects a fact's value REFERENCES.
+"""The general dependency index (§8): which catalog objects a fact's value REFERENCES — an
+entity_bridge, like an approved_join, references TWO sources (both endpoints are indexed).
 
 This is a DOMAIN concept shared by two callers that must agree exactly: the OverlayProjection (which
 persists the reverse index into overlay_fact_dependency) and command-time referent validation
@@ -29,6 +30,17 @@ def fact_dependencies(
     tables and ALL paired columns on both sides UNDER THEIR RESPECTIVE SOURCES (a cross-catalog join's
     to-side must be tracked under the to-catalog, or its drift-staling and the read-time freshness
     guard both fail open). A drop/rename/type-change to ANY referent stales the dependent fact."""
+    if fact_type == facts.ENTITY_BRIDGE:
+        lr, rr = value["left_ref"], value["right_ref"]
+        l_src, r_src = lr["catalog_source"], rr["catalog_source"]
+        l_obj, r_obj = table_obj(lr), table_obj(rr)
+        # both endpoints, each under its OWN catalog_source: the table AND the identifier column, so a
+        # drop/rename/retype of either endpoint stales the bridge. A bridge is unordered — indexing both
+        # sides symmetrically is correct.
+        return {
+            (l_src, l_obj), (r_src, r_obj),
+            (l_src, f"{l_obj}.{lr['column']}"), (r_src, f"{r_obj}.{rr['column']}"),
+        }
     if fact_type == facts.APPROVED_JOIN:
         fr, tr = value["from_ref"], value["to_ref"]
         from_src, to_src = fr["catalog_source"], tr["catalog_source"]
