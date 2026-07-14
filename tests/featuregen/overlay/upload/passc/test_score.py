@@ -172,3 +172,18 @@ def test_deterministic_same_input_same_evidence():
     a = _c("transactions", "cif_id", term_name=_CIF_TERM)
     b = _c("customers", "cif_id", term_name=_CIF_TERM, is_grain=True)
     assert _score(a, b) == _score(a, b)
+
+
+def test_empty_canon_names_stay_possible_and_capped_at_weak():
+    # Audit fix I-4 (scoring consequence): "id"/"key" both canonicalize to "" — the vacuous name
+    # match must not flip the namespace to COMPATIBLE, so this high-scoring pair (85 without any
+    # name signal) stays POSSIBLE and rule 2 caps it at weak instead of proposing it as strong.
+    a = _c("transactions", "id", term_name=_CIF_TERM, data_domain="retail")
+    b = _c("customers", "key", term_name=_CIF_TERM, data_domain="retail", is_grain=True)
+    ev = _score(a, b)
+    assert ev.namespace_compatibility is N.POSSIBLE
+    assert "same_column_name" not in ev.namespace_reason_codes
+    assert "same_column_name" not in _names(ev)              # the scorer guard already held
+    assert ev.score >= 80                                    # strong-threshold score...
+    assert ev.bucket == "weak"                               # ...but POSSIBLE caps at weak
+    assert "Capped at weak" in ev.explanation

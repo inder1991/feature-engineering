@@ -56,6 +56,26 @@ def test_same_concept_different_name_no_synonyms_is_possible():
     assert reasons == ("same_identifier_concept",)
 
 
+def test_empty_canonical_names_do_not_corroborate():
+    # Audit fix I-4: "id" and "key" BOTH canonicalize to "" (generic id tail stripped) — a
+    # shared-EMPTY canonical name is no corroboration, so the pair must stay POSSIBLE, not be
+    # upgraded to COMPATIBLE via a vacuous "same_column_name" ("" == "").
+    a = _c(column="id", term_name="Customer Information File Identifier")
+    b = _c(column="key", term_name="Customer Information File Identifier")
+    verdict, reasons = classify_namespace(a, b)
+    assert verdict is N.POSSIBLE
+    assert reasons == ("same_identifier_concept",)
+
+
+def test_both_named_id_do_not_corroborate():
+    # Same trap with literally identical generic names: both "id" -> _canon "" on both sides.
+    a = _c(column="id", term_name="Customer Information File Identifier")
+    b = _c(column="id", table="other", term_name="Customer Information File Identifier")
+    verdict, reasons = classify_namespace(a, b)
+    assert verdict is N.POSSIBLE
+    assert reasons == ("same_identifier_concept",)
+
+
 def test_placeholder_synonyms_do_not_corroborate():
     # "(blank)" is an upload placeholder, not an alias — must stay POSSIBLE, not COMPATIBLE.
     a = _c(column="cif_id", term_name="Customer Information File Identifier")

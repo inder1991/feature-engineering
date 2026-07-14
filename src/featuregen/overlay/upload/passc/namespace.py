@@ -34,7 +34,11 @@ def classify_namespace(
     ca, cb = normalized_identifier_concept(a), normalized_identifier_concept(b)
     if ca and cb and ca == cb:
         reasons = ["same_identifier_concept"]
-        same_name = _canon(a.column) == _canon(b.column)
+        # Non-empty guard (mirrors candidates._positive_signals): generic names like "id"/"key"
+        # both _canon to "" — a shared-EMPTY name is no corroboration, and treating "" == "" as
+        # same_column_name would upgrade POSSIBLE -> COMPATIBLE, defeating the weak cap.
+        ca_name = _canon(a.column)
+        same_name = bool(ca_name) and ca_name == _canon(b.column)
         # _synonym_canons, not raw truthiness: "(blank)"/"n/a" placeholders are not corroboration.
         if same_name or _synonym_canons(a.synonyms) or _synonym_canons(b.synonyms):
             reasons.append("same_column_name" if same_name else "synonym_corroboration")
