@@ -81,8 +81,8 @@ def test_demote_removes_a_projected_bridge(db):
 def test_bridge_events_are_skipped_by_the_overlay_projection(db):
     # Draining the GENERIC overlay projection over a bridge event must not halt it (a bridge ref has
     # no single catalog_source; pre-fix, _catalog_source KeyErrors and the fail-closed runner marks
-    # the aggregate degraded and stops advancing), and must create no overlay read-model rows —
-    # bridge drift/expire integration is 3B.3.
+    # the aggregate degraded and stops advancing), and must create no overlay_proposal/_state rows —
+    # since 3B.3.0 the dependency index IS maintained (endpoint wiring for drift-staling).
     from featuregen.overlay.projection import OverlayProjection
     from featuregen.projections.runner import projection_lag, run_projection
     ensure_upload_catalog_adapter()
@@ -95,6 +95,29 @@ def test_bridge_events_are_skipped_by_the_overlay_projection(db):
     assert db.execute(
         "SELECT count(*) FROM projection_degraded WHERE projection_name = 'overlay'"
     ).fetchone()[0] == 0
-    # … and leave no single-source read-model rows for the two-source bridge fact.
+    # … and leave no single-source read-model rows for the two-source bridge fact. The dependency
+    # index is the 3B.3.0 exception: both endpoints (table + identifier column) are indexed there.
     assert db.execute("SELECT count(*) FROM overlay_proposal WHERE fact_key=%s", (key,)).fetchone()[0] == 0
-    assert db.execute("SELECT count(*) FROM overlay_fact_dependency WHERE fact_key=%s", (key,)).fetchone()[0] == 0
+    assert db.execute("SELECT count(*) FROM overlay_fact_dependency WHERE fact_key=%s", (key,)).fetchone()[0] == 4
+
+
+def test_bridge_endpoints_land_in_the_dependency_index(db):
+    from featuregen.overlay.projection import OverlayProjection, dependents_of
+    from featuregen.projections.runner import run_projection
+    ensure_upload_catalog_adapter()
+    _two_catalog_customer(db)
+    key = propose_bridge(db, derive_bridge_candidates(db)[0], actor=_ENRICH_ACTOR, now=_NOW)
+    while run_projection(db, OverlayProjection()) >= 500:
+        pass
+    deps = set(db.execute(
+        "SELECT catalog_source, ref_object FROM overlay_fact_dependency WHERE fact_key = %s",
+        (key,)).fetchall())
+    assert deps == {
+        ("core", "public.customer_master"), ("crm", "public.customers"),
+        ("core", "public.customer_master.customer_id"), ("crm", "public.customers.customer_id")}
+    # the reverse index drift-staling reads finds the bridge from EITHER catalog side
+    assert key in dependents_of(db, "core", "public.customer_master.customer_id")
+    assert key in dependents_of(db, "crm", "public.customers.customer_id")
+    # still NO single-source read-model rows for the two-source bridge
+    assert db.execute("SELECT count(*) FROM overlay_proposal WHERE fact_key=%s", (key,)).fetchone()[0] == 0
+    assert db.execute("SELECT count(*) FROM overlay_fact_state WHERE fact_key=%s", (key,)).fetchone()[0] == 0

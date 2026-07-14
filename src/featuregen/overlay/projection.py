@@ -43,12 +43,23 @@ class OverlayProjection:
 
         if event.type == facts.OVERLAY_FACT_PROPOSED:
             # 3B.2B: an entity_bridge fact is two-source; the single-catalog_source overlay read models
-            # (overlay_proposal/_state/_dependency) don't model it and _catalog_source would KeyError on
-            # its {entity_id,left_ref,right_ref} ref. The bridge lifecycle uses a direct fold
+            # (overlay_proposal/_state) don't model it and _catalog_source would KeyError on its
+            # {entity_id,left_ref,right_ref} ref. The bridge lifecycle uses a direct fold
             # (bridge_projection), not this projection; later bridge events (CONFIRMED/EXPIRED/…) are
-            # inherently no-ops here (no proposal/state row is ever created). Bridge drift/expire/stale
-            # integration is deferred to 3B.3.
+            # inherently no-ops here (no proposal/state row is ever created).
             if payload.get("fact_type") == "entity_bridge":
+                # 3B.3.0: a bridge is two-source — the single-catalog_source overlay_proposal/_state read
+                # models still don't model it (skip them), but its two catalog endpoints DO belong in
+                # overlay_fact_dependency so catalog drift stales the bridge (detect_catalog_changes ->
+                # dependents_of -> a STALED event on the bridge fact). Maintain ONLY the dependency index
+                # here; bridge dependencies are immutable post-propose, so CONFIRMED/EXPIRED/… stay no-ops.
+                conn.execute("DELETE FROM overlay_fact_dependency WHERE fact_key = %s", (fk,))
+                for dep_source, ref_object in fact_dependencies(
+                        payload["object_ref"], "entity_bridge", payload["proposed_value"], ""):
+                    conn.execute(
+                        "INSERT INTO overlay_fact_dependency (fact_key, catalog_source, ref_object) "
+                        "VALUES (%s, %s, %s) ON CONFLICT (fact_key, catalog_source, ref_object) DO NOTHING",
+                        (fk, dep_source, ref_object))
                 return
             conn.execute(
                 """
