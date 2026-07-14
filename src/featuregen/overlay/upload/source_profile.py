@@ -13,13 +13,15 @@ candidate awaiting confirmation, never overriding a taxonomy floor or structural
   structure and `domain/sample_profile/sensitivity`. *Semantics-vouched, structure-incomplete* — a
   glossary does NOT attest a physical `type`, which is what drives profile-aware validation (Task 4).
 
-Pure module: depends only on ``overlay.evidence`` (the strength axis). No DB, no I/O.
+Pure module: no DB, no I/O. Depends on ``overlay.evidence`` (the strength axis) and the reader's
+``_headers._ALIASES`` (so glossary detection matches exactly what the technical reader accepts).
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
 
 from featuregen.overlay.evidence import AssertionStrength
+from featuregen.overlay.upload._headers import _ALIASES
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,9 +77,9 @@ TECHNICAL_CSV_PROFILE = SourceCapabilityProfile(
 # ── Header-signature dispatch: which profile a raw upload's headers select. ──────────────────────
 # NOTE (reuse): as of Task 3 there is no `glossary_reader.is_glossary_csv` to reuse, so the
 # glossary-signature check lives HERE and Task 4's glossary reader must reuse `profile_for_upload`
-# (or `_is_glossary_headers`) rather than re-deriving detection. Kept as a leaf that depends only on
-# `overlay.evidence` (not on `_headers`/`canonical`) so profile-aware validation in `canonical.py`
-# can import this module without an import cycle.
+# (or `_is_glossary_headers`) rather than re-deriving detection. Importing `_headers` here is
+# cycle-safe: `canonical.py` imports this module only under TYPE_CHECKING, so the runtime chain
+# `source_profile -> _headers -> canonical` never loops back.
 
 
 def _norm_header(h: str) -> str:
@@ -92,12 +94,17 @@ def _norm_header(h: str) -> str:
 # the technical row-key headers so a stray column can't misclassify a technical upload as a glossary.
 _GLOSSARY_HEADER_SIGNATURE = frozenset(
     _norm_header(h) for h in ("business_term", "bian_path", "fibo_path"))
-_TECHNICAL_KEY_HEADERS = frozenset(_norm_header(h) for h in ("column", "table"))
+# The technical row-keys are the SAME alias sets the technical reader accepts for `column` and
+# `table` (M-7): a technical CSV keyed on `attribute`/`columnname`/`tablename` must never flip to
+# the glossary profile just because a stray glossary-signal header rides along — the glossary
+# profile has no FQN row key, so every row would quarantine.
+_TECHNICAL_KEY_HEADERS = frozenset(
+    _norm_header(h) for h in (_ALIASES["column"] | _ALIASES["table"]))
 
 
 def _is_glossary_headers(headers: list[str]) -> bool:
     """True iff ``headers`` look glossary-shaped: at least one glossary-distinctive header present and
-    no technical row-key (`column`/`table`) header present."""
+    no technical row-key header (any `column`/`table` alias the reader accepts) present."""
     norm = {_norm_header(h) for h in headers}
     return bool(_GLOSSARY_HEADER_SIGNATURE & norm) and not (_TECHNICAL_KEY_HEADERS & norm)
 

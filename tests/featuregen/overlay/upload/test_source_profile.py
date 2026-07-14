@@ -75,6 +75,20 @@ def test_profile_for_upload_is_header_normalization_tolerant():
     assert profile_for_upload(messy) is FTR_GLOSSARY_PROFILE
 
 
+def test_technical_alias_keys_block_glossary_misclassification():
+    # M-7: the technical reader accepts `attribute`/`columnname` as `column` and `tablename` as
+    # `table` (_headers._ALIASES), so a technical CSV keyed on those aliases plus a stray
+    # glossary-signal header must stay TECHNICAL — flipping it to the glossary profile drops the
+    # FQN row key and quarantines every row. "Absence of technical row-keys" must match what the
+    # reader actually accepts as a row key.
+    assert profile_for_upload(["attribute", "tablename", "type", "business_term"]) \
+        is TECHNICAL_CSV_PROFILE
+    assert profile_for_upload(["Column Name", "table", "type", "bian_path"]) \
+        is TECHNICAL_CSV_PROFILE
+    # A real glossary (glossary signals, NO column/table alias at all) is still detected.
+    assert profile_for_upload(["business_term", "definition", "bian_path"]) is FTR_GLOSSARY_PROFILE
+
+
 def test_profile_is_frozen():
     import dataclasses
 

@@ -70,6 +70,22 @@ class OverlayProjection:
                     payload["fact_type"], payload.get("use_case"), payload.get("evidence_ref"), seq,
                 ),
             )
+            # A fresh PROPOSED supersedes a terminal read-model state (M-9): propose_fact only
+            # admits a re-propose over an empty stream or a REJECTED terminal, so when a once-
+            # confirmed fact (overlay_fact_state row exists) is re-proposed, reset the row to the
+            # new DRAFT — otherwise resolve_fact keeps reporting the stale REJECTED for a fact
+            # whose workflow status is DRAFT. Fail-closed unchanged (a DRAFT never serves a value);
+            # seq-guarded like every write here so replays never regress newer state. The next
+            # CONFIRM's DO UPDATE restores VERIFIED with fresh value/confirmers.
+            conn.execute(
+                """
+                UPDATE overlay_fact_state
+                SET status = 'DRAFT', value = NULL, prior_value = NULL, expires_at = NULL,
+                    updated_seq = %s
+                WHERE fact_key = %s AND updated_seq < %s
+                """,
+                (seq, fk, seq),
+            )
             # Refresh the dependency set on every (re)proposal: DELETE the fact's existing
             # rows first so a re-proposal after REJECTED — which may reference DIFFERENT columns —
             # never leaves stale dependency rows behind. Then insert the fresh set.
@@ -203,8 +219,9 @@ class OverlayProjection:
 
 
 def current_fact(conn: DbConn, fact_key: str) -> dict | None:
-    """The hot overlay_fact_state row for `fact_key` (VERIFIED / REVERIFY / STALE / REJECTED), or
-    None if the fact never reached a confirmed state. Drives the merged-view read path."""
+    """The hot overlay_fact_state row for `fact_key` (VERIFIED / REVERIFY / STALE / REJECTED, or
+    DRAFT after a once-confirmed fact is re-proposed), or None if the fact never reached a
+    confirmed state. Drives the merged-view read path."""
     with conn.cursor(row_factory=dict_row) as cur:
         cur.execute("SELECT * FROM overlay_fact_state WHERE fact_key = %s", (fact_key,))
         return cur.fetchone()

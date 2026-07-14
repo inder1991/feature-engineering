@@ -135,3 +135,30 @@ def test_display_is_not_authority(resolved):
 def test_is_feature_eligible_false_when_no_decision(db):
     # A field with no decision at all is not feature-eligible (fail-closed).
     assert is_feature_eligible(db, _REF, "concept") is False
+
+
+def test_leakage_anchor_decision_recorded_and_gates_from_confirmed_taxonomy(db):
+    # M-8: leakage_anchor is derived (taxonomy_evidence) and lifecycle-managed (ingest
+    # _TAXONOMY_FIELDS) alongside temporal_role/sensitivity_floor, so it carries the same
+    # _BEHAVIOURAL policy as its siblings. Pre-fix policy_for('leakage_anchor') returned None and
+    # _resolve_generic_field early-returned: no decision was ever recorded, is_feature_eligible
+    # was always False — dead evidence.
+    build_graph(db, _SOURCE, [_ROW])
+    _seed(db, "leakage_anchor", True, EvidenceProducer.TAXONOMY, AssertionStrength.CONFIRMED)
+    resolve_and_project(db, source=_SOURCE, logical_refs=[_REF])
+    decisions = read_field_decisions(db, _REF, "leakage_anchor")
+    assert decisions                                            # a decision IS recorded now
+    assert decisions[-1].load_bearing_value_hash is not None    # confirmed-taxonomy derivation gates
+    assert is_feature_eligible(db, _REF, "leakage_anchor") is True
+
+
+def test_leakage_anchor_from_proposed_concept_is_recorded_but_not_load_bearing(db):
+    # §3.2 mirror of the additivity sibling test: a derivation from a PROPOSED concept is
+    # taxonomy/proposed — the decision is recorded, but it never gates the operational value.
+    build_graph(db, _SOURCE, [_ROW])
+    _seed(db, "leakage_anchor", True, EvidenceProducer.TAXONOMY, AssertionStrength.PROPOSED)
+    resolve_and_project(db, source=_SOURCE, logical_refs=[_REF])
+    decisions = read_field_decisions(db, _REF, "leakage_anchor")
+    assert decisions
+    assert decisions[-1].load_bearing_value_hash is None
+    assert is_feature_eligible(db, _REF, "leakage_anchor") is False

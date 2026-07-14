@@ -108,9 +108,10 @@ _SENSITIVITY = FieldPolicy(
     severity_order=SENSITIVITY_ORDER,
 )
 
-# additivity / temporal_role — OPERATIONAL behavioural fields DERIVED from the concept. They gate
-# only from a CONFIRMED concept's derivation (taxonomy/confirmed) or a direct source/human signal; a
-# derivation from a PROPOSED concept is taxonomy/proposed and does NOT gate (§3.2).
+# additivity / temporal_role / leakage_anchor — OPERATIONAL behavioural fields DERIVED from the
+# concept. They gate only from a CONFIRMED concept's derivation (taxonomy/confirmed) or a direct
+# source/human signal; a derivation from a PROPOSED concept is taxonomy/proposed and does NOT
+# gate (§3.2).
 _BEHAVIOURAL = FieldPolicy(
     influence_max=InfluenceTier.OPERATIONAL,
     display_rule=AnyOf((_TAXONOMY_PROPOSED, _TAXONOMY_CONFIRMED, _SOURCE_ATTESTED, _HUMAN_CONFIRMED)),
@@ -141,6 +142,11 @@ _POLICIES: dict[str, FieldPolicy] = {
     "sensitivity": _SENSITIVITY,
     "additivity": _BEHAVIOURAL,
     "temporal_role": _BEHAVIOURAL,
+    # leakage_anchor is derived + lifecycle-managed exactly like temporal_role (taxonomy_evidence /
+    # ingest._TAXONOMY_FIELDS); without a policy its evidence was dead — no decision, never
+    # eligible. Decision-only (no graph_node display column); templates.py's registry-based
+    # leakage check is unchanged (this field never weakens it).
+    "leakage_anchor": _BEHAVIOURAL,
     "table_role": _TABLE_ADVISORY,
     "primary_entity": _TABLE_ADVISORY,
     "event_or_snapshot": _TABLE_ADVISORY,   # advisory: informs modelling, never load-bearing

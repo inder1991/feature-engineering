@@ -391,6 +391,22 @@ def test_router_includes_aggregation_with_a_join_key(db):
     assert "aggregation" in names       # a join key exists -> aggregation applies
 
 
+def test_router_includes_aggregation_when_only_the_parent_side_is_candidate(db):
+    # M-6: graph_edge.to_ref is COLUMN-level (public.accounts.id — both declared edges and Pass-C
+    # projected edges store 3-segment to_refs), so the parent (to) side must be matched against the
+    # candidate COLUMN refs. Comparing it against 2-segment public.<table> refs never matched,
+    # silently dropping the "aggregate children up" family for entity-grain candidate sets.
+    from featuregen.overlay.upload.feature_assist import route_strategies
+    build_graph(db, "par", [
+        CanonicalRow("par", "orders", "id", "integer", is_grain=True),
+        CanonicalRow("par", "orders", "acct_id", "integer", joins_to="accounts.id"),
+        CanonicalRow("par", "accounts", "id", "integer", is_grain=True)])
+    # Candidates are ONLY the parent pk — the child fk (the edge's from_ref) is NOT in the set.
+    cols = [{"object_ref": "public.accounts.id", "catalog_source": "par"}]
+    names = [n for n, _ in route_strategies(db, cols)]
+    assert "aggregation" in names   # children join INTO the candidate column -> aggregate them up
+
+
 def test_feature_rationale_flows_from_generator_to_gate1(db):
     # §14.2 — a per-feature causal rationale rides the candidate through to Gate #1.
     _bank(db)
