@@ -76,3 +76,25 @@ def test_demote_removes_a_projected_bridge(db):
     project_verified_bridge(db, ref, now=_NOW)
     assert demote_bridge_edges(db, fact_key(ref, "entity_bridge")) == 1
     assert active_bridges(db) == ()
+
+
+def test_bridge_events_are_skipped_by_the_overlay_projection(db):
+    # Draining the GENERIC overlay projection over a bridge event must not halt it (a bridge ref has
+    # no single catalog_source; pre-fix, _catalog_source KeyErrors and the fail-closed runner marks
+    # the aggregate degraded and stops advancing), and must create no overlay read-model rows —
+    # bridge drift/expire integration is 3B.3.
+    from featuregen.overlay.projection import OverlayProjection
+    from featuregen.projections.runner import projection_lag, run_projection
+    ensure_upload_catalog_adapter()
+    _two_catalog_customer(db)
+    key = propose_bridge(db, derive_bridge_candidates(db)[0], actor=_ENRICH_ACTOR, now=_NOW)
+    while run_projection(db, OverlayProjection()) >= 500:
+        pass
+    # The projection must advance PAST the bridge event (no fail-closed halt, no degraded marker) …
+    assert projection_lag(db, "overlay") == 0
+    assert db.execute(
+        "SELECT count(*) FROM projection_degraded WHERE projection_name = 'overlay'"
+    ).fetchone()[0] == 0
+    # … and leave no single-source read-model rows for the two-source bridge fact.
+    assert db.execute("SELECT count(*) FROM overlay_proposal WHERE fact_key=%s", (key,)).fetchone()[0] == 0
+    assert db.execute("SELECT count(*) FROM overlay_fact_dependency WHERE fact_key=%s", (key,)).fetchone()[0] == 0

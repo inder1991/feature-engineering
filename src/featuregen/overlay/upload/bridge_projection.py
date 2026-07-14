@@ -60,5 +60,5 @@ def active_bridges(conn) -> tuple[ActiveBridgeV1, ...]:
     rows = conn.execute(
         "SELECT fact_key, entity_id, left_catalog_source, left_object_ref, right_catalog_source, "
         "  right_object_ref FROM entity_bridge_edge WHERE status = 'VERIFIED' "
-        "ORDER BY entity_id, left_object_ref, right_object_ref").fetchall()
+        "ORDER BY entity_id, left_object_ref, right_object_ref, fact_key").fetchall()
     return tuple(ActiveBridgeV1(*r) for r in rows)
