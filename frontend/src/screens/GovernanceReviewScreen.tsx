@@ -4,22 +4,26 @@ import {
   type JoinProposal,
   type RejectCategory,
   REJECT_CATEGORIES,
+  type RelationshipReadiness,
   TABLE_FACT_REJECT_CATEGORIES,
   type TableFactProposal,
   type TableFactRejectCategory,
   confirmJoin,
   confirmTableFact,
   listJoinProposals,
+  listRelationshipReadiness,
   listTableFactProposals,
   rejectJoin,
   rejectTableFact,
 } from '../api'
 
-// Governance review: the confirmation surface over what the enrichment passes proposed. Two
-// tabs share one source queue: Joins (Pass C, TWO distinct admins) and Grain & availability
-// (Pass B table facts, SINGLE confirmer — one approve reaches VERIFIED and projects). Both are
-// evidence-forward cards with a consequence line, an LLM/metadata caution, and a what-to-verify
-// checklist that GATES the Approve button. Reject is structured (category + optional note).
+// Governance review: the confirmation surface over what the enrichment passes proposed. Three
+// tabs share one source queue: Joins (Pass C, TWO distinct admins), Grain & availability
+// (Pass B table facts, SINGLE confirmer — one approve reaches VERIFIED and projects), and
+// Readiness (READ-ONLY: the per-table relationship diagnostic — what joins were discovered and
+// where they stand — no actions). The two action tabs are evidence-forward cards with a
+// consequence line, an LLM/metadata caution, and a what-to-verify checklist that GATES the
+// Approve button. Reject is structured (category + optional note).
 // Follows ReviewQueueScreen's shape: source input -> load() -> per-card action handlers -> a
 // session-local decided Map (the durable state lives server-side; a reload refetches the open
 // queue, which no longer contains what was decided).
@@ -34,6 +38,29 @@ interface Decision {
 const STATUS_BADGE: Record<JoinProposal['status'], { label: string; tone: string }> = {
   PROPOSED: { label: 'proposed', tone: 'gj-proposed' },
   PARTIALLY_CONFIRMED: { label: 'awaiting 2nd', tone: 'gj-partial' },
+}
+
+// Readiness-tab status chips: strong outcomes reuse the solid governance tones (verified green,
+// conflicting red, proposed accent); the two nothing-actionable states stay quiet (muted/faint).
+const READINESS_BADGE: Record<RelationshipReadiness['status'], { label: string; tone: string }> = {
+  confirmed: { label: 'confirmed', tone: 'gj-verified' },
+  conflicting: { label: 'conflicting', tone: 'gj-rejected' },
+  candidate_proposed: { label: 'candidate proposed', tone: 'gj-proposed' },
+  weak_candidates_only: { label: 'weak candidates only', tone: 'gj-weak' },
+  no_candidates: { label: 'no candidates', tone: 'gj-none' },
+}
+
+// "2 confirmed · 1 proposed" — only the non-zero pair categories, in precedence-adjacent order.
+function pairCounts(r: RelationshipReadiness): string {
+  const parts = [
+    [r.confirmed_pairs.length, 'confirmed'] as const,
+    [r.proposed_pairs.length, 'proposed'] as const,
+    [r.weak_pairs.length, 'weak'] as const,
+    [r.conflicting_pairs.length, 'conflicting'] as const,
+  ]
+    .filter(([n]) => n > 0)
+    .map(([n, label]) => `${n} ${label}`)
+  return parts.length > 0 ? parts.join(' · ') : 'no candidate pairs'
 }
 
 function categoryLabel(category: string): string {
@@ -64,14 +91,16 @@ export function GovernanceReviewScreen() {
   const [source, setSource] = useState('')
   const [proposals, setProposals] = useState<JoinProposal[] | null>(null)
   const [tableFacts, setTableFacts] = useState<TableFactProposal[] | null>(null)
+  const [readiness, setReadiness] = useState<RelationshipReadiness[] | null>(null)
   const [loadedSource, setLoadedSource] = useState('')
   // Which queue is on screen. Only one renders at a time — per-card state (checklists, reject
   // boxes) is keyed component state, so switching tabs does not leak ticks across kinds.
-  const [tab, setTab] = useState<'joins' | 'facts'>('joins')
+  const [tab, setTab] = useState<'joins' | 'facts' | 'readiness'>('joins')
   // Per-QUEUE load errors (whole-branch review FIX 2): each tab surfaces its OWN fetch failure
   // without blanking the other tab's data.
   const [joinsError, setJoinsError] = useState('')
   const [factsError, setFactsError] = useState('')
+  const [readinessError, setReadinessError] = useState('')
   // Conflict banner (409): survives the reload that follows it, unlike `error`.
   const [notice, setNotice] = useState('')
   // Session-only DISPLAY state for cards decided this session, keyed by fact_key. The durable
@@ -89,21 +118,29 @@ export function GovernanceReviewScreen() {
     if (!name.trim()) return
     const id = ++loadSeq.current
     setNotice('')
-    // Both queues load together so the tab counts are honest and a 409 reload refreshes both —
-    // but they settle INDEPENDENTLY (whole-branch review FIX 2): a table-facts endpoint failure
-    // must not reject the joins load and blank its tab (or vice versa). Each tab renders from
-    // its own settled result; a failed queue shows a per-tab error instead.
-    const [joinsRes, factsRes] = await Promise.allSettled([
+    // All three fetches load together so the tab counts are honest and a 409 reload refreshes
+    // everything — but they settle INDEPENDENTLY (whole-branch review FIX 2): a table-facts or
+    // readiness endpoint failure must not reject the joins load and blank its tab (or any other
+    // combination). Each tab renders from its own settled result; a failed fetch shows a
+    // per-tab error instead.
+    const [joinsRes, factsRes, readinessRes] = await Promise.allSettled([
       listJoinProposals(name.trim()),
       listTableFactProposals(name.trim()),
+      listRelationshipReadiness(name.trim()),
     ])
     if (id !== loadSeq.current) return
     setProposals(joinsRes.status === 'fulfilled' ? joinsRes.value.proposals : null)
     setJoinsError(joinsRes.status === 'rejected' ? errorDetail(joinsRes.reason) : '')
     setTableFacts(factsRes.status === 'fulfilled' ? factsRes.value.proposals : null)
     setFactsError(factsRes.status === 'rejected' ? errorDetail(factsRes.reason) : '')
+    setReadiness(readinessRes.status === 'fulfilled' ? readinessRes.value.relationships : null)
+    setReadinessError(readinessRes.status === 'rejected' ? errorDetail(readinessRes.reason) : '')
     setLoadedSource(
-      joinsRes.status === 'fulfilled' || factsRes.status === 'fulfilled' ? name.trim() : '',
+      joinsRes.status === 'fulfilled' ||
+        factsRes.status === 'fulfilled' ||
+        readinessRes.status === 'fulfilled'
+        ? name.trim()
+        : '',
     )
     setDecided(new Map())
     setGeneration(g => g + 1)
@@ -146,13 +183,20 @@ export function GovernanceReviewScreen() {
           {notice}
         </p>
       )}
-      {(proposals || tableFacts) && (
+      {(proposals || tableFacts || readiness) && (
         <div className="viewtoggle" role="group" aria-label="Proposal kind">
           <button type="button" aria-pressed={tab === 'joins'} onClick={() => setTab('joins')}>
             Joins ({proposals ? proposals.length : '—'})
           </button>
           <button type="button" aria-pressed={tab === 'facts'} onClick={() => setTab('facts')}>
             Grain &amp; availability ({tableFacts ? tableFacts.length : '—'})
+          </button>
+          <button
+            type="button"
+            aria-pressed={tab === 'readiness'}
+            onClick={() => setTab('readiness')}
+          >
+            Readiness ({readiness ? readiness.length : '—'})
           </button>
         </div>
       )}
@@ -164,6 +208,11 @@ export function GovernanceReviewScreen() {
       {tab === 'facts' && factsError && (
         <p role="alert" className="error">
           {factsError}
+        </p>
+      )}
+      {tab === 'readiness' && readinessError && (
+        <p role="alert" className="error">
+          {readinessError}
         </p>
       )}
       {tab === 'joins' && proposals?.length === 0 && (
@@ -261,6 +310,37 @@ export function GovernanceReviewScreen() {
                 />
               )
             })}
+          </ul>
+        </>
+      )}
+      {tab === 'readiness' && readiness?.length === 0 && (
+        <p className="empty" role="status">
+          No tables with relationship readiness for this source.
+        </p>
+      )}
+      {tab === 'readiness' && readiness && readiness.length > 0 && (
+        // READ-ONLY diagnostic: one compact row per table — where its join relationships stand
+        // (the precedence-folded status) plus the per-category pair counts. No actions here;
+        // confirming happens on the Joins tab.
+        <>
+          <p className="tabular-nums" role="status">
+            {readiness.length} table{readiness.length === 1 ? '' : 's'} ·{' '}
+            {readiness.filter(r => r.status === 'confirmed').length} with a confirmed join
+          </p>
+          <ul className="rows">
+            {readiness.map(r => (
+              <li className="row q-item" key={`${r.schema}.${r.table}`}>
+                <div className="q-head">
+                  <span className="mono gj-kind">
+                    {r.schema}.{r.table}
+                  </span>
+                  <span className={`badge ${READINESS_BADGE[r.status].tone}`}>
+                    {READINESS_BADGE[r.status].label}
+                  </span>
+                  <span className="gj-score">{pairCounts(r)}</span>
+                </div>
+              </li>
+            ))}
           </ul>
         </>
       )}
