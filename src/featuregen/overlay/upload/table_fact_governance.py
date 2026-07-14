@@ -277,8 +277,13 @@ def project_verified_table_fact(conn: DbConn, source: str, ref, fact_type: str, 
                                "deferring projection of a verified %s in %r to the next "
                                "caught-up ingest", fact_type, source)
                 return "pending"
+            # only_fact_type scopes the clear-then-set to the JUST-CONFIRMED type (whole-branch
+            # review FIX 1): confirming a grain must never clear a file-declared as_of (or vice
+            # versa) — under a stale drift watermark resolve_fact refuses to re-serve the other
+            # fact, so an unscoped clear would silently wipe it until the next re-upload.
             project_table_facts_for_ref(conn, source=source, table=ref.table,
-                                        declared_grain=set(), declared_as_of=set(), now=now)
+                                        declared_grain=set(), declared_as_of=set(),
+                                        only_fact_type=fact_type, now=now)
             # flag_col/event_col come from the closed _PROJECTION_COLUMNS map above, never input.
             row = conn.execute(
                 f"SELECT 1 FROM graph_node WHERE catalog_source = %s AND table_name = %s"

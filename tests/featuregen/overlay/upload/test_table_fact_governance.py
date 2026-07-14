@@ -75,8 +75,8 @@ def _seed_grain(conn, source="src", table="t", value=None):
     return ref, fact_key(ref, "grain")
 
 
-def _seed_availability(conn, source="src", table="u"):
-    value = {"column": "as_of_date", "basis": "posted_at"}
+def _seed_availability(conn, source="src", table="u", column="as_of_date"):
+    value = {"column": column, "basis": "posted_at"}
     ref = table_ref(source, table)
     res = propose_fact(conn, Command(
         "propose_fact", "overlay_fact", None,
@@ -346,6 +346,64 @@ def test_project_pending_on_stale_watermark(passc_conn, human_admin_1):
     status = project_verified_table_fact(passc_conn, "src", ref, "grain", now=now)
     assert status == "pending"
     assert not any(g for g, _e in _grain_flags(passc_conn).values())
+
+
+def test_confirm_grain_preserves_file_declared_as_of_on_stale_watermark(
+        passc_conn, human_admin_1):
+    """Whole-branch review FIX 1: a single-fact confirm must NEVER touch the OTHER fact type.
+
+    A file-declared as_of lives on the SAME table as the Pass B grain proposal being confirmed —
+    exactly as ingest lands it: a VERIFIED availability_time overlay fact (`_table_facts` +
+    `_assert_fact`) plus graph_node.is_as_of=true (build_graph). Under a STALE drift watermark
+    (the common governance case — an admin approving hours after the upload) resolve_fact
+    REFUSES to re-serve the availability fact, so a clear-BOTH projection wipes is_as_of and
+    never restores it until the next re-upload. Confirming the grain must leave it untouched."""
+    from featuregen.overlay.catalog_changes import _write_watermark
+    from featuregen.overlay.upload.ingest import _assert_fact
+
+    _seed_graph_nodes(passc_conn, cols=("cif_id", "amt", "tran_date"))
+    _assert_fact(passc_conn, "src", "t", "availability_time",
+                 {"column": "tran_date", "basis": "posted_at"}, actor=SERVICE_ACTOR)
+    passc_conn.execute(
+        "UPDATE graph_node SET is_as_of = true WHERE catalog_source = 'src' "
+        "AND table_name = 't' AND column_name = 'tran_date'")
+
+    ref, key = _seed_grain(passc_conn)                       # Pass B grain DRAFT, same table
+    _confirm_via_context(passc_conn, key, human_admin_1)     # -> VERIFIED
+    _seal_drift_config()
+    now = datetime.now(UTC)
+    _write_watermark(passc_conn, "src", now - timedelta(hours=2))   # STALE vs the 60m SLA
+
+    status = project_verified_table_fact(passc_conn, "src", ref, "grain", now=now)
+    assert status == "pending"       # the grain itself honestly defers under the stale guard
+    (is_as_of,) = passc_conn.execute(
+        "SELECT is_as_of FROM graph_node WHERE catalog_source = 'src' AND table_name = 't' "
+        "AND column_name = 'tran_date'").fetchone()
+    assert is_as_of is True          # the file-declared as_of survives the grain confirm
+
+
+def test_confirm_availability_preserves_file_declared_grain_on_stale_watermark(
+        passc_conn, human_admin_1):
+    """The symmetric FIX 1 case: confirming an availability_time must never clear a
+    file-declared grain on the same table."""
+    from featuregen.overlay.catalog_changes import _write_watermark
+    from featuregen.overlay.upload.ingest import _assert_fact
+
+    _seed_graph_nodes(passc_conn, cols=("cif_id", "amt", "as_of_date"))
+    _assert_fact(passc_conn, "src", "t", "grain", dict(_GRAIN_VALUE), actor=SERVICE_ACTOR)
+    passc_conn.execute(
+        "UPDATE graph_node SET is_grain = true WHERE catalog_source = 'src' "
+        "AND table_name = 't' AND column_name = 'cif_id'")
+
+    ref, key = _seed_availability(passc_conn, table="t")     # Pass B as-of DRAFT, same table
+    _confirm_via_context(passc_conn, key, human_admin_1)     # -> VERIFIED
+    _seal_drift_config()
+    now = datetime.now(UTC)
+    _write_watermark(passc_conn, "src", now - timedelta(hours=2))   # STALE vs the 60m SLA
+
+    status = project_verified_table_fact(passc_conn, "src", ref, "availability_time", now=now)
+    assert status == "pending"
+    assert _grain_flags(passc_conn)["cif_id"][0] is True     # the file-declared grain survives
 
 
 def test_project_is_fail_soft(passc_conn, human_admin_1, monkeypatch):
