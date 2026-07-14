@@ -137,7 +137,7 @@ def _catalog_schema_fingerprint(conn, catalog_source: str) -> str:
         "SELECT object_ref, kind, table_name, is_grain, concept FROM graph_node "
         "WHERE catalog_source = %s ORDER BY object_ref", (catalog_source,)).fetchall()
     edges = conn.execute(
-        "SELECT from_ref, to_ref, cardinality FROM graph_edge "
+        "SELECT from_ref, to_ref, cardinality, authority, approved_join_status FROM graph_edge "
         "WHERE catalog_source = %s AND kind = 'joins' ORDER BY from_ref, to_ref", (catalog_source,)).fetchall()
     blob = json.dumps({"nodes": [list(n) for n in nodes], "edges": [list(e) for e in edges]},
                       sort_keys=True, default=str)
@@ -152,12 +152,18 @@ def realization_fingerprint(conn, catalog_source: str) -> str:
     return hashlib.sha256(parts.encode()).hexdigest()
 
 
-def _join_edges(conn, catalog_source: str) -> list[tuple[str, str, str | None]]:
+def _join_edges(conn, catalog_source: str) -> list[tuple[str, str, str | None, str | None]]:
     """Intra-catalog declared join edges (both endpoints in THIS catalog — a cross-source target is a
-    3B.2B bridge concern, not a realization)."""
+    3B.2B bridge concern, not a realization). Governed-seam filtered like every other join reader
+    (join_path/entity/feature_assist): only ``authority='operational'`` edges that are file-declared
+    (``approved_join_fact_key IS NULL``) OR human-VERIFIED (``approved_join_status='VERIFIED'``) are
+    realized — an ungoverned display-only edge, or a governed edge not yet VERIFIED, is never realized.
+    ``approved_join_status`` is returned so the deriver stamps APPROVED_JOIN (VERIFIED) vs DECLARED_JOIN
+    (file-declared)."""
     return conn.execute(
-        "SELECT e.from_ref, e.to_ref, e.cardinality FROM graph_edge e "
-        "WHERE e.catalog_source = %s AND e.kind = 'joins' "
+        "SELECT e.from_ref, e.to_ref, e.cardinality, e.approved_join_status FROM graph_edge e "
+        "WHERE e.catalog_source = %s AND e.kind = 'joins' AND e.authority = 'operational' "
+        "  AND (e.approved_join_fact_key IS NULL OR e.approved_join_status = 'VERIFIED') "
         "  AND EXISTS(SELECT 1 FROM graph_node n WHERE n.catalog_source = e.catalog_source "
         "             AND n.object_ref = e.to_ref) "
         "ORDER BY e.from_ref, e.to_ref", (catalog_source,)).fetchall()
@@ -174,7 +180,7 @@ def derive_catalog_realizations(conn, catalog_source: str) -> CatalogRealization
     local: list[CatalogEntityRelationshipV1] = []
     proposals: list[EntityRelationshipProposalV1] = []
 
-    for from_key, to_key, card_token in _join_edges(conn, catalog_source):
+    for from_key, to_key, card_token, approved_status in _join_edges(conn, catalog_source):
         from_table, to_table = table_of(from_key), table_of(to_key)
         fg, tg = object_grain(conn, catalog_source, from_table), object_grain(conn, catalog_source, to_table)
         fke, tke = key_entity(conn, catalog_source, from_key), key_entity(conn, catalog_source, to_key)
@@ -186,6 +192,11 @@ def derive_catalog_realizations(conn, catalog_source: str) -> CatalogRealization
                                      declared=declared, global_rel=global_relationship_for(fg, tg)) \
             or normalize_realization(from_object_grain=fg, to_object_grain=tg,
                                      declared=declared, global_rel=global_relationship_for(tg, fg))
+        # A human-VERIFIED approved_join fact (projected onto the edge by the join-governance flow)
+        # is stamped APPROVED_JOIN; a file-declared edge (no attested fact) stays DECLARED_JOIN. The
+        # _join_edges filter guarantees a linked edge here is VERIFIED, so this is exhaustive.
+        authority = (RealizationAuthority.APPROVED_JOIN if approved_status == "VERIFIED"
+                     else RealizationAuthority.DECLARED_JOIN)
         rid = f"{catalog_source}:{from_key}->{to_key}"
         rel = CatalogEntityRelationshipV1(
             realization_id=rid, relationship_id=(norm.relationship_id if norm else ""),
@@ -194,7 +205,7 @@ def derive_catalog_realizations(conn, catalog_source: str) -> CatalogRealization
             from_key_ref=from_key, from_key_entity=fke, to_key_ref=to_key, to_key_entity=tke,
             declared_cardinality=declared,
             reversed_authoring=(norm.reversed_authoring if norm else False),
-            authority=RealizationAuthority.DECLARED_JOIN, status=RelationshipStatus.ACTIVE)
+            authority=authority, status=RelationshipStatus.ACTIVE)
         if norm is None:
             local.append(rel)
             proposals.append(EntityRelationshipProposalV1(
