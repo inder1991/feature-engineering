@@ -399,6 +399,68 @@ export function rejectJoin(
   })
 }
 
+// ---- table-fact governance (Pass B confirm surface): grain / availability_time facts --------
+// Pass B proposes grain and as-of facts from LLM enrichment — never value-profiled. Unlike
+// joins these are SINGLE-confirmer: one platform-admin approve reaches VERIFIED directly
+// (four-eyes still holds — the proposer is the service enrichment actor, never the confirmer),
+// then the fact projects synchronously into the operational overlay.
+
+// proposed_value by fact_type — grain: {columns, is_unique}; availability_time: {column, basis}.
+// evidence_parse_status "missing" means the stored value did not parse — render defensively.
+export interface TableFactProposal {
+  fact_key: string
+  task_id: string
+  target_event_id: string
+  fact_type: 'grain' | 'availability_time'
+  table: string
+  proposed_value: {
+    columns?: string[]
+    is_unique?: boolean
+    column?: string
+    basis?: string
+  } | null
+  status: 'PROPOSED'
+  origin: string
+  advisory: {
+    table_role: string | null
+    primary_entity: string | null
+    event_or_snapshot: string | null
+  }
+  evidence_parse_status: string
+}
+
+// Structured rejection vocabulary — mirrors the backend's Literal exactly; the category is a
+// first-class analytics key fed back to re-proposal, the note is free text.
+export const TABLE_FACT_REJECT_CATEGORIES = [
+  'wrong_grain_columns', 'wrong_as_of_column', 'not_unique', 'needs_data_check',
+] as const
+export type TableFactRejectCategory = (typeof TABLE_FACT_REJECT_CATEGORIES)[number]
+
+export function listTableFactProposals(
+  source: string,
+): Promise<{ source: string; proposals: TableFactProposal[]; next_cursor: string | null }> {
+  return request(`/sources/${encodeURIComponent(source)}/governance/table-facts`)
+}
+
+export function confirmTableFact(
+  factKey: string,
+  body: { note?: string },
+): Promise<{ governance_status: string; operational_projection: string }> {
+  return post(`/governance/table-facts/${encodeURIComponent(factKey)}/confirm`, {
+    note: body.note ?? null,
+  })
+}
+
+export function rejectTableFact(
+  factKey: string,
+  body: { category: TableFactRejectCategory; note?: string },
+): Promise<{ governance_status: string; category: string }> {
+  return post(`/governance/table-facts/${encodeURIComponent(factKey)}/reject`, {
+    category: body.category,
+    note: body.note ?? null,
+  })
+}
+
 export function columnJoins(objectRef: string, source: string): Promise<JoinEdge[]> {
   return request(
     `/columns/${encodeURIComponent(objectRef)}/joins?source=${encodeURIComponent(source)}`)
