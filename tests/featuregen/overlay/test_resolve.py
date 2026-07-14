@@ -274,6 +274,70 @@ def test_fresh_rejected_reports_rejected_not_missing(db):
     assert resolved.reason_if_missing == "rejected"
 
 
+def _repropose(db, key, expected_version):
+    """A fresh PROPOSED (new fingerprint) after a terminal REJECTED — the re-propose path."""
+    return append_overlay_event(
+        db, fact_key=key, type=facts.OVERLAY_FACT_PROPOSED, actor=_human(),
+        expected_version=expected_version,
+        payload={
+            "catalog_object_ref": {
+                "catalog_source": "enterprise", "object_kind": "column",
+                "schema": "risk", "table": "loans", "column": "origination_ts",
+            },
+            "object_ref": display_object_ref(_REF), "fact_type": "availability_time",
+            "proposed_value": {"column": "origination_ts", "basis": "ingested_at"},
+            "proposal_fingerprint": "fp2", "evidence_ref": "eviu_2", "proposed_by": "owner_a",
+        },
+    )
+
+
+def test_reproposed_after_verified_then_rejected_reports_draft_not_stale_rejected(db):
+    # M-9: VERIFIED -> REJECTED leaves an overlay_fact_state row (the fact was once CONFIRMED);
+    # a re-propose used to rewrite only overlay_proposal, so resolve_fact kept reporting the stale
+    # REJECTED for a fact whose workflow status is a fresh DRAFT. The PROPOSED projection now
+    # resets the read-model row to the new draft. Fail-closed unchanged: no value is served.
+    key, draft = _propose_draft(db)
+    confirmed = append_overlay_event(
+        db, fact_key=key, type=facts.OVERLAY_FACT_CONFIRMED, actor=_human(), expected_version=1,
+        payload={
+            "value": {"column": "origination_ts", "basis": "posted_at"},
+            "confirmers": [{"subject": "owner_a", "role": "data_owner"}],
+            "expires_at": "2027-01-01T00:00:00+00:00", "confirms_event_id": draft.event_id,
+        },
+    )
+    append_overlay_event(
+        db, fact_key=key, type=facts.OVERLAY_FACT_REJECTED, actor=_human(), expected_version=2,
+        payload={"rejected_by": "user:alice", "target_event_id": confirmed.event_id,
+                 "reason": "wrong basis"},
+    )
+    _repropose(db, key, expected_version=3)
+    run_projection(db, OverlayProjection())
+
+    resolved = resolve_fact(db, StubCatalog(), _REF, "availability_time")
+
+    assert resolved.status == "DRAFT"                       # NOT the stale REJECTED
+    assert resolved.value is None                           # fail-closed: a DRAFT never serves
+    assert resolved.reason_if_missing == "draft_unconfirmed"
+
+
+def test_reproposed_after_never_confirmed_rejection_still_reports_draft(db):
+    # A never-confirmed DRAFT -> REJECTED -> re-propose has NO overlay_fact_state row and falls
+    # through to read_proposal — must keep working (the M-9 reset is a no-op when no row exists).
+    key, draft = _propose_draft(db)
+    append_overlay_event(
+        db, fact_key=key, type=facts.OVERLAY_FACT_REJECTED, actor=_human(), expected_version=1,
+        payload={"rejected_by": "user:alice", "target_event_id": draft.event_id, "reason": "bad"},
+    )
+    _repropose(db, key, expected_version=2)
+    run_projection(db, OverlayProjection())
+
+    resolved = resolve_fact(db, StubCatalog(), _REF, "availability_time")
+
+    assert resolved.status == "DRAFT"
+    assert resolved.value is None
+    assert resolved.reason_if_missing == "draft_unconfirmed"
+
+
 def test_verified_past_expiry_blocks_expired_pending_reverify(db):
     # SP-1.5 Task 3: a VERIFIED overlay fact past its expires_at must fail closed (the async poller
     # may not have STALED it yet) — blocked REVERIFY, surfacing the current value as prior_value.
