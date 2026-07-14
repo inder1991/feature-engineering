@@ -259,6 +259,41 @@ def test_scoped_call_with_foreign_intent_id_is_404(make_client, conn):
     assert ok.json()["intent_id"] == alice_intent
 
 
+# ── 3B.3a shadow isolation: a shadow DB fault must never poison the request's transaction ─────────────
+def test_shadow_db_error_does_not_poison_request_transaction(make_client, conn, monkeypatch):
+    """Savepoint regression (task-5 review). The shadow planner runs on the REQUEST's connection; a
+    DB-level error inside it (statement timeout, schema drift, serialization failure) used to abort the
+    whole transaction — the swallowed exception let the route return 200, but the post-return commit
+    silently became a ROLLBACK and the just-persisted run/scope rows were gone. The savepoint must
+    confine the abort to the shadow call: the response stays 200 AND the request's writes survive."""
+    _bank_multi(conn)
+
+    def _exploding_shadow(shadow_conn, **_kwargs):
+        # A guaranteed DB error ON THE REQUEST'S CONNECTION — the poison the savepoint must contain.
+        shadow_conn.execute("SELECT * FROM a_table_that_does_not_exist")
+
+    monkeypatch.setattr("featuregen.api.routes.contract.run_shadow_planner", _exploding_shadow)
+    client = make_client(_fake())
+
+    # ENTITY-scoped: catalog_source OMITTED + a confirmed target_entity → the shadow branch fires.
+    res = client.post("/contract/considered-set", json={
+        "hypothesis": HYPOTHESIS, "objective": "predict churn", "target_ref": TARGET,
+        "confirmed_scope": {"primary": CHURN, "confirmation_source": "user_confirmed",
+                            "target_entity": "customer"}}, headers=AUTH)
+    assert res.status_code == 200, res.text
+    body = res.json()
+    run, scope_id = body["generation_run_id"], body["scope_id"]
+    assert run and scope_id
+
+    # The transaction is still LIVE and the governing writes SURVIVED the shadow fault: the scope row
+    # the response advertises is really there (without the savepoint this read raises
+    # InFailedSqlTransaction — the poisoned txn that would have turned the commit into a rollback).
+    row = conn.execute(
+        "SELECT scope_id FROM confirmed_generation_scope WHERE generation_run_id = %s",
+        (run,)).fetchone()
+    assert row is not None and row[0] == scope_id
+
+
 # ── Fix 5: every disposition stage carries the replay stamps (evaluation_version + evaluated_at) ───────
 def test_dispositions_carry_replay_stamps(make_client, conn, monkeypatch):
     monkeypatch.setenv(FLAG, "1")

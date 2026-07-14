@@ -22,9 +22,10 @@ def _catalog(db, source):
                (source, _NOW, _NOW))
 
 
-def _tmpl():
+def _tmpl(stock_grains: tuple[str, ...] = ()):
     return Template(id="t_bal", family="f", intent="i",
-                    needs=(Need(role="stock_col", concept="monetary_stock"),
+                    needs=(Need(role="stock_col", concept="monetary_stock",
+                                allowed_source_grains=stock_grains),
                            Need(role="entity", concept="customer_id")),
                     params={}, aggregation="avg", additivity="semi_additive", explain="M", use_cases=(),
                     pit="trailing")
@@ -51,10 +52,12 @@ def test_no_authorized_catalog_is_not_applicable(db):
 
 
 def test_rejected_alternative_does_not_downgrade_a_resolved_result(db):
-    # two catalogs: 'core' binds cleanly; 'bad' has an unsafe stock column (a rejected alternative). The
-    # result must still be `resolved` (candidate-local-first).
+    # two catalogs, and the stock need constrained to the customer grain: 'core' binds cleanly (its
+    # accounts table IS customer-grain); 'bad' has NO grain column, so its stock candidate is
+    # grain_incompatible and its only plan is genuinely non-resolved. Candidate-local-first: the clean
+    # 'core' plan wins AND the rejected 'bad' alternative is preserved, never dropped.
     _catalog(db, "core")
-    bad = [(CanonicalRow("bad", "accounts", "customer_id", "integer", is_grain=True), "customer_id"),
+    bad = [(CanonicalRow("bad", "accounts", "customer_id", "integer"), "customer_id"),  # NOT a grain column
            (CanonicalRow("bad", "accounts", "amt", "numeric"), "monetary_stock"),
            (CanonicalRow("bad", "accounts", "amt2", "numeric"), "outcome_label")]  # noise, not bound
     build_graph(db, "bad", [r for r, _ in bad], concepts={content_hash(r): c for r, c in bad})
@@ -62,6 +65,12 @@ def test_rejected_alternative_does_not_downgrade_a_resolved_result(db):
                "VALUES ('bad', %s, 'r', 1) ON CONFLICT (catalog_source) DO UPDATE SET last_completed_at = %s",
                (_NOW, _NOW))
     scope = resolve_catalog_scope(db, roles=(), target_entity="customer", now=_NOW)
-    result = plan_bindings(db, template=_tmpl(), target_entity="customer", scope=scope, roles=(), now=_NOW)
-    assert result.result_status is PlanResolutionStatus.resolved
-    assert len(result.candidate_plans) >= 2               # alternatives preserved
+    result = plan_bindings(db, template=_tmpl(stock_grains=("customer",)), target_entity="customer",
+                           scope=scope, roles=(), now=_NOW)
+    assert result.result_status is PlanResolutionStatus.resolved   # the clean 'core' plan wins
+    sel = next(p for p in result.candidate_plans if p.plan_id == result.selected_plan_id)
+    assert sel.catalog_source == "core"
+    # …and the rejected alternative from 'bad' is PRESENT and non-resolved (preserved, not dropped).
+    bad_plans = [p for p in result.candidate_plans if p.catalog_source == "bad"]
+    assert bad_plans, "the rejected 'bad' alternative must be preserved in candidate_plans"
+    assert all(p.resolution_status is not PlanResolutionStatus.resolved for p in bad_plans)

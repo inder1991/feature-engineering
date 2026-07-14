@@ -9,6 +9,9 @@ from datetime import datetime
 
 from featuregen.overlay.upload.planner.contracts import (
     BindingPlanningResultV1,
+    BoundingMetricsV1,
+    GroundTemplateDiffOutcome,
+    GroundTemplateDiffV1,
     PlanResolutionStatus,
     ReasonCode,
 )
@@ -40,8 +43,10 @@ def run_shadow_planner(conn, *, eligible_recipe_ids: frozenset[str], target_enti
                 run_id=run_id, recipe_id=rid, target_entity=target_entity, catalog_scope_id=scope.scope_id,
                 selected_plan_id=None, candidate_plans=(), result_status=PlanResolutionStatus.internal_error,
                 primary_reason_code=ReasonCode.planner_internal_error,
-                reason_codes=(ReasonCode.planner_internal_error,), bounding=None,  # type: ignore[arg-type]
-                ground_template_diff=None, replay_envelope=_envelope(scope, rid, target_entity))  # type: ignore[arg-type]
+                reason_codes=(ReasonCode.planner_internal_error,),
+                bounding=BoundingMetricsV1(False, False, False, False, 0, 0, 0),   # zero — nothing was explored
+                ground_template_diff=GroundTemplateDiffV1(GroundTemplateDiffOutcome.not_compared, (), None),
+                replay_envelope=_envelope(scope, rid, target_entity))
         logger.info("shadow_binding_plan recipe=%s status=%s selected=%s scope=%s",
                     result.recipe_id, result.result_status, result.selected_plan_id, scope.scope_id)
         results.append(result)

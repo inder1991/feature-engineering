@@ -408,9 +408,10 @@ def _scoped_considered_set(body: ConsideredSetIn, conn: _Conn, identity: _Identi
     # binding plans for the eligible recipes. Log-only — the response is UNCHANGED.
     if body.catalog_source is None and scope.target_entity is not None:
         try:
-            run_shadow_planner(conn, eligible_recipe_ids=applicability.eligible_ids,
-                               target_entity=scope.target_entity, roles=identity.role_claims,
-                               run_id=generation_run_id, now=now)
+            with conn.transaction():         # savepoint — a shadow DB error must not poison the request's txn
+                run_shadow_planner(conn, eligible_recipe_ids=applicability.eligible_ids,
+                                   target_entity=scope.target_entity, roles=identity.role_claims,
+                                   run_id=generation_run_id, now=now)
         except Exception:                    # shadow must NEVER affect the live response
             logger.exception("shadow planner dispatch failed")
     return response
