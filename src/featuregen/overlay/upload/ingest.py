@@ -190,10 +190,15 @@ def _propose_governed_joins(conn, rows: list[CanonicalRow], *, actor) -> None:
             "cardinality": ref.cardinality,
         }
         try:
-            result = propose_fact(conn, Command(
-                "propose_fact", "overlay_fact", None,
-                {"ref": ref, "fact_type": "approved_join", "proposed_value": value},
-                actor, proposal_fingerprint(value)))
+            # Per-proposal savepoint (audit I-2): a DB-class fault inside propose_fact aborts the
+            # transaction it runs in; the except below swallows the Python exception, so without a
+            # ROLLBACK TO here the REQUEST tx would stay aborted and the next unguarded statement
+            # in ingest would raise InFailedSqlTransaction, rolling back the Pass A facts.
+            with conn.transaction():
+                result = propose_fact(conn, Command(
+                    "propose_fact", "overlay_fact", None,
+                    {"ref": ref, "fact_type": "approved_join", "proposed_value": value},
+                    actor, proposal_fingerprint(value)))
         except Exception:  # noqa: BLE001 — advisory: a proposal failure must never fail an upload
             counters.incr("overlay.governed_joins.propose_error")
             logger.warning("advisory governed-join proposal raised for %s.%s -> %s",
@@ -807,7 +812,16 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
         # written are display-only; route each declared join into the governed approved_join path so
         # it is never stranded display-only. Advisory/fail-soft + adapter-gated. (The `or` is
         # belt-and-braces: governed_joins_enabled already fires under OVERLAY_PASS_C.)
-        _propose_governed_joins(conn, vr.good, actor=actor)
+        # OWN savepoint + except (audit I-2, the Pass C pattern below): a DB-class fault in the
+        # seam must never poison the request tx and roll back Pass A facts + the graph — the seam
+        # degrades to a warning and the upload always ingests.
+        try:
+            with conn.transaction():
+                _propose_governed_joins(conn, vr.good, actor=actor)
+        except Exception:  # noqa: BLE001 — advisory: the governed-join seam never fails an upload
+            counters.incr("overlay.governed_joins.error")
+            logger.warning("advisory governed-join seam failed for %r — Pass A facts + graph "
+                           "intact", catalog_source, exc_info=True)
 
     if pass_c_enabled():
         # Pass C (Phase 3A Task 10): deterministic join-candidate discovery — blocking/scoring from
@@ -834,8 +848,8 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
             synthesize_tables,
         )
         try:
-            # TWO savepoints (exactly like the Pass A stages above — NOT like
-            # _propose_governed_joins, which has no savepoint): a DB abort inside either must not
+            # TWO savepoints (exactly like the Pass A stages and the governed-join seam
+            # above): a DB abort inside either must not
             # poison the request tx and roll back Pass A facts + the quarantine. The try/except
             # makes Pass B strictly advisory. The FIRST savepoint contains the LLM egress + its
             # IMMUTABLE record_llm_call security audit, RELEASED before the advisory stage starts —
