@@ -205,3 +205,44 @@ def test_fingerprint_is_stable_and_composite(db):
     fp2 = derive_catalog_realizations(db, "core").fingerprint
     assert fp1 == fp2 and len(fp1) == 64                              # sha256 hex, deterministic
     assert REALIZATION_DERIVATION_VERSION == "1.0.0"
+
+
+# ── governed-join authority (3B.2A follow-ups): read the human-attested approved_join off the edge ──
+
+def _mark_join(db, catalog_source, **cols):
+    """Simulate the join-governance flow stamping the (single) join edge — approved_join_fact_key /
+    approved_join_status / authority — as the Pass C projection would."""
+    sets = ", ".join(f"{k} = %s" for k in cols)
+    db.execute(f"UPDATE graph_edge SET {sets} WHERE catalog_source = %s AND kind = 'joins'",
+               (*cols.values(), catalog_source))
+
+
+def test_verified_approved_join_stamps_approved_authority(db):
+    _accounts_customer_catalog(db)
+    # a human-attested VERIFIED approved_join projected onto the edge -> APPROVED_JOIN authority
+    _mark_join(db, "core", approved_join_fact_key="fk:x", approved_join_status="VERIFIED")
+    r = derive_catalog_realizations(db, "core").realizations[0]
+    assert r.authority is RealizationAuthority.APPROVED_JOIN
+
+
+def test_display_only_join_is_not_realized(db):
+    _accounts_customer_catalog(db)
+    # an ungoverned display-only edge (governed seam ON, not yet routed) is never realized
+    _mark_join(db, "core", authority="display_only")
+    result = derive_catalog_realizations(db, "core")
+    assert result.realizations == () and result.conflicts == () and result.local_relationships == ()
+
+
+def test_linked_but_unverified_join_is_not_realized(db):
+    _accounts_customer_catalog(db)
+    # a governed edge that is linked (fact_key set) but NOT yet VERIFIED (e.g. DRAFT) -> not realized
+    _mark_join(db, "core", approved_join_fact_key="fk:x", approved_join_status="DRAFT")
+    assert derive_catalog_realizations(db, "core").realizations == ()
+
+
+def test_fingerprint_reflects_a_join_governance_status_change(db):
+    _accounts_customer_catalog(db)
+    fp_before = derive_catalog_realizations(db, "core").fingerprint
+    _mark_join(db, "core", approved_join_fact_key="fk:x", approved_join_status="VERIFIED")
+    fp_after = derive_catalog_realizations(db, "core").fingerprint
+    assert fp_before != fp_after   # the composite key changes when an edge's governance status changes
