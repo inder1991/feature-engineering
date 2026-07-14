@@ -709,6 +709,21 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
         logger.warning("upload of %r held by the large-change brake: %s", catalog_source, brake.reason)
         return IngestResult("held", brake.reason, 0, 0, len(vr.quarantined))
 
+    if not vr.good and vr.quarantined:
+        # Every row quarantined -> nothing usable (a CSV whose headers never mapped to
+        # table/column/type, or a glossary whose FQNs all failed to resolve — the rows still carry a
+        # source, so the "no row has a source" structural error above does NOT catch this). Persist
+        # the quarantine so the reviewer can see WHY each row failed (like the held path), and
+        # return an HONEST non-success status instead of "ingested" with asserted=0. Crucially,
+        # return BEFORE build_graph so a garbage upload NEVER wipes an existing graph (mirrors the
+        # structural-error early-return above). After the brake, so a held upload still reports held.
+        persist_quarantine(conn, catalog_source, vr.quarantined)
+        return IngestResult(
+            "rejected",
+            f"no rows could be ingested — all {len(vr.quarantined)} quarantined "
+            f"(check the file's headers include table/column/type, or that the FQNs resolve)",
+            0, 0, len(vr.quarantined))
+
     asserted = 0
     for table, fact_type, value in _table_facts(vr.good):
         if _assert_fact(conn, catalog_source, table, fact_type, value, actor=actor):
