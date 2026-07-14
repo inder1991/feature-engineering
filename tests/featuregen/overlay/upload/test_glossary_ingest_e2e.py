@@ -105,7 +105,7 @@ def test_glossary_ingest_end_to_end(db, monkeypatch):
 
     # 5) Readiness returns a cause-labelled diagnostic (spec §9).
     readiness = compute_readiness(db, source=_SOURCE, scope=ReadinessScopeType.CATALOG)
-    assert readiness.operational_status == "blocked"                # grain/join are not promoted in Phase 1
+    assert readiness.operational_status == "blocked"                # grain/availability not promoted in Phase 1
     assert all(r.cause for r in readiness.blocking_requirements)    # every blocker carries a cause
     assert CAUSE_NOT_PROMOTED in {r.cause for r in readiness.blocking_requirements}
 

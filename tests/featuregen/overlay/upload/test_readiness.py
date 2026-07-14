@@ -4,8 +4,9 @@ Proves the review-#13 must-fix: after resolve-and-project, :func:`compute_readin
 blocking requirements LABELLED BY CAUSE so the report never conflates three very different
 situations —
 
-* ``not_promoted_in_phase1`` — grain / join, which Phase 1 deliberately does not promote (EXPECTED,
-  never an ingestion failure);
+* ``not_promoted_in_phase1`` — grain / availability, which Phase 1 deliberately does not promote
+  (EXPECTED, never an ingestion failure); the join dimension is now WIRED to live approved_join
+  state and only blocks on a real CONFLICTING relationship;
 * ``unresolved_authority`` — an OPERATIONAL field whose load-bearing value is unresolved because the
   active evidence's authority is insufficient (additivity awaiting a concept confirmation);
 * ``ingestion_error`` — a genuine failure (irreconcilably conflicting evidence).
@@ -87,7 +88,7 @@ def test_catalog_readiness_labels_blockers_by_cause(resolved):
 
     causes = {r.cause for r in rep.blocking_requirements}
     assert "unresolved_authority" in causes   # additivity (OPERATIONAL) awaiting concept confirmation
-    assert "not_promoted_in_phase1" in causes  # grain / join — EXPECTED, not a failure
+    assert "not_promoted_in_phase1" in causes  # grain / availability — EXPECTED, not a failure
     assert "ingestion_error" not in causes     # nothing genuinely failed in this scenario
 
     # The additivity blocker is attributed to unresolved_authority — never to error / not_promoted.
@@ -96,14 +97,16 @@ def test_catalog_readiness_labels_blockers_by_cause(resolved):
     assert additivity[0].cause == "unresolved_authority"
     assert additivity[0].status == "proposed"
 
-    # grain/availability/join blockers are labelled not_promoted_in_phase1 (expected), never
+    # grain/availability blockers are labelled not_promoted_in_phase1 (expected), never
     # ingestion_error. (Phase 2: grain/availability now read the table's fact state — with no
-    # Pass B proposal in this scenario they are still missing/not-promoted blockers.)
+    # Pass B proposal in this scenario they are still missing/not-promoted blockers. The join
+    # dimension is WIRED to live approved_join state: with no relationships it reads NO_CANDIDATES
+    # -> "confirmed" (satisfied) and must never be the old static per-table blocker — that
+    # always-"blocked on joins" noise was the bug the wiring fixed.)
     structural = [r for r in rep.blocking_requirements if r.cause == "not_promoted_in_phase1"]
-    assert {r.requirement_id.split(":")[0] for r in structural} == {
-        "grain", "availability", "join"
-    }
+    assert {r.requirement_id.split(":")[0] for r in structural} == {"grain", "availability"}
     assert all(r.status == "missing" for r in structural)
+    assert not any(r.requirement_id.startswith("join:") for r in rep.blocking_requirements)
 
     # A proposed-unconfirmed concept -> a REVIEW requirement (non-blocking), never a blocker.
     assert any(r.requirement_id.endswith(":concept") for r in rep.review_requirements)
@@ -137,7 +140,10 @@ def test_table_scope_subsets_to_one_table(resolved):
     # accounts fields + accounts structural facts present...
     assert any(i.endswith(":additivity") for i in ids)
     assert any(i.startswith("grain:") and "accounts" in i for i in ids)
-    assert any(i.startswith("join:") and "accounts" in i for i in ids)
+    # ...but NOT the join requirement: wired to live approved_join state, a table with no
+    # relationships is satisfied (NO_CANDIDATES -> "confirmed"), so it surfaces in neither
+    # actionable list (pre-wiring it was a false static blocker on every table).
+    assert not any(i.startswith("join:") for i in ids)
     # ...customers.region is excluded by the subset (fields AND its advisory gap).
     assert not any("region" in i for i in ids)
     assert not any("customers" in i for i in ids)

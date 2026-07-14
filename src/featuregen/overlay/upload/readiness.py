@@ -77,16 +77,19 @@ _LOW_CONFIDENCE = frozenset({"low"})
 # The structural facts Phase 1 does NOT promote (spec §9 / §16). Each in-scope table gets one
 # requirement per fact. Phase 2: grain/availability now READ the table's overlay fact state (Pass B
 # proposes them as DRAFT facts; a human confirm makes them VERIFIED), so their requirement flips
-# missing -> proposed -> confirmed instead of staying hard-coded missing. `join` stays static —
-# Phase 3 owns approved_join state.
+# missing -> proposed -> confirmed instead of staying hard-coded missing. Phase 3A follow-up:
+# `join` is now WIRED too — :func:`_join_requirement_status` coarsens the table's live
+# RelationshipStatus (compute_relationship_readiness) into this requirement, so only a real
+# CONFLICTING relationship blocks; it is never a static missing/not-promoted blocker anymore.
 _PHASE1_UNPROMOTED: tuple[tuple[str, str], ...] = (
     ("grain", "structural_or_human"),
     ("availability", "structural_or_human"),   # Phase 2 addition
     ("join", "approved_join"),
 )
 
-# Requirement name -> the overlay fact_type Pass B proposes under (table_synth). A requirement not
-# in this map (join) has no readable fact stream yet and stays a static missing/not-promoted.
+# Requirement name -> the overlay fact_type Pass B proposes under (table_synth). `join` is NOT here
+# because approved_join state is not a single per-table fact stream: the requirement loop routes it
+# to _join_requirement_status (the relationship-readiness fold) instead.
 _FACT_TYPE_BY_REQUIREMENT = {"grain": "grain", "availability": "availability_time"}
 
 # Granular causes for the non-terminal lifecycle states (must not collapse to "missing"). The
@@ -126,6 +129,30 @@ def _table_fact_status(conn, source, table, requirement) -> tuple[str, str]:
     if status == "STALE":
         return "proposed", CAUSE_FACT_STALE               # drift -> awaiting re-confirm
     return "proposed", CAUSE_PROPOSED_UNCONFIRMED
+
+
+def _join_requirement_status(conn, source, schema, table) -> tuple[str, str]:
+    """The "join" requirement's (readiness_status, cause), wired to REAL approved_join state
+    (Phase 3A follow-up — pre-fix this was a static ("missing", not_promoted) on EVERY table).
+
+    Delegates to :func:`compute_relationship_readiness` — the ONE source of truth folding the
+    table's approved_join facts + weak ledger rows into a :class:`RelationshipStatus` — and
+    coarsens its five-value verdict into the 4-value requirement vocabulary. Only a real
+    CONFLICTING relationship blocks; every other state is satisfied or a review ask, so a table
+    is never falsely "blocked on joins"."""
+    rows = compute_relationship_readiness(conn, source=source, subset=f"{schema}.{table}")
+    status = rows[0].status if rows else RelationshipStatus.NO_CANDIDATES
+    if status is RelationshipStatus.CONFLICTING:
+        # Two active fact_keys claiming one column pair — a genuine failure a human reconciles.
+        return "conflicting", CAUSE_INGESTION_ERROR
+    if status in (RelationshipStatus.CANDIDATE_PROPOSED, RelationshipStatus.WEAK_CANDIDATES_ONLY):
+        # Pending / weak-only candidates: a review ask, never a blocker.
+        return "proposed", CAUSE_PROPOSED_UNCONFIRMED
+    # CONFIRMED (a VERIFIED approved_join) is satisfied. NO_CANDIDATES also maps to "confirmed":
+    # a table with no relationships has nothing to promote, and "confirmed" is the one status the
+    # requirement loop's blocking rule (status in {"missing", "conflicting"}) treats as satisfied
+    # AND the review partition (status == "proposed") leaves out of the review queue.
+    return "confirmed", CAUSE_NOT_PROMOTED
 
 
 class ReadinessScopeType(StrEnum):
@@ -322,9 +349,11 @@ def compute_readiness(
     policies, and reports:
 
     * ``blocking_requirements`` — each carrying a ``cause`` (``not_promoted_in_phase1`` for the
-      grain/join facts Phase 1 does not promote; ``unresolved_authority`` for an OPERATIONAL field
+      structural facts Phase 1 does not promote; ``unresolved_authority`` for an OPERATIONAL field
       whose load-bearing value is unresolved; ``ingestion_error`` for irreconcilably conflicting
-      evidence). ``operational_status`` is ``"blocked"`` iff this list is non-empty.
+      evidence — a conflicting field OR a CONFLICTING join relationship, the join dimension's one
+      blocking state now that it reads live approved_join state). ``operational_status`` is
+      ``"blocked"`` iff this list is non-empty.
     * ``review_requirements`` — shown-but-unconfirmed advisory proposals a human could promote.
     * ``advisory_gaps`` — soft, non-actionable notes (e.g. a low-confidence domain proposal).
     * ``summary_scores`` — DISPLAY-ONLY percentages derived from the requirement list.
@@ -365,16 +394,21 @@ def compute_readiness(
     #    the table's overlay fact state (missing -> proposed -> confirmed); only a `missing` fact
     #    (never proposed, or proposal rejected — the cause distinguishes them) blocks. A confirmed
     #    fact is satisfied; a proposed one is a non-blocking review ask (the `blocking` partition
-    #    below routes it into review_requirements). `join` stays static-missing (Phase 3).
+    #    below routes it into review_requirements). Phase 3A follow-up: `join` reads the table's
+    #    LIVE relationship state (_join_requirement_status) — "conflicting" is its one blocking
+    #    status; grain/availability never yield "conflicting", so their gate is unchanged.
     for schema, table in _tables_of(refs):
         for fact_name, authority in _PHASE1_UNPROMOTED:
-            fact_status, fact_cause = _table_fact_status(conn, source, table, fact_name)
+            if fact_name == "join":
+                fact_status, fact_cause = _join_requirement_status(conn, source, schema, table)
+            else:
+                fact_status, fact_cause = _table_fact_status(conn, source, table, fact_name)
             all_reqs.append(
                 ReadinessRequirement(
                     requirement_id=f"{fact_name}:{source}.{schema}.{table}",
                     scope=ReadinessScopeType.TABLE,
                     status=fact_status,
-                    blocking=fact_status == "missing",
+                    blocking=fact_status in ("missing", "conflicting"),
                     cause=fact_cause,
                     authority_required=authority,
                 )
@@ -447,9 +481,10 @@ def compute_readiness(
 
 # ═══ Relationship readiness (Phase 3A Task 9, spec §16) — a DISTINCT per-table dimension ══════════
 #
-# NOT part of the 4-value ReadinessRequirement.status vocabulary above (the static `join`
-# requirement in _PHASE1_UNPROMOTED is untouched): relationships get their OWN five-value enum and
-# view. Read-only — this dimension never writes.
+# NOT part of the 4-value ReadinessRequirement.status vocabulary above: relationships get their
+# OWN five-value enum and view, which stays the full-detail surface. The coarse FeatureReadiness
+# `join` requirement is now WIRED to this view (_join_requirement_status coarsens the five-value
+# verdict into confirmed/proposed/conflicting) but never changes it. Read-only — never writes.
 
 
 class RelationshipStatus(StrEnum):
