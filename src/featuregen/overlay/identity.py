@@ -111,8 +111,12 @@ def fact_key(
     return _digest(canonical)
 
 
-def display_object_ref(ref: CatalogObjectRef | ApprovedJoinRef) -> str:
+def display_object_ref(ref: CatalogObjectRef | ApprovedJoinRef | EntityBridgeRef) -> str:
     """Human-readable dotted reference carried alongside the hashed key for display/audit (§3.1)."""
+    if isinstance(ref, EntityBridgeRef):
+        # unordered bridge — '<->' (a join's '->' is directional)
+        return (f"{ref.entity_id}: {display_object_ref(ref.left_ref)}"
+                f" <-> {display_object_ref(ref.right_ref)}")
     if isinstance(ref, ApprovedJoinRef):
         return f"{display_object_ref(ref.from_ref)} -> {display_object_ref(ref.to_ref)}"
     parts = [ref.schema, ref.table]

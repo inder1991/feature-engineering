@@ -22,7 +22,7 @@ from featuregen.contracts.db import DbConn
 from featuregen.contracts.identity import IdentityEnvelope
 from featuregen.overlay._types import EligibleAssignee, FactType, Gate, JoinSide, Role
 from featuregen.overlay.catalog import CatalogAdapter
-from featuregen.overlay.identity import ApprovedJoinRef, CatalogObjectRef
+from featuregen.overlay.identity import ApprovedJoinRef, CatalogObjectRef, EntityBridgeRef
 
 
 @dataclass(frozen=True, slots=True)
@@ -123,6 +123,20 @@ def resolve_authority(
             governance_queue=unknown,
             dual=not same_owner,
         )
+    if fact_type == "entity_bridge":
+        if not isinstance(ref, EntityBridgeRef):
+            raise TypeError(
+                f"entity_bridge authority requires an EntityBridgeRef, got {type(ref).__name__}")
+        # 3B.2B shadow: a SINGLE governance confirmation (four-eyes: proposer != confirmer). Two-owner
+        # dual sign-off is deferred to 3C (when a bridge becomes live-traversable). owner_of is consulted
+        # only to collapse onto a shared owner when both catalogs happen to share one.
+        left_owner = adapter.owner_of(ref.left_ref)
+        right_owner = adapter.owner_of(ref.right_ref)
+        if left_owner is not None and left_owner == right_owner:
+            return Authority(role="data_owner", gate="OVERLAY_DATA_OWNER",
+                             subjects=(left_owner,), governance_queue=False)
+        return Authority(role="platform-admin", gate="OVERLAY_DATA_OWNER",
+                         subjects=(), governance_queue=True)
     if not isinstance(ref, CatalogObjectRef):
         raise TypeError(
             f"{fact_type!r} authority requires a CatalogObjectRef, got {type(ref).__name__}"
