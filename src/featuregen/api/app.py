@@ -25,6 +25,7 @@ from featuregen.api.routes import (
     integrations,
     lineage,
     quarantine,
+    readiness,
     search,
     uploads,
 )
@@ -92,6 +93,7 @@ def create_app(llm_client: LLMClient | None = None) -> FastAPI:
     app.include_router(integrations.router)
     app.include_router(search.router)
     app.include_router(quarantine.router)
+    app.include_router(readiness.router)
     app.include_router(graph.router)
     app.include_router(lineage.router)
     app.include_router(features.router)

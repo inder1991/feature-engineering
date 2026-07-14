@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
+from featuregen.overlay.upload.object_ref import _norm
 from featuregen.overlay.upload.read_scope import SENSITIVITY_ROLES
 
 if TYPE_CHECKING:
@@ -98,7 +99,7 @@ def validate_rows(rows: list[CanonicalRow],
         if missing:
             quarantined.append(RowError(i, f"missing required field(s): {', '.join(missing)}", r))
             continue
-        if catalog_source is not None and r.source != catalog_source:
+        if catalog_source is not None and _norm(r.source) != _norm(catalog_source):
             quarantined.append(RowError(
                 i, f"row source '{r.source}' does not match upload source '{catalog_source}'", r))
             continue
@@ -109,7 +110,11 @@ def validate_rows(rows: list[CanonicalRow],
                 i, f"unrecognized sensitivity '{r.sensitivity}' "
                 f"(expected one of: {', '.join(sorted(_VALID_SENSITIVITY - {''}))})", r))
             continue
-        key = (r.source, r.table, r.column)
+        # Key on the SAME strip+lower normalizer as object identity (object_ref._norm): a raw key
+        # would let two case-variant rows for ONE physical column (e.g. a pii-tagged 'SSN' + an
+        # untagged 'ssn') slip past the fail-closed conflict path below and graph an untagged,
+        # world-visible twin of the PII column. The rows themselves flow to build_graph unmutated.
+        key = (_norm(r.source), _norm(r.table), _norm(r.column))
         if key in seen:
             first_row, first_i = seen[key]
             if _material(first_row) == _material(r):

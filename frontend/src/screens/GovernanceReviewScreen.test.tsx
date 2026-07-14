@@ -14,6 +14,7 @@ vi.mock('../api', async importOriginal => {
     listTableFactProposals: vi.fn(),
     confirmTableFact: vi.fn(),
     rejectTableFact: vi.fn(),
+    listRelationshipReadiness: vi.fn(),
   }
 })
 const listJoinProposals = vi.mocked(api.listJoinProposals)
@@ -22,6 +23,7 @@ const rejectJoin = vi.mocked(api.rejectJoin)
 const listTableFactProposals = vi.mocked(api.listTableFactProposals)
 const confirmTableFact = vi.mocked(api.confirmTableFact)
 const rejectTableFact = vi.mocked(api.rejectTableFact)
+const listRelationshipReadiness = vi.mocked(api.listRelationshipReadiness)
 
 // Block body (not an arrow returning the reset): a function returned from beforeEach is treated
 // as a per-test teardown by Vitest (same convention as ReviewQueueScreen.test.tsx).
@@ -47,6 +49,10 @@ beforeEach(() => {
   })
   rejectTableFact.mockReset()
   rejectTableFact.mockResolvedValue({ governance_status: 'REJECTED', category: 'not_unique' })
+  // The screen fetches the read-only readiness diagnostic alongside the two queues; tests that
+  // don't exercise the Readiness tab default it to empty.
+  listRelationshipReadiness.mockReset()
+  listRelationshipReadiness.mockResolvedValue({ source: 'compliance', relationships: [] })
 })
 
 // One PROPOSED proposal with parsed evidence: 4 baseline checklist items + 2 derived (signals).
@@ -281,5 +287,33 @@ describe('governance review screen', () => {
     expect(listJoinProposals).toHaveBeenCalledTimes(2) // reloaded
     expect(confirmJoin).toHaveBeenCalledTimes(1) // never blind-retried
     expect(screen.getByText(/no open join proposals/i)).toBeInTheDocument()
+  })
+
+  it('readiness tab: renders the per-table diagnostic with a status badge and pair counts, read-only', async () => {
+    listJoinProposals.mockResolvedValue({ source: 'compliance', proposals: [], next_cursor: null })
+    listRelationshipReadiness.mockResolvedValue({
+      source: 'compliance',
+      relationships: [{
+        scope: 'TABLE',
+        source: 'compliance',
+        schema: 'public',
+        table: 'transactions',
+        status: 'confirmed',
+        confirmed_pairs: ['a <-> b'],
+        proposed_pairs: [],
+        weak_pairs: [],
+        conflicting_pairs: [],
+      }],
+    })
+    await loadQueue()
+    expect(listRelationshipReadiness).toHaveBeenCalledWith('compliance')
+    await userEvent.click(await screen.findByRole('button', { name: /readiness \(1\)/i }))
+    // The table renders with its precedence-folded status badge and the pair counts.
+    expect(await screen.findByText('public.transactions')).toBeInTheDocument()
+    expect(screen.getByText('confirmed')).toBeInTheDocument() // the badge (exact-match: not "1 confirmed")
+    expect(screen.getByText('1 confirmed')).toBeInTheDocument() // the pair-count pill
+    // READ-ONLY: no approve/reject/checklist surface on this tab.
+    expect(screen.queryByRole('checkbox')).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /approve|reject/i })).not.toBeInTheDocument()
   })
 })

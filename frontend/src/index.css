@@ -3032,3 +3032,21 @@ button.gj-chip--on:hover {
   background: var(--danger);
   border-color: var(--danger);
 }
+
+/* ---------------------------------------------------------------- readiness tab (read-only)
+   Appended for GovernanceReviewScreen's Readiness tab: two QUIET status chips for the
+   nothing-actionable states. Strong outcomes reuse the solid gj- tones above (verified /
+   rejected / proposed); weak-candidates-only stays muted, no-candidates fainter still.
+   Existing tokens only; nothing above this line is modified. */
+
+.badge.gj-weak {
+  background: var(--surface-2);
+  border-color: var(--line);
+  color: var(--ink-soft);
+}
+
+.badge.gj-none {
+  background: var(--paper);
+  border-color: var(--line);
+  color: var(--ink-faint);
+}

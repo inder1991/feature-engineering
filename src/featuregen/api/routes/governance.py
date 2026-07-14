@@ -10,7 +10,10 @@ written, so this surface can never approve a non-join fact), the REAL overlay
 All three routes require the raw `platform-admin` role CLAIM (`require_confirmer`) — the exact
 claim the overlay's dual-owner join confirm authorizes on, so the route gate and the overlay gate
 can never disagree. Overlay denials (already-confirmed, CAS-stale) surface as 409 with a
-human-readable detail; every other denial reason passes through verbatim.
+human-readable detail; every other denial reason passes through verbatim. A denied
+confirm/reject RETURNS its 409 (never raises) so `get_conn` COMMITS the request tx — persisting
+the COMMAND_DENIED security_audit row the overlay wrote on this connection and releasing the
+security-chain advisory lock (audit I-3); a deny appends no fact event, so the commit is safe.
 
 Each handler self-ensures the upload-context catalog adapter: an API-only process registers no
 adapter at startup (the worker does), and `resolve_authority` inside confirm/reject fails closed
@@ -32,6 +35,7 @@ from typing import Annotated, Literal
 
 import psycopg
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from featuregen.api.deps import get_conn, get_identity, require_confirmer
@@ -126,7 +130,17 @@ def confirm_join(fact_key: str, body: ConfirmJoinRequest, conn: _Conn,
         expected_version=None)
     result = confirm_fact(conn, cmd)
     if not result.accepted:
-        raise HTTPException(status_code=409, detail=_deny_to_detail(result.denied_reason))
+        # RETURN the 409, never raise it (audit I-3): get_conn COMMITS the request tx on a normal
+        # return, which persists the COMMAND_DENIED security_audit row the overlay's
+        # `_deny_audited` just wrote on THIS connection — a denied SoD/four-eyes probe leaves a
+        # DURABLE trace — and releases the security-chain advisory lock cleanly. Raising would
+        # roll both back; re-writing the audit on a SECOND connection self-deadlocks on
+        # pg_advisory_xact_lock(7000007) still held by this idle-in-transaction session. Safe to
+        # commit: a deny appends NO fact event (only the audit row, or nothing for benign
+        # CAS-stale/wrong-state denials). The body is byte-identical to HTTPException's
+        # {"detail": ...} rendering, so the client contract is unchanged.
+        return JSONResponse(status_code=409,
+                            content={"detail": _deny_to_detail(result.denied_reason)})
     status = fold_overlay_state(load_fact(conn, fact_key)).status
     projection = "not_applicable"
     if status == "VERIFIED":
@@ -153,7 +167,10 @@ def reject_join(fact_key: str, body: RejectJoinRequest, conn: _Conn,
         expected_version=None)
     result = reject_fact(conn, cmd)
     if not result.accepted:
-        raise HTTPException(status_code=409, detail=_deny_to_detail(result.denied_reason))
+        # RETURN, don't raise — the commit persists the overlay's COMMAND_DENIED audit row
+        # and releases the advisory lock (audit I-3; full rationale in confirm_join).
+        return JSONResponse(status_code=409,
+                            content={"detail": _deny_to_detail(result.denied_reason)})
     return {"governance_status": "REJECTED", "category": body.category}
 
 
@@ -196,7 +213,10 @@ def confirm_table_fact(fact_key: str, body: ConfirmTableFactRequest, conn: _Conn
         expected_version=None)
     result = confirm_fact(conn, cmd)
     if not result.accepted:
-        raise HTTPException(status_code=409, detail=_deny_to_detail(result.denied_reason))
+        # RETURN, don't raise — the commit persists the overlay's COMMAND_DENIED audit row
+        # and releases the advisory lock (audit I-3; full rationale in confirm_join).
+        return JSONResponse(status_code=409,
+                            content={"detail": _deny_to_detail(result.denied_reason)})
     status = fold_overlay_state(load_fact(conn, fact_key)).status
     projection = "not_applicable"
     if status == "VERIFIED":
@@ -224,5 +244,8 @@ def reject_table_fact(fact_key: str, body: RejectTableFactRequest, conn: _Conn,
         expected_version=None)
     result = reject_fact(conn, cmd)
     if not result.accepted:
-        raise HTTPException(status_code=409, detail=_deny_to_detail(result.denied_reason))
+        # RETURN, don't raise — the commit persists the overlay's COMMAND_DENIED audit row
+        # and releases the advisory lock (audit I-3; full rationale in confirm_join).
+        return JSONResponse(status_code=409,
+                            content={"detail": _deny_to_detail(result.denied_reason)})
     return {"governance_status": "REJECTED", "category": body.category}

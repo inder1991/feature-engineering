@@ -461,6 +461,31 @@ export function rejectTableFact(
   })
 }
 
+// ---- relationship readiness (read-only visibility over the governance outcomes) --------------
+// The per-table diagnostic behind the two queues above: one row per table with the precedence-
+// folded status (conflicting > confirmed > candidate_proposed > weak_candidates_only >
+// no_candidates) plus the DISJOINT pair lists (each pair rendered "lo <-> hi", listed once under
+// its own highest category). Pure read — confirmation stays on the governance endpoints.
+
+export interface RelationshipReadiness {
+  scope: string
+  source: string
+  schema: string
+  table: string
+  status: 'no_candidates' | 'candidate_proposed' | 'weak_candidates_only' | 'confirmed'
+    | 'conflicting'
+  confirmed_pairs: string[]
+  proposed_pairs: string[]
+  weak_pairs: string[]
+  conflicting_pairs: string[]
+}
+
+export function listRelationshipReadiness(
+  source: string,
+): Promise<{ source: string; relationships: RelationshipReadiness[] }> {
+  return request(`/sources/${encodeURIComponent(source)}/readiness/relationships`)
+}
+
 export function columnJoins(objectRef: string, source: string): Promise<JoinEdge[]> {
   return request(
     `/columns/${encodeURIComponent(objectRef)}/joins?source=${encodeURIComponent(source)}`)

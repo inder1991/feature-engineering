@@ -291,7 +291,10 @@ def test_identity_less_rows_do_not_open_bogus_conflicts(db):
     res = ingest_upload(db, _SOURCE, upload.rows, actor=_actor(), now=NOW, client=None,
                         glossary=upload)
 
-    assert res.status == "ingested"                                 # the rows quarantine; upload still ok
+    # BOTH rows quarantine (identity-less), so the all-quarantine upload is honestly REJECTED (was
+    # "ingested" pre-fix — the unrecognized-headers bug). The point stands: no bogus conflict opens.
+    assert res.status == "rejected"
+    assert res.quarantined == 2
     assert db.execute("SELECT count(*) FROM conflict_review").fetchone()[0] == 0
 
 
