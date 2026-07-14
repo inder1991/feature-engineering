@@ -50,9 +50,11 @@ class JoinGovernanceNotFound(Exception):
 # Mirrors table_fact_projection._WORKLIST_READER: both sides of an upload-context join route to
 # the platform-admin governance queue (UploadContextAdapter.owner_of -> None), and
 # get_task_proposal authorizes on role_claims — the reader MUST hold platform-admin or every
-# read is denied. Subject-less system reader.
+# read is denied. Subject-less system reader. authenticated=False: get_task_proposal authorizes on
+# role_claims (never .authenticated), and a fabricated authenticated identity is forbidden outside
+# the sanctioned trust roots (mirrors enrich_llm._ENRICH_ACTOR).
 _READER = IdentityEnvelope(
-    subject="system:join-governance", actor_kind="service", authenticated=True,
+    subject="system:join-governance", actor_kind="service", authenticated=False,
     auth_method="internal", role_claims=("platform-admin",))
 
 # Folded stream statuses the queue lists, mapped to the surface vocabulary: a folded DRAFT is
