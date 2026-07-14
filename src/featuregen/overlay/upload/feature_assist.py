@@ -603,10 +603,11 @@ def route_strategies(conn, cols: list[dict]) -> list[tuple[str, str]]:
         (sources, refs)).fetchall()
     if sum(1 for dt, _, _ in rows if _is_numeric(dt)) >= 2:
         picks.append(("ratio", "ratios / cross-features between two numeric columns (e.g. utilization)"))
-    # aggregation applies if a candidate column is a join key (from_ref) OR a candidate TABLE is the
-    # parent that children join to (to_ref) — the entity-grain "aggregate children up" case. Scoped to
+    # aggregation applies if a candidate column is a join key (from_ref) OR the parent column that
+    # children join to (to_ref) — the entity-grain "aggregate children up" case. graph_edge stores
+    # BOTH endpoints COLUMN-level (public.table.column — declared edges in graph.py and Pass-C
+    # projected edges alike), so both sides compare against the candidate column refs. Scoped to
     # the candidate catalogs so cross-catalog same-named refs don't spuriously enable it.
-    tables = [f"public.{c['object_ref'].split('.')[-2]}" for c in cols if c["object_ref"].count(".") >= 2]
     # authority='operational' (Task 7): a governed-seam display-only edge must NOT enable a feature
     # strategy — the confirmed approved_join fact is the source of truth once the seam is on.
     # Governed edge filter (Pass C Task 8): a fact-LINKED edge enables a strategy only while its
@@ -615,7 +616,7 @@ def route_strategies(conn, cols: list[dict]) -> list[tuple[str, str]]:
                     "AND (approved_join_fact_key IS NULL OR approved_join_status = 'VERIFIED') "
                     "AND catalog_source = ANY(%s) "
                     "AND (from_ref = ANY(%s) OR to_ref = ANY(%s)) LIMIT 1",
-                    (list(set(sources)), refs, tables)).fetchone() is not None:
+                    (list(set(sources)), refs, refs)).fetchone() is not None:
         picks.append(("aggregation", "aggregations (count/sum/avg) over related child rows via a join key"))
     if any(a for _, a, _ in rows):
         picks.append(("temporal", "recency / trend / velocity over a point-in-time (as-of) column"))
