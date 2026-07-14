@@ -10,7 +10,10 @@ written, so this surface can never approve a non-join fact), the REAL overlay
 All three routes require the raw `platform-admin` role CLAIM (`require_confirmer`) — the exact
 claim the overlay's dual-owner join confirm authorizes on, so the route gate and the overlay gate
 can never disagree. Overlay denials (already-confirmed, CAS-stale) surface as 409 with a
-human-readable detail; every other denial reason passes through verbatim.
+human-readable detail; every other denial reason passes through verbatim. A denied
+confirm/reject RETURNS its 409 (never raises) so `get_conn` COMMITS the request tx — persisting
+the COMMAND_DENIED security_audit row the overlay wrote on this connection and releasing the
+security-chain advisory lock (audit I-3); a deny appends no fact event, so the commit is safe.
 
 Each handler self-ensures the upload-context catalog adapter: an API-only process registers no
 adapter at startup (the worker does), and `resolve_authority` inside confirm/reject fails closed
@@ -28,15 +31,14 @@ a stale drift watermark's correct refusal reports "pending".
 """
 from __future__ import annotations
 
-import logging
 from typing import Annotated, Literal
 
 import psycopg
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from featuregen.api.deps import _auth_stub_enabled, get_conn, get_identity, require_confirmer
-from featuregen.config import get_settings
+from featuregen.api.deps import get_conn, get_identity, require_confirmer
 from featuregen.contracts.envelopes import Command, IdentityEnvelope
 from featuregen.overlay.confirmation_commands import confirm_fact, reject_fact
 from featuregen.overlay.state import fold_overlay_state
@@ -55,9 +57,6 @@ from featuregen.overlay.upload.table_fact_governance import (
     project_verified_table_fact,
 )
 from featuregen.overlay.upload.upload_catalog import ensure_upload_catalog_adapter
-from featuregen.security.audit import record_security_event
-
-logger = logging.getLogger(__name__)
 
 router = APIRouter()
 _Conn = Annotated[psycopg.Connection, Depends(get_conn, scope="function")]
@@ -88,30 +87,6 @@ def _clean(s: str | None) -> str | None:
     """Strip; an empty/whitespace-only note becomes None (absent, not '')."""
     s = (s or "").strip()
     return s or None
-
-
-def _audit_governance_denial(identity: IdentityEnvelope, action: str,
-                             reason: str | None) -> None:
-    """Durably record a governance denial (same-subject re-confirm, four-eyes, not-owner, stale
-    CAS...). The overlay already wrote a COMMAND_DENIED row via `_deny_audited` — but on the
-    REQUEST connection, and the 409 the route raises next makes `get_conn` roll that back, so a
-    denied SoD-bypass probe would leave ZERO durable trace. Mirror `deps.audit_access_denied`
-    (the 403 path): write on a SEPARATE committing connection that survives the request rollback.
-    Best-effort — an audit failure must never turn a correct 409 into a 500 — and skipped under
-    the dev auth stub (a production control; a separate committing connection would pollute the
-    rolled-back test DB)."""
-    if _auth_stub_enabled():
-        return
-    dsn = get_settings().dsn
-    if not dsn:
-        return
-    try:
-        with psycopg.connect(dsn) as conn:   # own tx, committed on exit — survives the 409 rollback
-            record_security_event(conn, event_type="COMMAND_DENIED", actor=identity,
-                                  attempted_action=action, decision="denied", reason=reason,
-                                  aggregate="overlay_fact")
-    except Exception:  # noqa: BLE001 — never let an audit failure mask the (correct) denial
-        logger.warning("failed to durably record governance denial for %s", action, exc_info=True)
 
 
 def _deny_to_detail(reason: str | None) -> str:
@@ -155,11 +130,17 @@ def confirm_join(fact_key: str, body: ConfirmJoinRequest, conn: _Conn,
         expected_version=None)
     result = confirm_fact(conn, cmd)
     if not result.accepted:
-        # Durable BEFORE the 409: the overlay's own denial audit rides the request tx, which
-        # the 409 rolls back (get_conn) — re-record on a separate committing connection.
-        _audit_governance_denial(identity, f"confirm_fact approved_join {fact_key}",
-                                 result.denied_reason)
-        raise HTTPException(status_code=409, detail=_deny_to_detail(result.denied_reason))
+        # RETURN the 409, never raise it (audit I-3): get_conn COMMITS the request tx on a normal
+        # return, which persists the COMMAND_DENIED security_audit row the overlay's
+        # `_deny_audited` just wrote on THIS connection — a denied SoD/four-eyes probe leaves a
+        # DURABLE trace — and releases the security-chain advisory lock cleanly. Raising would
+        # roll both back; re-writing the audit on a SECOND connection self-deadlocks on
+        # pg_advisory_xact_lock(7000007) still held by this idle-in-transaction session. Safe to
+        # commit: a deny appends NO fact event (only the audit row, or nothing for benign
+        # CAS-stale/wrong-state denials). The body is byte-identical to HTTPException's
+        # {"detail": ...} rendering, so the client contract is unchanged.
+        return JSONResponse(status_code=409,
+                            content={"detail": _deny_to_detail(result.denied_reason)})
     status = fold_overlay_state(load_fact(conn, fact_key)).status
     projection = "not_applicable"
     if status == "VERIFIED":
@@ -186,10 +167,10 @@ def reject_join(fact_key: str, body: RejectJoinRequest, conn: _Conn,
         expected_version=None)
     result = reject_fact(conn, cmd)
     if not result.accepted:
-        # Durable BEFORE the 409 — see _audit_governance_denial (the request tx rolls back).
-        _audit_governance_denial(identity, f"reject_fact approved_join {fact_key}",
-                                 result.denied_reason)
-        raise HTTPException(status_code=409, detail=_deny_to_detail(result.denied_reason))
+        # RETURN, don't raise — the commit persists the overlay's COMMAND_DENIED audit row
+        # and releases the advisory lock (audit I-3; full rationale in confirm_join).
+        return JSONResponse(status_code=409,
+                            content={"detail": _deny_to_detail(result.denied_reason)})
     return {"governance_status": "REJECTED", "category": body.category}
 
 
@@ -232,10 +213,10 @@ def confirm_table_fact(fact_key: str, body: ConfirmTableFactRequest, conn: _Conn
         expected_version=None)
     result = confirm_fact(conn, cmd)
     if not result.accepted:
-        # Durable BEFORE the 409 — see _audit_governance_denial (the request tx rolls back).
-        _audit_governance_denial(identity, f"confirm_fact {ctx['fact_type']} {fact_key}",
-                                 result.denied_reason)
-        raise HTTPException(status_code=409, detail=_deny_to_detail(result.denied_reason))
+        # RETURN, don't raise — the commit persists the overlay's COMMAND_DENIED audit row
+        # and releases the advisory lock (audit I-3; full rationale in confirm_join).
+        return JSONResponse(status_code=409,
+                            content={"detail": _deny_to_detail(result.denied_reason)})
     status = fold_overlay_state(load_fact(conn, fact_key)).status
     projection = "not_applicable"
     if status == "VERIFIED":
@@ -263,8 +244,8 @@ def reject_table_fact(fact_key: str, body: RejectTableFactRequest, conn: _Conn,
         expected_version=None)
     result = reject_fact(conn, cmd)
     if not result.accepted:
-        # Durable BEFORE the 409 — see _audit_governance_denial (the request tx rolls back).
-        _audit_governance_denial(identity, f"reject_fact {ctx['fact_type']} {fact_key}",
-                                 result.denied_reason)
-        raise HTTPException(status_code=409, detail=_deny_to_detail(result.denied_reason))
+        # RETURN, don't raise — the commit persists the overlay's COMMAND_DENIED audit row
+        # and releases the advisory lock (audit I-3; full rationale in confirm_join).
+        return JSONResponse(status_code=409,
+                            content={"detail": _deny_to_detail(result.denied_reason)})
     return {"governance_status": "REJECTED", "category": body.category}

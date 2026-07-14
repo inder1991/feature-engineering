@@ -46,6 +46,7 @@ from tests.featuregen.overlay.upload.test_table_fact_governance import (
     _seed_graph_nodes as _seed_table_graph_nodes,
 )
 
+from featuregen.api.deps import get_conn
 from featuregen.events.registry import event_registry
 from featuregen.overlay.catalog import _clear_catalog_adapter
 from featuregen.overlay.catalog_changes import _write_watermark, detect_catalog_changes
@@ -497,3 +498,88 @@ def test_table_fact_unknown_fact_key_404(client):
     r = client.post("/governance/table-facts/no-such-key/reject",
                     json={"category": "needs_data_check"}, headers=_h("priya"))
     assert r.status_code == 404
+
+
+# ═══════════ Denial-audit durability — audit I-3 redo (commit the deny-path tx) ══════════════════
+
+
+def _denial_rows(conn) -> list[str]:
+    """The raw denied_reason of every COMMAND_DENIED row on the tamper-evident chain."""
+    return [r[0] for r in conn.execute(
+        "SELECT reason FROM security_audit WHERE event_type = 'COMMAND_DENIED' ORDER BY seq"
+    ).fetchall()]
+
+
+@pytest.fixture
+def prod_tx_client(client, conn):
+    """`client` with get_conn re-overridden to PRODUCTION transaction semantics at savepoint
+    granularity: a route that RETURNS releases the savepoint (deps.get_conn: commit), a route
+    that RAISES rolls back to it (deps.get_conn: rollback). The plain `client` override does
+    neither, so under it a COMMAND_DENIED row written on the request conn stays visible after a
+    409 whether or not production get_conn would have rolled it back — THIS override is what
+    makes denial-audit DURABILITY (audit I-3) observable inside the suite's rolled-back outer
+    transaction."""
+    conn.execute("SELECT 1")   # open the outer tx so conn.transaction() nests as a SAVEPOINT
+
+    def _prod_like():
+        with conn.transaction():
+            yield conn
+
+    client.app.dependency_overrides[get_conn] = _prod_like
+    return client
+
+
+def test_denied_confirm_commits_a_durable_command_denied_row(prod_tx_client, seeded_join, conn):
+    """A four-eyes/SoD denial must leave a DURABLE trace: the overlay's `_deny_audited` writes
+    COMMAND_DENIED on the REQUEST connection, so the route must COMMIT the deny-path tx (return
+    the 409, not raise it) — raising makes get_conn roll the row back and an insider probe
+    leaves zero evidence (audit I-3)."""
+    _ref, key = seeded_join
+    r = prod_tx_client.post(f"/governance/joins/{key}/confirm", json={}, headers=_h("priya"))
+    assert r.status_code == 200, r.text
+
+    # same-admin repeat -> the overlay denies (SoD), the 409 body is the HTTPException-identical
+    # contract, AND the COMMAND_DENIED row SURVIVES the request (the deny-path tx committed).
+    r = prod_tx_client.post(f"/governance/joins/{key}/confirm", json={}, headers=_h("priya"))
+    assert r.status_code == 409
+    assert r.json() == {"detail": "You already approved this — a different admin must confirm."}
+    assert _denial_rows(conn) == ["this owner already confirmed; awaiting the other owner"]
+
+
+def test_successful_confirm_writes_no_denial_row(prod_tx_client, seeded_join, conn):
+    _ref, key = seeded_join
+    r = prod_tx_client.post(f"/governance/joins/{key}/confirm", json={"note": "cif ok"},
+                            headers=_h("priya"))
+    assert r.status_code == 200, r.text
+    assert r.json()["governance_status"] == "PARTIALLY_CONFIRMED"
+    assert _denial_rows(conn) == []
+
+
+def test_denied_409_is_returned_not_raised_on_all_four_routes(
+        prod_tx_client, seeded_join, seeded_grain, conn):
+    """Every governed deny path RETURNS its 409 (committing the request tx) with the exact
+    `{"detail": ...}` body HTTPException produced — the frontend contract is unchanged. The
+    not-awaiting denials here are benign plain-CommandResult denials (no audit row), proving
+    the deny-path commit is a harmless no-op when there is nothing to persist."""
+    _jref, join_key = seeded_join
+    _gref, grain_key = seeded_grain
+    assert prod_tx_client.post(f"/governance/joins/{join_key}/reject",
+                               json={"category": "needs_data_check"},
+                               headers=_h("priya")).status_code == 200
+    assert prod_tx_client.post(f"/governance/table-facts/{grain_key}/reject",
+                               json={"category": "not_unique"},
+                               headers=_h("priya")).status_code == 200
+
+    body = {"detail": "fact not awaiting confirmation (status=REJECTED)"}
+    r = prod_tx_client.post(f"/governance/joins/{join_key}/confirm", json={}, headers=_h("priya"))
+    assert (r.status_code, r.json()) == (409, body)
+    r = prod_tx_client.post(f"/governance/joins/{join_key}/reject",
+                            json={"category": "wrong_direction"}, headers=_h("priya"))
+    assert (r.status_code, r.json()) == (409, body)
+    r = prod_tx_client.post(f"/governance/table-facts/{grain_key}/confirm", json={},
+                            headers=_h("priya"))
+    assert (r.status_code, r.json()) == (409, body)
+    r = prod_tx_client.post(f"/governance/table-facts/{grain_key}/reject",
+                            json={"category": "needs_data_check"}, headers=_h("priya"))
+    assert (r.status_code, r.json()) == (409, body)
+    assert _denial_rows(conn) == []   # benign denials are unaudited; the commit persisted nothing
