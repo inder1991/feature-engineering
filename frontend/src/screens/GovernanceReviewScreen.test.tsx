@@ -224,6 +224,51 @@ describe('governance review screen', () => {
     expect(rejectTableFact).not.toHaveBeenCalled()
   })
 
+  it('keeps the joins tab populated when only the table-facts fetch fails (decoupled queues)', async () => {
+    // Whole-branch review FIX 2: the two queues settle independently — a table-facts endpoint
+    // failure must not blank the joins tab; it surfaces as a per-tab error on the facts tab.
+    listJoinProposals.mockResolvedValue({
+      source: 'compliance', proposals: [PROPOSAL], next_cursor: null,
+    })
+    listTableFactProposals.mockRejectedValue(new api.ApiError(500, 'table-facts queue exploded'))
+    await loadQueue()
+    // The joins queue rendered despite the sibling failure.
+    expect(await screen.findAllByText('COMP_FINANCIAL_TRAN_REPOS_DLY')).not.toHaveLength(0)
+    expect(screen.getByRole('button', { name: /joins \(1\)/i })).toBeInTheDocument()
+    // The facts tab is still reachable and shows ITS error, not a blank screen.
+    await userEvent.click(screen.getByRole('button', { name: /grain & availability/i }))
+    expect(await screen.findByRole('alert')).toHaveTextContent(/table-facts queue exploded/i)
+    // Switching back: the joins queue is still there.
+    await userEvent.click(screen.getByRole('button', { name: /joins \(1\)/i }))
+    expect(screen.getAllByText('COMP_FINANCIAL_TRAN_REPOS_DLY')).not.toHaveLength(0)
+  })
+
+  it('keeps the facts tab loadable when only the joins fetch fails (the reverse decoupling)', async () => {
+    listJoinProposals.mockRejectedValue(new api.ApiError(500, 'joins queue exploded'))
+    listTableFactProposals.mockResolvedValue({
+      source: 'compliance',
+      proposals: [{
+        fact_key: 'fact:grain:compliance.t',
+        task_id: 'tf1',
+        target_event_id: 'ev1',
+        fact_type: 'grain' as const,
+        table: 't',
+        proposed_value: { columns: ['cif_id'], is_unique: true },
+        status: 'PROPOSED' as const,
+        origin: 'llm_proposed_not_profiled',
+        advisory: { table_role: null, primary_entity: null, event_or_snapshot: null },
+        evidence_parse_status: 'parsed',
+      }],
+      next_cursor: null,
+    })
+    await loadQueue()
+    // The joins tab (the default) shows its own error…
+    expect(await screen.findByRole('alert')).toHaveTextContent(/joins queue exploded/i)
+    // …while the facts queue is intact and reachable.
+    await userEvent.click(screen.getByRole('button', { name: /grain & availability \(1\)/i }))
+    expect(await screen.findAllByText(/cif_id/)).not.toHaveLength(0)
+  })
+
   it('on a 409 conflict shows the server detail and reloads the list, never blind-retrying', async () => {
     listJoinProposals
       .mockResolvedValueOnce({ source: 'compliance', proposals: [PROPOSAL], next_cursor: null })

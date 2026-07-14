@@ -56,6 +56,10 @@ function approvedFactNote(projection: string): string {
     : 'Verified — the operational projection is deferred to the next caught-up ingest.'
 }
 
+function errorDetail(err: unknown): string {
+  return err instanceof ApiError ? err.detail : String(err)
+}
+
 export function GovernanceReviewScreen() {
   const [source, setSource] = useState('')
   const [proposals, setProposals] = useState<JoinProposal[] | null>(null)
@@ -64,7 +68,10 @@ export function GovernanceReviewScreen() {
   // Which queue is on screen. Only one renders at a time — per-card state (checklists, reject
   // boxes) is keyed component state, so switching tabs does not leak ticks across kinds.
   const [tab, setTab] = useState<'joins' | 'facts'>('joins')
-  const [error, setError] = useState('')
+  // Per-QUEUE load errors (whole-branch review FIX 2): each tab surfaces its OWN fetch failure
+  // without blanking the other tab's data.
+  const [joinsError, setJoinsError] = useState('')
+  const [factsError, setFactsError] = useState('')
   // Conflict banner (409): survives the reload that follows it, unlike `error`.
   const [notice, setNotice] = useState('')
   // Session-only DISPLAY state for cards decided this session, keyed by fact_key. The durable
@@ -81,28 +88,25 @@ export function GovernanceReviewScreen() {
   async function load(name: string) {
     if (!name.trim()) return
     const id = ++loadSeq.current
-    setError('')
     setNotice('')
-    try {
-      // Both queues load together so the tab counts are honest and a 409 reload refreshes both.
-      const [joinsRes, factsRes] = await Promise.all([
-        listJoinProposals(name.trim()),
-        listTableFactProposals(name.trim()),
-      ])
-      if (id !== loadSeq.current) return
-      setProposals(joinsRes.proposals)
-      setTableFacts(factsRes.proposals)
-      setLoadedSource(name.trim())
-      setDecided(new Map())
-      setGeneration(g => g + 1)
-    } catch (err) {
-      if (id !== loadSeq.current) return
-      setProposals(null)
-      setTableFacts(null)
-      setLoadedSource('')
-      setDecided(new Map())
-      setError(err instanceof ApiError ? err.detail : String(err))
-    }
+    // Both queues load together so the tab counts are honest and a 409 reload refreshes both —
+    // but they settle INDEPENDENTLY (whole-branch review FIX 2): a table-facts endpoint failure
+    // must not reject the joins load and blank its tab (or vice versa). Each tab renders from
+    // its own settled result; a failed queue shows a per-tab error instead.
+    const [joinsRes, factsRes] = await Promise.allSettled([
+      listJoinProposals(name.trim()),
+      listTableFactProposals(name.trim()),
+    ])
+    if (id !== loadSeq.current) return
+    setProposals(joinsRes.status === 'fulfilled' ? joinsRes.value.proposals : null)
+    setJoinsError(joinsRes.status === 'rejected' ? errorDetail(joinsRes.reason) : '')
+    setTableFacts(factsRes.status === 'fulfilled' ? factsRes.value.proposals : null)
+    setFactsError(factsRes.status === 'rejected' ? errorDetail(factsRes.reason) : '')
+    setLoadedSource(
+      joinsRes.status === 'fulfilled' || factsRes.status === 'fulfilled' ? name.trim() : '',
+    )
+    setDecided(new Map())
+    setGeneration(g => g + 1)
   }
 
   function submit(e: FormEvent) {
@@ -137,25 +141,30 @@ export function GovernanceReviewScreen() {
           Load proposals
         </button>
       </form>
-      {error && (
-        <p role="alert" className="error">
-          {error}
-        </p>
-      )}
       {notice && (
         <p role="alert" className="error">
           {notice}
         </p>
       )}
-      {proposals && tableFacts && (
+      {(proposals || tableFacts) && (
         <div className="viewtoggle" role="group" aria-label="Proposal kind">
           <button type="button" aria-pressed={tab === 'joins'} onClick={() => setTab('joins')}>
-            Joins ({proposals.length})
+            Joins ({proposals ? proposals.length : '—'})
           </button>
           <button type="button" aria-pressed={tab === 'facts'} onClick={() => setTab('facts')}>
-            Grain &amp; availability ({tableFacts.length})
+            Grain &amp; availability ({tableFacts ? tableFacts.length : '—'})
           </button>
         </div>
+      )}
+      {tab === 'joins' && joinsError && (
+        <p role="alert" className="error">
+          {joinsError}
+        </p>
+      )}
+      {tab === 'facts' && factsError && (
+        <p role="alert" className="error">
+          {factsError}
+        </p>
       )}
       {tab === 'joins' && proposals?.length === 0 && (
         <p className="empty" role="status">

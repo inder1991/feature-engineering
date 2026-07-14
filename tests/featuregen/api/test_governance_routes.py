@@ -39,6 +39,7 @@ from tests.featuregen.overlay.upload.test_join_governance import (
     _seed_join_with_evidence,
 )
 from tests.featuregen.overlay.upload.test_table_fact_governance import (
+    _seed_availability,
     _seed_grain,
 )
 from tests.featuregen.overlay.upload.test_table_fact_governance import (
@@ -363,6 +364,33 @@ def test_table_fact_single_admin_confirm_verifies_and_projects(
     flags = _grain_flags(conn)
     assert flags["cif_id"][0] is True and flags["cif_id"][1] is not None
     assert flags["amt"][0] is False
+    # a verified fact leaves the open queue
+    r = client.get("/sources/src/governance/table-facts", headers=_h("priya"))
+    assert r.json()["proposals"] == []
+
+
+def test_table_fact_availability_confirm_verifies_and_projects(
+        client, sealed_config, overlay_env, conn):
+    """The availability_time sibling of the grain happy path (whole-branch review FIX 3): one
+    platform-admin confirm on a Pass B as-of proposal -> VERIFIED + synchronously projected —
+    graph_node.is_as_of lands on the proposed column with fact-event provenance."""
+    _ref, key = _seed_availability(overlay_env, table="t", column="tran_date")
+    _seed_table_graph_nodes(conn, cols=("cif_id", "tran_date"))
+    _write_watermark(conn, "src", datetime.now(UTC))   # fresh: within the default 60m SLA
+
+    r = client.post(f"/governance/table-facts/{key}/confirm", json={"note": "as-of looks right"},
+                    headers=_h("priya"))
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["governance_status"] == "VERIFIED"
+    assert body["operational_projection"] == "projected"
+    assert fold_overlay_state(load_fact(conn, key)).status == "VERIFIED"
+    # is_as_of landed on tran_date IN THIS REQUEST, with fact-event provenance — and only there
+    flags = {c: (a, e) for c, a, e in conn.execute(
+        "SELECT column_name, is_as_of, availability_fact_event_id FROM graph_node "
+        "WHERE catalog_source = 'src' AND table_name = 't' AND kind = 'column'").fetchall()}
+    assert flags["tran_date"][0] is True and flags["tran_date"][1] is not None
+    assert flags["cif_id"][0] is False
     # a verified fact leaves the open queue
     r = client.get("/sources/src/governance/table-facts", headers=_h("priya"))
     assert r.json()["proposals"] == []
