@@ -259,6 +259,95 @@ def test_scoped_call_with_foreign_intent_id_is_404(make_client, conn):
     assert ok.json()["intent_id"] == alice_intent
 
 
+# ── 3B.3a shadow isolation: a shadow DB fault must never poison the request's transaction ─────────────
+def test_shadow_db_error_does_not_poison_request_transaction(make_client, conn, monkeypatch):
+    """Savepoint regression (task-5 review). The shadow planner runs on the REQUEST's connection; a
+    DB-level error inside it (statement timeout, schema drift, serialization failure) used to abort the
+    whole transaction — the swallowed exception let the route return 200, but the post-return commit
+    silently became a ROLLBACK and the just-persisted run/scope rows were gone. The savepoint must
+    confine the abort to the shadow call: the response stays 200 AND the request's writes survive."""
+    _bank_multi(conn)
+
+    def _exploding_shadow(shadow_conn, **_kwargs):
+        # A guaranteed DB error ON THE REQUEST'S CONNECTION — the poison the savepoint must contain.
+        shadow_conn.execute("SELECT * FROM a_table_that_does_not_exist")
+
+    monkeypatch.setattr("featuregen.api.routes.contract.run_shadow_planner", _exploding_shadow)
+    client = make_client(_fake())
+
+    # ENTITY-scoped: catalog_source OMITTED + a confirmed target_entity → the shadow branch fires.
+    res = client.post("/contract/considered-set", json={
+        "hypothesis": HYPOTHESIS, "objective": "predict churn", "target_ref": TARGET,
+        "confirmed_scope": {"primary": CHURN, "confirmation_source": "user_confirmed",
+                            "target_entity": "customer"}}, headers=AUTH)
+    assert res.status_code == 200, res.text
+    body = res.json()
+    run, scope_id = body["generation_run_id"], body["scope_id"]
+    assert run and scope_id
+
+    # The transaction is still LIVE and the governing writes SURVIVED the shadow fault: the scope row
+    # the response advertises is really there (without the savepoint this read raises
+    # InFailedSqlTransaction — the poisoned txn that would have turned the commit into a rollback).
+    row = conn.execute(
+        "SELECT scope_id FROM confirmed_generation_scope WHERE generation_run_id = %s",
+        (run,)).fetchone()
+    assert row is not None and row[0] == scope_id
+
+
+# ── 3B.3a per-recipe savepoint: a DB error SWALLOWED inside run_shadow_planner must not poison the txn ─
+def test_shadow_internal_db_error_swallowed_by_planner_does_not_poison_transaction(
+        make_client, conn, monkeypatch):
+    """Savepoint-defeat regression (task-5 whole-branch review). run_shadow_planner isolates planner
+    failures per recipe with a try/except that SWALLOWS the exception and continues — so a DB-level
+    error inside plan_bindings aborts the psycopg transaction yet run_shadow_planner returns NORMALLY.
+    The route's OUTER savepoint then exits without an exception and its RELEASE SAVEPOINT raises
+    InFailedSqlTransaction on the aborted subtransaction, which the route's except also swallows: the
+    request returns 200 while the poisoned transaction turns the post-return commit into a silent
+    ROLLBACK — the advertised run/scope rows are LOST. The per-recipe savepoint inside
+    run_shadow_planner must trigger ROLLBACK TO SAVEPOINT on the failing recipe so the connection
+    stays usable and the request's writes survive a real commit."""
+    _bank_multi(conn)
+
+    def _exploding_discovery(disc_conn, *_args, **_kwargs):
+        # A guaranteed DB error INSIDE plan_bindings, on the request's connection — the path the
+        # sibling test above does NOT exercise (there run_shadow_planner itself raises).
+        disc_conn.execute("SELECT * FROM a_table_that_does_not_exist")
+
+    monkeypatch.setattr("featuregen.overlay.upload.planner.plan.discover_ingredient_candidates",
+                        _exploding_discovery)
+    client = make_client(_fake())
+
+    # ENTITY-scoped: catalog_source OMITTED + a confirmed target_entity → the shadow branch fires.
+    res = client.post("/contract/considered-set", json={
+        "hypothesis": HYPOTHESIS, "objective": "predict churn", "target_ref": TARGET,
+        "confirmed_scope": {"primary": CHURN, "confirmation_source": "user_confirmed",
+                            "target_entity": "customer"}}, headers=AUTH)
+    assert res.status_code == 200, res.text
+    body = res.json()
+    run, scope_id = body["generation_run_id"], body["scope_id"]
+    assert run and scope_id
+
+    # The governing scope row the response advertises survived a REAL commit (the exact step the bug
+    # corrupts: committing a poisoned transaction silently ROLLS BACK and the row is gone).
+    conn.commit()
+    try:
+        row = conn.execute(
+            "SELECT scope_id FROM confirmed_generation_scope WHERE generation_run_id = %s",
+            (run,)).fetchone()
+        assert row is not None and row[0] == scope_id
+    finally:
+        # This test COMMITTED (the point of the proof), so the suite's rollback isolation cannot undo
+        # it — restore the empty committed baseline ourselves (precedent: security/conftest truncates
+        # after its committing test). schema_migrations + the migration-seeded projection_checkpoints
+        # rows are the only committed baseline state; everything else app-level starts empty.
+        conn.rollback()   # clear any in-flight (possibly aborted) txn so the cleanup can run
+        tables = [r[0] for r in conn.execute(
+            "SELECT tablename FROM pg_tables WHERE schemaname = 'public' "
+            "AND tablename NOT IN ('schema_migrations', 'projection_checkpoints')").fetchall()]
+        conn.execute("TRUNCATE " + ", ".join(f'"{t}"' for t in tables) + " CASCADE")
+        conn.commit()
+
+
 # ── Fix 5: every disposition stage carries the replay stamps (evaluation_version + evaluated_at) ───────
 def test_dispositions_carry_replay_stamps(make_client, conn, monkeypatch):
     monkeypatch.setenv(FLAG, "1")
