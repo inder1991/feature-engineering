@@ -108,6 +108,25 @@ def test_sensitivity_floor_restricts_but_does_not_certify(resolved):
     assert decision.load_bearing_value_hash is None                     # not a certified classification
 
 
+def test_certified_below_floor_sensitivity_records_floor_clamped_load_bearing_value(db):
+    # Defense-in-depth (review): a CERTIFIED classification BELOW the taxonomy floor
+    # (source-attested `public` under a `pii` -> `restricted` floor) must record a load-bearing
+    # value clamped to the floor — exactly like the display value — never the raw below-floor
+    # `public`. Pre-fix the decision logged the RAW certified value, so the audit log carried an
+    # operational sensitivity below the floor.
+    build_graph(db, _SOURCE, [_ROW])
+    _seed(db, "sensitivity_floor", "pii", EvidenceProducer.TAXONOMY, AssertionStrength.PROPOSED)
+    _seed(db, "sensitivity", "public", EvidenceProducer.SOURCE, AssertionStrength.ATTESTED)
+    resolve_and_project(db, source=_SOURCE, logical_refs=[_REF])
+
+    decision = read_field_decisions(db, _REF, "sensitivity")[-1]
+    assert decision.display_value_hash == canonical_hash("restricted")       # already clamped
+    assert decision.load_bearing_value_hash == canonical_hash("restricted")  # clamped, not "public"
+    # the certification itself is unchanged: a source-attested classification still certifies
+    (classification_status,) = _node(db, "classification_status")
+    assert classification_status == "confirmed"
+
+
 def test_decision_event_per_field_carries_both_effective_values(resolved):
     # An advisory field (concept): DISPLAY present, load-bearing absent.
     concept = read_field_decisions(resolved, _REF, "concept")[-1]

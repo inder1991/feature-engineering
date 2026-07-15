@@ -272,6 +272,14 @@ def _resolve_sensitivity(
     effective_restriction = apply_sensitivity_floor(floor, proposals, now=now)
     certified = classification.load_bearing_value is not None
     classification_status = "confirmed" if certified else "proposed"
+    # Defense-in-depth (review): the RECORDED load-bearing value is floor-clamped exactly like the
+    # display value — a certified below-floor classification (e.g. `public` under a `restricted`
+    # floor) must never enter the decision log as an operational sensitivity below the floor.
+    # None (nothing certified) stays None: clamping records a restriction, never manufactures one.
+    certified_restriction = (
+        apply_sensitivity_floor(floor, [_to_restriction(classification.load_bearing_value)], now=now)
+        if certified else None
+    )
 
     all_evidence = [*floor_evidence, *class_evidence]
     decision_id = _record(
@@ -280,7 +288,7 @@ def _resolve_sensitivity(
         field_name=_SENSITIVITY_FIELD,
         evidence=all_evidence,
         display_value=effective_restriction,          # the shown, floor-guaranteed restriction
-        load_bearing_value=classification.load_bearing_value,  # None until a source/human certifies
+        load_bearing_value=certified_restriction,     # None until a source/human certifies
         conflict_status="resolved" if certified else (classification.unresolved_reason or "floor_only"),
         reason_codes=[] if certified else [classification.unresolved_reason or "floor_only"],
         now=now,
