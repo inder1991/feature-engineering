@@ -42,6 +42,7 @@ from featuregen.overlay.identity import (
     ApprovedJoinRef,
     CatalogObjectRef,
     ColumnPair,
+    EntityBridgeRef,
     fact_key,
     proposal_fingerprint,
 )
@@ -154,6 +155,24 @@ def _seed_verified_grain(conn, admin, *, source="src", table="txn_grain"):
     assert res.accepted, res.denied_reason
     assert fold_overlay_state(load_fact(conn, key)).status == "VERIFIED"
     return key
+
+
+def _seed_open_bridge_task(conn):
+    """An OPEN entity_bridge gate task via the REAL 3B.2B propose path (propose_fact -> open_task).
+    entity_bridge is NOT a dashboard-governed fact type and never lands in ``overlay_proposal``
+    (projection.py early-returns it), so its open task sits OUTSIDE the dashboard's enumeration."""
+    ref = EntityBridgeRef(
+        entity_id="party",
+        left_ref=CatalogObjectRef("src", "column", "public", "customers", "party_id"),
+        right_ref=CatalogObjectRef("src2", "column", "public", "parties", "party_id"))
+    value = {"entity_id": "party",
+             "left_ref": asdict(ref.left_ref), "right_ref": asdict(ref.right_ref)}
+    res = propose_fact(conn, Command(
+        "propose_fact", "overlay_fact", None,
+        {"ref": ref, "fact_type": "entity_bridge", "proposed_value": value},
+        SERVICE_ACTOR, proposal_fingerprint(value)))
+    assert res.accepted, res.denied_reason
+    return fact_key(ref, "entity_bridge")
 
 
 # ── Fixtures ─────────────────────────────────────────────────────────────────────────────────────
@@ -368,6 +387,32 @@ def test_recent_activity_counts_the_window(passc_conn, seed_governed_facts):
 
 
 # ── Cross-source + per-source summaries ──────────────────────────────────────────────────────────
+
+
+def test_catalog_queue_counts_only_enumerated_governed_tasks(passc_conn, seed_two_sources):
+    """The CATALOG headline queue must count ONLY the enumerated governed-fact tasks, so it
+    reconciles with the per-source queues (and the rollups). Pre-fix the catalog scope ran an
+    UNSCOPED ``status='open'`` query, so a NON-governed open task (here an entity_bridge gate
+    task — 3B.2B proposes it via propose_fact -> open_task, but projection.py keeps it out of
+    ``overlay_proposal``) inflated the headline open_depth: catalog 4 vs per-source 2+1."""
+    bridge_key = _seed_open_bridge_task(passc_conn)
+    _drain(passc_conn)
+    # the bridge gate task IS open, and its fact is NOT in the governed enumeration
+    assert passc_conn.execute(
+        "SELECT count(*) FROM human_tasks WHERE status = 'open' AND fact_key = %s",
+        (bridge_key,)).fetchone()[0] == 1
+    assert passc_conn.execute(
+        "SELECT count(*) FROM overlay_proposal WHERE fact_key = %s",
+        (bridge_key,)).fetchone()[0] == 0
+
+    catalog = compute_governance_dashboard(passc_conn, source=None)
+    per_source = [compute_governance_dashboard(passc_conn, source=s) for s in ("src", "src2")]
+    # reconciliation: the catalog queue == the sum of the per-source queues (2 side-labelled
+    # tasks for the dual DRAFT join + 1 for the DRAFT grain) — the bridge task is EXCLUDED
+    assert catalog.queue_health.open_depth == \
+        sum(d.queue_health.open_depth for d in per_source)
+    assert catalog.queue_health.open_depth == 3
+    assert sum(catalog.queue_health.age_buckets.values()) == 3
 
 
 def test_cross_source_and_source_summaries(passc_conn, seed_two_sources):

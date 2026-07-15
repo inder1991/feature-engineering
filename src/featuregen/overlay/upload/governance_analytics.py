@@ -10,8 +10,10 @@ Folds the governed pipeline's three stores into the one dashboard shape the gove
   The one loaded stream also yields the reject ``category`` (the last ``OVERLAY_FACT_REJECTED``
   event's payload) and the CONFIRMED/REJECTED timestamps for recent activity — no double load.
 * **Queue health** — open ``human_tasks`` depth + age buckets (``lt_1d``/``1_7d``/``gt_7d``).
-  ``human_tasks`` has no ``catalog_source`` column, so a source scope filters by the source's
-  enumerated fact_keys.
+  ``human_tasks`` has no ``catalog_source`` column, so EVERY scope — the catalog view included —
+  filters by the scope's enumerated governed fact_keys. Non-governed open tasks (e.g. the 3B.2B
+  ``entity_bridge`` gate tasks, which never enter ``overlay_proposal``) are excluded, so the
+  headline ``open_depth`` always reconciles with the rollups + the per-source rows.
 * **Calibration seed** — the ``pass_c_candidate_evidence`` ledger (bucket + evidence_json) joined
   with the FOLDED outcome per fact_key: per-bucket confirm rates, and reject categories attributed
   to the top-``score_delta`` positive signal. The Phase-4 calibration/HITL input.
@@ -188,14 +190,12 @@ def _rollups(records: list[_FactRecord]) -> tuple[FactTypeRollup, ...]:
     return tuple(out)
 
 
-def _queue_health(conn: DbConn, fact_keys: list[str] | None, now: datetime) -> QueueHealth:
-    """Open-task depth + age buckets. ``fact_keys=None`` -> cross-source (every open task);
-    a list scopes to those keys (``human_tasks`` has no catalog_source column); an EMPTY list
-    short-circuits to zeros (no governed facts -> no queue)."""
-    if fact_keys is None:
-        rows = conn.execute(
-            "SELECT created_at FROM human_tasks WHERE status = 'open'").fetchall()
-    elif not fact_keys:
+def _queue_health(conn: DbConn, fact_keys: list[str], now: datetime) -> QueueHealth:
+    """Open-task depth + age buckets for the scope's ENUMERATED governed fact_keys — every scope
+    (catalog included) filters by fact_key, because ``human_tasks`` has no catalog_source column
+    AND holds non-governed tasks (e.g. entity_bridge gates) that must never inflate the governed
+    queue. An EMPTY list short-circuits to zeros (no governed facts -> no queue)."""
+    if not fact_keys:
         rows = []
     else:
         rows = conn.execute(
@@ -338,8 +338,10 @@ def compute_governance_dashboard(
         source=source_norm,
         generated_at=now.isoformat(),
         fact_types=_rollups(records),
-        queue_health=_queue_health(
-            conn, None if source_norm is None else [r.fact_key for r in records], now),
+        # BOTH scopes pass the enumerated governed fact_keys (`records` is already cross-source
+        # when source_norm is None): the catalog headline counts ONLY governed-fact tasks and
+        # reconciles with the rollups + the sum of the per-source queues.
+        queue_health=_queue_health(conn, [r.fact_key for r in records], now),
         calibration_seed=_calibration_seed(conn, source_norm, join_records),
         recent_activity=_recent_activity(records, now),
     )
