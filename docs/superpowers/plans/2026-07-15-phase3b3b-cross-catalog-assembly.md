@@ -79,14 +79,34 @@ def test_make_binding_plan_validates_and_derives():
     assert len(plan.plan_id) > 3
 
 
-def test_make_binding_plan_rejects_bad_participation():
+def _bridge_seg(cat, e="account"):
+    return c.BindingPathSegmentV1(c.SegmentKind.governed_bridge, cat, from_entity=e, to_entity=e,
+                                  bridge_fact_key=f"b_{cat}")
+
+
+def test_make_binding_plan_derives_multibridge_participation():
+    # a 2-bridge path core->other->third derives ordered/deduped participation, bridge_count, tier_3
+    segs = (c.BindingPathSegmentV1(c.SegmentKind.direct_catalog, "core"),
+            _bridge_seg("other"), _bridge_seg("third"))
+    plan = c.make_binding_plan(
+        recipe_id="t", target_entity="customer", catalog_source="core",
+        ingredient_bindings=(), path_segments=segs,
+        resolution_status=c.PlanResolutionStatus.resolved,
+        path_resolution_status=c.PathResolutionStatus.source_to_target_resolved,
+        primary_reason_code=None, reason_codes=(), safety=c.BindingSafety.safe,
+        preference_rank=0, preference_reasons=(), candidate_role=c.CandidateRole.selected)
+    assert plan.participating_catalogs == ("core", "other", "third")
+    assert plan.bridge_count == 2 and plan.tier is c.PlanTier.tier_3_multi_bridge
+
+
+def test_make_binding_plan_rejects_over_budget_bridges():
     import pytest
-    bridge = c.BindingPathSegmentV1(c.SegmentKind.governed_bridge, "other", from_entity="account",
-                                    to_entity="account", bridge_fact_key="b1")
+    # 3 governed bridges exceeds MAX_BRIDGES_PER_PLAN (2) -> fail-closed, never constructed
+    segs = (c.BindingPathSegmentV1(c.SegmentKind.direct_catalog, "core"),
+            _bridge_seg("c1"), _bridge_seg("c2"), _bridge_seg("c3"))
     with pytest.raises(ValueError):
-        # a governed_bridge to catalog 'other' whose catalog isn't first / participation mismatch
         c.make_binding_plan(recipe_id="t", target_entity="c", catalog_source="core",
-                            ingredient_bindings=(), path_segments=(bridge,),
+                            ingredient_bindings=(), path_segments=segs,
                             resolution_status=c.PlanResolutionStatus.resolved,
                             path_resolution_status=c.PathResolutionStatus.source_to_target_resolved,
                             primary_reason_code=None, reason_codes=(), safety=c.BindingSafety.safe,
@@ -129,14 +149,15 @@ def make_binding_plan(*, recipe_id, target_entity, catalog_source, ingredient_bi
             participating.append(seg.catalog_source)
     bridge_count = sum(1 for s in path_segments if s.segment_kind is SegmentKind.governed_bridge)
     tier = tier_from_bridge_count(bridge_count)
-    # structural validation (fail closed on a malformed plan)
-    if participating[0] != catalog_source:
-        raise ValueError("participating_catalogs[0] must be catalog_source")
-    if len(set(participating)) != len(participating):
-        raise ValueError("participating_catalogs has duplicates")
-    for s in path_segments:
-        if s.catalog_source not in participating:
-            raise ValueError(f"segment catalog {s.catalog_source!r} not in participating_catalogs")
+    # structural validation — participating_catalogs/bridge_count are DERIVED here (single source of truth,
+    # so they can't drift), leaving one meaningful fail-closed invariant: the bridge budget. A plan that
+    # exceeds MAX_BRIDGES_PER_PLAN must NEVER be constructed (the assembler bounds this, but the canonical
+    # constructor enforces it so no caller can mint an over-budget plan).
+    if bridge_count > MAX_BRIDGES_PER_PLAN:
+        raise ValueError(f"bridge_count {bridge_count} exceeds MAX_BRIDGES_PER_PLAN {MAX_BRIDGES_PER_PLAN}")
+    if path_resolution_status is PathResolutionStatus.source_to_target_resolved \
+            and resolution_status is PlanResolutionStatus.unresolved:
+        raise ValueError("source_to_target_resolved plan cannot have resolution_status=unresolved")
     refs = tuple(sorted(b.bound_object_ref for b in ingredient_bindings))
     material = (f"{recipe_id}|{catalog_source}|{'|'.join(refs)}|{tier}|"
                f"{'>'.join(f'{s.segment_kind}:{s.catalog_source}:{s.realization_ref or s.bridge_fact_key or \"\"}' for s in path_segments)}"
