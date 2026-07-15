@@ -1,4 +1,8 @@
-from featuregen.overlay.upload.canonical import CanonicalRow, validate_rows
+from featuregen.overlay.upload.canonical import (
+    MAX_COLUMNS_PER_TABLE,
+    CanonicalRow,
+    validate_rows,
+)
 
 
 def _row(**kw):
@@ -132,3 +136,34 @@ def test_conflicting_metadata_for_a_column_fails_closed():
     result = validate_rows(rows)
     assert all(not (r.table == "t" and r.column == "ssn") for r in result.good)  # neither accepted
     assert sum(1 for q in result.quarantined if q.row and q.row.column == "ssn") == 2
+
+
+def test_table_at_the_column_bound_ingests_normally():
+    rows = [_row(column=f"c{i}") for i in range(MAX_COLUMNS_PER_TABLE)]
+    result = validate_rows(rows)
+    assert len(result.good) == MAX_COLUMNS_PER_TABLE
+    assert result.quarantined == []
+
+
+def test_table_over_the_column_bound_is_quarantined_whole():
+    # Lineage installs a whole anchor table even past its node cap ("acceptable under upload
+    # governance, where table widths are bounded" — lineage.py) and the LLM table-synthesis egress
+    # filter rejects >64 column profiles. Ingest must UPHOLD the width bound both assume (#29):
+    # an over-wide table is quarantined WHOLE — never a silent arbitrary prefix of its columns.
+    wide = [_row(column=f"c{i}") for i in range(MAX_COLUMNS_PER_TABLE + 1)]
+    narrow = [_row(table="customers", column="id")]
+    result = validate_rows(wide + narrow)
+    assert len(result.good) == 1                               # the under-bound table still ingests
+    assert result.good[0].table == "customers"
+    assert len(result.quarantined) == MAX_COLUMNS_PER_TABLE + 1
+    assert all("accounts" in q.message and str(MAX_COLUMNS_PER_TABLE) in q.message
+               and "column" in q.message for q in result.quarantined)
+
+
+def test_column_bound_counts_unique_columns_not_raw_rows():
+    # Dedup happens first: bound-many unique columns plus duplicate rows is still AT the bound.
+    rows = [_row(column=f"c{i}") for i in range(MAX_COLUMNS_PER_TABLE)]
+    rows += [_row(column="c0"), _row(column="C1 ")]            # exact + case/space-variant dups
+    result = validate_rows(rows)
+    assert len(result.good) == MAX_COLUMNS_PER_TABLE
+    assert result.quarantined == []
