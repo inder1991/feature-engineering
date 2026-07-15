@@ -71,3 +71,18 @@ def test_find_join_path_direct_and_multihop(db):
     multi = find_join_path(db, "bank", "transactions", "customers")
     assert multi is not None and len(multi) == 2
     assert find_join_path(db, "bank", "transactions", "nowhere") is None
+
+
+def test_find_join_path_does_not_traverse_absent_target_table(db):
+    # #12: an operational edge whose TARGET table isn't loaded must NOT be traversable — a feature/
+    # contract path must never run THROUGH a nonexistent table. (Display surfaces still show the
+    # pending edge; this is find_join_path only.)
+    pending = [CanonicalRow("bank", "transactions", "acct_id", "integer",
+                            joins_to="accounts.account_id", cardinality="N:1")]
+    build_graph(db, "bank", pending)
+    assert find_join_path(db, "bank", "transactions", "accounts") is None
+    # Once the target table IS loaded, the same declared edge traverses normally.
+    build_graph(db, "bank", pending + [
+        CanonicalRow("bank", "accounts", "account_id", "integer", is_grain=True)])
+    path = find_join_path(db, "bank", "transactions", "accounts")
+    assert path is not None and len(path) == 1

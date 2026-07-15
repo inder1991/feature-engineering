@@ -40,7 +40,10 @@ def find_join_path(conn, catalog_source: str, from_table: str,
     """The shortest join path (list of steps) between two tables, or None if unreachable.
     [] when from_table == to_table. Edges are traversed undirected (you may join either way). READ-
     SCOPED: an edge whose from/to column has a sensitivity the caller's roles can't see is excluded, so
-    a path can't be walked THROUGH a restricted join key the caller isn't cleared to know about."""
+    a path can't be walked THROUGH a restricted join key the caller isn't cleared to know about.
+    BOTH endpoints must EXIST in this catalog (#12): an edge whose target column isn't loaded is a
+    display-only pending fact, never a traversable hop — a feature/contract path must not run through
+    an absent table (display/lineage surfaces still show pending edges; this filter is here only)."""
     if from_table == to_table:
         return []
     allowed = allowed_sensitivities(roles)
@@ -55,6 +58,9 @@ def find_join_path(conn, catalog_source: str, from_table: str,
         # while its approved_join fact is VERIFIED — the independent second gate for the async
         # ingest-latency window. A declared edge (fact_key NULL) traverses byte-for-byte.
         "  AND (e.approved_join_fact_key IS NULL OR e.approved_join_status = 'VERIFIED') "
+        # #12: a missing endpoint node makes the LEFT JOIN's sensitivity NULL — which would PASS the
+        # filters below. Require both endpoints to exist so a path never traverses an absent table.
+        "  AND fn.object_ref IS NOT NULL AND tn.object_ref IS NOT NULL "
         "  AND (fn.sensitivity IS NULL OR fn.sensitivity = ANY(%s)) "
         "  AND (tn.sensitivity IS NULL OR tn.sensitivity = ANY(%s))",
         (catalog_source, allowed, allowed)).fetchall()

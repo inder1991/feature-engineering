@@ -85,6 +85,20 @@ def _edge_rows(conn, source="src"):
         r[2:], strict=True)) for r in rows}
 
 
+@pytest.fixture(autouse=True)
+def _endpoint_nodes(passc_conn):
+    """`find_join_path` requires BOTH endpoint nodes to exist (#12). In production a join edge's
+    endpoints are always loaded columns (candidates come from the built graph; the confirm path's
+    referent gate validates against graph_node), so seed the candidate's endpoint columns here —
+    traversal assertions must exercise the authority/status filters, not node absence."""
+    for obj_ref, table, col, grain in ((_FROM, "transactions", "cif_id", False),
+                                       (_TO, "customers", "cif_id", True)):
+        passc_conn.execute(
+            "INSERT INTO graph_node (catalog_source, object_ref, kind, table_name, column_name,"
+            " is_grain, is_as_of) VALUES ('src', %s, 'column', %s, %s, %s, false)",
+            (obj_ref, table, col, grain))
+
+
 # ── Governed edge filter (flag-off-safe) ─────────────────────────────────────────────────────────
 
 

@@ -458,10 +458,24 @@ _FROM = "public.transactions.cif_id"
 _TO = "public.customers.cif_id"
 
 
+def _seed_endpoint_nodes(conn) -> None:
+    """The seeded candidate's endpoint COLUMN nodes. In production a VERIFIED join's endpoints
+    always exist in graph_node (Pass C candidates come from loaded columns and the confirm path's
+    referent gate — join_referents.check_referents_exist — validates against the graph);
+    find_join_path requires both to exist (#12), so traversal tests must seed them."""
+    for obj_ref, table, col, grain in ((_FROM, "transactions", "cif_id", False),
+                                       (_TO, "customers", "cif_id", True)):
+        conn.execute(
+            "INSERT INTO graph_node (catalog_source, object_ref, kind, table_name, column_name,"
+            " is_grain, is_as_of) VALUES ('src', %s, 'column', %s, %s, %s, false)",
+            (obj_ref, table, col, grain))
+
+
 def test_project_verified_join_creates_operational_edge(passc_conn, human_admin_1, human_admin_2):
     """A just-VERIFIED join becomes operational SYNCHRONOUSLY — find_join_path traverses without
     waiting for a re-upload (`_confirm_join` drains the overlay READ-MODEL projection but never
     projects graph edges, so the edge here is created by `project_verified_join` alone)."""
+    _seed_endpoint_nodes(passc_conn)
     ref, _key = _seed_join_with_evidence(passc_conn)
     _confirm_join(passc_conn, ref, admin1=human_admin_1, admin2=human_admin_2)
     assert find_join_path(passc_conn, "src", "transactions", "customers") is None
@@ -481,6 +495,7 @@ def test_project_verified_join_projects_within_the_confirming_request(
     drain-before-project) and then project — the operational edge exists and `find_join_path`
     traverses it IMMEDIATELY, no re-ingest. Pre-fix this always returned "pending" (edge absent
     until a future re-upload)."""
+    _seed_endpoint_nodes(passc_conn)
     ref, key = _seed_join_with_evidence(passc_conn)
     _confirm_once(passc_conn, ref, key, human_admin_1, "side one")
     _confirm_once(passc_conn, ref, key, human_admin_2, "side two")   # VERIFIED — no drain ran
