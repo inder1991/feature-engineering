@@ -325,8 +325,9 @@ def test_rollup_bridges_self_guard_on_mismatched_position_entity(db):
 # a state with no permitted transition becomes a REJECTED candidate (missing_realization /
 # unsanctioned_bridge / bounded_out_*) — never a fabricated segment.
 # ---------------------------------------------------------------------------------------------
-from featuregen.overlay.upload.planner.assembly import assemble_paths
+from featuregen.overlay.upload.planner.assembly import assemble_paths, rank_and_classify
 from featuregen.overlay.upload.planner.contracts import (
+    BindingPathSegmentV1,
     BindingQuality,
     BindingSafety,
     CandidateRole,
@@ -334,6 +335,7 @@ from featuregen.overlay.upload.planner.contracts import (
     PathResolutionStatus,
     PlanResolutionStatus,
     PlanTier,
+    make_binding_plan,
 )
 from featuregen.overlay.upload.taxonomy.entity_relationships import EntitySemanticPathV1
 
@@ -521,6 +523,39 @@ def test_equal_rank_complete_paths_resolve_with_ambiguity(db):
     assert all(p.resolution_status is PlanResolutionStatus.resolved_with_ambiguity
                for p in asm.complete)
     assert asm.complete[0].plan_id < asm.complete[1].plan_id      # canonical plan_id tie-break
+
+
+def test_unknown_realizer_authority_ranks_worst_not_best(db):
+    # B4-review M3, fail-closed: a realizer segment the governed authority lookup cannot resolve
+    # must rank LAST (INFERRED_JOIN-level), never default to APPROVED-best.
+    _core_catalog(db)   # core's txn->account realization is a DECLARED_JOIN (authority rank 1)
+
+    def _plan(ref):
+        return make_binding_plan(
+            recipe_id="t3b3b", target_entity="account", catalog_source="core",
+            ingredient_bindings=_bindings("core"),
+            path_segments=(
+                BindingPathSegmentV1(segment_kind=SegmentKind.direct_catalog, catalog_source="core"),
+                BindingPathSegmentV1(segment_kind=SegmentKind.semantic_rollup, catalog_source="core",
+                                     from_entity="transaction", to_entity="account",
+                                     cardinality="many_to_one"),
+                BindingPathSegmentV1(segment_kind=SegmentKind.intra_catalog_realization,
+                                     catalog_source="core", realization_ref=ref)),
+            resolution_status=PlanResolutionStatus.resolved,
+            path_resolution_status=PathResolutionStatus.source_to_target_resolved,
+            primary_reason_code=None, reason_codes=(), safety=BindingSafety.safe,
+            preference_rank=-1, preference_reasons=(), candidate_role=CandidateRole.rejected)
+
+    known = _plan("core:public.transactions.account_id->public.accounts.account_id")
+    unknown = _plan("core:THIS_REALIZATION_DOES_NOT_EXIST")
+    ranked = rank_and_classify(db, (unknown, known))
+    # the resolvable DECLARED realizer (rank 1) beats the unresolvable one (worst, rank 2)
+    assert [p.path_segments[2].realization_ref for p in ranked] == [
+        "core:public.transactions.account_id->public.accounts.account_id",
+        "core:THIS_REALIZATION_DOES_NOT_EXIST"]
+    assert ranked[0].candidate_role is CandidateRole.selected
+    assert ranked[1].candidate_role is CandidateRole.lower_rank_alternative   # strictly worse: no tie
+    assert all(p.resolution_status is PlanResolutionStatus.resolved for p in ranked)
 
 
 # --- fail-closed rejects: missing_realization / unsanctioned_bridge ----------------------------

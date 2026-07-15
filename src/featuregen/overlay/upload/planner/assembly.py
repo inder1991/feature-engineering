@@ -442,6 +442,9 @@ def assemble_paths(conn, *, source_position: _Position, semantic_path: EntitySem
                 r_moves = realize_in_place(conn, state.position, hop, scope)
                 if len(r_moves) > MAX_REALIZATIONS_PER_HOP:
                     realizations_truncated = True
+                    # ReasonCode.bounded_out_max_realizations_per_hop is RESERVED for this cut. It is
+                    # not attached to a candidate: the truncated state CONTINUES on the kept moves (no
+                    # reject is minted here), so the cut is surfaced on the bounding metrics instead.
                     r_moves = r_moves[:MAX_REALIZATIONS_PER_HOP]
                 roll_moves = rollup_bridges(conn, state.position, hop, scope)
             repo_moves = reposition_bridges(conn, state.position, scope)
@@ -529,14 +532,16 @@ def _authority_rank_lookup(conn, plans: Sequence[BindingPlanV1]) -> dict[tuple[s
 def _rank_key(p: BindingPlanV1, authority: dict[tuple[str, str], int]) -> tuple[int, int, int, int, int]:
     """The FULL ranking precedence (best-first, plan_id excluded): validity/safety -> bridge_count
     -> ingredient-binding rank (order.py's worst-binding quality) -> semantic-path rank (fewer
-    realized hops) -> physical-realization rank (worst realizer authority; a pure-bridge path has
-    no realizer and ranks neutrally at 0)."""
+    realized hops) -> physical-realization rank (worst realizer authority). Fail-closed: a realizer
+    the governed lookup cannot resolve ranks WORST (INFERRED_JOIN-level), never APPROVED-best. A
+    pure-bridge path has no realizer segment and ranks neutrally at 0 (the `default=`)."""
     return (
         0 if p.safety is BindingSafety.safe else 1,
         p.bridge_count,
         _agg_quality(p),
         sum(1 for s in p.path_segments if s.segment_kind is SegmentKind.semantic_rollup),
-        max((authority.get((s.catalog_source, s.realization_ref or ""), 0)
+        max((authority.get((s.catalog_source, s.realization_ref or ""),
+                           _AUTHORITY_RANK[RealizationAuthority.INFERRED_JOIN])
              for s in p.path_segments
              if s.segment_kind is SegmentKind.intra_catalog_realization), default=0),
     )
