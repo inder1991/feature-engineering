@@ -366,26 +366,31 @@ def create_sync(integration_id: str, body: SyncIn, conn: _Conn, identity: _Ident
     service_name may be typed by hand, so a sync can be created even while OM discovery is down. One
     sync per (integration, service_name): a duplicate is a 409."""
     _get_integration(conn, integration_id)
-    if not body.service_name.strip():
+    # STRIP the identifiers before they are stored (#16): the service name keys the one-sync-per-
+    # service slot and target_source IS the catalog identity, so a padded variant must never mint a
+    # second sync/catalog beside the trimmed one.
+    service_name = body.service_name.strip()
+    target_source = body.target_source.strip()
+    if not service_name:
         raise HTTPException(status_code=400, detail="service_name is required")
-    if not body.target_source.strip():
+    if not target_source:
         raise HTTPException(status_code=400, detail="target_source is required")
     if body.tag_map_override is not None:
         _validate_tag_map(body.tag_map_override)
-    if store.sync_exists_for_service(conn, integration_id, body.service_name):
+    if store.sync_exists_for_service(conn, integration_id, service_name):
         raise HTTPException(
             status_code=409,
-            detail=f"a sync for service '{body.service_name}' already exists on this integration")
+            detail=f"a sync for service '{service_name}' already exists on this integration")
     try:
         sync = store.create_sync(
-            conn, integration_id=integration_id, service_name=body.service_name,
+            conn, integration_id=integration_id, service_name=service_name,
             database_filter=body.database_filter, schema_filter=body.schema_filter,
-            target_source=body.target_source, tag_map_override=body.tag_map_override,
+            target_source=target_source, tag_map_override=body.tag_map_override,
             table_naming=body.table_naming, created_by=identity.subject)
     except store.SyncServiceConflict as exc:   # lost the race after the pre-check passed
         raise HTTPException(
             status_code=409,
-            detail=f"a sync for service '{body.service_name}' already exists on this "
+            detail=f"a sync for service '{service_name}' already exists on this "
                    "integration") from exc
     return sync
 
@@ -410,9 +415,11 @@ def get_sync_by_id(integration_id: str, sync_id: str, conn: _Conn, identity: _Id
 def patch_sync(integration_id: str, sync_id: str, body: SyncPatch, conn: _Conn,
                identity: _Identity) -> dict:
     current = _get_sync_of_integration(conn, integration_id, sync_id)
-    service_name = body.service_name if body.service_name is not None else current["service_name"]
+    # STRIP the identifiers before they replace the stored ones (#16) — same rule as create_sync.
+    service_name = (body.service_name if body.service_name is not None
+                    else current["service_name"]).strip()
     target_source = (body.target_source if body.target_source is not None
-                     else current["target_source"])
+                     else current["target_source"]).strip()
     table_naming = body.table_naming if body.table_naming is not None else current["table_naming"]
     database_filter = (body.database_filter if body.database_filter is not None
                        else current["database_filter"])
@@ -421,9 +428,9 @@ def patch_sync(integration_id: str, sync_id: str, body: SyncPatch, conn: _Conn,
     tag_map_override = (body.tag_map_override if body.tag_map_override is not None
                         else current["tag_map_override"])
 
-    if not service_name.strip():
+    if not service_name:
         raise HTTPException(status_code=400, detail="service_name is required")
-    if not target_source.strip():
+    if not target_source:
         raise HTTPException(status_code=400, detail="target_source is required")
     if tag_map_override is not None:
         _validate_tag_map(tag_map_override)

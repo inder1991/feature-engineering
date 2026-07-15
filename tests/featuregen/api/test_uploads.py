@@ -37,6 +37,25 @@ def test_bad_rows_quarantined_good_rows_ingested(client):
     assert body["quarantined"] == 1
 
 
+def test_padded_source_resolves_to_same_catalog(client):
+    """#16: a padded source id must resolve to the SAME catalog as its trimmed form. The padded
+    truncated re-upload hits the large-change brake — pre-fix it silently minted a SECOND catalog
+    (' deposits ') and reported a fresh 'first upload' ingest instead."""
+    upload_csv(client, "deposits", DEPOSITS_CSV)
+    tiny = "source,table,column,type,is_grain\ndeposits,accounts,id,integer,y\n"
+    res = client.post("/uploads", data={"source": " deposits "},
+                      files={"file": ("deposits.csv", tiny.encode(), "text/csv")}, headers=AUTH)
+    assert res.status_code == 200
+    assert res.json()["status"] == "held"     # same catalog -> the brake sees the truncation
+
+
+def test_whitespace_only_source_400(client):
+    """#16: a source that strips to nothing is a client error, not a catalog named '   '."""
+    res = client.post("/uploads", data={"source": "   "},
+                      files={"file": ("d.csv", DEPOSITS_CSV.encode(), "text/csv")}, headers=AUTH)
+    assert res.status_code == 400
+
+
 def test_truncated_reupload_is_held(client):
     upload_csv(client, "deposits", DEPOSITS_CSV)
     tiny = "source,table,column,type,is_grain\ndeposits,accounts,id,integer,y\n"

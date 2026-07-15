@@ -303,6 +303,31 @@ def test_sync_target_source_required(client):
     assert _create_sync(client, iid, target_source="  ").status_code == 400
 
 
+def test_sync_ids_stripped_before_store(client):
+    """#16: service/source ids are stripped BEFORE they are stored — ' cards ' and 'cards' must be
+    ONE catalog, and a padded service name must occupy the same one-sync-per-service slot."""
+    iid = _integration_id(client)
+    created = _create_sync(client, iid, service_name=f" {CARDS_SERVICE} ",
+                           target_source=" cards ")
+    assert created.status_code == 200
+    sync = created.json()
+    assert sync["service_name"] == CARDS_SERVICE
+    assert sync["target_source"] == "cards"
+    # the padded create claimed the exact service name: an unpadded duplicate is refused
+    assert _create_sync(client, iid).status_code == 409
+
+
+def test_patch_sync_strips_ids(client):
+    """#16 (patch path): edited ids are stripped before they replace the stored ones."""
+    iid, sid = _configured_sync(client)
+    res = client.patch(f"/integrations/{iid}/syncs/{sid}",
+                       json={"target_source": " retail ", "service_name": " svc_2 "},
+                       headers=OWNER)
+    assert res.status_code == 200
+    assert res.json()["target_source"] == "retail"
+    assert res.json()["service_name"] == "svc_2"
+
+
 def test_one_sync_per_service_409(client):
     iid = _integration_id(client)
     assert _create_sync(client, iid).status_code == 200

@@ -74,6 +74,11 @@ def create_upload(
     identity: Annotated[IdentityEnvelope, Depends(get_identity)],
     client: Annotated[LLMClient | None, Depends(get_llm_optional)],
 ) -> IngestResult:
+    # The source id IS the catalog identity (fact keys, snapshots, the brake all key on it raw), so
+    # strip it before anything downstream sees it — 'sales' and 'sales ' must be ONE catalog (#16).
+    source = source.strip()
+    if not source:
+        raise HTTPException(status_code=400, detail="source is required")
     try:
         rows, profile, glossary = _read_rows(file.filename or "", _read_capped(file), source)
     except HTTPException:
