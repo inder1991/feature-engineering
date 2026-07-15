@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import io
+import logging
 import os
 from datetime import UTC, datetime
 from typing import Annotated
@@ -11,6 +12,7 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 
 from featuregen.api.deps import get_conn, get_identity, get_llm_optional, require_catalog_write
 from featuregen.contracts.envelopes import IdentityEnvelope
+from featuregen.contracts.errors import ConcurrencyError
 from featuregen.intake.llm import LLMClient
 from featuregen.overlay.upload.canonical import CanonicalRow
 from featuregen.overlay.upload.csv_reader import read_csv_rows
@@ -27,6 +29,7 @@ from featuregen.overlay.upload.source_profile import (
 )
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 # A catalog upload is a SCHEMA export (column names/types/grain), not a data extract, so a modest cap
 # bounds the whole-file in-memory read + parse against an accidental or malicious oversized upload.
@@ -89,5 +92,33 @@ def create_upload(
     # governed, audited enrichment path (M2/M4). Either way the upload itself succeeds or brakes.
     # `profile` carries the glossary-vs-technical decision so validation is profile-aware (spec §U);
     # `glossary` (a glossary upload only) carries the sidecar that drives per-field evidence wiring.
-    return ingest_upload(conn, source, rows, actor=identity,
-                         now=datetime.now(UTC), client=client, profile=profile, glossary=glossary)
+    #
+    # Typed fault mapping (#27): parse errors became a 400 above, but every ingest fault used to
+    # collapse into an opaque 500. Map the KNOWN fault classes to a status + a stage diagnostic; an
+    # unknown fault still surfaces as a 500 (logged with its traceback) but names the failed stage.
+    try:
+        return ingest_upload(conn, source, rows, actor=identity,
+                             now=datetime.now(UTC), client=client, profile=profile,
+                             glossary=glossary)
+    except ConcurrencyError as exc:
+        # OCC: a concurrent upload/confirm bumped one of this upload's fact streams mid-write. The
+        # request's transaction rolls back cleanly, so a retry is the correct client response.
+        raise HTTPException(
+            status_code=409,
+            detail="ingest conflict: a concurrent change touched this catalog while the upload "
+                   f"was being persisted — retry the upload ({exc})") from exc
+    except psycopg.Error as exc:
+        # A graph-constraint / persist / validation DB fault. Name the stage and the fault CLASS
+        # (+ SQLSTATE) — never the raw driver message, which can embed row values (redaction).
+        sqlstate = getattr(exc, "sqlstate", None)
+        raise HTTPException(
+            status_code=422,
+            detail=f"ingest failed at the persist/graph stage: {type(exc).__name__}"
+                   f"{f' (SQLSTATE {sqlstate})' if sqlstate else ''} — "
+                   "the upload was not applied") from exc
+    except Exception as exc:
+        logger.exception("upload of %r failed at the ingest stage", source)
+        raise HTTPException(
+            status_code=500,
+            detail=f"ingest stage failed: {type(exc).__name__} — the upload was not "
+                   "applied") from exc

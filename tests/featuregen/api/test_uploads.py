@@ -117,6 +117,49 @@ def test_upload_enriches_via_configured_llm_client(make_client):
     assert recording.tasks                      # enrichment was attempted via the app's client
 
 
+def _boom_ingest(monkeypatch, exc: Exception):
+    """Make the route's ingest_upload seam raise `exc` (the route imports it module-level)."""
+    from featuregen.api.routes import uploads
+
+    def _raise(*args, **kwargs):
+        raise exc
+
+    monkeypatch.setattr(uploads, "ingest_upload", _raise)
+
+
+def test_concurrent_ingest_conflict_maps_to_409(client, monkeypatch):
+    """#27: an OCC ConcurrencyError (a concurrent upload/confirm bumped a fact stream) is a
+    retryable conflict, not an opaque 500."""
+    from featuregen.contracts.errors import ConcurrencyError
+
+    _boom_ingest(monkeypatch, ConcurrencyError("expected_version 3 != stream_version 4"))
+    res = upload_csv(client, "deposits", DEPOSITS_CSV)
+    assert res.status_code == 409
+    assert "concurrent" in res.json()["detail"]
+
+
+def test_persist_fault_maps_to_422_with_stage_marker(client, monkeypatch):
+    """#27: a graph-constraint / persist DB fault names its stage instead of an opaque 500."""
+    import psycopg
+
+    _boom_ingest(monkeypatch, psycopg.errors.UniqueViolation("duplicate key"))
+    res = upload_csv(client, "deposits", DEPOSITS_CSV)
+    assert res.status_code == 422
+    detail = res.json()["detail"]
+    assert "persist" in detail
+    assert "UniqueViolation" in detail
+
+
+def test_unknown_ingest_fault_surfaces_500_with_stage_marker(client, monkeypatch):
+    """#27: an unknown fault still surfaces as a 500 — but with a stage marker, never swallowed."""
+    _boom_ingest(monkeypatch, RuntimeError("wat"))
+    res = upload_csv(client, "deposits", DEPOSITS_CSV)
+    assert res.status_code == 500
+    detail = res.json()["detail"]
+    assert "ingest stage" in detail
+    assert "RuntimeError" in detail
+
+
 def test_upload_rejects_oversized_file(client, monkeypatch):
     import io
 
