@@ -79,7 +79,9 @@ def enumerate_single_catalog_plans(template: Template, catalog_source: str, targ
                   else PlanResolutionStatus.resolved)
         reasons = (ReasonCode.missing_required_need,) if missing_required else ()
         # a tier-1 ingredient binding is ingredient_binding_only until the 3B.3b assembler (B5)
-        # enriches it into an executable path; candidate_role starts rejected (the ranker resets it).
+        # enriches it into an executable path; candidate_role is `unranked` — tier-1 plans are not
+        # processed by the cross-catalog ranker (rank_and_classify), which is the only thing that
+        # assigns selected/alternative/rejected (the tier-1 order_plans never touches candidate_role).
         plans.append(make_binding_plan(
             recipe_id=template.id, target_entity=target_entity, catalog_source=catalog_source,
             ingredient_bindings=bindings,
@@ -89,7 +91,7 @@ def enumerate_single_catalog_plans(template: Template, catalog_source: str, targ
             path_resolution_status=PathResolutionStatus.ingredient_binding_only,
             primary_reason_code=(reasons[0] if reasons else None),
             reason_codes=reasons, safety=BindingSafety.safe, preference_rank=-1, preference_reasons=(),
-            candidate_role=CandidateRole.rejected))
+            candidate_role=CandidateRole.unranked))
 
     plans_truncated = len(plans) > MAX_PLANS_PER_RECIPE
     if plans_truncated:

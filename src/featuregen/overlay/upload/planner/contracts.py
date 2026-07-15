@@ -96,6 +96,10 @@ class PathResolutionStatus(StrEnum):
 
 
 class CandidateRole(StrEnum):
+    # `unranked` is the neutral state for a plan the cross-catalog classifier (rank_and_classify)
+    # never processed — e.g. tier-1 single-catalog plans, which only pass through the tier-1
+    # ranker (order_plans) and are never assigned selected/alternative/rejected.
+    unranked = "unranked"
     selected = "selected"
     equal_rank_alternative = "equal_rank_alternative"
     lower_rank_alternative = "lower_rank_alternative"

@@ -24,7 +24,7 @@ def _plan(pid, refs, *, status=PlanResolutionStatus.resolved, quality=BindingQua
                          BindingSafety.safe, -1, (),
                          participating_catalogs=(catalog,), bridge_count=0,
                          path_resolution_status=PathResolutionStatus.ingredient_binding_only,
-                         candidate_role=CandidateRole.rejected)
+                         candidate_role=CandidateRole.unranked)
 
 
 def test_resolved_ranks_before_partial():
