@@ -143,6 +143,10 @@ describe('governance review screen', () => {
       note: 'watchlist CIF, not customer',
     })
     expect(await screen.findByText(/rejected \(different entity\)/i)).toBeInTheDocument()
+    // Honest copy: the category is recorded + surfaced on the dashboard — the old claim that it
+    // "feeds back into re-proposal" described behavior that does not exist and must stay gone.
+    expect(screen.getByText(/surfaced on the governance dashboard/i)).toBeInTheDocument()
+    expect(screen.queryByText(/feeds back|fed back|re-proposal/i)).not.toBeInTheDocument()
     expect(confirmJoin).not.toHaveBeenCalled()
   })
 

@@ -450,7 +450,7 @@ function JoinCard({ proposal: p, onDecided, onConflict }: JoinCardProps) {
       onDecided(p.fact_key, {
         badge: `rejected · ${categoryLabel(category)}`,
         tone: 'gj-rejected',
-        note: `Rejected (${categoryLabel(category)}) — recorded for audit; the category feeds back into re-proposal.`,
+        note: `Rejected (${categoryLabel(category)}) — recorded and surfaced on the governance dashboard.`,
       })
     } catch (e) {
       if (e instanceof ApiError && e.status === 409) {
@@ -586,7 +586,7 @@ function JoinCard({ proposal: p, onDecided, onConflict }: JoinCardProps) {
 
       {rejectOpen && (
         <div className="gj-rejectbox">
-          <span className="gj-verify-h">Reason (recorded + fed back to re-proposal)</span>
+          <span className="gj-verify-h">Reason (recorded and surfaced on the governance dashboard)</span>
           <div className="gj-chips" role="group" aria-label="Rejection reason">
             {REJECT_CATEGORIES.map(c => (
               <button
@@ -743,7 +743,7 @@ function TableFactCard({ proposal: p, onDecided, onConflict }: TableFactCardProp
       onDecided(p.fact_key, {
         badge: `rejected · ${categoryLabel(category)}`,
         tone: 'gj-rejected',
-        note: `Rejected (${categoryLabel(category)}) — recorded for audit; the category feeds back into re-proposal.`,
+        note: `Rejected (${categoryLabel(category)}) — recorded and surfaced on the governance dashboard.`,
       })
     } catch (e) {
       if (e instanceof ApiError && e.status === 409) {
@@ -865,7 +865,7 @@ function TableFactCard({ proposal: p, onDecided, onConflict }: TableFactCardProp
 
       {rejectOpen && (
         <div className="gj-rejectbox">
-          <span className="gj-verify-h">Reason (recorded + fed back to re-proposal)</span>
+          <span className="gj-verify-h">Reason (recorded and surfaced on the governance dashboard)</span>
           <div className="gj-chips" role="group" aria-label="Rejection reason">
             {TABLE_FACT_REJECT_CATEGORIES.map(c => (
               <button

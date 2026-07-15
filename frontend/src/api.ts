@@ -359,7 +359,7 @@ export interface JoinProposal {
 }
 
 // Structured rejection vocabulary — mirrors the backend's Literal exactly; the category is a
-// first-class analytics key fed back to re-proposal, the note is free text.
+// first-class analytics key surfaced on the governance dashboard, the note is free text.
 export const REJECT_CATEGORIES = [
   'wrong_direction', 'wrong_cardinality', 'different_entity', 'not_a_real_key',
   'needs_data_check',
@@ -430,7 +430,7 @@ export interface TableFactProposal {
 }
 
 // Structured rejection vocabulary — mirrors the backend's Literal exactly; the category is a
-// first-class analytics key fed back to re-proposal, the note is free text.
+// first-class analytics key surfaced on the governance dashboard, the note is free text.
 export const TABLE_FACT_REJECT_CATEGORIES = [
   'wrong_grain_columns', 'wrong_as_of_column', 'not_unique', 'needs_data_check',
 ] as const
@@ -484,6 +484,60 @@ export function listRelationshipReadiness(
   source: string,
 ): Promise<{ source: string; relationships: RelationshipReadiness[] }> {
   return request(`/sources/${encodeURIComponent(source)}/readiness/relationships`)
+}
+
+// ---- governance dashboard (read-only rollups over the recorded governance outcomes) ----------
+// Phase 4 observability: per-fact-type counts by folded status, queue health, the calibration
+// SEED (an observation of signal vs. outcome — nothing here changes scoring), and recent
+// activity. The cross-source route also carries a per-source summary list. Pure reads; an
+// unknown source answers an all-zeros dashboard, never a 404.
+
+export interface FactTypeRollup {
+  fact_type: string
+  pending: number
+  confirmed: number
+  rejected: number
+  needs_attention: number
+  rejected_by_category: Record<string, number>
+}
+
+// One source's roll-up row on the cross-source dashboard (the scoping entry point).
+export interface SourceGovernanceSummary {
+  source: string
+  pending: number
+  confirmed: number
+  rejected: number
+  oldest_pending_age_seconds: number | null
+}
+
+export interface GovernanceDashboard {
+  scope: string
+  source: string | null
+  generated_at: string
+  fact_types: FactTypeRollup[]
+  queue_health: {
+    open_depth: number
+    oldest_pending_age_seconds: number | null
+    age_buckets: Record<string, number>
+  }
+  calibration_seed: {
+    confirm_rate_by_bucket: Record<
+      string,
+      { confirmed: number; rejected: number; rate: number | null }
+    >
+    reject_category_by_top_signal: Record<string, Record<string, number>>
+  }
+  recent_activity: { days: number; confirmed: number; rejected: number }
+  // Present on the cross-source route only; the single-source route omits it.
+  sources?: SourceGovernanceSummary[]
+}
+
+export function getGovernanceDashboard(): Promise<GovernanceDashboard> {
+  return request('/governance/dashboard')
+}
+
+export function getSourceGovernanceDashboard(source: string): Promise<GovernanceDashboard> {
+  return request(`/sources/${encodeURIComponent(source)}/governance/dashboard`)
 }
 
 export function columnJoins(objectRef: string, source: string): Promise<JoinEdge[]> {

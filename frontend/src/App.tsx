@@ -2,6 +2,7 @@ import type { ReactElement } from 'react'
 import { useHashRoute } from './nav'
 import type { Route } from './nav'
 import { SessionBar } from './SessionBar'
+import { GovernanceDashboardScreen } from './screens/GovernanceDashboardScreen'
 import { GovernanceReviewScreen } from './screens/GovernanceReviewScreen'
 import { IntegrationsScreen } from './screens/IntegrationsScreen'
 import { OverviewScreen } from './screens/OverviewScreen'
@@ -109,6 +110,13 @@ const ICONS: Record<Route, ReactElement> = {
       <path d="m6.25 8 1.25 1.25L10 6.5" />
     </NavIcon>
   ),
+  dashboard: (
+    // Rollup bars over a baseline: the read-only counts at a glance.
+    <NavIcon>
+      <path d="M2.75 13.25h10.5" />
+      <path d="M4.75 10.75v-3.5M8 10.75v-6M11.25 10.75v-4.5" />
+    </NavIcon>
+  ),
 }
 
 const PAGES: { route: Route; label: string; eyebrow: string; title: string; description: string }[] = [
@@ -173,6 +181,13 @@ const PAGES: { route: Route; label: string; eyebrow: string; title: string; desc
     title: 'Discovered joins',
     description: 'Approve or reject the joins Pass C found.',
   },
+  {
+    route: 'dashboard',
+    label: 'Dashboard',
+    eyebrow: 'Governance',
+    title: 'Governance dashboard',
+    description: 'Pipeline rollups + outcomes.',
+  },
 ]
 
 export default function App() {
@@ -232,6 +247,7 @@ export default function App() {
         )}
         {route === 'review' && <ReviewQueueScreen initialSource={params.get('source') ?? ''} />}
         {route === 'governance' && <GovernanceReviewScreen />}
+        {route === 'dashboard' && <GovernanceDashboardScreen />}
         {route === 'workbench' && <WorkbenchScreen />}
       </main>
     </div>

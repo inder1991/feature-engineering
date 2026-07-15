@@ -3050,3 +3050,13 @@ button.gj-chip--on:hover {
   border-color: var(--line);
   color: var(--ink-faint);
 }
+
+/* ---------------------------------------------------------------- governance dashboard
+   Appended for GovernanceDashboardScreen: composes the existing .stats/.stat/.rows/.q-item/
+   .callout/table vocabulary unchanged; the ONLY addition is the accent number tone (pending
+   counts), mirroring the tone-ok/warn/danger stat tones above. Nothing above this line is
+   modified. */
+
+.stat b.tone-accent {
+  color: var(--accent);
+}

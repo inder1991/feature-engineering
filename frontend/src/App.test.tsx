@@ -41,7 +41,7 @@ function arriveAt(hash: string) {
 }
 
 describe('app shell', () => {
-  it('renders eight nav items in order (Integrations after Ingest) and lands on Overview by default', () => {
+  it('renders nine nav items in order (Dashboard after Governance) and lands on Overview by default', () => {
     render(<App />)
     const nav = within(screen.getByRole('navigation'))
     expect(nav.getAllByRole('button').map(b => b.textContent)).toEqual([
@@ -53,6 +53,7 @@ describe('app shell', () => {
       'Integrations',
       'Review queue',
       'Governance',
+      'Dashboard',
     ])
     expect(screen.getByRole('heading', { level: 1, name: 'Overview' })).toBeInTheDocument()
     expect(screen.getByRole('heading', { name: 'The loop' })).toBeInTheDocument()
