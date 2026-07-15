@@ -88,6 +88,19 @@ def test_resolve_rejects_a_column_already_in_the_catalog(db):
     assert not resolved and "already" in reason
 
 
+def test_resolve_recognizes_case_space_variant_of_existing_column(db):
+    # #7: the resolution path's "already in the catalog?" check must use the SAME normalized ref as
+    # the main ingest path — a case/trailing-space variant of an existing column IS that column, not
+    # a new one to add as a twin node.
+    idx = _quarantine_one_bad(db)
+    resolved, reason = resolve_quarantine_row(db, "deposits", idx, {"column": "ID "}, actor=_actor())
+    assert not resolved and "already" in reason
+    twins = db.execute(
+        "SELECT count(*) FROM graph_node WHERE catalog_source = 'deposits' AND kind = 'column' "
+        "AND lower(btrim(column_name)) = 'id'").fetchone()[0]
+    assert twins == 1                                   # no case-variant twin was added
+
+
 def test_resolve_cannot_bypass_the_large_change_brake(db):
     # #4: an all-quarantined WRONG-SOURCE upload is held by the brake — but resolving it row-by-row
     # used to bypass the brake entirely, letting a reviewer contaminate the catalog with an unrelated

@@ -35,6 +35,7 @@ from featuregen.overlay.upload.field_resolution import FIELD_POLICY_VERSION, res
 from featuregen.overlay.upload.field_revalidation import flag_pending_revalidation
 from featuregen.overlay.upload.glossary_reader import GlossaryRecord, GlossaryUpload
 from featuregen.overlay.upload.graph import (
+    _column_ref,
     add_column_row,
     build_graph,
     governed_join_proposal,
@@ -1017,7 +1018,10 @@ def resolve_quarantine_row(conn, catalog_source: str, row_index: int, edits: dic
     if vr.structural_error or vr.quarantined:
         return False, vr.structural_error or vr.quarantined[0].message   # still invalid — surface why
     good = vr.good[0]
-    c_ref = f"public.{good.table}.{good.column}"
+    # #7: the SAME ref seam the main ingest path graphs under — `good` is already identity-normalized
+    # by validate_rows (#1), so a case/space variant of an existing column resolves to that column's
+    # ref and is refused below rather than re-added as a raw-cased twin node.
+    c_ref = _column_ref(good.table, good.column)
     if conn.execute("SELECT 1 FROM graph_node WHERE catalog_source = %s AND object_ref = %s",
                     (catalog_source, c_ref)).fetchone() is not None:
         return False, f"{good.table}.{good.column} is already in the catalog"
