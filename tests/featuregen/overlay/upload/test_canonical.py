@@ -50,6 +50,21 @@ def test_unrecognized_sensitivity_is_quarantined():
     assert "sensitivity" in result.quarantined[0].message
 
 
+def test_dotted_table_or_column_is_quarantined():
+    # A '.' inside a table/column name would corrupt the "public.<table>.<column>" object ref: two
+    # distinct rows can collide on the graph PK, or lineage/join-path mis-parses the segments. Fail
+    # closed at validation so a dotted name never reaches normalize_ref/build_graph (#2).
+    rows = [
+        _row(table="orders.line", column="id"),      # dot in the table name
+        _row(table="orders", column="customer.id"),  # dot in the column name
+        _row(table="orders", column="ok"),           # a clean row still passes
+    ]
+    result = validate_rows(rows)
+    assert [r.column for r in result.good] == ["ok"]
+    assert len(result.quarantined) == 2
+    assert all("." in q.message for q in result.quarantined)
+
+
 def test_conflicting_metadata_for_a_column_fails_closed():
     # A later duplicate with a pii tag must NOT be silently dropped (leaving the column world-readable).
     rows = [

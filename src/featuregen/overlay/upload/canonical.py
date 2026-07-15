@@ -110,6 +110,15 @@ def validate_rows(rows: list[CanonicalRow],
                 i, f"unrecognized sensitivity '{r.sensitivity}' "
                 f"(expected one of: {', '.join(sorted(_VALID_SENSITIVITY - {''}))})", r))
             continue
+        if "." in r.table or "." in r.column:
+            # The graph/lineage object ref is "public.<table>.<column>" (dot-joined, unescaped). A '.'
+            # inside a table or column name mis-parses: two distinct rows can collide on the graph PK
+            # (catalog_source, object_ref), or join-path/lineage split on the wrong segment and bind
+            # the wrong table. Fail closed here so a dotted name never reaches normalize_ref/build_graph.
+            quarantined.append(RowError(
+                i, f"table/column name contains the '.' path separator "
+                f"({r.table!r}, {r.column!r}); it would corrupt the object reference", r))
+            continue
         # Key on the SAME strip+lower normalizer as object identity (object_ref._norm): a raw key
         # would let two case-variant rows for ONE physical column (e.g. a pii-tagged 'SSN' + an
         # untagged 'ssn') slip past the fail-closed conflict path below and graph an untagged,
