@@ -2,6 +2,7 @@ from featuregen.overlay.upload.canonical import UNKNOWN_TYPE, validate_rows
 from featuregen.overlay.upload.glossary_reader import (
     GlossaryRecord,
     GlossaryUpload,
+    _split_fqn,
     is_glossary_csv,
     read_glossary,
 )
@@ -101,6 +102,35 @@ def test_invalid_fqn_yields_a_quarantinable_row_and_no_record():
     assert up.records == []                                   # cannot key a record without a table
     assert len(up.rows) == 1
     assert up.rows[0].table == "" and up.rows[0].column == ""  # missing identity -> quarantines
+
+
+def test_fqn_with_an_empty_component_has_no_resolvable_identity():
+    # `schema..column` used to be silently REINTERPRETED (#26): the empty component was filtered out
+    # BEFORE the arity check, so a malformed 3-part FQN collapsed into a valid-looking 2-part TABLE
+    # term. An empty dot-separated piece means the identity is NOT resolvable — reject the whole FQN.
+    for bad in ("schema..column", ".a.b", "a.b.", "a..b", "..", " . . "):
+        assert _split_fqn(bad) == (None, None, None), f"{bad!r} must not resolve"
+
+
+def test_valid_fqns_still_parse_after_the_empty_component_guard():
+    assert _split_fqn("schema.table.column") == ("schema", "table", "column")
+    assert _split_fqn("schema.table") == ("schema", "table", None)
+    assert _split_fqn(" s . t . c ") == ("s", "t", "c")       # per-part strip still applies
+    assert _split_fqn("no_dots") == (None, None, None)        # 1-part stays unresolvable
+    assert _split_fqn("") == (None, None, None)
+
+
+def test_fqn_with_an_empty_component_quarantines_and_emits_no_record():
+    csv = (
+        "physical_name,business_term,description_business_definition,bian_path,fibo_path\n"
+        "DPL_EIB_COMPLIANCE..CUST_NAME,Customer Name,A name.,Party/Customer,fibo:X\n"
+    )
+    up = read_glossary(csv, source="ftr")
+    assert up.records == []                                   # no sidecar for a malformed FQN
+    assert len(up.rows) == 1
+    assert up.rows[0].table == "" and up.rows[0].column == ""  # identity-less -> quarantined
+    vr = validate_rows(up.rows, "ftr", profile=None)
+    assert vr.good == []
 
 
 def test_read_glossary_rows_all_pass_under_glossary_profile():

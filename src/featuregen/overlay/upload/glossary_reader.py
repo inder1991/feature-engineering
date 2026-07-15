@@ -118,8 +118,14 @@ def _split_synonyms(value: str) -> tuple[str, ...]:
 def _split_fqn(fqn: str) -> tuple[str | None, str | None, str | None]:
     """Split a ``schema.table.column`` FQN, PRESERVING schema. Returns ``(schema, table, column)``:
     exactly 3 parts → ``(schema, table, column)`` (a COLUMN term); exactly 2 parts → ``(schema, table,
-    None)`` (a TABLE term); anything else → ``(None, None, None)`` (no resolvable identity)."""
-    parts = [p.strip() for p in fqn.split(".") if p.strip()]
+    None)`` (a TABLE term); anything else → ``(None, None, None)`` (no resolvable identity).
+
+    An EMPTY component (``schema..column``, ``.a.b``, ``a.b.``) is detected BEFORE the arity check
+    and rejects the whole FQN (#26): filtering empties first would silently REINTERPRET a malformed
+    3-part FQN as a valid-looking 2-part TABLE term instead of quarantining it."""
+    parts = [p.strip() for p in fqn.split(".")]
+    if any(not p for p in parts):
+        return None, None, None
     if len(parts) == 3:
         return parts[0], parts[1], parts[2]
     if len(parts) == 2:
