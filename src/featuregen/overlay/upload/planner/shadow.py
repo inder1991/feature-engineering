@@ -34,8 +34,9 @@ def run_shadow_planner(conn, *, eligible_recipe_ids: frozenset[str], target_enti
         if tmpl is None:
             continue
         try:
-            result = plan_bindings(conn, template=tmpl, target_entity=target_entity, scope=scope,
-                                   roles=roles, now=now)
+            with conn.transaction():   # per-recipe savepoint — a DB error here must not poison the request txn
+                result = plan_bindings(conn, template=tmpl, target_entity=target_entity, scope=scope,
+                                       roles=roles, now=now)
             result = dataclasses.replace(result, run_id=run_id)
         except Exception:   # planner failure is isolated per recipe; never touches the response
             logger.exception("shadow planner internal error for recipe %s", rid)

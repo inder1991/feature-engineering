@@ -33,9 +33,6 @@ from featuregen.overlay.upload.planner.order import order_plans
 from featuregen.overlay.upload.taxonomy.entity_registry import GRAPH_VERSION
 from featuregen.overlay.upload.templates import Template, ground_template
 
-_FAILURE_PRECEDENCE = (PlanResolutionStatus.safety_rejected, PlanResolutionStatus.bounded_out,
-                       PlanResolutionStatus.partially_resolved, PlanResolutionStatus.unresolved)
-
 
 def _envelope(scope: CatalogScopeV1, recipe_id: str, target_entity: str | None) -> PlannerReplayEnvelopeV1:
     material = (f"{PLANNER_VERSION}|{scope.scope_id}|{recipe_id}|{target_entity or ''}|{NEED_METADATA_VERSION}"
@@ -115,6 +112,8 @@ def plan_bindings(conn, *, template: Template, target_entity: str | None, scope:
 
 
 def _classify_failure(plans, bounding):
+    # Precedence: bounded_out > partially_resolved > unresolved. safety_rejected can't occur in tier-1
+    # (unsafe columns are filtered pre-enumeration); safety_rejected/staging precedence is a 3B.3c concern.
     present = {p.resolution_status for p in plans}
     if bounding.combinations_truncated or bounding.plans_truncated:
         return PlanResolutionStatus.bounded_out, ReasonCode.bounded_out_max_combinations

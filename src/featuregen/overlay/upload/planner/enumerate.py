@@ -52,6 +52,8 @@ def enumerate_single_catalog_plans(template: Template, catalog_source: str, targ
     optional = [n.role for n in template.needs if n.optional]
     # one axis per REQUIRED need = its eligible candidates; a required need with no eligible candidate
     # still yields a single partial "axis" (None) so the plan is preserved as partially_resolved.
+    # NOTE: bounded-product truncation determinism DEPENDS on candidates.py pre-sorting each need's
+    # candidates by object_ref — no per-axis re-sort happens here.
     axes: list[tuple[str, tuple[IngredientCandidateV1 | None, ...]]] = []
     for role in required:
         eligible = tuple(c for c in discovery.candidates.get(role, ()) if c.eligible)
