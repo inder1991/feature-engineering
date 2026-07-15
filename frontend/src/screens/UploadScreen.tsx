@@ -11,17 +11,19 @@ import { ConnectorPanel } from './ConnectorPanel'
 import type { ConnectorStage } from './ConnectorPanel'
 import { CalloutGlyph, IngestResultCallout } from './IngestResultCallout'
 
-const MAX_UPLOAD_BYTES = 20 * 1024 * 1024
+// Mirrors the backend contract exactly (#28): uploads.py caps at 25 MiB and accepts
+// .csv/.xlsx/.xlsm — the pre-flight must not refuse what the server would take.
+const MAX_UPLOAD_BYTES = 25 * 1024 * 1024
 
 // Client-side pre-flight only; the server remains the authoritative control. Both the picker
 // and the drop path go through this (the `accept` attribute filters the picker dialog but does
 // nothing for drops).
 function describeInvalidFile(candidate: File): string {
-  if (!/\.(csv|xlsx)$/i.test(candidate.name)) {
-    return `Unsupported file type: ${candidate.name}. Choose a .csv or .xlsx file.`
+  if (!/\.(csv|xlsx|xlsm)$/i.test(candidate.name)) {
+    return `Unsupported file type: ${candidate.name}. Choose a .csv, .xlsx, or .xlsm file.`
   }
   if (candidate.size > MAX_UPLOAD_BYTES) {
-    return `${candidate.name} is larger than the 20 MB upload limit. Split it into smaller uploads.`
+    return `${candidate.name} is larger than the 25 MiB upload limit. Split it into smaller uploads.`
   }
   return ''
 }
@@ -247,7 +249,7 @@ function FileUploadPath({ onReviewQueue }: { onReviewQueue: (source: string) => 
               onDragLeave={() => setDragging(false)}
               onDrop={onDrop}
             >
-              File (.csv / .xlsx)
+              File (.csv / .xlsx / .xlsm)
               {/* No `required` here: jsdom never counts an uploaded FileList toward a required
                   file input's validity (valueMissing stays true), which blocks programmatic form
                   submission in tests. It would also fight the drop path (dropping sets React
@@ -255,7 +257,7 @@ function FileUploadPath({ onReviewQueue }: { onReviewQueue: (source: string) => 
                   button and the `if (!file …) return` guard above. */}
               <input
                 type="file"
-                accept=".csv,.xlsx"
+                accept=".csv,.xlsx,.xlsm"
                 className="visually-hidden"
                 onChange={e => {
                   const chosen = e.target.files?.[0]

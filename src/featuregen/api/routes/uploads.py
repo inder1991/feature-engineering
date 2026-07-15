@@ -66,7 +66,8 @@ def _read_rows(
             upload = read_glossary(text, source=source)
             return upload.rows, FTR_GLOSSARY_PROFILE, upload
         return read_csv_rows(text, source=source), None, None
-    raise HTTPException(status_code=400, detail="unsupported file type (expected .csv or .xlsx)")
+    raise HTTPException(status_code=400,
+                        detail="unsupported file type (expected .csv, .xlsx, or .xlsm)")
 
 
 @router.post("/uploads", dependencies=[Depends(require_catalog_write)])

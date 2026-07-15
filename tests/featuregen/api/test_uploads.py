@@ -86,6 +86,10 @@ def test_unsupported_extension_400(client):
     res = client.post("/uploads", data={"source": "deposits"},
                       files={"file": ("notes.txt", b"hello", "text/plain")}, headers=AUTH)
     assert res.status_code == 400
+    # #28: the reject message lists EVERYTHING the reader accepts — .xlsm was accepted but unnamed.
+    detail = res.json()["detail"]
+    for ext in (".csv", ".xlsx", ".xlsm"):
+        assert ext in detail
 
 
 def test_unparseable_excel_400(client):

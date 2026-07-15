@@ -135,19 +135,21 @@ describe('upload screen', () => {
     expect(uploadFile).not.toHaveBeenCalled()
   })
 
-  it('rejects a file over 20 MB before any request', async () => {
+  it('rejects a file over 25 MiB (the backend cap) before any request', async () => {
     renderUpload()
     await userEvent.type(screen.getByLabelText(/source name/i), 'deposits')
     const big = new File(['x'], 'big.csv', { type: 'text/csv' })
-    Object.defineProperty(big, 'size', { value: 20 * 1024 * 1024 + 1 })
+    Object.defineProperty(big, 'size', { value: 25 * 1024 * 1024 + 1 })
     await userEvent.upload(screen.getByLabelText(/file/i), big)
-    expect(await screen.findByRole('alert')).toHaveTextContent(/20 MB/)
+    expect(await screen.findByRole('alert')).toHaveTextContent(/25 MiB/)
     expect(screen.getByRole('button', { name: 'Upload' })).toBeDisabled()
     expect(uploadFile).not.toHaveBeenCalled()
   })
 
   it('shows transport errors as an alert', async () => {
-    uploadFile.mockRejectedValue(new api.ApiError(400, 'unsupported file type (expected .csv or .xlsx)'))
+    uploadFile.mockRejectedValue(
+      new api.ApiError(400, 'unsupported file type (expected .csv, .xlsx, or .xlsm)'),
+    )
     renderUpload()
     await submit()
     expect(await screen.findByRole('alert')).toHaveTextContent(/unsupported file type/)
