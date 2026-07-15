@@ -211,6 +211,27 @@ def test_declared_unresolved_join_renders_pending(client):
     assert edge["to"] == "gl:public.batches.batch_id"
 
 
+def test_join_edges_carry_authority_state(client, conn):
+    # #10: lineage shows display-only pending/rejected joins, so each join edge must carry its
+    # authority (and, when fact-linked, the folded approved_join_status) — a consumer can tell
+    # display-only from operational without re-deriving find_join_path's filter. Additive field.
+    upload_csv(client, "deposits", DEPOSITS_CSV)
+    body = _lineage(client).json()
+    joins = [e for e in body["edges"] if e["kind"] == "join"]
+    assert joins and all(e["authority"] == "operational" for e in joins)   # flag-off raw edges
+    assert all("approved_join_status" not in e for e in joins)             # NULL pruned (`?`)
+
+    conn.execute(  # simulate the passc projector demoting a fact-linked edge
+        "UPDATE graph_edge SET authority = 'display_only', approved_join_status = 'REJECTED' "
+        "WHERE catalog_source = 'deposits' AND kind = 'joins' "
+        "AND from_ref = 'public.accounts.cust_id'")
+    body = _lineage(client).json()
+    edge = next(e for e in body["edges"] if e["kind"] == "join"
+                and e["from"] == "deposits:public.accounts.cust_id")
+    assert edge["authority"] == "display_only"
+    assert edge["approved_join_status"] == "REJECTED"
+
+
 # ---- read-scope ----------------------------------------------------------------------------
 def test_pii_column_absent_without_role_and_its_feature_edge_disappears(client):
     upload_csv(client, "deposits", DEPOSITS_CSV)

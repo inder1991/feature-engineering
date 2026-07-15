@@ -6,7 +6,10 @@ def test_column_joins_resolved_edge(client):
     edges = client.get("/columns/public.transactions.account_id/joins",
                        params={"source": "deposits"}, headers=AUTH).json()
     assert edges == [{"from_ref": "public.transactions.account_id",
-                      "to_ref": "public.accounts.id", "cardinality": "N:1", "resolved": True}]
+                      "to_ref": "public.accounts.id", "cardinality": "N:1", "resolved": True,
+                      # #10: authority state rides along so a client can tell an operational
+                      # edge (traversable by /join-path) from a display-only pending one.
+                      "authority": "operational", "approved_join_status": None}]
 
 
 def test_column_joins_pending_target_unresolved(client):

@@ -286,7 +286,8 @@ class _Builder:
         rows = self.conn.execute(
             "SELECT e.from_ref, e.to_ref, e.cardinality, "
             "  EXISTS(SELECT 1 FROM graph_node n WHERE n.object_ref = e.to_ref "
-            "         AND n.catalog_source = e.catalog_source) AS resolved "
+            "         AND n.catalog_source = e.catalog_source) AS resolved, "
+            "  e.authority, e.approved_join_status "
             "FROM graph_edge e "
             "LEFT JOIN graph_node fn ON fn.object_ref = e.from_ref "
             "  AND fn.catalog_source = e.catalog_source "
@@ -300,11 +301,14 @@ class _Builder:
             (source, cols, cols, self.allowed, self.allowed)).fetchall()
         colset = set(cols)
         out: list[tuple[_Unit | None, dict | None, dict]] = []
-        for from_ref, to_ref, card, resolved in rows:
+        for from_ref, to_ref, card, resolved, authority, join_status in rows:
+            # #10: carry the edge's authority (+ folded fact status when fact-linked) so a
+            # consumer can tell a display-only pending/rejected join from an operational one.
             if from_ref in colset:   # forward: declared orientation + declared cardinality
                 edge = _prune({"from": f"{source}:{from_ref}", "to": f"{source}:{to_ref}",
                                "layer": "joins", "kind": "join", "cardinality": card,
-                               "resolved": bool(resolved)})
+                               "resolved": bool(resolved), "authority": authority,
+                               "approved_join_status": join_status})
                 if resolved:
                     out.append((("table", source, _table_of(to_ref)), None, edge))
                 else:
@@ -312,7 +316,8 @@ class _Builder:
             else:   # reverse: orient the step to the traversal and invert the fan (M7)
                 edge = _prune({"from": f"{source}:{to_ref}", "to": f"{source}:{from_ref}",
                                "layer": "joins", "kind": "join", "cardinality": _invert(card),
-                               "resolved": True})   # from_ref always exists in its own catalog
+                               "resolved": True,   # from_ref always exists in its own catalog
+                               "authority": authority, "approved_join_status": join_status})
                 out.append((("table", source, _table_of(from_ref)), None, edge))
         return out
 

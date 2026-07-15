@@ -217,6 +217,10 @@ class JoinEdge:
     to_ref: str
     cardinality: str | None
     resolved: bool   # whether to_ref is a known node (a pending/cross-source target is unresolved)
+    # #10: enough authority state to tell a display-only pending/rejected edge from an operational
+    # one (what find_join_path traverses: authority='operational' + VERIFIED-or-unlinked). Additive.
+    authority: str | None = None             # 'operational' | 'display_only'
+    approved_join_status: str | None = None  # folded fact status when fact-linked (e.g. 'VERIFIED')
 
 
 def column_joins(conn, catalog_source: str, object_ref: str, *,
@@ -232,7 +236,8 @@ def column_joins(conn, catalog_source: str, object_ref: str, *,
         "SELECT e.from_ref, e.to_ref, e.cardinality, "
         # M5: scope by catalog — a cross-source target present in ANOTHER catalog is NOT resolved here.
         "  EXISTS(SELECT 1 FROM graph_node n WHERE n.object_ref = e.to_ref "
-        "         AND n.catalog_source = e.catalog_source) AS resolved "
+        "         AND n.catalog_source = e.catalog_source) AS resolved, "
+        "  e.authority, e.approved_join_status "
         "FROM graph_edge e "
         "LEFT JOIN graph_node fn ON fn.object_ref = e.from_ref AND fn.catalog_source = e.catalog_source "
         "LEFT JOIN graph_node tn ON tn.object_ref = e.to_ref AND tn.catalog_source = e.catalog_source "
@@ -241,4 +246,5 @@ def column_joins(conn, catalog_source: str, object_ref: str, *,
         "  AND (tn.sensitivity IS NULL OR tn.sensitivity = ANY(%s)) "
         "ORDER BY e.to_ref",
         (catalog_source, object_ref, allowed, allowed)).fetchall()
-    return [JoinEdge(from_ref=r[0], to_ref=r[1], cardinality=r[2], resolved=r[3]) for r in rows]
+    return [JoinEdge(from_ref=r[0], to_ref=r[1], cardinality=r[2], resolved=r[3],
+                     authority=r[4], approved_join_status=r[5]) for r in rows]
