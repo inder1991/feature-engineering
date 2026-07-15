@@ -897,6 +897,19 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
             logger.warning("advisory glossary evidence wiring failed for %r — facts + graph intact",
                            catalog_source, exc_info=True)
 
+    # DRAIN before the end-of-ingest re-projections (full-chain e2e finding, 2026-07-15): the
+    # governed seams above (_propose_governed_joins / Pass C / Pass B) appended OVERLAY_FACT_PROPOSED
+    # events AFTER the last drain, so `projection_lag > 0` here whenever THIS upload proposed
+    # anything — and the lag guards below would then skip BOTH re-projection blocks. build_graph
+    # just wiped every edge/node, so the skip left a previously-VERIFIED approved_join's operational
+    # edge deleted (and a Pass-B-confirmed grain flag cleared) until the NEXT caught-up ingest of
+    # the source — feature construction went dark on any re-upload that discovered a new candidate.
+    # Draining on this conn (the project_verified_join drain-then-project pattern) brings the read
+    # model to head; the guards below now fire ONLY on a genuine poison-HALT, their real purpose.
+    # Flag-off byte-for-byte safe: with the seams off nothing was appended since the line-749 drain,
+    # so this pass processes zero events.
+    _drain_projection(conn)
+
     # SPECIALIZED_FACT bridge (Task 9): build_graph just wiped graph_node, so re-project any
     # already-CONFIRMED grain/as-of facts onto the fresh column nodes. UNCONDITIONAL (not
     # flag-gated) — a grain confirmed in a PRIOR cycle must survive a rebuild even when
