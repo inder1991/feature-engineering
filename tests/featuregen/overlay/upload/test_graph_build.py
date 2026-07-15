@@ -75,6 +75,25 @@ def test_build_graph_folds_drafted_definition_and_domain(db):
         assert hit == 1, term
 
 
+def test_malformed_joins_to_is_not_written_as_raw_edge(db):
+    # A malformed joins_to (here a bare table name, no column) must NOT become a raw 'joins' edge on
+    # the ungoverned graph-write path — it would be an operational edge to a garbage/phantom target.
+    # Only a parse_join_ref-valid target becomes an edge, at public.<table>.<column> (#5).
+    build_graph(db, "core", [
+        CanonicalRow("core", "orders", "customer_id", "integer", joins_to="customers"),   # bare, invalid
+        CanonicalRow("core", "orders", "ok_fk", "integer", joins_to="dw.customers.id"),   # schema.table.column
+        CanonicalRow("core", "orders", "plain_fk", "integer", joins_to="customers.id"),   # table.column
+    ])
+    joins = db.execute(
+        "SELECT from_ref, to_ref FROM graph_edge WHERE catalog_source='core' AND kind='joins' "
+        "ORDER BY from_ref").fetchall()
+    # The bare 'customers' is skipped; the 3-part target normalizes to public.<table>.<column>.
+    assert joins == [
+        ("public.orders.ok_fk", "public.customers.id"),
+        ("public.orders.plain_fk", "public.customers.id"),
+    ]
+
+
 def test_column_joins_resolved_is_catalog_scoped(db):
     from featuregen.overlay.upload.canonical import CanonicalRow
     from featuregen.overlay.upload.graph import build_graph, column_joins

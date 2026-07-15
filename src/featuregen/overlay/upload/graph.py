@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -11,6 +12,8 @@ from featuregen.overlay.upload.enrich import content_hash
 from featuregen.overlay.upload.read_scope import allowed_sensitivities
 
 _SCHEMA = "public"
+
+logger = logging.getLogger(__name__)
 
 
 def governed_joins_enabled() -> bool:
@@ -101,6 +104,19 @@ def _column_ref(table: str, column: str) -> str:
     return f"{_SCHEMA}.{table}.{column}"
 
 
+def _validated_join_target(from_ref: str, joins_to: str) -> str | None:
+    """The 'joins' edge target for a declared `joins_to`, as ``public.<table>.<column>`` — or None
+    (logging the diagnostic) when the value is malformed. Gates the ungoverned graph write on the SAME
+    parse_join_ref the governed proposal path uses, so a malformed join is skipped-loud rather than
+    written as a raw operational edge to a garbage/phantom target (#5)."""
+    parsed = parse_join_ref(joins_to)
+    if not parsed.ok:
+        logger.warning("skipping malformed joins_to on %s: %s", from_ref, parsed.diagnostic)
+        return None
+    assert parsed.to_table is not None and parsed.to_col is not None   # ok=True guarantees both
+    return _column_ref(parsed.to_table, parsed.to_col)
+
+
 def build_graph(conn, catalog_source: str, rows: list[CanonicalRow],
                 concepts: dict[str, str] | None = None,
                 definitions: dict[str, str] | None = None,
@@ -143,12 +159,14 @@ def build_graph(conn, catalog_source: str, rows: list[CanonicalRow],
         if r.joins_to:
             # Single-column join: this column -> target "table.column" (may be not-yet-loaded).
             # Under the governed seam the raw edge is DISPLAY-ONLY (authority='display_only') — the
-            # confirmed approved_join fact becomes feature-construction's source of truth.
-            to_ref = f"{_SCHEMA}.{r.joins_to}" if r.joins_to.count(".") == 1 else r.joins_to
-            conn.execute(
-                "INSERT INTO graph_edge (catalog_source, kind, from_ref, to_ref, cardinality, "
-                "authority) VALUES (%s, 'joins', %s, %s, %s, %s) ON CONFLICT DO NOTHING",
-                (catalog_source, c_ref, to_ref, r.cardinality or None, _join_edge_authority()))
+            # confirmed approved_join fact becomes feature-construction's source of truth. A malformed
+            # joins_to is skipped-loud (never written as a raw edge).
+            to_ref = _validated_join_target(c_ref, r.joins_to)
+            if to_ref is not None:
+                conn.execute(
+                    "INSERT INTO graph_edge (catalog_source, kind, from_ref, to_ref, cardinality, "
+                    "authority) VALUES (%s, 'joins', %s, %s, %s, %s) ON CONFLICT DO NOTHING",
+                    (catalog_source, c_ref, to_ref, r.cardinality or None, _join_edge_authority()))
 
     # Re-apply human-confirmed entity tags (entity_suggestion). The graph was just rebuilt from the
     # upload, which may not declare these; a confirmed tag must survive re-upload. Only fills a blank —
@@ -185,11 +203,12 @@ def add_column_row(conn, catalog_source: str, r: CanonicalRow) -> None:
         "INSERT INTO graph_edge (catalog_source, kind, from_ref, to_ref) "
         "VALUES (%s, 'contains', %s, %s) ON CONFLICT DO NOTHING", (catalog_source, t_ref, c_ref))
     if r.joins_to:
-        to_ref = f"{_SCHEMA}.{r.joins_to}" if r.joins_to.count(".") == 1 else r.joins_to
-        conn.execute(
-            "INSERT INTO graph_edge (catalog_source, kind, from_ref, to_ref, cardinality, authority) "
-            "VALUES (%s, 'joins', %s, %s, %s, %s) ON CONFLICT DO NOTHING",
-            (catalog_source, c_ref, to_ref, r.cardinality or None, _join_edge_authority()))
+        to_ref = _validated_join_target(c_ref, r.joins_to)   # skip a malformed join, don't write raw
+        if to_ref is not None:
+            conn.execute(
+                "INSERT INTO graph_edge (catalog_source, kind, from_ref, to_ref, cardinality, "
+                "authority) VALUES (%s, 'joins', %s, %s, %s, %s) ON CONFLICT DO NOTHING",
+                (catalog_source, c_ref, to_ref, r.cardinality or None, _join_edge_authority()))
 
 
 @dataclass(frozen=True, slots=True)
