@@ -12,6 +12,14 @@ def test_duplicate_header_rejected():
         read_csv_rows(text, source="deposits")
 
 
+def test_invalid_boolean_token_rejected():
+    # An unrecognized boolean token (here is_grain='maybe') must not be silently coerced to False;
+    # surface it as a parse error rather than dropping a possible grain declaration (#18).
+    text = "table,column,type,is_grain\norders,id,integer,maybe\n"
+    with pytest.raises(ValueError, match="boolean"):
+        read_csv_rows(text, source="deposits")
+
+
 def test_conflicting_alias_headers_rejected():
     # `table` and `tablename` both alias to the canonical `table` field; last-write-wins would
     # silently pick one identity column. Reject the ambiguous file (#17).

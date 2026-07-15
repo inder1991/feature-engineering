@@ -28,6 +28,7 @@ _ALIASES: dict[str, set[str]] = {
     "entity": {"entity", "businessentity"},
 }
 _TRUE = {"y", "yes", "true", "1"}
+_FALSE = {"n", "no", "false", "0", ""}   # "" (blank/absent) is a valid False
 
 
 def _norm(h: str) -> str:
@@ -72,7 +73,15 @@ def build_row(fmap: Mapping[str, str], rowdict: Mapping[str, object], source: st
         return str(val).strip() if val is not None else ""
 
     def flag(field: str) -> bool:
-        return cell(field).lower() in _TRUE
+        token = cell(field).lower()
+        if token in _TRUE:
+            return True
+        if token in _FALSE:
+            return False
+        # An unrecognized token was previously coerced to False, silently dropping a possible grain /
+        # as-of declaration. Surface it as a parse error instead (#18); the upload boundary 400s it.
+        raise ValueError(
+            f"invalid boolean for '{field}': {token!r} (expected y/yes/true/1, n/no/false/0, or blank)")
 
     return CanonicalRow(
         source=cell("source") or source,

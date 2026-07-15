@@ -50,6 +50,42 @@ def test_unrecognized_sensitivity_is_quarantined():
     assert "sensitivity" in result.quarantined[0].message
 
 
+def test_whitespace_only_required_field_quarantined():
+    # A required field that is only whitespace is effectively missing. Readers strip cells, but a
+    # reviewer-edited row can carry "   "; reject it rather than graphing a blank-named object (#18).
+    result = validate_rows([_row(table="   ")])
+    assert result.good == []
+    assert len(result.quarantined) == 1
+    assert "table" in result.quarantined[0].message
+
+
+def test_invalid_cardinality_quarantined():
+    result = validate_rows([_row(cardinality="many-to-one")])   # a typo for "N:1"
+    assert result.good == []
+    assert "cardinality" in result.quarantined[0].message
+
+
+def test_invalid_additivity_quarantined():
+    result = validate_rows([_row(additivity="kinda")])
+    assert result.good == []
+    assert "additivity" in result.quarantined[0].message
+
+
+def test_invalid_as_of_basis_quarantined_not_coerced():
+    # An unrecognized as-of basis must surface for review, NOT silently become posted_at (#18).
+    result = validate_rows([_row(as_of=True, as_of_basis="whenever")])
+    assert result.good == []
+    assert "as_of_basis" in result.quarantined[0].message
+
+
+def test_valid_enums_and_empty_pass():
+    rows = [_row(cardinality="N:1", additivity="semi_additive", as_of=True, as_of_basis="posted_at"),
+            _row(column="c2", cardinality="", additivity="", as_of_basis="")]
+    result = validate_rows(rows)
+    assert len(result.good) == 2
+    assert result.quarantined == []
+
+
 def test_dotted_table_or_column_is_quarantined():
     # A '.' inside a table/column name would corrupt the "public.<table>.<column>" object ref: two
     # distinct rows can collide on the graph PK, or lineage/join-path mis-parses the segments. Fail

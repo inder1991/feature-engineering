@@ -13,6 +13,15 @@ _REQUIRED = ("source", "table", "column", "type")
 _REQUIRED_NO_TYPE = ("source", "table", "column")   # `type` dropped for a profile that doesn't attest it
 _VALID_SENSITIVITY = frozenset({"", *SENSITIVITY_ROLES})   # "" (none) + the recognized tags
 
+# Closed vocabularies for the enumerable canonical fields (a blank means "not declared" and passes).
+# A typo would otherwise silently degrade a fan-hint (cardinality), an aggregation-safety signal
+# (additivity), or be coerced to the posted_at default (as_of_basis) — quarantine it so the reviewer
+# sees it, mirroring the sensitivity check. `as_of_basis` matches ingest's own {posted_at, ingested_at}
+# coercion vocab (the fact-level `event_time_plus_lag` is not expressible via the CSV basis column).
+_VALID_CARDINALITY = frozenset({"1:1", "1:N", "N:1"})
+_VALID_ADDITIVITY = frozenset({"additive", "semi_additive", "non_additive"})
+_VALID_AS_OF_BASIS = frozenset({"posted_at", "ingested_at"})
+
 # The glossary sentinel for a physical type the source declares but does NOT attest (spec §U). A
 # glossary carries meaning, not structure, so its rows are emitted with `type=UNKNOWN_TYPE` — never
 # `""` (which quarantines). Under a type-attesting profile (technical, or the no-profile default) this
@@ -95,7 +104,7 @@ def validate_rows(rows: list[CanonicalRow],
         # where `type` is not required at all and the sentinel passes as a readiness gap. Under a
         # type-attesting profile (technical) OR the default `profile=None`, a literal `"unknown"` is a
         # PRESENT type value like any other (MINOR-6: do not quarantine it — pre-branch behaviour).
-        missing = [f for f in required if not getattr(r, f)]
+        missing = [f for f in required if not str(getattr(r, f)).strip()]   # whitespace-only == missing
         if missing:
             quarantined.append(RowError(i, f"missing required field(s): {', '.join(missing)}", r))
             continue
@@ -118,6 +127,21 @@ def validate_rows(rows: list[CanonicalRow],
             quarantined.append(RowError(
                 i, f"table/column name contains the '.' path separator "
                 f"({r.table!r}, {r.column!r}); it would corrupt the object reference", r))
+            continue
+        # Closed-vocabulary check for the enumerable fields (empty = not declared, always allowed). A
+        # value outside its set is quarantined for review rather than silently degraded/coerced (#18).
+        enum_bad = None
+        if r.cardinality and r.cardinality not in _VALID_CARDINALITY:
+            enum_bad = (f"unrecognized cardinality '{r.cardinality}' "
+                        f"(expected one of: {', '.join(sorted(_VALID_CARDINALITY))})")
+        elif r.additivity and r.additivity not in _VALID_ADDITIVITY:
+            enum_bad = (f"unrecognized additivity '{r.additivity}' "
+                        f"(expected one of: {', '.join(sorted(_VALID_ADDITIVITY))})")
+        elif r.as_of_basis and r.as_of_basis not in _VALID_AS_OF_BASIS:
+            enum_bad = (f"unrecognized as_of_basis '{r.as_of_basis}' "
+                        f"(expected one of: {', '.join(sorted(_VALID_AS_OF_BASIS))})")
+        if enum_bad:
+            quarantined.append(RowError(i, enum_bad, r))
             continue
         # Key on the SAME strip+lower normalizer as object identity (object_ref._norm): a raw key
         # would let two case-variant rows for ONE physical column (e.g. a pii-tagged 'SSN' + an
