@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING
 
 from featuregen.overlay.upload.object_ref import _norm
@@ -83,7 +83,11 @@ def validate_rows(rows: list[CanonicalRow],
     `UNKNOWN_TYPE` sentinel is interpreted as "no type attested" ONLY under a glossary profile; under a
     type-attesting profile or `profile=None`, a literal `"unknown"` is just a present type value
     (MINOR-6 technical-path parity). EVERY other check — identity present, source-mismatch, sensitivity
-    validity, dedup/conflict — is identical across profiles."""
+    validity, dedup/conflict — is identical across profiles.
+
+    Accepted rows are returned with their identity components (source/table/column, and the joins_to
+    target) NORMALIZED by the same strip+lower `_norm` the dedup key uses (#1): the returned row IS
+    the operational identity every downstream stage keys on. Quarantined rows keep the raw values."""
     if not rows:
         return ValidationResult(structural_error="empty upload: no rows")
     if all(not r.source for r in rows):
@@ -146,11 +150,21 @@ def validate_rows(rows: list[CanonicalRow],
         # Key on the SAME strip+lower normalizer as object identity (object_ref._norm): a raw key
         # would let two case-variant rows for ONE physical column (e.g. a pii-tagged 'SSN' + an
         # untagged 'ssn') slip past the fail-closed conflict path below and graph an untagged,
-        # world-visible twin of the PII column. The rows themselves flow to build_graph unmutated.
+        # world-visible twin of the PII column.
         key = (_norm(r.source), _norm(r.table), _norm(r.column))
+        # The ACCEPTED row carries the normalized identity itself (#1): dedup keyed on _norm but rows
+        # returned raw let two uploads differing only in case/padding split one physical column into
+        # twin graph nodes, false mass drift (0% snapshot overlap -> brake-held as a "wrong source"),
+        # and enrichment-cache misses. Every downstream stage (build_graph refs, the drift snapshot,
+        # fact payloads, content_hash) inherits THIS one identifier. `joins_to` names a table.column
+        # target, so it is the same class of identity and gets the same _norm — otherwise a declared
+        # join to 'Accounts.ID' would dangle beside the normalized 'public.accounts.id' node. The
+        # RAW row is preserved where the code needs display: quarantined RowErrors (above) keep it.
+        canonical = replace(r, source=_norm(r.source), table=_norm(r.table),
+                            column=_norm(r.column), joins_to=_norm(r.joins_to))
         if key in seen:
             first_row, first_i = seen[key]
-            if _material(first_row) == _material(r):
+            if _material(first_row) == _material(canonical):
                 continue  # same load-bearing metadata (advisory `definition` may differ) -> dedup
             # Same column, differing metadata. Dedup used to keep the FIRST row and silently drop the
             # later one's fields — including `sensitivity`, so a later `pii` tag could be lost and the
@@ -163,7 +177,7 @@ def validate_rows(rows: list[CanonicalRow],
                 quarantined.append(RowError(first_i, msg, first_row))
             quarantined.append(RowError(i, msg, r))
             continue
-        seen[key] = (r, i)
-        good.append(r)
+        seen[key] = (canonical, i)
+        good.append(canonical)
 
     return ValidationResult(good=good, quarantined=quarantined, structural_error=None)

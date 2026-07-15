@@ -72,6 +72,34 @@ def test_slice_ingest_serve_drift_and_brake(db):
     assert res3.status == "held"
 
 
+def test_case_whitespace_variant_reupload_is_one_identity(db):
+    # #1: a re-upload differing ONLY in case / trailing whitespace on table+column is the SAME
+    # catalog: ONE graph node per column (no case-variant twin), NO drift (changed_objects == 0),
+    # and no false fact re-assertion. Pre-fix the raw refs split identity: the brake saw 0% overlap
+    # (held) and the snapshot diff reported mass drift.
+    _seal_config()
+    now = datetime(2026, 7, 5, tzinfo=UTC)
+    source = "deposits"
+    rows1 = [
+        CanonicalRow(source, "accounts", "id", "integer", is_grain=True),
+        CanonicalRow(source, "accounts", "balance", "numeric"),
+    ]
+    assert ingest_upload(db, source, rows1, actor=_actor(), now=now).status == "ingested"
+
+    rows2 = [
+        CanonicalRow(source, "Accounts ", "ID ", "integer", is_grain=True),
+        CanonicalRow(source, " accounts", "Balance", "numeric"),
+    ]
+    res2 = ingest_upload(db, source, rows2, actor=_actor(), now=now)
+    assert res2.status == "ingested"          # same catalog — not held as a wrong source
+    assert res2.changed_objects == 0          # no false drift/staling
+    assert res2.asserted == 0                 # grain fact value unchanged -> no re-assertion
+    refs = sorted(r[0] for r in db.execute(
+        "SELECT object_ref FROM graph_node WHERE catalog_source = %s AND kind = 'column'",
+        (source,)).fetchall())
+    assert refs == ["public.accounts.balance", "public.accounts.id"]   # ONE node per column
+
+
 def test_enrichment_failure_does_not_abort_ingest(db):
     _seal_config()
     now = datetime(2026, 7, 5, tzinfo=UTC)

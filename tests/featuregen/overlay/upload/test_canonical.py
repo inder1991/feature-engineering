@@ -101,6 +101,28 @@ def test_dotted_table_or_column_is_quarantined():
     assert all("." in q.message for q in result.quarantined)
 
 
+def test_accepted_rows_carry_normalized_identity():
+    # #1: validate_rows dedups on the NORMALIZED (strip+lower) key, so the rows it RETURNS must carry
+    # that same normalized identity — otherwise graph nodes / drift snapshot / cache keys inherit the
+    # raw casing and one physical column splits into case-variant twins across uploads.
+    result = validate_rows([_row(source="Deposits ", table="Accounts ", column=" ID",
+                                 joins_to="Customers.CUST_ID ")])
+    assert len(result.good) == 1
+    good = result.good[0]
+    assert good.source == "deposits"
+    assert good.table == "accounts"
+    assert good.column == "id"
+    assert good.joins_to == "customers.cust_id"   # the join TARGET is an identity too
+
+
+def test_case_variant_duplicates_dedup_to_one_normalized_row():
+    rows = [_row(table="Accounts", column="ID"), _row(table="accounts ", column="id ")]
+    result = validate_rows(rows)
+    assert len(result.good) == 1
+    assert (result.good[0].table, result.good[0].column) == ("accounts", "id")
+    assert result.quarantined == []
+
+
 def test_conflicting_metadata_for_a_column_fails_closed():
     # A later duplicate with a pii tag must NOT be silently dropped (leaving the column world-readable).
     rows = [
