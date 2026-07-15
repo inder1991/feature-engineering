@@ -1,4 +1,23 @@
+import pytest
+
 from featuregen.overlay.upload.csv_reader import read_csv_rows
+
+
+def test_duplicate_header_rejected():
+    # A repeated column (here two `sensitivity` columns) is silently collapsed last-write-wins by
+    # csv.DictReader, which can drop a PII tag (the first `pii` overwritten by the trailing blank).
+    # Reject the structurally-broken file loudly instead of graphing an untagged SSN column (#17).
+    text = "sensitivity,table,column,type,sensitivity\npii,orders,ssn,varchar,\n"
+    with pytest.raises(ValueError, match="sensitivity"):
+        read_csv_rows(text, source="deposits")
+
+
+def test_conflicting_alias_headers_rejected():
+    # `table` and `tablename` both alias to the canonical `table` field; last-write-wins would
+    # silently pick one identity column. Reject the ambiguous file (#17).
+    text = "table,tablename,column,type\norders,ORDERS,id,integer\n"
+    with pytest.raises(ValueError, match="table"):
+        read_csv_rows(text, source="deposits")
 
 
 def test_reads_aliased_headers_and_booleans():

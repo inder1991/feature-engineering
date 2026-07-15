@@ -37,13 +37,31 @@ def _norm(h: str) -> str:
 
 
 def field_map(headers: list[str]) -> dict[str, str]:
-    """Map each canonical field to the source header that supplies it (unknown headers ignored)."""
+    """Map each canonical field to the source header that supplies it (unknown headers ignored).
+
+    REJECTS structural header corruption instead of silently last-write-winning (#17): two columns
+    that normalize to the same name (a DUPLICATE header — csv.DictReader collapses them and the
+    reader can drop a value, e.g. a PII `sensitivity` tag) OR two DISTINCT headers that alias to the
+    same canonical field (e.g. `table` + `tablename`) raise ``ValueError``. The caller surfaces it as
+    a clear diagnostic (a 400 at the upload boundary) rather than graphing an ambiguous/under-tagged
+    row. Unknown/unmapped headers are ignored, so a repeated unrecognized column is harmless."""
     out: dict[str, str] = {}
+    seen_norm: dict[str, str] = {}   # normalized header -> the raw header it came from (mapped only)
     for h in headers:
         n = _norm(h)
-        for field, variants in _ALIASES.items():
-            if n in variants:
-                out[field] = h
+        matched = next((field for field, variants in _ALIASES.items() if n in variants), None)
+        if matched is None:
+            continue
+        if n in seen_norm:
+            raise ValueError(
+                f"duplicate header {h!r} (also {seen_norm[n]!r}): a repeated column is silently "
+                "collapsed and can drop a value such as a sensitivity tag — give each a distinct name")
+        if matched in out:
+            raise ValueError(
+                f"conflicting headers {out[matched]!r} and {h!r} both map to the '{matched}' field "
+                f"— remove one so the {matched} value is unambiguous")
+        seen_norm[n] = h
+        out[matched] = h
     return out
 
 

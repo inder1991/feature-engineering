@@ -1,6 +1,7 @@
 import io
 
 import openpyxl
+import pytest
 
 from featuregen.overlay.upload.excel_reader import read_excel_rows
 
@@ -28,6 +29,15 @@ def test_reads_aliased_headers_types_and_flags():
     assert rows[0].column == "id" and rows[0].type == "integer" and rows[0].is_grain is True
     assert rows[1].as_of is True and rows[1].is_grain is False
     assert rows[2].sensitivity == "pii" and rows[2].definition == "Hashed SSN"
+
+
+def test_conflicting_alias_headers_rejected():
+    # Two headers aliasing to the same canonical field (`table` + `tablename`) are ambiguous; reject
+    # the file rather than silently last-write-winning one identity column (#17).
+    data = _xlsx([["table", "tablename", "column", "type"],
+                  ["orders", "ORDERS", "id", "integer"]])
+    with pytest.raises(ValueError, match="table"):
+        read_excel_rows(data, source="deposits")
 
 
 def test_skips_leading_blank_rows_and_source_column():
