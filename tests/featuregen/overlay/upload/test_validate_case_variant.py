@@ -33,7 +33,8 @@ def test_case_variant_identical_material_dedups_to_one():
     vr = validate_rows(rows)
     assert len(vr.good) == 1
     assert vr.quarantined == []
-    assert vr.good[0].table == "Accounts"                           # rows flow to build_graph unmutated
+    assert vr.good[0].table == "accounts"    # accepted rows carry the normalized identity (finding #1)
+    assert vr.good[0].column == "ssn"        # so build_graph / snapshot / cache all key on one ref
 
 
 def test_source_mismatch_check_uses_identity_normalizer():
