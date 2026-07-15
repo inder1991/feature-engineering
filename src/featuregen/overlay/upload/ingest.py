@@ -23,7 +23,7 @@ from featuregen.overlay.object_identity import ObjectBinding, may_attach
 from featuregen.overlay.projection import OverlayProjection
 from featuregen.overlay.state import fold_overlay_state
 from featuregen.overlay.store import append_overlay_event, load_fact
-from featuregen.overlay.upload.brake import large_change_brake
+from featuregen.overlay.upload.brake import large_change_brake, resolution_brake
 from featuregen.overlay.upload.canonical import CanonicalRow, validate_rows
 from featuregen.overlay.upload.enrich import (
     classify_domains,
@@ -997,9 +997,11 @@ def _row_from_raw(raw: dict, catalog_source: str) -> CanonicalRow:
 def resolve_quarantine_row(conn, catalog_source: str, row_index: int, edits: dict, *,
                            actor) -> tuple[bool, str]:
     """Apply a reviewer's inline fix to a quarantined row: merge the edits onto the raw row, RE-RUN the
-    real deterministic validation (validate_rows — never the client mock), and, if it now passes and its
-    column isn't already in the catalog, add it to the source graph + reconcile its table's grain /
-    point-in-time facts and drop it from the queue. Returns (resolved, reason).
+    real deterministic validation (validate_rows — never the client mock), and, if it now passes, its
+    column isn't already in the catalog, and the cumulative resolved additions don't trip the
+    source-level large-change brake (#4 — resolution is an ingestion path), add it to the source
+    graph + reconcile its table's grain / point-in-time facts and drop it from the queue.
+    Returns (resolved, reason).
 
     LIMITS (holds until the source is re-uploaded — the file stays the source of truth): a resolved
     column is added incrementally, so it is NOT recorded in the drift snapshot and a subsequent
@@ -1019,6 +1021,16 @@ def resolve_quarantine_row(conn, catalog_source: str, row_index: int, edits: dic
     if conn.execute("SELECT 1 FROM graph_node WHERE catalog_source = %s AND object_ref = %s",
                     (catalog_source, c_ref)).fetchone() is not None:
         return False, f"{good.table}.{good.column} is already in the catalog"
+    # #4: resolution is an INGESTION path, so it takes the same source-level large-change brake an
+    # upload does. Cumulative: every object added by resolution since the last successful upload
+    # (graph minus the drift snapshot) counts alongside this row's, so an all-quarantined
+    # wrong-source upload cannot be laundered into the catalog one resolved row at a time.
+    brake = resolution_brake(
+        conn, catalog_source, set(UploadCatalog(catalog_source, [good]).fingerprint().keys()))
+    if brake.held:
+        logger.warning("quarantine resolution for %r held by the large-change brake: %s",
+                       catalog_source, brake.reason)
+        return False, f"held by the large-change brake: {brake.reason}"
     add_column_row(conn, catalog_source, good)
     if good.is_grain:
         # reconcile the table's grain fact with its FULL grain-column set (now incl. the added column),

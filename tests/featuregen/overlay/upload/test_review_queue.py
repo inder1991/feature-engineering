@@ -88,6 +88,41 @@ def test_resolve_rejects_a_column_already_in_the_catalog(db):
     assert not resolved and "already" in reason
 
 
+def test_resolve_cannot_bypass_the_large_change_brake(db):
+    # #4: an all-quarantined WRONG-SOURCE upload is held by the brake — but resolving it row-by-row
+    # used to bypass the brake entirely, letting a reviewer contaminate the catalog with an unrelated
+    # schema one object at a time. The cumulative resolved additions must re-trip the source brake.
+    _seal()
+    now = datetime(2026, 7, 5, tzinfo=UTC)
+    rows = [
+        CanonicalRow("deposits", "accounts", "id", "integer", is_grain=True),
+        CanonicalRow("deposits", "accounts", "balance", "numeric"),
+        CanonicalRow("deposits", "accounts", "posted_at", "timestamp", as_of=True),
+        CanonicalRow("deposits", "customers", "cust_id", "integer", is_grain=True),
+    ]
+    assert ingest_upload(db, "deposits", rows, actor=_actor(), now=now).status == "ingested"
+
+    foreign = [CanonicalRow("crm", t, c, "text") for t, c in [
+        ("leads", "lead_id"), ("leads", "stage"),
+        ("tickets", "ticket_id"), ("tickets", "priority")]]
+    held = ingest_upload(db, "deposits", foreign, actor=_actor(), now=now)
+    assert held.status == "held"                      # the upload path is braked...
+    q = list_quarantine(db, "deposits")
+    assert len(q) == 4
+
+    outcomes = [resolve_quarantine_row(db, "deposits", item.row_index,
+                                       {"source": "deposits"}, actor=_actor())
+                for item in q]
+    refused = [reason for resolved, reason in outcomes if not resolved]
+    assert refused and "brake" in refused[0]          # ...and row-by-row resolution is too
+    # The brake fired BEFORE the whole foreign schema landed in the graph.
+    foreign_cols = db.execute(
+        "SELECT count(*) FROM graph_node WHERE catalog_source = 'deposits' AND kind = 'column' "
+        "AND table_name IN ('leads', 'tickets')").fetchone()[0]
+    assert foreign_cols < 4
+    assert list_quarantine(db, "deposits")            # refused rows stay queued for review
+
+
 def test_dismiss_quarantine_row(db):
     idx = _quarantine_one_bad(db)
     assert dismiss_quarantine_row(db, "deposits", idx) is True
