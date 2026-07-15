@@ -45,7 +45,10 @@ def run_shadow_planner(conn, *, eligible_recipe_ids: frozenset[str], target_enti
                 selected_plan_id=None, candidate_plans=(), result_status=PlanResolutionStatus.internal_error,
                 primary_reason_code=ReasonCode.planner_internal_error,
                 reason_codes=(ReasonCode.planner_internal_error,),
-                bounding=BoundingMetricsV1(False, False, False, False, 0, 0, 0),   # zero — nothing was explored
+                bounding=BoundingMetricsV1(False, False, False, False, 0, 0, 0,   # zero — nothing was explored
+                                           realizations_truncated=False, bridge_transitions_truncated=False,
+                                           frontier_states_truncated=False, deeper_tiers_not_explored=False,
+                                           total_states_expanded=0, total_bridge_transitions_explored=0),
                 ground_template_diff=GroundTemplateDiffV1(GroundTemplateDiffOutcome.not_compared, (), None),
                 replay_envelope=_envelope(scope, rid, target_entity))
         logger.info("shadow_binding_plan recipe=%s status=%s selected=%s scope=%s",

@@ -3,7 +3,9 @@ from featuregen.overlay.upload.planner.candidates import CandidateDiscoveryV1
 from featuregen.overlay.upload.planner.contracts import (
     BindingQuality,
     BindingSafety,
+    CandidateRole,
     IngredientCandidateV1,
+    PathResolutionStatus,
     PlanResolutionStatus,
     PlanTier,
     SegmentKind,
@@ -36,6 +38,11 @@ def test_single_eligible_per_need_yields_one_resolved_plan():
     assert p.resolution_status is PlanResolutionStatus.resolved
     assert len(p.path_segments) == 1 and p.path_segments[0].segment_kind is SegmentKind.direct_catalog
     assert {b.bound_object_ref for b in p.ingredient_bindings} == {"public.t.a", "public.t.b"}
+    # 3B.3b derived fields: a tier-1 ingredient binding is single-catalog, zero-bridge,
+    # ingredient_binding_only (the B5 assembler enriches it; the ranker resets candidate_role)
+    assert p.participating_catalogs == ("core",) and p.bridge_count == 0
+    assert p.path_resolution_status is PathResolutionStatus.ingredient_binding_only
+    assert p.candidate_role is CandidateRole.rejected
 
 
 def test_cartesian_product_of_eligible_candidates():

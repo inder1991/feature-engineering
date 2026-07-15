@@ -14,6 +14,7 @@ from featuregen.overlay.upload.planner.candidates import discover_ingredient_can
 from featuregen.overlay.upload.planner.contracts import (
     APPLICABILITY_MAPPING_VERSION,
     CONCEPT_REGISTRY_VERSION,
+    PLAN_CONTRACT_VERSION,
     PLANNER_VERSION,
     REASON_CODE_REGISTRY_VERSION,
     RECIPE_REGISTRY_VERSION,
@@ -45,7 +46,9 @@ def _envelope(scope: CatalogScopeV1, recipe_id: str, target_entity: str | None) 
         realization_derivation_version=REALIZATION_DERIVATION_VERSION,
         bridge_derivation_version=BRIDGE_DERIVATION_VERSION, concept_registry_version=CONCEPT_REGISTRY_VERSION,
         catalog_scope=scope, replay_strength=ReplayStrength.conditional,
-        planner_input_hash="ph_" + hashlib.sha256(material.encode()).hexdigest()[:24])
+        planner_input_hash="ph_" + hashlib.sha256(material.encode()).hexdigest()[:24],
+        # 3B.3a consults no bridges; the 3B.3b assembler (B5) records the crossings it could see.
+        active_bridge_fact_keys=(), plan_contract_version=PLAN_CONTRACT_VERSION)
 
 
 def _differential(conn, template, plans, scope, roles, now) -> GroundTemplateDiffV1:
@@ -90,7 +93,11 @@ def plan_bindings(conn, *, template: Template, target_entity: str | None, scope:
     ordered = order_plans(all_plans)
     resolved = [p for p in ordered.plans if p.resolution_status is PlanResolutionStatus.resolved]
     bounding = BoundingMetricsV1(cols_trunc, combos_trunc, plans_trunc, scope.catalog_consideration_truncated,
-                                 total_cols, total_combos, len(ordered.plans))
+                                 total_cols, total_combos, len(ordered.plans),
+                                 # 3B.3b assembly metrics — no assembly runs on this tier-1 path yet (B5):
+                                 realizations_truncated=False, bridge_transitions_truncated=False,
+                                 frontier_states_truncated=False, deeper_tiers_not_explored=False,
+                                 total_states_expanded=0, total_bridge_transitions_explored=0)
     diff = _differential(conn, template, ordered.plans, scope, roles, now)
 
     if resolved:
@@ -127,6 +134,9 @@ def _empty_result(recipe_id, target_entity, scope, envelope, status, reason):
         run_id=None, recipe_id=recipe_id, target_entity=target_entity, catalog_scope_id=scope.scope_id,
         selected_plan_id=None, candidate_plans=(), result_status=status, primary_reason_code=reason,
         reason_codes=(reason,),
-        bounding=BoundingMetricsV1(False, False, False, scope.catalog_consideration_truncated, 0, 0, 0),
+        bounding=BoundingMetricsV1(False, False, False, scope.catalog_consideration_truncated, 0, 0, 0,
+                                   realizations_truncated=False, bridge_transitions_truncated=False,
+                                   frontier_states_truncated=False, deeper_tiers_not_explored=False,
+                                   total_states_expanded=0, total_bridge_transitions_explored=0),
         ground_template_diff=GroundTemplateDiffV1(GroundTemplateDiffOutcome.not_compared, (), None),
         replay_envelope=envelope)

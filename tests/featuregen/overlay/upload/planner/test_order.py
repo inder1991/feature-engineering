@@ -3,7 +3,9 @@ from featuregen.overlay.upload.planner.contracts import (
     BindingPlanV1,
     BindingQuality,
     BindingSafety,
+    CandidateRole,
     IngredientBindingV1,
+    PathResolutionStatus,
     PlanResolutionStatus,
     PlanTier,
     SegmentKind,
@@ -13,11 +15,16 @@ from featuregen.overlay.upload.planner.order import order_plans
 
 def _plan(pid, refs, *, status=PlanResolutionStatus.resolved, quality=BindingQuality.grain_and_role_fit,
           catalog="core"):
+    # direct construction (not make_binding_plan): these tests pin hand-chosen plan_ids ("a"/"z")
+    # to assert deterministic tie-breaking, which a derived plan_id would defeat.
     binds = tuple(IngredientBindingV1("t", f"r{i}", "c", (), "", "", catalog, r, "account", quality,
                                       BindingSafety.safe, ()) for i, r in enumerate(refs))
     return BindingPlanV1(pid, "t", "customer", PlanTier.tier_1_single_catalog, catalog, binds,
                          (BindingPathSegmentV1(SegmentKind.direct_catalog, catalog),), status, None, (),
-                         BindingSafety.safe, -1, ())
+                         BindingSafety.safe, -1, (),
+                         participating_catalogs=(catalog,), bridge_count=0,
+                         path_resolution_status=PathResolutionStatus.ingredient_binding_only,
+                         candidate_role=CandidateRole.rejected)
 
 
 def test_resolved_ranks_before_partial():

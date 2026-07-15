@@ -3,7 +3,6 @@ candidates into tier-1 BindingPlanV1s, bounded + deterministic. A plan binding e
 `resolved` (pre-ranking); otherwise `partially_resolved`. Ranking is Task 4."""
 from __future__ import annotations
 
-import hashlib
 import itertools
 from dataclasses import dataclass
 
@@ -11,16 +10,17 @@ from featuregen.overlay.upload.planner.candidates import CandidateDiscoveryV1
 from featuregen.overlay.upload.planner.contracts import (
     MAX_PARTIAL_COMBINATIONS,
     MAX_PLANS_PER_RECIPE,
-    PLANNER_VERSION,
     BindingPathSegmentV1,
     BindingPlanV1,
     BindingSafety,
+    CandidateRole,
     IngredientBindingV1,
     IngredientCandidateV1,
+    PathResolutionStatus,
     PlanResolutionStatus,
-    PlanTier,
     ReasonCode,
     SegmentKind,
+    make_binding_plan,
 )
 from featuregen.overlay.upload.templates import Template
 
@@ -39,11 +39,6 @@ def _binding(c: IngredientCandidateV1) -> IngredientBindingV1:
         join_role=c.join_role, temporal_role=c.temporal_role, bound_catalog_source=c.catalog_source,
         bound_object_ref=c.object_ref, actual_source_grain=c.actual_source_grain,
         binding_quality=c.binding_quality, safety=c.safety, reason_codes=c.reason_codes)
-
-
-def _plan_id(recipe_id: str, catalog: str, refs: tuple[str, ...]) -> str:
-    material = f"{recipe_id}|{catalog}|{'|'.join(sorted(refs))}|{PlanTier.tier_1_single_catalog}|{PLANNER_VERSION}"
-    return "bp_" + hashlib.sha256(material.encode()).hexdigest()[:16]
 
 
 def enumerate_single_catalog_plans(template: Template, catalog_source: str, target_entity: str | None,
@@ -80,18 +75,21 @@ def enumerate_single_catalog_plans(template: Template, catalog_source: str, targ
         bound = [c for c in combo if c is not None] + opt_bindings
         missing_required = any(c is None for c in combo)
         bindings = tuple(_binding(c) for c in sorted(bound, key=lambda c: c.need_role))
-        refs = tuple(b.bound_object_ref for b in bindings)
         status = (PlanResolutionStatus.partially_resolved if missing_required
                   else PlanResolutionStatus.resolved)
         reasons = (ReasonCode.missing_required_need,) if missing_required else ()
-        plans.append(BindingPlanV1(
-            plan_id=_plan_id(template.id, catalog_source, refs), recipe_id=template.id,
-            target_entity=target_entity, tier=PlanTier.tier_1_single_catalog, catalog_source=catalog_source,
+        # a tier-1 ingredient binding is ingredient_binding_only until the 3B.3b assembler (B5)
+        # enriches it into an executable path; candidate_role starts rejected (the ranker resets it).
+        plans.append(make_binding_plan(
+            recipe_id=template.id, target_entity=target_entity, catalog_source=catalog_source,
             ingredient_bindings=bindings,
             path_segments=(BindingPathSegmentV1(segment_kind=SegmentKind.direct_catalog,
                                                 catalog_source=catalog_source),),
-            resolution_status=status, primary_reason_code=(reasons[0] if reasons else None),
-            reason_codes=reasons, safety=BindingSafety.safe, preference_rank=-1, preference_reasons=()))
+            resolution_status=status,
+            path_resolution_status=PathResolutionStatus.ingredient_binding_only,
+            primary_reason_code=(reasons[0] if reasons else None),
+            reason_codes=reasons, safety=BindingSafety.safe, preference_rank=-1, preference_reasons=(),
+            candidate_role=CandidateRole.rejected))
 
     plans_truncated = len(plans) > MAX_PLANS_PER_RECIPE
     if plans_truncated:

@@ -3,7 +3,12 @@ from datetime import UTC, datetime
 from featuregen.overlay.upload.canonical import CanonicalRow
 from featuregen.overlay.upload.enrich import content_hash
 from featuregen.overlay.upload.graph import build_graph
-from featuregen.overlay.upload.planner.contracts import PlanResolutionStatus, ReplayStrength
+from featuregen.overlay.upload.planner.contracts import (
+    PLAN_CONTRACT_VERSION,
+    PathResolutionStatus,
+    PlanResolutionStatus,
+    ReplayStrength,
+)
 from featuregen.overlay.upload.planner.plan import plan_bindings
 from featuregen.overlay.upload.planner.scope import resolve_catalog_scope
 from featuregen.overlay.upload.templates import Need, Template
@@ -41,8 +46,14 @@ def test_plan_bindings_resolves_a_single_catalog_plan(db):
     assert sel.catalog_source == "core"
     assert {b.bound_object_ref for b in sel.ingredient_bindings} == {"public.accounts.balance",
                                                                      "public.accounts.customer_id"}
+    # 3B.3b derived fields on a tier-1 plan (from the canonical make_binding_plan constructor)
+    assert sel.participating_catalogs == ("core",) and sel.bridge_count == 0
+    assert sel.path_resolution_status is PathResolutionStatus.ingredient_binding_only
     assert result.replay_envelope.replay_strength is ReplayStrength.conditional   # watermark stamps, not a snapshot
     assert result.replay_envelope.planner_input_hash
+    assert result.replay_envelope.plan_contract_version == PLAN_CONTRACT_VERSION
+    assert result.replay_envelope.active_bridge_fact_keys == ()   # 3B.3a consults no bridges
+    assert result.bounding.frontier_states_truncated is False     # no assembly on this path yet
 
 
 def test_no_authorized_catalog_is_not_applicable(db):
