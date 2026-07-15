@@ -45,13 +45,14 @@ Per source-binding candidate + semantic path, run a bounded frontier search. A s
  selected_segments, bridge_count, participating_catalogs, used_bridge_fact_keys)
 ```
 
-The initial state is the source-binding's physical position `(source_entity, source_catalog, source_object_ref)` at hop 0. From each state, expand **all** deterministically-ordered permitted transitions within bounds:
+The physical position is `(current_entity_id, current_catalog_source, current_table_object_ref)` — the entity we've rolled up to + the table we're sitting on. The initial state is the source binding's position `(source_entity, source_catalog, source_table_object_ref)` at hop 0 (the source-grain table). Bridge endpoints in `ActiveBridgeV1` are identifier **column** refs; a bridge is continuous with the current position only when its matching endpoint's *table* equals `current_table_object_ref` (and catalog matches). From each state, expand **all** deterministically-ordered permitted transitions within bounds:
 
-1. **Realize the next semantic hop in place** — an in-scope `CatalogEntityRelationshipV1` whose `(from_object_grain, to_object_grain)` matches the hop's `(from_entity, to_entity)` **and** whose `from_key_ref`/source object is *continuous* with the current position (same catalog + object). Emits `semantic_rollup(E1→E2)` + `intra_catalog_realization` segments; advances to the hop's `to` object; `semantic_hop_index += 1`.
-2. **Traverse a governed active bridge at the current entity** — an `ActiveBridgeV1` with `entity_id == current_entity_id` where one endpoint *exactly* matches `(current_catalog_source, current_object_ref)`; cross to the *other* endpoint (endpoints are UNORDERED/symmetric — normalize). Emits a `governed_bridge` segment; `bridge_count += 1`; `used_bridge_fact_keys += fact_key`; entity unchanged, physical position moves to the other catalog/object. (Then the same or next hop can realize from the new position.)
-3. **Dead-end** — no permitted transition continues the branch → preserve it as a rejected candidate with the precise reason (`missing_realization` or `unsanctioned_bridge`).
+1. **Realize the next hop by an intra-catalog realization (R)** — a `CatalogEntityRelationshipV1` in `current_catalog_source` whose `from_object_ref == current_table_object_ref` (continuity) **and** `(from_object_grain, to_object_grain) == (hop.from_entity, hop.to_entity)`. Emits `semantic_rollup(E1→E2)` + `intra_catalog_realization`; advances to `(hop.to_entity, current_catalog, realization.to_object_ref)`; hop consumed; no bridge.
+2. **Realize the next hop by a cross-catalog roll-up bridge (B)** — the current table has a column `k` with `entity == hop.to_entity` (an `E2`-identity FK); a VERIFIED `active_bridge` with `entity_id == hop.to_entity` whose one endpoint `== (current_catalog_source, current_table.k)` and whose other endpoint `(catalog2, table2.k2)` sits on an `hop.to_entity`-**grain** table (`table2` is `E2`-grain). Emits `semantic_rollup(E1→E2)` + `governed_bridge`; advances to `(hop.to_entity, catalog2, table2)`; hop consumed; `bridge_count += 1`; `used_bridge_fact_keys += fact_key`. *(This is the acceptance scenario's `transaction → account`: the transactions table's `account_id` FK bridges to the account-grain `accounts` table — a cross-catalog FK→grain-key roll-up, exactly what 3B.2A defers to bridges.)*
+3. **Reposition via a same-entity bridge** — a VERIFIED `active_bridge` with `entity_id == current_entity_id`, one endpoint `== (current_catalog_source, current_table's grain-key column)`, the other on a `current_entity`-grain table in `catalog2`. Emits `governed_bridge`; **entity unchanged**, position moves to `(current_entity, catalog2, table2)`; hop **not** consumed; `bridge_count += 1`; `used_bridge_fact_keys += fact_key`. (Used when the next hop's realizer exists only in another catalog reachable at the current entity.)
+4. **Dead-end** — no permitted transition → preserve the branch as a rejected candidate: `missing_realization` (no R and no B for the hop from any reachable in-scope state) or `unsanctioned_bridge` (a realizer exists in another in-scope catalog but no verified bridge reaches it within `MAX_BRIDGES_PER_PLAN`).
 
-A state is **complete** when `semantic_hop_index == len(hops)` and `current_entity_id == target_entity` — a `source_to_target_resolved` path.
+A state is **complete** when `semantic_hop_index == len(hops)` and `current_entity_id == target_entity` — a `source_to_target_resolved` path. Transitions 1–3 are all matched by the same continuity rule (the realizer/bridge's source table == `current_table_object_ref`), so the output is an executable path.
 
 **Cycle prevention + bounds:** the visited key is `(current_entity_id, current_catalog_source, current_object_ref, frozenset(used_bridge_fact_keys))`; **the same bridge fact never appears twice** in one plan. Chained bridges (A→B→C at one entity) are allowed (the search + bounds support them). Bounds: `MAX_BRIDGES_PER_PLAN`, `MAX_REALIZATIONS_PER_HOP`, `MAX_PHYSICAL_PATHS_PER_BINDING`, and a **frontier bound** `MAX_STATES_EXPANDED_PER_BINDING` — on any hit, record the matching truncation flag; a result blocked only by truncation is `bounded_out`, never pretend-complete.
 
@@ -80,15 +81,18 @@ A state is **complete** when `semantic_hop_index == len(hops)` and `current_enti
 
 ### Path-segment grammar (validated; invalid sequences cannot be built)
 
-At a physical representation of `E1`, each semantic hop `E1 → E2` is:
+Each semantic hop `E1 → E2` is:
 
 ```
-[zero or more governed_bridge segments at E1]   # cross catalogs, entity unchanged
-semantic_rollup(E1 → E2)                        # explanatory marker
-intra_catalog_realization(E1/object → E2/object)  # the physical join evidence; advances the entity
+[zero or more REPOSITIONING governed_bridge segments at E1]   # same-entity catalog moves to reach the realizer
+semantic_rollup(E1 → E2)                                       # explanatory marker
+<exactly ONE realizer of the hop:>
+    intra_catalog_realization(E1-table → E2-table)            # (R) both grains in the current catalog
+  | governed_bridge(E2, E1-table.E2_key → E2-table.key)        # (B) cross-catalog FK→grain-key roll-up
+# the resulting physical position represents E2
 ```
 
-Validated: each `semantic_rollup` matches exactly one semantic hop and is followed by its realization; `governed_bridge` segments preserve the entity and change the physical catalog/object; realizations advance the entity; segment continuity holds end-to-end; the final physical entity equals the confirmed target. `semantic_rollup` is explanatory (not independently executable); the `intra_catalog_realization` + `governed_bridge` segments carry the physical evidence — all three retained for audit.
+Validated: each `semantic_rollup` matches exactly one hop and is followed by **exactly one** realizer — either an `intra_catalog_realization` (R) or a roll-up `governed_bridge` (B); *repositioning* `governed_bridge` segments (which precede the `semantic_rollup`) preserve the entity and change only the catalog/table; the realizer advances the entity to `E2`; segment continuity (each segment's source table == the prior segment's destination table) holds end-to-end; the final physical entity equals the confirmed target. A `governed_bridge` segment is tagged whether it is a **roll-up** (advances the entity) or a **reposition** (entity unchanged), so `bridge_count` and the grammar are unambiguous. `semantic_rollup` is explanatory (not independently executable); the `intra_catalog_realization` + `governed_bridge` segments carry the physical evidence — all retained for audit.
 
 ---
 
@@ -179,8 +183,9 @@ A bridge is usable only when: it is active + VERIFIED; **both** endpoint catalog
 
 ## Mandatory adversarial tests
 
-1. **Acceptance path** — `transaction → account → customer` with one bridge → a `tier_2_one_bridge`, `source_to_target_resolved` plan whose segments match the grammar.
-2. **Zero-bridge roll-up** — a single-catalog `transaction → customer` roll-up → a fully-realized `tier_1`, `source_to_target_resolved` plan (proving 3B.3b creates realized tier-1, which 3B.3a did not).
+1. **Acceptance path** — `transaction → account → customer` where `transaction → account` is realized by a **roll-up bridge (B)** (the `transactions.account_id` FK → account-grain `accounts`) and `account → customer` by an **intra-catalog realization (R)** → a `tier_2_one_bridge`, `source_to_target_resolved` plan whose segments match the grammar (one roll-up bridge, `bridge_count=1`).
+2. **Zero-bridge roll-up** — a single-catalog `transaction → customer` roll-up realized entirely by intra-catalog realizations (R) → a fully-realized `tier_1`, `source_to_target_resolved` plan (proving 3B.3b creates realized tier-1, which 3B.3a did not).
+2b. **Repositioning bridge** — the next hop's realizer exists only in another catalog reachable at the *current* entity (same-grain crossing) → a `governed_bridge` reposition segment (`from_entity == to_entity`) that does not advance the hop, followed by the realizer in the new catalog.
 3. **Non-greedy dead-end** — a current-catalog realization that dead-ends on the next hop while a bridge-first path completes → the assembler finds the complete path (proves it is not greedy).
 4. **Wrong-object_ref bridge** — a bridge with the right `entity_id` but an endpoint object_ref ≠ the current position → rejected (not traversed).
 5. **Reverse-orientation bridge** — the current position matches the bridge's *right* endpoint → still traversable (symmetric normalization).
