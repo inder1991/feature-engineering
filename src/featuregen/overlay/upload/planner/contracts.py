@@ -339,8 +339,13 @@ def make_binding_plan(*, recipe_id: str, target_entity: str | None, catalog_sour
     segments_material = ">".join(
         f"{s.segment_kind}:{s.catalog_source}:{s.realization_ref or s.bridge_fact_key or ''}"
         for s in path_segments)
+    # path_resolution_status is part of the hashed material: a tier-1 resolved plan and an
+    # immediate-dead-end reject over the same refs/segments must NOT share a plan_id (3B.4 keys
+    # its store by plan_id). It is stable at construction time — the ranker only rewrites
+    # resolution_status/candidate_role — so it is safe to hash (candidate_role is NOT: it is
+    # reset post-construction via dataclasses.replace).
     material = (f"{recipe_id}|{catalog_source}|{'|'.join(refs)}|{tier}|{segments_material}"
-                f"|{PLANNER_VERSION}|{PLAN_CONTRACT_VERSION}")
+                f"|{path_resolution_status}|{PLANNER_VERSION}|{PLAN_CONTRACT_VERSION}")
     plan_id = "bp_" + hashlib.sha256(material.encode()).hexdigest()[:16]
     return BindingPlanV1(
         plan_id=plan_id, recipe_id=recipe_id, target_entity=target_entity, tier=tier,

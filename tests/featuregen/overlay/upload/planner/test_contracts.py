@@ -120,6 +120,28 @@ def test_make_binding_plan_rejects_resolved_path_with_unresolved_status():
                             preference_rank=0, preference_reasons=(), candidate_role=c.CandidateRole.rejected)
 
 
+def test_plan_id_distinguishes_path_resolution_status():
+    # Regression (b5 review): a tier-1 ingredient_binding_only plan and an immediate-dead-end
+    # assembly reject (source_to_target_rejected) over the SAME recipe/catalog/refs/segments/tier
+    # collided on plan_id because the hashed material omitted path_resolution_status. 3B.4 keys
+    # its store by plan_id, so the collision would silently conflate a resolved plan with a reject.
+    def _plan(path_status: c.PathResolutionStatus) -> c.BindingPlanV1:
+        return c.make_binding_plan(
+            recipe_id="t", target_entity="customer", catalog_source="ops",
+            ingredient_bindings=(),
+            path_segments=(c.BindingPathSegmentV1(c.SegmentKind.direct_catalog, "ops"),),
+            resolution_status=c.PlanResolutionStatus.unresolved,
+            path_resolution_status=path_status,
+            primary_reason_code=None, reason_codes=(), safety=c.BindingSafety.safe,
+            preference_rank=0, preference_reasons=(), candidate_role=c.CandidateRole.rejected)
+
+    binding_only = _plan(c.PathResolutionStatus.ingredient_binding_only)
+    rejected = _plan(c.PathResolutionStatus.source_to_target_rejected)
+    # same tier (both bridge-free -> tier_1) and same segments: only path_resolution_status differs
+    assert binding_only.tier is rejected.tier is c.PlanTier.tier_1_single_catalog
+    assert binding_only.plan_id != rejected.plan_id
+
+
 def test_make_binding_plan_rejects_over_budget_bridges():
     import pytest
     # 3 governed bridges exceeds MAX_BRIDGES_PER_PLAN (2) -> fail-closed, never constructed
