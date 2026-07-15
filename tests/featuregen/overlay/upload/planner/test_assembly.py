@@ -305,3 +305,291 @@ def test_transitions_return_empty_when_nothing_matches(db):
     assert realize_in_place(db, pos, hop, scope) == ()
     assert rollup_bridges(db, pos, hop, scope) == ()
     assert reposition_bridges(db, pos, scope) == ()
+
+
+def test_rollup_bridges_self_guard_on_mismatched_position_entity(db):
+    # B3 carry-forward: the physics must be SELF-defending — a caller pairing the wrong position
+    # with a hop (pos.entity != hop.from_entity) gets (), fail-closed, even though the FK column,
+    # the VERIFIED bridge, and the account-grain far table all exist.
+    _split_catalogs(db)
+    _seed_bridge(db, "bfk1", "account",
+                 "ops", "public.transactions.account_id", "rev", "public.accounts.account_id")
+    pos = _Position("account", "ops", "public.transactions")   # entity does NOT match the hop's from
+    assert rollup_bridges(db, pos, _txn_to_account_hop(), _scope("ops", "rev")) == ()
+
+
+# ---------------------------------------------------------------------------------------------
+# Task B4 — the bounded frontier search + layered tier search + ranking + ambiguity.
+# The search is NON-GREEDY: within a tier it expands ALL permitted transitions; a locally-valid
+# realization that dead-ends must never prevent a bridge-first path from completing. Fail-closed:
+# a state with no permitted transition becomes a REJECTED candidate (missing_realization /
+# unsanctioned_bridge / bounded_out_*) — never a fabricated segment.
+# ---------------------------------------------------------------------------------------------
+from featuregen.overlay.upload.planner.assembly import assemble_paths
+from featuregen.overlay.upload.planner.contracts import (
+    BindingQuality,
+    BindingSafety,
+    CandidateRole,
+    IngredientBindingV1,
+    PathResolutionStatus,
+    PlanResolutionStatus,
+    PlanTier,
+)
+from featuregen.overlay.upload.taxonomy.entity_relationships import EntitySemanticPathV1
+
+
+def _bindings(catalog, ref="public.transactions.transaction_id"):
+    return (IngredientBindingV1(
+        recipe_id="t3b3b", need_role="txn", concept="transaction_id", required_grains=("transaction",),
+        join_role="source_entity_key", temporal_role="", bound_catalog_source=catalog,
+        bound_object_ref=ref, actual_source_grain="transaction",
+        binding_quality=BindingQuality.grain_and_role_fit, safety=BindingSafety.safe, reason_codes=()),)
+
+
+def _template():
+    return _tmpl((Need(role="txn", concept="transaction_id"),))
+
+
+def _first_path(source, target):
+    paths, _ = semantic_rollup_paths(source, target)
+    return paths[0]
+
+
+def _assemble(db, *, source, catalog, table="public.transactions", target, path=None, scope,
+              bindings=None):
+    return assemble_paths(
+        db, source_position=_Position(source, catalog, table),
+        semantic_path=path if path is not None else _first_path(source, target),
+        scope=scope, ingredient_bindings=bindings if bindings is not None else _bindings(catalog),
+        template=_template(), target_entity=target)
+
+
+# --- completion: roll-up bridge (tier 2) and zero-bridge (tier 1) -----------------------------
+
+def test_assemble_completes_via_rollup_bridge(db):
+    _split_catalogs(db)
+    _seed_bridge(db, "bfk1", "account",
+                 "ops", "public.transactions.account_id", "rev", "public.accounts.account_id")
+    asm = _assemble(db, source="transaction", catalog="ops", target="account",
+                    scope=_scope("ops", "rev"))
+    assert len(asm.complete) == 1
+    p = asm.complete[0]
+    assert p.path_resolution_status is PathResolutionStatus.source_to_target_resolved
+    assert p.resolution_status is PlanResolutionStatus.resolved
+    assert p.bridge_count == 1 and p.tier is PlanTier.tier_2_one_bridge
+    assert p.candidate_role is CandidateRole.selected
+    assert p.participating_catalogs == ("ops", "rev")
+    assert [s.segment_kind for s in p.path_segments] == [
+        SegmentKind.direct_catalog, SegmentKind.semantic_rollup, SegmentKind.governed_bridge]
+    assert p.path_segments[2].bridge_fact_key == "bfk1"
+
+
+def test_assemble_zero_bridge_rollup_is_tier_1(db):
+    _core_catalog(db)
+    asm = _assemble(db, source="transaction", catalog="core", target="account", scope=_scope("core"))
+    assert len(asm.complete) == 1 and asm.rejected == ()
+    p = asm.complete[0]
+    assert p.path_resolution_status is PathResolutionStatus.source_to_target_resolved
+    assert p.bridge_count == 0 and p.tier is PlanTier.tier_1_single_catalog
+    assert [s.segment_kind for s in p.path_segments] == [
+        SegmentKind.direct_catalog, SegmentKind.semantic_rollup, SegmentKind.intra_catalog_realization]
+
+
+def test_assemble_exact_zero_hop_completes_in_place(db):
+    # EXACT semantic path (source == target, no hops) -> a valid zero-bridge complete plan
+    _seed(db, "core", [
+        (CanonicalRow("core", "accounts", "account_id", "integer", is_grain=True), "account_id"),
+    ])
+    asm = _assemble(db, source="account", catalog="core", table="public.accounts", target="account",
+                    path=EntitySemanticPathV1(hops=()), scope=_scope("core"),
+                    bindings=_bindings("core", ref="public.accounts.account_id"))
+    assert len(asm.complete) == 1 and asm.rejected == ()
+    p = asm.complete[0]
+    assert p.path_resolution_status is PathResolutionStatus.source_to_target_resolved
+    assert p.bridge_count == 0 and p.tier is PlanTier.tier_1_single_catalog
+    assert [s.segment_kind for s in p.path_segments] == [SegmentKind.direct_catalog]
+
+
+# --- THE GATE: non-greedy — a locally-valid realization that dead-ends must not block the
+# --- bridge-first path from completing ---------------------------------------------------------
+
+def _dead_end_vs_bridge(db):
+    """ops realizes hop 0 (txn->account) INTRA-catalog, but ops.accounts has no path to customer:
+    a greedy searcher that commits to the first (R) transition dies at hop 1. The ONLY completing
+    physical path is bridge-FIRST: ops.transactions -bridge-> rev.accounts -R-> rev.customers."""
+    _seed(db, "ops", [
+        (CanonicalRow("ops", "transactions", "transaction_id", "integer", is_grain=True),
+         "transaction_id"),
+        (CanonicalRow("ops", "transactions", "account_id", "integer",
+                      joins_to="accounts.account_id", cardinality="N:1"), "account_id"),
+        (CanonicalRow("ops", "accounts", "account_id", "integer", is_grain=True), "account_id"),
+    ])
+    _seed(db, "rev", [
+        (CanonicalRow("rev", "accounts", "account_id", "integer", is_grain=True), "account_id"),
+        (CanonicalRow("rev", "accounts", "customer_id", "integer",
+                      joins_to="customers.customer_id", cardinality="N:1"), "customer_id"),
+        (CanonicalRow("rev", "customers", "customer_id", "integer", is_grain=True), "customer_id"),
+    ])
+    _seed_bridge(db, "bfkx", "account",
+                 "ops", "public.transactions.account_id", "rev", "public.accounts.account_id")
+
+
+def test_non_greedy_dead_end_does_not_block_bridge_first_completion(db):
+    _dead_end_vs_bridge(db)
+    asm = _assemble(db, source="transaction", catalog="ops", target="customer",
+                    scope=_scope("ops", "rev"))
+    # the bridge-first path completes even though the (deterministically FIRST) R transition dead-ends
+    assert len(asm.complete) == 1
+    p = asm.complete[0]
+    assert p.path_resolution_status is PathResolutionStatus.source_to_target_resolved
+    assert p.bridge_count == 1
+    assert any(s.bridge_fact_key == "bfkx" for s in p.path_segments)
+    # the dead end is a first-class REJECTED candidate (a realizer for hop 1 exists in rev, but no
+    # verified bridge reaches it from the dead-end position) — never silently dropped
+    assert len(asm.rejected) == 1
+    r = asm.rejected[0]
+    assert r.path_resolution_status is PathResolutionStatus.source_to_target_rejected
+    assert r.primary_reason_code is ReasonCode.unsanctioned_bridge
+
+
+# --- cycle prevention: reposition pair must terminate, no bridge fact reused -------------------
+
+def test_reposition_cycle_terminates_without_bridge_reuse(db):
+    _seed(db, "core", [
+        (CanonicalRow("core", "accounts", "account_id", "integer", is_grain=True), "account_id"),
+    ])
+    _seed(db, "rev", [
+        (CanonicalRow("rev", "accounts", "account_id", "integer", is_grain=True), "account_id"),
+    ])
+    # two parallel same-entity crossings between the SAME tables: an unguarded search ping-pongs forever
+    _seed_bridge(db, "cyc1", "account",
+                 "core", "public.accounts.account_id", "rev", "public.accounts.account_id")
+    _seed_bridge(db, "cyc2", "account",
+                 "core", "public.accounts.account_id", "rev", "public.accounts.account_id")
+    asm = _assemble(db, source="account", catalog="core", table="public.accounts",
+                    target="customer", scope=_scope("core", "rev"),
+                    bindings=_bindings("core", ref="public.accounts.account_id"))
+    # terminates, completes nothing (no account->customer realizer exists anywhere), rejects finitely
+    assert asm.complete == ()
+    assert asm.rejected
+    for p in asm.rejected:
+        keys = [s.bridge_fact_key for s in p.path_segments if s.bridge_fact_key is not None]
+        assert len(keys) == len(set(keys))          # the same bridge fact never appears twice
+        assert p.primary_reason_code is ReasonCode.missing_realization
+    assert asm.bounding.total_states_expanded < 10  # finite, small — the cycle was cut, not bounded out
+    assert asm.bounding.frontier_states_truncated is False
+
+
+# --- whole-tier completion: fewest bridges wins; deeper tiers are not expanded -----------------
+
+def test_whole_tier_zero_bridge_preferred_over_bridge_solution(db):
+    _core_catalog(db)                                # 0-bridge R path core.transactions -> core.accounts
+    _seed(db, "rev", [
+        (CanonicalRow("rev", "accounts", "account_id", "integer", is_grain=True), "account_id"),
+    ])
+    _seed_bridge(db, "bfk_alt", "account",           # a 1-bridge alternative that must NOT be explored
+                 "core", "public.transactions.account_id", "rev", "public.accounts.account_id")
+    asm = _assemble(db, source="transaction", catalog="core", target="account",
+                    scope=_scope("core", "rev"))
+    assert len(asm.complete) == 1
+    p = asm.complete[0]
+    assert p.bridge_count == 0 and p.tier is PlanTier.tier_1_single_catalog
+    assert p.candidate_role is CandidateRole.selected
+    assert p.resolution_status is PlanResolutionStatus.resolved   # a clear single winner, no ambiguity
+    assert all(q.bridge_count == 0 for q in asm.complete)         # the 1-bridge tier never completed
+    assert asm.bounding.deeper_tiers_not_explored is True
+
+
+# --- ambiguity: full-key ties resolve WITH ambiguity, deterministically ------------------------
+
+def test_equal_rank_complete_paths_resolve_with_ambiguity(db):
+    _seed(db, "core", [
+        (CanonicalRow("core", "transactions", "transaction_id", "integer", is_grain=True),
+         "transaction_id"),
+        (CanonicalRow("core", "transactions", "account_id", "integer",
+                      joins_to="accounts.account_id", cardinality="N:1"), "account_id"),
+        (CanonicalRow("core", "transactions", "acct_ref", "integer",
+                      joins_to="accounts2.account_id", cardinality="N:1"), "account_id"),
+        (CanonicalRow("core", "accounts", "account_id", "integer", is_grain=True), "account_id"),
+        (CanonicalRow("core", "accounts2", "account_id", "integer", is_grain=True), "account_id"),
+    ])
+    asm = _assemble(db, source="transaction", catalog="core", target="account", scope=_scope("core"))
+    # two physical paths, equal on the FULL ranking key (safety/bridges/quality/path-len/authority)
+    assert len(asm.complete) == 2
+    assert [p.candidate_role for p in asm.complete] == [
+        CandidateRole.selected, CandidateRole.equal_rank_alternative]
+    assert all(p.resolution_status is PlanResolutionStatus.resolved_with_ambiguity
+               for p in asm.complete)
+    assert asm.complete[0].plan_id < asm.complete[1].plan_id      # canonical plan_id tie-break
+
+
+# --- fail-closed rejects: missing_realization / unsanctioned_bridge ----------------------------
+
+def test_missing_realization_rejects_without_fabricating_segments(db):
+    _seed(db, "bare", [
+        (CanonicalRow("bare", "transactions", "transaction_id", "integer", is_grain=True),
+         "transaction_id"),
+        (CanonicalRow("bare", "transactions", "account_id", "integer"), "account_id"),
+    ])
+    asm = _assemble(db, source="transaction", catalog="bare", target="account", scope=_scope("bare"))
+    assert asm.complete == ()
+    assert len(asm.rejected) == 1
+    r = asm.rejected[0]
+    assert r.path_resolution_status is PathResolutionStatus.source_to_target_rejected
+    assert r.resolution_status is PlanResolutionStatus.unresolved
+    assert r.primary_reason_code is ReasonCode.missing_realization
+    assert r.candidate_role is CandidateRole.rejected
+    # NEVER a fabricated realizer/bridge segment to force completion
+    assert [s.segment_kind for s in r.path_segments] == [SegmentKind.direct_catalog]
+
+
+def test_unsanctioned_bridge_rejects_when_realizer_is_only_across_an_unbridged_crossing(db):
+    _seed(db, "ops", [
+        (CanonicalRow("ops", "transactions", "transaction_id", "integer", is_grain=True),
+         "transaction_id"),
+        (CanonicalRow("ops", "transactions", "account_id", "integer"), "account_id"),
+    ])
+    _seed(db, "rev", [    # rev CAN realize txn->account — but no VERIFIED bridge reaches rev
+        (CanonicalRow("rev", "transactions", "transaction_id", "integer", is_grain=True),
+         "transaction_id"),
+        (CanonicalRow("rev", "transactions", "account_id", "integer",
+                      joins_to="accounts.account_id", cardinality="N:1"), "account_id"),
+        (CanonicalRow("rev", "accounts", "account_id", "integer", is_grain=True), "account_id"),
+    ])
+    asm = _assemble(db, source="transaction", catalog="ops", target="account",
+                    scope=_scope("ops", "rev"))
+    assert asm.complete == ()
+    assert len(asm.rejected) == 1
+    r = asm.rejected[0]
+    assert r.primary_reason_code is ReasonCode.unsanctioned_bridge
+    assert r.path_resolution_status is PathResolutionStatus.source_to_target_rejected
+    assert [s.segment_kind for s in r.path_segments] == [SegmentKind.direct_catalog]
+
+
+# --- determinism under seeding shuffle ----------------------------------------------------------
+
+def test_ranked_output_is_byte_identical_under_bridge_seed_shuffle(db):
+    _seed(db, "ops", [
+        (CanonicalRow("ops", "transactions", "transaction_id", "integer", is_grain=True),
+         "transaction_id"),
+        (CanonicalRow("ops", "transactions", "account_id", "integer"), "account_id"),
+    ])
+    for cat in ("rev", "rev2"):
+        _seed(db, cat, [
+            (CanonicalRow(cat, "accounts", "account_id", "integer", is_grain=True), "account_id"),
+        ])
+    bridges = [("b_rev", "rev"), ("b_rev2", "rev2")]
+
+    def run(order):
+        db.execute("DELETE FROM entity_bridge_edge")
+        for fk, cat in order:
+            _seed_bridge(db, fk, "account",
+                         "ops", "public.transactions.account_id", cat, "public.accounts.account_id")
+        return _assemble(db, source="transaction", catalog="ops", target="account",
+                         scope=_scope("ops", "rev", "rev2"))
+
+    a = run(bridges)
+    b = run(list(reversed(bridges)))
+    assert repr(a) == repr(b)                                     # byte-identical ranked output
+    assert [p.plan_id for p in a.complete] == [p.plan_id for p in b.complete]
+    assert len(a.complete) == 2 and all(p.bridge_count == 1 for p in a.complete)
