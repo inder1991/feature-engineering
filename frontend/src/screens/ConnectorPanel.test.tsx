@@ -95,7 +95,7 @@ const PREVIEW: api.SyncPreview = {
 
 const IMPORT_OK: api.SyncImportResult = {
   result: {
-    status: 'ingested', reason: null, asserted: 3, staled: 0, quarantined: 1,
+    status: 'ingested', reason: null, asserted: 3, changed_objects: 0, quarantined: 1,
     flagged: "first upload of 'cards' (13 objects) — review recommended",
   },
   import_id: 'omimp_01HZYBBBBBBBBBBBBBBBBBBBBB',
@@ -374,7 +374,7 @@ describe('approve flow', () => {
 
     const status = await screen.findByRole('status')
     expect(status).toHaveTextContent('Ingested.')
-    expect(status).toHaveTextContent('3 facts asserted, 0 staled, 1 quarantined')
+    expect(status).toHaveTextContent('3 facts asserted, 0 objects changed, 1 quarantined')
     expect(status).toHaveTextContent(/first upload of 'cards'/)
     expect(importSync).toHaveBeenCalledExactlyOnceWith(SYNC.sync_id, SNAPSHOT_HASH)
 
@@ -394,7 +394,7 @@ describe('approve flow', () => {
     importSync.mockResolvedValue({
       result: {
         status: 'held', reason: 'overlap 20% < 60% (possible wrong source)',
-        asserted: 0, staled: 0, quarantined: 0, flagged: null,
+        asserted: 0, changed_objects: 0, quarantined: 0, flagged: null,
       },
       import_id: 'omimp_01HELD',
       review_queue: { quarantined: 0, semantics_pending: 0 },

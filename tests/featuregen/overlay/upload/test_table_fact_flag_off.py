@@ -56,7 +56,7 @@ def test_declared_grain_survives_drift_stale_reupload(overlay_conn, human_actor)
     r2 = ingest_upload(overlay_conn, "src", _rows("pii"), actor=human_actor,
                        now=_NOW + timedelta(minutes=1))
     assert r2.status == "ingested"
-    assert r2.staled == 1   # the grain fact drift-STALEd — resolve_fact now serves None
+    assert r2.changed_objects == 1   # `id` type-changed; its grain fact drift-STALEd (serves None)
 
     # The file-declared grain must NOT be wiped by the clear-then-set projection.
     assert _is_grain(overlay_conn, "id") is True

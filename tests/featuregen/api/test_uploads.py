@@ -70,6 +70,18 @@ def test_empty_upload_rejected(client):
     assert res.json()["status"] == "rejected"
 
 
+def test_ingest_result_counts_changed_objects_not_staled_facts(client):
+    """#30: the drift counter counts CHANGED CATALOG OBJECTS (drop/type_change/rename). A type
+    change on a column carrying NO facts still counts 1 while ZERO facts stale — so the old
+    'staled' name lied. The field now says what it counts."""
+    upload_csv(client, "deposits", DEPOSITS_CSV)
+    changed = DEPOSITS_CSV.replace("balance,numeric", "balance,text")   # one type_change, no facts
+    body = upload_csv(client, "deposits", changed).json()
+    assert body["status"] == "ingested"
+    assert "staled" not in body
+    assert body["changed_objects"] == 1   # one object changed; no fact was staled by it
+
+
 def test_excel_upload_ingests(client):
     data = _xlsx([["source", "table", "column", "type", "is_grain"],
                   ["gl", "ledger", "entry_id", "integer", "y"],

@@ -35,7 +35,7 @@ beforeEach(() => {
 })
 
 const result = (over: Partial<api.IngestResult>): api.IngestResult => ({
-  status: 'ingested', reason: null, asserted: 0, staled: 0, quarantined: 0, flagged: null, ...over })
+  status: 'ingested', reason: null, asserted: 0, changed_objects: 0, quarantined: 0, flagged: null, ...over })
 
 function renderUpload(over: {
   onReviewQueue?: (s: string) => void
@@ -59,14 +59,14 @@ async function submit(source = 'deposits') {
 describe('upload screen', () => {
   it('shows the ingest summary with the first-upload flag', async () => {
     uploadFile.mockResolvedValue(result({
-      asserted: 4, staled: 1,
+      asserted: 4, changed_objects: 1,
       flagged: "first upload of 'deposits' (9 objects) — review recommended" }))
     renderUpload()
     await submit()
     // Counts are wrapped in semantic-color spans; assert the full line via the status container,
     // which also pins the callout's role=status announcement contract.
     const status = await screen.findByRole('status')
-    expect(status).toHaveTextContent('4 facts asserted, 1 staled, 0 quarantined')
+    expect(status).toHaveTextContent('4 facts asserted, 1 objects changed, 0 quarantined')
     expect(status).toHaveTextContent(/first upload of 'deposits'/)
   })
 
@@ -231,7 +231,7 @@ describe('ingest paths', () => {
     listSyncs.mockResolvedValue([SYNC])
     previewSync.mockResolvedValue(PREVIEW)
     importSync.mockResolvedValue({
-      result: { status: 'ingested', reason: null, asserted: 0, staled: 0, quarantined: 0, flagged: null },
+      result: { status: 'ingested', reason: null, asserted: 0, changed_objects: 0, quarantined: 0, flagged: null },
       import_id: 'omimp_01HZY',
       review_queue: { quarantined: 0, semantics_pending: 3 },
     })

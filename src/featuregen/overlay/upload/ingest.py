@@ -98,7 +98,9 @@ class IngestResult:
     status: str            # "ingested" | "held" | "rejected"
     reason: str | None
     asserted: int
-    staled: int
+    # Catalog OBJECTS this upload dropped/renamed/type-changed (the drift diff) — NOT a count of
+    # facts staled; one changed object can stale zero or many facts (#30, was misnamed `staled`).
+    changed_objects: int
     quarantined: int
     flagged: str | None = None   # a soft-gate note (e.g. first upload — review recommended)
 
@@ -747,7 +749,9 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
     else:
         changes = detect_catalog_changes(conn, upload, actor=actor, now=now, open_reverify=False)
         _drain_projection(conn)
-    staled = sum(1 for c in changes if c.kind in ("drop", "type_change", "rename"))
+    # Changed catalog OBJECTS (drift kinds that retire something), not facts staled (#30): each such
+    # change stales its dependent facts inside detect_catalog_changes, but this counts the objects.
+    changed_objects = sum(1 for c in changes if c.kind in ("drop", "type_change", "rename"))
 
     # ── Glossary path (GUARDED): a glossary upload passes its semantic sidecar; a non-glossary upload
     # (glossary=None) skips ALL of the below and is byte-for-byte unchanged. The ingestion-run id is
@@ -971,7 +975,7 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
     persist_quarantine(conn, catalog_source, vr.quarantined)
     flagged = (f"first upload of '{catalog_source}' ({len(vr.good)} objects) — review recommended"
                if brake.is_first_upload else None)
-    return IngestResult("ingested", None, asserted, staled, len(vr.quarantined), flagged)
+    return IngestResult("ingested", None, asserted, changed_objects, len(vr.quarantined), flagged)
 
 
 def _bool(v) -> bool:

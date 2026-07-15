@@ -70,7 +70,8 @@ export interface IngestResult {
   status: 'ingested' | 'held' | 'rejected'
   reason: string | null
   asserted: number
-  staled: number
+  // Catalog objects this upload dropped/renamed/type-changed — not facts staled (#30).
+  changed_objects: number
   quarantined: number
   flagged: string | null
 }

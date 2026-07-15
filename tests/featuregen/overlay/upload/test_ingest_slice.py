@@ -57,7 +57,7 @@ def test_slice_ingest_serve_drift_and_brake(db):
     ]
     res2 = ingest_upload(db, source, rows2, actor=_actor(), now=now)
     assert res2.status == "ingested"
-    assert res2.staled >= 1
+    assert res2.changed_objects >= 1
 
     cat2 = UploadCatalog(source, rows2)
     avail2 = resolve_fact(db, cat2, table_ref(source, "accounts"), "availability_time", now=now)
@@ -99,7 +99,7 @@ def test_drift_skipped_when_projection_lags(db, monkeypatch):
     rows = [CanonicalRow("deposits", "accounts", "id", "integer", is_grain=True)]
     res = ingest_upload(db, "deposits", rows, actor=_actor(), now=now)
     assert res.status == "ingested"   # the upload's facts still assert
-    assert res.staled == 0            # drift deferred
+    assert res.changed_objects == 0   # drift deferred
     assert called == []               # detect_catalog_changes was NOT run (laundering avoided)
 
 
@@ -112,7 +112,7 @@ def test_safety_metadata_change_is_drift(db):
                   actor=_actor(), now=now)
     res = ingest_upload(db, "s", [CanonicalRow("s", "t", "amt", "numeric", additivity="non_additive")],
                         actor=_actor(), now=now)
-    assert res.staled >= 1   # the additivity flip registered as a type_change
+    assert res.changed_objects >= 1   # the additivity flip registered as a type_change
 
 
 def test_fingerprint_backward_compatible_without_safety():

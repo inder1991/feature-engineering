@@ -134,7 +134,7 @@ describe('api client', () => {
 
   it('uploads multipart form data without forcing a content type', async () => {
     fetchMock.mockImplementation(ok({
-      status: 'ingested', reason: null, asserted: 4, staled: 0, quarantined: 0, flagged: null }))
+      status: 'ingested', reason: null, asserted: 4, changed_objects: 0, quarantined: 0, flagged: null }))
     const file = new File(['source,table\n'], 'd.csv', { type: 'text/csv' })
     const result = await uploadFile(file, 'deposits')
     expect(result.status).toBe('ingested')
@@ -471,7 +471,7 @@ describe('sync preview/import client', () => {
   it('importSync POSTs the previewed snapshot hash to /syncs/{id}/import', async () => {
     fetchMock.mockImplementation(ok({
       result: {
-        status: 'ingested', reason: null, asserted: 3, staled: 0, quarantined: 1, flagged: null,
+        status: 'ingested', reason: null, asserted: 3, changed_objects: 0, quarantined: 1, flagged: null,
       },
       import_id: 'omimp_01HZY',
       review_queue: { quarantined: 1, semantics_pending: 13 },

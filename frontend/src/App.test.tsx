@@ -23,7 +23,7 @@ beforeEach(() => {
 })
 
 const ingest = (over: Partial<api.IngestResult>): api.IngestResult => ({
-  status: 'ingested', reason: null, asserted: 0, staled: 0, quarantined: 0, flagged: null, ...over })
+  status: 'ingested', reason: null, asserted: 0, changed_objects: 0, quarantined: 0, flagged: null, ...over })
 
 const qRow = (rowIndex: number): api.QuarantineItem => ({
   row_index: rowIndex,

@@ -23,7 +23,7 @@ export function CalloutGlyph({ children }: { children: ReactNode }) {
   )
 }
 
-// Semantic count: asserted/live reads in --ok; staled/quarantined in --warn, but only when
+// Semantic count: asserted/live reads in --ok; changed/quarantined in --warn, but only when
 // nonzero (a plain 0 stays quiet ink). Presentational only; the number and text are unchanged.
 export function Count({ value, tone }: { value: number; tone: 'ok' | 'warn' }) {
   const colored = tone === 'ok' || value > 0
@@ -96,7 +96,7 @@ export function IngestResultCallout({
         </p>
         <p className="tabular-nums">
           <Count value={result.asserted} tone="ok" /> facts asserted,{' '}
-          <Count value={result.staled} tone="warn" /> staled,{' '}
+          <Count value={result.changed_objects} tone="warn" /> objects changed,{' '}
           <Count value={result.quarantined} tone="warn" /> quarantined
         </p>
         {result.flagged && (
