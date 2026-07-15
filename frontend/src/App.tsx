@@ -178,8 +178,10 @@ const PAGES: { route: Route; label: string; eyebrow: string; title: string; desc
     route: 'governance',
     label: 'Governance',
     eyebrow: 'CATALOG · GOVERNANCE REVIEW',
-    title: 'Discovered joins',
-    description: 'Approve or reject the joins Pass C found.',
+    // The screen hosts three tabs — Joins (Pass C), Grain & availability (Pass B), Readiness —
+    // so the header names the whole review surface, not just the joins tab.
+    title: 'Governance review',
+    description: 'Confirm the joins, grain, and availability facts the enrichment passes proposed.',
   },
   {
     route: 'dashboard',
