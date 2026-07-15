@@ -24,7 +24,7 @@ from typing import Any
 
 from featuregen.contracts import SchemaValidationError
 from featuregen.contracts.envelopes import IdentityEnvelope
-from featuregen.intake.llm import LLMClient
+from featuregen.intake.llm import DEFAULT_LLM_MODEL, LLMClient
 from featuregen.overlay.upload.enrich_llm import audited_structured_call
 from featuregen.overlay.upload.taxonomy.recognition import (
     TAXONOMY_VERSION,
@@ -110,7 +110,7 @@ def recognize(
     ``TECHNICAL_FAILURE``; a well-formed ``unscoped`` body folds to ``UNSCOPED``. The input carries only
     the redacted hypothesis + prediction goal (``catalog_metadata`` is empty — recognition never sees
     columns). ``model_id`` defaults to the env-configured model (matching the wired client)."""
-    model = model_id or os.environ.get("FEATUREGEN_LLM_MODEL", "claude-opus-4-8")
+    model = model_id or os.environ.get("FEATUREGEN_LLM_MODEL", DEFAULT_LLM_MODEL)
     instruction = _recognition_instruction(redacted_hypothesis, redacted_goal)
 
     try:

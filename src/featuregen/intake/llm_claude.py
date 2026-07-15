@@ -1,6 +1,7 @@
 """Config-gated real Claude adapter (spec §9.5, Decision D12). Ships but is NEVER required in CI:
 `anthropic` is imported LAZILY inside `.call`, never at module scope. Default model
-`claude-opus-4-8`, adaptive thinking, structured outputs via output_config.format. Maps each
+`claude-sonnet-5` (overridable via FEATUREGEN_LLM_MODEL), adaptive thinking, structured outputs
+via output_config.format. Maps each
 provider outcome to the §9.2 PROVIDER_* taxonomy. NO production fallback to FakeLLM — an
 enabled-but-unavailable adapter fails closed (LLMAdapterUnavailable) into the clarification/manual
 path. The output-schema carries NO PHI/PII (server-compiled, cross-call-cached, §9.1).
@@ -13,6 +14,7 @@ import os
 from dataclasses import dataclass
 
 from featuregen.intake.llm import (
+    DEFAULT_LLM_MODEL,
     PROVIDER_AUTH_ERROR,
     PROVIDER_MAX_TOKENS,
     PROVIDER_NON_RETRYABLE,
@@ -28,7 +30,7 @@ from featuregen.intake.redaction import INPUT_KEY_CATALOG, INPUT_KEY_INTENT
 @dataclass(frozen=True)
 class ClaudeConfig:
     enabled: bool = False
-    model: str = "claude-opus-4-8"       # config-driven; never hard-coded at a call site
+    model: str = DEFAULT_LLM_MODEL       # config-driven; never hard-coded at a call site
     max_tokens: int = 4096
     thinking: str = "adaptive"           # adaptive thinking (§9.5); budget_tokens is a 400 on 4.8
     effort: str = "high"
@@ -37,7 +39,7 @@ class ClaudeConfig:
     def from_env(cls) -> ClaudeConfig:
         return cls(
             enabled=os.environ.get("FEATUREGEN_LLM_PROVIDER") == "anthropic",
-            model=os.environ.get("FEATUREGEN_LLM_MODEL", "claude-opus-4-8"),
+            model=os.environ.get("FEATUREGEN_LLM_MODEL", DEFAULT_LLM_MODEL),
             max_tokens=int(os.environ.get("FEATUREGEN_LLM_MAX_TOKENS", "4096")),
             thinking=os.environ.get("FEATUREGEN_LLM_THINKING", "adaptive"),
             effort=os.environ.get("FEATUREGEN_LLM_EFFORT", "high"),

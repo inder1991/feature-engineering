@@ -73,6 +73,11 @@ STATUS_FAILED = "failed_into_clarification"
 # replayed forever for the same identity; find_llm_call skips it so call_llm re-drives.
 _REUSABLE_STATUSES = frozenset({STATUS_OK, STATUS_REPAIRED, STATUS_RETRIED})
 
+# Default provider model for every LLM call, overridable per deployment via FEATUREGEN_LLM_MODEL and
+# per request via generation_settings["model"]. Single source of truth so the wired client and the
+# audit record can never disagree on which model the default resolves to.
+DEFAULT_LLM_MODEL = "claude-sonnet-5"
+
 
 def compute_input_hash(inputs: Mapping[str, Any]) -> str:
     """sha256 of the exact redacted (LLM-safe) input — the dedup/identity component (§9.3).

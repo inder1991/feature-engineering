@@ -31,7 +31,7 @@ from featuregen.overlay.upload.taxonomy.recognizer_prompt import (
 CHURN = "customer.relationship_attrition.churn"
 DEPOSIT = "customer.relationship_attrition.deposit_attrition"
 
-_MODEL = "claude-opus-4-8"
+_MODEL = "claude-sonnet-5"
 
 
 def _candidate(

@@ -19,6 +19,7 @@ from featuregen.contracts.envelopes import IdentityEnvelope
 from featuregen.contracts.identity import identity_to_jsonb
 from featuregen.documents.registry import DocumentSchemaRegistry
 from featuregen.intake.llm import (
+    DEFAULT_LLM_MODEL,
     STATUS_FAILED,
     LLMClient,
     LLMRequest,
@@ -60,7 +61,7 @@ def _generation_settings() -> dict:
     provider = os.environ.get("FEATUREGEN_LLM_PROVIDER", "fake")
     if provider == "anthropic":
         return {"provider": "anthropic",
-                "model": os.environ.get("FEATUREGEN_LLM_MODEL", "claude-opus-4-8")}
+                "model": os.environ.get("FEATUREGEN_LLM_MODEL", DEFAULT_LLM_MODEL)}
     return {"provider": "fake", "model": "test"}
 
 
