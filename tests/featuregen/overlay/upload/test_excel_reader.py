@@ -3,6 +3,7 @@ import io
 import openpyxl
 import pytest
 
+from featuregen.overlay.upload import excel_reader
 from featuregen.overlay.upload.excel_reader import read_excel_rows
 
 
@@ -49,3 +50,56 @@ def test_skips_leading_blank_rows_and_source_column():
     rows = read_excel_rows(data, source="fallback")
     assert len(rows) == 1
     assert rows[0].source == "cards" and rows[0].column == "acct_id"
+
+
+# ── Decompression-bomb bound (round-3 #27) ───────────────────────────────────────────────────────
+# The API edge caps the COMPRESSED upload bytes (uploads._read_capped), but a small zip can expand
+# to an enormous sheet. The reader itself must bound what it READS and reject an over-budget sheet
+# (a clean parse error -> 400), never silently truncate it. Caps are patched small so the tests
+# stay fast; production values live in excel_reader.MAX_SHEET_ROWS / MAX_SHEET_CELLS.
+
+
+def test_sheet_over_row_cap_rejected(monkeypatch):
+    monkeypatch.setattr(excel_reader, "MAX_SHEET_ROWS", 5)
+    data = _xlsx([["table", "column", "type"]]
+                 + [["accounts", f"c{i}", "text"] for i in range(6)])
+    with pytest.raises(ValueError, match="exceeds the .* read budget"):
+        read_excel_rows(data, source="deposits")
+
+
+def test_sheet_over_cell_budget_rejected(monkeypatch):
+    # Wide rows blow the rows*width budget even under the row cap — the bomb shape.
+    monkeypatch.setattr(excel_reader, "MAX_SHEET_CELLS", 40)
+    data = _xlsx([["table", "column", "type"] + [f"x{i}" for i in range(17)],
+                  ["accounts", "id", "integer"] + ["v"] * 17,
+                  ["accounts", "b", "integer"] + ["v"] * 17])
+    with pytest.raises(ValueError, match="exceeds the .* read budget"):
+        read_excel_rows(data, source="deposits")
+
+
+def test_blank_row_flood_counts_toward_budget(monkeypatch):
+    # A bomb of blank rows before any header must hit the budget too (the header scan would
+    # otherwise spin through them unbounded).
+    monkeypatch.setattr(excel_reader, "MAX_SHEET_ROWS", 5)
+    data = _xlsx([[None, None]] * 6 + [["table", "column", "type"],
+                                       ["accounts", "id", "integer"]])
+    with pytest.raises(ValueError, match="exceeds the .* read budget"):
+        read_excel_rows(data, source="deposits")
+
+
+def test_sheet_within_caps_still_reads(monkeypatch):
+    monkeypatch.setattr(excel_reader, "MAX_SHEET_ROWS", 5)
+    monkeypatch.setattr(excel_reader, "MAX_SHEET_CELLS", 40)
+    data = _xlsx([["table", "column", "type"],
+                  ["accounts", "id", "integer"],
+                  ["accounts", "posted_at", "timestamp"]])
+    rows = read_excel_rows(data, source="deposits")
+    assert [r.column for r in rows] == ["id", "posted_at"]
+
+
+def test_production_caps_are_sane():
+    # The real caps must stay comfortably above a legitimate schema export (a row per catalog
+    # column) while remaining finite — and wide enough for canonical's 200-column table bound.
+    assert excel_reader.MAX_SHEET_ROWS >= 100_000
+    assert excel_reader.MAX_SHEET_CELLS >= excel_reader.MAX_SHEET_ROWS
+    assert excel_reader.MAX_SHEET_CELLS <= 50_000_000
