@@ -170,7 +170,15 @@ def terminalize_run(conn, run_id: str, *, status: str, now: datetime,
     """Transition an ``in_progress`` run to a terminal status ON THE GIVEN CONNECTION (an
     ``ingested`` terminalize must commit atomically with the ingest transaction — never record
     ``ingested`` for a tx that then fails). Returns True when this call performed the transition;
-    False when the run was already terminal (or unknown) — idempotent-safe, nothing clobbered."""
+    False when the run was already terminal (or unknown) — idempotent-safe, nothing clobbered.
+
+    Isolation assumption (review FIX 5): the success path's atomic
+    ``UPDATE ... WHERE status = 'in_progress'`` relies on READ COMMITTED (the Postgres default)
+    to SEE the run row that ``open_run`` committed on its independent connection — the request
+    transaction usually began BEFORE that commit. Under REPEATABLE READ / SERIALIZABLE the
+    request's snapshot would predate the row, the UPDATE would match nothing, and every success
+    terminalize would silently no-op (the sweep would later mislabel the run 'abandoned'). If
+    isolation is ever raised, this path needs a re-check."""
     if status not in _TERMINAL_STATUSES:
         raise ValueError(f"{status!r} is not a terminal ingestion_run status "
                          f"(expected one of {sorted(_TERMINAL_STATUSES)})")
