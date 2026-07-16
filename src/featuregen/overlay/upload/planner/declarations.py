@@ -514,3 +514,92 @@ def compile_aggregation(
             physical_cardinality=card, cardinality_source=source, grouping_keys=keys,
             ingredient_stages=tuple(stages_by_hop[seg_idx]))
         for sem_idx, seg_idx, announce, card, source, keys, exec_cat, exec_table in hops)
+
+
+# ─── C5: cross-hop composition (the conservative fail-closed guard, spec §4.2) ────────────────
+#
+# The recipe corpus has NO structured output algebra, so this is NOT an expression evaluator:
+# a measure aggregated at hop k produces an intermediate-grain result that FLOWS into every later
+# fan-in hop and is implicitly re-aggregated there (C4 stages each measure exactly once, at its
+# FIRST fan-in hop). The guard passes ONLY what it can PROVE sound; everything else is one honest
+# aggregation_composition_unsupported — never a fabricated composition proof.
+
+
+@dataclass(frozen=True, slots=True)
+class CompositionResult:
+    """``check_composition``'s verdict: the cross-hop composition is provably sound, or the
+    canonical (ordered + deduped) reason codes saying why it is not — only ever
+    ``aggregation_composition_unsupported`` from this check."""
+
+    composable: bool
+    reason_codes: tuple[ReasonCode, ...]
+
+
+def _stage_composes_by_sum(stage: IngredientAggregationV1) -> bool:
+    """Is this stage's OUTPUT provably re-aggregable by SUM at the later fan-in hops? Provable
+    ONLY as: an ``additive`` measure aggregated by SUM — declared, or the versioned additive
+    auto-rule (declared None) — and individually sound (a stage on a cardinality-unavailable hop
+    is NOT: its fan-in is unproven, so its output's shape is too). SUM of an additive measure is
+    itself additive, so SUM∘SUM composes; every other (additivity, function) pair — an averaging/
+    latest/count intermediate, a semi-additive or non-additive or unknown input — has no
+    composition proof and fails closed."""
+    return (stage.additivity is AdditivityClass.additive
+            and (stage.declared_function is None
+                 or stage.declared_function is AggregationFunction.sum)
+            and stage.validation is AggregationValidation.sound)
+
+
+def _grouping_survives(earlier: HopAggregationV1, later: HopAggregationV1) -> bool:
+    """Does the earlier fan-in hop's grouping provably survive into the later one? Provable ONLY
+    as: both hops actually grouped somewhere known (non-empty grouping keys + execution table —
+    a cardinality-unavailable hop has neither), the entity axis is continuous (the earlier hop's
+    output grain IS the later hop's from-side entity; an intervening skipped hop breaks the chain
+    and honestly fails), and both execute in the SAME catalog — an intra-catalog realized chain
+    carries the group rows table-to-table by construction. A bridge crossing (the execution
+    catalog changes) is NEVER confirmable from hop evidence alone (``HopAggregationV1`` carries
+    no from-side keys for the later hop), so it fails closed."""
+    if not (earlier.grouping_keys and earlier.execution_table
+            and later.grouping_keys and later.execution_table):
+        return False
+    if not earlier.to_entity or earlier.to_entity != later.from_entity:
+        return False
+    return earlier.execution_catalog == later.execution_catalog
+
+
+def check_composition(
+        hop_aggregations: tuple[HopAggregationV1, ...],
+        output_additivity: AdditivityClass) -> CompositionResult:
+    """§4.2 — is the composition ACROSS the path's fan-in hops provably sound? Pure over C4's
+    output tuples plus the recipe's declared OUTPUT additivity (``template.additivity`` through
+    ``to_additivity_class`` — F13); no context, no connection, no expression algebra.
+
+    Zero or one fan-in hop composes trivially: nothing crosses a hop boundary, and a single
+    hop's aggregation — e.g. the SUM(interest)/SUM(principal) ratio — is C4's per-ingredient
+    concern, never a composition failure. With two or more, every measure staged BEFORE the last
+    fan-in hop flows downstream and must compose: provably sound ONLY as an additive SUM stage
+    whose grouping survives every remaining hop boundary (SUM∘SUM). Anything else — a non-SUM or
+    non-additive/semi-additive/unknown intermediate re-aggregated downstream (average-of-average),
+    a bridge crossing or broken entity chain (grouping unconfirmable), or a pure-SUM chain whose
+    declared OUTPUT is not additive (F13: an intended-but-undeclared ratio/rate) →
+    ``aggregation_composition_unsupported``. Deterministic: hops ordered by ``segment_index``;
+    codes canonical + deduped."""
+    hops = sorted(hop_aggregations, key=lambda h: h.segment_index)
+    if len(hops) <= 1:
+        return CompositionResult(composable=True, reason_codes=())
+
+    survives = [_grouping_survives(hops[k], hops[k + 1]) for k in range(len(hops) - 1)]
+    codes: list[ReasonCode] = []
+    any_cross_hop = False
+    for i, hop in enumerate(hops[:-1]):     # a stage at the LAST fan-in hop flows nowhere further
+        for stage in hop.ingredient_stages:
+            any_cross_hop = True
+            if not (_stage_composes_by_sum(stage) and all(survives[i:])):
+                codes.append(ReasonCode.aggregation_composition_unsupported)
+    # F13 output cross-check: a chain that composed purely by SUM must DECLARE an additive
+    # output; a non-additive/semi-additive/unknown/n-a output over it is a ratio/rate the recipe
+    # intends but never declared as algebra — not provably the intended output, fail closed.
+    # (When a chain already failed above, the code dedups to the same honest verdict.)
+    if any_cross_hop and output_additivity is not AdditivityClass.additive:
+        codes.append(ReasonCode.aggregation_composition_unsupported)
+    reason_codes = canonical_reason_codes(codes)
+    return CompositionResult(composable=len(reason_codes) == 0, reason_codes=reason_codes)

@@ -26,6 +26,7 @@ from featuregen.overlay.upload.planner.declarations import (
     CompileBudget,
     CompilerContext,
     PathPositionV1,
+    check_composition,
     check_connectivity,
     compile_aggregation,
     compile_temporal,
@@ -870,3 +871,156 @@ def test_measures_assigned_once_to_first_fan_in_hop_and_hops_ordered(db):
     assert hops[1].ingredient_stages == ()
     assert (hops[0].from_entity, hops[0].to_entity) == ("transaction", "account")
     assert (hops[1].from_entity, hops[1].to_entity) == ("account", "customer")
+
+
+# ─── C5: cross-hop composition guard ──────────────────────────────────────────────────────────
+# check_composition is PURE over C4's output tuples + the recipe's declared OUTPUT additivity —
+# hops are built directly here (unit-level, no DB). Conservative + fail-closed (spec §4.2): the
+# recipe has no output algebra, so only PROVABLY sound chains pass (additive SUM∘SUM with the
+# grouping key surviving every hop boundary); everything else is composition-unsupported.
+
+def _c5_stage(role, *, additivity=c.AdditivityClass.additive, declared=None,
+              validation=c.AggregationValidation.sound, table="public.accounts"):
+    return c.IngredientAggregationV1(
+        need_role=role, bound_object_ref=f"{table}.{role}", additivity=additivity,
+        provenance=c.AdditivityProvenanceV1(
+            uploaded_value=None, concept_value=str(additivity), selected=additivity,
+            source=c.AdditivitySource.concept, conflict=False),
+        physical_cardinality=Cardinality.MANY_TO_ONE, axis=c.AggregationAxisKind.entity,
+        declared_function=declared, validation=validation, missing_inputs=(), reason_codes=())
+
+
+def _c5_hop(sem_idx, seg_idx, *, from_entity, to_entity, table, key, catalog="core",
+            source="realization", stages=()):
+    return c.HopAggregationV1(
+        semantic_hop_index=sem_idx, segment_index=seg_idx,
+        from_entity=from_entity, to_entity=to_entity,
+        execution_catalog=catalog, execution_table=table,
+        physical_cardinality=Cardinality.MANY_TO_ONE, cardinality_source=source,
+        grouping_keys=(key,), ingredient_stages=tuple(stages))
+
+
+def _c5_two_hop(stage0=(), stage1=()):
+    """The C4 chain shape (transactions → accounts → customers, both N:1, one catalog):
+    two fan-in hops whose entity axis chains and whose grouping keys survive by construction."""
+    return (
+        _c5_hop(0, 1, from_entity="transaction", to_entity="account",
+                table="public.accounts", key="public.accounts.account_id", stages=stage0),
+        _c5_hop(1, 3, from_entity="account", to_entity="customer",
+                table="public.customers", key="public.customers.customer_id", stages=stage1),
+    )
+
+
+def test_composition_sum_of_sum_additive_across_two_hops_composes():
+    # the ONE provably sound chain: additive measures aggregated by SUM at hop 1 — the versioned
+    # auto-rule (declared None) AND an explicitly declared SUM — re-aggregated by SUM at hop 2,
+    # grouping surviving the intra-catalog chain, additive declared OUTPUT.
+    hops = _c5_two_hop(stage0=(
+        _c5_stage("amount"),
+        _c5_stage("fees", declared=c.AggregationFunction.sum),
+    ))
+    out = check_composition(hops, c.AdditivityClass.additive)
+    assert out.composable is True and out.reason_codes == ()
+
+
+def test_composition_average_intermediate_reaggregated_is_unsupported():
+    # the average-of-average case: hop 1's declared averaging function (the corpus enum's
+    # weighted_average; spec §4.2 names average_over_period as the same class) is individually
+    # SOUND at C4 with its weight bound — but its OUTPUT is a non-additive intermediate with no
+    # surviving weight, re-aggregated at hop 2 → not provable, fail closed. Two failing stages
+    # dedup to the ONE canonical code.
+    hops = _c5_two_hop(stage0=(
+        _c5_stage("rate", additivity=c.AdditivityClass.non_additive,
+                  declared=c.AggregationFunction.weighted_average),
+        _c5_stage("fee_rate", additivity=c.AdditivityClass.non_additive,
+                  declared=c.AggregationFunction.weighted_average),
+    ))
+    out = check_composition(hops, c.AdditivityClass.non_additive)
+    assert out.composable is False
+    assert out.reason_codes == (c.ReasonCode.aggregation_composition_unsupported,)
+
+
+def test_composition_semi_additive_summed_across_two_hops_is_unsupported():
+    # a balance rolled up at hop 1 (the single-PIT auto-SUM — individually sound) yields an
+    # account-grain aggregate whose re-aggregability at hop 2 cannot be proven from a
+    # semi-additive input → unsupported; a declared take_latest intermediate (equally sound
+    # per-ingredient) is equally unprovable downstream. Sound stages can still fail composition.
+    hops = _c5_two_hop(stage0=(
+        _c5_stage("balance", additivity=c.AdditivityClass.semi_additive),))
+    out = check_composition(hops, c.AdditivityClass.semi_additive)
+    assert out.composable is False
+    assert out.reason_codes == (c.ReasonCode.aggregation_composition_unsupported,)
+    latest = _c5_two_hop(stage0=(
+        _c5_stage("balance", additivity=c.AdditivityClass.semi_additive,
+                  declared=c.AggregationFunction.take_latest),))
+    assert check_composition(latest, c.AdditivityClass.semi_additive).composable is False
+
+
+def test_composition_grouping_lost_across_bridge_is_unsupported():
+    # additive SUM∘SUM, but hop 2 executes in ANOTHER catalog (a bridge crossing): hop evidence
+    # carries no from-side keys for the later hop, so hop 1's grouping key cannot be confirmed
+    # to survive → fail closed even though every stage is individually sound.
+    hops = (
+        _c5_hop(0, 1, from_entity="transaction", to_entity="account",
+                table="public.accounts", key="public.accounts.account_id",
+                stages=(_c5_stage("amount"),)),
+        _c5_hop(1, 3, from_entity="account", to_entity="customer", catalog="crm",
+                table="public.customers", key="public.customers.customer_id",
+                source="bridge_construction"),
+    )
+    out = check_composition(hops, c.AdditivityClass.additive)
+    assert out.composable is False
+    assert out.reason_codes == (c.ReasonCode.aggregation_composition_unsupported,)
+
+
+def test_composition_single_fan_in_hop_is_trivially_composable():
+    # SUM(interest)/SUM(principal) at ONE hop is a valid weighted rate — a per-ingredient C4
+    # concern, NOT a composition failure: with nothing downstream to compose, even the
+    # non-additive-output ratio recipe passes the guard. Zero hops likewise.
+    hop = _c5_hop(0, 1, from_entity="transaction", to_entity="account",
+                  table="public.accounts", key="public.accounts.account_id",
+                  stages=(_c5_stage("interest"), _c5_stage("principal")))
+    out = check_composition((hop,), c.AdditivityClass.non_additive)
+    assert out.composable is True and out.reason_codes == ()
+    assert check_composition((), c.AdditivityClass.non_additive).composable is True
+
+
+def test_composition_non_additive_output_over_pure_sum_chain_is_unsupported():
+    # F13 output cross-check: the same chain that composes purely by SUM must DECLARE an
+    # additive output — a non-additive/semi-additive/unknown OUTPUT over a pure-SUM chain is a
+    # ratio/rate the recipe intends but never declared as algebra → not provably the intended
+    # output, fail closed.
+    hops = _c5_two_hop(stage0=(_c5_stage("amount"),))
+    assert check_composition(hops, c.AdditivityClass.additive).composable is True
+    out = check_composition(hops, c.AdditivityClass.non_additive)
+    assert out.composable is False
+    assert out.reason_codes == (c.ReasonCode.aggregation_composition_unsupported,)
+    assert check_composition(hops, c.AdditivityClass.semi_additive).composable is False
+    assert check_composition(hops, c.AdditivityClass.unknown).composable is False
+
+
+def test_composition_last_hop_stage_flows_nowhere_and_broken_chains_fail_closed():
+    # a measure staged at the LAST fan-in hop has no downstream re-aggregation: even a declared
+    # weighted_average passes (its own hop is C4's per-ingredient concern) — and with no
+    # cross-hop composition the F13 output cross-check has nothing to check.
+    hops = _c5_two_hop(stage1=(
+        _c5_stage("rate", additivity=c.AdditivityClass.non_additive,
+                  declared=c.AggregationFunction.weighted_average),))
+    assert check_composition(hops, c.AdditivityClass.non_additive).composable is True
+    # an additive SUM chain whose LATER hop lost its physical evidence (cardinality unavailable →
+    # no grouping keys, no execution table) is unprovable — fail closed
+    broken = (
+        _c5_two_hop(stage0=(_c5_stage("amount"),))[0],
+        c.HopAggregationV1(
+            semantic_hop_index=1, segment_index=3, from_entity="account", to_entity="customer",
+            execution_catalog="core", execution_table="", physical_cardinality=None,
+            cardinality_source="unavailable", grouping_keys=(), ingredient_stages=()),
+    )
+    assert check_composition(broken, c.AdditivityClass.additive).composable is False
+    # an entity-axis discontinuity (a skipped hop between the two fan-ins) is never provable
+    gap = (
+        _c5_two_hop(stage0=(_c5_stage("amount"),))[0],
+        _c5_hop(1, 5, from_entity="branch", to_entity="customer",
+                table="public.customers", key="public.customers.customer_id"),
+    )
+    assert check_composition(gap, c.AdditivityClass.additive).composable is False
