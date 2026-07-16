@@ -25,9 +25,16 @@ class ResolveIn(BaseModel):
     edits: dict[str, str] = {}   # the reviewer's corrected field values, merged onto the raw row
 
 
+def _normalize_source(source: str) -> str:
+    """Ingest normalizes the source before anything keys on it (uploads.py: strip().lower()), so
+    quarantine rows live under the lowercased id. Normalize the path param the SAME way, or a
+    caller asking for /sources/Sales/quarantine silently misses the queue stored under 'sales'."""
+    return source.strip().lower()
+
+
 @router.get("/sources/{source}/quarantine", dependencies=[Depends(require_catalog_read)])
 def source_quarantine(source: str, conn: _Conn, identity: _Identity) -> list[QuarantineItem]:
-    return list_quarantine(conn, source)
+    return list_quarantine(conn, _normalize_source(source))
 
 
 @router.post("/sources/{source}/quarantine/{row_index}/resolve",
@@ -36,13 +43,14 @@ def resolve_row(source: str, row_index: int, body: ResolveIn, conn: _Conn,
                 identity: _Identity) -> dict:
     """Apply the reviewer's inline fix: re-validate SERVER-side; if it now passes, the row enters the
     catalog and leaves the queue. `resolved=false` + a reason when the fix still doesn't validate."""
-    resolved, reason = resolve_quarantine_row(conn, source, row_index, body.edits, actor=identity)
+    resolved, reason = resolve_quarantine_row(conn, _normalize_source(source), row_index,
+                                              body.edits, actor=identity)
     return {"resolved": resolved, "reason": reason}
 
 
 @router.post("/sources/{source}/quarantine/{row_index}/dismiss",
              dependencies=[Depends(require_catalog_write)])
 def dismiss_row(source: str, row_index: int, conn: _Conn, identity: _Identity) -> dict:
-    if not dismiss_quarantine_row(conn, source, row_index):
+    if not dismiss_quarantine_row(conn, _normalize_source(source), row_index):
         raise HTTPException(status_code=404, detail="no such quarantined row")
     return {"dismissed": True}

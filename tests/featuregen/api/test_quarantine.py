@@ -45,3 +45,25 @@ def test_dismiss_endpoint(client):
     assert client.post("/sources/deposits/quarantine/9/dismiss", headers=AUTH).status_code == 200
     assert client.get("/sources/deposits/quarantine", headers=AUTH).json() == []
     assert client.post("/sources/deposits/quarantine/999/dismiss", headers=AUTH).status_code == 404
+
+
+# Ingest normalizes the source (uploads.py: source.strip().lower()), so quarantine rows live
+# under the lowercased source. The quarantine routes must normalize the path param the SAME way,
+# or /sources/Deposits/quarantine silently answers [] for a queue stored under 'deposits' (#11).
+
+def test_list_and_resolve_normalize_mixed_case_source(client):
+    upload_csv(client, "deposits", DEPOSITS_CSV + "deposits,accounts,opened_at,\n")
+    items = client.get("/sources/Deposits/quarantine", headers=AUTH).json()
+    assert len(items) == 1
+    assert "missing required field(s): type" in items[0]["reason"]
+
+    r = client.post("/sources/DEPOSITS/quarantine/9/resolve",
+                    json={"edits": {"type": "timestamp"}}, headers=AUTH)
+    assert r.status_code == 200 and r.json()["resolved"] is True
+    assert client.get("/sources/deposits/quarantine", headers=AUTH).json() == []
+
+
+def test_dismiss_normalizes_mixed_case_source(client):
+    upload_csv(client, "deposits", DEPOSITS_CSV + "deposits,accounts,opened_at,\n")
+    assert client.post("/sources/Deposits/quarantine/9/dismiss", headers=AUTH).status_code == 200
+    assert client.get("/sources/deposits/quarantine", headers=AUTH).json() == []
