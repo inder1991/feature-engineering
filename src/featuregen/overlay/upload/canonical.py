@@ -69,6 +69,14 @@ class RowError:
     row_index: int
     message: str
     row: CanonicalRow | None = None
+    # Round-3 #4 dismiss-proof floor: for a metadata-conflict quarantine, the distinct non-empty
+    # sensitivity tags declared ACROSS the conflicting duplicates for this (source, table, column) —
+    # each member carries the whole group's declarations, so an untagged row's own record says "this
+    # column was declared as at least pii". persist_quarantine stores it on the durable row and the
+    # resolve path enforces it INDEPENDENTLY of live siblings: the previous sibling-only check was
+    # bypassed by dismissing the tagged member (a hard DELETE) and then resolving the untagged one,
+    # which graphed a world-readable node for a declared-PII column. Empty for every other reason.
+    sensitivity_floor: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -117,6 +125,11 @@ def validate_rows(rows: list[CanonicalRow],
     quarantined: list[RowError] = []
     seen: dict[tuple[str, str, str], tuple[CanonicalRow, int]] = {}  # key -> (first row, its index)
     conflicted: set[tuple[str, str, str]] = set()
+    # Per conflicted key: the sensitivity tags declared across its duplicates, and the positions of
+    # its RowErrors in `quarantined` (stamped with the finished floor after the loop — a 3rd
+    # duplicate can add a tag after the first two were already queued).
+    conflict_floor: dict[tuple[str, str, str], set[str]] = {}
+    conflict_qi: dict[tuple[str, str, str], list[int]] = {}
 
     for i, r in enumerate(rows):
         # A physical `type` is missing when the profile requires it AND the cell is empty. The
@@ -193,14 +206,31 @@ def validate_rows(rows: list[CanonicalRow],
             # column left world-readable (fail-OPEN). Fail CLOSED instead: quarantine ALL rows for the
             # column (pull the already-accepted first one back out) so it is NOT graphed until resolved.
             msg = f"conflicting metadata for {key} (rows for the same column disagree)"
+            floor = conflict_floor.setdefault(key, set())
+            qi = conflict_qi.setdefault(key, [])
             if key not in conflicted:
                 conflicted.add(key)
                 good.remove(first_row)
+                floor.add(first_row.sensitivity)
+                qi.append(len(quarantined))
                 quarantined.append(RowError(first_i, msg, first_row))
+            floor.add(r.sensitivity)
+            qi.append(len(quarantined))
             quarantined.append(RowError(i, msg, r))
             continue
         seen[key] = (canonical, i)
         good.append(canonical)
+
+    # Stamp each conflict group's finished sensitivity floor onto ALL of its RowErrors (Round-3 #4
+    # dismiss-proof — see RowError.sensitivity_floor). Done after the loop so a later duplicate's
+    # tag reaches the members quarantined before it; only appends happened since, so the recorded
+    # positions are stable. A group whose duplicates declared no tag has nothing to floor.
+    for key, idxs in conflict_qi.items():
+        group_floor = tuple(sorted(conflict_floor[key] - {""}))
+        if not group_floor:
+            continue
+        for qi_pos in idxs:
+            quarantined[qi_pos] = replace(quarantined[qi_pos], sensitivity_floor=group_floor)
 
     # Per-table width bound (#29), applied AFTER dedup so it counts the unique ACCEPTED columns per
     # (source, table) — exactly the set that would be graphed. Over the bound, the WHOLE table is

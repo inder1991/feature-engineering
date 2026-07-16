@@ -196,6 +196,46 @@ def test_resolve_pii_member_succeeds_and_sibling_then_hits_the_catalog_check(db)
     assert not resolved2 and "already" in reason2
 
 
+def test_resolve_refused_after_pii_sibling_dismissed(db):
+    # Round-3 #4 dismiss-then-resolve bypass: the live-sibling check only inspects rows STILL in
+    # quarantine_row, and dismiss hard-deletes — so dismissing the pii member (as an apparent
+    # duplicate) then resolving the untagged member found no sibling and graphed a WORLD-READABLE
+    # node for a declared-PII column. The row's own quarantine record now carries the conflict
+    # floor, so the resolution is refused even with no live sibling (fail-closed MOST_RESTRICTIVE).
+    untagged_idx, pii_idx = _quarantine_sensitivity_conflict_pair(db)
+    assert dismiss_quarantine_row(db, "deposits", pii_idx) is True
+    resolved, reason = resolve_quarantine_row(db, "deposits", untagged_idx, {}, actor=_actor())
+    assert not resolved and "sensitivity" in reason
+    assert db.execute(   # no world-readable node was added for the declared-PII column
+        "SELECT 1 FROM graph_node WHERE catalog_source = 'deposits' AND object_ref = %s",
+        ("public.accounts.ssn",)).fetchone() is None
+    assert len(list_quarantine(db, "deposits")) == 1       # the refused row stays queued
+
+
+def test_resolve_at_recorded_floor_succeeds_after_dismissal(db):
+    # Matching the recorded floor tag is consistent (nothing is weakened) -> allowed even though
+    # the tagged sibling is gone from the queue.
+    untagged_idx, pii_idx = _quarantine_sensitivity_conflict_pair(db)
+    assert dismiss_quarantine_row(db, "deposits", pii_idx) is True
+    resolved, reason = resolve_quarantine_row(db, "deposits", untagged_idx,
+                                              {"sensitivity": "pii"}, actor=_actor())
+    assert resolved and reason == ""
+    sens = db.execute(
+        "SELECT sensitivity FROM graph_node WHERE catalog_source = 'deposits' AND object_ref = %s",
+        ("public.accounts.ssn",)).fetchone()[0]
+    assert sens == "pii"                                    # the node carries the restrictive tag
+
+
+def test_resolve_edits_cannot_strip_the_recorded_floor(db):
+    # The floor is read from the STORED quarantine record, never from the reviewer's merged edits —
+    # an edit naming the floor key must not lift it.
+    untagged_idx, pii_idx = _quarantine_sensitivity_conflict_pair(db)
+    assert dismiss_quarantine_row(db, "deposits", pii_idx) is True
+    resolved, reason = resolve_quarantine_row(
+        db, "deposits", untagged_idx, {"sensitivity_conflict_floor": []}, actor=_actor())
+    assert not resolved and "sensitivity" in reason
+
+
 def _ingest_prior_queue(db, now):
     """Ingest a 3-good + 1-bad upload for 'deposits': queue holds the one bad row."""
     rows = [

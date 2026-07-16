@@ -35,6 +35,11 @@ def persist_quarantine(conn, catalog_source: str, errors: list[RowError]) -> Non
     conn.execute("DELETE FROM quarantine_row WHERE catalog_source = %s", (catalog_source,))
     for e in errors:
         raw = asdict(e.row) if e.row is not None else {}
+        if e.sensitivity_floor:
+            # Round-3 #4 dismiss-proof floor (see RowError.sensitivity_floor): stored INSIDE the
+            # row's own durable record so the resolve path can enforce "declared as at least
+            # <tag>" even after the tagged sibling is dismissed (hard-deleted) from the queue.
+            raw["sensitivity_conflict_floor"] = list(e.sensitivity_floor)
         conn.execute(
             "INSERT INTO quarantine_row (catalog_source, row_index, raw, reason) "
             "VALUES (%s, %s, %s, %s)",

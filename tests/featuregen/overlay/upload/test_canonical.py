@@ -46,6 +46,31 @@ def test_row_carries_definition():
     assert r.definition == "ledger balance"
 
 
+def test_sensitivity_conflict_records_floor_on_both_quarantined_rows():
+    # Round-3 #4 dismiss-proof follow-up: each member of a (pii, untagged) conflict pair must CARRY
+    # the tag(s) declared across the duplicates, so the floor survives the tagged sibling being
+    # dismissed from the queue — the untagged row's own record says "declared as at least pii".
+    rows = [_row(column="ssn", type="text", sensitivity="pii"),
+            _row(column="ssn", type="text")]
+    result = validate_rows(rows)
+    assert result.good == []
+    assert len(result.quarantined) == 2
+    assert all(e.sensitivity_floor == ("pii",) for e in result.quarantined)
+
+
+def test_non_conflict_quarantine_records_no_floor():
+    result = validate_rows([_row(column="", type="text")])   # missing column, not a conflict
+    assert result.quarantined[0].sensitivity_floor == ()
+
+
+def test_conflict_without_sensitivity_disagreement_records_no_floor():
+    # Duplicates disagreeing on type only declared NO sensitivity — nothing to floor.
+    rows = [_row(column="id", type="integer"), _row(column="id", type="text")]
+    result = validate_rows(rows)
+    assert len(result.quarantined) == 2
+    assert all(e.sensitivity_floor == () for e in result.quarantined)
+
+
 def test_unrecognized_sensitivity_is_quarantined():
     rows = [_row(column="ssn", sensitivity="confidential")]   # not pii/restricted
     result = validate_rows(rows)

@@ -810,10 +810,10 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
     _drain_projection(conn)   # catch up (bounded, #21) BEFORE the diff reads the dependency index
     if projection_lag(conn, "overlay") > 0:
         # The drain stopped short of head (poison-HALT or the #21 budget): the dependency index is
-        # stale, so drift would
-        # stale NOTHING for a just-dropped/changed column yet still advance the snapshot — laundering
-        # the change for a full TTL. Skip drift this upload (same guard as the worker); it re-detects
-        # once the projection catches up. The upload's facts still assert; the snapshot is NOT advanced.
+        # stale, so drift detection would stale NOTHING for a just-dropped/changed column yet still
+        # advance the snapshot — laundering the change for a full TTL. Skip drift this upload (same
+        # guard as the worker); it re-detects once the projection catches up. The upload's facts
+        # still assert; the snapshot is NOT advanced.
         counters.incr("overlay.drift.skipped_projection_lag")
         logger.warning("overlay projection lags after ingest of %r — skipping catalog-change detection "
                        "to avoid laundering drift (re-runs when the projection catches up)", catalog_source)
@@ -1118,6 +1118,26 @@ def resolve_quarantine_row(conn, catalog_source: str, row_index: int, edits: dic
     if conn.execute("SELECT 1 FROM graph_node WHERE catalog_source = %s AND object_ref = %s",
                     (catalog_source, c_ref)).fetchone() is not None:
         return False, f"{good.table}.{good.column} is already in the catalog"
+    # Round-3 #4 (dismiss-proof): the live-sibling check below only inspects rows STILL in
+    # quarantine_row, and dismiss_quarantine_row hard-DELETEs — so dismissing the pii-tagged member
+    # of a conflict pair (as an apparent duplicate) and then resolving the untagged one found no
+    # sibling and graphed a WORLD-READABLE node for a declared-PII column. Each conflict-quarantined
+    # row therefore carries its OWN floor (validate_rows stamps the tags declared across the
+    # conflicting duplicates; persist_quarantine stores it in `raw` as sensitivity_conflict_floor),
+    # read from the STORED record — never from `merged` — so reviewer edits cannot strip it. Same
+    # covering rule as the sibling check: '' sits below every tag and the tags are mutually
+    # unordered role gates, so any recorded tag the resolution doesn't match refuses (fail-closed
+    # MOST_RESTRICTIVE — a resolve can NEVER graph a node below the column's ever-declared floor).
+    own_floor = sorted(
+        {str(t).strip() for t in (row[0].get("sensitivity_conflict_floor") or ())}
+        - {"", good.sensitivity})
+    if own_floor:
+        return False, (
+            f"sensitivity conflict: {good.table}.{good.column} was declared with sensitivity "
+            f"{', '.join(repr(t) for t in own_floor)} by a conflicting duplicate — recorded on "
+            f"this row's own quarantine record, so dismissing the tagged row does not lift it; "
+            f"resolving as '{good.sensitivity or 'untagged'}' would weaken the column's effective "
+            "sensitivity — match the declared tag instead")
     # Round-3 #4: the whole-upload sensitivity-conflict invariant survives resolution. validate_rows
     # quarantines BOTH members when one (table, column) appears with disagreeing metadata (a 'pii'
     # copy + an untagged one) precisely so the untagged copy can't graph a world-readable node for a
@@ -1130,7 +1150,8 @@ def resolve_quarantine_row(conn, catalog_source: str, row_index: int, edits: dic
     # refuses (fail-closed MOST_RESTRICTIVE — a resolve can never lower the column's effective
     # sensitivity). Resolving the strictest member first still succeeds; the leftover siblings then
     # hit the already-in-the-catalog refusal above, so they can never weaken the node either (the
-    # existing-node side of the invariant).
+    # existing-node side of the invariant). Kept as defense in depth beside the own-record floor
+    # above: it also covers rows queued BEFORE the floor was recorded (pre-migration quarantine).
     sibling_tags = sorted({
         str(raw.get("sensitivity") or "").strip()
         for (raw,) in conn.execute(
