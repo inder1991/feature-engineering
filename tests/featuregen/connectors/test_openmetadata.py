@@ -117,6 +117,85 @@ def test_foreign_key_maps_to_joins_to_with_unknown_cardinality():
     assert rows[("transactions", "account_id")].joins_to == "accounts.account_id"
 
 
+def _fk_table(name: str, columns: list[dict], constraints: list[dict]) -> dict:
+    """A minimal table entity with explicit FOREIGN_KEY constraints, in the cards scope."""
+    return {"name": name, "service": {"name": "mysql_prod"},
+            "databaseSchema": {"name": "public"},
+            "columns": columns, "tableConstraints": constraints}
+
+
+def test_composite_fk_is_skipped_but_reported_dropped():
+    """#15: a composite FK still does not translate (v1 carries single-column joins only), but the
+    loss is no longer silent — the dropped relationship is named in the translation diagnostics."""
+    t = _fk_table(
+        "ledger",
+        columns=[{"name": "acct", "dataType": "BIGINT"}, {"name": "ccy", "dataType": "VARCHAR"}],
+        constraints=[{"constraintType": "FOREIGN_KEY",
+                      "columns": ["acct", "ccy"],
+                      "referredColumns": ["mysql_prod.cards_db.public.balances.acct",
+                                          "mysql_prod.cards_db.public.balances.ccy"]}])
+    translation = read_openmetadata([t], CARDS_CONFIG)
+    assert all(r.joins_to == "" for r in translation.rows)     # unchanged: no composite join written
+    assert [(d.table, d.columns, d.referred) for d in translation.dropped_joins] == [
+        ("ledger", ("acct", "ccy"),
+         ("mysql_prod.cards_db.public.balances.acct", "mysql_prod.cards_db.public.balances.ccy"))]
+    assert "composite" in translation.dropped_joins[0].reason
+
+
+def test_multiple_fks_from_one_column_keep_last_and_report_overwritten():
+    """#15: two FKs from ONE local column — CanonicalRow carries one join per column, so v1 keeps
+    the LAST (unchanged), but the overwritten relationship must surface as a diagnostic."""
+    t = _fk_table(
+        "payments",
+        columns=[{"name": "party_id", "dataType": "BIGINT"}],
+        constraints=[
+            {"constraintType": "FOREIGN_KEY", "columns": ["party_id"],
+             "referredColumns": ["mysql_prod.cards_db.public.customers.cust_id"]},
+            {"constraintType": "FOREIGN_KEY", "columns": ["party_id"],
+             "referredColumns": ["mysql_prod.cards_db.public.merchants.merchant_id"]}])
+    translation = read_openmetadata([t], CARDS_CONFIG)
+    fk = _by_column(translation.rows)[("payments", "party_id")]
+    assert fk.joins_to == "merchants.merchant_id"              # unchanged v1 behavior: last wins
+    assert [(d.table, d.columns, d.referred) for d in translation.dropped_joins] == [
+        ("payments", ("party_id",), ("mysql_prod.cards_db.public.customers.cust_id",))]
+    assert "merchants.merchant_id" in translation.dropped_joins[0].reason   # names what was kept
+
+
+def test_single_fks_produce_no_dropped_join_diagnostics():
+    """The fixture pull carries only clean single-column FKs: no diagnostics, joins unchanged."""
+    translation = _rows()
+    assert translation.dropped_joins == []
+    assert _by_column(translation.rows)[("accounts", "cust_id")].joins_to == "customers.cust_id"
+
+
+def test_preview_surfaces_dropped_joins(conn):
+    """#15: the dry run the human approves names every FK relationship the translation dropped."""
+    t = _fk_table(
+        "payments",
+        columns=[{"name": "party_id", "dataType": "BIGINT"},
+                 {"name": "acct", "dataType": "BIGINT"},
+                 {"name": "ccy", "dataType": "VARCHAR"}],
+        constraints=[
+            {"constraintType": "FOREIGN_KEY", "columns": ["acct", "ccy"],
+             "referredColumns": ["mysql_prod.cards_db.public.balances.acct",
+                                 "mysql_prod.cards_db.public.balances.ccy"]},
+            {"constraintType": "FOREIGN_KEY", "columns": ["party_id"],
+             "referredColumns": ["mysql_prod.cards_db.public.customers.cust_id"]},
+            {"constraintType": "FOREIGN_KEY", "columns": ["party_id"],
+             "referredColumns": ["mysql_prod.cards_db.public.merchants.merchant_id"]}])
+    preview = build_preview(conn, CARDS_CONFIG, read_openmetadata([t], CARDS_CONFIG))
+    dropped = preview["dropped_joins"]
+    assert {(d["table"], tuple(d["columns"]), tuple(d["referred"])) for d in dropped} == {
+        ("payments", ("acct", "ccy"),
+         ("mysql_prod.cards_db.public.balances.acct", "mysql_prod.cards_db.public.balances.ccy")),
+        ("payments", ("party_id",), ("mysql_prod.cards_db.public.customers.cust_id",))}
+    assert all(d["reason"] for d in dropped)
+
+
+def test_preview_dropped_joins_empty_on_clean_pull(conn):
+    assert build_preview(conn, CARDS_CONFIG, _rows())["dropped_joins"] == []
+
+
 def test_mapped_tag_becomes_sensitivity():
     rows = _by_column(_rows().rows)
     assert rows[("customers", "email")].sensitivity == "pii"

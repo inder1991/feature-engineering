@@ -387,7 +387,7 @@ def test_preview_dry_run_shape_and_verdicts(client, conn):
     assert res.status_code == 200
     preview = res.json()
     assert set(preview) == {"summary", "tag_map", "tables", "brake", "as_of_suggestions",
-                            "snapshot_hash"}
+                            "collisions", "dropped_joins", "snapshot_hash"}
     assert preview["summary"] == {"tables": 3, "columns": 14, "new": 3, "changed": 0,
                                   "unchanged": 0, "removed": 0, "would_quarantine": 1,
                                   "semantics_pending": 13}

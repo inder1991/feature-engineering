@@ -180,11 +180,24 @@ class FoldCollision:
 
 
 @dataclass(frozen=True, slots=True)
+class DroppedJoin:
+    """A FOREIGN_KEY relationship the v1 translation cannot carry: a COMPOSITE FK (CanonicalRow
+    holds single-column joins only) or a second FK from a column that already carries one (one
+    join per column; the LAST constraint wins, unchanged v1 behavior). Dropping stays the v1
+    behavior — but the loss is surfaced in the preview instead of vanishing silently (#15)."""
+    table: str                    # local (folded) table the constraint lives on
+    columns: tuple[str, ...]      # local column(s) of the dropped FK
+    referred: tuple[str, ...]     # referred column(s) exactly as OM reported them
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
 class Translation:
     rows: list[CanonicalRow]
     as_of_suggestions: list[AsOfSuggestion]
     tag_counts: dict[str, int]     # every OM tagFQN seen in the pull -> column count (tag-map panel)
     collisions: list[FoldCollision] = field(default_factory=list)   # folded-name clashes, held out (#14)
+    dropped_joins: list[DroppedJoin] = field(default_factory=list)  # FK relationships not carried (#15)
 
 
 def _entity_name(entity: Any) -> str:
@@ -240,26 +253,43 @@ def _grain_columns(t: dict[str, Any]) -> set[str]:
     return cols
 
 
-def _join_targets(t: dict[str, Any], config: OMConfig) -> dict[str, str]:
-    """FOREIGN_KEY constraints -> {local column: 'table.column'}. CanonicalRow carries
-    single-column joins only, so composite FKs are skipped (v1); the referred table name is
-    folded with the SAME naming rule as imported tables so the edge resolves in-scope.
-    Cardinality is unknown to OM and stays blank (the UI renders 'cardinality unknown')."""
-    out: dict[str, str] = {}
+def _join_targets(t: dict[str, Any], table: str,
+                  config: OMConfig) -> tuple[dict[str, str], list[DroppedJoin]]:
+    """FOREIGN_KEY constraints -> ({local column: 'table.column'}, dropped diagnostics). The
+    JOINS WRITTEN are unchanged v1 behavior: CanonicalRow carries single-column joins only, so
+    composite FKs are skipped, and a column carrying several FKs keeps the LAST constraint's
+    target. What changed (#15): every relationship those rules drop is now COLLECTED as a
+    DroppedJoin so the preview can name the loss instead of losing it silently. The referred
+    table name is folded with the SAME naming rule as imported tables so the edge resolves
+    in-scope. Cardinality is unknown to OM and stays blank (the UI renders 'cardinality
+    unknown')."""
+    dropped: list[DroppedJoin] = []
+    candidates: dict[str, list[tuple[str, str]]] = {}   # local column -> [(target, raw referred)]
     for c in t.get("tableConstraints") or []:
         if not isinstance(c, dict) or c.get("constraintType") != "FOREIGN_KEY":
             continue
-        cols = c.get("columns") or []
-        refs = c.get("referredColumns") or []
+        cols = [str(x) for x in c.get("columns") or []]
+        refs = [str(x) for x in c.get("referredColumns") or []]
         if len(cols) != 1 or len(refs) != 1:
+            dropped.append(DroppedJoin(
+                table=table, columns=tuple(cols), referred=tuple(refs),
+                reason="composite foreign key: the catalog carries single-column joins only (v1)"))
             continue
-        parts = str(refs[0]).split(".")
+        parts = refs[0].split(".")
         if len(parts) < 2:
             continue
         target_schema = parts[-3] if len(parts) >= 3 else ""
         folded = _fold_table(parts[-2], target_schema, config.table_naming)
-        out[str(cols[0])] = f"{folded}.{parts[-1]}"
-    return out
+        candidates.setdefault(cols[0], []).append((f"{folded}.{parts[-1]}", refs[0]))
+    out: dict[str, str] = {}
+    for col, targets in candidates.items():
+        kept, _ = targets[-1]
+        out[col] = kept                                 # unchanged v1 behavior: last wins
+        dropped.extend(DroppedJoin(
+            table=table, columns=(col,), referred=(raw,),
+            reason=f"column carries multiple foreign keys; kept '{kept}' (one join per column)")
+            for _target, raw in targets[:-1])
+    return out, dropped
 
 
 def _partition_hints(t: dict[str, Any]) -> list[tuple[str, str]]:
@@ -311,6 +341,7 @@ def read_openmetadata(tables_json: list[dict[str, Any]], config: OMConfig) -> Tr
     rows: list[CanonicalRow] = []
     suggestions: list[AsOfSuggestion] = []
     tag_counts: dict[str, int] = {}
+    dropped_joins: list[DroppedJoin] = []
     # Pass 1 (#14): fold every in-scope table and group the DISTINCT upstream FQNs behind each folded
     # name. A folded name carrying >1 distinct FQN is a collision — two upstream tables that would
     # silently merge into one catalog table (the default table_naming drops schema). Hold them all out.
@@ -334,7 +365,8 @@ def read_openmetadata(tables_json: list[dict[str, Any]], config: OMConfig) -> Tr
         if table in collided:
             continue
         grain = _grain_columns(t)
-        joins = _join_targets(t, config)
+        joins, dropped = _join_targets(t, table, config)
+        dropped_joins.extend(dropped)
         suggested: set[str] = set()
         for col_name, hint in _partition_hints(t):
             if col_name not in suggested:
@@ -362,7 +394,7 @@ def read_openmetadata(tables_json: list[dict[str, Any]], config: OMConfig) -> Tr
                     table, name, f"{data_type} column named like a time axis"))
                 suggested.add(name)
     return Translation(rows=rows, as_of_suggestions=suggestions, tag_counts=tag_counts,
-                       collisions=collisions)
+                       collisions=collisions, dropped_joins=dropped_joins)
 
 
 def snapshot_hash(rows: Iterable[CanonicalRow]) -> str:
@@ -488,6 +520,10 @@ def build_preview(conn: Any, config: OMConfig, translation: Translation) -> dict
         ],
         "tables": tables,
         "collisions": [{"table": c.table, "fqns": list(c.fqns)} for c in translation.collisions],
+        "dropped_joins": [
+            {"table": d.table, "columns": list(d.columns), "referred": list(d.referred),
+             "reason": d.reason}
+            for d in translation.dropped_joins],
         "brake": {"would_hold": brake.held, "reason": brake.reason},
         "as_of_suggestions": [asdict(s) for s in translation.as_of_suggestions],
         "snapshot_hash": snapshot_hash(translation.rows),
