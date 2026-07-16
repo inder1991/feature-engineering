@@ -409,9 +409,14 @@ def _scoped_considered_set(body: ConsideredSetIn, conn: _Conn, identity: _Identi
     if body.catalog_source is None and scope.target_entity is not None:
         try:
             with conn.transaction():         # savepoint — a shadow DB error must not poison the request's txn
+                # 3B.3c (C8): the contract-compile kill-switch is read HERE and only here — the
+                # planner stays pure (no os.environ below the route). Default OFF: plans stay
+                # contract_resolution_status=not_compiled and the shadow pass is byte-identical.
                 run_shadow_planner(conn, eligible_recipe_ids=applicability.eligible_ids,
                                    target_entity=scope.target_entity, roles=identity.role_claims,
-                                   run_id=generation_run_id, now=now)
+                                   run_id=generation_run_id, now=now,
+                                   compile_contracts=os.environ.get(
+                                       "FEATUREGEN_INTENT_CONTRACT_COMPILE", "0") == "1")
         except Exception:                    # shadow must NEVER affect the live response
             logger.exception("shadow planner dispatch failed")
     return response

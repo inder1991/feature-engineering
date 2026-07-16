@@ -1,19 +1,37 @@
 """Phase-3B.3a — cross-catalog binding planner contracts + reason-code/status vocabulary.
 
 The BACKBONE reused by 3B.3b/c/3B.4/3C. Supersedes the parent 3B design's CrossCatalog* names.
-Frozen dataclasses; lowercase snake_case StrEnum values. No behaviour — pure contracts + constants
-(plus the pure canonical `make_binding_plan` constructor added in 3B.3b — the ONE plan-id authority)."""
+Frozen dataclasses; lowercase snake_case StrEnum values. No behaviour — pure contracts + constants,
+plus the two pure identity authorities: `make_binding_plan` (3B.3b — mints physical_plan_id under the
+frozen PHYSICAL_PLAN_VERSION) and `make_contract_id` (3B.3c — the freshness-free declaration identity)."""
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Iterable
 from dataclasses import dataclass
+from datetime import datetime
 from enum import StrEnum
 
+from featuregen.overlay.upload.taxonomy.entity_relationships import Cardinality
+
 PLANNER_VERSION = "3b3a.1.0.0"
-# The BindingPlanV1 schema/derivation version: hashed into every plan_id so plans minted under a
-# different contract shape can never collide with (or masquerade as) plans from another version.
-PLAN_CONTRACT_VERSION = "3b3b.1.0.0"
-REASON_CODE_REGISTRY_VERSION = "1.1.0"
+# The BindingPlanV1 SCHEMA version (contract shape). 3B.3c split it out of the physical-id
+# material: it may bump freely as fields are added without moving any physical_plan_id.
+PLAN_CONTRACT_VERSION = "3b3c.1.0.0"
+# FROZEN (F1): the version hashed into every physical_plan_id. It pins the physical-path
+# derivation, NOT the dataclass shape — it must never track PLAN_CONTRACT_VERSION bumps, or every
+# stored physical id would silently move. Bump ONLY on a change to the physical-id material itself.
+PHYSICAL_PLAN_VERSION = "3b3b.1.0.0"
+REASON_CODE_REGISTRY_VERSION = "1.2.0"
+# 3B.3c contract-compiler rule versions — each hashed into contract_id (via make_contract_id) or
+# pinned in the replay envelope, so a rule change can never masquerade as the same contract:
+AGGREGATION_RULE_VERSION = "1.0.0"
+ADDITIVITY_RULE_VERSION = "1.0.0"
+TEMPORAL_RULE_VERSION = "1.0.0"
+SAFETY_EVALUATOR_VERSION = "1.0.0"
+DRIFT_FRESHNESS_SLA_VERSION = "1.0.0"
+PLANNER_BOUNDS_VERSION = "1.0.0"
+RANKING_VERSION = "1.0.0"
 # Version pins for inputs that have no formal version source yet (wired to real policy versions in 3C):
 READ_SCOPE_POLICY_VERSION = "1.0.0"
 ROLE_RESOLUTION_VERSION = "unknown"
@@ -106,6 +124,114 @@ class CandidateRole(StrEnum):
     rejected = "rejected"
 
 
+class DeclarationStatus(StrEnum):
+    """3B.3c — the freshness-FREE declaration outcome (third status axis, identity-bearing half).
+
+    Derived purely from the declaration checks (connectivity, aggregation, temporal, safety);
+    hashed into contract_id. Freshness deliberately has NO member here: a stale-but-fully-declared
+    plan keeps declaration_status=resolved and the SAME contract_id (F7)."""
+    not_compiled = "not_compiled"
+    resolved = "resolved"
+    unresolved_ingredient_connectivity = "unresolved_ingredient_connectivity"
+    unresolved_aggregation_declaration = "unresolved_aggregation_declaration"
+    unresolved_temporal_declaration = "unresolved_temporal_declaration"
+    unresolved_safety_evaluation = "unresolved_safety_evaluation"
+    safety_rejected = "safety_rejected"
+
+
+class ContractResolutionStatus(StrEnum):
+    """3B.3c — the full OBSERVED contract outcome: every DeclarationStatus member PLUS
+    unresolved_freshness (the one observation-time, non-identity-bearing failure)."""
+    not_compiled = "not_compiled"
+    resolved = "resolved"
+    unresolved_ingredient_connectivity = "unresolved_ingredient_connectivity"
+    unresolved_aggregation_declaration = "unresolved_aggregation_declaration"
+    unresolved_temporal_declaration = "unresolved_temporal_declaration"
+    unresolved_safety_evaluation = "unresolved_safety_evaluation"
+    safety_rejected = "safety_rejected"
+    unresolved_freshness = "unresolved_freshness"
+
+
+class AggregationFunction(StrEnum):
+    """Functions a recipe/registry may DECLARE (validate, never fabricate — the compiler's only
+    auto-derivations are the two SUM rules versioned by AGGREGATION_RULE_VERSION)."""
+    sum = "sum"
+    count = "count"     # type: ignore[assignment]  # deliberately shadows str.count on this StrEnum
+    min = "min"
+    max = "max"
+    weighted_average = "weighted_average"
+    ratio_recompute = "ratio_recompute"
+    take_latest = "take_latest"
+
+
+class AggregationValidation(StrEnum):
+    sound = "sound"
+    incompatible = "incompatible"
+    undeclared = "undeclared"
+    inputs_missing = "inputs_missing"
+
+
+class AdditivityClass(StrEnum):
+    additive = "additive"
+    semi_additive = "semi_additive"
+    non_additive = "non_additive"
+    not_applicable = "not_applicable"
+    unknown = "unknown"
+
+
+class AdditivitySource(StrEnum):
+    uploaded_column = "uploaded_column"
+    concept = "concept"
+    unknown = "unknown"
+
+
+class AggregationAxisKind(StrEnum):
+    entity = "entity"
+    time = "time"
+
+
+class ColumnRole(StrEnum):
+    """Why a physical column is read — multi-role (a column may be ingredient AND join_key)."""
+    ingredient = "ingredient"
+    temporal_anchor = "temporal_anchor"
+    join_key = "join_key"
+    bridge_key = "bridge_key"
+    aggregation_weight = "aggregation_weight"
+    aggregation_component = "aggregation_component"
+    filter = "filter"
+    partition = "partition"     # type: ignore[assignment]  # deliberately shadows str.partition
+
+
+class ReplayFreshness(StrEnum):
+    """Replay-time comparison of a stored plan's stamps vs current state — COMPUTED by 3B.4;
+    3B.3c only defines the vocabulary alongside the compile-time stamps it will compare."""
+    current = "current"
+    drifted = "drifted"
+    unverifiable = "unverifiable"
+
+
+class StampConsistency(StrEnum):
+    """Did the participating catalogs' state stamps hold from scope-start to compile-end?
+    (F10 revalidation; consistent only when every fingerprint recheck passed.)"""
+    consistent = "consistent"
+    unverifiable = "unverifiable"
+
+
+def to_additivity_class(s: str | None) -> AdditivityClass:
+    """Normalize a raw additivity string (uploaded column / concept registry) — NEVER raises.
+    None/''/'n/a' mean the measure does not aggregate (not_applicable); anything unrecognized is
+    honestly `unknown`, which downstream is NEVER treated as additive (no silent SUM)."""
+    if s is None:
+        return AdditivityClass.not_applicable
+    v = s.strip().lower()
+    if v in ("", "n/a"):
+        return AdditivityClass.not_applicable
+    try:
+        return AdditivityClass(v)
+    except ValueError:
+        return AdditivityClass.unknown
+
+
 class ReasonCode(StrEnum):
     selected_best_single_catalog = "selected_best_single_catalog"
     ambiguous_multiple_equal_plans = "ambiguous_multiple_equal_plans"
@@ -136,6 +262,31 @@ class ReasonCode(StrEnum):
     bounded_out_max_bridges = "bounded_out_max_bridges"
     bounded_out_max_realizations_per_hop = "bounded_out_max_realizations_per_hop"
     bounded_out_max_frontier_states = "bounded_out_max_frontier_states"
+    # 3B.3c contract compiler — connectivity (C2)
+    ingredient_not_connected_to_path = "ingredient_not_connected_to_path"
+    # 3B.3c — aggregation declaration/validation (C4/C5)
+    aggregation_strategy_missing = "aggregation_strategy_missing"
+    aggregation_incompatible_with_additivity = "aggregation_incompatible_with_additivity"
+    aggregation_weight_missing = "aggregation_weight_missing"
+    aggregation_components_missing = "aggregation_components_missing"
+    aggregation_axis_unsupported = "aggregation_axis_unsupported"
+    aggregation_composition_unsupported = "aggregation_composition_unsupported"
+    semi_additive_temporal_strategy_missing = "semi_additive_temporal_strategy_missing"
+    additivity_source_conflict = "additivity_source_conflict"
+    physical_cardinality_unavailable = "physical_cardinality_unavailable"
+    # 3B.3c — temporal declaration (C3)
+    temporal_anchor_missing = "temporal_anchor_missing"
+    temporal_anchor_ambiguous = "temporal_anchor_ambiguous"
+    # 3B.3c — universal safety over the physical read set (C6)
+    safety_evaluation_incomplete = "safety_evaluation_incomplete"
+    leakage_anchor_read = "leakage_anchor_read"
+    protected_attribute_read = "protected_attribute_read"
+    # 3B.3c — freshness observation (C7; NEVER hashed into contract_id) + run budget (C8)
+    freshness_stamp_unavailable = "freshness_stamp_unavailable"
+    participating_catalog_stale = "participating_catalog_stale"
+    projection_lagging = "projection_lagging"
+    catalog_mutated_during_compile = "catalog_mutated_during_compile"
+    compile_budget_exhausted = "compile_budget_exhausted"
 
 
 class GroundTemplateDiffOutcome(StrEnum):
@@ -217,11 +368,109 @@ class BindingPathSegmentV1:
     cardinality: str | None = None
     direction: str | None = None
     reason_codes: tuple[ReasonCode, ...] = ()
+    # 3B.3c audit evidence (F9): the semantic hop this segment realizes — populated by the
+    # assembler at emission (a later 3B.3c task); None on pre-3B.3c and non-hop segments.
+    relationship_id: str | None = None
+    relationship_version: str | None = None
+
+
+# ---- 3B.3c contract-compiler evidence (computed onto the plan; persisted only in 3B.4) ----
+
+@dataclass(frozen=True, slots=True)
+class AdditivityProvenanceV1:
+    """F6 — where an ingredient's additivity came from; both raw values kept so a
+    conflict (uploaded vs concept) is auditable, never silently resolved."""
+    uploaded_value: str | None
+    concept_value: str | None
+    selected: AdditivityClass
+    source: AdditivitySource
+    conflict: bool
+
+
+@dataclass(frozen=True, slots=True)
+class IngredientAggregationV1:
+    """One ingredient's aggregation stage at one hop (per hop x ingredient — a single hop may
+    need SUM on two different ingredients)."""
+    need_role: str
+    bound_object_ref: str
+    additivity: AdditivityClass
+    provenance: AdditivityProvenanceV1
+    physical_cardinality: Cardinality | None
+    axis: AggregationAxisKind
+    declared_function: AggregationFunction | None
+    validation: AggregationValidation
+    missing_inputs: tuple[str, ...]
+    reason_codes: tuple[ReasonCode, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class HopAggregationV1:
+    """The aggregation evidence for ONE fan-in hop of the plan's path: where it executes,
+    the REALIZATION-level cardinality (F8 — not the semantic hop's), the GROUP-BY keys, and
+    the per-ingredient stages."""
+    semantic_hop_index: int
+    segment_index: int
+    from_entity: str
+    to_entity: str
+    execution_catalog: str
+    execution_table: str
+    physical_cardinality: Cardinality | None
+    cardinality_source: str
+    grouping_keys: tuple[str, ...]
+    ingredient_stages: tuple[IngredientAggregationV1, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class WindowSpecV1:
+    """A TYPED window declaration (never a bare string)."""
+    length: int | None
+    unit: str | None
+    boundary: str | None
+    inclusive: bool
+
+
+@dataclass(frozen=True, slots=True)
+class ParamBindingV1:
+    """The representative param instantiation the contract was compiled against (F7):
+    canonical (name, value) pairs + the honest flag that these are representatives, not
+    a full parameter-space validation."""
+    values: tuple[tuple[str, str], ...]
+    is_representative: bool
+
+
+@dataclass(frozen=True, slots=True)
+class TemporalDeclarationV1:
+    pit_anchor: str | None
+    anchor_binding: str | None
+    window: WindowSpecV1 | None
+    param_binding: ParamBindingV1
+    time_axis_aggregating: bool
+    reason_codes: tuple[ReasonCode, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class PhysicalColumnReadV1:
+    """One physically-read column with multi-role provenance. `not_evaluated` here is
+    STRUCTURAL (no resolvable _Col) and is never treated as safe."""
+    object_ref: str
+    catalog_source: str
+    roles: tuple[ColumnRole, ...]
+    safety: BindingSafety
+    reason_codes: tuple[ReasonCode, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class PhysicalReadSetV1:
+    """The immutable inventory of EVERY column the contract would read (ingredients + join/bridge
+    keys + anchors + weights) — the universal-safety surface, not just the ingredient bindings."""
+    columns: tuple[PhysicalColumnReadV1, ...]
 
 
 @dataclass(frozen=True, slots=True)
 class BindingPlanV1:
-    plan_id: str
+    # renamed from plan_id in 3B.3c (F11): minted over the PHYSICAL path under the frozen
+    # PHYSICAL_PLAN_VERSION; the ranking tie-break; IMMUTABLE through contract compilation.
+    physical_plan_id: str
     recipe_id: str
     target_entity: str | None
     tier: PlanTier
@@ -239,6 +488,19 @@ class BindingPlanV1:
     bridge_count: int
     path_resolution_status: PathResolutionStatus
     candidate_role: CandidateRole
+    # 3B.3c — the contract axes + evidence, filled by the shadow compiler (compute-only; defaults
+    # keep every pre-3B.3c constructor working). Diagnostics live ONLY in contract_* fields —
+    # never mixed into the ingredient/path axes' reason fields above.
+    contract_id: str | None = None
+    declaration_status: DeclarationStatus = DeclarationStatus.not_compiled
+    contract_resolution_status: ContractResolutionStatus = ContractResolutionStatus.not_compiled
+    contract_primary_reason_code: ReasonCode | None = None
+    contract_reason_codes: tuple[ReasonCode, ...] = ()
+    hop_aggregations: tuple[HopAggregationV1, ...] = ()
+    temporal_declaration: TemporalDeclarationV1 | None = None
+    physical_read_set: PhysicalReadSetV1 | None = None
+    audit_envelope: PlannerReplayEnvelopeV1 | None = None
+    resolved_at_compilation: datetime | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -283,6 +545,22 @@ class PlannerReplayEnvelopeV1:
     # 3B.3b — the exact governed crossings visible to this run + the plan schema they were minted under:
     active_bridge_fact_keys: tuple[str, ...]
     plan_contract_version: str
+    # 3B.3c (F9) — the full audit version set + compile-time state evidence. Defaults keep
+    # pre-compile envelopes constructible; compiled plans pin all of it and set
+    # replay_strength=ReplayStrength.audit_only (watermarks correlate drift; they never permit
+    # deterministic re-execution). stamp_consistency defaults to `unverifiable` (fail-closed):
+    # only the compile-end fingerprint recheck may claim `consistent`.
+    aggregation_rule_version: str = AGGREGATION_RULE_VERSION
+    additivity_rule_version: str = ADDITIVITY_RULE_VERSION
+    temporal_rule_version: str = TEMPORAL_RULE_VERSION
+    safety_evaluator_version: str = SAFETY_EVALUATOR_VERSION
+    drift_freshness_sla_version: str = DRIFT_FRESHNESS_SLA_VERSION
+    planner_bounds_version: str = PLANNER_BOUNDS_VERSION
+    ranking_version: str = RANKING_VERSION
+    authz_role_claims: tuple[str, ...] = ()
+    recipe_content_hash: str = ""
+    catalog_state_stamps: tuple[CatalogStateStampV1, ...] = ()
+    stamp_consistency: StampConsistency = StampConsistency.unverifiable
 
 
 @dataclass(frozen=True, slots=True)
@@ -299,6 +577,13 @@ class BindingPlanningResultV1:
     bounding: BoundingMetricsV1
     ground_template_diff: GroundTemplateDiffV1
     replay_envelope: PlannerReplayEnvelopeV1
+    # 3B.3c — the contract-axis roll-up across the run's COMPILED (source_to_target_resolved)
+    # plans; orthogonal to result_status/selected_plan_id (the ingredient axis), which are
+    # untouched. selected_contract_physical_plan_id carries a physical id; selected_contract_id
+    # its declaration identity.
+    contract_result_status: ContractResolutionStatus = ContractResolutionStatus.not_compiled
+    selected_contract_physical_plan_id: str | None = None
+    selected_contract_id: str | None = None
 
 
 def tier_from_bridge_count(n: int) -> PlanTier:
@@ -321,7 +606,8 @@ def make_binding_plan(*, recipe_id: str, target_entity: str | None, catalog_sour
                       preference_reasons: tuple[str, ...],
                       candidate_role: CandidateRole) -> BindingPlanV1:
     """The ONE canonical constructor: derives participating_catalogs (ordered by first traversal, dedup,
-    catalog_source first), bridge_count, tier, and a plan_id over the canonical content + PLAN_CONTRACT_VERSION;
+    catalog_source first), bridge_count, tier, and a physical_plan_id over the canonical content + the
+    FROZEN PHYSICAL_PLAN_VERSION (never PLAN_CONTRACT_VERSION — F1: schema bumps must not move ids);
     validates the structural invariants. participating_catalogs cannot be a static default (it depends on
     catalog_source + segments), which is why this constructor exists."""
     participating: list[str] = [catalog_source]
@@ -344,17 +630,73 @@ def make_binding_plan(*, recipe_id: str, target_entity: str | None, catalog_sour
         f"{s.segment_kind}:{s.catalog_source}:{s.realization_ref or s.bridge_fact_key or ''}"
         for s in path_segments)
     # path_resolution_status is part of the hashed material: a tier-1 resolved plan and an
-    # immediate-dead-end reject over the same refs/segments must NOT share a plan_id (3B.4 keys
-    # its store by plan_id). It is stable at construction time — the ranker only rewrites
-    # resolution_status/candidate_role — so it is safe to hash (candidate_role is NOT: it is
-    # reset post-construction via dataclasses.replace).
+    # immediate-dead-end reject over the same refs/segments must NOT share a physical_plan_id
+    # (3B.4 keys its store by physical id). It is stable at construction time — the ranker only
+    # rewrites resolution_status/candidate_role — so it is safe to hash (candidate_role is NOT:
+    # it is reset post-construction via dataclasses.replace). The tail is the FROZEN
+    # PHYSICAL_PLAN_VERSION: byte-identical to the pre-split material, so every 3B.3b id is stable.
     material = (f"{recipe_id}|{catalog_source}|{'|'.join(refs)}|{tier}|{segments_material}"
-                f"|{path_resolution_status}|{PLANNER_VERSION}|{PLAN_CONTRACT_VERSION}")
-    plan_id = "bp_" + hashlib.sha256(material.encode()).hexdigest()[:16]
+                f"|{path_resolution_status}|{PLANNER_VERSION}|{PHYSICAL_PLAN_VERSION}")
+    physical_plan_id = "bp_" + hashlib.sha256(material.encode()).hexdigest()[:16]
     return BindingPlanV1(
-        plan_id=plan_id, recipe_id=recipe_id, target_entity=target_entity, tier=tier,
+        physical_plan_id=physical_plan_id, recipe_id=recipe_id, target_entity=target_entity, tier=tier,
         catalog_source=catalog_source, ingredient_bindings=ingredient_bindings, path_segments=path_segments,
         resolution_status=resolution_status, primary_reason_code=primary_reason_code, reason_codes=reason_codes,
         safety=safety, preference_rank=preference_rank, preference_reasons=preference_reasons,
         participating_catalogs=tuple(participating), bridge_count=bridge_count,
         path_resolution_status=path_resolution_status, candidate_role=candidate_role)
+
+
+# Observation-time reason codes (freshness + run budget): they describe WHEN/HOW the compile ran,
+# not WHAT was declared — excluded from the contract_id material so a stale recompile of identical
+# declarations keeps its identity (F7).
+_NON_DECLARATION_REASON_CODES = frozenset({
+    ReasonCode.freshness_requirement_unsatisfied,
+    ReasonCode.freshness_stamp_unavailable,
+    ReasonCode.participating_catalog_stale,
+    ReasonCode.projection_lagging,
+    ReasonCode.catalog_mutated_during_compile,
+    ReasonCode.compile_budget_exhausted,
+})
+
+_REASON_CODE_ORDER = {rc: i for i, rc in enumerate(ReasonCode)}
+
+
+def canonical_reason_codes(codes: Iterable[ReasonCode]) -> tuple[ReasonCode, ...]:
+    """Canonical diagnostic order: ReasonCode DEFINITION (registry) order, deduped — so no
+    serialization or accumulation order can perturb hashed material or stored diagnostics."""
+    return tuple(sorted(set(codes), key=_REASON_CODE_ORDER.__getitem__))
+
+
+def make_contract_id(plan: BindingPlanV1, *, resolved_at_compilation: datetime) -> str:
+    """The declaration identity (F7/F12), minted over WHAT was declared: declaration_status +
+    the DECLARATION reason codes + the per-ingredient aggregation declarations + the temporal
+    signature + the compiler rule versions, anchored to the immutable physical_plan_id and the
+    PLAN_CONTRACT_VERSION schema.
+
+    DELIBERATE exclusions — the freshness observation never enters the identity: the
+    contract_resolution_status freshness delta, every freshness/budget reason code, catalog state
+    stamps, and `resolved_at_compilation` (accepted here precisely so no caller can believe the
+    compile time participates: it is carried as plan evidence, NEVER hashed). Identical
+    declarations therefore compile to the SAME contract_id, fresh or stale, today or in replay."""
+    del resolved_at_compilation     # evidence, not identity — see docstring
+    decl_codes = canonical_reason_codes(
+        rc for rc in plan.contract_reason_codes if rc not in _NON_DECLARATION_REASON_CODES)
+    stages = sorted(
+        (s.need_role, s.additivity.value,
+         s.declared_function.value if s.declared_function is not None else "",
+         s.validation.value)
+        for h in plan.hop_aggregations for s in h.ingredient_stages)
+    stage_material = ";".join(",".join(s) for s in stages)
+    td = plan.temporal_declaration
+    if td is None:
+        temporal_material = ""
+    else:
+        w = td.window
+        window_material = "" if w is None else f"{w.length}:{w.unit}:{w.boundary}:{w.inclusive}"
+        temporal_material = f"{td.pit_anchor or ''}~{window_material}~{td.time_axis_aggregating}"
+    material = (f"{plan.physical_plan_id}|{plan.declaration_status}|{'|'.join(decl_codes)}"
+                f"|{stage_material}|{temporal_material}"
+                f"|{AGGREGATION_RULE_VERSION}|{ADDITIVITY_RULE_VERSION}|{TEMPORAL_RULE_VERSION}"
+                f"|{SAFETY_EVALUATOR_VERSION}|{PLAN_CONTRACT_VERSION}")
+    return "cc_" + hashlib.sha256(material.encode()).hexdigest()[:16]

@@ -42,7 +42,7 @@ def test_plan_bindings_resolves_a_single_catalog_plan(db):
     result = plan_bindings(db, template=_tmpl(), target_entity="customer", scope=scope, roles=(), now=_NOW)
     assert result.result_status is PlanResolutionStatus.resolved
     assert result.selected_plan_id is not None
-    sel = next(p for p in result.candidate_plans if p.plan_id == result.selected_plan_id)
+    sel = next(p for p in result.candidate_plans if p.physical_plan_id == result.selected_plan_id)
     assert sel.catalog_source == "core"
     assert {b.bound_object_ref for b in sel.ingredient_bindings} == {"public.accounts.balance",
                                                                      "public.accounts.customer_id"}
@@ -81,7 +81,7 @@ def test_rejected_alternative_does_not_downgrade_a_resolved_result(db):
     result = plan_bindings(db, template=_tmpl(stock_grains=("customer",)), target_entity="customer",
                            scope=scope, roles=(), now=_NOW)
     assert result.result_status is PlanResolutionStatus.resolved   # the clean 'core' plan wins
-    sel = next(p for p in result.candidate_plans if p.plan_id == result.selected_plan_id)
+    sel = next(p for p in result.candidate_plans if p.physical_plan_id == result.selected_plan_id)
     assert sel.catalog_source == "core"
     # …and the rejected alternative from 'bad' is PRESENT and non-resolved (preserved, not dropped).
     bad_plans = [p for p in result.candidate_plans if p.catalog_source == "bad"]
@@ -151,7 +151,7 @@ def test_acceptance_rollup_bridge_end_to_end(db):
                            scope=_scope("ops", "rev"), roles=(), now=_NOW)
     # candidate-local-first: the tier-1 outcome is untouched by the enrichment
     assert result.result_status is PlanResolutionStatus.resolved
-    sel = next(p for p in result.candidate_plans if p.plan_id == result.selected_plan_id)
+    sel = next(p for p in result.candidate_plans if p.physical_plan_id == result.selected_plan_id)
     assert sel.path_resolution_status is PathResolutionStatus.ingredient_binding_only
     # ...and the governed source->target roll-up IS in the candidate set (logged for 3B.4)
     cross = [p for p in result.candidate_plans
@@ -205,7 +205,7 @@ def test_acceptance_plan_bindings_is_deterministic(db):
                        roles=(), now=_NOW)
     r2 = plan_bindings(db, template=_txn_template(), target_entity="account", scope=scope,
                        roles=(), now=_NOW)
-    assert [p.plan_id for p in r1.candidate_plans] == [p.plan_id for p in r2.candidate_plans]
+    assert [p.physical_plan_id for p in r1.candidate_plans] == [p.physical_plan_id for p in r2.candidate_plans]
     assert r1.replay_envelope == r2.replay_envelope
 
 
@@ -229,3 +229,113 @@ def test_acceptance_out_of_scope_bridge_is_never_pinned_or_crossed(db):
                if p.path_resolution_status is PathResolutionStatus.source_to_target_rejected]
     assert rejects and all(p.primary_reason_code is ReasonCode.missing_realization for p in rejects)
     assert result.result_status is PlanResolutionStatus.resolved   # tier-1 untouched
+
+
+# ---------------------------------------------------------------------------------------------
+# Task C8 — the shadow contract-compile pass wired into plan_bindings: batched CompilerContext,
+# the run-owned CompileBudget, and the contract selection roll-up. compile_ctx=None must stay
+# byte-identical to pre-C8 behaviour (all plans not_compiled, no roll-up, zero extra reads).
+# ---------------------------------------------------------------------------------------------
+from datetime import timedelta
+
+from featuregen.overlay.upload.planner.contracts import ContractResolutionStatus
+from featuregen.overlay.upload.planner.declarations import CompileBudget, build_compiler_context
+
+
+def _freshness(db, *sources, head_seq=1):
+    for src in sources:
+        db.execute(
+            "INSERT INTO overlay_drift_watermark (catalog_source, last_completed_at, last_run_id,"
+            " head_seq) VALUES (%s,%s,'c8',%s) ON CONFLICT (catalog_source) DO UPDATE SET"
+            " last_completed_at = EXCLUDED.last_completed_at, head_seq = EXCLUDED.head_seq",
+            (src, _NOW, head_seq))
+    db.execute(
+        "INSERT INTO projection_checkpoints (projection_name, checkpoint_seq) VALUES"
+        " ('overlay', %s) ON CONFLICT (projection_name) DO UPDATE SET"
+        " checkpoint_seq = EXCLUDED.checkpoint_seq", (head_seq,))
+
+
+def _c8_fixture(db):
+    """The B5 bridge roll-up fixture made compile-ready: fresh watermarks + an applied projection
+    checkpoint, so a compiled contract's freshness axis resolves."""
+    _split(db)
+    _seed_bridge(db, "bfk_c8", "account",
+                 "ops", "public.transactions.account_id", "rev", "public.accounts.account_id")
+    _freshness(db, "ops", "rev")
+    return _scope("ops", "rev")
+
+
+def _cross(result):
+    return [p for p in result.candidate_plans
+            if p.path_resolution_status is PathResolutionStatus.source_to_target_resolved]
+
+
+def test_compile_pass_is_additive_and_rolls_up_contract_selection(db):
+    scope = _c8_fixture(db)
+    tmpl = _txn_template()
+    base = plan_bindings(db, template=tmpl, target_entity="account", scope=scope, roles=(),
+                         now=_NOW)
+    ctx = build_compiler_context(db, scope, (), _NOW)
+    result = plan_bindings(db, template=tmpl, target_entity="account", scope=scope, roles=(),
+                           now=_NOW, compile_ctx=ctx)
+    # tier-1 decision + plan order + physical ids: identical to the uncompiled run
+    assert result.result_status is base.result_status
+    assert result.selected_plan_id == base.selected_plan_id
+    assert [p.physical_plan_id for p in result.candidate_plans] == \
+        [p.physical_plan_id for p in base.candidate_plans]
+    (cross,) = _cross(result)
+    assert cross.contract_resolution_status is ContractResolutionStatus.resolved
+    assert cross.contract_id is not None
+    # tier-1 (non source->target) plans are NEVER compiled
+    assert all(p.contract_resolution_status is ContractResolutionStatus.not_compiled
+               for p in result.candidate_plans
+               if p.path_resolution_status is not PathResolutionStatus.source_to_target_resolved)
+    # the roll-up selects the best COMPILED plan; the tier-1 selection is a different axis
+    assert result.selected_contract_physical_plan_id == cross.physical_plan_id
+    assert result.selected_contract_id == cross.contract_id
+    assert result.contract_result_status is ContractResolutionStatus.resolved
+    assert result.selected_contract_physical_plan_id != result.selected_plan_id
+    # the uncompiled run has NO roll-up
+    assert base.contract_result_status is ContractResolutionStatus.not_compiled
+    assert base.selected_contract_physical_plan_id is None and base.selected_contract_id is None
+
+
+def test_compile_budget_is_shared_and_exhaustion_is_recorded(db):
+    scope = _c8_fixture(db)
+    tmpl = _txn_template()
+    ctx = build_compiler_context(db, scope, (), _NOW)
+    budget = CompileBudget(remaining=1, deadline=_NOW + timedelta(minutes=5))
+    r1 = plan_bindings(db, template=tmpl, target_entity="account", scope=scope, roles=(),
+                       now=_NOW, compile_ctx=ctx, budget=budget)
+    r2 = plan_bindings(db, template=tmpl, target_entity="account", scope=scope, roles=(),
+                       now=_NOW, compile_ctx=ctx, budget=budget)
+    (c1,) = _cross(r1)
+    assert c1.contract_resolution_status is ContractResolutionStatus.resolved
+    assert budget.remaining == 0
+    (c2,) = _cross(r2)
+    assert c2.contract_resolution_status is ContractResolutionStatus.not_compiled
+    assert c2.contract_id is None
+    assert ReasonCode.compile_budget_exhausted in c2.contract_reason_codes
+    # a budget-skipped plan is NEVER the contract selection
+    assert r2.contract_result_status is ContractResolutionStatus.not_compiled
+    assert r2.selected_contract_physical_plan_id is None
+    # the deadline bound skips identically (deterministic: compared against the injected now)
+    past = CompileBudget(remaining=5, deadline=_NOW)
+    r3 = plan_bindings(db, template=tmpl, target_entity="account", scope=scope, roles=(),
+                       now=_NOW, compile_ctx=ctx, budget=past)
+    (c3,) = _cross(r3)
+    assert c3.contract_resolution_status is ContractResolutionStatus.not_compiled
+    assert ReasonCode.compile_budget_exhausted in c3.contract_reason_codes
+    assert past.remaining == 5      # nothing was compiled, nothing decremented
+
+
+def test_no_compile_ctx_leaves_every_plan_not_compiled(db):
+    scope = _c8_fixture(db)
+    result = plan_bindings(db, template=_txn_template(), target_entity="account", scope=scope,
+                           roles=(), now=_NOW)
+    assert result.contract_result_status is ContractResolutionStatus.not_compiled
+    assert result.selected_contract_physical_plan_id is None
+    assert result.selected_contract_id is None
+    assert all(p.contract_resolution_status is ContractResolutionStatus.not_compiled
+               and p.contract_id is None and p.contract_reason_codes == ()
+               for p in result.candidate_plans)
