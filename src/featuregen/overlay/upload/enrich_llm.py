@@ -19,6 +19,9 @@ from __future__ import annotations
 import logging
 import os
 
+import psycopg
+
+from featuregen.config import get_settings
 from featuregen.contracts.envelopes import IdentityEnvelope
 from featuregen.contracts.identity import identity_to_jsonb
 from featuregen.documents.registry import DocumentSchemaRegistry
@@ -151,6 +154,35 @@ def _audit_egress_block(conn, *, task: str, actor, reason: str) -> None:
                               reason=reason or "egress guard blocked")
     except Exception:  # noqa: BLE001 — never let an audit failure mask the (correct) egress block
         logger.exception("failed to record EGRESS_BLOCKED security event for %s", task)
+
+
+def _record_llm_call_durable(conn, **record_kwargs) -> None:
+    """Finding #20: by the time this runs, content has ALREADY egressed to the provider — so the
+    immutable llm_call record must NOT share the upload transaction's fate (a later graph/DB
+    failure in the same request would erase the evidence that data left the system). Mirror of the
+    api.deps.audit_access_denied separate-connection pattern: gated on the production DSN being
+    configured (unset ⟹ tests / no-DB harness, where a separately-committing connection would
+    pollute the rolled-back test DB — same reasoning as that gate), and connecting to the SAME
+    database the upload runs on (``conn.info.dsn``, the runtime.dispatch derivation) so a stray
+    env DSN can never redirect audit rows elsewhere.
+
+    The fresh connection performs ONE bare INSERT (record_llm_call) and NEVER takes an advisory
+    lock — it cannot re-acquire the upload's ``pg_advisory_xact_lock`` and self-deadlock the way a
+    second chain-locking security-audit connection did (program-audit I-3). NOT used for
+    ``_audit_egress_block``: record_security_event's tamper-evident chain lock is exactly that
+    hazard, so egress-block events stay on the request conn.
+
+    Best-effort fallback: if the separate connection cannot be opened/committed, the record is
+    written on the request conn — transactional evidence beats none — and the failure is logged."""
+    if get_settings().dsn:
+        try:
+            with psycopg.connect(conn.info.dsn) as audit_conn:  # own tx, committed on `with` exit
+                record_llm_call(audit_conn, **record_kwargs)
+            return
+        except Exception:  # noqa: BLE001 — degraded audit must never fail the (done) provider call
+            logger.exception(
+                "durable llm_call audit write failed; falling back to the request connection")
+    record_llm_call(conn, **record_kwargs)
 
 # Structural output schemas for the three enrichment tasks (single string field each).
 _SCHEMAS: dict[tuple[str, int], dict] = {
@@ -332,7 +364,7 @@ def audited_structured_call(conn, client: LLMClient, *, task: str, prompt_id: st
 
     outcome = drive_structured_call(
         client, req, lambda output: reg.validate(schema_id, 1, output))
-    record_llm_call(
+    _record_llm_call_durable(   # #20: egress evidence survives an upload-transaction rollback
         conn, run_id=_RUN, request=req, input_hash=compute_input_hash(req.inputs),
         redaction_version=redaction_version,
         input_redaction={"redacted_spans": spans} if spans else {},
@@ -490,14 +522,15 @@ def audited_batch_call(conn, client: LLMClient, *, task: str, prompt_id: str, sc
     summary = {"requested": [it.ref for it in included],
                "outcomes": {o.ref: o.status for o in item_outcomes}}
     cost = dict(outcome.cost_metadata or {})
-    record_llm_call(conn, run_id=_RUN, request=req, input_hash=compute_input_hash(req.inputs),
-                    redaction_version=redaction_version,
-                    input_redaction={"redacted_spans": all_spans} if all_spans else {},
-                    raw_output={"output": outcome.output,
-                                "self_reported_scores": outcome.self_reported_scores},
-                    validation_result=outcome.validation_result,
-                    repair_attempts=list(outcome.repair_attempts), latency_ms=None,
-                    cost_metadata={**cost, "batch": summary}, created_by=identity_to_jsonb(actor))
+    _record_llm_call_durable(   # #20: egress evidence survives an upload-transaction rollback
+        conn, run_id=_RUN, request=req, input_hash=compute_input_hash(req.inputs),
+        redaction_version=redaction_version,
+        input_redaction={"redacted_spans": all_spans} if all_spans else {},
+        raw_output={"output": outcome.output,
+                    "self_reported_scores": outcome.self_reported_scores},
+        validation_result=outcome.validation_result,
+        repair_attempts=list(outcome.repair_attempts), latency_ms=None,
+        cost_metadata={**cost, "batch": summary}, created_by=identity_to_jsonb(actor))
 
     return BatchCallResult(
         outcomes=tuple(egress_outcomes) + tuple(item_outcomes), provider_calls=1,

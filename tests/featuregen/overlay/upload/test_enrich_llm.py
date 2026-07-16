@@ -234,6 +234,52 @@ def test_batch_item_failing_closed_is_excluded_not_batch_fatal(db, monkeypatch):
     assert by["h2"].status == VALID
 
 
+# ---- finding #20: the llm_call egress audit must survive the upload transaction ----------------
+
+
+def test_llm_egress_audit_survives_upload_rollback(db, monkeypatch):
+    """By the time the audit row is written, data has ALREADY left the system — so the record must
+    commit INDEPENDENTLY of the upload transaction. A later rollback of the request connection
+    (graph/DB failure in the same upload) must not erase the evidence. The request conn holds an
+    advisory lock here, proving the separate audit conn never re-acquires one (program-audit I-3
+    self-deadlock class)."""
+    import psycopg
+
+    monkeypatch.setenv("FEATUREGEN_DSN", db.info.dsn)     # production signal: durable audit ON
+    task = "test.egress.audit.rollback"
+    client = FakeLLM(script={task: FakeResponse(output={"concept": "monetary_amount"})})
+    register_enrichment_schemas(db)
+    db.execute("SELECT pg_advisory_xact_lock(4242)")      # the upload tx holds an advisory lock
+    try:
+        out = audited_enrich_call(
+            db, client, task=task, prompt_id="overlay_concept_v1", schema_id="overlay_concept",
+            catalog_metadata=_META, out_key="concept", instruction="Classify this column.")
+        assert out == "monetary_amount"
+        db.rollback()                                     # the upload transaction later fails
+        with psycopg.connect(db.info.dsn) as fresh:
+            n = fresh.execute(
+                "SELECT count(*) FROM llm_call WHERE task = %s", (task,)).fetchone()[0]
+        assert n == 1                                     # the egress evidence SURVIVES
+    finally:
+        # llm_call is write-once (trigger-enforced); as table owner, drop the guard just long
+        # enough to remove this test's committed row so the shared test DB stays clean.
+        with psycopg.connect(db.info.dsn, autocommit=True) as c:
+            c.execute("ALTER TABLE llm_call DISABLE TRIGGER llm_call_no_mutation")
+            c.execute("DELETE FROM llm_call WHERE task = %s", (task,))
+            c.execute("ALTER TABLE llm_call ENABLE TRIGGER llm_call_no_mutation")
+
+
+def test_llm_egress_audit_stays_transactional_without_production_dsn(db, monkeypatch):
+    """Without the production DSN signal (tests / no-DB harness) the audit stays on the request
+    conn — same gate as api.deps.audit_access_denied, so a rolled-back test never leaks
+    committed rows into the shared database."""
+    monkeypatch.delenv("FEATUREGEN_DSN", raising=False)
+    _call(db, _Capture())
+    n = db.execute(
+        "SELECT count(*) FROM llm_call WHERE run_id = 'overlay-enrichment'").fetchone()[0]
+    assert n == 1                                         # visible in-tx; rolled back on teardown
+
+
 def test_flag_off_no_client_means_no_llm_egress_paths_at_all(db):
     """FLAG-OFF safety: with no LLM provider wired (client=None — the default), ingest never
     touches the enrichment/egress seams: no llm_call rows, no EGRESS_BLOCKED events, upload
