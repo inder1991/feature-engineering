@@ -271,6 +271,8 @@ const SYNC_PREVIEW: SyncPreview = {
     { table: 'cards', status: 'new', columns: 4, quarantine: [], changes: [] },
     { table: 'transactions', status: 'new', columns: 6, quarantine: [], changes: [] },
   ],
+  collisions: [],
+  dropped_joins: [],
   brake: { would_hold: false, reason: null },
   as_of_suggestions: [
     { table: 'accounts', column: 'opened_on', hint: 'partition column (TIME-UNIT)' },

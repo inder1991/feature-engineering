@@ -22,6 +22,8 @@ import {
   previewSync,
 } from '../api'
 import type {
+  DroppedJoin,
+  FoldCollision,
   Integration,
   PreviewTable,
   Sync,
@@ -332,6 +334,10 @@ export function ConnectorPanel({
           <BrakeCallout brake={preview.data.brake} />
           <TagMapPanel rows={preview.data.tag_map} disabled={busy || stale} onRemap={remap} />
           <TablesPanel tables={preview.data.tables} />
+          <DataLossWarning
+            collisions={preview.data.collisions}
+            droppedJoins={preview.data.dropped_joins}
+          />
           {preview.data.as_of_suggestions.length > 0 && (
             <p className="conn-asof">
               As-of suggestions attached for the reviewer:{' '}
@@ -542,6 +548,64 @@ function BrakeCallout({ brake }: { brake: { would_hold: boolean; reason: string 
           source&#39;s known objects is held for a human, exactly like a hostile upload. This one
           stays within that limit.
         </p>
+      </div>
+    </div>
+  )
+}
+
+// Known data loss the pull would otherwise hide (#1): tables held out because distinct upstream
+// tables fold to the same catalog name, and FK relationships the translation cannot carry.
+// Rendered BEFORE the approve button — the human never approves an import missing tables or
+// joins they were not shown.
+function DataLossWarning({
+  collisions,
+  droppedJoins,
+}: {
+  collisions: FoldCollision[]
+  droppedJoins: DroppedJoin[]
+}) {
+  if (collisions.length === 0 && droppedJoins.length === 0) return null
+  return (
+    <div className="callout callout--warn">
+      <CalloutGlyph>
+        <path d="M8 2.75 14 13.25H2z" />
+        <path d="M8 6.75v2.75M8 11.5v.01" />
+      </CalloutGlyph>
+      <div className="callout-body">
+        {collisions.length > 0 && (
+          <p>
+            <strong>
+              {collisions.length} table{collisions.length === 1 ? '' : 's'} excluded (name
+              collision):
+            </strong>{' '}
+            {collisions.map((c, i) => (
+              <span key={c.table}>
+                {i > 0 && '; '}
+                <span className="mono">{c.table}</span> ({c.fqns.join(', ')})
+              </span>
+            ))}
+            . Distinct upstream tables fold to the same catalog name under this sync&#39;s table
+            naming; they are held out of the import, never silently merged.
+          </p>
+        )}
+        {droppedJoins.length > 0 && (
+          <p>
+            <strong>
+              {droppedJoins.length} foreign-key relationship
+              {droppedJoins.length === 1 ? '' : 's'} dropped:
+            </strong>{' '}
+            {droppedJoins.map((d, i) => (
+              <span key={`${d.table}:${d.columns.join(',')}`}>
+                {i > 0 && '; '}
+                <span className="mono">
+                  {d.table}({d.columns.join(', ')}) → {d.referred.join(', ')}
+                </span>{' '}
+                ({d.reason})
+              </span>
+            ))}
+            . These joins will not exist in the catalog after import.
+          </p>
+        )}
       </div>
     </div>
   )

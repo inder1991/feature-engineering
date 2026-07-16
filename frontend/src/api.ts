@@ -1237,6 +1237,23 @@ export interface AsOfSuggestion {
   hint: string
 }
 
+// Two or more DISTINCT upstream tables (different fullyQualifiedNames) that fold to the SAME
+// catalog table name under the sync's table naming. Held OUT of the pull (fail-closed — the
+// connector never silently merges distinct sources); the preview must show the exclusion.
+export interface FoldCollision {
+  table: string
+  fqns: string[]
+}
+
+// A FOREIGN_KEY relationship the translation cannot carry (composite FK, or a second FK on a
+// column that already carries one). The join is dropped on import; the preview must show the loss.
+export interface DroppedJoin {
+  table: string
+  columns: string[]
+  referred: string[]
+  reason: string
+}
+
 // The dry run a human approves. `snapshot_hash` and `local_baseline_hash` are the honesty
 // anchors: import must present BOTH back, and the server answers 409 if OpenMetadata moved
 // (snapshot) or the local catalog for the source changed (baseline) since this preview was
@@ -1255,6 +1272,10 @@ export interface SyncPreview {
   }
   tag_map: TagMapEntry[]
   tables: PreviewTable[]
+  // Known data loss (#1): tables held out by folded-name collisions and FK relationships the
+  // translation drops. Always present in build_preview's JSON; both empty on a clean pull.
+  collisions: FoldCollision[]
+  dropped_joins: DroppedJoin[]
   brake: { would_hold: boolean; reason: string | null }
   as_of_suggestions: AsOfSuggestion[]
   snapshot_hash: string

@@ -85,6 +85,8 @@ const PREVIEW: api.SyncPreview = {
     },
     { table: 'card_products', status: 'unchanged', columns: 6, quarantine: [], changes: [] },
   ],
+  collisions: [],
+  dropped_joins: [],
   brake: { would_hold: false, reason: null },
   as_of_suggestions: [
     { table: 'accounts', column: 'opened_on', hint: 'partition column (TIME-UNIT)' },
@@ -242,6 +244,44 @@ describe('preview rendering', () => {
     if (!removed) throw new Error('promotions row not found')
     expect(within(removed).getByText('removed')).toBeInTheDocument()
     expect(removed).toHaveTextContent('import will drop this table and stale its 2 columns')
+  })
+
+  it('warns about collision-excluded tables and dropped FK joins before approve (#1)', async () => {
+    listIntegrations.mockResolvedValue([INTEGRATION])
+    listSyncs.mockResolvedValue([SYNC])
+    previewSync.mockResolvedValue({
+      ...PREVIEW,
+      collisions: [{
+        table: 'orders',
+        fqns: ['mysql_prod.cards_db.public.orders', 'mysql_prod.cards_db.audit.orders'],
+      }],
+      dropped_joins: [{
+        table: 'accounts', columns: ['branch_id', 'region_id'],
+        referred: ['branches.branch_id', 'branches.region_id'],
+        reason: 'composite foreign key not supported',
+      }],
+    })
+    renderPanel()
+    await userEvent.click(await screen.findByRole('button', { name: 'Preview import' }))
+    await screen.findByRole('heading', { name: 'Preview: mysql_prod into source cards' })
+
+    // Both losses named, with their specifics, so approval is informed — never silent.
+    expect(screen.getByText(/1 table excluded \(name collision\)/i)).toBeInTheDocument()
+    expect(screen.getByText('orders')).toBeInTheDocument()
+    expect(screen.getByText(
+      /mysql_prod\.cards_db\.public\.orders, mysql_prod\.cards_db\.audit\.orders/,
+    )).toBeInTheDocument()
+    expect(screen.getByText(/held out of the import, never silently merged/)).toBeInTheDocument()
+    expect(screen.getByText(/1 foreign-key relationship dropped/i)).toBeInTheDocument()
+    expect(screen.getByText(/accounts\(branch_id, region_id\)/)).toBeInTheDocument()
+    expect(screen.getByText(/composite foreign key not supported/)).toBeInTheDocument()
+    expect(screen.getByText(/will not exist in the catalog after import/)).toBeInTheDocument()
+  })
+
+  it('renders no data-loss warning on a clean pull', async () => {
+    await renderWithPreview()   // PREVIEW carries empty collisions/dropped_joins
+    expect(screen.queryByText(/excluded \(name collision\)/i)).not.toBeInTheDocument()
+    expect(screen.queryByText(/foreign-key relationship/i)).not.toBeInTheDocument()
   })
 
   it('renders the would-hold brake with its reason', async () => {

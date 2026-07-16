@@ -190,6 +190,8 @@ const PREVIEW: api.SyncPreview = {
   },
   tag_map: [],
   tables: [{ table: 'accounts', status: 'new', columns: 3, quarantine: [], changes: [] }],
+  collisions: [],
+  dropped_joins: [],
   brake: { would_hold: false, reason: null },
   as_of_suggestions: [],
   snapshot_hash: 'ab'.repeat(32),
