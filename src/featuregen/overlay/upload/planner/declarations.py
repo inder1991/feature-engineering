@@ -18,18 +18,33 @@ from featuregen.overlay.config import OverlayConfig
 from featuregen.overlay.upload.binding_roles import JoinRole, TemporalRole
 from featuregen.overlay.upload.bridge_projection import ActiveBridgeV1
 from featuregen.overlay.upload.catalog_realizations import table_of
+from featuregen.overlay.upload.concepts import concept
 from featuregen.overlay.upload.need_metadata import ResolvedNeedMetadataV1, derive_need_metadata
 from featuregen.overlay.upload.planner.contracts import (
+    AdditivityClass,
+    AdditivityProvenanceV1,
+    AdditivitySource,
+    AggregationAxisKind,
     AggregationFunction,
+    AggregationValidation,
+    BindingPathSegmentV1,
     BindingPlanV1,
     CatalogStateStampV1,
+    HopAggregationV1,
+    IngredientAggregationV1,
+    IngredientBindingV1,
     ParamBindingV1,
     ReasonCode,
+    SegmentKind,
     TemporalDeclarationV1,
     WindowSpecV1,
     canonical_reason_codes,
+    to_additivity_class,
 )
-from featuregen.overlay.upload.taxonomy.entity_relationships import CatalogEntityRelationshipV1
+from featuregen.overlay.upload.taxonomy.entity_relationships import (
+    Cardinality,
+    CatalogEntityRelationshipV1,
+)
 from featuregen.overlay.upload.templates import Template, _Col
 
 # The injectable declared-function registry: ``(recipe_id, need_role) ->`` the recipe's DECLARED
@@ -237,3 +252,265 @@ def compile_temporal(ctx: CompilerContext, plan: BindingPlanV1,
         pit_anchor=pit_anchor, anchor_binding=anchor_binding, window=window,
         param_binding=param_binding, time_axis_aggregating=window is not None,
         reason_codes=canonical_reason_codes(codes))
+
+
+# ─── C4: per-ingredient aggregation + additivity + physical/bridge cardinality ────────────────
+#
+# VALIDATE, NEVER FABRICATE (versioned by AGGREGATION_RULE_VERSION): the ONLY auto-derivations are
+# `additive` fan-in → SUM and `semi_additive` entity-axis single-PIT → SUM, both expressed as
+# validation=sound with declared_function=None — the derived SUM is never written into the
+# DECLARED slot. Every other function must come from ctx.agg_declarations (empty in production);
+# anything unprovable resolves undeclared/incompatible/inputs_missing, never a guessed function.
+
+# hop_physical_cardinality's `source` vocabulary (F4): where the fan-in evidence came from.
+CARDINALITY_SOURCE_REALIZATION = "realization"
+CARDINALITY_SOURCE_BRIDGE = "bridge_construction"
+CARDINALITY_SOURCE_UNAVAILABLE = "unavailable"
+
+# Declared functions that are provably duplication/order-safe on ANY fan-in without extra inputs.
+_ORDER_SAFE_DECLARED = frozenset(
+    {AggregationFunction.count, AggregationFunction.min, AggregationFunction.max})
+
+
+def resolve_additivity(ctx: CompilerContext, binding: IngredientBindingV1) -> AdditivityProvenanceV1:
+    """§4.1 — which additivity governs this ingredient, with full provenance. Precedence:
+    the UPLOADED column additivity when the bound column asserts one (anything but absent/blank/
+    n/a) → else the CONCEPT's additivity when the concept is registered → else honest ``unknown``
+    (which downstream is NEVER treated as additive — no silent SUM). BOTH raw values are kept
+    (F15) and a disagreement between two ASSERTED sources sets ``conflict`` — recorded for the
+    plan-level ``additivity_source_conflict`` diagnostic, never silently resolved."""
+    col = ctx.columns_by_catalog.get(binding.bound_catalog_source, {}).get(
+        binding.bound_object_ref)
+    uploaded = to_additivity_class(col.additivity) if col is not None else None
+    con = concept(binding.concept)
+    concept_raw = con.additivity if con is not None else None
+    concept_add = to_additivity_class(concept_raw)
+    selected: AdditivityClass
+    if uploaded is not None and uploaded is not AdditivityClass.not_applicable:
+        selected, source = uploaded, AdditivitySource.uploaded_column
+    elif con is not None:
+        selected, source = concept_add, AdditivitySource.concept
+    else:
+        selected, source = AdditivityClass.unknown, AdditivitySource.unknown
+    conflict = (uploaded is not None and uploaded is not AdditivityClass.not_applicable
+                and concept_add not in (AdditivityClass.unknown, AdditivityClass.not_applicable)
+                and uploaded is not concept_add)
+    return AdditivityProvenanceV1(
+        uploaded_value=col.additivity if col is not None else None, concept_value=concept_raw,
+        selected=selected, source=source, conflict=conflict)
+
+
+def _hop_evidence(
+        ctx: CompilerContext, segment: BindingPathSegmentV1,
+) -> tuple[Cardinality | None, str, tuple[str, ...], str, str]:
+    """One hop segment's physical evidence: (cardinality, source, grouping_keys,
+    execution_catalog, execution_table). Realized hop → the REALIZATION's declared_cardinality
+    (F4/F8 — the physical authority; the segment's semantic cardinality string is never
+    consulted), its to-side key as the GROUP BY, its to-table as the execution site. Bridge-ROLLUP
+    hop → many_to_one BY CONSTRUCTION (the bridge anchors an E2-key FK column to an E2-grain far
+    table), grouped at the far (target-grain) endpoint — the endpoint in the segment's catalog
+    (endpoint storage order is unordered). Anything the context cannot resolve →
+    ``(None, "unavailable", (), <segment catalog>, "")`` — fail closed, never a guessed fan-in."""
+    if segment.realization_ref is not None:
+        r = next((x for x in ctx.realizations_by_catalog.get(segment.catalog_source, ())
+                  if x.realization_id == segment.realization_ref), None)
+        if r is None:
+            return None, CARDINALITY_SOURCE_UNAVAILABLE, (), segment.catalog_source, ""
+        return (r.declared_cardinality, CARDINALITY_SOURCE_REALIZATION, (r.to_key_ref,),
+                segment.catalog_source, r.to_object_ref)
+    if segment.bridge_fact_key is not None:
+        br = next((x for x in ctx.active_bridges
+                   if x.fact_key == segment.bridge_fact_key), None)
+        if br is not None:
+            far = [(cat, ref)
+                   for cat, ref in ((br.left_catalog_source, br.left_object_ref),
+                                    (br.right_catalog_source, br.right_object_ref))
+                   if cat == segment.catalog_source]
+            if len(far) == 1:   # exactly one endpoint on the segment's (far) side, else fail closed
+                cat, ref = far[0]
+                return (Cardinality.MANY_TO_ONE, CARDINALITY_SOURCE_BRIDGE, (ref,),
+                        cat, table_of(ref))
+        return None, CARDINALITY_SOURCE_UNAVAILABLE, (), segment.catalog_source, ""
+    return None, CARDINALITY_SOURCE_UNAVAILABLE, (), segment.catalog_source, ""
+
+
+def hop_physical_cardinality(
+        ctx: CompilerContext, segment: BindingPathSegmentV1,
+) -> tuple[Cardinality | None, str, tuple[str, ...]]:
+    """The PHYSICAL fan-in of one hop-realizing segment: (cardinality, source, grouping_keys).
+    Valid for hop realizers (a realized roll-up or a rollup governed_bridge) — a same-entity
+    reposition bridge is not a hop and is never passed here by ``compile_aggregation``."""
+    cardinality, source, keys, _cat, _table = _hop_evidence(ctx, segment)
+    return cardinality, source, keys
+
+
+def _semantic_hops(
+        plan: BindingPlanV1,
+) -> list[tuple[int, int, BindingPathSegmentV1, BindingPathSegmentV1 | None]]:
+    """The plan's semantic hops as (semantic_hop_index, segment_index, announcing segment,
+    realizer-or-None). The assembler emits each hop as a ``semantic_rollup`` announcement followed
+    by its realizer — ``intra_catalog_realization``, or a rollup ``governed_bridge`` carrying the
+    SAME from/to entities (the entity match keeps a same-entity REPOSITION bridge from being
+    mistaken for a realizer; repositions cross on the GRAIN key — 1:1 by construction — and are
+    never hops). A semantic_rollup with no realizer stays a hop with no physical evidence (fail
+    closed: its cardinality resolves unavailable)."""
+    out: list[tuple[int, int, BindingPathSegmentV1, BindingPathSegmentV1 | None]] = []
+    segs = plan.path_segments
+    sem_idx = -1
+    for idx, seg in enumerate(segs):
+        if seg.segment_kind is not SegmentKind.semantic_rollup:
+            continue
+        sem_idx += 1
+        if seg.realization_ref is not None or seg.bridge_fact_key is not None:
+            out.append((sem_idx, idx, seg, seg))    # self-realized single-segment hop
+            continue
+        realizer: BindingPathSegmentV1 | None = None
+        seg_index = idx
+        nxt = segs[idx + 1] if idx + 1 < len(segs) else None
+        if nxt is not None and nxt.segment_kind is not SegmentKind.semantic_rollup:
+            if nxt.realization_ref is not None:
+                realizer, seg_index = nxt, idx + 1
+            elif (nxt.bridge_fact_key is not None
+                    and (nxt.from_entity, nxt.to_entity) == (seg.from_entity, seg.to_entity)):
+                realizer, seg_index = nxt, idx + 1
+        out.append((sem_idx, seg_index, seg, realizer))
+    return out
+
+
+def _validate_declared_inputs(
+        declared: AggregationFunction, need_role: str, bound_roles: frozenset[str],
+) -> tuple[AggregationValidation, ReasonCode | None, tuple[str, ...]]:
+    """The declared strategies that need MORE inputs than the measure itself. The input-role
+    convention (versioned under AGGREGATION_RULE_VERSION — no governed weight/component
+    declaration source exists yet): ``<role>_weight`` (or a plan-wide ``weight``) for
+    weighted_average; ``<role>_numerator``/``<role>_denominator`` (or plan-wide
+    ``numerator``/``denominator``) for ratio_recompute. Unbound inputs → inputs_missing with the
+    missing roles recorded — never a silently degraded plain average/ratio."""
+    if declared is AggregationFunction.weighted_average:
+        if f"{need_role}_weight" in bound_roles or "weight" in bound_roles:
+            return AggregationValidation.sound, None, ()
+        return (AggregationValidation.inputs_missing, ReasonCode.aggregation_weight_missing,
+                (f"{need_role}_weight",))
+    if declared is AggregationFunction.ratio_recompute:
+        missing = tuple(
+            f"{need_role}_{part}" for part in ("numerator", "denominator")
+            if f"{need_role}_{part}" not in bound_roles and part not in bound_roles)
+        if missing:
+            return (AggregationValidation.inputs_missing,
+                    ReasonCode.aggregation_components_missing, missing)
+        return AggregationValidation.sound, None, ()
+    # any other declared function reaching here has no compatibility proof — fail closed
+    return (AggregationValidation.incompatible,
+            ReasonCode.aggregation_incompatible_with_additivity, ())
+
+
+def _validate_stage(
+        selected: AdditivityClass, declared: AggregationFunction | None,
+        time_axis_aggregating: bool, need_role: str, bound_roles: frozenset[str],
+) -> tuple[AggregationValidation, ReasonCode | None, tuple[str, ...]]:
+    """The §4 validation matrix for ONE measure stage on a fan-in hop:
+    (validation, matrix reason, missing_inputs)."""
+    if selected is AdditivityClass.not_applicable:
+        # a non-aggregating measure sitting on a fan-in hop is structurally wrong on ANY axis
+        return AggregationValidation.incompatible, ReasonCode.aggregation_axis_unsupported, ()
+    if selected is AdditivityClass.unknown:
+        # unknown is NEVER treated as additive, and no declared function can be validated
+        # against an unknown additivity — honest undeclared, no silent SUM
+        return AggregationValidation.undeclared, ReasonCode.aggregation_strategy_missing, ()
+    if selected is AdditivityClass.additive:
+        if declared is None or declared is AggregationFunction.sum \
+                or declared in _ORDER_SAFE_DECLARED:
+            return AggregationValidation.sound, None, ()    # undeclared → the versioned SUM rule
+        return (AggregationValidation.incompatible,
+                ReasonCode.aggregation_incompatible_with_additivity, ())
+    if selected is AdditivityClass.semi_additive:
+        if declared is None:
+            if time_axis_aggregating:   # a stock rolled ACROSS time needs a declared strategy
+                return (AggregationValidation.undeclared,
+                        ReasonCode.semi_additive_temporal_strategy_missing, ())
+            return AggregationValidation.sound, None, ()    # entity-axis single-PIT SUM rule
+        if declared is AggregationFunction.sum:
+            if time_axis_aggregating:   # the classic error: summing a balance over a window
+                return (AggregationValidation.incompatible,
+                        ReasonCode.aggregation_incompatible_with_additivity, ())
+            return AggregationValidation.sound, None, ()
+        if declared is AggregationFunction.take_latest or declared in _ORDER_SAFE_DECLARED:
+            return AggregationValidation.sound, None, ()
+        return _validate_declared_inputs(declared, need_role, bound_roles)
+    # non_additive: no sound default exists — everything must be declared and provable
+    if declared is None:
+        return AggregationValidation.undeclared, ReasonCode.aggregation_strategy_missing, ()
+    if declared is AggregationFunction.sum:
+        return (AggregationValidation.incompatible,
+                ReasonCode.aggregation_incompatible_with_additivity, ())
+    if declared is AggregationFunction.take_latest or declared in _ORDER_SAFE_DECLARED:
+        return AggregationValidation.sound, None, ()
+    return _validate_declared_inputs(declared, need_role, bound_roles)
+
+
+def compile_aggregation(
+        ctx: CompilerContext, plan: BindingPlanV1, template: Template,
+        temporal: TemporalDeclarationV1,
+        placement: Mapping[str, PathPositionV1]) -> tuple[HopAggregationV1, ...]:
+    """Per-(hop × ingredient) aggregation evidence for every FAN-IN hop of the plan's path. A hop
+    is fan-in when its PHYSICAL cardinality (realization / bridge-construction — never the
+    semantic segment string) is many_to_one/many_to_many; a hop whose cardinality the context
+    cannot resolve is kept fail-closed (its stages carry ``physical_cardinality_unavailable``);
+    a provably 1:1 / 1:N hop needs no aggregation and emits nothing. The execution site is the
+    hop's TO-side table (the realization's to-table / the bridge's far endpoint table — not the
+    C2 diagnostic placement map). Each MEASURE ingredient (join_role=measure; keys/time are never
+    aggregated) is staged EXACTLY ONCE, at the FIRST fan-in hop at/after its placement position —
+    whether that hop's OUTPUT re-aggregates at later hops is C5's composition guard. Deterministic:
+    hops by segment_index, stages by need_role. Pure over ``ctx`` — no connection."""
+    del template    # uniform check signature; the template's OUTPUT additivity is C5's input
+    hops: list[tuple[int, int, BindingPathSegmentV1,
+                     Cardinality | None, str, tuple[str, ...], str, str]] = []
+    for sem_idx, seg_idx, announce, realizer in _semantic_hops(plan):
+        card, source, keys, exec_cat, exec_table = _hop_evidence(
+            ctx, realizer if realizer is not None else announce)
+        if card in (Cardinality.ONE_TO_ONE, Cardinality.ONE_TO_MANY):
+            continue    # provably no fan-in — nothing aggregates at this hop
+        hops.append((sem_idx, seg_idx, announce, card, source, keys, exec_cat, exec_table))
+
+    bound_roles = frozenset(b.need_role for b in plan.ingredient_bindings)
+    measure_role = str(JoinRole.MEASURE)
+    stages_by_hop: dict[int, list[IngredientAggregationV1]] = {h[1]: [] for h in hops}
+    for b in sorted(plan.ingredient_bindings, key=lambda x: x.need_role):
+        if b.join_role != measure_role:
+            continue    # join-key / source-key / time ingredients are carried, never aggregated
+        pos = placement.get(b.need_role)
+        if pos is None:
+            continue    # off-path — C2 connectivity's verdict, not an aggregation stage
+        hop = next((h for h in hops if h[1] >= pos.segment_index), None)
+        if hop is None:
+            continue    # no fan-in at/after its position — carried at grain, nothing to validate
+        card = hop[3]
+        provenance = resolve_additivity(ctx, b)
+        declared = ctx.agg_declarations.get((plan.recipe_id, b.need_role))
+        codes: list[ReasonCode] = []
+        missing: tuple[str, ...] = ()
+        if card is None:
+            validation = AggregationValidation.undeclared   # can't validate an unknown fan-in
+            codes.append(ReasonCode.physical_cardinality_unavailable)
+        else:
+            validation, matrix_reason, missing = _validate_stage(
+                provenance.selected, declared, temporal.time_axis_aggregating,
+                b.need_role, bound_roles)
+            if matrix_reason is not None:
+                codes.append(matrix_reason)
+        if provenance.conflict:
+            codes.append(ReasonCode.additivity_source_conflict)
+        stages_by_hop[hop[1]].append(IngredientAggregationV1(
+            need_role=b.need_role, bound_object_ref=b.bound_object_ref,
+            additivity=provenance.selected, provenance=provenance, physical_cardinality=card,
+            axis=AggregationAxisKind.entity, declared_function=declared, validation=validation,
+            missing_inputs=missing, reason_codes=canonical_reason_codes(codes)))
+
+    return tuple(
+        HopAggregationV1(
+            semantic_hop_index=sem_idx, segment_index=seg_idx,
+            from_entity=announce.from_entity or "", to_entity=announce.to_entity or "",
+            execution_catalog=exec_cat, execution_table=exec_table,
+            physical_cardinality=card, cardinality_source=source, grouping_keys=keys,
+            ingredient_stages=tuple(stages_by_hop[seg_idx]))
+        for sem_idx, seg_idx, announce, card, source, keys, exec_cat, exec_table in hops)

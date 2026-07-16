@@ -27,8 +27,12 @@ from featuregen.overlay.upload.planner.declarations import (
     CompilerContext,
     PathPositionV1,
     check_connectivity,
+    compile_aggregation,
     compile_temporal,
+    hop_physical_cardinality,
+    resolve_additivity,
 )
+from featuregen.overlay.upload.taxonomy.entity_relationships import Cardinality
 from featuregen.overlay.upload.templates import Need, Template, _load_columns
 
 _NOW = datetime(2026, 7, 16, 12, 0, tzinfo=UTC)
@@ -64,9 +68,11 @@ def _txn_core(db):
     ])
 
 
-def _ctx(db, *catalogs: str) -> CompilerContext:
+def _ctx(db, *catalogs: str,
+         agg: dict[tuple[str, str], c.AggregationFunction] | None = None) -> CompilerContext:
     """The C2 test constructor — batch-loads via the REAL loaders, then drops the connection.
-    (The per-run production builder `build_compiler_context` is C8.)"""
+    (The per-run production builder `build_compiler_context` is C8.) ``agg`` injects the declared
+    aggregation-function registry (F5) — EMPTY in production, populated only by tests."""
     return CompilerContext(
         realizations_by_catalog={
             s: derive_catalog_realizations(db, s).realizations for s in catalogs},
@@ -80,7 +86,7 @@ def _ctx(db, *catalogs: str) -> CompilerContext:
         config=_overlay_config(),
         roles=(),
         now=_NOW,
-        agg_declarations={})
+        agg_declarations=agg or {})
 
 
 def _binding(role, obj_ref, *, join_role=str(JoinRole.MEASURE), catalog="core",
@@ -103,11 +109,11 @@ def _plan(bindings, segments):
         preference_rank=0, preference_reasons=(), candidate_role=c.CandidateRole.unranked)
 
 
-def _rollup_segments(realization_id):
+def _rollup_segments(realization_id, *, from_entity="transaction", to_entity="account"):
     """The assembler's per-hop emission shape: semantic_rollup (no refs) + the realizer."""
     return (
         c.BindingPathSegmentV1(c.SegmentKind.semantic_rollup, "core",
-                               from_entity="transaction", to_entity="account",
+                               from_entity=from_entity, to_entity=to_entity,
                                cardinality="many_to_one"),
         c.BindingPathSegmentV1(c.SegmentKind.intra_catalog_realization, "core",
                                realization_ref=realization_id),
@@ -425,3 +431,442 @@ def test_temporal_same_role_anchors_on_one_column_are_one_anchor():
     assert out.pit_anchor == str(TemporalRole.EVENT_TIME)
     assert out.anchor_binding == "public.transactions.event_ts"
     assert out.reason_codes == ()
+
+
+# ─── C4: per-ingredient aggregation + additivity + physical/bridge cardinality ────────────────
+# compile_aggregation VALIDATES, never fabricates: the only auto-derivations are the two SUM rules
+# (additive fan-in; semi_additive entity-axis single-PIT), both expressed as validation=sound with
+# declared_function=None — SUM is never written into the DECLARED slot. Every other function must
+# come from the injected ctx.agg_declarations registry (empty in production).
+
+def _acct_core(db):
+    """core: accounts (account grain) rolls up N:1 to customers (customer grain). The measure
+    columns cover every additivity class: concept-additive (amount), concept-semi-additive
+    (balance), concept-non-additive (rate), an uploaded override that CONFLICTS with its concept
+    (forced), an unrecognized uploaded value (weird), and a non-aggregating categorical (product)."""
+    _seed(db, "core", [
+        (CanonicalRow("core", "accounts", "account_id", "integer", is_grain=True), "account_id"),
+        (CanonicalRow("core", "accounts", "customer_id", "integer",
+                      joins_to="customers.customer_id", cardinality="N:1"), "customer_id"),
+        (CanonicalRow("core", "accounts", "amount", "numeric"), "monetary_flow"),
+        (CanonicalRow("core", "accounts", "balance", "numeric"), "monetary_stock"),
+        (CanonicalRow("core", "accounts", "rate", "numeric"), "monetary_rate"),
+        (CanonicalRow("core", "accounts", "rate_weight", "numeric"), "monetary_flow"),
+        (CanonicalRow("core", "accounts", "forced", "numeric", additivity="non_additive"),
+         "monetary_flow"),
+        (CanonicalRow("core", "accounts", "weird", "numeric", additivity="entangled"),
+         "monetary_flow"),
+        (CanonicalRow("core", "accounts", "product", "text"), "product_type"),
+        (CanonicalRow("core", "customers", "customer_id", "integer", is_grain=True), "customer_id"),
+    ])
+
+
+_T_C4 = _template(
+    "c4_agg_probe",
+    needs=(Need("m", "monetary_flow"), Need("entity", "customer_id")), params={})
+
+
+def _temporal(*, aggregating: bool) -> c.TemporalDeclarationV1:
+    """The C3 output shape C4 consumes: a single-PIT read (False) vs a trailing-window
+    time-axis-aggregating recipe (True)."""
+    return c.TemporalDeclarationV1(
+        pit_anchor=str(TemporalRole.AS_OF_TIME), anchor_binding=None,
+        window=c.WindowSpecV1(90, "days", "trailing", True) if aggregating else None,
+        param_binding=c.ParamBindingV1(values=(), is_representative=True),
+        time_axis_aggregating=aggregating, reason_codes=())
+
+
+def _c4_plan(ctx, *measure_bindings):
+    """A source-key-anchored account→customer roll-up plan over _acct_core's one realization."""
+    (r,) = ctx.realizations_by_catalog["core"]
+    return _plan(
+        bindings=(_binding("source_key", "public.accounts.customer_id",
+                           join_role=str(JoinRole.SOURCE_ENTITY_KEY), concept="customer_id"),
+                  *measure_bindings),
+        segments=_rollup_segments(r.realization_id, from_entity="account", to_entity="customer"))
+
+
+def _c4_compile(ctx, plan, *, aggregating=False):
+    return compile_aggregation(ctx, plan, _T_C4, _temporal(aggregating=aggregating),
+                               check_connectivity(ctx, plan).placement)
+
+
+def test_additive_fan_in_undeclared_is_sound_sum_default(db):
+    # §4 bank example 1: transaction_amount (additive), fan-in, undeclared → sound (SUM default).
+    _acct_core(db)
+    ctx = _ctx(db, "core")
+    plan = _c4_plan(ctx, _binding("amount", "public.accounts.amount"))
+    (hop,) = _c4_compile(ctx, plan)
+    assert (hop.semantic_hop_index, hop.segment_index) == (0, 1)
+    assert (hop.from_entity, hop.to_entity) == ("account", "customer")
+    assert hop.physical_cardinality is Cardinality.MANY_TO_ONE
+    assert hop.cardinality_source == "realization"
+    assert hop.grouping_keys == ("public.customers.customer_id",)    # the realization's to-key
+    assert (hop.execution_catalog, hop.execution_table) == ("core", "public.customers")
+    (stage,) = hop.ingredient_stages     # the source key is NEVER an aggregation stage
+    assert stage.need_role == "amount"
+    assert stage.additivity is c.AdditivityClass.additive
+    assert stage.axis is c.AggregationAxisKind.entity
+    assert stage.physical_cardinality is Cardinality.MANY_TO_ONE
+    assert stage.validation is c.AggregationValidation.sound
+    # SUM is the VERSIONED auto-derivation (AGGREGATION_RULE_VERSION) — never fabricated into
+    # the declared slot: an absent declaration stays honestly None.
+    assert stage.declared_function is None
+    assert stage.reason_codes == () and stage.missing_inputs == ()
+
+
+def test_non_additive_declared_sum_is_incompatible(db):
+    # §4 bank example 2: interest_rate (non_additive), fan-in, registry-declared SUM → incompatible.
+    _acct_core(db)
+    ctx = _ctx(db, "core", agg={("r1", "rate"): c.AggregationFunction.sum})
+    plan = _c4_plan(ctx, _binding("rate", "public.accounts.rate", concept="monetary_rate"))
+    (hop,) = _c4_compile(ctx, plan)
+    (stage,) = hop.ingredient_stages
+    assert stage.additivity is c.AdditivityClass.non_additive
+    assert stage.declared_function is c.AggregationFunction.sum
+    assert stage.validation is c.AggregationValidation.incompatible
+    assert stage.reason_codes == (c.ReasonCode.aggregation_incompatible_with_additivity,)
+
+
+def test_non_additive_undeclared_is_strategy_missing(db):
+    # §4 bank example 3: interest_rate (non_additive), fan-in, undeclared → undeclared.
+    _acct_core(db)
+    ctx = _ctx(db, "core")
+    plan = _c4_plan(ctx, _binding("rate", "public.accounts.rate", concept="monetary_rate"))
+    (hop,) = _c4_compile(ctx, plan)
+    (stage,) = hop.ingredient_stages
+    assert stage.validation is c.AggregationValidation.undeclared
+    assert stage.declared_function is None
+    assert stage.reason_codes == (c.ReasonCode.aggregation_strategy_missing,)
+
+
+def test_non_additive_weighted_average_with_weight_unbound_is_inputs_missing(db):
+    # §4 bank example 4: declared weighted_average, weight NOT bound → inputs_missing with the
+    # missing role recorded.
+    _acct_core(db)
+    ctx = _ctx(db, "core", agg={("r1", "rate"): c.AggregationFunction.weighted_average})
+    plan = _c4_plan(ctx, _binding("rate", "public.accounts.rate", concept="monetary_rate"))
+    (hop,) = _c4_compile(ctx, plan)
+    (stage,) = hop.ingredient_stages
+    assert stage.validation is c.AggregationValidation.inputs_missing
+    assert stage.reason_codes == (c.ReasonCode.aggregation_weight_missing,)
+    assert stage.missing_inputs == ("rate_weight",)
+
+
+def test_non_additive_weighted_average_with_weight_bound_is_sound(db):
+    # the converse: the declared weight role ("<role>_weight") IS bound → the input check passes.
+    # Stages stay sorted by need_role (rate, rate_weight) — determinism.
+    _acct_core(db)
+    ctx = _ctx(db, "core", agg={("r1", "rate"): c.AggregationFunction.weighted_average})
+    plan = _c4_plan(ctx,
+                    _binding("rate", "public.accounts.rate", concept="monetary_rate"),
+                    _binding("rate_weight", "public.accounts.rate_weight"))
+    (hop,) = _c4_compile(ctx, plan)
+    assert [s.need_role for s in hop.ingredient_stages] == ["rate", "rate_weight"]
+    rate_stage = hop.ingredient_stages[0]
+    assert rate_stage.validation is c.AggregationValidation.sound
+    assert rate_stage.declared_function is c.AggregationFunction.weighted_average
+    assert rate_stage.missing_inputs == () and rate_stage.reason_codes == ()
+
+
+def test_non_additive_ratio_recompute_components_missing(db):
+    # declared ratio_recompute with neither component bound → inputs_missing, BOTH roles recorded.
+    _acct_core(db)
+    ctx = _ctx(db, "core", agg={("r1", "rate"): c.AggregationFunction.ratio_recompute})
+    plan = _c4_plan(ctx, _binding("rate", "public.accounts.rate", concept="monetary_rate"))
+    (hop,) = _c4_compile(ctx, plan)
+    (stage,) = hop.ingredient_stages
+    assert stage.validation is c.AggregationValidation.inputs_missing
+    assert stage.reason_codes == (c.ReasonCode.aggregation_components_missing,)
+    assert stage.missing_inputs == ("rate_numerator", "rate_denominator")
+
+
+def test_semi_additive_single_pit_entity_rollup_is_sound(db):
+    # §4 bank example 5: balance (semi_additive), entity roll-up at a single PIT → sound (SUM).
+    _acct_core(db)
+    ctx = _ctx(db, "core")
+    plan = _c4_plan(ctx, _binding("balance", "public.accounts.balance", concept="monetary_stock"))
+    (hop,) = _c4_compile(ctx, plan, aggregating=False)
+    (stage,) = hop.ingredient_stages
+    assert stage.additivity is c.AdditivityClass.semi_additive
+    assert stage.validation is c.AggregationValidation.sound
+    assert stage.declared_function is None      # the second versioned auto-derivation
+    assert stage.reason_codes == ()
+
+
+def test_semi_additive_across_window_is_temporal_strategy_missing(db):
+    # §4 bank example 6: balance (semi_additive) summed across a 90-day window with NO declared
+    # temporal strategy → undeclared.
+    _acct_core(db)
+    ctx = _ctx(db, "core")
+    plan = _c4_plan(ctx, _binding("balance", "public.accounts.balance", concept="monetary_stock"))
+    (hop,) = _c4_compile(ctx, plan, aggregating=True)
+    (stage,) = hop.ingredient_stages
+    assert stage.validation is c.AggregationValidation.undeclared
+    assert stage.reason_codes == (c.ReasonCode.semi_additive_temporal_strategy_missing,)
+
+
+def test_semi_additive_across_window_declared_strategy_validates(db):
+    # a DECLARED temporal strategy resolves the across-window case: take_latest is sound; a
+    # declared SUM of a stock over time stays incompatible (the classic balance-summing error).
+    _acct_core(db)
+    ctx = _ctx(db, "core", agg={("r1", "balance"): c.AggregationFunction.take_latest})
+    plan = _c4_plan(ctx, _binding("balance", "public.accounts.balance", concept="monetary_stock"))
+    (hop,) = _c4_compile(ctx, plan, aggregating=True)
+    (stage,) = hop.ingredient_stages
+    assert stage.validation is c.AggregationValidation.sound
+    assert stage.declared_function is c.AggregationFunction.take_latest
+
+    ctx_sum = _ctx(db, "core", agg={("r1", "balance"): c.AggregationFunction.sum})
+    (hop2,) = _c4_compile(ctx_sum, _c4_plan(
+        ctx_sum, _binding("balance", "public.accounts.balance", concept="monetary_stock")),
+        aggregating=True)
+    (stage2,) = hop2.ingredient_stages
+    assert stage2.validation is c.AggregationValidation.incompatible
+    assert stage2.reason_codes == (c.ReasonCode.aggregation_incompatible_with_additivity,)
+
+
+def test_additivity_precedence_uploaded_beats_concept(db):
+    # §4.1 precedence: an uploaded column additivity outranks the concept's; an UNSTATED upload
+    # (stored NULL) falls through to the concept.
+    _acct_core(db)
+    ctx = _ctx(db, "core")
+    prov = resolve_additivity(ctx, _binding("forced", "public.accounts.forced"))
+    assert prov.selected is c.AdditivityClass.non_additive
+    assert prov.source is c.AdditivitySource.uploaded_column
+    assert prov.conflict is True
+    assert prov.uploaded_value == "non_additive" and prov.concept_value == "additive"   # F15: BOTH raw values kept
+    prov2 = resolve_additivity(ctx, _binding("amount", "public.accounts.amount"))
+    assert prov2.selected is c.AdditivityClass.additive
+    assert prov2.source is c.AdditivitySource.concept
+    assert prov2.conflict is False and prov2.uploaded_value is None
+
+
+def test_additivity_unknown_when_neither_source_asserts(db):
+    # no resolvable column AND no registry concept → honest unknown/unknown, never a guess.
+    _acct_core(db)
+    ctx = _ctx(db, "core")
+    prov = resolve_additivity(
+        ctx, _binding("ghost", "public.accounts.missing", concept="not_a_concept"))
+    assert prov.selected is c.AdditivityClass.unknown
+    assert prov.source is c.AdditivitySource.unknown
+    assert prov.uploaded_value is None and prov.concept_value is None
+    assert prov.conflict is False
+
+
+def test_conflict_carries_reason_and_both_values_on_the_stage(db):
+    # uploaded non_additive vs concept additive: the uploaded value WINS the validation (undeclared
+    # non-additive → strategy missing) and the conflict is auditable on the stage — the reason code
+    # plus both raw values in provenance, never silently resolved.
+    _acct_core(db)
+    ctx = _ctx(db, "core")
+    plan = _c4_plan(ctx, _binding("forced", "public.accounts.forced"))
+    (hop,) = _c4_compile(ctx, plan)
+    (stage,) = hop.ingredient_stages
+    assert stage.additivity is c.AdditivityClass.non_additive
+    assert stage.validation is c.AggregationValidation.undeclared
+    assert stage.reason_codes == (c.ReasonCode.aggregation_strategy_missing,
+                                  c.ReasonCode.additivity_source_conflict)
+    assert stage.provenance.conflict is True
+    assert (stage.provenance.uploaded_value, stage.provenance.concept_value) \
+        == ("non_additive", "additive")
+
+
+def test_unknown_additivity_is_never_treated_as_additive(db):
+    # an unrecognized uploaded value resolves to unknown — which NEVER silently aggregates, even
+    # when a function IS declared (compatibility can't be validated against unknown). The
+    # unparseable upload also genuinely disagrees with the concept → conflict is flagged.
+    _acct_core(db)
+    ctx = _ctx(db, "core", agg={("r1", "weird"): c.AggregationFunction.sum})
+    plan = _c4_plan(ctx, _binding("weird", "public.accounts.weird"))
+    (hop,) = _c4_compile(ctx, plan)
+    (stage,) = hop.ingredient_stages
+    assert stage.additivity is c.AdditivityClass.unknown
+    assert stage.provenance.source is c.AdditivitySource.uploaded_column
+    assert stage.validation is c.AggregationValidation.undeclared
+    assert stage.reason_codes == (c.ReasonCode.aggregation_strategy_missing,
+                                  c.ReasonCode.additivity_source_conflict)
+
+
+def test_non_aggregating_measure_on_fan_in_is_axis_unsupported(db):
+    # additivity n/a (a categorical) sitting on a fan-in hop → incompatible: the measure does not
+    # aggregate on ANY axis.
+    _acct_core(db)
+    ctx = _ctx(db, "core")
+    plan = _c4_plan(ctx, _binding("product", "public.accounts.product", concept="product_type"))
+    (hop,) = _c4_compile(ctx, plan)
+    (stage,) = hop.ingredient_stages
+    assert stage.additivity is c.AdditivityClass.not_applicable
+    assert stage.provenance.source is c.AdditivitySource.concept
+    assert stage.validation is c.AggregationValidation.incompatible
+    assert stage.reason_codes == (c.ReasonCode.aggregation_axis_unsupported,)
+
+
+def test_realized_hop_uses_realization_cardinality_not_the_segment_string(db):
+    # F4/F8: the REALIZATION's declared_cardinality is the physical authority — the semantic
+    # segment's cardinality string (here "many_to_one") is never consulted. A 1:1 realization
+    # means NO fan-in: the same plan compiles to zero aggregation hops.
+    _acct_core(db)
+    ctx = _ctx(db, "core")
+    (r,) = ctx.realizations_by_catalog["core"]
+    seg = c.BindingPathSegmentV1(c.SegmentKind.intra_catalog_realization, "core",
+                                 realization_ref=r.realization_id)
+    assert hop_physical_cardinality(ctx, seg) == (
+        Cardinality.MANY_TO_ONE, "realization", ("public.customers.customer_id",))
+
+    r11 = dataclasses.replace(r, declared_cardinality=Cardinality.ONE_TO_ONE)
+    ctx11 = dataclasses.replace(ctx, realizations_by_catalog={"core": (r11,)})
+    assert hop_physical_cardinality(ctx11, seg)[0] is Cardinality.ONE_TO_ONE
+    plan = _c4_plan(ctx11, _binding("amount", "public.accounts.amount"))
+    assert _c4_compile(ctx11, plan) == ()
+
+
+def _bridge_core_crm(db):
+    """core.accounts holds a customer-keyed FK bridged (VERIFIED) to crm.customers — the
+    E2-key-FK → E2-grain-table construction of a governed roll-up bridge."""
+    _seed(db, "core", [
+        (CanonicalRow("core", "accounts", "account_id", "integer", is_grain=True), "account_id"),
+        (CanonicalRow("core", "accounts", "customer_id", "integer"), "customer_id"),
+        (CanonicalRow("core", "accounts", "balance", "numeric"), "monetary_stock"),
+    ])
+    _seed(db, "crm", [
+        (CanonicalRow("crm", "customers", "customer_id", "integer", is_grain=True), "customer_id"),
+        (CanonicalRow("crm", "customers", "spend", "numeric"), "monetary_flow"),
+    ])
+    db.execute(
+        "INSERT INTO entity_bridge_edge (fact_key, entity_id, left_catalog_source, left_object_ref,"
+        " right_catalog_source, right_object_ref, status) VALUES (%s,%s,%s,%s,%s,%s,'VERIFIED')",
+        ("bridge:customer:c4", "customer", "core", "public.accounts.customer_id",
+         "crm", "public.customers.customer_id"))
+
+
+def test_bridge_rollup_hop_is_many_to_one_by_construction(db):
+    # a bridge-rollup hop has NO realization — its fan-in is many_to_one BY CONSTRUCTION (an
+    # E2-key FK column linked to an E2-grain far table); the far (target-grain) endpoint is the
+    # GROUP-BY key and the execution site.
+    _bridge_core_crm(db)
+    ctx = _ctx(db, "core", "crm")
+    plan = _plan(
+        bindings=(
+            _binding("source_key", "public.accounts.customer_id",
+                     join_role=str(JoinRole.SOURCE_ENTITY_KEY), concept="customer_id"),
+            _binding("balance", "public.accounts.balance", concept="monetary_stock"),
+        ),
+        segments=(
+            c.BindingPathSegmentV1(c.SegmentKind.semantic_rollup, "core",
+                                   from_entity="account", to_entity="customer",
+                                   cardinality="many_to_one"),
+            c.BindingPathSegmentV1(c.SegmentKind.governed_bridge, "crm",
+                                   from_entity="account", to_entity="customer",
+                                   bridge_fact_key="bridge:customer:c4"),
+        ))
+    assert hop_physical_cardinality(ctx, plan.path_segments[1]) == (
+        Cardinality.MANY_TO_ONE, "bridge_construction", ("public.customers.customer_id",))
+    (hop,) = _c4_compile(ctx, plan)
+    assert (hop.semantic_hop_index, hop.segment_index) == (0, 1)
+    assert hop.physical_cardinality is Cardinality.MANY_TO_ONE
+    assert hop.cardinality_source == "bridge_construction"
+    assert hop.grouping_keys == ("public.customers.customer_id",)
+    assert (hop.execution_catalog, hop.execution_table) == ("crm", "public.customers")
+    (stage,) = hop.ingredient_stages
+    assert stage.need_role == "balance"
+    assert stage.validation is c.AggregationValidation.sound    # semi_additive, single-PIT
+
+    # an unknown fact key resolves NOTHING — fail closed, never many_to_one on faith
+    ghost = c.BindingPathSegmentV1(c.SegmentKind.governed_bridge, "crm",
+                                   from_entity="account", to_entity="customer",
+                                   bridge_fact_key="bridge:customer:ghost")
+    assert hop_physical_cardinality(ctx, ghost) == (None, "unavailable", ())
+
+
+def test_reposition_bridge_is_not_an_aggregation_hop(db):
+    # a same-entity governed_bridge (reposition) crosses on the GRAIN key — 1:1 by construction,
+    # no fan-in, never an aggregation hop.
+    _bridge_core_crm(db)
+    ctx = _ctx(db, "core", "crm")
+    plan = _plan(
+        bindings=(
+            _binding("source_key", "public.accounts.customer_id",
+                     join_role=str(JoinRole.SOURCE_ENTITY_KEY), concept="customer_id"),
+            _binding("spend", "public.customers.spend", catalog="crm"),
+        ),
+        segments=(
+            c.BindingPathSegmentV1(c.SegmentKind.governed_bridge, "crm",
+                                   from_entity="customer", to_entity="customer",
+                                   bridge_fact_key="bridge:customer:c4"),
+        ))
+    assert _c4_compile(ctx, plan) == ()
+
+
+def test_unrealized_hop_fails_closed_as_cardinality_unavailable(db):
+    # matrix row 1: no physical evidence (a bare semantic_rollup, or a realizer whose ref the
+    # context cannot resolve) → the hop compiles with cardinality None and every stage honestly
+    # undeclared/physical_cardinality_unavailable — never a guessed fan-in.
+    _acct_core(db)
+    ctx = _ctx(db, "core")
+    bare = c.BindingPathSegmentV1(c.SegmentKind.semantic_rollup, "core",
+                                  from_entity="account", to_entity="customer",
+                                  cardinality="many_to_one")
+    assert hop_physical_cardinality(ctx, bare) == (None, "unavailable", ())
+    src = _binding("source_key", "public.accounts.customer_id",
+                   join_role=str(JoinRole.SOURCE_ENTITY_KEY), concept="customer_id")
+    bal = _binding("balance", "public.accounts.balance", concept="monetary_stock")
+    (hop,) = _c4_compile(ctx, _plan(bindings=(src, bal), segments=(bare,)))
+    assert hop.physical_cardinality is None
+    assert hop.cardinality_source == "unavailable"
+    assert hop.grouping_keys == () and hop.execution_table == ""
+    (stage,) = hop.ingredient_stages
+    assert stage.validation is c.AggregationValidation.undeclared
+    assert stage.reason_codes == (c.ReasonCode.physical_cardinality_unavailable,)
+
+    (hop2,) = _c4_compile(ctx, _plan(
+        bindings=(src, bal),
+        segments=_rollup_segments("core:no.such->ref", from_entity="account",
+                                  to_entity="customer")))
+    assert hop2.physical_cardinality is None and hop2.cardinality_source == "unavailable"
+    (stage2,) = hop2.ingredient_stages
+    assert stage2.reason_codes == (c.ReasonCode.physical_cardinality_unavailable,)
+
+
+def _chain_core(db):
+    """core: transactions → accounts → customers, both roll-ups N:1 — the two-fan-in-hop chain."""
+    _seed(db, "core", [
+        (CanonicalRow("core", "transactions", "transaction_id", "integer", is_grain=True),
+         "transaction_id"),
+        (CanonicalRow("core", "transactions", "account_id", "integer",
+                      joins_to="accounts.account_id", cardinality="N:1"), "account_id"),
+        (CanonicalRow("core", "transactions", "amount", "numeric"), "monetary_flow"),
+        (CanonicalRow("core", "accounts", "account_id", "integer", is_grain=True), "account_id"),
+        (CanonicalRow("core", "accounts", "customer_id", "integer",
+                      joins_to="customers.customer_id", cardinality="N:1"), "customer_id"),
+        (CanonicalRow("core", "accounts", "balance", "numeric"), "monetary_stock"),
+        (CanonicalRow("core", "customers", "customer_id", "integer", is_grain=True), "customer_id"),
+    ])
+
+
+def test_measures_assigned_once_to_first_fan_in_hop_and_hops_ordered(db):
+    # each measure is staged EXACTLY ONCE, at the FIRST fan-in hop at/after its placement
+    # position: amount (placed at the source table, position 0) and balance (placed at hop 1's
+    # to-table, position 1) both stage at the first hop; the second fan-in hop carries no stages
+    # here — whether hop 1's OUTPUT may be re-aggregated at hop 2 is C5's composition guard, not a
+    # duplicate stage. Hops are ordered by segment_index; stages by need_role.
+    _chain_core(db)
+    ctx = _ctx(db, "core")
+    by_from = {r.from_object_ref: r for r in ctx.realizations_by_catalog["core"]}
+    r_txn, r_acct = by_from["public.transactions"], by_from["public.accounts"]
+    plan = _plan(
+        bindings=(
+            _binding("source_key", "public.transactions.account_id",
+                     join_role=str(JoinRole.SOURCE_ENTITY_KEY), concept="account_id"),
+            _binding("balance", "public.accounts.balance", concept="monetary_stock"),
+            _binding("amount", "public.transactions.amount"),
+        ),
+        segments=(*_rollup_segments(r_txn.realization_id),
+                  *_rollup_segments(r_acct.realization_id, from_entity="account",
+                                    to_entity="customer")))
+    hops = _c4_compile(ctx, plan)
+    assert [(h.semantic_hop_index, h.segment_index) for h in hops] == [(0, 1), (1, 3)]
+    assert [s.need_role for s in hops[0].ingredient_stages] == ["amount", "balance"]
+    assert hops[1].ingredient_stages == ()
+    assert (hops[0].from_entity, hops[0].to_entity) == ("transaction", "account")
+    assert (hops[1].from_entity, hops[1].to_entity) == ("account", "customer")
