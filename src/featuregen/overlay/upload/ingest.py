@@ -57,7 +57,11 @@ from featuregen.overlay.upload.source_profile import (
     SourceCapabilityProfile,
     strength_for,
 )
-from featuregen.overlay.upload.stage_report import StageRecorder, record_stage
+from featuregen.overlay.upload.stage_report import (
+    StageRecorder,
+    record_skipped_downstream,
+    record_stage,
+)
 from featuregen.overlay.upload.table_fact_projection import project_table_facts
 from featuregen.overlay.upload.taxonomy_evidence import derive_concept_evidence
 from featuregen.overlay.upload.upload_catalog import (
@@ -832,6 +836,9 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
             persist_quarantine(conn, catalog_source, vr.quarantined)
             record_stage(stage_recorder, "quarantine", "succeeded",
                          detail={"rows": len(vr.quarantined)}, started_at=stage_started)
+        # #13 gap B: the stage account stays COMPLETE — everything downstream honestly not_run.
+        record_skipped_downstream(stage_recorder, reason_code="skipped_rejected",
+                                  is_glossary=glossary is not None)
         return IngestResult("rejected", vr.structural_error, 0, 0, len(vr.quarantined))
     # ANY quarantined row makes validation `partial`, not `succeeded` — per-row failures are the
     # stage's own outcome even though the upload proceeds on the good rows (#22).
@@ -856,6 +863,9 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
             record_stage(stage_recorder, "quarantine", "succeeded",
                          detail={"rows": len(vr.quarantined)}, started_at=stage_started)
         logger.warning("upload of %r held by the large-change brake: %s", catalog_source, brake.reason)
+        # #13 gap B: report the stages the hold skipped as not_run — a complete, honest account.
+        record_skipped_downstream(stage_recorder, reason_code="skipped_upload_held",
+                                  is_glossary=glossary is not None)
         return IngestResult("held", brake.reason, 0, 0, len(vr.quarantined))
     record_stage(stage_recorder, "brake", "succeeded", started_at=stage_started)
 
@@ -871,6 +881,9 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
         persist_quarantine(conn, catalog_source, vr.quarantined)
         record_stage(stage_recorder, "quarantine", "succeeded",
                      detail={"rows": len(vr.quarantined)}, started_at=stage_started)
+        # #13 gap B: the stage account stays COMPLETE — everything downstream honestly not_run.
+        record_skipped_downstream(stage_recorder, reason_code="skipped_rejected",
+                                  is_glossary=glossary is not None)
         return IngestResult(
             "rejected",
             f"no rows could be ingested — all {len(vr.quarantined)} quarantined "

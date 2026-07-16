@@ -288,13 +288,24 @@ def test_quarantining_upload_reports_validation_partial(client):
     assert stages["quarantine"]["detail"] == {"rows": 1}
 
 
-def test_held_upload_reports_brake_deferred_and_stops(client):
+def test_held_upload_reports_downstream_stages_not_run(client):
+    """#13 gap B: a HELD upload's run reports the skipped downstream stages as ``not_run``
+    (reason ``skipped_upload_held``) — a COMPLETE account, not a truncated one."""
     upload_csv(client, "deposits", DEPOSITS_CSV)
     res = upload_csv(client, "deposits", TINY_CSV)
     assert res.json()["status"] == "held"
     run = _get_run(client, res.headers[RUN_HEADER]).json()
-    assert [(s["stage"], s["state"]) for s in run["stages"]] == [
+    stages = {s["stage"]: s for s in run["stages"]}
+    assert [(s["stage"], s["state"]) for s in run["stages"][:3]] == [
         ("parse", "succeeded"), ("validation", "succeeded"), ("brake", "deferred")]
+    for name in ("fact_assertion", "drift", "enrich_concept", "enrich_definition",
+                 "enrich_domain", "graph_persistence", "governed_joins", "pass_c", "pass_b",
+                 "projection_drain", "table_fact_projection", "join_projection", "join_drift",
+                 "quarantine"):
+        assert stages[name]["state"] == "not_run", name
+        assert stages[name]["reason_code"] == "skipped_upload_held", name
+    assert stages["glossary_classification"]["state"] == "not_applicable"   # not invented
+    assert stages["glossary_evidence"]["state"] == "not_applicable"
 
 
 def test_parse_failure_reports_a_failed_parse_stage(client):

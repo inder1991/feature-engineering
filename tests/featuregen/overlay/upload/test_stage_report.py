@@ -12,7 +12,13 @@ from datetime import UTC, datetime
 
 import pytest
 
-from featuregen.overlay.upload.stage_report import StageRecorder, StageReport, record_stage
+from featuregen.overlay.upload.stage_report import (
+    INGEST_STAGES,
+    StageRecorder,
+    StageReport,
+    record_skipped_downstream,
+    record_stage,
+)
 
 _NOW = datetime(2026, 7, 16, 12, 0, tzinfo=UTC)
 
@@ -85,6 +91,38 @@ def test_stage_report_is_frozen():
     report = StageReport("validation", "succeeded")
     with pytest.raises(Exception):
         report.state = "failed"   # type: ignore[misc]
+
+
+# ── early-exit completeness (#13 gap B) ───────────────────────────────────────────────────────────
+
+
+def test_record_skipped_downstream_marks_unreported_ingest_stages_not_run():
+    rec = StageRecorder()
+    rec.record("validation", "succeeded")
+    rec.record("brake", "deferred", reason_code="held")
+    record_skipped_downstream(rec, reason_code="skipped_upload_held", is_glossary=False)
+    states = {r.stage: (r.state, r.reason_code) for r in rec.reports}
+    assert set(states) == set(INGEST_STAGES)                       # complete: every ingest stage
+    assert states["validation"] == ("succeeded", None)             # already-recorded: untouched
+    assert states["brake"] == ("deferred", "held")
+    assert states["fact_assertion"] == ("not_run", "skipped_upload_held")
+    assert states["quarantine"] == ("not_run", "skipped_upload_held")
+    # glossary stages are genuinely not-applicable for a non-glossary upload — never not_run
+    assert states["glossary_classification"] == ("not_applicable", None)
+    assert states["glossary_evidence"] == ("not_applicable", None)
+
+
+def test_record_skipped_downstream_glossary_upload_marks_glossary_stages_not_run():
+    rec = StageRecorder()
+    rec.record("validation", "failed", reason_code="structural_error")
+    record_skipped_downstream(rec, reason_code="skipped_rejected", is_glossary=True)
+    states = {r.stage: r.state for r in rec.reports}
+    assert states["glossary_classification"] == "not_run"
+    assert states["glossary_evidence"] == "not_run"
+
+
+def test_record_skipped_downstream_none_recorder_is_a_noop():
+    record_skipped_downstream(None, reason_code="skipped_rejected", is_glossary=False)
 
 
 # ── the defensive seam ingest relies on ───────────────────────────────────────────────────────────

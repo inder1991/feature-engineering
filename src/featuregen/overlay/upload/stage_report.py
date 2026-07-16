@@ -41,6 +41,23 @@ STAGE_STATES = frozenset({
     "retrying", "succeeded", "partial", "failed", "deferred", "lagged", "cancelled",
     "audit_degraded"})
 
+# The CANONICAL ordered stage list (#13 gap B) — every stage a run can report, in execution
+# order, defined ONCE. ``connector_pull`` exists only for connector-origin runs (recorded by the
+# integrations import route); ``parse`` is recorded by the routes; ``manifest_finalization`` is
+# appended by the flush itself when the run terminalizes. ``INGEST_STAGES`` is the slice
+# ``ingest_upload`` owns — the stages an early exit must account for.
+CANONICAL_STAGES: tuple[str, ...] = (
+    "connector_pull", "parse",
+    "validation", "brake", "fact_assertion", "drift", "glossary_classification",
+    "enrich_concept", "enrich_definition", "enrich_domain", "graph_persistence",
+    "governed_joins", "pass_c", "pass_b", "glossary_evidence", "projection_drain",
+    "table_fact_projection", "join_projection", "join_drift", "quarantine",
+    "manifest_finalization")
+INGEST_STAGES: tuple[str, ...] = CANONICAL_STAGES[2:-1]
+# Stages that only exist for a glossary upload: at an early exit of a NON-glossary upload they
+# stay honestly ``not_applicable`` — never invented as ``not_run``.
+_GLOSSARY_STAGES = frozenset({"glossary_classification", "glossary_evidence"})
+
 
 @dataclass(frozen=True, slots=True)
 class StageReport:
@@ -135,6 +152,25 @@ class StageRecorder:
                     "durable stage-report flush failed; falling back to the request connection")
         if fallback_conn is not None:
             self.flush(fallback_conn, ingestion_run_id, now=now)
+
+
+def record_skipped_downstream(recorder: StageRecorder | None, *, reason_code: str,
+                              is_glossary: bool) -> None:
+    """At an ingest EARLY EXIT (structural rejection / brake hold / all-quarantined rejection),
+    mark every ingest stage NOT yet recorded as ``not_run`` with the exit's reason, so the run's
+    stage account is COMPLETE — a reader sees "enrich_concept: not_run", never a missing row
+    (#13 gap B). The glossary stages of a non-glossary upload stay ``not_applicable`` (a stage
+    that could never have run is not "skipped by the exit"). Defensive like every recorder seam:
+    a ``None`` recorder no-ops and each record goes through ``record_stage`` (failure-contained)."""
+    if recorder is None:
+        return
+    for stage in INGEST_STAGES:
+        if recorder.has(stage):
+            continue
+        if stage in _GLOSSARY_STAGES and not is_glossary:
+            record_stage(recorder, stage, "not_applicable")
+        else:
+            record_stage(recorder, stage, "not_run", reason_code=reason_code)
 
 
 def record_stage(recorder: StageRecorder | None, stage: str, state: str, *,

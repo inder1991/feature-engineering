@@ -205,10 +205,21 @@ def test_concept_evidence_write_failure_records_partial(db, monkeypatch):
     assert concept.detail["resolved"] == 1
 
 
-# ── early-exit paths ──────────────────────────────────────────────────────────────────────────────
+# ── early-exit paths: the stage account stays COMPLETE (#13 gap B) ────────────────────────────────
+
+# Every stage ingest_upload owns, in execution order — what a COMPLETE run account contains.
+_ALL_INGEST_STAGES = [
+    "validation", "brake", "fact_assertion", "drift", "glossary_classification",
+    "enrich_concept", "enrich_definition", "enrich_domain", "graph_persistence",
+    "governed_joins", "pass_c", "pass_b", "glossary_evidence", "projection_drain",
+    "table_fact_projection", "join_projection", "join_drift", "quarantine"]
 
 
-def test_held_upload_records_brake_deferred_and_stops(db):
+def test_held_upload_records_not_run_for_downstream_stages(db):
+    """#13 gap B: a brake-HELD upload no longer truncates the stage account — every downstream
+    stage is reported ``not_run`` (reason ``skipped_upload_held``) so a reader sees "enrichment:
+    not_run" instead of a missing row. Glossary stages stay ``not_applicable`` (non-glossary
+    upload — never invented as not_run)."""
     _seal_config()
     ingest_upload(db, "deposits", [
         CanonicalRow("deposits", "accounts", c, "integer") for c in "abcdefgh"],
@@ -217,29 +228,58 @@ def test_held_upload_records_brake_deferred_and_stops(db):
     res = ingest_upload(db, "deposits", [CanonicalRow("deposits", "accounts", "a", "integer")],
                         actor=_actor(), now=_NOW, stage_recorder=rec)
     assert res.status == "held"
-    assert [(r.stage, r.state) for r in rec.reports] == [
-        ("validation", "succeeded"), ("brake", "deferred")]   # nothing after the hold
+    assert [r.stage for r in rec.reports] == _ALL_INGEST_STAGES     # complete, in canonical order
+    assert [(r.stage, r.state) for r in rec.reports[:2]] == [
+        ("validation", "succeeded"), ("brake", "deferred")]
     assert _report(rec, "brake").reason_code == "held"
+    for r in rec.reports[2:]:
+        if r.stage in ("glossary_classification", "glossary_evidence"):
+            assert r.state == "not_applicable", r.stage
+        else:
+            assert r.state == "not_run", r.stage
+            assert r.reason_code == "skipped_upload_held", r.stage
+        assert r.started_at is None, r.stage                        # a not_run never started
 
 
-def test_structural_error_records_validation_failed(db):
+def test_structural_error_records_validation_failed_and_not_run_downstream(db):
     _seal_config()
     rec = StageRecorder()
     res = ingest_upload(db, "deposits", [], actor=_actor(), now=_NOW, stage_recorder=rec)
     assert res.status == "rejected"
-    assert [(r.stage, r.state) for r in rec.reports] == [("validation", "failed")]
+    assert [r.stage for r in rec.reports] == _ALL_INGEST_STAGES
+    assert _report(rec, "validation").state == "failed"
     assert _report(rec, "validation").reason_code == "structural_error"
+    assert _report(rec, "brake").state == "not_run"
+    assert _report(rec, "brake").reason_code == "skipped_rejected"
+    assert _report(rec, "quarantine").state == "not_run"            # nothing was persisted
 
 
-def test_all_quarantined_records_validation_partial_and_quarantine(db):
+def test_all_quarantined_records_quarantine_then_not_run_downstream(db):
     _seal_config()
     rec = StageRecorder()
     res = ingest_upload(db, "deposits", [CanonicalRow("deposits", "accounts", "id", "")],
                         actor=_actor(), now=_NOW, stage_recorder=rec)   # no type -> quarantined
     assert res.status == "rejected"
-    assert [(r.stage, r.state) for r in rec.reports] == [
+    assert [(r.stage, r.state) for r in rec.reports[:3]] == [
         ("validation", "partial"), ("brake", "succeeded"), ("quarantine", "succeeded")]
     assert _report(rec, "quarantine").detail == {"rows": 1}
+    assert sorted(r.stage for r in rec.reports) == sorted(_ALL_INGEST_STAGES)
+    assert _report(rec, "enrich_concept").state == "not_run"
+    assert _report(rec, "enrich_concept").reason_code == "skipped_rejected"
+    assert _report(rec, "graph_persistence").state == "not_run"     # the graph was NOT rebuilt
+
+
+def test_glossary_early_exit_marks_glossary_stages_not_run(db):
+    """A GLOSSARY upload's early exit marks the glossary stages ``not_run`` (they would have run),
+    never ``not_applicable``."""
+    from featuregen.overlay.upload.glossary_reader import GlossaryUpload
+    _seal_config()
+    rec = StageRecorder()
+    res = ingest_upload(db, "gloss", [], actor=_actor(), now=_NOW,
+                        glossary=GlossaryUpload(rows=[], records=[]), stage_recorder=rec)
+    assert res.status == "rejected"
+    assert _report(rec, "glossary_classification").state == "not_run"
+    assert _report(rec, "glossary_evidence").state == "not_run"
 
 
 # ── flag- and lag-dependent stages ────────────────────────────────────────────────────────────────
