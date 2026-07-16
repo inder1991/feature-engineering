@@ -34,7 +34,7 @@ PLANNER_BOUNDS_VERSION = "1.0.0"
 RANKING_VERSION = "1.0.0"
 # Version pins for inputs that have no formal version source yet (wired to real policy versions in 3C):
 READ_SCOPE_POLICY_VERSION = "1.0.0"
-ROLE_RESOLUTION_VERSION = "unknown"
+ROLE_RESOLUTION_VERSION = "1.0.0"   # 3B.4: a real version (was the "unknown" placeholder); pins the frozen-input identity
 RECIPE_REGISTRY_VERSION = "1.0.0"
 APPLICABILITY_MAPPING_VERSION = "1.0.0"
 CONCEPT_REGISTRY_VERSION = "concepts@1"
@@ -207,6 +207,7 @@ class ReplayFreshness(StrEnum):
     3B.3c only defines the vocabulary alongside the compile-time stamps it will compare."""
     current = "current"
     drifted = "drifted"
+    incompatible = "incompatible"   # producer/compiler/registry VERSION mismatch — comparison not meaningful (NOT drift)
     unverifiable = "unverifiable"
 
 
@@ -272,6 +273,7 @@ class ReasonCode(StrEnum):
     aggregation_axis_unsupported = "aggregation_axis_unsupported"
     aggregation_composition_unsupported = "aggregation_composition_unsupported"
     semi_additive_temporal_strategy_missing = "semi_additive_temporal_strategy_missing"
+    aggregation_ordering_column_missing = "aggregation_ordering_column_missing"   # 3B.4: take_latest has no bound ordering column available+surviving at its hop
     additivity_source_conflict = "additivity_source_conflict"
     physical_cardinality_unavailable = "physical_cardinality_unavailable"
     # 3B.3c — temporal declaration (C3)
@@ -304,6 +306,11 @@ class CatalogStateStampV1:
     head_seq: int
     last_completed_at: str
     stamp_kind: CatalogStateStampKind = CatalogStateStampKind.drift_watermark
+    # 3B.4: replay-time drift signal — the compiler-input fingerprint (covers the classifier's real read-set,
+    # not just the join graph) + the projection checkpoint (a LAG invariant, never an equality drift signal).
+    # Both default so the existing constructors (scope.py, declarations.py) still compile.
+    compiler_input_fingerprint: str = ""
+    projection_checkpoint: int = 0
 
 
 @dataclass(frozen=True, slots=True)
