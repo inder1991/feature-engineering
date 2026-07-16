@@ -1,8 +1,8 @@
 // The standard ingest-result vocabulary, shared by both ingest paths (file upload and the
 // OpenMetadata connector). The SAME pipeline produces the result either way, so the SAME
 // callout renders it — held, rejected, and ingested keep one voice across vehicles.
-import type { ReactNode } from 'react'
-import type { IngestResult } from '../api'
+import { useEffect, useState, type ReactNode } from 'react'
+import { getIngestionRun, type IngestionStage, type IngestResult } from '../api'
 
 export function CalloutGlyph({ children }: { children: ReactNode }) {
   return (
@@ -29,6 +29,106 @@ export function Count({ value, tone }: { value: number; tone: 'ok' | 'warn' }) {
   const colored = tone === 'ok' || value > 0
   return (
     <span style={colored ? { color: `var(--${tone})`, fontWeight: 600 } : undefined}>{value}</span>
+  )
+}
+
+// ---- per-stage summary line (one honest sentence, never a stage dump) ------------------------
+
+// The states that read as a soft warning wherever they appear.
+const WARN_STATES = new Set(['failed', 'partial', 'audit_degraded'])
+
+// Stages the dedicated rules below already voice; the warn catch-all skips them.
+const VOICED_STAGES = new Set(['pass_b', 'pass_c', 'projection_drain'])
+
+export interface StageSummarySegment {
+  text: string
+  warn: boolean
+}
+
+function humanize(token: string): string {
+  return token === 'audit_degraded' ? 'audit-degraded' : token.replace(/_/g, ' ')
+}
+
+// Fold the run's stages into a few segments: enrichment (the enrich_* stages) speaks as one
+// word, Pass B/C report on/off/skipped, the projection drain speaks only when it is behind, and
+// any OTHER stage surfaces only in a warn state (failed | partial | audit_degraded). Unknown
+// stages/states from a newer backend stay quiet — this line summarizes, it never breaks.
+// eslint-disable-next-line react-refresh/only-export-components -- pure summarizer, exported for tests
+export function summarizeStages(stages: IngestionStage[]): StageSummarySegment[] {
+  const segments: StageSummarySegment[] = []
+
+  const enrich = stages.filter(s => s.stage.startsWith('enrich_'))
+  if (enrich.some(s => s.state === 'failed')) {
+    segments.push({ text: 'enrichment failed', warn: true })
+  } else if (enrich.some(s => s.state === 'partial')) {
+    segments.push({ text: 'enrichment partial', warn: true })
+  } else if (enrich.some(s => s.state === 'succeeded')) {
+    segments.push({ text: 'Enriched', warn: false })
+  } else if (enrich.some(s => s.state === 'skipped_no_client')) {
+    segments.push({ text: 'enrichment skipped', warn: false })
+  } else if (enrich.some(s => s.state === 'disabled')) {
+    segments.push({ text: 'enrichment off', warn: false })
+  }
+
+  for (const [stage, label] of [['pass_b', 'Pass B'], ['pass_c', 'Pass C']] as const) {
+    const s = stages.find(x => x.stage === stage)
+    if (!s) continue
+    if (s.state === 'succeeded') segments.push({ text: `${label} on`, warn: false })
+    else if (s.state === 'disabled') segments.push({ text: `${label} off`, warn: false })
+    else if (s.state === 'skipped_no_client') segments.push({ text: `${label} skipped`, warn: false })
+    else if (WARN_STATES.has(s.state)) {
+      segments.push({ text: `${label} ${humanize(s.state)}`, warn: true })
+    }
+    // not_applicable / not_run / unknown: quiet
+  }
+
+  const drain = stages.find(s => s.stage === 'projection_drain')
+  if (drain) {
+    if (drain.state === 'lagged' || drain.state === 'deferred') {
+      segments.push({ text: `projection ${drain.state}`, warn: true })
+    } else if (WARN_STATES.has(drain.state)) {
+      segments.push({ text: `projection ${humanize(drain.state)}`, warn: true })
+    }
+  }
+
+  for (const s of stages) {
+    if (s.stage.startsWith('enrich_') || VOICED_STAGES.has(s.stage)) continue
+    if (WARN_STATES.has(s.state)) {
+      segments.push({ text: `${humanize(s.stage)} ${humanize(s.state)}`, warn: true })
+    }
+  }
+  return segments
+}
+
+// Best-effort color under the ingested result: fetch the run, render one compact line. A fetch
+// failure (or an all-quiet run) renders nothing extra — the core result above already told the
+// truth, and this line must never block or break it.
+function StageSummaryLine({ runId }: { runId: string }) {
+  const [segments, setSegments] = useState<StageSummarySegment[] | null>(null)
+  useEffect(() => {
+    let cancelled = false
+    getIngestionRun(runId).then(
+      run => {
+        if (!cancelled) setSegments(summarizeStages(run.stages))
+      },
+      () => {}, // degrade silently: the summary is a bonus, never a gate
+    )
+    return () => {
+      cancelled = true
+    }
+  }, [runId])
+  if (!segments || segments.length === 0) return null
+  return (
+    <p>
+      {segments.map((seg, i) => (
+        <span key={`${i}-${seg.text}`}>
+          {i > 0 && ' · '}
+          <span style={seg.warn ? { color: 'var(--warn)', fontWeight: 600 } : undefined}>
+            {seg.text}
+          </span>
+        </span>
+      ))}
+    </p>
   )
 }
 
@@ -104,6 +204,7 @@ export function IngestResultCallout({
             <span style={{ fontWeight: 600 }}>Flagged:</span> {result.flagged}
           </p>
         )}
+        {result.ingestion_run_id && <StageSummaryLine runId={result.ingestion_run_id} />}
         {result.quarantined > 0 && (
           <button type="button" className="btn" onClick={() => onReviewQueue(source)}>
             Review {result.quarantined} quarantined row{result.quarantined === 1 ? '' : 's'}

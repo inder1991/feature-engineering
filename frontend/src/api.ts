@@ -14,7 +14,13 @@ export class ApiError extends Error {
   }
 }
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
+// Core transport: same auth headers + error handling as always, but hands back the Response
+// alongside the parsed body for the few callers that need transport metadata (the ingest run-id
+// header). Everything else goes through the body-only `request` wrapper below.
+async function requestWithResponse<T>(
+  path: string,
+  init?: RequestInit,
+): Promise<{ body: T; response: Response }> {
   const { user, roles } = getSession()
   // X-User is free text from the session bar. Header values must be ISO-8859-1, so a
   // non-Latin-1 name would make fetch throw before any request is sent. Percent-encode at
@@ -45,7 +51,12 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     }
     throw new ApiError(res.status, detail)
   }
-  return res.json() as Promise<T>
+  return { body: (await res.json()) as T, response: res }
+}
+
+async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  const { body } = await requestWithResponse<T>(path, init)
+  return body
 }
 
 function post<T>(path: string, body: unknown): Promise<T> {
@@ -74,6 +85,35 @@ export interface IngestResult {
   changed_objects: number
   quarantined: number
   flagged: string | null
+  // CLIENT-attached from the X-Ingestion-Run-Id response header, never a body field: the id of
+  // the per-stage run record behind GET /ingestion-runs/{id}. Optional so existing fixtures and
+  // callers keep compiling; null when the server sent no header.
+  ingestion_run_id?: string | null
+}
+
+// ---- ingestion runs (read-only per-stage record of one upload/import) ------------------------
+// One pipeline stage of an ingestion run. `stage` and `state` stay open strings: an unknown
+// value from a newer backend must summarize (or stay quiet), never break the client. Known
+// states include succeeded | partial | failed | skipped_no_client | disabled | not_applicable |
+// not_run | lagged | deferred | audit_degraded; known stages include parse, validation, brake,
+// fact_assertion, drift, enrich_concept/definition/domain, pass_b, pass_c, governed_joins,
+// projection_drain, quarantine.
+export interface IngestionStage {
+  stage: string
+  state: string
+  reason_code: string | null
+  detail: Record<string, unknown> | null
+  started_at: string | null
+  completed_at: string | null
+}
+
+export interface IngestionRun {
+  run_id: string
+  stages: IngestionStage[]
+}
+
+export function getIngestionRun(runId: string): Promise<IngestionRun> {
+  return request(`/ingestion-runs/${encodeURIComponent(runId)}`)
 }
 
 export interface SearchHit {
@@ -252,11 +292,15 @@ export interface FeatureSpecIn {
   derives_from: { catalog_source: string; object_ref: string }[]
 }
 
-export function uploadFile(file: File, source: string): Promise<IngestResult> {
+export async function uploadFile(file: File, source: string): Promise<IngestResult> {
   const form = new FormData()
   form.append('file', file)
   form.append('source', source)
-  return request('/uploads', { method: 'POST', body: form })
+  const { body, response } = await requestWithResponse<IngestResult>('/uploads', {
+    method: 'POST',
+    body: form,
+  })
+  return { ...body, ingestion_run_id: response.headers.get('X-Ingestion-Run-Id') }
 }
 
 export function searchCatalog(
@@ -1217,15 +1261,27 @@ export interface SyncImportResult {
   semantics_pending: number
 }
 
-export function importSync(
+export async function importSync(
   syncId: string,
   snapshotHash: string,
   localBaselineHash: string,
 ): Promise<SyncImportResult> {
-  return post(`/syncs/${encodeURIComponent(syncId)}/import`, {
-    snapshot_hash: snapshotHash,
-    local_baseline_hash: localBaselineHash,
-  })
+  const { body, response } = await requestWithResponse<SyncImportResult>(
+    `/syncs/${encodeURIComponent(syncId)}/import`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        snapshot_hash: snapshotHash,
+        local_baseline_hash: localBaselineHash,
+      }),
+    },
+  )
+  // The run id rides the inner IngestResult so the shared callout reads it from either vehicle.
+  return {
+    ...body,
+    result: { ...body.result, ingestion_run_id: response.headers.get('X-Ingestion-Run-Id') },
+  }
 }
 
 export function recommendFeatures(
