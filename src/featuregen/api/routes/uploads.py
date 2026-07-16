@@ -105,9 +105,12 @@ def create_upload(
     # Design #3: open the durable run manifest BEFORE parse, on an independent committing
     # connection, so a parse/oversize/unsupported failure still has a queryable run row. The
     # effective_config flag snapshot is pinned HERE, once — never re-read from env mid-run.
+    # authorization_decision records the gate outcome (review FIX 4): this line is reached only
+    # after the route's require_catalog_write dependency passed.
     run_id = open_run(conn, origin_type="upload", catalog_source=source,
                       filename=file.filename, actor=identity,
-                      effective_config=_effective_config_snapshot(), now=datetime.now(UTC))
+                      effective_config=_effective_config_snapshot(), now=datetime.now(UTC),
+                      authorization_decision="granted:catalog_write")
     response.headers[_RUN_ID_HEADER] = run_id   # the success response; error paths set it below
     file_sha256: str | None = None              # stays NULL when the capped read rejects the file
     failure_status = "rejected"                 # pre-ingest failure = the FILE was rejected...

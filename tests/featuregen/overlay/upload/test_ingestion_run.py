@@ -80,6 +80,15 @@ def test_open_run_records_in_progress_run(db, no_dsn) -> None:
     assert run["status_history"] == [{"status": "in_progress", "at": _NOW, "reason_code": None}]
 
 
+def test_open_run_records_authorization_decision(db, no_dsn) -> None:
+    """Review FIX 4: the route reaches open_run only AFTER its permission gate passed, and the
+    manifest records that gate outcome — authorization_decision is written at open, not dead
+    schema. Callers that don't state one (the degenerate default) honestly leave it NULL."""
+    run_id = _open(db, authorization_decision="granted:catalog_write")
+    assert get_run(db, run_id)["authorization_decision"] == "granted:catalog_write"
+    assert get_run(db, _open(db))["authorization_decision"] is None
+
+
 def test_open_run_sanitizes_filename(db, no_dsn) -> None:
     run_id = _open(db, filename="../../etc/" + "a" * 500 + ".csv")
     name = get_run(db, run_id)["filename"]

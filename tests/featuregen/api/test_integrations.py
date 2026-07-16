@@ -661,6 +661,8 @@ def test_import_records_ingested_connector_run_linked_from_import_row(client, co
     assert run["filename"] is None                       # no file: the source is the OM pull
     assert run["file_sha256"] is None
     assert run["actor_subject"] == "user:o"              # the approving human, per the spec
+    # review FIX 4: the import route's gate is require_catalog_write too — recorded at open
+    assert run["authorization_decision"] == "granted:catalog_write"
     assert run["row_count"] == 14
     assert run["quarantined_count"] == 1
     assert run["fingerprint_algo_version"] == "gn-v1"

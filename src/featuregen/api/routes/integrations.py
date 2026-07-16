@@ -563,9 +563,12 @@ def import_sync(sync_id: str, body: ImportIn, response: Response, conn: _Conn,
     with no import row at all. The run id rides the ``X-Ingestion-Run-Id`` RESPONSE HEADER on
     success and on every post-open error; the JSON body stays byte-for-byte unchanged."""
     sync, integ = _resolve_sync(conn, sync_id)
+    # authorization_decision records the gate outcome (review FIX 4): this line is reached only
+    # after the route's require_catalog_write dependency passed (the connector's import gate).
     run_id = open_run(conn, origin_type="connector", catalog_source=sync["target_source"],
                       filename=None, actor=identity,
-                      effective_config=_effective_config_snapshot(), now=datetime.now(UTC))
+                      effective_config=_effective_config_snapshot(), now=datetime.now(UTC),
+                      authorization_decision="granted:catalog_write")
     response.headers[RUN_ID_HEADER] = run_id   # the success response; error paths set it below
     try:
         _, translation = _pull(sync, integ)

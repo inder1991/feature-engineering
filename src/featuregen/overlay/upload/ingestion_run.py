@@ -112,13 +112,13 @@ def _clean_filename(filename: str | None) -> str | None:
 
 def _insert_run(conn, run_id: str, *, origin_type: str, catalog_source: str,
                 filename: str | None, actor: IdentityEnvelope, effective_config: dict,
-                now: datetime) -> None:
+                now: datetime, authorization_decision: str | None) -> None:
     conn.execute(
         "INSERT INTO ingestion_run (id, origin_type, catalog_source, filename, actor_subject, "
-        "actor_role_claims, effective_config, status, started_at, heartbeat_at) "
-        "VALUES (%s, %s, %s, %s, %s, %s, %s, 'in_progress', %s, %s)",
+        "actor_role_claims, effective_config, authorization_decision, status, started_at, "
+        "heartbeat_at) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'in_progress', %s, %s)",
         (run_id, origin_type, catalog_source, _clean_filename(filename), actor.subject,
-         list(actor.role_claims), Jsonb(effective_config), now, now))
+         list(actor.role_claims), Jsonb(effective_config), authorization_decision, now, now))
     _append_status_event(conn, run_id, status="in_progress", at=now, reason_code=None)
 
 
@@ -130,8 +130,13 @@ def _append_status_event(conn, run_id: str, *, status: str, at: datetime,
 
 
 def open_run(conn, *, origin_type: str, catalog_source: str, filename: str | None,
-             actor: IdentityEnvelope, effective_config: dict, now: datetime) -> str:
+             actor: IdentityEnvelope, effective_config: dict, now: datetime,
+             authorization_decision: str | None = None) -> str:
     """Mint + durably record an ``in_progress`` run; returns the run id.
+
+    ``authorization_decision`` records the permission-gate outcome that admitted the request
+    (review FIX 4): a route reaches open_run only AFTER its gate passed, so it states that
+    honestly — e.g. ``"granted:catalog_write"`` for POST /uploads and the connector import.
 
     Independent-commit rule: the INSERT goes on a FRESH connection from ``get_settings().dsn``,
     committed immediately, so the run row survives the request transaction rolling back (a parse
@@ -140,7 +145,8 @@ def open_run(conn, *, origin_type: str, catalog_source: str, filename: str | Non
     connection takes NO advisory lock (I-3 self-deadlock class)."""
     run_id = mint_id("ingrun")
     kwargs = dict(origin_type=origin_type, catalog_source=catalog_source, filename=filename,
-                  actor=actor, effective_config=effective_config, now=now)
+                  actor=actor, effective_config=effective_config, now=now,
+                  authorization_decision=authorization_decision)
     dsn = get_settings().dsn
     if dsn:
         try:

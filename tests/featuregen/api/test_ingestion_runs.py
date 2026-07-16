@@ -40,6 +40,9 @@ def test_successful_upload_records_ingested_run(client):
     assert run["filename"] == "deposits.csv"
     assert run["actor_subject"] == "user:tester"
     assert run["actor_role_claims"] == ["platform_admin"]
+    # review FIX 4: the run records the permission-gate outcome that admitted it —
+    # POST /uploads is gated by require_catalog_write, so the decision is never NULL here
+    assert run["authorization_decision"] == "granted:catalog_write"
     assert run["row_count"] == 9
     assert run["quarantined_count"] == 0
     assert run["file_sha256"] == hashlib.sha256(DEPOSITS_CSV.encode()).hexdigest()
