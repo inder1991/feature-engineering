@@ -62,6 +62,39 @@ def test_stale_source_excluded(db):
     assert search(db, "balance", now=later).hits == []
 
 
+def test_resolved_row_freshness_is_its_own_not_the_source_watermark(db):
+    # Round-3 #5: search freshness is SOURCE-level (the drift watermark), but a quarantine-RESOLVED
+    # row is added incrementally — it was never part of any scan/snapshot, so it must not inherit
+    # the source watermark (a later scan of the OTHER rows would keep re-blessing it as fresh
+    # forever). Its freshness is its OWN resolution instant: honest right after resolving, stale
+    # once that instant ages past the SLA — regardless of the watermark advancing without it.
+    from featuregen.overlay.upload.ingest import resolve_quarantine_row
+    from featuregen.overlay.upload.review_queue import list_quarantine
+    _seal()
+    t0 = datetime(2026, 7, 5, tzinfo=UTC)
+    rows = [
+        CanonicalRow("deposits", "accounts", "id", "integer", is_grain=True),
+        CanonicalRow("deposits", "accounts", "", "numeric"),   # blank column -> quarantined
+    ]
+    assert ingest_upload(db, "deposits", rows, actor=_actor(), now=t0).status == "ingested"
+    idx = list_quarantine(db, "deposits")[0].row_index
+    resolved, reason = resolve_quarantine_row(db, "deposits", idx, {"column": "balance"},
+                                              actor=_actor(), now=t0)
+    assert resolved, reason
+
+    # Right after resolution the row IS searchable — its own attestation (t0) is fresh.
+    assert any(h.column == "balance" for h in search(db, "balance", now=t0).hits)
+
+    # A later watermark advance (a scan re-blessing the SCANNED objects, without a graph rebuild)
+    # must NOT re-bless the resolved row it never saw.
+    t1 = t0 + timedelta(days=3)
+    db.execute("UPDATE overlay_drift_watermark SET last_completed_at = %s "
+               "WHERE catalog_source = 'deposits'", (t1,))
+    hits = search(db, "", now=t1).hits                        # empty query = browse all fresh rows
+    assert any(h.column == "id" for h in hits)                # scanned column: fresh under the scan
+    assert not any(h.column == "balance" for h in hits)       # resolved column: honestly stale
+
+
 def test_search_uses_llm_concept(db):
     from featuregen.intake.llm import FakeLLM, FakeResponse
     _seal()

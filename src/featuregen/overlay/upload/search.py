@@ -95,7 +95,11 @@ def _build_predicates(
     facet_preds maps each active facet name to its predicate — AND across facets, OR (= ANY)
     within one. Read-scope and freshness are deliberately NOT facets: they are AND-ed always."""
     base_preds = [
-        "w.last_completed_at >= %(cutoff)s",
+        # Freshness is SOURCE-level (the drift watermark) EXCEPT for a node carrying its OWN
+        # attestation instant (attested_at — a quarantine-RESOLVED row, which no scan ever saw):
+        # that node is fresh for the SLA window after its resolution and never re-blessed by a
+        # later scan of the OTHER rows (round-3 #5). NULL attested_at = watermark, as before.
+        "COALESCE(n.attested_at, w.last_completed_at) >= %(cutoff)s",
         "(n.sensitivity IS NULL OR n.sensitivity = ANY(%(allowed)s))",   # read-scope hard filter
     ]
     if query:

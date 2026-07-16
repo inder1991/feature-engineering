@@ -1,0 +1,11 @@
+-- src/featuregen/db/migrations/0992_graph_node_attested_at.sql
+-- Per-node freshness attestation (ingestion review round 3, #5). Search freshness is SOURCE-level
+-- (overlay_drift_watermark.last_completed_at) — honest for nodes an upload/scan built, but a node
+-- added incrementally by quarantine RESOLUTION was never part of any scan/snapshot, so it must not
+-- inherit the source watermark: a later scan of the OTHER rows would keep re-blessing a row it
+-- never saw. NULL = built by an upload/scan; freshness comes from the source watermark (unchanged
+-- behaviour for every existing row). Non-NULL = the node's OWN attestation instant (its
+-- quarantine-resolution time), which search's freshness cutoff uses INSTEAD of the watermark. The
+-- next real upload rebuilds the graph from the file (build_graph inserts leave this NULL), so the
+-- override lives exactly as long as the incremental addition it describes.
+ALTER TABLE graph_node ADD COLUMN IF NOT EXISTS attested_at timestamptz NULL;

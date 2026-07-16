@@ -6,7 +6,7 @@ import logging
 import os
 import re
 from dataclasses import asdict, dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 
 from featuregen.aggregates.ids import mint_id
 from featuregen.overlay import facts
@@ -1056,7 +1056,7 @@ def _row_from_raw(raw: dict, catalog_source: str) -> CanonicalRow:
 
 
 def resolve_quarantine_row(conn, catalog_source: str, row_index: int, edits: dict, *,
-                           actor) -> tuple[bool, str]:
+                           actor, now: datetime | None = None) -> tuple[bool, str]:
     """Apply a reviewer's inline fix to a quarantined row: merge the edits onto the raw row, RE-RUN the
     real deterministic validation (validate_rows — never the client mock), and, if it now passes, its
     column isn't already in the catalog, and the cumulative resolved additions don't trip the
@@ -1122,7 +1122,14 @@ def resolve_quarantine_row(conn, catalog_source: str, row_index: int, edits: dic
         logger.warning("quarantine resolution for %r held by the large-change brake: %s",
                        catalog_source, brake.reason)
         return False, f"held by the large-change brake: {brake.reason}"
-    add_column_row(conn, catalog_source, good)
+    # Round-3 #5: stamp the node with its OWN attestation instant (this resolution, `now`). Search
+    # freshness is otherwise SOURCE-level (the drift watermark), and this row was never part of any
+    # scan/snapshot — inheriting the watermark would present it as "fresh" under a scan that never
+    # saw it, re-blessed by every later scan of the OTHER rows. With its own stamp it is fresh for
+    # the SLA window after the human verified it, then honestly stale until a real re-upload of the
+    # fixed file rebuilds the graph (which supersedes the resolution — see LIMITS above). The source
+    # watermark itself is NEVER advanced here.
+    add_column_row(conn, catalog_source, good, attested_at=now or datetime.now(UTC))
     if good.is_grain:
         # reconcile the table's grain fact with its FULL grain-column set (now incl. the added column),
         # or the uniqueness key stays silently wrong (a grain column added to the graph but not the fact).

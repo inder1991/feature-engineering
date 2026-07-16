@@ -4,6 +4,7 @@ import logging
 import os
 from collections.abc import Iterable
 from dataclasses import dataclass
+from datetime import datetime
 
 from featuregen.overlay.identity import ApprovedJoinRef, CatalogObjectRef, ColumnPair
 from featuregen.overlay.upload.canonical import CanonicalRow
@@ -178,27 +179,33 @@ def build_graph(conn, catalog_source: str, rows: list[CanonicalRow],
         (catalog_source,))
 
 
-def add_column_row(conn, catalog_source: str, r: CanonicalRow) -> None:
+def add_column_row(conn, catalog_source: str, r: CanonicalRow, *,
+                   attested_at: datetime | None = None) -> None:
     """Incrementally add ONE canonical column row to an EXISTING source graph — the quarantine-fix path
     (a wholesale build_graph would wipe the source's other columns). No enrichment (concept/definition/
-    domain arrive with an upload; a fix carries only the declared row). Idempotent via ON CONFLICT."""
+    domain arrive with an upload; a fix carries only the declared row). Idempotent via ON CONFLICT.
+
+    `attested_at` (round-3 #5) is the node's OWN freshness instant: an incrementally-added row was
+    never part of any scan/snapshot, so it must not inherit the source watermark — search's freshness
+    cutoff uses this instead. Stamped on the column node AND a newly-created table node (an existing
+    table node keeps its scan-backed NULL via ON CONFLICT DO NOTHING)."""
     t_ref = _table_ref(r.table)
     conn.execute(
         "INSERT INTO graph_node (catalog_source, object_ref, kind, table_name, column_name, "
-        "data_type, definition, is_grain, is_as_of, concept, domain, search_doc) "
-        f"VALUES (%s, %s, 'table', %s, NULL, NULL, NULL, false, false, NULL, NULL, {_SEARCH_DOC}) "
+        "data_type, definition, is_grain, is_as_of, concept, domain, attested_at, search_doc) "
+        f"VALUES (%s, %s, 'table', %s, NULL, NULL, NULL, false, false, NULL, NULL, %s, {_SEARCH_DOC}) "
         "ON CONFLICT DO NOTHING",
-        (catalog_source, t_ref, r.table, r.table, "", r.table, "", ""))
+        (catalog_source, t_ref, r.table, attested_at, r.table, "", r.table, "", ""))
     c_ref = _column_ref(r.table, r.column)
     definition = r.definition or None
     conn.execute(
         "INSERT INTO graph_node (catalog_source, object_ref, kind, table_name, column_name, "
         "data_type, definition, is_grain, is_as_of, concept, domain, sensitivity, additivity, unit, "
-        f"currency, entity, search_doc) VALUES (%s, %s, 'column', %s, %s, %s, %s, %s, %s, NULL, NULL, "
-        f"%s, %s, %s, %s, %s, {_SEARCH_DOC}) ON CONFLICT DO NOTHING",
+        f"currency, entity, attested_at, search_doc) VALUES (%s, %s, 'column', %s, %s, %s, %s, %s, "
+        f"%s, NULL, NULL, %s, %s, %s, %s, %s, %s, {_SEARCH_DOC}) ON CONFLICT DO NOTHING",
         (catalog_source, c_ref, r.table, r.column, r.type, definition, r.is_grain, r.as_of,
          r.sensitivity or None, r.additivity or None, r.unit or None, r.currency or None,
-         r.entity or None, r.column, definition or "", r.table, "", r.entity or ""))
+         r.entity or None, attested_at, r.column, definition or "", r.table, "", r.entity or ""))
     conn.execute(
         "INSERT INTO graph_edge (catalog_source, kind, from_ref, to_ref) "
         "VALUES (%s, 'contains', %s, %s) ON CONFLICT DO NOTHING", (catalog_source, t_ref, c_ref))
