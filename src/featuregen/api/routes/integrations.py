@@ -592,7 +592,10 @@ def import_sync(sync_id: str, body: ImportIn, response: Response, conn: _Conn,
         pre_fingerprint, fingerprint_algo = source_fingerprint(conn, sync["target_source"])
         result = ingest_upload(conn, sync["target_source"], translation.rows,
                                actor=identity, now=datetime.now(UTC), client=client,
-                               stage_recorder=recorder)
+                               stage_recorder=recorder,
+                               # #10: connector-synced facts record the honest origin — matches
+                               # the origin_type this route stamps on its ingestion_run.
+                               origin_type="connector")
         import_id = store.record_import(
             conn, sync=sync, integration_id=integ["integration_id"], snapshot_hash=current_hash,
             approved_by=identity.subject, result=asdict(result), ingestion_run_id=run_id)

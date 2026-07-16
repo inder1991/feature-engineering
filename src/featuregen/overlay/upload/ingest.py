@@ -170,11 +170,18 @@ def _table_facts(rows: list[CanonicalRow]):
             yield table, "availability_time", {"column": as_of_row.column, "basis": basis}
 
 
-def _assert_fact(conn, source: str, table: str, fact_type: str, value: dict, *, actor) -> bool:
+def _assert_fact(conn, source: str, table: str, fact_type: str, value: dict, *, actor,
+                 origin_type: str = "upload") -> bool:
     """Assert a fact, or RE-assert it when the upload changed its value or it is not currently
     VERIFIED. Skipping only-on-existence (the original bug) served a stale value forever (B1) and
     left a staled fact stuck unservable after the file was fixed (M1). We diff on the value: skip
-    only when the stream is already VERIFIED with the identical value."""
+    only when the stream is already VERIFIED with the identical value.
+
+    #10 honest authority: the auto-confirm records `authority_basis=source_declared` + the ingest
+    `origin_type` ("upload" | "connector" | "resolution") + the actor's REAL role_claims. It never
+    fabricates a confirmer — an uploader (whatever their role) is not a data owner vouching for the
+    fact; the fact is authoritative because the SOURCE declared it. Operationally identical: the
+    fact folds/projects VERIFIED exactly as before."""
     fk = fact_key(table_ref(source, table), fact_type)
     stream = load_fact(conn, fk)
     if stream:
@@ -192,7 +199,8 @@ def _assert_fact(conn, source: str, table: str, fact_type: str, value: dict, *, 
             "proposed_by": actor.subject})
     append_overlay_event(conn, fact_key=fk, type=facts.OVERLAY_FACT_CONFIRMED,
         actor=actor, expected_version=base + 1, payload={
-            "value": value, "confirmers": [{"subject": actor.subject, "role": "data_owner"}],
+            "value": value, "authority_basis": facts.AUTHORITY_SOURCE_DECLARED,
+            "origin_type": origin_type, "role_claims": list(actor.role_claims),
             "expires_at": None, "confirms_event_id": draft.event_id})
     return True
 
@@ -769,7 +777,11 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
                   actor, now: datetime | None = None, client=None,
                   profile: SourceCapabilityProfile | None = None,
                   glossary: GlossaryUpload | None = None,
-                  stage_recorder: StageRecorder | None = None) -> IngestResult:
+                  stage_recorder: StageRecorder | None = None,
+                  origin_type: str = "upload") -> IngestResult:
+    # `origin_type` (#10): how this ingest entered the system — "upload" (default; the /uploads
+    # route) or "connector" (the integrations sync route) — stamped as the source-declared
+    # authority origin on every auto-confirmed fact. Matches the ingestion_run origin_type.
     # `stage_recorder` (#22) BUFFERS an honest per-stage outcome as each stage runs — it never
     # writes during ingest (the route flushes it alongside terminalize), never touches the return
     # value, and `None` (every direct caller / flag-off) is a no-op: byte-for-byte unchanged.
@@ -858,7 +870,8 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
 
     asserted = 0
     for table, fact_type, value in _table_facts(vr.good):
-        if _assert_fact(conn, catalog_source, table, fact_type, value, actor=actor):
+        if _assert_fact(conn, catalog_source, table, fact_type, value, actor=actor,
+                        origin_type=origin_type):
             asserted += 1
     record_stage(stage_recorder, "fact_assertion", "succeeded", detail={"asserted": asserted})
 
@@ -1343,11 +1356,13 @@ def resolve_quarantine_row(conn, catalog_source: str, row_index: int, edits: dic
             "AND kind = 'column' AND is_grain = true ORDER BY column_name",
             (catalog_source, good.table)).fetchall()]
         _assert_fact(conn, catalog_source, good.table, "grain",
-                     {"columns": grain_cols, "is_unique": True}, actor=actor)
+                     {"columns": grain_cols, "is_unique": True}, actor=actor,
+                     origin_type="resolution")
     if good.as_of:
         basis = good.as_of_basis if good.as_of_basis in ("posted_at", "ingested_at") else "posted_at"
         _assert_fact(conn, catalog_source, good.table, "availability_time",
-                     {"column": good.column, "basis": basis}, actor=actor)
+                     {"column": good.column, "basis": basis}, actor=actor,
+                     origin_type="resolution")
     conn.execute("DELETE FROM quarantine_row WHERE catalog_source = %s AND row_index = %s",
                  (catalog_source, row_index))
     return True, ""

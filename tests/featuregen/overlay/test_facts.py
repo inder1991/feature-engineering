@@ -145,6 +145,97 @@ def test_confirmed_event_schema_rejects_missing_required_field():
         )
 
 
+def _confirmed_base() -> dict:
+    return {
+        "value": {"columns": ["id"], "is_unique": True},
+        "expires_at": None,
+        "confirms_event_id": "evt_1",
+    }
+
+
+def _validate_confirmed(body: dict) -> None:
+    event_registry().validate(
+        facts.OVERLAY_FACT_CONFIRMED, facts.OVERLAY_EVENT_SCHEMA_VERSION, body
+    )
+
+
+def test_confirmed_event_schema_accepts_source_declared_authority():
+    """#10: the source-declared shape — authority_basis + origin_type + role_claims, and NO
+    confirmers — is a valid CONFIRMED payload."""
+    _validate_confirmed({
+        **_confirmed_base(),
+        "authority_basis": "source_declared",
+        "origin_type": "upload",
+        "role_claims": ["platform-admin"],
+    })
+    for origin in ("connector", "resolution"):
+        _validate_confirmed({
+            **_confirmed_base(),
+            "authority_basis": "source_declared",
+            "origin_type": origin,
+            "role_claims": [],
+        })
+
+
+def test_confirmed_event_schema_legacy_confirmers_shape_still_validates():
+    # backward-compat: a pre-#10 event (confirmers, no authority_basis) still validates
+    _validate_confirmed({
+        **_confirmed_base(),
+        "confirmers": [{"subject": "u", "role": "data_owner"}],
+    })
+
+
+def test_confirmed_event_schema_requires_confirmers_or_authority_basis():
+    # an event with NEITHER human confirmers NOR a source-declared basis is invalid
+    with pytest.raises(SchemaValidationError):
+        _validate_confirmed(_confirmed_base())
+
+
+def test_confirmed_event_schema_rejects_both_confirmers_and_authority_basis():
+    # an event may not claim BOTH a human confirmation and a source-declared basis
+    with pytest.raises(SchemaValidationError):
+        _validate_confirmed({
+            **_confirmed_base(),
+            "confirmers": [{"subject": "u", "role": "data_owner"}],
+            "authority_basis": "source_declared",
+            "origin_type": "upload",
+            "role_claims": ["platform-admin"],
+        })
+
+
+def test_confirmed_event_schema_source_declared_requires_complete_triple():
+    # authority_basis without origin_type / role_claims is invalid (no half-attributed events)
+    with pytest.raises(SchemaValidationError):
+        _validate_confirmed({
+            **_confirmed_base(),
+            "authority_basis": "source_declared",
+            "role_claims": ["platform-admin"],
+        })
+    with pytest.raises(SchemaValidationError):
+        _validate_confirmed({
+            **_confirmed_base(),
+            "authority_basis": "source_declared",
+            "origin_type": "upload",
+        })
+
+
+def test_confirmed_event_schema_rejects_unknown_basis_and_origin():
+    with pytest.raises(SchemaValidationError):
+        _validate_confirmed({
+            **_confirmed_base(),
+            "authority_basis": "somebody_said_so",
+            "origin_type": "upload",
+            "role_claims": [],
+        })
+    with pytest.raises(SchemaValidationError):
+        _validate_confirmed({
+            **_confirmed_base(),
+            "authority_basis": "source_declared",
+            "origin_type": "carrier_pigeon",
+            "role_claims": [],
+        })
+
+
 def test_rejected_event_schema_category_optional():
     """Task 5 addendum: `category` is a first-class OPTIONAL nullable property on REJECTED —
     a reliable analytics key alongside the polymorphic free-text `reason`. NOT required:

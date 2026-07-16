@@ -34,6 +34,17 @@ def _confirmed(eid="evt_conf", value=None):
     })
 
 
+def _source_confirmed(eid="evt_conf", value=None, origin="upload"):
+    # #10: the source-declared auto-confirm shape — authority basis instead of confirmers.
+    return _Evt(facts.OVERLAY_FACT_CONFIRMED, eid, {
+        "value": value or {"columns": ["id"], "is_unique": True},
+        "authority_basis": facts.AUTHORITY_SOURCE_DECLARED,
+        "origin_type": origin,
+        "role_claims": ["platform-admin"],
+        "expires_at": "2026-12-31T00:00:00+00:00", "confirms_event_id": "evt_draft",
+    })
+
+
 def test_proposed_only_is_draft():
     st = fold_overlay_state([_proposed()])
     assert st.status == DRAFT
@@ -131,6 +142,55 @@ def test_reproposed_after_rejected_resets_prior_value():
     assert st.partial_confirmers == []
     assert st.expires_at is None
     assert st.confirmed_event_id is None
+
+
+def test_source_declared_confirm_folds_verified_with_source_provenance():
+    # #10: a source-declared CONFIRMED folds VERIFIED with the honest basis recorded — and NO
+    # fabricated confirmer.
+    st = fold_overlay_state([_proposed(), _source_confirmed()])
+    assert st.status == VERIFIED
+    assert st.value == {"columns": ["id"], "is_unique": True}
+    assert st.confirmers == []
+    assert st.authority_basis == facts.AUTHORITY_SOURCE_DECLARED
+    assert st.origin_type == "upload"
+    assert st.role_claims == ["platform-admin"]
+    assert st.authority_provenance == facts.AUTHORITY_SOURCE_DECLARED
+
+
+def test_source_declared_confirm_is_operationally_identical_to_confirmer_confirm():
+    # #10 invariant: only the recorded PROVENANCE differs — every operational field of the folded
+    # state (status, value, expiry, event ids, prior_value) is identical to the confirmer path.
+    legacy = fold_overlay_state([_proposed(), _confirmed()])
+    src = fold_overlay_state([_proposed(), _source_confirmed()])
+    for f in ("status", "value", "expires_at", "confirmed_event_id", "draft_event_id",
+              "proposal_fingerprint", "prior_value", "partial_confirmers", "object_ref",
+              "fact_type", "use_case"):
+        assert getattr(src, f) == getattr(legacy, f), f
+
+
+def test_legacy_confirmed_event_is_never_reclassified():
+    # #10: a pre-#10 event (confirmers, no authority_basis) folds exactly as today — provenance
+    # reads legacy_unspecified, never source_declared.
+    st = fold_overlay_state([_proposed(), _confirmed()])
+    assert st.status == VERIFIED
+    assert st.confirmers == [{"subject": "owner_a", "role": "data_owner"}]
+    assert st.authority_basis is None
+    assert st.origin_type is None
+    assert st.role_claims == []
+    assert st.authority_provenance == facts.AUTHORITY_LEGACY_UNSPECIFIED
+
+
+def test_reproposed_after_rejected_resets_source_authority_fields():
+    # the PROPOSED reset must clear #10 carry-over exactly like confirmers/expiry (no stale
+    # source_declared provenance on a fresh DRAFT).
+    rej = _Evt(facts.OVERLAY_FACT_REJECTED, "evt_rej",
+               {"rejected_by": "owner_a", "reason": "wrong", "target_event_id": "evt_conf"})
+    st = fold_overlay_state([_proposed(), _source_confirmed(), rej, _proposed(eid="evt_draft2")])
+    assert st.status == DRAFT
+    assert st.authority_basis is None
+    assert st.origin_type is None
+    assert st.role_claims == []
+    assert st.authority_provenance is None
 
 
 def test_stray_proposed_after_confirm_does_not_regress_to_draft():

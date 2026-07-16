@@ -156,7 +156,10 @@ class OverlayProjection:
                 WHERE overlay_fact_state.updated_seq < EXCLUDED.updated_seq
                 """,
                 (
-                    fk, Jsonb(payload["value"]), Jsonb(payload["confirmers"]),
+                    # #10: a source-declared CONFIRMED carries NO confirmers (its provenance is
+                    # authority_basis on the event) — store an honest empty list, never a
+                    # fabricated confirmer. Confirmer-based events project verbatim as before.
+                    fk, Jsonb(payload["value"]), Jsonb(payload.get("confirmers") or []),
                     event.occurred_at, payload.get("expires_at"), event.event_id, seq, fk,
                 ),
             )

@@ -160,6 +160,20 @@ OVERLAY_FACT_STALED = "OVERLAY_FACT_STALED"
 OVERLAY_EVENT_SCHEMA_VERSION = 1
 OVERLAY_OWNER = "featuregen-overlay"
 
+# ---- authority basis (#10 honest authority attribution) ----
+# A first-class basis for a CONFIRMED fact's authority, DISTINCT from a human confirmer entry:
+# `source_declared` means the fact is authoritative because the ingested source declared it (the
+# upload catalog treats the source as the system of record) — NOT because a human owner vouched.
+# Written ONLY by the auto-confirm paths (upload / connector sync / quarantine resolution); the
+# genuine human confirm paths keep writing real `confirmers`.
+AUTHORITY_SOURCE_DECLARED = "source_declared"
+# READ-side label only (OverlayState.authority_provenance) for pre-#10 events, which used the same
+# confirmer shape for genuine human confirms AND upload auto-confirms with no discriminator. Such
+# events are NEVER retroactively reclassified — and this value is never written to an event.
+AUTHORITY_LEGACY_UNSPECIFIED = "legacy_unspecified"
+# Where a source-declared fact entered the system.
+ORIGIN_TYPES = ("upload", "connector", "resolution")
+
 
 def _evt(properties: Mapping, required: list[str]) -> dict:
     return {
@@ -178,6 +192,38 @@ _CONFIRMER = {
     "properties": {"subject": {"type": "string"}, "role": {"type": "string"}},
     "additionalProperties": False,
 }
+
+def _confirmed_schema() -> dict:
+    """OVERLAY_FACT_CONFIRMED payload schema. Extended ADDITIVELY for #10 under schema_version 1
+    (the established pattern for optional fields here — see `note`/`category`): `confirmers` is no
+    longer unconditionally required; instead the `oneOf` authority rule demands EITHER real human
+    `confirmers` OR the complete source-declared triple (`authority_basis` + `origin_type` +
+    `role_claims`) — never both, never neither. Every pre-#10 event (confirmers, no
+    authority_basis) satisfies the first arm unchanged, so existing events still validate and
+    replay without an upcaster."""
+    schema = _evt(
+        {
+            "value": {"type": "object"},
+            "confirmers": {"type": "array", "items": _CONFIRMER},
+            # #10 source-declared authority (all three or none — enforced by the oneOf below):
+            "authority_basis": {"type": "string", "enum": [AUTHORITY_SOURCE_DECLARED]},
+            "origin_type": {"type": "string", "enum": list(ORIGIN_TYPES)},
+            "role_claims": {"type": "array", "items": {"type": "string"}},
+            "expires_at": _NSTR,
+            "confirms_event_id": _STR,
+            "note": _NSTR,  # optional approver note (confirmation surface); absent pre-feature
+        },
+        ["value", "confirms_event_id"],
+    )
+    schema["oneOf"] = [
+        # human confirmation (and every legacy pre-#10 event): confirmers, no authority basis
+        {"required": ["confirmers"], "not": {"required": ["authority_basis"]}},
+        # source-declared: the complete honest-attribution triple, and NO confirmer entry
+        {"required": ["authority_basis", "origin_type", "role_claims"],
+         "not": {"required": ["confirmers"]}},
+    ]
+    return schema
+
 
 OVERLAY_EVENT_SCHEMAS: dict[str, dict] = {
     OVERLAY_FACT_PROPOSED: _evt(
@@ -206,16 +252,7 @@ OVERLAY_EVENT_SCHEMAS: dict[str, dict] = {
         {"by_owner": _STR, "role": _STR, "draft_event_id": _STR, "note": _NSTR},
         ["by_owner", "role", "draft_event_id"],
     ),
-    OVERLAY_FACT_CONFIRMED: _evt(
-        {
-            "value": {"type": "object"},
-            "confirmers": {"type": "array", "items": _CONFIRMER},
-            "expires_at": _NSTR,
-            "confirms_event_id": _STR,
-            "note": _NSTR,  # optional approver note (confirmation surface); absent pre-feature
-        },
-        ["value", "confirmers", "confirms_event_id"],
-    ),
+    OVERLAY_FACT_CONFIRMED: _confirmed_schema(),
     OVERLAY_FACT_REJECTED: _evt(
         {
             "rejected_by": _STR,

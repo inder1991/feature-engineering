@@ -30,6 +30,24 @@ class OverlayState:
     object_ref: str | None = None
     fact_type: FactType | None = None
     use_case: str | None = None
+    # #10 honest authority attribution: set from a source-declared CONFIRMED event
+    # (authority_basis="source_declared" + origin_type + the acting principal's role_claims).
+    # None/[] on the confirmer path — human confirms AND legacy pre-#10 events alike.
+    authority_basis: str | None = None
+    origin_type: str | None = None
+    role_claims: list = field(default_factory=list)
+
+    @property
+    def authority_provenance(self) -> str | None:
+        """How this fact's confirmation is attributed: `source_declared` when the event carried an
+        authority basis; `legacy_unspecified` for any confirmer-based confirmation (a genuine human
+        confirm or a pre-#10 auto-confirm — the v1 shape has no discriminator and is NEVER
+        retroactively reclassified); None when nothing is confirmed."""
+        if self.authority_basis is not None:
+            return self.authority_basis
+        if self.confirmers:
+            return facts.AUTHORITY_LEGACY_UNSPECIFIED
+        return None
 
 
 def fold_overlay_state(stream: Iterable) -> OverlayState:
@@ -64,6 +82,9 @@ def fold_overlay_state(stream: Iterable) -> OverlayState:
             st.partial_confirmers = []
             st.expires_at = None
             st.confirmed_event_id = None
+            st.authority_basis = None
+            st.origin_type = None
+            st.role_claims = []
         elif event.type == facts.OVERLAY_FACT_PARTIALLY_CONFIRMED:
             st.status = PARTIALLY_CONFIRMED
             st.partial_confirmers = st.partial_confirmers + [
@@ -72,7 +93,22 @@ def fold_overlay_state(stream: Iterable) -> OverlayState:
         elif event.type == facts.OVERLAY_FACT_CONFIRMED:
             st.status = VERIFIED
             st.value = payload["value"]
-            st.confirmers = list(payload["confirmers"])
+            if "authority_basis" in payload:
+                # #10 source-declared: the source (upload/connector/resolution) is the authority —
+                # record the honest basis + origin + the actor's real role_claims; NO confirmer is
+                # fabricated. Operationally identical to the confirmer path (same VERIFIED).
+                st.authority_basis = payload["authority_basis"]
+                st.origin_type = payload.get("origin_type")
+                st.role_claims = list(payload.get("role_claims") or [])
+                st.confirmers = []
+            else:
+                # Human confirmation — and every legacy pre-#10 event, which used this same shape
+                # for auto-confirms too. Folds exactly as before (`legacy_unspecified` provenance
+                # via authority_provenance); NEVER retroactively reclassified as source_declared.
+                st.confirmers = list(payload["confirmers"])
+                st.authority_basis = None
+                st.origin_type = None
+                st.role_claims = []
             st.expires_at = payload.get("expires_at")
             st.confirmed_event_id = event.event_id
             st.prior_value = None
