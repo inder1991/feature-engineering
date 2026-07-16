@@ -296,8 +296,15 @@ def enrich_concepts(conn, rows: list[CanonicalRow], client: LLMClient, actor=Non
                         "the single best-fitting concept name, or 'unclassified' if none fits.", actor)
             if raw is None:
                 continue   # failure/empty -> don't cache; retry next ingest (M3)
-            concept = raw if is_known_concept(raw) else UNCLASSIFIED
-            _cache_put(conn, "enrichment_concept", h, concept, _CONCEPT_CACHE_VERSION)
+            # #22: only a REAL classification is durable — a known concept, or the literal
+            # 'unclassified' (a legitimate "none fits" verdict). An UNKNOWN/off-vocabulary response
+            # is still coerced to UNCLASSIFIED for THIS run (today's return behaviour) but is NOT
+            # cached: caching the coercion would poison the cache permanently on a transient bad
+            # response, where batch mode rejects unknowns for retry (_accept_concept).
+            classified = raw == UNCLASSIFIED or is_known_concept(raw)
+            concept = raw if classified else UNCLASSIFIED
+            if classified:
+                _cache_put(conn, "enrichment_concept", h, concept, _CONCEPT_CACHE_VERSION)
             result[h] = concept
             resolved[h] = concept
 

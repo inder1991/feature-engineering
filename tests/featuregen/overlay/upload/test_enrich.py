@@ -27,6 +27,35 @@ def test_unknown_concept_falls_back_to_unclassified(db):
     assert out[content_hash(rows[0])] == "unclassified"
 
 
+def test_unknown_concept_is_not_cached_and_retries_next_run(db):
+    """#22: single mode coerces an UNKNOWN/off-vocabulary concept to 'unclassified' for THIS run,
+    but must not cache the coercion — a transient bad response would poison the cache permanently
+    (batch mode already rejects unknowns for retry). A later run re-attempts and a now-valid
+    response is cached."""
+    rows = [CanonicalRow("deposits", "accounts", "weird", "text")]
+    h = content_hash(rows[0])
+    bad = FakeLLM(script={_TASK: FakeResponse(output={"concept": "totally_made_up"})})
+    assert enrich_concepts(db, rows, bad)[h] == "unclassified"   # this-run coercion kept
+    assert db.execute("SELECT count(*) FROM enrichment_concept").fetchone()[0] == 0  # NOT cached
+    # Next run re-attempts (no poisoned cache hit) and the valid classification sticks.
+    ok = FakeLLM(script={_TASK: FakeResponse(output={"concept": "monetary_stock"})})
+    assert enrich_concepts(db, rows, ok)[h] == "monetary_stock"
+    cached = enrich_concepts(db, rows, _NeverCalledLLM())
+    assert cached[h] == "monetary_stock"
+
+
+def test_genuine_unclassified_is_a_real_classification_and_caches(db):
+    """#22: the literal 'unclassified' is a legitimate vocabulary value ("none of the concepts
+    fits") — it stays cacheable, unlike the unknown/error coercion."""
+    rows = [CanonicalRow("deposits", "accounts", "weird", "text")]
+    h = content_hash(rows[0])
+    client = FakeLLM(script={_TASK: FakeResponse(output={"concept": "unclassified"})})
+    assert enrich_concepts(db, rows, client)[h] == "unclassified"
+    assert db.execute("SELECT count(*) FROM enrichment_concept").fetchone()[0] == 1  # cached
+    cached = enrich_concepts(db, rows, _NeverCalledLLM())   # cache hit — client never called
+    assert cached[h] == "unclassified"
+
+
 class _CapturingFake(FakeLLM):
     def call(self, request):
         self.last = request
