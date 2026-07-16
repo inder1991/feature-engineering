@@ -10,6 +10,7 @@ from typing import Annotated
 
 import psycopg
 from fastapi import Depends, FastAPI
+from fastapi.responses import PlainTextResponse
 
 from featuregen.aggregates.bootstrap import register_phase06_event_schemas
 from featuregen.api.deps import get_conn, get_identity
@@ -38,6 +39,7 @@ from featuregen.events.registry import event_registry
 from featuregen.intake.llm import LLMClient
 from featuregen.overlay.config import overlay_config_from_env, register_overlay_config
 from featuregen.overlay.facts import register_overlay_event_types
+from featuregen.overlay.upload.ingestion_run import RUN_ID_HEADER
 
 logger = logging.getLogger(__name__)
 
@@ -88,6 +90,21 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
 def create_app(llm_client: LLMClient | None = None) -> FastAPI:
     app = FastAPI(title="FeatureGen API", lifespan=_lifespan)
     app.state.llm_client = llm_client
+
+    @app.exception_handler(Exception)
+    def _raw_fault_run_id_header(request, exc: Exception) -> PlainTextResponse:
+        """Design #3 (review FIX 2/3): the ingestion routes attach ``exc.headers[RUN_ID_HEADER]``
+        to a raw (non-HTTPException) fault so the caller can still link the 500 to its durable
+        run. Starlette's default ServerErrorMiddleware response carries no such header, so this
+        handler reproduces that response byte-for-byte — same plain-text body, status 500 — and
+        adds ONLY the run-id header, only when the raising route attached one (any other
+        ``headers`` shape, e.g. urllib's HTTPError.headers, is ignored). The middleware still
+        re-raises the exception after the response is sent, so logging and test visibility are
+        unchanged."""
+        headers = getattr(exc, "headers", None)
+        run_id = headers.get(RUN_ID_HEADER) if isinstance(headers, dict) else None
+        return PlainTextResponse("Internal Server Error", status_code=500,
+                                 headers={RUN_ID_HEADER: run_id} if run_id else None)
 
     app.include_router(auth.router)
     app.include_router(admin.router)

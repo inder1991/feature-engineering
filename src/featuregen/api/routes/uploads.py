@@ -183,3 +183,16 @@ def create_upload(
             reason_code=f"http_{exc.status_code}", fallback_conn=conn)
         exc.headers = {**(exc.headers or {}), _RUN_ID_HEADER: run_id}
         raise
+    except Exception as exc:
+        # Review FIX 2: a raw (non-HTTPException) fault — e.g. a psycopg.Error from the
+        # source_fingerprint calls or the success-path terminalize — used to escape with NO
+        # run-id header and leave the run stuck in_progress. The request transaction is likely
+        # ABORTED (a DB fault poisons it), so the terminal state MUST go on a fresh connection;
+        # then the run id rides the raised exception's headers, which the app-level Exception
+        # handler lifts onto the default 500 response (body untouched). Re-raised unchanged.
+        terminalize_run_durable(
+            run_id, status="failed", now=datetime.now(UTC), file_sha256=file_sha256,
+            redacted_failure_code=type(exc).__name__,
+            reason_code="unhandled_exception", fallback_conn=conn)
+        exc.headers = {**(getattr(exc, "headers", None) or {}), _RUN_ID_HEADER: run_id}
+        raise

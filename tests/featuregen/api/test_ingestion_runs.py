@@ -12,6 +12,8 @@ from __future__ import annotations
 import hashlib
 import io
 
+import psycopg
+from fastapi.testclient import TestClient
 from tests.featuregen.api._helpers import AUTH, DEPOSITS_CSV, VIEWER, upload_csv
 
 RUN_HEADER = "X-Ingestion-Run-Id"
@@ -143,6 +145,50 @@ def test_ingest_fault_records_failed_run(client, monkeypatch):
     assert run["status"] == "failed"
     assert run["redacted_failure_code"] == "RuntimeError"
     assert run["status_history"][-1]["reason_code"] == "http_500"
+
+
+def test_raw_db_fault_records_failed_run_on_fresh_conn_and_500_carries_header(
+        client, conn, monkeypatch, _dsn):
+    """Review FIX 2 (+ M-5): a REAL psycopg.Error escaping create_upload — here from the
+    source_fingerprint seam, which only the outer handlers see — POISONS the request transaction
+    (any later statement on it raises InFailedSqlTransaction), so the terminal state can only be
+    recorded by ``terminalize_run_durable`` on a FRESH connection. The raw 500 must still carry
+    the run-id header (body byte-for-byte Starlette's default), and the 'failed' run must be
+    retrievable via GET afterwards. Pre-fix the exception escaped the route entirely: no header,
+    and the run stayed 'in_progress' forever."""
+    from featuregen.api.routes import uploads
+
+    monkeypatch.setenv("FEATUREGEN_DSN", _dsn)   # arm the fresh-connection durable path
+
+    def _poisoning_fingerprint(c, source):
+        # genuinely-bad SQL on the REQUEST connection: raises a real psycopg.Error AND aborts
+        # the tx — the in-request fallback conn is now unusable, only a fresh conn can write
+        return c.execute("SELECT definitely_not_a_column FROM ingestion_run").fetchone()
+
+    monkeypatch.setattr(uploads, "source_fingerprint", _poisoning_fingerprint)
+
+    run_id = None
+    try:
+        with TestClient(client.app, raise_server_exceptions=False) as raw_client:
+            res = upload_csv(raw_client, "deposits", DEPOSITS_CSV)
+        assert res.status_code == 500
+        run_id = res.headers[RUN_HEADER]                    # the header survives the raw fault
+        assert run_id.startswith("ingrun_")
+        assert res.text == "Internal Server Error"          # body-compat: the default 500, untouched
+
+        conn.rollback()   # clear the poisoned suite tx so the GET below can run on it
+        run = _get_run(client, run_id).json()
+        assert run["status"] == "failed"                    # written on the FRESH conn (durable)
+        assert run["redacted_failure_code"] == "UndefinedColumn"   # the CLASS, never the message
+        assert "definitely_not_a_column" not in str(run)
+        assert [e["status"] for e in run["status_history"]] == ["in_progress", "failed"]
+        assert run["status_history"][-1]["reason_code"] == "unhandled_exception"
+    finally:
+        if run_id:   # the durable rows committed for real — clean them up
+            with psycopg.connect(_dsn) as c:
+                c.execute("DELETE FROM ingestion_run_status_event WHERE ingestion_run_id = %s",
+                          (run_id,))
+                c.execute("DELETE FROM ingestion_run WHERE id = %s", (run_id,))
 
 
 # ── GET /ingestion-runs/{run_id} ──────────────────────────────────────────────────────────────────
