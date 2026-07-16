@@ -36,6 +36,7 @@ from typing import Any
 
 from featuregen.overlay.upload.brake import large_change_brake
 from featuregen.overlay.upload.canonical import CanonicalRow, validate_rows
+from featuregen.overlay.upload.graph import parse_join_ref
 from featuregen.overlay.upload.upload_catalog import UploadCatalog
 
 # ---- Client ---------------------------------------------------------------------------------
@@ -418,31 +419,69 @@ def semantics_pending_count(rows: Iterable[CanonicalRow]) -> int:
 # ---- Preview (dry run — NEVER writes) --------------------------------------------------------
 
 
-def _current_columns(conn: Any, target_source: str) -> dict[str, dict[str, tuple[str, str, bool]]]:
-    """Current catalog columns for the target source: {table: {column: (type, sensitivity,
-    grain)}} — the exact local state a preview's diff is computed against."""
-    existing: dict[str, dict[str, tuple[str, str, bool]]] = {}
-    for tbl, coln, dtype, sens, grain in conn.execute(
-            "SELECT table_name, column_name, data_type, COALESCE(sensitivity, ''), is_grain "
+def _join_display(joins_to: str) -> str:
+    """Canonical 'table.column' display of a join target, '' when blank/malformed — the SAME
+    parse_join_ref build_graph gates its edge write on, so the diff and the import agree on what a
+    declared join resolves to (a malformed joins_to writes NO edge, i.e. compares as blank)."""
+    parsed = parse_join_ref(joins_to)
+    return f"{parsed.to_table}.{parsed.to_col}" if parsed.ok else ""
+
+
+def _current_columns(conn: Any, target_source: str) -> dict[str, dict[str, dict[str, Any]]]:
+    """Current catalog columns for the target source: {table: {column: {field: value}}} covering
+    EVERY per-column field an import (build_graph) writes — type, sensitivity, is_grain, is_as_of,
+    definition, additivity, unit, currency, entity, and the column's 'joins' edge (#2) — the exact
+    local state a preview's diff is computed against."""
+    existing: dict[str, dict[str, dict[str, Any]]] = {}
+    for (tbl, coln, dtype, sens, grain, as_of, definition, additivity, unit, currency,
+         entity) in conn.execute(
+            "SELECT table_name, column_name, data_type, COALESCE(sensitivity, ''), is_grain, "
+            "is_as_of, COALESCE(definition, ''), COALESCE(additivity, ''), COALESCE(unit, ''), "
+            "COALESCE(currency, ''), COALESCE(entity, '') "
             "FROM graph_node WHERE catalog_source = %s AND kind = 'column'",
             (target_source,)).fetchall():
-        existing.setdefault(tbl, {})[coln] = (dtype or "", sens, bool(grain))
+        existing.setdefault(tbl, {})[coln] = {
+            "type": dtype or "", "sensitivity": sens, "is_grain": bool(grain),
+            "is_as_of": bool(as_of), "definition": definition, "additivity": additivity,
+            "unit": unit, "currency": currency, "entity": entity, "joins_to": ""}
+    # The column's current join lives on graph_edge, not the node row; resolve the edge target back
+    # to 'table.column' via graph_node (never by splitting the ref string) so the diff compares the
+    # same canonical form the incoming joins_to normalizes to.
+    for tbl, coln, to_ref in conn.execute(
+            "SELECT n.table_name, n.column_name, e.to_ref FROM graph_edge e "
+            "JOIN graph_node n ON n.catalog_source = e.catalog_source "
+            "AND n.object_ref = e.from_ref "
+            "WHERE e.catalog_source = %s AND e.kind = 'joins' AND n.kind = 'column' "
+            "ORDER BY e.to_ref",
+            (target_source,)).fetchall():
+        if tbl in existing and coln in existing[tbl]:
+            existing[tbl][coln]["joins_to"] = _join_display(to_ref)
     return existing
 
 
-def _baseline_hash(existing: Mapping[str, Mapping[str, tuple[str, str, bool]]]) -> str:
-    canon = sorted(
-        [tbl, col, dtype, sens, grain]
-        for tbl, cols in existing.items() for col, (dtype, sens, grain) in cols.items())
-    return hashlib.sha256(json.dumps(canon).encode()).hexdigest()
+def _baseline_hash(existing: Mapping[str, Mapping[str, Mapping[str, Any]]]) -> str:
+    return hashlib.sha256(json.dumps(existing, sort_keys=True).encode()).hexdigest()
 
 
 def local_baseline_hash(conn: Any, target_source: str) -> str:
-    """Deterministic hash of the CURRENT local catalog state (graph_node columns) for a source —
+    """Deterministic hash of the CURRENT local catalog state for a source (graph_node columns,
+    every import-written field, plus their join edges — the same state the diff reads, #2) —
     the baseline a preview's diff was computed against. Preview returns it; approval recomputes it
     and 409s on a mismatch, so an upload landing between preview and approval forces a re-preview
     instead of importing a diff the human never reviewed (#13, the LOCAL twin of snapshot_hash)."""
     return _baseline_hash(_current_columns(conn, target_source))
+
+
+def _field_change(cname: str, label: str, old: str, new: str, *, quote: bool = False) -> str:
+    """One human-readable diff line for a string-valued field, matching the type/sensitivity line
+    style. A blank INCOMING value renders as '(cleared)': import rebuilds the node from the
+    incoming row, so blank-over-set really clears the field (the OM connector leaves additivity/
+    unit/currency/entity blank by design — the reviewer must see that loss, #2). A blank CURRENT
+    value renders empty: 'cust_id join: -> customers.cust_id'."""
+    def render(value: str) -> str:
+        return f"'{value}'" if quote and value else value
+    head = f"{cname} {label}: {render(old)}" if old else f"{cname} {label}:"
+    return f"{head} -> {render(new) if new else '(cleared)'}"
 
 
 def build_preview(conn: Any, config: OMConfig, translation: Translation) -> dict[str, Any]:
@@ -482,14 +521,29 @@ def build_preview(conn: Any, config: OMConfig, translation: Translation) -> dict
                 if cname not in ex:
                     changes.append(f"column {cname} added")
                     continue
-                old_type, old_sens, old_grain = ex[cname]
-                if (row.type or "") != old_type:
-                    changes.append(f"{cname} type: {old_type or 'none'} -> {row.type or 'none'}")
-                if (row.sensitivity or "") != old_sens:
-                    changes.append(f"{cname} sensitivity: {old_sens or 'none'} -> "
+                cur = ex[cname]
+                if (row.type or "") != cur["type"]:
+                    changes.append(f"{cname} type: {cur['type'] or 'none'} -> "
+                                   f"{row.type or 'none'}")
+                if (row.sensitivity or "") != cur["sensitivity"]:
+                    changes.append(f"{cname} sensitivity: {cur['sensitivity'] or 'none'} -> "
                                    f"{row.sensitivity or 'none'}")
-                if row.is_grain != old_grain:
-                    changes.append(f"{cname} grain: {old_grain} -> {row.is_grain}")
+                if row.is_grain != cur["is_grain"]:
+                    changes.append(f"{cname} grain: {cur['is_grain']} -> {row.is_grain}")
+                if row.as_of != cur["is_as_of"]:
+                    changes.append(f"{cname} as_of: {cur['is_as_of']} -> {row.as_of}")
+                # Every remaining field the import writes to graph_node — definition, the
+                # semantics slots, and the join edge (#2). A diff that omitted these reported
+                # 'unchanged' while the import overwrote or CLEARED them.
+                for label, new, old, quote in (
+                        ("definition", row.definition or "", cur["definition"], True),
+                        ("additivity", row.additivity or "", cur["additivity"], False),
+                        ("unit", row.unit or "", cur["unit"], False),
+                        ("currency", row.currency or "", cur["currency"], False),
+                        ("entity", row.entity or "", cur["entity"], False),
+                        ("join", _join_display(row.joins_to), cur["joins_to"], False)):
+                    if new != old:
+                        changes.append(_field_change(cname, label, old, new, quote=quote))
             # Removal is judged against the whole PULL (good + quarantined): a quarantined column
             # is held for review, not removed — reporting it as removed would be dishonest.
             for cname in sorted(ex):

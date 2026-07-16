@@ -477,6 +477,99 @@ def test_preview_diffs_against_current_catalog(conn):
                    "(expected one of: pii, restricted)"}]
 
 
+def test_preview_definition_only_change_is_surfaced(conn):
+    """#2: a column whose ONLY difference is `definition` must show as changed with a specific
+    line — the old diff compared type/sensitivity/grain only and reported the table unchanged,
+    hiding a real rewrite from the approving human."""
+    actor = make_actor(subject="user:owner", roles=("data_owner",))
+    existing = [replace(r, definition="row creation timestamp")
+                if (r.table, r.column) == ("customers", "created_at") else r
+                for r in _existing_cards_rows()]
+    assert ingest_upload(conn, "cards", existing, actor=actor).status == "ingested"
+
+    preview = build_preview(conn, CARDS_CONFIG, _rows())
+    customers = {t["table"]: t for t in preview["tables"]}["customers"]
+    assert customers["status"] == "changed"
+    assert customers["changes"] == [
+        "created_at definition: 'row creation timestamp' -> 'row creation time'"]
+
+
+def test_preview_surfaces_import_clearing_semantics_fields(conn):
+    """#2: the OM connector leaves additivity/unit/currency/entity blank by design and import
+    rebuilds the node from the incoming row — so blank-over-set is a REAL clear the reviewer
+    must see, never an 'unchanged' verdict."""
+    actor = make_actor(subject="user:owner", roles=("data_owner",))
+    existing = [replace(r, additivity="additive", unit="dollars", currency="USD",
+                        entity="Account")
+                if (r.table, r.column) == ("accounts", "balance") else r
+                for r in _existing_cards_rows()]
+    assert ingest_upload(conn, "cards", existing, actor=actor).status == "ingested"
+
+    preview = build_preview(conn, CARDS_CONFIG, _rows())
+    accounts = {t["table"]: t for t in preview["tables"]}["accounts"]
+    assert accounts["status"] == "changed"
+    assert "balance additivity: additive -> (cleared)" in accounts["changes"]
+    assert "balance unit: dollars -> (cleared)" in accounts["changes"]
+    assert "balance currency: USD -> (cleared)" in accounts["changes"]
+    assert "balance entity: Account -> (cleared)" in accounts["changes"]
+
+
+def test_preview_surfaces_as_of_change(conn):
+    """#2: `is_as_of` is written by the import (OM rows always carry as_of=False), so an import
+    that would un-set a confirmed as-of column is a visible change, not an 'unchanged' table."""
+    actor = make_actor(subject="user:owner", roles=("data_owner",))
+    existing = [replace(r, as_of=True, as_of_basis="posted_at")
+                if (r.table, r.column) == ("customers", "created_at") else r
+                for r in _existing_cards_rows()]
+    assert ingest_upload(conn, "cards", existing, actor=actor).status == "ingested"
+
+    preview = build_preview(conn, CARDS_CONFIG, _rows())
+    customers = {t["table"]: t for t in preview["tables"]}["customers"]
+    assert customers["status"] == "changed"
+    assert "created_at as_of: True -> False" in customers["changes"]
+
+
+def test_preview_surfaces_join_change(conn):
+    """#2: an incoming joins_to differing from the current 'joins' edge is surfaced — a rewired
+    relationship must not hide inside an 'unchanged' table."""
+    actor = make_actor(subject="user:owner", roles=("data_owner",))
+    existing = [replace(r, joins_to="clients.client_id")
+                if (r.table, r.column) == ("accounts", "cust_id") else r
+                for r in _existing_cards_rows()]
+    assert ingest_upload(conn, "cards", existing, actor=actor).status == "ingested"
+
+    preview = build_preview(conn, CARDS_CONFIG, _rows())
+    accounts = {t["table"]: t for t in preview["tables"]}["accounts"]
+    assert accounts["status"] == "changed"
+    assert "cust_id join: clients.client_id -> customers.cust_id" in accounts["changes"]
+
+
+def test_preview_surfaces_join_the_import_would_add(conn):
+    """#2: a join the import would ADD (no current edge) renders with a blank old side."""
+    actor = make_actor(subject="user:owner", roles=("data_owner",))
+    existing = [replace(r, joins_to="")
+                if (r.table, r.column) == ("accounts", "cust_id") else r
+                for r in _existing_cards_rows()]
+    assert ingest_upload(conn, "cards", existing, actor=actor).status == "ingested"
+
+    preview = build_preview(conn, CARDS_CONFIG, _rows())
+    accounts = {t["table"]: t for t in preview["tables"]}["accounts"]
+    assert accounts["status"] == "changed"
+    assert "cust_id join: -> customers.cust_id" in accounts["changes"]
+
+
+def test_preview_unchanged_table_has_no_spurious_change_lines(conn):
+    """Honest but not noisy (#2): a column whose EVERY compared field matches the incoming row —
+    including definition, semantics blanks, and the join edge — stays unchanged with zero lines."""
+    actor = make_actor(subject="user:owner", roles=("data_owner",))
+    assert ingest_upload(conn, "cards", _existing_cards_rows(), actor=actor).status == "ingested"
+
+    preview = build_preview(conn, CARDS_CONFIG, _rows())
+    customers = {t["table"]: t for t in preview["tables"]}["customers"]
+    assert customers["status"] == "unchanged"
+    assert customers["changes"] == []
+
+
 def test_preview_flags_whole_table_removal(conn):
     """A table in the current catalog that the pull no longer includes is surfaced as 'removed' —
     import DELETE-then-rebuilds the source, so the human must see the drop before approving."""
