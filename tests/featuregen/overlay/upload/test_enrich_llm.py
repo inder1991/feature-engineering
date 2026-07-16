@@ -325,6 +325,31 @@ def test_llm_egress_audit_stays_transactional_without_production_dsn(db, monkeyp
     assert n == 1                                         # visible in-tx; rolled back on teardown
 
 
+def test_durable_audit_connection_built_from_settings_dsn(db, monkeypatch):
+    """#20 follow-up: psycopg3's ConnectionInfo.dsn STRIPS the password, so a durable-audit
+    connection built from conn.info.dsn fails auth in any password-auth deployment and silently
+    falls back to the request conn — defeating the durability #20 promised. The separate
+    connection must be opened from get_settings().dsn (the full configured DSN, password intact),
+    the exact api.deps.audit_access_denied pattern."""
+    import psycopg
+
+    marker_dsn = "host=settings-dsn-marker dbname=audit user=fg password=kept"
+    monkeypatch.setenv("FEATUREGEN_DSN", marker_dsn)      # durable-audit gate ON
+    seen: list[str] = []
+
+    def spy(conninfo, *args, **kwargs):
+        seen.append(conninfo)
+        raise RuntimeError("spy: durable connection intentionally refused")
+
+    monkeypatch.setattr(psycopg, "connect", spy)
+    out = _call(db, _Capture())                           # best-effort fallback -> request conn
+    assert out == "monetary_amount"
+    assert seen == [marker_dsn]                           # settings DSN, NOT conn.info.dsn
+    n = db.execute(
+        "SELECT count(*) FROM llm_call WHERE run_id = 'overlay-enrichment'").fetchone()[0]
+    assert n == 1                                         # fallback record stays transactional
+
+
 def test_flag_off_no_client_means_no_llm_egress_paths_at_all(db):
     """FLAG-OFF safety: with no LLM provider wired (client=None — the default), ingest never
     touches the enrichment/egress seams: no llm_call rows, no EGRESS_BLOCKED events, upload

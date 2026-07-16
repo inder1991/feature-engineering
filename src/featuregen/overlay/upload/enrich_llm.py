@@ -165,9 +165,10 @@ def _record_llm_call_durable(conn, **record_kwargs) -> None:
     failure in the same request would erase the evidence that data left the system). Mirror of the
     api.deps.audit_access_denied separate-connection pattern: gated on the production DSN being
     configured (unset ⟹ tests / no-DB harness, where a separately-committing connection would
-    pollute the rolled-back test DB — same reasoning as that gate), and connecting to the SAME
-    database the upload runs on (``conn.info.dsn``, the runtime.dispatch derivation) so a stray
-    env DSN can never redirect audit rows elsewhere.
+    pollute the rolled-back test DB — same reasoning as that gate), and connecting with
+    ``get_settings().dsn`` — the FULL configured DSN, exactly as audit_access_denied does. NOT
+    ``conn.info.dsn``: psycopg3's ConnectionInfo.dsn strips the password, so in a password-auth
+    deployment that connect fails and the record silently degrades to the request conn.
 
     The fresh connection performs ONE bare INSERT (record_llm_call) and NEVER takes an advisory
     lock — it cannot re-acquire the upload's ``pg_advisory_xact_lock`` and self-deadlock the way a
@@ -177,9 +178,10 @@ def _record_llm_call_durable(conn, **record_kwargs) -> None:
 
     Best-effort fallback: if the separate connection cannot be opened/committed, the record is
     written on the request conn — transactional evidence beats none — and the failure is logged."""
-    if get_settings().dsn:
+    dsn = get_settings().dsn
+    if dsn:
         try:
-            with psycopg.connect(conn.info.dsn) as audit_conn:  # own tx, committed on `with` exit
+            with psycopg.connect(dsn) as audit_conn:  # own tx, committed on `with` exit
                 record_llm_call(audit_conn, **record_kwargs)
             return
         except Exception:  # noqa: BLE001 — degraded audit must never fail the (done) provider call
