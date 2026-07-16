@@ -25,7 +25,7 @@ from featuregen.overlay.projection import OverlayProjection
 from featuregen.overlay.state import fold_overlay_state
 from featuregen.overlay.store import append_overlay_event, load_fact
 from featuregen.overlay.upload.brake import large_change_brake, resolution_brake
-from featuregen.overlay.upload.canonical import CanonicalRow, validate_rows
+from featuregen.overlay.upload.canonical import CanonicalRow, ValidationResult, validate_rows
 from featuregen.overlay.upload.enrich import (
     classify_domains,
     content_hash,
@@ -730,6 +730,19 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
     if glossary is not None and profile is None:
         profile = FTR_GLOSSARY_PROFILE
     vr = validate_rows(rows, catalog_source, profile=profile)
+    if glossary is not None and glossary.quarantined:
+        # #9 — merge the READER-level quarantine (multi-schema fold collisions: the schema is dropped
+        # from the CanonicalRow, so only the reader could detect them) into this upload's quarantine,
+        # so the collisions land in the review queue beside validation failures. Index spaces are
+        # disjoint by construction (reader indexes start at len(rows); validate's are < len(rows)),
+        # so the quarantine_row (catalog_source, row_index) PK cannot conflict. An ALL-collisions
+        # glossary leaves `rows` empty — validate's "empty upload" structural error would then mask
+        # the real cause AND skip persistence; clear it so the all-quarantined path below persists
+        # the collisions and rejects honestly. A structural error on a NON-empty `rows` (e.g. "no
+        # row has a source") still rejects as before.
+        vr = ValidationResult(good=vr.good,
+                              quarantined=[*vr.quarantined, *glossary.quarantined],
+                              structural_error=vr.structural_error if rows else None)
     if vr.structural_error:
         return IngestResult("rejected", vr.structural_error, 0, 0, len(vr.quarantined))
 

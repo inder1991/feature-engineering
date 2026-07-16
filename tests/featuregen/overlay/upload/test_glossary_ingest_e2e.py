@@ -153,3 +153,40 @@ def test_non_public_schema_glossary_projects_into_graph_node(db, monkeypatch):
     assert definition.startswith("The ledger balance of the account.")
     assert concept_decision_id is not None                         # display ≠ authority link landed
     assert definition_decision_id is not None
+
+
+# ── #9 — multi-schema fold collision: the flat graph node ref hardcodes `public.`, so two glossary
+# rows from DIFFERENT schemas sharing (table, column) would silently fold into ONE graph node
+# (last-writer-wins). The reader quarantines the colliding pair; ingest must land them in the review
+# queue (quarantine_row) with the schema-collision reason while the clean rows ingest normally. ──
+_COLLIDE_SOURCE = "gloss_collide"
+
+
+def test_multi_schema_collision_lands_in_review_queue_not_graph(db):
+    _seal()
+    csv_text = (
+        "physical_name,business_term,description_business_definition,data_domain,bian_path,fibo_path\n"
+        f"public.accounts.balance,Account Balance,{_BAL_DEF},Deposits,Product/CurrentAccount,"
+        "fibo-fbc:Balance\n"
+        "sales.orders.id,Order Id,The sales order identifier.,Sales,,\n"
+        "hr.orders.id,Order Id,The HR order identifier.,HR,,\n")
+    upload = read_glossary(csv_text, source=_COLLIDE_SOURCE)
+
+    res = ingest_upload(db, _COLLIDE_SOURCE, upload.rows, actor=_actor(), now=NOW, client=None,
+                        glossary=upload)
+    assert res.status == "ingested"                     # the clean row still ingests
+    assert res.quarantined == 2                         # the colliding pair is counted
+
+    reasons = [r[0] for r in db.execute(
+        "SELECT reason FROM quarantine_row WHERE catalog_source = %s ORDER BY row_index",
+        (_COLLIDE_SOURCE,)).fetchall()]
+    assert len(reasons) == 2
+    assert all("schema collision" in r and "orders.id" in r for r in reasons)
+
+    # Neither colliding row reached the graph — no silently merged `public.orders.id` node.
+    assert db.execute(
+        "SELECT 1 FROM graph_node WHERE catalog_source = %s AND object_ref = 'public.orders.id'",
+        (_COLLIDE_SOURCE,)).fetchone() is None
+    assert db.execute(
+        "SELECT 1 FROM graph_node WHERE catalog_source = %s AND object_ref = 'public.accounts.balance'",
+        (_COLLIDE_SOURCE,)).fetchone() is not None

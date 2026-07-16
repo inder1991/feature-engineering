@@ -30,8 +30,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 
 from featuregen.overlay.upload._headers import _norm as _norm_header
-from featuregen.overlay.upload.canonical import UNKNOWN_TYPE, CanonicalRow
-from featuregen.overlay.upload.object_ref import normalize_ref
+from featuregen.overlay.upload.canonical import UNKNOWN_TYPE, CanonicalRow, RowError
+from featuregen.overlay.upload.object_ref import _norm, normalize_ref
 from featuregen.overlay.upload.source_profile import (
     FTR_GLOSSARY_PROFILE,
     profile_for_upload,
@@ -82,10 +82,17 @@ class GlossaryRecord:
 @dataclass(frozen=True, slots=True)
 class GlossaryUpload:
     """The result of reading a glossary CSV: canonical rows for the validate → graph spine plus the
-    per-term semantic sidecars keyed by ``normalize_ref``."""
+    per-term semantic sidecars keyed by ``normalize_ref``.
+
+    ``quarantined`` (#9) carries the rows the READER itself failed closed on — a multi-schema fold
+    collision, detected here because the flat ``CanonicalRow`` drops the schema so validation can no
+    longer see it. ``ingest_upload`` merges these into the upload's quarantine (the review queue)
+    alongside validation failures. Each ``row_index`` starts AT ``len(rows)`` so it can never collide
+    with a ``validate_rows`` index (``0..len(rows)-1``) on the ``quarantine_row`` primary key."""
 
     rows: list[CanonicalRow] = field(default_factory=list)
     records: list[GlossaryRecord] = field(default_factory=list)
+    quarantined: list[RowError] = field(default_factory=list)
 
 
 def is_glossary_csv(headers: list[str]) -> bool:
@@ -138,21 +145,51 @@ def read_glossary(text: str, *, source: str) -> GlossaryUpload:
     reader = csv.DictReader(io.StringIO(text))
     fmap = _field_map(list(reader.fieldnames or []))
 
-    rows: list[CanonicalRow] = []
-    records: list[GlossaryRecord] = []
+    # Pass 1 — parse every row and map each COLUMN term's fold key (normalized table.column — the
+    # identity the schema-dropping CanonicalRow/graph collapses to) to its distinct schemas (#9).
+    # The flat graph ref hardcodes `public.` (graph._column_ref), so two column terms from DIFFERENT
+    # schemas sharing (table, column) would silently fold into ONE graph node (last-writer-wins).
+    # Detection must happen HERE: the schema is dropped from the CanonicalRow, so no later stage can
+    # see the collision. Schemas compare NORMALIZED (case/padding variants of one schema are one
+    # schema); the first-seen raw spelling is kept for the reviewer-facing message.
+    parsed = []   # (raw, definition, declared_type, schema, table, column) per CSV row
+    schemas_by_fold: dict[tuple[str, str], dict[str, str]] = {}
     for raw in reader:
-        fqn = _cell(fmap, raw, "fqn")
         definition = _cell(fmap, raw, "definition")
         # Optional declared physical type; blank/absent -> UNKNOWN_TYPE (the historical default).
         declared_type = _cell(fmap, raw, "data_type").lower() or UNKNOWN_TYPE
-        schema, table, column = _split_fqn(fqn)
+        schema, table, column = _split_fqn(_cell(fmap, raw, "fqn"))
+        parsed.append((raw, definition, declared_type, schema, table, column))
+        if table is not None and column is not None and schema is not None:
+            fold = (_norm(table), _norm(column))
+            schemas_by_fold.setdefault(fold, {}).setdefault(_norm(schema), schema)
 
+    # Pass 2 — emit rows/records, diverting every column term whose fold key spans >1 schema into
+    # the reader-level quarantine (fail-closed: no CanonicalRow, no sidecar — a quarantined identity
+    # must not be graphed or receive evidence). A single schema per (table, column) — one schema, or
+    # the same schema repeated — ingests exactly as before.
+    rows: list[CanonicalRow] = []
+    records: list[GlossaryRecord] = []
+    collisions: list[tuple[str, CanonicalRow]] = []   # (message, raw-valued row) pending an index
+    for raw, definition, declared_type, schema, table, column in parsed:
         if table is None:
             # Unresolvable FQN — emit an identity-less row so profile-aware validate_rows quarantines
             # it (failure class: invalid FQN / missing identity). No sidecar: a ref needs a table.
             rows.append(CanonicalRow(source=source, table="", column="", type=UNKNOWN_TYPE,
                                      definition=definition))
             continue
+
+        if column is not None:
+            variants = schemas_by_fold[(_norm(table), _norm(column))]
+            if len(variants) > 1:
+                shown = ", ".join(sorted(variants.values(), key=str.lower))
+                collisions.append((
+                    f"schema collision — {_norm(table)}.{_norm(column)} declared under schemas "
+                    f"[{shown}]; the catalog graph is single-schema, so these rows would silently "
+                    f"merge into one column — resolve to a single schema and re-upload",
+                    CanonicalRow(source=source, table=table, column=column,
+                                 type=declared_type, definition=definition)))
+                continue
 
         records.append(GlossaryRecord(
             logical_ref=normalize_ref(source, schema, table, column),
@@ -165,4 +202,7 @@ def read_glossary(text: str, *, source: str) -> GlossaryUpload:
             rows.append(CanonicalRow(source=source, table=table, column=column,
                                      type=declared_type, definition=definition))
 
-    return GlossaryUpload(rows=rows, records=records)
+    # Index the reader-level quarantine AFTER the emitted rows: validate_rows indexes 0..len(rows)-1,
+    # and quarantine_row PKs on (catalog_source, row_index), so the spaces must stay disjoint.
+    quarantined = [RowError(len(rows) + j, msg, row) for j, (msg, row) in enumerate(collisions)]
+    return GlossaryUpload(rows=rows, records=records, quarantined=quarantined)

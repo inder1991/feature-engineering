@@ -191,3 +191,69 @@ def test_declared_type_rows_still_pass_under_glossary_profile():
     vr = validate_rows(up.rows, "ftr", profile=FTR_GLOSSARY_PROFILE)
     assert len(vr.good) == 3                                  # a declared type is accepted, not rejected
     assert vr.quarantined == []
+
+
+# --- #9 — multi-schema fold collision (the flat graph is single-schema) ---------------------------
+# The graph node ref is `public.<table>.<column>` (schema hardcoded), so two glossary rows from
+# DIFFERENT schemas sharing (table, column) would silently fold into ONE node (last-writer-wins).
+# Fail closed: the reader — the only place the schema is still in hand — quarantines BOTH rows.
+
+_COLLISION_CSV = (
+    "physical_name,business_term,description_business_definition,data_domain,bian_path,fibo_path\n"
+    "sales.orders.id,Order Id,The sales order identifier.,Sales,,\n"
+    "hr.orders.id,Order Id,The HR order identifier.,HR,,\n"
+)
+
+
+def test_multi_schema_fold_collision_quarantines_both_rows():
+    up = read_glossary(_COLLISION_CSV, source="ftr")
+    assert up.rows == []                                      # neither row may reach the graph
+    assert up.records == []                                   # no sidecar for a quarantined identity
+    assert len(up.quarantined) == 2
+    for e in up.quarantined:
+        assert "schema collision" in e.message
+        assert "orders.id" in e.message
+        assert "sales" in e.message and "hr" in e.message     # both schemas named for the reviewer
+        assert "single-schema" in e.message
+        assert e.row is not None and e.row.table == "orders" and e.row.column == "id"
+    # Indexes are unique and start AT len(rows), disjoint from validate_rows' 0..len(rows)-1 space
+    # (quarantine_row PKs on (catalog_source, row_index), so an overlap would abort the ingest tx).
+    assert sorted(e.row_index for e in up.quarantined) == [len(up.rows), len(up.rows) + 1]
+
+
+def test_same_schema_repeated_is_not_a_collision():
+    csv = (
+        "physical_name,business_term,description_business_definition,data_domain,bian_path,fibo_path\n"
+        "sales.orders.id,Order Id,The sales order identifier.,Sales,,\n"
+        "SALES.orders.id,Order Id,The sales order identifier.,Sales,,\n"   # case-variant SAME schema
+    )
+    up = read_glossary(csv, source="ftr")
+    assert up.quarantined == []                               # one schema -> no false collision
+    assert len(up.rows) == 2                                  # validate_rows dedups them downstream
+    vr = validate_rows(up.rows, "ftr", profile=FTR_GLOSSARY_PROFILE)
+    assert len(vr.good) == 1 and vr.quarantined == []
+
+
+def test_distinct_columns_across_schemas_ingest_normally():
+    csv = (
+        "physical_name,business_term,description_business_definition,data_domain,bian_path,fibo_path\n"
+        "sales.orders.id,Order Id,The sales order identifier.,Sales,,\n"
+        "hr.customers.name,Customer Name,The HR customer name.,HR,,\n"    # no (table, column) fold
+    )
+    up = read_glossary(csv, source="ftr")
+    assert up.quarantined == []
+    assert {(r.table, r.column) for r in up.rows} == {("orders", "id"), ("customers", "name")}
+    assert len(up.records) == 2
+
+
+def test_collision_quarantine_does_not_touch_clean_rows_in_the_same_file():
+    csv = (
+        "physical_name,business_term,description_business_definition,data_domain,bian_path,fibo_path\n"
+        "sales.orders.id,Order Id,The sales order identifier.,Sales,,\n"
+        "hr.orders.id,Order Id,The HR order identifier.,HR,,\n"
+        "public.accounts.balance,Account Balance,The ledger balance.,Deposits,,\n"
+    )
+    up = read_glossary(csv, source="ftr")
+    assert len(up.quarantined) == 2                           # only the colliding pair
+    assert [(r.table, r.column) for r in up.rows] == [("accounts", "balance")]
+    assert [r.term_name for r in up.records] == ["Account Balance"]
