@@ -48,9 +48,10 @@ def _create_sync(client, integration_id, headers=OWNER, **overrides):
 def _preview(client, sync_id, headers=VIEWER):
     return client.post(f"/syncs/{sync_id}/preview", headers=headers)
 
-def _import(client, sync_id, snapshot_hash, headers=OWNER):
+def _import(client, sync_id, snapshot_hash, local_baseline_hash="", headers=OWNER):
     return client.post(f"/syncs/{sync_id}/import",
-                       json={"snapshot_hash": snapshot_hash}, headers=headers)
+                       json={"snapshot_hash": snapshot_hash,
+                             "local_baseline_hash": local_baseline_hash}, headers=headers)
 
 def _configured_sync(client):
     """An integration + a cards sync on mysql_prod, returning (integration_id, sync_id)."""
@@ -387,7 +388,8 @@ def test_preview_dry_run_shape_and_verdicts(client, conn):
     assert res.status_code == 200
     preview = res.json()
     assert set(preview) == {"summary", "tag_map", "tables", "brake", "as_of_suggestions",
-                            "collisions", "dropped_joins", "snapshot_hash"}
+                            "collisions", "dropped_joins", "snapshot_hash",
+                            "local_baseline_hash"}
     assert preview["summary"] == {"tables": 3, "columns": 14, "new": 3, "changed": 0,
                                   "unchanged": 0, "removed": 0, "would_quarantine": 1,
                                   "semantics_pending": 13}
@@ -479,9 +481,11 @@ def test_preview_maps_upstream_auth_and_unreachable(client, monkeypatch):
 
 def test_import_runs_the_unchanged_ingest_pipeline(client, conn):
     iid, sid = _configured_sync(client)
-    snapshot = _preview(client, sid).json()["snapshot_hash"]
+    pv = _preview(client, sid).json()
+    snapshot = pv["snapshot_hash"]
 
-    res = _import(client, sid, snapshot)
+    # approval against an UNCHANGED local baseline succeeds (#13)
+    res = _import(client, sid, snapshot, pv["local_baseline_hash"])
     assert res.status_code == 200
     body = res.json()
     assert body["result"]["status"] == "ingested"
@@ -513,7 +517,7 @@ def test_import_snapshot_mismatch_409_and_nothing_ingested(client, conn, monkeyp
     from featuregen.api.routes import integrations as routes
 
     _, sid = _configured_sync(client)
-    stale = _preview(client, sid).json()["snapshot_hash"]
+    pv = _preview(client, sid).json()
 
     # OM moves between preview and import: a column disappears from page 2
     page1, page2 = fixture_pages()
@@ -521,11 +525,39 @@ def test_import_snapshot_mismatch_409_and_nothing_ingested(client, conn, monkeyp
     monkeypatch.setattr(routes, "_build_fetch",
                         lambda base_url, token: fixture_fetch(page1, page2))
 
-    res = _import(client, sid, stale)
+    res = _import(client, sid, pv["snapshot_hash"], pv["local_baseline_hash"])
     assert res.status_code == 409
     assert "preview again" in res.json()["detail"]
     assert conn.execute("SELECT count(*) FROM graph_node WHERE catalog_source = 'cards'"
                         ).fetchone()[0] == 0
+    assert conn.execute("SELECT count(*) FROM integration_import").fetchone()[0] == 0
+
+
+def test_import_local_catalog_drift_409_and_nothing_imported(client, conn):
+    """#13 (TOCTOU): the preview's diff was computed against a LOCAL catalog baseline; if another
+    upload changes that source between preview and approval, the reviewed diff is stale — approval
+    must demand a re-preview, mirroring the remote snapshot-hash 409."""
+    from tests.featuregen._helpers import make_actor
+
+    from featuregen.overlay.upload.canonical import CanonicalRow
+    from featuregen.overlay.upload.ingest import ingest_upload
+
+    _, sid = _configured_sync(client)
+    pv = _preview(client, sid).json()
+
+    # the LOCAL catalog moves between preview and approval (an upload lands for the same source)
+    actor = make_actor(subject="user:owner", roles=("data_owner",))
+    upload = [CanonicalRow(source="cards", table="promotions", column="promo_id", type="bigint",
+                           is_grain=True, definition="promotion key")]
+    assert ingest_upload(conn, "cards", upload, actor=actor).status == "ingested"
+
+    res = _import(client, sid, pv["snapshot_hash"], pv["local_baseline_hash"])
+    assert res.status_code == 409
+    assert "preview again" in res.json()["detail"]
+    assert "catalog" in res.json()["detail"]
+    # nothing imported: the catalog still holds ONLY the interleaved upload's column
+    assert conn.execute("SELECT count(*) FROM graph_node WHERE catalog_source = 'cards' "
+                        "AND kind = 'column'").fetchone()[0] == 1
     assert conn.execute("SELECT count(*) FROM integration_import").fetchone()[0] == 0
 
 
@@ -546,7 +578,7 @@ def test_import_held_by_brake_is_recorded_honestly(client, conn):
     preview = _preview(client, sid).json()
     assert preview["brake"]["would_hold"] is True                # preview PREDICTED the hold
 
-    res = _import(client, sid, preview["snapshot_hash"])
+    res = _import(client, sid, preview["snapshot_hash"], preview["local_baseline_hash"])
     assert res.status_code == 200
     body = res.json()
     assert body["result"]["status"] == "held"
@@ -587,6 +619,7 @@ def test_token_value_never_serialized_in_any_response(client):
         _preview(client, sid, headers=AUTH),
     ]
     preview = responses[-1].json()
-    responses.append(_import(client, sid, preview["snapshot_hash"], headers=AUTH))
+    responses.append(_import(client, sid, preview["snapshot_hash"],
+                             preview["local_baseline_hash"], headers=AUTH))
     for res in responses:
         assert TOKEN_VALUE not in res.text

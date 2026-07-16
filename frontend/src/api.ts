@@ -1143,9 +1143,11 @@ export interface AsOfSuggestion {
   hint: string
 }
 
-// The dry run a human approves. `snapshot_hash` is the honesty anchor: import must present it
-// back, and the server answers 409 if OpenMetadata moved since this preview was taken. The tag
-// map shown here is the EFFECTIVE map: integration.tag_map merged with the sync's override.
+// The dry run a human approves. `snapshot_hash` and `local_baseline_hash` are the honesty
+// anchors: import must present BOTH back, and the server answers 409 if OpenMetadata moved
+// (snapshot) or the local catalog for the source changed (baseline) since this preview was
+// taken. The tag map shown here is the EFFECTIVE map: integration.tag_map merged with the
+// sync's override.
 export interface SyncPreview {
   summary: {
     tables: number
@@ -1162,6 +1164,7 @@ export interface SyncPreview {
   brake: { would_hold: boolean; reason: string | null }
   as_of_suggestions: AsOfSuggestion[]
   snapshot_hash: string
+  local_baseline_hash: string
 }
 
 export function previewSync(syncId: string): Promise<SyncPreview> {
@@ -1177,8 +1180,15 @@ export interface SyncImportResult {
   review_queue: { quarantined: number; semantics_pending: number }
 }
 
-export function importSync(syncId: string, snapshotHash: string): Promise<SyncImportResult> {
-  return post(`/syncs/${encodeURIComponent(syncId)}/import`, { snapshot_hash: snapshotHash })
+export function importSync(
+  syncId: string,
+  snapshotHash: string,
+  localBaselineHash: string,
+): Promise<SyncImportResult> {
+  return post(`/syncs/${encodeURIComponent(syncId)}/import`, {
+    snapshot_hash: snapshotHash,
+    local_baseline_hash: localBaselineHash,
+  })
 }
 
 export function recommendFeatures(

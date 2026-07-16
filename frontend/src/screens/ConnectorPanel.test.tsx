@@ -91,6 +91,7 @@ const PREVIEW: api.SyncPreview = {
     { table: 'transactions', column: 'posted_at', hint: 'timestamp column named like a time axis' },
   ],
   snapshot_hash: SNAPSHOT_HASH,
+  local_baseline_hash: 'ef'.repeat(32),
 }
 
 const IMPORT_OK: api.SyncImportResult = {

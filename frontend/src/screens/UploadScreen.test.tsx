@@ -193,6 +193,7 @@ const PREVIEW: api.SyncPreview = {
   brake: { would_hold: false, reason: null },
   as_of_suggestions: [],
   snapshot_hash: 'ab'.repeat(32),
+  local_baseline_hash: 'ef'.repeat(32),
 }
 
 function gateStates(): string[] {

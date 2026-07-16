@@ -75,6 +75,7 @@ from featuregen.connectors.openmetadata import (
     fetch_services,
     fetch_tables,
     httpx_fetch,
+    local_baseline_hash,
     read_openmetadata,
     snapshot_hash,
 )
@@ -188,7 +189,8 @@ class SyncPatch(BaseModel):
 
 
 class ImportIn(BaseModel):
-    snapshot_hash: str
+    snapshot_hash: str            # the previewed REMOTE pull (OM side)
+    local_baseline_hash: str      # the previewed LOCAL catalog state the diff ran against (#13)
 
 
 # ---- Validators ------------------------------------------------------------------------------
@@ -535,7 +537,9 @@ def preview_sync(sync_id: str, conn: _Conn, identity: _Identity) -> dict:
 @router.post("/syncs/{sync_id}/import", dependencies=[Depends(require_catalog_write)])
 def import_sync(sync_id: str, body: ImportIn, conn: _Conn, identity: _Identity,
                 client: Annotated[LLMClient | None, Depends(get_llm_optional)]) -> dict:
-    """Confirmed import: re-pull, re-translate, verify the previewed snapshot hash, then run the
+    """Confirmed import: re-pull, re-translate, verify the previewed snapshot hash AND the local
+    catalog baseline the previewed diff was computed against (#13 — an upload landing between
+    preview and approval makes the reviewed diff stale, exactly like OM moving), then run the
     UNCHANGED ingest pipeline in this request's one transaction. Suggestion is never ingestion:
     as-of hints from the preview are NOT applied here — rows carry blank semantics. Records
     integration_import for every attempt (audit), but stamps last_import_at ONLY when rows
@@ -548,6 +552,12 @@ def import_sync(sync_id: str, body: ImportIn, conn: _Conn, identity: _Identity,
             status_code=409,
             detail="OpenMetadata changed since this preview (snapshot hash mismatch). "
                    "Run preview again and approve the fresh dry run.")
+    if local_baseline_hash(conn, sync["target_source"]) != body.local_baseline_hash:
+        raise HTTPException(
+            status_code=409,
+            detail=f"the FeatureGen catalog for source '{sync['target_source']}' changed since "
+                   "this preview (local baseline mismatch). Run preview again and approve the "
+                   "fresh dry run.")
     result = ingest_upload(conn, sync["target_source"], translation.rows,
                            actor=identity, now=datetime.now(UTC), client=client)
     import_id = store.record_import(

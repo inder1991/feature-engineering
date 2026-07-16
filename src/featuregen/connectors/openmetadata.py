@@ -418,6 +418,33 @@ def semantics_pending_count(rows: Iterable[CanonicalRow]) -> int:
 # ---- Preview (dry run — NEVER writes) --------------------------------------------------------
 
 
+def _current_columns(conn: Any, target_source: str) -> dict[str, dict[str, tuple[str, str, bool]]]:
+    """Current catalog columns for the target source: {table: {column: (type, sensitivity,
+    grain)}} — the exact local state a preview's diff is computed against."""
+    existing: dict[str, dict[str, tuple[str, str, bool]]] = {}
+    for tbl, coln, dtype, sens, grain in conn.execute(
+            "SELECT table_name, column_name, data_type, COALESCE(sensitivity, ''), is_grain "
+            "FROM graph_node WHERE catalog_source = %s AND kind = 'column'",
+            (target_source,)).fetchall():
+        existing.setdefault(tbl, {})[coln] = (dtype or "", sens, bool(grain))
+    return existing
+
+
+def _baseline_hash(existing: Mapping[str, Mapping[str, tuple[str, str, bool]]]) -> str:
+    canon = sorted(
+        [tbl, col, dtype, sens, grain]
+        for tbl, cols in existing.items() for col, (dtype, sens, grain) in cols.items())
+    return hashlib.sha256(json.dumps(canon).encode()).hexdigest()
+
+
+def local_baseline_hash(conn: Any, target_source: str) -> str:
+    """Deterministic hash of the CURRENT local catalog state (graph_node columns) for a source —
+    the baseline a preview's diff was computed against. Preview returns it; approval recomputes it
+    and 409s on a mismatch, so an upload landing between preview and approval forces a re-preview
+    instead of importing a diff the human never reviewed (#13, the LOCAL twin of snapshot_hash)."""
+    return _baseline_hash(_current_columns(conn, target_source))
+
+
 def build_preview(conn: Any, config: OMConfig, translation: Translation) -> dict[str, Any]:
     """The dry-run the human approves: validation verdicts, per-table diff vs the CURRENT catalog
     (graph_node), tag-map panel, brake PREDICTION, as-of suggestions, and the snapshot hash.
@@ -430,13 +457,7 @@ def build_preview(conn: Any, config: OMConfig, translation: Translation) -> dict
     if vr.structural_error:
         raise ValueError(f"nothing to import: {vr.structural_error}")
 
-    # Current catalog columns for the target source: {table: {column: (type, sensitivity, grain)}}.
-    existing: dict[str, dict[str, tuple[str, str, bool]]] = {}
-    for tbl, coln, dtype, sens, grain in conn.execute(
-            "SELECT table_name, column_name, data_type, COALESCE(sensitivity, ''), is_grain "
-            "FROM graph_node WHERE catalog_source = %s AND kind = 'column'",
-            (config.target_source,)).fetchall():
-        existing.setdefault(tbl, {})[coln] = (dtype or "", sens, bool(grain))
+    existing = _current_columns(conn, config.target_source)
 
     good_by_table: dict[str, dict[str, CanonicalRow]] = {}
     for r in vr.good:
@@ -527,4 +548,7 @@ def build_preview(conn: Any, config: OMConfig, translation: Translation) -> dict
         "brake": {"would_hold": brake.held, "reason": brake.reason},
         "as_of_suggestions": [asdict(s) for s in translation.as_of_suggestions],
         "snapshot_hash": snapshot_hash(translation.rows),
+        # The LOCAL twin of snapshot_hash (#13): the catalog state this diff was computed against.
+        # Approval recomputes it and 409s if an upload moved the source since this preview.
+        "local_baseline_hash": _baseline_hash(existing),
     }

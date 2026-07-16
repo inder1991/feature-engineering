@@ -230,6 +230,7 @@ const SYNC: Sync = {
 }
 
 const SNAPSHOT_HASH = 'ab'.repeat(32)
+const BASELINE_HASH = 'ef'.repeat(32)
 
 const SYNC_PREVIEW: SyncPreview = {
   summary: {
@@ -258,6 +259,7 @@ const SYNC_PREVIEW: SyncPreview = {
     { table: 'transactions', column: 'posted_at', hint: 'timestamp column named like a time axis' },
   ],
   snapshot_hash: SNAPSHOT_HASH,
+  local_baseline_hash: BASELINE_HASH,
 }
 
 describe('integration client (tier 1)', () => {
@@ -476,13 +478,16 @@ describe('sync preview/import client', () => {
       import_id: 'omimp_01HZY',
       review_queue: { quarantined: 1, semantics_pending: 13 },
     }))
-    const result = await importSync(SYNC.sync_id, SNAPSHOT_HASH)
+    const result = await importSync(SYNC.sync_id, SNAPSHOT_HASH, BASELINE_HASH)
     expect(result.import_id).toBe('omimp_01HZY')
     expect(result.review_queue).toEqual({ quarantined: 1, semantics_pending: 13 })
     const [url, init] = fetchMock.mock.calls[0]
     expect(url).toBe(`/syncs/${SYNC.sync_id}/import`)
     expect(init.method).toBe('POST')
-    expect(JSON.parse(init.body)).toEqual({ snapshot_hash: SNAPSHOT_HASH })
+    expect(JSON.parse(init.body)).toEqual({
+      snapshot_hash: SNAPSHOT_HASH,
+      local_baseline_hash: BASELINE_HASH,
+    })
   })
 
   it('surfaces the snapshot-mismatch 409 with the backend re-preview guidance', async () => {
@@ -490,7 +495,7 @@ describe('sync preview/import client', () => {
       + 'Run preview again and approve the fresh dry run.'
     fetchMock.mockImplementation(async () =>
       new Response(JSON.stringify({ detail }), { status: 409 }))
-    await expect(importSync(SYNC.sync_id, SNAPSHOT_HASH)).rejects.toMatchObject({
+    await expect(importSync(SYNC.sync_id, SNAPSHOT_HASH, BASELINE_HASH)).rejects.toMatchObject({
       status: 409, detail })
   })
 

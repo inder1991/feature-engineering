@@ -515,6 +515,22 @@ def test_preview_predicts_brake_hold_on_shrunken_pull(conn):
                         "WHERE catalog_source = 'cards'").fetchone()[0] == 30
 
 
+def test_preview_local_baseline_hash_tracks_the_current_catalog(conn):
+    """#13: the preview carries a hash of the CURRENT catalog state its diff was computed against;
+    the same function recomputes it at approval, and any graph mutation for the source changes it."""
+    from featuregen.connectors.openmetadata import local_baseline_hash
+
+    before = build_preview(conn, CARDS_CONFIG, _rows())["local_baseline_hash"]
+    assert before == local_baseline_hash(conn, "cards")
+
+    actor = make_actor(subject="user:owner", roles=("data_owner",))
+    assert ingest_upload(conn, "cards", _existing_cards_rows(), actor=actor).status == "ingested"
+
+    after = local_baseline_hash(conn, "cards")
+    assert after != before                            # the baseline moved with the catalog
+    assert build_preview(conn, CARDS_CONFIG, _rows())["local_baseline_hash"] == after
+
+
 def test_preview_of_empty_pull_raises_value_error(conn):
     with pytest.raises(ValueError, match="nothing to import"):
         build_preview(conn, CARDS_CONFIG,

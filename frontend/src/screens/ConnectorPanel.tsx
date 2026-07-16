@@ -4,9 +4,9 @@
 // per-table diff, quarantine, pending semantics), then approve. There is no URL/token/scope here:
 // the sync and its integration carry them, configured once under Integrations.
 //
-// Approval posts the previewed snapshot hash back: if OpenMetadata moved since the preview, the
-// server answers 409 and this panel asks for a fresh dry run — the human only ever approves the
-// exact snapshot they reviewed.
+// Approval posts the previewed snapshot hash AND local-baseline hash back: if OpenMetadata moved
+// or the local catalog for the source changed since the preview, the server answers 409 and this
+// panel asks for a fresh dry run — the human only ever approves the exact diff they reviewed.
 //
 // Remap is a CONFIG change, never a client-side edit of the preview payload: quietly rewriting
 // previewed rows would let the UI approve something the server never showed, so changing the map
@@ -215,7 +215,11 @@ export function ConnectorPanel({
     setImportBusy(true)
     setImportError(null)
     try {
-      const res = await importSync(preview.sync.sync_id, preview.data.snapshot_hash)
+      const res = await importSync(
+        preview.sync.sync_id,
+        preview.data.snapshot_hash,
+        preview.data.local_baseline_hash,
+      )
       if (seq.current !== ticket) return
       setImported({ ...res, source: preview.sync.target_source })
       setConfirming(false)
@@ -401,8 +405,8 @@ export function ConnectorPanel({
               </CalloutGlyph>
               <div className="callout-body">
                 <p>
-                  <strong>The preview went stale.</strong> OpenMetadata changed since this preview
-                  (snapshot hash mismatch). Nothing was imported.
+                  <strong>The preview went stale.</strong> OpenMetadata or the local catalog
+                  changed since this preview was taken. Nothing was imported.
                 </p>
                 <p>Run the preview again and approve the fresh dry run.</p>
                 <button
