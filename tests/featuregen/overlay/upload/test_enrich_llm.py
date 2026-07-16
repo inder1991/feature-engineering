@@ -234,6 +234,51 @@ def test_batch_item_failing_closed_is_excluded_not_batch_fatal(db, monkeypatch):
     assert by["h2"].status == VALID
 
 
+# ---- finding #24: the audit records the REAL generation settings + provider usage --------------
+
+
+def test_audit_records_real_generation_settings_for_anthropic(db, monkeypatch):
+    """#24(a): with a real provider configured, the llm_call generation_settings carry the ACTUAL
+    settings the adapter applies — model + max_tokens + thinking + effort, read from the SAME env
+    as ClaudeConfig.from_env — not just provider/model."""
+    monkeypatch.setenv("FEATUREGEN_LLM_PROVIDER", "anthropic")
+    monkeypatch.setenv("FEATUREGEN_LLM_MODEL", "claude-sonnet-5")
+    monkeypatch.setenv("FEATUREGEN_LLM_MAX_TOKENS", "2048")
+    monkeypatch.setenv("FEATUREGEN_LLM_THINKING", "adaptive")
+    monkeypatch.setenv("FEATUREGEN_LLM_EFFORT", "medium")
+    _call(db, _Capture())
+    gs = db.execute("SELECT generation_settings FROM llm_call "
+                    "WHERE run_id = 'overlay-enrichment'").fetchone()[0]
+    assert gs == {"provider": "anthropic", "model": "claude-sonnet-5", "max_tokens": 2048,
+                  "thinking": "adaptive", "effort": "medium"}
+
+
+def test_audit_captures_provider_usage_tokens(db):
+    """#24(b): a client that reports provider usage (the real adapter, from resp.usage) has the
+    token counts captured on the immutable llm_call record — not discarded."""
+    class _WithUsage:
+        def call(self, request):
+            return LLMResult(output={"concept": "monetary_amount"}, self_reported_scores={},
+                             call_ref="", status=PROVIDER_OK,
+                             cost_metadata={"input_tokens": 321, "output_tokens": 87})
+
+    assert _call(db, _WithUsage()) == "monetary_amount"
+    cm = db.execute("SELECT cost_metadata FROM llm_call "
+                    "WHERE run_id = 'overlay-enrichment'").fetchone()[0]
+    assert cm["input_tokens"] == 321 and cm["output_tokens"] == 87
+
+
+def test_audit_without_usage_records_cleanly(db):
+    """#24: usage is optional — a FakeLLM call (no usage) still audits cleanly, with empty
+    cost_metadata rather than a crash or a fabricated count."""
+    out = _call(db, FakeLLM(script={"overlay.enrich.concept":
+                                    FakeResponse(output={"concept": "monetary_amount"})}))
+    assert out == "monetary_amount"
+    cm = db.execute("SELECT cost_metadata FROM llm_call "
+                    "WHERE run_id = 'overlay-enrichment'").fetchone()[0]
+    assert cm == {}
+
+
 # ---- finding #20: the llm_call egress audit must survive the upload transaction ----------------
 
 

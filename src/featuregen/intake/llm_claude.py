@@ -112,14 +112,16 @@ class ClaudeLLM:
             # The schema is structural only — it carries no PHI/PII (§9.1). Fail closed if it is missing.
             if not request.output_schema:
                 return _fail(PROVIDER_NON_RETRYABLE)
+            # #24 — the request's PINNED generation_settings win (config is the fallback), so the
+            # settings the audit records are the settings the provider actually ran with.
             output_config = {
-                "effort": self._config.effort,
+                "effort": request.generation_settings.get("effort", self._config.effort),
                 "format": {"type": "json_schema", "schema": request.output_schema},
             }
             resp = client.messages.create(
                 model=model,
                 max_tokens=request.generation_settings.get("max_tokens", self._config.max_tokens),
-                thinking={"type": self._config.thinking},
+                thinking={"type": request.generation_settings.get("thinking", self._config.thinking)},
                 output_config=output_config,
                 messages=[{"role": "user", "content": user_content}],
             )
@@ -136,12 +138,29 @@ class ClaudeLLM:
         provider_status = _map_stop_reason(resp.stop_reason)
         output, scores = _parse_structured(resp)
         return LLMResult(
-            output=output, self_reported_scores=scores, call_ref="", status=provider_status
+            output=output, self_reported_scores=scores, call_ref="", status=provider_status,
+            cost_metadata=_usage_cost(resp),  # #24 — provider usage rides out, never discarded
         )
 
 
 def _fail(provider_status: str) -> LLMResult:
     return LLMResult(output={}, self_reported_scores={}, call_ref="", status=provider_status)
+
+
+def _usage_cost(resp) -> dict:
+    """#24/N9 — lift the provider-reported token usage (`resp.usage`) onto LLMResult.cost_metadata
+    so it lands on the immutable llm_call record instead of being discarded. Usage is OPTIONAL
+    (a FakeLLM-shaped client has none): absent/partial usage yields an empty/partial dict."""
+    usage = getattr(resp, "usage", None)
+    if usage is None:
+        return {}
+    out: dict = {}
+    for key in ("input_tokens", "output_tokens",
+                "cache_creation_input_tokens", "cache_read_input_tokens"):
+        val = getattr(usage, key, None)
+        if isinstance(val, int):
+            out[key] = val
+    return out
 
 
 def _parse_structured(resp) -> tuple[dict, dict]:

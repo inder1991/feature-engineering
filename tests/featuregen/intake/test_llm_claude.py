@@ -50,6 +50,78 @@ def test_stop_reason_mapping_to_provider_taxonomy():
     assert _map_stop_reason("some_future_reason") == PROVIDER_NON_RETRYABLE
 
 
+# ---- finding #24: the adapter surfaces provider usage and applies the pinned settings ----------
+
+
+def _stub_adapter(monkeypatch, create):
+    """A ClaudeLLM whose SDK surface is stubbed: `anthropic` in sys.modules is a bare module with
+    the two exception types `.call` references, and the constructed client is a create-capturing
+    fake — no SDK, no network."""
+    import sys
+    import types
+
+    stub = types.ModuleType("anthropic")
+    stub.APIStatusError = type("APIStatusError", (Exception,), {})
+    stub.APIConnectionError = type("APIConnectionError", (Exception,), {})
+    monkeypatch.setitem(sys.modules, "anthropic", stub)
+    adapter = ClaudeLLM(ClaudeConfig(enabled=True))
+    adapter._client = types.SimpleNamespace(messages=types.SimpleNamespace(create=create))
+    return adapter
+
+
+def _schema_request(generation_settings):
+    from dataclasses import replace
+
+    return replace(_bare_request(), output_schema={"type": "object"},
+                   generation_settings=generation_settings)
+
+
+def test_claude_adapter_surfaces_provider_usage_and_pinned_settings(monkeypatch):
+    """#24: resp.usage token counts must ride out on LLMResult.cost_metadata (they were discarded),
+    and the request's PINNED generation settings (max_tokens/thinking/effort) are what the adapter
+    actually applies — so the audited settings are the applied settings."""
+    from types import SimpleNamespace
+
+    captured = {}
+
+    def _create(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(
+            stop_reason="end_turn",
+            content=[SimpleNamespace(type="text", text='{"concept": "monetary_amount"}')],
+            usage=SimpleNamespace(input_tokens=321, output_tokens=87),
+        )
+
+    adapter = _stub_adapter(monkeypatch, _create)
+    out = adapter.call(_schema_request(
+        {"provider": "anthropic", "model": "claude-opus-4-8",
+         "max_tokens": 1024, "thinking": "adaptive", "effort": "low"}))
+    assert out.status == PROVIDER_OK
+    assert out.output == {"concept": "monetary_amount"}
+    assert out.cost_metadata["input_tokens"] == 321
+    assert out.cost_metadata["output_tokens"] == 87
+    assert captured["max_tokens"] == 1024
+    assert captured["thinking"] == {"type": "adaptive"}
+    assert captured["output_config"]["effort"] == "low"    # pinned setting wins over config default
+
+
+def test_claude_adapter_without_usage_still_returns_cleanly(monkeypatch):
+    """#24: usage is OPTIONAL — a response without it yields empty cost_metadata, never a crash
+    (FakeLLM-shaped clients carry no usage)."""
+    from types import SimpleNamespace
+
+    def _create(**kwargs):
+        return SimpleNamespace(
+            stop_reason="end_turn",
+            content=[SimpleNamespace(type="text", text='{"concept": "monetary_amount"}')],
+        )
+
+    adapter = _stub_adapter(monkeypatch, _create)
+    out = adapter.call(_schema_request({"provider": "anthropic", "model": "claude-opus-4-8"}))
+    assert out.status == PROVIDER_OK
+    assert out.cost_metadata == {}
+
+
 @pytest.mark.skipif(
     not __import__("os").environ.get("FEATUREGEN_LLM_SMOKE"),
     reason="config-gated live Claude smoke test; never gated in CI (D5, §15)",

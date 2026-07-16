@@ -26,7 +26,6 @@ from featuregen.contracts.envelopes import IdentityEnvelope
 from featuregen.contracts.identity import identity_to_jsonb
 from featuregen.documents.registry import DocumentSchemaRegistry
 from featuregen.intake.llm import (
-    DEFAULT_LLM_MODEL,
     STATUS_FAILED,
     LLMClient,
     LLMRequest,
@@ -34,6 +33,7 @@ from featuregen.intake.llm import (
     drive_structured_call,
     record_llm_call,
 )
+from featuregen.intake.llm_claude import ClaudeConfig
 from featuregen.intake.redaction import (
     EgressViolation,
     RedactionResult,
@@ -131,14 +131,17 @@ def _redact_free_text_meta(metadata: dict) -> tuple[dict | None, list[dict], str
 
 
 def _generation_settings() -> dict:
-    """Provider/model for the audit record + idempotency key, read from the SAME env that configures
-    the client (ClaudeConfig.from_env). So a real ClaudeLLM is audited as anthropic/<model> and
-    requests its configured model — NOT the old hard-coded {"provider":"fake","model":"test"}, which
-    made a production Claude call request model "test". Defaults to fake/test with no provider set."""
+    """Generation settings for the audit record + idempotency key, read from the SAME env that
+    configures the client (ClaudeConfig.from_env). So a real ClaudeLLM is audited as
+    anthropic/<model> WITH the settings the adapter actually applies — model + max_tokens +
+    thinking + effort (#24), which the adapter also treats as pinned — never just provider/model
+    (and never the old hard-coded {"provider":"fake","model":"test"}, which made a production
+    Claude call request model "test"). Defaults to fake/test with no provider set."""
     provider = os.environ.get("FEATUREGEN_LLM_PROVIDER", "fake")
     if provider == "anthropic":
-        return {"provider": "anthropic",
-                "model": os.environ.get("FEATUREGEN_LLM_MODEL", DEFAULT_LLM_MODEL)}
+        cfg = ClaudeConfig.from_env()
+        return {"provider": "anthropic", "model": cfg.model, "max_tokens": cfg.max_tokens,
+                "thinking": cfg.thinking, "effort": cfg.effort}
     return {"provider": "fake", "model": "test"}
 
 
