@@ -362,3 +362,64 @@ def test_get_run_requires_auth_and_allows_catalog_viewer(client):
 
 def test_get_unknown_run_404s(client):
     assert _get_run(client, "ingrun_DOES_NOT_EXIST").status_code == 404
+
+
+# ── run provenance (design #3, deferred piece): objects + facts on the run detail ────────────────
+
+
+def test_run_detail_exposes_observed_objects_and_asserted_facts(client):
+    """The run answers WHICH objects/facts it touched (not just counts): `objects` carries the
+    observed table/column refs, `facts` the asserted fact keys — additive keys on the run detail
+    only; the POST /uploads body stays byte-identical (test_uploads.py proves that)."""
+    res = upload_csv(client, "deposits", DEPOSITS_CSV)
+    assert res.status_code == 200
+    run = _get_run(client, res.headers[RUN_HEADER]).json()
+
+    observed = {o["object_ref"] for o in run["objects"] if o["relation"] == "observed"}
+    assert {"public.accounts", "public.accounts.id", "public.accounts.balance",
+            "public.customers", "public.customers.email",
+            "public.transactions.amount"} <= observed
+    assert [o for o in run["objects"] if o["relation"] == "changed"] == []   # first upload: adds only
+    assert all(o["at"] for o in run["objects"])
+
+    asserted = {f["fact_key"] for f in run["facts"] if f["relation"] == "asserted"}
+    assert len(asserted) == 4       # 3 grains + 1 availability — exactly the body's asserted count
+    assert [f for f in run["facts"] if f["relation"] == "changed"] == []
+    assert all(f["at"] for f in run["facts"])
+
+
+def test_run_detail_provenance_marks_only_the_retyped_column_changed(client):
+    """A re-upload retyping ONE column: THAT run's `objects` carries a `changed` row for the
+    retyped ref and none for the untouched refs; unchanged facts are not re-asserted."""
+    assert upload_csv(client, "deposits", DEPOSITS_CSV).status_code == 200
+    res2 = upload_csv(client, "deposits",
+                      DEPOSITS_CSV.replace("balance,numeric", "balance,text"))
+    assert res2.status_code == 200
+    run2 = _get_run(client, res2.headers[RUN_HEADER]).json()
+
+    changed = {o["object_ref"] for o in run2["objects"] if o["relation"] == "changed"}
+    assert changed == {"public.accounts.balance"}
+    observed = {o["object_ref"] for o in run2["objects"] if o["relation"] == "observed"}
+    assert "public.accounts.balance" in observed     # changed AND observed coexist for the ref
+    assert run2["facts"] == []                       # grain/availability values did not change
+
+
+def test_run_detail_provenance_idempotent_reupload_observed_only(client):
+    """An identical re-upload: the run observed everything but changed/asserted nothing."""
+    assert upload_csv(client, "deposits", DEPOSITS_CSV).status_code == 200
+    res2 = upload_csv(client, "deposits", DEPOSITS_CSV)
+    assert res2.status_code == 200
+    run2 = _get_run(client, res2.headers[RUN_HEADER]).json()
+    assert {o["relation"] for o in run2["objects"]} == {"observed"}
+    assert run2["facts"] == []
+
+
+def test_run_detail_provenance_keys_present_and_empty_on_a_preingest_failure(client):
+    """A run that never reached ingest (unsupported file type) still serves the additive keys —
+    as EMPTY lists, never an error or a missing field."""
+    res = client.post("/uploads", data={"source": "deposits"},
+                      files={"file": ("x.txt", b"nope", "text/plain")}, headers=AUTH)
+    assert res.status_code == 400
+    run = _get_run(client, res.headers[RUN_HEADER]).json()
+    assert run["objects"] == []
+    assert run["facts"] == []

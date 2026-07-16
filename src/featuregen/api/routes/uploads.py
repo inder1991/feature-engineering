@@ -151,7 +151,11 @@ def create_upload(
         try:
             result = ingest_upload(conn, source, rows, actor=identity,
                                    now=datetime.now(UTC), client=client, profile=profile,
-                                   glossary=glossary, stage_recorder=recorder)
+                                   glossary=glossary, stage_recorder=recorder,
+                                   # design #3 provenance: the run this route opened above —
+                                   # ingest records its observed/changed objects + asserted/
+                                   # changed facts against it (fail-soft, body untouched).
+                                   ingestion_run_id=run_id)
         except ConcurrencyError as exc:
             # OCC: a concurrent upload/confirm bumped one of this upload's fact streams mid-write.
             # The request's transaction rolls back cleanly, so a retry is the correct client

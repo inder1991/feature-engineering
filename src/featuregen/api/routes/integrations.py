@@ -605,7 +605,10 @@ def import_sync(sync_id: str, body: ImportIn, request: Request, response: Respon
                                stage_recorder=recorder,
                                # #10: connector-synced facts record the honest origin — matches
                                # the origin_type this route stamps on its ingestion_run.
-                               origin_type="connector")
+                               origin_type="connector",
+                               # design #3 provenance: observed/changed objects + asserted/
+                               # changed facts recorded against this route's run (fail-soft).
+                               ingestion_run_id=run_id)
         import_id = store.record_import(
             conn, sync=sync, integration_id=integ["integration_id"], snapshot_hash=current_hash,
             approved_by=identity.subject, result=asdict(result), ingestion_run_id=run_id)

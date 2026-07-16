@@ -298,7 +298,10 @@ def record_run_facts(conn, run_id: str, fact_keys, relation: str, now: datetime)
 
 def get_run(conn, run_id: str) -> dict | None:
     """The run row + its append-only status history (``status_history``) + its per-stage reports
-    (``stages``, design #22 — recorded order, i.e. execution order), or None."""
+    (``stages``, design #22 — recorded order, i.e. execution order) + its provenance associations
+    (``objects``: observed/changed catalog refs; ``facts``: asserted/changed fact keys — design #3
+    deferred piece; empty lists for a run recorded before 0998 or one that never reached ingest),
+    or None."""
     cur = conn.execute(f"SELECT {_RUN_COLUMNS} FROM ingestion_run WHERE id = %s", (run_id,))
     row = cur.fetchone()
     if row is None:
@@ -315,5 +318,17 @@ def get_run(conn, run_id: str) -> dict | None:
         for stage, attempt, state, started_at, completed_at, reason_code, detail in conn.execute(
             "SELECT stage, attempt, state, started_at, completed_at, reason_code, detail "
             "FROM ingestion_run_stage WHERE ingestion_run_id = %s ORDER BY id",
+            (run_id,)).fetchall()]
+    run["objects"] = [
+        {"object_ref": object_ref, "relation": relation, "at": at}
+        for object_ref, relation, at in conn.execute(
+            "SELECT object_ref, relation, at FROM ingestion_run_object "
+            "WHERE ingestion_run_id = %s ORDER BY relation, object_ref",
+            (run_id,)).fetchall()]
+    run["facts"] = [
+        {"fact_key": fk, "relation": relation, "at": at}
+        for fk, relation, at in conn.execute(
+            "SELECT fact_key, relation, at FROM ingestion_run_fact "
+            "WHERE ingestion_run_id = %s ORDER BY relation, fact_key",
             (run_id,)).fetchall()]
     return run
