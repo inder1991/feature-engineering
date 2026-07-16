@@ -1,6 +1,7 @@
 import { type FormEvent, type ReactNode, useRef, useState } from 'react'
 import {
   ApiError,
+  type JoinDivergence,
   type JoinProposal,
   type RejectCategory,
   REJECT_CATEGORIES,
@@ -8,6 +9,7 @@ import {
   TABLE_FACT_REJECT_CATEGORIES,
   type TableFactProposal,
   type TableFactRejectCategory,
+  acknowledgeJoinDivergence,
   confirmJoin,
   confirmTableFact,
   listJoinProposals,
@@ -90,6 +92,11 @@ function errorDetail(err: unknown): string {
 export function GovernanceReviewScreen() {
   const [source, setSource] = useState('')
   const [proposals, setProposals] = useState<JoinProposal[] | null>(null)
+  // Governed-join divergences ride the same joins response: a re-upload retargeted/dropped a
+  // joins_to that admins VERIFIED. Advisory — the verified join stays operational until an
+  // admin acts, so these render as a warning ABOVE the open-proposals list, never as actions
+  // on the join itself.
+  const [divergences, setDivergences] = useState<JoinDivergence[] | null>(null)
   const [tableFacts, setTableFacts] = useState<TableFactProposal[] | null>(null)
   const [readiness, setReadiness] = useState<RelationshipReadiness[] | null>(null)
   const [loadedSource, setLoadedSource] = useState('')
@@ -103,6 +110,10 @@ export function GovernanceReviewScreen() {
   const [readinessError, setReadinessError] = useState('')
   // Conflict banner (409): survives the reload that follows it, unlike `error`.
   const [notice, setNotice] = useState('')
+  // Divergence acknowledge in flight (its id) + its failure detail. One at a time: every
+  // Acknowledge button disables while any acknowledge runs, since success reloads the queue.
+  const [ackBusyId, setAckBusyId] = useState<number | null>(null)
+  const [ackError, setAckError] = useState('')
   // Session-only DISPLAY state for cards decided this session, keyed by fact_key. The durable
   // state is server-side; clearing on (re)load is correct — a decided fact leaves the open
   // queue. Join and table-fact keys never collide, so one map serves both tabs.
@@ -130,6 +141,9 @@ export function GovernanceReviewScreen() {
     ])
     if (id !== loadSeq.current) return
     setProposals(joinsRes.status === 'fulfilled' ? joinsRes.value.proposals : null)
+    // `?? null` guards an older backend that predates the additive divergences field.
+    setDivergences(joinsRes.status === 'fulfilled' ? (joinsRes.value.divergences ?? null) : null)
+    setAckError('')
     setJoinsError(joinsRes.status === 'rejected' ? errorDetail(joinsRes.reason) : '')
     setTableFacts(factsRes.status === 'fulfilled' ? factsRes.value.proposals : null)
     setFactsError(factsRes.status === 'rejected' ? errorDetail(factsRes.reason) : '')
@@ -160,6 +174,22 @@ export function GovernanceReviewScreen() {
   async function onConflict(detail: string) {
     await load(loadedSource)
     setNotice(detail)
+  }
+
+  // Acknowledge = advisory bookkeeping ("seen — the verified join stands / is being handled").
+  // It never touches the join or its edge; on success the row leaves the open list, so the
+  // standard reload refreshes the whole queue (load() never rejects — fetches settle per-tab).
+  async function acknowledge(divergenceId: number) {
+    setAckBusyId(divergenceId)
+    setAckError('')
+    try {
+      await acknowledgeJoinDivergence(divergenceId)
+      await load(loadedSource)
+    } catch (e) {
+      setAckError(errorDetail(e))
+    } finally {
+      setAckBusyId(null)
+    }
   }
 
   return (
@@ -214,6 +244,76 @@ export function GovernanceReviewScreen() {
         <p role="alert" className="error">
           {readinessError}
         </p>
+      )}
+      {tab === 'joins' && divergences && divergences.length > 0 && (
+        // Governed-join drift (#14): a re-upload disputes what admins VERIFIED. Warning-toned
+        // and ABOVE the proposals list; the only action is Acknowledge ("seen") — adopting a
+        // retarget goes through the existing proposal flow below, never a button here.
+        <div className="callout callout--warn" role="alert">
+          <div className="callout-body">
+            <p>
+              <strong>
+                The latest upload disputes{' '}
+                {divergences.length === 1
+                  ? 'a join you verified'
+                  : `${divergences.length} joins you verified`}
+                .
+              </strong>{' '}
+              Acknowledging records only that a reviewer has seen it — it never retires or
+              changes a verified join.
+            </p>
+            <ul className="gj-drift-list">
+              {divergences.map(d => (
+                <li className="gj-drift-item" key={d.id}>
+                  <p className="gj-drift-line">
+                    {d.kind === 'retargeted' ? (
+                      <>
+                        ⚠ The source changed a join you verified —{' '}
+                        <span className="mono">{d.from_ref}</span>: you verified →{' '}
+                        <span className="mono">{d.verified_to_ref}</span>, but the latest upload
+                        declares → <span className="mono">{d.declared_to_ref}</span>.
+                      </>
+                    ) : (
+                      <>
+                        ⚠ The source dropped a join you verified —{' '}
+                        <span className="mono">{d.from_ref}</span>: you verified →{' '}
+                        <span className="mono">{d.verified_to_ref}</span>, but the latest upload
+                        no longer declares this join.
+                      </>
+                    )}
+                  </p>
+                  <p className="gj-drift-note">
+                    The verified join stays operational until an admin acts — it was not
+                    auto-changed.
+                    {d.kind === 'retargeted' && (
+                      <>
+                        {' '}
+                        To adopt the new target, confirm it in the open proposals below — it
+                        already appears there as a pending proposal.
+                      </>
+                    )}
+                  </p>
+                  <div className="gj-actions">
+                    <button
+                      type="button"
+                      className="btn q-ghost"
+                      aria-label={`Acknowledge divergence for ${d.from_ref}`}
+                      disabled={ackBusyId !== null}
+                      onClick={() => void acknowledge(d.id)}
+                    >
+                      {ackBusyId === d.id ? 'Acknowledging…' : 'Acknowledge'}
+                    </button>
+                  </div>
+                </li>
+              ))}
+            </ul>
+            {ackError && (
+              <p className="field-error" role="alert">
+                {ackError}
+              </p>
+            )}
+          </div>
+        </div>
       )}
       {tab === 'joins' && proposals?.length === 0 && (
         <p className="empty" role="status">

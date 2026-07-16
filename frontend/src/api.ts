@@ -375,9 +375,27 @@ export interface JoinConfirmResult {
   approvals: JoinApproval[]
 }
 
+// A governed-join divergence: a re-upload retargeted or dropped a joins_to that admins had
+// VERIFIED. Advisory only — the verified join stays operational until an admin acts. For kind
+// "retargeted" the new target also appears in `proposals` as its own pending proposal (the
+// existing confirm flow adopts it); for "dropped" declared_to_ref is null.
+export interface JoinDivergence {
+  id: number
+  from_ref: string
+  verified_to_ref: string
+  declared_to_ref: string | null
+  kind: 'retargeted' | 'dropped'
+  detected_at: string
+}
+
 export function listJoinProposals(
   source: string,
-): Promise<{ source: string; proposals: JoinProposal[]; next_cursor: string | null }> {
+): Promise<{
+  source: string
+  proposals: JoinProposal[]
+  divergences: JoinDivergence[]
+  next_cursor: string | null
+}> {
   return request(`/sources/${encodeURIComponent(source)}/governance/joins`)
 }
 
@@ -398,6 +416,23 @@ export function rejectJoin(
     category: body.category,
     note: body.note ?? null,
   })
+}
+
+// Acknowledge a divergence ("seen — the verified join stands / is being handled"). Advisory
+// bookkeeping only: it never touches the approved_join fact or its operational edge, and a
+// later re-upload that still diverges re-opens the row. Returns the acknowledged row.
+export function acknowledgeJoinDivergence(divergenceId: number): Promise<{
+  id: number
+  catalog_source: string
+  from_ref: string
+  verified_to_ref: string
+  declared_to_ref: string | null
+  kind: 'retargeted' | 'dropped'
+  detected_at: string
+  acknowledged_at: string
+  acknowledged_by: string
+}> {
+  return post(`/governance/joins/divergences/${divergenceId}/acknowledge`, {})
 }
 
 // ---- table-fact governance (Pass B confirm surface): grain / availability_time facts --------

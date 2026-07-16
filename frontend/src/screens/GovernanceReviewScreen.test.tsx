@@ -1,4 +1,4 @@
-import { render, screen } from '@testing-library/react'
+import { render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import * as api from '../api'
@@ -11,6 +11,7 @@ vi.mock('../api', async importOriginal => {
     listJoinProposals: vi.fn(),
     confirmJoin: vi.fn(),
     rejectJoin: vi.fn(),
+    acknowledgeJoinDivergence: vi.fn(),
     listTableFactProposals: vi.fn(),
     confirmTableFact: vi.fn(),
     rejectTableFact: vi.fn(),
@@ -20,6 +21,7 @@ vi.mock('../api', async importOriginal => {
 const listJoinProposals = vi.mocked(api.listJoinProposals)
 const confirmJoin = vi.mocked(api.confirmJoin)
 const rejectJoin = vi.mocked(api.rejectJoin)
+const acknowledgeJoinDivergence = vi.mocked(api.acknowledgeJoinDivergence)
 const listTableFactProposals = vi.mocked(api.listTableFactProposals)
 const confirmTableFact = vi.mocked(api.confirmTableFact)
 const rejectTableFact = vi.mocked(api.rejectTableFact)
@@ -37,6 +39,13 @@ beforeEach(() => {
   })
   rejectJoin.mockReset()
   rejectJoin.mockResolvedValue({ governance_status: 'REJECTED', category: 'different_entity' })
+  acknowledgeJoinDivergence.mockReset()
+  acknowledgeJoinDivergence.mockResolvedValue({
+    id: 7, catalog_source: 'compliance', from_ref: 'compliance.public.t.c',
+    verified_to_ref: 'compliance.public.u.c', declared_to_ref: 'compliance.public.v.c',
+    kind: 'retargeted', detected_at: '2026-07-15T00:00:00Z',
+    acknowledged_at: '2026-07-16T00:00:00Z', acknowledged_by: 'reviewer',
+  })
   // The screen loads BOTH queues per source; the joins tests only exercise the joins tab, so
   // the table-facts queue defaults to empty (and vice versa is set explicitly per test).
   listTableFactProposals.mockReset()
@@ -92,7 +101,7 @@ async function loadQueue() {
 describe('governance review screen', () => {
   it('renders a proposal card with from/to, cardinality, and the advisory score', async () => {
     listJoinProposals.mockResolvedValue({
-      source: 'compliance', proposals: [PROPOSAL], next_cursor: null,
+      source: 'compliance', proposals: [PROPOSAL], divergences: [], next_cursor: null,
     })
     await loadQueue()
     // The table names appear in both the join strip and the consequence line.
@@ -108,7 +117,7 @@ describe('governance review screen', () => {
 
   it('gates Approve on the checklist: disabled until every item is ticked, then confirms', async () => {
     listJoinProposals.mockResolvedValue({
-      source: 'compliance', proposals: [PROPOSAL], next_cursor: null,
+      source: 'compliance', proposals: [PROPOSAL], divergences: [], next_cursor: null,
     })
     await loadQueue()
     const approveBtn = await screen.findByRole('button', { name: /^approve$/i })
@@ -129,7 +138,7 @@ describe('governance review screen', () => {
 
   it('rejects with a structured category + note; the confirm button is gated on a category', async () => {
     listJoinProposals.mockResolvedValue({
-      source: 'compliance', proposals: [PROPOSAL], next_cursor: null,
+      source: 'compliance', proposals: [PROPOSAL], divergences: [], next_cursor: null,
     })
     await loadQueue()
     await userEvent.click(await screen.findByRole('button', { name: /reject…/i }))
@@ -161,6 +170,7 @@ describe('governance review screen', () => {
           note: 'Check the account namespace.', confirmed_at: '2026-07-10T00:00:00Z',
         }],
       }],
+      divergences: [],
       next_cursor: null,
     })
     await loadQueue()
@@ -179,6 +189,7 @@ describe('governance review screen', () => {
     listJoinProposals.mockResolvedValue({
       source: 'compliance',
       proposals: [{ ...PROPOSAL, evidence: {}, evidence_version: null, evidence_parse_status: 'missing' }],
+      divergences: [],
       next_cursor: null,
     })
     await loadQueue()
@@ -194,7 +205,9 @@ describe('governance review screen', () => {
   })
 
   it('grain & availability tab: renders the grain card, gates Approve on the checklist, single confirm', async () => {
-    listJoinProposals.mockResolvedValue({ source: 'compliance', proposals: [], next_cursor: null })
+    listJoinProposals.mockResolvedValue({
+      source: 'compliance', proposals: [], divergences: [], next_cursor: null,
+    })
     listTableFactProposals.mockResolvedValue({
       source: 'compliance',
       proposals: [{
@@ -238,7 +251,7 @@ describe('governance review screen', () => {
     // Whole-branch review FIX 2: the two queues settle independently — a table-facts endpoint
     // failure must not blank the joins tab; it surfaces as a per-tab error on the facts tab.
     listJoinProposals.mockResolvedValue({
-      source: 'compliance', proposals: [PROPOSAL], next_cursor: null,
+      source: 'compliance', proposals: [PROPOSAL], divergences: [], next_cursor: null,
     })
     listTableFactProposals.mockRejectedValue(new api.ApiError(500, 'table-facts queue exploded'))
     await loadQueue()
@@ -281,8 +294,12 @@ describe('governance review screen', () => {
 
   it('on a 409 conflict shows the server detail and reloads the list, never blind-retrying', async () => {
     listJoinProposals
-      .mockResolvedValueOnce({ source: 'compliance', proposals: [PROPOSAL], next_cursor: null })
-      .mockResolvedValueOnce({ source: 'compliance', proposals: [], next_cursor: null })
+      .mockResolvedValueOnce({
+        source: 'compliance', proposals: [PROPOSAL], divergences: [], next_cursor: null,
+      })
+      .mockResolvedValueOnce({
+        source: 'compliance', proposals: [], divergences: [], next_cursor: null,
+      })
     confirmJoin.mockRejectedValue(new api.ApiError(409, 'Changed since you loaded it — refresh.'))
     await loadQueue()
     for (const box of await screen.findAllByRole('checkbox')) await userEvent.click(box)
@@ -293,8 +310,71 @@ describe('governance review screen', () => {
     expect(screen.getByText(/no open join proposals/i)).toBeInTheDocument()
   })
 
+  it('renders the divergence alert per kind and acknowledges, refreshing the queue', async () => {
+    // Governed-join drift (#14): a re-upload disputed two VERIFIED joins. The alert lists both
+    // kinds, says the verified join stays operational, routes retarget adoption to the existing
+    // proposal flow (no confirm/retire button here), and Acknowledge reloads the queue.
+    const RETARGETED: api.JoinDivergence = {
+      id: 7,
+      from_ref: 'compliance.public.txn.cif_id',
+      verified_to_ref: 'compliance.public.customer_master.cif_id',
+      declared_to_ref: 'compliance.public.watchlist.cif_id',
+      kind: 'retargeted',
+      detected_at: '2026-07-15T00:00:00Z',
+    }
+    const DROPPED: api.JoinDivergence = {
+      id: 8,
+      from_ref: 'compliance.public.pos_txn.acct_id',
+      verified_to_ref: 'compliance.public.account_master.acct_id',
+      declared_to_ref: null,
+      kind: 'dropped',
+      detected_at: '2026-07-15T00:00:00Z',
+    }
+    listJoinProposals
+      .mockResolvedValueOnce({
+        source: 'compliance', proposals: [PROPOSAL], divergences: [RETARGETED, DROPPED],
+        next_cursor: null,
+      })
+      .mockResolvedValueOnce({
+        source: 'compliance', proposals: [PROPOSAL], divergences: [DROPPED], next_cursor: null,
+      })
+    await loadQueue()
+    // Both kind statements render, with the declared new target and the per-item note.
+    expect(await screen.findByText(/the source changed a join you verified/i)).toBeInTheDocument()
+    expect(screen.getByText(/the source dropped a join you verified/i)).toBeInTheDocument()
+    expect(screen.getByText('compliance.public.watchlist.cif_id')).toBeInTheDocument()
+    expect(screen.getAllByText(/stays operational until an admin acts/i)).toHaveLength(2)
+    // Retargeted routes adoption through the proposals list below — Acknowledge is the ONLY
+    // action on the alert (no confirm/retire button).
+    expect(screen.getByText(/confirm it in the open proposals below/i)).toBeInTheDocument()
+    const ackButtons = screen.getAllByRole('button', { name: /acknowledge divergence/i })
+    expect(ackButtons).toHaveLength(2)
+    await userEvent.click(ackButtons[0])
+    // Acknowledged -> refreshed: the retargeted item left the open list, the dropped one stays.
+    await waitFor(() =>
+      expect(screen.queryByText(/the source changed a join you verified/i)).not.toBeInTheDocument(),
+    )
+    expect(acknowledgeJoinDivergence).toHaveBeenCalledWith(7)
+    expect(listJoinProposals).toHaveBeenCalledTimes(2)
+    expect(screen.getByText(/the source dropped a join you verified/i)).toBeInTheDocument()
+  })
+
+  it('renders no divergence block when the joins response carries none', async () => {
+    listJoinProposals.mockResolvedValue({
+      source: 'compliance', proposals: [PROPOSAL], divergences: [], next_cursor: null,
+    })
+    await loadQueue()
+    expect(await screen.findAllByText('COMP_FINANCIAL_TRAN_REPOS_DLY')).not.toHaveLength(0)
+    expect(screen.queryByText(/the latest upload disputes/i)).not.toBeInTheDocument()
+    expect(
+      screen.queryByRole('button', { name: /acknowledge divergence/i }),
+    ).not.toBeInTheDocument()
+  })
+
   it('readiness tab: renders the per-table diagnostic with a status badge and pair counts, read-only', async () => {
-    listJoinProposals.mockResolvedValue({ source: 'compliance', proposals: [], next_cursor: null })
+    listJoinProposals.mockResolvedValue({
+      source: 'compliance', proposals: [], divergences: [], next_cursor: null,
+    })
     listRelationshipReadiness.mockResolvedValue({
       source: 'compliance',
       relationships: [{
