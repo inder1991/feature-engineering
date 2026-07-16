@@ -754,6 +754,38 @@ def test_held_import_records_held_run(client, conn):
     assert run["pre_source_fingerprint"] == run["post_source_fingerprint"]
 
 
+def test_connector_ingest_fault_500_carries_run_header_and_failed_run(client, monkeypatch):
+    """Review FIX 3: a raw (non-HTTPException) fault inside the import — e.g. an OCC
+    ConcurrencyError from ingest_upload surfacing as a 500 — must still carry the
+    X-Ingestion-Run-Id header (via the exception's headers + the app-level handler, body
+    byte-for-byte the default 500) so the caller can link the failure to its durable 'failed'
+    run. Pre-fix the except path terminalized the run but re-raised header-less."""
+    from fastapi.testclient import TestClient
+
+    from featuregen.api.routes import integrations as routes
+    from featuregen.contracts.errors import ConcurrencyError
+
+    _, sid = _configured_sync(client)
+    pv = _preview(client, sid).json()
+
+    def _raise(*args, **kwargs):
+        raise ConcurrencyError("expected_version 3 != stream_version 4")
+
+    monkeypatch.setattr(routes, "ingest_upload", _raise)
+    with TestClient(client.app, raise_server_exceptions=False) as raw_client:
+        res = _import(raw_client, sid, pv["snapshot_hash"], pv["local_baseline_hash"])
+    assert res.status_code == 500
+    run_id = res.headers[RUN_HEADER]
+    assert run_id.startswith("ingrun_")
+    assert res.text == "Internal Server Error"    # body-compat: the default 500, untouched
+
+    run = _get_run(client, run_id).json()
+    assert run["status"] == "failed"
+    assert run["redacted_failure_code"] == "ConcurrencyError"     # the CLASS, never the message
+    assert "stream_version" not in str(run)
+    assert run["status_history"][-1]["reason_code"] == "unhandled_exception"
+
+
 def test_migration_0995_import_run_link_column_is_nullable(conn):
     row = conn.execute(
         "SELECT is_nullable, data_type FROM information_schema.columns "

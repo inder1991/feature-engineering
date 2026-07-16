@@ -630,10 +630,13 @@ def import_sync(sync_id: str, body: ImportIn, response: Response, conn: _Conn,
         raise
     except Exception as exc:
         # A raw fault (e.g. an ingest ConcurrencyError / DB error surfacing as a 500) keeps its
-        # existing behavior — re-raised unchanged, body untouched — but its run is terminalized
-        # durably first, so the attempt stays queryable even without the header.
+        # existing body — re-raised unchanged — but its run is terminalized durably first, and
+        # the run id rides the raised exception's headers (review FIX 3), which the app-level
+        # Exception handler lifts onto the default 500 response so the caller can link the
+        # failure to its run.
         terminalize_run_durable(
             run_id, status="failed", now=datetime.now(UTC),
             redacted_failure_code=type(exc).__name__,
             reason_code="unhandled_exception", fallback_conn=conn)
+        exc.headers = {**(getattr(exc, "headers", None) or {}), RUN_ID_HEADER: run_id}
         raise
