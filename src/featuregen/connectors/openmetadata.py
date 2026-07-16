@@ -37,6 +37,7 @@ from typing import Any
 from featuregen.overlay.upload.brake import large_change_brake
 from featuregen.overlay.upload.canonical import CanonicalRow, validate_rows
 from featuregen.overlay.upload.graph import parse_join_ref
+from featuregen.overlay.upload.semantics import semantics_pending
 from featuregen.overlay.upload.upload_catalog import UploadCatalog
 
 # ---- Client ---------------------------------------------------------------------------------
@@ -411,9 +412,12 @@ def snapshot_hash(rows: Iterable[CanonicalRow]) -> str:
 
 def semantics_pending_count(rows: Iterable[CanonicalRow]) -> int:
     """Columns arriving without ANY of the safety facts the gauntlet depends on (as-of basis,
-    additivity, unit/currency, entity) — flagged 'semantics pending' for owner confirmation."""
+    additivity, unit/currency, entity) — flagged 'semantics pending' for owner confirmation.
+    Delegates to the SHARED predicate behind /sources/{source}/semantics-pending (#22), so this
+    count and that queue can never disagree on what 'pending' means."""
     return sum(1 for r in rows
-               if not (r.as_of or r.additivity or r.unit or r.currency or r.entity))
+               if semantics_pending(as_of=r.as_of, additivity=r.additivity, unit=r.unit,
+                                    currency=r.currency, entity=r.entity))
 
 
 # ---- Preview (dry run — NEVER writes) --------------------------------------------------------
