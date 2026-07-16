@@ -5,6 +5,7 @@ transport's error mapping is proven with httpx.MockTransport (still no network).
 """
 from __future__ import annotations
 
+import copy
 from dataclasses import replace
 
 import httpx
@@ -214,6 +215,62 @@ def test_database_filter_stays_a_glob():
     assert missed.rows == []
 
 
+# ---- Folded-name collisions (#14) --------------------------------------------------------------
+
+
+def _schema_table(schema: str, name: str, columns: list[dict] | None = None) -> dict:
+    """A table entity under mysql_prod.cards_db.<schema>.<name>."""
+    return {"name": name,
+            "fullyQualifiedName": f"mysql_prod.cards_db.{schema}.{name}",
+            "service": {"name": "mysql_prod"}, "database": {"name": "cards_db"},
+            "databaseSchema": {"name": schema},
+            "columns": columns or [{"name": "id", "dataType": "BIGINT"}]}
+
+
+def test_folded_name_collision_is_held_out_not_silently_merged():
+    """Two DISTINCT upstream tables (sales.account, finance.account) fold to the same bare name
+    under the default table_naming='table'. They must NOT merge into one table: both are held out
+    of the translation (fail-closed) and the collision surfaces as an explicit diagnostic."""
+    tables = [_schema_table("sales", "account"),
+              _schema_table("finance", "account",
+                            columns=[{"name": "id", "dataType": "BIGINT"},
+                                     {"name": "gl_code", "dataType": "VARCHAR"}]),
+              _schema_table("sales", "customers")]
+    translation = read_openmetadata(tables, CARDS_CONFIG)
+    assert {r.table for r in translation.rows} == {"customers"}      # nothing merged
+    assert [(c.table, c.fqns) for c in translation.collisions] == [
+        ("account", ("mysql_prod.cards_db.finance.account", "mysql_prod.cards_db.sales.account"))]
+
+
+def test_same_upstream_table_twice_is_not_a_collision():
+    """A duplicate entity for the SAME upstream FQN (a re-listed page) is not a collision — only
+    DISTINCT upstream identities folding to one name are."""
+    t = _schema_table("sales", "account")
+    translation = read_openmetadata([t, copy.deepcopy(t)], CARDS_CONFIG)
+    assert translation.collisions == []
+    assert {r.table for r in translation.rows} == {"account"}
+
+
+def test_schema_table_naming_keeps_would_be_collisions_apart():
+    """The non-colliding path is untouched: under schema_table naming the same two tables fold to
+    distinct names and both import."""
+    tables = [_schema_table("sales", "account"), _schema_table("finance", "account")]
+    translation = read_openmetadata(tables, replace(CARDS_CONFIG, table_naming="schema_table"))
+    assert translation.collisions == []
+    assert {r.table for r in translation.rows} == {"sales_account", "finance_account"}
+
+
+def test_preview_surfaces_folded_name_collision(conn):
+    tables = [_schema_table("sales", "account"), _schema_table("finance", "account"),
+              _schema_table("sales", "customers")]
+    preview = build_preview(conn, CARDS_CONFIG, read_openmetadata(tables, CARDS_CONFIG))
+    assert preview["collisions"] == [
+        {"table": "account",
+         "fqns": ["mysql_prod.cards_db.finance.account", "mysql_prod.cards_db.sales.account"]}]
+    # the held-out tables never reach the diff/ingest inputs
+    assert "account" not in {t["table"] for t in preview["tables"]}
+
+
 # ---- Snapshot hash ----------------------------------------------------------------------------
 
 
@@ -222,6 +279,14 @@ def test_snapshot_hash_is_order_insensitive_but_content_sensitive():
     assert snapshot_hash(rows) == snapshot_hash(list(reversed(rows)))
     changed = [replace(rows[0], type="text"), *rows[1:]]
     assert snapshot_hash(changed) != snapshot_hash(rows)
+
+
+def test_snapshot_hash_is_canonical_when_rows_share_table_column():
+    # #32 — two rows sharing (table, column) but differing elsewhere must hash identically regardless of
+    # arrival order — the old (table, column)-only sort was stable, so order leaked into the hash.
+    r1 = CanonicalRow(source="s", table="t", column="a", type="int", definition="x")
+    r2 = CanonicalRow(source="s", table="t", column="a", type="int", definition="y")
+    assert snapshot_hash([r1, r2]) == snapshot_hash([r2, r1])
 
 
 # ---- Real transport error mapping (httpx.MockTransport — still no network) --------------------

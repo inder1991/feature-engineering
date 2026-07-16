@@ -171,10 +171,20 @@ class AsOfSuggestion:
 
 
 @dataclass(frozen=True, slots=True)
+class FoldCollision:
+    """Two or more DISTINCT upstream tables (different fullyQualifiedNames) that fold to the SAME
+    catalog table name under the active table_naming. Held OUT of the translation (fail-closed — the
+    connector never silently merges distinct sources) and surfaced for a human to resolve (#14)."""
+    table: str
+    fqns: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class Translation:
     rows: list[CanonicalRow]
     as_of_suggestions: list[AsOfSuggestion]
     tag_counts: dict[str, int]     # every OM tagFQN seen in the pull -> column count (tag-map panel)
+    collisions: list[FoldCollision] = field(default_factory=list)   # folded-name clashes, held out (#14)
 
 
 def _entity_name(entity: Any) -> str:
@@ -301,13 +311,28 @@ def read_openmetadata(tables_json: list[dict[str, Any]], config: OMConfig) -> Tr
     rows: list[CanonicalRow] = []
     suggestions: list[AsOfSuggestion] = []
     tag_counts: dict[str, int] = {}
+    # Pass 1 (#14): fold every in-scope table and group the DISTINCT upstream FQNs behind each folded
+    # name. A folded name carrying >1 distinct FQN is a collision — two upstream tables that would
+    # silently merge into one catalog table (the default table_naming drops schema). Hold them all out.
+    in_scope: list[tuple[dict[str, Any], Mapping[str, str], str]] = []
+    fqns_by_folded: dict[str, set[str]] = {}
     for t in tables_json:
         if not isinstance(t, dict):
             continue
         parts = _fqn_parts(t)
         if not _in_scope(parts, config.filters):
             continue
-        table = _fold_table(str(t.get("name") or ""), parts["schema"], config.table_naming)
+        folded = _fold_table(str(t.get("name") or ""), parts["schema"], config.table_naming)
+        fqns_by_folded.setdefault(folded, set()).add(str(t.get("fullyQualifiedName") or ""))
+        in_scope.append((t, parts, folded))
+    collisions = [
+        FoldCollision(table=folded, fqns=tuple(sorted(fqns)))
+        for folded, fqns in sorted(fqns_by_folded.items()) if len(fqns) > 1]
+    collided = {c.table for c in collisions}
+    # Pass 2: translate only the non-colliding tables.
+    for t, _parts, table in in_scope:
+        if table in collided:
+            continue
         grain = _grain_columns(t)
         joins = _join_targets(t, config)
         suggested: set[str] = set()
@@ -336,14 +361,18 @@ def read_openmetadata(tables_json: list[dict[str, Any]], config: OMConfig) -> Tr
                 suggestions.append(AsOfSuggestion(
                     table, name, f"{data_type} column named like a time axis"))
                 suggested.add(name)
-    return Translation(rows=rows, as_of_suggestions=suggestions, tag_counts=tag_counts)
+    return Translation(rows=rows, as_of_suggestions=suggestions, tag_counts=tag_counts,
+                       collisions=collisions)
 
 
 def snapshot_hash(rows: Iterable[CanonicalRow]) -> str:
     """Deterministic hash of the translated rows (sorted, so OM page order can't flip it).
     Preview returns it; import recomputes it after the re-pull and 409s on a mismatch —
     stale-preview protection."""
-    canon = sorted((asdict(r) for r in rows), key=lambda d: (d["table"], d["column"]))
+    # Sort by the WHOLE canonicalized row, not just (table, column): folded-key collisions or
+    # duplicate entities can yield rows sharing (table, column) but differing elsewhere, and a
+    # partial key leaves their order to the upstream pull — so equal sets could hash differently (#32).
+    canon = sorted((asdict(r) for r in rows), key=lambda d: json.dumps(d, sort_keys=True))
     return hashlib.sha256(json.dumps(canon, sort_keys=True).encode()).hexdigest()
 
 
@@ -458,6 +487,7 @@ def build_preview(conn: Any, config: OMConfig, translation: Translation) -> dict
             for tag, count in sorted(translation.tag_counts.items())
         ],
         "tables": tables,
+        "collisions": [{"table": c.table, "fqns": list(c.fqns)} for c in translation.collisions],
         "brake": {"would_hold": brake.held, "reason": brake.reason},
         "as_of_suggestions": [asdict(s) for s in translation.as_of_suggestions],
         "snapshot_hash": snapshot_hash(translation.rows),
