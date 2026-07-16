@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -693,11 +694,35 @@ def _ingest_glossary_evidence(conn, *, source: str, rows: list[CanonicalRow],
         logger.warning("advisory readiness diagnostic failed for %r", source, exc_info=True)
 
 
+def ingest_source_lock_key(catalog_source: str) -> int:
+    """Stable 64-bit advisory-lock key serializing ingests of ONE ``catalog_source`` (#3).
+
+    sha256 over a dedicated ``overlay_ingest:`` namespace, first 8 bytes big-endian signed — the
+    exact derivation worker.py uses for its ``overlay_renewal`` / ``overlay_drift:{source}`` keys,
+    under a DISTINCT prefix so this key space cannot collide with those (nor, practically, with the
+    fixed constants: security-chain 7_000_007, migrations 6157423001, global-seq
+    4_201_873_355_201_001). MUST stay stable across releases: two versions deriving different keys
+    for the same source would stop excluding each other during a rolling deploy."""
+    return int.from_bytes(
+        hashlib.sha256(f"overlay_ingest:{catalog_source}".encode()).digest()[:8],
+        "big", signed=True)
+
+
 def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
                   actor, now: datetime | None = None, client=None,
                   profile: SourceCapabilityProfile | None = None,
                   glossary: GlossaryUpload | None = None) -> IngestResult:
     ensure_upload_catalog_adapter()   # governed fact lifecycle needs an adapter (owner_of->None)
+    # #3 — SERIALIZE same-source ingests. build_graph is DELETE-this-source-then-reinsert, so two
+    # concurrent uploads of the SAME source would clobber each other's graph (last-writer-wins) and
+    # let the drift snapshot diverge from the graph. A transaction-scoped, SOURCE-scoped advisory
+    # lock taken ONCE, on the REQUEST connection, at the very top (before brake/snapshot/facts/
+    # graph) blocks the second same-source ingest until the first commits; different sources hash
+    # to different keys and never block each other. Auto-released at COMMIT/ROLLBACK (nothing to
+    # clean up). DEADLOCK SAFETY (program-audit I-3 history): acquired nowhere else in the ingest
+    # path, and enrich_llm's durable-audit connection deliberately takes NO advisory lock, so no
+    # second connection can wait on the key this transaction holds.
+    conn.execute("SELECT pg_advisory_xact_lock(%s)", (ingest_source_lock_key(catalog_source),))
     # `profile` (spec §U) makes validation profile-aware: a glossary upload's `type="unknown"` rows
     # pass, while a technical upload (or the default `profile=None`) still requires a real type. A
     # glossary sidecar IMPLIES the glossary profile (a glossary attests no physical type), so default
