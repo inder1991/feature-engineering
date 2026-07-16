@@ -5,8 +5,8 @@ from featuregen.overlay.upload.planner.safety import evaluate_binding_safety
 def test_enums_are_lowercase_snake_and_complete():
     assert c.PlanResolutionStatus.resolved == "resolved"
     assert {s.value for s in c.PlanResolutionStatus} == {
-        "resolved", "partially_resolved", "unresolved", "safety_rejected",
-        "not_applicable", "bounded_out", "internal_error"}
+        "resolved", "resolved_with_ambiguity", "partially_resolved", "unresolved",
+        "safety_rejected", "not_applicable", "bounded_out", "internal_error"}
     assert c.ReplayStrength.conditional == "conditional"
     assert c.PlanTier.tier_1_single_catalog == "tier_1_single_catalog"
     assert c.BindingSafety.safe == "safe"
@@ -52,3 +52,105 @@ def test_evaluate_binding_safety_parity_with_safe_to_bind():
     for col in reps:
         expected = c.BindingSafety.safe if _safe_to_bind(col) else c.BindingSafety.unsafe
         assert evaluate_binding_safety(col) is expected
+
+
+# ---- 3B.3b (Task B1): contract additions + canonical constructor ----
+
+def test_new_enum_members():
+    assert c.PlanTier.tier_2_one_bridge == "tier_2_one_bridge"
+    assert c.PlanTier.tier_3_multi_bridge == "tier_3_multi_bridge"
+    assert {s.value for s in c.PathResolutionStatus} == {
+        "ingredient_binding_only", "source_to_target_resolved", "source_to_target_rejected"}
+    assert c.PlanResolutionStatus.resolved_with_ambiguity == "resolved_with_ambiguity"
+    for r in ("unsupported_multi_grain_ingredients", "ambiguous_semantic_path",
+              "bounded_out_max_bridges", "bounded_out_max_frontier_states"):
+        assert r in {x.value for x in c.ReasonCode}
+
+
+def test_tier_from_bridge_count():
+    assert c.tier_from_bridge_count(0) is c.PlanTier.tier_1_single_catalog
+    assert c.tier_from_bridge_count(1) is c.PlanTier.tier_2_one_bridge
+    assert c.tier_from_bridge_count(3) is c.PlanTier.tier_3_multi_bridge
+
+
+def test_make_binding_plan_validates_and_derives():
+    seg = c.BindingPathSegmentV1(c.SegmentKind.direct_catalog, "core")
+    plan = c.make_binding_plan(
+        recipe_id="t", target_entity="customer", catalog_source="core",
+        ingredient_bindings=(), path_segments=(seg,),
+        resolution_status=c.PlanResolutionStatus.resolved,
+        path_resolution_status=c.PathResolutionStatus.source_to_target_resolved,
+        primary_reason_code=None, reason_codes=(), safety=c.BindingSafety.safe,
+        preference_rank=0, preference_reasons=(), candidate_role=c.CandidateRole.selected)
+    assert plan.participating_catalogs == ("core",) and plan.bridge_count == 0
+    assert plan.tier is c.PlanTier.tier_1_single_catalog
+    assert len(plan.plan_id) > 3
+
+
+def _bridge_seg(cat, e="account"):
+    return c.BindingPathSegmentV1(c.SegmentKind.governed_bridge, cat, from_entity=e, to_entity=e,
+                                  bridge_fact_key=f"b_{cat}")
+
+
+def test_make_binding_plan_derives_multibridge_participation():
+    # a 2-bridge path core->other->third derives ordered/deduped participation, bridge_count, tier_3
+    segs = (c.BindingPathSegmentV1(c.SegmentKind.direct_catalog, "core"),
+            _bridge_seg("other"), _bridge_seg("third"))
+    plan = c.make_binding_plan(
+        recipe_id="t", target_entity="customer", catalog_source="core",
+        ingredient_bindings=(), path_segments=segs,
+        resolution_status=c.PlanResolutionStatus.resolved,
+        path_resolution_status=c.PathResolutionStatus.source_to_target_resolved,
+        primary_reason_code=None, reason_codes=(), safety=c.BindingSafety.safe,
+        preference_rank=0, preference_reasons=(), candidate_role=c.CandidateRole.selected)
+    assert plan.participating_catalogs == ("core", "other", "third")
+    assert plan.bridge_count == 2 and plan.tier is c.PlanTier.tier_3_multi_bridge
+
+
+def test_make_binding_plan_rejects_resolved_path_with_unresolved_status():
+    import pytest
+    # a source_to_target_resolved plan whose resolution_status is unresolved is contradictory -> fail-closed
+    seg = c.BindingPathSegmentV1(c.SegmentKind.direct_catalog, "core")
+    with pytest.raises(ValueError):
+        c.make_binding_plan(recipe_id="t", target_entity="c", catalog_source="core",
+                            ingredient_bindings=(), path_segments=(seg,),
+                            resolution_status=c.PlanResolutionStatus.unresolved,
+                            path_resolution_status=c.PathResolutionStatus.source_to_target_resolved,
+                            primary_reason_code=None, reason_codes=(), safety=c.BindingSafety.safe,
+                            preference_rank=0, preference_reasons=(), candidate_role=c.CandidateRole.rejected)
+
+
+def test_plan_id_distinguishes_path_resolution_status():
+    # Regression (b5 review): a tier-1 ingredient_binding_only plan and an immediate-dead-end
+    # assembly reject (source_to_target_rejected) over the SAME recipe/catalog/refs/segments/tier
+    # collided on plan_id because the hashed material omitted path_resolution_status. 3B.4 keys
+    # its store by plan_id, so the collision would silently conflate a resolved plan with a reject.
+    def _plan(path_status: c.PathResolutionStatus) -> c.BindingPlanV1:
+        return c.make_binding_plan(
+            recipe_id="t", target_entity="customer", catalog_source="ops",
+            ingredient_bindings=(),
+            path_segments=(c.BindingPathSegmentV1(c.SegmentKind.direct_catalog, "ops"),),
+            resolution_status=c.PlanResolutionStatus.unresolved,
+            path_resolution_status=path_status,
+            primary_reason_code=None, reason_codes=(), safety=c.BindingSafety.safe,
+            preference_rank=0, preference_reasons=(), candidate_role=c.CandidateRole.rejected)
+
+    binding_only = _plan(c.PathResolutionStatus.ingredient_binding_only)
+    rejected = _plan(c.PathResolutionStatus.source_to_target_rejected)
+    # same tier (both bridge-free -> tier_1) and same segments: only path_resolution_status differs
+    assert binding_only.tier is rejected.tier is c.PlanTier.tier_1_single_catalog
+    assert binding_only.plan_id != rejected.plan_id
+
+
+def test_make_binding_plan_rejects_over_budget_bridges():
+    import pytest
+    # 3 governed bridges exceeds MAX_BRIDGES_PER_PLAN (2) -> fail-closed, never constructed
+    segs = (c.BindingPathSegmentV1(c.SegmentKind.direct_catalog, "core"),
+            _bridge_seg("c1"), _bridge_seg("c2"), _bridge_seg("c3"))
+    with pytest.raises(ValueError):
+        c.make_binding_plan(recipe_id="t", target_entity="c", catalog_source="core",
+                            ingredient_bindings=(), path_segments=segs,
+                            resolution_status=c.PlanResolutionStatus.resolved,
+                            path_resolution_status=c.PathResolutionStatus.source_to_target_resolved,
+                            primary_reason_code=None, reason_codes=(), safety=c.BindingSafety.safe,
+                            preference_rank=0, preference_reasons=(), candidate_role=c.CandidateRole.selected)
