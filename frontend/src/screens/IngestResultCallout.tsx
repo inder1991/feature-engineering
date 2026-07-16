@@ -145,6 +145,21 @@ export function IngestResultCallout({
   // connector whose scope they narrow. Defaults to the file-upload advice.
   heldAdvice?: string
 }) {
+  // The backend PERSISTS quarantine rows even when the catalog change itself is held or
+  // rejected, so both branches must surface the queue (#12) — and the copy must not claim
+  // "nothing was applied" when the review queue just changed.
+  const quarantineHandoff = result.quarantined > 0 && (
+    <>
+      <p>
+        <Count value={result.quarantined} tone="warn" /> row
+        {result.quarantined === 1 ? ' was' : 's were'} quarantined for review — the review queue
+        changed even though no catalog objects did.
+      </p>
+      <button type="button" className="btn" onClick={() => onReviewQueue(source)}>
+        Review {result.quarantined} quarantined row{result.quarantined === 1 ? '' : 's'}
+      </button>
+    </>
+  )
   if (result.status === 'held') {
     return (
       <div className="callout callout--warn" role="status">
@@ -160,10 +175,13 @@ export function IngestResultCallout({
           </p>
           <p>{result.reason}</p>
           <p>
-            Nothing was applied. There is no override yet.{' '}
+            {result.quarantined > 0
+              ? 'No catalog changes were applied. There is no override yet.'
+              : 'Nothing was applied. There is no override yet.'}{' '}
             {heldAdvice ??
               'Adjust the file so it keeps most existing objects, or split the change into smaller uploads.'}
           </p>
+          {quarantineHandoff}
         </div>
       </div>
     )
@@ -180,6 +198,7 @@ export function IngestResultCallout({
             <strong>Rejected.</strong>
           </p>
           <p>{result.reason}</p>
+          {quarantineHandoff}
         </div>
       </div>
     )

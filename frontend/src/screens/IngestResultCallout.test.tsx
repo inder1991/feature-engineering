@@ -1,4 +1,5 @@
 import { render, screen, waitFor } from '@testing-library/react'
+import userEvent from '@testing-library/user-event'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import * as api from '../api'
 import { IngestResultCallout, summarizeStages } from './IngestResultCallout'
@@ -85,6 +86,57 @@ describe('ingest result stage summary', () => {
     expect(screen.getByText('Ingested.')).toBeInTheDocument()
     renderCallout(result({ status: 'held', reason: 'too much removed', ingestion_run_id: 'run-4' }))
     expect(getIngestionRun).not.toHaveBeenCalled()
+  })
+})
+
+// The backend persists quarantine rows on held/rejected too (#12): both branches must offer the
+// review-queue handoff and must not claim "nothing was applied" when the queue changed.
+describe('held/rejected quarantine handoff', () => {
+  it('held with quarantined rows shows the count, honest copy, and the review-queue button', async () => {
+    const onReviewQueue = vi.fn()
+    render(
+      <IngestResultCallout
+        result={result({ status: 'held', reason: 'removes 8 of 10 objects', quarantined: 2 })}
+        source="deposits"
+        onReviewQueue={onReviewQueue}
+      />,
+    )
+    const callout = screen.getByRole('status')
+    expect(callout).toHaveTextContent(/held: this change removes too much/i)
+    // Honest copy: the review queue DID change, so the blanket claim must not render.
+    expect(callout).not.toHaveTextContent('Nothing was applied.')
+    expect(callout).toHaveTextContent('No catalog changes were applied.')
+    expect(callout).toHaveTextContent(/2 rows were quarantined for review/)
+    await userEvent.click(screen.getByRole('button', { name: 'Review 2 quarantined rows' }))
+    expect(onReviewQueue).toHaveBeenCalledExactlyOnceWith('deposits')
+  })
+
+  it('rejected with quarantined rows shows the count and the review-queue button', async () => {
+    const onReviewQueue = vi.fn()
+    render(
+      <IngestResultCallout
+        result={result({ status: 'rejected', reason: 'unrecognized headers', quarantined: 1 })}
+        source="deposits"
+        onReviewQueue={onReviewQueue}
+      />,
+    )
+    const callout = screen.getByRole('status')
+    expect(callout).toHaveTextContent('Rejected.')
+    expect(callout).toHaveTextContent(/1 row was quarantined for review/)
+    await userEvent.click(screen.getByRole('button', { name: 'Review 1 quarantined row' }))
+    expect(onReviewQueue).toHaveBeenCalledExactlyOnceWith('deposits')
+  })
+
+  it('held/rejected with an empty queue keep the plain copy and offer no button', () => {
+    render(
+      <IngestResultCallout
+        result={result({ status: 'held', reason: 'too much removed' })}
+        source="deposits"
+        onReviewQueue={() => {}}
+      />,
+    )
+    expect(screen.getByRole('status')).toHaveTextContent('Nothing was applied.')
+    expect(screen.queryByRole('button', { name: /quarantined row/ })).toBeNull()
   })
 })
 
