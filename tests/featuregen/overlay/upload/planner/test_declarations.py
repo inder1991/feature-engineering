@@ -28,10 +28,12 @@ from featuregen.overlay.upload.planner.declarations import (
     PathPositionV1,
     audit_envelope,
     bridge_fingerprint,
+    build_compiler_context,
     build_physical_read_set,
     check_composition,
     check_connectivity,
     compile_aggregation,
+    compile_contract,
     compile_temporal,
     hop_physical_cardinality,
     recipe_content_hash,
@@ -41,6 +43,7 @@ from featuregen.overlay.upload.planner.declarations import (
     stage_safety,
 )
 from featuregen.overlay.upload.planner.plan import _envelope
+from featuregen.overlay.upload.planner.scope import resolve_catalog_scope
 from featuregen.overlay.upload.taxonomy.entity_relationships import Cardinality
 from featuregen.overlay.upload.templates import Need, Template, _load_columns
 
@@ -1409,3 +1412,254 @@ def test_recipe_content_hash_is_canonical_and_stable(db):
     # ...but genuinely different identity fields ARE
     t_other = _c7_template(needs=needs, params={"window": (30,), "measure": ("a", "b")})
     assert recipe_content_hash(t_other) != env1.recipe_content_hash
+
+
+# ─── C8: compile_contract (the precedence fold) + build_compiler_context (the per-run batch) ──
+# The fold derives declaration_status by the §10 precedence MINUS freshness (identity-bearing),
+# then folds the freshness OBSERVATION in for contract_resolution_status. The C4 handoff is the
+# key correctness edge: a validation=sound stage carrying additivity_source_conflict MUST be
+# promoted to unresolved_aggregation_declaration — contract_id hashes stage VALIDATION, not stage
+# reason codes, so an unpromoted conflict would be invisible to identity.
+
+def _c8_seed(db):
+    """_txn_core plus every failure ingredient the fold tests need: a conflicted-additivity
+    measure (uploaded additive vs concept semi_additive), a non-additive rate, the leakage-anchor
+    outcome column, a pii-scoped column (invisible without the pii role), and the off-path
+    card_swipes table."""
+    _seed(db, "core", [
+        (CanonicalRow("core", "transactions", "transaction_id", "integer", is_grain=True),
+         "transaction_id"),
+        (CanonicalRow("core", "transactions", "account_id", "integer",
+                      joins_to="accounts.account_id", cardinality="N:1"), "account_id"),
+        (CanonicalRow("core", "transactions", "amount", "numeric"), "monetary_flow"),
+        (CanonicalRow("core", "transactions", "boosted", "numeric", additivity="additive"),
+         "monetary_stock"),
+        (CanonicalRow("core", "transactions", "rate", "numeric"), "monetary_rate"),
+        (CanonicalRow("core", "transactions", "defaulted", "text"), "default_flag"),
+        (CanonicalRow("core", "transactions", "email", "text", sensitivity="pii"), "pii"),
+        (CanonicalRow("core", "card_swipes", "transaction_id", "integer", is_grain=True),
+         "transaction_id"),
+        (CanonicalRow("core", "card_swipes", "fee_amount", "numeric"), "monetary_flow"),
+        (CanonicalRow("core", "accounts", "account_id", "integer", is_grain=True), "account_id"),
+    ])
+
+
+_C8_NEEDS = (Need("source_key", "account_id", join_role=JoinRole.SOURCE_ENTITY_KEY),
+             Need("amount", "monetary_flow"))
+
+
+def _c8_template(needs=_C8_NEEDS, *, additivity="additive"):
+    return _template("c8_contract_probe", needs=needs, params={}, additivity=additivity)
+
+
+def _c8_plan(ctx, *measures):
+    (r,) = ctx.realizations_by_catalog["core"]
+    return _plan(
+        bindings=(_binding("source_key", "public.transactions.account_id",
+                           join_role=str(JoinRole.SOURCE_ENTITY_KEY), concept="account_id"),
+                  *measures),
+        segments=_rollup_segments(r.realization_id))
+
+
+def _c8_compile(db, ctx, plan, template):
+    return compile_contract(db, ctx, plan, template,
+                            base_envelope=_envelope(db, _c7_scope(), "r1", "account"))
+
+
+def _fresh(db):
+    _watermark(db, "core", _NOW - timedelta(minutes=5), head_seq=1)
+    _checkpoint(db, 1)
+
+
+def test_compile_contract_resolves_and_pins_evidence(db):
+    _c8_seed(db)
+    _fresh(db)
+    ctx = _ctx(db, "core")
+    plan = _c8_plan(ctx, _binding("amount", "public.transactions.amount"))
+    out = _c8_compile(db, ctx, plan, _c8_template())
+    assert out.declaration_status is c.DeclarationStatus.resolved
+    assert out.contract_resolution_status is c.ContractResolutionStatus.resolved
+    assert out.contract_primary_reason_code is None and out.contract_reason_codes == ()
+    assert out.contract_id and out.contract_id.startswith("cc_")
+    # the physical identity NEVER moves through compilation; the compile time is pinned
+    assert out.physical_plan_id == plan.physical_plan_id
+    assert out.resolved_at_compilation == _NOW
+    # evidence attached: hops, temporal, read set, and the §9 audit envelope
+    assert out.hop_aggregations and out.temporal_declaration is not None
+    assert out.physical_read_set is not None and out.physical_read_set.columns
+    assert out.audit_envelope is not None
+    assert out.audit_envelope.replay_strength is c.ReplayStrength.audit_only
+    assert out.audit_envelope.stamp_consistency is c.StampConsistency.consistent
+    assert [s.catalog_source for s in out.audit_envelope.catalog_state_stamps] == ["core"]
+    # deterministic identity: an identical recompile mints the identical contract_id
+    assert _c8_compile(db, ctx, plan, _c8_template()).contract_id == out.contract_id
+
+
+def test_stale_plan_keeps_declaration_status_and_contract_identity(db):
+    _c8_seed(db)
+    _watermark(db, "core", _NOW - timedelta(hours=2), head_seq=1)   # stale vs the 60-min SLA
+    _checkpoint(db, 1)
+    ctx = _ctx(db, "core")
+    plan = _c8_plan(ctx, _binding("amount", "public.transactions.amount"))
+    stale = _c8_compile(db, ctx, plan, _c8_template())
+    assert stale.declaration_status is c.DeclarationStatus.resolved
+    assert stale.contract_resolution_status is c.ContractResolutionStatus.unresolved_freshness
+    assert stale.contract_primary_reason_code is c.ReasonCode.participating_catalog_stale
+    assert stale.contract_reason_codes == (c.ReasonCode.participating_catalog_stale,)
+    _fresh(db)      # the catalog re-scans; the DECLARATIONS never changed
+    fresh = _c8_compile(db, ctx, plan, _c8_template())
+    assert fresh.contract_resolution_status is c.ContractResolutionStatus.resolved
+    # F7: freshness is an observation — identical declarations mint the SAME contract_id
+    assert stale.contract_id == fresh.contract_id
+
+
+def test_sound_stage_with_additivity_conflict_promotes_to_unresolved_aggregation(db):
+    # THE C4 handoff: uploaded 'additive' beats concept 'semi_additive' and validates sound, but
+    # the stage carries additivity_source_conflict — a code contract_id cannot see through stage
+    # validation alone, so the fold MUST promote it into the declaration status + reason codes.
+    _c8_seed(db)
+    _fresh(db)
+    ctx = _ctx(db, "core")
+    plan = _c8_plan(ctx, _binding("boosted", "public.transactions.boosted",
+                                  concept="monetary_stock"))
+    t = _c8_template((Need("source_key", "account_id", join_role=JoinRole.SOURCE_ENTITY_KEY),
+                      Need("boosted", "monetary_stock")))
+    out = _c8_compile(db, ctx, plan, t)
+    (hop,) = out.hop_aggregations
+    (stage,) = hop.ingredient_stages
+    assert stage.validation is c.AggregationValidation.sound          # sound, yet...
+    assert c.ReasonCode.additivity_source_conflict in stage.reason_codes
+    assert out.declaration_status is c.DeclarationStatus.unresolved_aggregation_declaration
+    assert out.contract_resolution_status is \
+        c.ContractResolutionStatus.unresolved_aggregation_declaration
+    assert out.contract_primary_reason_code is c.ReasonCode.additivity_source_conflict
+    assert c.ReasonCode.additivity_source_conflict in out.contract_reason_codes
+
+
+def test_precedence_connectivity_first_and_all_codes_preserved(db):
+    # FOUR simultaneous failures: an off-path ingredient (connectivity), an unbound as-of anchor
+    # (temporal), an undeclared non-additive measure (aggregation), and NO drift watermark
+    # (freshness). Primary = the §10-strongest (connectivity); every code is preserved, enum-
+    # ordered and deduped; the freshness delta never reaches contract_resolution_status because
+    # the declaration fold already failed.
+    _c8_seed(db)    # deliberately NO watermark
+    ctx = _ctx(db, "core")
+    plan = _c8_plan(ctx,
+                    _binding("fee", "public.card_swipes.fee_amount"),           # off-path table
+                    _binding("rate", "public.transactions.rate", concept="monetary_rate"))
+    t = _c8_template((Need("source_key", "account_id", join_role=JoinRole.SOURCE_ENTITY_KEY),
+                      Need("fee", "monetary_flow"), Need("rate", "monetary_rate"),
+                      Need("asof", "as_of_date")))
+    out = _c8_compile(db, ctx, plan, t)
+    assert out.declaration_status is c.DeclarationStatus.unresolved_ingredient_connectivity
+    assert out.contract_resolution_status is \
+        c.ContractResolutionStatus.unresolved_ingredient_connectivity
+    assert out.contract_primary_reason_code is c.ReasonCode.ingredient_not_connected_to_path
+    assert out.contract_reason_codes == (
+        c.ReasonCode.ingredient_not_connected_to_path,
+        c.ReasonCode.aggregation_strategy_missing,
+        c.ReasonCode.temporal_anchor_missing,
+        c.ReasonCode.freshness_stamp_unavailable)
+
+
+def test_precedence_safety_rejected_beats_temporal_aggregation_freshness(db):
+    _c8_seed(db)    # NO watermark: the freshness failure is also present, and outranked
+    ctx = _ctx(db, "core")
+    plan = _c8_plan(ctx,
+                    _binding("outcome", "public.transactions.defaulted", concept="default_flag"),
+                    _binding("rate", "public.transactions.rate", concept="monetary_rate"))
+    t = _c8_template((Need("source_key", "account_id", join_role=JoinRole.SOURCE_ENTITY_KEY),
+                      Need("outcome", "default_flag"), Need("rate", "monetary_rate"),
+                      Need("asof", "as_of_date")))
+    out = _c8_compile(db, ctx, plan, t)
+    assert out.declaration_status is c.DeclarationStatus.safety_rejected
+    assert out.contract_resolution_status is c.ContractResolutionStatus.safety_rejected
+    assert out.contract_primary_reason_code is c.ReasonCode.leakage_anchor_read
+    for code in (c.ReasonCode.leakage_anchor_read, c.ReasonCode.aggregation_strategy_missing,
+                 c.ReasonCode.temporal_anchor_missing, c.ReasonCode.freshness_stamp_unavailable):
+        assert code in out.contract_reason_codes
+    # preserved codes stay canonical: enum-ordered + deduped
+    assert out.contract_reason_codes == c.canonical_reason_codes(out.contract_reason_codes)
+
+
+def test_precedence_safety_gap_beats_temporal_and_primary_is_not_first_code(db):
+    # the pii-scoped email column is NOT loaded for a role-less caller: structurally not_evaluated
+    # → unresolved_safety_evaluation (rank 3), outranking the unbound as-of anchor (rank 4). The
+    # PRIMARY is the precedence-strongest code, NOT the first canonical code
+    # (temporal_anchor_missing sorts before safety_evaluation_incomplete in the registry).
+    _c8_seed(db)
+    _fresh(db)
+    ctx = _ctx(db, "core")
+    plan = _c8_plan(ctx, _binding("m2", "public.transactions.email"))
+    t = _c8_template((Need("source_key", "account_id", join_role=JoinRole.SOURCE_ENTITY_KEY),
+                      Need("m2", "monetary_flow"), Need("asof", "as_of_date")))
+    out = _c8_compile(db, ctx, plan, t)
+    assert out.declaration_status is c.DeclarationStatus.unresolved_safety_evaluation
+    assert out.contract_resolution_status is \
+        c.ContractResolutionStatus.unresolved_safety_evaluation
+    assert out.contract_primary_reason_code is c.ReasonCode.safety_evaluation_incomplete
+    assert out.contract_reason_codes == (c.ReasonCode.temporal_anchor_missing,
+                                         c.ReasonCode.safety_evaluation_incomplete)
+
+
+def test_precedence_temporal_beats_aggregation(db):
+    _c8_seed(db)
+    _fresh(db)
+    ctx = _ctx(db, "core")
+    plan = _c8_plan(ctx, _binding("rate", "public.transactions.rate", concept="monetary_rate"))
+    t = _c8_template((Need("source_key", "account_id", join_role=JoinRole.SOURCE_ENTITY_KEY),
+                      Need("rate", "monetary_rate"), Need("asof", "as_of_date")))
+    out = _c8_compile(db, ctx, plan, t)
+    assert out.declaration_status is c.DeclarationStatus.unresolved_temporal_declaration
+    assert out.contract_resolution_status is \
+        c.ContractResolutionStatus.unresolved_temporal_declaration
+    assert out.contract_primary_reason_code is c.ReasonCode.temporal_anchor_missing
+    assert out.contract_reason_codes == (c.ReasonCode.aggregation_strategy_missing,
+                                         c.ReasonCode.temporal_anchor_missing)
+
+
+def test_compile_contract_never_compiles_a_non_source_to_target_plan(db):
+    _c8_seed(db)
+    _fresh(db)
+    ctx = _ctx(db, "core")
+    plan = c.make_binding_plan(
+        recipe_id="r1", target_entity="account", catalog_source="core",
+        ingredient_bindings=(_binding("amount", "public.transactions.amount"),),
+        path_segments=(), resolution_status=c.PlanResolutionStatus.resolved,
+        path_resolution_status=c.PathResolutionStatus.ingredient_binding_only,
+        primary_reason_code=None, reason_codes=(), safety=c.BindingSafety.safe,
+        preference_rank=0, preference_reasons=(), candidate_role=c.CandidateRole.unranked)
+    out = _c8_compile(db, ctx, plan, _c8_template())
+    assert out is plan      # untouched — not even a copy
+    assert out.contract_resolution_status is c.ContractResolutionStatus.not_compiled
+    assert out.contract_id is None
+
+
+def test_build_compiler_context_batches_the_authorized_scope_and_is_immutable(db):
+    _c8_seed(db)
+    _fresh(db)
+    scope = resolve_catalog_scope(db, roles=(), target_entity="account", now=_NOW)
+    assert scope.authorized_catalog_sources == ("core",)
+    ctx = build_compiler_context(db, scope, (), _NOW)
+    assert set(ctx.realizations_by_catalog) == {"core"} == set(ctx.columns_by_catalog)
+    assert ctx.realizations_by_catalog["core"] == \
+        derive_catalog_realizations(db, "core").realizations
+    # columns are keyed by object_ref and READ-SCOPED: the pii column is absent for a role-less run
+    cols = ctx.columns_by_catalog["core"]
+    assert "public.transactions.amount" in cols
+    assert cols["public.transactions.amount"].concept == "monetary_flow"
+    assert "public.transactions.email" not in cols
+    # scope-start fingerprints + stamps + config + the EMPTY production declaration registry
+    assert ctx.catalog_fingerprint_at_start["core"] == realization_fingerprint(db, "core")
+    assert ctx.bridge_fingerprint_at_start == bridge_fingerprint(db)
+    assert ctx.catalog_stamps["core"].catalog_source == "core"
+    assert ctx.catalog_stamps["core"].head_seq == 1
+    assert ctx.config.drift_freshness_sla == timedelta(minutes=60)   # the env loader's default
+    assert (ctx.roles, ctx.now) == ((), _NOW)
+    assert dict(ctx.agg_declarations) == {}     # validate, never fabricate: EMPTY in production
+    with pytest.raises(TypeError):
+        ctx.agg_declarations[("r1", "m")] = c.AggregationFunction.sum
+    # ...and it compiles: the built context is interchangeable with the test-constructed one
+    plan = _c8_plan(ctx, _binding("amount", "public.transactions.amount"))
+    out = _c8_compile(db, ctx, plan, _c8_template())
+    assert out.contract_resolution_status is c.ContractResolutionStatus.resolved

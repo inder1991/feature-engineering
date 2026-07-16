@@ -1,28 +1,33 @@
-"""Phase-3B.3c C2–C7 — the contract compiler's data spine + the declaration checks
+"""Phase-3B.3c C2–C8 — the contract compiler: the data spine, the declaration checks
 (connectivity; the temporal declaration, which runs FIRST in the compile pipeline; aggregation;
-composition; the physical-read set; freshness).
+composition; the physical-read set; freshness), the §10 precedence fold (``compile_contract``),
+and the per-run batched context builder (``build_compiler_context``).
 
-One IMMUTABLE, conn-free ``CompilerContext`` is batch-loaded per shadow run (the production
-builder ``build_compiler_context`` arrives in C8); every declaration check is a pure function
-over that context and a plan. The ONE impure boundary (F8) is freshness:
-``revalidate_freshness`` (and its ``bridge_fingerprint`` helper) takes an explicit connection,
-because freshness is an OBSERVATION of current state, never a declaration. ``CompileBudget`` is
-the ONE deliberately mutable exception: the per-run compile allowance owned by
-``run_shadow_planner`` (C8). Behaviour-neutral until C8 threads ``compile_contracts`` through
-the shadow planner — nothing imports this module yet."""
+One IMMUTABLE, conn-free ``CompilerContext`` is batch-loaded per shadow run; every declaration
+check is a pure function over that context and a plan. The impure boundary (F8) is deliberately
+tiny: ``revalidate_freshness`` (with its ``bridge_fingerprint`` helper) takes a connection
+because freshness is an OBSERVATION of current state, never a declaration — and
+``build_compiler_context`` reads once to snapshot everything else. ``CompileBudget`` is the ONE
+deliberately mutable exception: the per-run compile allowance owned by ``run_shadow_planner``
+(C8), decremented by ``plan_bindings``' compile pass. Consumed ONLY by the shadow path behind
+the route-read ``FEATUREGEN_INTENT_CONTRACT_COMPILE`` kill-switch (default off)."""
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime
 from types import MappingProxyType
 
 from featuregen.overlay.catalog_changes import drift_head_seq, drift_watermark
-from featuregen.overlay.config import OverlayConfig
+from featuregen.overlay.config import OverlayConfig, overlay_config_from_env
 from featuregen.overlay.upload.binding_roles import JoinRole, TemporalRole
 from featuregen.overlay.upload.bridge_projection import ActiveBridgeV1, active_bridges
-from featuregen.overlay.upload.catalog_realizations import realization_fingerprint, table_of
+from featuregen.overlay.upload.catalog_realizations import (
+    derive_catalog_realizations,
+    realization_fingerprint,
+    table_of,
+)
 from featuregen.overlay.upload.concepts import concept
 from featuregen.overlay.upload.need_metadata import ResolvedNeedMetadataV1, derive_need_metadata
 from featuregen.overlay.upload.planner.contracts import (
@@ -42,14 +47,17 @@ from featuregen.overlay.upload.planner.contracts import (
     BindingPathSegmentV1,
     BindingPlanV1,
     BindingSafety,
+    CatalogScopeV1,
     CatalogStateStampKind,
     CatalogStateStampV1,
     ColumnRole,
     ContractResolutionStatus,
+    DeclarationStatus,
     HopAggregationV1,
     IngredientAggregationV1,
     IngredientBindingV1,
     ParamBindingV1,
+    PathResolutionStatus,
     PhysicalColumnReadV1,
     PhysicalReadSetV1,
     PlannerReplayEnvelopeV1,
@@ -60,6 +68,7 @@ from featuregen.overlay.upload.planner.contracts import (
     TemporalDeclarationV1,
     WindowSpecV1,
     canonical_reason_codes,
+    make_contract_id,
     to_additivity_class,
 )
 from featuregen.overlay.upload.planner.safety import evaluate_column_safety
@@ -67,7 +76,7 @@ from featuregen.overlay.upload.taxonomy.entity_relationships import (
     Cardinality,
     CatalogEntityRelationshipV1,
 )
-from featuregen.overlay.upload.templates import Template, _Col
+from featuregen.overlay.upload.templates import Template, _Col, _load_columns
 from featuregen.projections.runner import _checkpoint_seq
 
 # The injectable declared-function registry: ``(recipe_id, need_role) ->`` the recipe's DECLARED
@@ -110,9 +119,9 @@ class CompilerContext:
 @dataclass(slots=True)
 class CompileBudget:
     """DELIBERATELY MUTABLE (the one exception to the frozen convention): the per-run compile
-    allowance — a remaining-plan count and a wall-clock deadline — owned and decremented by
-    ``run_shadow_planner`` (C8). A run past either bound records ``compile_budget_exhausted``
-    instead of compiling further plans."""
+    allowance — a remaining-plan count and a deadline over the run's INJECTED now — owned by
+    ``run_shadow_planner`` and decremented by ``plan_bindings``' compile pass (C8). A run past
+    either bound records ``compile_budget_exhausted`` instead of compiling further plans."""
 
     remaining: int
     deadline: datetime
@@ -826,3 +835,150 @@ def audit_envelope(ctx: CompilerContext, plan: BindingPlanV1, template: Template
         catalog_state_stamps=stamps,
         stamp_consistency=stamp_consistency,
         replay_strength=ReplayStrength.audit_only)
+
+
+# ─── C8: the §10 precedence fold + compile_contract + the per-run batched context builder ─────
+#
+# compile_contract runs the C2–C7 checks in pipeline order and FOLDS: declaration_status is the
+# freshness-FREE, identity-bearing verdict (hashed into contract_id); contract_resolution_status
+# additionally folds the freshness OBSERVATION in. Only a source_to_target_resolved plan is ever
+# compiled — every other plan stays honestly not_compiled. build_compiler_context is the third
+# (and last) sanctioned impure function: it exists precisely to batch every read ONCE per run.
+
+# The temporal reason codes that BLOCK the declaration (an anchor problem, not a mere annotation).
+_TEMPORAL_BLOCKING_CODES = frozenset(
+    {ReasonCode.temporal_anchor_missing, ReasonCode.temporal_anchor_ambiguous})
+
+# Declaration-blocking aggregation evidence — the C4 HANDOFF: a stage can be validation=sound yet
+# carry additivity_source_conflict in its reason_codes (contract_id hashes stage VALIDATION, never
+# stage reason codes), so the fold must read stage.reason_codes and promote ANY of these to
+# unresolved_aggregation_declaration or the conflict would be invisible to the contract identity.
+_AGGREGATION_BLOCKING_CODES = frozenset({
+    ReasonCode.aggregation_strategy_missing,
+    ReasonCode.aggregation_incompatible_with_additivity,
+    ReasonCode.aggregation_weight_missing,
+    ReasonCode.aggregation_components_missing,
+    ReasonCode.aggregation_axis_unsupported,
+    ReasonCode.aggregation_composition_unsupported,
+    ReasonCode.semi_additive_temporal_strategy_missing,
+    ReasonCode.additivity_source_conflict,
+    ReasonCode.physical_cardinality_unavailable,
+})
+
+
+def _strongest(codes: Iterable[ReasonCode]) -> ReasonCode | None:
+    """The first code in canonical (registry) order — the failing level's primary."""
+    ordered = canonical_reason_codes(codes)
+    return ordered[0] if ordered else None
+
+
+def compile_contract(conn, ctx: CompilerContext, plan: BindingPlanV1, template: Template, *,
+                     base_envelope: PlannerReplayEnvelopeV1) -> BindingPlanV1:
+    """Run the declaration checks in pipeline order over ONE source_to_target_resolved plan and
+    fold the verdicts (§10). Any other plan is returned UNTOUCHED (honest not_compiled — the
+    contract axes only ever describe an executable source→target path).
+
+    The fold: declaration_status = the §10 precedence MINUS freshness — connectivity →
+    safety_rejected → safety-evaluation gap → temporal → aggregation — first failing wins;
+    contract_resolution_status additionally folds the freshness observation (C7) in at rank 6.
+    contract_primary_reason_code is the strongest reason by the FULL precedence;
+    contract_reason_codes preserves EVERY check's codes (canonical order, deduped).
+    contract_id is minted over the DECLARATION material only (F7: the freshness codes are
+    excluded inside make_contract_id), so a stale recompile keeps its identity. The one impure
+    step is revalidate_freshness (the sanctioned conn use); everything else is pure over ctx."""
+    if plan.path_resolution_status is not PathResolutionStatus.source_to_target_resolved:
+        return plan
+
+    connectivity = check_connectivity(ctx, plan)
+    temporal = compile_temporal(ctx, plan, template)
+    hop_aggregations = compile_aggregation(ctx, plan, template, temporal, connectivity.placement)
+    composition = check_composition(hop_aggregations, to_additivity_class(template.additivity))
+    read_set = build_physical_read_set(ctx, plan)
+    safety_verdict, safety_codes = stage_safety(read_set)
+    freshness = revalidate_freshness(conn, ctx, plan)
+
+    connectivity_codes = tuple(
+        ReasonCode.ingredient_not_connected_to_path for _ in connectivity.disconnected_roles)
+    stage_codes = tuple(code for h in hop_aggregations for s in h.ingredient_stages
+                        for code in s.reason_codes)
+    aggregation_codes = canonical_reason_codes(stage_codes + composition.reason_codes)
+    aggregation_sound = (
+        composition.composable
+        and all(s.validation is AggregationValidation.sound
+                for h in hop_aggregations for s in h.ingredient_stages)
+        and not any(code in _AGGREGATION_BLOCKING_CODES for code in aggregation_codes))
+    temporal_blocking = tuple(
+        code for code in temporal.reason_codes if code in _TEMPORAL_BLOCKING_CODES)
+
+    if not connectivity.connected:
+        declaration = DeclarationStatus.unresolved_ingredient_connectivity
+        primary: ReasonCode | None = ReasonCode.ingredient_not_connected_to_path
+    elif safety_verdict is BindingSafety.unsafe:
+        declaration = DeclarationStatus.safety_rejected
+        primary = _strongest(safety_codes)
+    elif safety_verdict is BindingSafety.not_evaluated:
+        declaration = DeclarationStatus.unresolved_safety_evaluation
+        primary = _strongest(safety_codes)
+    elif temporal_blocking:
+        declaration = DeclarationStatus.unresolved_temporal_declaration
+        primary = _strongest(temporal_blocking)
+    elif not aggregation_sound:
+        declaration = DeclarationStatus.unresolved_aggregation_declaration
+        primary = _strongest(aggregation_codes)
+    else:
+        declaration = DeclarationStatus.resolved
+        primary = None
+
+    if declaration is DeclarationStatus.resolved:
+        # freshness (rank 6) folds in ONLY once every declaration check passed
+        contract_status = freshness.status
+        if freshness.status is ContractResolutionStatus.unresolved_freshness:
+            primary = _strongest(freshness.reason_codes)
+    else:
+        contract_status = ContractResolutionStatus(declaration.value)
+
+    all_codes = canonical_reason_codes(
+        connectivity_codes + temporal.reason_codes + stage_codes + composition.reason_codes
+        + safety_codes + freshness.reason_codes)
+
+    enriched = replace(
+        plan,
+        declaration_status=declaration,
+        contract_resolution_status=contract_status,
+        contract_primary_reason_code=primary,
+        contract_reason_codes=all_codes,
+        hop_aggregations=hop_aggregations,
+        temporal_declaration=temporal,
+        physical_read_set=read_set,
+        audit_envelope=audit_envelope(ctx, plan, template, base_envelope,
+                                      freshness.stamps, freshness.stamp_consistency),
+        resolved_at_compilation=ctx.now)
+    return replace(enriched,
+                   contract_id=make_contract_id(enriched, resolved_at_compilation=ctx.now))
+
+
+def build_compiler_context(conn, scope: CatalogScopeV1, roles: Iterable[str],
+                           now: datetime) -> CompilerContext:
+    """The PRODUCTION per-run context builder — batch-loads EVERYTHING the compiler reads ONCE
+    per shadow run (the §11 guard: no per-plan re-query): the realizations, the active governed
+    crossings, the READ-SCOPED columns, and the scope-start fingerprints the compile-end recheck
+    revalidates. Impure by design (the sanctioned context-build reads); the returned context is
+    immutable and conn-free. The config comes from the deployment env loader; agg_declarations
+    is EMPTY in production — validate, never fabricate: no governed declaration source exists."""
+    roles = tuple(roles)
+    catalogs = scope.authorized_catalog_sources
+    return CompilerContext(
+        realizations_by_catalog={
+            src: derive_catalog_realizations(conn, src).realizations for src in catalogs},
+        active_bridges=active_bridges(conn),
+        columns_by_catalog={
+            src: {col.object_ref: col for col in _load_columns(conn, src, roles)}
+            for src in catalogs},
+        catalog_fingerprint_at_start={
+            src: realization_fingerprint(conn, src) for src in catalogs},
+        bridge_fingerprint_at_start=bridge_fingerprint(conn),
+        catalog_stamps={s.catalog_source: s for s in scope.catalog_state_stamps},
+        config=overlay_config_from_env(),
+        roles=roles,
+        now=now,
+        agg_declarations={})
