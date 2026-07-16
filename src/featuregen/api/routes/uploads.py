@@ -79,8 +79,11 @@ def create_upload(
     client: Annotated[LLMClient | None, Depends(get_llm_optional)],
 ) -> IngestResult:
     # The source id IS the catalog identity (fact keys, snapshots, the brake all key on it raw), so
-    # strip it before anything downstream sees it — 'sales' and 'sales ' must be ONE catalog (#16).
-    source = source.strip()
+    # normalize it the way every other identity component is normalized — strip+LOWER, matching
+    # object_ref._norm — before anything downstream sees it: 'sales', 'sales ' and 'Sales' must be
+    # ONE catalog (#16). A merely-stripped 'Sales' would miss the prior 'sales' refs and bypass the
+    # large-change brake as a "first upload" while its facts still keyed on the lowered stream.
+    source = source.strip().lower()
     if not source:
         raise HTTPException(status_code=400, detail="source is required")
     try:

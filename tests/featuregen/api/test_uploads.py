@@ -49,6 +49,19 @@ def test_padded_source_resolves_to_same_catalog(client):
     assert res.json()["status"] == "held"     # same catalog -> the brake sees the truncation
 
 
+def test_case_variant_source_resolves_to_same_catalog(client):
+    """#16 follow-up: the catalog source is case-normalized like every other identity component
+    (object_ref._norm is strip+LOWER). Pre-fix the boundary only stripped, so 'Deposits' missed the
+    prior 'deposits' refs (case-sensitive) and a truncated re-upload bypassed the large-change brake
+    as a fresh 'first upload' — while its facts still keyed on the lowered 'deposits' stream."""
+    upload_csv(client, "deposits", DEPOSITS_CSV)
+    tiny = "source,table,column,type,is_grain\ndeposits,accounts,id,integer,y\n"
+    res = client.post("/uploads", data={"source": "Deposits"},
+                      files={"file": ("deposits.csv", tiny.encode(), "text/csv")}, headers=AUTH)
+    assert res.status_code == 200
+    assert res.json()["status"] == "held"     # same catalog -> the brake sees the truncation
+
+
 def test_whitespace_only_source_400(client):
     """#16: a source that strips to nothing is a client error, not a catalog named '   '."""
     res = client.post("/uploads", data={"source": "   "},

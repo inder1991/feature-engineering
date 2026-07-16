@@ -329,6 +329,31 @@ def test_patch_sync_strips_ids(client):
     assert res.json()["service_name"] == "svc_2"
 
 
+def test_sync_target_source_lowercased_service_name_case_preserved(client):
+    """#16 follow-up: target_source IS the catalog identity, and identity is strip+LOWER everywhere
+    else (object_ref._norm) — a 'Cards' sync must feed the SAME catalog as 'cards', or its imports
+    bypass the large-change brake as a fresh catalog while facts key on the lowered stream. The
+    service_name is only STRIPPED: it names an external OpenMetadata service, where case may matter."""
+    iid = _integration_id(client)
+    created = _create_sync(client, iid, service_name="MySQL_Prod", target_source=" Cards ")
+    assert created.status_code == 200
+    sync = created.json()
+    assert sync["target_source"] == "cards"
+    assert sync["service_name"] == "MySQL_Prod"
+
+
+def test_patch_sync_lowercases_target_source_only(client):
+    """#16 follow-up (patch path): same rule as create — catalog identity folds case, the OM
+    service name keeps it."""
+    iid, sid = _configured_sync(client)
+    res = client.patch(f"/integrations/{iid}/syncs/{sid}",
+                       json={"target_source": " Retail ", "service_name": " Svc_2 "},
+                       headers=OWNER)
+    assert res.status_code == 200
+    assert res.json()["target_source"] == "retail"
+    assert res.json()["service_name"] == "Svc_2"
+
+
 def test_one_sync_per_service_409(client):
     iid = _integration_id(client)
     assert _create_sync(client, iid).status_code == 200

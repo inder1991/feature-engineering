@@ -368,11 +368,13 @@ def create_sync(integration_id: str, body: SyncIn, conn: _Conn, identity: _Ident
     service_name may be typed by hand, so a sync can be created even while OM discovery is down. One
     sync per (integration, service_name): a duplicate is a 409."""
     _get_integration(conn, integration_id)
-    # STRIP the identifiers before they are stored (#16): the service name keys the one-sync-per-
-    # service slot and target_source IS the catalog identity, so a padded variant must never mint a
-    # second sync/catalog beside the trimmed one.
+    # Normalize the identifiers before they are stored (#16): target_source IS the catalog
+    # identity, and identity is strip+LOWER everywhere else (object_ref._norm) — a 'Cards' sync must
+    # feed the SAME catalog as 'cards' or its imports bypass the large-change brake as a fresh
+    # catalog. service_name is only STRIPPED (it keys the one-sync-per-service slot but names an
+    # external OpenMetadata service, where case may matter to OM).
     service_name = body.service_name.strip()
-    target_source = body.target_source.strip()
+    target_source = body.target_source.strip().lower()
     if not service_name:
         raise HTTPException(status_code=400, detail="service_name is required")
     if not target_source:
@@ -417,11 +419,12 @@ def get_sync_by_id(integration_id: str, sync_id: str, conn: _Conn, identity: _Id
 def patch_sync(integration_id: str, sync_id: str, body: SyncPatch, conn: _Conn,
                identity: _Identity) -> dict:
     current = _get_sync_of_integration(conn, integration_id, sync_id)
-    # STRIP the identifiers before they replace the stored ones (#16) — same rule as create_sync.
+    # Normalize the identifiers before they replace the stored ones (#16) — same rule as
+    # create_sync: catalog identity folds case, the external OM service name keeps it.
     service_name = (body.service_name if body.service_name is not None
                     else current["service_name"]).strip()
     target_source = (body.target_source if body.target_source is not None
-                     else current["target_source"]).strip()
+                     else current["target_source"]).strip().lower()
     table_naming = body.table_naming if body.table_naming is not None else current["table_naming"]
     database_filter = (body.database_filter if body.database_filter is not None
                        else current["database_filter"])
