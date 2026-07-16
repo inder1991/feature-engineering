@@ -213,6 +213,23 @@ def test_upload_response_body_unchanged_by_run_manifest(client):
     assert run_id.encode() not in res.content
 
 
+def test_upload_response_body_byte_identical_with_stage_reports(client):
+    """Design #22, CRITICAL compatibility: per-stage status must not change the POST /uploads
+    response body AT ALL — stage reports live only in ingestion_run_stage, retrieved via
+    GET /ingestion-runs/{id}. Byte-for-byte: the body is exactly the IngestResult serialization
+    (FastAPI's compact separators + ensure_ascii=False), with no stage field anywhere."""
+    import json
+
+    res = upload_csv(client, "deposits", DEPOSITS_CSV)
+    assert res.status_code == 200
+    expected = {
+        "status": "ingested", "reason": None, "asserted": 4, "changed_objects": 0,
+        "quarantined": 0,
+        "flagged": "first upload of 'deposits' (9 objects) — review recommended"}
+    assert res.content == json.dumps(
+        expected, separators=(",", ":"), ensure_ascii=False).encode()
+
+
 def test_upload_rejects_oversized_file(client, monkeypatch):
     import io
 

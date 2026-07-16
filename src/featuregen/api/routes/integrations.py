@@ -91,6 +91,7 @@ from featuregen.overlay.upload.ingestion_run import (
     terminalize_run_durable,
 )
 from featuregen.overlay.upload.read_scope import SENSITIVITY_ROLES
+from featuregen.overlay.upload.stage_report import StageRecorder, record_stage
 
 router = APIRouter()
 _Conn = Annotated[psycopg.Connection, Depends(get_conn, scope="function")]
@@ -570,8 +571,12 @@ def import_sync(sync_id: str, body: ImportIn, response: Response, conn: _Conn,
                       effective_config=_effective_config_snapshot(), now=datetime.now(UTC),
                       authorization_decision="granted:catalog_write")
     response.headers[RUN_ID_HEADER] = run_id   # the success response; error paths set it below
+    # Design #22: the connector's "parse" stage is the pull + translate (there is no file);
+    # every ingest stage is recorded inside ingest_upload; the flush rides terminalize.
+    recorder = StageRecorder()
     try:
         _, translation = _pull(sync, integ)
+        record_stage(recorder, "parse", "succeeded", detail={"rows": len(translation.rows)})
         current_hash = snapshot_hash(translation.rows)
         if current_hash != body.snapshot_hash:
             raise HTTPException(
@@ -586,7 +591,8 @@ def import_sync(sync_id: str, body: ImportIn, response: Response, conn: _Conn,
                        "approve the fresh dry run.")
         pre_fingerprint, fingerprint_algo = source_fingerprint(conn, sync["target_source"])
         result = ingest_upload(conn, sync["target_source"], translation.rows,
-                               actor=identity, now=datetime.now(UTC), client=client)
+                               actor=identity, now=datetime.now(UTC), client=client,
+                               stage_recorder=recorder)
         import_id = store.record_import(
             conn, sync=sync, integration_id=integ["integration_id"], snapshot_hash=current_hash,
             approved_by=identity.subject, result=asdict(result), ingestion_run_id=run_id)
@@ -608,6 +614,9 @@ def import_sync(sync_id: str, body: ImportIn, response: Response, conn: _Conn,
                         row_count=len(translation.rows), quarantined_count=result.quarantined,
                         pre_fingerprint=pre_fingerprint, post_fingerprint=post_fingerprint,
                         fingerprint_algo_version=fingerprint_algo)
+        # #22: stages commit WITH the terminal state (savepointed + fail-contained inside flush,
+        # so the JSON body below stays byte-for-byte unchanged).
+        recorder.flush(conn, run_id, now=datetime.now(UTC))
         return {
             "result": asdict(result),
             "import_id": import_id,
@@ -622,10 +631,14 @@ def import_sync(sync_id: str, body: ImportIn, response: Response, conn: _Conn,
         # the failed attempt's manifest survives. A pull/verify/ingest exception is a FAILED
         # attempt (there is no file to 'reject'). Redaction: record the exception CLASS (of the
         # underlying cause when the HTTPException merely wraps one), never its message.
+        # #22: a pull/verify failure never recorded parse — state honestly where it stopped.
+        if not recorder.has("parse"):
+            record_stage(recorder, "parse", "failed", reason_code=f"http_{exc.status_code}")
         terminalize_run_durable(
             run_id, status="failed", now=datetime.now(UTC),
             redacted_failure_code=type(exc.__cause__ or exc).__name__,
             reason_code=f"http_{exc.status_code}", fallback_conn=conn)
+        recorder.flush_durable(run_id, now=datetime.now(UTC), fallback_conn=conn)
         exc.headers = {**(exc.headers or {}), RUN_ID_HEADER: run_id}
         raise
     except Exception as exc:
@@ -638,5 +651,7 @@ def import_sync(sync_id: str, body: ImportIn, response: Response, conn: _Conn,
             run_id, status="failed", now=datetime.now(UTC),
             redacted_failure_code=type(exc).__name__,
             reason_code="unhandled_exception", fallback_conn=conn)
+        # #22: flush the stages reached before the fault (best-effort, never masks the failure).
+        recorder.flush_durable(run_id, now=datetime.now(UTC), fallback_conn=conn)
         exc.headers = {**(getattr(exc, "headers", None) or {}), RUN_ID_HEADER: run_id}
         raise

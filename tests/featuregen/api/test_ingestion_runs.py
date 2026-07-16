@@ -186,9 +186,93 @@ def test_raw_db_fault_records_failed_run_on_fresh_conn_and_500_carries_header(
     finally:
         if run_id:   # the durable rows committed for real — clean them up
             with psycopg.connect(_dsn) as c:
+                c.execute("DELETE FROM ingestion_run_stage WHERE ingestion_run_id = %s",
+                          (run_id,))
                 c.execute("DELETE FROM ingestion_run_status_event WHERE ingestion_run_id = %s",
                           (run_id,))
                 c.execute("DELETE FROM ingestion_run WHERE id = %s", (run_id,))
+
+
+# ── per-stage status (#22) rides the SAME run surface ─────────────────────────────────────────────
+
+
+def test_successful_upload_records_ordered_stage_reports(client):
+    """Design #22: the run answers 'what actually ran' per stage — parse (recorded by the route)
+    first, then every ingest stage in execution order with its honest state. The suite app has no
+    LLM client, so the three enrichment stages are skipped_no_client (not a fake 'succeeded');
+    the flag-gated passes are disabled."""
+    res = upload_csv(client, "deposits", DEPOSITS_CSV)
+    run = _get_run(client, res.headers[RUN_HEADER]).json()
+    stages = {s["stage"]: s for s in run["stages"]}
+    assert [s["stage"] for s in run["stages"]] == [
+        "parse", "validation", "brake", "fact_assertion", "drift", "glossary_classification",
+        "enrich_concept", "enrich_definition", "enrich_domain", "graph_persistence",
+        "governed_joins", "pass_c", "pass_b", "glossary_evidence", "projection_drain",
+        "table_fact_projection", "join_projection", "join_drift", "quarantine"]
+    assert stages["parse"]["state"] == "succeeded"
+    assert stages["validation"]["state"] == "succeeded"
+    assert stages["fact_assertion"]["detail"] == {"asserted": 4}
+    assert stages["enrich_concept"]["state"] == "skipped_no_client"
+    assert stages["enrich_definition"]["state"] == "skipped_no_client"
+    assert stages["enrich_domain"]["state"] == "skipped_no_client"
+    assert stages["pass_b"]["state"] == "disabled"
+    assert stages["pass_c"]["state"] == "disabled"
+    assert stages["quarantine"]["detail"] == {"rows": 0}
+    assert all(s["attempt"] == 1 and s["completed_at"] is not None for s in run["stages"])
+
+
+def test_quarantining_upload_reports_validation_partial(client):
+    res = upload_csv(client, "deposits", DEPOSITS_CSV + "deposits,accounts,,integer\n")
+    assert res.json()["quarantined"] == 1
+    run = _get_run(client, res.headers[RUN_HEADER]).json()
+    stages = {s["stage"]: s for s in run["stages"]}
+    assert stages["validation"]["state"] == "partial"       # per-row failures surface, not launder
+    assert stages["validation"]["detail"] == {"good": 9, "quarantined": 1}
+    assert stages["quarantine"]["detail"] == {"rows": 1}
+
+
+def test_held_upload_reports_brake_deferred_and_stops(client):
+    upload_csv(client, "deposits", DEPOSITS_CSV)
+    res = upload_csv(client, "deposits", TINY_CSV)
+    assert res.json()["status"] == "held"
+    run = _get_run(client, res.headers[RUN_HEADER]).json()
+    assert [(s["stage"], s["state"]) for s in run["stages"]] == [
+        ("parse", "succeeded"), ("validation", "succeeded"), ("brake", "deferred")]
+
+
+def test_parse_failure_reports_a_failed_parse_stage(client):
+    """A failed request still gets its stage account (flushed durably beside the failed run):
+    parse failed, nothing after it — the honest 'we never reached ingest'."""
+    res = client.post("/uploads", data={"source": "gl"},
+                      files={"file": ("gl.xlsx", b"not a workbook",
+                                      "application/octet-stream")}, headers=AUTH)
+    assert res.status_code == 400
+    run = _get_run(client, res.headers[RUN_HEADER]).json()
+    assert [(s["stage"], s["state"]) for s in run["stages"]] == [("parse", "failed")]
+    assert run["stages"][0]["reason_code"] == "http_400"
+
+
+def test_unsupported_extension_reports_failed_parse(client):
+    res = client.post("/uploads", data={"source": "deposits"},
+                      files={"file": ("notes.txt", b"hello", "text/plain")}, headers=AUTH)
+    run = _get_run(client, res.headers[RUN_HEADER]).json()
+    assert [(s["stage"], s["state"]) for s in run["stages"]] == [("parse", "failed")]
+
+
+def test_ingest_fault_still_reports_stages_reached(client, monkeypatch):
+    """An ingest-stage fault: the run is failed, and the stages recorded BEFORE the fault (parse)
+    are still flushed on the durable path — a failed run shows how far it got."""
+    from featuregen.api.routes import uploads
+
+    def _raise(*args, **kwargs):
+        raise RuntimeError("wat")
+
+    monkeypatch.setattr(uploads, "ingest_upload", _raise)
+    res = upload_csv(client, "deposits", DEPOSITS_CSV)
+    assert res.status_code == 500
+    run = _get_run(client, res.headers[RUN_HEADER]).json()
+    assert run["status"] == "failed"
+    assert [(s["stage"], s["state"]) for s in run["stages"]] == [("parse", "succeeded")]
 
 
 # ── GET /ingestion-runs/{run_id} ──────────────────────────────────────────────────────────────────

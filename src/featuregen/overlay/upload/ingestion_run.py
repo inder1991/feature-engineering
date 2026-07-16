@@ -253,7 +253,8 @@ def reconcile_ingestion_runs(conn, *, now: datetime, lease_timeout: timedelta) -
 
 
 def get_run(conn, run_id: str) -> dict | None:
-    """The run row + its append-only status history (``status_history``), or None."""
+    """The run row + its append-only status history (``status_history``) + its per-stage reports
+    (``stages``, design #22 — recorded order, i.e. execution order), or None."""
     cur = conn.execute(f"SELECT {_RUN_COLUMNS} FROM ingestion_run WHERE id = %s", (run_id,))
     row = cur.fetchone()
     if row is None:
@@ -264,4 +265,11 @@ def get_run(conn, run_id: str) -> dict | None:
         for status, at, reason_code in conn.execute(
             "SELECT status, at, reason_code FROM ingestion_run_status_event "
             "WHERE ingestion_run_id = %s ORDER BY at, id", (run_id,)).fetchall()]
+    run["stages"] = [
+        {"stage": stage, "attempt": attempt, "state": state, "started_at": started_at,
+         "completed_at": completed_at, "reason_code": reason_code, "detail": detail}
+        for stage, attempt, state, started_at, completed_at, reason_code, detail in conn.execute(
+            "SELECT stage, attempt, state, started_at, completed_at, reason_code, detail "
+            "FROM ingestion_run_stage WHERE ingestion_run_id = %s ORDER BY id",
+            (run_id,)).fetchall()]
     return run

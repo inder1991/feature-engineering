@@ -36,6 +36,7 @@ from featuregen.overlay.upload.source_profile import (
     FTR_GLOSSARY_PROFILE,
     SourceCapabilityProfile,
 )
+from featuregen.overlay.upload.stage_report import StageRecorder, record_stage
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -112,6 +113,9 @@ def create_upload(
                       effective_config=_effective_config_snapshot(), now=datetime.now(UTC),
                       authorization_decision="granted:catalog_write")
     response.headers[_RUN_ID_HEADER] = run_id   # the success response; error paths set it below
+    # Design #22: buffer an honest per-stage account (parse here; every ingest stage inside
+    # ingest_upload) and flush it ALONGSIDE terminalize — never mid-request, never into the body.
+    recorder = StageRecorder()
     file_sha256: str | None = None              # stays NULL when the capped read rejects the file
     failure_status = "rejected"                 # pre-ingest failure = the FILE was rejected...
     try:
@@ -123,6 +127,7 @@ def create_upload(
             raise
         except Exception as exc:   # a malformed file is a client error, not a 500
             raise HTTPException(status_code=400, detail=f"could not parse upload: {exc}") from exc
+        record_stage(recorder, "parse", "succeeded", detail={"rows": len(rows)})
         pre_fingerprint, fingerprint_algo = source_fingerprint(conn, source)
         failure_status = "failed"               # ...an ingest-stage fault = the ATTEMPT failed
         # client=None (no provider configured) -> enrichment is skipped; a configured client runs
@@ -138,7 +143,7 @@ def create_upload(
         try:
             result = ingest_upload(conn, source, rows, actor=identity,
                                    now=datetime.now(UTC), client=client, profile=profile,
-                                   glossary=glossary)
+                                   glossary=glossary, stage_recorder=recorder)
         except ConcurrencyError as exc:
             # OCC: a concurrent upload/confirm bumped one of this upload's fact streams mid-write.
             # The request's transaction rolls back cleanly, so a retry is the correct client
@@ -172,15 +177,24 @@ def create_upload(
                         file_sha256=file_sha256, pre_fingerprint=pre_fingerprint,
                         post_fingerprint=post_fingerprint,
                         fingerprint_algo_version=fingerprint_algo)
+        # #22: the stage reports commit WITH the terminal state on the request connection
+        # (flush is savepointed + fail-contained, so it can neither 500 the upload nor change
+        # the response body — which stays exactly the IngestResult serialization).
+        recorder.flush(conn, run_id, now=datetime.now(UTC))
         return result
     except HTTPException as exc:
         # The request transaction is rolling back — terminalize on an independent connection so
         # the failed attempt's manifest survives. Redaction: record the exception CLASS (of the
         # underlying cause when the HTTPException merely wraps one), never its message.
+        # #22: a pre-ingest failure (oversize / unsupported / unparseable) never recorded parse,
+        # so the run's stage account states honestly where it stopped.
+        if not recorder.has("parse"):
+            record_stage(recorder, "parse", "failed", reason_code=f"http_{exc.status_code}")
         terminalize_run_durable(
             run_id, status=failure_status, now=datetime.now(UTC), file_sha256=file_sha256,
             redacted_failure_code=type(exc.__cause__ or exc).__name__,
             reason_code=f"http_{exc.status_code}", fallback_conn=conn)
+        recorder.flush_durable(run_id, now=datetime.now(UTC), fallback_conn=conn)
         exc.headers = {**(exc.headers or {}), _RUN_ID_HEADER: run_id}
         raise
     except Exception as exc:
@@ -194,5 +208,8 @@ def create_upload(
             run_id, status="failed", now=datetime.now(UTC), file_sha256=file_sha256,
             redacted_failure_code=type(exc).__name__,
             reason_code="unhandled_exception", fallback_conn=conn)
+        # #22: flush the stages REACHED before the fault, durably — a failed run still explains
+        # how far it got. Best-effort; a lost flush never masks the real failure.
+        recorder.flush_durable(run_id, now=datetime.now(UTC), fallback_conn=conn)
         exc.headers = {**(getattr(exc, "headers", None) or {}), _RUN_ID_HEADER: run_id}
         raise
