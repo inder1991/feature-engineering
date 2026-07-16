@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 import os
+from contextvars import ContextVar
 
 import psycopg
 
@@ -159,6 +160,24 @@ def _audit_egress_block(conn, *, task: str, actor, reason: str) -> None:
         logger.exception("failed to record EGRESS_BLOCKED security event for %s", task)
 
 
+# #13 gap D: how many durable llm_call audit writes DEGRADED to the request connection in this
+# request context. A ContextVar, not a module global: FastAPI runs each sync request in its own
+# copied context, so counts can never bleed across concurrent requests. Incremented ONLY on the
+# genuine degrade (DSN configured but the fresh connection failed) — the DSN-less harness writing
+# on the request conn is the designed test path, not a degradation.
+_AUDIT_DEGRADED: ContextVar[int] = ContextVar("overlay_llm_audit_degraded", default=0)
+
+
+def consume_audit_degradations() -> int:
+    """Return-and-reset the count of durable llm_call audit writes that degraded to the request
+    connection since the last consume (#13 gap D). Ingest calls this at each enrichment stage
+    boundary so the stage that carried the degraded call reports it in its detail."""
+    n = _AUDIT_DEGRADED.get()
+    if n:
+        _AUDIT_DEGRADED.set(0)
+    return n
+
+
 def _record_llm_call_durable(conn, **record_kwargs) -> None:
     """Finding #20: by the time this runs, content has ALREADY egressed to the provider — so the
     immutable llm_call record must NOT share the upload transaction's fate (a later graph/DB
@@ -187,6 +206,9 @@ def _record_llm_call_durable(conn, **record_kwargs) -> None:
         except Exception:  # noqa: BLE001 — degraded audit must never fail the (done) provider call
             logger.exception(
                 "durable llm_call audit write failed; falling back to the request connection")
+            # #13 gap D: the degradation is COUNTED (per request context) so the enrichment stage
+            # that carried this call can report audit_degraded instead of a log-only trace.
+            _AUDIT_DEGRADED.set(_AUDIT_DEGRADED.get() + 1)
     record_llm_call(conn, **record_kwargs)
 
 # Structural output schemas for the three enrichment tasks (single string field each).

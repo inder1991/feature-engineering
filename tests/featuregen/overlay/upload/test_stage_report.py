@@ -194,6 +194,27 @@ def test_record_after_flush_continues_the_attempt_sequence(db):
         (1, "succeeded"), (2, "succeeded")]
 
 
+def test_flush_failure_writes_an_audit_degraded_marker(db):
+    """#13 gap D: a failed stage flush is NOT a silent swallow — a single best-effort
+    ``manifest_finalization: audit_degraded`` marker is written (here via the DSN-less fallback:
+    a fresh savepoint on the given connection) and the event is counted, so the run itself says
+    its stage account degraded."""
+    from featuregen.runtime.observability import counters
+
+    run_id = _open_run(db)
+    rec = StageRecorder()
+    # a set is not JSON-serializable -> the batch INSERT faults inside the savepoint
+    rec.record("validation", "succeeded", detail={"bad": {1, 2}})
+    before = counters.snapshot()["counters"].get("overlay.stage_report.flush_degraded", 0)
+    assert rec.flush(db, run_id, now=_NOW) == 0
+    db.execute("SELECT 1")                            # the tx is NOT aborted (savepoint contained)
+    assert [(r[0], r[2], r[3]) for r in _rows(db, run_id)] == [
+        ("manifest_finalization", "audit_degraded", "stage_flush_failed")]
+    after = counters.snapshot()["counters"].get("overlay.stage_report.flush_degraded", 0)
+    assert after == before + 1
+    assert rec.reports != ()                          # the buffer is still KEPT for a durable retry
+
+
 def test_flush_durable_falls_back_to_the_given_connection(db):
     """No DSN configured (the rolled-back harness): flush_durable degrades to fallback_conn —
     the same best-effort ladder terminalize_run_durable uses."""

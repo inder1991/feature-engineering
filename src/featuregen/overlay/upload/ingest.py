@@ -32,6 +32,7 @@ from featuregen.overlay.upload.enrich import (
     draft_definitions,
     enrich_concepts,
 )
+from featuregen.overlay.upload.enrich_llm import consume_audit_degradations
 from featuregen.overlay.upload.field_resolution import FIELD_POLICY_VERSION, resolve_and_project
 from featuregen.overlay.upload.field_revalidation import flag_pending_revalidation
 from featuregen.overlay.upload.glossary_reader import GlossaryRecord, GlossaryUpload
@@ -152,6 +153,18 @@ def _enrichment_outcome(result: dict | None, expected: int, *, internal_failures
     if unresolved or internal_failures:
         return "partial", "items_failed", detail
     return "succeeded", None, detail
+
+
+def _with_audit_degradations(detail: dict) -> dict:
+    """Attach the count of durable llm_call audit writes that DEGRADED to the request connection
+    during the LLM stage that just ran (#13 gap D) — the stage detail then carries the honest
+    ``audit_degraded`` count instead of the degradation living only in a log line. Consuming at
+    every stage boundary keeps the attribution per stage; a zero count leaves ``detail``
+    untouched (byte-for-byte for the healthy path)."""
+    degraded = consume_audit_degradations()
+    if degraded:
+        detail = {**detail, "audit_degraded": degraded}
+    return detail
 
 
 def _table_facts(rows: list[CanonicalRow]):
@@ -981,6 +994,7 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
         # (a failed call is simply absent from the returned dict; a contained concept-evidence
         # write failure is threaded out via `stats`), so an outer success is not evidence.
         concept_stats: dict = {}
+        consume_audit_degradations()   # #13 gap D: discard any stale count before the first stage
         stage_started = datetime.now(UTC)
         try:
             # Glossary carry-forward (Task 6): thread the sidecar + bindings + snapshot so Pass A
@@ -998,8 +1012,8 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
         state, reason, detail = _enrichment_outcome(
             concepts, len({content_hash(r) for r in vr.good}),
             internal_failures=concept_stats.get("evidence_write_failures", 0))
-        record_stage(stage_recorder, "enrich_concept", state, reason_code=reason, detail=detail,
-                     started_at=stage_started)
+        record_stage(stage_recorder, "enrich_concept", state, reason_code=reason,
+                     detail=_with_audit_degradations(detail), started_at=stage_started)
         stage_started = datetime.now(UTC)
         try:
             with conn.transaction():
@@ -1008,8 +1022,8 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
             logger.warning("advisory definition enrichment failed for %r", catalog_source, exc_info=True)
         state, reason, detail = _enrichment_outcome(
             definitions, len({content_hash(r) for r in vr.good if not r.definition}))
-        record_stage(stage_recorder, "enrich_definition", state, reason_code=reason, detail=detail,
-                     started_at=stage_started)
+        record_stage(stage_recorder, "enrich_definition", state, reason_code=reason,
+                     detail=_with_audit_degradations(detail), started_at=stage_started)
         stage_started = datetime.now(UTC)
         try:
             with conn.transaction():
@@ -1017,8 +1031,8 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
         except Exception:  # noqa: BLE001
             logger.warning("advisory domain enrichment failed for %r", catalog_source, exc_info=True)
         state, reason, detail = _enrichment_outcome(domains, len({r.table for r in vr.good}))
-        record_stage(stage_recorder, "enrich_domain", state, reason_code=reason, detail=detail,
-                     started_at=stage_started)
+        record_stage(stage_recorder, "enrich_domain", state, reason_code=reason,
+                     detail=_with_audit_degradations(detail), started_at=stage_started)
     stage_started = datetime.now(UTC)
     build_graph(conn, catalog_source, vr.good, concepts, definitions, domains)
     record_stage(stage_recorder, "graph_persistence", "succeeded", started_at=stage_started)
@@ -1116,8 +1130,8 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
             # Pass B swallows per-table failures internally (an unsynthesized table is simply
             # absent from `syntheses`), so the report compares against the assembled items (#22).
             state, reason, detail = _enrichment_outcome(syntheses, len(items))
-            record_stage(stage_recorder, "pass_b", state, reason_code=reason, detail=detail,
-                         started_at=stage_started)
+            record_stage(stage_recorder, "pass_b", state, reason_code=reason,
+                         detail=_with_audit_degradations(detail), started_at=stage_started)
         except Exception:  # noqa: BLE001 — advisory: Pass B never fails an upload; Pass A facts hold
             counters.incr("overlay.table_synth.error")
             logger.warning("advisory Pass B table synthesis failed for %r — Pass A facts + graph "

@@ -32,6 +32,7 @@ import psycopg
 from psycopg.types.json import Jsonb
 
 from featuregen.config import get_settings
+from featuregen.runtime.observability import counters
 
 logger = logging.getLogger(__name__)
 
@@ -136,12 +137,50 @@ class StageRecorder:
         except Exception:  # noqa: BLE001 — status reporting must never affect the run it describes
             logger.warning("stage-report flush failed for ingestion run %s — the run itself is "
                            "unaffected", ingestion_run_id, exc_info=True)
+            # #13 gap D: NOT a silent swallow — count it and best-effort mark the run's stage
+            # account as degraded (a single manifest_finalization: audit_degraded marker).
+            self._mark_flush_degraded(conn, ingestion_run_id, now=now)
             return 0
         # The finalization attempt advances only when it actually WROTE, so a contained failure
         # followed by a later (durable) flush re-uses the number the failed batch never landed.
         self._attempts["manifest_finalization"] = final_attempt
         self._reports.clear()
         return len(reports)
+
+    _DEGRADED_MARKER_SQL = (
+        "INSERT INTO ingestion_run_stage (ingestion_run_id, stage, attempt, state, "
+        "started_at, completed_at, reason_code) VALUES "
+        "(%s, 'manifest_finalization', %s, 'audit_degraded', %s, %s, 'stage_flush_failed')")
+
+    def _mark_flush_degraded(self, conn, ingestion_run_id: str, *, now: datetime) -> None:
+        """The stage flush itself failed, so the run's account is (partly) lost — record THAT
+        (#13 gap D) instead of swallowing: increment the ``flush_degraded`` counter and
+        best-effort write ONE ``manifest_finalization: audit_degraded`` row. Fresh committing
+        connection first (the durable-audit pattern: one bare INSERT, NEVER an advisory lock —
+        the program-audit I-3 self-deadlock class); no DSN (the test harness) or a failed
+        connect degrades to a fresh savepoint on the given connection (usable again — the failed
+        batch's savepoint already rolled back). A lost marker is logged, never raised, and the
+        buffer stays KEPT either way so a later durable flush can still land the real account."""
+        counters.incr("overlay.stage_report.flush_degraded")
+        attempt = self._attempts.get("manifest_finalization", 0) + 1
+        params = (ingestion_run_id, attempt, now, now)
+        dsn = get_settings().dsn
+        if dsn:
+            try:
+                with psycopg.connect(dsn) as fresh:   # own tx, committed on `with` exit
+                    fresh.execute(self._DEGRADED_MARKER_SQL, params)
+                self._attempts["manifest_finalization"] = attempt
+                return
+            except Exception:  # noqa: BLE001 — best-effort by contract
+                logger.exception("degraded stage-flush marker failed on a fresh connection; "
+                                 "falling back to the request connection")
+        try:
+            with conn.transaction():   # savepoint: the marker must not poison the caller's tx
+                conn.execute(self._DEGRADED_MARKER_SQL, params)
+            self._attempts["manifest_finalization"] = attempt
+        except Exception:  # noqa: BLE001 — the marker is best-effort; the log line remains
+            logger.warning("degraded stage-flush marker lost for ingestion run %s",
+                           ingestion_run_id, exc_info=True)
 
     def flush_durable(self, ingestion_run_id: str, *, now: datetime, fallback_conn=None) -> None:
         """``flush`` on a FRESH independent connection — the route's exception path, where the

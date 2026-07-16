@@ -205,6 +205,40 @@ def test_concept_evidence_write_failure_records_partial(db, monkeypatch):
     assert concept.detail["resolved"] == 1
 
 
+def test_durable_llm_audit_degradation_flags_the_enrich_stage(db, monkeypatch):
+    """#13 gap D: when the durable llm_call audit write degrades to the request connection
+    (production DSN set, fresh connection refused — the enrich_llm fallback path), the enrichment
+    stage that carried the call reports it: an ``audit_degraded`` count rides the stage detail
+    instead of living only in a log line. The stage OUTCOME itself is untouched (the enrichment
+    succeeded; only its audit durability degraded)."""
+    import psycopg
+    _seal_config()
+    monkeypatch.setenv("FEATUREGEN_DSN", "host=degrade-marker dbname=x user=y password=z")
+
+    real_connect = psycopg.connect
+
+    def refuse(conninfo, *args, **kwargs):
+        if "degrade-marker" in str(conninfo):
+            raise RuntimeError("durable audit connection refused")
+        return real_connect(conninfo, *args, **kwargs)
+
+    monkeypatch.setattr(psycopg, "connect", refuse)
+    client = FakeLLM(script={
+        "overlay.enrich.concept": FakeResponse(output={"concept": "monetary_stock"}),
+        "overlay.enrich.definition": FakeResponse(output={"definition": "drafted"}),
+        "overlay.enrich.domain": FakeResponse(output={"domain": "Deposits"})})
+    rec = StageRecorder()
+    res = ingest_upload(db, "deposits",
+                        [CanonicalRow("deposits", "accounts", "balance", "numeric")],
+                        actor=_actor(), now=_NOW, client=client, stage_recorder=rec)
+    assert res.status == "ingested"
+    concept = _report(rec, "enrich_concept")
+    assert concept.state == "succeeded"
+    assert concept.detail["audit_degraded"] >= 1
+    domain = _report(rec, "enrich_domain")
+    assert domain.detail["audit_degraded"] >= 1
+
+
 # ── early-exit paths: the stage account stays COMPLETE (#13 gap B) ────────────────────────────────
 
 # Every stage ingest_upload owns, in execution order — what a COMPLETE run account contains.
