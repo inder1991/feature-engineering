@@ -43,6 +43,10 @@ from featuregen.contracts.envelopes import Command, IdentityEnvelope
 from featuregen.overlay.confirmation_commands import confirm_fact, reject_fact
 from featuregen.overlay.state import fold_overlay_state
 from featuregen.overlay.store import load_fact
+from featuregen.overlay.upload.join_drift import (
+    acknowledge_governed_join_divergence,
+    list_governed_join_divergences,
+)
 from featuregen.overlay.upload.join_governance import (
     JoinGovernanceNotFound,
     list_open_approved_join_proposals,
@@ -115,7 +119,13 @@ def list_joins(source: str, conn: _Conn,
                limit: int = Query(default=100, ge=1, le=500)) -> dict:
     ensure_upload_catalog_adapter()
     proposals = list_open_approved_join_proposals(conn, source, limit=limit)
-    return {"source": source.strip().lower(), "proposals": proposals, "next_cursor": None}
+    # ADDITIVE: the source's OPEN governed-join divergences (a re-upload retargeted/dropped a
+    # joins_to humans VERIFIED — advisory only, the verified join stays operational; see
+    # join_drift.py). Rendered beside the open proposals so ONE screen shows the reviewer both
+    # what awaits confirmation and what a re-upload now disputes.
+    divergences = list_governed_join_divergences(conn, source.strip().lower())
+    return {"source": source.strip().lower(), "proposals": proposals,
+            "divergences": divergences, "next_cursor": None}
 
 
 @router.post("/governance/joins/{fact_key}/confirm", dependencies=[Depends(require_confirmer)])
@@ -172,6 +182,20 @@ def reject_join(fact_key: str, body: RejectJoinRequest, conn: _Conn,
         return JSONResponse(status_code=409,
                             content={"detail": _deny_to_detail(result.denied_reason)})
     return {"governance_status": "REJECTED", "category": body.category}
+
+
+@router.post("/governance/joins/divergences/{divergence_id}/acknowledge",
+             dependencies=[Depends(require_confirmer)])
+def acknowledge_join_divergence(divergence_id: int, conn: _Conn, identity: _Identity) -> dict:
+    """Mark a governed-join divergence acknowledged ("seen — the verified join stands / is being
+    handled"). ADVISORY bookkeeping only: it never touches the approved_join fact or its edge —
+    retiring/re-verifying the join is a separate governance action. A later re-upload that still
+    diverges RE-OPENS the row (join_drift.py resets acknowledged_* on a fresh detection)."""
+    row = acknowledge_governed_join_divergence(
+        conn, divergence_id, subject=identity.subject, now=None)
+    if row is None:
+        raise HTTPException(status_code=404, detail="No such divergence.")
+    return row
 
 
 # ── Table-fact routes (Pass B confirm surface, Task 2) ───────────────────────────────────────────
