@@ -1,272 +1,227 @@
-# Phase 3B.3c — Contract Completion (declarations · resolvability · safety staging · replay) Design
+# Phase 3B.3c — Contract Resolvability Classifier (declarations · safety · freshness · audit evidence) Design
 
-**Status:** approved design (2026-07-16). Successor to 3B.3b (cross-catalog assembly, merged `bd3e380`).
-**Predecessors consumed:** 3B.3b `assemble_paths` → a `source_to_target_resolved` `BindingPlanV1` (the physical path); 3B.1 `RESOLVED_NEED_METADATA` (temporal roles + source grain); 3A `EntitySemanticPathV1` hops (`cardinality`, `aggregation_required`); concept/template `additivity`; `evaluate_binding_safety`; `drift_watermark` + `CatalogStateStampV1`.
+**Status:** approved design v2 (2026-07-16), reshaped after a 19-finding adversarial spec review (10 Blocker / 7 High / 2 Medium — all accepted). v1's error: it assumed a structured recipe algebra, bound recipe instances, and a durable store that do not exist, and it overloaded `resolved`. v2 re-scopes 3B.3c to a **sound classifier** and moves persistence to 3B.4.
+**Predecessors consumed:** 3B.3b `assemble_paths` → a `source_to_target_resolved` `BindingPlanV1` (physical path); 3B.3a tier-1 `IngredientBindingV1`s (each `need_role`, `bound_catalog_source`, `bound_object_ref`, `concept`, `join_role`, `temporal_role`); 3B.2A `CatalogEntityRelationshipV1.declared_cardinality` (physical fan-in); concept/column `additivity`; `_safe_to_bind`; `drift_watermark` + `config.drift_freshness_sla` + the `overlay_checkpoint ≥ head_seq` projection-lag guard.
 
-## 1. What 3B.3c is (and is not)
+## 1. What 3B.3c is (v2)
 
-3B.3b proves a **physical path exists** ("you can roll transaction grain up to customer grain via this realization and that governed bridge"). A path is not yet a feature contract. **3B.3c compiles the selected path into a complete, mathematically-honest, replayable feature-contract definition, and states plainly whether it is executable or exactly why not.** Still shadow, still log-only, still behaviour-neutral, no migration — it only makes the shadow plan a *real contract* instead of a route, and feeds 3B.4 an honest resolvability signal.
+3B.3b proves a **physical path exists**. 3B.3c **classifies whether that path forms a complete, mathematically-honest feature contract, and if not, exactly why** — computing the declarations + safety + freshness + audit evidence *on the returned plan object*. It is a **classifier**, not a compiler that fabricates missing declarations and not a store.
 
-**Governing invariant (the promise of this phase):**
-> A plan is `resolved` only when every grain transition carries an explicit aggregation declaration compatible with the measure's additivity profile on the actual aggregation axis; the temporal semantics are declared; every physically-read column is safety-`safe`; and the participating catalogs were fresh at compile time.
+**Governing invariant (contract axis only):**
+> A plan's `contract_resolution_status` is `resolved` only when: every ingredient's table is connected to the physical path; every grain transition has a per-ingredient aggregation that is sound for that ingredient's additivity on the actual (physical) aggregation axis; the temporal declaration is bound; every physically-read column is universal-safety `safe`; and every participating catalog was fresh (watermark present, not stale, projection caught up) at compile time.
 
-**In scope:** contract completion + resolvability classification for the **single-source-grain** plans 3B.3b produces — aggregation declaration (per hop + composition), temporal declaration, safety staging over *every physically-read column*, freshness/replay evidence, and a deterministic resolution-status precedence. **Detect-and-classify only.**
+**Design posture — detect/validate, never fabricate.** The only sound aggregation *derivation* is `additive → SUM`. Every other function must be recipe-declared; today the corpus does not declare per-ingredient functions, so **most cross-catalog plans will classify `unresolved_*` with a precise reason** — that is the honest, intended output, and it is exactly the population 3B.4 measures. 3B.3c does **not** build the authoring surfaces that would move those plans to `resolved`.
 
-**Explicitly OUT of scope (the boundary that sizes this phase):**
-- **No authoring surfaces.** 3B.3c does NOT build the weighted-average weight-ingredient binding, the per-recipe temporal-strategy declaration, or numerator/denominator recomposition. A recipe that *needs* those stays `unresolved` with a precise reason code; standing those authoring surfaces up (moving recipes unresolved→resolved) is a later enrichment phase. This mirrors the steer: "if the recipe provides no weighting basis, the plan remains unresolved."
-- **No multi-grain / multi-branch** ingredient planning (that is 3D).
-- **No enforcement / live path** (that is 3C). Nothing 3B.3c writes alters candidate generation or any response.
-- **No policy.** Safety here is *universal-safety only* (`_safe_to_bind`: leakage / PII / blocked-attribute). Contextual policy is the separate Governed Feature Policy initiative — no policy leak into this phase.
+**In scope:** the third resolution axis (§2); per-ingredient aggregation validation + composition (§4); ingredient-connectivity (§3); additivity-source resolution (§4.1); temporal validation on *representative* params (§5); universal-safety staging over the physical-read set (§6); compile-time freshness + transactional consistency (§7); identity split (§8); self-contained *audit* evidence (§9); precedence + diagnostic consistency (§10); operational guards (§11).
 
-## 2. Compile pipeline (the dependency order)
+**Out of scope (explicit):**
+- **No durable store, no replay-time reads.** 3B.3c returns the compiled contract on the in-memory plan; the append-only store, the replay-time freshness comparison, and the 3B.4 metric aggregation are **3B.4**.
+- **No aggregation/temporal AUTHORING** (weight-ingredient binding, temporal-strategy declaration, numerator/denominator recomposition) and **no bound parameter-instance planning** — a later enrichment phase (moves `unresolved`→`resolved`).
+- **No multi-grain / multi-branch** planning (3D); **no enforcement / live path** (3C); **no policy** (Governed Feature Policy). Safety here is universal-safety only.
 
-Aggregation and temporal semantics cannot be compiled independently — for a semi-additive balance the *temporal* declaration determines whether the aggregation is even valid. The compiler runs one deterministic order (work may be shared internally, but the decision model honours the dependency):
+## 2. Three orthogonal resolution axes (fixes F1, F2)
 
-1. **Resolve temporal roles + PIT anchor** — from `RESOLVED_NEED_METADATA` temporal roles + the recipe's window/PIT.
-2. **Determine the effective aggregation axes** — each physical hop is an *entity axis* roll-up; the recipe window is the *time axis*.
-3. **Compile per-hop aggregation declarations** — one `AggregationStepV1` per semantic hop that requires aggregation.
-4. **Validate additivity + strategy composition** — per-hop additivity compatibility, then a plan-level composition check across hops.
-5. **Stage safety** — universal-safety over every physically-read column, role preserved.
-6. **Establish freshness + replay evidence** — compile-time catalog stamps + the full replay version set.
-7. **Derive the final resolution status** — by the fixed precedence (§8), preserving all reason codes.
+Do not overload `resolved`. A plan carries three independent statuses:
 
-A single new module `planner/declarations.py` holds the compiler; `plan.py` calls it as a **post-assembly compile pass** over each `source_to_target_resolved` plan (the physics in `assembly.py` stays cleanly separated from contract-compilation).
+| axis | field | owner | meaning |
+|---|---|---|---|
+| ingredient | `resolution_status` | 3B.3a | were the recipe's need columns bound? |
+| path | `path_resolution_status` | 3B.3b | does a governed physical source→target path exist? |
+| **contract** | **`contract_resolution_status`** (NEW) | **3B.3c** | is the path a complete, sound, safe, fresh executable contract? |
 
-## 3. Additivity: axis-aware, derived (not newly authored)
+```python
+class ContractResolutionStatus(StrEnum):
+    resolved = "resolved"
+    unresolved_ingredient_connectivity = "unresolved_ingredient_connectivity"
+    unresolved_aggregation_declaration = "unresolved_aggregation_declaration"
+    unresolved_temporal_declaration = "unresolved_temporal_declaration"
+    unresolved_safety_evaluation = "unresolved_safety_evaluation"   # F2: safety-incomplete has a home
+    safety_rejected = "safety_rejected"
+    unresolved_freshness = "unresolved_freshness"
+    not_compiled = "not_compiled"   # tier-1 / non-source_to_target plans the compiler doesn't touch
+```
 
-Additivity exists today as a scalar per measure concept (`additive` / `semi_additive` / `non_additive` / `n/a`), with good coverage (`monetary_flow`=additive, `monetary_stock`/balances=semi_additive, `monetary_rate`=non_additive, …). What's missing is axis-awareness. We get it **by derivation**, using the standard dimensional-modelling meaning of semi-additive (additive across every dimension *except time*):
+The compile pass runs only on `source_to_target_resolved` plans; every other plan gets `contract_resolution_status = not_compiled` (so the axis is total and never silently absent). The top-level `BindingPlanningResultV1` gains a **contract roll-up** (`contract_result_status` + the selected plan's contract status) *separate* from its ingredient-level `result_status` — the two never alias.
+
+## 3. Ingredient connectivity (fixes F4)
+
+3B.3a binds each need independently and may land ingredients on **different tables**; 3B.3b's path only guarantees the *source-key* table rolls up to the target. So a plan can be `source_to_target_resolved` yet have an ingredient whose table the path never touches. 3B.3c checks connectivity **first among the contract checks**:
+
+> For every `IngredientBindingV1`, `table_of(bound_object_ref)` must be either on the physical path (a realization/bridge segment's endpoint table in that catalog) or co-located with a path table (same catalog + same table as the source-key binding). Otherwise → `unresolved_ingredient_connectivity`, reason `ingredient_not_connected_to_path`, evidence = the disconnected `need_role` + its table + the path tables.
+
+Multi-branch planning that *would* connect them is 3D; here it is an explicit, evidenced rejection.
+
+## 4. Per-ingredient aggregation (fixes F3, F5, F6, F8)
+
+Aggregation is **per (hop × ingredient)**, not one-per-hop. At a single fan-in hop, `average_rate = SUM(interest_amount)/SUM(principal_amount)` needs `SUM` on two different ingredients and a division — one plan-wide op cannot express that.
 
 ```python
 @dataclass(frozen=True, slots=True)
-class AdditivityProfileV1:
-    kind: AdditivityKind                     # additive | semi_additive | non_additive | not_applicable
-    additive_across: tuple[AggregationAxisKind, ...]      # e.g. (entity,)
-    non_additive_across: tuple[AggregationAxisKind, ...]  # e.g. (time,)
-    supported_temporal_strategies: tuple[AggregationFunction, ...]  # () when none declared
-    source: ProfileSource                    # derived_convention | authored_override  (future)
-```
-
-Derivation from the scalar (the default; per-measure `authored_override` is a future enrichment, and the contract is shaped so it slots in without a redesign):
-
-| scalar | `additive_across` | `non_additive_across` | entity-axis roll-up | time-axis roll-up |
-|---|---|---|---|---|
-| `additive` | (entity, time) | () | valid (SUM/COUNT/MIN/MAX) | valid |
-| `semi_additive` | (entity,) | (time,) | valid at a single PIT (SUM) | requires an explicitly-declared temporal strategy |
-| `non_additive` | () | (entity, time) | requires weighting / recomputation | requires temporal rule |
-| `n/a` | (entity, time) | () | not an aggregating measure | — |
-
-`AggregationAxisKind = {entity, time}`. Because a 3B.3c **hop** is always an entity-axis roll-up and the recipe **window** is the time axis, this table decides hop validity with no new authoring.
-
-## 4. Aggregation function vocabulary + per-hop declaration
-
-The semantic hop's `AggregationStrategy` is deliberately abstract (`NOT_APPLICABLE` / `RECIPE_DECLARED` — "the actual function is a Phase-3B recipe concern"). 3B.3c introduces the concrete function vocabulary:
-
-```python
-class AggregationFunction(StrEnum):
-    sum = "sum"; count = "count"; min = "min"; max = "max"           # additive-safe
-    last_as_of = "last_as_of"; first_as_of = "first_as_of"          # semi-additive temporal
-    average_over_period = "average_over_period"; max_over_period = "max_over_period"
-    weighted_average = "weighted_average"                            # non-additive (needs a weight ingredient)
-    recomputed_ratio = "recomputed_ratio"                            # non-additive (needs numerator+denominator)
-    none = "none"
-```
-
-One declaration per hop that requires aggregation:
-
-```python
-@dataclass(frozen=True, slots=True)
-class AggregationStepV1:
-    semantic_hop_index: int
-    source_entity: str
-    target_entity: str
-    cardinality: Cardinality                      # the physical fan-in (many_to_one / many_to_many)
-    aggregation_required: bool
-    axis: AggregationAxisKind                     # entity (a roll-up hop is always the entity axis)
-    proposed_strategy: AggregationFunction | None # None when nothing legal is declarable
-    additivity_evaluation: AdditivityEvaluation   # compatible | incompatible | incomplete
-    supporting_bindings: tuple[str, ...]          # weight/component object_refs, when required
+class IngredientAggregationV1:
+    need_role: str                       # the ingredient this stage aggregates
+    bound_object_ref: str
+    additivity: AdditivityClass          # resolved per §4.1 (with provenance)
+    additivity_source: AdditivitySource  # uploaded_column | concept | unknown  (F6 provenance)
+    physical_cardinality: Cardinality    # the REALIZATION fan-in at this hop (F8), not the semantic hop
+    axis: AggregationAxisKind            # entity | time
+    declared_function: AggregationFunction | None   # from the recipe; None when undeclared
+    validation: AggregationValidation    # sound | incompatible | undeclared | inputs_missing
     reason_codes: tuple[ReasonCode, ...]
+
+@dataclass(frozen=True, slots=True)
+class HopAggregationV1:
+    semantic_hop_index: int
+    from_entity: str; to_entity: str
+    physical_cardinality: Cardinality    # from CatalogEntityRelationshipV1.declared_cardinality
+    grouping_keys: tuple[str, ...]       # the realization's to-side key(s) — the GROUP BY
+    ingredient_stages: tuple[IngredientAggregationV1, ...]
 ```
 
-**Per-hop derivation (fails closed by construction):**
-- **additive** measure + fan-in → `sum` (the canonical additive roll-up; always valid). `compatible`.
-- **semi-additive** measure, entity-axis hop at a single PIT → `sum`. `compatible`. But if the *recipe also aggregates across the time axis* and declares no temporal strategy → `incomplete`, reason `semi_additive_temporal_strategy_missing`.
-- **non-additive** measure → cannot silently `sum`/`avg`. Needs `weighted_average` (with a weight ingredient) or `recomputed_ratio` (with numerator+denominator). The recipe binds neither today → `incomplete`, reason `aggregation_weight_missing` / `aggregation_components_missing`. If a strategy *were* proposed but contradicts the additivity → `incompatible`, reason `aggregation_incompatible_with_additivity`. If no strategy is declarable at all → reason `aggregation_strategy_missing`.
+**Validation per ingredient stage (never fabricate a function):**
+- `additive` ingredient, fan-in → the one sound derivation `SUM` is `sound`. (A recipe-declared `count/min/max` is also validated `sound`; an undeclared function still resolves via the `SUM` default only because additivity guarantees SUM — `count/min/max` are *different features* and require the recipe to ask for them.)
+- `semi_additive`, entity-axis hop, **single-PIT** temporal (§5) → `SUM` is `sound`. Same measure with the recipe aggregating across the **time axis** and no declared temporal strategy → `undeclared`, reason `semi_additive_temporal_strategy_missing`.
+- `non_additive` → no sound default. Requires a recipe-declared rule (weighted-average with a bound weight, ratio recomputation with bound numerator+denominator, take-latest, …); today undeclared → `undeclared`, reason `aggregation_strategy_missing`. A declared function that contradicts additivity → `incompatible`, reason `aggregation_incompatible_with_additivity`. A declared function whose inputs aren't bound → `inputs_missing`, reason `aggregation_weight_missing` / `aggregation_components_missing`, with `missing_inputs` recorded.
+- `n/a` (non-aggregating measure) that nonetheless sits on a fan-in hop → `incompatible`, reason `aggregation_axis_unsupported`.
 
-Bank examples the derivation must get right:
+Bank examples (verbatim outcomes the classifier must produce):
 ```
-transaction_amount, fan-in transaction→customer, sum            → compatible
-interest_rate,      fan-in transaction→customer, sum            → incompatible (aggregation_incompatible_with_additivity)
-interest_rate,      required weighted_average, weight missing    → incomplete   (aggregation_weight_missing)
-balance,            entity roll-up at end-of-day, sum            → compatible
-balance,            summed across a 90-day window (time axis)     → incomplete   (semi_additive_temporal_strategy_missing)
+transaction_amount (additive), fan-in, undeclared         → sound      (SUM default)
+interest_rate (non_additive),  fan-in, declared SUM        → incompatible (aggregation_incompatible_with_additivity)
+interest_rate (non_additive),  fan-in, undeclared          → undeclared   (aggregation_strategy_missing)
+interest_rate (non_additive),  declared weighted_average, weight unbound → inputs_missing (aggregation_weight_missing)
+balance (semi_additive), entity roll-up at end-of-day       → sound      (SUM)
+balance (semi_additive), summed across a 90-day window       → undeclared   (semi_additive_temporal_strategy_missing)
 ```
 
-**Plan-level composition check.** Do not flatten the path to one aggregation field. For `transaction → account → customer`, each transition has its own step, and the compiler then asks: *are the hop outputs safely composable?* This catches:
-- average-of-average without a surviving weight basis,
-- ratio-of-ratios,
-- summing snapshot balances across time,
-- aggregation applied inconsistently before vs after a bridge.
-Failure → plan reason `aggregation_composition_unsupported`. (A path can have every hop individually `compatible` yet fail composition — e.g. `weighted_average` at hop 1 whose weight basis doesn't survive hop 2.)
+### 4.1 Additivity source + provenance (fixes F6)
+Three additivity sources exist and can disagree: uploaded column additivity (`canonical`/`graph_node`), concept additivity, template *output* additivity. Per-ingredient precedence:
+1. **uploaded-column additivity** if the bound column asserts one → `AdditivitySource.uploaded_column`;
+2. else **concept additivity** of the bound column's concept → `AdditivitySource.concept`;
+3. else `unknown` → `AdditivityClass.unknown`, which is **not** treated as additive — it forces `undeclared`/`unresolved`, never a silent `SUM`.
+`template.additivity` is the **output** target — used only in the composition check (§4.2), never as an ingredient's input additivity. A column whose upload and concept additivity *conflict* → `unresolved_aggregation_declaration`, reason `additivity_source_conflict`, both values in provenance.
 
-## 5. Temporal declaration
+### 4.2 Cross-hop composition (fixes F5, F8)
+The recipe has **no structured output algebra** in the corpus (Option A), so composition is a **conservative, fail-closed cross-hop guard over the per-ingredient stages** — not an expression evaluator. For each ingredient across a multi-hop path it asks: *is the sound aggregation at hop k re-aggregable by the aggregation at hop k+1?* The provable-sound chains: `SUM∘SUM` (additive), and a same-axis re-group whose grouping key survives. Everything it cannot **prove** composable → `unresolved_aggregation_declaration`, reason `aggregation_composition_unsupported` — the average-of-average case (a non-additive intermediate, e.g. an `average_over_period` output at hop k, re-aggregated at hop k+1 with no surviving weight), a semi-additive balance whose grouping/placement differs before vs after a bridge, or any declared function pair with no declared composition rule. (A path with every stage individually `sound` can still fail composition; conversely `SUM(interest)/SUM(principal)` at a *single* hop is a valid weighted rate and is a per-ingredient concern, not a composition failure.)
 
-Compiled from `RESOLVED_NEED_METADATA` temporal roles (`event_time` / `as_of_time` / `valid_from` / …) + the recipe's window/PIT:
+## 5. Temporal validation on representative params (fixes F7)
+
+`plan_bindings` receives an **unbound** `Template` (params are allowed-value tuples). 3B.3c compiles against a **representative default-bound instance** (each param's first allowed value) and records that it did so; full parameter-instance planning is out of scope. The window is a **typed** contract, not a bare string:
 
 ```python
 @dataclass(frozen=True, slots=True)
 class TemporalDeclarationV1:
-    pit_anchor: TemporalRole | None       # the effective as-of/event anchor
+    pit_anchor: TemporalRole | None       # effective as-of/event anchor from RESOLVED_NEED_METADATA
     anchor_binding: str | None            # bound object_ref supplying it, when required
-    window: str | None                    # the recipe's trailing-window rule (verbatim from the template)
-    time_axis_aggregating: bool           # does the recipe aggregate across the time axis?
+    window: WindowSpecV1 | None           # typed: {length, unit, boundary, inclusive} — NOT str
+    param_binding: ParamBindingV1         # {name: chosen_representative_value}, + is_representative=True
+    time_axis_aggregating: bool           # does the representative recipe aggregate the measure over time?
     reason_codes: tuple[ReasonCode, ...]
 ```
 
-If a roll-up needs an as-of anchor the bound columns can't supply → `unresolved_temporal_declaration`, reason `temporal_anchor_missing`. The temporal declaration is computed **first** (step 1) because it decides whether a semi-additive entity roll-up is valid (single-PIT vs across-time).
+Handles both `window` and `window_min` corpus params. A roll-up needing an as-of anchor the bound columns can't supply → `unresolved_temporal_declaration`, reason `temporal_anchor_missing`. Multiple temporal anchors / bitemporal (`valid_from`+`valid_to`) are validated for consistency → reason `temporal_anchor_ambiguous` when they conflict. Temporal is computed **before** aggregation (it decides semi-additive single-PIT vs across-time).
 
-## 6. Safety staging over every physically-read column
+## 6. Universal-safety over the physical-read set (fixes F13, F14, F2)
 
-Safety is **not** limited to feature-ingredient columns. The executable contract would read: measure ingredients, event-time / as-of columns, realization join keys, bridge endpoint keys, aggregation weights, ratio numerator/denominator components, and any filter/partition columns. 3B.3c stages universal-safety over **every bound column the contract requires reading**, preserving the column's role:
+Safety covers **every physically-read column**, not just ingredients, with **multi-role** provenance (a column may be both `ingredient` and `join_key`). It is **universal-safety only** — leakage-anchor + protected/special — **explicitly separate from PII/authorization** (read-scope), which 3B.3c does not re-gate.
 
 ```python
 class ColumnRole(StrEnum):
-    ingredient = "ingredient"; temporal_anchor = "temporal_anchor"
-    join_key = "join_key"; bridge_key = "bridge_key"
-    aggregation_weight = "aggregation_weight"; aggregation_component = "aggregation_component"
+    ingredient; temporal_anchor; join_key; bridge_key
+    aggregation_weight; aggregation_component; filter; partition
 
 @dataclass(frozen=True, slots=True)
-class ColumnSafetyV1:
-    object_ref: str; catalog_source: str; role: ColumnRole; safety: BindingSafety  # safe|unsafe|not_evaluated
+class PhysicalColumnReadV1:
+    object_ref: str; catalog_source: str
+    roles: tuple[ColumnRole, ...]         # multi-role
+    safety: BindingSafety                 # safe | unsafe | not_evaluated
+    reason_codes: tuple[ReasonCode, ...]
+
+@dataclass(frozen=True, slots=True)
+class PhysicalReadSetV1:
+    columns: tuple[PhysicalColumnReadV1, ...]   # the immutable inventory the contract would read
 ```
 
-`evaluate_binding_safety(col: _Col)` today accepts an ingredient column; 3B.3c puts a **stable compiler-facing wrapper** around it and applies it to every physical column ref where its semantics apply. Plan-level fold:
-
+The read-set is derived from ingredient bindings **+ the path segments' realization/bridge key refs** (segments must expose these — §9). `evaluate_binding_safety(col: _Col)` returns only `safe|unsafe` (unknown-concept → `safe`); it is applied through a **stable compiler-facing wrapper**. `not_evaluated` is **structural** — the wrapper returns it when a physical column cannot be resolved to a `_Col` (e.g. a bare bridge/join key with no loaded metadata), never as an `evaluate_binding_safety` result. Fold:
 ```
-any unsafe                     → unsafe        → resolution safety_rejected
-none unsafe, any not_evaluated → not_evaluated → NOT fully resolved (reason safety_evaluation_incomplete)
+any unsafe                     → unsafe        → contract safety_rejected            (reason: the column's block, e.g. leakage_anchor / protected_attribute)
+none unsafe, any not_evaluated → not_evaluated → contract unresolved_safety_evaluation (reason: safety_evaluation_incomplete)
 all safe                       → safe          → eligible for resolved
 ```
+`not_evaluated` is never treated as `safe`.
 
-`not_evaluated` is never treated as `safe` (fail-closed). A column whose safety can't be evaluated leaves the plan not-fully-resolved with `safety_evaluation_incomplete`, not pretend-executable.
+## 7. Freshness + transactional consistency (fixes F10, F15)
 
-## 7. Freshness: two separate concepts (auditability)
+**Compile-time freshness (part of the plan record):** each participating catalog must have a drift watermark present, be within `config.drift_freshness_sla` (the existing policy — not a hardcoded 24h; its version pinned in the envelope), and have its **overlay projection caught up** (`overlay_checkpoint ≥ drift head_seq`, the same guard `resolve.py` enforces). Any failure → `unresolved_freshness`, reason `freshness_stamp_unavailable` / `participating_catalog_stale` / `projection_lagging`. Catalogs with no watermark are already dropped by scope resolution — 3B.3c treats a *participating* catalog that later lacks a watermark as stale, not silently absent.
 
-A persisted plan must **not** silently mutate its original resolution status as catalog state changes — otherwise historical metrics change depending on when they're queried.
+**Transactional consistency (F10):** the scope stamps + `active_bridges` are read at the top of `plan_bindings`, but realization/graph/bridge reads happen later; under READ COMMITTED concurrent ingestion could desync them. 3B.3c **revalidates every catalog stamp at compile completion** — if any participating catalog's drift `head_seq` advanced during the compile, the plan's replay evidence is marked `unverifiable` and the plan classifies `unresolved_freshness` (reason `catalog_mutated_during_compile`) rather than emitting an envelope inconsistent with the reads. (A repeatable-read planning context is the stronger alternative and is noted as a 3C upgrade; revalidation is the shadow-safe choice.)
 
-- **Compile-time freshness (part of the immutable record).** At compilation: were all participating catalogs' states available and acceptable (drift watermark present, not staled, within `fresh_within`)? If not → `resolution_status = unresolved_freshness`, reason `freshness_stamp_unavailable` / `participating_catalog_stale`. Each participating catalog is stamped with a `CatalogStateStampV1` (`catalog_source, head_seq, last_completed_at, stamp_kind=drift_watermark`) into the replay envelope. The plan records `resolved_at_compilation`.
-- **Replay / observation-time freshness (computed on read, never mutates the record).** Later, compare current catalog state to the plan's recorded stamps → a *separate* field:
+**Replay-time freshness is 3B.4**, not here — see §9.
 
-```python
-class ReplayFreshness(StrEnum):
-    current = "current"; drifted = "drifted"; unverifiable = "unverifiable"
+## 8. Identity: physical_plan_id vs contract_id (fixes F11, F12)
+
+Compilation must **not** mutate the id the ranker used. Split:
+- `physical_plan_id` — minted by assembly (3B.3b) over the physical path; the ranking tie-break; **immutable through compilation**. (Rename the current `plan_id` role; ranking + candidate-local-first unchanged.)
+- `contract_id` — minted by 3B.3c over the **declaration material only**: `physical_plan_id · per-ingredient (need_role, resolved additivity, declared_function, validation) · temporal declaration · composition outcome · contract_resolution_status · the rule-registry versions`. **Excludes** all timestamps, freshness stamps, and `resolved_at_compilation`, so identical compiles are byte-identical and freshness changes never change the id.
+
+Canonical material is defined explicitly and its components are **sorted + deduped** (§10) so serialization order can't perturb it. `resolved_at_compilation` is a typed `datetime`, carried as evidence, **never hashed**.
+
+## 9. Self-contained AUDIT evidence; store deferred to 3B.4 (fixes F9, F16)
+
+`run_shadow_planner` today only logs a one-line summary and persists nothing. 3B.3c therefore **computes** the compiled contract + evidence onto the returned `BindingPlanV1`; it does **not** persist. The durable append-only store, the 3B.4 metric aggregation, and the replay-time freshness comparison are **3B.4's** contract.
+
+Replay strength is honestly **`audit_only`** (not `watermark_only`): watermarks permit drift *correlation*, never deterministic re-execution, since historical graph state can't be reconstructed. For the evidence to be self-contained for *audit*, the assembled path segments must carry (added this phase): the **semantic `relationship_id` + `relationship_version`** per hop, and the **realization key refs / bridge fact_keys** already present. The replay envelope pins the full version set — recipe + template version + a **recipe content-hash**, `need_metadata_version`, `graph_version`, realization-derivation version, `bridge_derivation_version`, aggregation-rule / additivity-rule / temporal-rule / safety-evaluator versions, `drift_freshness_sla` policy version, planner bounds + ranking version, **authz role claims**, and the per-participating-catalog `CatalogStateStampV1` — with a `stamp_consistency` flag (`consistent` | `unverifiable`, §7).
+
+The replay-time comparison (a pure `ReplayFreshness ∈ {current, drifted, unverifiable}` over a stored plan's stamps vs current state) is **defined as a 3B.4 function**; 3B.3c ships only the compile-time stamps + the immutable record.
+
+## 10. Precedence + diagnostic consistency (fixes F17, F2)
+
+**Deterministic contract-status precedence** (primary = strongest reason it can't execute; **all** reason codes preserved, sorted + deduped):
 ```
-
-The original plan stays immutable (`resolved`/`unresolved_*` at compilation) but may be observed `invalidated_by_drift`. 3B.3c produces the compile-time status + the stamps; the replay-time comparison is a read-side helper (also used by 3B.4).
-
-## 8. Resolution status + precedence + reason codes
-
-**Status vocabulary — kept compact; diagnostic precision lives in reason codes.** Additions to `PlanResolutionStatus`:
-- `unresolved_aggregation_declaration` (broader than "missing" — the compiler may have *found* a strategy and proved it wrong)
-- `unresolved_temporal_declaration`
-- `unresolved_freshness`
-- (`safety_rejected` already exists)
-
-**Reason-code registry additions** (the diagnostic precision):
+1. unresolved_ingredient_connectivity
+2. safety_rejected
+3. unresolved_safety_evaluation
+4. unresolved_temporal_declaration
+5. unresolved_aggregation_declaration
+6. unresolved_freshness
+7. resolved
 ```
-aggregation_strategy_missing            aggregation_incompatible_with_additivity
-aggregation_weight_missing              aggregation_components_missing
-aggregation_axis_unsupported            aggregation_composition_unsupported
-semi_additive_temporal_strategy_missing
-temporal_anchor_missing
-safety_evaluation_incomplete
-freshness_stamp_unavailable             participating_catalog_stale
-```
+(Connectivity first: a plan whose ingredients aren't even connected isn't a contract to reason about further. Safety before the declaration checks: a leakage/protected read is the hardest block.)
 
-**Deterministic precedence for a plan with multiple problems** (the *primary* status = the strongest reason it can't be treated as executable; **all** reason codes are preserved so the full set answers "what must be fixed"):
-```
-1. safety_rejected
-2. unresolved_temporal_declaration
-3. unresolved_aggregation_declaration
-4. unresolved_freshness
-5. resolved
-```
-Example:
-```
-resolution_status = safety_rejected
-reason_codes = [blocked_attribute, aggregation_weight_missing, freshness_stamp_unavailable]
-```
-Candidate-local-first still holds: a failed *unselected* alternative never affects the selected plan; but every issue on the *selected* contract is preserved.
+**Diagnostics:** every reason code is registered in `ReasonCode` (including one for the safety block — reuse/register `blocked_attribute`/`leakage_anchor_read` explicitly rather than referencing an unregistered name). The retained-plan fields (`required_strategy`, `missing_inputs`, provenance) appear in the contract summary too. Reason codes are **canonically ordered (enum order) and deduped** so `contract_id` is stable. Candidate-local-first holds: a failed *unselected* alternative never affects the selected plan, but every issue on the selected contract is preserved.
 
-## 9. Preserve the rejected plan completely (fail-closed ≠ discard)
+## 11. Operational guards (fixes F18)
 
-A plan that fails resolution is retained in full for shadow evaluation. The compiled result carries, at minimum:
-```
-physical_path_status: source_to_target_resolved      # from 3B.3b, unchanged
-resolution_status: unresolved_aggregation_declaration
-aggregation_steps: [AggregationStepV1, ...]          # per hop, with the failing hop marked
-temporal_declaration: TemporalDeclarationV1
-column_safety: [ColumnSafetyV1, ...]
-required_strategy: weighted_average
-missing_inputs: [principal_amount]
-reason_codes: [aggregation_incompatible_with_additivity, ...]
-compiler_version + rule versions (see §10)
-catalog_state_stamps: [CatalogStateStampV1, ...]
-resolved_at_compilation
-```
-This is exactly the population 3B.4 measures. The 3B.4 hand-off metric this phase is designed to feed: **`physically_resolved_but_contract_unresolved`**, broken down by `aggregation | temporal | freshness | safety`.
+"Behaviour-neutral" means *response-neutral*; latency/txn-duration is real behaviour and the compile pass adds per-plan reads.
+- **Dedicated kill switch** for the compile pass (a flag separate from the shadow-planner entry), default off; when off, plans keep `contract_resolution_status = not_compiled`.
+- **Batched compiler context** — load realizations + `active_bridges` + catalog stamps **once per run**, pass an immutable context to every plan compile (no per-plan re-query).
+- **Per-run compile budget + timeout** — bound total plans compiled + wall-time; on exceed, remaining plans stay `not_compiled` with a recorded `compile_budget_exhausted` marker (never a silent skip).
+- **Timing metrics** emitted for the run (compiles, wall-time, budget hits).
 
-## 10. Replay envelope completion
+## 12. Contracts summary
 
-`watermark_only` replay strength is honest **only** if it's understood as drift-correlation, not deterministic re-execution — the historical graph state can't be reconstructed from watermarks alone, and the contract must name that accurately. Beyond 3B.3b's `active_bridge_fact_keys` + `plan_contract_version`, 3B.3c pins the full version set into the replay envelope:
-- recipe + template version; `need_metadata_version`; semantic-path / `graph_version`;
-- realization-derivation version; active-bridge / `bridge_derivation_version`;
-- **aggregation-rule registry version; additivity-rule version; temporal-compilation rule version; safety-evaluator version;**
-- planner bounds + ranking version; **per-participating-catalog `CatalogStateStampV1`.**
+New: `ContractResolutionStatus`, `IngredientAggregationV1`, `HopAggregationV1`, `AggregationFunction`, `AggregationValidation`, `AdditivityClass`, `AdditivitySource`, `AggregationAxisKind`, `TemporalDeclarationV1`, `WindowSpecV1`, `ParamBindingV1`, `ColumnRole`, `PhysicalColumnReadV1`, `PhysicalReadSetV1`, `ReplayFreshness` (defined, used by 3B.4). Extended: `BindingPlanV1` + `contract_resolution_status` / `hop_aggregations` / `temporal_declaration` / `physical_read_set` / `contract_id` / `resolved_at_compilation` (physical_plan_id = renamed existing); `BindingPathSegmentV1` + `relationship_id` / `relationship_version`; `PlannerReplayEnvelopeV1` + the §9 version set + stamps + `stamp_consistency`; `BindingPlanningResultV1` + the contract roll-up; `ReasonCode` +~15; `PLAN_CONTRACT_VERSION` bump. New module `planner/declarations.py`. Safety wrapper around `evaluate_binding_safety`. New flag for the compile pass.
 
-## 11. Where it runs, and behaviour-neutrality
+## 13. Task decomposition
 
-- New module `src/featuregen/overlay/upload/planner/declarations.py` — the pure, read-only compiler (`compile_contract(conn, plan, template, scope, now) -> BindingPlanV1` enriched, plus the axis/additivity/aggregation/temporal/safety/freshness helpers).
-- `plan.py::plan_bindings` calls it as a **post-assembly compile pass** on each `source_to_target_resolved` plan (the assembler is untouched). The compiled declarations + resolution status + stamps ride on the existing `BindingPlanV1` (additive fields; bump `PLAN_CONTRACT_VERSION`; the canonical `make_binding_plan` remains the sole constructor and the new declaration fields participate in plan_id material where they change identity).
-- **Log-only / shadow / behaviour-neutral / no migration.** Consumed only by `run_shadow_planner`; the live grounding path and the route are untouched; per-recipe savepoint isolation preserved; F4 preserved (a compiled contract is still a *definition*, never an operational join). Full `tests/featuregen` suite stays green.
+- **C1 — axes + vocabularies + additivity resolution.** `ContractResolutionStatus`; `AggregationFunction`/`AggregationValidation`/`AdditivityClass`/`AdditivitySource`/axis enums; per-ingredient additivity-source precedence (§4.1) + `additivity_source_conflict`; `ReasonCode` additions (all registered); `PLAN_CONTRACT_VERSION` bump; the `physical_plan_id`/`contract_id` split + canonical `contract_id` material (timestamps excluded). Pure/unit.
+- **C2 — ingredient connectivity** (`check_connectivity`) — `unresolved_ingredient_connectivity`; DB-backed (multi-table ingredients).
+- **C3 — temporal on representative params** (`compile_temporal`) — typed `WindowSpecV1`, `window`/`window_min`, multi-anchor/bitemporal; runs first.
+- **C4 — per-ingredient aggregation + additivity validation** (`compile_aggregation`) — physical cardinality from the realization, per-ingredient stages, the §4 validation matrix (never fabricate).
+- **C5 — composition check** (`check_composition`) — `aggregation_composition_unsupported`; avg-of-avg / ratio-of-ratios / snapshot-sum-across-time / cross-bridge placement.
+- **C6 — physical-read set + universal-safety staging** (`stage_safety`) — read-set from bindings + segment key refs; multi-role; wrapper; structural `not_evaluated`; `safety_rejected` / `unresolved_safety_evaluation`.
+- **C7 — freshness + transactional consistency + audit envelope** — `config.drift_freshness_sla` + projection-lag guard + end-of-compile stamp revalidation; self-contained segments (`relationship_id`/version); `audit_only` strength; `stamp_consistency`.
+- **C8 — precedence + roll-up + wire the batched compile pass into `plan_bindings` + operational guards** — §10 precedence, all-reason-code preservation, immutable `resolved_at_compilation`, kill-switch flag, batched context, budget/timeout, timing metrics, the result-level contract roll-up, behaviour-neutral proof.
 
-## 12. Contracts summary (new / extended)
+## 14. Mandatory tests (adversarial; expanded per F19)
 
-New (in `contracts.py` unless noted): `AdditivityProfileV1`, `AdditivityKind`, `AggregationAxisKind`, `ProfileSource`, `AggregationFunction`, `AggregationStepV1`, `AdditivityEvaluation`, `TemporalDeclarationV1`, `ColumnRole`, `ColumnSafetyV1`, `ReplayFreshness`; `PlanResolutionStatus` +3 members; `ReasonCode` +~11; `PlannerReplayEnvelopeV1` + the version set + `catalog_state_stamps`; `BindingPlanV1` + `aggregation_steps` / `temporal_declaration` / `column_safety` / `resolved_at_compilation`. New module `planner/declarations.py`. Wrapper around `evaluate_binding_safety` for arbitrary physical columns.
+1. Additive ingredient, fan-in, undeclared → `resolved` (SUM default). 2. Non-additive rate + declared SUM → `aggregation_incompatible_with_additivity`. 3. Non-additive rate, undeclared → `aggregation_strategy_missing` (NOT "incompatible"). 4. Non-additive rate, `weighted_average` declared, weight unbound → `aggregation_weight_missing` + `missing_inputs`. 5. Semi-additive balance, entity roll-up at single PIT → `resolved`. 6. Semi-additive balance across the window → `semi_additive_temporal_strategy_missing`. 7. **Cross-hop average-of-average** (a two-hop path where hop-1's declared aggregation output is non-additive — e.g. `average_over_period` — and hop-2 re-aggregates it with no surviving weight) → `aggregation_composition_unsupported`. Counter-case in the same test: `SUM(interest)/SUM(principal)` at a *single* hop classifies per-ingredient `sound`, NOT a composition failure. 8. **Disconnected same-grain tables** (amount on t1, timestamp on t2) → `ingredient_not_connected_to_path`. 9. **Physical/semantic cardinality disagreement** (realization is 1:N where the semantic hop is N:1) → uses the physical cardinality. 10. Unbound temporal anchor → `unresolved_temporal_declaration`; **`window_min` param** bound representatively; **multiple/bitemporal anchors** → `temporal_anchor_ambiguous`. 11. **Unsafe join-key / bridge-key** column → `safety_rejected` (proves non-ingredient coverage). 12. **Structural `not_evaluated`** (bare key, no `_Col`) → `unresolved_safety_evaluation`, not `safe`. 13. **PII column permitted by read-scope** → NOT safety_rejected (universal-safety ≠ authorization). 14. **Additivity source conflict** (upload vs concept) → `additivity_source_conflict`. 15. Stale participating catalog → `unresolved_freshness`; **projection lag** (`checkpoint < head_seq`) → `projection_lagging`. 16. **Concurrent catalog mutation during compile** (head_seq advances) → `catalog_mutated_during_compile`, `stamp_consistency=unverifiable`. 17. Multi-problem plan → precedence picks connectivity/safety as primary; all reason codes preserved + sorted/deduped. 18. **Identity**: compilation does not change `physical_plan_id` and the ranked selection is unchanged; `contract_id` excludes `resolved_at_compilation` (compile twice → identical `contract_id`, reasons, stamps). 19. **Deterministic reason ordering** under input shuffle. 20. Kill-switch off → all plans `not_compiled`, zero extra reads. 21. Behaviour-neutral: full `tests/featuregen` green; route + live path untouched; a `resolved` tier-1 plan's ingredient-level selection/status unchanged; **considered-set API byte-identical**.
 
-## 13. Task decomposition (for the implementation plan)
-
-- **C1 — contracts + vocabularies + additivity derivation.** All new dataclasses/enums; the derived `AdditivityProfileV1` table (§3) with `authored_override`-ready shape; `PlanResolutionStatus`/`ReasonCode` additions; `PLAN_CONTRACT_VERSION` bump. Pure, unit-tested against the additivity table.
-- **C2 — temporal declaration** (`compile_temporal`) — first in the pipeline; `unresolved_temporal_declaration` / `temporal_anchor_missing`.
-- **C3 — per-hop aggregation declaration + additivity validation** (`compile_aggregation_steps`) — the derivation of §4 per hop, axis-aware via §3, using the temporal result. All aggregation reason codes.
-- **C4 — plan-level composition check** — `aggregation_composition_unsupported`; the avg-of-avg / ratio-of-ratios / snapshot-sum-across-time / inconsistent-across-bridge cases.
-- **C5 — safety staging over every physically-read column** (`stage_safety`) — the wrapper + role tagging + the fold; `safety_rejected` / `safety_evaluation_incomplete`.
-- **C6 — freshness + replay envelope** — compile-time stamps + `unresolved_freshness`; the read-side `ReplayFreshness` helper; the full version set.
-- **C7 — resolution precedence + wire the compile pass into `plan_bindings`** — the §8 precedence, all-reason-code preservation, immutable `resolved_at_compilation`, behaviour-neutral proof, and the 3B.4 hand-off metric shape.
-
-## 14. Mandatory tests (adversarial, DB-backed where needed)
-
-1. Additive measure, single fan-in → `resolved`, hop `sum`, `compatible`.
-2. Non-additive rate, fan-in, no weight → `unresolved_aggregation_declaration` / `aggregation_incompatible_with_additivity`; physical path preserved.
-3. Non-additive rate, `weighted_average` required, weight ingredient missing → `aggregation_weight_missing`; `missing_inputs` recorded.
-4. Semi-additive balance, entity roll-up at a single PIT → `resolved` (`sum`).
-5. Semi-additive balance, aggregated across the time window, no temporal strategy → `semi_additive_temporal_strategy_missing`.
-6. Two-hop path where each hop is individually compatible but composition fails (avg-of-avg) → `aggregation_composition_unsupported`.
-7. Temporal anchor required but unbound → `unresolved_temporal_declaration`.
-8. A join-key / bridge-key column is unsafe → `safety_rejected` (proves safety covers non-ingredient columns).
-9. A column's safety can't be evaluated → `safety_evaluation_incomplete`, not `safe`.
-10. A participating catalog stale at compile → `unresolved_freshness`; stamps recorded.
-11. Multi-problem plan → precedence picks `safety_rejected` as primary; all reason codes preserved.
-12. Replay-time: drift a participating catalog after compile → the immutable record's status is unchanged; `ReplayFreshness.drifted` on read.
-13. Behaviour-neutral: full `tests/featuregen` green; route + live path untouched; a `resolved` tier-1 plan's selection/status unchanged.
-14. Determinism: compile twice → identical declarations, reason codes, stamps, plan_id.
-
-## 15. Phase boundaries (recap)
+## 15. Phase boundaries
 
 ```
 3B.3a  find source-grain ingredient candidates
 3B.3b  build governed physical source→target paths
-3B.3c  prove the selected path is a mathematically, temporally, safely & operationally complete contract  ← this
-3B.4   measure completeness, failure distributions, readiness (consumes physically_resolved_but_contract_unresolved)
-3D     add multi-grain & multi-branch planning; the aggregation/temporal AUTHORING surfaces
+3B.3c  CLASSIFY whether the selected path is a sound/temporal/safe/fresh contract (this) — compute-only, honest-unresolved
+3B.4   PERSIST + measure (durable store, replay-time freshness, physically_resolved_but_contract_unresolved)
+3D+    aggregation/temporal AUTHORING surfaces + bound-instance planning + multi-grain/multi-branch
 ```
