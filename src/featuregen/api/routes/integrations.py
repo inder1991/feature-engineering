@@ -575,12 +575,16 @@ def import_sync(sync_id: str, body: ImportIn, request: Request, response: Respon
     # failure in dependency teardown — which discards this response, header included — still
     # yields a 500 carrying the run id via the app-level Exception handler.
     request.state.ingestion_run_id = run_id
-    # Design #22: the connector's "parse" stage is the pull + translate (there is no file);
-    # every ingest stage is recorded inside ingest_upload; the flush rides terminalize.
+    # Design #22 + depth #13 gap C: the OM pull + translation is its own ``connector_pull`` stage
+    # (the stage the design named for the connector tier); ``parse`` then marks the translated
+    # rows ready, keeping the stage vocabulary shared with the file-upload route. Every ingest
+    # stage is recorded inside ingest_upload; the flush rides terminalize.
     recorder = StageRecorder()
     pull_started = datetime.now(UTC)   # #13 gap A: the pull/translate start, kept for error paths
     try:
         _, translation = _pull(sync, integ)
+        record_stage(recorder, "connector_pull", "succeeded",
+                     detail={"rows": len(translation.rows)}, started_at=pull_started)
         record_stage(recorder, "parse", "succeeded", detail={"rows": len(translation.rows)},
                      started_at=pull_started)
         current_hash = snapshot_hash(translation.rows)
@@ -640,8 +644,13 @@ def import_sync(sync_id: str, body: ImportIn, request: Request, response: Respon
         # the failed attempt's manifest survives. A pull/verify/ingest exception is a FAILED
         # attempt (there is no file to 'reject'). Redaction: record the exception CLASS (of the
         # underlying cause when the HTTPException merely wraps one), never its message.
-        # #22: a pull/verify failure never recorded parse — state honestly where it stopped.
-        if not recorder.has("parse"):
+        # #22 + #13 gap C: a pull failure never recorded connector_pull/parse — state honestly
+        # where it stopped: the PULL failed, so parse (the translation hand-off) never ran.
+        if not recorder.has("connector_pull"):
+            record_stage(recorder, "connector_pull", "failed",
+                         reason_code=f"http_{exc.status_code}", started_at=pull_started)
+            record_stage(recorder, "parse", "not_run", reason_code="skipped_pull_failed")
+        elif not recorder.has("parse"):   # unreachable today (recorded together); belt-and-braces
             record_stage(recorder, "parse", "failed", reason_code=f"http_{exc.status_code}")
         terminalize_run_durable(
             run_id, status="failed", now=datetime.now(UTC),
@@ -656,6 +665,11 @@ def import_sync(sync_id: str, body: ImportIn, request: Request, response: Respon
         # the run id rides the raised exception's headers (review FIX 3), which the app-level
         # Exception handler lifts onto the default 500 response so the caller can link the
         # failure to its run.
+        # #13 gap C: a raw fault during the pull itself still names the stage that died.
+        if not recorder.has("connector_pull"):
+            record_stage(recorder, "connector_pull", "failed",
+                         reason_code="unhandled_exception", started_at=pull_started)
+            record_stage(recorder, "parse", "not_run", reason_code="skipped_pull_failed")
         terminalize_run_durable(
             run_id, status="failed", now=datetime.now(UTC),
             redacted_failure_code=type(exc).__name__,

@@ -47,12 +47,26 @@ def test_record_buffers_in_memory_and_flush_persists(db):
     rec.record("brake", "deferred", reason_code="held")
     assert _rows(db, run_id) == []                    # buffered: nothing written during "ingest"
 
-    assert rec.flush(db, run_id, now=_NOW) == 2
+    assert rec.flush(db, run_id, now=_NOW) == 3       # the buffer + manifest_finalization (#13 C)
     rows = _rows(db, run_id)
     assert [(r[0], r[1], r[2], r[3]) for r in rows] == [
-        ("validation", 1, "partial", None), ("brake", 1, "deferred", "held")]
+        ("validation", 1, "partial", None), ("brake", 1, "deferred", "held"),
+        ("manifest_finalization", 1, "succeeded", None)]
     assert rows[0][4] == {"good": 3, "quarantined": 1}
     assert rows[0][5] is not None                     # a completed_at is always stamped
+
+
+def test_flush_appends_manifest_finalization_as_the_final_stage(db):
+    """#13 gap C: terminalizing a run (the flush rides terminalize) records the finalization
+    itself as the run's FINAL stage — succeeded when the stage batch landed."""
+    run_id = _open_run(db)
+    rec = StageRecorder()
+    rec.record("parse", "succeeded")
+    rec.flush(db, run_id, now=_NOW)
+    rows = _rows(db, run_id)
+    assert rows[-1][0] == "manifest_finalization"
+    assert rows[-1][2] == "succeeded"
+    assert rows[-1][5] == _NOW                        # completed at the terminalize instant
 
 
 def test_record_persists_started_at(db):
@@ -76,7 +90,7 @@ def test_repeated_stage_records_get_increasing_attempts(db):
     rec.record("drift", "lagged", reason_code="projection_lag")
     rec.record("drift", "succeeded")
     rec.flush(db, run_id, now=_NOW)
-    assert [(r[0], r[1], r[2]) for r in _rows(db, run_id)] == [
+    assert [(r[0], r[1], r[2]) for r in _rows(db, run_id) if r[0] == "drift"] == [
         ("drift", 1, "lagged"), ("drift", 2, "succeeded")]
 
 
@@ -154,16 +168,16 @@ def test_flush_failure_is_contained_and_keeps_the_buffer(db):
     assert rec.flush(db, "ingrun_NO_SUCH_RUN", now=_NOW) == 0
     db.execute("SELECT 1")                            # the tx is NOT aborted (savepoint contained it)
     run_id = _open_run(db)
-    assert rec.flush(db, run_id, now=_NOW) == 1       # buffer survived the failed flush
+    assert rec.flush(db, run_id, now=_NOW) == 2       # buffer survived + manifest_finalization
 
 
 def test_double_flush_writes_nothing_new(db):
     run_id = _open_run(db)
     rec = StageRecorder()
     rec.record("validation", "succeeded")
-    assert rec.flush(db, run_id, now=_NOW) == 1
+    assert rec.flush(db, run_id, now=_NOW) == 2       # validation + manifest_finalization
     assert rec.flush(db, run_id, now=_NOW) == 0       # drained: no duplicate rows, no UNIQUE breach
-    assert len(_rows(db, run_id)) == 1
+    assert len(_rows(db, run_id)) == 2
 
 
 def test_record_after_flush_continues_the_attempt_sequence(db):
@@ -173,7 +187,11 @@ def test_record_after_flush_continues_the_attempt_sequence(db):
     rec.flush(db, run_id, now=_NOW)
     rec.record("drift", "succeeded")                  # a later record of the SAME stage
     rec.flush(db, run_id, now=_NOW)
-    assert [(r[1], r[2]) for r in _rows(db, run_id)] == [(1, "lagged"), (2, "succeeded")]
+    assert [(r[1], r[2]) for r in _rows(db, run_id) if r[0] == "drift"] == [
+        (1, "lagged"), (2, "succeeded")]
+    # each flush finalizes once more — the manifest stage's attempts append too (no UNIQUE breach)
+    assert [(r[1], r[2]) for r in _rows(db, run_id) if r[0] == "manifest_finalization"] == [
+        (1, "succeeded"), (2, "succeeded")]
 
 
 def test_flush_durable_falls_back_to_the_given_connection(db):
@@ -183,4 +201,5 @@ def test_flush_durable_falls_back_to_the_given_connection(db):
     rec = StageRecorder()
     rec.record("parse", "failed", reason_code="http_400")
     rec.flush_durable(run_id, now=_NOW, fallback_conn=db)
-    assert [(r[0], r[2]) for r in _rows(db, run_id)] == [("parse", "failed")]
+    assert [(r[0], r[2]) for r in _rows(db, run_id)] == [
+        ("parse", "failed"), ("manifest_finalization", "succeeded")]

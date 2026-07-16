@@ -251,8 +251,10 @@ def test_successful_upload_records_ordered_stage_reports(client):
         "parse", "validation", "brake", "fact_assertion", "drift", "glossary_classification",
         "enrich_concept", "enrich_definition", "enrich_domain", "graph_persistence",
         "governed_joins", "pass_c", "pass_b", "glossary_evidence", "projection_drain",
-        "table_fact_projection", "join_projection", "join_drift", "quarantine"]
+        "table_fact_projection", "join_projection", "join_drift", "quarantine",
+        "manifest_finalization"]
     assert stages["parse"]["state"] == "succeeded"
+    assert stages["manifest_finalization"]["state"] == "succeeded"   # #13 C: terminalize reported
     assert stages["validation"]["state"] == "succeeded"
     assert stages["fact_assertion"]["detail"] == {"asserted": 4}
     assert stages["enrich_concept"]["state"] == "skipped_no_client"
@@ -310,13 +312,15 @@ def test_held_upload_reports_downstream_stages_not_run(client):
 
 def test_parse_failure_reports_a_failed_parse_stage(client):
     """A failed request still gets its stage account (flushed durably beside the failed run):
-    parse failed, nothing after it — the honest 'we never reached ingest'."""
+    parse failed, nothing after it but the finalization record — the honest 'we never reached
+    ingest'."""
     res = client.post("/uploads", data={"source": "gl"},
                       files={"file": ("gl.xlsx", b"not a workbook",
                                       "application/octet-stream")}, headers=AUTH)
     assert res.status_code == 400
     run = _get_run(client, res.headers[RUN_HEADER]).json()
-    assert [(s["stage"], s["state"]) for s in run["stages"]] == [("parse", "failed")]
+    assert [(s["stage"], s["state"]) for s in run["stages"]] == [
+        ("parse", "failed"), ("manifest_finalization", "succeeded")]
     assert run["stages"][0]["reason_code"] == "http_400"
 
 
@@ -324,12 +328,14 @@ def test_unsupported_extension_reports_failed_parse(client):
     res = client.post("/uploads", data={"source": "deposits"},
                       files={"file": ("notes.txt", b"hello", "text/plain")}, headers=AUTH)
     run = _get_run(client, res.headers[RUN_HEADER]).json()
-    assert [(s["stage"], s["state"]) for s in run["stages"]] == [("parse", "failed")]
+    assert [(s["stage"], s["state"]) for s in run["stages"]] == [
+        ("parse", "failed"), ("manifest_finalization", "succeeded")]
 
 
 def test_ingest_fault_still_reports_stages_reached(client, monkeypatch):
     """An ingest-stage fault: the run is failed, and the stages recorded BEFORE the fault (parse)
-    are still flushed on the durable path — a failed run shows how far it got."""
+    are still flushed on the durable path — a failed run shows how far it got. The finalization
+    itself is the terminal stage: EVERY terminalized run carries one (#13 gap C)."""
     from featuregen.api.routes import uploads
 
     def _raise(*args, **kwargs):
@@ -340,7 +346,8 @@ def test_ingest_fault_still_reports_stages_reached(client, monkeypatch):
     assert res.status_code == 500
     run = _get_run(client, res.headers[RUN_HEADER]).json()
     assert run["status"] == "failed"
-    assert [(s["stage"], s["state"]) for s in run["stages"]] == [("parse", "succeeded")]
+    assert [(s["stage"], s["state"]) for s in run["stages"]] == [
+        ("parse", "succeeded"), ("manifest_finalization", "succeeded")]
 
 
 # ── GET /ingestion-runs/{run_id} ──────────────────────────────────────────────────────────────────

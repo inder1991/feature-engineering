@@ -714,6 +714,50 @@ def test_failed_pull_still_records_a_failed_run_with_no_import_row(client, conn,
     assert conn.execute("SELECT count(*) FROM integration_import").fetchone()[0] == 0
 
 
+def test_import_records_connector_pull_stage_and_manifest_finalization(client):
+    """#13 gap C: a connector import's run reports ``connector_pull`` (the OM pull + translation)
+    as its FIRST stage and ``manifest_finalization`` as its LAST — the connector-specific stages
+    the design named, riding the same run surface."""
+    _, sid = _configured_sync(client)
+    pv = _preview(client, sid).json()
+    res = _import(client, sid, pv["snapshot_hash"], pv["local_baseline_hash"])
+    assert res.status_code == 200
+    run = _get_run(client, res.headers[RUN_HEADER]).json()
+    names = [s["stage"] for s in run["stages"]]
+    assert names[:2] == ["connector_pull", "parse"]
+    assert names[-1] == "manifest_finalization"
+    stages = {s["stage"]: s for s in run["stages"]}
+    assert stages["connector_pull"]["state"] == "succeeded"
+    assert stages["connector_pull"]["started_at"] is not None
+    assert stages["manifest_finalization"]["state"] == "succeeded"
+
+
+def test_failed_pull_records_failed_connector_pull_stage(client, monkeypatch):
+    """#13 gap C: an unreachable OM records ``connector_pull: failed`` (and parse honestly
+    ``not_run`` — nothing was translated), with the finalization stage still recorded on the
+    durable path."""
+    from featuregen.api.routes import integrations as routes
+    from featuregen.connectors.openmetadata import OMUnreachable
+
+    _, sid = _configured_sync(client)
+
+    def unreachable(base_url, token):
+        def fetch(path, params):
+            raise OMUnreachable("OpenMetadata unreachable: connect timeout")
+        return fetch
+
+    monkeypatch.setattr(routes, "_build_fetch", unreachable)
+    res = _import(client, sid, "deadbeef")
+    assert res.status_code == 502
+    run = _get_run(client, res.headers[RUN_HEADER]).json()
+    stages = {s["stage"]: s for s in run["stages"]}
+    assert stages["connector_pull"]["state"] == "failed"
+    assert stages["connector_pull"]["reason_code"] == "http_502"
+    assert stages["parse"]["state"] == "not_run"
+    assert stages["parse"]["reason_code"] == "skipped_pull_failed"
+    assert stages["manifest_finalization"]["state"] == "succeeded"
+
+
 def test_snapshot_mismatch_409_records_failed_run(client, monkeypatch):
     from featuregen.api.routes import integrations as routes
 

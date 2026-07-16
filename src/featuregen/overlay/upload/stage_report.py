@@ -111,14 +111,21 @@ class StageRecorder:
 
     def flush(self, conn, ingestion_run_id: str, *, now: datetime) -> int:
         """Write the buffered reports to ``ingestion_run_stage`` and drain the buffer; returns the
-        number written. DEFENSIVE + savepointed: a flush fault (FK, constraint, connection) is
-        warned and contained — it neither raises nor poisons the caller's transaction, and the
-        buffer is KEPT so a later durable flush can still land the stages."""
+        number written. The flush rides terminalize, so it appends the run's FINAL stage itself —
+        ``manifest_finalization: succeeded`` (#13 gap C) — atomically with the batch: either the
+        whole account lands finalized, or nothing does. DEFENSIVE + savepointed: a flush fault
+        (FK, constraint, connection) is warned and contained — it neither raises nor poisons the
+        caller's transaction, and the buffer is KEPT so a later durable flush can still land the
+        stages."""
         if not self._reports:
             return 0
+        final_attempt = self._attempts.get("manifest_finalization", 0) + 1
+        reports = [*self._reports, StageReport(
+            stage="manifest_finalization", state="succeeded", started_at=now,
+            completed_at=now, attempt=final_attempt)]
         try:
             with conn.transaction():   # savepoint: a fault must not abort the ingest tx
-                for r in self._reports:
+                for r in reports:
                     conn.execute(
                         "INSERT INTO ingestion_run_stage (ingestion_run_id, stage, attempt, "
                         "state, started_at, completed_at, reason_code, detail) "
@@ -130,9 +137,11 @@ class StageRecorder:
             logger.warning("stage-report flush failed for ingestion run %s — the run itself is "
                            "unaffected", ingestion_run_id, exc_info=True)
             return 0
-        flushed = len(self._reports)
+        # The finalization attempt advances only when it actually WROTE, so a contained failure
+        # followed by a later (durable) flush re-uses the number the failed batch never landed.
+        self._attempts["manifest_finalization"] = final_attempt
         self._reports.clear()
-        return flushed
+        return len(reports)
 
     def flush_durable(self, ingestion_run_id: str, *, now: datetime, fallback_conn=None) -> None:
         """``flush`` on a FRESH independent connection — the route's exception path, where the
