@@ -196,7 +196,7 @@ def _write_concept_evidence(conn, *, resolved: dict[str, str], by_hash: dict[str
                             meta_by_hash: dict[str, dict],
                             rec_by_tc: dict[tuple[str, str], GlossaryRecord],
                             bindings: dict[str, ObjectBinding] | None,
-                            source_snapshot_id: str) -> None:
+                            source_snapshot_id: str) -> int:
     """Write one ``field_evidence`` proposal per glossary column classified THIS run (spec §5.1),
     ROUTED THROUGH producer-scoped staleness + snapshot reuse (whole-branch review Important-2 — the
     LLM producer must not bypass the machinery every other producer goes through).
@@ -212,7 +212,11 @@ def _write_concept_evidence(conn, *, resolved: dict[str, str], by_hash: dict[str
     re-upload supersedes the old row instead of accumulating a second live one -> no resolver
     ``_CONFLICT`` NULLing the concept); an UNCHANGED input (same ``input_hash`` already ACTIVE) is REUSED,
     not re-written. NEVER touches another producer's rows. Fail-soft + txn-safe: each item is savepointed
-    so a single failure logs and is contained, never aborting enrichment or poisoning the caller's txn."""
+    so a single failure logs and is contained, never aborting enrichment or poisoning the caller's txn.
+
+    Returns the number of CONTAINED per-item write failures so the caller's stage report (#22) can
+    say ``partial`` — the swallowed except below must never be laundered into an outer success."""
+    failures = 0
     for h, concept in resolved.items():
         if concept == UNCLASSIFIED or not is_known_concept(concept):
             continue   # C3: unclassified / invalid is not a proposal
@@ -245,14 +249,17 @@ def _write_concept_evidence(conn, *, resolved: dict[str, str], by_hash: dict[str
                         producer_item_ref=h, producer_configuration_hash=_vocab_fingerprint(),
                         source_snapshot_id=source_snapshot_id, input_hash=input_hash)
         except Exception:  # noqa: BLE001 — advisory: an evidence-write failure never aborts enrichment
+            failures += 1
             logger.warning("advisory concept field_evidence write failed for %s", rec.logical_ref,
                            exc_info=True)
+    return failures
 
 
 def enrich_concepts(conn, rows: list[CanonicalRow], client: LLMClient, actor=None, *,
                     glossary: GlossaryUpload | None = None,
                     bindings: dict[str, ObjectBinding] | None = None,
-                    source_snapshot_id: str | None = None) -> dict[str, str]:
+                    source_snapshot_id: str | None = None,
+                    stats: dict | None = None) -> dict[str, str]:
     """Classify each column into a controlled concept; returns {content_hash: concept} (unchanged).
 
     Glossary carry-forward (guarded — non-glossary uploads are UNCHANGED): when ``glossary`` is given,
@@ -261,7 +268,11 @@ def enrich_concepts(conn, rows: list[CanonicalRow], client: LLMClient, actor=Non
     — each newly-classified attachable glossary column writes an item-level ``concept``
     ``field_evidence`` proposal through producer-scoped staleness (see ``_write_concept_evidence``).
     ``source_snapshot_id`` is required to write evidence (a NOT-NULL column); absent it, enrichment
-    still runs and returns concepts, just without the evidence side-effect."""
+    still runs and returns concepts, just without the evidence side-effect.
+
+    ``stats`` (#22, optional out-param — the return shape is unchanged): when given, receives
+    ``evidence_write_failures``, the count of per-item evidence-write failures the stage CONTAINED
+    internally, so the caller's stage report can say ``partial`` instead of a laundered success."""
     by_hash: dict[str, CanonicalRow] = {content_hash(r): r for r in rows}
     result = _cache_get(conn, "enrichment_concept", list(by_hash), _CONCEPT_CACHE_VERSION)
     rec_by_tc = _records_by_tc(glossary) if glossary is not None else {}
@@ -310,9 +321,11 @@ def enrich_concepts(conn, rows: list[CanonicalRow], client: LLMClient, actor=Non
 
     # Item-level LLM concept evidence (glossary only) — written in BOTH modes now (Important-2).
     if glossary is not None and source_snapshot_id is not None:
-        _write_concept_evidence(
+        failures = _write_concept_evidence(
             conn, resolved=resolved, by_hash=by_hash, meta_by_hash=meta_by_hash,
             rec_by_tc=rec_by_tc, bindings=bindings, source_snapshot_id=source_snapshot_id)
+        if stats is not None:
+            stats["evidence_write_failures"] = failures
     return result
 
 
