@@ -44,6 +44,7 @@ from featuregen.overlay.upload.graph import (
     governed_joins_enabled,
     parse_join_ref,
 )
+from featuregen.overlay.upload.ingestion_run import record_run_facts, record_run_objects
 from featuregen.overlay.upload.join_drift import detect_governed_join_divergences
 from featuregen.overlay.upload.object_ref import _norm, normalize_ref, parse_ref
 from featuregen.overlay.upload.passc.projection import (
@@ -188,11 +189,18 @@ def _table_facts(rows: list[CanonicalRow]):
 
 
 def _assert_fact(conn, source: str, table: str, fact_type: str, value: dict, *, actor,
-                 origin_type: str = "upload") -> bool:
+                 origin_type: str = "upload") -> str | None:
     """Assert a fact, or RE-assert it when the upload changed its value or it is not currently
     VERIFIED. Skipping only-on-existence (the original bug) served a stale value forever (B1) and
     left a staled fact stuck unservable after the file was fixed (M1). We diff on the value: skip
     only when the stream is already VERIFIED with the identical value.
+
+    Returns the assertion OUTCOME (run-provenance, design #3): ``None`` — skipped, the stream is
+    already VERIFIED with the identical value; ``"asserted"`` — a first assertion, or a same-value
+    re-assert of a non-VERIFIED stream (M1's staled-then-fixed fact: the CONTENT didn't change);
+    ``"changed"`` — the value genuinely differs from the stream's last known value (the folded
+    current value, or the prior_value a STALED/EXPIRED fold retired it to). Truthy exactly when
+    the original bool was True, so `if _assert_fact(...)` call sites keep their behavior.
 
     #10 honest authority: the auto-confirm records `authority_basis=source_declared` + the ingest
     `origin_type` ("upload" | "connector" | "resolution") + the actor's REAL role_claims. It never
@@ -201,10 +209,14 @@ def _assert_fact(conn, source: str, table: str, fact_type: str, value: dict, *, 
     fact folds/projects VERIFIED exactly as before."""
     fk = fact_key(table_ref(source, table), fact_type)
     stream = load_fact(conn, fk)
+    outcome = "asserted"
     if stream:
         state = fold_overlay_state(stream)
         if state.status == "VERIFIED" and state.value == value:
-            return False   # genuinely unchanged -> skip (cheap re-upload)
+            return None    # genuinely unchanged -> skip (cheap re-upload)
+        prior = state.value if state.value is not None else state.prior_value
+        if prior is not None and prior != value:
+            outcome = "changed"
     # New fact, a changed value, or a non-VERIFIED (STALE/REVERIFY/REJECTED) stream -> (re)assert.
     base = stream[-1].stream_version if stream else 0
     draft = append_overlay_event(conn, fact_key=fk, type=facts.OVERLAY_FACT_PROPOSED,
@@ -219,7 +231,7 @@ def _assert_fact(conn, source: str, table: str, fact_type: str, value: dict, *, 
             "value": value, "authority_basis": facts.AUTHORITY_SOURCE_DECLARED,
             "origin_type": origin_type, "role_claims": list(actor.role_claims),
             "expires_at": None, "confirms_event_id": draft.event_id})
-    return True
+    return outcome
 
 
 def _propose_governed_joins(conn, rows: list[CanonicalRow], *, actor) -> None:
@@ -795,10 +807,17 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
                   profile: SourceCapabilityProfile | None = None,
                   glossary: GlossaryUpload | None = None,
                   stage_recorder: StageRecorder | None = None,
-                  origin_type: str = "upload") -> IngestResult:
+                  origin_type: str = "upload",
+                  ingestion_run_id: str | None = None) -> IngestResult:
     # `origin_type` (#10): how this ingest entered the system — "upload" (default; the /uploads
     # route) or "connector" (the integrations sync route) — stamped as the source-declared
     # authority origin on every auto-confirmed fact. Matches the ingestion_run origin_type.
+    # `ingestion_run_id` (design #3, the deferred provenance piece): the durable run the calling
+    # route opened via `open_run` BEFORE this call. When set, the run's observed objects (every
+    # table/column ref this upload builds), changed objects (the drift diff's drop/type_change/
+    # rename refs) and asserted/changed facts are recorded as ingestion_run_object /
+    # ingestion_run_fact associations — batched, fail-soft, on THIS connection (atomic with the
+    # ingest). `None` (every direct caller) records NOTHING: byte-for-byte unchanged.
     # `stage_recorder` (#22) BUFFERS an honest per-stage outcome as each stage runs — it never
     # writes during ingest (the route flushes it alongside terminalize), never touches the return
     # value, and `None` (every direct caller / flag-off) is a no-op: byte-for-byte unchanged.
@@ -905,10 +924,20 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
 
     stage_started = datetime.now(UTC)
     asserted = 0
+    # Run-provenance collection (design #3): the fact keys this run (re)asserted, and the subset
+    # whose VALUE genuinely changed. Collected regardless of flag so the loop stays one shape;
+    # recorded (below, after the drift diff) ONLY when the route threaded an ingestion_run_id.
+    asserted_fact_keys: list[str] = []
+    changed_fact_keys: list[str] = []
     for table, fact_type, value in _table_facts(vr.good):
-        if _assert_fact(conn, catalog_source, table, fact_type, value, actor=actor,
-                        origin_type=origin_type):
+        outcome = _assert_fact(conn, catalog_source, table, fact_type, value, actor=actor,
+                               origin_type=origin_type)
+        if outcome:
             asserted += 1
+            fk = fact_key(table_ref(catalog_source, table), fact_type)
+            asserted_fact_keys.append(fk)
+            if outcome == "changed":
+                changed_fact_keys.append(fk)
     record_stage(stage_recorder, "fact_assertion", "succeeded", detail={"asserted": asserted},
                  started_at=stage_started)
 
@@ -941,6 +970,24 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
     else:
         record_stage(stage_recorder, "drift", "succeeded",
                      detail={"changed_objects": changed_objects}, started_at=stage_started)
+
+    if ingestion_run_id is not None:
+        # Run provenance (design #3, deferred piece): durable run↔object / run↔fact associations on
+        # THIS connection, so they commit atomically with the ingest they describe. `observed` =
+        # every table/column ref this upload builds (`upload.fingerprint()` — the exact refs
+        # build_graph and the drift diff key on); `changed` objects = the drift diff's retiring
+        # kinds (under drift_lagged `changes` is empty — deferred drift records no provenance
+        # either, honestly). The recorders are fail-soft internally (own savepoint + log +
+        # counter): a provenance failure can NEVER abort the ingest. `None` (direct callers)
+        # records nothing — flag-off byte-for-byte.
+        prov_at = now or datetime.now(UTC)
+        record_run_objects(conn, ingestion_run_id, catalog_source,
+                           upload.fingerprint().keys(), "observed", prov_at)
+        record_run_objects(conn, ingestion_run_id, catalog_source,
+                           [c.object_ref for c in changes
+                            if c.kind in ("drop", "type_change", "rename")], "changed", prov_at)
+        record_run_facts(conn, ingestion_run_id, asserted_fact_keys, "asserted", prov_at)
+        record_run_facts(conn, ingestion_run_id, changed_fact_keys, "changed", prov_at)
 
     # ── Glossary path (GUARDED): a glossary upload passes its semantic sidecar; a non-glossary upload
     # (glossary=None) skips ALL of the below and is byte-for-byte unchanged. The ingestion-run id is

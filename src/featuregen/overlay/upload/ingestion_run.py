@@ -41,6 +41,7 @@ from psycopg.types.json import Jsonb
 from featuregen.aggregates.ids import mint_id
 from featuregen.config import get_settings
 from featuregen.contracts.envelopes import IdentityEnvelope
+from featuregen.runtime.observability import counters
 
 logger = logging.getLogger(__name__)
 
@@ -250,6 +251,49 @@ def reconcile_ingestion_runs(conn, *, now: datetime, lease_timeout: timedelta) -
                            reason_code="lease_expired"):
             swept += 1
     return swept
+
+
+def record_run_objects(conn, run_id: str, catalog_source: str, refs, relation: str,
+                       now: datetime) -> None:
+    """Associate a run with the catalog objects it ``observed`` (saw in the upload) or ``changed``
+    (its drift diff retired: drop/type_change/rename) — the design-#3 provenance piece the manifest
+    counts couldn't answer ("WHICH run touched this object"). Batched INSERT … ON CONFLICT DO
+    NOTHING on the GIVEN connection, so the associations commit atomically with the ingest they
+    describe. FAIL-SOFT by contract: any failure is contained in its own savepoint, logged and
+    counted — provenance is a read model and must NEVER abort an ingest. Keys on the dedicated
+    ``ingestion_run_id`` column, never the reserved overlay-event ``run_id`` (which must stay NULL
+    on fact events)."""
+    rows = [(run_id, catalog_source, ref, relation, now) for ref in sorted(set(refs))]
+    if not rows:
+        return
+    try:
+        with conn.transaction():
+            conn.cursor().executemany(
+                "INSERT INTO ingestion_run_object (ingestion_run_id, catalog_source, object_ref, "
+                "relation, at) VALUES (%s, %s, %s, %s, %s) ON CONFLICT DO NOTHING", rows)
+    except Exception:  # noqa: BLE001 — advisory read model: never fails the ingest it describes
+        counters.incr("overlay.run_provenance.object_write_failed")
+        logger.warning("run-provenance object write failed for run %s (%s, %d refs) — ingest "
+                       "unaffected", run_id, relation, len(rows), exc_info=True)
+
+
+def record_run_facts(conn, run_id: str, fact_keys, relation: str, now: datetime) -> None:
+    """Associate a run with the overlay facts it ``asserted`` ((re)asserted this run) or
+    ``changed`` (the assertion changed the fact's value). Same contract as
+    :func:`record_run_objects`: batched, idempotent (ON CONFLICT DO NOTHING), atomic with the
+    ingest transaction, and fail-soft in its own savepoint."""
+    rows = [(run_id, fk, relation, now) for fk in sorted(set(fact_keys))]
+    if not rows:
+        return
+    try:
+        with conn.transaction():
+            conn.cursor().executemany(
+                "INSERT INTO ingestion_run_fact (ingestion_run_id, fact_key, relation, at) "
+                "VALUES (%s, %s, %s, %s) ON CONFLICT DO NOTHING", rows)
+    except Exception:  # noqa: BLE001 — advisory read model: never fails the ingest it describes
+        counters.incr("overlay.run_provenance.fact_write_failed")
+        logger.warning("run-provenance fact write failed for run %s (%s, %d keys) — ingest "
+                       "unaffected", run_id, relation, len(rows), exc_info=True)
 
 
 def get_run(conn, run_id: str) -> dict | None:

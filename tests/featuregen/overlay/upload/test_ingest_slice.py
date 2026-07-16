@@ -289,3 +289,156 @@ def test_domain_failure_does_not_discard_concepts(db, monkeypatch):
     now = datetime(2026, 7, 5, tzinfo=UTC)
     ing.ingest_upload(db, "deposits", rows, actor=_actor(), now=now, client=client)
     assert captured["concepts"] and captured["domains"] is None   # concepts survived; only domains lost
+
+
+# ── Run provenance (design #3, deferred piece): durable run↔object / run↔fact associations. ──
+# `ingestion_run_id` is OPTIONAL: the routes pass the id they opened; a direct caller passing
+# nothing (every test above) records NOTHING and behaves byte-for-byte as before.
+
+
+def _open_run(db, run_id: str, source: str = "deposits") -> str:
+    db.execute(
+        "INSERT INTO ingestion_run (id, origin_type, catalog_source, actor_subject, status, "
+        "started_at, heartbeat_at) VALUES (%s, 'upload', %s, 'user:tester', 'in_progress', "
+        "now(), now())", (run_id, source))
+    return run_id
+
+
+def _run_objects(db, run_id: str) -> set[tuple[str, str]]:
+    return {(ref, rel) for ref, rel in db.execute(
+        "SELECT object_ref, relation FROM ingestion_run_object WHERE ingestion_run_id = %s",
+        (run_id,)).fetchall()}
+
+
+def _run_facts(db, run_id: str) -> set[tuple[str, str]]:
+    return {(fk, rel) for fk, rel in db.execute(
+        "SELECT fact_key, relation FROM ingestion_run_fact WHERE ingestion_run_id = %s",
+        (run_id,)).fetchall()}
+
+
+def test_run_provenance_records_observed_objects_and_asserted_facts(db):
+    from featuregen.overlay.identity import fact_key
+    _seal_config()
+    now = datetime(2026, 7, 5, tzinfo=UTC)
+    source = "deposits"
+    rows = [
+        CanonicalRow(source, "accounts", "id", "integer", is_grain=True),
+        CanonicalRow(source, "accounts", "posted_at", "timestamp", as_of=True),
+        CanonicalRow(source, "accounts", "balance", "numeric"),
+    ]
+    run = _open_run(db, "ingrun_prov1")
+    res = ingest_upload(db, source, rows, actor=_actor(), now=now, ingestion_run_id=run)
+    assert res.status == "ingested"
+
+    objs = _run_objects(db, run)
+    # every table + column ref this upload built — the same refs build_graph/the drift diff key on
+    assert {("public.accounts", "observed"), ("public.accounts.id", "observed"),
+            ("public.accounts.posted_at", "observed"),
+            ("public.accounts.balance", "observed")} <= objs
+    assert not {o for o in objs if o[1] == "changed"}   # a first upload only ADDS — nothing retired
+
+    facts_ = _run_facts(db, run)
+    grain_key = fact_key(table_ref(source, "accounts"), "grain")
+    avail_key = fact_key(table_ref(source, "accounts"), "availability_time")
+    assert (grain_key, "asserted") in facts_
+    assert (avail_key, "asserted") in facts_
+    # a FIRST assertion changed no pre-existing value — 'changed' marks modification, not creation
+    assert not {f for f in facts_ if f[1] == "changed"}
+
+
+def test_run_provenance_retype_marks_only_the_retyped_column_changed(db):
+    _seal_config()
+    now = datetime(2026, 7, 5, tzinfo=UTC)
+    source = "deposits"
+    rows1 = [
+        CanonicalRow(source, "accounts", "id", "integer", is_grain=True),
+        CanonicalRow(source, "accounts", "balance", "numeric"),
+    ]
+    run1 = _open_run(db, "ingrun_prov_r1")
+    assert ingest_upload(db, source, rows1, actor=_actor(), now=now,
+                         ingestion_run_id=run1).status == "ingested"
+
+    rows2 = [
+        CanonicalRow(source, "accounts", "id", "integer", is_grain=True),
+        CanonicalRow(source, "accounts", "balance", "text"),   # numeric -> text
+    ]
+    run2 = _open_run(db, "ingrun_prov_r2")
+    res2 = ingest_upload(db, source, rows2, actor=_actor(), now=now, ingestion_run_id=run2)
+    assert res2.status == "ingested"
+    assert res2.changed_objects == 1
+
+    objs2 = _run_objects(db, run2)
+    assert ("public.accounts.balance", "changed") in objs2       # the retyped column — THIS run
+    assert ("public.accounts.balance", "observed") in objs2      # changed AND observed coexist
+    assert ("public.accounts.id", "changed") not in objs2        # the unchanged column is not
+    assert ("public.accounts", "changed") not in objs2
+    assert not _run_objects(db, run1) & {("public.accounts.balance", "changed")}  # not run 1's doing
+
+
+def test_run_provenance_idempotent_reupload_observed_but_nothing_changed(db):
+    _seal_config()
+    now = datetime(2026, 7, 5, tzinfo=UTC)
+    source = "deposits"
+    rows = [
+        CanonicalRow(source, "accounts", "id", "integer", is_grain=True),
+        CanonicalRow(source, "accounts", "balance", "numeric"),
+    ]
+    run1 = _open_run(db, "ingrun_prov_i1")
+    assert ingest_upload(db, source, rows, actor=_actor(), now=now,
+                         ingestion_run_id=run1).status == "ingested"
+
+    run2 = _open_run(db, "ingrun_prov_i2")
+    res2 = ingest_upload(db, source, rows, actor=_actor(), now=now, ingestion_run_id=run2)
+    assert res2.status == "ingested"
+    assert res2.asserted == 0                                     # VERIFIED same-value -> no-op
+
+    objs2 = _run_objects(db, run2)
+    assert ("public.accounts.id", "observed") in objs2            # the run still SAW everything
+    assert not {o for o in objs2 if o[1] == "changed"}            # ...but changed nothing
+    assert _run_facts(db, run2) == set()                          # and (re)asserted no fact
+
+
+def test_run_provenance_fact_value_change_marks_the_fact_changed(db):
+    from featuregen.overlay.identity import fact_key
+    _seal_config()
+    now = datetime(2026, 7, 5, tzinfo=UTC)
+    source = "deposits"
+    rows1 = [
+        CanonicalRow(source, "accounts", "id", "integer", is_grain=True),
+        CanonicalRow(source, "accounts", "posted_at", "timestamp", as_of=True),
+        CanonicalRow(source, "accounts", "ingested_at", "timestamp"),
+    ]
+    run1 = _open_run(db, "ingrun_prov_f1")
+    assert ingest_upload(db, source, rows1, actor=_actor(), now=now,
+                         ingestion_run_id=run1).status == "ingested"
+
+    rows2 = [   # the availability basis MOVES: posted_at -> ingested_at (both columns survive)
+        CanonicalRow(source, "accounts", "id", "integer", is_grain=True),
+        CanonicalRow(source, "accounts", "posted_at", "timestamp"),
+        CanonicalRow(source, "accounts", "ingested_at", "timestamp", as_of=True),
+    ]
+    run2 = _open_run(db, "ingrun_prov_f2")
+    res2 = ingest_upload(db, source, rows2, actor=_actor(), now=now, ingestion_run_id=run2)
+    assert res2.status == "ingested"
+
+    facts2 = _run_facts(db, run2)
+    avail_key = fact_key(table_ref(source, "accounts"), "availability_time")
+    grain_key = fact_key(table_ref(source, "accounts"), "grain")
+    assert (avail_key, "asserted") in facts2                      # the run re-asserted it...
+    assert (avail_key, "changed") in facts2                       # ...with a genuinely new value
+    assert (grain_key, "changed") not in facts2                   # the unchanged fact is untouched
+    assert (grain_key, "asserted") not in facts2
+
+
+def test_run_provenance_off_records_nothing_and_result_is_unchanged(db):
+    _seal_config()
+    now = datetime(2026, 7, 5, tzinfo=UTC)
+    rows = [
+        CanonicalRow("deposits", "accounts", "id", "integer", is_grain=True),
+        CanonicalRow("deposits", "accounts", "balance", "numeric"),
+    ]
+    res = ingest_upload(db, "deposits", rows, actor=_actor(), now=now)   # no ingestion_run_id
+    assert res.status == "ingested"
+    assert res.asserted == 1
+    assert db.execute("SELECT count(*) FROM ingestion_run_object").fetchone()[0] == 0
+    assert db.execute("SELECT count(*) FROM ingestion_run_fact").fetchone()[0] == 0
