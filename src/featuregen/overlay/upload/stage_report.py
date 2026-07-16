@@ -76,10 +76,13 @@ class StageRecorder:
         return stage in self._attempts
 
     def record(self, stage: str, state: str, *, reason_code: str | None = None,
-               detail: dict | None = None) -> None:
+               detail: dict | None = None, started_at: datetime | None = None) -> None:
         """Buffer one stage outcome. Raises on a state outside the taxonomy (the 0996 CHECK would
         reject it at flush time anyway — failing loud HERE keeps call sites honest; ingest call
-        sites go through ``record_stage``, which contains the raise)."""
+        sites go through ``record_stage``, which contains the raise). ``started_at`` is the
+        instant the stage BEGAN (depth review #13 gap A) — call sites capture it before the stage
+        runs; a marker record (disabled / not_applicable / skipped / not_run) never started and
+        leaves it None."""
         if state not in STAGE_STATES:
             raise ValueError(f"{state!r} is not a stage state "
                              f"(expected one of {sorted(STAGE_STATES)})")
@@ -87,7 +90,7 @@ class StageRecorder:
         self._attempts[stage] = attempt
         self._reports.append(StageReport(
             stage=stage, state=state, reason_code=reason_code, detail=detail,
-            completed_at=datetime.now(UTC), attempt=attempt))
+            started_at=started_at, completed_at=datetime.now(UTC), attempt=attempt))
 
     def flush(self, conn, ingestion_run_id: str, *, now: datetime) -> int:
         """Write the buffered reports to ``ingestion_run_stage`` and drain the buffer; returns the
@@ -135,14 +138,16 @@ class StageRecorder:
 
 
 def record_stage(recorder: StageRecorder | None, stage: str, state: str, *,
-                 reason_code: str | None = None, detail: dict | None = None) -> None:
+                 reason_code: str | None = None, detail: dict | None = None,
+                 started_at: datetime | None = None) -> None:
     """The ingest-side seam: record a stage outcome on an OPTIONAL recorder. ``None`` is a no-op
     (direct callers / flag-off byte-for-byte), and ANY recorder failure is warned and swallowed —
     status reporting can never fail (or even perturb) the ingest it describes."""
     if recorder is None:
         return
     try:
-        recorder.record(stage, state, reason_code=reason_code, detail=detail)
+        recorder.record(stage, state, reason_code=reason_code, detail=detail,
+                        started_at=started_at)
     except Exception:  # noqa: BLE001 — defensive by contract (design #22)
         logger.warning("stage-report record failed for stage %r (state %r) — ingest unaffected",
                        stage, state, exc_info=True)

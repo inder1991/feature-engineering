@@ -122,7 +122,8 @@ def create_upload(
     # Design #22: buffer an honest per-stage account (parse here; every ingest stage inside
     # ingest_upload) and flush it ALONGSIDE terminalize — never mid-request, never into the body.
     recorder = StageRecorder()
-    file_sha256: str | None = None              # stays NULL when the capped read rejects the file
+    parse_started = datetime.now(UTC)           # #13 gap A: parse's start instant, kept for the
+    file_sha256: str | None = None              # error paths too. Stays before the capped read.
     failure_status = "rejected"                 # pre-ingest failure = the FILE was rejected...
     try:
         data = _read_capped(file)
@@ -133,7 +134,8 @@ def create_upload(
             raise
         except Exception as exc:   # a malformed file is a client error, not a 500
             raise HTTPException(status_code=400, detail=f"could not parse upload: {exc}") from exc
-        record_stage(recorder, "parse", "succeeded", detail={"rows": len(rows)})
+        record_stage(recorder, "parse", "succeeded", detail={"rows": len(rows)},
+                     started_at=parse_started)
         pre_fingerprint, fingerprint_algo = source_fingerprint(conn, source)
         failure_status = "failed"               # ...an ingest-stage fault = the ATTEMPT failed
         # client=None (no provider configured) -> enrichment is skipped; a configured client runs
@@ -195,7 +197,8 @@ def create_upload(
         # #22: a pre-ingest failure (oversize / unsupported / unparseable) never recorded parse,
         # so the run's stage account states honestly where it stopped.
         if not recorder.has("parse"):
-            record_stage(recorder, "parse", "failed", reason_code=f"http_{exc.status_code}")
+            record_stage(recorder, "parse", "failed", reason_code=f"http_{exc.status_code}",
+                         started_at=parse_started)
         terminalize_run_durable(
             run_id, status=failure_status, now=datetime.now(UTC), file_sha256=file_sha256,
             redacted_failure_code=type(exc.__cause__ or exc).__name__,

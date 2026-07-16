@@ -578,9 +578,11 @@ def import_sync(sync_id: str, body: ImportIn, request: Request, response: Respon
     # Design #22: the connector's "parse" stage is the pull + translate (there is no file);
     # every ingest stage is recorded inside ingest_upload; the flush rides terminalize.
     recorder = StageRecorder()
+    pull_started = datetime.now(UTC)   # #13 gap A: the pull/translate start, kept for error paths
     try:
         _, translation = _pull(sync, integ)
-        record_stage(recorder, "parse", "succeeded", detail={"rows": len(translation.rows)})
+        record_stage(recorder, "parse", "succeeded", detail={"rows": len(translation.rows)},
+                     started_at=pull_started)
         current_hash = snapshot_hash(translation.rows)
         if current_hash != body.snapshot_hash:
             raise HTTPException(

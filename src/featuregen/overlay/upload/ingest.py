@@ -803,6 +803,10 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
     # it — otherwise the `unknown`-type rows would all quarantine and no evidence could attach.
     if glossary is not None and profile is None:
         profile = FTR_GLOSSARY_PROFILE
+    # #13 gap A: each stage's record carries the instant it BEGAN. `stage_started` is re-captured
+    # immediately before every stage that actually runs; marker records (disabled/not_applicable/
+    # skipped_no_client/not_run) never started and pass none.
+    stage_started = datetime.now(UTC)
     vr = validate_rows(rows, catalog_source, profile=profile)
     if glossary is not None and glossary.quarantined:
         # #9 — merge the READER-level quarantine (multi-schema fold collisions: the schema is dropped
@@ -819,37 +823,41 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
                               structural_error=vr.structural_error if rows else None)
     if vr.structural_error:
         record_stage(stage_recorder, "validation", "failed", reason_code="structural_error",
-                     detail={"quarantined": len(vr.quarantined)})
+                     detail={"quarantined": len(vr.quarantined)}, started_at=stage_started)
         # #33 consistency: a structural rejection WITH quarantine content (a glossary whose reader
         # quarantined rows was merged above) surfaces it like the held/all-quarantined paths below;
         # with none it leaves the prior queue untouched (nothing ingested, nothing new to review).
         if vr.quarantined:
+            stage_started = datetime.now(UTC)
             persist_quarantine(conn, catalog_source, vr.quarantined)
             record_stage(stage_recorder, "quarantine", "succeeded",
-                         detail={"rows": len(vr.quarantined)})
+                         detail={"rows": len(vr.quarantined)}, started_at=stage_started)
         return IngestResult("rejected", vr.structural_error, 0, 0, len(vr.quarantined))
     # ANY quarantined row makes validation `partial`, not `succeeded` — per-row failures are the
     # stage's own outcome even though the upload proceeds on the good rows (#22).
     record_stage(stage_recorder, "validation", "partial" if vr.quarantined else "succeeded",
-                 detail={"good": len(vr.good), "quarantined": len(vr.quarantined)})
+                 detail={"good": len(vr.good), "quarantined": len(vr.quarantined)},
+                 started_at=stage_started)
 
     upload = UploadCatalog(catalog_source, vr.good)
+    stage_started = datetime.now(UTC)
     brake = large_change_brake(conn, catalog_source, upload)
     if brake.held:
         record_stage(stage_recorder, "brake", "deferred", reason_code="held",
-                     detail={"reason": brake.reason})
+                     detail={"reason": brake.reason}, started_at=stage_started)
         # persist the quarantine even when held, so a reviewer can see WHY this upload's rows failed
         # (was: returned before persist_quarantine -> the queue still showed the previous upload).
         # ONLY when non-empty (#33): a held upload did NOT ingest — the catalog still reflects the
         # prior upload — so a held-but-clean upload must not wipe the queue a reviewer is working
         # through (persist_quarantine's whole-source refresh deletes everything first).
         if vr.quarantined:
+            stage_started = datetime.now(UTC)
             persist_quarantine(conn, catalog_source, vr.quarantined)
             record_stage(stage_recorder, "quarantine", "succeeded",
-                         detail={"rows": len(vr.quarantined)})
+                         detail={"rows": len(vr.quarantined)}, started_at=stage_started)
         logger.warning("upload of %r held by the large-change brake: %s", catalog_source, brake.reason)
         return IngestResult("held", brake.reason, 0, 0, len(vr.quarantined))
-    record_stage(stage_recorder, "brake", "succeeded")
+    record_stage(stage_recorder, "brake", "succeeded", started_at=stage_started)
 
     if not vr.good and vr.quarantined:
         # Every row quarantined -> nothing usable (a CSV whose headers never mapped to
@@ -859,22 +867,26 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
         # return an HONEST non-success status instead of "ingested" with asserted=0. Crucially,
         # return BEFORE build_graph so a garbage upload NEVER wipes an existing graph (mirrors the
         # structural-error early-return above). After the brake, so a held upload still reports held.
+        stage_started = datetime.now(UTC)
         persist_quarantine(conn, catalog_source, vr.quarantined)
         record_stage(stage_recorder, "quarantine", "succeeded",
-                     detail={"rows": len(vr.quarantined)})
+                     detail={"rows": len(vr.quarantined)}, started_at=stage_started)
         return IngestResult(
             "rejected",
             f"no rows could be ingested — all {len(vr.quarantined)} quarantined "
             f"(check the file's headers include table/column/type, or that the FQNs resolve)",
             0, 0, len(vr.quarantined))
 
+    stage_started = datetime.now(UTC)
     asserted = 0
     for table, fact_type, value in _table_facts(vr.good):
         if _assert_fact(conn, catalog_source, table, fact_type, value, actor=actor,
                         origin_type=origin_type):
             asserted += 1
-    record_stage(stage_recorder, "fact_assertion", "succeeded", detail={"asserted": asserted})
+    record_stage(stage_recorder, "fact_assertion", "succeeded", detail={"asserted": asserted},
+                 started_at=stage_started)
 
+    stage_started = datetime.now(UTC)
     _drain_projection(conn)   # catch up (bounded, #21) BEFORE the diff reads the dependency index
     drift_lagged = False
     if projection_lag(conn, "overlay") > 0:
@@ -896,11 +908,13 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
     changed_objects = sum(1 for c in changes if c.kind in ("drop", "type_change", "rename"))
     if drift_lagged:
         # `lagged`, not `skipped`: the honest state is "deferred behind the projection — re-runs on
-        # the next caught-up ingest", exactly what the guard above does.
-        record_stage(stage_recorder, "drift", "lagged", reason_code="projection_lag")
+        # the next caught-up ingest", exactly what the guard above does. The drain itself RAN, so
+        # the stage carries its start instant either way.
+        record_stage(stage_recorder, "drift", "lagged", reason_code="projection_lag",
+                     started_at=stage_started)
     else:
         record_stage(stage_recorder, "drift", "succeeded",
-                     detail={"changed_objects": changed_objects})
+                     detail={"changed_objects": changed_objects}, started_at=stage_started)
 
     # ── Glossary path (GUARDED): a glossary upload passes its semantic sidecar; a non-glossary upload
     # (glossary=None) skips ALL of the below and is byte-for-byte unchanged. The ingestion-run id is
@@ -909,6 +923,7 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
     snapshot_id = mint_id("ing") if is_glossary else None
     bindings: dict[str, ObjectBinding] | None = None
     if glossary is not None:
+        stage_started = datetime.now(UTC)
         try:
             # Classify the RAW rows (not vr.good): validate_rows DEDUPs same-FQN rows that differ only
             # in the advisory `definition`, so a definition CONFLICT is invisible in vr.good. The raw
@@ -921,13 +936,13 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
             _open_glossary_conflicts(
                 conn, conflicts, ref_map=_schema_preserving_ref_map(glossary), now=now)
             record_stage(stage_recorder, "glossary_classification", "succeeded",
-                         detail={"conflicts": len(conflicts)})
+                         detail={"conflicts": len(conflicts)}, started_at=stage_started)
         except Exception:  # noqa: BLE001 — advisory: identity/conflict classification never aborts
             logger.warning("advisory glossary identity/conflict classification failed for %r",
                            catalog_source, exc_info=True)
             bindings = {}
             record_stage(stage_recorder, "glossary_classification", "failed",
-                         reason_code="exception")
+                         reason_code="exception", started_at=stage_started)
     else:
         record_stage(stage_recorder, "glossary_classification", "not_applicable")
 
@@ -953,6 +968,7 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
         # (a failed call is simply absent from the returned dict; a contained concept-evidence
         # write failure is threaded out via `stats`), so an outer success is not evidence.
         concept_stats: dict = {}
+        stage_started = datetime.now(UTC)
         try:
             # Glossary carry-forward (Task 6): thread the sidecar + bindings + snapshot so Pass A
             # writes item-level LLM concept evidence. Non-glossary keeps the exact original call.
@@ -969,7 +985,9 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
         state, reason, detail = _enrichment_outcome(
             concepts, len({content_hash(r) for r in vr.good}),
             internal_failures=concept_stats.get("evidence_write_failures", 0))
-        record_stage(stage_recorder, "enrich_concept", state, reason_code=reason, detail=detail)
+        record_stage(stage_recorder, "enrich_concept", state, reason_code=reason, detail=detail,
+                     started_at=stage_started)
+        stage_started = datetime.now(UTC)
         try:
             with conn.transaction():
                 definitions = draft_definitions(conn, vr.good, client, actor, concepts=concepts)
@@ -977,16 +995,20 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
             logger.warning("advisory definition enrichment failed for %r", catalog_source, exc_info=True)
         state, reason, detail = _enrichment_outcome(
             definitions, len({content_hash(r) for r in vr.good if not r.definition}))
-        record_stage(stage_recorder, "enrich_definition", state, reason_code=reason, detail=detail)
+        record_stage(stage_recorder, "enrich_definition", state, reason_code=reason, detail=detail,
+                     started_at=stage_started)
+        stage_started = datetime.now(UTC)
         try:
             with conn.transaction():
                 domains = classify_domains(conn, vr.good, client, actor)
         except Exception:  # noqa: BLE001
             logger.warning("advisory domain enrichment failed for %r", catalog_source, exc_info=True)
         state, reason, detail = _enrichment_outcome(domains, len({r.table for r in vr.good}))
-        record_stage(stage_recorder, "enrich_domain", state, reason_code=reason, detail=detail)
+        record_stage(stage_recorder, "enrich_domain", state, reason_code=reason, detail=detail,
+                     started_at=stage_started)
+    stage_started = datetime.now(UTC)
     build_graph(conn, catalog_source, vr.good, concepts, definitions, domains)
-    record_stage(stage_recorder, "graph_persistence", "succeeded")
+    record_stage(stage_recorder, "graph_persistence", "succeeded", started_at=stage_started)
     if governed_joins_enabled() or pass_c_enabled():
         # Governed seam (Task 7 / §12.1) — Pass C (Task 10) implies it: the raw 'joins' edges just
         # written are display-only; route each declared join into the governed approved_join path so
@@ -995,15 +1017,18 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
         # OWN savepoint + except (audit I-2, the Pass C pattern below): a DB-class fault in the
         # seam must never poison the request tx and roll back Pass A facts + the graph — the seam
         # degrades to a warning and the upload always ingests.
+        stage_started = datetime.now(UTC)
         try:
             with conn.transaction():
                 _propose_governed_joins(conn, vr.good, actor=actor)
-            record_stage(stage_recorder, "governed_joins", "succeeded")
+            record_stage(stage_recorder, "governed_joins", "succeeded",
+                         started_at=stage_started)
         except Exception:  # noqa: BLE001 — advisory: the governed-join seam never fails an upload
             counters.incr("overlay.governed_joins.error")
             logger.warning("advisory governed-join seam failed for %r — Pass A facts + graph "
                            "intact", catalog_source, exc_info=True)
-            record_stage(stage_recorder, "governed_joins", "failed", reason_code="exception")
+            record_stage(stage_recorder, "governed_joins", "failed", reason_code="exception",
+                         started_at=stage_started)
     else:
         record_stage(stage_recorder, "governed_joins", "disabled")
 
@@ -1014,15 +1039,17 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
         # OWN savepoint + except (the Pass B pattern above): a DB abort in here must never poison
         # the request tx and roll back Pass A facts + the graph — Pass C degrades to a warning and
         # the upload always ingests.
+        stage_started = datetime.now(UTC)
         try:
             with conn.transaction():
                 _run_pass_c(conn, catalog_source, vr.good, concepts=concepts, glossary=glossary)
-            record_stage(stage_recorder, "pass_c", "succeeded")
+            record_stage(stage_recorder, "pass_c", "succeeded", started_at=stage_started)
         except Exception:  # noqa: BLE001 — advisory: Pass C never fails an upload
             counters.incr("overlay.passc.error")
             logger.warning("advisory Pass C join-candidate pass failed for %r — Pass A facts + "
                            "graph intact", catalog_source, exc_info=True)
-            record_stage(stage_recorder, "pass_c", "failed", reason_code="exception")
+            record_stage(stage_recorder, "pass_c", "failed", reason_code="exception",
+                         started_at=stage_started)
     else:
         record_stage(stage_recorder, "pass_c", "disabled")
 
@@ -1039,6 +1066,7 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
             assemble_table_items,
             synthesize_tables,
         )
+        stage_started = datetime.now(UTC)
         try:
             # TWO savepoints (exactly like the Pass A stages and the governed-join seam
             # above): a DB abort inside either must not
@@ -1075,17 +1103,20 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
             # Pass B swallows per-table failures internally (an unsynthesized table is simply
             # absent from `syntheses`), so the report compares against the assembled items (#22).
             state, reason, detail = _enrichment_outcome(syntheses, len(items))
-            record_stage(stage_recorder, "pass_b", state, reason_code=reason, detail=detail)
+            record_stage(stage_recorder, "pass_b", state, reason_code=reason, detail=detail,
+                         started_at=stage_started)
         except Exception:  # noqa: BLE001 — advisory: Pass B never fails an upload; Pass A facts hold
             counters.incr("overlay.table_synth.error")
             logger.warning("advisory Pass B table synthesis failed for %r — Pass A facts + graph "
                            "intact", catalog_source, exc_info=True)
-            record_stage(stage_recorder, "pass_b", "failed", reason_code="exception")
+            record_stage(stage_recorder, "pass_b", "failed", reason_code="exception",
+                         started_at=stage_started)
 
     if glossary is not None and bindings is not None and snapshot_id is not None:
         # Attach per-field evidence + revalidation + resolve/readiness on top of the built graph.
         # Belt-and-braces fail-soft: the helper savepoints every stage, and this outer guard makes a
         # stray failure a warning rather than a rollback of the already-committed facts + graph.
+        stage_started = datetime.now(UTC)
         try:
             contained = _ingest_glossary_evidence(
                 conn, source=catalog_source, rows=vr.good, glossary=glossary,
@@ -1095,11 +1126,13 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
             record_stage(stage_recorder, "glossary_evidence",
                          "partial" if contained else "succeeded",
                          reason_code="items_failed" if contained else None,
-                         detail={"contained_failures": contained} if contained else None)
+                         detail={"contained_failures": contained} if contained else None,
+                         started_at=stage_started)
         except Exception:  # noqa: BLE001
             logger.warning("advisory glossary evidence wiring failed for %r — facts + graph intact",
                            catalog_source, exc_info=True)
-            record_stage(stage_recorder, "glossary_evidence", "failed", reason_code="exception")
+            record_stage(stage_recorder, "glossary_evidence", "failed", reason_code="exception",
+                         started_at=stage_started)
     else:
         record_stage(stage_recorder, "glossary_evidence", "not_applicable")
 
@@ -1115,6 +1148,7 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
     # budget (a huge unrelated global backlog), their real purpose.
     # Flag-off byte-for-byte safe: with the seams off nothing was appended since the line-749 drain,
     # so this pass processes zero events.
+    stage_started = datetime.now(UTC)
     _drain_projection(conn)
 
     # SPECIALIZED_FACT bridge (Task 9): build_graph just wiped graph_node, so re-project any
@@ -1133,9 +1167,12 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
     # ONE lag read drives BOTH the projection_drain report (did the drain above reach head?) and
     # the existing grain/as-of guard — nothing runs between them, so they cannot disagree (#22).
     table_projection_lagged = projection_lag(conn, "overlay") > 0
+    # The drain above RAN in both states (lagged = it stopped short of head), so the stage
+    # carries its start instant either way (#13 gap A).
     record_stage(stage_recorder, "projection_drain",
                  "lagged" if table_projection_lagged else "succeeded",
-                 reason_code="projection_lag" if table_projection_lagged else None)
+                 reason_code="projection_lag" if table_projection_lagged else None,
+                 started_at=stage_started)
     if table_projection_lagged:
         # Under projection lag the overlay_fact_state read model resolve_fact reads is stale: the
         # clear-then-set could wipe a just-declared grain (a not-yet-projected confirm) or persist a
@@ -1149,19 +1186,21 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
     else:
         # Savepoint + except: a projection DB fault must never poison the request tx or roll back
         # facts/quarantine (this path must not be able to 500 a flag-off upload).
+        stage_started = datetime.now(UTC)
         try:
             with conn.transaction():   # savepoint: a projection fault must not roll back facts
                 project_table_facts(conn, source=catalog_source,
                                     tables=sorted({r.table for r in vr.good}),
                                     declared_grain=declared_grain, declared_as_of=declared_as_of,
                                     now=now)
-            record_stage(stage_recorder, "table_fact_projection", "succeeded")
+            record_stage(stage_recorder, "table_fact_projection", "succeeded",
+                         started_at=stage_started)
         except Exception:  # noqa: BLE001 — advisory: re-projection never fails an upload
             counters.incr("overlay.table_fact_projection.error")
             logger.warning("advisory grain/as-of re-projection failed for %r — facts intact",
                            catalog_source, exc_info=True)
             record_stage(stage_recorder, "table_fact_projection", "failed",
-                         reason_code="exception")
+                         reason_code="exception", started_at=stage_started)
 
     # approved_join re-projection (Pass C Task 10, closing Task 8's loop): build_graph wiped EVERY
     # edge for this source, so a join VERIFIED in a PRIOR cycle must be re-projected from its FACT
@@ -1178,16 +1217,19 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
                        "re-projection (re-runs when the projection catches up)", catalog_source)
         record_stage(stage_recorder, "join_projection", "lagged", reason_code="projection_lag")
     else:
+        stage_started = datetime.now(UTC)
         try:
             with conn.transaction():   # savepoint: a projection fault must not roll back facts
                 project_confirmed_joins(conn, source=catalog_source,
                                         pairs=list_approved_join_refs(conn, catalog_source))
-            record_stage(stage_recorder, "join_projection", "succeeded")
+            record_stage(stage_recorder, "join_projection", "succeeded",
+                         started_at=stage_started)
         except Exception:  # noqa: BLE001 — advisory: join re-projection never fails an upload
             counters.incr("overlay.passc.join_projection.error")
             logger.warning("advisory approved-join re-projection failed for %r — facts intact",
                            catalog_source, exc_info=True)
-            record_stage(stage_recorder, "join_projection", "failed", reason_code="exception")
+            record_stage(stage_recorder, "join_projection", "failed", reason_code="exception",
+                         started_at=stage_started)
 
     if governed_joins_enabled():
         # Governed-join DRIFT detection (advisory): a re-upload that RETARGETS or DROPS a joins_to
@@ -1201,21 +1243,25 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
         # inside must never poison the request tx and roll back Pass A facts + the graph — the
         # detection degrades to a warning and the upload always ingests. Flag-off byte-for-byte:
         # this whole block is behind governed_joins_enabled().
+        stage_started = datetime.now(UTC)
         try:
             with conn.transaction():
                 detect_governed_join_divergences(conn, catalog_source, vr.good,
                                                  source_snapshot_id=snapshot_id, now=now)
-            record_stage(stage_recorder, "join_drift", "succeeded")
+            record_stage(stage_recorder, "join_drift", "succeeded", started_at=stage_started)
         except Exception:  # noqa: BLE001 — advisory: drift detection never fails an upload
             counters.incr("overlay.join_drift.error")
             logger.warning("advisory governed-join drift detection failed for %r — facts + graph "
                            "intact", catalog_source, exc_info=True)
-            record_stage(stage_recorder, "join_drift", "failed", reason_code="exception")
+            record_stage(stage_recorder, "join_drift", "failed", reason_code="exception",
+                         started_at=stage_started)
     else:
         record_stage(stage_recorder, "join_drift", "disabled")
 
+    stage_started = datetime.now(UTC)
     persist_quarantine(conn, catalog_source, vr.quarantined)
-    record_stage(stage_recorder, "quarantine", "succeeded", detail={"rows": len(vr.quarantined)})
+    record_stage(stage_recorder, "quarantine", "succeeded", detail={"rows": len(vr.quarantined)},
+                 started_at=stage_started)
     flagged = (f"first upload of '{catalog_source}' ({len(vr.good)} objects) — review recommended"
                if brake.is_first_upload else None)
     return IngestResult("ingested", None, asserted, changed_objects, len(vr.quarantined), flagged)

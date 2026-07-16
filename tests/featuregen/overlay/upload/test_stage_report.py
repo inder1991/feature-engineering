@@ -49,6 +49,21 @@ def test_record_buffers_in_memory_and_flush_persists(db):
     assert rows[0][5] is not None                     # a completed_at is always stamped
 
 
+def test_record_persists_started_at(db):
+    """Depth review #13 gap A: a stage that RAN records the instant it began; a marker-style
+    record (disabled / not_applicable / not_run) has no start instant and stays NULL."""
+    run_id = _open_run(db)
+    rec = StageRecorder()
+    t0 = datetime(2026, 7, 16, 11, 59, tzinfo=UTC)
+    rec.record("validation", "succeeded", started_at=t0)
+    rec.record("pass_b", "disabled")                  # a marker: never started
+    rec.flush(db, run_id, now=_NOW)
+    rows = db.execute(
+        "SELECT stage, started_at FROM ingestion_run_stage WHERE ingestion_run_id = %s "
+        "AND stage IN ('validation', 'pass_b') ORDER BY id", (run_id,)).fetchall()
+    assert rows == [("validation", t0), ("pass_b", None)]
+
+
 def test_repeated_stage_records_get_increasing_attempts(db):
     run_id = _open_run(db)
     rec = StageRecorder()

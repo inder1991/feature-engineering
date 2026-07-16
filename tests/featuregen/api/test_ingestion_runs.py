@@ -264,6 +264,20 @@ def test_successful_upload_records_ordered_stage_reports(client):
     assert all(s["attempt"] == 1 and s["completed_at"] is not None for s in run["stages"])
 
 
+def test_successful_upload_stages_carry_started_at(client):
+    """Depth review #13 gap A: a successful upload's run shows started_at on every stage that
+    RAN; stages that never started (skipped_no_client / disabled / not_applicable) stay NULL."""
+    res = upload_csv(client, "deposits", DEPOSITS_CSV)
+    run = _get_run(client, res.headers[RUN_HEADER]).json()
+    stages = {s["stage"]: s for s in run["stages"]}
+    for name in ("parse", "validation", "brake", "fact_assertion", "drift", "graph_persistence",
+                 "projection_drain", "table_fact_projection", "join_projection", "quarantine"):
+        assert stages[name]["started_at"] is not None, name
+    for name in ("enrich_concept", "enrich_definition", "enrich_domain", "pass_b", "pass_c",
+                 "glossary_classification", "glossary_evidence", "governed_joins", "join_drift"):
+        assert stages[name]["started_at"] is None, name
+
+
 def test_quarantining_upload_reports_validation_partial(client):
     res = upload_csv(client, "deposits", DEPOSITS_CSV + "deposits,accounts,,integer\n")
     assert res.json()["quarantined"] == 1

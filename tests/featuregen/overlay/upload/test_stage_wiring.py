@@ -81,6 +81,25 @@ def test_successful_upload_records_all_stages_in_order(db):
     assert _report(rec, "quarantine").detail == {"rows": 0}
 
 
+def test_stages_that_ran_carry_started_at(db):
+    """Depth review #13 gap A: every stage that actually EXECUTED records when it began (so a
+    reader can see where time went); marker records (disabled / not_applicable / skipped_no_client)
+    never started and carry no start instant."""
+    _seal_config()
+    rec = StageRecorder()
+    res = ingest_upload(db, "deposits", _rows("deposits"), actor=_actor(), now=_NOW,
+                        stage_recorder=rec)
+    assert res.status == "ingested"
+    ran = {"validation", "brake", "fact_assertion", "drift", "graph_persistence",
+           "projection_drain", "table_fact_projection", "join_projection", "quarantine"}
+    for r in rec.reports:
+        if r.stage in ran:
+            assert r.started_at is not None, r.stage
+            assert r.started_at <= r.completed_at, r.stage
+        else:
+            assert r.started_at is None, r.stage
+
+
 def test_none_recorder_result_identical(db):
     """The no-op contract: a caller that passes no recorder gets EXACTLY the same IngestResult."""
     _seal_config()
