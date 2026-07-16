@@ -96,6 +96,53 @@ def test_audited_batch_call_returns_per_item_outcomes(db):
     assert n == 1
 
 
+def test_audited_batch_call_reports_actual_provider_calls_across_repair(db):
+    # #21: a batch whose first body is malformed (schema-invalid) is repaired — TWO provider
+    # requests were issued, and the batch result must say so: the configured budget is a
+    # PROVIDER-CALL budget, so a hardcoded provider_calls=1 lets it be exceeded materially.
+    items = [eb.BatchItem("h1", {"table": "t", "column": "balance", "type": "numeric"})]
+    client = FakeLLM(script={_CTASK: [
+        FakeResponse(output={"bogus": True}),   # PROVIDER_OK, body fails the batch schema → repair
+        FakeResponse(output={"results": [{"ref": "h1", "concept": "monetary_stock"}]})]})
+    res = audited_batch_call(db, client, task=_CTASK, prompt_id="overlay_concept_batch_v1",
+                             schema_id="overlay_concept_batch", shared_metadata={},
+                             items=items, out_key="concept", instruction="Classify each column.",
+                             accept=_accept_known)
+    by = {o.ref: o for o in res.outcomes}
+    assert by["h1"].status == eb.VALID
+    assert res.provider_calls == 2
+
+
+def test_run_batched_budget_counts_actual_provider_requests(db, monkeypatch):
+    # #21: repairs/retries consume the provider-call budget. Chunk 1 (h1) costs TWO requests
+    # (malformed body → repair); with a budget of 2 the second chunk (h2) must NOT be dispatched
+    # at all — the budget reflects requests actually issued, not batch calls.
+    monkeypatch.setenv("OVERLAY_ENRICH_CONCEPT_MODE", "batch")
+    monkeypatch.setenv("OVERLAY_ENRICH_BATCH_CONCEPT_MAX_ITEMS", "1")
+    monkeypatch.setenv("OVERLAY_ENRICH_MAX_PROVIDER_CALLS", "2")
+    monkeypatch.setenv("OVERLAY_ENRICH_MAX_SINGLE_FALLBACK", "0")
+
+    class _Counting:
+        def __init__(self, inner):
+            self.inner, self.n = inner, 0
+
+        def call(self, request):
+            self.n += 1
+            return self.inner.call(request)
+
+    client = _Counting(FakeLLM(script={_CTASK: [
+        FakeResponse(output={"bogus": True}),
+        FakeResponse(output={"results": [{"ref": "h1", "concept": "monetary_stock"}]})]}))
+    items = [eb.BatchItem("h1", {"table": "t", "column": "a", "type": "text"}),
+             eb.BatchItem("h2", {"table": "t", "column": "b", "type": "text"})]
+    got = eb.run_batched(db, client, short="concept", task=_CTASK,
+                         prompt_id="overlay_concept_batch_v1", schema_id="overlay_concept_batch",
+                         shared_metadata={}, items=items, out_key="concept",
+                         instruction="Classify.", accept=_accept_known, actor=None)
+    assert got == {"h1": "monetary_stock"}
+    assert client.n == 2   # budget exhausted by the repaired chunk — h2 never dispatched
+
+
 def test_audited_batch_call_excludes_unsafe_item_before_egress(db):
     # An item whose metadata carries a disallowed key (free-text definition) is excluded, audited,
     # and the remainder still batched (spec C9 exclude-and-proceed).

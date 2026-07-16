@@ -533,5 +533,8 @@ def audited_batch_call(conn, client: LLMClient, *, task: str, prompt_id: str, sc
         cost_metadata={**cost, "batch": summary}, created_by=identity_to_jsonb(actor))
 
     return BatchCallResult(
-        outcomes=tuple(egress_outcomes) + tuple(item_outcomes), provider_calls=1,
+        outcomes=tuple(egress_outcomes) + tuple(item_outcomes),
+        # #21: the ACTUAL provider requests the driver issued (initial + repairs + retries) — never
+        # a hardcoded 1, so the caller's provider-call budget reflects reality.
+        provider_calls=outcome.provider_calls,
         input_tokens=int(cost.get("input_tokens", 0)), output_tokens=int(cost.get("output_tokens", 0)))

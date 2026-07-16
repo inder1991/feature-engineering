@@ -177,9 +177,14 @@ class StructuredCallOutcome:
     repair_attempts: tuple      # ({attempt, class, reason}, ...)
     cost_metadata: dict
     security_audit_reason: str | None
+    # #21 — provider requests ACTUALLY issued (1 + repairs + retries), reported even on a FAILED
+    # outcome (the requests were made — any provider-call budget was spent). Default 1 keeps the
+    # dataclass additive for out-of-tree constructors.
+    provider_calls: int = 1
 
 
-def _failed(resp: LLMResult, attempts: list, reason: str, *, security_audit: bool = False) -> StructuredCallOutcome:
+def _failed(resp: LLMResult, attempts: list, reason: str, *, provider_calls: int,
+            security_audit: bool = False) -> StructuredCallOutcome:
     return StructuredCallOutcome(
         output=dict(resp.output),
         self_reported_scores=dict(resp.self_reported_scores),
@@ -188,6 +193,7 @@ def _failed(resp: LLMResult, attempts: list, reason: str, *, security_audit: boo
         repair_attempts=tuple(attempts),
         cost_metadata={},
         security_audit_reason=reason if security_audit else None,
+        provider_calls=provider_calls,
     )
 
 
@@ -204,12 +210,15 @@ def drive_structured_call(
     SchemaValidationError on an invalid structure. A `PROVIDER_OK` whose body fails validation is
     malformed structure → bounded repair. Refusal → fail into clarification directly (no repair).
     Truncation/schema-fault/transient → bounded retry. Auth → fail closed + security-audit signal.
-    Nothing proceeds on an unresolved outcome; an invalid structure is a doubt, not a value."""
+    Nothing proceeds on an unresolved outcome; an invalid structure is a doubt, not a value.
+    The outcome's `provider_calls` counts every `client.call` issued (#21) so callers tallying a
+    provider-call budget account for repairs/retries, not just the initial request."""
     attempts: list[dict] = []
     repairs_used = 0
     retries_used = 0
     errors: list[str] = []
     resp = client.call(request)
+    provider_calls = 1
     while True:
         ps = resp.status
         if ps == PROVIDER_OK:
@@ -232,6 +241,7 @@ def drive_structured_call(
                     repair_attempts=tuple(attempts),
                     cost_metadata=dict(resp.cost_metadata),  # N9 — capture provider usage/cost
                     security_audit_reason=None,
+                    provider_calls=provider_calls,
                 )
         if ps == PROVIDER_INVALID:
             if repairs_used < repair_budget:
@@ -242,21 +252,28 @@ def drive_structured_call(
                 # key EXCLUDED from the identity hash so the repair keeps its parent's identity.
                 request = replace(request, inputs={**request.inputs, "_repair_errors": list(errors)})
                 resp = client.call(request)
+                provider_calls += 1
                 continue
-            return _failed(resp, attempts, "repair budget exhausted (malformed structure)")
+            return _failed(resp, attempts, "repair budget exhausted (malformed structure)",
+                           provider_calls=provider_calls)
         if ps == PROVIDER_REFUSAL:
-            return _failed(resp, attempts, "provider refusal (policy decline)")
+            return _failed(resp, attempts, "provider refusal (policy decline)",
+                           provider_calls=provider_calls)
         if ps in _RETRYABLE:
             if retries_used < retry_budget:
                 retries_used += 1
                 attempts.append({"attempt": retries_used, "class": "retry", "reason": ps})
                 resp = client.call(request)
+                provider_calls += 1
                 continue
-            return _failed(resp, attempts, f"{ps} retry budget exhausted")
+            return _failed(resp, attempts, f"{ps} retry budget exhausted",
+                           provider_calls=provider_calls)
         if ps == PROVIDER_AUTH_ERROR:
-            return _failed(resp, attempts, "provider auth failure", security_audit=True)
+            return _failed(resp, attempts, "provider auth failure", provider_calls=provider_calls,
+                           security_audit=True)
         # PROVIDER_NON_RETRYABLE and any unknown token → fail closed
-        return _failed(resp, attempts, f"non-retryable provider outcome ({ps})")
+        return _failed(resp, attempts, f"non-retryable provider outcome ({ps})",
+                       provider_calls=provider_calls)
 
 
 # ---- R10 collaborator DI seam (module-global; mirrors overlay/catalog.py) --------------------

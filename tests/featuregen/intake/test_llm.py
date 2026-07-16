@@ -171,6 +171,41 @@ def test_max_tokens_retries_then_validates():
     assert out.repair_attempts[0]["class"] == "retry"
 
 
+def test_provider_calls_counted_single_request():
+    # #21: the outcome must report how many provider requests were ACTUALLY issued.
+    fake = FakeLLM()
+    fake.script(task="structure_intent", prompt_id="intake.v1",
+                responses=[FakeResponse(output={"entity": "customer"})])
+    out = drive_structured_call(fake, _req(), _needs_entity)
+    assert out.status == STATUS_OK
+    assert out.provider_calls == 1
+
+
+def test_provider_calls_counted_across_repairs():
+    # #21: a repaired call issued TWO provider requests — both must be counted, or a
+    # provider-call budget tallied from the outcome undercounts reality.
+    fake = FakeLLM()
+    fake.script(task="structure_intent", prompt_id="intake.v1",
+                responses=[FakeResponse(output={"wrong": 1}),                 # ok token, invalid body
+                           FakeResponse(output={"entity": "customer"})])       # repair validates
+    out = drive_structured_call(fake, _req(), _needs_entity)
+    assert out.status == STATUS_REPAIRED
+    assert out.provider_calls == 2
+
+
+def test_provider_calls_counted_when_retry_budget_exhausted():
+    # #21: 1 initial + 2 retries = 3 provider requests; the FAILED outcome still reports them
+    # (the requests were made — the budget was spent).
+    fake = FakeLLM()
+    fake.script(task="structure_intent", prompt_id="intake.v1",
+                responses=[FakeResponse(output={}, provider_status="max_tokens"),
+                           FakeResponse(output={}, provider_status="max_tokens"),
+                           FakeResponse(output={}, provider_status="max_tokens")])
+    out = drive_structured_call(fake, _req(), _needs_entity, retry_budget=2)
+    assert out.status == STATUS_FAILED
+    assert out.provider_calls == 3
+
+
 def test_auth_error_fails_closed_and_flags_security_audit():
     fake = FakeLLM()
     fake.script(task="structure_intent", prompt_id="intake.v1",
