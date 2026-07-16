@@ -195,8 +195,15 @@ def validate_rows(rows: list[CanonicalRow],
         # target, so it is the same class of identity and gets the same _norm — otherwise a declared
         # join to 'Accounts.ID' would dangle beside the normalized 'public.accounts.id' node. The
         # RAW row is preserved where the code needs display: quarantined RowErrors (above) keep it.
+        # `type` gets the same strip+lower (#20): it is not identity, but every downstream keying —
+        # the graph node's data_type, the drift type-fingerprint, the enrichment content_hash — must
+        # be adapter-INDEPENDENT, and the OpenMetadata translation already lowercases dataType while
+        # CSV/Excel pass the cell through raw. Un-normalized, the same physical column reads as
+        # 'VARCHAR' via CSV and 'varchar' via OM: a vehicle switch became a false type change that
+        # staled facts and missed enrichment caches. Like #1, an existing catalog with mixed-case
+        # types re-keys ONCE on its next upload.
         canonical = replace(r, source=_norm(r.source), table=_norm(r.table),
-                            column=_norm(r.column), joins_to=_norm(r.joins_to))
+                            column=_norm(r.column), joins_to=_norm(r.joins_to), type=_norm(r.type))
         if key in seen:
             first_row, first_i = seen[key]
             if _material(first_row) == _material(canonical):

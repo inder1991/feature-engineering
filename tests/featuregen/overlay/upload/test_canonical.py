@@ -159,6 +159,28 @@ def test_accepted_rows_carry_normalized_identity():
     assert good.joins_to == "customers.cust_id"   # the join TARGET is an identity too
 
 
+def test_type_is_normalized_lowercase_stripped_across_adapters():
+    # #20: the canonical data_type must be adapter-INDEPENDENT. The OpenMetadata connector
+    # lowercases dataType at translation while CSV/Excel pass the cell through raw, so one
+    # physical column arrived as 'VARCHAR' via CSV and 'varchar' via OM — a false type change
+    # (drift) on every vehicle switch. The accepted row carries the strip+lower type, exactly
+    # like the identity components, so graph data_type / drift fingerprints / enrichment cache
+    # keys agree across adapters.
+    csv_row = _row(type=" VARCHAR ")          # CSV/Excel: case-sensitive free text, padded
+    om_row = _row(type="varchar")             # the OM translation already lowercases
+    assert validate_rows([csv_row]).good[0].type == "varchar"
+    assert validate_rows([csv_row]).good[0] == validate_rows([om_row]).good[0]
+
+
+def test_case_variant_type_duplicates_dedup_not_conflict():
+    # #20 follow-on: 'VARCHAR' and 'varchar' for the SAME column are one declaration, not a
+    # metadata conflict — pre-normalization they quarantined the column as disagreeing rows.
+    result = validate_rows([_row(type="VARCHAR"), _row(type="varchar")])
+    assert len(result.good) == 1
+    assert result.good[0].type == "varchar"
+    assert result.quarantined == []
+
+
 def test_case_variant_duplicates_dedup_to_one_normalized_row():
     rows = [_row(table="Accounts", column="ID"), _row(table="accounts ", column="id ")]
     result = validate_rows(rows)

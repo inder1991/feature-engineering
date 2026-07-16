@@ -100,6 +100,34 @@ def test_case_whitespace_variant_reupload_is_one_identity(db):
     assert refs == ["public.accounts.balance", "public.accounts.id"]   # ONE node per column
 
 
+def test_type_case_variant_reupload_is_no_drift(db):
+    # #20: a re-upload that renders the SAME physical type in a different case — exactly what
+    # switching ingestion vehicles does (CSV keeps 'VARCHAR' raw, the OpenMetadata connector
+    # lowercases to 'varchar') — is NOT a type change: no drift (changed_objects == 0), and the
+    # graph node's data_type is the one normalized rendering. Pre-fix the case flip re-keyed the
+    # drift fingerprint, invalidating facts and missing enrichment caches.
+    _seal_config()
+    now = datetime(2026, 7, 5, tzinfo=UTC)
+    source = "deposits"
+    rows1 = [
+        CanonicalRow(source, "accounts", "id", "integer", is_grain=True),
+        CanonicalRow(source, "accounts", "ccy", "VARCHAR"),
+    ]
+    assert ingest_upload(db, source, rows1, actor=_actor(), now=now).status == "ingested"
+
+    rows2 = [
+        CanonicalRow(source, "accounts", "id", "integer", is_grain=True),
+        CanonicalRow(source, "accounts", "ccy", "varchar"),   # the OM rendering of the same column
+    ]
+    res2 = ingest_upload(db, source, rows2, actor=_actor(), now=now)
+    assert res2.status == "ingested"
+    assert res2.changed_objects == 0          # no false type_change / dependent staling
+    types = db.execute(
+        "SELECT data_type FROM graph_node WHERE catalog_source = %s AND column_name = 'ccy'",
+        (source,)).fetchall()
+    assert types == [("varchar",)]            # ONE node, adapter-independent canonical type
+
+
 def test_two_as_of_columns_conflict_surfaced_same_either_row_order(db):
     # #17: ONE table declaring TWO as_of columns used to silently assert whichever row came first
     # (reordering equivalent CSV rows changed the availability fact, no conflict reported). Now the
