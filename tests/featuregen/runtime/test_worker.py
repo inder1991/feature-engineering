@@ -572,8 +572,8 @@ def test_migrate_subcommand_applies_migrations(_dsn) -> None:
     assert main(["migrate", "--dsn", _dsn]) == 0
 
 
-def _open_stale_run(db, *, hours_old: float = 2.0):
-    """An in_progress ingestion_run whose heartbeat lease expired (default lease is 30 min)."""
+def _open_stale_run(db, *, hours_old: float = 3.0):
+    """An in_progress ingestion_run whose heartbeat lease expired (default lease is 2h)."""
     from datetime import timedelta
 
     from tests.featuregen._helpers import mint_test_identity
@@ -608,15 +608,37 @@ def test_run_worker_once_sweeps_expired_ingestion_runs(db, monkeypatch):
     assert get_run(db, fresh)["status"] == "in_progress"
 
 
+def test_default_lease_outlasts_a_long_synchronous_ingest(db, monkeypatch):
+    """Review FIX 1: LLM enrichment runs synchronously in-request with NO mid-ingest heartbeat,
+    so a large upload can legitimately run for well over 30 minutes — the old 1800s default let
+    the sweep mislabel a still-running (eventually successful) ingest 'abandoned', after which
+    the request's own terminalize no-oped. The default lease is 2h: a run whose heartbeat is
+    just UNDER the default-lease cutoff is NOT swept; only one older than 2h is."""
+    from featuregen.overlay.upload.ingestion_run import get_run
+    from featuregen.runtime.worker import compose, run_worker_once
+
+    monkeypatch.delenv("FEATUREGEN_DSN", raising=False)
+    monkeypatch.delenv("FEATUREGEN_INGESTION_RUN_LEASE_SECONDS", raising=False)
+    long_ingest, now = _open_stale_run(db, hours_old=1.99)   # default lease minus epsilon
+    crashed, _ = _open_stale_run(db, hours_old=2.01)         # past the default lease
+    reg, projections = compose(db)
+
+    tick = run_worker_once(db, reg, projections, owner="w1", now=now)
+
+    assert tick.errors == 0
+    assert get_run(db, long_ingest)["status"] == "in_progress"   # still mid-ingest, NOT swept
+    assert get_run(db, crashed)["status"] == "abandoned"
+
+
 def test_ingestion_sweep_lease_timeout_is_env_configurable(db, monkeypatch):
-    """FEATUREGEN_INGESTION_RUN_LEASE_SECONDS overrides the 30-min default: under a week-long
-    lease, a 2-hour-stale run keeps its lease and is NOT abandoned."""
+    """FEATUREGEN_INGESTION_RUN_LEASE_SECONDS overrides the 2h default: under a week-long
+    lease, a 3-hour-stale run keeps its lease and is NOT abandoned."""
     from featuregen.overlay.upload.ingestion_run import get_run
     from featuregen.runtime.worker import compose, run_worker_once
 
     monkeypatch.delenv("FEATUREGEN_DSN", raising=False)
     monkeypatch.setenv("FEATUREGEN_INGESTION_RUN_LEASE_SECONDS", str(7 * 24 * 3600))
-    stale, now = _open_stale_run(db)
+    stale, now = _open_stale_run(db, hours_old=3.0)
     reg, projections = compose(db)
 
     tick = run_worker_once(db, reg, projections, owner="w1", now=now)

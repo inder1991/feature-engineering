@@ -308,10 +308,17 @@ def _sweep_ingestion_runs(conn: psycopg.Connection, *, now: datetime) -> int:
     """Ingestion-run reconciliation sweep (first-release hardening #3): terminalize in_progress
     ingestion runs whose heartbeat lease expired to 'abandoned' — a process that died mid-ingest
     must not leave its run open forever. The lease timeout comes from
-    FEATUREGEN_INGESTION_RUN_LEASE_SECONDS (default 30 min — generously above any real
-    upload/import request, so an active run is never swept out from under its route). Cheap every
-    tick: one indexed read of (status, heartbeat_at); the stage guard makes any fault fail-soft."""
-    lease_seconds = float(os.environ.get("FEATUREGEN_INGESTION_RUN_LEASE_SECONDS", "1800"))
+    FEATUREGEN_INGESTION_RUN_LEASE_SECONDS (default 2h). The default MUST exceed the maximum
+    realistic in-request ingest duration — including a cold batched LLM-enrichment pass with
+    provider backoff, which runs synchronously inside the upload/import request — because
+    NOTHING heartbeats a run mid-ingest yet: heartbeat_at is written once at open_run. A lease
+    shorter than a slow-but-successful ingest makes the sweep mislabel it 'abandoned', after
+    which the request's own success terminalize (WHERE status = 'in_progress') silently no-ops
+    and a COMMITTED ingest stays recorded 'abandoned' forever (review FIX 1). The proper
+    follow-up is a mid-ingest heartbeat (e.g. per enrichment batch), after which this default
+    can shrink again. Cheap every tick: one indexed read of (status, heartbeat_at); the stage
+    guard makes any fault fail-soft."""
+    lease_seconds = float(os.environ.get("FEATUREGEN_INGESTION_RUN_LEASE_SECONDS", "7200"))
     swept = reconcile_ingestion_runs(conn, now=now, lease_timeout=timedelta(seconds=lease_seconds))
     if swept:
         counters.incr("ingestion_run.abandoned", swept)
