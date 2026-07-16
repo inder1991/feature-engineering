@@ -20,14 +20,16 @@ from featuregen.overlay.upload.catalog_realizations import (
 )
 from featuregen.overlay.upload.enrich import content_hash
 from featuregen.overlay.upload.graph import build_graph
+from featuregen.overlay.upload.need_metadata import RESOLVED_NEED_METADATA
 from featuregen.overlay.upload.planner import contracts as c
 from featuregen.overlay.upload.planner.declarations import (
     CompileBudget,
     CompilerContext,
     PathPositionV1,
     check_connectivity,
+    compile_temporal,
 )
-from featuregen.overlay.upload.templates import _load_columns
+from featuregen.overlay.upload.templates import Need, Template, _load_columns
 
 _NOW = datetime(2026, 7, 16, 12, 0, tzinfo=UTC)
 
@@ -81,10 +83,11 @@ def _ctx(db, *catalogs: str) -> CompilerContext:
         agg_declarations={})
 
 
-def _binding(role, obj_ref, *, join_role=str(JoinRole.MEASURE), catalog="core"):
+def _binding(role, obj_ref, *, join_role=str(JoinRole.MEASURE), catalog="core",
+             concept="monetary_flow", temporal=str(TemporalRole.NONE)):
     return c.IngredientBindingV1(
-        recipe_id="r1", need_role=role, concept="monetary_flow", required_grains=(),
-        join_role=join_role, temporal_role=str(TemporalRole.NONE),
+        recipe_id="r1", need_role=role, concept=concept, required_grains=(),
+        join_role=join_role, temporal_role=temporal,
         bound_catalog_source=catalog, bound_object_ref=obj_ref, actual_source_grain=None,
         binding_quality=c.BindingQuality.exact_concept, safety=c.BindingSafety.safe,
         reason_codes=())
@@ -229,3 +232,196 @@ def test_compile_budget_is_plain_mutable():
     b = CompileBudget(remaining=2, deadline=_NOW)
     b.remaining -= 1
     assert b.remaining == 1 and b.deadline == _NOW
+
+
+# ─── C3: temporal declaration on representative params ───────────────────────────────────────
+# compile_temporal is PURE — template + plan material only; the empty conn-free context below
+# proves no test (and no code path) needs a loaded catalog, let alone a connection.
+
+def _empty_ctx() -> CompilerContext:
+    return CompilerContext(
+        realizations_by_catalog={}, active_bridges=(), columns_by_catalog={},
+        catalog_fingerprint_at_start={}, bridge_fingerprint_at_start="", catalog_stamps={},
+        config=_overlay_config(), roles=(), now=_NOW, agg_declarations={})
+
+
+def _template(tid, needs, params, *, additivity="semi_additive") -> Template:
+    """A DIRECT Template(...) construction — deliberately NOT registered in ALL_TEMPLATES, so a
+    static-registry lookup (RESOLVED_NEED_METADATA[tid]) would KeyError. Real concepts, so
+    derive_need_metadata resolves against the governed registry (F17)."""
+    return Template(
+        id=tid, family="c3_test_family", intent="C3 injected recipe (not in the static registry)",
+        needs=needs, params=params, aggregation="sum", additivity=additivity, explain="H",
+        use_cases=("test",), pit="as of t, trailing window (t − w, t]")
+
+
+def test_temporal_custom_template_asof_unbound_is_anchor_missing():
+    # an as-of roll-up whose as-of need has NO bound ingredient: the anchor ROLE is declared
+    # (pit_anchor set) but nothing supplies it -> temporal_anchor_missing, anchor_binding=None.
+    t = _template(
+        "c3_asof_rollup",
+        needs=(Need("stock_col", "monetary_stock"), Need("asof", "as_of_date"),
+               Need("entity", "customer_id")),
+        params={})
+    assert t.id not in RESOLVED_NEED_METADATA      # proves derive_need_metadata must be used
+    plan = _plan(
+        bindings=(
+            _binding("entity", "public.accounts.account_id",
+                     join_role=str(JoinRole.SOURCE_ENTITY_KEY), concept="customer_id"),
+            _binding("stock_col", "public.accounts.balance", concept="monetary_stock"),
+        ),
+        segments=())
+    out = compile_temporal(_empty_ctx(), plan, t)
+    assert out.pit_anchor == str(TemporalRole.AS_OF_TIME)
+    assert out.anchor_binding is None
+    assert out.reason_codes == (c.ReasonCode.temporal_anchor_missing,)
+    # no window param -> pure point-in-time: no window, no time-axis aggregation
+    assert out.window is None and out.time_axis_aggregating is False
+
+
+def test_temporal_window_param_binds_representatively():
+    t = _template(
+        "c3_windowed_trend",
+        needs=(Need("stock_col", "monetary_stock"), Need("asof", "as_of_date"),
+               Need("entity", "customer_id")),
+        params={"window": (90, 60, 30), "measure": ("normalized", "slope")})
+    plan = _plan(
+        bindings=(
+            _binding("entity", "public.accounts.account_id",
+                     join_role=str(JoinRole.SOURCE_ENTITY_KEY), concept="customer_id"),
+            _binding("stock_col", "public.accounts.balance", concept="monetary_stock"),
+            _binding("asof", "public.accounts.as_of_date", join_role=str(JoinRole.TIME),
+                     concept="as_of_date", temporal=str(TemporalRole.AS_OF_TIME)),
+        ),
+        segments=())
+    out = compile_temporal(_empty_ctx(), plan, t)
+    # FIRST allowed value of each param is the representative; typed window, never a string
+    assert out.window == c.WindowSpecV1(length=90, unit="days", boundary="trailing",
+                                        inclusive=True)
+    assert out.param_binding.is_representative is True
+    assert out.param_binding.values == (("measure", "normalized"), ("window", "90"))
+    assert out.time_axis_aggregating is True       # a trailing window rolls the measure over time
+    assert out.pit_anchor == str(TemporalRole.AS_OF_TIME)
+    assert out.anchor_binding == "public.accounts.as_of_date"
+    assert out.reason_codes == ()
+
+
+def test_temporal_window_min_param_is_a_minute_window():
+    # the corpus's real-time family windows in MINUTES (window_min), never trailing days
+    t = _template(
+        "c3_realtime_velocity",
+        needs=(Need("flow_col", "monetary_flow"), Need("event_ts", "event_timestamp"),
+               Need("entity", "customer_id")),
+        params={"window_min": (60, 15, 1440)})
+    plan = _plan(
+        bindings=(
+            _binding("entity", "public.transactions.account_id",
+                     join_role=str(JoinRole.SOURCE_ENTITY_KEY), concept="customer_id"),
+            _binding("event_ts", "public.transactions.event_ts", join_role=str(JoinRole.TIME),
+                     concept="event_timestamp", temporal=str(TemporalRole.EVENT_TIME)),
+        ),
+        segments=())
+    out = compile_temporal(_empty_ctx(), plan, t)
+    assert out.window == c.WindowSpecV1(length=60, unit="minutes", boundary="trailing",
+                                        inclusive=True)
+    assert out.time_axis_aggregating is True
+    assert out.pit_anchor == str(TemporalRole.EVENT_TIME)
+    assert out.anchor_binding == "public.transactions.event_ts"
+
+
+def test_temporal_bitemporal_interval_is_valid_not_ambiguous():
+    # valid_from + valid_to TOGETHER describe one validity interval (F17) — never flagged
+    # ambiguous merely because two temporal roles are present. Neither is a primary PIT anchor.
+    t = _template(
+        "c3_bitemporal_attrs",
+        needs=(Need("attr", "monetary_stock"),
+               Need("vf", "effective_date", temporal_role=TemporalRole.VALID_FROM),
+               Need("vt", "effective_date", temporal_role=TemporalRole.VALID_TO),
+               Need("entity", "customer_id")),
+        params={})
+    plan = _plan(
+        bindings=(
+            _binding("entity", "public.accounts.account_id",
+                     join_role=str(JoinRole.SOURCE_ENTITY_KEY), concept="customer_id"),
+            _binding("vf", "public.accounts.valid_from", join_role=str(JoinRole.TIME),
+                     concept="effective_date", temporal=str(TemporalRole.VALID_FROM)),
+            _binding("vt", "public.accounts.valid_to", join_role=str(JoinRole.TIME),
+                     concept="effective_date", temporal=str(TemporalRole.VALID_TO)),
+        ),
+        segments=())
+    out = compile_temporal(_empty_ctx(), plan, t)
+    assert c.ReasonCode.temporal_anchor_ambiguous not in out.reason_codes
+    assert out.pit_anchor is None and out.anchor_binding is None
+    assert out.reason_codes == ()      # a valid interval is not a missing anchor either
+
+
+def test_temporal_two_distinct_event_anchors_are_ambiguous():
+    # two DISTINCT event-time needs bound to DIFFERENT columns genuinely compete — no honest
+    # single PIT anchor exists.
+    t = _template(
+        "c3_two_event_axes",
+        needs=(Need("e1", "event_timestamp"), Need("e2", "event_timestamp"),
+               Need("entity", "customer_id")),
+        params={})
+    plan = _plan(
+        bindings=(
+            _binding("entity", "public.transactions.account_id",
+                     join_role=str(JoinRole.SOURCE_ENTITY_KEY), concept="customer_id"),
+            _binding("e1", "public.transactions.trade_ts", join_role=str(JoinRole.TIME),
+                     concept="event_timestamp", temporal=str(TemporalRole.EVENT_TIME)),
+            _binding("e2", "public.transactions.settle_ts", join_role=str(JoinRole.TIME),
+                     concept="event_timestamp", temporal=str(TemporalRole.EVENT_TIME)),
+        ),
+        segments=())
+    out = compile_temporal(_empty_ctx(), plan, t)
+    assert out.reason_codes == (c.ReasonCode.temporal_anchor_ambiguous,)
+    assert out.pit_anchor is None and out.anchor_binding is None
+
+
+def test_temporal_asof_takes_precedence_over_event_time():
+    # as_of + event coexist legitimately across the corpus (e.g. margin_call_intensity: the
+    # as-of is the evaluation date, the event axis is the measured one) — the as-of WINS as the
+    # primary PIT anchor; coexistence is NOT ambiguity.
+    t = _template(
+        "c3_asof_plus_event",
+        needs=(Need("flow_col", "monetary_flow"), Need("asof", "as_of_date"),
+               Need("event_ts", "event_timestamp"), Need("entity", "customer_id")),
+        params={"window": (30, 90)})
+    plan = _plan(
+        bindings=(
+            _binding("entity", "public.transactions.account_id",
+                     join_role=str(JoinRole.SOURCE_ENTITY_KEY), concept="customer_id"),
+            _binding("asof", "public.transactions.as_of_date", join_role=str(JoinRole.TIME),
+                     concept="as_of_date", temporal=str(TemporalRole.AS_OF_TIME)),
+            _binding("event_ts", "public.transactions.event_ts", join_role=str(JoinRole.TIME),
+                     concept="event_timestamp", temporal=str(TemporalRole.EVENT_TIME)),
+        ),
+        segments=())
+    out = compile_temporal(_empty_ctx(), plan, t)
+    assert out.pit_anchor == str(TemporalRole.AS_OF_TIME)
+    assert out.anchor_binding == "public.transactions.as_of_date"
+    assert out.reason_codes == ()
+    assert out.window == c.WindowSpecV1(30, "days", "trailing", True)
+
+
+def test_temporal_same_role_anchors_on_one_column_are_one_anchor():
+    # two same-role needs BOUND TO THE SAME COLUMN are one anchor, not a competition
+    t = _template(
+        "c3_two_needs_one_axis",
+        needs=(Need("e1", "event_timestamp"), Need("e2", "event_timestamp"),
+               Need("entity", "customer_id")),
+        params={})
+    plan = _plan(
+        bindings=(
+            _binding("entity", "public.transactions.account_id",
+                     join_role=str(JoinRole.SOURCE_ENTITY_KEY), concept="customer_id"),
+            _binding("e1", "public.transactions.event_ts", join_role=str(JoinRole.TIME),
+                     concept="event_timestamp", temporal=str(TemporalRole.EVENT_TIME)),
+            _binding("e2", "public.transactions.event_ts", join_role=str(JoinRole.TIME),
+                     concept="event_timestamp", temporal=str(TemporalRole.EVENT_TIME)),
+        ),
+        segments=())
+    out = compile_temporal(_empty_ctx(), plan, t)
+    assert out.pit_anchor == str(TemporalRole.EVENT_TIME)
+    assert out.anchor_binding == "public.transactions.event_ts"
+    assert out.reason_codes == ()

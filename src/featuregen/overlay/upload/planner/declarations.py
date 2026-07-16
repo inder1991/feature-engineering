@@ -1,4 +1,5 @@
-"""Phase-3B.3c C2 — the contract compiler's data spine + the first declaration check.
+"""Phase-3B.3c C2/C3 — the contract compiler's data spine + the declaration checks
+(connectivity; the temporal declaration, which runs FIRST in the compile pipeline).
 
 One IMMUTABLE, conn-free ``CompilerContext`` is batch-loaded per shadow run (the production
 builder ``build_compiler_context`` arrives in C8); every declaration check is a pure function
@@ -14,16 +15,22 @@ from datetime import datetime
 from types import MappingProxyType
 
 from featuregen.overlay.config import OverlayConfig
-from featuregen.overlay.upload.binding_roles import JoinRole
+from featuregen.overlay.upload.binding_roles import JoinRole, TemporalRole
 from featuregen.overlay.upload.bridge_projection import ActiveBridgeV1
 from featuregen.overlay.upload.catalog_realizations import table_of
+from featuregen.overlay.upload.need_metadata import ResolvedNeedMetadataV1, derive_need_metadata
 from featuregen.overlay.upload.planner.contracts import (
     AggregationFunction,
     BindingPlanV1,
     CatalogStateStampV1,
+    ParamBindingV1,
+    ReasonCode,
+    TemporalDeclarationV1,
+    WindowSpecV1,
+    canonical_reason_codes,
 )
 from featuregen.overlay.upload.taxonomy.entity_relationships import CatalogEntityRelationshipV1
-from featuregen.overlay.upload.templates import _Col
+from featuregen.overlay.upload.templates import Template, _Col
 
 # The injectable declared-function registry: ``(recipe_id, need_role) ->`` the recipe's DECLARED
 # aggregation function. EMPTY in production until a governed declaration source exists (validate,
@@ -157,3 +164,76 @@ def check_connectivity(ctx: CompilerContext, plan: BindingPlanV1) -> Connectivit
             segment_index=index, catalog_source=key[0], table=key[1])
     return ConnectivityResult(
         connected=not disconnected, disconnected_roles=tuple(disconnected), placement=placement)
+
+
+# ─── C3: temporal declaration on representative params ───────────────────────────────────────
+
+# The corpus's window params, in lookup order: trailing DAY windows ("window") and the real-time
+# family's trailing MINUTE windows ("window_min" — templates.py declares those minutes/hours,
+# NEVER trailing days; recording them as days would falsify the hashed temporal signature).
+_WINDOW_PARAM_UNITS: tuple[tuple[str, str], ...] = (("window", "days"), ("window_min", "minutes"))
+
+# Roles that can serve as the recipe's primary PIT anchor, in PRECEDENCE order: an AS_OF_TIME
+# need outranks EVENT_TIME when both are present (e.g. margin_call_intensity — the as-of is the
+# evaluation date, the event axis is the measured one), so coexistence is NOT ambiguity (F17).
+_PRIMARY_ANCHOR_PRECEDENCE: tuple[TemporalRole, ...] = (
+    TemporalRole.AS_OF_TIME, TemporalRole.EVENT_TIME)
+
+
+def compile_temporal(ctx: CompilerContext, plan: BindingPlanV1,
+                     template: Template) -> TemporalDeclarationV1:
+    """The plan's temporal declaration, compiled FIRST in the pipeline (its window/anchor output
+    feeds C4's semi-additive single-PIT-vs-across-time decision). Pure — template + plan material
+    only, resolved through ``derive_need_metadata`` (F17: works for INJECTED templates; the
+    static ``RESOLVED_NEED_METADATA`` registry would KeyError on them).
+
+    Declared, never fabricated: each param binds its FIRST allowed value and the result is
+    honestly flagged ``is_representative`` (F7) — one instantiation, not a parameter-space
+    validation. A ``window``/``window_min`` param becomes a TYPED trailing ``WindowSpecV1``
+    (days/minutes respectively) and makes the recipe time-axis-aggregating; no window param
+    means a pure point-in-time read. The primary PIT anchor is the highest-precedence temporal
+    need role; ``valid_from``+``valid_to`` together are a VALID bitemporal interval (never a
+    primary anchor, never ambiguity). ``temporal_anchor_ambiguous`` fires ONLY for genuinely
+    incompatible anchors — the winning role's needs bound to ≥2 DISTINCT columns; a declared
+    anchor role that no ingredient supplies is ``temporal_anchor_missing``."""
+    del ctx     # uniform check signature; conn-free like every check in this module
+    metas = derive_need_metadata(template)
+
+    param_binding = ParamBindingV1(
+        values=tuple(sorted(
+            (name, str(allowed[0])) for name, allowed in template.params.items())),
+        is_representative=True)
+
+    window: WindowSpecV1 | None = None
+    for key, unit in _WINDOW_PARAM_UNITS:
+        allowed = template.params.get(key)
+        if allowed:
+            window = WindowSpecV1(length=int(allowed[0]), unit=unit,
+                                  boundary="trailing", inclusive=True)
+            break
+
+    anchor_metas: list[ResolvedNeedMetadataV1] = []
+    for role in _PRIMARY_ANCHOR_PRECEDENCE:
+        anchor_metas = [m for m in metas if m.temporal_role == role]
+        if anchor_metas:
+            break
+
+    pit_anchor: str | None = None
+    anchor_binding: str | None = None
+    codes: list[ReasonCode] = []
+    if anchor_metas:
+        bound_by_role = {b.need_role: b.bound_object_ref for b in plan.ingredient_bindings}
+        bound_refs = {bound_by_role[m.role] for m in anchor_metas if m.role in bound_by_role}
+        if len(bound_refs) > 1:
+            codes.append(ReasonCode.temporal_anchor_ambiguous)      # genuinely competing columns
+        else:
+            pit_anchor = str(anchor_metas[0].temporal_role)
+            if bound_refs:
+                anchor_binding = next(iter(bound_refs))
+            else:
+                codes.append(ReasonCode.temporal_anchor_missing)    # declared but unsupplied
+
+    return TemporalDeclarationV1(
+        pit_anchor=pit_anchor, anchor_binding=anchor_binding, window=window,
+        param_binding=param_binding, time_axis_aggregating=window is not None,
+        reason_codes=canonical_reason_codes(codes))
