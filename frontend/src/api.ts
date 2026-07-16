@@ -384,6 +384,49 @@ export function dismissQuarantineRow(
   return post(`/sources/${encodeURIComponent(source)}/quarantine/${rowIndex}/dismiss`, {})
 }
 
+// ---- semantics-pending queue (#22): owner completion of semantically blank columns ----------
+// A column can land structurally vouched but semantically blank (the OpenMetadata connector does
+// this BY DESIGN). The queue lists them; completion is a data owner setting the declared facts,
+// exactly as a file declaration would have.
+
+// One pending column as the wire returns it. `missing` names the semantic fields still absent,
+// from the backend's set (as_of, additivity, unit, currency, entity) — kept open strings so a
+// newer backend field renders instead of breaking the client.
+export interface SemanticsPendingItem {
+  object_ref: string
+  table: string
+  column: string
+  data_type: string | null
+  missing: string[]
+}
+
+export function getSemanticsPending(source: string): Promise<SemanticsPendingItem[]> {
+  return request(`/sources/${encodeURIComponent(source)}/semantics-pending`)
+}
+
+// The values an owner is SETTING — any subset. Omitted fields never ride the wire
+// (JSON.stringify drops undefined keys): completion sets values, it does not clear them.
+export interface SemanticsValues {
+  additivity?: string
+  unit?: string
+  currency?: string
+  entity?: string
+  is_as_of?: boolean
+}
+
+// 422 on a value outside the upload vocabularies, 409 if is_as_of would give the table a second
+// as-of axis, 404 on an unknown ref — all arrive as ApiError with the backend's own sentence.
+export function completeSemantics(
+  source: string,
+  objectRef: string,
+  values: SemanticsValues,
+): Promise<{ completed: boolean; applied: Record<string, unknown> }> {
+  return post(
+    `/sources/${encodeURIComponent(source)}/columns/${encodeURIComponent(objectRef)}/semantics`,
+    values,
+  )
+}
+
 // ---- join governance (confirmation surface): list / confirm / reject discovered joins -------
 // Pass C proposes joins from metadata only; each needs TWO distinct admins before it projects to
 // an operational graph edge. The score is advisory — approval is gated on the human checklist.

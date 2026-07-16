@@ -61,10 +61,14 @@ function syncLabel(sync: Sync): string {
 
 export function ConnectorPanel({
   onReviewQueue,
+  onSemanticsQueue,
   onStage,
   onManageIntegrations,
 }: {
   onReviewQueue: (source: string) => void
+  // Opens the semantics-pending queue for a source (#22): the post-import count links there so
+  // a data owner can complete the columns the import landed semantically blank.
+  onSemanticsQueue: (source: string) => void
   onStage: (stage: ConnectorStage) => void
   onManageIntegrations: () => void
 }) {
@@ -454,9 +458,9 @@ export function ConnectorPanel({
             Import record <span className="mono">{imported.import_id}</span>: your approval is
             recorded on it; vehicle <span className="mono">openmetadata-connector</span>.
           </p>
-          {/* Honesty (#25): semantics-pending is an informational COUNT — the import creates no
-              review records for it, so this callout must not claim a queue. Quarantined rows are
-              the real queue, and the result callout above already offers that handoff. */}
+          {/* The count links to the semantics-pending queue (#22): the import still creates no
+              review records — the queue is the live pending predicate over the source's columns,
+              where a data owner completes them. Quarantined rows keep their own handoff above. */}
           {imported.result.status === 'ingested' && imported.semantics_pending > 0 && (
             <div className="callout">
               <CalloutGlyph>
@@ -472,10 +476,16 @@ export function ConnectorPanel({
                     owner confirmation (semantics pending).
                   </strong>{' '}
                   They imported into {imported.source} without as-of basis, additivity, unit, or
-                  currency — facts OpenMetadata does not carry. This is an informational count,
-                  not a review queue; feature generation treats the missing facts honestly until
-                  a data owner confirms them.
+                  currency — facts OpenMetadata does not carry. Feature generation treats the
+                  missing facts honestly until a data owner completes them.
                 </p>
+                <button
+                  type="button"
+                  className="btn"
+                  onClick={() => onSemanticsQueue(imported.source)}
+                >
+                  Complete semantics
+                </button>
               </div>
             </div>
           )}

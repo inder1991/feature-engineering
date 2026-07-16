@@ -9,6 +9,7 @@ import { OverviewScreen } from './screens/OverviewScreen'
 import { RegistryScreen } from './screens/RegistryScreen'
 import { ReviewQueueScreen } from './screens/ReviewQueueScreen'
 import { SearchScreen } from './screens/SearchScreen'
+import { SemanticsPendingScreen } from './screens/SemanticsPendingScreen'
 import { UploadScreen } from './screens/UploadScreen'
 import { WorkbenchScreen } from './screens/WorkbenchScreen'
 
@@ -76,6 +77,13 @@ const ICONS: Record<Route, ReactElement> = {
     <NavIcon>
       <path d="M2.75 4.5h10.5M2.75 8h10.5M2.75 11.5h5.5" />
       <circle cx="12.25" cy="11.5" r="1.5" />
+    </NavIcon>
+  ),
+  semantics: (
+    // A tag awaiting its label: connector-landed columns whose meaning an owner declares.
+    <NavIcon>
+      <path d="M8.4 2.75h4.85V7.6L7.4 13.45 2.55 8.6z" />
+      <circle cx="10.75" cy="5.25" r="0.9" />
     </NavIcon>
   ),
   workbench: (
@@ -175,6 +183,15 @@ const PAGES: { route: Route; label: string; eyebrow: string; title: string; desc
     description: 'Rows the catalog refused to trust',
   },
   {
+    route: 'semantics',
+    label: 'Semantics',
+    eyebrow: 'CATALOG · SEMANTICS',
+    title: 'Semantics pending',
+    description:
+      'Columns that imported without their declared semantics. Fill in additivity, unit, '
+      + 'currency, entity, or the as-of flag — feature generation treats the gaps honestly until you do.',
+  },
+  {
     route: 'governance',
     label: 'Governance',
     eyebrow: 'CATALOG · GOVERNANCE REVIEW',
@@ -199,6 +216,11 @@ export default function App() {
   // the queue the address bar names.
   const openReview = (source: string) => {
     navigate('review', { source })
+  }
+  // Same URL-borne handoff for the semantics queue: the connector's post-import "N semantics
+  // pending" link lands here with the sync's target source in the hash.
+  const openSemantics = (source: string) => {
+    navigate('semantics', { source })
   }
   const page = PAGES.find(p => p.route === route) ?? PAGES[0]
   return (
@@ -239,6 +261,7 @@ export default function App() {
         {route === 'upload' && (
           <UploadScreen
             onReviewQueue={openReview}
+            onSemanticsQueue={openSemantics}
             onManageIntegrations={() => navigate('integrations')}
           />
         )}
@@ -248,6 +271,9 @@ export default function App() {
           <RegistryScreen featureId={params.get('id')} navigate={navigate} />
         )}
         {route === 'review' && <ReviewQueueScreen initialSource={params.get('source') ?? ''} />}
+        {route === 'semantics' && (
+          <SemanticsPendingScreen initialSource={params.get('source') ?? ''} />
+        )}
         {route === 'governance' && <GovernanceReviewScreen />}
         {route === 'dashboard' && <GovernanceDashboardScreen />}
         {route === 'workbench' && <WorkbenchScreen />}

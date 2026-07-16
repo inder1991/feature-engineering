@@ -98,9 +98,11 @@ function GatesStrip({ stage }: { stage: ConnectorStage }) {
 
 export function UploadScreen({
   onReviewQueue,
+  onSemanticsQueue,
   onManageIntegrations,
 }: {
   onReviewQueue: (source: string) => void
+  onSemanticsQueue: (source: string) => void
   onManageIntegrations: () => void
 }) {
   const [path, setPath] = useState<'file' | 'connector'>('file')
@@ -146,6 +148,7 @@ export function UploadScreen({
         <div hidden={path !== 'connector'}>
           <ConnectorPanel
             onReviewQueue={onReviewQueue}
+            onSemanticsQueue={onSemanticsQueue}
             onStage={setStage}
             onManageIntegrations={onManageIntegrations}
           />

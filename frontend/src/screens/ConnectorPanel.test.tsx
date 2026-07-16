@@ -107,12 +107,14 @@ const IMPORT_OK: api.SyncImportResult = {
 
 function renderPanel(over: {
   onReviewQueue?: (s: string) => void
+  onSemanticsQueue?: (s: string) => void
   onStage?: (s: string) => void
   onManageIntegrations?: () => void
 } = {}) {
   render(
     <ConnectorPanel
       onReviewQueue={over.onReviewQueue ?? (() => {})}
+      onSemanticsQueue={over.onSemanticsQueue ?? (() => {})}
       onStage={over.onStage ?? (() => {})}
       onManageIntegrations={over.onManageIntegrations ?? (() => {})}
     />,
@@ -121,7 +123,10 @@ function renderPanel(over: {
 
 // Arranges the mocks BEFORE render (the panel lists integrations + syncs on mount), then walks to
 // a rendered preview of the first (auto-selected) sync.
-async function renderWithPreview(over: { onReviewQueue?: (s: string) => void } = {}) {
+async function renderWithPreview(over: {
+  onReviewQueue?: (s: string) => void
+  onSemanticsQueue?: (s: string) => void
+} = {}) {
   listIntegrations.mockResolvedValue([INTEGRATION])
   listSyncs.mockResolvedValue([SYNC])
   previewSync.mockResolvedValue(PREVIEW)
@@ -407,10 +412,11 @@ describe('approve flow', () => {
     expect(importSync).not.toHaveBeenCalled()
   })
 
-  it('confirm imports the exact previewed hashes; semantics pending is an honest count', async () => {
+  it('confirm imports the exact previewed hashes; semantics pending links to its queue', async () => {
     const onReviewQueue = vi.fn()
+    const onSemanticsQueue = vi.fn()
     importSync.mockResolvedValue(IMPORT_OK)
-    await renderWithPreview({ onReviewQueue })
+    await renderWithPreview({ onReviewQueue, onSemanticsQueue })
     await userEvent.click(screen.getByRole('button', { name: 'Approve import' }))
     await userEvent.click(screen.getByRole('button', { name: 'Confirm approval' }))
 
@@ -422,12 +428,12 @@ describe('approve flow', () => {
       SYNC.sync_id, SNAPSHOT_HASH, PREVIEW.local_baseline_hash)
 
     expect(screen.getByText('omimp_01HZYBBBBBBBBBBBBBBBBBBBBB')).toBeInTheDocument()
-    // Honesty (#25): semantics pending is an informational count — no claimed queue, no queue
-    // button of its own. The quarantine handoff (a REAL queue) stays on the result callout.
+    // The pending count now hands off to the semantics-pending queue (#22) for the sync's
+    // TARGET source; the quarantine handoff (its own queue) stays on the result callout.
     expect(screen.getByText(/13 columns need owner confirmation/i)).toBeInTheDocument()
-    expect(screen.getByText(/not a review queue/i)).toBeInTheDocument()
     expect(screen.queryByText(/now in the review queue/i)).not.toBeInTheDocument()
-    expect(screen.queryByRole('button', { name: 'Open review queue' })).not.toBeInTheDocument()
+    await userEvent.click(screen.getByRole('button', { name: 'Complete semantics' }))
+    expect(onSemanticsQueue).toHaveBeenCalledExactlyOnceWith('cards')
 
     await userEvent.click(screen.getByRole('button', { name: /review 1 quarantined row/i }))
     expect(onReviewQueue).toHaveBeenCalledExactlyOnceWith('cards')

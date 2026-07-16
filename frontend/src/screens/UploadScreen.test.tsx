@@ -42,11 +42,13 @@ const result = (over: Partial<api.IngestResult>): api.IngestResult => ({
 
 function renderUpload(over: {
   onReviewQueue?: (s: string) => void
+  onSemanticsQueue?: (s: string) => void
   onManageIntegrations?: () => void
 } = {}) {
   render(
     <UploadScreen
       onReviewQueue={over.onReviewQueue ?? (() => {})}
+      onSemanticsQueue={over.onSemanticsQueue ?? (() => {})}
       onManageIntegrations={over.onManageIntegrations ?? (() => {})}
     />,
   )

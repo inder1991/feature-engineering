@@ -3,12 +3,12 @@
 import { useCallback, useMemo, useSyncExternalStore } from 'react'
 
 export type Route =
-  | 'overview' | 'upload' | 'search' | 'review' | 'workbench' | 'registry' | 'integrations'
-  | 'governance' | 'dashboard'
+  | 'overview' | 'upload' | 'search' | 'review' | 'semantics' | 'workbench' | 'registry'
+  | 'integrations' | 'governance' | 'dashboard'
 
 const ROUTES: readonly string[] =
-  ['overview', 'upload', 'search', 'review', 'workbench', 'registry', 'integrations',
-    'governance', 'dashboard']
+  ['overview', 'upload', 'search', 'review', 'semantics', 'workbench', 'registry',
+    'integrations', 'governance', 'dashboard']
 
 export function parseHash(hash: string): { route: Route; params: URLSearchParams } {
   const raw = hash.replace(/^#\/?/, '')

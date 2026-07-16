@@ -31,6 +31,13 @@ describe('useHashRoute', () => {
     expect(result.current.route).toBe('integrations')
   })
 
+  it('resolves the semantics route with its ?source= param', () => {
+    window.location.hash = '#/semantics?source=cards'
+    const { result } = renderHook(() => useHashRoute())
+    expect(result.current.route).toBe('semantics')
+    expect(result.current.params.get('source')).toBe('cards')
+  })
+
   it('reacts to hashchange events', () => {
     const { result } = renderHook(() => useHashRoute())
     expect(result.current.route).toBe('overview')

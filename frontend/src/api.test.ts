@@ -1,11 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
-  ApiError, contractConfirm, contractConsideredSet, contractDraft, type ContractDraft,
-  createIntegration, createSync, deleteIntegration, deleteSync, discoverServices,
-  type DiscoveredService, type FeatureIdea, getIntegration, getSync, importSync,
-  type Integration, type LineageGraph, lineageGraph, listContracts, listIntegrations,
-  listSyncs, patchIntegration, patchSync, previewSync, recommendFeatures, recommendFeatureSets,
-  refineCandidate, searchCatalog, type Sync, type SyncPreview, uploadFile,
+  ApiError, completeSemantics, contractConfirm, contractConsideredSet, contractDraft,
+  type ContractDraft, createIntegration, createSync, deleteIntegration, deleteSync,
+  discoverServices, type DiscoveredService, type FeatureIdea, getIntegration,
+  getSemanticsPending, getSync, importSync, type Integration, type LineageGraph, lineageGraph,
+  listContracts, listIntegrations, listSyncs, patchIntegration, patchSync, previewSync,
+  recommendFeatures, recommendFeatureSets, refineCandidate, searchCatalog, type Sync,
+  type SyncPreview, uploadFile,
 } from './api'
 import { setSession } from './session'
 
@@ -525,6 +526,45 @@ describe('sync preview/import client', () => {
     fetchMock.mockImplementation(async () =>
       new Response(JSON.stringify({ detail }), { status: 400 }))
     await expect(previewSync(SYNC.sync_id)).rejects.toMatchObject({ status: 400, detail })
+  })
+})
+
+describe('semantics-pending client (#22)', () => {
+  it('getSemanticsPending GETs the source-scoped queue with the source percent-encoded', async () => {
+    const rows = [{
+      object_ref: 'accounts.balance', table: 'accounts', column: 'balance',
+      data_type: 'numeric', missing: ['as_of', 'additivity', 'unit', 'currency', 'entity'],
+    }]
+    fetchMock.mockImplementation(ok(rows))
+    const result = await getSemanticsPending('cards/legacy')
+    expect(result).toEqual(rows)
+    const [url, init] = fetchMock.mock.calls[0]
+    expect(url).toBe('/sources/cards%2Flegacy/semantics-pending')
+    expect(init.method).toBeUndefined()
+  })
+
+  it('completeSemantics POSTs only the set values, with the ref encoded in the path', async () => {
+    fetchMock.mockImplementation(ok({ completed: true, applied: { additivity: 'additive' } }))
+    const result = await completeSemantics('cards', 'accounts.balance#v2', {
+      additivity: 'additive',
+      is_as_of: true,
+    })
+    expect(result).toEqual({ completed: true, applied: { additivity: 'additive' } })
+    const [url, init] = fetchMock.mock.calls[0]
+    expect(url).toBe('/sources/cards/columns/accounts.balance%23v2/semantics')
+    expect(init.method).toBe('POST')
+    // Unset fields never ride the wire: completion SETS values, it does not clear them.
+    expect(JSON.parse(init.body)).toEqual({ additivity: 'additive', is_as_of: true })
+  })
+
+  it('surfaces the second-as-of-axis 409 as ApiError with the backend sentence', async () => {
+    const detail = "table 'accounts' already has an as-of axis ('opened_at'); a table asserts "
+      + 'ONE availability basis — unset it first or complete that column instead'
+    fetchMock.mockImplementation(async () =>
+      new Response(JSON.stringify({ detail }), { status: 409 }))
+    await expect(
+      completeSemantics('cards', 'accounts.balance', { is_as_of: true }),
+    ).rejects.toMatchObject({ status: 409, detail })
   })
 })
 
