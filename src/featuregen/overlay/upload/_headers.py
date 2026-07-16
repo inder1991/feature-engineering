@@ -72,21 +72,26 @@ def build_row(fmap: Mapping[str, str], rowdict: Mapping[str, object], source: st
         val = rowdict.get(col) if col else None
         return str(val).strip() if val is not None else ""
 
+    errors: list[str] = []
+
     def flag(field: str) -> bool:
         token = cell(field).lower()
         if token in _TRUE:
             return True
-        if token in _FALSE:
-            return False
-        # An unrecognized token was previously coerced to False, silently dropping a possible grain /
-        # as-of declaration. Surface it as a parse error instead (#18); the upload boundary 400s it.
-        raise ValueError(
-            f"invalid boolean for '{field}': {token!r} (expected y/yes/true/1, n/no/false/0, or blank)")
+        if token not in _FALSE:
+            # An unrecognized token was once coerced to False, silently dropping a possible grain /
+            # as-of declaration (#18) — then raised, which 400'd the WHOLE upload while an enum typo
+            # (cardinality/additivity/as_of_basis) only quarantines its row. Record the fault ON the
+            # row instead: validate_rows quarantines exactly this row with this reason (#18 f-up).
+            errors.append(f"invalid boolean for '{field}': {token!r} "
+                          "(expected y/yes/true/1, n/no/false/0, or blank)")
+        return False
 
+    is_grain, as_of = flag("is_grain"), flag("as_of")     # evaluated before errors is read below
     return CanonicalRow(
         source=cell("source") or source,
         table=cell("table"), column=cell("column"), type=cell("type"),
-        is_grain=flag("is_grain"), as_of=flag("as_of"),
+        is_grain=is_grain, as_of=as_of, parse_error="; ".join(errors),
         as_of_basis=cell("as_of_basis").lower(),
         definition=cell("definition"), sensitivity=cell("sensitivity").lower(),
         joins_to=cell("joins_to"), cardinality=cell("cardinality"),

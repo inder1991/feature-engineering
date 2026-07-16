@@ -57,6 +57,11 @@ class CanonicalRow:
     unit: str = ""            # e.g. dollars, cents
     currency: str = ""        # e.g. USD
     entity: str = ""          # the business entity this column denotes (Customer, Account)
+    # NOT catalog metadata: a reader-recorded cell-parse fault (e.g. an invalid boolean token).
+    # Non-empty ⟹ validate_rows quarantines the row with this reason (#18 follow-up) — a per-row
+    # cell fault must neither raise in the reader (that 400s the WHOLE upload, unlike an enum typo,
+    # which only quarantines its row) nor silently coerce (the original #18 finding).
+    parse_error: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -122,6 +127,12 @@ def validate_rows(rows: list[CanonicalRow],
         missing = [f for f in required if not str(getattr(r, f)).strip()]   # whitespace-only == missing
         if missing:
             quarantined.append(RowError(i, f"missing required field(s): {', '.join(missing)}", r))
+            continue
+        if r.parse_error:
+            # A reader-detected cell fault (an invalid boolean token, #18 follow-up). Quarantine
+            # THIS row with the reader's reason — consistent with the enum-vocabulary checks below;
+            # raising in the reader rejected the whole file for one typo'd flag.
+            quarantined.append(RowError(i, r.parse_error, r))
             continue
         if catalog_source is not None and _norm(r.source) != _norm(catalog_source):
             quarantined.append(RowError(

@@ -12,12 +12,16 @@ def test_duplicate_header_rejected():
         read_csv_rows(text, source="deposits")
 
 
-def test_invalid_boolean_token_rejected():
-    # An unrecognized boolean token (here is_grain='maybe') must not be silently coerced to False;
-    # surface it as a parse error rather than dropping a possible grain declaration (#18).
-    text = "table,column,type,is_grain\norders,id,integer,maybe\n"
-    with pytest.raises(ValueError, match="boolean"):
-        read_csv_rows(text, source="deposits")
+def test_invalid_boolean_token_carries_parse_error():
+    # An unrecognized boolean token (here is_grain='maybe') must not be silently coerced to False
+    # (#18: that dropped a possible grain declaration) — but raising here 400'd the WHOLE upload,
+    # while an enum typo (cardinality/additivity/as_of_basis) only quarantines its row (#18
+    # follow-up). The reader records the fault ON the row; validate_rows quarantines exactly it.
+    text = "table,column,type,is_grain\norders,id,integer,maybe\norders,amt,numeric,\n"
+    rows = read_csv_rows(text, source="deposits")
+    assert len(rows) == 2
+    assert "boolean" in rows[0].parse_error and "maybe" in rows[0].parse_error
+    assert rows[1].parse_error == ""                      # a valid/blank boolean still parses clean
 
 
 def test_conflicting_alias_headers_rejected():

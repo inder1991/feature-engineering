@@ -82,6 +82,21 @@ def test_invalid_as_of_basis_quarantined_not_coerced():
     assert "as_of_basis" in result.quarantined[0].message
 
 
+def test_reader_parse_error_quarantines_that_row_only():
+    # #18 follow-up: an invalid boolean token used to raise in the reader -> 400 the whole upload,
+    # while enum typos only quarantine their row. The reader now records the fault on the row
+    # (CanonicalRow.parse_error); validation quarantines it with the reader's reason and ingests
+    # the rest — never the silent coerce-to-False that #18 removed.
+    rows = [_row(column="id",
+                 parse_error="invalid boolean for 'is_grain': 'maybe' (expected y/yes/true/1, "
+                             "n/no/false/0, or blank)"),
+            _row(column="ok")]
+    result = validate_rows(rows)
+    assert [r.column for r in result.good] == ["ok"]
+    assert len(result.quarantined) == 1
+    assert "is_grain" in result.quarantined[0].message and "maybe" in result.quarantined[0].message
+
+
 def test_valid_enums_and_empty_pass():
     rows = [_row(cardinality="N:1", additivity="semi_additive", as_of=True, as_of_basis="posted_at"),
             _row(column="c2", cardinality="", additivity="", as_of_basis="")]

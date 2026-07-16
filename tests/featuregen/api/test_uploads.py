@@ -37,6 +37,17 @@ def test_bad_rows_quarantined_good_rows_ingested(client):
     assert body["quarantined"] == 1
 
 
+def test_invalid_boolean_quarantines_row_not_whole_upload(client):
+    """#18 follow-up: one typo'd is_grain token must quarantine that ROW with a reason — consistent
+    with the enum fields (cardinality/additivity/as_of_basis) — not 400 the entire file, and never
+    silently coerce to False (the original #18 finding)."""
+    res = upload_csv(client, "deposits", DEPOSITS_CSV + "deposits,savings,flag,integer,maybe\n")
+    assert res.status_code == 200
+    body = res.json()
+    assert body["status"] == "ingested"                   # the rest of the file still ingests
+    assert body["quarantined"] == 1                       # only the typo'd row is held for review
+
+
 def test_padded_source_resolves_to_same_catalog(client):
     """#16: a padded source id must resolve to the SAME catalog as its trimmed form. The padded
     truncated re-upload hits the large-change brake — pre-fix it silently minted a SECOND catalog
