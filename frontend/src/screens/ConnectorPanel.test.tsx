@@ -423,7 +423,7 @@ describe('approve flow', () => {
 
     const notice = await screen.findByRole('alert')
     expect(notice).toHaveTextContent(/the preview went stale/i)
-    expect(notice).toHaveTextContent(/snapshot hash mismatch/)
+    expect(notice).toHaveTextContent(/OpenMetadata or the local catalog changed/i)
     expect(notice).toHaveTextContent(/nothing was imported/i)
     // The stale dry run is no longer approvable; only a fresh preview reopens the gate.
     expect(screen.getByRole('button', { name: 'Approve import' })).toBeDisabled()
