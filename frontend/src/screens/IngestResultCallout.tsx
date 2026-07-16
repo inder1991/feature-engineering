@@ -3,6 +3,7 @@
 // callout renders it — held, rejected, and ingested keep one voice across vehicles.
 import { useEffect, useState, type ReactNode } from 'react'
 import { getIngestionRun, type IngestionStage, type IngestResult } from '../api'
+import { RunDetailPanel } from './RunDetailPanel'
 
 export function CalloutGlyph({ children }: { children: ReactNode }) {
   return (
@@ -100,9 +101,10 @@ export function summarizeStages(stages: IngestionStage[]): StageSummarySegment[]
   return segments
 }
 
-// Best-effort color under the ingested result: fetch the run, render one compact line. A fetch
-// failure (or an all-quiet run) renders nothing extra — the core result above already told the
-// truth, and this line must never block or break it.
+// Best-effort color under the result — ANY result: held/rejected runs carry stages too (incl.
+// not_run for what never got a chance). Fetch the run, render one compact line. A fetch failure
+// (or an all-quiet run) renders nothing extra — the core result above already told the truth,
+// and this line must never block or break it.
 function StageSummaryLine({ runId }: { runId: string }) {
   const [segments, setSegments] = useState<StageSummarySegment[] | null>(null)
   useEffect(() => {
@@ -145,6 +147,24 @@ export function IngestResultCallout({
   // connector whose scope they narrow. Defaults to the file-upload advice.
   heldAdvice?: string
 }) {
+  // Every outcome opens a run record now (held/rejected included), so every branch gets the
+  // compact stage line AND the same door into the full manifest. The panel renders as a
+  // sibling below the callout, never inside it.
+  const runId = result.ingestion_run_id ?? null
+  const [showRun, setShowRun] = useState(false)
+  const runDetailsButton = runId && (
+    <button
+      type="button"
+      className="btn"
+      aria-expanded={showRun}
+      onClick={() => setShowRun(v => !v)}
+    >
+      {showRun ? 'Hide run details' : 'View run details'}
+    </button>
+  )
+  const runDetailsPanel = showRun && runId && (
+    <RunDetailPanel runId={runId} onClose={() => setShowRun(false)} />
+  )
   // The backend PERSISTS quarantine rows even when the catalog change itself is held or
   // rejected, so both branches must surface the queue (#12) — and the copy must not claim
   // "nothing was applied" when the review queue just changed.
@@ -162,74 +182,88 @@ export function IngestResultCallout({
   )
   if (result.status === 'held') {
     return (
-      <div className="callout callout--warn" role="status">
-        <CalloutGlyph>
-          <path d="M8 2.75 14 13.25H2z" />
-          <path d="M8 6.75v2.75M8 11.5v.01" />
-        </CalloutGlyph>
-        <div className="callout-body">
-          <p>
-            <strong>
-              Held: this change removes too much of the existing catalog to apply automatically.
-            </strong>
-          </p>
-          <p>{result.reason}</p>
-          <p>
-            {result.quarantined > 0
-              ? 'No catalog changes were applied. There is no override yet.'
-              : 'Nothing was applied. There is no override yet.'}{' '}
-            {heldAdvice ??
-              'Adjust the file so it keeps most existing objects, or split the change into smaller uploads.'}
-          </p>
-          {quarantineHandoff}
+      <>
+        <div className="callout callout--warn" role="status">
+          <CalloutGlyph>
+            <path d="M8 2.75 14 13.25H2z" />
+            <path d="M8 6.75v2.75M8 11.5v.01" />
+          </CalloutGlyph>
+          <div className="callout-body">
+            <p>
+              <strong>
+                Held: this change removes too much of the existing catalog to apply automatically.
+              </strong>
+            </p>
+            <p>{result.reason}</p>
+            <p>
+              {result.quarantined > 0
+                ? 'No catalog changes were applied. There is no override yet.'
+                : 'Nothing was applied. There is no override yet.'}{' '}
+              {heldAdvice ??
+                'Adjust the file so it keeps most existing objects, or split the change into smaller uploads.'}
+            </p>
+            {runId && <StageSummaryLine runId={runId} />}
+            {quarantineHandoff}
+            {runDetailsButton}
+          </div>
         </div>
-      </div>
+        {runDetailsPanel}
+      </>
     )
   }
   if (result.status === 'rejected') {
     return (
-      <div className="callout callout--danger" role="status">
-        <CalloutGlyph>
-          <circle cx="8" cy="8" r="6.25" />
-          <path d="m5.75 5.75 4.5 4.5m0-4.5-4.5 4.5" />
-        </CalloutGlyph>
-        <div className="callout-body">
-          <p>
-            <strong>Rejected.</strong>
-          </p>
-          <p>{result.reason}</p>
-          {quarantineHandoff}
+      <>
+        <div className="callout callout--danger" role="status">
+          <CalloutGlyph>
+            <circle cx="8" cy="8" r="6.25" />
+            <path d="m5.75 5.75 4.5 4.5m0-4.5-4.5 4.5" />
+          </CalloutGlyph>
+          <div className="callout-body">
+            <p>
+              <strong>Rejected.</strong>
+            </p>
+            <p>{result.reason}</p>
+            {runId && <StageSummaryLine runId={runId} />}
+            {quarantineHandoff}
+            {runDetailsButton}
+          </div>
         </div>
-      </div>
+        {runDetailsPanel}
+      </>
     )
   }
   return (
-    <div className="callout callout--ok" role="status">
-      <CalloutGlyph>
-        <circle cx="8" cy="8" r="6.25" />
-        <path d="m5.25 8.25 2 2 3.5-4.5" />
-      </CalloutGlyph>
-      <div className="callout-body">
-        <p>
-          <strong>Ingested.</strong>
-        </p>
-        <p className="tabular-nums">
-          <Count value={result.asserted} tone="ok" /> facts asserted,{' '}
-          <Count value={result.changed_objects} tone="warn" /> objects changed,{' '}
-          <Count value={result.quarantined} tone="warn" /> quarantined
-        </p>
-        {result.flagged && (
-          <p style={{ color: 'var(--warn)' }}>
-            <span style={{ fontWeight: 600 }}>Flagged:</span> {result.flagged}
+    <>
+      <div className="callout callout--ok" role="status">
+        <CalloutGlyph>
+          <circle cx="8" cy="8" r="6.25" />
+          <path d="m5.25 8.25 2 2 3.5-4.5" />
+        </CalloutGlyph>
+        <div className="callout-body">
+          <p>
+            <strong>Ingested.</strong>
           </p>
-        )}
-        {result.ingestion_run_id && <StageSummaryLine runId={result.ingestion_run_id} />}
-        {result.quarantined > 0 && (
-          <button type="button" className="btn" onClick={() => onReviewQueue(source)}>
-            Review {result.quarantined} quarantined row{result.quarantined === 1 ? '' : 's'}
-          </button>
-        )}
+          <p className="tabular-nums">
+            <Count value={result.asserted} tone="ok" /> facts asserted,{' '}
+            <Count value={result.changed_objects} tone="warn" /> objects changed,{' '}
+            <Count value={result.quarantined} tone="warn" /> quarantined
+          </p>
+          {result.flagged && (
+            <p style={{ color: 'var(--warn)' }}>
+              <span style={{ fontWeight: 600 }}>Flagged:</span> {result.flagged}
+            </p>
+          )}
+          {runId && <StageSummaryLine runId={runId} />}
+          {result.quarantined > 0 && (
+            <button type="button" className="btn" onClick={() => onReviewQueue(source)}>
+              Review {result.quarantined} quarantined row{result.quarantined === 1 ? '' : 's'}
+            </button>
+          )}
+          {runDetailsButton}
+        </div>
       </div>
-    </div>
+      {runDetailsPanel}
+    </>
   )
 }

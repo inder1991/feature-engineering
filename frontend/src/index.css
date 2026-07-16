@@ -3094,3 +3094,55 @@ button.gj-chip--on:hover {
   font-size: 12.5px;
   color: var(--ink-soft);
 }
+
+/* ---------------------------------------------------------------- ingestion run detail (#14)
+   Appended for RunDetailPanel: the durable run manifest reached from the ingest result callout
+   and from a failed upload's error callout. Stage chips: warn states (failed/partial/
+   audit_degraded/lagged/deferred) get the soft warn tone; a FAILED run's status chip gets the
+   solid danger fill (mirrors .badge.rejected, per the strong-states rule); quiet states
+   (not_run/skipped/disabled/not_applicable) keep the muted base .badge. The state word always
+   renders inside the chip — color never works alone. Composes the existing .panel / .kv /
+   .badge / .btn / .callout / table vocabulary; nothing above this line is modified. */
+
+.badge.stage-warn {
+  background: var(--warn-soft);
+  border-color: transparent;
+  color: var(--warn);
+}
+
+.badge.run-failed {
+  background: var(--danger-solid);
+  border-color: transparent;
+  color: var(--chip-ink);
+}
+
+.run-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.run-head .mono {
+  font-size: 12px;
+  color: var(--ink-soft);
+  overflow-wrap: anywhere;
+}
+
+.run-head .btn {
+  margin-left: auto;
+}
+
+.run-section {
+  margin: 18px 0 6px;
+}
+
+.run-history {
+  margin: 0;
+  padding-left: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: 12.5px;
+  color: var(--ink-soft);
+  font-variant-numeric: tabular-nums;
+}

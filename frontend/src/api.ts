@@ -108,6 +108,7 @@ export interface IngestResult {
 // projection_drain, quarantine.
 export interface IngestionStage {
   stage: string
+  attempt: number
   state: string
   reason_code: string | null
   detail: Record<string, unknown> | null
@@ -115,15 +116,34 @@ export interface IngestionStage {
   completed_at: string | null
 }
 
+// One append-only status transition of a run (opened -> ingested/held/rejected/failed), in
+// recorded order. reason_code is the redacted vocabulary token, never raw error text.
+export interface IngestionStatusEvent {
+  status: string
+  at: string
+  reason_code: string | null
+}
+
 // The GET /ingestion-runs/{id} record as the backend returns it (overlay/upload/ingestion_run
-// get_run): the run row keyed `id` — NOT run_id — plus origin/source/status and the per-stage
-// reports. The wire carries more columns (filename, actor, fingerprints, status_history, ...);
-// declare only what the client reads, under the exact backend names.
+// get_run): the run row keyed `id` — NOT run_id — plus who/what/when manifest facts, the
+// status history, and the per-stage reports. The wire carries a few more columns (file_sha256,
+// fingerprints, effective_config, heartbeat_at); declare only what the client reads, under the
+// exact backend names. Runs exist for EVERY outcome now — ingested, held, rejected, and failed.
 export interface IngestionRun {
   id: string
   origin_type: string
   catalog_source: string
+  filename: string | null
+  actor_subject: string | null
+  actor_role_claims: string[]
+  authorization_decision: string | null
   status: string
+  row_count: number | null
+  quarantined_count: number | null
+  started_at: string | null
+  completed_at: string | null
+  redacted_failure_code: string | null
+  status_history: IngestionStatusEvent[]
   stages: IngestionStage[]
 }
 

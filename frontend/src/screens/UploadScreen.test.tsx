@@ -13,6 +13,7 @@ vi.mock('../api', async importOriginal => {
     listSyncs: vi.fn(),
     previewSync: vi.fn(),
     importSync: vi.fn(),
+    getIngestionRun: vi.fn(),
   }
 })
 const uploadFile = vi.mocked(api.uploadFile)
@@ -20,6 +21,7 @@ const listIntegrations = vi.mocked(api.listIntegrations)
 const listSyncs = vi.mocked(api.listSyncs)
 const previewSync = vi.mocked(api.previewSync)
 const importSync = vi.mocked(api.importSync)
+const getIngestionRun = vi.mocked(api.getIngestionRun)
 
 // Block body (not `() => uploadFile.mockReset()`): mockReset() returns the mock fn, and Vitest
 // treats a function returned from beforeEach as a per-test teardown — it would then call the mock
@@ -30,6 +32,7 @@ beforeEach(() => {
   listSyncs.mockReset()
   previewSync.mockReset()
   importSync.mockReset()
+  getIngestionRun.mockReset()
   listIntegrations.mockResolvedValue([])
   listSyncs.mockResolvedValue([])
 })
@@ -153,6 +156,44 @@ describe('upload screen', () => {
     renderUpload()
     await submit()
     expect(await screen.findByRole('alert')).toHaveTextContent(/unsupported file type/)
+    // No X-Ingestion-Run-Id header rode the error: there is no run to inspect, so no link.
+    expect(screen.queryByRole('button', { name: /run details/i })).toBeNull()
+  })
+
+  // A failed upload still opened a run record (#14): the ApiError carries the run id from the
+  // X-Ingestion-Run-Id header, and the error callout must open the run-detail panel for it.
+  it('a failed upload with a run id offers "View run details" and opens the panel', async () => {
+    uploadFile.mockRejectedValue(
+      new api.ApiError(500, 'ingest failed', 'run-failed-1'),
+    )
+    getIngestionRun.mockResolvedValue({
+      id: 'run-failed-1', origin_type: 'upload', catalog_source: 'deposits',
+      filename: 'd.csv', actor_subject: 'user:o', actor_role_claims: ['data_owner'],
+      authorization_decision: 'permitted', status: 'failed', row_count: null,
+      quarantined_count: null, started_at: '2026-07-16T09:00:00+00:00', completed_at: null,
+      redacted_failure_code: 'FACT_ASSERTION_ERROR',
+      status_history: [
+        { status: 'opened', at: '2026-07-16T09:00:00+00:00', reason_code: null },
+        { status: 'failed', at: '2026-07-16T09:00:01+00:00',
+          reason_code: 'FACT_ASSERTION_ERROR' },
+      ],
+      stages: [
+        { stage: 'parse', attempt: 1, state: 'succeeded', reason_code: null, detail: null,
+          started_at: null, completed_at: null },
+        { stage: 'fact_assertion', attempt: 1, state: 'failed',
+          reason_code: 'FACT_ASSERTION_ERROR', detail: null,
+          started_at: null, completed_at: null },
+      ],
+    })
+    renderUpload()
+    await submit()
+    expect(await screen.findByRole('alert')).toHaveTextContent(/upload failed/i)
+    await userEvent.click(screen.getByRole('button', { name: 'View run details' }))
+    expect(getIngestionRun).toHaveBeenCalledExactlyOnceWith('run-failed-1')
+    const panel = await screen.findByRole('region', { name: /ingestion run details/i })
+    expect(panel).toHaveTextContent('FACT_ASSERTION_ERROR')
+    await userEvent.click(screen.getByRole('button', { name: 'Hide run details' }))
+    expect(screen.queryByRole('region', { name: /ingestion run details/i })).toBeNull()
   })
 })
 

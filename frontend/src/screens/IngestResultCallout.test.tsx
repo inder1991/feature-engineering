@@ -23,13 +23,23 @@ const result = (over: Partial<api.IngestResult> = {}): api.IngestResult => ({
 })
 
 const stage = (name: string, state: string): api.IngestionStage => ({
-  stage: name, state, reason_code: null, detail: null, started_at: null, completed_at: null,
+  stage: name, attempt: 1, state, reason_code: null, detail: null,
+  started_at: null, completed_at: null,
 })
 
-// The full IngestionRun wire shape (backend get_run keys: id, origin_type, catalog_source,
-// status, stages) — typed against the api interface so a field-name drift fails typecheck.
-const run = (id: string, stages: api.IngestionStage[]): api.IngestionRun => ({
-  id, origin_type: 'upload', catalog_source: 'deposits', status: 'ingested', stages,
+// The full IngestionRun wire shape (backend get_run keys) — typed against the api interface so
+// a field-name drift fails typecheck. Runs exist for every outcome: ingested/held/rejected/failed.
+const run = (
+  id: string,
+  stages: api.IngestionStage[],
+  over: Partial<api.IngestionRun> = {},
+): api.IngestionRun => ({
+  id, origin_type: 'upload', catalog_source: 'deposits', filename: 'deposits.csv',
+  actor_subject: 'user:o', actor_role_claims: ['data_owner'],
+  authorization_decision: 'permitted', status: 'ingested', row_count: 4,
+  quarantined_count: 0, started_at: '2026-07-16T09:00:00+00:00',
+  completed_at: '2026-07-16T09:00:02+00:00', redacted_failure_code: null,
+  status_history: [], stages, ...over,
 })
 
 function renderCallout(res: api.IngestResult) {
@@ -81,11 +91,64 @@ describe('ingest result stage summary', () => {
     expect(screen.queryByText(/Enriched|Pass B|Pass C|projection/)).toBeNull()
   })
 
-  it('never fetches without a run id, and never for a non-ingested result', () => {
+  it('never fetches without a run id — any status', () => {
     renderCallout(result())
-    expect(screen.getByText('Ingested.')).toBeInTheDocument()
-    renderCallout(result({ status: 'held', reason: 'too much removed', ingestion_run_id: 'run-4' }))
+    renderCallout(result({ status: 'held', reason: 'too much removed' }))
+    renderCallout(result({ status: 'rejected', reason: 'unrecognized headers' }))
     expect(getIngestionRun).not.toHaveBeenCalled()
+  })
+
+  // Held/rejected runs carry stages too now — including not_run for what never got a chance.
+  // The same compact line renders under the reason; quiet not_run stages stay quiet.
+  it('held with a run id fetches and shows the stage summary', async () => {
+    getIngestionRun.mockResolvedValue(run('run-5', [
+      stage('parse', 'succeeded'),
+      stage('brake', 'failed'),
+      stage('enrich_concept', 'not_run'),
+      stage('pass_b', 'not_run'),
+    ], { status: 'held' }))
+    renderCallout(result({ status: 'held', reason: 'too much removed', ingestion_run_id: 'run-5' }))
+    expect(getIngestionRun).toHaveBeenCalledWith('run-5')
+    expect(await screen.findByText('brake failed')).toHaveStyle({ fontWeight: '600' })
+    // not_run stays quiet in the one-line summary (the full table lives in the run panel).
+    expect(screen.queryByText(/not run/)).toBeNull()
+  })
+
+  it('rejected with a run id fetches and shows the stage summary', async () => {
+    getIngestionRun.mockResolvedValue(run('run-6', [
+      stage('validation', 'partial'),
+      stage('drift', 'not_run'),
+    ], { status: 'rejected' }))
+    renderCallout(
+      result({ status: 'rejected', reason: 'unrecognized headers', ingestion_run_id: 'run-6' }))
+    expect(getIngestionRun).toHaveBeenCalledWith('run-6')
+    expect(await screen.findByText('validation partial')).toHaveStyle({ fontWeight: '600' })
+  })
+})
+
+// Every outcome with a run id gets the same door into the full manifest.
+describe('view run details', () => {
+  it.each(['ingested', 'held', 'rejected'] as const)(
+    '%s result offers "View run details" and toggles the panel',
+    async status => {
+      getIngestionRun.mockResolvedValue(
+        run('run-7', [stage('parse', 'succeeded')], { status }))
+      renderCallout(result({ status, reason: status === 'ingested' ? null : 'why',
+        ingestion_run_id: 'run-7' }))
+      const button = screen.getByRole('button', { name: 'View run details' })
+      expect(button).toHaveAttribute('aria-expanded', 'false')
+      await userEvent.click(button)
+      expect(await screen.findByRole('heading', { name: 'Ingestion run' })).toBeInTheDocument()
+      const hide = screen.getByRole('button', { name: 'Hide run details' })
+      expect(hide).toHaveAttribute('aria-expanded', 'true')
+      await userEvent.click(hide)
+      expect(screen.queryByRole('heading', { name: 'Ingestion run' })).toBeNull()
+    },
+  )
+
+  it('offers no run-details button without a run id', () => {
+    renderCallout(result())
+    expect(screen.queryByRole('button', { name: /run details/i })).toBeNull()
   })
 })
 

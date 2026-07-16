@@ -10,6 +10,7 @@ import type { IngestResult } from '../api'
 import { ConnectorPanel } from './ConnectorPanel'
 import type { ConnectorStage } from './ConnectorPanel'
 import { CalloutGlyph, IngestResultCallout } from './IngestResultCallout'
+import { RunDetailPanel } from './RunDetailPanel'
 
 // Mirrors the backend contract exactly (#28): uploads.py caps at 25 MiB and accepts
 // .csv/.xlsx/.xlsm — the pre-flight must not refuse what the server would take.
@@ -164,7 +165,11 @@ function FileUploadPath({ onReviewQueue }: { onReviewQueue: (source: string) => 
   // review-queue handoff never read the live input (which the user may already have edited
   // for the next upload).
   const [uploaded, setUploaded] = useState<{ result: IngestResult; source: string } | null>(null)
-  const [error, setError] = useState('')
+  // A failed upload still opened a run record: the ApiError carries its id (from the
+  // X-Ingestion-Run-Id header), so the error keeps it and the callout can open the run-detail
+  // panel — a FAILED run stays inspectable (#14). runId is null when the server sent no header.
+  const [error, setError] = useState<{ detail: string; runId: string | null } | null>(null)
+  const [showFailedRun, setShowFailedRun] = useState(false)
   const [busy, setBusy] = useState(false)
   const [hover, setHover] = useState(false)
   const [focus, setFocus] = useState(false)
@@ -175,12 +180,17 @@ function FileUploadPath({ onReviewQueue }: { onReviewQueue: (source: string) => 
     const submittedSource = source.trim()
     if (!file || !submittedSource) return
     setBusy(true)
-    setError('')
+    setError(null)
+    setShowFailedRun(false)
     setUploaded(null)
     try {
       setUploaded({ result: await uploadFile(file, submittedSource), source: submittedSource })
     } catch (err) {
-      setError(err instanceof ApiError ? err.detail : String(err))
+      setError(
+        err instanceof ApiError
+          ? { detail: err.detail, runId: err.ingestionRunId }
+          : { detail: String(err), runId: null },
+      )
     } finally {
       setBusy(false)
     }
@@ -302,17 +312,32 @@ function FileUploadPath({ onReviewQueue }: { onReviewQueue: (source: string) => 
         </form>
       </div>
       {error && (
-        <div className="callout callout--danger" role="alert">
-          <CalloutGlyph>
-            <circle cx="8" cy="8" r="6.25" />
-            <path d="m5.75 5.75 4.5 4.5m0-4.5-4.5 4.5" />
-          </CalloutGlyph>
-          <div className="callout-body">
-            <p>
-              <strong>Upload failed.</strong> {error}
-            </p>
+        <>
+          <div className="callout callout--danger" role="alert">
+            <CalloutGlyph>
+              <circle cx="8" cy="8" r="6.25" />
+              <path d="m5.75 5.75 4.5 4.5m0-4.5-4.5 4.5" />
+            </CalloutGlyph>
+            <div className="callout-body">
+              <p>
+                <strong>Upload failed.</strong> {error.detail}
+              </p>
+              {error.runId && (
+                <button
+                  type="button"
+                  className="btn"
+                  aria-expanded={showFailedRun}
+                  onClick={() => setShowFailedRun(v => !v)}
+                >
+                  {showFailedRun ? 'Hide run details' : 'View run details'}
+                </button>
+              )}
+            </div>
           </div>
-        </div>
+          {showFailedRun && error.runId && (
+            <RunDetailPanel runId={error.runId} onClose={() => setShowFailedRun(false)} />
+          )}
+        </>
       )}
       {uploaded && (
         <IngestResultCallout
