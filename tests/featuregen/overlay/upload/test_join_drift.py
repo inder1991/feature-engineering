@@ -49,14 +49,28 @@ _TO = "public.accounts.account_id"
 # ── Seed helpers ──────────────────────────────────────────────────────────────────────────────────
 
 
+def _file_declared(db, from_ref=_FROM, to_ref=_TO, *, source=_SRC):
+    """Mark a join as FILE-DECLARED in a prior upload (migration 0991). Stored SORTED, exactly as
+    the detector records it — a divergence is only ever raised for a file-declared VERIFIED join."""
+    lo, hi = sorted((from_ref, to_ref))
+    db.execute(
+        "INSERT INTO file_declared_join (catalog_source, from_ref, to_ref, declared_at)"
+        " VALUES (%s, %s, %s, %s) ON CONFLICT DO NOTHING", (source, lo, hi, _NOW))
+
+
 def _verified_edge(db, from_ref=_FROM, to_ref=_TO, *, source=_SRC, status="VERIFIED",
-                   authority="operational"):
-    """A fact-linked `joins` graph_edge in the shape `project_confirmed_joins` writes."""
+                   authority="operational", file_declared=True):
+    """A fact-linked `joins` graph_edge in the shape `project_confirmed_joins` writes. By default
+    also records the FILE-DECLARED marker (the common case — a join a file declared and humans then
+    verified). `file_declared=False` seeds a PASS-C-DISCOVERED join (no marker): never in any
+    file's joins_to, so the detector must never drift-check it."""
     db.execute(
         "INSERT INTO graph_edge (catalog_source, kind, from_ref, to_ref, cardinality, authority,"
         " approved_join_fact_key, approved_join_status)"
         " VALUES (%s, 'joins', %s, %s, 'N:1', %s, 'fk-test', %s)",
         (source, from_ref, to_ref, authority, status))
+    if file_declared:
+        _file_declared(db, from_ref, to_ref, source=source)
 
 
 def _row(table="transactions", column="acct_id", joins_to="", **kw) -> CanonicalRow:
@@ -151,6 +165,34 @@ def test_non_verified_and_display_only_edges_are_ignored(db):
                    authority="display_only")                         # not operational
     detect_governed_join_divergences(db, _SRC, [_row()], now=_NOW)
     assert _divergence_rows(db) == []
+
+
+def test_pass_c_discovered_join_never_diverges_but_file_declared_still_does(db):
+    # THE fix (coordinator concern #2): a PASS-C-DISCOVERED VERIFIED join — proposed+confirmed from
+    # upload metadata alone, NEVER in any file's joins_to — has no file-declared marker, so a
+    # re-upload that (of course) does not declare it must raise NO divergence. A genuinely
+    # file-declared-then-dropped join in the SAME source still surfaces its 'dropped' divergence.
+    _verified_edge(db, from_ref="public.txn.merchant_id", to_ref="public.merchants.merchant_id",
+                   file_declared=False)                              # Pass-C discovered: no marker
+    _verified_edge(db)                                               # file-declared: has a marker
+    # The re-upload declares NEITHER join.
+    detect_governed_join_divergences(db, _SRC, [_row()], now=_NOW)
+    rows = _divergence_rows(db)
+    assert rows == [(_FROM, _TO, None, "dropped", None)]             # ONLY the file-declared one
+
+
+def test_a_later_file_declaration_starts_drift_checking_a_pass_c_pair(db):
+    # A Pass-C join is silent UNTIL a file declares the same pair — from then on it is drift-checked
+    # (the marker is durable). First: Pass-C VERIFIED, no marker, re-upload without it -> silent.
+    _verified_edge(db, file_declared=False)
+    detect_governed_join_divergences(db, _SRC, [_row()], now=_NOW)
+    assert _divergence_rows(db) == []
+    # Now a file DECLARES the pair (records the marker) — the join is confirmed already.
+    detect_governed_join_divergences(db, _SRC, [_row(joins_to="accounts.account_id")], now=_NOW)
+    assert _divergence_rows(db) == []                                # declared == verified -> fine
+    # A subsequent upload drops it -> NOW a 'dropped' divergence (it became file-declared).
+    detect_governed_join_divergences(db, _SRC, [_row()], now=_NOW)
+    assert [r[3] for r in _divergence_rows(db)] == ["dropped"]
 
 
 def test_acknowledge_unknown_id_returns_none(db):

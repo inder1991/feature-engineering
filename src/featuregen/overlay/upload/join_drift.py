@@ -8,7 +8,15 @@ writes ONLY to the advisory `governed_join_divergence` table (migration 0990). T
 stays VERIFIED and its edge stays operational until a human acts (no auto-demote); the divergence
 row is the reviewer's prompt to act.
 
-Per VERIFIED (from_ref, verified_to_ref):
+FILE-DECLARED ONLY (the load-bearing scope): a VERIFIED join is drift-checked ONLY when a FILE
+declared it (a row's `joins_to`) at some point — recorded durably in `file_declared_join`
+(migration 0991). A PASS-C-DISCOVERED join (proposed from upload metadata alone, never in any
+file) has no marker and is NEVER considered, so it can't false-positive as 'dropped' on every
+re-upload and flood the queue. Neither the fact payload, graph_edge, nor the per-cycle-rewritten
+Pass-C ledger carries a durable origin signal (see the migration), so the detector maintains the
+marker itself: it records one for every currently-declared join before it diffs.
+
+Per file-declared VERIFIED (from_ref, verified_to_ref):
 * the upload re-declares the SAME pair (either orientation — Pass C can confirm the reverse of
   the file's authoring) -> RESOLVED: any existing divergence row is deleted;
 * the upload declares NO parseable join on the from-column -> 'dropped' (a malformed `joins_to`
@@ -56,6 +64,30 @@ def _declared_join_map(rows: list[CanonicalRow]) -> dict[str, str]:
     return declared
 
 
+def _record_file_declared(conn: DbConn, catalog_source: str,
+                          declared: dict[str, str], now: datetime) -> None:
+    """Durably mark each currently-declared (from, to) pair as FILE-DECLARED (migration 0991), so a
+    LATER upload that drops the join can still recognize it as a file-declared join to drift-check.
+    Stored SORTED (unordered pair) — the confirmed edge may be the reverse of the file's authoring.
+    Idempotent upsert; monotonic (a stale marker only ever gates a fact-derived edge, so it is
+    harmless)."""
+    for from_ref, to_ref in declared.items():
+        lo, hi = sorted((from_ref, to_ref))
+        conn.execute(
+            "INSERT INTO file_declared_join (catalog_source, from_ref, to_ref, declared_at)"
+            " VALUES (%s, %s, %s, %s)"
+            " ON CONFLICT (catalog_source, from_ref, to_ref) DO UPDATE SET"
+            " declared_at = EXCLUDED.declared_at",
+            (catalog_source, lo, hi, now))
+
+
+def _file_declared_pairs(conn: DbConn, catalog_source: str) -> set[frozenset[str]]:
+    """Every unordered column-ref pair a FILE has ever declared for the source (migration 0991)."""
+    return {frozenset((r[0], r[1])) for r in conn.execute(
+        "SELECT from_ref, to_ref FROM file_declared_join WHERE catalog_source = %s",
+        (catalog_source,)).fetchall()}
+
+
 def detect_governed_join_divergences(conn: DbConn, catalog_source: str,
                                      rows: list[CanonicalRow], *,
                                      source_snapshot_id: str | None = None,
@@ -65,6 +97,11 @@ def detect_governed_join_divergences(conn: DbConn, catalog_source: str,
     (each ``{from_ref, verified_to_ref, declared_to_ref, kind}``). READ-ONLY on graph_edge and
     the fact streams — never mutates governed state."""
     now = now or datetime.now(UTC)   # ingest's `now` is Optional — mirror project_confirmed_joins
+    declared = _declared_join_map(rows)
+    # Record THIS upload's declared joins as file-declared FIRST (before the early return): the
+    # first upload declares the join while it is still a DRAFT (no VERIFIED edge yet), and a LATER
+    # upload that DROPS it must still recognize it as file-declared to raise a divergence.
+    _record_file_declared(conn, catalog_source, declared, now)
     verified = conn.execute(
         "SELECT from_ref, to_ref FROM graph_edge"
         " WHERE catalog_source = %s AND kind = 'joins'"
@@ -72,9 +109,13 @@ def detect_governed_join_divergences(conn: DbConn, catalog_source: str,
         (catalog_source,)).fetchall()
     if not verified:
         return []
-    declared = _declared_join_map(rows)
+    file_declared = _file_declared_pairs(conn, catalog_source)
     detected: list[dict] = []
     for from_ref, verified_to_ref in verified:
+        if frozenset((from_ref, verified_to_ref)) not in file_declared:
+            # A PASS-C-DISCOVERED VERIFIED join (never in any file's joins_to) has no marker — it
+            # is NOT drift-checked, so it can't false-positive as 'dropped' on every re-upload.
+            continue
         declared_to = declared.get(from_ref)
         if declared_to == verified_to_ref or declared.get(verified_to_ref) == from_ref:
             # Re-affirmed (either orientation): the divergence — if it was ever open — is RESOLVED.
