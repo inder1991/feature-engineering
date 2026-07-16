@@ -107,8 +107,15 @@ export interface IngestionStage {
   completed_at: string | null
 }
 
+// The GET /ingestion-runs/{id} record as the backend returns it (overlay/upload/ingestion_run
+// get_run): the run row keyed `id` — NOT run_id — plus origin/source/status and the per-stage
+// reports. The wire carries more columns (filename, actor, fingerprints, status_history, ...);
+// declare only what the client reads, under the exact backend names.
 export interface IngestionRun {
-  run_id: string
+  id: string
+  origin_type: string
+  catalog_source: string
+  status: string
   stages: IngestionStage[]
 }
 

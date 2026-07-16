@@ -25,26 +25,29 @@ const stage = (name: string, state: string): api.IngestionStage => ({
   stage: name, state, reason_code: null, detail: null, started_at: null, completed_at: null,
 })
 
+// The full IngestionRun wire shape (backend get_run keys: id, origin_type, catalog_source,
+// status, stages) — typed against the api interface so a field-name drift fails typecheck.
+const run = (id: string, stages: api.IngestionStage[]): api.IngestionRun => ({
+  id, origin_type: 'upload', catalog_source: 'deposits', status: 'ingested', stages,
+})
+
 function renderCallout(res: api.IngestResult) {
   render(<IngestResultCallout result={res} source="deposits" onReviewQueue={() => {}} />)
 }
 
 describe('ingest result stage summary', () => {
   it('renders one compact summary line from the run stages', async () => {
-    getIngestionRun.mockResolvedValue({
-      run_id: 'run-1',
-      stages: [
-        stage('parse', 'succeeded'),
-        stage('validation', 'succeeded'),
-        stage('drift', 'failed'),
-        stage('enrich_concept', 'succeeded'),
-        stage('enrich_definition', 'succeeded'),
-        stage('enrich_domain', 'succeeded'),
-        stage('pass_b', 'disabled'),
-        stage('pass_c', 'succeeded'),
-        stage('projection_drain', 'lagged'),
-      ],
-    })
+    getIngestionRun.mockResolvedValue(run('run-1', [
+      stage('parse', 'succeeded'),
+      stage('validation', 'succeeded'),
+      stage('drift', 'failed'),
+      stage('enrich_concept', 'succeeded'),
+      stage('enrich_definition', 'succeeded'),
+      stage('enrich_domain', 'succeeded'),
+      stage('pass_b', 'disabled'),
+      stage('pass_c', 'succeeded'),
+      stage('projection_drain', 'lagged'),
+    ]))
     renderCallout(result({ ingestion_run_id: 'run-1' }))
     expect(getIngestionRun).toHaveBeenCalledWith('run-1')
     // The whole line, exactly — enrichment folds to one word, quiet stages stay quiet, and the
@@ -70,10 +73,8 @@ describe('ingest result stage summary', () => {
   })
 
   it('renders nothing extra for an all-quiet run', async () => {
-    getIngestionRun.mockResolvedValue({
-      run_id: 'run-3',
-      stages: [stage('parse', 'succeeded'), stage('validation', 'succeeded')],
-    })
+    getIngestionRun.mockResolvedValue(
+      run('run-3', [stage('parse', 'succeeded'), stage('validation', 'succeeded')]))
     renderCallout(result({ ingestion_run_id: 'run-3' }))
     await waitFor(() => expect(getIngestionRun).toHaveBeenCalledTimes(1))
     expect(screen.queryByText(/Enriched|Pass B|Pass C|projection/)).toBeNull()
