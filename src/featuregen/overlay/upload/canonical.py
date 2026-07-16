@@ -22,15 +22,16 @@ _VALID_CARDINALITY = frozenset({"1:1", "1:N", "N:1"})
 _VALID_ADDITIVITY = frozenset({"additive", "semi_additive", "non_additive"})
 _VALID_AS_OF_BASIS = frozenset({"posted_at", "ingested_at"})
 
-# Per-table column-count bound (#29). Two downstream consumers assume table widths are bounded but
-# nothing at ingest enforced it: lineage installs a whole ANCHOR table even past its MAX_NODES=200
-# cap ("acceptable under upload governance, where table widths are bounded" — lineage.py), and the
-# LLM table-synthesis per-item egress filter rejects any item with more than 64 column profiles
-# (enrich_llm._MAX_COLUMN_PROFILES — an over-wide table silently gets NO synthesis). 64 is the
-# TIGHTEST of those assumptions, so validation upholds it here — the single seam every ingestion
-# entry (CSV/Excel ingest, glossary, OpenMetadata connector) already flows through. Keep the two
-# 64s in lockstep: raising this bound past _MAX_COLUMN_PROFILES re-breaks table synthesis.
-MAX_COLUMNS_PER_TABLE = 64
+# Per-table column-count bound (#29). The ALWAYS-ON structural assumption is LINEAGE's: it installs
+# a whole ANCHOR table even past its MAX_NODES=200 cap ("acceptable under upload governance, where
+# table widths are bounded" — lineage.py), so validation upholds that bound here — the single seam
+# every ingestion entry (CSV/Excel ingest, glossary, OpenMetadata connector) already flows through.
+# Keep the value in LOCKSTEP with lineage.MAX_NODES (test-enforced); raising one requires the other.
+# NOT the 64-profile LLM synthesis egress cap (enrich_llm._MAX_COLUMN_PROFILES): that is a flags-on
+# concern table_synth enforces itself — a 65..200-column table ingests fine and simply gets no LLM
+# table synthesis, whereas quarantining at 64 rejected legitimate wide bank tables (denormalized /
+# regulatory extracts) even with no LLM configured.
+MAX_COLUMNS_PER_TABLE = 200
 
 # The glossary sentinel for a physical type the source declares but does NOT attest (spec §U). A
 # glossary carries meaning, not structure, so its rows are emitted with `type=UNKNOWN_TYPE` — never
@@ -210,8 +211,8 @@ def validate_rows(rows: list[CanonicalRow],
             quarantined.append(RowError(
                 seen[(row.source, row.table, row.column)][1],
                 f"table '{row.table}' declares {width[tk]} columns, over the "
-                f"{MAX_COLUMNS_PER_TABLE}-column per-table bound (lineage and LLM enrichment "
-                f"assume bounded table widths); the whole table is quarantined — split it or "
+                f"{MAX_COLUMNS_PER_TABLE}-column per-table bound (lineage assumes bounded "
+                f"table widths); the whole table is quarantined — split it or "
                 f"reduce its width", row))
         good = kept
 

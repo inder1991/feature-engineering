@@ -145,11 +145,29 @@ def test_table_at_the_column_bound_ingests_normally():
     assert result.quarantined == []
 
 
+def test_100_column_table_ingests_under_the_lineage_bound():
+    # #29 follow-up: the always-on bound is LINEAGE's structural assumption (MAX_NODES), not the
+    # flags-on 64-profile LLM synthesis egress cap — denormalized/regulatory bank extracts routinely
+    # exceed 64 columns and must ingest flag-off. table_synth enforces its own 64 cap separately
+    # (enrich_llm._item_egress_ok), so an over-64 table simply gets no synthesis, not no ingest.
+    rows = [_row(column=f"c{i}") for i in range(100)]
+    result = validate_rows(rows)
+    assert len(result.good) == 100
+    assert result.quarantined == []
+
+
+def test_column_bound_is_lineages_node_cap():
+    # The bound and lineage.MAX_NODES move in LOCKSTEP: lineage installs a whole anchor table even
+    # past its cap only because ingest keeps table widths within it. Raising one requires the other.
+    from featuregen.overlay.upload.lineage import MAX_NODES
+    assert MAX_COLUMNS_PER_TABLE == MAX_NODES
+
+
 def test_table_over_the_column_bound_is_quarantined_whole():
     # Lineage installs a whole anchor table even past its node cap ("acceptable under upload
-    # governance, where table widths are bounded" — lineage.py) and the LLM table-synthesis egress
-    # filter rejects >64 column profiles. Ingest must UPHOLD the width bound both assume (#29):
-    # an over-wide table is quarantined WHOLE — never a silent arbitrary prefix of its columns.
+    # governance, where table widths are bounded" — lineage.py). Ingest must UPHOLD the width bound
+    # it assumes (#29): an over-wide table is quarantined WHOLE — never a silent arbitrary prefix
+    # of its columns.
     wide = [_row(column=f"c{i}") for i in range(MAX_COLUMNS_PER_TABLE + 1)]
     narrow = [_row(table="customers", column="id")]
     result = validate_rows(wide + narrow)
