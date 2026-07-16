@@ -55,7 +55,7 @@ def test_cartesian_product_of_eligible_candidates():
         candidate_columns_truncated=False, total_candidate_columns_considered=3)
     en = enumerate_single_catalog_plans(tmpl, "core", "customer", disc)
     assert len(en.plans) == 2                            # a1×b1, a2×b1
-    assert len({p.plan_id for p in en.plans}) == 2       # deterministic distinct ids
+    assert len({p.physical_plan_id for p in en.plans}) == 2       # deterministic distinct ids
 
 
 def test_ineligible_only_need_gives_partial_plan_not_resolved():

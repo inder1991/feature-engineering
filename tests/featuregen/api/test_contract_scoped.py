@@ -361,3 +361,29 @@ def test_dispositions_carry_replay_stamps(make_client, conn, monkeypatch):
             assert s["evaluation_version"] == APPLICABILITY_MAPPING_VERSION
             assert isinstance(s["evaluated_at"], str) and s["evaluated_at"]
             datetime.fromisoformat(s["evaluated_at"])   # ISO-8601, round-trippable for replay
+
+
+# ── 3B.3c (C8): the contract-compile kill-switch is read ONLY in the route and threaded through ───────
+def test_shadow_contract_compile_flag_is_threaded_from_env(make_client, conn, monkeypatch):
+    """FEATUREGEN_INTENT_CONTRACT_COMPILE is the compile pass's dedicated kill switch: read in the
+    route (the planner stays pure — no os.environ below the route), default OFF, passed verbatim as
+    run_shadow_planner(compile_contracts=...)."""
+    _bank_multi(conn)
+    captured: list[bool] = []
+
+    def _capture_shadow(_conn, **kwargs):
+        captured.append(kwargs["compile_contracts"])
+        return ()
+
+    monkeypatch.setattr("featuregen.api.routes.contract.run_shadow_planner", _capture_shadow)
+    client = make_client(_fake())
+    body = {"hypothesis": HYPOTHESIS, "objective": "predict churn", "target_ref": TARGET,
+            "confirmed_scope": {"primary": CHURN, "confirmation_source": "user_confirmed",
+                                "target_entity": "customer"}}
+    monkeypatch.delenv("FEATUREGEN_INTENT_CONTRACT_COMPILE", raising=False)
+    res = client.post("/contract/considered-set", json=body, headers=AUTH)
+    assert res.status_code == 200, res.text
+    monkeypatch.setenv("FEATUREGEN_INTENT_CONTRACT_COMPILE", "1")
+    res2 = client.post("/contract/considered-set", json=body, headers=AUTH)
+    assert res2.status_code == 200, res2.text
+    assert captured == [False, True]

@@ -34,12 +34,12 @@ def _agg_quality(p: BindingPlanV1) -> int:
 
 def _key(p: BindingPlanV1) -> tuple:
     return (_STATUS_RANK.get(p.resolution_status, 9), -len(p.ingredient_bindings), _agg_quality(p),
-            p.catalog_source, _first_ref(p), p.recipe_id, p.plan_id)
+            p.catalog_source, _first_ref(p), p.recipe_id, p.physical_plan_id)
 
 
 def _tie_key(p: BindingPlanV1) -> tuple:
     k = _key(p)
-    return k[:-1]   # everything except the plan_id tiebreak
+    return k[:-1]   # everything except the physical_plan_id tiebreak
 
 
 def order_plans(plans: Sequence[BindingPlanV1]) -> OrderedPlansV1:

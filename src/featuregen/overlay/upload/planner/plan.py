@@ -3,12 +3,15 @@ catalogs, classify the result by candidate-local-first precedence, compute the g
 and build the replay envelope. 3B.3b (B5) wires the cross-catalog assembler in as a LOG-ONLY enrichment:
 the source->target roll-up plans (complete + fail-closed rejected) are ADDED to candidate_plans and the
 governed crossing set is pinned on the envelope, while the tier-1 result classification is byte-identical.
-Read-only, deterministic."""
+3B.3c (C8) adds the equally log-only contract-compile pass: when the caller supplies a batched
+``CompilerContext`` (+ the run-owned ``CompileBudget``), each source->target-resolved plan is compiled
+in place and the result carries the contract selection roll-up — tier-1 classification, plan order and
+physical ids untouched. Read-only, deterministic."""
 from __future__ import annotations
 
 import hashlib
 from collections.abc import Iterable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 
 from featuregen.overlay.upload.binding_roles import JoinRole
@@ -17,7 +20,9 @@ from featuregen.overlay.upload.bridge_projection import active_bridges
 from featuregen.overlay.upload.catalog_realizations import REALIZATION_DERIVATION_VERSION, table_of
 from featuregen.overlay.upload.need_metadata import NEED_METADATA_VERSION
 from featuregen.overlay.upload.planner.assembly import (
+    _authority_rank_lookup,
     _Position,
+    _rank_key,
     assemble_paths,
     ingredient_eligibility,
     semantic_rollup_paths,
@@ -34,12 +39,20 @@ from featuregen.overlay.upload.planner.contracts import (
     BindingPlanV1,
     BoundingMetricsV1,
     CatalogScopeV1,
+    ContractResolutionStatus,
     GroundTemplateDiffOutcome,
     GroundTemplateDiffV1,
+    PathResolutionStatus,
     PlannerReplayEnvelopeV1,
     PlanResolutionStatus,
     ReasonCode,
     ReplayStrength,
+    canonical_reason_codes,
+)
+from featuregen.overlay.upload.planner.declarations import (
+    CompileBudget,
+    CompilerContext,
+    compile_contract,
 )
 from featuregen.overlay.upload.planner.enumerate import enumerate_single_catalog_plans
 from featuregen.overlay.upload.planner.order import order_plans
@@ -86,13 +99,15 @@ def _differential(conn, template, plans, scope, roles, now) -> GroundTemplateDif
                     outcome = (GroundTemplateDiffOutcome.live_binding_present_and_ranked_first
                                if p.preference_rank == 0
                                else GroundTemplateDiffOutcome.live_binding_present_but_ranked_lower)
-                    return GroundTemplateDiffV1(outcome, live_refs, p.plan_id)
+                    return GroundTemplateDiffV1(outcome, live_refs, p.physical_plan_id)
         return GroundTemplateDiffV1(GroundTemplateDiffOutcome.live_binding_absent_unexpectedly, live_refs, None)
     return GroundTemplateDiffV1(GroundTemplateDiffOutcome.live_path_had_no_binding, (), None)
 
 
 def plan_bindings(conn, *, template: Template, target_entity: str | None, scope: CatalogScopeV1,
-                  roles: Iterable[str] = (), now: datetime) -> BindingPlanningResultV1:
+                  roles: Iterable[str] = (), now: datetime,
+                  compile_ctx: CompilerContext | None = None,
+                  budget: CompileBudget | None = None) -> BindingPlanningResultV1:
     roles = tuple(roles)
     envelope = _envelope(conn, scope, template.id, target_entity)
     if not scope.authorized_catalog_sources:
@@ -135,7 +150,7 @@ def plan_bindings(conn, *, template: Template, target_entity: str | None, scope:
 
     if resolved:
         status = PlanResolutionStatus.resolved
-        selected = resolved[0].plan_id
+        selected = resolved[0].physical_plan_id
         reasons = ((ReasonCode.selected_best_single_catalog,)
                    + ((ReasonCode.ambiguous_multiple_equal_plans,) if ordered.ambiguous else ()))
         primary = ReasonCode.selected_best_single_catalog
@@ -144,11 +159,56 @@ def plan_bindings(conn, *, template: Template, target_entity: str | None, scope:
         status, primary = _classify_failure(ordered.plans, bounding)
         reasons = (primary,) if primary else ()
 
+    # 3B.3c (C8) — the SHADOW contract-compile pass + the contract-axis roll-up. Gated on the
+    # caller-provided batched context (the route kill-switch): compile_ctx=None is byte-identical
+    # to the pre-C8 path — no compile, no roll-up, zero extra reads. Only source_to_target_resolved
+    # plans compile; the tier-1 result_status/selected_plan_id decision above is UNTOUCHED
+    # (candidate-local-first), and physical ids/order are immutable through compilation.
+    contract_status = ContractResolutionStatus.not_compiled
+    selected_contract_pid: str | None = None
+    selected_contract_id: str | None = None
+    if compile_ctx is not None:
+        candidate_plans = tuple(
+            _compile_or_mark(conn, p, template, compile_ctx, budget, envelope)
+            for p in candidate_plans)
+        # Contract selection roll-up (F3): the best COMPILED source→target plan by the EXISTING
+        # assembly physical ranking key (physical_plan_id tie-break). A budget-skipped or tier-1
+        # plan is never eligible — it stayed not_compiled.
+        compiled = [p for p in candidate_plans
+                    if p.path_resolution_status is PathResolutionStatus.source_to_target_resolved
+                    and p.contract_resolution_status is not ContractResolutionStatus.not_compiled]
+        if compiled:
+            authority = _authority_rank_lookup(conn, compiled)
+            best = min(compiled, key=lambda p: (_rank_key(p, authority), p.physical_plan_id))
+            contract_status = best.contract_resolution_status
+            selected_contract_pid = best.physical_plan_id
+            selected_contract_id = best.contract_id
+
     return BindingPlanningResultV1(
         run_id=None, recipe_id=template.id, target_entity=target_entity, catalog_scope_id=scope.scope_id,
         selected_plan_id=selected, candidate_plans=candidate_plans, result_status=status,
         primary_reason_code=primary, reason_codes=reasons + asm.reason_codes, bounding=bounding,
-        ground_template_diff=diff, replay_envelope=envelope)
+        ground_template_diff=diff, replay_envelope=envelope,
+        contract_result_status=contract_status,
+        selected_contract_physical_plan_id=selected_contract_pid,
+        selected_contract_id=selected_contract_id)
+
+
+def _compile_or_mark(conn, plan: BindingPlanV1, template: Template, compile_ctx: CompilerContext,
+                     budget: CompileBudget | None,
+                     envelope: PlannerReplayEnvelopeV1) -> BindingPlanV1:
+    """Compile ONE candidate while the run-owned budget allows it. Non source→target plans pass
+    through untouched (never compiled); a plan skipped because the budget (count or the deadline
+    over the INJECTED now — deterministic, never wall-clock) is spent stays not_compiled and
+    honestly records compile_budget_exhausted — never a silent skip."""
+    if plan.path_resolution_status is not PathResolutionStatus.source_to_target_resolved:
+        return plan
+    if budget is not None and not (budget.remaining > 0 and compile_ctx.now < budget.deadline):
+        return replace(plan, contract_reason_codes=canonical_reason_codes(
+            plan.contract_reason_codes + (ReasonCode.compile_budget_exhausted,)))
+    if budget is not None:
+        budget.remaining -= 1
+    return compile_contract(conn, compile_ctx, plan, template, base_envelope=envelope)
 
 
 @dataclass(frozen=True, slots=True)
@@ -216,8 +276,8 @@ def _assemble_rollups(conn, *, template: Template, target_entity: str | None, sc
                 states += one.bounding.total_states_expanded
                 transitions += one.bounding.total_bridge_transitions_explored
                 for p in one.complete + one.rejected:
-                    if p.plan_id not in seen_plan_ids:   # defensive: an identical mint is appended once
-                        seen_plan_ids.add(p.plan_id)
+                    if p.physical_plan_id not in seen_plan_ids:   # defensive: an identical mint is appended once
+                        seen_plan_ids.add(p.physical_plan_id)
                         plans.append(p)
     return _AssemblyRollupsV1(tuple(plans), reasons, r_trunc, b_trunc, f_trunc, deeper,
                               states, transitions)

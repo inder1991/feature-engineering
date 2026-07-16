@@ -126,7 +126,8 @@ def _split_catalogs(db):
 def test_realize_in_place_finds_the_realization_at_the_exact_position(db):
     _core_catalog(db)
     pos = _Position("transaction", "core", "public.transactions")
-    moves = realize_in_place(db, pos, _txn_to_account_hop(), _scope("core"))
+    hop = _txn_to_account_hop()
+    moves = realize_in_place(db, pos, hop, _scope("core"))
     assert len(moves) == 1
     m = moves[0]
     assert m.next_position == _Position("account", "core", "public.accounts")
@@ -136,6 +137,13 @@ def test_realize_in_place_finds_the_realization_at_the_exact_position(db):
     roll, real = m.segments
     assert (roll.from_entity, roll.to_entity) == ("transaction", "account")
     assert roll.cardinality == "many_to_one"
+    # 3B.3c C7 (C1 carry-forward, F16): the semantic hop's identity rides on the announcement
+    # segment — self-contained audit evidence, NEVER physical-plan-id material
+    assert (roll.relationship_id, roll.relationship_version) == (
+        hop.relationship_id, hop.relationship_version)
+    assert (roll.relationship_id, roll.relationship_version) == (
+        "transaction_to_account", "1.0.0")
+    assert real.relationship_id is None and real.relationship_version is None
     assert real.catalog_source == "core"
     # the distinguishing ref (plan_id material) — MUST be present on every realizer segment
     assert real.realization_ref == "core:public.transactions.account_id->public.accounts.account_id"
@@ -177,7 +185,8 @@ def test_rollup_bridge_crosses_catalog_via_fk_and_verified_bridge(db):
     _seed_bridge(db, "bfk1", "account",
                  "ops", "public.transactions.account_id", "rev", "public.accounts.account_id")
     pos = _Position("transaction", "ops", "public.transactions")
-    moves = rollup_bridges(db, pos, _txn_to_account_hop(), _scope("ops", "rev"))
+    hop = _txn_to_account_hop()
+    moves = rollup_bridges(db, pos, hop, _scope("ops", "rev"))
     assert len(moves) == 1
     m = moves[0]
     assert m.next_position == _Position("account", "rev", "public.accounts")
@@ -186,9 +195,40 @@ def test_rollup_bridge_crosses_catalog_via_fk_and_verified_bridge(db):
         SegmentKind.semantic_rollup, SegmentKind.governed_bridge]
     roll, bridge = m.segments
     assert (roll.from_entity, roll.to_entity) == ("transaction", "account")
+    # 3B.3c C7 (C1 carry-forward, F16): the announcement carries the semantic hop's identity
+    assert (roll.relationship_id, roll.relationship_version) == (
+        hop.relationship_id, hop.relationship_version)
+    assert bridge.relationship_id is None and bridge.relationship_version is None
     assert bridge.catalog_source == "rev"
     assert (bridge.from_entity, bridge.to_entity) == ("transaction", "account")
     assert bridge.bridge_fact_key == "bfk1"   # the distinguishing ref (plan_id material)
+
+
+def test_relationship_refs_are_never_physical_plan_id_material():
+    # behaviour-neutrality proof for the C7 assembly change: two otherwise-identical plans, one
+    # whose semantic_rollup announcement carries relationship refs and one whose doesn't, MUST
+    # mint the SAME physical_plan_id — the segment material hashes segment_kind:catalog:ref
+    # (realization_ref/bridge_fact_key) only, so audit evidence can never move a stored id.
+    def _mint(with_refs: bool):
+        return make_binding_plan(
+            recipe_id="t3b3b", target_entity="account", catalog_source="core",
+            ingredient_bindings=_bindings("core"),
+            path_segments=(
+                BindingPathSegmentV1(segment_kind=SegmentKind.direct_catalog, catalog_source="core"),
+                BindingPathSegmentV1(
+                    segment_kind=SegmentKind.semantic_rollup, catalog_source="core",
+                    from_entity="transaction", to_entity="account", cardinality="many_to_one",
+                    relationship_id="transaction_to_account" if with_refs else None,
+                    relationship_version="1.0.0" if with_refs else None),
+                BindingPathSegmentV1(
+                    segment_kind=SegmentKind.intra_catalog_realization, catalog_source="core",
+                    realization_ref="core:public.transactions.account_id->public.accounts.account_id")),
+            resolution_status=PlanResolutionStatus.resolved,
+            path_resolution_status=PathResolutionStatus.source_to_target_resolved,
+            primary_reason_code=None, reason_codes=(), safety=BindingSafety.safe,
+            preference_rank=-1, preference_reasons=(), candidate_role=CandidateRole.rejected)
+
+    assert _mint(True).physical_plan_id == _mint(False).physical_plan_id
 
 
 def test_rollup_bridge_endpoint_on_a_different_table_is_not_continuous(db):
@@ -522,7 +562,7 @@ def test_equal_rank_complete_paths_resolve_with_ambiguity(db):
         CandidateRole.selected, CandidateRole.equal_rank_alternative]
     assert all(p.resolution_status is PlanResolutionStatus.resolved_with_ambiguity
                for p in asm.complete)
-    assert asm.complete[0].plan_id < asm.complete[1].plan_id      # canonical plan_id tie-break
+    assert asm.complete[0].physical_plan_id < asm.complete[1].physical_plan_id   # canonical id tie-break
 
 
 def test_unknown_realizer_authority_ranks_worst_not_best(db):
@@ -626,5 +666,5 @@ def test_ranked_output_is_byte_identical_under_bridge_seed_shuffle(db):
     a = run(bridges)
     b = run(list(reversed(bridges)))
     assert repr(a) == repr(b)                                     # byte-identical ranked output
-    assert [p.plan_id for p in a.complete] == [p.plan_id for p in b.complete]
+    assert [p.physical_plan_id for p in a.complete] == [p.physical_plan_id for p in b.complete]
     assert len(a.complete) == 2 and all(p.bridge_count == 1 for p in a.complete)

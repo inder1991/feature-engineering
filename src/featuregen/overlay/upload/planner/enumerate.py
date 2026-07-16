@@ -95,6 +95,6 @@ def enumerate_single_catalog_plans(template: Template, catalog_source: str, targ
 
     plans_truncated = len(plans) > MAX_PLANS_PER_RECIPE
     if plans_truncated:
-        plans = sorted(plans, key=lambda p: p.plan_id)[:MAX_PLANS_PER_RECIPE]
+        plans = sorted(plans, key=lambda p: p.physical_plan_id)[:MAX_PLANS_PER_RECIPE]
     return EnumerationV1(plans=tuple(plans), combinations_truncated=combinations_truncated,
                          plans_truncated=plans_truncated, total_combinations_explored=explored)

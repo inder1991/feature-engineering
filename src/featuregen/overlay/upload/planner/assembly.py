@@ -129,7 +129,7 @@ class _Position:
 class _Move:
     """One permitted transition out of a position: where it lands + the exact path segments it
     emits. Every realizer segment carries its distinguishing ref (``realization_ref`` for R,
-    ``bridge_fact_key`` for B/reposition) so downstream plan_id material stays unambiguous.
+    ``bridge_fact_key`` for B/reposition) so downstream physical-plan-id material stays unambiguous.
     ``bridge_fact_key`` doubles as the frontier's same-bridge-never-twice cycle key; it is None
     for intra-catalog realizations."""
     next_position: _Position
@@ -191,7 +191,11 @@ def realize_in_place(conn, pos: _Position, hop: EntityRelationshipRefV1,
                 BindingPathSegmentV1(
                     segment_kind=SegmentKind.semantic_rollup, catalog_source=pos.catalog,
                     from_entity=hop.from_entity, to_entity=hop.to_entity,
-                    cardinality=hop.cardinality),
+                    cardinality=hop.cardinality,
+                    # 3B.3c C7 (F16): the hop's identity rides on the announcement — audit
+                    # evidence only; NEVER physical-plan-id material (that hashes only the ref)
+                    relationship_id=hop.relationship_id,
+                    relationship_version=hop.relationship_version),
                 BindingPathSegmentV1(
                     segment_kind=SegmentKind.intra_catalog_realization, catalog_source=pos.catalog,
                     realization_ref=r.realization_id),
@@ -233,7 +237,10 @@ def rollup_bridges(conn, pos: _Position, hop: EntityRelationshipRefV1,
                         BindingPathSegmentV1(
                             segment_kind=SegmentKind.semantic_rollup, catalog_source=pos.catalog,
                             from_entity=hop.from_entity, to_entity=hop.to_entity,
-                            cardinality=hop.cardinality),
+                            cardinality=hop.cardinality,
+                            # 3B.3c C7 (F16): audit evidence only — never plan-id material
+                            relationship_id=hop.relationship_id,
+                            relationship_version=hop.relationship_version),
                         BindingPathSegmentV1(
                             segment_kind=SegmentKind.governed_bridge, catalog_source=cat2,
                             from_entity=hop.from_entity, to_entity=hop.to_entity,
@@ -530,7 +537,7 @@ def _authority_rank_lookup(conn, plans: Sequence[BindingPlanV1]) -> dict[tuple[s
 
 
 def _rank_key(p: BindingPlanV1, authority: dict[tuple[str, str], int]) -> tuple[int, int, int, int, int]:
-    """The FULL ranking precedence (best-first, plan_id excluded): validity/safety -> bridge_count
+    """The FULL ranking precedence (best-first, physical_plan_id excluded): validity/safety -> bridge_count
     -> ingredient-binding rank (order.py's worst-binding quality) -> semantic-path rank (fewer
     realized hops) -> physical-realization rank (worst realizer authority). Fail-closed: a realizer
     the governed lookup cannot resolve ranks WORST (INFERRED_JOIN-level), never APPROVED-best. A
@@ -548,15 +555,15 @@ def _rank_key(p: BindingPlanV1, authority: dict[tuple[str, str], int]) -> tuple[
 
 
 def rank_and_classify(conn, complete_plans: Sequence[BindingPlanV1]) -> tuple[BindingPlanV1, ...]:
-    """Order the COMPLETE plans by the full precedence with the canonical plan_id tie-break, then
-    classify: the single best is ``selected``; a plan tying the best on the FULL key except
-    plan_id is an ``equal_rank_alternative`` and the tie marks every tied plan
+    """Order the COMPLETE plans by the full precedence with the canonical physical_plan_id tie-break,
+    then classify: the single best is ``selected``; a plan tying the best on the FULL key except
+    physical_plan_id is an ``equal_rank_alternative`` and the tie marks every tied plan
     ``resolved_with_ambiguity`` (an ambiguous binding is surfaced, never silently picked); a
     strictly lower complete plan is a ``lower_rank_alternative``. Idempotent under re-ranking."""
     if not complete_plans:
         return ()
     authority = _authority_rank_lookup(conn, complete_plans)
-    ordered = sorted(complete_plans, key=lambda p: (_rank_key(p, authority), p.plan_id))
+    ordered = sorted(complete_plans, key=lambda p: (_rank_key(p, authority), p.physical_plan_id))
     top = _rank_key(ordered[0], authority)
     ambiguous = len(ordered) > 1 and _rank_key(ordered[1], authority) == top
     out: list[BindingPlanV1] = []
