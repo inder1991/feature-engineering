@@ -132,6 +132,24 @@ describe('api client', () => {
     expect((err as TypeError).message).toBe('Failed to fetch')
   })
 
+  it('keeps the X-Ingestion-Run-Id header on a failed request so the run stays inspectable', async () => {
+    // POST /uploads (and /syncs/{id}/import) attach the run id header to post-open 4xx/5xx too;
+    // dropping it on the error path would orphan the very run record that explains the failure.
+    fetchMock.mockImplementation(async () =>
+      new Response(JSON.stringify({ detail: 'upload failed at the ingest stage' }),
+        { status: 500, headers: { 'X-Ingestion-Run-Id': 'igr_01HZZC' } }))
+    const file = new File(['source,table\n'], 'd.csv', { type: 'text/csv' })
+    await expect(uploadFile(file, 'deposits')).rejects.toMatchObject({
+      status: 500, detail: 'upload failed at the ingest stage', ingestionRunId: 'igr_01HZZC' })
+  })
+
+  it('leaves ingestionRunId null when a failure carries no run header', async () => {
+    fetchMock.mockImplementation(async () =>
+      new Response(JSON.stringify({ detail: 'nope' }), { status: 404 }))
+    await expect(searchCatalog('x')).rejects.toMatchObject({
+      status: 404, detail: 'nope', ingestionRunId: null })
+  })
+
   it('uploads multipart form data without forcing a content type', async () => {
     fetchMock.mockImplementation(ok({
       status: 'ingested', reason: null, asserted: 4, changed_objects: 0, quarantined: 0, flagged: null }))

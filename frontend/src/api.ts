@@ -7,10 +7,16 @@ export class ApiError extends Error {
   // tsconfig sets erasableSyntaxOnly, which forbids the `public x` shorthand. Same public shape.
   status: number
   detail: string
-  constructor(status: number, detail: string) {
+  // The X-Ingestion-Run-Id response header when the failed request carried one (POST /uploads
+  // and /syncs/{id}/import attach it to every post-open 4xx/5xx), so a failed ingest's run
+  // record stays inspectable via GET /ingestion-runs/{id}. null when the server sent no header;
+  // optional in the constructor so existing throw/new sites keep working unchanged.
+  ingestionRunId: string | null
+  constructor(status: number, detail: string, ingestionRunId: string | null = null) {
     super(detail)
     this.status = status
     this.detail = detail
+    this.ingestionRunId = ingestionRunId
   }
 }
 
@@ -49,7 +55,9 @@ async function requestWithResponse<T>(
     } catch {
       // non-JSON error body (proxy HTML page and the like): keep the status fallback
     }
-    throw new ApiError(res.status, detail)
+    // A failed ingest still opened a run: keep its id (header) on the error, or it is lost —
+    // the JSON body of a 4xx/5xx never carries it.
+    throw new ApiError(res.status, detail, res.headers.get('X-Ingestion-Run-Id'))
   }
   return { body: (await res.json()) as T, response: res }
 }
