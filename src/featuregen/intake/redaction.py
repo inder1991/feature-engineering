@@ -153,6 +153,29 @@ def build_llm_inputs(
     }
 
 
+def redact_free_text(text: str) -> RedactionResult:
+    """Scan-and-redact FREE TEXT that arrives with no upstream SP-0 classification — e.g. an
+    uploaded glossary's curated business definitions / synonyms / taxonomy paths. Uploader-authored
+    prose is never presumable-'clean': the deterministic detectors CLASSIFY it honestly (a hit ⟹
+    'contains_pii' ⟹ the located spans are scrubbed; no hit ⟹ 'clean' *because it was scanned*,
+    not by fiat), and the text then rides the SAME IntentRedactor path intents do.
+
+    Residual + its seam: the deterministic set above documents personal-NAME detection as DEFERRED
+    (regex cannot do it safely). When an IntentRedactor IS registered via
+    ``register_intent_redactor(...)`` — e.g. a NER-backed one — the text routes through IT instead
+    of the DefaultIntentRedactor, closing that residual; the classification handed to it is the
+    deterministic pre-scan verdict, which a NER redactor should treat as advisory (it exists to
+    find what the deterministic set cannot). Unregistered, the DefaultIntentRedactor applies —
+    strictly stronger than unscanned egress, never weaker.
+
+    ``.text is None`` ⟹ fail closed: the caller must not egress the value."""
+    classification = "contains_pii" if _scan(text) else "clean"
+    redactor: IntentRedactor = (
+        _INTENT_REDACTOR if _INTENT_REDACTOR is not None else DefaultIntentRedactor()
+    )
+    return redactor.redact(text, classification)
+
+
 # Keys that carry DATA VALUES (rows / samples / profiled value-sets / extrema) rather than
 # METADATA. Actual value/status-code sets are SP-1 profiling + SP-3 grounding (§4.4) — they must
 # NEVER reach the LLM. Their presence in an outbound payload is a hard egress violation.

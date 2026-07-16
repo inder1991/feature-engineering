@@ -1,3 +1,6 @@
+import json
+
+from featuregen.intake import redaction as redaction_module
 from featuregen.intake.llm import (
     PROVIDER_NON_RETRYABLE,
     PROVIDER_OK,
@@ -5,18 +8,40 @@ from featuregen.intake.llm import (
     FakeResponse,
     LLMResult,
 )
-from featuregen.intake.redaction import INPUT_KEY_CATALOG, INPUT_KEY_INTENT
-from featuregen.overlay.upload.enrich_llm import audited_enrich_call, register_enrichment_schemas
+from featuregen.intake.redaction import (
+    INPUT_KEY_CATALOG,
+    INPUT_KEY_CLASSIFICATION,
+    INPUT_KEY_INTENT,
+    RedactionResult,
+)
+from featuregen.overlay.upload.enrich_batch import EGRESS, VALID, BatchItem
+from featuregen.overlay.upload.enrich_llm import (
+    audited_batch_call,
+    audited_enrich_call,
+    register_enrichment_schemas,
+)
 
 _META = {"table": "accounts", "column": "balance", "type": "numeric"}
 
 
-def _call(db, client):
+def _call(db, client, catalog_metadata=_META):
     register_enrichment_schemas(db)
     return audited_enrich_call(
         db, client, task="overlay.enrich.concept", prompt_id="overlay_concept_v1",
-        schema_id="overlay_concept", catalog_metadata=_META, out_key="concept",
+        schema_id="overlay_concept", catalog_metadata=catalog_metadata, out_key="concept",
         instruction="Classify the concept of this column.")
+
+
+class _Capture:
+    """Client that records the outbound request and answers with a valid concept."""
+
+    def __init__(self):
+        self.requests = []
+
+    def call(self, request):
+        self.requests.append(request)
+        return LLMResult(output={"concept": "monetary_amount"}, self_reported_scores={},
+                         call_ref="", status=PROVIDER_OK)
 
 
 def test_audited_call_returns_output_and_records(db):
@@ -58,3 +83,179 @@ def test_provider_that_fails_without_schema_now_succeeds(db):
                              call_ref="", status=PROVIDER_OK)
 
     assert _call(db, _RealShaped()) == "monetary_amount"
+
+
+# ---- finding #19: glossary free-text is uploader-authored content — it MUST be scanned, never
+# ---- egressed under a hardcoded "clean" claim. --------------------------------------------------
+
+_PII_SIDECAR = {
+    "table": "accounts", "column": "balance", "type": "numeric",
+    "term_name": "Account Balance",
+    "business_definition": "Posted ledger balance; escalate breaks to jane.doe@bank.example.",
+}
+
+
+def test_glossary_free_text_pii_is_scanned_and_scrubbed_before_egress(db):
+    """A detectable PII pattern (email) inside a glossary business definition is redacted BEFORE
+    egress — the definition still rides (enrichment keeps its semantics), the pattern does not,
+    and the classification is the honest 'contains_pii', not a hardcoded 'clean'."""
+    client = _Capture()
+    out = _call(db, client, catalog_metadata=_PII_SIDECAR)
+    assert out == "monetary_amount"                       # enrichment still works
+    sent = client.requests[-1].inputs
+    flat = json.dumps(sent[INPUT_KEY_CATALOG])
+    assert "jane.doe@bank.example" not in flat            # the email never left the system
+    assert "[REDACTED:EMAIL]" in sent[INPUT_KEY_CATALOG]["business_definition"]
+    assert sent[INPUT_KEY_CLASSIFICATION] == "contains_pii"
+
+
+def test_clean_glossary_free_text_still_egresses_and_enriches(db):
+    """A clean curated definition passes through verbatim — scanned-clean, enrichment unbroken."""
+    meta = {**_META, "term_name": "Account Balance",
+            "business_definition": "The posted ledger balance of the account."}
+    client = _Capture()
+    assert _call(db, client, catalog_metadata=meta) == "monetary_amount"
+    sent = client.requests[-1].inputs
+    assert sent[INPUT_KEY_CATALOG]["business_definition"] == \
+        "The posted ledger balance of the account."
+    assert sent[INPUT_KEY_CLASSIFICATION] == "clean"
+
+
+def test_glossary_pii_scrub_is_recorded_on_the_llm_call_audit(db):
+    """The llm_call record carries the redaction honestly: the redactor's version (not the
+    'metadata-only' names/types claim) and the span TYPES — never the scrubbed value."""
+    _call(db, _Capture(), catalog_metadata=_PII_SIDECAR)
+    row = db.execute(
+        "SELECT redaction_version, input_redaction::text, redacted_input::text FROM llm_call "
+        "WHERE run_id = 'overlay-enrichment'").fetchone()
+    assert row is not None
+    version, input_redaction, redacted_input = row
+    assert version != "metadata-only"                     # free-text WAS scanned
+    assert "EMAIL" in input_redaction                     # span type recorded...
+    assert "jane.doe@bank.example" not in input_redaction  # ...never the value
+    assert "jane.doe@bank.example" not in redacted_input   # stored input is the redacted rendering
+
+
+def test_registered_ner_redactor_scrubs_names_from_glossary_free_text(db, monkeypatch):
+    """The personal-NAMES residual is closeable via the register_intent_redactor seam: when a
+    NER-backed redactor IS registered, glossary free-text routes through it."""
+    class _NerRedactor:
+        def redact(self, raw_intent, raw_input_classification):
+            if "Jane Doe" in raw_intent:
+                return RedactionResult(raw_intent.replace("Jane Doe", "[REDACTED:NAME]"),
+                                       "ner-redactor@test",
+                                       ({"type": "NAME", "start": 0, "end": 8},), "ok")
+            return RedactionResult(raw_intent, "ner-redactor@test", (), "ok")
+
+    monkeypatch.setattr(redaction_module, "_INTENT_REDACTOR", _NerRedactor())
+    meta = {**_META, "business_definition": "Owned by Jane Doe in Finance."}
+    client = _Capture()
+    assert _call(db, client, catalog_metadata=meta) == "monetary_amount"
+    flat = json.dumps(client.requests[-1].inputs[INPUT_KEY_CATALOG])
+    assert "Jane Doe" not in flat
+    assert "[REDACTED:NAME]" in flat
+
+
+def test_free_text_redactor_fail_closed_blocks_dispatch(db, monkeypatch):
+    """A redactor that fails closed on a glossary value blocks the call: nothing is dispatched
+    and the block is audited as a security event."""
+    class _FailClosed:
+        def redact(self, raw_intent, raw_input_classification):
+            return RedactionResult(None, "fail@test", (), "fail_into_clarification")
+
+    monkeypatch.setattr(redaction_module, "_INTENT_REDACTOR", _FailClosed())
+    client = _Capture()
+    out = _call(db, client, catalog_metadata=dict(_PII_SIDECAR))
+    assert out is None
+    assert client.requests == []                          # no dispatch — fail closed
+    n = db.execute(
+        "SELECT count(*) FROM security_audit WHERE event_type = 'EGRESS_BLOCKED'").fetchone()[0]
+    assert n == 1
+
+
+def test_batch_glossary_free_text_pii_scrubbed_per_item(db):
+    """Batch seam: a PII pattern (SSN) in one item's business definition is scrubbed pre-egress;
+    the item still enriches (redacted, not dropped) and the sibling item is untouched."""
+    register_enrichment_schemas(db)
+    items = [
+        BatchItem("h1", {"table": "accounts", "column": "balance", "type": "numeric",
+                         "business_definition": "Balance; sample holder SSN 123-45-6789."}),
+        BatchItem("h2", {"table": "accounts", "column": "opened_on", "type": "date"}),
+    ]
+
+    class _BatchCapture:
+        def __init__(self):
+            self.requests = []
+
+        def call(self, request):
+            self.requests.append(request)
+            return LLMResult(output={"results": [{"ref": "h1", "concept": "monetary_amount"},
+                                                 {"ref": "h2", "concept": "event_date"}]},
+                             self_reported_scores={}, call_ref="", status=PROVIDER_OK)
+
+    client = _BatchCapture()
+    res = audited_batch_call(
+        db, client, task="overlay.enrich.concept", prompt_id="overlay_concept_batch_v1",
+        schema_id="overlay_concept_batch", shared_metadata={}, items=items, out_key="concept",
+        instruction="Classify each column.", accept=lambda raw: (raw, "valid"))
+    by = {o.ref: o for o in res.outcomes}
+    assert by["h1"].status == VALID and by["h2"].status == VALID
+    sent_items = client.requests[-1].inputs[INPUT_KEY_CATALOG]["items"]
+    flat = json.dumps(sent_items)
+    assert "123-45-6789" not in flat                      # the SSN never left the system
+    assert "[REDACTED:SSN]" in flat
+    assert client.requests[-1].inputs[INPUT_KEY_CLASSIFICATION] == "contains_pii"
+
+
+def test_batch_item_failing_closed_is_excluded_not_batch_fatal(db, monkeypatch):
+    """Batch seam: an item whose free-text the redactor fails closed on is EXCLUDED (terminal
+    egress outcome, audited) while the rest of the batch proceeds."""
+    class _FailOnJane:
+        def redact(self, raw_intent, raw_input_classification):
+            if "Jane" in raw_intent:
+                return RedactionResult(None, "ner@test", (), "fail_into_clarification")
+            return RedactionResult(raw_intent, "ner@test", (), "ok")
+
+    monkeypatch.setattr(redaction_module, "_INTENT_REDACTOR", _FailOnJane())
+    register_enrichment_schemas(db)
+    items = [
+        BatchItem("h1", {"table": "accounts", "column": "owner", "type": "text",
+                         "business_definition": "Jane's book of accounts."}),
+        BatchItem("h2", {"table": "accounts", "column": "balance", "type": "numeric"}),
+    ]
+    client = FakeLLM(script={"overlay.enrich.concept": FakeResponse(
+        output={"results": [{"ref": "h2", "concept": "monetary_amount"}]})})
+    res = audited_batch_call(
+        db, client, task="overlay.enrich.concept", prompt_id="overlay_concept_batch_v1",
+        schema_id="overlay_concept_batch", shared_metadata={}, items=items, out_key="concept",
+        instruction="Classify each column.", accept=lambda raw: (raw, "valid"))
+    by = {o.ref: o for o in res.outcomes}
+    assert by["h1"].status == EGRESS
+    assert by["h2"].status == VALID
+
+
+def test_flag_off_no_client_means_no_llm_egress_paths_at_all(db):
+    """FLAG-OFF safety: with no LLM provider wired (client=None — the default), ingest never
+    touches the enrichment/egress seams: no llm_call rows, no EGRESS_BLOCKED events, upload
+    ingests unchanged. Findings #19/#20 only alter the client-wired path."""
+    from datetime import UTC, datetime, timedelta
+
+    from featuregen.contracts.envelopes import IdentityEnvelope
+    from featuregen.overlay.config import OverlayConfig, register_overlay_config
+    from featuregen.overlay.upload.canonical import CanonicalRow
+    from featuregen.overlay.upload.ingest import ingest_upload
+
+    register_overlay_config(OverlayConfig(
+        ttl_default=timedelta(days=180), ttl_min=timedelta(days=30), ttl_max=timedelta(days=365),
+        ttl_jitter_fraction=0.1, renewal_grace=timedelta(days=14),
+        drift_scan_interval=timedelta(minutes=15), drift_freshness_sla=timedelta(hours=24),
+        profiler_require_restricted_role=False))
+    actor = IdentityEnvelope(subject="upload", actor_kind="human", authenticated=True,
+                             auth_method="oidc", role_claims=("data_owner",))
+    rows = [CanonicalRow("s", "accounts", "id", "integer", is_grain=True),
+            CanonicalRow("s", "accounts", "balance", "numeric")]
+    res = ingest_upload(db, "s", rows, actor=actor, now=datetime(2026, 7, 5, tzinfo=UTC))
+    assert res.status == "ingested"
+    assert db.execute("SELECT count(*) FROM llm_call").fetchone()[0] == 0
+    assert db.execute("SELECT count(*) FROM security_audit "
+                      "WHERE event_type = 'EGRESS_BLOCKED'").fetchone()[0] == 0

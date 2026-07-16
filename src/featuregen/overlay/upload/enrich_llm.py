@@ -7,8 +7,12 @@ a feature_contract). Catalog enrichment is not a feature contract, so we COMPOSE
 from the decoupled building blocks — registered output-schema, reserved input keys, `assert_llm_safe`,
 `drive_structured_call`, `record_llm_call` — under our own run bucket.
 
-Enrichment inputs carry schema METADATA only (names/types); the "intent" is a fixed instruction, never
-uploader free text or data values — so it is classified `clean` and passes the egress guard.
+Enrichment inputs carry schema METADATA (names/types) plus — for a GLOSSARY column — its curated
+business-semantic sidecar; the "intent" is a fixed instruction, never uploader free text or data
+values. The structural names/types are classified `clean`; the sidecar's FREE-TEXT values
+(definitions/synonyms/taxonomy paths) are uploader-authored and therefore NEVER presumed clean —
+each rides through `redact_free_text` (finding #19), so the classification on the wire is what the
+scan actually established ('clean' only post-scan; 'contains_pii' + scrubbed spans otherwise).
 """
 from __future__ import annotations
 
@@ -32,6 +36,7 @@ from featuregen.intake.redaction import (
     RedactionResult,
     assert_llm_safe,
     build_llm_inputs,
+    redact_free_text,
 )
 from featuregen.overlay.upload.enrich_batch import (
     EGRESS,
@@ -50,7 +55,76 @@ _OWNER = "featuregen-overlay"
 # to the immutable llm_call records recorded under this same run bucket.
 ENRICHMENT_RUN_ID = "overlay-enrichment"
 _RUN = ENRICHMENT_RUN_ID
-_REDACTION_VERSION = "metadata-only"  # inputs are names/types only — nothing to redact
+_REDACTION_VERSION = "metadata-only"  # structural names/types only — nothing to redact. When the
+# metadata carries glossary FREE-TEXT, _redact_free_text_meta supplies the ACTUAL redactor version
+# instead (finding #19) — this constant is never stamped on a call whose free-text was scanned.
+
+
+# Finding #19: glossary sidecar values (business definitions, synonyms, data domains, BIAN/FIBO
+# taxonomy paths, the term name) are uploader-authored FREE TEXT — not structural names/types — so
+# they are never presumable-clean. Each rides through `redaction.redact_free_text` before egress:
+# the deterministic scan (email/SSN/PAN/IBAN/phone/account/DOB/address) classifies + scrubs, and a
+# REGISTERED IntentRedactor (`register_intent_redactor` — the NER seam redaction.py documents as
+# the DEFERRED personal-NAMES closer) supersedes the default when present. A value the redactor
+# fails closed on blocks the item (batch: excluded + audited; single: no dispatch).
+_FREE_TEXT_META_KEYS = frozenset({
+    "term_name", "business_definition", "synonyms", "data_domain", "bian_path", "fibo_path",
+})
+
+
+def _redact_free_text_meta(metadata: dict) -> tuple[dict | None, list[dict], str | None]:
+    """Route every glossary free-text value in `metadata` (top-level keys + each column_profiles
+    descriptor's business_definition) through `redact_free_text`. Returns
+    ``(redacted_metadata, span_records, redaction_version)``:
+
+    * ``redacted_metadata`` — the metadata with scrubbed free-text, or ``None`` when any value
+      failed closed (the caller must not egress the item);
+    * ``span_records`` — ``{"key", "type", "start", "end"}`` per scrubbed span (types/positions,
+      NEVER values) for the llm_call ``input_redaction`` audit field;
+    * ``redaction_version`` — the redactor version that scanned the free-text, or ``None`` when
+      the metadata carried no free-text at all (pure structural names/types)."""
+    out = dict(metadata)
+    spans: list[dict] = []
+    version: str | None = None
+
+    def _one(text: str, key: str) -> str | None:          # None ⟹ fail closed
+        nonlocal version
+        res = redact_free_text(text)
+        version = version or res.redaction_version
+        if res.text is None:
+            return None
+        spans.extend({"key": key, **dict(s)} for s in res.redacted_spans)
+        return res.text
+
+    for key in sorted(_FREE_TEXT_META_KEYS & out.keys()):
+        val = out[key]
+        if isinstance(val, str):
+            redacted = _one(val, key)
+            if redacted is None:
+                return None, spans, version
+            out[key] = redacted
+        elif isinstance(val, list):
+            new_list = []
+            for v in val:
+                nv = _one(v, key) if isinstance(v, str) else v
+                if nv is None:
+                    return None, spans, version
+                new_list.append(nv)
+            out[key] = new_list
+    profiles = out.get("column_profiles")
+    if isinstance(profiles, list):
+        new_profiles = []
+        for desc in profiles:
+            if isinstance(desc, dict) and isinstance(desc.get("business_definition"), str):
+                nv = _one(desc["business_definition"], "column_profiles.business_definition")
+                if nv is None:
+                    return None, spans, version
+                desc = {**desc, "business_definition": nv}
+            new_profiles.append(desc)
+        out["column_profiles"] = new_profiles
+    if version is None:
+        return metadata, [], None                          # no free-text — metadata untouched
+    return out, spans, version
 
 
 def _generation_settings() -> dict:
@@ -229,10 +303,20 @@ def audited_structured_call(conn, client: LLMClient, *, task: str, prompt_id: st
         register_enrichment_schemas(conn)   # provider never fails closed for lack of a schema.
         schema = reg.schema_for(schema_id, 1)
 
-    redaction = RedactionResult(text=instruction, redaction_version=_REDACTION_VERSION,
+    # #19: glossary free-text in the metadata is scanned/scrubbed BEFORE the payload is built —
+    # the classification below is what the scan established, never a hardcoded "clean".
+    safe_metadata, spans, free_text_version = _redact_free_text_meta(dict(catalog_metadata))
+    if safe_metadata is None:
+        logger.warning("free-text redaction failed closed for %s (schema %s); no dispatch",
+                       task, schema_id)
+        _audit_egress_block(conn, task=task, actor=actor,
+                            reason="glossary free-text redaction failed closed")
+        return None                       # hard fail closed — no dispatch, no cache
+    redaction_version = free_text_version or _REDACTION_VERSION
+    redaction = RedactionResult(text=instruction, redaction_version=redaction_version,
                                 redacted_spans=(), disposition="ok")
-    inputs = build_llm_inputs(redaction, catalog_metadata=catalog_metadata,
-                              raw_input_classification="clean")
+    inputs = build_llm_inputs(redaction, catalog_metadata=safe_metadata,
+                              raw_input_classification="contains_pii" if spans else "clean")
     req = LLMRequest(
         task=task, prompt_id=prompt_id, prompt_version=1, inputs=inputs,
         output_schema_id=schema_id, output_schema_version=1,
@@ -250,7 +334,8 @@ def audited_structured_call(conn, client: LLMClient, *, task: str, prompt_id: st
         client, req, lambda output: reg.validate(schema_id, 1, output))
     record_llm_call(
         conn, run_id=_RUN, request=req, input_hash=compute_input_hash(req.inputs),
-        redaction_version=_REDACTION_VERSION, input_redaction={},
+        redaction_version=redaction_version,
+        input_redaction={"redacted_spans": spans} if spans else {},
         raw_output={"output": outcome.output, "self_reported_scores": outcome.self_reported_scores},
         validation_result=outcome.validation_result, repair_attempts=list(outcome.repair_attempts),
         latency_ms=None, cost_metadata=outcome.cost_metadata, created_by=identity_to_jsonb(actor))
@@ -284,7 +369,9 @@ def audited_enrich_call(conn, client: LLMClient, *, task: str, prompt_id: str, s
 # domain, and BIAN/FIBO taxonomy paths. These are MEANING (semantics about the column), not raw data
 # values, so they pass the per-item egress filter under DISTINCT keys — deliberately NOT the plain
 # `definition` key (which stays forbidden, so a technical free-text definition can never ride through
-# this seam). The batch-level `assert_llm_safe` PII scan still applies on top.
+# this seam). Being MEANING does not make them CLEAN: each free-text value is then scanned/scrubbed
+# by `_redact_free_text_meta` (finding #19), and the batch-level `assert_llm_safe` scan still
+# applies on top.
 _ITEM_META_ALLOWED = frozenset({
     "table", "column", "type", "columns", "concept",
     "term_name", "business_definition", "synonyms", "data_domain", "bian_path", "fibo_path",
@@ -342,6 +429,24 @@ def audited_batch_call(conn, client: LLMClient, *, task: str, prompt_id: str, sc
     for _it in excluded:
         _audit_egress_block(conn, task=task, actor=actor, reason="item metadata not metadata-only")
 
+    # #19: per-item free-text scan/scrub (spec C9 grain — a fail-closed value excludes ITS item,
+    # never the batch). The classification below is what the scan established, never a hardcoded
+    # "clean"; scrubbed span types/positions are recorded on the llm_call audit row.
+    safe_items: list[BatchItem] = []
+    all_spans: list[dict] = []
+    free_text_version: str | None = None
+    for it in included:
+        meta, spans, version = _redact_free_text_meta(it.metadata)
+        free_text_version = free_text_version or version
+        if meta is None:
+            egress_outcomes.append(BatchItemOutcome(it.ref, EGRESS, None, (EGRESS,)))
+            _audit_egress_block(conn, task=task, actor=actor,
+                                reason="glossary free-text redaction failed closed")
+            continue
+        safe_items.append(BatchItem(it.ref, meta))
+        all_spans.extend({"ref": it.ref, **s} for s in spans)
+    included = safe_items
+
     if not included:
         return BatchCallResult(tuple(egress_outcomes), 0, 0, 0)
 
@@ -353,10 +458,11 @@ def audited_batch_call(conn, client: LLMClient, *, task: str, prompt_id: str, sc
 
     catalog_metadata = {**shared_metadata,
                         "items": [{"ref": it.ref, **it.metadata} for it in included]}
-    redaction = RedactionResult(text=instruction, redaction_version=_REDACTION_VERSION,
+    redaction_version = free_text_version or _REDACTION_VERSION
+    redaction = RedactionResult(text=instruction, redaction_version=redaction_version,
                                 redacted_spans=(), disposition="ok")
     inputs = build_llm_inputs(redaction, catalog_metadata=catalog_metadata,
-                              raw_input_classification="clean")
+                              raw_input_classification="contains_pii" if all_spans else "clean")
     req = LLMRequest(task=task, prompt_id=prompt_id, prompt_version=1, inputs=inputs,
                      output_schema_id=schema_id, output_schema_version=1,
                      generation_settings=_generation_settings(), output_schema=schema)
@@ -385,7 +491,8 @@ def audited_batch_call(conn, client: LLMClient, *, task: str, prompt_id: str, sc
                "outcomes": {o.ref: o.status for o in item_outcomes}}
     cost = dict(outcome.cost_metadata or {})
     record_llm_call(conn, run_id=_RUN, request=req, input_hash=compute_input_hash(req.inputs),
-                    redaction_version=_REDACTION_VERSION, input_redaction={},
+                    redaction_version=redaction_version,
+                    input_redaction={"redacted_spans": all_spans} if all_spans else {},
                     raw_output={"output": outcome.output,
                                 "self_reported_scores": outcome.self_reported_scores},
                     validation_result=outcome.validation_result,

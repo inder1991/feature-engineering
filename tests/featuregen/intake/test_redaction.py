@@ -246,3 +246,46 @@ def test_egress_backstop_allows_feature_value_numbers():
     i = _safe_inputs()
     i[INPUT_KEY_INTENT] = "90-day rolling count over a 365 day lookback for the top 100 customers"
     assert_llm_safe(_Req(i))  # no raise
+
+
+# ---- redact_free_text (finding #19): un-classified free text is scanned, never presumed clean ----
+
+
+def test_redact_free_text_clean_text_is_scanned_then_passes(monkeypatch):
+    from featuregen.intake import redaction as _rmod
+    from featuregen.intake.redaction import redact_free_text
+
+    monkeypatch.setattr(_rmod, "_INTENT_REDACTOR", None)   # deterministic default path
+    r = redact_free_text("The posted ledger balance of the account.")
+    assert r.disposition == "ok"
+    assert r.text == "The posted ledger balance of the account."
+    assert r.redacted_spans == ()
+
+
+def test_redact_free_text_scrubs_detectable_pii(monkeypatch):
+    from featuregen.intake import redaction as _rmod
+    from featuregen.intake.redaction import redact_free_text
+
+    monkeypatch.setattr(_rmod, "_INTENT_REDACTOR", None)
+    r = redact_free_text("Escalate breaks to jane.doe@bank.example or SSN 123-45-6789.")
+    assert r.text is not None
+    assert "jane.doe@bank.example" not in r.text and "123-45-6789" not in r.text
+    assert "[REDACTED:EMAIL]" in r.text and "[REDACTED:SSN]" in r.text
+    assert {s["type"] for s in r.redacted_spans} == {"EMAIL", "SSN"}
+
+
+def test_redact_free_text_routes_through_registered_redactor(monkeypatch):
+    # The NER seam: a REGISTERED redactor supersedes the deterministic default, so name-grade
+    # detection layers in via register_intent_redactor without touching the pattern set.
+    from featuregen.intake import redaction as _rmod
+    from featuregen.intake.redaction import redact_free_text
+
+    class _Ner:
+        def redact(self, raw_intent, raw_input_classification):
+            return RedactionResult(raw_intent.replace("Jane Doe", "[REDACTED:NAME]"),
+                                   "ner@test", (), "ok")
+
+    monkeypatch.setattr(_rmod, "_INTENT_REDACTOR", _Ner())
+    r = redact_free_text("Owned by Jane Doe in Finance.")
+    assert r.text == "Owned by [REDACTED:NAME] in Finance."
+    assert r.redaction_version == "ner@test"
