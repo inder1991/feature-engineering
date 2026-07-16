@@ -199,10 +199,13 @@ def terminalize_run_durable(run_id: str, *, status: str, now: datetime,
             logger.exception(
                 "durable ingestion_run terminalize failed; falling back to the request connection")
     if fallback_conn is not None:
-        terminalize_run(fallback_conn, run_id, **kwargs)
-    else:
-        logger.warning("ingestion_run %s could not be terminalized to %s (no DSN, no fallback "
-                       "connection) — the reconciliation sweep will abandon it", run_id, status)
+        try:
+            terminalize_run(fallback_conn, run_id, **kwargs)
+            return
+        except Exception:  # noqa: BLE001 — called from except paths: never mask the real failure
+            logger.exception("fallback ingestion_run terminalize failed for %s", run_id)
+    logger.warning("ingestion_run %s could not be terminalized to %s — the reconciliation sweep "
+                   "will abandon it once its heartbeat lease expires", run_id, status)
 
 
 def get_run(conn, run_id: str) -> dict | None:

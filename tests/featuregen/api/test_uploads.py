@@ -200,6 +200,19 @@ def test_unknown_ingest_fault_surfaces_500_with_stage_marker(client, monkeypatch
     assert "RuntimeError" in detail
 
 
+def test_upload_response_body_unchanged_by_run_manifest(client):
+    """FLAG-OFF / compatibility (design #3, CRITICAL): the run manifest is purely additive — the
+    run id rides the X-Ingestion-Run-Id HEADER only, and the POST /uploads JSON body stays the
+    exact IngestResult shape (same fields, same order) with the run id appearing nowhere in it."""
+    res = upload_csv(client, "deposits", DEPOSITS_CSV)
+    assert res.status_code == 200
+    body = res.json()
+    assert list(body.keys()) == ["status", "reason", "asserted", "changed_objects",
+                                 "quarantined", "flagged"]
+    run_id = res.headers["X-Ingestion-Run-Id"]
+    assert run_id.encode() not in res.content
+
+
 def test_upload_rejects_oversized_file(client, monkeypatch):
     import io
 

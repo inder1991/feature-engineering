@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import io
 import logging
 import os
@@ -8,7 +9,7 @@ from datetime import UTC, datetime
 from typing import Annotated
 
 import psycopg
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Response, UploadFile
 
 from featuregen.api.deps import get_conn, get_identity, get_llm_optional, require_catalog_write
 from featuregen.contracts.envelopes import IdentityEnvelope
@@ -23,6 +24,13 @@ from featuregen.overlay.upload.glossary_reader import (
     read_glossary,
 )
 from featuregen.overlay.upload.ingest import IngestResult, ingest_upload
+from featuregen.overlay.upload.ingestion_run import (
+    _effective_config_snapshot,
+    open_run,
+    source_fingerprint,
+    terminalize_run,
+    terminalize_run_durable,
+)
 from featuregen.overlay.upload.source_profile import (
     FTR_GLOSSARY_PROFILE,
     SourceCapabilityProfile,
@@ -30,6 +38,11 @@ from featuregen.overlay.upload.source_profile import (
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
+
+# Design #3: the run id rides a RESPONSE HEADER — on success and on every post-open error — so a
+# caller whose request failed can still fetch GET /ingestion-runs/{id}. A header, deliberately:
+# it does not change the JSON body, so the flag-off POST /uploads response stays byte-for-byte.
+_RUN_ID_HEADER = "X-Ingestion-Run-Id"
 
 # A catalog upload is a SCHEMA export (column names/types/grain), not a data extract, so a modest cap
 # bounds the whole-file in-memory read + parse against an accidental or malicious oversized upload.
@@ -74,6 +87,7 @@ def _read_rows(
 def create_upload(
     file: Annotated[UploadFile, File(...)],
     source: Annotated[str, Form(...)],
+    response: Response,
     conn: Annotated[psycopg.Connection, Depends(get_conn, scope="function")],
     identity: Annotated[IdentityEnvelope, Depends(get_identity)],
     client: Annotated[LLMClient | None, Depends(get_llm_optional)],
@@ -86,43 +100,81 @@ def create_upload(
     source = source.strip().lower()
     if not source:
         raise HTTPException(status_code=400, detail="source is required")
+    # Design #3: open the durable run manifest BEFORE parse, on an independent committing
+    # connection, so a parse/oversize/unsupported failure still has a queryable run row. The
+    # effective_config flag snapshot is pinned HERE, once — never re-read from env mid-run.
+    run_id = open_run(conn, origin_type="upload", catalog_source=source,
+                      filename=file.filename, actor=identity,
+                      effective_config=_effective_config_snapshot(), now=datetime.now(UTC))
+    response.headers[_RUN_ID_HEADER] = run_id   # the success response; error paths set it below
+    file_sha256: str | None = None              # stays NULL when the capped read rejects the file
+    failure_status = "rejected"                 # pre-ingest failure = the FILE was rejected...
     try:
-        rows, profile, glossary = _read_rows(file.filename or "", _read_capped(file), source)
-    except HTTPException:
+        data = _read_capped(file)
+        file_sha256 = hashlib.sha256(data).hexdigest()
+        try:
+            rows, profile, glossary = _read_rows(file.filename or "", data, source)
+        except HTTPException:
+            raise
+        except Exception as exc:   # a malformed file is a client error, not a 500
+            raise HTTPException(status_code=400, detail=f"could not parse upload: {exc}") from exc
+        pre_fingerprint, fingerprint_algo = source_fingerprint(conn, source)
+        failure_status = "failed"               # ...an ingest-stage fault = the ATTEMPT failed
+        # client=None (no provider configured) -> enrichment is skipped; a configured client runs
+        # the governed, audited enrichment path (M2/M4). Either way the upload itself succeeds or
+        # brakes. `profile` carries the glossary-vs-technical decision so validation is
+        # profile-aware (spec §U); `glossary` (a glossary upload only) carries the sidecar that
+        # drives per-field evidence wiring.
+        #
+        # Typed fault mapping (#27): parse errors became a 400 above, but every ingest fault used
+        # to collapse into an opaque 500. Map the KNOWN fault classes to a status + a stage
+        # diagnostic; an unknown fault still surfaces as a 500 (logged with its traceback) but
+        # names the failed stage.
+        try:
+            result = ingest_upload(conn, source, rows, actor=identity,
+                                   now=datetime.now(UTC), client=client, profile=profile,
+                                   glossary=glossary)
+        except ConcurrencyError as exc:
+            # OCC: a concurrent upload/confirm bumped one of this upload's fact streams mid-write.
+            # The request's transaction rolls back cleanly, so a retry is the correct client
+            # response.
+            raise HTTPException(
+                status_code=409,
+                detail="ingest conflict: a concurrent change touched this catalog while the "
+                       f"upload was being persisted — retry the upload ({exc})") from exc
+        except psycopg.Error as exc:
+            # A graph-constraint / persist / validation DB fault. Name the stage and the fault
+            # CLASS (+ SQLSTATE) — never the raw driver message, which can embed row values
+            # (redaction).
+            sqlstate = getattr(exc, "sqlstate", None)
+            raise HTTPException(
+                status_code=422,
+                detail=f"ingest failed at the persist/graph stage: {type(exc).__name__}"
+                       f"{f' (SQLSTATE {sqlstate})' if sqlstate else ''} — "
+                       "the upload was not applied") from exc
+        except Exception as exc:
+            logger.exception("upload of %r failed at the ingest stage", source)
+            raise HTTPException(
+                status_code=500,
+                detail=f"ingest stage failed: {type(exc).__name__} — the upload was not "
+                       "applied") from exc
+        # Terminalize ON THE REQUEST CONNECTION: the terminal status (IngestResult.status maps
+        # 1:1 onto the run vocabulary) commits atomically with the ingest it describes —
+        # 'ingested' can never be recorded for a transaction that then fails to commit.
+        post_fingerprint, _ = source_fingerprint(conn, source)
+        terminalize_run(conn, run_id, status=result.status, now=datetime.now(UTC),
+                        row_count=len(rows), quarantined_count=result.quarantined,
+                        file_sha256=file_sha256, pre_fingerprint=pre_fingerprint,
+                        post_fingerprint=post_fingerprint,
+                        fingerprint_algo_version=fingerprint_algo)
+        return result
+    except HTTPException as exc:
+        # The request transaction is rolling back — terminalize on an independent connection so
+        # the failed attempt's manifest survives. Redaction: record the exception CLASS (of the
+        # underlying cause when the HTTPException merely wraps one), never its message.
+        terminalize_run_durable(
+            run_id, status=failure_status, now=datetime.now(UTC), file_sha256=file_sha256,
+            redacted_failure_code=type(exc.__cause__ or exc).__name__,
+            reason_code=f"http_{exc.status_code}", fallback_conn=conn)
+        exc.headers = {**(exc.headers or {}), _RUN_ID_HEADER: run_id}
         raise
-    except Exception as exc:   # a malformed file is a client error, not a 500
-        raise HTTPException(status_code=400, detail=f"could not parse upload: {exc}") from exc
-    # client=None (no provider configured) -> enrichment is skipped; a configured client runs the
-    # governed, audited enrichment path (M2/M4). Either way the upload itself succeeds or brakes.
-    # `profile` carries the glossary-vs-technical decision so validation is profile-aware (spec §U);
-    # `glossary` (a glossary upload only) carries the sidecar that drives per-field evidence wiring.
-    #
-    # Typed fault mapping (#27): parse errors became a 400 above, but every ingest fault used to
-    # collapse into an opaque 500. Map the KNOWN fault classes to a status + a stage diagnostic; an
-    # unknown fault still surfaces as a 500 (logged with its traceback) but names the failed stage.
-    try:
-        return ingest_upload(conn, source, rows, actor=identity,
-                             now=datetime.now(UTC), client=client, profile=profile,
-                             glossary=glossary)
-    except ConcurrencyError as exc:
-        # OCC: a concurrent upload/confirm bumped one of this upload's fact streams mid-write. The
-        # request's transaction rolls back cleanly, so a retry is the correct client response.
-        raise HTTPException(
-            status_code=409,
-            detail="ingest conflict: a concurrent change touched this catalog while the upload "
-                   f"was being persisted — retry the upload ({exc})") from exc
-    except psycopg.Error as exc:
-        # A graph-constraint / persist / validation DB fault. Name the stage and the fault CLASS
-        # (+ SQLSTATE) — never the raw driver message, which can embed row values (redaction).
-        sqlstate = getattr(exc, "sqlstate", None)
-        raise HTTPException(
-            status_code=422,
-            detail=f"ingest failed at the persist/graph stage: {type(exc).__name__}"
-                   f"{f' (SQLSTATE {sqlstate})' if sqlstate else ''} — "
-                   "the upload was not applied") from exc
-    except Exception as exc:
-        logger.exception("upload of %r failed at the ingest stage", source)
-        raise HTTPException(
-            status_code=500,
-            detail=f"ingest stage failed: {type(exc).__name__} — the upload was not "
-                   "applied") from exc

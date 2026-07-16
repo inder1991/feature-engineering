@@ -173,6 +173,16 @@ def test_terminalize_run_durable_falls_back_to_given_conn(db, no_dsn) -> None:
     assert get_run(db, run_id)["status"] == "failed"
 
 
+def test_terminalize_run_durable_never_raises(no_dsn) -> None:
+    """The route calls this from its EXCEPT path: a failing manifest write (e.g. the fallback conn
+    sits in an aborted transaction after a real DB fault) must never mask the actual failure."""
+    class Broken:
+        def execute(self, *args, **kwargs):
+            raise RuntimeError("current transaction is aborted")
+
+    terminalize_run_durable("ingrun_X", status="failed", now=_LATER, fallback_conn=Broken())
+
+
 # ── effective config snapshot ─────────────────────────────────────────────────────────────────────
 
 
