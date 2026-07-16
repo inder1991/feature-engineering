@@ -195,10 +195,15 @@ def _join_rows(joins_to="accounts.account_id") -> list[CanonicalRow]:
 
 
 def _verified_join_via_real_flow(db, monkeypatch, admin1, admin2):
-    """Flag-on ingest of the declared join, then the dual platform-admin confirm -> VERIFIED."""
+    """Flag-on ingest of the declared join, then the dual platform-admin confirm -> VERIFIED.
+
+    The ingest calls here use the REAL clock (no `now=`): the end-of-ingest
+    `project_confirmed_joins` defaults to `datetime.now(UTC)` and `resolve_fact`'s drift-freshness
+    guard (24h SLA) would refuse to serve the fact against a days-old fixed watermark — the same
+    reason the full-ingestion e2e runs on the real clock."""
     monkeypatch.setenv("OVERLAY_GOVERNED_JOINS", "1")
     _seal_config()
-    res = ingest_upload(db, _SRC, _join_rows(), actor=_actor(), now=_NOW)
+    res = ingest_upload(db, _SRC, _join_rows(), actor=_actor())
     assert res.status == "ingested"
     ref = governed_join_proposal(_join_rows()[0])
     _confirm_join(db, ref, admin1=admin1, admin2=admin2)
@@ -208,7 +213,7 @@ def _verified_join_via_real_flow(db, monkeypatch, admin1, admin2):
 def test_reingest_without_the_join_surfaces_dropped_and_never_demotes(
         db, monkeypatch, human_admin_1, human_admin_2):
     _ref, key = _verified_join_via_real_flow(db, monkeypatch, human_admin_1, human_admin_2)
-    res = ingest_upload(db, _SRC, _join_rows(joins_to=""), actor=_actor(), now=_NOW)
+    res = ingest_upload(db, _SRC, _join_rows(joins_to=""), actor=_actor())
     assert res.status == "ingested"                                  # advisory: never aborts
     (div,) = list_governed_join_divergences(db, _SRC)
     assert div["kind"] == "dropped" and div["from_ref"] == _FROM
@@ -225,7 +230,7 @@ def test_reingest_retargeting_the_join_surfaces_retargeted(
         db, monkeypatch, human_admin_1, human_admin_2):
     _ref, key = _verified_join_via_real_flow(db, monkeypatch, human_admin_1, human_admin_2)
     res = ingest_upload(db, _SRC, _join_rows(joins_to="parties.party_id"),
-                        actor=_actor(), now=_NOW)
+                        actor=_actor())
     assert res.status == "ingested"
     (div,) = list_governed_join_divergences(db, _SRC)
     assert div["kind"] == "retargeted"
@@ -236,9 +241,9 @@ def test_reingest_retargeting_the_join_surfaces_retargeted(
 def test_reingest_reaffirming_the_join_clears_the_divergence(
         db, monkeypatch, human_admin_1, human_admin_2):
     _verified_join_via_real_flow(db, monkeypatch, human_admin_1, human_admin_2)
-    ingest_upload(db, _SRC, _join_rows(joins_to=""), actor=_actor(), now=_NOW)
+    ingest_upload(db, _SRC, _join_rows(joins_to=""), actor=_actor())
     assert len(list_governed_join_divergences(db, _SRC)) == 1
-    ingest_upload(db, _SRC, _join_rows(), actor=_actor(), now=_NOW)  # re-declares the join
+    ingest_upload(db, _SRC, _join_rows(), actor=_actor())  # re-declares the join
     assert list_governed_join_divergences(db, _SRC) == []
 
 
@@ -250,7 +255,7 @@ def test_flag_off_never_calls_detection_and_writes_no_rows(db, monkeypatch):
     import featuregen.overlay.upload.ingest as ingest_module
     monkeypatch.setattr(ingest_module, "detect_governed_join_divergences",
                         lambda *a, **kw: calls.append(a))
-    res = ingest_upload(db, _SRC, _join_rows(), actor=_actor(), now=_NOW)
+    res = ingest_upload(db, _SRC, _join_rows(), actor=_actor())
     assert res.status == "ingested"
     assert calls == []                                               # detection never invoked
     assert _divergence_rows(db) == []

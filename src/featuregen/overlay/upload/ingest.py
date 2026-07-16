@@ -43,6 +43,7 @@ from featuregen.overlay.upload.graph import (
     governed_joins_enabled,
     parse_join_ref,
 )
+from featuregen.overlay.upload.join_drift import detect_governed_join_divergences
 from featuregen.overlay.upload.object_ref import normalize_ref, parse_ref
 from featuregen.overlay.upload.passc.projection import (
     list_approved_join_refs,
@@ -1010,6 +1011,27 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
             counters.incr("overlay.passc.join_projection.error")
             logger.warning("advisory approved-join re-projection failed for %r — facts intact",
                            catalog_source, exc_info=True)
+
+    if governed_joins_enabled():
+        # Governed-join DRIFT detection (advisory): a re-upload that RETARGETS or DROPS a joins_to
+        # humans VERIFIED is surfaced as a governed_join_divergence row — NEVER a state change on
+        # the fact/edge (no auto-demote; the old join stays operational until a human acts). MUST
+        # run here, after the approved-join re-projection above: build_graph wiped every edge
+        # mid-ingest, and only project_confirmed_joins restored the source's VERIFIED operational
+        # edges the detector diffs against (under projection lag the block above skipped, the
+        # detector sees zero VERIFIED joins and no-ops — it re-detects on the next caught-up
+        # ingest). OWN savepoint + except (the _propose_governed_joins pattern): a DB-class fault
+        # inside must never poison the request tx and roll back Pass A facts + the graph — the
+        # detection degrades to a warning and the upload always ingests. Flag-off byte-for-byte:
+        # this whole block is behind governed_joins_enabled().
+        try:
+            with conn.transaction():
+                detect_governed_join_divergences(conn, catalog_source, vr.good,
+                                                 source_snapshot_id=snapshot_id, now=now)
+        except Exception:  # noqa: BLE001 — advisory: drift detection never fails an upload
+            counters.incr("overlay.join_drift.error")
+            logger.warning("advisory governed-join drift detection failed for %r — facts + graph "
+                           "intact", catalog_source, exc_info=True)
 
     persist_quarantine(conn, catalog_source, vr.quarantined)
     flagged = (f"first upload of '{catalog_source}' ({len(vr.good)} objects) — review recommended"
