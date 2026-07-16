@@ -71,6 +71,7 @@ from featuregen.overlay.upload.planner.contracts import (
     make_contract_id,
     to_additivity_class,
 )
+from featuregen.overlay.upload.planner.fingerprint import compiler_input_fingerprint
 from featuregen.overlay.upload.planner.safety import evaluate_column_safety
 from featuregen.overlay.upload.taxonomy.entity_relationships import (
     Cardinality,
@@ -786,7 +787,12 @@ def revalidate_freshness(conn, ctx: CompilerContext, plan: BindingPlanV1) -> Fre
         stamps.append(CatalogStateStampV1(
             catalog_source=src, head_seq=head or 0,
             last_completed_at=wm.isoformat() if wm is not None else "",
-            stamp_kind=CatalogStateStampKind.drift_watermark))
+            stamp_kind=CatalogStateStampKind.drift_watermark,
+            # 3B.4 (F3/F14): the compile-time replay drift signal — the compiler-input fingerprint (covers
+            # the classifier's real read-set, which realization_fingerprint omits) + the projection
+            # checkpoint (a LAG invariant). The scope.py pre-compile stamp keeps defaults (no ctx there).
+            compiler_input_fingerprint=compiler_input_fingerprint(ctx, src),
+            projection_checkpoint=checkpoint))
     if bridge_fingerprint(conn) != ctx.bridge_fingerprint_at_start:
         codes.append(ReasonCode.catalog_mutated_during_compile)
         consistency = StampConsistency.unverifiable

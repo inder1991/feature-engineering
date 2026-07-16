@@ -118,7 +118,11 @@ def plan_bindings(conn, *, template: Template, target_entity: str | None, scope:
     cols_trunc = combos_trunc = plans_trunc = False
     total_cols = total_combos = 0
     for src in scope.authorized_catalog_sources:
-        disc = discover_ingredient_candidates(conn, template, src, roles=roles)
+        # 3B.4 F5: when compiling, discover over the context's frozen column snapshot so the
+        # planner_input_hash covers the same data the selection consumed (else a fresh read could differ).
+        frozen_cols = (list(compile_ctx.columns_by_catalog[src].values())
+                       if compile_ctx is not None and src in compile_ctx.columns_by_catalog else None)
+        disc = discover_ingredient_candidates(conn, template, src, roles=roles, columns=frozen_cols)
         cols_trunc |= disc.candidate_columns_truncated
         total_cols += disc.total_candidate_columns_considered
         en = enumerate_single_catalog_plans(template, src, target_entity, disc)
