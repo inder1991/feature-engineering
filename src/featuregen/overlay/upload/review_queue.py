@@ -22,7 +22,16 @@ class QuarantineItem:
 
 
 def persist_quarantine(conn, catalog_source: str, errors: list[RowError]) -> None:
-    """Replace the source's quarantine with this upload's errors (whole-source refresh)."""
+    """Replace the source's quarantine with this upload's errors (whole-source refresh).
+
+    CONTRACT (#33): a caller invokes this only when the new upload SUPERSEDES the queue —
+    (a) a successful ingest: its quarantine (INCLUDING an empty one — a clean re-upload of the
+        fixed file legitimately clears the queue) now mirrors the file that is in the graph; or
+    (b) a NON-ingesting upload (held / all-quarantined / structural-reject) that produced
+        quarantine rows: the reviewer must see why ITS rows failed.
+    A non-ingesting upload with NO quarantine must NOT call this: the catalog still reflects the
+    prior upload, so an empty whole-source refresh would silently wipe a queue the reviewer is
+    still working through. The callers in ingest.py guard for that."""
     conn.execute("DELETE FROM quarantine_row WHERE catalog_source = %s", (catalog_source,))
     for e in errors:
         raw = asdict(e.row) if e.row is not None else {}

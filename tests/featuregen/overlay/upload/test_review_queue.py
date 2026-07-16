@@ -196,6 +196,82 @@ def test_resolve_pii_member_succeeds_and_sibling_then_hits_the_catalog_check(db)
     assert not resolved2 and "already" in reason2
 
 
+def _ingest_prior_queue(db, now):
+    """Ingest a 3-good + 1-bad upload for 'deposits': queue holds the one bad row."""
+    rows = [
+        CanonicalRow("deposits", "accounts", "id", "integer", is_grain=True),
+        CanonicalRow("deposits", "accounts", "balance", "numeric"),
+        CanonicalRow("deposits", "customers", "cust_id", "integer", is_grain=True),
+        CanonicalRow("deposits", "accounts", "", "text"),   # blank column -> quarantined
+    ]
+    res = ingest_upload(db, "deposits", rows, actor=_actor(), now=now)
+    assert res.status == "ingested" and res.quarantined == 1
+    assert len(list_quarantine(db, "deposits")) == 1
+
+
+def test_held_upload_with_no_quarantine_keeps_the_prior_queue(db):
+    # #33: a held upload did NOT ingest — the catalog still reflects the prior upload — so a held
+    # upload that produced NO quarantine must not wipe the queue a reviewer is working through
+    # (pre-fix, persist_quarantine's whole-source refresh with an empty list deleted every entry).
+    _seal()
+    now = datetime(2026, 7, 5, tzinfo=UTC)
+    _ingest_prior_queue(db, now)
+
+    # a truncated (but individually valid) re-upload trips the large-change brake: held, 0 quarantined
+    held = ingest_upload(
+        db, "deposits", [CanonicalRow("deposits", "accounts", "id", "integer", is_grain=True)],
+        actor=_actor(), now=now)
+    assert held.status == "held" and held.quarantined == 0
+    assert len(list_quarantine(db, "deposits")) == 1   # the reviewer's queue survives
+
+
+def test_held_upload_with_quarantine_still_replaces_the_queue(db):
+    # The held path's existing intent stands (#33 contract): when the held upload DID produce
+    # quarantine, the reviewer sees why ITS rows failed — replacing the prior queue.
+    _seal()
+    now = datetime(2026, 7, 5, tzinfo=UTC)
+    _ingest_prior_queue(db, now)
+
+    foreign = [CanonicalRow("crm", t, c, "text") for t, c in [
+        ("leads", "lead_id"), ("leads", "stage"),
+        ("tickets", "ticket_id"), ("tickets", "priority")]]   # wrong source -> all quarantined
+    held = ingest_upload(db, "deposits", foreign, actor=_actor(), now=now)
+    assert held.status == "held" and held.quarantined == 4
+    q = list_quarantine(db, "deposits")
+    assert len(q) == 4                                        # the held upload's rows, not the old one
+    assert all("crm" in item.reason for item in q)
+
+
+def test_structural_rejection_without_quarantine_keeps_the_prior_queue(db):
+    # #33 contract: a structural rejection produced nothing to review, so (like the held-clean case)
+    # the prior queue is left untouched.
+    _seal()
+    now = datetime(2026, 7, 5, tzinfo=UTC)
+    _ingest_prior_queue(db, now)
+    res = ingest_upload(db, "deposits", [], actor=_actor(), now=now)
+    assert res.status == "rejected" and res.quarantined == 0
+    assert len(list_quarantine(db, "deposits")) == 1
+
+
+def test_structural_rejection_with_reader_quarantine_replaces_the_queue(db):
+    # #33 consistency: a structurally-rejected glossary whose READER quarantined rows (multi-schema
+    # fold collisions merged in by ingest) surfaces them like the held/all-quarantined paths do,
+    # instead of leaving the prior upload's queue silently stale beside a rejection.
+    from featuregen.overlay.upload.canonical import RowError
+    from featuregen.overlay.upload.glossary_reader import GlossaryUpload
+    _seal()
+    now = datetime(2026, 7, 5, tzinfo=UTC)
+    _ingest_prior_queue(db, now)
+
+    rows = [CanonicalRow("", "t", "c", "unknown")]            # sourceless -> structural rejection
+    glossary = GlossaryUpload(rows=rows, records=[], quarantined=[
+        RowError(len(rows), "multi-schema fold collision: s1.t.c vs s2.t.c", None)])
+    res = ingest_upload(db, "deposits", rows, actor=_actor(), now=now, glossary=glossary)
+    assert res.status == "rejected" and res.quarantined == 1
+    q = list_quarantine(db, "deposits")
+    assert len(q) == 1 and "collision" in q[0].reason         # the rejection's evidence, not the old row
+
+
 def test_resolve_second_as_of_column_is_refused(db):
     # #17 resolve-path: after the as_of ambiguity quarantined both rows, resolving ONE picks the
     # table's availability basis explicitly; resolving the OTHER must be refused loudly — a second

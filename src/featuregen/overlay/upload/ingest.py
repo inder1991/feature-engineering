@@ -748,6 +748,11 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
                               quarantined=[*vr.quarantined, *glossary.quarantined],
                               structural_error=vr.structural_error if rows else None)
     if vr.structural_error:
+        # #33 consistency: a structural rejection WITH quarantine content (a glossary whose reader
+        # quarantined rows was merged above) surfaces it like the held/all-quarantined paths below;
+        # with none it leaves the prior queue untouched (nothing ingested, nothing new to review).
+        if vr.quarantined:
+            persist_quarantine(conn, catalog_source, vr.quarantined)
         return IngestResult("rejected", vr.structural_error, 0, 0, len(vr.quarantined))
 
     upload = UploadCatalog(catalog_source, vr.good)
@@ -755,7 +760,11 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
     if brake.held:
         # persist the quarantine even when held, so a reviewer can see WHY this upload's rows failed
         # (was: returned before persist_quarantine -> the queue still showed the previous upload).
-        persist_quarantine(conn, catalog_source, vr.quarantined)
+        # ONLY when non-empty (#33): a held upload did NOT ingest — the catalog still reflects the
+        # prior upload — so a held-but-clean upload must not wipe the queue a reviewer is working
+        # through (persist_quarantine's whole-source refresh deletes everything first).
+        if vr.quarantined:
+            persist_quarantine(conn, catalog_source, vr.quarantined)
         logger.warning("upload of %r held by the large-change brake: %s", catalog_source, brake.reason)
         return IngestResult("held", brake.reason, 0, 0, len(vr.quarantined))
 
