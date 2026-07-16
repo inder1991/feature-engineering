@@ -117,6 +117,9 @@ def _table_facts(rows: list[CanonicalRow]):
         grain_cols = [r.column for r in trows if r.is_grain]
         if grain_cols:
             yield table, "grain", {"columns": grain_cols, "is_unique": True}
+        # At most ONE as_of row can reach here (#17): validate_rows quarantines ALL of a table's
+        # as_of rows when it declares 2+, so this next() is never an order-dependent pick — the
+        # ambiguity was surfaced to the reviewer, not silently resolved to whichever row came first.
         as_of_row = next((r for r in trows if r.as_of), None)
         if as_of_row:
             # Use the declared basis when valid; default to posted_at (M8 — no longer hard-coded).
@@ -1112,6 +1115,21 @@ def resolve_quarantine_row(conn, catalog_source: str, row_index: int, edits: dic
             f"declare sensitivity {', '.join(repr(t) for t in sibling_tags)}; resolving this row "
             f"as '{good.sensitivity or 'untagged'}' would weaken the column's effective "
             "sensitivity — resolve the tagged row (or match its tag) instead")
+    # #17: a table asserts ONE availability basis. validate_rows quarantined ALL of a table's as_of
+    # rows when 2+ were declared; resolving the FIRST picks the basis explicitly, but resolving a
+    # SECOND as_of column would silently re-assert availability_time onto it (the same
+    # last-writer-wins the validation fix removed, via the resolve path). Refuse it loudly — the
+    # reviewer edits as_of off this row (or dismisses it) instead of flipping the chosen basis.
+    if good.as_of:
+        other = conn.execute(
+            "SELECT column_name FROM graph_node WHERE catalog_source = %s AND table_name = %s "
+            "AND kind = 'column' AND is_as_of = true AND column_name <> %s",
+            (catalog_source, good.table, good.column)).fetchone()
+        if other is not None:
+            return False, (
+                f"as_of conflict: {good.table} already has availability basis column "
+                f"'{other[0]}', and a table has ONE availability basis — edit as_of off this "
+                f"row (or dismiss it) rather than silently flipping the basis")
     # #4: resolution is an INGESTION path, so it takes the same source-level large-change brake an
     # upload does. Cumulative: every object added by resolution since the last successful upload
     # (graph minus the drift snapshot) counts alongside this row's, so an all-quarantined

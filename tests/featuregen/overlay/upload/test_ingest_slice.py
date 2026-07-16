@@ -100,6 +100,37 @@ def test_case_whitespace_variant_reupload_is_one_identity(db):
     assert refs == ["public.accounts.balance", "public.accounts.id"]   # ONE node per column
 
 
+def test_two_as_of_columns_conflict_surfaced_same_either_row_order(db):
+    # #17: ONE table declaring TWO as_of columns used to silently assert whichever row came first
+    # (reordering equivalent CSV rows changed the availability fact, no conflict reported). Now the
+    # ambiguity quarantines both as_of rows — NO availability_time fact is asserted — and the
+    # surfaced conflict is identical regardless of row order. A single as_of column still asserts
+    # availability normally (test_slice_ingest_serve_drift_and_brake above).
+    from featuregen.overlay.upload.review_queue import list_quarantine
+    _seal_config()
+    now = datetime(2026, 7, 5, tzinfo=UTC)
+
+    def _rows(src, flipped):
+        pair = [
+            CanonicalRow(src, "accounts", "posted_at", "timestamp", as_of=True),
+            CanonicalRow(src, "accounts", "ingested_at", "timestamp", as_of=True),
+        ]
+        return [CanonicalRow(src, "accounts", "id", "integer", is_grain=True),
+                *(reversed(pair) if flipped else pair)]
+
+    surfaced = []
+    for src, flipped in (("s1", False), ("s2", True)):
+        rows = _rows(src, flipped)
+        res = ingest_upload(db, src, rows, actor=_actor(), now=now)
+        assert res.status == "ingested"        # the unambiguous rows still ingest
+        assert res.quarantined == 2            # both as_of rows surfaced, not silently resolved
+        avail = resolve_fact(db, UploadCatalog(src, rows), table_ref(src, "accounts"),
+                             "availability_time", now=now)
+        assert avail.value is None             # no silently-picked availability basis
+        surfaced.append(sorted((q.raw["column"], q.reason) for q in list_quarantine(db, src)))
+    assert surfaced[0] == surfaced[1]          # row order changes NOTHING the reviewer sees
+
+
 def test_enrichment_failure_does_not_abort_ingest(db):
     _seal_config()
     now = datetime(2026, 7, 5, tzinfo=UTC)

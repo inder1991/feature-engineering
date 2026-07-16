@@ -227,4 +227,31 @@ def validate_rows(rows: list[CanonicalRow],
                 f"reduce its width", row))
         good = kept
 
+    # Availability-basis ambiguity (#17), applied AFTER dedup/width like the bound above: a table
+    # asserts ONE availability basis, so 2+ accepted as_of columns for the SAME table are
+    # order-ambiguous — ingest's availability_time fact would silently follow whichever row came
+    # FIRST in the file. Fail CLOSED like the metadata-conflict path: quarantine ALL of the table's
+    # as_of rows under one deterministic reason naming the competing columns (sorted — independent
+    # of row order), so NO basis is asserted until a reviewer resolves exactly one (or edits as_of
+    # off the others and re-uploads). The table's other columns still ingest.
+    as_of_cols: dict[tuple[str, str], list[CanonicalRow]] = {}
+    for row in good:
+        if row.as_of:
+            as_of_cols.setdefault((row.source, row.table), []).append(row)
+    ambiguous = {tk: rs for tk, rs in as_of_cols.items() if len(rs) > 1}
+    if ambiguous:
+        kept = []
+        for row in good:
+            tk = (row.source, row.table)
+            if tk not in ambiguous or not row.as_of:
+                kept.append(row)
+                continue
+            competing = ", ".join(sorted(r.column for r in ambiguous[tk]))
+            quarantined.append(RowError(
+                seen[(row.source, row.table, row.column)][1],
+                f"table '{row.table}' declares {len(ambiguous[tk])} as_of columns ({competing}); "
+                f"a table has ONE availability basis — no basis is asserted until a reviewer "
+                f"resolves exactly one of them", row))
+        good = kept
+
     return ValidationResult(good=good, quarantined=quarantined, structural_error=None)

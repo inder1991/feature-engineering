@@ -196,6 +196,37 @@ def test_resolve_pii_member_succeeds_and_sibling_then_hits_the_catalog_check(db)
     assert not resolved2 and "already" in reason2
 
 
+def test_resolve_second_as_of_column_is_refused(db):
+    # #17 resolve-path: after the as_of ambiguity quarantined both rows, resolving ONE picks the
+    # table's availability basis explicitly; resolving the OTHER must be refused loudly — a second
+    # resolve would silently flip the basis (the same last-writer-wins the validation fix removed).
+    _seal()
+    now = datetime(2026, 7, 5, tzinfo=UTC)
+    rows = [
+        CanonicalRow("deposits", "accounts", "id", "integer", is_grain=True),
+        CanonicalRow("deposits", "accounts", "posted_at", "timestamp", as_of=True),
+        CanonicalRow("deposits", "accounts", "ingested_at", "timestamp", as_of=True),
+    ]
+    res = ingest_upload(db, "deposits", rows, actor=_actor(), now=now)
+    assert res.status == "ingested" and res.quarantined == 2
+    q = list_quarantine(db, "deposits")
+    first = next(i for i in q if i.raw["column"] == "posted_at")
+    second = next(i for i in q if i.raw["column"] == "ingested_at")
+
+    resolved, reason = resolve_quarantine_row(db, "deposits", first.row_index, {}, actor=_actor())
+    assert resolved and reason == ""
+    resolved2, reason2 = resolve_quarantine_row(db, "deposits", second.row_index, {}, actor=_actor())
+    assert not resolved2 and "as_of" in reason2
+
+    from featuregen.overlay.identity import fact_key
+    from featuregen.overlay.state import fold_overlay_state
+    from featuregen.overlay.store import load_fact
+    from featuregen.overlay.upload.upload_catalog import table_ref
+    state = fold_overlay_state(load_fact(db, fact_key(table_ref("deposits", "accounts"),
+                                                      "availability_time")))
+    assert state.value["column"] == "posted_at"     # the human-chosen basis stands
+
+
 def test_dismiss_quarantine_row(db):
     idx = _quarantine_one_bad(db)
     assert dismiss_quarantine_row(db, "deposits", idx) is True

@@ -193,6 +193,31 @@ def test_table_over_the_column_bound_is_quarantined_whole():
                and "column" in q.message for q in result.quarantined)
 
 
+def test_two_as_of_columns_for_one_table_quarantined_order_independent():
+    # #17: ingest's availability_time fact would silently follow whichever as_of row came FIRST in
+    # the file — reordering equivalent CSV rows changed the asserted basis. Fail closed instead
+    # (mirroring the metadata-conflict path): quarantine ALL of the table's as_of rows with ONE
+    # deterministic reason naming the competing columns, so no basis is asserted until a reviewer
+    # picks exactly one. Row order must not change anything the reviewer sees.
+    a = _row(column="posted_at", type="timestamp", as_of=True)
+    b = _row(column="ingested_at", type="timestamp", as_of=True)
+    keep = _row(column="id", is_grain=True)
+    other_table = _row(table="events", column="event_at", type="timestamp", as_of=True)
+    r1 = validate_rows([keep, a, b, other_table])
+    r2 = validate_rows([keep, b, a, other_table])
+    for res in (r1, r2):
+        # the unrelated column and the single-as_of table are untouched
+        assert sorted((g.table, g.column) for g in res.good) == [
+            ("accounts", "id"), ("events", "event_at")]
+        assert sorted(q.row.column for q in res.quarantined) == ["ingested_at", "posted_at"]
+    # the surfaced reason is IDENTICAL regardless of CSV row order and names both columns
+    msgs1 = {q.message for q in r1.quarantined}
+    msgs2 = {q.message for q in r2.quarantined}
+    assert msgs1 == msgs2 and len(msgs1) == 1
+    msg = next(iter(msgs1))
+    assert "posted_at" in msg and "ingested_at" in msg and "as_of" in msg
+
+
 def test_column_bound_counts_unique_columns_not_raw_rows():
     # Dedup happens first: bound-many unique columns plus duplicate rows is still AT the bound.
     rows = [_row(column=f"c{i}") for i in range(MAX_COLUMNS_PER_TABLE)]
