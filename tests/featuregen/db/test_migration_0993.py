@@ -13,10 +13,12 @@ import pytest
 
 
 def _node(conn, object_ref: str, *, kind: str = "column", sensitivity: str | None = None) -> None:
+    # column_name follows the kind (NULL on a table node): 0997's structural checks now also hold,
+    # and this suite must keep violating ONLY the vocabulary constraint under test.
     conn.execute(
         "INSERT INTO graph_node (catalog_source, object_ref, kind, table_name, column_name, "
-        "sensitivity) VALUES ('src', %s, %s, 'txn', 'amount', %s)",
-        (object_ref, kind, sensitivity))
+        "sensitivity) VALUES ('src', %s, %s, 'txn', %s, %s)",
+        (object_ref, kind, None if kind == "table" else "amount", sensitivity))
 
 
 def _edge(conn, to_ref: str, *, kind: str = "joins", cardinality: str | None = "N:1",
