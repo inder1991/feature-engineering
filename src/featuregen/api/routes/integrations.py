@@ -576,5 +576,9 @@ def import_sync(sync_id: str, body: ImportIn, conn: _Conn, identity: _Identity,
     return {
         "result": asdict(result),
         "import_id": import_id,
-        "review_queue": {"quarantined": result.quarantined, "semantics_pending": pending},
+        # Informational COUNT, not a queue (#25): landed OM columns await a data owner's semantics
+        # confirmation, but the import creates NO review records for them — claiming a "review
+        # queue" here would be dishonest. Quarantined rows (reported inside result) are the only
+        # items this import routes to a real review queue.
+        "semantics_pending": pending,
     }

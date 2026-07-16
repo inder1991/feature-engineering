@@ -344,7 +344,7 @@ export function ConnectorPanel({
                   ({s.hint})
                 </span>
               ))}
-              . A human confirms as-of and its basis in the review queue; the connector never
+              . A data owner confirms as-of and its basis after import; the connector never
               invents semantics.
             </p>
           )}
@@ -363,9 +363,9 @@ export function ConnectorPanel({
                     without safety facts.
                   </strong>{' '}
                   OpenMetadata does not carry as-of basis, additivity, unit, or currency. These
-                  columns import searchable and are routed to the review queue for owner
-                  confirmation; feature generation treats their missing facts honestly until
-                  confirmed.
+                  columns import searchable; nothing is routed to a review queue — feature
+                  generation treats their missing facts honestly until a data owner confirms
+                  them.
                 </p>
               </div>
             </div>
@@ -448,34 +448,31 @@ export function ConnectorPanel({
             Import record <span className="mono">{imported.import_id}</span>: your approval is
             recorded on it; vehicle <span className="mono">openmetadata-connector</span>.
           </p>
-          {imported.result.status === 'ingested' &&
-            imported.review_queue.quarantined + imported.review_queue.semantics_pending > 0 && (
-              <div className="callout">
-                <CalloutGlyph>
-                  <path d="M2.75 8h9M8.5 4.75 11.75 8 8.5 11.25" />
-                </CalloutGlyph>
-                <div className="callout-body">
-                  <p>
-                    <strong>
-                      {imported.review_queue.quarantined + imported.review_queue.semantics_pending}{' '}
-                      item
-                      {imported.review_queue.quarantined + imported.review_queue.semantics_pending === 1
-                        ? ''
-                        : 's'}{' '}
-                      now in the review queue for {imported.source}:
-                    </strong>{' '}
-                    {imported.review_queue.quarantined} quarantined column
-                    {imported.review_queue.quarantined === 1 ? '' : 's'} and{' '}
-                    {imported.review_queue.semantics_pending} semantics confirmation
-                    {imported.review_queue.semantics_pending === 1 ? '' : 's'} (as-of, additivity,
-                    unit, currency).
-                  </p>
-                  <button type="button" className="btn" onClick={() => onReviewQueue(imported.source)}>
-                    Open review queue
-                  </button>
-                </div>
+          {/* Honesty (#25): semantics-pending is an informational COUNT — the import creates no
+              review records for it, so this callout must not claim a queue. Quarantined rows are
+              the real queue, and the result callout above already offers that handoff. */}
+          {imported.result.status === 'ingested' && imported.semantics_pending > 0 && (
+            <div className="callout">
+              <CalloutGlyph>
+                <circle cx="8" cy="8" r="6.25" />
+                <path d="M8 4.75v4M8 11.25v.01" />
+              </CalloutGlyph>
+              <div className="callout-body">
+                <p>
+                  <strong>
+                    {imported.semantics_pending === 1
+                      ? '1 column needs'
+                      : `${imported.semantics_pending} columns need`}{' '}
+                    owner confirmation (semantics pending).
+                  </strong>{' '}
+                  They imported into {imported.source} without as-of basis, additivity, unit, or
+                  currency — facts OpenMetadata does not carry. This is an informational count,
+                  not a review queue; feature generation treats the missing facts honestly until
+                  a data owner confirms them.
+                </p>
               </div>
-            )}
+            </div>
+          )}
         </>
       )}
     </div>

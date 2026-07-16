@@ -476,11 +476,11 @@ describe('sync preview/import client', () => {
         status: 'ingested', reason: null, asserted: 3, changed_objects: 0, quarantined: 1, flagged: null,
       },
       import_id: 'omimp_01HZY',
-      review_queue: { quarantined: 1, semantics_pending: 13 },
+      semantics_pending: 13,
     }))
     const result = await importSync(SYNC.sync_id, SNAPSHOT_HASH, BASELINE_HASH)
     expect(result.import_id).toBe('omimp_01HZY')
-    expect(result.review_queue).toEqual({ quarantined: 1, semantics_pending: 13 })
+    expect(result.semantics_pending).toBe(13)
     const [url, init] = fetchMock.mock.calls[0]
     expect(url).toBe(`/syncs/${SYNC.sync_id}/import`)
     expect(init.method).toBe('POST')

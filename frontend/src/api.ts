@@ -1173,11 +1173,13 @@ export function previewSync(syncId: string): Promise<SyncPreview> {
 }
 
 // Import wraps the standard IngestResult (same pipeline, same shape) with the audit record id
-// and the review-queue handoff counts.
+// and `semantics_pending`: an informational COUNT of landed columns awaiting a data owner's
+// semantics confirmation. It is NOT a queue — the import creates no review records for pending
+// semantics. Quarantined rows (inside result) are the only items routed to a real review queue.
 export interface SyncImportResult {
   result: IngestResult
   import_id: string
-  review_queue: { quarantined: number; semantics_pending: number }
+  semantics_pending: number
 }
 
 export function importSync(

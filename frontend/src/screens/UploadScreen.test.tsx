@@ -234,7 +234,7 @@ describe('ingest paths', () => {
     importSync.mockResolvedValue({
       result: { status: 'ingested', reason: null, asserted: 0, changed_objects: 0, quarantined: 0, flagged: null },
       import_id: 'omimp_01HZY',
-      review_queue: { quarantined: 0, semantics_pending: 3 },
+      semantics_pending: 3,
     })
     renderUpload()
     expect(gateStates()).toEqual(['active', 'todo', 'todo', 'todo'])

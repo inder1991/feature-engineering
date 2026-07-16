@@ -490,7 +490,12 @@ def test_import_runs_the_unchanged_ingest_pipeline(client, conn):
     body = res.json()
     assert body["result"]["status"] == "ingested"
     assert body["result"]["quarantined"] == 1
-    assert body["review_queue"] == {"quarantined": 1, "semantics_pending": 13}
+    # #25 HONESTY: semantics_pending is an informational COUNT of landed columns awaiting owner
+    # confirmation — the import creates NO review records for them, so the response must not
+    # claim a routed queue. (Quarantined rows, reported inside result, DO land in the real
+    # quarantine review queue.)
+    assert body["semantics_pending"] == 13
+    assert "review_queue" not in body
     assert body["import_id"].startswith("omimp_")
 
     # the standard pipeline artifacts exist
@@ -582,7 +587,7 @@ def test_import_held_by_brake_is_recorded_honestly(client, conn):
     assert res.status_code == 200
     body = res.json()
     assert body["result"]["status"] == "held"
-    assert body["review_queue"]["semantics_pending"] == 0        # nothing landed
+    assert body["semantics_pending"] == 0                        # nothing landed
     # the prior catalog is untouched by the held sync
     assert conn.execute("SELECT count(*) FROM graph_node WHERE catalog_source = 'cards' "
                         "AND kind = 'column'").fetchone()[0] == 25

@@ -100,7 +100,7 @@ const IMPORT_OK: api.SyncImportResult = {
     flagged: "first upload of 'cards' (13 objects) — review recommended",
   },
   import_id: 'omimp_01HZYBBBBBBBBBBBBBBBBBBBBB',
-  review_queue: { quarantined: 1, semantics_pending: 13 },
+  semantics_pending: 13,
 }
 
 function renderPanel(over: {
@@ -214,7 +214,8 @@ describe('preview rendering', () => {
     expect(screen.getByText('accounts.opened_on')).toBeInTheDocument()
     expect(screen.getByText(/partition column \(TIME-UNIT\)/)).toBeInTheDocument()
     expect(screen.getByText(/13 columns arrive/)).toBeInTheDocument()
-    expect(screen.getByText(/routed to the review queue for owner confirmation/)).toBeInTheDocument()
+    // Honest copy (#25): pending semantics are an informational count, never a claimed queue.
+    expect(screen.getByText(/nothing is routed to a review queue/)).toBeInTheDocument()
 
     expect(screen.getByText(/approve import of 14 columns into source/i)).toBeInTheDocument()
   })
@@ -366,7 +367,7 @@ describe('approve flow', () => {
     expect(importSync).not.toHaveBeenCalled()
   })
 
-  it('confirm imports the exact previewed snapshot and hands off to the review queue', async () => {
+  it('confirm imports the exact previewed hashes; semantics pending is an honest count', async () => {
     const onReviewQueue = vi.fn()
     importSync.mockResolvedValue(IMPORT_OK)
     await renderWithPreview({ onReviewQueue })
@@ -377,17 +378,19 @@ describe('approve flow', () => {
     expect(status).toHaveTextContent('Ingested.')
     expect(status).toHaveTextContent('3 facts asserted, 0 objects changed, 1 quarantined')
     expect(status).toHaveTextContent(/first upload of 'cards'/)
-    expect(importSync).toHaveBeenCalledExactlyOnceWith(SYNC.sync_id, SNAPSHOT_HASH)
+    expect(importSync).toHaveBeenCalledExactlyOnceWith(
+      SYNC.sync_id, SNAPSHOT_HASH, PREVIEW.local_baseline_hash)
 
     expect(screen.getByText('omimp_01HZYBBBBBBBBBBBBBBBBBBBBB')).toBeInTheDocument()
-    expect(screen.getByText(/14 items now in the review queue for cards/i)).toBeInTheDocument()
-    expect(screen.getByText(/13 semantics confirmations/i)).toBeInTheDocument()
-    await userEvent.click(screen.getByRole('button', { name: 'Open review queue' }))
-    expect(onReviewQueue).toHaveBeenCalledWith('cards')
+    // Honesty (#25): semantics pending is an informational count — no claimed queue, no queue
+    // button of its own. The quarantine handoff (a REAL queue) stays on the result callout.
+    expect(screen.getByText(/13 columns need owner confirmation/i)).toBeInTheDocument()
+    expect(screen.getByText(/not a review queue/i)).toBeInTheDocument()
+    expect(screen.queryByText(/now in the review queue/i)).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Open review queue' })).not.toBeInTheDocument()
 
-    // The standard result callout's quarantine handoff works here too.
     await userEvent.click(screen.getByRole('button', { name: /review 1 quarantined row/i }))
-    expect(onReviewQueue).toHaveBeenLastCalledWith('cards')
+    expect(onReviewQueue).toHaveBeenCalledExactlyOnceWith('cards')
     expect(screen.getByRole('button', { name: 'Imported' })).toBeDisabled()
   })
 
@@ -398,7 +401,7 @@ describe('approve flow', () => {
         asserted: 0, changed_objects: 0, quarantined: 0, flagged: null,
       },
       import_id: 'omimp_01HELD',
-      review_queue: { quarantined: 0, semantics_pending: 0 },
+      semantics_pending: 0,
     })
     await renderWithPreview()
     await userEvent.click(screen.getByRole('button', { name: 'Approve import' }))
