@@ -1,14 +1,19 @@
 """Phase-3B.3a — cross-catalog binding planner contracts + reason-code/status vocabulary.
 
 The BACKBONE reused by 3B.3b/c/3B.4/3C. Supersedes the parent 3B design's CrossCatalog* names.
-Frozen dataclasses; lowercase snake_case StrEnum values. No behaviour — pure contracts + constants."""
+Frozen dataclasses; lowercase snake_case StrEnum values. No behaviour — pure contracts + constants
+(plus the pure canonical `make_binding_plan` constructor added in 3B.3b — the ONE plan-id authority)."""
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 from enum import StrEnum
 
 PLANNER_VERSION = "3b3a.1.0.0"
-REASON_CODE_REGISTRY_VERSION = "1.0.0"
+# The BindingPlanV1 schema/derivation version: hashed into every plan_id so plans minted under a
+# different contract shape can never collide with (or masquerade as) plans from another version.
+PLAN_CONTRACT_VERSION = "3b3b.1.0.0"
+REASON_CODE_REGISTRY_VERSION = "1.1.0"
 # Version pins for inputs that have no formal version source yet (wired to real policy versions in 3C):
 READ_SCOPE_POLICY_VERSION = "1.0.0"
 ROLE_RESOLUTION_VERSION = "unknown"
@@ -21,6 +26,11 @@ MAX_CANDIDATE_COLUMNS_PER_NEED_PER_CATALOG = 8
 MAX_PARTIAL_COMBINATIONS = 256
 MAX_PLANS_PER_RECIPE = 32
 MAX_AUTHORIZED_CATALOGS_CONSIDERED = 16
+# 3B.3b assembly bounds (bounded frontier search — never greedy, never unbounded):
+MAX_BRIDGES_PER_PLAN = 2
+MAX_REALIZATIONS_PER_HOP = 4
+MAX_PHYSICAL_PATHS_PER_BINDING = 16
+MAX_STATES_EXPANDED_PER_BINDING = 512
 
 
 class ReplayStrength(StrEnum):
@@ -61,16 +71,39 @@ class SegmentKind(StrEnum):
 
 class PlanTier(StrEnum):
     tier_1_single_catalog = "tier_1_single_catalog"
+    tier_2_one_bridge = "tier_2_one_bridge"
+    tier_3_multi_bridge = "tier_3_multi_bridge"
 
 
 class PlanResolutionStatus(StrEnum):
     resolved = "resolved"
+    resolved_with_ambiguity = "resolved_with_ambiguity"
     partially_resolved = "partially_resolved"
     unresolved = "unresolved"
     safety_rejected = "safety_rejected"
     not_applicable = "not_applicable"
     bounded_out = "bounded_out"
     internal_error = "internal_error"
+
+
+class PathResolutionStatus(StrEnum):
+    """How far the plan's PATH is resolved — orthogonal to tier (bridge count) and to
+    PlanResolutionStatus (ingredient binding). A 3B.3a tier-1 plan is ingredient_binding_only
+    until the 3B.3b assembler enriches it into an executable source-to-target path."""
+    ingredient_binding_only = "ingredient_binding_only"
+    source_to_target_resolved = "source_to_target_resolved"
+    source_to_target_rejected = "source_to_target_rejected"
+
+
+class CandidateRole(StrEnum):
+    # `unranked` is the neutral state for a plan the cross-catalog classifier (rank_and_classify)
+    # never processed — e.g. tier-1 single-catalog plans, which only pass through the tier-1
+    # ranker (order_plans) and are never assigned selected/alternative/rejected.
+    unranked = "unranked"
+    selected = "selected"
+    equal_rank_alternative = "equal_rank_alternative"
+    lower_rank_alternative = "lower_rank_alternative"
+    rejected = "rejected"
 
 
 class ReasonCode(StrEnum):
@@ -93,10 +126,16 @@ class ReasonCode(StrEnum):
     missing_required_aggregation = "missing_required_aggregation"
     missing_temporal_declaration = "missing_temporal_declaration"
     freshness_requirement_unsatisfied = "freshness_requirement_unsatisfied"
-    # reserved 3B.3b
+    # live as of 3B.3b (reserved in 3B.3a)
     ambiguous_equal_cross_catalog_paths = "ambiguous_equal_cross_catalog_paths"
     unsanctioned_bridge = "unsanctioned_bridge"
     missing_realization = "missing_realization"
+    # 3B.3b assembly
+    unsupported_multi_grain_ingredients = "unsupported_multi_grain_ingredients"
+    ambiguous_semantic_path = "ambiguous_semantic_path"
+    bounded_out_max_bridges = "bounded_out_max_bridges"
+    bounded_out_max_realizations_per_hop = "bounded_out_max_realizations_per_hop"
+    bounded_out_max_frontier_states = "bounded_out_max_frontier_states"
 
 
 class GroundTemplateDiffOutcome(StrEnum):
@@ -195,6 +234,11 @@ class BindingPlanV1:
     safety: BindingSafety
     preference_rank: int
     preference_reasons: tuple[str, ...]
+    # 3B.3b — derived by make_binding_plan (the canonical constructor), deliberately no defaults:
+    participating_catalogs: tuple[str, ...]
+    bridge_count: int
+    path_resolution_status: PathResolutionStatus
+    candidate_role: CandidateRole
 
 
 @dataclass(frozen=True, slots=True)
@@ -206,6 +250,13 @@ class BoundingMetricsV1:
     total_candidate_columns_considered: int
     total_combinations_explored: int
     total_plans_preserved: int
+    # 3B.3b assembly bounds observability:
+    realizations_truncated: bool
+    bridge_transitions_truncated: bool
+    frontier_states_truncated: bool
+    deeper_tiers_not_explored: bool
+    total_states_expanded: int
+    total_bridge_transitions_explored: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -229,6 +280,9 @@ class PlannerReplayEnvelopeV1:
     catalog_scope: CatalogScopeV1
     replay_strength: ReplayStrength
     planner_input_hash: str
+    # 3B.3b — the exact governed crossings visible to this run + the plan schema they were minted under:
+    active_bridge_fact_keys: tuple[str, ...]
+    plan_contract_version: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -245,3 +299,62 @@ class BindingPlanningResultV1:
     bounding: BoundingMetricsV1
     ground_template_diff: GroundTemplateDiffV1
     replay_envelope: PlannerReplayEnvelopeV1
+
+
+def tier_from_bridge_count(n: int) -> PlanTier:
+    if n == 0:
+        return PlanTier.tier_1_single_catalog
+    if n == 1:
+        return PlanTier.tier_2_one_bridge
+    return PlanTier.tier_3_multi_bridge
+
+
+def make_binding_plan(*, recipe_id: str, target_entity: str | None, catalog_source: str,
+                      ingredient_bindings: tuple[IngredientBindingV1, ...],
+                      path_segments: tuple[BindingPathSegmentV1, ...],
+                      resolution_status: PlanResolutionStatus,
+                      path_resolution_status: PathResolutionStatus,
+                      primary_reason_code: ReasonCode | None,
+                      reason_codes: tuple[ReasonCode, ...],
+                      safety: BindingSafety,
+                      preference_rank: int,
+                      preference_reasons: tuple[str, ...],
+                      candidate_role: CandidateRole) -> BindingPlanV1:
+    """The ONE canonical constructor: derives participating_catalogs (ordered by first traversal, dedup,
+    catalog_source first), bridge_count, tier, and a plan_id over the canonical content + PLAN_CONTRACT_VERSION;
+    validates the structural invariants. participating_catalogs cannot be a static default (it depends on
+    catalog_source + segments), which is why this constructor exists."""
+    participating: list[str] = [catalog_source]
+    for seg in path_segments:
+        if seg.catalog_source not in participating:
+            participating.append(seg.catalog_source)
+    bridge_count = sum(1 for s in path_segments if s.segment_kind is SegmentKind.governed_bridge)
+    tier = tier_from_bridge_count(bridge_count)
+    # structural validation — participating_catalogs/bridge_count are DERIVED here (single source of truth,
+    # so they can't drift), leaving one meaningful fail-closed invariant: the bridge budget. A plan that
+    # exceeds MAX_BRIDGES_PER_PLAN must NEVER be constructed (the assembler bounds this, but the canonical
+    # constructor enforces it so no caller can mint an over-budget plan).
+    if bridge_count > MAX_BRIDGES_PER_PLAN:
+        raise ValueError(f"bridge_count {bridge_count} exceeds MAX_BRIDGES_PER_PLAN {MAX_BRIDGES_PER_PLAN}")
+    if path_resolution_status is PathResolutionStatus.source_to_target_resolved \
+            and resolution_status is PlanResolutionStatus.unresolved:
+        raise ValueError("source_to_target_resolved plan cannot have resolution_status=unresolved")
+    refs = tuple(sorted(b.bound_object_ref for b in ingredient_bindings))
+    segments_material = ">".join(
+        f"{s.segment_kind}:{s.catalog_source}:{s.realization_ref or s.bridge_fact_key or ''}"
+        for s in path_segments)
+    # path_resolution_status is part of the hashed material: a tier-1 resolved plan and an
+    # immediate-dead-end reject over the same refs/segments must NOT share a plan_id (3B.4 keys
+    # its store by plan_id). It is stable at construction time — the ranker only rewrites
+    # resolution_status/candidate_role — so it is safe to hash (candidate_role is NOT: it is
+    # reset post-construction via dataclasses.replace).
+    material = (f"{recipe_id}|{catalog_source}|{'|'.join(refs)}|{tier}|{segments_material}"
+                f"|{path_resolution_status}|{PLANNER_VERSION}|{PLAN_CONTRACT_VERSION}")
+    plan_id = "bp_" + hashlib.sha256(material.encode()).hexdigest()[:16]
+    return BindingPlanV1(
+        plan_id=plan_id, recipe_id=recipe_id, target_entity=target_entity, tier=tier,
+        catalog_source=catalog_source, ingredient_bindings=ingredient_bindings, path_segments=path_segments,
+        resolution_status=resolution_status, primary_reason_code=primary_reason_code, reason_codes=reason_codes,
+        safety=safety, preference_rank=preference_rank, preference_reasons=preference_reasons,
+        participating_catalogs=tuple(participating), bridge_count=bridge_count,
+        path_resolution_status=path_resolution_status, candidate_role=candidate_role)

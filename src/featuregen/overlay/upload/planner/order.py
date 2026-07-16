@@ -10,7 +10,10 @@ from featuregen.overlay.upload.planner.contracts import (
     PlanResolutionStatus,
 )
 
-_STATUS_RANK = {PlanResolutionStatus.resolved: 0, PlanResolutionStatus.partially_resolved: 1}
+# resolved_with_ambiguity IS a successful resolution (3B.3b): it ranks with resolved, ahead of
+# partially_resolved — without it an ambiguous plan would sink to the .get(..., 9) default.
+_STATUS_RANK = {PlanResolutionStatus.resolved: 0, PlanResolutionStatus.resolved_with_ambiguity: 0,
+                PlanResolutionStatus.partially_resolved: 1}
 _QUALITY_RANK = {BindingQuality.grain_and_role_fit: 0, BindingQuality.exact_concept: 1,
                  BindingQuality.entity_tagged: 2, BindingQuality.weak: 3}
 
