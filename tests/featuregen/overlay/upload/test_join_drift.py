@@ -39,6 +39,7 @@ from featuregen.overlay.upload.join_drift import (
     detect_governed_join_divergences,
     list_governed_join_divergences,
 )
+from featuregen.overlay.upload.upload_catalog import table_ref
 
 _NOW = datetime(2026, 7, 11, tzinfo=UTC)
 _SRC = "deposits"
@@ -301,3 +302,69 @@ def test_flag_off_never_calls_detection_and_writes_no_rows(db, monkeypatch):
     assert res.status == "ingested"
     assert calls == []                                               # detection never invoked
     assert _divergence_rows(db) == []
+
+
+# ── Safety coverage: fail-soft detection + projection-lag no-op ──────────────────────────────────
+
+
+def test_detection_db_fault_never_aborts_upload_or_rolls_back_pass_a(db, monkeypatch):
+    """Fail-soft (the drift block's own savepoint + except in ingest_upload): a GENUINE DB-class
+    fault inside `detect_governed_join_divergences` — a failed statement that aborts the
+    transaction it runs in at the PG level — must degrade to a warning. The upload still ingests,
+    the Pass A facts + graph are NOT rolled back, and the request tx is left healthy for the
+    statements that follow (persist_quarantine). Mirrors test_governed_joins_failsoft, which
+    proves the same for the propose seam."""
+    import featuregen.overlay.upload.ingest as ingest_mod
+
+    monkeypatch.setenv("OVERLAY_GOVERNED_JOINS", "1")
+    _seal_config()
+    calls: list[str] = []
+
+    def _db_fault(conn, source, rows, **kw):
+        calls.append(source)
+        conn.execute("SELECT 1/0")   # DB-class fault: aborts the transaction it runs in
+
+    monkeypatch.setattr(ingest_mod, "detect_governed_join_divergences", _db_fault)
+    res = ingest_upload(db, _SRC, _join_rows(), actor=_actor())
+    assert res.status == "ingested"                    # degraded to a warning, never an error
+    assert calls == [_SRC]                             # the detection seam WAS reached + blew up
+    # Pass A facts + graph intact — nothing the advisory failure could roll back did roll back.
+    grain = load_fact(db, fact_key(table_ref(_SRC, "accounts"), "grain"))
+    assert fold_overlay_state(grain).status == "VERIFIED"
+    nodes = db.execute(
+        "SELECT count(*) FROM graph_node WHERE catalog_source = %s", (_SRC,)).fetchone()[0]
+    assert nodes > 0
+    assert db.execute("SELECT 1").fetchone()[0] == 1   # request tx healthy, not aborted
+
+
+def test_projection_lag_skip_writes_no_false_dropped_divergence(
+        db, monkeypatch, human_admin_1, human_admin_2):
+    """Projection-lag no-op: when the lag guard SKIPS the end-of-ingest `project_confirmed_joins`,
+    build_graph's wipe leaves graph_edge with ZERO VERIFIED operational joins — detection still
+    runs, sees no verified joins, and must write NO false 'dropped' for the (still-VERIFIED) join
+    the lagged re-upload didn't re-declare. It re-detects on the next caught-up ingest — the
+    contract stated in ingest_upload's drift block."""
+    import featuregen.overlay.upload.ingest as ingest_mod
+
+    _ref, key = _verified_join_via_real_flow(db, monkeypatch, human_admin_1, human_admin_2)
+    real_detect = ingest_mod.detect_governed_join_divergences
+    detections: list[list[dict]] = []
+
+    def _spy(conn, source, rows, **kw):
+        out = real_detect(conn, source, rows, **kw)
+        detections.append(out)
+        return out
+
+    monkeypatch.setattr(ingest_mod, "detect_governed_join_divergences", _spy)
+    monkeypatch.setattr(ingest_mod, "projection_lag", lambda conn, name: 1)   # pretend halted
+    res = ingest_upload(db, _SRC, _join_rows(joins_to=""), actor=_actor())    # drops the join
+    assert res.status == "ingested"
+    assert detections == [[]]                          # detection RAN and detected NOTHING
+    # The lag guard really fired: the wiped edges were NOT re-projected, so mid-lag the source
+    # carries zero VERIFIED joins — there is nothing for the detector to false-drop against.
+    edges = db.execute(
+        "SELECT count(*) FROM graph_edge WHERE catalog_source = %s AND kind = 'joins'"
+        " AND approved_join_status = 'VERIFIED'", (_SRC,)).fetchone()[0]
+    assert edges == 0
+    assert _divergence_rows(db) == []                  # NO false 'dropped' row was written
+    assert fold_overlay_state(load_fact(db, key)).status == "VERIFIED"   # the fact is untouched
