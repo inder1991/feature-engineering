@@ -191,7 +191,11 @@ def realize_in_place(conn, pos: _Position, hop: EntityRelationshipRefV1,
                 BindingPathSegmentV1(
                     segment_kind=SegmentKind.semantic_rollup, catalog_source=pos.catalog,
                     from_entity=hop.from_entity, to_entity=hop.to_entity,
-                    cardinality=hop.cardinality),
+                    cardinality=hop.cardinality,
+                    # 3B.3c C7 (F16): the hop's identity rides on the announcement — audit
+                    # evidence only; NEVER physical-plan-id material (that hashes only the ref)
+                    relationship_id=hop.relationship_id,
+                    relationship_version=hop.relationship_version),
                 BindingPathSegmentV1(
                     segment_kind=SegmentKind.intra_catalog_realization, catalog_source=pos.catalog,
                     realization_ref=r.realization_id),
@@ -233,7 +237,10 @@ def rollup_bridges(conn, pos: _Position, hop: EntityRelationshipRefV1,
                         BindingPathSegmentV1(
                             segment_kind=SegmentKind.semantic_rollup, catalog_source=pos.catalog,
                             from_entity=hop.from_entity, to_entity=hop.to_entity,
-                            cardinality=hop.cardinality),
+                            cardinality=hop.cardinality,
+                            # 3B.3c C7 (F16): audit evidence only — never plan-id material
+                            relationship_id=hop.relationship_id,
+                            relationship_version=hop.relationship_version),
                         BindingPathSegmentV1(
                             segment_kind=SegmentKind.governed_bridge, catalog_source=cat2,
                             from_entity=hop.from_entity, to_entity=hop.to_entity,

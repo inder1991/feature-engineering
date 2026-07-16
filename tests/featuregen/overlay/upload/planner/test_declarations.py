@@ -26,16 +26,21 @@ from featuregen.overlay.upload.planner.declarations import (
     CompileBudget,
     CompilerContext,
     PathPositionV1,
+    audit_envelope,
+    bridge_fingerprint,
     build_physical_read_set,
     check_composition,
     check_connectivity,
     compile_aggregation,
     compile_temporal,
     hop_physical_cardinality,
+    recipe_content_hash,
     resolve_additivity,
+    revalidate_freshness,
     safety_of_ref,
     stage_safety,
 )
+from featuregen.overlay.upload.planner.plan import _envelope
 from featuregen.overlay.upload.taxonomy.entity_relationships import Cardinality
 from featuregen.overlay.upload.templates import Need, Template, _load_columns
 
@@ -85,7 +90,7 @@ def _ctx(db, *catalogs: str, roles: tuple[str, ...] = (),
         columns_by_catalog={
             s: {col.object_ref: col for col in _load_columns(db, s, roles)} for s in catalogs},
         catalog_fingerprint_at_start={s: realization_fingerprint(db, s) for s in catalogs},
-        bridge_fingerprint_at_start="",
+        bridge_fingerprint_at_start=bridge_fingerprint(db),
         catalog_stamps={
             s: c.CatalogStateStampV1(s, 0, _NOW.isoformat()) for s in catalogs},
         config=_overlay_config(),
@@ -1203,3 +1208,204 @@ def test_stage_safety_fold_matrix():
     # all safe → safe; the empty read set is vacuously safe
     assert stage_safety(c.PhysicalReadSetV1((safe,))) == (c.BindingSafety.safe, ())
     assert stage_safety(c.PhysicalReadSetV1(())) == (c.BindingSafety.safe, ())
+
+
+# ─── C7: freshness (the ONE impure boundary) + fingerprint consistency + audit envelope ───────
+# revalidate_freshness/bridge_fingerprint are the ONLY compiler functions that take a connection
+# (F8). The fingerprint recheck (F9/F11) exists because head_seq is INSUFFICIENT: a graph rebuild
+# never moves the drift watermark, so only comparing realization/bridge fingerprints taken at
+# scope-start against compile-end state can catch a mutation mid-compile. audit_envelope is pure.
+
+def _watermark(db, source, at, head_seq=0):
+    db.execute(
+        "INSERT INTO overlay_drift_watermark (catalog_source, last_completed_at, last_run_id,"
+        " head_seq) VALUES (%s,%s,'drift_c7',%s) ON CONFLICT (catalog_source) DO UPDATE SET"
+        " last_completed_at = EXCLUDED.last_completed_at, head_seq = EXCLUDED.head_seq",
+        (source, at, head_seq))
+
+
+def _checkpoint(db, seq):
+    db.execute(
+        "INSERT INTO projection_checkpoints (projection_name, checkpoint_seq) VALUES"
+        " ('overlay', %s) ON CONFLICT (projection_name) DO UPDATE SET"
+        " checkpoint_seq = EXCLUDED.checkpoint_seq", (seq,))
+
+
+def _c7_plan(ctx):
+    (r,) = ctx.realizations_by_catalog["core"]
+    return _plan(
+        bindings=(
+            _binding("source_key", "public.transactions.account_id",
+                     join_role=str(JoinRole.SOURCE_ENTITY_KEY)),
+            _binding("amount", "public.transactions.amount"),
+        ),
+        segments=_rollup_segments(r.realization_id))
+
+
+def test_freshness_stale_watermark_is_participating_catalog_stale(db):
+    # now - wm (2h) > drift_freshness_sla (60min) → stale; the stamps themselves stayed
+    # consistent (no fingerprint moved), so ONLY the freshness axis fails.
+    _txn_core(db)
+    _watermark(db, "core", _NOW - timedelta(hours=2))
+    _checkpoint(db, 0)
+    ctx = _ctx(db, "core")
+    out = revalidate_freshness(db, ctx, _c7_plan(ctx))
+    assert out.status is c.ContractResolutionStatus.unresolved_freshness
+    assert out.reason_codes == (c.ReasonCode.participating_catalog_stale,)
+    assert out.stamp_consistency is c.StampConsistency.consistent
+
+
+def test_freshness_missing_watermark_is_stamp_unavailable(db):
+    _txn_core(db)   # deliberately NO overlay_drift_watermark row for core
+    ctx = _ctx(db, "core")
+    out = revalidate_freshness(db, ctx, _c7_plan(ctx))
+    assert out.status is c.ContractResolutionStatus.unresolved_freshness
+    assert out.reason_codes == (c.ReasonCode.freshness_stamp_unavailable,)
+    # the catalog is still stamped — honestly empty, never a fabricated watermark
+    (stamp,) = out.stamps
+    assert (stamp.catalog_source, stamp.head_seq, stamp.last_completed_at) == ("core", 0, "")
+
+
+def test_freshness_projection_behind_drift_head_is_lagging(db):
+    # the drift scan advanced to head_seq=10 but the overlay projection checkpoint sits at 4:
+    # a just-staled fact may not be applied to the read model yet — fail closed.
+    _txn_core(db)
+    _watermark(db, "core", _NOW - timedelta(minutes=5), head_seq=10)
+    _checkpoint(db, 4)
+    ctx = _ctx(db, "core")
+    out = revalidate_freshness(db, ctx, _c7_plan(ctx))
+    assert out.status is c.ContractResolutionStatus.unresolved_freshness
+    assert out.reason_codes == (c.ReasonCode.projection_lagging,)
+    assert out.stamp_consistency is c.StampConsistency.consistent
+    assert out.stamps[0].head_seq == 10
+
+
+def test_graph_rebuild_without_head_seq_move_is_mutation_unverifiable(db):
+    # F9/F11 — the head_seq-insufficiency proof: watermark FRESH, checkpoint == head_seq (drift
+    # sees nothing), yet the catalog graph was REBUILT between ctx-snapshot and compile-end.
+    # Only the realization-fingerprint recheck can catch this mutation.
+    _txn_core(db)
+    _watermark(db, "core", _NOW - timedelta(minutes=5), head_seq=7)
+    _checkpoint(db, 7)
+    ctx = _ctx(db, "core")
+    plan = _c7_plan(ctx)
+    _seed(db, "core", [     # the rebuild: card_swipes dropped, a new column appeared
+        (CanonicalRow("core", "transactions", "transaction_id", "integer", is_grain=True),
+         "transaction_id"),
+        (CanonicalRow("core", "transactions", "account_id", "integer",
+                      joins_to="accounts.account_id", cardinality="N:1"), "account_id"),
+        (CanonicalRow("core", "transactions", "amount", "numeric"), "monetary_flow"),
+        (CanonicalRow("core", "transactions", "channel", "text"), "categorical"),
+        (CanonicalRow("core", "accounts", "account_id", "integer", is_grain=True), "account_id"),
+        (CanonicalRow("core", "accounts", "balance", "numeric"), "monetary_stock"),
+    ])
+    assert realization_fingerprint(db, "core") != ctx.catalog_fingerprint_at_start["core"]
+    out = revalidate_freshness(db, ctx, plan)
+    assert out.status is c.ContractResolutionStatus.unresolved_freshness
+    assert out.reason_codes == (c.ReasonCode.catalog_mutated_during_compile,)
+    assert out.stamp_consistency is c.StampConsistency.unverifiable
+    assert out.stamps[0].head_seq == 7      # unchanged — head_seq alone saw NOTHING
+
+
+def test_bridge_fact_set_change_is_mutation_unverifiable(db):
+    # the ACTIVE governed-crossing set changed mid-compile (a new VERIFIED bridge projected):
+    # the bridge fingerprint recheck fails even though every catalog fingerprint held.
+    _txn_core(db)
+    _watermark(db, "core", _NOW - timedelta(minutes=5), head_seq=2)
+    _checkpoint(db, 2)
+    ctx = _ctx(db, "core")
+    db.execute(
+        "INSERT INTO entity_bridge_edge (fact_key, entity_id, left_catalog_source,"
+        " left_object_ref, right_catalog_source, right_object_ref, status)"
+        " VALUES (%s,%s,%s,%s,%s,%s,'VERIFIED')",
+        ("bridge:account:c7", "account", "core", "public.transactions.account_id",
+         "crm", "public.accounts.account_id"))
+    assert bridge_fingerprint(db) != ctx.bridge_fingerprint_at_start
+    out = revalidate_freshness(db, ctx, _c7_plan(ctx))
+    assert out.status is c.ContractResolutionStatus.unresolved_freshness
+    assert out.reason_codes == (c.ReasonCode.catalog_mutated_during_compile,)
+    assert out.stamp_consistency is c.StampConsistency.unverifiable
+
+
+def test_fresh_consistent_catalog_resolves_with_stamps(db):
+    _txn_core(db)
+    wm_at = _NOW - timedelta(minutes=5)
+    _watermark(db, "core", wm_at, head_seq=3)
+    _checkpoint(db, 3)
+    ctx = _ctx(db, "core")
+    out = revalidate_freshness(db, ctx, _c7_plan(ctx))
+    assert out.status is c.ContractResolutionStatus.resolved
+    assert out.reason_codes == ()
+    assert out.stamp_consistency is c.StampConsistency.consistent
+    (stamp,) = out.stamps
+    assert stamp.catalog_source == "core" and stamp.head_seq == 3
+    assert stamp.stamp_kind is c.CatalogStateStampKind.drift_watermark
+    # tz-safe equality (the driver may render the offset differently than it was written)
+    assert datetime.fromisoformat(stamp.last_completed_at) == wm_at
+
+
+def _c7_scope():
+    return c.CatalogScopeV1(
+        scope_id="s_c7", authorized_catalog_sources=("core",), catalog_state_stamps=(),
+        omitted_catalog_sources=(), read_scope_policy_version="1.0.0",
+        role_resolution_version="unknown", resolved_at=_NOW.isoformat(),
+        catalog_consideration_truncated=False)
+
+
+def _c7_template(needs, params):
+    return _template("c7_recipe", needs=needs, params=params)
+
+
+def test_audit_envelope_pins_version_set_claims_stamps_and_strength(db):
+    _txn_core(db)
+    _watermark(db, "core", _NOW - timedelta(minutes=5), head_seq=3)
+    _checkpoint(db, 3)
+    ctx = _ctx(db, "core", roles=("z_admin", "a_viewer", "z_admin"))
+    plan = _c7_plan(ctx)
+    fresh = revalidate_freshness(db, ctx, plan)
+    base = _envelope(db, _c7_scope(), "r1", "account")
+    t = _c7_template(
+        needs=(Need("stock_col", "monetary_stock"), Need("asof", "as_of_date"),
+               Need("entity", "customer_id")),
+        params={"window": (90, 60), "measure": ("normalized", "slope")})
+    env = audit_envelope(ctx, plan, t, base, fresh.stamps, fresh.stamp_consistency)
+    # watermarks correlate drift; they never permit deterministic re-execution
+    assert env.replay_strength is c.ReplayStrength.audit_only
+    assert env.authz_role_claims == ("a_viewer", "z_admin")     # sorted + deduped
+    assert env.catalog_state_stamps == fresh.stamps
+    assert env.stamp_consistency is c.StampConsistency.consistent
+    # the full §9 rule-version set is pinned
+    assert (env.aggregation_rule_version, env.additivity_rule_version,
+            env.temporal_rule_version, env.safety_evaluator_version,
+            env.drift_freshness_sla_version, env.planner_bounds_version,
+            env.ranking_version) == (
+        c.AGGREGATION_RULE_VERSION, c.ADDITIVITY_RULE_VERSION, c.TEMPORAL_RULE_VERSION,
+        c.SAFETY_EVALUATOR_VERSION, c.DRIFT_FRESHNESS_SLA_VERSION, c.PLANNER_BOUNDS_VERSION,
+        c.RANKING_VERSION)
+    # the base envelope's identity fields ride through untouched
+    assert env.planner_input_hash == base.planner_input_hash
+    assert env.plan_contract_version == base.plan_contract_version
+    assert env.catalog_scope is base.catalog_scope
+
+
+def test_recipe_content_hash_is_canonical_and_stable(db):
+    _txn_core(db)
+    _watermark(db, "core", _NOW - timedelta(minutes=5), head_seq=1)
+    _checkpoint(db, 1)
+    ctx = _ctx(db, "core")
+    plan = _c7_plan(ctx)
+    fresh = revalidate_freshness(db, ctx, plan)
+    base = _envelope(db, _c7_scope(), "r1", "account")
+    needs = (Need("stock_col", "monetary_stock"), Need("asof", "as_of_date"))
+    t = _c7_template(needs=needs, params={"window": (90, 60), "measure": ("a", "b")})
+    env1 = audit_envelope(ctx, plan, t, base, fresh.stamps, fresh.stamp_consistency)
+    env2 = audit_envelope(ctx, plan, t, base, fresh.stamps, fresh.stamp_consistency)
+    assert env1.recipe_content_hash and env1.recipe_content_hash == env2.recipe_content_hash
+    assert env1.recipe_content_hash == recipe_content_hash(t)
+    # canonical: params-dict insertion order and needs-tuple order are NOT identity
+    t_reordered = _c7_template(
+        needs=tuple(reversed(needs)), params={"measure": ("a", "b"), "window": (90, 60)})
+    assert recipe_content_hash(t_reordered) == env1.recipe_content_hash
+    # ...but genuinely different identity fields ARE
+    t_other = _c7_template(needs=needs, params={"window": (30,), "measure": ("a", "b")})
+    assert recipe_content_hash(t_other) != env1.recipe_content_hash

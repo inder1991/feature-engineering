@@ -1,26 +1,38 @@
-"""Phase-3B.3c C2/C3 — the contract compiler's data spine + the declaration checks
-(connectivity; the temporal declaration, which runs FIRST in the compile pipeline).
+"""Phase-3B.3c C2–C7 — the contract compiler's data spine + the declaration checks
+(connectivity; the temporal declaration, which runs FIRST in the compile pipeline; aggregation;
+composition; the physical-read set; freshness).
 
 One IMMUTABLE, conn-free ``CompilerContext`` is batch-loaded per shadow run (the production
 builder ``build_compiler_context`` arrives in C8); every declaration check is a pure function
-over that context and a plan — no check in this module takes a connection. ``CompileBudget`` is
+over that context and a plan. The ONE impure boundary (F8) is freshness:
+``revalidate_freshness`` (and its ``bridge_fingerprint`` helper) takes an explicit connection,
+because freshness is an OBSERVATION of current state, never a declaration. ``CompileBudget`` is
 the ONE deliberately mutable exception: the per-run compile allowance owned by
 ``run_shadow_planner`` (C8). Behaviour-neutral until C8 threads ``compile_contracts`` through
 the shadow planner — nothing imports this module yet."""
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from types import MappingProxyType
 
+from featuregen.overlay.catalog_changes import drift_head_seq, drift_watermark
 from featuregen.overlay.config import OverlayConfig
 from featuregen.overlay.upload.binding_roles import JoinRole, TemporalRole
-from featuregen.overlay.upload.bridge_projection import ActiveBridgeV1
-from featuregen.overlay.upload.catalog_realizations import table_of
+from featuregen.overlay.upload.bridge_projection import ActiveBridgeV1, active_bridges
+from featuregen.overlay.upload.catalog_realizations import realization_fingerprint, table_of
 from featuregen.overlay.upload.concepts import concept
 from featuregen.overlay.upload.need_metadata import ResolvedNeedMetadataV1, derive_need_metadata
 from featuregen.overlay.upload.planner.contracts import (
+    ADDITIVITY_RULE_VERSION,
+    AGGREGATION_RULE_VERSION,
+    DRIFT_FRESHNESS_SLA_VERSION,
+    PLANNER_BOUNDS_VERSION,
+    RANKING_VERSION,
+    SAFETY_EVALUATOR_VERSION,
+    TEMPORAL_RULE_VERSION,
     AdditivityClass,
     AdditivityProvenanceV1,
     AdditivitySource,
@@ -30,16 +42,21 @@ from featuregen.overlay.upload.planner.contracts import (
     BindingPathSegmentV1,
     BindingPlanV1,
     BindingSafety,
+    CatalogStateStampKind,
     CatalogStateStampV1,
     ColumnRole,
+    ContractResolutionStatus,
     HopAggregationV1,
     IngredientAggregationV1,
     IngredientBindingV1,
     ParamBindingV1,
     PhysicalColumnReadV1,
     PhysicalReadSetV1,
+    PlannerReplayEnvelopeV1,
     ReasonCode,
+    ReplayStrength,
     SegmentKind,
+    StampConsistency,
     TemporalDeclarationV1,
     WindowSpecV1,
     canonical_reason_codes,
@@ -51,6 +68,7 @@ from featuregen.overlay.upload.taxonomy.entity_relationships import (
     CatalogEntityRelationshipV1,
 )
 from featuregen.overlay.upload.templates import Template, _Col
+from featuregen.projections.runner import _checkpoint_seq
 
 # The injectable declared-function registry: ``(recipe_id, need_role) ->`` the recipe's DECLARED
 # aggregation function. EMPTY in production until a governed declaration source exists (validate,
@@ -693,3 +711,118 @@ def stage_safety(read_set: PhysicalReadSetV1) -> tuple[BindingSafety, tuple[Reas
     if any(col.safety is BindingSafety.not_evaluated for col in read_set.columns):
         return BindingSafety.not_evaluated, (ReasonCode.safety_evaluation_incomplete,)
     return BindingSafety.safe, ()
+
+
+# ─── C7: freshness (the ONE impure boundary) + fingerprint consistency + audit envelope ───────
+#
+# Freshness is an OBSERVATION of current state, never a declaration (F7: it is excluded from
+# contract_id), so revalidate_freshness — and its bridge_fingerprint helper — are the ONLY
+# functions in the whole compiler that take a connection (F8). The fingerprint recheck (F9/F11)
+# exists because head_seq is INSUFFICIENT: a graph rebuild (re-upload, column add/drop) rewrites
+# graph_node/graph_edge WITHOUT moving the drift watermark, so only comparing the
+# realization/bridge fingerprints taken at scope-start against compile-end state catches a
+# mutation mid-compile. audit_envelope stays pure — evidence in, envelope out.
+
+
+@dataclass(frozen=True, slots=True)
+class FreshnessResult:
+    """``revalidate_freshness``'s verdict: the freshness-axis status (``resolved`` or
+    ``unresolved_freshness`` — NEVER a declaration status), the canonical observation reason
+    codes, one ``CatalogStateStampV1`` per participating catalog (honestly empty when no
+    watermark exists — never fabricated), and whether the scope-start fingerprints HELD to
+    compile-end. Observation-time evidence only: none of this enters contract_id (F7)."""
+
+    status: ContractResolutionStatus
+    reason_codes: tuple[ReasonCode, ...]
+    stamps: tuple[CatalogStateStampV1, ...]
+    stamp_consistency: StampConsistency
+
+
+def bridge_fingerprint(conn) -> str:
+    """A deterministic hash of the CURRENT active-bridge fact-set (the VERIFIED projected
+    crossings). Taken once at scope-start by C8's context builder (``bridge_fingerprint_at_start``)
+    and recomputed at compile-end by :func:`revalidate_freshness` — a bridge verified, rejected,
+    or expired mid-compile changes the set and fails the consistency recheck. Impure (reads the
+    projection); order-insensitive (sorted fact keys)."""
+    material = "|".join(sorted(b.fact_key for b in active_bridges(conn)))
+    return hashlib.sha256(material.encode()).hexdigest()
+
+
+def revalidate_freshness(conn, ctx: CompilerContext, plan: BindingPlanV1) -> FreshnessResult:
+    """The compile-END freshness + consistency observation over ``plan.participating_catalogs``
+    — the ONE impure check (F8). Per catalog: no drift watermark → ``freshness_stamp_unavailable``;
+    ``ctx.now - watermark > drift_freshness_sla`` → ``participating_catalog_stale``; the overlay
+    projection checkpoint behind the drift head_seq → ``projection_lagging`` (a just-staled fact
+    may not be applied to the read model yet). Consistency (F9/F11): a catalog whose
+    ``realization_fingerprint`` — or the active-bridge fact-set — changed since the ctx snapshot
+    → ``catalog_mutated_during_compile`` + ``stamp_consistency=unverifiable``; head_seq alone
+    CANNOT catch this (a graph rebuild never moves the drift watermark). Every catalog is
+    stamped with what was actually observed. Reason codes canonical; deterministic given state."""
+    codes: list[ReasonCode] = []
+    stamps: list[CatalogStateStampV1] = []
+    consistency = StampConsistency.consistent
+    checkpoint = _checkpoint_seq(conn, "overlay")
+    for src in plan.participating_catalogs:
+        wm = drift_watermark(conn, src)
+        head = drift_head_seq(conn, src)
+        if wm is None:
+            codes.append(ReasonCode.freshness_stamp_unavailable)
+        elif (ctx.now - wm) > ctx.config.drift_freshness_sla:
+            codes.append(ReasonCode.participating_catalog_stale)
+        if head is not None and checkpoint < head:
+            codes.append(ReasonCode.projection_lagging)
+        if realization_fingerprint(conn, src) != ctx.catalog_fingerprint_at_start.get(src):
+            codes.append(ReasonCode.catalog_mutated_during_compile)
+            consistency = StampConsistency.unverifiable
+        stamps.append(CatalogStateStampV1(
+            catalog_source=src, head_seq=head or 0,
+            last_completed_at=wm.isoformat() if wm is not None else "",
+            stamp_kind=CatalogStateStampKind.drift_watermark))
+    if bridge_fingerprint(conn) != ctx.bridge_fingerprint_at_start:
+        codes.append(ReasonCode.catalog_mutated_during_compile)
+        consistency = StampConsistency.unverifiable
+    reason_codes = canonical_reason_codes(codes)
+    status = (ContractResolutionStatus.unresolved_freshness if reason_codes
+              else ContractResolutionStatus.resolved)
+    return FreshnessResult(status=status, reason_codes=reason_codes, stamps=tuple(stamps),
+                           stamp_consistency=consistency)
+
+
+def recipe_content_hash(template: Template) -> str:
+    """The STABLE canonical hash of the template's identity — id, family, intent, the sorted
+    ``(role, concept)`` need pairs, and the sorted params with their full allowed-value tuples.
+    Deterministic across runs and construction order (needs-tuple order and params-dict insertion
+    order are canonicalized away); pure. Pinned on the audit envelope so a replay can prove WHICH
+    recipe content the contract was compiled against (§9)."""
+    needs = ";".join(f"{n.role}:{n.concept}"
+                     for n in sorted(template.needs, key=lambda n: (n.role, n.concept)))
+    params = ";".join(f"{name}={','.join(str(v) for v in values)}"
+                      for name, values in sorted(template.params.items()))
+    material = f"{template.id}|{template.family}|{template.intent}|{needs}|{params}"
+    return "rh_" + hashlib.sha256(material.encode()).hexdigest()[:16]
+
+
+def audit_envelope(ctx: CompilerContext, plan: BindingPlanV1, template: Template,
+                   base_envelope: PlannerReplayEnvelopeV1,
+                   stamps: tuple[CatalogStateStampV1, ...],
+                   stamp_consistency: StampConsistency) -> PlannerReplayEnvelopeV1:
+    """The §9 audit envelope: the planner-time base extended with the full compiler rule-version
+    set, the canonical recipe content hash, the caller's sorted+deduped role claims, the
+    compile-end catalog state stamps, and their consistency verdict. Pure — evidence in, envelope
+    out. ``replay_strength`` is pinned ``audit_only``: drift watermarks CORRELATE state for audit;
+    they never permit deterministic re-execution (no row-level snapshot exists)."""
+    del plan    # uniform compile-step signature; the plan carries its own evidence fields
+    return replace(
+        base_envelope,
+        aggregation_rule_version=AGGREGATION_RULE_VERSION,
+        additivity_rule_version=ADDITIVITY_RULE_VERSION,
+        temporal_rule_version=TEMPORAL_RULE_VERSION,
+        safety_evaluator_version=SAFETY_EVALUATOR_VERSION,
+        drift_freshness_sla_version=DRIFT_FRESHNESS_SLA_VERSION,
+        planner_bounds_version=PLANNER_BOUNDS_VERSION,
+        ranking_version=RANKING_VERSION,
+        recipe_content_hash=recipe_content_hash(template),
+        authz_role_claims=tuple(sorted(set(ctx.roles))),
+        catalog_state_stamps=stamps,
+        stamp_consistency=stamp_consistency,
+        replay_strength=ReplayStrength.audit_only)
