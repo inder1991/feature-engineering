@@ -23,6 +23,7 @@ from featuregen.api.routes import (
     governance,
     governance_dashboard,
     graph,
+    ingestion_runs,
     integrations,
     lineage,
     quarantine,
@@ -91,6 +92,7 @@ def create_app(llm_client: LLMClient | None = None) -> FastAPI:
     app.include_router(auth.router)
     app.include_router(admin.router)
     app.include_router(uploads.router)
+    app.include_router(ingestion_runs.router)
     app.include_router(integrations.router)
     app.include_router(search.router)
     app.include_router(quarantine.router)
