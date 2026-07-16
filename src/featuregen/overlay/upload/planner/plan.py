@@ -86,7 +86,7 @@ def _differential(conn, template, plans, scope, roles, now) -> GroundTemplateDif
                     outcome = (GroundTemplateDiffOutcome.live_binding_present_and_ranked_first
                                if p.preference_rank == 0
                                else GroundTemplateDiffOutcome.live_binding_present_but_ranked_lower)
-                    return GroundTemplateDiffV1(outcome, live_refs, p.plan_id)
+                    return GroundTemplateDiffV1(outcome, live_refs, p.physical_plan_id)
         return GroundTemplateDiffV1(GroundTemplateDiffOutcome.live_binding_absent_unexpectedly, live_refs, None)
     return GroundTemplateDiffV1(GroundTemplateDiffOutcome.live_path_had_no_binding, (), None)
 
@@ -135,7 +135,7 @@ def plan_bindings(conn, *, template: Template, target_entity: str | None, scope:
 
     if resolved:
         status = PlanResolutionStatus.resolved
-        selected = resolved[0].plan_id
+        selected = resolved[0].physical_plan_id
         reasons = ((ReasonCode.selected_best_single_catalog,)
                    + ((ReasonCode.ambiguous_multiple_equal_plans,) if ordered.ambiguous else ()))
         primary = ReasonCode.selected_best_single_catalog
@@ -216,8 +216,8 @@ def _assemble_rollups(conn, *, template: Template, target_entity: str | None, sc
                 states += one.bounding.total_states_expanded
                 transitions += one.bounding.total_bridge_transitions_explored
                 for p in one.complete + one.rejected:
-                    if p.plan_id not in seen_plan_ids:   # defensive: an identical mint is appended once
-                        seen_plan_ids.add(p.plan_id)
+                    if p.physical_plan_id not in seen_plan_ids:   # defensive: an identical mint is appended once
+                        seen_plan_ids.add(p.physical_plan_id)
                         plans.append(p)
     return _AssemblyRollupsV1(tuple(plans), reasons, r_trunc, b_trunc, f_trunc, deeper,
                               states, transitions)

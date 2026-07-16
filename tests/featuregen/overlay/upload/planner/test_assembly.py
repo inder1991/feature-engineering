@@ -522,7 +522,7 @@ def test_equal_rank_complete_paths_resolve_with_ambiguity(db):
         CandidateRole.selected, CandidateRole.equal_rank_alternative]
     assert all(p.resolution_status is PlanResolutionStatus.resolved_with_ambiguity
                for p in asm.complete)
-    assert asm.complete[0].plan_id < asm.complete[1].plan_id      # canonical plan_id tie-break
+    assert asm.complete[0].physical_plan_id < asm.complete[1].physical_plan_id   # canonical id tie-break
 
 
 def test_unknown_realizer_authority_ranks_worst_not_best(db):
@@ -626,5 +626,5 @@ def test_ranked_output_is_byte_identical_under_bridge_seed_shuffle(db):
     a = run(bridges)
     b = run(list(reversed(bridges)))
     assert repr(a) == repr(b)                                     # byte-identical ranked output
-    assert [p.plan_id for p in a.complete] == [p.plan_id for p in b.complete]
+    assert [p.physical_plan_id for p in a.complete] == [p.physical_plan_id for p in b.complete]
     assert len(a.complete) == 2 and all(p.bridge_count == 1 for p in a.complete)

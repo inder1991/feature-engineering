@@ -42,7 +42,7 @@ def test_plan_bindings_resolves_a_single_catalog_plan(db):
     result = plan_bindings(db, template=_tmpl(), target_entity="customer", scope=scope, roles=(), now=_NOW)
     assert result.result_status is PlanResolutionStatus.resolved
     assert result.selected_plan_id is not None
-    sel = next(p for p in result.candidate_plans if p.plan_id == result.selected_plan_id)
+    sel = next(p for p in result.candidate_plans if p.physical_plan_id == result.selected_plan_id)
     assert sel.catalog_source == "core"
     assert {b.bound_object_ref for b in sel.ingredient_bindings} == {"public.accounts.balance",
                                                                      "public.accounts.customer_id"}
@@ -81,7 +81,7 @@ def test_rejected_alternative_does_not_downgrade_a_resolved_result(db):
     result = plan_bindings(db, template=_tmpl(stock_grains=("customer",)), target_entity="customer",
                            scope=scope, roles=(), now=_NOW)
     assert result.result_status is PlanResolutionStatus.resolved   # the clean 'core' plan wins
-    sel = next(p for p in result.candidate_plans if p.plan_id == result.selected_plan_id)
+    sel = next(p for p in result.candidate_plans if p.physical_plan_id == result.selected_plan_id)
     assert sel.catalog_source == "core"
     # …and the rejected alternative from 'bad' is PRESENT and non-resolved (preserved, not dropped).
     bad_plans = [p for p in result.candidate_plans if p.catalog_source == "bad"]
@@ -151,7 +151,7 @@ def test_acceptance_rollup_bridge_end_to_end(db):
                            scope=_scope("ops", "rev"), roles=(), now=_NOW)
     # candidate-local-first: the tier-1 outcome is untouched by the enrichment
     assert result.result_status is PlanResolutionStatus.resolved
-    sel = next(p for p in result.candidate_plans if p.plan_id == result.selected_plan_id)
+    sel = next(p for p in result.candidate_plans if p.physical_plan_id == result.selected_plan_id)
     assert sel.path_resolution_status is PathResolutionStatus.ingredient_binding_only
     # ...and the governed source->target roll-up IS in the candidate set (logged for 3B.4)
     cross = [p for p in result.candidate_plans
@@ -205,7 +205,7 @@ def test_acceptance_plan_bindings_is_deterministic(db):
                        roles=(), now=_NOW)
     r2 = plan_bindings(db, template=_txn_template(), target_entity="account", scope=scope,
                        roles=(), now=_NOW)
-    assert [p.plan_id for p in r1.candidate_plans] == [p.plan_id for p in r2.candidate_plans]
+    assert [p.physical_plan_id for p in r1.candidate_plans] == [p.physical_plan_id for p in r2.candidate_plans]
     assert r1.replay_envelope == r2.replay_envelope
 
 
