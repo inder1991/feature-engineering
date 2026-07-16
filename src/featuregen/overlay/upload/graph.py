@@ -87,7 +87,9 @@ def governed_join_proposal(row: CanonicalRow) -> ApprovedJoinRef | None:
         column_pairs=(ColumnPair(row.column, parsed.to_col),),
         cardinality=row.cardinality or "N:1")
 
-# Weighted tsvector: column name (A) > definition (B) > table/concept/domain (C).
+# Weighted tsvector: column name (A) > definition (B) > table/concept/domain (C). The ONE definition
+# of the search_doc expression (#20) — the build_graph/add_column_row INSERTs and rebuild_search_doc
+# all render it, with the inputs _search_doc_params derives. Never copy these weights elsewhere.
 _SEARCH_DOC = (
     "setweight(to_tsvector('english', coalesce(%s, '')), 'A') || "   # column name
     "setweight(to_tsvector('english', coalesce(%s, '')), 'B') || "   # definition
@@ -95,6 +97,39 @@ _SEARCH_DOC = (
     "setweight(to_tsvector('english', coalesce(%s, '')), 'C') || "   # concept
     "setweight(to_tsvector('english', coalesce(%s, '')), 'C')"       # domain
 )
+
+
+def _search_doc_params(kind: str, table: str | None, column: str | None, definition: str | None,
+                       concept: str | None, domain: str | None,
+                       entity: str | None) -> tuple[str | None, str, str | None, str, str]:
+    """The five ``_SEARCH_DOC`` inputs — name(A), definition(B), table(C), concept(C),
+    domain+entity(C) — derived from a node's field values. Shared by the insert paths AND
+    :func:`rebuild_search_doc` (#20), so an insert-time doc and a rebuilt doc can never disagree on
+    what feeds which weight. A table node's "name" slot is its table name; a column node's concept is
+    indexed HUMANIZED (``monetary_stock`` -> ``monetary stock``) and its entity rides the domain slot."""
+    if kind == "table":
+        return (table, "", table, "", domain or "")
+    return (column, definition or "", table, humanize(concept) if concept else "",
+            (domain or "") + " " + (entity or ""))
+
+
+def rebuild_search_doc(conn, catalog_source: str, object_ref: str) -> None:
+    """Re-derive a node's ``search_doc`` from its CURRENT flat values (#20). ``build_graph`` writes
+    the doc ONCE at insert; any later change to a doc-bearing field (field_resolution's concept/
+    definition/domain display projection, an applied entity suggestion) must call this in the same
+    transaction, or full-text search keeps matching the replaced terms and misses the new ones.
+    Case-insensitive on object_ref so field_resolution's lowercased projection key reaches the same
+    row its UPDATE matched. A ref matching no node is a no-op."""
+    rows = conn.execute(
+        "SELECT object_ref, kind, table_name, column_name, definition, concept, domain, entity "
+        "FROM graph_node WHERE catalog_source = %s AND lower(object_ref) = lower(%s)",
+        (catalog_source, object_ref)).fetchall()
+    for ref, kind, table, column, definition, concept, domain, entity in rows:
+        conn.execute(
+            f"UPDATE graph_node SET search_doc = {_SEARCH_DOC} "
+            "WHERE catalog_source = %s AND object_ref = %s",
+            (*_search_doc_params(kind, table, column, definition, concept, domain, entity),
+             catalog_source, ref))
 
 
 def _table_ref(table: str) -> str:
@@ -135,7 +170,8 @@ def build_graph(conn, catalog_source: str, rows: list[CanonicalRow],
             "INSERT INTO graph_node (catalog_source, object_ref, kind, table_name, column_name, "
             "data_type, definition, is_grain, is_as_of, concept, domain, search_doc) "
             f"VALUES (%s, %s, 'table', %s, NULL, NULL, NULL, false, false, NULL, %s, {_SEARCH_DOC})",
-            (catalog_source, t_ref, table, domain, table, "", table, "", domain or ""))
+            (catalog_source, t_ref, table, domain,
+             *_search_doc_params("table", table, None, None, None, domain, None)))
 
     for r in rows:
         c_ref = _column_ref(r.table, r.column)
@@ -151,8 +187,8 @@ def build_graph(conn, catalog_source: str, rows: list[CanonicalRow],
             (catalog_source, c_ref, r.table, r.column, r.type, definition,
              r.is_grain, r.as_of, concept, domain, r.sensitivity or None,
              r.additivity or None, r.unit or None, r.currency or None, r.entity or None,
-             r.column, definition or "", r.table, humanize(concept) if concept else "",
-             (domain or "") + " " + (r.entity or "")))
+             *_search_doc_params("column", r.table, r.column, definition, concept, domain,
+                                 r.entity or None)))
         conn.execute(
             "INSERT INTO graph_edge (catalog_source, kind, from_ref, to_ref) "
             "VALUES (%s, 'contains', %s, %s) ON CONFLICT DO NOTHING",
@@ -171,12 +207,16 @@ def build_graph(conn, catalog_source: str, rows: list[CanonicalRow],
 
     # Re-apply human-confirmed entity tags (entity_suggestion). The graph was just rebuilt from the
     # upload, which may not declare these; a confirmed tag must survive re-upload. Only fills a blank —
-    # a freshly-declared entity on the upload wins.
-    conn.execute(
+    # a freshly-declared entity on the upload wins. Entity feeds search_doc's domain slot, and the
+    # inserts above wrote the doc with the blank entity — rebuild the touched nodes' docs (#20).
+    reapplied = conn.execute(
         "UPDATE graph_node n SET entity = s.suggested_entity FROM entity_suggestion s "
         "WHERE s.catalog_source = n.catalog_source AND s.object_ref = n.object_ref "
-        "AND s.status = 'applied' AND n.catalog_source = %s AND n.entity IS NULL",
-        (catalog_source,))
+        "AND s.status = 'applied' AND n.catalog_source = %s AND n.entity IS NULL "
+        "RETURNING n.object_ref",
+        (catalog_source,)).fetchall()
+    for (ref,) in reapplied:
+        rebuild_search_doc(conn, catalog_source, ref)
 
 
 def add_column_row(conn, catalog_source: str, r: CanonicalRow, *,
@@ -195,7 +235,8 @@ def add_column_row(conn, catalog_source: str, r: CanonicalRow, *,
         "data_type, definition, is_grain, is_as_of, concept, domain, attested_at, search_doc) "
         f"VALUES (%s, %s, 'table', %s, NULL, NULL, NULL, false, false, NULL, NULL, %s, {_SEARCH_DOC}) "
         "ON CONFLICT DO NOTHING",
-        (catalog_source, t_ref, r.table, attested_at, r.table, "", r.table, "", ""))
+        (catalog_source, t_ref, r.table, attested_at,
+         *_search_doc_params("table", r.table, None, None, None, None, None)))
     c_ref = _column_ref(r.table, r.column)
     definition = r.definition or None
     conn.execute(
@@ -205,7 +246,8 @@ def add_column_row(conn, catalog_source: str, r: CanonicalRow, *,
         f"%s, NULL, NULL, %s, %s, %s, %s, %s, %s, {_SEARCH_DOC}) ON CONFLICT DO NOTHING",
         (catalog_source, c_ref, r.table, r.column, r.type, definition, r.is_grain, r.as_of,
          r.sensitivity or None, r.additivity or None, r.unit or None, r.currency or None,
-         r.entity or None, attested_at, r.column, definition or "", r.table, "", r.entity or ""))
+         r.entity or None, attested_at,
+         *_search_doc_params("column", r.table, r.column, definition, None, None, r.entity or None)))
     conn.execute(
         "INSERT INTO graph_edge (catalog_source, kind, from_ref, to_ref) "
         "VALUES (%s, 'contains', %s, %s) ON CONFLICT DO NOTHING", (catalog_source, t_ref, c_ref))

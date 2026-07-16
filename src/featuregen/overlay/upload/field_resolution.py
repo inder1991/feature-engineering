@@ -55,6 +55,7 @@ from featuregen.overlay.field_evidence import (
 from featuregen.overlay.safety_floor import apply_sensitivity_floor
 from featuregen.overlay.upload.field_policies import policy_for
 from featuregen.overlay.upload.field_revalidation import active_disqualifiers_for
+from featuregen.overlay.upload.graph import rebuild_search_doc
 from featuregen.overlay.upload.object_ref import parse_ref
 
 # Bumped when the policy set or the resolver's projection contract changes (recorded on each decision).
@@ -92,6 +93,11 @@ _DISPLAY_COLUMN: dict[str, str] = {
     "primary_entity": "primary_entity",
     "event_or_snapshot": "event_or_snapshot",
 }
+
+# The display columns that feed graph.build_graph's weighted search_doc (definition-B, concept/
+# domain-C). A projection into one of these must rebuild the node's FTS doc via
+# graph.rebuild_search_doc (#20) — search must match the projected values, not the insert-time ones.
+_SEARCH_DOC_DISPLAY_COLUMNS = frozenset({"concept", "definition", "domain"})
 
 # The companion *_decision_id link column per projected field (the display ≠ authority pointer).
 # ``logical_representation`` owns ``logical_type_decision_id``; ``semantic_type`` stays decision-only
@@ -200,6 +206,10 @@ def _project_display(
         "WHERE catalog_source = %s AND lower(object_ref) = %s",
         params,
     )
+    # A doc-bearing display column changed: re-derive the node's search_doc from its now-current
+    # values IN THE SAME TRANSACTION (#20), so full-text search follows the projection.
+    if display_col in _SEARCH_DOC_DISPLAY_COLUMNS:
+        rebuild_search_doc(conn, catalog_source, object_ref_lc)
 
 
 def _resolve_generic_field(

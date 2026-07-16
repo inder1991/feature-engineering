@@ -133,3 +133,70 @@ def test_search_uses_llm_domain_and_drafted_definition(db):
 
     # the drafted definition made 'ledger' find the otherwise-cryptic column
     assert any(h.column == "bal" for h in search(db, "ledger", now=now).hits)
+
+
+def test_field_resolution_projection_rebuilds_search_doc(db):
+    # Round-3 #20: build_graph writes search_doc ONCE at insert; resolve_and_project later changes
+    # the node's concept/definition display values. Full-text search must follow the CURRENT values:
+    # the new terms match, the replaced ones stop matching.
+    from featuregen.overlay.evidence import AssertionStrength, EvidenceProducer
+    from featuregen.overlay.field_evidence import field_input_hash, record_field_evidence
+    from featuregen.overlay.upload.field_resolution import resolve_and_project
+    from featuregen.overlay.upload.object_ref import normalize_ref
+
+    _seal()
+    now = datetime(2026, 7, 5, tzinfo=UTC)
+    rows = [CanonicalRow("deposits", "accounts", "balance", "numeric",
+                         definition="obsolete ledger wording")]
+    assert ingest_upload(db, "deposits", rows, actor=_actor(), now=now).status == "ingested"
+    # Freshly built: the initial definition term matches (build_graph behaviour unchanged).
+    assert any(h.column == "balance" for h in search(db, "obsolete", now=now).hits)
+
+    ref = normalize_ref("deposits", None, "accounts", "balance")
+
+    def seed(field, value, producer, strength):
+        record_field_evidence(
+            db, logical_ref=ref, field_name=field, proposed_value=value, producer=producer,
+            strength=strength, producer_ref="test-producer", source_snapshot_id="snap-1",
+            input_hash=field_input_hash(logical_ref=ref, field_name=field, material=value))
+
+    seed("definition", "authoritative settlement narrative",
+         EvidenceProducer.SOURCE, AssertionStrength.ATTESTED)
+    seed("concept", "monetary_stock", EvidenceProducer.LLM, AssertionStrength.PROPOSED)
+    resolve_and_project(db, source="deposits", logical_refs=[ref])
+    # Sanity: the display projection landed on the flat node.
+    assert db.execute(
+        "SELECT definition, concept FROM graph_node WHERE catalog_source = 'deposits' "
+        "AND object_ref = 'public.accounts.balance'").fetchone() == (
+        "authoritative settlement narrative", "monetary_stock")
+
+    # The NEW definition and (humanized) concept terms match the node...
+    assert any(h.column == "balance" for h in search(db, "settlement", now=now).hits)
+    assert any(h.column == "balance" for h in search(db, "monetary", now=now).hits)
+    # ...and the REPLACED definition term no longer does.
+    assert not any(h.column == "balance" for h in search(db, "obsolete", now=now).hits)
+
+
+def test_entity_apply_and_reapply_rebuild_search_doc(db):
+    # Round-3 #20 (entity path): a human-confirmed entity tag lands on the node AFTER build_graph
+    # wrote search_doc — both apply_entity_suggestion and build_graph's re-apply-on-rebuild must
+    # re-derive the doc, or the confirmed entity term is unfindable.
+    from featuregen.overlay.upload.entity import apply_entity_suggestion
+    from featuregen.overlay.upload.graph import build_graph
+
+    _seal()
+    now = datetime(2026, 7, 5, tzinfo=UTC)
+    rows = [CanonicalRow("deposits", "accounts", "cust_id", "integer")]
+    assert ingest_upload(db, "deposits", rows, actor=_actor(), now=now).status == "ingested"
+    assert not any(h.column == "cust_id" for h in search(db, "customer", now=now).hits)
+
+    db.execute(
+        "INSERT INTO entity_suggestion (catalog_source, object_ref, table_name, column_name, "
+        "suggested_entity, status) VALUES ('deposits', 'public.accounts.cust_id', 'accounts', "
+        "'cust_id', 'Customer', 'pending')")
+    assert apply_entity_suggestion(db, "deposits", "public.accounts.cust_id")
+    assert any(h.column == "cust_id" for h in search(db, "customer", now=now).hits)
+
+    # A graph rebuild (re-upload) re-applies the confirmed tag — the term must stay searchable.
+    build_graph(db, "deposits", rows)
+    assert any(h.column == "cust_id" for h in search(db, "customer", now=now).hits)

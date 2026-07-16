@@ -19,6 +19,7 @@ from dataclasses import dataclass
 
 from featuregen.overlay.upload.contract._serial import actor_json as _actor_json
 from featuregen.overlay.upload.enrich_llm import audited_enrich_call
+from featuregen.overlay.upload.graph import rebuild_search_doc
 from featuregen.overlay.upload.read_scope import allowed_sensitivities
 
 # A blank / unknown / list-stringified entity suggestion is not applied.
@@ -186,6 +187,9 @@ def apply_entity_suggestion(conn, catalog_source: str, object_ref: str, *, actor
         return False
     conn.execute("UPDATE graph_node SET entity = %s WHERE catalog_source = %s AND object_ref = %s",
                  (row[0], catalog_source, object_ref))
+    # Entity feeds the node's search_doc (domain slot) — rebuild it so the confirmed tag is
+    # full-text searchable, not just faceted (#20).
+    rebuild_search_doc(conn, catalog_source, object_ref)
     return True
 
 
