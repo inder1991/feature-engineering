@@ -21,7 +21,7 @@ import signal
 import threading
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import psycopg
 from psycopg.rows import dict_row
@@ -31,6 +31,7 @@ from featuregen.overlay.catalog import current_catalog_adapter
 from featuregen.overlay.catalog_changes import detect_catalog_changes, drift_watermark
 from featuregen.overlay.config import current_overlay_config
 from featuregen.overlay.expiry import fire_due_overlay_expiries, fire_due_overlay_renewals
+from featuregen.overlay.upload.ingestion_run import reconcile_ingestion_runs
 from featuregen.projections.runner import projection_lag, run_projection
 from featuregen.runtime.dispatch import process_one, recover_stuck
 from featuregen.runtime.external_commands import (
@@ -303,6 +304,21 @@ def _run_drift_scan(conn: psycopg.Connection, *, now: datetime) -> int:
     return len(detect_catalog_changes(conn, adapter, actor=_drift_actor(), now=now))
 
 
+def _sweep_ingestion_runs(conn: psycopg.Connection, *, now: datetime) -> int:
+    """Ingestion-run reconciliation sweep (first-release hardening #3): terminalize in_progress
+    ingestion runs whose heartbeat lease expired to 'abandoned' — a process that died mid-ingest
+    must not leave its run open forever. The lease timeout comes from
+    FEATUREGEN_INGESTION_RUN_LEASE_SECONDS (default 30 min — generously above any real
+    upload/import request, so an active run is never swept out from under its route). Cheap every
+    tick: one indexed read of (status, heartbeat_at); the stage guard makes any fault fail-soft."""
+    lease_seconds = float(os.environ.get("FEATUREGEN_INGESTION_RUN_LEASE_SECONDS", "1800"))
+    swept = reconcile_ingestion_runs(conn, now=now, lease_timeout=timedelta(seconds=lease_seconds))
+    if swept:
+        counters.incr("ingestion_run.abandoned", swept)
+        log("ingestion_run.sweep", swept=swept, lease_seconds=lease_seconds)
+    return swept
+
+
 def _stage(name: str) -> Callable:
     """Wrap a stage callable so a fault increments a counted, logged error and returns a fallback
     instead of propagating — one failing stage never stalls the tick (the poison guard already
@@ -445,6 +461,12 @@ def run_worker_once(
     # Catalog-drift scan (SP-1.5 Task 4): its own transaction (advisory-locked, cadence-gated,
     # snapshot+watermark advanced atomically). Skips cleanly when no adapter/config is wired.
     _stage("drift")(lambda: _tx(conn, lambda: _run_drift_scan(conn, now=now)), 0)
+
+    # Ingestion-run reconciliation (design #3 crash recovery): abandon lease-expired in_progress
+    # runs. Its own transaction; fail-soft via the stage guard like every other poller.
+    _stage("ingestion_run_sweep")(
+        lambda: _tx(conn, lambda: _sweep_ingestion_runs(conn, now=now)), 0
+    )
 
     def _advance_projections() -> int:
         advanced = 0

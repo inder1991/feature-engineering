@@ -20,6 +20,7 @@ from featuregen.overlay.upload.ingestion_run import (
     _effective_config_snapshot,
     get_run,
     open_run,
+    reconcile_ingestion_runs,
     source_fingerprint,
     terminalize_run,
     terminalize_run_durable,
@@ -181,6 +182,53 @@ def test_terminalize_run_durable_never_raises(no_dsn) -> None:
             raise RuntimeError("current transaction is aborted")
 
     terminalize_run_durable("ingrun_X", status="failed", now=_LATER, fallback_conn=Broken())
+
+
+# ── reconciliation sweep (crash recovery) ─────────────────────────────────────────────────────────
+
+_LEASE = timedelta(minutes=30)
+
+
+def test_reconcile_abandons_expired_in_progress_runs_only(db, no_dsn) -> None:
+    """A run whose process died stays in_progress forever; the sweep terminalizes exactly the
+    lease-expired ones to 'abandoned' and leaves fresh + already-terminal runs alone."""
+    stale = _open(db, now=_NOW - timedelta(hours=2))
+    fresh = _open(db)
+    finished = _open(db, now=_NOW - timedelta(hours=2))
+    terminalize_run(db, finished, status="ingested", now=_NOW - timedelta(hours=1))
+
+    assert reconcile_ingestion_runs(db, now=_NOW, lease_timeout=_LEASE) == 1
+
+    run = get_run(db, stale)
+    assert run["status"] == "abandoned"
+    assert run["completed_at"] == _NOW
+    assert [e["status"] for e in run["status_history"]] == ["in_progress", "abandoned"]
+    assert run["status_history"][-1]["reason_code"] == "lease_expired"
+    assert get_run(db, fresh)["status"] == "in_progress"        # heartbeat within the lease
+    assert get_run(db, finished)["status"] == "ingested"        # terminal state never clobbered
+
+
+def test_reconcile_heartbeat_exactly_at_cutoff_is_not_swept(db, no_dsn) -> None:
+    """The lease is `heartbeat_at < now - lease_timeout`, strictly — a run heartbeating exactly on
+    the boundary still holds its lease."""
+    run_id = _open(db, now=_NOW - _LEASE)
+    assert reconcile_ingestion_runs(db, now=_NOW, lease_timeout=_LEASE) == 0
+    assert get_run(db, run_id)["status"] == "in_progress"
+
+
+def test_reconcile_is_zero_on_nothing_expired(db, no_dsn) -> None:
+    _open(db)
+    assert reconcile_ingestion_runs(db, now=_NOW, lease_timeout=_LEASE) == 0
+
+
+def test_reconcile_is_idempotent(db, no_dsn) -> None:
+    """A second sweep finds nothing: the abandoned run is terminal, so it neither re-transitions
+    nor appends duplicate history."""
+    stale = _open(db, now=_NOW - timedelta(hours=2))
+    assert reconcile_ingestion_runs(db, now=_NOW, lease_timeout=_LEASE) == 1
+    assert reconcile_ingestion_runs(db, now=_NOW, lease_timeout=_LEASE) == 0
+    assert [e["status"] for e in get_run(db, stale)["status_history"]] == \
+        ["in_progress", "abandoned"]
 
 
 # ── effective config snapshot ─────────────────────────────────────────────────────────────────────

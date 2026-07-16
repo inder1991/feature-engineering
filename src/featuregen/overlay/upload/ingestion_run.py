@@ -18,6 +18,9 @@ durability model, per the design's review-corrected lifecycle:
   double-terminalize neither clobbers the terminal state nor duplicates history.
 * ``terminalize_run_durable`` is the route's exception-path variant: the request connection is
   rolling back, so the terminal state goes on its own fresh committing connection.
+* ``reconcile_ingestion_runs`` is the crash-recovery sweep (worker-driven): an ``in_progress``
+  run whose process died would otherwise stay open forever, so an expired heartbeat lease is
+  terminalized to ``abandoned`` (reason ``lease_expired``).
 
 The ``pre/post_source_fingerprint`` pair (``source_fingerprint``) is CORRELATION state — "did the
 source's graph state change around this run" — versioned by algo so it can evolve; it is not a
@@ -30,7 +33,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import psycopg
 from psycopg.types.json import Jsonb
@@ -212,6 +215,27 @@ def terminalize_run_durable(run_id: str, *, status: str, now: datetime,
             logger.exception("fallback ingestion_run terminalize failed for %s", run_id)
     logger.warning("ingestion_run %s could not be terminalized to %s — the reconciliation sweep "
                    "will abandon it once its heartbeat lease expires", run_id, status)
+
+
+def reconcile_ingestion_runs(conn, *, now: datetime, lease_timeout: timedelta) -> int:
+    """Crash recovery (design #3): terminalize every ``in_progress`` run whose heartbeat lease
+    expired (``heartbeat_at < now - lease_timeout``, strictly) to ``abandoned`` with a
+    ``lease_expired`` status event; returns the number swept.
+
+    Runs on the GIVEN connection (the worker wraps it in its own transaction) and reuses
+    ``terminalize_run``, so the sweep shares the one transition path: only ``in_progress`` runs
+    move, a concurrent terminalize (the route finishing late, or another worker's sweep) simply
+    wins the ``WHERE status = 'in_progress'`` race and this sweep counts nothing for that run —
+    no clobbered terminal state, no duplicate history. No advisory locks, by the module's rule."""
+    expired = conn.execute(
+        "SELECT id FROM ingestion_run WHERE status = 'in_progress' AND heartbeat_at < %s "
+        "ORDER BY heartbeat_at", (now - lease_timeout,)).fetchall()
+    swept = 0
+    for (run_id,) in expired:
+        if terminalize_run(conn, run_id, status="abandoned", now=now,
+                           reason_code="lease_expired"):
+            swept += 1
+    return swept
 
 
 def get_run(conn, run_id: str) -> dict | None:

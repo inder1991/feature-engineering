@@ -572,6 +572,76 @@ def test_migrate_subcommand_applies_migrations(_dsn) -> None:
     assert main(["migrate", "--dsn", _dsn]) == 0
 
 
+def _open_stale_run(db, *, hours_old: float = 2.0):
+    """An in_progress ingestion_run whose heartbeat lease expired (default lease is 30 min)."""
+    from datetime import timedelta
+
+    from tests.featuregen._helpers import mint_test_identity
+
+    from featuregen.overlay.upload.ingestion_run import open_run
+
+    now = _now()
+    actor = mint_test_identity(subject="user:crashed", role_claims=("data_owner",))
+    run_id = open_run(
+        db, origin_type="upload", catalog_source="deposits", filename="d.csv", actor=actor,
+        effective_config={}, now=now - timedelta(hours=hours_old))
+    return run_id, now
+
+
+def test_run_worker_once_sweeps_expired_ingestion_runs(db, monkeypatch):
+    """Crash recovery (design #3): the worker tick reconciles lease-expired in_progress ingestion
+    runs to 'abandoned' (reason lease_expired) and leaves fresh runs alone."""
+    from featuregen.overlay.upload.ingestion_run import get_run
+    from featuregen.runtime.worker import compose, run_worker_once
+
+    monkeypatch.delenv("FEATUREGEN_DSN", raising=False)
+    stale, now = _open_stale_run(db)
+    fresh, _ = _open_stale_run(db, hours_old=0.0)
+    reg, projections = compose(db)
+
+    tick = run_worker_once(db, reg, projections, owner="w1", now=now)
+
+    assert tick.errors == 0
+    swept = get_run(db, stale)
+    assert swept["status"] == "abandoned"
+    assert swept["status_history"][-1]["reason_code"] == "lease_expired"
+    assert get_run(db, fresh)["status"] == "in_progress"
+
+
+def test_ingestion_sweep_lease_timeout_is_env_configurable(db, monkeypatch):
+    """FEATUREGEN_INGESTION_RUN_LEASE_SECONDS overrides the 30-min default: under a week-long
+    lease, a 2-hour-stale run keeps its lease and is NOT abandoned."""
+    from featuregen.overlay.upload.ingestion_run import get_run
+    from featuregen.runtime.worker import compose, run_worker_once
+
+    monkeypatch.delenv("FEATUREGEN_DSN", raising=False)
+    monkeypatch.setenv("FEATUREGEN_INGESTION_RUN_LEASE_SECONDS", str(7 * 24 * 3600))
+    stale, now = _open_stale_run(db)
+    reg, projections = compose(db)
+
+    tick = run_worker_once(db, reg, projections, owner="w1", now=now)
+
+    assert tick.errors == 0
+    assert get_run(db, stale)["status"] == "in_progress"
+
+
+def test_run_worker_once_survives_a_failing_ingestion_sweep(db, seeded_pipeline, monkeypatch):
+    """Fail-soft: a sweep fault is counted + logged by the stage guard and never crashes the tick —
+    the rest of the stages (the seeded queue step) still run."""
+    import featuregen.runtime.worker as worker
+
+    def _boom(*_args, **_kwargs):
+        raise RuntimeError("sweep exploded")
+
+    monkeypatch.setattr(worker, "reconcile_ingestion_runs", _boom)
+    reg, projections = seeded_pipeline
+
+    tick = worker.run_worker_once(db, reg, projections, owner="w1", now=_now())
+
+    assert tick.errors >= 1
+    assert tick.queue_processed >= 1  # the failing sweep did not stall the rest of the tick
+
+
 def test_run_drift_scan_skips_and_cadence_gates(db):
     # SP-1.5 Task 4: the drift stage skips (0) with no adapter/config, runs when due, and skips
     # within the scan interval (not every tick).
