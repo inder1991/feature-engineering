@@ -1,145 +1,131 @@
-# Phase 3B.4 — Shadow Harness + Objective 3C Enablement Gate Design
+# Phase 3B.4 — Shadow Harness + Objective 3C Enablement Gate Design (v2)
 
-**Status:** approved design (2026-07-16). Successor to 3B.3c (contract resolvability classifier, merged `b9131ea`). Consumes 3B.3c's compiled `BindingPlanV1`/`BindingPlanningResultV1` (contract declarations + `audit_envelope`). Terminal deliverable: the objective, signed-off gate that governs whether 3C (enforcement) may be enabled.
+**Status:** approved design v2 (2026-07-16), reshaped after a 15-finding adversarial review (7 Blocker / 8 High — all accepted; 3 verified as real bugs in merged 3B.3c). Successor to 3B.3c (merged `b9131ea`). Terminal deliverable: the objective, signed-off gate that governs whether 3C (enforcement) may be enabled.
+**v1's errors:** capture integrity was unprovable (no record of the *expected* set); the replay fingerprint hashed the join graph, not the classifier's actual read-set; the wall-time budget was inert; selection could report a "selected" plan from a partially-compiled set; the persistence model conflated three orthogonal states; the statistical bound counted non-independent repeated contracts.
 
-## 1. What 3B.4 is (and the gate it defines)
+## 1. What 3B.4 is
 
-3B.3c *computes* a contract classification and discards it (log-only). 3B.4 **persists** those classifications over real runs, **measures** the population, and defines the **objective enablement gate** for 3C — the same discipline as the 1A/1B gates (`recognition_eval`): nothing goes live until a measured signal says it's safe.
+3B.3c *computes* a contract classification and discards it (log-only). 3B.4 **persists** those classifications, **measures** the population, and defines the **objective, conjunctive enablement gate** for 3C. **The gate is "verdicts are trustworthy enough to enforce," NOT "enough plans resolve"** — a resolution-rate target would conflict with 3B.3c's validate-not-derive contract and pressure the system to fabricate.
 
-**The gate is "verdicts are trustworthy enough to enforce," NOT "enough plans resolve."** 3B.3c is deliberately validate-not-derive, so by design most plans are honestly `unresolved` for want of authoring. A resolution-rate target would directly conflict with that contract and would pressure the system to fabricate. So the gate is a **conjunctive readiness assessment** (§9) — every sub-gate must pass; a composite/averaged score is forbidden.
+Two required, complementary artifacts:
+- **A curated gold set** — expert-labelled scenarios with expected verdicts. Proves *correctness* (esp. false-resolves, which the unlabelled durable population cannot detect). Versioned + content-hashed; signed.
+- **The durable population report** — real shadow runs. Proves *representativeness, operational completeness, replay behaviour*.
 
-The gate rests on **two required, complementary artifacts**:
-- **A curated gold set** — expert-labelled scenarios with expected verdicts. Proves *correctness* (esp. false-resolve detection, which the unlabelled durable population cannot do by itself). Versioned + hashed; a signed-off enablement artifact.
-- **The durable population report** — the real shadow runs. Proves *representativeness, operational completeness, and replay behaviour* over production traffic.
+**Both required; neither substitutes for the other.** Still shadow / flag-gated / behaviour-neutral; persists telemetry and computes readiness; enforces nothing.
 
-Both are required. Neither substitutes for the other.
+## 2. Capture integrity: the dispatch manifest (fixes F1, F2)
 
-**In scope:** the two-table durable store (§3); replay-stamp enrichment (§4) then `ReplayFreshness` (§5); the 6-cause taxonomy + cause-labelling (§6); the curated gold set + `contract_eval` harness (§7); the population report keyed on *selected enforcement candidates* (§8); the conjunctive 3C gate + its statistical bound (§9); the two gating-note folds (§10). Migration `0997`.
+A missing result row is not evidence — you cannot tell an un-run recipe from a lost write, and `resolve_catalog_scope`/`build_compiler_context` can fail *before* the recipe loop even starts (`shadow.py:35`, no rows at all). So capture integrity is proven against a **durable dispatch manifest written FIRST**, before any planning:
 
-**Out of scope:** 3C enforcement / live grounding / review UIs; any authoring surface (3D); multi-grain/multi-branch (3D). 3B.4 is still **shadow / flag-gated / behaviour-neutral** — it persists telemetry and computes readiness; it changes no response and enforces nothing.
+- **`planner_shadow_dispatch`** (append-only) — one row per shadow run, written at run start: `generation_run_id`, `catalog_scope_id`, `compile_flag`, the **exact eligible recipe-id set + its hash**, `expected_count`, `invocation_predicate` (the guard that fired the shadow: `catalog_source is None and target_entity is not None`), `applicability_version`, `producer_commit`, `compiler/registry versions`, `created_at`. This is the ground truth the population is reconciled against.
 
-## 2. Design posture
+**Capture integrity = for every manifest, `expected_count` run-result rows exist, one per manifest recipe id.** A pre-loop failure leaves a manifest with zero results → *detected* as total loss, not invisible. `manifest.recipe_hash` lets the gate confirm the eligible set itself wasn't silently altered.
 
-- **Persist, don't enforce.** The store is planner telemetry, NOT a governed `overlay_fact` (no four-eyes). Written by `run_shadow_planner` when the compile flag is on; never read by the live grounding path.
-- **Capture integrity over convenience.** Every *eligible* (run × recipe) invocation is accounted for — including the recipe-with-no-template skip, no-authorized-catalog, internal_error, budget-exhaustion, and a store-write failure. A missing row is a capture defect, not an absent observation. The denominator must never be positively biased.
-- **The absence of ground truth is explicit.** The durable population has no labels, so it cannot detect a false resolve. Only the gold set can. The gate names both.
+**Persistence must not be circular (F2):** recording a store failure *in the failing store* is unreliable. So:
+- Each recipe's parent `run_result` + child `plan_observation` rows are written **atomically** (one transaction), on a **fresh fallback savepoint** (independent of the planning savepoint at `shadow.py:55` and the route savepoint at `contract.py:409`).
+- The **independent loss signal** is the manifest-vs-results reconciliation (a manifest recipe with no result row = confirmed loss) **plus** a structured-log/metric `persistence_loss` counter emitted outside the DB write path. Gate 1 consumes the reconciliation, not a self-reported row.
 
-## 3. The two-table durable store (fixes the positively-biased denominator)
+## 3. The persistence model: three orthogonal axes + DB hygiene (fixes F10, F11)
 
-A single plan-grained table loses every recipe that produced no selectable plan. So **two append-only tables** (migration `0997`):
+`run_outcome` conflated planning, compile completeness, and persistence health. Split into three fields on `planner_shadow_run_result` (one row per `generation_run_id` × `recipe_id`):
+- **`planner_outcome`** ∈ {`compiled`, `no_physical_plan`, `internal_error`, `no_authorized_catalog`, `template_not_found`} — the planning disposition.
+- **`compile_outcome`** ∈ {`complete`, `partial`, `skipped`, `budget_exhausted`} — did EVERY candidate for the recipe compile? (see §5).
+- **`capture_status`** ∈ {`persisted`, `persistence_partial`} — the write health.
 
-- **`planner_shadow_run_result`** — ONE row per (generation_run_id, recipe_id): the recipe-level outcome. Columns: `run_id`, `recipe_id`, `catalog_scope_id`, `target_entity`, `result_status` (ingredient-axis), `contract_result_status`, `selected_contract_physical_plan_id`, `selected_contract_id`, `run_outcome` (a closed enum — see below), `candidate_plan_count`, `bounding` summary, `created_at`. This row exists even when there is NO plan.
-  - `run_outcome ∈ {compiled_selected, no_physical_plan, internal_error, budget_exhausted_before_selection, no_authorized_catalog, template_not_found, persistence_partial}` — the recipe-level disposition that the plan table alone would drop.
-- **`planner_shadow_plan_observation`** — ONE row per candidate physical plan: `run_id`, `recipe_id`, `physical_plan_id`, `contract_id`, `is_selected` (the enforcement candidate), `contract_resolution_status`, `declaration_status`, `contract_primary_reason_code`, `contract_reason_codes`, `bridge_count`/`tier`, the compiled declarations (aggregation/temporal/read-set as JSON), the enriched replay stamp (§4), `created_at`.
+**`planner_shadow_plan_observation`** (one row per candidate physical plan) persists — additive to what the metric needs (F11): `generation_run_id`, `recipe_id`, `physical_plan_id`, `contract_id`, **`path_resolution_status`** (the metric filters on it), `contract_resolution_status`, `declaration_status`, `contract_primary_reason_code`, `contract_reason_codes`, `bridge_count`/`tier`, `preference_rank` + selection evidence, the compiled declarations (canonical JSON), the enriched replay stamp (§6). **`is_selected` is DERIVED** by joining the parent's `selected_contract_physical_plan_id` — never a duplicated boolean that can disagree.
 
-**Capture integrity:** `run_shadow_planner` writes exactly one `run_result` per eligible recipe id (the `template_not_found` skip becomes a row, not a silent `continue`). A store-write failure is caught and recorded (`persistence_partial` + a run-level `persistence_loss` counter) — never a silent drop. The write happens inside the per-recipe savepoint discipline already in place (a write failure isolates to that recipe, and the counter surfaces it).
+**DB hygiene (all three tables):** composite primary keys (`generation_run_id` + …); foreign keys to the manifest/run; DB-level CHECK constraints on every status enum; **WORM** — `REVOKE UPDATE, DELETE` (append-only, enforced, not just convention); **idempotent** writes (a retried run reconciles by `(generation_run_id, recipe_id, physical_plan_id)`; a divergent duplicate write is a validated conflict, not a silent overwrite); a `payload_schema_version` + payload hash on the JSON columns; canonical (sorted-key) JSON serialization. Key on **`generation_run_id`** (never the ambiguous `run_id`).
 
-## 4. Replay-stamp enrichment (REQUIRED before `ReplayFreshness`)
+## 4. Selection trustworthiness: compile_completeness (fixes F6)
 
-`CatalogStateStampV1` today carries only `head_seq` + `last_completed_at`; the compiler itself documents (`declarations.py:728`) that a graph rebuild can change realizations without advancing that watermark. Persisting only head_seq means replay would report `current` after meaningful drift. So each persisted per-catalog stamp is enriched to carry (additive contract change; bump the relevant versions):
-- **per-catalog realization/graph fingerprint** (`realization_fingerprint` — the schema+graph+concept+derivation hash the compiler already computes at ctx-build but does not persist),
-- **projection checkpoint** (`_checkpoint_seq(conn,"overlay")` at compile time),
-- drift watermark + head sequence (present),
-- and at the envelope level: the **active-bridge fingerprint** (or exact fact-key set) and **all compiler + registry versions** (mostly present in the envelope already — verify completeness).
+The C8 selection chooses the best among whatever COMPILED, ignoring budget-skipped physical plans (`plan.py:170`). So a "selected" plan can be the best of a *partial* set while a better, uncompiled candidate exists. **`is_selected` is eligible for the metric, the audit, and 3C ONLY when `compile_outcome == complete`.** A `partial`/`budget_exhausted` recipe's selection is *provisional* and excluded from the enforcement denominator (counted separately as an operational-completeness gap that Gate 1 surfaces).
 
-`CatalogStateStampV1` gains `realization_fingerprint: str` + `projection_checkpoint: int`; the envelope gains/keeps `bridge_fingerprint`. C7's compile-time revalidation already computes these on the ctx — 3B.4 threads them onto the persisted stamp so replay can compare them.
+## 5. The compiler-input fingerprint (fixes F3, F8) — the replay foundation
 
-## 5. `ReplayFreshness` (read-side; `unverifiable` is never `current`)
+`realization_fingerprint` hashes only graph_node `(object_ref, kind, table_name, is_grain, concept)` + join edges — it **omits `additivity`, `is_as_of`, `entity`, `sensitivity`**, the exact `_Col` fields the classifier reads (additivity flips an aggregation verdict; is_as_of/entity/sensitivity feed temporal/safety/connectivity). A change to any of them changes the verdict **without moving `realization_fingerprint`** → a false `current`. So replay is founded on a new **`compiler_input_fingerprint`** — a role/scope-scoped hash over EVERY input this plan's classification actually consumed:
+- the plan's read-set `_Col` rows in full (`additivity, is_as_of, entity, sensitivity, concept, is_grain, data_type` — read-scope-filtered exactly as the compiler loaded them),
+- the realizations the path used (by `realization_id` + their cardinality/keys),
+- the **scope-filtered** bridge fact-key set (§6 — not the global bridge fingerprint),
+- the compiled declarations (aggregation/temporal/read-set),
+- read-scope (the `authz_role_claims`), and all compiler + registry versions.
 
-A pure read-side helper: given a stored plan's enriched stamps and the current catalog state, return `ReplayFreshness ∈ {current, drifted, unverifiable}`:
-- **`current`** — every participating catalog's realization fingerprint + bridge fingerprint + projection checkpoint + head_seq match the persisted stamp.
-- **`drifted`** — any fingerprint/head_seq/checkpoint differs (the graph moved since compile).
-- **`unverifiable`** — a stamp is missing/incomplete, or `stamp_consistency` was already `unverifiable` at compile, or a required current value can't be read. **`unverifiable` must NEVER be reported/treated as `current`** (fail-closed).
+Scoped to the plan (not the whole catalog) so an unrelated change elsewhere doesn't drift it. This also completes the **frozen-input identity** (F8): a canonical **`compiler_input_hash`** over the above + `producer_commit`/build id + effective-config hash + REAL versions (fix `ROLE_RESOLUTION_VERSION="unknown"`). Reports compare only within a **homogeneous producer cohort** (never mix producer versions).
 
-Consumed by the population report + the drift-detection gate; never mutates the stored record (the immutable compile-time verdict stands).
+## 6. Replay stamp enrichment + scope-filtered bridge signal (fixes F4, F5)
 
-## 6. The 6-cause taxonomy (not every non-authoring reason is a bug)
+Each persisted per-catalog stamp carries: the **`compiler_input_fingerprint`** (§5), the drift watermark + head_seq, and the **projection checkpoint** — but the checkpoint is a **LAG invariant, not an equality signal (F4)**: the checkpoint is global projection progress that advances for unrelated events, so requiring equality would falsely mark unchanged contracts `drifted`. The rule: `checkpoint >= relevant head_seq` → caught up; `checkpoint < head_seq` (missing/regressed/lagging) → `unverifiable`. Advancement alone is never drift.
 
-Cause-labelling borrows `readiness.py`'s discipline (it splits expected-deferred from genuine-error) but 3B.4 needs a finer taxonomy, because e.g. `safety_rejected` can be a CORRECT hard rejection and `ingredient_not_connected_to_path` can be genuinely unsupported topology — neither is a classifier bug. Every observed unresolved reason is mapped to exactly one **`ResolutionCause`**:
+The **bridge drift signal is scope-filtered, not global (F5)**: persist the exact scope-visible / plan-used bridge fact-key set (already in the replay envelope as `active_bridge_fact_keys`), not the global `bridge_fingerprint()` — an unrelated out-of-scope bridge change must not drift every stored plan.
 
+## 7. `ReplayFreshness` — pure comparator + impure adapter (fixes F15, F4)
+
+Split into a **pure comparator** (`stored evidence × current evidence → verdict`) and an **impure current-state adapter** (reads current fingerprints/checkpoints). The adapter reads under a **consistent snapshot or revalidation protocol** so multi-catalog current values are mutually consistent. States:
 ```python
-class ResolutionCause(StrEnum):
-    expected_missing_authoring = "expected_missing_authoring"       # aggregation_strategy_missing, semi_additive_temporal_strategy_missing, temporal_anchor_missing, aggregation_weight/components_missing
-    expected_policy_or_catalog_state = "expected_policy_or_catalog_state"  # safety_rejected (correct hard block), unresolved_freshness, participating_catalog_stale, projection_lagging
-    unsupported_topology_or_model = "unsupported_topology_or_model" # ingredient_not_connected_to_path, physical_cardinality_unavailable, aggregation_composition_unsupported, aggregation_axis_unsupported
-    classifier_defect = "classifier_defect"                        # a reason that SHOULD NOT occur — a modelling/logic gap
-    operationally_unmeasured = "operationally_unmeasured"          # observed but no cause rule maps it (e.g. a new reason code shipped without a taxonomy entry)
-    unknown = "unknown"                                            # unmappable
+class ReplayFreshness(StrEnum):
+    current = "current"        # every scoped compiler_input_fingerprint + bridge set matches, checkpoint not lagging
+    drifted = "drifted"        # a catalog-state input changed since compile
+    incompatible = "incompatible"  # producer/compiler/registry VERSION mismatch — comparison is not meaningful (NOT drift)
+    unverifiable = "unverifiable"  # a stamp is missing/incomplete, checkpoint lagging, stamp_consistency was unverifiable, or a current value can't be read
 ```
+A **version mismatch is `incompatible`, not `drifted`** (F15). **`unverifiable`/`incompatible` must NEVER be reported/treated as `current`** (fail-closed). Never mutates the stored record.
 
-A versioned `reason_code → ResolutionCause` map (`RESOLUTION_CAUSE_MAP`, its own registry version). **The release gate requires ZERO `unknown`, `classifier_defect`, or `operationally_unmeasured` observations** — it does NOT claim every unresolved result must be missing authoring. `safety_rejected`/topology causes are legitimate and pass. `operationally_unmeasured` deliberately catches a new reason code that shipped without a taxonomy entry (so the gate re-opens when the vocabulary grows).
+## 8. The two-layer cause taxonomy (fixes F9)
 
-## 7. Curated gold set + `contract_eval` harness
+Whether `physical_cardinality_unavailable` or `safety_rejected` is expected data, unsupported topology, or a bug depends on **evidence + expert expectation**, not the reason code alone. So cause-labelling is TWO layers:
+- **Layer A — static reason CATEGORY** (`ReasonCategory`, a versioned map, MACHINE): every `ReasonCode` in the registry → its structural category (`missing_authoring` / `policy_or_catalog_state` / `topology_or_model` / `bounding` / `internal`). **Exhaustive over the whole `ReasonCode` registry** — a static test asserts every code is mapped *even if not observed in the window* (a new unmapped code fails the check → `operationally_unmeasured`).
+- **Layer B — contextual classification** (per observation, EVIDENCE + EXPERT): is this observed reason, on its evidence, `expected`, `unsupported_topology`, or a `classifier_defect`? `classifier_defect` is a Layer-B determination, never inferred from the code.
 
-Modeled on `recognition_eval` but **deterministic exact-match** (not statistical recall — the classifier is deterministic). New `planner/contract_eval.py` + `planner/contract_gold.py`:
-- **Gold set** — curated scenarios, each: a seeded catalog fixture (or a reference to one) + a recipe + the EXPECTED `declaration_status` / `contract_resolution_status` / primary reason / `ResolutionCause` / (for a `resolved` case) an expert assertion that the compiled contract is genuinely valid. Includes the adversarial shapes (multi-grain, disconnected tables, non-additive fan-in, semi-additive-across-time, bridge roll-up, unsafe join key, ambiguity, freshness). **Versioned + content-hashed**; carries the expert reviewer + sign-off.
-- **`evaluate()`** — runs the compiler over the gold set, scores EXACT match of verdict + cause; the **false-resolve check** is the strictest: a gold case an expert labelled "not a valid contract" that the classifier calls `resolved` is a gold-set failure. Also a **stratified real-population audit**: sample stored `resolved` plans across strata (tier, family, dimension) for expert inspection — zero false resolves required.
-- **`main()`** — a runnable report (the enablement artifact) recording code commit, gold-set hash, evaluator version, registry versions, observation window, reviewer, sign-off time (§9 artifact integrity).
+Distinct terminal labels: **`operationally_unmeasured`** = a reason code with no Layer-A map entry (a registry gap); **`unknown`** = mapped but Layer-B-unclassifiable pending evidence. The release gate (§10) requires **zero `classifier_defect` (Layer B), zero `operationally_unmeasured` (Layer-A exhaustiveness), zero `unknown`** — it does NOT claim every unresolved result is missing authoring (a correct `safety_rejected` or unsupported-topology reject passes).
 
-## 8. Population report (denominator = selected enforcement candidates)
+## 9. Curated gold set + `contract_eval` harness
 
-The headline metric uses **ONE observation per (generation_run_id, recipe_id) — the SELECTED contract plan** (`is_selected`). Lower-ranked candidates are retained in `planner_shadow_plan_observation` for diagnostics but MUST NOT inflate the enforcement denominator (they are not what 3C would enforce). The report over the store:
-- **`physically_resolved_but_contract_unresolved`** — of selected plans that are `source_to_target_resolved` (path-resolved), the fraction whose `contract_resolution_status` is not `resolved`, broken down by dimension (connectivity / aggregation / temporal / safety / freshness) AND by `ResolutionCause`.
-- Recipe-level outcome distribution (from `run_result`: no_physical_plan / internal_error / budget_exhausted / no_authorized_catalog / template_not_found / persistence_partial) — so the denominator is honest.
-- Replay-freshness distribution over stored plans (`current`/`drifted`/`unverifiable`).
-- Determinism/stability observations (§below).
+Deterministic exact-match (the classifier is deterministic). New `planner/contract_eval.py` + `planner/contract_gold.py`:
+- **Gold set** — curated scenarios (seeded catalog fixtures + recipe), each with the EXPECTED `declaration_status` / `contract_resolution_status` / primary reason / Layer-B cause / (for `resolved`) an **immutable expert assertion that the compiled contract is genuinely valid**. Covers the adversarial shapes (multi-grain, disconnected tables, non-additive fan-in, semi-additive-across-time, bridge roll-up, unsafe join key, ambiguity, freshness, take_latest-without-ordering). **Versioned + content-hashed**; each case carries immutable sample IDs + the expert label.
+- **`evaluate()`** — exact-match verdict+cause; the **false-resolve check** is strictest: a gold case labelled "not a valid contract" that the classifier calls `resolved` is a FAILURE.
+- **Stratified real-population audit** — samples stored `is_selected`+`complete` plans by **unique `compiler_input_hash`** (see §10 sampling), across non-overlapping strata, for expert inspection.
 
-## 9. The conjunctive 3C enablement gate (every sub-gate must pass)
+## 10. The conjunctive 3C enablement gate (every sub-gate; no averaging)
 
-3C may be enabled only when ALL hold in the release window (no averaging):
+**Machine-computed:** gates 1, 2, 5, 6. **Human-labelled + signed:** gates 3, 4, 7. A human provides labels/approval but **cannot override a FAILED machine gate.**
 
-1. **Capture integrity** — 100% of eligible (run × recipe) invocations accounted for; `persistence_loss == 0`.
-2. **Population explainability** — 100% of observed reason codes cause-labelled; **zero** `unknown` / `classifier_defect` / `operationally_unmeasured`.
-3. **No false resolves** — zero on the COMPLETE curated gold set AND zero in the stratified real-population audit.
-4. **Statistical bound** — a defined maximum acceptable one-sided upper confidence bound on the true false-resolve rate. *Determinism removes run randomness, not uncertainty about untested input shapes.* With zero observed false-resolves over an audit of N (per stratum), the one-sided 95% upper bound ≈ 3/N (rule of three; Clopper-Pearson exact). 3B.4 provides the MACHINERY (compute the bound from the audit sample); the **maximum acceptable upper bound is a signed POLICY parameter** (e.g. "≤ 1% at 95% one-sided"), not a hardcoded constant — and it sets the minimum audit sample size per stratum.
+1. **Capture integrity** — every manifest recipe id has a run-result row (`expected_count` reconciled); `recipe_hash` intact; `persistence_loss == 0`; pre-loop failures visible.
+2. **Population explainability** — Layer-A map exhaustive over the registry; **zero** `operationally_unmeasured`; every observation Layer-B classified; **zero** `classifier_defect`, **zero** `unknown` in the window.
+3. **No false resolves** — zero on the COMPLETE curated gold set AND zero in the stratified real-population audit (over `is_selected` + `compile_outcome==complete` only).
+4. **Statistical bound** — sampling unit = a **unique frozen-input/contract-shape fingerprint (`compiler_input_hash`/`contract_id`)**; **dedupe retries + repeated traffic** (repeated runs of one contract are NOT independent); non-overlapping strata; preserve the random seed + sampling frame; finite-population correction. With zero observed false-resolves, the one-sided 95% upper bound ≈ 3/n (rule of three; Clopper-Pearson exact) → **~300 independent examples per gated stratum for a 1% bound**. The max acceptable bound is a signed POLICY parameter; 3B.4 provides the machinery.
+5. **Replay stability** — for an UNCHANGED frozen envelope: identical `selected physical_plan_id`, `contract_id`, `declaration_status`, `declaration reason codes`. Do NOT require `contract_resolution_status` identity after drift — `contract_id` excludes freshness (`contracts.py:671`), so a changed freshness verdict under drift is CORRECT (`ReplayFreshness=drifted`), not instability.
+6. **Drift detection** — 100% on controlled catalog / realization (incl. additivity/is_as_of/sensitivity) / bridge / projection / version mutations; `unverifiable`/`incompatible` never treated as `current`.
+7. **Artifact integrity** — a machine-readable signed report: code commit, gold-set hash, query/evaluator version, registry versions, policy hash, report-input digest, observation window, **immutable sample IDs + expert labels**, signer authority, a **DETACHED approval/signature** (the evaluator cannot sign its own output), a verification command, **nonzero exit on any failed gate**.
 
-**Machine-computed vs human-labelled.** Gates 1, 2, 5, 6 are computed automatically from the store + controlled mutations. Gates 3, 4, 7 require **human expert input** — the gold-set validity labels, the stratified-audit inspection, and the sign-off — exactly like the 1A gold-set expert review. 3B.4 builds the harness that PRODUCES the signed enablement artifact; it does not auto-pass the gate. The final enablement remains a human decision recorded in the artifact.
-5. **Replay stability** — 100% identity/verdict stability for UNCHANGED frozen inputs (§below).
-6. **Drift detection** — 100% on controlled catalog / realization / bridge / projection / version mutations; `unverifiable` never treated as `current`.
-7. **Artifact integrity** — the signed report records code commit, gold-set hash, query/evaluator version, registry versions, observation window, reviewer, sign-off time.
+## 11. Real-bug folds (from the review — merged 3B.3c defects)
 
-### Stability vs freshness (a required distinction)
-"Replay stability" is about the DECLARATION, not freshness. For an UNCHANGED frozen envelope, require IDENTICAL: `selected physical_plan_id`, `contract_id`, `declaration_status`, `declaration reason codes`. Do **NOT** require the full `contract_resolution_status` to be identical after catalog drift — `contract_id` intentionally excludes freshness (`contracts.py:671`), so a *changed* freshness verdict is CORRECT when `ReplayFreshness=drifted`. Conflating the two would flag correct drift-detection as instability.
+- **Inert wall-time budget (F12):** `compile_ctx.now < budget.deadline` compares the FIXED deterministic `now` against `now + COMPILE_BUDGET` → always true; only the count limit fires. Fix: an **injectable monotonic clock** distinct from the deterministic `now` — the budget deadline uses the monotonic clock; it does NOT enter `contract_id`/the verdict (determinism preserved). A real elapsed-time test proves the deadline fires.
+- **`take_latest` needs `anchor_binding`, not `pit_anchor` (F13):** `compile_temporal` sets `pit_anchor` from the metadata role even when no column is bound (`declarations.py:268`). The guard must require a BOUND ordering column (`anchor_binding is not None`); absent → a specific `aggregation_ordering_column_missing` reason (undeclared).
+- **`AggregationFunction` extension invalidates sign-off:** extending the vocabulary bumps the aggregation-rule/registry version → the artifact-integrity check (gate 7) sees a version change → **prior sign-off is invalidated** by construction.
 
-## 10. Gating-note folds (from the 3B.3c whole-branch review)
+## 12. Contracts summary
 
-- **`take_latest` requires a bound ordering column** — thread `temporal.pit_anchor` into `_validate_stage`; a `take_latest`/temporal function is `sound` only when a temporal ordering anchor is BOUND (a real ordering column), not merely a non-null role. Absent → `undeclared` / a temporal reason. (Inert today — registry empty — but sound before the registry is populated.)
-- **`AggregationFunction` extension invalidates sign-off** — extending the vocabulary (e.g. to the full spec §4 set) MUST bump the aggregation-rule / registry version, which **invalidates any prior gold-set sign-off** (§9 artifact integrity checks the registry versions). This makes the gate re-open on a vocabulary change by construction.
+New tables (migration `0997`): `planner_shadow_dispatch`, `planner_shadow_run_result`, `planner_shadow_plan_observation` (append-only, WORM, composite-keyed, CHECK-constrained) + `planner/shadow_store.py`. New: `PlannerOutcome`/`CompileOutcome`/`CaptureStatus`/`ReasonCategory` enums; `compiler_input_fingerprint`/`compiler_input_hash`; `ResolutionCause` (Layer B) + the versioned Layer-A map + exhaustiveness test; `ReplayFreshness` reader (pure comparator + impure adapter, +`incompatible`); `planner/contract_eval.py` + `planner/contract_gold.py`; `planner/shadow_report.py`; the signed enablement-report shape + verifier. Extended: `CatalogStateStampV1` + `compiler_input_fingerprint`/`projection_checkpoint`; `PlannerReplayEnvelopeV1` keeps the scope-filtered `active_bridge_fact_keys`; a real `ROLE_RESOLUTION_VERSION` + `producer_commit`/config hash; the monotonic-clock seam in `run_shadow_planner`/`plan_bindings`; the `take_latest` `anchor_binding` guard; rule-version bumps. Flag reuse: `FEATUREGEN_INTENT_CONTRACT_COMPILE` gates the store write too.
 
-## 11. Contracts summary
+## 13. Task decomposition
 
-New: `planner_shadow_run_result` + `planner_shadow_plan_observation` (migration 0997) + their reader/writer (`planner/shadow_store.py`); `RunOutcome` enum; `ResolutionCause` + `RESOLUTION_CAUSE_MAP` (+ version); `ReplayFreshness` READER (the enum exists from 3B.3c C1); `planner/contract_eval.py` + `planner/contract_gold.py`; the population report (`planner/shadow_report.py`); the signed enablement report shape. Extended: `CatalogStateStampV1` + `realization_fingerprint`/`projection_checkpoint`; `PlannerReplayEnvelopeV1` + `bridge_fingerprint` (if absent); `run_shadow_planner` writes the store when compiling; `_validate_stage` take_latest ordering guard; `PLAN_CONTRACT_VERSION`/rule-version bumps. Flag reuse: the existing `FEATUREGEN_INTENT_CONTRACT_COMPILE` gates the store write too (persist only when compiling).
+- **D1 — migration 0997 + the three tables + store contracts.** Manifest + run_result + plan_observation; WORM/CHECK/composite-key/idempotent; `PlannerOutcome`/`CompileOutcome`/`CaptureStatus`; `planner/shadow_store.py` writers/readers; canonical JSON + payload schema hash.
+- **D2 — dispatch manifest + capture-integrity wiring.** Write the manifest FIRST (before the loop, capturing pre-loop failures); atomic parent+children per recipe on a fresh fallback savepoint; the independent `persistence_loss` signal + manifest reconciliation. Behaviour-neutral (store only when compiling; response untouched).
+- **D3 — `compiler_input_fingerprint` + `compiler_input_hash` + stamp enrichment.** The role/scope-scoped fingerprint over the classifier's real read-set; enrich `CatalogStateStampV1`; real `ROLE_RESOLUTION_VERSION` + producer/config; homogeneous-cohort discipline.
+- **D4 — `ReplayFreshness` (pure comparator + impure snapshot adapter).** The 4 states; checkpoint-as-lag-invariant; scope-filtered bridge signal; version-mismatch→incompatible; unverifiable≠current.
+- **D5 — two-layer cause taxonomy.** Layer-A map (exhaustive over the registry, static test) + Layer-B contextual/expert classification; `operationally_unmeasured` vs `unknown`.
+- **D6 — compile_completeness (F6) + budget monotonic-clock fix (F12) + take_latest anchor_binding (F13).** The completeness gate on `is_selected`; injectable monotonic clock + elapsed-time test; the ordering-column guard.
+- **D7 — curated gold set + `contract_eval`.** Versioned/hashed gold set + immutable expert labels; exact-match + false-resolve `evaluate()`; the stratified-audit sampler (dedup by `compiler_input_hash`, seeded, stratified).
+- **D8 — population report + the 7-gate conjunctive evaluator + signed artifact.** Selected-candidate denominator (complete-only); per-dimension + per-cause; recipe-outcome + freshness distributions; the statistical-bound machinery (dedup, finite-population, sample-size); the machine-readable signed report + detached signature + verifier + nonzero exit; human-can't-override-a-failed-machine-gate.
 
-## 12. Task decomposition
+## 14. Mandatory tests (expanded per the review's "missing tests")
 
-- **D1 — migration 0997 + store contracts + writer/reader.** The two append-only tables; `RunOutcome`; `planner/shadow_store.py` (`write_run_result`/`write_plan_observations`/readers); append-only, deterministic.
-- **D2 — capture-integrity wiring into `run_shadow_planner`.** One `run_result` per eligible recipe (template_not_found → a row); plan observations per candidate; `persistence_partial` + `persistence_loss` on a write failure; behaviour-neutral (store write only when compiling; response untouched).
-- **D3 — replay-stamp enrichment + `ReplayFreshness` reader.** Extend `CatalogStateStampV1` (+fingerprint/checkpoint) + envelope bridge fingerprint; thread from the compile-time ctx onto the persisted stamp; the pure `replay_freshness(stored, conn)` reader (`unverifiable` never `current`).
-- **D4 — `ResolutionCause` taxonomy + cause-labelling.** The versioned map; `operationally_unmeasured` for an unmapped code; the labeller over the store.
-- **D5 — curated gold set + `contract_eval`.** `contract_gold.py` (versioned, hashed, adversarial shapes + expert `resolved`-validity assertions) + `evaluate()` (exact-match + false-resolve check) + the stratified-audit sampler.
-- **D6 — population report + the conjunctive gate + signed enablement report.** `shadow_report.py` (selected-candidate denominator; per-dimension + per-cause; recipe-outcome + freshness distributions); the stability-vs-freshness check; the 7-gate evaluator with the statistical bound; the artifact-integrity report.
-- **D7 — the two gating-note folds** (take_latest ordering column; AggregationFunction version-bump-invalidates-sign-off).
+Store round-trip + selected-only denominator; **pre-loop scope/context failure** (manifest exists, zero results → total-loss detected); **total store outage AND fallback-write failure** (independent loss signal fires); **partial candidate compilation** (`is_selected` excluded until `complete`); **real elapsed-time budget timeout** (monotonic clock, not count); **additivity / is_as_of / sensitivity change without watermark movement → `drifted`** (proves `compiler_input_fingerprint`, not `realization_fingerprint`); **unrelated projection checkpoint advancement → NOT drifted** (lag invariant); **out-of-scope bridge change → NOT drifted** (scope-filtered); **mixed producer versions → `incompatible`, cohort-separated**; **divergent duplicate write → validated conflict** (idempotency); **cause-map exhaustiveness over the registry** (unmapped code → `operationally_unmeasured`); **clustered/repeated-contract sampling deduped** (statistical unit = unique `compiler_input_hash`); **signed-report tampering → verification fails / nonzero exit**; gold-set exact-match + false-resolve; conjunctive gate (any sub-gate fails → gate fails; human can't override a failed machine gate); stability-vs-freshness (unchanged→identical id/verdict; drifted→same contract_id + `ReplayFreshness=drifted`); take_latest with/without a bound ordering column; behaviour-neutral (flag off → no store write, response byte-identical; full `tests/featuregen` green).
 
-## 13. Mandatory tests
-
-1. Store round-trip: a compiled run persists exactly one `run_result` per eligible recipe (incl. `template_not_found`, `no_authorized_catalog`, `internal_error`, `budget_exhausted`) + one observation per candidate; denominator = selected only.
-2. Capture integrity: a forced store-write failure → `persistence_partial` + `persistence_loss` incremented, never a silent drop; response unchanged.
-3. Stamp enrichment: a graph rebuild that does NOT move head_seq → `ReplayFreshness=drifted` (proves the fingerprint, not head_seq, is the guard); a bridge change → drifted; a missing stamp → `unverifiable` (never `current`).
-4. Cause-labelling: `safety_rejected`/topology → their legitimate causes (NOT classifier_defect); a reason code with no map entry → `operationally_unmeasured`.
-5. Gold set: exact-match verdict+cause on every case; an expert-"invalid" case classified `resolved` → gold FAILURE; a stratified audit samples stored resolved plans.
-6. Conjunctive gate: any single sub-gate failing → gate FAILS (no averaging); zero unknown/classifier_defect/operationally_unmeasured required; the statistical-bound sample-size math.
-7. Stability vs freshness: unchanged frozen input → identical physical_plan_id/contract_id/declaration_status/declaration-reasons; a drifted catalog → SAME contract_id but `ReplayFreshness=drifted` (NOT flagged as instability).
-8. take_latest ordering: `take_latest` with a bound ordering column → sound; without → undeclared/temporal reason.
-9. AggregationFunction extension bumps the rule version → prior sign-off invalidated (artifact-integrity check fails).
-10. Behaviour-neutral: flag off → no store write, response byte-identical; full `tests/featuregen` green.
-
-## 14. Phase boundaries
+## 15. Phase boundaries
 
 ```
-3B.3a  find source-grain ingredient candidates
-3B.3b  build governed physical source→target paths
-3B.3c  CLASSIFY each path as a complete contract (compute-only, honest-unresolved)
-3B.4   PERSIST + MEASURE + GATE — durable store, replay-freshness, cause-labelled population, curated gold set, conjunctive 3C enablement gate   ← this
-3C     ENFORCE (only after the gate passes) — live grounding + review UIs
-3D     aggregation/temporal AUTHORING surfaces (move recipes unresolved→resolved) + multi-grain/multi-branch
+3B.3a/b/c   find → build → CLASSIFY (compute-only, honest-unresolved)
+3B.4        PERSIST (manifest+run+plan, WORM) + fingerprint + replay-freshness + cause-label + gold set + conjunctive signed gate   ← this
+3C          ENFORCE — only after the signed gate passes; live grounding + review UIs
+3D          aggregation/temporal AUTHORING surfaces + multi-grain/multi-branch (move recipes unresolved→resolved)
 ```
