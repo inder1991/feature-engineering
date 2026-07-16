@@ -227,15 +227,19 @@ def touch_sync_last_import(conn: Any, sync_id: str, when: datetime) -> None:
 
 
 def record_import(conn: Any, *, sync: dict[str, Any], integration_id: str, snapshot_hash: str,
-                  approved_by: str, result: dict[str, Any]) -> str:
+                  approved_by: str, result: dict[str, Any],
+                  ingestion_run_id: str | None = None) -> str:
     """Persist one import's audit record: what ran (which sync/integration), under whose approval,
     with what outcome. The ingest events are attributed to the approving human (the sanctioned
     identity path — see api/routes/integrations.py); the record here names the connector as the
-    VEHICLE and carries the sync/integration ids as plain text so the history outlives them."""
+    VEHICLE and carries the sync/integration ids as plain text so the history outlives them.
+    ``ingestion_run_id`` links the run manifest (design #3): the run is opened BEFORE the pull, so
+    the import row points at the run — a failed pull has its run with no import row at all."""
     import_id = mint_id("omimp")
     conn.execute(
         "INSERT INTO integration_import (import_id, sync_id, integration_id, target_source, "
-        "snapshot_hash, approved_by, vehicle, result) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+        "snapshot_hash, approved_by, vehicle, result, ingestion_run_id) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
         (import_id, sync["sync_id"], integration_id, sync["target_source"], snapshot_hash,
-         approved_by, "openmetadata-connector", Jsonb(result)))
+         approved_by, "openmetadata-connector", Jsonb(result), ingestion_run_id))
     return import_id

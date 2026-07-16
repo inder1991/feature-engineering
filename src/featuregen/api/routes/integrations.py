@@ -55,7 +55,7 @@ from typing import Annotated, Any, Literal
 from urllib.parse import urlsplit
 
 import psycopg
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Response
 from pydantic import BaseModel, ConfigDict
 
 from featuregen.api.deps import (
@@ -82,6 +82,14 @@ from featuregen.connectors.openmetadata import (
 from featuregen.contracts.envelopes import IdentityEnvelope
 from featuregen.intake.llm import LLMClient
 from featuregen.overlay.upload.ingest import ingest_upload
+from featuregen.overlay.upload.ingestion_run import (
+    RUN_ID_HEADER,
+    _effective_config_snapshot,
+    open_run,
+    source_fingerprint,
+    terminalize_run,
+    terminalize_run_durable,
+)
 from featuregen.overlay.upload.read_scope import SENSITIVITY_ROLES
 
 router = APIRouter()
@@ -538,7 +546,8 @@ def preview_sync(sync_id: str, conn: _Conn, identity: _Identity) -> dict:
 
 
 @router.post("/syncs/{sync_id}/import", dependencies=[Depends(require_catalog_write)])
-def import_sync(sync_id: str, body: ImportIn, conn: _Conn, identity: _Identity,
+def import_sync(sync_id: str, body: ImportIn, response: Response, conn: _Conn,
+                identity: _Identity,
                 client: Annotated[LLMClient | None, Depends(get_llm_optional)]) -> dict:
     """Confirmed import: re-pull, re-translate, verify the previewed snapshot hash AND the local
     catalog baseline the previewed diff was computed against (#13 — an upload landing between
@@ -546,42 +555,82 @@ def import_sync(sync_id: str, body: ImportIn, conn: _Conn, identity: _Identity,
     UNCHANGED ingest pipeline in this request's one transaction. Suggestion is never ingestion:
     as-of hints from the preview are NOT applied here — rows carry blank semantics. Records
     integration_import for every attempt (audit), but stamps last_import_at ONLY when rows
-    actually landed (status 'ingested') — a brake-held / rejected attempt wrote nothing."""
+    actually landed (status 'ingested') — a brake-held / rejected attempt wrote nothing.
+
+    Design #3 (connector tier): every import attempt is an ingestion, so it opens a durable
+    ``ingestion_run`` BEFORE the pull — the dependency is REVERSED from integration_import (the
+    import row points at the run), so a pull/verify/ingest failure still has its queryable run
+    with no import row at all. The run id rides the ``X-Ingestion-Run-Id`` RESPONSE HEADER on
+    success and on every post-open error; the JSON body stays byte-for-byte unchanged."""
     sync, integ = _resolve_sync(conn, sync_id)
-    _, translation = _pull(sync, integ)
-    current_hash = snapshot_hash(translation.rows)
-    if current_hash != body.snapshot_hash:
-        raise HTTPException(
-            status_code=409,
-            detail="OpenMetadata changed since this preview (snapshot hash mismatch). "
-                   "Run preview again and approve the fresh dry run.")
-    if local_baseline_hash(conn, sync["target_source"]) != body.local_baseline_hash:
-        raise HTTPException(
-            status_code=409,
-            detail=f"the FeatureGen catalog for source '{sync['target_source']}' changed since "
-                   "this preview (local baseline mismatch). Run preview again and approve the "
-                   "fresh dry run.")
-    result = ingest_upload(conn, sync["target_source"], translation.rows,
-                           actor=identity, now=datetime.now(UTC), client=client)
-    import_id = store.record_import(
-        conn, sync=sync, integration_id=integ["integration_id"], snapshot_hash=current_hash,
-        approved_by=identity.subject, result=asdict(result))
-    pending = 0
-    if result.status == "ingested":
-        # Only a real ingest lands rows, so only 'ingested' advances last_import_at: stamping a
-        # brake-HELD / REJECTED attempt (which wrote nothing) would falsely claim a synced source.
-        # The attempt itself is still audited by record_import above.
-        store.touch_sync_last_import(conn, sync["sync_id"], datetime.now(UTC))
-        # Every OM row arrives semantics-blank — the translator never sets as-of/additivity/unit/
-        # currency/entity — so every row that WASN'T quarantined is semantics-pending. Derive that
-        # from the pipeline's own quarantine count rather than re-running validate_rows.
-        pending = len(translation.rows) - result.quarantined
-    return {
-        "result": asdict(result),
-        "import_id": import_id,
-        # Informational COUNT, not a queue (#25): landed OM columns await a data owner's semantics
-        # confirmation, but the import creates NO review records for them — claiming a "review
-        # queue" here would be dishonest. Quarantined rows (reported inside result) are the only
-        # items this import routes to a real review queue.
-        "semantics_pending": pending,
-    }
+    run_id = open_run(conn, origin_type="connector", catalog_source=sync["target_source"],
+                      filename=None, actor=identity,
+                      effective_config=_effective_config_snapshot(), now=datetime.now(UTC))
+    response.headers[RUN_ID_HEADER] = run_id   # the success response; error paths set it below
+    try:
+        _, translation = _pull(sync, integ)
+        current_hash = snapshot_hash(translation.rows)
+        if current_hash != body.snapshot_hash:
+            raise HTTPException(
+                status_code=409,
+                detail="OpenMetadata changed since this preview (snapshot hash mismatch). "
+                       "Run preview again and approve the fresh dry run.")
+        if local_baseline_hash(conn, sync["target_source"]) != body.local_baseline_hash:
+            raise HTTPException(
+                status_code=409,
+                detail=f"the FeatureGen catalog for source '{sync['target_source']}' changed "
+                       "since this preview (local baseline mismatch). Run preview again and "
+                       "approve the fresh dry run.")
+        pre_fingerprint, fingerprint_algo = source_fingerprint(conn, sync["target_source"])
+        result = ingest_upload(conn, sync["target_source"], translation.rows,
+                               actor=identity, now=datetime.now(UTC), client=client)
+        import_id = store.record_import(
+            conn, sync=sync, integration_id=integ["integration_id"], snapshot_hash=current_hash,
+            approved_by=identity.subject, result=asdict(result), ingestion_run_id=run_id)
+        pending = 0
+        if result.status == "ingested":
+            # Only a real ingest lands rows, so only 'ingested' advances last_import_at: stamping a
+            # brake-HELD / REJECTED attempt (which wrote nothing) would falsely claim a synced
+            # source. The attempt itself is still audited by record_import above.
+            store.touch_sync_last_import(conn, sync["sync_id"], datetime.now(UTC))
+            # Every OM row arrives semantics-blank — the translator never sets as-of/additivity/
+            # unit/currency/entity — so every row that WASN'T quarantined is semantics-pending.
+            # Derive that from the pipeline's own quarantine count, not a validate_rows re-run.
+            pending = len(translation.rows) - result.quarantined
+        # Terminalize ON THE REQUEST CONNECTION (like POST /uploads): the terminal status
+        # (IngestResult.status maps 1:1 onto the run vocabulary) commits atomically with the
+        # ingest it describes — 'ingested' can never be recorded for a tx that then fails.
+        post_fingerprint, _ = source_fingerprint(conn, sync["target_source"])
+        terminalize_run(conn, run_id, status=result.status, now=datetime.now(UTC),
+                        row_count=len(translation.rows), quarantined_count=result.quarantined,
+                        pre_fingerprint=pre_fingerprint, post_fingerprint=post_fingerprint,
+                        fingerprint_algo_version=fingerprint_algo)
+        return {
+            "result": asdict(result),
+            "import_id": import_id,
+            # Informational COUNT, not a queue (#25): landed OM columns await a data owner's
+            # semantics confirmation, but the import creates NO review records for them —
+            # claiming a "review queue" here would be dishonest. Quarantined rows (reported
+            # inside result) are the only items this import routes to a real review queue.
+            "semantics_pending": pending,
+        }
+    except HTTPException as exc:
+        # The request transaction is rolling back — terminalize on an independent connection so
+        # the failed attempt's manifest survives. A pull/verify/ingest exception is a FAILED
+        # attempt (there is no file to 'reject'). Redaction: record the exception CLASS (of the
+        # underlying cause when the HTTPException merely wraps one), never its message.
+        terminalize_run_durable(
+            run_id, status="failed", now=datetime.now(UTC),
+            redacted_failure_code=type(exc.__cause__ or exc).__name__,
+            reason_code=f"http_{exc.status_code}", fallback_conn=conn)
+        exc.headers = {**(exc.headers or {}), RUN_ID_HEADER: run_id}
+        raise
+    except Exception as exc:
+        # A raw fault (e.g. an ingest ConcurrencyError / DB error surfacing as a 500) keeps its
+        # existing behavior — re-raised unchanged, body untouched — but its run is terminalized
+        # durably first, so the attempt stays queryable even without the header.
+        terminalize_run_durable(
+            run_id, status="failed", now=datetime.now(UTC),
+            redacted_failure_code=type(exc).__name__,
+            reason_code="unhandled_exception", fallback_conn=conn)
+        raise

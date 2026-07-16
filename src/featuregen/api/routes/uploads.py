@@ -25,6 +25,7 @@ from featuregen.overlay.upload.glossary_reader import (
 )
 from featuregen.overlay.upload.ingest import IngestResult, ingest_upload
 from featuregen.overlay.upload.ingestion_run import (
+    RUN_ID_HEADER,
     _effective_config_snapshot,
     open_run,
     source_fingerprint,
@@ -42,7 +43,8 @@ logger = logging.getLogger(__name__)
 # Design #3: the run id rides a RESPONSE HEADER — on success and on every post-open error — so a
 # caller whose request failed can still fetch GET /ingestion-runs/{id}. A header, deliberately:
 # it does not change the JSON body, so the flag-off POST /uploads response stays byte-for-byte.
-_RUN_ID_HEADER = "X-Ingestion-Run-Id"
+# The name itself lives in ingestion_run.py (shared with the connector import route).
+_RUN_ID_HEADER = RUN_ID_HEADER
 
 # A catalog upload is a SCHEMA export (column names/types/grain), not a data extract, so a modest cap
 # bounds the whole-file in-memory read + parse against an accidental or malicious oversized upload.

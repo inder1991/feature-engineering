@@ -43,6 +43,12 @@ logger = logging.getLogger(__name__)
 
 FINGERPRINT_ALGO_VERSION = "gn-v1"
 
+# Design #3: the run id rides a RESPONSE HEADER — on success and on every post-open error — so a
+# caller whose request failed can still fetch GET /ingestion-runs/{id}. A header, deliberately: it
+# never changes a route's JSON body, keeping every ingestion response byte-for-byte. Defined here
+# (not per route) so the upload and connector routes can never drift apart on the name.
+RUN_ID_HEADER = "X-Ingestion-Run-Id"
+
 _TERMINAL_STATUSES = frozenset({"ingested", "held", "rejected", "failed", "abandoned"})
 
 _RUN_COLUMNS = (

@@ -635,6 +635,130 @@ def test_import_unknown_sync_404(client):
     assert _import(client, "sync_missing", "deadbeef").status_code == 404
 
 
+# ---- Ingestion-run manifest (connector origin, design #3) --------------------------------------
+
+RUN_HEADER = "X-Ingestion-Run-Id"
+
+
+def _get_run(client, run_id):
+    return client.get(f"/ingestion-runs/{run_id}", headers=VIEWER)
+
+
+def test_import_records_ingested_connector_run_linked_from_import_row(client, conn):
+    """A successful import leaves an 'ingested' connector-origin run, and integration_import points
+    AT the run (the run is created FIRST, before the pull — never the reverse)."""
+    _, sid = _configured_sync(client)
+    pv = _preview(client, sid).json()
+    res = _import(client, sid, pv["snapshot_hash"], pv["local_baseline_hash"])
+    assert res.status_code == 200
+    run_id = res.headers[RUN_HEADER]
+    assert run_id.startswith("ingrun_")
+
+    run = _get_run(client, run_id).json()
+    assert run["status"] == "ingested"
+    assert run["origin_type"] == "connector"
+    assert run["catalog_source"] == "cards"
+    assert run["filename"] is None                       # no file: the source is the OM pull
+    assert run["file_sha256"] is None
+    assert run["actor_subject"] == "user:o"              # the approving human, per the spec
+    assert run["row_count"] == 14
+    assert run["quarantined_count"] == 1
+    assert run["fingerprint_algo_version"] == "gn-v1"
+    # first import into an empty catalog: pre is the empty-graph hash, post the built graph
+    assert run["pre_source_fingerprint"] != run["post_source_fingerprint"]
+    assert run["completed_at"] is not None
+    assert [e["status"] for e in run["status_history"]] == ["in_progress", "ingested"]
+
+    assert conn.execute(
+        "SELECT ingestion_run_id FROM integration_import WHERE import_id = %s",
+        (res.json()["import_id"],)).fetchone()[0] == run_id
+
+
+def test_import_response_body_unchanged_run_id_rides_the_header_only(client):
+    """Compatibility: the import response BODY is byte-for-byte what it was before the manifest —
+    the run id rides the response header ONLY."""
+    _, sid = _configured_sync(client)
+    pv = _preview(client, sid).json()
+    res = _import(client, sid, pv["snapshot_hash"], pv["local_baseline_hash"])
+    assert set(res.json()) == {"result", "import_id", "semantics_pending"}
+    assert res.headers[RUN_HEADER] not in res.text
+
+
+def test_failed_pull_still_records_a_failed_run_with_no_import_row(client, conn, monkeypatch):
+    """The design's reversed dependency: a pull that dies BEFORE ingest gets no integration_import
+    row, but its run exists (durable 'failed'), retrievable via the header id."""
+    from featuregen.api.routes import integrations as routes
+    from featuregen.connectors.openmetadata import OMUnreachable
+
+    _, sid = _configured_sync(client)
+
+    def unreachable(base_url, token):
+        def fetch(path, params):
+            raise OMUnreachable("OpenMetadata unreachable: connect timeout")
+        return fetch
+
+    monkeypatch.setattr(routes, "_build_fetch", unreachable)
+    res = _import(client, sid, "deadbeef")
+    assert res.status_code == 502
+    run_id = res.headers[RUN_HEADER]
+
+    run = _get_run(client, run_id).json()
+    assert run["status"] == "failed"
+    assert run["origin_type"] == "connector"
+    assert run["redacted_failure_code"] == "OMUnreachable"   # the CLASS, never the message
+    assert "connect timeout" not in str(run)
+    assert [e["status"] for e in run["status_history"]] == ["in_progress", "failed"]
+    assert run["status_history"][-1]["reason_code"] == "http_502"
+    assert conn.execute("SELECT count(*) FROM integration_import").fetchone()[0] == 0
+
+
+def test_snapshot_mismatch_409_records_failed_run(client, monkeypatch):
+    from featuregen.api.routes import integrations as routes
+
+    _, sid = _configured_sync(client)
+    pv = _preview(client, sid).json()
+    page1, page2 = fixture_pages()
+    del page2["data"][0]["columns"][2]           # OM moves between preview and import
+    monkeypatch.setattr(routes, "_build_fetch",
+                        lambda base_url, token: fixture_fetch(page1, page2))
+
+    res = _import(client, sid, pv["snapshot_hash"], pv["local_baseline_hash"])
+    assert res.status_code == 409
+    run = _get_run(client, res.headers[RUN_HEADER]).json()
+    assert run["status"] == "failed"
+    assert run["status_history"][-1]["reason_code"] == "http_409"
+
+
+def test_held_import_records_held_run(client, conn):
+    """The run's terminal status mirrors ingest_upload's verdict: a brake-held import is 'held'."""
+    from tests.featuregen._helpers import make_actor
+
+    from featuregen.overlay.upload.canonical import CanonicalRow
+    from featuregen.overlay.upload.ingest import ingest_upload
+
+    actor = make_actor(subject="user:owner", roles=("data_owner",))
+    big = [CanonicalRow(source="cards", table=f"legacy_{t}", column=f"col_{c}", type="text")
+           for t in range(5) for c in range(5)]
+    assert ingest_upload(conn, "cards", big, actor=actor).status == "ingested"
+
+    _, sid = _configured_sync(client)
+    pv = _preview(client, sid).json()
+    res = _import(client, sid, pv["snapshot_hash"], pv["local_baseline_hash"])
+    assert res.json()["result"]["status"] == "held"
+    run = _get_run(client, res.headers[RUN_HEADER]).json()
+    assert run["status"] == "held"
+    assert run["row_count"] == 14
+    # nothing landed, so the source's graph state did not move around the run
+    assert run["pre_source_fingerprint"] == run["post_source_fingerprint"]
+
+
+def test_migration_0995_import_run_link_column_is_nullable(conn):
+    row = conn.execute(
+        "SELECT is_nullable, data_type FROM information_schema.columns "
+        "WHERE table_name = 'integration_import' AND column_name = 'ingestion_run_id'").fetchone()
+    assert row == ("YES", "text")
+
+
 def test_token_value_never_serialized_in_any_response(client):
     integ_res = _create_integration(client, headers=AUTH)
     iid = integ_res.json()["integration_id"]
