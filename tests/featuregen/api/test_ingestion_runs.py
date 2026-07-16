@@ -193,6 +193,49 @@ def test_raw_db_fault_records_failed_run_on_fresh_conn_and_500_carries_header(
                 c.execute("DELETE FROM ingestion_run WHERE id = %s", (run_id,))
 
 
+def test_post_route_commit_failure_500_still_carries_run_id_header(client, conn):
+    """FIX #4: ``get_conn`` COMMITS in dependency teardown, AFTER the route returned (function
+    scope — the commit must surface as a 500, never a silent 200). But a commit failure discards
+    the route's already-built response — and with it the ``response.headers`` run id — and the
+    raised psycopg error carries no ``exc.headers``, so the 500 used to arrive with NO
+    ``X-Ingestion-Run-Id``. The route now also stashes the id on ``request.state`` and the
+    app-level Exception handler (which builds this 500 and shares the request scope) stamps it,
+    so the caller can still fetch the run — which the reconciliation sweep will terminalize to
+    'abandoned' once its heartbeat lease expires (the request tx, including the route's own
+    terminalize, rolled back with the failed commit). Body stays byte-for-byte the default 500."""
+    from featuregen.api.deps import get_conn as get_conn_dep
+
+    def _commit_fails():
+        yield conn   # the route runs normally on the suite conn...
+        raise psycopg.OperationalError("simulated commit failure")   # ...teardown commit fails
+
+    client.app.dependency_overrides[get_conn_dep] = _commit_fails
+    with TestClient(client.app, raise_server_exceptions=False) as raw_client:
+        res = upload_csv(raw_client, "deposits", DEPOSITS_CSV)
+    assert res.status_code == 500
+    assert res.headers[RUN_HEADER].startswith("ingrun_")   # the id survives the lost response
+    assert res.text == "Internal Server Error"             # body-compat: header only
+
+
+def test_teardown_failure_without_a_run_gets_no_header(client, conn):
+    """The request.state fallback must never invent a header: a route that opened NO ingestion
+    run (here GET /ingestion-runs/{id} itself, which must SUCCEED so the teardown commit is
+    reached) failing in dependency teardown 500s WITHOUT an ``X-Ingestion-Run-Id``."""
+    from featuregen.api.deps import get_conn as get_conn_dep
+
+    run_id = upload_csv(client, "deposits", DEPOSITS_CSV).headers[RUN_HEADER]
+
+    def _commit_fails():
+        yield conn
+        raise psycopg.OperationalError("simulated commit failure")
+
+    client.app.dependency_overrides[get_conn_dep] = _commit_fails
+    with TestClient(client.app, raise_server_exceptions=False) as raw_client:
+        res = _get_run(raw_client, run_id)   # the route 200s; only the teardown commit fails
+    assert res.status_code == 500
+    assert RUN_HEADER not in res.headers
+
+
 # ── per-stage status (#22) rides the SAME run surface ─────────────────────────────────────────────
 
 

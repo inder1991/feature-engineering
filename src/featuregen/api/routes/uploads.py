@@ -9,7 +9,7 @@ from datetime import UTC, datetime
 from typing import Annotated
 
 import psycopg
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Response, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, Response, UploadFile
 
 from featuregen.api.deps import get_conn, get_identity, get_llm_optional, require_catalog_write
 from featuregen.contracts.envelopes import IdentityEnvelope
@@ -90,6 +90,7 @@ def _read_rows(
 def create_upload(
     file: Annotated[UploadFile, File(...)],
     source: Annotated[str, Form(...)],
+    request: Request,
     response: Response,
     conn: Annotated[psycopg.Connection, Depends(get_conn, scope="function")],
     identity: Annotated[IdentityEnvelope, Depends(get_identity)],
@@ -113,6 +114,11 @@ def create_upload(
                       effective_config=_effective_config_snapshot(), now=datetime.now(UTC),
                       authorization_decision="granted:catalog_write")
     response.headers[_RUN_ID_HEADER] = run_id   # the success response; error paths set it below
+    # FIX #4: the id ALSO rides request.state — get_conn's commit runs in dependency teardown,
+    # AFTER this route returns, and a commit failure discards the built response (header included)
+    # while raising a bare psycopg error with no exc.headers. The app-level Exception handler
+    # shares this request scope, so state is the one channel that survives every failure mode.
+    request.state.ingestion_run_id = run_id
     # Design #22: buffer an honest per-stage account (parse here; every ingest stage inside
     # ingest_upload) and flush it ALONGSIDE terminalize — never mid-request, never into the body.
     recorder = StageRecorder()

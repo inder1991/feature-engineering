@@ -100,9 +100,21 @@ def create_app(llm_client: LLMClient | None = None) -> FastAPI:
         adds ONLY the run-id header, only when the raising route attached one (any other
         ``headers`` shape, e.g. urllib's HTTPError.headers, is ignored). The middleware still
         re-raises the exception after the response is sent, so logging and test visibility are
-        unchanged."""
+        unchanged.
+
+        FIX #4 fallback: ``request.state.ingestion_run_id`` (stashed by the upload/connector
+        routes right after ``open_run``). A ``get_conn`` COMMIT failure happens in dependency
+        teardown, AFTER the route returned: the built response — run-id header included — is
+        discarded and the bare psycopg error carries no ``exc.headers``, so pre-fix the 500 lost
+        the run id entirely. A user middleware cannot stamp it either: it sits INSIDE Starlette's
+        ServerErrorMiddleware, which builds this 500 from THIS handler and sends it directly —
+        the error response never flows back through inner middleware. This handler shares the
+        request scope (and therefore ``request.state``), so it is the one seam that observes
+        every raw-fault path. Routes that opened no run leave state unset -> no header."""
         headers = getattr(exc, "headers", None)
         run_id = headers.get(RUN_ID_HEADER) if isinstance(headers, dict) else None
+        if not run_id:
+            run_id = getattr(request.state, "ingestion_run_id", None)
         return PlainTextResponse("Internal Server Error", status_code=500,
                                  headers={RUN_ID_HEADER: run_id} if run_id else None)
 

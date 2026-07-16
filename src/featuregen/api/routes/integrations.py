@@ -55,7 +55,7 @@ from typing import Annotated, Any, Literal
 from urllib.parse import urlsplit
 
 import psycopg
-from fastapi import APIRouter, Depends, HTTPException, Response
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel, ConfigDict
 
 from featuregen.api.deps import (
@@ -547,7 +547,7 @@ def preview_sync(sync_id: str, conn: _Conn, identity: _Identity) -> dict:
 
 
 @router.post("/syncs/{sync_id}/import", dependencies=[Depends(require_catalog_write)])
-def import_sync(sync_id: str, body: ImportIn, response: Response, conn: _Conn,
+def import_sync(sync_id: str, body: ImportIn, request: Request, response: Response, conn: _Conn,
                 identity: _Identity,
                 client: Annotated[LLMClient | None, Depends(get_llm_optional)]) -> dict:
     """Confirmed import: re-pull, re-translate, verify the previewed snapshot hash AND the local
@@ -571,6 +571,10 @@ def import_sync(sync_id: str, body: ImportIn, response: Response, conn: _Conn,
                       effective_config=_effective_config_snapshot(), now=datetime.now(UTC),
                       authorization_decision="granted:catalog_write")
     response.headers[RUN_ID_HEADER] = run_id   # the success response; error paths set it below
+    # FIX #4 (mirrors POST /uploads): the id ALSO rides request.state so a get_conn commit
+    # failure in dependency teardown — which discards this response, header included — still
+    # yields a 500 carrying the run id via the app-level Exception handler.
+    request.state.ingestion_run_id = run_id
     # Design #22: the connector's "parse" stage is the pull + translate (there is no file);
     # every ingest stage is recorded inside ingest_upload; the flush rides terminalize.
     recorder = StageRecorder()
