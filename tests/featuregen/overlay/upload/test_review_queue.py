@@ -136,6 +136,66 @@ def test_resolve_cannot_bypass_the_large_change_brake(db):
     assert list_quarantine(db, "deposits")            # refused rows stay queued for review
 
 
+def _quarantine_sensitivity_conflict_pair(db):
+    """Ingest one good row + a conflicting duplicate pair for accounts.ssn (one 'pii', one untagged).
+    validate_rows quarantines BOTH members fail-closed. Returns (untagged_idx, pii_idx)."""
+    _seal()
+    now = datetime(2026, 7, 5, tzinfo=UTC)
+    rows = [
+        CanonicalRow("deposits", "accounts", "id", "integer", is_grain=True),
+        CanonicalRow("deposits", "accounts", "ssn", "text", sensitivity="pii"),
+        CanonicalRow("deposits", "accounts", "ssn", "text"),   # untagged twin -> conflict pair
+    ]
+    res = ingest_upload(db, "deposits", rows, actor=_actor(), now=now)
+    assert res.status == "ingested" and res.quarantined == 2
+    q = list_quarantine(db, "deposits")
+    assert len(q) == 2 and all("conflicting" in item.reason for item in q)
+    untagged = next(i for i in q if not (i.raw.get("sensitivity") or "").strip())
+    pii = next(i for i in q if (i.raw.get("sensitivity") or "").strip() == "pii")
+    return untagged.row_index, pii.row_index
+
+
+def test_resolve_refuses_untagged_member_while_pii_sibling_is_quarantined(db):
+    # Round-3 #4: validate_rows quarantined BOTH members of the pii/untagged conflict pair so the
+    # untagged copy can't make a PII column world-readable — but resolving the untagged member ALONE
+    # re-validated it in isolation and graphed exactly that world-readable node. Fail closed: a
+    # resolution whose sensitivity sits below a still-quarantined sibling's tag must be refused.
+    untagged_idx, _pii_idx = _quarantine_sensitivity_conflict_pair(db)
+    resolved, reason = resolve_quarantine_row(db, "deposits", untagged_idx, {}, actor=_actor())
+    assert not resolved and "sensitivity" in reason
+    assert db.execute(   # no world-readable node was added for the PII column
+        "SELECT 1 FROM graph_node WHERE catalog_source = 'deposits' AND object_ref = %s",
+        ("public.accounts.ssn",)).fetchone() is None
+    assert len(list_quarantine(db, "deposits")) == 2       # both members stay queued
+
+
+def test_resolve_untagged_member_edited_to_the_sibling_tag_succeeds(db):
+    # Matching the quarantined sibling's tag is consistent (nothing is weakened) -> allowed.
+    untagged_idx, _pii_idx = _quarantine_sensitivity_conflict_pair(db)
+    resolved, reason = resolve_quarantine_row(db, "deposits", untagged_idx,
+                                              {"sensitivity": "pii"}, actor=_actor())
+    assert resolved and reason == ""
+    sens = db.execute(
+        "SELECT sensitivity FROM graph_node WHERE catalog_source = 'deposits' AND object_ref = %s",
+        ("public.accounts.ssn",)).fetchone()[0]
+    assert sens == "pii"                                    # the node carries the restrictive tag
+
+
+def test_resolve_pii_member_succeeds_and_sibling_then_hits_the_catalog_check(db):
+    # Resolving the MOST restrictive member first is safe (at-or-above every sibling); the leftover
+    # untagged twin is then refused by the existing already-in-the-catalog check, so it can never
+    # overwrite/weaken the pii node either.
+    untagged_idx, pii_idx = _quarantine_sensitivity_conflict_pair(db)
+    resolved, reason = resolve_quarantine_row(db, "deposits", pii_idx, {}, actor=_actor())
+    assert resolved and reason == ""
+    sens = db.execute(
+        "SELECT sensitivity FROM graph_node WHERE catalog_source = 'deposits' AND object_ref = %s",
+        ("public.accounts.ssn",)).fetchone()[0]
+    assert sens == "pii"
+    resolved2, reason2 = resolve_quarantine_row(db, "deposits", untagged_idx, {}, actor=_actor())
+    assert not resolved2 and "already" in reason2
+
+
 def test_dismiss_quarantine_row(db):
     idx = _quarantine_one_bad(db)
     assert dismiss_quarantine_row(db, "deposits", idx) is True

@@ -44,7 +44,7 @@ from featuregen.overlay.upload.graph import (
     parse_join_ref,
 )
 from featuregen.overlay.upload.join_drift import detect_governed_join_divergences
-from featuregen.overlay.upload.object_ref import normalize_ref, parse_ref
+from featuregen.overlay.upload.object_ref import _norm, normalize_ref, parse_ref
 from featuregen.overlay.upload.passc.projection import (
     list_approved_join_refs,
     project_confirmed_joins,
@@ -1085,6 +1085,33 @@ def resolve_quarantine_row(conn, catalog_source: str, row_index: int, edits: dic
     if conn.execute("SELECT 1 FROM graph_node WHERE catalog_source = %s AND object_ref = %s",
                     (catalog_source, c_ref)).fetchone() is not None:
         return False, f"{good.table}.{good.column} is already in the catalog"
+    # Round-3 #4: the whole-upload sensitivity-conflict invariant survives resolution. validate_rows
+    # quarantines BOTH members when one (table, column) appears with disagreeing metadata (a 'pii'
+    # copy + an untagged one) precisely so the untagged copy can't graph a world-readable node for a
+    # PII column — but re-validating the ONE edited row in isolation forgot those siblings, and
+    # resolving the untagged member alone re-opened exactly that leak. Mirror the validate_rows
+    # conflict key (the same `_norm` its dedup uses; `good` is already normalized) against the OTHER
+    # still-quarantined rows of this source, and refuse a resolution whose sensitivity fails to
+    # cover a sibling's declared tag: '' sits below every tag, and 'pii'/'restricted' are distinct
+    # read-scope role gates with no order between them, so ANY differing non-empty sibling tag
+    # refuses (fail-closed MOST_RESTRICTIVE — a resolve can never lower the column's effective
+    # sensitivity). Resolving the strictest member first still succeeds; the leftover siblings then
+    # hit the already-in-the-catalog refusal above, so they can never weaken the node either (the
+    # existing-node side of the invariant).
+    sibling_tags = sorted({
+        str(raw.get("sensitivity") or "").strip()
+        for (raw,) in conn.execute(
+            "SELECT raw FROM quarantine_row WHERE catalog_source = %s AND row_index <> %s",
+            (catalog_source, row_index)).fetchall()
+        if _norm(str(raw.get("table") or "")) == good.table
+        and _norm(str(raw.get("column") or "")) == good.column
+    } - {"", good.sensitivity})
+    if sibling_tags:
+        return False, (
+            f"sensitivity conflict: still-quarantined row(s) for {good.table}.{good.column} "
+            f"declare sensitivity {', '.join(repr(t) for t in sibling_tags)}; resolving this row "
+            f"as '{good.sensitivity or 'untagged'}' would weaken the column's effective "
+            "sensitivity — resolve the tagged row (or match its tag) instead")
     # #4: resolution is an INGESTION path, so it takes the same source-level large-change brake an
     # upload does. Cumulative: every object added by resolution since the last successful upload
     # (graph minus the drift snapshot) counts alongside this row's, so an all-quarantined
