@@ -162,6 +162,61 @@ def test_drift_skipped_when_projection_lags(db, monkeypatch):
     assert called == []               # detect_catalog_changes was NOT run (laundering avoided)
 
 
+def test_unrelated_backlog_beyond_drain_bound_defers_drift(db, monkeypatch):
+    # #21: the in-request drain is BOUNDED. A large GLOBAL backlog of UNRELATED projection work must
+    # not be drained to head inside this upload's transaction — the drain stops at the budget,
+    # projection_lag stays > 0, and the EXISTING lag guard defers drift (the tested skip path).
+    # The upload itself still ingests. Pre-fix the drain looped to head unconditionally, so drift
+    # ran and lag was 0 here.
+    from featuregen.overlay.upload import ingest as ingest_mod
+    from featuregen.overlay.upload.upload_catalog import ensure_upload_catalog_adapter
+    from featuregen.projections.runner import projection_lag
+    _seal_config()
+    now = datetime(2026, 7, 5, tzinfo=UTC)
+    # Seed an unprojected GLOBAL backlog from an UNRELATED source: 6 facts -> 12 overlay events.
+    ensure_upload_catalog_adapter()
+    for i in range(6):
+        ingest_mod._assert_fact(db, "other", f"t{i}", "grain",
+                                {"columns": ["id"], "is_unique": True}, actor=_actor())
+    monkeypatch.setattr(ingest_mod, "_DRAIN_MAX_EVENTS", 4, raising=False)   # budget < backlog
+    called: list[bool] = []
+    monkeypatch.setattr(ingest_mod, "detect_catalog_changes",
+                        lambda *a, **k: called.append(True) or [])
+    rows = [CanonicalRow("deposits", "accounts", "id", "integer", is_grain=True)]
+    res = ingest_upload(db, "deposits", rows, actor=_actor(), now=now)
+    assert res.status == "ingested"             # the upload still succeeds
+    assert called == []                         # drift NOT computed on a stale dependency index
+    assert res.changed_objects == 0             # nothing staled/advanced on stale state
+    assert projection_lag(db, "overlay") > 0    # the bound actually stopped short of head
+
+
+def test_small_upload_drains_fully_and_drift_runs(db):
+    # #21 guard: with the REAL default bound, a normal upload's own events still drain to head
+    # (lag == 0 after ingest) and drift runs on the next re-upload — the bound must never bite on
+    # the common case. If this fails after touching _DRAIN_MAX_EVENTS, the bound is too small.
+    from featuregen.projections.runner import projection_lag
+    _seal_config()
+    now = datetime(2026, 7, 5, tzinfo=UTC)
+    source = "deposits"
+    rows1 = [
+        CanonicalRow(source, "accounts", "id", "integer", is_grain=True),
+        CanonicalRow(source, "accounts", "posted_at", "timestamp", as_of=True),
+        CanonicalRow(source, "accounts", "balance", "numeric"),
+        CanonicalRow(source, "customers", "cust_id", "integer", is_grain=True),
+    ]
+    assert ingest_upload(db, source, rows1, actor=_actor(), now=now).status == "ingested"
+    assert projection_lag(db, "overlay") == 0   # own events fully drained (bound not hit)
+    rows2 = [
+        CanonicalRow(source, "accounts", "id", "integer", is_grain=True),
+        CanonicalRow(source, "accounts", "balance", "numeric"),
+        CanonicalRow(source, "customers", "cust_id", "integer", is_grain=True),
+    ]
+    res2 = ingest_upload(db, source, rows2, actor=_actor(), now=now)
+    assert res2.status == "ingested"
+    assert res2.changed_objects >= 1            # drift RAN and saw the drop (not lag-skipped)
+    assert projection_lag(db, "overlay") == 0   # caught up again after drift's own events
+
+
 def test_safety_metadata_change_is_drift(db):
     # A re-upload that reclassifies a column's SAFETY metadata (additive -> non_additive) is a
     # type_change, so its dependents get staled — a data_type-only fingerprint would miss it.

@@ -87,13 +87,32 @@ def pass_c_enabled() -> bool:
     return os.environ.get("OVERLAY_PASS_C", "0") == "1"
 
 
+# #21 — per-call ceiling on the events one _drain_projection call may process. The drain runs
+# INSIDE the upload's request transaction (the source advisory lock held throughout; the global-seq
+# lock once facts are asserted), and the projection backlog is GLOBAL — unbounded, upload latency
+# and lock hold time would scale with UNRELATED backlog, not this upload's size. 5000 (10 full
+# batches) comfortably covers a normal upload's OWN events (2 per (re)asserted table fact plus a
+# handful of governed-seam proposals — hundreds, not thousands), so the common case still reaches
+# head and drift runs; a larger unrelated backlog leaves projection_lag > 0 and every call site's
+# EXISTING lag guard then defers drift / re-projection to a later caught-up ingest (the background
+# worker drains too) — a spent budget degrades into an already-tested skip path, never a new one.
+_DRAIN_MAX_EVENTS = 5000
+
+
 def _drain_projection(conn) -> None:
-    """Run the overlay projection until caught up. A single run_projection caps at 500 events and an
-    upload emits 2 per (re)asserted fact, so one pass on a large upload leaves the dependency index
-    stale when detect_catalog_changes reads it (false stale / missed drop). Each pass advances the
-    checkpoint, so this terminates (a partial batch = caught up or poison-halted)."""
-    while run_projection(conn, OverlayProjection()) >= 500:
-        pass
+    """Run the overlay projection until caught up — or the #21 budget (_DRAIN_MAX_EVENTS) is spent.
+    A single run_projection caps at 500 events and an upload emits 2 per (re)asserted fact, so one
+    pass on a large upload leaves the dependency index stale when detect_catalog_changes reads it
+    (false stale / missed drop). Each pass advances the checkpoint, so this terminates (a partial
+    batch = caught up or poison-halted; a spent budget = stop early, the caller's projection_lag
+    guard takes over)."""
+    drained = 0
+    while drained < _DRAIN_MAX_EVENTS:
+        batch = min(500, _DRAIN_MAX_EVENTS - drained)
+        applied = run_projection(conn, OverlayProjection(), batch=batch)
+        drained += applied
+        if applied < batch:   # short batch: caught up (or poison-halted) — nothing more to drain
+            return
 
 
 @dataclass(frozen=True, slots=True)
@@ -788,9 +807,10 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
         if _assert_fact(conn, catalog_source, table, fact_type, value, actor=actor):
             asserted += 1
 
-    _drain_projection(conn)   # fully catch up BEFORE the diff reads the dependency index (>500-event uploads)
+    _drain_projection(conn)   # catch up (bounded, #21) BEFORE the diff reads the dependency index
     if projection_lag(conn, "overlay") > 0:
-        # The drain reached a poison-HALT, not head: the dependency index is stale, so drift would
+        # The drain stopped short of head (poison-HALT or the #21 budget): the dependency index is
+        # stale, so drift would
         # stale NOTHING for a just-dropped/changed column yet still advance the snapshot — laundering
         # the change for a full TTL. Skip drift this upload (same guard as the worker); it re-detects
         # once the projection catches up. The upload's facts still assert; the snapshot is NOT advanced.
@@ -961,7 +981,8 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
     # edge deleted (and a Pass-B-confirmed grain flag cleared) until the NEXT caught-up ingest of
     # the source — feature construction went dark on any re-upload that discovered a new candidate.
     # Draining on this conn (the project_verified_join drain-then-project pattern) brings the read
-    # model to head; the guards below now fire ONLY on a genuine poison-HALT, their real purpose.
+    # model to head; the guards below now fire ONLY on a genuine poison-HALT or a spent #21 drain
+    # budget (a huge unrelated global backlog), their real purpose.
     # Flag-off byte-for-byte safe: with the seams off nothing was appended since the line-749 drain,
     # so this pass processes zero events.
     _drain_projection(conn)
