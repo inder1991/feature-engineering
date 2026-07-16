@@ -29,11 +29,15 @@ from featuregen.overlay.upload.planner.contracts import (
     AggregationValidation,
     BindingPathSegmentV1,
     BindingPlanV1,
+    BindingSafety,
     CatalogStateStampV1,
+    ColumnRole,
     HopAggregationV1,
     IngredientAggregationV1,
     IngredientBindingV1,
     ParamBindingV1,
+    PhysicalColumnReadV1,
+    PhysicalReadSetV1,
     ReasonCode,
     SegmentKind,
     TemporalDeclarationV1,
@@ -41,6 +45,7 @@ from featuregen.overlay.upload.planner.contracts import (
     canonical_reason_codes,
     to_additivity_class,
 )
+from featuregen.overlay.upload.planner.safety import evaluate_column_safety
 from featuregen.overlay.upload.taxonomy.entity_relationships import (
     Cardinality,
     CatalogEntityRelationshipV1,
@@ -603,3 +608,88 @@ def check_composition(
         codes.append(ReasonCode.aggregation_composition_unsupported)
     reason_codes = canonical_reason_codes(codes)
     return CompositionResult(composable=len(reason_codes) == 0, reason_codes=reason_codes)
+
+
+# ─── C6: the physical-read set + reason-bearing universal safety ──────────────────────────────
+#
+# UNIVERSAL safety only (F13): leakage anchors + protected/special attributes — the concerns that
+# hold for EVERY caller, evaluated by safety.evaluate_column_safety (parity-locked to
+# _safe_to_bind). PII/read-scope is AUTHORIZATION, already enforced by the read-scoped column
+# load, and is never re-gated here. The read set inventories EVERY column the contract would
+# read — ingredients AND join/bridge keys AND temporal anchors — because a leakage anchor read
+# through a JOIN KEY leaks exactly as much as one read through an ingredient.
+
+# JoinRole values that make an ingredient's bound column a physical JOIN-KEY read.
+_KEY_JOIN_ROLES = frozenset(str(r) for r in (
+    JoinRole.SOURCE_ENTITY_KEY, JoinRole.TARGET_ENTITY_KEY, JoinRole.INTERMEDIATE_ENTITY_KEY))
+
+
+def safety_of_ref(ctx: CompilerContext, catalog_source: str,
+                  object_ref: str) -> tuple[BindingSafety, ReasonCode | None]:
+    """One physical ref's universal safety. A ref with no loaded ``_Col`` (a bare bridge/join key
+    the read-scoped column load never saw) is STRUCTURALLY ``not_evaluated`` +
+    ``safety_evaluation_incomplete`` — an honest evidence gap, NOT a safety violation, and never
+    silently safe. Pure over ``ctx`` — no connection."""
+    col = ctx.columns_by_catalog.get(catalog_source, {}).get(object_ref)
+    if col is None:
+        return BindingSafety.not_evaluated, ReasonCode.safety_evaluation_incomplete
+    return evaluate_column_safety(col)
+
+
+def build_physical_read_set(ctx: CompilerContext, plan: BindingPlanV1) -> PhysicalReadSetV1:
+    """The immutable inventory of every column the plan's contract would read, MULTI-ROLE: each
+    ingredient's bound column (+ ``join_key`` when its join_role is an entity-key role, +
+    ``temporal_anchor`` when it carries a real temporal role), each path realization's from/to
+    key (``join_key``), and each bridge segment's BOTH endpoint columns (``bridge_key``).
+    Duplicate ``(catalog, object_ref)`` reads merge into ONE ``PhysicalColumnReadV1`` with the
+    UNION of roles; per-column safety + reason from :func:`safety_of_ref`. A segment whose
+    realization/bridge ref the context cannot resolve contributes no reads — that plan already
+    fails C2 connectivity, fail-closed there. Deterministic: columns sorted by
+    ``(catalog_source, object_ref)``, roles value-sorted + deduped. Pure over ``ctx``."""
+    none_temporal = str(TemporalRole.NONE)
+    roles_of: dict[tuple[str, str], set[ColumnRole]] = {}
+
+    def _read(catalog: str, ref: str, role: ColumnRole) -> None:
+        roles_of.setdefault((catalog, ref), set()).add(role)
+
+    for b in plan.ingredient_bindings:
+        _read(b.bound_catalog_source, b.bound_object_ref, ColumnRole.ingredient)
+        if b.join_role in _KEY_JOIN_ROLES:
+            _read(b.bound_catalog_source, b.bound_object_ref, ColumnRole.join_key)
+        if b.temporal_role and b.temporal_role != none_temporal:
+            _read(b.bound_catalog_source, b.bound_object_ref, ColumnRole.temporal_anchor)
+    for seg in plan.path_segments:
+        if seg.realization_ref is not None:
+            r = next((x for x in ctx.realizations_by_catalog.get(seg.catalog_source, ())
+                      if x.realization_id == seg.realization_ref), None)
+            if r is not None:
+                _read(seg.catalog_source, r.from_key_ref, ColumnRole.join_key)
+                _read(seg.catalog_source, r.to_key_ref, ColumnRole.join_key)
+        elif seg.bridge_fact_key is not None:
+            br = next((x for x in ctx.active_bridges if x.fact_key == seg.bridge_fact_key), None)
+            if br is not None:
+                _read(br.left_catalog_source, br.left_object_ref, ColumnRole.bridge_key)
+                _read(br.right_catalog_source, br.right_object_ref, ColumnRole.bridge_key)
+
+    columns: list[PhysicalColumnReadV1] = []
+    for catalog, ref in sorted(roles_of):
+        safety, reason = safety_of_ref(ctx, catalog, ref)
+        columns.append(PhysicalColumnReadV1(
+            object_ref=ref, catalog_source=catalog,
+            roles=tuple(sorted(roles_of[(catalog, ref)])),
+            safety=safety, reason_codes=(reason,) if reason is not None else ()))
+    return PhysicalReadSetV1(columns=tuple(columns))
+
+
+def stage_safety(read_set: PhysicalReadSetV1) -> tuple[BindingSafety, tuple[ReasonCode, ...]]:
+    """Fold the per-column verdicts into ONE stage verdict: any ``unsafe`` column → ``unsafe``
+    with ALL unsafe columns' reason codes (canonical order); else any structural gap →
+    ``not_evaluated`` (incomplete evidence is NEVER safe); else ``safe``. The caller (C8) maps
+    unsafe → ``safety_rejected`` and not_evaluated → ``unresolved_safety_evaluation``."""
+    unsafe = [col for col in read_set.columns if col.safety is BindingSafety.unsafe]
+    if unsafe:
+        return BindingSafety.unsafe, canonical_reason_codes(
+            code for col in unsafe for code in col.reason_codes)
+    if any(col.safety is BindingSafety.not_evaluated for col in read_set.columns):
+        return BindingSafety.not_evaluated, (ReasonCode.safety_evaluation_incomplete,)
+    return BindingSafety.safe, ()

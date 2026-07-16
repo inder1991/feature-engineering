@@ -26,12 +26,15 @@ from featuregen.overlay.upload.planner.declarations import (
     CompileBudget,
     CompilerContext,
     PathPositionV1,
+    build_physical_read_set,
     check_composition,
     check_connectivity,
     compile_aggregation,
     compile_temporal,
     hop_physical_cardinality,
     resolve_additivity,
+    safety_of_ref,
+    stage_safety,
 )
 from featuregen.overlay.upload.taxonomy.entity_relationships import Cardinality
 from featuregen.overlay.upload.templates import Need, Template, _load_columns
@@ -69,23 +72,24 @@ def _txn_core(db):
     ])
 
 
-def _ctx(db, *catalogs: str,
+def _ctx(db, *catalogs: str, roles: tuple[str, ...] = (),
          agg: dict[tuple[str, str], c.AggregationFunction] | None = None) -> CompilerContext:
     """The C2 test constructor — batch-loads via the REAL loaders, then drops the connection.
     (The per-run production builder `build_compiler_context` is C8.) ``agg`` injects the declared
-    aggregation-function registry (F5) — EMPTY in production, populated only by tests."""
+    aggregation-function registry (F5) — EMPTY in production, populated only by tests. ``roles``
+    feeds the READ-SCOPED column load (C6: a pii column is loaded only for a pii_reader)."""
     return CompilerContext(
         realizations_by_catalog={
             s: derive_catalog_realizations(db, s).realizations for s in catalogs},
         active_bridges=active_bridges(db),
         columns_by_catalog={
-            s: {col.object_ref: col for col in _load_columns(db, s, ())} for s in catalogs},
+            s: {col.object_ref: col for col in _load_columns(db, s, roles)} for s in catalogs},
         catalog_fingerprint_at_start={s: realization_fingerprint(db, s) for s in catalogs},
         bridge_fingerprint_at_start="",
         catalog_stamps={
             s: c.CatalogStateStampV1(s, 0, _NOW.isoformat()) for s in catalogs},
         config=_overlay_config(),
-        roles=(),
+        roles=roles,
         now=_NOW,
         agg_declarations=agg or {})
 
@@ -1024,3 +1028,178 @@ def test_composition_last_hop_stage_flows_nowhere_and_broken_chains_fail_closed(
                 table="public.customers", key="public.customers.customer_id"),
     )
     assert check_composition(gap, c.AdditivityClass.additive).composable is False
+
+
+# ─── C6: physical-read set + reason-bearing universal safety ──────────────────────────────────
+# The read set inventories EVERY column the contract would read — ingredients AND join/bridge
+# keys AND temporal anchors — because a leakage anchor read through a JOIN KEY leaks exactly as
+# much as one read through an ingredient. UNIVERSAL safety only (F13): leakage anchors +
+# protected/special attributes; PII/read-scope is authorization and is never re-gated here.
+# Structural not_evaluated (no loaded _Col) is an honest gap, NEVER silently safe.
+
+def _c6_core(db):
+    """core: accounts (account grain) rolls up N:1 to customers — plus a leakage-anchor outcome
+    column (defaulted), an ECOA protected attribute (gender), a pii-scoped contact column
+    (email — visible only to a pii_reader), and an as-of date."""
+    _seed(db, "core", [
+        (CanonicalRow("core", "accounts", "account_id", "integer", is_grain=True), "account_id"),
+        (CanonicalRow("core", "accounts", "customer_id", "integer",
+                      joins_to="customers.customer_id", cardinality="N:1"), "customer_id"),
+        (CanonicalRow("core", "accounts", "balance", "numeric"), "monetary_stock"),
+        (CanonicalRow("core", "accounts", "as_of_date", "date"), "as_of_date"),
+        (CanonicalRow("core", "accounts", "defaulted", "text"), "default_flag"),
+        (CanonicalRow("core", "accounts", "gender", "text"), "protected_attribute"),
+        (CanonicalRow("core", "accounts", "email", "text", sensitivity="pii"), "pii"),
+        (CanonicalRow("core", "customers", "customer_id", "integer", is_grain=True), "customer_id"),
+    ])
+
+
+def _c6_plan(ctx, *extra_bindings, realization_id=None):
+    """A source-key-anchored account→customer roll-up plan over _c6_core's one realization."""
+    (r,) = ctx.realizations_by_catalog["core"]
+    return _plan(
+        bindings=(_binding("source_key", "public.accounts.customer_id",
+                           join_role=str(JoinRole.SOURCE_ENTITY_KEY), concept="customer_id"),
+                  *extra_bindings),
+        segments=_rollup_segments(realization_id or r.realization_id,
+                                  from_entity="account", to_entity="customer"))
+
+
+def _by_ref(read_set):
+    return {(col.catalog_source, col.object_ref): col for col in read_set.columns}
+
+
+def test_read_set_merges_roles_and_covers_keys_and_anchors(db):
+    _c6_core(db)
+    ctx = _ctx(db, "core")
+    plan = _c6_plan(
+        ctx,
+        _binding("balance", "public.accounts.balance", concept="monetary_stock"),
+        _binding("asof", "public.accounts.as_of_date", join_role=str(JoinRole.TIME),
+                 concept="as_of_date", temporal=str(TemporalRole.AS_OF_TIME)))
+    rs = build_physical_read_set(ctx, plan)
+    by_ref = _by_ref(rs)
+    # the source-key column is BOTH an ingredient and the realization's from-key: merged into
+    # ONE PhysicalColumnReadV1 with the UNION of roles
+    assert by_ref[("core", "public.accounts.customer_id")].roles == (
+        c.ColumnRole.ingredient, c.ColumnRole.join_key)
+    # the realization's to-key is a PURE join key — no ingredient binds it on this plan
+    assert by_ref[("core", "public.customers.customer_id")].roles == (c.ColumnRole.join_key,)
+    # the TIME ingredient carries its real temporal role as a second role
+    assert by_ref[("core", "public.accounts.as_of_date")].roles == (
+        c.ColumnRole.ingredient, c.ColumnRole.temporal_anchor)
+    assert by_ref[("core", "public.accounts.balance")].roles == (c.ColumnRole.ingredient,)
+    # deterministic: exactly the four reads, sorted by (catalog_source, object_ref)
+    assert [(col.catalog_source, col.object_ref) for col in rs.columns] == [
+        ("core", "public.accounts.as_of_date"), ("core", "public.accounts.balance"),
+        ("core", "public.accounts.customer_id"), ("core", "public.customers.customer_id")]
+    assert all(col.safety is c.BindingSafety.safe and col.reason_codes == ()
+               for col in rs.columns)
+    assert stage_safety(rs) == (c.BindingSafety.safe, ())
+
+
+def test_leakage_anchor_join_key_is_unsafe_with_reason(db):
+    # the realization's from-key repointed (dataclasses.replace, like the C4 cardinality test) at
+    # the leakage-anchor outcome column: it is read as a JOIN KEY only — never an ingredient —
+    # and the universal-safety stage still refuses the read (NON-ingredient coverage).
+    _c6_core(db)
+    ctx = _ctx(db, "core")
+    (r,) = ctx.realizations_by_catalog["core"]
+    r_leak = dataclasses.replace(r, from_key_ref="public.accounts.defaulted")
+    ctx = dataclasses.replace(ctx, realizations_by_catalog={"core": (r_leak,)})
+    plan = _c6_plan(ctx, _binding("balance", "public.accounts.balance", concept="monetary_stock"))
+    rs = build_physical_read_set(ctx, plan)
+    leak = _by_ref(rs)[("core", "public.accounts.defaulted")]
+    assert leak.roles == (c.ColumnRole.join_key,)
+    assert leak.safety is c.BindingSafety.unsafe
+    assert leak.reason_codes == (c.ReasonCode.leakage_anchor_read,)
+    assert stage_safety(rs) == (c.BindingSafety.unsafe, (c.ReasonCode.leakage_anchor_read,))
+
+
+def test_protected_attribute_ingredient_is_unsafe_with_reason(db):
+    _c6_core(db)
+    ctx = _ctx(db, "core")
+    plan = _c6_plan(ctx, _binding("attr", "public.accounts.gender",
+                                  concept="protected_attribute"))
+    rs = build_physical_read_set(ctx, plan)
+    attr = _by_ref(rs)[("core", "public.accounts.gender")]
+    assert attr.roles == (c.ColumnRole.ingredient,)
+    assert attr.safety is c.BindingSafety.unsafe
+    assert attr.reason_codes == (c.ReasonCode.protected_attribute_read,)
+    assert stage_safety(rs) == (c.BindingSafety.unsafe,
+                                (c.ReasonCode.protected_attribute_read,))
+
+
+def test_bridge_key_without_loaded_col_is_structurally_not_evaluated(db):
+    # crm is deliberately NOT loaded into the context: the bridge's far endpoint is a bare key
+    # with no _Col — a STRUCTURAL gap (safety_evaluation_incomplete), not a safety violation,
+    # and the fold refuses to claim safety over it.
+    _bridge_core_crm(db)
+    ctx = _ctx(db, "core")
+    assert safety_of_ref(ctx, "crm", "public.customers.customer_id") == (
+        c.BindingSafety.not_evaluated, c.ReasonCode.safety_evaluation_incomplete)
+    plan = _plan(
+        bindings=(
+            _binding("source_key", "public.accounts.customer_id",
+                     join_role=str(JoinRole.SOURCE_ENTITY_KEY), concept="customer_id"),
+            _binding("balance", "public.accounts.balance", concept="monetary_stock"),
+        ),
+        segments=(
+            c.BindingPathSegmentV1(c.SegmentKind.semantic_rollup, "core",
+                                   from_entity="account", to_entity="customer",
+                                   cardinality="many_to_one"),
+            c.BindingPathSegmentV1(c.SegmentKind.governed_bridge, "crm",
+                                   from_entity="account", to_entity="customer",
+                                   bridge_fact_key="bridge:customer:c4"),
+        ))
+    rs = build_physical_read_set(ctx, plan)
+    by_ref = _by_ref(rs)
+    far = by_ref[("crm", "public.customers.customer_id")]
+    assert far.roles == (c.ColumnRole.bridge_key,)
+    assert far.safety is c.BindingSafety.not_evaluated
+    assert far.reason_codes == (c.ReasonCode.safety_evaluation_incomplete,)
+    # the NEAR endpoint is loaded: bridge key + source-key ingredient, evaluated safe
+    near = by_ref[("core", "public.accounts.customer_id")]
+    assert near.roles == (c.ColumnRole.bridge_key, c.ColumnRole.ingredient, c.ColumnRole.join_key)
+    assert near.safety is c.BindingSafety.safe
+    assert stage_safety(rs) == (c.BindingSafety.not_evaluated,
+                                (c.ReasonCode.safety_evaluation_incomplete,))
+
+
+def test_pii_column_visible_under_read_scope_is_not_unsafe(db):
+    # universal-safety ≠ authorization (F13): a pii column the caller is AUTHORIZED to read
+    # (read scope loaded it for a pii_reader) is NOT a universal-safety violation — only
+    # leakage anchors and protected/special attributes are.
+    _c6_core(db)
+    ctx = _ctx(db, "core", roles=("pii_reader",))
+    assert "public.accounts.email" in ctx.columns_by_catalog["core"]
+    plan = _c6_plan(ctx, _binding("contact", "public.accounts.email", concept="pii"))
+    rs = build_physical_read_set(ctx, plan)
+    email = _by_ref(rs)[("core", "public.accounts.email")]
+    assert email.safety is c.BindingSafety.safe and email.reason_codes == ()
+    assert stage_safety(rs) == (c.BindingSafety.safe, ())
+
+
+def _read(ref, safety, codes=()):
+    return c.PhysicalColumnReadV1(object_ref=ref, catalog_source="core",
+                                  roles=(c.ColumnRole.ingredient,), safety=safety,
+                                  reason_codes=tuple(codes))
+
+
+def test_stage_safety_fold_matrix():
+    safe = _read("public.t.a", c.BindingSafety.safe)
+    gap = _read("public.t.b", c.BindingSafety.not_evaluated,
+                (c.ReasonCode.safety_evaluation_incomplete,))
+    leak = _read("public.t.c", c.BindingSafety.unsafe, (c.ReasonCode.leakage_anchor_read,))
+    prot = _read("public.t.d", c.BindingSafety.unsafe, (c.ReasonCode.protected_attribute_read,))
+    # any unsafe wins — over a structural gap too; ALL unsafe columns' reasons carried, in
+    # canonical (enum-definition) order regardless of column order
+    assert stage_safety(c.PhysicalReadSetV1((safe, prot, gap, leak))) == (
+        c.BindingSafety.unsafe,
+        (c.ReasonCode.leakage_anchor_read, c.ReasonCode.protected_attribute_read))
+    # no unsafe + any structural gap → not_evaluated (incomplete evidence is NEVER safe)
+    assert stage_safety(c.PhysicalReadSetV1((safe, gap))) == (
+        c.BindingSafety.not_evaluated, (c.ReasonCode.safety_evaluation_incomplete,))
+    # all safe → safe; the empty read set is vacuously safe
+    assert stage_safety(c.PhysicalReadSetV1((safe,))) == (c.BindingSafety.safe, ())
+    assert stage_safety(c.PhysicalReadSetV1(())) == (c.BindingSafety.safe, ())
