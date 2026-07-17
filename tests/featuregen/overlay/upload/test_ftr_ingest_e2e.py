@@ -28,6 +28,7 @@ from featuregen.overlay.upload.ingest import ingest_upload
 _SOURCE = "ftr"
 _COL_REF = "public.comp_fin_tran.cust_name"
 _TABLE_REF = "public.comp_fin_tran"
+_TABLE_LREF = "ftr::dpl_eib_compliance.comp_fin_tran"   # schema-preserving evidence key
 
 NOW = datetime(2026, 7, 17, tzinfo=UTC)
 
@@ -87,3 +88,47 @@ def test_cross_schema_upload_is_held(db):
     # Fail-closed BEFORE any side effect: the original attribution survives untouched — the node
     # still exists with its original schema_name, proving no delete/rebuild ran.
     assert _node(db, _COL_REF, "schema_name") == ("DPL_EIB_COMPLIANCE",)
+
+
+def test_table_term_reaches_table_node_via_evidence(db):
+    """Task 6 (round-4 #5): the ONE table-level term reaches the TABLE node through the SAME
+    governed source-evidence + resolve_and_project path columns use — never a direct UPDATE.
+    ``build_graph`` inserts the table node with ``definition = NULL``; only the projection of the
+    resolved evidence may fill it."""
+    _seal()
+    assert _ingest(db, _FTR_CSV).status == "ingested"
+
+    row = db.execute(
+        "SELECT definition, domain, definition_decision_id FROM graph_node "
+        "WHERE catalog_source = %s AND object_ref = %s AND kind = 'table'",
+        (_SOURCE, _TABLE_REF)).fetchone()
+    assert row is not None
+    definition, domain, definition_decision_id = row
+    assert definition is not None
+    assert "compliance transaction repository" in definition.lower()
+    assert (domain or "").lower() == "compliance"
+    # The projection recorded a field DECISION and linked it (display != authority) — proof the
+    # value came from resolve_and_project, not a write straight onto the node.
+    assert definition_decision_id is not None
+
+    # And the SOURCE evidence rows live at the schema-preserving TABLE logical_ref — proof the
+    # term flowed through the evidence store.
+    fields = {r[0] for r in db.execute(
+        "SELECT field_name FROM field_evidence WHERE logical_ref = %s AND lifecycle = 'active'",
+        (_TABLE_LREF,)).fetchall()}
+    assert {"business_term", "definition", "domain"} <= fields
+
+
+def test_table_term_schema_disagreement_skips_table_evidence(db):
+    """Round-4 #5 tail: a table term whose declared schema disagrees with its columns' is SKIPPED
+    (the columns are authoritative for the schema) — no evidence attached, node left NULL."""
+    _seal()
+    disagreeing = _FTR_CSV.replace("DPL_EIB_COMPLIANCE.COMP_FIN_TRAN,Financial",
+                                   "OTHER_SCHEMA.COMP_FIN_TRAN,Financial")
+    assert disagreeing != _FTR_CSV                     # the table row really was rewritten
+    assert _ingest(db, disagreeing).status == "ingested"
+
+    assert _node(db, _TABLE_REF, "definition") == (None,)
+    assert db.execute(
+        "SELECT count(*) FROM field_evidence WHERE logical_ref = %s",
+        ("ftr::other_schema.comp_fin_tran",)).fetchone() == (0,)

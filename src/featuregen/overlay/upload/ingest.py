@@ -648,8 +648,9 @@ def _stale_absent_fields(
 def _write_glossary_source_evidence(
     conn, *, logical_ref: str, rec: GlossaryRecord, snapshot_id: str
 ) -> bool:
-    """Write SOURCE evidence for a glossary column at the profile's per-field strength (definition +
-    bian/fibo/term ATTESTED, domain PROPOSED). Returns whether the column's MATERIAL changed vs the
+    """Write SOURCE evidence for a glossary term (column or table ``logical_ref``) at the profile's
+    per-field strength (definition + bian/fibo/term ATTESTED, domain PROPOSED). Returns whether the
+    term's MATERIAL changed vs the
     prior upload — a material field whose prior source proposal was staled EITHER because its value
     changed (present->present) OR because the new upload dropped it entirely (present->absent)."""
     material_changed = False
@@ -769,6 +770,13 @@ def _ingest_glossary_evidence(conn, *, source: str, rows: list[CanonicalRow],
     contained; the upload's FACTS (already asserted) and raw graph are never rolled back. LLM concept
     evidence is written INSIDE ``enrich_concepts`` (Task 6); this never re-writes it.
 
+    TABLE-level terms (round-4 #5) take a dedicated pass after the column loop: a 2-part record has
+    no ``CanonicalRow`` and no ``classify_upload`` binding, so its SOURCE evidence is written at the
+    schema-preserving TABLE ref and the ref joins the same ``resolve_and_project`` set — the
+    projection (``_graph_key`` maps a column-less ref to the ``public.<table>`` node) is the ONLY
+    thing that fills the table node's definition/domain, never a direct UPDATE. A table term whose
+    schema disagrees with its columns' is skipped (the columns are authoritative — #5 tail).
+
     Returns the number of CONTAINED failures (per-column evidence/revalidation writes + the
     resolve/project pass; not the log-only readiness diagnostic) so the caller's stage report can
     say ``partial`` instead of laundering them under an outer success (#22)."""
@@ -832,6 +840,56 @@ def _ingest_glossary_evidence(conn, *, source: str, rows: list[CanonicalRow],
                 logger.warning("advisory revalidation flag failed for %s", logical_ref,
                                exc_info=True)
         attachable_refs.append(logical_ref)
+
+    # Dedicated TABLE-term pass (see docstring): mirror the column loop's savepointed, fail-soft
+    # shape — SOURCE evidence + revalidation-on-material-change, then membership in the resolve set.
+    column_schemas: dict[str, set[str]] = {}   # normalized table -> its column records' schemas
+    for rec in glossary.records:
+        if rec.is_table:
+            continue
+        try:
+            _rec_source, schema, table, column = parse_ref(rec.logical_ref)
+        except ValueError:
+            continue
+        if column is not None:
+            column_schemas.setdefault(table, set()).add(schema)
+    for rec in glossary.records:
+        if not rec.is_table:
+            continue
+        try:
+            _rec_source, schema, table, column = parse_ref(rec.logical_ref)
+        except ValueError:
+            continue
+        if column is not None:
+            continue
+        declared = column_schemas.get(table)
+        if declared and declared != {schema}:
+            # #5 tail: the columns are authoritative for the schema — attaching the table term's
+            # evidence under a disagreeing identity would split one physical table across two refs.
+            logger.warning(
+                "glossary table term %s declares schema %r but its columns declare %s — columns "
+                "are authoritative; table evidence skipped", rec.logical_ref, schema,
+                sorted(declared))
+            continue
+        material_changed = False
+        try:
+            with conn.transaction():
+                material_changed = _write_glossary_source_evidence(
+                    conn, logical_ref=rec.logical_ref, rec=rec, snapshot_id=snapshot_id)
+        except Exception:  # noqa: BLE001 — evidence-write failure: warn + continue (facts intact)
+            contained_failures += 1
+            logger.warning("advisory glossary SOURCE evidence failed for %s", rec.logical_ref,
+                           exc_info=True)
+        if material_changed:
+            try:
+                with conn.transaction():
+                    _flag_human_confirmed_revalidation(
+                        conn, logical_ref=rec.logical_ref, snapshot_id=snapshot_id, now=now)
+            except Exception:  # noqa: BLE001
+                contained_failures += 1
+                logger.warning("advisory revalidation flag failed for %s", rec.logical_ref,
+                               exc_info=True)
+        attachable_refs.append(rec.logical_ref)
 
     if not attachable_refs:
         return contained_failures
