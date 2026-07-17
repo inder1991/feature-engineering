@@ -20,26 +20,43 @@ def test_classifies_and_caches(db):
     assert cached[content_hash(rows[0])] == "monetary_amount"
 
 
-def test_unknown_concept_falls_back_to_unclassified(db):
+def test_off_vocab_concept_is_rejected_not_resolved_single_mode(db):
+    """#5: single mode must enforce the SAME response contract as batch — an off-vocabulary/invalid
+    concept response is NOT accepted, NOT coerced to 'unclassified', and NOT counted resolved (it is
+    simply absent from the returned dict), exactly like batch's `_accept_concept`/`validate_batch_results`
+    treats an INVALID batch entry. A stage report computed from `len(out)` must not be able to see
+    "all N items resolved" when every provider response was garbage."""
     rows = [CanonicalRow("deposits", "accounts", "weird", "text")]
+    h = content_hash(rows[0])
     client = FakeLLM(script={_TASK: FakeResponse(output={"concept": "totally_made_up"})})
     out = enrich_concepts(db, rows, client)
-    assert out[content_hash(rows[0])] == "unclassified"
+    assert h not in out                                          # NOT resolved — mirrors batch INVALID
+    assert db.execute("SELECT count(*) FROM enrichment_concept").fetchone()[0] == 0  # NOT cached
 
 
-def test_unknown_concept_is_not_cached_and_retries_next_run(db):
-    """#22: single mode coerces an UNKNOWN/off-vocabulary concept to 'unclassified' for THIS run,
-    but must not cache the coercion — a transient bad response would poison the cache permanently
-    (batch mode already rejects unknowns for retry). A later run re-attempts and a now-valid
-    response is cached."""
+def test_off_vocab_concept_is_not_cached_and_retries_next_run(db):
+    """#5/#22: a transient off-vocabulary response must not poison the cache — a later run re-attempts
+    and a now-valid response resolves and caches normally."""
     rows = [CanonicalRow("deposits", "accounts", "weird", "text")]
     h = content_hash(rows[0])
     bad = FakeLLM(script={_TASK: FakeResponse(output={"concept": "totally_made_up"})})
-    assert enrich_concepts(db, rows, bad)[h] == "unclassified"   # this-run coercion kept
+    assert h not in enrich_concepts(db, rows, bad)
     assert db.execute("SELECT count(*) FROM enrichment_concept").fetchone()[0] == 0  # NOT cached
     # Next run re-attempts (no poisoned cache hit) and the valid classification sticks.
     ok = FakeLLM(script={_TASK: FakeResponse(output={"concept": "monetary_stock"})})
     assert enrich_concepts(db, rows, ok)[h] == "monetary_stock"
+    cached = enrich_concepts(db, rows, _NeverCalledLLM())
+    assert cached[h] == "monetary_stock"
+
+
+def test_valid_concept_still_resolves_single_mode(db):
+    """#5 counterpart: a valid (in-vocabulary) single-mode response is still accepted, cached, and
+    counted resolved exactly as before — only the off-vocab path changed."""
+    rows = [CanonicalRow("deposits", "accounts", "balance", "numeric")]
+    h = content_hash(rows[0])
+    client = FakeLLM(script={_TASK: FakeResponse(output={"concept": "monetary_stock"})})
+    out = enrich_concepts(db, rows, client)
+    assert out[h] == "monetary_stock"
     cached = enrich_concepts(db, rows, _NeverCalledLLM())
     assert cached[h] == "monetary_stock"
 
@@ -247,6 +264,60 @@ def test_corrected_glossary_metadata_misses_the_stale_concept_cache(db):
     second = FakeLLM(script={_TASK: FakeResponse(output={"concept": "account_identifier"})})
     out2 = enrich_concepts(db, [row], second, glossary=_glossary("timestamp"))
     assert out2[h] == "account_identifier"                 # the fresh classification, keyed for downstream
+
+
+# ── #6: a cache HIT must (idempotently) repair concept evidence a prior write failed to create ──
+
+def test_cache_hit_repairs_missing_concept_evidence(db, monkeypatch):
+    """#6: if the FIRST run's concept field_evidence write failed (contained, fail-soft — see
+    `test_evidence_write_failure_is_fail_soft` in test_pass_a_evidence.py), the classification is
+    still cached and `graph_node.concept` still gets populated downstream, but with NO supporting
+    field_evidence. A prior version of `enrich_concepts` never revisited a cache HIT, so that gap
+    was permanent. The SECOND run — a genuine cache HIT (the LLM is never called) — must WRITE the
+    missing evidence."""
+    import featuregen.overlay.upload.enrich as enrich_mod
+    from featuregen.overlay.field_evidence import read_active_field_evidence
+    from featuregen.overlay.upload.glossary_reader import GlossaryUpload
+
+    row = CanonicalRow("ftr", "comp_fin_tran", "txn_ts", "unknown")
+    rec = _rec()
+    glossary = GlossaryUpload(rows=[row], records=[rec])
+
+    def _boom(*a, **k):
+        raise RuntimeError("field_evidence store unavailable")
+
+    monkeypatch.setattr(enrich_mod, "record_field_evidence", _boom)
+    first = FakeLLM(script={_TASK: FakeResponse(output={"concept": "monetary_stock"})})
+    out = enrich_concepts(db, [row], first, glossary=glossary, source_snapshot_id="snap-1")
+    assert out[content_hash(row)] == "monetary_stock"                    # enrichment survives (fail-soft)
+    assert read_active_field_evidence(db, rec.logical_ref, "concept") == []  # evidence write FAILED
+
+    monkeypatch.undo()   # restore the real record_field_evidence for the repair run
+    hit = enrich_concepts(db, [row], _NeverCalledLLM(), glossary=glossary, source_snapshot_id="snap-1")
+    assert hit[content_hash(row)] == "monetary_stock"                    # a genuine cache HIT (no LLM call)
+    ev = read_active_field_evidence(db, rec.logical_ref, "concept")
+    assert len(ev) == 1 and ev[0].proposed_value == "monetary_stock"     # the HIT repaired the evidence
+
+
+def test_cache_hit_evidence_write_is_idempotent(db):
+    """#6 idempotency: repeated cache-hit runs never duplicate the concept evidence row — the
+    input_hash reuse check makes re-writing an already-present, unchanged proposal a safe no-op."""
+    from featuregen.overlay.field_evidence import read_active_field_evidence
+    from featuregen.overlay.upload.glossary_reader import GlossaryUpload
+
+    row = CanonicalRow("ftr", "comp_fin_tran", "txn_ts", "unknown")
+    rec = _rec()
+    glossary = GlossaryUpload(rows=[row], records=[rec])
+
+    first = FakeLLM(script={_TASK: FakeResponse(output={"concept": "monetary_stock"})})
+    enrich_concepts(db, [row], first, glossary=glossary, source_snapshot_id="snap-1")
+    assert len(read_active_field_evidence(db, rec.logical_ref, "concept")) == 1
+
+    # Two more cache-hit runs (LLM never called) must not add a second active row.
+    enrich_concepts(db, [row], _NeverCalledLLM(), glossary=glossary, source_snapshot_id="snap-1")
+    enrich_concepts(db, [row], _NeverCalledLLM(), glossary=glossary, source_snapshot_id="snap-1")
+    ev = read_active_field_evidence(db, rec.logical_ref, "concept")
+    assert len(ev) == 1 and ev[0].proposed_value == "monetary_stock"
 
 
 # ── R5-3: a sanitizer-SUPPRESSED definition is never silently LLM-drafted ────────────────────────

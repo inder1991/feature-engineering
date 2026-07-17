@@ -137,9 +137,10 @@ def _bounded(val: str | None, max_len: int) -> str | None:
 
 
 def _accept_concept(raw: str) -> tuple[str | None, str]:
-    """Batch-path concept policy (spec C3): the literal 'unclassified' is a real classification and
-    IS cached; a known concept is cached; anything else is invalid -> NOT cached (retried next
-    ingest). This differs from single mode, which coerces unknowns to UNCLASSIFIED."""
+    """The concept response contract (spec C3), shared by BOTH batch and single mode (#5 — a single
+    off-vocabulary response must not be coerced/counted resolved just because it took the un-batched
+    path): the literal 'unclassified' is a real classification and IS cached; a known concept is
+    cached; anything else is invalid -> NOT cached, NOT counted resolved (retried next ingest)."""
     v = raw.strip()
     if v == UNCLASSIFIED:
         return UNCLASSIFIED, "valid"
@@ -219,16 +220,26 @@ def _write_concept_evidence(conn, *, resolved: dict[str, str], by_hash: dict[str
                             meta_by_hash: dict[str, dict],
                             rec_by_tc: dict[tuple[str, str], GlossaryRecord],
                             bindings: dict[str, ObjectBinding] | None,
-                            source_snapshot_id: str) -> int:
+                            source_snapshot_id: str,
+                            cache_hit_hashes: frozenset[str] = frozenset()) -> int:
     """Write one ``field_evidence`` proposal per glossary column classified THIS run (spec §5.1),
     ROUTED THROUGH producer-scoped staleness + snapshot reuse (whole-branch review Important-2 — the
     LLM producer must not bypass the machinery every other producer goes through).
 
+    ``resolved`` (#6) now carries BOTH a hash classified by a FRESH LLM call this run AND a cache
+    HIT reused from a prior run's cached classification — a HIT still needs its evidence to EXIST
+    (self-heals a prior write that failed and left the concept ungoverned), and re-writing an
+    already-present, input-unchanged proposal is a safe no-op below (the ``reused`` check), so this
+    never duplicates or stales a still-current concept. ``cache_hit_hashes`` identifies which of
+    ``resolved`` came from the cache rather than a call this run.
+
     ``producer=LLM`` / ``strength=PROPOSED``; ``producer_ref`` is the enrichment run bucket (ties the
-    proposal to its immutable llm_call records), ``producer_item_ref`` the batch item ref (content
-    hash), ``producer_configuration_hash`` the vocabulary fingerprint. C3: an ``unclassified`` (or any
-    non-known) value is NOT a proposal — no evidence. Only ATTACHABLE columns (``may_attach`` on the
-    Task-2 binding, when supplied) get evidence.
+    proposal to its immutable llm_call records — for a cache HIT this is the bucket the ORIGINAL call
+    was recorded under, since the classification itself is unchanged), ``producer_item_ref`` the batch
+    item ref (content hash), prefixed ``cache:`` for a HIT so the audit trail honestly shows no
+    provider call backed THIS run's write. ``producer_configuration_hash`` the vocabulary fingerprint.
+    C3: an ``unclassified`` (or any non-known) value is NOT a proposal — no evidence. Only ATTACHABLE
+    columns (``may_attach`` on the Task-2 binding, when supplied) get evidence.
 
     Producer-scoped staleness (mirrors ``ingest._write_producer_field``): before writing, the LLM's OWN
     prior ACTIVE ``concept`` rows whose ``input_hash`` differs from this run's are STALED (a reclassifying
@@ -254,6 +265,7 @@ def _write_concept_evidence(conn, *, resolved: dict[str, str], by_hash: dict[str
         material = meta_by_hash.get(h, {"table": row.table, "column": row.column, "type": row.type})
         input_hash = field_input_hash(logical_ref=rec.logical_ref, field_name="concept",
                                       material=material)
+        item_ref = f"cache:{h}" if h in cache_hit_hashes else h
         try:
             with conn.transaction():   # savepoint: contain a failed write without poisoning the txn
                 # Stale the LLM's own prior ACTIVE concept rows with a DIFFERENT input (a reclassify),
@@ -269,7 +281,7 @@ def _write_concept_evidence(conn, *, resolved: dict[str, str], by_hash: dict[str
                         conn, logical_ref=rec.logical_ref, field_name="concept",
                         proposed_value=concept, producer=EvidenceProducer.LLM,
                         strength=AssertionStrength.PROPOSED, producer_ref=ENRICHMENT_RUN_ID,
-                        producer_item_ref=h, producer_configuration_hash=_vocab_fingerprint(),
+                        producer_item_ref=item_ref, producer_configuration_hash=_vocab_fingerprint(),
                         source_snapshot_id=source_snapshot_id, input_hash=input_hash)
         except Exception:  # noqa: BLE001 — advisory: an evidence-write failure never aborts enrichment
             failures += 1
@@ -288,10 +300,12 @@ def enrich_concepts(conn, rows: list[CanonicalRow], client: LLMClient, actor=Non
     Glossary carry-forward (guarded — non-glossary uploads are UNCHANGED): when ``glossary`` is given,
     each glossary column's concept input ALSO carries its business-semantic sidecar (see
     ``_concept_metadata``), and — in BOTH single and batch modes (Important-2: single is the default)
-    — each newly-classified attachable glossary column writes an item-level ``concept``
-    ``field_evidence`` proposal through producer-scoped staleness (see ``_write_concept_evidence``).
-    ``source_snapshot_id`` is required to write evidence (a NOT-NULL column); absent it, enrichment
-    still runs and returns concepts, just without the evidence side-effect.
+    — every attachable glossary column with a known concept writes an item-level ``concept``
+    ``field_evidence`` proposal through producer-scoped staleness (see ``_write_concept_evidence``):
+    a fresh classification this run, AND (#6) a cache HIT reused from a prior run — so a HIT REPAIRS
+    a prior failed evidence write instead of leaving it missing forever. ``source_snapshot_id`` is
+    required to write evidence (a NOT-NULL column); absent it, enrichment still runs and returns
+    concepts, just without the evidence side-effect.
 
     ``stats`` (#22, optional out-param — the return shape is unchanged): when given, receives
     ``evidence_write_failures``, the count of per-item evidence-write failures the stage CONTAINED
@@ -308,14 +322,18 @@ def enrich_concepts(conn, rows: list[CanonicalRow], client: LLMClient, actor=Non
     key_of = {h: concept_cache_key(r, _rec_of(r)) for h, r in by_hash.items()}
     cached = _cache_get(conn, "enrichment_concept", list(key_of.values()), _CONCEPT_CACHE_VERSION)
     result = {h: cached[key_of[h]] for h in by_hash if key_of[h] in cached}
+    hit_hashes = frozenset(result)   # #6: cache HITS this run — their evidence still needs repair
 
-    # Metadata for every cache-MISS row — the LLM input AND (glossary) the evidence input material.
-    meta_by_hash = {h: _concept_metadata(r, _rec_of(r)) for h, r in by_hash.items()
-                    if h not in result}
-    resolved: dict[str, str] = {}   # {content_hash: concept} classified THIS run (the evidence set)
+    # Metadata for EVERY row, not just cache MISSES (#6): a MISS needs it as the LLM input, and BOTH
+    # a MISS classified this run AND a HIT reused from cache need it as the evidence input material
+    # (a HIT's material must match what a fresh classification would have used, so its input_hash
+    # lines up with an already-active row -> reused, not duplicated).
+    meta_by_hash = {h: _concept_metadata(r, _rec_of(r)) for h, r in by_hash.items()}
+    miss_hashes = [h for h in by_hash if h not in result]
+    resolved: dict[str, str] = {}   # {content_hash: concept} classified THIS run (a MISS only)
 
     if enrich_config.mode("concept") == "batch":
-        misses = [BatchItem(h, meta_by_hash[h]) for h in meta_by_hash]
+        misses = [BatchItem(h, meta_by_hash[h]) for h in miss_hashes]
         resolved = run_batched(
             conn, client, short="concept", task=_TASK, prompt_id="overlay_concept_batch_v1",
             schema_id="overlay_concept_batch",
@@ -328,7 +346,7 @@ def enrich_concepts(conn, rows: list[CanonicalRow], client: LLMClient, actor=Non
             _cache_put(conn, "enrichment_concept", key_of[h], concept, _CONCEPT_CACHE_VERSION)
             result[h] = concept
     else:
-        for h in meta_by_hash:                            # single mode — today's exact behaviour
+        for h in miss_hashes:                              # single mode
             # Metadata only (names/types + the glossary sidecar for a glossary column) — NEVER the
             # uploader's free-text definition on a technical row (M4 egress risk).
             raw = _call(conn, client, _TASK, "overlay_concept_v1", "overlay_concept",
@@ -337,23 +355,29 @@ def enrich_concepts(conn, rows: list[CanonicalRow], client: LLMClient, actor=Non
                         "the single best-fitting concept name, or 'unclassified' if none fits.", actor)
             if raw is None:
                 continue   # failure/empty -> don't cache; retry next ingest (M3)
-            # #22: only a REAL classification is durable — a known concept, or the literal
-            # 'unclassified' (a legitimate "none fits" verdict). An UNKNOWN/off-vocabulary response
-            # is still coerced to UNCLASSIFIED for THIS run (today's return behaviour) but is NOT
-            # cached: caching the coercion would poison the cache permanently on a transient bad
-            # response, where batch mode rejects unknowns for retry (_accept_concept).
-            classified = raw == UNCLASSIFIED or is_known_concept(raw)
-            concept = raw if classified else UNCLASSIFIED
-            if classified:
-                _cache_put(conn, "enrichment_concept", key_of[h], concept, _CONCEPT_CACHE_VERSION)
+            # #5: single mode enforces the IDENTICAL response contract as batch (_accept_concept) — a
+            # known concept or the literal 'unclassified' is accepted, cached, and counted resolved;
+            # an off-vocabulary/invalid response is REJECTED outright (never coerced to UNCLASSIFIED,
+            # never counted resolved) so a stage report can't paper over every provider response being
+            # invalid, and a later retry can still succeed (mirrors batch's _accept_concept exactly).
+            concept, _reason = _accept_concept(raw)
+            if concept is None:
+                continue
+            _cache_put(conn, "enrichment_concept", key_of[h], concept, _CONCEPT_CACHE_VERSION)
             result[h] = concept
             resolved[h] = concept
 
-    # Item-level LLM concept evidence (glossary only) — written in BOTH modes now (Important-2).
+    # Item-level LLM concept evidence (glossary only) — written in BOTH modes (Important-2), and now
+    # for a cache HIT too (#6): a HIT's evidence must be (re)written so a prior failed write self-heals
+    # on the very next upload instead of leaving graph_node.concept populated with no supporting
+    # field_evidence forever. `_write_concept_evidence`'s input_hash reuse check makes this a safe
+    # no-op when the evidence already exists and is unchanged — no duplicate/stale rows.
     if glossary is not None and source_snapshot_id is not None:
+        evidence_targets = {**resolved, **{h: result[h] for h in hit_hashes}}
         failures = _write_concept_evidence(
-            conn, resolved=resolved, by_hash=by_hash, meta_by_hash=meta_by_hash,
-            rec_by_tc=rec_by_tc, bindings=bindings, source_snapshot_id=source_snapshot_id)
+            conn, resolved=evidence_targets, by_hash=by_hash, meta_by_hash=meta_by_hash,
+            rec_by_tc=rec_by_tc, bindings=bindings, source_snapshot_id=source_snapshot_id,
+            cache_hit_hashes=hit_hashes)
         if stats is not None:
             stats["evidence_write_failures"] = failures
     return result

@@ -287,11 +287,15 @@ def test_enrich_concepts_batch_mode_caches_valid_only(db, monkeypatch):
 
 
 def test_enrich_concepts_single_mode_unchanged(db, monkeypatch):
+    """#5: single mode now enforces the IDENTICAL response contract as batch — an off-vocabulary
+    response is rejected (not coerced to 'unclassified', not counted resolved), matching
+    `test_enrich_concepts_batch_mode_caches_valid_only` above. See test_enrich.py for the dedicated
+    single-mode contract-parity tests."""
     monkeypatch.delenv("OVERLAY_ENRICH_CONCEPT_MODE", raising=False)   # default single
     rows = [CanonicalRow("deposits", "accounts", "weird", "text")]
     client = FakeLLM(script={"overlay.enrich.concept": FakeResponse(output={"concept": "totally_made_up"})})
     out = enrich_concepts(db, rows, client)
-    assert out[content_hash(rows[0])] == "unclassified"   # single keeps today's coerce behaviour
+    assert content_hash(rows[0]) not in out   # rejected, mirrors batch INVALID — not coerced
 
 
 from featuregen.overlay.upload.enrich import classify_domains
