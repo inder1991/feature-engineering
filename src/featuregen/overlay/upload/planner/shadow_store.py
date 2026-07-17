@@ -65,7 +65,7 @@ class DivergentDuplicateError(Exception):
 # ── row contracts ──
 @dataclass(frozen=True, slots=True)
 class DispatchRecordV1:
-    generation_run_id: str
+    generation_run_id: str | None
     eligible_recipe_ids: tuple[str, ...]
     recipe_hash: str
     expected_count: int
@@ -80,7 +80,7 @@ class DispatchRecordV1:
 
 @dataclass(frozen=True, slots=True)
 class RunResultRowV1:
-    generation_run_id: str
+    generation_run_id: str | None
     recipe_id: str
     catalog_scope_id: str | None
     planner_input_hash: str | None
@@ -100,7 +100,7 @@ class RunResultRowV1:
 
 @dataclass(frozen=True, slots=True)
 class PlanObservationRowV1:
-    generation_run_id: str
+    generation_run_id: str | None
     recipe_id: str
     physical_plan_id: str
     path_resolution_status: str
@@ -122,7 +122,7 @@ class PlanObservationRowV1:
 
 @dataclass(frozen=True, slots=True)
 class ReconcileResultV1:
-    generation_run_id: str
+    generation_run_id: str | None
     expected: int
     present: int
     missing_recipe_ids: tuple[str, ...]
