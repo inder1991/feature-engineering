@@ -99,8 +99,8 @@ def _report(**over) -> PopulationReportV1:
         headline_by_primary={"grain_incompatible": 2}, breakdown_by_category={"topology_or_model": 2},
         recipe_outcome_matrix={"compiled|complete": 10}, replay_freshness={"current": 10},
         operationally_unmeasured_count=0, incomplete_count=0, compile_disabled_count=0,
-        internal_error_count=0, preloop_failure_count=0, persistence_partial_count=0,
-        truncated_count=0, reconcile_complete=True, persistence_loss=0,
+        internal_error_count=0, preloop_failure_count=0, template_not_found_count=0,
+        persistence_partial_count=0, truncated_count=0, reconcile_complete=True, persistence_loss=0,
         sample_units=tuple(SampleUnit("tier_1_single_catalog", "balance_stock", "resolved", None,
                                       f"h{i}", True, True) for i in range(6)))
     base.update(over)
@@ -137,8 +137,8 @@ def test_any_single_sub_gate_failure_fails_the_whole_gate(override):
 
 
 @pytest.mark.parametrize("flag", [
-    "incomplete_count", "compile_disabled_count", "internal_error_count",
-    "preloop_failure_count", "persistence_partial_count", "truncated_count", "persistence_loss",
+    "incomplete_count", "compile_disabled_count", "internal_error_count", "preloop_failure_count",
+    "template_not_found_count", "persistence_partial_count", "truncated_count", "persistence_loss",
 ])
 def test_gate1_fails_on_each_integrity_breach(flag):
     res = evaluate_gate(_inputs(report=_report(**{flag: 1})))
@@ -251,6 +251,18 @@ def test_population_report_numerator_denominator(db):
     assert report.denominator == 1 and report.numerator == 0
     assert report.recipe_outcome_matrix and report.sample_units
     assert report.reconcile_complete and report.persistence_loss == 0
+
+
+def test_template_not_found_trips_gate1_even_though_reconcile_is_complete(db):
+    # Minor-1: an eligible recipe with no template is RECORDED (reconcile stays complete), so without
+    # this driver a taxonomy drift would silently drop it from the denominator. Gate 1 must catch it.
+    _cross_seed(db)
+    run_shadow_planner(db, eligible_recipe_ids=frozenset({"t_roll", "ghost_recipe"}),
+                       target_entity="account", roles=(), run_id="tnf", now=_NOW,
+                       templates=(_txn_template(),), compile_contracts=True, persist=True)
+    report = build_population_report(db, ["tnf"], family_of=lambda rid: "roll_family")
+    assert report.reconcile_complete and report.template_not_found_count == 1   # recorded, not lost
+    assert not evaluate_gate(_inputs(report=report)).gate1_capture              # but Gate 1 blocks
 
 
 def test_pg_e2e_run_to_report_to_signed_gate(db, monkeypatch):

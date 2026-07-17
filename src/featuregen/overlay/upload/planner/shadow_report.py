@@ -57,6 +57,7 @@ class PopulationReportV1:
     compile_disabled_count: int
     internal_error_count: int
     preloop_failure_count: int
+    template_not_found_count: int                 # eligible recipe with no template (taxonomy drift)
     persistence_partial_count: int
     truncated_count: int                          # any BoundingMetrics *_truncated flag (F8)
     reconcile_complete: bool
@@ -98,7 +99,7 @@ def build_population_report(conn, run_ids: Sequence[str], *,
     obs_by_key = {(o[0], o[1], o[2]): o for o in obs}   # (run, recipe, physical_plan_id) -> row
 
     matrix: dict[str, int] = {}
-    incomplete = disabled = internal = preloop = partial = truncated = 0
+    incomplete = disabled = internal = preloop = partial = truncated = tnf = 0
     denominator = numerator = op_unmeasured = 0
     headline: dict[str, int] = {}
     breakdown: dict[str, int] = {}
@@ -110,6 +111,7 @@ def build_population_report(conn, run_ids: Sequence[str], *,
         disabled += compile_status == "compile_disabled"
         internal += outcome == "internal_error"
         preloop += outcome == "preloop_failure"
+        tnf += outcome == "template_not_found"
         partial += capture == "persistence_partial"
         truncated += _is_truncated(bounding)
         selected = obs_by_key.get((run_id, recipe_id, selected_pid)) if selected_pid is not None else None
@@ -138,7 +140,7 @@ def build_population_report(conn, run_ids: Sequence[str], *,
         recipe_outcome_matrix=matrix, replay_freshness=dict(replay_freshness or {}),
         operationally_unmeasured_count=op_unmeasured, incomplete_count=incomplete,
         compile_disabled_count=disabled, internal_error_count=internal, preloop_failure_count=preloop,
-        persistence_partial_count=partial, truncated_count=truncated,
+        template_not_found_count=tnf, persistence_partial_count=partial, truncated_count=truncated,
         reconcile_complete=all(r.complete for r in reconciles), persistence_loss=loss,
         sample_units=tuple(units))
 
@@ -295,6 +297,8 @@ def _gate1(report: PopulationReportV1) -> tuple[bool, list[str]]:
         "compile_disabled eligible recipes": report.compile_disabled_count > 0,
         "planner internal_error": report.internal_error_count > 0,
         "preloop_failure": report.preloop_failure_count > 0,
+        "template_not_found (un-templated eligible recipe — taxonomy drift)":
+            report.template_not_found_count > 0,
         "planner truncation/bounding (F8)": report.truncated_count > 0,
     }
     reasons = [f"Gate 1: {name}" for name, failed in checks.items() if failed]
@@ -313,7 +317,9 @@ def statistical_bound(units: Iterable[SampleUnit], policy: GatePolicy
     for s in sample.strata:
         if s.distinct_shapes == 0:
             reasons.append(f"Gate 4: stratum {s.stratum.key} has zero in-frame shapes")
-        elif clopper_pearson_upper(0, s.distinct_shapes, policy.alpha) > policy.max_false_resolve_bound:
+        # the bound is over the AUDITED count (the per-stratum draw actually checked for false
+        # resolves), never the larger available count — the evidence is what was audited.
+        elif clopper_pearson_upper(0, len(s.sampled), policy.alpha) > policy.max_false_resolve_bound:
             reasons.append(f"Gate 4: stratum {s.stratum.key} bound exceeds policy "
                            f"({s.distinct_shapes} < {policy.required_shapes} shapes)")
     return not reasons, sample, reasons
@@ -399,7 +405,7 @@ class GateArtifactV1:
             "gold_set_hash": self.gold_set_hash, "gold_set_version": self.gold_set_version,
             "evaluator_version": self.evaluator_version, "category_map_version": self.category_map_version,
             "strata_version": self.strata_version, "policy_hash": self.policy_hash,
-            "observation_window": list(self.observation_window), "sample_ids": sorted(self.sample_ids),
+            "observation_window": sorted(self.observation_window), "sample_ids": sorted(self.sample_ids),
             "review_content_hash": self.review_content_hash, "signer_key_id": self.signer_key_id,
             "report_input_digest": self.report_input_digest, "gate_passed": self.gate_passed,
             "gate_reasons": list(self.gate_reasons),
@@ -422,6 +428,7 @@ def report_input_digest(report: PopulationReportV1) -> str:
         "operationally_unmeasured": report.operationally_unmeasured_count,
         "incomplete": report.incomplete_count, "compile_disabled": report.compile_disabled_count,
         "internal_error": report.internal_error_count, "preloop_failure": report.preloop_failure_count,
+        "template_not_found": report.template_not_found_count,
         "persistence_partial": report.persistence_partial_count, "truncated": report.truncated_count,
         "reconcile_complete": report.reconcile_complete, "persistence_loss": report.persistence_loss,
     }
