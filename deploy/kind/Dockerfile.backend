@@ -1,0 +1,16 @@
+# FeatureGen backend — FastAPI on uvicorn. Editable install so the on-disk migration .sql
+# files (located via Path(__file__).parent/migrations) are found at runtime.
+FROM python:3.11-slim
+WORKDIR /app
+ENV PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1
+
+RUN pip install --upgrade pip setuptools wheel
+COPY pyproject.toml README.md ./
+COPY src ./src
+# The `llm` extra pulls the anthropic SDK — a PRODUCTION-only lazy import (CI uses FakeLLM), version-
+# bounded in pyproject — so FEATUREGEN_LLM_PROVIDER=anthropic resolves a client instead of failing
+# closed. Editable so the on-disk migration .sql files are still found at runtime.
+RUN pip install -e ".[llm]"
+
+EXPOSE 8000
+CMD ["uvicorn", "--factory", "featuregen.api.app:create_app_from_env", "--host", "0.0.0.0", "--port", "8000"]

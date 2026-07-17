@@ -370,7 +370,18 @@ _ENRICH_ACTOR = IdentityEnvelope(
 
 def register_enrichment_schemas(conn) -> None:
     """Register the enrichment output-schemas so the audited call can resolve/validate them.
-    Idempotent (register_schema upserts). Called at overlay bootstrap."""
+    Idempotent (register_schema upserts). Called at overlay bootstrap.
+
+    Fail-closed provider-compat guard (Phase-1 hardening): before touching the DB, assert every
+    canonical schema PROJECTS to an Anthropic-compatible wire schema. A node that survives the
+    projection still provider-incompatible (e.g. a bare `{maxLength}` leaving an empty node) raises
+    ValueError HERE — at bootstrap — instead of failing every live structured-output call closed."""
+    from featuregen.intake.schema_projection import (
+        assert_schemas_provider_compatible,
+        project_for_anthropic,
+    )
+    assert_schemas_provider_compatible(
+        [(name, project_for_anthropic(schema)) for (name, _v), schema in _SCHEMAS.items()])
     reg = DocumentSchemaRegistry(conn)
     for (name, ver), schema in _SCHEMAS.items():
         reg.register_schema(name, ver, schema, _OWNER)

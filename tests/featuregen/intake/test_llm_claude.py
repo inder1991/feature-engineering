@@ -50,6 +50,43 @@ def test_stop_reason_mapping_to_provider_taxonomy():
     assert _map_stop_reason("some_future_reason") == PROVIDER_NON_RETRYABLE
 
 
+# ---- Phase-1 hardening: wire-schema projection + safe 400 diagnostic (SDK-FREE, run in CI) ------
+
+
+def test_wire_output_config_projects_schema():
+    """The wire `output_config` must carry a PROJECTED (Anthropic-compatible) schema — `maxLength`/
+    `maxItems` stripped and the nullable-enum normalized — while the request's pinned effort wins.
+    Pure + SDK-free so the projection is proven every CI build without importing the SDK."""
+    from featuregen.intake.llm import LLMRequest
+    from featuregen.intake.llm_claude import ClaudeConfig, _wire_output_config
+    from featuregen.intake.schema_projection import provider_incompatibilities
+
+    canonical = {"type": "object", "properties": {
+        "results": {"type": "array", "items": {"type": "object", "properties": {
+            "ref": {"type": "string", "maxLength": 128},
+            "basis": {"type": ["string", "null"], "enum": ["event", "snapshot", None]},
+        }}, "maxItems": 40}}}
+    req = LLMRequest(task="t", prompt_id="p", prompt_version=1, inputs={"x": 1},
+                     output_schema_id="s", output_schema_version=1,
+                     generation_settings={"effort": "low"}, output_schema=canonical)
+    wire = _wire_output_config(req, ClaudeConfig(enabled=True, effort="high"))
+    assert wire["format"]["type"] == "json_schema"
+    assert provider_incompatibilities(wire["format"]["schema"]) == []
+    assert wire["effort"] == "low"  # request's PINNED effort wins over the config default
+
+
+def test_rejected_schema_keyword_is_token_only():
+    """`_rejected_schema_keyword` returns a bare JSON-Schema keyword TOKEN (or None) — never the
+    provider message body — so a schema-rejection 400 can be diagnosed without logging content."""
+    from featuregen.intake.llm_claude import _SCHEMA_KEYWORDS, _rejected_schema_keyword
+
+    msg = "output_config.format.schema: 'maxLength' is not supported for this endpoint"
+    assert _rejected_schema_keyword(msg) == "maxLength"
+    # returns only a fixed token or None — never echoes the message body
+    assert _rejected_schema_keyword(msg) in _SCHEMA_KEYWORDS
+    assert _rejected_schema_keyword("a benign message with no schema keyword") is None
+
+
 # ---- finding #24: the adapter surfaces provider usage and applies the pinned settings ----------
 
 

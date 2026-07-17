@@ -10,6 +10,7 @@ See the Adapter Appendix in docs/plans/2026-07-01-sp2-03-llm-envelope.md for the
 """
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass
 
@@ -25,6 +26,9 @@ from featuregen.intake.llm import (
     LLMResult,
 )
 from featuregen.intake.redaction import INPUT_KEY_CATALOG, INPUT_KEY_INTENT
+from featuregen.intake.schema_projection import project_for_anthropic
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -66,6 +70,36 @@ def _map_stop_reason(stop_reason: str) -> str:
     # An UNKNOWN/unexpected stop_reason must NOT be treated as OK (fail-open) — a new provider outcome
     # the driver doesn't recognize fails CLOSED into the manual path rather than passing a bad result (N11).
     return _STOP_REASON_MAP.get(stop_reason, PROVIDER_NON_RETRYABLE)
+
+
+def _wire_output_config(request: LLMRequest, config: ClaudeConfig) -> dict:
+    """Build the `output_config` sent to Anthropic. The canonical strict schema stays the source of
+    truth for validating the RESPONSE (the driver's `reg.validate`, unchanged); here we PROJECT it to
+    the provider-compatible subset for the WIRE ONLY (`project_for_anthropic`). Pure + SDK-free so a
+    unit test can prove the outbound schema is clean without importing the SDK. The request's PINNED
+    generation_settings win over the config default (#24) — the audited settings are the applied ones."""
+    # `call()` fails closed on a missing schema before reaching here; `or {}` keeps the pure helper
+    # type-safe (project_for_anthropic wants a dict) without changing that behavior.
+    return {
+        "effort": request.generation_settings.get("effort", config.effort),
+        "format": {"type": "json_schema",
+                   "schema": project_for_anthropic(request.output_schema or {})},
+    }
+
+
+# JSON-Schema keywords a provider 400 might name. Length/array-size/numeric bounds are stripped by the
+# wire projection; `enum`/`type` round out the recognizable tokens. Order = extraction priority.
+_SCHEMA_KEYWORDS = ("maxLength", "maxItems", "minItems", "minimum", "maximum",
+                    "exclusiveMinimum", "exclusiveMaximum", "multipleOf", "enum", "type")
+
+
+def _rejected_schema_keyword(message: str) -> str | None:
+    """Best-effort extraction of the rejected JSON-Schema keyword from a provider 400 message.
+    Returns only a keyword token — never the message body — so nothing content-bearing is logged."""
+    for kw in _SCHEMA_KEYWORDS:
+        if kw in message:
+            return kw
+    return None
 
 
 class ClaudeLLM:
@@ -113,11 +147,10 @@ class ClaudeLLM:
             if not request.output_schema:
                 return _fail(PROVIDER_NON_RETRYABLE)
             # #24 — the request's PINNED generation_settings win (config is the fallback), so the
-            # settings the audit records are the settings the provider actually ran with.
-            output_config = {
-                "effort": request.generation_settings.get("effort", self._config.effort),
-                "format": {"type": "json_schema", "schema": request.output_schema},
-            }
+            # settings the audit records are the settings the provider actually ran with. The schema
+            # is PROJECTED to the Anthropic-compatible subset for the wire (canonical stays the
+            # response source of truth); the build is a pure, SDK-free, unit-tested helper.
+            output_config = _wire_output_config(request, self._config)
             resp = client.messages.create(
                 model=model,
                 max_tokens=request.generation_settings.get("max_tokens", self._config.max_tokens),
@@ -127,6 +160,13 @@ class ClaudeLLM:
             )
         except anthropic.APIStatusError as exc:  # map transport/status failures to the taxonomy
             status = getattr(exc, "status_code", 0)
+            if status == 400:
+                # A schema-rejection 400 (the provider refusing a structured-output schema) is
+                # logged as HTTP status + a single JSON-Schema keyword TOKEN only — never the
+                # request/response body or any PII. It still falls through to the taxonomy below.
+                keyword = _rejected_schema_keyword(str(getattr(exc, "message", exc)))
+                logger.warning("anthropic rejected structured-output schema (HTTP 400, keyword=%s)",
+                               keyword or "unknown")
             if status in (401, 403):
                 return _fail(PROVIDER_AUTH_ERROR)   # auth/permission → fail closed + security-audit
             if status == 429 or status >= 500:

@@ -36,6 +36,11 @@ dependencies = [
 featuregen = "featuregen.__main__:main"
 
 [project.optional-dependencies]
+llm = [
+    # Anthropic structured-output client (production-only, lazy-imported; CI uses FakeLLM). Floor
+    # pinned to the deploy-proven version that supports output_config + json_schema outputs.
+    "anthropic>=0.117,<1.0",
+]
 dev = [
     "pytest>=8.0",
     "pytest-postgresql>=6.0",
