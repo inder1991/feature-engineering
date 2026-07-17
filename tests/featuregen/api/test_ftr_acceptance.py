@@ -1,32 +1,49 @@
 """Task 10 — the A1 capstone: one full API -> PostgreSQL -> search acceptance test over a
-SYNTHESIZED realistic FTR upload (126 column terms + 1 table term), proving the whole adapter
-works end-to-end and is sample-safe (round-4 resolutions #11/#12).
+SYNTHESIZED upload modelling the REAL FTR file's shape (round-5 resolution R5-10).
 
-The fixture is generated programmatically (never read from a real export): the exact 17-header FTR
-layout, unique integer source_rows, term_type varied across the closed vocabulary, and a few
-definitions carrying recognized/unrecognized sample clauses with SYNTHETIC scrub tokens
-(``ARTKOM``, ``8484848481``) that must be ABSENT from every persistence/egress surface afterwards:
-``graph_node`` (definition, semantic_terms, search_doc), ``field_evidence``, ``quarantine_row``,
-and the immutable ``llm_call`` audit records (``redacted_input``) of the enrichment run bucket.
+The previous synthetic fixture (5 invented term_types, clean short definitions) missed two real
+defects the actual ``FTR_Column_Mapping_final.csv`` run exposed: a 6th term_type
+(``Regulatory Term``) was quarantined by the closed vocabulary (R5-1), and 41 definitions saying
+"The sample profile has no non-blank values." were blanked by the value-shape guesser (R5-2).
+This fixture models the real file's METADATA — content is synthesized, never read from a real
+export:
+
+- 127 data rows = 126 three-part column FQNs + 1 two-part table term, all under ONE schema
+  (``DPL_EIB_COMPLIANCE``), one table (``COMP_FIN_TRAN``); unique integer source_rows 18..144.
+- term_type distribution ``Business Term``x81, ``Dimension``x27, ``Code Value``x9, ``Measure``x6,
+  ``Reference Data``x3, ``Regulatory Term``x1 — ALL must ingest (open vocabulary, R5-1).
+- 85 definitions carry the canonical ``... The sample profile is <TYPE>, with representative
+  values such as A; B; C, which supports interpretation.`` clause (STRIPPED — prose survives);
+  41 say ``... The sample profile has no non-blank values.`` (PRESERVED — must NOT blank);
+  every definition > 200 chars.
+- declared ``data_type`` varies VARCHAR / DOUBLE / TIMESTAMP and must reach the concept
+  classifier (R5-5) instead of the operational ``unknown``.
+
+Two sample-bearing definitions carry SYNTHETIC scrub tokens (``ARTKOM``, ``8484848481``) that
+must be ABSENT from every persistence/egress surface afterwards: ``graph_node`` (definition,
+semantic_terms, search_doc), ``field_evidence``, ``quarantine_row.raw``, and the immutable
+``llm_call`` audit records (``redacted_input``) of the enrichment run bucket. (ARTKOM has non-hex
+letters and the numeric token is a 10-digit run, so neither can appear by chance inside a sha256
+content hash.)
 
 The LLM is a PERMISSIVE fake (`_EchoLLM`): for a batch prompt it echoes one fixed valid value per
-REQUESTED ref (whatever the chunk asked for), for a single prompt it returns the flat shape — the
-test proves the WIRING (chunked batching past the 40-item cap, egress redaction, audit records),
-not specific enrichment values. Non-vacuousness is asserted explicitly: the concept stage saw all
-126 columns and >= 2 audited batch calls occurred, so "no leaked payload" is never a vacuous pass.
+REQUESTED ref, for a single prompt the flat shape — the test proves the WIRING (chunked batching
+past the 40-item cap, egress redaction, audit records), not specific enrichment values.
 """
 from __future__ import annotations
 
 import csv
 import io
 import json
+from collections import Counter
 
 from tests.featuregen.api._helpers import AUTH, upload_csv
 
 from featuregen.intake.llm import PROVIDER_OK, LLMRequest, LLMResult
 from featuregen.overlay.upload.enrich_llm import ENRICHMENT_RUN_ID
+from featuregen.overlay.upload.ingestion_run import RUN_ID_HEADER
 
-# ── Synthesized FTR fixture (resolution #12 — programmatic, realistic, NEVER a real export) ──────
+# ── Synthesized REAL-SHAPED FTR fixture (R5-10 — programmatic, NEVER a real export) ──────────────
 
 _HDR = ("source_row,schema.table.column,term_name,description_business_definition,data_domain,"
         "term_type,related_business_process_l1,related_terms,related_business_process_l2,"
@@ -36,64 +53,85 @@ _HDR = ("source_row,schema.table.column,term_name,description_business_definitio
 _SCHEMA = "DPL_EIB_COMPLIANCE"
 _TABLE = "COMP_FIN_TRAN"
 _N_COLS = 126
+_N_ROWS = 127            # 126 column terms + 1 table term — the honest input row count (R5-9)
 
-# Distinctive SYNTHETIC scrub tokens. ENTITY_TOKEN has non-hex letters so it can never appear by
-# chance inside a sha256 content hash; NUMERIC_TOKEN is a 10-digit run for the same reason (a
-# short digit group like "84848" occurs in ~0.06% of 64-char hex hashes — a real flake risk given
-# the hundreds of hashes this ingest mints into refs/producer_item_refs/redacted_input).
+# The REAL file's term_type distribution across all 127 rows. The 126 COLUMN rows take the first
+# 126 (80 Business Term + the rest); the TABLE term takes the 81st "Business Term".
+_TT_COLUMNS: tuple[str, ...] = (("Business Term",) * 80 + ("Dimension",) * 27
+                                + ("Code Value",) * 9 + ("Measure",) * 6
+                                + ("Reference Data",) * 3 + ("Regulatory Term",))
+_TT_DIST = {"Business Term": 81, "Dimension": 27, "Code Value": 9, "Measure": 6,
+            "Reference Data": 3, "Regulatory Term": 1}
+_N_SAMPLED = 85          # canonical representative-values clause -> STRIPPED
+_N_NO_SAMPLE = 41        # "sample profile has no non-blank values" -> PRESERVED, must NOT blank
+
+# Distinctive SYNTHETIC scrub tokens riding inside canonical sample clauses of two rows (0 and 44
+# — different concept batch chunks). ENTITY_TOKEN has non-hex letters, NUMERIC_TOKEN is a 10-digit
+# run: neither can appear by chance inside the sha256 hashes this ingest mints.
 ENTITY_TOKEN = "ARTKOM"
 NUMERIC_TOKEN = "8484848481"
+_TOKEN_ROWS = {0, 44}
 
-# Three sample-bearing definitions exercising all sanitizer paths (verified against sanitize.py):
-# recognized clause with entity values -> STRIPPED; recognized clause with numeric values ->
-# STRIPPED; an unrecognized residual value list -> the whole field BLANKED (suspected_value_list).
-_D_ENTITY = ("Registered legal name of the counterparty entity. The sample profile is TEXT, with "
-             f"representative values such as {ENTITY_TOKEN} GLOBAL FZE; NORDIC HOLDINGS AS, "
-             "which supports interpretation.")
-_D_NUMERIC = ("Internal ledger movement identifier. The sample profile is NUMERIC, with "
-              f"representative values such as {NUMERIC_TOKEN}; 9021055512, which supports "
-              "interpretation.")
-_D_RESIDUAL = f"Reconciliation batch counter; the values were {NUMERIC_TOKEN}; 9021055512."
+_DATA_TYPES = ("VARCHAR", "DOUBLE", "TIMESTAMP")   # assigned i % 3 — cust_name (i=0) is VARCHAR
 
-_TERM_TYPES = ("Measure", "Dimension", "Code Value", "Reference Data", "Business Term")
-_DATA_TYPES = ("VARCHAR", "DECIMAL", "DATE", "INTEGER", "CHAR(3)")
+# Canonical FTR sample clauses (the shape strip_sample_values excises), varied per declared type.
+_CLAUSES = {
+    "VARCHAR": (" The sample profile is ALPHA_NUMERIC, with representative values such as "
+                "K4M2X9; P7Q1R3; T5W8Z2, which supports interpretation."),
+    "DOUBLE": (" The sample profile is NUMERIC, with representative values such as "
+               "104.25; 98.10; 250.75, which supports interpretation."),
+    "TIMESTAMP": (" The sample profile is ALPHA_SPECIAL, with representative values such as "
+                  "2031-01-15 10:01:02; 2031-02-20 15:07:08, which supports interpretation."),
+}
+_TOKEN_CLAUSE = (" The sample profile is TEXT, with representative values such as "
+                 f"{ENTITY_TOKEN} GLOBAL FZE; {NUMERIC_TOKEN}; 9021055512, "
+                 "which supports interpretation.")
+_NO_SAMPLE_TAIL = " The sample profile has no non-blank values."
 
 
-def _ftr_csv(n_cols: int = _N_COLS) -> str:
-    """The exact FTR header + ``n_cols`` column rows + one 2-part table term row. Rows are written
-    via csv.writer so every comma-bearing definition is QUOTED (resolution #11). source_row values
-    are unique parsed ints (18 .. 18+n_cols)."""
+def _prose(name: str, term: str) -> str:
+    """Comma-bearing business prose > 200 chars on its own (the real file's definitions all exceed
+    200 chars) — so EVERY emitted definition is >200 whichever tail it gets, and csv.writer must
+    quote every row."""
+    return (f"{term} as captured on the {name.lower()} field of the daily compliance transaction "
+            "feed, sourced from the finance transaction repository at end of day and reviewed by "
+            "the compliance operations team for completeness, accuracy and timeliness before "
+            "regulatory submission.")
+
+
+def _real_shaped_ftr_csv() -> str:
+    """The exact FTR header + 126 column rows + one 2-part table term row, modelling the REAL
+    file's metadata (module docstring). All commas in definitions are QUOTED via csv.writer;
+    source_row values are unique parsed ints 18..144."""
     buf = io.StringIO()
     buf.write(_HDR)
     w = csv.writer(buf, lineterminator="\n")
-    for i in range(n_cols):
+    for i in range(_N_COLS):
         if i == 0:
-            name, term, definition, ttype = ("CUST_NAME", "Counterparty Legal Name",
-                                             _D_ENTITY, "Dimension")
+            name, term = "CUST_NAME", "Counterparty Legal Name"
             synonyms = "Client Name|Account Holder"
-        elif i == 1:
-            name, term, definition, ttype = ("TXN_REF_NBR", "Transaction Reference Number",
-                                             _D_NUMERIC, "Business Term")
-            synonyms = "Txn Ref"
-        elif i == 2:
-            name, term, definition, ttype = ("RECON_BATCH_CT", "Reconciliation Batch Count",
-                                             _D_RESIDUAL, "Measure")
+        elif i == _N_COLS - 1:   # the single Regulatory Term column (_TT_COLUMNS[-1])
+            name, term = "REG_RPT_CD", "Regulatory Reporting Code"
             synonyms = ""
         else:
-            name = f"COL_{i}"
-            term = f"Compliance Attribute {i}"
-            # Plain, comma-bearing prose: stays searchable, never trips the value-shape gate.
-            definition = (f"Business attribute recording the {name.lower()} field, as reported "
-                          "for daily compliance monitoring.")
-            ttype = _TERM_TYPES[i % len(_TERM_TYPES)]   # several Measure rows among them
+            name, term = f"COL_{i}", f"Compliance Attribute {i}"
             synonyms = ""
-        w.writerow([18 + i, f"{_SCHEMA}.{_TABLE}.{name}", term, definition, "Compliance", ttype,
-                    "Monitoring", "", "Screening", "", synonyms, "Compliance", "Transaction",
-                    "", "", "fibo-fbc:FinancialTransaction", _DATA_TYPES[i % len(_DATA_TYPES)]])
-    # The 2-part TABLE term (record-only — no CanonicalRow, no grain/as-of assertion).
-    w.writerow([18 + n_cols, f"{_SCHEMA}.{_TABLE}", "Financial Transaction Repository",
-                "Daily compliance transaction repository, covering settled transactions.",
-                "Compliance", "Reference Data", "", "", "", "", "", "Reference", "Table",
+        dtype = _DATA_TYPES[i % len(_DATA_TYPES)]
+        definition = _prose(name, term)
+        if i < _N_SAMPLED:       # 85 sample-bearing definitions (canonical clause -> stripped)
+            definition += _TOKEN_CLAUSE if i in _TOKEN_ROWS else _CLAUSES[dtype]
+        else:                    # 41 "no non-blank values" definitions (must NOT blank)
+            definition += _NO_SAMPLE_TAIL
+        w.writerow([18 + i, f"{_SCHEMA}.{_TABLE}.{name}", term, definition, "Compliance",
+                    _TT_COLUMNS[i], "Monitoring", "", "Screening", "", synonyms, "Compliance",
+                    "Transaction", "", "", "fibo-fbc:FinancialTransaction", dtype])
+    # The 2-part TABLE term (record-only — no CanonicalRow): the 81st "Business Term".
+    w.writerow([18 + _N_COLS, f"{_SCHEMA}.{_TABLE}", "Financial Transaction Repository",
+                "Daily compliance transaction repository, covering settled transactions reported "
+                "by the finance systems of record, retained for regulatory review and "
+                "reconciliation across the compliance monitoring, screening and reporting "
+                "processes of the enterprise investment bank.",
+                "Compliance", "Business Term", "", "", "", "", "", "Reference", "Table",
                 "", "", "", ""])
     return buf.getvalue()
 
@@ -150,26 +188,36 @@ def _stage(conn, stage: str) -> tuple[str, dict]:
 # ── The capstone acceptance test ─────────────────────────────────────────────────────────────────
 
 def test_ftr_full_api_pg_search_acceptance(make_client, conn, monkeypatch):
-    monkeypatch.setenv("OVERLAY_PASS_C", "1")                    # resolution #11 — flags ON
+    monkeypatch.setenv("OVERLAY_PASS_C", "1")                    # flags ON, as in production
     monkeypatch.setenv("OVERLAY_ENRICH_CONCEPT_MODE", "batch")   # 126 items >> 40-item batch cap
     llm = _EchoLLM()
     client = make_client(llm)
 
-    csv_text = _ftr_csv()
-    # Guard against fixture drift making sample-safety vacuous: the raw upload DOES carry both
-    # scrub tokens (and a Measure row) before we assert their absence downstream.
-    assert ENTITY_TOKEN in csv_text and NUMERIC_TOKEN in csv_text
-    assert ",Measure," in csv_text
+    csv_text = _real_shaped_ftr_csv()
+    # ── Fixture self-guards: the CSV really models the REAL file (else every downstream absence /
+    # distribution assertion could pass vacuously on a drifted fixture).
+    data_rows = list(csv.reader(io.StringIO(csv_text)))[1:]
+    assert len(data_rows) == _N_ROWS
+    defs = [r[3] for r in data_rows]
+    assert all(len(d) > 200 for d in defs)                       # real file: all defs > 200 chars
+    assert sum("representative values such as" in d for d in defs) == _N_SAMPLED
+    assert sum("no non-blank values" in d for d in defs) == _N_NO_SAMPLE
+    assert Counter(r[5] for r in data_rows) == _TT_DIST          # all 6 term_types, real counts
+    assert len({r[0] for r in data_rows}) == _N_ROWS             # unique source_row 18..144
+    assert csv_text.count(ENTITY_TOKEN) == len(_TOKEN_ROWS)      # the raw CSV DID carry the tokens
+    assert NUMERIC_TOKEN in csv_text
 
-    # 1) Upload ingests cleanly: no fake grain/as-of facts (#8 honest label), nothing quarantined.
+    # 1) THE assertion that catches the two real blockers: the Regulatory Term row and all 41
+    #    "no non-blank values" rows INGEST — status ingested, NOTHING quarantined, and FTR
+    #    declares no grain/as-of facts (honest label).
     res = upload_csv(client, "ftr", csv_text)
     assert res.status_code == 200, res.text
     body = res.json()
     assert body["status"] == "ingested"
-    assert body["asserted"] == 0        # FTR declares no grain/as-of facts
+    assert body["asserted"] == 0
     assert body["quarantined"] == 0
 
-    # 2) Exactly 126 column nodes landed, scoped by catalog_source.
+    # 2) Exactly 126 column nodes + 1 table node landed, scoped by catalog_source.
     n_cols = conn.execute(
         "SELECT count(*) FROM graph_node WHERE catalog_source = 'ftr' AND kind = 'column'"
     ).fetchone()[0]
@@ -179,15 +227,34 @@ def test_ftr_full_api_pg_search_acceptance(make_client, conn, monkeypatch):
     ).fetchone()[0]
     assert n_tables == 1
 
-    # 3) The table term resolved onto the (public-flattened) table node: definition projected from
-    #    the dedicated table-term evidence path, domain classified by enrichment.
+    # 3) EVERY definition is PRESENT — none of the 41 "no non-blank values" definitions was
+    #    blanked, and the 85 stripped ones kept their business prose (the second real blocker).
+    n_defined = conn.execute(
+        "SELECT count(*) FROM graph_node WHERE catalog_source = %s AND kind = 'column' "
+        "AND definition IS NOT NULL AND definition <> ''", ("ftr",)).fetchone()[0]
+    assert n_defined == _N_COLS
+    # The parse stage's honest sanitize provenance agrees: exactly the 85 canonical clauses were
+    # stripped and NOTHING was suppressed/blanked fail-closed (R5-8).
+    state, detail = _stage(conn, "parse")
+    assert state == "succeeded"
+    assert detail.get("definitions_stripped") == _N_SAMPLED, detail
+    assert detail.get("definitions_suppressed") == 0, detail
+    assert detail.get("rows") == _N_COLS                # the 126 CanonicalRows (table term aside)
+
+    # 4) The Regulatory Term column ingested (the first real blocker: the closed vocabulary
+    #    quarantined it) — its node exists with its definition intact.
+    reg_def, = conn.execute(
+        "SELECT definition FROM graph_node WHERE catalog_source = 'ftr' "
+        "AND object_ref = 'public.comp_fin_tran.reg_rpt_cd'").fetchone()
+    assert reg_def and "Regulatory Reporting Code" in reg_def
+
+    # The table term resolved onto the (public-flattened) table node; both the table node AND a
+    # column node preserve the declared (pre-flatten) schema.
     t_def, t_domain, t_schema = conn.execute(
         "SELECT definition, domain, schema_name FROM graph_node "
         "WHERE catalog_source = 'ftr' AND object_ref = 'public.comp_fin_tran'").fetchone()
     assert t_def is not None and t_def.startswith("Daily compliance transaction repository")
     assert t_domain is not None
-
-    # 4) Both the table node AND a column node preserve the declared (pre-flatten) schema.
     assert t_schema == _SCHEMA
     (c_schema,) = conn.execute(
         "SELECT schema_name FROM graph_node "
@@ -205,8 +272,8 @@ def test_ftr_full_api_pg_search_acceptance(make_client, conn, monkeypatch):
         assert _count_matching(conn, "quarantine_row", token) == 0
         assert _count_matching(conn, "llm_call", token,
                                where="t.run_id = %s", params=(ENRICHMENT_RUN_ID,)) == 0
-        # The egressed payload specifically (resolution #11's audit check): no enrichment call's
-        # immutable redacted_input carries a sample value.
+        # The egressed payload specifically: no enrichment call's immutable redacted_input
+        # carries a sample value.
         assert conn.execute(
             "SELECT count(*) FROM llm_call WHERE run_id = %s AND redacted_input::text ILIKE %s",
             (ENRICHMENT_RUN_ID, f"%{token}%")).fetchone()[0] == 0
@@ -215,15 +282,26 @@ def test_ftr_full_api_pg_search_acceptance(make_client, conn, monkeypatch):
             "SELECT count(*) FROM graph_node WHERE catalog_source = 'ftr' "
             "AND search_doc @@ plainto_tsquery('english', %s)", (token,)).fetchone()[0] == 0
 
-    # 6) NON-VACUOUS: enrichment really ran, chunked past the 40-item batch cap. ceil(126/40) = 4
-    #    chunks minimum, each one audited llm_call — so >= 2 batch calls is guaranteed with margin.
+    # 6) The DECLARED type reached the classifier (R5-5): every audited concept batch item carries
+    #    the file's varchar/double/timestamp, never the operational 'unknown'; the VARCHAR column
+    #    cust_name specifically egressed as 'varchar'.
+    concept_inputs = conn.execute(
+        "SELECT redacted_input FROM llm_call WHERE run_id = %s "
+        "AND task = 'overlay.enrich.concept' AND prompt_id = 'overlay_concept_batch_v1'",
+        (ENRICHMENT_RUN_ID,)).fetchall()
+    items = [it for (ri,) in concept_inputs for it in ri["catalog_metadata"]["items"]]
+    assert len(items) == _N_COLS                     # one item per column across the chunks
+    assert {it.get("type") for it in items} == {"varchar", "double", "timestamp"}
+    assert not any(it.get("type") == "unknown" for it in items)
+    by_col = {it["column"].lower(): it for it in items}
+    assert by_col["cust_name"]["type"] == "varchar"
+
+    # 7) NON-VACUOUS: enrichment really ran, chunked past the 40-item batch cap — ceil(126/40) = 4
+    #    audited concept batch calls minimum.
     total_llm_calls = conn.execute(
         "SELECT count(*) FROM llm_call WHERE run_id = %s", (ENRICHMENT_RUN_ID,)).fetchone()[0]
     assert total_llm_calls >= 1
-    concept_batch_audits = conn.execute(
-        "SELECT count(*) FROM llm_call WHERE run_id = %s AND task = 'overlay.enrich.concept' "
-        "AND prompt_id = 'overlay_concept_batch_v1'", (ENRICHMENT_RUN_ID,)).fetchone()[0]
-    assert concept_batch_audits >= 4        # ceil(126 / 40) — proves chunking, audited durably
+    assert len(concept_inputs) >= 4         # ceil(126 / 40) — proves chunking, audited durably
     assert llm.concept_batch_calls >= 4     # and the provider actually saw each chunk
     # Every requested item resolved: the concept stage's honest detail saw all 126 columns.
     state, detail = _stage(conn, "enrich_concept")
@@ -232,13 +310,15 @@ def test_ftr_full_api_pg_search_acceptance(make_client, conn, monkeypatch):
     for other in ("enrich_definition", "enrich_domain"):
         state, detail = _stage(conn, other)
         assert state == "succeeded", (other, state, detail)
-    # The parse stage recorded the sanitize provenance: >= 3 clauses stripped/blanked (the three
-    # sample-bearing definitions), so the sanitizer provably fired on this upload.
-    state, detail = _stage(conn, "parse")
-    assert state == "succeeded"
-    assert detail.get("sanitized_clauses", 0) >= 3, detail
 
-    # 7) SEARCH — the ingested glossary is findable end-to-end through the API (and, per #5 above,
+    # 8) The run manifest records the HONEST input row count (R5-9): all 127 data rows — the
+    #    table term included — not len(rows).
+    run_id = res.headers[RUN_ID_HEADER]
+    (row_count,) = conn.execute(
+        "SELECT row_count FROM ingestion_run WHERE id = %s", (run_id,)).fetchone()
+    assert row_count == _N_ROWS
+
+    # 9) SEARCH — the ingested glossary is findable end-to-end through the API (and, per #5 above,
     #    a scrub token never is).
     hits = client.get("/search", params={"q": "counterparty", "source": "ftr"},
                       headers=AUTH).json()["hits"]

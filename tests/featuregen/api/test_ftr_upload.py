@@ -14,6 +14,11 @@ Contracts under test (round-4 resolutions #6/#9/#10):
   M4): a row whose definition holds a recognized sample clause AND which quarantines for a
   NON-definition reason persists only the SANITIZED definition in ``quarantine_row.raw``.
 
+Since R5-1 the term_type vocabulary is OPEN (an unknown value like ``Mesure`` or the real file's
+``Regulatory Term`` INGESTS — see test_ftr_acceptance.py), so the adapter-level quarantine
+triggers exercised here are the ones that STILL quarantine: an UNRESOLVABLE FQN (R5-7), a
+DUPLICATE ``source_row`` (provenance rule), and a MALFORMED row width (R5-6).
+
 Fixture strings mirror tests/featuregen/overlay/upload/test_ftr_adapter.py (inline, never read
 from ~/Downloads).
 """
@@ -41,28 +46,38 @@ _FTR_CSV = _HDR + (
     '20,DPL_EIB_COMPLIANCE.COMP_FIN_TRAN,Financial Transaction Repository,'
     '"Daily compliance transaction repository.",Compliance,Reference Data,,,,,,Reference,Table,,,,\n')
 
-# The same upload plus one row whose term_type is OUTSIDE the closed vocabulary ("Mesure") — the
-# adapter quarantines it at reader level, stamped with _adapter="ftr" + its source_row.
-_FTR_CSV_BAD_TERM_TYPE = _FTR_CSV + (
+# The same upload plus one row whose FQN cannot resolve (no dots — neither a 3-part column nor a
+# 2-part table identity): the adapter quarantines it at reader level (R5-7), stamped with
+# _adapter="ftr" + its source_row, the raw FQN preserved in the reason for the re-upload fix.
+_FTR_CSV_BAD_FQN = _FTR_CSV + (
+    '21,no_dots_here,Settlement Date,'
+    '"The date the transaction settles.",Payments,Business Term,Settlement,,,,,Payment,'
+    'Transaction,,,,DATE\n')
+
+# The same upload plus one MALFORMED-WIDTH row (R5-6): the definition is UNQUOTED and carries a
+# comma, so csv sees 18 cells and every later field shifts one column right (csv.DictReader files
+# the overflow under its None key) — the adapter quarantines it as read, nothing shifted ingests.
+_FTR_CSV_MALFORMED_WIDTH = _FTR_CSV + (
     '21,DPL_EIB_COMPLIANCE.COMP_FIN_TRAN.SETTLE_DT,Settlement Date,'
-    '"The date the transaction settles.",Payments,Mesure,Settlement,,,,,Payment,Transaction,,,,'
-    'DATE\n')
+    'The date the transaction settles, net of adjustments,Payments,Business Term,Settlement,'
+    ',,,,Payment,Transaction,,,,DATE\n')
 
 # Near-FTR (#10): the distinctive schema.table.column header is present, but one header is renamed
 # (term_name -> business_name), so the multiset is not the exact FTR layout -> HTTP 400.
 _NEAR_FTR_CSV = _FTR_CSV.replace("term_name,", "business_name,", 1)
 
 # Whole-branch M4: a row that BOTH carries a RECOGNIZED sample clause in its definition (synthetic
-# scrub token ARTKOM — never a real value; the clause shape mirrors test_ftr_acceptance._D_ENTITY,
-# a verified strip_sample_values path) AND quarantines for a NON-definition reason (unknown
-# term_type "Mesure" -> adapter-level quarantine). The durable quarantine_row must persist only the
-# SANITIZED definition — the raw sample values may never reach any persistence surface.
+# scrub token ARTKOM — never a real value; the clause shape mirrors the acceptance fixture, a
+# verified strip_sample_values path) AND quarantines for a NON-definition reason — a DUPLICATE
+# source_row (18, already claimed by the CUST_NAME row; every member of the duplicate group fails
+# closed). The durable quarantine_row must persist only the SANITIZED definition — the raw sample
+# values may never reach any persistence surface.
 _SAMPLE_TOKEN = "ARTKOM"
 _FTR_CSV_SAMPLE_IN_QUARANTINE = _FTR_CSV + (
-    '21,DPL_EIB_COMPLIANCE.COMP_FIN_TRAN.CPTY_NAME,Counterparty Name,'
+    '18,DPL_EIB_COMPLIANCE.COMP_FIN_TRAN.CPTY_NAME,Counterparty Name,'
     '"Registered counterparty name. The sample profile is TEXT, with representative values '
     f'such as {_SAMPLE_TOKEN} GLOBAL FZE; NORDIC HOLDINGS AS, which supports interpretation.",'
-    'Party,Mesure,Onboarding,,,,,Party,Customer,,,,VARCHAR\n')
+    'Party,Dimension,Onboarding,,,,,Party,Customer,,,,VARCHAR\n')
 
 
 def _actor() -> IdentityEnvelope:
@@ -95,13 +110,14 @@ def test_near_ftr_upload_rejected_with_diagnostic(client):
 # ── Quarantine provenance: _adapter="ftr" + source_row persist on the durable row (#9) ───────────
 
 def test_ftr_quarantine_row_carries_adapter_tag_and_source_row(client, conn):
-    res = upload_csv(client, "ftr", _FTR_CSV_BAD_TERM_TYPE)
+    res = upload_csv(client, "ftr", _FTR_CSV_BAD_FQN)
     assert res.status_code == 200, res.text
     assert res.json()["quarantined"] == 1
     rows = _ftr_quarantine_rows(conn, "ftr")
     assert len(rows) == 1
     _, raw, reason = rows[0]
-    assert "term_type" in reason
+    assert "unresolvable FQN" in reason
+    assert "no_dots_here" in reason         # the raw FQN the uploader must see to fix the file
     assert raw["source_row"] == "21"        # provenance back to the file's own row id
     assert raw["_adapter"] == "ftr"         # the inline-repair guard's discriminator
 
@@ -115,12 +131,13 @@ def test_ftr_quarantined_sample_bearing_row_persists_only_sanitized_definition(c
 
     res = upload_csv(client, "ftr", _FTR_CSV_SAMPLE_IN_QUARANTINE)
     assert res.status_code == 200, res.text
-    assert res.json()["quarantined"] >= 1
+    # BOTH members of the duplicate source_row group fail closed: CUST_NAME and CPTY_NAME.
+    assert res.json()["quarantined"] == 2
 
     rows = _ftr_quarantine_rows(conn, "ftr")
-    assert len(rows) >= 1                    # NON-VACUOUS: the durable surface holds the row
-    _, _, reason = rows[0]
-    assert "term_type" in reason             # quarantined for the NON-definition reason, as staged
+    assert len(rows) == 2                    # NON-VACUOUS: the durable surface holds the rows
+    (cpty_reason,) = [reason for _, raw, reason in rows if raw.get("column") == "CPTY_NAME"]
+    assert "duplicate source_row" in cpty_reason   # the NON-definition reason, as staged
     # Positive control: the SAME probe shape DOES see this row's raw (its column identity), so the
     # token-absence probes below scan a surface that provably contains the quarantined row.
     assert conn.execute(
@@ -139,9 +156,10 @@ def test_ftr_quarantined_sample_bearing_row_persists_only_sanitized_definition(c
 # ── Inline repair is refused for FTR rows (#9) ───────────────────────────────────────────────────
 
 def test_ftr_quarantine_row_refuses_inline_repair(client, conn):
-    res = upload_csv(client, "ftr", _FTR_CSV_BAD_TERM_TYPE)
+    res = upload_csv(client, "ftr", _FTR_CSV_MALFORMED_WIDTH)
     assert res.status_code == 200, res.text
-    (row_index, _, _), = _ftr_quarantine_rows(conn, "ftr")
+    (row_index, _, reason), = _ftr_quarantine_rows(conn, "ftr")
+    assert "malformed row width" in reason               # 18 cells — nothing shifted ingested
     resolved, reason = resolve_quarantine_row(
         conn, "ftr", row_index, {"column": "settle_dt"}, actor=_actor())
     assert resolved is False
