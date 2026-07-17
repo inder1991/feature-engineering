@@ -502,13 +502,20 @@ def _cross_schema_conflicts(conn, catalog_source: str, rows: list[CanonicalRow],
     column node where EITHER the stored ``schema_name`` is non-NULL and differs (case-insensitive)
     from the incoming schema, OR the stored ``schema_name`` IS NULL — a legacy/unverifiable node
     (built before schema preservation, or by a schema-less upload) that a new schema must not
-    silently claim (the legacy-NULL policy). Errors are indexed by the row's position in the
-    ORIGINAL upload (disjoint from validate's quarantined indexes — those rows are not conflict
-    candidates — and from the reader-level quarantine, which starts AT ``len(rows)``) and stamped
-    ``adapter="ftr"``: a schema conflict cannot be repaired inline (resolving the row would bypass
-    this very fence) — the fix is re-uploading a corrected file. Schema-less records (the generic
-    glossary reader) contribute nothing, so only schema-carrying uploads can ever hold."""
+    silently claim (the legacy-NULL policy). The fence keys on the TABLE node too (R5-4): an
+    incoming table whose existing ``public.<table>`` node carries a differing (or NULL — same
+    legacy policy) ``schema_name`` conflicts even when NO column names overlap — comparing only
+    column nodes let a new schema with disjoint columns silently replace the table's identity.
+    Every affected row (each row is affected by at most ONE error — the more specific column-level
+    one wins — keeping the quarantine's ``(catalog_source, row_index)`` PK safe) is indexed by its
+    position in the ORIGINAL upload (disjoint from validate's quarantined indexes — those rows are
+    not conflict candidates — and from the reader-level quarantine, which starts AT ``len(rows)``)
+    and stamped ``adapter="ftr"``: a schema conflict cannot be repaired inline (resolving the row
+    would bypass this very fence) — the fix is re-uploading a corrected file. Schema-less records
+    (the generic glossary reader) contribute nothing, so only schema-carrying uploads can ever
+    hold."""
     incoming: dict[tuple[str, str], str] = {}
+    incoming_tables: dict[str, str] = {}   # normalized table -> declared schema (first wins)
     for rec in glossary.records:
         if not rec.schema:
             continue
@@ -516,9 +523,10 @@ def _cross_schema_conflicts(conn, catalog_source: str, rows: list[CanonicalRow],
             _src, _schema, table, column = parse_ref(rec.logical_ref)
         except ValueError:
             continue
+        incoming_tables.setdefault(table, rec.schema)
         if column is not None:
             incoming[(table, column)] = rec.schema
-    if not incoming:
+    if not incoming_tables:
         return []
     existing = conn.execute(
         "SELECT object_ref, schema_name FROM graph_node "
@@ -533,21 +541,45 @@ def _cross_schema_conflicts(conn, catalog_source: str, rows: list[CanonicalRow],
             continue
         if schema_name is None or _lc(schema_name) != _lc(declared):
             conflicts[(parts[1], parts[2])] = schema_name
-    if not conflicts:
+    existing_tables = conn.execute(
+        "SELECT object_ref, schema_name FROM graph_node "
+        "WHERE catalog_source = %s AND kind = 'table'", (catalog_source,)).fetchall()
+    table_conflicts: dict[str, str | None] = {}   # table -> existing table-node schema_name
+    for object_ref, schema_name in existing_tables:
+        parts = object_ref.split(".")   # "public.table"
+        if len(parts) != 2:
+            continue
+        declared_table = incoming_tables.get(parts[1])
+        if declared_table is None:
+            continue
+        if schema_name is None or _lc(schema_name) != _lc(declared_table):
+            table_conflicts[parts[1]] = schema_name
+    if not conflicts and not table_conflicts:
         return []
+
+    def _attribution(existing_schema: str | None) -> str:
+        return (f"already exists under schema {existing_schema!r}"
+                if existing_schema is not None
+                else "already exists with no attested schema (legacy — unverifiable)")
+
     errors: list[RowError] = []
     for i, r in enumerate(rows):
-        key = (_lc(r.table), _lc(r.column))
-        if key not in conflicts or i in skip_indexes:
+        if i in skip_indexes:
             continue
-        existing_schema, declared = conflicts[key], incoming[key]
-        attribution = (f"already exists under schema {existing_schema!r}"
-                       if existing_schema is not None
-                       else "already exists with no attested schema (legacy — unverifiable)")
-        errors.append(RowError(
-            i, f"schema conflict — public.{key[0]}.{key[1]} {attribution}; cannot re-attribute "
-               f"to {declared!r} while the operational key is single-schema (Delivery C)",
-            r, adapter="ftr"))
+        key = (_lc(r.table), _lc(r.column))
+        if key in conflicts:
+            errors.append(RowError(
+                i, f"schema conflict — public.{key[0]}.{key[1]} "
+                   f"{_attribution(conflicts[key])}; cannot re-attribute to {incoming[key]!r} "
+                   f"while the operational key is single-schema (Delivery C)",
+                r, adapter="ftr"))
+        elif key[0] in table_conflicts:
+            errors.append(RowError(
+                i, f"schema conflict — table public.{key[0]} "
+                   f"{_attribution(table_conflicts[key[0]])}; cannot re-attribute to "
+                   f"{incoming_tables[key[0]]!r} while the operational key is single-schema "
+                   f"(Delivery C)",
+                r, adapter="ftr"))
     return errors
 
 

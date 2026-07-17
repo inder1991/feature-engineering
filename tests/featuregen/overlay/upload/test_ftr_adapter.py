@@ -350,3 +350,18 @@ def test_multi_schema_fold_collision_quarantines_both_rows():
     assert p.rows == [] and p.records == []
     assert len(p.quarantined) == 2
     assert all("schema collision" in q.message for q in p.quarantined)
+
+
+def test_same_table_different_columns_different_schemas_quarantines_all_rows():
+    """R5-4: the fold key above only catches the SAME (table, column) under two schemas. Two rows
+    under the same table but DIFFERENT columns evaded it — both ingested, and the single
+    ``public.tab`` identity would carry one schema on the table node and another on a column.
+    The TABLE is judged across its column rows; when it spans schemas, every row quarantines
+    adapter-level (``adapter="ftr"`` — inline repair refused, fix the file and re-upload)."""
+    csv_text = _HDR + _row(source_row="18", fqn="SCHEMA_A.TAB.C1") + _row(
+        source_row="19", fqn="SCHEMA_B.TAB.C2")
+    p = read_ftr_glossary(csv_text, source="ftr")
+    assert p.rows == [] and p.records == []
+    assert len(p.quarantined) == 2
+    assert all(q.adapter == "ftr" for q in p.quarantined)
+    assert all("spans multiple schemas" in q.message for q in p.quarantined)

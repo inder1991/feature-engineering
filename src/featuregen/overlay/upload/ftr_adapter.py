@@ -43,7 +43,8 @@ decisions follow the round-4/round-5 review resolutions in the A1 plan:
   mirroring the duplicate-FQN rule).
 
 Structure mirrors ``read_glossary``'s two passes: Pass 1 parses and indexes the collision keys
-(multi-schema folds, duplicate normalized FQNs, source_row ints), diverting malformed-width rows
+(multi-schema folds, multi-schema TABLE spans — R5-4: same table, different columns, different
+schemas — duplicate normalized FQNs, source_row ints), diverting malformed-width rows
 before their shifted fields can pollute those indexes; Pass 2 emits, diverting bad rows into the
 reader-level quarantine whose ``row_index`` starts AT ``len(rows)`` so it can never collide with a
 ``validate_rows`` index on the ``quarantine_row`` primary key.
@@ -228,6 +229,7 @@ def read_ftr_glossary(text: str, *, source: str) -> PreparedFtrUpload:
     parsed: list[_ParsedRow] = []
     pending: list[tuple[str, CanonicalRow]] = []   # (message, quarantine row) awaiting an index
     schemas_by_fold: dict[tuple[str, str], dict[str, str]] = {}
+    schemas_by_table: dict[str, set[str]] = {}     # normalized table -> its COLUMN rows' schemas
     fqn_counts: Counter[tuple[str, str, str]] = Counter()
     srcrow_counts: Counter[int] = Counter()
     for raw in reader:
@@ -290,6 +292,7 @@ def read_ftr_glossary(text: str, *, source: str) -> PreparedFtrUpload:
             if column is not None:
                 fold = (_norm(table), _norm(column))
                 schemas_by_fold.setdefault(fold, {}).setdefault(_norm(schema), schema)
+                schemas_by_table.setdefault(_norm(table), set()).add(_norm(schema))
 
     # Pass 2 — emit rows/records, diverting bad rows into the reader-level quarantine. Every
     # quarantined row carries the SANITIZED definition and its raw identity spelling (mirroring
@@ -350,6 +353,22 @@ def read_ftr_glossary(text: str, *, source: str) -> PreparedFtrUpload:
                     f"merge into one column — resolve to a single schema and re-upload",
                     _quarantine_row(r)))
                 continue
+
+        # R5-4: the fold key above only catches the SAME (table, column) under two schemas — two
+        # rows under the same table but DIFFERENT columns evaded it, and the single public.<table>
+        # identity would carry one schema on its table node and another on a column. Judge the
+        # TABLE across its COLUMN rows (a table term's own schema disagreeing with single-schema
+        # columns is the round-4 #5 tail's case, handled at evidence time — not this fence); when
+        # the table spans, EVERY row of it — the table term included, its identity is just as
+        # ambiguous — fails closed.
+        table_schemas = schemas_by_table.get(_norm(r.table), set())
+        if len(table_schemas) > 1:
+            table = _norm(r.table)
+            pending.append((
+                f"table {table!r} spans multiple schemas {sorted(table_schemas)!r} — a single "
+                f"public.{table} identity cannot carry two schemas; split into one schema per "
+                f"upload", _quarantine_row(r)))
+            continue
 
         records.append(GlossaryRecord(
             logical_ref=normalize_ref(source, r.schema, r.table, r.column),

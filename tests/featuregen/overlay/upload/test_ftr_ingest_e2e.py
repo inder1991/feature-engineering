@@ -9,6 +9,9 @@ Contracts under test (round-4 resolutions #1/#4/#5):
   DIFFERENT schema is HELD fail-closed BEFORE any side effect (#4): honest ``IngestResult``
   (``held``, quarantined == the REAL conflict count, never ``len(rows)``) and the existing
   node's ``schema_name`` untouched (no delete/rebuild happened).
+- The fence keys on the TABLE node too (R5-4): a new schema claiming an existing
+  ``public.<table>`` is held even when NO column names overlap — the column-node comparison
+  alone would have let it straight through to a silent identity rewrite.
 
 Fixture is the Task-3a inline ``_FTR_CSV`` (never read from ~/Downloads); refs are LOWERCASE and
 every query is ``catalog_source``-scoped.
@@ -17,7 +20,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
-from tests.featuregen.overlay.upload.test_ftr_adapter import _FTR_CSV
+from tests.featuregen.overlay.upload.test_ftr_adapter import _FTR_CSV, _HDR, _row
 
 from featuregen.contracts.envelopes import IdentityEnvelope
 from featuregen.overlay.config import OverlayConfig, register_overlay_config
@@ -79,18 +82,47 @@ def test_cross_schema_upload_is_held(db):
     _seal()
     assert _ingest(db, _FTR_CSV).status == "ingested"
 
-    # Second upload to the SAME source re-attributes CUST_NAME to a different schema. Only that
-    # one column conflicts (TXN_AMT still agrees), so the REAL conflict count is exactly 1.
-    second = _FTR_CSV.replace("DPL_EIB_COMPLIANCE.COMP_FIN_TRAN.CUST_NAME",
-                              "OTHER_SCHEMA.COMP_FIN_TRAN.CUST_NAME")
+    # Second upload to the SAME source re-attributes the WHOLE table to a different schema —
+    # single-schema WITHIN the upload, because R5-4 now quarantines a table spanning two schemas
+    # at the adapter before the fence ever sees it — and adds an unrelated NEW table. Only
+    # comp_fin_tran's two column rows conflict; NEW_TAB has no existing node and passes, so the
+    # REAL conflict count is exactly 2, never len(rows) == 3.
+    second = (_FTR_CSV.replace("DPL_EIB_COMPLIANCE", "OTHER_SCHEMA")
+              + _row(source_row="21", fqn="SOME_SCHEMA.NEW_TAB.COL_X"))
     res = _ingest(db, second)
     assert res.status == "held"
-    assert res.quarantined == 1                      # the real conflict count, never len(rows)
+    assert res.quarantined == 2                      # the real conflict count, never len(rows)
     assert "schema conflict" in (res.reason or "")
 
     # Fail-closed BEFORE any side effect: the original attribution survives untouched — the node
-    # still exists with its original schema_name, proving no delete/rebuild ran.
+    # still exists with its original schema_name, proving no delete/rebuild ran — and the held
+    # upload's new table was never graphed.
     assert _node(db, _COL_REF, "schema_name") == ("DPL_EIB_COMPLIANCE",)
+    assert _node(db, "public.new_tab", "schema_name") is None
+
+
+def test_cross_upload_new_schema_cannot_claim_table_without_column_overlap(db):
+    """R5-4 table-level fence: a new schema claiming an existing ``public.<table>`` identity is
+    HELD even when NO column names overlap. The column-node fence alone compared only existing
+    COLUMN nodes, so a second upload for the same table with disjoint columns silently replaced
+    the table's schema attribution."""
+    _seal()
+    first = _HDR + _row(source_row="18", fqn="SCHEMA_A.TAB.C1") + _row(
+        source_row="19", fqn="SCHEMA_A.TAB.C2")
+    assert _ingest(db, first).status == "ingested"
+    assert _node(db, "public.tab", "schema_name") == ("SCHEMA_A",)
+
+    # Same table, DIFFERENT schema, entirely NON-overlapping columns — no existing column node
+    # matches, so only the TABLE-node comparison can catch the identity claim.
+    second = _HDR + _row(source_row="18", fqn="SCHEMA_B.TAB.C3") + _row(
+        source_row="19", fqn="SCHEMA_B.TAB.C4")
+    res = _ingest(db, second)
+    assert res.status == "held"
+    assert res.quarantined == 2                      # both claiming rows — the real count
+    assert "schema conflict" in (res.reason or "")
+
+    # Fail-closed: the original table attribution survives untouched.
+    assert _node(db, "public.tab", "schema_name") == ("SCHEMA_A",)
 
 
 def test_table_term_reaches_table_node_via_evidence(db):
