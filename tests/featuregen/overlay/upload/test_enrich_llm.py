@@ -16,12 +16,40 @@ from featuregen.intake.redaction import (
 )
 from featuregen.overlay.upload.enrich_batch import EGRESS, VALID, BatchItem
 from featuregen.overlay.upload.enrich_llm import (
+    _SCHEMAS,
     audited_batch_call,
     audited_enrich_call,
     register_enrichment_schemas,
 )
 
 _META = {"table": "accounts", "column": "balance", "type": "numeric"}
+
+
+def _forbidden_array_keys(node, path=""):
+    """Walk a JSONSchema node (dict/list) and yield the dotted path of every `minItems`/`maxItems`
+    encountered anywhere in the structure."""
+    if isinstance(node, dict):
+        for key, val in node.items():
+            here = f"{path}.{key}" if path else key
+            if key in ("minItems", "maxItems"):
+                yield here
+            yield from _forbidden_array_keys(val, here)
+    elif isinstance(node, list):
+        for i, val in enumerate(node):
+            yield from _forbidden_array_keys(val, f"{path}[{i}]")
+
+
+def test_no_output_schema_carries_array_minitems_or_maxitems():
+    """API-compatibility pin: the Anthropic structured-output API rejects `maxItems` (and, defensively,
+    `minItems`) on `array` types with HTTP 400, which fails every enrichment call closed. The real
+    per-batch count cap is code-enforced (`validate_batch_results`), so NO schema may carry either key.
+    Reintroducing one must fail CI, not silently break the live provider (FakeLLM never validates it)."""
+    offenders = {
+        name: found
+        for (name, _ver), schema in _SCHEMAS.items()
+        if (found := sorted(_forbidden_array_keys(schema)))
+    }
+    assert offenders == {}, f"schemas still carry minItems/maxItems (rejected by the API): {offenders}"
 
 
 def _call(db, client, catalog_metadata=_META):

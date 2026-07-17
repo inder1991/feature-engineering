@@ -229,11 +229,15 @@ _SCHEMAS: dict[tuple[str, int], dict] = {
                               "properties": {"findings": {"type": "array",
                                                           "items": {"type": "string"}}},
                               "required": ["findings"]},
-    # Batch array output-schemas (spec C18 — bounded arrays; `maxItems` is a generous backstop, app
-    # validation enforces the real per-batch cap). One {ref, <out_key>} object per requested item.
+    # Batch array output-schemas (spec C18). NO `minItems`/`maxItems` on ANY array: the Anthropic
+    # structured-output API rejects array `maxItems` with HTTP 400 ("For 'array' type, property
+    # 'maxItems' is not supported"), which would fail EVERY batch call closed. The real per-batch
+    # count cap is code-enforced by `validate_batch_results` (extra/duplicate refs against the
+    # REQUESTED ref-set), and the input side is bounded by `chunk_items` / `_MAX_COLUMN_PROFILES`, so
+    # dropping the schema cap loses no real bound. One {ref, <out_key>} object per requested item.
     ("overlay_concept_batch", 1): {
         "type": "object", "additionalProperties": False,
-        "properties": {"results": {"type": "array", "minItems": 0, "maxItems": 256,
+        "properties": {"results": {"type": "array",
             "items": {"type": "object", "additionalProperties": False,
                       "properties": {"ref": {"type": "string", "maxLength": 128},
                                      "concept": {"type": "string", "maxLength": 128}},
@@ -241,7 +245,7 @@ _SCHEMAS: dict[tuple[str, int], dict] = {
         "required": ["results"]},
     ("overlay_definition_batch", 1): {
         "type": "object", "additionalProperties": False,
-        "properties": {"results": {"type": "array", "minItems": 0, "maxItems": 256,
+        "properties": {"results": {"type": "array",
             "items": {"type": "object", "additionalProperties": False,
                       "properties": {"ref": {"type": "string", "maxLength": 128},
                                      "definition": {"type": "string", "maxLength": 500}},
@@ -249,7 +253,7 @@ _SCHEMAS: dict[tuple[str, int], dict] = {
         "required": ["results"]},
     ("overlay_domain_batch", 1): {
         "type": "object", "additionalProperties": False,
-        "properties": {"results": {"type": "array", "minItems": 0, "maxItems": 256,
+        "properties": {"results": {"type": "array",
             "items": {"type": "object", "additionalProperties": False,
                       "properties": {"ref": {"type": "string", "maxLength": 256},
                                      "domain": {"type": "string", "maxLength": 64}},
@@ -264,13 +268,13 @@ _SCHEMAS: dict[tuple[str, int], dict] = {
     # would require a lag_hours field end-to-end (out of scope).
     ("overlay_table_synth_batch", 1): {
         "type": "object", "additionalProperties": False,
-        "properties": {"results": {"type": "array", "minItems": 0, "maxItems": 256,
+        "properties": {"results": {"type": "array",
             "items": {"type": "object", "additionalProperties": False,
                 "properties": {
                     "ref": {"type": "string", "maxLength": 256},
                     "synthesis": {"type": "object", "additionalProperties": False,
                         "properties": {
-                            "grain_columns": {"type": "array", "maxItems": 16,
+                            "grain_columns": {"type": "array",
                                               "items": {"type": "string", "maxLength": 128}},
                             "as_of_column": {"type": ["string", "null"], "maxLength": 128},
                             "as_of_basis": {"type": ["string", "null"],
@@ -285,7 +289,7 @@ _SCHEMAS: dict[tuple[str, int], dict] = {
     ("overlay_table_synth", 1): {
         "type": "object", "additionalProperties": False,
         "properties": {
-            "grain_columns": {"type": "array", "maxItems": 16,
+            "grain_columns": {"type": "array",
                               "items": {"type": "string", "maxLength": 128}},
             "as_of_column": {"type": ["string", "null"], "maxLength": 128},
             "as_of_basis": {"type": ["string", "null"],
@@ -302,17 +306,17 @@ _SCHEMAS: dict[tuple[str, int], dict] = {
     # Batch-only (ref_aware, no single seam), so only the `_batch` shape exists.
     ("overlay_table_synth_summary_batch", 1): {
         "type": "object", "additionalProperties": False,
-        "properties": {"results": {"type": "array", "minItems": 0, "maxItems": 256,
+        "properties": {"results": {"type": "array",
             "items": {"type": "object", "additionalProperties": False,
                 "properties": {
                     "ref": {"type": "string", "maxLength": 256},
                     "summary": {"type": "object", "additionalProperties": False,
                         "properties": {
-                            "grain_candidates": {"type": "array", "maxItems": 32,
+                            "grain_candidates": {"type": "array",
                                                  "items": {"type": "string", "maxLength": 128}},
-                            "temporal_candidates": {"type": "array", "maxItems": 32,
+                            "temporal_candidates": {"type": "array",
                                                     "items": {"type": "string", "maxLength": 128}},
-                            "entity_signals": {"type": "array", "maxItems": 16,
+                            "entity_signals": {"type": "array",
                                                "items": {"type": "string", "maxLength": 128}},
                             "event_or_snapshot": {"type": ["string", "null"],
                                                   "enum": ["event", "snapshot", None]},
