@@ -15,7 +15,7 @@ import re
 from dataclasses import dataclass
 
 from featuregen.overlay.upload.entity import _is_id_like
-from featuregen.overlay.upload.passc.types import DEFAULT_CONFIG, PassCConfig
+from featuregen.overlay.upload.passc.types import DEFAULT_CONFIG, KNOWN_TERM_TYPES, PassCConfig
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,10 +74,16 @@ def _hits_negative(col: ColMeta, cfg: PassCConfig) -> bool:
 
 
 def is_join_key_eligible(col: ColMeta, cfg: PassCConfig = DEFAULT_CONFIG) -> bool:
-    """May this column anchor a join candidate? Measures never; word-boundary negatives never;
-    otherwise the column must LOOK like an id (name-suffix heuristic, shared with entity
-    suggestions) or its term name must carry an id token."""
-    if (col.term_type or "").strip().lower() == "measure":
+    """May this column anchor a join candidate? Measures never; an UNRECOGNIZED non-blank glossary
+    term_type never (ingestion is open-vocab, so a typo like "Mesure" would otherwise slip past the
+    exact-measure gate — conservative until classified); a BLANK term_type (technical CSV /
+    non-glossary — the primary join source) falls through; word-boundary negatives never; otherwise
+    the column must LOOK like an id (name-suffix heuristic, shared with entity suggestions) or its
+    term name must carry an id token."""
+    tt = (col.term_type or "").strip().lower()
+    if tt == "measure":
+        return False
+    if tt and tt not in KNOWN_TERM_TYPES:
         return False
     if _hits_negative(col, cfg):
         return False

@@ -27,6 +27,25 @@ def test_measure_term_type_alone_blocks_an_otherwise_id_like_column():
     assert is_join_key_eligible(_c(column="settlement_id", term_name="Settlement Total", term_type="dimension")) is True
 
 
+def test_unknown_nonblank_term_type_is_ineligible():
+    # Open-vocab ingestion means a typo like "Mesure" arrives as term_type "mesure" — NOT the exact
+    # "measure" — and must NOT be offered as a join key (it could be a mistyped measure).
+    assert is_join_key_eligible(_c(column="acct_id", term_type="measure")) is False
+    assert is_join_key_eligible(_c(column="acct_id", term_type="mesure")) is False
+    assert is_join_key_eligible(_c(column="acct_id", term_type="foobar")) is False
+
+
+def test_known_term_types_fall_through_to_id_heuristic():
+    assert is_join_key_eligible(_c(column="acct_id", term_type="dimension")) is True
+    assert is_join_key_eligible(_c(column="acct_id", term_type="regulatory_term")) is True
+
+
+def test_blank_term_type_stays_eligible():
+    # CRITICAL regression guard: technical CSV / non-glossary columns have NO term_type and are the
+    # PRIMARY join source — blank must fall through to the id-like heuristic, never be blocked.
+    assert is_join_key_eligible(_c(column="acct_id", term_type="")) is True
+
+
 def test_word_boundary_negatives_do_not_trip_real_ids():
     # "Mandate Reference" contains substring "date"; "Corporate Account Number" contains "rate" — both are IDs
     assert is_join_key_eligible(_c(column="mandate_ref", term_name="Mandate Reference"))

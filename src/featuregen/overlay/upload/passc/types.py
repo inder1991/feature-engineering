@@ -3,6 +3,11 @@ from dataclasses import dataclass
 from enum import StrEnum
 CONFIG_VERSION = "passc-config-v1"
 ALGORITHM_VERSION = "passc-algo-v1"
+# Keep in sync with ftr_adapter.KNOWN_TERM_TYPES; drives conservative Pass C eligibility — an
+# UNRECOGNIZED non-blank glossary term_type is ineligible (could be a mistyped measure), while a
+# BLANK term_type (technical CSV / non-glossary) stays eligible.
+KNOWN_TERM_TYPES = frozenset({"measure", "dimension", "code_value", "reference_data",
+                              "business_term", "regulatory_term"})
 class NamespaceCompatibility(StrEnum):
     COMPATIBLE = "compatible"; POSSIBLE = "possible"; AMBIGUOUS = "ambiguous"; INCOMPATIBLE = "incompatible"
 class CardinalityInferenceStatus(StrEnum):
