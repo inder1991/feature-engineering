@@ -1,4 +1,5 @@
--- src/featuregen/db/migrations/0999_graph_node_schema_declared.sql
+-- src/featuregen/db/migrations/1000_graph_node_schema_declared.sql
+-- (renumbered 0999->1000: origin/main took 0999_planner_shadow_store.sql via Phase 3B.4)
 -- FTR glossary adapter A1 (Tasks 5+8) — three ADDITIVE, nullable graph_node columns. The
 -- operational object identity stays the public-flattened ref (single-schema until Delivery C);
 -- these columns preserve what the flatten would otherwise discard, without changing any key:
