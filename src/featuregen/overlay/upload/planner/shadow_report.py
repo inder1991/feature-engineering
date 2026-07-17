@@ -255,6 +255,7 @@ class GateResult:
     gate6_drift: bool
     gate7_artifact: bool
     reasons: tuple[str, ...] = ()
+    sample: StratifiedSample | None = None      # the EXACT frame Gate 4 evaluated (pins the artifact)
 
     @property
     def machine_gates(self) -> tuple[bool, ...]:
@@ -346,7 +347,7 @@ def evaluate_gate(inputs: GateInputs) -> GateResult:
     if inputs.audit_false_resolves:
         reasons.append(f"Gate 3: {inputs.audit_false_resolves} audit false resolves")
 
-    gate4, _, r4 = statistical_bound(inputs.report.sample_units, inputs.policy)
+    gate4, sample4, r4 = statistical_bound(inputs.report.sample_units, inputs.policy)
     reasons += r4
 
     gate5 = inputs.stability.stable
@@ -365,7 +366,7 @@ def evaluate_gate(inputs: GateInputs) -> GateResult:
     return GateResult(gate1_capture=gate1, gate2a_map=gate2a, gate2b_review=gate2b,
                       gate3_no_false_resolves=gate3, gate4_statistical_bound=gate4,
                       gate5_replay_stability=gate5, gate6_drift=gate6, gate7_artifact=gate7,
-                      reasons=tuple(reasons))
+                      reasons=tuple(reasons), sample=sample4)
 
 
 # ─── §10.7 the signed artifact ───────────────────────────────────────────────────────────────
@@ -410,20 +411,30 @@ class GateArtifactV1:
 
 
 def report_input_digest(report: PopulationReportV1) -> str:
+    """A digest over EVERYTHING a verifier needs to reproduce the population AND every Gate-1 integrity
+    driver — so recomputing the digest alone detects tampering of the integrity counts, not just the
+    ratio (defense-in-depth; the gate verdict itself is separately signed in the artifact)."""
     material = {
         "run_ids": sorted(report.run_ids), "denominator": report.denominator,
         "numerator": report.numerator, "headline": report.headline_by_primary,
         "breakdown": report.breakdown_by_category, "recipe_outcome_matrix": report.recipe_outcome_matrix,
         "replay_freshness": report.replay_freshness,
         "operationally_unmeasured": report.operationally_unmeasured_count,
+        "incomplete": report.incomplete_count, "compile_disabled": report.compile_disabled_count,
+        "internal_error": report.internal_error_count, "preloop_failure": report.preloop_failure_count,
+        "persistence_partial": report.persistence_partial_count, "truncated": report.truncated_count,
+        "reconcile_complete": report.reconcile_complete, "persistence_loss": report.persistence_loss,
     }
     return hashlib.sha256(json.dumps(material, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
-def build_gate_artifact(*, report: PopulationReportV1, result: GateResult, sample: StratifiedSample,
+def build_gate_artifact(*, report: PopulationReportV1, result: GateResult,
                         review_content_hash: str, policy: GatePolicy, code_commit: str,
                         producer_cohort: str, signer_key_id: str) -> GateArtifactV1:
-    sample_ids = tuple(sorted({h for s in sample.strata for h in s.sampled}))
+    # the sample the artifact pins IS the frame Gate 4 evaluated (carried on the result — no
+    # second, potentially-divergent statistical_bound call).
+    strata = result.sample.strata if result.sample is not None else ()
+    sample_ids = tuple(sorted({h for s in strata for h in s.sampled}))
     return GateArtifactV1(
         code_commit=code_commit, producer_cohort=producer_cohort, gold_set_hash=GOLD_SET_HASH,
         gold_set_version=GOLD_SET_VERSION, evaluator_version=EVALUATOR_VERSION,
@@ -434,8 +445,34 @@ def build_gate_artifact(*, report: PopulationReportV1, result: GateResult, sampl
         gate_reasons=result.reasons)
 
 
+def write_gate_artifact(path: str, artifact: GateArtifactV1) -> None:
+    """Write the artifact's EXACT canonical bytes to ``path`` — the bytes the sidecar signature covers
+    and ``verify_report_file`` re-hashes. Never hand-serialize the artifact some other way."""
+    with open(path, "wb") as handle:
+        handle.write(artifact.canonical_bytes())
+
+
+def authority_sign_gate(inputs: GateInputs, *, private_key_pem: str, code_commit: str,
+                        producer_cohort: str, signer_key_id: str, review_content_hash: str
+                        ) -> tuple[GateArtifactV1, bytes]:
+    """AUTHORITY-side entrypoint (§10.7/F10): the signing authority INDEPENDENTLY re-derives the gate
+    from ``inputs`` and signs ONLY that self-computed artifact — it never signs bytes handed to it. So
+    a compromised evaluator cannot get a hand-forged ``gate_passed=True`` signed: the authority holds
+    the private key AND computes the verdict, closing the 'evaluator signs its own PASS' gap by
+    construction rather than by procedure. Import ``sign_report`` lazily to keep the signing dependency
+    out of the pure report path."""
+    from featuregen.overlay.upload.planner.signing import sign_report
+    result = evaluate_gate(inputs)
+    artifact = build_gate_artifact(
+        report=inputs.report, result=result, review_content_hash=review_content_hash,
+        policy=inputs.policy, code_commit=code_commit, producer_cohort=producer_cohort,
+        signer_key_id=signer_key_id)
+    return artifact, sign_report(artifact.canonical_bytes(), private_key_pem)
+
+
 __all__ = [
     "EVALUATOR_VERSION", "GateArtifactV1", "GateInputs", "GatePolicy", "GateResult",
-    "PopulationReportV1", "build_gate_artifact", "build_population_report", "clopper_pearson_upper",
-    "evaluate_gate", "report_input_digest", "required_shapes_for_bound", "statistical_bound",
+    "PopulationReportV1", "authority_sign_gate", "build_gate_artifact", "build_population_report",
+    "clopper_pearson_upper", "evaluate_gate", "report_input_digest", "required_shapes_for_bound",
+    "statistical_bound", "write_gate_artifact",
 ]

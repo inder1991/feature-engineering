@@ -110,12 +110,18 @@ def read_signature_sidecar(report_path: str | Path) -> bytes:
 
 def verify_report_file(report_path: str | Path,
                        trusted_public_key_pem: str | None = None) -> bool:
-    """Verify a report file against its ``.sig`` sidecar. Missing sidecar / tamper / wrong key → False."""
+    """Verify a report file against its ``.sig`` sidecar. ALL failure modes → False (fail-closed): a
+    missing/unreadable report OR sidecar, a tampered payload, the wrong key, or an UNSET trusted key
+    (``GateKeyNotConfigured``) — verification never trusts by default and never raises out of here."""
     try:
         signature = read_signature_sidecar(report_path)
+        report_bytes = Path(report_path).read_bytes()
     except (OSError, ValueError):
         return False
-    return verify_report(Path(report_path).read_bytes(), signature, trusted_public_key_pem)
+    try:
+        return verify_report(report_bytes, signature, trusted_public_key_pem)
+    except GateKeyNotConfigured:
+        return False    # no trusted key configured → refuse (fail-closed), never a default-trust pass
 
 
 def verify_cli(report_path: str | Path, trusted_public_key_pem: str | None = None) -> int:

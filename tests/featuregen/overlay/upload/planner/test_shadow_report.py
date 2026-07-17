@@ -18,6 +18,8 @@ from featuregen.overlay.upload.planner.shadow_report import (
     GateInputs,
     GatePolicy,
     PopulationReportV1,
+    _is_truncated,
+    authority_sign_gate,
     build_gate_artifact,
     build_population_report,
     clopper_pearson_upper,
@@ -25,6 +27,7 @@ from featuregen.overlay.upload.planner.shadow_report import (
     report_input_digest,
     required_shapes_for_bound,
     statistical_bound,
+    write_gate_artifact,
 )
 from featuregen.overlay.upload.planner.signing import (
     GateKeyNotConfigured,
@@ -76,6 +79,17 @@ def test_sidecar_file_verify_and_cli_exit(tmp_path, monkeypatch):
     assert verify_report_file(report) and verify_cli(report) == 0
     report.write_bytes(b'{"gate_passed":true,"tampered":1}')      # edit the report, keep the old sig
     assert not verify_report_file(report) and verify_cli(report) == 1   # nonzero exit
+
+
+def test_verify_cli_is_fail_closed_on_missing_file_and_unset_key(tmp_path, monkeypatch):
+    priv, pub = generate_keypair()
+    monkeypatch.setenv("FEATUREGEN_INTENT_GATE_PUBLIC_KEY", pub)
+    report = tmp_path / "g.json"
+    report.write_bytes(b"{}")
+    write_signature_sidecar(report, sign_report(report.read_bytes(), priv))
+    assert verify_cli(tmp_path / "missing.json") == 1              # no report/sidecar → nonzero, no raise
+    monkeypatch.delenv("FEATUREGEN_INTENT_GATE_PUBLIC_KEY", raising=False)
+    assert verify_cli(report) == 1                                 # unset trusted key → fail-closed, no raise
 
 
 # ── the conjunctive gate ──
@@ -172,9 +186,8 @@ def test_statistical_bound_sufficient_shapes_pass():
 def test_artifact_records_provenance_and_signature_covers_it():
     priv, pub = generate_keypair()
     report = _report()
-    result = evaluate_gate(_inputs(report=report))
-    _, sample, _ = statistical_bound(report.sample_units, _LENIENT)
-    art = build_gate_artifact(report=report, result=result, sample=sample,
+    result = evaluate_gate(_inputs(report=report))    # the sample Gate 4 used is carried on the result
+    art = build_gate_artifact(report=report, result=result,
                               review_content_hash="rev123", policy=_LENIENT, code_commit="abc123",
                               producer_cohort="cohort-A", signer_key_id="authority-1")
     assert art.code_commit == "abc123" and art.gold_set_hash and art.policy_hash
@@ -187,6 +200,44 @@ def test_artifact_records_provenance_and_signature_covers_it():
     assert verify_report(art.canonical_bytes(), sig, pub)
     tampered = dataclasses.replace(art, gate_passed=not art.gate_passed)
     assert not verify_report(tampered.canonical_bytes(), sig, pub)
+
+
+def test_write_gate_artifact_bytes_verify_via_sidecar(tmp_path, monkeypatch):
+    priv, pub = generate_keypair()
+    monkeypatch.setenv("FEATUREGEN_INTENT_GATE_PUBLIC_KEY", pub)
+    report = _report()
+    art = build_gate_artifact(report=report, result=evaluate_gate(_inputs(report=report)),
+                              review_content_hash="r", policy=_LENIENT, code_commit="c",
+                              producer_cohort="p", signer_key_id="a")
+    path = tmp_path / "gate.json"
+    write_gate_artifact(str(path), art)                           # exact canonical bytes on disk
+    write_signature_sidecar(path, sign_report(art.canonical_bytes(), priv))
+    assert verify_report_file(path)                               # round-trips through the file/sidecar
+
+
+def test_authority_signing_refuses_to_bless_a_forged_pass():
+    # the authority re-derives the gate from inputs; a FAILING gate yields gate_passed=False in the
+    # signed artifact — an evaluator cannot get a hand-asserted PASS signed.
+    priv, pub = generate_keypair()
+    failing = _inputs(report=_report(incomplete_count=9))         # Gate 1 fails
+    art, sig = authority_sign_gate(failing, private_key_pem=priv, code_commit="c",
+                                   producer_cohort="p", signer_key_id="a", review_content_hash="r")
+    assert art.gate_passed is False                              # the authority signed a FAIL, not a forged PASS
+    assert verify_report(art.canonical_bytes(), sig, pub)        # the signature is valid over the honest FAIL
+
+
+def test_is_truncated_covers_every_bounding_bound_flag():
+    # Gate 1's truncation detection must catch every real BoundingMetrics bound flag (F8) and must NOT
+    # trip on the deterministic best-tier prune (deeper_tiers_not_explored).
+    from dataclasses import fields
+
+    from featuregen.overlay.upload.planner.contracts import BoundingMetricsV1
+    bound_flags = [f.name for f in fields(BoundingMetricsV1) if f.name.endswith("_truncated")]
+    assert bound_flags   # there ARE bound flags to catch
+    for flag in bound_flags:
+        assert _is_truncated({flag: True}), f"{flag} not detected as truncation"
+    assert not _is_truncated({"deeper_tiers_not_explored": True})   # deterministic prune, not a bound
+    assert not _is_truncated({}) and not _is_truncated(None)
 
 
 # ── §9 report over the real store + PG e2e (route→manifest→run→plan→report→gate) ──
@@ -218,11 +269,10 @@ def test_pg_e2e_run_to_report_to_signed_gate(db, monkeypatch):
         gold_report=EvalReport(results=(CaseResult("c1", True, False, ()),)),
         audit_false_resolves=0, stability=StabilityResult(True, 2, ()), drift_detected_ratio=1.0,
         signature_valid=True, policy=GatePolicy(max_false_resolve_bound=0.99))   # 1 shape suffices here
-    result = evaluate_gate(inputs)
-    _, sample, _ = statistical_bound(report.sample_units, inputs.policy)
-    art = build_gate_artifact(report=report, result=result, sample=sample, review_content_hash="rev",
-                              policy=inputs.policy, code_commit="e2e-commit", producer_cohort="e2e",
-                              signer_key_id="authority")
-    sig = sign_report(art.canonical_bytes(), priv)          # SIGNER side (holds the private key)
+    # authority-side: the signer INDEPENDENTLY re-derives the gate and signs only its own result
+    art, sig = authority_sign_gate(inputs, private_key_pem=priv, code_commit="e2e-commit",
+                                   producer_cohort="e2e", signer_key_id="authority",
+                                   review_content_hash="rev")
     assert verify_report(art.canonical_bytes(), sig)        # EVALUATOR side (config public key)
-    assert result.gate1_capture   # capture integrity held over the real persisted run
+    assert art.report_input_digest == report_input_digest(report)
+    assert evaluate_gate(inputs).gate1_capture   # capture integrity held over the real persisted run
