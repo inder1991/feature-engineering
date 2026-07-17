@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable
 from dataclasses import dataclass
 
 from featuregen.overlay.upload.planner.cause import CATEGORY_MAP_VERSION, ResolutionCause
@@ -78,8 +78,7 @@ def missing_shape_labels(observed: Iterable[str], artifact: ReviewArtifactV1) ->
     return tuple(sorted(k for k in set(observed) if k not in labelled))
 
 
-def review_gate_clean(observed_shapes: Iterable[str], artifact: ReviewArtifactV1,
-                      distinct_reason_categories: Mapping[str, object] | None = None) -> bool:
+def review_gate_clean(observed_shapes: Iterable[str], artifact: ReviewArtifactV1) -> bool:
     """Gate 2b (human): every observed distinct shape is labelled, and no label is a defect/unknown/
     operationally_unmeasured. (The Layer-A exhaustiveness half is checked separately by the machine.)"""
     return (not missing_shape_labels(observed_shapes, artifact)
