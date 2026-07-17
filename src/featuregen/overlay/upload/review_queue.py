@@ -40,6 +40,10 @@ def persist_quarantine(conn, catalog_source: str, errors: list[RowError]) -> Non
             # row's own durable record so the resolve path can enforce "declared as at least
             # <tag>" even after the tagged sibling is dismissed (hard-deleted) from the queue.
             raw["sensitivity_conflict_floor"] = list(e.sensitivity_floor)
+        if e.adapter:
+            # A1 resolution #9: which specialized reader quarantined this row — the resolve path
+            # refuses inline repair for adapter-owned rows (their sidecar can't be reconstructed).
+            raw["_adapter"] = e.adapter
         conn.execute(
             "INSERT INTO quarantine_row (catalog_source, row_index, raw, reason) "
             "VALUES (%s, %s, %s, %s)",

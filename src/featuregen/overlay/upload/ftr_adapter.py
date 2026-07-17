@@ -337,7 +337,8 @@ def read_ftr_glossary(text: str, *, source: str) -> PreparedFtrUpload:
     # Index the reader-level quarantine AFTER the emitted rows (mirroring read_glossary):
     # validate_rows indexes 0..len(rows)-1 and quarantine_row PKs on (catalog_source, row_index),
     # so the spaces must stay disjoint.
-    quarantined = [RowError(len(rows) + j, msg, row) for j, (msg, row) in enumerate(pending)]
+    quarantined = [RowError(len(rows) + j, msg, row, adapter="ftr")
+                   for j, (msg, row) in enumerate(pending)]
     return PreparedFtrUpload(rows=rows, records=records, quarantined=quarantined,
                              sanitized_count=sanitized_count,
                              sanitizer_version=SANITIZER_VERSION,

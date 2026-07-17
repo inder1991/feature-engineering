@@ -18,6 +18,13 @@ from featuregen.intake.llm import LLMClient
 from featuregen.overlay.upload.canonical import CanonicalRow
 from featuregen.overlay.upload.csv_reader import read_csv_rows
 from featuregen.overlay.upload.excel_reader import read_excel_rows
+from featuregen.overlay.upload.ftr_adapter import (
+    PreparedFtrUpload,
+    ftr_fingerprint_error,
+    is_ftr_glossary,
+    read_ftr_glossary,
+    to_glossary_upload,
+)
 from featuregen.overlay.upload.glossary_reader import (
     GlossaryUpload,
     is_glossary_csv,
@@ -67,21 +74,36 @@ def _peek_headers(text: str) -> list[str]:
 
 def _read_rows(
     filename: str, data: bytes, source: str
-) -> tuple[list[CanonicalRow], SourceCapabilityProfile | None, GlossaryUpload | None]:
+) -> tuple[list[CanonicalRow], SourceCapabilityProfile | None, GlossaryUpload | None,
+           PreparedFtrUpload | None]:
     """Read an upload into rows + the source profile that governs validation + (for a glossary) its
-    semantic sidecar (spec §U). A glossary-shaped CSV takes the glossary path and carries
-    ``FTR_GLOSSARY_PROFILE`` (so its ``type="unknown"`` rows validate) AND the ``GlossaryUpload`` whose
-    records drive per-field evidence wiring in ``ingest_upload``; every other upload keeps its existing,
-    byte-for-byte-unchanged path with no profile and no glossary."""
+    semantic sidecar (spec §U). An exact-fingerprint FTR export takes the FTR adapter path FIRST
+    (A1 Task 3b): its ``GlossaryUpload`` rides the same glossary spine, and the 4th element carries
+    the ``PreparedFtrUpload`` envelope whose sanitize provenance the route records in the PARSE
+    stage detail (resolution #6). A NEAR-FTR file (the distinctive ``schema.table.column`` header
+    present but not the exact 17-column multiset) is REJECTED with a fingerprint diagnostic
+    (resolution #10) — never silently mangled by another reader. A glossary-shaped CSV takes the
+    glossary path and carries ``FTR_GLOSSARY_PROFILE`` (so its ``type="unknown"`` rows validate)
+    AND the ``GlossaryUpload`` whose records drive per-field evidence wiring in ``ingest_upload``;
+    every other upload keeps its existing, byte-for-byte-unchanged path with no profile and no
+    glossary (4th element ``None``)."""
     name = filename.lower()
     if name.endswith((".xlsx", ".xlsm")):
-        return read_excel_rows(data, source=source), None, None
+        return read_excel_rows(data, source=source), None, None, None
     if name.endswith(".csv"):
         text = data.decode("utf-8-sig")
-        if is_glossary_csv(_peek_headers(text)):
+        headers = _peek_headers(text)
+        if is_ftr_glossary(headers):
+            prepared = read_ftr_glossary(text, source=source)
+            g = to_glossary_upload(prepared)
+            return g.rows, FTR_GLOSSARY_PROFILE, g, prepared
+        err = ftr_fingerprint_error(headers)
+        if err is not None:
+            raise HTTPException(status_code=400, detail=f"FTR glossary format error: {err}")
+        if is_glossary_csv(headers):
             upload = read_glossary(text, source=source)
-            return upload.rows, FTR_GLOSSARY_PROFILE, upload
-        return read_csv_rows(text, source=source), None, None
+            return upload.rows, FTR_GLOSSARY_PROFILE, upload, None
+        return read_csv_rows(text, source=source), None, None, None
     raise HTTPException(status_code=400,
                         detail="unsupported file type (expected .csv, .xlsx, or .xlsm)")
 
@@ -129,12 +151,20 @@ def create_upload(
         data = _read_capped(file)
         file_sha256 = hashlib.sha256(data).hexdigest()
         try:
-            rows, profile, glossary = _read_rows(file.filename or "", data, source)
+            rows, profile, glossary, prepared = _read_rows(file.filename or "", data, source)
         except HTTPException:
             raise
         except Exception as exc:   # a malformed file is a client error, not a 500
             raise HTTPException(status_code=400, detail=f"could not parse upload: {exc}") from exc
-        record_stage(recorder, "parse", "succeeded", detail={"rows": len(rows)},
+        # A1 resolution #6: an FTR upload's sanitize provenance rides the PARSE stage detail —
+        # ingest_upload takes no prepared metadata, so this is the one honest place to record how
+        # many sample clauses/PII spans parse removed and under which sanitizer/redactor versions.
+        parse_detail: dict = {"rows": len(rows)}
+        if prepared is not None:
+            parse_detail.update({"sanitized_clauses": prepared.sanitized_count,
+                                 "sanitizer_version": prepared.sanitizer_version,
+                                 "redaction_version": prepared.redaction_version})
+        record_stage(recorder, "parse", "succeeded", detail=parse_detail,
                      started_at=parse_started)
         pre_fingerprint, fingerprint_algo = source_fingerprint(conn, source)
         failure_status = "failed"               # ...an ingest-stage fault = the ATTEMPT failed

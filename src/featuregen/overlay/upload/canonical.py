@@ -82,6 +82,12 @@ class RowError:
     # bypassed by dismissing the tagged member (a hard DELETE) and then resolving the untagged one,
     # which graphed a world-readable node for a declared-PII column. Empty for every other reason.
     sensitivity_floor: tuple[str, ...] = ()
+    # Which specialized reader quarantined this row ("ftr"), or "" for the common validate path.
+    # persist_quarantine stores it in the durable raw as "_adapter" so resolve_quarantine_row can
+    # refuse inline repair for rows whose sidecar (schema/term_type/taxonomy/facets) cannot be
+    # reconstructed from an edited CanonicalRow (A1 resolution #9) — the fix is re-uploading the
+    # corrected file.
+    adapter: str = ""
 
 
 @dataclass(frozen=True, slots=True)

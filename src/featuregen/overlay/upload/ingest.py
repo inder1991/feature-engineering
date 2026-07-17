@@ -1375,6 +1375,14 @@ def resolve_quarantine_row(conn, catalog_source: str, row_index: int, edits: dic
         (catalog_source, row_index)).fetchone()
     if row is None:
         return False, "no such quarantined row"
+    # A1 resolution #9: an FTR-adapter-quarantined row cannot be repaired inline — a resolved
+    # CanonicalRow cannot reconstruct the glossary sidecar (schema, term_type, taxonomy, safe
+    # facets, per-field evidence), so resolving it would graph a column stripped of exactly the
+    # semantics the FTR upload exists to carry. Refuse BEFORE any validation/mutation; the durable
+    # fix is re-uploading the corrected file (adapter-aware repair is future work).
+    if row[0].get("_adapter") == "ftr":
+        return False, ("This row came from an FTR glossary upload and cannot be fixed inline — "
+                       "re-upload the corrected FTR file.")
     merged = {**row[0], **(edits or {})}
     vr = validate_rows([_row_from_raw(merged, catalog_source)], catalog_source)
     if vr.structural_error or vr.quarantined:
