@@ -247,10 +247,11 @@ def test_compiler_context_is_genuinely_immutable(db):
 
 
 def test_compile_budget_is_plain_mutable():
-    # run-owned (C8): decrement + deadline comparison must work on a plain dataclass
-    b = CompileBudget(remaining=2, deadline=_NOW)
+    # run-owned (C8/D6): decrement + monotonic-deadline comparison must work on a plain dataclass
+    b = CompileBudget(remaining=2, deadline_monotonic=100.0, clock=lambda: 0.0)
     b.remaining -= 1
-    assert b.remaining == 1 and b.deadline == _NOW
+    b.stopped_by_time = False
+    assert b.remaining == 1 and b.deadline_monotonic == 100.0 and b.stopped_by_time is False
 
 
 # ─── C3: temporal declaration on representative params ───────────────────────────────────────
@@ -470,7 +471,9 @@ def _acct_core(db):
         (CanonicalRow("core", "accounts", "weird", "numeric", additivity="entangled"),
          "monetary_flow"),
         (CanonicalRow("core", "accounts", "product", "text"), "product_type"),
+        (CanonicalRow("core", "accounts", "as_of_date", "timestamp"), "as_of_time"),
         (CanonicalRow("core", "customers", "customer_id", "integer", is_grain=True), "customer_id"),
+        (CanonicalRow("core", "customers", "reporting_date", "timestamp"), "as_of_time"),
     ])
 
 
@@ -499,9 +502,26 @@ def _c4_plan(ctx, *measure_bindings):
         segments=_rollup_segments(r.realization_id, from_entity="account", to_entity="customer"))
 
 
-def _c4_compile(ctx, plan, *, aggregating=False):
-    return compile_aggregation(ctx, plan, _T_C4, _temporal(aggregating=aggregating),
-                               check_connectivity(ctx, plan).placement)
+def _temporal_anchored(ref: str, *, aggregating: bool = True) -> c.TemporalDeclarationV1:
+    """A time-axis-aggregating temporal decl whose ordering anchor IS bound to a real column."""
+    return c.TemporalDeclarationV1(
+        pit_anchor=str(TemporalRole.AS_OF_TIME), anchor_binding=ref,
+        window=c.WindowSpecV1(90, "days", "trailing", True) if aggregating else None,
+        param_binding=c.ParamBindingV1(values=(), is_representative=True),
+        time_axis_aggregating=aggregating, reason_codes=())
+
+
+def _asof_binding():
+    """The bound temporal ordering ingredient on the accounts (source) grain."""
+    return _binding("asof", "public.accounts.as_of_date", join_role=str(JoinRole.TIME),
+                    concept="as_of_time", temporal=str(TemporalRole.AS_OF_TIME))
+
+
+def _c4_compile(ctx, plan, *, aggregating=False, temporal=None):
+    return compile_aggregation(
+        ctx, plan, _T_C4,
+        temporal if temporal is not None else _temporal(aggregating=aggregating),
+        check_connectivity(ctx, plan).placement)
 
 
 def test_additive_fan_in_undeclared_is_sound_sum_default(db):
@@ -619,17 +639,95 @@ def test_semi_additive_across_window_is_temporal_strategy_missing(db):
     assert stage.reason_codes == (c.ReasonCode.semi_additive_temporal_strategy_missing,)
 
 
-def test_semi_additive_across_window_declared_strategy_validates(db):
-    # a DECLARED temporal strategy resolves the across-window case: take_latest is sound; a
-    # declared SUM of a stock over time stays incompatible (the classic balance-summing error).
+def test_ordering_column_availability_branches():
+    # unit-cover _ordering_column_available (F14). Fan-in hops are (sem, seg, ...) tuples; only h[1]
+    # (segment_index) and the compared exec catalog matter here.
+    from featuregen.overlay.upload.planner.declarations import _ordering_column_available as avail
+    # a fan-in hop is (sem, seg, ..., exec_cat, exec_table); only seg (h[1]) + the compared catalog/
+    # table matter. Signature: avail(hop_seg_idx, exec_cat, exec_table, anchor_pos, fanin_hops).
+    hops = [(0, 1, None, None, None, None, "core", "public.customers")]   # one fan-in hop at seg 1
+    at0 = PathPositionV1(0, "core", "public.accounts")
+    # bound, same catalog, STRICTLY before the hop on the many-side, nothing grouped between → available
+    assert avail(1, "core", "public.customers", at0, hops) is True
+    # no anchor on path → not available
+    assert avail(1, "core", "public.customers", None, hops) is False
+    # F14-1 (the over-approval fix): anchor on the hop's grouped OUTPUT/to-side table (seg == hop) →
+    # NOT row grain → fail closed, whether detected by segment_index equality or by table match
+    assert avail(1, "core", "public.customers",
+                 PathPositionV1(1, "core", "public.customers"), hops) is False
+    # anchor in a DIFFERENT execution catalog (a bridge crossing) → fail closed
+    assert avail(1, "core", "public.customers", PathPositionV1(0, "crm", "public.snap"), hops) is False
+    # anchor enters AFTER this hop → not available
+    assert avail(1, "core", "public.customers", PathPositionV1(2, "core", "public.later"), hops) is False
+    # an intervening fan-in hop grouped the ordering column away before this hop → not available
+    two = [(0, 1, None, None, None, None, "core", "t1"), (1, 2, None, None, None, None, "core", "t2")]
+    assert avail(2, "core", "t2", PathPositionV1(0, "core", "public.accounts"), two) is False
+
+
+def test_take_latest_with_bound_ordering_column_is_sound(db):
+    # F14: take_latest is sound ONLY when its temporal ordering column is proven present at the hop.
+    # Here the as_of anchor is bound to accounts (the source grain) and survives to the roll-up hop.
+    _acct_core(db)
+    ctx = _ctx(db, "core", agg={("r1", "balance"): c.AggregationFunction.take_latest})
+    plan = _c4_plan(ctx, _binding("balance", "public.accounts.balance", concept="monetary_stock"),
+                    _asof_binding())
+    (hop,) = _c4_compile(ctx, plan, temporal=_temporal_anchored("public.accounts.as_of_date"))
+    balance = next(s for s in hop.ingredient_stages if s.need_role == "balance")
+    assert balance.validation is c.AggregationValidation.sound
+    assert balance.declared_function is c.AggregationFunction.take_latest
+    assert balance.reason_codes == ()
+    # the ordering column IS a physically-read column (safety-checked), carried as the temporal anchor
+    read = build_physical_read_set(ctx, plan)
+    anchor = next(col for col in read.columns if col.object_ref == "public.accounts.as_of_date")
+    assert c.ColumnRole.temporal_anchor in anchor.roles
+
+
+def test_take_latest_without_ordering_column_is_missing(db):
+    # F14: `anchor_binding is not None` alone is insufficient — with NO ordering column bound,
+    # take_latest is honestly aggregation_ordering_column_missing, never a silent latest-of-nothing.
     _acct_core(db)
     ctx = _ctx(db, "core", agg={("r1", "balance"): c.AggregationFunction.take_latest})
     plan = _c4_plan(ctx, _binding("balance", "public.accounts.balance", concept="monetary_stock"))
-    (hop,) = _c4_compile(ctx, plan, aggregating=True)
+    (hop,) = _c4_compile(ctx, plan, aggregating=True)   # _temporal(...) has anchor_binding=None
     (stage,) = hop.ingredient_stages
-    assert stage.validation is c.AggregationValidation.sound
-    assert stage.declared_function is c.AggregationFunction.take_latest
+    assert stage.validation is c.AggregationValidation.inputs_missing
+    assert stage.reason_codes == (c.ReasonCode.aggregation_ordering_column_missing,)
 
+
+def test_take_latest_ordering_column_off_path_is_missing(db):
+    # F14 fail-closed: an anchor_binding that names a column NOT bound on this plan's path (so it has
+    # no placement / can't be proven to reach the hop) → aggregation_ordering_column_missing.
+    _acct_core(db)
+    ctx = _ctx(db, "core", agg={("r1", "balance"): c.AggregationFunction.take_latest})
+    plan = _c4_plan(ctx, _binding("balance", "public.accounts.balance", concept="monetary_stock"))
+    (hop,) = _c4_compile(ctx, plan,
+                         temporal=_temporal_anchored("crm.public.customers.snapshot_ts"))
+    (stage,) = hop.ingredient_stages
+    assert stage.validation is c.AggregationValidation.inputs_missing
+    assert stage.reason_codes == (c.ReasonCode.aggregation_ordering_column_missing,)
+
+
+def test_take_latest_ordering_column_on_target_grain_is_missing(db):
+    # F14-1 (the over-approval fix): an anchor bound to the roll-up's TO-side (customer/target-grain)
+    # table sits AT the aggregation hop — already collapsed to one value per group, NOT row grain — so
+    # take_latest is honestly missing, never a silent latest-over-a-constant.
+    _acct_core(db)
+    ctx = _ctx(db, "core", agg={("r1", "balance"): c.AggregationFunction.take_latest})
+    plan = _c4_plan(
+        ctx, _binding("balance", "public.accounts.balance", concept="monetary_stock"),
+        _binding("asof", "public.customers.reporting_date", join_role=str(JoinRole.TIME),
+                 concept="as_of_time", temporal=str(TemporalRole.AS_OF_TIME)))
+    (hop,) = _c4_compile(ctx, plan,
+                         temporal=_temporal_anchored("public.customers.reporting_date"))
+    balance = next(s for s in hop.ingredient_stages if s.need_role == "balance")
+    assert balance.validation is c.AggregationValidation.inputs_missing
+    assert balance.reason_codes == (c.ReasonCode.aggregation_ordering_column_missing,)
+
+
+def test_declared_sum_of_a_stock_over_time_stays_incompatible(db):
+    # the classic balance-summing error is unaffected by the take_latest guard: a declared SUM of a
+    # semi-additive stock across a window is still incompatible.
+    _acct_core(db)
     ctx_sum = _ctx(db, "core", agg={("r1", "balance"): c.AggregationFunction.sum})
     (hop2,) = _c4_compile(ctx_sum, _c4_plan(
         ctx_sum, _binding("balance", "public.accounts.balance", concept="monetary_stock")),

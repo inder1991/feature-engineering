@@ -5,9 +5,11 @@ the MUTABLE ``CompileBudget`` that persists ACROSS recipes (F10) — the operati
 the compile pass's extra reads. The flag is read in the route, never here (the planner stays pure)."""
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import logging
-from collections.abc import Iterable
+import time
+from collections.abc import Callable, Iterable
 from datetime import datetime, timedelta
 
 from featuregen.overlay.upload.planner.contracts import (
@@ -21,13 +23,21 @@ from featuregen.overlay.upload.planner.contracts import (
 from featuregen.overlay.upload.planner.declarations import CompileBudget, build_compiler_context
 from featuregen.overlay.upload.planner.plan import _envelope, plan_bindings
 from featuregen.overlay.upload.planner.scope import resolve_catalog_scope
+from featuregen.overlay.upload.planner.shadow_capture import (
+    build_dispatch,
+    map_result,
+    preloop_failure_row,
+    template_not_found_row,
+)
+from featuregen.overlay.upload.planner.shadow_store import write_dispatch, write_run_and_plans
 from featuregen.overlay.upload.templates import ALL_TEMPLATES, Template
 
 logger = logging.getLogger(__name__)
 
-# C8 run-budget defaults (§11): the compile pass is bounded per RUN — a plan count and a deadline.
-# The deadline is derived from the INJECTED `now` (never a wall-clock read in the deterministic
-# path), so it bounds runs whose caller-supplied clock advances, and tests can inject a tiny one.
+# C8 run-budget defaults (§11): the compile pass is bounded per RUN — a plan count and a REAL
+# elapsed-time deadline (D6/F17). The deadline runs over an injected monotonic ``clock`` (default
+# ``time.monotonic``; tests inject a fake advancing clock) — operational, never a verdict input; a
+# budget-truncated run is EXCLUDED from deterministic identity comparisons.
 MAX_COMPILES_PER_RUN = 500
 COMPILE_BUDGET = timedelta(seconds=30)
 
@@ -35,21 +45,47 @@ COMPILE_BUDGET = timedelta(seconds=30)
 def run_shadow_planner(conn, *, eligible_recipe_ids: frozenset[str], target_entity: str | None,
                        roles: Iterable[str] = (), run_id: str | None, now: datetime,
                        templates: tuple[Template, ...] | None = None,
-                       compile_contracts: bool = False) -> tuple[BindingPlanningResultV1, ...]:
+                       compile_contracts: bool = False,
+                       persist: bool = False,
+                       monotonic: Callable[[], float] = time.monotonic
+                       ) -> tuple[BindingPlanningResultV1, ...]:
     roles = tuple(roles)
-    scope = resolve_catalog_scope(conn, roles=roles, target_entity=target_entity, now=now)
+    # 3B.4: the durable dispatch MANIFEST — written FIRST, before scope resolution (so a pre-loop
+    # failure is visible), WITHOUT catalog_scope_id (a resolve_catalog_scope output). Whenever
+    # `persist` (the telemetry flag), independent of the compile flag (F3).
+    if persist:
+        write_dispatch(conn, build_dispatch(run_id=run_id, eligible_recipe_ids=eligible_recipe_ids,
+                                            compile_flag=compile_contracts, telemetry_flag=True, now=now))
     compile_ctx = None
     budget: CompileBudget | None = None
-    if compile_contracts:
-        # ONE immutable context per run (no per-plan re-query) + the run-owned mutable budget,
-        # threaded into EVERY plan_bindings call so it persists across recipes (F10).
-        compile_ctx = build_compiler_context(conn, scope, roles, now)
-        budget = CompileBudget(remaining=MAX_COMPILES_PER_RUN, deadline=now + COMPILE_BUDGET)
+    try:
+        # A nested savepoint (only when persisting) so a scope/context failure is CAUGHT here and the
+        # route's outer savepoint retains the manifest (F2) — never propagated out of run_shadow_planner.
+        with conn.transaction() if persist else contextlib.nullcontext():
+            scope = resolve_catalog_scope(conn, roles=roles, target_entity=target_entity, now=now)
+            if compile_contracts:
+                # ONE immutable context per run (no per-plan re-query) + the run-owned mutable budget,
+                # threaded into EVERY plan_bindings call so it persists across recipes (F10).
+                compile_ctx = build_compiler_context(conn, scope, roles, now)
+                budget = CompileBudget(remaining=MAX_COMPILES_PER_RUN,
+                                       deadline_monotonic=monotonic() + COMPILE_BUDGET.total_seconds(),
+                                       clock=monotonic)
+    except Exception:
+        if not persist:
+            raise   # non-persist path is byte-identical: the route's savepoint catches it
+        logger.exception("shadow planner pre-loop failure (scope/context) run=%s", run_id)
+        for rid in sorted(eligible_recipe_ids):
+            with contextlib.suppress(Exception):   # capture-integrity relies on manifest reconciliation
+                write_run_and_plans(conn, preloop_failure_row(run_id=run_id, recipe_id=rid, now=now), [])
+        return ()
     by_id = {t.id: t for t in (templates if templates is not None else ALL_TEMPLATES)}
     results: list[BindingPlanningResultV1] = []
     for rid in sorted(eligible_recipe_ids):
         tmpl = by_id.get(rid)
         if tmpl is None:
+            if persist:
+                with contextlib.suppress(Exception):
+                    write_run_and_plans(conn, template_not_found_row(run_id=run_id, recipe_id=rid, now=now), [])
             continue
         try:
             with conn.transaction():   # per-recipe savepoint — a DB error here must not poison the request txn
@@ -75,13 +111,26 @@ def run_shadow_planner(conn, *, eligible_recipe_ids: frozenset[str], target_enti
                     " contract_status=%s contract_selected=%s",
                     result.recipe_id, result.result_status, result.selected_plan_id, scope.scope_id,
                     result.contract_result_status, result.selected_contract_physical_plan_id)
+        if persist:
+            # Map -> store rows + two-phase write. A persistence failure is caught here (never
+            # re-propagated) so the manifest is retained; the loss surfaces via manifest reconciliation.
+            try:
+                run_row, observations = map_result(
+                    result, template=tmpl, scope=scope, compile_ctx=compile_ctx,
+                    compile_contracts=compile_contracts,
+                    budget_stopped_by_time=budget.stopped_by_time if budget is not None else None,
+                    now=now)
+                write_run_and_plans(conn, run_row, observations)
+            except Exception:
+                logger.exception("shadow store write failed for recipe %s run=%s", rid, run_id)
         results.append(result)
     if budget is not None:
-        # The §11 run metric — derived from the budget alone (no wall-clock read): how many plans
-        # compiled and whether either bound was hit (a hit means some plan recorded
-        # compile_budget_exhausted, or the whole run started past its deadline).
+        # The §11 run metric: how many plans compiled and whether either bound was hit. ``stopped_by_time``
+        # (set when a plan was skipped) records that some plan recorded compile_budget_exhausted; the
+        # final read of the injected clock covers a run that only overran after its last compile.
         compiles = MAX_COMPILES_PER_RUN - budget.remaining
-        budget_hit = budget.remaining <= 0 or now >= budget.deadline
+        budget_hit = (budget.stopped_by_time is not None
+                      or budget.remaining <= 0 or budget.clock() >= budget.deadline_monotonic)
         logger.info("shadow_contract_compile_run run=%s compiles=%d budget_hit=%s remaining=%d",
                     run_id, compiles, budget_hit, budget.remaining)
     return tuple(results)

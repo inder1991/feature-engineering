@@ -416,7 +416,11 @@ def _scoped_considered_set(body: ConsideredSetIn, conn: _Conn, identity: _Identi
                                    target_entity=scope.target_entity, roles=identity.role_claims,
                                    run_id=generation_run_id, now=now,
                                    compile_contracts=os.environ.get(
-                                       "FEATUREGEN_INTENT_CONTRACT_COMPILE", "0") == "1")
+                                       "FEATUREGEN_INTENT_CONTRACT_COMPILE", "0") == "1",
+                                   # 3B.4: the telemetry flag gates PERSISTENCE, independent of the
+                                   # compile flag — read ONLY here so the planner stays pure.
+                                   persist=os.environ.get(
+                                       "FEATUREGEN_INTENT_SHADOW_TELEMETRY", "0") == "1")
         except Exception:                    # shadow must NEVER affect the live response
             logger.exception("shadow planner dispatch failed")
     return response

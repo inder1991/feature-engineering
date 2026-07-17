@@ -14,7 +14,7 @@ the route-read ``FEATUREGEN_INTENT_CONTRACT_COMPILE`` kill-switch (default off).
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime
 from types import MappingProxyType
@@ -71,6 +71,7 @@ from featuregen.overlay.upload.planner.contracts import (
     make_contract_id,
     to_additivity_class,
 )
+from featuregen.overlay.upload.planner.fingerprint import compiler_input_fingerprint
 from featuregen.overlay.upload.planner.safety import evaluate_column_safety
 from featuregen.overlay.upload.taxonomy.entity_relationships import (
     Cardinality,
@@ -119,12 +120,22 @@ class CompilerContext:
 @dataclass(slots=True)
 class CompileBudget:
     """DELIBERATELY MUTABLE (the one exception to the frozen convention): the per-run compile
-    allowance — a remaining-plan count and a deadline over the run's INJECTED now — owned by
-    ``run_shadow_planner`` and decremented by ``plan_bindings``' compile pass (C8). A run past
-    either bound records ``compile_budget_exhausted`` instead of compiling further plans."""
+    allowance — a remaining-plan count and a MONOTONIC-clock deadline — owned by ``run_shadow_planner``
+    and decremented by ``plan_bindings``' compile pass (C8). A run past either bound records
+    ``compile_budget_exhausted`` instead of compiling further plans.
+
+    D6/F17: the deadline is a REAL elapsed-time bound over an injected ``clock`` (default
+    ``time.monotonic`` in the caller), NOT the deterministic ``now`` — so a compile pass that genuinely
+    overruns is truncated. Because the wall-clock changes the observed result, ``deadline_monotonic``/
+    ``clock`` NEVER enter a hash or verdict; instead a budget-truncated (incomplete) execution is
+    EXCLUDED from deterministic identity comparisons. ``stopped_by_time`` remembers WHICH bound fired
+    FIRST (None until one does, then True=deadline / False=count) so the store labels
+    ``budget_time`` vs ``budget_count``."""
 
     remaining: int
-    deadline: datetime
+    deadline_monotonic: float
+    clock: Callable[[], float]
+    stopped_by_time: bool | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -436,12 +447,41 @@ def _validate_declared_inputs(
             ReasonCode.aggregation_incompatible_with_additivity, ())
 
 
+def _ordering_column_available(
+        hop_seg_idx: int, exec_cat: str, exec_table: str, anchor_pos: PathPositionV1 | None,
+        fanin_hops: Iterable[tuple[int, int, object, object, object, object, str, str]]) -> bool:
+    """Is the temporal ORDERING column provably present, at ROW grain, at this fan-in hop — the
+    precondition ``take_latest`` needs (F14: ``anchor_binding is not None`` alone is NOT sufficient).
+    Fail-closed — proven ONLY when the anchor is bound and on-path (``anchor_pos``), sits STRICTLY
+    BEFORE this hop IN THE SAME EXECUTION CATALOG on the many-side rows — never the hop's grouped
+    OUTPUT/to-side table (``check_connectivity`` places a to-side table AT ``hop_seg_idx``, so an
+    anchor there is already collapsed to the target grain) and never a bridge crossing — and NO
+    fan-in hop between the anchor's position and this hop already grouped the rows away. Everything
+    else fails closed."""
+    if anchor_pos is None or anchor_pos.catalog_source != exec_cat:
+        return False
+    if anchor_pos.segment_index >= hop_seg_idx or anchor_pos.table == exec_table:
+        return False    # on the hop's grouped to-side grain (or after it) — not row grain
+    return not any(anchor_pos.segment_index <= h[1] < hop_seg_idx for h in fanin_hops)
+
+
+def _take_latest_validation(ordering_available: bool
+                            ) -> tuple[AggregationValidation, ReasonCode | None, tuple[str, ...]]:
+    """``take_latest`` is sound ONLY with a proven temporal ordering column at the hop (F14); without
+    one it is honestly inputs_missing, never a silent latest-of-nothing."""
+    if ordering_available:
+        return AggregationValidation.sound, None, ()
+    return AggregationValidation.inputs_missing, ReasonCode.aggregation_ordering_column_missing, ()
+
+
 def _validate_stage(
         selected: AdditivityClass, declared: AggregationFunction | None,
         time_axis_aggregating: bool, need_role: str, bound_roles: frozenset[str],
+        ordering_available: bool,
 ) -> tuple[AggregationValidation, ReasonCode | None, tuple[str, ...]]:
     """The §4 validation matrix for ONE measure stage on a fan-in hop:
-    (validation, matrix reason, missing_inputs)."""
+    (validation, matrix reason, missing_inputs). ``ordering_available`` (F14) is the proven presence
+    of the temporal ordering column at this hop — required for a ``take_latest`` stage to be sound."""
     if selected is AdditivityClass.not_applicable:
         # a non-aggregating measure sitting on a fan-in hop is structurally wrong on ANY axis
         return AggregationValidation.incompatible, ReasonCode.aggregation_axis_unsupported, ()
@@ -466,8 +506,10 @@ def _validate_stage(
                 return (AggregationValidation.incompatible,
                         ReasonCode.aggregation_incompatible_with_additivity, ())
             return AggregationValidation.sound, None, ()
-        if declared is AggregationFunction.take_latest or declared in _ORDER_SAFE_DECLARED:
+        if declared in _ORDER_SAFE_DECLARED:
             return AggregationValidation.sound, None, ()
+        if declared is AggregationFunction.take_latest:
+            return _take_latest_validation(ordering_available)
         return _validate_declared_inputs(declared, need_role, bound_roles)
     # non_additive: no sound default exists — everything must be declared and provable
     if declared is None:
@@ -475,8 +517,10 @@ def _validate_stage(
     if declared is AggregationFunction.sum:
         return (AggregationValidation.incompatible,
                 ReasonCode.aggregation_incompatible_with_additivity, ())
-    if declared is AggregationFunction.take_latest or declared in _ORDER_SAFE_DECLARED:
+    if declared in _ORDER_SAFE_DECLARED:
         return AggregationValidation.sound, None, ()
+    if declared is AggregationFunction.take_latest:
+        return _take_latest_validation(ordering_available)
     return _validate_declared_inputs(declared, need_role, bound_roles)
 
 
@@ -506,6 +550,17 @@ def compile_aggregation(
 
     bound_roles = frozenset(b.need_role for b in plan.ingredient_bindings)
     measure_role = str(JoinRole.MEASURE)
+    # F14: where the temporal ORDERING column enters the path (the bound anchor's placement) — the
+    # take_latest guard proves it survives, at row grain, to each aggregation hop.
+    none_temporal = str(TemporalRole.NONE)
+    anchor_pos: PathPositionV1 | None = None
+    if temporal.anchor_binding is not None:
+        anchor_role = next(
+            (b.need_role for b in plan.ingredient_bindings
+             if b.bound_object_ref == temporal.anchor_binding
+             and b.temporal_role and b.temporal_role != none_temporal), None)
+        if anchor_role is not None:
+            anchor_pos = placement.get(anchor_role)
     stages_by_hop: dict[int, list[IngredientAggregationV1]] = {h[1]: [] for h in hops}
     for b in sorted(plan.ingredient_bindings, key=lambda x: x.need_role):
         if b.join_role != measure_role:
@@ -525,9 +580,10 @@ def compile_aggregation(
             validation = AggregationValidation.undeclared   # can't validate an unknown fan-in
             codes.append(ReasonCode.physical_cardinality_unavailable)
         else:
+            ordering_available = _ordering_column_available(hop[1], hop[6], hop[7], anchor_pos, hops)
             validation, matrix_reason, missing = _validate_stage(
                 provenance.selected, declared, temporal.time_axis_aggregating,
-                b.need_role, bound_roles)
+                b.need_role, bound_roles, ordering_available)
             if matrix_reason is not None:
                 codes.append(matrix_reason)
         if provenance.conflict:
@@ -786,7 +842,12 @@ def revalidate_freshness(conn, ctx: CompilerContext, plan: BindingPlanV1) -> Fre
         stamps.append(CatalogStateStampV1(
             catalog_source=src, head_seq=head or 0,
             last_completed_at=wm.isoformat() if wm is not None else "",
-            stamp_kind=CatalogStateStampKind.drift_watermark))
+            stamp_kind=CatalogStateStampKind.drift_watermark,
+            # 3B.4 (F3/F14): the compile-time replay drift signal — the compiler-input fingerprint (covers
+            # the classifier's real read-set, which realization_fingerprint omits) + the projection
+            # checkpoint (a LAG invariant). The scope.py pre-compile stamp keeps defaults (no ctx there).
+            compiler_input_fingerprint=compiler_input_fingerprint(ctx, src),
+            projection_checkpoint=checkpoint))
     if bridge_fingerprint(conn) != ctx.bridge_fingerprint_at_start:
         codes.append(ReasonCode.catalog_mutated_during_compile)
         consistency = StampConsistency.unverifiable
@@ -858,6 +919,7 @@ _AGGREGATION_BLOCKING_CODES = frozenset({
     ReasonCode.aggregation_incompatible_with_additivity,
     ReasonCode.aggregation_weight_missing,
     ReasonCode.aggregation_components_missing,
+    ReasonCode.aggregation_ordering_column_missing,
     ReasonCode.aggregation_axis_unsupported,
     ReasonCode.aggregation_composition_unsupported,
     ReasonCode.semi_additive_temporal_strategy_missing,

@@ -22,6 +22,12 @@ class Settings:
     # the chain, so the signature must be keyed. Fail-closed — audit.py refuses to sign when
     # this is unset rather than fall back to a default (see security.audit).
     audit_hmac_key: str | None
+    # The TRUSTED PUBLIC key (PEM) for verifying the Phase-3B.4 3C-enablement-gate artifact's
+    # ed25519 DETACHED signature (§10.7). ASYMMETRIC by design: the PRIVATE key is held by a
+    # separate signing authority outside the evaluator's process, so the evaluator that computes
+    # the gate cannot sign (forge) its own PASS — only this public half is a config input, and it
+    # is NEVER embedded in the artifact. Fail-closed: verification refuses when unset.
+    intent_gate_public_key: str | None
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -29,6 +35,7 @@ class Settings:
             dsn=os.environ.get("FEATUREGEN_DSN"),
             test_dsn=os.environ.get("FEATUREGEN_TEST_DSN"),
             audit_hmac_key=os.environ.get("FEATUREGEN_AUDIT_HMAC_KEY"),
+            intent_gate_public_key=os.environ.get("FEATUREGEN_INTENT_GATE_PUBLIC_KEY"),
         )
 
 

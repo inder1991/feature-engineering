@@ -19,6 +19,10 @@ dependencies = [
     "jsonschema>=4.21",
     "python-ulid>=2.2",
     "PyJWT[crypto]>=2.8",
+    # ed25519 detached signing of the 3B.4 3C-enablement-gate artifact (planner/signing.py). A DIRECT
+    # dependency because the asymmetric-verify is the crux of the gate's trust model — it must not
+    # rely on PyJWT's transitive pull.
+    "cryptography>=42",
     "openpyxl>=3.1",
     "fastapi>=0.115",
     "uvicorn>=0.30",
