@@ -300,7 +300,7 @@ def test_enrich_concepts_single_mode_unchanged(db, monkeypatch):
     response is rejected (not coerced to 'unclassified', not counted resolved), matching
     `test_enrich_concepts_batch_mode_caches_valid_only` above. See test_enrich.py for the dedicated
     single-mode contract-parity tests."""
-    monkeypatch.delenv("OVERLAY_ENRICH_CONCEPT_MODE", raising=False)   # default single
+    monkeypatch.setenv("OVERLAY_ENRICH_CONCEPT_MODE", "single")   # pin single (Pass A now defaults to BATCH, #4)
     rows = [CanonicalRow("deposits", "accounts", "weird", "text")]
     client = FakeLLM(script={"overlay.enrich.concept": FakeResponse(output={"concept": "totally_made_up"})})
     out = enrich_concepts(db, rows, client)

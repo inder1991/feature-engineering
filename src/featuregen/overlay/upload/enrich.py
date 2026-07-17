@@ -51,7 +51,11 @@ def _vocab_fingerprint() -> str:
 
 # Cache versions fold prompt/schema/vocabulary identity into the cache key (spec C6). Bump the vN
 # literal on any prompt or schema change to a task; the concept version also tracks the vocabulary.
-_CONCEPT_CACHE_VERSION = f"concept:v1:{_vocab_fingerprint()}"
+# v2 (#3): the concept cache key moved from `content_hash` to `concept_cache_key` (full classifier
+# metadata — term/declared type/domain/synonyms/BIAN/FIBO — not just the sidecar-blind definition).
+# The version bump versions pre-existing v1 rows out explicitly (intentional one-time re-key) rather
+# than leaving them orphaned under a same-version key.
+_CONCEPT_CACHE_VERSION = f"concept:v2:{_vocab_fingerprint()}"
 _DEFINITION_CACHE_VERSION = "definition:v1"
 _DOMAIN_CACHE_VERSION = "domain:v1"
 

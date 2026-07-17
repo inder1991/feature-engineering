@@ -483,3 +483,13 @@ def test_input_row_count_includes_quarantined_rows():
     p = read_ftr_glossary(csv_text, source="ftr")
     assert len(p.rows) == 2 and len(p.quarantined) == 1
     assert p.input_row_count == 4         # 2 columns + table term + the quarantined row
+
+
+# ── Drift guard: KNOWN_TERM_TYPES is duplicated verbatim in the glossary-agnostic `passc.types`
+#    and the FTR-specific `ftr_adapter` (passc must NOT import the FTR reader, so they can't share
+#    one import). It now gates Pass C eligibility — a silent desync would change join eligibility on
+#    only one side. This test fails CI the moment the two copies diverge. ───────────────────────────
+def test_known_term_types_matches_passc_copy():
+    from featuregen.overlay.upload.passc import types as passc_types
+
+    assert KNOWN_TERM_TYPES == passc_types.KNOWN_TERM_TYPES

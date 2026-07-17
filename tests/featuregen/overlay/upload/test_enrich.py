@@ -20,12 +20,15 @@ def test_classifies_and_caches(db):
     assert cached[content_hash(rows[0])] == "monetary_amount"
 
 
-def test_off_vocab_concept_is_rejected_not_resolved_single_mode(db):
+def test_off_vocab_concept_is_rejected_not_resolved_single_mode(db, monkeypatch):
     """#5: single mode must enforce the SAME response contract as batch — an off-vocabulary/invalid
     concept response is NOT accepted, NOT coerced to 'unclassified', and NOT counted resolved (it is
     simply absent from the returned dict), exactly like batch's `_accept_concept`/`validate_batch_results`
     treats an INVALID batch entry. A stage report computed from `len(out)` must not be able to see
     "all N items resolved" when every provider response was garbage."""
+    # Pin single mode: Pass A defaults to BATCH (#4), so without this the #5 single-mode reject path
+    # would not be exercised.
+    monkeypatch.setenv("OVERLAY_ENRICH_CONCEPT_MODE", "single")
     rows = [CanonicalRow("deposits", "accounts", "weird", "text")]
     h = content_hash(rows[0])
     client = FakeLLM(script={_TASK: FakeResponse(output={"concept": "totally_made_up"})})
@@ -49,9 +52,12 @@ def test_off_vocab_concept_is_not_cached_and_retries_next_run(db):
     assert cached[h] == "monetary_stock"
 
 
-def test_valid_concept_still_resolves_single_mode(db):
+def test_valid_concept_still_resolves_single_mode(db, monkeypatch):
     """#5 counterpart: a valid (in-vocabulary) single-mode response is still accepted, cached, and
     counted resolved exactly as before — only the off-vocab path changed."""
+    # Pin single mode: Pass A defaults to BATCH (#4), so without this the single-mode accept path
+    # would not be exercised.
+    monkeypatch.setenv("OVERLAY_ENRICH_CONCEPT_MODE", "single")
     rows = [CanonicalRow("deposits", "accounts", "balance", "numeric")]
     h = content_hash(rows[0])
     client = FakeLLM(script={_TASK: FakeResponse(output={"concept": "monetary_stock"})})

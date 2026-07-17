@@ -121,8 +121,11 @@ describe('RunDetailPanel', () => {
     expect(rows[0]).toHaveTextContent('resolved: 64')
     expect(rows[0]).toHaveTextContent('expected: 126')
     expect(rows[1]).toHaveTextContent('table_schema_mismatch_skipped: 1')
-    // A detail-less stage shows the em dash, never an empty cell.
-    expect(rows[2]).toHaveTextContent('—')
+    // A detail-less stage shows the em dash in the DETAIL cell, never an empty cell. Assert on the
+    // detail column specifically — the reason cell also renders '—', so a row-level assertion would
+    // pass even if the detail cell were blank.
+    const detailCell = within(rows[2]).getAllByRole('cell')[3] // Stage · State · Reason · Detail · Duration
+    expect(detailCell).toHaveTextContent('—')
   })
 
   // #15 (A1-minimal): row_count is a parsed-row count, not an asserted-fact count — an FTR
