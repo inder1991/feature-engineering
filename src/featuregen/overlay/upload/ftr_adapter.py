@@ -5,7 +5,7 @@ schema-qualified physical FQN, business term + definition, BIAN/FIBO taxonomy, p
 synonyms/related terms, a declared SQL type). This module recognizes EXACTLY that layout and turns
 it into the same :class:`~featuregen.overlay.upload.glossary_reader.GlossaryUpload` shape the
 generic glossary reader produces, so the unchanged validate → graph spine ingests it. Design
-decisions follow the round-4 review resolutions in the A1 plan:
+decisions follow the round-4/round-5 review resolutions in the A1 plan:
 
 - **Exact fingerprint (#10/#12):** :func:`is_ftr_glossary` is an exact normalized header-MULTISET
   match — a missing, extra, or duplicated header disqualifies the file. A near-miss that still
@@ -17,9 +17,20 @@ decisions follow the round-4 review resolutions in the A1 plan:
   ``GlossaryRecord.declared_type``, validated against a bounded SQL-type token (≤64 chars,
   ``^[a-z0-9 _()]+$`` after lowercasing) so even declared metadata never bypasses the free-text
   controls.
-- **Closed term_type vocabulary (#7):** ``TERM_TYPE_VOCAB_V1`` is explicit and versioned in code.
-  An unknown value quarantines its row; the value shown in the reason is PII-redacted and
-  length-bounded before it can persist.
+- **Open term_type vocabulary (R5-1, reversing round-4 #7):** term_type is DATA, not a gate. Any
+  value — known, new (the real file's ``Regulatory Term``), or blank — ingests, normalized
+  (lowercase, spaces→``_``) onto ``GlossaryRecord.term_type``. The ONLY behavioral use anywhere is
+  the exact normalized ``measure`` Pass C join-key exclusion (downstream, via ``ColMeta.term_type``).
+  ``KNOWN_TERM_TYPES`` documents the observed set for reference; nothing checks against it.
+- **Malformed row widths quarantine (R5-6):** a row with cells beyond the 17 headers (an unquoted
+  comma shifting every later field one column right — ``csv.DictReader`` files the overflow under
+  its ``None`` key) is diverted to the adapter-level quarantine as read, never ingested as parsed.
+- **Unresolvable FQNs quarantine via the adapter (R5-7, redoing round-4 M3):** a row whose
+  ``schema.table.column`` cell cannot resolve is NOT dropped to an identity-less row (which lost
+  the term/domain/taxonomy/term_type/schema/declared_type sidecar in the untagged validate path).
+  The adapter emits a tagged ``RowError(adapter="ftr")`` whose reason preserves the raw physical
+  FQN + the (already-redacted) record fields, and whose row carries the SANITIZED definition +
+  source_row — nothing silently lost, inline repair refused, the FQN visible for the re-upload fix.
 - **Parse-time sanitize (#2/#10):** every definition goes through
   :func:`~featuregen.overlay.upload.sanitize.sanitize_definition` (safe facets kept, raw sample
   values stripped or the field blanked); EVERY other uploader free-text field (term name, domain,
@@ -32,9 +43,10 @@ decisions follow the round-4 review resolutions in the A1 plan:
   mirroring the duplicate-FQN rule).
 
 Structure mirrors ``read_glossary``'s two passes: Pass 1 parses and indexes the collision keys
-(multi-schema folds, duplicate normalized FQNs, source_row ints); Pass 2 emits, diverting bad rows
-into the reader-level quarantine whose ``row_index`` starts AT ``len(rows)`` so it can never
-collide with a ``validate_rows`` index on the ``quarantine_row`` primary key.
+(multi-schema folds, duplicate normalized FQNs, source_row ints), diverting malformed-width rows
+before their shifted fields can pollute those indexes; Pass 2 emits, diverting bad rows into the
+reader-level quarantine whose ``row_index`` starts AT ``len(rows)`` so it can never collide with a
+``validate_rows`` index on the ``quarantine_row`` primary key.
 
 Pure module: no DB, no LLM, no route wiring (dispatch is Task 3b).
 """
@@ -63,11 +75,12 @@ from featuregen.overlay.upload.sanitize import (
     sanitize_definition,
 )
 
-# The closed, versioned term_type vocabulary (resolution #7). Values compare NORMALIZED
-# (lowercase, whitespace runs → "_"): "Reference Data" ⟶ "reference_data". Widening the set is a
-# NEW version — never a silent edit.
-TERM_TYPE_VOCAB_V1 = frozenset({"measure", "dimension", "code_value", "reference_data",
-                                "business_term"})
+# The term_type values observed in real FTR exports, normalized (lowercase, whitespace runs → "_":
+# "Reference Data" ⟶ "reference_data"). REFERENCE/DOCS ONLY (R5-1): the vocabulary is OPEN — no
+# code checks membership, an unlisted or blank value ingests unchanged. The only behavioral
+# consumer of term_type is Pass C's exact-"measure" join-key exclusion, downstream of this module.
+KNOWN_TERM_TYPES = frozenset({"measure", "dimension", "code_value", "reference_data",
+                              "business_term", "regulatory_term"})
 
 # The exact 17 FTR headers, normalized via the shared header normalizer (`_headers._norm`:
 # BOM-strip + lowercase + drop spaces/underscores — dots survive, keeping `schema.table.column`
@@ -105,7 +118,7 @@ class PreparedFtrUpload:
 
     rows: list[CanonicalRow]        # SANITIZED definitions; source_row stamped; type = UNKNOWN_TYPE
     records: list[GlossaryRecord]   # SANITIZED free-text; schema/physical_fqn/declared_type set
-    quarantined: list[RowError]     # bad/dup FQN, bad/dup source_row, unknown term_type, multi-schema
+    quarantined: list[RowError]     # malformed width, bad/dup FQN, bad/dup source_row, multi-schema
     sanitized_count: int
     sanitizer_version: str
     redaction_version: str | None
@@ -180,7 +193,7 @@ class _ParsedRow:
     semantic_type: str
     domain: str
     term_type_raw: str
-    term_type: str                  # normalized (lowercase, spaces→_); vocab-checked in Pass 2
+    term_type: str                  # normalized (lowercase, spaces→_); OPEN vocabulary (R5-1)
     process_path: str
     related_terms: tuple[str, ...]
     synonyms: tuple[str, ...]
@@ -210,7 +223,10 @@ def read_ftr_glossary(text: str, *, source: str) -> PreparedFtrUpload:
     # reader can see two schemas folding onto one (table, column)), duplicate NORMALIZED FQNs
     # (validate_rows would silently dedup two identical rows — the file is malformed, fail closed
     # on BOTH), and source_row ints (uniqueness is judged on the PARSED value: "007" == "7").
+    # Malformed-width rows (R5-6) divert straight to `pending` here, BEFORE their shifted fields
+    # can be parsed or pollute the collision indexes.
     parsed: list[_ParsedRow] = []
+    pending: list[tuple[str, CanonicalRow]] = []   # (message, quarantine row) awaiting an index
     schemas_by_fold: dict[tuple[str, str], dict[str, str]] = {}
     fqn_counts: Counter[tuple[str, str, str]] = Counter()
     srcrow_counts: Counter[int] = Counter()
@@ -219,6 +235,19 @@ def read_ftr_glossary(text: str, *, source: str) -> PreparedFtrUpload:
         sanitized_count += san.removed
         if redaction_version is None and san.redaction_version is not None:
             redaction_version = san.redaction_version
+        extra = raw.get(None)
+        if extra:
+            # R5-6: cells beyond the 17 headers (csv.DictReader's None key) mean an unquoted comma
+            # shifted every later field one column right — NOTHING parsed from this row can be
+            # trusted, so quarantine it adapter-level as read (identity blanked; the definition
+            # cell sanitized so nothing raw persists; source_row kept so the row is locatable).
+            # The reason echoes only counts, never cell content — no redaction needed.
+            pending.append((
+                f"malformed row width: {len(_FTR_HEADERS) + len(extra)} cells, expected "
+                f"{len(_FTR_HEADERS)} (an unquoted comma likely shifted fields)",
+                CanonicalRow(source=source, table="", column="", type=UNKNOWN_TYPE,
+                             definition=san.clean, source_row=_cell(hmap, raw, "sourcerow"))))
+            continue
         fqn_raw = _cell(hmap, raw, "schema.table.column")
         schema, table, column = _split_fqn(fqn_raw)
         source_row = _cell(hmap, raw, "sourcerow")
@@ -265,14 +294,12 @@ def read_ftr_glossary(text: str, *, source: str) -> PreparedFtrUpload:
     # Pass 2 — emit rows/records, diverting bad rows into the reader-level quarantine. Every
     # quarantined row carries the SANITIZED definition and its raw identity spelling (mirroring
     # read_glossary's raw-valued quarantine rows) with type=UNKNOWN_TYPE (resolution #1 applies to
-    # quarantined rows too). Resolution #9's inline-repair refusal covers ONLY these ADAPTER-level
-    # quarantine rows (dup FQN, unknown term_type, bad/dup source_row, multi-schema fold) — they
-    # are built as RowError(adapter="ftr") below, and that tag is what resolve_quarantine_row
-    # keys the refusal on. The unresolvable-FQN rows take a different, untagged path (see the
-    # r.table is None branch).
+    # quarantined rows too). Resolution #9's inline-repair refusal covers ALL of these ADAPTER-level
+    # quarantine rows (malformed width, unresolvable FQN, dup FQN, bad/dup source_row, multi-schema
+    # fold) — they are built as RowError(adapter="ftr") below, and that tag is what
+    # resolve_quarantine_row keys the refusal on; the fix is always re-uploading a corrected file.
     rows: list[CanonicalRow] = []
     records: list[GlossaryRecord] = []
-    pending: list[tuple[str, CanonicalRow]] = []   # (message, raw-valued row) awaiting an index
 
     def _quarantine_row(r: _ParsedRow) -> CanonicalRow:
         return CanonicalRow(source=source, table=r.table or "", column=r.column or "",
@@ -280,14 +307,18 @@ def read_ftr_glossary(text: str, *, source: str) -> PreparedFtrUpload:
 
     for r in parsed:
         if r.table is None:
-            # Unresolvable FQN — emit an identity-less row so profile-aware validate_rows
-            # quarantines it (mirroring read_glossary) WITHOUT the _adapter="ftr" tag the
-            # adapter-level RowErrors carry, so — unlike those — this row CAN be inline-repaired
-            # via resolve_quarantine_row. That is acceptable: the row carried NO glossary sidecar
-            # (a ref needs a table, so there is nothing to lose on repair) and its definition was
-            # already sanitized at parse time.
-            rows.append(CanonicalRow(source=source, table="", column="", type=UNKNOWN_TYPE,
-                                     definition=r.definition, source_row=r.source_row))
+            # R5-7: an unresolvable FQN quarantines HERE, adapter-tagged, instead of dropping to an
+            # identity-less row for validate_rows (which was untagged — inline-repairable — and
+            # silently LOST the row's term/domain/taxonomy/term_type/schema/declared_type sidecar).
+            # The reason carries the raw physical FQN deliberately unredacted and unbounded — it is
+            # the physical identifier the uploader must see to fix the file — while the record
+            # fields it echoes (term_name/domain redacted in Pass 1; term_type redacted here) obey
+            # the persistence controls, and the row carries only the SANITIZED definition.
+            pending.append((
+                f"unresolvable FQN {r.physical_fqn!r} — term={r.term_name!r} "
+                f"type={_redact(r.term_type_raw)!r} domain={r.domain!r} "
+                f"source_row={r.source_row}; fix the FQN and re-upload",
+                _quarantine_row(r)))
             continue
 
         if r.source_row_int is None:
@@ -299,13 +330,6 @@ def read_ftr_glossary(text: str, *, source: str) -> PreparedFtrUpload:
             pending.append((
                 f"duplicate source_row {r.source_row_int} — source_row must be unique within the "
                 f"upload; every row sharing it is quarantined", _quarantine_row(r)))
-            continue
-
-        if r.term_type and r.term_type not in TERM_TYPE_VOCAB_V1:
-            shown = ", ".join(sorted(TERM_TYPE_VOCAB_V1))
-            pending.append((
-                f"unknown term_type '{_reason_value(r.term_type)}' "
-                f"(expected one of: {shown}) — TERM_TYPE_VOCAB_V1", _quarantine_row(r)))
             continue
 
         fqn_key = (_norm(r.schema or ""), _norm(r.table), _norm(r.column) if r.column else "")

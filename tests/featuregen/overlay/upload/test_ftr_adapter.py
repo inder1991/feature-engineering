@@ -1,15 +1,19 @@
 """Tests for the FTR glossary adapter module (Task 3a — module only, no route dispatch).
 
-Contracts under test (round-4 resolutions #1/#3/#7/#10/#12):
+Contracts under test (round-4 resolutions #1/#3/#10/#12 + round-5 R5-1/R5-6/R5-7):
 - ``is_ftr_glossary`` is an EXACT normalized header-multiset match — a missing, extra, or
   duplicated header disqualifies the file.
 - ``ftr_fingerprint_error`` returns a specific near-FTR diagnostic (missing/extra/duplicate
   normalized headers) ONLY when the FTR-distinctive ``schema.table.column`` header is present.
 - The OPERATIONAL ``CanonicalRow.type`` is ALWAYS ``UNKNOWN_TYPE`` (#1); the FTR-declared SQL type
   survives only as bounded, non-operational ``GlossaryRecord.declared_type`` metadata (#3).
-- ``term_type`` is matched against the versioned closed vocabulary ``TERM_TYPE_VOCAB_V1``; an
-  unknown value quarantines its row with a bounded, redacted value in the reason (#7).
+- ``term_type`` is an OPEN vocabulary (R5-1): any value — known, new (``Regulatory Term``), or
+  blank — ingests, normalized (lowercase, spaces→``_``). ``KNOWN_TERM_TYPES`` is reference only.
 - ``source_row`` must be a non-empty integer, unique (as parsed int) across the upload (#12).
+- A malformed-width row (extra cells beyond the 17 headers — an unquoted comma shifting fields)
+  is quarantined adapter-level, never ingested with shifted fields (R5-6).
+- An unresolvable-FQN row is quarantined adapter-level with the raw FQN + record fields preserved
+  in the reason — no identity-less row is emitted for it (R5-7).
 - Every definition is sanitized at parse time (an unhandled sample clause blanks the field, the
   row still ingests); every other free-text field is PII-redacted.
 
@@ -20,7 +24,7 @@ from __future__ import annotations
 from featuregen.intake.redaction import REDACTION_VERSION
 from featuregen.overlay.upload.canonical import UNKNOWN_TYPE
 from featuregen.overlay.upload.ftr_adapter import (
-    TERM_TYPE_VOCAB_V1,
+    KNOWN_TERM_TYPES,
     PreparedFtrUpload,
     ftr_fingerprint_error,
     is_ftr_glossary,
@@ -191,20 +195,37 @@ def test_quarantine_indices_disjoint_from_row_indices():
     assert sorted(q.row_index for q in p.quarantined) == [1, 2]   # starts AT len(rows)
 
 
-# ── Quarantine: term_type vocabulary (resolution #7) ─────────────────────────────────────────────
+# ── term_type is OPEN (R5-1: normalize + ingest; never quarantine) ───────────────────────────────
 
-def test_term_type_vocab_is_the_versioned_closed_set():
-    assert TERM_TYPE_VOCAB_V1 == frozenset(
-        {"measure", "dimension", "code_value", "reference_data", "business_term"})
+def test_known_term_types_is_reference_only_and_contains_the_real_file_set():
+    # Informational constant (docs/reference) — NOT a quarantine gate. The only behavioral use of
+    # term_type anywhere is the exact normalized "measure" Pass C join-key exclusion (downstream).
+    assert KNOWN_TERM_TYPES == frozenset(
+        {"measure", "dimension", "code_value", "reference_data", "business_term",
+         "regulatory_term"})
 
 
-def test_unknown_term_type_quarantined_with_bounded_value_in_reason():
-    csv_text = _HDR + _row(term_type="Mesure")
+def test_open_term_type_regulatory_term_and_blank_ingest_measure_normalizes():
+    csv_text = (_HDR
+                + _row(source_row="18", term_type="Regulatory Term")
+                + _row(source_row="19", fqn="DPL_EIB_COMPLIANCE.COMP_FIN_TRAN.TXN_AMT",
+                       term_type="")
+                + _row(source_row="20", fqn="DPL_EIB_COMPLIANCE.COMP_FIN_TRAN.TXN_CCY",
+                       term_type="Measure"))
     p = read_ftr_glossary(csv_text, source="ftr")
-    assert p.rows == [] and p.records == []
-    assert len(p.quarantined) == 1
-    assert "mesure" in p.quarantined[0].message
-    assert "term_type" in p.quarantined[0].message
+    assert p.quarantined == []                          # nothing quarantined on term_type — ever
+    assert len(p.rows) == 3 and len(p.records) == 3     # all three ingest as normal columns
+    assert p.records[0].term_type == "regulatory_term"  # new value: normalized, kept
+    assert p.records[1].term_type == ""                 # blank: kept blank
+    assert p.records[2].term_type == "measure"          # exact "measure" still reaches Pass C
+
+
+def test_unknown_term_type_ingests_not_quarantined():
+    csv_text = _HDR + _row(term_type="Mesure")          # a typo'd value is data, not a defect
+    p = read_ftr_glossary(csv_text, source="ftr")
+    assert p.quarantined == []
+    assert len(p.rows) == 1 and len(p.records) == 1
+    assert p.records[0].term_type == "mesure"
 
 
 def test_blank_term_type_is_not_declared_and_passes():
@@ -260,15 +281,67 @@ def test_recognized_sample_clause_stripped_and_facets_kept():
     assert p.sanitized_count >= 1
 
 
-# ── Structural mirrors of read_glossary ──────────────────────────────────────────────────────────
+# ── Quarantine: malformed row width (R5-6) ───────────────────────────────────────────────────────
 
-def test_unresolvable_fqn_yields_identity_less_row_and_no_record():
+def test_malformed_row_width_quarantined_good_rows_still_ingest():
+    good = _row(source_row="18")
+    # An extra 18th cell — csv.DictReader files it under the None key; an unquoted comma in a real
+    # export shifts every later field one column right, so the row must never ingest as parsed.
+    bad = _row(source_row="19", fqn="DPL_EIB_COMPLIANCE.COMP_FIN_TRAN.TXN_AMT").rstrip("\n") \
+        + ",stray\n"
+    p = read_ftr_glossary(_HDR + good + bad, source="ftr")
+    assert len(p.rows) == 1 and len(p.records) == 1           # the good row still ingests
+    assert p.rows[0].source_row == "18"
+    assert len(p.quarantined) == 1
+    q = p.quarantined[0]
+    assert q.adapter == "ftr"                                 # adapter-level: inline repair refused
+    assert "malformed row width" in q.message
+    assert "18 cells" in q.message and "expected 17" in q.message
+    assert "stray" not in q.message                           # cell content never echoed in reason
+
+
+# ── Quarantine: unresolvable FQN (R5-7 — adapter-level, fields preserved) ────────────────────────
+
+def test_unresolvable_fqn_quarantined_with_raw_fqn_and_fields_in_reason():
     csv_text = _HDR + _row(fqn="no_dots_here")
     p = read_ftr_glossary(csv_text, source="ftr")
-    assert p.records == [] and p.quarantined == []
-    assert len(p.rows) == 1
-    assert p.rows[0].table == "" and p.rows[0].column == ""   # validate_rows will quarantine
+    assert p.rows == [] and p.records == []                   # NO identity-less row is emitted
+    assert len(p.quarantined) == 1
+    q = p.quarantined[0]
+    assert q.adapter == "ftr"                                 # tagged: inline repair refused
+    assert "no_dots_here" in q.message                        # raw physical FQN is visible
+    assert "Customer Name" in q.message                       # term preserved
+    assert "Dimension" in q.message                           # term_type preserved
+    assert "Party" in q.message                               # domain preserved
+    assert "18" in q.message                                  # source_row locatable
+    assert q.row is not None and q.row.table == "" and q.row.column == ""
+    assert q.row.source_row == "18"
 
+
+def test_unresolvable_trailing_dot_fqn_quarantined_not_reinterpreted():
+    csv_text = _HDR + _row(fqn="DPL_EIB_COMPLIANCE.COMP_FIN_TRAN.")
+    p = read_ftr_glossary(csv_text, source="ftr")
+    assert p.rows == [] and p.records == []
+    assert len(p.quarantined) == 1
+    assert p.quarantined[0].adapter == "ftr"
+    assert "DPL_EIB_COMPLIANCE.COMP_FIN_TRAN." in p.quarantined[0].message
+
+
+def test_unresolvable_fqn_quarantine_row_carries_sanitized_definition_not_raw():
+    definition = ('"Customer account number. The sample profile is NUMERIC, with representative '
+                  'values such as 3708484836801; 3708446902413, which supports interpretation of '
+                  'the field."')
+    csv_text = _HDR + _row(fqn="no_dots_here", definition=definition)
+    p = read_ftr_glossary(csv_text, source="ftr")
+    assert len(p.quarantined) == 1
+    q = p.quarantined[0]
+    assert q.row is not None
+    assert "3708484836801" not in q.row.definition            # sanitized, never raw
+    assert "3708484836801" not in q.message                   # and never via the reason either
+    assert "Customer account number" in q.row.definition
+
+
+# ── Structural mirrors of read_glossary ──────────────────────────────────────────────────────────
 
 def test_multi_schema_fold_collision_quarantines_both_rows():
     csv_text = _HDR + _row(source_row="18", fqn="SCHEMA_A.COMP_FIN_TRAN.CUST_NAME") + _row(
