@@ -97,7 +97,16 @@ def _planner_outcome(result: BindingPlanningResultV1) -> PlannerOutcome:
     return PlannerOutcome.no_physical_plan   # defensive total fallback
 
 
-def _compile_axes(result: BindingPlanningResultV1, compile_contracts: bool
+def is_identity_comparable(compile_status: CompileStatus) -> bool:
+    """A run whose compile pass was TRUNCATED by the operational budget (``incomplete``) must be
+    EXCLUDED from deterministic double-compile verdict comparisons (D6/F17): the set of compiled
+    contracts then depends on wall-time/ordering, not the inputs alone. complete / not_applicable /
+    compile_disabled are all determined by the inputs, so they ARE comparable."""
+    return compile_status is not CompileStatus.incomplete
+
+
+def _compile_axes(result: BindingPlanningResultV1, compile_contracts: bool,
+                  budget_stopped_by_time: bool | None
                   ) -> tuple[CompileStatus, IncompleteReason | None, int, int, int]:
     eligible = [p for p in result.candidate_plans
                 if p.path_resolution_status is PathResolutionStatus.source_to_target_resolved]
@@ -111,9 +120,11 @@ def _compile_axes(result: BindingPlanningResultV1, compile_contracts: bool
         return CompileStatus.compile_disabled, None, path_resolved_eligible, 0, path_resolved_eligible
     if compiled == path_resolved_eligible:
         return CompileStatus.complete, None, path_resolved_eligible, compiled, skipped
-    # some eligible candidate did not compile under an active compile pass -> operationally incomplete
-    # (D6 refines budget_count vs budget_time; the count-budget is the default cause here).
-    return CompileStatus.incomplete, IncompleteReason.budget_count, path_resolved_eligible, compiled, skipped
+    # some eligible candidate did not compile under an active compile pass -> operationally incomplete.
+    # D6/F17: the budget records which bound truncated the run (budget_time when the elapsed-time
+    # deadline fired, else the plan-count bound).
+    reason = IncompleteReason.budget_time if budget_stopped_by_time else IncompleteReason.budget_count
+    return CompileStatus.incomplete, reason, path_resolved_eligible, compiled, skipped
 
 
 def _declarations_json(plan: BindingPlanV1) -> dict:
@@ -156,10 +167,13 @@ def _observation(plan: BindingPlanV1, *, run_id: str | None, recipe_id: str, ctx
 
 
 def map_result(result: BindingPlanningResultV1, *, template, scope, compile_ctx, compile_contracts,
-               now) -> tuple[RunResultRowV1, list[PlanObservationRowV1]]:
+               now, budget_stopped_by_time: bool | None = None
+               ) -> tuple[RunResultRowV1, list[PlanObservationRowV1]]:
     """Map one recipe's planner result to its store rows. ``compile_ctx`` is the batched context (needed
-    for the fingerprints); None when not compiling."""
-    compile_status, incomplete_reason, eligible, compiled, skipped = _compile_axes(result, compile_contracts)
+    for the fingerprints); None when not compiling. ``budget_stopped_by_time`` (from the run's shared
+    budget) labels an incomplete run's cause as budget_time vs budget_count (D6/F17)."""
+    compile_status, incomplete_reason, eligible, compiled, skipped = _compile_axes(
+        result, compile_contracts, budget_stopped_by_time)
     p_hash = planner_input_hash(compile_ctx, template, scope) if compile_ctx is not None else None
     run_row = RunResultRowV1(
         generation_run_id=result.run_id, recipe_id=result.recipe_id,

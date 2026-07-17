@@ -202,15 +202,20 @@ def _compile_or_mark(conn, plan: BindingPlanV1, template: Template, compile_ctx:
                      budget: CompileBudget | None,
                      envelope: PlannerReplayEnvelopeV1) -> BindingPlanV1:
     """Compile ONE candidate while the run-owned budget allows it. Non source→target plans pass
-    through untouched (never compiled); a plan skipped because the budget (count or the deadline
-    over the INJECTED now — deterministic, never wall-clock) is spent stays not_compiled and
-    honestly records compile_budget_exhausted — never a silent skip."""
+    through untouched (never compiled); a plan skipped because the budget (the plan-count OR the
+    real elapsed-time deadline over the injected monotonic ``clock`` — D6/F17) is spent stays
+    not_compiled and honestly records compile_budget_exhausted — never a silent skip. The budget
+    remembers WHICH bound fired first (``stopped_by_time``) so the store can label budget_time vs
+    budget_count."""
     if plan.path_resolution_status is not PathResolutionStatus.source_to_target_resolved:
         return plan
-    if budget is not None and not (budget.remaining > 0 and compile_ctx.now < budget.deadline):
-        return replace(plan, contract_reason_codes=canonical_reason_codes(
-            plan.contract_reason_codes + (ReasonCode.compile_budget_exhausted,)))
     if budget is not None:
+        blocked_time = budget.clock() >= budget.deadline_monotonic
+        if budget.remaining <= 0 or blocked_time:
+            if budget.stopped_by_time is None:   # first-stop-wins: record the bound that truncated
+                budget.stopped_by_time = blocked_time
+            return replace(plan, contract_reason_codes=canonical_reason_codes(
+                plan.contract_reason_codes + (ReasonCode.compile_budget_exhausted,)))
         budget.remaining -= 1
     return compile_contract(conn, compile_ctx, plan, template, base_envelope=envelope)
 

@@ -116,6 +116,56 @@ def test_persistence_failure_retains_manifest_and_reconcile_detects_loss(db, mon
     assert not rec.complete                                     # the loss is detected
 
 
+# ── D6: compile-status refinement (budget_time vs budget_count) + identity-comparability ──
+def test_is_identity_comparable_excludes_only_incomplete():
+    assert sc.is_identity_comparable(ss.CompileStatus.complete) is True
+    assert sc.is_identity_comparable(ss.CompileStatus.not_applicable) is True
+    assert sc.is_identity_comparable(ss.CompileStatus.compile_disabled) is True
+    assert sc.is_identity_comparable(ss.CompileStatus.incomplete) is False   # budget-truncated → excluded
+
+
+def test_compile_axes_labels_budget_time_vs_count():
+    import types
+
+    from featuregen.overlay.upload.planner.contracts import (
+        ContractResolutionStatus as CRS,
+    )
+    from featuregen.overlay.upload.planner.contracts import (
+        PathResolutionStatus as PRS,
+    )
+
+    def _p(compiled):
+        return types.SimpleNamespace(
+            path_resolution_status=PRS.source_to_target_resolved,
+            contract_resolution_status=CRS.resolved if compiled else CRS.not_compiled)
+
+    result = types.SimpleNamespace(candidate_plans=(_p(True), _p(False)))   # 2 eligible, 1 compiled
+    st, reason, elig, comp, skip = sc._compile_axes(result, True, True)
+    assert st is ss.CompileStatus.incomplete and reason is ss.IncompleteReason.budget_time
+    assert (elig, comp, skip) == (2, 1, 1)
+    assert sc._compile_axes(result, True, False)[1] is ss.IncompleteReason.budget_count
+    assert sc._compile_axes(result, True, None)[1] is ss.IncompleteReason.budget_count   # None → count
+
+
+def test_real_elapsed_time_deadline_marks_incomplete_budget_time(db):
+    # D6/F17: a compile pass that overruns the REAL elapsed-time deadline (injected monotonic clock
+    # already past it) is truncated → compile_status=incomplete / incomplete_reason=budget_time.
+    _cross_seed(db)
+    calls = {"n": 0}
+
+    def clock():   # construction reads 0 (deadline=+30s); the first compile check is already past it
+        calls["n"] += 1
+        return 0.0 if calls["n"] == 1 else 1e6
+
+    run_shadow_planner(db, eligible_recipe_ids=frozenset({"t_roll"}), target_entity="account",
+                       roles=(), run_id="run_bt", now=_NOW, templates=(_txn_template(),),
+                       compile_contracts=True, persist=True, monotonic=clock)
+    row = ss.read_run_results(db, "run_bt")[0]
+    assert row["compile_status"] == "incomplete"
+    assert row["incomplete_reason"] == "budget_time"
+    assert row["compiled_count"] == 0 and row["skipped_count"] >= 1
+
+
 def test_template_not_found_writes_a_row(db):
     _catalog(db, "core")
     run_shadow_planner(db, eligible_recipe_ids=frozenset({"t_bal", "ghost"}), target_entity="customer",
