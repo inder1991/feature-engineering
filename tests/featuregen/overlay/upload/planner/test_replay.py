@@ -12,6 +12,8 @@ from featuregen.overlay.upload.planner.replay import (
     CurrentEvidenceV1,
     StoredEvidenceV1,
     compare,
+    read_current_evidence,
+    replay_freshness,
 )
 from featuregen.overlay.upload.templates import _load_columns
 
@@ -100,3 +102,15 @@ def test_graph_rebuild_drifts_the_fingerprint_at_fixed_head(db):
     build_graph(db, "core", [r for r, _ in rows], concepts={content_hash(r): cn for r, cn in rows})
     assert _fp(db) != stored_fp
     assert compare(stored, _current(fp=_fp(db), head=3, checkpoint=100)) is ReplayFreshness.drifted
+
+
+def test_adapter_recomputes_and_missing_catalog_is_unverifiable(db):
+    # drives the IMPURE read_current_evidence + replay_freshness end-to-end. A catalog with no data
+    # (drift_head_seq -> None) is unverifiable; a re-read of the same fingerprint is NOT a drift.
+    _seed(db)
+    stored = StoredEvidenceV1(fingerprints={"core": _fp(db), "ghost": "x"},
+                             head_seqs={"core": 3, "ghost": 3}, versions=_V)
+    cur = read_current_evidence(db, stored)
+    assert cur.fingerprints["core"] == _fp(db)          # recomputed the real per-catalog fingerprint
+    assert cur.head_seqs["ghost"] is None               # a catalog with no watermark -> None
+    assert replay_freshness(db, stored) is ReplayFreshness.unverifiable   # ghost head None -> unverifiable
