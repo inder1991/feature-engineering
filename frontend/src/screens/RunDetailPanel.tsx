@@ -126,7 +126,7 @@ export function RunDetailPanel({ runId, onClose }: { runId: string; onClose: () 
             <div>
               <dt>Rows</dt>
               <dd className="tabular-nums">
-                {run.row_count ?? '—'} asserted · {run.quarantined_count ?? '—'} quarantined
+                {run.row_count ?? '—'} rows · {run.quarantined_count ?? '—'} quarantined
               </dd>
             </div>
             <div>

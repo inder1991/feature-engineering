@@ -69,7 +69,7 @@ describe('RunDetailPanel', () => {
     expect(panel).toHaveTextContent('user:owner')
     expect(panel).toHaveTextContent('roles: data_owner, platform_admin')
     expect(panel).toHaveTextContent('permitted')
-    expect(panel).toHaveTextContent('12 asserted · 2 quarantined')
+    expect(panel).toHaveTextContent('12 rows · 2 quarantined')
     expect(panel).toHaveTextContent('2026-07-16 09:00:00+00:00')
     expect(panel).toHaveTextContent('FACT_ASSERTION_ERROR')
 
@@ -97,6 +97,19 @@ describe('RunDetailPanel', () => {
     expect(notRun).not.toHaveClass('stage-warn')
     expect(notRun).not.toHaveClass('ok')
     expect(within(rows[3]).getByText('disabled')).not.toHaveClass('stage-warn')
+  })
+
+  // #15 (A1-minimal): row_count is a parsed-row count, not an asserted-fact count — an FTR
+  // upload with no grain/as-of asserts 0 facts while row_count is 126, so "126 asserted" on a
+  // fully-rejected run was a lie. The label must say "rows"; the full count model is A2.
+  it('labels counts honestly: rows · quarantined, never "asserted"', async () => {
+    getIngestionRun.mockResolvedValue({
+      ...RUN, status: 'rejected', row_count: 126, quarantined_count: 126,
+    })
+    render(<RunDetailPanel runId="run-9" onClose={() => {}} />)
+    const panel = await screen.findByRole('region', { name: /ingestion run details/i })
+    expect(panel).toHaveTextContent('126 rows · 126 quarantined')
+    expect(panel).not.toHaveTextContent('asserted')
   })
 
   it('shows a loading line until the fetch resolves', () => {
