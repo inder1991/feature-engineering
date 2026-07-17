@@ -32,6 +32,7 @@ from dataclasses import dataclass, field
 from featuregen.overlay.upload._headers import _norm as _norm_header
 from featuregen.overlay.upload.canonical import UNKNOWN_TYPE, CanonicalRow, RowError
 from featuregen.overlay.upload.object_ref import _norm, normalize_ref
+from featuregen.overlay.upload.sample_parser import parse_sample_profile
 from featuregen.overlay.upload.source_profile import (
     FTR_GLOSSARY_PROFILE,
     profile_for_upload,
@@ -85,7 +86,9 @@ class GlossaryRecord:
     # is not the physical-type authority). Validated + bounded by the adapter (resolution #3).
     declared_type: str = ""
     # SAFE parser facets derived from a recognized sample clause (never the raw sample values) —
-    # populated by the sanitizer, preserved as parser evidence in a later task.
+    # populated by BOTH readers (the FTR adapter via the sanitizer BEFORE stripping; the generic
+    # reader at read time) and consumed as PARSER evidence at ingest, which never re-parses the
+    # definition (Task 7 / review #4 — the FTR definition arrives already sample-stripped).
     logical_representation: str = ""
     semantic_type: str = ""
 
@@ -218,12 +221,18 @@ def read_glossary(text: str, *, source: str) -> GlossaryUpload:
                                  type=declared_type, definition=definition)))
                 continue
 
+        # SAFE parser facets, captured at read time so the record CARRIES them (Task 7 / review #4):
+        # evidence-time no longer re-parses the definition (an adapter may have stripped its sample
+        # clause). The generic reader does not strip, so parsing here is behaviour-preserving.
+        profile = parse_sample_profile(definition)
         records.append(GlossaryRecord(
             logical_ref=normalize_ref(source, schema, table, column),
             term_name=_cell(fmap, raw, "term_name"), definition=definition,
             domain=_cell(fmap, raw, "domain"), synonyms=_split_synonyms(_cell(fmap, raw, "synonyms")),
             bian_path=_cell(fmap, raw, "bian_path"), fibo_path=_cell(fmap, raw, "fibo_path"),
-            is_table=column is None))
+            is_table=column is None,
+            logical_representation=profile.logical_representation or "",
+            semantic_type=profile.semantic_type or ""))
 
         if column is not None:   # a 2-part table term is a record only, never a CanonicalRow
             rows.append(CanonicalRow(source=source, table=table, column=column,

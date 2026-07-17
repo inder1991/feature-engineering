@@ -21,6 +21,7 @@ from tests.featuregen.overlay.upload.test_ftr_adapter import _FTR_CSV
 
 from featuregen.contracts.envelopes import IdentityEnvelope
 from featuregen.overlay.config import OverlayConfig, register_overlay_config
+from featuregen.overlay.field_evidence import read_active_field_evidence
 from featuregen.overlay.upload.canonical import UNKNOWN_TYPE
 from featuregen.overlay.upload.ftr_adapter import read_ftr_glossary, to_glossary_upload
 from featuregen.overlay.upload.ingest import ingest_upload
@@ -29,6 +30,7 @@ _SOURCE = "ftr"
 _COL_REF = "public.comp_fin_tran.cust_name"
 _TABLE_REF = "public.comp_fin_tran"
 _TABLE_LREF = "ftr::dpl_eib_compliance.comp_fin_tran"   # schema-preserving evidence key
+_AMT_LREF = "ftr::dpl_eib_compliance.comp_fin_tran.txn_amt"   # schema-preserving column key
 
 NOW = datetime(2026, 7, 17, tzinfo=UTC)
 
@@ -117,6 +119,31 @@ def test_table_term_reaches_table_node_via_evidence(db):
         "SELECT field_name FROM field_evidence WHERE logical_ref = %s AND lifecycle = 'active'",
         (_TABLE_LREF,)).fetchall()}
     assert {"business_term", "definition", "domain"} <= fields
+
+
+def test_parser_evidence_survives_sanitization(db):
+    """Task 7 (round-4 #4): the sample clause is STRIPPED from the definition at parse time, so
+    re-parsing ``rec.definition`` at evidence time finds nothing. The SAFE facets the sanitizer
+    captured BEFORE stripping (``GlossaryRecord.logical_representation`` / ``.semantic_type``) must
+    still reach ``field_evidence`` as ACTIVE parser:supported rows at the schema-preserving ref."""
+    _seal()
+    # TXN_AMT's definition now embeds a canonical FTR sample clause (pre-flight verified:
+    # parse_sample_profile -> decimal/amount; sanitize -> state='stripped', prose kept).
+    with_sample = _FTR_CSV.replace(
+        '"The monetary amount of the transaction."',
+        '"The monetary amount of the transaction. The sample profile is NUMERIC, with '
+        'representative values such as 100.00; 200.00, which supports interpretation as '
+        'an amount."')
+    assert with_sample != _FTR_CSV                     # the TXN_AMT row really was rewritten
+    assert _ingest(db, with_sample).status == "ingested"
+
+    for field_name, expected in (("logical_representation", "decimal"),
+                                 ("semantic_type", "amount")):
+        rows = [e for e in read_active_field_evidence(db, _AMT_LREF, field_name)
+                if e.producer == "parser"]
+        assert rows, f"no ACTIVE parser evidence for {field_name}"
+        assert {e.strength for e in rows} == {"supported"}
+        assert {e.proposed_value for e in rows} == {expected}
 
 
 def test_table_term_schema_disagreement_skips_table_evidence(db):

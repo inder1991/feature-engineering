@@ -60,7 +60,6 @@ from featuregen.overlay.upload.passc.projection import (
 )
 from featuregen.overlay.upload.readiness import ReadinessScopeType, compute_readiness
 from featuregen.overlay.upload.review_queue import persist_quarantine
-from featuregen.overlay.upload.sample_parser import parse_sample_profile
 from featuregen.overlay.upload.source_profile import (
     FTR_GLOSSARY_PROFILE,
     SourceCapabilityProfile,
@@ -682,31 +681,32 @@ def _write_glossary_source_evidence(
 
 
 def _write_glossary_parser_evidence(
-    conn, *, logical_ref: str, description: str, snapshot_id: str
+    conn, *, logical_ref: str, logical_representation: str, semantic_type: str, snapshot_id: str
 ) -> None:
-    """Write PARSER evidence (logical_representation / semantic_type @ parser:supported) from the
-    deterministic sample-value parser. No profile in the description -> a diagnostic, then continue
-    (failure class: parser no-profile is a gap, never a failure)."""
-    parsed = parse_sample_profile(description or "")
+    """Write PARSER evidence (logical_representation / semantic_type @ parser:supported) from the SAFE
+    facets the reader CARRIED on the record — captured by the deterministic sample parser at read time,
+    BEFORE any sample-clause stripping (Task 7 / review #4: the FTR adapter sanitizes the definition,
+    so re-parsing it here would find nothing and silently drop the evidence). An empty facet (``""``)
+    is ABSENT: nothing is written, and no facets at all is a gap, never a failure."""
     present: set[str] = set()
-    for field_name, value in (("logical_representation", parsed.logical_representation),
-                              ("semantic_type", parsed.semantic_type)):
-        if value is None:
+    for field_name, value in (("logical_representation", logical_representation),
+                              ("semantic_type", semantic_type)):
+        if not value:
             continue
         present.add(field_name)
         _write_producer_field(
             conn, logical_ref=logical_ref, field_name=field_name, value=value,
             producer=EvidenceProducer.PARSER, strength=AssertionStrength.SUPPORTED,
-            producer_ref=snapshot_id, snapshot_id=snapshot_id, material=description or "",
+            producer_ref=snapshot_id, snapshot_id=snapshot_id, material=value,
         )
-    # Reconcile absent parser fields: an edited description that drops its sample-profile phrase leaves
+    # Reconcile absent parser fields: an edited upload that drops its sample-profile facet leaves
     # the prior logical_representation/semantic_type ACTIVE + load-bearing unless we stale it here.
     _stale_absent_fields(
         conn, logical_ref=logical_ref, producer=EvidenceProducer.PARSER,
         all_fields=_PARSER_FIELDS, present=present,
     )
-    if not present and parsed.diagnostic:
-        logger.info("glossary parser found no profile for %s: %s", logical_ref, parsed.diagnostic)
+    if not present:
+        logger.info("glossary record carried no sample-profile facets for %s", logical_ref)
 
 
 def _write_glossary_taxonomy_evidence(
@@ -814,8 +814,9 @@ def _ingest_glossary_evidence(conn, *, source: str, rows: list[CanonicalRow],
         try:
             with conn.transaction():
                 _write_glossary_parser_evidence(
-                    conn, logical_ref=logical_ref, description=rec.definition,
-                    snapshot_id=snapshot_id)
+                    conn, logical_ref=logical_ref,
+                    logical_representation=rec.logical_representation,
+                    semantic_type=rec.semantic_type, snapshot_id=snapshot_id)
         except Exception:  # noqa: BLE001
             contained_failures += 1
             logger.warning("advisory glossary PARSER evidence failed for %s", logical_ref,
