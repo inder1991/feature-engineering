@@ -58,11 +58,6 @@ _ALIASES: dict[str, set[str]] = {
     "data_type": {"datatype", "type", "sqltype", "physicaltype", "columntype"},
 }
 
-# Synonyms/aliases arrive as a single cell holding several terms. The CSV parser already consumed the
-# field-separating commas, so a comma INSIDE a quoted cell is a legit character — split only on the
-# list separators a glossary actually uses (`;` and `|`), never on `,`.
-_SYNONYM_SEP = re.compile(r"[;|]")
-
 
 @dataclass(frozen=True, slots=True)
 class GlossaryRecord:
@@ -77,6 +72,18 @@ class GlossaryRecord:
     bian_path: str = ""
     fibo_path: str = ""
     is_table: bool = False
+    # FTR-adapter fields (A1) — ALL defaulted so existing constructors and the generic glossary
+    # reader above keep working unchanged; only the FTR adapter populates them.
+    source_row: str = ""              # original file row id, carried for quarantine provenance
+    term_type: str = ""               # closed-vocab term class (measure/dimension/...), normalized
+    process_path: str = ""            # joined related_business_process_l1..3
+    related_terms: tuple[str, ...] = ()
+    schema: str = ""                  # real (pre-flatten) schema segment of the declared FQN
+    physical_fqn: str = ""            # the raw schema.table.column as declared in the file
+    # SAFE parser facets derived from a recognized sample clause (never the raw sample values) —
+    # populated by the sanitizer, preserved as parser evidence in a later task.
+    logical_representation: str = ""
+    semantic_type: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -118,8 +125,24 @@ def _cell(fmap: Mapping[str, str], raw: Mapping[str, object], field_name: str) -
     return str(val).strip() if val is not None else ""
 
 
+def join_path(parts: list[str], sep: str = " / ") -> str:
+    """Join ordered taxonomy levels (e.g. ``bian_level_1..4``) into one path string, dropping blank
+    or whitespace-only levels so a sparse hierarchy renders without dangling separators. One of the
+    whitelisted glossary transforms (spec: `copy`/`split_fqn`/`join_path`/`split_list`)."""
+    return sep.join(p.strip() for p in parts if p.strip())
+
+
+def split_list(value: str, delimiters: tuple[str, ...] = (";", "|")) -> tuple[str, ...]:
+    """Split a single-cell list on ANY of ``delimiters``, stripping items and dropping empties. A
+    list cell (synonyms, related terms) holds several values in one field: the CSV parser already
+    consumed the field-separating commas, so a comma INSIDE a quoted cell is a legit character —
+    the defaults are the list separators a glossary actually uses (``;`` and ``|``), never ``,``."""
+    sep = re.compile("[" + "".join(re.escape(d) for d in delimiters) + "]")
+    return tuple(s.strip() for s in sep.split(value) if s.strip())
+
+
 def _split_synonyms(value: str) -> tuple[str, ...]:
-    return tuple(s.strip() for s in _SYNONYM_SEP.split(value) if s.strip())
+    return split_list(value)
 
 
 def _split_fqn(fqn: str) -> tuple[str | None, str | None, str | None]:

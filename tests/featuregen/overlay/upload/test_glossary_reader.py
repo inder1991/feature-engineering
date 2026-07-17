@@ -4,7 +4,9 @@ from featuregen.overlay.upload.glossary_reader import (
     GlossaryUpload,
     _split_fqn,
     is_glossary_csv,
+    join_path,
     read_glossary,
+    split_list,
 )
 from featuregen.overlay.upload.object_ref import normalize_ref
 from featuregen.overlay.upload.source_profile import FTR_GLOSSARY_PROFILE
@@ -257,3 +259,56 @@ def test_collision_quarantine_does_not_touch_clean_rows_in_the_same_file():
     assert len(up.quarantined) == 2                           # only the colliding pair
     assert [(r.table, r.column) for r in up.rows] == [("accounts", "balance")]
     assert [r.term_name for r in up.records] == ["Account Balance"]
+
+
+# --- Shared whitelisted transforms (Task 1): join_path / split_list -------------------------------
+
+
+def test_join_path_joins_ordered_levels_dropping_blanks():
+    assert join_path(["Party", "", "Customer"]) == "Party / Customer"
+
+
+def test_join_path_drops_whitespace_only_parts():
+    assert join_path(["Party", "   ", "Customer", ""]) == "Party / Customer"
+
+
+def test_join_path_of_all_blank_parts_is_empty():
+    assert join_path(["", "  ", ""]) == ""
+
+
+def test_join_path_honors_a_custom_separator():
+    assert join_path(["A", "B"], sep="/") == "A/B"
+
+
+def test_split_list_splits_on_any_listed_delimiter():
+    assert split_list("A; B | C") == ("A", "B", "C")
+
+
+def test_split_list_strips_and_drops_empties():
+    assert split_list(" A ;; B ;  ") == ("A", "B")
+
+
+def test_split_list_of_blank_input_is_empty():
+    assert split_list("") == ()
+    assert split_list("  ") == ()
+
+
+def test_split_list_honors_custom_delimiters():
+    assert split_list("A, B; C", delimiters=(",", ";")) == ("A", "B", "C")
+
+
+def test_split_list_does_not_split_on_commas_by_default():
+    # Commas inside a quoted CSV cell are legit characters, not list separators.
+    assert split_list("Smith, John; Doe, Jane") == ("Smith, John", "Doe, Jane")
+
+
+def test_glossary_record_new_fields_default_empty():
+    rec = GlossaryRecord(logical_ref="ftr.public.t.c", term_name="T", definition="D")
+    assert rec.source_row == ""
+    assert rec.term_type == ""
+    assert rec.process_path == ""
+    assert rec.related_terms == ()
+    assert rec.schema == ""
+    assert rec.physical_fqn == ""
+    assert rec.logical_representation == ""
+    assert rec.semantic_type == ""
