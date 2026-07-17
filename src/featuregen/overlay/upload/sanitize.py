@@ -17,9 +17,10 @@ through :func:`sanitize_definition` at parse time:
      (``representative values``, ``sample values/profile``, ``observed values/entries``,
      ``example values``): a clause the stripper could not consume → blank the WHOLE definition.
    * ``suspected_value_list`` — else, the residual carries >= 2 VALUE-SHAPED tokens (numeric run,
-     time-of-day, short code, quoted literal, all-caps entity run) TOGETHER WITH a list separator
-     (``;``/``,``/conjunctive ``and``) or a sample-context word (``values``/``entries``/``codes``/
-     ``observed``/``include``) → blank the WHOLE definition.
+     time-of-day, short code, DOUBLE-quoted literal, all-caps entity run) TOGETHER WITH a list
+     separator (``;`` or ``,`` ONLY — resolution #2 says "semicolons or commas") or a
+     sample-context word (``values``/``entries``/``codes``/``observed``/``include``) → blank the
+     WHOLE definition.
 
    Either way ``state="suspected_unhandled"`` and ``clean=""`` — the row still ingests; identity
    is intact. Individual values are NEVER deleted by shape (that would corrupt definitions);
@@ -61,14 +62,19 @@ _VALUE_TOKEN_RES: tuple[re.Pattern[str], ...] = (
     re.compile(r"\b\d+\.\d+\b|\b\d{3,}\b"),  # numeric: decimal, or a 3+ digit run
     re.compile(r"\b\d{1,2}:\d{2}(?::\d{2})?\b"),  # time-of-day: 15:07[:08]
     re.compile(r"\b[A-Z]{2,}-?\d+[A-Z0-9]*\b"),  # short code: LON01 / AB-1 / EI0300357
-    re.compile(r"\"[^\"]+\"|'[^']+'"),  # quoted literal: "OPN" / 'CLS'
+    # Quoted literal: DOUBLE quotes only, bounded length ("OPN"). Single quotes are NOT value
+    # evidence — possessive prose ("the client's ledger, the bank's records") would otherwise
+    # match `'s ledger, the bank'` as a quoted span and over-blank legitimate definitions.
+    re.compile(r"\"[^\"]{1,40}\""),
     re.compile(r"\b[A-Z][A-Z]+(?:\s+[A-Z][A-Z&]+)+\b"),  # all-caps entity run: NORDIC HOLDINGS AS
 )
 
-# List evidence: a separator or a sample-context word. Conjunctive ``and`` counts as a separator —
-# a two-item list ("Cutoffs 15:07:08 and 23:59:59") carries no ';'/',' — which is harmless for
-# prose because the gate still requires >= 2 value-shaped tokens.
-_LIST_SEPARATOR_RE = re.compile(r"[;,]|\band\b", re.IGNORECASE)
+# List evidence: a separator or a sample-context word. Separators are ';' and ',' ONLY (resolution
+# #2: "semicolons or commas"). Conjunctive ``and`` is NOT a separator — treating it as one blanked
+# legitimate quantitative prose ("between 100 and 500 basis points", "periods 2019 and 2020").
+# The accepted trade-off: a bare two-item ``X and Y`` value pair with no ';'/',', no marker, and no
+# context word passes through (rare/ambiguous; every demonstrated real leak carries one of those).
+_LIST_SEPARATOR_RE = re.compile(r"[;,]")
 _SAMPLE_CONTEXT_RE = re.compile(r"\b(?:values|entries|codes|observed|include)\b", re.IGNORECASE)
 
 _VALUE_TOKEN_THRESHOLD = 2

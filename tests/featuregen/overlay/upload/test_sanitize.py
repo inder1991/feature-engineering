@@ -8,9 +8,9 @@ residual is then judged by the VALUE-SHAPE RESIDUAL-SUSPICION GATE:
   values``, ``sample values/profile``, ``observed values/entries``, ``example values``) → the whole
   definition is blanked (``suspected_unhandled``).
 * ``suspected_value_list`` — the residual carries >= 2 VALUE-SHAPED tokens (numeric run, time,
-  short code, quoted literal, all-caps entity run) together with a list separator (``;``/``,``/
-  conjunctive ``and``) or a sample-context word (``values``/``entries``/``codes``/``observed``/
-  ``include``) → blanked.
+  short code, double-quoted literal, all-caps entity run) together with a list separator (``;`` or
+  ``,`` ONLY — conjunctive ``and`` is NOT one) or a sample-context word (``values``/``entries``/
+  ``codes``/``observed``/``include``) → blanked.
 
 Everything else — concept prose, a single acronym, an ordinary lowercase taxonomy list, even a bare
 introducer phrase like ``such as`` — is PRESERVED (the v1 introducer whitelist both leaked
@@ -89,7 +89,7 @@ _OBSERVED_ENTRIES_DESC = (
 )
 _BRANCH_CODES_DESC = "Branch codes: LON01, NYC02, SGP03."
 _QUOTED_STATUSES_DESC = 'Statuses are "OPN", "CLS", "PND".'
-_TIME_CUTOFFS_DESC = "Cutoffs 15:07:08 and 23:59:59 apply."
+_TIME_CUTOFFS_DESC = "Cutoffs 15:07:08; 23:59:59 apply."
 
 # NEGATIVES (resolution #2): legitimate concept prose the v1 introducer whitelist over-blanked, plus
 # bare-word controls. All must be PRESERVED verbatim.
@@ -104,6 +104,17 @@ _SUCH_AS_CATEGORIES_DESC = "Categories Such As retail and corporate."
 # Title-case proper nouns are shape-indistinguishable from concept words ("tenor and rate") — the
 # gate deliberately lets them through (accepted residual risk of resolution #2).
 _EXAMPLES_INCLUDE_DESC = "Total exposure across counterparties; examples include Acme and Beta."
+# Numeric-range / year prose joined by conjunctive "and": >= 2 numeric tokens but NO ';'/',' and no
+# sample-context word — "and" is NOT a list separator (resolution #2: "semicolons or commas"), so
+# legitimate quantitative prose must be PRESERVED.
+_NUMERIC_RANGE_DESC = "Threshold applies to exposures between 100 and 500 basis points."
+_REPORTING_YEARS_DESC = "Revised for reporting periods 2019 and 2020 under Basel III."
+_FISCAL_YEARS_DESC = "Ratios computed for 2021 and 2022 fiscal reporting."
+# Possessive apostrophes are NOT quoted-value tokens: the quoted-literal pattern is DOUBLE-quote
+# only, so spans between possessive `'` marks never count as values despite the commas.
+_POSSESSIVE_LIST_DESC = (
+    "the client's ledger, the bank's records, the firm's books, the fund's assets"
+)
 
 # THRESHOLD boundary: ONE value-shaped token is below the >= 2 gate — preserved by design (a single
 # ambient token is indistinguishable from a prose reference).
@@ -196,6 +207,10 @@ def test_plain_definition_unchanged():
         _FOR_EXAMPLE_PROSE_DESC,
         _SUCH_AS_CATEGORIES_DESC,
         _EXAMPLES_INCLUDE_DESC,
+        _NUMERIC_RANGE_DESC,
+        _REPORTING_YEARS_DESC,
+        _FISCAL_YEARS_DESC,
+        _POSSESSIVE_LIST_DESC,
     ],
 )
 def test_concept_prose_preserved_not_blanked(desc):
@@ -226,7 +241,7 @@ def test_single_value_token_below_threshold_preserved():
         (_OBSERVED_ENTRIES_DESC, "unhandled_marker"),  # demonstrated leak: "observed entries"
         (_BRANCH_CODES_DESC, "suspected_value_list"),  # demonstrated leak: code list
         (_QUOTED_STATUSES_DESC, "suspected_value_list"),  # quoted literals
-        (_TIME_CUTOFFS_DESC, "suspected_value_list"),  # conjunctive time list
+        (_TIME_CUTOFFS_DESC, "suspected_value_list"),  # semicolon-separated time list
         ("Counterparty codes E.G. AB-01 and CD-02.", "suspected_value_list"),
         ("Values observed, e.g., 12:30 and 13:45.", "suspected_value_list"),
         ('Statuses (examples include "OPEN"; "CLOSED").', "suspected_value_list"),
