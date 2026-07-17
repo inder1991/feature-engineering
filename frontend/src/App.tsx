@@ -222,6 +222,11 @@ export default function App() {
   const openSemantics = (source: string) => {
     navigate('semantics', { source })
   }
+  // And for the governance dashboard -> review launchpad: a source row's Review action (or a
+  // scoped pending count) lands on the confirmation surface with that source in the hash.
+  const openGovernanceReview = (source: string) => {
+    navigate('governance', { source })
+  }
   const page = PAGES.find(p => p.route === route) ?? PAGES[0]
   return (
     <div className="shell">
@@ -274,8 +279,10 @@ export default function App() {
         {route === 'semantics' && (
           <SemanticsPendingScreen initialSource={params.get('source') ?? ''} />
         )}
-        {route === 'governance' && <GovernanceReviewScreen />}
-        {route === 'dashboard' && <GovernanceDashboardScreen />}
+        {route === 'governance' && (
+          <GovernanceReviewScreen initialSource={params.get('source') ?? ''} />
+        )}
+        {route === 'dashboard' && <GovernanceDashboardScreen onReview={openGovernanceReview} />}
         {route === 'workbench' && <WorkbenchScreen />}
       </main>
     </div>

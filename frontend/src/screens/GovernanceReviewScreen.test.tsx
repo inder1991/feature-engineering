@@ -401,3 +401,24 @@ describe('governance review screen', () => {
     expect(screen.queryByRole('button', { name: /approve|reject/i })).not.toBeInTheDocument()
   })
 })
+
+describe('governance ?source= handoff', () => {
+  it('a non-empty initialSource fills the input and auto-loads that queue', async () => {
+    listJoinProposals.mockResolvedValue({
+      source: 'compliance', proposals: [], divergences: [], next_cursor: null,
+    })
+    render(<GovernanceReviewScreen initialSource="compliance" />)
+    expect(screen.getByLabelText('Source')).toHaveValue('compliance')
+    await waitFor(() => expect(listJoinProposals).toHaveBeenCalledWith('compliance'))
+    expect(listTableFactProposals).toHaveBeenCalledWith('compliance')
+    expect(listRelationshipReadiness).toHaveBeenCalledWith('compliance')
+    // The empty open queue renders (loaded), not the pre-load blank screen.
+    expect(await screen.findByText(/no open join proposals/i)).toBeInTheDocument()
+  })
+
+  it('an empty initialSource stays on the manual source form without fetching', () => {
+    render(<GovernanceReviewScreen initialSource="" />)
+    expect(screen.getByLabelText('Source')).toHaveValue('')
+    expect(listJoinProposals).not.toHaveBeenCalled()
+  })
+})

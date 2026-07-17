@@ -3146,3 +3146,22 @@ button.gj-chip--on:hover {
   color: var(--ink-soft);
   font-variant-numeric: tabular-nums;
 }
+
+/* ---------------------------------------------------------------- governance dashboard launch
+   Appended for GovernanceDashboardScreen's launchpad: a scoped view renders its actionable
+   counts (pending / needs attention / open tasks) as real <button class="stat"> tiles that open
+   the Governance review screen. These rules only neutralize the generic button geometry
+   (inline-flex / fixed height / weight) so the tile looks exactly like the static .stat card,
+   plus a quiet hover to signal it launches. Nothing above this line is modified. */
+
+button.stat {
+  display: inline-block;
+  height: auto;
+  font-weight: inherit;
+  text-align: left;
+}
+
+button.stat:hover {
+  border-color: var(--accent-line);
+  background: var(--paper);
+}

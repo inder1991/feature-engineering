@@ -1,4 +1,4 @@
-import { type FormEvent, type ReactNode, useRef, useState } from 'react'
+import { type FormEvent, type ReactNode, useEffect, useRef, useState } from 'react'
 import {
   ApiError,
   type JoinDivergence,
@@ -89,8 +89,10 @@ function errorDetail(err: unknown): string {
   return err instanceof ApiError ? err.detail : String(err)
 }
 
-export function GovernanceReviewScreen() {
-  const [source, setSource] = useState('')
+// initialSource: the dashboard -> review handoff rides the URL (?source=), mirroring
+// ReviewQueueScreen — App passes the hash param; a non-empty value auto-loads that queue.
+export function GovernanceReviewScreen({ initialSource = '' }: { initialSource?: string }) {
+  const [source, setSource] = useState(initialSource)
   const [proposals, setProposals] = useState<JoinProposal[] | null>(null)
   // Governed-join divergences ride the same joins response: a re-upload retargeted/dropped a
   // joins_to that admins VERIFIED. Advisory — the verified join stays operational until an
@@ -159,6 +161,14 @@ export function GovernanceReviewScreen() {
     setDecided(new Map())
     setGeneration(g => g + 1)
   }
+
+  // Adopt the URL-borne source and auto-load its queue — on mount AND when a later deep link
+  // changes the param while the screen stays mounted (same shape as ReviewQueueScreen).
+  useEffect(() => {
+    setSource(initialSource)
+    if (initialSource.trim()) void load(initialSource)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [initialSource])
 
   function submit(e: FormEvent) {
     e.preventDefault()

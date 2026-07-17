@@ -46,10 +46,12 @@ const DASH: api.GovernanceDashboard = {
 }
 
 // The same dashboard scoped to one source: the wire omits `sources` on the per-source route.
+// needs_attention is nonzero here so the scoped launchpad tests cover BOTH actionable stats.
 const SCOPED: api.GovernanceDashboard = {
   ...DASH,
   scope: 'source',
   source: 'compliance',
+  fact_types: [{ ...DASH.fact_types[0], needs_attention: 1 }],
   sources: undefined,
 }
 
@@ -67,16 +69,20 @@ const ZEROS: api.GovernanceDashboard = {
   sources: [],
 }
 
+// The launchpad callback App wires to navigate('governance', { source }).
+const onReview = vi.fn()
+
 beforeEach(() => {
   getGovernanceDashboard.mockReset()
   getGovernanceDashboard.mockResolvedValue(DASH)
   getSourceGovernanceDashboard.mockReset()
   getSourceGovernanceDashboard.mockResolvedValue(SCOPED)
+  onReview.mockReset()
 })
 
 describe('governance dashboard screen', () => {
   it('renders the rollup counts, reject categories, queue health, calibration seed, and sources', async () => {
-    render(<GovernanceDashboardScreen />)
+    render(<GovernanceDashboardScreen onReview={onReview} />)
     // Summary card: the four folded-status counts for the fact type.
     const rollup = await screen.findByRole('group', { name: 'Joins rollup' })
     expect(rollup).toHaveTextContent('1 pending')
@@ -104,7 +110,7 @@ describe('governance dashboard screen', () => {
   })
 
   it('a source row scopes the whole view; "Back to all catalogs" clears the scope', async () => {
-    render(<GovernanceDashboardScreen />)
+    render(<GovernanceDashboardScreen onReview={onReview} />)
     await userEvent.click(await screen.findByRole('button', { name: 'compliance' }))
     expect(getSourceGovernanceDashboard).toHaveBeenCalledWith('compliance')
     // Scoped: the scope line + back control appear, the cross-source table is gone.
@@ -118,14 +124,51 @@ describe('governance dashboard screen', () => {
 
   it('shows the empty state when nothing is recorded anywhere', async () => {
     getGovernanceDashboard.mockResolvedValue(ZEROS)
-    render(<GovernanceDashboardScreen />)
+    render(<GovernanceDashboardScreen onReview={onReview} />)
     expect(await screen.findByText(/nothing recorded yet/i)).toBeInTheDocument()
     expect(screen.queryByRole('group', { name: 'Joins rollup' })).not.toBeInTheDocument()
   })
 
   it('surfaces an ApiError detail as the alert', async () => {
     getGovernanceDashboard.mockRejectedValue(new api.ApiError(403, 'need catalog:read'))
-    render(<GovernanceDashboardScreen />)
+    render(<GovernanceDashboardScreen onReview={onReview} />)
     expect(await screen.findByRole('alert')).toHaveTextContent('need catalog:read')
+  })
+
+  it('a source row\'s Review action launches onReview for that source (no scoping refetch)', async () => {
+    render(<GovernanceDashboardScreen onReview={onReview} />)
+    await userEvent.click(await screen.findByRole('button', { name: 'Review compliance' }))
+    expect(onReview).toHaveBeenCalledTimes(1)
+    expect(onReview).toHaveBeenCalledWith('compliance')
+    // Review launches the other screen; it does NOT scope the dashboard.
+    expect(getSourceGovernanceDashboard).not.toHaveBeenCalled()
+  })
+
+  it('cross-source counts are NOT clickable — the rows are the launch point', async () => {
+    render(<GovernanceDashboardScreen onReview={onReview} />)
+    await screen.findByRole('group', { name: 'Joins rollup' })
+    // Unscoped, no stat renders as a button: not pending, not open tasks.
+    expect(screen.queryByRole('button', { name: /pending/i })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /open tasks/i })).not.toBeInTheDocument()
+  })
+
+  it('scoped: pending, needs-attention, and open-tasks counts launch onReview; decided counts stay static', async () => {
+    render(<GovernanceDashboardScreen onReview={onReview} />)
+    await userEvent.click(await screen.findByRole('button', { name: 'compliance' }))
+    await screen.findByText(/scoped to/i)
+    // The three actionable counts are real buttons naming what they open.
+    await userEvent.click(
+      screen.getByRole('button', { name: 'Review 1 pending Joins for compliance' }),
+    )
+    expect(onReview).toHaveBeenCalledWith('compliance')
+    expect(
+      screen.getByRole('button', { name: 'Review 1 needs-attention Joins for compliance' }),
+    ).toBeInTheDocument()
+    expect(
+      screen.getByRole('button', { name: 'Review 3 open tasks for compliance' }),
+    ).toBeInTheDocument()
+    // Decided counts are not actionable: no button mentions confirmed or rejected.
+    expect(screen.queryByRole('button', { name: /confirmed/i })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /rejected/i })).not.toBeInTheDocument()
   })
 })

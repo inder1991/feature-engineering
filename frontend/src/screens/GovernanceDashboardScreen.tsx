@@ -13,8 +13,11 @@ import {
 // depth + ages), the calibration SEED (confirm rate by evidence bucket — an OBSERVATION of
 // signal vs. outcome; tuning is a later step, nothing here changes scoring), and the
 // cross-source overview. A source row scopes every panel to that source (a refetch of the
-// single-source route); "Back to all catalogs" clears the scope. No actions live here —
-// confirming/rejecting stays on the Governance review screen.
+// single-source route); "Back to all catalogs" clears the scope. Deciding stays on the
+// Governance review screen — this dashboard is the LAUNCHPAD into it: every source row has a
+// Review action, and in a scoped view the open counts (pending / needs attention / open tasks)
+// open that source's review queue via onReview. Cross-source counts stay static — they span
+// sources, so the per-source rows are the launch point there.
 
 const FACT_TYPE_LABELS: Record<string, string> = {
   approved_join: 'Joins',
@@ -54,26 +57,56 @@ function ratePct(rate: number | null): string {
 
 // Same semantics as ConnectorPanel's Stat: the tone colors the NUMBER only; ok is always
 // colored, the alert tones (accent/warn/danger) only when nonzero — a plain 0 stays quiet ink.
+// With `action` the whole tile renders as a real <button> (keyboard-accessible launch into the
+// review screen); without it, the same static tile as before.
 function Stat({
   n,
   label,
   tone,
+  action,
 }: {
   n: number
   label: string
   tone?: 'ok' | 'warn' | 'danger' | 'accent'
+  action?: { onClick: () => void; ariaLabel: string }
 }) {
   const colored = tone === 'ok' || (tone !== undefined && n > 0)
-  return (
-    <div className="stat">
+  const body = (
+    <>
       <b className={colored ? `tone-${tone}` : undefined}>{n}</b> {label}
-    </div>
+    </>
   )
+  if (action) {
+    return (
+      <button type="button" className="stat" onClick={action.onClick} aria-label={action.ariaLabel}>
+        {body}
+      </button>
+    )
+  }
+  return <div className="stat">{body}</div>
 }
 
 // One governed fact type's rollup card: the folded-status counts + its reject categories.
-function RollupCard({ rollup: ft }: { rollup: FactTypeRollup }) {
+// When the view is scoped to a source (reviewSource non-null), the OPEN counts (pending /
+// needs attention) launch that source's review queue; zero counts and the decided counts
+// (confirmed / rejected) stay static — there is nothing to act on.
+function RollupCard({
+  rollup: ft,
+  reviewSource,
+  onReview,
+}: {
+  rollup: FactTypeRollup
+  reviewSource: string | null
+  onReview: (source: string) => void
+}) {
   const rejects = Object.entries(ft.rejected_by_category)
+  const launch = (n: number, kind: string) =>
+    reviewSource !== null && n > 0
+      ? {
+          onClick: () => onReview(reviewSource),
+          ariaLabel: `Review ${n} ${kind} ${factTypeLabel(ft.fact_type)} for ${reviewSource}`,
+        }
+      : undefined
   return (
     <li className="row q-item">
       <div className="q-head">
@@ -81,10 +114,15 @@ function RollupCard({ rollup: ft }: { rollup: FactTypeRollup }) {
         <span className="gj-score mono">{ft.fact_type}</span>
       </div>
       <div className="stats" role="group" aria-label={`${factTypeLabel(ft.fact_type)} rollup`}>
-        <Stat n={ft.pending} label="pending" tone="accent" />
+        <Stat n={ft.pending} label="pending" tone="accent" action={launch(ft.pending, 'pending')} />
         <Stat n={ft.confirmed} label="confirmed" tone="ok" />
         <Stat n={ft.rejected} label="rejected" tone="danger" />
-        <Stat n={ft.needs_attention} label="needs attention" tone="warn" />
+        <Stat
+          n={ft.needs_attention}
+          label="needs attention"
+          tone="warn"
+          action={launch(ft.needs_attention, 'needs-attention')}
+        />
       </div>
       {rejects.length > 0 && (
         <p className="q-note">
@@ -96,7 +134,13 @@ function RollupCard({ rollup: ft }: { rollup: FactTypeRollup }) {
   )
 }
 
-export function GovernanceDashboardScreen() {
+export function GovernanceDashboardScreen({
+  onReview,
+}: {
+  // Launch the Governance review screen scoped to a source (App navigates with ?source=, the
+  // same URL-borne handoff as the upload -> review-queue and connector -> semantics links).
+  onReview: (source: string) => void
+}) {
   const [dash, setDash] = useState<GovernanceDashboard | null>(null)
   // Which source the whole view is scoped to; null = cross-source (every catalog).
   const [scopedSource, setScopedSource] = useState<string | null>(null)
@@ -176,13 +220,30 @@ export function GovernanceDashboardScreen() {
           <h2>Pipeline rollups</h2>
           <ul className="rows">
             {dash.fact_types.map(ft => (
-              <RollupCard key={ft.fact_type} rollup={ft} />
+              <RollupCard
+                key={ft.fact_type}
+                rollup={ft}
+                reviewSource={scopedSource}
+                onReview={onReview}
+              />
             ))}
           </ul>
 
           <h2>Queue health</h2>
           <div className="stats" role="group" aria-label="Queue health">
-            <Stat n={dash.queue_health.open_depth} label="open tasks" tone="accent" />
+            <Stat
+              n={dash.queue_health.open_depth}
+              label="open tasks"
+              tone="accent"
+              action={
+                scopedSource !== null && dash.queue_health.open_depth > 0
+                  ? {
+                      onClick: () => onReview(scopedSource),
+                      ariaLabel: `Review ${dash.queue_health.open_depth} open tasks for ${scopedSource}`,
+                    }
+                  : undefined
+              }
+            />
             <div className="stat">
               <b>{humanizeAge(dash.queue_health.oldest_pending_age_seconds)}</b> oldest pending
             </div>
@@ -240,7 +301,9 @@ export function GovernanceDashboardScreen() {
           {scopedSource === null && dash.sources && dash.sources.length > 0 && (
             <>
               <h2>Catalogs</h2>
-              <p className="hint">Pick a source to scope every panel above to it.</p>
+              <p className="hint">
+                Pick a source to scope every panel above to it, or Review to open its queue.
+              </p>
               <table>
                 <thead>
                   <tr>
@@ -249,6 +312,9 @@ export function GovernanceDashboardScreen() {
                     <th className="num">Confirmed</th>
                     <th className="num">Rejected</th>
                     <th className="num">Oldest pending</th>
+                    <th className="num">
+                      <span className="visually-hidden">Actions</span>
+                    </th>
                   </tr>
                 </thead>
                 <tbody>
@@ -269,6 +335,16 @@ export function GovernanceDashboardScreen() {
                       <td className="num tabular-nums">{s.rejected}</td>
                       <td className="num tabular-nums">
                         {humanizeAge(s.oldest_pending_age_seconds)}
+                      </td>
+                      <td className="num">
+                        <button
+                          type="button"
+                          className="btn q-ghost"
+                          aria-label={`Review ${s.source}`}
+                          onClick={() => onReview(s.source)}
+                        >
+                          Review
+                        </button>
                       </td>
                     </tr>
                   ))}
