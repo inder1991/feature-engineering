@@ -277,9 +277,9 @@ def test_domain_failure_does_not_discard_concepts(db, monkeypatch):
     captured: dict = {}
     real_build = ing.build_graph
 
-    def spy(conn, src, rows, concepts, definitions, domains):
+    def spy(conn, src, rows, concepts, definitions, domains, **kw):
         captured.update(concepts=concepts, domains=domains)
-        return real_build(conn, src, rows, concepts, definitions, domains)
+        return real_build(conn, src, rows, concepts, definitions, domains, **kw)
 
     monkeypatch.setattr(ing, "build_graph", spy)
     rows = [CanonicalRow("deposits", "accounts", "balance", "numeric")]

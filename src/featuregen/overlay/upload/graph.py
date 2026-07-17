@@ -5,12 +5,17 @@ import os
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime
+from typing import TYPE_CHECKING
 
 from featuregen.overlay.identity import ApprovedJoinRef, CatalogObjectRef, ColumnPair
 from featuregen.overlay.upload.canonical import CanonicalRow
 from featuregen.overlay.upload.concepts import humanize
 from featuregen.overlay.upload.enrich import content_hash
+from featuregen.overlay.upload.object_ref import parse_ref
 from featuregen.overlay.upload.read_scope import allowed_sensitivities
+
+if TYPE_CHECKING:   # annotation-only — keeps graph.py free of a runtime glossary_reader import
+    from featuregen.overlay.upload.glossary_reader import GlossaryUpload
 
 _SCHEMA = "public"
 
@@ -140,6 +145,52 @@ def _column_ref(table: str, column: str) -> str:
     return f"{_SCHEMA}.{table}.{column}"
 
 
+def schema_by_ref(glossary: GlossaryUpload | None) -> dict[str, str]:
+    """Graph ``object_ref`` -> the REAL (pre-flatten) schema the glossary declared for it, raw case
+    as declared (round-4 #5). Keys are built via the SAME ``_table_ref``/``_column_ref`` the graph
+    INSERTs use (from the ``logical_ref``'s already-normalized components), so a lookup keyed by the
+    node's ref can never miss on case/spelling. Every schema-bearing record contributes its TABLE
+    ref (a table term names its table directly; a column term attests its table's schema too); a
+    column term also contributes its COLUMN ref. First declaration wins on a pathological
+    disagreement (the reader already quarantines per-(table,column) schema collisions; table-vs-
+    column agreement is validated by the table-evidence path, round-4 #5 tail). Empty for ``None``
+    or a schema-less (generic/technical) glossary — every node then keeps ``schema_name`` NULL."""
+    out: dict[str, str] = {}
+    if glossary is None:
+        return out
+    for rec in glossary.records:
+        if not rec.schema:
+            continue
+        try:
+            _src, _schema, table, column = parse_ref(rec.logical_ref)
+        except ValueError:
+            continue
+        out.setdefault(_table_ref(table), rec.schema)
+        if column is not None:
+            out.setdefault(_column_ref(table, column), rec.schema)
+    return out
+
+
+def declared_type_by_ref(glossary: GlossaryUpload | None) -> dict[str, str]:
+    """Graph COLUMN ``object_ref`` -> the bounded FTR-declared SQL type, retained as NON-operational
+    metadata (round-4 #1: the operational ``data_type`` stays ``UNKNOWN_TYPE``). Same ref
+    construction as :func:`schema_by_ref`; empty for ``None`` or a glossary without declared
+    types — ``declared_type`` then stays NULL."""
+    out: dict[str, str] = {}
+    if glossary is None:
+        return out
+    for rec in glossary.records:
+        if not rec.declared_type:
+            continue
+        try:
+            _src, _schema, table, column = parse_ref(rec.logical_ref)
+        except ValueError:
+            continue
+        if column is not None:
+            out.setdefault(_column_ref(table, column), rec.declared_type)
+    return out
+
+
 def _validated_join_target(from_ref: str, joins_to: str) -> str | None:
     """The 'joins' edge target for a declared `joins_to`, as ``public.<table>.<column>`` — or None
     (logging the diagnostic) when the value is malformed. Gates the ungoverned graph write on the SAME
@@ -156,10 +207,17 @@ def _validated_join_target(from_ref: str, joins_to: str) -> str | None:
 def build_graph(conn, catalog_source: str, rows: list[CanonicalRow],
                 concepts: dict[str, str] | None = None,
                 definitions: dict[str, str] | None = None,
-                domains: dict[str, str] | None = None) -> None:
+                domains: dict[str, str] | None = None,
+                schemas: dict[str, str] | None = None,
+                declared_types: dict[str, str] | None = None) -> None:
     concepts = concepts or {}
     definitions = definitions or {}   # {content_hash: drafted_definition} (blank columns only)
     domains = domains or {}           # {table_name: domain}
+    # Additive schema preservation (round-4 #5): both keyed by the node's object_ref, built by the
+    # caller via schema_by_ref/declared_type_by_ref. Default None -> every node writes NULL, so
+    # technical/generic uploads are byte-for-byte unchanged.
+    schemas = schemas or {}           # {object_ref: real (pre-flatten) schema, raw case}
+    declared_types = declared_types or {}   # {column object_ref: bounded FTR-declared SQL type}
     conn.execute("DELETE FROM graph_edge WHERE catalog_source = %s", (catalog_source,))
     conn.execute("DELETE FROM graph_node WHERE catalog_source = %s", (catalog_source,))
 
@@ -168,9 +226,10 @@ def build_graph(conn, catalog_source: str, rows: list[CanonicalRow],
         domain = domains.get(table)
         conn.execute(
             "INSERT INTO graph_node (catalog_source, object_ref, kind, table_name, column_name, "
-            "data_type, definition, is_grain, is_as_of, concept, domain, search_doc) "
-            f"VALUES (%s, %s, 'table', %s, NULL, NULL, NULL, false, false, NULL, %s, {_SEARCH_DOC})",
-            (catalog_source, t_ref, table, domain,
+            "data_type, definition, is_grain, is_as_of, concept, domain, schema_name, search_doc) "
+            f"VALUES (%s, %s, 'table', %s, NULL, NULL, NULL, false, false, NULL, %s, %s, "
+            f"{_SEARCH_DOC})",
+            (catalog_source, t_ref, table, domain, schemas.get(t_ref),
              *_search_doc_params("table", table, None, None, None, domain, None)))
 
     for r in rows:
@@ -182,11 +241,13 @@ def build_graph(conn, catalog_source: str, rows: list[CanonicalRow],
         conn.execute(
             "INSERT INTO graph_node (catalog_source, object_ref, kind, table_name, column_name, "
             "data_type, definition, is_grain, is_as_of, concept, domain, sensitivity, "
-            "additivity, unit, currency, entity, search_doc) "
-            f"VALUES (%s, %s, 'column', %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, {_SEARCH_DOC})",
+            "additivity, unit, currency, entity, schema_name, declared_type, search_doc) "
+            f"VALUES (%s, %s, 'column', %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, "
+            f"%s, {_SEARCH_DOC})",
             (catalog_source, c_ref, r.table, r.column, r.type, definition,
              r.is_grain, r.as_of, concept, domain, r.sensitivity or None,
              r.additivity or None, r.unit or None, r.currency or None, r.entity or None,
+             schemas.get(c_ref), declared_types.get(c_ref),
              *_search_doc_params("column", r.table, r.column, definition, concept, domain,
                                  r.entity or None)))
         conn.execute(

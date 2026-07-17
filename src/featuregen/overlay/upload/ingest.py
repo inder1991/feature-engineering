@@ -25,7 +25,12 @@ from featuregen.overlay.projection import OverlayProjection
 from featuregen.overlay.state import fold_overlay_state
 from featuregen.overlay.store import append_overlay_event, load_fact
 from featuregen.overlay.upload.brake import large_change_brake, resolution_brake
-from featuregen.overlay.upload.canonical import CanonicalRow, ValidationResult, validate_rows
+from featuregen.overlay.upload.canonical import (
+    CanonicalRow,
+    RowError,
+    ValidationResult,
+    validate_rows,
+)
 from featuregen.overlay.upload.enrich import (
     classify_domains,
     content_hash,
@@ -40,9 +45,11 @@ from featuregen.overlay.upload.graph import (
     _column_ref,
     add_column_row,
     build_graph,
+    declared_type_by_ref,
     governed_join_proposal,
     governed_joins_enabled,
     parse_join_ref,
+    schema_by_ref,
 )
 from featuregen.overlay.upload.ingestion_run import record_run_facts, record_run_objects
 from featuregen.overlay.upload.join_drift import detect_governed_join_divergences
@@ -480,6 +487,68 @@ def _schema_by_table(glossary: GlossaryUpload | None) -> dict[str, str]:
     return out
 
 
+def _cross_schema_conflicts(conn, catalog_source: str, rows: list[CanonicalRow],
+                            glossary: GlossaryUpload, *,
+                            skip_indexes: set[int]) -> list[RowError]:
+    """The cross-upload schema fence (round-4 #4): RowErrors for every incoming row that would
+    silently RE-ATTRIBUTE an existing ``public.table.column`` graph node to a DIFFERENT schema —
+    empty when the upload is safe. The operational key is single-schema until Delivery C, so a
+    schema change on the same public-flattened identity is a silent identity rewrite; fail closed
+    and hold the WHOLE upload instead.
+
+    A conflict is an incoming column whose lowercased ``(table, column)`` matches an existing
+    column node where EITHER the stored ``schema_name`` is non-NULL and differs (case-insensitive)
+    from the incoming schema, OR the stored ``schema_name`` IS NULL — a legacy/unverifiable node
+    (built before schema preservation, or by a schema-less upload) that a new schema must not
+    silently claim (the legacy-NULL policy). Errors are indexed by the row's position in the
+    ORIGINAL upload (disjoint from validate's quarantined indexes — those rows are not conflict
+    candidates — and from the reader-level quarantine, which starts AT ``len(rows)``) and stamped
+    ``adapter="ftr"``: a schema conflict cannot be repaired inline (resolving the row would bypass
+    this very fence) — the fix is re-uploading a corrected file. Schema-less records (the generic
+    glossary reader) contribute nothing, so only schema-carrying uploads can ever hold."""
+    incoming: dict[tuple[str, str], str] = {}
+    for rec in glossary.records:
+        if not rec.schema:
+            continue
+        try:
+            _src, _schema, table, column = parse_ref(rec.logical_ref)
+        except ValueError:
+            continue
+        if column is not None:
+            incoming[(table, column)] = rec.schema
+    if not incoming:
+        return []
+    existing = conn.execute(
+        "SELECT object_ref, schema_name FROM graph_node "
+        "WHERE catalog_source = %s AND kind = 'column'", (catalog_source,)).fetchall()
+    conflicts: dict[tuple[str, str], str | None] = {}   # (table, column) -> existing schema_name
+    for object_ref, schema_name in existing:
+        parts = object_ref.split(".")   # "public.table.column" — validate_rows rejects dotted names
+        if len(parts) != 3:
+            continue
+        declared = incoming.get((parts[1], parts[2]))
+        if declared is None:
+            continue
+        if schema_name is None or _lc(schema_name) != _lc(declared):
+            conflicts[(parts[1], parts[2])] = schema_name
+    if not conflicts:
+        return []
+    errors: list[RowError] = []
+    for i, r in enumerate(rows):
+        key = (_lc(r.table), _lc(r.column))
+        if key not in conflicts or i in skip_indexes:
+            continue
+        existing_schema, declared = conflicts[key], incoming[key]
+        attribution = (f"already exists under schema {existing_schema!r}"
+                       if existing_schema is not None
+                       else "already exists with no attested schema (legacy — unverifiable)")
+        errors.append(RowError(
+            i, f"schema conflict — public.{key[0]}.{key[1]} {attribution}; cannot re-attribute "
+               f"to {declared!r} while the operational key is single-schema (Delivery C)",
+            r, adapter="ftr"))
+    return errors
+
+
 def _schema_preserving_ref_map(glossary: GlossaryUpload) -> dict[str, str]:
     """Map each column record's PUBLIC-FLATTENED ref (the key ``classify_upload`` emits conflicts under,
     via ``normalize_ref(source, None, table, column)``) to its SCHEMA-PRESERVING ``rec.logical_ref``
@@ -879,6 +948,37 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
                  detail={"good": len(vr.good), "quarantined": len(vr.quarantined)},
                  started_at=stage_started)
 
+    if glossary is not None:
+        # Cross-upload schema fence (round-4 #4) — BEFORE any side effect (no UploadCatalog, no
+        # facts, no graph write): a schema-carrying upload that would re-attribute an existing
+        # public-flattened column to a DIFFERENT schema holds the WHOLE upload fail-closed.
+        # Rows validation already quarantined are skipped (they never reach the graph, so they
+        # cannot re-attribute anything — and their RowError indexes stay collision-free).
+        stage_started = datetime.now(UTC)
+        conflict_errors = _cross_schema_conflicts(
+            conn, catalog_source, rows, glossary,
+            skip_indexes={e.row_index for e in vr.quarantined})
+        if conflict_errors:
+            reason = (f"schema conflict: {len(conflict_errors)} column(s) already attributed to a "
+                      f"different (or unverifiable) schema — e.g. {conflict_errors[0].message}; "
+                      f"upload held fail-closed, correct the file and re-upload")
+            record_stage(stage_recorder, "brake", "deferred", reason_code="held",
+                         detail={"reason": reason, "schema_conflicts": len(conflict_errors)},
+                         started_at=stage_started)
+            # Persist the conflicts BESIDE the upload's validation quarantine (one whole-source
+            # refresh — persist_quarantine deletes everything first, so two calls would clobber),
+            # and report the REAL total persisted for review — never len(rows).
+            held_quarantine = [*vr.quarantined, *conflict_errors]
+            stage_started = datetime.now(UTC)
+            persist_quarantine(conn, catalog_source, held_quarantine)
+            record_stage(stage_recorder, "quarantine", "succeeded",
+                         detail={"rows": len(held_quarantine)}, started_at=stage_started)
+            logger.warning("upload of %r held by the cross-schema fence: %s",
+                           catalog_source, reason)
+            record_skipped_downstream(stage_recorder, reason_code="skipped_upload_held",
+                                      is_glossary=True)
+            return IngestResult("held", reason, 0, 0, len(held_quarantine))
+
     upload = UploadCatalog(catalog_source, vr.good)
     stage_started = datetime.now(UTC)
     brake = large_change_brake(conn, catalog_source, upload)
@@ -1082,7 +1182,11 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
         record_stage(stage_recorder, "enrich_domain", state, reason_code=reason,
                      detail=_with_audit_degradations(detail), started_at=stage_started)
     stage_started = datetime.now(UTC)
-    build_graph(conn, catalog_source, vr.good, concepts, definitions, domains)
+    # Additive schema preservation (round-4 #5): object_ref-keyed maps from the glossary's
+    # schema-carrying records; None/empty for technical and generic-glossary uploads, whose
+    # nodes keep schema_name/declared_type NULL — byte-for-byte unchanged.
+    build_graph(conn, catalog_source, vr.good, concepts, definitions, domains,
+                schemas=schema_by_ref(glossary), declared_types=declared_type_by_ref(glossary))
     record_stage(stage_recorder, "graph_persistence", "succeeded", started_at=stage_started)
     if governed_joins_enabled() or pass_c_enabled():
         # Governed seam (Task 7 / §12.1) — Pass C (Task 10) implies it: the raw 'joins' edges just
