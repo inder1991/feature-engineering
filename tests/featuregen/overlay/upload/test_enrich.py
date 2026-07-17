@@ -185,6 +185,70 @@ def test_concept_metadata_keeps_operational_type_when_no_declared_type():
     assert _concept_metadata(row, None)["type"] == "numeric"
 
 
+# ── #3: the concept CACHE key hashes the FULL classifier input, not just the raw row ─────────────
+
+def _rec(**overrides):
+    from featuregen.overlay.upload.glossary_reader import GlossaryRecord
+    base = dict(logical_ref="ftr::s.comp_fin_tran.txn_ts", term_name="Transaction Time",
+                definition="Business timestamp of the transaction.", declared_type="varchar",
+                domain="Payments")
+    base.update(overrides)
+    return GlossaryRecord(**base)
+
+
+def test_concept_cache_key_changes_with_declared_type():
+    """#3: correcting the glossary's declared SQL type changes the classifier's real input, so the
+    CACHE key must change (re-classify) while content_hash — the downstream dict key consumed by
+    graph/ingest — stays byte-for-byte stable (it never sees the sidecar)."""
+    from featuregen.overlay.upload.enrich import concept_cache_key
+    row = CanonicalRow("ftr", "comp_fin_tran", "txn_ts", "unknown")
+    a, b = _rec(declared_type="varchar"), _rec(declared_type="timestamp")
+    assert concept_cache_key(row, a) != concept_cache_key(row, b)   # cache key discriminates
+    assert concept_cache_key(row, a) == concept_cache_key(row, a)   # ... and is deterministic
+    assert content_hash(row) == content_hash(row)                   # downstream key: sidecar-blind
+
+
+def test_concept_cache_key_changes_with_term_domain_and_taxonomy():
+    from featuregen.overlay.upload.enrich import concept_cache_key
+    row = CanonicalRow("ftr", "comp_fin_tran", "txn_ts", "unknown")
+    base = concept_cache_key(row, _rec())
+    assert concept_cache_key(row, _rec(term_name="Settlement Time")) != base
+    assert concept_cache_key(row, _rec(domain="Treasury")) != base
+    assert concept_cache_key(row, _rec(bian_path="BIAN/Payments/Execution")) != base
+    assert concept_cache_key(row, _rec(fibo_path="FIBO/FND/DateTime")) != base
+    assert concept_cache_key(row, _rec(synonyms=("posting time",))) != base
+
+
+def test_concept_cache_key_handles_technical_rows_without_glossary():
+    """A technical CSV has no sidecar (rec=None): the key must still work, be deterministic, and
+    differ from a glossary-enriched key for the same physical column."""
+    from featuregen.overlay.upload.enrich import concept_cache_key
+    row = CanonicalRow("ftr", "comp_fin_tran", "txn_ts", "unknown")
+    assert concept_cache_key(row, None) == concept_cache_key(row, None)
+    assert concept_cache_key(row, None) != concept_cache_key(row, _rec())
+
+
+def test_corrected_glossary_metadata_misses_the_stale_concept_cache(db):
+    """#3 end-to-end: a re-upload that CORRECTS declared_type must MISS the cache and re-classify
+    (the second client's answer wins), while an UNCHANGED re-upload still HITS (client not called)."""
+    from featuregen.overlay.upload.glossary_reader import GlossaryUpload
+    row = CanonicalRow("ftr", "comp_fin_tran", "txn_ts", "unknown")
+    h = content_hash(row)
+
+    def _glossary(declared_type):
+        return GlossaryUpload(rows=[row], records=[_rec(declared_type=declared_type)])
+
+    first = FakeLLM(script={_TASK: FakeResponse(output={"concept": "monetary_stock"})})
+    assert enrich_concepts(db, [row], first, glossary=_glossary("varchar"))[h] == "monetary_stock"
+    # Unchanged re-upload: still a cache HIT — the raising client is never called.
+    out = enrich_concepts(db, [row], _NeverCalledLLM(), glossary=_glossary("varchar"))
+    assert out[h] == "monetary_stock"
+    # Corrected declared_type: the classifier input changed -> MISS -> re-classified, not stale.
+    second = FakeLLM(script={_TASK: FakeResponse(output={"concept": "account_identifier"})})
+    out2 = enrich_concepts(db, [row], second, glossary=_glossary("timestamp"))
+    assert out2[h] == "account_identifier"                 # the fresh classification, keyed for downstream
+
+
 # ── R5-3: a sanitizer-SUPPRESSED definition is never silently LLM-drafted ────────────────────────
 
 def test_suppressed_definition_is_not_llm_drafted(db):

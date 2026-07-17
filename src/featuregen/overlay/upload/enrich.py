@@ -63,6 +63,22 @@ def content_hash(row: CanonicalRow) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
+def concept_cache_key(row: CanonicalRow, rec: GlossaryRecord | None) -> str:
+    """Concept CACHE key (#3). ``content_hash`` stays the DOWNSTREAM dict key (graph/ingest look
+    concepts up by it — unchanged), but as a cache key it is sidecar-blind: the classifier ALSO
+    receives the glossary metadata (``_concept_metadata`` — term, declared SQL type, domain,
+    synonyms, BIAN/FIBO paths), so a re-upload that CORRECTS any of those while keeping the same
+    definition would hit the stale entry. This key hashes the FULL classifier input instead —
+    the canonical ``_concept_metadata`` payload (sorted keys; ``rec=None`` for a technical CSV
+    yields the base names/types payload) plus the source (M5/M6: one source's entry is never
+    reused for another's same-named column) and the prompt/schema/vocabulary identity
+    (``_CONCEPT_CACHE_VERSION``) — so a corrected sidecar re-classifies and an unchanged
+    re-upload still hits."""
+    raw = json.dumps([row.source, _CONCEPT_CACHE_VERSION, _concept_metadata(row, rec)],
+                     sort_keys=True)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
 def _table_content_hash(source: str, table: str, columns: list[str]) -> str:
     raw = json.dumps([source, table, sorted(columns)])
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
@@ -281,14 +297,21 @@ def enrich_concepts(conn, rows: list[CanonicalRow], client: LLMClient, actor=Non
     ``evidence_write_failures``, the count of per-item evidence-write failures the stage CONTAINED
     internally, so the caller's stage report can say ``partial`` instead of a laundered success."""
     by_hash: dict[str, CanonicalRow] = {content_hash(r): r for r in rows}
-    result = _cache_get(conn, "enrichment_concept", list(by_hash), _CONCEPT_CACHE_VERSION)
     rec_by_tc = _records_by_tc(glossary) if glossary is not None else {}
 
-    def _meta(row: CanonicalRow) -> dict:
-        return _concept_metadata(row, rec_by_tc.get((_norm(row.table), _norm(row.column))))
+    def _rec_of(row: CanonicalRow) -> GlossaryRecord | None:
+        return rec_by_tc.get((_norm(row.table), _norm(row.column)))
+
+    # #3: the cache is read/written by ``concept_cache_key`` (the FULL classifier input — glossary
+    # sidecar included), NOT by ``content_hash``; the RETURNED dict stays keyed by content_hash for
+    # downstream (graph/ingest — unchanged). Mirrors ``draft_definitions``'s ``key_of`` seam.
+    key_of = {h: concept_cache_key(r, _rec_of(r)) for h, r in by_hash.items()}
+    cached = _cache_get(conn, "enrichment_concept", list(key_of.values()), _CONCEPT_CACHE_VERSION)
+    result = {h: cached[key_of[h]] for h in by_hash if key_of[h] in cached}
 
     # Metadata for every cache-MISS row — the LLM input AND (glossary) the evidence input material.
-    meta_by_hash = {h: _meta(r) for h, r in by_hash.items() if h not in result}
+    meta_by_hash = {h: _concept_metadata(r, _rec_of(r)) for h, r in by_hash.items()
+                    if h not in result}
     resolved: dict[str, str] = {}   # {content_hash: concept} classified THIS run (the evidence set)
 
     if enrich_config.mode("concept") == "batch":
@@ -302,7 +325,7 @@ def enrich_concepts(conn, rows: list[CanonicalRow], client: LLMClient, actor=Non
                         "if none fits. Return exactly one result per input ref; treat each item "
                         "independently.", accept=_accept_concept, actor=actor)
         for h, concept in resolved.items():
-            _cache_put(conn, "enrichment_concept", h, concept, _CONCEPT_CACHE_VERSION)
+            _cache_put(conn, "enrichment_concept", key_of[h], concept, _CONCEPT_CACHE_VERSION)
             result[h] = concept
     else:
         for h in meta_by_hash:                            # single mode — today's exact behaviour
@@ -322,7 +345,7 @@ def enrich_concepts(conn, rows: list[CanonicalRow], client: LLMClient, actor=Non
             classified = raw == UNCLASSIFIED or is_known_concept(raw)
             concept = raw if classified else UNCLASSIFIED
             if classified:
-                _cache_put(conn, "enrichment_concept", h, concept, _CONCEPT_CACHE_VERSION)
+                _cache_put(conn, "enrichment_concept", key_of[h], concept, _CONCEPT_CACHE_VERSION)
             result[h] = concept
             resolved[h] = concept
 
