@@ -99,6 +99,23 @@ def test_preloop_failure_retains_manifest_and_writes_failure_rows(db, monkeypatc
     assert row["planner_outcome"] == "preloop_failure"
 
 
+def test_persistence_failure_retains_manifest_and_reconcile_detects_loss(db, monkeypatch):
+    # F6: a write_run_and_plans failure is caught internally (never re-propagated) so the manifest is
+    # retained; the loss surfaces via manifest<->results reconciliation (not a circular self-report).
+    _catalog(db, "core")
+
+    def _boom(*a, **k):
+        raise RuntimeError("store write failed")
+
+    monkeypatch.setattr(shadow_mod, "write_run_and_plans", _boom)
+    results = run_shadow_planner(db, eligible_recipe_ids=frozenset({"t_bal"}), target_entity="customer",
+                                 roles=(), run_id="run_pl", now=_NOW, templates=(_tmpl(),), persist=True)
+    assert len(results) == 1                                    # planning succeeded; only persistence failed
+    rec = ss.reconcile(db, "run_pl")                            # manifest RETAINED
+    assert rec.expected == 1 and rec.present == 0 and rec.missing_recipe_ids == ("t_bal",)
+    assert not rec.complete                                     # the loss is detected
+
+
 def test_template_not_found_writes_a_row(db):
     _catalog(db, "core")
     run_shadow_planner(db, eligible_recipe_ids=frozenset({"t_bal", "ghost"}), target_entity="customer",
