@@ -55,6 +55,15 @@ _ACCOUNT_DESC = (
 )
 _ACCOUNT_VALUES = ("3708484836801", "3708446902413", "3708454004701")
 
+# TWO canonical clauses in one definition (whole-branch re-review IMPORTANT): the single-pass v3
+# strip excised only the FIRST clause and LEAKED the second clause's raw values into ``clean``
+# under state="stripped". v4 must strip to a fixed point — BOTH clauses gone, prose kept.
+_TWO_CLAUSE_DESC = (
+    "Account identifier for the customer. The sample profile is NUMERIC, with representative "
+    "values such as 3708484836801; 3708446902413, which supports interpretation as an identifier. "
+    "A secondary panel lists values such as 25-345129408-1-151; 25-999."
+)
+
 # RECOGNIZED clause, decimal values → decimal/amount facets (no "sample profile is" token).
 _AMOUNT_DESC = (
     "Posting amount is the monetary value of the ledger entry, with representative values such as "
@@ -111,8 +120,8 @@ _CLAUSE_PLUS_PII_DESC = (
 # ── version ───────────────────────────────────────────────────────────────────────────────────────
 
 
-def test_sanitizer_version_bumped_for_guesser_removal():
-    assert SANITIZER_VERSION == "ftr-sanitize-v3"
+def test_sanitizer_version_bumped_for_multipass_strip():
+    assert SANITIZER_VERSION == "ftr-sanitize-v4"
 
 
 # ── sanitize_definition: the 41-row real case — MUST NOT blank ────────────────────────────────────
@@ -166,6 +175,29 @@ def test_recognized_clause_stripped_with_facets():
     assert result.removed == 1  # the stripped clause; no PII spans
     assert result.sanitizer_version == SANITIZER_VERSION
     assert result.redaction_version is not None
+
+
+def test_two_clause_definition_strips_both_clauses_no_leak():
+    """Whole-branch re-review IMPORTANT: a SECOND `values such as` clause in a later sentence must
+    not leak — stripping runs to a fixed point, so BOTH clauses go while the prose survives."""
+    result = sanitize_definition(_TWO_CLAUSE_DESC)
+    assert result.state == "stripped"
+    assert result.reason == ""
+    assert "3708484836801" not in result.clean
+    assert "3708446902413" not in result.clean
+    assert "25-345129408-1-151" not in result.clean
+    assert "25-999" not in result.clean
+    assert "values such as" not in result.clean.lower()
+    assert "Account identifier for the customer." in result.clean  # business prose survives
+
+
+def test_bare_values_such_as_anchor_fails_closed():
+    """Belt AND braces: if a `values such as` anchor ever survives the multi-pass strip (here: no
+    value text follows, so the stripper cannot consume it), the whole definition blanks."""
+    result = sanitize_definition("Legacy appendix retains values such as")
+    assert result.clean == ""
+    assert result.state == "suspected_unhandled"
+    assert result.reason == "unhandled_marker"
 
 
 @pytest.mark.parametrize(

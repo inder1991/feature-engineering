@@ -9,10 +9,14 @@ through :func:`sanitize_definition` at parse time:
    which later become parser evidence. Facets are types, never values.
 2. :func:`~featuregen.overlay.upload.sample_parser.strip_sample_values` excises the recognized
    ``representative values such as ...`` clause — the REAL file's run showed 100% of actual
-   sample values live in this one canonical shape (round-5 resolution R5-2).
+   sample values live in this one canonical shape (round-5 resolution R5-2). v4 (whole-branch
+   re-review): stripping runs to a FIXED POINT — a definition can carry a SECOND such clause in
+   a later sentence, and the single-pass v3 leaked that clause's raw values under
+   ``state="stripped"`` — bounded by ``_MAX_STRIP_PASSES`` against pathological non-convergence.
 3. FAIL-CLOSED DATA-MARKER SCAN on the residual: a phrase that implies ACTUAL DATA
    (``representative values``, ``sample values``, ``observed values/entries``, ``example
-   values``) surviving the strip means a sample clause the stripper could not consume →
+   values``, or — v4 belt-and-braces — a bare ``values such as`` anchor the multi-pass strip
+   somehow left behind) surviving the strip means a sample clause the stripper could not consume →
    ``state="suspected_unhandled"``, ``reason="unhandled_marker"``, ``clean=""``. The row still
    ingests; identity is intact. Individual values are NEVER deleted by shape (that would corrupt
    definitions); suspicion always blanks the whole field. Bare ``sample profile`` is NOT a
@@ -39,19 +43,28 @@ from dataclasses import dataclass
 from featuregen.intake.redaction import redact_free_text
 from featuregen.overlay.upload.sample_parser import parse_sample_profile, strip_sample_values
 
-SANITIZER_VERSION = "ftr-sanitize-v3"
+SANITIZER_VERSION = "ftr-sanitize-v4"
 
 # DATA-implying marker phrases (R5-2): if one survives the strip, a sample clause the stripper
 # could not consume is still in the residual — fail closed. Precise PHRASES only, so "sample
 # population size", "a representative office", and the SAFE "sample profile has no non-blank
 # values" (41 real rows) never trigger. Bare ``sample profile`` is deliberately NOT a marker.
+# v4 adds the bare ``values such as`` anchor: the multi-pass strip removes every consumable
+# clause first, so this only fires on a clause the stripper could NOT consume (e.g. an anchor
+# with no value text after it, or a non-converged pathological input) — blank, never leak.
 _UNHANDLED_MARKER_RE = re.compile(
     r"\brepresentative\s+values?\b"
     r"|\bsample\s+values?\b"
     r"|\bobserved\s+(?:values?|entries)\b"
-    r"|\bexample\s+values?\b",
+    r"|\bexample\s+values?\b"
+    r"|\bvalues\s+such\s+as\b",
     re.IGNORECASE,
 )
+
+# Fixed-point bound for the multi-pass strip. Each successful pass strictly shortens the text, so
+# convergence is guaranteed in practice; the bound is a belt — if a ``values such as`` clause
+# somehow remains after it, the marker scan above fails the whole field closed.
+_MAX_STRIP_PASSES = 20
 
 
 @dataclass(frozen=True, slots=True)
@@ -63,7 +76,9 @@ class DefinitionSanitize:
     ``"suspected_unhandled"`` (a data marker survived the strip → blanked).
     ``logical_representation`` / ``semantic_type`` — SAFE facets from ``parse_sample_profile``
     (``""`` when unknown); captured BEFORE stripping so they survive the excision.
-    ``removed`` — sample clauses stripped/blanked + PII spans redacted.
+    ``removed`` — stripping/blanking events + PII spans redacted. The multi-pass excision counts
+    as ONE event however many clauses it consumed, so ``removed - 1`` on a non-blanked
+    ``"stripped"`` field is still exactly the redacted-span count (the adapter's R5-8 arithmetic).
     ``reason`` — why a field was blanked (``"unhandled_marker"`` | ``"pii_redaction_failed"``);
     ``""`` otherwise.
     """
@@ -85,8 +100,19 @@ def sanitize_definition(text: str | None) -> DefinitionSanitize:
     profile = parse_sample_profile(text)  # BEFORE stripping — the facets must survive the excision
     logical = profile.logical_representation or ""
     semantic = profile.semantic_type or ""
-    stripped = strip_sample_values(text)
-    clause_stripped = stripped != text
+    # v4 (whole-branch re-review IMPORTANT): strip to a FIXED POINT. `strip_sample_values` excises
+    # only the FIRST clause per call, so a definition with a second `values such as` clause in a
+    # later sentence leaked that clause's raw values under state="stripped". Loop on its own
+    # output until it stops changing (each pass strictly shortens the text), bounded against
+    # pathological non-convergence — the marker scan below then fails the residual closed.
+    stripped = text
+    clause_stripped = False
+    for _ in range(_MAX_STRIP_PASSES):
+        residual = strip_sample_values(stripped)
+        if residual == stripped:
+            break
+        clause_stripped = True
+        stripped = residual
     if _UNHANDLED_MARKER_RE.search(stripped):
         # A data-implying marker survived the strip: a sample clause the stripper could not
         # consume — blank the whole field, never individual values. The blanked residual counts.

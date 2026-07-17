@@ -21,7 +21,8 @@ Fixture is inline (never read from ~/Downloads); definitions with commas are quo
 """
 from __future__ import annotations
 
-from featuregen.intake.redaction import REDACTION_VERSION
+import featuregen.intake.redaction as redaction_module
+from featuregen.intake.redaction import REDACTION_VERSION, RedactionResult
 from featuregen.overlay.upload.canonical import UNKNOWN_TYPE
 from featuregen.overlay.upload.ftr_adapter import (
     KNOWN_TERM_TYPES,
@@ -418,6 +419,25 @@ def test_marker_suppressed_definition_counts_as_suppressed_not_stripped():
     assert p.definitions_suppressed == 1
     assert p.definitions_stripped == 0
     assert p.pii_spans_redacted == 0      # the field was blanked whole — no span accounting
+
+
+class _FailClosedRedactor:
+    def redact(self, raw_intent, raw_input_classification):
+        return RedactionResult(None, "stub-redactor@1", (), "fail_into_clarification")
+
+
+def test_pii_redaction_failed_blank_counts_as_suppressed_not_stripped(monkeypatch):
+    """Whole-branch re-review MINOR: suppression provenance follows the R5-3 flag (`san.reason`
+    truthy), not just the marker state — a definition blanked because PII redaction FAILED (here:
+    with a clause also excised first, the exact old-miscount shape) is `definitions_suppressed`,
+    never `definitions_stripped`."""
+    monkeypatch.setattr(redaction_module, "_INTENT_REDACTOR", _FailClosedRedactor())
+    p = read_ftr_glossary(_HDR + _row(definition=_STRIPPED_DEF), source="ftr")
+    assert p.records[0].definition == ""                      # blanked fail-closed
+    assert p.records[0].definition_suppressed is True         # the R5-3 flag it must align with
+    assert p.definitions_suppressed >= 1
+    assert p.definitions_stripped == 0
+    assert p.pii_spans_redacted == 0      # a blanked field never yields span accounting
 
 
 def test_definition_pii_span_counted_separately():

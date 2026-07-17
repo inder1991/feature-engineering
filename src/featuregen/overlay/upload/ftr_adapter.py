@@ -115,8 +115,10 @@ class PreparedFtrUpload:
     ``sanitized_count`` sums :class:`~featuregen.overlay.upload.sanitize.DefinitionSanitize`
     ``.removed`` across every definition — clauses stripped, fields blanked, PII spans redacted —
     a legacy AGGREGATE kept for continuity. The HONEST breakdown (R5-8) rides beside it:
-    ``definitions_stripped`` (state ``"stripped"`` — the canonical sample clause was excised),
-    ``definitions_suppressed`` (state ``"suspected_unhandled"`` — blanked whole, fail-closed),
+    ``definitions_stripped`` (non-blanked state ``"stripped"`` — sample clause(s) excised, prose
+    kept), ``definitions_suppressed`` (blanked whole, fail-closed — a truthy sanitize ``reason``,
+    i.e. an unhandled marker OR a failed PII redaction, the same signal as the R5-3
+    ``definition_suppressed`` record flag),
     ``pii_spans_redacted`` (PII spans removed across the DEFINITION redactions of non-blanked
     fields), and ``fields_redacted`` (NON-definition free-text values — term name, domain, each
     synonym/related term, joined taxonomy/process paths — that :func:`redact_text` changed).
@@ -131,8 +133,8 @@ class PreparedFtrUpload:
     sanitized_count: int
     sanitizer_version: str
     redaction_version: str | None
-    definitions_stripped: int       # R5-8: canonical clause removed, prose kept
-    definitions_suppressed: int     # R5-8: blanked fail-closed (a data marker survived the strip)
+    definitions_stripped: int       # R5-8: clause(s) removed, prose kept, NOT blanked
+    definitions_suppressed: int     # R5-8: blanked fail-closed (truthy reason: marker OR redaction)
     pii_spans_redacted: int         # R5-8: PII spans removed across definition redactions
     fields_redacted: int            # R5-8: non-definition free-text values redact_text changed
     input_row_count: int            # R5-9: every CSV data row read, quarantines + table term incl.
@@ -260,13 +262,16 @@ def read_ftr_glossary(text: str, *, source: str) -> PreparedFtrUpload:
         san = sanitize_definition(_cell(hmap, raw, "descriptionbusinessdefinition"))
         sanitized_count += san.removed
         # R5-8: the honest breakdown. `removed` conflates stripped clauses, blanked fields and PII
-        # spans — split it: state says what happened to the field; on a NON-blanked field (no
-        # `reason`), `removed` minus the possible stripped clause is exactly the redacted-span
-        # count. A blanked field (`reason` set) never yields a span count — no double bookkeeping.
-        if san.state == "stripped":
-            definitions_stripped += 1
-        elif san.state == "suspected_unhandled":
+        # spans — split it. Suppression is judged by `reason` — the SAME signal as the R5-3
+        # definition_suppressed flag below — so ANY fail-closed blank (unhandled_marker OR
+        # pii_redaction_failed) counts as suppressed, even when a clause was excised first
+        # (state=="stripped" with clean==""). Only a NON-blanked stripped field counts as
+        # stripped, and only a NON-blanked field yields a span count: `removed` minus the
+        # possible stripped clause. A blanked field never does — no double bookkeeping.
+        if san.reason:
             definitions_suppressed += 1
+        elif san.state == "stripped":
+            definitions_stripped += 1
         if not san.reason:
             pii_spans_redacted += san.removed - (1 if san.state == "stripped" else 0)
         if redaction_version is None and san.redaction_version is not None:
