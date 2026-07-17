@@ -15,6 +15,7 @@ import logging
 from featuregen.overlay.upload.canonical import CanonicalRow
 from featuregen.overlay.upload.enrich import content_hash
 from featuregen.overlay.upload.enrich_batch import BatchItem, run_batched
+from featuregen.overlay.upload.enrich_llm import _MAX_COLUMN_PROFILES
 from featuregen.overlay.upload.sample_parser import strip_sample_values
 from featuregen.runtime.observability import counters
 
@@ -110,26 +111,142 @@ def make_ref_accept(columns_by_table: dict[str, set[str]]):
     return accept
 
 
+def make_summary_accept(columns_by_ref: dict[str, set[str]]):
+    """A ref-aware accept for the PHASE-1 chunk-summary task (#1). `ref` is a chunk id; validate the
+    serialized `summary` and FILTER its candidate columns to those actually in THAT chunk (a summary
+    is advisory input to phase 2, not a governed fact — a stray hallucinated column drops silently, it
+    must never lose the whole chunk's summary and thereby fail the table). Only unparseable / non-object
+    raw is rejected; everything else normalizes to a bounded, egress-safe summary."""
+    def accept(raw: str, ref: str) -> tuple[str | None, str]:
+        cols = columns_by_ref.get(ref, set())
+        try:
+            s = json.loads(raw)
+        except (ValueError, TypeError):
+            return None, "unparseable"
+        if not isinstance(s, dict):
+            return None, "not_object"
+        grain = [c for c in (s.get("grain_candidates") or [])
+                 if isinstance(c, str) and c in cols][:32]
+        temporal = [c for c in (s.get("temporal_candidates") or [])
+                    if isinstance(c, str) and c in cols][:32]
+        entity = [e for e in (s.get("entity_signals") or []) if isinstance(e, str)][:16]
+        kind = s.get("event_or_snapshot")
+        if kind not in ("event", "snapshot", None):
+            kind = None
+        out = {"grain_candidates": grain, "temporal_candidates": temporal,
+               "entity_signals": entity, "event_or_snapshot": kind}
+        return json.dumps(out, sort_keys=True), "valid"
+    return accept
+
+
 def synthesize_tables(conn, client, items: list[BatchItem], *, columns_by_table, actor
                       ) -> dict[str, dict]:
     """Run the governed batch synthesis; return {table: synthesis_dict} for VALID results only.
     Validation is done INSIDE run_batched via the ref-aware accept — this function does no
     post-filtering (an INVALID synthesis never reaches here).
 
+    Wide tables (#1): an item whose ``column_profiles`` exceeds ``_MAX_COLUMN_PROFILES`` cannot egress
+    as one giant item, so it is routed through the TWO-PHASE path (phase-1 per-chunk summaries -> a
+    single phase-2 synthesis over the summaries + a complete roster). NARROW tables (``<=64`` profiles)
+    keep today's single-call fast path byte-for-byte. A wide table that fails to summarize every chunk,
+    or whose synthesis is invalid, simply never appears in the returned dict — the caller then reports
+    the honest partial/failed outcome (no phantom "resolved").
+
     NOTE: the batch-mode config (``OVERLAY_ENRICH_TABLE_SYNTH_MODE`` / ``mode("table_synth")``) is
     intentionally NOT consulted here. Pass B is BATCH-ONLY: a ref_aware task has no single-call
     seam (run_batched skips the single fallback for ref_aware), so there is no "single" execution
     path a mode switch could select. Only the FEATURE switch (``OVERLAY_TABLE_SYNTH``,
     ``ingest.table_synth_enabled``) gates Pass B."""
+    narrow = [it for it in items
+              if len(it.metadata.get("column_profiles") or []) <= _MAX_COLUMN_PROFILES]
+    wide = [it for it in items
+            if len(it.metadata.get("column_profiles") or []) > _MAX_COLUMN_PROFILES]
+    resolved: dict[str, dict] = {}
+    if narrow:
+        # Today's exact path: one synthesis batch over the full profiles (fast path, byte-for-byte).
+        resolved.update(_run_synthesis(conn, client, narrow, columns_by_table=columns_by_table,
+                                       actor=actor, instruction=_INSTRUCTION))
+    if wide:
+        resolved.update(_synthesize_wide_tables(conn, client, wide,
+                                                columns_by_table=columns_by_table, actor=actor))
+    return resolved
+
+
+def _run_synthesis(conn, client, items: list[BatchItem], *, columns_by_table, actor, instruction
+                   ) -> dict[str, dict]:
+    """The governed phase-2 synthesis batch (shared by the narrow fast path and the wide path): SAME
+    task/schema/accept/result-shape — only the item metadata (full profiles vs summaries+roster) and
+    the instruction differ. Returns {table: synthesis_dict} for VALID results only."""
     accept = make_ref_accept(columns_by_table)
     resolved = run_batched(
         conn, client, short="table_synth", task="table_synth",
         prompt_id="overlay_table_synth_v1", schema_id="overlay_table_synth_batch",
         shared_metadata={}, items=items, out_key="synthesis",
-        instruction=_INSTRUCTION, accept=accept, actor=actor,
+        instruction=instruction, accept=accept, actor=actor,
         extract=lambda e: json.dumps(e.get("synthesis"), sort_keys=True), ref_aware=True,
     )
     return {table: json.loads(raw) for table, raw in resolved.items()}
+
+
+def _chunk_profiles(profiles: list[dict]) -> list[list[dict]]:
+    """Deterministic consecutive chunks of the table's profiles (stable column order preserved), each
+    ``<=_MAX_COLUMN_PROFILES`` so every chunk item passes the per-item egress cap."""
+    return [profiles[i:i + _MAX_COLUMN_PROFILES]
+            for i in range(0, len(profiles), _MAX_COLUMN_PROFILES)]
+
+
+def _synthesize_wide_tables(conn, client, wide_items: list[BatchItem], *, columns_by_table, actor
+                            ) -> dict[str, dict]:
+    """Two-phase synthesis for tables wider than the egress cap (#1).
+
+    Phase 1: split each wide table into consecutive ``<=64``-profile chunks and SUMMARIZE each chunk
+    (no fact output) — every chunk item is egress-safe. Phase 2: for each table whose chunks ALL
+    summarized, run ONE synthesis over its chunk summaries + a compact complete roster (names/types).
+    A table missing any chunk summary is dropped (never partially synthesized) so the caller reports it
+    honestly as unresolved."""
+    chunk_items: list[BatchItem] = []
+    chunk_refs_by_table: dict[str, list[str]] = {}
+    columns_by_ref: dict[str, set[str]] = {}
+    roster_by_table: dict[str, list[str]] = {}
+    for it in wide_items:
+        table = it.ref
+        profiles = it.metadata.get("column_profiles") or []
+        # Complete roster: `name:type` only — small, egress-safe, and enough for phase-2 grounding.
+        roster_by_table[table] = [f"{d.get('column', '')}:{d.get('type', '')}"[:200]
+                                  for d in profiles]
+        refs: list[str] = []
+        for idx, chunk in enumerate(_chunk_profiles(profiles)):
+            ref = f"{table}#chunk{idx}"
+            refs.append(ref)
+            columns_by_ref[ref] = {d.get("column") for d in chunk if d.get("column")}
+            chunk_items.append(BatchItem(ref=ref,
+                                         metadata={"table": table, "column_profiles": chunk}))
+        chunk_refs_by_table[table] = refs
+
+    summaries = run_batched(
+        conn, client, short="table_synth", task="table_synth_summary",
+        prompt_id="overlay_table_synth_summary_v1", schema_id="overlay_table_synth_summary_batch",
+        shared_metadata={}, items=chunk_items, out_key="summary",
+        instruction=_SUMMARY_INSTRUCTION, accept=make_summary_accept(columns_by_ref), actor=actor,
+        extract=lambda e: json.dumps(e.get("summary"), sort_keys=True), ref_aware=True,
+    )
+
+    phase2_items: list[BatchItem] = []
+    for table, refs in chunk_refs_by_table.items():
+        if not all(r in summaries for r in refs):
+            # An incomplete summary set for a wide table -> no synthesis (never a partial/guessed one).
+            counters.incr("overlay.table_synth.wide.incomplete_summaries")
+            logger.info("table_synth wide %r summarized %d/%d chunks — no synthesis (honest miss)",
+                        table, sum(r in summaries for r in refs), len(refs))
+            continue
+        chunk_summaries = [json.loads(summaries[r]) for r in refs]
+        phase2_items.append(BatchItem(ref=table, metadata={
+            "table": table, "chunk_summaries": chunk_summaries,
+            "column_roster": roster_by_table[table]}))
+    if not phase2_items:
+        return {}
+    return _run_synthesis(conn, client, phase2_items, columns_by_table=columns_by_table,
+                          actor=actor, instruction=_SYNTH_WIDE_INSTRUCTION)
 
 
 _INSTRUCTION = (
@@ -138,6 +255,24 @@ _INSTRUCTION = (
     "guess; the as-of/availability column and its basis (posted_at|ingested_at); "
     "the primary business entity; the table role; and whether it is an event or snapshot table. "
     "Only name columns that appear in the provided column list."
+)
+
+_SUMMARY_INSTRUCTION = (
+    "For each column CHUNK, SUMMARIZE the columns to support a LATER whole-table synthesis — DO NOT "
+    "propose a table grain here. Identify: candidate grain/identifier columns (columns that could help "
+    "uniquely identify a row), temporal/as-of columns (event or load timestamps), entity signals "
+    "(the business entities these columns describe), and whether the chunk looks like event or "
+    "snapshot data. Only name columns that appear in the provided column list."
+)
+
+_SYNTH_WIDE_INSTRUCTION = (
+    "This is a WIDE table presented as per-chunk SUMMARIES (each with candidate grain/id columns, "
+    "temporal/as-of columns, entity signals, and an event/snapshot hint) PLUS the table's COMPLETE "
+    "column roster (each entry `name:type`). Using the summaries and the roster, identify for the WHOLE "
+    "table: the grain (the minimal set of columns whose combination uniquely identifies one row) — "
+    "RETURN AN EMPTY grain_columns list if you cannot determine it, do not guess; the as-of/availability "
+    "column and its basis (posted_at|ingested_at); the primary business entity; the table role; and "
+    "whether it is an event or snapshot table. Only name columns that appear in the column roster."
 )
 
 

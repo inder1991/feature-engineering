@@ -295,6 +295,30 @@ _SCHEMAS: dict[tuple[str, int], dict] = {
             "event_or_snapshot": {"type": ["string", "null"],
                                   "enum": ["event", "snapshot", None]},
         }, "required": ["grain_columns"]},
+    # Table-synthesis PHASE 1 (#1 — wide tables): per-column-CHUNK summary. NO fact output — a compact
+    # digest of one <=_MAX_COLUMN_PROFILES chunk (candidate grain/id + temporal/as-of columns, entity
+    # signals, event/snapshot hint) that later feeds the SINGLE per-table synthesis (phase 2) alongside
+    # a complete roster, so a table wider than the egress cap is never sent as one giant profile list.
+    # Batch-only (ref_aware, no single seam), so only the `_batch` shape exists.
+    ("overlay_table_synth_summary_batch", 1): {
+        "type": "object", "additionalProperties": False,
+        "properties": {"results": {"type": "array", "minItems": 0, "maxItems": 256,
+            "items": {"type": "object", "additionalProperties": False,
+                "properties": {
+                    "ref": {"type": "string", "maxLength": 256},
+                    "summary": {"type": "object", "additionalProperties": False,
+                        "properties": {
+                            "grain_candidates": {"type": "array", "maxItems": 32,
+                                                 "items": {"type": "string", "maxLength": 128}},
+                            "temporal_candidates": {"type": "array", "maxItems": 32,
+                                                    "items": {"type": "string", "maxLength": 128}},
+                            "entity_signals": {"type": "array", "maxItems": 16,
+                                               "items": {"type": "string", "maxLength": 128}},
+                            "event_or_snapshot": {"type": ["string", "null"],
+                                                  "enum": ["event", "snapshot", None]},
+                        }, "required": []}},
+                "required": ["ref", "summary"]}}},
+        "required": ["results"]},
     # Feature-assist output schemas (M6 — routed through the audited seam). Permissive object shapes:
     # the value is the LLM's proposal that the deterministic layer then grounds/validates.
     ("feature_ideas", 1): {"type": "object", "additionalProperties": True,
@@ -435,6 +459,11 @@ _ITEM_META_ALLOWED = frozenset({
     "table", "column", "type", "columns", "concept",
     "term_name", "business_definition", "synonyms", "data_domain", "bian_path", "fibo_path",
     "column_profiles",
+    # Pass B phase-2 (#1 — wide tables): the per-chunk summaries (bounded structured digests) and the
+    # complete column ROSTER (short `name:type` strings). Both are MEANING/structure, not data values,
+    # and are bounded field-by-field below — the phase-2 item carries these INSTEAD of a giant
+    # column_profiles list, so a >64-col table's synthesis input still passes the per-item egress cap.
+    "chunk_summaries", "column_roster",
 })
 
 # The ONLY keys a per-column descriptor may carry, each a short scalar. `definition` is deliberately
@@ -448,6 +477,18 @@ _COLUMN_PROFILE_KEYS = frozenset({
 })
 _MAX_COLUMN_PROFILES = 64
 
+# A phase-2 chunk-summary (#1) carries ONLY column-name lists + an event/snapshot enum — bounded,
+# egress-safe, and column-name-shaped (never a data value). `event_or_snapshot` is the lone scalar
+# (nullable enum); the three `*_candidates`/`entity_signals` keys are short string lists. A summary
+# with any other key (or a non-list/oversized value) is rejected pre-egress.
+_CHUNK_SUMMARY_LIST_KEYS = frozenset({
+    "grain_candidates", "temporal_candidates", "entity_signals",
+})
+_CHUNK_SUMMARY_KEYS = _CHUNK_SUMMARY_LIST_KEYS | {"event_or_snapshot"}
+# A wide table produces ceil(ncols/_MAX_COLUMN_PROFILES) chunk summaries; the generous cap backstops a
+# pathological column count without unbounding the phase-2 payload.
+_MAX_CHUNK_SUMMARIES = 256
+
 
 def _column_profile_ok(desc: object) -> bool:
     if not isinstance(desc, dict):
@@ -455,6 +496,21 @@ def _column_profile_ok(desc: object) -> bool:
     if any(k not in _COLUMN_PROFILE_KEYS for k in desc):
         return False
     return all(isinstance(v, str) and len(v) <= 200 for v in desc.values())
+
+
+def _chunk_summary_ok(summary: object) -> bool:
+    if not isinstance(summary, dict):
+        return False
+    if any(k not in _CHUNK_SUMMARY_KEYS for k in summary):
+        return False
+    for k, v in summary.items():
+        if k == "event_or_snapshot":
+            if v is not None and (not isinstance(v, str) or len(v) > 64):
+                return False
+        elif not isinstance(v, list) or not all(
+                isinstance(x, str) and len(x) <= 128 for x in v):
+            return False
+    return True
 
 
 def _item_egress_ok(metadata: dict) -> bool:
@@ -465,6 +521,11 @@ def _item_egress_ok(metadata: dict) -> bool:
             if not isinstance(v, list) or len(v) > _MAX_COLUMN_PROFILES:
                 return False
             if not all(_column_profile_ok(d) for d in v):
+                return False
+        elif k == "chunk_summaries":
+            if not isinstance(v, list) or len(v) > _MAX_CHUNK_SUMMARIES:
+                return False
+            if not all(_chunk_summary_ok(s) for s in v):
                 return False
         elif isinstance(v, list):
             if not all(isinstance(x, str) and len(x) <= 200 for x in v):
