@@ -37,8 +37,13 @@ def _quality(col: _Col, concept: str, grain_ok: bool) -> BindingQuality:
 
 
 def discover_ingredient_candidates(conn, template: Template, catalog_source: str,
-                                   *, roles: Iterable[str] = ()) -> CandidateDiscoveryV1:
-    cols = _load_columns(conn, catalog_source, roles)
+                                   *, roles: Iterable[str] = (),
+                                   columns: list[_Col] | None = None) -> CandidateDiscoveryV1:
+    # 3B.4 F5: when a frozen column snapshot is supplied (from the compiler context), discover over
+    # EXACTLY those columns so the planner_input_hash covers the same data the selection consumed — a
+    # fresh _load_columns under READ COMMITTED could differ. build_compiler_context loads via the
+    # identical `_load_columns(conn, src, roles)`, so passing its snapshot is behaviour-neutral.
+    cols = columns if columns is not None else _load_columns(conn, catalog_source, roles)
     resolved = {r.role: r for r in RESOLVED_NEED_METADATA.get(template.id, ())}
     out: dict[str, tuple[IngredientCandidateV1, ...]] = {}
     truncated = False

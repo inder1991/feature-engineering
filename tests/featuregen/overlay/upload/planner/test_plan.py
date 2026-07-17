@@ -236,7 +236,6 @@ def test_acceptance_out_of_scope_bridge_is_never_pinned_or_crossed(db):
 # the run-owned CompileBudget, and the contract selection roll-up. compile_ctx=None must stay
 # byte-identical to pre-C8 behaviour (all plans not_compiled, no roll-up, zero extra reads).
 # ---------------------------------------------------------------------------------------------
-from datetime import timedelta
 
 from featuregen.overlay.upload.planner.contracts import ContractResolutionStatus
 from featuregen.overlay.upload.planner.declarations import CompileBudget, build_compiler_context
@@ -304,7 +303,7 @@ def test_compile_budget_is_shared_and_exhaustion_is_recorded(db):
     scope = _c8_fixture(db)
     tmpl = _txn_template()
     ctx = build_compiler_context(db, scope, (), _NOW)
-    budget = CompileBudget(remaining=1, deadline=_NOW + timedelta(minutes=5))
+    budget = CompileBudget(remaining=1, deadline_monotonic=1e9, clock=lambda: 0.0)  # count governs
     r1 = plan_bindings(db, template=tmpl, target_entity="account", scope=scope, roles=(),
                        now=_NOW, compile_ctx=ctx, budget=budget)
     r2 = plan_bindings(db, template=tmpl, target_entity="account", scope=scope, roles=(),
@@ -319,14 +318,15 @@ def test_compile_budget_is_shared_and_exhaustion_is_recorded(db):
     # a budget-skipped plan is NEVER the contract selection
     assert r2.contract_result_status is ContractResolutionStatus.not_compiled
     assert r2.selected_contract_physical_plan_id is None
-    # the deadline bound skips identically (deterministic: compared against the injected now)
-    past = CompileBudget(remaining=5, deadline=_NOW)
+    # the elapsed-time deadline skips too (D6: the injected monotonic clock is already past it)
+    past = CompileBudget(remaining=5, deadline_monotonic=0.0, clock=lambda: 1.0)
     r3 = plan_bindings(db, template=tmpl, target_entity="account", scope=scope, roles=(),
                        now=_NOW, compile_ctx=ctx, budget=past)
     (c3,) = _cross(r3)
     assert c3.contract_resolution_status is ContractResolutionStatus.not_compiled
     assert ReasonCode.compile_budget_exhausted in c3.contract_reason_codes
-    assert past.remaining == 5      # nothing was compiled, nothing decremented
+    assert past.remaining == 5           # nothing was compiled, nothing decremented
+    assert past.stopped_by_time is True  # the time bound (not the count) is what fired
 
 
 def test_no_compile_ctx_leaves_every_plan_not_compiled(db):
