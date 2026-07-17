@@ -236,7 +236,9 @@ def test_duplicate_source_row_quarantines_both_rows():
 # ── Sanitize at parse time ───────────────────────────────────────────────────────────────────────
 
 def test_unhandled_sample_clause_blanks_definition_but_row_survives():
-    csv_text = _HDR + _row(definition='"Counterparty name; examples include Acme and Beta."')
+    # v2 value-shape gate trigger: a residual "observed entries" marker + all-caps entity values.
+    csv_text = _HDR + _row(
+        definition='"Counterparty name; observed entries include ARTKOM FZE and NORDIC AS."')
     p = read_ftr_glossary(csv_text, source="ftr")
     assert p.quarantined == []
     assert len(p.rows) == 1 and p.rows[0].definition == ""
