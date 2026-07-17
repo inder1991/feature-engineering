@@ -1,4 +1,4 @@
--- src/featuregen/db/migrations/0998_planner_shadow_store.sql
+-- src/featuregen/db/migrations/0999_planner_shadow_store.sql
 -- Phase-3B.4 shadow harness: durable, append-only (WORM) telemetry for the shadow contract
 -- classifier. Three tables capture the FULL population so the 3C-enablement gate can be computed
 -- with provable capture integrity:

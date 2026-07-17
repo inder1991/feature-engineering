@@ -4,7 +4,7 @@ import psycopg
 import pytest
 from psycopg.types.json import Jsonb
 
-# 0998 adds the Phase-3B.4 shadow-telemetry store (dispatch manifest + run_result + plan_observation),
+# 0999 adds the Phase-3B.4 shadow-telemetry store (dispatch manifest + run_result + plan_observation),
 # append-only/WORM with a full CHECK surface: every enum column is constrained, JSON columns are
 # jsonb_typeof='object', run_result carries count-consistency + incomplete_reason-scope CHECKs, and
 # plan_observation carries the is_compiled cross-field guards. Migrations are applied once per session;

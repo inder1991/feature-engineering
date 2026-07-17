@@ -1,6 +1,6 @@
 """Phase-3B.4 — the durable, append-only (WORM) shadow-telemetry store.
 
-Persists the shadow contract classifier's output as three append-only tables (migration 0998):
+Persists the shadow contract classifier's output as three append-only tables (migration 0999):
 a dispatch MANIFEST (the expected eligible set, written first), one recipe-level RUN_RESULT per
 (run, recipe), and one PLAN_OBSERVATION per candidate physical plan. The store is planner telemetry
 — NOT a governed overlay_fact — and is written only when the shadow-telemetry flag is on. Capture
