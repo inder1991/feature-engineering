@@ -389,3 +389,63 @@ def test_clean_and_stripped_definitions_are_not_flagged_suppressed():
     assert p.quarantined == []
     assert all(r.definition_suppressed is False for r in p.records)   # clean AND stripped rows
     assert p.records[1].definition != ""    # the stripped definition survives (only the clause went)
+
+
+# ── R5-8: honest sanitizer provenance breakdown ──────────────────────────────────────────────────
+
+_STRIPPED_DEF = ('"Customer account number. The sample profile is NUMERIC, with representative '
+                 'values such as 3708484836801; 3708446902413, which supports interpretation."')
+_SUPPRESSED_DEF = '"Counterparty name; observed entries include ARTKOM FZE and NORDIC AS."'
+
+
+def test_clean_fixture_breakdown_all_zero():
+    p = read_ftr_glossary(_FTR_CSV, source="ftr")
+    assert p.definitions_stripped == 0
+    assert p.definitions_suppressed == 0
+    assert p.pii_spans_redacted == 0
+    assert p.fields_redacted == 0
+
+
+def test_canonical_clause_counts_as_stripped_not_suppressed():
+    p = read_ftr_glossary(_HDR + _row(definition=_STRIPPED_DEF), source="ftr")
+    assert p.definitions_stripped == 1
+    assert p.definitions_suppressed == 0
+    assert p.pii_spans_redacted == 0      # the digits left with the clause, never via redaction
+
+
+def test_marker_suppressed_definition_counts_as_suppressed_not_stripped():
+    p = read_ftr_glossary(_HDR + _row(definition=_SUPPRESSED_DEF), source="ftr")
+    assert p.definitions_suppressed == 1
+    assert p.definitions_stripped == 0
+    assert p.pii_spans_redacted == 0      # the field was blanked whole — no span accounting
+
+
+def test_definition_pii_span_counted_separately():
+    csv_text = _HDR + _row(
+        definition='"Contact ops.desk@example.com for the source extract mapping."')
+    p = read_ftr_glossary(csv_text, source="ftr")
+    assert p.pii_spans_redacted == 1
+    assert p.definitions_stripped == 0 and p.definitions_suppressed == 0
+    assert p.fields_redacted == 0         # a DEFINITION span never counts as a field redaction
+
+
+def test_non_definition_field_redaction_counted():
+    csv_text = _HDR + _row(synonyms="Client Name|ops.desk@example.com")
+    p = read_ftr_glossary(csv_text, source="ftr")
+    assert p.fields_redacted == 1         # exactly the one changed synonym value
+    assert p.pii_spans_redacted == 0      # the definition itself carried no PII
+
+
+# ── R5-9: honest input row count (every DATA row, table term + quarantines included) ─────────────
+
+def test_input_row_count_counts_every_data_row():
+    p = read_ftr_glossary(_FTR_CSV, source="ftr")
+    assert p.input_row_count == 3         # 2 column rows + the table term (len(rows) == 2)
+    assert len(p.rows) == 2
+
+
+def test_input_row_count_includes_quarantined_rows():
+    csv_text = _FTR_CSV + _row(source_row="21", fqn="no_dots_here")
+    p = read_ftr_glossary(csv_text, source="ftr")
+    assert len(p.rows) == 2 and len(p.quarantined) == 1
+    assert p.input_row_count == 4         # 2 columns + table term + the quarantined row

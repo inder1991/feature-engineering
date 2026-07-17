@@ -159,9 +159,16 @@ def create_upload(
         # A1 resolution #6: an FTR upload's sanitize provenance rides the PARSE stage detail —
         # ingest_upload takes no prepared metadata, so this is the one honest place to record how
         # many sample clauses/PII spans parse removed and under which sanitizer/redactor versions.
+        # R5-8: the legacy `sanitized_clauses` aggregate conflated stripped clauses, blanked
+        # fields and PII spans — the honest breakdown rides beside it so the run manifest states
+        # exactly what sanitization did (and to which field class).
         parse_detail: dict = {"rows": len(rows)}
         if prepared is not None:
             parse_detail.update({"sanitized_clauses": prepared.sanitized_count,
+                                 "definitions_stripped": prepared.definitions_stripped,
+                                 "definitions_suppressed": prepared.definitions_suppressed,
+                                 "pii_spans_redacted": prepared.pii_spans_redacted,
+                                 "fields_redacted": prepared.fields_redacted,
                                  "sanitizer_version": prepared.sanitizer_version,
                                  "redaction_version": prepared.redaction_version})
         record_stage(recorder, "parse", "succeeded", detail=parse_detail,
@@ -214,8 +221,13 @@ def create_upload(
         # 1:1 onto the run vocabulary) commits atomically with the ingest it describes —
         # 'ingested' can never be recorded for a transaction that then fails to commit.
         post_fingerprint, _ = source_fingerprint(conn, source)
+        # R5-9: an FTR upload's run manifest records the INPUT data-row count (accepted columns +
+        # the table term + adapter-quarantined rows) — `len(rows)` silently drops the latter two.
+        # Every non-FTR path (technical/generic/xlsx) keeps `len(rows)` exactly as before.
         terminalize_run(conn, run_id, status=result.status, now=datetime.now(UTC),
-                        row_count=len(rows), quarantined_count=result.quarantined,
+                        row_count=(prepared.input_row_count if prepared is not None
+                                   else len(rows)),
+                        quarantined_count=result.quarantined,
                         file_sha256=file_sha256, pre_fingerprint=pre_fingerprint,
                         post_fingerprint=post_fingerprint,
                         fingerprint_algo_version=fingerprint_algo)

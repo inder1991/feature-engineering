@@ -113,9 +113,17 @@ class PreparedFtrUpload:
     provenance the route records in its PARSE stage detail (resolution #6, Task 3b).
 
     ``sanitized_count`` sums :class:`~featuregen.overlay.upload.sanitize.DefinitionSanitize`
-    ``.removed`` across every definition — clauses stripped, fields blanked, PII spans redacted.
-    ``redaction_version`` is the redactor version observed (``None`` only when no text needed
-    redacting at all)."""
+    ``.removed`` across every definition — clauses stripped, fields blanked, PII spans redacted —
+    a legacy AGGREGATE kept for continuity. The HONEST breakdown (R5-8) rides beside it:
+    ``definitions_stripped`` (state ``"stripped"`` — the canonical sample clause was excised),
+    ``definitions_suppressed`` (state ``"suspected_unhandled"`` — blanked whole, fail-closed),
+    ``pii_spans_redacted`` (PII spans removed across the DEFINITION redactions of non-blanked
+    fields), and ``fields_redacted`` (NON-definition free-text values — term name, domain, each
+    synonym/related term, joined taxonomy/process paths — that :func:`redact_text` changed).
+    ``input_row_count`` (R5-9) is the number of CSV DATA rows the adapter READ — accepted column
+    rows + the table term + every adapter-quarantined row — the honest run-manifest "rows" figure
+    (``len(rows)`` drops the table term and the quarantines). ``redaction_version`` is the
+    redactor version observed (``None`` only when no text needed redacting at all)."""
 
     rows: list[CanonicalRow]        # SANITIZED definitions; source_row stamped; type = UNKNOWN_TYPE
     records: list[GlossaryRecord]   # SANITIZED free-text; schema/physical_fqn/declared_type set
@@ -123,6 +131,11 @@ class PreparedFtrUpload:
     sanitized_count: int
     sanitizer_version: str
     redaction_version: str | None
+    definitions_stripped: int       # R5-8: canonical clause removed, prose kept
+    definitions_suppressed: int     # R5-8: blanked fail-closed (a data marker survived the strip)
+    pii_spans_redacted: int         # R5-8: PII spans removed across definition redactions
+    fields_redacted: int            # R5-8: non-definition free-text values redact_text changed
+    input_row_count: int            # R5-9: every CSV data row read, quarantines + table term incl.
 
 
 def is_ftr_glossary(headers: list[str]) -> bool:
@@ -210,14 +223,23 @@ def read_ftr_glossary(text: str, *, source: str) -> PreparedFtrUpload:
     hmap = {_norm_header(h): h for h in (reader.fieldnames or [])}
 
     sanitized_count = 0
+    definitions_stripped = 0
+    definitions_suppressed = 0
+    pii_spans_redacted = 0
+    fields_redacted = 0
+    input_row_count = 0
     redaction_version: str | None = None
 
-    def _redact(value: str) -> str:
-        """redact_text + fold the observed redactor version into the envelope."""
-        nonlocal redaction_version
+    def _redact(value: str, *, count: bool = True) -> str:
+        """redact_text + fold the observed redactor version into the envelope. A CHANGED value
+        counts toward ``fields_redacted`` (R5-8) unless ``count=False`` — the quarantine-REASON
+        rendering below is not a persisted field value."""
+        nonlocal redaction_version, fields_redacted
         clean, version = redact_text(value)
         if redaction_version is None and version is not None:
             redaction_version = version
+        if count and clean != value:
+            fields_redacted += 1
         return clean
 
     # Pass 1 — parse + sanitize every row; index the collision keys the emit pass checks:
@@ -234,8 +256,19 @@ def read_ftr_glossary(text: str, *, source: str) -> PreparedFtrUpload:
     fqn_counts: Counter[tuple[str, str, str]] = Counter()
     srcrow_counts: Counter[int] = Counter()
     for raw in reader:
+        input_row_count += 1
         san = sanitize_definition(_cell(hmap, raw, "descriptionbusinessdefinition"))
         sanitized_count += san.removed
+        # R5-8: the honest breakdown. `removed` conflates stripped clauses, blanked fields and PII
+        # spans — split it: state says what happened to the field; on a NON-blanked field (no
+        # `reason`), `removed` minus the possible stripped clause is exactly the redacted-span
+        # count. A blanked field (`reason` set) never yields a span count — no double bookkeeping.
+        if san.state == "stripped":
+            definitions_stripped += 1
+        elif san.state == "suspected_unhandled":
+            definitions_suppressed += 1
+        if not san.reason:
+            pii_spans_redacted += san.removed - (1 if san.state == "stripped" else 0)
         if redaction_version is None and san.redaction_version is not None:
             redaction_version = san.redaction_version
         extra = raw.get(None)
@@ -323,7 +356,7 @@ def read_ftr_glossary(text: str, *, source: str) -> PreparedFtrUpload:
             # the persistence controls, and the row carries only the SANITIZED definition.
             pending.append((
                 f"unresolvable FQN {r.physical_fqn!r} — term={r.term_name!r} "
-                f"type={_redact(r.term_type_raw)!r} domain={r.domain!r} "
+                f"type={_redact(r.term_type_raw, count=False)!r} domain={r.domain!r} "
                 f"source_row={r.source_row}; fix the FQN and re-upload",
                 _quarantine_row(r)))
             continue
@@ -397,7 +430,12 @@ def read_ftr_glossary(text: str, *, source: str) -> PreparedFtrUpload:
     return PreparedFtrUpload(rows=rows, records=records, quarantined=quarantined,
                              sanitized_count=sanitized_count,
                              sanitizer_version=SANITIZER_VERSION,
-                             redaction_version=redaction_version)
+                             redaction_version=redaction_version,
+                             definitions_stripped=definitions_stripped,
+                             definitions_suppressed=definitions_suppressed,
+                             pii_spans_redacted=pii_spans_redacted,
+                             fields_redacted=fields_redacted,
+                             input_row_count=input_row_count)
 
 
 def to_glossary_upload(p: PreparedFtrUpload) -> GlossaryUpload:
