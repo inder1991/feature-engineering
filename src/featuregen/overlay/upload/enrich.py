@@ -173,6 +173,13 @@ def _concept_metadata(row: CanonicalRow, rec: GlossaryRecord | None) -> dict:
     Free-text values are bounded to ``_MAX_META_LEN`` to stay within the metadata-only egress filter."""
     meta: dict = {"table": row.table, "column": row.column, "type": row.type}
     if rec is not None:
+        # R5-5: the FTR adapter keeps the OPERATIONAL row type UNKNOWN_TYPE (a business glossary is
+        # not the physical-type authority), but the file's DECLARED SQL type is real classifier
+        # signal. It rides the already-allowlisted `type` key — a bounded structural token the
+        # adapter validated (`^[a-z0-9 _()]+$`, ≤64), never free text — so the classifier sees
+        # "varchar"/"double", not the useless operational "unknown". CanonicalRow.type is untouched.
+        if rec.declared_type:
+            meta["type"] = rec.declared_type[:_MAX_META_LEN]
         # `business_definition` (NOT `definition`) is deliberate: the plain `definition` key stays
         # forbidden by the egress filter so a technical upload's free text can never egress (M4); the
         # curated glossary definition rides through under this distinct, unambiguous key.
@@ -329,12 +336,39 @@ def enrich_concepts(conn, rows: list[CanonicalRow], client: LLMClient, actor=Non
     return result
 
 
+def suppressed_definition_hashes(rows: list[CanonicalRow],
+                                 glossary: GlossaryUpload | None) -> set[str]:
+    """Content hashes of rows whose BLANK definition is sanitizer-SUPPRESSED (R5-3): the uploader
+    DECLARED one, but the adapter blanked it fail-closed (``GlossaryRecord.definition_suppressed``).
+    Suppressed is NOT missing — LLM-drafting over it would land generated text in the graph with no
+    governance decision, so these rows stay empty pending review. Shared by ``draft_definitions``
+    (the skip) and ingest's ``enrich_definition`` stage report (the honest expected count)."""
+    if glossary is None:
+        return set()
+    rec_by_tc = _records_by_tc(glossary)
+    out: set[str] = set()
+    for r in rows:
+        if r.definition:
+            continue
+        rec = rec_by_tc.get((_norm(r.table), _norm(r.column)))
+        if rec is not None and rec.definition_suppressed:
+            out.add(content_hash(r))
+    return out
+
+
 def draft_definitions(conn, rows: list[CanonicalRow], client: LLMClient, actor=None,
-                      *, concepts: dict[str, str] | None = None) -> dict[str, str]:
+                      *, concepts: dict[str, str] | None = None,
+                      glossary: GlossaryUpload | None = None) -> dict[str, str]:
     """Draft a definition ONLY for columns with no declared one (R3). Keyed by (content_hash,
-    assigned concept) so a concept change re-drafts (spec C6). Returns {content_hash: definition}."""
+    assigned concept) so a concept change re-drafts (spec C6). Returns {content_hash: definition}.
+
+    R5-3 (``glossary`` given): a sanitizer-SUPPRESSED blank (``definition_suppressed`` on the
+    sidecar) is skipped — suppressed is not missing; it stays empty pending review, never silently
+    LLM-drafted. Non-glossary callers are byte-for-byte unchanged."""
     concepts = concepts or {}
     blank = {content_hash(r): r for r in rows if not r.definition}
+    for h in suppressed_definition_hashes(rows, glossary):
+        blank.pop(h, None)   # R5-3: suppressed ≠ missing — never silently LLM-drafted
     key_of = {h: _def_cache_key(h, concepts.get(h, "")) for h in blank}
     cached = _cache_get(conn, "enrichment_definition", list(key_of.values()), _DEFINITION_CACHE_VERSION)
     result = {h: cached[key_of[h]] for h in blank if key_of[h] in cached}

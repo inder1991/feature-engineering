@@ -36,6 +36,7 @@ from featuregen.overlay.upload.enrich import (
     content_hash,
     draft_definitions,
     enrich_concepts,
+    suppressed_definition_hashes,
 )
 from featuregen.overlay.upload.enrich_llm import consume_audit_degradations
 from featuregen.overlay.upload.field_resolution import FIELD_POLICY_VERSION, resolve_and_project
@@ -1301,11 +1302,18 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
         stage_started = datetime.now(UTC)
         try:
             with conn.transaction():
-                definitions = draft_definitions(conn, vr.good, client, actor, concepts=concepts)
+                # R5-3: the glossary sidecar lets draft_definitions SKIP sanitizer-suppressed
+                # blanks (suppressed ≠ missing — never silently LLM-drafted); None for technical.
+                definitions = draft_definitions(conn, vr.good, client, actor, concepts=concepts,
+                                                glossary=glossary)
         except Exception:  # noqa: BLE001
             logger.warning("advisory definition enrichment failed for %r", catalog_source, exc_info=True)
         state, reason, detail = _enrichment_outcome(
-            definitions, len({content_hash(r) for r in vr.good if not r.definition}))
+            definitions,
+            # Honest expected count (R5-3): suppressed blanks are deliberately NOT drafted, so they
+            # must not be counted as unresolved items degrading the stage to "partial".
+            len({content_hash(r) for r in vr.good if not r.definition}
+                - suppressed_definition_hashes(vr.good, glossary)))
         record_stage(stage_recorder, "enrich_definition", state, reason_code=reason,
                      detail=_with_audit_degradations(detail), started_at=stage_started)
         stage_started = datetime.now(UTC)

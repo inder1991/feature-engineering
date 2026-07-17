@@ -184,6 +184,7 @@ class _ParsedRow:
 
     source_row: str                 # raw cell, stamped on outputs for provenance
     source_row_int: int | None      # parsed id, None when not a valid integer
+    definition_suppressed: bool     # R5-3: the sanitizer blanked a DECLARED definition fail-closed
     physical_fqn: str
     schema: str | None
     table: str | None
@@ -261,6 +262,9 @@ def read_ftr_glossary(text: str, *, source: str) -> PreparedFtrUpload:
         row = _ParsedRow(
             source_row=source_row,
             source_row_int=source_row_int,
+            # R5-3: `reason` is set ONLY when a non-empty declared definition was blanked
+            # fail-closed (unhandled_marker / pii_redaction_failed) — suppressed, not missing.
+            definition_suppressed=bool(san.reason),
             physical_fqn=fqn_raw,
             schema=schema, table=table, column=column,
             term_name=_redact(_cell(hmap, raw, "termname")),
@@ -378,7 +382,7 @@ def read_ftr_glossary(text: str, *, source: str) -> PreparedFtrUpload:
             process_path=r.process_path, related_terms=r.related_terms,
             schema=r.schema or "", physical_fqn=r.physical_fqn,
             logical_representation=r.logical_representation, semantic_type=r.semantic_type,
-            declared_type=r.declared_type))
+            declared_type=r.declared_type, definition_suppressed=r.definition_suppressed))
 
         if r.column is not None:   # a 2-part table term is a record only, never a CanonicalRow
             rows.append(CanonicalRow(source=source, table=r.table, column=r.column,

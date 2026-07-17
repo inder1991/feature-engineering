@@ -365,3 +365,27 @@ def test_same_table_different_columns_different_schemas_quarantines_all_rows():
     assert len(p.quarantined) == 2
     assert all(q.adapter == "ftr" for q in p.quarantined)
     assert all("spans multiple schemas" in q.message for q in p.quarantined)
+
+
+# ── R5-3: suppressed definitions are flagged on the record (draft-skip seam) ─────────────────────
+
+def test_suppressed_definition_flagged_on_record():
+    """R5-3: when the sanitizer blanks a declared definition FAIL-CLOSED, the record carries
+    ``definition_suppressed=True`` so enrichment treats it as suppressed-pending-review, never as
+    naturally missing (which would silently LLM-draft over a governance decision)."""
+    csv_text = _HDR + _row(
+        definition='"Counterparty name; observed entries include ARTKOM FZE and NORDIC AS."')
+    p = read_ftr_glossary(csv_text, source="ftr")
+    assert p.records[0].definition == ""
+    assert p.records[0].definition_suppressed is True
+
+
+def test_clean_and_stripped_definitions_are_not_flagged_suppressed():
+    stripped = ('"Customer account number. The sample profile is NUMERIC, with representative '
+                'values such as 3708484836801; 3708446902413, which supports interpretation."')
+    p = read_ftr_glossary(_HDR + _row() + _row(source_row="19",
+                                               fqn="DPL_EIB_COMPLIANCE.COMP_FIN_TRAN.TXN_AMT",
+                                               definition=stripped), source="ftr")
+    assert p.quarantined == []
+    assert all(r.definition_suppressed is False for r in p.records)   # clean AND stripped rows
+    assert p.records[1].definition != ""    # the stripped definition survives (only the clause went)

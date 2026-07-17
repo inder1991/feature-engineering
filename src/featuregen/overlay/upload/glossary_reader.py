@@ -91,6 +91,11 @@ class GlossaryRecord:
     # definition (Task 7 / review #4 — the FTR definition arrives already sample-stripped).
     logical_representation: str = ""
     semantic_type: str = ""
+    # R5-3: True when the uploader DID declare a definition but the sanitizer blanked it FAIL-CLOSED
+    # (an unhandled data marker survived the strip, or PII redaction failed). A suppressed
+    # definition is NOT "missing": `enrich.draft_definitions` must skip it, so it stays empty
+    # pending review instead of being silently overwritten by LLM text with no governance decision.
+    definition_suppressed: bool = False
 
 
 @dataclass(frozen=True, slots=True)

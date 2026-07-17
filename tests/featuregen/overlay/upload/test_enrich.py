@@ -148,3 +148,83 @@ def test_concept_inputs_exclude_free_text_definition(db):
     assert "definition" not in catalog                        # the free-text definition is excluded (M4)
     assert set(catalog) == {"table", "column", "type", "vocabulary"}   # nothing else is sent
     assert "123-45-6789" not in str(captured["inputs"])       # the PII never reaches the payload
+
+
+# ── R5-5: the FTR-declared SQL type reaches the concept classifier ───────────────────────────────
+
+def test_concept_metadata_carries_declared_type_instead_of_unknown():
+    """R5-5: the FTR adapter keeps the OPERATIONAL type UNKNOWN_TYPE, but the file's real declared
+    SQL type (VARCHAR/DOUBLE/TIMESTAMP) is classifier signal — it must ride the allowlisted `type`
+    key, and the useless operational `unknown` token must not be sent in its place."""
+    from featuregen.overlay.upload.canonical import UNKNOWN_TYPE
+    from featuregen.overlay.upload.enrich import _concept_metadata
+    from featuregen.overlay.upload.enrich_llm import _ITEM_META_ALLOWED, _item_egress_ok
+    from featuregen.overlay.upload.glossary_reader import GlossaryRecord
+
+    row = CanonicalRow("ftr", "comp_fin_tran", "cust_name", UNKNOWN_TYPE)
+    rec = GlossaryRecord(logical_ref="ftr::dpl_eib_compliance.comp_fin_tran.cust_name",
+                         term_name="Customer Name", definition="Registered legal name.",
+                         declared_type="varchar")
+    meta = _concept_metadata(row, rec)
+    assert meta["type"] == "varchar"            # the declared type reaches the classifier ...
+    assert UNKNOWN_TYPE not in meta.values()    # ... never the operational unknown token
+    assert "type" in _ITEM_META_ALLOWED        # rides an allowlisted key ...
+    assert _item_egress_ok(meta)               # ... and the whole dict passes the egress filter
+
+
+def test_concept_metadata_keeps_operational_type_when_no_declared_type():
+    """Without a declared type (technical rows; generic glossary records) the operational
+    CanonicalRow.type is sent unchanged — byte-for-byte today's behaviour."""
+    from featuregen.overlay.upload.enrich import _concept_metadata
+    from featuregen.overlay.upload.glossary_reader import GlossaryRecord
+
+    row = CanonicalRow("upl", "accounts", "bal", "numeric")
+    rec = GlossaryRecord(logical_ref="upl::public.accounts.bal", term_name="Balance",
+                         definition="ledger balance")
+    assert _concept_metadata(row, rec)["type"] == "numeric"
+    assert _concept_metadata(row, None)["type"] == "numeric"
+
+
+# ── R5-3: a sanitizer-SUPPRESSED definition is never silently LLM-drafted ────────────────────────
+
+def test_suppressed_definition_is_not_llm_drafted(db):
+    """R5-3: a definition the sanitizer blanked FAIL-CLOSED (un-strippable sample data survived) is
+    NOT 'missing' — silently LLM-drafting it would land generated text in the graph with no
+    governance decision. It stays empty; a naturally-missing definition on the same upload still
+    drafts."""
+    from featuregen.overlay.upload.enrich import draft_definitions
+    from featuregen.overlay.upload.glossary_reader import GlossaryRecord, GlossaryUpload
+
+    suppressed = CanonicalRow("ftr", "comp_fin_tran", "cust_name", "unknown")
+    missing = CanonicalRow("ftr", "comp_fin_tran", "txn_amt", "unknown")
+    glossary = GlossaryUpload(rows=[suppressed, missing], records=[
+        GlossaryRecord(logical_ref="ftr::dpl_eib_compliance.comp_fin_tran.cust_name",
+                       term_name="Customer Name", definition="", definition_suppressed=True),
+        GlossaryRecord(logical_ref="ftr::dpl_eib_compliance.comp_fin_tran.txn_amt",
+                       term_name="Transaction Amount", definition=""),
+    ])
+    client = FakeLLM(script={"overlay.enrich.definition":
+                             FakeResponse(output={"definition": "an llm draft"})})
+    out = draft_definitions(db, [suppressed, missing], client, glossary=glossary)
+    assert out[content_hash(missing)] == "an llm draft"   # naturally-missing still drafts
+    assert content_hash(suppressed) not in out            # suppressed stays empty — no silent draft
+
+
+def test_suppressed_definition_hashes_only_flags_suppressed_blank_rows():
+    """The shared helper (draft skip + ingest's honest expected count) flags ONLY blank rows whose
+    sidecar marks the definition suppressed — declared and naturally-missing rows are untouched."""
+    from featuregen.overlay.upload.enrich import suppressed_definition_hashes
+    from featuregen.overlay.upload.glossary_reader import GlossaryRecord, GlossaryUpload
+
+    suppressed = CanonicalRow("ftr", "t", "a", "unknown")
+    missing = CanonicalRow("ftr", "t", "b", "unknown")
+    declared = CanonicalRow("ftr", "t", "c", "unknown", definition="kept")
+    glossary = GlossaryUpload(rows=[suppressed, missing, declared], records=[
+        GlossaryRecord(logical_ref="ftr::s.t.a", term_name="A", definition="",
+                       definition_suppressed=True),
+        GlossaryRecord(logical_ref="ftr::s.t.b", term_name="B", definition=""),
+        GlossaryRecord(logical_ref="ftr::s.t.c", term_name="C", definition="kept"),
+    ])
+    rows = [suppressed, missing, declared]
+    assert suppressed_definition_hashes(rows, glossary) == {content_hash(suppressed)}
+    assert suppressed_definition_hashes(rows, None) == set()
