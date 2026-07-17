@@ -473,6 +473,7 @@ def _acct_core(db):
         (CanonicalRow("core", "accounts", "product", "text"), "product_type"),
         (CanonicalRow("core", "accounts", "as_of_date", "timestamp"), "as_of_time"),
         (CanonicalRow("core", "customers", "customer_id", "integer", is_grain=True), "customer_id"),
+        (CanonicalRow("core", "customers", "reporting_date", "timestamp"), "as_of_time"),
     ])
 
 
@@ -642,20 +643,25 @@ def test_ordering_column_availability_branches():
     # unit-cover _ordering_column_available (F14). Fan-in hops are (sem, seg, ...) tuples; only h[1]
     # (segment_index) and the compared exec catalog matter here.
     from featuregen.overlay.upload.planner.declarations import _ordering_column_available as avail
+    # a fan-in hop is (sem, seg, ..., exec_cat, exec_table); only seg (h[1]) + the compared catalog/
+    # table matter. Signature: avail(hop_seg_idx, exec_cat, exec_table, anchor_pos, fanin_hops).
     hops = [(0, 1, None, None, None, None, "core", "public.customers")]   # one fan-in hop at seg 1
     at0 = PathPositionV1(0, "core", "public.accounts")
-    # bound, same catalog, at/before the hop, nothing grouped between → available
-    assert avail(1, "core", at0, hops) is True
-    assert avail(0, "core", PathPositionV1(0, "core", "public.accounts"), []) is True
+    # bound, same catalog, STRICTLY before the hop on the many-side, nothing grouped between → available
+    assert avail(1, "core", "public.customers", at0, hops) is True
     # no anchor on path → not available
-    assert avail(1, "core", None, hops) is False
+    assert avail(1, "core", "public.customers", None, hops) is False
+    # F14-1 (the over-approval fix): anchor on the hop's grouped OUTPUT/to-side table (seg == hop) →
+    # NOT row grain → fail closed, whether detected by segment_index equality or by table match
+    assert avail(1, "core", "public.customers",
+                 PathPositionV1(1, "core", "public.customers"), hops) is False
     # anchor in a DIFFERENT execution catalog (a bridge crossing) → fail closed
-    assert avail(1, "core", PathPositionV1(0, "crm", "public.snap"), hops) is False
+    assert avail(1, "core", "public.customers", PathPositionV1(0, "crm", "public.snap"), hops) is False
     # anchor enters AFTER this hop → not available
-    assert avail(1, "core", PathPositionV1(2, "core", "public.later"), hops) is False
+    assert avail(1, "core", "public.customers", PathPositionV1(2, "core", "public.later"), hops) is False
     # an intervening fan-in hop grouped the ordering column away before this hop → not available
     two = [(0, 1, None, None, None, None, "core", "t1"), (1, 2, None, None, None, None, "core", "t2")]
-    assert avail(2, "core", PathPositionV1(0, "core", "public.accounts"), two) is False
+    assert avail(2, "core", "t2", PathPositionV1(0, "core", "public.accounts"), two) is False
 
 
 def test_take_latest_with_bound_ordering_column_is_sound(db):
@@ -688,9 +694,9 @@ def test_take_latest_without_ordering_column_is_missing(db):
     assert stage.reason_codes == (c.ReasonCode.aggregation_ordering_column_missing,)
 
 
-def test_take_latest_ordering_column_in_other_catalog_is_missing(db):
-    # F14 fail-closed: an anchor_binding that names a column NOT on this plan's path (so it has no
-    # placement / can't be proven to reach the hop) → aggregation_ordering_column_missing.
+def test_take_latest_ordering_column_off_path_is_missing(db):
+    # F14 fail-closed: an anchor_binding that names a column NOT bound on this plan's path (so it has
+    # no placement / can't be proven to reach the hop) → aggregation_ordering_column_missing.
     _acct_core(db)
     ctx = _ctx(db, "core", agg={("r1", "balance"): c.AggregationFunction.take_latest})
     plan = _c4_plan(ctx, _binding("balance", "public.accounts.balance", concept="monetary_stock"))
@@ -699,6 +705,23 @@ def test_take_latest_ordering_column_in_other_catalog_is_missing(db):
     (stage,) = hop.ingredient_stages
     assert stage.validation is c.AggregationValidation.inputs_missing
     assert stage.reason_codes == (c.ReasonCode.aggregation_ordering_column_missing,)
+
+
+def test_take_latest_ordering_column_on_target_grain_is_missing(db):
+    # F14-1 (the over-approval fix): an anchor bound to the roll-up's TO-side (customer/target-grain)
+    # table sits AT the aggregation hop — already collapsed to one value per group, NOT row grain — so
+    # take_latest is honestly missing, never a silent latest-over-a-constant.
+    _acct_core(db)
+    ctx = _ctx(db, "core", agg={("r1", "balance"): c.AggregationFunction.take_latest})
+    plan = _c4_plan(
+        ctx, _binding("balance", "public.accounts.balance", concept="monetary_stock"),
+        _binding("asof", "public.customers.reporting_date", join_role=str(JoinRole.TIME),
+                 concept="as_of_time", temporal=str(TemporalRole.AS_OF_TIME)))
+    (hop,) = _c4_compile(ctx, plan,
+                         temporal=_temporal_anchored("public.customers.reporting_date"))
+    balance = next(s for s in hop.ingredient_stages if s.need_role == "balance")
+    assert balance.validation is c.AggregationValidation.inputs_missing
+    assert balance.reason_codes == (c.ReasonCode.aggregation_ordering_column_missing,)
 
 
 def test_declared_sum_of_a_stock_over_time_stays_incompatible(db):

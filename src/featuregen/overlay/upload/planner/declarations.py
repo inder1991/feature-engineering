@@ -448,18 +448,20 @@ def _validate_declared_inputs(
 
 
 def _ordering_column_available(
-        hop_seg_idx: int, exec_cat: str, anchor_pos: PathPositionV1 | None,
+        hop_seg_idx: int, exec_cat: str, exec_table: str, anchor_pos: PathPositionV1 | None,
         fanin_hops: Iterable[tuple[int, int, object, object, object, object, str, str]]) -> bool:
     """Is the temporal ORDERING column provably present, at ROW grain, at this fan-in hop — the
     precondition ``take_latest`` needs (F14: ``anchor_binding is not None`` alone is NOT sufficient).
-    Fail-closed — proven ONLY when the anchor is bound and on-path (``anchor_pos``), sits at/before
-    this hop IN THE SAME EXECUTION CATALOG (a bridge crossing can't be proven to carry the raw
-    column), and NO fan-in hop between the anchor's position and this hop already grouped the rows
-    (which would collapse the ordering column away). Everything else fails closed."""
+    Fail-closed — proven ONLY when the anchor is bound and on-path (``anchor_pos``), sits STRICTLY
+    BEFORE this hop IN THE SAME EXECUTION CATALOG on the many-side rows — never the hop's grouped
+    OUTPUT/to-side table (``check_connectivity`` places a to-side table AT ``hop_seg_idx``, so an
+    anchor there is already collapsed to the target grain) and never a bridge crossing — and NO
+    fan-in hop between the anchor's position and this hop already grouped the rows away. Everything
+    else fails closed."""
     if anchor_pos is None or anchor_pos.catalog_source != exec_cat:
         return False
-    if anchor_pos.segment_index > hop_seg_idx:
-        return False
+    if anchor_pos.segment_index >= hop_seg_idx or anchor_pos.table == exec_table:
+        return False    # on the hop's grouped to-side grain (or after it) — not row grain
     return not any(anchor_pos.segment_index <= h[1] < hop_seg_idx for h in fanin_hops)
 
 
@@ -578,7 +580,7 @@ def compile_aggregation(
             validation = AggregationValidation.undeclared   # can't validate an unknown fan-in
             codes.append(ReasonCode.physical_cardinality_unavailable)
         else:
-            ordering_available = _ordering_column_available(hop[1], hop[6], anchor_pos, hops)
+            ordering_available = _ordering_column_available(hop[1], hop[6], hop[7], anchor_pos, hops)
             validation, matrix_reason, missing = _validate_stage(
                 provenance.selected, declared, temporal.time_axis_aggregating,
                 b.need_role, bound_roles, ordering_available)
@@ -917,6 +919,7 @@ _AGGREGATION_BLOCKING_CODES = frozenset({
     ReasonCode.aggregation_incompatible_with_additivity,
     ReasonCode.aggregation_weight_missing,
     ReasonCode.aggregation_components_missing,
+    ReasonCode.aggregation_ordering_column_missing,
     ReasonCode.aggregation_axis_unsupported,
     ReasonCode.aggregation_composition_unsupported,
     ReasonCode.semi_additive_temporal_strategy_missing,
