@@ -136,18 +136,23 @@ def stratified_sample(units: Iterable[SampleUnit], *, seed: int, per_stratum: in
     """Partition the FRAME (selected + complete plans) into strata, DEDUP by distinct
     ``contract_input_hash`` (a repeated shape is one unit of evidence), then draw up to ``per_stratum``
     shapes from each stratum with a preserved seed. A stratum with fewer distinct shapes than
-    ``per_stratum`` is ``rare`` (insufficient evidence for its bound)."""
-    # dedup: first occurrence of each distinct shape inside the frame wins (order-independent via sort)
-    by_stratum: dict[StratumId, dict[str, SampleUnit]] = {}
+    ``per_stratum`` is ``rare`` (insufficient evidence for its bound).
+
+    Fail-closed / observable (no silent exclusion): the strata are enumerated over the PRE-FRAME
+    universe — EVERY stratum that has any population at all — so a stratum whose whole population is
+    out-of-frame (e.g. every run of that shape was budget-truncated) surfaces as an explicit
+    zero-coverage ``rare`` sample, never a silent absence that the gate would read as covered."""
+    units = list(units)
+    universe = {u.stratum for u in units}             # every OBSERVED stratum (in or out of frame)
+    by_stratum: dict[StratumId, set[str]] = {}
     for u in units:
         if not (u.is_selected and u.is_complete):
-            continue                          # outside the sampling frame
-        shapes = by_stratum.setdefault(u.stratum, {})
-        shapes.setdefault(u.contract_input_hash, u)
+            continue                                  # outside the sampling frame
+        by_stratum.setdefault(u.stratum, set()).add(u.contract_input_hash)
     strata: list[StratumSample] = []
-    for stratum in sorted(by_stratum, key=lambda s: s.key):
-        hashes = sorted(by_stratum[stratum])          # deterministic base order
-        rng = random.Random(f"{seed}:{stratum.key}")  # seed folds the stratum so draws differ per stratum
+    for stratum in sorted(universe, key=lambda s: s.key):
+        hashes = sorted(by_stratum.get(stratum, set()))   # deterministic base order ((), if 0 in-frame)
+        rng = random.Random(f"{seed}:{stratum.key}")      # seed folds the stratum so draws differ per stratum
         rng.shuffle(hashes)
         sampled = tuple(sorted(hashes[:per_stratum]))
         strata.append(StratumSample(stratum=stratum, distinct_shapes=len(hashes),
@@ -175,21 +180,25 @@ class StabilityResult:
 
 def double_compile_stable(first: Iterable[CompileVerdict],
                           second: Iterable[CompileVerdict]) -> StabilityResult:
-    """Compare two compiles of the SAME frozen fixture. A pair is checked ONLY when BOTH runs are
-    identity-comparable (``complete`` — D6/F17); a budget-truncated run is excluded. Stable iff there
-    is at least one comparable pair AND every comparable pair agrees on ``(contract_id,
-    declaration_status)``. An empty comparison is NOT stable (no evidence)."""
-    second_by_key = {v.key: v for v in second}
-    mismatched: list[str] = []
+    """Compare two compiles of the SAME frozen fixture. A verdict is comparable only when the run is
+    identity-comparable (not budget-truncated — D6/F17; the caller feeds compiled fixtures so the
+    comparison is non-vacuous). Stable iff there is at least one comparable pair AND every comparable
+    pair agrees on ``(contract_id, declaration_status)``.
+
+    Fail-closed / observable (no silent exclusion): a plan that is comparable in ONE compile but not
+    the other — dropped, added, or its status flipped to/from budget-truncated between runs — is a
+    plan-set DIVERGENCE and is flagged, never silently tolerated. An empty comparison is NOT stable
+    (no evidence)."""
+    first_by = {v.key: v for v in first}
+    second_by = {v.key: v for v in second}
+    cmp_first = {k for k, v in first_by.items() if is_identity_comparable(v.compile_status)}
+    cmp_second = {k for k, v in second_by.items() if is_identity_comparable(v.compile_status)}
+    mismatched: set[str] = cmp_first ^ cmp_second      # a comparable plan present on only one side
     compared = 0
-    for a in first:
-        b = second_by_key.get(a.key)
-        if b is None:
-            continue
-        if not (is_identity_comparable(a.compile_status) and is_identity_comparable(b.compile_status)):
-            continue                       # a truncated (incomplete) run is not comparable
+    for k in cmp_first & cmp_second:
         compared += 1
+        a, b = first_by[k], second_by[k]
         if (a.contract_id, a.declaration_status) != (b.contract_id, b.declaration_status):
-            mismatched.append(a.key)
+            mismatched.add(k)
     return StabilityResult(stable=compared > 0 and not mismatched, compared=compared,
                            mismatched_keys=tuple(sorted(mismatched)))

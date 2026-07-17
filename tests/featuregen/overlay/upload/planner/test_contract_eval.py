@@ -109,6 +109,18 @@ def test_sampler_excludes_unselected_and_incomplete_from_the_frame():
     assert stratum.distinct_shapes == 1 and stratum.sampled == ("h3",)
 
 
+def test_sampler_surfaces_a_fully_out_of_frame_stratum_as_zero_coverage():
+    # fail-closed: a stratum whose WHOLE population is out-of-frame (all incomplete) must NOT vanish —
+    # it surfaces as an explicit zero-coverage rare stratum the gate can fail on.
+    units = [_unit("h1", family="in_frame"),                              # one in-frame stratum
+             _unit("g1", family="truncated", complete=False),            # all out-of-frame
+             _unit("g2", family="truncated", complete=False)]
+    s = stratified_sample(units, seed=1, per_stratum=1)
+    truncated = next(st for st in s.strata if st.stratum.family == "truncated")
+    assert truncated.distinct_shapes == 0 and truncated.sampled == () and truncated.rare
+    assert truncated.stratum in s.rare_strata     # observable → fails the gate for that stratum
+
+
 def test_sampler_is_seeded_and_deterministic():
     units = [_unit(f"h{i}") for i in range(20)]
     a = stratified_sample(units, seed=42, per_stratum=5)
@@ -135,6 +147,18 @@ def test_double_compile_divergent_is_unstable():
     second = [_v("p1", CompileStatus.complete, "cid_DIFFERENT")]
     r = double_compile_stable(first, second)
     assert not r.stable and r.mismatched_keys == ("p1",)
+
+
+def test_double_compile_plan_set_divergence_is_unstable():
+    # fail-closed: a plan comparable in one compile but dropped from the other is a plan-set
+    # divergence, NOT a silently-tolerated stable pass.
+    first = [_v("p1", CompileStatus.complete, "cid1"), _v("p2", CompileStatus.complete, "cid2")]
+    second = [_v("p1", CompileStatus.complete, "cid1")]                 # p2 vanished
+    r = double_compile_stable(first, second)
+    assert not r.stable and r.mismatched_keys == ("p2",) and r.compared == 1
+    # symmetric: a plan ADDED in the second compile is equally a divergence
+    r2 = double_compile_stable([_v("p1", CompileStatus.complete, "cid1")], first)
+    assert not r2.stable and "p2" in r2.mismatched_keys
 
 
 def test_double_compile_empty_comparison_fails():

@@ -154,6 +154,8 @@ GOLD_CASES: tuple[GoldCase, ...] = (
 
 
 def _gold_set_hash() -> str:
+    ids = [gc.case_id for gc in GOLD_CASES]
+    assert len(ids) == len(set(ids)), "gold case_ids must be unique (hash + eval key on case_id)"
     material = [
         [c.case_id, c.description, sorted(list(m) for m in c.measures),
          sorted(f"{k[0]}|{k[1]}={v.value}" for k, v in c.agg.items()),
