@@ -320,9 +320,10 @@ def _pass_c_columns(conn, catalog_source: str, rows: list[CanonicalRow], *,
     declared row entity, else "" (empty falls back to the same-identifier-concept + corroborator
     namespace path — safe). `table_entity` is LOW-STAKES (a different table_entity alone is never
     incompatible): the table's declared grain-column entity, else the table name. Glossary sidecar
-    fields (term_name/synonyms/BIAN/FIBO leaves/domain) come from the `GlossaryRecord` matched by
-    normalized (table, column); a technical upload (glossary=None) leaves them "" — Pass C still
-    runs on name/concept/entity signals. The sidecar carries no term-type facet, so term_type=""."""
+    fields (term_name/term_type/synonyms/BIAN/FIBO leaves/domain) come from the `GlossaryRecord`
+    matched by normalized (table, column); a technical upload (glossary=None) leaves them "" — Pass C
+    still runs on name/concept/entity signals. `term_type` is supplied by the FTR glossary adapter
+    (A1) so `is_join_key_eligible` can exclude Measures; other readers leave it ""."""
     from featuregen.overlay.upload.entity import entity_of
     from featuregen.overlay.upload.passc.identifiers import ColMeta
 
@@ -352,7 +353,7 @@ def _pass_c_columns(conn, catalog_source: str, rows: list[CanonicalRow], *,
         out.append(ColMeta(
             object_ref=object_ref, table=r.table, column=r.column, data_type=r.type,
             term_name=rec.term_name if rec else "",
-            term_type="",
+            term_type=rec.term_type if rec else "",
             concept=concepts.get(content_hash(r)) or "",
             synonyms="|".join(rec.synonyms) if rec else "",
             bian_leaf=_taxonomy_leaf(rec.bian_path) if rec else "",

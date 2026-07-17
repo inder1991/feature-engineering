@@ -20,6 +20,13 @@ def test_negative_filter_fields_never_eligible():
     assert not is_join_key_eligible(_c(column="tran_amt", term_name="Transaction Amount", term_type="Measure"))
 
 
+def test_measure_term_type_alone_blocks_an_otherwise_id_like_column():
+    # The term_type gate must act on its own: "settlement_id" passes the id-suffix heuristic and
+    # "Settlement Total" trips no negative token, so ONLY term_type separates these two outcomes.
+    assert is_join_key_eligible(_c(column="settlement_id", term_name="Settlement Total", term_type="measure")) is False
+    assert is_join_key_eligible(_c(column="settlement_id", term_name="Settlement Total", term_type="dimension")) is True
+
+
 def test_word_boundary_negatives_do_not_trip_real_ids():
     # "Mandate Reference" contains substring "date"; "Corporate Account Number" contains "rate" — both are IDs
     assert is_join_key_eligible(_c(column="mandate_ref", term_name="Mandate Reference"))

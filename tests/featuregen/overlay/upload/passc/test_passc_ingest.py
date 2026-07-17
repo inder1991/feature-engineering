@@ -234,3 +234,41 @@ def test_verified_join_reprojected_after_reupload(passc_conn, monkeypatch,
     assert row[0] == "operational" and row[1] == fact_key(ref, "approved_join")
     path = find_join_path(passc_conn, "deposits", "transactions", "accounts")
     assert path is not None and len(path) == 1                   # traversable again post-confirm
+
+
+# ── 7. FTR adapter (A1): the sidecar's term_type reaches ColMeta, so Measures can't anchor joins ──
+
+class _NoGraphConn:
+    """Stub for `_pass_c_columns`' only conn use — `entity_of` runs one SELECT and needs
+    `fetchone() -> None` (no graph node); everything else in the assembly is pure."""
+
+    def execute(self, *_args):
+        return self
+
+    def fetchone(self):
+        return None
+
+
+def test_pass_c_columns_thread_glossary_term_type():
+    from featuregen.overlay.upload.ingest import _pass_c_columns
+    from featuregen.overlay.upload.passc.identifiers import is_join_key_eligible
+
+    rows = [CanonicalRow("ftr", "positions", "settlement_id", "unknown"),
+            CanonicalRow("ftr", "positions", "position_id", "unknown", is_grain=True)]
+    glossary = GlossaryUpload(rows=rows, records=[
+        GlossaryRecord(logical_ref=normalize_ref("ftr", "risk", "positions", "settlement_id"),
+                       term_name="Settlement Total", definition="The settlement total.",
+                       term_type="measure"),
+        GlossaryRecord(logical_ref=normalize_ref("ftr", "risk", "positions", "position_id"),
+                       term_name="Position Identifier", definition="The position id.",
+                       term_type="dimension")])
+
+    cols = {c.column: c for c in _pass_c_columns(
+        _NoGraphConn(), "ftr", rows, concepts=None, glossary=glossary)}
+
+    # settlement_id is id-like by suffix and its term trips no negative token — ONLY the threaded
+    # term_type keeps this glossary-declared Measure out of the join-key candidate pool.
+    assert cols["settlement_id"].term_type == "measure"
+    assert is_join_key_eligible(cols["settlement_id"]) is False
+    assert cols["position_id"].term_type == "dimension"
+    assert is_join_key_eligible(cols["position_id"]) is True
