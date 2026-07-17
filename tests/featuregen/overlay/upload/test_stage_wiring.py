@@ -117,10 +117,16 @@ def test_none_recorder_result_identical(db):
 # ── the KEY #22 case: internal per-item failures surface as partial, never "succeeded" ───────────
 
 
-def test_partial_enrichment_records_partial_not_succeeded(db):
+def test_partial_enrichment_records_partial_not_succeeded(db, monkeypatch):
     """Two columns, ONE concept classification fails inside the stage (the empty response is
     swallowed by enrich_concepts and simply omitted from its result — today's behaviour). The
-    outer ingest still succeeds; the stage report must say PARTIAL with the unresolved count."""
+    outer ingest still succeeds; the stage report must say PARTIAL with the unresolved count.
+
+    This is a SINGLE-mode assertion: per-item partial only exists on the per-column path, so pin the
+    mode (Pass A now defaults to batch, where both columns share one call, #4)."""
+    monkeypatch.setenv("OVERLAY_ENRICH_CONCEPT_MODE", "single")
+    monkeypatch.setenv("OVERLAY_ENRICH_DEFINITION_MODE", "single")
+    monkeypatch.setenv("OVERLAY_ENRICH_DOMAIN_MODE", "single")
     _seal_config()
 
     class _SecondConceptFails:

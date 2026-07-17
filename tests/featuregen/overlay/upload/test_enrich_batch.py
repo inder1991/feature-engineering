@@ -7,10 +7,19 @@ from featuregen.overlay.upload.enrich import content_hash, enrich_concepts
 from featuregen.overlay.upload.enrich_llm import audited_batch_call
 
 
-def test_mode_defaults_single_and_reads_env(monkeypatch):
-    assert cfg.mode("concept") == "single"
-    monkeypatch.setenv("OVERLAY_ENRICH_CONCEPT_MODE", "batch")
+def test_pass_a_defaults_batch_table_synth_single_and_reads_env(monkeypatch):
+    # #4: Pass A stages default to BATCH so a wide file no longer makes one sync LLM call per column
+    # under the source lock. table_synth's config entry is inert (Pass B never reads mode) and stays
+    # single. The per-task env override still wins in both directions.
+    monkeypatch.delenv("OVERLAY_ENRICH_CONCEPT_MODE", raising=False)
+    monkeypatch.delenv("OVERLAY_ENRICH_DEFINITION_MODE", raising=False)
+    monkeypatch.delenv("OVERLAY_ENRICH_DOMAIN_MODE", raising=False)
     assert cfg.mode("concept") == "batch"
+    assert cfg.mode("definition") == "batch"
+    assert cfg.mode("domain") == "batch"
+    assert cfg.mode("table_synth") == "single"
+    monkeypatch.setenv("OVERLAY_ENRICH_CONCEPT_MODE", "single")
+    assert cfg.mode("concept") == "single"
 
 
 def test_max_items_default_and_override(monkeypatch):

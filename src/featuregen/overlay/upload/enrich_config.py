@@ -1,18 +1,29 @@
-"""Rollout knobs for batched enrichment (spec C10). All default so production is unchanged:
-mode=single, conservative budgets. Batch is opt-in per task via env — the kill switch."""
+"""Rollout knobs for batched enrichment (spec C10). Budgets stay conservative; batch stays a
+per-task env override — the kill switch. Pass A enrichment (concept/definition/domain) now DEFAULTS
+to batch: a wide file was 1 LLM call per column (126 cols -> 126 sync round-trips) all under the
+same-source advisory lock (ingest.py); batch cuts concept to ~ceil(cols/40) calls, shrinking the
+lock hold (#4). Set ``OVERLAY_ENRICH_<TASK>_MODE=single`` to fall back to the per-item path.
+``table_synth`` keeps the ``single`` generic default (Pass B is batch-only and never consults
+``mode`` — its default is inert, so leaving it single avoids re-pinning the Pass B switch tests)."""
 from __future__ import annotations
 
 import os
 from dataclasses import dataclass
 
+# Per-task default execution mode. Pass A stages batch by default (#4); table_synth's entry is inert
+# (synthesize_tables never reads mode()) and stays single so the config-namespace tests are unmoved.
+_DEFAULT_MODE = {"concept": "batch", "definition": "batch", "domain": "batch",
+                 "table_synth": "single"}
 _DEFAULT_MAX_ITEMS = {"concept": 40, "definition": 12, "domain": 20, "table_synth": 8}
 _DEFAULT_MAX_INPUT_TOKENS = {"concept": 14000, "definition": 8000, "domain": 8000,
                              "table_synth": 6000}
 
 
 def mode(short: str) -> str:
-    """'single' (default, today's exact path) or 'batch'."""
-    return os.environ.get(f"OVERLAY_ENRICH_{short.upper()}_MODE", "single").strip().lower()
+    """'single' (today's per-item path) or 'batch'. Pass A tasks default to batch; ``table_synth``
+    defaults to single (see module docstring). Any task defaults to single if unlisted."""
+    return os.environ.get(f"OVERLAY_ENRICH_{short.upper()}_MODE",
+                          _DEFAULT_MODE.get(short, "single")).strip().lower()
 
 
 def max_items(short: str) -> int:

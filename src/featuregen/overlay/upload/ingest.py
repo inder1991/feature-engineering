@@ -1039,6 +1039,19 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
     # clean up). DEADLOCK SAFETY (program-audit I-3 history): acquired nowhere else in the ingest
     # path, and enrich_llm's durable-audit connection deliberately takes NO advisory lock, so no
     # second connection can wait on the key this transaction holds.
+    # LOCK-HOLD DURING ENRICHMENT (#4): the three Pass A LLM stages below run WHILE this lock is held
+    # (they are between here and build_graph). Enrichment defaults to BATCH now (enrich_config), so a
+    # wide file makes ~ceil(cols/40) concept calls instead of one-per-column — the lock hold shrinks
+    # by ~30x on a 126-col file. RELEASING the lock across the LLM calls and re-acquiring is NOT a safe
+    # small change and is deliberately NOT done: this is a transaction-scoped lock (only releases at
+    # COMMIT/ROLLBACK — you cannot unlock it mid-tx without switching to session-level advisory locks),
+    # and enrichment is NOT the tail of the ingest — facts are already asserted above and build_graph's
+    # whole-source DELETE+rebuild still runs AFTER it. A concurrent same-source ingest slipping into a
+    # release window could commit its own build_graph, then this tx's later build_graph would clobber
+    # it (last-writer-wins) with the drift snapshot/facts computed before the window now inconsistent —
+    # exactly the corruption this lock exists to prevent. A true lock-release-during-enrichment (or
+    # hoisting enrichment's side effects entirely before the lock) is a separate concurrency-design
+    # task; batch mode is the throughput mitigation for now.
     conn.execute("SELECT pg_advisory_xact_lock(%s)", (ingest_source_lock_key(catalog_source),))
     # `profile` (spec §U) makes validation profile-aware: a glossary upload's `type="unknown"` rows
     # pass, while a technical upload (or the default `profile=None`) still requires a real type. A
