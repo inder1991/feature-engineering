@@ -1,21 +1,21 @@
-"""Tests for the fail-closed free-text sanitizer (FTR adapter Task 2, round-4 resolution #2).
+"""Tests for the fail-closed free-text sanitizer (FTR adapter Task 2, round-5 resolution R5-2).
 
-The invariant under test: no raw customer sample value ever survives into ``clean``. A recognized
-``representative values such as ...`` clause is STRIPPED (safe facets preserved); the POST-strip
-residual is then judged by the VALUE-SHAPE RESIDUAL-SUSPICION GATE:
+The invariant under test: no raw customer sample value ever survives into ``clean`` — AND no
+legitimate business definition is wrongly blanked. The REAL-file run showed 100% of actual sample
+values live in the canonical ``representative values such as ...`` clause, which
+``strip_sample_values`` excises (safe facets preserved). The v2 value-shape guesser is GONE
+(R5-2): it over-blanked 41 real "sample profile has no non-blank values" definitions plus a
+payment definition with numbers, while still missing bare code-lists. What remains:
 
-* ``unhandled_marker`` — a known sample-data marker phrase survived the strip (``representative
-  values``, ``sample values/profile``, ``observed values/entries``, ``example values``) → the whole
-  definition is blanked (``suspected_unhandled``).
-* ``suspected_value_list`` — the residual carries >= 2 VALUE-SHAPED tokens (numeric run, time,
-  short code, double-quoted literal, all-caps entity run) together with a list separator (``;`` or
-  ``,`` ONLY — conjunctive ``and`` is NOT one) or a sample-context word (``values``/``entries``/
-  ``codes``/``observed``/``include``) → blanked.
+* ``strip_sample_values`` — canonical-clause excision (covers every real sample value);
+* a fail-closed DATA-marker scan on the residual — ``representative values``, ``sample values``,
+  ``observed values/entries``, ``example values`` surviving the strip means a sample clause the
+  stripper could not consume → the whole definition is blanked (``suspected_unhandled``). Bare
+  ``sample profile`` is NOT a marker (the 41 real "no non-blank values" rows must pass);
+* ``redact_free_text`` for PII — a redactor that fails closed blanks the field too.
 
-Everything else — concept prose, a single acronym, an ordinary lowercase taxonomy list, even a bare
-introducer phrase like ``such as`` — is PRESERVED (the v1 introducer whitelist both leaked
-non-whitelisted lists and over-blanked legitimate prose; the shape gate replaces it). PII in the
-surviving prose is redacted, and a redactor that fails closed blanks the field too.
+Accepted, documented tradeoff (R5-2): a bare non-canonical value list with no marker is not
+auto-caught — the real file never does this, and distinguishing it from prose is intractable.
 
 Descriptions are FTR-shaped but inline — no ``~/Downloads``.
 """
@@ -32,7 +32,20 @@ from featuregen.overlay.upload.sanitize import (
     sanitize_definition,
 )
 
-# ── Labeled corpus ────────────────────────────────────────────────────────────────────────────────
+# ── Labeled corpus (REAL-file shapes) ─────────────────────────────────────────────────────────────
+
+# The 41-row REAL case: "sample profile has no non-blank values" — SAFE prose, carries no data.
+# The v2 guesser blanked these; R5-2 says they MUST be preserved verbatim.
+_NO_NONBLANK_DESC = (
+    "Reserved regulatory adjustment bucket for future use. The sample profile has no non-blank "
+    "values, and this column is unpopulated."
+)
+
+# The canonical FTR clause with multi-word entity values — the ONE shape that carries real data.
+_CANONICAL_ENTITY_DESC = (
+    "The counterparty legal name. The sample profile is text, with representative values such as "
+    "ARTKOM GLOBAL FZE; NOQODI, which supports interpretation."
+)
 
 # RECOGNIZED clause (FTR shape): token + uniform-length all-digit values → identifier facets.
 _ACCOUNT_DESC = (
@@ -55,17 +68,10 @@ _TIME_DESC = (
     "supports interpretation of the field."
 )
 
-# RECOGNIZED clause, alphanumeric codes → text/text facets.
-_CODE_DESC = (
-    "Transaction Identifier uniquely traces the financial transaction. The sample profile is "
-    "ALPHA_NUMERIC, with representative values such as EI0300357; EI0046562; EI0061842, which "
-    "supports interpretation of the field."
-)
-
-# RECOGNIZED clause with multi-word entity values: still stripped — no raw value survives.
-_CANONICAL_ENTITY_DESC = (
-    "Counterparty legal name, with representative values such as ACME FZE; NOQODI, which supports "
-    "interpretation of the field."
+# A REAL payment definition full of numbers — the v2 guesser wiped it; it carries NO sample data
+# and MUST NOT be blanked (R5-2).
+_PAYMENT_DESC = (
+    "ISO 20022 pacs.008 settlement amounts reconciled across 103 and 202 message types."
 )
 
 # PLAIN definition: business prose only — no clause, no marker, no PII.
@@ -74,51 +80,23 @@ _PLAIN_DESC = (
     "banking system."
 )
 
-# MULTIPLE clauses: the stripper excises only the FIRST recognized clause; the second clause's raw
-# value list survives the strip and must trip the value-shape gate (fail closed — no leak).
-_MULTI_CLAUSE_DESC = (
-    "The sample profile is NUMERIC, with representative values such as 111; 222, which supports "
-    "interpretation of the field. Legacy systems show these codes differently, e.g. AB-1; CD-2."
-)
-
-# POSITIVES (resolution #2): residuals the stripper does NOT handle but that plainly carry sample
-# data — a surviving marker phrase, or a value-shaped list. All must blank the whole definition.
-_VALUES_WERE_DESC = "Postal region of the account holder; the values were 84848; 90210."
+# FAIL-CLOSED positives: a DATA-implying marker phrase survives the strip (the stripper cannot
+# consume these — no "values such as" anchor), so the whole definition blanks.
+_MARKER_RESIDUAL_DESC = "Balances observed. representative values remain embedded here"
 _OBSERVED_ENTRIES_DESC = (
     "Counterparty legal name; observed entries include ARTKOM GLOBAL FZE and NORDIC HOLDINGS AS."
 )
-_BRANCH_CODES_DESC = "Branch codes: LON01, NYC02, SGP03."
-_QUOTED_STATUSES_DESC = 'Statuses are "OPN", "CLS", "PND".'
-_TIME_CUTOFFS_DESC = "Cutoffs 15:07:08; 23:59:59 apply."
+_SAMPLE_VALUES_DESC = "Ledger bucket; sample values are retained in the appendix."
 
-# NEGATIVES (resolution #2): legitimate concept prose the v1 introducer whitelist over-blanked, plus
-# bare-word controls. All must be PRESERVED verbatim.
+# NEGATIVE controls: legitimate concept prose that must be PRESERVED verbatim — including the
+# phrases the v1 whitelist / v2 guesser used to over-blank.
 _SUCH_AS_PROSE_DESC = "Contract attributes such as tenor and rate drive the pricing model."
 _REPRESENTATIVE_OFFICE_DESC = "Flag set when the branch is a representative office in the region."
 _SAMPLE_POPULATION_DESC = "Count of accounts in the sample population size used for QA checks."
 _GDP_DESC = "Macroeconomic input holding the GDP figure for the year."
 _TAXONOMY_DESC = "Classified by party, product, account."
-_LEGAL_NAME_DESC = "Registered legal name of the counterparty."
-_FOR_EXAMPLE_PROSE_DESC = "Product tiers, For Example: gold and platinum."
-_SUCH_AS_CATEGORIES_DESC = "Categories Such As retail and corporate."
-# Title-case proper nouns are shape-indistinguishable from concept words ("tenor and rate") — the
-# gate deliberately lets them through (accepted residual risk of resolution #2).
-_EXAMPLES_INCLUDE_DESC = "Total exposure across counterparties; examples include Acme and Beta."
-# Numeric-range / year prose joined by conjunctive "and": >= 2 numeric tokens but NO ';'/',' and no
-# sample-context word — "and" is NOT a list separator (resolution #2: "semicolons or commas"), so
-# legitimate quantitative prose must be PRESERVED.
-_NUMERIC_RANGE_DESC = "Threshold applies to exposures between 100 and 500 basis points."
-_REPORTING_YEARS_DESC = "Revised for reporting periods 2019 and 2020 under Basel III."
-_FISCAL_YEARS_DESC = "Ratios computed for 2021 and 2022 fiscal reporting."
-# Possessive apostrophes are NOT quoted-value tokens: the quoted-literal pattern is DOUBLE-quote
-# only, so spans between possessive `'` marks never count as values despite the commas.
-_POSSESSIVE_LIST_DESC = (
-    "the client's ledger, the bank's records, the firm's books, the fund's assets"
-)
-
-# THRESHOLD boundary: ONE value-shaped token is below the >= 2 gate — preserved by design (a single
-# ambient token is indistinguishable from a prose reference).
-_SINGLE_CODE_DESC = "Counterparty short code, e.g. AB-01."
+# Bare "sample profile" is NOT a data marker (R5-2): this prose mention must survive.
+_SAMPLE_PROFILE_MENTION_DESC = 'Published in the "sample profile" appendix each month.'
 
 # PII-only prose: the deterministic redactor scrubs the token, the rest of the prose survives.
 _PII_DESC = "Reconciliation contact mailbox; escalations go to ops@bank.example when unresolved."
@@ -133,11 +111,47 @@ _CLAUSE_PLUS_PII_DESC = (
 # ── version ───────────────────────────────────────────────────────────────────────────────────────
 
 
-def test_sanitizer_version_bumped_for_value_shape_gate():
-    assert SANITIZER_VERSION == "ftr-sanitize-v2"
+def test_sanitizer_version_bumped_for_guesser_removal():
+    assert SANITIZER_VERSION == "ftr-sanitize-v3"
 
 
-# ── sanitize_definition: recognized clauses ───────────────────────────────────────────────────────
+# ── sanitize_definition: the 41-row real case — MUST NOT blank ────────────────────────────────────
+
+
+def test_no_nonblank_values_profile_preserved():
+    """41 of the real file's 127 definitions say "sample profile has no non-blank values" — SAFE
+    prose the v2 guesser wrongly blanked. R5-2: bare `sample profile` is not a data marker."""
+    result = sanitize_definition(_NO_NONBLANK_DESC)
+    assert result.state == "none"
+    assert result.reason == ""
+    assert result.clean == _NO_NONBLANK_DESC
+    assert result.removed == 0
+
+
+def test_payment_definition_with_numbers_not_blanked():
+    """A real payment definition full of numerics carries no sample data — the v2 token gate wiped
+    it; v3 must let it through untouched."""
+    result = sanitize_definition(_PAYMENT_DESC)
+    assert result.state in {"none", "stripped"}
+    assert result.reason == ""
+    assert result.clean == _PAYMENT_DESC
+
+
+# ── sanitize_definition: canonical clauses stripped (facets preserved) ────────────────────────────
+
+
+def test_canonical_entity_clause_stripped_with_facets():
+    """The canonical FTR clause — the ONE real shape carrying data — is excised: no raw value
+    reaches ``clean``, the business prose survives, and the safe facets are captured pre-strip."""
+    result = sanitize_definition(_CANONICAL_ENTITY_DESC)
+    assert result.state == "stripped"
+    assert result.reason == ""
+    assert "ARTKOM" not in result.clean
+    assert "NOQODI" not in result.clean
+    assert "counterparty legal name" in result.clean.lower()
+    assert result.clean  # non-empty business prose — NOT blanked
+    assert result.logical_representation == "text"
+    assert result.semantic_type == "text"
 
 
 def test_recognized_clause_stripped_with_facets():
@@ -159,27 +173,15 @@ def test_recognized_clause_stripped_with_facets():
     [
         (_AMOUNT_DESC, ("1250.00", "9.99"), "decimal", "amount"),
         (_TIME_DESC, ("15:07:08", "10:01:01", "11:00:56"), "time", "time"),
-        (_CODE_DESC, ("EI0300357", "EI0046562", "EI0061842"), "text", "text"),
     ],
 )
-def test_decimal_time_code_samples_stripped(desc, raw_values, logical, semantic):
+def test_decimal_and_time_samples_stripped(desc, raw_values, logical, semantic):
     result = sanitize_definition(desc)
     assert result.state == "stripped"
     assert result.logical_representation == logical
     assert result.semantic_type == semantic
     for value in raw_values:
         assert value not in result.clean
-
-
-def test_canonical_entity_values_stripped_no_leak():
-    """The canonical FTR clause with multi-word entity values is still handled by the stripper —
-    no raw value reaches ``clean`` and the surrounding prose is not blanked."""
-    result = sanitize_definition(_CANONICAL_ENTITY_DESC)
-    assert result.state == "stripped"
-    assert result.reason == ""
-    assert "ACME" not in result.clean
-    assert "NOQODI" not in result.clean
-    assert "Counterparty legal name" in result.clean
 
 
 # ── sanitize_definition: plain prose + preserved concept prose (negative corpus) ─────────────────
@@ -203,70 +205,39 @@ def test_plain_definition_unchanged():
         _SAMPLE_POPULATION_DESC,
         _GDP_DESC,
         _TAXONOMY_DESC,
-        _LEGAL_NAME_DESC,
-        _FOR_EXAMPLE_PROSE_DESC,
-        _SUCH_AS_CATEGORIES_DESC,
-        _EXAMPLES_INCLUDE_DESC,
-        _NUMERIC_RANGE_DESC,
-        _REPORTING_YEARS_DESC,
-        _FISCAL_YEARS_DESC,
-        _POSSESSIVE_LIST_DESC,
+        _SAMPLE_PROFILE_MENTION_DESC,
     ],
 )
 def test_concept_prose_preserved_not_blanked(desc):
-    """Resolution #2 negatives: introducer phrases, bare `sample`/`representative`, a single
-    acronym, and lowercase taxonomy lists carry no value-shaped list — they must pass through."""
+    """R5-2 negatives: introducer phrases, `a representative office`, `sample population size`,
+    a bare `sample profile` mention, acronyms, and taxonomy lists all pass through verbatim."""
     result = sanitize_definition(desc)
-    assert result.state in {"none", "stripped"}
+    assert result.state == "none"
     assert result.reason == ""
     assert result.clean == desc
 
 
-def test_single_value_token_below_threshold_preserved():
-    """The gate needs >= 2 value-shaped tokens: one ambient code is below the threshold and the
-    definition is preserved (deliberate boundary of resolution #2)."""
-    result = sanitize_definition(_SINGLE_CODE_DESC)
-    assert result.state == "none"
-    assert result.reason == ""
-    assert result.clean == _SINGLE_CODE_DESC
-
-
-# ── sanitize_definition: suspected_unhandled (value-shape residual gate, fail closed) ────────────
+# ── sanitize_definition: fail-closed data-marker scan on the residual ─────────────────────────────
 
 
 @pytest.mark.parametrize(
-    ("desc", "reason"),
+    "desc",
     [
-        (_VALUES_WERE_DESC, "suspected_value_list"),  # demonstrated leak: numeric list
-        (_OBSERVED_ENTRIES_DESC, "unhandled_marker"),  # demonstrated leak: "observed entries"
-        (_BRANCH_CODES_DESC, "suspected_value_list"),  # demonstrated leak: code list
-        (_QUOTED_STATUSES_DESC, "suspected_value_list"),  # quoted literals
-        (_TIME_CUTOFFS_DESC, "suspected_value_list"),  # semicolon-separated time list
-        ("Counterparty codes E.G. AB-01 and CD-02.", "suspected_value_list"),
-        ("Values observed, e.g., 12:30 and 13:45.", "suspected_value_list"),
-        ('Statuses (examples include "OPEN"; "CLOSED").', "suspected_value_list"),
-        # A quoted marker phrase still fails closed — mention or not, the stripper never vouched.
-        ('Published in the "sample profile" appendix each month.', "unhandled_marker"),
+        _MARKER_RESIDUAL_DESC,  # `representative values` with no "such as" anchor — strip can't consume
+        _OBSERVED_ENTRIES_DESC,  # demonstrated leak: "observed entries include ..."
+        _SAMPLE_VALUES_DESC,  # `sample values` marker
+        "Codes recorded; example values appear in legacy exports.",  # `example values` marker
     ],
 )
-def test_suspicious_residual_blanks_whole_definition(desc, reason):
+def test_surviving_data_marker_blanks_whole_definition(desc):
+    """A DATA-implying marker phrase surviving the strip means a sample clause the stripper could
+    not consume — fail closed: blank the WHOLE definition, never individual values."""
+    assert sanitize_definition(desc).clean == ""  # nothing leaks
     result = sanitize_definition(desc)
     assert result.state == "suspected_unhandled"
-    assert result.reason == reason
-    assert result.clean == ""
+    assert result.reason == "unhandled_marker"
     assert result.removed >= 1
     assert result.redaction_version is None  # nothing safe to redact — the field was blanked
-
-
-def test_multiple_clauses_residual_value_list_fails_closed():
-    """One recognized clause is excised, but a second (unrecognized) clause's value list survives
-    the strip — the residual must blank the field rather than leak `AB-1; CD-2`."""
-    result = sanitize_definition(_MULTI_CLAUSE_DESC)
-    assert result.state == "suspected_unhandled"
-    assert result.reason == "suspected_value_list"
-    assert result.clean == ""
-    assert "111" not in result.clean and "AB-1" not in result.clean
-    assert result.removed == 2  # the stripped clause + the blanked field
 
 
 # ── sanitize_definition: PII redaction ────────────────────────────────────────────────────────────
@@ -299,6 +270,7 @@ def test_redactor_fail_closed_blanks_field(monkeypatch):
     result = sanitize_definition(_PLAIN_DESC)
     assert result.clean == ""
     assert result.state == "none"
+    assert result.reason == "pii_redaction_failed"
     assert result.removed == 1  # the blanked field counts
     assert result.redaction_version == "stub-redactor@1"
 
