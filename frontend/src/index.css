@@ -3147,6 +3147,14 @@ button.gj-chip--on:hover {
   font-variant-numeric: tabular-nums;
 }
 
+/* Per-stage detail cell (#22): a compact key:value list of the stage's honest counts/flags so
+   signals like no_items_resolved / table_schema_mismatch_skipped are visible, not dropped. */
+.stage-detail {
+  font-size: 12px;
+  color: var(--ink-soft);
+  font-variant-numeric: tabular-nums;
+}
+
 /* ---------------------------------------------------------------- governance dashboard launch
    Appended for GovernanceDashboardScreen's launchpad: a scoped view renders its actionable
    counts (pending / needs attention / open tasks) as real <button class="stat"> tiles that open

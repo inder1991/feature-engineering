@@ -46,6 +46,15 @@ function fmtDuration(started: string | null, completed: string | null): string {
   return ms < 1000 ? `${ms} ms` : `${(ms / 1000).toFixed(1)} s`
 }
 
+// A stage's `detail` is a small dict of honest counts/flags (no_items_resolved, resolved/expected,
+// sanitized_clauses, definitions_suppressed, table_schema_mismatch_skipped, …). Render it as a
+// compact key:value list so those signals are visible instead of silently dropped. Values are
+// stringified defensively — a newer backend can add any JSON-scalar we haven't typed.
+function detailEntries(detail: Record<string, unknown> | null): [string, string][] {
+  if (!detail) return []
+  return Object.entries(detail).map(([k, v]) => [k, String(v)])
+}
+
 export function RunDetailPanel({ runId, onClose }: { runId: string; onClose: () => void }) {
   const [run, setRun] = useState<IngestionRun | null>(null)
   const [error, setError] = useState('')
@@ -169,23 +178,38 @@ export function RunDetailPanel({ runId, onClose }: { runId: string; onClose: () 
                   <th>Stage</th>
                   <th>State</th>
                   <th>Reason</th>
+                  <th>Detail</th>
                   <th className="num">Duration</th>
                 </tr>
               </thead>
               <tbody>
-                {run.stages.map((s, i) => (
-                  <tr key={`${s.stage}-${s.attempt}-${i}`}>
-                    <td className="mono">
-                      {s.stage}
-                      {s.attempt > 1 ? ` (attempt ${s.attempt})` : ''}
-                    </td>
-                    <td>
-                      <span className={stageChipClass(s.state)}>{label(s.state)}</span>
-                    </td>
-                    <td className="mono">{s.reason_code ?? '—'}</td>
-                    <td className="num tabular-nums">{fmtDuration(s.started_at, s.completed_at)}</td>
-                  </tr>
-                ))}
+                {run.stages.map((s, i) => {
+                  const detail = detailEntries(s.detail)
+                  return (
+                    <tr key={`${s.stage}-${s.attempt}-${i}`}>
+                      <td className="mono">
+                        {s.stage}
+                        {s.attempt > 1 ? ` (attempt ${s.attempt})` : ''}
+                      </td>
+                      <td>
+                        <span className={stageChipClass(s.state)}>{label(s.state)}</span>
+                      </td>
+                      <td className="mono">{s.reason_code ?? '—'}</td>
+                      <td className="mono stage-detail">
+                        {detail.length === 0
+                          ? '—'
+                          : detail.map(([k, v]) => (
+                              <div key={k}>
+                                {k}: {v}
+                              </div>
+                            ))}
+                      </td>
+                      <td className="num tabular-nums">
+                        {fmtDuration(s.started_at, s.completed_at)}
+                      </td>
+                    </tr>
+                  )
+                })}
               </tbody>
             </table>
           )}

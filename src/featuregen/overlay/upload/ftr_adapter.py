@@ -105,6 +105,10 @@ _MAX_SQL_TYPE_LEN = 64
 # length-bounded (resolution #7's ≤32 — bounding AFTER redaction so truncation cannot split a PII
 # token back into an unrecognizable, unredacted fragment).
 _REASON_VALUE_BOUND = 32
+# The unresolvable-FQN reason echoes the raw physical FQN UNREDACTED (it is structural identity the
+# uploader must see to fix the file, not free-text PII) — but still BOUNDED so a pathologically long
+# cell cannot bloat the durable quarantine row. Truncated values get a trailing ellipsis.
+_MAX_FQN_LEN = 200
 
 
 @dataclass(frozen=True)
@@ -191,6 +195,13 @@ def _reason_value(raw: str) -> str:
     length-bound (resolution #7)."""
     clean, _ = redact_text(raw)
     return clean[:_REASON_VALUE_BOUND]
+
+
+def _bounded_fqn(raw_fqn: str) -> str:
+    """Cap the raw physical FQN echoed in the unresolvable-FQN quarantine reason to ``_MAX_FQN_LEN``
+    (structural identity — bounded, not redacted) so a pathologically long cell cannot bloat the
+    durable ``quarantine_row.raw``. A truncated value gets a trailing ellipsis."""
+    return raw_fqn if len(raw_fqn) <= _MAX_FQN_LEN else raw_fqn[:_MAX_FQN_LEN] + "…"
 
 
 @dataclass(frozen=True, slots=True)
@@ -355,12 +366,13 @@ def read_ftr_glossary(text: str, *, source: str) -> PreparedFtrUpload:
             # R5-7: an unresolvable FQN quarantines HERE, adapter-tagged, instead of dropping to an
             # identity-less row for validate_rows (which was untagged — inline-repairable — and
             # silently LOST the row's term/domain/taxonomy/term_type/schema/declared_type sidecar).
-            # The reason carries the raw physical FQN deliberately unredacted and unbounded — it is
-            # the physical identifier the uploader must see to fix the file — while the record
-            # fields it echoes (term_name/domain redacted in Pass 1; term_type redacted here) obey
-            # the persistence controls, and the row carries only the SANITIZED definition.
+            # The reason carries the raw physical FQN deliberately unredacted (it is the physical
+            # identifier the uploader must see to fix the file) but length-BOUNDED (_bounded_fqn) so
+            # a pathologically long cell cannot bloat the durable row — while the record fields it
+            # echoes (term_name/domain redacted in Pass 1; term_type redacted here) obey the
+            # persistence controls, and the row carries only the SANITIZED definition.
             pending.append((
-                f"unresolvable FQN {r.physical_fqn!r} — term={r.term_name!r} "
+                f"unresolvable FQN {_bounded_fqn(r.physical_fqn)!r} — term={r.term_name!r} "
                 f"type={_redact(r.term_type_raw, count=False)!r} domain={r.domain!r} "
                 f"source_row={r.source_row}; fix the FQN and re-upload",
                 _quarantine_row(r)))

@@ -822,7 +822,7 @@ def _project_semantic_terms(conn, *, source: str, object_ref: str, rec: Glossary
 def _ingest_glossary_evidence(conn, *, source: str, rows: list[CanonicalRow],
                               glossary: GlossaryUpload, bindings: dict[str, ObjectBinding],
                               concepts: dict[str, str] | None, snapshot_id: str,
-                              now: datetime | None) -> int:
+                              now: datetime | None, stats: dict | None = None) -> int:
     """Attach the glossary's per-field evidence (source / parser / taxonomy), flag human-confirmation
     revalidation on a material change, project ``semantic_terms`` into search (Task 8), then
     resolve-and-project + a readiness diagnostic (spec §6.3).
@@ -841,7 +841,10 @@ def _ingest_glossary_evidence(conn, *, source: str, rows: list[CanonicalRow],
 
     Returns the number of CONTAINED failures (per-column evidence/revalidation writes + the
     resolve/project pass; not the log-only readiness diagnostic) so the caller's stage report can
-    say ``partial`` instead of laundering them under an outer success (#22)."""
+    say ``partial`` instead of laundering them under an outer success (#22). A ``stats`` dict, when
+    passed, threads out non-failure counts the stage detail should SURFACE — currently
+    ``table_schema_mismatch_skipped`` (a table term skipped because its schema disagrees with its
+    columns'): visible in the run manifest, but not a failure (the upload still succeeds)."""
     contained_failures = 0
     rows_by_tc = {(_lc(r.table), _lc(r.column)): r for r in rows}
     attachable_refs: list[str] = []
@@ -937,10 +940,15 @@ def _ingest_glossary_evidence(conn, *, source: str, rows: list[CanonicalRow],
         if declared and declared != {schema}:
             # #5 tail: the columns are authoritative for the schema — attaching the table term's
             # evidence under a disagreeing identity would split one physical table across two refs.
+            # Not a failure (the upload still succeeds), but the skip is surfaced in the stage
+            # detail via `stats` so a reviewer can see the table evidence was dropped.
             logger.warning(
                 "glossary table term %s declares schema %r but its columns declare %s — columns "
                 "are authoritative; table evidence skipped", rec.logical_ref, schema,
                 sorted(declared))
+            if stats is not None:
+                stats["table_schema_mismatch_skipped"] = (
+                    stats.get("table_schema_mismatch_skipped", 0) + 1)
             continue
         material_changed = False
         try:
@@ -1454,15 +1462,25 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
         # stray failure a warning rather than a rollback of the already-committed facts + graph.
         stage_started = datetime.now(UTC)
         try:
+            glossary_stats: dict = {}
             contained = _ingest_glossary_evidence(
                 conn, source=catalog_source, rows=vr.good, glossary=glossary,
-                bindings=bindings, concepts=concepts, snapshot_id=snapshot_id, now=now)
+                bindings=bindings, concepts=concepts, snapshot_id=snapshot_id, now=now,
+                stats=glossary_stats)
             # The helper CONTAINS per-column failures (savepoint + warning); `partial` surfaces
-            # them instead of laundering the outer no-raise as success (#22).
+            # them instead of laundering the outer no-raise as success (#22). A table-term schema
+            # mismatch is NOT a failure (the upload still succeeds) but IS surfaced in the detail so
+            # a reviewer can see the table evidence was skipped rather than it vanishing to a log.
+            skipped = glossary_stats.get("table_schema_mismatch_skipped", 0)
+            detail: dict = {}
+            if contained:
+                detail["contained_failures"] = contained
+            if skipped:
+                detail["table_schema_mismatch_skipped"] = skipped
             record_stage(stage_recorder, "glossary_evidence",
                          "partial" if contained else "succeeded",
                          reason_code="items_failed" if contained else None,
-                         detail={"contained_failures": contained} if contained else None,
+                         detail=detail or None,
                          started_at=stage_started)
         except Exception:  # noqa: BLE001
             logger.warning("advisory glossary evidence wiring failed for %r — facts + graph intact",

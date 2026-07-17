@@ -29,6 +29,7 @@ from featuregen.overlay.upload.canonical import UNKNOWN_TYPE
 from featuregen.overlay.upload.ftr_adapter import read_ftr_glossary, to_glossary_upload
 from featuregen.overlay.upload.ingest import ingest_upload
 from featuregen.overlay.upload.search import search
+from featuregen.overlay.upload.stage_report import StageRecorder
 
 _SOURCE = "ftr"
 _COL_REF = "public.comp_fin_tran.cust_name"
@@ -52,10 +53,10 @@ def _seal() -> None:
         profiler_require_restricted_role=False))
 
 
-def _ingest(db, csv_text: str):
+def _ingest(db, csv_text: str, *, recorder: StageRecorder | None = None):
     upload = to_glossary_upload(read_ftr_glossary(csv_text, source=_SOURCE))
     return ingest_upload(db, _SOURCE, upload.rows, actor=_actor(), now=NOW, client=None,
-                         glossary=upload)
+                         glossary=upload, stage_recorder=recorder)
 
 
 def _node(db, object_ref: str, *cols):
@@ -186,12 +187,20 @@ def test_table_term_schema_disagreement_skips_table_evidence(db):
     disagreeing = _FTR_CSV.replace("DPL_EIB_COMPLIANCE.COMP_FIN_TRAN,Financial",
                                    "OTHER_SCHEMA.COMP_FIN_TRAN,Financial")
     assert disagreeing != _FTR_CSV                     # the table row really was rewritten
-    assert _ingest(db, disagreeing).status == "ingested"
+    recorder = StageRecorder()
+    assert _ingest(db, disagreeing, recorder=recorder).status == "ingested"
 
     assert _node(db, _TABLE_REF, "definition") == (None,)
     assert db.execute(
         "SELECT count(*) FROM field_evidence WHERE logical_ref = %s",
         ("ftr::other_schema.comp_fin_tran",)).fetchone() == (0,)
+
+    # The skip is not a failure (the upload still ingested) but it MUST be visible in the run
+    # manifest: the glossary_evidence stage detail carries the skip count so a reviewer can see the
+    # table evidence was dropped rather than it vanishing to a log line alone.
+    evidence = next(r for r in recorder.reports if r.stage == "glossary_evidence")
+    assert evidence.detail is not None
+    assert evidence.detail.get("table_schema_mismatch_skipped") == 1
 
 
 # ── Task 8: glossary semantics reach full-text search via semantic_terms ─────────────────────────

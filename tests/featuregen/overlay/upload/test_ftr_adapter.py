@@ -342,6 +342,20 @@ def test_unresolvable_fqn_quarantine_row_carries_sanitized_definition_not_raw():
     assert "Customer account number" in q.row.definition
 
 
+def test_unresolvable_long_fqn_reason_is_length_bounded():
+    # A pathologically long (unresolvable, no-dots) FQN cell must NOT bloat the durable quarantine
+    # reason: the FQN is structural identity (bounded, not redacted) — capped with an ellipsis.
+    long_fqn = "x" * 5000
+    csv_text = _HDR + _row(fqn=long_fqn)
+    p = read_ftr_glossary(csv_text, source="ftr")
+    assert len(p.quarantined) == 1
+    q = p.quarantined[0]
+    assert long_fqn not in q.message                          # the full 5000-char cell is NOT echoed
+    assert "…" in q.message                                   # truncation is visible
+    assert "x" * 200 in q.message                             # the bounded prefix survives
+    assert len(q.message) < 400                               # the reason stays sanely bounded
+
+
 # ── Structural mirrors of read_glossary ──────────────────────────────────────────────────────────
 
 def test_multi_schema_fold_collision_quarantines_both_rows():

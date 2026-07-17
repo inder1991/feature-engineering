@@ -99,6 +99,32 @@ describe('RunDetailPanel', () => {
     expect(within(rows[3]).getByText('disabled')).not.toHaveClass('stage-warn')
   })
 
+  // #22: a stage's `detail` payload (honest counts/flags) must render, not drop — a reviewer
+  // needs to see no_items_resolved / resolved-vs-expected / table_schema_mismatch_skipped.
+  it('renders each stage detail as a compact key:value list', async () => {
+    getIngestionRun.mockResolvedValue({
+      ...RUN,
+      stages: [
+        stage('pass_b', 'partial', {
+          reason_code: 'no_items_resolved',
+          detail: { no_items_resolved: true, resolved: 64, expected: 126 },
+        }),
+        stage('glossary_evidence', 'succeeded', {
+          detail: { table_schema_mismatch_skipped: 1 },
+        }),
+        stage('parse', 'succeeded'), // detail: null → renders a placeholder, never blank
+      ],
+    })
+    render(<RunDetailPanel runId="run-9" onClose={() => {}} />)
+    const rows = within(await screen.findByRole('table')).getAllByRole('row').slice(1)
+    expect(rows[0]).toHaveTextContent('no_items_resolved: true')
+    expect(rows[0]).toHaveTextContent('resolved: 64')
+    expect(rows[0]).toHaveTextContent('expected: 126')
+    expect(rows[1]).toHaveTextContent('table_schema_mismatch_skipped: 1')
+    // A detail-less stage shows the em dash, never an empty cell.
+    expect(rows[2]).toHaveTextContent('—')
+  })
+
   // #15 (A1-minimal): row_count is a parsed-row count, not an asserted-fact count — an FTR
   // upload with no grain/as-of asserts 0 facts while row_count is 126, so "126 asserted" on a
   // fully-rejected run was a lie. The label must say "rows"; the full count model is A2.

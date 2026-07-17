@@ -1,0 +1,75 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: backend-config
+  namespace: featuregen
+data:
+  FEATUREGEN_DSN: "postgresql://postgres:postgres@postgres:5432/featuregen"
+  FEATUREGEN_AUDIT_HMAC_KEY: "local-dev-not-a-real-secret"
+  # Dev auth stub: routes read X-User / X-Roles headers instead of a real session.
+  FEATUREGEN_AUTH_STUB: "1"
+  # Belt-and-braces: the initContainer already migrates; the app also auto-applies on boot (idempotent).
+  FEATUREGEN_AUTO_MIGRATE: "1"
+  # Pass C — deterministic governed join DISCOVERY (implies governed-join routing for declared joins).
+  # Declared/discovered joins become approved_join PROPOSALS awaiting two distinct platform-admins in
+  # the Governance review screen. (No ANTHROPIC_API_KEY here — see the note on OVERLAY_TABLE_SYNTH.)
+  OVERLAY_PASS_C: "1"
+  # Pass B — governed table synthesis (grain/availability as PROPOSED-only, human-gated facts). The
+  # two-phase wide-table fix now handles the 126-column table. Like concept enrichment, Pass B only
+  # actually runs when an LLM provider is configured; this env has NO provider key, so the flag
+  # readies Pass B but it stays inert (skipped_no_client) until an ANTHROPIC_API_KEY is added.
+  OVERLAY_TABLE_SYNTH: "1"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend
+  namespace: featuregen
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: backend
+  template:
+    metadata:
+      labels:
+        app: backend
+    spec:
+      initContainers:
+        # Wait for Postgres and apply migrations before the app serves (retry until the DB is up).
+        - name: migrate
+          image: featuregen-backend:local
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            - configMapRef: { name: backend-config }
+          command:
+            - sh
+            - -c
+            - "until python -m featuregen migrate; do echo 'waiting for postgres...'; sleep 3; done"
+      containers:
+        - name: backend
+          image: featuregen-backend:local
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            - configMapRef: { name: backend-config }
+          ports:
+            - containerPort: 8000
+          readinessProbe:
+            httpGet: { path: /health, port: 8000 }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /health, port: 8000 }
+            initialDelaySeconds: 15
+            periodSeconds: 20
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend
+  namespace: featuregen
+spec:
+  selector:
+    app: backend
+  ports:
+    - { port: 8000, targetPort: 8000 }
