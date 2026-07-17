@@ -25,6 +25,7 @@ from featuregen.overlay.field_evidence import read_active_field_evidence
 from featuregen.overlay.upload.canonical import UNKNOWN_TYPE
 from featuregen.overlay.upload.ftr_adapter import read_ftr_glossary, to_glossary_upload
 from featuregen.overlay.upload.ingest import ingest_upload
+from featuregen.overlay.upload.search import search
 
 _SOURCE = "ftr"
 _COL_REF = "public.comp_fin_tran.cust_name"
@@ -159,3 +160,49 @@ def test_table_term_schema_disagreement_skips_table_evidence(db):
     assert db.execute(
         "SELECT count(*) FROM field_evidence WHERE logical_ref = %s",
         ("ftr::other_schema.comp_fin_tran",)).fetchone() == (0,)
+
+
+# ── Task 8: glossary semantics reach full-text search via semantic_terms ─────────────────────────
+# CUST_NAME's synonym "Account Holder" and its BIAN level "Identification" appear ONLY in the
+# glossary sidecar — never in the column name or definition — so a hit proves the semantic_terms
+# slot is populated AND indexed (search_doc rebuilt after the projection).
+
+def test_search_finds_column_by_synonym(db):
+    _seal()
+    assert _ingest(db, _FTR_CSV).status == "ingested"
+
+    hits = search(db, "Account Holder", now=NOW, roles=["catalog_viewer"]).hits
+    assert any(h.object_ref == _COL_REF and h.catalog_source == _SOURCE for h in hits)
+
+
+def test_search_finds_by_bian_path(db):
+    _seal()
+    assert _ingest(db, _FTR_CSV).status == "ingested"
+
+    # "Identification" is BIAN level 3 for CUST_NAME (bian_path), nowhere else in the fixture.
+    hits = search(db, "Identification", now=NOW, roles=["catalog_viewer"]).hits
+    assert any(h.object_ref == _COL_REF and h.catalog_source == _SOURCE for h in hits)
+
+
+def test_search_finds_table_by_term(db):
+    _seal()
+    assert _ingest(db, _FTR_CSV).status == "ingested"
+
+    # "Financial" appears only in the TABLE term "Financial Transaction Repository" — not in the
+    # table name (comp_fin_tran) or its projected definition — so the TABLE node's semantic_terms
+    # must be populated too (round-4 #8).
+    hits = search(db, "Financial", now=NOW, roles=["catalog_viewer"]).hits
+    assert any(h.object_ref == _TABLE_REF and h.kind == "table" and h.catalog_source == _SOURCE
+               for h in hits)
+
+
+def test_semantic_terms_column_populated(db):
+    _seal()
+    assert _ingest(db, _FTR_CSV).status == "ingested"
+
+    # The raw projection column (tsvector-agnostic): non-empty and carrying the synonym verbatim.
+    row = _node(db, _COL_REF, "semantic_terms")
+    assert row is not None
+    (semantic_terms,) = row
+    assert semantic_terms
+    assert "account holder" in semantic_terms.lower()

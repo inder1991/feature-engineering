@@ -40,15 +40,17 @@ from featuregen.overlay.upload.enrich import (
 from featuregen.overlay.upload.enrich_llm import consume_audit_degradations
 from featuregen.overlay.upload.field_resolution import FIELD_POLICY_VERSION, resolve_and_project
 from featuregen.overlay.upload.field_revalidation import flag_pending_revalidation
-from featuregen.overlay.upload.glossary_reader import GlossaryRecord, GlossaryUpload
+from featuregen.overlay.upload.glossary_reader import GlossaryRecord, GlossaryUpload, join_path
 from featuregen.overlay.upload.graph import (
     _column_ref,
+    _table_ref,
     add_column_row,
     build_graph,
     declared_type_by_ref,
     governed_join_proposal,
     governed_joins_enabled,
     parse_join_ref,
+    rebuild_search_doc,
     schema_by_ref,
 )
 from featuregen.overlay.upload.ingestion_run import record_run_facts, record_run_objects
@@ -60,6 +62,7 @@ from featuregen.overlay.upload.passc.projection import (
 )
 from featuregen.overlay.upload.readiness import ReadinessScopeType, compute_readiness
 from featuregen.overlay.upload.review_queue import persist_quarantine
+from featuregen.overlay.upload.sanitize import redact_text
 from featuregen.overlay.upload.source_profile import (
     FTR_GLOSSARY_PROFILE,
     SourceCapabilityProfile,
@@ -758,12 +761,38 @@ def _flag_human_confirmed_revalidation(conn, *, logical_ref: str, snapshot_id: s
         )
 
 
+def _project_semantic_terms(conn, *, source: str, object_ref: str, rec: GlossaryRecord) -> None:
+    """Project the record's semantic text — term name, synonyms, BIAN/FIBO/process paths, related
+    terms — onto the graph node's ``semantic_terms`` and rebuild its ``search_doc`` (Task 8), so a
+    search for a business synonym or a taxonomy token finds the column/table.
+
+    ``semantic_terms`` is a SEARCH-PROJECTION column (index material, like ``search_doc`` itself),
+    NOT an evidence-resolved authority field, so a direct UPDATE is correct here — contrast
+    definition/domain, which must flow through ``resolve_and_project``. Re-redacted via
+    ``redact_text`` as defense-in-depth: the FTR adapter already redacted every field at parse time
+    (idempotent there), but this also covers any generic path that reaches here unredacted. An
+    empty/blanked result leaves the node's freshly-inserted NULL. ``rebuild_search_doc`` is called
+    EXPLICITLY because ``resolve_and_project``'s ``_project_display`` rebuild is conditional on a
+    doc-bearing display column changing — this ref might otherwise keep a doc without the terms."""
+    text = join_path(
+        [rec.term_name, *rec.synonyms, rec.bian_path, rec.fibo_path, rec.process_path,
+         *rec.related_terms], sep=" ")
+    clean, _redaction_version = redact_text(text)
+    if not clean:
+        return
+    conn.execute(
+        "UPDATE graph_node SET semantic_terms = %s WHERE catalog_source = %s AND object_ref = %s",
+        (clean, source, object_ref))
+    rebuild_search_doc(conn, source, object_ref)
+
+
 def _ingest_glossary_evidence(conn, *, source: str, rows: list[CanonicalRow],
                               glossary: GlossaryUpload, bindings: dict[str, ObjectBinding],
                               concepts: dict[str, str] | None, snapshot_id: str,
                               now: datetime | None) -> int:
     """Attach the glossary's per-field evidence (source / parser / taxonomy), flag human-confirmation
-    revalidation on a material change, then resolve-and-project + a readiness diagnostic (spec §6.3).
+    revalidation on a material change, project ``semantic_terms`` into search (Task 8), then
+    resolve-and-project + a readiness diagnostic (spec §6.3).
 
     GUARDED to ATTACHABLE columns only (Task-2 ``may_attach`` binding). Every stage is savepointed and
     fail-soft by the failure-class table: a per-column / per-stage failure logs a warning and is
@@ -840,6 +869,14 @@ def _ingest_glossary_evidence(conn, *, source: str, rows: list[CanonicalRow],
                 contained_failures += 1
                 logger.warning("advisory revalidation flag failed for %s", logical_ref,
                                exc_info=True)
+        try:
+            with conn.transaction():
+                _project_semantic_terms(
+                    conn, source=source, object_ref=_column_ref(table, column), rec=rec)
+        except Exception:  # noqa: BLE001 — search projection failure: warn + continue (facts intact)
+            contained_failures += 1
+            logger.warning("advisory semantic_terms projection failed for %s", logical_ref,
+                           exc_info=True)
         attachable_refs.append(logical_ref)
 
     # Dedicated TABLE-term pass (see docstring): mirror the column loop's savepointed, fail-soft
@@ -890,6 +927,14 @@ def _ingest_glossary_evidence(conn, *, source: str, rows: list[CanonicalRow],
                 contained_failures += 1
                 logger.warning("advisory revalidation flag failed for %s", rec.logical_ref,
                                exc_info=True)
+        try:
+            with conn.transaction():
+                _project_semantic_terms(
+                    conn, source=source, object_ref=_table_ref(table), rec=rec)
+        except Exception:  # noqa: BLE001 — search projection failure: warn + continue (facts intact)
+            contained_failures += 1
+            logger.warning("advisory semantic_terms projection failed for %s", rec.logical_ref,
+                           exc_info=True)
         attachable_refs.append(rec.logical_ref)
 
     if not attachable_refs:

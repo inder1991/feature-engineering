@@ -92,30 +92,36 @@ def governed_join_proposal(row: CanonicalRow) -> ApprovedJoinRef | None:
         column_pairs=(ColumnPair(row.column, parsed.to_col),),
         cardinality=row.cardinality or "N:1")
 
-# Weighted tsvector: column name (A) > definition (B) > table/concept/domain (C). The ONE definition
-# of the search_doc expression (#20) — the build_graph/add_column_row INSERTs and rebuild_search_doc
-# all render it, with the inputs _search_doc_params derives. Never copy these weights elsewhere.
+# Weighted tsvector: column name (A) > definition (B) > table/concept/domain/semantics (C). The ONE
+# definition of the search_doc expression (#20) — the build_graph/add_column_row INSERTs and
+# rebuild_search_doc all render it, with the inputs _search_doc_params derives. Never copy these
+# weights elsewhere.
 _SEARCH_DOC = (
     "setweight(to_tsvector('english', coalesce(%s, '')), 'A') || "   # column name
     "setweight(to_tsvector('english', coalesce(%s, '')), 'B') || "   # definition
     "setweight(to_tsvector('english', coalesce(%s, '')), 'C') || "   # table name
     "setweight(to_tsvector('english', coalesce(%s, '')), 'C') || "   # concept
-    "setweight(to_tsvector('english', coalesce(%s, '')), 'C')"       # domain
+    "setweight(to_tsvector('english', coalesce(%s, '')), 'C') || "   # domain
+    "setweight(to_tsvector('english', coalesce(%s, '')), 'C')"       # semantic_terms (glossary)
 )
 
 
 def _search_doc_params(kind: str, table: str | None, column: str | None, definition: str | None,
-                       concept: str | None, domain: str | None,
-                       entity: str | None) -> tuple[str | None, str, str | None, str, str]:
-    """The five ``_SEARCH_DOC`` inputs — name(A), definition(B), table(C), concept(C),
-    domain+entity(C) — derived from a node's field values. Shared by the insert paths AND
-    :func:`rebuild_search_doc` (#20), so an insert-time doc and a rebuilt doc can never disagree on
-    what feeds which weight. A table node's "name" slot is its table name; a column node's concept is
-    indexed HUMANIZED (``monetary_stock`` -> ``monetary stock``) and its entity rides the domain slot."""
+                       concept: str | None, domain: str | None, entity: str | None,
+                       semantic_terms: str | None) -> tuple[str | None, str, str | None, str, str,
+                                                            str]:
+    """The six ``_SEARCH_DOC`` inputs — name(A), definition(B), table(C), concept(C),
+    domain+entity(C), semantic_terms(C) — derived from a node's field values. Shared by the insert
+    paths AND :func:`rebuild_search_doc` (#20), so an insert-time doc and a rebuilt doc can never
+    disagree on what feeds which weight. A table node's "name" slot is its table name; a column
+    node's concept is indexed HUMANIZED (``monetary_stock`` -> ``monetary stock``) and its entity
+    rides the domain slot. ``semantic_terms`` is the glossary-projected term/synonym/taxonomy text
+    (Task 8) — NULL for technical/generic nodes (the INSERT sites pass None; only the glossary
+    projection populates it, after which the doc is rebuilt)."""
     if kind == "table":
-        return (table, "", table, "", domain or "")
+        return (table, "", table, "", domain or "", semantic_terms or "")
     return (column, definition or "", table, humanize(concept) if concept else "",
-            (domain or "") + " " + (entity or ""))
+            (domain or "") + " " + (entity or ""), semantic_terms or "")
 
 
 def rebuild_search_doc(conn, catalog_source: str, object_ref: str) -> None:
@@ -126,14 +132,16 @@ def rebuild_search_doc(conn, catalog_source: str, object_ref: str) -> None:
     Case-insensitive on object_ref so field_resolution's lowercased projection key reaches the same
     row its UPDATE matched. A ref matching no node is a no-op."""
     rows = conn.execute(
-        "SELECT object_ref, kind, table_name, column_name, definition, concept, domain, entity "
+        "SELECT object_ref, kind, table_name, column_name, definition, concept, domain, entity, "
+        "semantic_terms "
         "FROM graph_node WHERE catalog_source = %s AND lower(object_ref) = lower(%s)",
         (catalog_source, object_ref)).fetchall()
-    for ref, kind, table, column, definition, concept, domain, entity in rows:
+    for ref, kind, table, column, definition, concept, domain, entity, semantic_terms in rows:
         conn.execute(
             f"UPDATE graph_node SET search_doc = {_SEARCH_DOC} "
             "WHERE catalog_source = %s AND object_ref = %s",
-            (*_search_doc_params(kind, table, column, definition, concept, domain, entity),
+            (*_search_doc_params(kind, table, column, definition, concept, domain, entity,
+                                 semantic_terms),
              catalog_source, ref))
 
 
@@ -230,7 +238,7 @@ def build_graph(conn, catalog_source: str, rows: list[CanonicalRow],
             f"VALUES (%s, %s, 'table', %s, NULL, NULL, NULL, false, false, NULL, %s, %s, "
             f"{_SEARCH_DOC})",
             (catalog_source, t_ref, table, domain, schemas.get(t_ref),
-             *_search_doc_params("table", table, None, None, None, domain, None)))
+             *_search_doc_params("table", table, None, None, None, domain, None, None)))
 
     for r in rows:
         c_ref = _column_ref(r.table, r.column)
@@ -249,7 +257,7 @@ def build_graph(conn, catalog_source: str, rows: list[CanonicalRow],
              r.additivity or None, r.unit or None, r.currency or None, r.entity or None,
              schemas.get(c_ref), declared_types.get(c_ref),
              *_search_doc_params("column", r.table, r.column, definition, concept, domain,
-                                 r.entity or None)))
+                                 r.entity or None, None)))
         conn.execute(
             "INSERT INTO graph_edge (catalog_source, kind, from_ref, to_ref) "
             "VALUES (%s, 'contains', %s, %s) ON CONFLICT DO NOTHING",
@@ -297,7 +305,7 @@ def add_column_row(conn, catalog_source: str, r: CanonicalRow, *,
         f"VALUES (%s, %s, 'table', %s, NULL, NULL, NULL, false, false, NULL, NULL, %s, {_SEARCH_DOC}) "
         "ON CONFLICT DO NOTHING",
         (catalog_source, t_ref, r.table, attested_at,
-         *_search_doc_params("table", r.table, None, None, None, None, None)))
+         *_search_doc_params("table", r.table, None, None, None, None, None, None)))
     c_ref = _column_ref(r.table, r.column)
     definition = r.definition or None
     conn.execute(
@@ -308,7 +316,8 @@ def add_column_row(conn, catalog_source: str, r: CanonicalRow, *,
         (catalog_source, c_ref, r.table, r.column, r.type, definition, r.is_grain, r.as_of,
          r.sensitivity or None, r.additivity or None, r.unit or None, r.currency or None,
          r.entity or None, attested_at,
-         *_search_doc_params("column", r.table, r.column, definition, None, None, r.entity or None)))
+         *_search_doc_params("column", r.table, r.column, definition, None, None, r.entity or None,
+                             None)))
     conn.execute(
         "INSERT INTO graph_edge (catalog_source, kind, from_ref, to_ref) "
         "VALUES (%s, 'contains', %s, %s) ON CONFLICT DO NOTHING", (catalog_source, t_ref, c_ref))
