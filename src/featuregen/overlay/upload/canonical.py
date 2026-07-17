@@ -62,6 +62,11 @@ class CanonicalRow:
     # cell fault must neither raise in the reader (that 400s the WHOLE upload, unlike an enum typo,
     # which only quarantines its row) nor silently coerce (the original #18 finding).
     parse_error: str = ""
+    # NOT catalog metadata: the source file's own row id (FTR `source_row`), carried for quarantine
+    # provenance/repair. Defaulted so every existing reader/constructor keeps working; only the FTR
+    # adapter stamps it. Deliberately NOT part of `_material` — provenance never makes two rows for
+    # one column "conflicting metadata".
+    source_row: str = ""
 
 
 @dataclass(frozen=True, slots=True)

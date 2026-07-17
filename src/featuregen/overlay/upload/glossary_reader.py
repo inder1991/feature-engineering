@@ -80,6 +80,10 @@ class GlossaryRecord:
     related_terms: tuple[str, ...] = ()
     schema: str = ""                  # real (pre-flatten) schema segment of the declared FQN
     physical_fqn: str = ""            # the raw schema.table.column as declared in the file
+    # The FTR-declared SQL type, retained as NON-operational metadata (round-4 resolution #1): the
+    # operational `CanonicalRow.type` stays UNKNOWN_TYPE under the FTR adapter (a business glossary
+    # is not the physical-type authority). Validated + bounded by the adapter (resolution #3).
+    declared_type: str = ""
     # SAFE parser facets derived from a recognized sample clause (never the raw sample values) —
     # populated by the sanitizer, preserved as parser evidence in a later task.
     logical_representation: str = ""
