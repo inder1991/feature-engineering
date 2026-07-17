@@ -10,6 +10,9 @@ Contracts under test (round-4 resolutions #6/#9/#10):
   and ``resolve_quarantine_row`` refuses inline resolution for them (#9): the sidecar
   (schema/term_type/taxonomy/facets) cannot be reconstructed from a repaired CanonicalRow, so the
   only durable fix is re-uploading the corrected FTR file.
+- The quarantine surface is SAMPLE-SAFE against a row that genuinely carried a sample (whole-branch
+  M4): a row whose definition holds a recognized sample clause AND which quarantines for a
+  NON-definition reason persists only the SANITIZED definition in ``quarantine_row.raw``.
 
 Fixture strings mirror tests/featuregen/overlay/upload/test_ftr_adapter.py (inline, never read
 from ~/Downloads).
@@ -48,6 +51,18 @@ _FTR_CSV_BAD_TERM_TYPE = _FTR_CSV + (
 # Near-FTR (#10): the distinctive schema.table.column header is present, but one header is renamed
 # (term_name -> business_name), so the multiset is not the exact FTR layout -> HTTP 400.
 _NEAR_FTR_CSV = _FTR_CSV.replace("term_name,", "business_name,", 1)
+
+# Whole-branch M4: a row that BOTH carries a RECOGNIZED sample clause in its definition (synthetic
+# scrub token ARTKOM — never a real value; the clause shape mirrors test_ftr_acceptance._D_ENTITY,
+# a verified strip_sample_values path) AND quarantines for a NON-definition reason (unknown
+# term_type "Mesure" -> adapter-level quarantine). The durable quarantine_row must persist only the
+# SANITIZED definition — the raw sample values may never reach any persistence surface.
+_SAMPLE_TOKEN = "ARTKOM"
+_FTR_CSV_SAMPLE_IN_QUARANTINE = _FTR_CSV + (
+    '21,DPL_EIB_COMPLIANCE.COMP_FIN_TRAN.CPTY_NAME,Counterparty Name,'
+    '"Registered counterparty name. The sample profile is TEXT, with representative values '
+    f'such as {_SAMPLE_TOKEN} GLOBAL FZE; NORDIC HOLDINGS AS, which supports interpretation.",'
+    'Party,Mesure,Onboarding,,,,,Party,Customer,,,,VARCHAR\n')
 
 
 def _actor() -> IdentityEnvelope:
@@ -89,6 +104,36 @@ def test_ftr_quarantine_row_carries_adapter_tag_and_source_row(client, conn):
     assert "term_type" in reason
     assert raw["source_row"] == "21"        # provenance back to the file's own row id
     assert raw["_adapter"] == "ftr"         # the inline-repair guard's discriminator
+
+
+# ── Quarantine surface is sample-safe for a row that GENUINELY carried a sample (M4) ─────────────
+
+def test_ftr_quarantined_sample_bearing_row_persists_only_sanitized_definition(client, conn):
+    # Self-guard: the raw upload really DOES carry the synthetic sample token — fixture drift
+    # would otherwise turn the absence assertions below into a vacuous pass.
+    assert _SAMPLE_TOKEN in _FTR_CSV_SAMPLE_IN_QUARANTINE
+
+    res = upload_csv(client, "ftr", _FTR_CSV_SAMPLE_IN_QUARANTINE)
+    assert res.status_code == 200, res.text
+    assert res.json()["quarantined"] >= 1
+
+    rows = _ftr_quarantine_rows(conn, "ftr")
+    assert len(rows) >= 1                    # NON-VACUOUS: the durable surface holds the row
+    _, _, reason = rows[0]
+    assert "term_type" in reason             # quarantined for the NON-definition reason, as staged
+    # Positive control: the SAME probe shape DOES see this row's raw (its column identity), so the
+    # token-absence probes below scan a surface that provably contains the quarantined row.
+    assert conn.execute(
+        "SELECT count(*) FROM quarantine_row WHERE catalog_source = %s AND raw::text ILIKE %s",
+        ("ftr", "%CPTY_NAME%")).fetchone()[0] >= 1
+    # The durable raw persisted the SANITIZED definition, not the raw sample.
+    assert conn.execute(
+        "SELECT count(*) FROM quarantine_row WHERE catalog_source = %s AND raw::text ILIKE %s",
+        ("ftr", f"%{_SAMPLE_TOKEN}%")).fetchone()[0] == 0
+    # Strongest form: no column of any durable quarantine row (reason included) carries the token.
+    assert conn.execute(
+        "SELECT count(*) FROM quarantine_row t WHERE t.catalog_source = %s AND t::text ILIKE %s",
+        ("ftr", f"%{_SAMPLE_TOKEN}%")).fetchone()[0] == 0
 
 
 # ── Inline repair is refused for FTR rows (#9) ───────────────────────────────────────────────────

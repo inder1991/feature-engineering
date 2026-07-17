@@ -265,7 +265,11 @@ def read_ftr_glossary(text: str, *, source: str) -> PreparedFtrUpload:
     # Pass 2 — emit rows/records, diverting bad rows into the reader-level quarantine. Every
     # quarantined row carries the SANITIZED definition and its raw identity spelling (mirroring
     # read_glossary's raw-valued quarantine rows) with type=UNKNOWN_TYPE (resolution #1 applies to
-    # quarantined rows too — inline repair is refused for FTR rows anyway, resolution #9).
+    # quarantined rows too). Resolution #9's inline-repair refusal covers ONLY these ADAPTER-level
+    # quarantine rows (dup FQN, unknown term_type, bad/dup source_row, multi-schema fold) — they
+    # are built as RowError(adapter="ftr") below, and that tag is what resolve_quarantine_row
+    # keys the refusal on. The unresolvable-FQN rows take a different, untagged path (see the
+    # r.table is None branch).
     rows: list[CanonicalRow] = []
     records: list[GlossaryRecord] = []
     pending: list[tuple[str, CanonicalRow]] = []   # (message, raw-valued row) awaiting an index
@@ -277,7 +281,11 @@ def read_ftr_glossary(text: str, *, source: str) -> PreparedFtrUpload:
     for r in parsed:
         if r.table is None:
             # Unresolvable FQN — emit an identity-less row so profile-aware validate_rows
-            # quarantines it (mirroring read_glossary). No sidecar: a ref needs a table.
+            # quarantines it (mirroring read_glossary) WITHOUT the _adapter="ftr" tag the
+            # adapter-level RowErrors carry, so — unlike those — this row CAN be inline-repaired
+            # via resolve_quarantine_row. That is acceptable: the row carried NO glossary sidecar
+            # (a ref needs a table, so there is nothing to lose on repair) and its definition was
+            # already sanitized at parse time.
             rows.append(CanonicalRow(source=source, table="", column="", type=UNKNOWN_TYPE,
                                      definition=r.definition, source_row=r.source_row))
             continue
