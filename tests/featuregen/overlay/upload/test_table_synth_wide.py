@@ -35,7 +35,8 @@ class _RecordingLLM(FakeLLM):
 
 
 def _profiles(n):
-    return [{"column": f"c{i}", "type": "integer"} for i in range(n)]
+    return [{"column": f"c{i}", "operational_type": "integer", "declared_type": ""}
+            for i in range(n)]
 
 
 def _items_of(request):
@@ -60,12 +61,13 @@ def test_old_giant_item_would_egress_reject_but_a_chunk_is_admissible():
 
 
 def test_phase2_wide_item_is_egress_admissible():
-    """The phase-2 item carries chunk summaries + a complete roster (names/types) — admissible even
-    though the roster is longer than 64 (it is bounded short strings, not full profiles)."""
+    """The phase-2 item carries chunk summaries + a complete STRUCTURED roster — admissible even
+    though the roster is longer than 64 (it is bounded identity entries, not full profiles)."""
     meta = {"table": "ftr",
             "chunk_summaries": [_summary(grain_candidates=["c0"], temporal_candidates=["c1"],
                                          entity_signals=["transaction"], event_or_snapshot="event")],
-            "column_roster": [f"c{i}:integer" for i in range(126)]}
+            "column_roster": [{"column": f"c{i}", "operational_type": "integer",
+                               "declared_type": ""} for i in range(126)]}
     assert _item_egress_ok(meta) is True
     # a summary carrying a data-value / unknown key is rejected (egress-safe: bounded fields only)
     bad = {"table": "ftr", "chunk_summaries": [{"grain_candidates": ["c0"], "rows": ["secret"]}]}
@@ -114,7 +116,9 @@ def test_wide_table_two_phase_produces_proposal(db):
     meta = synth_items[0]
     assert "column_profiles" not in meta                    # NOT the giant profile list
     assert len(meta["chunk_summaries"]) == 2                # both chunk summaries
-    assert len(meta["column_roster"]) == n                  # the complete roster (names/types)
+    assert len(meta["column_roster"]) == n                  # the complete structured roster
+    assert meta["column_roster"][0] == {"column": "c0", "operational_type": "integer",
+                                        "declared_type": ""}
 
 
 def test_narrow_table_keeps_the_fast_path(db):

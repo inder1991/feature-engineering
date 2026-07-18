@@ -411,6 +411,17 @@ _SCHEMAS: dict[tuple[str, int], dict] = {
         "required": ["status", "candidates"]},
 }
 
+# Pass B v2 (Phase-2 Slice 1, Task 4): the OUTPUT contract is byte-for-byte v1 — v2 exists because
+# the INPUT item contract changed (dual `operational_type`/`declared_type` column profiles,
+# STRUCTURED `column_roster` entries `{column, operational_type, declared_type}`, and the fenced
+# `table_definition`), and the prompt/schema version stamped on the immutable llm_call record must
+# identify WHICH item contract egressed. Same body objects as v1 (an intentional alias, not a copy
+# — the two versions cannot drift), registered as real v2 rows via `register_enrichment_schemas`'s
+# `_SCHEMAS` sweep so the Task-1 version seam (`schema_for(schema_id, 2)`) resolves them.
+for _synth_schema_id in ("overlay_table_synth_batch", "overlay_table_synth",
+                         "overlay_table_synth_summary_batch"):
+    _SCHEMAS[(_synth_schema_id, 2)] = _SCHEMAS[(_synth_schema_id, 1)]
+
 # Fallback service identity for when no real actor is threaded in. authenticated=False — a
 # fabricated authenticated identity is forbidden outside sanctioned auth modules; production threads
 # the real (authenticated) upload actor from ingest.
@@ -551,12 +562,21 @@ _ITEM_META_ALLOWED = frozenset({
 # The FTR-sidecar facets (term_type/domain/process_path — MF-2) come from the GlossaryRecord so the
 # synthesizer reasons over the column's business classification, not just its physical name/type;
 # they are bounded structural tokens (the default 200 cap via `_max_len_for`), never data values.
+# Task 4 (Phase-2 Slice 1): `operational_type` (the row's physical type) and `declared_type` (the
+# glossary-DECLARED SQL type — a HINT, not confirmation) are TWO separate keys; the CONFLATED
+# `type` key stays allowlisted only for the v1 item shape (it is no longer emitted by the v2
+# assembler and never combined with the dual keys by any producer).
 _COLUMN_PROFILE_KEYS = frozenset({
-    "column", "type", "concept", "business_definition",
+    "column", "type", "operational_type", "declared_type", "concept", "business_definition",
     "identifier_role", "temporal_role", "semantic_type", "entity",
     "term_type", "domain", "process_path",
 })
 _MAX_COLUMN_PROFILES = 64
+
+# A STRUCTURED wide-roster entry (Task 4): only the three identity keys, short strings only —
+# structured (never the old `name:type` flat string) because a column name may itself contain
+# `:`/`/`, which the flat form conflated irrecoverably.
+_ROSTER_ENTRY_KEYS = frozenset({"column", "operational_type", "declared_type"})
 
 # A phase-2 chunk-summary (#1) carries ONLY column-name lists + an event/snapshot enum — bounded,
 # egress-safe, and column-name-shaped (never a data value). `event_or_snapshot` is the lone scalar
@@ -569,6 +589,13 @@ _CHUNK_SUMMARY_KEYS = _CHUNK_SUMMARY_LIST_KEYS | {"event_or_snapshot"}
 # A wide table produces ceil(ncols/_MAX_COLUMN_PROFILES) chunk summaries; the generous cap backstops a
 # pathological column count without unbounding the phase-2 payload.
 _MAX_CHUNK_SUMMARIES = 256
+
+# The roster count cap is tied to the chunk caps BY CONSTRUCTION: the complete roster of the
+# LARGEST summarizable wide table (`_MAX_CHUNK_SUMMARIES` chunks of `_MAX_COLUMN_PROFILES`
+# profiles) always fits, so a table whose chunks all summarize can never have its phase-2 item
+# egress-rejected for roster size — the two bounds cannot drift apart. (The OLD flat-string roster
+# had NO count bound at all; any real table is far below this.)
+_MAX_ROSTER = _MAX_CHUNK_SUMMARIES * _MAX_COLUMN_PROFILES
 
 
 # The single source of truth for the SANITIZED business-definition length bound (DRY): re-exported by
@@ -606,6 +633,16 @@ def _column_profile_len_ok(desc: dict) -> bool:
 
 def _column_profile_ok(desc: object) -> bool:
     return _column_profile_shape_ok(desc) and _column_profile_len_ok(desc)
+
+
+def _roster_entry_ok(entry: object) -> bool:
+    """One structured `column_roster` entry: a dict of the three identity keys ONLY
+    (`_ROSTER_ENTRY_KEYS`), short strings. Shape and length together — roster entries are
+    structural names/types, never free text, so the sanitizer cannot shorten them and the [F7]
+    shape/length split does not apply. The OLD flat `name:type` string is rejected."""
+    if not isinstance(entry, dict) or any(k not in _ROSTER_ENTRY_KEYS for k in entry):
+        return False
+    return all(isinstance(v, str) and len(v) <= _MAX_LEN_DEFAULT for v in entry.values())
 
 
 def _chunk_summary_shape_ok(summary: object) -> bool:
@@ -654,6 +691,14 @@ def _item_shape_ok(metadata: dict) -> bool:
             if not isinstance(v, list) or len(v) > _MAX_CHUNK_SUMMARIES:
                 return False
             if not all(_chunk_summary_shape_ok(s) for s in v):
+                return False
+        elif k == "column_roster":
+            # Task 4: STRUCTURED entries only ({column, operational_type, declared_type} dicts) —
+            # `_roster_entry_ok` checks shape AND length (structural tokens, never sanitized), so
+            # the roster needs no `_item_len_ok` half. The old flat `name:type` strings now fail.
+            if not isinstance(v, list) or len(v) > _MAX_ROSTER:
+                return False
+            if not all(_roster_entry_ok(e) for e in v):
                 return False
         elif isinstance(v, list):
             if not all(isinstance(x, str) for x in v):

@@ -1,11 +1,13 @@
 """Pass B — per-table input assembler (spec §15.2).
 
-`assemble_table_items` joins each table's `CanonicalRow`s with the Pass A enrichment
-(`concepts{content_hash: concept}` + drafted `definitions{content_hash: definition}`) by
-`content_hash` and emits one `BatchItem` per table whose metadata carries each column's
-egress-safe descriptor. Pass B (Task 6/7) later proposes grain/availability as human-gated typed-fact
-proposals and table_role/primary_entity as advisory field evidence; this task is the input assembler
-only — no driver, no propose logic (YAGNI).
+`assemble_table_items` consumes the Task-3 metadata views (`column_view.build_table_views` — one
+`TableMetadataView` per table, each column a `ColumnMetadataView` with the sidecar already
+bound-and-fenced) and emits one `BatchItem` per table whose metadata carries each column's
+egress-safe descriptor plus the table-level `table_definition` when the view has one. The
+descriptor keeps `operational_type` and `declared_type` as TWO fields — the declared type is a
+HINT from the glossary, never a confirmation of the physical type. Pass B later proposes
+grain/availability as human-gated typed-fact proposals and table_role/primary_entity as advisory
+field evidence; the assembler does no propose logic.
 """
 from __future__ import annotations
 
@@ -14,87 +16,57 @@ import logging
 from typing import TYPE_CHECKING
 
 from featuregen.overlay.upload import enrich_config
-from featuregen.overlay.upload.canonical import CanonicalRow
-from featuregen.overlay.upload.enrich import MAX_DEFINITION_LEN, bounded_definition, content_hash
 from featuregen.overlay.upload.enrich_batch import BatchItem, run_batched
 from featuregen.overlay.upload.enrich_llm import _MAX_COLUMN_PROFILES
-from featuregen.overlay.upload.object_ref import _norm
-from featuregen.overlay.upload.sample_parser import strip_sample_values
 from featuregen.runtime.observability import counters
 
 if TYPE_CHECKING:
-    from featuregen.overlay.upload.glossary_reader import GlossaryRecord
+    from featuregen.overlay.upload.column_view import ColumnMetadataView, TableMetadataView
 
 logger = logging.getLogger(__name__)
 
 
-def _descriptor(r: CanonicalRow, concept: str | None, definition: str | None,
-                rec: GlossaryRecord | None) -> dict:
-    """Egress-safe per-column descriptor. When a glossary sidecar (`rec`) is present it supplies the
-    DECLARED type (a glossary keeps the operational `r.type` at `unknown`), the curated business
-    definition, and the FTR facets (term_type/domain/process_path/semantic_type — MF-2); else the
-    descriptor falls back to `r.type` and the Pass A draft, byte-for-byte as before."""
-    desc: dict = {"column": r.column,
-                  "type": (rec.declared_type if rec and rec.declared_type else (r.type or ""))}
-    if concept:
-        desc["concept"] = concept
-    # CRITICAL (M4 egress rule): source business_definition ONLY from the CURATED sidecar meaning
-    # (`rec.definition`, sanitized) or, for a blank column, the Pass A draft (`definition`) — NEVER
-    # from `r.definition`, the uploader's raw free-text cell. enrich.py::_concept_metadata forbids
-    # egressing a technical row's r.definition; we mirror that exactly. The curated sidecar wins over
-    # the draft (the draft only fills blanks). Even the curated text is sample-value-stripped as
-    # defence-in-depth and bounded on a word boundary to the per-value business_definition egress cap.
-    src_def = rec.definition if rec and rec.definition else definition
-    if src_def:
-        cleaned = strip_sample_values(src_def)
-        if cleaned:
-            desc["business_definition"] = bounded_definition(cleaned, MAX_DEFINITION_LEN)
-    if rec is not None:
-        # Bounded structural facets (business classification), each capped at the default egress
-        # per-value length (200). Blank facets are omitted so a technical descriptor is unchanged.
-        for key, val in (("term_type", rec.term_type), ("domain", rec.domain),
-                         ("process_path", rec.process_path),
-                         ("semantic_type", getattr(rec, "semantic_type", None))):
-            if val:
-                desc[key] = val[:200]
+def _descriptor(view: ColumnMetadataView) -> dict:
+    """Egress-safe per-column descriptor from the Task-3 view: `{column, operational_type,
+    declared_type, concept?, business_definition?, term_type?, domain?, process_path?,
+    semantic_type?}`. NEVER a conflated `type` key — `operational_type` is the row's physical type
+    (stays `unknown` under a glossary upload until confirmed) and `declared_type` is the
+    glossary-DECLARED SQL type (a hint; blank for a technical upload). Both always present so the
+    synthesizer sees the distinction even when one is blank.
+
+    M4 still holds by construction: the view sources `business_definition` ONLY from the curated
+    sidecar meaning or the Pass-A draft (never the uploader's raw `r.definition` cell), bounded to
+    the 600 egress window; the field-aware egress seam (`_redact_free_text_meta`) re-sanitizes it
+    (sample-clause strip + PII) at dispatch. Facets are bounded structural tokens (200 cap)."""
+    desc: dict = {"column": view.column,
+                  "operational_type": (view.operational_type or "")[:200],
+                  "declared_type": (view.declared_type or "")[:200]}
+    if view.concept:
+        desc["concept"] = view.concept
+    if view.business_definition:
+        desc["business_definition"] = view.business_definition
+    for key, val in (("term_type", view.term_type), ("domain", view.domain),
+                     ("process_path", view.process_path),
+                     ("semantic_type", view.semantic_type)):
+        if val:
+            desc[key] = val[:200]
     return desc
 
 
-def assemble_table_items(rows: list[CanonicalRow], *, concepts: dict[str, str] | None,
-                         definitions: dict[str, str] | None,
-                         records: dict[tuple[str, str], GlossaryRecord] | None = None
-                         ) -> list[BatchItem]:
-    """One BatchItem per table; metadata carries each column's enriched, egress-safe descriptor.
-
-    Each descriptor is `{column, type, concept?, business_definition?, term_type?, domain?,
-    process_path?, semantic_type?}` (only non-empty keys) and the assembled `BatchItem.metadata` is
-    admissible under the Task-3 metadata-only egress filter (`enrich_llm._item_egress_ok`).
-
-    `records` (MF-2) is the glossary semantic sidecar keyed by NORMALIZED `(table, column)` — the same
-    `(table, column)` bridge Pass A (`enrich._records_by_tc`) and Pass C use, since the schema-dropped
-    `CanonicalRow` cannot join a schema-preserving `logical_ref`. A column with a record carries its
-    declared type + curated meaning + facets; `records=None` / no record for a column falls back to
-    `r.type` (a technical CSV upload is unchanged, byte-for-byte).
-    """
-    # Pass A stages are savepointed and may fail, leaving concepts/definitions None. Degrade to empty
-    # enrichment rather than AttributeError on None.get(...). A non-glossary upload has no records.
-    concepts = concepts or {}
-    definitions = definitions or {}
-    records = records or {}
-    by_table: dict[str, list[CanonicalRow]] = {}
-    for r in rows:
-        by_table.setdefault(r.table, []).append(r)
+def assemble_table_items(views: dict[str, TableMetadataView]) -> list[BatchItem]:
+    """One BatchItem per table view; metadata is `{table, column_profiles, table_definition?}` —
+    `table_definition` ONLY when the view carries one (the [F8] schema fence already ran in
+    `build_table_views`, so a mismatched table term never reaches this seam). Each profile is the
+    dual-type descriptor above and the assembled metadata is admissible under the metadata-only
+    egress contract (`enrich_llm._item_egress_ok`). Sidecar attachment/withholding, Pass-A joins,
+    and normalization all happened in the view builder — the assembler only projects."""
     items: list[BatchItem] = []
-    for table, trows in by_table.items():
-        # Normalize the row's (table, column) on lookup — the record map is keyed by parse_ref's
-        # lowercased components, while a glossary CanonicalRow preserves the raw FQN case (mirrors
-        # enrich._records_by_tc / Pass C, which lowercase both sides).
-        profiles = [
-            _descriptor(r, concepts.get(content_hash(r)), definitions.get(content_hash(r)),
-                        records.get((_norm(r.table), _norm(r.column))))
-            for r in trows
-        ]
-        items.append(BatchItem(ref=table, metadata={"table": table, "column_profiles": profiles}))
+    for table, view in views.items():
+        metadata: dict = {"table": table,
+                          "column_profiles": [_descriptor(c) for c in view.columns]}
+        if view.table_definition:
+            metadata["table_definition"] = view.table_definition
+        items.append(BatchItem(ref=table, metadata=metadata))
     return items
 
 
@@ -212,11 +184,16 @@ def _run_synthesis(conn, client, items: list[BatchItem], *, columns_by_table, ac
                    ) -> dict[str, dict]:
     """The governed phase-2 synthesis batch (shared by the narrow fast path and the wide path): SAME
     task/schema/accept/result-shape — only the item metadata (full profiles vs summaries+roster) and
-    the instruction differ. Returns {table: synthesis_dict} for VALID results only."""
+    the instruction differ. Returns {table: synthesis_dict} for VALID results only.
+
+    Ships the Pass B **v2** contract via the Task-1 version seam (`prompt_version=2,
+    schema_version=2` — dual-type profiles + structured roster + table_definition); the OUTPUT
+    schema body is unchanged, but the stamped versions identify which item contract egressed."""
     accept = make_ref_accept(columns_by_table)
     resolved = run_batched(
         conn, client, short="table_synth", task="table_synth",
-        prompt_id="overlay_table_synth_v1", schema_id="overlay_table_synth_batch",
+        prompt_id="overlay_table_synth_v2", schema_id="overlay_table_synth_batch",
+        prompt_version=2, schema_version=2,
         shared_metadata={}, items=items, out_key="synthesis",
         instruction=instruction, accept=accept, actor=actor,
         extract=lambda e: json.dumps(e.get("synthesis"), sort_keys=True), ref_aware=True,
@@ -232,25 +209,43 @@ def _chunk_profiles(profiles: list[dict]) -> list[list[dict]]:
             for i in range(0, len(profiles), _MAX_COLUMN_PROFILES)]
 
 
+def _roster_entry(desc: dict) -> dict:
+    """One STRUCTURED wide-roster entry `{column, operational_type, declared_type}` from a
+    per-column descriptor (the wide path holds assembled items, so the descriptor — which carries
+    exactly these keys from the view — is the projection source). Structured, never the old
+    `name:type` flat string: a column name may itself contain `:`/`/`, which the flat form
+    conflated irrecoverably. Values are bounded to the default per-value egress cap."""
+    return {"column": (desc.get("column") or "")[:200],
+            "operational_type": (desc.get("operational_type") or "")[:200],
+            "declared_type": (desc.get("declared_type") or "")[:200]}
+
+
 def _synthesize_wide_tables(conn, client, wide_items: list[BatchItem], *, columns_by_table, actor
                             ) -> dict[str, dict]:
     """Two-phase synthesis for tables wider than the egress cap (#1).
 
     Phase 1: split each wide table into consecutive ``<=64``-profile chunks and SUMMARIZE each chunk
     (no fact output) — every chunk item is egress-safe. Phase 2: for each table whose chunks ALL
-    summarized, run ONE synthesis over its chunk summaries + a compact complete roster (names/types).
-    A table missing any chunk summary is dropped (never partially synthesized) so the caller reports it
-    honestly as unresolved."""
+    summarized, run ONE synthesis over its chunk summaries + a compact complete roster of STRUCTURED
+    ``{column, operational_type, declared_type}`` entries + the table's ``table_definition`` (when
+    the assembled item carried one). A table missing any chunk summary is dropped (never partially
+    synthesized) so the caller reports it honestly as unresolved."""
     chunk_items: list[BatchItem] = []
     chunk_refs_by_table: dict[str, list[str]] = {}
     columns_by_ref: dict[str, set[str]] = {}
-    roster_by_table: dict[str, list[str]] = {}
+    roster_by_table: dict[str, list[dict]] = {}
+    table_def_by_table: dict[str, str] = {}
     for it in wide_items:
         table = it.ref
         profiles = it.metadata.get("column_profiles") or []
-        # Complete roster: `name:type` only — small, egress-safe, and enough for phase-2 grounding.
-        roster_by_table[table] = [f"{d.get('column', '')}:{d.get('type', '')}"[:200]
-                                  for d in profiles]
+        # Complete roster: STRUCTURED {column, operational_type, declared_type} entries — small,
+        # egress-safe, and enough for phase-2 grounding without conflating a `:`-containing name.
+        roster_by_table[table] = [_roster_entry(d) for d in profiles]
+        # The table-level definition rides the ASSEMBLED item's metadata; the rebuilt phase-2 item
+        # must carry it forward explicitly or the wide path silently drops it.
+        table_def = it.metadata.get("table_definition")
+        if table_def:
+            table_def_by_table[table] = table_def
         refs: list[str] = []
         for idx, chunk in enumerate(_chunk_profiles(profiles)):
             ref = f"{table}#chunk{idx}"
@@ -262,7 +257,8 @@ def _synthesize_wide_tables(conn, client, wide_items: list[BatchItem], *, column
 
     summaries = run_batched(
         conn, client, short="table_synth", task="table_synth_summary",
-        prompt_id="overlay_table_synth_summary_v1", schema_id="overlay_table_synth_summary_batch",
+        prompt_id="overlay_table_synth_summary_v2", schema_id="overlay_table_synth_summary_batch",
+        prompt_version=2, schema_version=2,   # v2 item contract (dual-type profiles) — Task-1 seam
         shared_metadata={}, items=chunk_items, out_key="summary",
         instruction=_SUMMARY_INSTRUCTION, accept=make_summary_accept(columns_by_ref), actor=actor,
         extract=lambda e: json.dumps(e.get("summary"), sort_keys=True), ref_aware=True,
@@ -278,16 +274,28 @@ def _synthesize_wide_tables(conn, client, wide_items: list[BatchItem], *, column
                         table, sum(r in summaries for r in refs), len(refs))
             continue
         chunk_summaries = [json.loads(summaries[r]) for r in refs]
-        phase2_items.append(BatchItem(ref=table, metadata={
-            "table": table, "chunk_summaries": chunk_summaries,
-            "column_roster": roster_by_table[table]}))
+        metadata: dict = {"table": table, "chunk_summaries": chunk_summaries,
+                          "column_roster": roster_by_table[table]}
+        if table in table_def_by_table:
+            metadata["table_definition"] = table_def_by_table[table]
+        phase2_items.append(BatchItem(ref=table, metadata=metadata))
     if not phase2_items:
         return {}
     return _run_synthesis(conn, client, phase2_items, columns_by_table=columns_by_table,
                           actor=actor, instruction=_SYNTH_WIDE_INSTRUCTION)
 
 
+_TYPE_FIELDS_NOTE = (
+    "Each column profile carries TWO type fields: operational_type is the observed physical type "
+    "(it stays 'unknown' until operationally confirmed — an empty or unknown value means the "
+    "physical type is NOT established) and declared_type is the glossary-DECLARED SQL type, a HINT "
+    "from documentation, not a confirmation of the physical type. Never treat declared_type as the "
+    "operational type. When present, table_definition is the curated business definition of the "
+    "whole table. "
+)
+
 _INSTRUCTION = (
+    _TYPE_FIELDS_NOTE +
     "For each table, identify: the grain (the minimal set of columns whose combination uniquely "
     "identifies one row) — RETURN AN EMPTY grain_columns list if you cannot determine it, do not "
     "guess; the as-of/availability column and its basis (posted_at|ingested_at); "
@@ -296,6 +304,7 @@ _INSTRUCTION = (
 )
 
 _SUMMARY_INSTRUCTION = (
+    _TYPE_FIELDS_NOTE +
     "For each column CHUNK, SUMMARIZE the columns to support a LATER whole-table synthesis — DO NOT "
     "propose a table grain here. Identify: candidate grain/identifier columns (columns that could help "
     "uniquely identify a row), temporal/as-of columns (event or load timestamps), entity signals "
@@ -304,9 +313,11 @@ _SUMMARY_INSTRUCTION = (
 )
 
 _SYNTH_WIDE_INSTRUCTION = (
+    _TYPE_FIELDS_NOTE +
     "This is a WIDE table presented as per-chunk SUMMARIES (each with candidate grain/id columns, "
     "temporal/as-of columns, entity signals, and an event/snapshot hint) PLUS the table's COMPLETE "
-    "column roster (each entry `name:type`). Using the summaries and the roster, identify for the WHOLE "
+    "column roster (each entry an object {column, operational_type, declared_type} — the same two "
+    "type fields described above). Using the summaries and the roster, identify for the WHOLE "
     "table: the grain (the minimal set of columns whose combination uniquely identifies one row) — "
     "RETURN AN EMPTY grain_columns list if you cannot determine it, do not guess; the as-of/availability "
     "column and its basis (posted_at|ingested_at); the primary business entity; the table role; and "

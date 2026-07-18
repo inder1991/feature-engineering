@@ -1506,6 +1506,7 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
     else:
         # Pass B (spec §15): governed table synthesis — grain/availability as PROPOSED-only,
         # human-gated facts; table_role/primary_entity/event_or_snapshot as advisory evidence.
+        from featuregen.overlay.upload.column_view import build_table_views
         from featuregen.overlay.upload.enrich_llm import _ENRICH_ACTOR
         from featuregen.overlay.upload.table_synth import (
             _propose_table_facts,
@@ -1523,27 +1524,23 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
             # SECOND contains the advisory propose/projection writes.
             with conn.transaction():
                 synth_snapshot = snapshot_id or mint_id("tsy")  # non-glossary uploads have snapshot_id=None
-                # MF-2: thread the glossary semantic sidecar into Pass B, keyed by normalized
-                # (table, column) — the SAME (table, column) bridge Pass C uses (341-353): the flat
-                # CanonicalRow is schema-dropped, so it cannot join the schema-preserving logical_ref
-                # string; (table, column) is the stable key. Table-level terms (no column) and
-                # unparseable refs are skipped. Empty for a non-glossary technical upload -> unchanged.
-                records: dict[tuple[str, str], GlossaryRecord] = {}
-                if glossary is not None:
-                    for rec in glossary.records:
-                        if rec.is_table:
-                            continue
-                        try:
-                            _src, _schema, t, c = parse_ref(rec.logical_ref)
-                        except ValueError:
-                            continue
-                        if c is None:
-                            continue
-                        records.setdefault((t, c), rec)
-                items = assemble_table_items(vr.good, concepts=concepts, definitions=definitions,
-                                             records=records)
-                cols = {t: {r.column for r in vr.good if r.table == t}
-                        for t in {r.table for r in vr.good}}
+                # Task 4 (Phase-2 Slice 1): Pass B input is assembled from the Task-3 metadata
+                # views — the glossary sidecar attaches per column ONLY through the same validated
+                # `bindings` map the governed evidence path uses ([F4]; `bindings={}` on a classify
+                # failure withholds every sidecar crash-free, and the column is never dropped), the
+                # table term is [F8]-fenced inside the builder, and each descriptor keeps
+                # operational_type/declared_type separate. Non-glossary uploads pass glossary=None
+                # (bindings is then None too) and assemble pure-technical dual-type profiles.
+                views = build_table_views(vr.good, glossary=glossary, bindings=bindings,
+                                          concepts=concepts, definitions=definitions,
+                                          domains=domains)
+                items = assemble_table_items(views)
+                # Keyed by the NORMALIZED table name — the views (and therefore the item refs the
+                # ref-aware accept validates against) are keyed by `_norm(r.table)`, so a raw-cased
+                # key here would miss its ref and reject every grain column of that table.
+                cols: dict[str, set[str]] = {}
+                for r in vr.good:
+                    cols.setdefault(r.table.strip().lower(), set()).add(r.column)
                 syntheses = synthesize_tables(conn, client, items, columns_by_table=cols,
                                               actor=actor)     # LLM-call attribution only
             with conn.transaction():

@@ -245,9 +245,12 @@ def _sweep_domain(db, client: _RecordingClient):
 
 
 def _sweep_table_synth(db, client: _RecordingClient):
+    from featuregen.overlay.upload.column_view import build_table_views
     from featuregen.overlay.upload.table_synth import assemble_table_items, synthesize_tables
     rows, cols, identity = _table_inputs()
-    items = assemble_table_items(rows, concepts=None, definitions=None)
+    views = build_table_views(rows, glossary=None, bindings=None,
+                              concepts=None, definitions=None, domains=None)
+    items = assemble_table_items(views)
     def run(_size: int):
         client.reset()
         synthesize_tables(db, client, items, columns_by_table=cols, actor=None)

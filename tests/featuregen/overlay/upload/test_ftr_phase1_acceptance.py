@@ -145,13 +145,18 @@ def test_ftr_sample_accepts_cleanly(db, synthetic_ftr_upload):
             for prof in item["column_profiles"]:
                 profiled[prof["column"]] = prof
     assert len(profiled) == 126                     # every column's descriptor reached Pass B
-    assert profiled["event_ts"]["type"] == "timestamp"     # declared type carried into Pass B too
-    assert all(p["type"] != UNKNOWN_TYPE for p in profiled.values())
-    # The phase-2 synthesis got a COMPLETE roster (name:type for every column).
+    # Task 4 (Phase-2 Slice 1): the DECLARED type rides its own field — never a conflated `type`.
+    # The operational type honestly stays UNKNOWN (a business glossary is not the type authority).
+    assert profiled["event_ts"]["declared_type"] == "timestamp"
+    assert "type" not in profiled["event_ts"]
+    assert all(p["declared_type"] != UNKNOWN_TYPE for p in profiled.values())
+    assert all(p["operational_type"] == UNKNOWN_TYPE for p in profiled.values())
+    # The phase-2 synthesis got a COMPLETE STRUCTURED roster (one entry per column).
     synth_reqs = client.requests_for("table_synth")
     assert synth_reqs, "Pass B phase-2 synthesis never ran"
     roster = synth_reqs[0].inputs["catalog_metadata"]["items"][0]["column_roster"]
     assert len(roster) == 126
+    assert roster[0].keys() == {"column", "operational_type", "declared_type"}
 
     # Pass B abstained on the one table (the required abstaining synthesis) — no proposed facts.
     assert r.passb_abstained == 1

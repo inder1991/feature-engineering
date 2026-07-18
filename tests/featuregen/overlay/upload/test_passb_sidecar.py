@@ -1,17 +1,17 @@
-"""Task 5 (MF-2) — Pass B receives the COMPLETE FTR glossary sidecar.
+"""MF-2 — Pass B receives the COMPLETE FTR glossary sidecar (now via the Task-3 views).
 
-`assemble_table_items` now threads a `records: {(table, column): GlossaryRecord}` sidecar map into
-each column descriptor, so the glossary columns that HAVE a curated meaning arrive with the declared
-type (not `unknown`), the sanitized business definition, and the term_type/domain/process_path
-facets — instead of the blank-column-only draft dict that starved exactly those columns before.
+The glossary columns that HAVE a curated meaning arrive with the DECLARED type in its OWN field
+(`declared_type` — the operational `unknown` stays visible in `operational_type`, never conflated),
+the curated business definition, and the term_type/domain/process_path facets. A non-glossary /
+technical upload keeps a blank `declared_type` and its physical `operational_type`.
 
 The GlossaryRecord below is constructed against its REAL definition in
-`overlay/upload/glossary_reader.py` (all keyword args, required fields present); a non-glossary /
-technical upload (`records=None`) is byte-for-byte unchanged — the descriptor falls back to `r.type`.
+`overlay/upload/glossary_reader.py` (all keyword args, required fields present).
 """
 from featuregen.overlay.upload.canonical import CanonicalRow
+from featuregen.overlay.upload.column_view import build_table_views
 from featuregen.overlay.upload.enrich_llm import _column_profile_ok
-from featuregen.overlay.upload.glossary_reader import GlossaryRecord
+from featuregen.overlay.upload.glossary_reader import GlossaryRecord, GlossaryUpload
 from featuregen.overlay.upload.table_synth import assemble_table_items
 
 
@@ -29,12 +29,19 @@ def _rec(table, col, **kw):
     return GlossaryRecord(**base)
 
 
+def _assemble(rows, glossary):
+    views = build_table_views(rows, glossary=glossary, bindings=None,
+                              concepts=None, definitions=None, domains=None)
+    return assemble_table_items(views)
+
+
 def test_descriptor_carries_full_sidecar():
     rows = [_row("txn", "fee_amt")]
-    records = {("txn", "fee_amt"): _rec("txn", "fee_amt")}
-    items = assemble_table_items(rows, concepts=None, definitions=None, records=records)
+    g = GlossaryUpload(rows=rows, records=[_rec("txn", "fee_amt")])
+    items = _assemble(rows, g)
     prof = items[0].metadata["column_profiles"][0]
-    assert prof["type"] == "double"                 # declared type, not "unknown"
+    assert prof["declared_type"] == "double"        # the declared type, in its OWN field
+    assert prof["operational_type"] == "unknown"    # the physical type stays visible, unconflated
     assert prof["business_definition"] == "A settled amount."
     assert prof["term_type"] == "measure"
     assert prof["domain"] == "Payments"
@@ -42,8 +49,9 @@ def test_descriptor_carries_full_sidecar():
     assert _column_profile_ok(prof) is True         # egress allows the new keys
 
 
-def test_no_records_falls_back_to_row_type():
+def test_no_glossary_falls_back_to_row_type():
     rows = [_row("txn", "id")]
-    items = assemble_table_items(rows, concepts=None, definitions=None, records=None)
+    items = _assemble(rows, None)
     prof = items[0].metadata["column_profiles"][0]
-    assert prof["type"] == "unknown"
+    assert prof["operational_type"] == "unknown" and prof["declared_type"] == ""
+    assert "type" not in prof
