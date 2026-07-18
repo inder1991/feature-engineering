@@ -98,18 +98,24 @@ def record_decision(conn, *, evaluation_id: str, decision: str, decided_by: str,
 def is_live_cross_catalog_enabled(conn) -> bool:
     """flag ∧ (latest non-superseded decision for this deployment is APPROVE) ∧ (its evaluation is
     PASS) ∧ (that evaluation's stored version vector == the current one). Fail-closed on anything
-    else: explicitly superseded decisions are excluded outright, and a decided_at tie resolves
+    else: explicitly superseded decisions are excluded outright (supersession only counts WITHIN
+    the same deployment — a foreign deployment's row can never neutralize this one's REVOKE), an
+    unconfigured deployment id never honors an approval, and a decided_at tie resolves
     REVOKE-first so an ambiguous ordering can never resurrect a revoked approval."""
     if not _flag_on():
+        return False
+    dep = deployment_id()
+    if not dep or dep == "unset":   # unconfigured deployments must not share 'unset' approvals
         return False
     row = conn.execute(
         "SELECT d.decision, e.result, e.version_vector FROM live_activation_decision d"
         " JOIN enablement_evaluation e ON e.evaluation_id = d.evaluation_id"
         " WHERE d.deployment_id = %s"
         " AND NOT EXISTS (SELECT 1 FROM live_activation_decision s"
-        "                 WHERE s.supersedes_decision_id = d.decision_id)"
+        "                 WHERE s.supersedes_decision_id = d.decision_id"
+        "                 AND s.deployment_id = d.deployment_id)"
         " ORDER BY d.decided_at DESC, (d.decision = 'REVOKE') DESC, d.decision_id DESC LIMIT 1",
-        (deployment_id(),)).fetchone()
+        (dep,)).fetchone()
     if row is None:
         return False
     decision, result, stored_vv = row

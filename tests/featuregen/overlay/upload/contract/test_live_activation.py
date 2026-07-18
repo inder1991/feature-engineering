@@ -72,6 +72,39 @@ def test_revoke_supersedes_approval(db, monkeypatch):
     assert is_live_cross_catalog_enabled(db) is False
 
 
+def test_cross_deployment_supersede_cannot_resurrect_a_revoked_approval(db, monkeypatch):
+    """A decision filed under ANOTHER deployment must not neutralize this deployment's REVOKE.
+    d1: APPROVE over PASS, then a bare REVOKE (supersedes=NULL) → disabled. A d2 decision whose
+    supersedes_decision_id points at d1's REVOKE must NOT exclude it — d1 stays disabled."""
+    monkeypatch.setenv("FEATUREGEN_INTENT_LIVE_CROSS_CATALOG", "1")
+    monkeypatch.setenv("FEATUREGEN_DEPLOYMENT_ID", "d1")
+    eid = record_evaluation(db, telemetry_window={}, population_report={}, gold_set_result={},
+                            stability_result={}, result="PASS", evaluated_at=_NOW)
+    record_decision(db, evaluation_id=eid, decision="APPROVE", decided_by="a", reason="go",
+                    decided_at=_NOW)
+    revoke_id = record_decision(db, evaluation_id=eid, decision="REVOKE", decided_by="a",
+                                reason="stop", decided_at=datetime(2026, 7, 18, 1, tzinfo=UTC),
+                                supersedes_decision_id=None)   # bare revoke — supersedes nothing
+    assert is_live_cross_catalog_enabled(db) is False
+    monkeypatch.setenv("FEATUREGEN_DEPLOYMENT_ID", "d2")      # hostile/mistaken other deployment
+    record_decision(db, evaluation_id=eid, decision="REVOKE", decided_by="b", reason="d2 noise",
+                    decided_at=datetime(2026, 7, 18, 2, tzinfo=UTC),
+                    supersedes_decision_id=revoke_id)         # points at d1's REVOKE
+    monkeypatch.setenv("FEATUREGEN_DEPLOYMENT_ID", "d1")
+    assert is_live_cross_catalog_enabled(db) is False         # d1's REVOKE still governs
+
+
+def test_unset_deployment_id_is_disabled_even_with_approval(db, monkeypatch):
+    """Fail-closed: an unconfigured deployment id must never honor an approval — two deployments
+    that both forget FEATUREGEN_DEPLOYMENT_ID must not share approvals recorded under 'unset'."""
+    monkeypatch.setenv("FEATUREGEN_INTENT_LIVE_CROSS_CATALOG", "1")
+    monkeypatch.delenv("FEATUREGEN_DEPLOYMENT_ID", raising=False)
+    _approved(db)   # recorded under the default deployment_id 'unset'
+    assert is_live_cross_catalog_enabled(db) is False
+    with pytest.raises(LiveActivationNotReady):
+        require_live_ready(db)
+
+
 def test_wrong_deployment_does_not_inherit_approval(db, monkeypatch):
     monkeypatch.setenv("FEATUREGEN_INTENT_LIVE_CROSS_CATALOG", "1")
     monkeypatch.setenv("FEATUREGEN_DEPLOYMENT_ID", "d1")
