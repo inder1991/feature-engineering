@@ -126,21 +126,34 @@ def _call_raw(conn, client: LLMClient, task: str, prompt_id: str, schema_id: str
 def _candidate_columns(conn, catalog_source: str | None, roles: Iterable[str],
                        entity: str | None = None) -> list[dict]:
     # Read-scope: never feed a sensitivity-tagged column the caller can't see to the LLM (M6).
-    sql = ("SELECT catalog_source, object_ref, table_name, column_name, concept, domain, definition "
-           "FROM graph_node WHERE kind = 'column' "
-           "AND (sensitivity IS NULL OR sensitivity = ANY(%s))")
+    # The LEFT JOIN reads the column's OWN table node (kind='table') for the table-level definition
+    # and primary_entity — one scoped query, NOT a second unscoped fetch (spec §5). One table node
+    # per (catalog, table), so the join never fans a column into duplicate rows.
+    sql = ("SELECT c.catalog_source, c.object_ref, c.table_name, c.column_name, c.concept, "
+           "c.domain, c.definition, c.data_type, c.declared_type, c.semantic_terms, c.entity, "
+           "c.additivity, c.unit, c.currency, c.is_grain, c.is_as_of, c.grain_fact_event_id, "
+           "c.availability_fact_event_id, t.definition, t.primary_entity "
+           "FROM graph_node c "
+           "LEFT JOIN graph_node t ON t.catalog_source = c.catalog_source AND t.kind = 'table' "
+           "AND t.table_name = c.table_name "
+           "WHERE c.kind = 'column' "
+           "AND (c.sensitivity IS NULL OR c.sensitivity = ANY(%s))")
     params: list = [allowed_sensitivities(roles)]
     if entity:
         # Cross-domain gather: candidates from EVERY catalog that contains this entity, not one source.
-        sql += (" AND catalog_source IN "
+        sql += (" AND c.catalog_source IN "
                 "(SELECT DISTINCT catalog_source FROM graph_node WHERE entity = %s)")
         params.append(entity)
     elif catalog_source:
-        sql += " AND catalog_source = %s"
+        sql += " AND c.catalog_source = %s"
         params.append(catalog_source)
     rows = conn.execute(sql, params).fetchall()
     return [{"catalog_source": r[0], "object_ref": r[1], "table": r[2], "column": r[3],
-             "concept": r[4], "domain": r[5], "definition": r[6]} for r in rows]
+             "concept": r[4], "domain": r[5], "definition": r[6], "data_type": r[7],
+             "declared_type": r[8], "semantic_terms": r[9], "entity": r[10], "additivity": r[11],
+             "unit": r[12], "currency": r[13], "is_grain": r[14], "is_as_of": r[15],
+             "grain_fact_event_id": r[16], "availability_fact_event_id": r[17],
+             "table_definition": r[18], "table_primary_entity": r[19]} for r in rows]
 
 
 def _menu(cols: list[dict]) -> list[dict]:
