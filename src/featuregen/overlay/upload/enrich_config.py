@@ -36,6 +36,15 @@ def max_input_tokens(short: str) -> int:
                               _DEFAULT_MAX_INPUT_TOKENS[short]))
 
 
+def stage_deadline_s() -> float:
+    """MF-4 — wall-clock ceiling (seconds) for an enrichment stage's batching run. Past it,
+    ``run_batched`` STOPS issuing new chunks and reports ``timed_out`` (partial), so a slow provider
+    can't hold the source advisory lock across the whole ingest. Default 240s
+    (env ``OVERLAY_ENRICH_STAGE_DEADLINE_S``). This is a STAGE ceiling above the per-call timeout
+    (``FEATUREGEN_LLM_TIMEOUT``, default 60s) and the per-run wallclock budget."""
+    return float(os.environ.get("OVERLAY_ENRICH_STAGE_DEADLINE_S", "240"))
+
+
 @dataclass(frozen=True)
 class Budget:
     max_batch_attempts: int    # retries of a failed chunk before splitting

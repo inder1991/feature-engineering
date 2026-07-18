@@ -38,6 +38,10 @@ class ClaudeConfig:
     max_tokens: int = 4096
     thinking: str = "adaptive"           # adaptive thinking (§9.5); budget_tokens is a 400 on 4.8
     effort: str = "high"
+    # MF-4 — per-call wall-clock ceiling (seconds). A hung provider call would otherwise hold the
+    # source advisory lock indefinitely and could fail the whole catalog ingest. Retries stay bounded
+    # (2, unchanged); this bounds each attempt. Default 60s (env FEATUREGEN_LLM_TIMEOUT).
+    timeout: float = 60.0
 
     @classmethod
     def from_env(cls) -> ClaudeConfig:
@@ -47,6 +51,7 @@ class ClaudeConfig:
             max_tokens=int(os.environ.get("FEATUREGEN_LLM_MAX_TOKENS", "4096")),
             thinking=os.environ.get("FEATUREGEN_LLM_THINKING", "adaptive"),
             effort=os.environ.get("FEATUREGEN_LLM_EFFORT", "high"),
+            timeout=float(os.environ.get("FEATUREGEN_LLM_TIMEOUT", "60")),
         )
 
 
@@ -157,6 +162,7 @@ class ClaudeLLM:
                 thinking={"type": request.generation_settings.get("thinking", self._config.thinking)},
                 output_config=output_config,
                 messages=[{"role": "user", "content": user_content}],
+                timeout=self._config.timeout,   # MF-4 — bound each attempt (retries stay bounded at 2)
             )
         except anthropic.APIStatusError as exc:  # map transport/status failures to the taxonomy
             status = getattr(exc, "status_code", 0)

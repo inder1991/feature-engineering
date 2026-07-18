@@ -137,10 +137,21 @@ def _single_fallback(conn, client, *, task, out_key, instruction, item: BatchIte
 
 def run_batched(conn, client, *, short: str, task: str, prompt_id: str, schema_id: str,
                 shared_metadata: dict, items: list[BatchItem], out_key: str, instruction: str,
-                accept: Accept, actor, extract=None, ref_aware: bool = False) -> dict[str, str]:
+                accept: Accept, actor, extract=None, ref_aware: bool = False,
+                now: Callable[[], float] = time.monotonic, deadline_s: float | None = None,
+                report: dict | None = None) -> dict[str, str]:
     """Chunk `items`, call the governed batch seam, and walk the bounded degradation ladder
     (spec C4): salvage valid -> retry a failed chunk -> adaptive split -> capped single fallback ->
-    leave remainder uncached. Returns {ref: accepted_value} for items resolved this run."""
+    leave remainder uncached. Returns {ref: accepted_value} for items resolved this run.
+
+    MF-4 — stage deadline: when ``deadline_s`` is not None, before issuing each top-level chunk we
+    check the INJECTED monotonic clock ``now`` (test-seam; real ``time.monotonic`` in production). If
+    ``now() - start >= deadline_s`` we STOP issuing new chunks, mark ``report['timed_out']`` (when a
+    ``report`` dict is supplied) and increment a counter, and break — the ALREADY-resolved items are
+    returned as a PARTIAL result, no exception is raised, and the caller's ingest stage degrades to
+    partial while the already-asserted facts still commit. ``deadline_s=None`` (the default) leaves
+    the guard fully inert, preserving today's behavior byte-for-byte; the enrichment entry points
+    pass ``enrich_config.stage_deadline_s()`` so production has a concrete ceiling."""
     from featuregen.overlay.upload.enrich_llm import audited_batch_call  # lazy (import cycle)
     b = enrich_config.budget(short)
     max_items = enrich_config.max_items(short)
@@ -214,6 +225,15 @@ def run_batched(conn, client, *, short: str, task: str, prompt_id: str, schema_i
             if value is not None:
                 resolved[it.ref] = value
 
+    deadline_start = now()
     for chunk in chunk_items(items, max_items=max_items, max_input_tokens=max_tokens):
+        # MF-4 — stage deadline: stop ISSUING new chunks once the ceiling is crossed. Facts already
+        # asserted and the rest of ingestion are unaffected — the run returns a partial result and the
+        # source advisory lock is released rather than held by a hung provider call.
+        if deadline_s is not None and now() - deadline_start >= deadline_s:
+            counters.incr(f"overlay.enrich.{short}.batch.timed_out")
+            if report is not None:
+                report["timed_out"] = True
+            break
         process(chunk, 0)
     return resolved

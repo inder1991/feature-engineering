@@ -371,7 +371,8 @@ def enrich_concepts(conn, rows: list[CanonicalRow], client: LLMClient, actor=Non
             instruction="For each item classify the column into the provided controlled concept "
                         "vocabulary — choose the single best-fitting concept name, or 'unclassified' "
                         "if none fits. Return exactly one result per input ref; treat each item "
-                        "independently.", accept=_accept_concept, actor=actor)
+                        "independently.", accept=_accept_concept, actor=actor,
+            deadline_s=enrich_config.stage_deadline_s())   # MF-4 — bound the source-lock hold
         for h, concept in resolved.items():
             _cache_put(conn, "enrichment_concept", key_of[h], concept, _CONCEPT_CACHE_VERSION)
             result[h] = concept
@@ -464,7 +465,8 @@ def draft_definitions(conn, rows: list[CanonicalRow], client: LLMClient, actor=N
             instruction="Draft a one-line business definition for EACH column. Treat each item "
                         "independently: use only that item's table/column/type/concept; do not infer "
                         "relationships between items; do not reuse another item's facts; return "
-                        "exactly one result per input ref.", accept=_accept_bounded(500), actor=actor)
+                        "exactly one result per input ref.", accept=_accept_bounded(500), actor=actor,
+            deadline_s=enrich_config.stage_deadline_s())   # MF-4 — bound the source-lock hold
         for h, def_text in resolved.items():
             _cache_put(conn, "enrichment_definition", key_of[h], def_text, _DEFINITION_CACHE_VERSION)
             result[h] = def_text
@@ -506,7 +508,8 @@ def classify_domains(conn, rows: list[CanonicalRow], client: LLMClient,
             schema_id="overlay_domain_batch", shared_metadata={}, items=misses, out_key="domain",
             instruction="For each item classify the table's business domain. Return exactly one "
                         "result per input ref; treat each table independently.",
-            accept=_accept_bounded(64), actor=actor)
+            accept=_accept_bounded(64), actor=actor,
+            deadline_s=enrich_config.stage_deadline_s())   # MF-4 — bound the source-lock hold
         for table, dom in resolved.items():
             _cache_put(conn, "enrichment_domain", hash_of_table[table], dom, _DOMAIN_CACHE_VERSION)
             out[table] = dom

@@ -13,6 +13,7 @@ import json
 import logging
 from typing import TYPE_CHECKING
 
+from featuregen.overlay.upload import enrich_config
 from featuregen.overlay.upload.canonical import CanonicalRow
 from featuregen.overlay.upload.enrich import MAX_DEFINITION_LEN, bounded_definition, content_hash
 from featuregen.overlay.upload.enrich_batch import BatchItem, run_batched
@@ -219,6 +220,7 @@ def _run_synthesis(conn, client, items: list[BatchItem], *, columns_by_table, ac
         shared_metadata={}, items=items, out_key="synthesis",
         instruction=instruction, accept=accept, actor=actor,
         extract=lambda e: json.dumps(e.get("synthesis"), sort_keys=True), ref_aware=True,
+        deadline_s=enrich_config.stage_deadline_s(),   # MF-4 — bound the source-lock hold
     )
     return {table: json.loads(raw) for table, raw in resolved.items()}
 
@@ -264,6 +266,7 @@ def _synthesize_wide_tables(conn, client, wide_items: list[BatchItem], *, column
         shared_metadata={}, items=chunk_items, out_key="summary",
         instruction=_SUMMARY_INSTRUCTION, accept=make_summary_accept(columns_by_ref), actor=actor,
         extract=lambda e: json.dumps(e.get("summary"), sort_keys=True), ref_aware=True,
+        deadline_s=enrich_config.stage_deadline_s(),   # MF-4 — bound the source-lock hold
     )
 
     phase2_items: list[BatchItem] = []
