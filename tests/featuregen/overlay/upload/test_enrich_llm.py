@@ -262,6 +262,42 @@ def test_batch_item_failing_closed_is_excluded_not_batch_fatal(db, monkeypatch):
     assert by["h2"].status == VALID
 
 
+# ---- Phase-2 Task 2: the sample-strip audit reaches llm_call.input_redaction -------------------
+
+
+def test_llm_call_records_sample_strip_audit(db):
+    """A Pass B batch with a sample-bearing definition egresses clean AND persists the sample-strip
+    audit in llm_call.input_redaction."""
+    item = BatchItem(ref="txn", metadata={"table": "txn", "table_definition":
+        "Txn events. Values such as SECRET1.", "column_profiles": []})
+    client = FakeLLM(script={"overlay.table_synth":
+        FakeResponse(output={"results": [{"ref": "txn", "synthesis": {"grain_columns": []}}]})})
+    audited_batch_call(db, client, task="overlay.table_synth",
+        prompt_id="overlay_table_synth_v1", schema_id="overlay_table_synth_batch",
+        shared_metadata={}, items=[item], out_key="synthesis",
+        instruction="x", accept=lambda raw, ref: (raw, "valid"), ref_aware=True)
+    row = db.execute("SELECT redacted_input, input_redaction FROM llm_call "
+                     "ORDER BY created_at DESC LIMIT 1").fetchone()
+    blob = str(row["redacted_input"] if isinstance(row, dict) else row[0])
+    assert "SECRET1" not in blob
+    ir = row["input_redaction"] if isinstance(row, dict) else row[1]
+    assert any(a["path"] == "table_definition" for a in ir["sample_strip"])
+
+
+def test_llm_call_records_definition_pii_spans_alongside_sample_strip(db):
+    """[F3] end-to-end: a definition-field PII span still lands in input_redaction's
+    redacted_spans (same granularity as before the field-aware split), next to the
+    sample-strip audit — and the scrubbed value itself never persists."""
+    _call(db, _Capture(), catalog_metadata=_PII_SIDECAR)      # business_definition carries an email
+    ir = db.execute("SELECT input_redaction FROM llm_call "
+                    "WHERE run_id = 'overlay-enrichment'").fetchone()[0]
+    assert any(s["key"] == "business_definition" and s["type"] == "EMAIL"
+               and {"start", "end"} <= s.keys() for s in ir["redacted_spans"])
+    assert any(a["path"] == "business_definition" and a["state"] == "none"
+               for a in ir["sample_strip"])
+    assert "jane.doe@bank.example" not in str(ir)
+
+
 # ---- finding #24: the audit records the REAL generation settings + provider usage --------------
 
 

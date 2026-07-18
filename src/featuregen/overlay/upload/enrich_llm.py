@@ -49,6 +49,7 @@ from featuregen.overlay.upload.enrich_batch import (
     BatchItemOutcome,
     validate_batch_results,
 )
+from featuregen.overlay.upload.sanitize import sanitize_definition
 from featuregen.security.audit import record_security_event
 
 logger = logging.getLogger(__name__)
@@ -66,53 +67,102 @@ _REDACTION_VERSION = "metadata-only"  # structural names/types only — nothing 
 
 # Finding #19: glossary sidecar values (business definitions, synonyms, data domains, BIAN/FIBO
 # taxonomy paths, the term name) are uploader-authored FREE TEXT — not structural names/types — so
-# they are never presumable-clean. Each rides through `redaction.redact_free_text` before egress:
-# the deterministic scan (email/SSN/PAN/IBAN/phone/account/DOB/address) classifies + scrubs, and a
-# REGISTERED IntentRedactor (`register_intent_redactor` — the NER seam redaction.py documents as
-# the DEFERRED personal-NAMES closer) supersedes the default when present. A value the redactor
-# fails closed on blocks the item (batch: excluded + audited; single: no dispatch).
-_FREE_TEXT_META_KEYS = frozenset({
-    "term_name", "business_definition", "synonyms", "data_domain", "bian_path", "fibo_path",
-})
+# they are never presumable-clean. Phase-2 Slice 1 makes the boundary FIELD-AWARE: the two curated
+# DEFINITION fields (business_definition + the table-level table_definition) can EMBED raw sample
+# values in prose, so they route through `sanitize.sanitize_definition` (sample-clause strip +
+# fail-closed data-marker scan + PII redaction); every other free-text field is PII-only via
+# `redaction.redact_free_text`. The deterministic scan (email/SSN/PAN/IBAN/phone/account/DOB/
+# address) classifies + scrubs, and a REGISTERED IntentRedactor (`register_intent_redactor` — the
+# NER seam redaction.py documents as the DEFERRED personal-NAMES closer) supersedes the default
+# when present (sanitize_definition's PII step rides the same seam). A value that fails closed
+# (redactor failure, or a definition the sanitizer blanks) blocks the ITEM (batch: excluded +
+# audited; single: no dispatch).
+_DEFINITION_META_KEYS = frozenset({"business_definition", "table_definition"})
+# [F6] `synonyms` is prose emitted as list[str] (enrich.py) — a LIST of prose values, each
+# PII-scanned per item and audited at an indexed path (`synonyms[0]`).
+_LIST_PROSE_META_KEYS = frozenset({"synonyms"})
+_SCALAR_PROSE_META_KEYS = frozenset({"term_name", "data_domain", "bian_path", "fibo_path"})
+_PROSE_META_KEYS = _SCALAR_PROSE_META_KEYS | _LIST_PROSE_META_KEYS
+_FREE_TEXT_META_KEYS = _DEFINITION_META_KEYS | _PROSE_META_KEYS
 
 
-def _redact_free_text_meta(metadata: dict) -> tuple[dict | None, list[dict], str | None]:
+def _meta_field_kind(key: str) -> str:
+    """The egress KIND of one free-text metadata key: ``definition`` (sample-strip + PII via
+    `sanitize_definition`), ``prose`` (PII-only via `redact_free_text`), or ``list_of_prose``
+    (per-item PII). A free-text key with NO declared kind is a hard error ([F6] fail closed) —
+    a new key must be classified before anything under it can egress, never silently routed
+    down the weaker prose path."""
+    if key in _DEFINITION_META_KEYS:
+        return "definition"
+    if key in _LIST_PROSE_META_KEYS:
+        return "list_of_prose"
+    if key in _SCALAR_PROSE_META_KEYS:
+        return "prose"
+    raise ValueError(f"free-text metadata key {key!r} has no declared egress kind (fail closed)")
+
+
+def _redact_free_text_meta(metadata: dict) -> tuple[dict | None, list[dict], list[dict], str | None]:
     """Route every glossary free-text value in `metadata` (top-level keys + each column_profiles
-    descriptor's business_definition) through `redact_free_text`. Returns
-    ``(redacted_metadata, span_records, redaction_version)``:
+    descriptor's business_definition) through its FIELD-KIND sanitizer (`_meta_field_kind`).
+    Returns ``(redacted_metadata, pii_spans, sample_audits, redaction_version)``:
 
-    * ``redacted_metadata`` — the metadata with scrubbed free-text, or ``None`` when any value
-      failed closed (the caller must not egress the item);
-    * ``span_records`` — ``{"key", "type", "start", "end"}`` per scrubbed span (types/positions,
-      NEVER values) for the llm_call ``input_redaction`` audit field;
-    * ``redaction_version`` — the redactor version that scanned the free-text, or ``None`` when
-      the metadata carried no free-text at all (pure structural names/types)."""
+    * ``redacted_metadata`` — the metadata with sanitized free-text, or ``None`` when any value
+      failed closed (the caller must not egress the item): a prose value the redactor returned
+      ``None`` for, or a definition `sanitize_definition` BLANKED (``suspected_unhandled`` marker
+      or ``pii_redaction_failed``);
+    * ``pii_spans`` — ``{"key", "type", "start", "end"}`` per scrubbed PII span (types/positions,
+      NEVER values) for ``input_redaction["redacted_spans"]``. Definition fields contribute their
+      `sanitize_definition` spans at the same granularity ([F3]); list items are keyed at their
+      indexed path (``synonyms[0]``);
+    * ``sample_audits`` — ``{"path", "sanitizer_version", "state", "removed_count"}`` per
+      DEFINITION field processed (prose fields never emit one) for
+      ``input_redaction["sample_strip"]``;
+    * ``redaction_version`` — the redactor/sanitizer version that scanned the free-text, or
+      ``None`` when the metadata carried no free-text at all (pure structural names/types)."""
     out = dict(metadata)
-    spans: list[dict] = []
+    pii_spans: list[dict] = []
+    sample_audits: list[dict] = []
     version: str | None = None
 
-    def _one(text: str, key: str) -> str | None:          # None ⟹ fail closed
+    def _definition(text: str, path: str) -> str | None:  # None ⟹ fail closed (blanked field)
+        nonlocal version
+        d = sanitize_definition(text)
+        version = version or d.redaction_version or d.sanitizer_version
+        sample_audits.append({"path": path, "sanitizer_version": d.sanitizer_version,
+                              "state": d.state, "removed_count": d.removed})
+        if d.reason:
+            # The sanitizer blanked the field (unhandled data marker, or its PII redaction failed
+            # closed): nothing provably safe — block the whole item, matching the prose contract.
+            return None
+        # [F3]: the definition's PII spans keep reaching input_redaction["redacted_spans"] at the
+        # same granularity as prose fields — the sample audit above is IN ADDITION, not instead.
+        pii_spans.extend({"key": path, **dict(s)} for s in d.redacted_spans)
+        return d.clean
+
+    def _prose(text: str, path: str) -> str | None:        # None ⟹ fail closed
         nonlocal version
         res = redact_free_text(text)
         version = version or res.redaction_version
         if res.text is None:
             return None
-        spans.extend({"key": key, **dict(s)} for s in res.redacted_spans)
+        pii_spans.extend({"key": path, **dict(s)} for s in res.redacted_spans)
         return res.text
 
     for key in sorted(_FREE_TEXT_META_KEYS & out.keys()):
+        kind = _meta_field_kind(key)                       # ValueError on an unclassified key
+        scrub = _definition if kind == "definition" else _prose
         val = out[key]
         if isinstance(val, str):
-            redacted = _one(val, key)
+            redacted = scrub(val, key)
             if redacted is None:
-                return None, spans, version
+                return None, pii_spans, sample_audits, version
             out[key] = redacted
         elif isinstance(val, list):
             new_list = []
-            for v in val:
-                nv = _one(v, key) if isinstance(v, str) else v
+            for i, v in enumerate(val):
+                nv = scrub(v, f"{key}[{i}]") if isinstance(v, str) else v
                 if nv is None:
-                    return None, spans, version
+                    return None, pii_spans, sample_audits, version
                 new_list.append(nv)
             out[key] = new_list
     profiles = out.get("column_profiles")
@@ -120,15 +170,16 @@ def _redact_free_text_meta(metadata: dict) -> tuple[dict | None, list[dict], str
         new_profiles = []
         for desc in profiles:
             if isinstance(desc, dict) and isinstance(desc.get("business_definition"), str):
-                nv = _one(desc["business_definition"], "column_profiles.business_definition")
+                nv = _definition(desc["business_definition"],
+                                 "column_profiles.business_definition")
                 if nv is None:
-                    return None, spans, version
+                    return None, pii_spans, sample_audits, version
                 desc = {**desc, "business_definition": nv}
             new_profiles.append(desc)
         out["column_profiles"] = new_profiles
     if version is None:
-        return metadata, [], None                          # no free-text — metadata untouched
-    return out, spans, version
+        return metadata, [], [], None                      # no free-text — metadata untouched
+    return out, pii_spans, sample_audits, version
 
 
 def _generation_settings() -> dict:
@@ -408,7 +459,8 @@ def audited_structured_call(conn, client: LLMClient, *, task: str, prompt_id: st
 
     # #19: glossary free-text in the metadata is scanned/scrubbed BEFORE the payload is built —
     # the classification below is what the scan established, never a hardcoded "clean".
-    safe_metadata, spans, free_text_version = _redact_free_text_meta(dict(catalog_metadata))
+    safe_metadata, spans, sample_audits, free_text_version = _redact_free_text_meta(
+        dict(catalog_metadata))
     if safe_metadata is None:
         logger.warning("free-text redaction failed closed for %s (schema %s); no dispatch",
                        task, schema_id)
@@ -438,7 +490,8 @@ def audited_structured_call(conn, client: LLMClient, *, task: str, prompt_id: st
     _record_llm_call_durable(   # #20: egress evidence survives an upload-transaction rollback
         conn, run_id=_RUN, request=req, input_hash=compute_input_hash(req.inputs),
         redaction_version=redaction_version,
-        input_redaction={"redacted_spans": spans} if spans else {},
+        input_redaction=({"redacted_spans": spans, "sample_strip": sample_audits}
+                         if (spans or sample_audits) else {}),
         raw_output={"output": outcome.output, "self_reported_scores": outcome.self_reported_scores},
         validation_result=outcome.validation_result, repair_attempts=list(outcome.repair_attempts),
         latency_ms=None, cost_metadata=outcome.cost_metadata, created_by=identity_to_jsonb(actor))
@@ -480,7 +533,8 @@ def audited_enrich_call(conn, client: LLMClient, *, task: str, prompt_id: str, s
 # applies on top.
 _ITEM_META_ALLOWED = frozenset({
     "table", "column", "type", "columns", "concept",
-    "term_name", "business_definition", "synonyms", "data_domain", "bian_path", "fibo_path",
+    "term_name", "business_definition", "table_definition",
+    "synonyms", "data_domain", "bian_path", "fibo_path",
     "column_profiles",
     # Pass B phase-2 (#1 — wide tables): the per-chunk summaries (bounded structured digests) and the
     # complete column ROSTER (short `name:type` strings). Both are MEANING/structure, not data values,
@@ -524,60 +578,118 @@ _MAX_CHUNK_SUMMARIES = 256
 # imports `enrich_llm`, so this module is the cycle-free home for the shared constant.
 MAX_DEFINITION_LEN = 600
 
-# Per-value egress length cap. Every scalar is capped at 200 EXCEPT the sanitized `business_definition`
-# — the intended metadata payload — which gets a larger (still-bounded) window so a real definition is
-# not cut mid-sentence before it egresses. Matches `enrich.bounded_definition`'s bound (same constant).
+# Per-value egress length cap. Every scalar is capped at 200 EXCEPT the two sanitized DEFINITION
+# fields — the intended metadata payload — which get a larger (still-bounded) window so a real
+# definition is not cut mid-sentence before it egresses. `business_definition` matches
+# `enrich.bounded_definition`'s bound (same constant); [F7] gives the table-level
+# `table_definition` the SAME 600 window (it previously inherited the 200 default).
 _MAX_LEN_DEFAULT = 200
-_MAX_LEN_BY_KEY = {"business_definition": MAX_DEFINITION_LEN}
+_MAX_LEN_BY_KEY = {"business_definition": MAX_DEFINITION_LEN,
+                   "table_definition": MAX_DEFINITION_LEN}
 
 
 def _max_len_for(key: str) -> int:
     return _MAX_LEN_BY_KEY.get(key, _MAX_LEN_DEFAULT)
 
 
-def _column_profile_ok(desc: object) -> bool:
+def _column_profile_shape_ok(desc: object) -> bool:
     if not isinstance(desc, dict):
         return False
     if any(k not in _COLUMN_PROFILE_KEYS for k in desc):
         return False
-    return all(isinstance(v, str) and len(v) <= _max_len_for(k) for k, v in desc.items())
+    return all(isinstance(v, str) for v in desc.values())
 
 
-def _chunk_summary_ok(summary: object) -> bool:
+def _column_profile_len_ok(desc: dict) -> bool:
+    return all(len(v) <= _max_len_for(k) for k, v in desc.items() if isinstance(v, str))
+
+
+def _column_profile_ok(desc: object) -> bool:
+    return _column_profile_shape_ok(desc) and _column_profile_len_ok(desc)
+
+
+def _chunk_summary_shape_ok(summary: object) -> bool:
     if not isinstance(summary, dict):
         return False
     if any(k not in _CHUNK_SUMMARY_KEYS for k in summary):
         return False
     for k, v in summary.items():
         if k == "event_or_snapshot":
-            if v is not None and (not isinstance(v, str) or len(v) > 64):
+            if v is not None and not isinstance(v, str):
                 return False
-        elif not isinstance(v, list) or not all(
-                isinstance(x, str) and len(x) <= 128 for x in v):
+        elif not isinstance(v, list) or not all(isinstance(x, str) for x in v):
             return False
     return True
 
 
-def _item_egress_ok(metadata: dict) -> bool:
+def _chunk_summary_len_ok(summary: dict) -> bool:
+    for k, v in summary.items():
+        if k == "event_or_snapshot":
+            if isinstance(v, str) and len(v) > 64:
+                return False
+        elif isinstance(v, list) and any(isinstance(x, str) and len(x) > 128 for x in v):
+            return False
+    return True
+
+
+def _chunk_summary_ok(summary: object) -> bool:
+    return _chunk_summary_shape_ok(summary) and _chunk_summary_len_ok(summary)
+
+
+def _item_shape_ok(metadata: dict) -> bool:
+    """[F7] SHAPE/allowlist half of the per-item egress gate — runs BEFORE `_redact_free_text_meta`:
+    allowlisted keys only, correct value types + list structure, count caps. Per-value LENGTH is
+    deliberately NOT checked here: a long RAW definition may sanitize (sample-clause strip) to
+    within its bound, so the length gate (`_item_len_ok`) runs AFTER sanitization instead — the
+    old combined pre-redaction gate excluded such items before the sanitizer could shorten them."""
     if any(k not in _ITEM_META_ALLOWED for k in metadata):
         return False
     for k, v in metadata.items():
         if k == "column_profiles":
             if not isinstance(v, list) or len(v) > _MAX_COLUMN_PROFILES:
                 return False
-            if not all(_column_profile_ok(d) for d in v):
+            if not all(_column_profile_shape_ok(d) for d in v):
                 return False
         elif k == "chunk_summaries":
             if not isinstance(v, list) or len(v) > _MAX_CHUNK_SUMMARIES:
                 return False
-            if not all(_chunk_summary_ok(s) for s in v):
+            if not all(_chunk_summary_shape_ok(s) for s in v):
                 return False
         elif isinstance(v, list):
-            if not all(isinstance(x, str) and len(x) <= _max_len_for(k) for x in v):
+            if not all(isinstance(x, str) for x in v):
                 return False
-        elif not isinstance(v, str) or len(v) > _max_len_for(k):
+        elif not isinstance(v, str):
             return False
     return True
+
+
+def _item_len_ok(metadata: dict) -> bool:
+    """[F7] Per-value LENGTH half of the per-item egress gate — the batch seam runs it AFTER
+    `_redact_free_text_meta`, on the SANITIZED item, so the bound applies to what would actually
+    egress (a stripped definition that now fits passes; one still over-bound is excluded +
+    audited on the same egress path)."""
+    for k, v in metadata.items():
+        if k == "column_profiles":
+            if isinstance(v, list) and not all(
+                    _column_profile_len_ok(d) for d in v if isinstance(d, dict)):
+                return False
+        elif k == "chunk_summaries":
+            if isinstance(v, list) and not all(
+                    _chunk_summary_len_ok(s) for s in v if isinstance(s, dict)):
+                return False
+        elif isinstance(v, list):
+            if not all(len(x) <= _max_len_for(k) for x in v if isinstance(x, str)):
+                return False
+        elif isinstance(v, str) and len(v) > _max_len_for(k):
+            return False
+    return True
+
+
+def _item_egress_ok(metadata: dict) -> bool:
+    """The FULL per-item egress contract (shape AND length) — the single predicate assemblers
+    (`table_synth`) validate against. The batch seam applies the two halves at different times
+    ([F7]): shape before sanitization, length after."""
+    return _item_shape_ok(metadata) and _item_len_ok(metadata)
 
 
 def audited_batch_call(conn, client: LLMClient, *, task: str, prompt_id: str, schema_id: str,
@@ -592,28 +704,42 @@ def audited_batch_call(conn, client: LLMClient, *, task: str, prompt_id: str, sc
     ``prompt_version``/``schema_version`` pin the request's contract (default ``1`` — byte-for-byte the
     v1 behavior): output-schema resolution, the stamped request versions, and validation all use them."""
     actor = actor or _ENRICH_ACTOR
-    excluded = [it for it in items if not _item_egress_ok(it.metadata)]
-    included = [it for it in items if _item_egress_ok(it.metadata)]
+    # [F7] SHAPE gate only pre-redaction: an item with a forbidden key / wrong structure never
+    # reaches the sanitizer, but a merely-long definition is NOT excluded here — sanitization may
+    # bring it under its length bound, so the length gate runs after `_redact_free_text_meta`.
+    excluded = [it for it in items if not _item_shape_ok(it.metadata)]
+    included = [it for it in items if _item_shape_ok(it.metadata)]
     egress_outcomes = [BatchItemOutcome(it.ref, EGRESS, None, (EGRESS,)) for it in excluded]
     for _it in excluded:
         _audit_egress_block(conn, task=task, actor=actor, reason="item metadata not metadata-only")
 
     # #19: per-item free-text scan/scrub (spec C9 grain — a fail-closed value excludes ITS item,
     # never the batch). The classification below is what the scan established, never a hardcoded
-    # "clean"; scrubbed span types/positions are recorded on the llm_call audit row.
+    # "clean"; scrubbed span types/positions + per-definition sample-strip audits are recorded on
+    # the llm_call audit row. Span/audit records of an item that is ultimately EXCLUDED never ride
+    # the record — input_redaction describes only what actually egressed.
     safe_items: list[BatchItem] = []
     all_spans: list[dict] = []
+    all_sample_audits: list[dict] = []
     free_text_version: str | None = None
     for it in included:
-        meta, spans, version = _redact_free_text_meta(it.metadata)
+        meta, spans, sample_audits, version = _redact_free_text_meta(it.metadata)
         free_text_version = free_text_version or version
         if meta is None:
             egress_outcomes.append(BatchItemOutcome(it.ref, EGRESS, None, (EGRESS,)))
             _audit_egress_block(conn, task=task, actor=actor,
                                 reason="glossary free-text redaction failed closed")
             continue
+        if not _item_len_ok(meta):
+            # [F7] LENGTH gate on the SANITIZED item: a value still over its egress bound after
+            # sample-strip/PII redaction is excluded + audited on the same egress path.
+            egress_outcomes.append(BatchItemOutcome(it.ref, EGRESS, None, (EGRESS,)))
+            _audit_egress_block(conn, task=task, actor=actor,
+                                reason="sanitized item metadata over egress length bound")
+            continue
         safe_items.append(BatchItem(it.ref, meta))
         all_spans.extend({"ref": it.ref, **s} for s in spans)
+        all_sample_audits.extend({"ref": it.ref, **a} for a in sample_audits)
     included = safe_items
 
     if not included:
@@ -663,7 +789,8 @@ def audited_batch_call(conn, client: LLMClient, *, task: str, prompt_id: str, sc
     _record_llm_call_durable(   # #20: egress evidence survives an upload-transaction rollback
         conn, run_id=_RUN, request=req, input_hash=compute_input_hash(req.inputs),
         redaction_version=redaction_version,
-        input_redaction={"redacted_spans": all_spans} if all_spans else {},
+        input_redaction=({"redacted_spans": all_spans, "sample_strip": all_sample_audits}
+                         if (all_spans or all_sample_audits) else {}),
         raw_output={"output": outcome.output,
                     "self_reported_scores": outcome.self_reported_scores},
         validation_result=outcome.validation_result,

@@ -81,6 +81,10 @@ class DefinitionSanitize:
     ``"stripped"`` field is still exactly the redacted-span count (the adapter's R5-8 arithmetic).
     ``reason`` — why a field was blanked (``"unhandled_marker"`` | ``"pii_redaction_failed"``);
     ``""`` otherwise.
+    ``redacted_spans`` — the PII span records (``{"type","start","end"}`` — types/positions in the
+    STRIPPED text, NEVER values) `redact_free_text` scrubbed from the surviving text, so a
+    definition-field egress audit keeps span granularity (Phase-2 [F3]); ``()`` on every
+    fail-closed/blanked path (nothing survived to locate spans in).
     """
 
     clean: str
@@ -91,6 +95,7 @@ class DefinitionSanitize:
     sanitizer_version: str
     redaction_version: str | None
     reason: str = ""
+    redacted_spans: tuple = ()
 
 
 def sanitize_definition(text: str | None) -> DefinitionSanitize:
@@ -132,7 +137,8 @@ def sanitize_definition(text: str | None) -> DefinitionSanitize:
         )
     removed = len(result.redacted_spans) + (1 if clause_stripped else 0)
     return DefinitionSanitize(
-        result.text, state, logical, semantic, removed, SANITIZER_VERSION, result.redaction_version
+        result.text, state, logical, semantic, removed, SANITIZER_VERSION, result.redaction_version,
+        redacted_spans=tuple(result.redacted_spans),
     )
 
 
