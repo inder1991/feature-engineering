@@ -73,6 +73,25 @@ def assemble_table_items(views: dict[str, TableMetadataView]) -> list[BatchItem]
 
 _VALID_BASIS = {"posted_at", "ingested_at"}  # lag-free bases only (event_time_plus_lag needs lag_hours)
 
+# The five per-table disposition fields — the per-run record set is TOTAL over them: every table
+# that reaches `make_ref_accept` gets exactly one record per field, and every assembled table that
+# never resolves gets the same five as `not_evaluated` ([F12]). ONE constant so the accept, the
+# totalizer, and their tests can never drift.
+DISPOSITION_FIELDS = ("grain", "availability_time", "table_role", "primary_entity",
+                      "event_or_snapshot")
+
+
+def add_not_evaluated(dispositions: list[dict], table: str) -> None:
+    """[F12] totality for a table that NEVER REACHED per-field validation (egress-excluded,
+    provider-failed, timed out, whole-rejected raw, or simply missing from the batch result —
+    ``run_batched`` returns resolved refs only): append the full five-field record set with status
+    ``not_evaluated`` so the per-run disposition shape stays uniform/TOTAL. ``not_evaluated`` is
+    DISTINCT from ``abstained`` — abstained means the model was asked and offered nothing for an
+    EVALUATED table; not_evaluated means validation never saw the table at all."""
+    for field in DISPOSITION_FIELDS:
+        dispositions.append({"table": table, "field": field, "status": "not_evaluated",
+                             "reason": None, "prior_value_staled": False})
+
 
 def make_ref_accept(columns_by_table: dict[str, set[str]], *,
                     dispositions: list[dict] | None = None):
@@ -223,11 +242,17 @@ def make_summary_accept(columns_by_ref: dict[str, set[str]]):
     return accept
 
 
-def synthesize_tables(conn, client, items: list[BatchItem], *, columns_by_table, actor
-                      ) -> dict[str, dict]:
+def synthesize_tables(conn, client, items: list[BatchItem], *, columns_by_table, actor,
+                      dispositions: list[dict] | None = None) -> dict[str, dict]:
     """Run the governed batch synthesis; return {table: synthesis_dict} for VALID results only.
     Validation is done INSIDE run_batched via the ref-aware accept — this function does no
     post-filtering (an INVALID synthesis never reaches here).
+
+    ``dispositions`` (Slice-2 Task 3) is the caller's per-run collector, threaded into BOTH
+    execution paths' ref-aware accepts (`make_ref_accept`), which append the five per-field
+    records for every table they validate. Mutated IN PLACE (the caller keeps the same list it
+    later hands to `_propose_table_facts` for the [F9] staling flips and totalizes via
+    `add_not_evaluated`); ``None`` (a direct caller) collects nothing.
 
     Wide tables (#1): an item whose ``column_profiles`` exceeds ``_MAX_COLUMN_PROFILES`` cannot egress
     as one giant item, so it is routed through the TWO-PHASE path (phase-1 per-chunk summaries -> a
@@ -249,15 +274,17 @@ def synthesize_tables(conn, client, items: list[BatchItem], *, columns_by_table,
     if narrow:
         # Today's exact path: one synthesis batch over the full profiles (fast path, byte-for-byte).
         resolved.update(_run_synthesis(conn, client, narrow, columns_by_table=columns_by_table,
-                                       actor=actor, instruction=_INSTRUCTION))
+                                       actor=actor, instruction=_INSTRUCTION,
+                                       dispositions=dispositions))
     if wide:
         resolved.update(_synthesize_wide_tables(conn, client, wide,
-                                                columns_by_table=columns_by_table, actor=actor))
+                                                columns_by_table=columns_by_table, actor=actor,
+                                                dispositions=dispositions))
     return resolved
 
 
-def _run_synthesis(conn, client, items: list[BatchItem], *, columns_by_table, actor, instruction
-                   ) -> dict[str, dict]:
+def _run_synthesis(conn, client, items: list[BatchItem], *, columns_by_table, actor, instruction,
+                   dispositions: list[dict] | None = None) -> dict[str, dict]:
     """The governed phase-2 synthesis batch (shared by the narrow fast path and the wide path): SAME
     task/schema/accept/result-shape — only the item metadata (full profiles vs summaries+roster) and
     the instruction differ. Returns {table: synthesis_dict} for VALID results only.
@@ -266,8 +293,13 @@ def _run_synthesis(conn, client, items: list[BatchItem], *, columns_by_table, ac
     `table_role` vocab is enumerated in the instruction) over the **unchanged canonical v2
     schema**. [F1]: `table_role` is deliberately NOT a schema enum — `reg.validate` rejects the
     WHOLE synthesis on one schema violation, so a strict role enum would lose a valid grain to one
-    off-vocab role; the vocab is enforced per-field in `make_ref_accept` instead."""
-    accept = make_ref_accept(columns_by_table)
+    off-vocab role; the vocab is enforced per-field in `make_ref_accept` instead.
+
+    ``dispositions`` threads the caller's per-run collector into the ref-aware accept, which
+    appends the five per-field records for every table it validates (retries never duplicate: a
+    resolved ref is excluded from every retry/split chunk, and only a parseable-dict raw — which
+    always resolves — appends records)."""
+    accept = make_ref_accept(columns_by_table, dispositions=dispositions)
     resolved = run_batched(
         conn, client, short="table_synth", task="table_synth",
         prompt_id="overlay_table_synth_v3", schema_id="overlay_table_synth_batch",
@@ -298,9 +330,11 @@ def _roster_entry(desc: dict) -> dict:
             "declared_type": (desc.get("declared_type") or "")[:200]}
 
 
-def _synthesize_wide_tables(conn, client, wide_items: list[BatchItem], *, columns_by_table, actor
-                            ) -> dict[str, dict]:
-    """Two-phase synthesis for tables wider than the egress cap (#1).
+def _synthesize_wide_tables(conn, client, wide_items: list[BatchItem], *, columns_by_table, actor,
+                            dispositions: list[dict] | None = None) -> dict[str, dict]:
+    """Two-phase synthesis for tables wider than the egress cap (#1). ``dispositions`` threads to
+    the PHASE-2 synthesis only (whose refs are the table names); the phase-1 chunk summaries are
+    advisory input keyed by chunk ref and record no per-field dispositions.
 
     Phase 1: split each wide table into consecutive ``<=64``-profile chunks and SUMMARIZE each chunk
     (no fact output) — every chunk item is egress-safe. Phase 2: for each table whose chunks ALL
@@ -364,7 +398,8 @@ def _synthesize_wide_tables(conn, client, wide_items: list[BatchItem], *, column
     if not phase2_items:
         return {}
     return _run_synthesis(conn, client, phase2_items, columns_by_table=columns_by_table,
-                          actor=actor, instruction=_SYNTH_WIDE_INSTRUCTION)
+                          actor=actor, instruction=_SYNTH_WIDE_INSTRUCTION,
+                          dispositions=dispositions)
 
 
 _TYPE_FIELDS_NOTE = (

@@ -1510,10 +1510,17 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
         from featuregen.overlay.upload.enrich_llm import _ENRICH_ACTOR
         from featuregen.overlay.upload.table_synth import (
             _propose_table_facts,
+            add_not_evaluated,
             assemble_table_items,
             synthesize_tables,
         )
         stage_started = datetime.now(UTC)
+        # The per-run TOTAL disposition collector (Slice-2 Task 3): `make_ref_accept` (inside
+        # synthesize_tables) appends five per-field records for every table it validates,
+        # `_propose_table_facts` flips `prior_value_staled` on the SAME list ([F9]), and every
+        # assembled table that never resolved gets five `not_evaluated` records below ([F12]).
+        # Persisted as `pass_b` stage detail — a JSON-safe list of small records, never row data.
+        dispositions: list[dict] = []
         try:
             # TWO savepoints (exactly like the Pass A stages and the governed-join seam
             # above): a DB abort inside either must not
@@ -1542,16 +1549,20 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
                 for r in vr.good:
                     cols.setdefault(r.table.strip().lower(), set()).add(r.column)
                 syntheses = synthesize_tables(conn, client, items, columns_by_table=cols,
-                                              actor=actor)     # LLM-call attribution only
+                                              actor=actor,     # LLM-call attribution only
+                                              dispositions=dispositions)
             with conn.transaction():
                 # Key the advisory table ref + its projection under the SAME schema the glossary
                 # columns use (a non-public schema for an FTR glossary; public for a technical
                 # upload) so readiness sees ONE (schema, table) pair per physical table.
                 schema_by_table = _schema_by_table(glossary)
-                # Propose under the SERVICE actor so a human confirmer later satisfies four-eyes:
+                # Propose under the SERVICE actor so a human confirmer later satisfies four-eyes.
+                # The SAME collector threads in so the [F9] staling flips land on the records the
+                # accept appended (prior_value_staled is live on the ingest path, not just tests):
                 _propose_table_facts(conn, catalog_source, syntheses, actor=_ENRICH_ACTOR,
                                      source_snapshot_id=synth_snapshot,
-                                     schema_by_table=schema_by_table)
+                                     schema_by_table=schema_by_table,
+                                     dispositions=dispositions)
                 # Project the advisory table fields' DISPLAY. resolve_and_project is otherwise
                 # called ONLY over glossary COLUMN refs (_ingest_glossary_evidence); table refs need
                 # this explicit call or table_role/primary_entity/event_or_snapshot never project
@@ -1561,9 +1572,17 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
                     for t in sorted({r.table for r in vr.good})]
                 resolve_and_project(conn, source=catalog_source, logical_refs=pass_b_table_refs,
                                     now=now)
+            # [F12] totality: a table that never RESOLVED (egress-excluded, provider-failed,
+            # timed out, whole-rejected raw, or missing from the batch result — run_batched
+            # returns resolved refs only) has no disposition records; give it the uniform five
+            # `not_evaluated` records so the persisted set is TOTAL over (assembled table x field).
+            for it in items:
+                if it.ref not in syntheses:
+                    add_not_evaluated(dispositions, it.ref)
             # Pass B swallows per-table failures internally (an unsynthesized table is simply
             # absent from `syntheses`), so the report compares against the assembled items (#22).
             state, reason, detail = _enrichment_outcome(syntheses, len(items))
+            detail["dispositions"] = dispositions      # the durable per-field account (Task 3)
             record_stage(stage_recorder, "pass_b", state, reason_code=reason,
                          detail=_with_audit_degradations(detail), started_at=stage_started)
         except Exception:  # noqa: BLE001 — advisory: Pass B never fails an upload; Pass A facts hold
