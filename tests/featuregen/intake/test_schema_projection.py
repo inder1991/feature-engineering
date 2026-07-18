@@ -72,3 +72,68 @@ def test_assert_raises_when_projection_cannot_clean():
         assert "bad" in str(e)
     else:
         raise AssertionError("expected ValueError")
+
+
+# ── forward-looking hardening: schema-valued containers the recursion previously missed ────────────
+# A stripped keyword hidden inside additionalProperties / patternProperties / prefixItems /
+# if-then-else must be (a) stripped by project_for_anthropic AND (b) detected by
+# provider_incompatibilities on the un-projected schema — else a future _SCHEMAS entry using one of
+# these hides an incompatibility from BOTH sides (static test green, wire schema still 400s).
+
+
+def test_maxlength_inside_additional_properties_is_stripped_and_detected():
+    schema = {"type": "object",
+              "additionalProperties": {"type": "string", "maxLength": 8}}
+    assert any("maxLength" in p for p in provider_incompatibilities(schema))
+    out = project_for_anthropic(schema)
+    assert "maxLength" not in out["additionalProperties"]
+    assert provider_incompatibilities(out) == []
+
+
+def test_bool_additional_properties_is_untouched_and_clean():
+    # additionalProperties: false is a bool (not a sub-schema) — must not be recursed or flagged.
+    schema = {"type": "object", "properties": {"x": {"type": "string"}},
+              "additionalProperties": False}
+    assert provider_incompatibilities(schema) == []
+    out = project_for_anthropic(schema)
+    assert out["additionalProperties"] is False
+
+
+def test_maxlength_inside_pattern_properties_is_stripped_and_detected():
+    schema = {"type": "object",
+              "patternProperties": {"^x": {"type": "string", "maxLength": 8}}}
+    assert any("maxLength" in p for p in provider_incompatibilities(schema))
+    out = project_for_anthropic(schema)
+    assert "maxLength" not in out["patternProperties"]["^x"]
+    assert provider_incompatibilities(out) == []
+
+
+def test_maxlength_inside_prefix_items_is_stripped_and_detected():
+    schema = {"type": "array",
+              "prefixItems": [{"type": "string", "maxLength": 8}, {"type": "integer"}]}
+    assert any("maxLength" in p for p in provider_incompatibilities(schema))
+    out = project_for_anthropic(schema)
+    assert "maxLength" not in out["prefixItems"][0]
+    assert provider_incompatibilities(out) == []
+
+
+def test_maxlength_inside_if_then_branch_is_stripped_and_detected():
+    schema = {
+        "type": "object",
+        "properties": {"kind": {"type": "string"}},
+        "if": {"type": "object", "properties": {"kind": {"const": "a"}}},
+        "then": {"type": "object", "properties": {"tag": {"type": "string", "maxLength": 8}}},
+        "else": {"type": "object", "properties": {"tag": {"type": "string"}}},
+    }
+    assert any("maxLength" in p for p in provider_incompatibilities(schema))
+    out = project_for_anthropic(schema)
+    assert "maxLength" not in out["then"]["properties"]["tag"]
+    assert provider_incompatibilities(out) == []
+
+
+def test_maxitems_inside_not_is_stripped_and_detected():
+    schema = {"type": "array", "not": {"type": "array", "maxItems": 3}}
+    assert any("maxItems" in p for p in provider_incompatibilities(schema))
+    out = project_for_anthropic(schema)
+    assert "maxItems" not in out["not"]
+    assert provider_incompatibilities(out) == []

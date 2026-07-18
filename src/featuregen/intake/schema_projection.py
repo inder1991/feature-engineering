@@ -20,8 +20,14 @@ PROVIDER_UNSUPPORTED_KEYWORDS = frozenset({
     "exclusiveMinimum", "exclusiveMaximum", "multipleOf",
 })
 
-_NESTED_SCHEMA_KEYS = ("properties", "$defs", "definitions")
+# dict-of-schemas containers — every VALUE is a sub-schema (patternProperties too: regex → schema).
+_NESTED_SCHEMA_KEYS = ("properties", "$defs", "definitions", "patternProperties")
+# list-of-schemas containers — the combinators plus prefixItems (positional tuple validation).
 _COMBINATOR_KEYS = ("anyOf", "oneOf", "allOf")
+_LIST_OF_SCHEMA_KEYS = ("prefixItems",)
+# Applicators whose value is a SINGLE sub-schema (dict). `additionalProperties` may instead be a bool
+# (no sub-schema) — recursion is skipped for that form by the isinstance(dict) guard at each site.
+_SINGLE_SUBSCHEMA_KEYS = ("additionalProperties", "not", "if", "then", "else")
 # Keys that make a node a well-formed provider schema node. A node declaring none of these has no
 # type/union the API can dispatch on (e.g. an empty node left after stripping) → incompatible.
 _SCHEMA_SHAPE_KEYS = ("type", "anyOf", "oneOf", "allOf", "$ref", "enum", "const", "not")
@@ -44,14 +50,17 @@ def _project(node: object) -> object:
         if kw in PROVIDER_UNSUPPORTED_KEYWORDS:
             del node[kw]
     # 3) recurse into nested schema containers
-    for key in _NESTED_SCHEMA_KEYS:
+    for key in _NESTED_SCHEMA_KEYS:                        # dict-of-schemas
         if isinstance(node.get(key), dict):
             node[key] = {k: _project(v) for k, v in node[key].items()}
     if isinstance(node.get("items"), (dict, list)):
         node["items"] = _project(node["items"])
-    for key in _COMBINATOR_KEYS:
+    for key in _COMBINATOR_KEYS + _LIST_OF_SCHEMA_KEYS:    # list-of-schemas
         if isinstance(node.get(key), list):
             node[key] = [_project(v) for v in node[key]]
+    for key in _SINGLE_SUBSCHEMA_KEYS:                     # single sub-schema (bool add'lProps skipped)
+        if isinstance(node.get(key), dict):
+            node[key] = _project(node[key])
     return node
 
 
@@ -87,16 +96,19 @@ def provider_incompatibilities(schema: object, _path: str = "$") -> list[str]:
     t, enum = schema.get("type"), schema.get("enum")
     if isinstance(t, list) and "null" in t and isinstance(enum, list):
         problems.append(f"nullable-enum at {_path}")
-    for key in _NESTED_SCHEMA_KEYS:
+    for key in _NESTED_SCHEMA_KEYS:                        # dict-of-schemas
         if isinstance(schema.get(key), dict):
             for k, v in schema[key].items():
                 problems += provider_incompatibilities(v, f"{_path}.{key}.{k}")
     if "items" in schema:
         problems += provider_incompatibilities(schema["items"], f"{_path}.items")
-    for key in _COMBINATOR_KEYS:
+    for key in _COMBINATOR_KEYS + _LIST_OF_SCHEMA_KEYS:    # list-of-schemas
         if isinstance(schema.get(key), list):
             for i, v in enumerate(schema[key]):
                 problems += provider_incompatibilities(v, f"{_path}.{key}[{i}]")
+    for key in _SINGLE_SUBSCHEMA_KEYS:                     # single sub-schema (bool add'lProps skipped)
+        if isinstance(schema.get(key), dict):
+            problems += provider_incompatibilities(schema[key], f"{_path}.{key}")
     return problems
 
 

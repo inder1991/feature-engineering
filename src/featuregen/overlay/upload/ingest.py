@@ -1186,12 +1186,21 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
         # its own re-upload must NOT be held, and it cannot half-land behind the fence anyway.
         incoming_carries_schema = any(rec.schema for rec in glossary.records)
         if incoming_carries_schema and _source_is_schema_less(conn, catalog_source):
-            return IngestResult(
-                "held",
-                "this FTR upload requires a new or existing FTR-only source; it cannot "
-                f"enrich the existing schema-less technical source '{catalog_source}'. "
-                "Choose a new source name or an FTR source.",
-                0, 0, len(vr.quarantined))
+            # Hold BEFORE any side effect on the target source. Record THIS run's manifest only
+            # (record_stage/record_skipped_downstream mutate no source) — deliberately NOT
+            # persist_quarantine: on this path vr.quarantined is typically empty and its whole-source
+            # review-queue refresh (delete-then-insert) would WIPE the schema-less source we refuse to
+            # touch. Mirrors the sibling held paths' manifest calls so the run account stays complete.
+            reason = ("this FTR upload requires a new or existing FTR-only source; it cannot "
+                      f"enrich the existing schema-less technical source '{catalog_source}'. "
+                      "Choose a new source name or an FTR source.")
+            record_stage(stage_recorder, "brake", "deferred", reason_code="held",
+                         detail={"reason": reason}, started_at=datetime.now(UTC))
+            logger.warning("upload of %r held by the MF-6 source-kind guard: %s",
+                           catalog_source, reason)
+            record_skipped_downstream(stage_recorder, reason_code="skipped_upload_held",
+                                      is_glossary=True)
+            return IngestResult("held", reason, 0, 0, len(vr.quarantined))
         # Cross-upload schema fence (round-4 #4) — BEFORE any side effect (no UploadCatalog, no
         # facts, no graph write): a schema-carrying upload that would re-attribute an existing
         # public-flattened column to a DIFFERENT schema holds the WHOLE upload fail-closed.
