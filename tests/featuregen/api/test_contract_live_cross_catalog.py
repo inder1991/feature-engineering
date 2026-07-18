@@ -354,3 +354,116 @@ def test_s9_item9_wrong_deployment_id_does_not_inherit_approval(make_client, con
     res = client.post("/contract/considered-set", json=_entity_scoped_body(), headers=AUTH)
     assert res.status_code == 503, res.text
     assert conn.execute("SELECT count(*) FROM confirmed_generation_scope").fetchone()[0] == 0
+
+
+# ═══════════ whole-branch review fixes — the two composition findings the isolated tests missed ═══════════
+# FINDING 1: the NON-scoped considered-set path (no confirmed_scope) ALSO enforces the live readiness gate
+# + governed cross-catalog lens — otherwise a flag-on-approved caller POSTing an entity-scoped run with no
+# confirmed_scope would get UNGOVERNED cross-catalog options surfaced, breaching the core invariant that in
+# an enabled deployment every customer-visible cross-catalog feature has a governed physical plan.
+def _non_scoped_body() -> dict:
+    """An ENTITY-scoped run with NO confirmed_scope (catalog_source omitted) — the non-scoped route path."""
+    return {"hypothesis": HYPOTHESIS, "objective": "predict churn", "entity": "Customer"}
+
+
+def test_non_scoped_flag_on_approved_rejects_cross_catalog_llm(make_client, conn, monkeypatch):
+    """FINDING 1 — a flag-on-approved NON-scoped run (no confirmed_scope) runs the SAME governed lens: a
+    cross-catalog LLM idea is rejected GOVERNED_CROSS_CATALOG_PLAN_REQUIRED (no ungoverned cross-catalog
+    option survives) while its single-catalog sibling is kept."""
+    monkeypatch.setenv(FLAG, "1")
+    monkeypatch.setenv(DEP, "d1")
+    _approve(conn)
+    single = FeatureIdea("single_llm", "", ["public.t.a"], "sum", None,
+                         derives_pairs=(("ops", "public.t.a"),))
+    _stub_report(monkeypatch, _cross_llm_idea(), single)
+    client = make_client(_flow_llm())
+    res = client.post("/contract/considered-set", json=_non_scoped_body(), headers=AUTH)
+    assert res.status_code == 200, res.text
+    out = res.json()
+    names = {f["name"] for s in out["alternatives"] for f in s["features"]}
+    assert "single_llm" in names and "cross_llm" not in names
+    assert any(r.get("name") == "cross_llm"
+               and r.get("reason") == GOVERNED_CROSS_CATALOG_PLAN_REQUIRED for r in out["rejections"])
+
+
+def test_non_scoped_flag_on_not_approved_returns_503_before_dispatch(make_client, conn, monkeypatch):
+    """FINDING 1 — a flag-on-but-NOT-approved NON-scoped entity run fails closed 503 BEFORE any builder
+    dispatch (the non-scoped path mirrors the scoped readiness interlock)."""
+    monkeypatch.setenv(FLAG, "1")
+    monkeypatch.setenv(DEP, "d1")   # configured deployment, but NO approval decision recorded
+
+    def _must_not_dispatch(*a, **k):
+        raise AssertionError("no LLM/planner dispatch may happen when not activation-approved")
+
+    monkeypatch.setattr("featuregen.api.routes.contract.build_considered_set", _must_not_dispatch)
+    client = make_client(_fake())
+    res = client.post("/contract/considered-set", json=_non_scoped_body(), headers=AUTH)
+    assert res.status_code == 503, res.text
+
+
+# FINDING 2: at the GOVERNING write a governed contract's persisted join_path must be RE-DERIVED from the
+# SERVER envelope's ordered_path — never the client body (the confirm match-check validates name/derives/
+# aggregation but NOT join_path, so a client could otherwise replay a governed feature with a FABRICATED
+# bridge that the freshness recheck still passes, defeating "a governed draft path equals the plan's,
+# byte-for-byte").
+def _fresh_envelope():
+    from featuregen.overlay.upload.planner.plan_envelope import PlanEnvelopeV1
+    return PlanEnvelopeV1(
+        recipe_id="r", physical_plan_id="bp_1", generation_run_id="run", catalog_sources=("deposits",),
+        ordered_path=("deposits:direct_catalog:",), contract_id="c1",
+        contract_resolution_status="resolved", contract_reason_codes=(),
+        catalog_fingerprint={"deposits": "fp"}, compiler_version={"plan_contract": "1.0.0"},
+        input_stamps=({"catalog_source": "deposits", "compiler_input_fingerprint": "fp",
+                       "head_seq": 1, "projection_checkpoint": 1},))
+
+
+def test_confirm_persists_server_envelope_join_path_not_client_forged(make_client, conn, monkeypatch):
+    """FINDING 2 — a governed confirm whose client body carries a FABRICATED join_path (matching
+    name/derives_pairs/aggregation, plan fresh) persists the SERVER envelope's ordered_path-derived path,
+    NEVER the client's forged value: the join_path can no longer smuggle an ungoverned bridge."""
+    from tests.featuregen.api._helpers import DEPOSITS_CSV, upload_csv
+    from tests.featuregen.api.test_contract import _fake as _deposits_llm
+
+    from featuregen.overlay.upload.contract.author import _envelope_join_path
+    from featuregen.overlay.upload.planner.contracts import ReplayFreshness
+
+    client = make_client(_deposits_llm())
+    upload_csv(client, "deposits", DEPOSITS_CSV)
+    res = client.post("/contract/considered-set", json={
+        "hypothesis": "customers churn when their balance drops",
+        "definition": "90-day average balance per account",
+        "objective": "predict churn", "catalog_source": "deposits"}, headers=AUTH)
+    assert res.status_code == 200, res.text
+    intent_id = res.json()["intent_id"]
+    dr = client.post("/contract/draft", json={
+        "intent_id": intent_id, "chosen_source": "anchor",
+        "chosen_option_id": "avg_balance_90d", "why": ""}, headers=AUTH)
+    assert dr.status_code == 200, dr.text
+    draft = dr.json()["draft"]
+    draft["intent_id"] = intent_id
+
+    env = _fresh_envelope()
+
+    def _governed_chosen(*a, **k):
+        # the server-reconstructed chosen feature is GOVERNED (carries a fresh plan envelope), matching the
+        # draft's name/derives_pairs/aggregation so the confirm match-check passes.
+        return FeatureIdea(
+            name=draft["feature_name"], description="", derives_from=draft["derives_from"],
+            aggregation=draft["aggregation"], grain_table=draft["grain_table"],
+            derives_pairs=tuple(tuple(p) for p in draft["derives_pairs"]),
+            plan_envelope=env, origin="governed_planner", path_authority="governed_cross_catalog")
+
+    monkeypatch.setattr("featuregen.api.routes.contract.chosen_feature", _governed_chosen)
+    monkeypatch.setattr("featuregen.api.routes.contract.recheck_plan_freshness",
+                        lambda *a, **k: ReplayFreshness.current)
+    # the client forges a join_path that does NOT match the server envelope's ordered_path
+    forged = [{"kind": "governed_segment", "segment": "FORGED:evil:bridge",
+               "catalog_source": "FORGED", "segment_kind": "evil", "ref": "bridge"}]
+    draft["join_path"] = forged
+    cr = client.post("/contract/confirm", json=draft, headers=AUTH)
+    assert cr.status_code == 200, cr.text
+    contract_id = cr.json()["contract_id"]
+    persisted = conn.execute("SELECT join_path FROM contract WHERE contract_id = %s",
+                             (contract_id,)).fetchone()[0]
+    assert persisted == list(_envelope_join_path(env.ordered_path))   # the server envelope's path
+    assert persisted != forged                                         # never the client's forgery

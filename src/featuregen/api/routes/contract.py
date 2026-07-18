@@ -32,6 +32,7 @@ from featuregen.overlay.upload.contract.author import (
     ContractDraft,
     CrossCatalogPlanRequired,
     StalePlan,
+    _envelope_join_path,
     draft_contract,
 )
 from featuregen.overlay.upload.contract.gate1 import (
@@ -485,10 +486,22 @@ def considered_set(body: ConsideredSetIn, conn: _Conn, identity: _Identity, clie
                                actor=identity.subject)
     except IntentValidationError as e:
         raise HTTPException(status_code=422, detail=str(e)) from e
+    # 3C.2a — the LIVE governed cross-catalog interlock on the NON-scoped path too (mirrors
+    # _scoped_considered_set): an entity-scoped run (no single catalog) with the live flag ON must be
+    # activation-approved BEFORE any dispatch — fail-closed 503 — and the resolved is_live threads into the
+    # builder so the SAME _reject_cross_catalog_llm + anchor-drop + governed lens filters run here as on the
+    # scoped path. FLAG UNSET → the gate short-circuits (no readiness query) and is_live reads False WITHOUT
+    # a DB query, so this is byte-identical to today for every flag-off / single-catalog request.
+    if body.catalog_source is None and _live_cross_catalog_flag_on():
+        try:
+            require_live_ready(conn)
+        except LiveActivationNotReady as e:
+            raise HTTPException(status_code=503, detail=str(e)) from e
+    is_live = is_live_cross_catalog_enabled(conn)
     cs = build_considered_set(
         conn, intent, client, entity=body.entity, catalog_source=body.catalog_source,
         roles=identity.role_claims, target_ref=body.target_ref, objective=body.objective,
-        feedback=body.feedback, now=datetime.now(UTC))
+        feedback=body.feedback, now=datetime.now(UTC), is_live=is_live)
     return _considered_set_response(intent, cs)
 
 
@@ -622,6 +635,12 @@ def confirm(body: DraftIn, conn: _Conn, identity: _Identity) -> Contract:
     if env is not None:
         if recheck_plan_freshness(conn, env, identity.role_claims) is not ReplayFreshness.current:
             raise HTTPException(status_code=409, detail="plan stale, regenerate")
+        # 3C.2a fail-closed: a governed contract's persisted join_path is RE-DERIVED from the SERVER
+        # envelope's ordered_path, NEVER the client body — the match-check above validates
+        # name/derives_pairs/aggregation but NOT join_path, so a replay carrying a FABRICATED path (which
+        # the freshness recheck still passes) would otherwise be persisted as the "governed" bridge. Scoped
+        # strictly to the envelope-present case (single-catalog / flag-off drafts keep their client path).
+        draft = replace(draft, join_path=tuple(_envelope_join_path(env.ordered_path)))
     elif (is_live_cross_catalog_enabled(conn)
           and len({cs for cs, _ref in chosen.derives_pairs}) > 1):
         raise HTTPException(status_code=422,
