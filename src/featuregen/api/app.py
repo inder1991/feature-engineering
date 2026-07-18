@@ -21,6 +21,7 @@ from featuregen.api.routes import (
     contract,
     entity,
     features,
+    gate,
     governance,
     governance_dashboard,
     graph,
@@ -133,6 +134,7 @@ def create_app(llm_client: LLMClient | None = None) -> FastAPI:
     app.include_router(features.router)
     app.include_router(governance.router)
     app.include_router(governance_dashboard.router)
+    app.include_router(gate.router)
     app.include_router(assist.router)
     app.include_router(contract.router)
     app.include_router(entity.router)
