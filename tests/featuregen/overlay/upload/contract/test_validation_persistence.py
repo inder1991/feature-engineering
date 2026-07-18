@@ -8,6 +8,32 @@ round-trip; per RF-I3 only symbols that exist at this task are imported here.
 import psycopg
 import pytest
 
+from featuregen.intake.llm import FakeLLM, FakeResponse
+from featuregen.overlay.upload.canonical import CanonicalRow
+from featuregen.overlay.upload.contract.author import draft_contract
+from featuregen.overlay.upload.feature_assist import FeatureIdea, Requirement
+from featuregen.overlay.upload.graph import build_graph
+
+
+def _bank(db):
+    build_graph(db, "bank", [
+        CanonicalRow("bank", "accounts", "id", "integer", is_grain=True),
+        CanonicalRow("bank", "accounts", "balance", "numeric",
+                     definition="end-of-day ledger balance"),
+        CanonicalRow("bank", "accounts", "posted_at", "timestamp", as_of=True)])
+
+
+def _nev_idea() -> FeatureIdea:
+    """A chosen feature honestly carrying NEEDS_EXTERNAL_VALIDATION + its typed requirement —
+    passed DIRECTLY to draft_contract (the snapshot-restore path is Task 3's concern)."""
+    return FeatureIdea(
+        name="avg_balance_90d", description="", derives_from=["public.accounts.balance"],
+        aggregation="avg_90d", grain_table="accounts",
+        derives_pairs=(("bank", "public.accounts.balance"),),
+        validation_status="NEEDS_EXTERNAL_VALIDATION",
+        requirements=(Requirement("TYPE_IS_NUMERIC", ("bank", "public.accounts.balance"),
+                                  "declared numeric; operational type unknown"),))
+
 
 def _seed_feature(db, feature_id: str, name: str) -> None:
     """RF-I4: contract.feature_id is FK-constrained (contract_feature_id_fk, migration 0972) —
@@ -44,3 +70,25 @@ def test_contract_validation_status_defaults_to_design_checked(db):
     ).fetchone()
     assert row[0] == "DESIGN_CHECKED"
     assert row[1] == []
+
+
+def test_draft_contract_carries_validation_status_and_requirements(db):
+    _bank(db)
+    client = FakeLLM(script={"overlay.contract.draft": FakeResponse(
+        output={"definition": "Average 90-day ledger balance per account."})})
+    draft = draft_contract(db, _nev_idea(), client)
+    assert draft.validation_status == "NEEDS_EXTERNAL_VALIDATION"
+    assert draft.requirements == (
+        Requirement("TYPE_IS_NUMERIC", ("bank", "public.accounts.balance"),
+                    "declared numeric; operational type unknown"),)
+
+
+def test_draft_defaults_are_design_checked_and_empty(db):
+    _bank(db)
+    client = FakeLLM(script={"overlay.contract.draft": FakeResponse(output={"definition": "x"})})
+    plain = FeatureIdea(name="f", description="", derives_from=["public.accounts.balance"],
+                        aggregation="avg_90d", grain_table="accounts",
+                        derives_pairs=(("bank", "public.accounts.balance"),))
+    draft = draft_contract(db, plain, client)
+    assert draft.validation_status == "DESIGN_CHECKED"
+    assert draft.requirements == ()

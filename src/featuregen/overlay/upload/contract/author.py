@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from featuregen.intake.llm import LLMClient
 from featuregen.overlay.upload.enrich_llm import audited_enrich_call
 from featuregen.overlay.upload.entity import find_cross_catalog_path
-from featuregen.overlay.upload.feature_assist import FeatureIdea
+from featuregen.overlay.upload.feature_assist import FeatureIdea, Requirement
 from featuregen.overlay.upload.join_path import find_join_path
 from featuregen.overlay.upload.read_scope import allowed_sensitivities
 
@@ -34,6 +34,11 @@ class ContractDraft:
     # The deterministic join path grain -> derived tables (the no-DB-honesty piece); [] if single-table
     # or cross-catalog (cross-catalog join-path authoring rides find_cross_catalog_path, follow-up).
     join_path: tuple[dict, ...] = ()
+    # 3A-ii: the honest tri-state carried from the chosen FeatureIdea, so a NEEDS_EXTERNAL_VALIDATION
+    # feature reaches confirm/persistence honestly (never silently DESIGN_CHECKED). This is a SEPARATE
+    # axis from the hyphenated `verification` stamp; underscore VALIDATION_STATES vocabulary.
+    validation_status: str = "DESIGN_CHECKED"
+    requirements: tuple[Requirement, ...] = ()
 
 
 def _as_of_column(conn, grain_table: str | None, catalog_source: str | None) -> str | None:
@@ -114,4 +119,5 @@ def draft_contract(conn, feature: FeatureIdea, client: LLMClient, *, actor=None,
         as_of_column=_as_of_column(conn, feature.grain_table, grain_catalog),
         derives_from=list(feature.derives_from), target_ref=target_ref,
         derives_pairs=feature.derives_pairs,
-        join_path=_join_path(conn, feature.grain_table, feature.derives_pairs, roles))
+        join_path=_join_path(conn, feature.grain_table, feature.derives_pairs, roles),
+        validation_status=feature.validation_status, requirements=feature.requirements)
