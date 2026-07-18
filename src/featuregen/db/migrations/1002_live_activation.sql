@@ -6,12 +6,12 @@
 -- (mirror 0971). Approval is permitted only over a result='PASS' evaluation (enforced in code).
 CREATE TABLE IF NOT EXISTS enablement_evaluation (
     evaluation_id     text        PRIMARY KEY,
-    telemetry_window  jsonb       NOT NULL,
-    population_report jsonb       NOT NULL,
-    gold_set_result   jsonb       NOT NULL,
-    stability_result  jsonb       NOT NULL,
+    telemetry_window  jsonb       NOT NULL CHECK (jsonb_typeof(telemetry_window) = 'object'),
+    population_report jsonb       NOT NULL CHECK (jsonb_typeof(population_report) = 'object'),
+    gold_set_result   jsonb       NOT NULL CHECK (jsonb_typeof(gold_set_result) = 'object'),
+    stability_result  jsonb       NOT NULL CHECK (jsonb_typeof(stability_result) = 'object'),
     layer_b_labels    jsonb       NULL,
-    version_vector    jsonb       NOT NULL,
+    version_vector    jsonb       NOT NULL CHECK (jsonb_typeof(version_vector) = 'object'),
     result            text        NOT NULL CHECK (result IN ('PASS', 'FAIL')),
     content_hash      text        NOT NULL,
     evaluated_at      timestamptz NOT NULL DEFAULT now()
