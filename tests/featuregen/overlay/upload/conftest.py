@@ -226,3 +226,108 @@ def fake_synth_client(glossary_rows, technical_rows):
     client.script(task="overlay.enrich.domain", prompt_id="overlay_domain_v1",
                   responses=[FakeResponse(output={"domain": "payments"})])
     return client
+
+
+# ── Task 11 fixture: the PG-backed acceptance harness on the committed synthetic FTR sample. ──────
+# `synthetic_ftr_upload(db, *, source)` reads the committed CSV, routes it through the REAL FTR
+# reader (`read_ftr_glossary`/`to_glossary_upload`), and runs `ingest_upload` with a scripted,
+# request-CAPTURING FakeLLM (Pass A concept/definition/domain + the Pass B two-phase wide-table
+# path). Pass B is enabled (OVERLAY_TABLE_SYNTH=1) so the acceptance test can inspect what Pass B
+# actually received. The scripted synthesis ABSTAINS (empty grain, no as-of), the required "at least
+# one abstaining table". Also consumed by Task 8. Returns the `IngestResult`; the capturing client
+# and the parsed upload are stashed on the callable (`.client`, `.upload`) for request inspection.
+
+_SYNTHETIC_FTR_CSV = (
+    __import__("pathlib").Path(__file__).parent / "fixtures" / "ftr_sample_synthetic.csv")
+
+
+class _CapturingFakeLLM:
+    """Wraps a FakeLLM, recording every LLMRequest it is asked to serve so the acceptance test can
+    prove Pass A received sanitized defs + declared types and Pass B received complete metadata by
+    inspecting the CAPTURED request inputs (never the responses). Satisfies the LLMClient protocol."""
+
+    def __init__(self, inner) -> None:
+        self._inner = inner
+        self.requests: list = []
+
+    def call(self, request):
+        self.requests.append(request)
+        return self._inner.call(request)
+
+    def requests_for(self, task: str) -> list:
+        return [r for r in self.requests if r.task == task]
+
+
+class _SyntheticFtrUpload:
+    def __init__(self) -> None:
+        self.client: _CapturingFakeLLM | None = None
+        self.upload = None
+
+    def __call__(self, db, *, source: str):
+        from datetime import UTC, datetime, timedelta
+
+        from featuregen.contracts.envelopes import IdentityEnvelope
+        from featuregen.intake.llm import FakeLLM, FakeResponse
+        from featuregen.overlay.config import OverlayConfig, register_overlay_config
+        from featuregen.overlay.upload.canonical import validate_rows
+        from featuregen.overlay.upload.enrich import content_hash
+        from featuregen.overlay.upload.enrich_llm import _MAX_COLUMN_PROFILES
+        from featuregen.overlay.upload.ftr_adapter import read_ftr_glossary, to_glossary_upload
+        from featuregen.overlay.upload.ingest import ingest_upload
+        from featuregen.overlay.upload.source_profile import FTR_GLOSSARY_PROFILE
+
+        register_overlay_config(OverlayConfig(
+            ttl_default=timedelta(days=180), ttl_min=timedelta(days=30),
+            ttl_max=timedelta(days=365), ttl_jitter_fraction=0.1, renewal_grace=timedelta(days=14),
+            drift_scan_interval=timedelta(minutes=15), drift_freshness_sla=timedelta(hours=24),
+            profiler_require_restricted_role=False))
+
+        text = _SYNTHETIC_FTR_CSV.read_text(encoding="utf-8")
+        upload = to_glossary_upload(read_ftr_glossary(text, source=source))
+        self.upload = upload
+
+        # Script the refs off the VALIDATED rows, exactly what ingest enriches: validate_rows
+        # lowercases table/column, so a content_hash / table name computed from the raw upload.rows
+        # (uppercase FQN) would never match the enrichment's per-item refs — the batch would resolve
+        # nothing and silently fall back. `good` is the same list `ingest_upload` derives internally.
+        good = validate_rows(upload.rows, source, profile=FTR_GLOSSARY_PROFILE).good
+        hashes = [content_hash(r) for r in good]
+        tables = sorted({r.table for r in good})
+        # Wide-table Pass B two-phase refs: one summary per <=64-column chunk, keyed by table name.
+        chunk_refs: list[str] = []
+        for t in tables:
+            ncols = sum(1 for r in good if r.table == t)
+            nchunks = -(-ncols // _MAX_COLUMN_PROFILES)   # ceil
+            chunk_refs += [f"{t}#chunk{i}" for i in range(nchunks)]
+        abstain = {"grain_columns": [], "as_of_column": None, "as_of_basis": None,
+                   "primary_entity": None, "table_role": None, "event_or_snapshot": None}
+        chunk_summary = {"grain_candidates": [], "temporal_candidates": [], "entity_signals": [],
+                         "event_or_snapshot": "event"}
+        inner = FakeLLM(script={
+            "overlay.enrich.concept": FakeResponse(output={"results": [
+                {"ref": h, "concept": "monetary_stock"} for h in hashes]}),
+            # Every fixture definition is declared, so draft_definitions makes no call; scripted anyway.
+            "overlay.enrich.definition": FakeResponse(output={"results": []}),
+            "overlay.enrich.domain": FakeResponse(output={"results": [
+                {"ref": t, "domain": "compliance"} for t in tables]}),
+            "table_synth_summary": FakeResponse(output={"results": [
+                {"ref": ref, "summary": chunk_summary} for ref in chunk_refs]}),
+            "table_synth": FakeResponse(output={"results": [
+                {"ref": t, "synthesis": abstain} for t in tables]}),
+        })
+        client = _CapturingFakeLLM(inner)
+        self.client = client
+
+        actor = IdentityEnvelope(subject="upload", actor_kind="human", authenticated=True,
+                                 auth_method="oidc", role_claims=("data_owner",))
+        return ingest_upload(db, source, upload.rows, actor=actor,
+                             now=datetime(2026, 7, 17, tzinfo=UTC), client=client, glossary=upload)
+
+
+@pytest.fixture
+def synthetic_ftr_upload(monkeypatch):
+    """Return `synthetic_ftr_upload(db, *, source) -> IngestResult` (Task 11 / Task 8). Enables
+    Pass B for the run (OVERLAY_TABLE_SYNTH=1, auto-reverted). The capturing client and parsed
+    upload are exposed as `synthetic_ftr_upload.client` / `.upload` after a call."""
+    monkeypatch.setenv("OVERLAY_TABLE_SYNTH", "1")
+    return _SyntheticFtrUpload()
