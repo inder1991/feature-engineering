@@ -3,7 +3,8 @@
 `make_ref_accept` validates each serialized `synthesis` against THAT table's real columns (grain
 columns + as_of column must exist on the table; as_of basis must be a lag-free enum), mapping a valid
 result onto the FACT_VALUE_SCHEMAS shapes (grain `{columns, is_unique}` / availability `{column,
-basis}`). An all-empty proposal is an ABSTENTION (`empty_synthesis`), never a guessed grain.
+basis}`). An all-empty proposal is a VALID ABSTENTION (`abstained` — both facts None), never a
+guessed grain (MF-3); only unparseable / non-object raw is rejected.
 `synthesize_tables` drives `run_batched` over the assembled items and returns `{table: synthesis}` for
 VALID results only — validation happens INSIDE the harness (ref-aware), so an INVALID synthesis never
 reaches the returned dict.
@@ -70,18 +71,26 @@ def test_bad_as_of_basis_keeps_a_valid_grain():
     assert out["availability_time"] is None
 
 
-def test_bad_as_of_with_no_grain_is_empty_synthesis():
-    # Decoupling does NOT resurrect a nothing-proposal: a bad as-of AND no grain -> both absent ->
-    # still an abstention (skipped-loud), never a guessed grain.
+def test_bad_as_of_with_no_grain_is_a_valid_abstention():
+    # MF-3: decoupling does NOT resurrect a guessed grain — but a bad as-of AND no grain is now a
+    # VALID ABSTENTION (both facts None), not a whole-item reject. The advisory role/entity survive.
     accept = make_ref_accept({"txn": {"id"}})
-    val, reason = accept(_syn(grain_columns=[], as_of_column="ghost", as_of_basis="posted_at"), "txn")
-    assert val is None and reason == "empty_synthesis"
+    val, reason = accept(_syn(grain_columns=[], as_of_column="ghost", as_of_basis="posted_at",
+                              table_role="reference"), "txn")
+    assert reason == "abstained"
+    out = json.loads(val)
+    assert out["grain"] is None and out["availability_time"] is None   # zero facts proposed
+    assert out["table_role"] == "reference"                            # advisory field retained
 
 
-def test_abstention_empty_grain_is_skipped_not_guessed():
+def test_empty_grain_is_a_valid_abstention_not_guessed():
+    # MF-3: an empty grain_columns is the model ABSTAINING — accepted (no grain guessed), reason
+    # "abstained" so _enrichment_outcome counts it resolved-but-abstained, not a stage failure.
     accept = make_ref_accept({"txn": {"id"}})
     val, reason = accept(_syn(grain_columns=[]), "txn")
-    assert val is None and reason == "empty_synthesis"
+    assert reason == "abstained"
+    out = json.loads(val)
+    assert out["grain"] is None and out["availability_time"] is None
 
 
 # --- driver e2e (fake client) -----------------------------------------------------------------------

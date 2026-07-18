@@ -127,7 +127,7 @@ def make_ref_accept(columns_by_table: dict[str, set[str]]):
         # outside the lag-free enum) drops ONLY the availability — it must NEVER discard an otherwise
         # VALID grain proposal. Coupling them silently lost a real grain to a single hallucinated
         # as-of column; the grain still proposes and the bad as-of is logged/counted, not returned as
-        # a whole-item rejection. Both absent still abstains (empty_synthesis) below.
+        # a whole-item rejection. Both absent is a valid ABSTENTION (retained below), never a reject.
         availability = None
         if as_of_col is not None:
             if as_of_col in cols and as_of_basis in _VALID_BASIS:
@@ -136,12 +136,13 @@ def make_ref_accept(columns_by_table: dict[str, set[str]]):
                 counters.incr("overlay.table_synth.availability.dropped_bad_as_of")
                 logger.info("table_synth dropped a bad as-of for %r (col=%r basis=%r) — keeping grain",
                             ref, as_of_col, as_of_basis)
-        if grain is None and availability is None:
-            return None, "empty_synthesis"    # abstention / nothing proposed -> skipped-loud
+        # A parseable synthesis with neither grain nor availability is a VALID ABSTENTION (some tables
+        # genuinely have no single grain / as-of) — retain any role/entity it returned and propose zero
+        # grain/availability facts. Only unparseable / non-object raw (rejected earlier) is a failure.
         out = {"grain": grain, "availability_time": availability,
                "table_role": s.get("table_role"), "primary_entity": s.get("primary_entity"),
                "event_or_snapshot": s.get("event_or_snapshot")}
-        return json.dumps(out, sort_keys=True), "valid"
+        return json.dumps(out, sort_keys=True), ("valid" if (grain or availability) else "abstained")
     return accept
 
 

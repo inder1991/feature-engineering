@@ -151,13 +151,23 @@ def _enrichment_outcome(result: dict | None, expected: int, *, internal_failures
     (the stage's advisory except fired) is ``failed``; a non-empty expectation resolving NOTHING is
     ``failed``; SOME items unresolved — or the stage caught per-item failures INTERNALLY (the
     concept-evidence writes, batch discards, Pass B) — is ``partial``: an outer success is NOT
-    evidence that every item succeeded. Counts ride in ``detail`` (never row data)."""
+    evidence that every item succeeded. Counts ride in ``detail`` (never row data).
+
+    A Pass B ABSTENTION (a parseable synthesis with no grain AND no as-of) is RESOLVED, not a failure
+    — some tables genuinely have no single grain/as-of. Its count rides in ``detail["abstained"]``
+    (present only when non-zero, like ``unresolved``). Only dict-valued stages (Pass B) can abstain;
+    string-valued stages (concept/definition/domain) never match, so their detail is unchanged."""
     if result is None:
         return "failed", "exception", {"expected": expected}
     detail: dict = {"resolved": len(result), "expected": expected}
     unresolved = max(expected - len(result), 0)
     if unresolved:
         detail["unresolved"] = unresolved
+    abstained = sum(1 for syn in result.values()
+                    if isinstance(syn, dict)
+                    and syn.get("grain") is None and syn.get("availability_time") is None)
+    if abstained:
+        detail["abstained"] = abstained
     if internal_failures:
         detail["internal_failures"] = internal_failures
     if expected and not result:
