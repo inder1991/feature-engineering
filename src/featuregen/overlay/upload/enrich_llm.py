@@ -389,17 +389,22 @@ def register_enrichment_schemas(conn) -> None:
 
 def audited_structured_call(conn, client: LLMClient, *, task: str, prompt_id: str, schema_id: str,
                             catalog_metadata: dict, instruction: str,
-                            actor: IdentityEnvelope | None = None) -> dict | None:
+                            actor: IdentityEnvelope | None = None,
+                            prompt_version: int = 1, schema_version: int = 1) -> dict | None:
     """Run one governed metadata-only call and return the VALIDATED output dict, or None on any egress
     block / non-success. Attaches the registered output-schema (so a real provider does NOT fail closed),
     runs the egress guard, and records one immutable llm_call. The single audited seam for every overlay
-    LLM node — enrichment, contract authoring/refine, and contract critique."""
+    LLM node — enrichment, contract authoring/refine, and contract critique.
+
+    ``prompt_version``/``schema_version`` pin the request's contract (default ``1`` — byte-for-byte the
+    v1 behavior): the resolved output-schema, the stamped request versions, and the validation all use
+    them, so a versioned enrichment call cannot silently egress under the v1 contract."""
     actor = actor or _ENRICH_ACTOR
     reg = DocumentSchemaRegistry(conn)
-    schema = reg.schema_for(schema_id, 1)
+    schema = reg.schema_for(schema_id, schema_version)
     if schema is None:                      # self-register on first use (idempotent) so a real
         register_enrichment_schemas(conn)   # provider never fails closed for lack of a schema.
-        schema = reg.schema_for(schema_id, 1)
+        schema = reg.schema_for(schema_id, schema_version)
 
     # #19: glossary free-text in the metadata is scanned/scrubbed BEFORE the payload is built —
     # the classification below is what the scan established, never a hardcoded "clean".
@@ -416,8 +421,8 @@ def audited_structured_call(conn, client: LLMClient, *, task: str, prompt_id: st
     inputs = build_llm_inputs(redaction, catalog_metadata=safe_metadata,
                               raw_input_classification="contains_pii" if spans else "clean")
     req = LLMRequest(
-        task=task, prompt_id=prompt_id, prompt_version=1, inputs=inputs,
-        output_schema_id=schema_id, output_schema_version=1,
+        task=task, prompt_id=prompt_id, prompt_version=prompt_version, inputs=inputs,
+        output_schema_id=schema_id, output_schema_version=schema_version,
         generation_settings=_generation_settings(),   # from env — NOT a hard-coded fake/test
         output_schema=schema)
 
@@ -429,7 +434,7 @@ def audited_structured_call(conn, client: LLMClient, *, task: str, prompt_id: st
         return None                       # hard fail closed — no dispatch, no cache
 
     outcome = drive_structured_call(
-        client, req, lambda output: reg.validate(schema_id, 1, output))
+        client, req, lambda output: reg.validate(schema_id, schema_version, output))
     _record_llm_call_durable(   # #20: egress evidence survives an upload-transaction rollback
         conn, run_id=_RUN, request=req, input_hash=compute_input_hash(req.inputs),
         redaction_version=redaction_version,
@@ -447,12 +452,15 @@ def audited_structured_call(conn, client: LLMClient, *, task: str, prompt_id: st
 
 def audited_enrich_call(conn, client: LLMClient, *, task: str, prompt_id: str, schema_id: str,
                         catalog_metadata: dict, out_key: str, instruction: str,
-                        actor: IdentityEnvelope | None = None) -> str | None:
+                        actor: IdentityEnvelope | None = None,
+                        prompt_version: int = 1, schema_version: int = 1) -> str | None:
     """Single-string convenience over `audited_structured_call`: returns the trimmed `out_key` field, or
-    None on any egress block / non-success / empty output (so the caller never caches a failure)."""
+    None on any egress block / non-success / empty output (so the caller never caches a failure).
+    ``prompt_version``/``schema_version`` (default ``1``) thread straight to the structured seam."""
     out = audited_structured_call(
         conn, client, task=task, prompt_id=prompt_id, schema_id=schema_id,
-        catalog_metadata=catalog_metadata, instruction=instruction, actor=actor)
+        catalog_metadata=catalog_metadata, instruction=instruction, actor=actor,
+        prompt_version=prompt_version, schema_version=schema_version)
     if not out:
         return None
     val = str(out.get(out_key, "")).strip()
@@ -575,10 +583,14 @@ def _item_egress_ok(metadata: dict) -> bool:
 def audited_batch_call(conn, client: LLMClient, *, task: str, prompt_id: str, schema_id: str,
                        shared_metadata: dict, items: list[BatchItem], out_key: str, instruction: str,
                        accept, actor: IdentityEnvelope | None = None,
-                       extract=None, ref_aware: bool = False) -> BatchCallResult:
+                       extract=None, ref_aware: bool = False,
+                       prompt_version: int = 1, schema_version: int = 1) -> BatchCallResult:
     """One GOVERNED batch call (spec C4/C9): per-item egress filter -> batch-level egress guard ->
     schema-validated array call -> one immutable llm_call with a per-item outcome summary. Returns a
-    BatchCallResult whose outcomes classify every requested ref (via validate_batch_results)."""
+    BatchCallResult whose outcomes classify every requested ref (via validate_batch_results).
+
+    ``prompt_version``/``schema_version`` pin the request's contract (default ``1`` — byte-for-byte the
+    v1 behavior): output-schema resolution, the stamped request versions, and validation all use them."""
     actor = actor or _ENRICH_ACTOR
     excluded = [it for it in items if not _item_egress_ok(it.metadata)]
     included = [it for it in items if _item_egress_ok(it.metadata)]
@@ -608,10 +620,10 @@ def audited_batch_call(conn, client: LLMClient, *, task: str, prompt_id: str, sc
         return BatchCallResult(tuple(egress_outcomes), 0, 0, 0)
 
     reg = DocumentSchemaRegistry(conn)
-    schema = reg.schema_for(schema_id, 1)
+    schema = reg.schema_for(schema_id, schema_version)
     if schema is None:
         register_enrichment_schemas(conn)
-        schema = reg.schema_for(schema_id, 1)
+        schema = reg.schema_for(schema_id, schema_version)
 
     catalog_metadata = {**shared_metadata,
                         "items": [{"ref": it.ref, **it.metadata} for it in included]}
@@ -620,8 +632,8 @@ def audited_batch_call(conn, client: LLMClient, *, task: str, prompt_id: str, sc
                                 redacted_spans=(), disposition="ok")
     inputs = build_llm_inputs(redaction, catalog_metadata=catalog_metadata,
                               raw_input_classification="contains_pii" if all_spans else "clean")
-    req = LLMRequest(task=task, prompt_id=prompt_id, prompt_version=1, inputs=inputs,
-                     output_schema_id=schema_id, output_schema_version=1,
+    req = LLMRequest(task=task, prompt_id=prompt_id, prompt_version=prompt_version, inputs=inputs,
+                     output_schema_id=schema_id, output_schema_version=schema_version,
                      generation_settings=_generation_settings(), output_schema=schema)
 
     try:
@@ -633,7 +645,8 @@ def audited_batch_call(conn, client: LLMClient, *, task: str, prompt_id: str, sc
                                          extract=extract, ref_aware=ref_aware)
         return BatchCallResult(tuple(egress_outcomes) + tuple(missing), 0, 0, 0)
 
-    outcome = drive_structured_call(client, req, lambda o: reg.validate(schema_id, 1, o))
+    outcome = drive_structured_call(client, req,
+                                    lambda o: reg.validate(schema_id, schema_version, o))
     # A repair-exhausted / truncated batch (STATUS_FAILED) carries an UNVERIFIED body — do not harvest
     # it. Treat it as empty so validate_batch_results marks every requested ref MISSING and the
     # orchestrator's fallback ladder recovers it. Mirrors audited_structured_call returning None on

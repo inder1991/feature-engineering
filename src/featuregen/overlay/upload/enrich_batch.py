@@ -115,20 +115,26 @@ def chunk_items(items: list[BatchItem], *, max_items: int,
 
 
 def _single_fallback(conn, client, *, task, out_key, instruction, item: BatchItem, shared_metadata,
-                     accept, actor, ref_aware: bool = False) -> tuple[str | None, str]:
+                     accept, actor, ref_aware: bool = False,
+                     prompt_version: int = 1, schema_version: int = 1) -> tuple[str | None, str]:
     """One per-item fallback through the existing single seam. Returns (value|None, status).
 
     A ``ref_aware`` (structured) task has NO single-call fallback in Phase 2: the flat single schema
     carries no ``synthesis`` wrapper and the ref-aware ``accept`` needs ``(raw, ref)``, so the item is
-    simply left unresolved (MISSING) — never re-sent through the mismatched flat seam."""
+    simply left unresolved (MISSING) — never re-sent through the mismatched flat seam.
+
+    ``prompt_version``/``schema_version`` (default ``1``) thread through to the single seam so a
+    versioned batch that degrades to per-item fallback runs under the SAME contract, never silently
+    retrying under v1 — the prompt_id label is versioned to match (``_v1`` at the default)."""
     if ref_aware:
         return None, MISSING
     from featuregen.overlay.upload.enrich_llm import audited_enrich_call  # lazy (import cycle)
     single_prompt = task.rsplit(".", 1)[-1]   # concept|definition|domain
     raw = audited_enrich_call(
-        conn, client, task=task, prompt_id=f"overlay_{single_prompt}_v1",
+        conn, client, task=task, prompt_id=f"overlay_{single_prompt}_v{prompt_version}",
         schema_id=f"overlay_{single_prompt}", out_key=out_key,
-        catalog_metadata={**shared_metadata, **item.metadata}, instruction=instruction, actor=actor)
+        catalog_metadata={**shared_metadata, **item.metadata}, instruction=instruction, actor=actor,
+        prompt_version=prompt_version, schema_version=schema_version)
     if raw is None:
         return None, FALLBACK_FAILED
     value, _reason = accept(raw)
@@ -138,11 +144,16 @@ def _single_fallback(conn, client, *, task, out_key, instruction, item: BatchIte
 def run_batched(conn, client, *, short: str, task: str, prompt_id: str, schema_id: str,
                 shared_metadata: dict, items: list[BatchItem], out_key: str, instruction: str,
                 accept: Accept, actor, extract=None, ref_aware: bool = False,
+                prompt_version: int = 1, schema_version: int = 1,
                 now: Callable[[], float] = time.monotonic, deadline_s: float | None = None,
                 report: dict | None = None) -> dict[str, str]:
     """Chunk `items`, call the governed batch seam, and walk the bounded degradation ladder
     (spec C4): salvage valid -> retry a failed chunk -> adaptive split -> capped single fallback ->
     leave remainder uncached. Returns {ref: accepted_value} for items resolved this run.
+
+    ``prompt_version``/``schema_version`` (default ``1`` — byte-for-byte today) pin the enrichment
+    contract and thread through BOTH the batch seam AND the single-fallback seam, so a versioned batch
+    that degrades to per-item fallback can never silently retry under the v1 prompt/schema.
 
     MF-4 — stage deadline: when ``deadline_s`` is not None, before issuing each top-level chunk we
     check the INJECTED monotonic clock ``now`` (test-seam; real ``time.monotonic`` in production). If
@@ -173,7 +184,8 @@ def run_batched(conn, client, *, short: str, task: str, prompt_id: str, schema_i
         res = audited_batch_call(conn, client, task=task, prompt_id=prompt_id, schema_id=schema_id,
                                  shared_metadata=shared_metadata, items=chunk, out_key=out_key,
                                  instruction=instruction, accept=accept, actor=actor,
-                                 extract=extract, ref_aware=ref_aware)
+                                 extract=extract, ref_aware=ref_aware,
+                                 prompt_version=prompt_version, schema_version=schema_version)
         calls += res.provider_calls
         counters.incr(f"overlay.enrich.{short}.batch.calls")
         for o in res.outcomes:
@@ -221,7 +233,9 @@ def run_batched(conn, client, *, short: str, task: str, prompt_id: str, schema_i
             value, status = _single_fallback(conn, client, task=task, out_key=out_key,
                                               instruction=instruction, item=it,
                                               shared_metadata=shared_metadata, accept=accept,
-                                              actor=actor, ref_aware=ref_aware)
+                                              actor=actor, ref_aware=ref_aware,
+                                              prompt_version=prompt_version,
+                                              schema_version=schema_version)
             if value is not None:
                 resolved[it.ref] = value
 
