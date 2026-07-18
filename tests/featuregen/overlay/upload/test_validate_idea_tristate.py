@@ -238,3 +238,77 @@ def test_governed_grain_clears_grain_check(db):
     assert rej is None
     assert all(r.code != "GRAIN_IS_UNIQUE" for r in idea.requirements)
     assert idea.grain_ref == ("bank", "public.accounts.id")
+
+
+def test_absent_units_across_combining_op_needs_unit_and_currency_consistent(db):
+    build_graph(db, "t", [
+        CanonicalRow("t", "accounts", "id", "integer", is_grain=True),
+        CanonicalRow("t", "accounts", "a", "numeric"),   # no unit / currency
+        CanonicalRow("t", "accounts", "b", "numeric")])
+    _fresh(db, "t")
+    known, src_of = _kv(["public.accounts.a", "public.accounts.b"], "t")
+    raw = {"name": "ratio_ab", "derives_from": ["public.accounts.a", "public.accounts.b"],
+           "aggregation": "ratio"}
+    idea, rej = _validate_idea(db, raw, known, src_of, None, NOW, FRESH)
+    assert rej is None
+    assert idea.validation_status == "NEEDS_EXTERNAL_VALIDATION"
+    codes = {r.code for r in idea.requirements}
+    assert "UNIT_CONSISTENT" in codes and "CURRENCY_CONSISTENT" in codes
+
+
+def test_mixed_units_still_hard_rejected(db):
+    build_graph(db, "t", [
+        CanonicalRow("t", "accounts", "id", "integer", is_grain=True),
+        CanonicalRow("t", "accounts", "a", "numeric", unit="dollars"),
+        CanonicalRow("t", "accounts", "b", "numeric", unit="cents")])
+    _fresh(db, "t")
+    known, src_of = _kv(["public.accounts.a", "public.accounts.b"], "t")
+    raw = {"name": "sum_ab", "derives_from": ["public.accounts.a", "public.accounts.b"],
+           "aggregation": "avg"}
+    idea, rej = _validate_idea(db, raw, known, src_of, None, NOW, FRESH)
+    assert idea is None and rej.code == RejectCode.MIXED_UNITS
+
+
+def test_mixed_currency_still_hard_rejected(db):
+    build_graph(db, "t", [
+        CanonicalRow("t", "accounts", "id", "integer", is_grain=True),
+        CanonicalRow("t", "accounts", "a", "numeric", currency="USD"),
+        CanonicalRow("t", "accounts", "b", "numeric", currency="EUR")])
+    _fresh(db, "t")
+    known, src_of = _kv(["public.accounts.a", "public.accounts.b"], "t")
+    raw = {"name": "sum_ab", "derives_from": ["public.accounts.a", "public.accounts.b"],
+           "aggregation": "avg"}
+    idea, rej = _validate_idea(db, raw, known, src_of, None, NOW, FRESH)
+    assert idea is None and rej.code == RejectCode.MIXED_CURRENCY
+
+
+def test_partially_absent_unit_needs_check_on_the_absent_operand_only(db):
+    # a declares dollars, b declares NOTHING: no positive contradiction (no reject), but the silent
+    # pass is closed — the ABSENT operand carries the UNIT_CONSISTENT check. Currency agrees on both
+    # so no CURRENCY_CONSISTENT (a matching hint adds no requirement — and promotes nothing).
+    build_graph(db, "t", [
+        CanonicalRow("t", "accounts", "id", "integer", is_grain=True),
+        CanonicalRow("t", "accounts", "a", "numeric", unit="dollars", currency="USD"),
+        CanonicalRow("t", "accounts", "b", "numeric", currency="USD")])
+    _fresh(db, "t")
+    known, src_of = _kv(["public.accounts.a", "public.accounts.b"], "t")
+    raw = {"name": "ratio_ab", "derives_from": ["public.accounts.a", "public.accounts.b"],
+           "aggregation": "ratio"}
+    idea, rej = _validate_idea(db, raw, known, src_of, None, NOW, FRESH)
+    assert rej is None
+    assert idea.validation_status == "NEEDS_EXTERNAL_VALIDATION"
+    units = [r.operand for r in idea.requirements if r.code == "UNIT_CONSISTENT"]
+    assert units == [("t", "public.accounts.b")]
+    assert all(r.code != "CURRENCY_CONSISTENT" for r in idea.requirements)
+
+
+def test_single_measure_absent_unit_adds_no_requirement(db):
+    build_graph(db, "t", [
+        CanonicalRow("t", "accounts", "id", "integer", is_grain=True),
+        CanonicalRow("t", "accounts", "a", "numeric")])
+    _fresh(db, "t")
+    known, src_of = _kv(["public.accounts.a"], "t")
+    raw = {"name": "avg_a", "derives_from": ["public.accounts.a"], "aggregation": "avg"}
+    idea, rej = _validate_idea(db, raw, known, src_of, None, NOW, FRESH)
+    assert rej is None
+    assert all(r.code not in ("UNIT_CONSISTENT", "CURRENCY_CONSISTENT") for r in idea.requirements)

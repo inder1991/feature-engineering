@@ -282,7 +282,9 @@ def _validate_idea(conn, raw: dict, known: set[str], src_of: dict[str, set[str]]
                 requirements.append(Requirement("ADDITIVITY_SUPPORTS_OPERATION", (src, d),
                                                 "additivity not governed-confirmed"))
 
-    # ── disposition: unit / currency (Task 9 AUGMENTS this block) ──
+    # ── disposition: unit / currency — DISTINCT hint fields (never folded): a hint may TIGHTEN
+    #    (a positive contradiction rejects; absence needs-checks) but never CLEAR — matching
+    #    non-empty hints add no requirement and promote nothing ──
     units = {meta[d]["unit"] for d in derives if meta.get(d, {}).get("unit")}
     currencies = {meta[d]["currency"] for d in derives if meta.get(d, {}).get("currency")}
     if len(units) > 1:
@@ -290,6 +292,14 @@ def _validate_idea(conn, raw: dict, known: set[str], src_of: dict[str, set[str]]
                                f"mixed units {sorted(units)}; aggregation would be silently wrong")
     if len(currencies) > 1:
         return None, Rejection(RejectCode.MIXED_CURRENCY, f"mixed currencies {sorted(currencies)}")
+    if len(pairs) >= 2:   # a COMBINING op: an operand's unknown scale/currency is a fact to verify
+        for src, d in pairs:
+            if not meta[d]["unit"]:
+                requirements.append(Requirement("UNIT_CONSISTENT", (src, d),
+                                                "unit unknown across a combining op"))
+            if not meta[d]["currency"]:
+                requirements.append(Requirement("CURRENCY_CONSISTENT", (src, d),
+                                                "currency unknown across a combining op"))
 
     # ── disposition: temporal — a windowed feature needs a governed-VERIFIED as-of column; a table
     #    with NO as-of column at all is still a hard reject (future-leakage risk) ──
