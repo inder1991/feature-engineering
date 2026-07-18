@@ -246,6 +246,53 @@ def test_confirm_default_draft_persists_rerun_status_not_draft(db):
     assert [r["code"] for r in row[1]] == ["TYPE_IS_NUMERIC", "TEMPORAL_IS_POPULATED"]
 
 
+def test_needs_external_validation_survives_gate1_to_persisted_contract(db):
+    """Task 6 e2e (RF-C2, real catalog): a NEEDS_EXTERNAL_VALIDATION feature chosen at Gate #1 is
+    snapshotted, reconstructed, drafted, re-validated (MCV), and confirmed — and the CONTRACT ROW
+    records NEEDS_EXTERNAL_VALIDATION + the confirm-time RE-RUN's requirements (RF-C1), NOT a
+    silent DESIGN_CHECKED at any hop. The hyphenated verification stamp stays a SEPARATE axis
+    (recon #1 — does NOT reuse governance VERIFICATION_STAMPS)."""
+    _bank(db)
+    _seed_intent(db, "intent-e2e")
+    # Gate #1: the human's chosen option lands in the persisted considered-set snapshot.
+    cs = ConsideredSet("intent-e2e", None, [FeatureSet("templates", [_nev_idea()])], None)
+    db.execute(
+        "INSERT INTO contract_considered (intent_id, considered) VALUES (%s, %s::jsonb)",
+        ("intent-e2e", json.dumps(_snapshot(db, cs))))
+    # Reconstruct the chosen feature from the SERVER snapshot — the honest state must survive.
+    chosen = chosen_feature(db, "intent-e2e", "alternative", "avg_balance_90d")
+    assert chosen is not None
+    assert chosen.validation_status == "NEEDS_EXTERNAL_VALIDATION"
+    assert chosen.requirements == (
+        Requirement("TYPE_IS_NUMERIC", ("bank", "public.accounts.balance"),
+                    "operational type unknown; numeric declared hint"),)
+    # Author the draft; the state rides onto the draft.
+    client = FakeLLM(script={"overlay.contract.draft": FakeResponse(
+        output={"definition": "Average 90-day ledger balance per account."})})
+    draft = draft_contract(db, chosen, client)
+    assert draft.validation_status == "NEEDS_EXTERNAL_VALIDATION"
+    assert draft.requirements == chosen.requirements
+    # The MCV re-runs and passes the gate (grounded; no `now`, so freshness is skipped) — and the
+    # re-run itself derives the honest state from the operationally-unknown catalog column.
+    check = validate_minimum(db, draft)
+    assert check.ok is True
+    assert check.validation_status == "NEEDS_EXTERNAL_VALIDATION"
+    # Confirm persists the CONFIRM-TIME re-run's honest state (RF-C1), never the draft's copy.
+    c = confirm_contract(db, draft, actor="ds1", intent_id="intent-e2e")
+    row = db.execute(
+        "SELECT validation_status, requirements, verification FROM contract "
+        "WHERE contract_id = %s", (c.contract_id,)).fetchone()
+    assert row[0] == "NEEDS_EXTERNAL_VALIDATION"         # honest at the END of the whole path
+    assert row[1] == [
+        {"code": "TYPE_IS_NUMERIC", "operand": ["bank", "public.accounts.balance"],
+         "detail": "operational type unknown; numeric declared hint"},
+        {"code": "TEMPORAL_IS_POPULATED", "operand": ["bank", "public.accounts.posted_at"],
+         "detail": "as-of column declared, not governed-verified"},
+    ]                                                    # the RE-RUN's real requirements (RF-C2)
+    assert row[1] == requirements_to_json(check.requirements)
+    assert row[2] == "DESIGN-CHECKED"                    # the SEPARATE verification axis intact
+
+
 def test_confirm_clean_rerun_persists_design_checked(db):
     """A re-run with NOTHING left to verify (non-numeric, non-windowed op on a known column)
     persists DESIGN_CHECKED + [] — earned by the clean re-run, not an artifact of draft defaults."""
