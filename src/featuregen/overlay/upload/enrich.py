@@ -21,7 +21,11 @@ from featuregen.overlay.upload.concepts import (
     is_known_concept,
 )
 from featuregen.overlay.upload.enrich_batch import BatchItem, run_batched
-from featuregen.overlay.upload.enrich_llm import ENRICHMENT_RUN_ID, audited_enrich_call
+from featuregen.overlay.upload.enrich_llm import (
+    ENRICHMENT_RUN_ID,
+    MAX_DEFINITION_LEN,
+    audited_enrich_call,
+)
 from featuregen.overlay.upload.glossary_reader import GlossaryRecord, GlossaryUpload
 from featuregen.overlay.upload.object_ref import normalize_ref, parse_ref
 from featuregen.overlay.upload.sample_parser import strip_sample_values
@@ -40,7 +44,9 @@ _DOMAIN_TASK = "overlay.enrich.domain"
 # Larger bound for a SANITIZED business definition specifically. The 200-char default cut every real
 # definition mid-sentence; sanitized definitions are the intended metadata payload, so allow a bigger
 # but still-bounded window with word-boundary truncation. Second boundary remains the batch token budget.
-_MAX_DEFINITION_LEN = 600
+# DRY: the value is the single `MAX_DEFINITION_LEN` shared with the egress cap (`enrich_llm`) and Pass
+# B's descriptor bound (`table_synth`); `_MAX_DEFINITION_LEN` stays as the historical private alias.
+_MAX_DEFINITION_LEN = MAX_DEFINITION_LEN
 
 
 def bounded_definition(text: str, limit: int) -> str:

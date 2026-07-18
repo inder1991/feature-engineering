@@ -486,9 +486,13 @@ _ITEM_META_ALLOWED = frozenset({
 # `business_definition` (already stripped of sample values upstream). The role fields
 # (identifier_role/temporal_role/semantic_type/entity) come from Pass A evidence and sharpen grain
 # proposals (an identifier-role column is grain-eligible; a temporal-role column is as-of-eligible).
+# The FTR-sidecar facets (term_type/domain/process_path — MF-2) come from the GlossaryRecord so the
+# synthesizer reasons over the column's business classification, not just its physical name/type;
+# they are bounded structural tokens (the default 200 cap via `_max_len_for`), never data values.
 _COLUMN_PROFILE_KEYS = frozenset({
     "column", "type", "concept", "business_definition",
     "identifier_role", "temporal_role", "semantic_type", "entity",
+    "term_type", "domain", "process_path",
 })
 _MAX_COLUMN_PROFILES = 64
 
@@ -505,11 +509,18 @@ _CHUNK_SUMMARY_KEYS = _CHUNK_SUMMARY_LIST_KEYS | {"event_or_snapshot"}
 _MAX_CHUNK_SUMMARIES = 256
 
 
+# The single source of truth for the SANITIZED business-definition length bound (DRY): re-exported by
+# `enrich` (as `MAX_DEFINITION_LEN`, with the private `_MAX_DEFINITION_LEN` alias) and consumed by
+# `table_synth._descriptor` — so `enrich.bounded_definition`'s window, the metadata-only egress cap,
+# and Pass B's descriptor bound can never drift apart. Defined HERE (not in `enrich`) because `enrich`
+# imports `enrich_llm`, so this module is the cycle-free home for the shared constant.
+MAX_DEFINITION_LEN = 600
+
 # Per-value egress length cap. Every scalar is capped at 200 EXCEPT the sanitized `business_definition`
 # — the intended metadata payload — which gets a larger (still-bounded) window so a real definition is
-# not cut mid-sentence before it egresses. Matches enrich.bounded_definition's `_MAX_DEFINITION_LEN`.
+# not cut mid-sentence before it egresses. Matches `enrich.bounded_definition`'s bound (same constant).
 _MAX_LEN_DEFAULT = 200
-_MAX_LEN_BY_KEY = {"business_definition": 600}
+_MAX_LEN_BY_KEY = {"business_definition": MAX_DEFINITION_LEN}
 
 
 def _max_len_for(key: str) -> int:

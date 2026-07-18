@@ -11,52 +11,86 @@ from __future__ import annotations
 
 import json
 import logging
+from typing import TYPE_CHECKING
 
 from featuregen.overlay.upload.canonical import CanonicalRow
-from featuregen.overlay.upload.enrich import bounded_definition, content_hash
+from featuregen.overlay.upload.enrich import MAX_DEFINITION_LEN, bounded_definition, content_hash
 from featuregen.overlay.upload.enrich_batch import BatchItem, run_batched
 from featuregen.overlay.upload.enrich_llm import _MAX_COLUMN_PROFILES
+from featuregen.overlay.upload.object_ref import _norm
 from featuregen.overlay.upload.sample_parser import strip_sample_values
 from featuregen.runtime.observability import counters
+
+if TYPE_CHECKING:
+    from featuregen.overlay.upload.glossary_reader import GlossaryRecord
 
 logger = logging.getLogger(__name__)
 
 
-def _descriptor(r: CanonicalRow, concept: str | None, definition: str | None) -> dict:
-    desc: dict = {"column": r.column, "type": r.type or ""}
+def _descriptor(r: CanonicalRow, concept: str | None, definition: str | None,
+                rec: GlossaryRecord | None) -> dict:
+    """Egress-safe per-column descriptor. When a glossary sidecar (`rec`) is present it supplies the
+    DECLARED type (a glossary keeps the operational `r.type` at `unknown`), the curated business
+    definition, and the FTR facets (term_type/domain/process_path/semantic_type — MF-2); else the
+    descriptor falls back to `r.type` and the Pass A draft, byte-for-byte as before."""
+    desc: dict = {"column": r.column,
+                  "type": (rec.declared_type if rec and rec.declared_type else (r.type or ""))}
     if concept:
         desc["concept"] = concept
-    # CRITICAL (M4 egress rule): source business_definition ONLY from the CURATED `definition` (the
-    # glossary sidecar meaning / Pass A draft) — NEVER from `r.definition`, the uploader's raw
-    # free-text cell. enrich.py::_concept_metadata forbids egressing a technical row's r.definition;
-    # we mirror that exactly. Even the curated text is sample-value-stripped as defence-in-depth and
-    # bounded on a word boundary to the per-value business_definition cap the egress filter enforces.
-    if definition:
-        cleaned = strip_sample_values(definition)
+    # CRITICAL (M4 egress rule): source business_definition ONLY from the CURATED sidecar meaning
+    # (`rec.definition`, sanitized) or, for a blank column, the Pass A draft (`definition`) — NEVER
+    # from `r.definition`, the uploader's raw free-text cell. enrich.py::_concept_metadata forbids
+    # egressing a technical row's r.definition; we mirror that exactly. The curated sidecar wins over
+    # the draft (the draft only fills blanks). Even the curated text is sample-value-stripped as
+    # defence-in-depth and bounded on a word boundary to the per-value business_definition egress cap.
+    src_def = rec.definition if rec and rec.definition else definition
+    if src_def:
+        cleaned = strip_sample_values(src_def)
         if cleaned:
-            desc["business_definition"] = bounded_definition(cleaned, 600)
+            desc["business_definition"] = bounded_definition(cleaned, MAX_DEFINITION_LEN)
+    if rec is not None:
+        # Bounded structural facets (business classification), each capped at the default egress
+        # per-value length (200). Blank facets are omitted so a technical descriptor is unchanged.
+        for key, val in (("term_type", rec.term_type), ("domain", rec.domain),
+                         ("process_path", rec.process_path),
+                         ("semantic_type", getattr(rec, "semantic_type", None))):
+            if val:
+                desc[key] = val[:200]
     return desc
 
 
 def assemble_table_items(rows: list[CanonicalRow], *, concepts: dict[str, str] | None,
-                         definitions: dict[str, str] | None) -> list[BatchItem]:
+                         definitions: dict[str, str] | None,
+                         records: dict[tuple[str, str], GlossaryRecord] | None = None
+                         ) -> list[BatchItem]:
     """One BatchItem per table; metadata carries each column's enriched, egress-safe descriptor.
 
-    Each descriptor is `{column, type, concept?, business_definition?}` (only non-empty keys) and the
-    assembled `BatchItem.metadata` is admissible under the Task-3 metadata-only egress filter
-    (`enrich_llm._item_egress_ok`).
+    Each descriptor is `{column, type, concept?, business_definition?, term_type?, domain?,
+    process_path?, semantic_type?}` (only non-empty keys) and the assembled `BatchItem.metadata` is
+    admissible under the Task-3 metadata-only egress filter (`enrich_llm._item_egress_ok`).
+
+    `records` (MF-2) is the glossary semantic sidecar keyed by NORMALIZED `(table, column)` — the same
+    `(table, column)` bridge Pass A (`enrich._records_by_tc`) and Pass C use, since the schema-dropped
+    `CanonicalRow` cannot join a schema-preserving `logical_ref`. A column with a record carries its
+    declared type + curated meaning + facets; `records=None` / no record for a column falls back to
+    `r.type` (a technical CSV upload is unchanged, byte-for-byte).
     """
     # Pass A stages are savepointed and may fail, leaving concepts/definitions None. Degrade to empty
-    # enrichment rather than AttributeError on None.get(...).
+    # enrichment rather than AttributeError on None.get(...). A non-glossary upload has no records.
     concepts = concepts or {}
     definitions = definitions or {}
+    records = records or {}
     by_table: dict[str, list[CanonicalRow]] = {}
     for r in rows:
         by_table.setdefault(r.table, []).append(r)
     items: list[BatchItem] = []
     for table, trows in by_table.items():
+        # Normalize the row's (table, column) on lookup — the record map is keyed by parse_ref's
+        # lowercased components, while a glossary CanonicalRow preserves the raw FQN case (mirrors
+        # enrich._records_by_tc / Pass C, which lowercase both sides).
         profiles = [
-            _descriptor(r, concepts.get(content_hash(r)), definitions.get(content_hash(r)))
+            _descriptor(r, concepts.get(content_hash(r)), definitions.get(content_hash(r)),
+                        records.get((_norm(r.table), _norm(r.column))))
             for r in trows
         ]
         items.append(BatchItem(ref=table, metadata={"table": table, "column_profiles": profiles}))

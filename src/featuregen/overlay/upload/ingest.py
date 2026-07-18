@@ -1442,7 +1442,25 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
             # SECOND contains the advisory propose/projection writes.
             with conn.transaction():
                 synth_snapshot = snapshot_id or mint_id("tsy")  # non-glossary uploads have snapshot_id=None
-                items = assemble_table_items(vr.good, concepts=concepts, definitions=definitions)
+                # MF-2: thread the glossary semantic sidecar into Pass B, keyed by normalized
+                # (table, column) — the SAME (table, column) bridge Pass C uses (341-353): the flat
+                # CanonicalRow is schema-dropped, so it cannot join the schema-preserving logical_ref
+                # string; (table, column) is the stable key. Table-level terms (no column) and
+                # unparseable refs are skipped. Empty for a non-glossary technical upload -> unchanged.
+                records: dict[tuple[str, str], GlossaryRecord] = {}
+                if glossary is not None:
+                    for rec in glossary.records:
+                        if rec.is_table:
+                            continue
+                        try:
+                            _src, _schema, t, c = parse_ref(rec.logical_ref)
+                        except ValueError:
+                            continue
+                        if c is None:
+                            continue
+                        records.setdefault((t, c), rec)
+                items = assemble_table_items(vr.good, concepts=concepts, definitions=definitions,
+                                             records=records)
                 cols = {t: {r.column for r in vr.good if r.table == t}
                         for t in {r.table for r in vr.good}}
                 syntheses = synthesize_tables(conn, client, items, columns_by_table=cols,
