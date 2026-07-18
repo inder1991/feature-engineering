@@ -93,6 +93,19 @@ export interface IngestResult {
   changed_objects: number
   quarantined: number
   flagged: string | null
+  // MF-5 truthful counts (backend IngestResult additive fields). Optional so older fixtures and a
+  // pre-MF-5 backend keep compiling; the callout renders the second line only when they arrive.
+  // objects_stored == tables + columns; containment_edges == columns (one contains edge each);
+  // facts_asserted mirrors `asserted`; join_candidates is Pass C's count (0 when off); Pass B
+  // splits into proposed (a synthesis with a grain or as-of) + abstained (neither).
+  objects_stored?: number
+  tables?: number
+  columns?: number
+  containment_edges?: number
+  facts_asserted?: number
+  join_candidates?: number
+  passb_proposed?: number
+  passb_abstained?: number
   // CLIENT-attached from the X-Ingestion-Run-Id response header, never a body field: the id of
   // the per-stage run record behind GET /ingestion-runs/{id}. Optional so existing fixtures and
   // callers keep compiling; null when the server sent no header.

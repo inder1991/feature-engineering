@@ -143,6 +143,21 @@ class IngestResult:
     changed_objects: int
     quarantined: int
     flagged: str | None = None   # a soft-gate note (e.g. first upload — review recommended)
+    # MF-5 truthful counts (additive, `=0` defaults so every POSITIONAL reject/held constructor
+    # site still builds). `asserted`/`changed_objects`/`quarantined` above conflate "127 nodes
+    # stored" with "126 columns" and say nothing about edges, join candidates, or Pass B; these
+    # tell the honest story. `objects_stored == tables + columns`; `containment_edges == columns`
+    # (one `contains` edge per column); `facts_asserted` mirrors `asserted` (the Pass A count);
+    # `join_candidates` is Pass C's discovered count (0 when Pass C is off); Pass B splits into
+    # `proposed` (a synthesis with a grain or an as-of) + `abstained` (neither).
+    objects_stored: int = 0
+    tables: int = 0
+    columns: int = 0
+    containment_edges: int = 0
+    facts_asserted: int = 0
+    join_candidates: int = 0
+    passb_proposed: int = 0
+    passb_abstained: int = 0
 
 
 def _enrichment_outcome(result: dict | None, expected: int, *, internal_failures: int = 0
@@ -387,13 +402,17 @@ def _pass_c_columns(conn, catalog_source: str, rows: list[CanonicalRow], *,
 
 
 def _run_pass_c(conn, catalog_source: str, rows: list[CanonicalRow], *,
-                concepts: dict[str, str] | None, glossary: GlossaryUpload | None) -> None:
+                concepts: dict[str, str] | None, glossary: GlossaryUpload | None) -> int:
     """Pass C: block + score this upload's columns, OWN THE CYCLE in the candidate ledger
     (clear-then-write: DELETE this source's rows, INSERT this cycle's strong + weak rows — a
     suppressed bucket is counted, never persisted), then propose the strong bucket through the
     governed approved_join path (`propose_join_candidates` grain-gates internally and stamps
     fact_key/proposed_event_id back onto the just-written ledger rows). Runs for glossary AND
-    technical uploads. The caller wraps this in a savepoint + except (fail-soft)."""
+    technical uploads. The caller wraps this in a savepoint + except (fail-soft).
+
+    Returns the count of candidate pairs this cycle PERSISTED to the ledger (strong + weak;
+    suppressed pairs are counted-not-persisted and excluded) — the MF-5 `join_candidates` count
+    threaded onto IngestResult. 0 when nothing survived scoring."""
     from featuregen.overlay.upload.enrich_llm import _ENRICH_ACTOR
     from featuregen.overlay.upload.passc.candidates import block_candidates, score
     from featuregen.overlay.upload.passc.lifecycle import candidate_fingerprint, unordered_pair
@@ -445,6 +464,9 @@ def _run_pass_c(conn, catalog_source: str, rows: list[CanonicalRow], *,
     if strong:
         # Service proposer (four-eyes holds against the two human confirmers). Fail-soft inside.
         propose_join_candidates(conn, catalog_source, strong, actor=_ENRICH_ACTOR)
+
+    # Persisted (non-suppressed) candidate pairs — the truthful `join_candidates` count (MF-5).
+    return sum(1 for ev in evidences if ev.bucket != "suppressed")
 
 
 # ── Glossary ingest wiring (spec §6.3 / §U). GUARDED: only runs for a glossary upload (a `glossary`
@@ -1407,6 +1429,9 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
     else:
         record_stage(stage_recorder, "governed_joins", "disabled")
 
+    # MF-5: Pass C's discovered join-candidate count, threaded onto the truthful result. 0 when
+    # Pass C is off (default) or a DB fault degrades it below (join_candidate_count stays 0).
+    join_candidate_count = 0
     if pass_c_enabled():
         # Pass C (Phase 3A Task 10): deterministic join-candidate discovery — blocking/scoring from
         # upload metadata alone (NO LLM/client needed), the durable candidate ledger, and governed
@@ -1417,7 +1442,8 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
         stage_started = datetime.now(UTC)
         try:
             with conn.transaction():
-                _run_pass_c(conn, catalog_source, vr.good, concepts=concepts, glossary=glossary)
+                join_candidate_count = _run_pass_c(
+                    conn, catalog_source, vr.good, concepts=concepts, glossary=glossary)
             record_stage(stage_recorder, "pass_c", "succeeded", started_at=stage_started)
         except Exception:  # noqa: BLE001 — advisory: Pass C never fails an upload
             counters.incr("overlay.passc.error")
@@ -1428,6 +1454,10 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
     else:
         record_stage(stage_recorder, "pass_c", "disabled")
 
+    # MF-5: the Pass B syntheses drive the truthful proposed/abstained split at the success return.
+    # Initialised empty so it is ALWAYS in scope — Pass B off, no client, or an advisory failure
+    # before it binds all leave `syntheses` at {} (proposed == abstained == 0).
+    syntheses: dict = {}
     if not table_synth_enabled():
         record_stage(stage_recorder, "pass_b", "disabled")
     elif client is None:
@@ -1667,7 +1697,20 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
                  started_at=stage_started)
     flagged = (f"first upload of '{catalog_source}' ({len(vr.good)} objects) — review recommended"
                if brake.is_first_upload else None)
-    return IngestResult("ingested", None, asserted, changed_objects, len(vr.quarantined), flagged)
+    # MF-5 truthful counts, computed from data already in scope. tables/columns come from the
+    # VALIDATED rows (one graph node each -> objects_stored; one `contains` edge per column ->
+    # containment_edges). Pass B abstained = a synthesis with NO grain AND NO as-of (matches
+    # `_enrichment_outcome`); proposed = the rest. `syntheses` is {} unless Pass B ran.
+    tables = len({r.table for r in vr.good})
+    columns = len(vr.good)
+    passb_abstained = sum(1 for syn in syntheses.values()
+                          if syn.get("grain") is None and syn.get("availability_time") is None)
+    passb_proposed = len(syntheses) - passb_abstained
+    return IngestResult("ingested", None, asserted, changed_objects, len(vr.quarantined), flagged,
+                        objects_stored=tables + columns, tables=tables, columns=columns,
+                        containment_edges=columns, facts_asserted=asserted,
+                        join_candidates=join_candidate_count, passb_proposed=passb_proposed,
+                        passb_abstained=passb_abstained)
 
 
 def _bool(v) -> bool:

@@ -203,6 +203,40 @@ describe('held/rejected quarantine handoff', () => {
   })
 })
 
+// MF-5: the truthful second line — objects stored (tables · columns), containment edges, join
+// candidates, and the Pass B proposed/abstained split. Rendered only when the backend sent the
+// additive counts; a pre-MF-5 result (no objects_stored) stays a single line.
+describe('MF-5 truthful counts line', () => {
+  it('renders the objects/edges/join/Pass B breakdown when the counts are present', () => {
+    renderCallout(result({
+      objects_stored: 5, tables: 2, columns: 3, containment_edges: 3,
+      facts_asserted: 4, join_candidates: 0, passb_proposed: 2, passb_abstained: 1,
+    }))
+    expect(screen.getByRole('status')).toHaveTextContent(
+      '5 objects stored (2 tables · 3 columns), 3 containment edges, ' +
+        '0 join candidates · Pass B: 2 proposed, 1 abstained',
+    )
+  })
+
+  it('uses singular nouns for a one-table, one-column, one-candidate upload', () => {
+    renderCallout(result({
+      objects_stored: 2, tables: 1, columns: 1, containment_edges: 1,
+      facts_asserted: 1, join_candidates: 1, passb_proposed: 0, passb_abstained: 0,
+    }))
+    expect(screen.getByRole('status')).toHaveTextContent(
+      '2 objects stored (1 table · 1 column), 1 containment edge, ' +
+        '1 join candidate · Pass B: 0 proposed, 0 abstained',
+    )
+  })
+
+  it('stays a single line for a pre-MF-5 result with no counts', () => {
+    renderCallout(result())
+    const callout = screen.getByRole('status')
+    expect(callout).toHaveTextContent('4 facts asserted, 0 objects changed, 0 quarantined')
+    expect(callout).not.toHaveTextContent('objects stored')
+  })
+})
+
 describe('summarizeStages', () => {
   it('folds mixed enrichment to its worst state and voices skipped passes', () => {
     expect(

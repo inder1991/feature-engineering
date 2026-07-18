@@ -249,6 +249,20 @@ export function IngestResultCallout({
             <Count value={result.changed_objects} tone="warn" /> objects changed,{' '}
             <Count value={result.quarantined} tone="warn" /> quarantined
           </p>
+          {/* MF-5 second line — the truthful breakdown. Rendered only when the backend sent the
+              additive counts (objects_stored present), so a pre-MF-5 result stays one line. */}
+          {result.objects_stored !== undefined && (
+            <p className="tabular-nums">
+              <Count value={result.objects_stored} tone="ok" /> objects stored (
+              {result.tables ?? 0} table{result.tables === 1 ? '' : 's'} ·{' '}
+              {result.columns ?? 0} column{result.columns === 1 ? '' : 's'}),{' '}
+              <Count value={result.containment_edges ?? 0} tone="ok" /> containment edge
+              {result.containment_edges === 1 ? '' : 's'},{' '}
+              {result.join_candidates ?? 0} join candidate
+              {result.join_candidates === 1 ? '' : 's'} · Pass B:{' '}
+              {result.passb_proposed ?? 0} proposed, {result.passb_abstained ?? 0} abstained
+            </p>
+          )}
           {result.flagged && (
             <p style={{ color: 'var(--warn)' }}>
               <span style={{ fontWeight: 600 }}>Flagged:</span> {result.flagged}
