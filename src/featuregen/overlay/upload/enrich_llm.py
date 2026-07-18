@@ -182,6 +182,154 @@ def _redact_free_text_meta(metadata: dict) -> tuple[dict | None, list[dict], lis
     return out, pii_spans, sample_audits, version
 
 
+# The feature MENU's nested field-aware egress classification (spec §5, [F4]). Distinct top-level
+# keys (`columns` of DICTS, `table_context`) from the enrichment payload, so this adapter is inert
+# on every enrichment call (a `columns` list of STRINGS is left untouched). RF-I6 (BINDING): the
+# adapter fires on EVERY audited_structured_call, including `overlay.contract.draft`, whose
+# `columns` is contract/author.py `_column_defs(...)` — {object_ref, column, concept, definition},
+# with `concept`/`definition` NULLABLE straight from graph_node. Those keys are all classified
+# below (identity/definition-kind), and a None value in a definition-kind field passes through as
+# content-free — so the legitimate draft path is IMPROVED (its definitions now sample-stripped),
+# never fail-closed. Only a genuinely-unknown key blocks.
+_FEATURE_COLUMN_DEFINITION_KEYS = frozenset({"definition", "semantic_terms"})
+# Identity strings: `catalog_source` is deliberately NOT emitted by the enriched menu (RF-I7
+# handoff) and `concept`/`domain` may be None — absence/None is structural-optional, never a block.
+_FEATURE_COLUMN_IDENTITY_KEYS = frozenset({"object_ref", "table", "column", "concept", "domain"})
+_FEATURE_COLUMN_FACT_KEYS = frozenset({
+    "data_type", "declared_type", "entity", "additivity", "unit", "currency",
+    "is_grain", "is_as_of"})
+_FEATURE_FACT_SUBKEYS = frozenset({"value", "authority"})
+_TABLE_CONTEXT_DEFINITION_KEYS = frozenset({"table_definition"})
+_TABLE_CONTEXT_IDENTITY_KEYS = frozenset({"table", "as_of_column", "primary_entity"})
+_TABLE_CONTEXT_LIST_KEYS = frozenset({"grain_columns"})
+_FEATURE_STRUCTURAL_MAX_LEN = 200
+
+
+def _fact_wrapper_ok(v: object) -> bool:
+    """A governed/hint fact wrapper: exactly {value, authority}; value a bounded str or None
+    (RF-I7: is_grain/is_as_of booleans arrive RENDERED as "true"/"false" strings); authority in
+    {governed, hint}. Enum-ish tokens, never sample-bearing prose."""
+    if not isinstance(v, dict) or any(k not in _FEATURE_FACT_SUBKEYS for k in v):
+        return False
+    val = v.get("value")
+    if val is not None and not (isinstance(val, str) and len(val) <= _FEATURE_STRUCTURAL_MAX_LEN):
+        return False
+    return v.get("authority") in ("governed", "hint")
+
+
+def sanitize_feature_context(
+        metadata: dict) -> tuple[dict | None, list[dict], list[dict], str | None]:
+    """Nested field-aware egress adapter for the feature menu ([F4], spec §5). Traverses
+    ``columns[*]`` (DICT elements only — a list-of-strings `columns` from enrichment is left
+    untouched) and any ``table_context[*]`` block. Definition-kind fields (`definition`,
+    `semantic_terms`, `table_definition`) route through `sanitize_definition` (sample-clause strip +
+    fail-closed data-marker scan + PII redaction); a ``None`` there is content-free and passes
+    through (the contract-draft `_column_defs` shape carries NULL graph definitions — RF-I6).
+    Structural fields (identity strings, {value, authority} fact wrappers, grain-column ref lists)
+    are exact-key allowlisted + length-bounded, never sample-stripped. FAIL CLOSED: any unclassified
+    key anywhere, or a definition the sanitizer BLANKS, returns (None, ...) — the caller blocks
+    dispatch + audits EGRESS_BLOCKED. Returns the SAME ``metadata`` object (untouched) when no
+    feature menu is present or only structural passthrough occurred, so non-feature and flag-off
+    payloads stay byte-identical."""
+    columns = metadata.get("columns")
+    table_context = metadata.get("table_context")
+    has_cols = isinstance(columns, list) and any(isinstance(c, dict) for c in columns)
+    has_ctx = isinstance(table_context, list) and any(isinstance(b, dict) for b in table_context)
+    if not has_cols and not has_ctx:
+        return metadata, [], [], None
+
+    pii_spans: list[dict] = []
+    sample_audits: list[dict] = []
+    version: str | None = None
+
+    def _defn(text: object, path: str) -> str | None:  # None ⟹ fail closed
+        nonlocal version
+        if not isinstance(text, str):
+            return None
+        d = sanitize_definition(text)
+        version = version or d.redaction_version or d.sanitizer_version
+        sample_audits.append({"path": path, "sanitizer_version": d.sanitizer_version,
+                              "state": d.state, "removed_count": d.removed})
+        if d.reason:
+            return None
+        pii_spans.extend({"key": path, **dict(s)} for s in d.redacted_spans)
+        return d.clean
+
+    def _structural_ok(v: object) -> bool:  # identity strings may be None (concept/domain nullable)
+        return v is None or (isinstance(v, str) and len(v) <= _FEATURE_STRUCTURAL_MAX_LEN)
+
+    new_columns = columns
+    if has_cols:
+        rebuilt: list = []
+        for idx, col in enumerate(columns):
+            if not isinstance(col, dict):
+                rebuilt.append(col)              # enrichment roster token — untouched
+                continue
+            out: dict = {}
+            for k, v in col.items():
+                path = f"columns[{idx}].{k}"
+                if k in _FEATURE_COLUMN_DEFINITION_KEYS:
+                    if v is None:                # NULL graph definition (_column_defs) — no content
+                        out[k] = v
+                        continue
+                    clean = _defn(v, path)
+                    if clean is None:
+                        return None, pii_spans, sample_audits, version
+                    out[k] = clean
+                elif k in _FEATURE_COLUMN_IDENTITY_KEYS:
+                    if not _structural_ok(v):
+                        return None, pii_spans, sample_audits, version
+                    out[k] = v
+                elif k in _FEATURE_COLUMN_FACT_KEYS:
+                    if not _fact_wrapper_ok(v):
+                        return None, pii_spans, sample_audits, version
+                    out[k] = v
+                else:
+                    return None, pii_spans, sample_audits, version   # unclassified — fail closed
+            rebuilt.append(out)
+        new_columns = rebuilt
+
+    new_ctx = table_context
+    if has_ctx:
+        rebuilt_ctx: list = []
+        for idx, block in enumerate(table_context):
+            if not isinstance(block, dict):
+                return None, pii_spans, sample_audits, version
+            out = {}
+            for k, v in block.items():
+                path = f"table_context[{idx}].{k}"
+                if k in _TABLE_CONTEXT_DEFINITION_KEYS:
+                    if v is None:
+                        out[k] = v
+                        continue
+                    clean = _defn(v, path)
+                    if clean is None:
+                        return None, pii_spans, sample_audits, version
+                    out[k] = clean
+                elif k in _TABLE_CONTEXT_IDENTITY_KEYS:
+                    if not _structural_ok(v):
+                        return None, pii_spans, sample_audits, version
+                    out[k] = v
+                elif k in _TABLE_CONTEXT_LIST_KEYS:
+                    if not (isinstance(v, list) and all(
+                            isinstance(x, str) and len(x) <= _FEATURE_STRUCTURAL_MAX_LEN
+                            for x in v)):
+                        return None, pii_spans, sample_audits, version
+                    out[k] = v
+                else:
+                    return None, pii_spans, sample_audits, version
+            rebuilt_ctx.append(out)
+        new_ctx = rebuilt_ctx
+
+    if version is None:
+        return metadata, [], [], None            # structural passthrough only — untouched
+    safe = dict(metadata)
+    safe["columns"] = new_columns
+    if has_ctx:
+        safe["table_context"] = new_ctx
+    return safe, pii_spans, sample_audits, version
+
+
 def _generation_settings() -> dict:
     """Generation settings for the audit record + idempotency key, read from the SAME env that
     configures the client (ClaudeConfig.from_env). So a real ClaudeLLM is audited as
@@ -480,6 +628,20 @@ def audited_structured_call(conn, client: LLMClient, *, task: str, prompt_id: st
         _audit_egress_block(conn, task=task, actor=actor,
                             reason="glossary free-text redaction failed closed")
         return None                       # hard fail closed — no dispatch, no cache
+    # [F4] the nested feature-menu adapter (spec §5) — fires on EVERY call (RF-I6: including the
+    # contract-draft `_column_defs` shape, which it sanitizes rather than blocks); inert (same
+    # object) on payloads without a feature menu.
+    ctx_meta, ctx_spans, ctx_sample_audits, ctx_version = sanitize_feature_context(safe_metadata)
+    if ctx_meta is None:
+        logger.warning("feature-context egress adapter blocked %s (schema %s); no dispatch",
+                       task, schema_id)
+        _audit_egress_block(conn, task=task, actor=actor,
+                            reason="feature-context egress adapter failed closed")
+        return None                       # hard fail closed — no dispatch, no cache
+    safe_metadata = ctx_meta
+    spans = spans + ctx_spans
+    sample_audits = sample_audits + ctx_sample_audits
+    free_text_version = free_text_version or ctx_version
     redaction_version = free_text_version or _REDACTION_VERSION
     redaction = RedactionResult(text=instruction, redaction_version=redaction_version,
                                 redacted_spans=(), disposition="ok")
