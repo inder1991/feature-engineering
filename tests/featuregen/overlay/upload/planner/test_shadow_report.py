@@ -254,6 +254,19 @@ def test_population_report_numerator_denominator(db):
     assert report.reconcile_complete and report.persistence_loss == 0
 
 
+def test_population_report_default_family_is_total_over_unknown_recipe_ids(db):
+    # The WORM store outlives code versions: a persisted run may reference a template id the current
+    # taxonomy no longer knows. The DEFAULT family lookup (what the /gate/evaluate route uses) must
+    # keep that unit IN the population under a sentinel family — never KeyError, never a silent drop.
+    _cross_seed(db)
+    run_shadow_planner(db, eligible_recipe_ids=frozenset({"t_roll"}), target_entity="account",
+                       roles=(), run_id="fam_def", now=_NOW, templates=(_txn_template(),),
+                       compile_contracts=True, persist=True)
+    report = build_population_report(db, ["fam_def"])          # no family_of override
+    assert report.denominator == 1                              # included, not dropped
+    assert report.sample_units[0].family == "unknown_template"  # observable sentinel stratum
+
+
 def test_template_not_found_trips_gate1_even_though_reconcile_is_complete(db):
     # Minor-1: an eligible recipe with no template is RECORDED (reconcile stays complete), so without
     # this driver a taxonomy drift would silently drop it from the denominator. Gate 1 must catch it.

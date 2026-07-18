@@ -33,3 +33,26 @@ def test_gate_cohorts_lists_producer_commits(client, admin_headers, db):
         " payload_schema_version) VALUES ('r','{}','h',0,'p',true,true,true,true,'v','sha1','{}','ch','pv')")
     r = client.get("/gate/cohorts", headers=admin_headers)
     assert r.status_code == 200 and any(c["cohort"] == "sha1" for c in r.json())
+
+
+def test_gate_e2e_collects_a_batch_and_evaluates(client, admin_headers, db, monkeypatch):
+    monkeypatch.setenv("FEATUREGEN_PRODUCER_COMMIT", "sha-e2e")
+    # collect one qualifying shadow run (all four flags on) via the planner entrypoint the route uses
+    from datetime import UTC, datetime
+
+    from tests.featuregen.overlay.upload.planner.test_plan import _txn_template
+    from tests.featuregen.overlay.upload.planner.test_shadow_capture import _cross_seed
+
+    from featuregen.overlay.upload.planner.shadow import run_shadow_planner
+    now = datetime(2026, 7, 18, 12, 0, tzinfo=UTC)
+    _cross_seed(db)
+    run_shadow_planner(db, eligible_recipe_ids=frozenset({"t_roll"}), target_entity="account",
+                       roles=(), run_id="e2e", now=now, templates=(_txn_template(),),
+                       compile_contracts=True, persist=True, scoped_applicability=True, ranking=True)
+    r = client.post("/gate/evaluate", json={"cohort": "sha-e2e", "since": "2026-07-18T00:00:00Z",
+                                            "until": "2026-07-19T00:00:00Z"}, headers=admin_headers)
+    assert r.status_code == 200
+    body = r.json()
+    assert body["coverage"]["qualifying"] == 1 and body["population"]["denominator"] >= 0
+    assert set(body["verdict"]) == {"passed", "gate1_capture", "gate2a_map", "gate3_gold",
+                                    "gate5_stability", "gate6_drift"}

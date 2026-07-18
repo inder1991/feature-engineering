@@ -86,7 +86,16 @@ def build_population_report(conn, run_ids: Sequence[str], *,
     denominator (and gated separately by Gate 1). Reads the store directly (the report has specific
     column needs beyond the generic readers)."""
     run_ids = tuple(run_ids)
-    fam = family_of or _family_map().__getitem__
+    # The default family lookup must be TOTAL over persisted recipe ids: the WORM store outlives code
+    # versions, so a run may reference a template id the CURRENT taxonomy no longer knows. Such a unit
+    # stays IN the population (no silent drop) under a sentinel family — a distinct stratum that can
+    # never satisfy the Gate-4 bound (fail-closed), never a KeyError that 500s the gate evaluation.
+    family_map = _family_map()
+
+    def _default_fam(rid: str) -> str:
+        return family_map.get(rid, "unknown_template")
+
+    fam = family_of or _default_fam
     runs = conn.execute(
         "SELECT generation_run_id, recipe_id, planner_outcome, compile_status,"
         " selected_contract_physical_plan_id, capture_status, bounding"
