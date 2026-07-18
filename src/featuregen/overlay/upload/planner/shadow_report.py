@@ -375,6 +375,61 @@ def evaluate_gate(inputs: GateInputs) -> GateResult:
                       reasons=tuple(reasons), sample=sample4)
 
 
+@dataclass(frozen=True, slots=True)
+class MachineGateResult:
+    """The 3C.1 machine-only verdict: the five MACHINE-checkable sub-gates ANDed (no averaging). This is
+    NECESSARY-BUT-NOT-SUFFICIENT for trustworthiness — the human-review sub-gates (2b/3-audit/4) and the
+    signed artifact (7) are deliberately NOT evaluated in 3C.1; the admin supplies the real-population
+    judgment from the population view."""
+
+    gate1_capture: bool
+    gate2a_map: bool
+    gate3_gold: bool
+    gate5_stability: bool
+    gate6_drift: bool
+    reasons: tuple[str, ...] = ()
+
+    @property
+    def passed(self) -> bool:
+        return all((self.gate1_capture, self.gate2a_map, self.gate3_gold,
+                    self.gate5_stability, self.gate6_drift))
+
+
+def evaluate_machine_gate(*, report: PopulationReportV1, gold_report: EvalReport,
+                          stability: StabilityResult, drift_ratio: float) -> MachineGateResult:
+    """The conjunctive machine-only gate (3C.1). Fail-closed: an empty qualifying population fails Gate 1
+    (no evidence is not a pass)."""
+    reasons: list[str] = []
+    g1, r1 = _gate1(report)
+    gate1 = g1 and report.denominator > 0
+    reasons += r1
+    if report.denominator == 0:
+        reasons.append("Gate 1: empty qualifying population (no evidence)")
+
+    try:
+        assert_map_exhaustive()
+        map_ok = True
+    except AssertionError as exc:
+        map_ok = False
+        reasons.append(f"Gate 2a: {exc}")
+    gate2a = map_ok and report.operationally_unmeasured_count == 0
+    if report.operationally_unmeasured_count:
+        reasons.append(f"Gate 2a: {report.operationally_unmeasured_count} operationally_unmeasured")
+
+    gate3 = gold_report.passed
+    if not gate3:
+        reasons.append(f"Gate 3 (gold): failures {gold_report.false_resolves}")
+    gate5 = stability.stable
+    if not gate5:
+        reasons.append(f"Gate 5: replay unstable (compared={stability.compared})")
+    gate6 = drift_ratio >= 1.0
+    if not gate6:
+        reasons.append(f"Gate 6: drift detection {drift_ratio:.3f} < 1.0")
+
+    return MachineGateResult(gate1_capture=gate1, gate2a_map=gate2a, gate3_gold=gate3,
+                             gate5_stability=gate5, gate6_drift=gate6, reasons=tuple(reasons))
+
+
 # ─── §10.7 the signed artifact ───────────────────────────────────────────────────────────────
 @dataclass(frozen=True, slots=True)
 class GateArtifactV1:
@@ -479,7 +534,7 @@ def authority_sign_gate(inputs: GateInputs, *, private_key_pem: str, code_commit
 
 __all__ = [
     "EVALUATOR_VERSION", "GateArtifactV1", "GateInputs", "GatePolicy", "GateResult",
-    "PopulationReportV1", "authority_sign_gate", "build_gate_artifact", "build_population_report",
-    "clopper_pearson_upper", "evaluate_gate", "report_input_digest", "required_shapes_for_bound",
-    "statistical_bound", "write_gate_artifact",
+    "MachineGateResult", "PopulationReportV1", "authority_sign_gate", "build_gate_artifact",
+    "build_population_report", "clopper_pearson_upper", "evaluate_gate", "evaluate_machine_gate",
+    "report_input_digest", "required_shapes_for_bound", "statistical_bound", "write_gate_artifact",
 ]

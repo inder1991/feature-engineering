@@ -24,6 +24,7 @@ from featuregen.overlay.upload.planner.shadow_report import (
     build_population_report,
     clopper_pearson_upper,
     evaluate_gate,
+    evaluate_machine_gate,
     report_input_digest,
     required_shapes_for_bound,
     statistical_bound,
@@ -288,3 +289,31 @@ def test_pg_e2e_run_to_report_to_signed_gate(db, monkeypatch):
     assert verify_report(art.canonical_bytes(), sig)        # EVALUATOR side (config public key)
     assert art.report_input_digest == report_input_digest(report)
     assert evaluate_gate(inputs).gate1_capture   # capture integrity held over the real persisted run
+
+
+# ── the machine-only gate (3C.1) ──
+def _machine_inputs(**over):
+    base = dict(report=_report(), gold_report=EvalReport(results=(CaseResult("c1", True, False, ()),)),
+                stability=StabilityResult(stable=True, compared=3, mismatched_keys=()), drift_ratio=1.0)
+    base.update(over)
+    return base
+
+
+def test_machine_gate_passes_when_all_five_hold():
+    assert evaluate_machine_gate(**_machine_inputs()).passed
+
+
+def test_machine_gate_fails_on_empty_population():
+    res = evaluate_machine_gate(**_machine_inputs(report=_report(denominator=0)))
+    assert not res.gate1_capture and not res.passed   # no evidence is not a pass
+
+
+@pytest.mark.parametrize("over", [
+    {"report": _report(incomplete_count=1)},           # capture integrity
+    {"report": _report(operationally_unmeasured_count=1)},  # map exhaustiveness
+    {"gold_report": EvalReport(results=(CaseResult("c1", False, True, ("x",)),))},  # gold false-resolve
+    {"stability": StabilityResult(stable=False, compared=0, mismatched_keys=())},   # double-compile
+    {"drift_ratio": 0.5},                              # drift
+])
+def test_each_machine_sub_gate_failure_fails_the_verdict(over):
+    assert not evaluate_machine_gate(**_machine_inputs(**over)).passed
