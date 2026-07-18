@@ -8,6 +8,7 @@ re-authors the definition narrative (audited).
 """
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 
@@ -41,15 +42,24 @@ class MinimumCheck:
 
 def validate_minimum(conn, draft: ContractDraft, *, target_ref: str | None = None,
                      now: datetime | None = None,
-                     fresh_within: timedelta = timedelta(hours=24)) -> MinimumCheck:
+                     fresh_within: timedelta = timedelta(hours=24),
+                     roles: Iterable[str] = ()) -> MinimumCheck:
     """MCV — the deterministic gauntlet re-applied to the draft (defense in depth: a source could have
-    gone stale or been dropped since discovery). Reuses the feature loop's checks. No LLM."""
-    raw = {"derives_from": draft.derives_from, "aggregation": draft.aggregation}
+    gone stale or been dropped since discovery). Reuses the feature loop's checks. No LLM.
+
+    The re-run must be FAITHFUL: `grain_table` rides along so the grain + cross-table join
+    dispositions fire (without it they silently no-op and GRAIN_IS_UNIQUE / JOIN_CONNECTIVITY are
+    dropped from the persisted requirements — the whole-branch-review Critical). `roles` is the
+    confirming actor's read-scope for the join-authority disposition; the default () preserves the
+    draft/refine loop's existing behavior."""
+    raw = {"derives_from": draft.derives_from, "aggregation": draft.aggregation,
+           "grain_table": draft.grain_table}
     known = _live_columns(conn, draft.derives_from)   # LIVE graph, not set(draft.derives_from) (B2)
     src_of: dict[str, set[str]] = {}                  # the draft's carried (catalog, ref) pairs (B3)
     for cs, ref in draft.derives_pairs:
         src_of.setdefault(ref, set()).add(cs)
-    idea, reason = _validate_idea(conn, raw, known, src_of, target_ref, now, fresh_within)
+    idea, reason = _validate_idea(conn, raw, known, src_of, target_ref, now, fresh_within,
+                                  roles=roles)
     if idea is None:
         return MinimumCheck(ok=False, reasons=[reason.message],
                             validation_status="REJECTED", requirements=())

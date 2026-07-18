@@ -566,8 +566,10 @@ def confirm(body: DraftIn, conn: _Conn, identity: _Identity) -> Contract:
         raise HTTPException(status_code=422, detail="the draft does not match the chosen feature")
     target = intent_target_ref(conn, body.intent_id)   # SERVER truth — never the client body
     try:
-        return confirm_contract(conn, draft, actor=identity.subject, now=datetime.now(UTC),
-                                target_ref=target, intent_id=body.intent_id)
+        return confirm_contract(conn, draft, actor=identity.subject,
+                                roles=identity.role_claims,   # the CONFIRMER's authority reaches the
+                                #                               re-run's join-authority disposition
+                                now=datetime.now(UTC), target_ref=target, intent_id=body.intent_id)
     except ContractValidationError as e:
         raise HTTPException(status_code=422, detail=str(e)) from e
     except psycopg.errors.UniqueViolation as e:   # concurrent double-confirm -> conflict, not 500

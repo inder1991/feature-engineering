@@ -129,6 +129,35 @@ def test_reconfirm_reuses_one_feature_not_a_new_one(db):
     assert db.execute("SELECT count(*) FROM feature WHERE name = 'avg_balance_90d'").fetchone()[0] == 1
 
 
+def test_confirm_threads_confirmer_roles_to_join_authority(db):
+    """The FAITHFUL confirm-time re-run (grain_table threaded) activates the cross-table join
+    disposition, so the CONFIRMING actor's roles must reach classify_join_path through
+    confirm_contract -> validate_minimum -> _validate_idea: a hop through a pii-tagged column is
+    read-scope-DENIED (-> refused) for a role-less confirm but CONFIRMS for a pii_reader — the
+    roles threading that keeps the grain_table fix from introducing a NEW over-rejection."""
+    from featuregen.overlay.upload.contract.govern import ContractValidationError
+    _bank(db)
+    db.execute(
+        "INSERT INTO graph_node (catalog_source, object_ref, kind, table_name, column_name, "
+        "sensitivity) VALUES "
+        "('bank', 'public.transactions.acct_id', 'column', 'transactions', 'acct_id', 'pii'), "
+        "('bank', 'public.transactions.txn_id', 'column', 'transactions', 'txn_id', NULL)")
+    db.execute(
+        "INSERT INTO graph_edge (catalog_source, kind, from_ref, to_ref, cardinality, authority) "
+        "VALUES ('bank', 'joins', 'public.transactions.acct_id', 'public.accounts.id', 'N:1', "
+        "'operational')")
+    draft = ContractDraft(
+        "txn_count", "Count of transactions per account.", "accounts", "count_txns", "posted_at",
+        ["public.transactions.txn_id"], derives_pairs=(("bank", "public.transactions.txn_id"),))
+    with pytest.raises(ContractValidationError):     # role-less: the only hop is hidden -> DENIED
+        confirm_contract(db, draft, actor="ds1", now=NOW)
+    c = confirm_contract(db, draft, actor="ds1", roles=("pii_reader",), now=NOW)   # authorized
+    row = db.execute("SELECT validation_status, requirements FROM contract WHERE contract_id = %s",
+                     (c.contract_id,)).fetchone()
+    assert row[0] == "NEEDS_EXTERNAL_VALIDATION"     # the grain is still honestly unconfirmed
+    assert [r["code"] for r in row[1]] == ["GRAIN_IS_UNIQUE"]
+
+
 def test_confirm_wires_the_carried_catalog_pairs(db):
     # B3: govern uses the draft's carried (catalog_source, object_ref) — feature lineage binds ONLY to
     # the catalog the feature actually read, even with a same-named column in another catalog.

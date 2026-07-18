@@ -204,8 +204,9 @@ def test_author_contract_consumes_minimumcheck(db):
 
 def test_confirm_persists_validation_status_and_requirements(db):
     """RF-C1 + RF-C2: confirm persists the CONFIRM-TIME MCV re-run's status + requirements. The
-    draft carries ONE requirement; the live re-run on `_bank`'s operationally-unknown balance
-    derives TWO (numeric + temporal) — the persisted row must hold the RE-RUN's, not the draft's.
+    draft carries ONE requirement; the FAITHFUL live re-run (grain_table threaded — the whole-
+    branch-review Critical) on `_bank` derives THREE (numeric + temporal + grain) — the persisted
+    row must hold the RE-RUN's, not the draft's.
     Recon #1: the hyphenated `verification` stamp is a SEPARATE axis and stays 'DESIGN-CHECKED'."""
     _bank(db)
     draft = ContractDraft(
@@ -225,7 +226,9 @@ def test_confirm_persists_validation_status_and_requirements(db):
          "detail": "operational type unknown; numeric declared hint"},
         {"code": "TEMPORAL_IS_POPULATED", "operand": ["bank", "public.accounts.posted_at"],
          "detail": "as-of column declared, not governed-verified"},
-    ]                                                    # the RE-RUN's two, not the draft's one
+        {"code": "GRAIN_IS_UNIQUE", "operand": ["bank", "public.accounts.id"],
+         "detail": "grain declared, not governed-verified"},
+    ]                                                    # the RE-RUN's three, not the draft's one
     assert row[1] == requirements_to_json(validate_minimum(db, draft).requirements)
     assert row[2] == "DESIGN-CHECKED"                    # the SEPARATE verification axis intact
 
@@ -243,7 +246,8 @@ def test_confirm_default_draft_persists_rerun_status_not_draft(db):
     row = db.execute("SELECT validation_status, requirements FROM contract WHERE contract_id = %s",
                      (c.contract_id,)).fetchone()
     assert row[0] == "NEEDS_EXTERNAL_VALIDATION"
-    assert [r["code"] for r in row[1]] == ["TYPE_IS_NUMERIC", "TEMPORAL_IS_POPULATED"]
+    assert [r["code"] for r in row[1]] == [
+        "TYPE_IS_NUMERIC", "TEMPORAL_IS_POPULATED", "GRAIN_IS_UNIQUE"]   # the FAITHFUL re-run set
 
 
 def test_needs_external_validation_survives_gate1_to_persisted_contract(db):
@@ -288,20 +292,27 @@ def test_needs_external_validation_survives_gate1_to_persisted_contract(db):
          "detail": "operational type unknown; numeric declared hint"},
         {"code": "TEMPORAL_IS_POPULATED", "operand": ["bank", "public.accounts.posted_at"],
          "detail": "as-of column declared, not governed-verified"},
+        {"code": "GRAIN_IS_UNIQUE", "operand": ["bank", "public.accounts.id"],
+         "detail": "grain declared, not governed-verified"},
     ]                                                    # the RE-RUN's real requirements (RF-C2)
     assert row[1] == requirements_to_json(check.requirements)
     assert row[2] == "DESIGN-CHECKED"                    # the SEPARATE verification axis intact
 
 
-def test_confirm_clean_rerun_persists_design_checked(db):
-    """A re-run with NOTHING left to verify (non-numeric, non-windowed op on a known column)
-    persists DESIGN_CHECKED + [] — earned by the clean re-run, not an artifact of draft defaults."""
+def test_confirm_grain_feature_persists_faithful_grain_requirement(db):
+    """The whole-branch review's proof case: a grain-only feature (non-numeric, non-windowed op on
+    the file-declared grain) used to persist a SILENTLY-DOWNGRADED clean DESIGN_CHECKED + [] because
+    the re-run dropped grain_table and the grain disposition never fired. The FAITHFUL re-run
+    persists NEEDS_EXTERNAL_VALIDATION + [GRAIN_IS_UNIQUE] — and, no-over-rejection invariant, the
+    feature CONFIRMS (needs-checked, not REJECTED)."""
     _bank(db)
     draft = ContractDraft(
         "distinct_accounts", "Distinct account count.", "accounts", "count_distinct", "posted_at",
         ["public.accounts.id"], derives_pairs=(("bank", "public.accounts.id"),))
-    c = confirm_contract(db, draft, actor="ds1")
+    c = confirm_contract(db, draft, actor="ds1")         # must NOT raise: governable, just honest
     row = db.execute("SELECT validation_status, requirements FROM contract WHERE contract_id = %s",
                      (c.contract_id,)).fetchone()
-    assert row[0] == "DESIGN_CHECKED"
-    assert row[1] == []
+    assert row[0] == "NEEDS_EXTERNAL_VALIDATION"         # NOT the silent DESIGN_CHECKED downgrade
+    assert row[1] == [
+        {"code": "GRAIN_IS_UNIQUE", "operand": ["bank", "public.accounts.id"],
+         "detail": "grain declared, not governed-verified"}]

@@ -8,6 +8,7 @@ of the same feature is a new version; history stays.
 from __future__ import annotations
 
 import json
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -40,13 +41,17 @@ class Contract:
 
 
 
-def confirm_contract(conn, draft: ContractDraft, *, actor, target_ref: str | None = None,
+def confirm_contract(conn, draft: ContractDraft, *, actor, roles: Iterable[str] = (),
+                     target_ref: str | None = None,
                      now: datetime | None = None, intent_id: str | None = None) -> Contract:
     """The human gate. RE-RUNS the deterministic MCV (B1) and refuses to govern an invalid draft, then
     registers a versioned governed contract + wires its derives-from into the feature layer. Re-confirming
-    the same feature bumps the version. A non-empty definition is required (no empty-narrative contract)."""
+    the same feature bumps the version. A non-empty definition is required (no empty-narrative contract).
+    `roles` is the CONFIRMING actor's read-scope, threaded into the re-run so the cross-table
+    join-authority disposition judges the confirmer's real authority — without it a sensitivity-tagged
+    hop would read DENIED and over-reject a legitimately authorized feature."""
     tref = target_ref if target_ref is not None else draft.target_ref   # M3: fall back to the draft's
-    check = validate_minimum(conn, draft, target_ref=tref, now=now)
+    check = validate_minimum(conn, draft, target_ref=tref, now=now, roles=roles)
     if not check.ok:
         raise ContractValidationError(f"contract failed MCV, not governed: {check.reasons}")
     if not (draft.definition or "").strip():
