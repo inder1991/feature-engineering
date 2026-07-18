@@ -12,6 +12,7 @@ import hashlib
 import json
 from typing import Any
 
+from featuregen.config import get_settings
 from featuregen.overlay.upload.planner.contracts import (
     APPLICABILITY_MAPPING_VERSION,
     CONCEPT_REGISTRY_VERSION,
@@ -40,9 +41,6 @@ from featuregen.overlay.upload.planner.shadow_store import (
     RunResultRowV1,
 )
 
-# A build-time producer identity would come from the deployment; a static placeholder is fine for
-# shadow telemetry (D8's artifact-integrity gate is where a real commit is required).
-PRODUCER_COMMIT = "dev"
 INVOCATION_PREDICATE = "entity_scoped_no_catalog"
 
 _COMPILER_VERSIONS = {
@@ -72,14 +70,17 @@ def _jsonable(obj) -> Any:
 
 
 def build_dispatch(*, run_id: str | None, eligible_recipe_ids: frozenset[str], compile_flag: bool,
-                   telemetry_flag: bool, now) -> DispatchRecordV1:
+                   telemetry_flag: bool, scoped_applicability_flag: bool, ranking_flag: bool, now
+                   ) -> DispatchRecordV1:
     eligible = tuple(sorted(eligible_recipe_ids))
     recipe_hash = hashlib.sha256("|".join(eligible).encode()).hexdigest()
     return DispatchRecordV1(
         generation_run_id=run_id, eligible_recipe_ids=eligible, recipe_hash=recipe_hash,
         expected_count=len(eligible), invocation_predicate=INVOCATION_PREDICATE,
         compile_flag=compile_flag, telemetry_flag=telemetry_flag,
-        applicability_version=APPLICABILITY_MAPPING_VERSION, producer_commit=PRODUCER_COMMIT,
+        scoped_applicability_flag=scoped_applicability_flag, ranking_flag=ranking_flag,
+        applicability_version=APPLICABILITY_MAPPING_VERSION,
+        producer_commit=get_settings().producer_commit,
         compiler_versions=_COMPILER_VERSIONS, created_at=now)
 
 

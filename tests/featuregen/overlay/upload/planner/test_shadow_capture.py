@@ -166,6 +166,17 @@ def test_real_elapsed_time_deadline_marks_incomplete_budget_time(db):
     assert row["compiled_count"] == 0 and row["skipped_count"] >= 1
 
 
+def test_dispatch_records_all_four_flags_and_the_configured_commit(db, monkeypatch):
+    monkeypatch.setenv("FEATUREGEN_PRODUCER_COMMIT", "sha-abc")
+    _catalog(db, "core")
+    run_shadow_planner(db, eligible_recipe_ids=frozenset({"t_bal"}), target_entity="customer",
+                       roles=(), run_id="prov", now=_NOW, templates=(_tmpl(),), persist=True,
+                       scoped_applicability=True, ranking=True)
+    row = db.execute("SELECT scoped_applicability_flag, ranking_flag, producer_commit FROM "
+                     "planner_shadow_dispatch WHERE generation_run_id='prov'").fetchone()
+    assert row == (True, True, "sha-abc")
+
+
 def test_template_not_found_writes_a_row(db):
     _catalog(db, "core")
     run_shadow_planner(db, eligible_recipe_ids=frozenset({"t_bal", "ghost"}), target_entity="customer",
