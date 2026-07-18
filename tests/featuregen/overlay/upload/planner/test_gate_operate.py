@@ -2,7 +2,12 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
-from featuregen.overlay.upload.planner.gate_operate import select_window
+from featuregen.overlay.upload.planner.gate_operate import (
+    run_double_compile,
+    run_drift_checks,
+    run_gold_suite,
+    select_window,
+)
 
 _T0 = datetime(2026, 7, 18, tzinfo=UTC)
 
@@ -42,3 +47,26 @@ def test_out_of_range_runs_are_excluded(db):
 def test_empty_window_is_reproducible_and_empty(db):
     sel = select_window(db, cohort="ghost", since=_T0, until=datetime(2026, 7, 19, tzinfo=UTC))
     assert sel.run_ids == () and sel.coverage.qualifying == 0
+
+
+def test_gold_suite_matches_the_live_classifier(db):
+    report = run_gold_suite(db)
+    assert report.passed and report.false_resolves == ()
+
+
+def test_double_compile_is_stable_on_the_frozen_gold_fixtures(db):
+    result = run_double_compile(db)
+    assert result.stable and result.compared >= 1 and result.mismatched_keys == ()
+
+
+def test_drift_checks_detect_every_controlled_mutation(db):
+    assert run_drift_checks(db) == 1.0
+
+
+def test_drivers_leave_no_durable_catalog_state(db):
+    # the controlled drivers seed 'core' but roll it back — no rows survive
+    run_gold_suite(db)
+    run_double_compile(db)
+    run_drift_checks(db)
+    remaining = db.execute("SELECT count(*) FROM graph_node WHERE catalog_source = 'core'").fetchone()[0]
+    assert remaining == 0
