@@ -150,14 +150,19 @@ def _record(
     conflict_status: str,
     reason_codes: Sequence[str],
     now: datetime | None,
+    event_type: FieldDecisionEventType = FieldDecisionEventType.RESOLVED,
+    supersedes_event_id: str | None = None,
 ) -> str:
-    """Record one RESOLVED field-decision event and return its id. Display + load-bearing values are
-    hashed with the SAME :func:`canonical_hash` the evidence store uses (``None`` -> ``None`` hash)."""
+    """Record one field-decision event and return its id. Display + load-bearing values are hashed
+    with the SAME :func:`canonical_hash` the evidence store uses (``None`` -> ``None`` hash). The
+    defaults record the resolver's RESOLVED event with no supersession link (the existing resolve
+    callers, unchanged); the stale lifecycle passes ``event_type=STALED`` + the superseded decision
+    with ``evidence=()`` / ``None`` values."""
     return record_field_decision(
         conn,
         logical_ref=logical_ref,
         field_name=field_name,
-        event_type=FieldDecisionEventType.RESOLVED,
+        event_type=event_type,
         selected_evidence_ids=[e.evidence_id for e in evidence],
         evidence_set_hash=_evidence_set_hash(evidence),
         display_value_hash=canonical_hash(display_value) if display_value is not None else None,
@@ -169,7 +174,7 @@ def _record(
         field_policy_version=FIELD_POLICY_VERSION,
         resolver_version=RESOLVER_VERSION,
         actor_ref=None,
-        supersedes_event_id=None,
+        supersedes_event_id=supersedes_event_id,
         now=now,
     )
 
@@ -372,3 +377,53 @@ def is_feature_eligible(conn: DbConn, logical_ref: str, field_name: str) -> bool
     if latest.event_type in _RETIRED_EVENTS:
         return False
     return latest.load_bearing_value_hash is not None
+
+
+def stale_and_clear_field(
+    conn: DbConn, *, source: str, logical_ref: str, field_name: str, now: datetime | None = None
+) -> None:
+    """Retire a field whose evidence has fully staled: record a STALED decision and CLEAR the flat
+    ``graph_node`` display column, repointing the ``*_decision_id`` link at the STALED decision.
+    The link stays NON-NULL by design — the audit trail must reach the staling event, and
+    :func:`is_feature_eligible` reads the decision log (a STALED latest decision is retired), never
+    the link.
+
+    Why this exists: :func:`resolve_and_project` iterates ``_active_field_names`` — a field with NO
+    active evidence is never resolved, so producer-scope staling alone (``stale_source_evidence``)
+    would leave the previous display value visible forever. This is the missing lifecycle step for
+    a dropped/absent advisory field on a re-upload. Callers must run it BEFORE the round's
+    ``resolve_and_project`` in the SAME transaction; the projection then skips the evidence-less
+    field and cannot re-project the cleared value away.
+
+    [F2] ``supersedes_event_id`` comes from the DURABLE decision log — the latest non-retired
+    decision (``None`` if the field was never decided) — NEVER from the ``graph_node`` link column:
+    ``build_graph`` DELETEs+recreates ``graph_node`` (link columns default NULL) BEFORE Pass B's
+    reconcile runs, so the flat link reads NULL there. ``field_decision_event`` survives
+    ``build_graph``; mirroring :func:`is_feature_eligible`, the log is the source of truth."""
+    now = now or datetime.now(UTC)
+    decisions = read_field_decisions(conn, logical_ref, field_name)  # oldest-first
+    supersedes = next(
+        (d.decision_event_id for d in reversed(decisions) if d.event_type not in _RETIRED_EVENTS),
+        None,
+    )
+    decision_id = _record(
+        conn,
+        logical_ref=logical_ref,
+        field_name=field_name,
+        evidence=(),
+        display_value=None,
+        load_bearing_value=None,
+        conflict_status="staled",
+        reason_codes=["evidence_staled"],
+        now=now,
+        event_type=FieldDecisionEventType.STALED,
+        supersedes_event_id=supersedes,
+    )
+    _project_display(
+        conn,
+        source=source,
+        logical_ref=logical_ref,
+        field_name=field_name,
+        display_value=None,
+        decision_id=decision_id,
+    )

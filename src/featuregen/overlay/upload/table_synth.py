@@ -431,6 +431,23 @@ _SKIP_QUIET_STATES = frozenset({"VERIFIED", "DRAFT", "PARTIALLY_CONFIRMED"})
 _ADVISORY_TABLE_FIELDS = ("table_role", "primary_entity", "event_or_snapshot")
 
 
+def _mark_staled(dispositions: list[dict] | None, table: str, field: str, *,
+                 status_if_missing: str) -> None:
+    """Set ``prior_value_staled=True`` on the ``{table, field}`` disposition record ([F9] — driven
+    by the staled COUNT in BOTH directions: a present value superseding older LLM rows AND a
+    dropped/absent field retiring them). Finds the record ``make_ref_accept`` appended for this run
+    (searched newest-first); a caller that never threaded the collector through the accept gets an
+    appended record with ``status_if_missing`` so the flag is never silently lost."""
+    if dispositions is None:
+        return
+    for rec in reversed(dispositions):
+        if rec.get("table") == table and rec.get("field") == field:
+            rec["prior_value_staled"] = True
+            return
+    dispositions.append({"table": table, "field": field, "status": status_if_missing,
+                         "reason": None, "prior_value_staled": True})
+
+
 def _active_skip_state(conn, ref, fact_type) -> str | None:
     from featuregen.overlay.identity import fact_key
     from featuregen.overlay.state import fold_overlay_state
@@ -445,7 +462,8 @@ def _active_skip_state(conn, ref, fact_type) -> str | None:
 
 def _propose_table_facts(conn, source: str, syntheses: dict[str, dict], *, actor,
                          source_snapshot_id: str,
-                         schema_by_table: dict[str, str] | None = None) -> None:
+                         schema_by_table: dict[str, str] | None = None,
+                         dispositions: list[dict] | None = None) -> None:
     """Route Pass B grain/availability candidates into governed PROPOSED-only facts and advisory
     table-field evidence. Fail-soft (never aborts the upload). Skips QUIETLY only when a stronger
     active claim governs the key (VERIFIED / a pending proposal); otherwise lets propose_fact
@@ -463,7 +481,21 @@ def _propose_table_facts(conn, source: str, syntheses: dict[str, dict], *, actor
     Empty / absent (a non-glossary technical upload) falls back to ``public``, which is correct —
     technical columns are public and write no glossary column decisions. NOTE: the grain/availability
     FACT stays keyed under the always-public ``table_ref`` (below); only the advisory field evidence
-    ref is schema-aligned."""
+    ref is schema-aligned.
+
+    ``dispositions`` is the SAME per-run collector list ``make_ref_accept`` appended to during
+    validation: [F9] flips ``prior_value_staled=True`` on the matching ``{table, field}`` record
+    whenever this pass ACTUALLY staled prior LLM rows — a present value superseding an older one
+    AND a dropped/absent field retiring them (both driven by the staled COUNT, decoupled from the
+    clear-gate below).
+
+    STALE-VALUE LIFECYCLE (Slice-2 Task 2): an advisory field the new synthesis NO LONGER carries
+    gets its prior LLM evidence producer-scope staled here; when NO active evidence remains for the
+    field (no human/source confirmation keeping it alive), ``stale_and_clear_field`` records a
+    STALED decision (supersedes read from the durable decision log, [F2]) and CLEARS the flat
+    ``graph_node`` display column. This runs BEFORE the caller's ``resolve_and_project`` in the
+    SAME transaction (the ingest Pass B savepoint), which then SKIPS the evidence-less field —
+    the clear is never re-projected away."""
     # Imported lazily (mirrors _propose_governed_joins): propose_fact resolves the catalog adapter
     # at import-use time, and the pure assembler/accept tests must import this module without
     # pulling the command stack (or ingest, which imports table_synth lazily in the Pass B block).
@@ -471,9 +503,14 @@ def _propose_table_facts(conn, source: str, syntheses: dict[str, dict], *, actor
     from featuregen.overlay.catalog import current_catalog_adapter
     from featuregen.overlay.commands import propose_fact
     from featuregen.overlay.evidence import AssertionStrength, EvidenceProducer
+    from featuregen.overlay.field_evidence import stale_source_evidence
     from featuregen.overlay.identity import proposal_fingerprint
     from featuregen.overlay.upload.enrich_llm import ENRICHMENT_RUN_ID
-    from featuregen.overlay.upload.ingest import _write_producer_field
+    from featuregen.overlay.upload.field_resolution import (
+        _active_field_names,
+        stale_and_clear_field,
+    )
+    from featuregen.overlay.upload.ingest import _STALE_ALL, _write_producer_field
     from featuregen.overlay.upload.object_ref import normalize_ref
     from featuregen.overlay.upload.upload_catalog import table_ref
 
@@ -525,7 +562,28 @@ def _propose_table_facts(conn, source: str, syntheses: dict[str, dict], *, actor
         for field_name in _ADVISORY_TABLE_FIELDS:
             v = syn.get(field_name)
             if v:
-                _write_producer_field(
+                staled = _write_producer_field(
                     conn, logical_ref=logical_ref, field_name=field_name, value=v,
                     producer=EvidenceProducer.LLM, strength=AssertionStrength.PROPOSED,
                     producer_ref=ENRICHMENT_RUN_ID, snapshot_id=source_snapshot_id, material=v)
+                if staled > 0:
+                    # [F9] present-replaces-older: the accepted value superseded prior LLM rows.
+                    _mark_staled(dispositions, table, field_name, status_if_missing="accepted")
+                continue
+            # Dropped/absent advisory field (the stale-value lifecycle): retire ALL of the LLM's
+            # prior ACTIVE rows for this field — _STALE_ALL can never equal a real input_hash, so
+            # every LLM row stales; other producers' rows (human/source) are NEVER touched.
+            n = stale_source_evidence(
+                conn, logical_ref=logical_ref, field_name=field_name,
+                producer=EvidenceProducer.LLM, keep_input_hash=_STALE_ALL)
+            if n > 0:
+                # [F9] DECOUPLED from the clear-gate: the LLM rows WERE staled even when a human
+                # confirmation below keeps the field alive and blocks the clear.
+                _mark_staled(dispositions, table, field_name, status_if_missing="abstained")
+                if field_name not in _active_field_names(conn, logical_ref):
+                    # NO producer's evidence remains: resolve_and_project would SKIP this field
+                    # (it iterates active field names), leaving the prior display visible. Record
+                    # the STALED decision + clear the display NOW — same transaction, BEFORE the
+                    # caller's resolve_and_project, so the clear is never re-projected away.
+                    stale_and_clear_field(
+                        conn, source=source, logical_ref=logical_ref, field_name=field_name)
