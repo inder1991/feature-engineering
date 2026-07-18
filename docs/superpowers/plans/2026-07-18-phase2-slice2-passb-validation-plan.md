@@ -1,146 +1,178 @@
-# Phase-2 Slice 2 — Per-field Pass B Validation + Stale-Value Lifecycle + Durable Dispositions — Implementation Plan
+# Phase-2 Slice 2 — Per-field Pass B Validation + Stale-Value Lifecycle + Durable Dispositions — Implementation Plan (rev. 2)
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax.
+> **For agentic workers:** REQUIRED SUB-SKILL: superpowers:subagent-driven-development, task-by-task. Steps use checkbox (`- [ ]`).
+> **rev. 2** incorporates a 17-finding review; Slice-2 items `[F9]`–`[F17]` addressed inline.
 
-**Goal:** Validate every Pass B table-synthesis field independently (complete grain checks, a versioned `table_role` vocabulary with aliases, `primary_entity` gated through the governed entity registry, `event_or_snapshot` normalization); when a field is dropped or abstained, **stale the prior value out of the graph** (not just the evidence); and record every field's disposition as durable, reviewer-visible state.
+**Goal:** Validate every Pass B field independently (normalized grain checks, a versioned+schema-enforced `table_role` vocabulary, `primary_entity` gated through `known_entities()`, normalized `event_or_snapshot`); when a field is dropped/abstained, **stale the prior value out of the graph**; and record a **total** per-field disposition set (all five fields for every evaluated table, plus table-level `not_evaluated`) as durable, structured, reviewer-visible state.
 
-**Architecture:** All field validation happens in `make_ref_accept` (`table_synth.py`), which now (a) drops only the invalid field, never the whole synthesis, and (b) records a per-field disposition into a side-channel collector. Dropped/abstained advisory fields are producer-scope staled AND run through a new "touched-field resolver" that records a `STALED` decision and clears the `graph_node` display column + decision link. Dispositions persist as ingestion-run stage detail keyed by `(table, field)`.
+**Architecture:** Field validation lives in `make_ref_accept`; it drops only the invalid field and appends a per-field disposition record. Dropped/absent advisory fields are producer-scope staled AND cleared from `graph_node` via a `STALED` decision. Dispositions are a **list of records** (no delimited keys), and `staled` is a lifecycle flag (`prior_value_staled`), not a status.
 
-**Tech Stack:** Python 3.11, psycopg3, PostgreSQL. Interpreter `.venv/bin/python`. Depends on Slice 1 (the version seam `prompt_version`/`schema_version` params).
+**Tech Stack:** Python 3.11, psycopg3, PostgreSQL. Interpreter `.venv/bin/python`. **Depends on Slice 1** (the version seam; Slice 1 left Pass B at schema/prompt v2 — Slice 2 bumps to **v3**).
 
 ## Global Constraints
 
-- Branch off Slice 1's branch tip (Slice 2 depends on the Task-1 version seam). Confirm the base with the user.
-- All subagent work on **Opus 4.8**.
-- **Governance unchanged:** grain/availability stay PROPOSED-only governed facts; `table_role`/`primary_entity`/`event_or_snapshot` stay RECOMMENDATION-ceilinged advisory field evidence (`field_policies.py` `_TABLE_ADVISORY`). Nothing auto-verifies.
-- **Reuse, don't reinvent:** `known_entities()` (`taxonomy/dimensions.py`) with the clear-on-miss pattern (`recognition.py`); `stale_source_evidence` (`field_evidence.py`) + the `_stale_absent_fields` shape (`ingest.py`); `_project_display`/`_DISPLAY_COLUMN`/`_DECISION_LINK_COLUMN`/`is_feature_eligible`/`_RETIRED_EVENTS` (`field_resolution.py`); `record_stage`/`StageRecorder` JSONB detail (`stage_report.py`); the version seam (`enrich_llm.audited_batch_call`).
-- Disposition **status vocab**: `accepted`, `abstained`, `dropped_invalid`, `staled`. **Reason-code vocab**: `grain_col_not_in_table`, `grain_duplicate`, `grain_over_bound`, `role_off_vocab`, `entity_not_registered`, `basis_not_allowed`, `as_of_col_not_in_table`.
-- **Verify line numbers before editing** — anchor on symbol names. (Current facts: `make_ref_accept` `table_synth.py:104`; the whole-synthesis grain reject at `:117-118`; the advisory `if v:` write at `:422-428`; `_ADVISORY_TABLE_FIELDS` `:328`; `_VALID_BASIS`; the two synth schemas `enrich_llm.py:269`/`:289` + summary `:307`; `resolve_and_project` processes only fields WITH active evidence.)
-- Run `.venv/bin/python -m pytest <targets> -q` after each task; `.venv/bin/ruff check <files>`.
+- Branch off Slice 1's tip. All subagent work on **Opus 4.8**.
+- **Governance unchanged:** grain/availability stay PROPOSED governed facts; the three advisory fields stay RECOMMENDATION-ceilinged evidence; nothing auto-verifies.
+- **Vocab consistency `[F9]`:** the schema enum lists the **accepted raw** values `{fact, dim, reference, event_fact, snapshot_fact, dimension, bridge}`; code normalizes aliases to a **canonical** set `{event_fact, snapshot_fact, dimension, reference, bridge, fact}` (legacy `fact` retained as canonical). `event_or_snapshot` and `primary_entity` are `strip().lower()`-normalized before matching.
+- **Schema-first + code backup `[F10]`:** Pass B ships schema **v3** with a nullable-enum `table_role`; code-side normalization/gating remains as defense. `primary_entity` stays a free string (38-value enum is verbose) gated code-side through `known_entities()`.
+- **Total dispositions `[F12]`:** every evaluated table produces a disposition for **all five** fields (`grain`, `availability_time`, `table_role`, `primary_entity`, `event_or_snapshot`); a table that never reached `make_ref_accept` (unresolved/failed) gets a table-level `not_evaluated`. `abstained` (evaluated, model gave nothing) ≠ `not_evaluated`.
+- **Disposition shape `[F13,F15]`:** a **list** of `{"table","field","status","reason","prior_value_staled"}` records — never a `"table.field"` string key. `status ∈ {accepted, abstained, dropped_invalid, not_evaluated}`; `prior_value_staled` is a separate lifecycle bool set by `_propose_table_facts`. **Reason vocab:** `grain_invalid_shape, grain_duplicate, grain_over_bound, grain_col_not_in_table, role_off_vocab, entity_not_registered, basis_not_allowed, as_of_col_not_in_table`.
+- **Stale contract `[F14]`:** a fully-staled field gets a `STALED` decision (`supersedes_event_id` = the prior decision); `_project_display(display_value=None, decision_id=<staled>)` clears the **display column** (NULL) and repoints the **link** to the STALED decision (an audit trail — the link is NOT NULL). Assert the display column is NULL, the latest decision is STALED, and no active LLM evidence remains — **not** `is_feature_eligible` (always False for ceiling fields), **not** link-IS-NULL.
+- **Test commands:** run pytest directly (no `| tail` — it masks the exit code) `[F16]`; exact-match assertions from scripted FakeLLM, no `...`.
+- **Verify line numbers** — anchor on symbols. (Current: `make_ref_accept:104` [grain whole-reject `:117-118`]; advisory `if v:` write `:422-428`; `_ADVISORY_TABLE_FIELDS:328`; schemas `enrich_llm.py:269/289/307`; `resolve_and_project` processes only fields WITH active evidence.)
 
 ---
 
-### Task 1: Complete per-field validation + versioned vocab + disposition collection + prompt v3
+### Task 1: Vocab module + schema v3 + complete validation + total dispositions + prompt/schema v3
 
-**Files:**
-- Create: `src/featuregen/overlay/upload/table_vocab.py` (vocab + normalizers)
-- Modify: `src/featuregen/overlay/upload/table_synth.py` (`make_ref_accept`, `make_summary_accept` role normalization, the three synth drivers pass `prompt_version=3`)
-- Test: `tests/featuregen/overlay/upload/test_passb_field_validation.py`
+**Files:** Create `table_vocab.py`; modify `table_synth.py` (`make_ref_accept`, `make_summary_accept`, synth drivers → `prompt_version=3, schema_version=3`), `enrich_llm.py` (`_SCHEMAS` v3 with the `table_role` enum, registered). Test `tests/featuregen/overlay/upload/test_passb_field_validation.py`.
 
 **Interfaces:**
-- Produces:
-  - `table_vocab.MAX_GRAIN_COLS = 16`
-  - `table_vocab.TABLE_ROLES = frozenset({"event_fact", "snapshot_fact", "dimension", "reference", "bridge"})`
-  - `table_vocab.normalize_table_role(raw: str | None, *, event_or_snapshot: str | None) -> str | None` — aliases `dim`→`dimension`; `fact`→`event_fact` if `event_or_snapshot=="event"`, `snapshot_fact` if `"snapshot"`, else retained `fact`; `reference` kept; any other/unmapped → `None`.
-  - `table_vocab.normalize_event_or_snapshot(raw) -> str | None` — `{"event","snapshot"}` else `None`.
-  - `make_ref_accept(columns_by_table, *, dispositions: dict[tuple[str, str], dict] | None = None)` — validates each field independently, drops only the invalid one, and records a `{"status","reason"}` disposition per `(table, field)` into `dispositions`.
+- `table_vocab.MAX_GRAIN_COLS = 16`
+- `table_vocab.TABLE_ROLE_ENUM = ["fact","dim","reference","event_fact","snapshot_fact","dimension","bridge"]` (schema enum, accepted raw)
+- `table_vocab.CANONICAL_TABLE_ROLES = frozenset({"event_fact","snapshot_fact","dimension","reference","bridge","fact"})`
+- `table_vocab.normalize_table_role(raw, *, event_or_snapshot) -> str | None`
+- `table_vocab.normalize_event_or_snapshot(raw) -> str | None`
+- `make_ref_accept(columns_by_table, *, dispositions: list | None = None)` — appends `{"table","field","status","reason","prior_value_staled": False}` records for all five fields per call.
 
-- [ ] **Step 1: Write the failing tests**
+- [ ] **Step 1: Write the failing tests (exact, no placeholders)**
 
 ```python
 # tests/featuregen/overlay/upload/test_passb_field_validation.py
 import json
 from featuregen.overlay.upload.table_synth import make_ref_accept
-from featuregen.overlay.upload.table_vocab import normalize_table_role, MAX_GRAIN_COLS
+from featuregen.overlay.upload.table_vocab import (
+    normalize_table_role, normalize_event_or_snapshot, MAX_GRAIN_COLS, CANONICAL_TABLE_ROLES)
 
 
 def _accept(cols):
-    disp = {}
+    disp = []
     return make_ref_accept({"t": set(cols)}, dispositions=disp), disp
 
 
-def test_bad_grain_column_drops_only_grain_keeps_role_entity():
-    accept, disp = _accept(["a", "b"])
-    payload = json.dumps({"grain_columns": ["a", "ghost"], "table_role": "fact",
-                          "primary_entity": "customer", "event_or_snapshot": "event"})
-    value, reason = accept(payload, "t")
-    out = json.loads(value)
-    assert out["grain"] is None                                  # grain dropped
-    assert out["table_role"] == "event_fact"                     # fact -> event_fact (kept)
-    assert out["primary_entity"] == "customer"
-    assert disp[("t", "grain")]["reason"] == "grain_col_not_in_table"
+def _find(disp, field):
+    return next(d for d in disp if d["table"] == "t" and d["field"] == field)
 
 
-def test_grain_rejects_duplicates_and_over_bound():
-    accept, disp = _accept(["a", "b"])
-    dup = json.dumps({"grain_columns": ["a", "a"]})
-    assert json.loads(accept(dup, "t")[0])["grain"] is None
-    assert disp[("t", "grain")]["reason"] == "grain_duplicate"
-    big_cols = [str(i) for i in range(MAX_GRAIN_COLS + 1)]
-    accept2, disp2 = _accept(big_cols)
-    over = json.dumps({"grain_columns": big_cols})
-    assert json.loads(accept2(over, "t")[0])["grain"] is None
-    assert disp2[("t", "grain")]["reason"] == "grain_over_bound"
-
-
-def test_table_role_alias_and_off_vocab():
+def test_vocab_is_internally_consistent():
+    assert normalize_table_role("fact", event_or_snapshot=None) in CANONICAL_TABLE_ROLES  # "fact"
     assert normalize_table_role("dim", event_or_snapshot=None) == "dimension"
     assert normalize_table_role("fact", event_or_snapshot="snapshot") == "snapshot_fact"
-    assert normalize_table_role("reference", event_or_snapshot=None) == "reference"
-    assert normalize_table_role("wharrgarbl", event_or_snapshot=None) is None
+    assert normalize_table_role("FACT ", event_or_snapshot="event") == "event_fact"       # strip/lower
+    assert normalize_table_role("nonsense", event_or_snapshot=None) is None
+    assert normalize_event_or_snapshot(" Event ") == "event"                              # strip/lower
+
+
+def test_grain_normalized_duplicate_and_invalid_shape():
+    accept, disp = _accept(["Id", "amt"])
+    # case-variant duplicate must be caught (normalized)
+    assert json.loads(accept(json.dumps({"grain_columns": ["id", "ID"]}), "t")[0])["grain"] is None
+    assert _find(disp, "grain")["reason"] == "grain_duplicate"
+    # a non-string element is an invalid shape, NOT silently filtered
+    accept2, disp2 = _accept(["id"])
+    assert json.loads(accept2(json.dumps({"grain_columns": ["id", 7]}), "t")[0])["grain"] is None
+    assert _find(disp2, "grain")["reason"] == "grain_invalid_shape"
+
+
+def test_grain_maps_back_to_canonical_table_spelling():
+    accept, disp = _accept(["CustomerId"])
+    out = json.loads(accept(json.dumps({"grain_columns": ["customerid"]}), "t")[0])
+    assert out["grain"]["columns"] == ["CustomerId"]        # canonical table spelling, not the input
+    assert _find(disp, "grain")["status"] == "accepted"
+
+
+def test_grain_over_bound():
+    big = [str(i) for i in range(MAX_GRAIN_COLS + 1)]
+    accept, disp = _accept(big)
+    assert json.loads(accept(json.dumps({"grain_columns": big}), "t")[0])["grain"] is None
+    assert _find(disp, "grain")["reason"] == "grain_over_bound"
+
+
+def test_bad_grain_keeps_role_and_entity():
     accept, disp = _accept(["a"])
-    v = json.loads(accept(json.dumps({"grain_columns": [], "table_role": "wharrgarbl"}), "t")[0])
-    assert v["table_role"] is None and disp[("t", "table_role")]["status"] == "dropped_invalid"
+    out = json.loads(accept(json.dumps({"grain_columns": ["ghost"], "table_role": "fact",
+                                        "primary_entity": "customer", "event_or_snapshot": "event"}),
+                            "t")[0])
+    assert out["grain"] is None and out["table_role"] == "event_fact"
+    assert out["primary_entity"] == "customer"
+    assert _find(disp, "grain")["reason"] == "grain_col_not_in_table"
 
 
-def test_primary_entity_gated_through_registry():
+def test_off_vocab_role_and_unregistered_entity_dropped():
     accept, disp = _accept(["a"])
-    v = json.loads(accept(json.dumps({"grain_columns": [], "primary_entity": "not_an_entity"}), "t")[0])
-    assert v["primary_entity"] is None
-    assert disp[("t", "primary_entity")]["reason"] == "entity_not_registered"
+    out = json.loads(accept(json.dumps({"grain_columns": [], "table_role": "wat",
+                                        "primary_entity": "Customer"}), "t")[0])
+    assert out["table_role"] is None and _find(disp, "table_role")["reason"] == "role_off_vocab"
+    assert out["primary_entity"] == "customer"              # "Customer" normalized + registered
+    accept2, disp2 = _accept(["a"])
+    out2 = json.loads(accept2(json.dumps({"grain_columns": [], "primary_entity": "zzz"}), "t")[0])
+    assert out2["primary_entity"] is None
+    assert _find(disp2, "primary_entity")["reason"] == "entity_not_registered"
 
 
-def test_event_or_snapshot_normalized():
-    accept, _ = _accept(["a"])
-    v = json.loads(accept(json.dumps({"grain_columns": [], "event_or_snapshot": "EVENTish"}), "t")[0])
-    assert v["event_or_snapshot"] is None
+def test_dispositions_are_total_five_fields():
+    accept, disp = _accept(["a"])
+    accept(json.dumps({"grain_columns": []}), "t")
+    fields = {d["field"] for d in disp}
+    assert fields == {"grain", "availability_time", "table_role", "primary_entity",
+                      "event_or_snapshot"}
+    assert _find(disp, "table_role")["status"] == "abstained"   # absent advisory == abstained
 ```
 
-- [ ] **Step 2: Run to verify they fail**
-
-Run: `.venv/bin/python -m pytest tests/featuregen/overlay/upload/test_passb_field_validation.py -q` → FAIL.
+- [ ] **Step 2: Run — expect FAIL** `.venv/bin/python -m pytest tests/featuregen/overlay/upload/test_passb_field_validation.py -q`
 
 - [ ] **Step 3: Implement `table_vocab.py`**
 
 ```python
 # src/featuregen/overlay/upload/table_vocab.py
-"""Versioned controlled vocabularies for Pass B table synthesis. table_role migrates from the legacy
-open values (fact/dim/reference) to a controlled set via explicit aliases; an unmapped value is an
-abstention (dropped), never active advisory evidence. primary_entity is gated by the governed
-entity registry (known_entities). Enforced code-side; the schema keeps table_role a free string."""
 from __future__ import annotations
 
-MAX_GRAIN_COLS = 16   # matches the grain_columns maxItems in the synth schema
-
-TABLE_ROLES = frozenset({"event_fact", "snapshot_fact", "dimension", "reference", "bridge"})
-_ROLE_ALIASES = {"dim": "dimension", "reference": "reference"}
+MAX_GRAIN_COLS = 16
+TABLE_ROLE_ENUM = ["fact", "dim", "reference", "event_fact", "snapshot_fact", "dimension", "bridge"]
+CANONICAL_TABLE_ROLES = frozenset({"event_fact", "snapshot_fact", "dimension", "reference",
+                                   "bridge", "fact"})
+_ROLE_ALIASES = {"dim": "dimension"}
 
 
 def normalize_event_or_snapshot(raw: str | None) -> str | None:
-    return raw if raw in ("event", "snapshot") else None
+    if not isinstance(raw, str):
+        return None
+    v = raw.strip().lower()
+    return v if v in ("event", "snapshot") else None
 
 
 def normalize_table_role(raw: str | None, *, event_or_snapshot: str | None) -> str | None:
     if not isinstance(raw, str):
         return None
     v = raw.strip().lower()
-    if v in TABLE_ROLES:
+    if v in CANONICAL_TABLE_ROLES:
         return v
     if v in _ROLE_ALIASES:
         return _ROLE_ALIASES[v]
-    if v == "fact":
-        eos = normalize_event_or_snapshot(event_or_snapshot)
-        return "event_fact" if eos == "event" else "snapshot_fact" if eos == "snapshot" else "fact"
+    if v == "fact":                                        # unreachable (fact in CANONICAL) — kept explicit
+        return "fact"
+    if v in ("event_fact", "snapshot_fact"):
+        return v
     return None
 ```
-(`"fact"` with no event/snapshot signal is retained as `"fact"` — a legacy value the reviewer required not to silently drop; it is still a recognized advisory value.)
+(Note: `"fact"` is canonical; the `event_or_snapshot`-driven split happens on the RAW alias path handled in `make_ref_accept`: when the model returns `"fact"` AND an `event_or_snapshot`, prefer `event_fact`/`snapshot_fact`. Implement that preference in `make_ref_accept` where both fields are in scope — see Step 4 — rather than passing `event_or_snapshot` deeper. The `event_or_snapshot` param remains for callers that want the split at normalize time.)
 
-- [ ] **Step 4: Rewrite `make_ref_accept` for per-field validation + dispositions**
+Refine: put the fact-split in `normalize_table_role` since it takes `event_or_snapshot`:
+```python
+    if v == "fact":
+        return {"event": "event_fact", "snapshot": "snapshot_fact"}.get(
+            normalize_event_or_snapshot(event_or_snapshot), "fact")
+```
+and drop the `"fact"` early-return in `CANONICAL_TABLE_ROLES` by checking aliases/fact BEFORE the canonical membership. Order: strip/lower → if `"fact"` split-or-retain → alias map → canonical membership → `event_fact`/`snapshot_fact` → None.
 
-Replace the whole-synthesis grain reject with per-field validation. Key changes to the `accept` closure:
+- [ ] **Step 4: Rewrite `make_ref_accept`** for normalized grain, normalized advisory, total dispositions:
+
 ```python
 def make_ref_accept(columns_by_table, *, dispositions=None):
-    disp = dispositions if dispositions is not None else {}
+    disp = dispositions if dispositions is not None else []
+    def _put(ref, field, status, reason=None):
+        disp.append({"table": ref, "field": field, "status": status, "reason": reason,
+                     "prior_value_staled": False})
     def accept(raw, ref):
         cols = columns_by_table.get(ref, set())
         try:
@@ -150,114 +182,107 @@ def make_ref_accept(columns_by_table, *, dispositions=None):
         if not isinstance(s, dict):
             return None, "not_object"
 
-        # --- grain: validate independently; drop grain only, never the whole synthesis ---
-        raw_grain = [c for c in (s.get("grain_columns") or []) if isinstance(c, str)]
+        # grain
+        rg = s.get("grain_columns")
         grain = None
-        if raw_grain:
-            if len(raw_grain) != len(set(raw_grain)):
-                disp[(ref, "grain")] = {"status": "dropped_invalid", "reason": "grain_duplicate"}
-            elif len(raw_grain) > table_vocab.MAX_GRAIN_COLS:
-                disp[(ref, "grain")] = {"status": "dropped_invalid", "reason": "grain_over_bound"}
-            elif any(c not in cols for c in raw_grain):
-                disp[(ref, "grain")] = {"status": "dropped_invalid", "reason": "grain_col_not_in_table"}
-            else:
-                grain = {"columns": raw_grain, "is_unique": True}
-                disp[(ref, "grain")] = {"status": "accepted", "reason": None}
+        if rg in (None, []):
+            _put(ref, "grain", "abstained")
+        elif not isinstance(rg, list) or not all(isinstance(c, str) for c in rg):
+            _put(ref, "grain", "dropped_invalid", "grain_invalid_shape")
         else:
-            disp[(ref, "grain")] = {"status": "abstained", "reason": None}
-
-        # --- availability: unchanged decoupling, now with a disposition ---
-        availability, as_of_col, as_of_basis = None, s.get("as_of_column"), s.get("as_of_basis")
-        if as_of_col is not None:
-            if as_of_col in cols and as_of_basis in _VALID_BASIS:
-                availability = {"column": as_of_col, "basis": as_of_basis}
-                disp[(ref, "availability_time")] = {"status": "accepted", "reason": None}
+            fold = [c.strip().lower() for c in rg]
+            back = {c.lower(): c for c in cols}
+            if len(fold) != len(set(fold)):
+                _put(ref, "grain", "dropped_invalid", "grain_duplicate")
+            elif len(rg) > table_vocab.MAX_GRAIN_COLS:
+                _put(ref, "grain", "dropped_invalid", "grain_over_bound")
+            elif any(f not in back for f in fold):
+                _put(ref, "grain", "dropped_invalid", "grain_col_not_in_table")
             else:
-                reason = "basis_not_allowed" if as_of_col in cols else "as_of_col_not_in_table"
-                disp[(ref, "availability_time")] = {"status": "dropped_invalid", "reason": reason}
-                counters.incr("overlay.table_synth.availability.dropped_bad_as_of")
+                grain = {"columns": [back[f] for f in fold], "is_unique": True}
+                _put(ref, "grain", "accepted")
 
-        # --- advisory: normalize/gate each; a dropped one is a disposition (staled later) ---
+        # availability
+        availability, aoc, aob = None, s.get("as_of_column"), s.get("as_of_basis")
+        if aoc is None:
+            _put(ref, "availability_time", "abstained")
+        elif aoc in cols and aob in _VALID_BASIS:
+            availability = {"column": aoc, "basis": aob}
+            _put(ref, "availability_time", "accepted")
+        else:
+            _put(ref, "availability_time", "dropped_invalid",
+                 "basis_not_allowed" if aoc in cols else "as_of_col_not_in_table")
+
+        # advisory (normalized/gated), each with a disposition
         eos = table_vocab.normalize_event_or_snapshot(s.get("event_or_snapshot"))
-        role = table_vocab.normalize_table_role(s.get("table_role"), event_or_snapshot=eos)
-        if s.get("table_role") and role is None:
-            disp[(ref, "table_role")] = {"status": "dropped_invalid", "reason": "role_off_vocab"}
+        _put(ref, "event_or_snapshot", "accepted" if eos else "abstained")
+        rr = s.get("table_role")
+        role = table_vocab.normalize_table_role(rr, event_or_snapshot=eos)
+        if rr and role is None:
+            _put(ref, "table_role", "dropped_invalid", "role_off_vocab")
+        else:
+            _put(ref, "table_role", "accepted" if role else "abstained")
         ent = s.get("primary_entity")
-        if isinstance(ent, str) and ent and ent not in known_entities():
-            disp[(ref, "primary_entity")] = {"status": "dropped_invalid",
-                                             "reason": "entity_not_registered"}
-            ent = None
+        ent = ent.strip().lower() if isinstance(ent, str) else None
+        if ent and ent not in known_entities():
+            _put(ref, "primary_entity", "dropped_invalid", "entity_not_registered"); ent = None
+        else:
+            _put(ref, "primary_entity", "accepted" if ent else "abstained")
 
         out = {"grain": grain, "availability_time": availability,
                "table_role": role, "primary_entity": ent, "event_or_snapshot": eos}
         return json.dumps(out, sort_keys=True), ("valid" if (grain or availability) else "abstained")
     return accept
 ```
-Add imports for `table_vocab` and `known_entities`. Apply `normalize_table_role`/`normalize_event_or_snapshot` in `make_summary_accept` too (its `entity_signals`/`event_or_snapshot` normalization). Bump `prompt_version=3` in the three synth drivers (`synthesize_tables`/`_run_synthesis`/`_synthesize_wide_tables` → `run_batched`), and update `_INSTRUCTION`/`_SUMMARY_INSTRUCTION`/`_SYNTH_WIDE_INSTRUCTION` to enumerate the controlled `table_role` values.
+Add `table_vocab` + `known_entities` imports. Apply the same normalization in `make_summary_accept`. Add the **v3** synth schemas (copy v2, set `table_role` to `{"type": ["string","null"], "enum": table_vocab.TABLE_ROLE_ENUM + [None]}`) + register; pass `prompt_version=3, schema_version=3` from the synth drivers; update `_INSTRUCTION`/`_SUMMARY_INSTRUCTION`/`_SYNTH_WIDE_INSTRUCTION` to enumerate the accepted `table_role` values.
 
-- [ ] **Step 5: Run to verify pass + Pass B regression**
-
-Run: `.venv/bin/python -m pytest tests/featuregen/overlay/upload/test_passb_field_validation.py tests/featuregen/overlay/upload/test_passb_abstention.py tests/featuregen/overlay/upload/test_table_synth*.py -q` → PASS.
-
-- [ ] **Step 6: Commit**
-
-```bash
-git add src/featuregen/overlay/upload/table_vocab.py src/featuregen/overlay/upload/table_synth.py tests/featuregen/overlay/upload/test_passb_field_validation.py
-git commit -m "feat(passb): complete per-field validation — grain checks, versioned table_role vocab, entity-registry gating, dispositions, prompt v3"
-```
+- [ ] **Step 5: Run — expect PASS** `.venv/bin/python -m pytest tests/featuregen/overlay/upload/test_passb_field_validation.py tests/featuregen/overlay/upload/test_passb_abstention.py tests/featuregen/overlay/upload/test_table_synth*.py -q`
+- [ ] **Step 6: Commit** `feat(passb): normalized per-field validation, consistent vocab, schema+prompt v3, total dispositions`
 
 ---
 
-### Task 2: Stale-value lifecycle — clear the projected graph column + decision link
+### Task 2: Stale-value lifecycle — clear the graph display + record a STALED decision
 
-**Files:**
-- Modify: `src/featuregen/overlay/upload/field_resolution.py` (add `stale_and_clear_field(...)`)
-- Modify: `src/featuregen/overlay/upload/table_synth.py` (`_propose_table_facts` — stale + clear dropped/absent advisory fields)
-- Test: `tests/featuregen/overlay/upload/test_passb_stale_lifecycle.py`
+**Files:** Modify `field_resolution.py` (`stale_and_clear_field`, `_record` override for `event_type`/`supersedes_event_id`/None values), `table_synth.py` (`_propose_table_facts` — stale dropped/absent advisory fields + set `prior_value_staled`). Test `tests/featuregen/overlay/upload/test_passb_stale_lifecycle.py`.
 
-**Interfaces:**
-- Consumes: `stale_source_evidence`, `_DISPLAY_COLUMN`/`_DECISION_LINK_COLUMN`/`_project_display`/`_record`/`is_feature_eligible`, `_active_field_names`.
-- Produces: `field_resolution.stale_and_clear_field(conn, *, source: str, logical_ref: str, field_name: str, now: datetime | None = None) -> None` — records a `STALED` field decision (display=None, load-bearing=None, no selected evidence) and calls `_project_display(display_value=None, decision_id=<staled>)` to clear the display column + repoint the link; rebuilds search if the field is search-doc-bearing.
+**Interfaces:** `field_resolution.stale_and_clear_field(conn, *, source, logical_ref, field_name, now=None) -> None`; `_propose_table_facts(..., dispositions: list | None = None)` sets `prior_value_staled=True` on the matching `{table, field}` record when it stales one.
 
-- [ ] **Step 1: Write the failing test (assert the GRAPH, not just evidence)**
+- [ ] **Step 1: Write the failing test (assert the graph + the decision, per `[F14]`)**
 
 ```python
 # tests/featuregen/overlay/upload/test_passb_stale_lifecycle.py
-# Round 1: Pass B proposes table_role='fact' -> resolve/project -> graph_node.table_role='event_fact'.
-# Round 2: a re-upload where Pass B OMITS table_role -> the prior advisory value must be STALED and
-# graph_node.table_role must be NULL, and is_feature_eligible(...) False.
-def test_dropped_advisory_field_clears_graph_column_and_link(db):
-    # helper: run _propose_table_facts + resolve_and_project for a synthesized table, then re-run
-    # with the field absent; assert the graph column + decision link are cleared.
-    ...
-    assert row_after["table_role"] is None
-    assert row_after["table_role_decision_id"] is None
+# Round 1: propose table_role='fact' (+event) -> resolve/project -> graph_node.table_role='event_fact'.
+# Round 2: re-propose with table_role ABSENT -> the field is staled and cleared.
+def test_dropped_advisory_field_is_staled_and_cleared(db, passb_two_round_harness):
+    graph, decisions, evidence = passb_two_round_harness(
+        db, round1={"grain_columns": [], "table_role": "fact", "event_or_snapshot": "event"},
+        round2={"grain_columns": []})            # table_role omitted in round 2
+    assert graph["table_role"] is None                       # display column cleared
+    assert decisions.latest("table_role").event_type == "STALED"
+    assert decisions.latest("table_role").supersedes_event_id is not None
+    assert evidence.active_llm("table_role") == []           # no active LLM evidence remains
 ```
-(The implementer builds the two-round harness against the real `_propose_table_facts` + wherever `resolve_and_project` runs for the advisory refs — see Step 3.)
+(The harness runs `_propose_table_facts` + `resolve_and_project` for the table ref across two rounds and exposes the graph row, the field-decision log, and active evidence.)
 
-- [ ] **Step 2: Run to verify it fails**
-
-Run: `.venv/bin/python -m pytest tests/featuregen/overlay/upload/test_passb_stale_lifecycle.py -q` → FAIL (stale leaves the graph value visible).
+- [ ] **Step 2: Run — expect FAIL** `.venv/bin/python -m pytest tests/featuregen/overlay/upload/test_passb_stale_lifecycle.py -q`
 
 - [ ] **Step 3: Implement `stale_and_clear_field` + wire it**
 
-In `field_resolution.py`, add:
+Extend `_record` to accept `event_type=FieldDecisionEventType.RESOLVED`, `display_value` (may be None), `load_bearing_value` (may be None), `selected_evidence=()`, `conflict_status`, `reason_codes`, `supersedes_event_id=None` — keeping the existing caller's defaults unchanged. Add:
 ```python
 def stale_and_clear_field(conn, *, source, logical_ref, field_name, now=None):
-    """The last active evidence for `field_name` was staled — record a STALED decision and clear the
-    projected display column + decision link (resolve_and_project skips fields with no active
-    evidence, so it never revisits a fully-staled field). Idempotent: a no-op if nothing is set."""
     now = now or datetime.now(UTC)
+    prev = _current_decision_id(conn, source, logical_ref, field_name)   # read the graph link column
     decision_id = _record(conn, source=source, logical_ref=logical_ref, field_name=field_name,
-                          display_value=None, load_bearing_value=None, selected_evidence=[],
-                          event_type=FieldDecisionEventType.STALED, conflict_status="staled",
-                          reason_codes=["evidence_staled"], now=now)
+                          display_value=None, load_bearing_value=None, selected_evidence=(),
+                          event_type=FieldDecisionEventType.STALED, supersedes_event_id=prev,
+                          conflict_status="staled", reason_codes=["evidence_staled"], now=now)
     _project_display(conn, source=source, logical_ref=logical_ref, field_name=field_name,
                      display_value=None, decision_id=decision_id)
 ```
-(You must extend `_record` to accept an `event_type`/`display_value`/`load_bearing_value`/`selected_evidence`/`conflict_status`/`reason_codes` override — today it hardcodes `RESOLVED`. Keep the default behavior for the existing caller unchanged.)
+Add `_current_decision_id` (SELECT the `*_decision_id` link from `graph_node` via `_graph_key`).
 
-In `table_synth.py` `_propose_table_facts`, after the advisory write loop, reconcile the dropped/absent advisory fields (producer-scope stale the LLM evidence, then clear the graph):
+In `_propose_table_facts`, after the advisory write loop, reconcile absent/dropped advisory fields:
 ```python
         written = {f for f in _ADVISORY_TABLE_FIELDS if syn.get(f)}
         for field_name in _ADVISORY_TABLE_FIELDS:
@@ -265,97 +290,72 @@ In `table_synth.py` `_propose_table_facts`, after the advisory write loop, recon
                 continue
             n = stale_source_evidence(conn, logical_ref=logical_ref, field_name=field_name,
                                       producer=EvidenceProducer.LLM, keep_input_hash=_STALE_ALL)
-            if n and not _active_field_names_has(conn, logical_ref, field_name):
+            if n and not _active_field_names(conn, logical_ref) & {field_name}:
                 stale_and_clear_field(conn, source=source, logical_ref=logical_ref,
                                       field_name=field_name)
+                _mark_staled(dispositions, table, field_name)   # prior_value_staled = True
 ```
-Import `stale_and_clear_field`, `stale_source_evidence`, `_STALE_ALL` (or a local sentinel), and a helper to test "no remaining active evidence for this field" (a scoped `_active_field_names`). **Trace where `resolve_and_project` runs for the Pass B advisory refs** and ensure this staling runs in the same transaction/order so the clear isn't re-projected away.
+Add imports (`stale_and_clear_field`, `stale_source_evidence`, `_active_field_names`, `_STALE_ALL`) and `_mark_staled(disp, table, field)` (find/append the `{table, field}` record → `prior_value_staled=True`). **Trace** where `resolve_and_project` runs for the Pass B advisory refs and ensure this staling is in the same transaction so the clear is not re-projected away.
 
-- [ ] **Step 4: Run to verify pass + regression**
-
-Run: `.venv/bin/python -m pytest tests/featuregen/overlay/upload/test_passb_stale_lifecycle.py tests/featuregen/overlay/upload/test_field_resolution*.py -q` → PASS.
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add src/featuregen/overlay/upload/field_resolution.py src/featuregen/overlay/upload/table_synth.py tests/featuregen/overlay/upload/test_passb_stale_lifecycle.py
-git commit -m "fix(passb): stale-value lifecycle — a dropped advisory field clears its graph column + decision link (STALED)"
-```
+- [ ] **Step 4: Run — expect PASS** `.venv/bin/python -m pytest tests/featuregen/overlay/upload/test_passb_stale_lifecycle.py tests/featuregen/overlay/upload/test_field_resolution*.py -q`
+- [ ] **Step 5: Commit** `fix(passb): stale lifecycle — STALED decision (supersedes) + display cleared; prior_value_staled on the disposition`
 
 ---
 
-### Task 3: Durable per-field dispositions as ingestion-run stage detail
+### Task 3: Durable, total dispositions in the `pass_b` stage detail
 
-**Files:**
-- Modify: `src/featuregen/overlay/upload/table_synth.py` (`synthesize_tables` threads the `dispositions` collector out)
-- Modify: `src/featuregen/overlay/upload/ingest.py` (Pass B block — pass the collector, fold it into the `pass_b` stage detail keyed by `table.field`)
-- Test: `tests/featuregen/overlay/upload/test_passb_dispositions.py`
+**Files:** Modify `table_synth.py` (`synthesize_tables(..., dispositions=…)` threads the collector; returns it), `ingest.py` (create the collector, add `not_evaluated` for unresolved tables, fold into `pass_b` stage detail). Test `tests/featuregen/overlay/upload/test_passb_dispositions.py`.
 
-**Interfaces:**
-- Consumes: `make_ref_accept(..., dispositions=…)` (Task 1), `record_stage(..., detail=…)` (`stage_report.py`).
-- Produces: `synthesize_tables(..., dispositions: dict | None = None)` populates the collector; the `pass_b` stage `detail` gains `{"dispositions": {"<table>.<field>": {"status","reason"}, ...}}`.
+**Interfaces:** the `pass_b` stage `detail` gains `"dispositions": [ {"table","field","status","reason","prior_value_staled"}, ... ]` (a list, JSON-safe).
 
-- [ ] **Step 1: Write the failing test**
+- [ ] **Step 1: Write the failing test (exact scripted result)**
 
 ```python
 # tests/featuregen/overlay/upload/test_passb_dispositions.py
-# Ingest a fixture where Pass B returns an off-vocab table_role and a ghost grain column; assert the
-# ingestion_run_stage 'pass_b' detail carries dispositions with the right status + reason vocab.
-def test_dispositions_persist_in_stage_detail(db, synthetic_ftr_upload):
-    ...
+def test_dispositions_persist_total_in_stage_detail(db, synthetic_ftr_upload_scripted):
+    # script FakeLLM to return, for table 'txn': grain_columns=['ghost'], table_role='wat'
+    run_id = synthetic_ftr_upload_scripted(db, source="ftr_disp", synthesis={
+        "txn": {"grain_columns": ["ghost"], "table_role": "wat", "grain_columns_valid": False}})
     detail = _pass_b_stage_detail(db, run_id)
-    assert detail["dispositions"]["txn.grain"]["reason"] in (
-        "grain_col_not_in_table", "grain_duplicate", "grain_over_bound", None)
-    assert detail["dispositions"]["txn.table_role"]["status"] in ("accepted", "dropped_invalid",
-                                                                  "abstained", "staled")
+    recs = {(d["table"], d["field"]): d for d in detail["dispositions"]}
+    assert recs[("txn", "grain")]["reason"] == "grain_col_not_in_table"
+    assert recs[("txn", "table_role")]["status"] == "dropped_invalid"
+    assert recs[("txn", "table_role")]["reason"] == "role_off_vocab"
+    # totality: all five fields present for the evaluated table
+    assert {f for (t, f) in recs if t == "txn"} == {
+        "grain", "availability_time", "table_role", "primary_entity", "event_or_snapshot"}
 ```
 
-- [ ] **Step 2: Run to verify it fails**
-
-Run: `.venv/bin/python -m pytest tests/featuregen/overlay/upload/test_passb_dispositions.py -q` → FAIL.
-
-- [ ] **Step 3: Thread the collector into the stage detail**
-
-`synthesize_tables` creates/accepts a `dispositions` dict and threads it into `make_ref_accept` (via `_run_synthesis`/`_synthesize_wide_tables`). Return it (or accept a passed-in collector). In `ingest.py`, create the collector, pass it to `synthesize_tables`, and merge it into the `pass_b` stage `detail` as `{"dispositions": {f"{t}.{field}": v for (t, field), v in disp.items()}}` (JSON-safe keys). Keep the existing `_enrichment_outcome` detail keys; add `dispositions` alongside.
-
-- [ ] **Step 4: Run to verify pass + regression**
-
-Run: `.venv/bin/python -m pytest tests/featuregen/overlay/upload/test_passb_dispositions.py tests/featuregen/overlay/upload/test_stage_wiring.py -q` → PASS.
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add src/featuregen/overlay/upload/table_synth.py src/featuregen/overlay/upload/ingest.py tests/featuregen/overlay/upload/test_passb_dispositions.py
-git commit -m "feat(passb): durable per-field dispositions in the pass_b stage detail (status + reason vocab)"
-```
+- [ ] **Step 2: Run — expect FAIL.**
+- [ ] **Step 3: Thread + totalize** — `synthesize_tables` creates/accepts the `dispositions` list, threads it into `make_ref_accept` (via `_run_synthesis`/`_synthesize_wide_tables`) and into `_propose_table_facts`, and returns it. In `ingest.py`, after synthesis, add a `not_evaluated` record for every assembled table absent from `syntheses` (`[F12]`), then set `detail["dispositions"] = collector` alongside the existing `_enrichment_outcome` keys.
+- [ ] **Step 4: Run — expect PASS** `.venv/bin/python -m pytest tests/featuregen/overlay/upload/test_passb_dispositions.py tests/featuregen/overlay/upload/test_stage_wiring.py -q`
+- [ ] **Step 5: Commit** `feat(passb): durable total per-field dispositions (list records + table-level not_evaluated) in pass_b stage detail`
 
 ---
 
-### Task 4: Integration — validation + staling + dispositions on the synthetic fixture
+### Task 4: Integration on the synthetic fixture
 
-**Files:**
-- Create/extend: `tests/featuregen/overlay/upload/test_slice2_acceptance.py`
+**Files:** Create `tests/featuregen/overlay/upload/test_slice2_acceptance.py`.
 
-- [ ] **Step 1: Write the acceptance assertions**
+- [ ] **Step 1: Exact assertions** — on the synthetic FTR fixture: (a) a ghost grain column keeps a valid `table_role`/`primary_entity`; (b) `dim`/`fact`/`reference` all accepted via the vocab (canonical outputs `dimension`/`fact-or-event_fact`/`reference`); (c) an off-vocab role + non-registry entity dropped with the exact reason codes; (d) a second upload omitting a prior `table_role` → `graph_node.table_role` NULL, latest decision STALED, no active LLM evidence, and the disposition record `prior_value_staled=True`; (e) the `pass_b` stage detail carries total dispositions.
+- [ ] **Step 2: Run** `.venv/bin/python -m pytest tests/featuregen/overlay/upload/test_slice2_acceptance.py -q`; then `.venv/bin/python -m pytest -q` (directly).
+- [ ] **Step 3: Commit** `test(passb): slice-2 integration — normalized validation, graph-clearing stale, total dispositions, vocab aliases`
 
-On the Phase-1 synthetic FTR fixture with a scripted FakeLLM: (a) a synthesis with a ghost grain column keeps its valid `table_role`/`primary_entity` (grain dropped only); (b) an off-vocab role and a non-registry entity are dropped with the right reason codes; (c) a second upload that omits a previously-proposed `table_role` clears `graph_node.table_role` + `table_role_decision_id` and `is_feature_eligible` is False; (d) the `pass_b` stage detail carries the dispositions; (e) `dim`/`fact`/`reference` all still accepted (via aliases).
+---
 
-- [ ] **Step 2: Run + full suite**
+### Task 5: Real-provider canary for the v3 Pass B contract `[F17]`
 
-Run: `.venv/bin/python -m pytest tests/featuregen/overlay/upload/test_slice2_acceptance.py -q` then `.venv/bin/python -m pytest -q 2>&1 | tail -8` (green).
+**Files:** Modify `tests/eval/test_anthropic_live_canary.py`.
 
-- [ ] **Step 3: Commit**
-
-```bash
-git add tests/featuregen/overlay/upload/test_slice2_acceptance.py
-git commit -m "test(passb): slice-2 integration — per-field validation, graph-clearing stale lifecycle, durable dispositions, vocab aliases"
-```
+- [ ] **Step 1: Add** the `overlay_table_synth_batch` **v3** schema (the `table_role` nullable-enum) to the canary, registering v3 and validating a real response against the canonical v3 schema (proves the enum + nullable projects and the provider honors it). `skipif(not ANTHROPIC_API_KEY)`, `anthropic` imported in-body.
+- [ ] **Step 2: Run** `.venv/bin/python -m pytest -m eval tests/eval/test_anthropic_live_canary.py -q` → SKIPPED without a key. A keyed run gates slice completion.
+- [ ] **Step 3: Commit** `test(eval): live canary covers the Pass B v3 table_role enum schema`
 
 ---
 
 ## Self-Review
 
-**Spec coverage:** complete grain checks + role vocab + entity gating + event normalization → Task 1; the stale-value lifecycle that clears the graph column + link → Task 2; durable dispositions with the defined vocab → Task 3; integration incl. re-upload staling + alias compatibility → Task 4. Prompt v3 via the version seam → Task 1.
-**Placeholder scan:** Task 2 Step 1/Step 3 and Task 3 Step 3 require the implementer to trace the `resolve_and_project` call site for advisory refs and build the two-round harness — flagged explicitly with the exact graph assertions to satisfy (`table_role` NULL, `table_role_decision_id` NULL, `is_feature_eligible` False). The `_record` override is spelled out. All other code steps carry code.
-**Type consistency:** `make_ref_accept(..., dispositions=…)` (Task 1) is consumed by `synthesize_tables(..., dispositions=…)` (Task 3); `stale_and_clear_field` (Task 2) is called from `_propose_table_facts` (Task 2) and exercised in Task 4; the status/reason vocab is identical across Tasks 1, 3, 4.
-**Cross-slice:** the `prompt_version`/`schema_version` seam is Slice 1 Task 1 — Slice 2 must be branched on top of it; Slice 2 bumps `prompt_version` to 3 (schema stays at Slice 1's v2 — the vocab is enforced code-side, not in the schema).
+**Spec coverage:** consistent vocab + normalized validation + schema v3 `[F9,F10,F11]` → T1; total dispositions `[F12]` → T1+T3; disposition shape + staled-as-flag `[F13,F15]` → T1+T3; corrected stale contract `[F14]` → T2; provider canary `[F17]` → T5. All test steps are concrete `[F16]`.
+**Placeholder scan:** no `...` in any test; harnesses (Task 2/3) are named with the exact assertions they must satisfy. Commands run pytest directly.
+**Type consistency:** `make_ref_accept(..., dispositions=list)` (T1) ← `synthesize_tables(..., dispositions=…)` (T3) ← `_propose_table_facts(..., dispositions=…)` (T2, sets `prior_value_staled`); the reason/status vocab is identical across T1/T3/T4; `stale_and_clear_field` (T2) called from `_propose_table_facts` (T2), asserted in T4.
+**Cross-slice:** depends on Slice 1's version seam; bumps Pass B prompt **and** schema to v3 (Slice 1 left them at v2).
