@@ -13,6 +13,7 @@ from datetime import datetime
 
 from featuregen.aggregates.ids import mint_id
 from featuregen.overlay.upload.contract._serial import actor_json as _actor_json
+from featuregen.overlay.upload.contract._serial import requirements_to_json
 from featuregen.overlay.upload.contract.author import ContractDraft
 from featuregen.overlay.upload.contract.review import validate_minimum
 from featuregen.overlay.upload.features import (
@@ -76,10 +77,16 @@ def confirm_contract(conn, draft: ContractDraft, *, actor, target_ref: str | Non
     contract_id = mint_id("contract")
     conn.execute(
         "INSERT INTO contract (contract_id, feature_id, feature_name, definition, version, actor, "
-        "join_path, intent_id, verification) VALUES (%s, %s, %s, %s, %s, %s::jsonb, %s::jsonb, %s, %s)",
+        "join_path, intent_id, verification, validation_status, requirements) "
+        "VALUES (%s, %s, %s, %s, %s, %s::jsonb, %s::jsonb, %s, %s, %s, %s::jsonb)",
         (contract_id, feature_id, draft.feature_name, draft.definition, version, _actor_json(actor),
          json.dumps(list(draft.join_path)), intent_id,   # intent_id: audit link to the hypothesis (M5)
-         "DESIGN-CHECKED"))   # §14.5 stamp — gauntlet-passed; predictive value unverified (0968)
+         "DESIGN-CHECKED",   # §14.5 stamp — gauntlet-passed; predictive value unverified (0968).
+         #                     A SEPARATE (hyphenated, 0973-constrained) axis from validation_status.
+         check.validation_status,   # RF-C1: the CONFIRM-TIME re-run's honest tri-state — NOT the
+         #                            draft's carried value (an upgrade/downgrade since Gate #1 is
+         #                            a real change and must be recorded, never silently kept stale)
+         json.dumps(requirements_to_json(check.requirements))))
     return Contract(contract_id, feature_id, draft.feature_name, version)
 
 

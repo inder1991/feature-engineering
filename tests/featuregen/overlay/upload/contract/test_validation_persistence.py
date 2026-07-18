@@ -11,32 +11,40 @@ import psycopg
 import pytest
 
 from featuregen.intake.llm import FakeLLM, FakeResponse
-from featuregen.overlay.upload.canonical import CanonicalRow
+from featuregen.overlay.upload.canonical import UNKNOWN_TYPE, CanonicalRow
+from featuregen.overlay.upload.contract._serial import requirements_to_json
 from featuregen.overlay.upload.contract.author import ContractDraft, draft_contract
 from featuregen.overlay.upload.contract.gate1 import ConsideredSet, _snapshot, chosen_feature
+from featuregen.overlay.upload.contract.govern import confirm_contract
 from featuregen.overlay.upload.contract.review import MinimumCheck, validate_minimum
 from featuregen.overlay.upload.feature_assist import FeatureIdea, FeatureSet, Requirement
 from featuregen.overlay.upload.graph import build_graph
 
 
 def _bank(db):
+    """RF-C2: `balance` is genuinely OPERATIONAL-UNKNOWN — `type=UNKNOWN_TYPE` with a numeric
+    glossary `declared_type` (the FTR case) — so the confirm-time MCV re-run itself derives
+    NEEDS_EXTERNAL_VALIDATION -> TYPE_IS_NUMERIC. (An operationally 'numeric' balance is a KNOWN
+    type, which never yields TYPE_IS_NUMERIC.)"""
     build_graph(db, "bank", [
         CanonicalRow("bank", "accounts", "id", "integer", is_grain=True),
-        CanonicalRow("bank", "accounts", "balance", "numeric",
+        CanonicalRow("bank", "accounts", "balance", UNKNOWN_TYPE,
                      definition="end-of-day ledger balance"),
-        CanonicalRow("bank", "accounts", "posted_at", "timestamp", as_of=True)])
+        CanonicalRow("bank", "accounts", "posted_at", "timestamp", as_of=True)],
+        declared_types={"public.accounts.balance": "numeric"})
 
 
 def _nev_idea() -> FeatureIdea:
     """A chosen feature honestly carrying NEEDS_EXTERNAL_VALIDATION + its typed requirement —
-    passed DIRECTLY to draft_contract (the snapshot-restore path is Task 3's concern)."""
+    passed DIRECTLY to draft_contract (the snapshot-restore path is Task 3's concern). The detail
+    is the VALIDATOR's real string for `_bank`'s operationally-unknown balance (RF-C2)."""
     return FeatureIdea(
         name="avg_balance_90d", description="", derives_from=["public.accounts.balance"],
         aggregation="avg_90d", grain_table="accounts",
         derives_pairs=(("bank", "public.accounts.balance"),),
         validation_status="NEEDS_EXTERNAL_VALIDATION",
         requirements=(Requirement("TYPE_IS_NUMERIC", ("bank", "public.accounts.balance"),
-                                  "declared numeric; operational type unknown"),))
+                                  "operational type unknown; numeric declared hint"),))
 
 
 def _seed_feature(db, feature_id: str, name: str) -> None:
@@ -84,7 +92,7 @@ def test_draft_contract_carries_validation_status_and_requirements(db):
     assert draft.validation_status == "NEEDS_EXTERNAL_VALIDATION"
     assert draft.requirements == (
         Requirement("TYPE_IS_NUMERIC", ("bank", "public.accounts.balance"),
-                    "declared numeric; operational type unknown"),)
+                    "operational type unknown; numeric declared hint"),)
 
 
 def test_draft_defaults_are_design_checked_and_empty(db):
@@ -118,7 +126,7 @@ def test_snapshot_round_trips_validation_status_and_requirements(db):
     assert feat.validation_status == "NEEDS_EXTERNAL_VALIDATION"
     assert feat.requirements == (
         Requirement("TYPE_IS_NUMERIC", ("bank", "public.accounts.balance"),
-                    "declared numeric; operational type unknown"),)
+                    "operational type unknown; numeric declared hint"),)
 
 
 def test_snapshot_restores_previously_dropped_verification_fields(db):
@@ -192,3 +200,61 @@ def test_author_contract_consumes_minimumcheck(db):
     result_draft, unresolved = author_contract(db, draft, client)
     assert unresolved == []                              # MCV clean + no critique -> nothing unresolved
     assert result_draft.feature_name == "avg_balance_90d"
+
+
+def test_confirm_persists_validation_status_and_requirements(db):
+    """RF-C1 + RF-C2: confirm persists the CONFIRM-TIME MCV re-run's status + requirements. The
+    draft carries ONE requirement; the live re-run on `_bank`'s operationally-unknown balance
+    derives TWO (numeric + temporal) — the persisted row must hold the RE-RUN's, not the draft's.
+    Recon #1: the hyphenated `verification` stamp is a SEPARATE axis and stays 'DESIGN-CHECKED'."""
+    _bank(db)
+    draft = ContractDraft(
+        "avg_balance_90d", "Average 90-day ledger balance per account.", "accounts", "avg_90d",
+        "posted_at", ["public.accounts.balance"],
+        derives_pairs=(("bank", "public.accounts.balance"),),
+        validation_status="NEEDS_EXTERNAL_VALIDATION",
+        requirements=(Requirement("TYPE_IS_NUMERIC", ("bank", "public.accounts.balance"),
+                                  "operational type unknown; numeric declared hint"),))
+    c = confirm_contract(db, draft, actor="ds1")
+    row = db.execute(
+        "SELECT validation_status, requirements, verification FROM contract "
+        "WHERE contract_id = %s", (c.contract_id,)).fetchone()
+    assert row[0] == "NEEDS_EXTERNAL_VALIDATION"         # honest, not silently DESIGN_CHECKED
+    assert row[1] == [
+        {"code": "TYPE_IS_NUMERIC", "operand": ["bank", "public.accounts.balance"],
+         "detail": "operational type unknown; numeric declared hint"},
+        {"code": "TEMPORAL_IS_POPULATED", "operand": ["bank", "public.accounts.posted_at"],
+         "detail": "as-of column declared, not governed-verified"},
+    ]                                                    # the RE-RUN's two, not the draft's one
+    assert row[1] == requirements_to_json(validate_minimum(db, draft).requirements)
+    assert row[2] == "DESIGN-CHECKED"                    # the SEPARATE verification axis intact
+
+
+def test_confirm_default_draft_persists_rerun_status_not_draft(db):
+    """RF-C1 (downgrade caught): a draft still claiming its default DESIGN_CHECKED confirms against
+    a catalog whose measure is operationally unknown — the persisted status is the re-run's
+    NEEDS_EXTERNAL_VALIDATION, never the draft's stale claim."""
+    _bank(db)
+    draft = ContractDraft(
+        "avg_balance_90d", "Average 90-day ledger balance.", "accounts", "avg_90d", "posted_at",
+        ["public.accounts.balance"], derives_pairs=(("bank", "public.accounts.balance"),))
+    assert draft.validation_status == "DESIGN_CHECKED"   # the stale draft default
+    c = confirm_contract(db, draft, actor="ds1")
+    row = db.execute("SELECT validation_status, requirements FROM contract WHERE contract_id = %s",
+                     (c.contract_id,)).fetchone()
+    assert row[0] == "NEEDS_EXTERNAL_VALIDATION"
+    assert [r["code"] for r in row[1]] == ["TYPE_IS_NUMERIC", "TEMPORAL_IS_POPULATED"]
+
+
+def test_confirm_clean_rerun_persists_design_checked(db):
+    """A re-run with NOTHING left to verify (non-numeric, non-windowed op on a known column)
+    persists DESIGN_CHECKED + [] — earned by the clean re-run, not an artifact of draft defaults."""
+    _bank(db)
+    draft = ContractDraft(
+        "distinct_accounts", "Distinct account count.", "accounts", "count_distinct", "posted_at",
+        ["public.accounts.id"], derives_pairs=(("bank", "public.accounts.id"),))
+    c = confirm_contract(db, draft, actor="ds1")
+    row = db.execute("SELECT validation_status, requirements FROM contract WHERE contract_id = %s",
+                     (c.contract_id,)).fetchone()
+    assert row[0] == "DESIGN_CHECKED"
+    assert row[1] == []
