@@ -74,10 +74,15 @@ definition, a nested field, and a table definition is absent from the payload **
 ### D. Durable disposition store [G11]
 
 An invalid LLM value never becomes evidence, and `field_evidence` has no disposition field — so counters/
-logs are not a durable record. Persist per-field dispositions as **ingestion-run stage detail keyed by
-`(table, field)`**. **Status vocab:** `accepted`, `abstained`, `dropped_invalid`, `staled`. **Reason-code
-vocab:** `grain_col_not_in_table`, `grain_duplicate`, `grain_over_bound`, `role_off_vocab`,
-`entity_not_registered`, `basis_not_allowed`, `as_of_col_not_in_table`. Reviewer-visible.
+logs are not a durable record. Persist per-field dispositions as **ingestion-run stage detail**, a **list of
+`{table, field, status, reason, prior_value_staled}` records** (never a delimited `"table.field"` key).
+**Status vocab:** `accepted`, `abstained`, `dropped_invalid`, `not_evaluated` — `staled` is **not** a
+status; it is the separate lifecycle bool `prior_value_staled` (a prior value can be staled while the
+current disposition is `dropped_invalid` or `accepted`). **Reason-code vocab:** `grain_invalid_shape`,
+`grain_col_not_in_table`, `grain_duplicate`, `grain_over_bound`, `role_off_vocab`, `entity_not_registered`,
+`basis_not_allowed`, `as_of_col_not_in_table`, `event_or_snapshot_off_vocab`. The disposition set is
+**total** — every evaluated table produces a record for all five fields; a table that never reached
+validation (unresolved/failed) produces five `not_evaluated` records. Reviewer-visible.
 
 ### E. Prompt/schema versioning seam [G13]
 
@@ -125,19 +130,27 @@ together.
 1. **Grain validation (complete) [G8].** Accept only when: every column exists in the table; **no duplicate
    normalized columns**; **within the bounded grain size**; an empty list is abstention; **any violation
    drops grain only**, keeping the other fields.
-2. **Versioned `table_role` vocab with aliases [G-prev/G8].** Live values are `fact` (13×), `dim` (2×),
-   `reference` (2×). Ship a versioned vocab: `dim`→`dimension`; `fact`→`event_fact`/`snapshot_fact` via
-   `event_or_snapshot`, else retained `fact`; `reference` kept. Co-update prompt + narrow & wide schemas +
-   tests. Unmapped → **abstention** (dropped, `dropped_invalid`), never active advisory evidence.
+2. **Versioned `table_role` vocab with aliases [G-prev/G8, revised by F1].** Live values are `fact` (13×),
+   `dim` (2×), `reference` (2×). Versioned vocab: `dim`→`dimension`; `fact`→`event_fact`/`snapshot_fact`
+   via `event_or_snapshot`, else retained `fact`; `reference` kept; unmapped → **abstention** (dropped),
+   never active advisory evidence. **Enforced code-side (`make_ref_accept`, per-field drop) + prompt
+   steering — NOT a `table_role` enum on the canonical response schema:** a strict enum there makes
+   `reg.validate` reject the *whole* synthesis on one off-vocab role, destroying per-field salvage (F1).
+   The canonical schema keeps `table_role` a bounded string. Co-update the prompt + tests only.
 3. **`primary_entity` gated through `known_entities()`** (`taxonomy/dimensions.py`, 38 entities),
-   clear-on-miss (`recognition.py:246`).
-4. **`event_or_snapshot` normalization** on the synthesis path.
-5. **Stale-value lifecycle that clears the graph [G3].** Producer-scope staling alone is insufficient:
-   `resolve_and_project` skips fields with no active evidence (`field_resolution.py:315`), so a staled
-   advisory field leaves the previous `graph_node.table_role`/`primary_entity` visible. Add an explicit
-   **touched-field resolver** that records a `STALED` decision, **clears the display column + decision
-   link**, and rebuilds search where relevant. Test the **graph projection + eligibility**, not only the
-   evidence lifecycle.
+   clear-on-miss (`recognition.py:246`); normalize with `strip().lower()` before the membership test.
+4. **`event_or_snapshot` normalization** (`strip().lower()`) on the synthesis path; a non-empty invalid
+   value is `dropped_invalid` (reason `event_or_snapshot_off_vocab`), not silently `abstained`. `as_of_column`
+   is matched case-folded and mapped back to the table's canonical spelling; `as_of_basis` is
+   `strip().lower()`-normalized — the same normalization grain gets.
+5. **Stale-value lifecycle that clears the graph [G3, revised by F2/F5].** Producer-scope staling alone is
+   insufficient: `resolve_and_project` skips fields with no active evidence, so a staled advisory field
+   leaves the previous `graph_node.table_role`/`primary_entity` visible. Add a **touched-field resolver**
+   that records a `STALED` decision (with `supersedes_event_id` read from the **durable decision log**,
+   `read_field_decisions` — NOT the `graph_node` link, which `build_graph` wipes before Pass B) and
+   **clears the display column (NULL) while repointing the decision link to the STALED decision** (an audit
+   trail — the link is NOT NULL). Test: display column NULL + latest decision `staled` (the stored enum is
+   lowercase) + no active LLM evidence — not `is_feature_eligible` (always False for ceiling fields).
 6. **Durable dispositions (§D)** for every field.
 
 ## Slice 3 — Authority-aware context + tri-state validator + relevance + rollout + eval
