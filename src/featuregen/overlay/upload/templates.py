@@ -164,13 +164,21 @@ def _safe_to_bind(col: _Col) -> bool:
     return True
 
 
-def _match(cols: Sequence[_Col], need: Need) -> _Col | None:
+def _match(cols: Sequence[_Col], need: Need, *, prefer_table: str | None = None) -> _Col | None:
     """Pick the best SAFE column for a need, or None. A column scores by how well it fits:
     exact concept match is strongest; for an as-of need an ``is_as_of`` column also qualifies; for an
     identifier/entity need an ``is_grain`` (then entity-tagged) column also qualifies. A column with no
     positive signal is not a match. Ties break on column name for determinism. Unsafe columns
     (:func:`_safe_to_bind`) are skipped BEFORE scoring — so a structural is_grain/is_as_of pick that lands
-    on a target / protected column is refused, not silently bound."""
+    on a target / protected column is refused, not silently bound.
+
+    ``prefer_table`` (the recipe's resolved grain table) is a TIE-BREAK only: among columns that already
+    fit the need, one in the grain table is preferred over an equally-fitting sibling-table column. A
+    recipe should source its measures / as-of from its OWN grain table when it can — otherwise a generic
+    need (monetary_stock / as_of_date / …) binds the alphabetically-first sibling table, producing a
+    spurious cross-table candidate the join gauntlet then rejects (NO_JOIN_PATH) even though a clean
+    single-table binding existed. The bonus never overrides a stronger concept/structural fit and never
+    turns a non-fitting column (score 0) into a match — so it only disambiguates genuine ties."""
     c = concept(need.concept)                    # exists (validated at import), but guard anyway
     want_as_of = bool(c and c.pit_role == "as_of")
     want_entity = bool(c and c.entity_link)
@@ -188,6 +196,8 @@ def _match(cols: Sequence[_Col], need: Need) -> _Col | None:
             score -= 2                           # the grain column fits the entity need
         if want_entity and col.entity:
             score -= 1                           # an entity-tagged column is a weaker entity fit
+        if score < 0 and prefer_table is not None and col.table == prefer_table:
+            score -= 1                           # same-grain-table affinity — a tie-break among fits
         if score < 0 and score < best_score:
             best, best_score = col, score
     return best
@@ -250,10 +260,24 @@ def ground_template(conn, template: Template, *, catalog_source: str,
     bound = _bind_params(template, params)
     cols = _load_columns(conn, catalog_source, roles)
 
+    # Resolve the grain table FIRST (from the entity need) so every other need prefers a column in the
+    # grain table when one fits equally well. Without this, a generic need binds the alphabetically-
+    # first sibling table (e.g. drawn->accounts.balance while grain=facilities), and the join gauntlet
+    # then rejects the resulting cross-table candidate (NO_JOIN_PATH) even though a clean single-table
+    # binding existed. The grain table is what `entity_col.table` resolves to below — computed here up
+    # front purely to steer the tie-break; the actual grain remains derived from the final bindings.
+    prefer_table: str | None = None
+    for need in template.needs:
+        if _is_entity_concept(need.concept):
+            ecol = _match(cols, need)
+            if ecol is not None:
+                prefer_table = ecol.table
+            break
+
     bindings: dict[str, _Col] = {}
     notes = list(template.notes) + list(template.derived)
     for need in template.needs:
-        col = _match(cols, need)
+        col = _match(cols, need, prefer_table=prefer_table)
         if col is None:
             if need.optional:
                 notes.append(
