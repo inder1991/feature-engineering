@@ -144,9 +144,10 @@ def _template_candidates(conn, *, catalog_source: str, roles, target_ref: str | 
         raw = {"name": idea.name, "description": idea.description,
                "derives_from": list(idea.derives_from), "aggregation": idea.aggregation,
                "grain_table": idea.grain_table, "rationale": idea.rationale}
-        _, rej = _validate_idea(conn, raw, known, src_of, target_ref, now, fresh_within)
+        validated, rej = _validate_idea(conn, raw, known, src_of, target_ref, now, fresh_within,
+                                        roles=roles)
         if rej is None:
-            ideas.append(idea)   # keep the converted idea (identical to the gauntlet's rebuild)
+            ideas.append(validated)   # [F9] keep the VALIDATOR's idea (carries status + requirements)
             grounded_ids.add(gf.template_id)
             binding_by_id[gf.template_id] = binding_quality(gf).value   # ranker's binding signal
         else:
