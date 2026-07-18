@@ -31,3 +31,26 @@ The `≤25%` token/cost bar reads `llm_call.cost_metadata` — confirm the actua
 
 ## 9. Operand-driven dispositions are a later tightening (3a-i, accepted)
 The typed `operation_kind`/`measure_refs` operands are POPULATED, but the numeric/windowed dispositions still key off the aggregation-string heuristics (`_needs_numeric`/`_is_windowed`) inherited today. Half A stamps the operands + requirements correctly; making `operation_kind` (from a structured LLM schema) the disposition driver is a follow-on.
+
+---
+
+## REVIEW FIXES (BINDING — from the 5-agent plan review; apply during execution, OVERRIDE the plan text)
+
+### CRITICAL
+- **RF-C1 (3a-ii, confirm persists the RE-RUN status).** `confirm_contract` re-runs `validate_minimum` (→ `MinimumCheck`). Persist **that re-run's** `validation_status` + `requirements` into `contract.validation_status`/`contract.requirements` — NOT `draft.validation_status`/`draft.requirements`. The INSERT binds `check.validation_status` and `requirements_to_json(check.requirements)`. (Reconciliation #2 already decided this; the plan text does the opposite.)
+- **RF-C2 (3a-ii, the e2e must be REAL).** Task 5's confirm test + Task 6 e2e must exercise a genuinely **operational-unknown** column: a `CanonicalRow(... type=UNKNOWN_TYPE ...)` whose glossary `declared_type` is numeric (the FTR case), so the confirm-time re-run itself produces `NEEDS_EXTERNAL_VALIDATION` → `TYPE_IS_NUMERIC`. Rework the `_bank` fixture accordingly (its current `balance` is `'numeric'` = operationally KNOWN, which never yields `TYPE_IS_NUMERIC`). Delete the hand-invented, self-contradictory detail string; assert `contract.validation_status == 'NEEDS_EXTERNAL_VALIDATION'` and `contract.requirements` == the re-run's requirements.
+- **RF-C3 (flag helper, ONE public definition).** Define `feature_context_enabled()` — **public name**, in `feature_assist.py`, reading env `FEATUREGEN_FEATURE_CONTEXT` via `(os.environ.get("FEATUREGEN_FEATURE_CONTEXT","").strip().lower() in {"1","true","yes","on"})` — **once, in 3a-iii**. 3a-iv **imports and reuses** it (delete 3a-iv's `feature_context_enabled()` redefinition; delete 3a-iii's private `_feature_context_enabled` name). Every call site uses the one public helper.
+
+### IMPORTANT
+- **RF-I1 (3a-i, valid join status).** Join tests must use a value in the `graph_edge_approved_join_status_check` vocab: `DRAFT/PARTIALLY_CONFIRMED/VERIFIED/REJECTED/STALE/REVERIFY`. "Authorized-but-unverified" = a fact-linked edge (`approved_join_fact_key` non-null) with status **`'DRAFT'`** (or `PARTIALLY_CONFIRMED`). Never `'PROPOSED'` (not a folded status; violates the CHECK).
+- **RF-I2 (3a-i).** Delete the placeholder test flagged in the plan before running.
+- **RF-I3 (3a-ii, import order).** Do NOT import `MinimumCheck` at the top of the Task-1 test file — it is introduced in Task 4. Introduce that import with Task 4; earlier tasks import only symbols that exist at that task (or split per-task test files).
+- **RF-I4 (3a-ii, FK).** Task 1 must seed a real `feature` row (satisfying `contract_feature_id_fk`, migration 0972) before inserting a `contract` row.
+- **RF-I5 (3a-iii, byte budget).** The byte-budget test must compute the expected budget INCLUDING the per-table `table_context` grain block that `select_relevant_context` always adds for the mandatory grain column.
+- **RF-I6 (3a-iii, egress adapter covers BOTH shapes — do NOT fail-close the draft path).** The nested `sanitize_feature_context` fires on every `audited_structured_call`, including `overlay.contract.draft` whose `columns` is `_column_defs(...)` (a different-but-safe dict shape). Extend the adapter's allowlist to cover BOTH the feature-menu shape AND the contract-draft column-def keys, sanitizing definition-kind fields in each; only a genuinely-unknown key blocks. This *improves* sample-safety on the draft path rather than fail-closing a legitimate call.
+- **RF-I7 (3a-i, coerce bool).** `is_grain`/`is_as_of` are BOOLEAN flat columns; `read_column_facts` must return `value` as `str | None` (render the flag, e.g. `"true"`/`"false"`), so the egress wrapper (`_fact_wrapper_ok`, `str|None`) accepts it — otherwise every enriched grain/as-of column fail-closes the flag-ON dispatch.
+- **RF-I8 (3a-iv, v2 per-site).** Pass a literal `1` at the `leakage_check` + `recommend_set` sites (their inputs do NOT widen under the flag); pass v2 only where the menu widens (`feature_ideas`; `recipe` only if its input widens). Per reconciliation #6.
+- **RF-I9 (seam — this REVISES reconciliation #5's "snapshot gate").** Do **NOT** flag-gate `_idea_json` / the considered-set snapshot. The internal governed snapshot **always** serializes `validation_status`+`requirements` (additive; produced by the always-on validator), so 3a-ii's flag-OFF snapshot round-trip works. Flag-OFF **byte-identity applies to the `/features/recommend` RESPONSE + the outbound LLM request payload only**, not the internal snapshot. 3a-iv Task 4 becomes: extend `_idea_json` to always serialize the new fields; gate only the response serializer + the enriched menu.
+
+### MINOR (per-task review + TDD will catch; noted)
+gold-set/eval-fixture column mismatch (3a-iv); a ruff redefinition risk if RF-C3 not applied; the eval cost-key caveat (reconciliation #7). Not blocking.
