@@ -27,6 +27,7 @@ Pure module: depends only on the standard library.
 """
 from __future__ import annotations
 
+import dataclasses
 import re
 from dataclasses import dataclass
 
@@ -207,3 +208,42 @@ def _classify_from_token(
         f"sample-profile token '{token}' present but no representative values to classify; "
         "logical_representation inferred from the token, semantics/computation withheld"
     )
+
+
+_TEMPORAL_DECLARED = ("timestamp", "datetime", "date", "time")
+_NUMERIC_MEASURE_DECLARED = ("double", "float", "real", "decimal", "numeric", "number", "money")
+_IDENTIFIER_NAME_SUFFIXES = ("_id", "_key", "_code", "_no", "_num", "_ref")
+_IDENTIFIER_SEMANTICS = ("identifier",)
+_MEASURE_SEMANTICS = ("amount",)
+
+
+def reconcile_profile(parsed: ParsedProfile, *, declared_type: str, column: str) -> ParsedProfile:
+    """Reconcile the deterministic sample-shape classification against the declared SQL type and the
+    column name. On a contradiction, WITHHOLD the parser fields (set them to None) and record a
+    diagnostic rather than asserting a possibly-wrong operational value at parser:supported.
+
+    Pure + permissive by default: when ``declared_type`` is blank/``unknown`` or nothing contradicts
+    the sample shape, ``parsed`` is returned unchanged. Withholding sets BOTH
+    ``logical_representation`` and ``semantic_type`` to None and appends a diagnostic, preserving any
+    prior diagnostic text."""
+    dt = (declared_type or "").strip().lower()
+    col = (column or "").strip().lower()
+    sem, log = parsed.semantic_type, parsed.logical_representation
+    reasons: list[str] = []
+
+    # A temporal declared type must never surface as an identifier / numeric_string.
+    if any(dt.startswith(t) for t in _TEMPORAL_DECLARED) and (
+            sem in _IDENTIFIER_SEMANTICS or log in ("numeric_string", "time")):
+        reasons.append(f"declared type '{dt}' is temporal but sample parsed as {log}/{sem}")
+    # A numeric measure declared type must never surface as an identifier.
+    elif any(t in dt for t in _NUMERIC_MEASURE_DECLARED) and sem in _IDENTIFIER_SEMANTICS:
+        reasons.append(f"declared type '{dt}' is a numeric measure but sample parsed as an identifier")
+    # A column named like an identifier must never surface as a numeric measure.
+    elif any(col.endswith(s) for s in _IDENTIFIER_NAME_SUFFIXES) and sem in _MEASURE_SEMANTICS:
+        reasons.append(f"column '{col}' is named like an identifier but sample parsed as a measure")
+
+    if not reasons:
+        return parsed
+    prior = f" ({parsed.diagnostic})" if parsed.diagnostic else ""
+    return dataclasses.replace(parsed, logical_representation=None, semantic_type=None,
+                               diagnostic="withheld parser evidence: " + "; ".join(reasons) + prior)

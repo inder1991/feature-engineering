@@ -63,6 +63,7 @@ from featuregen.overlay.upload.passc.projection import (
 )
 from featuregen.overlay.upload.readiness import ReadinessScopeType, compute_readiness
 from featuregen.overlay.upload.review_queue import persist_quarantine
+from featuregen.overlay.upload.sample_parser import ParsedProfile, reconcile_profile
 from featuregen.overlay.upload.sanitize import redact_text
 from featuregen.overlay.upload.source_profile import (
     FTR_GLOSSARY_PROFILE,
@@ -717,13 +718,31 @@ def _write_glossary_source_evidence(
 
 
 def _write_glossary_parser_evidence(
-    conn, *, logical_ref: str, logical_representation: str, semantic_type: str, snapshot_id: str
+    conn, *, logical_ref: str, logical_representation: str, semantic_type: str,
+    declared_type: str, column: str, snapshot_id: str
 ) -> None:
     """Write PARSER evidence (logical_representation / semantic_type @ parser:supported) from the SAFE
     facets the reader CARRIED on the record — captured by the deterministic sample parser at read time,
     BEFORE any sample-clause stripping (Task 7 / review #4: the FTR adapter sanitizes the definition,
     so re-parsing it here would find nothing and silently drop the evidence). An empty facet (``""``)
-    is ABSENT: nothing is written, and no facets at all is a gap, never a failure."""
+    is ABSENT: nothing is written, and no facets at all is a gap, never a failure.
+
+    Before writing, the carried facets are reconciled against the record's ``declared_type`` and
+    ``column`` name (MF-1): the sample-shape classifier sees neither, so an epoch/timestamp integer or
+    a point-less decimal can be asserted as an ``identifier`` at the OPERATIONAL parser:supported tier.
+    :func:`reconcile_profile` WITHHOLDS a contradicted field (sets it to None) rather than asserting a
+    wrong operational value — a withheld field is then simply ABSENT and staled like any unparsed one."""
+    reconciled = reconcile_profile(
+        ParsedProfile(logical_representation=logical_representation or None,
+                      semantic_type=semantic_type or None, computational_type=None,
+                      sample_values=(), diagnostic=None),
+        declared_type=declared_type, column=column or "",
+    )
+    if reconciled.diagnostic:
+        logger.info("glossary parser evidence reconciled for %s: %s", logical_ref,
+                    reconciled.diagnostic)
+    logical_representation = reconciled.logical_representation or ""
+    semantic_type = reconciled.semantic_type or ""
     present: set[str] = set()
     for field_name, value in (("logical_representation", logical_representation),
                               ("semantic_type", semantic_type)):
@@ -881,7 +900,9 @@ def _ingest_glossary_evidence(conn, *, source: str, rows: list[CanonicalRow],
                 _write_glossary_parser_evidence(
                     conn, logical_ref=logical_ref,
                     logical_representation=rec.logical_representation,
-                    semantic_type=rec.semantic_type, snapshot_id=snapshot_id)
+                    semantic_type=rec.semantic_type,
+                    declared_type=rec.declared_type, column=column or "",
+                    snapshot_id=snapshot_id)
         except Exception:  # noqa: BLE001
             contained_failures += 1
             logger.warning("advisory glossary PARSER evidence failed for %s", logical_ref,
