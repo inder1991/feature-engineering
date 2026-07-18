@@ -176,3 +176,65 @@ def test_governed_additive_sum_clears_additivity_check(db):
     assert rej is None
     assert idea.validation_status == "DESIGN_CHECKED"
     assert all(r.code != "ADDITIVITY_SUPPORTS_OPERATION" for r in idea.requirements)
+
+
+def test_windowed_declared_as_of_needs_temporal(db):
+    _bank(db)   # posted_at as_of=True but file-declared (no availability_fact_event_id)
+    known, src_of = _kv(["public.accounts.balance"], "bank")
+    raw = {"name": "avg_bal_90d", "derives_from": ["public.accounts.balance"],
+           "aggregation": "avg_90d"}
+    idea, rej = _validate_idea(db, raw, known, src_of, None, NOW, FRESH)
+    assert rej is None
+    assert idea.validation_status == "NEEDS_EXTERNAL_VALIDATION"
+    temporal = [r for r in idea.requirements if r.code == "TEMPORAL_IS_POPULATED"]
+    assert temporal and temporal[0].operand == ("bank", "public.accounts.posted_at")
+    assert idea.time_ref == ("bank", "public.accounts.posted_at")
+
+
+def test_governed_as_of_clears_temporal(db):
+    _bank(db)
+    db.execute("UPDATE graph_node SET availability_fact_event_id = 'evt_av' "
+               "WHERE object_ref = 'public.accounts.posted_at'")
+    known, src_of = _kv(["public.accounts.balance"], "bank")
+    raw = {"name": "avg_bal_90d", "derives_from": ["public.accounts.balance"],
+           "aggregation": "avg_90d"}
+    idea, rej = _validate_idea(db, raw, known, src_of, None, NOW, FRESH)
+    assert rej is None
+    assert all(r.code != "TEMPORAL_IS_POPULATED" for r in idea.requirements)
+
+
+def test_windowed_with_no_as_of_column_is_rejected(db):
+    build_graph(db, "t", [
+        CanonicalRow("t", "accounts", "id", "integer", is_grain=True),
+        CanonicalRow("t", "accounts", "balance", "numeric")])   # no as_of column at all
+    _fresh(db, "t")
+    known, src_of = _kv(["public.accounts.balance"], "t")
+    raw = {"name": "avg_bal_90d", "derives_from": ["public.accounts.balance"],
+           "aggregation": "avg_90d"}
+    idea, rej = _validate_idea(db, raw, known, src_of, None, NOW, FRESH)
+    assert idea is None and rej.code == RejectCode.NO_POINT_IN_TIME
+
+
+def test_grain_declared_not_confirmed_needs_grain_is_unique(db):
+    _bank(db)   # id is_grain=True but file-declared (no grain_fact_event_id)
+    known, src_of = _kv(["public.accounts.balance"], "bank")
+    raw = {"name": "cnt_per_account", "derives_from": ["public.accounts.balance"],
+           "aggregation": "count", "grain_table": "accounts"}
+    idea, rej = _validate_idea(db, raw, known, src_of, None, NOW, FRESH)
+    assert rej is None
+    grain = [r for r in idea.requirements if r.code == "GRAIN_IS_UNIQUE"]
+    assert grain and grain[0].operand == ("bank", "public.accounts.id")
+    assert idea.grain_ref == ("bank", "public.accounts.id")
+
+
+def test_governed_grain_clears_grain_check(db):
+    _bank(db)
+    db.execute("UPDATE graph_node SET grain_fact_event_id = 'evt_g' "
+               "WHERE object_ref = 'public.accounts.id'")
+    known, src_of = _kv(["public.accounts.balance"], "bank")
+    raw = {"name": "cnt_per_account", "derives_from": ["public.accounts.balance"],
+           "aggregation": "count", "grain_table": "accounts"}
+    idea, rej = _validate_idea(db, raw, known, src_of, None, NOW, FRESH)
+    assert rej is None
+    assert all(r.code != "GRAIN_IS_UNIQUE" for r in idea.requirements)
+    assert idea.grain_ref == ("bank", "public.accounts.id")

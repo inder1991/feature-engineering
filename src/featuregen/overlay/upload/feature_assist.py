@@ -192,14 +192,6 @@ def _column_meta(conn, pairs: list[tuple[str, str]]) -> dict[str, dict]:
             for cs, ref, add, unit, cur in rows if (cs, ref) in wanted}
 
 
-def _table_has_as_of(conn, catalog_source: str, table: str) -> bool:
-    row = conn.execute(
-        "SELECT 1 FROM graph_node WHERE catalog_source = %s AND table_name = %s "
-        "AND is_as_of = true LIMIT 1",
-        (catalog_source, table)).fetchone()
-    return row is not None
-
-
 # Aggregation words that REQUIRE a numeric measure (ratio/mean/sum/…); count/count_distinct do not.
 _NUMERIC_OP_WORDS = ("sum", "total", "avg", "average", "mean", "ratio", "rate", "net_",
                      "percent", "pct", "std", "variance", "median")
@@ -260,7 +252,7 @@ def _validate_idea(conn, raw: dict, known: set[str], src_of: dict[str, set[str]]
 
     aggregation = raw.get("aggregation")
     grain_table = raw.get("grain_table")
-    catalogs = {p[0] for p in pairs}   # noqa: F841 — Tasks 8/10 dispositions consume it
+    catalogs = {p[0] for p in pairs}
     requirements: list[Requirement] = []
     grain_operand: tuple[str, str] | None = None
     time_operand: tuple[str, str] | None = None
@@ -299,12 +291,34 @@ def _validate_idea(conn, raw: dict, known: set[str], src_of: dict[str, set[str]]
     if len(currencies) > 1:
         return None, Rejection(RejectCode.MIXED_CURRENCY, f"mixed currencies {sorted(currencies)}")
 
-    # ── disposition: point-in-time (Task 8 REPLACES this block) ──
+    # ── disposition: temporal — a windowed feature needs a governed-VERIFIED as-of column; a table
+    #    with NO as-of column at all is still a hard reject (future-leakage risk) ──
     if _is_windowed(aggregation):
+        checked_tables: set[tuple[str, str]] = set()
         for src, d in pairs:
-            if d.count(".") >= 2 and not _table_has_as_of(conn, src, d.split(".")[-2]):
+            if d.count(".") < 2 or (src, d.split(".")[-2]) in checked_tables:
+                continue
+            checked_tables.add((src, d.split(".")[-2]))
+            aref = _as_of_column_ref(conn, src, d.split(".")[-2])
+            if aref is None:
                 return None, Rejection(RejectCode.NO_POINT_IN_TIME,
                                        f"no point-in-time basis for {d} (future-leakage risk)")
+            time_operand = (src, aref)
+            facts = read_column_facts(conn, logical_ref_of(src, aref), "is_as_of")
+            if facts.authority != "governed":
+                requirements.append(Requirement("TEMPORAL_IS_POPULATED", (src, aref),
+                                                "as-of column declared, not governed-verified"))
+
+    # ── disposition: grain — a grain feature needs a governed-VERIFIED grain column ──
+    if grain_table and len(catalogs) == 1:
+        gcat = next(iter(catalogs))
+        gref = _grain_column_ref(conn, gcat, grain_table)
+        if gref is not None:
+            grain_operand = (gcat, gref)
+            facts = read_column_facts(conn, logical_ref_of(gcat, gref), "is_grain")
+            if facts.authority != "governed":
+                requirements.append(Requirement("GRAIN_IS_UNIQUE", (gcat, gref),
+                                                "grain declared, not governed-verified"))
 
     # ── finalize (tri-state) ──
     status = "NEEDS_EXTERNAL_VALIDATION" if requirements else "DESIGN_CHECKED"
