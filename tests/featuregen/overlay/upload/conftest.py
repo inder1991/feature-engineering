@@ -233,9 +233,12 @@ def fake_synth_client(glossary_rows, technical_rows):
 # reader (`read_ftr_glossary`/`to_glossary_upload`), and runs `ingest_upload` with a scripted,
 # request-CAPTURING FakeLLM (Pass A concept/definition/domain + the Pass B two-phase wide-table
 # path). Pass B is enabled (OVERLAY_TABLE_SYNTH=1) so the acceptance test can inspect what Pass B
-# actually received. The scripted synthesis ABSTAINS (empty grain, no as-of), the required "at least
-# one abstaining table". Also consumed by Task 8. Returns the `IngestResult`; the capturing client
-# and the parsed upload are stashed on the callable (`.client`, `.upload`) for request inspection.
+# actually received. By default the scripted synthesis ABSTAINS (empty grain, no as-of), the
+# required "at least one abstaining table"; the Slice-2 acceptance test overrides individual keys
+# via `synthesis=` (merged over the abstain dict, so only REAL schema keys ever egress — [F14]) and
+# threads a `stage_recorder=` to read back the persisted `pass_b` stage detail. Also consumed by
+# Task 8. Returns the `IngestResult`; the capturing client and the parsed upload are stashed on the
+# callable (`.client`, `.upload`) for request inspection.
 
 _SYNTHETIC_FTR_CSV = (
     __import__("pathlib").Path(__file__).parent / "fixtures" / "ftr_sample_synthetic.csv")
@@ -263,7 +266,7 @@ class _SyntheticFtrUpload:
         self.client: _CapturingFakeLLM | None = None
         self.upload = None
 
-    def __call__(self, db, *, source: str):
+    def __call__(self, db, *, source: str, synthesis: dict | None = None, stage_recorder=None):
         from datetime import UTC, datetime, timedelta
 
         from featuregen.contracts.envelopes import IdentityEnvelope
@@ -301,6 +304,10 @@ class _SyntheticFtrUpload:
             chunk_refs += [f"{t}#chunk{i}" for i in range(nchunks)]
         abstain = {"grain_columns": [], "as_of_column": None, "as_of_basis": None,
                    "primary_entity": None, "table_role": None, "event_or_snapshot": None}
+        # A caller override MERGES over the abstain dict: only the six REAL v2 schema keys can ever
+        # egress ([F14] — the synth object is additionalProperties:false), and an omitted key stays
+        # an honest abstention (None), never an accidental extra property.
+        synth = {**abstain, **synthesis} if synthesis else abstain
         chunk_summary = {"grain_candidates": [], "temporal_candidates": [], "entity_signals": [],
                          "event_or_snapshot": "event"}
         inner = FakeLLM(script={
@@ -313,7 +320,7 @@ class _SyntheticFtrUpload:
             "table_synth_summary": FakeResponse(output={"results": [
                 {"ref": ref, "summary": chunk_summary} for ref in chunk_refs]}),
             "table_synth": FakeResponse(output={"results": [
-                {"ref": t, "synthesis": abstain} for t in tables]}),
+                {"ref": t, "synthesis": synth} for t in tables]}),
         })
         client = _CapturingFakeLLM(inner)
         self.client = client
@@ -321,7 +328,8 @@ class _SyntheticFtrUpload:
         actor = IdentityEnvelope(subject="upload", actor_kind="human", authenticated=True,
                                  auth_method="oidc", role_claims=("data_owner",))
         return ingest_upload(db, source, upload.rows, actor=actor,
-                             now=datetime(2026, 7, 17, tzinfo=UTC), client=client, glossary=upload)
+                             now=datetime(2026, 7, 17, tzinfo=UTC), client=client, glossary=upload,
+                             stage_recorder=stage_recorder)
 
 
 @pytest.fixture
