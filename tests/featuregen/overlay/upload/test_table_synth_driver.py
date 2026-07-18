@@ -4,7 +4,10 @@
 columns + as_of column must exist on the table; as_of basis must be a lag-free enum), mapping a valid
 result onto the FACT_VALUE_SCHEMAS shapes (grain `{columns, is_unique}` / availability `{column,
 basis}`). An all-empty proposal is a VALID ABSTENTION (`abstained` — both facts None), never a
-guessed grain (MF-3); only unparseable / non-object raw is rejected.
+guessed grain (MF-3); only unparseable / non-object raw is rejected. Slice 2: an INVALID field
+(e.g. a ghost grain column) drops THAT FIELD ONLY — the synthesis still resolves with the
+surviving fields (per-field salvage), and advisory fields are vocab-normalized (`fact`+`event` ->
+`event_fact`).
 `synthesize_tables` drives `run_batched` over the assembled items and returns `{table: synthesis}` for
 VALID results only — validation happens INSIDE the harness (ref-aware), so an INVALID synthesis never
 reaches the returned dict.
@@ -33,10 +36,16 @@ def test_valid_grain_maps_to_fact_shape():
     assert out["table_role"] == "fact"
 
 
-def test_grain_column_not_in_table_is_rejected():
+def test_grain_column_not_in_table_drops_grain_only():
+    # Slice 2 (per-field salvage): a ghost grain column drops the GRAIN FIELD only — the synthesis
+    # still resolves (abstained: no grain/availability) and keeps its surviving advisory fields,
+    # instead of the old whole-item rejection that lost a valid role/entity with it.
     accept = make_ref_accept({"txn": {"id"}})
-    val, reason = accept(_syn(grain_columns=["ghost"]), "txn")
-    assert val is None and reason == "grain_col_not_in_table"
+    val, reason = accept(_syn(grain_columns=["ghost"], table_role="reference"), "txn")
+    assert val is not None and reason == "abstained"
+    out = json.loads(val)
+    assert out["grain"] is None and out["availability_time"] is None
+    assert out["table_role"] == "reference"
 
 
 def test_parseable_non_object_json_is_rejected_not_object():
@@ -99,8 +108,9 @@ _STASK = "table_synth"
 
 
 def test_synthesize_tables_end_to_end(db):
-    """A canned batch resolves the valid table; an invalid grain (ghost column) never appears in the
-    returned dict — validation runs INSIDE run_batched via the ref-aware accept, not post-filtering."""
+    """A canned batch resolves both tables; dim's ghost grain drops the grain FIELD only (Slice 2
+    per-field salvage) — validation runs INSIDE run_batched via the ref-aware accept, not
+    post-filtering. Advisory fields come back vocab-normalized (fact+event -> event_fact)."""
     items = [BatchItem("txn", {"table": "txn",
                                "column_profiles": [{"column": "id", "type": "integer"},
                                                    {"column": "posted_at", "type": "timestamp"}]}),
@@ -115,9 +125,10 @@ def test_synthesize_tables_end_to_end(db):
     out = synthesize_tables(db, client, items,
                             columns_by_table={"txn": {"id", "posted_at"}, "dim": {"id"}},
                             actor=None)
-    assert set(out) == {"txn"}                                 # dim's ghost grain never resolves
+    assert set(out) == {"txn", "dim"}                          # dim resolves WITHOUT the ghost grain
     assert out["txn"]["grain"] == {"columns": ["id"], "is_unique": True}
     assert out["txn"]["availability_time"] == {"column": "posted_at", "basis": "posted_at"}
-    assert out["txn"]["table_role"] == "fact"
+    assert out["txn"]["table_role"] == "event_fact"            # "fact" + event -> event_fact
     assert out["txn"]["primary_entity"] == "transaction"
     assert out["txn"]["event_or_snapshot"] == "event"
+    assert out["dim"]["grain"] is None                         # the invalid FIELD dropped, not the table

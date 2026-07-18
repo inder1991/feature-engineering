@@ -4,8 +4,9 @@ The descriptor carries `operational_type` + `declared_type` as TWO fields (never
 `type`); the wide-table roster entry is a STRUCTURED `{column, operational_type, declared_type}`
 object (a column name may itself contain `:`/`/`, which the old `name:type` string conflated
 irrecoverably); the item metadata carries the fenced `table_definition`; and both Pass B batch
-calls ship prompt/schema v2 via the Task-1 version seam. Views are constructed via the REAL
-`build_table_views` — no hand-rolled view objects.
+calls ship the Slice-2 stamp via the Task-1 version seam — prompt v3, canonical schema v2 (the
+schema deliberately stays v2: [F1], the role vocab is code-side, never a schema enum). Views are
+constructed via the REAL `build_table_views` — no hand-rolled view objects.
 """
 from featuregen.intake.llm import FakeLLM, FakeResponse
 from featuregen.overlay.upload import table_synth as ts
@@ -145,13 +146,14 @@ def test_wide_phase2_item_carries_structured_roster_and_table_definition(db):
     assert len(meta["column_roster"]) == n
     assert meta["column_roster"][0] == {"column": "c0", "operational_type": "integer",
                                         "declared_type": ""}  # structured, not "c0:integer"
-    # both phases ship the v2 contract via the Task-1 seam
-    assert synth_req.prompt_version == 2 and synth_req.output_schema_version == 2
+    # both phases ship the Slice-2 contract via the Task-1 seam: prompt v3, canonical schema
+    # STAYS v2 ([F1] — the role vocab is code-side + prompt-side, never a schema enum)
+    assert synth_req.prompt_version == 3 and synth_req.output_schema_version == 2
     summary_req = [r for r in client.requests if r.task == "table_synth_summary"][0]
-    assert summary_req.prompt_version == 2 and summary_req.output_schema_version == 2
+    assert summary_req.prompt_version == 3 and summary_req.output_schema_version == 2
 
 
-def test_narrow_fast_path_ships_v2_contract(db):
+def test_narrow_fast_path_ships_v3_prompt_v2_schema(db):
     rows = [_row("narrow", "c0")]
     items = assemble_table_items(_views(rows))
     client = _RecordingLLM({"table_synth": FakeResponse(output={"results": [
@@ -159,7 +161,7 @@ def test_narrow_fast_path_ships_v2_contract(db):
     out = synthesize_tables(db, client, items, columns_by_table={"narrow": {"c0"}}, actor=None)
     assert out["narrow"]["grain"] == {"columns": ["c0"], "is_unique": True}
     req = [r for r in client.requests if r.task == "table_synth"][0]
-    assert req.prompt_version == 2 and req.output_schema_version == 2
+    assert req.prompt_version == 3 and req.output_schema_version == 2
 
 
 # ── v2 schemas + instructions describe the dual-type contract ───────────────────────────────────

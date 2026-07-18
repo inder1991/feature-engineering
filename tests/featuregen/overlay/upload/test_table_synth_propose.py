@@ -118,4 +118,5 @@ def test_ingest_wires_pass_b_behind_flag(db, monkeypatch):
     assert avail.status == "DRAFT"
 
     ev = read_active_field_evidence(db, normalize_ref("src", None, "txn"), "table_role")
-    assert any(e.proposed_value == "fact" for e in ev)
+    # Slice 2: the accept vocab-normalizes the advisory role — "fact" + event -> "event_fact".
+    assert any(e.proposed_value == "event_fact" for e in ev)

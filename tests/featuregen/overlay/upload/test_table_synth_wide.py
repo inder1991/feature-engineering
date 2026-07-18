@@ -11,8 +11,11 @@ two phases:
   column roster (names/types only). Emits the SAME table-fact result shape ``_propose_table_facts``
   already consumes, so downstream proposal/projection is unchanged.
 
-A NARROW table keeps the today's single-call fast path (no phase-1 summary). A wide table that fails to
-summarize every chunk, or whose synthesis is invalid, resolves to NOTHING — never a phantom "resolved".
+A NARROW table keeps the today's single-call fast path (no phase-1 summary). A wide table that fails
+to summarize every chunk resolves to NOTHING — never a phantom "resolved". Slice 2: an invalid
+FIELD in the phase-2 synthesis (e.g. a ghost grain column) drops that field only — the table still
+resolves with the surviving fields (per-field salvage), counted as an abstention when no
+grain/availability survives.
 """
 from featuregen.intake.llm import FakeLLM, FakeResponse
 from featuregen.overlay.upload.enrich_batch import BatchItem
@@ -96,7 +99,7 @@ def test_wide_table_two_phase_produces_proposal(db):
     assert set(out) == {"ftr"}
     assert out["ftr"]["grain"] == {"columns": ["c0"], "is_unique": True}
     assert out["ftr"]["availability_time"] == {"column": "c1", "basis": "posted_at"}
-    assert out["ftr"]["table_role"] == "fact"
+    assert out["ftr"]["table_role"] == "event_fact"          # "fact" + event -> event_fact (Slice 2)
     assert out["ftr"]["primary_entity"] == "transaction"
     assert out["ftr"]["event_or_snapshot"] == "event"
 
@@ -155,9 +158,10 @@ def test_wide_missing_chunk_summary_is_honest_no_phantom(db):
     assert state == "failed" and reason == "no_items_resolved"    # honest stage report
 
 
-def test_wide_invalid_synthesis_is_honest_no_phantom(db):
-    """All chunks summarize but phase-2 names a GHOST grain column -> make_ref_accept rejects ->
-    the table resolves to NOTHING (no phantom), so the stage reports honestly."""
+def test_wide_ghost_grain_drops_field_only_no_phantom_grain(db):
+    """All chunks summarize but phase-2 names a GHOST grain column -> Slice-2 per-field salvage:
+    the grain FIELD is dropped (never a phantom grain proposal) while the table still resolves,
+    counted honestly as an ABSTENTION (no grain/availability survived)."""
     n = 70                                                  # wide (>64) -> 2 chunks (64 + 6)
     profiles = _profiles(n)
     cols = {f"c{i}" for i in range(n)}
@@ -170,9 +174,11 @@ def test_wide_invalid_synthesis_is_honest_no_phantom(db):
     })
     items = [BatchItem("ftr", {"table": "ftr", "column_profiles": profiles})]
     out = synthesize_tables(db, client, items, columns_by_table={"ftr": cols}, actor=None)
-    assert out == {}
-    state, reason, _ = _enrichment_outcome(out, expected=1)
-    assert state == "failed" and reason == "no_items_resolved"
+    assert set(out) == {"ftr"}
+    assert out["ftr"]["grain"] is None                      # the ghost grain NEVER proposes
+    assert out["ftr"]["availability_time"] is None
+    state, _reason, detail = _enrichment_outcome(out, expected=1)
+    assert state == "succeeded" and detail["abstained"] == 1
 
 
 def test_mixed_narrow_and_wide_both_resolve(db):

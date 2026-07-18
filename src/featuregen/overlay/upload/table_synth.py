@@ -15,9 +15,10 @@ import json
 import logging
 from typing import TYPE_CHECKING
 
-from featuregen.overlay.upload import enrich_config
+from featuregen.overlay.upload import enrich_config, table_vocab
 from featuregen.overlay.upload.enrich_batch import BatchItem, run_batched
 from featuregen.overlay.upload.enrich_llm import _MAX_COLUMN_PROFILES
+from featuregen.overlay.upload.taxonomy.dimensions import known_entities
 from featuregen.runtime.observability import counters
 
 if TYPE_CHECKING:
@@ -73,48 +74,113 @@ def assemble_table_items(views: dict[str, TableMetadataView]) -> list[BatchItem]
 _VALID_BASIS = {"posted_at", "ingested_at"}  # lag-free bases only (event_time_plus_lag needs lag_hours)
 
 
-def make_ref_accept(columns_by_table: dict[str, set[str]]):
+def make_ref_accept(columns_by_table: dict[str, set[str]], *,
+                    dispositions: list[dict] | None = None):
     """A ref-aware accept for `validate_batch_results(..., ref_aware=True)`. `ref` is the table name;
     validate the serialized `synthesis` against THAT table's real columns and map a valid result onto
-    the FACT_VALUE_SCHEMAS shapes (grain `{columns, is_unique}` / availability `{column, basis}`)."""
+    the FACT_VALUE_SCHEMAS shapes (grain `{columns, is_unique}` / availability `{column, basis}`).
+
+    Slice 2: every field is validated INDEPENDENTLY — an invalid field drops THAT FIELD ONLY (the
+    table still resolves; only unparseable / non-object raw whole-rejects). The `table_role` vocab
+    is enforced HERE, not as a schema enum ([F1] — `reg.validate` would fail the WHOLE synthesis on
+    one off-vocab role, destroying this per-field salvage). Every resolved synthesis appends a
+    disposition record to `dispositions` for ALL FIVE fields ([F12] — TOTAL):
+    ``{"table", "field", "status", "reason", "prior_value_staled": False}`` with
+    ``status in {accepted, abstained, dropped_invalid}``; an absent advisory field == abstained.
+    ``prior_value_staled`` is set later by the staling seam, never here."""
+    disp = dispositions if dispositions is not None else []
+
+    def _put(ref: str, field: str, status: str, reason: str | None = None) -> None:
+        disp.append({"table": ref, "field": field, "status": status, "reason": reason,
+                     "prior_value_staled": False})
+
     def accept(raw: str, ref: str) -> tuple[str | None, str]:
         cols = columns_by_table.get(ref, set())
+        back = {c.lower(): c for c in cols}   # normalized -> CANONICAL table spelling
         try:
             s = json.loads(raw)
         except (ValueError, TypeError):
             return None, "unparseable"
         if not isinstance(s, dict):
             return None, "not_object"   # "null"/"[]"/"\"x\"" parse fine but can't .get(...)
-        grain_cols = [c for c in (s.get("grain_columns") or []) if isinstance(c, str)]
-        if any(c not in cols for c in grain_cols):
-            return None, "grain_col_not_in_table"
-        as_of_col = s.get("as_of_column")
-        as_of_basis = s.get("as_of_basis")
-        # `is_unique=True` is the CLAIM being proposed (these columns are asserted to identify a row),
-        # NOT empirical proof — there is no profiling in Phase 2. Human confirmation IS the uniqueness
-        # attestation; the proposal's LLM origin (proposed_by=service actor) is what a reviewer sees.
-        # The fact schema {columns,is_unique} forbids a caveat field, so origin is surfaced via the
-        # worklist, not the value. An empty grain_columns == the model ABSTAINING (skip, not error).
-        grain = {"columns": grain_cols, "is_unique": True} if grain_cols else None
-        # Availability is DECOUPLED from grain: a bad as-of (a column the table lacks, or a basis
-        # outside the lag-free enum) drops ONLY the availability — it must NEVER discard an otherwise
-        # VALID grain proposal. Coupling them silently lost a real grain to a single hallucinated
-        # as-of column; the grain still proposes and the bad as-of is logged/counted, not returned as
-        # a whole-item rejection. Both absent is a valid ABSTENTION (retained below), never a reject.
-        availability = None
-        if as_of_col is not None:
-            if as_of_col in cols and as_of_basis in _VALID_BASIS:
-                availability = {"column": as_of_col, "basis": as_of_basis}
+
+        # ── grain: a real list[str], case-folded for duplicates/membership, mapped BACK to the
+        # table's canonical spelling. Any violation drops the GRAIN ONLY — the other fields keep
+        # their own verdicts. `is_unique=True` is the CLAIM being proposed (these columns are
+        # asserted to identify a row), NOT empirical proof — there is no profiling in Phase 2; human
+        # confirmation IS the uniqueness attestation. An empty/absent grain_columns == the model
+        # ABSTAINING (MF-3), never a reject.
+        rg = s.get("grain_columns")
+        grain = None
+        if rg is None or rg == []:
+            _put(ref, "grain", "abstained")
+        elif not isinstance(rg, list) or not all(isinstance(c, str) for c in rg):
+            _put(ref, "grain", "dropped_invalid", "grain_invalid_shape")
+        else:
+            fold = [c.strip().lower() for c in rg]
+            if len(fold) != len(set(fold)):
+                _put(ref, "grain", "dropped_invalid", "grain_duplicate")
+            elif len(rg) > table_vocab.MAX_GRAIN_COLS:
+                _put(ref, "grain", "dropped_invalid", "grain_over_bound")
+            elif any(f not in back for f in fold):
+                _put(ref, "grain", "dropped_invalid", "grain_col_not_in_table")
             else:
+                grain = {"columns": [back[f] for f in fold], "is_unique": True}
+                _put(ref, "grain", "accepted")
+
+        # ── availability: DECOUPLED from grain — a bad as-of (a column the table lacks, or a basis
+        # outside the lag-free enum) drops ONLY the availability, never an otherwise-valid grain.
+        # [F13]: the column is case-folded and emitted in the CANONICAL table spelling (same map as
+        # grain); the basis is strip/lower-matched into `_VALID_BASIS`.
+        availability = None
+        aoc, aob = s.get("as_of_column"), s.get("as_of_basis")
+        if aoc is None:
+            _put(ref, "availability_time", "abstained")
+        else:
+            col = back.get(aoc.strip().lower()) if isinstance(aoc, str) else None
+            basis = aob.strip().lower() if isinstance(aob, str) else None
+            if col is not None and basis in _VALID_BASIS:
+                availability = {"column": col, "basis": basis}
+                _put(ref, "availability_time", "accepted")
+            else:
+                _put(ref, "availability_time", "dropped_invalid",
+                     "basis_not_allowed" if col is not None else "as_of_col_not_in_table")
                 counters.incr("overlay.table_synth.availability.dropped_bad_as_of")
                 logger.info("table_synth dropped a bad as-of for %r (col=%r basis=%r) — keeping grain",
-                            ref, as_of_col, as_of_basis)
+                            ref, aoc, aob)
+
+        # ── advisory fields: strip/lower-normalized, vocab/registry-gated, each with its own
+        # disposition. [F13]: a NON-EMPTY event_or_snapshot that normalizes to None is OFF-VOCAB
+        # (dropped_invalid), not an abstention.
+        reos = s.get("event_or_snapshot")
+        eos = table_vocab.normalize_event_or_snapshot(reos)
+        if eos is not None:
+            _put(ref, "event_or_snapshot", "accepted")
+        elif isinstance(reos, str) and reos != "":
+            _put(ref, "event_or_snapshot", "dropped_invalid", "event_or_snapshot_off_vocab")
+        else:
+            _put(ref, "event_or_snapshot", "abstained")
+
+        rr = s.get("table_role")
+        role = table_vocab.normalize_table_role(rr, event_or_snapshot=eos)
+        if rr and role is None:
+            _put(ref, "table_role", "dropped_invalid", "role_off_vocab")
+        else:
+            _put(ref, "table_role", "accepted" if role else "abstained")
+
+        ent = s.get("primary_entity")
+        ent = ent.strip().lower() if isinstance(ent, str) else None
+        if ent and ent not in known_entities():
+            _put(ref, "primary_entity", "dropped_invalid", "entity_not_registered")
+            ent = None
+        else:
+            _put(ref, "primary_entity", "accepted" if ent else "abstained")
+
         # A parseable synthesis with neither grain nor availability is a VALID ABSTENTION (some tables
-        # genuinely have no single grain / as-of) — retain any role/entity it returned and propose zero
-        # grain/availability facts. Only unparseable / non-object raw (rejected earlier) is a failure.
+        # genuinely have no single grain / as-of) — retain the surviving advisory fields and propose
+        # zero grain/availability facts. Only unparseable / non-object raw (above) is a failure.
         out = {"grain": grain, "availability_time": availability,
-               "table_role": s.get("table_role"), "primary_entity": s.get("primary_entity"),
-               "event_or_snapshot": s.get("event_or_snapshot")}
+               "table_role": role, "primary_entity": ent, "event_or_snapshot": eos}
         return json.dumps(out, sort_keys=True), ("valid" if (grain or availability) else "abstained")
     return accept
 
@@ -127,20 +193,30 @@ def make_summary_accept(columns_by_ref: dict[str, set[str]]):
     raw is rejected; everything else normalizes to a bounded, egress-safe summary."""
     def accept(raw: str, ref: str) -> tuple[str | None, str]:
         cols = columns_by_ref.get(ref, set())
+        back = {c.lower(): c for c in cols}   # normalized -> CANONICAL chunk spelling (Slice 2)
+
+        def _known(names) -> list[str]:
+            # Same normalization as make_ref_accept: case-fold, match against the chunk's real
+            # columns, emit the CANONICAL spelling; a stray/off-chunk candidate drops silently
+            # (a summary is advisory phase-1 input, never a governed fact). Deduped post-fold.
+            out: list[str] = []
+            for c in names or []:
+                if isinstance(c, str):
+                    hit = back.get(c.strip().lower())
+                    if hit is not None and hit not in out:
+                        out.append(hit)
+            return out[:32]
+
         try:
             s = json.loads(raw)
         except (ValueError, TypeError):
             return None, "unparseable"
         if not isinstance(s, dict):
             return None, "not_object"
-        grain = [c for c in (s.get("grain_candidates") or [])
-                 if isinstance(c, str) and c in cols][:32]
-        temporal = [c for c in (s.get("temporal_candidates") or [])
-                    if isinstance(c, str) and c in cols][:32]
+        grain = _known(s.get("grain_candidates"))
+        temporal = _known(s.get("temporal_candidates"))
         entity = [e for e in (s.get("entity_signals") or []) if isinstance(e, str)][:16]
-        kind = s.get("event_or_snapshot")
-        if kind not in ("event", "snapshot", None):
-            kind = None
+        kind = table_vocab.normalize_event_or_snapshot(s.get("event_or_snapshot"))
         out = {"grain_candidates": grain, "temporal_candidates": temporal,
                "entity_signals": entity, "event_or_snapshot": kind}
         return json.dumps(out, sort_keys=True), "valid"
@@ -186,14 +262,16 @@ def _run_synthesis(conn, client, items: list[BatchItem], *, columns_by_table, ac
     task/schema/accept/result-shape — only the item metadata (full profiles vs summaries+roster) and
     the instruction differ. Returns {table: synthesis_dict} for VALID results only.
 
-    Ships the Pass B **v2** contract via the Task-1 version seam (`prompt_version=2,
-    schema_version=2` — dual-type profiles + structured roster + table_definition); the OUTPUT
-    schema body is unchanged, but the stamped versions identify which item contract egressed."""
+    Ships the Pass B Slice-2 contract via the Task-1 version seam: **prompt v3** (the code-side
+    `table_role` vocab is enumerated in the instruction) over the **unchanged canonical v2
+    schema**. [F1]: `table_role` is deliberately NOT a schema enum — `reg.validate` rejects the
+    WHOLE synthesis on one schema violation, so a strict role enum would lose a valid grain to one
+    off-vocab role; the vocab is enforced per-field in `make_ref_accept` instead."""
     accept = make_ref_accept(columns_by_table)
     resolved = run_batched(
         conn, client, short="table_synth", task="table_synth",
-        prompt_id="overlay_table_synth_v2", schema_id="overlay_table_synth_batch",
-        prompt_version=2, schema_version=2,
+        prompt_id="overlay_table_synth_v3", schema_id="overlay_table_synth_batch",
+        prompt_version=3, schema_version=2,
         shared_metadata={}, items=items, out_key="synthesis",
         instruction=instruction, accept=accept, actor=actor,
         extract=lambda e: json.dumps(e.get("synthesis"), sort_keys=True), ref_aware=True,
@@ -257,8 +335,12 @@ def _synthesize_wide_tables(conn, client, wide_items: list[BatchItem], *, column
 
     summaries = run_batched(
         conn, client, short="table_synth", task="table_synth_summary",
-        prompt_id="overlay_table_synth_summary_v2", schema_id="overlay_table_synth_summary_batch",
-        prompt_version=2, schema_version=2,   # v2 item contract (dual-type profiles) — Task-1 seam
+        # Slice-2 stamp: prompt v3 / canonical schema v2, matching the synthesis call so one Pass B
+        # run never egresses under two contract generations. The summary TEXT is unchanged at v3
+        # (it emits no table_role, so there is no vocab to enumerate) — the bump identifies the
+        # Slice-2 contract, mirroring the Slice-1 v2-aliases-v1 schema precedent.
+        prompt_id="overlay_table_synth_summary_v3", schema_id="overlay_table_synth_summary_batch",
+        prompt_version=3, schema_version=2,
         shared_metadata={}, items=chunk_items, out_key="summary",
         instruction=_SUMMARY_INSTRUCTION, accept=make_summary_accept(columns_by_ref), actor=actor,
         extract=lambda e: json.dumps(e.get("summary"), sort_keys=True), ref_aware=True,
@@ -294,12 +376,21 @@ _TYPE_FIELDS_NOTE = (
     "whole table. "
 )
 
+# Prompt v3 ([F1]): the accepted table_role values are enumerated in the PROMPT (and enforced
+# per-field in `make_ref_accept`) — never as an enum on the canonical response schema, which would
+# whole-reject a synthesis over one off-vocab role.
+_ROLE_VOCAB_NOTE = (
+    "table_role MUST be one of: " + ", ".join(table_vocab.TABLE_ROLE_ENUM) +
+    " (any other value is discarded); event_or_snapshot MUST be event or snapshot. "
+)
+
 _INSTRUCTION = (
     _TYPE_FIELDS_NOTE +
     "For each table, identify: the grain (the minimal set of columns whose combination uniquely "
     "identifies one row) — RETURN AN EMPTY grain_columns list if you cannot determine it, do not "
     "guess; the as-of/availability column and its basis (posted_at|ingested_at); "
     "the primary business entity; the table role; and whether it is an event or snapshot table. "
+    + _ROLE_VOCAB_NOTE +
     "Only name columns that appear in the provided column list."
 )
 
@@ -321,7 +412,8 @@ _SYNTH_WIDE_INSTRUCTION = (
     "table: the grain (the minimal set of columns whose combination uniquely identifies one row) — "
     "RETURN AN EMPTY grain_columns list if you cannot determine it, do not guess; the as-of/availability "
     "column and its basis (posted_at|ingested_at); the primary business entity; the table role; and "
-    "whether it is an event or snapshot table. Only name columns that appear in the column roster."
+    "whether it is an event or snapshot table. " + _ROLE_VOCAB_NOTE +
+    "Only name columns that appear in the column roster."
 )
 
 
