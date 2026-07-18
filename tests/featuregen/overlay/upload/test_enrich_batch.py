@@ -23,9 +23,10 @@ def test_pass_a_defaults_batch_table_synth_single_and_reads_env(monkeypatch):
 
 
 def test_max_items_default_and_override(monkeypatch):
-    assert cfg.max_items("concept") == 40
-    assert cfg.max_items("definition") == 12
-    assert cfg.max_items("domain") == 20
+    # MF-8a — conservative isolation ceilings (were 40/12/20). The env override still wins.
+    assert cfg.max_items("concept") == 20
+    assert cfg.max_items("definition") == 8
+    assert cfg.max_items("domain") == 8
     monkeypatch.setenv("OVERLAY_ENRICH_BATCH_CONCEPT_MAX_ITEMS", "16")
     assert cfg.max_items("concept") == 16
 

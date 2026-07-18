@@ -14,7 +14,13 @@ from dataclasses import dataclass
 # (synthesize_tables never reads mode()) and stays single so the config-namespace tests are unmoved.
 _DEFAULT_MODE = {"concept": "batch", "definition": "batch", "domain": "batch",
                  "table_synth": "single"}
-_DEFAULT_MAX_ITEMS = {"concept": 40, "definition": 12, "domain": 20, "table_synth": 8}
+# MF-8a — conservative ISOLATION boundaries, not throughput maxima. The old 40/12/20/8 were picked
+# for throughput with NO accuracy evidence (the hermetic gold gate drives a scripted FakeLLM that
+# echoes each column's expected answer, so it measures the harness, not the provider, and compares no
+# batch sizes / no cross-item contamination). Until the key-gated real-provider sweep
+# (tests/eval/test_batch_size_sweep.py) produces evidence a higher ceiling holds accuracy, keep these
+# small so cross-item contamination has less room. The env override still raises a ceiling per task.
+_DEFAULT_MAX_ITEMS = {"concept": 20, "definition": 8, "domain": 8, "table_synth": 4}
 _DEFAULT_MAX_INPUT_TOKENS = {"concept": 14000, "definition": 8000, "domain": 8000,
                              "table_synth": 6000}
 
