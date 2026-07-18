@@ -1,8 +1,18 @@
-"""Slice 3a-iii Task 1 — `_candidate_columns` widened with feature-correctness fields + table-node
-context (single scoped query). The thin `_menu` projection stays byte-identical: nothing new
-egresses until the flag-gated enrichment (Task 2)."""
+"""Slice 3a-iii Tasks 1+2 — `_candidate_columns` widened with feature-correctness fields +
+table-node context (single scoped query), and the flag-gated ENRICHED menu that wraps every
+governed/hint fact in an OperationalColumnFacts `{value, authority}` pair via read_column_facts.
+The thin `_menu` projection stays byte-identical: nothing new egresses while
+FEATUREGEN_FEATURE_CONTEXT is off."""
+from featuregen.overlay.field_decision import FieldDecisionEventType, record_field_decision
+from featuregen.overlay.field_evidence import canonical_hash
 from featuregen.overlay.upload.canonical import CanonicalRow
-from featuregen.overlay.upload.feature_assist import _candidate_columns, _menu
+from featuregen.overlay.upload.column_authority import logical_ref_of
+from featuregen.overlay.upload.feature_assist import (
+    _candidate_columns,
+    _enriched_menu,
+    _menu,
+    feature_context_enabled,
+)
 from featuregen.overlay.upload.graph import build_graph
 
 
@@ -70,3 +80,90 @@ def test_thin_menu_unchanged_after_widening(db):
     amount = next(m for m in menu if m["object_ref"] == "public.transactions.amount")
     assert amount == {"object_ref": "public.transactions.amount", "table": "transactions",
                       "column": "amount", "concept": None, "domain": None}
+
+
+def _govern_additivity(db, logical_ref, value):
+    """Record a load-bearing RESOLVED decision so is_feature_eligible(logical_ref, 'additivity')
+    is True — the ONLY path to authority='governed' for a decision-governed field."""
+    record_field_decision(
+        db, logical_ref=logical_ref, field_name="additivity",
+        event_type=FieldDecisionEventType.RESOLVED, selected_evidence_ids=[],
+        evidence_set_hash=canonical_hash([]), display_value_hash=canonical_hash(value),
+        load_bearing_value_hash=canonical_hash(value), conflict_status="resolved",
+        reason_codes=[], field_policy_version="upload-field-policy-v1",
+        resolver_version="upload-resolve-and-project-v1", actor_ref=None,
+        supersedes_event_id=None)
+
+
+def test_feature_context_enabled_reads_env(monkeypatch):
+    # RF-C3: the ONE public flag helper. Default OFF; truthy set is {1, true, yes, on},
+    # case-insensitive and whitespace-tolerant; everything else is OFF.
+    monkeypatch.delenv("FEATUREGEN_FEATURE_CONTEXT", raising=False)
+    assert feature_context_enabled() is False
+    for raw in ("1", "true", "yes", "on", " TRUE ", "Yes", "ON"):
+        monkeypatch.setenv("FEATUREGEN_FEATURE_CONTEXT", raw)
+        assert feature_context_enabled() is True, raw
+    for raw in ("", "0", "false", "no", "off", "enabled", "2"):
+        monkeypatch.setenv("FEATUREGEN_FEATURE_CONTEXT", raw)
+        assert feature_context_enabled() is False, raw
+
+
+def test_enriched_menu_wraps_governed_fields_and_flag_gates(db, monkeypatch):
+    _bank_graph(db)
+    # Govern amount.additivity via the decision log (display value stays the flat column).
+    _govern_additivity(db, logical_ref_of("bank", "public.transactions.amount"), "additive")
+
+    monkeypatch.delenv("FEATUREGEN_FEATURE_CONTEXT", raising=False)
+    assert feature_context_enabled() is False
+    monkeypatch.setenv("FEATUREGEN_FEATURE_CONTEXT", "1")
+    assert feature_context_enabled() is True
+
+    cols = _candidate_columns(db, "bank", roles=())
+    menu = _enriched_menu(db, cols)
+    amount = next(m for m in menu if m["object_ref"] == "public.transactions.amount")
+    # Structural identity stays bare; definition/semantic_terms are free-text strings
+    # (sanitized at egress in Task 4).
+    assert amount["table"] == "transactions"
+    assert amount["definition"] == "txn amount"
+    assert amount["semantic_terms"] == "payment amount"
+    # Every fact field is a {value, authority} wrapper, never a bare value.
+    for field in ("data_type", "declared_type", "entity", "additivity", "unit", "currency",
+                  "is_grain", "is_as_of"):
+        assert set(amount[field].keys()) == {"value", "authority"}, field
+        assert amount[field]["authority"] in ("governed", "hint"), field
+    # Decision-governed additivity carries authority='governed' with the flat display value.
+    assert amount["additivity"] == {"value": "additive", "authority": "governed"}
+    # Hint fields carry the flat value verbatim.
+    assert amount["declared_type"] == {"value": "numeric", "authority": "hint"}
+    assert amount["unit"] == {"value": "dollars", "authority": "hint"}
+    assert amount["currency"] == {"value": "USD", "authority": "hint"}
+    # Booleans render as strings (RF-I7); a False flag with no fact event is a hint.
+    assert amount["is_grain"] == {"value": "false", "authority": "hint"}
+    # Fact-event-governed grain / as-of columns (flag true AND *_fact_event_id non-null).
+    acct = next(m for m in menu if m["object_ref"] == "public.accounts.account_id")
+    assert acct["is_grain"] == {"value": "true", "authority": "governed"}
+    txn_date = next(m for m in menu if m["object_ref"] == "public.transactions.txn_date")
+    assert txn_date["is_as_of"] == {"value": "true", "authority": "governed"}
+
+
+def test_flag_off_menu_content_is_byte_identical_thin_projection(db, monkeypatch):
+    # With the flag OFF (unset or an explicit falsy value) the menu CONTENT is exactly the thin
+    # 5-key projection — no wrappers, no enrichment keys — even though the widened candidate rows
+    # carry the new fields. (The route-level serializer split lands in 3a-iv.)
+    _bank_graph(db)
+    for off in (None, "0"):
+        if off is None:
+            monkeypatch.delenv("FEATUREGEN_FEATURE_CONTEXT", raising=False)
+        else:
+            monkeypatch.setenv("FEATUREGEN_FEATURE_CONTEXT", off)
+        assert feature_context_enabled() is False
+        menu = _menu(_candidate_columns(db, "bank", roles=()))
+        assert sorted(m["object_ref"] for m in menu) == [
+            "public.accounts.account_id", "public.transactions.amount",
+            "public.transactions.txn_date"]
+        for m in menu:
+            assert set(m.keys()) == {"object_ref", "table", "column", "concept", "domain"}
+            assert all(not isinstance(v, dict) for v in m.values())
+        amount = next(m for m in menu if m["object_ref"] == "public.transactions.amount")
+        assert amount == {"object_ref": "public.transactions.amount", "table": "transactions",
+                          "column": "amount", "concept": None, "domain": None}

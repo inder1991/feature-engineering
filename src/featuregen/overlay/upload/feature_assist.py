@@ -12,6 +12,7 @@ proposals only.
 from __future__ import annotations
 
 import logging
+import os
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass, field, replace
@@ -158,6 +159,60 @@ def _candidate_columns(conn, catalog_source: str | None, roles: Iterable[str],
 
 def _menu(cols: list[dict]) -> list[dict]:
     return [{k: c[k] for k in ("object_ref", "table", "column", "concept", "domain")} for c in cols]
+
+
+FEATURE_CONTEXT_FLAG = "FEATUREGEN_FEATURE_CONTEXT"
+
+
+def feature_context_enabled() -> bool:
+    """The single env gate for the whole Slice-3 enrichment (menu widening, per-table context,
+    relevance, versioned shape). Default OFF ⟹ the thin pre-Slice-3 menu, byte-for-byte.
+    RF-C3: the ONE public definition — 3a-iv imports and reuses this; never redefine it."""
+    return os.environ.get(FEATURE_CONTEXT_FLAG, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+# Menu fact key -> read_column_facts field_name. `data_type` reads the OPERATIONAL structural type
+# under the contract's `logical_representation` authority field (value = graph_node.data_type).
+_MENU_FACT_FIELDS = {
+    "data_type": "logical_representation",
+    "declared_type": "declared_type",
+    "entity": "entity",
+    "additivity": "additivity",
+    "unit": "unit",
+    "currency": "currency",
+    "is_grain": "is_grain",
+    "is_as_of": "is_as_of",
+}
+_MENU_IDENTITY_FIELDS = ("object_ref", "table", "column", "concept", "domain")
+_MENU_DEFINITION_FIELDS = ("definition", "semantic_terms")
+
+
+def _enriched_column(conn, c: dict) -> dict:
+    """One flag-ON menu column: structural identity bare, definition-kind free text kept (sanitized
+    at egress in enrich_llm), and each governed/hint fact wrapped as OperationalColumnFacts
+    {value, authority} via read_column_facts (never a bare display value; spec §5). The candidate
+    dict carries the PUBLIC-FLATTENED object_ref, so the decision-log key is rebuilt through the
+    same logical_ref_of bridge the validator uses."""
+    out: dict = {}
+    for k in _MENU_IDENTITY_FIELDS:
+        v = c.get(k)
+        if v is not None:
+            out[k] = v
+    for k in _MENU_DEFINITION_FIELDS:
+        v = c.get(k)
+        if v:
+            out[k] = v
+    lref = logical_ref_of(c["catalog_source"], c["object_ref"])
+    for menu_key, field_name in _MENU_FACT_FIELDS.items():
+        facts = read_column_facts(conn, lref, field_name)
+        out[menu_key] = {"value": facts.value, "authority": facts.authority}
+    return out
+
+
+def _enriched_menu(conn, cols: list[dict]) -> list[dict]:
+    """The flag-ON menu (feature_context_enabled()). When the flag is OFF, callers keep serving
+    the thin `_menu` projection unchanged — flag-off byte-identity is a Slice-3 invariant."""
+    return [_enriched_column(conn, c) for c in cols]
 
 
 @dataclass(frozen=True, slots=True)
