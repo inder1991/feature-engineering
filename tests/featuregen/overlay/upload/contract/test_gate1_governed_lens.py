@@ -125,6 +125,43 @@ def test_build_considered_set_surfaces_governed_option_when_live(db, monkeypatch
     assert all(s.lens != "governed" for s in cs.alternatives)
 
 
+# ── 3C.2a CRITICAL: a cross-catalog DEFINITION-MODE anchor is dropped when live (fail-closed) ──────────
+def test_build_considered_set_drops_cross_catalog_definition_anchor_when_live(db, monkeypatch):
+    # On a live entity-scoped run the definition anchor is generated over the WHOLE cross-catalog
+    # candidate pool (catalog_source is None), so it CAN span >1 catalog with NO governed physical plan.
+    # Such an anchor must never reach the customer-visible considered set / be choosable at Gate #1.
+    monkeypatch.setattr("featuregen.overlay.upload.contract.gate1.recommend_feature_sets_report",
+                        lambda *a, **k: SetsReport(sets=[], rejections=[]))   # isolate the anchor path
+    cross_anchor = FeatureIdea("cross_anchor", "", ["a", "b"], "sum", None,
+                               derives_pairs=(("ops", "public.t.a"), ("rev", "public.u.b")))
+    monkeypatch.setattr("featuregen.overlay.upload.contract.gate1.recommend_features",
+                        lambda *a, **k: [cross_anchor])
+    intent = submit_intent(hypothesis="an entity-scoped hypothesis",
+                           definition="a cross-catalog definition", actor="ds1")
+    # target_entity=None + templates=() isolates the anchor drop (no governed-options lens runs here).
+    cs = build_considered_set(db, intent, _recommend_set_client(), catalog_source=None, entity=None,
+                              is_live=True, target_entity=None, templates=(), now=_NOW)
+    assert cs.anchor is None    # the ungoverned cross-catalog anchor never becomes customer-visible
+    assert any(r.get("name") == "cross_anchor"
+               and r.get("reason") == GOVERNED_CROSS_CATALOG_PLAN_REQUIRED for r in cs.rejections)
+
+
+# ── 3C.2a: a SINGLE-catalog definition anchor under is_live is preserved (no over-rejection) ───────────
+def test_build_considered_set_preserves_single_catalog_definition_anchor_when_live(db, monkeypatch):
+    monkeypatch.setattr("featuregen.overlay.upload.contract.gate1.recommend_feature_sets_report",
+                        lambda *a, **k: SetsReport(sets=[], rejections=[]))
+    single_anchor = FeatureIdea("single_anchor", "", ["a"], "sum", None,
+                                derives_pairs=(("ops", "public.t.a"),))
+    monkeypatch.setattr("featuregen.overlay.upload.contract.gate1.recommend_features",
+                        lambda *a, **k: [single_anchor])
+    intent = submit_intent(hypothesis="an entity-scoped hypothesis",
+                           definition="a single-catalog definition", actor="ds1")
+    cs = build_considered_set(db, intent, _recommend_set_client(), catalog_source=None, entity=None,
+                              is_live=True, target_entity=None, templates=(), now=_NOW)
+    assert cs.anchor is not None and cs.anchor.name == "single_anchor"   # single-catalog anchor untouched
+    assert not any(r.get("reason") == GOVERNED_CROSS_CATALOG_PLAN_REQUIRED for r in cs.rejections)
+
+
 # ── (a) flag off → the governed branch never runs (byte-identical to today) ───────────────────────────
 def test_flag_off_skips_the_governed_branch_entirely(db, monkeypatch):
     _minimal(db)

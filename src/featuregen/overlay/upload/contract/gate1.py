@@ -391,10 +391,11 @@ def build_considered_set(conn, intent: Intent, client: LLMClient, *, entity: str
     elif is_live:
         # 3C.2a — the LIVE governed cross-catalog lens (entity-scoped: no single catalog to ground on).
         # FIRST enforce the invariant over the LLM alternatives (a cross-catalog LLM idea has no governed
-        # plan → rejected), THEN append the governed planner's resolved plans as their own lens. Order
-        # matters: the governed ideas span >1 catalog by construction, so they must be appended AFTER the
-        # filter (never subjected to it). Authority rides on the ideas (origin/path_authority), not the
-        # lens name. This whole branch is skipped when the flag is off (is_live=False) — byte-identical.
+        # plan → rejected), THEN append the governed planner's resolved plans as their own lens. The
+        # governed ideas each carry a resolved plan envelope (a governed plan MAY be single-catalog), so
+        # they are appended AFTER the filter for safety regardless — never subjected to it. Authority
+        # rides on the ideas (origin/path_authority), not the lens name. This whole branch is skipped
+        # when the flag is off (is_live=False) — byte-identical.
         alternatives, cross_catalog_rejections = _reject_cross_catalog_llm(alternatives)
         rejections.extend(cross_catalog_rejections)
         if target_entity is not None:   # a governed plan needs a target grain to plan toward
@@ -413,6 +414,15 @@ def build_considered_set(conn, intent: Intent, client: LLMClient, *, entity: str
             conn, intent.redacted_definition, client, entity=entity, catalog_source=catalog_source,
             roles=roles, target_ref=target_ref, now=now, target=1)
         anchor = ideas[0] if ideas else None
+        # 3C.2a fail-closed: on a live entity-scoped run (catalog_source is None) the definition anchor is
+        # generated over the WHOLE cross-catalog candidate pool, so it CAN span >1 catalog with NO
+        # governed physical plan. Mirror the alternatives filter: drop such an anchor (it must never be
+        # customer-visible / choosable at Gate #1) and surface it as the same rejection. A single-catalog
+        # anchor is untouched. (Routing the definition through the governed planner is 3C.2b, not here.)
+        if is_live and anchor is not None and len({cs for cs, _ref in anchor.derives_pairs}) > 1:
+            rejections.append({"name": anchor.name, "reason": GOVERNED_CROSS_CATALOG_PLAN_REQUIRED,
+                               "code": GOVERNED_CROSS_CATALOG_PLAN_REQUIRED})
+            anchor = None
     recommendation = (recommend_set(conn, alternatives, intent.redacted_hypothesis, client)
                       if any(s.features for s in alternatives) else None)
     cs = ConsideredSet(intent.intent_id, anchor, alternatives, recommendation, rejections,
