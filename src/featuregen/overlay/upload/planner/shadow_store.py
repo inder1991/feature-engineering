@@ -72,6 +72,8 @@ class DispatchRecordV1:
     invocation_predicate: str
     compile_flag: bool
     telemetry_flag: bool
+    scoped_applicability_flag: bool | None
+    ranking_flag: bool | None
     applicability_version: str
     producer_commit: str
     compiler_versions: Mapping[str, str]
@@ -151,12 +153,14 @@ def write_dispatch(conn, rec: DispatchRecordV1) -> None:
     conn.execute(
         "INSERT INTO planner_shadow_dispatch "
         "(generation_run_id, eligible_recipe_ids, recipe_hash, expected_count, invocation_predicate, "
-        " compile_flag, telemetry_flag, applicability_version, producer_commit, compiler_versions, "
+        " compile_flag, telemetry_flag, scoped_applicability_flag, ranking_flag, "
+        " applicability_version, producer_commit, compiler_versions, "
         " compiler_versions_hash, payload_schema_version, created_at) "
-        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
         "ON CONFLICT (generation_run_id) DO NOTHING",
         (rec.generation_run_id, list(rec.eligible_recipe_ids), rec.recipe_hash, rec.expected_count,
-         rec.invocation_predicate, rec.compile_flag, rec.telemetry_flag, rec.applicability_version,
+         rec.invocation_predicate, rec.compile_flag, rec.telemetry_flag,
+         rec.scoped_applicability_flag, rec.ranking_flag, rec.applicability_version,
          rec.producer_commit, Jsonb(versions), payload_hash(versions), PAYLOAD_SCHEMA_VERSION,
          rec.created_at))
     row = conn.execute(

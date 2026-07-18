@@ -1,7 +1,8 @@
 import type { ReactElement } from 'react'
-import { useHashRoute } from './nav'
+import { gateConsoleEnabled, useHashRoute } from './nav'
 import type { Route } from './nav'
 import { SessionBar } from './SessionBar'
+import { GateEvaluationScreen } from './screens/GateEvaluationScreen'
 import { GovernanceDashboardScreen } from './screens/GovernanceDashboardScreen'
 import { GovernanceReviewScreen } from './screens/GovernanceReviewScreen'
 import { IntegrationsScreen } from './screens/IntegrationsScreen'
@@ -125,6 +126,14 @@ const ICONS: Record<Route, ReactElement> = {
       <path d="M4.75 10.75v-3.5M8 10.75v-6M11.25 10.75v-4.5" />
     </NavIcon>
   ),
+  gate: (
+    // Gauge with a needle: the machine gate reads out — it does not decide.
+    <NavIcon>
+      <path d="M2.75 11.25a5.25 5.25 0 0 1 10.5 0" />
+      <path d="m8 11.25 2.4-2.9" />
+      <path d="M2.75 13.5h10.5" />
+    </NavIcon>
+  ),
 }
 
 const PAGES: { route: Route; label: string; eyebrow: string; title: string; description: string }[] = [
@@ -207,6 +216,17 @@ const PAGES: { route: Route; label: string; eyebrow: string; title: string; desc
     title: 'Governance dashboard',
     description: 'Pipeline rollups + outcomes.',
   },
+  {
+    // Internal, authority-only, behind VITE_INTENT_GATE_CONSOLE — filtered out of the rendered
+    // nav in App() when the flag is off (parseHash also refuses the route then).
+    route: 'gate',
+    label: 'Gate console',
+    eyebrow: 'INTENT · GATE CONSOLE',
+    title: 'Gate evaluation',
+    description:
+      'Authority-only: run the machine gate over a shadow cohort — verdict, failed conditions, '
+      + 'coverage, and the population behind the numbers. Evaluating decides nothing.',
+  },
 ]
 
 export default function App() {
@@ -227,7 +247,10 @@ export default function App() {
   const openGovernanceReview = (source: string) => {
     navigate('governance', { source })
   }
-  const page = PAGES.find(p => p.route === route) ?? PAGES[0]
+  // The gate console page exists only when its flag is on — checked per render (not module
+  // scope) so vi.stubEnv works in tests, same as the WorkbenchScreen intent flags.
+  const pages = gateConsoleEnabled() ? PAGES : PAGES.filter(p => p.route !== 'gate')
+  const page = pages.find(p => p.route === route) ?? pages[0]
   return (
     <div className="shell">
       <aside className="rail">
@@ -239,7 +262,7 @@ export default function App() {
           </div>
         </div>
         <nav className="rail-nav" aria-label="Primary">
-          {PAGES.map(p => (
+          {pages.map(p => (
             <button
               key={p.route}
               type="button"
@@ -283,6 +306,7 @@ export default function App() {
           <GovernanceReviewScreen initialSource={params.get('source') ?? ''} />
         )}
         {route === 'dashboard' && <GovernanceDashboardScreen onReview={openGovernanceReview} />}
+        {route === 'gate' && gateConsoleEnabled() && <GateEvaluationScreen />}
         {route === 'workbench' && <WorkbenchScreen />}
       </main>
     </div>

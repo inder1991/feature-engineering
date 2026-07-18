@@ -30,6 +30,7 @@ from featuregen.intake.llm import LLMClient, compute_input_hash
 from featuregen.overlay.upload.contract._serial import actor_json as _actor_json
 from featuregen.overlay.upload.contract.author import ContractDraft, draft_contract
 from featuregen.overlay.upload.contract.gate1 import (
+    _intent_scoped_applicability_enabled,
     build_considered_set,
     chosen_feature,
     gate1_choice,
@@ -420,7 +421,12 @@ def _scoped_considered_set(body: ConsideredSetIn, conn: _Conn, identity: _Identi
                                    # 3B.4: the telemetry flag gates PERSISTENCE, independent of the
                                    # compile flag — read ONLY here so the planner stays pure.
                                    persist=os.environ.get(
-                                       "FEATUREGEN_INTENT_SHADOW_TELEMETRY", "0") == "1")
+                                       "FEATUREGEN_INTENT_SHADOW_TELEMETRY", "0") == "1",
+                                   # 3C.1 run provenance: the OTHER two intent flags, recorded on the
+                                   # dispatch manifest (read here, in the route, like the two above —
+                                   # the planner stays pure and only stamps what it is handed).
+                                   scoped_applicability=_intent_scoped_applicability_enabled(),
+                                   ranking=_intent_ranking_enabled())
         except Exception:                    # shadow must NEVER affect the live response
             logger.exception("shadow planner dispatch failed")
     return response
