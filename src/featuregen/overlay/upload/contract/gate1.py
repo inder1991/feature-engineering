@@ -9,7 +9,9 @@ without a recorded choice here**, in both definition and hypothesis-only modes.
 from __future__ import annotations
 
 import json
+import logging
 import os
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import timedelta
@@ -28,7 +30,21 @@ from featuregen.overlay.upload.feature_assist import (
     recommend_set,
     set_signals,
 )
-from featuregen.overlay.upload.planner.plan_envelope import PlanEnvelopeV1
+from featuregen.overlay.upload.planner.contracts import (
+    BindingPlanningResultV1,
+    BindingPlanV1,
+    ContractResolutionStatus,
+    PathResolutionStatus,
+    ReasonCode,
+)
+from featuregen.overlay.upload.planner.declarations import CompileBudget, build_compiler_context
+from featuregen.overlay.upload.planner.plan import plan_bindings
+from featuregen.overlay.upload.planner.plan_envelope import (
+    PlanEnvelopeV1,
+    plan_envelope_from_result,
+)
+from featuregen.overlay.upload.planner.scope import resolve_catalog_scope
+from featuregen.overlay.upload.planner.shadow import COMPILE_BUDGET, MAX_COMPILES_PER_RUN
 from featuregen.overlay.upload.taxonomy.applicability import ApplicabilityResult
 from featuregen.overlay.upload.taxonomy.ranking_signals import binding_quality
 from featuregen.overlay.upload.templates import (
@@ -37,6 +53,14 @@ from featuregen.overlay.upload.templates import (
     Template,
     ground_all,
 )
+
+logger = logging.getLogger(__name__)
+
+# 3C.2a — the fail-closed cross-catalog invariant. On a live entity-scoped run EVERY customer-visible
+# cross-catalog feature must have a governed physical plan, so an LLM alternative whose derives span
+# more than one catalog (which has NO such plan) can never be a recommendation — it is surfaced as a
+# rejection carrying this reason string instead.
+GOVERNED_CROSS_CATALOG_PLAN_REQUIRED = "governed_cross_catalog_plan_required"
 
 
 class Gate1Error(Exception):
@@ -185,10 +209,136 @@ def _templates_to_ground(intent: Intent,
     return ALL_TEMPLATES
 
 
+# ── Phase-3C.2a Task 5: the LIVE governed cross-catalog lens ───────────────────────────────────────
+# On a flag-on-and-activation-approved entity-scoped run (no single catalog to ground on), the governed
+# cross-catalog PLANNER — not the LLM — is the authority for cross-catalog features: every option it
+# surfaces carries a governed physical plan, and every LLM alternative that spans >1 catalog is rejected
+# (it has no such plan). Authority is a STRUCTURED FIELD on the idea (origin / path_authority), NEVER the
+# lens name. The route resolves the flag; the builder is handed the resolved ``is_live`` boolean.
+def _plan_read_set_pairs(plan: BindingPlanV1) -> tuple[tuple[str, str], ...]:
+    """The (catalog_source, object_ref) pairs the governed plan READS — its physical read-set (every
+    column the contract would touch: ingredients + join/bridge keys + anchors), falling back to the
+    ingredient bindings when a plan carries no read-set. Deduped + sorted so the idea is deterministic."""
+    if plan.physical_read_set is not None and plan.physical_read_set.columns:
+        pairs = {(c.catalog_source, c.object_ref) for c in plan.physical_read_set.columns}
+    else:
+        pairs = {(b.bound_catalog_source, b.bound_object_ref) for b in plan.ingredient_bindings}
+    return tuple(sorted(pairs))
+
+
+def _governed_rejection_reason(result: BindingPlanningResultV1) -> str:
+    """The primary reason a recipe has no SELECTED RESOLVED governed cross-catalog contract: the best
+    compiled-but-unresolved plan's contract reason, else the fail-closed source→target REJECT reason,
+    else a result-level assembler reason (the tier-1 selection reasons are stripped — they say nothing
+    about the cross-catalog outcome), else the observed contract status."""
+    pid = result.selected_contract_physical_plan_id
+    if pid is not None:
+        plan = next((p for p in result.candidate_plans if p.physical_plan_id == pid), None)
+        if plan is not None and plan.contract_primary_reason_code is not None:
+            return plan.contract_primary_reason_code.value
+    for p in result.candidate_plans:
+        if (p.path_resolution_status is PathResolutionStatus.source_to_target_rejected
+                and p.primary_reason_code is not None):
+            return p.primary_reason_code.value
+    cross = [rc for rc in result.reason_codes
+             if rc not in (ReasonCode.selected_best_single_catalog,
+                           ReasonCode.ambiguous_multiple_equal_plans)]
+    if cross:
+        return cross[0].value
+    return result.contract_result_status.value
+
+
+def _governed_idea_from_result(result: BindingPlanningResultV1, template: Template,
+                               target_entity: str) -> FeatureIdea | None:
+    """A SELECTED RESOLVED governed contract plan → a Gate-#1 :class:`FeatureIdea` carrying the exact
+    compiled plan envelope (so drafting reconstructs the governed path, never a permissive one) and the
+    STRUCTURED provenance (``origin`` / ``path_authority``). None when the run has no resolved contract
+    plan — the caller then surfaces a rejection instead."""
+    if (result.contract_result_status is not ContractResolutionStatus.resolved
+            or result.selected_contract_physical_plan_id is None):
+        return None
+    plan = next((p for p in result.candidate_plans
+                 if p.physical_plan_id == result.selected_contract_physical_plan_id), None)
+    if plan is None:
+        return None
+    envelope = plan_envelope_from_result(result)
+    if envelope is None:   # a resolved contract always projects an envelope; fail closed if it cannot
+        return None
+    pairs = _plan_read_set_pairs(plan)
+    rationale = (f"governed cross-catalog plan for {template.id} at {target_entity} grain")[:_MAX_RATIONALE]
+    return FeatureIdea(
+        name=template.id, description=template.intent,
+        derives_from=[ref for _cs, ref in pairs], aggregation=template.aggregation,
+        grain_table=None, derives_pairs=pairs, verification="DESIGN-CHECKED", critic_note="",
+        rationale=rationale, plan_envelope=envelope,
+        origin="governed_planner", path_authority="governed_cross_catalog")
+
+
+def _governed_cross_catalog_options(conn, *, target_entity: str, eligible_recipe_ids,
+                                    roles=(), now, templates: Sequence[Template] | None = None,
+                                    ) -> tuple[list[FeatureIdea], list[dict]]:
+    """Resolve the run scope ONCE, compile each eligible recipe's binding plan (compile ON), and split
+    the outcomes: a SELECTED RESOLVED contract plan becomes a governed :class:`FeatureIdea`; anything
+    unresolved becomes a rejection dict ``{lens, reason, recipe_id}`` carrying its primary reason code.
+    A per-recipe savepoint isolates a planner DB error (it becomes a rejection, never poisons the
+    request txn nor 500s the whole considered set)."""
+    roles = tuple(roles)
+    tmpls = templates if templates is not None else ALL_TEMPLATES
+    by_id = {t.id: t for t in tmpls}
+    scope = resolve_catalog_scope(conn, roles=roles, target_entity=target_entity, now=now)
+    compile_ctx = build_compiler_context(conn, scope, roles, now)
+    budget = CompileBudget(remaining=MAX_COMPILES_PER_RUN,
+                           deadline_monotonic=time.monotonic() + COMPILE_BUDGET.total_seconds(),
+                           clock=time.monotonic)
+    ideas: list[FeatureIdea] = []
+    rejections: list[dict] = []
+    for rid in sorted(eligible_recipe_ids):
+        tmpl = by_id.get(rid)
+        if tmpl is None:
+            continue
+        try:
+            with conn.transaction():   # per-recipe savepoint — a planner DB error must not poison the txn
+                result = plan_bindings(conn, template=tmpl, target_entity=target_entity, scope=scope,
+                                       roles=roles, now=now, compile_ctx=compile_ctx, budget=budget)
+        except Exception:   # a genuine DB/planner failure for ONE recipe is a rejection, never a 500
+            logger.exception("governed cross-catalog planning failed for recipe %s", rid)
+            rejections.append({"lens": "governed", "reason": ReasonCode.planner_internal_error.value,
+                               "recipe_id": rid})
+            continue
+        idea = _governed_idea_from_result(result, tmpl, target_entity)
+        if idea is not None:
+            ideas.append(idea)
+        else:
+            rejections.append({"lens": "governed", "reason": _governed_rejection_reason(result),
+                               "recipe_id": rid})
+    return ideas, rejections
+
+
+def _reject_cross_catalog_llm(alternatives: list[FeatureSet]) -> tuple[list[FeatureSet], list[dict]]:
+    """Enforce the cross-catalog invariant over the LLM alternatives: an idea whose ``derives_pairs``
+    span more than one distinct catalog_source has no governed physical plan, so it is REMOVED from its
+    FeatureSet and returned as a rejection (reason ``governed_cross_catalog_plan_required``). Single-
+    catalog ideas are untouched — the FeatureSet keeps them in order, membership byte-identical."""
+    filtered: list[FeatureSet] = []
+    rejections: list[dict] = []
+    for s in alternatives:
+        kept: list[FeatureIdea] = []
+        for f in s.features:
+            if len({cs for cs, _ref in f.derives_pairs}) > 1:
+                rejections.append({"name": f.name, "reason": GOVERNED_CROSS_CATALOG_PLAN_REQUIRED,
+                                   "code": GOVERNED_CROSS_CATALOG_PLAN_REQUIRED})
+            else:
+                kept.append(f)
+        filtered.append(FeatureSet(lens=s.lens, features=kept))
+    return filtered, rejections
+
+
 def build_considered_set(conn, intent: Intent, client: LLMClient, *, entity: str | None = None,
                          catalog_source: str | None = None, roles=(), target_ref: str | None = None,
                          objective: str = "", feedback: str | None = None, now=None,
-                         applicability: ApplicabilityResult | None = None) -> ConsideredSet:
+                         applicability: ApplicabilityResult | None = None,
+                         is_live: bool = False, target_entity: str | None = None,
+                         templates: Sequence[Template] | None = None) -> ConsideredSet:
     """Discovery loop → validated alternatives; the anchor is the requester's definition run through the
     same validated loop (definition mode only). Every option shown to the human has passed the gauntlet.
     Persists the intent + target_ref (M6, BLOCKER 2) and the considered-set snapshot (BLOCKER 1) when the
@@ -197,7 +347,16 @@ def build_considered_set(conn, intent: Intent, client: LLMClient, *, entity: str
     ``applicability`` is the ONE applicability decision (computed once in the API layer, Task 7). When
     scoped grounding is enabled it narrows the template lens to the eligible recipe subset; either way it
     is carried through on the returned :class:`ConsideredSet` for the disposition stage (Task 5). The
-    builder is computation-only — it NEVER persists the confirmed scope (the API layer owns that)."""
+    builder is computation-only — it NEVER persists the confirmed scope (the API layer owns that).
+
+    ``is_live`` (3C.2a) is the ROUTE-resolved live-activation boolean — the builder NEVER reads the env
+    flag. On an entity-scoped run (``catalog_source is None``) with ``is_live`` set, the governed
+    cross-catalog planner runs at ``target_entity`` grain: its resolved plans become options (each idea
+    carrying ``origin='governed_planner'`` / ``path_authority='governed_cross_catalog'`` and the exact
+    plan envelope), its unresolved ones and every cross-catalog LLM alternative become rejections. With
+    ``is_live`` false the whole governed branch is skipped — byte-identical to today. ``templates``
+    (default ``ALL_TEMPLATES``) narrows the recipe registry the governed lens plans over (tests inject
+    a fixture template); it never affects the single-catalog template lens."""
     persist_intent(conn, intent, target_ref)
     # The prediction goal enriches the generation prompt (hypothesis = the causal premise; goal = what
     # we're predicting). Redacted with the same discipline as the hypothesis before it reaches the LLM,
@@ -229,6 +388,25 @@ def build_considered_set(conn, intent: Intent, client: LLMClient, *, entity: str
         if template_ideas:
             alternatives.append(FeatureSet(lens="templates", features=template_ideas))
         rejections.extend(template_rejections)
+    elif is_live:
+        # 3C.2a — the LIVE governed cross-catalog lens (entity-scoped: no single catalog to ground on).
+        # FIRST enforce the invariant over the LLM alternatives (a cross-catalog LLM idea has no governed
+        # plan → rejected), THEN append the governed planner's resolved plans as their own lens. Order
+        # matters: the governed ideas span >1 catalog by construction, so they must be appended AFTER the
+        # filter (never subjected to it). Authority rides on the ideas (origin/path_authority), not the
+        # lens name. This whole branch is skipped when the flag is off (is_live=False) — byte-identical.
+        alternatives, cross_catalog_rejections = _reject_cross_catalog_llm(alternatives)
+        rejections.extend(cross_catalog_rejections)
+        if target_entity is not None:   # a governed plan needs a target grain to plan toward
+            eligible = (applicability.eligible_ids if applicability is not None
+                        else frozenset(t.id for t in
+                                       (templates if templates is not None else ALL_TEMPLATES)))
+            governed_ideas, governed_rejections = _governed_cross_catalog_options(
+                conn, target_entity=target_entity, eligible_recipe_ids=eligible, roles=roles,
+                now=now, templates=templates)
+            if governed_ideas:
+                alternatives.append(FeatureSet(lens="templates", features=governed_ideas))
+            rejections.extend(governed_rejections)
     anchor: FeatureIdea | None = None
     if intent.intake_mode == "definition":
         ideas = recommend_features(

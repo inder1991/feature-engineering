@@ -50,6 +50,11 @@ from featuregen.overlay.upload.contract.intake import (
     redact_free_text,
     submit_intent,
 )
+from featuregen.overlay.upload.contract.live_activation import (
+    LiveActivationNotReady,
+    is_live_cross_catalog_enabled,
+    require_live_ready,
+)
 from featuregen.overlay.upload.contract.review import author_contract
 from featuregen.overlay.upload.contract.scope_records import (
     dimension_provenance,
@@ -213,6 +218,14 @@ def _intent_ranking_enabled() -> bool:
     return os.environ.get("FEATUREGEN_INTENT_RANKING", "0") == "1"
 
 
+def _live_cross_catalog_flag_on() -> bool:
+    """3C.2a — the LIVE governed cross-catalog kill switch, read ONLY in the route (the builder is handed
+    the resolved boolean, never the env). OFF by default → no readiness query, no governed lens, byte-
+    identical to today. On its own it is necessary-but-not-sufficient: activation approval is still
+    required (see :func:`require_live_ready`), so a flag-on-but-unapproved deployment fails closed 503."""
+    return os.environ.get("FEATUREGEN_INTENT_LIVE_CROSS_CATALOG", "0") == "1"
+
+
 def rankable_recipe_ids(dispositions: list[RecipeEvaluation]) -> list[str]:
     """The precomputed rankable set: the recipe ids whose rolled-up disposition is ``ELIGIBLE``.
 
@@ -359,6 +372,16 @@ def _scoped_considered_set(body: ConsideredSetIn, conn: _Conn, identity: _Identi
         if owned is None:
             raise HTTPException(status_code=404, detail="unknown intent")
         intent = replace(intent, intent_id=body.intent_id)
+    # 3C.2a — the LIVE governed cross-catalog readiness interlock. On an entity-scoped run (no single
+    # catalog) with the live flag ON, the deployment MUST be activation-approved BEFORE any LLM/planner
+    # dispatch — fail-closed 503, NEVER a legacy fallback, and BEFORE any run/scope is minted or
+    # persisted. The env flag is read ONLY here; the builder is handed the resolved boolean below. Flag
+    # unset → no readiness query at all (``is_live_cross_catalog_enabled`` short-circuits), byte-identical.
+    if body.catalog_source is None and _live_cross_catalog_flag_on():
+        try:
+            require_live_ready(conn)
+        except LiveActivationNotReady as e:
+            raise HTTPException(status_code=503, detail=str(e)) from e
     # 4. Mint the generation run — the run is born only NOW, when the human commits to generate.
     generation_run_id = mint_id("grun")
     # 5. Persist the confirmed scope in the API layer, BEFORE the builder (the run→scope linkage exists
@@ -377,10 +400,16 @@ def _scoped_considered_set(body: ConsideredSetIn, conn: _Conn, identity: _Identi
     # 6. Compute applicability ONCE — grounding AND the disposition lens consume this single object.
     applicability = applicability_result(scope)
     now = datetime.now(UTC)
+    # 3C.2a: the resolved live-activation boolean threads into the builder so the governed cross-catalog
+    # lens runs ONLY when the deployment is flag-on-and-approved (short-circuits to False when the flag is
+    # unset — no DB query). ``target_entity`` is the confirmed-scope grain the governed planner plans to,
+    # exactly the entity the log-only shadow planner already uses below.
+    is_live = is_live_cross_catalog_enabled(conn)
     cs = build_considered_set(
         conn, intent, client, entity=body.entity, catalog_source=body.catalog_source,
         roles=identity.role_claims, target_ref=body.target_ref, objective=body.objective,
-        feedback=body.feedback, now=now, applicability=applicability)
+        feedback=body.feedback, now=now, applicability=applicability,
+        is_live=is_live, target_entity=scope.target_entity)
     # 7. The per-stage disposition lens over the SAME applicability + this run's grounding outcome.
     dispositions = evaluate_dispositions(
         applicability, cs.grounded_template_ids, cs.rejected_template_ids,
