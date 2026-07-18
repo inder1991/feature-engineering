@@ -28,6 +28,10 @@ class Settings:
     # the gate cannot sign (forge) its own PASS — only this public half is a config input, and it
     # is NEVER embedded in the artifact. Fail-closed: verification refuses when unset.
     intent_gate_public_key: str | None
+    # The producing code version stamped on each shadow run's dispatch manifest (the "cohort" the 3C.1
+    # gate windows over). Set at deploy (e.g. the git SHA). Unset -> the sentinel "unset", which the
+    # window selector treats as an uncertified cohort (fail-closed exclusion).
+    producer_commit: str
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -36,6 +40,7 @@ class Settings:
             test_dsn=os.environ.get("FEATUREGEN_TEST_DSN"),
             audit_hmac_key=os.environ.get("FEATUREGEN_AUDIT_HMAC_KEY"),
             intent_gate_public_key=os.environ.get("FEATUREGEN_INTENT_GATE_PUBLIC_KEY"),
+            producer_commit=os.environ.get("FEATUREGEN_PRODUCER_COMMIT", "unset"),
         )
 
 

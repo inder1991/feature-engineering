@@ -37,3 +37,16 @@ def make_client(conn):
 @pytest.fixture
 def client(make_client):
     return make_client()
+
+
+@pytest.fixture
+def admin_headers():
+    """Stub identity carrying the raw `platform-admin` role CLAIM — the exact claim
+    `require_confirmer` gates on (hyphen, not the functional `platform_admin` role)."""
+    return {"X-User": "priya", "X-Roles": "platform-admin"}
+
+
+@pytest.fixture
+def non_admin_headers():
+    """Stub identity WITHOUT the confirmer claim (functional read-only role only)."""
+    return {"X-User": "v", "X-Roles": "catalog_viewer"}

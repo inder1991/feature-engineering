@@ -24,6 +24,7 @@ from featuregen.overlay.upload.planner.shadow_report import (
     build_population_report,
     clopper_pearson_upper,
     evaluate_gate,
+    evaluate_machine_gate,
     report_input_digest,
     required_shapes_for_bound,
     statistical_bound,
@@ -253,6 +254,19 @@ def test_population_report_numerator_denominator(db):
     assert report.reconcile_complete and report.persistence_loss == 0
 
 
+def test_population_report_default_family_is_total_over_unknown_recipe_ids(db):
+    # The WORM store outlives code versions: a persisted run may reference a template id the current
+    # taxonomy no longer knows. The DEFAULT family lookup (what the /gate/evaluate route uses) must
+    # keep that unit IN the population under a sentinel family — never KeyError, never a silent drop.
+    _cross_seed(db)
+    run_shadow_planner(db, eligible_recipe_ids=frozenset({"t_roll"}), target_entity="account",
+                       roles=(), run_id="fam_def", now=_NOW, templates=(_txn_template(),),
+                       compile_contracts=True, persist=True)
+    report = build_population_report(db, ["fam_def"])          # no family_of override
+    assert report.denominator == 1                              # included, not dropped
+    assert report.sample_units[0].family == "unknown_template"  # observable sentinel stratum
+
+
 def test_template_not_found_trips_gate1_even_though_reconcile_is_complete(db):
     # Minor-1: an eligible recipe with no template is RECORDED (reconcile stays complete), so without
     # this driver a taxonomy drift would silently drop it from the denominator. Gate 1 must catch it.
@@ -288,3 +302,31 @@ def test_pg_e2e_run_to_report_to_signed_gate(db, monkeypatch):
     assert verify_report(art.canonical_bytes(), sig)        # EVALUATOR side (config public key)
     assert art.report_input_digest == report_input_digest(report)
     assert evaluate_gate(inputs).gate1_capture   # capture integrity held over the real persisted run
+
+
+# ── the machine-only gate (3C.1) ──
+def _machine_inputs(**over):
+    base = dict(report=_report(), gold_report=EvalReport(results=(CaseResult("c1", True, False, ()),)),
+                stability=StabilityResult(stable=True, compared=3, mismatched_keys=()), drift_ratio=1.0)
+    base.update(over)
+    return base
+
+
+def test_machine_gate_passes_when_all_five_hold():
+    assert evaluate_machine_gate(**_machine_inputs()).passed
+
+
+def test_machine_gate_fails_on_empty_population():
+    res = evaluate_machine_gate(**_machine_inputs(report=_report(denominator=0)))
+    assert not res.gate1_capture and not res.passed   # no evidence is not a pass
+
+
+@pytest.mark.parametrize("over", [
+    {"report": _report(incomplete_count=1)},           # capture integrity
+    {"report": _report(operationally_unmeasured_count=1)},  # map exhaustiveness
+    {"gold_report": EvalReport(results=(CaseResult("c1", False, True, ("x",)),))},  # gold false-resolve
+    {"stability": StabilityResult(stable=False, compared=0, mismatched_keys=())},   # double-compile
+    {"drift_ratio": 0.5},                              # drift
+])
+def test_each_machine_sub_gate_failure_fails_the_verdict(over):
+    assert not evaluate_machine_gate(**_machine_inputs(**over)).passed

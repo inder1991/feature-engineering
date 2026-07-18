@@ -6,9 +6,11 @@ const API = 'http://localhost:8000'
 // /integrations (instances + their syncs + service discovery) and /syncs (preview + import) —
 // the flat /connectors path was removed in the two-tier restructure. /contract(s) is the governed
 // feature-contract flow; /graph is the lineage graph; /governance is the join confirm/reject
-// surface (the list rides /sources/{source}/governance/joins, already covered by /sources).
+// surface (the list rides /sources/{source}/governance/joins, already covered by /sources);
+// /gate is the authority-only Phase-3C.1 evaluation console (cohorts + evaluate).
 const API_PATHS = ['/uploads', '/search', '/sources', '/columns', '/join-path', '/features',
-  '/contract', '/contracts', '/graph', '/health', '/integrations', '/syncs', '/governance']
+  '/contract', '/contracts', '/graph', '/health', '/integrations', '/syncs', '/governance',
+  '/gate']
 
 export default defineConfig({
   plugins: [react()],

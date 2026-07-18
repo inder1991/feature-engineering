@@ -47,6 +47,8 @@ def run_shadow_planner(conn, *, eligible_recipe_ids: frozenset[str], target_enti
                        templates: tuple[Template, ...] | None = None,
                        compile_contracts: bool = False,
                        persist: bool = False,
+                       scoped_applicability: bool = False,
+                       ranking: bool = False,
                        monotonic: Callable[[], float] = time.monotonic
                        ) -> tuple[BindingPlanningResultV1, ...]:
     roles = tuple(roles)
@@ -55,7 +57,9 @@ def run_shadow_planner(conn, *, eligible_recipe_ids: frozenset[str], target_enti
     # `persist` (the telemetry flag), independent of the compile flag (F3).
     if persist:
         write_dispatch(conn, build_dispatch(run_id=run_id, eligible_recipe_ids=eligible_recipe_ids,
-                                            compile_flag=compile_contracts, telemetry_flag=True, now=now))
+                                            compile_flag=compile_contracts, telemetry_flag=True,
+                                            scoped_applicability_flag=scoped_applicability,
+                                            ranking_flag=ranking, now=now))
     compile_ctx = None
     budget: CompileBudget | None = None
     try:

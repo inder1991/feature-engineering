@@ -22,7 +22,8 @@ def _dispatch(run_id="grun_1", recipe_ids=("r1", "r2"), recipe_hash="rh") -> Dis
     return DispatchRecordV1(
         generation_run_id=run_id, eligible_recipe_ids=tuple(recipe_ids), recipe_hash=recipe_hash,
         expected_count=len(recipe_ids), invocation_predicate="entity_scoped", compile_flag=True,
-        telemetry_flag=True, applicability_version="1.0.0", producer_commit="abc",
+        telemetry_flag=True, scoped_applicability_flag=False, ranking_flag=False,
+        applicability_version="1.0.0", producer_commit="abc",
         compiler_versions={"planner": "1.0.0"}, created_at=_NOW)
 
 
