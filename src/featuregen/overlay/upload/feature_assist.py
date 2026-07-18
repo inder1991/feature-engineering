@@ -22,8 +22,17 @@ import psycopg
 from featuregen.contracts.envelopes import IdentityEnvelope
 from featuregen.intake.llm import LLMClient
 from featuregen.overlay.catalog_changes import drift_watermark
+from featuregen.overlay.upload.column_authority import (  # noqa: F401 — Tasks 6-10 dispositions
+    logical_ref_of,
+    read_column_facts,
+)
 from featuregen.overlay.upload.enrich_llm import audited_structured_call
-from featuregen.overlay.upload.join_path import JoinStep, find_join_path
+from featuregen.overlay.upload.join_path import (  # noqa: F401 — JoinOutcome/classify: Task 10
+    JoinOutcome,
+    JoinStep,
+    classify_join_path,
+    find_join_path,
+)
 from featuregen.overlay.upload.read_scope import allowed_sensitivities
 
 logger = logging.getLogger(__name__)
@@ -190,42 +199,78 @@ def _table_has_as_of(conn, catalog_source: str, table: str) -> bool:
     return row is not None
 
 
+# Aggregation words that REQUIRE a numeric measure (ratio/mean/sum/…); count/count_distinct do not.
+_NUMERIC_OP_WORDS = ("sum", "total", "avg", "average", "mean", "ratio", "rate", "net_",
+                     "percent", "pct", "std", "variance", "median")
+
+
+def _needs_numeric(aggregation: str | None) -> bool:
+    a = (aggregation or "").lower()
+    return any(w in a for w in _NUMERIC_OP_WORDS)
+
+
+def _window_of(aggregation: str | None) -> str | None:
+    m = _WINDOW_RE.search((aggregation or "").lower())
+    return m.group(0) if m else None
+
+
+def _as_of_column_ref(conn, catalog_source: str, table: str) -> str | None:
+    row = conn.execute(
+        "SELECT object_ref FROM graph_node WHERE catalog_source = %s AND table_name = %s "
+        "AND is_as_of = true AND kind = 'column' LIMIT 1", (catalog_source, table)).fetchone()
+    return row[0] if row else None
+
+
+def _grain_column_ref(conn, catalog_source: str, table: str) -> str | None:
+    row = conn.execute(
+        "SELECT object_ref FROM graph_node WHERE catalog_source = %s AND table_name = %s "
+        "AND is_grain = true AND kind = 'column' LIMIT 1", (catalog_source, table)).fetchone()
+    return row[0] if row else None
+
+
 def _validate_idea(conn, raw: dict, known: set[str], src_of: dict[str, set[str]],
-                   target_ref: str | None, now: datetime | None, fresh_within: timedelta):
-    """The deterministic gauntlet. Returns (FeatureIdea, 'ok') or (None, reason). Runs every pass so a
-    leaky / stale / unsafe candidate can NEVER be returned. `src_of` maps object_ref -> the catalog
-    source(s) it lives in within the candidate context, used to resolve each derive's catalog (B3)."""
+                   target_ref: str | None, now: datetime | None, fresh_within: timedelta,
+                   *, roles: Iterable[str] = ()):
+    """The deterministic TRI-STATE gauntlet (spec §2). Returns (FeatureIdea, None) for DESIGN_CHECKED
+    or NEEDS_EXTERNAL_VALIDATION — the returned idea carries validation_status + typed requirements +
+    resolved operands — or (None, Rejection) for REJECTED (deterministically invalid / unauthorized).
+    `roles` gates cross-table join authority (a read-scope-DENIED hop rejects). `src_of` maps
+    object_ref -> the candidate catalog source(s), used to resolve each derive's catalog (B3)."""
     derives = [d for d in raw.get("derives_from", []) if d in known]
     if not derives:
         return None, Rejection(RejectCode.UNGROUNDED, "ungrounded")
-    # B3: resolve each derive to exactly one catalog_source from the candidate context. If a bare
-    # object_ref maps to >1 catalog we cannot know which the LLM meant -> fail closed.
     pairs: list[tuple[str, str]] = []
     for d in derives:
         srcs = src_of.get(d, set())
         if len(srcs) != 1:
             return None, Rejection(RejectCode.AMBIGUOUS_CATALOG, f"ambiguous catalog for {d}")
         pairs.append((next(iter(srcs)), d))
-    # M4: verify each resolved (catalog_source, object_ref) pair actually EXISTS as a graph node.
-    # `src_of` may be client-supplied over HTTP (the MCV path) — a fabricated catalog must fail closed,
-    # not sail through freshness on a catalog the column doesn't live in. _column_meta is pair-scoped.
     meta = _column_meta(conn, pairs)
     for src, d in pairs:
         if d not in meta or meta[d]["catalog_source"] != src:
             return None, Rejection(RejectCode.UNKNOWN_COLUMN, f"unknown column {d} in catalog {src}")
     if target_ref and target_ref in derives:
         return None, Rejection(RejectCode.LEAKAGE, "leaks target")
-    if now is not None:   # freshness — every RESOLVED source must be fresh
+    if now is not None:
         for src in {p[0] for p in pairs}:
             wm = drift_watermark(conn, src)
             if wm is None or wm < now - fresh_within:
                 return None, Rejection(RejectCode.STALE, f"stale source: {src}")
-    if _is_additive_unsafe(raw.get("aggregation")):   # aggregation safety (additivity) — M2 widened
+
+    aggregation = raw.get("aggregation")
+    grain_table = raw.get("grain_table")
+    catalogs = {p[0] for p in pairs}   # noqa: F841 — Tasks 8/10 dispositions consume it
+    requirements: list[Requirement] = []
+    grain_operand: tuple[str, str] | None = None
+    time_operand: tuple[str, str] | None = None
+
+    # ── disposition: additivity (Task 7 REPLACES this block) ──
+    if _is_additive_unsafe(aggregation):
         for d in derives:
             if meta.get(d, {}).get("additivity") in ("semi_additive", "non_additive"):
                 return None, Rejection(RejectCode.ADDITIVITY, f"unsafe additive aggregation of {d}")
-    # unit/currency safety: combining columns of mixed scale (dollars vs cents) / currency is
-    # silently wrong (migration 0957). Reject when the derives span >1 distinct non-empty unit/currency.
+
+    # ── disposition: unit / currency (Task 9 AUGMENTS this block) ──
     units = {meta[d]["unit"] for d in derives if meta.get(d, {}).get("unit")}
     currencies = {meta[d]["currency"] for d in derives if meta.get(d, {}).get("currency")}
     if len(units) > 1:
@@ -233,17 +278,23 @@ def _validate_idea(conn, raw: dict, known: set[str], src_of: dict[str, set[str]]
                                f"mixed units {sorted(units)}; aggregation would be silently wrong")
     if len(currencies) > 1:
         return None, Rejection(RejectCode.MIXED_CURRENCY, f"mixed currencies {sorted(currencies)}")
-    if _is_windowed(raw.get("aggregation")):   # point-in-time: a windowed feature needs an as-of column
+
+    # ── disposition: point-in-time (Task 8 REPLACES this block) ──
+    if _is_windowed(aggregation):
         for src, d in pairs:
-            # object_ref is "[catalog.]schema.table.column"; table is the second-to-last segment.
             if d.count(".") >= 2 and not _table_has_as_of(conn, src, d.split(".")[-2]):
                 return None, Rejection(RejectCode.NO_POINT_IN_TIME,
                                        f"no point-in-time basis for {d} (future-leakage risk)")
+
+    # ── finalize (tri-state) ──
+    status = "NEEDS_EXTERNAL_VALIDATION" if requirements else "DESIGN_CHECKED"
     return FeatureIdea(
         name=str(raw.get("name", "")), description=str(raw.get("description", "")),
-        derives_from=derives, aggregation=raw.get("aggregation"),
-        grain_table=raw.get("grain_table"), derives_pairs=tuple(pairs),
-        rationale=str(raw.get("rationale", ""))), None   # §14.2 one-line causal rationale (opportunistic)
+        derives_from=derives, aggregation=aggregation, grain_table=grain_table,
+        derives_pairs=tuple(pairs), rationale=str(raw.get("rationale", "")),
+        operation_kind=_norm_agg(aggregation), measure_refs=tuple(pairs),
+        grain_ref=grain_operand, time_ref=time_operand, window=_window_of(aggregation),
+        grouping_refs=(), validation_status=status, requirements=tuple(requirements)), None
 
 
 def _norm_agg(aggregation: str | None) -> str:
@@ -305,10 +356,10 @@ def _critique_candidates(conn, client: LLMClient, objective: str,
 
 def _vet(conn, raw: dict, known: set[str], src_of: dict[str, set[str]], registered: set,
          accepted: list[FeatureIdea], seen: set[str], avoid: list[dict],
-         target_ref, now, fresh_within) -> FeatureIdea | None:
+         target_ref, now, fresh_within, *, roles: Iterable[str] = ()) -> FeatureIdea | None:
     """Gauntlet + dedup for one raw candidate. Returns the FeatureIdea to accept, or None (recording a
     structured rejection in `avoid`). Shared by the generation loop and the single critic-fix pass."""
-    idea, rej = _validate_idea(conn, raw, known, src_of, target_ref, now, fresh_within)
+    idea, rej = _validate_idea(conn, raw, known, src_of, target_ref, now, fresh_within, roles=roles)
     if rej is not None:
         avoid.append({"name": raw.get("name", ""), "reason": rej.message, "code": rej.code})
         return None
@@ -329,6 +380,7 @@ def _fix_pass(conn, client: LLMClient, objective: str, accepted: list[FeatureIde
               issues: dict[str, str], menu: list[dict], known: set[str],
               src_of: dict[str, set[str]], registered: set,
               target_ref, now, fresh_within, feedback: str | None = None, *,
+              roles: Iterable[str] = (),
               actor: IdentityEnvelope | None = None) -> list[FeatureIdea]:
     """One LLM-1 revision pass: keep the critic-clean features; ask LLM-1 to revise the flagged ones
     given the critic's notes; gauntlet-validate the revisions. Returns the merged list. `feedback`
@@ -344,7 +396,8 @@ def _fix_pass(conn, client: LLMClient, objective: str, accepted: list[FeatureIde
     out = _call_raw(conn, client, "overlay.feature.recommend", "feature_recommend_v1",
                     "feature_ideas", objective, inputs, actor=actor)
     for raw in out.get("features", []):
-        idea = _vet(conn, raw, known, src_of, registered, keep, seen, [], target_ref, now, fresh_within)
+        idea = _vet(conn, raw, known, src_of, registered, keep, seen, [], target_ref, now,
+                    fresh_within, roles=roles)
         if idea is not None:
             keep.append(idea)
             seen.add(idea.name)
@@ -391,7 +444,7 @@ def _generate(conn, objective: str, client: LLMClient, *,
             break
         for raw in proposed:
             idea = _vet(conn, raw, known, src_of, registered, accepted, seen, avoid,
-                        target_ref, now, fresh_within)
+                        target_ref, now, fresh_within, roles=roles)
             if idea is not None:
                 accepted.append(idea)
                 seen.add(idea.name)
@@ -405,7 +458,8 @@ def _generate(conn, objective: str, client: LLMClient, *,
                 break                          # critic satisfied — nothing to fix
             if i < critic_reviews - 1:         # not the last allowed review -> let LLM-1 fix, re-review
                 accepted = _fix_pass(conn, client, objective, accepted, issues, menu, known, src_of,
-                                     registered, target_ref, now, fresh_within, feedback, actor=actor)
+                                     registered, target_ref, now, fresh_within, feedback,
+                                     roles=roles, actor=actor)
 
     # ---- Phase 3: forward to the human; residual critic notes ride along as ADVISORY ----
     if issues:
@@ -530,7 +584,8 @@ def refine_idea(conn, idea: dict, instruction: str, client: LLMClient, *,
         return None, {"name": str(idea.get("name", "")),
                       "reason": "no revision was produced", "code": RejectCode.NO_REVISION}
     raw = proposed[0] if isinstance(proposed[0], dict) else {}
-    revised, rej = _validate_idea(conn, raw, known, src_of, target_ref, now, fresh_within)
+    revised, rej = _validate_idea(conn, raw, known, src_of, target_ref, now, fresh_within,
+                                  roles=roles)
     if rej is not None or revised is None:
         rej = rej or Rejection(RejectCode.NO_REVISION, "no revision was produced")
         return None, {"name": str(raw.get("name", "")), "reason": rej.message, "code": rej.code}
