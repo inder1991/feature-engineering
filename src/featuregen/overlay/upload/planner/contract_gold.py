@@ -25,11 +25,16 @@ from featuregen.overlay.upload.enrich import content_hash
 from featuregen.overlay.upload.graph import build_graph
 from featuregen.overlay.upload.planner import contracts as c
 from featuregen.overlay.upload.planner.cause import ResolutionCause, contextual_cause
-from featuregen.overlay.upload.planner.contract_eval import ActualVerdict, ExpectedVerdict
+from featuregen.overlay.upload.planner.contract_eval import (
+    ActualVerdict,
+    CompileVerdict,
+    ExpectedVerdict,
+)
 from featuregen.overlay.upload.planner.contracts import AggregationFunction, ReasonCode
 from featuregen.overlay.upload.planner.declarations import build_compiler_context, compile_contract
 from featuregen.overlay.upload.planner.plan import _envelope
 from featuregen.overlay.upload.planner.scope import resolve_catalog_scope
+from featuregen.overlay.upload.planner.shadow_store import CompileStatus
 from featuregen.overlay.upload.templates import Need, Template
 
 GOLD_SET_VERSION = "1.0.0"
@@ -199,3 +204,19 @@ def run_gold_case(conn, case: GoldCase, *, seed: Callable[[object], None] = _see
         contract_resolution_status=str(compiled.contract_resolution_status),
         primary_reason_code=primary, cause=actual_cause.value)
     return case.case_id, expected, actual
+
+
+def compile_gold_case(conn, case: GoldCase, *, seed: Callable[[object], None] = _seed) -> CompileVerdict:
+    """Compile one gold case through the REAL pipeline and return its verdict as a CompileVerdict for the
+    double-compile determinism check (compile_status is complete because the case's plan is
+    source_to_target_resolved and is compiled here)."""
+    seed(conn)
+    scope = resolve_catalog_scope(conn, roles=(), target_entity="customer", now=_GOLD_NOW)
+    ctx = build_compiler_context(conn, scope, (), _GOLD_NOW)
+    if case.agg:
+        ctx = dataclasses.replace(ctx, agg_declarations=dict(case.agg))
+    plan = _build_plan(ctx, case)
+    compiled = compile_contract(conn, ctx, plan, _TEMPLATE,
+                                base_envelope=_envelope(conn, scope, case.case_id, "customer"))
+    return CompileVerdict(key=case.case_id, compile_status=CompileStatus.complete,
+                          contract_id=compiled.contract_id, declaration_status=str(compiled.declaration_status))
