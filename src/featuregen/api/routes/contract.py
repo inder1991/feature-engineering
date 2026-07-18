@@ -28,7 +28,12 @@ from featuregen.contracts.envelopes import IdentityEnvelope
 from featuregen.idgen import mint_id
 from featuregen.intake.llm import LLMClient, compute_input_hash
 from featuregen.overlay.upload.contract._serial import actor_json as _actor_json
-from featuregen.overlay.upload.contract.author import ContractDraft, draft_contract
+from featuregen.overlay.upload.contract.author import (
+    ContractDraft,
+    CrossCatalogPlanRequired,
+    StalePlan,
+    draft_contract,
+)
 from featuregen.overlay.upload.contract.gate1 import (
     _intent_scoped_applicability_enabled,
     build_considered_set,
@@ -61,6 +66,8 @@ from featuregen.overlay.upload.contract.scope_records import (
     record_confirmed_scope,
     record_recognition_attempt,
 )
+from featuregen.overlay.upload.planner.contracts import ReplayFreshness
+from featuregen.overlay.upload.planner.plan_envelope import recheck_plan_freshness
 from featuregen.overlay.upload.planner.shadow import run_shadow_planner
 from featuregen.overlay.upload.taxonomy.applicability import (
     ConfirmedScope,
@@ -549,8 +556,17 @@ def draft(body: DraftReqIn, conn: _Conn, identity: _Identity, client: _LLM) -> d
     record_gate1_choice(conn, body.intent_id, chosen_source=body.chosen_source,
                         chosen_option_id=body.chosen_option_id, actor=identity.subject, why=body.why)
     target = intent_target_ref(conn, body.intent_id)   # server truth, not client-supplied
-    d = draft_contract(conn, feature, client, roles=identity.role_claims, target_ref=target,
-                       actor=identity)
+    # 3C.2a fail-closed: a governed feature drafts its compiled plan envelope's path, rechecked for
+    # freshness under the REQUEST's roles (the set it compiled under — else it would spuriously drift);
+    # a drifted plan → 409 (regenerate, never a substitute path), and a cross-catalog feature with no
+    # governed envelope → 422 (it must be regenerated under the governed planner, never permissively bridged).
+    try:
+        d = draft_contract(conn, feature, client, roles=identity.role_claims, target_ref=target,
+                           actor=identity)
+    except StalePlan as e:
+        raise HTTPException(status_code=409, detail="plan stale, regenerate") from e
+    except CrossCatalogPlanRequired as e:
+        raise HTTPException(status_code=422, detail=str(e)) from e
     d, unresolved = author_contract(conn, d, client, now=datetime.now(UTC), actor=identity)
     return {"draft": d, "unresolved": unresolved, "intent_id": body.intent_id}
 
@@ -593,6 +609,17 @@ def confirm(body: DraftIn, conn: _Conn, identity: _Identity) -> Contract:
             or frozenset(draft.derives_pairs) != frozenset(chosen.derives_pairs)
             or (draft.aggregation or "") != (chosen.aggregation or "")):
         raise HTTPException(status_code=422, detail="the draft does not match the chosen feature")
+    # 3C.2a fail-closed at the GOVERNING write: re-run the freshness recheck against the SERVER-
+    # reconstructed chosen feature's plan envelope (never the client body) under the request's roles —
+    # a plan that drifted between draft and confirm must never silently finalize (409, regenerate). A
+    # cross-catalog feature that reached confirm with no governed envelope is refused outright.
+    env = chosen.plan_envelope
+    if env is not None:
+        if recheck_plan_freshness(conn, env, identity.role_claims) is not ReplayFreshness.current:
+            raise HTTPException(status_code=409, detail="plan stale, regenerate")
+    elif len({cs for cs, _ref in chosen.derives_pairs}) > 1:
+        raise HTTPException(status_code=422,
+                            detail="cross-catalog feature requires a governed plan envelope")
     target = intent_target_ref(conn, body.intent_id)   # SERVER truth — never the client body
     try:
         return confirm_contract(conn, draft, actor=identity.subject, now=datetime.now(UTC),

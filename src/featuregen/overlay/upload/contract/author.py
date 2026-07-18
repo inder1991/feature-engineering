@@ -13,10 +13,28 @@ from dataclasses import dataclass
 
 from featuregen.intake.llm import LLMClient
 from featuregen.overlay.upload.enrich_llm import audited_enrich_call
-from featuregen.overlay.upload.entity import find_cross_catalog_path
 from featuregen.overlay.upload.feature_assist import FeatureIdea
 from featuregen.overlay.upload.join_path import find_join_path
+from featuregen.overlay.upload.planner.contracts import ReplayFreshness
+from featuregen.overlay.upload.planner.plan_envelope import recheck_plan_freshness
 from featuregen.overlay.upload.read_scope import allowed_sensitivities
+
+
+class StalePlan(Exception):
+    """3C.2a fail-closed: a governed feature's pinned plan envelope no longer matches the CURRENT
+    catalog state (freshness ≠ ``current``). Drafting/confirming must REGENERATE the plan, never
+    substitute a recomputed permissive path — so this is raised, never swallowed into a fallback."""
+
+    def __init__(self, freshness: ReplayFreshness, physical_plan_id: str) -> None:
+        self.freshness = freshness
+        self.physical_plan_id = physical_plan_id
+        super().__init__(f"governed plan {physical_plan_id} is {freshness.value}; regenerate")
+
+
+class CrossCatalogPlanRequired(Exception):
+    """3C.2a fail-closed: a cross-catalog feature (its ``derives_pairs`` span >1 catalog_source) reached
+    drafting with NO governed plan envelope. It must NEVER author a permissive ``find_cross_catalog_path``
+    — a governed cross-catalog feature has to be regenerated under the governed planner."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -63,33 +81,61 @@ def _column_defs(conn, pairs: tuple[tuple[str, str], ...], roles: Iterable[str])
 
 def _join_path(conn, grain_table: str | None, pairs: tuple[tuple[str, str], ...],
                roles: Iterable[str] = ()) -> tuple[dict, ...]:
-    """The deterministic join path from the grain table to each other table the feature reads. Single-
-    catalog uses the column-level `find_join_path`; CROSS-catalog uses `entity.find_cross_catalog_path`,
-    so a feature spanning catalogs records how its tables bridge via the shared entity (Customer)."""
+    """The deterministic SINGLE-catalog join path from the grain table to each other table the feature
+    reads (column-level `find_join_path`). 3C.2a: a CROSS-catalog feature never authors a permissive path
+    here — `draft_contract` either rebinds it to its governed plan envelope's ordered_path or fail-closes
+    it (a cross-catalog feature must be regenerated under the governed planner, never permissively
+    bridged). A multi-catalog pair set reaching this function is therefore a fail-closed error."""
     if not grain_table or not pairs:
         return ()
     tables = sorted({(cs, ref.split(".")[-2]) for cs, ref in pairs if ref.count(".") >= 2})
     if not tables:
         return ()
     catalogs = {cs for cs, _ in tables}
+    if len(catalogs) != 1:                              # cross-catalog: never a permissive path here
+        raise CrossCatalogPlanRequired(
+            "cross-catalog feature has no governed plan envelope; refusing a permissive join path")
+    catalog = next(iter(catalogs))
     steps: list[dict] = []
-    if len(catalogs) == 1:                              # single-catalog: column-level path
-        catalog = next(iter(catalogs))
-        for _, t in tables:
-            if t != grain_table:
-                for s in (find_join_path(conn, catalog, grain_table, t, roles=roles) or []):
-                    steps.append({"kind": "join", "from": s.from_ref, "to": s.to_ref,
-                                  "cardinality": s.cardinality})
-        return tuple(steps)
-    # cross-catalog: bridge each other-catalog table to the grain via the entity graph (wires entity.py)
-    grain_catalog = next((cs for cs, t in tables if t == grain_table), tables[0][0])
-    for cs, t in tables:
-        if (cs, t) != (grain_catalog, grain_table):
-            for xs in (find_cross_catalog_path(conn, grain_catalog, grain_table, cs, t,
-                                               roles=roles) or []):   # CrossStep, not JoinStep
-                steps.append({"kind": xs.kind, "from": f"{xs.from_source}.{xs.from_table}",
-                              "to": f"{xs.to_source}.{xs.to_table}", "via": xs.detail})
+    for _, t in tables:
+        if t != grain_table:
+            for s in (find_join_path(conn, catalog, grain_table, t, roles=roles) or []):
+                steps.append({"kind": "join", "from": s.from_ref, "to": s.to_ref,
+                              "cardinality": s.cardinality})
     return tuple(steps)
+
+
+def _envelope_join_path(ordered_path: tuple[str, ...]) -> tuple[dict, ...]:
+    """3C.2a — a governed feature's drafted join path IS its compiled envelope's ``ordered_path`` (never
+    a recomputed permissive path). Each pinned ``catalog:segment_kind:ref`` segment becomes one step dict
+    carrying the raw segment, so ``tuple(s['segment'] for s in join_path)`` reconstructs ``ordered_path``
+    EXACTLY — the invariant that a governed draft path equals the plan's, byte-for-byte."""
+    steps: list[dict] = []
+    for seg in ordered_path:
+        catalog_source, _, rest = seg.partition(":")
+        segment_kind, _, ref = rest.partition(":")
+        steps.append({"kind": "governed_segment", "segment": seg, "catalog_source": catalog_source,
+                      "segment_kind": segment_kind, "ref": ref})
+    return tuple(steps)
+
+
+def _draft_join_path(conn, feature: FeatureIdea, roles: tuple[str, ...],
+                     catalogs: set[str]) -> tuple[dict, ...]:
+    """3C.2a rebinding + freshness recheck — the single decision point for a draft's join path:
+      * a governed feature (carrying a ``plan_envelope``) drafts its EXACT compiled ``ordered_path`` and
+        is refused (`StalePlan`) if its pinned plan has drifted — rechecked under the SAME ``roles`` the
+        plan compiled with (a mismatched role set would recompute a different fingerprint → spurious drift);
+      * a cross-catalog feature with NO governed envelope is fail-closed (`CrossCatalogPlanRequired`);
+      * a single-catalog feature with no envelope uses the permissive column-level path exactly as before."""
+    if feature.plan_envelope is not None:
+        fresh = recheck_plan_freshness(conn, feature.plan_envelope, roles)
+        if fresh is not ReplayFreshness.current:
+            raise StalePlan(fresh, feature.plan_envelope.physical_plan_id)
+        return _envelope_join_path(feature.plan_envelope.ordered_path)
+    if len(catalogs) > 1:
+        raise CrossCatalogPlanRequired(
+            "cross-catalog feature has no governed plan envelope; regenerate under the governed planner")
+    return _join_path(conn, feature.grain_table, feature.derives_pairs, roles)
 
 
 def draft_contract(conn, feature: FeatureIdea, client: LLMClient, *, actor=None,
@@ -97,8 +143,14 @@ def draft_contract(conn, feature: FeatureIdea, client: LLMClient, *, actor=None,
     """Author a contract draft for the chosen feature. Structured facts deterministic (catalog-scoped via
     the feature's resolved pairs, B3); the definition narrative LLM-authored via the audited seam (metadata
     only, read-scoped). `target_ref` is carried on the draft so the leakage check cannot no-op."""
+    roles = tuple(roles)
     catalogs = {cs for cs, _ in feature.derives_pairs}
     grain_catalog = next(iter(catalogs)) if len(catalogs) == 1 else None   # single-catalog grain
+    # 3C.2a — bind the join path BEFORE the LLM call so a stale / ungoverned cross-catalog feature
+    # fail-closes fast (no wasted authoring dispatch): a governed feature drafts its compiled envelope's
+    # ordered_path (rechecked for freshness under `roles`), a cross-catalog feature with no envelope is
+    # rejected, and a single-catalog feature is unchanged (see :func:`_draft_join_path`).
+    join_path = _draft_join_path(conn, feature, roles, catalogs)
     definition = audited_enrich_call(
         conn, client, task="overlay.contract.draft", prompt_id="overlay_contract_v1",
         schema_id="overlay_contract",
@@ -113,5 +165,4 @@ def draft_contract(conn, feature: FeatureIdea, client: LLMClient, *, actor=None,
         aggregation=feature.aggregation,
         as_of_column=_as_of_column(conn, feature.grain_table, grain_catalog),
         derives_from=list(feature.derives_from), target_ref=target_ref,
-        derives_pairs=feature.derives_pairs,
-        join_path=_join_path(conn, feature.grain_table, feature.derives_pairs, roles))
+        derives_pairs=feature.derives_pairs, join_path=join_path)

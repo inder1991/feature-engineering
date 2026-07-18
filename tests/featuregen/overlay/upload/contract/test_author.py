@@ -1,4 +1,6 @@
 """Phase 3 — contract authoring: deterministic facts + LLM-authored definition (audited)."""
+import pytest
+
 from featuregen.intake.llm import FakeLLM, FakeResponse
 from featuregen.overlay.upload.canonical import CanonicalRow
 from featuregen.overlay.upload.contract.author import draft_contract
@@ -86,8 +88,12 @@ def test_draft_authors_the_join_path(db):
     assert step["from"] and step["to"] and "accounts" in (step["from"] + step["to"])
 
 
-def test_draft_authors_cross_catalog_join_path_via_entity(db):
-    # entity.py wired: a feature spanning two catalogs gets an entity-bridged join path authored
+def test_draft_rejects_cross_catalog_feature_without_a_governed_envelope(db):
+    # 3C.2a (Task 6) supersedes the old permissive entity-bridged cross-catalog draft: a feature spanning
+    # two catalogs with NO governed plan envelope must NEVER author a permissive find_cross_catalog_path
+    # — it is fail-closed (regenerate under the governed planner). See test_draft_rebinding for the
+    # governed-envelope rebinding path.
+    from featuregen.overlay.upload.contract.author import CrossCatalogPlanRequired
     build_graph(db, "deposits", [
         CanonicalRow("deposits", "accounts", "cust_ref", "integer", entity="Customer"),
         CanonicalRow("deposits", "accounts", "balance", "numeric")])
@@ -99,6 +105,5 @@ def test_draft_authors_cross_catalog_join_path_via_entity(db):
                           derives_pairs=(("deposits", "public.accounts.balance"),
                                          ("cards", "public.card_accounts.spend")))
     client = FakeLLM(script={"overlay.contract.draft": FakeResponse(output={"definition": "x"})})
-    draft = draft_contract(db, feature, client)
-    assert any(step.get("kind") == "entity" and step.get("via") == "Customer"
-               for step in draft.join_path)   # accounts --entity(Customer)--> card_accounts
+    with pytest.raises(CrossCatalogPlanRequired):
+        draft_contract(db, feature, client)
