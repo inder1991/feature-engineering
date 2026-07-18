@@ -4,18 +4,27 @@ import { useCallback, useMemo, useSyncExternalStore } from 'react'
 
 export type Route =
   | 'overview' | 'upload' | 'search' | 'review' | 'semantics' | 'workbench' | 'registry'
-  | 'integrations' | 'governance' | 'dashboard'
+  | 'integrations' | 'governance' | 'dashboard' | 'gate'
 
 const ROUTES: readonly string[] =
   ['overview', 'upload', 'search', 'review', 'semantics', 'workbench', 'registry',
     'integrations', 'governance', 'dashboard']
+
+// The internal gate console (Phase 3C.1) is an authority-only surface behind its own Vite flag.
+// Checked at CALL time (not module scope) so vi.stubEnv works per-test, mirroring the
+// WorkbenchScreen intent-flag helpers. With the flag off, '#/gate' parses like any unknown hash
+// — the route falls back to 'overview' and the screen is unreachable.
+export function gateConsoleEnabled(): boolean {
+  return import.meta.env.VITE_INTENT_GATE_CONSOLE === '1'
+}
 
 export function parseHash(hash: string): { route: Route; params: URLSearchParams } {
   const raw = hash.replace(/^#\/?/, '')
   const q = raw.indexOf('?')
   const path = q === -1 ? raw : raw.slice(0, q)
   const query = q === -1 ? '' : raw.slice(q + 1)
-  const route = ROUTES.includes(path) ? (path as Route) : 'overview'
+  const known = ROUTES.includes(path) || (path === 'gate' && gateConsoleEnabled())
+  const route = known ? (path as Route) : 'overview'
   return { route, params: new URLSearchParams(query) }
 }
 
