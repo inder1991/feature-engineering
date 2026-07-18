@@ -28,6 +28,7 @@ from featuregen.overlay.upload.feature_assist import (
     recommend_set,
     set_signals,
 )
+from featuregen.overlay.upload.planner.plan_envelope import PlanEnvelopeV1
 from featuregen.overlay.upload.taxonomy.applicability import ApplicabilityResult
 from featuregen.overlay.upload.taxonomy.ranking_signals import binding_quality
 from featuregen.overlay.upload.templates import (
@@ -267,7 +268,11 @@ def _idea_json(f: FeatureIdea | None) -> dict | None:
             "verification": f.verification,   # honest §14.5 stamp surfaced at Gate #1 (item 4)
             "critic_note": f.critic_note,     # advisory residual critic note — the human weighs it
             "rationale": f.rationale,         # §14.2 one-line causal 'why' — audit the logic first
-            "derives_pairs": [list(p) for p in f.derives_pairs]}   # for server-side reconstruction
+            "derives_pairs": [list(p) for p in f.derives_pairs],   # for server-side reconstruction
+            # 3C.2a carry-forward: provenance + the governed plan envelope (null for LLM/single-catalog
+            # options), persisted with the considered set so drafting reconstructs the EXACT plan.
+            "origin": f.origin, "path_authority": f.path_authority,
+            "plan_envelope": f.plan_envelope.to_json() if f.plan_envelope else None}
 
 
 def _snapshot(conn, cs: ConsideredSet) -> dict:
@@ -311,7 +316,10 @@ def _idea_from_json(d: dict) -> FeatureIdea:
     return FeatureIdea(
         name=d["name"], description="", derives_from=list(d.get("derives_from", [])),
         aggregation=d.get("aggregation"), grain_table=d.get("grain_table"),
-        derives_pairs=tuple(tuple(p) for p in d.get("derives_pairs", [])))
+        derives_pairs=tuple(tuple(p) for p in d.get("derives_pairs", [])),
+        # 3C.2a: absent keys (pre-3C snapshots) deserialize to the defaults — behaviour-neutral.
+        origin=d.get("origin", "llm"), path_authority=d.get("path_authority", "single_or_llm"),
+        plan_envelope=PlanEnvelopeV1.from_json(d["plan_envelope"]) if d.get("plan_envelope") else None)
 
 
 def chosen_feature(conn, intent_id: str, chosen_source: str,

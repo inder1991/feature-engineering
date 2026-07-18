@@ -24,6 +24,7 @@ from featuregen.intake.llm import LLMClient
 from featuregen.overlay.catalog_changes import drift_watermark
 from featuregen.overlay.upload.enrich_llm import audited_structured_call
 from featuregen.overlay.upload.join_path import JoinStep, find_join_path
+from featuregen.overlay.upload.planner.plan_envelope import PlanEnvelopeV1
 from featuregen.overlay.upload.read_scope import allowed_sensitivities
 
 logger = logging.getLogger(__name__)
@@ -137,6 +138,13 @@ class FeatureIdea:
     # §14.2 reason->rules: a one-line causal rationale for WHY this feature operationalizes the
     # hypothesis, surfaced at Gate #1 so the reviewer audits the logic before any code exists.
     rationale: str = ""
+    # 3C.2a — governed-plan carry-forward + provenance. All defaulted so every existing constructor
+    # and persisted snapshot stays valid: an LLM/single-catalog idea has no envelope, origin "llm",
+    # and today's permissive path authority. A governed cross-catalog option carries the exact
+    # compiled plan envelope so drafting NEVER recomputes a permissive path.
+    plan_envelope: PlanEnvelopeV1 | None = None
+    origin: str = "llm"
+    path_authority: str = "single_or_llm"
 
 
 def _column_meta(conn, pairs: list[tuple[str, str]]) -> dict[str, dict]:
