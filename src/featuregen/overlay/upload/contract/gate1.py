@@ -16,6 +16,10 @@ from datetime import timedelta
 
 from featuregen.intake.llm import LLMClient
 from featuregen.overlay.upload.contract._serial import actor_json as _actor_json
+from featuregen.overlay.upload.contract._serial import (
+    requirements_from_json,
+    requirements_to_json,
+)
 from featuregen.overlay.upload.contract.intake import Intent, redact_free_text
 from featuregen.overlay.upload.feature_assist import (
     FeatureIdea,
@@ -268,6 +272,8 @@ def _idea_json(f: FeatureIdea | None) -> dict | None:
             "verification": f.verification,   # honest §14.5 stamp surfaced at Gate #1 (item 4)
             "critic_note": f.critic_note,     # advisory residual critic note — the human weighs it
             "rationale": f.rationale,         # §14.2 one-line causal 'why' — audit the logic first
+            "validation_status": f.validation_status,   # 3A-ii honest tri-state (NEW axis)
+            "requirements": requirements_to_json(f.requirements),
             "derives_pairs": [list(p) for p in f.derives_pairs]}   # for server-side reconstruction
 
 
@@ -312,7 +318,12 @@ def _idea_from_json(d: dict) -> FeatureIdea:
     return FeatureIdea(
         name=d["name"], description="", derives_from=list(d.get("derives_from", [])),
         aggregation=d.get("aggregation"), grain_table=d.get("grain_table"),
-        derives_pairs=tuple(tuple(p) for p in d.get("derives_pairs", [])))
+        derives_pairs=tuple(tuple(p) for p in d.get("derives_pairs", [])),
+        verification=d.get("verification", "DESIGN-CHECKED"),      # was dropped pre-3A-ii
+        critic_note=d.get("critic_note", ""),                      # was dropped pre-3A-ii
+        rationale=d.get("rationale", ""),                          # was dropped pre-3A-ii
+        validation_status=d.get("validation_status", "DESIGN_CHECKED"),   # 3A-ii honest state
+        requirements=requirements_from_json(d.get("requirements", [])))
 
 
 def chosen_feature(conn, intent_id: str, chosen_source: str,

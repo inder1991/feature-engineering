@@ -5,13 +5,16 @@ the underscore VALIDATION_STATES vocab — a NEW axis, separate from the hyphena
 stamp) and `contract.requirements` (jsonb). Later tasks extend this file with the draft/confirm
 round-trip; per RF-I3 only symbols that exist at this task are imported here.
 """
+import json
+
 import psycopg
 import pytest
 
 from featuregen.intake.llm import FakeLLM, FakeResponse
 from featuregen.overlay.upload.canonical import CanonicalRow
 from featuregen.overlay.upload.contract.author import draft_contract
-from featuregen.overlay.upload.feature_assist import FeatureIdea, Requirement
+from featuregen.overlay.upload.contract.gate1 import ConsideredSet, _snapshot, chosen_feature
+from featuregen.overlay.upload.feature_assist import FeatureIdea, FeatureSet, Requirement
 from featuregen.overlay.upload.graph import build_graph
 
 
@@ -92,3 +95,47 @@ def test_draft_defaults_are_design_checked_and_empty(db):
     draft = draft_contract(db, plain, client)
     assert draft.validation_status == "DESIGN_CHECKED"
     assert draft.requirements == ()
+
+
+def _seed_intent(db, intent_id: str) -> None:
+    """contract_considered.intent_id is FK-constrained (contract_considered_intent_id_fk, migration
+    0972) — a snapshot insert must reference a REAL intent row."""
+    db.execute(
+        "INSERT INTO contract_intent (intent_id, hypothesis, intake_mode) "
+        "VALUES (%s, 'h', 'hypothesis')", (intent_id,))
+
+
+def test_snapshot_round_trips_validation_status_and_requirements(db):
+    _bank(db)
+    _seed_intent(db, "intent-rt")
+    cs = ConsideredSet("intent-rt", None, [FeatureSet("templates", [_nev_idea()])], None)
+    db.execute(
+        "INSERT INTO contract_considered (intent_id, considered) VALUES (%s, %s::jsonb)",
+        ("intent-rt", json.dumps(_snapshot(db, cs))))
+    feat = chosen_feature(db, "intent-rt", "alternative", "avg_balance_90d")
+    assert feat is not None
+    assert feat.validation_status == "NEEDS_EXTERNAL_VALIDATION"
+    assert feat.requirements == (
+        Requirement("TYPE_IS_NUMERIC", ("bank", "public.accounts.balance"),
+                    "declared numeric; operational type unknown"),)
+
+
+def test_snapshot_restores_previously_dropped_verification_fields(db):
+    _bank(db)
+    _seed_intent(db, "intent-vf")
+    idea = FeatureIdea(
+        name="f", description="", derives_from=["public.accounts.balance"],
+        aggregation="avg_90d", grain_table="accounts",
+        derives_pairs=(("bank", "public.accounts.balance"),),
+        verification="DESIGN-CHECKED", critic_note="weak grain fit", rationale="proxy for churn")
+    cs = ConsideredSet("intent-vf", None, [FeatureSet("templates", [idea])], None)
+    db.execute(
+        "INSERT INTO contract_considered (intent_id, considered) VALUES (%s, %s::jsonb)",
+        ("intent-vf", json.dumps(_snapshot(db, cs))))
+    feat = chosen_feature(db, "intent-vf", "alternative", "f")
+    assert feat is not None
+    assert feat.verification == "DESIGN-CHECKED"
+    assert feat.critic_note == "weak grain fit"      # was silently dropped pre-3A-ii
+    assert feat.rationale == "proxy for churn"       # was silently dropped pre-3A-ii
+    assert feat.validation_status == "DESIGN_CHECKED"
+    assert feat.requirements == ()
