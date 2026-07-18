@@ -1,199 +1,216 @@
-# Phase-2: Make Stored Enrichment Flow to Its Consumers — Design (rev. 2)
+# Phase-2: Make Stored Enrichment Flow to Its Consumers — Design (rev. 3)
 
 **Date:** 2026-07-18
-**Status:** Draft for user review — **revised** to incorporate a 12-finding adversarial review (3 Critical, 9 Important). All 12 accepted; changes noted inline as `[Fn]`.
+**Status:** Draft for user review — **revised twice**. Rev. 2 incorporated a 12-finding review; rev. 3
+incorporates a further 14-finding review (2 Critical, 12 Important), all accepted. Findings tagged `[Gn]`.
 **Predecessor:** Phase-1 LLM-enrichment hardening (branch `phase1-llm-enrichment-hardening`, merge-ready).
 
 ## Problem
 
-The same catalog column is represented across `CanonicalRow`, `GlossaryRecord`, the enrichment maps, and
-the governed evidence, but never assembled into one record — so information exists yet isn't used. Three
-consumption gaps remain after Phase-1: no shared column view; Pass B loses/accepts-unvalidated
-table-synthesis fields; and the feature generator (`feature_assist._menu`, `feature_assist.py:117`) sends
-the LLM only `object_ref/table/column/concept/domain`, discarding the definition it reads and never
-selecting the governed fields.
+The same catalog column is spread across `CanonicalRow`, `GlossaryRecord`, the enrichment maps, and the
+governed evidence, never assembled — so information exists yet isn't used. Three consumption gaps remain:
+no shared column view; Pass B loses/accepts-unvalidated table-synthesis fields; and the feature generator
+(`feature_assist._menu`, `:117`) discards the enrichment.
+
+**Scope note (head-architect flag):** three review rounds deepened this materially. Slice 3 now carries a
+tri-state result model, an expanded validator, deterministic relevance, and a real-provider eval — it is
+large and may itself decompose at plan time. The **external-attestation ingestion far-end** (a signed
+type/grain/temporal attestation flowing back in) is **defined as a contract here but its consuming endpoint
+is deferred** to a follow-on; Phase-2 produces the requirements + result state, not the round-trip.
+
+## Foundational model changes (used across slices)
+
+### A. Tri-state feature result + external-validation contract [G2, Critical]
+
+This platform cannot inspect physical data, and FTR deliberately stores `data_type=unknown` (declared type
+is only a hint). `_is_numeric` gates numeric/ratio strategies on the **operational** type
+(`feature_assist.py:577`), and `FeatureIdea.verification` is a single `"DESIGN-CHECKED"` stamp (`:133`) —
+so a binary accept/reject validator would leave **every FTR numeric feature permanently rejected**. That is
+a dead end, not honesty.
+
+Replace the binary stamp with a **tri-state** result:
+- **`DESIGN_CHECKED`** — structurally safe with the authority available now (no external checks needed).
+- **`NEEDS_EXTERNAL_VALIDATION`** — structurally plausible, carrying a **machine-readable requirements
+  list** the external execution platform must satisfy against real data. Requirement vocabulary (initial):
+  `TYPE_IS_NUMERIC`, `GRAIN_IS_UNIQUE`, `TEMPORAL_IS_POPULATED`, `TEMPORAL_LAG_BOUNDED`,
+  `JOIN_CONNECTIVITY`, `CURRENCY_CONSISTENT`. Each requirement names the column(s)/join it concerns.
+- **`REJECTED`** — deterministic invalidity (missing column, target leakage, unmapped concept, additive
+  aggregation over a governed-non-additive column).
+
+"An unverified type is not a wrong type." The external platform consumes the requirements and returns a
+**signed type/grain/temporal attestation**; on attestation a feature promotes out of
+`NEEDS_EXTERNAL_VALIDATION`. Phase-2 defines the requirements + attestation **shape**; its ingestion
+endpoint is the deferred far-end.
+
+### B. `OperationalColumnFacts` authority adapter [G1, Critical]
+
+"Present on `graph_node`" ≠ operational. Of the fields the validator wants, **only `additivity`** has a
+decision policy + link (`additivity_decision_id`, migration `0984`); `entity`, `unit`, `currency`, and
+`data_type` are **flat columns with no decision governance**, and `is_feature_eligible` returns a bare bool
+(`field_resolution.py:360`) — not value + provenance.
+
+Introduce a field-specific `OperationalColumnFacts(field) -> {value, authority, provenance}` adapter.
+**Authority tiers:** `governed` (`additivity` via its decision; `is_grain`/`is_as_of` via a **non-null
+`*_fact_event_id`**), `file_declared` (a flat CSV value with no decision), `hint` (`declared_type`), `none`.
+**Validator rule (fail-closed):** any signal may *reject* or *tighten*; only a `governed` value may *clear*
+a required check or yield `DESIGN_CHECKED`; a `hint`/`file_declared` value that a check depends on yields a
+`NEEDS_EXTERNAL_VALIDATION` requirement instead. `declared_type` (hint) may reject a non-numeric operation
+but **never approves** a numeric one. Either add evidence/decision support for a field or it is a hint —
+never silently operational.
+
+### C. Field-aware feature-egress projection [G12, from rev.2 G2]
+
+`graph_node.definition` can be the **raw** technical-upload cell (`graph.py:248`), and the redactor
+(`enrich_llm.py:79`) covers only selected keys. So a dedicated projection sanitizes every outbound field,
+**by field type** (not one sanitizer for all strings, which would corrupt a column name):
+- **Free-text** (`definition`, `table_definition`, semantic prose) → `sanitize_definition`/`redact_text`.
+- **Structural** (`object_ref`, column/table names, types, enums, IDs) → **allowlist + bound**, never
+  sample-clause stripped (`sanitize.py:96`).
+Per-field **audit record**: `{path, sanitizer_version, state, removed_count}` (the sample stripper doesn't
+emit redaction spans, so we record a count, not spans). Fail-closed: a planted token in a raw graph
+definition, a nested field, and a table definition is absent from the payload **and** the recorded
+`llm_call` input.
+
+### D. Durable disposition store [G11]
+
+An invalid LLM value never becomes evidence, and `field_evidence` has no disposition field — so counters/
+logs are not a durable record. Persist per-field dispositions as **ingestion-run stage detail keyed by
+`(table, field)`**. **Status vocab:** `accepted`, `abstained`, `dropped_invalid`, `staled`. **Reason-code
+vocab:** `grain_col_not_in_table`, `grain_duplicate`, `grain_over_bound`, `role_off_vocab`,
+`entity_not_registered`, `basis_not_allowed`, `as_of_col_not_in_table`. Reviewer-visible.
+
+### E. Prompt/schema versioning seam [G13]
+
+`audited_structured_call`/`audited_batch_call` **hardcode** prompt+schema version 1 (`enrich_llm.py:390`).
+Add explicit `prompt_version`/`schema_version` parameters so a changed request shape ships a new version.
+Pass B input+vocab change → `overlay_table_synth*` **v2**; feature-gen menu change → `feature_recommend`
+**v2**, applied across recommendation, refinement, recipe, and feature-set paths, all under the flag.
 
 ## Architecture
 
-**One authority-aware column view, assembled once — but the graph persists only a SUBSET of it [F4].**
+The `ColumnMetadataView` is the in-memory ingest-time assembly; `graph_node` is a **lossy** projection of
+it (rev.2's projection matrix stands: `term_name`/`term_type`/`process_path`/synonyms/BIAN-FIBO/structured
+facets are **not** persisted, so Slice 3 uses only graph-persisted fields and reads governed values via the
+adapter in §B). Binding is single-schema-per-source today (`field_resolution.py:26`); the view keys by
+schema-preserving `logical_ref`, `(table,column)` valid **only under the FTR single-schema fence** [G-prev].
 
-The `ColumnMetadataView` is the in-memory ingest-time assembly. `graph_node` is a **lossy** projection of
-it: it persists the operational + search fields, **not** the full structured sidecar. So the view is a
-*superset*, and Slice 3 (which reads the graph) may only use what the graph actually persists, loading
-governed/authority values through decision/fact readers rather than the ingest-time builder.
+## Slice 1 — ColumnMetadataView + schema-safe attachable binding + egress foundation
 
-**Projection matrix [F4]** — where each field lives (`graph_node` column refs from migrations `0945`/
-`0951`/`0953`/`0957`/`0986`/`1000`):
+**Gate:** schema-safe *attachable* binding and the field-aware egress projection exist and are tested.
 
-| Field | Ingest view | graph_node | Read for Slice 3 via |
-|---|---|---|---|
-| concept, domain, definition | ✓ | ✓ (flat) | graph (definition **sanitized on egress**, [F2]) |
-| operational_type (`data_type`), declared_type | ✓ | ✓ (flat) | graph |
-| semantic_terms | ✓ (structured) | ✓ **flattened, search-only** | graph (bounded, sanitized) |
-| entity, additivity, unit, currency | ✓ (if known) | ✓ (flat) | **authority-qualified** read [F1] |
-| is_grain, is_as_of (+ `*_fact_event_id`) | — (governed) | ✓ (flat + provenance) | fact-provenance read [F1] |
-| table_role, primary_entity, event_or_snapshot | — (Pass B) | ✓ (flat, RECOMMENDATION-ceiling) | advisory only |
-| term_name, term_type, process_path, synonyms, bian/fibo, logical_representation | ✓ | **NOT persisted** | not available graph-side |
-
-Consequence: Slice 3 **cannot** compute "counts by term-type" from the graph (`term_type` isn't persisted)
-[F4]. Its per-table summary uses only graph-persisted fields (domain/concept/entity). If term-type
-grouping is later wanted, Slice 1 adds a small additive `term_type` column — flagged as an explicit,
-optional sub-decision, not assumed.
-
-**Binding scope [F5].** Graph identity is public-flattened and **single-schema-per-source** today
-(`field_resolution.py:26`). The view is keyed internally by the schema-preserving `logical_ref`; the
-within-upload `(table, column)` index is valid **only under the FTR single-schema fence** — the spec states
-this scope explicitly. Multi-schema keying by `logical_ref` is deferred with the rest of multi-schema.
-
-**Two honest verified tiers (unchanged, tightened by [F1]).** Operational fields (`is_grain`/`is_as_of`
-with fact provenance; `entity`/`additivity`/`unit`/`currency`) can be genuinely operational; the three
-table advisory fields are RECOMMENDATION-ceilinged (`field_policies.py:125`) and are **always** advisory —
-they feed generation, never a safety check.
-
-## Cross-cutting invariants (every slice)
-
-- **Sanitized recursive feature-egress projection [F2] (Critical).** `graph_node.definition` can be the
-  **raw** technical-upload cell (`graph.py:248`: `r.definition or draft`), and the current redactor
-  (`enrich_llm.py:79`) only covers selected top-level keys + `column_profiles[].business_definition`. So
-  **no field leaves for the LLM without passing a dedicated, path-aware, recursive sanitizer**
-  (`strip_sample_values` + `redact_free_text`) with per-value bounds and an audit span. This covers the new
-  `table_definition`, `columns[].definition`, and `semantic_terms`. Raw graph definitions are **never** sent
-  as-is. Fail-closed tests: a planted PII/sample token in a graph definition, a nested field, and a table
-  definition must all be absent from the outbound payload and from the recorded `llm_call` input.
-- **Read-scope preservation [F3] (Critical).** All column-derived context (per-table grain columns, as-of
-  column, summaries, counts) is assembled **from the already-authorized candidate set** returned by
-  `_candidate_columns` (which filters by the caller's allowed sensitivities, `feature_assist.py:96`) — never
-  a second unrestricted graph query. A restricted column excluded from the menu must not reappear via
-  `grain_columns`/`availability_column`/summary/count.
-- **Authority-qualified safety [F1] (Critical).** The deterministic validator must not treat a display-only
-  graph value as operational truth. It reads governed values through the authority path
-  (`is_feature_eligible` / decision + fact readers) and emits explicit rejection/unresolved codes for
-  unverified operational type, absent grain, unverified temporal basis, unverified additivity, and missing
-  join connectivity. `declared_type_hint` is a generation hint and **never** approves a numeric operation.
-- **Rollout + replay versioning [F11].** Slice 3 changes feature-generation behavior, so it ships behind a
-  **default-off** `feature-context` flag (the "flag-off byte-for-byte" claim applies only to Pass B/Pass C;
-  corrected). Every changed request shape bumps its prompt/schema/config version (Pass B input+vocab change
-  → new `overlay_table_synth*` prompt/schema version; feature-gen menu change → new
-  `feature_recommend_v#`).
-- **Metadata-only egress, operational_type ≠ declared_type, binding-only matching** — as before.
-
-## Slice 1 — Shared ColumnMetadataView + schema-safe binding + egress foundation
-
-**Deliverable gate:** schema-safe binding and the sanitized egress projection exist and are tested.
-
-- **`overlay/upload/column_view.py`** — `ColumnMetadataView` (frozen; `operational_type` and
-  `declared_type` as two fields) and `TableMetadataView` (carries `table_definition` from
-  `GlossaryRecord(is_table=True)`). Not a DB identity.
-- **Reconciled facets [F9].** The view carries the **reconciled** `semantic_type`/`logical_representation`
-  — it applies Phase-1's `reconcile_profile(...)` against `declared_type` + column (the same reconciliation
-  the evidence layer uses, `ingest.py:767`), so Pass B never sees a facet the evidence layer withheld.
-  Raw facets, if ever carried, are tagged non-authoritative.
-- **Builder** keyed by `logical_ref` (with the `(table, column)` FTR-scope index [F5]); respects the
-  Phase-1 egress bounds.
-- **Dual-type roster contract [F6].** Replacing the single `type` key breaks the wide-table path, which
-  builds `name:type` from `d.get('type')` (`table_synth.py:251`). Define an explicit roster representation
-  carrying **both** types — e.g. `column:operational/declared` — and update the narrow descriptor, the wide
-  roster, the chunk-summary path, the egress allowlist (`_COLUMN_PROFILE_KEYS`), the Pass B prompt
-  (`templates.py`), and their tests **together**.
-- **Sanitized egress projection [F2]** (foundation used by Slices 1 & 3): a `feature_egress_view(...)` that
-  recursively sanitizes + bounds every string field. Pass B item metadata gains a sanitized
-  `table_definition`.
+- **`overlay/upload/column_view.py`** — `ColumnMetadataView` (operational_type + declared_type separate)
+  and `TableMetadataView` (`table_definition` from `GlossaryRecord(is_table=True)`).
+- **Attachable binding, not just keying [G7].** The builder consumes **validated** bindings and applies
+  `may_attach`, and reuses the existing rule that **skips a table term whose schema disagrees with its
+  columns**. Keying by `logical_ref` alone does not prevent a mismatched/unvalidated sidecar from attaching.
+- **Reconciled facets [G-prev/G9].** The view carries `reconcile_profile(...)`-reconciled
+  `semantic_type`/`logical_representation` (the same withholding the evidence layer applies,
+  `ingest.py:767`) — never the raw contradictory facet.
+- **Structured roster [G5].** Do **not** use a `column:operational/declared` string — column names may
+  contain `:`/`/`. Roster entries are structured objects `{column, operational_type, declared_type}`. The
+  narrow descriptor, the wide roster (`table_synth.py:251`), **and** the wide phase-2 final synthesis
+  (`table_synth.py:275`, which must **explicitly propagate `table_definition`** — adding it to the initial
+  item does not carry it through) all use the structured form.
+- **Egress projection (§C)** is delivered here as the shared foundation.
 
 ## Slice 2 — Per-field Pass B validation + stale-value lifecycle + durable dispositions
 
-**Deliverable gate:** field validation, stale-value lifecycle, and durable per-field dispositions.
+**Gate:** field validation, a stale-value lifecycle that clears the *graph*, and durable dispositions.
 
-All in `table_synth.py` `make_ref_accept` (+ persistence in `_propose_table_facts`) and new versioned
-vocab constants.
+Implementation map [G6]: **prompt** = `table_synth.py:290` `_INSTRUCTION` (+ `_SUMMARY_INSTRUCTION`,
+`_SYNTH_WIDE_INSTRUCTION`); **schemas** = `enrich_llm.py` `_SCHEMAS` (`overlay_table_synth`/`_batch`/
+`_summary_batch`, `:269/289/307`); **egress allowlist** = `_COLUMN_PROFILE_KEYS`; plus tests — all changed
+together.
 
-1. **Full grain decoupling.** A hallucinated grain column drops **only** grain (record a reason), keeping
-   `table_role`/`primary_entity`/`event_or_snapshot`/as-of — today it discards the whole synthesis
-   (`table_synth.py:126`). Empty grain stays an honest abstention.
-2. **Versioned `table_role` vocabulary [F8].** The **current** live values are `fact` (13×), `dim` (2×),
-   `reference` (2×). A new vocab must not silently drop them. Ship a **versioned** vocab with explicit
-   aliases (`dim`→`dimension`; `fact`→`event_fact`/`snapshot_fact` resolved via `event_or_snapshot`, else
-   retained as `fact`; `reference` kept), and update the **prompt (`templates.py`) + schema + tests in one
-   change**. An unmapped value is treated as **abstention** (dropped), never written as active advisory
-   evidence.
-3. **`primary_entity` gated through `known_entities()`** (`taxonomy/dimensions.py`, 38 governed entities),
-   clear-on-miss — the established pattern (`recognition.py:246`). Not the relationship `entity_registry.py`.
-4. **`event_or_snapshot` normalization** on the synthesis path (`make_summary_accept` already does it).
-5. **Stale-value lifecycle [F7].** Today advisory evidence is written only for a truthy value
-   (`table_synth.py:422`), so a dropped/abstained field leaves the **previous** LLM value ACTIVE. On a
-   successful drop/abstention (distinct from a whole-table synthesis failure), **producer-scope stale** the
-   prior value (as Phase-1 does for parser fields via `_stale_absent_fields`).
-6. **Durable per-field disposition [F7].** Persist each field's disposition + reason as reviewer-visible
-   durable state (evidence/decision detail), not only counters/logs.
+1. **Grain validation (complete) [G8].** Accept only when: every column exists in the table; **no duplicate
+   normalized columns**; **within the bounded grain size**; an empty list is abstention; **any violation
+   drops grain only**, keeping the other fields.
+2. **Versioned `table_role` vocab with aliases [G-prev/G8].** Live values are `fact` (13×), `dim` (2×),
+   `reference` (2×). Ship a versioned vocab: `dim`→`dimension`; `fact`→`event_fact`/`snapshot_fact` via
+   `event_or_snapshot`, else retained `fact`; `reference` kept. Co-update prompt + narrow & wide schemas +
+   tests. Unmapped → **abstention** (dropped, `dropped_invalid`), never active advisory evidence.
+3. **`primary_entity` gated through `known_entities()`** (`taxonomy/dimensions.py`, 38 entities),
+   clear-on-miss (`recognition.py:246`).
+4. **`event_or_snapshot` normalization** on the synthesis path.
+5. **Stale-value lifecycle that clears the graph [G3].** Producer-scope staling alone is insufficient:
+   `resolve_and_project` skips fields with no active evidence (`field_resolution.py:315`), so a staled
+   advisory field leaves the previous `graph_node.table_role`/`primary_entity` visible. Add an explicit
+   **touched-field resolver** that records a `STALED` decision, **clears the display column + decision
+   link**, and rebuilds search where relevant. Test the **graph projection + eligibility**, not only the
+   evidence lifecycle.
+6. **Durable dispositions (§D)** for every field.
 
-## Slice 3 — Authority-aware context + expanded validator + rollout flag + quality eval
+## Slice 3 — Authority-aware context + tri-state validator + relevance + rollout + eval
 
-**Deliverable gate:** authority-aware sanitized context, expanded deterministic validator, the rollout
-flag, and a real-provider quality evaluation.
+**Gate:** authority-aware sanitized context, the tri-state validator (§A/§B), deterministic relevance, the
+rollout flag, and a threshold-gated real-provider eval.
 
-1. **Menu enrichment [from authorized set, sanitized].** Widen `_candidate_columns` (`:96`) to select the
-   governed fields; stop `_menu` (`:117`) discarding them. Per column emit `concept`, `domain`,
-   **sanitized** `definition` + `semantic_terms` [F2], `operational_type`, `declared_type_hint`, `entity`,
-   `additivity`, `unit`, `currency`, `is_grain`, `is_as_of` — each governed field tier-tagged
-   (`verified`/`file_declared`/`operational`/`none`; `declared_type_hint` always `hint`).
-2. **Per-table context [F3, from authorized set].** One block per table, assembled **only from the
-   authorized candidate rows**: `table_definition` (sanitized), the three advisory fields tagged
-   `advisory`, and confirmed `grain_columns`/`availability_column` (derived from the authorized set's
-   projected flags).
-3. **Expanded deterministic validator [F1].** Add authority-qualified reads and explicit
-   rejection/unresolved codes: unverified operational type, absent grain, unverified temporal basis,
-   unverified additivity, missing join connectivity. `declared_type_hint` never satisfies a numeric-safety
-   check. The validator remains the sole safety authority; richer prompts only affect generation.
-4. **Deterministic relevance selection [F10].** Define it precisely: `roles` in `feature_assist` is an
-   **authorization** role, not a semantic objective role — do not overload it. Specify (a) how the
-   objective yields target entity/concepts/domains; (b) a mandatory set always included (confirmed grain
-   cols, as-of col, objective-entity matches) even when it exceeds N; (c) a stable priority order with a
-   deterministic tie-break (e.g. by `object_ref`); (d) a **token/byte budget** as the real bound (column
-   count alone does not bound prompt size); (e) overflow behavior when the mandatory set exceeds the
-   budget (send mandatory, summarize rest, never silently drop); (f) durable truncation statistics
-   (`log()` + a recorded count).
-5. **Rollout flag + versioning [F11].** Default-off `feature-context` flag; new `feature_recommend_v#`
-   for the changed menu shape.
+1. **Menu enrichment (authorized, sanitized, authority-tagged).** Widen `_candidate_columns` (`:96`); stop
+   `_menu` (`:117`) discarding. Each column carries concept, domain, sanitized definition + semantic_terms
+   (§C), operational_type, `declared_type_hint`, and the governed fields — each wrapped by
+   `OperationalColumnFacts` (§B) so the LLM and validator both see `{value, authority}`.
+2. **Per-table context [G4].** `_candidate_columns` returns column rows only, so table definitions/advisory
+   fields need a **scoped read of the parent table node restricted to exactly the tables in the authorized
+   candidate set** (or a scoped join) — never a second unrestricted query. If every column of a table is
+   restricted, **emit no context** for it. Confirmed grain/as-of require a **non-null `*_fact_event_id`**,
+   not merely a true flag [G4].
+3. **Tri-state validator (§A/§B) + authorization threading [G10].** The gauntlet emits `DESIGN_CHECKED` /
+   `NEEDS_EXTERNAL_VALIDATION(requirements)` / `REJECTED`. `find_join_path` needs caller **roles** to
+   exclude restricted join keys, but `_validate_idea`/`_vet`/refinement/contract MCV don't thread roles
+   today (`feature_assist.py:278`, `contract/review.py:31`) — the plan threads authorization through
+   **every** validation and revalidation call. Missing join connectivity → a `JOIN_CONNECTIVITY`
+   external-requirement (retained), not a hard reject, unless a required key is unauthorized (reject).
+4. **Deterministic relevance selection [G9] (a real algorithm, not "specify X").**
+   - **Objective parsing:** the objective's target entity + concepts/domains (reuse the recognizer /
+     `known_entities()`); `roles` in `feature_assist` is an **authorization** role — do not overload it.
+   - **Scorer:** normalized (lowercase, entity via `known_entities`) match — entity match > concept match >
+     domain match, summed to an integer score.
+   - **Mandatory set:** confirmed grain columns, the as-of column, objective-entity columns.
+   - **Ordering:** score desc, then `object_ref` asc (stable, deterministic tie-break).
+   - **Hard bound:** a serialized **byte/token budget** is the real limit (column count is not). Select
+     mandatory first, then by score until the budget; the rest become a compact per-table summary.
+   - **Overflow [G9]:** if the **mandatory** set alone exceeds the budget, **deterministically chunk** or
+     return `CONTEXT_TOO_LARGE` — **never dispatch an oversized request**.
+   - **Durable truncation stats:** `log()` + a recorded dropped/summarized count.
+5. **Rollout + versioning (§E).** Default-off `feature-context` flag; `feature_recommend` v2 across all
+   feature-gen paths.
 
 ## Testing strategy
 
-- **Slice 1:** operational/declared kept separate; reconciled facets in the view (a timestamp facet the
-  evidence layer withheld is absent) [F9]; `table_definition` attaches; the dual-type roster is non-blank
-  on the wide path [F6]; the sanitized egress projection strips a planted sample/PII token from a raw
-  graph definition, a nested field, and a table definition — asserted absent from the payload AND the
-  recorded `llm_call` input (fail-closed) [F2].
-- **Slice 2:** bad grain drops only grain; `dim`/`fact`/`reference` still accepted via aliases and an
-  off-vocab role abstains [F8]; non-registry entity cleared; a re-upload that drops a previously-proposed
-  advisory value **stales** it (no stale ACTIVE value) [F7]; per-field disposition is queryable [F7].
-- **Slice 3:** read-scope — a restricted column excluded from the menu never appears in grain/summary/count
-  [F3]; the validator rejects a numeric aggregation grounded only on `declared_type_hint` and emits the
-  right code [F1]; relevance selection is deterministic and honors the token budget with logged truncation
-  [F10]; the flag defaults off (no behavior change when off) [F11].
-- **Quality evaluation [F12] (not a scripted plumbing test).** Keep the hermetic FTR integration test, then
-  add a **curated feature-generation gold set** and a key-gated **real-provider** evaluation comparing
-  baseline vs enriched context on: grounded-acceptance rate, **unsafe-acceptance rate**, rejection-reason
-  distribution, expert relevance, tokens, latency, cost. A scripted-fake pass is explicitly **not**
-  evidence of improvement.
-
-## Delivery gates (per the review's recommendation)
-
-Order Slice 1 → 2 → 3, each gated:
-1. **Slice 1:** schema-safe binding + sanitized egress projection (+ reconciled facets, dual-type roster).
-2. **Slice 2:** per-field validation + stale-value lifecycle + durable dispositions + versioned vocab.
-3. **Slice 3:** authority-aware context + expanded deterministic validator + rollout flag + quality eval.
+- **Slice 1:** operational/declared separate; a schema-mismatched table term does **not** attach [G7]; a
+  withheld (reconciled-away) facet is absent from the view [G9]; the wide phase-2 carries `table_definition`
+  and the structured roster is intact for a column name containing `:` [G5]; the egress projection strips a
+  planted token from a raw graph definition + nested field + table definition (absent from payload **and**
+  `llm_call` input) and emits the `{path, sanitizer_version, state, removed_count}` audit record; a
+  structural field (column name) is **not** sample-stripped [G12].
+- **Slice 2:** grain rejects duplicates and over-bound and drops grain only [G8]; `dim`/`fact`/`reference`
+  accepted via aliases, off-vocab abstains [G8]; non-registry entity cleared; a re-upload dropping a prior
+  advisory value **stales the graph column + decision link** and `is_eligible`/display both clear [G3]; the
+  disposition row exists with the right status + reason-code [G11].
+- **Slice 3:** a restricted column never appears in menu/grain/summary/count [G4]; the validator returns
+  `NEEDS_EXTERNAL_VALIDATION` with `TYPE_IS_NUMERIC` for an FTR sum-of-amount (not `REJECTED`, not
+  `DESIGN_CHECKED`) [G2]; `declared_type_hint` alone never yields `DESIGN_CHECKED` for a numeric op [G1/G2];
+  authorization is threaded so an unauthorized join key rejects [G10]; relevance is deterministic, honors
+  the byte budget, and returns `CONTEXT_TOO_LARGE` rather than an oversized request when mandatory overflows
+  [G9]; the flag defaults off (no behavior change) [E].
+- **Quality gate [G14] (thresholds, not just metrics).** Hermetic FTR integration test **plus** a curated
+  feature-gen gold set + a key-gated real-provider baseline-vs-enriched eval, with **delivery thresholds**:
+  **zero** unsafe-accepted features; **zero** restricted/unsanitized outbound fields; grounded-acceptance
+  **non-regression**; a defined **expert-relevance improvement** target; **bounded** token/cost/latency
+  regression; **pinned** model + settings + a **versioned** gold artifact.
 
 ## Global constraints
 
-- Three independently-planned slices; each becomes its own implementation plan; order 1 → 2 → 3.
-- No governance regression; the deterministic validator is **strengthened** (not bypassed) and stays the
-  sole safety authority; advisory fields never satisfy a safety check.
-- Reuse `known_entities()`, `reconcile_profile`, the RECOMMENDATION-ceiling policy, and the Phase-1 egress
-  bounds — no parallel vocabulary, no new advisory status column, no second unscoped query.
+- No governance regression; the validator is **strengthened** (tri-state + authority-qualified), never
+  bypassed; advisory fields never satisfy a safety check; hints may only tighten, never approve.
+- Reuse `known_entities()`, `reconcile_profile`, `may_attach`, the RECOMMENDATION-ceiling policy, and the
+  Phase-1 egress bounds — no parallel vocabulary, no unscoped query, no oversized dispatch.
 - All subagent work on Opus 4.8.
 
-## Out of scope / deferred
+## Delivery gates & out of scope
 
-- Rewriting `build_graph`/search to route through the view (already receive the fields).
-- Multi-schema binding by `logical_ref` (deferred with the rest of multi-schema) [F5].
-- Persisting the full structured sidecar to the graph (only `term_type`, and only if term-type grouping is
-  adopted) [F4].
-- External data verification (uniqueness/population/freshness) — the downstream execution platform's job.
+- Order 1 → 2 → 3; slice 3 may decompose at plan time (tri-state model / validator / relevance / eval).
+- **Deferred:** the external-attestation **ingestion** endpoint (Phase-2 defines the requirements +
+  attestation shape only) [G2]; multi-schema binding by `logical_ref`; persisting the full structured
+  sidecar to the graph (`term_type` only, and only if term-type grouping is adopted); rewriting
+  `build_graph`/search to route through the view (already receive the fields).
