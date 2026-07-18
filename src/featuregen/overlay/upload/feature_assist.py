@@ -79,6 +79,24 @@ class Rejection:
         return self.message
 
 
+# Requirement codes — a CLOSED vocabulary. A requirement rides on a NEEDS_EXTERNAL_VALIDATION idea,
+# tying an unverified fact (e.g. TYPE_IS_NUMERIC) to the specific named operand it concerns.
+REQUIREMENT_CODES = frozenset({
+    "TYPE_IS_NUMERIC", "GRAIN_IS_UNIQUE", "TEMPORAL_IS_POPULATED", "TEMPORAL_LAG_BOUNDED",
+    "JOIN_CONNECTIVITY", "UNIT_CONSISTENT", "CURRENCY_CONSISTENT", "ADDITIVITY_SUPPORTS_OPERATION",
+})
+
+# The tri-state validator dispositions. A SEPARATE axis from the hyphenated `verification` stamp.
+VALIDATION_STATES = ("DESIGN_CHECKED", "NEEDS_EXTERNAL_VALIDATION", "REJECTED")
+
+
+@dataclass(frozen=True, slots=True)
+class Requirement:
+    code: str                       # in REQUIREMENT_CODES
+    operand: tuple[str, str]        # (catalog_source, object_ref) the requirement concerns
+    detail: str = ""                # human-readable, no PII / no sample values
+
+
 def _call_raw(conn, client: LLMClient, task: str, prompt_id: str, schema_id: str,
               instruction: str, catalog_metadata: dict, *,
               actor: IdentityEnvelope | None = None) -> dict:
@@ -137,6 +155,16 @@ class FeatureIdea:
     # §14.2 reason->rules: a one-line causal rationale for WHY this feature operationalizes the
     # hypothesis, surfaced at Gate #1 so the reviewer audits the logic before any code exists.
     rationale: str = ""
+    # ── Slice 3 typed computation operands (deterministically resolved from the proposal) ──
+    operation_kind: str = ""                              # "sum"|"count"|"avg"|"ratio"|"recency"|...
+    measure_refs: tuple[tuple[str, str], ...] = ()        # (catalog_source, object_ref) columns aggregated
+    grain_ref: tuple[str, str] | None = None              # the grain the feature is computed per
+    time_ref: tuple[str, str] | None = None               # the point-in-time column
+    window: str | None = None                             # e.g. "90d"
+    grouping_refs: tuple[tuple[str, str], ...] = ()       # group-by columns
+    # ── Slice 3 tri-state honest status (a NEW axis; `verification` above is unchanged) ──
+    validation_status: str = "DESIGN_CHECKED"             # in VALIDATION_STATES
+    requirements: tuple[Requirement, ...] = ()            # typed requirements on named operands
 
 
 def _column_meta(conn, pairs: list[tuple[str, str]]) -> dict[str, dict]:
