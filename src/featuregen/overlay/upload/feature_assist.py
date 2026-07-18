@@ -215,6 +215,37 @@ def _enriched_menu(conn, cols: list[dict]) -> list[dict]:
     return [_enriched_column(conn, c) for c in cols]
 
 
+def _table_context(cols: list[dict]) -> list[dict]:
+    """One context block per TABLE, assembled ONLY from the already-authorized candidate rows
+    (spec §5): a table whose columns were all read-scope-excluded has no rows here and gets no
+    block. Confirmed grain columns require a non-null grain_fact_event_id and the as-of column a
+    non-null availability_fact_event_id (governed-VERIFIED, not merely file-declared);
+    primary_entity is ADVISORY."""
+    by_table: dict[tuple[str, str], list[dict]] = {}
+    for c in cols:
+        by_table.setdefault((c["catalog_source"], c["table"]), []).append(c)
+    blocks: list[dict] = []
+    for (_catalog, table), members in sorted(by_table.items()):
+        block: dict = {"table": table}
+        tdef = next((m["table_definition"] for m in members if m.get("table_definition")), None)
+        if tdef:
+            block["table_definition"] = tdef
+        grain_cols = sorted(m["column"] for m in members
+                            if m["is_grain"] and m["grain_fact_event_id"])
+        if grain_cols:
+            block["grain_columns"] = grain_cols
+        as_of = next((m["column"] for m in sorted(members, key=lambda x: x["column"])
+                      if m["is_as_of"] and m["availability_fact_event_id"]), None)
+        if as_of:
+            block["as_of_column"] = as_of
+        pentity = next((m["table_primary_entity"] for m in members
+                        if m.get("table_primary_entity")), None)
+        if pentity:
+            block["primary_entity"] = pentity
+        blocks.append(block)
+    return blocks
+
+
 @dataclass(frozen=True, slots=True)
 class FeatureIdea:
     name: str

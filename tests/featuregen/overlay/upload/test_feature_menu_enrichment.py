@@ -167,3 +167,70 @@ def test_flag_off_menu_content_is_byte_identical_thin_projection(db, monkeypatch
         amount = next(m for m in menu if m["object_ref"] == "public.transactions.amount")
         assert amount == {"object_ref": "public.transactions.amount", "table": "transactions",
                           "column": "amount", "concept": None, "domain": None}
+
+
+def test_table_context_from_authorized_rows_requires_fact_event_id(db):
+    import featuregen.overlay.upload.feature_assist as fa
+    rows = [
+        CanonicalRow("bank", "accounts", "account_id", "integer", is_grain=True),
+        CanonicalRow("bank", "accounts", "region", "text", is_grain=True),  # is_grain but no fact id
+        CanonicalRow("bank", "transactions", "txn_date", "timestamp", as_of=True),
+    ]
+    build_graph(db, "bank", rows)
+    db.execute("UPDATE graph_node SET grain_fact_event_id='fe_grain1' "
+               "WHERE object_ref='public.accounts.account_id'")
+    db.execute("UPDATE graph_node SET availability_fact_event_id='fe_avail1' "
+               "WHERE object_ref='public.transactions.txn_date'")
+    db.execute("UPDATE graph_node SET definition='Accounts master', primary_entity='Account' "
+               "WHERE kind='table' AND table_name='accounts'")
+
+    cols = fa._candidate_columns(db, "bank", roles=())
+    ctx = {b["table"]: b for b in fa._table_context(cols)}
+    assert ctx["accounts"]["table_definition"] == "Accounts master"
+    assert ctx["accounts"]["primary_entity"] == "Account"
+    # Only the fact-event-linked grain column is confirmed; the file-declared one is excluded.
+    assert ctx["accounts"]["grain_columns"] == ["account_id"]
+    assert "as_of_column" not in ctx["accounts"]
+    assert ctx["transactions"]["as_of_column"] == "txn_date"
+    assert "grain_columns" not in ctx["transactions"]
+
+
+def test_table_context_skips_read_scope_excluded_table(db):
+    import featuregen.overlay.upload.feature_assist as fa
+    rows = [
+        CanonicalRow("bank", "accounts", "balance", "numeric", definition="ledger balance"),
+        CanonicalRow("bank", "secrets", "ssn", "text", sensitivity="pii", definition="cust SSN"),
+    ]
+    build_graph(db, "bank", rows)
+    cols = fa._candidate_columns(db, "bank", roles=())  # no pii role
+    tables = {b["table"] for b in fa._table_context(cols)}
+    assert "accounts" in tables
+    assert "secrets" not in tables  # every column excluded -> no block
+
+
+def test_table_context_never_leaks_excluded_column_into_partially_visible_table(db):
+    # Read-scope invariant at COLUMN grain: when only SOME columns of a table are excluded, the
+    # block still exists but the excluded column must not surface anywhere in it — not via
+    # grain_columns and not via as_of_column, even though both carry governed fact events.
+    import featuregen.overlay.upload.feature_assist as fa
+    rows = [
+        CanonicalRow("bank", "accounts", "account_id", "integer", is_grain=True),
+        CanonicalRow("bank", "accounts", "owner_tax_id", "text", is_grain=True,
+                     sensitivity="pii"),
+        CanonicalRow("bank", "accounts", "opened_at", "timestamp", as_of=True,
+                     sensitivity="pii"),
+    ]
+    build_graph(db, "bank", rows)
+    db.execute("UPDATE graph_node SET grain_fact_event_id='fe_g1' "
+               "WHERE object_ref IN ('public.accounts.account_id', "
+               "'public.accounts.owner_tax_id')")
+    db.execute("UPDATE graph_node SET availability_fact_event_id='fe_a1' "
+               "WHERE object_ref='public.accounts.opened_at'")
+
+    cols = fa._candidate_columns(db, "bank", roles=())  # no pii role
+    blocks = fa._table_context(cols)
+    assert [b["table"] for b in blocks] == ["accounts"]
+    block = blocks[0]
+    assert block["grain_columns"] == ["account_id"]
+    assert "as_of_column" not in block  # the only as-of column is read-scope-excluded
+    assert "owner_tax_id" not in repr(block) and "opened_at" not in repr(block)
