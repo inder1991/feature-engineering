@@ -85,3 +85,42 @@ def test_stale_source_is_rejected(db):
     raw = {"name": "x", "derives_from": ["public.accounts.balance"], "aggregation": "avg"}
     idea, rej = _validate_idea(db, raw, known, src_of, None, NOW, FRESH)
     assert idea is None and rej.code == RejectCode.STALE
+
+
+def _ftr_col(db, table, column, *, data_type="unknown", declared_type=None):
+    ref = f"public.{table}.{column}"
+    db.execute(
+        "INSERT INTO graph_node (catalog_source, object_ref, kind, table_name, column_name, "
+        "data_type, declared_type) VALUES ('ftr', %s, 'column', %s, %s, %s, %s)",
+        (ref, table, column, data_type, declared_type))
+    _fresh(db, "ftr")
+    return ref
+
+
+def test_type_is_numeric_when_data_type_unknown_but_declared_numeric(db):
+    ref = _ftr_col(db, "loans", "balance", data_type="unknown", declared_type="numeric")
+    known, src_of = _kv([ref], "ftr")
+    raw = {"name": "avg_balance", "derives_from": [ref], "aggregation": "avg"}
+    idea, rej = _validate_idea(db, raw, known, src_of, None, NOW, FRESH)
+    assert rej is None
+    assert idea.validation_status == "NEEDS_EXTERNAL_VALIDATION"
+    codes = [(r.code, r.operand) for r in idea.requirements]
+    assert ("TYPE_IS_NUMERIC", ("ftr", ref)) in codes
+
+
+def test_declared_non_numeric_is_rejected(db):
+    ref = _ftr_col(db, "loans", "status", data_type="unknown", declared_type="varchar")
+    known, src_of = _kv([ref], "ftr")
+    raw = {"name": "avg_status", "derives_from": [ref], "aggregation": "avg"}
+    idea, rej = _validate_idea(db, raw, known, src_of, None, NOW, FRESH)
+    assert idea is None and rej.code == RejectCode.NON_NUMERIC
+
+
+def test_operational_numeric_data_type_clears_type_check(db):
+    ref = _ftr_col(db, "loans", "amt", data_type="numeric", declared_type=None)
+    known, src_of = _kv([ref], "ftr")
+    raw = {"name": "avg_amt", "derives_from": [ref], "aggregation": "avg"}
+    idea, rej = _validate_idea(db, raw, known, src_of, None, NOW, FRESH)
+    assert rej is None
+    assert idea.validation_status == "DESIGN_CHECKED"
+    assert all(r.code != "TYPE_IS_NUMERIC" for r in idea.requirements)

@@ -22,7 +22,7 @@ import psycopg
 from featuregen.contracts.envelopes import IdentityEnvelope
 from featuregen.intake.llm import LLMClient
 from featuregen.overlay.catalog_changes import drift_watermark
-from featuregen.overlay.upload.column_authority import (  # noqa: F401 — Tasks 6-10 dispositions
+from featuregen.overlay.upload.column_authority import (
     logical_ref_of,
     read_column_facts,
 )
@@ -72,6 +72,7 @@ class RejectCode:
     ADDITIVITY = "ADDITIVITY"
     MIXED_UNITS = "MIXED_UNITS"
     MIXED_CURRENCY = "MIXED_CURRENCY"
+    NON_NUMERIC = "NON_NUMERIC"             # numeric op on a positively non-numeric declared type
     NO_POINT_IN_TIME = "NO_POINT_IN_TIME"
     REDUNDANT = "REDUNDANT"                 # near-duplicate of an already-accepted candidate (item 1a)
     ALREADY_REGISTERED = "ALREADY_REGISTERED"   # duplicates a confirmed/registered feature (item 2)
@@ -263,6 +264,20 @@ def _validate_idea(conn, raw: dict, known: set[str], src_of: dict[str, set[str]]
     requirements: list[Requirement] = []
     grain_operand: tuple[str, str] | None = None
     time_operand: tuple[str, str] | None = None
+
+    # ── disposition: numeric type (a numeric op's measure must be numeric; declared_type is a HINT
+    #    that may only reject/needs-check, never clear — only operational data_type clears) ──
+    if _needs_numeric(aggregation):
+        for src, d in pairs:
+            lref = logical_ref_of(src, d)
+            if _is_numeric(read_column_facts(conn, lref, "logical_representation").value):
+                continue
+            declared = read_column_facts(conn, lref, "declared_type").value
+            if declared and not _is_numeric(declared):
+                return None, Rejection(RejectCode.NON_NUMERIC,
+                                       f"declared type {declared!r} of {d} is not numeric")
+            requirements.append(Requirement("TYPE_IS_NUMERIC", (src, d),
+                                            "operational type unknown; numeric declared hint"))
 
     # ── disposition: additivity (Task 7 REPLACES this block) ──
     if _is_additive_unsafe(aggregation):
