@@ -556,13 +556,16 @@ def draft(body: DraftReqIn, conn: _Conn, identity: _Identity, client: _LLM) -> d
     record_gate1_choice(conn, body.intent_id, chosen_source=body.chosen_source,
                         chosen_option_id=body.chosen_option_id, actor=identity.subject, why=body.why)
     target = intent_target_ref(conn, body.intent_id)   # server truth, not client-supplied
-    # 3C.2a fail-closed: a governed feature drafts its compiled plan envelope's path, rechecked for
-    # freshness under the REQUEST's roles (the set it compiled under — else it would spuriously drift);
-    # a drifted plan → 409 (regenerate, never a substitute path), and a cross-catalog feature with no
-    # governed envelope → 422 (it must be regenerated under the governed planner, never permissively bridged).
+    # 3C.2a — the live-activation boolean is resolved ONLY here (the route boundary) and threaded down.
+    # FLAG-OFF (default) → byte-identical: a cross-catalog feature draws the permissive
+    # find_cross_catalog_path path exactly as before. FLAG-ON fail-closed: a governed feature drafts its
+    # compiled plan envelope's path, rechecked for freshness under the REQUEST's roles (the set it compiled
+    # under — else it would spuriously drift); a drifted plan → 409 (regenerate, never a substitute path),
+    # and a cross-catalog feature with no governed envelope → 422 (regenerate under the governed planner).
+    is_live = is_live_cross_catalog_enabled(conn)
     try:
         d = draft_contract(conn, feature, client, roles=identity.role_claims, target_ref=target,
-                           actor=identity)
+                           actor=identity, is_live=is_live)
     except StalePlan as e:
         raise HTTPException(status_code=409, detail="plan stale, regenerate") from e
     except CrossCatalogPlanRequired as e:
@@ -611,13 +614,16 @@ def confirm(body: DraftIn, conn: _Conn, identity: _Identity) -> Contract:
         raise HTTPException(status_code=422, detail="the draft does not match the chosen feature")
     # 3C.2a fail-closed at the GOVERNING write: re-run the freshness recheck against the SERVER-
     # reconstructed chosen feature's plan envelope (never the client body) under the request's roles —
-    # a plan that drifted between draft and confirm must never silently finalize (409, regenerate). A
-    # cross-catalog feature that reached confirm with no governed envelope is refused outright.
+    # a plan that drifted between draft and confirm must never silently finalize (409, regenerate). The
+    # envelope branch is self-gated (only the flag-on governed planner attaches one), so it needs no
+    # is_live guard. The cross-catalog-without-envelope 422 fires ONLY when the deployment is flag-on-and-
+    # approved; FLAG-OFF a cross-catalog feature confirms via the permissive path, byte-identical to before.
     env = chosen.plan_envelope
     if env is not None:
         if recheck_plan_freshness(conn, env, identity.role_claims) is not ReplayFreshness.current:
             raise HTTPException(status_code=409, detail="plan stale, regenerate")
-    elif len({cs for cs, _ref in chosen.derives_pairs}) > 1:
+    elif (is_live_cross_catalog_enabled(conn)
+          and len({cs for cs, _ref in chosen.derives_pairs}) > 1):
         raise HTTPException(status_code=422,
                             detail="cross-catalog feature requires a governed plan envelope")
     target = intent_target_ref(conn, body.intent_id)   # SERVER truth — never the client body

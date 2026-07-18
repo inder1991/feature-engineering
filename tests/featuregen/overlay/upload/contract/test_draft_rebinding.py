@@ -79,8 +79,8 @@ def test_recheck_uses_the_passed_roles(db):
     assert tuple(s["segment"] for s in draft.join_path) == feature.plan_envelope.ordered_path
 
 
-# ── (c) a cross-catalog feature with NO envelope is fail-closed at draft ───────────────────────────────
-def test_cross_catalog_without_envelope_is_rejected_at_draft(db):
+# ── (c) a cross-catalog feature with NO envelope: FLAG-ON fail-closes, FLAG-OFF draws permissive path ──
+def _ungoverned_cross_feature(db) -> FeatureIdea:
     build_graph(db, "deposits", [
         CanonicalRow("deposits", "accounts", "cust_ref", "integer", entity="Customer"),
         CanonicalRow("deposits", "accounts", "balance", "numeric")])
@@ -92,8 +92,23 @@ def test_cross_catalog_without_envelope_is_rejected_at_draft(db):
                           derives_pairs=(("deposits", "public.accounts.balance"),
                                          ("cards", "public.card_accounts.spend")))
     assert feature.plan_envelope is None            # a cross-catalog LLM idea has no governed plan
-    with pytest.raises(CrossCatalogPlanRequired):   # never a permissive find_cross_catalog_path
-        draft_contract(db, feature, _client(), roles=())
+    return feature
+
+
+def test_cross_catalog_without_envelope_is_rejected_at_draft_when_live(db):
+    # FLAG-ON (is_live=True): fail-closed — never a permissive find_cross_catalog_path.
+    feature = _ungoverned_cross_feature(db)
+    with pytest.raises(CrossCatalogPlanRequired):
+        draft_contract(db, feature, _client(), roles=(), is_live=True)
+
+
+def test_cross_catalog_without_envelope_draws_permissive_path_when_not_live(db):
+    # FLAG-OFF (is_live default False): behaviour-neutral — the permissive entity-bridged path is authored
+    # via find_cross_catalog_path exactly as before 3C.2a; HTTP 200, no CrossCatalogPlanRequired.
+    feature = _ungoverned_cross_feature(db)
+    draft = draft_contract(db, feature, _client(), roles=())
+    assert any(step.get("kind") == "entity" and step.get("via") == "Customer"
+               for step in draft.join_path)   # accounts --entity(Customer)--> card_accounts
 
 
 # ── (d) a single-catalog feature with no envelope drafts EXACTLY as before (behaviour-neutral) ─────────

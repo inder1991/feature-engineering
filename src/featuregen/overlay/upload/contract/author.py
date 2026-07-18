@@ -13,6 +13,7 @@ from dataclasses import dataclass
 
 from featuregen.intake.llm import LLMClient
 from featuregen.overlay.upload.enrich_llm import audited_enrich_call
+from featuregen.overlay.upload.entity import find_cross_catalog_path
 from featuregen.overlay.upload.feature_assist import FeatureIdea
 from featuregen.overlay.upload.join_path import find_join_path
 from featuregen.overlay.upload.planner.contracts import ReplayFreshness
@@ -81,27 +82,35 @@ def _column_defs(conn, pairs: tuple[tuple[str, str], ...], roles: Iterable[str])
 
 def _join_path(conn, grain_table: str | None, pairs: tuple[tuple[str, str], ...],
                roles: Iterable[str] = ()) -> tuple[dict, ...]:
-    """The deterministic SINGLE-catalog join path from the grain table to each other table the feature
-    reads (column-level `find_join_path`). 3C.2a: a CROSS-catalog feature never authors a permissive path
-    here — `draft_contract` either rebinds it to its governed plan envelope's ordered_path or fail-closes
-    it (a cross-catalog feature must be regenerated under the governed planner, never permissively
-    bridged). A multi-catalog pair set reaching this function is therefore a fail-closed error."""
+    """The deterministic permissive join path from the grain table to each other table the feature reads.
+    Single-catalog uses the column-level `find_join_path`; CROSS-catalog uses `entity.find_cross_catalog_path`,
+    so a feature spanning catalogs records how its tables bridge via the shared entity (Customer). 3C.2a:
+    this is the FLAG-OFF path — a flag-on cross-catalog feature never reaches here (`_draft_join_path`
+    rebinds it to its governed plan envelope's ordered_path or fail-closes it), so `find_cross_catalog_path`
+    is never invoked on a flag-on cross-catalog draft (its removal is 3C.2b)."""
     if not grain_table or not pairs:
         return ()
     tables = sorted({(cs, ref.split(".")[-2]) for cs, ref in pairs if ref.count(".") >= 2})
     if not tables:
         return ()
     catalogs = {cs for cs, _ in tables}
-    if len(catalogs) != 1:                              # cross-catalog: never a permissive path here
-        raise CrossCatalogPlanRequired(
-            "cross-catalog feature has no governed plan envelope; refusing a permissive join path")
-    catalog = next(iter(catalogs))
     steps: list[dict] = []
-    for _, t in tables:
-        if t != grain_table:
-            for s in (find_join_path(conn, catalog, grain_table, t, roles=roles) or []):
-                steps.append({"kind": "join", "from": s.from_ref, "to": s.to_ref,
-                              "cardinality": s.cardinality})
+    if len(catalogs) == 1:                              # single-catalog: column-level path
+        catalog = next(iter(catalogs))
+        for _, t in tables:
+            if t != grain_table:
+                for s in (find_join_path(conn, catalog, grain_table, t, roles=roles) or []):
+                    steps.append({"kind": "join", "from": s.from_ref, "to": s.to_ref,
+                                  "cardinality": s.cardinality})
+        return tuple(steps)
+    # cross-catalog (flag-off permissive): bridge each other-catalog table to the grain via the entity graph
+    grain_catalog = next((cs for cs, t in tables if t == grain_table), tables[0][0])
+    for cs, t in tables:
+        if (cs, t) != (grain_catalog, grain_table):
+            for xs in (find_cross_catalog_path(conn, grain_catalog, grain_table, cs, t,
+                                               roles=roles) or []):   # CrossStep, not JoinStep
+                steps.append({"kind": xs.kind, "from": f"{xs.from_source}.{xs.from_table}",
+                              "to": f"{xs.to_source}.{xs.to_table}", "via": xs.detail})
     return tuple(steps)
 
 
@@ -120,37 +129,46 @@ def _envelope_join_path(ordered_path: tuple[str, ...]) -> tuple[dict, ...]:
 
 
 def _draft_join_path(conn, feature: FeatureIdea, roles: tuple[str, ...],
-                     catalogs: set[str]) -> tuple[dict, ...]:
+                     catalogs: set[str], is_live: bool) -> tuple[dict, ...]:
     """3C.2a rebinding + freshness recheck — the single decision point for a draft's join path:
       * a governed feature (carrying a ``plan_envelope``) drafts its EXACT compiled ``ordered_path`` and
         is refused (`StalePlan`) if its pinned plan has drifted — rechecked under the SAME ``roles`` the
-        plan compiled with (a mismatched role set would recompute a different fingerprint → spurious drift);
-      * a cross-catalog feature with NO governed envelope is fail-closed (`CrossCatalogPlanRequired`);
-      * a single-catalog feature with no envelope uses the permissive column-level path exactly as before."""
+        plan compiled with (a mismatched role set would recompute a different fingerprint → spurious drift).
+        This branch is SELF-GATED: only the flag-on governed planner ever attaches an envelope, so it is
+        correct for both flag states and needs no ``is_live`` guard;
+      * FLAG-ON (``is_live``) a cross-catalog feature with NO governed envelope is fail-closed
+        (`CrossCatalogPlanRequired`) — it must be regenerated under the governed planner, never bridged;
+      * FLAG-OFF the permissive `_join_path` draws the path exactly as before — a cross-catalog feature
+        rides `find_cross_catalog_path` (byte-identical to pre-3C.2a) and a single-catalog feature uses
+        the column-level path. ``find_cross_catalog_path`` removal is 3C.2b, never a flag-on invocation."""
     if feature.plan_envelope is not None:
         fresh = recheck_plan_freshness(conn, feature.plan_envelope, roles)
         if fresh is not ReplayFreshness.current:
             raise StalePlan(fresh, feature.plan_envelope.physical_plan_id)
         return _envelope_join_path(feature.plan_envelope.ordered_path)
-    if len(catalogs) > 1:
+    if is_live and len(catalogs) > 1:
         raise CrossCatalogPlanRequired(
             "cross-catalog feature has no governed plan envelope; regenerate under the governed planner")
     return _join_path(conn, feature.grain_table, feature.derives_pairs, roles)
 
 
 def draft_contract(conn, feature: FeatureIdea, client: LLMClient, *, actor=None,
-                   roles: Iterable[str] = (), target_ref: str | None = None) -> ContractDraft:
+                   roles: Iterable[str] = (), target_ref: str | None = None,
+                   is_live: bool = False) -> ContractDraft:
     """Author a contract draft for the chosen feature. Structured facts deterministic (catalog-scoped via
     the feature's resolved pairs, B3); the definition narrative LLM-authored via the audited seam (metadata
-    only, read-scoped). `target_ref` is carried on the draft so the leakage check cannot no-op."""
+    only, read-scoped). `target_ref` is carried on the draft so the leakage check cannot no-op. ``is_live``
+    is the route-resolved live-activation boolean (default ``False`` — no other caller changes): FLAG-OFF
+    a cross-catalog feature draws the permissive `find_cross_catalog_path` path byte-identically to before;
+    FLAG-ON a cross-catalog feature with no governed envelope fail-closes (`CrossCatalogPlanRequired`)."""
     roles = tuple(roles)
     catalogs = {cs for cs, _ in feature.derives_pairs}
     grain_catalog = next(iter(catalogs)) if len(catalogs) == 1 else None   # single-catalog grain
-    # 3C.2a — bind the join path BEFORE the LLM call so a stale / ungoverned cross-catalog feature
-    # fail-closes fast (no wasted authoring dispatch): a governed feature drafts its compiled envelope's
-    # ordered_path (rechecked for freshness under `roles`), a cross-catalog feature with no envelope is
-    # rejected, and a single-catalog feature is unchanged (see :func:`_draft_join_path`).
-    join_path = _draft_join_path(conn, feature, roles, catalogs)
+    # 3C.2a — bind the join path BEFORE the LLM call so a stale / (flag-on) ungoverned cross-catalog
+    # feature fail-closes fast (no wasted authoring dispatch): a governed feature drafts its compiled
+    # envelope's ordered_path (rechecked for freshness under `roles`); FLAG-ON a cross-catalog feature
+    # with no envelope is rejected; FLAG-OFF the permissive path is unchanged (see :func:`_draft_join_path`).
+    join_path = _draft_join_path(conn, feature, roles, catalogs, is_live)
     definition = audited_enrich_call(
         conn, client, task="overlay.contract.draft", prompt_id="overlay_contract_v1",
         schema_id="overlay_contract",
