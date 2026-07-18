@@ -1474,3 +1474,57 @@ export async function leakageCheck(
   })
   return body.warnings
 }
+
+// ---- gate operationalization (Phase 3C.1, authority-only console) ---------------------------
+// Read-only evaluation triggers over the persisted shadow stores. The request body carries ONLY
+// the batch identifier (cohort + window) — every count and verdict is assembled server-side;
+// the client never sends numbers and there is no sign/approve call on this surface.
+
+// One shadow-dispatch cohort (a producer commit) with the window its runs span.
+export interface GateCohort {
+  cohort: string
+  first_run_at: string
+  last_run_at: string
+  run_count: number
+}
+
+// The machine verdict: overall PASS/FAIL plus the per-condition booleans behind it.
+export interface GateVerdict {
+  passed: boolean
+  gate1_capture: boolean
+  gate2a_map: boolean
+  gate3_gold: boolean
+  gate5_stability: boolean
+  gate6_drift: boolean
+}
+
+export interface GateEvaluation {
+  verdict: GateVerdict
+  // Human-readable failed conditions; empty when every gate passed.
+  reasons: string[]
+  // Always true from the server: a machine PASS never authorizes go-live by itself.
+  necessary_not_sufficient: boolean
+  // Which dispatched runs qualified for the window, and why the rest were excluded (fail-closed).
+  coverage: { dispatched_in_range: number; qualifying: number; excluded: Record<string, number> }
+  population: {
+    denominator: number
+    numerator: number
+    headline_by_primary: Record<string, number>
+    breakdown_by_category: Record<string, number>
+    // "planner_outcome|compile_status" -> count
+    recipe_outcome_matrix: Record<string, number>
+  }
+  versions: { evaluator: string; cohort: string }
+}
+
+export function listGateCohorts(): Promise<GateCohort[]> {
+  return request('/gate/cohorts')
+}
+
+export function evaluateGate(body: {
+  cohort: string
+  since: string
+  until: string
+}): Promise<GateEvaluation> {
+  return post('/gate/evaluate', body)
+}
