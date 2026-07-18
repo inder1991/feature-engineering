@@ -27,7 +27,7 @@ from featuregen.overlay.upload.column_authority import (
     read_column_facts,
 )
 from featuregen.overlay.upload.enrich_llm import audited_structured_call
-from featuregen.overlay.upload.join_path import (  # noqa: F401 — JoinOutcome/classify: Task 10
+from featuregen.overlay.upload.join_path import (
     JoinOutcome,
     JoinStep,
     classify_join_path,
@@ -74,6 +74,8 @@ class RejectCode:
     MIXED_CURRENCY = "MIXED_CURRENCY"
     NON_NUMERIC = "NON_NUMERIC"             # numeric op on a positively non-numeric declared type
     NO_POINT_IN_TIME = "NO_POINT_IN_TIME"
+    NO_JOIN_PATH = "NO_JOIN_PATH"           # cross-table feature with no structural join path
+    JOIN_DENIED = "JOIN_DENIED"             # the only path crosses a read-scope-denied hop
     REDUNDANT = "REDUNDANT"                 # near-duplicate of an already-accepted candidate (item 1a)
     ALREADY_REGISTERED = "ALREADY_REGISTERED"   # duplicates a confirmed/registered feature (item 2)
     CRITIC = "CRITIC"                       # LLM-2 critic flagged a quality/fit issue (item 5)
@@ -329,6 +331,23 @@ def _validate_idea(conn, raw: dict, known: set[str], src_of: dict[str, set[str]]
             if facts.authority != "governed":
                 requirements.append(Requirement("GRAIN_IS_UNIQUE", (gcat, gref),
                                                 "grain declared, not governed-verified"))
+
+    # ── disposition: cross-table join authority (spec §7). A measure in a different table than the
+    #    grain needs a real path; UNVERIFIED -> JOIN_CONNECTIVITY, no-path / read-scope-denied -> reject ──
+    if grain_table and len(catalogs) == 1:
+        jcat = next(iter(catalogs))
+        for src, d in pairs:
+            if d.count(".") >= 2 and d.split(".")[-2] != grain_table:
+                outcome = classify_join_path(conn, jcat, grain_table, d.split(".")[-2], roles=roles)
+                if outcome.kind == JoinOutcome.NO_PATH:
+                    return None, Rejection(RejectCode.NO_JOIN_PATH,
+                                           f"no join path {grain_table} -> {d}")
+                if outcome.kind == JoinOutcome.DENIED:
+                    return None, Rejection(RejectCode.JOIN_DENIED,
+                                           f"join {grain_table} -> {d} crosses a read-scope-denied hop")
+                if outcome.kind == JoinOutcome.UNVERIFIED:
+                    requirements.append(Requirement("JOIN_CONNECTIVITY", (src, d),
+                                                    "join authorized but not verified"))
 
     # ── finalize (tri-state) ──
     status = "NEEDS_EXTERNAL_VALIDATION" if requirements else "DESIGN_CHECKED"

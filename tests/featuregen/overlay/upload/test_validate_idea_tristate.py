@@ -312,3 +312,67 @@ def test_single_measure_absent_unit_adds_no_requirement(db):
     idea, rej = _validate_idea(db, raw, known, src_of, None, NOW, FRESH)
     assert rej is None
     assert all(r.code not in ("UNIT_CONSISTENT", "CURRENCY_CONSISTENT") for r in idea.requirements)
+
+
+def _two_table(db, *, fact_key=None, status=None, acct_sensitivity=None):
+    db.execute("INSERT INTO graph_node (catalog_source, object_ref, kind, table_name, column_name, "
+               "data_type) VALUES ('bank', 'public.transactions.amount', 'column', 'transactions', "
+               "'amount', 'numeric')")
+    db.execute("INSERT INTO graph_node (catalog_source, object_ref, kind, table_name, column_name) "
+               "VALUES ('bank', 'public.transactions.acct_id', 'column', 'transactions', 'acct_id')")
+    db.execute("INSERT INTO graph_node (catalog_source, object_ref, kind, table_name, column_name, "
+               "is_grain, sensitivity) VALUES ('bank', 'public.accounts.account_id', 'column', "
+               "'accounts', 'account_id', true, %s)", (acct_sensitivity,))
+    db.execute("INSERT INTO graph_edge (catalog_source, kind, from_ref, to_ref, cardinality, "
+               "authority, approved_join_fact_key, approved_join_status) VALUES ('bank', 'joins', "
+               "'public.transactions.acct_id', 'public.accounts.account_id', 'N:1', 'operational', "
+               "%s, %s)", (fact_key, status))
+    _fresh(db, "bank")
+
+
+def test_cross_table_operational_join_clears(db):
+    _two_table(db)   # declared edge (no fact link) -> OPERATIONAL
+    known, src_of = _kv(["public.transactions.amount"], "bank")
+    raw = {"name": "sum_txn_per_acct", "derives_from": ["public.transactions.amount"],
+           "aggregation": "count", "grain_table": "accounts"}
+    idea, rej = _validate_idea(db, raw, known, src_of, None, NOW, FRESH, roles=())
+    assert rej is None
+    assert all(r.code != "JOIN_CONNECTIVITY" for r in idea.requirements)
+
+
+def test_cross_table_unverified_join_needs_join_connectivity(db):
+    # RF-I1: "authorized but unverified" = fact-linked edge with a status IN the
+    # graph_edge_approved_join_status_check vocabulary that is not yet VERIFIED -> 'DRAFT'.
+    _two_table(db, fact_key="ajf-1", status="DRAFT")
+    known, src_of = _kv(["public.transactions.amount"], "bank")
+    raw = {"name": "sum_txn_per_acct", "derives_from": ["public.transactions.amount"],
+           "aggregation": "count", "grain_table": "accounts"}
+    idea, rej = _validate_idea(db, raw, known, src_of, None, NOW, FRESH, roles=())
+    assert rej is None
+    assert idea.validation_status == "NEEDS_EXTERNAL_VALIDATION"
+    joins = [r for r in idea.requirements if r.code == "JOIN_CONNECTIVITY"]
+    assert joins and joins[0].operand == ("bank", "public.transactions.amount")
+
+
+def test_cross_table_no_path_is_rejected(db):
+    db.execute("INSERT INTO graph_node (catalog_source, object_ref, kind, table_name, column_name, "
+               "data_type) VALUES ('bank', 'public.transactions.amount', 'column', 'transactions', "
+               "'amount', 'numeric')")
+    db.execute("INSERT INTO graph_node (catalog_source, object_ref, kind, table_name, column_name, "
+               "is_grain) VALUES ('bank', 'public.accounts.account_id', 'column', 'accounts', "
+               "'account_id', true)")
+    _fresh(db, "bank")   # no join edge between transactions and accounts
+    known, src_of = _kv(["public.transactions.amount"], "bank")
+    raw = {"name": "sum_txn_per_acct", "derives_from": ["public.transactions.amount"],
+           "aggregation": "count", "grain_table": "accounts"}
+    idea, rej = _validate_idea(db, raw, known, src_of, None, NOW, FRESH, roles=())
+    assert idea is None and rej.code == RejectCode.NO_JOIN_PATH
+
+
+def test_cross_table_read_scope_denied_hop_is_rejected(db):
+    _two_table(db, acct_sensitivity="pii")   # the only hop's endpoint is pii-hidden for roles=()
+    known, src_of = _kv(["public.transactions.amount"], "bank")
+    raw = {"name": "sum_txn_per_acct", "derives_from": ["public.transactions.amount"],
+           "aggregation": "count", "grain_table": "accounts"}
+    idea, rej = _validate_idea(db, raw, known, src_of, None, NOW, FRESH, roles=())
+    assert idea is None and rej.code == RejectCode.JOIN_DENIED
