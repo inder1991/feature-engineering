@@ -626,10 +626,13 @@ def route_strategies(conn, cols: list[dict]) -> list[tuple[str, str]]:
     # Source-qualified: match the exact (catalog_source, object_ref) pairs, so a same-named column in
     # ANOTHER catalog can't contaminate strategy selection (wrong type / as-of / entity).
     rows = conn.execute(
-        "SELECT data_type, is_as_of, entity FROM graph_node WHERE kind = 'column' "
+        "SELECT data_type, is_as_of, entity, declared_type FROM graph_node WHERE kind = 'column' "
         "AND (catalog_source, object_ref) IN (SELECT * FROM unnest(%s::text[], %s::text[]))",
         (sources, refs)).fetchall()
-    if sum(1 for dt, _, _ in rows if _is_numeric(dt)) >= 2:
+    # A column is numeric-capable if OPERATIONAL data_type is numeric OR the FTR-declared_type hint is
+    # (spec §2 [F10]): the hint ENABLES the numeric strategy so an FTR feature is proposed, while
+    # operational data_type stays 'unknown' and the validator still returns NEEDS_EXTERNAL_VALIDATION.
+    if sum(1 for dt, _, _, decl in rows if _is_numeric(dt) or _is_numeric(decl)) >= 2:
         picks.append(("ratio", "ratios / cross-features between two numeric columns (e.g. utilization)"))
     # aggregation applies if a candidate column is a join key (from_ref) OR the parent column that
     # children join to (to_ref) — the entity-grain "aggregate children up" case. graph_edge stores
@@ -646,9 +649,9 @@ def route_strategies(conn, cols: list[dict]) -> list[tuple[str, str]]:
                     "AND (from_ref = ANY(%s) OR to_ref = ANY(%s)) LIMIT 1",
                     (list(set(sources)), refs, refs)).fetchone() is not None:
         picks.append(("aggregation", "aggregations (count/sum/avg) over related child rows via a join key"))
-    if any(a for _, a, _ in rows):
+    if any(a for _, a, _, _ in rows):
         picks.append(("temporal", "recency / trend / velocity over a point-in-time (as-of) column"))
-    if any(e for _, _, e in rows):
+    if any(e for _, _, e, _ in rows):
         picks.append(("distributional",
                       "distributional features vs a peer group (z-score / percentile per entity)"))
     return picks
