@@ -45,9 +45,9 @@ def confirm_contract(conn, draft: ContractDraft, *, actor, target_ref: str | Non
     registers a versioned governed contract + wires its derives-from into the feature layer. Re-confirming
     the same feature bumps the version. A non-empty definition is required (no empty-narrative contract)."""
     tref = target_ref if target_ref is not None else draft.target_ref   # M3: fall back to the draft's
-    ok, reasons = validate_minimum(conn, draft, target_ref=tref, now=now)
-    if not ok:
-        raise ContractValidationError(f"contract failed MCV, not governed: {reasons}")
+    check = validate_minimum(conn, draft, target_ref=tref, now=now)
+    if not check.ok:
+        raise ContractValidationError(f"contract failed MCV, not governed: {check.reasons}")
     if not (draft.definition or "").strip():
         raise ContractValidationError("contract has an empty definition, not governed")
     pairs = draft.derives_pairs   # B3: resolved (catalog_source, object_ref) carried on the draft

@@ -8,13 +8,13 @@ re-authors the definition narrative (audited).
 """
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 
 from featuregen.intake.llm import LLMClient
 from featuregen.overlay.upload.contract.author import ContractDraft
 from featuregen.overlay.upload.enrich_llm import audited_enrich_call, audited_structured_call
-from featuregen.overlay.upload.feature_assist import _validate_idea
+from featuregen.overlay.upload.feature_assist import Requirement, _validate_idea
 
 
 def _live_columns(conn, object_refs: list[str]) -> set[str]:
@@ -28,9 +28,20 @@ def _live_columns(conn, object_refs: list[str]) -> set[str]:
     return {r[0] for r in rows}
 
 
+@dataclass(frozen=True, slots=True)
+class MinimumCheck:
+    """MCV outcome carrying the tri-state forward (3A-ii). `ok` is the govern gate (a REJECTED draft
+    must never be governed); `validation_status` + `requirements` are the honest state re-derived from
+    the LIVE catalog; `reasons` is non-empty only when REJECTED. Replaces the old (bool, list[str])."""
+    ok: bool
+    reasons: list[str]
+    validation_status: str
+    requirements: tuple[Requirement, ...]
+
+
 def validate_minimum(conn, draft: ContractDraft, *, target_ref: str | None = None,
                      now: datetime | None = None,
-                     fresh_within: timedelta = timedelta(hours=24)) -> tuple[bool, list[str]]:
+                     fresh_within: timedelta = timedelta(hours=24)) -> MinimumCheck:
     """MCV — the deterministic gauntlet re-applied to the draft (defense in depth: a source could have
     gone stale or been dropped since discovery). Reuses the feature loop's checks. No LLM."""
     raw = {"derives_from": draft.derives_from, "aggregation": draft.aggregation}
@@ -39,7 +50,11 @@ def validate_minimum(conn, draft: ContractDraft, *, target_ref: str | None = Non
     for cs, ref in draft.derives_pairs:
         src_of.setdefault(ref, set()).add(cs)
     idea, reason = _validate_idea(conn, raw, known, src_of, target_ref, now, fresh_within)
-    return (idea is not None, [] if idea is not None else [reason.message])
+    if idea is None:
+        return MinimumCheck(ok=False, reasons=[reason.message],
+                            validation_status="REJECTED", requirements=())
+    return MinimumCheck(ok=True, reasons=[], validation_status=idea.validation_status,
+                        requirements=idea.requirements)
 
 
 def critique_contract(conn, draft: ContractDraft, client: LLMClient, *, actor=None) -> list[str]:
@@ -81,12 +96,12 @@ def author_contract(conn, draft: ContractDraft, client: LLMClient, *, target_ref
     `target_ref` falls back to the draft's own (M3), so the leakage check cannot silently no-op."""
     tref = target_ref if target_ref is not None else draft.target_ref
     for _ in range(budget):
-        _, mcv = validate_minimum(conn, draft, target_ref=tref, now=now)
+        check = validate_minimum(conn, draft, target_ref=tref, now=now)
         critique = critique_contract(conn, draft, client, actor=actor)
-        if not mcv and not critique:
+        if not check.reasons and not critique:
             return draft, []                       # clean
-        if mcv and not critique:
-            return draft, mcv                      # structural defect the LLM can't fix → surface
-        draft = refine_contract(conn, draft, mcv + critique, client, actor=actor)
-    _, mcv = validate_minimum(conn, draft, target_ref=tref, now=now)
-    return draft, mcv
+        if check.reasons and not critique:
+            return draft, check.reasons            # structural defect the LLM can't fix → surface
+        draft = refine_contract(conn, draft, check.reasons + critique, client, actor=actor)
+    check = validate_minimum(conn, draft, target_ref=tref, now=now)
+    return draft, check.reasons

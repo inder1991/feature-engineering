@@ -41,13 +41,13 @@ class _SeqLLM:
 
 def test_mcv_is_the_deterministic_gauntlet(db):
     _bank(db)
-    ok, reasons = validate_minimum(db, _draft(["public.accounts.balance"]),
-                                   target_ref="public.accounts.churned", now=NOW)
-    assert ok and reasons == []
+    check = validate_minimum(db, _draft(["public.accounts.balance"]),
+                             target_ref="public.accounts.churned", now=NOW)
+    assert check.ok and check.reasons == []
     # a draft that derives from the target label fails MCV — deterministically
-    bad_ok, bad = validate_minimum(db, _draft(["public.accounts.churned"]),
-                                   target_ref="public.accounts.churned", now=NOW)
-    assert not bad_ok and "leaks target" in bad[0]
+    bad = validate_minimum(db, _draft(["public.accounts.churned"]),
+                           target_ref="public.accounts.churned", now=NOW)
+    assert not bad.ok and "leaks target" in bad.reasons[0]
 
 
 def test_critique_refine_loop_converges(db):
@@ -78,8 +78,8 @@ def test_mcv_grounding_uses_live_graph_not_the_draft(db):
     # B2: a draft claiming a column that no longer exists in the graph must fail grounding.
     _bank(db)
     ghost = _draft(["public.accounts.vanished"])
-    ok, reasons = validate_minimum(db, ghost, now=NOW)
-    assert not ok and "ungrounded" in reasons[0]
+    check = validate_minimum(db, ghost, now=NOW)
+    assert not check.ok and "ungrounded" in check.reasons[0]
 
 
 def test_critique_is_audited(db):
@@ -102,5 +102,5 @@ def test_mcv_rejects_fabricated_catalog_pair(db):
     draft = ContractDraft("f", "def", "accounts", "avg_90d", "posted_at",
                           ["public.accounts.balance"],
                           derives_pairs=(("fabricated_catalog", "public.accounts.balance"),))
-    ok, reasons = validate_minimum(db, draft, now=NOW)
-    assert not ok and "unknown column" in reasons[0]
+    check = validate_minimum(db, draft, now=NOW)
+    assert not check.ok and "unknown column" in check.reasons[0]

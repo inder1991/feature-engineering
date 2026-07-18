@@ -12,8 +12,9 @@ import pytest
 
 from featuregen.intake.llm import FakeLLM, FakeResponse
 from featuregen.overlay.upload.canonical import CanonicalRow
-from featuregen.overlay.upload.contract.author import draft_contract
+from featuregen.overlay.upload.contract.author import ContractDraft, draft_contract
 from featuregen.overlay.upload.contract.gate1 import ConsideredSet, _snapshot, chosen_feature
+from featuregen.overlay.upload.contract.review import MinimumCheck, validate_minimum
 from featuregen.overlay.upload.feature_assist import FeatureIdea, FeatureSet, Requirement
 from featuregen.overlay.upload.graph import build_graph
 
@@ -139,3 +140,55 @@ def test_snapshot_restores_previously_dropped_verification_fields(db):
     assert feat.rationale == "proxy for churn"       # was silently dropped pre-3A-ii
     assert feat.validation_status == "DESIGN_CHECKED"
     assert feat.requirements == ()
+
+
+def test_validate_minimum_carries_needs_external_validation(db, monkeypatch):
+    _bank(db)
+    draft = ContractDraft(
+        "avg_balance_90d", "Average 90-day balance.", "accounts", "avg_90d", "posted_at",
+        ["public.accounts.balance"], derives_pairs=(("bank", "public.accounts.balance"),),
+        validation_status="NEEDS_EXTERNAL_VALIDATION",
+        requirements=(Requirement("TYPE_IS_NUMERIC", ("bank", "public.accounts.balance"), "x"),))
+    crafted = FeatureIdea(
+        name="avg_balance_90d", description="", derives_from=["public.accounts.balance"],
+        aggregation="avg_90d", grain_table="accounts",
+        derives_pairs=(("bank", "public.accounts.balance"),),
+        validation_status="NEEDS_EXTERNAL_VALIDATION",
+        requirements=(Requirement("TYPE_IS_NUMERIC", ("bank", "public.accounts.balance"), "x"),))
+    monkeypatch.setattr(
+        "featuregen.overlay.upload.contract.review._validate_idea",
+        lambda *a, **k: (crafted, None))
+    check = validate_minimum(db, draft)
+    assert isinstance(check, MinimumCheck)
+    assert check.ok is True
+    assert check.reasons == []
+    assert check.validation_status == "NEEDS_EXTERNAL_VALIDATION"
+    assert check.requirements == (
+        Requirement("TYPE_IS_NUMERIC", ("bank", "public.accounts.balance"), "x"),)
+
+
+def test_validate_minimum_rejected_reports_reason_and_status(db):
+    _bank(db)
+    # derives from a column that does not exist -> the gauntlet REJECTS (ungrounded)
+    draft = ContractDraft(
+        "bad", "d", "accounts", "avg_90d", "posted_at", ["public.accounts.nope"],
+        derives_pairs=(("bank", "public.accounts.nope"),))
+    check = validate_minimum(db, draft)
+    assert check.ok is False
+    assert check.reasons                                 # a non-empty rejection reason
+    assert check.validation_status == "REJECTED"
+    assert check.requirements == ()
+
+
+def test_author_contract_consumes_minimumcheck(db):
+    _bank(db)
+    draft = ContractDraft(
+        "avg_balance_90d", "Average 90-day balance.", "accounts", "avg_90d", "posted_at",
+        ["public.accounts.balance"], derives_pairs=(("bank", "public.accounts.balance"),))
+    client = FakeLLM(script={
+        "overlay.contract.critique": FakeResponse(output={"findings": []}),
+        "overlay.contract.refine": FakeResponse(output={"definition": "Average 90-day balance."})})
+    from featuregen.overlay.upload.contract.review import author_contract
+    result_draft, unresolved = author_contract(db, draft, client)
+    assert unresolved == []                              # MCV clean + no critique -> nothing unresolved
+    assert result_draft.feature_name == "avg_balance_90d"
