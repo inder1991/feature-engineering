@@ -21,7 +21,15 @@ def test_descriptor_with_non_string_value_fails():
 
 
 def test_oversized_descriptor_value_fails():
-    bad = [{"column": "c0", "business_definition": "x" * 201}]
+    # A non-definition descriptor scalar stays capped at 200 (only business_definition gets 600).
+    bad = [{"column": "c0", "type": "x" * 201}]
+    assert _item_egress_ok({"table": "txn", "column_profiles": bad}) is False
+
+
+def test_descriptor_business_definition_allows_up_to_600():
+    ok = [{"column": "c0", "business_definition": "x" * 600}]
+    assert _item_egress_ok({"table": "txn", "column_profiles": ok}) is True
+    bad = [{"column": "c0", "business_definition": "x" * 601}]
     assert _item_egress_ok({"table": "txn", "column_profiles": bad}) is False
 
 

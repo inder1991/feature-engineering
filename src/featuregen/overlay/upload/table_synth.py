@@ -13,7 +13,7 @@ import json
 import logging
 
 from featuregen.overlay.upload.canonical import CanonicalRow
-from featuregen.overlay.upload.enrich import content_hash
+from featuregen.overlay.upload.enrich import bounded_definition, content_hash
 from featuregen.overlay.upload.enrich_batch import BatchItem, run_batched
 from featuregen.overlay.upload.enrich_llm import _MAX_COLUMN_PROFILES
 from featuregen.overlay.upload.sample_parser import strip_sample_values
@@ -30,11 +30,11 @@ def _descriptor(r: CanonicalRow, concept: str | None, definition: str | None) ->
     # glossary sidecar meaning / Pass A draft) — NEVER from `r.definition`, the uploader's raw
     # free-text cell. enrich.py::_concept_metadata forbids egressing a technical row's r.definition;
     # we mirror that exactly. Even the curated text is sample-value-stripped as defence-in-depth and
-    # bounded to 200 chars (the per-value cap the Task-3 egress filter enforces).
+    # bounded on a word boundary to the per-value business_definition cap the egress filter enforces.
     if definition:
         cleaned = strip_sample_values(definition)
         if cleaned:
-            desc["business_definition"] = cleaned[:200]
+            desc["business_definition"] = bounded_definition(cleaned, 600)
     return desc
 
 

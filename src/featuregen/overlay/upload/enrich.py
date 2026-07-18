@@ -37,6 +37,23 @@ _MAX_META_LEN = 200
 _DEF_TASK = "overlay.enrich.definition"
 _DOMAIN_TASK = "overlay.enrich.domain"
 
+# Larger bound for a SANITIZED business definition specifically. The 200-char default cut every real
+# definition mid-sentence; sanitized definitions are the intended metadata payload, so allow a bigger
+# but still-bounded window with word-boundary truncation. Second boundary remains the batch token budget.
+_MAX_DEFINITION_LEN = 600
+
+
+def bounded_definition(text: str, limit: int) -> str:
+    """Trim `text` to <= `limit` chars on a word boundary (prefer a sentence end within the window)."""
+    if len(text) <= limit:
+        return text
+    window = text[:limit]
+    cut = window.rfind(". ")
+    if cut >= limit // 2:          # a sentence break in the back half → keep whole sentences
+        return window[:cut + 1]
+    sp = window.rfind(" ")
+    return window[:sp] if sp > 0 else window
+
 # B1b: the controlled vocabulary the classifier chooses from, handed to the LLM so it classifies into
 # the full structured concept set (B1a) rather than a hardcoded subset. Static — built once.
 _CONCEPT_VOCABULARY: list[dict] = list(classification_vocabulary())
@@ -209,10 +226,13 @@ def _concept_metadata(row: CanonicalRow, rec: GlossaryRecord | None) -> dict:
         # customer sample VALUES in prose ("...representative values such as 3708484836801; 15:07:08
         # ..."). `strip_sample_values` EXCISES that clause before it egresses, so the classifier sees
         # the business meaning but never a raw value (the redaction PII backstop misses most of them).
-        for key, val in (("term_name", rec.term_name),
-                         ("business_definition", strip_sample_values(rec.definition)),
-                         ("data_domain", rec.domain), ("bian_path", rec.bian_path),
-                         ("fibo_path", rec.fibo_path)):
+        meta_defn = strip_sample_values(rec.definition)
+        if meta_defn:
+            # The sanitized business definition is the payload we WANT the classifier to see, so give
+            # it the larger word-bounded window instead of the 200-char default that cut it mid-sentence.
+            meta["business_definition"] = bounded_definition(meta_defn, _MAX_DEFINITION_LEN)
+        for key, val in (("term_name", rec.term_name), ("data_domain", rec.domain),
+                         ("bian_path", rec.bian_path), ("fibo_path", rec.fibo_path)):
             if val:
                 meta[key] = val[:_MAX_META_LEN]
         if rec.synonyms:

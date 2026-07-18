@@ -505,12 +505,23 @@ _CHUNK_SUMMARY_KEYS = _CHUNK_SUMMARY_LIST_KEYS | {"event_or_snapshot"}
 _MAX_CHUNK_SUMMARIES = 256
 
 
+# Per-value egress length cap. Every scalar is capped at 200 EXCEPT the sanitized `business_definition`
+# — the intended metadata payload — which gets a larger (still-bounded) window so a real definition is
+# not cut mid-sentence before it egresses. Matches enrich.bounded_definition's `_MAX_DEFINITION_LEN`.
+_MAX_LEN_DEFAULT = 200
+_MAX_LEN_BY_KEY = {"business_definition": 600}
+
+
+def _max_len_for(key: str) -> int:
+    return _MAX_LEN_BY_KEY.get(key, _MAX_LEN_DEFAULT)
+
+
 def _column_profile_ok(desc: object) -> bool:
     if not isinstance(desc, dict):
         return False
     if any(k not in _COLUMN_PROFILE_KEYS for k in desc):
         return False
-    return all(isinstance(v, str) and len(v) <= 200 for v in desc.values())
+    return all(isinstance(v, str) and len(v) <= _max_len_for(k) for k, v in desc.items())
 
 
 def _chunk_summary_ok(summary: object) -> bool:
@@ -543,9 +554,9 @@ def _item_egress_ok(metadata: dict) -> bool:
             if not all(_chunk_summary_ok(s) for s in v):
                 return False
         elif isinstance(v, list):
-            if not all(isinstance(x, str) and len(x) <= 200 for x in v):
+            if not all(isinstance(x, str) and len(x) <= _max_len_for(k) for x in v):
                 return False
-        elif not isinstance(v, str) or len(v) > 200:
+        elif not isinstance(v, str) or len(v) > _max_len_for(k):
             return False
     return True
 
