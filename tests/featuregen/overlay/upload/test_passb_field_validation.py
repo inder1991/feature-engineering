@@ -127,3 +127,86 @@ def test_invalid_nonempty_event_or_snapshot_is_dropped_not_abstained():
     assert out["event_or_snapshot"] is None
     d = _find(disp, "event_or_snapshot")
     assert d["status"] == "dropped_invalid" and d["reason"] == "event_or_snapshot_off_vocab"
+
+
+# ── [F1] COMPLETE per-field salvage via the REAL path ───────────────────────────────────────────
+# The driver validates the WHOLE `{"results": [...]}` envelope with `reg.validate` BEFORE the
+# ref-aware accept ever runs, so `as_of_basis` / `event_or_snapshot` (like `table_role`) must be
+# BOUNDED STRINGS on the canonical schema — a strict enum there would whole-reject the response on
+# one case-variant/off-vocab value, losing a valid grain and making the code-side normalizers
+# (strip/lower + `basis_not_allowed` / `event_or_snapshot_off_vocab`) unreachable. These tests run
+# `reg.validate` against the REGISTERED schema first, then the accept — not just the direct accept.
+
+_SYNTH_SCHEMA_IDS = ("overlay_table_synth", "overlay_table_synth_batch",
+                     "overlay_table_synth_summary_batch")
+
+
+def _enum_nodes(node):
+    if isinstance(node, dict):
+        if "enum" in node:
+            yield node
+        for v in node.values():
+            yield from _enum_nodes(v)
+    elif isinstance(node, list):
+        for v in node:
+            yield from _enum_nodes(v)
+
+
+def test_no_synth_schema_carries_a_strict_enum():
+    """No Pass B synth schema (either registered version) may carry a schema-side enum — the
+    closed vocabularies live in the PROMPT + `make_ref_accept`, never on the envelope schema."""
+    from featuregen.overlay.upload.enrich_llm import _SCHEMAS
+
+    for schema_id in _SYNTH_SCHEMA_IDS:
+        for version in (1, 2):
+            assert list(_enum_nodes(_SCHEMAS[(schema_id, version)])) == [], (
+                f"{schema_id} v{version} carries a strict enum — whole-rejects on one "
+                "off-vocab field value, destroying per-field salvage")
+
+
+def _real_path(db, synthesis: dict, cols):
+    """The REAL Pass B validation order: `reg.validate` over the whole batch envelope (schema v2 —
+    the version `synthesize_tables` requests) FIRST, then the ref-aware accept on the item."""
+    from featuregen.documents.registry import DocumentSchemaRegistry
+    from featuregen.overlay.upload.enrich_llm import register_enrichment_schemas
+
+    register_enrichment_schemas(db)
+    reg = DocumentSchemaRegistry(db)
+    # must NOT raise — a field-level vocab violation can never whole-reject the envelope
+    reg.validate("overlay_table_synth_batch", 2, {"results": [{"ref": "t", "synthesis": synthesis}]})
+    disp: list[dict] = []
+    accept = make_ref_accept({"t": set(cols)}, dispositions=disp)
+    out, _verdict = accept(json.dumps(synthesis), "t")
+    assert out is not None
+    return json.loads(out), disp
+
+
+def test_case_variant_event_or_snapshot_salvaged_via_real_path(db):
+    out, disp = _real_path(db, {"grain_columns": ["id"], "event_or_snapshot": " Event "}, {"id"})
+    assert out["grain"] == {"columns": ["id"], "is_unique": True}   # grain preserved
+    assert out["event_or_snapshot"] == "event"                      # normalized, not whole-rejected
+    assert _find(disp, "event_or_snapshot")["status"] == "accepted"
+
+
+def test_off_vocab_event_or_snapshot_drops_field_only_via_real_path(db):
+    out, disp = _real_path(db, {"grain_columns": ["id"], "event_or_snapshot": "sometimes"}, {"id"})
+    assert out["grain"] == {"columns": ["id"], "is_unique": True}   # grain KEPT
+    assert out["event_or_snapshot"] is None
+    d = _find(disp, "event_or_snapshot")
+    assert d["status"] == "dropped_invalid" and d["reason"] == "event_or_snapshot_off_vocab"
+
+
+def test_case_variant_as_of_basis_salvaged_via_real_path(db):
+    out, disp = _real_path(db, {"grain_columns": ["id"], "as_of_column": "posted_at",
+                                "as_of_basis": " Posted_At "}, {"id", "posted_at"})
+    assert out["grain"] == {"columns": ["id"], "is_unique": True}
+    assert out["availability_time"] == {"column": "posted_at", "basis": "posted_at"}
+    assert _find(disp, "availability_time")["status"] == "accepted"
+
+
+def test_off_vocab_as_of_basis_drops_availability_only_via_real_path(db):
+    out, disp = _real_path(db, {"grain_columns": ["id"], "as_of_column": "posted_at",
+                                "as_of_basis": "event_time_plus_lag"}, {"id", "posted_at"})
+    assert out["grain"] == {"columns": ["id"], "is_unique": True}
+    assert out["availability_time"] is None
+    assert _find(disp, "availability_time")["reason"] == "basis_not_allowed"

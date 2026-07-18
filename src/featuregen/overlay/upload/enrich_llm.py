@@ -312,10 +312,17 @@ _SCHEMAS: dict[tuple[str, int], dict] = {
         "required": ["results"]},
     # Table-synthesis (Pass B) output schemas. `_batch` is an array of per-item {ref, synthesis}
     # objects (batch harness treats `synthesis` as one structured out-key); the flat sibling is the
-    # `_single_fallback` shape. `event_time_plus_lag` is intentionally EXCLUDED from as_of_basis:
-    # FACT_VALUE_SCHEMAS mandates a `lag_hours` when basis == event_time_plus_lag (facts.py), and
-    # Pass B has no way to infer a lag, so such a proposal would always be denied by
-    # validate_fact_value. Phase 2 offers only the two lag-free bases; adding event_time_plus_lag
+    # `_single_fallback` shape. [F1] per-field salvage: `as_of_basis`, `table_role`, and
+    # `event_or_snapshot` are BOUNDED STRINGS here, never schema enums — `reg.validate` validates
+    # the WHOLE response envelope BEFORE the ref-aware accept, so a strict enum would fail the
+    # ENTIRE synthesis on one case-variant/off-vocab value (losing a valid grain with it). The
+    # closed vocabularies are enumerated in the PROMPT and enforced CODE-SIDE per field in
+    # `table_synth.make_ref_accept` (strip/lower normalization; an off-vocab value drops THAT FIELD
+    # ONLY, with `basis_not_allowed` / `role_off_vocab` / `event_or_snapshot_off_vocab` reason
+    # codes). `event_time_plus_lag` remains intentionally OUTSIDE the accepted as_of_basis vocab
+    # (`_VALID_BASIS`): FACT_VALUE_SCHEMAS mandates a `lag_hours` when basis == event_time_plus_lag
+    # (facts.py), and Pass B has no way to infer a lag, so such a proposal would always be denied by
+    # validate_fact_value. Phase 2 accepts only the two lag-free bases; adding event_time_plus_lag
     # would require a lag_hours field end-to-end (out of scope).
     ("overlay_table_synth_batch", 1): {
         "type": "object", "additionalProperties": False,
@@ -328,12 +335,10 @@ _SCHEMAS: dict[tuple[str, int], dict] = {
                             "grain_columns": {"type": "array",
                                               "items": {"type": "string", "maxLength": 128}},
                             "as_of_column": {"type": ["string", "null"], "maxLength": 128},
-                            "as_of_basis": {"type": ["string", "null"],
-                                            "enum": ["posted_at", "ingested_at", None]},
+                            "as_of_basis": {"type": ["string", "null"], "maxLength": 64},
                             "primary_entity": {"type": ["string", "null"], "maxLength": 128},
                             "table_role": {"type": ["string", "null"], "maxLength": 64},
-                            "event_or_snapshot": {"type": ["string", "null"],
-                                                  "enum": ["event", "snapshot", None]},
+                            "event_or_snapshot": {"type": ["string", "null"], "maxLength": 64},
                         }, "required": ["grain_columns"]}},
                 "required": ["ref", "synthesis"]}}},
         "required": ["results"]},
@@ -343,12 +348,10 @@ _SCHEMAS: dict[tuple[str, int], dict] = {
             "grain_columns": {"type": "array",
                               "items": {"type": "string", "maxLength": 128}},
             "as_of_column": {"type": ["string", "null"], "maxLength": 128},
-            "as_of_basis": {"type": ["string", "null"],
-                            "enum": ["posted_at", "ingested_at", None]},
+            "as_of_basis": {"type": ["string", "null"], "maxLength": 64},
             "primary_entity": {"type": ["string", "null"], "maxLength": 128},
             "table_role": {"type": ["string", "null"], "maxLength": 64},
-            "event_or_snapshot": {"type": ["string", "null"],
-                                  "enum": ["event", "snapshot", None]},
+            "event_or_snapshot": {"type": ["string", "null"], "maxLength": 64},
         }, "required": ["grain_columns"]},
     # Table-synthesis PHASE 1 (#1 — wide tables): per-column-CHUNK summary. NO fact output — a compact
     # digest of one <=_MAX_COLUMN_PROFILES chunk (candidate grain/id + temporal/as-of columns, entity
@@ -369,8 +372,7 @@ _SCHEMAS: dict[tuple[str, int], dict] = {
                                                     "items": {"type": "string", "maxLength": 128}},
                             "entity_signals": {"type": "array",
                                                "items": {"type": "string", "maxLength": 128}},
-                            "event_or_snapshot": {"type": ["string", "null"],
-                                                  "enum": ["event", "snapshot", None]},
+                            "event_or_snapshot": {"type": ["string", "null"], "maxLength": 64},
                         }, "required": []}},
                 "required": ["ref", "summary"]}}},
         "required": ["results"]},
@@ -578,7 +580,7 @@ _MAX_COLUMN_PROFILES = 64
 # `:`/`/`, which the flat form conflated irrecoverably.
 _ROSTER_ENTRY_KEYS = frozenset({"column", "operational_type", "declared_type"})
 
-# A phase-2 chunk-summary (#1) carries ONLY column-name lists + an event/snapshot enum — bounded,
+# A phase-2 chunk-summary (#1) carries ONLY column-name lists + an event/snapshot signal — bounded,
 # egress-safe, and column-name-shaped (never a data value). `event_or_snapshot` is the lone scalar
 # (nullable enum); the three `*_candidates`/`entity_signals` keys are short string lists. A summary
 # with any other key (or a non-list/oversized value) is rejected pre-egress.

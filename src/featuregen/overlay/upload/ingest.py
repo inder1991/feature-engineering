@@ -1559,10 +1559,13 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
                 # Propose under the SERVICE actor so a human confirmer later satisfies four-eyes.
                 # The SAME collector threads in so the [F9] staling flips land on the records the
                 # accept appended (prior_value_staled is live on the ingest path, not just tests):
+                # `now` is the same threaded round timestamp resolve_and_project uses below, so
+                # a STALED decision recorded here orders consistently with the round's RESOLVED
+                # sibling decisions (Minor-1 — the monotonic read_field_decisions contract).
                 _propose_table_facts(conn, catalog_source, syntheses, actor=_ENRICH_ACTOR,
                                      source_snapshot_id=synth_snapshot,
                                      schema_by_table=schema_by_table,
-                                     dispositions=dispositions)
+                                     dispositions=dispositions, now=now)
                 # Project the advisory table fields' DISPLAY. resolve_and_project is otherwise
                 # called ONLY over glossary COLUMN refs (_ingest_glossary_evidence); table refs need
                 # this explicit call or table_role/primary_entity/event_or_snapshot never project

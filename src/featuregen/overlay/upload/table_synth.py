@@ -22,6 +22,8 @@ from featuregen.overlay.upload.taxonomy.dimensions import known_entities
 from featuregen.runtime.observability import counters
 
 if TYPE_CHECKING:
+    from datetime import datetime
+
     from featuregen.overlay.upload.column_view import ColumnMetadataView, TableMetadataView
 
 logger = logging.getLogger(__name__)
@@ -498,7 +500,8 @@ def _active_skip_state(conn, ref, fact_type) -> str | None:
 def _propose_table_facts(conn, source: str, syntheses: dict[str, dict], *, actor,
                          source_snapshot_id: str,
                          schema_by_table: dict[str, str] | None = None,
-                         dispositions: list[dict] | None = None) -> None:
+                         dispositions: list[dict] | None = None,
+                         now: datetime | None = None) -> None:
     """Route Pass B grain/availability candidates into governed PROPOSED-only facts and advisory
     table-field evidence. Fail-soft (never aborts the upload). Skips QUIETLY only when a stronger
     active claim governs the key (VERIFIED / a pending proposal); otherwise lets propose_fact
@@ -530,7 +533,12 @@ def _propose_table_facts(conn, source: str, syntheses: dict[str, dict], *, actor
     STALED decision (supersedes read from the durable decision log, [F2]) and CLEARS the flat
     ``graph_node`` display column. This runs BEFORE the caller's ``resolve_and_project`` in the
     SAME transaction (the ingest Pass B savepoint), which then SKIPS the evidence-less field —
-    the clear is never re-projected away."""
+    the clear is never re-projected away.
+
+    ``now`` is the ingest round's threaded decision timestamp, passed through to
+    ``stale_and_clear_field`` so the STALED decision carries the SAME ``now`` as the round's
+    sibling RESOLVED decisions (the monotonic-ordering contract of ``read_field_decisions``).
+    ``None`` (a direct caller) keeps the prior wall-clock behavior."""
     # Imported lazily (mirrors _propose_governed_joins): propose_fact resolves the catalog adapter
     # at import-use time, and the pure assembler/accept tests must import this module without
     # pulling the command stack (or ingest, which imports table_synth lazily in the Pass B block).
@@ -621,4 +629,5 @@ def _propose_table_facts(conn, source: str, syntheses: dict[str, dict], *, actor
                     # the STALED decision + clear the display NOW — same transaction, BEFORE the
                     # caller's resolve_and_project, so the clear is never re-projected away.
                     stale_and_clear_field(
-                        conn, source=source, logical_ref=logical_ref, field_name=field_name)
+                        conn, source=source, logical_ref=logical_ref, field_name=field_name,
+                        now=now)

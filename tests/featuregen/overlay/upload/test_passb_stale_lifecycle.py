@@ -110,6 +110,30 @@ def test_present_value_replacing_older_marks_prior_value_staled(overlay_conn, se
     assert read_field_decisions(overlay_conn, _REF, "table_role")[-1].event_type == "resolved"
 
 
+def test_staled_decision_uses_the_threaded_now(overlay_conn, service_actor):
+    """Minor-1: the STALED decision carries the SAME threaded ``now`` as the round's sibling
+    RESOLVED decisions (``read_field_decisions`` orders by ``created_at`` — a wall-clock STALED
+    row under a future-dated round ``now`` would misorder the history). ``_propose_table_facts``
+    threads ``now`` through to ``stale_and_clear_field``; unset keeps the wall-clock default."""
+    from datetime import UTC, datetime, timedelta
+
+    _seed_table_node(overlay_conn)
+    _round(overlay_conn, {"grain_columns": [], "table_role": "dimension"},
+           actor=service_actor, snapshot="snap-r1")
+
+    future = datetime.now(UTC) + timedelta(days=7)
+    dispositions: list[dict] = []
+    accept = make_ref_accept({"txn": {"id", "posted_at"}}, dispositions=dispositions)
+    out, _verdict = accept(json.dumps({"grain_columns": []}), "txn")   # table_role DROPPED
+    _propose_table_facts(overlay_conn, "src", {"txn": json.loads(out)}, actor=service_actor,
+                         source_snapshot_id="snap-r2", dispositions=dispositions, now=future)
+    resolve_and_project(overlay_conn, source="src", logical_refs=[_REF], now=future)
+
+    latest = read_field_decisions(overlay_conn, _REF, "table_role")[-1]
+    assert latest.event_type == "staled"
+    assert latest.created_at == future           # the round's now, not wall-clock
+
+
 def test_human_confirmation_keeps_field_alive_while_llm_rows_stale(overlay_conn, service_actor):
     """[F9] the clear-gate decoupling: with a HUMAN confirmation active, a dropped advisory field
     still stales its LLM rows (disposition marked) but records NO staled decision — the field
