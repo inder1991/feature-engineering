@@ -3,7 +3,7 @@ customer path, read-only: the body carries only a batch identifier; every count/
 server-side from the persisted WORM stores (never the request body)."""
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Annotated
 
 import psycopg
@@ -35,7 +35,12 @@ class EvaluateIn(BaseModel):
 
 @router.post("/gate/evaluate", dependencies=[Depends(require_confirmer)])
 def evaluate(body: EvaluateIn, conn: _Conn) -> dict:
-    window = select_window(conn, cohort=body.cohort, since=body.since, until=body.until)
+    # The frontend sends date-only strings, which Pydantic coerces to NAIVE midnight; a naive
+    # timestamp compared against timestamptz is cast in the PG session timezone (deployment-
+    # dependent). Pin naive edges to UTC so the window is reproducible everywhere.
+    since = body.since if body.since.tzinfo else body.since.replace(tzinfo=UTC)
+    until = body.until if body.until.tzinfo else body.until.replace(tzinfo=UTC)
+    window = select_window(conn, cohort=body.cohort, since=since, until=until)
     report = build_population_report(conn, window.run_ids)
     gold = run_gold_suite(conn)
     stability = run_double_compile(conn)

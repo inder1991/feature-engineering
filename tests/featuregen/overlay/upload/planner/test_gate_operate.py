@@ -37,6 +37,16 @@ def test_only_fully_qualifying_runs_are_selected(db):
     assert sel.coverage.excluded["wrong_cohort"] == 2  # other_cohort + uncertified are not this cohort
 
 
+def test_unset_cohort_is_never_selectable_even_when_requested_verbatim(db):
+    # A caller passing the 'unset' sentinel AS the cohort must select nothing, even though rows
+    # with producer_commit='unset' match it verbatim — guards the `or cohort == "unset"` disjunct.
+    _dispatch(db, "uncertified", cohort="unset")
+    sel = select_window(db, cohort="unset", since=_T0, until=datetime(2026, 7, 19, tzinfo=UTC))
+    assert sel.run_ids == ()
+    assert sel.coverage.dispatched_in_range == 1
+    assert sel.coverage.excluded["wrong_cohort"] == 1
+
+
 def test_out_of_range_runs_are_excluded(db):
     _dispatch(db, "inrange", at=_T0)
     _dispatch(db, "before", at=datetime(2026, 7, 1, tzinfo=UTC))

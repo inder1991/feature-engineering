@@ -83,10 +83,11 @@ export function GateEvaluationScreen() {
   const [cohorts, setCohorts] = useState<GateCohort[] | null>(null)
   const [cohortsError, setCohortsError] = useState('')
   const [cohort, setCohort] = useState('')
-  // Default window: the trailing 30 days. Sent verbatim as the date-input value (YYYY-MM-DD);
-  // the server parses it as a datetime at midnight UTC.
+  // Default window: the trailing 30 days INCLUDING today. Sent verbatim as the date-input value
+  // (YYYY-MM-DD); the server pins it to midnight UTC. The window is half-open [since, until), so
+  // `until` defaults to TOMORROW — defaulting it to today would exclude every same-day run.
   const [since, setSince] = useState(() => isoDate(new Date(Date.now() - 30 * 86_400_000)))
-  const [until, setUntil] = useState(() => isoDate(new Date()))
+  const [until, setUntil] = useState(() => isoDate(new Date(Date.now() + 86_400_000)))
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
   // The result is kept WITH the window it was evaluated for — editing the form after a run must

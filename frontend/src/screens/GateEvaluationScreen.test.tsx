@@ -4,6 +4,14 @@ import { describe, expect, it, vi } from 'vitest'
 import { GateEvaluationScreen } from './GateEvaluationScreen'
 
 describe('gate evaluation screen', () => {
+  it('defaults until to tomorrow so the half-open window includes today', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: true, json: async () => [] }))
+    const tomorrow = new Date(Date.now() + 86_400_000).toISOString().slice(0, 10)
+    render(<GateEvaluationScreen />)
+    expect(await screen.findByLabelText('Until')).toHaveValue(tomorrow)
+  })
+
+
   it('renders a FAIL verdict with the necessary-not-sufficient caveat and coverage', async () => {
     vi.stubGlobal('fetch', vi.fn()
       .mockResolvedValueOnce({ ok: true, json: async () => [{ cohort: 'sha1', first_run_at: 'x', last_run_at: 'y', run_count: 3 }] })

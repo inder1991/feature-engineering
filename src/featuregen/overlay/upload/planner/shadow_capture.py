@@ -3,7 +3,8 @@
 Keeps ``shadow.py`` the orchestrator: this module owns the (result -> RunResultRowV1 + observations)
 mapping, the TOTAL ``PlanResolutionStatus -> PlannerOutcome`` map (an unmapped status would hit the DB
 CHECK and become silent loss), the ``compile_status`` computation (relative to PATH-RESOLVED
-candidates), and the calls into the D3 replay fingerprints. Pure over its inputs (no DB).
+candidates), and the calls into the D3 replay fingerprints. No DB access; ``build_dispatch``
+additionally reads deployment config (the producer commit) via ``get_settings()``.
 """
 from __future__ import annotations
 

@@ -16,6 +16,31 @@ def test_gate_evaluate_requires_platform_admin(client, non_admin_headers):
     assert r.status_code == 403
 
 
+def test_gate_cohorts_requires_platform_admin(client, non_admin_headers):
+    r = client.get("/gate/cohorts", headers=non_admin_headers)
+    assert r.status_code == 403
+
+
+def test_gate_evaluate_window_is_utc_anchored(client, admin_headers, db):
+    """The frontend sends date-only strings (YYYY-MM-DD) which Pydantic coerces to NAIVE midnight;
+    the route must pin those edges to UTC so the window is reproducible across deployments. Pin a
+    non-UTC session timezone (east of UTC, where a naive midnight lands BEFORE UTC midnight) and
+    prove a run created late in the same UTC day is still inside the half-open [since, until)."""
+    db.execute(
+        "INSERT INTO planner_shadow_dispatch (generation_run_id, eligible_recipe_ids, recipe_hash,"
+        " expected_count, invocation_predicate, compile_flag, telemetry_flag, scoped_applicability_flag,"
+        " ranking_flag, applicability_version, producer_commit, compiler_versions, compiler_versions_hash,"
+        " payload_schema_version, created_at) VALUES ('utc1','{}','h',0,'p',true,true,true,true,'v',"
+        "'sha-utc','{}','ch','pv','2026-07-18T23:30:00+00:00')")
+    db.execute("SET TIME ZONE 'Asia/Kolkata'")
+    r = client.post("/gate/evaluate", json={"cohort": "sha-utc", "since": "2026-07-18",
+                                            "until": "2026-07-19"}, headers=admin_headers)
+    assert r.status_code == 200
+    coverage = r.json()["coverage"]
+    assert coverage["dispatched_in_range"] == 1
+    assert coverage["qualifying"] == 1
+
+
 def test_gate_evaluate_empty_window_fails_closed(client, admin_headers):
     r = client.post("/gate/evaluate", json={"cohort": "ghost", "since": "2026-07-18T00:00:00Z",
                                             "until": "2026-07-19T00:00:00Z"}, headers=admin_headers)
