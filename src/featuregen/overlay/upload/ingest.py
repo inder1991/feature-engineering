@@ -523,6 +523,21 @@ def _schema_by_table(glossary: GlossaryUpload | None) -> dict[str, str]:
     return out
 
 
+def _source_is_schema_less(conn, catalog_source: str) -> bool:
+    """True iff ``catalog_source`` already holds column nodes and NONE carry a ``schema_name`` — a
+    schema-less TECHNICAL source (built by a plain technical CSV upload; build_graph writes
+    schema_name only for a schema-carrying glossary). False for a brand-new source (zero existing
+    column nodes) and for an existing FTR/glossary source (schema_name set), so neither is falsely
+    held. ``count(schema_name)`` counts only NON-NULL values, so ``with_schema == 0`` means every
+    existing column node is schema-less."""
+    row = conn.execute(
+        "SELECT count(*) AS n, count(schema_name) AS with_schema "
+        "FROM graph_node WHERE catalog_source = %s AND kind = 'column'",
+        (catalog_source,)).fetchone()
+    n, with_schema = (row["n"], row["with_schema"]) if isinstance(row, dict) else (row[0], row[1])
+    return n > 0 and with_schema == 0
+
+
 def _cross_schema_conflicts(conn, catalog_source: str, rows: list[CanonicalRow],
                             glossary: GlossaryUpload, *,
                             skip_indexes: set[int]) -> list[RowError]:
@@ -1160,6 +1175,23 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
                  started_at=stage_started)
 
     if glossary is not None:
+        # MF-6 source-kind guard — a SCHEMA-CARRYING (FTR) upload carries a schema (the schema segment
+        # of its FQN, set by the FTR adapter), so it can only enrich a NEW source or an existing
+        # FTR-only source. Pointed at an EXISTING schema-less source (every column node's schema_name
+        # NULL) it would otherwise half-land behind the column-level cross-schema fence below with an
+        # opaque "schema conflict" message (the legacy-NULL policy). Detect it up front and hold with
+        # an actionable message BEFORE any side effect; the fence stays the column-level backstop.
+        # GATED on the INCOMING upload carrying a schema: a GENERIC glossary (read_glossary) is
+        # schema-less BY DESIGN (its records set no schema, so build_graph leaves schema_name NULL) —
+        # its own re-upload must NOT be held, and it cannot half-land behind the fence anyway.
+        incoming_carries_schema = any(rec.schema for rec in glossary.records)
+        if incoming_carries_schema and _source_is_schema_less(conn, catalog_source):
+            return IngestResult(
+                "held",
+                "this FTR upload requires a new or existing FTR-only source; it cannot "
+                f"enrich the existing schema-less technical source '{catalog_source}'. "
+                "Choose a new source name or an FTR source.",
+                0, 0, len(vr.quarantined))
         # Cross-upload schema fence (round-4 #4) — BEFORE any side effect (no UploadCatalog, no
         # facts, no graph write): a schema-carrying upload that would re-attribute an existing
         # public-flattened column to a DIFFERENT schema holds the WHOLE upload fail-closed.
