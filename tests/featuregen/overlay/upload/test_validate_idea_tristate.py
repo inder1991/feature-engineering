@@ -1,8 +1,11 @@
 from datetime import UTC, datetime, timedelta
 
+from featuregen.overlay.field_decision import FieldDecisionEventType, record_field_decision
+from featuregen.overlay.field_evidence import canonical_hash
 from featuregen.overlay.upload.canonical import CanonicalRow
 from featuregen.overlay.upload.feature_assist import RejectCode, _validate_idea
 from featuregen.overlay.upload.graph import build_graph
+from featuregen.overlay.upload.object_ref import normalize_ref
 
 NOW = datetime(2026, 7, 18, tzinfo=UTC)
 FRESH = timedelta(hours=24)
@@ -124,3 +127,52 @@ def test_operational_numeric_data_type_clears_type_check(db):
     assert rej is None
     assert idea.validation_status == "DESIGN_CHECKED"
     assert all(r.code != "TYPE_IS_NUMERIC" for r in idea.requirements)
+
+
+def _govern(db, catalog, ref, field_name, value):
+    lref = normalize_ref(catalog, "public", ref.split(".")[-2], ref.split(".")[-1])
+    record_field_decision(
+        db, logical_ref=lref, field_name=field_name,
+        event_type=FieldDecisionEventType.RESOLVED, selected_evidence_ids=[],
+        evidence_set_hash=canonical_hash([]), display_value_hash=canonical_hash(value),
+        load_bearing_value_hash=canonical_hash(value), conflict_status="resolved",
+        reason_codes=[], field_policy_version="upload-field-policy-v1",
+        resolver_version="upload-resolve-and-project-v1", actor_ref=None, supersedes_event_id=None)
+
+
+def test_governed_non_additive_sum_is_rejected(db):
+    build_graph(db, "bank", [
+        CanonicalRow("bank", "accounts", "balance", "numeric", additivity="non_additive")])
+    _fresh(db, "bank")
+    _govern(db, "bank", "public.accounts.balance", "additivity", "non_additive")
+    known, src_of = _kv(["public.accounts.balance"], "bank")
+    raw = {"name": "sum_bal", "derives_from": ["public.accounts.balance"], "aggregation": "sum"}
+    idea, rej = _validate_idea(db, raw, known, src_of, None, NOW, FRESH)
+    assert idea is None and rej.code == RejectCode.ADDITIVITY
+
+
+def test_unresolved_additivity_sum_needs_external_validation(db):
+    build_graph(db, "bank", [
+        CanonicalRow("bank", "accounts", "balance", "numeric", additivity="semi_additive")])
+    _fresh(db, "bank")   # additivity is file-declared only -> NOT governed
+    known, src_of = _kv(["public.accounts.balance"], "bank")
+    raw = {"name": "sum_bal", "derives_from": ["public.accounts.balance"], "aggregation": "sum"}
+    idea, rej = _validate_idea(db, raw, known, src_of, None, NOW, FRESH)
+    assert rej is None
+    assert idea.validation_status == "NEEDS_EXTERNAL_VALIDATION"
+    assert any(r.code == "ADDITIVITY_SUPPORTS_OPERATION" for r in idea.requirements)
+    operands = [r.operand for r in idea.requirements if r.code == "ADDITIVITY_SUPPORTS_OPERATION"]
+    assert operands == [("bank", "public.accounts.balance")]
+
+
+def test_governed_additive_sum_clears_additivity_check(db):
+    build_graph(db, "bank", [
+        CanonicalRow("bank", "accounts", "balance", "numeric", additivity="additive")])
+    _fresh(db, "bank")
+    _govern(db, "bank", "public.accounts.balance", "additivity", "additive")
+    known, src_of = _kv(["public.accounts.balance"], "bank")
+    raw = {"name": "sum_bal", "derives_from": ["public.accounts.balance"], "aggregation": "sum"}
+    idea, rej = _validate_idea(db, raw, known, src_of, None, NOW, FRESH)
+    assert rej is None
+    assert idea.validation_status == "DESIGN_CHECKED"
+    assert all(r.code != "ADDITIVITY_SUPPORTS_OPERATION" for r in idea.requirements)

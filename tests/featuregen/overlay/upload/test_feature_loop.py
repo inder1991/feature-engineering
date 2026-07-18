@@ -26,9 +26,24 @@ def _fresh_watermark(db, source, now):
         (source, now, now))
 
 
+def _govern_additivity(db, source, table, column, value):
+    from featuregen.overlay.field_decision import FieldDecisionEventType, record_field_decision
+    from featuregen.overlay.field_evidence import canonical_hash
+    from featuregen.overlay.upload.object_ref import normalize_ref
+    lref = normalize_ref(source, "public", table, column)
+    record_field_decision(
+        db, logical_ref=lref, field_name="additivity",
+        event_type=FieldDecisionEventType.RESOLVED, selected_evidence_ids=[],
+        evidence_set_hash=canonical_hash([]), display_value_hash=canonical_hash(value),
+        load_bearing_value_hash=canonical_hash(value), conflict_status="resolved",
+        reason_codes=[], field_policy_version="upload-field-policy-v1",
+        resolver_version="upload-resolve-and-project-v1", actor_ref=None, supersedes_event_id=None)
+
+
 def test_loop_rejects_leaky_and_unsafe_keeps_good(db):
     _bank(db)
     _fresh_watermark(db, "bank", NOW)
+    _govern_additivity(db, "bank", "accounts", "balance", "non_additive")
     client = FakeLLM(script={"overlay.feature.recommend": FakeResponse(output={"features": [
         {"name": "leaky", "derives_from": ["public.accounts.churned"]},                 # leaks target
         {"name": "unsafe", "derives_from": ["public.accounts.balance"],
@@ -207,6 +222,7 @@ def test_gauntlet_catches_additive_unsafe_names_without_sum(db):
         CanonicalRow("t", "accounts", "balance", "numeric", additivity="semi_additive"),
         CanonicalRow("t", "accounts", "posted_at", "timestamp", as_of=True)])
     _fresh_watermark(db, "t", NOW)
+    _govern_additivity(db, "t", "accounts", "balance", "semi_additive")
     for agg in ("total_balance", "running_total", "cumulative"):
         client = FakeLLM(script={"overlay.feature.recommend": FakeResponse(output={"features": [
             {"name": f"f_{agg}", "derives_from": ["public.accounts.balance"], "aggregation": agg}]})})

@@ -279,11 +279,16 @@ def _validate_idea(conn, raw: dict, known: set[str], src_of: dict[str, set[str]]
             requirements.append(Requirement("TYPE_IS_NUMERIC", (src, d),
                                             "operational type unknown; numeric declared hint"))
 
-    # ── disposition: additivity (Task 7 REPLACES this block) ──
+    # ── disposition: additivity — only a GOVERNED semi/non-additive rejects; an unresolved
+    #    (file-declared / hint) additivity is honest needs-check (spec [F6]) ──
     if _is_additive_unsafe(aggregation):
-        for d in derives:
-            if meta.get(d, {}).get("additivity") in ("semi_additive", "non_additive"):
+        for src, d in pairs:
+            facts = read_column_facts(conn, logical_ref_of(src, d), "additivity")
+            if facts.authority == "governed" and facts.value in ("semi_additive", "non_additive"):
                 return None, Rejection(RejectCode.ADDITIVITY, f"unsafe additive aggregation of {d}")
+            if facts.authority != "governed":
+                requirements.append(Requirement("ADDITIVITY_SUPPORTS_OPERATION", (src, d),
+                                                "additivity not governed-confirmed"))
 
     # ── disposition: unit / currency (Task 9 AUGMENTS this block) ──
     units = {meta[d]["unit"] for d in derives if meta.get(d, {}).get("unit")}
