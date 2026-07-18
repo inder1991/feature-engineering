@@ -208,7 +208,9 @@ def test_upload_response_body_unchanged_by_run_manifest(client):
     assert res.status_code == 200
     body = res.json()
     assert list(body.keys()) == ["status", "reason", "asserted", "changed_objects",
-                                 "quarantined", "flagged"]
+                                 "quarantined", "flagged", "objects_stored", "tables", "columns",
+                                 "containment_edges", "facts_asserted", "join_candidates",
+                                 "passb_proposed", "passb_abstained"]
     run_id = res.headers["X-Ingestion-Run-Id"]
     assert run_id.encode() not in res.content
 
@@ -225,7 +227,9 @@ def test_upload_response_body_byte_identical_with_stage_reports(client):
     expected = {
         "status": "ingested", "reason": None, "asserted": 4, "changed_objects": 0,
         "quarantined": 0,
-        "flagged": "first upload of 'deposits' (9 objects) — review recommended"}
+        "flagged": "first upload of 'deposits' (9 objects) — review recommended",
+        "objects_stored": 12, "tables": 3, "columns": 9, "containment_edges": 9,
+        "facts_asserted": 4, "join_candidates": 0, "passb_proposed": 0, "passb_abstained": 0}
     assert res.content == json.dumps(
         expected, separators=(",", ":"), ensure_ascii=False).encode()
 
