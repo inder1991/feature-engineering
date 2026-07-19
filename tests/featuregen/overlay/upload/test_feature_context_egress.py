@@ -11,11 +11,19 @@ SAFE dict shape, with NULLABLE graph `definition`/`concept` — must pass the ga
 import json
 
 from featuregen.intake.llm import PROVIDER_OK, FakeLLM, FakeResponse, LLMResult
-from featuregen.intake.redaction import INPUT_KEY_CATALOG
+from featuregen.intake.redaction import INPUT_KEY_CATALOG, INPUT_KEY_CLASSIFICATION
 from featuregen.overlay.upload.enrich_llm import sanitize_feature_context
 
 _SAMPLE = ("Posting amount is the monetary value of the ledger entry, with representative values "
            "such as 3708484836801; 3708446902413; 3708454004701, which supports interpretation.")
+
+# Plain-prose definition carrying a REAL PII token (EMAIL — the Slice-1 deterministic detector's
+# canonical class): no sample-clause marker anywhere, so `sanitize_definition` neither strips nor
+# blanks (state="none", reason="") and the ONLY protective action is the PII redaction — exercising
+# the adapter's `pii_spans.extend(...)` span-emission branch, which no clause-strip/blank test can.
+_PII_TOKEN = "jane.doe@bank.example"
+_PII_DEFN = (f"Escalation contact for this ledger column; route alerts to {_PII_TOKEN} "
+             "before month-end close.")
 
 
 def test_non_feature_payload_untouched():
@@ -112,6 +120,27 @@ def test_enriched_menu_shape_with_flag_facts_passes():
     assert (spans, audits, ver) == ([], [], None)
 
 
+def test_definition_pii_redaction_emits_keyed_spans():
+    """[F3] span-emission branch: a REAL PII token in a nested menu definition (no sample clause,
+    so nothing strips or blanks) must surface as a pii_spans record keyed to its nested path —
+    delete `pii_spans.extend(...)` in `_defn` and this fails."""
+    meta = {"columns": [{"object_ref": "public.ledger.contact_notes", "table": "ledger",
+                         "column": "contact_notes", "definition": _PII_DEFN}]}
+    safe, spans, audits, ver = sanitize_feature_context(meta)
+    assert safe is not None                                  # redacted, NOT fail-closed
+    clean = safe["columns"][0]["definition"]
+    assert _PII_TOKEN not in clean                           # the raw token never survives
+    assert "[REDACTED:EMAIL]" in clean
+    # The span record keeps nested-path granularity: key + type + offsets, never the value.
+    email_spans = [s for s in spans if s.get("key") == "columns[0].definition"]
+    assert email_spans, f"no span keyed columns[0].definition in {spans!r}"
+    assert all(s["type"] == "EMAIL" and "start" in s and "end" in s for s in email_spans)
+    assert all("value" not in s for s in email_spans)
+    # Plain prose: sanitized (state none), not clause-stripped, and versioned by the redactor.
+    assert any(a["path"] == "columns[0].definition" and a["state"] == "none" for a in audits)
+    assert ver
+
+
 class _Capture:
     """Client that records the outbound request and answers with a valid (empty) idea list."""
 
@@ -170,6 +199,37 @@ def test_audited_structured_call_strips_planted_sample_before_dispatch(db):
     assert row is not None
     assert "columns[0].definition" in row[0]        # sample_strip audit reached the record
     assert "3708484836801" not in row[0]            # ...and never the value
+
+
+def test_audited_structured_call_persists_pii_span_and_classification(db):
+    """End-to-end at the seam: a REAL PII token in a menu column's definition is redacted (not
+    blanked) before dispatch, its span record reaches the immutable llm_call's input_redaction
+    keyed to the nested path, and the persisted classification honestly reads `contains_pii` —
+    dropping the adapter's span branch would silently flip it to `clean`."""
+    client = _Capture()
+    out = _seam_call(db, client, {"columns": [
+        {"object_ref": "public.ledger.contact_notes", "table": "ledger",
+         "column": "contact_notes", "definition": _PII_DEFN}]})
+    assert out == {"features": []}                  # redacted, dispatched — NOT fail-closed
+    assert len(client.requests) == 1
+    req_inputs = client.requests[-1].inputs
+    assert _PII_TOKEN not in json.dumps(req_inputs[INPUT_KEY_CATALOG])  # never egressed
+    assert req_inputs[INPUT_KEY_CLASSIFICATION] == "contains_pii"       # honest outbound verdict
+    row = db.execute(
+        "SELECT input_redaction, redacted_input FROM llm_call"
+        " WHERE task = 'overlay.feature.recommend'").fetchone()
+    assert row is not None
+    input_redaction, redacted_input = row
+    # (a) the span record persisted at nested-path granularity: key + type + offsets, no value.
+    spans = [s for s in input_redaction["redacted_spans"]
+             if s.get("key") == "columns[0].definition"]
+    assert spans, f"no persisted span keyed columns[0].definition in {input_redaction!r}"
+    assert all(s["type"] == "EMAIL" and "start" in s and "end" in s for s in spans)
+    # (b) the raw token is in neither the redaction record nor the persisted outbound payload.
+    assert _PII_TOKEN not in json.dumps(input_redaction)
+    assert _PII_TOKEN not in json.dumps(redacted_input)
+    # (c) the persisted request's classification field reads the scan's honest verdict.
+    assert redacted_input[INPUT_KEY_CLASSIFICATION] == "contains_pii"
 
 
 def test_audited_structured_call_blocks_blanked_definition_no_dispatch(db):
