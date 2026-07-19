@@ -57,9 +57,18 @@ CREATE TABLE IF NOT EXISTS feature_contract_validation_state (
     effective_verification text        NOT NULL
                            CHECK (effective_verification IN ('UNVERIFIED', 'DESIGN-CHECKED',
                                                             'DATA-CHECKED', 'USEFULNESS-CHECKED')),
+    -- MF-4: TERMINAL supersession marker. A re-confirm mints a new contract version and emits a
+    -- SUPERSEDED event for the prior version; the fold sets this true + demotes effective_verification
+    -- to UNVERIFIED, so the retired version reads not-live and a late EXTERNAL_PASSED can never
+    -- resurrect it. Derived (the fold is a pure function of the event prefix), so a replay reproduces
+    -- it identically. Additive + nullable-with-default = existing/replayed rows default false.
+    superseded             boolean     NOT NULL DEFAULT false,
     applied_seq            bigint      NOT NULL DEFAULT 0,
     updated_at             timestamptz NOT NULL DEFAULT now()
 );
+-- Idempotent add for a database that already applied an earlier 1009 without the column.
+ALTER TABLE feature_contract_validation_state
+    ADD COLUMN IF NOT EXISTS superseded boolean NOT NULL DEFAULT false;
 
 -- 3) The IMMUTABLE requirement rows (write-once), version- + fingerprint- + content-hash-keyed. A
 --    re-assessment against a new schema version or a changed metadata input yields NEW rows (distinct
@@ -92,3 +101,17 @@ $$ LANGUAGE plpgsql;
 CREATE OR REPLACE TRIGGER feature_validation_requirement_no_mutation
     BEFORE UPDATE OR DELETE ON feature_validation_requirement
     FOR EACH ROW EXECUTE FUNCTION feature_validation_requirement_write_once();
+
+-- MF-3 (WORM breach): the BEFORE UPDATE OR DELETE row triggers above are FOR EACH ROW and, like
+-- every row trigger, do NOT fire on a statement-level TRUNCATE — so without this the app role could
+-- vaporize the append-only authority log (and the immutable requirement rows) while the mutable
+-- state table keeps serving DATA-CHECKED. Mirror the 0900/1002 deployment control: a guarded REVOKE
+-- of destructive DML from the production non-superuser 'featuregen_app' role. No-op in the superuser
+-- test cluster where the role is absent (a superuser bypasses grants anyway). The REBUILDABLE
+-- feature_contract_validation_state is DELIBERATELY excluded — a projection replay must overwrite it.
+DO $$ BEGIN
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'featuregen_app') THEN
+        REVOKE UPDATE, DELETE, TRUNCATE ON feature_contract_validation_event FROM featuregen_app;
+        REVOKE UPDATE, DELETE, TRUNCATE ON feature_validation_requirement FROM featuregen_app;
+    END IF;
+END $$;

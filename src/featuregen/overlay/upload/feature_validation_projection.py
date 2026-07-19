@@ -60,11 +60,19 @@ _EVENT_TYPES = ("ASSESSED", "EXTERNAL_PASSED", "EXTERNAL_FAILED", "INVALIDATED",
 # --------------------------------------------------------------------------------------------------
 def _fold_effective_state(
     events: Sequence[Mapping], blocking_req_ids: frozenset[str], *, contract_id: str
-) -> tuple[str, str]:
+) -> tuple[str, str, bool]:
     """Fold a contract's validation events (ascending ``seq``) into ``(validation_status,
-    effective_verification)``. The LATEST-seq event governs (a later INVALIDATED demotes a prior
-    DATA-CHECKED); ``blocking_req_ids`` is the set of the contract's blocking requirements (from
-    ``feature_validation_requirement``), the requirements the DATA-CHECKED promotion depends on.
+    effective_verification, superseded)``. The LATEST-seq event governs (a later INVALIDATED demotes
+    a prior DATA-CHECKED); ``blocking_req_ids`` is the set of the contract's blocking requirements
+    (from ``feature_validation_requirement``), the requirements the DATA-CHECKED promotion depends
+    on.
+
+    MF-4: SUPERSEDED is TERMINAL. Once a newer contract version has retired this one, the fold
+    freezes the row as history — ``superseded`` is set True, the effective stamp is demoted to
+    UNVERIFIED, and NO later (late/redelivered) EXTERNAL_PASSED/ASSESSED/INVALIDATED can re-promote
+    it. Because the fold is a PURE function of the ordered event prefix, this stickiness needs no
+    persisted flag to be correct on replay — the returned ``superseded`` is carried into the state
+    row only so the read surface can report WHY a retired version reads UNVERIFIED.
 
     Raises ``ProjectionApplyError`` on a poison event (non-object payload, or an ASSESSED that
     declares a validation_status outside the vocabulary) so ``catch_up`` marks it degraded + skips.
@@ -72,6 +80,7 @@ def _fold_effective_state(
     status = "needs_external_validation"
     verification = _UNVERIFIED
     passed: set[str] = set()  # requirement_ids with a CURRENT external pass (reset each assessment)
+    superseded = False        # MF-4: TERMINAL once a SUPERSEDED event is seen
 
     for event in events:
         etype = event["event_type"]
@@ -80,6 +89,12 @@ def _fold_effective_state(
             raise ProjectionApplyError(
                 AGGREGATE, contract_id,
                 f"malformed payload (not a JSON object) on seq={event['seq']}")
+
+        if superseded and etype != "SUPERSEDED":
+            # MF-4: retired version — every later event is a no-op for the state (the malformed-
+            # payload poison check above still runs, so corruption is never masked). This is the
+            # stickiness that stops a late EXTERNAL_PASSED resurrecting a live DATA-CHECKED.
+            continue
 
         if etype == "ASSESSED":
             passed = set()  # a fresh deterministic assessment opens a new external-check epoch
@@ -119,9 +134,11 @@ def _fold_effective_state(
             status, verification = "needs_external_validation", _UNVERIFIED
 
         elif etype == "SUPERSEDED":
-            # A newer contract version replaced this one. The 1009 state table has no dedicated
-            # superseded column, so the row is RETAINED as history (validation_status kept) but its
-            # effective stamp is demoted — it is no longer a live verification.
+            # A newer contract version replaced this one. Retain the row as history
+            # (validation_status kept) but demote the effective stamp AND set the terminal
+            # ``superseded`` marker — from here the fold ignores any later event (gate above), so a
+            # redelivered EXTERNAL_PASSED can never resurrect this retired version's live stamp.
+            superseded = True
             verification = _UNVERIFIED
 
         else:
@@ -129,7 +146,7 @@ def _fold_effective_state(
             # reachable via a raw/corrupt row — treat as poison.
             raise ProjectionApplyError(AGGREGATE, contract_id, f"unknown event_type {etype!r}")
 
-    return status, verification
+    return status, verification, superseded
 
 
 # --------------------------------------------------------------------------------------------------
@@ -172,8 +189,35 @@ def _head_seq(conn: DbConn) -> int:
 
 
 # --------------------------------------------------------------------------------------------------
-# The projection API: apply_event / catch_up / reset / rebuild.
+# The projection API: lock_checkpoint / apply_event / catch_up / reset / rebuild.
 # --------------------------------------------------------------------------------------------------
+def lock_checkpoint(conn: DbConn) -> None:
+    """MF-1: serialize the WHOLE emit+fold of validation events across concurrent confirms.
+
+    A validation event's ``seq`` is a per-table IDENTITY assigned AT INSERT and visible to other
+    sessions only at COMMIT. Under READ COMMITTED two concurrent ``confirm_contract`` calls would
+    each read the SAME ``projection_checkpoints`` checkpoint with a plain SELECT, fold only their
+    OWN uncommitted event, and advance the checkpoint — so one confirm's committed event is
+    PERMANENTLY skipped (never folded; ``is_read_ready`` then serves a stale stamp as ready) or the
+    checkpoint regresses below head.
+
+    The fix is to take this projection's ``projection_checkpoints`` row FOR UPDATE *BEFORE* any
+    event is INSERTed in the confirm transaction. The row-lock is held to end-of-transaction, so a
+    second concurrent confirm BLOCKS here until the first commits, then reads the advanced checkpoint
+    and folds its own (necessarily higher-seq) event over the committed prefix — seqs are ASSIGNED
+    and FOLDED in the same lock order. A FOR UPDATE inside ``catch_up`` alone does NOT fix this: by
+    the time ``catch_up`` runs the seq is already assigned at INSERT. The checkpoint row is seeded
+    (``INSERT ... ON CONFLICT DO NOTHING`` via ``_ensure_checkpoint``) so the lock finds a row.
+    """
+    _ensure_checkpoint(conn, PROJECTION_NAME, is_analytics=True)
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT checkpoint_seq FROM projection_checkpoints "
+            "WHERE projection_name = %s FOR UPDATE",
+            (PROJECTION_NAME,))
+        cur.fetchone()
+
+
 def apply_event(conn: DbConn, event_row: Mapping) -> bool:
     """Fold ONE validation event into its contract's ``feature_contract_validation_state`` row
     (UPSERT), advancing ``applied_seq`` to this event's ``seq``.
@@ -194,21 +238,24 @@ def apply_event(conn: DbConn, event_row: Mapping) -> bool:
 
     events = _event_prefix(conn, contract_id, seq)
     blocking = _blocking_requirement_ids(conn, contract_id)
-    status, verification = _fold_effective_state(events, blocking, contract_id=contract_id)
+    status, verification, superseded = _fold_effective_state(
+        events, blocking, contract_id=contract_id)
 
     conn.execute(
         """
         INSERT INTO feature_contract_validation_state
-            (contract_id, validation_status, effective_verification, applied_seq, updated_at)
-        VALUES (%s, %s, %s, %s, now())
+            (contract_id, validation_status, effective_verification, superseded, applied_seq,
+             updated_at)
+        VALUES (%s, %s, %s, %s, %s, now())
         ON CONFLICT (contract_id) DO UPDATE SET
             validation_status = EXCLUDED.validation_status,
             effective_verification = EXCLUDED.effective_verification,
+            superseded = EXCLUDED.superseded,
             applied_seq = EXCLUDED.applied_seq,
             updated_at = now()
         WHERE feature_contract_validation_state.applied_seq < EXCLUDED.applied_seq
         """,
-        (contract_id, status, verification, seq))
+        (contract_id, status, verification, superseded, seq))
     return True
 
 
@@ -237,7 +284,12 @@ def catch_up(conn: DbConn, *, batch: int = 500) -> int:
             with conn.transaction():  # savepoint: discard a poison event's partial writes
                 if apply_event(conn, row):
                     applied += 1
-        except Exception as exc:  # noqa: BLE001 — any apply failure is fail-open-but-audited
+        except ProjectionApplyError as exc:
+            # MF-2: ONLY a SIGNALLED poison event (malformed/unknown payload, raised by the fold) is
+            # fail-open-but-audited — mark degraded, record the skip, advance PAST it. Any OTHER
+            # exception (a transient deadlock / lock-timeout) is NOT poison: let it PROPAGATE so the
+            # confirm transaction aborts and the event is retried on the next attempt, instead of
+            # being silently skipped past (which would serve the pre-event stale stamp as ready).
             _mark_degraded(conn, row["contract_id"], reason=str(exc)[:500], seq=int(row["seq"]))
             conn.execute(
                 "INSERT INTO projection_skips (projection_name, event_global_seq, reason) "
@@ -248,7 +300,12 @@ def catch_up(conn: DbConn, *, batch: int = 500) -> int:
 
     head = _head_seq(conn)
     conn.execute(
-        "UPDATE projection_checkpoints SET checkpoint_seq = %s, head_seq = %s, updated_at = now() "
+        # MF-1 (defense-in-depth): advance the checkpoint MONOTONICALLY. GREATEST never lets a
+        # concurrent/late catch_up regress the checkpoint below a higher committed watermark; the
+        # FOR-UPDATE lock taken in lock_checkpoint before the emit is the real serializer, this just
+        # guards the checkpoint value itself. head_seq stays freshly recorded regardless.
+        "UPDATE projection_checkpoints "
+        "SET checkpoint_seq = GREATEST(checkpoint_seq, %s), head_seq = %s, updated_at = now() "
         "WHERE projection_name = %s",
         (last_seq, head, PROJECTION_NAME))
     return applied

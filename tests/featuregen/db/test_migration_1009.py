@@ -14,8 +14,12 @@ requirement identity UNIQUE are all exercised. Mirrors tests/featuregen/db/test_
 """
 from __future__ import annotations
 
+from pathlib import Path
+
 import psycopg
 import pytest
+
+import featuregen.db.migrations as _migrations
 
 _KEY_COLUMNS = {
     "feature_contract_validation_event": {
@@ -176,3 +180,52 @@ def test_event_seq_is_monotonic_per_table(conn) -> None:
         "SELECT seq FROM feature_contract_validation_event WHERE contract_id = %s "
         "ORDER BY seq", (cid,)).fetchall()]
     assert len(seqs) == 2 and seqs[0] < seqs[1]
+
+
+def test_state_has_superseded_column(conn) -> None:
+    # MF-4: the state table carries the terminal supersession marker (additive, default false).
+    cid = _contract(conn, "c_sup_col")
+    _state(conn, cid)
+    row = conn.execute("SELECT superseded FROM feature_contract_validation_state "
+                       "WHERE contract_id = %s", (cid,)).fetchone()
+    assert row[0] is False   # defaults false; the fold sets it true on a SUPERSEDED event
+
+
+def _migration_1009_sql() -> str:
+    return (Path(_migrations.__file__).resolve().parent / "migrations"
+            / "1009_feature_contract_validation.sql").read_text(encoding="utf-8")
+
+
+def test_1009_worm_revokes_destructive_dml_on_authority_tables(db) -> None:
+    """MF-3: the BEFORE UPDATE OR DELETE row triggers do NOT fire on a statement-level TRUNCATE, so
+    the append-only authority log AND the immutable requirement rows must ALSO have UPDATE/DELETE/
+    TRUNCATE revoked from the production app role (mirrors the 0900/1002 revoke). The REBUILDABLE
+    feature_contract_validation_state is DELIBERATELY excluded — a replay must overwrite it.
+
+    The role is absent in the superuser test cluster (so the migration's guarded REVOKE is a no-op
+    there); this test creates it to exercise the guarded branch, then re-applies the migration SQL
+    exactly as apply_migrations does. All rolled back on teardown."""
+    worm_tables = ("feature_contract_validation_event", "feature_validation_requirement")
+    db.execute("CREATE ROLE featuregen_app NOLOGIN")
+    for table in worm_tables:
+        db.execute(f"GRANT UPDATE, DELETE, TRUNCATE ON {table} TO featuregen_app")
+        for priv in ("UPDATE", "DELETE", "TRUNCATE"):
+            assert db.execute("SELECT has_table_privilege('featuregen_app', %s, %s)",
+                              (table, priv)).fetchone()[0] is True
+
+    db.execute(_migration_1009_sql())   # applying with the role present must strip the privileges
+
+    for table in worm_tables:
+        for priv in ("UPDATE", "DELETE", "TRUNCATE"):
+            assert db.execute("SELECT has_table_privilege('featuregen_app', %s, %s)",
+                              (table, priv)).fetchone()[0] is False, \
+                f"{priv} on {table} should be revoked from featuregen_app by the WORM migration"
+
+    # The rebuildable state table is NOT revoked — a projection replay must be able to overwrite it.
+    db.execute("GRANT UPDATE, TRUNCATE ON feature_contract_validation_state TO featuregen_app")
+    db.execute(_migration_1009_sql())
+    for priv in ("UPDATE", "TRUNCATE"):
+        assert db.execute(
+            "SELECT has_table_privilege('featuregen_app', "
+            "'feature_contract_validation_state', %s)", (priv,)).fetchone()[0] is True, \
+            f"{priv} on the rebuildable state table must NOT be revoked"

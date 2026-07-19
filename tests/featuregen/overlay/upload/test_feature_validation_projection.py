@@ -7,12 +7,17 @@ the signed EXTERNAL_PASSED/FAILED) — this task only folds whatever the append-
 """
 from __future__ import annotations
 
+import psycopg
+import pytest
 from psycopg.types.json import Jsonb
 
+from featuregen.overlay.upload import feature_validation_projection as fvp
 from featuregen.overlay.upload.feature_validation_projection import (
     PROJECTION_NAME,
     apply_event,
     catch_up,
+    is_read_ready,
+    lock_checkpoint,
     read_state,
     rebuild,
     reset,
@@ -237,6 +242,29 @@ def test_superseded_retains_row_and_demotes_stamp(conn) -> None:
     apply_event(conn, sup)
     # Row RETAINED as history: validation_status kept, effective stamp demoted to UNVERIFIED.
     assert _status(conn, cid) == ("design_checked", "UNVERIFIED", sup["seq"])
+    # MF-4: the terminal superseded marker is set on the state row.
+    assert read_state(conn, cid)["superseded"] is True
+
+
+def test_superseded_is_terminal_late_external_passed_cannot_resurrect(conn) -> None:
+    """MF-4 stickiness: once SUPERSEDED, a late/redelivered EXTERNAL_PASSED that would otherwise
+    promote every blocking requirement to DATA-CHECKED must NOT resurrect the retired version."""
+    cid = _contract(conn, "c_sup_terminal")
+    _requirement(conn, cid, requirement_id="req_st", blocking=True)
+    apply_event(conn, _event(conn, cid, "ASSESSED"))          # needs_external / UNVERIFIED
+    apply_event(conn, _event(conn, cid, "SUPERSEDED"))        # retired: superseded / UNVERIFIED
+    # A late EXTERNAL_PASSED for the (only) blocking requirement — would normally reach DATA-CHECKED.
+    late = _event(conn, cid, "EXTERNAL_PASSED", payload={"requirement_id": "req_st"})
+    apply_event(conn, late)
+    status, verification, applied = _status(conn, cid)
+    assert verification == "UNVERIFIED" and verification != "DATA-CHECKED"  # NOT resurrected
+    assert read_state(conn, cid)["superseded"] is True
+    assert applied == late["seq"]                             # folded, but the promotion was gated
+
+    # reset==replay: a full rebuild reproduces the identical terminal-superseded state.
+    rebuild(conn)
+    assert read_state(conn, cid)["superseded"] is True
+    assert read_state(conn, cid)["effective_verification"] == "UNVERIFIED"
 
 
 def test_reset_clears_state_and_ledgers(conn) -> None:
@@ -250,3 +278,136 @@ def test_reset_clears_state_and_ledgers(conn) -> None:
         "SELECT checkpoint_seq FROM projection_checkpoints WHERE projection_name = %s",
         (PROJECTION_NAME,)).fetchone()[0]
     assert ck == 0
+
+
+# --------------------------------------------------------------------------------------------------
+# MF-2 — catch_up's fold loop catches ONLY ProjectionApplyError (poison); any other exception (a
+# transient deadlock/lock-timeout) PROPAGATES, so the event is never silently skipped + degraded.
+# --------------------------------------------------------------------------------------------------
+def test_transient_error_propagates_not_treated_as_poison(conn, monkeypatch) -> None:
+    cid = _contract(conn, "c_transient")
+    ev = _event(conn, cid, "ASSESSED")
+
+    def _boom(_conn, _row):
+        raise RuntimeError("deadlock detected")  # a transient DB error surrogate — NOT poison
+
+    monkeypatch.setattr(fvp, "apply_event", _boom)
+    with pytest.raises(RuntimeError, match="deadlock detected"):
+        catch_up(conn)
+
+    # NOT degraded, NOT skipped — a transient failure is not poison.
+    assert conn.execute("SELECT count(*) FROM projection_degraded WHERE projection_name = %s",
+                        (PROJECTION_NAME,)).fetchone()[0] == 0
+    assert conn.execute("SELECT count(*) FROM projection_skips WHERE projection_name = %s",
+                        (PROJECTION_NAME,)).fetchone()[0] == 0
+    # The checkpoint did NOT advance past the un-applied event (the final UPDATE never ran).
+    ck = conn.execute("SELECT checkpoint_seq FROM projection_checkpoints WHERE projection_name = %s",
+                      (PROJECTION_NAME,)).fetchone()[0]
+    assert ck < ev["seq"]
+
+
+def test_genuine_poison_still_degrades_and_skips(conn) -> None:
+    # A malformed ASSESSED (validation_status outside the vocabulary) is a SIGNALLED poison
+    # (ProjectionApplyError) — it still fails-open-but-audited: degraded + skipped + advanced past.
+    cid = _contract(conn, "c_poison_mf2")
+    poison = _event(conn, cid, "ASSESSED", payload={"validation_status": "CORRUPT"})
+    assert catch_up(conn) == 0                              # nothing applied
+    assert conn.execute("SELECT count(*) FROM projection_degraded WHERE projection_name = %s",
+                        (PROJECTION_NAME,)).fetchone()[0] == 1
+    assert conn.execute("SELECT count(*) FROM projection_skips WHERE projection_name = %s",
+                        (PROJECTION_NAME,)).fetchone()[0] == 1
+    ck = conn.execute("SELECT checkpoint_seq FROM projection_checkpoints WHERE projection_name = %s",
+                      (PROJECTION_NAME,)).fetchone()[0]
+    assert ck == poison["seq"]                              # advanced PAST the poison (fail-open)
+
+
+# --------------------------------------------------------------------------------------------------
+# MF-1 — concurrent confirms serialize (lock BEFORE insert): both events fold, no skip / no regress.
+# --------------------------------------------------------------------------------------------------
+def _seed_committed_contract(conn, contract_id: str) -> None:
+    feature_id = f"f_{contract_id}"
+    conn.execute("INSERT INTO feature (feature_id, name) VALUES (%s, %s)", (feature_id, feature_id))
+    conn.execute("INSERT INTO contract (contract_id, feature_id, feature_name, version) "
+                 "VALUES (%s, %s, %s, 1)", (contract_id, feature_id, feature_id))
+
+
+def _emit_assessed(conn, contract_id: str) -> None:
+    conn.execute("INSERT INTO feature_contract_validation_event "
+                 "(event_id, contract_id, event_type, payload) VALUES (%s, %s, 'ASSESSED', %s)",
+                 (f"ev_race_{contract_id}", contract_id, Jsonb({"validation_status": "design_checked"})))
+
+
+def test_concurrent_confirms_serialize_no_skip_or_regress(_dsn) -> None:
+    """MF-1 (load-bearing): two GENUINELY interleaved confirms on two REAL connections. Each confirm
+    locks the checkpoint FOR UPDATE BEFORE inserting its ASSESSED event, then folds. Connection B
+    BLOCKS on that lock while A holds it (proving seq-assignment is serialized WITH the fold), and
+    after A commits, B folds its own higher-seq event over A's committed prefix. Both events end up
+    folded, the checkpoint == head (never regresses, nothing permanently skipped), both contracts'
+    state is correct, and is_read_ready is TRUE + CONSISTENT."""
+    ca = psycopg.connect(_dsn)
+    cb = psycopg.connect(_dsn)
+    cid_a, cid_b = "c_race_a", "c_race_b"
+    fid_a, fid_b = f"f_{cid_a}", f"f_{cid_b}"
+    try:
+        # Seed both contracts + the checkpoint row, COMMITTED, so both real sessions see them.
+        _seed_committed_contract(ca, cid_a)
+        _seed_committed_contract(ca, cid_b)
+        fvp._ensure_checkpoint(ca, PROJECTION_NAME, is_analytics=True)
+        ca.execute("UPDATE projection_checkpoints SET checkpoint_seq = 0 WHERE projection_name = %s",
+                   (PROJECTION_NAME,))
+        ca.commit()
+
+        # --- Confirm A: take the checkpoint lock FIRST, BEFORE inserting any event (the
+        #     lock-before-insert discipline). No event emitted / no fold yet. ---
+        lock_checkpoint(ca)
+
+        # --- Confirm B interleaves in the window BEFORE A has emitted or folded: its lock_checkpoint
+        #     must BLOCK on A's held row-lock. This is what isolates the fix — a plain (unlocked)
+        #     SELECT would NOT block here (A has taken no other lock yet), so seq-assignment would
+        #     race. Proven deterministically with a short lock_timeout -> LockNotAvailable. ---
+        cb.execute("SET lock_timeout = '500ms'")
+        with pytest.raises(psycopg.errors.LockNotAvailable):
+            lock_checkpoint(cb)
+        cb.rollback()                       # clear B's aborted transaction
+        cb.execute("SET lock_timeout = '0'")
+        cb.commit()
+
+        # --- A now emits ASSESSED(A) + folds UNDER the held lock, then commits: its event + advanced
+        #     checkpoint become visible to B. ---
+        _emit_assessed(ca, cid_a)
+        catch_up(ca)
+        ca.commit()
+
+        # --- B now proceeds under the (freed) lock: emit ASSESSED(B), fold over A's committed prefix. ---
+        lock_checkpoint(cb)
+        _emit_assessed(cb, cid_b)
+        catch_up(cb)
+        cb.commit()
+
+        # --- Both folded; checkpoint == head; both states correct; read-ready + consistent. ---
+        head = ca.execute("SELECT max(seq) FROM feature_contract_validation_event").fetchone()[0]
+        ck = ca.execute("SELECT checkpoint_seq FROM projection_checkpoints WHERE projection_name = %s",
+                        (PROJECTION_NAME,)).fetchone()[0]
+        assert ck == head                                    # no regress, nothing skipped
+        for cid in (cid_a, cid_b):
+            st = read_state(ca, cid)
+            assert st is not None, f"{cid} was permanently skipped (never folded)"
+            assert st["validation_status"] == "design_checked"
+            assert st["effective_verification"] == "DESIGN-CHECKED"
+        assert is_read_ready(ca) is True
+    finally:
+        ca.rollback()
+        cb.rollback()
+        # Committed rows persist in the session DB — clean up so nothing leaks into other tests.
+        # TRUNCATE bypasses the write-once triggers (allowed in the superuser test cluster).
+        with psycopg.connect(_dsn, autocommit=True) as cc:
+            cc.execute("TRUNCATE feature_contract_validation_event, "
+                       "feature_validation_requirement, feature_contract_validation_state")
+            cc.execute("UPDATE projection_checkpoints SET checkpoint_seq = 0, head_seq = 0 "
+                       "WHERE projection_name = %s", (PROJECTION_NAME,))
+            cc.execute("DELETE FROM projection_skips WHERE projection_name = %s", (PROJECTION_NAME,))
+            cc.execute("DELETE FROM projection_degraded WHERE projection_name = %s", (PROJECTION_NAME,))
+            cc.execute("DELETE FROM contract WHERE contract_id IN (%s, %s)", (cid_a, cid_b))
+            cc.execute("DELETE FROM feature WHERE feature_id IN (%s, %s)", (fid_a, fid_b))
+        ca.close()
+        cb.close()

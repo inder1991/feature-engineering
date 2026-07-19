@@ -86,10 +86,13 @@ def confirm_contract(conn, draft: ContractDraft, *, actor, roles: Iterable[str] 
     pairs = draft.derives_pairs   # B3: resolved (catalog_source, object_ref) carried on the draft
     # B4: ONE feature per feature_name — re-confirm reuses + refreshes the feature (no proliferation),
     # so drift impact/freshness point at a single live feature, not N duplicates.
-    prev = conn.execute("SELECT feature_id, version FROM contract WHERE feature_name = %s "
-                        "ORDER BY version DESC LIMIT 1", (draft.feature_name,)).fetchone()
+    prev = conn.execute("SELECT contract_id, feature_id, version FROM contract "
+                        "WHERE feature_name = %s ORDER BY version DESC LIMIT 1",
+                        (draft.feature_name,)).fetchone()
     if prev is not None:
-        feature_id, version = prev[0], prev[1] + 1
+        # MF-4: the PRIOR latest contract_id is retired by this re-confirm — carried so the seed
+        # emits a SUPERSEDED event for it (below), demoting its now-dead validation stamp.
+        superseded_contract_id, feature_id, version = prev[0], prev[1], prev[2] + 1
         conn.execute(
             "UPDATE feature SET description = %s, grain_table = %s, aggregation = %s, "
             "as_of_column = %s, verification = %s WHERE feature_id = %s",   # refresh the stamp too
@@ -101,6 +104,7 @@ def confirm_contract(conn, draft: ContractDraft, *, actor, roles: Iterable[str] 
                          "VALUES (%s, %s, %s) ON CONFLICT DO NOTHING",
                          (feature_id, catalog_source, object_ref))
     else:
+        superseded_contract_id = None   # first version — nothing to retire
         feature_id = register_feature(conn, FeatureSpec(
             name=draft.feature_name, description=draft.definition, grain_table=draft.grain_table,
             aggregation=draft.aggregation, as_of_column=draft.as_of_column, derives_from=pairs,
@@ -130,11 +134,13 @@ def confirm_contract(conn, draft: ContractDraft, *, actor, roles: Iterable[str] 
     # MCV re-run. The 1003 columns above stay the INITIAL stamp (unchanged); this emits the ASSESSED
     # event + persists the immutable requirement rows + projects the current-state row — all on THIS
     # transaction, so the lifecycle seed is atomic with confirm.
-    _seed_validation_lifecycle(conn, contract_id, check, pairs, metadata_content_hash)
+    _seed_validation_lifecycle(conn, contract_id, check, pairs, metadata_content_hash,
+                               superseded_contract_id=superseded_contract_id)
     return Contract(contract_id, feature_id, draft.feature_name, version)
 
 
-def _seed_validation_lifecycle(conn, contract_id, check, pairs, snapshot_content_hash) -> None:
+def _seed_validation_lifecycle(conn, contract_id, check, pairs, snapshot_content_hash,
+                               *, superseded_contract_id=None) -> None:
     """C4-T3: from the confirm-time ``MinimumCheck``, persist the immutable requirement rows, emit the
     ASSESSED event, and fold it into ``feature_contract_validation_state`` — all on ``conn`` (atomic
     with the contract insert). Idempotent: requirement rows use ``ON CONFLICT DO NOTHING`` on the 1009
@@ -143,7 +149,15 @@ def _seed_validation_lifecycle(conn, contract_id, check, pairs, snapshot_content
     The requirement fingerprint is the IMMUTABLE metadata-snapshot content_hash (MF-3 binding — what
     catalog state the contract was authored against) when present, else a canonical hash of the draft's
     resolved (catalog, ref) pairs + the confirm-time requirements (a pre-C0 / snapshot-less confirm).
+
+    MF-1: takes the projection checkpoint row FOR UPDATE (``lock_checkpoint``) BEFORE inserting any
+    event, so concurrent confirms serialize their seq-assignment WITH the fold (no skip/regress).
+    MF-4: when ``superseded_contract_id`` is given (a re-confirm), emits a SUPERSEDED event for that
+    retired version BEFORE this version's ASSESSED — folded in the same transaction, under the same
+    lock, so the retired version's live stamp is demoted terminally.
     """
+    # MF-1: serialize emit+fold across concurrent confirms — lock BEFORE any event is inserted.
+    feature_validation_projection.lock_checkpoint(conn)
     fingerprint = snapshot_content_hash or canonical_hash(
         {"derives_pairs": [[cs, ref] for cs, ref in pairs],
          "requirements": requirements_to_json(check.requirements)})
@@ -160,6 +174,16 @@ def _seed_validation_lifecycle(conn, contract_id, check, pairs, snapshot_content
             "content_hash) DO NOTHING",
             (mint_id("req"), contract_id, REQUIREMENT_SCHEMA_VERSION, fingerprint, req.code,
              Jsonb({"operand": operand}), Jsonb({"detail": req.detail}), True, content_hash))
+    # MF-4: a re-confirm mints a NEW contract_id for this feature; the PRIOR latest version is now
+    # dead. Emit SUPERSEDED for it in THIS transaction, BEFORE the new version's ASSESSED, so the
+    # fold demotes the retired version's live stamp AND marks it terminally superseded — a late
+    # EXTERNAL_PASSED can never resurrect it, and a consumer filtering on effective_verification
+    # never picks the dead version. Same lock + seq space -> folded in order by catch_up below.
+    if superseded_contract_id is not None:
+        conn.execute(
+            "INSERT INTO feature_contract_validation_event "
+            "(event_id, contract_id, event_type, payload) VALUES (%s, %s, 'SUPERSEDED', %s)",
+            (mint_id("fcve"), superseded_contract_id, Jsonb({"superseded_by": contract_id})))
     # The ASSESSED payload is MINIMAL + honest: the C4 lowercase status vocabulary (mirrors the 1009
     # CHECK — a DISTINCT axis from the 1003 UPPERCASE column), plus counts. The fold reads the
     # requirement rows above for the authoritative blocking detail, so the requirement rows MUST be
@@ -171,7 +195,7 @@ def _seed_validation_lifecycle(conn, contract_id, check, pairs, snapshot_content
             "validation_status": check.validation_status.lower(),
             "requirement_count": len(check.requirements),
             "has_blocking": bool(check.requirements)})))
-    feature_validation_projection.catch_up(conn)   # fold the ASSESSED into the current-state row
+    feature_validation_projection.catch_up(conn)   # fold SUPERSEDED (if any) + ASSESSED in seq order
 
 
 def contract_freshness(conn, contract_id: str, *, now: datetime) -> FeatureFreshness:
