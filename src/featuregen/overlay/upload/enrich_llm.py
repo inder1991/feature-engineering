@@ -572,6 +572,15 @@ for _synth_schema_id in ("overlay_table_synth_batch", "overlay_table_synth",
                          "overlay_table_synth_summary_batch"):
     _SCHEMAS[(_synth_schema_id, 2)] = _SCHEMAS[(_synth_schema_id, 1)]
 
+# Feature-assist v2 (Phase-2 Slice 3A-iv, spec §8): the OUTPUT contract is byte-for-byte v1 — the
+# permissive `additionalProperties: True` shape already admits the new proposal fields, and semantic
+# validation stays CODE-SIDE in `_validate_idea`. v2 exists only so the immutable `llm_call` record
+# stamps WHICH input contract egressed (the widened menu / tri-state shape) instead of a hardcoded 1
+# masked by a `…_v1` prompt_id string. Registered as real v2 rows via `register_enrichment_schemas`'s
+# `_SCHEMAS` sweep so `schema_for(schema_id, 2)` resolves them; an intentional alias, never a copy.
+for _feature_schema_id in ("feature_ideas", "feature_recipe", "leakage", "feature_set_rec"):
+    _SCHEMAS[(_feature_schema_id, 2)] = _SCHEMAS[(_feature_schema_id, 1)]
+
 # Fallback service identity for when no real actor is threaded in. authenticated=False — a
 # fabricated authenticated identity is forbidden outside sanctioned auth modules; production threads
 # the real (authenticated) upload actor from ingest.
