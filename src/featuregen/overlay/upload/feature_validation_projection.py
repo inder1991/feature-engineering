@@ -301,6 +301,29 @@ def read_state(conn: DbConn, contract_id: str) -> dict | None:
         return cur.fetchone()
 
 
+def is_read_ready(conn: DbConn) -> bool:
+    """Per-read FAIL-CLOSED health gate for the validation STATE read model. Returns False when the
+    projection is DEGRADED or LAGGED — the caller must then serve UNVERIFIED/unavailable and NEVER
+    fall back to the legacy 1003 stamp, so a lagged/degraded projection can never serve a stale
+    DATA-CHECKED/design_checked.
+
+    Reuses the C4-T2 detection primitives (never re-implementing them):
+      * DEGRADED — ANY poison marker for this projection in ``projection_degraded`` (the same ledger
+        ``_mark_degraded`` writes). Projection-wide: a poisoned read model is untrustworthy for every
+        contract, so the whole read fails closed (mirrors ``check_projection_readiness``).
+      * LAGGED — the projection ``checkpoint_seq`` sits below the max event ``seq``. The lag is
+        measured over the DEDICATED ``feature_contract_validation_event`` stream's own seq space
+        (via this module's ``_head_seq``), NOT the GLOBAL ``events``/``global_seq`` head that
+        ``projections.runner.projection_lag`` uses — this custom projection folds its own table.
+    """
+    degraded = conn.execute(
+        "SELECT 1 FROM projection_degraded WHERE projection_name = %s LIMIT 1",
+        (PROJECTION_NAME,)).fetchone() is not None
+    if degraded:
+        return False
+    return _checkpoint_seq(conn, PROJECTION_NAME) >= _head_seq(conn)
+
+
 class FeatureContractValidationProjection:
     """Thin object adapter over the module functions, exposing the framework's ``name`` /
     ``is_analytics`` identity for registration. ``is_analytics=True`` reflects the fail-OPEN poison

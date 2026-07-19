@@ -196,24 +196,78 @@ def contracts_affected_by(conn, catalog_source: str, object_ref: str) -> list[st
     return sorted(r[0] for r in rows)
 
 
+# Delivery C4-T4: the effective-fields sentinels the fail-closed read returns instead of the
+# projection's real stamp. UNVERIFIED is always the safe effective verification when we cannot trust
+# the read model — NEVER the legacy 1003 stamp.
+_EFFECTIVE_UNVERIFIED = "UNVERIFIED"
+_EFFECTIVE_UNAVAILABLE = "unavailable"        # projection DEGRADED/LAGGED — fail closed
+_EFFECTIVE_LEGACY_UNASSESSED = "legacy_unassessed"  # a pre-C4 contract with no projected state row
+
+
+def _effective_validation(ready: bool, state_status, state_verification) -> tuple[str, str]:
+    """Map the projection health + a contract's ``feature_contract_validation_state`` row (its
+    ``validation_status``/``effective_verification``, or ``None`` when there is no state row) to the
+    authoritative ``(effective_validation_status, effective_verification)`` the read APIs expose.
+
+    FAIL CLOSED (C4-T4): the effective stamp is PROJECTION-sourced only. A DEGRADED/LAGGED projection
+    (``ready is False``) → ``('unavailable', 'UNVERIFIED')`` — never the legacy 1003 column. A
+    contract with NO state row (historical / pre-C4) → ``('legacy_unassessed', 'UNVERIFIED')``, not
+    fabricated as design_checked. Otherwise the real projected effective stamp is returned verbatim.
+    """
+    if not ready:
+        return _EFFECTIVE_UNAVAILABLE, _EFFECTIVE_UNVERIFIED
+    if state_status is None:
+        return _EFFECTIVE_LEGACY_UNASSESSED, _EFFECTIVE_UNVERIFIED
+    return state_status, state_verification
+
+
 def list_contracts(conn, *, limit: int = 50) -> list[dict]:
-    """The governed-contract inventory (registry READ surface)."""
+    """The governed-contract inventory (registry READ surface).
+
+    C4-T4: each row carries the EFFECTIVE validation stamp from the ``feature_contract_validation``
+    PROJECTION (``effective_validation_status``/``effective_verification`` — the authoritative fields
+    for consumers), LEFT JOINed on ``contract_id``, gated FAIL-CLOSED by the projection's read
+    readiness. ``verification`` remains the 1003 INITIAL confirm-time stamp (kept, additive) — the
+    effective fields, not it, are authoritative, and a lagged/degraded projection serves
+    'unavailable'/UNVERIFIED here, never that legacy column."""
+    ready = feature_validation_projection.is_read_ready(conn)   # ONE fail-closed gate for the read
     rows = conn.execute(
-        "SELECT contract_id, feature_id, feature_name, version, verification, created_at "
-        "FROM contract ORDER BY created_at DESC LIMIT %s", (limit,)).fetchall()
-    return [{"contract_id": r[0], "feature_id": r[1], "feature_name": r[2], "version": r[3],
-             "verification": r[4], "created_at": r[5].isoformat()} for r in rows]
+        "SELECT c.contract_id, c.feature_id, c.feature_name, c.version, c.verification, "
+        "c.created_at, s.validation_status, s.effective_verification "
+        "FROM contract c "
+        "LEFT JOIN feature_contract_validation_state s ON s.contract_id = c.contract_id "
+        "ORDER BY c.created_at DESC LIMIT %s", (limit,)).fetchall()
+    out = []
+    for r in rows:
+        eff_status, eff_verif = _effective_validation(ready, r[6], r[7])
+        out.append({"contract_id": r[0], "feature_id": r[1], "feature_name": r[2], "version": r[3],
+                    "verification": r[4], "created_at": r[5].isoformat(),
+                    "effective_validation_status": eff_status,
+                    "effective_verification": eff_verif})
+    return out
 
 
 def get_contract_detail(conn, contract_id: str) -> dict | None:
+    """C4-T4: the contract detail carries the EFFECTIVE validation stamp read from the
+    ``feature_contract_validation`` PROJECTION (``effective_validation_status``/
+    ``effective_verification``), gated FAIL-CLOSED. ``verification`` stays the 1003 INITIAL stamp
+    (kept, additive); the effective fields are the authoritative ones and never fall back to that
+    legacy column when the projection is degraded/lagged."""
     row = conn.execute(
         "SELECT contract_id, feature_id, feature_name, definition, version, verification, intent_id, "
         "created_at FROM contract WHERE contract_id = %s", (contract_id,)).fetchone()
     if row is None:
         return None
+    ready = feature_validation_projection.is_read_ready(conn)
+    state = feature_validation_projection.read_state(conn, contract_id)
+    eff_status, eff_verif = _effective_validation(
+        ready, None if state is None else state["validation_status"],
+        None if state is None else state["effective_verification"])
     return {"contract_id": row[0], "feature_id": row[1], "feature_name": row[2], "definition": row[3],
             "version": row[4], "verification": row[5], "intent_id": row[6],
-            "created_at": row[7].isoformat()}
+            "created_at": row[7].isoformat(),
+            "effective_validation_status": eff_status,
+            "effective_verification": eff_verif}
 
 
 def feature_detail(conn, feature_id: str, *, roles=()) -> dict | None:
