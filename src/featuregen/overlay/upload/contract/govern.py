@@ -7,6 +7,7 @@ of the same feature is a new version; history stays.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -45,6 +46,97 @@ class ContractValidationError(Exception):
     """The draft failed the deterministic MCV — it must not be governed."""
 
 
+class ContractPointerConflict(Exception):
+    """H2b fail-closed: the ``feature_current_contract`` compare-and-swap matched 0 rows — a concurrent
+    confirm advanced the pointer between this confirm's pointer READ and its CAS. The per-feature advisory
+    lock (taken at the top of ``confirm_contract``) makes this UNREACHABLE in practice; it is kept as
+    defense-in-depth so the pointer can NEVER be lost-updated. Raising it aborts the whole confirm
+    transaction (no torn write). (H2d should map it at the API like ``UniqueViolation`` -> 409.)"""
+
+
+def feature_contract_lock_key(feature_name: str) -> int:
+    """H2b — stable 64-bit advisory-lock key serializing confirms of ONE feature identity.
+
+    sha256 over a dedicated ``contract_confirm:`` namespace of the NORMALIZED feature identity
+    (``.strip().lower()`` — the repo's catalog/feature key convention), first 8 bytes big-endian signed
+    — the exact derivation ``ingest_source_lock_key`` uses, under a DISTINCT prefix so this key space
+    cannot collide with the ingest / drift / renewal namespaces nor the fixed constants (security-chain
+    7_000_007, migrations 6157423001, global-seq 4_201_873_355_201_001). Identical feature identities
+    ALWAYS derive the same key (the serialization invariant); a superset of DB-distinct case/whitespace
+    variants merely over-serializes (safe). MUST stay stable across releases: two versions deriving
+    different keys for the same feature would stop excluding each other during a rolling deploy,
+    re-opening the pointer-CAS interleave this lock exists to close."""
+    normalized = feature_name.strip().lower()
+    return int.from_bytes(
+        hashlib.sha256(f"contract_confirm:{normalized}".encode()).digest()[:8],
+        "big", signed=True)
+
+
+def _contract_input_items(draft: ContractDraft):
+    """H2b — expand the RECONCILED draft into role-labelled input items (the immutable lineage a contract
+    version was built from). Yields ``(source, graph_ref, logical_ref, physical_ref, role, decision_id,
+    fact_id)``. Reflects the POST-reconciliation (Slice-3 server-authoritative grain/derives) values,
+    EXACTLY like the feature/feature_derives_from compat writes — the draft handed to ``confirm_contract``
+    is already reconciled upstream (the route overwrites grain_table/derives_from/join_path from the
+    server-reconstructed chosen feature before calling confirm).
+
+    Completeness: derives + grain + as_of + governed join-path columns all become rows — derives-pairs-
+    only lineage is INCOMPLETE. decision_id/fact_id are NULL here: the draft carries no field-decision /
+    governed-fact id yet (H2c reverse-dependency + H1b governed-support wire those)."""
+    catalogs = {cs for cs, _ in draft.derives_pairs}
+    # grain_table / as_of_column are bare names on the draft; attribute them to the grain's catalog.
+    # Single-catalog: the one catalog. Cross-catalog: first catalog deterministically (the governed
+    # planner's grain-catalog is H1a/H3 — approximate here, never NULL since `source` is NOT NULL).
+    grain_source = (next(iter(catalogs)) if len(catalogs) == 1
+                    else (sorted(catalogs)[0] if catalogs else None))
+    # derives — every measure/source column the feature reads (B3 carried pairs).
+    for cs, ref in draft.derives_pairs:
+        yield (cs, ref, ref, ref, "derives", None, None)
+    # grain — the server-authoritative grain table (Slice-3 reconciled).
+    if draft.grain_table and grain_source is not None:
+        yield (grain_source, None, draft.grain_table, draft.grain_table, "grain", None, None)
+    # as_of — the grain table's as-of column.
+    if draft.as_of_column and grain_source is not None:
+        yield (grain_source, None, draft.as_of_column, draft.as_of_column, "as_of", None, None)
+    # governed join-path columns — each join step's target ref, so the lineage is COMPLETE.
+    # # H1b: ungoverned support-column requirement/rejection is wired there; this task records the
+    # roles the reconciled draft already carries and drops NONE silently.
+    for step in draft.join_path:
+        ref = step.get("ref") or step.get("to")
+        if not ref:
+            continue
+        yield (step.get("catalog_source") or grain_source or "", ref, ref, ref, "join", None, None)
+
+
+def _insert_contract_input_columns(conn, contract_id: str, draft: ContractDraft) -> None:
+    """H2b — persist the write-once ``contract_input_column`` lineage for THIS contract version. The
+    ``item_hash`` is a deterministic content hash of (contract_id, role, refs, decision/fact ids), so the
+    same input under a different contract version hashes differently and two distinct inputs of one
+    contract never collide. ON CONFLICT DO NOTHING makes the insert idempotent (a re-run is a no-op — the
+    1011 no-mutation trigger blocks UPDATE/DELETE, NOT an INSERT that DO-NOTHINGs)."""
+    for source, graph_ref, logical_ref, physical_ref, role, decision_id, fact_id in \
+            _contract_input_items(draft):
+        item_hash = canonical_hash({
+            "contract_id": contract_id, "source": source, "graph_ref": graph_ref,
+            "logical_ref": logical_ref, "physical_ref": physical_ref, "role": role,
+            "decision_id": decision_id, "fact_id": fact_id})
+        conn.execute(
+            "INSERT INTO contract_input_column (contract_id, source, graph_ref, logical_ref, "
+            "physical_ref, role, decision_id, fact_id, item_hash) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) "
+            "ON CONFLICT (contract_id, item_hash) DO NOTHING",
+            (contract_id, source, graph_ref, logical_ref, physical_ref, role, decision_id, fact_id,
+             item_hash))
+
+
+def _cancel_undelivered_external_submissions(conn, prior_contract_id: str | None) -> None:
+    """H2b — Delivery I seam (NO-OP stub). On a pointer advance the plan requires cancelling any
+    UNDELIVERED external submissions for the now-superseded contract. Delivery I (external submissions)
+    does not exist yet, so there is nothing to cancel and NO external-submission table to touch. The
+    SUPERSEDED path already calls this so Delivery I wires it in one place. # Delivery I wires this."""
+    return
+
+
 def _confirm_snapshot_binding(conn, intent_id: str | None) -> tuple[str | None, str | None]:
     """MF-3 — the SERVER C0 metadata-snapshot lineage recorded on the considered set for this intent,
     read AT CONFIRM. Returns ``(snapshot_id, content_hash)`` to bind IMMUTABLY onto the write-once-in-
@@ -81,6 +173,14 @@ def confirm_contract(conn, draft: ContractDraft, *, actor, roles: Iterable[str] 
     `roles` is the CONFIRMING actor's read-scope, threaded into the re-run so the cross-table
     join-authority disposition judges the confirmer's real authority — without it a sensitivity-tagged
     hop would read DENIED and over-reject a legitimately authorized feature."""
+    # H2b STEP 1 — ADVISORY LOCK FIRST, before ANY feature lookup or validate_minimum. Serializes
+    # concurrent confirms of the SAME feature identity so their pointer CAS (STEP 5) cannot interleave:
+    # two first-confirms can't both register the feature (B4 proliferation), and a re-confirm can't lose
+    # the pointer advance. pg_advisory_xact_lock binds to the CALLER's transaction (confirm never opens
+    # its own) and releases on its COMMIT/ROLLBACK. Taken BEFORE the per-feature reads so the whole
+    # read-decide-write of the pointer is serialized. (Ordered before the global validation-projection
+    # checkpoint lock taken later in _seed_validation_lifecycle — a consistent lock order, no deadlock.)
+    conn.execute("SELECT pg_advisory_xact_lock(%s)", (feature_contract_lock_key(draft.feature_name),))
     tref = target_ref if target_ref is not None else draft.target_ref   # M3: fall back to the draft's
     check = validate_minimum(conn, draft, target_ref=tref, now=now, roles=roles)
     if not check.ok:
@@ -94,9 +194,83 @@ def confirm_contract(conn, draft: ContractDraft, *, actor, roles: Iterable[str] 
                         "WHERE feature_name = %s ORDER BY version DESC LIMIT 1",
                         (draft.feature_name,)).fetchone()
     if prev is not None:
-        # MF-4: the PRIOR latest contract_id is retired by this re-confirm — carried so the seed
-        # emits a SUPERSEDED event for it (below), demoting its now-dead validation stamp.
-        superseded_contract_id, feature_id, version = prev[0], prev[1], prev[2] + 1
+        # MF-4: legacy latest contract by feature_name — the superseded FALLBACK for a pre-H2b feature
+        # with no pointer. The compat feature/derives writes are DEFERRED to after the CAS (STEP 7).
+        legacy_prior_contract_id, feature_id, version = prev[0], prev[1], prev[2] + 1
+    else:
+        legacy_prior_contract_id = None   # first version — nothing to retire
+        feature_id = register_feature(conn, FeatureSpec(
+            name=draft.feature_name, description=draft.definition, grain_table=draft.grain_table,
+            aggregation=draft.aggregation, as_of_column=draft.as_of_column, derives_from=pairs,
+            verification="DESIGN-CHECKED"))   # governed => EARNS DESIGN-CHECKED (default is UNVERIFIED)
+        version = 1                            # the feature row must exist before the contract FK below
+    # H2b STEP 2 — read the CURRENT pointer (the AUTHORITATIVE superseded target). Prefer the pointer's
+    # prior contract; fall back to the legacy latest-by-feature_name contract when no pointer exists yet
+    # (a feature governed before H2b). Read under the advisory lock, so a re-confirm sees the truly-latest
+    # committed pointer and its CAS below is uncontended.
+    pointer = conn.execute(
+        "SELECT contract_id, pointer_version FROM feature_current_contract WHERE feature_id = %s",
+        (feature_id,)).fetchone()
+    prior_pointer_contract_id = pointer[0] if pointer is not None else None
+    prior_pointer_version = pointer[1] if pointer is not None else None
+    superseded_contract_id = (prior_pointer_contract_id if prior_pointer_contract_id is not None
+                              else legacy_prior_contract_id)
+    contract_id = mint_id("contract")
+    # MF-3: bind THIS contract to the immutable metadata snapshot the considered set was authored against,
+    # read AT CONFIRM from the server row. Persisted onto the never-repointed contract row so a later
+    # broaden (which repoints the mutable contract_considered.snapshot_id) cannot change what catalog state
+    # this governed contract was authored against. NULL on a pre-C0 / READ COMMITTED set (additive).
+    metadata_snapshot_id, metadata_content_hash = _confirm_snapshot_binding(conn, intent_id)
+    # H2b STEP 3 — insert the immutable contract version + the new 1011 columns. generation_source /
+    # recipe_id / physical_plan_id / planner_declaration_id are NULL: the draft does not carry them yet.
+    # # H1a/H3 will supply them (recipe / physical-plan / planner-declaration provenance).
+    conn.execute(
+        "INSERT INTO contract (contract_id, feature_id, feature_name, definition, version, actor, "
+        "join_path, intent_id, verification, validation_status, requirements, "
+        "metadata_snapshot_id, metadata_content_hash, metadata_input_fingerprint, "
+        "initial_validation_status, initial_verification) "
+        "VALUES (%s, %s, %s, %s, %s, %s::jsonb, %s::jsonb, %s, %s, %s, %s::jsonb, %s, %s, %s, %s, %s)",
+        (contract_id, feature_id, draft.feature_name, draft.definition, version, _actor_json(actor),
+         json.dumps(list(draft.join_path)), intent_id,   # intent_id: audit link to the hypothesis (M5)
+         "DESIGN-CHECKED",   # §14.5 stamp — gauntlet-passed; predictive value unverified (0968).
+         #                     A SEPARATE (hyphenated, 0973-constrained) axis from validation_status.
+         check.validation_status,   # RF-C1: the CONFIRM-TIME re-run's honest tri-state — NOT the
+         #                            draft's carried value (an upgrade/downgrade since Gate #1 is
+         #                            a real change and must be recorded, never silently kept stale)
+         json.dumps(requirements_to_json(check.requirements)),
+         metadata_snapshot_id, metadata_content_hash,   # MF-3: immutable contract -> snapshot binding
+         metadata_content_hash,      # 1011 metadata_input_fingerprint — the C0 snapshot input hash the
+         #                             contract was authored against (NULL on a pre-C0 confirm)
+         check.validation_status,    # 1011 initial_validation_status — the at-confirm INITIAL axis, same
+         #                             value the ASSESSED event stamps (SEPARATE from the mutable 1003 col)
+         "DESIGN-CHECKED"))          # 1011 initial_verification — the at-confirm INITIAL verification
+    # H2b STEP 4 — insert the immutable, write-once contract_input_column lineage: one role-labelled row
+    # per reconciled input (derives + grain + as_of + governed join). This + the pointer (STEP 5) are the
+    # AUTHORITATIVE write; feature/feature_derives_from (STEP 7) are the current-pointer compat projection.
+    _insert_contract_input_columns(conn, contract_id, draft)
+    # H2b STEP 5 — CAS the feature_current_contract pointer to this new version (the AUTHORITATIVE write).
+    if prior_pointer_version is None:
+        conn.execute(
+            "INSERT INTO feature_current_contract (feature_id, contract_id, pointer_version, set_at) "
+            "VALUES (%s, %s, 1, now())", (feature_id, contract_id))
+    else:
+        swapped = conn.execute(
+            "UPDATE feature_current_contract SET contract_id = %s, pointer_version = %s, set_at = now() "
+            "WHERE feature_id = %s AND pointer_version = %s",
+            (contract_id, prior_pointer_version + 1, feature_id, prior_pointer_version)).rowcount
+        if swapped != 1:   # someone advanced the pointer concurrently — fail closed (never lost-update)
+            raise ContractPointerConflict(
+                f"feature_current_contract CAS lost for feature {feature_id} at pointer_version "
+                f"{prior_pointer_version}; a concurrent confirm advanced it")
+        # H2b STEP 8 — on a pointer ADVANCE, cancel undelivered external submissions for the superseded
+        # contract (Delivery I seam — no-op today; the SUPERSEDED path already calls it).
+        _cancel_undelivered_external_submissions(conn, superseded_contract_id)
+    # H2b STEP 7 — COMPAT PROJECTION. feature/feature_derives_from now reflect the CURRENT pointer (they
+    # are the current-pointer compatibility projection, NOT historical truth — the pointer + input rows
+    # above are). Sequenced AFTER the CAS. A first-confirm already wrote them via register_feature (the
+    # feature row must exist before the contract FK); a re-confirm refreshes them here to mirror the
+    # now-current version — same values as before, just explicitly downstream of the pointer.
+    if prev is not None:
         conn.execute(
             "UPDATE feature SET description = %s, grain_table = %s, aggregation = %s, "
             "as_of_column = %s, verification = %s WHERE feature_id = %s",   # refresh the stamp too
@@ -107,37 +281,11 @@ def confirm_contract(conn, draft: ContractDraft, *, actor, roles: Iterable[str] 
             conn.execute("INSERT INTO feature_derives_from (feature_id, catalog_source, object_ref) "
                          "VALUES (%s, %s, %s) ON CONFLICT DO NOTHING",
                          (feature_id, catalog_source, object_ref))
-    else:
-        superseded_contract_id = None   # first version — nothing to retire
-        feature_id = register_feature(conn, FeatureSpec(
-            name=draft.feature_name, description=draft.definition, grain_table=draft.grain_table,
-            aggregation=draft.aggregation, as_of_column=draft.as_of_column, derives_from=pairs,
-            verification="DESIGN-CHECKED"))   # governed => EARNS DESIGN-CHECKED (default is UNVERIFIED)
-        version = 1
-    contract_id = mint_id("contract")
-    # MF-3: bind THIS contract to the immutable metadata snapshot the considered set was authored against,
-    # read AT CONFIRM from the server row. Persisted onto the never-repointed contract row so a later
-    # broaden (which repoints the mutable contract_considered.snapshot_id) cannot change what catalog state
-    # this governed contract was authored against. NULL on a pre-C0 / READ COMMITTED set (additive).
-    metadata_snapshot_id, metadata_content_hash = _confirm_snapshot_binding(conn, intent_id)
-    conn.execute(
-        "INSERT INTO contract (contract_id, feature_id, feature_name, definition, version, actor, "
-        "join_path, intent_id, verification, validation_status, requirements, "
-        "metadata_snapshot_id, metadata_content_hash) "
-        "VALUES (%s, %s, %s, %s, %s, %s::jsonb, %s::jsonb, %s, %s, %s, %s::jsonb, %s, %s)",
-        (contract_id, feature_id, draft.feature_name, draft.definition, version, _actor_json(actor),
-         json.dumps(list(draft.join_path)), intent_id,   # intent_id: audit link to the hypothesis (M5)
-         "DESIGN-CHECKED",   # §14.5 stamp — gauntlet-passed; predictive value unverified (0968).
-         #                     A SEPARATE (hyphenated, 0973-constrained) axis from validation_status.
-         check.validation_status,   # RF-C1: the CONFIRM-TIME re-run's honest tri-state — NOT the
-         #                            draft's carried value (an upgrade/downgrade since Gate #1 is
-         #                            a real change and must be recorded, never silently kept stale)
-         json.dumps(requirements_to_json(check.requirements)),
-         metadata_snapshot_id, metadata_content_hash))   # MF-3: immutable contract -> snapshot binding
-    # Delivery C4-T3: ADDITIVELY seed the event-sourced validation lifecycle from the SAME confirm-time
-    # MCV re-run. The 1003 columns above stay the INITIAL stamp (unchanged); this emits the ASSESSED
-    # event + persists the immutable requirement rows + projects the current-state row — all on THIS
-    # transaction, so the lifecycle seed is atomic with confirm.
+    # H2b STEP 6 / Delivery C4-T3: ADDITIVELY seed the event-sourced validation lifecycle from the SAME
+    # confirm-time MCV re-run. The 1003 columns above stay the INITIAL stamp (unchanged); this emits the
+    # ASSESSED event + persists the immutable requirement rows + projects the current-state row — all on
+    # THIS transaction, so the lifecycle seed is atomic with confirm. superseded_contract_id is now the
+    # POINTER's prior contract (STEP 2), so the existing SUPERSEDED emit demotes the RIGHT prior version.
     _seed_validation_lifecycle(conn, contract_id, check, pairs, metadata_content_hash,
                                superseded_contract_id=superseded_contract_id)
     return Contract(contract_id, feature_id, draft.feature_name, version)
