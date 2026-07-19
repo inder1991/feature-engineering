@@ -50,7 +50,9 @@ INGESTION_RUN_TS_KEYS = {
 # fail here and force a deliberate lockstep look at api.ts.
 INGESTION_RUN_WIRE_KEYS = INGESTION_RUN_TS_KEYS | {
     "file_sha256", "pre_source_fingerprint", "post_source_fingerprint",
-    "fingerprint_algo_version", "effective_config", "heartbeat_at", "objects", "facts"}
+    "fingerprint_algo_version", "effective_config", "heartbeat_at", "objects", "facts",
+    # Delivery B item 9 (source-profile provenance): wire-only until the client reads them
+    "source_type", "profile_version"}
 # IngestionStage (api.ts)
 INGESTION_STAGE_KEYS = {"stage", "attempt", "state", "reason_code", "detail",
                         "started_at", "completed_at"}

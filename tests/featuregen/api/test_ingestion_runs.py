@@ -16,6 +16,8 @@ import psycopg
 from fastapi.testclient import TestClient
 from tests.featuregen.api._helpers import AUTH, DEPOSITS_CSV, VIEWER, upload_csv
 
+from featuregen.overlay.upload.source_profile import SOURCE_CAPABILITY_PROFILE_VERSION
+
 RUN_HEADER = "X-Ingestion-Run-Id"
 
 TINY_CSV = "source,table,column,type,is_grain\ndeposits,accounts,id,integer,y\n"
@@ -47,6 +49,10 @@ def test_successful_upload_records_ingested_run(client):
     assert run["authorization_decision"] == "granted:catalog_write"
     assert run["row_count"] == 9
     assert run["quarantined_count"] == 0
+    # Delivery B item 9: the manifest records the capability profile that produced the run, so
+    # field_evidence rows with producer_ref = run_id trace to the capability rules that made them
+    assert run["source_type"] == "technical_csv"
+    assert run["profile_version"] == SOURCE_CAPABILITY_PROFILE_VERSION
     assert run["file_sha256"] == hashlib.sha256(DEPOSITS_CSV.encode()).hexdigest()
     assert run["fingerprint_algo_version"] == "gn-v1"
     # first upload: the pre fingerprint is the empty-graph hash, the post reflects the built graph
@@ -107,6 +113,8 @@ def test_parse_failure_still_records_queryable_run(client):
     assert run["file_sha256"] == hashlib.sha256(b"not a workbook").hexdigest()
     assert run["redacted_failure_code"]                    # the exception CLASS, never its message
     assert "not a workbook" not in str(run)                # redaction: no file content in the run
+    # the failure came BEFORE profile selection, so the provenance is honestly NULL (item 9)
+    assert run["source_type"] is None and run["profile_version"] is None
     assert [e["status"] for e in run["status_history"]] == ["in_progress", "rejected"]
     assert run["status_history"][-1]["reason_code"] == "http_400"
 
