@@ -40,8 +40,9 @@ class RequirementValidationError(Exception):
 class ValidationRequirementSchema:
     """The versioned, immutable contract for one requirement CODE.
 
-    `params_schema` / `result_schema` map a field name to its python type. For v1 EVERY key in
-    `params_schema` is a REQUIRED param (a param whose type is declared must be supplied).
+    `params_schema` / `result_schema` map a field name to its python type. A key in `params_schema`
+    is REQUIRED (must be supplied) UNLESS it is also listed in `optional_params` — an optional param
+    may be omitted, but if supplied it is still type-checked and no undeclared param is ever allowed.
     """
 
     code: str
@@ -51,6 +52,7 @@ class ValidationRequirementSchema:
     result_schema: Mapping[str, type] = field(default_factory=dict)
     unit: str | None = None
     blocking: bool = True
+    optional_params: frozenset[str] = frozenset()
 
 
 # ── The registry — DETERMINISTIC + CLOSED. Exactly the 8 codes in REQUIREMENT_CODES, all v1. Each
@@ -105,13 +107,17 @@ _SCHEMAS: tuple[ValidationRequirementSchema, ...] = (
         params_schema={},
         result_schema={"is_consistent": bool, "distinct_units": int},
     ),
-    # A currency-consistency check needs the reference currency it must agree with.
+    # A currency-consistency check agrees against a reference currency column WHEN one is bound.
+    # `currency_ref` is OPTIONAL: `_validate_idea` mints this requirement precisely for an operand
+    # whose currency is UNKNOWN (no bound currency column), so the reference ref is genuinely
+    # unavailable at mint time — supply it when known, omit it (the external check discovers it) when not.
     ValidationRequirementSchema(
         code="CURRENCY_CONSISTENT",
         schema_version="v1",
         subject_kind="column_ref",
         params_schema={"currency_ref": tuple},
         result_schema={"is_consistent": bool, "distinct_currencies": int},
+        optional_params=frozenset({"currency_ref"}),
     ),
     # An additivity check needs the operation being applied and returns whether it is supported.
     ValidationRequirementSchema(
@@ -151,8 +157,9 @@ def _validate_params(
     schema: ValidationRequirementSchema, params: Mapping[str, object]
 ) -> tuple[tuple[str, object], ...]:
     """Validate `params` against `schema.params_schema` and return the hashable sorted (name, value)
-    tuple form. For v1 every declared param is REQUIRED, no extra params are allowed, and each value
-    must be an instance of its declared type. Any violation is a `RequirementValidationError`."""
+    tuple form. Every declared param is REQUIRED unless listed in `schema.optional_params`; no extra
+    params are allowed, and each supplied value must be an instance of its declared type. Any
+    violation is a `RequirementValidationError`."""
     allowed = schema.params_schema
     extra = set(params) - set(allowed)
     if extra:
@@ -160,12 +167,14 @@ def _validate_params(
             f"requirement {schema.code!r} got unknown param(s) {sorted(extra)}; "
             f"allowed: {sorted(allowed)}"
         )
-    missing = set(allowed) - set(params)
+    missing = (set(allowed) - schema.optional_params) - set(params)
     if missing:
         raise RequirementValidationError(
             f"requirement {schema.code!r} missing required param(s) {sorted(missing)}"
         )
     for name, expected_type in allowed.items():
+        if name not in params:   # an omitted OPTIONAL param — nothing to type-check
+            continue
         value = params[name]
         if not isinstance(value, expected_type):
             raise RequirementValidationError(

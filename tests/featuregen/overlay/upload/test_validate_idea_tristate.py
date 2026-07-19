@@ -376,3 +376,68 @@ def test_cross_table_read_scope_denied_hop_is_rejected(db):
            "aggregation": "count", "grain_table": "accounts"}
     idea, rej = _validate_idea(db, raw, known, src_of, None, NOW, FRESH, roles=())
     assert idea is None and rej.code == RejectCode.JOIN_DENIED
+
+
+# ── C2-C3 Task 2: requirements minted through the validated registry factory ──────────────────────
+def test_type_is_numeric_requirement_is_registry_built(db):
+    # RF-C2 operational-unknown fixture: same code/operand as before, now registry-validated —
+    # every minted requirement carries the pinned schema_version and (here) no params.
+    ref = _ftr_col(db, "loans", "balance", data_type="unknown", declared_type="numeric")
+    known, src_of = _kv([ref], "ftr")
+    raw = {"name": "avg_balance", "derives_from": [ref], "aggregation": "avg"}
+    idea, rej = _validate_idea(db, raw, known, src_of, None, NOW, FRESH)
+    assert rej is None
+    numeric = [r for r in idea.requirements if r.code == "TYPE_IS_NUMERIC"]
+    assert numeric and numeric[0].operand == ("ftr", ref)   # code/operand unchanged
+    assert numeric[0].schema_version == "v1"                # came through build_requirement
+    assert numeric[0].params == ()                          # a no-param code
+
+
+def test_additivity_requirement_carries_operation_param(db):
+    build_graph(db, "bank", [
+        CanonicalRow("bank", "accounts", "balance", "numeric", additivity="semi_additive")])
+    _fresh(db, "bank")   # file-declared additivity -> NOT governed -> needs-check
+    known, src_of = _kv(["public.accounts.balance"], "bank")
+    raw = {"name": "sum_bal", "derives_from": ["public.accounts.balance"], "aggregation": "sum"}
+    idea, rej = _validate_idea(db, raw, known, src_of, None, NOW, FRESH)
+    assert rej is None
+    add = [r for r in idea.requirements if r.code == "ADDITIVITY_SUPPORTS_OPERATION"]
+    assert add and add[0].operand == ("bank", "public.accounts.balance")
+    assert add[0].schema_version == "v1"
+    assert dict(add[0].params) == {"operation": "sum"}   # the normalized server-known operation
+
+
+def test_full_requirement_set_is_registry_validated_and_unchanged(db):
+    # A representative multi-requirement feature exercising 5 of the codes at once (additivity, unit,
+    # currency, temporal, grain). The SET of (code, operand) is the pre-rewire behavior — locked as a
+    # regression guard — and every requirement is now registry-validated (schema_version "v1").
+    build_graph(db, "t", [
+        CanonicalRow("t", "accounts", "id", "integer", is_grain=True),   # file-declared grain
+        CanonicalRow("t", "accounts", "posted_at", "timestamp", as_of=True),   # file-declared as-of
+        CanonicalRow("t", "accounts", "a", "numeric", additivity="semi_additive"),   # no unit/ccy
+        CanonicalRow("t", "accounts", "b", "numeric")])   # no unit/ccy
+    _fresh(db, "t")
+    known, src_of = _kv(["public.accounts.a", "public.accounts.b"], "t")
+    raw = {"name": "sum_ab_90d", "derives_from": ["public.accounts.a", "public.accounts.b"],
+           "aggregation": "sum_90d", "grain_table": "accounts"}
+    idea, rej = _validate_idea(db, raw, known, src_of, None, NOW, FRESH)
+    assert rej is None
+    assert idea.validation_status == "NEEDS_EXTERNAL_VALIDATION"
+    assert {(r.code, r.operand) for r in idea.requirements} == {
+        ("ADDITIVITY_SUPPORTS_OPERATION", ("t", "public.accounts.a")),
+        ("ADDITIVITY_SUPPORTS_OPERATION", ("t", "public.accounts.b")),
+        ("UNIT_CONSISTENT", ("t", "public.accounts.a")),
+        ("UNIT_CONSISTENT", ("t", "public.accounts.b")),
+        ("CURRENCY_CONSISTENT", ("t", "public.accounts.a")),
+        ("CURRENCY_CONSISTENT", ("t", "public.accounts.b")),
+        ("TEMPORAL_IS_POPULATED", ("t", "public.accounts.posted_at")),
+        ("GRAIN_IS_UNIQUE", ("t", "public.accounts.id")),
+    }
+    # every requirement is registry-validated (pinned schema version)
+    assert all(r.schema_version == "v1" for r in idea.requirements)
+    # the additivity checks carry their typed operation param; currency omits its OPTIONAL ref
+    for r in idea.requirements:
+        if r.code == "ADDITIVITY_SUPPORTS_OPERATION":
+            assert dict(r.params) == {"operation": "sum_90d"}
+        if r.code == "CURRENCY_CONSISTENT":
+            assert r.params == ()

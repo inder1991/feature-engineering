@@ -75,8 +75,12 @@ def test_grain_is_unique_result_schema():
     }
 
 
-def test_currency_consistent_requires_currency_ref():
-    assert schema_for("CURRENCY_CONSISTENT").params_schema == {"currency_ref": tuple}
+def test_currency_consistent_declares_optional_currency_ref():
+    # C2-C3 Task 2: currency_ref is DECLARED (typed tuple) but OPTIONAL — `_validate_idea` mints this
+    # requirement for an operand whose currency is UNKNOWN, so no reference ref is available at mint.
+    schema = schema_for("CURRENCY_CONSISTENT")
+    assert schema.params_schema == {"currency_ref": tuple}
+    assert schema.optional_params == frozenset({"currency_ref"})
 
 
 # ── build_requirement — the sanctioned factory ────────────────────────────────────────────────────
@@ -171,6 +175,24 @@ def test_build_currency_consistent_valid():
         params={"currency_ref": ("bank", "public.t.ccy")},
     )
     assert r.params == (("currency_ref", ("bank", "public.t.ccy")),)
+
+
+def test_build_currency_consistent_without_optional_ref():
+    # the OPTIONAL currency_ref may be omitted (the unknown-currency mint case in _validate_idea)
+    r = build_requirement(code="CURRENCY_CONSISTENT", operand=("bank", "public.t.amount"))
+    assert r.code == "CURRENCY_CONSISTENT"
+    assert r.params == ()
+    assert r.schema_version == "v1"
+
+
+def test_build_currency_consistent_wrong_type_ref_still_rejected():
+    # optional does NOT mean untyped: a supplied currency_ref must still be the declared tuple type
+    with pytest.raises(RequirementValidationError):
+        build_requirement(
+            code="CURRENCY_CONSISTENT",
+            operand=("bank", "public.t.amount"),
+            params={"currency_ref": "not-a-tuple"},
+        )
 
 
 # ── Requirement backward-compatibility (additive extension) ────────────────────────────────────────

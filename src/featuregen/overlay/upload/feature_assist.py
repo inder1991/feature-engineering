@@ -499,7 +499,15 @@ def _validate_idea(conn, raw: dict, known: set[str], src_of: dict[str, set[str]]
             if wm is None or wm < now - fresh_within:
                 return None, Rejection(RejectCode.STALE, f"stale source: {src}")
 
+    # C2-C3: every requirement below is minted through the SANCTIONED, registry-validated factory
+    # (validation_requirements.build_requirement) — the deterministic code picks code + typed params
+    # from server-known refs; a bad code/param is a PROGRAMMER error (raises), never swallowed. Imported
+    # here (function-local) because validation_requirements imports REQUIREMENT_CODES/Requirement from
+    # this module — a module-top import would be a circular import at load time.
+    from featuregen.overlay.upload.validation_requirements import build_requirement
+
     aggregation = raw.get("aggregation")
+    operation = _norm_agg(aggregation)   # the normalized operation string (server-known, not the LLM's)
     grain_table = raw.get("grain_table")
     catalogs = {p[0] for p in pairs}
     requirements: list[Requirement] = []
@@ -517,8 +525,9 @@ def _validate_idea(conn, raw: dict, known: set[str], src_of: dict[str, set[str]]
             if declared and not _is_numeric(declared):
                 return None, Rejection(RejectCode.NON_NUMERIC,
                                        f"declared type {declared!r} of {d} is not numeric")
-            requirements.append(Requirement("TYPE_IS_NUMERIC", (src, d),
-                                            "operational type unknown; numeric declared hint"))
+            requirements.append(build_requirement(
+                code="TYPE_IS_NUMERIC", operand=(src, d),
+                detail="operational type unknown; numeric declared hint", params=None))
 
     # ── disposition: additivity — only a GOVERNED semi/non-additive rejects; an unresolved
     #    (file-declared / hint) additivity is honest needs-check (spec [F6]) ──
@@ -528,8 +537,9 @@ def _validate_idea(conn, raw: dict, known: set[str], src_of: dict[str, set[str]]
             if facts.authority == "governed" and facts.value in ("semi_additive", "non_additive"):
                 return None, Rejection(RejectCode.ADDITIVITY, f"unsafe additive aggregation of {d}")
             if facts.authority != "governed":
-                requirements.append(Requirement("ADDITIVITY_SUPPORTS_OPERATION", (src, d),
-                                                "additivity not governed-confirmed"))
+                requirements.append(build_requirement(
+                    code="ADDITIVITY_SUPPORTS_OPERATION", operand=(src, d),
+                    detail="additivity not governed-confirmed", params={"operation": operation}))
 
     # ── disposition: unit / currency — DISTINCT hint fields (never folded): a hint may TIGHTEN
     #    (a positive contradiction rejects; absence needs-checks) but never CLEAR — matching
@@ -544,11 +554,15 @@ def _validate_idea(conn, raw: dict, known: set[str], src_of: dict[str, set[str]]
     if len(pairs) >= 2:   # a COMBINING op: an operand's unknown scale/currency is a fact to verify
         for src, d in pairs:
             if not meta[d]["unit"]:
-                requirements.append(Requirement("UNIT_CONSISTENT", (src, d),
-                                                "unit unknown across a combining op"))
+                requirements.append(build_requirement(
+                    code="UNIT_CONSISTENT", operand=(src, d),
+                    detail="unit unknown across a combining op", params=None))
             if not meta[d]["currency"]:
-                requirements.append(Requirement("CURRENCY_CONSISTENT", (src, d),
-                                                "currency unknown across a combining op"))
+                # currency is UNKNOWN here (that is the mint condition), so no bound currency_ref is
+                # available — pass none; currency_ref is OPTIONAL in the registry (C2C3-T1 tweak).
+                requirements.append(build_requirement(
+                    code="CURRENCY_CONSISTENT", operand=(src, d),
+                    detail="currency unknown across a combining op", params={}))
 
     # ── disposition: temporal — a windowed feature needs a governed-VERIFIED as-of column; a table
     #    with NO as-of column at all is still a hard reject (future-leakage risk) ──
@@ -565,8 +579,9 @@ def _validate_idea(conn, raw: dict, known: set[str], src_of: dict[str, set[str]]
             time_operand = (src, aref)
             facts = read_column_facts(conn, logical_ref_of(src, aref), "is_as_of")
             if facts.authority != "governed":
-                requirements.append(Requirement("TEMPORAL_IS_POPULATED", (src, aref),
-                                                "as-of column declared, not governed-verified"))
+                requirements.append(build_requirement(
+                    code="TEMPORAL_IS_POPULATED", operand=(src, aref),
+                    detail="as-of column declared, not governed-verified", params=None))
 
     # ── disposition: grain — a grain feature needs a governed-VERIFIED grain column ──
     if grain_table and len(catalogs) == 1:
@@ -576,8 +591,9 @@ def _validate_idea(conn, raw: dict, known: set[str], src_of: dict[str, set[str]]
             grain_operand = (gcat, gref)
             facts = read_column_facts(conn, logical_ref_of(gcat, gref), "is_grain")
             if facts.authority != "governed":
-                requirements.append(Requirement("GRAIN_IS_UNIQUE", (gcat, gref),
-                                                "grain declared, not governed-verified"))
+                requirements.append(build_requirement(
+                    code="GRAIN_IS_UNIQUE", operand=(gcat, gref),
+                    detail="grain declared, not governed-verified", params=None))
 
     # ── disposition: cross-table join authority (spec §7). A measure in a different table than the
     #    grain needs a real path; UNVERIFIED -> JOIN_CONNECTIVITY, no-path / read-scope-denied -> reject ──
@@ -593,8 +609,9 @@ def _validate_idea(conn, raw: dict, known: set[str], src_of: dict[str, set[str]]
                     return None, Rejection(RejectCode.JOIN_DENIED,
                                            f"join {grain_table} -> {d} crosses a read-scope-denied hop")
                 if outcome.kind == JoinOutcome.UNVERIFIED:
-                    requirements.append(Requirement("JOIN_CONNECTIVITY", (src, d),
-                                                    "join authorized but not verified"))
+                    requirements.append(build_requirement(
+                        code="JOIN_CONNECTIVITY", operand=(src, d),
+                        detail="join authorized but not verified", params=None))
 
     # ── finalize (tri-state) ──
     status = "NEEDS_EXTERNAL_VALIDATION" if requirements else "DESIGN_CHECKED"
