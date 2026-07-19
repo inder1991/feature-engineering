@@ -115,15 +115,17 @@ class Requirement:
 
 def _call_raw(conn, client: LLMClient, task: str, prompt_id: str, schema_id: str,
               instruction: str, catalog_metadata: dict, *,
-              actor: IdentityEnvelope | None = None) -> dict:
+              actor: IdentityEnvelope | None = None,
+              prompt_version: int = 1, schema_version: int = 1) -> dict:
     """Every feature-assist LLM call goes through the AUDITED seam (M6): the egress guard scans the
-    user text (`instruction`) + metadata before dispatch, and the call is recorded in llm_call. Was a
-    raw client.call() that skipped both — a real leak against a non-fake provider. `actor` is the
-    HUMAN subject the route threaded in, so the llm_call attribution names who asked (not the fallback
-    service enrichment actor); absent, the seam falls back to that service identity."""
+    user text (`instruction`) + metadata before dispatch, and the call is recorded in llm_call.
+    `prompt_version`/`schema_version` (default 1 — byte-for-byte v1) pin the request's contract so the
+    immutable record stamps WHICH input contract egressed, not a hardcoded 1. `actor` is the HUMAN
+    subject the route threaded in; absent, the seam falls back to the service identity."""
     out = audited_structured_call(
         conn, client, task=task, prompt_id=prompt_id, schema_id=schema_id,
-        catalog_metadata=catalog_metadata, instruction=instruction, actor=actor)
+        catalog_metadata=catalog_metadata, instruction=instruction, actor=actor,
+        prompt_version=prompt_version, schema_version=schema_version)
     return out if isinstance(out, dict) else {}
 
 
@@ -172,6 +174,12 @@ def feature_context_enabled() -> bool:
     relevance, versioned shape). Default OFF ⟹ the thin pre-Slice-3 menu, byte-for-byte.
     RF-C3: the ONE public definition — 3a-iv imports and reuses this; never redefine it."""
     return os.environ.get(FEATURE_CONTEXT_FLAG, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _feature_schema_version() -> int:
+    """2 when the feature-context flag is on (the widened INPUT contract egressed), else 1 — so the
+    immutable llm_call stamps the real numeric version, not a hardcoded 1 masked by a `…_v1` prompt_id."""
+    return 2 if feature_context_enabled() else 1
 
 
 # Menu fact key -> read_column_facts field_name. `data_type` reads the OPERATIONAL structural type
@@ -628,6 +636,7 @@ def _critique_candidates(conn, client: LLMClient, objective: str,
     summary = [{"name": f.name, "derives_from": f.derives_from, "aggregation": f.aggregation,
                 "grain_table": f.grain_table} for f in candidates]
     try:
+        # critique stays v1 (no feature_candidate_critique v2 registered — spec §8)
         out = _call_raw(
             conn, client, "overlay.feature.critique_candidates", "feature_candidate_critique_v1",
             "feature_candidate_critique", objective, {"candidates": summary}, actor=actor)
@@ -684,7 +693,9 @@ def _fix_pass(conn, client: LLMClient, objective: str, accepted: list[FeatureIde
     if feedback:
         inputs["feedback"] = feedback
     out = _call_raw(conn, client, "overlay.feature.recommend", "feature_recommend_v1",
-                    "feature_ideas", objective, inputs, actor=actor)
+                    "feature_ideas", objective, inputs, actor=actor,
+                    prompt_version=_feature_schema_version(),
+                    schema_version=_feature_schema_version())
     for raw in out.get("features", []):
         idea = _vet(conn, raw, known, src_of, registered, keep, seen, [], target_ref, now,
                     fresh_within, roles=roles)
@@ -736,7 +747,9 @@ def _generate(conn, objective: str, client: LLMClient, *,
         if feedback:
             inputs["feedback"] = feedback
         out = _call_raw(conn, client, "overlay.feature.recommend", "feature_recommend_v1",
-                        "feature_ideas", objective, inputs, actor=actor)
+                        "feature_ideas", objective, inputs, actor=actor,
+                        prompt_version=_feature_schema_version(),
+                        schema_version=_feature_schema_version())
         proposed = out.get("features", [])
         if not proposed:                       # stalled generator -> stop
             break
@@ -887,7 +900,9 @@ def refine_idea(conn, idea: dict, instruction: str, client: LLMClient, *,
     if objective:
         inputs["objective"] = objective
     out = _call_raw(conn, client, "overlay.feature.recommend", "feature_recommend_v1",
-                    "feature_ideas", instruction, inputs, actor=actor)
+                    "feature_ideas", instruction, inputs, actor=actor,
+                    prompt_version=_feature_schema_version(),
+                    schema_version=_feature_schema_version())
     proposed = out.get("features", [])
     if not proposed:
         return None, {"name": str(idea.get("name", "")),
@@ -929,7 +944,9 @@ def feature_recipe(conn, nl_query: str, client: LLMClient, *, catalog_source: st
     if table_context:
         recipe_inputs["table_context"] = table_context
     out = _call_raw(conn, client, "overlay.feature.recipe", "feature_recipe_v1", "feature_recipe",
-                    nl_query, recipe_inputs, actor=actor)
+                    nl_query, recipe_inputs, actor=actor,
+                    prompt_version=_feature_schema_version(),
+                    schema_version=_feature_schema_version())
     derives = [d for d in out.get("derives_from", []) if d in known]
     grain = out.get("grain_table")
     join_table = out.get("join_table")
@@ -952,9 +969,11 @@ def leakage_check(conn, derives_from: list[str], target_ref: str,
                   client: LLMClient, *,
                   actor: IdentityEnvelope | None = None) -> list[LeakageWarning]:
     used = set(derives_from)
+    # leakage input does not widen under the flag — stays v1 (RF-I8/recon #6)
     out = _call_raw(conn, client, "overlay.feature.leakage", "feature_leakage_v1", "leakage",
                     "Flag columns that leak the prediction target.",
-                    {"derives_from": list(derives_from), "target": target_ref}, actor=actor)
+                    {"derives_from": list(derives_from), "target": target_ref}, actor=actor,
+                    prompt_version=1, schema_version=1)
     return [LeakageWarning(object_ref=w["object_ref"], reason=str(w.get("reason", "")))
             for w in out.get("leaks", [])
             if isinstance(w, dict) and w.get("object_ref") in used]
@@ -1118,8 +1137,10 @@ def recommend_set(conn, sets: list[FeatureSet], hypothesis: str,
     summary = [{"lens": s.lens, "signals": set_signals(conn, s),
                 "features": [{"name": f.name, "derives_from": f.derives_from,
                               "aggregation": f.aggregation} for f in s.features]} for s in sets]
+    # recommend_set input does not widen under the flag — stays v1 (RF-I8/recon #6)
     out = _call_raw(conn, client, "overlay.feature.recommend_set", "feature_set_v1",
-                    "feature_set_rec", hypothesis, {"sets": summary}, actor=actor)
+                    "feature_set_rec", hypothesis, {"sets": summary}, actor=actor,
+                    prompt_version=1, schema_version=1)
     default = sets[0].lens if sets else ""
     return SetRecommendation(recommended_lens=str(out.get("recommended_lens", default)),
                              reasoning=str(out.get("reasoning", "")))
