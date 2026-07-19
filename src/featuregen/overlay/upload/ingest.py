@@ -67,6 +67,7 @@ from featuregen.overlay.upload.sample_parser import ParsedProfile, reconcile_pro
 from featuregen.overlay.upload.sanitize import redact_text
 from featuregen.overlay.upload.source_profile import (
     FTR_GLOSSARY_PROFILE,
+    TECHNICAL_CSV_PROFILE,
     SourceCapabilityProfile,
     strength_for,
 )
@@ -484,6 +485,11 @@ _MATERIAL_FIELDS = frozenset({"definition"})
 # (present->absent) must have its prior ACTIVE rows STALED, else a dropped value stays load-bearing
 # (Task-10 Important-3). Kept in sync with `_write_glossary_source_evidence` / `_parser_evidence`.
 _SOURCE_FIELDS: tuple[str, ...] = ("definition", "domain", "business_term", "bian_path", "fibo_path")
+# The SOURCE fields a TECHNICAL CSV declares per column (Delivery B item 8) — the technical mirror of
+# `_SOURCE_FIELDS`, reconciled present->absent the same way. Kept in sync with
+# `_write_technical_source_evidence` and TECHNICAL_CSV_PROFILE.attested_fields.
+_TECHNICAL_SOURCE_FIELDS: tuple[str, ...] = (
+    "definition", "sensitivity", "additivity", "unit", "currency", "entity")
 _PARSER_FIELDS: tuple[str, ...] = ("logical_representation", "semantic_type")
 # The full set of behavioural fields TAXONOMY can DERIVE from a concept (see `derive_concept_evidence`).
 # `additivity` is conditional (skipped for an `n/a` concept), so a reclassification to a non-additive
@@ -758,6 +764,42 @@ def _write_glossary_source_evidence(
     dropped = _stale_absent_fields(
         conn, logical_ref=logical_ref, producer=EvidenceProducer.SOURCE,
         all_fields=_SOURCE_FIELDS, present=present,
+    )
+    if dropped & _MATERIAL_FIELDS:
+        material_changed = True
+    return material_changed
+
+
+def _write_technical_source_evidence(
+    conn, *, logical_ref: str, row: CanonicalRow, producer_ref: str, snapshot_id: str
+) -> bool:
+    """Write SOURCE evidence for a TECHNICAL-CSV column at the technical profile's per-field strength
+    (all six fields ATTESTED — the structural source vouches for them, spec §U.1), so a declared
+    unit/currency/entity/sensitivity/additivity/definition can be governed and become operationally
+    load-bearing through the evidence machinery instead of living ONLY as `graph_node` flat columns
+    (Delivery B item 8). The exact technical mirror of :func:`_write_glossary_source_evidence`:
+    present->absent reconciliation stales a field the new upload dropped, and the return says whether
+    the column's MATERIAL changed vs the prior upload — a material field staled by a changed value
+    (present->present) OR dropped entirely (present->absent)."""
+    material_changed = False
+    present: set[str] = set()
+    for field_name, value in (("definition", row.definition), ("sensitivity", row.sensitivity),
+                              ("additivity", row.additivity), ("unit", row.unit),
+                              ("currency", row.currency), ("entity", row.entity)):
+        if not value:
+            continue
+        present.add(field_name)
+        staled = _write_producer_field(
+            conn, logical_ref=logical_ref, field_name=field_name, value=value,
+            producer=EvidenceProducer.SOURCE,
+            strength=strength_for(TECHNICAL_CSV_PROFILE, field_name),
+            producer_ref=producer_ref, snapshot_id=snapshot_id, material=value,
+        )
+        if field_name in _MATERIAL_FIELDS and staled > 0:
+            material_changed = True
+    dropped = _stale_absent_fields(
+        conn, logical_ref=logical_ref, producer=EvidenceProducer.SOURCE,
+        all_fields=_TECHNICAL_SOURCE_FIELDS, present=present,
     )
     if dropped & _MATERIAL_FIELDS:
         material_changed = True
@@ -1068,6 +1110,55 @@ def _ingest_glossary_evidence(conn, *, source: str, rows: list[CanonicalRow],
                         len(readiness.review_requirements))
     except Exception:  # noqa: BLE001
         logger.warning("advisory readiness diagnostic failed for %r", source, exc_info=True)
+    return contained_failures
+
+
+def _ingest_technical_evidence(conn, *, source: str, rows: list[CanonicalRow],
+                               producer_ref: str, now: datetime | None) -> int:
+    """Attach the TECHNICAL upload's per-column SOURCE evidence (Delivery B item 8), flag
+    human-confirmation revalidation on a material change, then resolve-and-project — the
+    technical-path mirror of :func:`_ingest_glossary_evidence`'s column loop. Runs ONLY when
+    ``glossary is None`` (the glossary path writes its own source evidence; running both would
+    double-write the overlapping fields).
+
+    Refs are keyed exactly like the technical graph: schema-less ``normalize_ref`` (public-
+    flattened), so ``resolve_and_project``'s ``_graph_key`` reaches the same node ``build_graph``
+    wrote. Every stage is savepointed and fail-soft (the glossary loop's failure-class table): a
+    per-column failure logs and is contained; the upload's FACTS and raw graph are never rolled
+    back. Returns the number of CONTAINED failures."""
+    contained_failures = 0
+    attachable_refs: list[str] = []
+    for row in rows:
+        logical_ref = normalize_ref(source, None, row.table, row.column)
+        material_changed = False
+        try:
+            with conn.transaction():
+                material_changed = _write_technical_source_evidence(
+                    conn, logical_ref=logical_ref, row=row,
+                    producer_ref=producer_ref, snapshot_id=producer_ref)
+        except Exception:  # noqa: BLE001 — evidence-write failure: warn + continue (facts intact)
+            contained_failures += 1
+            logger.warning("advisory technical SOURCE evidence failed for %s", logical_ref,
+                           exc_info=True)
+        if material_changed:
+            try:
+                with conn.transaction():
+                    _flag_human_confirmed_revalidation(
+                        conn, logical_ref=logical_ref, snapshot_id=producer_ref, now=now)
+            except Exception:  # noqa: BLE001
+                contained_failures += 1
+                logger.warning("advisory revalidation flag failed for %s", logical_ref,
+                               exc_info=True)
+        attachable_refs.append(logical_ref)
+    if not attachable_refs:
+        return contained_failures
+    try:
+        with conn.transaction():
+            resolve_and_project(conn, source=source, logical_refs=attachable_refs, now=now)
+    except Exception:  # noqa: BLE001 — resolver failure: continue with the raw graph (degraded)
+        contained_failures += 1
+        logger.warning("advisory resolve_and_project failed for %r — graph left with raw nodes "
+                       "(degraded)", source, exc_info=True)
     return contained_failures
 
 
@@ -1628,6 +1719,22 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
                          started_at=stage_started)
     else:
         record_stage(stage_recorder, "glossary_evidence", "not_applicable")
+    if glossary is None:
+        # Technical-source evidence (Delivery B item 8) — the non-glossary mirror of the block
+        # above: the declared unit/currency/entity/sensitivity/additivity/definition become SOURCE
+        # evidence + a resolved decision, not just graph_node flat columns. `producer_ref` is the
+        # route's durable ingestion_run_id when threaded; a direct caller (None) gets a minted
+        # fallback so technical evidence ALWAYS carries a producer_ref (same `mint_id("ing")`
+        # namespace the glossary snapshot uses). Belt-and-braces fail-soft like the glossary block:
+        # the helper savepoints every stage, and this outer guard makes a stray failure a warning
+        # rather than a rollback of the already-committed facts + graph.
+        try:
+            _ingest_technical_evidence(
+                conn, source=catalog_source, rows=vr.good,
+                producer_ref=ingestion_run_id or mint_id("ing"), now=now)
+        except Exception:  # noqa: BLE001
+            logger.warning("advisory technical evidence wiring failed for %r — facts + graph "
+                           "intact", catalog_source, exc_info=True)
 
     # DRAIN before the end-of-ingest re-projections (full-chain e2e finding, 2026-07-15): the
     # governed seams above (_propose_governed_joins / Pass C / Pass B) appended OVERLAY_FACT_PROPOSED

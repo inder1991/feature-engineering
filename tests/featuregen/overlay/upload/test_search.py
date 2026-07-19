@@ -140,7 +140,11 @@ def test_field_resolution_projection_rebuilds_search_doc(db):
     # the node's concept/definition display values. Full-text search must follow the CURRENT values:
     # the new terms match, the replaced ones stop matching.
     from featuregen.overlay.evidence import AssertionStrength, EvidenceProducer
-    from featuregen.overlay.field_evidence import field_input_hash, record_field_evidence
+    from featuregen.overlay.field_evidence import (
+        field_input_hash,
+        record_field_evidence,
+        stale_source_evidence,
+    )
     from featuregen.overlay.upload.field_resolution import resolve_and_project
     from featuregen.overlay.upload.object_ref import normalize_ref
 
@@ -155,10 +159,16 @@ def test_field_resolution_projection_rebuilds_search_doc(db):
     ref = normalize_ref("deposits", None, "accounts", "balance")
 
     def seed(field, value, producer, strength):
+        # SUPERSEDE like a real producer (`_write_producer_field`): the technical ingest above now
+        # writes its own source/attested definition evidence (Delivery B item 8), so a bare second
+        # attested row would be a same-strength CONFLICT resolving to no display value at all.
+        input_hash = field_input_hash(logical_ref=ref, field_name=field, material=value)
+        stale_source_evidence(db, logical_ref=ref, field_name=field, producer=producer,
+                              keep_input_hash=input_hash)
         record_field_evidence(
             db, logical_ref=ref, field_name=field, proposed_value=value, producer=producer,
             strength=strength, producer_ref="test-producer", source_snapshot_id="snap-1",
-            input_hash=field_input_hash(logical_ref=ref, field_name=field, material=value))
+            input_hash=input_hash)
 
     seed("definition", "authoritative settlement narrative",
          EvidenceProducer.SOURCE, AssertionStrength.ATTESTED)
