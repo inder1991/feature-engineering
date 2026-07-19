@@ -28,7 +28,13 @@ from featuregen.contracts.envelopes import IdentityEnvelope
 from featuregen.idgen import mint_id
 from featuregen.intake.llm import LLMClient, compute_input_hash
 from featuregen.overlay.upload.contract._serial import actor_json as _actor_json
-from featuregen.overlay.upload.contract.author import ContractDraft, draft_contract
+from featuregen.overlay.upload.contract.author import (
+    ContractDraft,
+    CrossCatalogPlanRequired,
+    StalePlan,
+    _envelope_join_path,
+    draft_contract,
+)
 from featuregen.overlay.upload.contract.gate1 import (
     _intent_scoped_applicability_enabled,
     build_considered_set,
@@ -50,12 +56,19 @@ from featuregen.overlay.upload.contract.intake import (
     redact_free_text,
     submit_intent,
 )
+from featuregen.overlay.upload.contract.live_activation import (
+    LiveActivationNotReady,
+    is_live_cross_catalog_enabled,
+    require_live_ready,
+)
 from featuregen.overlay.upload.contract.review import author_contract
 from featuregen.overlay.upload.contract.scope_records import (
     dimension_provenance,
     record_confirmed_scope,
     record_recognition_attempt,
 )
+from featuregen.overlay.upload.planner.contracts import ReplayFreshness
+from featuregen.overlay.upload.planner.plan_envelope import recheck_plan_freshness
 from featuregen.overlay.upload.planner.shadow import run_shadow_planner
 from featuregen.overlay.upload.taxonomy.applicability import (
     ConfirmedScope,
@@ -213,6 +226,14 @@ def _intent_ranking_enabled() -> bool:
     return os.environ.get("FEATUREGEN_INTENT_RANKING", "0") == "1"
 
 
+def _live_cross_catalog_flag_on() -> bool:
+    """3C.2a — the LIVE governed cross-catalog kill switch, read ONLY in the route (the builder is handed
+    the resolved boolean, never the env). OFF by default → no readiness query, no governed lens, byte-
+    identical to today. On its own it is necessary-but-not-sufficient: activation approval is still
+    required (see :func:`require_live_ready`), so a flag-on-but-unapproved deployment fails closed 503."""
+    return os.environ.get("FEATUREGEN_INTENT_LIVE_CROSS_CATALOG", "0") == "1"
+
+
 def rankable_recipe_ids(dispositions: list[RecipeEvaluation]) -> list[str]:
     """The precomputed rankable set: the recipe ids whose rolled-up disposition is ``ELIGIBLE``.
 
@@ -359,6 +380,16 @@ def _scoped_considered_set(body: ConsideredSetIn, conn: _Conn, identity: _Identi
         if owned is None:
             raise HTTPException(status_code=404, detail="unknown intent")
         intent = replace(intent, intent_id=body.intent_id)
+    # 3C.2a — the LIVE governed cross-catalog readiness interlock. On an entity-scoped run (no single
+    # catalog) with the live flag ON, the deployment MUST be activation-approved BEFORE any LLM/planner
+    # dispatch — fail-closed 503, NEVER a legacy fallback, and BEFORE any run/scope is minted or
+    # persisted. The env flag is read ONLY here; the builder is handed the resolved boolean below. Flag
+    # unset → no readiness query at all (``is_live_cross_catalog_enabled`` short-circuits), byte-identical.
+    if body.catalog_source is None and _live_cross_catalog_flag_on():
+        try:
+            require_live_ready(conn)
+        except LiveActivationNotReady as e:
+            raise HTTPException(status_code=503, detail=str(e)) from e
     # 4. Mint the generation run — the run is born only NOW, when the human commits to generate.
     generation_run_id = mint_id("grun")
     # 5. Persist the confirmed scope in the API layer, BEFORE the builder (the run→scope linkage exists
@@ -377,10 +408,16 @@ def _scoped_considered_set(body: ConsideredSetIn, conn: _Conn, identity: _Identi
     # 6. Compute applicability ONCE — grounding AND the disposition lens consume this single object.
     applicability = applicability_result(scope)
     now = datetime.now(UTC)
+    # 3C.2a: the resolved live-activation boolean threads into the builder so the governed cross-catalog
+    # lens runs ONLY when the deployment is flag-on-and-approved (short-circuits to False when the flag is
+    # unset — no DB query). ``target_entity`` is the confirmed-scope grain the governed planner plans to,
+    # exactly the entity the log-only shadow planner already uses below.
+    is_live = is_live_cross_catalog_enabled(conn)
     cs = build_considered_set(
         conn, intent, client, entity=body.entity, catalog_source=body.catalog_source,
         roles=identity.role_claims, target_ref=body.target_ref, objective=body.objective,
-        feedback=body.feedback, now=now, applicability=applicability)
+        feedback=body.feedback, now=now, applicability=applicability,
+        is_live=is_live, target_entity=scope.target_entity)
     # 7. The per-stage disposition lens over the SAME applicability + this run's grounding outcome.
     dispositions = evaluate_dispositions(
         applicability, cs.grounded_template_ids, cs.rejected_template_ids,
@@ -449,10 +486,22 @@ def considered_set(body: ConsideredSetIn, conn: _Conn, identity: _Identity, clie
                                actor=identity.subject)
     except IntentValidationError as e:
         raise HTTPException(status_code=422, detail=str(e)) from e
+    # 3C.2a — the LIVE governed cross-catalog interlock on the NON-scoped path too (mirrors
+    # _scoped_considered_set): an entity-scoped run (no single catalog) with the live flag ON must be
+    # activation-approved BEFORE any dispatch — fail-closed 503 — and the resolved is_live threads into the
+    # builder so the SAME _reject_cross_catalog_llm + anchor-drop + governed lens filters run here as on the
+    # scoped path. FLAG UNSET → the gate short-circuits (no readiness query) and is_live reads False WITHOUT
+    # a DB query, so this is byte-identical to today for every flag-off / single-catalog request.
+    if body.catalog_source is None and _live_cross_catalog_flag_on():
+        try:
+            require_live_ready(conn)
+        except LiveActivationNotReady as e:
+            raise HTTPException(status_code=503, detail=str(e)) from e
+    is_live = is_live_cross_catalog_enabled(conn)
     cs = build_considered_set(
         conn, intent, client, entity=body.entity, catalog_source=body.catalog_source,
         roles=identity.role_claims, target_ref=body.target_ref, objective=body.objective,
-        feedback=body.feedback, now=datetime.now(UTC))
+        feedback=body.feedback, now=datetime.now(UTC), is_live=is_live)
     return _considered_set_response(intent, cs)
 
 
@@ -520,8 +569,20 @@ def draft(body: DraftReqIn, conn: _Conn, identity: _Identity, client: _LLM) -> d
     record_gate1_choice(conn, body.intent_id, chosen_source=body.chosen_source,
                         chosen_option_id=body.chosen_option_id, actor=identity.subject, why=body.why)
     target = intent_target_ref(conn, body.intent_id)   # server truth, not client-supplied
-    d = draft_contract(conn, feature, client, roles=identity.role_claims, target_ref=target,
-                       actor=identity)
+    # 3C.2a — the live-activation boolean is resolved ONLY here (the route boundary) and threaded down.
+    # FLAG-OFF (default) → byte-identical: a cross-catalog feature draws the permissive
+    # find_cross_catalog_path path exactly as before. FLAG-ON fail-closed: a governed feature drafts its
+    # compiled plan envelope's path, rechecked for freshness under the REQUEST's roles (the set it compiled
+    # under — else it would spuriously drift); a drifted plan → 409 (regenerate, never a substitute path),
+    # and a cross-catalog feature with no governed envelope → 422 (regenerate under the governed planner).
+    is_live = is_live_cross_catalog_enabled(conn)
+    try:
+        d = draft_contract(conn, feature, client, roles=identity.role_claims, target_ref=target,
+                           actor=identity, is_live=is_live)
+    except StalePlan as e:
+        raise HTTPException(status_code=409, detail="plan stale, regenerate") from e
+    except CrossCatalogPlanRequired as e:
+        raise HTTPException(status_code=422, detail=str(e)) from e
     d, unresolved = author_contract(conn, d, client, now=datetime.now(UTC), actor=identity)
     return {"draft": d, "unresolved": unresolved, "intent_id": body.intent_id}
 
@@ -564,6 +625,26 @@ def confirm(body: DraftIn, conn: _Conn, identity: _Identity) -> Contract:
             or frozenset(draft.derives_pairs) != frozenset(chosen.derives_pairs)
             or (draft.aggregation or "") != (chosen.aggregation or "")):
         raise HTTPException(status_code=422, detail="the draft does not match the chosen feature")
+    # 3C.2a fail-closed at the GOVERNING write: re-run the freshness recheck against the SERVER-
+    # reconstructed chosen feature's plan envelope (never the client body) under the request's roles —
+    # a plan that drifted between draft and confirm must never silently finalize (409, regenerate). The
+    # envelope branch is self-gated (only the flag-on governed planner attaches one), so it needs no
+    # is_live guard. The cross-catalog-without-envelope 422 fires ONLY when the deployment is flag-on-and-
+    # approved; FLAG-OFF a cross-catalog feature confirms via the permissive path, byte-identical to before.
+    env = chosen.plan_envelope
+    if env is not None:
+        if recheck_plan_freshness(conn, env, identity.role_claims) is not ReplayFreshness.current:
+            raise HTTPException(status_code=409, detail="plan stale, regenerate")
+        # 3C.2a fail-closed: a governed contract's persisted join_path is RE-DERIVED from the SERVER
+        # envelope's ordered_path, NEVER the client body — the match-check above validates
+        # name/derives_pairs/aggregation but NOT join_path, so a replay carrying a FABRICATED path (which
+        # the freshness recheck still passes) would otherwise be persisted as the "governed" bridge. Scoped
+        # strictly to the envelope-present case (single-catalog / flag-off drafts keep their client path).
+        draft = replace(draft, join_path=tuple(_envelope_join_path(env.ordered_path)))
+    elif (is_live_cross_catalog_enabled(conn)
+          and len({cs for cs, _ref in chosen.derives_pairs}) > 1):
+        raise HTTPException(status_code=422,
+                            detail="cross-catalog feature requires a governed plan envelope")
     target = intent_target_ref(conn, body.intent_id)   # SERVER truth — never the client body
     try:
         return confirm_contract(conn, draft, actor=identity.subject, now=datetime.now(UTC),
