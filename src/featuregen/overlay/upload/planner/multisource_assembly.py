@@ -26,8 +26,8 @@ Read-only over the reused frontier + compiler surfaces; nothing here edits ``ass
 """
 from __future__ import annotations
 
-from collections.abc import Iterable
-from dataclasses import dataclass
+from collections.abc import Iterable, Sequence
+from dataclasses import dataclass, replace
 from datetime import datetime
 
 from featuregen.overlay.catalog import CatalogAdapter
@@ -39,6 +39,7 @@ from featuregen.overlay.upload.planner.assembly import (
     semantic_rollup_paths,
 )
 from featuregen.overlay.upload.planner.contracts import (
+    MAX_OPERAND_COMBINATIONS,
     MAX_PATHS_PER_OPERAND,
     BindingPlanV1,
     BindingQuality,
@@ -54,6 +55,7 @@ from featuregen.overlay.upload.planner.multisource_contracts import (
     MultiSourceReason,
     OperandSlotV1,
     PathAggregation,
+    PhysicalLandingV1,
 )
 from featuregen.overlay.upload.planner.multisource_endpoints import governed_endpoint
 from featuregen.overlay.upload.planner.multisource_reuse import injected_operand_template
@@ -263,3 +265,162 @@ def enumerate_operand_paths(
     return OperandEnumerationResultV1(
         candidates=tuple(candidates), status=MultiSourceReason.resolved,
         reason_codes=reason_codes, bounds=bounds)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════════════════════
+# Task 6 — exact physical-landing convergence + deterministic ranking (spec §5 step 4, §8).
+#
+# Each operand's candidates (Task 5) land on a re-derived physical grain. The SAME operand can reach
+# ONE landing by several distinct governed plans: the frontier dedups complete states by
+# ``used_bridge_fact_keys``, so distinct bridge-key plans re-derive to the same physical landing
+# (Task-5 note). Convergence therefore groups each operand's candidates BY full ``PhysicalLandingV1``
+# identity — (catalog, table_ref, composite grain_key_refs) — keeping the best-ranked candidate per
+# (operand, landing), then INTERSECTS the per-operand landing sets on that full identity. A landing
+# every operand reaches is a common landing; the final join is on EVERY grain key.
+#
+# Ranking reuses the frontier's own ``_AUTHORITY_RANK``-derived per-plan rank, carried on
+# ``BindingPlanV1.preference_rank`` (its full precedence already folds in _AUTHORITY_RANK -> bridge
+# count -> binding quality -> hops -> realizer authority). Convergence is CONN-FREE by contract
+# (spec §8) and never re-reads the graph for authority (§12 read-only): it consumes the authority the
+# frontier already computed. A common landing's SEMANTIC rank is (Σ preference_rank, Σ bridge_count):
+# authority of the crossings first, fewest TOTAL crossings second. A top-semantic-rank tie across
+# DISTINCT landings is ``ambiguous_physical_grain`` (+ ``landing_ambiguous``) — detected BEFORE any
+# stable-identity presentation order, so an ambiguity is surfaced, never silently resolved by a
+# tiebreak. No common landing -> ``no_common_physical_grain``. The theoretical cross-operand product
+# is capped at ``MAX_OPERAND_COMBINATIONS`` (truncation is a recorded bound). Fail-closed: an empty
+# ``landed_combinations`` ALWAYS carries a reason, never a bare empty tuple.
+# ═══════════════════════════════════════════════════════════════════════════════════════════════
+
+
+@dataclass(frozen=True, slots=True)
+class LandedCombinationV1:
+    """One converged physical landing every operand reaches, carrying the per-operand best-ranked
+    candidate AT that landing. ``operand_candidates`` preserves INPUT operand order (convergence keys
+    operands positionally — ``OperandEnumerationResultV1`` carries no slot id), so downstream maps a
+    candidate back to its operand by index. The final join is on the landing's full ``grain_key_refs``."""
+    landing: PhysicalLandingV1
+    operand_candidates: tuple[OperandPathCandidateV1, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class ConvergenceResultV1:
+    """The typed convergence result (finding #7, spec §8). ``landed_combinations`` is empty UNLESS
+    exactly one unambiguous best common landing exists (then length 1 — the per-operand best candidate
+    at that landing); an empty result ALWAYS carries a ``status``/``reason_codes`` reason
+    (``no_common_physical_grain``/``ambiguous_physical_grain``, plus ``budget_truncated`` when the
+    combination space was capped), never a bare empty tuple. ``bounds`` extends the incoming metrics
+    with ``landing_ambiguous`` + ``operand_combinations_truncated``."""
+    landed_combinations: tuple[LandedCombinationV1, ...]
+    status: MultiSourceReason
+    reason_codes: tuple[MultiSourceReason, ...]
+    bounds: MultiSourceBoundingMetricsV1
+
+
+def _landing_of(candidate: OperandPathCandidateV1) -> PhysicalLandingV1:
+    """The full physical-landing identity of a candidate: its re-derived (catalog, table_ref) plus the
+    landing endpoint's composite ``grain_key_refs`` (multi-column grain preserved verbatim, order
+    intact) — the identity landings are grouped + intersected on."""
+    return PhysicalLandingV1(
+        catalog=candidate.landing_catalog, table_ref=candidate.landing_table_ref,
+        grain_key_refs=candidate.landing_endpoint.grain_key_refs)
+
+
+def _candidate_rank(candidate: OperandPathCandidateV1) -> tuple[int, int, str]:
+    """Per-candidate rank (best = smallest) for choosing the best plan at a given (operand, landing):
+    the frontier's ``_AUTHORITY_RANK``-derived ``preference_rank``, then fewest crossings
+    (``bridge_count``), then the canonical ``physical_plan_id`` for a deterministic final tiebreak."""
+    plan = candidate.binding_plan
+    return (plan.preference_rank, plan.bridge_count, plan.physical_plan_id)
+
+
+def _best_per_landing(
+        result: OperandEnumerationResultV1) -> dict[PhysicalLandingV1, OperandPathCandidateV1]:
+    """Group ONE operand's candidates by full ``PhysicalLandingV1`` identity, keeping the best-ranked
+    candidate per landing (distinct bridge-key plans re-derive to the same landing — Task-5 note; the
+    frontier dedups complete states by ``used_bridge_fact_keys``)."""
+    best: dict[PhysicalLandingV1, OperandPathCandidateV1] = {}
+    for candidate in result.candidates:
+        landing = _landing_of(candidate)
+        incumbent = best.get(landing)
+        if incumbent is None or _candidate_rank(candidate) < _candidate_rank(incumbent):
+            best[landing] = candidate
+    return best
+
+
+def _landing_semantic_key(operand_bests: tuple[OperandPathCandidateV1, ...]) -> tuple[int, int]:
+    """The SEMANTIC rank of a common landing (best = smallest), EXCLUDING any stable landing identity
+    so a genuine tie surfaces before ordering: authority of the crossings first (Σ frontier
+    ``preference_rank``, which is ``_AUTHORITY_RANK``-derived), fewest TOTAL crossings second
+    (Σ ``bridge_count``) across every operand's best candidate at the landing."""
+    return (
+        sum(c.binding_plan.preference_rank for c in operand_bests),
+        sum(c.binding_plan.bridge_count for c in operand_bests),
+    )
+
+
+def _empty_convergence(reason: MultiSourceReason, bounds: MultiSourceBoundingMetricsV1, *,
+                       truncated: bool, ambiguous: bool) -> ConvergenceResultV1:
+    """A fail-closed empty convergence: no landed combination, ALWAYS a reason (never a bare empty
+    tuple), with ``landing_ambiguous``/``operand_combinations_truncated`` recorded on the bounds."""
+    reason_codes = (reason,) + ((MultiSourceReason.budget_truncated,) if truncated else ())
+    return ConvergenceResultV1(
+        landed_combinations=(), status=reason, reason_codes=reason_codes,
+        bounds=replace(bounds, operand_combinations_truncated=truncated,
+                       landing_ambiguous=bounds.landing_ambiguous or ambiguous))
+
+
+def converge(operand_results: Sequence[OperandEnumerationResultV1], *,
+             bounds: MultiSourceBoundingMetricsV1) -> ConvergenceResultV1:
+    """Converge every operand onto ONE exact physical landing (spec §5 step 4, §8).
+
+    Intersect the per-operand landing sets on full ``PhysicalLandingV1`` identity, rank the common
+    landings by the frontier's ``_AUTHORITY_RANK``-derived semantic rank (authority of the crossings
+    -> fewest total crossings), and select the single unambiguous best — surfacing a top-semantic-rank
+    tie across DISTINCT landings as ``ambiguous_physical_grain`` (+ ``landing_ambiguous``) BEFORE any
+    stable-identity tiebreak, and no common landing as ``no_common_physical_grain``. Conn-free
+    (spec §8): the crossing authority the frontier already folded into each governed plan is reused,
+    never re-read (§12). Operates only on the governed candidates handed in (Task-5 note M11). The
+    theoretical cross-operand product is capped at ``MAX_OPERAND_COMBINATIONS`` (a recorded bound).
+    Fail-closed: an empty ``landed_combinations`` always carries a reason."""
+    # Per-operand landing -> best candidate. An operand that resolved no candidate contributes an
+    # empty set, which fails the intersection closed (no common landing).
+    per_operand = [_best_per_landing(r) for r in operand_results]
+
+    # Cross-operand product cap (spec §8): the theoretical (one-landing-per-operand) combination
+    # space. The realised work is bounded by the intersection (<= the smallest per-operand set), so
+    # the cap only records an honest bound; it never drops a genuinely common landing.
+    product = 1
+    for bests in per_operand:
+        product *= len(bests)
+    truncated = bounds.operand_combinations_truncated or product > MAX_OPERAND_COMBINATIONS
+
+    if not per_operand:
+        return _empty_convergence(MultiSourceReason.no_common_physical_grain, bounds,
+                                  truncated=truncated, ambiguous=False)
+    common = set(per_operand[0])
+    for bests in per_operand[1:]:
+        common &= set(bests)
+    if not common:
+        return _empty_convergence(MultiSourceReason.no_common_physical_grain, bounds,
+                                  truncated=truncated, ambiguous=False)
+
+    # Rank the common landings by SEMANTIC key; detect a top-rank tie across distinct landings BEFORE
+    # any stable-identity ordering (the ambiguity must surface, not be silently tiebroken).
+    keyed: list[tuple[tuple[int, int], PhysicalLandingV1, tuple[OperandPathCandidateV1, ...]]] = []
+    for landing in common:
+        operand_bests = tuple(bests[landing] for bests in per_operand)
+        keyed.append((_landing_semantic_key(operand_bests), landing, operand_bests))
+    best_key = min(k for k, _l, _c in keyed)
+    top = [(landing, operand_bests) for k, landing, operand_bests in keyed if k == best_key]
+    if len(top) > 1:
+        return _empty_convergence(MultiSourceReason.ambiguous_physical_grain, bounds,
+                                  truncated=truncated, ambiguous=True)
+
+    landing, operand_bests = top[0]
+    combination = LandedCombinationV1(landing=landing, operand_candidates=operand_bests)
+    reason_codes = (MultiSourceReason.budget_truncated,) if truncated else ()
+    return ConvergenceResultV1(
+        landed_combinations=(combination,), status=MultiSourceReason.resolved,
+        reason_codes=reason_codes,
+        bounds=replace(bounds, operand_combinations_truncated=truncated,
+                       landing_ambiguous=bounds.landing_ambiguous))
