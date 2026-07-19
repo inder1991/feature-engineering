@@ -130,6 +130,148 @@ def test_read_scope_hides_anchor_and_sibling_without_leak(client, conn):
     assert body["unavailable_sections"] == ["relationships.semantic"]   # no permission-count leak
 
 
+# ── (2b) F1: the readiness TABLE diagnostic is read-scoped — no hidden-column leak ───────────────
+
+
+def _seed_proposed_concept(conn, ref):
+    """A NON-load-bearing (proposed) concept decision for `ref`: an LLM/PROPOSED concept does NOT
+    satisfy concept's SOURCE-or-HUMAN operational rule, so resolve_and_project records a display-only
+    'proposed' decision — which surfaces as a NAMED `field:<ref>:concept` review requirement in the
+    UNSCOPED table diagnostic (the leak vector). Real field_decision_event rows, not a stub."""
+    record_field_evidence(
+        conn, logical_ref=ref, field_name="concept", proposed_value="monetary_stock",
+        producer=EvidenceProducer.LLM, strength=AssertionStrength.PROPOSED, producer_ref="enrich",
+        source_snapshot_id="snap-1",
+        input_hash=field_input_hash(logical_ref=ref, field_name="concept",
+                                    material="monetary_stock"))
+    resolve_and_project(conn, source="hr", logical_refs=[ref])
+
+
+def test_readiness_table_diagnostic_read_scoped_no_hidden_column_leak(client, conn):
+    """The MERGE BLOCKER (F1): the asset's readiness.table_diagnostic must be computed under the
+    caller's read-scope, so a hidden sensitivity-restricted sibling column that HAS decision rows
+    never leaks its name/logical_ref/count via a `field:...` requirement, an advisory gap, or a
+    summary count — for a `catalog:read` caller WITHOUT pii_reader viewing a VISIBLE sibling."""
+    from featuregen.overlay.upload.readiness import ReadinessScopeType, compute_readiness
+
+    build_graph(conn, "hr", [
+        CanonicalRow("hr", "employees", "salary", "numeric"),
+        CanonicalRow("hr", "employees", "national_id", "text", sensitivity="pii"),
+    ])
+    visible_ref = "hr::public.employees.salary"
+    hidden_ref = "hr::public.employees.national_id"
+    _seed_proposed_concept(conn, visible_ref)
+    _seed_proposed_concept(conn, hidden_ref)   # the hidden column HAS real decision rows
+
+    # NON-VACUITY: the UNSCOPED diagnostic (roles=None) DOES name the hidden column — proving the
+    # leak is real and that read-scope is what removes it, not an empty diagnostic.
+    unscoped = compute_readiness(conn, source="hr", scope=ReadinessScopeType.TABLE,
+                                 subset="employees")
+    unscoped_ids = [rq.requirement_id for rq in
+                    (*unscoped.blocking_requirements, *unscoped.review_requirements)]
+    assert any("national_id" in rid for rid in unscoped_ids), unscoped_ids
+
+    # A caller WITHOUT pii_reader GETs the VISIBLE sibling.
+    r = _asset(client, "hr", "public.employees.salary", headers=AUTH)
+    assert r.status_code == 200, r.text
+    body = r.json()
+
+    # NO LEAK ANYWHERE: grep the WHOLE payload (readiness requirements/gaps/scores + relationships).
+    assert "national_id" not in json.dumps(body)
+
+    # And specifically the read-scoped table diagnostic keeps the VISIBLE ref, drops the hidden one.
+    diag = body["readiness"]["table_diagnostic"]
+    named = [rq["requirement_id"] for rq in
+             diag["blocking_requirements"] + diag["review_requirements"]] + list(diag["advisory_gaps"])
+    assert any("salary" in n for n in named), named          # visible sibling still reported
+    assert not any("national_id" in n for n in named)        # hidden sibling gone
+
+    # SANITY: a pii_reader (who MAY see national_id) does get its concept requirement — the scope,
+    # not an empty diagnostic, is what hid it above.
+    pii_diag = _asset(client, "hr", "public.employees.salary",
+                      headers=PII_AUTH).json()["readiness"]["table_diagnostic"]
+    pii_named = [rq["requirement_id"] for rq in
+                 pii_diag["blocking_requirements"] + pii_diag["review_requirements"]]
+    assert any("national_id" in n for n in pii_named), pii_named
+
+
+# ── (2c) F4: as_join_key confirms a TO-side (dimension) join, consistent with relationships ───────
+
+
+def test_as_join_key_confirms_to_side_join_consistent_with_relationships(client, conn):
+    """F4: a VERIFIED approved_join A.cust_id -> B.id; GETting the asset for B.id (the to_ref, a
+    dimension key) must show readiness.as_join_key CONFIRMED — consistent with
+    relationships.approved_joins in the SAME payload, which lists the join. Pre-fix the readiness
+    matched from_ref only, so the to-side key showed 'no verified approved_join yet'."""
+    build_graph(conn, "joins_src", [
+        CanonicalRow("joins_src", "a", "cust_id", "integer"),
+        CanonicalRow("joins_src", "b", "id", "integer"),
+    ])
+    conn.execute(
+        "INSERT INTO graph_edge (catalog_source, kind, from_ref, to_ref, approved_join_status, "
+        "authority) VALUES ('joins_src', 'joins', 'public.a.cust_id', 'public.b.id', 'VERIFIED', "
+        "'display_only')")
+
+    body = _asset(client, "joins_src", "public.b.id").json()
+
+    caps = body["readiness"]["column_capabilities"]
+    join_cap = caps["as_join_key"]
+    jr = next(r for r in join_cap["requirements"] if r["requirement_id"] == "join_connectivity")
+    assert jr["status"] == "confirmed"
+    assert jr["reason"] == "verified_approved_join"
+
+    # Consistency: the SAME payload's relationships lists the very join readiness just confirmed.
+    approved = body["relationships"]["approved_joins"]
+    assert any(j["to_ref"] == "public.b.id" and j["status"] == "VERIFIED" for j in approved), approved
+
+
+# ── (2d) F5: the history section is bounded + batches its stage reads ─────────────────────────────
+
+
+def test_history_section_bounded_and_batched(conn):
+    """F5: a daily-ingested ref would otherwise return an unbounded run list + a per-run stage
+    round trip (1 + N queries). The section caps the run list at _HISTORY_RUN_LIMIT (flagging
+    `truncated`) and fetches ALL stages in ONE `= ANY(...)` query — a constant 2 queries."""
+    from featuregen.overlay.upload.asset_detail import _HISTORY_RUN_LIMIT, _history_section
+
+    ref = "public.t.c"
+    conn.execute(
+        "INSERT INTO graph_node (catalog_source, object_ref, kind, table_name, column_name, "
+        "data_type) VALUES ('runs', %s, 'column', 't', 'c', 'text')", (ref,))
+    n = _HISTORY_RUN_LIMIT + 5
+    for i in range(n):
+        run_id = f"run-{i:03d}"
+        conn.execute(
+            "INSERT INTO ingestion_run (id, origin_type, catalog_source, actor_subject, status, "
+            "started_at, completed_at, heartbeat_at) VALUES (%s, 'upload', 'runs', 'tester', "
+            "'ingested', now(), now(), now())", (run_id,))
+        conn.execute(
+            "INSERT INTO ingestion_run_object (ingestion_run_id, catalog_source, object_ref, "
+            "relation, at) VALUES (%s, 'runs', %s, 'observed', now() + (%s || ' seconds')::interval)",
+            (run_id, ref, i))
+        conn.execute(
+            "INSERT INTO ingestion_run_stage (ingestion_run_id, stage, attempt, state) "
+            "VALUES (%s, 'validate', 1, 'succeeded')", (run_id,))
+
+    class _CountingConn:
+        def __init__(self, real):
+            self._real = real
+            self.executes: list[str] = []
+
+        def execute(self, sql, params=None):
+            self.executes.append(sql)
+            return self._real.execute(sql, params) if params is not None else self._real.execute(sql)
+
+    counting = _CountingConn(conn)
+    section = _history_section(counting, "runs", ref)
+
+    assert section["truncated"] is True
+    assert len(section["runs"]) == _HISTORY_RUN_LIMIT           # bounded, not N
+    assert all(run["stages"] for run in section["runs"])       # stages present for each
+    # CONSTANT query count: one run query + one batched stage query, regardless of N runs.
+    assert len(counting.executes) == 2, counting.executes
+
+
 # ── (3) effective_metadata authority reflects C1 (governed vs hint) ──────────────────────────────
 
 

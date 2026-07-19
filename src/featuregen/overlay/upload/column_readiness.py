@@ -22,7 +22,8 @@ triggers no check, opens no task, and writes nothing:
   merged: C1 wraps ``read_column_facts`` and is the single read this module consults for authority.
 * the governed grain / availability facts are read through C1's ``is_grain`` / ``is_as_of`` axes
   (governed iff the flag is true AND the ``*_fact_event_id`` link is non-null).
-* the approved_join reads (:func:`overlay.upload.graph.column_joins`) back join connectivity.
+* the VERIFIED ``approved_join`` edge (queried directly, matched on EITHER endpoint — F4) backs join
+  connectivity, read-scoped on both endpoints like the relationships section.
 
 DIAGNOSTIC EXTERNAL-CHECK PREVIEWS vs BLOCKING REQUIREMENTS. A capability may advertise that a
 future feature build would require an EXTERNAL data check (``TYPE_IS_NUMERIC``, ``GRAIN_IS_UNIQUE``,
@@ -49,9 +50,13 @@ from featuregen.contracts import DbConn
 from featuregen.overlay.catalog_changes import drift_watermark
 from featuregen.overlay.upload.canonical import UNKNOWN_TYPE
 from featuregen.overlay.upload.column_authority import logical_ref_of, read_column_facts
-from featuregen.overlay.upload.graph import column_joins
+from featuregen.overlay.upload.feature_metadata_snapshot import (
+    CatalogProjectionUnavailable,
+    check_projection_readiness,
+)
 from featuregen.overlay.upload.object_ref import parse_ref
 from featuregen.overlay.upload.operational_facts import OperationalValue, read_operational_value
+from featuregen.overlay.upload.read_scope import allowed_sensitivities
 
 # The external-check PREVIEW codes — a diagnostic advertisement that a future feature build would run
 # this check. Kept in LOCKSTEP with :data:`feature_assist.REQUIREMENT_CODES` (the gauntlet's closed
@@ -122,10 +127,13 @@ class ColumnRequirement:
 class ColumnCapability:
     """One column USE and whether it is ready for it. ``operational_status`` is the blocker-based
     gate (``"blocked"`` iff any requirement is ``blocking``), mirroring
-    :class:`readiness.FeatureReadiness`."""
+    :class:`readiness.FeatureReadiness`. The third value ``"unavailable"`` (F3) is the whole-matrix
+    verdict when C1's load-bearing projection is DEGRADED/LAGGED — no capability can be ``"ready"``
+    over a projection C1 refuses to read, so every capability reports ``"unavailable"``, distinct
+    from a clean ``"blocked"``."""
 
     use: str
-    operational_status: Literal["ready", "blocked"]
+    operational_status: Literal["ready", "blocked", "unavailable"]
     requirements: tuple[ColumnRequirement, ...]
 
 
@@ -218,9 +226,11 @@ def _identity_requirement(conn: DbConn, source: str, object_ref_flat: str) -> Co
     """Identity — the column node exists in this catalog. Present is satisfied; absent BLOCKS every
     capability (nothing can be asserted about a column that is not in the graph)."""
     exists = conn.execute(
-        "SELECT 1 FROM graph_node WHERE catalog_source = %s AND lower(object_ref) = %s "
+        # F7: object_ref is canonical lowercase, so equality against lower(%s) uses the (source,
+        # object_ref) PK directly instead of a functional scan over lower(object_ref).
+        "SELECT 1 FROM graph_node WHERE catalog_source = %s AND object_ref = lower(%s) "
         "AND kind = 'column'",
-        (source, object_ref_flat.lower()),
+        (source, object_ref_flat),
     ).fetchone() is not None
     return ColumnRequirement(
         requirement_id="identity", status="confirmed" if exists else "missing",
@@ -263,8 +273,17 @@ def _type_requirement(conn: DbConn, logical_ref: str) -> ColumnRequirement:
     a non-governed numeric hint -> ``proposed``; either way numeric, so it never blocks). An UNKNOWN
     type (``None`` or the ``unknown`` sentinel) emits a ``TYPE_IS_NUMERIC`` external-check PREVIEW —
     advisory, never a fabricated pass. A positively NON-numeric type (text/date/...) BLOCKS with a
-    clear reason: the column plainly cannot be a measure."""
+    clear reason: the column plainly cannot be a measure.
+
+    F2: a C1 FAIL-CLOSED status (:data:`_CONFLICT_STATUSES` — ``conflict`` / ``fork`` /
+    ``hash_mismatch``) sets ``value=None``, which would otherwise fall into the empty-value branch and
+    emit a benign ``TYPE_IS_NUMERIC`` preview — reporting ``as_measure`` READY over a tampered / forked
+    / conflicted type. It is therefore checked FIRST and routed through :func:`_status_and_reason`, so
+    it BLOCKS with C1's own reason regardless of the advisory type-preview gate."""
     ov = read_operational_value(conn, logical_ref, "logical_representation")
+    if ov.status in _CONFLICT_STATUSES:
+        status, reason = _status_and_reason(ov)
+        return _mk_c1_requirement("operational_type", status, True, reason, ov)
     base = (ov.value or "").strip().lower()
     if base in ("", UNKNOWN_TYPE):
         return _preview_requirement(
@@ -312,11 +331,29 @@ def _join_requirement(
 ) -> ColumnRequirement:
     """Join connectivity — DIAGNOSTIC, never blocking (a join key is only REQUIRED when another
     table participates). A VERIFIED ``approved_join`` touching this column confirms it; otherwise a
-    ``JOIN_CONNECTIVITY`` external-check PREVIEW. Read-scoped on join endpoints via ``roles``."""
-    verified = any(
-        e.resolved and e.approved_join_status == "VERIFIED"
-        for e in column_joins(conn, source, object_ref_flat, roles=roles)
-    )
+    ``JOIN_CONNECTIVITY`` external-check PREVIEW. Read-scoped on join endpoints via ``roles``.
+
+    F4: matched in EITHER direction (``from_ref = %s OR to_ref = %s``), because a dimension key is
+    typically the join TARGET (``to_ref``). The prior ``column_joins`` read matched ``from_ref`` only
+    (and carried its same-catalog ``e.resolved`` conjunct), so a to-side key showed 'no verified join'
+    in readiness while ``relationships.approved_joins`` in the SAME payload listed the VERIFIED join.
+    This query mirrors :func:`asset_detail._relationships_section`'s predicate (both endpoints read-
+    scoped) so the two surfaces stay consistent."""
+    allowed = allowed_sensitivities(roles)
+    verified = conn.execute(
+        "SELECT 1 FROM graph_edge e "
+        "LEFT JOIN graph_node fn ON fn.object_ref = e.from_ref "
+        "  AND fn.catalog_source = e.catalog_source "
+        "LEFT JOIN graph_node tn ON tn.object_ref = e.to_ref "
+        "  AND tn.catalog_source = e.catalog_source "
+        "WHERE e.catalog_source = %s AND e.kind = 'joins' "
+        "AND e.approved_join_status = 'VERIFIED' "
+        "AND (e.from_ref = %s OR e.to_ref = %s) "
+        "AND (fn.sensitivity IS NULL OR fn.sensitivity = ANY(%s)) "
+        "AND (tn.sensitivity IS NULL OR tn.sensitivity = ANY(%s)) "
+        "LIMIT 1",
+        (source, object_ref_flat, object_ref_flat, allowed, allowed),
+    ).fetchone() is not None
     if verified:
         return ColumnRequirement(
             requirement_id="join_connectivity", status="confirmed", blocking=False,
@@ -338,6 +375,35 @@ def _capability(use: str, reqs: Iterable[ColumnRequirement | None]) -> ColumnCap
     )
 
 
+# The five capabilities the MATRIX reports, in the ColumnReadiness field order.
+_CAPABILITIES: tuple[str, ...] = (
+    "as_measure", "as_entity_key", "as_event_time", "as_grain_key", "as_join_key",
+)
+
+
+def _unavailable_matrix(
+    source: str, object_ref: str, logical_ref: str, detail: str
+) -> ColumnReadiness:
+    """F3: the whole-matrix verdict when C1's load-bearing overlay projection is DEGRADED/LAGGED.
+    ``read_operational_value`` refuses EVERY field with ``projection_unavailable`` (value=None) under
+    a bad projection, so a capability could otherwise report 'ready' over reads C1 has refused. Every
+    capability is instead ``"unavailable"``, each carrying ONE always-blocking requirement that names
+    the projection reason — never a fabricated 'ready'."""
+    req = ColumnRequirement(
+        requirement_id="projection_unavailable", status="missing", blocking=True,
+        authority="none", c1_status="projection_unavailable", evidence_ids=(), fact_event_id=None,
+        decision_event_id=None, external_preview=False,
+        reason=f"projection_unavailable: {detail}",
+    )
+    caps = {
+        use: ColumnCapability(use=use, operational_status="unavailable", requirements=(req,))
+        for use in _CAPABILITIES
+    }
+    return ColumnReadiness(
+        source=source, object_ref=object_ref, logical_ref=logical_ref, **caps
+    )
+
+
 def column_readiness(
     conn: DbConn, *, source: str, object_ref: str, roles: Iterable[str] = ()
 ) -> ColumnReadiness:
@@ -349,9 +415,18 @@ def column_readiness(
     (:func:`operational_facts.read_operational_value`) — never re-derived. DIAGNOSTIC only: it
     creates nothing, triggers no check, and writes nothing (see the module docstring for the
     external-check PREVIEW vs blocking distinction). ``roles`` read-scopes the join-connectivity read.
+
+    F3: the C1 projection-health gate is checked ONCE at entry. If the load-bearing overlay projection
+    is DEGRADED/LAGGED, C1 refuses every field, so the whole matrix is returned ``"unavailable"``
+    (:func:`_unavailable_matrix`) rather than each field degrading to a benign 'missing' that the
+    advisory gates would let pass as 'ready'.
     """
     norm_source = source.strip().lower()
     logical_ref = logical_ref_of(norm_source, object_ref)
+    try:
+        check_projection_readiness(conn)
+    except CatalogProjectionUnavailable as exc:
+        return _unavailable_matrix(norm_source, object_ref, logical_ref, exc.detail)
     _src, _schema, table, column = parse_ref(logical_ref)
     # The public-flattened graph object_ref (matches how build_graph stores nodes/edges).
     object_ref_flat = ".".join(["public", table, *([column] if column else [])])

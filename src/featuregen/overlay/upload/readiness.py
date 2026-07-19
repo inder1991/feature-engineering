@@ -26,7 +26,7 @@ requirement list, never the gate").
 """
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Literal
@@ -43,6 +43,7 @@ from featuregen.overlay.field_decision import FieldDecisionEvent, read_field_dec
 from featuregen.overlay.field_evidence import read_active_field_evidence
 from featuregen.overlay.upload.field_policies import policy_for
 from featuregen.overlay.upload.object_ref import parse_ref
+from featuregen.overlay.upload.read_scope import allowed_sensitivities
 
 # --- Cause labels (the review-#13 must-fix). A blocking requirement always carries exactly one. ----
 CAUSE_NOT_PROMOTED = "not_promoted_in_phase1"
@@ -212,14 +213,57 @@ def _render_authority(pred: AuthorityPredicate | None) -> str:
     return "unknown"
 
 
+def _read_scoped_refs(
+    conn: DbConn, norm_source: str, refs: list[str], roles: Iterable[str]
+) -> list[str]:
+    """Drop every ``logical_ref`` whose ``graph_node`` COLUMN carries a sensitivity these ``roles``
+    can't see (F1 read-scope leak fix). Mirrors :func:`asset_detail._load_anchor`'s predicate — a ref
+    is HIDDEN iff its column node has a non-null ``sensitivity`` that is NOT in
+    :func:`allowed_sensitivities`. Refs with no matching column node are KEPT (nothing sensitivity-
+    restricted is known about them), so this never over-drops a legitimately-visible decided ref.
+
+    Because it prunes the ref UNIVERSE, a hidden sibling column can never surface anywhere downstream
+    of readiness — not as a ``field:...`` requirement_id, an ``advisory_gaps`` entry, or a
+    ``summary_scores`` count — for a caller who can't see it."""
+    if not refs:
+        return refs
+    allowed = allowed_sensitivities(roles)
+    hidden = {
+        r[0]
+        for r in conn.execute(
+            "SELECT object_ref FROM graph_node WHERE catalog_source = %s AND kind = 'column' "
+            "AND sensitivity IS NOT NULL AND NOT (sensitivity = ANY(%s))",
+            (norm_source, allowed),
+        ).fetchall()
+    }
+    if not hidden:
+        return refs
+    kept: list[str] = []
+    for ref in refs:
+        _src, _schema, table, column = parse_ref(ref)
+        # graph_node object_refs are public-flattened (mirrors logical_ref_of / build_graph).
+        flat = ".".join(["public", table, *([column] if column else [])])
+        if flat not in hidden:
+            kept.append(ref)
+    return kept
+
+
 def _scoped_refs(
-    conn: DbConn, *, source: str, subset: str | Sequence[str] | None
+    conn: DbConn, *, source: str, subset: str | Sequence[str] | None,
+    roles: Iterable[str] | None = None,
 ) -> list[str]:
     """The in-scope ``logical_ref`` set — the universe readiness reports on (the refs Task 8 recorded
     decisions for), filtered to this ``source`` and narrowed by ``subset``.
 
     ``subset`` is ``None`` (the whole catalog source), a TABLE selector string, or an explicit
     sequence of logical_refs (a TABLE call the caller already resolved to refs).
+
+    ``roles`` is the READ-SCOPE seam (F1): ``None`` (the default) preserves today's behaviour — every
+    decided ref for the source. A non-None ``roles`` (even an empty iterable — a caller with no
+    sensitivity role) prunes refs whose column node is sensitivity-hidden from those roles
+    (:func:`_read_scoped_refs`), so a hidden sibling never leaks its name/existence/count through the
+    readiness diagnostic. Applied BEFORE the subset match so table derivation, the per-field loop, and
+    the counts all see only the visible universe.
 
     A string TABLE selector is SCHEMA-AWARE (Task-9 review fix — matching on the table name alone
     over-reported across two same-named tables in different schemas). It may be written:
@@ -232,6 +276,8 @@ def _scoped_refs(
     norm_source = source.strip().lower()
     rows = conn.execute("SELECT DISTINCT logical_ref FROM field_decision_event").fetchall()
     refs = [r[0] for r in rows if parse_ref(r[0])[0] == norm_source]
+    if roles is not None:
+        refs = _read_scoped_refs(conn, norm_source, refs, roles)
     if subset is None:
         return sorted(refs)
     if isinstance(subset, str):
@@ -343,6 +389,7 @@ def compute_readiness(
     source: str,
     scope: ReadinessScopeType,
     subset: str | Sequence[str] | None = None,
+    roles: Iterable[str] | None = None,
 ) -> FeatureReadiness:
     """Compute a scoped, blocker-based readiness DIAGNOSTIC for ``source`` (spec §9).
 
@@ -363,8 +410,14 @@ def compute_readiness(
     SCHEMA-AWARE selector (``"schema.table"``, or a bare ``"table"`` when unambiguous within a single
     schema; see :func:`_scoped_refs`) or an explicit logical_ref list. A non-None ``subset`` that
     matches NOTHING yields a single ``subset_not_found`` blocker (never a false "ready"). GENERATION_RUN
-    / RECIPE gating is Phase 2+ and is stamped on the verdict but computed with the same diagnostic."""
-    refs = _scoped_refs(conn, source=source, subset=subset)
+    / RECIPE gating is Phase 2+ and is stamped on the verdict but computed with the same diagnostic.
+
+    ``roles`` is the READ-SCOPE seam (F1, default ``None`` = today's unscoped behaviour): when a
+    caller passes its roles, the in-scope ref universe is pruned of sensitivity-hidden columns
+    (:func:`_scoped_refs`), so no requirement_id, advisory gap, or count in the returned verdict ever
+    names or tallies a column the caller can't see. The per-table structural + join requirements are
+    emitted only for the tables that survive that prune."""
+    refs = _scoped_refs(conn, source=source, subset=subset, roles=roles)
 
     all_reqs: list[ReadinessRequirement] = []
     advisory: list[str] = []

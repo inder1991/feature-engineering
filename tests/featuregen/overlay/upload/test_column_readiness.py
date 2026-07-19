@@ -176,3 +176,64 @@ def test_requirement_authority_sourced_from_c1(db):
     assert additivity.decision_event_id == ov.decision_event_id
     assert additivity.authority == "governed"
     assert additivity.status == "confirmed"
+
+
+# 7. F2: a C1 hash_mismatch on logical_representation (a tampered flat data_type) BLOCKS as_measure —
+#    it must NOT fall through to a benign TYPE_IS_NUMERIC preview (fail-closed reads carry value=None).
+def test_tampered_type_hash_mismatch_blocks_as_measure(db):
+    build_graph(db, _SOURCE, [CanonicalRow(_SOURCE, "accounts", "balance", "numeric")])
+    ref = normalize_ref(_SOURCE, None, "accounts", "balance")
+    _seed(db, ref, "logical_representation", "numeric", EvidenceProducer.PARSER,
+          AssertionStrength.SUPPORTED)
+    resolve_and_project(db, source=_SOURCE, logical_refs=[ref])
+    # Tamper the flat data_type out from under the decision that authorized "numeric" -> hash_mismatch.
+    _set_col(db, "public.accounts.balance", data_type="tampered_type")
+
+    cr = column_readiness(db, source=_SOURCE, object_ref="public.accounts.balance")
+    otype = _req(cr.as_measure, "operational_type")
+    assert otype.blocking is True
+    assert otype.status == "conflicting"
+    assert otype.c1_status == "hash_mismatch"
+    assert cr.as_measure.operational_status == "blocked"
+    # NOT a fabricated pass: no advisory preview stands in for the refused type.
+    assert not _has(cr.as_measure, "external:TYPE_IS_NUMERIC")
+
+
+# 8. F3: a DEGRADED overlay projection makes C1 refuse EVERY field (projection_unavailable), so the
+#    WHOLE matrix reports "unavailable" — no capability may be "ready" over a refused projection.
+def test_degraded_projection_makes_whole_matrix_unavailable(db):
+    build_graph(db, _SOURCE, [CanonicalRow(_SOURCE, "accounts", "acct_id", "varchar")])
+    _set_col(db, "public.accounts.acct_id", is_grain=True, grain_fact_event_id="evt_grain_1")
+    # Baseline: a healthy projection -> as_grain_key is ready.
+    healthy = column_readiness(db, source=_SOURCE, object_ref="public.accounts.acct_id")
+    assert healthy.as_grain_key.operational_status == "ready"
+
+    db.execute(
+        "INSERT INTO projection_degraded (projection_name, aggregate, aggregate_id, reason, "
+        "poison_seq) VALUES ('overlay', 'overlay_fact', 'poisoned', 'poison', 1)")
+
+    cr = column_readiness(db, source=_SOURCE, object_ref="public.accounts.acct_id")
+    for use in ("as_measure", "as_entity_key", "as_event_time", "as_grain_key", "as_join_key"):
+        cap = getattr(cr, use)
+        assert cap.operational_status == "unavailable", use
+        assert all(r.blocking for r in cap.requirements)   # nothing "ready" over a refused read
+    assert _req(cr.as_grain_key, "projection_unavailable").c1_status == "projection_unavailable"
+
+
+# 9. F4: a VERIFIED approved_join whose TO_REF is this column (the typical dimension key) confirms
+#    as_join_key — the readiness query matches from_ref OR to_ref, not from_ref only.
+def test_join_key_confirmed_on_to_side_verified_join(db):
+    build_graph(db, _SOURCE, [
+        CanonicalRow(_SOURCE, "a", "cust_id", "integer"),
+        CanonicalRow(_SOURCE, "b", "id", "integer"),
+    ])
+    db.execute(
+        "INSERT INTO graph_edge (catalog_source, kind, from_ref, to_ref, approved_join_status, "
+        "authority) VALUES (%s, 'joins', 'public.a.cust_id', 'public.b.id', 'VERIFIED', "
+        "'display_only')", (_SOURCE,))
+
+    cr = column_readiness(db, source=_SOURCE, object_ref="public.b.id")   # the to_ref
+    jr = _req(cr.as_join_key, "join_connectivity")
+    assert jr.status == "confirmed"
+    assert jr.reason == "verified_approved_join"
+    assert cr.as_join_key.operational_status == "ready"

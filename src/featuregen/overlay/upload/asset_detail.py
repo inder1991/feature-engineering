@@ -45,6 +45,11 @@ from featuregen.overlay.upload.readiness import ReadinessScopeType, compute_read
 # The response contract version — bump on a breaking shape change so a client can negotiate.
 ASSET_DETAIL_VERSION = "asset-detail/v1"
 
+# F5: the history section returns at most this many newest run associations (a daily-ingested ref
+# would otherwise return an unbounded run list + a per-run stage round trip inside the RR tx). When
+# more exist the section flags ``truncated: true``.
+_HISTORY_RUN_LIMIT = 20
+
 # The F0 sections, in render order. ``identity`` is ALWAYS built (it is the anchor's core); the rest
 # are selectable via the route's ``include`` param. ``relationships.semantic`` is F1 (unavailable).
 _F0_SECTIONS: tuple[str, ...] = (
@@ -78,7 +83,9 @@ def _load_anchor(conn: DbConn, source: str, object_ref: str, allowed: list[str])
     indistinguishable so a hidden object never leaks its existence via a different status/shape."""
     row = conn.execute(
         f"SELECT {_ANCHOR_COLUMNS} FROM graph_node "
-        "WHERE catalog_source = %s AND lower(object_ref) = lower(%s) "
+        # F7: object_ref is canonical lowercase, so equality against lower(%s) uses the (source,
+        # object_ref) PK directly instead of forcing a functional scan over lower(object_ref).
+        "WHERE catalog_source = %s AND object_ref = lower(%s) "
         "AND (sensitivity IS NULL OR sensitivity = ANY(%s))",
         (source, object_ref, allowed),
     ).fetchone()
@@ -159,21 +166,19 @@ def _evidence_section(conn: DbConn, logical_ref: str) -> dict:
             "proposed_value": value, "confidence_band": band,
         })
 
-    decisions = conn.execute(
-        "SELECT DISTINCT field_name FROM field_decision_event WHERE logical_ref = %s",
-        (logical_ref,),
-    ).fetchall()
+    # F8: ONE DISTINCT ON query for the latest decision per field, replacing the prior per-field 1+N
+    # (a DISTINCT field_name query + a LIMIT-1 round trip per field). The ORDER BY makes the
+    # DISTINCT-ON row the newest decision for each field (matching the per-field ORDER BY it replaced).
     latest: dict[str, dict] = {}
-    for (field_name,) in decisions:
-        row = conn.execute(
-            "SELECT decision_event_id, event_type, conflict_status, load_bearing_value_hash, "
-            "created_at FROM field_decision_event WHERE logical_ref = %s AND field_name = %s "
-            "ORDER BY created_at DESC, decision_event_id DESC LIMIT 1",
-            (logical_ref, field_name),
-        ).fetchone()
+    for field_name, deid, event_type, conflict_status, lbv_hash, created_at in conn.execute(
+        "SELECT DISTINCT ON (field_name) field_name, decision_event_id, event_type, "
+        "conflict_status, load_bearing_value_hash, created_at FROM field_decision_event "
+        "WHERE logical_ref = %s ORDER BY field_name, created_at DESC, decision_event_id DESC",
+        (logical_ref,),
+    ).fetchall():
         latest[field_name] = {
-            "decision_event_id": row[0], "event_type": row[1], "conflict_status": row[2],
-            "load_bearing": row[3] is not None, "decided_at": row[4],
+            "decision_event_id": deid, "event_type": event_type, "conflict_status": conflict_status,
+            "load_bearing": lbv_hash is not None, "decided_at": created_at,
         }
 
     return {"proposals_by_field": by_field, "latest_decision_by_field": latest}
@@ -254,8 +259,11 @@ def _readiness_section(
     conn: DbConn, source: str, anchor: dict, roles: Iterable[str]
 ) -> dict:
     """The F0-T1 per-column capability MATRIX (columns only) + the parent-table blocker diagnostic
-    (:func:`compute_readiness` TABLE scope). Both are pure reads; ``roles`` read-scopes the matrix's
-    join-connectivity read."""
+    (:func:`compute_readiness` TABLE scope). Both are pure reads; ``roles`` read-scopes BOTH the
+    matrix's join-connectivity read AND the table diagnostic (F1): the table diagnostic is computed
+    under the caller's read-scope so a hidden sensitivity-restricted sibling column never leaks its
+    name/id/count via a ``field:...`` requirement, an ``advisory_gaps`` ref, or a ``summary_scores``
+    tally — the same no-leak guarantee the anchor load and relationships section already carry."""
     section: dict = {}
     if anchor["kind"] == "column":
         section["column_capabilities"] = asdict(
@@ -265,7 +273,8 @@ def _readiness_section(
         section["column_capabilities"] = None   # a table asset has no per-column matrix
     section["table_diagnostic"] = asdict(
         compute_readiness(
-            conn, source=source, scope=ReadinessScopeType.TABLE, subset=anchor["table_name"]
+            conn, source=source, scope=ReadinessScopeType.TABLE, subset=anchor["table_name"],
+            roles=roles,
         )
     )
     return section
@@ -273,31 +282,45 @@ def _readiness_section(
 
 def _history_section(conn: DbConn, source: str, object_ref: str) -> dict:
     """The reverse ``ingestion_run_object`` lookup (which runs observed/changed this ref, newest
-    first) + each run's per-stage outcomes — set queries, not a per-run round trip for the runs."""
+    first) + each run's per-stage outcomes.
+
+    BOUNDED + BATCHED (F5): the run list is capped at :data:`_HISTORY_RUN_LIMIT` newest associations
+    (``truncated`` is ``True`` when more exist), and every listed run's stages are fetched in ONE
+    ``ingestion_run_id = ANY(...)`` query grouped in Python — so a daily-ingested ref costs a constant
+    2 queries and a bounded payload inside the RR transaction, never the prior 1 + N-runs round trips
+    and unbounded body. ``lower(o.object_ref)`` is kept (NOT F7'd to the PK) so the case-folded
+    predicate uses the purpose-built ``ingestion_run_object_source_ref_at_idx`` functional index."""
     run_rows = conn.execute(
         "SELECT o.ingestion_run_id, o.relation, o.at, r.status, r.origin_type, r.started_at, "
         "r.completed_at FROM ingestion_run_object o "
         "JOIN ingestion_run r ON r.id = o.ingestion_run_id "
         "WHERE o.catalog_source = %s AND lower(o.object_ref) = lower(%s) "
-        "ORDER BY o.at DESC, o.ingestion_run_id",
-        (source, object_ref),
+        "ORDER BY o.at DESC, o.ingestion_run_id "
+        "LIMIT %s",
+        (source, object_ref, _HISTORY_RUN_LIMIT + 1),   # +1 sentinel row detects truncation
     ).fetchall()
-    runs: list[dict] = []
-    for run_id, relation, at, status, origin_type, started_at, completed_at in run_rows:
-        stages = [
-            {"stage": s, "attempt": a, "state": st, "reason_code": rc}
-            for s, a, st, rc in conn.execute(
-                "SELECT stage, attempt, state, reason_code FROM ingestion_run_stage "
-                "WHERE ingestion_run_id = %s ORDER BY id",
-                (run_id,),
-            ).fetchall()
-        ]
-        runs.append({
-            "ingestion_run_id": run_id, "relation": relation, "at": at, "status": status,
-            "origin_type": origin_type, "started_at": started_at, "completed_at": completed_at,
-            "stages": stages,
-        })
-    return {"runs": runs}
+    truncated = len(run_rows) > _HISTORY_RUN_LIMIT
+    run_rows = run_rows[:_HISTORY_RUN_LIMIT]
+
+    run_ids = [row[0] for row in run_rows]
+    stages_by_run: dict[str, list[dict]] = {}
+    if run_ids:
+        for run_id, stage, attempt, state, reason_code in conn.execute(
+            "SELECT ingestion_run_id, stage, attempt, state, reason_code FROM ingestion_run_stage "
+            "WHERE ingestion_run_id = ANY(%s) ORDER BY ingestion_run_id, id",
+            (run_ids,),
+        ).fetchall():
+            stages_by_run.setdefault(run_id, []).append(
+                {"stage": stage, "attempt": attempt, "state": state, "reason_code": reason_code}
+            )
+
+    runs = [
+        {"ingestion_run_id": run_id, "relation": relation, "at": at, "status": status,
+         "origin_type": origin_type, "started_at": started_at, "completed_at": completed_at,
+         "stages": stages_by_run.get(run_id, [])}
+        for run_id, relation, at, status, origin_type, started_at, completed_at in run_rows
+    ]
+    return {"runs": runs, "truncated": truncated}
 
 
 def _consistency_token(body: dict) -> str:
