@@ -42,15 +42,26 @@ from featuregen.overlay.upload.planner.assembly import (
 from featuregen.overlay.upload.planner.contracts import (
     MAX_OPERAND_COMBINATIONS,
     MAX_PATHS_PER_OPERAND,
+    AggregationValidation,
     BindingPlanV1,
     BindingQuality,
     BindingSafety,
     CatalogScopeV1,
+    HopAggregationV1,
     IngredientBindingV1,
     PlanResolutionStatus,
+    ReasonCode,
     SegmentKind,
+    TemporalDeclarationV1,
 )
-from featuregen.overlay.upload.planner.declarations import CompilerContext
+from featuregen.overlay.upload.planner.declarations import (
+    CompilerContext,
+    build_physical_read_set,
+    check_connectivity,
+    compile_aggregation,
+    compile_temporal,
+    stage_safety,
+)
 from featuregen.overlay.upload.planner.multisource_contracts import (
     GovernedEndpointV1,
     MultiSourceBoundingMetricsV1,
@@ -62,6 +73,7 @@ from featuregen.overlay.upload.planner.multisource_contracts import (
 from featuregen.overlay.upload.planner.multisource_endpoints import governed_endpoint
 from featuregen.overlay.upload.planner.multisource_reuse import injected_operand_template
 from featuregen.overlay.upload.taxonomy.entity_relationships import RealizationAuthority
+from featuregen.overlay.upload.templates import Template
 
 # The single-source resolution statuses that count as a governed complete path. ``assemble_paths``
 # returns ranked/classified plans; a top-rank tie is normalized to ``resolved_with_ambiguity`` —
@@ -70,6 +82,33 @@ _RESOLVED_STATUSES = frozenset(
     {PlanResolutionStatus.resolved, PlanResolutionStatus.resolved_with_ambiguity})
 
 _OPERAND_NEED_ROLE = "operand"
+
+
+def _operand_recipe_id(operand: OperandSlotV1) -> str:
+    """The injected recipe id A keys the operand's ``Template``/``agg_declarations`` on — stable per
+    slot so enumeration and the Task-7 per-path checks compile the SAME plan identity."""
+    return f"ms:{operand.slot_id}"
+
+
+def _operand_anchor_concept(operand: OperandSlotV1) -> str | None:
+    """The ordering-anchor concept A injects as a SECOND temporal need — present ONLY for a
+    ``take_latest`` strategy (so ``compile_temporal`` can find + validate the anchor)."""
+    strategy = operand.path_strategy
+    return (strategy.ordering_anchor_concept
+            if strategy.aggregation is PathAggregation.take_latest else None)
+
+
+def _operand_template(operand: OperandSlotV1) -> Template:
+    """The injected single-need ``Template`` for one operand — the ONE builder Task-5 enumeration AND
+    the Task-7 per-path checks both call, so the template a path is VALIDATED against is byte-identical
+    to the one it was ENUMERATED against (same measure/counted/time need + the second temporal need for
+    ``take_latest``, same ``ordering_anchor_concept``). A mismatched template would validate a
+    different plan than was enumerated (spec §5 step 5)."""
+    return injected_operand_template(
+        recipe_id=_operand_recipe_id(operand), need_role=_OPERAND_NEED_ROLE,
+        concept=operand.authoritative_concept,
+        source_entity=operand.source_binding.source_grain_entity,
+        anchor_concept=_operand_anchor_concept(operand))
 
 
 @dataclass(frozen=True, slots=True)
@@ -261,16 +300,11 @@ def enumerate_operand_paths(
     ``realization_endpoint_ungoverned`` (never a bare empty tuple). ``ctx`` is already role-scoped;
     ``roles`` is carried for signature parity with the rest of the assembly engine."""
     del roles   # ctx is already read-scoped by the caller's roles; the frontier reads conn directly
-    recipe_id = f"ms:{operand.slot_id}"
+    recipe_id = _operand_recipe_id(operand)
     source_entity = operand.source_binding.source_grain_entity
     source_table = table_of(operand.object_ref)
     source_position = _Position(source_entity, operand.catalog_source, source_table)
-    anchor_concept = (operand.path_strategy.ordering_anchor_concept
-                      if operand.path_strategy.aggregation is PathAggregation.take_latest else None)
-    template = injected_operand_template(
-        recipe_id=recipe_id, need_role=_OPERAND_NEED_ROLE,
-        concept=operand.authoritative_concept, source_entity=source_entity,
-        anchor_concept=anchor_concept)
+    template = _operand_template(operand)
     bindings = _operand_bindings(conn, operand, recipe_id=recipe_id, need_role=_OPERAND_NEED_ROLE)
 
     plans, truncated, total_states = _enumerate_plans(
@@ -487,3 +521,129 @@ def converge(operand_results: Sequence[OperandEnumerationResultV1], *,
         reason_codes=reason_codes,
         bounds=replace(bounds, operand_combinations_truncated=truncated,
                        landing_ambiguous=bounds.landing_ambiguous))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════════════════════
+# Task 7 — per-path aggregation + temporal checks via REUSE (spec §5 step 5, §1 reuse model).
+#
+# A validates each converged operand path by DRIVING the existing single-source compiler over the
+# operand's OWN governed ``BindingPlanV1`` (the Task-5 ``OperandPathCandidateV1``) — it never
+# reimplements aggregation/temporal logic:
+#   check_connectivity(ctx, plan).placement -> compile_temporal(ctx, plan, template)
+#     -> compile_aggregation(ctx, plan, template, temporal, placement)
+# with A's OWN ``CompilerContext`` (a POPULATED ``agg_declarations`` keyed by the injected
+# (recipe_id, need_role), so a declared ``take_latest``/``sum`` is validated — not resolved
+# ``undeclared``). The template fed to the compiler is REBUILT by ``_operand_template`` — the SAME
+# builder Task-5 enumeration used — so a path is validated against byte-identically the template it
+# was enumerated against (a mismatched template would validate a DIFFERENT plan).
+#
+# The three checks map the reused compiler's verdicts onto the unified ``MultiSourceReason`` vocab:
+#   * an UNSOUND aggregation stage — OR an unsafe/safety-rejected binding (Task-6 convergence
+#     intentionally deferred SAFETY to this step; an unsafe path must NEVER pass) -> the path is
+#     ``aggregation_unsafe_on_path``.
+#   * per-path PIT treatments individually valid AND mutually as-of-consistent at the common landing,
+#     else ``temporal_paths_incompatible``.
+#   * a TIME-slot ``take_latest`` operand (RECENCY/TREND) — which ``compile_aggregation`` NEVER
+#     validates, because it stages MEASURE join_role only (``declarations.py`` C4) — is validated by
+#     A's OWN ordering-anchor check; an unbindable ordering anchor rejects with
+#     ``ordering_anchor_missing`` (the multi-source reason), never silently degrading to the
+#     single-source ``temporal_anchor_missing`` and passing.
+# Pure over ``ctx`` (no new DB read beyond what the reused fns already do).
+# ═══════════════════════════════════════════════════════════════════════════════════════════════
+
+# The temporal declaration codes that make a single path's PIT treatment INDIVIDUALLY invalid — an
+# anchor problem, not a mere annotation (mirrors ``declarations._TEMPORAL_BLOCKING_CODES``).
+_TEMPORAL_BLOCKING_CODES = frozenset(
+    {ReasonCode.temporal_anchor_missing, ReasonCode.temporal_anchor_ambiguous})
+
+
+@dataclass(frozen=True, slots=True)
+class ResolvedOperandPathV1:
+    """The per-path check INPUT (spec §5 step 5): one operand paired with the governed candidate path
+    convergence chose for it. Carries the ``OperandSlotV1`` (so ``_operand_template`` rebuilds the
+    injected ``Template`` + reads the ``path_strategy`` deterministically, matching Task-5 enumeration)
+    and the Task-5 ``OperandPathCandidateV1`` (the resolved ``BindingPlanV1`` + revalidated landing).
+    The reused per-path compiler runs over this."""
+    operand: OperandSlotV1
+    candidate: OperandPathCandidateV1
+
+
+def check_operand_path(
+        ctx: CompilerContext, operand_path: ResolvedOperandPathV1,
+) -> tuple[TemporalDeclarationV1, tuple[HopAggregationV1, ...], MultiSourceReason | None]:
+    """Validate ONE operand path by reusing the single-source compiler (spec §5 step 5). Runs
+    ``check_connectivity`` -> ``compile_temporal`` -> ``compile_aggregation`` over the operand's OWN
+    ``BindingPlanV1`` with the SAME injected ``Template`` enumeration used, and returns the compiled
+    ``(temporal, hop_aggregations, reason)``. ``reason`` is:
+
+      * ``aggregation_unsafe_on_path`` when the plan's read set is safety-REJECTED (an unsafe binding —
+        Task-6 convergence deferred safety to here, so an unsafe path is NOT let through), OR any
+        fan-in aggregation stage is not ``sound`` (e.g. a ``sum`` over a fan-in of a non-additive
+        measure -> ``incompatible``);
+      * ``None`` when the path's aggregation + temporal declaration are sound.
+
+    Pure over ``ctx`` — the reused checks are conn-free (``build_physical_read_set``/``stage_safety``
+    read only the batch-loaded context). ``not_evaluated`` safety (a structural evidence gap on a bare
+    bridge/join key the read-scope never loaded) is NOT a safety REJECTION and never fails the path
+    here — only a genuine ``unsafe`` verdict does."""
+    plan = operand_path.candidate.binding_plan
+    template = _operand_template(operand_path.operand)
+    placement = check_connectivity(ctx, plan).placement
+    temporal = compile_temporal(ctx, plan, template)
+    hop_aggregations = compile_aggregation(ctx, plan, template, temporal, placement)
+
+    # Safety (Task-6 deferred it to this step): an unsafe/safety-rejected binding must NEVER pass.
+    safety_verdict, _codes = stage_safety(build_physical_read_set(ctx, plan))
+    if safety_verdict is BindingSafety.unsafe:
+        return temporal, hop_aggregations, MultiSourceReason.aggregation_unsafe_on_path
+
+    # Any UNSOUND aggregation stage on any fan-in hop -> the path's roll-up is unsafe.
+    if any(stage.validation is not AggregationValidation.sound
+           for hop in hop_aggregations for stage in hop.ingredient_stages):
+        return temporal, hop_aggregations, MultiSourceReason.aggregation_unsafe_on_path
+
+    return temporal, hop_aggregations, None
+
+
+def check_paths_temporal_consistency(
+        operand_paths: Sequence[TemporalDeclarationV1]) -> MultiSourceReason | None:
+    """Cross-path temporal coherence at the common landing (spec §5 step 5). Each element is one
+    operand path's PIT treatment — the ``TemporalDeclarationV1`` ``check_operand_path`` compiled.
+    Returns ``temporal_paths_incompatible`` when ANY path's treatment is individually invalid (an
+    anchor missing/ambiguous), OR the paths are mutually as-of-INCONSISTENT — more than one DISTINCT
+    point-in-time anchor role across the paths (e.g. one ``as_of_time`` snapshot joined with one
+    ``event_time`` axis has no shared as-of at the landing). Anchor-free paths (``pit_anchor is None``)
+    impose no as-of and combine with anything. ``None`` = every path is individually valid and shares
+    at most one as-of treatment. Pure — no ``ctx``/conn (the treatments were already compiled)."""
+    for temporal in operand_paths:
+        if any(code in _TEMPORAL_BLOCKING_CODES for code in temporal.reason_codes):
+            return MultiSourceReason.temporal_paths_incompatible
+    distinct_anchors = {t.pit_anchor for t in operand_paths if t.pit_anchor is not None}
+    if len(distinct_anchors) > 1:
+        return MultiSourceReason.temporal_paths_incompatible
+    return None
+
+
+def check_time_slot_take_latest(
+        operand_path: ResolvedOperandPathV1) -> MultiSourceReason | None:
+    """A's OWN ordering-anchor validation for a TIME-slot ``take_latest`` operand (RECENCY/TREND, spec
+    §4/§5 step 5). ``compile_aggregation`` stages MEASURE join_role ONLY (``declarations.py`` C4), so a
+    TIME operand is never validated by the reused aggregation compiler — A must prove its ordering
+    anchor here. Returns ``ordering_anchor_missing`` when the strategy is ``take_latest`` but its
+    ordering anchor is unbindable — no anchor concept, or no bound temporal need on the resolved plan
+    carrying that concept (Task-5 ``_operand_bindings`` binds the anchor ONLY when a same-table column
+    tagged with the concept exists). This is the multi-source reason, NOT the single-source
+    ``temporal_anchor_missing`` — an unbindable anchor must REJECT the operand, never silently pass.
+    ``None`` for a non-``take_latest`` strategy (no ordering anchor to validate) or a bound anchor."""
+    strategy = operand_path.operand.path_strategy
+    if strategy.aggregation is not PathAggregation.take_latest:
+        return None     # only a take_latest slot carries an ordering anchor for A to validate
+    anchor_concept = strategy.ordering_anchor_concept
+    if not anchor_concept:
+        return MultiSourceReason.ordering_anchor_missing    # take_latest requires an anchor concept
+    none_temporal = str(TemporalRole.NONE)
+    anchor_bound = any(
+        b.concept == anchor_concept and b.bound_object_ref
+        and b.temporal_role and b.temporal_role != none_temporal
+        for b in operand_path.candidate.binding_plan.ingredient_bindings)
+    return None if anchor_bound else MultiSourceReason.ordering_anchor_missing
