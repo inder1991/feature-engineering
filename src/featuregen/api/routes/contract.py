@@ -40,6 +40,7 @@ from featuregen.overlay.upload.contract.gate1 import (
     _intent_scoped_applicability_enabled,
     build_considered_set,
     chosen_feature,
+    considered_snapshot_lineage,
     gate1_choice,
     intent_target_ref,
     persist_intent,
@@ -68,6 +69,7 @@ from featuregen.overlay.upload.contract.scope_records import (
     record_confirmed_scope,
     record_recognition_attempt,
 )
+from featuregen.overlay.upload.feature_metadata_snapshot import CatalogProjectionUnavailable
 from featuregen.overlay.upload.planner.contracts import ReplayFreshness
 from featuregen.overlay.upload.planner.plan_envelope import recheck_plan_freshness
 from featuregen.overlay.upload.planner.shadow import run_shadow_planner
@@ -418,11 +420,18 @@ def _scoped_considered_set(body: ConsideredSetIn, conn: _FeatureGenConn, identit
     # unset — no DB query). ``target_entity`` is the confirmed-scope grain the governed planner plans to,
     # exactly the entity the log-only shadow planner already uses below.
     is_live = is_live_cross_catalog_enabled(conn)
-    cs = build_considered_set(
-        conn, intent, client, entity=body.entity, catalog_source=body.catalog_source,
-        roles=identity.role_claims, target_ref=body.target_ref, objective=body.objective,
-        feedback=body.feedback, now=now, applicability=applicability,
-        is_live=is_live, target_entity=scope.target_entity)
+    # Delivery C0 Task 5: anchor the metadata snapshot to THIS run (the scoped path already minted it
+    # in step 4). A projection-lagged catalog aborts the whole considered set — feature generation must
+    # not proceed on a stale projected view — surfaced as 503 CATALOG_PROJECTION_UNAVAILABLE.
+    try:
+        cs = build_considered_set(
+            conn, intent, client, entity=body.entity, catalog_source=body.catalog_source,
+            roles=identity.role_claims, target_ref=body.target_ref, objective=body.objective,
+            feedback=body.feedback, now=now, applicability=applicability,
+            is_live=is_live, target_entity=scope.target_entity,
+            generation_run_id=generation_run_id)
+    except CatalogProjectionUnavailable as e:
+        raise HTTPException(status_code=503, detail=e.detail) from e
     # 7. The per-stage disposition lens over the SAME applicability + this run's grounding outcome.
     dispositions = evaluate_dispositions(
         applicability, cs.grounded_template_ids, cs.rejected_template_ids,
@@ -504,10 +513,16 @@ def considered_set(body: ConsideredSetIn, conn: _FeatureGenConn, identity: _Iden
         except LiveActivationNotReady as e:
             raise HTTPException(status_code=503, detail=str(e)) from e
     is_live = is_live_cross_catalog_enabled(conn)
-    cs = build_considered_set(
-        conn, intent, client, entity=body.entity, catalog_source=body.catalog_source,
-        roles=identity.role_claims, target_ref=body.target_ref, objective=body.objective,
-        feedback=body.feedback, now=datetime.now(UTC), is_live=is_live)
+    # Delivery C0 Task 5: on the REPEATABLE READ feature-gen conn the builder mints an ``fgr`` run and
+    # snapshots the in-scope catalog state, recording the lineage on the considered set. A
+    # projection-lagged catalog aborts here → 503 (feature generation never proceeds on a stale view).
+    try:
+        cs = build_considered_set(
+            conn, intent, client, entity=body.entity, catalog_source=body.catalog_source,
+            roles=identity.role_claims, target_ref=body.target_ref, objective=body.objective,
+            feedback=body.feedback, now=datetime.now(UTC), is_live=is_live)
+    except CatalogProjectionUnavailable as e:
+        raise HTTPException(status_code=503, detail=e.detail) from e
     return _considered_set_response(intent, cs)
 
 
@@ -591,7 +606,12 @@ def draft(body: DraftReqIn, conn: _FeatureGenConn, identity: _Identity, client: 
     except CrossCatalogPlanRequired as e:
         raise HTTPException(status_code=422, detail=str(e)) from e
     d, unresolved = author_contract(conn, d, client, now=datetime.now(UTC), actor=identity)
-    return {"draft": d, "unresolved": unresolved, "intent_id": body.intent_id}
+    # Delivery C0 Task 5: carry the SERVER-persisted snapshot lineage forward (the run + immutable
+    # snapshot the considered set was authored against). Reloaded from the server considered-set row —
+    # the request model carries no client snapshot id, so there is nothing client-supplied to trust.
+    # Null on a READ COMMITTED / pre-C0 considered set. This is ADDITIVE — the validator is unchanged.
+    snapshot = considered_snapshot_lineage(conn, body.intent_id)
+    return {"draft": d, "unresolved": unresolved, "intent_id": body.intent_id, "snapshot": snapshot}
 
 
 @router.get("/contracts", dependencies=[Depends(require_feature_read)])
@@ -665,6 +685,17 @@ def confirm(body: DraftIn, conn: _FeatureGenConn, identity: _Identity) -> Contra
         raise HTTPException(status_code=422,
                             detail="cross-catalog feature requires a governed plan envelope")
     target = intent_target_ref(conn, body.intent_id)   # SERVER truth — never the client body
+    # Delivery C0 Task 5: reload the SERVER snapshot lineage the considered set was authored against and
+    # bind the governing write to it in the audit trail (a regulator can prove EXACTLY what catalog state
+    # this contract was authored against). Reloaded from the server considered-set row — the confirm
+    # request model (DraftIn) carries no client snapshot id, so no client value is ever trusted. ADDITIVE:
+    # the confirm-time MCV re-run + Slice-3 tamper-fix (grain_table/derives_from/join_path above) are
+    # UNCHANGED — re-sourcing the validator onto the snapshot is a later delivery (C2–C4/H).
+    lineage = considered_snapshot_lineage(conn, body.intent_id)
+    if lineage is not None:
+        logger.info("governing contract for intent %s against snapshot %s (run %s, content_hash %s)",
+                    body.intent_id, lineage["snapshot_id"], lineage["generation_run_id"],
+                    lineage["content_hash"])
     try:
         return confirm_contract(conn, draft, actor=identity.subject,
                                 roles=identity.role_claims,   # the CONFIRMER's authority reaches the

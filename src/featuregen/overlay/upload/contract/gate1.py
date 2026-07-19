@@ -16,7 +16,9 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import timedelta
 
+from featuregen.idgen import mint_id
 from featuregen.intake.llm import LLMClient
+from featuregen.overlay.field_evidence import canonical_hash
 from featuregen.overlay.upload.contract._serial import actor_json as _actor_json
 from featuregen.overlay.upload.contract._serial import (
     requirements_from_json,
@@ -34,6 +36,7 @@ from featuregen.overlay.upload.feature_assist import (
     recommend_set,
     set_signals,
 )
+from featuregen.overlay.upload.feature_metadata_snapshot import build_metadata_snapshot
 from featuregen.overlay.upload.planner.contracts import (
     BindingPlanningResultV1,
     BindingPlanV1,
@@ -338,12 +341,80 @@ def _reject_cross_catalog_llm(alternatives: list[FeatureSet]) -> tuple[list[Feat
     return filtered, rejections
 
 
+# ── Delivery C0 Task 5: the immutable metadata snapshot at considered-set time ──────────────────────
+# When the considered set is built on the feature-generation connection (REPEATABLE READ, C0-T2), mint a
+# generation run, snapshot the in-scope catalog state the set derives from (C0-T3), and record the
+# lineage on the contract_considered row so /contract/draft + /contract/confirm reload the SERVER
+# snapshot the set was authored against. Gated on the connection ACTUALLY running under REPEATABLE READ:
+# a plain READ COMMITTED caller (the direct-call gate1 unit tests, any non-feature-gen path) legitimately
+# takes NO snapshot — the snapshot is only meaningful/possible under the torn-free feature-gen isolation,
+# and ``build_metadata_snapshot`` hard-asserts it (so this guard is what keeps those callers additive
+# rather than a hard SnapshotIsolationError). The route always uses the REPEATABLE READ feature-gen conn,
+# so production ALWAYS snapshots.
+_REPEATABLE_READ = "repeatable read"
+
+
+def _on_repeatable_read(conn) -> bool:
+    """True when this connection runs under REPEATABLE READ — the feature-generation isolation the C0
+    snapshot requires. ``SHOW`` reflects the level the (already-started) transaction is running at."""
+    return conn.execute("SHOW transaction_isolation").fetchone()[0] == _REPEATABLE_READ
+
+
+def _candidate_refs(cs: ConsideredSet) -> list[tuple[str, str]]:
+    """The union of ``(catalog_source, object_ref)`` the considered set's candidates DERIVE FROM — the
+    anchor plus every alternative feature's ``derives_pairs`` — deduped + sorted so the snapshot's read
+    scope is deterministic. This is exactly the in-scope catalog surface the set was built against."""
+    refs: set[tuple[str, str]] = set()
+    if cs.anchor is not None:
+        refs.update(cs.anchor.derives_pairs)
+    for s in cs.alternatives:
+        for f in s.features:
+            refs.update(f.derives_pairs)
+    return sorted(refs)
+
+
+def _run_actor(intent: Intent) -> dict:
+    """The generation-run manifest actor as a jsonb dict, reusing the intent's actor serialization
+    (``feature_generation_run.actor`` is NOT NULL). A scalar subject is wrapped; ``None`` → ``{}``."""
+    raw = _actor_json(intent.actor)
+    if raw is None:
+        return {}
+    value = json.loads(raw)
+    return value if isinstance(value, dict) else {"subject": value}
+
+
+def _persist_considered_snapshot(conn, cs: ConsideredSet, intent: Intent, *,
+                                 generation_run_id: str | None, roles, catalog_source: str | None,
+                                 is_live: bool) -> tuple[str | None, str | None, str | None]:
+    """Mint the generation run (if not supplied), build the immutable catalog snapshot (C0-T3) over the
+    considered set's candidate refs, and return the ``(generation_run_id, snapshot_id, content_hash)``
+    lineage to record on the contract_considered row. Runs ONLY under REPEATABLE READ (returns all-None
+    otherwise). Built BEFORE the considered-set INSERT so a projection-lagged view aborts the whole
+    considered set (``CatalogProjectionUnavailable`` propagates to the route → 503) with NO row written —
+    the snapshot and the considered set commit atomically in the one feature transaction."""
+    if not _on_repeatable_read(conn):
+        return None, None, None
+    run_id = generation_run_id or mint_id("fgr")
+    refs = _candidate_refs(cs)
+    read_scope_hash = canonical_hash({
+        "refs": [list(r) for r in refs],   # already sorted, deduped
+        "roles": sorted(str(r) for r in roles),
+    })
+    snapshot = build_metadata_snapshot(
+        conn, generation_run_id=run_id, refs=refs, read_scope_hash=read_scope_hash,
+        actor=_run_actor(intent),
+        flags={"intake_mode": intent.intake_mode, "catalog_source": catalog_source,
+               "is_live": bool(is_live)})
+    return run_id, snapshot.snapshot_id, snapshot.content_hash
+
+
 def build_considered_set(conn, intent: Intent, client: LLMClient, *, entity: str | None = None,
                          catalog_source: str | None = None, roles=(), target_ref: str | None = None,
                          objective: str = "", feedback: str | None = None, now=None,
                          applicability: ApplicabilityResult | None = None,
                          is_live: bool = False, target_entity: str | None = None,
-                         templates: Sequence[Template] | None = None) -> ConsideredSet:
+                         templates: Sequence[Template] | None = None,
+                         generation_run_id: str | None = None) -> ConsideredSet:
     """Discovery loop → validated alternatives; the anchor is the requester's definition run through the
     same validated loop (definition mode only). Every option shown to the human has passed the gauntlet.
     Persists the intent + target_ref (M6, BLOCKER 2) and the considered-set snapshot (BLOCKER 1) when the
@@ -361,7 +432,13 @@ def build_considered_set(conn, intent: Intent, client: LLMClient, *, entity: str
     plan envelope), its unresolved ones and every cross-catalog LLM alternative become rejections. With
     ``is_live`` false the whole governed branch is skipped — byte-identical to today. ``templates``
     (default ``ALL_TEMPLATES``) narrows the recipe registry the governed lens plans over (tests inject
-    a fixture template); it never affects the single-catalog template lens."""
+    a fixture template); it never affects the single-catalog template lens.
+
+    ``generation_run_id`` (Delivery C0 Task 5) — when the caller already minted a run (the scoped route
+    reuses its generation run), the C0 metadata snapshot is anchored to it; otherwise, on a REPEATABLE
+    READ feature-generation connection, a fresh ``fgr`` run is minted. Either way the snapshot lineage is
+    recorded on the contract_considered row (see :func:`_persist_considered_snapshot`). On a READ
+    COMMITTED connection no snapshot is taken (additive — the lineage columns stay NULL)."""
     persist_intent(conn, intent, target_ref)
     # The prediction goal enriches the generation prompt (hypothesis = the causal premise; goal = what
     # we're predicting). Redacted with the same discipline as the hypothesis before it reaches the LLM,
@@ -435,10 +512,20 @@ def build_considered_set(conn, intent: Intent, client: LLMClient, *, entity: str
                        grounded_template_ids=grounded_template_ids,
                        rejected_template_ids=rejected_template_ids,
                        binding_quality_by_template=binding_quality_by_template)
+    # Delivery C0 Task 5: build the immutable catalog snapshot the set was authored against BEFORE the
+    # considered-set INSERT — a projection-lagged view raises here (→ route 503) with NO considered-set
+    # row written, and the snapshot + considered set commit atomically in the one feature transaction.
+    snap_run_id, snap_id, snap_hash = _persist_considered_snapshot(
+        conn, cs, intent, generation_run_id=generation_run_id, roles=roles,
+        catalog_source=catalog_source, is_live=is_live)
     conn.execute(   # persist the validated set so /contract/draft reconstructs the chosen feature here
-        "INSERT INTO contract_considered (intent_id, considered) VALUES (%s, %s::jsonb) "
-        "ON CONFLICT (intent_id) DO UPDATE SET considered = EXCLUDED.considered",
-        (intent.intent_id, json.dumps(_snapshot(conn, cs))))
+        "INSERT INTO contract_considered "
+        "(intent_id, considered, generation_run_id, snapshot_id, snapshot_content_hash) "
+        "VALUES (%s, %s::jsonb, %s, %s, %s) "
+        "ON CONFLICT (intent_id) DO UPDATE SET considered = EXCLUDED.considered, "
+        "generation_run_id = EXCLUDED.generation_run_id, snapshot_id = EXCLUDED.snapshot_id, "
+        "snapshot_content_hash = EXCLUDED.snapshot_content_hash",
+        (intent.intent_id, json.dumps(_snapshot(conn, cs)), snap_run_id, snap_id, snap_hash))
     return cs
 
 
@@ -548,6 +635,20 @@ def chosen_feature(conn, intent_id: str, chosen_source: str,
            for m in matches[1:]):
         return None   # ambiguous same-name options — cannot safely reconstruct
     return _idea_from_json(first)
+
+
+def considered_snapshot_lineage(conn, intent_id: str) -> dict | None:
+    """The SERVER-persisted C0 metadata-snapshot lineage recorded on the considered set for this intent
+    (Delivery C0 Task 5): the ``generation_run_id`` + immutable ``snapshot_id`` / ``content_hash`` the
+    set was authored against. /contract/draft + /contract/confirm reload THIS server value — a client
+    never supplies a snapshot id (the draft/confirm request models carry none, so there is nothing to
+    trust). Returns None when no snapshot was recorded (a READ COMMITTED / pre-C0 considered set)."""
+    row = conn.execute(
+        "SELECT generation_run_id, snapshot_id, snapshot_content_hash "
+        "FROM contract_considered WHERE intent_id = %s", (intent_id,)).fetchone()
+    if row is None or row[1] is None:
+        return None
+    return {"generation_run_id": row[0], "snapshot_id": row[1], "content_hash": row[2]}
 
 
 def record_gate1_choice(conn, intent_id: str, *, chosen_source: str, chosen_option_id: str,
