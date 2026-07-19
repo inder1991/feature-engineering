@@ -250,6 +250,13 @@ class AuditingClient:
         return tuple(self._dispatch_refs)
 
     def call(self, request: LLMRequest) -> LLMResult:
+        if not get_settings().dsn:
+            # No durable audit STORE is configured (dev/test/degraded config) — dispatch provenance
+            # is UNAVAILABLE, not FAILED: proceed UNAUDITED rather than halt all enrichment. The
+            # fail-closed guarantee below (a CONFIGURED store whose write fails -> no egress) still
+            # holds wherever the store exists; in production FEATUREGEN_DSN is always set, and a
+            # startup check should assert it so egress is never silently unaudited there.
+            return self._inner.call(request)
         self._attempt_no += 1
         gen = request.generation_settings or {}
         try:

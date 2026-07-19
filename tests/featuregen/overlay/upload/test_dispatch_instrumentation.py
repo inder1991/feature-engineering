@@ -161,12 +161,14 @@ def test_each_physical_retry_attempt_is_audited(db, durable_dsn, _dsn) -> None:
 # ── 3. fail-closed: AuditUnavailable ⟹ the provider is NEVER called ─────────────────────────────
 
 
-def test_audit_unavailable_fails_closed_with_no_egress(db, monkeypatch) -> None:
-    """When the pre-dispatch audit cannot be durably committed the provider must NOT be called.
-    The wrapper surfaces the same signal as a real pre-response transport failure (a RETURNED
-    PROVIDER_TRANSIENT result — never a raise), so drive_structured_call bounded-retries (each
-    retry re-attempts the audit, all blocked here) and fails into STATUS_FAILED →
-    audited_structured_call returns None and caches nothing."""
+def test_audit_unavailable_fails_closed_with_no_egress(db, monkeypatch, durable_dsn) -> None:
+    """When a CONFIGURED audit store's pre-dispatch write fails, the provider must NOT be called.
+    ``durable_dsn`` sets FEATUREGEN_DSN (the store IS configured), so this exercises the real
+    fail-closed guarantee — a configured-but-failing audit — NOT the graceful no-DSN degrade path
+    (unconfigured store -> proceed unaudited, covered elsewhere). The wrapper surfaces the same
+    signal as a real pre-response transport failure (a RETURNED PROVIDER_TRANSIENT result — never a
+    raise), so drive_structured_call bounded-retries (each retry re-attempts the audit, all blocked
+    here) and fails into STATUS_FAILED → audited_structured_call returns None and caches nothing."""
     calls: list = []
 
     class _Provider:
@@ -182,6 +184,32 @@ def test_audit_unavailable_fails_closed_with_no_egress(db, monkeypatch) -> None:
     out = _call(db, _Provider(), task="test.c5t3.failclosed", ctx=_ctx())
     assert out is None      # failed into clarification — nothing cached
     assert calls == []      # the provider was NEVER invoked — zero egress happened
+
+
+def test_no_dsn_degrades_to_unaudited_egress_not_fail_closed(db, monkeypatch) -> None:
+    """UNCONFIGURED audit store (no FEATUREGEN_DSN) is graceful-degrade, NOT fail-closed: dispatch
+    provenance is unavailable, so enrichment proceeds UNAUDITED rather than halting — the provider
+    IS called, the result comes back, and record_dispatch is never even reached. (Fail-closed is
+    reserved for a CONFIGURED store whose write fails — the test above.) This is why an environment
+    without the durable DSN still enriches; production sets the DSN so the audit is always enforced."""
+    monkeypatch.delenv("FEATUREGEN_DSN", raising=False)
+    calls: list = []
+
+    def _boom(**_kwargs):   # must NOT be called on the no-DSN path
+        calls.append("record_dispatch")
+        raise AuditUnavailable("should not be reached when no DSN is configured")
+
+    class _Provider:
+        def call(self, request):
+            calls.append("provider")
+            return LLMResult(output={"concept": "monetary_amount"}, self_reported_scores={},
+                             call_ref="", status=PROVIDER_OK)
+
+    monkeypatch.setattr(dispatch_audit_module, "record_dispatch", _boom)
+    out = _call(db, _Provider(), task="test.c5t3.nodsn", ctx=_ctx())
+    assert out == {"concept": "monetary_amount"}   # enrichment proceeded (unaudited)
+    assert "provider" in calls                     # the provider WAS called
+    assert "record_dispatch" not in calls          # the audit was skipped, not failed
 
 
 # ── 4. dispatch_audit=None is byte-identical to today ───────────────────────────────────────────
