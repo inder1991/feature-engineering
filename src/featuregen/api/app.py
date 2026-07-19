@@ -16,6 +16,7 @@ from featuregen.aggregates.bootstrap import register_phase06_event_schemas
 from featuregen.api.deps import get_conn, get_identity
 from featuregen.api.routes import (
     admin,
+    assets,
     assist,
     auth,
     contract,
@@ -126,6 +127,7 @@ def create_app(llm_client: LLMClient | None = None) -> FastAPI:
     app.include_router(ingestion_runs.router)
     app.include_router(integrations.router)
     app.include_router(search.router)
+    app.include_router(assets.router)
     app.include_router(quarantine.router)
     app.include_router(semantics.router)
     app.include_router(readiness.router)
