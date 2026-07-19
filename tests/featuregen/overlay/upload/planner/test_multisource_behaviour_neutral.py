@@ -11,10 +11,22 @@ Three independent proofs:
      constants — so it is checked separately: its branch diff may only ever APPEND lines, never
      remove or change an existing one.
   2. RUNTIME — a representative single-source ``plan_bindings`` run over a small governed
-     single-catalog fixture (the ``test_plan.py`` pattern) produces byte-identical
-     identity-bearing fields whether captured BEFORE any ``multisource_*`` module has been imported
-     into this process, or AFTER importing every one of them — proving the shadow engine's mere
-     presence never perturbs a single-source result.
+     single-catalog fixture (the ``test_plan.py`` pattern) produces byte-identical identity-bearing
+     fields whether captured in a FRESH subprocess interpreter that imports ONLY the single-source
+     planner (never any ``multisource_*`` module), or in THIS process (where every ``multisource_*``
+     module has been imported) — proving the shadow engine's mere presence never perturbs a
+     single-source result.
+
+     The baseline runs in a subprocess rather than being captured "before this process imports any
+     multisource_* module", because that in-process ordering is not a reliable precondition: pytest's
+     COLLECTION phase imports every sibling ``test_multisource_*.py`` module — which import the
+     production ``multisource_*`` modules at module scope — before ANY test body runs. So under
+     ``uv run pytest tests/featuregen/overlay/upload/planner/ -q`` (and under a full-tree
+     ``uv run pytest -q``), by the time this test's body executes the multisource modules are already
+     in ``sys.modules``; only running the file in total isolation ever satisfied the old
+     "before any import" snapshot. A fresh subprocess sidesteps collection order entirely — it never
+     imports the sibling test modules, so it is immune to which command/directory pytest was invoked
+     from.
   3. NO IMPORT-TIME SIDE EFFECT — every ``multisource_*`` module imports cleanly and defines no
      module-level DB/IO (static AST check: no import-time-reachable call whose name looks like a DB
      or network operation, outside a function/method body). With
@@ -22,18 +34,15 @@ Three independent proofs:
      no-op that opens NO connection (the Task-11 fake-``connect`` pattern) — so there is no possible
      shadow-store write on a normal (flag-off) path.
 
-NOTE on ordering: proof 2 needs to observe this process BEFORE any ``multisource_*`` module has
-been imported, so it is defined (and therefore, since this suite has no test-randomization plugin
-configured — ``addopts`` carries no ``-p randomly`` — runs) ahead of proof 3, which deliberately
-imports all of them.
-
 If proof 1 ever fails (a behavioural engine file WAS modified on this branch), that is a genuine
 neutrality violation to ESCALATE — do not weaken this test to make it pass.
 """
 from __future__ import annotations
 
 import ast
+import dataclasses
 import importlib
+import json
 import subprocess
 import sys
 from datetime import UTC, datetime
@@ -50,8 +59,8 @@ from featuregen.overlay.upload.templates import Need, Template
 _NOW = datetime(2026, 7, 19, tzinfo=UTC)
 
 # The eleven Task 1-12 `multisource_*` engine modules (design §12's "new carriers/context/store").
-# Shared by proof 2 (must NOT be imported yet when it captures its "before" snapshot) and proof 3
-# (imports every one of them).
+# Used by proof 3 below (imports every one of them, proving the in-process "after" run — which now
+# has all of them loaded — still matches the subprocess baseline).
 _MULTISOURCE_MODULES = (
     "featuregen.overlay.upload.planner.multisource_contracts",
     "featuregen.overlay.upload.planner.multisource_operation",
@@ -133,7 +142,6 @@ def test_contracts_file_branch_diff_is_additive_only():
 
 
 # ── 2. RUNTIME — single-source plan_bindings unaffected by importing the multisource modules ──
-# (defined/run BEFORE proof 3 below, which imports every multisource_* module — see module note)
 def _seed_single_catalog(db, source: str) -> None:
     """Mirrors ``test_plan.py``'s ``_catalog`` helper: one governed single-catalog fixture (a
     customer-grain accounts table with a monetary-stock measure) via the real graph write path,
@@ -162,36 +170,123 @@ def _identity_snapshot(result) -> dict:
     """The identity-bearing subset of a ``BindingPlanningResultV1`` (design §12's golden fields):
     selected plan, every candidate's physical id, the result/reason vocabulary, and the bounding
     metrics — deliberately NOT the whole dataclass (``catalog_scope_id``/``replay_envelope`` carry
-    provenance, not identity)."""
+    provenance, not identity). Returned already JSON-safe (str-cast StrEnums, lists not tuples, a
+    plain dict for ``bounding``) so it compares equal, field-for-field, to the parsed JSON emitted by
+    the subprocess baseline script below — both sides go through the identical normalization."""
     return {
         "selected_plan_id": result.selected_plan_id,
-        "candidate_physical_plan_ids": tuple(p.physical_plan_id for p in result.candidate_plans),
-        "candidate_resolution_statuses": tuple(p.resolution_status for p in result.candidate_plans),
-        "result_status": result.result_status,
-        "primary_reason_code": result.primary_reason_code,
-        "reason_codes": result.reason_codes,
-        "bounding": result.bounding,
+        "candidate_physical_plan_ids": [p.physical_plan_id for p in result.candidate_plans],
+        "candidate_resolution_statuses": [str(p.resolution_status) for p in result.candidate_plans],
+        "result_status": str(result.result_status),
+        "primary_reason_code": (str(result.primary_reason_code)
+                                if result.primary_reason_code is not None else None),
+        "reason_codes": [str(c) for c in result.reason_codes],
+        "bounding": dataclasses.asdict(result.bounding),
     }
 
 
-def test_single_source_plan_bindings_identical_before_and_after_multisource_import(db):
+# A hermetic, self-contained script for a FRESH `uv run python -c` interpreter: it imports ONLY the
+# single-source planner (never any test module, and in particular never any sibling
+# `test_multisource_*.py` — the thing that makes an in-process "before" snapshot impossible, since
+# pytest's collection phase has already imported all of those, and therefore every `multisource_*`
+# production module, before this test's body runs). It duplicates `_seed_single_catalog`/`_tmpl`
+# above rather than importing them, so the baseline interpreter's import graph is provably minimal —
+# not merely "happens not to import multisource_* today".
+#
+# Takes the DSN on stdin (not argv, since a libpq keyword/value conninfo string contains spaces) and
+# prints one line of JSON — the same identity snapshot shape `_identity_snapshot` builds in-process —
+# to stdout. Never commits: the seeded rows live only in this process's own uncommitted transaction
+# and vanish when the connection is rolled back and closed, mirroring the repo's `conn` fixture.
+_SUBPROCESS_BASELINE_SCRIPT = """
+import dataclasses
+import json
+import sys
+from datetime import UTC, datetime
+
+import psycopg
+
+# Sanity check on the baseline interpreter itself: nothing has pulled in a multisource_* module
+# merely by starting up (mirrors the intent of the old in-process "before" assertion, but as a
+# guarantee about THIS fresh interpreter rather than an assumption about pytest's collection order).
+assert not any(name.startswith("featuregen.overlay.upload.planner.multisource_")
+              for name in sys.modules), "a multisource module leaked into the baseline interpreter"
+
+from featuregen.overlay.upload.canonical import CanonicalRow
+from featuregen.overlay.upload.enrich import content_hash
+from featuregen.overlay.upload.graph import build_graph
+from featuregen.overlay.upload.planner.plan import plan_bindings
+from featuregen.overlay.upload.planner.scope import resolve_catalog_scope
+from featuregen.overlay.upload.templates import Need, Template
+
+assert not any(name.startswith("featuregen.overlay.upload.planner.multisource_")
+              for name in sys.modules), "importing the single-source planner pulled in a multisource module"
+
+NOW = datetime(2026, 7, 19, tzinfo=UTC)
+SOURCE = "core_neutrality"
+
+dsn = sys.stdin.read().strip()
+conn = psycopg.connect(dsn)
+try:
+    catalog = [
+        (CanonicalRow(SOURCE, "accounts", "customer_id", "integer", is_grain=True), "customer_id"),
+        (CanonicalRow(SOURCE, "accounts", "balance", "numeric", additivity="semi_additive",
+                      currency="USD"), "monetary_stock"),
+    ]
+    build_graph(conn, SOURCE, [r for r, _ in catalog], concepts={content_hash(r): c for r, c in catalog})
+    conn.execute(
+        "INSERT INTO overlay_drift_watermark (catalog_source, last_completed_at, last_run_id, head_seq) "
+        "VALUES (%s, %s, 'r', 1) ON CONFLICT (catalog_source) DO UPDATE SET last_completed_at = %s",
+        (SOURCE, NOW, NOW))
+
+    template = Template(id="t_bal_neutrality", family="f", intent="i",
+                        needs=(Need(role="stock_col", concept="monetary_stock"),
+                               Need(role="entity", concept="customer_id")),
+                        params={}, aggregation="avg", additivity="semi_additive", explain="M",
+                        use_cases=(), pit="trailing")
+
+    scope = resolve_catalog_scope(conn, roles=(), target_entity="customer", now=NOW)
+    result = plan_bindings(conn, template=template, target_entity="customer", scope=scope, roles=(), now=NOW)
+
+    snapshot = {
+        "selected_plan_id": result.selected_plan_id,
+        "candidate_physical_plan_ids": [p.physical_plan_id for p in result.candidate_plans],
+        "candidate_resolution_statuses": [str(p.resolution_status) for p in result.candidate_plans],
+        "result_status": str(result.result_status),
+        "primary_reason_code": (str(result.primary_reason_code)
+                                if result.primary_reason_code is not None else None),
+        "reason_codes": [str(c) for c in result.reason_codes],
+        "bounding": dataclasses.asdict(result.bounding),
+    }
+finally:
+    conn.rollback()
+    conn.close()
+
+print(json.dumps(snapshot))
+"""
+
+
+def _run_baseline_subprocess(dsn: str) -> dict:
+    proc = subprocess.run(
+        ("uv", "run", "python", "-c", _SUBPROCESS_BASELINE_SCRIPT),
+        cwd=_REPO_ROOT, input=dsn, capture_output=True, text=True, timeout=120)
+    assert proc.returncode == 0, (
+        f"baseline subprocess exited {proc.returncode}\n--- stdout ---\n{proc.stdout}\n"
+        f"--- stderr ---\n{proc.stderr}")
+    return json.loads(proc.stdout.strip().splitlines()[-1])
+
+
+def test_single_source_plan_bindings_identical_before_and_after_multisource_import(db, _dsn):
     """The RUNTIME proof (design §12): capture a representative single-source ``plan_bindings`` run
-    BEFORE any ``multisource_*`` module has been imported into this process, then AGAIN after
-    importing every one of them — the identity-bearing fields must be byte-for-byte identical. This
-    proves the shadow engine's mere presence in the process never perturbs a single-source result
-    (the strongest in-process form of the fallback the brief allows when a full golden capture
-    against a separate process isn't practical)."""
-    already_imported = [name for name in _MULTISOURCE_MODULES if name in sys.modules]
-    assert not already_imported, (
-        "test-ordering assumption violated: these multisource modules were already imported before "
-        f"the 'before' snapshot could be captured: {already_imported}. This test must run before any "
-        "other test in this file imports them.")
+    in a FRESH subprocess interpreter that has imported ONLY the single-source planner, then AGAIN in
+    THIS process after importing every ``multisource_*`` module — the identity-bearing fields must be
+    byte-for-byte identical. This proves the shadow engine's mere presence never perturbs a
+    single-source result, independent of pytest's collection/import order (see the module docstring
+    and ``_SUBPROCESS_BASELINE_SCRIPT`` for why an in-process "before any import" snapshot can't be
+    relied on once this file sits next to its `test_multisource_*.py` siblings)."""
+    baseline_snapshot = _run_baseline_subprocess(_dsn)
 
     _seed_single_catalog(db, "core_neutrality")
     scope = resolve_catalog_scope(db, roles=(), target_entity="customer", now=_NOW)
-
-    before = plan_bindings(db, template=_tmpl(), target_entity="customer", scope=scope, roles=(), now=_NOW)
-    before_snapshot = _identity_snapshot(before)
 
     for module_name in _MULTISOURCE_MODULES:
         importlib.import_module(module_name)
@@ -200,9 +295,9 @@ def test_single_source_plan_bindings_identical_before_and_after_multisource_impo
     after = plan_bindings(db, template=_tmpl(), target_entity="customer", scope=scope, roles=(), now=_NOW)
     after_snapshot = _identity_snapshot(after)
 
-    assert before_snapshot == after_snapshot
+    assert baseline_snapshot == after_snapshot
     # and the run resolved at all (a vacuous "both empty" comparison would prove nothing)
-    assert before_snapshot["selected_plan_id"] is not None
+    assert after_snapshot["selected_plan_id"] is not None
 
 
 # ── 3. NO IMPORT-TIME SIDE EFFECT ──
