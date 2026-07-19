@@ -625,6 +625,18 @@ def confirm(body: DraftIn, conn: _Conn, identity: _Identity) -> Contract:
             or frozenset(draft.derives_pairs) != frozenset(chosen.derives_pairs)
             or (draft.aggregation or "") != (chosen.aggregation or "")):
         raise HTTPException(status_code=422, detail="the draft does not match the chosen feature")
+    # SAFETY (tri-state gate): grain_table + derives_from drive the confirm-time MCV re-run's
+    # grain/join/additivity dispositions but are NOT covered by the match check above. A client could
+    # echo a matching name/derives_pairs/aggregation yet send grain_table=None (the grain + cross-table
+    # join dispositions are gated on `if grain_table and single-catalog`, so they silently no-op and
+    # GRAIN_IS_UNIQUE / JOIN_CONNECTIVITY vanish) or a trimmed derives_from (a measure kept in
+    # derives_pairs but dropped here is absent from the per-operand `pairs`, so its
+    # ADDITIVITY_SUPPORTS_OPERATION check never runs) — either erases the honest requirements and flips
+    # NEEDS_EXTERNAL_VALIDATION -> DESIGN_CHECKED at the GOVERNING write. Overwrite both from the SERVER-
+    # reconstructed chosen (the same server-authoritative pattern as join_path below), so the re-run
+    # always reasons over the operands the human actually chose.
+    draft = replace(draft, grain_table=chosen.grain_table,
+                    derives_from=list(chosen.derives_from))
     # 3C.2a fail-closed at the GOVERNING write: re-run the freshness recheck against the SERVER-
     # reconstructed chosen feature's plan envelope (never the client body) under the request's roles —
     # a plan that drifted between draft and confirm must never silently finalize (409, regenerate). The
