@@ -10,11 +10,13 @@ from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field
 
 from featuregen.api.deps import get_conn, get_identity, get_llm, require_feature_generate
+from featuregen.api.feature_serialize import serialize_feature_idea
 from featuregen.contracts.envelopes import IdentityEnvelope
 from featuregen.intake.llm import LLMClient
 from featuregen.overlay.upload.feature_assist import (
     LeakageWarning,
     Recipe,
+    feature_context_enabled,
     feature_recipe,
     leakage_check,
     recommend_feature_sets_report,
@@ -85,7 +87,10 @@ def recommend(
                                        feedback=body.feedback, now=datetime.now(UTC),
                                        actor=identity)
     # Rejections are shown to the human, never hidden: {"name", "reason", "code"} per candidate.
-    return {"proposals": report.ideas, "rejections": report.rejections}
+    feature_context = feature_context_enabled()
+    return {"proposals": [serialize_feature_idea(i, feature_context=feature_context)
+                          for i in report.ideas],
+            "rejections": report.rejections}
 
 
 @router.post("/features/refine", dependencies=[Depends(require_feature_generate)])
@@ -103,8 +108,9 @@ def refine(
                                      roles=identity.role_claims, entity=body.entity,
                                      target_ref=body.target_ref, now=datetime.now(UTC),
                                      objective=body.objective, actor=identity)
+    feature_context = feature_context_enabled()
     if revised is not None:
-        return {"revised": revised}
+        return {"revised": serialize_feature_idea(revised, feature_context=feature_context)}
     rej = rejection or {}
     return {"rejected": {"reason": str(rej.get("reason", "")), "code": str(rej.get("code", ""))}}
 
@@ -125,12 +131,16 @@ def recommend_sets(
                                            target_ref=body.target_ref, entity=body.entity,
                                            feedback=body.feedback, now=datetime.now(UTC),
                                            actor=identity)
+    feature_context = feature_context_enabled()
+    sets = [{"lens": s.lens,
+             "features": [serialize_feature_idea(f, feature_context=feature_context)
+                          for f in s.features]}
+            for s in report.sets]
     # No recommendation over nothing: when every set came back empty there is nothing to advise on,
     # and we do not spend an LLM call to say so.
     recommendation = (recommend_set(conn, report.sets, body.objective, client, actor=identity)
                       if any(s.features for s in report.sets) else None)
-    return {"sets": report.sets, "recommendation": recommendation,
-            "rejections": report.rejections}
+    return {"sets": sets, "recommendation": recommendation, "rejections": report.rejections}
 
 
 @router.post("/features/recipe", dependencies=[Depends(require_feature_generate)])
