@@ -12,7 +12,11 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime
 
+from psycopg.types.json import Jsonb
+
 from featuregen.aggregates.ids import mint_id
+from featuregen.overlay.field_evidence import canonical_hash
+from featuregen.overlay.upload import feature_validation_projection
 from featuregen.overlay.upload.contract._serial import actor_json as _actor_json
 from featuregen.overlay.upload.contract._serial import requirements_to_json
 from featuregen.overlay.upload.contract.author import ContractDraft
@@ -26,6 +30,11 @@ from featuregen.overlay.upload.features import (
     get_feature,
     register_feature,
 )
+
+# Delivery C4-T3: the immutable-requirement schema version stamped on every persisted
+# `feature_validation_requirement` row. A re-assessment against a NEW schema version yields NEW rows
+# (the 1009 UNIQUE key includes it), never a mutation of an existing row.
+REQUIREMENT_SCHEMA_VERSION = "req-schema-v1"
 
 
 class ContractValidationError(Exception):
@@ -117,7 +126,52 @@ def confirm_contract(conn, draft: ContractDraft, *, actor, roles: Iterable[str] 
          #                            a real change and must be recorded, never silently kept stale)
          json.dumps(requirements_to_json(check.requirements)),
          metadata_snapshot_id, metadata_content_hash))   # MF-3: immutable contract -> snapshot binding
+    # Delivery C4-T3: ADDITIVELY seed the event-sourced validation lifecycle from the SAME confirm-time
+    # MCV re-run. The 1003 columns above stay the INITIAL stamp (unchanged); this emits the ASSESSED
+    # event + persists the immutable requirement rows + projects the current-state row — all on THIS
+    # transaction, so the lifecycle seed is atomic with confirm.
+    _seed_validation_lifecycle(conn, contract_id, check, pairs, metadata_content_hash)
     return Contract(contract_id, feature_id, draft.feature_name, version)
+
+
+def _seed_validation_lifecycle(conn, contract_id, check, pairs, snapshot_content_hash) -> None:
+    """C4-T3: from the confirm-time ``MinimumCheck``, persist the immutable requirement rows, emit the
+    ASSESSED event, and fold it into ``feature_contract_validation_state`` — all on ``conn`` (atomic
+    with the contract insert). Idempotent: requirement rows use ``ON CONFLICT DO NOTHING`` on the 1009
+    identity key, and the projection's sequence guard makes the fold a replay-safe no-op.
+
+    The requirement fingerprint is the IMMUTABLE metadata-snapshot content_hash (MF-3 binding — what
+    catalog state the contract was authored against) when present, else a canonical hash of the draft's
+    resolved (catalog, ref) pairs + the confirm-time requirements (a pre-C0 / snapshot-less confirm).
+    """
+    fingerprint = snapshot_content_hash or canonical_hash(
+        {"derives_pairs": [[cs, ref] for cs, ref in pairs],
+         "requirements": requirements_to_json(check.requirements)})
+    for req in check.requirements:
+        operand = [req.operand[0], req.operand[1]]
+        content_hash = canonical_hash({"code": req.code, "operand": operand, "detail": req.detail})
+        # All deterministic external requirements are BLOCKING by default (the closed vocabulary is
+        # what a DATA-CHECKED promotion depends on). Write-once + identity-keyed (1009).
+        conn.execute(
+            "INSERT INTO feature_validation_requirement (requirement_id, contract_id, "
+            "requirement_schema_version, metadata_input_fingerprint, code, subject_json, "
+            "params_json, blocking, content_hash) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) "
+            "ON CONFLICT (contract_id, requirement_schema_version, metadata_input_fingerprint, "
+            "content_hash) DO NOTHING",
+            (mint_id("req"), contract_id, REQUIREMENT_SCHEMA_VERSION, fingerprint, req.code,
+             Jsonb({"operand": operand}), Jsonb({"detail": req.detail}), True, content_hash))
+    # The ASSESSED payload is MINIMAL + honest: the C4 lowercase status vocabulary (mirrors the 1009
+    # CHECK — a DISTINCT axis from the 1003 UPPERCASE column), plus counts. The fold reads the
+    # requirement rows above for the authoritative blocking detail, so the requirement rows MUST be
+    # persisted before this event is folded.
+    conn.execute(
+        "INSERT INTO feature_contract_validation_event "
+        "(event_id, contract_id, event_type, payload) VALUES (%s, %s, 'ASSESSED', %s)",
+        (mint_id("fcve"), contract_id, Jsonb({
+            "validation_status": check.validation_status.lower(),
+            "requirement_count": len(check.requirements),
+            "has_blocking": bool(check.requirements)})))
+    feature_validation_projection.catch_up(conn)   # fold the ASSESSED into the current-state row
 
 
 def contract_freshness(conn, contract_id: str, *, now: datetime) -> FeatureFreshness:
