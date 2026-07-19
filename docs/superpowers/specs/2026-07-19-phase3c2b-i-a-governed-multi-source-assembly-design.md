@@ -8,111 +8,103 @@
 
 ## 1. Purpose
 
-Give the planner a capability it lacks: **combine operands originating in different catalogs into one governed computation at one exact physical grain.** Today `enumerate_single_catalog_plans` requires all needs in one catalog and `_assemble_rollups` moves a single resolved single-catalog computation to a target entity — neither combines cross-catalog operands. A feature like *"AVG(transaction_amount) [`core_banking.transactions`] ÷ latest(account_balance) [`wealth.accounts`], per customer"* cannot be planned.
+Give the planner a capability it lacks: **combine operands originating in different catalogs into one governed computation at one exact physical grain.** Today `enumerate_single_catalog_plans` requires all needs in one catalog and `_assemble_rollups` moves a single resolved single-catalog computation to a target entity — neither combines cross-catalog operands. *"AVG(transaction_amount) [`core_banking.transactions`] ÷ latest(account_balance) [`wealth.accounts`], per customer"* cannot be planned.
 
-A builds each operand an **independent governed path** over **VERIFIED** bridges, **converges all paths to one exact physical landing** `{catalog, table, grain_key}`, applies each operand's own aggregation along its path, proves the paths are cardinality/aggregation/temporal-correct and mutually compatible, joins the per-path outputs at the landing key, applies the **final expression**, asserts nothing was substituted or lost, and compiles. Shadow-only, driven by a **synthetic gold set** of already-authoritative intents. A does **no** concept-authority resolution (B's job) and **no** structural inference — it trusts its typed input and proves the *assembly* is governed.
+A builds each operand an **independent governed path** over **VERIFIED** bridges, **converges all paths to one exact physical landing** `{catalog, table, grain_key_refs}`, applies each operand's own aggregation, proves per-path correctness + cross-path compatibility, joins per-path outputs at the landing keys, applies the **final expression**, asserts preservation, and compiles. Shadow-only, synthetic-gold-driven. A does **no** concept-authority resolution and **no** structural inference — it trusts its typed input for concept + source-side authority and proves the *assembly* governed.
 
-## 2. Input contract — `MultiSourcePlannerIntentV1`
+## 2. Contracts
 
-`@dataclass(frozen=True, slots=True)`, all fields authoritative (from B, or hand-authored in gold):
-
-- `target_entity: str` — the logical grain the feature is defined at.
-- `operands: tuple[OperandSlotV1, ...]`.
-- `final_expression: FinalExpressionV1` — the operation that combines per-operand results (see §3).
-- `operation_policy_version: str`.
+### 2.1 Input — `MultiSourcePlannerIntentV1`
+`@dataclass(frozen=True, slots=True)`; all fields authoritative (from B or hand-authored):
+- `target_entity: str` — logical grain the feature is defined at.
+- `operands: tuple[OperandSlotV1, ...]`; `final_expression: FinalExpressionV1`; `operation_policy_version: str`.
 
 `OperandSlotV1`:
-- `slot_id: str` (`op_0`…), `semantic_role: SemanticRole` (`MEASURE | TIME | COUNTED | NUMERATOR | DENOMINATOR | MINUEND | SUBTRAHEND`).
-- `catalog_source: str`, `object_ref: str` — exact pinned operand identity.
-- `authoritative_concept: str` — trusted, ∈ `CONCEPT_REGISTRY`.
-- `path_strategy: PathStrategyV1` — this operand's **own** aggregation to the landing grain: `aggregation` (e.g. `AVG`, `SUM`, `TAKE_LATEST`, `COUNT_DISTINCT`), plus its declared `output_type` and `output_additivity`. (Separating per-operand aggregation from the final expression is finding #3: for `AVG(x)/latest(y)`, `AVG` and `TAKE_LATEST` are per-path; `RATIO` is final.)
-- `structural_binding: GovernedStructuralBindingV1` — the **frozen governed structural projection** for this operand (finding #4): the authoritative source-grain entity, the source→landing key mapping, and its evidence provenance. A does **not** re-derive grain/key from `graph_node.concept`/`is_grain` (advisory; `catalog_realizations.object_grain`/`key_entity` read the display concept). Absent/ungoverned → A rejects.
+- `slot_id` (`op_0`…), `semantic_role: SemanticRole` (`MEASURE | TIME | COUNTED | NUMERATOR | DENOMINATOR | MINUEND | SUBTRAHEND`).
+- `catalog_source`, `object_ref` — exact pinned identity; `authoritative_concept ∈ CONCEPT_REGISTRY`.
+- `path_strategy: PathStrategyV1` — this operand's **own** aggregation to the landing (`AVG|SUM|MIN|MAX|STDDEV|TAKE_LATEST|COUNT|COUNT_DISTINCT`) + declared `output_type` + `output_additivity` + `external_type_required: bool` (finding #10: set when operational type is unknown).
+- `source_binding: GovernedSourceBindingV1` — **source-side only** (finding #2): authoritative `source_grain_entity`, `source_key_ref`, and evidence provenance. It does **not** carry a landing key mapping (A doesn't know the landing yet). A derives the source→landing mapping per path (§2.2). Absent/ungoverned → `SOURCE_BINDING_UNGOVERNED`.
 
-`FinalExpressionV1` — the combining op + typed shape + ordered slot references: `IDENTITY(measure)`, `RECENCY(time)`, `TREND(measure,time,window)`, `RATIO(numerator,denominator)`, `DIFFERENCE(minuend,subtrahend)`; `is_order_sensitive` marks the last two. Carries the final `output_additivity` and window/`time_ref` where applicable.
+`FinalExpressionV1` — combining op + **ordered slot references by `slot_id`** (incl. `time_slot_id`, never a raw `time_ref` — finding #5): `IDENTITY(measure_slot)`, `RECENCY(time_slot)`, `TREND(measure_slot, time_slot, window)`, `COUNT(counted_slot)`, `COUNT_DISTINCT(counted_slot)`, `RATIO(numerator_slot, denominator_slot)`, `DIFFERENCE(minuend_slot, subtrahend_slot)`. `is_order_sensitive` marks RATIO/DIFFERENCE. Carries final `output_additivity` + `window`.
 
-## 3. Operation shape (closed)
+### 2.2 Output — result vs plan (finding #1)
+Mirror `BindingPlanningResultV1` (which separates candidates from selected ids/bounds/envelope):
 
-Missing/extra/ambiguous operands → `OPERAND_SHAPE_INVALID`.
+`MultiSourcePlanningResultV1` `@dataclass(frozen=True, slots=True)`: `run_id`, `target_entity`, `candidate_plans: tuple[MultiSourceBindingPlanV1, ...]`, `selected_plan_id: str | None`, `result_status`, `primary_reason_code`, `reason_codes`, `bounding: MultiSourceBoundingMetricsV1`, `replay_envelope`, and the contract axis (`contract_result_status`, `selected_contract_physical_plan_id`, `selected_contract_id`).
 
-| `final_expression` | Operand slots | Per-operand `path_strategy` |
+`MultiSourceBindingPlanV1` (one candidate, carries **only its own** compile result): `plan_id` (deterministic over landing + paths + strategies + final expression + versions), `physical_landing: PhysicalLandingV1`, `operand_paths: tuple[OperandPathV1, ...]`, `final_expression`, `physical_read_set`, `resolution_status`, `reason_codes`, and its own `contract_result_status`/`contract_id` (**not** a selected id).
+
+`PhysicalLandingV1`: `catalog`, `table_ref`, **`grain_key_refs: tuple[str, ...]`** (finding #4 — grains are multi-column; `resolve_fact("grain").value["columns"]` is a list; join on **every** key).
+
+`OperandPathV1`: `slot_id`, `semantic_role`, pinned `(catalog_source, object_ref)`, ordered `path_segments` (each VERIFIED crossing named), the **A-derived source→landing key mapping**, applied `path_strategy`, per-path PIT treatment, per-path check verdicts.
+
+## 3. Complete operation → slot → path-strategy matrix (finding #5)
+
+Total and closed; missing/extra/ambiguous → `OPERAND_SHAPE_INVALID`.
+
+| `final_expression` | slots (semantic_role) | per-slot `path_strategy.aggregation` |
 |---|---|---|
-| `IDENTITY` | 1 `MEASURE` | one aggregation |
-| `RECENCY` | 1 `TIME` | latest/recency |
-| `TREND` | 1 `MEASURE` + 1 `TIME` + typed `window` | measure agg over window |
-| `RATIO` (order-sensitive) | 1 `NUMERATOR` + 1 `DENOMINATOR` | each carries its own aggregation |
-| `DIFFERENCE` (order-sensitive) | 1 `MINUEND` + 1 `SUBTRAHEND` | each carries its own aggregation |
+| `IDENTITY` | 1 `MEASURE` | `AVG|SUM|MIN|MAX|STDDEV` |
+| `COUNT` | 1 `COUNTED` | `COUNT` |
+| `COUNT_DISTINCT` | 1 `COUNTED` | `COUNT_DISTINCT` |
+| `RECENCY` | 1 `TIME` | `TAKE_LATEST` |
+| `TREND` | 1 `MEASURE` + 1 `TIME` (+ typed `window`) | measure: window agg; **time**: `TAKE_LATEST` (the TREND time slot's strategy is defined, not left open) |
+| `RATIO` (ordered) | 1 `NUMERATOR` + 1 `DENOMINATOR` | each its own measure agg |
+| `DIFFERENCE` (ordered) | 1 `MINUEND` + 1 `SUBTRAHEND` | each its own measure agg |
 
-Windowed ops require typed `window` + `time_ref` (never inferred).
+Windowed ops require a typed `window`; the time anchor is the `TIME` slot referenced by `time_slot_id`.
 
-## 4. The assembly steps
+## 4. Governed realizations (finding #3)
+
+Existing realization derivation reads table grain + key entity from `graph_node.concept` (`catalog_realizations.py:99`) and builds realizations from those values (`catalog_realizations.py:183`) — **advisory**. A VERIFIED bridge *edge* does not make its realization *endpoints* authoritative. A therefore **revalidates every realization endpoint** (source, intermediate, landing) against **governed grain/key facts** before use — an evidence-backed `GovernedRealizationV2` whose grain/key each cite a VERIFIED grain/key fact event. An endpoint with no governed grain/key fact → the path is unusable (`REALIZATION_ENDPOINT_UNGOVERNED`).
+
+## 5. The assembly steps
 
 Per intent (own savepoint):
-
-1. **Per-operand path enumeration (bounded).** For each operand, enumerate governed paths from its exact pinned `(catalog_source, object_ref)` node to candidate physical landings (§8 gives the enumeration/ranking/limits). Operand columns are pinned — constructed from the node + `authoritative_concept`, never display-concept discovery.
-2. **VERIFIED-only crossings.** Every cross-catalog hop uses a **VERIFIED** governed bridge (`approved_join`) and governed realizations only. No all-VERIFIED path for a required operand → `UNVERIFIED_CROSSING_REQUIRED`.
-3. **Exact physical convergence.** Select **one** physical landing `{catalog, table, grain_key}` that **every** operand path can reach (exact-convergence filtering over the planner's physical `_State.position`, not just the same logical entity — finding #1). No common physical landing → `NO_COMMON_PHYSICAL_GRAIN`. Ambiguous landings → deterministic ranking (§8); unresolved ambiguity → `AMBIGUOUS_PHYSICAL_GRAIN`.
-4. **Per-path aggregation correctness.** Apply each operand's `path_strategy.aggregation`; validate additivity for the operand's concept + the path's fan-in against the rule evaluators (`AGGREGATION_RULE_VERSION`/`ADDITIVITY_RULE_VERSION`). Non-additive measure summed across a fan-out crossing → `AGGREGATION_UNSAFE_ON_PATH`.
-5. **Temporal compatibility.** Each path's PIT treatment (`TEMPORAL_RULE_VERSION`) must be individually valid **and** mutually as-of-consistent at the landing. Incompatible → `TEMPORAL_PATHS_INCOMPATIBLE`.
-6. **Final join + expression.** Join the per-path aggregated outputs at the landing `grain_key` and apply `final_expression` (ordered slots preserved: numerator ≠ denominator). Join keys/bridge columns enter only the physical read set.
-7. **Preservation assertion.** Assert every original `(catalog_source, object_ref)` operand and its `semantic_role` slot survives exactly once in the correct slot, and the final expression matches the input. Deviation → `OPERAND_OR_SLOT_NOT_PRESERVED` (technical).
-8. **Compile.** `compile_multi_source_contract` (§6). Resolve requires: a selected physical landing all operands reach, per-path + final checks pass, `contract_result_status == resolved`, non-null selected contract plan id, steps 1–7 passed.
-
-## 5. New plan carrier — `MultiSourceBindingPlanV1`
-
-`BindingPlanV1` assumes one source catalog / one ingredient set / one shared path (`catalog_source`, path ordering, aggregation placement all singular). A **sibling** carrier:
-
-`MultiSourceBindingPlanV1` `@dataclass(frozen=True, slots=True)`:
-- `plan_id: str` — deterministic identity over operand paths + landing + per-path strategies + final expression + versions.
-- `target_entity: str`; `physical_landing: PhysicalLandingV1 {catalog, table, grain_key}`.
-- `operand_paths: tuple[OperandPathV1, ...]` — per slot: `slot_id`, `semantic_role`, pinned `(catalog_source, object_ref)`, ordered `path_segments` (each VERIFIED crossing named), applied `path_strategy`, per-path PIT treatment.
-- `final_expression: FinalExpressionV1`; `physical_read_set` (union); `resolution_status`, `reason_codes`, and the compiled `contract_id`/`contract_result_status`/selected contract plan id.
-
-Single-source planning (`BindingPlanV1`) is untouched and byte-identical.
+1. **Per-operand path enumeration (bounded, §8).** From each pinned operand node to candidate physical landings; operand columns pinned (node + `authoritative_concept`, never display-concept discovery).
+2. **VERIFIED-only crossings** with **GovernedRealizationV2 endpoints** (§4). No all-governed path for a required operand → `UNVERIFIED_CROSSING_REQUIRED` / `REALIZATION_ENDPOINT_UNGOVERNED`.
+3. **Exact physical convergence.** Select **one** `PhysicalLandingV1` (catalog+table+**grain_key_refs**) every operand path reaches — convergence over the physical position (`_Position` extended to carry the landing grain keys). No common landing → `NO_COMMON_PHYSICAL_GRAIN`; tie after ranking → `AMBIGUOUS_PHYSICAL_GRAIN`. A derives each path's source→landing key mapping here.
+4. **Per-path aggregation correctness (pure).** Apply `path_strategy`; validate additivity for the concept + fan-in against the rule evaluators. Unsafe → `AGGREGATION_UNSAFE_ON_PATH`.
+5. **Per-path temporal correctness (pure).** Each path's PIT treatment individually valid; cross-path as-of-consistency at the landing. Incompatible → `TEMPORAL_PATHS_INCOMPATIBLE`.
+6. **Final join + expression.** Join per-path aggregated outputs on **all** landing `grain_key_refs`; apply `final_expression` (ordered slots preserved).
+7. **Preservation assertion.** Every original operand + `semantic_role` slot survives exactly once in the correct slot; final expression matches input. Deviation → `OPERAND_OR_SLOT_NOT_PRESERVED` (technical).
+8. **Compile-end union check (finding #6).** Per-path checks above are pure (no freshness); freshness is **one** compile-end consistency check over the **union** of catalogs, realizations, bridges, and structural fact evidence (independent per-path freshness could observe different graph states). Then `compile_multi_source_contract` (§6-below). Resolve requires: one landing all operands reach, per-path + final + union checks pass, `contract_result_status == resolved`, non-null contract plan id, steps 1–7 passed.
 
 ## 6. `compile_multi_source_contract` (new)
 
-The existing `compile_contract(conn, ctx, plan: BindingPlanV1, template: Template, *, base_envelope)` runs declaration checks over **one** shared path and one Template (`declarations.py`); connectivity/aggregation/freshness/fingerprints all assume a single path (`declarations.py:167`, `fingerprint.py:104`). A defines a sibling:
-
+The existing `compile_contract` takes **one** `BindingPlanV1`+`Template` over one shared path (`declarations.py`); connectivity/aggregation/freshness/fingerprints assume a single path (`declarations.py:167`, `:816`, `fingerprint.py:104`). A sibling:
 ```
 compile_multi_source_contract(conn, ctx, plan: MultiSourceBindingPlanV1, spec: MultiSourceContractSpecV1,
                               *, base_envelope) -> MultiSourceBindingPlanV1
 ```
-
-With: **identity material** (deterministic over landing + paths + strategies + final expression + versions); **per-path declaration checks** (connectivity, safety, aggregation, temporal, freshness per operand path, reusing the single-path checks per path); **final-combination checks** (the final expression is well-typed at the landing grain; output additivity coherent); an **audit envelope**; and a **replay hash**. Declarations are **injected** from `spec` (production `build_compiler_context` supplies an empty agg-declaration registry). A mutable shared `CompileBudget` persists across intents in a run.
+**Identity material** (deterministic over landing + paths + strategies + final expression + versions); **per-path declaration checks** reusing the single-path connectivity/safety/aggregation/temporal checks; **one union freshness/consistency check** (§5.8); **final-combination checks** (final expression well-typed at the landing; output additivity coherent); **audit envelope**; **replay hash**. Declarations **injected** from `spec` (production `build_compiler_context` supplies an empty agg-declaration registry). Shared mutable `CompileBudget` across intents.
 
 ## 7. Shadow harness + store (migration 1005)
 
-Driven by an **authored synthetic gold set** (no gate hook — A has no LLM input). Default-off flag `FEATUREGEN_MULTISOURCE_ASSEMBLY_SHADOW`. Store follows the `0999` capture-integrity pattern: run manifest + expected intent set + role/scope fingerprints written first; per-intent two-phase result writes in a savepoint (DB error → `TECHNICAL_FAILURE`); reconciliation; append-only; idempotent `(run_id, intent_id)`; diagnostic-code arrays; separate axes for **semantic outcome / compile completeness / technical status / capture (bounded/truncated) status** (finding #12 — `BUDGET_TRUNCATED` is capture-incomplete, not technical). Persist per intent: intent id + `normalized_intent_hash`; per-operand slot (role, pin, concept, path_strategy, per-path aggregation/temporal, VERIFIED crossings, structural-binding provenance); selected `physical_landing`; `MultiSourceBindingPlanV1` id + read-set hash; contract verdict + selected contract plan id; versions (planner, operation-policy, aggregation/additivity/temporal, concept-registry, compiler); outcome + reason codes. Identities/hashes/enums/provenance only — no free-form text.
+Authored synthetic gold (no gate hook). Flag `FEATUREGEN_MULTISOURCE_ASSEMBLY_SHADOW`. **Orchestration (finding #12):** a runnable entrypoint; gold fixtures are set up in a transaction, but results are **persisted on a connection outside the fixture rollback** (or committed to the shadow tables before fixture teardown) so reconciliation is meaningful after fixture rollback; the entrypoint's transaction boundary is explicit. Store follows the `0999` capture-integrity pattern: run manifest + expected intent set + role/scope fingerprints first; per-intent two-phase writes in a savepoint; reconciliation; append-only; idempotent `(run_id, intent_id)`; **separate axes**: semantic outcome / compile completeness / technical status / capture (bounded/truncated) status. Persist per intent: intent id + `normalized_intent_hash`; per-operand slot (role, pin, concept, path_strategy, per-path aggregation/temporal, VERIFIED crossings, GovernedRealizationV2 endpoint fact ids, source_binding provenance, A-derived landing mapping); selected `physical_landing` (incl grain_key_refs); `MultiSourcePlanningResultV1` selected id + candidate ids + bounds + read-set hash; contract verdict; versions; outcome + reason codes. Identities/hashes/enums/provenance only.
 
 ## 8. Multi-path enumeration + ranking (finding #8)
 
-The current frontier search (`assembly.py:375`) handles one source path and stops at the first completing bridge tier. A needs: **bounded per-operand path enumeration** (cap per operand); **bounded path-combination search** across operands (cap the cartesian frontier); **exact convergence filtering** (retain only landings every operand reaches); **deterministic ranking** (authority rank → fewest crossings → stable identity order — reusing `_AUTHORITY_RANK`); **explicit ambiguity handling** (`AMBIGUOUS_PHYSICAL_GRAIN` when top-ranked landings tie); and **whole-plan limits** (total states/crossings). Every truncation is recorded and excludes the intent from identity comparisons.
+The current frontier (`assembly.py:375`) handles one source path and stops at the first completing bridge tier. A needs: **bounded per-operand enumeration**; **bounded path-combination search** across operands; **exact convergence filtering** (retain only landings every operand reaches, matching **grain_key_refs**); **deterministic ranking** (`_AUTHORITY_RANK` → fewest crossings → stable identity order); **explicit ambiguity** (`AMBIGUOUS_PHYSICAL_GRAIN` on ties); **whole-plan limits** (total states/crossings), recorded on `MultiSourceBoundingMetricsV1` and excluding truncated intents from identity comparisons.
 
 ## 9. Dispositions
 
-**Resolve:** all steps pass. **Rejections (semantic):** `OPERAND_SHAPE_INVALID`, `UNVERIFIED_CROSSING_REQUIRED`, `NO_COMMON_PHYSICAL_GRAIN`, `AMBIGUOUS_PHYSICAL_GRAIN`, `AGGREGATION_UNSAFE_ON_PATH`, `TEMPORAL_PATHS_INCOMPATIBLE`, `STRUCTURAL_BINDING_UNGOVERNED`. **Technical:** `OPERAND_OR_SLOT_NOT_PRESERVED`, `TECHNICAL_FAILURE`. **Capture-incomplete:** `BUDGET_TRUNCATED`.
+**Resolve:** all steps pass. **Semantic rejects:** `OPERAND_SHAPE_INVALID`, `UNVERIFIED_CROSSING_REQUIRED`, `REALIZATION_ENDPOINT_UNGOVERNED`, `NO_COMMON_PHYSICAL_GRAIN`, `AMBIGUOUS_PHYSICAL_GRAIN`, `AGGREGATION_UNSAFE_ON_PATH`, `TEMPORAL_PATHS_INCOMPATIBLE`, `SOURCE_BINDING_UNGOVERNED`. **Technical:** `OPERAND_OR_SLOT_NOT_PRESERVED`, `TECHNICAL_FAILURE`. **Capture-incomplete:** `BUDGET_TRUNCATED`.
 
-## 10. Assembly gate (exact-outcome gold)
+## 10. Gold set + gate (partitioned — finding #11, #7)
 
-Each gold case has an **immutable expected outcome** (finding #7). **Positive cases MUST resolve** with the exact expected `physical_landing`, operand paths, slots, `path_strategy` per slot, and `final_expression` — a reject-everything implementation fails. Negative cases must reject with the exact expected code. Then over the window:
-1. **Zero operand substitution or loss** (incl. ordered slots).
-2. **Zero unverified crossings** in any resolve.
-3. **Every resolve lands all operands at one exact physical grain.**
-4. **Correct per-path aggregation + temporal treatment** vs the evaluators.
-5. **Deterministic plan + contract identity** (same intent → identical `plan_id`/`normalized_intent_hash`/`contract_id`).
-6. **Complete manifest reconciliation.**
-7. **No unresolved truncation or technical failures** in the gated population.
+**Two partitions.** (a) **Correctness gold** — each case an immutable expected outcome; **positive cases MUST resolve** with the exact expected `physical_landing` (incl grain_key_refs), operand paths, per-slot `path_strategy`, and `final_expression`; negative cases reject with the exact code. (b) **Fault-observability controls** — injected DB error / budget truncation; they **pass when exactly classified** (`TECHNICAL_FAILURE`/`BUDGET_TRUNCATED`) and are **excluded from the clean operational population**.
 
-Resolution *rate* is descriptive; positive gold coverage is mandatory.
+**Gate** over the correctness population: positive coverage mandatory (reject-all fails); zero operand substitution/loss (incl. ordered slots); zero unverified crossings / ungoverned endpoints in a resolve; every resolve lands all operands at one exact physical grain; correct per-path aggregation + temporal; deterministic plan/contract identity; complete manifest reconciliation; **no technical failures or unresolved truncation in the clean population**. Define the **minimum distinct authoritative plan shapes** the correctness population must cover. Resolution rate descriptive.
 
-## 11. Gold set (must include)
+## 11. Gold cases (must include)
 
-**Positive (must resolve, exact expected plan):** single-measure roll-up across a VERIFIED bridge; `AVG(x)/latest(y)` `RATIO` with authored numerator/denominator (proves per-path strategy + ordered-role preservation); a `DIFFERENCE`; a `TREND`. **Negative (exact code):** operand reachable only via an **unverified** crossing (`UNVERIFIED_CROSSING_REQUIRED`); operands with **no common physical landing** (`NO_COMMON_PHYSICAL_GRAIN`); tied landings (`AMBIGUOUS_PHYSICAL_GRAIN`); non-additive measure across a fan-out (`AGGREGATION_UNSAFE_ON_PATH`); temporally incompatible paths; an operand with an ungoverned structural binding (`STRUCTURAL_BINDING_UNGOVERNED`); a crafted intent whose operand shares a concept with a different column (pin bypass — wrong column must never substitute). **Technical/capture:** injected DB error mid-run (isolated `TECHNICAL_FAILURE`, reconciliation intact); budget-truncated run (excluded from identity comparisons).
+**Correctness — positive:** single-measure roll-up over a VERIFIED bridge; `AVG(x)/latest(y)` `RATIO` (per-path strategy + ordered-role preservation); a `DIFFERENCE`; a `TREND`; a **multi-column-grain landing** (composite `grain_key_refs`, join on all keys); a `COUNT_DISTINCT`. **Correctness — negative:** unverified crossing; realization endpoint with no governed grain/key fact; no common physical landing; tied landings; non-additive-over-fan-out; temporally incompatible paths; ungoverned source binding; concept-collision pin-bypass (wrong column must never substitute). **Fault controls (separate partition):** injected DB error (`TECHNICAL_FAILURE`, reconciliation intact); budget-truncated run.
 
 ## 12. Behaviour-neutrality
 
-Flag off → no new path runs; single-source `plan_bindings`/`enumerate_single_catalog_plans`/`_assemble_rollups`/`compile_contract` byte-identical to `origin/main` (golden test). `MultiSourceBindingPlanV1`/`compile_multi_source_contract` are additive; nothing surfaces.
+Flag off → no new path; single-source `plan_bindings`/`enumerate_single_catalog_plans`/`_assemble_rollups`/`compile_contract` byte-identical (golden test). New carriers/compiler are additive; nothing surfaces.
 
 ## 13. Reused surfaces
 
-`discover_ingredient_candidates` (pinned candidate construction); the frontier `_State`/`_Position`/`_AUTHORITY_RANK` (extended for multi-operand convergence); the additivity/aggregation/temporal rule evaluators; governed crossing (`approved_join` VERIFIED) + realization reads; `build_compiler_context` pattern + the single-path declaration checks (per-path reuse); the `CompileBudget` bound pattern; the `0999`/`shadow_store.py` manifest+reconciliation two-phase write pattern.
+`discover_ingredient_candidates` (pinned construction); the frontier `_State`/`_Position`/`_AUTHORITY_RANK` (extended for multi-operand convergence + grain keys); additivity/aggregation/temporal evaluators; VERIFIED `approved_join` + a revalidated `GovernedRealizationV2` over grain/key fact events; `build_compiler_context` pattern + the single-path checks (per-path reuse) + a union freshness check; `BindingPlanningResultV1` shape (mirrored); `CompileBudget`; the `0999`/`shadow_store.py` manifest+reconciliation pattern.
