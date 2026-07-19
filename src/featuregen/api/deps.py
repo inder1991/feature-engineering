@@ -116,6 +116,33 @@ def get_conn() -> Iterator[psycopg.Connection]:
         conn.close()
 
 
+def get_feature_gen_conn() -> Iterator[psycopg.Connection]:
+    """Like :func:`get_conn` (one connection + transaction per request, commit on success / rollback on
+    error / close in finally, 503 when no DSN) but the feature-generation workflow reads committed catalog
+    state under ``REPEATABLE READ`` so the C0 metadata snapshot is torn-free — every read in the request
+    transaction sees ONE consistent catalog view.
+
+    The fresh connection is pinned to ``REPEATABLE READ`` BEFORE any query is issued, so the isolation
+    boundary is established before the handler's first SQL (in psycopg3 the level applies at the next
+    transaction start, which is that first statement). A read that somehow precedes the boundary, or a
+    mid-transaction isolation change, must surface as a SERVER error (psycopg raises), never silently
+    degrade to ``READ COMMITTED``. Routes depend on this with ``scope="function"`` so the commit runs
+    before the response is sent. Tests override this."""
+    dsn = get_settings().dsn
+    if not dsn:
+        raise HTTPException(status_code=503, detail="FEATUREGEN_DSN is not configured")
+    conn = psycopg.connect(dsn)
+    conn.isolation_level = psycopg.IsolationLevel.REPEATABLE_READ  # applies at the next tx start
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 def get_identity(
     request: Request,
     conn: Annotated[psycopg.Connection, Depends(get_conn, scope="function")],

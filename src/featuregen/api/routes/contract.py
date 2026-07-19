@@ -19,6 +19,7 @@ from pydantic import BaseModel, Field
 
 from featuregen.api.deps import (
     get_conn,
+    get_feature_gen_conn,
     get_identity,
     get_llm,
     require_feature_generate,
@@ -110,6 +111,10 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 _Conn = Annotated[psycopg.Connection, Depends(get_conn, scope="function")]
+# Delivery C0: the feature-generation writes read the catalog under REPEATABLE READ so the C0 metadata
+# snapshot (built in C0-T3) sees one torn-free view. The read-only /contracts list/detail routes stay on
+# _Conn — they are not feature-generation writes and take no snapshot.
+_FeatureGenConn = Annotated[psycopg.Connection, Depends(get_feature_gen_conn, scope="function")]
 _Identity = Annotated[IdentityEnvelope, Depends(get_identity)]
 _LLM = Annotated[LLMClient, Depends(get_llm)]
 
@@ -312,7 +317,7 @@ def _ranking_json(r: RankedRecipe) -> dict:
             "initial_view_reasons": [c.value for c in r.initial_view_reasons]}
 
 
-def _scoped_considered_set(body: ConsideredSetIn, conn: _Conn, identity: _Identity,
+def _scoped_considered_set(body: ConsideredSetIn, conn: _FeatureGenConn, identity: _Identity,
                            client: _LLM) -> dict:
     """Phase-1B (Task 7) — the confirmed-scope path. Validates the confirmed scope, MINTS the generation
     run, PERSISTS the confirmed scope in the API layer BEFORE the builder (the canonical run→scope
@@ -470,7 +475,8 @@ def _scoped_considered_set(body: ConsideredSetIn, conn: _Conn, identity: _Identi
 
 
 @router.post("/contract/considered-set", dependencies=[Depends(require_feature_generate)])
-def considered_set(body: ConsideredSetIn, conn: _Conn, identity: _Identity, client: _LLM) -> dict:
+def considered_set(body: ConsideredSetIn, conn: _FeatureGenConn, identity: _Identity,
+                   client: _LLM) -> dict:
     """Intake (mandatory hypothesis + optional definition, redacted) → the validated considered set:
     the anchor (from the definition) + generated alternatives + an advisory recommendation. Persists
     the intent. Every option shown has passed the gauntlet.
@@ -506,7 +512,8 @@ def considered_set(body: ConsideredSetIn, conn: _Conn, identity: _Identity, clie
 
 
 @router.post("/contract/recognitions", dependencies=[Depends(require_feature_generate)])
-def recognitions(body: RecognitionIn, conn: _Conn, identity: _Identity, client: _LLM) -> dict:
+def recognitions(body: RecognitionIn, conn: _FeatureGenConn, identity: _Identity,
+                 client: _LLM) -> dict:
     """Phase-1B Gate #1 recognition: classify the objective's governed use-case scope from the
     REDACTED hypothesis/goal (recognition NEVER sees catalog columns) and persist an append-only
     recognition attempt — BEFORE any generation run exists. Decoupled from generation: no
@@ -558,7 +565,7 @@ def recognitions(body: RecognitionIn, conn: _Conn, identity: _Identity, client: 
 
 
 @router.post("/contract/draft", dependencies=[Depends(require_feature_generate)])
-def draft(body: DraftReqIn, conn: _Conn, identity: _Identity, client: _LLM) -> dict:
+def draft(body: DraftReqIn, conn: _FeatureGenConn, identity: _Identity, client: _LLM) -> dict:
     """Gate #1 → author. The chosen feature is reconstructed from the SERVER-persisted considered set
     (BLOCKER 1 — never an arbitrary client payload); the choice is recorded (audit); the leakage target
     is read SERVER-side (BLOCKER 2). Then draft + the critique→refine loop (MCV each pass)."""
@@ -601,7 +608,7 @@ def get_governed_contract(contract_id: str, conn: _Conn, identity: _Identity) ->
 
 
 @router.post("/contract/confirm", dependencies=[Depends(require_feature_generate)])
-def confirm(body: DraftIn, conn: _Conn, identity: _Identity) -> Contract:
+def confirm(body: DraftIn, conn: _FeatureGenConn, identity: _Identity) -> Contract:
     """The human gate — the GOVERNING write. Server-stateful, no client trust (closes the two BLOCKERs
     at the write, not just at /draft):
       * intent_id is REQUIRED; a missing/forged one is rejected (no fall back to a client target_ref);

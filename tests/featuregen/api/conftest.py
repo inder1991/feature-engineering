@@ -4,7 +4,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from featuregen.api.app import create_app
-from featuregen.api.deps import get_conn
+from featuregen.api.deps import get_conn, get_feature_gen_conn
 
 
 @pytest.fixture(autouse=True)
@@ -19,7 +19,10 @@ def make_client(conn):
     """Build a TestClient whose requests run on the suite's rolled-back connection.
 
     The get_conn override yields the shared test conn WITHOUT commit/close — the root `conn`
-    fixture rolls everything back on teardown, keeping API tests isolated like all others."""
+    fixture rolls everything back on teardown, keeping API tests isolated like all others. The
+    feature-gen conn (REPEATABLE READ in prod, Delivery C0) is overridden to the SAME shared conn so the
+    contract feature-gen routes stay on the rolled-back test transaction; its production isolation is
+    covered directly in test_feature_gen_isolation.py."""
     with ExitStack() as stack:
 
         def _make(llm_client=None):
@@ -29,6 +32,7 @@ def make_client(conn):
                 yield conn
 
             app.dependency_overrides[get_conn] = _test_conn
+            app.dependency_overrides[get_feature_gen_conn] = _test_conn
             return stack.enter_context(TestClient(app))
 
         yield _make
