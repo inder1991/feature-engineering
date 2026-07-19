@@ -1,0 +1,29 @@
+-- src/featuregen/db/migrations/1010_asset_detail_indexes.sql
+-- Delivery F0 Task 3 — the read-model index for the F0-T2 asset-detail HISTORY section.
+--
+-- asset_detail._history_section runs the reverse ingestion_run_object lookup "which runs
+-- observed/changed this ref, newest-first":
+--
+--     SELECT o.ingestion_run_id, o.relation, o.at, ...
+--       FROM ingestion_run_object o JOIN ingestion_run r ON r.id = o.ingestion_run_id
+--      WHERE o.catalog_source = %s AND lower(o.object_ref) = lower(%s)
+--   ORDER BY o.at DESC, o.ingestion_run_id
+--
+-- The existing 0998 index ingestion_run_object_ref_idx is on the RAW column (object_ref) only, so
+-- it cannot serve this predicate on TWO counts: the filter is case-folded (lower(object_ref)), and
+-- it does not lead with catalog_source or carry the at-ordering. A B-tree on the raw column cannot
+-- satisfy an equality on lower(object_ref) — that requires an index on the EXPRESSION. This composite
+-- gives the planner (catalog_source, lower(object_ref)) equality lookup returning rows already in
+-- at DESC order (the newest-first history), removing both the seq scan and the sort for this path.
+--   NOTE the deliberate deviation from the plan's literal (catalog_source, object_ref, at DESC):
+--   the middle key is lower(object_ref), matching the query's case-insensitive predicate — a raw
+--   object_ref key would not be used by the planner for lower(object_ref) = lower(%s).
+--
+-- The other asset-detail sections are ALREADY covered and get NO new (redundant) index here:
+--   * evidence/decision reads key on logical_ref -> served by 0983 field_evidence_object_idx
+--     (logical_ref, field_name, lifecycle) and 0981 field_decision_event_object_idx
+--     (logical_ref, field_name, created_at); the "latest decision" ORDER BY created_at DESC LIMIT 1
+--     is a backward scan of 0981.
+-- Idempotent (IF NOT EXISTS) so a re-apply is a no-op.
+CREATE INDEX IF NOT EXISTS ingestion_run_object_source_ref_at_idx
+    ON ingestion_run_object (catalog_source, lower(object_ref), at DESC);
