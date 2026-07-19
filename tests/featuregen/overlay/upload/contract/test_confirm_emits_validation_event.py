@@ -18,6 +18,7 @@ from featuregen.overlay.upload.contract.govern import (
 )
 from featuregen.overlay.upload.feature_validation_projection import catch_up, read_state
 from featuregen.overlay.upload.graph import build_graph
+from featuregen.overlay.upload.validation_requirements import schema_for
 
 
 def _bank_nev(db):
@@ -117,6 +118,44 @@ def test_confirm_emits_assessed_design_checked_no_requirements(db):
     # 1003 INITIAL stamp preserved.
     assert db.execute("SELECT validation_status FROM contract WHERE contract_id = %s",
                       (c.contract_id,)).fetchone()[0] == "DESIGN_CHECKED"
+
+
+# --------------------------------------------------------------------------------------------------
+# 2b — C2-C3 review (I-1 a/b/c): the persisted requirement row carries the REGISTRY-typed params at the
+#      registry schema version, with registry-driven blocking — not a lossy stand-in.
+# --------------------------------------------------------------------------------------------------
+def _additivity(db):
+    """A `sum` over an operationally-numeric measure whose additivity is NOT governed-confirmed → the
+    confirm-time MCV mints ADDITIVITY_SUPPORTS_OPERATION carrying the typed `operation` param."""
+    build_graph(db, "ledger", [CanonicalRow("ledger", "postings", "amount", "numeric")])
+
+
+def _additivity_draft():
+    return ContractDraft(
+        "total_amount", "Total posted amount.", None, "sum", None,
+        ["public.postings.amount"], derives_pairs=(("ledger", "public.postings.amount"),))
+
+
+def test_confirm_persists_typed_params_at_registry_version_with_registry_blocking(db):
+    _additivity(db)
+    c = confirm_contract(db, _additivity_draft(), actor="ds1")
+    row = db.execute(
+        "SELECT requirement_schema_version, params_json, blocking FROM "
+        "feature_validation_requirement WHERE contract_id = %s AND code = %s",
+        (c.contract_id, "ADDITIVITY_SUPPORTS_OPERATION")).fetchone()
+    assert row is not None                                          # the ADDITIVITY row was persisted
+
+    # (a) the persisted version is the REGISTRY's own "v1" — schema_for MUST resolve it (the old
+    #     "req-schema-v1" namespace could not be resolved by the registry).
+    assert row[0] == "v1"
+    schema_for("ADDITIVITY_SUPPORTS_OPERATION", row[0])            # resolves, does not raise
+
+    # (b) the TYPED operation param survives into params_json (was dropped into a {"detail": ...} blob).
+    assert row[1]["params"] == {"operation": "sum"}
+    assert "detail" in row[1]                                       # detail kept alongside the params
+
+    # (c) blocking reflects the registry schema, not a hardcoded literal.
+    assert row[2] == schema_for("ADDITIVITY_SUPPORTS_OPERATION").blocking
 
 
 # --------------------------------------------------------------------------------------------------

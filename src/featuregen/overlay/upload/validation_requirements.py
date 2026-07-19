@@ -20,6 +20,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from types import MappingProxyType
 
 from featuregen.overlay.upload.feature_assist import REQUIREMENT_CODES, Requirement
 
@@ -53,6 +54,15 @@ class ValidationRequirementSchema:
     unit: str | None = None
     blocking: bool = True
     optional_params: frozenset[str] = frozenset()
+
+    def __post_init__(self) -> None:
+        # M-1: freeze the schema mappings. `frozen=True` only blocks attribute REBINDING — it does not
+        # stop a caller writing THROUGH a shared dict (`schema_for(code).params_schema["x"] = int`),
+        # which would silently rewrite validation for every subsequent build_requirement. Wrapping in
+        # MappingProxyType makes the returned mapping read-only, so the registry stays DETERMINISTIC and
+        # CLOSED as documented. (`optional_params` is already an immutable frozenset.)
+        object.__setattr__(self, "params_schema", MappingProxyType(dict(self.params_schema)))
+        object.__setattr__(self, "result_schema", MappingProxyType(dict(self.result_schema)))
 
 
 # ── The registry — DETERMINISTIC + CLOSED. Exactly the 8 codes in REQUIREMENT_CODES, all v1. Each
@@ -134,9 +144,11 @@ REQUIREMENT_SCHEMA_REGISTRY: dict[str, ValidationRequirementSchema] = {
 }
 
 # Guard the closed vocabulary at import time: the registry MUST cover exactly the 8 codes and no more.
-assert set(REQUIREMENT_SCHEMA_REGISTRY) == set(REQUIREMENT_CODES), (
-    "validation-requirement registry must cover exactly REQUIREMENT_CODES"
-)
+# M-3: an explicit raise, NOT a bare `assert` — `python -O` strips asserts, which would let a registry/
+# vocabulary drift fail OPEN (surfacing only as an UnknownRequirement crash at the first mint). The
+# integrity guard must hold even under optimized bytecode, so it fails LOUD at import.
+if set(REQUIREMENT_SCHEMA_REGISTRY) != set(REQUIREMENT_CODES):
+    raise RuntimeError("validation-requirement registry must cover exactly REQUIREMENT_CODES")
 
 
 def schema_for(code: str, schema_version: str = DEFAULT_SCHEMA_VERSION) -> ValidationRequirementSchema:
@@ -188,7 +200,20 @@ def _validate_params(
                 f"requirement {schema.code!r} param {name!r} must be {expected_type.__name__}, "
                 f"got bool"
             )
-    return tuple(sorted(params.items()))
+    param_tuple = tuple(sorted(params.items()))
+    # M-2: a bare `tuple` type-check admits a tuple carrying NESTED unhashable members (e.g. a list
+    # inside a `currency_ref` tuple). That would make the resulting Requirement unhashable and blow up
+    # only at a distant set/dict-key use site, not here. Probe hashability NOW so build_requirement can
+    # NEVER return an unhashable value object — an unhashable param is a RequirementValidationError,
+    # like any other schema violation. (Sorting above only compares the unique keys, never the values,
+    # so it does not itself require hashable values.)
+    try:
+        hash(param_tuple)
+    except TypeError as exc:
+        raise RequirementValidationError(
+            f"requirement {schema.code!r} has an unhashable param value: {exc}"
+        ) from exc
+    return param_tuple
 
 
 def build_requirement(

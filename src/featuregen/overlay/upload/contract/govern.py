@@ -30,11 +30,15 @@ from featuregen.overlay.upload.features import (
     get_feature,
     register_feature,
 )
+from featuregen.overlay.upload.validation_requirements import DEFAULT_SCHEMA_VERSION, schema_for
 
-# Delivery C4-T3: the immutable-requirement schema version stamped on every persisted
-# `feature_validation_requirement` row. A re-assessment against a NEW schema version yields NEW rows
-# (the 1009 UNIQUE key includes it), never a mutation of an existing row.
-REQUIREMENT_SCHEMA_VERSION = "req-schema-v1"
+# Delivery C4-T3 / C2-C3 review (I-1a): the immutable-requirement schema version stamped on each
+# persisted `feature_validation_requirement` row is the REGISTRY's OWN version. Each row now stamps the
+# requirement's OWN `schema_version` (the registry "v1"), so a downstream `schema_for(code, version)`
+# RESOLVES — the previous separate "req-schema-v1" namespace could not be resolved by the registry. This
+# constant is the unified registry default, kept as the shared reference (e.g. the pre-C0 fingerprint).
+# A re-assessment against a NEW schema version yields NEW rows (the 1009 UNIQUE key includes it).
+REQUIREMENT_SCHEMA_VERSION = DEFAULT_SCHEMA_VERSION
 
 
 class ContractValidationError(Exception):
@@ -164,16 +168,26 @@ def _seed_validation_lifecycle(conn, contract_id, check, pairs, snapshot_content
     for req in check.requirements:
         operand = [req.operand[0], req.operand[1]]
         content_hash = canonical_hash({"code": req.code, "operand": operand, "detail": req.detail})
-        # All deterministic external requirements are BLOCKING by default (the closed vocabulary is
-        # what a DATA-CHECKED promotion depends on). Write-once + identity-keyed (1009).
+        # C2-C3 review (I-1): persist the requirement's REGISTRY-typed shape, not a lossy stand-in. The
+        # requirements come from the confirm-time MCV re-mint (build_requirement), so they are always
+        # registry-valid; schema_for resolves.
+        #   (a) requirement_schema_version = the requirement's OWN schema_version (the registry "v1"),
+        #       so a downstream schema_for(code, version) RESOLVES (the old "req-schema-v1" could not);
+        #   (b) params_json carries the TYPED params (e.g. ADDITIVITY's {"operation": ...}) the external
+        #       check (Delivery I) reads — kept alongside `detail`, which used to be all this column held;
+        #   (c) blocking is the REGISTRY schema's blocking flag, not a hardcoded True.
+        # Write-once + identity-keyed (1009).
+        schema = schema_for(req.code, req.schema_version)
         conn.execute(
             "INSERT INTO feature_validation_requirement (requirement_id, contract_id, "
             "requirement_schema_version, metadata_input_fingerprint, code, subject_json, "
             "params_json, blocking, content_hash) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) "
             "ON CONFLICT (contract_id, requirement_schema_version, metadata_input_fingerprint, "
             "content_hash) DO NOTHING",
-            (mint_id("req"), contract_id, REQUIREMENT_SCHEMA_VERSION, fingerprint, req.code,
-             Jsonb({"operand": operand}), Jsonb({"detail": req.detail}), True, content_hash))
+            (mint_id("req"), contract_id, req.schema_version, fingerprint, req.code,
+             Jsonb({"operand": operand}),
+             Jsonb({"params": dict(req.params), "detail": req.detail}),
+             schema.blocking, content_hash))
     # MF-4: a re-confirm mints a NEW contract_id for this feature; the PRIOR latest version is now
     # dead. Emit SUPERSEDED for it in THIS transaction, BEFORE the new version's ASSESSED, so the
     # fold demotes the retired version's live stamp AND marks it terminally superseded — a late

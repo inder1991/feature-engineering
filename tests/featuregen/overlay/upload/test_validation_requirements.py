@@ -53,6 +53,22 @@ def test_schema_is_frozen():
         schema.code = "OTHER"  # type: ignore[misc]
 
 
+def test_schema_mappings_are_immutable_and_do_not_leak_across_lookups():
+    # M-1: a caller mutating a returned schema's mapping must NOT corrupt the global registry for every
+    # subsequent validation. The mappings are read-only (MappingProxyType), so a write RAISES, and a
+    # later lookup sees the pristine schema — never a stray injected/removed param.
+    schema = schema_for("TYPE_IS_NUMERIC")
+    with pytest.raises(TypeError):
+        schema.params_schema["sneaky"] = int  # type: ignore[index]
+    with pytest.raises(TypeError):
+        schema.result_schema["sneaky"] = int  # type: ignore[index]
+    # a fresh lookup is unaffected — no injected param leaked into the registry
+    assert schema_for("TYPE_IS_NUMERIC").params_schema == {}
+    assert schema_for("TYPE_IS_NUMERIC").result_schema == {"is_numeric": bool}
+    # the mutation would otherwise have broken build_requirement globally — it still mints cleanly
+    assert build_requirement(code="TYPE_IS_NUMERIC", operand=("bank", "public.t.c")).params == ()
+
+
 def test_lag_bounded_schema_has_params_result_and_unit():
     schema = schema_for("TEMPORAL_LAG_BOUNDED")
     assert schema.params_schema == {"max_lag": int, "unit": str}
@@ -192,6 +208,19 @@ def test_build_currency_consistent_wrong_type_ref_still_rejected():
             code="CURRENCY_CONSISTENT",
             operand=("bank", "public.t.amount"),
             params={"currency_ref": "not-a-tuple"},
+        )
+
+
+def test_build_rejects_unhashable_nested_param_value():
+    # M-2: `currency_ref` is typed `tuple`, so a tuple with a NESTED unhashable member (a list) passes
+    # the isinstance(tuple) check — yet the resulting Requirement would be unhashable and blow up only
+    # at a distant set/dict-key use site. build_requirement must reject it up front, never return a
+    # broken (unhashable) value object.
+    with pytest.raises(RequirementValidationError):
+        build_requirement(
+            code="CURRENCY_CONSISTENT",
+            operand=("bank", "public.t.amount"),
+            params={"currency_ref": (["cat"], "ref")},
         )
 
 
