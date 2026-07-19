@@ -11,6 +11,7 @@ proposals only.
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -81,6 +82,7 @@ class RejectCode:
     ALREADY_REGISTERED = "ALREADY_REGISTERED"   # duplicates a confirmed/registered feature (item 2)
     CRITIC = "CRITIC"                       # LLM-2 critic flagged a quality/fit issue (item 5)
     NO_REVISION = "NO_REVISION"             # refine_idea: the model produced no revision to validate
+    CONTEXT_TOO_LARGE = "CONTEXT_TOO_LARGE"
 
 
 @dataclass(frozen=True, slots=True)
@@ -244,6 +246,116 @@ def _table_context(cols: list[dict]) -> list[dict]:
             block["primary_entity"] = pentity
         blocks.append(block)
     return blocks
+
+
+# One hard byte budget on the assembled feature-context batch (spec §6). Referenced at call time so
+# tests can monkeypatch it; select_relevant_context reads this module global when byte_budget is None.
+FEATURE_CONTEXT_BYTE_BUDGET = 60_000
+
+_TOKEN_RE = re.compile(r"[a-z0-9]+")
+
+
+class ContextTooLarge(Exception):
+    """The mandatory feature-context set alone exceeds the single-call byte budget — surfaced as
+    RejectCode.CONTEXT_TOO_LARGE. We do NOT chunk: one audited_structured_call is one audited
+    llm_call, so chunking would need N calls + cross-chunk dedup and defeat the single fail-open
+    audit; relevance ordering already floats the highest-relevance items into the one bounded call
+    ([F13])."""
+
+
+def _tokenize(text: str | None) -> set[str]:
+    return set(_TOKEN_RE.findall((text or "").lower()))
+
+
+def _objective_tokens(objective: str | None, entity: str | None, scope) -> set[str]:
+    """The objective token set, by source priority (spec §6): the GOVERNED confirmed scope (leaf ids
+    + target_entity + modelling_contexts) when present and not unscoped; else the DIRECT-ASSIST
+    objective free-text + explicit entity; else the LEXICAL objective alone. NO LLM call."""
+    if scope is not None and not scope.unscoped:
+        toks: set[str] = set()
+        for uid in ([scope.primary] if scope.primary else []) + list(scope.secondary):
+            toks |= _tokenize(uid)
+        toks |= _tokenize(scope.target_entity)
+        for mc in scope.modelling_contexts:
+            toks |= _tokenize(mc)
+        return toks
+    return _tokenize(objective) | _tokenize(entity)
+
+
+def _objective_entity(entity: str | None, scope) -> str | None:
+    """The entity used for the mandatory entity-match: the confirmed target_entity (governed) else
+    the explicit assist entity."""
+    if scope is not None and not scope.unscoped and scope.target_entity:
+        return scope.target_entity
+    return entity
+
+
+def _column_tokens(col: dict) -> set[str]:
+    toks: set[str] = set()
+    for k in ("object_ref", "table", "column", "concept", "domain", "semantic_terms", "entity"):
+        v = col.get(k)
+        if isinstance(v, str):
+            toks |= _tokenize(v)
+    return toks
+
+
+def _is_mandatory(col: dict, objective_entity: str | None) -> bool:
+    """Always-included: a confirmed grain column, the confirmed as-of column, or a column whose
+    entity matches the objective entity (spec §6)."""
+    if col["is_grain"] and col["grain_fact_event_id"]:
+        return True
+    if col["is_as_of"] and col["availability_fact_event_id"]:
+        return True
+    ent = col.get("entity")
+    return (objective_entity is not None and isinstance(ent, str)
+            and ent.lower() == objective_entity.lower())
+
+
+def _assembled_bytes(columns: list[dict], table_context: list[dict]) -> int:
+    return len(json.dumps({"columns": columns, "table_context": table_context},
+                          sort_keys=True, default=str).encode("utf-8"))
+
+
+def select_relevant_context(conn, cols: list[dict], *, objective: str | None,
+                            entity: str | None, scope=None,
+                            byte_budget: int | None = None) -> tuple[list[dict], list[dict], int]:
+    """Deterministic relevance selection ([F13], spec §6). Returns
+    (selected_enriched_columns, table_context, dropped_count). Mandatory columns (confirmed grain,
+    as-of, entity-match) are ALWAYS included; the rest are added by descending shared-token score,
+    stable (-score, object_ref asc), until the ONE hard byte budget on the assembled batch is
+    reached. Raises ContextTooLarge when the mandatory set alone exceeds the budget (do NOT chunk).
+    Logs the dropped count."""
+    if byte_budget is None:
+        byte_budget = FEATURE_CONTEXT_BYTE_BUDGET
+    obj_tokens = _objective_tokens(objective, entity, scope)
+    obj_entity = _objective_entity(entity, scope)
+    enriched_by_ref = {(c["catalog_source"], c["object_ref"]): _enriched_column(conn, c)
+                       for c in cols}
+
+    def _enriched(rows: list[dict]) -> list[dict]:
+        return [enriched_by_ref[(c["catalog_source"], c["object_ref"])] for c in rows]
+
+    mandatory = [c for c in cols if _is_mandatory(c, obj_entity)]
+    optional = [c for c in cols if not _is_mandatory(c, obj_entity)]
+    scored = sorted(optional,
+                    key=lambda c: (-len(_column_tokens(c) & obj_tokens), c["object_ref"]))
+
+    selected = list(mandatory)
+    if _assembled_bytes(_enriched(selected), _table_context(selected)) > byte_budget:
+        raise ContextTooLarge(
+            f"mandatory feature context ({len(mandatory)} columns) exceeds byte budget "
+            f"{byte_budget}; not chunking")
+    dropped = 0
+    for i, c in enumerate(scored):
+        trial = selected + [c]
+        if _assembled_bytes(_enriched(trial), _table_context(trial)) > byte_budget:
+            dropped = len(scored) - i
+            break
+        selected = trial
+    if dropped:
+        logger.info("feature-context relevance dropped %d of %d optional columns (byte budget %d)",
+                    dropped, len(optional), byte_budget)
+    return _enriched(selected), _table_context(selected), dropped
 
 
 @dataclass(frozen=True, slots=True)
