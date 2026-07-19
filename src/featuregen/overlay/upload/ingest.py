@@ -39,7 +39,12 @@ from featuregen.overlay.upload.enrich import (
     suppressed_definition_hashes,
 )
 from featuregen.overlay.upload.enrich_llm import consume_audit_degradations
-from featuregen.overlay.upload.field_resolution import FIELD_POLICY_VERSION, resolve_and_project
+from featuregen.overlay.upload.field_resolution import (
+    FIELD_POLICY_VERSION,
+    is_feature_eligible,
+    resolve_and_project,
+    stale_and_clear_field,
+)
 from featuregen.overlay.upload.field_revalidation import flag_pending_revalidation
 from featuregen.overlay.upload.glossary_reader import GlossaryRecord, GlossaryUpload, join_path
 from featuregen.overlay.upload.graph import (
@@ -806,6 +811,31 @@ def _write_technical_source_evidence(
     return material_changed
 
 
+def _retire_dropped_technical_decisions(conn, *, source: str, logical_ref: str,
+                                        now: datetime | None) -> None:
+    """Retire the DECISION of a technical field the new upload DROPPED (Delivery B closing gate).
+
+    ``_stale_absent_fields`` stales the dropped field's EVIDENCE, and ``build_graph`` recreates the
+    flat display columns from the new rows — but ``resolve_and_project`` iterates only fields with
+    ACTIVE evidence, so the field's PRIOR load-bearing decision stayed the latest and
+    ``is_feature_eligible`` kept serving the dropped value (a stale load-bearing value).
+    :func:`overlay.upload.field_resolution.stale_and_clear_field` is the documented lifecycle step
+    for exactly this (Pass B uses it for dropped advisory table facts): it records a STALED decision
+    superseding the prior one and clears/repoints the display link. Guarded to fields that (a) have
+    NO active evidence from ANY producer — an active HUMAN row keeps the field resolvable, and the
+    pending-revalidation DISQUALIFIER (not a stale) is what blocks it — and (b) still confer a
+    load-bearing value, so never-declared fields (and already-retired ones) write no spurious STALED
+    decisions. Must run BEFORE the round's ``resolve_and_project`` (same request tx), which then
+    skips the evidence-less field and cannot re-project the cleared value."""
+    for field_name in _TECHNICAL_SOURCE_FIELDS:
+        if read_active_field_evidence(conn, logical_ref, field_name):
+            continue
+        if not is_feature_eligible(conn, logical_ref, field_name):
+            continue
+        stale_and_clear_field(conn, source=source, logical_ref=logical_ref,
+                              field_name=field_name, now=now)
+
+
 def _write_glossary_parser_evidence(
     conn, *, logical_ref: str, logical_representation: str, semantic_type: str,
     declared_type: str, column: str, snapshot_id: str
@@ -1149,6 +1179,16 @@ def _ingest_technical_evidence(conn, *, source: str, rows: list[CanonicalRow],
                 contained_failures += 1
                 logger.warning("advisory revalidation flag failed for %s", logical_ref,
                                exc_info=True)
+        try:
+            # A dropped field's prior LOAD-BEARING decision must be retired here, BEFORE the round's
+            # resolve_and_project (which skips evidence-less fields and would leave it the latest).
+            with conn.transaction():
+                _retire_dropped_technical_decisions(
+                    conn, source=source, logical_ref=logical_ref, now=now)
+        except Exception:  # noqa: BLE001
+            contained_failures += 1
+            logger.warning("advisory dropped-field decision retire failed for %s", logical_ref,
+                           exc_info=True)
         attachable_refs.append(logical_ref)
     if not attachable_refs:
         return contained_failures
