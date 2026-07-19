@@ -484,6 +484,16 @@ _GLOSSARY_CONFLICT_SEVERITY = "metadata_conflict"
 # The SOURCE fields whose change on a re-upload is MATERIAL enough to invalidate a prior human
 # confirmation (spec §6.3). A glossary attests no physical type, so `definition` is its material axis.
 _MATERIAL_FIELDS = frozenset({"definition"})
+# The TECHNICAL-CSV material axis (review M-1): the OPERATIONAL human-confirmable technical fields
+# (currency/unit/sensitivity/additivity — all PREFER_CONFIRMED, carrying the
+# CONFIRMATION_PENDING_REVALIDATION disqualifier) plus definition. A source re-declaration that
+# changes or drops ANY of these must flag a prior human confirmation pending revalidation — the
+# glossary-derived `_MATERIAL_FIELDS` (definition-only) left e.g. a source currency flip (EUR vs a
+# human-confirmed USD) silently non-material, so the stale human value stayed operational with no
+# review signal. NOT `entity`: it is RECOMMENDATION-only advisory (`_ENTITY_ADVISORY`), never
+# operational, so it needs no revalidation flag.
+_TECHNICAL_MATERIAL_FIELDS = frozenset(
+    {"definition", "currency", "unit", "sensitivity", "additivity"})
 
 # The full set of fields each producer can assert for a glossary column. On a re-upload we reconcile
 # these against the fields the NEW upload actually provides: a field the new upload NO LONGER asserts
@@ -785,7 +795,9 @@ def _write_technical_source_evidence(
     (Delivery B item 8). The exact technical mirror of :func:`_write_glossary_source_evidence`:
     present->absent reconciliation stales a field the new upload dropped, and the return says whether
     the column's MATERIAL changed vs the prior upload — a material field staled by a changed value
-    (present->present) OR dropped entirely (present->absent)."""
+    (present->present) OR dropped entirely (present->absent). Material here is
+    ``_TECHNICAL_MATERIAL_FIELDS`` (M-1): every operational human-confirmable technical field, not
+    just the glossary's definition axis."""
     material_changed = False
     present: set[str] = set()
     for field_name, value in (("definition", row.definition), ("sensitivity", row.sensitivity),
@@ -800,20 +812,22 @@ def _write_technical_source_evidence(
             strength=strength_for(TECHNICAL_CSV_PROFILE, field_name),
             producer_ref=producer_ref, snapshot_id=snapshot_id, material=value,
         )
-        if field_name in _MATERIAL_FIELDS and staled > 0:
+        if field_name in _TECHNICAL_MATERIAL_FIELDS and staled > 0:
             material_changed = True
     dropped = _stale_absent_fields(
         conn, logical_ref=logical_ref, producer=EvidenceProducer.SOURCE,
         all_fields=_TECHNICAL_SOURCE_FIELDS, present=present,
     )
-    if dropped & _MATERIAL_FIELDS:
+    if dropped & _TECHNICAL_MATERIAL_FIELDS:
         material_changed = True
     return material_changed
 
 
-def _retire_dropped_technical_decisions(conn, *, source: str, logical_ref: str,
-                                        now: datetime | None) -> None:
-    """Retire the DECISION of a technical field the new upload DROPPED (Delivery B closing gate).
+def _retire_dropped_field_decisions(conn, *, source: str, logical_ref: str,
+                                    fields: tuple[str, ...], now: datetime | None) -> None:
+    """Retire the DECISION of every ``fields`` member the new upload DROPPED (Delivery B closing
+    gate; generalized for review M-2 — the technical path passes ``_TECHNICAL_SOURCE_FIELDS``, the
+    glossary parser path ``_PARSER_FIELDS``).
 
     ``_stale_absent_fields`` stales the dropped field's EVIDENCE, and ``build_graph`` recreates the
     flat display columns from the new rows — but ``resolve_and_project`` iterates only fields with
@@ -827,7 +841,7 @@ def _retire_dropped_technical_decisions(conn, *, source: str, logical_ref: str,
     load-bearing value, so never-declared fields (and already-retired ones) write no spurious STALED
     decisions. Must run BEFORE the round's ``resolve_and_project`` (same request tx), which then
     skips the evidence-less field and cannot re-project the cleared value."""
-    for field_name in _TECHNICAL_SOURCE_FIELDS:
+    for field_name in fields:
         if read_active_field_evidence(conn, logical_ref, field_name):
             continue
         if not is_feature_eligible(conn, logical_ref, field_name):
@@ -873,8 +887,10 @@ def _write_glossary_parser_evidence(
             producer=EvidenceProducer.PARSER, strength=AssertionStrength.SUPPORTED,
             producer_ref=snapshot_id, snapshot_id=snapshot_id, material=value,
         )
-    # Reconcile absent parser fields: an edited upload that drops its sample-profile facet leaves
-    # the prior logical_representation/semantic_type ACTIVE + load-bearing unless we stale it here.
+    # Reconcile absent parser fields: stale the PARSER evidence an edited upload no longer asserts.
+    # This retires the EVIDENCE only — `resolve_and_project` iterates only fields with ACTIVE
+    # evidence, so the prior load-bearing DECISION would stay latest (M-2); the ingest loop retires
+    # it via `_retire_dropped_field_decisions(fields=_PARSER_FIELDS)` before resolve_and_project.
     _stale_absent_fields(
         conn, logical_ref=logical_ref, producer=EvidenceProducer.PARSER,
         all_fields=_PARSER_FIELDS, present=present,
@@ -1025,6 +1041,19 @@ def _ingest_glossary_evidence(conn, *, source: str, rows: list[CanonicalRow],
         except Exception:  # noqa: BLE001
             contained_failures += 1
             logger.warning("advisory glossary PARSER evidence failed for %s", logical_ref,
+                           exc_info=True)
+        try:
+            # M-2 — the parser mirror of the technical retire: a dropped sample facet's prior
+            # load-bearing logical_representation/semantic_type DECISION must be retired here,
+            # BEFORE this round's resolve_and_project (which skips evidence-less fields and would
+            # leave the stale decision the latest). Guarded inside the helper: an active HUMAN row
+            # (or a still-present facet) keeps the field untouched.
+            with conn.transaction():
+                _retire_dropped_field_decisions(
+                    conn, source=source, logical_ref=logical_ref, fields=_PARSER_FIELDS, now=now)
+        except Exception:  # noqa: BLE001
+            contained_failures += 1
+            logger.warning("advisory dropped-field decision retire failed for %s", logical_ref,
                            exc_info=True)
         if concepts is not None:
             try:
@@ -1183,8 +1212,9 @@ def _ingest_technical_evidence(conn, *, source: str, rows: list[CanonicalRow],
             # A dropped field's prior LOAD-BEARING decision must be retired here, BEFORE the round's
             # resolve_and_project (which skips evidence-less fields and would leave it the latest).
             with conn.transaction():
-                _retire_dropped_technical_decisions(
-                    conn, source=source, logical_ref=logical_ref, now=now)
+                _retire_dropped_field_decisions(
+                    conn, source=source, logical_ref=logical_ref,
+                    fields=_TECHNICAL_SOURCE_FIELDS, now=now)
         except Exception:  # noqa: BLE001
             contained_failures += 1
             logger.warning("advisory dropped-field decision retire failed for %s", logical_ref,

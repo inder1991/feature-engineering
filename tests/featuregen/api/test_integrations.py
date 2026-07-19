@@ -676,6 +676,23 @@ def test_import_records_ingested_connector_run_linked_from_import_row(client, co
         (res.json()["import_id"],)).fetchone()[0] == run_id
 
 
+def test_import_records_connector_source_profile_provenance(client):
+    """M-3 / migration 1004 traceability: the connector's glossary=None path writes SOURCE/ATTESTED
+    technical evidence, so its run must record which capability profile governed it —
+    source_type='connector' + the profile version, never NULL (pre-fix, both were NULL because
+    open_run/terminalize_run were called without them)."""
+    from featuregen.overlay.upload.source_profile import SOURCE_CAPABILITY_PROFILE_VERSION
+
+    _, sid = _configured_sync(client)
+    pv = _preview(client, sid).json()
+    res = _import(client, sid, pv["snapshot_hash"], pv["local_baseline_hash"])
+    assert res.status_code == 200
+
+    run = _get_run(client, res.headers[RUN_HEADER]).json()
+    assert run["source_type"] == "connector"
+    assert run["profile_version"] == SOURCE_CAPABILITY_PROFILE_VERSION
+
+
 def test_import_response_body_unchanged_run_id_rides_the_header_only(client):
     """Compatibility: the import response BODY is byte-for-byte what it was before the manifest —
     the run id rides the response header ONLY."""

@@ -193,3 +193,55 @@ def test_material_change_flags_human_confirmed_currency_pending_revalidation(db)
     # ...but its load-bearing effect is BLOCKED pending re-confirmation — the changed/dropped value
     # is NOT silently kept operational.
     assert is_feature_eligible(db, _BAL_REF, "currency") is False
+
+
+# ── M-1: the technical material axis is ALL operational human-confirmable fields, not just the
+# glossary-derived `definition`. A source currency change/drop with the definition UNCHANGED must
+# still flag the human confirmation CONFIRMATION_PENDING_REVALIDATION — gate 3 above only passed
+# because its upload 2 ALSO restated the definition. ──
+def test_changed_currency_alone_flags_human_confirmed_currency_pending_revalidation(db):
+    """Upload 1: human CONFIRMS currency=USD. Upload 2: the technical CSV re-declares the SAME
+    column with currency=EUR and the definition UNCHANGED -> the stale human USD must be flagged
+    pending revalidation, not silently kept operational with no review signal."""
+    _seal()
+    _ingest(db, _rows())
+    human_id = _confirm_human(db, _BAL_REF, "currency", "USD")
+    resolve_and_project(db, source=_SOURCE, logical_refs=[_BAL_REF], now=NOW)
+    assert is_feature_eligible(db, _BAL_REF, "currency") is True
+
+    # Upload 2: currency EUR, definition byte-for-byte UNCHANGED (the definition-only material
+    # axis saw NO change here, so pre-fix the revalidation flag never fired).
+    _ingest(db, _rows(currency="EUR"))
+
+    # The human confirmation is flagged CONFIRMATION_PENDING_REVALIDATION (the pending-
+    # revalidation row + the resolver-facing disqualifier).
+    assert _pending_revalidations(db, _BAL_REF, "currency") == 1
+    assert active_disqualifiers_for(db, _BAL_REF, "currency") == frozenset(
+        {Disqualifier.CONFIRMATION_PENDING_REVALIDATION})
+
+    # The human evidence itself is NOT staled — the disqualifier (not a stale) blocks it until a
+    # human re-confirms against the source's new EUR assertion.
+    active_ids = [e.evidence_id for e in read_active_field_evidence(db, _BAL_REF, "currency")]
+    assert human_id in active_ids
+
+
+def test_dropped_currency_alone_flags_human_confirmed_currency_pending_revalidation(db):
+    """Present->absent variant of M-1: upload 2 DROPS the human-confirmed currency (blank cell)
+    with the definition unchanged -> same flag; the stale human value must not stay operational."""
+    _seal()
+    _ingest(db, _rows())
+    human_id = _confirm_human(db, _BAL_REF, "currency", "USD")
+    resolve_and_project(db, source=_SOURCE, logical_refs=[_BAL_REF], now=NOW)
+    assert is_feature_eligible(db, _BAL_REF, "currency") is True
+
+    _ingest(db, _rows(currency=""))   # dropped; definition UNCHANGED
+
+    assert _pending_revalidations(db, _BAL_REF, "currency") == 1
+    assert active_disqualifiers_for(db, _BAL_REF, "currency") == frozenset(
+        {Disqualifier.CONFIRMATION_PENDING_REVALIDATION})
+
+    # The human evidence survived (producer-scoped staleness; the retire helper's active-HUMAN
+    # guard also leaves the field alone) — but its load-bearing effect is BLOCKED.
+    assert [e.evidence_id for e in read_active_field_evidence(db, _BAL_REF, "currency")] \
+        == [human_id]
+    assert is_feature_eligible(db, _BAL_REF, "currency") is False
