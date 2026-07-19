@@ -1,4 +1,5 @@
--- src/featuregen/db/migrations/1002_contract_validation_status.sql
+-- src/featuregen/db/migrations/1003_contract_validation_status.sql
+-- (renumbered from 1002 during the origin/main integration — 1002 was claimed by 1002_live_activation)
 -- Phase-2 Slice 3 (3A-ii): carry the honest tri-state validation onto the persisted contract. A
 -- feature confirmed while NEEDS_EXTERNAL_VALIDATION must persist that HONESTLY, never be silently
 -- recorded as DESIGN_CHECKED. This is a NEW axis, SEPARATE from the hyphenated `verification` stamp

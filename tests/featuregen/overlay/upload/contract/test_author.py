@@ -87,7 +87,9 @@ def test_draft_authors_the_join_path(db):
 
 
 def test_draft_authors_cross_catalog_join_path_via_entity(db):
-    # entity.py wired: a feature spanning two catalogs gets an entity-bridged join path authored
+    # 3C.2a flag-off (is_live default False): byte-identical to pre-3C.2a — a feature spanning two catalogs
+    # with no governed envelope gets an entity-bridged permissive path via find_cross_catalog_path. The
+    # flag-on fail-closed (CrossCatalogPlanRequired) path is covered in test_draft_rebinding.
     build_graph(db, "deposits", [
         CanonicalRow("deposits", "accounts", "cust_ref", "integer", entity="Customer"),
         CanonicalRow("deposits", "accounts", "balance", "numeric")])

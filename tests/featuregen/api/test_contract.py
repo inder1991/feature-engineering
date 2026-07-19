@@ -151,3 +151,80 @@ def test_confirm_rejects_a_draft_tampered_off_the_chosen_feature(make_client):
     draft["derives_from"] = [*draft["derives_from"], "public.accounts.churned"]
     draft["derives_pairs"] = [*draft["derives_pairs"], ["deposits", "public.accounts.churned"]]
     assert client.post("/contract/confirm", json=draft, headers=AUTH).status_code == 422
+
+
+# ── 3C.2a Task 6: the draft/confirm freshness-recheck route contract (409/422 fail-closed) ─────────────
+def _stale_envelope():
+    from featuregen.overlay.upload.planner.plan_envelope import PlanEnvelopeV1
+    return PlanEnvelopeV1(
+        recipe_id="r", physical_plan_id="bp_1", generation_run_id="run", catalog_sources=("deposits",),
+        ordered_path=("deposits:direct_catalog:",), contract_id="c1",
+        contract_resolution_status="resolved", contract_reason_codes=(),
+        catalog_fingerprint={"deposits": "fp"}, compiler_version={"plan_contract": "1.0.0"},
+        input_stamps=({"catalog_source": "deposits", "compiler_input_fingerprint": "fp",
+                       "head_seq": 1, "projection_checkpoint": 1},))
+
+
+def test_draft_route_maps_stale_plan_to_409(make_client, monkeypatch):
+    # a governed feature whose pinned plan drifted → StalePlan → HTTP 409 (regenerate), never a draft.
+    from featuregen.overlay.upload.contract.author import StalePlan
+    from featuregen.overlay.upload.planner.contracts import ReplayFreshness
+    client = make_client(_fake())
+    upload_csv(client, "deposits", DEPOSITS_CSV)
+    intent_id = _intent_id(client)
+
+    def _raise(*a, **k):
+        raise StalePlan(ReplayFreshness.drifted, "bp_x")
+
+    monkeypatch.setattr("featuregen.api.routes.contract.draft_contract", _raise)
+    res = client.post("/contract/draft", json={
+        "intent_id": intent_id, "chosen_source": "anchor",
+        "chosen_option_id": "avg_balance_90d", "why": ""}, headers=AUTH)
+    assert res.status_code == 409, res.text
+
+
+def test_draft_route_maps_cross_catalog_without_envelope_to_422(make_client, monkeypatch):
+    # a cross-catalog feature that reached drafting with no governed envelope → fail-closed 422.
+    from featuregen.overlay.upload.contract.author import CrossCatalogPlanRequired
+    client = make_client(_fake())
+    upload_csv(client, "deposits", DEPOSITS_CSV)
+    intent_id = _intent_id(client)
+
+    def _raise(*a, **k):
+        raise CrossCatalogPlanRequired("cross-catalog feature has no governed plan envelope")
+
+    monkeypatch.setattr("featuregen.api.routes.contract.draft_contract", _raise)
+    res = client.post("/contract/draft", json={
+        "intent_id": intent_id, "chosen_source": "anchor",
+        "chosen_option_id": "avg_balance_90d", "why": ""}, headers=AUTH)
+    assert res.status_code == 422, res.text
+
+
+def test_confirm_route_rechecks_freshness_and_maps_stale_to_409(make_client, monkeypatch):
+    # the GOVERNING write re-runs the freshness recheck against the SERVER-reconstructed chosen feature's
+    # envelope (never the client body); a plan that drifted between draft and confirm → 409, never finalize.
+    from featuregen.overlay.upload.feature_assist import FeatureIdea
+    from featuregen.overlay.upload.planner.contracts import ReplayFreshness
+    client = make_client(_fake())
+    upload_csv(client, "deposits", DEPOSITS_CSV)
+    intent_id = _intent_id(client)
+    dr = client.post("/contract/draft", json={
+        "intent_id": intent_id, "chosen_source": "anchor",
+        "chosen_option_id": "avg_balance_90d", "why": ""}, headers=AUTH)
+    assert dr.status_code == 200
+    draft = dr.json()["draft"]
+    draft["intent_id"] = intent_id
+
+    def _governed_chosen(*a, **k):
+        return FeatureIdea(
+            name=draft["feature_name"], description="", derives_from=draft["derives_from"],
+            aggregation=draft["aggregation"], grain_table=draft["grain_table"],
+            derives_pairs=tuple(tuple(p) for p in draft["derives_pairs"]),
+            plan_envelope=_stale_envelope(), origin="governed_planner",
+            path_authority="governed_cross_catalog")
+
+    monkeypatch.setattr("featuregen.api.routes.contract.chosen_feature", _governed_chosen)
+    monkeypatch.setattr("featuregen.api.routes.contract.recheck_plan_freshness",
+                        lambda *a, **k: ReplayFreshness.drifted)
+    res = client.post("/contract/confirm", json=draft, headers=AUTH)
+    assert res.status_code == 409, res.text

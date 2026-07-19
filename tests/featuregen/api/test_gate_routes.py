@@ -60,6 +60,26 @@ def test_gate_cohorts_lists_producer_commits(client, admin_headers, db):
     assert r.status_code == 200 and any(c["cohort"] == "sha1" for c in r.json())
 
 
+def test_persist_evaluation_and_approve_enables(client, admin_headers, db, monkeypatch):
+    monkeypatch.setenv("FEATUREGEN_PRODUCER_COMMIT", "sha-a")
+    monkeypatch.setenv("FEATUREGEN_INTENT_LIVE_CROSS_CATALOG", "1")
+    monkeypatch.setenv("FEATUREGEN_DEPLOYMENT_ID", "d1")
+    # persist an evaluation over an empty window → result FAIL (fail-closed), and confirm APPROVE is refused
+    ev = client.post("/gate/enablement-evaluation", json={"cohort": "ghost",
+                     "since": "2026-07-18T00:00:00Z", "until": "2026-07-19T00:00:00Z"}, headers=admin_headers)
+    assert ev.status_code == 200 and ev.json()["result"] == "FAIL"
+    bad = client.post("/gate/activation-decision", json={"evaluation_id": ev.json()["evaluation_id"],
+                      "decision": "APPROVE", "reason": "x"}, headers=admin_headers)
+    assert bad.status_code == 422   # APPROVE over a FAIL is refused server-side
+
+
+def test_activation_endpoints_require_platform_admin(client, non_admin_headers):
+    assert client.post("/gate/enablement-evaluation", json={"cohort": "c", "since":
+        "2026-07-18T00:00:00Z", "until": "2026-07-19T00:00:00Z"}, headers=non_admin_headers).status_code == 403
+    assert client.post("/gate/activation-decision", json={"evaluation_id": "e", "decision": "REVOKE",
+                       "reason": "x"}, headers=non_admin_headers).status_code == 403
+
+
 def test_gate_e2e_collects_a_batch_and_evaluates(client, admin_headers, db, monkeypatch):
     monkeypatch.setenv("FEATUREGEN_PRODUCER_COMMIT", "sha-e2e")
     # collect one qualifying shadow run (all four flags on) via the planner entrypoint the route uses

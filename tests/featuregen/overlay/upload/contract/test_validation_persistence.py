@@ -1,6 +1,6 @@
 """Slice 3A-ii — the honest validation state carried end-to-end and persisted on the contract row.
 
-Task 1 covers the table shape (migration 1002): `contract.validation_status` (CHECK-constrained to
+Task 1 covers the table shape (migration 1003): `contract.validation_status` (CHECK-constrained to
 the underscore VALIDATION_STATES vocab — a NEW axis, separate from the hyphenated `verification`
 stamp) and `contract.requirements` (jsonb). Later tasks extend this file with the draft/confirm
 round-trip; per RF-I3 only symbols that exist at this task are imported here.
