@@ -168,12 +168,13 @@ def _inject_operand_declarations(ctx: CompilerContext,
 
 def _operand_path(operand: OperandSlotV1, candidate) -> OperandPathV1:
     """One operand's ``OperandPathV1`` from its converged candidate: the frontier's own governed
-    ``binding_plan`` (its ``path_segments`` ARE the governed crossings) + the revalidated landing
-    endpoint (the endpoint whose ``grain_fact_key`` keys the replay envelope)."""
+    ``binding_plan`` (its ``path_segments`` ARE the governed crossings) + the FULL tuple of revalidated
+    governed endpoints in path order — source + each intermediate + landing (spec §3.2; every hop
+    endpoint's ``grain_fact_key`` keys the replay envelope, not just the landing's)."""
     return OperandPathV1(
         slot_id=operand.slot_id, semantic_role=operand.semantic_role,
         catalog_source=operand.catalog_source, object_ref=operand.object_ref,
-        binding_plan=candidate.binding_plan, governed_endpoints=(candidate.landing_endpoint,),
+        binding_plan=candidate.binding_plan, governed_endpoints=candidate.governed_endpoints,
         path_strategy=operand.path_strategy, pit_treatment="")
 
 

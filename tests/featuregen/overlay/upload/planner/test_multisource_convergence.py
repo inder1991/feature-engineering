@@ -64,12 +64,13 @@ def _cand(*, pid, catalog, table, keys, rank=0, bridges=1, hops=1, authority=0, 
     from the plan's OWN path; ``rank`` still sets the frontier's per-run ``preference_rank`` (a
     positional index) so a test can DIVERGE the two — the OLD (unsound) key summed ``preference_rank``,
     the NEW one sums ``authority_key``."""
+    landing_ep = GovernedEndpointV1(
+        catalog=catalog, table_ref=table, grain_key_refs=tuple(keys), grain_fact_key=fk)
     return OperandPathCandidateV1(
         binding_plan=_plan(pid, rank=rank, bridges=bridges),
         landing_catalog=catalog, landing_table_ref=table,
         authority_key=(authority, bridges, hops),
-        landing_endpoint=GovernedEndpointV1(
-            catalog=catalog, table_ref=table, grain_key_refs=tuple(keys), grain_fact_key=fk))
+        landing_endpoint=landing_ep, governed_endpoints=(landing_ep,))
 
 
 def _operand(candidates):

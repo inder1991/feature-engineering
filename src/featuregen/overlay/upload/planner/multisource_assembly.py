@@ -7,19 +7,24 @@ The first assembly-engine task. It INTEGRATES three pieces that already landed:
   (``semantic_rollup_paths`` -> ``assemble_paths``). Enumeration drives that same engine, but keeps
   EVERY resolved cross-catalog ``BindingPlanV1`` the frontier produces (not just the first, as the
   spike's ``run_operand_rollup`` returns), bounded by ``MAX_PATHS_PER_OPERAND``.
-* the Task-4 endpoint check (``multisource_endpoints.governed_endpoint``) — each resolved plan's
-  landing table is revalidated against a VERIFIED ``grain`` fact; an ungoverned landing is dropped.
+* the Task-4 endpoint check (``multisource_endpoints.governed_endpoint``) — EVERY hop endpoint of a
+  resolved plan (source + each intermediate + landing) is revalidated against a VERIFIED ``grain``
+  fact (spec §2/§3.2); an ungoverned source is ``source_binding_ungoverned``, an ungoverned
+  intermediate/landing is ``realization_endpoint_ungoverned``, and a candidate survives only when ALL
+  its hop endpoints are governed.
 * the Task-2 typed contracts (``multisource_contracts``) — status/reason fields are typed on the
   unified ``MultiSourceReason`` vocabulary (NOT the single-source ``PlanResolutionStatus``), and
   bounds reuse ``MultiSourceBoundingMetricsV1``.
 
 The frontier does NOT emit the landing (``_mint`` discards the landing ``_Position``); A re-derives
-the landing ``(catalog, table_ref)`` from the resolved plan's ``path_segments`` exactly the way
-``check_connectivity``/``_hop_evidence`` compute execution tables (``declarations.py:191-211``,
+EVERY hop endpoint ``(catalog, table_ref)`` from the resolved plan's ``path_segments`` exactly the
+way ``check_connectivity``/``_hop_evidence`` compute execution tables (``declarations.py:191-211``,
 ``:346-377``): walk the realization/bridge segments in order, tracking the physical target-side
-table, and take the LAST one. FAIL CLOSED: an empty result NEVER a bare empty tuple — it carries
-``no_governed_path`` (no VERIFIED-bridge path at all) or ``realization_endpoint_ungoverned`` (a
-path exists but its landing has no grain fact).
+table; the first entry is the source, the last is the landing. FAIL CLOSED: an empty result NEVER a
+bare empty tuple — it carries ``no_governed_path`` (no VERIFIED-bridge path at all),
+``source_binding_ungoverned`` (the source endpoint is ungoverned or its grain fact_key mismatches the
+binding's), or ``realization_endpoint_ungoverned`` (a path exists but an intermediate/landing has no
+grain fact).
 
 Read-only over the reused frontier + compiler surfaces; nothing here edits ``assemble_paths`` /
 ``governed_endpoint`` (the §12 behaviour-neutrality invariant).
@@ -119,6 +124,13 @@ class OperandPathCandidateV1:
     governed crossings), the landing ``(landing_catalog, landing_table_ref)`` re-derived from those
     segments, and the landing ``GovernedEndpointV1`` (proven by a VERIFIED ``grain`` fact).
 
+    ``governed_endpoints`` is the FULL tuple of revalidated endpoints in path order — the SOURCE,
+    each INTERMEDIATE, and the LANDING (spec §2/§3.2: every hop endpoint must have a VERIFIED grain
+    fact, not just the landing). ``landing_endpoint`` is exactly ``governed_endpoints[-1]``; the
+    source is ``governed_endpoints[0]``. A candidate exists only when ALL its hop endpoints resolved
+    to a ``GovernedEndpointV1`` (an ungoverned source is ``source_binding_ungoverned``; an ungoverned
+    intermediate/landing is ``realization_endpoint_ungoverned``).
+
     ``authority_key`` is the CROSS-RUN-COMPARABLE authority tuple (worst realizer authority, total
     crossings, semantic hops) computed from THIS candidate's OWN ``path_segments`` (Task-6 fix #T6) —
     NOT the frontier's ``preference_rank`` (a per-``assemble_paths``-run POSITIONAL index that resets
@@ -130,6 +142,7 @@ class OperandPathCandidateV1:
     landing_table_ref: str
     landing_endpoint: GovernedEndpointV1
     authority_key: tuple[int, int, int]
+    governed_endpoints: tuple[GovernedEndpointV1, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -199,22 +212,26 @@ def _anchor_column_ref(conn, operand: OperandSlotV1, anchor_concept: str) -> str
     return row[0] if row is not None else None
 
 
-def _rederive_landing(ctx: CompilerContext, plan: BindingPlanV1, *, source_catalog: str,
-                      source_table: str) -> tuple[str, str]:
-    """Re-derive the plan's landing ``(catalog, table_ref)`` from ``path_segments`` — the frontier
-    discards the landing ``_Position`` (``assembly.py:389-398``), so the landing is the target-side
-    execution table of the LAST hop. Mirrors ``check_connectivity``/``_hop_evidence``: a realization
-    segment lands on the realization's ``to_object_ref`` (already a TABLE ref); a bridge segment
-    lands on the endpoint table in the SEGMENT's catalog (endpoint storage order is unordered). A
-    segment whose ref the context cannot resolve contributes nothing (fail closed). The pre-first-hop
-    source position is the fallback (a degenerate zero-hop path lands in place)."""
-    landing = (source_catalog, source_table)
+def _rederive_hop_tables(ctx: CompilerContext, plan: BindingPlanV1, *, source_catalog: str,
+                         source_table: str) -> tuple[tuple[str, str], ...]:
+    """Re-derive EVERY hop endpoint table of the resolved path from ``path_segments``, in path order:
+    the SOURCE table, then the target-side execution table of each governed segment (intermediate ...
+    landing). The frontier discards the landing ``_Position`` (``assembly.py:389-398``), so A walks
+    the segments exactly as ``check_connectivity``/``_hop_evidence`` compute execution tables
+    (``declarations.py:191-211``, ``:346-377``): an ``intra_catalog_realization`` segment lands on
+    the realization's ``to_object_ref`` (already a TABLE ref); a ``governed_bridge`` segment lands on
+    the endpoint table in the SEGMENT's catalog (``cat2`` = the far/target side — ``assembly.py:245``;
+    endpoint storage order is unordered). Pure ``semantic_rollup`` announcement segments carry neither
+    ref and contribute no endpoint; a segment whose ref the context cannot resolve contributes nothing
+    (fail closed). The FIRST entry is always the source; the LAST is the landing (a degenerate
+    zero-hop path lands in place, so source == landing)."""
+    hops: list[tuple[str, str]] = [(source_catalog, source_table)]
     for seg in plan.path_segments:
         if seg.realization_ref is not None:
             r = next((x for x in ctx.realizations_by_catalog.get(seg.catalog_source, ())
                       if x.realization_id == seg.realization_ref), None)
             if r is not None:
-                landing = (seg.catalog_source, r.to_object_ref)
+                hops.append((seg.catalog_source, r.to_object_ref))
         elif seg.bridge_fact_key is not None:
             br = next((x for x in ctx.active_bridges if x.fact_key == seg.bridge_fact_key), None)
             if br is None:
@@ -222,9 +239,9 @@ def _rederive_landing(ctx: CompilerContext, plan: BindingPlanV1, *, source_catal
             for cat, col_ref in ((br.left_catalog_source, br.left_object_ref),
                                  (br.right_catalog_source, br.right_object_ref)):
                 if cat == seg.catalog_source:
-                    landing = (cat, table_of(col_ref))
+                    hops.append((cat, table_of(col_ref)))
                     break
-    return landing
+    return tuple(hops)
 
 
 def _enumerate_plans(conn, *, source_position: _Position, target_entity: str, scope: CatalogScopeV1,
@@ -294,11 +311,20 @@ def enumerate_operand_paths(
     Builds the injected single-need ``Template`` (with the second temporal need when the strategy is
     ``take_latest``) + hand-built source ``_Position`` from the operand's ``GovernedSourceBindingV1``,
     drives the reused frontier for every governed path (bounded ``MAX_PATHS_PER_OPERAND``), re-derives
-    each resolved plan's landing from ``path_segments``, and revalidates the landing with the Task-4
-    ``governed_endpoint`` grain-fact check — dropping ungoverned landings. Fail-closed: no
-    VERIFIED-bridge path -> ``no_governed_path``; a path whose landing lacks a grain fact ->
-    ``realization_endpoint_ungoverned`` (never a bare empty tuple). ``ctx`` is already role-scoped;
-    ``roles`` is carried for signature parity with the rest of the assembly engine."""
+    each resolved plan's EVERY hop endpoint (source + intermediates + landing) from ``path_segments``,
+    and revalidates EACH with the Task-4 ``governed_endpoint`` grain-fact check (spec §2/§3.2: every
+    hop endpoint must carry a VERIFIED ``grain`` fact, not just the landing). Fail-closed:
+
+      * no VERIFIED-bridge path resolves at all -> ``no_governed_path``;
+      * the SOURCE endpoint is ungoverned, OR its governed ``grain_fact_key`` != the binding's claimed
+        ``GovernedSourceBindingV1.grain_fact_key`` (the binding claims a grain that isn't the actual
+        VERIFIED one) -> ``source_binding_ungoverned`` (A trusts the binding's STRUCTURE but VALIDATES
+        its claimed grain fact is a real VERIFIED one, spec §1);
+      * an INTERMEDIATE or LANDING endpoint lacks a grain fact -> ``realization_endpoint_ungoverned``.
+
+    A candidate survives only when ALL its hop endpoints are governed; an empty result NEVER a bare
+    empty tuple. ``ctx`` is already role-scoped; ``roles`` is carried for signature parity with the
+    rest of the assembly engine."""
     del roles   # ctx is already read-scoped by the caller's roles; the frontier reads conn directly
     recipe_id = _operand_recipe_id(operand)
     source_entity = operand.source_binding.source_grain_entity
@@ -319,21 +345,45 @@ def enumerate_operand_paths(
             candidates=(), status=MultiSourceReason.no_governed_path,
             reason_codes=(MultiSourceReason.no_governed_path,), bounds=bounds)
 
+    # Source-endpoint governance (spec §2/§3.2, §1 reuse model). The source table is INVARIANT across
+    # this operand's plans (it is ``table_of(operand.object_ref)``), so revalidate it ONCE: A trusts
+    # the binding's STRUCTURE (columns/grain entity) yet VALIDATES that its CLAIMED grain fact is
+    # actually the VERIFIED one. An ungoverned source, OR a governed grain whose deterministic
+    # ``grain_fact_key`` != the binding's claimed one, is a ``source_binding_ungoverned`` reject.
+    source_endpoint = governed_endpoint(
+        conn, adapter, catalog=operand.catalog_source, table_ref=source_table, now=now)
+    if (source_endpoint is None
+            or source_endpoint.grain_fact_key != operand.source_binding.grain_fact_key):
+        return OperandEnumerationResultV1(
+            candidates=(), status=MultiSourceReason.source_binding_ungoverned,
+            reason_codes=(MultiSourceReason.source_binding_ungoverned,), bounds=bounds)
+
     authority_ranks = _realizer_authority_ranks(ctx)
     candidates: list[OperandPathCandidateV1] = []
     for plan in plans:
-        landing_catalog, landing_table_ref = _rederive_landing(
+        hop_tables = _rederive_hop_tables(
             ctx, plan, source_catalog=operand.catalog_source, source_table=source_table)
-        endpoint = governed_endpoint(
-            conn, adapter, catalog=landing_catalog, table_ref=landing_table_ref, now=now)
-        if endpoint is None:
-            continue    # the landing has no VERIFIED grain fact — ungoverned, dropped
+        # hop_tables[0] is the source (revalidated above); revalidate every INTERMEDIATE + LANDING
+        # endpoint. An ungoverned intermediate/landing drops the candidate; a candidate survives only
+        # when ALL its hop endpoints carry a VERIFIED grain fact (spec §2/§3.2).
+        endpoints: list[GovernedEndpointV1] = [source_endpoint]
+        ungoverned = False
+        for cat, table in hop_tables[1:]:
+            endpoint = governed_endpoint(conn, adapter, catalog=cat, table_ref=table, now=now)
+            if endpoint is None:
+                ungoverned = True   # an intermediate/landing endpoint has no VERIFIED grain fact
+                break
+            endpoints.append(endpoint)
+        if ungoverned:
+            continue
+        landing_catalog, landing_table_ref = hop_tables[-1]
         candidates.append(OperandPathCandidateV1(
             binding_plan=plan, landing_catalog=landing_catalog,
-            landing_table_ref=landing_table_ref, landing_endpoint=endpoint,
-            authority_key=_authority_key(plan, authority_ranks)))
+            landing_table_ref=landing_table_ref, landing_endpoint=endpoints[-1],
+            authority_key=_authority_key(plan, authority_ranks),
+            governed_endpoints=tuple(endpoints)))
 
-    # A governed path resolved but no landing was governed by a VERIFIED grain fact.
+    # Every governed path had an ungoverned INTERMEDIATE or LANDING endpoint (the source WAS governed).
     if not candidates:
         return OperandEnumerationResultV1(
             candidates=(), status=MultiSourceReason.realization_endpoint_ungoverned,

@@ -32,6 +32,7 @@ from tests.featuregen.overlay.upload.conftest import _confirm_grain
 from featuregen.contracts.envelopes import Command
 from featuregen.overlay.catalog import current_catalog_adapter
 from featuregen.overlay.commands import propose_fact
+from featuregen.overlay.identity import fact_key
 from featuregen.overlay.upload.canonical import CanonicalRow
 from featuregen.overlay.upload.enrich import content_hash
 from featuregen.overlay.upload.graph import build_graph
@@ -65,6 +66,10 @@ from featuregen.overlay.upload.upload_catalog import (
 )
 
 _NOW = datetime(2026, 7, 19, tzinfo=UTC)
+
+# The DETERMINISTIC grain fact_key of the operand's SOURCE table (core_banking.transactions) — the
+# source-endpoint revalidation (spec §2/§3.2) compares the binding's claimed grain key against it.
+_SRC_GRAIN_FK = fact_key(table_ref("core_banking", "transactions"), "grain")
 
 
 # ── seed helpers (the sanctioned assembly-suite / reuse-spike pattern) ─────────────────────────
@@ -118,7 +123,7 @@ def _operand(*, slot_id="op_0", catalog="core_banking", object_ref="public.trans
             ordering_anchor_concept=anchor_concept),
         source_binding=GovernedSourceBindingV1(
             source_grain_entity=source_entity, source_grain_key_refs=(source_key_ref,),
-            grain_fact_key="src-grain-fk"))
+            grain_fact_key=_SRC_GRAIN_FK))
 
 
 def _ctx(conn, catalogs, agg_declarations, now=_NOW):
@@ -163,6 +168,11 @@ def bridged_non_additive(db, service_actor, human_actor):
     _seed_verified_bridge(db, "bfk_acct", "account",
                           "core_banking", "public.transactions.account_id",
                           "wealth", "public.accounts.account_id")
+    # every hop endpoint governed: source transactions, intermediate wealth.accounts, landing customers
+    _seed_verified_grain(db, "core_banking", "transactions", ["transaction_id"],
+                         service_actor=service_actor, human_actor=human_actor)
+    _seed_verified_grain(db, "wealth", "accounts", ["account_id"],
+                         service_actor=service_actor, human_actor=human_actor)
     _seed_verified_grain(db, "wealth", "customers", ["customer_id"],
                          service_actor=service_actor, human_actor=human_actor)
     return db, _scope("core_banking", "wealth")
@@ -196,6 +206,14 @@ def take_latest_topology(db, service_actor, human_actor):
     _seed_verified_bridge(db, "bfk_rep_acct", "account",
                           "core_banking", "public.accounts.account_id",
                           "wealth", "public.accounts.account_id")
+    # every hop endpoint governed: source transactions, intermediate core_banking.accounts (the intra
+    # fan-in target) + wealth.accounts (the reposition-bridge far side), landing wealth.customers
+    _seed_verified_grain(db, "core_banking", "transactions", ["transaction_id"],
+                         service_actor=service_actor, human_actor=human_actor)
+    _seed_verified_grain(db, "core_banking", "accounts", ["account_id"],
+                         service_actor=service_actor, human_actor=human_actor)
+    _seed_verified_grain(db, "wealth", "accounts", ["account_id"],
+                         service_actor=service_actor, human_actor=human_actor)
     _seed_verified_grain(db, "wealth", "customers", ["customer_id"],
                          service_actor=service_actor, human_actor=human_actor)
     return db, _scope("core_banking", "wealth")

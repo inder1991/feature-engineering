@@ -34,6 +34,7 @@ from tests.featuregen.overlay.upload.conftest import _confirm_grain
 from featuregen.contracts.envelopes import Command
 from featuregen.overlay.catalog import current_catalog_adapter
 from featuregen.overlay.commands import propose_fact
+from featuregen.overlay.identity import fact_key
 from featuregen.overlay.upload.canonical import CanonicalRow
 from featuregen.overlay.upload.enrich import content_hash
 from featuregen.overlay.upload.graph import build_graph
@@ -84,6 +85,10 @@ from featuregen.overlay.upload.planner.multisource_reuse import build_operand_co
 from featuregen.overlay.upload.upload_catalog import ensure_upload_catalog_adapter, table_ref
 
 _NOW = datetime(2026, 7, 19, tzinfo=UTC)
+
+# The DETERMINISTIC grain fact_key of the enumerated operand's SOURCE table (core_banking.transactions)
+# — the source-endpoint revalidation (spec §2/§3.2) compares the binding's claimed grain key to it.
+_SRC_GRAIN_FK = fact_key(table_ref("core_banking", "transactions"), "grain")
 
 
 # ── seed helpers (the sanctioned Task-5/Task-7 pattern) ────────────────────────────────────────
@@ -153,7 +158,7 @@ def _operand(*, slot_id, catalog, object_ref="public.transactions.amount",
         path_strategy=strategy or _strategy(),
         source_binding=GovernedSourceBindingV1(
             source_grain_entity=source_entity, source_grain_key_refs=(source_key_ref,),
-            grain_fact_key="src-grain-fk"))
+            grain_fact_key=_SRC_GRAIN_FK))
 
 
 # ── real-assembly helpers (enumerate -> converge -> build the MultiSourceBindingPlanV1) ─────────
@@ -161,7 +166,7 @@ def _operand_path(operand, candidate):
     return OperandPathV1(
         slot_id=operand.slot_id, semantic_role=operand.semantic_role,
         catalog_source=operand.catalog_source, object_ref=operand.object_ref,
-        binding_plan=candidate.binding_plan, governed_endpoints=(candidate.landing_endpoint,),
+        binding_plan=candidate.binding_plan, governed_endpoints=candidate.governed_endpoints,
         path_strategy=operand.path_strategy, pit_treatment="")
 
 
@@ -221,6 +226,11 @@ def resolved_topology(db, service_actor, human_actor):
     _seed_verified_bridge(db, "bfk_acct", "account",
                           "core_banking", "public.transactions.account_id",
                           "wealth", "public.accounts.account_id")
+    # every hop endpoint governed: source transactions, intermediate wealth.accounts, landing customers
+    _seed_verified_grain(db, "core_banking", "transactions", ["transaction_id"],
+                         service_actor=service_actor, human_actor=human_actor)
+    _seed_verified_grain(db, "wealth", "accounts", ["account_id"],
+                         service_actor=service_actor, human_actor=human_actor)
     _seed_verified_grain(db, "wealth", "customers", ["customer_id"],
                          service_actor=service_actor, human_actor=human_actor)
     _watermark(db, "core_banking", _NOW - timedelta(minutes=5))

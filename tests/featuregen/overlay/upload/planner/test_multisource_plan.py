@@ -29,6 +29,7 @@ from tests.featuregen.overlay.upload.conftest import _confirm_grain
 from featuregen.contracts.envelopes import Command
 from featuregen.overlay.catalog import current_catalog_adapter
 from featuregen.overlay.commands import propose_fact
+from featuregen.overlay.identity import fact_key
 from featuregen.overlay.upload.canonical import CanonicalRow
 from featuregen.overlay.upload.enrich import content_hash
 from featuregen.overlay.upload.graph import build_graph
@@ -55,6 +56,10 @@ from featuregen.overlay.upload.planner.multisource_plan import plan_multi_source
 from featuregen.overlay.upload.upload_catalog import ensure_upload_catalog_adapter, table_ref
 
 _NOW = datetime(2026, 7, 19, tzinfo=UTC)
+
+# The DETERMINISTIC grain fact_key of the operands' SOURCE table (core_banking.transactions) — the
+# source-endpoint revalidation (spec §2/§3.2) compares the binding's claimed grain key against it.
+_SRC_GRAIN_FK = fact_key(table_ref("core_banking", "transactions"), "grain")
 
 
 # ── seed helpers (the sanctioned Task-5/Task-8 pattern) ────────────────────────────────────────
@@ -121,7 +126,7 @@ def _operand(*, slot_id, catalog="core_banking", object_ref="public.transactions
         path_strategy=strategy or _strategy(),
         source_binding=GovernedSourceBindingV1(
             source_grain_entity=source_entity, source_grain_key_refs=(source_key_ref,),
-            grain_fact_key="src-grain-fk"))
+            grain_fact_key=_SRC_GRAIN_FK))
 
 
 def _ratio_intent():
@@ -173,13 +178,24 @@ def _seed_bridged_topology(db):
                           "wealth", "public.accounts.account_id")
 
 
-@pytest.fixture
-def resolved_topology(db, service_actor, human_actor):
-    """The bridged topology WITH a VERIFIED wealth.customers grain fact and FRESH drift watermarks on
-    both participating catalogs — so the whole pipeline resolves (both axes)."""
-    _seed_bridged_topology(db)
+def _seed_all_hop_grains(db, service_actor, human_actor):
+    """VERIFIED grain on EVERY hop endpoint of the bridged topology (spec §2/§3.2): the source
+    transactions, the intermediate wealth.accounts, and the landing wealth.customers."""
+    _seed_verified_grain(db, "core_banking", "transactions", ["transaction_id"],
+                         service_actor=service_actor, human_actor=human_actor)
+    _seed_verified_grain(db, "wealth", "accounts", ["account_id"],
+                         service_actor=service_actor, human_actor=human_actor)
     _seed_verified_grain(db, "wealth", "customers", ["customer_id"],
                          service_actor=service_actor, human_actor=human_actor)
+
+
+@pytest.fixture
+def resolved_topology(db, service_actor, human_actor):
+    """The bridged topology WITH a VERIFIED grain fact on EVERY hop endpoint (source + intermediate +
+    landing) and FRESH drift watermarks on both participating catalogs — so the whole pipeline
+    resolves (both axes)."""
+    _seed_bridged_topology(db)
+    _seed_all_hop_grains(db, service_actor, human_actor)
     _watermark(db, "core_banking", _NOW - timedelta(minutes=5))
     _watermark(db, "wealth", _NOW - timedelta(minutes=5))
     return db, _scope("core_banking", "wealth")
@@ -191,18 +207,23 @@ def stale_landing_topology(db, service_actor, human_actor):
     still resolves (staleness bites only the compile-end UNION freshness), so the plan compiles with
     ``resolution_status=resolved`` but ``contract_result_status=unresolved_freshness``."""
     _seed_bridged_topology(db)
-    _seed_verified_grain(db, "wealth", "customers", ["customer_id"],
-                         service_actor=service_actor, human_actor=human_actor)
+    _seed_all_hop_grains(db, service_actor, human_actor)
     _watermark(db, "core_banking", _NOW - timedelta(minutes=5))
     _watermark(db, "wealth", _NOW - timedelta(hours=6))
     return db, _scope("core_banking", "wealth")
 
 
 @pytest.fixture
-def ungoverned_endpoint_topology(db):
-    """The bridged topology WITHOUT a grain fact on the wealth.customers landing — a governed path
-    resolves but its endpoint is not proven by a VERIFIED grain fact."""
+def ungoverned_endpoint_topology(db, service_actor, human_actor):
+    """The bridged topology with the source + intermediate governed but NO grain fact on the
+    wealth.customers landing — a governed path resolves, its source binding is governed, but the
+    LANDING endpoint is not proven by a VERIFIED grain fact -> ``realization_endpoint_ungoverned``."""
     _seed_bridged_topology(db)
+    _seed_verified_grain(db, "core_banking", "transactions", ["transaction_id"],
+                         service_actor=service_actor, human_actor=human_actor)
+    _seed_verified_grain(db, "wealth", "accounts", ["account_id"],
+                         service_actor=service_actor, human_actor=human_actor)
+    # deliberately NO grain fact on wealth.customers (the landing)
     _watermark(db, "core_banking", _NOW - timedelta(minutes=5))
     _watermark(db, "wealth", _NOW - timedelta(minutes=5))
     return db, _scope("core_banking", "wealth")

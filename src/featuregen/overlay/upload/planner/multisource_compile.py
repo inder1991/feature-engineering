@@ -349,7 +349,8 @@ def _resolved_operand_path(plan: MultiSourceBindingPlanV1, path: OperandPathV1,
     candidate = OperandPathCandidateV1(
         binding_plan=path.binding_plan, landing_catalog=landing.catalog,
         landing_table_ref=landing.table_ref, landing_endpoint=endpoint,
-        authority_key=(0, path.binding_plan.bridge_count, 0))
+        authority_key=(0, path.binding_plan.bridge_count, 0),
+        governed_endpoints=path.governed_endpoints)
     return ResolvedOperandPathV1(operand=operand, candidate=candidate)
 
 
