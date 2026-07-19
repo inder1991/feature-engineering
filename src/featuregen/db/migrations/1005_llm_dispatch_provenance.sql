@@ -67,8 +67,10 @@ CREATE OR REPLACE TRIGGER llm_dispatch_subject_no_mutation
     BEFORE UPDATE OR DELETE ON llm_dispatch_subject
     FOR EACH ROW EXECUTE FUNCTION llm_dispatch_subject_write_once();
 
--- 3) Transport outcome, appended AFTER egress. Append-only by usage — DELIBERATELY no
---    UNIQUE(dispatch_ref): a retry attempt-boundary may append one row per attempt.
+-- 3) Transport outcome, appended AFTER egress. Append-only + write-once (INSERT allowed, no
+--    UPDATE/DELETE): a retry attempt-boundary APPENDS one row per attempt (DELIBERATELY no
+--    UNIQUE(dispatch_ref)), but a recorded outcome is tamper-evident — a bank-grade trail must not
+--    let a 'transport_failed' be silently flipped to 'response_received' (or a row erased).
 CREATE TABLE IF NOT EXISTS llm_dispatch_outcome (
     id           bigint      GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     dispatch_ref text        NOT NULL REFERENCES llm_dispatch(dispatch_ref),
@@ -77,6 +79,17 @@ CREATE TABLE IF NOT EXISTS llm_dispatch_outcome (
 );
 CREATE INDEX IF NOT EXISTS llm_dispatch_outcome_dispatch_idx
     ON llm_dispatch_outcome (dispatch_ref);
+
+CREATE OR REPLACE FUNCTION llm_dispatch_outcome_write_once() RETURNS trigger AS $$
+BEGIN
+    RAISE EXCEPTION 'llm_dispatch_outcome records are write-once: % not allowed on id=%',
+        TG_OP, COALESCE(OLD.id, NEW.id);
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE TRIGGER llm_dispatch_outcome_no_mutation
+    BEFORE UPDATE OR DELETE ON llm_dispatch_outcome
+    FOR EACH ROW EXECUTE FUNCTION llm_dispatch_outcome_write_once();
 
 -- 4) Run <-> logical-call association (mirrors 0998 ingestion_run_object): "which LLM calls did
 --    this run make" (UNIQUE leads on ingestion_run_id) and "which runs used this call" (index).

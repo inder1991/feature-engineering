@@ -28,6 +28,8 @@ def durable_dsn(monkeypatch, _dsn):
     with psycopg.connect(_dsn, autocommit=True) as c:
         c.execute("ALTER TABLE llm_dispatch_subject "
                   "DISABLE TRIGGER llm_dispatch_subject_no_mutation")
+        c.execute("ALTER TABLE llm_dispatch_outcome "
+                  "DISABLE TRIGGER llm_dispatch_outcome_no_mutation")
         c.execute("ALTER TABLE llm_dispatch DISABLE TRIGGER llm_dispatch_no_mutation")
         c.execute("DELETE FROM llm_dispatch_subject WHERE dispatch_ref IN "
                   "(SELECT dispatch_ref FROM llm_dispatch WHERE logical_call_ref = ANY(%s))",
@@ -36,6 +38,8 @@ def durable_dsn(monkeypatch, _dsn):
         c.execute("ALTER TABLE llm_dispatch ENABLE TRIGGER llm_dispatch_no_mutation")
         c.execute("ALTER TABLE llm_dispatch_subject "
                   "ENABLE TRIGGER llm_dispatch_subject_no_mutation")
+        c.execute("ALTER TABLE llm_dispatch_outcome "
+                  "ENABLE TRIGGER llm_dispatch_outcome_no_mutation")
 
 
 _SUBJECTS = [

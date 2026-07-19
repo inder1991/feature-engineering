@@ -149,6 +149,21 @@ def test_outcome_vocabulary_closed(conn) -> None:
                      "VALUES ('disp_out', 'lost_interest')")
 
 
+def test_llm_dispatch_outcome_is_write_once(conn) -> None:
+    # A recorded outcome is tamper-evident: INSERT (append per attempt) is allowed, but a bank-grade
+    # trail must forbid silently flipping 'transport_failed' -> 'response_received' or erasing a row.
+    _dispatch(conn, "disp_wo_out")
+    conn.execute("INSERT INTO llm_dispatch_outcome (dispatch_ref, outcome) "
+                 "VALUES ('disp_wo_out', 'transport_failed')")
+    conn.execute("INSERT INTO llm_dispatch_outcome (dispatch_ref, outcome) "
+                 "VALUES ('disp_wo_out', 'response_received')")   # append still allowed
+    with pytest.raises(psycopg.errors.RaiseException, match="write-once"), conn.transaction():
+        conn.execute("UPDATE llm_dispatch_outcome SET outcome = 'response_received' "
+                     "WHERE dispatch_ref = 'disp_wo_out' AND outcome = 'transport_failed'")
+    with pytest.raises(psycopg.errors.RaiseException, match="write-once"), conn.transaction():
+        conn.execute("DELETE FROM llm_dispatch_outcome WHERE dispatch_ref = 'disp_wo_out'")
+
+
 def test_child_rows_require_a_real_dispatch(conn) -> None:
     conn.execute("SELECT 1")
     with pytest.raises(psycopg.errors.ForeignKeyViolation), conn.transaction():

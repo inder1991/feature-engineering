@@ -78,6 +78,8 @@ def durable_dsn(monkeypatch, _dsn):
         c.execute("DELETE FROM ingestion_run_llm_call WHERE ingestion_run_id = %s", (_RUN_ID,))
         c.execute("ALTER TABLE llm_dispatch_subject "
                   "DISABLE TRIGGER llm_dispatch_subject_no_mutation")
+        c.execute("ALTER TABLE llm_dispatch_outcome "
+                  "DISABLE TRIGGER llm_dispatch_outcome_no_mutation")
         c.execute("ALTER TABLE llm_dispatch DISABLE TRIGGER llm_dispatch_no_mutation")
         c.execute("DELETE FROM llm_dispatch_outcome WHERE dispatch_ref IN "
                   "(SELECT dispatch_ref FROM llm_dispatch WHERE ingestion_run_id = %s)",
@@ -89,6 +91,8 @@ def durable_dsn(monkeypatch, _dsn):
         c.execute("ALTER TABLE llm_dispatch ENABLE TRIGGER llm_dispatch_no_mutation")
         c.execute("ALTER TABLE llm_dispatch_subject "
                   "ENABLE TRIGGER llm_dispatch_subject_no_mutation")
+        c.execute("ALTER TABLE llm_dispatch_outcome "
+                  "ENABLE TRIGGER llm_dispatch_outcome_no_mutation")
         c.execute("ALTER TABLE llm_call DISABLE TRIGGER llm_call_no_mutation")
         c.execute("DELETE FROM llm_call WHERE task LIKE %s", ("test.c5t3.%",))
         c.execute("ALTER TABLE llm_call ENABLE TRIGGER llm_call_no_mutation")
