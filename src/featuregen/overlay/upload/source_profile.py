@@ -23,6 +23,11 @@ from dataclasses import dataclass
 from featuregen.overlay.evidence import AssertionStrength
 from featuregen.overlay.upload._headers import _ALIASES
 
+# The capability-profile schema version evidence writers stamp on profile-derived evidence
+# (Delivery B): bump when a profile's field sets (or the strength they confer) change, so stored
+# evidence stays traceable to the capability rules that produced it.
+SOURCE_CAPABILITY_PROFILE_VERSION = "scp-v1"
+
 
 @dataclass(frozen=True, slots=True)
 class SourceCapabilityProfile:

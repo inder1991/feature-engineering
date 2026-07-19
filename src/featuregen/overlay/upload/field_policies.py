@@ -131,6 +131,46 @@ _TABLE_ADVISORY = _recommendation(
 )
 
 
+# business_term / term_type / declared_type — glossary-curated advisory fields (Delivery B item 8).
+# A curated business term / term_type is advisory; a glossary-DECLARED SQL type is a HINT, never
+# physical-type authority — the RECOMMENDATION ceiling bars a load-bearing value however strong the
+# evidence (`data_type` below is the physical-type authority path).
+_GLOSSARY_ADVISORY = _recommendation(
+    display_rule=AnyOf((_LLM_PROPOSED, _SOURCE_PROPOSED, _SOURCE_ATTESTED, _HUMAN_CONFIRMED)),
+    operational_rule=_SOURCE_OR_HUMAN,
+)
+
+# entity — the source-declared entity is display/recommendation ONLY: a VERIFIED
+# `entity_assignment` fact remains the operational entity path (built in Delivery E).
+_ENTITY_ADVISORY = _recommendation(
+    display_rule=AnyOf((_LLM_PROPOSED, _SOURCE_PROPOSED, _SOURCE_ATTESTED, _HUMAN_CONFIRMED)),
+    operational_rule=_SOURCE_OR_HUMAN,
+)
+
+# data_type — the physical/operational type: OPERATIONAL only when a technical STRUCTURAL source
+# attests it (source/attested; a glossary-declared type enters as the `declared_type` HINT above,
+# and a human confirmation alone does not certify a physical type).
+_DATA_TYPE = FieldPolicy(
+    influence_max=InfluenceTier.OPERATIONAL,
+    display_rule=_SOURCE_OR_HUMAN,
+    operational_rule=_SOURCE_ATTESTED,
+    disqualifiers=_OPERATIONAL_DISQUALIFIERS,
+    resolution_mode=ResolutionMode.GENERIC_FIELD,
+    conflict_strategy=ConflictStrategy.PREFER_CONFIRMED,
+)
+
+# unit / currency — measure annotations: load-bearing only when source-ATTESTED or human-CONFIRMED
+# (_SOURCE_OR_HUMAN == AnyOf((_SOURCE_ATTESTED, _HUMAN_CONFIRMED)); never an LLM proposal alone, §8).
+_MEASURE_ANNOTATION = FieldPolicy(
+    influence_max=InfluenceTier.OPERATIONAL,
+    display_rule=_SOURCE_OR_HUMAN,
+    operational_rule=_SOURCE_OR_HUMAN,
+    disqualifiers=_OPERATIONAL_DISQUALIFIERS,
+    resolution_mode=ResolutionMode.GENERIC_FIELD,
+    conflict_strategy=ConflictStrategy.PREFER_CONFIRMED,
+)
+
+
 # The registry: object-field name -> its policy. Keyed by the field_name written to field_evidence.
 _POLICIES: dict[str, FieldPolicy] = {
     "concept": _CONCEPT,
@@ -150,6 +190,14 @@ _POLICIES: dict[str, FieldPolicy] = {
     "table_role": _TABLE_ADVISORY,
     "primary_entity": _TABLE_ADVISORY,
     "event_or_snapshot": _TABLE_ADVISORY,   # advisory: informs modelling, never load-bearing
+    # Source-authority fields (Delivery B item 8) — technical-CSV / glossary declared values.
+    "business_term": _GLOSSARY_ADVISORY,
+    "term_type": _GLOSSARY_ADVISORY,
+    "declared_type": _GLOSSARY_ADVISORY,    # glossary-declared SQL type: a HINT, never authority
+    "data_type": _DATA_TYPE,
+    "unit": _MEASURE_ANNOTATION,
+    "currency": _MEASURE_ANNOTATION,
+    "entity": _ENTITY_ADVISORY,             # operational path = VERIFIED entity_assignment (Del. E)
 }
 
 
