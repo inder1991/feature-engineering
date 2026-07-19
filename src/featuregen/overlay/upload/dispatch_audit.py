@@ -113,6 +113,42 @@ def record_dispatch(*, logical_call_ref: str, attempt_no: int, ingestion_run_id:
             f"attempt {attempt_no} — egress is not authorized") from exc
 
 
+def link_llm_call(*, llm_call_ref: str, dispatch_refs: Sequence[str],
+                  ingestion_run_id: str | None, stage: str) -> None:
+    """C5-T4: associate the logical ``llm_call`` back to the physical dispatch(es) that carried it
+    (``llm_call_dispatch``) and, when it served an ingestion run, to that run
+    (``ingestion_run_llm_call``). Same OWN-connection discipline as ``record_dispatch`` (fresh
+    ``get_settings().dsn`` connection, committed independently); both INSERTs are ``ON CONFLICT DO
+    NOTHING`` against the migration-1005 UNIQUEs, so a replay never duplicates an association.
+
+    FAIL-SOFT, deliberately unlike ``record_dispatch``'s raise: by the time the associations are
+    written, the pre-dispatch authorization AND the immutable llm_call are already durable — a
+    link-write failure loses convenience joins, not evidence — so it is logged and swallowed,
+    mirroring ``AuditingClient._record_outcome``'s post-egress posture. No DSN (tests / no-DB
+    harness) means no durable link store: logged, nothing written."""
+    dsn = get_settings().dsn
+    if not dsn:
+        logger.warning("no FEATUREGEN_DSN configured — llm_call linkage for %s not durably "
+                       "recorded", llm_call_ref)
+        return
+    try:
+        with psycopg.connect(dsn) as link_conn:   # own tx, committed on `with` exit
+            for dispatch_ref in dispatch_refs:
+                link_conn.execute(
+                    "INSERT INTO llm_call_dispatch (llm_call_ref, dispatch_ref) "
+                    "VALUES (%s, %s) ON CONFLICT (llm_call_ref, dispatch_ref) DO NOTHING",
+                    (llm_call_ref, dispatch_ref))
+            if ingestion_run_id is not None:
+                link_conn.execute(
+                    "INSERT INTO ingestion_run_llm_call (ingestion_run_id, llm_call_ref, stage) "
+                    "VALUES (%s, %s, %s) "
+                    "ON CONFLICT (ingestion_run_id, llm_call_ref, stage) DO NOTHING",
+                    (ingestion_run_id, llm_call_ref, stage))
+    except Exception:  # noqa: BLE001 — post-egress linkage must never mask the real result
+        logger.exception("llm_call linkage write failed for llm_call_ref=%s (run=%s, %d "
+                         "dispatches)", llm_call_ref, ingestion_run_id, len(dispatch_refs))
+
+
 def record_dispatch_outcome(*, dispatch_ref: str, outcome: str) -> None:
     """AFTER egress: append one ``llm_dispatch_outcome`` row (``response_received`` |
     ``transport_failed``) for a dispatch header, on the SAME own-connection discipline as
@@ -180,6 +216,14 @@ class AuditingClient:
         self._logical_call_ref = logical_call_ref
         self._redaction_version = redaction_version
         self._attempt_no = 0
+        self._dispatch_refs: list[str] = []
+
+    @property
+    def dispatch_refs(self) -> tuple[str, ...]:
+        """The dispatch_ref of every successfully audited physical attempt, in call order
+        (C5-T4): the caller links the logical llm_call back to these via ``link_llm_call``.
+        Read-only snapshot — fail-closed attempts (AuditUnavailable, no egress) never appear."""
+        return tuple(self._dispatch_refs)
 
     def call(self, request: LLMRequest) -> LLMResult:
         self._attempt_no += 1
@@ -201,6 +245,9 @@ class AuditingClient:
                 "(fail closed)", self._logical_call_ref, self._attempt_no)
             return LLMResult(output={}, self_reported_scores={}, call_ref="",
                              status=PROVIDER_TRANSIENT)
+        # The attempt is durably authorized — record it for llm_call linkage (C5-T4) BEFORE the
+        # provider call, so even a transport raise stays attributable to the logical call.
+        self._dispatch_refs.append(dispatch_ref)
         try:
             result = self._inner.call(request)
         except Exception:

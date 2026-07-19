@@ -60,8 +60,9 @@ def durable_dsn(monkeypatch, _dsn):
     """Point FEATUREGEN_DSN at the test cluster so the own-connection dispatch writes really
     commit, and durably create the ingestion_run row the dispatch header FK-references. Cleanup
     removes everything committed OUTSIDE the rolled-back request tx (mirror of
-    test_dispatch_audit's fixture): outcome → subject → dispatch (write-once triggers dropped
-    just long enough), the durable llm_call rows the DSN flips on, then the run row itself."""
+    test_dispatch_audit's fixture): the C5-T4 association rows FIRST (they FK dispatch, llm_call
+    AND the run), then outcome → subject → dispatch (write-once triggers dropped just long
+    enough), the durable llm_call rows the DSN flips on, then the run row itself."""
     monkeypatch.setenv("FEATUREGEN_DSN", _dsn)
     with psycopg.connect(_dsn, autocommit=True) as c:
         c.execute(
@@ -70,6 +71,11 @@ def durable_dsn(monkeypatch, _dsn):
             "'in_progress', now(), now()) ON CONFLICT (id) DO NOTHING", (_RUN_ID,))
     yield _RUN_ID
     with psycopg.connect(_dsn, autocommit=True) as c:
+        c.execute("DELETE FROM llm_call_dispatch WHERE dispatch_ref IN "
+                  "(SELECT dispatch_ref FROM llm_dispatch WHERE ingestion_run_id = %s) "
+                  "OR llm_call_ref IN (SELECT llm_call_ref FROM llm_call WHERE task LIKE %s)",
+                  (_RUN_ID, "test.c5t3.%"))
+        c.execute("DELETE FROM ingestion_run_llm_call WHERE ingestion_run_id = %s", (_RUN_ID,))
         c.execute("ALTER TABLE llm_dispatch_subject "
                   "DISABLE TRIGGER llm_dispatch_subject_no_mutation")
         c.execute("ALTER TABLE llm_dispatch DISABLE TRIGGER llm_dispatch_no_mutation")

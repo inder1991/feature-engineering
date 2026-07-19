@@ -43,7 +43,11 @@ from featuregen.intake.redaction import (
     build_llm_inputs,
     redact_free_text,
 )
-from featuregen.overlay.upload.dispatch_audit import AuditingClient, DispatchAuditContext
+from featuregen.overlay.upload.dispatch_audit import (
+    AuditingClient,
+    DispatchAuditContext,
+    link_llm_call,
+)
 from featuregen.overlay.upload.enrich_batch import (
     EGRESS,
     BatchCallResult,
@@ -379,7 +383,7 @@ def consume_audit_degradations() -> int:
     return n
 
 
-def _record_llm_call_durable(conn, **record_kwargs) -> None:
+def _record_llm_call_durable(conn, **record_kwargs) -> str:
     """Finding #20: by the time this runs, content has ALREADY egressed to the provider — so the
     immutable llm_call record must NOT share the upload transaction's fate (a later graph/DB
     failure in the same request would erase the evidence that data left the system). Mirror of the
@@ -397,20 +401,23 @@ def _record_llm_call_durable(conn, **record_kwargs) -> None:
     hazard, so egress-block events stay on the request conn.
 
     Best-effort fallback: if the separate connection cannot be opened/committed, the record is
-    written on the request conn — transactional evidence beats none — and the failure is logged."""
+    written on the request conn — transactional evidence beats none — and the failure is logged.
+
+    Returns the ``llm_call_ref`` of the row written (record_llm_call mints + returns it) so the
+    caller can associate the logical call to its dispatches/run (C5-T4 ``link_llm_call``)."""
     dsn = get_settings().dsn
     if dsn:
         try:
             with psycopg.connect(dsn) as audit_conn:  # own tx, committed on `with` exit
-                record_llm_call(audit_conn, **record_kwargs)
-            return
+                ref = record_llm_call(audit_conn, **record_kwargs)
+            return ref
         except Exception:  # noqa: BLE001 — degraded audit must never fail the (done) provider call
             logger.exception(
                 "durable llm_call audit write failed; falling back to the request connection")
             # #13 gap D: the degradation is COUNTED (per request context) so the enrichment stage
             # that carried this call can report audit_degraded instead of a log-only trace.
             _AUDIT_DEGRADED.set(_AUDIT_DEGRADED.get() + 1)
-    record_llm_call(conn, **record_kwargs)
+    return record_llm_call(conn, **record_kwargs)
 
 # Structural output schemas for the three enrichment tasks (single string field each).
 _SCHEMAS: dict[tuple[str, int], dict] = {
@@ -682,12 +689,14 @@ def audited_structured_call(conn, client: LLMClient, *, task: str, prompt_id: st
     # logical_call_ref is minted ONCE per logical call so its retry/repair attempts share it
     # (UNIQUE(logical_call_ref, attempt_no)). With no context, the client is used untouched.
     dispatch_client: LLMClient = client
+    auditing_client: AuditingClient | None = None
     if dispatch_audit is not None:
-        dispatch_client = AuditingClient(client, dispatch_audit, logical_call_ref=mint_id("lc"),
+        auditing_client = AuditingClient(client, dispatch_audit, logical_call_ref=mint_id("lc"),
                                          redaction_version=redaction_version)
+        dispatch_client = auditing_client
     outcome = drive_structured_call(
         dispatch_client, req, lambda output: reg.validate(schema_id, schema_version, output))
-    _record_llm_call_durable(   # #20: egress evidence survives an upload-transaction rollback
+    llm_call_ref = _record_llm_call_durable(   # #20: evidence survives an upload-tx rollback
         conn, run_id=_RUN, request=req, input_hash=compute_input_hash(req.inputs),
         redaction_version=redaction_version,
         input_redaction=({"redacted_spans": spans, "sample_strip": sample_audits}
@@ -695,6 +704,14 @@ def audited_structured_call(conn, client: LLMClient, *, task: str, prompt_id: st
         raw_output={"output": outcome.output, "self_reported_scores": outcome.self_reported_scores},
         validation_result=outcome.validation_result, repair_attempts=list(outcome.repair_attempts),
         latency_ms=None, cost_metadata=outcome.cost_metadata, created_by=identity_to_jsonb(actor))
+    if dispatch_audit is not None and auditing_client is not None:
+        # C5-T4 eligibility ordering: record → link → return. The llm_call is durable (above) and
+        # the dispatch/run associations commit HERE — before the output is handed back as eligible
+        # for cache/evidence. Fail-soft inside link_llm_call (authorization + llm_call already
+        # durable); with dispatch_audit=None this whole branch is skipped, byte-identical.
+        link_llm_call(llm_call_ref=llm_call_ref, dispatch_refs=auditing_client.dispatch_refs,
+                      ingestion_run_id=dispatch_audit.ingestion_run_id,
+                      stage=dispatch_audit.stage)
 
     if outcome.status == STATUS_FAILED:
         logger.warning("enrichment call %s (schema %s) failed: %s", task, schema_id,
