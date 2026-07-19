@@ -31,14 +31,27 @@ never reimplements:
   ``contract_input_hash``/``contract_output_hash`` alongside.
 
 ``CompileBudget`` is decremented once per compile (the mutable per-run allowance owned by the harness).
-``confirmed_event_id`` is re-queried from ``entity_bridge_edge`` for audit — never widening
-``active_bridges`` (finding #8) and never entering any hash (a per-event id is excluded from identity).
+
+**Universal-safety self-check (fail-closed, do NOT delegate).** The Task-7 ``check_operand_path``
+rejects only ``BindingSafety.unsafe`` and lets ``not_evaluated`` through, so the compiler is NOT allowed
+to trust the caller to scope ``roles`` perfectly: it re-runs ``build_physical_read_set``/``stage_safety``
+over EACH path and, if ANY operand/anchor/KEY column resolves ``not_evaluated`` (a read the scope never
+loaded), lands the SAME ``unresolved_safety_evaluation`` verdict single-source ``compile_contract`` does —
+never a resolved contract.
+
+``confirmed_event_ids_for_audit`` re-queries ``entity_bridge_edge`` for the durable
+``confirmed_event_id`` of every crossed VERIFIED bridge — a PURE AUDIT helper (never widening
+``active_bridges`` (finding #8), never entering any hash). It deliberately does NOT drive
+``declaration_status``/``contract_id``: a bridge revoked/expired MID-compile is caught by
+``revalidate_freshness``'s bridge fingerprint (the freshness OBSERVATION axis, excluded from identity) —
+the SOLE detector, so classification stays consistent with single-source.
 
 Read-only over the reused engine surfaces; nothing here edits ``declarations``/``assembly`` (§12).
 """
 from __future__ import annotations
 
 import hashlib
+from collections import Counter
 from dataclasses import dataclass, replace
 
 from featuregen.overlay.upload.planner.contracts import (
@@ -62,7 +75,9 @@ from featuregen.overlay.upload.planner.declarations import (
     CompileBudget,
     CompilerContext,
     FreshnessResult,
+    build_physical_read_set,
     revalidate_freshness,
+    stage_safety,
 )
 from featuregen.overlay.upload.planner.multisource_assembly import (
     _OPERAND_NEED_ROLE,
@@ -80,7 +95,6 @@ from featuregen.overlay.upload.planner.multisource_contracts import (
     MultiSourceBindingPlanV1,
     MultiSourceDeclarationEvidenceV1,
     MultiSourceReason,
-    MultiSourceReplayEnvelopeV1,
     OperandPathV1,
     OperandSlotV1,
     PathAggregation,
@@ -226,18 +240,25 @@ def union_freshness(conn, ctx: CompilerContext, plan: MultiSourceBindingPlanV1) 
 
 # ── audit re-query (never widens active_bridges; never enters identity) ──────────────────────────
 
+def _referenced_bridge_keys(plan: MultiSourceBindingPlanV1) -> list[str]:
+    """The sorted, deduped set of ``bridge_fact_key``s every operand path crosses — the ONE derivation
+    of the plan's referenced VERIFIED crossings (M-5: no duplicate inline computation)."""
+    return sorted({seg.bridge_fact_key
+                   for path in plan.operand_paths
+                   for seg in path.binding_plan.path_segments
+                   if seg.bridge_fact_key is not None})
+
+
 def confirmed_event_ids_for_audit(
         conn, plan: MultiSourceBindingPlanV1) -> tuple[tuple[str, str | None], ...]:
     """Re-query ``entity_bridge_edge`` for the durable ``confirmed_event_id`` of every VERIFIED bridge
-    the plan's operand paths cross (finding #8, spec §3.3). Audit-only: the projection's ``active_bridges``
-    deliberately does NOT select ``confirmed_event_id`` (no cardinality/per-event fields), so the store
-    re-reads it here instead of widening ``ActiveBridgeV1``. Returns sorted ``(fact_key, confirmed_event_id)``
-    pairs; the event ids are audit metadata and NEVER enter any hash (a per-event id is excluded from
-    the deterministic contract identity)."""
-    fact_keys = sorted({seg.bridge_fact_key
-                        for path in plan.operand_paths
-                        for seg in path.binding_plan.path_segments
-                        if seg.bridge_fact_key is not None})
+    the plan's operand paths cross (finding #8, spec §3.3). PURE AUDIT record: the projection's
+    ``active_bridges`` deliberately does NOT select ``confirmed_event_id`` (no cardinality/per-event
+    fields), so the store re-reads it here instead of widening ``ActiveBridgeV1``. Returns sorted
+    ``(fact_key, confirmed_event_id)`` pairs; the event ids are audit metadata and NEVER enter any hash
+    (a per-event id is excluded from the deterministic contract identity) and NEVER drive
+    ``declaration_status``/``contract_id`` — a mid-compile bridge mutation is the freshness axis' job."""
+    fact_keys = _referenced_bridge_keys(plan)
     if not fact_keys:
         return ()
     rows = conn.execute(
@@ -250,13 +271,24 @@ def confirmed_event_ids_for_audit(
 # ── final-combination checks + verdict mapping ───────────────────────────────────────────────────
 
 def _final_well_typed(plan: MultiSourceBindingPlanV1) -> bool:
-    """Every ``ordered_slot_id`` and the optional ``time_slot_id`` in the final expression references a
-    real operand slot present on the plan (§5 step 7 preservation, at the landing grain)."""
+    """The §5-step-7 operand-preservation check at the landing grain — BOTH directions:
+
+    1. every ``ordered_slot_id`` / optional ``time_slot_id`` the final expression references is a real
+       operand slot present on the plan (no dangling reference), AND
+    2. every operand slot is referenced EXACTLY once by the final expression — no operand silently
+       DROPPED from the combination, and no ``slot_id`` referenced twice.
+
+    (2) is the converse the earlier version missed: a landing that folds only some of its declared
+    operands, or double-counts one, is not a faithful realization of the declared combination."""
     slot_ids = {p.slot_id for p in plan.operand_paths}
     fe = plan.final_expression
-    if not set(fe.ordered_slot_ids) <= slot_ids:
-        return False
-    return fe.time_slot_id is None or fe.time_slot_id in slot_ids
+    referenced = list(fe.ordered_slot_ids)
+    if fe.time_slot_id is not None:
+        referenced.append(fe.time_slot_id)
+    if not set(referenced) <= slot_ids:
+        return False                                    # (1) a reference to a non-operand slot
+    counts = Counter(referenced)
+    return all(counts[slot_id] == 1 for slot_id in slot_ids)   # (2) each operand referenced ONCE
 
 
 def _output_additivity_coherent(plan: MultiSourceBindingPlanV1) -> bool:
@@ -339,21 +371,22 @@ def _inject_declarations(ctx: CompilerContext,
 
 def compile_multi_source_contract(
         conn, ctx: CompilerContext, plan: MultiSourceBindingPlanV1,
-        spec: MultiSourceContractSpecV1, *, base_envelope: MultiSourceReplayEnvelopeV1,
-        budget: CompileBudget) -> MultiSourceBindingPlanV1:
+        spec: MultiSourceContractSpecV1, *, budget: CompileBudget) -> MultiSourceBindingPlanV1:
     """Compile ONE assembled ``MultiSourceBindingPlanV1`` into a governed contract (spec §5 step 8, §6).
 
     Folds, in precedence order: (1) the Task-7 per-path checks over each ``OperandPathV1.binding_plan``
     (reused — never re-running the compiler here) with the spec's declarations injected into A's own
     context; (2) cross-path temporal consistency; (3) the final-combination well-typedness +
-    ``output_additivity`` coherence; then the compile-end (4) UNION freshness OBSERVATION by CALLING
-    ``revalidate_freshness`` with a union-catalog synthetic plan. Mints the deterministic, freshness-FREE
-    ``contract_id`` (+ input/output hashes), decrements the ``CompileBudget`` once, and re-queries
-    ``entity_bridge_edge`` for the audit ``confirmed_event_id``s. RESOLVES (``resolution_status`` =
-    ``resolved``, ``contract_result_status`` = ``resolved``) only when the per-path + final + union
-    checks all pass; a stale union yields ``unresolved_freshness`` but STILL a minted (identity-bearing)
-    contract id, exactly as the single-source compiler does. ``base_envelope`` is the replay fingerprint
-    material; its run id / input hash never enter the identity."""
+    ``output_additivity`` coherence; (4) the universal-safety SELF-CHECK — ``build_physical_read_set``/
+    ``stage_safety`` over each path, mapping any ``not_evaluated`` read (a KEY/anchor column the scope
+    never loaded) to ``unresolved_safety_evaluation`` exactly as single-source ``compile_contract`` does
+    (Task-7 lets ``not_evaluated`` through, so the compiler must NOT delegate this); then the compile-end
+    (5) UNION freshness OBSERVATION by CALLING ``revalidate_freshness`` with a union-catalog synthetic
+    plan. Mints the deterministic, freshness-FREE ``contract_id`` (+ input/output hashes) and decrements
+    the ``CompileBudget`` once. RESOLVES (``resolution_status`` = ``resolved``, ``contract_result_status``
+    = ``resolved``) only when the per-path + final + safety + union checks all pass; a stale union — or a
+    bridge revoked mid-compile — yields ``unresolved_freshness`` but STILL a minted (identity-bearing)
+    contract id, exactly as the single-source compiler does."""
     budget.remaining -= 1   # the per-compile decrement (the mutable per-run allowance, spec §6/C8)
 
     work_ctx = _inject_declarations(ctx, spec)
@@ -389,13 +422,15 @@ def compile_multi_source_contract(
     # (3) final-combination checks.
     final_reasons = _final_combination_reasons(plan)
 
-    # audit: re-query the durable confirmed_event_id for every crossed VERIFIED bridge (never widening
-    # active_bridges, never hashed) and fail closed if a referenced bridge is no longer VERIFIED.
-    referenced_bridges = {seg.bridge_fact_key for path in plan.operand_paths
-                          for seg in path.binding_plan.path_segments
-                          if seg.bridge_fact_key is not None}
-    audited = confirmed_event_ids_for_audit(conn, plan)
-    missing_bridges = referenced_bridges - {fk for fk, _ in audited}
+    # (4) universal-safety SELF-CHECK (I-1): Task-7 check_operand_path rejects only `unsafe` and lets
+    # `not_evaluated` through, so the compiler re-runs the reused build_physical_read_set/stage_safety
+    # over each path. A KEY/anchor column the ctx's read-scope never loaded resolves `not_evaluated` —
+    # a fail-closed, identity-bearing safety-evaluation gap, NEVER a resolved contract (mirrors the
+    # single-source compile_contract not_evaluated -> unresolved_safety_evaluation mapping).
+    safety_not_evaluated = any(
+        stage_safety(build_physical_read_set(work_ctx, path.binding_plan))[0]
+        is BindingSafety.not_evaluated
+        for path in plan.operand_paths)
 
     # assemble the freshness-FREE declaration verdict (ordered by precedence).
     semantic_reasons: list[MultiSourceReason] = []
@@ -405,23 +440,31 @@ def compile_multi_source_contract(
     if temporal_reason is not None:
         semantic_reasons.append(temporal_reason)
     semantic_reasons.extend(final_reasons)
-    if missing_bridges:
-        semantic_reasons.append(MultiSourceReason.technical_failure)
 
     declaration_ok = not semantic_reasons
     final_verdict = (DeclarationStatus.resolved if not final_reasons
                      else _declaration_status(final_reasons[0]))
 
-    if declaration_ok:
-        declaration_status = DeclarationStatus.resolved
-        resolution_status = MultiSourceReason.resolved
-        # freshness (observation) folds into the CONTRACT axis ONLY — CALL revalidate_freshness.
-        freshness = union_freshness(conn, work_ctx, plan)
-        contract_result_status = freshness.status
-    else:
+    if not declaration_ok:
         declaration_status = _declaration_status(semantic_reasons[0])
         resolution_status = semantic_reasons[0]
         contract_result_status = ContractResolutionStatus(declaration_status.value)
+    elif safety_not_evaluated:
+        # (I-1) a required KEY/anchor read never entered the read-scope -> the DECLARED safety is
+        # UNEVALUATED. Fail closed exactly like single-source (declarations.py:981-983): a freshness-
+        # free, identity-bearing declaration gap that can never mint a resolved contract. The assembly
+        # axis is otherwise sound, so resolution_status stays `resolved` (as with a stale union).
+        declaration_status = DeclarationStatus.unresolved_safety_evaluation
+        resolution_status = MultiSourceReason.resolved
+        contract_result_status = ContractResolutionStatus.unresolved_safety_evaluation
+    else:
+        declaration_status = DeclarationStatus.resolved
+        resolution_status = MultiSourceReason.resolved
+        # freshness (observation) folds into the CONTRACT axis ONLY — CALL revalidate_freshness. A
+        # bridge revoked/expired mid-compile is caught HERE by its bridge fingerprint (I-2), not by a
+        # compile-time bridge gate — so the union-freshness check is never skipped on that path.
+        freshness = union_freshness(conn, work_ctx, plan)
+        contract_result_status = freshness.status
 
     contract_id = multi_source_contract_id(plan, declaration_status=declaration_status)
     evidence = MultiSourceDeclarationEvidenceV1(
