@@ -114,23 +114,26 @@ def record_dispatch(*, logical_call_ref: str, attempt_no: int, ingestion_run_id:
 
 
 def link_llm_call(*, llm_call_ref: str, dispatch_refs: Sequence[str],
-                  ingestion_run_id: str | None, stage: str) -> None:
+                  ingestion_run_id: str | None, stage: str) -> bool:
     """C5-T4: associate the logical ``llm_call`` back to the physical dispatch(es) that carried it
     (``llm_call_dispatch``) and, when it served an ingestion run, to that run
     (``ingestion_run_llm_call``). Same OWN-connection discipline as ``record_dispatch`` (fresh
     ``get_settings().dsn`` connection, committed independently); both INSERTs are ``ON CONFLICT DO
     NOTHING`` against the migration-1005 UNIQUEs, so a replay never duplicates an association.
 
-    FAIL-SOFT, deliberately unlike ``record_dispatch``'s raise: by the time the associations are
-    written, the pre-dispatch authorization AND the immutable llm_call are already durable — a
-    link-write failure loses convenience joins, not evidence — so it is logged and swallowed,
-    mirroring ``AuditingClient._record_outcome``'s post-egress posture. No DSN (tests / no-DB
-    harness) means no durable link store: logged, nothing written."""
+    Returns ``ok``: ``True`` when the linkage was durably committed OR there is no durable link
+    store to write to (no DSN — the tests / no-DB harness, a designed path, not a failure);
+    ``False`` when the own-connection link write could not be committed. The best-effort commit
+    posture is UNCHANGED — this NEVER raises. The ingestion seam (``audited_structured_call`` /
+    ``audited_batch_call``) reads the bool to enforce C5 eligibility ordering: a ``False`` means the
+    logical outcome audit did NOT commit, so the enrichment result is DISCARDED (not eligible for
+    cache/evidence). The pre-dispatch authorization AND the immutable llm_call are already durable,
+    so a ``False`` loses convenience joins + defers the enrichment, never evidence."""
     dsn = get_settings().dsn
     if not dsn:
         logger.warning("no FEATUREGEN_DSN configured — llm_call linkage for %s not durably "
                        "recorded", llm_call_ref)
-        return
+        return True   # no durable link store to write to — the designed no-DB path, not a failure
     try:
         with psycopg.connect(dsn) as link_conn:   # own tx, committed on `with` exit
             for dispatch_ref in dispatch_refs:
@@ -144,9 +147,11 @@ def link_llm_call(*, llm_call_ref: str, dispatch_refs: Sequence[str],
                     "VALUES (%s, %s, %s) "
                     "ON CONFLICT (ingestion_run_id, llm_call_ref, stage) DO NOTHING",
                     (ingestion_run_id, llm_call_ref, stage))
+        return True
     except Exception:  # noqa: BLE001 — post-egress linkage must never mask the real result
         logger.exception("llm_call linkage write failed for llm_call_ref=%s (run=%s, %d "
                          "dispatches)", llm_call_ref, ingestion_run_id, len(dispatch_refs))
+        return False
 
 
 def record_dispatch_outcome(*, dispatch_ref: str, outcome: str) -> None:
@@ -174,6 +179,25 @@ def record_dispatch_outcome(*, dispatch_ref: str, outcome: str) -> None:
                          dispatch_ref, outcome)
         raise AuditUnavailable(
             f"dispatch outcome could not be durably committed for {dispatch_ref!r}") from exc
+
+
+def dispatch_egress_status(conn, dispatch_ref: str) -> str:
+    """The latest llm_dispatch_outcome ('response_received'|'transport_failed') for the dispatch, or
+    'egress_outcome_unknown' when the llm_dispatch header exists but has NO outcome row (crash between
+    record_dispatch and the outcome write) — never 'not sent': the pre-dispatch record proves egress
+    was AUTHORIZED and may have occurred.
+
+    Plain read on the PASSED connection (no own connection): the caller owns the transaction. The
+    latest outcome wins (order by recorded_at then id) because a retry attempt-boundary may append
+    more than one outcome row per dispatch_ref. A dispatch with no outcome row is
+    'egress_outcome_unknown' — the immutable pre-dispatch header in ``llm_dispatch`` is the proof
+    that egress was authorized, so the honest classification is UNKNOWN, never 'not sent'."""
+    outcome = conn.execute(
+        "SELECT outcome FROM llm_dispatch_outcome WHERE dispatch_ref = %s "
+        "ORDER BY recorded_at DESC, id DESC LIMIT 1", (dispatch_ref,)).fetchone()
+    if outcome is not None:
+        return outcome[0]
+    return "egress_outcome_unknown"
 
 
 # ---- C5-T3: the auditing-client wrapper (the dispatch seam) --------------------------------------

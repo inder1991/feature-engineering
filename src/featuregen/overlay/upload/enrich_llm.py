@@ -707,11 +707,20 @@ def audited_structured_call(conn, client: LLMClient, *, task: str, prompt_id: st
     if dispatch_audit is not None and auditing_client is not None:
         # C5-T4 eligibility ordering: record → link → return. The llm_call is durable (above) and
         # the dispatch/run associations commit HERE — before the output is handed back as eligible
-        # for cache/evidence. Fail-soft inside link_llm_call (authorization + llm_call already
-        # durable); with dispatch_audit=None this whole branch is skipped, byte-identical.
-        link_llm_call(llm_call_ref=llm_call_ref, dispatch_refs=auditing_client.dispatch_refs,
-                      ingestion_run_id=dispatch_audit.ingestion_run_id,
-                      stage=dispatch_audit.stage)
+        # for cache/evidence. C5-T6: an outcome-audit (link) FAILURE DISCARDS the result — the
+        # provider output is not eligible for cache/evidence until the logical outcome audit
+        # committed. The pre-dispatch authorization + the immutable llm_call are already durable, so
+        # this loses convenience joins + defers the enrichment, never evidence. Scoped to the
+        # dispatch_audit-present (ingestion) path ONLY; with dispatch_audit=None this whole branch
+        # is skipped and behavior is byte-identical.
+        if not link_llm_call(llm_call_ref=llm_call_ref,
+                             dispatch_refs=auditing_client.dispatch_refs,
+                             ingestion_run_id=dispatch_audit.ingestion_run_id,
+                             stage=dispatch_audit.stage):
+            logger.warning("enrichment call %s (schema %s) audit-degraded: the logical outcome "
+                           "audit did not commit — discarding the enrichment result", task,
+                           schema_id)
+            return None                   # discard — not eligible for cache/evidence
 
     if outcome.status == STATUS_FAILED:
         logger.warning("enrichment call %s (schema %s) failed: %s", task, schema_id,
@@ -1073,11 +1082,25 @@ def audited_batch_call(conn, client: LLMClient, *, task: str, prompt_id: str, sc
         cost_metadata={**cost, "batch": summary}, created_by=identity_to_jsonb(actor))
     if dispatch_audit is not None and auditing_client is not None:
         # C5-T4 eligibility ordering (mirrors audited_structured_call): record → link → return.
-        # Fail-soft inside link_llm_call — the pre-dispatch authorization + the llm_call are
-        # already durable; with dispatch_audit=None this branch is skipped, byte-identical.
-        link_llm_call(llm_call_ref=llm_call_ref, dispatch_refs=auditing_client.dispatch_refs,
-                      ingestion_run_id=dispatch_audit.ingestion_run_id,
-                      stage=dispatch_audit.stage)
+        # C5-T6: an outcome-audit (link) FAILURE DISCARDS the result — mark every INCLUDED ref
+        # MISSING so nothing is harvested/cached (the same all-MISSING discard the STATUS_FAILED
+        # path above uses), leaving the fallback ladder to recover it. The pre-dispatch
+        # authorization + the immutable llm_call are already durable; only the convenience linkage
+        # failed. Scoped to the dispatch_audit-present (ingestion) path ONLY; with
+        # dispatch_audit=None this branch is skipped and behavior is byte-identical.
+        if not link_llm_call(llm_call_ref=llm_call_ref,
+                             dispatch_refs=auditing_client.dispatch_refs,
+                             ingestion_run_id=dispatch_audit.ingestion_run_id,
+                             stage=dispatch_audit.stage):
+            logger.warning("batch %s (schema %s) audit-degraded: the logical outcome audit did not "
+                           "commit — discarding the enrichment result", task, schema_id)
+            discarded = validate_batch_results(included, [], out_key, accept,
+                                               extract=extract, ref_aware=ref_aware)
+            return BatchCallResult(
+                outcomes=tuple(egress_outcomes) + tuple(discarded),
+                provider_calls=outcome.provider_calls,
+                input_tokens=int(cost.get("input_tokens", 0)),
+                output_tokens=int(cost.get("output_tokens", 0)))
 
     return BatchCallResult(
         outcomes=tuple(egress_outcomes) + tuple(item_outcomes),
