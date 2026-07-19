@@ -76,13 +76,17 @@ def test_effective_needs_external_is_projection_sourced_not_column(db):
     assert _detail_in_list(
         db, c.contract_id)["effective_validation_status"] == "needs_external_validation"
 
-    # PROOF the read is projection-sourced: mutate ONLY the legacy 1003 column to a passing value.
-    db.execute("UPDATE contract SET validation_status = 'DESIGN_CHECKED', "
-               "verification = 'DATA-CHECKED' WHERE contract_id = %s", (c.contract_id,))
+    # PROOF the read is projection-sourced: the `contract` row is now IMMUTABLE (H2d WORM), so the old
+    # "mutate the legacy 1003 column" proof is physically impossible (that RAISE is covered by the 1012
+    # migration test). Instead mutate ONLY the PROJECTION state row (the authority the effective read is
+    # sourced from) to a PASSING value and show the effective read FOLLOWS it, while the untouched 1003
+    # `verification` column stays DESIGN-CHECKED — i.e. the effective stamp is NOT that legacy column.
+    db.execute("UPDATE feature_contract_validation_state SET validation_status = 'design_checked', "
+               "effective_verification = 'DATA-CHECKED' WHERE contract_id = %s", (c.contract_id,))
     detail2 = get_contract_detail(db, c.contract_id)
-    # Effective fields UNCHANGED — they reflect the projection state row, not the mutated column.
-    assert detail2["effective_validation_status"] == "needs_external_validation"
-    assert detail2["effective_verification"] == "UNVERIFIED"
+    assert detail2["effective_validation_status"] == "design_checked"
+    assert detail2["effective_verification"] == "DATA-CHECKED"
+    assert detail2["verification"] == "DESIGN-CHECKED"   # the 1003 column, untouched — not the source
 
 
 # --------------------------------------------------------------------------------------------------

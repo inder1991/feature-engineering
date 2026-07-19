@@ -503,6 +503,46 @@ def contract_read_status(conn, contract_id: str) -> tuple[str, str]:
     return _apply_dependency_read_gate(conn, contract_id, eff_status, eff_verif)
 
 
+def _contract_requirements(conn, contract_id: str) -> list[dict]:
+    """H2d — the IMMUTABLE requirement rows (1009) for a contract version: requirement_id / code /
+    params / blocking. Ordered deterministically (created_at, id). Empty for a legacy / pre-C4
+    contract (which never fabricated requirement rows)."""
+    rows = conn.execute(
+        "SELECT requirement_id, code, params_json, blocking FROM feature_validation_requirement "
+        "WHERE contract_id = %s ORDER BY created_at, requirement_id", (contract_id,)).fetchall()
+    return [{"requirement_id": r[0], "code": r[1], "params": r[2], "blocking": r[3]} for r in rows]
+
+
+def _invalidation_reasons(conn, contract_id: str) -> list[dict]:
+    """H2d — the drift-invalidation reasons for a contract version, read from the APPEND-ONLY INVALIDATED
+    validation-event payloads (H2c). Each entry is the event payload (``reason`` + the catalog identity
+    that drifted). Ordered by event ``seq``. Empty when the contract was never invalidated."""
+    rows = conn.execute(
+        "SELECT payload FROM feature_contract_validation_event "
+        "WHERE contract_id = %s AND event_type = 'INVALIDATED' ORDER BY seq", (contract_id,)).fetchall()
+    return [r[0] for r in rows]
+
+
+def _contract_history(conn, feature_id: str, contract_id: str) -> dict:
+    """H2d — history read STRICTLY from the immutable sources: the ``contract`` VERSIONS for this feature
+    (the append-only version log, NEVER the mutable ``feature`` row) + this contract version's
+    APPEND-ONLY validation-event stream (1009). Reconstructing history from the compat ``feature`` row
+    would be a lie — that row only mirrors the CURRENT pointer."""
+    versions = conn.execute(
+        "SELECT contract_id, version, verification, initial_validation_status, created_at "
+        "FROM contract WHERE feature_id = %s ORDER BY version", (feature_id,)).fetchall()
+    events = conn.execute(
+        "SELECT event_type, payload, created_at FROM feature_contract_validation_event "
+        "WHERE contract_id = %s ORDER BY seq", (contract_id,)).fetchall()
+    return {
+        "versions": [{"contract_id": v[0], "version": v[1], "verification": v[2],
+                      "initial_validation_status": v[3], "created_at": v[4].isoformat()}
+                     for v in versions],
+        "events": [{"event_type": e[0], "payload": e[1], "created_at": e[2].isoformat()}
+                   for e in events],
+    }
+
+
 def list_contracts(conn, *, limit: int = 50) -> list[dict]:
     """The governed-contract inventory (registry READ surface).
 
@@ -511,13 +551,24 @@ def list_contracts(conn, *, limit: int = 50) -> list[dict]:
     for consumers), LEFT JOINed on ``contract_id``, gated FAIL-CLOSED by the projection's read
     readiness. ``verification`` remains the 1003 INITIAL confirm-time stamp (kept, additive) — the
     effective fields, not it, are authoritative, and a lagged/degraded projection serves
-    'unavailable'/UNVERIFIED here, never that legacy column."""
+    'unavailable'/UNVERIFIED here, never that legacy column.
+
+    H2d (ADDITIVE): each row also exposes, sourced from the pointer + immutable versions/events —
+    the feature's CURRENT contract (``current_contract_id``/``pointer_version`` from
+    ``feature_current_contract``, + ``is_current``), the at-confirm INITIAL stamp columns
+    (``initial_validation_status``/``initial_verification``, 1011), the immutable snapshot
+    ``metadata_input_fingerprint`` (1008/MF-3), the planner ids (``physical_plan_id``/
+    ``planner_declaration_id`` — NULL until H1a/H3), the contract's ``requirements`` (1009 rows), and
+    its ``invalidation_reasons`` (INVALIDATED event payloads, H2c)."""
     ready = feature_validation_projection.is_read_ready(conn)   # ONE fail-closed gate for the read
     rows = conn.execute(
         "SELECT c.contract_id, c.feature_id, c.feature_name, c.version, c.verification, "
-        "c.created_at, s.validation_status, s.effective_verification "
+        "c.created_at, s.validation_status, s.effective_verification, "
+        "c.initial_validation_status, c.initial_verification, c.metadata_input_fingerprint, "
+        "c.physical_plan_id, c.planner_declaration_id, p.contract_id, p.pointer_version "
         "FROM contract c "
         "LEFT JOIN feature_contract_validation_state s ON s.contract_id = c.contract_id "
+        "LEFT JOIN feature_current_contract p ON p.feature_id = c.feature_id "
         "ORDER BY c.created_at DESC LIMIT %s", (limit,)).fetchall()
     out = []
     for r in rows:
@@ -528,7 +579,14 @@ def list_contracts(conn, *, limit: int = 50) -> list[dict]:
         out.append({"contract_id": r[0], "feature_id": r[1], "feature_name": r[2], "version": r[3],
                     "verification": r[4], "created_at": r[5].isoformat(),
                     "effective_validation_status": eff_status,
-                    "effective_verification": eff_verif})
+                    "effective_verification": eff_verif,
+                    "current_contract_id": r[13], "pointer_version": r[14],
+                    "is_current": r[13] is not None and r[13] == r[0],
+                    "initial_validation_status": r[8], "initial_verification": r[9],
+                    "metadata_input_fingerprint": r[10],
+                    "physical_plan_id": r[11], "planner_declaration_id": r[12],
+                    "requirements": _contract_requirements(conn, r[0]),
+                    "invalidation_reasons": _invalidation_reasons(conn, r[0])})
     return out
 
 
@@ -537,10 +595,19 @@ def get_contract_detail(conn, contract_id: str) -> dict | None:
     ``feature_contract_validation`` PROJECTION (``effective_validation_status``/
     ``effective_verification``), gated FAIL-CLOSED. ``verification`` stays the 1003 INITIAL stamp
     (kept, additive); the effective fields are the authoritative ones and never fall back to that
-    legacy column when the projection is degraded/lagged."""
+    legacy column when the projection is degraded/lagged.
+
+    H2d (ADDITIVE): also exposes the feature's CURRENT pointer (``current_contract_id``/
+    ``pointer_version`` + ``is_current``), the at-confirm INITIAL stamp columns
+    (``initial_validation_status``/``initial_verification``), the immutable snapshot
+    ``metadata_input_fingerprint``, the planner ids (NULL until H1a/H3), the contract's
+    ``requirements`` (1009), its ``invalidation_reasons`` (H2c INVALIDATED payloads), and a ``history``
+    section read STRICTLY from the immutable ``contract`` versions + validation-event stream."""
     row = conn.execute(
         "SELECT contract_id, feature_id, feature_name, definition, version, verification, intent_id, "
-        "created_at FROM contract WHERE contract_id = %s", (contract_id,)).fetchone()
+        "created_at, initial_validation_status, initial_verification, metadata_input_fingerprint, "
+        "physical_plan_id, planner_declaration_id FROM contract WHERE contract_id = %s",
+        (contract_id,)).fetchone()
     if row is None:
         return None
     ready = feature_validation_projection.is_read_ready(conn)
@@ -550,11 +617,24 @@ def get_contract_detail(conn, contract_id: str) -> dict | None:
         None if state is None else state["effective_verification"])
     # H2c: second fail-closed gate on the single-contract detail read too.
     eff_status, eff_verif = _apply_dependency_read_gate(conn, contract_id, eff_status, eff_verif)
+    pointer = conn.execute(
+        "SELECT contract_id, pointer_version FROM feature_current_contract WHERE feature_id = %s",
+        (row[1],)).fetchone()
+    current_contract_id = pointer[0] if pointer is not None else None
     return {"contract_id": row[0], "feature_id": row[1], "feature_name": row[2], "definition": row[3],
             "version": row[4], "verification": row[5], "intent_id": row[6],
             "created_at": row[7].isoformat(),
             "effective_validation_status": eff_status,
-            "effective_verification": eff_verif}
+            "effective_verification": eff_verif,
+            "current_contract_id": current_contract_id,
+            "pointer_version": pointer[1] if pointer is not None else None,
+            "is_current": current_contract_id is not None and current_contract_id == row[0],
+            "initial_validation_status": row[8], "initial_verification": row[9],
+            "metadata_input_fingerprint": row[10],
+            "physical_plan_id": row[11], "planner_declaration_id": row[12],
+            "requirements": _contract_requirements(conn, contract_id),
+            "invalidation_reasons": _invalidation_reasons(conn, contract_id),
+            "history": _contract_history(conn, row[1], contract_id)}
 
 
 def feature_detail(conn, feature_id: str, *, roles=()) -> dict | None:

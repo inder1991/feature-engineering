@@ -407,7 +407,14 @@ def test_concurrent_confirms_serialize_no_skip_or_regress(_dsn) -> None:
                        "WHERE projection_name = %s", (PROJECTION_NAME,))
             cc.execute("DELETE FROM projection_skips WHERE projection_name = %s", (PROJECTION_NAME,))
             cc.execute("DELETE FROM projection_degraded WHERE projection_name = %s", (PROJECTION_NAME,))
+            # `contract` is now WORM (H2d): its BEFORE UPDATE/DELETE row trigger fires even for a
+            # superuser, so the committed race contracts can't be DELETEd normally. Suppress user
+            # triggers on THIS throwaway autocommit cleanup connection only (session_replication_role
+            # is superuser-only + session-local) so the scoped delete of just these two committed rows
+            # works — no global TRUNCATE needed.
+            cc.execute("SET session_replication_role = replica")
             cc.execute("DELETE FROM contract WHERE contract_id IN (%s, %s)", (cid_a, cid_b))
             cc.execute("DELETE FROM feature WHERE feature_id IN (%s, %s)", (fid_a, fid_b))
+            cc.execute("SET session_replication_role = origin")
         ca.close()
         cb.close()
