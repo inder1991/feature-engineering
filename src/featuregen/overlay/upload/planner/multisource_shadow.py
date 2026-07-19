@@ -52,6 +52,7 @@ from featuregen.overlay.upload.planner.contracts import (
     PhysicalReadSetV1,
 )
 from featuregen.overlay.upload.planner.declarations import CompileBudget
+from featuregen.overlay.upload.planner.multisource_compile import crossing_audit_by_slot
 from featuregen.overlay.upload.planner.multisource_contracts import (
     GovernedEndpointV1,
     GovernedSourceBindingV1,
@@ -186,7 +187,7 @@ def _normalized_intent_hash(intent: MultiSourcePlannerIntentV1) -> str:
               "path_strategy": _strategy_dict(op.path_strategy),
               "source_binding": _source_binding_dict(op.source_binding)}
              for op in intent.operands),
-            key=lambda d: d["slot_id"]),
+            key=lambda d: str(d["slot_id"])),
     }
     return "nih_" + payload_hash(payload)
 
@@ -253,11 +254,14 @@ def _compile_completeness(result: MultiSourcePlanningResultV1) -> CompileComplet
 
 
 def _map_result(intent_id: str, intent: MultiSourcePlannerIntentV1,
-                result: MultiSourcePlanningResultV1, *, now: datetime
+                result: MultiSourcePlanningResultV1, *,
+                crossings: Mapping[str, Mapping[str, Any]], now: datetime
                 ) -> tuple[IntentResultRowV1, list[CandidateRowV1], list[OperandObservationRowV1]]:
     """Map one intent's ``MultiSourcePlanningResultV1`` to the Task-10 store rows (parent + candidate
     + operand), honouring the two-axis rule. ``capture_status`` is a placeholder — the store's
-    two-phase write determines the stored value."""
+    two-phase write determines the stored value. ``crossings`` is the pre-collected audit map for this
+    intent — ``{plan_id: {slot_id: crossing records}}`` — gathered on the fixture connection BEFORE the
+    rollback (I-1, finding #13), since ``confirmed_event_id`` must be re-queried while the bridges live."""
     slots_by_id = {op.slot_id: op for op in intent.operands}
     intent_row = IntentResultRowV1(
         run_id=result.run_id, intent_id=intent_id,
@@ -282,6 +286,7 @@ def _map_result(intent_id: str, intent: MultiSourcePlannerIntentV1,
             replay_envelope_hash=result.replay_envelope.input_hash,
             rank=rank, declaration_evidence=_evidence_dict(plan.declaration_evidence),
             created_at=now))
+        plan_crossings = crossings.get(plan.plan_id, {})
         for path in plan.operand_paths:
             slot = slots_by_id.get(path.slot_id)
             operand_rows.append(OperandObservationRowV1(
@@ -292,6 +297,7 @@ def _map_result(intent_id: str, intent: MultiSourcePlannerIntentV1,
                 path_strategy=_strategy_dict(path.path_strategy),
                 governed_endpoints=[_endpoint_dict(e) for e in path.governed_endpoints],
                 source_binding=_source_binding_dict(slot.source_binding) if slot is not None else {},
+                crossings=list(plan_crossings.get(path.slot_id, ())),
                 created_at=now))
     return intent_row, candidate_rows, operand_rows
 
@@ -331,7 +337,8 @@ def run_multisource_assembly_shadow(
         for iid in intent_ids:
             results[iid] = _synthetic_result(intents[iid], run_id, MultiSourceReason.technical_failure)
         planning_conn.rollback()
-        _persist_and_reconcile(telemetry_conn, run_id, intents, results, now=now)
+        # No plan assembled (all technical) -> no operand paths -> no crossings to collect.
+        _persist_and_reconcile(telemetry_conn, run_id, intents, results, {}, now=now)
         return tuple(results[iid] for iid in intent_ids)
 
     # (2b) plan each intent inside a per-intent savepoint; ONE mutable run-owned budget across intents.
@@ -359,24 +366,53 @@ def run_multisource_assembly_shadow(
             logger.exception("multisource shadow planner error intent=%s run=%s", iid, run_id)
             results[iid] = _synthetic_result(intent, run_id, MultiSourceReason.technical_failure)
 
-    # (3) results are retained in `results` (frozen, conn-free). (4) roll back the fixture transaction.
+    # (3) results are retained in `results` (frozen, conn-free). (3b) collect the per-crossing AUDIT
+    # records (I-1) on planning_conn while the bridges are STILL visible — confirmed_event_id must be
+    # re-queried BEFORE the rollback discards the fixture transaction (finding #13).
+    crossings = _collect_crossings(planning_conn, ctx, results, run_id)
+    # (4) roll back the fixture transaction.
     planning_conn.rollback()
 
     # (5) persist each on the durable telemetry connection + (6) reconcile.
-    _persist_and_reconcile(telemetry_conn, run_id, intents, results, now=now)
+    _persist_and_reconcile(telemetry_conn, run_id, intents, results, crossings, now=now)
     return tuple(results[iid] for iid in intent_ids)
+
+
+def _collect_crossings(
+        planning_conn, ctx, results: Mapping[str, MultiSourcePlanningResultV1], run_id: str | None,
+) -> dict[str, dict[str, Mapping[str, Any]]]:
+    """Gather the per-operand governed-crossing AUDIT records for every candidate plan (I-1), keyed
+    ``{intent_id: {plan_id: {slot_id: crossing records}}}``. Runs on ``planning_conn`` while the fixture
+    bridges are still live (BEFORE the rollback) so ``confirmed_event_id`` is re-queryable. Each plan's
+    re-query is isolated in its OWN savepoint: a failure degrades that plan's telemetry to empty
+    crossings (logged) but never poisons the outer transaction or the plan's other rows."""
+    crossings: dict[str, dict[str, Mapping[str, Any]]] = {}
+    for iid, result in results.items():
+        by_plan: dict[str, Mapping[str, Any]] = {}
+        for plan in result.candidate_plans:
+            try:
+                with planning_conn.transaction():
+                    by_plan[plan.plan_id] = crossing_audit_by_slot(planning_conn, ctx, plan)
+            except Exception:
+                logger.exception("multisource shadow crossings audit failed intent=%s plan=%s run=%s",
+                                 iid, plan.plan_id, run_id)
+                by_plan[plan.plan_id] = {}
+        crossings[iid] = by_plan
+    return crossings
 
 
 def _persist_and_reconcile(telemetry_conn, run_id: str | None,
                            intents: Mapping[str, MultiSourcePlannerIntentV1],
-                           results: Mapping[str, MultiSourcePlanningResultV1], *,
+                           results: Mapping[str, MultiSourcePlanningResultV1],
+                           crossings: Mapping[str, Mapping[str, Mapping[str, Any]]], *,
                            now: datetime) -> None:
     """Map + write every retained result on the DURABLE connection, then reconcile. A per-intent
     store-write failure is caught (never re-propagated) so the manifest is retained and the loss
-    surfaces via reconciliation — never a circular self-report."""
+    surfaces via reconciliation — never a circular self-report. ``crossings`` is the pre-collected
+    per-intent audit map (I-1); an intent with no candidate plan contributes none."""
     for iid in sorted(results):
         intent_row, candidate_rows, operand_rows = _map_result(
-            iid, intents[iid], results[iid], now=now)
+            iid, intents[iid], results[iid], crossings=crossings.get(iid, {}), now=now)
         try:
             write_intent_result(telemetry_conn, intent_row, candidate_rows, operand_rows)
         except Exception:

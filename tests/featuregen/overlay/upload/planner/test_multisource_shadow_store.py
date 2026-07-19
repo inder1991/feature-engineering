@@ -12,6 +12,7 @@ the CRITICAL two-axis rule — a resolved-ASSEMBLY-but-unresolved-CONTRACT plan 
 compile-INCOMPLETE on the contract axis, NOT a clean resolve (axes are not collapsed)."""
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime
 
 import pytest
@@ -225,6 +226,37 @@ def test_resolved_assembly_unresolved_contract_lands_compile_incomplete(db) -> N
     # Resolved on assembly, but NOT collapsed into a clean resolve — contract axis says incomplete.
     assert row["semantic_outcome"] == "resolved"
     assert row["compile_completeness"] == "incomplete"
+
+
+# ── crossings (I-1): governed-crossing audit evidence + payload-hash discipline ──
+
+
+def test_crossings_persist_and_exclude_confirmed_event_id_from_hash(db) -> None:
+    """I-1: the operand's governed ``crossings`` round-trip (incl. the AUDIT-only confirmed_event_id),
+    but the per-event confirmed_event_id is EXCLUDED from the divergent-duplicate payload_hash — hashing
+    only the deterministic crossing identity. A differing event id is idempotent; a differing authority
+    is a conflict."""
+    ms.write_manifest(db, _manifest())
+    crossing = {"kind": "governed_bridge", "catalog": "c2", "table": "public.acc",
+                "bridge_fact_key": "gbfk_1", "realization_ref": None, "authority": "verified",
+                "confirmed_event_id": "evt-gbfk_1"}
+    base = _operand()
+    ms.write_intent_result(db, _intent(), [_candidate()], [replace(base, crossings=[crossing])])
+
+    stored = ms.read_operands(db, "mrun_1", "i1", "bp_1")[0]["crossings"]
+    assert list(stored) == [crossing]   # full record persisted, incl. the audit confirmed_event_id
+
+    # a re-write differing ONLY in the per-event confirmed_event_id is IDEMPOTENT (excluded from hash)
+    status = ms.write_intent_result(
+        db, _intent(), [_candidate()],
+        [replace(base, crossings=[{**crossing, "confirmed_event_id": "evt-DIFFERENT"}])])
+    assert status is CaptureStatus.persisted
+
+    # ...but a re-write differing in the DETERMINISTIC crossing identity (authority) IS a conflict
+    with pytest.raises(DivergentDuplicateError):
+        ms.write_intent_result(
+            db, _intent(), [_candidate()],
+            [replace(base, crossings=[{**crossing, "authority": "unverified"}])])
 
 
 # ── two-phase capture (mirror 0999 write_run_and_plans) ──

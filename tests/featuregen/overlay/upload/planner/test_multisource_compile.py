@@ -63,6 +63,7 @@ from featuregen.overlay.upload.planner.multisource_compile import (
     MultiSourceContractSpecV1,
     compile_multi_source_contract,
     confirmed_event_ids_for_audit,
+    crossing_audit_by_slot,
     multi_source_contract_id,
     union_freshness,
 )
@@ -371,6 +372,27 @@ def test_confirmed_event_id_requeried_from_entity_bridge_edge_for_audit(resolved
     # carrying the durable confirmed_event_id (NEVER widening active_bridges)
     audit = confirmed_event_ids_for_audit(conn, plan)
     assert ("bfk_acct", "evt-bfk_acct") in audit
+
+
+def test_crossing_audit_by_slot_records_governed_crossings(resolved_topology):
+    # I-1: per-slot governed crossings — the VERIFIED bridge (authority=verified + audit
+    # confirmed_event_id, re-queried from entity_bridge_edge) and any declared realization — so
+    # crossing-governedness is falsifiable from persisted telemetry.
+    conn, scope = resolved_topology
+    operand = _operand(slot_id="op_0", catalog="core_banking")
+    ctx, plan = _assemble_identity(conn, scope, operand)
+
+    by_slot = crossing_audit_by_slot(conn, ctx, plan)
+
+    assert set(by_slot) == {"op_0"}
+    crossings = by_slot["op_0"]
+    assert crossings, "the cross-catalog operand crosses at least the VERIFIED bridge"
+    bridge = next(c for c in crossings if c["kind"] == "governed_bridge")
+    assert bridge["bridge_fact_key"] == "bfk_acct"
+    assert bridge["authority"] == "verified"
+    assert bridge["confirmed_event_id"] == "evt-bfk_acct"   # AUDIT-only, re-queried from the edge
+    # every recorded crossing is a governed authority (VERIFIED bridge / approved-or-declared realization)
+    assert all(c["authority"] in {"verified", "declared_join", "approved_join"} for c in crossings)
 
 
 # ── CompileBudget decremented by 1 per compile ──────────────────────────────────────────────────

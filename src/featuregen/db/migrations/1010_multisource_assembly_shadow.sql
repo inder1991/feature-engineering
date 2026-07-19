@@ -95,18 +95,32 @@ CREATE INDEX IF NOT EXISTS multisource_assembly_shadow_candidate_shape_idx
     ON multisource_assembly_shadow_candidate (contract_input_hash);
 
 -- Per-operand observation. Identities / enums / provenance ONLY (no free-form text): the operand's pin,
--- its semantic role, the per-path strategy, the governed endpoints (source + intermediates + landing), and
--- the governed source binding. governed_endpoints is a JSON array; the rest are JSON objects.
+-- its semantic role, the per-path strategy, the governed endpoints (source + intermediates + landing),
+-- the governed source binding, and the ORDERED governed crossings of its path (I-1). governed_endpoints
+-- and crossings are JSON arrays; the rest are JSON objects. role carries a CHECK over the closed
+-- SemanticRole vocabulary (M20), matching the discipline of the four intent_result axis columns.
+--
+-- crossings (I-1): one record per governed crossing/segment of the operand's binding_plan path, in path
+-- order — {kind, catalog, table, bridge_fact_key|realization_ref, authority, confirmed_event_id}. It makes
+-- crossing-governedness FALSIFIABLE from persisted telemetry (the gate asserts every crossing is a
+-- governed authority: a VERIFIED bridge or an approved/declared realization). confirmed_event_id is
+-- AUDIT-ONLY (re-queried from entity_bridge_edge for a crossed VERIFIED bridge): it is a per-EVENT id, so
+-- it is DELIBERATELY excluded from the divergent-duplicate payload_hash (which hashes only the
+-- deterministic crossing identity) and never enters any plan/contract identity.
 CREATE TABLE IF NOT EXISTS multisource_assembly_shadow_operand_obs (
     run_id                 text        NOT NULL,
     intent_id              text        NOT NULL,
     plan_id                text        NOT NULL,
     slot_id                text        NOT NULL,
     pin                    jsonb       NOT NULL CHECK (jsonb_typeof(pin) = 'object'),
-    role                   text        NOT NULL,
+    role                   text        NOT NULL CHECK (role IN
+                               ('measure', 'counted', 'time', 'numerator', 'denominator',
+                                'minuend', 'subtrahend')),
     path_strategy          jsonb       NOT NULL CHECK (jsonb_typeof(path_strategy) = 'object'),
     governed_endpoints     jsonb       NOT NULL CHECK (jsonb_typeof(governed_endpoints) = 'array'),
     source_binding         jsonb       NOT NULL CHECK (jsonb_typeof(source_binding) = 'object'),
+    crossings              jsonb       NOT NULL DEFAULT '[]'::jsonb
+                               CHECK (jsonb_typeof(crossings) = 'array'),
     payload_schema_version text        NOT NULL,
     created_at             timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (run_id, intent_id, plan_id, slot_id),

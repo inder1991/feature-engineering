@@ -56,6 +56,7 @@ from featuregen.overlay.upload.planner.multisource_shadow import (
 from featuregen.overlay.upload.planner.multisource_shadow_store import (
     read_candidates,
     read_intent_results,
+    read_operands,
     reconcile,
 )
 from featuregen.overlay.upload.upload_catalog import ensure_upload_catalog_adapter, table_ref
@@ -141,6 +142,14 @@ def _seed_resolved_topology(conn, service_actor, human_actor):
                          service_actor=service_actor, human_actor=human_actor)
     _watermark(conn, "core_banking", _NOW - timedelta(minutes=5))
     _watermark(conn, "wealth", _NOW - timedelta(minutes=5))
+
+
+def _seed_stale_union_topology(conn, service_actor, human_actor):
+    """The resolving topology, but with wealth's drift watermark STALE (2h > 60min SLA): every path
+    resolves on the ASSEMBLY axis, yet the compile-end UNION freshness observation fails — so the plan
+    lands resolved-assembly + INCOMPLETE-contract (the two axes are NEVER collapsed)."""
+    _seed_resolved_topology(conn, service_actor, human_actor)
+    _watermark(conn, "wealth", _NOW - timedelta(hours=2))   # stale -> union freshness unresolved
 
 
 def _adapter():
@@ -318,6 +327,54 @@ def test_telemetry_persists_despite_fixture_rollback_two_connection_boundary(
     # but the telemetry durably survives on the OTHER connection
     assert len(read_intent_results(db, "mrun_boundary")) == 1
     assert reconcile(db, "mrun_boundary").complete
+
+
+def test_resolved_assembly_stale_union_lands_compile_incomplete(
+        db, planning_conn, service_actor, human_actor):
+    """M22: a governed plan whose ASSEMBLY axis resolves but whose compile-end UNION freshness is stale
+    lands ``semantic_outcome=resolved`` + ``compile_completeness=incomplete`` in the store — the two
+    axes recorded separately, never collapsed into a clean resolve."""
+    _seed_stale_union_topology(planning_conn, service_actor, human_actor)
+
+    run_multisource_assembly_shadow(
+        planning_conn=planning_conn, telemetry_conn=db, adapter=_adapter(),
+        intents={"i_a": _ratio_intent()}, run_id="mrun_stale",
+        roles=("feature_engineer",), now=_NOW)
+
+    row = read_intent_results(db, "mrun_stale")[0]
+    assert row["semantic_outcome"] == "resolved"        # assembly axis: a governed plan WAS assembled
+    assert row["compile_completeness"] == "incomplete"  # contract axis: stale union -> NOT clean resolve
+    assert row["technical_status"] == "ok"              # not a technical/truncation failure
+
+
+def test_governed_crossings_persisted_for_resolved_operand(
+        db, planning_conn, service_actor, human_actor):
+    """I-1 end-to-end: a resolved cross-catalog operand persists its governed crossings on the operand
+    row — the VERIFIED bridge (authority=verified, carrying the audit ``confirmed_event_id`` re-queried
+    BEFORE the fixture rollback) plus the declared intra-catalog realization — so crossing-governedness
+    is FALSIFIABLE from persisted telemetry, not only from the endpoint grain-facts."""
+    _seed_resolved_topology(planning_conn, service_actor, human_actor)
+
+    run_multisource_assembly_shadow(
+        planning_conn=planning_conn, telemetry_conn=db, adapter=_adapter(),
+        intents={"i_a": _ratio_intent()}, run_id="mrun_cross",
+        roles=("feature_engineer",), now=_NOW)
+
+    plan_id = read_intent_results(db, "mrun_cross")[0]["selected_plan_id"]
+    operands = read_operands(db, "mrun_cross", "i_a", plan_id)
+    assert operands
+    for o in operands:
+        crossings = list(o["crossings"])
+        assert crossings, f"expected governed crossings on slot {o['slot_id']}"
+        # every crossing is a governed authority (VERIFIED bridge / approved-or-declared realization)
+        assert all(c["authority"] in {"verified", "declared_join", "approved_join"}
+                   for c in crossings)
+    # the VERIFIED bridge crossing carries its audit confirmed_event_id (re-queried pre-rollback)
+    bridge_crossings = [c for o in operands for c in o["crossings"]
+                        if c["kind"] == "governed_bridge"]
+    assert bridge_crossings
+    assert all(c["authority"] == "verified" for c in bridge_crossings)
+    assert any(c["confirmed_event_id"] == "evt-bfk_acct" for c in bridge_crossings)
 
 
 # ── CLI/admin entrypoint: the flag is read HERE (never in the harness) ──

@@ -133,6 +133,11 @@ class OperandObservationRowV1:
     governed_endpoints: Sequence[Any]
     source_binding: Mapping[str, Any]
     created_at: datetime
+    # I-1: the ORDERED governed crossings of the operand's path, each a dict
+    # {kind, catalog, table, bridge_fact_key|realization_ref, authority, confirmed_event_id}. The
+    # confirmed_event_id is AUDIT-ONLY and is EXCLUDED from the divergent-duplicate payload_hash (it is a
+    # per-event id). Defaults empty for a single-catalog operand (no crossings) / callers pre-I-1.
+    crossings: Sequence[Any] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -207,6 +212,13 @@ def _intent_payload(intent: IntentResultRowV1,
                 "path_strategy": dict(o.path_strategy),
                 "governed_endpoints": list(o.governed_endpoints),
                 "source_binding": dict(o.source_binding),
+                # I-1: hash the DETERMINISTIC crossing identity only — the per-event confirmed_event_id
+                # is excluded (non-deterministic; audit-only), so a divergent bridge event id is never a
+                # false conflict and the double-run determinism gate stays stable.
+                "crossings": [
+                    {k: v for k, v in dict(c).items() if k != "confirmed_event_id"}
+                    for c in o.crossings
+                ],
             } for o in operands),
             key=lambda d: (d["plan_id"], d["slot_id"]),
         ),
@@ -264,12 +276,12 @@ def _insert_operand(conn, o: OperandObservationRowV1) -> None:
     conn.execute(
         "INSERT INTO multisource_assembly_shadow_operand_obs "
         "(run_id, intent_id, plan_id, slot_id, pin, role, path_strategy, governed_endpoints, "
-        " source_binding, payload_schema_version, created_at) "
-        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
+        " source_binding, crossings, payload_schema_version, created_at) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
         "ON CONFLICT (run_id, intent_id, plan_id, slot_id) DO NOTHING",
         (o.run_id, o.intent_id, o.plan_id, o.slot_id, Jsonb(dict(o.pin)), o.role,
          Jsonb(dict(o.path_strategy)), Jsonb(list(o.governed_endpoints)), Jsonb(dict(o.source_binding)),
-         PAYLOAD_SCHEMA_VERSION, o.created_at))
+         Jsonb([dict(c) for c in o.crossings]), PAYLOAD_SCHEMA_VERSION, o.created_at))
 
 
 def write_intent_result(conn, intent_row: IntentResultRowV1,
@@ -347,7 +359,7 @@ def read_candidates(conn, run_id: str, intent_id: str) -> list[dict[str, Any]]:
 
 def read_operands(conn, run_id: str, intent_id: str, plan_id: str) -> list[dict[str, Any]]:
     cols = ("run_id", "intent_id", "plan_id", "slot_id", "pin", "role", "path_strategy",
-            "governed_endpoints", "source_binding")
+            "governed_endpoints", "source_binding", "crossings")
     rows = conn.execute(
         f"SELECT {', '.join(cols)} FROM multisource_assembly_shadow_operand_obs "
         "WHERE run_id = %s AND intent_id = %s AND plan_id = %s ORDER BY slot_id",

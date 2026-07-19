@@ -39,10 +39,16 @@ from featuregen.overlay.upload.graph import build_graph
 from featuregen.overlay.upload.planner.contracts import (
     AdditivityClass,
     AggregationFunction,
+    AggregationValidation,
+    BindingSafety,
     CatalogScopeV1,
     ParamBindingV1,
     ReasonCode,
     TemporalDeclarationV1,
+)
+from featuregen.overlay.upload.planner.declarations import (
+    build_physical_read_set,
+    stage_safety,
 )
 from featuregen.overlay.upload.planner.multisource_assembly import (
     ResolvedOperandPathV1,
@@ -219,7 +225,66 @@ def take_latest_topology(db, service_actor, human_actor):
     return db, _scope("core_banking", "wealth")
 
 
+@pytest.fixture
+def bridged_leakage_anchor(db, service_actor, human_actor):
+    """The Task-5 bridged topology, but the measure column carries a LEAKAGE-ANCHOR concept
+    (``default_flag``) — declared ADDITIVE so its ``sum`` aggregation is itself SOUND. That isolates
+    the SAFETY fold: the ONLY thing unsafe is the leakage-anchor read, which Task-6 convergence
+    deferred to this per-path check. ``check_operand_path`` must reject it via the safety branch, not
+    the aggregation branch."""
+    ensure_upload_catalog_adapter()
+    _seed(db, "core_banking", [
+        (CanonicalRow("core_banking", "transactions", "transaction_id", "integer", is_grain=True),
+         "transaction_id"),
+        (CanonicalRow("core_banking", "transactions", "account_id", "integer"), "account_id"),
+        (CanonicalRow("core_banking", "transactions", "dflag", "numeric", additivity="additive"),
+         "default_flag"),
+    ])
+    _seed(db, "wealth", [
+        (CanonicalRow("wealth", "accounts", "account_id", "integer", is_grain=True), "account_id"),
+        (CanonicalRow("wealth", "accounts", "customer_id", "integer",
+                      joins_to="customers.customer_id", cardinality="N:1"), "customer_id"),
+        (CanonicalRow("wealth", "customers", "customer_id", "integer", is_grain=True),
+         "customer_id"),
+    ])
+    _seed_verified_bridge(db, "bfk_acct", "account",
+                          "core_banking", "public.transactions.account_id",
+                          "wealth", "public.accounts.account_id")
+    _seed_verified_grain(db, "core_banking", "transactions", ["transaction_id"],
+                         service_actor=service_actor, human_actor=human_actor)
+    _seed_verified_grain(db, "wealth", "accounts", ["account_id"],
+                         service_actor=service_actor, human_actor=human_actor)
+    _seed_verified_grain(db, "wealth", "customers", ["customer_id"],
+                         service_actor=service_actor, human_actor=human_actor)
+    return db, _scope("core_banking", "wealth")
+
+
 # ── check_operand_path: aggregation soundness via reuse ─────────────────────────────────────────
+def test_unsafe_leakage_anchor_column_rejects_via_safety_fold(bridged_leakage_anchor):
+    # M16: an operand bound to a genuinely UNSAFE (leakage-anchor) column must reject on the SAFETY
+    # branch of check_operand_path — Task-6 convergence deferred safety to here, so an unsafe path can
+    # never pass. The column is declared additive so its aggregation is SOUND: the rejection is proven
+    # to come from the safety fold, NOT the aggregation fold.
+    conn, scope = bridged_leakage_anchor
+    operand = _operand(object_ref="public.transactions.dflag", concept="default_flag",
+                       aggregation=PathAggregation.sum, output_additivity=AdditivityClass.additive)
+    ctx = _ctx(conn, ["core_banking", "wealth"],
+               {("ms:op_0", "operand"): AggregationFunction.sum})
+    path = _first_path(conn, ctx, operand, scope)
+
+    temporal, hops, reason = check_operand_path(ctx, path)
+
+    assert reason is MultiSourceReason.aggregation_unsafe_on_path
+    # it came from the SAFETY fold: the read set carries an unsafe leakage-anchor column...
+    read_set = build_physical_read_set(ctx, path.candidate.binding_plan)
+    safety, codes = stage_safety(read_set)
+    assert safety is BindingSafety.unsafe
+    assert ReasonCode.leakage_anchor_read in codes
+    # ...and NOT the aggregation fold: every aggregation stage is itself sound (additive sum)
+    assert all(stage.validation is AggregationValidation.sound
+               for hop in hops for stage in hop.ingredient_stages)
+
+
 def test_non_additive_sum_over_fan_in_is_aggregation_unsafe(bridged_non_additive):
     conn, scope = bridged_non_additive
     operand = _operand(aggregation=PathAggregation.sum, output_additivity=AdditivityClass.additive)

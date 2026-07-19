@@ -45,6 +45,7 @@ from featuregen.overlay.upload.planner.assembly import (
     semantic_rollup_paths,
 )
 from featuregen.overlay.upload.planner.contracts import (
+    MAX_MULTISOURCE_STATES_EXPANDED,
     MAX_OPERAND_COMBINATIONS,
     MAX_PATHS_PER_OPERAND,
     AggregationValidation,
@@ -156,14 +157,18 @@ class OperandEnumerationResultV1:
     bounds: MultiSourceBoundingMetricsV1
 
 
-def _bounds(*, paths_truncated: bool, total_states: int) -> MultiSourceBoundingMetricsV1:
-    """Per-operand enumeration bounds. Only the ``MAX_PATHS_PER_OPERAND`` cut and the states-
-    expanded tally are meaningful at the operand grain; combinations/states/landing-ambiguity
-    bounds belong to the later cross-operand convergence step and stay ``False`` here."""
+def _bounds(*, paths_truncated: bool, states_truncated: bool,
+            total_states: int) -> MultiSourceBoundingMetricsV1:
+    """Per-operand enumeration bounds. Two INDEPENDENT frontier cuts are meaningful at the operand grain:
+    the ``MAX_PATHS_PER_OPERAND`` complete-path count cut (``paths_truncated``) and the
+    ``MAX_MULTISOURCE_STATES_EXPANDED`` cumulative frontier-state cut (``states_truncated``, M-a) — a
+    semantic path can expand many states while yielding few complete plans, so the state bound guards a
+    blow-up the path-count bound does not. Combinations/landing-ambiguity bounds belong to the later
+    cross-operand convergence step and stay ``False`` here."""
     return MultiSourceBoundingMetricsV1(
         paths_per_operand_truncated=paths_truncated,
         operand_combinations_truncated=False,
-        states_truncated=False,
+        states_truncated=states_truncated,
         landing_ambiguous=False,
         total_states_expanded=total_states)
 
@@ -246,15 +251,21 @@ def _rederive_hop_tables(ctx: CompilerContext, plan: BindingPlanV1, *, source_ca
 
 def _enumerate_plans(conn, *, source_position: _Position, target_entity: str, scope: CatalogScopeV1,
                      bindings: tuple[IngredientBindingV1, ...], template
-                     ) -> tuple[list[BindingPlanV1], bool, int]:
+                     ) -> tuple[list[BindingPlanV1], bool, bool, int]:
     """Drive the reused frontier (``semantic_rollup_paths`` -> ``assemble_paths``) across every
     governed semantic path from ``source_position`` to ``target_entity`` and collect the RESOLVED
-    cross-catalog plans, capped at ``MAX_PATHS_PER_OPERAND``. Returns (plans, truncated,
-    total_states_expanded). The cap is enforced across ALL semantic paths (the per-operand budget)."""
+    cross-catalog plans. Returns (plans, paths_truncated, states_truncated, total_states_expanded).
+
+    TWO independent per-operand bounds stop the walk (M-a): the ``MAX_PATHS_PER_OPERAND`` cap on the
+    number of KEPT complete plans, and the ``MAX_MULTISOURCE_STATES_EXPANDED`` cap on the CUMULATIVE
+    frontier state expansion summed across the semantic paths — a semantic path can expand many states
+    while yielding few complete plans, so the state cap guards a blow-up the path-count cap does not.
+    Either cap stops further semantic-path expansion (never a hot loop) and sets its own flag."""
     semantic_paths, _status = semantic_rollup_paths(source_position.entity, target_entity)
     plans: list[BindingPlanV1] = []
     total_states = 0
-    truncated = False
+    paths_truncated = False
+    states_truncated = False
     for semantic_path in semantic_paths:
         assembly = assemble_paths(
             conn, source_position=source_position, semantic_path=semantic_path, scope=scope,
@@ -264,11 +275,16 @@ def _enumerate_plans(conn, *, source_position: _Position, target_entity: str, sc
             if plan.resolution_status in _RESOLVED_STATUSES:
                 plans.append(plan)
                 if len(plans) > MAX_PATHS_PER_OPERAND:
-                    truncated = True    # a further governed path was dropped, not kept
+                    paths_truncated = True    # a further governed path was dropped, not kept
                     break
-        if truncated:
+        if paths_truncated:
             break
-    return plans[:MAX_PATHS_PER_OPERAND], truncated, total_states
+        # Cumulative frontier-state cap (M-a): stop expanding further semantic paths once the summed
+        # state expansion exceeds the bound — independent of how many complete plans were kept.
+        if total_states > MAX_MULTISOURCE_STATES_EXPANDED:
+            states_truncated = True
+            break
+    return plans[:MAX_PATHS_PER_OPERAND], paths_truncated, states_truncated, total_states
 
 
 def _realizer_authority_ranks(ctx: CompilerContext) -> dict[tuple[str, str], int]:
@@ -333,10 +349,12 @@ def enumerate_operand_paths(
     template = _operand_template(operand)
     bindings = _operand_bindings(conn, operand, recipe_id=recipe_id, need_role=_OPERAND_NEED_ROLE)
 
-    plans, truncated, total_states = _enumerate_plans(
+    plans, paths_truncated, states_truncated, total_states = _enumerate_plans(
         conn, source_position=source_position, target_entity=target_entity, scope=scope,
         bindings=bindings, template=template)
-    bounds = _bounds(paths_truncated=truncated, total_states=total_states)
+    truncated = paths_truncated or states_truncated
+    bounds = _bounds(paths_truncated=paths_truncated, states_truncated=states_truncated,
+                     total_states=total_states)
 
     # No VERIFIED-bridge path resolved at all — the planner only reads VERIFIED bridges, and
     # absence never proves an unverified route exists. Fail closed.

@@ -92,6 +92,23 @@ def test_advisory_is_grain_without_verified_fact_yields_none(db, adapter):
     assert endpoint is None  # fail-closed: advisory is_grain does not govern the endpoint
 
 
+def test_grain_column_absent_from_graph_node_yields_none(db, adapter, service_actor, human_actor):
+    # M8: the physical graph has ``customer_id``, but the VERIFIED grain fact names a column the graph
+    # LACKS (``phantom_key``). Membership is validated against ``graph_node.column_name`` — a grain
+    # column the physical graph does not carry makes the endpoint untrustworthy -> fail closed.
+    _seed(db, "wealth", [
+        (CanonicalRow("wealth", "customers", "customer_id", "integer", is_grain=True),
+         "customer_id"),
+    ])
+    _seed_verified_grain(db, "wealth", "customers", ["phantom_key"],
+                         service_actor=service_actor, human_actor=human_actor)
+
+    endpoint = governed_endpoint(db, adapter, catalog="wealth",
+                                 table_ref="public.customers", now=_NOW)
+
+    assert endpoint is None  # fail-closed: a grain column absent from graph_node does not govern
+
+
 def test_composite_grain_fact_yields_multi_element_refs(db, adapter, service_actor, human_actor):
     _seed(db, "risk", [
         (CanonicalRow("risk", "positions", "account_id", "integer", is_grain=True), "account_id"),

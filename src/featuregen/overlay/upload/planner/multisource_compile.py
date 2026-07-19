@@ -53,7 +53,9 @@ from __future__ import annotations
 import hashlib
 from collections import Counter
 from dataclasses import dataclass, replace
+from typing import Any
 
+from featuregen.overlay.upload.catalog_realizations import table_of
 from featuregen.overlay.upload.planner.contracts import (
     ADDITIVITY_RULE_VERSION,
     AGGREGATION_RULE_VERSION,
@@ -70,6 +72,7 @@ from featuregen.overlay.upload.planner.contracts import (
     PathResolutionStatus,
     PlanResolutionStatus,
     PlanTier,
+    SegmentKind,
 )
 from featuregen.overlay.upload.planner.declarations import (
     CompileBudget,
@@ -266,6 +269,79 @@ def confirmed_event_ids_for_audit(
         "WHERE fact_key = ANY(%s) AND status = 'VERIFIED' ORDER BY fact_key",
         (fact_keys,)).fetchall()
     return tuple((row[0], row[1]) for row in rows)
+
+
+# The persisted authority marker for a governed VERIFIED bridge crossing (there is no RealizationAuthority
+# analogue for a bridge — it is a VERIFIED entity_bridge fact); a realization crossing carries its own
+# RealizationAuthority value (approved_join / declared_join / inferred_join).
+_VERIFIED_BRIDGE_AUTHORITY = "verified"
+_UNVERIFIED_BRIDGE_AUTHORITY = "unverified"
+
+
+def crossing_audit_by_slot(
+        conn, ctx: CompilerContext,
+        plan: MultiSourceBindingPlanV1) -> dict[str, tuple[dict[str, Any], ...]]:
+    """Per operand ``slot_id`` -> the ORDERED audit records of the GOVERNED crossings on its path
+    (I-1, spec §3.3/§7). Each ``intra_catalog_realization`` or ``governed_bridge`` segment of the
+    operand's ``binding_plan.path_segments`` becomes one record —
+    ``{kind, catalog, table, bridge_fact_key|realization_ref, authority, confirmed_event_id}`` — so
+    crossing-governedness is FALSIFIABLE from persisted telemetry (the gate asserts every crossing is a
+    governed authority). ``semantic_rollup`` / ``direct_catalog`` segments are announcements, not physical
+    crossings, and contribute no record.
+
+    ``authority`` is derived from the segment identity: a realization's ``RealizationAuthority`` (looked
+    up on ``ctx.realizations_by_catalog``), and — for a bridge — ``verified`` iff the fact_key is present
+    in the ``confirmed_event_ids_for_audit`` re-query (which returns only VERIFIED bridges), else
+    ``unverified`` (fail-closed, so a bridge revoked before the re-query reads as non-governed).
+
+    ``confirmed_event_id`` is AUDIT-ONLY: it is re-queried here (never widening ``active_bridges``) and is
+    a per-EVENT id, so the store EXCLUDES it from the divergent-duplicate ``payload_hash`` (which hashes
+    only the deterministic crossing identity — kind/catalog/table/refs/authority) and it never enters any
+    plan/contract identity. This function must run where ``entity_bridge_edge`` is visible (BEFORE the
+    shadow harness rolls the fixture connection back — finding #13)."""
+    event_ids = dict(confirmed_event_ids_for_audit(conn, plan))
+    by_slot: dict[str, tuple[dict[str, Any], ...]] = {}
+    for path in plan.operand_paths:
+        records: list[dict[str, Any]] = []
+        for seg in path.binding_plan.path_segments:
+            if seg.segment_kind is SegmentKind.intra_catalog_realization:
+                realization = next(
+                    (r for r in ctx.realizations_by_catalog.get(seg.catalog_source, ())
+                     if r.realization_id == seg.realization_ref), None)
+                records.append({
+                    "kind": seg.segment_kind.value,
+                    "catalog": seg.catalog_source,
+                    "table": realization.to_object_ref if realization is not None else "",
+                    "bridge_fact_key": None,
+                    "realization_ref": seg.realization_ref,
+                    "authority": realization.authority.value if realization is not None else "",
+                    "confirmed_event_id": None,
+                })
+            elif seg.segment_kind is SegmentKind.governed_bridge:
+                bfk = seg.bridge_fact_key
+                bridge = next(
+                    (b for b in ctx.active_bridges if b.fact_key == bfk), None)
+                table = ""
+                if bridge is not None:
+                    for cat, col_ref in (
+                            (bridge.left_catalog_source, bridge.left_object_ref),
+                            (bridge.right_catalog_source, bridge.right_object_ref)):
+                        if cat == seg.catalog_source:
+                            table = table_of(col_ref)
+                            break
+                governed = bfk is not None and bfk in event_ids
+                records.append({
+                    "kind": seg.segment_kind.value,
+                    "catalog": seg.catalog_source,
+                    "table": table,
+                    "bridge_fact_key": bfk,
+                    "realization_ref": None,
+                    "authority": (_VERIFIED_BRIDGE_AUTHORITY if governed
+                                  else _UNVERIFIED_BRIDGE_AUTHORITY),
+                    "confirmed_event_id": event_ids.get(bfk) if bfk is not None else None,
+                })
+        by_slot[path.slot_id] = tuple(records)
+    return by_slot
 
 
 # ── final-combination checks + verdict mapping ───────────────────────────────────────────────────

@@ -31,6 +31,7 @@ from featuregen.overlay.upload.planner.contracts import (
     AdditivityClass,
     CatalogScopeV1,
 )
+from featuregen.overlay.upload.planner import multisource_assembly
 from featuregen.overlay.upload.planner.multisource_assembly import (
     OperandEnumerationResultV1,
     enumerate_operand_paths,
@@ -344,8 +345,23 @@ def test_truncation_at_max_paths_per_operand_sets_the_bound(bridge_fan):
     result = _enumerate(conn, operand=_operand(), catalogs=["core_banking", "wealth"], scope=scope)
 
     assert result.bounds.paths_per_operand_truncated is True
+    assert result.bounds.states_truncated is False   # the PATH-count cap fired, not the state cap
     assert len(result.candidates) == MAX_PATHS_PER_OPERAND
     assert MultiSourceReason.budget_truncated in result.reason_codes
     # every kept candidate still lands on the one VERIFIED-grain landing
     assert all((c.landing_catalog, c.landing_table_ref) == ("wealth", "public.customers")
                for c in result.candidates)
+
+
+def test_cumulative_state_bound_is_wired_and_truncates(bridged_governed, monkeypatch):
+    """M-a: the ``MAX_MULTISOURCE_STATES_EXPANDED`` cumulative frontier-state bound is WIRED (not a
+    permanently-False field). Driven to 0, a resolving operand that expands >0 frontier states records
+    ``states_truncated`` on the bounds — an early stop INDEPENDENT of the path-count cap."""
+    conn, scope = bridged_governed
+    monkeypatch.setattr(multisource_assembly, "MAX_MULTISOURCE_STATES_EXPANDED", 0)
+
+    result = _enumerate(conn, operand=_operand(), catalogs=["core_banking", "wealth"], scope=scope)
+
+    assert result.bounds.total_states_expanded > 0        # the frontier really expanded states...
+    assert result.bounds.states_truncated is True         # ...so the cumulative bound fired
+    assert result.bounds.paths_per_operand_truncated is False   # NOT the path-count cap (distinct)

@@ -60,6 +60,11 @@ from featuregen.overlay.upload.planner.multisource_shadow_store import (
 _DEFAULT_RUN_IDS = ("mgate_run_a", "mgate_run_b")
 _DEFAULT_ROLES = ("feature_engineer",)
 
+# Criterion (3), I-1: the crossing authorities that count as GOVERNED — a VERIFIED entity_bridge or an
+# approved/declared intra-catalog realization. An ``inferred_join`` / ``unverified`` crossing is NOT
+# governed; a resolved plan carrying one fails the gate on the PERSISTED crossings evidence.
+_GOVERNED_CROSSING_AUTHORITIES = frozenset({"verified", "approved_join", "declared_join"})
+
 
 @dataclass(frozen=True, slots=True)
 class AssemblyGateResultV1:
@@ -222,6 +227,15 @@ def evaluate_gate_over_runs(telemetry_conn, *, run_ids: Sequence[str],
                     failures.append(
                         f"ungoverned endpoint (no grain_fact_key) run={rid} case={case.case_id} "
                         f"slot={o['slot_id']}")
+                # (3, I-1) crossing-governedness from the PERSISTED crossings evidence: every crossing
+                # of a resolved plan must be a governed authority (VERIFIED bridge / approved-or-declared
+                # realization). This is backed by persisted telemetry, not only the endpoint grain-facts.
+                for cr in (o.get("crossings") or []):
+                    if cr.get("authority") not in _GOVERNED_CROSSING_AUTHORITIES:
+                        endpoints_ok = False
+                        failures.append(
+                            f"non-governed crossing run={rid} case={case.case_id} "
+                            f"slot={o['slot_id']} authority={cr.get('authority')}")
                 landing_ep = endpoints[-1]
                 if (landing_ep.get("catalog") != landing["catalog"]
                         or landing_ep.get("table_ref") != landing["table_ref"]
