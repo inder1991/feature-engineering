@@ -36,6 +36,7 @@ from featuregen.overlay.upload.field_resolution import (
 )
 from featuregen.overlay.upload.object_ref import parse_ref
 from featuregen.overlay.upload.source_profile import SOURCE_CAPABILITY_PROFILE_VERSION
+from featuregen.projections.runner import _checkpoint_seq, _head_seq
 
 # The standard governed+hint field set the snapshot captures — mirrors the fields
 # ``column_authority`` actually MODELS (its ``_VALUE_COLUMN`` keys). NOTE: the field key for the
@@ -73,6 +74,91 @@ class SnapshotIsolationError(RuntimeError):
     """The build was handed a connection NOT running under REPEATABLE READ — a caller bug: the
     feature-generation connection (C0-T2) pins the level at connect time, so a torn/inconsistent
     read must fail loudly here, never silently degrade to READ COMMITTED."""
+
+
+# The machine-readable code the C0-T5 route surfaces when the readiness gate refuses to snapshot.
+# It is a WHOLE-snapshot abort (not a per-candidate gauntlet ``RejectCode`` in feature_assist.py),
+# so it lives here beside the gate that raises it; the route imports it from this module. NOTE: it
+# is a "projected catalog truth is unavailable" signal — it must NEVER be reinterpreted as an
+# external-data / NEEDS_EXTERNAL_VALIDATION check.
+CATALOG_PROJECTION_UNAVAILABLE = "CATALOG_PROJECTION_UNAVAILABLE"
+
+# The named projections whose materialized read models the snapshot's authority-aware adapter reads
+# (``read_column_facts`` consumes the overlay read model + the field decisions the overlay
+# projection resolves — there is NO separate field-decision named checkpoint today). Semantic/
+# validation projections (Deliveries E/C4) EXTEND this tuple later; the gate only CHECKS projections
+# that exist now, and fails CLOSED on any that don't (see :func:`check_projection_readiness`).
+_LOAD_BEARING_PROJECTIONS: tuple[str, ...] = ("overlay",)
+
+
+class CatalogProjectionUnavailable(RuntimeError):
+    """A load-bearing catalog projection is LAGGED (its checkpoint sits behind the event head) or
+    DEGRADED (poisoned) — so the snapshot (C0-T3) would seal STALE projected truth. Feature
+    generation must ABORT rather than silently snapshot a lagged view. Carries the machine
+    ``code`` (:data:`CATALOG_PROJECTION_UNAVAILABLE`) + a human ``detail`` so the C0-T5 route can
+    surface exactly which projection was unavailable and why."""
+
+    def __init__(self, code: str, detail: str) -> None:
+        super().__init__(f"{code}: {detail}")
+        self.code = code
+        self.detail = detail
+
+
+def _projection_is_degraded(conn: DbConn, name: str) -> bool:
+    """True if ANY aggregate of the named projection carries a poison marker in the generic degraded
+    ledger (``projection_degraded`` — the SAME store ``runner._mark_degraded`` writes). A degraded
+    projection's read model is untrustworthy, so the snapshot must not consume it."""
+    return conn.execute(
+        "SELECT 1 FROM projection_degraded WHERE projection_name = %s LIMIT 1", (name,)
+    ).fetchone() is not None
+
+
+def _projection_checkpoint_exists(conn: DbConn, name: str) -> bool:
+    """True if the named projection has a tracked checkpoint row. Fail-CLOSED input to the gate: an
+    ABSENT checkpoint is an unknown/untracked projection, NOT a caught-up one — ``projection_lag``
+    would read a missing row as lag 0 (falsely 'ready') when the head is also 0."""
+    return conn.execute(
+        "SELECT 1 FROM projection_checkpoints WHERE projection_name = %s", (name,)
+    ).fetchone() is not None
+
+
+def check_projection_readiness(
+    conn: DbConn, *, projections: Sequence[str] = _LOAD_BEARING_PROJECTIONS
+) -> dict[str, int]:
+    """Readiness gate for the feature-generation snapshot (C0-T4). Reusing the projection-health
+    primitives in ``projections.runner`` (never re-implementing them), verify EVERY load-bearing
+    projection is READY, and return its ``{projection_name: checkpoint_seq}`` watermarks (the seq
+    the read model is current as-of) for pinning into the snapshot header.
+
+    Fail CLOSED. Raise :class:`CatalogProjectionUnavailable` (code
+    :data:`CATALOG_PROJECTION_UNAVAILABLE`) if ANY load-bearing projection:
+      * has NO tracked checkpoint (unknown/untracked — never treated as caught-up), OR
+      * is DEGRADED/poisoned (a marker in ``projection_degraded``), OR
+      * is LAGGED — its ``_checkpoint_seq`` sits below the event head ``_head_seq`` (= the
+        resolve.py lag-guard posture: a just-committed event the projection has not yet applied
+        would make the read model STALE)."""
+    head = _head_seq(conn)   # the event head: COALESCE(max(global_seq), 0) FROM events
+    watermarks: dict[str, int] = {}
+    for name in projections:
+        if not _projection_checkpoint_exists(conn, name):
+            raise CatalogProjectionUnavailable(
+                CATALOG_PROJECTION_UNAVAILABLE,
+                f"load-bearing projection {name!r} has no tracked checkpoint (untracked/unknown)",
+            )
+        if _projection_is_degraded(conn, name):
+            raise CatalogProjectionUnavailable(
+                CATALOG_PROJECTION_UNAVAILABLE,
+                f"load-bearing projection {name!r} is DEGRADED (poisoned read model)",
+            )
+        checkpoint = _checkpoint_seq(conn, name)
+        if checkpoint < head:
+            raise CatalogProjectionUnavailable(
+                CATALOG_PROJECTION_UNAVAILABLE,
+                f"load-bearing projection {name!r} is LAGGED: checkpoint {checkpoint} "
+                f"< event head {head}",
+            )
+        watermarks[name] = checkpoint
+    return watermarks
 
 
 @dataclass(frozen=True, slots=True)
@@ -214,6 +300,11 @@ def build_metadata_snapshot(
     skipped (never fabricated). MUST be given a REPEATABLE READ connection (raises
     :class:`SnapshotIsolationError` otherwise)."""
     isolation_level = _assert_repeatable_read(conn)   # before the first catalog read
+    # Readiness gate (C0-T4): a load-bearing projection that is LAGGED or DEGRADED would make the
+    # authority adapter read STALE projected truth. Refuse BEFORE writing anything (no run manifest,
+    # no snapshot) and let CatalogProjectionUnavailable propagate to the C0-T5 route. The returned
+    # watermarks pin the checkpoint the read model is current as-of into the snapshot header.
+    projection_watermarks = check_projection_readiness(conn)
     _ensure_run(conn, generation_run_id, actor or {}, flags or {})
 
     requested = tuple(fields) if fields is not None else _DEFAULT_FIELDS
@@ -243,10 +334,11 @@ def build_metadata_snapshot(
     snapshot_id = mint_id("snap")
     conn.execute(
         "INSERT INTO catalog_metadata_snapshot "
-        "(snapshot_id, generation_run_id, read_scope_hash, isolation_level, "
+        "(snapshot_id, generation_run_id, read_scope_hash, isolation_level, projection_watermarks, "
         "policy_version, registry_version, config_version, content_hash) "
-        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
         (snapshot_id, generation_run_id, read_scope_hash, isolation_level,
+         Jsonb(projection_watermarks),
          FIELD_POLICY_VERSION, RESOLVER_VERSION, SOURCE_CAPABILITY_PROFILE_VERSION, content_hash),
     )
     for item in items:
