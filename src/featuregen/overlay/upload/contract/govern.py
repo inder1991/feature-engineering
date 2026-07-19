@@ -21,6 +21,10 @@ from featuregen.overlay.upload import feature_validation_projection
 from featuregen.overlay.upload.contract._serial import actor_json as _actor_json
 from featuregen.overlay.upload.contract._serial import requirements_to_json
 from featuregen.overlay.upload.contract.author import ContractDraft
+from featuregen.overlay.upload.contract.invalidation import (
+    confirm_dependency_hash,
+    dependencies_drifted,
+)
 from featuregen.overlay.upload.contract.review import validate_minimum
 from featuregen.overlay.upload.features import (
     FeatureFreshness,
@@ -126,6 +130,58 @@ def _insert_contract_input_columns(conn, contract_id: str, draft: ContractDraft)
             "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) "
             "ON CONFLICT (contract_id, item_hash) DO NOTHING",
             (contract_id, source, graph_ref, logical_ref, physical_ref, role, decision_id, fact_id,
+             item_hash))
+
+
+def _contract_dependency_items(draft: ContractDraft):
+    """H2c — the reverse-dependency items a contract version depends on for drift fan-out: the SAME
+    catalog items that back a ``contract_input_column`` row (derives + grain + as_of + governed join)
+    and were consulted to clear a check / bind an input, each normalized to its PUBLIC-FLATTENED graph
+    ``object_ref`` so (a) the current-state signature can find its ``graph_node`` and (b) a drift ref
+    from ingest (``_graph_key``-derived) matches it. Yields ``(catalog_source, graph_ref, object_ref,
+    decision_id, fact_id, event_id)``. decision_id / fact_id / event_id are NULL — the reconciled draft
+    carries no field-decision / governed-fact / source-event id yet (# H1b wires those); the read gate
+    then tracks each item via its graph_node state signature (value/type), which is what drifts."""
+    catalogs = {cs for cs, _ in draft.derives_pairs}
+    grain_source = (next(iter(catalogs)) if len(catalogs) == 1
+                    else (sorted(catalogs)[0] if catalogs else None))
+    # derives — every measure/source column the feature reads (already a public-flattened object_ref).
+    for cs, ref in draft.derives_pairs:
+        yield (cs, ref, ref, None, None, None)
+    # grain — the server-authoritative grain TABLE node (public.<table>).
+    if draft.grain_table and grain_source is not None:
+        t_ref = f"public.{draft.grain_table}".lower()
+        yield (grain_source, t_ref, t_ref, None, None, None)
+    # as_of — the grain table's as-of COLUMN node (public.<table>.<column>).
+    if draft.as_of_column and draft.grain_table and grain_source is not None:
+        c_ref = f"public.{draft.grain_table}.{draft.as_of_column}".lower()
+        yield (grain_source, c_ref, c_ref, None, None, None)
+    # governed join-path columns — each step's target ref (already a graph object_ref).
+    for step in draft.join_path:
+        ref = step.get("ref") or step.get("to")
+        if not ref:
+            continue
+        yield (step.get("catalog_source") or grain_source or "", ref, ref, None, None, None)
+
+
+def _insert_contract_metadata_dependencies(conn, contract_id: str, draft: ContractDraft) -> None:
+    """H2c — persist the write-once ``contract_metadata_dependency`` reverse-dep rows for THIS contract
+    version (one per check-clearing / input-binding catalog item), in the SAME transaction as the input
+    rows. ``item_hash`` is the item's content hash AT CONFIRM — its identity refs + its CURRENT
+    ``graph_node`` state signature (the value/type that made it load-bearing) — so the read-time gate can
+    recompute the current hash and HARD-downgrade the contract on any mismatch. ON CONFLICT DO NOTHING
+    keeps it idempotent (the 1011 no-mutation trigger blocks UPDATE/DELETE, not a DO-NOTHING INSERT)."""
+    for catalog_source, graph_ref, object_ref, decision_id, fact_id, event_id in \
+            _contract_dependency_items(draft):
+        item_hash = confirm_dependency_hash(
+            conn, contract_id=contract_id, catalog_source=catalog_source, graph_ref=graph_ref,
+            logical_ref=object_ref, decision_id=decision_id, fact_id=fact_id, event_id=event_id)
+        conn.execute(
+            "INSERT INTO contract_metadata_dependency (contract_id, catalog_source, graph_ref, "
+            "logical_ref, decision_id, fact_id, event_id, item_hash) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s) "
+            "ON CONFLICT (contract_id, item_hash) DO NOTHING",
+            (contract_id, catalog_source, graph_ref, object_ref, decision_id, fact_id, event_id,
              item_hash))
 
 
@@ -248,6 +304,10 @@ def confirm_contract(conn, draft: ContractDraft, *, actor, roles: Iterable[str] 
     # per reconciled input (derives + grain + as_of + governed join). This + the pointer (STEP 5) are the
     # AUTHORITATIVE write; feature/feature_derives_from (STEP 7) are the current-pointer compat projection.
     _insert_contract_input_columns(conn, contract_id, draft)
+    # H2c STEP 4b — write the write-once contract_metadata_dependency reverse-dep rows (one per
+    # check-clearing / input-binding catalog item), same transaction. These back BOTH the eager
+    # invalidate_contracts_for fan-out AND the read-time second fail-closed gate.
+    _insert_contract_metadata_dependencies(conn, contract_id, draft)
     # H2b STEP 5 — CAS the feature_current_contract pointer to this new version (the AUTHORITATIVE write).
     if prior_pointer_version is None:
         conn.execute(
@@ -407,6 +467,42 @@ def _effective_validation(ready: bool, state_status, state_verification) -> tupl
     return state_status, state_verification
 
 
+# H2c: the downgrade a drifted dependency forces — needs (re)validation, stamp UNVERIFIED. NEVER the
+# promoted DATA-CHECKED/design_checked once any input drifted (fail closed, not latest-wins).
+_EFFECTIVE_NEEDS_REVALIDATION = "needs_external_validation"
+
+
+def _apply_dependency_read_gate(conn, contract_id: str, eff_status: str,
+                                eff_verif: str) -> tuple[str, str]:
+    """H2c READ-TIME SECOND fail-closed gate. A PROMOTED stamp (``design_checked`` — the status that
+    carries DESIGN-CHECKED or DATA-CHECKED) is HARD-downgraded to needs_external_validation/UNVERIFIED
+    when ANY of the contract's ``contract_metadata_dependency`` items has drifted since confirm
+    (recomputed current hash != stored hash: item missing / retyped / cleared / retired). This runs on
+    top of the projection's already-fail-closed effective stamp, so a stale DATA-CHECKED can NEVER be
+    served even if NO ``INVALIDATED`` was folded yet (projection lag, a missed eager wire, a seamed
+    drift source). Non-promoted stamps (needs_external_validation/rejected/unavailable/legacy) pass
+    through untouched — the gate only ever DOWNGRADES."""
+    if eff_status != "design_checked":
+        return eff_status, eff_verif
+    if dependencies_drifted(conn, contract_id):
+        return _EFFECTIVE_NEEDS_REVALIDATION, _EFFECTIVE_UNVERIFIED
+    return eff_status, eff_verif
+
+
+def contract_read_status(conn, contract_id: str) -> tuple[str, str]:
+    """The authoritative, drift-aware effective stamp for ONE contract — what any read surface MUST
+    serve. Computes the projection's effective stamp (fail-closed on a degraded/lagged projection),
+    THEN applies the H2c dependency read gate on top. Returns ``(effective_validation_status,
+    effective_verification)``; a drifted dependency yields ``('needs_external_validation',
+    'UNVERIFIED')`` even while the projection state row still reads DATA-CHECKED."""
+    ready = feature_validation_projection.is_read_ready(conn)
+    state = feature_validation_projection.read_state(conn, contract_id)
+    eff_status, eff_verif = _effective_validation(
+        ready, None if state is None else state["validation_status"],
+        None if state is None else state["effective_verification"])
+    return _apply_dependency_read_gate(conn, contract_id, eff_status, eff_verif)
+
+
 def list_contracts(conn, *, limit: int = 50) -> list[dict]:
     """The governed-contract inventory (registry READ surface).
 
@@ -426,6 +522,9 @@ def list_contracts(conn, *, limit: int = 50) -> list[dict]:
     out = []
     for r in rows:
         eff_status, eff_verif = _effective_validation(ready, r[6], r[7])
+        # H2c: second fail-closed gate — a stale DATA-CHECKED/design_checked never survives a drifted
+        # dependency, even if the projection has not folded an INVALIDATED yet.
+        eff_status, eff_verif = _apply_dependency_read_gate(conn, r[0], eff_status, eff_verif)
         out.append({"contract_id": r[0], "feature_id": r[1], "feature_name": r[2], "version": r[3],
                     "verification": r[4], "created_at": r[5].isoformat(),
                     "effective_validation_status": eff_status,
@@ -449,6 +548,8 @@ def get_contract_detail(conn, contract_id: str) -> dict | None:
     eff_status, eff_verif = _effective_validation(
         ready, None if state is None else state["validation_status"],
         None if state is None else state["effective_verification"])
+    # H2c: second fail-closed gate on the single-contract detail read too.
+    eff_status, eff_verif = _apply_dependency_read_gate(conn, contract_id, eff_status, eff_verif)
     return {"contract_id": row[0], "feature_id": row[1], "feature_name": row[2], "definition": row[3],
             "version": row[4], "verification": row[5], "intent_id": row[6],
             "created_at": row[7].isoformat(),

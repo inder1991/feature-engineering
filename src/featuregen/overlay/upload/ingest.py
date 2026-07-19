@@ -31,6 +31,11 @@ from featuregen.overlay.upload.canonical import (
     ValidationResult,
     validate_rows,
 )
+from featuregen.overlay.upload.contract.invalidation import (
+    REASON_FIELD_DECISION_RETIRED,
+    ChangedRef,
+    invalidate_contracts_for,
+)
 from featuregen.overlay.upload.enrich import (
     classify_domains,
     content_hash,
@@ -41,6 +46,7 @@ from featuregen.overlay.upload.enrich import (
 from featuregen.overlay.upload.enrich_llm import consume_audit_degradations
 from featuregen.overlay.upload.field_resolution import (
     FIELD_POLICY_VERSION,
+    _graph_key,
     is_feature_eligible,
     resolve_and_project,
     stale_and_clear_field,
@@ -260,6 +266,14 @@ def _assert_fact(conn, source: str, table: str, fact_type: str, value: dict, *, 
         if prior is not None and prior != value:
             outcome = "changed"
     # New fact, a changed value, or a non-VERIFIED (STALE/REVERIFY/REJECTED) stream -> (re)assert.
+    # H2c SEAM: wire fact-lifecycle drift -> invalidate_contracts_for here (a governed grain/availability
+    # fact whose value CHANGED, or that STALEd/EXPIRED/REJECTED, should INVALIDATE contracts bound to it
+    # via ChangedRef(fact_id=..., reason=FACT_STALE/FACT_EXPIRED/FACT_REJECTED)). NOT wired yet: reverse-
+    # dep rows carry fact_id=NULL until a draft binds governed-fact ids (# H1b), so a fact-keyed
+    # invalidate would match nothing; and there is no single fact-transition hook (the lifecycle is an
+    # event fold across join_governance/table_fact/operational_facts projections). Deferred, not forced.
+    # The read-time gate already covers grain/as_of facts fail-closed (is_grain/is_as_of are in the
+    # dependency graph_node state signature, so a drift-STALEd grain fact flips the hash).
     base = stream[-1].stream_version if stream else 0
     draft = append_overlay_event(conn, fact_key=fk, type=facts.OVERLAY_FACT_PROPOSED,
         actor=actor, expected_version=base, payload={
@@ -841,6 +855,7 @@ def _retire_dropped_field_decisions(conn, *, source: str, logical_ref: str,
     load-bearing value, so never-declared fields (and already-retired ones) write no spurious STALED
     decisions. Must run BEFORE the round's ``resolve_and_project`` (same request tx), which then
     skips the evidence-less field and cannot re-project the cleared value."""
+    retired = False
     for field_name in fields:
         if read_active_field_evidence(conn, logical_ref, field_name):
             continue
@@ -848,6 +863,17 @@ def _retire_dropped_field_decisions(conn, *, source: str, logical_ref: str,
             continue
         stale_and_clear_field(conn, source=source, logical_ref=logical_ref,
                               field_name=field_name, now=now)
+        retired = True
+    if retired:
+        # H2c PRIMARY DRIFT WIRE — a dropped/retyped column retired a load-bearing field DECISION a
+        # confirmed contract may depend on. EAGERLY append INVALIDATED to every affected contract
+        # version (defense-in-depth). The read-time gate already covers this fail-closed (the column's
+        # graph_node was deleted/changed by build_graph, so its dependency hash no longer matches), so
+        # this eager emit is not the sole safety. object_ref is the PUBLIC-FLATTENED graph ref the
+        # dependency rows store (the same key `_graph_key` derives for the display projection).
+        object_ref = _graph_key(source, logical_ref)[1]
+        invalidate_contracts_for(conn, changed=[ChangedRef(
+            catalog_source=source, reason=REASON_FIELD_DECISION_RETIRED, object_ref=object_ref)])
 
 
 def _write_glossary_parser_evidence(
