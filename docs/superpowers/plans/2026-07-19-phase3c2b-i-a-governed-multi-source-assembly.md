@@ -4,594 +4,269 @@
 
 **Goal:** Give the planner a shadow-only capability to combine operands originating in different catalogs into one governed computation at one exact physical grain, proven against a partitioned gold set.
 
-**Architecture:** New sibling contracts + a multi-operand assembly engine (independent governed VERIFIED-bridge path per operand → exact physical-landing convergence → per-path aggregation/temporal proofs → one compile-end union freshness check → final join + expression → new `compile_multi_source_contract`), driven by an authored synthetic gold set through a flag-gated shadow harness with an `0999`-style manifest/reconciliation store. Nothing surfaces; single-source planning is byte-identical when the flag is off.
+**Architecture:** Reuse the existing single-source frontier + per-path compiler by expressing each operand's path as an injected-template `BindingPlanV1`; add only endpoint governance (grain facts), physical-landing convergence (composite `grain_key_refs`), final join + expression, and one union freshness check. A **calls** reused functions, never edits them, so single-source planning stays byte-identical when the flag is off. **Task 1 is a spike** that proves the reuse premise against real code before any multi-source contract is built.
 
 **Tech Stack:** Python 3.12, `@dataclass(frozen=True, slots=True)` + lowercase-snake `StrEnum` (NOT pydantic), psycopg, pytest. All under `src/featuregen/overlay/upload/planner/`.
 
-**Spec:** `docs/superpowers/specs/2026-07-19-phase3c2b-i-a-governed-multi-source-assembly-design.md`
+**Spec:** `docs/superpowers/specs/2026-07-19-phase3c2b-i-a-governed-multi-source-assembly-design.md` (6th-review-hardened).
 
 ## Global Constraints
 
-- **Shadow-only:** log/measure, never surface; no data plane; no signing. (Spec shared invariants 1, 7.)
-- **F4 preserved:** output is a contract definition with a governed physical plan, never an attested cross-catalog `approved_join`.
-- **Fail-closed:** missing/ambiguous/conflicting/ungoverned/lossy input rejects; never guess.
-- **Authority, not display:** structural grain/key comes from governed grain/key facts (`resolve_fact`), never `graph_node.concept`/`is_grain`.
-- **Preservation is proof:** a resolve preserves every operand, its semantic slot, and the operation; "compiled" alone is not proof.
-- **Technical ≠ semantic ≠ capture-incomplete:** DB/infra = technical; budget truncation = capture-incomplete; neither is a semantic reject and neither is a resolve.
-- **Behaviour-neutral:** flag off ⇒ single-source `plan_bindings`/`enumerate_single_catalog_plans`/`_assemble_rollups`/`compile_contract` byte-identical to `origin/main`.
-- **Types:** `@dataclass(frozen=True, slots=True)` + lowercase-snake `StrEnum`. Version every policy.
-- **A ALONE:** do not implement any B (adapter/worker/hook/concept-authority) surface here.
+- **Shadow-only:** log/measure, never surface; no data plane; no signing.
+- **F4:** output is a contract definition with a governed physical plan, never an attested cross-catalog `approved_join`.
+- **Fail-closed:** missing/ambiguous/ungoverned/unsupported input rejects; never guess.
+- **Authority, not display:** structural grain/keys from governed `grain` facts (`resolve_fact` via the sealed-config adapter), never `graph_node.concept`/`is_grain`. No key fact exists (`FactType` = `grain|availability_time|scd_effective_dating|approved_join|entity_bridge|policy_tag`); crossings are the frontier's governed `path_segments` (intra-catalog `APPROVED_JOIN`/`DECLARED_JOIN`/`INFERRED_JOIN` realizations + VERIFIED `entity_bridge`).
+- **Reuse, don't edit:** A calls `assemble_paths`/`semantic_rollup_paths`/`compile_temporal`/`compile_aggregation`/`check_connectivity`/`revalidate_freshness` unchanged; A builds its **own** `CompilerContext` (production `build_compiler_context` has empty `agg_declarations` and role-scoped columns).
+- **Determinism keys on `fact_key`s** (deterministic from ref+type), never per-event `confirmed_event_id`.
+- **Behaviour-neutral:** flag off ⇒ single-source path byte-identical.
+- **Types:** `@dataclass(frozen=True, slots=True)` + lowercase-snake `StrEnum`; version every policy.
+- **A ALONE:** implement no B (adapter/worker/hook/concept-authority) surface.
+- **Migration 1006** (`1005_llm_dispatch_provenance` taken); re-confirm free at build time.
 - **Commit trailer:** every commit ends with `Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>`.
 
-**Reused surfaces (read before use — origin/main):** `planner/contracts.py` (version + `MAX_*` constants, `BindingPlanningResultV1`, `BoundingMetricsV1`, `PlannerReplayEnvelopeV1`, `AggregationFunction`, `PlanResolutionStatus`, `ReasonCode`, `SegmentKind`, `BindingPathSegmentV1`); `planner/assembly.py` (`_State`, `_Position`, `_AUTHORITY_RANK`, active-bridge frontier); `catalog_realizations.py` (`object_grain:99`, `key_entity:111` — both advisory; `resolve_fact`-backed grain fact); `resolve.py`/`resolve_fact` (governed fact read; `grain.value["columns"]`, `provenance["confirmed_event_id"]`); `planner/declarations.py` (`compile_contract:937`, `build_compiler_context`, `CompileBudget`, per-check fns, freshness `:816`); `planner/shadow_store.py` (`write_dispatch`, `write_run_and_plans`, `reconcile`) + `db/migrations/0999_planner_shadow_store.sql`; `planner/contract_eval.py`/`contract_gold.py` (gold evaluator pattern).
+**Reused surfaces (read before use — origin/main d90d457):** `planner/contracts.py` (`AggregationFunction:155`, `BindingPlanningResultV1`, `BoundingMetricsV1`, `PlanResolutionStatus`, `ReasonCode`, `BindingPlanV1`, `PhysicalReadSetV1:469`, `MAX_*`, `*_VERSION`); `planner/assembly.py` (`_Position` entity/catalog/table_ref, `assemble_paths(conn,*,source_position,semantic_path,scope,ingredient_bindings,template,target_entity)->AssemblyV1`, `semantic_rollup_paths(source_entity,target_entity)`, `_AUTHORITY_RANK`); `planner/declarations.py` (`CompilerContext` fields, `check_connectivity(ctx,plan).placement:167`, `compile_temporal(ctx,plan,template):241`, `compile_aggregation(ctx,plan,template,temporal,placement):527`, `revalidate_freshness:816`, `build_compiler_context:1046`, `CompileBudget`); `resolve.py` (`resolve_fact(conn,adapter,ref,fact_type,now=)`, adapter consulted for data facts `:210`); `facts.py` (grain value `{columns,is_unique}:56`, entity_bridge schema `:108`); `bridge_projection.py` (`active_bridges:57`, `entity_bridge_edge` for `confirmed_event_id`); `catalog_realizations.py` (`_join_edges` intra-catalog, `object_grain:99`); `templates.py` (`Template`/`Need`); `planner/shadow_store.py` + `db/migrations/0999_planner_shadow_store.sql`; `planner/contract_eval.py`/`contract_gold.py`.
 
 ---
 
-### Task 0: Prerequisite — rebase, migration check, flag constant
+### Task 0: Prerequisite — clean worktree, migration check, constants
 
-**Files:**
-- Modify: `src/featuregen/overlay/upload/planner/contracts.py` (append version + flag constants)
+**Files:** Modify `src/featuregen/overlay/upload/planner/contracts.py`.
 
-- [ ] **Step 1: Rebase the branch onto current origin/main**
-
+- [ ] **Step 1: Create a separate clean worktree off origin/main** (do NOT rebase the shared dirty tree — it holds the parallel session's uncommitted WIP).
 ```bash
 git fetch origin main
-git -c rebase.autostash=false rebase origin/main   # branch is docs-only; expect a clean replay
-git log --oneline -5   # confirm the 3 spec commits sit on top of origin/main HEAD
+git worktree add -b feature/phase3c2bia-build ../fe-3c2bia origin/main
+cd ../fe-3c2bia && git log --oneline -1   # expect origin/main HEAD (d90d457 or later)
 ```
-Expected: clean rebase (spec commits are docs-only). If the working tree is dirty with unrelated WIP, do NOT `git add -A`; the rebase autostash is disabled so a dirty conflict aborts safely — resolve by leaving that WIP untouched.
-
-- [ ] **Step 2: Confirm migration 1005 is free**
-
+- [ ] **Step 2: Confirm migration 1006 is free**
 ```bash
-git ls-files 'src/featuregen/db/migrations/1005_*.sql'   # expect: no output
-ls src/featuregen/db/migrations/ | tail -4
+git ls-files 'src/featuregen/db/migrations/1006_*.sql'   # expect: empty
+ls src/featuregen/db/migrations/ | tail -3               # expect ...1004_..., 1005_llm_dispatch_provenance
 ```
-Expected: no `1005_*` file. If taken, use the next free number and update every `1005_` reference in this plan.
-
-- [ ] **Step 3: Add version + flag constants**
-
-In `contracts.py`, after the existing `*_VERSION` block, append:
+Expected: no `1006_*`. If taken, use the next free number and update every `1006_` reference here.
+- [ ] **Step 3: Add constants** — append to `contracts.py` after the `*_VERSION` block:
 ```python
 # 3C.2b-i-A — governed multi-source operand assembly (shadow).
 MULTISOURCE_ASSEMBLY_VERSION = "3c2bia.1.0.0"
 OPERATION_POLICY_VERSION = "3c2bia.op.1.0.0"
 MULTISOURCE_ASSEMBLY_SHADOW_FLAG = "FEATUREGEN_MULTISOURCE_ASSEMBLY_SHADOW"
-# multi-source bounds (§8): per-operand path cap, cross-operand combination cap, whole-plan states.
+MULTISOURCE_GOLD_MIN_SHAPES = 6
 MAX_PATHS_PER_OPERAND = 8
 MAX_OPERAND_COMBINATIONS = 256
 MAX_MULTISOURCE_STATES_EXPANDED = 1024
 ```
-
-- [ ] **Step 4: Verify import + constant access**
-
-Run: `python -c "from featuregen.overlay.upload.planner.contracts import MULTISOURCE_ASSEMBLY_VERSION, MULTISOURCE_ASSEMBLY_SHADOW_FLAG, MAX_PATHS_PER_OPERAND; print('ok')"`
-Expected: `ok`
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add src/featuregen/overlay/upload/planner/contracts.py
-git commit -m "feat(3c2bia): version + bound constants for multi-source assembly
-
-Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>"
-```
+- [ ] **Step 4: Verify** — `python -c "from featuregen.overlay.upload.planner.contracts import MULTISOURCE_ASSEMBLY_SHADOW_FLAG, MULTISOURCE_GOLD_MIN_SHAPES; print('ok')"` → `ok`.
+- [ ] **Step 5: Commit** (`feat(3c2bia): worktree + version/bound constants`).
 
 ---
 
-### Task 1: Multi-source contracts (typed data)
+### Task 1: SPIKE — prove the reuse premise against real code
+
+**Goal:** Before building any multi-source contract, demonstrate that an **injected single-need `Template`** + a **hand-built `_Position`** runs through `semantic_rollup_paths` → `assemble_paths` → `check_connectivity` → `compile_temporal` → `compile_aggregation` (using A's **own** `CompilerContext`) and yields a **resolved** cross-catalog single-operand `BindingPlanV1` with an aggregation declaration. If any link fails, STOP and report — the whole design rests on this.
 
 **Files:**
-- Create: `src/featuregen/overlay/upload/planner/multisource_contracts.py`
-- Test: `tests/featuregen/overlay/upload/planner/test_multisource_contracts.py`
+- Create: `src/featuregen/overlay/upload/planner/multisource_reuse.py` (thin helpers: `build_operand_context(...)`, `injected_operand_template(...)`, `run_operand_rollup(...)`)
+- Test: `tests/featuregen/overlay/upload/planner/test_multisource_reuse_spike.py`
 
 **Interfaces:**
-- Consumes: `contracts.py` (`PlanResolutionStatus`, `ContractResolutionStatus`, `ReasonCode`, `BindingPathSegmentV1`, `PlannerReplayEnvelopeV1`).
-- Produces: `SemanticRole`, `PathAggregation`, `FinalOperation`, `PathStrategyV1`, `GovernedSourceBindingV1`, `OperandSlotV1`, `FinalExpressionV1`, `MultiSourcePlannerIntentV1`, `PhysicalLandingV1`, `OperandPathV1`, `MultiSourceBindingPlanV1`, `MultiSourceBoundingMetricsV1`, `MultiSourcePlanningResultV1`, `MultiSourceReason` (StrEnum of A's dispositions).
+- Produces: `injected_operand_template(*, recipe_id, need_role, concept, source_entity, anchor_concept=None) -> Template`; `build_operand_context(conn, *, catalogs, roles, now, agg_declarations) -> CompilerContext`; `run_operand_rollup(conn, ctx, *, source_position, target_entity, template, scope, ingredient_bindings) -> BindingPlanV1 | None`.
 
-- [ ] **Step 1: Write the failing test**
-
+- [ ] **Step 1: Write the failing test** — a two-catalog fixture where a `monetary_flow` column in catalog A is reachable to entity `customer` via a VERIFIED `entity_bridge`, with a VERIFIED grain fact on the landing:
 ```python
-# test_multisource_contracts.py
-from featuregen.overlay.upload.planner.multisource_contracts import (
-    SemanticRole, PathAggregation, FinalOperation, PathStrategyV1, OperandSlotV1,
-    GovernedSourceBindingV1, FinalExpressionV1, MultiSourcePlannerIntentV1, PhysicalLandingV1)
-
-def _ratio_intent():
-    num = OperandSlotV1(slot_id="op_0", semantic_role=SemanticRole.numerator,
-        catalog_source="core_banking", object_ref="public.transactions.amount",
-        authoritative_concept="monetary_flow",
-        path_strategy=PathStrategyV1(aggregation=PathAggregation.avg, output_type="decimal",
-                                     output_additivity="non_additive", external_type_required=False),
-        source_binding=GovernedSourceBindingV1(source_grain_entity="transaction",
-                                               source_key_ref="public.transactions.customer_id",
-                                               grain_fact_event_id="evt-1", key_fact_event_id="evt-2"))
-    den = OperandSlotV1(slot_id="op_1", semantic_role=SemanticRole.denominator,
-        catalog_source="wealth", object_ref="public.accounts.balance",
-        authoritative_concept="monetary_stock",
-        path_strategy=PathStrategyV1(aggregation=PathAggregation.take_latest, output_type="decimal",
-                                     output_additivity="semi_additive", external_type_required=False),
-        source_binding=GovernedSourceBindingV1(source_grain_entity="account",
-                                               source_key_ref="public.accounts.customer_id",
-                                               grain_fact_event_id="evt-3", key_fact_event_id="evt-4"))
-    return MultiSourcePlannerIntentV1(target_entity="customer", operands=(num, den),
-        final_expression=FinalExpressionV1(operation=FinalOperation.ratio,
-            ordered_slot_ids=("op_0", "op_1"), time_slot_id=None, window=None,
-            output_additivity="non_additive"),
-        operation_policy_version="3c2bia.op.1.0.0")
-
-def test_intent_is_frozen_and_slotted():
-    intent = _ratio_intent()
-    assert intent.final_expression.operation is FinalOperation.ratio
-    import dataclasses, pytest
-    with pytest.raises(dataclasses.FrozenInstanceError):
-        intent.operands = ()
-
-def test_physical_landing_supports_composite_grain():
-    land = PhysicalLandingV1(catalog="core_banking", table_ref="public.customer",
-                             grain_key_refs=("public.customer.customer_id", "public.customer.region"))
-    assert len(land.grain_key_refs) == 2
+def test_injected_operand_template_rolls_up_and_compiles(two_catalog_bridged_fixture):
+    conn, scope, now = two_catalog_bridged_fixture
+    tmpl = injected_operand_template(recipe_id="ms:op_0", need_role="measure_0",
+                                     concept="monetary_flow", source_entity="transaction")
+    ctx = build_operand_context(conn, catalogs=["core_banking", "wealth"],
+                                roles=("feature_engineer",), now=now,
+                                agg_declarations=_agg_decls_for("ms:op_0", "measure_0", "sum"))
+    plan = run_operand_rollup(conn, ctx, source_position=_Position("transaction", "core_banking",
+                              "public.transactions"), target_entity="customer", template=tmpl,
+                              scope=scope, ingredient_bindings=_binding_for("measure_0",
+                              "core_banking", "public.transactions.amount"))
+    assert plan is not None
+    assert plan.resolution_status is PlanResolutionStatus.resolved
+    conn_res = check_connectivity(ctx, plan)
+    temporal = compile_temporal(ctx, plan, tmpl)
+    hops = compile_aggregation(ctx, plan, tmpl, temporal, conn_res.placement)
+    assert hops  # a fan-in hop produced an aggregation declaration
 ```
-
-- [ ] **Step 2: Run test to verify it fails**
-
-Run: `pytest tests/featuregen/overlay/upload/planner/test_multisource_contracts.py -v`
-Expected: FAIL — `ModuleNotFoundError: multisource_contracts`.
-
-- [ ] **Step 3: Write the contracts module**
-
-```python
-# multisource_contracts.py
-"""3C.2b-i-A typed contracts (shadow). Frozen slotted dataclasses + lowercase-snake StrEnums.
-Siblings to BindingPlanV1/BindingPlanningResultV1 — single-source planning is untouched."""
-from __future__ import annotations
-from dataclasses import dataclass, field
-from enum import StrEnum
-from featuregen.overlay.upload.planner.contracts import (
-    BindingPathSegmentV1, ContractResolutionStatus, PlanResolutionStatus, PlannerReplayEnvelopeV1)
-
-
-class SemanticRole(StrEnum):
-    measure = "measure"; time = "time"; counted = "counted"
-    numerator = "numerator"; denominator = "denominator"
-    minuend = "minuend"; subtrahend = "subtrahend"
-
-
-class PathAggregation(StrEnum):
-    avg = "avg"; sum = "sum"; min = "min"; max = "max"; stddev = "stddev"
-    take_latest = "take_latest"; count = "count"; count_distinct = "count_distinct"
-
-
-class FinalOperation(StrEnum):
-    identity = "identity"; count = "count"; count_distinct = "count_distinct"
-    recency = "recency"; trend = "trend"; ratio = "ratio"; difference = "difference"
-
-
-class MultiSourceReason(StrEnum):
-    # semantic
-    operand_shape_invalid = "operand_shape_invalid"
-    unverified_crossing_required = "unverified_crossing_required"
-    realization_endpoint_ungoverned = "realization_endpoint_ungoverned"
-    no_common_physical_grain = "no_common_physical_grain"
-    ambiguous_physical_grain = "ambiguous_physical_grain"
-    aggregation_unsafe_on_path = "aggregation_unsafe_on_path"
-    temporal_paths_incompatible = "temporal_paths_incompatible"
-    source_binding_ungoverned = "source_binding_ungoverned"
-    resolved = "resolved"
-    # technical / capture
-    operand_or_slot_not_preserved = "operand_or_slot_not_preserved"
-    technical_failure = "technical_failure"
-    budget_truncated = "budget_truncated"
-
-
-@dataclass(frozen=True, slots=True)
-class PathStrategyV1:
-    aggregation: PathAggregation
-    output_type: str
-    output_additivity: str            # "additive"|"semi_additive"|"non_additive"|"n/a"
-    external_type_required: bool = False
-
-
-@dataclass(frozen=True, slots=True)
-class GovernedSourceBindingV1:
-    source_grain_entity: str
-    source_key_ref: str
-    grain_fact_event_id: str          # the VERIFIED grain fact backing source_grain_entity
-    key_fact_event_id: str            # the VERIFIED key fact backing source_key_ref
-
-
-@dataclass(frozen=True, slots=True)
-class OperandSlotV1:
-    slot_id: str
-    semantic_role: SemanticRole
-    catalog_source: str
-    object_ref: str
-    authoritative_concept: str
-    path_strategy: PathStrategyV1
-    source_binding: GovernedSourceBindingV1
-
-
-@dataclass(frozen=True, slots=True)
-class FinalExpressionV1:
-    operation: FinalOperation
-    ordered_slot_ids: tuple[str, ...]     # order-sensitive ops rely on this order
-    time_slot_id: str | None              # references a TIME operand slot; never a raw time_ref
-    window: str | None
-    output_additivity: str
-
-
-@dataclass(frozen=True, slots=True)
-class MultiSourcePlannerIntentV1:
-    target_entity: str
-    operands: tuple[OperandSlotV1, ...]
-    final_expression: FinalExpressionV1
-    operation_policy_version: str
-
-
-@dataclass(frozen=True, slots=True)
-class PhysicalLandingV1:
-    catalog: str
-    table_ref: str
-    grain_key_refs: tuple[str, ...]       # multi-column grains: join on EVERY key
-
-
-@dataclass(frozen=True, slots=True)
-class OperandPathV1:
-    slot_id: str
-    semantic_role: SemanticRole
-    catalog_source: str
-    object_ref: str
-    path_segments: tuple[BindingPathSegmentV1, ...]
-    source_to_landing_key_map: tuple[tuple[str, str], ...]   # (source_key_ref, landing_key_ref) — A-derived
-    path_strategy: PathStrategyV1
-    pit_treatment: str
-
-
-@dataclass(frozen=True, slots=True)
-class MultiSourceBoundingMetricsV1:
-    paths_per_operand_truncated: bool
-    operand_combinations_truncated: bool
-    states_truncated: bool
-    total_states_expanded: int
-
-
-@dataclass(frozen=True, slots=True)
-class MultiSourceBindingPlanV1:
-    plan_id: str
-    physical_landing: PhysicalLandingV1
-    operand_paths: tuple[OperandPathV1, ...]
-    final_expression: FinalExpressionV1
-    physical_read_set: tuple[str, ...]
-    resolution_status: PlanResolutionStatus
-    reason_codes: tuple[MultiSourceReason, ...]
-    contract_result_status: ContractResolutionStatus = ContractResolutionStatus.not_compiled
-    contract_id: str | None = None        # this plan's OWN declaration identity (never a selected id)
-
-
-@dataclass(frozen=True, slots=True)
-class MultiSourcePlanningResultV1:
-    run_id: str | None
-    target_entity: str
-    candidate_plans: tuple[MultiSourceBindingPlanV1, ...]
-    selected_plan_id: str | None
-    result_status: PlanResolutionStatus
-    primary_reason_code: MultiSourceReason | None
-    reason_codes: tuple[MultiSourceReason, ...]
-    bounding: MultiSourceBoundingMetricsV1
-    replay_envelope: PlannerReplayEnvelopeV1
-    contract_result_status: ContractResolutionStatus = ContractResolutionStatus.not_compiled
-    selected_contract_plan_id: str | None = None
-    selected_contract_id: str | None = None
-```
-
-- [ ] **Step 4: Run test to verify it passes**
-
-Run: `pytest tests/featuregen/overlay/upload/planner/test_multisource_contracts.py -v`
-Expected: PASS (2 tests).
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add src/featuregen/overlay/upload/planner/multisource_contracts.py tests/featuregen/overlay/upload/planner/test_multisource_contracts.py
-git commit -m "feat(3c2bia): multi-source assembly typed contracts
-
-Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>"
-```
+- [ ] **Step 2: Run → FAIL** (`ModuleNotFoundError` / fixtures absent). Build the fixture using the real governance write paths (seed a VERIFIED grain fact + a VERIFIED entity_bridge via `record_field_evidence`/the fact confirm path — read `facts.py`/`bridge_projection.py`/existing planner tests for the seeding helpers first).
+- [ ] **Step 3: Implement** the three helpers. `injected_operand_template`: a `Template` with `id=recipe_id`, one required `Need(role=need_role, concept=concept, ...)` (+ a temporal `Need` when `anchor_concept` is set), `source_entity`, `source_entity_need_role`. `build_operand_context`: a `CompilerContext` with `agg_declarations` populated (NOT the empty production builder) and `columns_by_catalog`/`realizations_by_catalog`/`active_bridges`/fingerprints/stamps loaded for the given catalogs+roles. `run_operand_rollup`: `paths, status = semantic_rollup_paths(source_position.entity, target_entity)`; pick the governed path; `assemble_paths(conn, source_position=..., semantic_path=path, scope=..., ingredient_bindings=..., template=..., target_entity=...)`; return the first `resolved` plan from `AssemblyV1.complete`.
+- [ ] **Step 4: Run → PASS.** If it cannot be made to pass, STOP: the reuse premise is wrong; report with the exact failure before proceeding.
+- [ ] **Step 5: Add a second test** proving the `take_latest` two-need injection: `injected_operand_template(..., anchor_concept="as_of_date")` yields a plan whose `compile_temporal` finds the anchor and `_take_latest` validation passes. Run → PASS.
+- [ ] **Step 6: Commit** (`feat(3c2bia): SPIKE — injected-template operand rollup + compile proven against real frontier`).
 
 ---
 
-### Task 2: Operation → slot → path-strategy matrix + shape validation
+### Task 2: Multi-source contracts
 
-**Files:**
-- Create: `src/featuregen/overlay/upload/planner/multisource_operation.py`
-- Test: `tests/featuregen/overlay/upload/planner/test_multisource_operation.py`
+**Files:** Create `src/featuregen/overlay/upload/planner/multisource_contracts.py`; Test `.../test_multisource_contracts.py`.
 
-**Interfaces:**
-- Consumes: Task 1 types.
-- Produces: `OPERATION_MATRIX` (mapping `FinalOperation` → required `(SemanticRole, count, allowed PathAggregation set)` spec + window requirement + whether ordered), `validate_operation_shape(intent) -> MultiSourceReason | None`.
+**Interfaces produced:** `SemanticRole`, `PathAggregation`, `FinalOperation`, `MultiSourceReason` (StrEnums); `PathStrategyV1`, `GovernedSourceBindingV1`, `OperandSlotV1`, `FinalExpressionV1`, `MultiSourcePlannerIntentV1`, `GovernedEndpointV1`, `PhysicalLandingV1`, `OperandPathV1`, `MultiSourceBoundingMetricsV1`, `MultiSourceReplayEnvelopeV1`, `MultiSourceBindingPlanV1`, `MultiSourcePlanningResultV1`; `PATH_AGG_TO_FUNCTION: dict[PathAggregation, AggregationFunction | None]`.
 
-- [ ] **Step 1: Write the failing test**
-
-```python
-from featuregen.overlay.upload.planner.multisource_operation import validate_operation_shape
-from featuregen.overlay.upload.planner.multisource_contracts import MultiSourceReason
-# reuse _ratio_intent() helper (copy into this test module)
-
-def test_valid_ratio_shape_ok():
-    assert validate_operation_shape(_ratio_intent()) is None
-
-def test_identity_requires_measure_not_counted():
-    intent = _identity_intent_with_counted()   # IDENTITY over a COUNTED slot
-    assert validate_operation_shape(intent) is MultiSourceReason.operand_shape_invalid
-
-def test_trend_requires_window_and_time_slot():
-    intent = _trend_intent_without_window()
-    assert validate_operation_shape(intent) is MultiSourceReason.operand_shape_invalid
-
-def test_count_distinct_requires_counted_operand():
-    assert validate_operation_shape(_count_distinct_intent()) is None
-```
-
-- [ ] **Step 2: Run to verify fail**
-
-Run: `pytest tests/featuregen/overlay/upload/planner/test_multisource_operation.py -v`
-Expected: FAIL — module missing.
-
-- [ ] **Step 3: Implement the matrix + validator**
-
-```python
-# multisource_operation.py
-"""The CLOSED operation→slot→path-strategy matrix (spec §3). Total; any mismatch → operand_shape_invalid."""
-from __future__ import annotations
-from dataclasses import dataclass
-from featuregen.overlay.upload.planner.multisource_contracts import (
-    FinalOperation, MultiSourcePlannerIntentV1, MultiSourceReason, PathAggregation, SemanticRole)
-
-_MEASURE_AGG = frozenset({PathAggregation.avg, PathAggregation.sum, PathAggregation.min,
-                          PathAggregation.max, PathAggregation.stddev})
-
-@dataclass(frozen=True, slots=True)
-class _SlotSpec:
-    role: SemanticRole
-    allowed: frozenset          # allowed PathAggregation for this slot
-
-@dataclass(frozen=True, slots=True)
-class _OpSpec:
-    slots: tuple[_SlotSpec, ...]
-    requires_window: bool
-    requires_time_slot: bool
-    order_sensitive: bool
-
-OPERATION_MATRIX: dict[FinalOperation, _OpSpec] = {
-    FinalOperation.identity: _OpSpec((_SlotSpec(SemanticRole.measure, _MEASURE_AGG),), False, False, False),
-    FinalOperation.count: _OpSpec((_SlotSpec(SemanticRole.counted, frozenset({PathAggregation.count})),), False, False, False),
-    FinalOperation.count_distinct: _OpSpec((_SlotSpec(SemanticRole.counted, frozenset({PathAggregation.count_distinct})),), False, False, False),
-    FinalOperation.recency: _OpSpec((_SlotSpec(SemanticRole.time, frozenset({PathAggregation.take_latest})),), False, True, False),
-    FinalOperation.trend: _OpSpec((_SlotSpec(SemanticRole.measure, _MEASURE_AGG),
-                                   _SlotSpec(SemanticRole.time, frozenset({PathAggregation.take_latest}))), True, True, False),
-    FinalOperation.ratio: _OpSpec((_SlotSpec(SemanticRole.numerator, _MEASURE_AGG),
-                                   _SlotSpec(SemanticRole.denominator, _MEASURE_AGG)), False, False, True),
-    FinalOperation.difference: _OpSpec((_SlotSpec(SemanticRole.minuend, _MEASURE_AGG),
-                                        _SlotSpec(SemanticRole.subtrahend, _MEASURE_AGG)), False, False, True),
-}
-
-def validate_operation_shape(intent: MultiSourcePlannerIntentV1) -> MultiSourceReason | None:
-    spec = OPERATION_MATRIX.get(intent.final_expression.operation)
-    if spec is None:
-        return MultiSourceReason.operand_shape_invalid
-    want = sorted((s.role for s in spec.slots), key=str)
-    have = sorted((o.semantic_role for o in intent.operands), key=str)
-    if want != have:
-        return MultiSourceReason.operand_shape_invalid
-    by_role = {}
-    for o in intent.operands:
-        by_role.setdefault(o.semantic_role, []).append(o)
-    for s in spec.slots:
-        matches = by_role.get(s.role, [])
-        if len(matches) != 1 or matches[0].path_strategy.aggregation not in s.allowed:
-            return MultiSourceReason.operand_shape_invalid
-    fe = intent.final_expression
-    if spec.requires_window and not fe.window:
-        return MultiSourceReason.operand_shape_invalid
-    if spec.requires_time_slot and fe.time_slot_id is None:
-        return MultiSourceReason.operand_shape_invalid
-    if spec.order_sensitive and len(set(fe.ordered_slot_ids)) != len(spec.slots):
-        return MultiSourceReason.operand_shape_invalid
-    # every ordered_slot_id and time_slot_id must reference a real slot
-    ids = {o.slot_id for o in intent.operands}
-    if not set(fe.ordered_slot_ids).issubset(ids) or (fe.time_slot_id and fe.time_slot_id not in ids):
-        return MultiSourceReason.operand_shape_invalid
-    return None
-```
-
-- [ ] **Step 4: Run to verify pass** (write the `_identity_intent_with_counted`/`_trend_intent_without_window`/`_count_distinct_intent` helpers in the test)
-
-Run: `pytest tests/featuregen/overlay/upload/planner/test_multisource_operation.py -v`
-Expected: PASS.
-
-- [ ] **Step 5: Commit** (`feat(3c2bia): closed operation→slot→path-strategy matrix + shape validation`)
-
----
-
-### Task 3: GovernedRealizationV2 — endpoint revalidation against governed facts
-
-**Files:**
-- Create: `src/featuregen/overlay/upload/planner/multisource_realizations.py`
-- Test: `tests/featuregen/overlay/upload/planner/test_multisource_realizations.py`
-
-**Interfaces:**
-- Consumes: `resolve.py`/`resolve_fact` (governed fact read), `catalog_realizations.py` (for the advisory baseline to reject).
-- Produces: `governed_grain_key_refs(conn, catalog, table_ref, *, now) -> tuple[str, ...] | None`; `governed_key_entity(conn, catalog, column_ref, *, now) -> tuple[str, str] | None` (entity, key_fact_event_id); `revalidate_endpoint(conn, catalog, table_ref, *, now) -> GovernedRealizationV2 | None`.
-
-- [ ] **Step 1: Write the failing test** (DB fixture: a table with a VERIFIED grain fact vs one whose grain is only advisory `is_grain`)
-
-```python
-def test_governed_grain_from_verified_fact_only(db_with_verified_grain):
-    keys = governed_grain_key_refs(db_with_verified_grain, "core_banking", "public.customer", now=NOW)
-    assert keys == ("public.customer.customer_id",)
-
-def test_advisory_is_grain_without_fact_is_none(db_with_advisory_is_grain_only):
-    assert governed_grain_key_refs(db_with_advisory_is_grain_only, "core_banking", "public.customer", now=NOW) is None
-
-def test_revalidate_endpoint_rejects_ungoverned(db_with_advisory_is_grain_only):
-    assert revalidate_endpoint(db_with_advisory_is_grain_only, "core_banking", "public.customer", now=NOW) is None
-```
-
-- [ ] **Step 2: Run to verify fail.** Run: `pytest .../test_multisource_realizations.py -v` → FAIL (module missing).
-
-- [ ] **Step 3: Implement** — read the governed grain fact via `resolve_fact(conn, adapter, table_ref, "grain", now=now)`; return `tuple(grain.value["columns"])` **only** when `grain.value is not None` and the fact is VERIFIED (carries `provenance["confirmed_event_id"]`); else `None`. `GovernedRealizationV2` is a frozen dataclass `{catalog, table_ref, grain_key_refs, grain_fact_event_id}`. `revalidate_endpoint` returns it only when grain keys are governed. Mirror the `resolve_fact` call site pattern used in `table_fact_projection.py` (read that file first).
-
-- [ ] **Step 4: Run to verify pass.** Expected: PASS.
-- [ ] **Step 5: Commit** (`feat(3c2bia): GovernedRealizationV2 endpoint revalidation vs governed grain/key facts`)
-
----
-
-### Task 4: Multi-operand path enumeration + convergence + ranking
-
-**Files:**
-- Create: `src/featuregen/overlay/upload/planner/multisource_assembly.py`
-- Test: `tests/featuregen/overlay/upload/planner/test_multisource_assembly.py`
-
-**Interfaces:**
-- Consumes: `assembly.py` (`_State`/`_Position`/`_AUTHORITY_RANK`, active-bridge frontier — read fully first), Task 1 types, Task 3 `revalidate_endpoint`, `contracts.MAX_PATHS_PER_OPERAND`/`MAX_OPERAND_COMBINATIONS`/`MAX_MULTISOURCE_STATES_EXPANDED`.
-- Produces: `enumerate_operand_paths(conn, operand, target_entity, *, scope, roles, now) -> tuple[_OperandPathCandidate, ...]`; `converge(operand_path_sets) -> tuple[list[_LandedCombination], MultiSourceBoundingMetricsV1]` (exact convergence on `PhysicalLandingV1` incl. `grain_key_refs`, deterministic ranking, bounded).
-
-- [ ] **Step 1: Write the failing test** — two operands in different catalogs, each reachable to `customer` via one VERIFIED bridge to a common `public.customer` table with `grain_key_refs=("public.customer.customer_id",)`; assert `converge` returns exactly one landed combination at that landing; a second test where the two operands share no reachable common landing → empty + no crash; a third where two landings tie → recorded ambiguity (empty selection, flag set).
-
+- [ ] **Step 1: Failing test** — construct a RATIO intent with a `take_latest` denominator carrying `ordering_anchor_concept`, assert frozen/slotted; a `PhysicalLandingV1` with two `grain_key_refs`; `PATH_AGG_TO_FUNCTION[PathAggregation.sum] is AggregationFunction.sum` and `PATH_AGG_TO_FUNCTION[PathAggregation.stddev] is None`.
 - [ ] **Step 2: Run → FAIL.**
-
-- [ ] **Step 3: Implement.** Per operand: run the single-source frontier from the operand's pinned source position, but (a) pin the operand column, (b) require every crossing VERIFIED, (c) require each endpoint to pass `revalidate_endpoint` (Task 3), capping at `MAX_PATHS_PER_OPERAND`. Each path ends at a `PhysicalLandingV1` (catalog, table_ref, **governed** grain_key_refs). `converge`: intersect the per-operand landing sets on the full `PhysicalLandingV1` identity (catalog+table+grain_key_refs); cap the cross-operand product at `MAX_OPERAND_COMBINATIONS`; rank landings by `_AUTHORITY_RANK` → fewest total crossings → stable identity order; if the top rank ties across distinct landings, record `ambiguous_physical_grain` (no selection). Record truncations on `MultiSourceBoundingMetricsV1`. This step does NOT compile or check aggregation/temporal (Tasks 5–6).
-
+- [ ] **Step 3: Implement** the module exactly per spec §3 (all fields as listed: `OperandPathV1.binding_plan: BindingPlanV1`, `governed_endpoints`; `GovernedSourceBindingV1` = `source_grain_entity`/`source_grain_key_refs`/`grain_fact_key`, no key fact; `PathStrategyV1.ordering_anchor_concept: str | None`; `MultiSourceReplayEnvelopeV1` fields over fact_keys; `physical_read_set: PhysicalReadSetV1`; `MultiSourceBoundingMetricsV1.landing_ambiguous`). `PATH_AGG_TO_FUNCTION` = `{sum:sum, min:min, max:max, take_latest:take_latest, count:count, count_distinct:count, avg:None, stddev:None}`. `MultiSourceReason` StrEnum lists every §9 disposition incl. `unsupported_path_aggregation`.
 - [ ] **Step 4: Run → PASS.**
-- [ ] **Step 5: Commit** (`feat(3c2bia): multi-operand path enumeration + exact physical convergence + ranking`)
+- [ ] **Step 5: Commit** (`feat(3c2bia): multi-source typed contracts + path-agg mapping`).
 
 ---
 
-### Task 5: Per-path pure aggregation + temporal checks
+### Task 3: Operation matrix + shape validation
 
-**Files:**
-- Modify: `src/featuregen/overlay/upload/planner/multisource_assembly.py`
-- Test: `tests/featuregen/overlay/upload/planner/test_multisource_checks.py`
+**Files:** Create `.../multisource_operation.py`; Test `.../test_multisource_operation.py`.
 
-**Interfaces:**
-- Consumes: the additivity/aggregation evaluator + temporal-rule evaluator (find them in `declarations.py`; read before use), Task 1 types.
-- Produces: `check_path_aggregation(operand, path) -> MultiSourceReason | None`; `check_paths_temporal(operand_paths) -> MultiSourceReason | None` (per-path validity + cross-path as-of consistency). **Pure** — no freshness, no clock-dependent graph reads (freshness is Task 6's union check).
+**Interfaces:** `OPERATION_MATRIX`, `validate_operation_shape(intent) -> MultiSourceReason | None`.
 
-- [ ] **Step 1: Failing test** — a non-additive measure with a `sum` strategy across a fan-out path → `aggregation_unsafe_on_path`; a `take_latest` on a semi-additive stock → ok; two operand paths with incompatible as-of semantics → `temporal_paths_incompatible`; compatible → `None`.
+- [ ] **Step 1: Failing test** — valid RATIO (take_latest denom + anchor) → `None`; IDENTITY over COUNTED → `operand_shape_invalid`; TREND without window → `operand_shape_invalid`; duplicate `slot_id` → `operand_shape_invalid`; `time_slot_id` pointing at a MEASURE → `operand_shape_invalid`; a `stddev` measure → `unsupported_path_aggregation`; `take_latest` without `ordering_anchor_concept` → `ordering_anchor_missing`.
 - [ ] **Step 2: Run → FAIL.**
-- [ ] **Step 3: Implement** reusing the existing additivity/aggregation classification + temporal-rule functions per path; the cross-path temporal check compares each path's PIT treatment for as-of consistency at the landing.
+- [ ] **Step 3: Implement** per spec §4: the closed matrix (allowed `PathAggregation` per slot, window/time requirements, order-sensitivity); **exact role→slot validation** (multiset of roles; each `ordered_slot_id`/`time_slot_id` references a real, correctly-roled, distinct slot; no duplicate ids); `stddev` → `unsupported_path_aggregation`; `take_latest` ⇒ `ordering_anchor_concept` present else `ordering_anchor_missing`.
 - [ ] **Step 4: Run → PASS.**
-- [ ] **Step 5: Commit** (`feat(3c2bia): pure per-path aggregation + temporal compatibility checks`)
+- [ ] **Step 5: Commit** (`feat(3c2bia): operation→slot→path-strategy matrix + exact shape validation`).
 
 ---
 
-### Task 6: compile_multi_source_contract + compile-end union freshness
+### Task 4: GovernedEndpointV1 — grain-fact endpoint revalidation
 
-**Files:**
-- Create: `src/featuregen/overlay/upload/planner/multisource_compile.py`
-- Test: `tests/featuregen/overlay/upload/planner/test_multisource_compile.py`
+**Files:** Create `.../multisource_endpoints.py`; Test `.../test_multisource_endpoints.py`.
 
-**Interfaces:**
-- Consumes: `declarations.py` (`build_compiler_context`, `CompileBudget`, the single-path connectivity/safety/aggregation/temporal checks, the freshness check `:816`, `make_contract_id`), Task 1 types.
-- Produces: `MultiSourceContractSpecV1` (injected declarations: per-operation aggregation function, output additivity, window, temporal requirements); `compile_multi_source_contract(conn, ctx, plan, spec, *, base_envelope) -> MultiSourceBindingPlanV1`.
+**Interfaces:** `governed_endpoint(conn, adapter, *, catalog, table_ref, now) -> GovernedEndpointV1 | None`.
 
-- [ ] **Step 1: Failing test** — a plan whose two paths are individually fresh but reference catalogs whose union fails one freshness watermark → `contract_result_status` reflects the union freshness failure; a fully-consistent plan → `resolved` with a stable `contract_id` (identity deterministic across two runs with the same inputs).
+- [ ] **Step 1: Failing test** — a table with a VERIFIED grain fact → `GovernedEndpointV1` whose `grain_key_refs` are the fact's short columns **qualified** to `table_ref` and validated against `graph_node.column_name`, and `grain_fact_key` set; a table with only advisory `is_grain` (no fact) → `None`; a composite grain fact → multi-element `grain_key_refs`.
 - [ ] **Step 2: Run → FAIL.**
-- [ ] **Step 3: Implement.** For each `OperandPathV1`: run the existing single-path connectivity/safety/aggregation/temporal declaration checks (reuse, do not reimplement). Then ONE union freshness/consistency check over the union of catalogs/realizations/bridges/structural fact ids (extend the single-plan freshness at `declarations.py:816` to the union — read it first). Then final-combination checks (final expression well-typed at the landing grain; `output_additivity` coherent with the per-path outputs). Compute `contract_id` via a deterministic identity over landing + paths + strategies + final expression + versions (mirror `make_contract_id`). Declarations come from `spec` (production `build_compiler_context` supplies an empty agg-declaration registry — inject here). Return the plan with `contract_result_status`/`contract_id` set.
+- [ ] **Step 3: Implement** — `resolve_fact(conn, adapter, table_ref, "grain", now=now)`; when `grain and grain.value is not None`, qualify each short column to `table_ref` (`f"{table_ref}.{col}"`), verify each exists in `graph_node` (`column_name` membership), and return `GovernedEndpointV1(catalog, table_ref, tuple(qualified), grain.fact_key)`; else `None`. Read `table_fact_projection.py`'s `resolve_fact("grain")` call site first for the adapter/ref pattern.
 - [ ] **Step 4: Run → PASS.**
-- [ ] **Step 5: Commit** (`feat(3c2bia): compile_multi_source_contract + compile-end union freshness`)
+- [ ] **Step 5: Commit** (`feat(3c2bia): GovernedEndpointV1 grain-fact endpoint revalidation`).
 
 ---
 
-### Task 7: Result orchestration — plan_multi_source
+### Task 5: Per-operand path enumeration (typed result)
 
-**Files:**
-- Create: `src/featuregen/overlay/upload/planner/multisource_plan.py`
-- Test: `tests/featuregen/overlay/upload/planner/test_multisource_plan.py`
+**Files:** Create `.../multisource_assembly.py`; Test `.../test_multisource_enumeration.py`.
 
-**Interfaces:**
-- Consumes: Tasks 2, 4, 5, 6, `_envelope`/`PlannerReplayEnvelopeV1` from `plan.py`/`contracts.py`.
-- Produces: `plan_multi_source(conn, *, intent, scope, roles, now, ctx=None, budget=None) -> MultiSourcePlanningResultV1`.
+**Interfaces:** `OperandEnumerationResultV1{candidates, status, reason_codes, bounds}`; `enumerate_operand_paths(conn, adapter, ctx, *, operand, target_entity, scope, roles, now) -> OperandEnumerationResultV1`. Each candidate carries the `BindingPlanV1`, the re-derived landing `(catalog, table_ref)`, and the landing `GovernedEndpointV1`.
 
-- [ ] **Step 1: Failing test** — the valid RATIO intent resolves: `result_status == resolved`, one selected candidate landing all operands, `selected_plan_id` set, preservation holds; a shape-invalid intent → `operand_shape_invalid`, no candidates; an intent whose operand needs an unverified crossing → `unverified_crossing_required`.
+- [ ] **Step 1: Failing test** — the bridged operand yields ≥1 candidate whose landing endpoint is governed; an operand reachable only without any VERIFIED bridge → status carries `no_governed_path`; an operand whose landing has no grain fact → `realization_endpoint_ungoverned`; truncation at `MAX_PATHS_PER_OPERAND` sets the bound.
 - [ ] **Step 2: Run → FAIL.**
-- [ ] **Step 3: Implement** the orchestration in spec §5 order: `validate_operation_shape` (Task 2) → `enumerate_operand_paths`+`converge` (Task 4) → per-path aggregation/temporal (Task 5) → final join + **preservation assertion** (every operand + slot survives once; else `operand_or_slot_not_preserved`) → `compile_multi_source_contract` (Task 6) → select best candidate → assemble `MultiSourcePlanningResultV1` with bounds + replay envelope. Fail-closed at every step; a raised DB error is NOT caught here (the harness savepoint classifies it technical).
+- [ ] **Step 3: Implement** — reuse Task 1's `run_operand_rollup` per governed path (build the injected template incl. the second temporal need when `take_latest`); **re-derive the landing** `(catalog, table_ref)` from the plan's `path_segments` (mirror `check_connectivity`'s execution-table logic); revalidate the landing (Task 4) → drop ungoverned; classify empties with the right reason (never a bare empty tuple); cap at `MAX_PATHS_PER_OPERAND`.
 - [ ] **Step 4: Run → PASS.**
-- [ ] **Step 5: Commit** (`feat(3c2bia): plan_multi_source orchestration → MultiSourcePlanningResultV1`)
+- [ ] **Step 5: Commit** (`feat(3c2bia): per-operand governed path enumeration (typed result)`).
 
 ---
 
-### Task 8: Migration 1005 + shadow store
+### Task 6: Convergence + ranking
 
-**Files:**
-- Create: `src/featuregen/db/migrations/1005_multisource_assembly_shadow.sql`
-- Create: `src/featuregen/overlay/upload/planner/multisource_shadow_store.py`
-- Test: `tests/featuregen/overlay/upload/planner/test_multisource_shadow_store.py`
+**Files:** Modify `.../multisource_assembly.py`; Test `.../test_multisource_convergence.py`.
 
-**Interfaces:**
-- Consumes: `shadow_store.py` (`write_dispatch`/`write_run_and_plans`/`reconcile` patterns — read first), `db/migrations/0999_planner_shadow_store.sql` (schema pattern).
-- Produces: `write_manifest(conn, rec)`; `write_intent_result(conn, run_result, observations)` (two-phase); `reconcile(conn, run_id) -> ReconcileResultV1`; row dataclasses carrying **separate axes**: `semantic_outcome`, `compile_completeness`, `technical_status`, `capture_status`.
+**Interfaces:** `ConvergenceResultV1{landed_combinations, status, reason_codes, bounds}`; `converge(operand_results, *, bounds) -> ConvergenceResultV1`.
 
-- [ ] **Step 1: Failing test** — write a manifest with an expected set of 2 intents; write one intent result; `reconcile` reports the missing one; a second write to the same `(run_id, intent_id)` is idempotent; the row records the four separate axes.
+- [ ] **Step 1: Failing test** — two operands both reaching one `PhysicalLandingV1` (catalog+table+`grain_key_refs`) → one landed combination; operands sharing no landing → `no_common_physical_grain`; two distinct landings tied at the top **semantic** rank → `ambiguous_physical_grain` + `landing_ambiguous` (tie detected BEFORE stable ordering); composite-grain landing preserved.
 - [ ] **Step 2: Run → FAIL.**
-- [ ] **Step 3: Implement.** Migration `1005` mirrors `0999`: `multisource_assembly_shadow_dispatch` (PK `run_id`, expected_intent_ids jsonb, versions jsonb, append-only), `multisource_assembly_shadow_intent_result` (PK `(run_id, intent_id)`, columns for `semantic_outcome`, `compile_completeness`, `technical_status`, `capture_status`, `normalized_intent_hash`, `selected_plan_id`, `physical_landing` jsonb, reason_codes jsonb), `multisource_assembly_shadow_operand_obs` (PK `(run_id, intent_id, slot_id)`, pin/role/path_strategy/crossings/endpoint-fact-ids/source-binding-provenance). Append-only (no UPDATE/DELETE). Store fns mirror `shadow_store.py` exactly (idempotent manifest; two-phase; reconcile = every manifest intent has a result row).
-- [ ] **Step 4: Run → PASS** (run the migration in the test DB fixture first).
-- [ ] **Step 5: Commit** (`feat(3c2bia): migration 1005 + multi-source shadow store (manifest/reconciliation, separated axes)`)
-
----
-
-### Task 9: Shadow harness — runnable entrypoint + fixture/persistence boundary
-
-**Files:**
-- Create: `src/featuregen/overlay/upload/planner/multisource_shadow.py`
-- Test: `tests/featuregen/overlay/upload/planner/test_multisource_shadow.py`
-
-**Interfaces:**
-- Consumes: Task 7 `plan_multi_source`, Task 8 store, `CompileBudget`, `MULTISOURCE_ASSEMBLY_SHADOW_FLAG`.
-- Produces: `run_multisource_assembly_shadow(conn, *, intents, run_id, roles, now, monotonic=time.monotonic) -> tuple[MultiSourcePlanningResultV1, ...]`.
-
-- [ ] **Step 1: Failing test** — a run over 2 gold intents writes the manifest FIRST, plans each in a per-intent savepoint, two-phase-writes results, reconciles clean; an injected DB error in one intent records `technical_status=technical_failure` and does not poison the others or the manifest; a run over a budget-exhausting set records `capture_status` truncation. Verify results persist even though gold fixtures are set up inside a transaction (persist on a boundary outside the fixture rollback — see Step 3).
-- [ ] **Step 2: Run → FAIL.**
-- [ ] **Step 3: Implement** mirroring `shadow.py::run_shadow_planner`: write manifest first (before any planning); own the mutable `CompileBudget` across intents; per-intent `with conn.transaction():` savepoint isolates DB errors → `technical_failure`; two-phase store write caught so the manifest survives; budget truncation → `budget_truncated` capture status. **Fixture/persistence boundary:** the runnable entrypoint accepts the connection and commits shadow rows on it; tests that build gold fixtures inside a rollback-only transaction must pass a *separate* committed connection (or commit before teardown) so `reconcile` is meaningful — document this in the entrypoint docstring and assert it in the test. Flag read happens in the CALLER, never here (harness stays pure), matching `shadow.py`.
+- [ ] **Step 3: Implement** — intersect per-operand landing sets on full `PhysicalLandingV1` identity; cap the product at `MAX_OPERAND_COMBINATIONS`; rank by `_AUTHORITY_RANK` → fewest total crossings; detect a top-semantic-rank tie across distinct landings and return `ambiguous_physical_grain` **before** applying stable-identity presentation order; record bounds.
 - [ ] **Step 4: Run → PASS.**
-- [ ] **Step 5: Commit** (`feat(3c2bia): multi-source shadow harness entrypoint + fixture/persistence boundary`)
+- [ ] **Step 5: Commit** (`feat(3c2bia): exact physical-landing convergence + deterministic ranking`).
 
 ---
 
-### Task 10: Partitioned gold set + assembly gate
+### Task 7: Per-path checks via reuse (aggregation + temporal)
 
-**Files:**
-- Create: `src/featuregen/overlay/upload/planner/multisource_gold.py`
-- Create: `src/featuregen/overlay/upload/planner/multisource_gate.py`
-- Test: `tests/featuregen/overlay/upload/planner/test_multisource_gate.py`
+**Files:** Modify `.../multisource_assembly.py`; Test `.../test_multisource_checks.py`.
 
-**Interfaces:**
-- Consumes: `contract_gold.py`/`contract_eval.py` (evaluator pattern — read first), Tasks 7/9.
-- Produces: `CORRECTNESS_GOLD` (immutable expected outcomes; positive must-resolve + negative exact-code), `FAULT_CONTROLS` (injected-fault cases), `evaluate_assembly_gate(conn, ...) -> AssemblyGateResultV1` (pass iff the spec §10 criteria hold over the correctness population; fault controls pass only when exactly classified and are EXCLUDED from the clean population).
+**Interfaces:** `check_operand_path(ctx, operand_path) -> tuple[TemporalDeclarationV1, tuple[HopAggregationV1,...], MultiSourceReason | None]`; `check_paths_temporal_consistency(operand_paths) -> MultiSourceReason | None`; A-owned `check_time_slot_take_latest(operand_path) -> MultiSourceReason | None`.
 
-- [ ] **Step 1: Failing test** — the gate PASSES on a correct implementation over the correctness population (positive cases resolved with exact expected landing/paths/slots/expression; negatives exact-code); the gate FAILS if any positive case does not resolve (reject-all cannot pass); a fault-control case passes when exactly classified and is not counted in the clean population; the gate FAILS on a technical failure in the clean population.
+- [ ] **Step 1: Failing test** — a non-additive measure with `sum` over a fan-in → `aggregation_unsafe_on_path`; `take_latest` measure with its anchor bound → ok; two paths with incompatible as-of semantics → `temporal_paths_incompatible`; a RECENCY TIME-slot `take_latest` validated by A's own check (since `compile_aggregation` stages MEASURE-only).
 - [ ] **Step 2: Run → FAIL.**
-- [ ] **Step 3: Implement.** `CORRECTNESS_GOLD` = the spec §11 correctness cases with immutable `expected` outcomes (landing incl. `grain_key_refs`, per-slot `path_strategy`, `final_expression`, reason code). `FAULT_CONTROLS` = injected DB error + budget truncation, `expected` = exact technical/capture classification. `evaluate_assembly_gate`: run the harness over the correctness gold; require positive coverage (≥1 must-resolve), zero operand substitution/loss, zero unverified crossings / ungoverned endpoints in resolves, one-grain landing, correct per-path aggregation/temporal, deterministic identity (run twice, compare), complete reconciliation, no technical/truncation in the clean population; separately assert each fault control is exactly classified. Encode the minimum-distinct-authoritative-shapes requirement as a coverage assertion.
+- [ ] **Step 3: Implement** — `check_operand_path` runs `check_connectivity(ctx, plan).placement` → `compile_temporal(ctx, plan, template)` → `compile_aggregation(ctx, plan, template, temporal, placement)` and maps unsafe stages to `aggregation_unsafe_on_path`; `check_paths_temporal_consistency` compares per-path PIT treatments for as-of consistency at the landing; `check_time_slot_take_latest` implements A's own ordering-anchor validation for TIME-slot operands (compile_aggregation never sees them).
 - [ ] **Step 4: Run → PASS.**
-- [ ] **Step 5: Commit** (`feat(3c2bia): partitioned gold set + assembly gate`)
+- [ ] **Step 5: Commit** (`feat(3c2bia): per-path aggregation/temporal checks via reuse + A-owned time-slot check`).
 
 ---
 
-### Task 11: Behaviour-neutrality golden test
+### Task 8: Final combination + compile_multi_source_contract + union freshness
 
-**Files:**
-- Test: `tests/featuregen/overlay/upload/planner/test_multisource_behaviour_neutral.py`
+**Files:** Create `.../multisource_compile.py`; Test `.../test_multisource_compile.py`.
 
-- [ ] **Step 1: Write the test** — with `FEATUREGEN_MULTISOURCE_ASSEMBLY_SHADOW` unset, assert a representative single-source `plan_bindings` run produces byte-identical `BindingPlanningResultV1` (same `plan_id`s, `selected_plan_id`, reason codes, bounds) to a captured golden from `origin/main`; assert no `multisource_*` table is written on a normal (non-shadow) considered-set path; assert importing the new modules has no import-time side effects on the single-source path.
-- [ ] **Step 2: Run → PASS** (the new code is additive; if it fails, a new module has a global side effect — fix it).
-- [ ] **Step 3: Commit** (`test(3c2bia): behaviour-neutrality — single-source path byte-identical, no shadow writes when flag off`)
+**Interfaces:** `MultiSourceContractSpecV1`; `compile_multi_source_contract(conn, ctx, plan, spec, *, base_envelope) -> MultiSourceBindingPlanV1`; `union_freshness(conn, ctx, plan) -> ...` (calls `revalidate_freshness` with a union-catalog synthetic plan); a multi-source `make_contract_id`-style hash.
+
+- [ ] **Step 1: Failing test** — a plan whose paths are individually fresh but whose union hits a stale watermark → the union check fails; a consistent plan → `resolved` with a **deterministic** `contract_id` across two runs (distinct run ids, same fact_keys); `CompileBudget.remaining` decremented by 1 per compile.
+- [ ] **Step 2: Run → FAIL.**
+- [ ] **Step 3: Implement** — per-path declaration checks (reuse Task 7); **union freshness by CALLING** `revalidate_freshness` with a synthetic `BindingPlanV1` whose `participating_catalogs` = the union (do NOT edit `revalidate_freshness`); final-combination well-typedness at the landing + `output_additivity` coherence; `contract_id`/`contract_input_hash`/`contract_output_hash` over landing + paths + `path_strategy`s + final expression + versions; decrement `CompileBudget`; re-query `entity_bridge_edge` for `confirmed_event_id` (audit only).
+- [ ] **Step 4: Run → PASS.**
+- [ ] **Step 5: Commit** (`feat(3c2bia): compile_multi_source_contract + union freshness (call, don't edit)`).
+
+---
+
+### Task 9: plan_multi_source orchestration
+
+**Files:** Create `.../multisource_plan.py`; Test `.../test_multisource_plan.py`.
+
+**Interfaces:** `plan_multi_source(conn, adapter, *, intent, scope, roles, now, ctx=None, budget=None) -> MultiSourcePlanningResultV1`.
+
+- [ ] **Step 1: Failing test** — the valid RATIO intent resolves (one selected candidate, preservation holds, `selected_plan_id` set); a shape-invalid intent → `operand_shape_invalid`, no candidates; an operand needing an ungoverned endpoint → `realization_endpoint_ungoverned`.
+- [ ] **Step 2: Run → FAIL.**
+- [ ] **Step 3: Implement** the spec §5 order: shape (Task 3) → enumerate per operand (Task 5) → converge (Task 6) → per-path checks (Task 7) → final join + **preservation assertion** (every operand + slot once; else `operand_or_slot_not_preserved`) → `compile_multi_source_contract` (Task 8) → select best → assemble `MultiSourcePlanningResultV1` with bounds + `MultiSourceReplayEnvelopeV1` (keyed on fact_keys). Fail-closed each step; DB errors propagate (harness classifies technical).
+- [ ] **Step 4: Run → PASS.**
+- [ ] **Step 5: Commit** (`feat(3c2bia): plan_multi_source orchestration`).
+
+---
+
+### Task 10: Migration 1006 + shadow store
+
+**Files:** Create `src/featuregen/db/migrations/1006_multisource_assembly_shadow.sql`; Create `.../multisource_shadow_store.py`; Test `.../test_multisource_shadow_store.py`.
+
+**Interfaces:** `write_manifest(conn, rec)`; `write_intent_result(conn, intent_row, candidate_rows, operand_rows)`; `reconcile(conn, run_id) -> ReconcileResultV1`; row dataclasses with the four axes.
+
+- [ ] **Step 1: Failing test** — manifest with an expected set of 2 intents; write 1 intent result with 2 candidate rows; `reconcile` reports the missing intent; a re-write with the **same** payload hash is idempotent; a re-write with a **different** payload hash raises (divergent-duplicate); the four axis columns persist.
+- [ ] **Step 2: Run → FAIL.**
+- [ ] **Step 3: Implement** — migration `1006` mirrors `0999` (WORM + REVOKE) with four tables: `multisource_assembly_shadow_dispatch` (PK `run_id`; `expected_intent_ids` jsonb; versions jsonb), `..._intent_result` (PK `(run_id,intent_id)`; `semantic_outcome`/`compile_completeness`/`technical_status`/`capture_status` text with CHECK vocabularies; `normalized_intent_hash`; `selected_plan_id`; `reason_codes` jsonb), `..._candidate` (PK `(run_id,intent_id,plan_id)`; `physical_landing` jsonb; `contract_input_hash`; `contract_output_hash`; `read_set_hash`; `replay_envelope_hash`; `rank` int; `declaration_evidence` jsonb), `..._operand_obs` (PK `(run_id,intent_id,plan_id,slot_id)`; `pin` jsonb; `role`; `path_strategy` jsonb; `governed_endpoints` jsonb; `source_binding` jsonb). Store fns mirror `shadow_store.py`; writes **read back and compare payload hash** (divergent-duplicate → error), not `ON CONFLICT DO NOTHING`.
+- [ ] **Step 4: Run → PASS** (apply the migration in the test DB fixture first).
+- [ ] **Step 5: Commit** (`feat(3c2bia): migration 1006 + shadow store (per-candidate, divergent-duplicate detection, 4 axes)`).
+
+---
+
+### Task 11: Two-connection shadow harness + CLI entrypoint
+
+**Files:** Create `.../multisource_shadow.py`; Test `.../test_multisource_shadow.py`.
+
+**Interfaces:** `run_multisource_assembly_shadow(*, planning_conn, telemetry_conn, adapter, intents, run_id, roles, now, monotonic=time.monotonic) -> tuple[MultiSourcePlanningResultV1, ...]`; a CLI/admin entrypoint that reads `FEATUREGEN_MULTISOURCE_ASSEMBLY_SHADOW`, builds the sealed-config adapter + table refs, and invokes the harness.
+
+- [ ] **Step 1: Failing test** — a run over 2 gold intents writes the manifest on `telemetry_conn` FIRST, plans each on `planning_conn` (fixture txn), retains results in memory, rolls back `planning_conn`, persists on `telemetry_conn`, reconciles clean; an injected DB error in one intent records `technical_status=technical_failure` without poisoning the others or the manifest; a budget-exhausting run records `capture_status` truncation.
+- [ ] **Step 2: Run → FAIL.**
+- [ ] **Step 3: Implement** mirroring `shadow.py::run_shadow_planner` but two-connection: `write_manifest(telemetry_conn, ...)` first; own the mutable `CompileBudget`; per-intent `with planning_conn.transaction():` savepoint isolating DB errors → `technical_failure`; collect results in memory; after all intents, roll back the fixture transaction on `planning_conn`; `write_intent_result(telemetry_conn, ...)`; `reconcile(telemetry_conn, run_id)`; budget truncation → `budget_truncated`. The flag is read in the CLI entrypoint, never in the harness. Document the two-connection contract in the entrypoint docstring.
+- [ ] **Step 4: Run → PASS.**
+- [ ] **Step 5: Commit** (`feat(3c2bia): two-connection shadow harness + CLI entrypoint`).
+
+---
+
+### Task 12: Partitioned gold set + assembly gate
+
+**Files:** Create `.../multisource_gold.py`, `.../multisource_gate.py`; Test `.../test_multisource_gate.py`.
+
+**Interfaces:** `seed_gold(conn)` (via real governance write paths → deterministic fact_keys); `CORRECTNESS_GOLD`, `FAULT_CONTROLS`; `evaluate_assembly_gate(...) -> AssemblyGateResultV1`.
+
+- [ ] **Step 1: Failing test** — the gate PASSES on a correct implementation over the correctness population (each positive resolves to the exact expected landing incl. `grain_key_refs`, per-slot `path_strategy`, `final_expression`); FAILS if any positive does not resolve; a fault-control case passes only when exactly classified and is excluded from the clean population; the gate FAILS on a technical failure in the clean population; the correctness population covers `MULTISOURCE_GOLD_MIN_SHAPES` (6) distinct authoritative shapes; double-run determinism uses distinct `run_id`s + stable authored `fact_key`s.
+- [ ] **Step 2: Run → FAIL.**
+- [ ] **Step 3: Implement** — `seed_gold` seeds VERIFIED grain facts + entity_bridge facts + VERIFIED intra-catalog joins + drift watermarks + projection checkpoints **through the real governance write paths** (deterministic `fact_key`s). `CORRECTNESS_GOLD` = spec §11 correctness cases with immutable `expected` outcomes; `FAULT_CONTROLS` = injected DB error + budget truncation with expected exact classification. `evaluate_assembly_gate`: run the harness twice (distinct run ids) over correctness gold; assert positive coverage ≥ `MULTISOURCE_GOLD_MIN_SHAPES`, zero substitution/loss, zero non-governed crossings/endpoints in resolves, one-grain landing, correct per-path aggregation/temporal, identical `contract_id`/`replay_envelope_hash` across runs, complete reconciliation, no technical/truncation in the clean population; separately assert each fault control exactly classified.
+- [ ] **Step 4: Run → PASS.**
+- [ ] **Step 5: Commit** (`feat(3c2bia): partitioned gold (real-governance-seeded) + assembly gate`).
+
+---
+
+### Task 13: Behaviour-neutrality golden test
+
+**Files:** Test `.../test_multisource_behaviour_neutral.py`.
+
+- [ ] **Step 1: Write the test** — with the flag unset, a representative single-source `plan_bindings` run is byte-identical (`plan_id`s, `selected_plan_id`, reason codes, bounds) to a golden captured from `origin/main`; no `multisource_assembly_shadow_*` table is written on a normal considered-set path; importing every new `multisource_*` module has no import-time side effect; grep-assert that no reused function (`assemble_paths`/`semantic_rollup_paths`/`compile_temporal`/`compile_aggregation`/`revalidate_freshness`/`check_connectivity`) was modified on this branch (`git diff origin/main -- planner/assembly.py planner/declarations.py` touches none of them).
+- [ ] **Step 2: Run → PASS** (additive by construction; a failure means a new module has a global side effect or a reused function was edited — fix it).
+- [ ] **Step 3: Commit** (`test(3c2bia): behaviour-neutrality — single-source byte-identical, reused fns untouched`).
 
 ---
 
 ## Self-Review
 
-**Spec coverage:** §2 contracts → Task 1; §3 matrix → Task 2; §4 GovernedRealizationV2 → Task 3; §5 steps 1–3 (enumeration/convergence) → Task 4; §5 steps 4–5 (per-path checks) → Task 5; §5 step 8 + §6 compiler + union freshness → Task 6; §5 steps 6–7 + orchestration → Task 7; §7 store + migration 1005 → Task 8; §7 entrypoint/fixture boundary → Task 9; §10–11 gold + gate → Task 10; §12 behaviour-neutrality → Task 11; §8 enumeration bounds → Task 4 (+ constants Task 0). Dispositions (§9) → Task 1 (`MultiSourceReason`), exercised across Tasks 4–7.
+**Spec coverage:** §1 reuse model → Task 1 (spike) + Tasks 5/7; §2 authority basis → Tasks 4/5/8; §3 contracts → Task 2; §4 matrix + agg mapping → Tasks 2/3; §5 steps → Tasks 5–9; §6 compiler → Task 8; §7 harness/store → Tasks 10/11; §8 typed results → Tasks 5/6; §9 dispositions → Task 2 (`MultiSourceReason`), exercised 5–9; §10–11 gold/gate → Task 12; §12 behaviour-neutrality → Task 13.
 
-**Placeholder scan:** Tasks 3–10 describe algorithms and reference existing functions by exact path/name rather than inlining every line — each names the file to read first and the exact functions to reuse, with concrete test assertions and the new signatures fully typed. Tasks 1–2 carry complete code. This is the appropriate granularity for reuse-heavy planner work; no "TBD"/"add error handling"/"similar to Task N".
+**Placeholder scan:** Task 1 (spike) and Task 2 carry full code; Tasks 3–12 give exact new signatures + concrete test assertions + the exact reused functions to call (each names the file to read first). No "TBD"/"add error handling"/"similar to Task N".
 
-**Type consistency:** `MultiSourceReason`/`SemanticRole`/`PathAggregation`/`FinalOperation` and all `*V1` dataclasses are defined in Task 1 and consumed unchanged in Tasks 2–11; `PhysicalLandingV1.grain_key_refs`, `OperandPathV1.source_to_landing_key_map`, and `MultiSourceBindingPlanV1.contract_id` (own, not selected) are used consistently. `plan_multi_source`/`compile_multi_source_contract`/`run_multisource_assembly_shadow` signatures match across producing and consuming tasks.
+**Type consistency:** `MultiSourceReason`/`SemanticRole`/`PathAggregation`/`FinalOperation` + all `*V1` dataclasses defined in Task 2, consumed unchanged in 3–13; `OperandPathV1.binding_plan: BindingPlanV1`, `GovernedSourceBindingV1.grain_fact_key` (no key fact), `PathStrategyV1.ordering_anchor_concept`, `PhysicalLandingV1.grain_key_refs`, `MultiSourceReplayEnvelopeV1` fact-key-keyed — all consistent. `plan_multi_source`/`compile_multi_source_contract`/`run_multisource_assembly_shadow` signatures match across producer/consumer tasks. The spike's `run_operand_rollup`/`build_operand_context`/`injected_operand_template` are reused by Task 5.
