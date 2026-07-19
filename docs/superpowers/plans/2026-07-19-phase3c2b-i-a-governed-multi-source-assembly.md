@@ -32,18 +32,12 @@
 
 **Files:** Modify `src/featuregen/overlay/upload/planner/contracts.py`.
 
-- [ ] **Step 1: Create a separate clean worktree off origin/main** (do NOT rebase the shared dirty tree — it holds the parallel session's uncommitted WIP).
+- [ ] **Step 1: Build in place on the current branch** (do NOT rebase or merge — the shared tree holds the parallel session's uncommitted WIP, and a merge is blocked by their untracked docs; A's reused planner/facts code is byte-identical between this branch's base and origin/main, verified, so building here is functionally correct). Every implementer stages ONLY its explicit files — never `git add -A` — to preserve the parallel WIP. The final merge-back re-confirms the migration number.
+- [ ] **Step 2: Confirm migration 1006 is above origin/main's highest** (origin/main tops at `1005_llm_dispatch_provenance`; A uses `1006`, B `1007`).
 ```bash
-git fetch origin main
-git worktree add -b feature/phase3c2bia-build ../fe-3c2bia origin/main
-cd ../fe-3c2bia && git log --oneline -1   # expect origin/main HEAD (d90d457 or later)
+git ls-tree -r --name-only origin/main -- src/featuregen/db/migrations/ | grep -oE "10[0-9][0-9]" | sort -n | tail -1   # expect 1005
 ```
-- [ ] **Step 2: Confirm migration 1006 is free**
-```bash
-git ls-files 'src/featuregen/db/migrations/1006_*.sql'   # expect: empty
-ls src/featuregen/db/migrations/ | tail -3               # expect ...1004_..., 1005_llm_dispatch_provenance
-```
-Expected: no `1006_*`. If taken, use the next free number and update every `1006_` reference here.
+Expected: `1005`. If higher, bump A's migration above it and update every `1006_` reference here.
 - [ ] **Step 3: Add constants** — append to `contracts.py` after the `*_VERSION` block:
 ```python
 # 3C.2b-i-A — governed multi-source operand assembly (shadow).
