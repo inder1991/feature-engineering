@@ -77,3 +77,49 @@ def test_overflow_raises_context_too_large_not_chunk(db, monkeypatch):
     with pytest.raises(fa.ContextTooLarge):
         fa.select_relevant_context(db, cols, objective="predict churn", entity=None, scope=None)
     assert fa.RejectCode.CONTEXT_TOO_LARGE == "CONTEXT_TOO_LARGE"
+
+
+def _capture_client(captured):
+    from featuregen.intake.llm import LLMResult
+
+    class _CaptureLLM:
+        def call(self, request):
+            captured.append(dict(request.inputs.get("catalog_metadata", {})))
+            return LLMResult(output={"features": []}, self_reported_scores={}, call_ref="",
+                             status="ok")
+
+    return _CaptureLLM()
+
+
+def test_flag_off_menu_byte_identical(db, monkeypatch):
+    _seed(db)
+    monkeypatch.delenv("FEATUREGEN_FEATURE_CONTEXT", raising=False)
+    captured: list = []
+    fa.recommend_features(db, "predict churn", _capture_client(captured), catalog_source="bank",
+                          budget=1, critic=False)
+    meta = captured[0]
+    assert "table_context" not in meta                 # no context block flag-off
+    assert all(set(m.keys()) == {"object_ref", "table", "column", "concept", "domain"}
+               for m in meta["columns"])               # thin projection only
+
+
+def test_flag_on_menu_enriched_with_context_and_relevance(db, monkeypatch):
+    _seed(db)
+    monkeypatch.setenv("FEATUREGEN_FEATURE_CONTEXT", "1")
+    captured: list = []
+    fa.recommend_features(db, "predict churn", _capture_client(captured), catalog_source="bank",
+                          budget=1, critic=False)
+    meta = captured[0]
+    assert "table_context" in meta
+    amount = next(m for m in meta["columns"] if m["object_ref"] == "public.accounts.churn_flag")
+    assert amount["additivity"]["authority"] in ("governed", "hint")  # wrapped fact
+
+
+def test_flag_on_overflow_surfaces_context_too_large(db, monkeypatch):
+    _seed(db)
+    monkeypatch.setenv("FEATUREGEN_FEATURE_CONTEXT", "1")
+    monkeypatch.setattr(fa, "FEATURE_CONTEXT_BYTE_BUDGET", 5)
+    report = fa.recommend_features_report(db, "predict churn", _capture_client([]),
+                                          catalog_source="bank", budget=1, critic=False)
+    assert report.ideas == []
+    assert any(r["code"] == fa.RejectCode.CONTEXT_TOO_LARGE for r in report.rejections)

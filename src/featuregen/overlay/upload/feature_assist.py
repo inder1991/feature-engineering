@@ -36,6 +36,7 @@ from featuregen.overlay.upload.join_path import (
     find_join_path,
 )
 from featuregen.overlay.upload.read_scope import allowed_sensitivities
+from featuregen.overlay.upload.taxonomy.applicability import ConfirmedScope
 
 logger = logging.getLogger(__name__)
 
@@ -358,6 +359,18 @@ def select_relevant_context(conn, cols: list[dict], *, objective: str | None,
     return _enriched(selected), _table_context(selected), dropped
 
 
+def _build_menu(conn, cols: list[dict], *, objective: str | None = None,
+                entity: str | None = None, scope=None) -> tuple[list[dict], list[dict]]:
+    """The menu + per-table context for one generation call. Flag-OFF ⟹ the thin pre-Slice-3 menu
+    and NO context (byte-identical). Flag-ON ⟹ the enriched, relevance-selected menu + context
+    (may raise ContextTooLarge)."""
+    if not feature_context_enabled():
+        return _menu(cols), []
+    columns, table_context, _dropped = select_relevant_context(
+        conn, cols, objective=objective, entity=entity, scope=scope)
+    return columns, table_context
+
+
 @dataclass(frozen=True, slots=True)
 class FeatureIdea:
     name: str
@@ -654,6 +667,7 @@ def _fix_pass(conn, client: LLMClient, objective: str, accepted: list[FeatureIde
               issues: dict[str, str], menu: list[dict], known: set[str],
               src_of: dict[str, set[str]], registered: set,
               target_ref, now, fresh_within, feedback: str | None = None, *,
+              table_context: list[dict] | None = None,
               roles: Iterable[str] = (),
               actor: IdentityEnvelope | None = None) -> list[FeatureIdea]:
     """One LLM-1 revision pass: keep the critic-clean features; ask LLM-1 to revise the flagged ones
@@ -665,6 +679,8 @@ def _fix_pass(conn, client: LLMClient, objective: str, accepted: list[FeatureIde
     fix_hints = [{"name": f.name, "derives_from": f.derives_from, "aggregation": f.aggregation,
                   "issue": issues[f.name]} for f in accepted if f.name in issues]
     inputs: dict = {"columns": menu, "fix": fix_hints}
+    if table_context:
+        inputs["table_context"] = table_context
     if feedback:
         inputs["feedback"] = feedback
     out = _call_raw(conn, client, "overlay.feature.recommend", "feature_recommend_v1",
@@ -681,6 +697,7 @@ def _fix_pass(conn, client: LLMClient, objective: str, accepted: list[FeatureIde
 def _generate(conn, objective: str, client: LLMClient, *,
               catalog_source: str | None = None, roles: Iterable[str] = (),
               entity: str | None = None,
+              scope: ConfirmedScope | None = None,
               target_ref: str | None = None, now: datetime | None = None,
               fresh_within: timedelta = timedelta(hours=24),
               target: int = 5, budget: int = 3, critic: bool = True,
@@ -697,7 +714,12 @@ def _generate(conn, objective: str, client: LLMClient, *,
     for c in cols:
         src_of.setdefault(c["object_ref"], set()).add(c["catalog_source"])
     registered = _registered_signatures(conn)
-    menu = _menu(cols)
+    try:
+        menu, table_context = _build_menu(
+            conn, cols, objective=objective, entity=entity, scope=scope)
+    except ContextTooLarge as exc:
+        logger.warning("feature context too large for %r: %s", objective, exc)
+        return [], [{"name": "", "reason": str(exc), "code": RejectCode.CONTEXT_TOO_LARGE}]
 
     # ---- Phase 1: generation (LLM-1 only; deterministic refinement, budget-bounded) ----
     accepted: list[FeatureIdea] = []
@@ -709,6 +731,8 @@ def _generate(conn, objective: str, client: LLMClient, *,
         # `avoid` is the loop's own machine feedback; `feedback` is HUMAN guidance for the whole
         # round (Gate #3 "regenerate with feedback"). Omitted when unset so the call is unchanged.
         inputs: dict = {"columns": menu, "avoid": avoid}
+        if table_context:
+            inputs["table_context"] = table_context
         if feedback:
             inputs["feedback"] = feedback
         out = _call_raw(conn, client, "overlay.feature.recommend", "feature_recommend_v1",
@@ -733,7 +757,7 @@ def _generate(conn, objective: str, client: LLMClient, *,
             if i < critic_reviews - 1:         # not the last allowed review -> let LLM-1 fix, re-review
                 accepted = _fix_pass(conn, client, objective, accepted, issues, menu, known, src_of,
                                      registered, target_ref, now, fresh_within, feedback,
-                                     roles=roles, actor=actor)
+                                     table_context=table_context, roles=roles, actor=actor)
 
     # ---- Phase 3: forward to the human; residual critic notes ride along as ADVISORY ----
     if issues:
@@ -745,6 +769,7 @@ def _generate(conn, objective: str, client: LLMClient, *,
 def recommend_features(conn, objective: str, client: LLMClient, *,
                        catalog_source: str | None = None, roles: Iterable[str] = (),
                        entity: str | None = None,
+                       scope: ConfirmedScope | None = None,
                        target_ref: str | None = None, now: datetime | None = None,
                        fresh_within: timedelta = timedelta(hours=24),
                        target: int = 5, budget: int = 3, critic: bool = True,
@@ -772,6 +797,7 @@ def recommend_features(conn, objective: str, client: LLMClient, *,
     what the LLM proposes — the gauntlet still validates every candidate exactly as without it."""
     ideas, _ = _generate(
         conn, objective, client, catalog_source=catalog_source, roles=roles, entity=entity,
+        scope=scope,
         target_ref=target_ref, now=now, fresh_within=fresh_within, target=target, budget=budget,
         critic=critic, critic_reviews=critic_reviews, feedback=feedback, actor=actor)
     return ideas
@@ -801,6 +827,7 @@ def _dedupe_rejections(rejections: list[dict]) -> list[dict]:
 def recommend_features_report(conn, objective: str, client: LLMClient, *,
                               catalog_source: str | None = None, roles: Iterable[str] = (),
                               entity: str | None = None,
+                              scope: ConfirmedScope | None = None,
                               target_ref: str | None = None, now: datetime | None = None,
                               fresh_within: timedelta = timedelta(hours=24),
                               target: int = 5, budget: int = 3, critic: bool = True,
@@ -812,6 +839,7 @@ def recommend_features_report(conn, objective: str, client: LLMClient, *,
     show the rejected candidates honestly instead of silently omitting them."""
     ideas, avoid = _generate(
         conn, objective, client, catalog_source=catalog_source, roles=roles, entity=entity,
+        scope=scope,
         target_ref=target_ref, now=now, fresh_within=fresh_within, target=target, budget=budget,
         critic=critic, critic_reviews=critic_reviews, feedback=feedback, actor=actor)
     return RecommendReport(ideas=ideas, rejections=_dedupe_rejections(avoid))
@@ -848,7 +876,14 @@ def refine_idea(conn, idea: dict, instruction: str, client: LLMClient, *,
         src_of.setdefault(c["object_ref"], set()).add(c["catalog_source"])
     fix = [{"name": idea.get("name", ""), "derives_from": idea.get("derives_from", []),
             "aggregation": idea.get("aggregation"), "issue": instruction}]
-    inputs: dict = {"columns": _menu(cols), "fix": fix}
+    try:
+        menu, table_context = _build_menu(conn, cols, objective=objective, entity=entity)
+    except ContextTooLarge as exc:
+        return None, {"name": str(idea.get("name", "")), "reason": str(exc),
+                      "code": RejectCode.CONTEXT_TOO_LARGE}
+    inputs: dict = {"columns": menu, "fix": fix}
+    if table_context:
+        inputs["table_context"] = table_context
     if objective:
         inputs["objective"] = objective
     out = _call_raw(conn, client, "overlay.feature.recommend", "feature_recommend_v1",
@@ -884,8 +919,17 @@ def feature_recipe(conn, nl_query: str, client: LLMClient, *, catalog_source: st
                    actor: IdentityEnvelope | None = None) -> Recipe:
     cols = _candidate_columns(conn, catalog_source, roles)
     known = {c["object_ref"] for c in cols}
+    try:
+        menu, table_context = _build_menu(conn, cols, objective=nl_query)
+    except ContextTooLarge as exc:
+        logger.warning("feature-recipe context too large for %r: %s", nl_query, exc)
+        return Recipe(intent=nl_query, grain_table=None, derives_from=[], aggregation=None,
+                      as_of_column=None)
+    recipe_inputs: dict = {"columns": menu}
+    if table_context:
+        recipe_inputs["table_context"] = table_context
     out = _call_raw(conn, client, "overlay.feature.recipe", "feature_recipe_v1", "feature_recipe",
-                    nl_query, {"columns": _menu(cols)}, actor=actor)
+                    nl_query, recipe_inputs, actor=actor)
     derives = [d for d in out.get("derives_from", []) if d in known]
     grain = out.get("grain_table")
     join_table = out.get("join_table")
