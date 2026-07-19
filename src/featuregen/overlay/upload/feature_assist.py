@@ -112,6 +112,13 @@ class Requirement:
     code: str                       # in REQUIREMENT_CODES
     operand: tuple[str, str]        # (catalog_source, object_ref) the requirement concerns
     detail: str = ""                # human-readable, no PII / no sample values
+    # C2-C3: a requirement is an IMMUTABLE VALUE OBJECT validated against the versioned
+    # ValidationRequirementSchema registry (see validation_requirements.py). These fields are ADDED
+    # LAST with defaults so every existing positional/keyword Requirement(code, operand, detail)
+    # construction stays byte-identical. `params` is a sorted tuple of (name, value) pairs — a
+    # HASHABLE, immutable representation (never a mutable dict) so the frozen dataclass stays hashable.
+    schema_version: str = "v1"      # which registry schema version this requirement was minted against
+    params: tuple[tuple[str, object], ...] = ()  # typed check parameters, sorted (name, value) pairs
 
 
 def _call_raw(conn, client: LLMClient, task: str, prompt_id: str, schema_id: str,

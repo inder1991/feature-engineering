@@ -1,0 +1,216 @@
+"""Delivery C2-C3 Task 1 — versioned ValidationRequirementSchema registry + build_requirement factory.
+
+Each of the 8 closed REQUIREMENT_CODES is defined in a VERSIONED registry with typed subject refs,
+params, result schema, unit, and default blocking behaviour. `build_requirement` is the ONLY sanctioned
+way to mint a Requirement: an unknown code / version / param is a PROGRAMMER ERROR (a raised
+exception), never open JSON quietly accepted. The extended `Requirement` stays frozen + hashable +
+backward-compatible.
+"""
+from __future__ import annotations
+
+import pytest
+
+from featuregen.overlay.upload.feature_assist import REQUIREMENT_CODES, Requirement
+from featuregen.overlay.upload.validation_requirements import (
+    REQUIREMENT_SCHEMA_REGISTRY,
+    RequirementValidationError,
+    UnknownRequirement,
+    ValidationRequirementSchema,
+    build_requirement,
+    schema_for,
+)
+
+
+# ── the registry ────────────────────────────────────────────────────────────────────────────────
+def test_registry_covers_exactly_the_closed_vocabulary():
+    assert set(REQUIREMENT_SCHEMA_REGISTRY) == set(REQUIREMENT_CODES)
+    assert len(REQUIREMENT_SCHEMA_REGISTRY) == 8
+
+
+def test_schema_for_returns_each_code_schema():
+    for code in REQUIREMENT_CODES:
+        schema = schema_for(code)
+        assert isinstance(schema, ValidationRequirementSchema)
+        assert schema.code == code
+        assert schema.schema_version == "v1"
+        assert schema.subject_kind == "column_ref"
+        assert isinstance(schema.blocking, bool)
+
+
+def test_schema_for_unknown_code_raises():
+    with pytest.raises(UnknownRequirement):
+        schema_for("NOT_A_CODE")
+
+
+def test_schema_for_wrong_version_raises():
+    with pytest.raises(UnknownRequirement):
+        schema_for("TYPE_IS_NUMERIC", schema_version="v2")
+
+
+def test_schema_is_frozen():
+    schema = schema_for("TYPE_IS_NUMERIC")
+    with pytest.raises(Exception):
+        schema.code = "OTHER"  # type: ignore[misc]
+
+
+def test_lag_bounded_schema_has_params_result_and_unit():
+    schema = schema_for("TEMPORAL_LAG_BOUNDED")
+    assert schema.params_schema == {"max_lag": int, "unit": str}
+    assert schema.result_schema == {"max_observed_lag": float, "within_bound": bool}
+    assert schema.unit == "days"
+    assert schema.blocking is True
+
+
+def test_type_is_numeric_schema_shapes():
+    schema = schema_for("TYPE_IS_NUMERIC")
+    assert schema.params_schema == {}
+    assert schema.result_schema == {"is_numeric": bool}
+    assert schema.unit is None
+
+
+def test_grain_is_unique_result_schema():
+    assert schema_for("GRAIN_IS_UNIQUE").result_schema == {
+        "is_unique": bool,
+        "duplicate_count": int,
+    }
+
+
+def test_currency_consistent_requires_currency_ref():
+    assert schema_for("CURRENCY_CONSISTENT").params_schema == {"currency_ref": tuple}
+
+
+# ── build_requirement — the sanctioned factory ────────────────────────────────────────────────────
+def test_build_no_param_requirement():
+    r = build_requirement(code="TYPE_IS_NUMERIC", operand=("bank", "public.t.c"))
+    assert isinstance(r, Requirement)
+    assert r.code == "TYPE_IS_NUMERIC"
+    assert r.operand == ("bank", "public.t.c")
+    assert r.detail == ""
+    assert r.schema_version == "v1"
+    assert r.params == ()
+
+
+def test_build_requirement_carries_detail():
+    r = build_requirement(
+        code="TYPE_IS_NUMERIC", operand=("bank", "public.t.c"), detail="numeric declared hint"
+    )
+    assert r.detail == "numeric declared hint"
+
+
+def test_build_lag_bounded_valid_params():
+    r = build_requirement(
+        code="TEMPORAL_LAG_BOUNDED",
+        operand=("bank", "public.t.as_of"),
+        params={"max_lag": 30, "unit": "days"},
+    )
+    # params stored as the sorted, hashable (name, value) tuple form
+    assert r.params == (("max_lag", 30), ("unit", "days"))
+    assert isinstance(r.params, tuple)
+
+
+def test_build_lag_bounded_missing_param_rejected():
+    with pytest.raises(RequirementValidationError):
+        build_requirement(
+            code="TEMPORAL_LAG_BOUNDED",
+            operand=("bank", "public.t.as_of"),
+            params={"max_lag": 30},
+        )
+
+
+def test_build_lag_bounded_extra_param_rejected():
+    with pytest.raises(RequirementValidationError):
+        build_requirement(
+            code="TEMPORAL_LAG_BOUNDED",
+            operand=("bank", "public.t.as_of"),
+            params={"max_lag": 30, "unit": "days", "bogus": 1},
+        )
+
+
+def test_build_lag_bounded_wrong_type_param_rejected():
+    with pytest.raises(RequirementValidationError):
+        build_requirement(
+            code="TEMPORAL_LAG_BOUNDED",
+            operand=("bank", "public.t.as_of"),
+            params={"max_lag": "30", "unit": "days"},
+        )
+
+
+def test_build_bool_where_int_expected_rejected():
+    # bool is an int subclass — the typed contract must not silently accept True for an int param.
+    with pytest.raises(RequirementValidationError):
+        build_requirement(
+            code="TEMPORAL_LAG_BOUNDED",
+            operand=("bank", "public.t.as_of"),
+            params={"max_lag": True, "unit": "days"},
+        )
+
+
+def test_build_no_param_code_rejects_supplied_params():
+    with pytest.raises(RequirementValidationError):
+        build_requirement(
+            code="TYPE_IS_NUMERIC", operand=("bank", "public.t.c"), params={"anything": 1}
+        )
+
+
+def test_build_unknown_code_rejected_not_open_json():
+    with pytest.raises((RequirementValidationError, UnknownRequirement)):
+        build_requirement(code="NOT_A_CODE", operand=("bank", "public.t.c"))
+
+
+def test_build_unknown_version_rejected():
+    with pytest.raises((RequirementValidationError, UnknownRequirement)):
+        build_requirement(
+            code="TYPE_IS_NUMERIC", operand=("bank", "public.t.c"), schema_version="v99"
+        )
+
+
+def test_build_currency_consistent_valid():
+    r = build_requirement(
+        code="CURRENCY_CONSISTENT",
+        operand=("bank", "public.t.amount"),
+        params={"currency_ref": ("bank", "public.t.ccy")},
+    )
+    assert r.params == (("currency_ref", ("bank", "public.t.ccy")),)
+
+
+# ── Requirement backward-compatibility (additive extension) ────────────────────────────────────────
+def test_requirement_positional_backward_compatible():
+    # The pre-C3 3-positional-arg construction still constructs unchanged, with new fields defaulted.
+    r = Requirement("TYPE_IS_NUMERIC", ("bank", "public.accounts.balance"), "detail")
+    assert r.code == "TYPE_IS_NUMERIC"
+    assert r.operand == ("bank", "public.accounts.balance")
+    assert r.detail == "detail"
+    assert r.schema_version == "v1"
+    assert r.params == ()
+
+
+def test_requirement_defaults_detail_and_new_fields():
+    r = Requirement(code="TYPE_IS_NUMERIC", operand=("bank", "public.accounts.balance"))
+    assert r.detail == ""
+    assert r.schema_version == "v1"
+    assert r.params == ()
+
+
+def test_requirement_still_frozen():
+    r = Requirement("TYPE_IS_NUMERIC", ("bank", "public.t.c"))
+    with pytest.raises(Exception):
+        r.code = "OTHER"  # type: ignore[misc]
+
+
+def test_requirement_still_hashable_with_params():
+    r = build_requirement(
+        code="TEMPORAL_LAG_BOUNDED",
+        operand=("bank", "public.t.as_of"),
+        params={"max_lag": 30, "unit": "days"},
+    )
+    # hashable => usable in a set / as a dict key despite carrying params
+    assert len({r, r}) == 1
+    assert r in {r}
+
+
+def test_requirement_equality_unaffected_for_old_shape():
+    # An old-shape requirement equals another built the same way (new fields default identically).
+    a = Requirement("TYPE_IS_NUMERIC", ("bank", "public.t.c"), "d")
+    b = Requirement("TYPE_IS_NUMERIC", ("bank", "public.t.c"), "d")
+    assert a == b
+    assert hash(a) == hash(b)
