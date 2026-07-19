@@ -19,8 +19,20 @@ authority is never re-implemented here:
 
 Authority is NEVER manufactured from timestamp ordering: producer/strength/status come only from the
 actual selected evidence + the decision lifecycle. ``status == "resolved"`` is the operational
-signal and is exactly ``is_feature_eligible`` (a live, non-retired decision carrying a load-bearing
-value) — a strict superset of the shipped ``authority == "governed"`` boolean.
+(governed) signal, and it is EQUIVALENT to ``read_column_facts``'s ``authority == "governed"``: it is
+granted for exactly the GOVERNED fields that reader wires — the two decision fields it governs via
+``is_feature_eligible`` (:data:`_GOVERNED_DECISION_FIELD` = ``additivity`` / ``logical_representation``)
+plus the fact-governed ``is_grain`` / ``is_as_of``. The implication is ONE-DIRECTIONAL against
+``is_feature_eligible``: ``resolved`` ⇒ ``is_feature_eligible`` (live + non-retired + load-bearing),
+but NOT the converse — C1 may REFUSE (``hash_mismatch`` on a degraded/tampered read, or
+``not_operational`` for a field ``read_column_facts`` treats as a hint) where ``is_feature_eligible``
+is still ``True``. C1 never claims governed authority where ``read_column_facts`` says ``hint``.
+
+# FOLLOW-UP (C0→C2-C4): the C0 snapshot builder (``feature_metadata_snapshot``) still sources value +
+# governance from ``read_column_facts`` directly, which has NO tamper gate (no fork/hash/projection
+# verification) — a tampered flat value or drifted evidence set is served unquestioned there. The
+# later deliveries (C2-C4) should RE-SOURCE onto this module's verified reads so those gates protect
+# the whole chain, not just C1's direct callers.
 
 BASE fail-closed cases (C1-T1):
 
@@ -33,7 +45,13 @@ BASE fail-closed cases (C1-T1):
 * live but NON-operational -> ``status="no_value"`` (a RECOMMENDATION-ceiling field, or an
   OPERATIONAL field whose evidence did not satisfy the operational rule / a disqualifier fired);
   ``conflict_status`` carries the precise reason.
-* operational -> ``status="resolved"`` (<=> a load-bearing value <=> feature-eligible).
+* live + load-bearing but NOT a governed decision projection (F2) -> ``status="not_operational"``: a
+  field with a real load-bearing decision that ``read_column_facts`` nonetheless governs as a HINT
+  (unit / currency / sensitivity / data_type / semantic_type / temporal_role / entity / …). The
+  decision + evidence-derived producer/strength are carried, but no governed authority is claimed —
+  so C1 AGREES with ``read_column_facts`` rather than fabricating governance over an unverified value.
+* operational (GOVERNED) -> ``status="resolved"`` (a governed decision field with a hash-verified
+  load-bearing value; ⇒ feature-eligible, see the one-directional note above).
 
 Note on ``status="conflict"`` vs ``status="no_value"`` (a deliberate refinement of the spec's
 shorthand "``conflict_status != 'resolved'`` -> conflict"): only the resolver's genuine ``conflict``
@@ -69,15 +87,21 @@ from featuregen.overlay.field_decision import (
     FieldDecisionEventType,
     read_field_decisions,
 )
-from featuregen.overlay.field_evidence import canonical_hash, read_active_field_evidence
+from featuregen.overlay.field_evidence import (
+    FieldEvidence,
+    canonical_hash,
+    read_active_field_evidence,
+)
 from featuregen.overlay.identity import fact_key as _fact_key
-from featuregen.overlay.upload.column_authority import read_column_facts
+from featuregen.overlay.upload.column_authority import _DECISION_ID_COLUMN, read_column_facts
 from featuregen.overlay.upload.feature_metadata_snapshot import (
     CatalogProjectionUnavailable,
     check_projection_readiness,
 )
 from featuregen.overlay.upload.field_policies import policy_for
 from featuregen.overlay.upload.field_resolution import (
+    _SENSITIVITY_FIELD,
+    _SENSITIVITY_FLOOR_FIELD,
     FIELD_POLICY_VERSION,
     RESOLVER_VERSION,
     _evidence_set_hash,
@@ -112,15 +136,20 @@ _STRENGTH_ORDER: tuple[AssertionStrength, ...] = (
     AssertionStrength.CONFIRMED,
 )
 
-# GATE 2 (value-hash) applicability: fields whose ``read_column_facts`` flat VALUE column IS the
-# resolver's decision DISPLAY projection — i.e. ``column_authority._VALUE_COLUMN[f]`` equals
-# ``field_resolution._DISPLAY_COLUMN[f]``. For ONLY these does the served value provably equal the
-# decision's projected value, so ``canonical_hash(value)`` can be verified against the decision's
-# load-bearing hash. ``logical_representation`` is EXCLUDED: its flat ``data_type`` column is the
-# build-time declared type (written by ``build_graph``), NOT projected from its decision, so its
-# value integrity is not verifiable via the decision hash (a documented C1-T1 decoupling). Kept in
-# sync with those two private mappings by the guard test in test_operational_facts_fail_closed.
-_VALUE_IS_DISPLAY_PROJECTION: frozenset[str] = frozenset({"additivity"})
+# The GOVERNED decision fields (F2): EXACTLY the fields ``read_column_facts`` treats as
+# ``authority == "governed"`` via ``is_feature_eligible`` — its ``_DECISION_ID_COLUMN`` keys
+# (``additivity`` / ``logical_representation``). DERIVED from that shipped mapping so C1 can never
+# DRIFT from ``read_column_facts``: a live, non-retired, load-bearing decision confers the
+# operational ``status="resolved"`` (governed) ONLY for a field in this set, and its served value is
+# verified against the decision's ``load_bearing_value_hash`` (GATE 2). EVERY OTHER policy field
+# (unit / currency / sensitivity / data_type / semantic_type / temporal_role / entity / …) is
+# ``authority == "hint"`` in ``read_column_facts`` — C1 returns ``status="not_operational"`` for
+# those, so the two readers AGREE (no fabricated governance, no unverified load-bearing value served
+# as authoritative). The fact-governed fields (``is_grain`` / ``is_as_of``) are governed on their own
+# SPECIALIZED_FACT path below (non-null ``*_fact_event_id``), never through this set. The equivalence
+# ``C1 governed ⇔ read_column_facts governed`` is asserted by the guard test in
+# test_operational_facts_fail_closed.
+_GOVERNED_DECISION_FIELD: frozenset[str] = frozenset(_DECISION_ID_COLUMN)
 
 
 def _fail_closed(
@@ -184,6 +213,28 @@ def _forked_head_reason(decisions: list[FieldDecisionEvent]) -> str | None:
     return None
 
 
+def _named_active_evidence(
+    conn: DbConn, logical_ref: str, field_name: str, selected: set[str]
+) -> list[FieldEvidence]:
+    """The currently-ACTIVE evidence records the decision NAMED (``selected``), gathered over the
+    SAME field(s) the resolver hashed. All fields are single-field EXCEPT ``sensitivity`` (F1): its
+    decision's evidence set spans BOTH the taxonomy ``sensitivity_floor`` AND the ``sensitivity``
+    classification — :func:`field_resolution._resolve_sensitivity` records the decision over
+    ``[*floor_evidence, *class_evidence]`` (two field_names). Mirroring that gather order here means
+    the recomputed :func:`_evidence_set_hash` covers the same set; a single-``sensitivity``-field
+    recompute could NEVER match a floor-carrying sensitivity decision, so every legitimately
+    certified ``sensitivity`` would false-positive as ``hash_mismatch``. ``_evidence_set_hash`` is
+    order-independent, so the gather order is not load-bearing — it is kept identical for clarity."""
+    if field_name == _SENSITIVITY_FIELD:
+        active = [
+            *read_active_field_evidence(conn, logical_ref, _SENSITIVITY_FLOOR_FIELD),
+            *read_active_field_evidence(conn, logical_ref, _SENSITIVITY_FIELD),
+        ]
+    else:
+        active = read_active_field_evidence(conn, logical_ref, field_name)
+    return [e for e in active if e.evidence_id in selected]
+
+
 def _hash_mismatch_reason(
     conn: DbConn,
     logical_ref: str,
@@ -193,23 +244,24 @@ def _hash_mismatch_reason(
 ) -> str | None:
     """GATE 2 — verify the operational head's hashes under the pinned resolver. Return a machine
     reason on ANY mismatch (the value is NOT authoritative), else ``None``. Called only when the
-    head would otherwise be served as ``resolved``.
+    head would otherwise be served as a GOVERNED ``resolved`` value.
 
     * EVIDENCE-SET integrity (field-agnostic): recompute :func:`_evidence_set_hash` (REUSED from
       ``field_resolution`` — never re-implemented) over the ACTIVE evidence the decision NAMED
-      (``selected_evidence_ids``) and compare to the decision's stored ``evidence_set_hash``. A
-      drifted or tampered evidence set no longer verifies.
-    * VALUE integrity (scoped to :data:`_VALUE_IS_DISPLAY_PROJECTION`): recompute
+      (:func:`_named_active_evidence` — which spans the two ``sensitivity`` field_names, F1) and
+      compare to the decision's stored ``evidence_set_hash``. A drifted or tampered evidence set no
+      longer verifies.
+    * VALUE integrity (scoped to :data:`_GOVERNED_DECISION_FIELD`): recompute
       ``canonical_hash(value)`` and compare to the decision's ``load_bearing_value_hash`` — a
-      tampered flat display value no longer hashes to the decision-authorized value."""
+      tampered flat value no longer hashes to the decision-authorized value. This covers ALL governed
+      decision fields, so a tampered ``logical_representation`` value is caught too (F3). Only a
+      governed field reaches this gate, so a field whose flat value is not a verified decision
+      projection is never served as an unverified load-bearing value in the first place (F2)."""
     selected = set(decision.selected_evidence_ids)
-    named = [
-        e for e in read_active_field_evidence(conn, logical_ref, field_name)
-        if e.evidence_id in selected
-    ]
+    named = _named_active_evidence(conn, logical_ref, field_name, selected)
     if _evidence_set_hash(named) != decision.evidence_set_hash:
         return "evidence_set_hash_mismatch"
-    if field_name in _VALUE_IS_DISPLAY_PROJECTION and (
+    if field_name in _GOVERNED_DECISION_FIELD and (
         canonical_hash(value) != decision.load_bearing_value_hash
     ):
         return "value_hash_mismatch"
@@ -269,8 +321,10 @@ def read_operational_value(conn: DbConn, logical_ref: str, field_name: str) -> O
     three C1-T2 verification gates (projection-health / fork / hash) that serve NO operational value
     on a degraded / ambiguous / tampered read. The ``value`` axis is sourced from
     :func:`read_column_facts` so it is byte-for-byte consistent with the shipped
-    ``OperationalColumnFacts.value``; ``status == "resolved"`` is exactly ``is_feature_eligible`` (a
-    live, non-retired, load-bearing decision whose hashes verify)."""
+    ``OperationalColumnFacts.value``; ``status == "resolved"`` is granted for exactly the fields
+    ``read_column_facts`` governs (``authority == "governed"``) and IMPLIES ``is_feature_eligible``,
+    but not conversely — C1 may refuse (``not_operational`` / ``hash_mismatch``) where eligibility
+    still holds (see the module docstring's one-directional note)."""
     policy = policy_for(field_name)
     # No policy => the field is not resolver-owned; treat as display-only (the lowest tier).
     # SPECIALIZED_FACT fields (is_grain/is_as_of) land here too — their operational authority is
@@ -341,15 +395,24 @@ def read_operational_value(conn: DbConn, logical_ref: str, field_name: str) -> O
         )
 
     if latest.load_bearing_value_hash is not None:
-        status = "resolved"                       # <=> is_feature_eligible (live + load-bearing)
+        # F2: a load-bearing head is served as GOVERNED ``resolved`` ONLY for a field
+        # ``read_column_facts`` also governs (:data:`_GOVERNED_DECISION_FIELD`). For ANY other policy
+        # field (unit/currency/sensitivity/data_type/…) ``read_column_facts`` says ``hint``, so C1
+        # reports ``not_operational`` — the decision + evidence-derived producer/strength are carried
+        # for traceability, but NO governed authority is claimed and the flat value is not served as
+        # a load-bearing claim (it stays the same display/hint value ``read_column_facts`` returns).
+        status = (
+            "resolved" if field_name in _GOVERNED_DECISION_FIELD else "not_operational"
+        )
     elif latest.conflict_status == "conflict":
         status = "conflict"                       # irreconcilable disagreement in the evidence
     else:
         status = "no_value"                       # live but non-operational (see module docstring)
 
-    # GATE 2 (hash verification) — only a "resolved" head carries a load-bearing value served as
-    # operational; conflict/no_value are already non-operational. Verify the head's hashes recompute
-    # under the pinned resolver before serving; any mismatch fails closed as "hash_mismatch".
+    # GATE 2 (hash verification) — only a GOVERNED "resolved" head carries a load-bearing value
+    # served as operational; not_operational/conflict/no_value are already non-operational. Verify
+    # the head's hashes recompute under the pinned resolver before serving; any mismatch fails closed
+    # as "hash_mismatch".
     if status == "resolved":
         hash_reason = _hash_mismatch_reason(conn, logical_ref, field_name, latest, value)
         if hash_reason is not None:

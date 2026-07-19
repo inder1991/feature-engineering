@@ -153,17 +153,78 @@ def test_conflict_when_top_strength_evidence_disagrees(db):
     assert is_feature_eligible(db, _REF, "additivity") is False
 
 
-# The strict-superset invariant made explicit: OperationalValue.value mirrors OperationalColumnFacts
-# for a governed field, and 'resolved' is exactly is_feature_eligible.
+# The governed invariant made explicit: OperationalValue.value mirrors OperationalColumnFacts for a
+# governed field, and 'resolved' governance agrees with read_column_facts. logical_representation is
+# a GOVERNED decision field, so under F3 its served flat value (data_type) is verified against the
+# decision — the parser evidence therefore matches the build-time data_type ("numeric") so the clean
+# happy path verifies (a divergent value would now, correctly, fail closed as hash_mismatch).
 def test_value_mirrors_column_facts_and_resolved_iff_eligible(db):
-    build_graph(db, _SOURCE, [_ROW])
-    _seed(db, "logical_representation", "decimal", EvidenceProducer.PARSER,
+    build_graph(db, _SOURCE, [_ROW])   # build_graph seeds data_type = "numeric" from the CanonicalRow
+    _seed(db, "logical_representation", "numeric", EvidenceProducer.PARSER,
           AssertionStrength.SUPPORTED)
     resolve_and_project(db, source=_SOURCE, logical_refs=[_REF])
 
     ov = read_operational_value(db, _REF, "logical_representation")
     facts = read_column_facts(db, _REF, "logical_representation")
-    assert ov.value == facts.value                          # same value axis
-    assert (ov.status == "resolved") is is_feature_eligible(db, _REF, "logical_representation")
+    assert ov.value == facts.value == "numeric"             # same value axis, verified projection
+    assert ov.status == "resolved"
+    assert is_feature_eligible(db, _REF, "logical_representation") is True
+    # resolved ⇒ eligible (one-directional); a governed field served resolved is always eligible.
+    assert not (ov.status == "resolved") or is_feature_eligible(db, _REF, "logical_representation")
     assert ov.producer is EvidenceProducer.PARSER
     assert ov.strength is AssertionStrength.SUPPORTED
+
+
+# F2(i) — a source-attested `unit` is feature-eligible, but read_column_facts governs it as a HINT
+# (it is not a decision-projection field). C1 must AGREE — status="not_operational", NEVER a
+# fabricated governed "resolved" — so the two authority readers never contradict for the same ref.
+def test_hint_field_agrees_with_column_authority_no_divergence(db):
+    build_graph(db, _SOURCE, [_ROW])
+    _seed(db, "unit", "dollars", EvidenceProducer.SOURCE, AssertionStrength.ATTESTED)
+    resolve_and_project(db, source=_SOURCE, logical_refs=[_REF])
+
+    ov = read_operational_value(db, _REF, "unit")
+    facts = read_column_facts(db, _REF, "unit")
+    assert facts.authority == "hint"                        # read_column_facts: hint
+    assert ov.status == "not_operational"                   # C1 agrees — never a governed "resolved"
+    assert ov.status != "resolved"
+    assert is_feature_eligible(db, _REF, "unit") is True     # eligible, yet C1 refuses governance
+    assert ov.value == facts.value                           # value axis still mirrors (a hint value)
+    assert ov.decision_event_id is not None                  # the decision is carried for traceability
+    assert ov.producer is EvidenceProducer.SOURCE            # evidence-derived producer/strength kept
+    assert ov.strength is AssertionStrength.ATTESTED
+
+
+# F2(ii) — for a field OUTSIDE the governed decision-projection set, the flat column value can differ
+# from what the decision authorized (it is not a projection of the decision). C1 must NOT serve that
+# unverified value under a governed "resolved". The decision authorizes 'USD' but the flat currency
+# column reads 'EUR' — C1 reports not_operational (never resolved over the unverified 'EUR').
+def test_unverified_flat_value_not_served_as_resolved(db):
+    build_graph(db, _SOURCE, [_ROW])
+    _seed(db, "currency", "USD", EvidenceProducer.HUMAN, AssertionStrength.CONFIRMED)
+    resolve_and_project(db, source=_SOURCE, logical_refs=[_REF])
+    _set_col(db, currency="EUR")                             # flat column diverges from the decision
+    assert read_column_facts(db, _REF, "currency").value == "EUR"
+
+    ov = read_operational_value(db, _REF, "currency")
+    assert ov.status == "not_operational"                   # no governed authority over 'EUR'
+    assert ov.status != "resolved"
+    assert read_column_facts(db, _REF, "currency").authority == "hint"   # both readers agree
+
+
+# F1 (via read_operational_value) — a certified sensitivity (taxonomy floor + source-attested class)
+# previously false-positived as hash_mismatch (GATE 2 recomputed the evidence-set hash over ONLY the
+# `sensitivity` field while the decision hashed [floor + class]). C1 must NOT report hash_mismatch on
+# this legitimate read. Post-F2 sensitivity is a hint field, so C1's clean status is not_operational —
+# crucially NOT hash_mismatch (the poisoned tamper signal is gone from the most safety-critical field).
+def test_certified_sensitivity_not_falsely_hash_mismatch(db):
+    build_graph(db, _SOURCE, [_ROW])
+    _seed(db, "sensitivity_floor", "pii", EvidenceProducer.TAXONOMY, AssertionStrength.PROPOSED)
+    _seed(db, "sensitivity", "restricted", EvidenceProducer.SOURCE, AssertionStrength.ATTESTED)
+    resolve_and_project(db, source=_SOURCE, logical_refs=[_REF])
+
+    ov = read_operational_value(db, _REF, "sensitivity")
+    assert ov.status != "hash_mismatch"                     # F1: no false tamper signal
+    assert ov.conflict_status != "evidence_set_hash_mismatch"
+    assert ov.status == "not_operational"                   # hint field — agrees with read_column_facts
+    assert read_column_facts(db, _REF, "sensitivity").authority == "hint"

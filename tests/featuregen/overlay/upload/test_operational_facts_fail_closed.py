@@ -32,9 +32,11 @@ from featuregen.overlay.field_evidence import (
     record_field_evidence,
 )
 from featuregen.overlay.upload.canonical import CanonicalRow
-from featuregen.overlay.upload.column_authority import _VALUE_COLUMN, read_column_facts
+from featuregen.overlay.upload.column_authority import (
+    _DECISION_ID_COLUMN,
+    read_column_facts,
+)
 from featuregen.overlay.upload.field_resolution import (
-    _DISPLAY_COLUMN,
     FIELD_POLICY_VERSION,
     RESOLVER_VERSION,
     resolve_and_project,
@@ -42,7 +44,8 @@ from featuregen.overlay.upload.field_resolution import (
 from featuregen.overlay.upload.graph import build_graph
 from featuregen.overlay.upload.object_ref import normalize_ref
 from featuregen.overlay.upload.operational_facts import (
-    _VALUE_IS_DISPLAY_PROJECTION,
+    _GOVERNED_DECISION_FIELD,
+    _hash_mismatch_reason,
     read_operational_value,
 )
 from featuregen.projections.runner import _checkpoint_seq, _head_seq
@@ -242,12 +245,67 @@ def test_projection_lagged_fails_closed(db):
     assert ov.value is None
 
 
-# ── Guard: _VALUE_IS_DISPLAY_PROJECTION stays in sync with the two source mappings it is derived fr
-def test_value_hash_scope_matches_derivation():
-    """The value-hash gate applies exactly to fields whose read_column_facts flat value column IS
-    the resolver's display projection (column names coincide). Assert the hand-maintained constant
-    equals that computed intersection so it can never silently drift out of sync."""
-    derived = frozenset(
-        f for f, col in _VALUE_COLUMN.items() if _DISPLAY_COLUMN.get(f) == col
+# ── GATE 2 (hash): a tampered logical_representation flat value now fails closed too (F3) ─────────
+def test_hash_mismatch_on_tampered_logical_representation_value(db):
+    """F3: the value-hash gate now covers EVERY governed decision field, not just additivity. A
+    clean parser-supported logical_representation whose flat ``data_type`` matches the decision
+    resolves; tampering that flat value out from under the decision now fails closed."""
+    build_graph(db, _SOURCE, [_ROW])   # build_graph seeds data_type = "numeric" from the CanonicalRow
+    _seed_evidence(db, "logical_representation", "numeric", EvidenceProducer.PARSER,
+                   AssertionStrength.SUPPORTED)
+    resolve_and_project(db, source=_SOURCE, logical_refs=[_REF])
+    assert read_operational_value(db, _REF, "logical_representation").status == "resolved"  # clean
+
+    # Tamper ONLY the flat data_type column, out from under the decision that authorized "numeric".
+    db.execute(
+        "UPDATE graph_node SET data_type = %s WHERE catalog_source = %s AND object_ref = %s",
+        ["tampered_type", _SOURCE, _OBJECT_REF])
+
+    ov = read_operational_value(db, _REF, "logical_representation")
+    assert ov.status == "hash_mismatch"
+    assert ov.conflict_status == "value_hash_mismatch"
+    assert ov.value is None
+
+
+# ── GATE 2 (F1): the sensitivity evidence-set hash recomputes over BOTH sensitivity_floor + class ─
+def test_sensitivity_evidence_set_hash_recomputes_over_both_fields(db):
+    """F1: a certified ``sensitivity`` decision hashes its evidence set over ``[*floor, *class]``
+    (TWO field_names). :func:`_hash_mismatch_reason` must gather BOTH to recompute a matching hash;
+    a single-``sensitivity``-field recompute could never match a floor-carrying decision, falsely
+    reporting ``evidence_set_hash_mismatch`` on the most safety-critical field. Verified at the gate
+    function directly (post-F2, ``sensitivity`` is not_operational, so it no longer reaches GATE 2
+    via read_operational_value — but the gate itself must be correct)."""
+    build_graph(db, _SOURCE, [_ROW])
+    _seed_evidence(db, "sensitivity_floor", "pii", EvidenceProducer.TAXONOMY,
+                   AssertionStrength.PROPOSED)                       # taxonomy floor -> restricted
+    _seed_evidence(db, "sensitivity", "restricted", EvidenceProducer.SOURCE,
+                   AssertionStrength.ATTESTED)                       # certifies the classification
+    resolve_and_project(db, source=_SOURCE, logical_refs=[_REF])
+
+    decision = read_field_decisions(db, _REF, "sensitivity")[-1]
+    assert decision.load_bearing_value_hash is not None              # certified -> load-bearing
+    assert len(decision.selected_evidence_ids) == 2                  # spans BOTH floor + class
+    # The two-field gather recomputes the SAME evidence-set hash -> NO false mismatch.
+    assert _hash_mismatch_reason(db, _REF, "sensitivity", decision, None) is None
+
+    # A genuinely drifted NAMED evidence set still fails closed: staling the floor evidence the
+    # decision named drops it from the active read, so the recompute (which the fix now spans across
+    # the floor field too) no longer covers the same set — exactly the tamper the gate must catch.
+    db.execute(
+        "UPDATE field_evidence SET lifecycle = 'stale' "
+        "WHERE logical_ref = %s AND field_name = %s",
+        (_REF, "sensitivity_floor"))
+    assert (
+        _hash_mismatch_reason(db, _REF, "sensitivity", decision, None)
+        == "evidence_set_hash_mismatch"
     )
-    assert _VALUE_IS_DISPLAY_PROJECTION == derived
+
+
+# ── Guard: C1's governed decision set stays in lockstep with column_authority (no authority drift) ─
+def test_governed_field_set_matches_column_authority():
+    """C1's ``status="resolved"`` (governed) + value-hash set must equal EXACTLY the fields
+    ``read_column_facts`` governs via ``is_feature_eligible`` — its ``_DECISION_ID_COLUMN`` keys.
+    Deriving :data:`_GOVERNED_DECISION_FIELD` from that mapping makes the two readers unable to
+    drift; this asserts the equivalence explicitly so a future edit to either is caught."""
+    assert _GOVERNED_DECISION_FIELD == frozenset(_DECISION_ID_COLUMN)
+    assert _GOVERNED_DECISION_FIELD == frozenset({"additivity", "logical_representation"})
