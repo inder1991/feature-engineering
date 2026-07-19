@@ -23,12 +23,21 @@ never raw upload text.
 from __future__ import annotations
 
 import logging
+from collections.abc import Sequence
+from dataclasses import dataclass
 
 import psycopg
 from psycopg.types.json import Jsonb
 
 from featuregen.config import get_settings
 from featuregen.idgen import mint_id
+from featuregen.intake.llm import (
+    PROVIDER_TRANSIENT,
+    LLMClient,
+    LLMRequest,
+    LLMResult,
+    compute_input_hash,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -102,3 +111,110 @@ def record_dispatch(*, logical_call_ref: str, attempt_no: int, ingestion_run_id:
         raise AuditUnavailable(
             f"pre-dispatch audit could not be durably committed for {logical_call_ref!r} "
             f"attempt {attempt_no} — egress is not authorized") from exc
+
+
+def record_dispatch_outcome(*, dispatch_ref: str, outcome: str) -> None:
+    """AFTER egress: append one ``llm_dispatch_outcome`` row (``response_received`` |
+    ``transport_failed``) for a dispatch header, on the SAME own-connection discipline as
+    ``record_dispatch`` (fresh ``get_settings().dsn`` connection, committed independently).
+
+    Raises ``AuditUnavailable`` when the append cannot be durably committed. The CALLER owns the
+    policy: unlike the pre-dispatch header (whose absence must block egress), an outcome-write
+    failure happens after the provider request already went out under a durable authorization
+    record — ``AuditingClient`` treats it as best-effort (logged, never masking the real
+    result/exception), mirroring ``_record_llm_call_durable``'s post-egress stance."""
+    dsn = get_settings().dsn
+    if not dsn:
+        raise AuditUnavailable(
+            "dispatch-outcome audit requires a configured FEATUREGEN_DSN — no durable commit is "
+            f"possible for dispatch_ref={dispatch_ref!r}")
+    try:
+        with psycopg.connect(dsn) as audit_conn:   # own tx, committed on `with` exit
+            audit_conn.execute(
+                "INSERT INTO llm_dispatch_outcome (dispatch_ref, outcome) VALUES (%s, %s)",
+                (dispatch_ref, outcome))
+    except Exception as exc:  # noqa: BLE001 — any durability failure is the same caller signal
+        logger.exception("dispatch-outcome audit write failed for dispatch_ref=%s outcome=%s",
+                         dispatch_ref, outcome)
+        raise AuditUnavailable(
+            f"dispatch outcome could not be durably committed for {dispatch_ref!r}") from exc
+
+
+# ---- C5-T3: the auditing-client wrapper (the dispatch seam) --------------------------------------
+
+
+@dataclass(frozen=True)
+class DispatchAuditContext:
+    """The ingestion-audit context a call site threads into ``audited_structured_call``: WHICH
+    ingestion run + stage this logical call serves, and WHICH catalog objects/fields it is about.
+    Each subject is a ``{catalog_source, object_ref, logical_ref, field_names}`` mapping (the
+    ``llm_dispatch_subject`` attribution grain). ``ingestion_run_id`` may be None for a dispatch
+    outside an ingestion run — recorded honestly as NULL."""
+
+    ingestion_run_id: str | None
+    stage: str
+    subjects: Sequence[dict] = ()
+
+
+class AuditingClient:
+    """LLMClient wrapper: audits EVERY physical provider attempt BEFORE egress, fail-closed.
+
+    ``drive_structured_call`` re-invokes ``client.call`` for each repair/retry attempt, so
+    wrapping the client is the ONE seam that sees every physical request. Per attempt:
+    increment ``attempt_no`` (1-based, shared ``logical_call_ref`` — the caller mints it once per
+    logical call so UNIQUE(logical_call_ref, attempt_no) keys the attempts), ``record_dispatch``
+    BEFORE egress, then call the inner provider, then append the transport outcome.
+
+    FAIL-CLOSED: on ``AuditUnavailable`` the inner provider is NEVER called; the wrapper returns
+    the exact signal a real pre-response transport failure produces today — ``ClaudeLLM.call``
+    maps ``anthropic.APIConnectionError`` (no response from the provider) to a RETURNED
+    ``PROVIDER_TRANSIENT`` result (``llm_claude._fail``), never a raise — so
+    ``drive_structured_call`` bounded-retries (each retry re-attempts the audit; a store that
+    recovers mid-call yields a properly audited egress) and otherwise fails into STATUS_FAILED
+    with no egress ever having happened."""
+
+    def __init__(self, inner: LLMClient, ctx: DispatchAuditContext, *, logical_call_ref: str,
+                 redaction_version: str | None = None) -> None:
+        self._inner = inner
+        self._ctx = ctx
+        self._logical_call_ref = logical_call_ref
+        self._redaction_version = redaction_version
+        self._attempt_no = 0
+
+    def call(self, request: LLMRequest) -> LLMResult:
+        self._attempt_no += 1
+        gen = request.generation_settings or {}
+        try:
+            dispatch_ref = record_dispatch(
+                logical_call_ref=self._logical_call_ref, attempt_no=self._attempt_no,
+                ingestion_run_id=self._ctx.ingestion_run_id, stage=self._ctx.stage,
+                task=request.task, redacted_input=dict(request.inputs),
+                input_hash=compute_input_hash(request.inputs),
+                subjects=[dict(s) for s in self._ctx.subjects],
+                redaction_version=self._redaction_version,
+                provider=gen.get("provider"), model=gen.get("model"),
+                prompt_version=request.prompt_version,
+                schema_version=request.output_schema_version)
+        except AuditUnavailable:
+            logger.warning(
+                "pre-dispatch audit unavailable for %s attempt %s — provider NOT called "
+                "(fail closed)", self._logical_call_ref, self._attempt_no)
+            return LLMResult(output={}, self_reported_scores={}, call_ref="",
+                             status=PROVIDER_TRANSIENT)
+        try:
+            result = self._inner.call(request)
+        except Exception:
+            # a REAL transport raise stays a raise — recorded first, then re-raised unchanged.
+            self._record_outcome(dispatch_ref, "transport_failed")
+            raise
+        self._record_outcome(dispatch_ref, "response_received")
+        return result
+
+    def _record_outcome(self, dispatch_ref: str, outcome: str) -> None:
+        # POST-egress best-effort: the dispatch already happened under a durable pre-dispatch
+        # record, so an outcome-write failure must never mask the real result/exception
+        # (mirrors _record_llm_call_durable's post-egress stance). Logged, never raised.
+        try:
+            record_dispatch_outcome(dispatch_ref=dispatch_ref, outcome=outcome)
+        except Exception:  # noqa: BLE001
+            logger.exception("dispatch outcome write failed for %s (%s)", dispatch_ref, outcome)

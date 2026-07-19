@@ -26,6 +26,7 @@ from featuregen.config import get_settings
 from featuregen.contracts.envelopes import IdentityEnvelope
 from featuregen.contracts.identity import identity_to_jsonb
 from featuregen.documents.registry import DocumentSchemaRegistry
+from featuregen.idgen import mint_id
 from featuregen.intake.llm import (
     STATUS_FAILED,
     LLMClient,
@@ -42,6 +43,7 @@ from featuregen.intake.redaction import (
     build_llm_inputs,
     redact_free_text,
 )
+from featuregen.overlay.upload.dispatch_audit import AuditingClient, DispatchAuditContext
 from featuregen.overlay.upload.enrich_batch import (
     EGRESS,
     BatchCallResult,
@@ -611,7 +613,8 @@ def register_enrichment_schemas(conn) -> None:
 def audited_structured_call(conn, client: LLMClient, *, task: str, prompt_id: str, schema_id: str,
                             catalog_metadata: dict, instruction: str,
                             actor: IdentityEnvelope | None = None,
-                            prompt_version: int = 1, schema_version: int = 1) -> dict | None:
+                            prompt_version: int = 1, schema_version: int = 1,
+                            dispatch_audit: DispatchAuditContext | None = None) -> dict | None:
     """Run one governed metadata-only call and return the VALIDATED output dict, or None on any egress
     block / non-success. Attaches the registered output-schema (so a real provider does NOT fail closed),
     runs the egress guard, and records one immutable llm_call. The single audited seam for every overlay
@@ -619,7 +622,12 @@ def audited_structured_call(conn, client: LLMClient, *, task: str, prompt_id: st
 
     ``prompt_version``/``schema_version`` pin the request's contract (default ``1`` — byte-for-byte the
     v1 behavior): the resolved output-schema, the stamped request versions, and the validation all use
-    them, so a versioned enrichment call cannot silently egress under the v1 contract."""
+    them, so a versioned enrichment call cannot silently egress under the v1 contract.
+
+    ``dispatch_audit`` (C5-T3): the INGESTION call sites thread a ``DispatchAuditContext`` so every
+    PHYSICAL provider attempt (initial + each repair/retry re-call inside ``drive_structured_call``)
+    is pre-dispatch audited via the ``AuditingClient`` wrapper, fail-closed. ``None`` (contract
+    authoring / feature generation) keeps today's behavior byte-identical — no dispatch audit."""
     actor = actor or _ENRICH_ACTOR
     reg = DocumentSchemaRegistry(conn)
     schema = reg.schema_for(schema_id, schema_version)
@@ -669,8 +677,16 @@ def audited_structured_call(conn, client: LLMClient, *, task: str, prompt_id: st
         _audit_egress_block(conn, task=task, actor=actor, reason=str(exc))
         return None                       # hard fail closed — no dispatch, no cache
 
+    # C5-T3: with an ingestion-audit context, wrap the client so EVERY physical attempt is audited
+    # BEFORE egress (fail-closed on AuditUnavailable — the provider is never called). The
+    # logical_call_ref is minted ONCE per logical call so its retry/repair attempts share it
+    # (UNIQUE(logical_call_ref, attempt_no)). With no context, the client is used untouched.
+    dispatch_client: LLMClient = client
+    if dispatch_audit is not None:
+        dispatch_client = AuditingClient(client, dispatch_audit, logical_call_ref=mint_id("lc"),
+                                         redaction_version=redaction_version)
     outcome = drive_structured_call(
-        client, req, lambda output: reg.validate(schema_id, schema_version, output))
+        dispatch_client, req, lambda output: reg.validate(schema_id, schema_version, output))
     _record_llm_call_durable(   # #20: egress evidence survives an upload-transaction rollback
         conn, run_id=_RUN, request=req, input_hash=compute_input_hash(req.inputs),
         redaction_version=redaction_version,
