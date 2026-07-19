@@ -32,6 +32,24 @@ class ContractValidationError(Exception):
     """The draft failed the deterministic MCV — it must not be governed."""
 
 
+def _confirm_snapshot_binding(conn, intent_id: str | None) -> tuple[str | None, str | None]:
+    """MF-3 — the SERVER C0 metadata-snapshot lineage recorded on the considered set for this intent,
+    read AT CONFIRM. Returns ``(snapshot_id, content_hash)`` to bind IMMUTABLY onto the write-once-in-
+    practice contract row: ``contract_considered.snapshot_id`` is a MUTABLE upsert pointer (a later
+    broaden repoints it S1->S2), so recording the value AT CONFIRM on the contract row is what makes
+    "what catalog state was this contract authored against" reconstructable and un-repointable. Returns
+    ``(None, None)`` when the intent has no considered-set row, or it recorded no snapshot (a pre-C0 /
+    READ COMMITTED considered set) — additive, the columns stay NULL."""
+    if intent_id is None:
+        return None, None
+    row = conn.execute(
+        "SELECT snapshot_id, snapshot_content_hash FROM contract_considered WHERE intent_id = %s",
+        (intent_id,)).fetchone()
+    if row is None:
+        return None, None
+    return row[0], row[1]
+
+
 @dataclass(frozen=True, slots=True)
 class Contract:
     contract_id: str
@@ -80,10 +98,16 @@ def confirm_contract(conn, draft: ContractDraft, *, actor, roles: Iterable[str] 
             verification="DESIGN-CHECKED"))   # governed => EARNS DESIGN-CHECKED (default is UNVERIFIED)
         version = 1
     contract_id = mint_id("contract")
+    # MF-3: bind THIS contract to the immutable metadata snapshot the considered set was authored against,
+    # read AT CONFIRM from the server row. Persisted onto the never-repointed contract row so a later
+    # broaden (which repoints the mutable contract_considered.snapshot_id) cannot change what catalog state
+    # this governed contract was authored against. NULL on a pre-C0 / READ COMMITTED set (additive).
+    metadata_snapshot_id, metadata_content_hash = _confirm_snapshot_binding(conn, intent_id)
     conn.execute(
         "INSERT INTO contract (contract_id, feature_id, feature_name, definition, version, actor, "
-        "join_path, intent_id, verification, validation_status, requirements) "
-        "VALUES (%s, %s, %s, %s, %s, %s::jsonb, %s::jsonb, %s, %s, %s, %s::jsonb)",
+        "join_path, intent_id, verification, validation_status, requirements, "
+        "metadata_snapshot_id, metadata_content_hash) "
+        "VALUES (%s, %s, %s, %s, %s, %s::jsonb, %s::jsonb, %s, %s, %s, %s::jsonb, %s, %s)",
         (contract_id, feature_id, draft.feature_name, draft.definition, version, _actor_json(actor),
          json.dumps(list(draft.join_path)), intent_id,   # intent_id: audit link to the hypothesis (M5)
          "DESIGN-CHECKED",   # §14.5 stamp — gauntlet-passed; predictive value unverified (0968).
@@ -91,7 +115,8 @@ def confirm_contract(conn, draft: ContractDraft, *, actor, roles: Iterable[str] 
          check.validation_status,   # RF-C1: the CONFIRM-TIME re-run's honest tri-state — NOT the
          #                            draft's carried value (an upgrade/downgrade since Gate #1 is
          #                            a real change and must be recorded, never silently kept stale)
-         json.dumps(requirements_to_json(check.requirements))))
+         json.dumps(requirements_to_json(check.requirements)),
+         metadata_snapshot_id, metadata_content_hash))   # MF-3: immutable contract -> snapshot binding
     return Contract(contract_id, feature_id, draft.feature_name, version)
 
 

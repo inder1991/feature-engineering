@@ -173,3 +173,52 @@ def test_two_considered_sets_over_identical_state_seal_the_same_content_hash(db)
 
     assert ids[0] != ids[1]          # a fresh snapshot id per build
     assert hashes[0] == hashes[1]    # identical committed state ⇒ identical seal (deterministic)
+
+
+# ── TEST 4 (MF-3) — a broaden AFTER confirm cannot repoint the confirmed contract's snapshot binding ──
+def test_broaden_after_confirm_does_not_repoint_contract_snapshot_binding(db):
+    """MF-3: the confirmed contract is bound to ITS snapshot on the write-once contract row. A subsequent
+    considered-set rebuild for the SAME intent (a broaden) repoints the MUTABLE
+    contract_considered.snapshot_id S1->S2, but the already-confirmed contract's ``metadata_snapshot_id``
+    must NOT move — a regulator reconstructs the authored-against snapshot from the contract, not the
+    mutable considered-set pointer."""
+    _rr(db)
+    _bank(db)
+    client = _client()
+    intent = submit_intent(hypothesis="customers churn when their balance drops",
+                           definition="90-day average balance per account", actor="ds1")
+
+    # 1. Considered set S1 → Gate #1 choice → draft → confirm. The contract binds to S1's snapshot.
+    build_considered_set(db, intent, client, catalog_source="bank", target_ref=_TARGET, now=NOW,
+                         generation_run_id="fgr_s1")
+    s1 = db.execute("SELECT snapshot_id FROM contract_considered WHERE intent_id = %s",
+                    (intent.intent_id,)).fetchone()[0]
+    assert s1
+
+    actor = _actor()
+    record_gate1_choice(db, intent.intent_id, chosen_source="anchor",
+                        chosen_option_id="avg_balance_90d", actor=actor, why="best fit")
+    feature = chosen_feature(db, intent.intent_id, "anchor", "avg_balance_90d")
+    assert feature is not None
+    target = intent_target_ref(db, intent.intent_id)
+    draft = draft_contract(db, feature, client, roles=actor.role_claims, target_ref=target, actor=actor)
+    draft, _ = author_contract(db, draft, client, now=NOW, actor=actor)
+    contract = confirm_contract(db, draft, actor=actor.subject, roles=actor.role_claims, now=NOW,
+                                target_ref=target, intent_id=intent.intent_id)
+
+    bound = db.execute(
+        "SELECT metadata_snapshot_id, metadata_content_hash FROM contract WHERE contract_id = %s",
+        (contract.contract_id,)).fetchone()
+    assert bound[0] == s1 and bound[1]   # the confirmed contract is durably bound to S1's snapshot
+
+    # 2. Broaden: rebuild the considered set for the SAME intent → the MUTABLE pointer repoints S1->S2.
+    build_considered_set(db, intent, client, catalog_source="bank", target_ref=_TARGET, now=NOW,
+                         generation_run_id="fgr_s2")
+    s2 = db.execute("SELECT snapshot_id FROM contract_considered WHERE intent_id = %s",
+                    (intent.intent_id,)).fetchone()[0]
+    assert s2 and s2 != s1   # the considered-set pointer moved to a fresh snapshot
+
+    # 3. The already-confirmed contract's binding is UNCHANGED — immutable against the later broaden.
+    still = db.execute("SELECT metadata_snapshot_id FROM contract WHERE contract_id = %s",
+                       (contract.contract_id,)).fetchone()[0]
+    assert still == s1

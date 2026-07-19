@@ -12,6 +12,7 @@ The shared API test conn is READ COMMITTED, so the builder itself takes no snaps
 REPEATABLE READ in the builder suite); the server considered-set row is seeded with a lineage to prove
 the draft/confirm RELOAD wiring reads the server value.
 """
+import psycopg
 from tests.featuregen.api._helpers import AUTH, DEPOSITS_CSV, upload_csv
 
 from featuregen.intake.llm import FakeLLM, FakeResponse
@@ -106,3 +107,22 @@ def test_considered_set_projection_unavailable_returns_503(make_client, monkeypa
     assert "LAGGED" in res.json()["detail"]
     # ATOMIC: nothing feature-generation was committed for this aborted request.
     assert res.json().get("intent_id") is None
+
+
+def test_considered_set_serialization_failure_returns_409(make_client, monkeypatch):
+    """MF-2: /contract/considered-set STAYS on REPEATABLE READ (it builds the snapshot), so a concurrent
+    broaden race on its ``contract_considered ... ON CONFLICT (intent_id) DO UPDATE`` can raise 40001
+    SerializationFailure. The route must map that to a designed 409 (re-fetch and retry), NEVER a 500."""
+    client = make_client(_fake())
+    upload_csv(client, "deposits", DEPOSITS_CSV)
+
+    def _conflict(*a, **k):
+        raise psycopg.errors.SerializationFailure(
+            "could not serialize access due to concurrent update")
+
+    monkeypatch.setattr("featuregen.api.routes.contract.build_considered_set", _conflict)
+    res = client.post("/contract/considered-set", json={
+        "hypothesis": "customers churn when their balance drops",
+        "objective": "predict churn", "catalog_source": "deposits"}, headers=AUTH)
+    assert res.status_code == 409, res.text
+    assert "concurrent" in res.json()["detail"]

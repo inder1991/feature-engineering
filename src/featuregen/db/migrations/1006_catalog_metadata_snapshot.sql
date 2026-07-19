@@ -37,6 +37,9 @@ CREATE TABLE IF NOT EXISTS catalog_metadata_snapshot (
     registry_version      text        NULL,
     config_version        text        NULL,
     content_hash          text        NOT NULL,               -- seals the exact snapshotted catalog state
+    item_count            int         NOT NULL DEFAULT 0,     -- MF-1: the sealed item-SET size, stamped at
+    --   build (a cheap cross-check for the future reload path). On the write-once header, so it is itself
+    --   immutable once committed.
     created_at            timestamptz NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS catalog_metadata_snapshot_run_idx
@@ -58,7 +61,12 @@ CREATE OR REPLACE TRIGGER catalog_metadata_snapshot_no_mutation
 --    provenance ids. UNIQUE (snapshot_id, item_hash): an item appears at most once per snapshot.
 CREATE TABLE IF NOT EXISTS catalog_metadata_snapshot_item (
     id                bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    snapshot_id       text   NOT NULL REFERENCES catalog_metadata_snapshot(snapshot_id),
+    -- MF-1: the FK is DEFERRABLE INITIALLY DEFERRED so the builder can INSERT ALL ITEMS FIRST and the
+    -- header LAST within one transaction (the header write is what SEALS the set — see the seal trigger
+    -- below). The child-before-parent order is validated at COMMIT, so a truly orphan item (no header
+    -- ever) still fails closed.
+    snapshot_id       text   NOT NULL REFERENCES catalog_metadata_snapshot(snapshot_id)
+                             DEFERRABLE INITIALLY DEFERRED,
     catalog_source    text   NOT NULL,
     graph_ref         text   NOT NULL,
     logical_ref       text   NULL,
@@ -86,3 +94,25 @@ $$ LANGUAGE plpgsql;
 CREATE OR REPLACE TRIGGER catalog_metadata_snapshot_item_no_mutation
     BEFORE UPDATE OR DELETE ON catalog_metadata_snapshot_item
     FOR EACH ROW EXECUTE FUNCTION catalog_metadata_snapshot_item_write_once();
+
+-- 4) MF-1 — HARD SEAL of the item SET (not just each row). The write-once trigger above only blocks
+--    UPDATE/DELETE; without this a NEW item_hash row could be INSERTed into an already-committed snapshot
+--    forever, silently desyncing the header's content_hash (which nothing reverifies). This BEFORE INSERT
+--    trigger seals the set the moment the header commits: an item INSERT is REFUSED once a header row
+--    exists for its snapshot_id. During the build the header is not present yet (the builder inserts ALL
+--    ITEMS FIRST, then the header LAST under the DEFERRABLE FK above), so items are allowed; the header
+--    write is what seals. The immutable replay artifact is thus immutable at the SET level, not just the
+--    row level.
+CREATE OR REPLACE FUNCTION catalog_metadata_snapshot_item_seal() RETURNS trigger AS $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM catalog_metadata_snapshot WHERE snapshot_id = NEW.snapshot_id) THEN
+        RAISE EXCEPTION 'catalog_metadata_snapshot_item set is sealed: a header already exists for '
+            'snapshot_id=%, no new items may be inserted', NEW.snapshot_id;
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE TRIGGER catalog_metadata_snapshot_item_seal_on_insert
+    BEFORE INSERT ON catalog_metadata_snapshot_item
+    FOR EACH ROW EXECUTE FUNCTION catalog_metadata_snapshot_item_seal();

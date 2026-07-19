@@ -113,9 +113,12 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 _Conn = Annotated[psycopg.Connection, Depends(get_conn, scope="function")]
-# Delivery C0: the feature-generation writes read the catalog under REPEATABLE READ so the C0 metadata
-# snapshot (built in C0-T3) sees one torn-free view. The read-only /contracts list/detail routes stay on
-# _Conn — they are not feature-generation writes and take no snapshot.
+# Delivery C0: ONLY the considered-set route BUILDS the C0 metadata snapshot, so ONLY it needs the
+# REPEATABLE READ (_FeatureGenConn) torn-free view. MF-2: /contract/draft, /contract/confirm and
+# /contract/recognitions do NOT build a snapshot — they only RELOAD server lineage / re-run the MCV — so
+# they stay on the default _Conn (READ COMMITTED). Putting them on REPEATABLE READ gave them no benefit
+# and turned designed 409 races (a concurrent re-confirm / double-submit) into uncaught 40001
+# SerializationFailure 500s. The read-only /contracts list/detail routes also stay on _Conn.
 _FeatureGenConn = Annotated[psycopg.Connection, Depends(get_feature_gen_conn, scope="function")]
 _Identity = Annotated[IdentityEnvelope, Depends(get_identity)]
 _LLM = Annotated[LLMClient, Depends(get_llm)]
@@ -432,6 +435,10 @@ def _scoped_considered_set(body: ConsideredSetIn, conn: _FeatureGenConn, identit
             generation_run_id=generation_run_id)
     except CatalogProjectionUnavailable as e:
         raise HTTPException(status_code=503, detail=e.detail) from e
+    except psycopg.errors.SerializationFailure as e:   # MF-2: the RR broaden race on contract_considered
+        raise HTTPException(   # (ON CONFLICT (intent_id) DO UPDATE) → a designed conflict, never a 500
+            status_code=409,
+            detail="a concurrent request updated this intent; re-fetch and retry") from e
     # 7. The per-stage disposition lens over the SAME applicability + this run's grounding outcome.
     dispositions = evaluate_dispositions(
         applicability, cs.grounded_template_ids, cs.rejected_template_ids,
@@ -523,11 +530,15 @@ def considered_set(body: ConsideredSetIn, conn: _FeatureGenConn, identity: _Iden
             feedback=body.feedback, now=datetime.now(UTC), is_live=is_live)
     except CatalogProjectionUnavailable as e:
         raise HTTPException(status_code=503, detail=e.detail) from e
+    except psycopg.errors.SerializationFailure as e:   # MF-2: the RR broaden race on contract_considered
+        raise HTTPException(   # (ON CONFLICT (intent_id) DO UPDATE) → a designed conflict, never a 500
+            status_code=409,
+            detail="a concurrent request updated this intent; re-fetch and retry") from e
     return _considered_set_response(intent, cs)
 
 
 @router.post("/contract/recognitions", dependencies=[Depends(require_feature_generate)])
-def recognitions(body: RecognitionIn, conn: _FeatureGenConn, identity: _Identity,
+def recognitions(body: RecognitionIn, conn: _Conn, identity: _Identity,
                  client: _LLM) -> dict:
     """Phase-1B Gate #1 recognition: classify the objective's governed use-case scope from the
     REDACTED hypothesis/goal (recognition NEVER sees catalog columns) and persist an append-only
@@ -580,7 +591,7 @@ def recognitions(body: RecognitionIn, conn: _FeatureGenConn, identity: _Identity
 
 
 @router.post("/contract/draft", dependencies=[Depends(require_feature_generate)])
-def draft(body: DraftReqIn, conn: _FeatureGenConn, identity: _Identity, client: _LLM) -> dict:
+def draft(body: DraftReqIn, conn: _Conn, identity: _Identity, client: _LLM) -> dict:
     """Gate #1 → author. The chosen feature is reconstructed from the SERVER-persisted considered set
     (BLOCKER 1 — never an arbitrary client payload); the choice is recorded (audit); the leakage target
     is read SERVER-side (BLOCKER 2). Then draft + the critique→refine loop (MCV each pass)."""
@@ -628,7 +639,7 @@ def get_governed_contract(contract_id: str, conn: _Conn, identity: _Identity) ->
 
 
 @router.post("/contract/confirm", dependencies=[Depends(require_feature_generate)])
-def confirm(body: DraftIn, conn: _FeatureGenConn, identity: _Identity) -> Contract:
+def confirm(body: DraftIn, conn: _Conn, identity: _Identity) -> Contract:
     """The human gate — the GOVERNING write. Server-stateful, no client trust (closes the two BLOCKERs
     at the write, not just at /draft):
       * intent_id is REQUIRED; a missing/forged one is rejected (no fall back to a client target_ref);

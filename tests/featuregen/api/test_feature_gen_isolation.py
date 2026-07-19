@@ -73,13 +73,26 @@ def test_get_feature_gen_conn_fails_closed_without_dsn(monkeypatch):
     assert exc.value.status_code == 503
 
 
-# ── 2. Only the feature-gen WRITES got the new conn; the read-only /contracts routes are unchanged ────
-def test_feature_gen_routes_bind_the_repeatable_read_conn():
+# ── 2. Only the snapshot-BUILDING route got the RR conn; every other contract route keeps get_conn ────
+def test_only_considered_set_binds_the_repeatable_read_conn():
+    """MF-2: ONLY /contract/considered-set BUILDS the C0 snapshot, so only it needs the REPEATABLE READ
+    conn. draft/confirm/recognitions merely reload lineage / re-run the MCV — REPEATABLE READ gave them no
+    benefit and turned designed 409 races into uncaught 40001 500s — so they must bind get_conn instead."""
     routes = contract_routes.router.routes
-    for path, method in [("/contract/considered-set", "POST"), ("/contract/recognitions", "POST"),
-                         ("/contract/draft", "POST"), ("/contract/confirm", "POST")]:
+    calls = _dep_calls(_route(routes, "/contract/considered-set", "POST").dependant)
+    assert get_feature_gen_conn in calls, "considered-set should read the feature-gen (RR) conn"
+
+
+def test_non_snapshot_feature_routes_keep_default_isolation():
+    """MF-2: draft/confirm/recognitions build NO snapshot, so they bind get_conn (READ COMMITTED) and must
+    NOT take the REPEATABLE READ conn — a concurrent re-confirm / double-submit must surface as a designed
+    409 (UniqueViolation / mapped SerializationFailure), never a 40001 SerializationFailure 500."""
+    routes = contract_routes.router.routes
+    for path, method in [("/contract/recognitions", "POST"), ("/contract/draft", "POST"),
+                         ("/contract/confirm", "POST")]:
         calls = _dep_calls(_route(routes, path, method).dependant)
-        assert get_feature_gen_conn in calls, f"{method} {path} should read the feature-gen conn"
+        assert get_conn in calls, f"{method} {path} should keep get_conn (default isolation)"
+        assert get_feature_gen_conn not in calls, f"{method} {path} must not take the RR conn (MF-2)"
 
 
 def test_read_only_contract_routes_keep_default_isolation():

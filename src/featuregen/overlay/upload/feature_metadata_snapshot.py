@@ -332,15 +332,12 @@ def build_metadata_snapshot(
     )
 
     snapshot_id = mint_id("snap")
-    conn.execute(
-        "INSERT INTO catalog_metadata_snapshot "
-        "(snapshot_id, generation_run_id, read_scope_hash, isolation_level, projection_watermarks, "
-        "policy_version, registry_version, config_version, content_hash) "
-        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
-        (snapshot_id, generation_run_id, read_scope_hash, isolation_level,
-         Jsonb(projection_watermarks),
-         FIELD_POLICY_VERSION, RESOLVER_VERSION, SOURCE_CAPABILITY_PROFILE_VERSION, content_hash),
-    )
+    # MF-1: INSERT ALL ITEMS FIRST, then the header LAST. The BEFORE INSERT seal on
+    # catalog_metadata_snapshot_item (migration 1006) refuses any item once a header row exists for its
+    # snapshot_id, so the header write is what SEALS the set — during the build the header is absent, so
+    # the items are allowed. The item -> header FK is DEFERRABLE INITIALLY DEFERRED, so the items may
+    # reference the not-yet-inserted header within this transaction (validated at COMMIT). content_hash
+    # was computed over the item hashes above — before either write — so it still seals the same set.
     for item in items:
         conn.execute(
             "INSERT INTO catalog_metadata_snapshot_item "
@@ -355,6 +352,16 @@ def build_metadata_snapshot(
              Jsonb({"authority": item.authority, "provenance": item.provenance}),
              item.decision_event_id, None, item.fact_event_id, item.item_hash),
         )
+    conn.execute(   # the header LAST — this write seals the item set (MF-1); item_count stamps its size
+        "INSERT INTO catalog_metadata_snapshot "
+        "(snapshot_id, generation_run_id, read_scope_hash, isolation_level, projection_watermarks, "
+        "policy_version, registry_version, config_version, content_hash, item_count) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+        (snapshot_id, generation_run_id, read_scope_hash, isolation_level,
+         Jsonb(projection_watermarks),
+         FIELD_POLICY_VERSION, RESOLVER_VERSION, SOURCE_CAPABILITY_PROFILE_VERSION, content_hash,
+         len(items)),
+    )
 
     index = {
         (item.catalog_source, item.graph_ref, item.field_or_fact_type): item.facts()
