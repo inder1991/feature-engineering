@@ -50,6 +50,16 @@ MAX_REALIZATIONS_PER_HOP = 4
 MAX_PHYSICAL_PATHS_PER_BINDING = 16
 MAX_STATES_EXPANDED_PER_BINDING = 512
 
+# 3C.2b-i-A — governed multi-source operand assembly (shadow). Combine operands from DIFFERENT
+# catalogs into one governed computation at one physical grain; log-only, never surfaces.
+MULTISOURCE_ASSEMBLY_VERSION = "3c2bia.1.0.0"
+OPERATION_POLICY_VERSION = "3c2bia.op.1.0.0"
+MULTISOURCE_ASSEMBLY_SHADOW_FLAG = "FEATUREGEN_MULTISOURCE_ASSEMBLY_SHADOW"
+MULTISOURCE_GOLD_MIN_SHAPES = 6
+MAX_PATHS_PER_OPERAND = 8
+MAX_OPERAND_COMBINATIONS = 256
+MAX_MULTISOURCE_STATES_EXPANDED = 1024
+
 
 class ReplayStrength(StrEnum):
     strong = "strong"
