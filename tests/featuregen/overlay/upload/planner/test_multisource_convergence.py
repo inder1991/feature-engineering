@@ -58,10 +58,16 @@ def _plan(pid, *, rank, bridges):
         candidate_role=CandidateRole.selected)
 
 
-def _cand(*, pid, catalog, table, keys, rank=0, bridges=1, fk="grain-fk"):
+def _cand(*, pid, catalog, table, keys, rank=0, bridges=1, hops=1, authority=0, fk="grain-fk"):
+    """A convergence candidate. ``authority_key`` — (worst realizer authority, bridge_count, hops) — is
+    the CROSS-RUN-COMPARABLE tuple convergence now ranks/ties on (Task-6 #T6), materialized by Task 5
+    from the plan's OWN path; ``rank`` still sets the frontier's per-run ``preference_rank`` (a
+    positional index) so a test can DIVERGE the two — the OLD (unsound) key summed ``preference_rank``,
+    the NEW one sums ``authority_key``."""
     return OperandPathCandidateV1(
         binding_plan=_plan(pid, rank=rank, bridges=bridges),
         landing_catalog=catalog, landing_table_ref=table,
+        authority_key=(authority, bridges, hops),
         landing_endpoint=GovernedEndpointV1(
             catalog=catalog, table_ref=table, grain_key_refs=tuple(keys), grain_fact_key=fk))
 
@@ -181,12 +187,15 @@ def test_duplicate_candidates_same_landing_keep_best_ranked():
     assert combo.operand_candidates[0].binding_plan.physical_plan_id == "p0_best"
 
 
-def test_large_combination_space_sets_truncation_bound():
+def test_large_product_but_small_intersection_is_not_truncated():
+    # Task-6 MINOR: the theoretical product can be huge while the REALISED work (the intersection) is
+    # tiny — a fully-captured run must NOT be tagged capture-incomplete. The OLD product-cap set
+    # budget_truncated on product > MAX even here; the corrected cap records it ONLY on a genuine drop.
     shared = ("wealth.public.customers.customer_id",)
 
     def op(pfx):
         # 20 distinct landings per operand -> product 20*20 = 400 > MAX_OPERAND_COMBINATIONS (256),
-        # but only the rank-0 `shared` landing is common (the rest live in per-operand catalogs).
+        # but only the `shared` landing is common (the rest live in per-operand catalogs).
         cands = [_cand(pid=f"{pfx}_best", catalog="wealth", table="public.customers", keys=shared,
                        rank=0, bridges=1)]
         for i in range(19):
@@ -198,9 +207,102 @@ def test_large_combination_space_sets_truncation_bound():
     result = converge([op("a"), op("b")], bounds=_bounds())
 
     assert result.status is MultiSourceReason.resolved
+    # only ONE landing is common -> nothing dropped -> the run is NOT falsely tagged truncated
+    assert result.bounds.operand_combinations_truncated is False
+    assert MultiSourceReason.budget_truncated not in result.reason_codes
+    assert result.landed_combinations[0].landing.grain_key_refs == shared
+
+
+def test_intersection_beyond_cap_records_the_bound():
+    # Task-6 MINOR (the other side): when the MATERIALISED common landings genuinely exceed the cap,
+    # budget_truncated IS recorded — an honest over-materialisation bound. Still fully ranked (never a
+    # silent drop of the best): the unambiguous best landing (cheapest crossing) is still selected.
+    n = MAX_OPERAND_COMBINATIONS + 1
+
+    def op(pfx):
+        # n DISTINCT landings shared by BOTH operands -> len(common) == n > MAX_OPERAND_COMBINATIONS.
+        # t0 (bridges=1) is strictly best; the rest (bridges=2) are strictly worse.
+        cands = [_cand(pid=f"{pfx}_0", catalog="wealth", table="public.t0",
+                       keys=("wealth.public.t0.id",), authority=0, bridges=1)]
+        for i in range(1, n):
+            cands.append(_cand(pid=f"{pfx}_{i}", catalog="wealth", table=f"public.t{i}",
+                               keys=(f"wealth.public.t{i}.id",), authority=0, bridges=2))
+        return _operand(cands)
+
+    result = converge([op("a"), op("b")], bounds=_bounds())
+
     assert result.bounds.operand_combinations_truncated is True
     assert MultiSourceReason.budget_truncated in result.reason_codes
-    assert result.landed_combinations[0].landing.grain_key_refs == shared
+    assert result.status is MultiSourceReason.resolved
+    assert result.landed_combinations[0].landing.grain_key_refs == ("wealth.public.t0.id",)
+
+
+def test_upstream_combination_truncation_propagates():
+    # An upstream operand_combinations_truncated bound is preserved even on a small, fully-resolved run.
+    keys = ("wealth.public.customers.customer_id",)
+    op0 = _operand([_cand(pid="p0", catalog="wealth", table="public.customers", keys=keys)])
+    op1 = _operand([_cand(pid="p1", catalog="wealth", table="public.customers", keys=keys)])
+
+    result = converge([op0, op1], bounds=_bounds(operand_combinations_truncated=True))
+
+    assert result.status is MultiSourceReason.resolved
+    assert result.bounds.operand_combinations_truncated is True
+    assert MultiSourceReason.budget_truncated in result.reason_codes
+
+
+def test_equal_authority_distinct_landings_from_different_runs_is_ambiguous():
+    """#T6 regression — HIDDEN TIE. Two DISTINCT landings of GENUINELY EQUAL authority must surface
+    ``ambiguous_physical_grain`` even when their candidates carry DIFFERENT per-run ``preference_rank``
+    (a positional index that resets per ``assemble_paths`` run and shifts when ungoverned siblings are
+    dropped before it is assigned). The OLD key summed ``preference_rank`` -> the landings got DIFFERENT
+    keys -> one silently won, tiebreaking away the real ambiguity. The NEW key sums the path-derived
+    ``authority_key`` -> equal authority ties -> the ambiguity is surfaced. FAILS under the old key."""
+    l1 = ("wealth.public.customers.customer_id",)
+    l2 = ("wealth.public.households.household_id",)
+
+    def op(pfx):
+        return _operand([
+            # SAME authority_key (0,1,1), DIFFERENT preference_rank (0 vs 3): the old Σ preference_rank
+            # key would break the genuine tie; the new Σ authority_key key preserves it.
+            _cand(pid=f"{pfx}_c", catalog="wealth", table="public.customers", keys=l1,
+                  authority=0, bridges=1, hops=1, rank=0),
+            _cand(pid=f"{pfx}_h", catalog="wealth", table="public.households", keys=l2,
+                  authority=0, bridges=1, hops=1, rank=3),
+        ])
+
+    result = converge([op("a"), op("b")], bounds=_bounds())
+
+    assert result.status is MultiSourceReason.ambiguous_physical_grain
+    assert result.landed_combinations == ()            # the ambiguity is surfaced, not tiebroken
+    assert result.bounds.landing_ambiguous is True
+    assert MultiSourceReason.ambiguous_physical_grain in result.reason_codes
+
+
+def test_strictly_more_authoritative_landing_resolves_not_ambiguous():
+    """#T6 regression — FALSE AMBIGUITY. Two DISTINCT landings that are each best-in-their-own
+    ``assemble_paths`` run (so BOTH carry ``preference_rank`` 0) but differ in REAL crossing authority —
+    an ``APPROVED_JOIN`` (rank 0) vs an ``INFERRED_JOIN`` (rank 2) realizer — must resolve to the more
+    authoritative landing, NOT report a false ambiguity. The OLD key summed ``preference_rank`` (0 == 0)
+    -> a manufactured top-rank tie -> spurious ``ambiguous_physical_grain`` (the authority difference
+    lived in the per-run rank key but was invisible across runs, the index having reset). The NEW key
+    sums ``authority_key`` -> APPROVED strictly beats INFERRED -> resolved. FAILS under the old key."""
+    approved = ("wealth.public.customers.customer_id",)     # APPROVED_JOIN crossing -> authority 0
+    inferred = ("wealth.public.households.household_id",)    # INFERRED_JOIN crossing -> authority 2
+
+    def op(pfx):
+        return _operand([
+            _cand(pid=f"{pfx}_a", catalog="wealth", table="public.customers", keys=approved,
+                  authority=0, bridges=1, hops=1, rank=0),    # best-in-its-run -> preference_rank 0
+            _cand(pid=f"{pfx}_i", catalog="wealth", table="public.households", keys=inferred,
+                  authority=2, bridges=1, hops=1, rank=0),    # ALSO best-in-its-run -> preference_rank 0
+        ])
+
+    result = converge([op("a"), op("b")], bounds=_bounds())
+
+    assert result.status is MultiSourceReason.resolved
+    assert len(result.landed_combinations) == 1
+    assert result.landed_combinations[0].landing.grain_key_refs == approved
+    assert result.bounds.landing_ambiguous is False
 
 
 def test_operand_with_no_candidates_fails_closed_to_no_common():

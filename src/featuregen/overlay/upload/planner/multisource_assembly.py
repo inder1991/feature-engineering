@@ -34,6 +34,7 @@ from featuregen.overlay.catalog import CatalogAdapter
 from featuregen.overlay.upload.binding_roles import JoinRole, TemporalRole
 from featuregen.overlay.upload.catalog_realizations import table_of
 from featuregen.overlay.upload.planner.assembly import (
+    _AUTHORITY_RANK,
     _Position,
     assemble_paths,
     semantic_rollup_paths,
@@ -47,6 +48,7 @@ from featuregen.overlay.upload.planner.contracts import (
     CatalogScopeV1,
     IngredientBindingV1,
     PlanResolutionStatus,
+    SegmentKind,
 )
 from featuregen.overlay.upload.planner.declarations import CompilerContext
 from featuregen.overlay.upload.planner.multisource_contracts import (
@@ -59,6 +61,7 @@ from featuregen.overlay.upload.planner.multisource_contracts import (
 )
 from featuregen.overlay.upload.planner.multisource_endpoints import governed_endpoint
 from featuregen.overlay.upload.planner.multisource_reuse import injected_operand_template
+from featuregen.overlay.upload.taxonomy.entity_relationships import RealizationAuthority
 
 # The single-source resolution statuses that count as a governed complete path. ``assemble_paths``
 # returns ranked/classified plans; a top-rank tie is normalized to ``resolved_with_ambiguity`` —
@@ -75,11 +78,19 @@ class OperandPathCandidateV1:
 
     Carries the frontier's own single-source ``binding_plan`` (its ``path_segments`` ARE the
     governed crossings), the landing ``(landing_catalog, landing_table_ref)`` re-derived from those
-    segments, and the landing ``GovernedEndpointV1`` (proven by a VERIFIED ``grain`` fact)."""
+    segments, and the landing ``GovernedEndpointV1`` (proven by a VERIFIED ``grain`` fact).
+
+    ``authority_key`` is the CROSS-RUN-COMPARABLE authority tuple (worst realizer authority, total
+    crossings, semantic hops) computed from THIS candidate's OWN ``path_segments`` (Task-6 fix #T6) —
+    NOT the frontier's ``preference_rank`` (a per-``assemble_paths``-run POSITIONAL index that resets
+    to 0 each run and is assigned before ungoverned landings are dropped, so summing it across the
+    runs/operands convergence concatenates is not a valid authority order). Convergence ranks and
+    ties on THIS tuple instead."""
     binding_plan: BindingPlanV1
     landing_catalog: str
     landing_table_ref: str
     landing_endpoint: GovernedEndpointV1
+    authority_key: tuple[int, int, int]
 
 
 @dataclass(frozen=True, slots=True)
@@ -204,6 +215,37 @@ def _enumerate_plans(conn, *, source_position: _Position, target_entity: str, sc
     return plans[:MAX_PATHS_PER_OPERAND], truncated, total_states
 
 
+def _realizer_authority_ranks(ctx: CompilerContext) -> dict[tuple[str, str], int]:
+    """(catalog, realization_id) -> ``_AUTHORITY_RANK`` for every governed realization in the batch-
+    loaded context — the SAME governed source the frontier's transitions used (conn-free, §12 read-
+    only). Mirrors ``assembly._authority_rank_lookup`` but over ``ctx.realizations_by_catalog`` (the
+    frontier ran on the same snapshot), so authority stays comparable ACROSS ``assemble_paths`` runs."""
+    lookup: dict[tuple[str, str], int] = {}
+    for cat, rels in ctx.realizations_by_catalog.items():
+        for r in rels:
+            lookup[(cat, r.realization_id)] = _AUTHORITY_RANK[r.authority]
+    return lookup
+
+
+def _authority_key(plan: BindingPlanV1, ranks: dict[tuple[str, str], int]) -> tuple[int, int, int]:
+    """The candidate's CROSS-RUN-COMPARABLE authority tuple, from ITS OWN ``path_segments`` (best =
+    smallest): ``(worst realizer authority, bridge_count, semantic hops)``. The worst-realizer
+    component mirrors ``assembly._rank_key`` exactly — a realizer the governed lookup cannot resolve
+    ranks WORST (``INFERRED_JOIN``-level), never APPROVED-best; a pure-bridge path has no realizer
+    segment and ranks neutrally at 0 (the ``default=``). Unlike the frontier's per-run ``preference_
+    rank`` (a positional index that resets to 0 each ``assemble_paths`` run), every component here is
+    derived from the path itself, so it is directly comparable across runs and across operands — a
+    valid quantity to SUM across a landing's per-operand best candidates (Task-6 fix #T6)."""
+    worst_realizer = max(
+        (ranks.get((s.catalog_source, s.realization_ref or ""),
+                    _AUTHORITY_RANK[RealizationAuthority.INFERRED_JOIN])
+         for s in plan.path_segments
+         if s.segment_kind is SegmentKind.intra_catalog_realization),
+        default=0)
+    hops = sum(1 for s in plan.path_segments if s.segment_kind is SegmentKind.semantic_rollup)
+    return (worst_realizer, plan.bridge_count, hops)
+
+
 def enumerate_operand_paths(
         conn, adapter: CatalogAdapter, ctx: CompilerContext, *, operand: OperandSlotV1,
         target_entity: str, scope: CatalogScopeV1, roles: Iterable[str],
@@ -243,6 +285,7 @@ def enumerate_operand_paths(
             candidates=(), status=MultiSourceReason.no_governed_path,
             reason_codes=(MultiSourceReason.no_governed_path,), bounds=bounds)
 
+    authority_ranks = _realizer_authority_ranks(ctx)
     candidates: list[OperandPathCandidateV1] = []
     for plan in plans:
         landing_catalog, landing_table_ref = _rederive_landing(
@@ -253,7 +296,8 @@ def enumerate_operand_paths(
             continue    # the landing has no VERIFIED grain fact — ungoverned, dropped
         candidates.append(OperandPathCandidateV1(
             binding_plan=plan, landing_catalog=landing_catalog,
-            landing_table_ref=landing_table_ref, landing_endpoint=endpoint))
+            landing_table_ref=landing_table_ref, landing_endpoint=endpoint,
+            authority_key=_authority_key(plan, authority_ranks)))
 
     # A governed path resolved but no landing was governed by a VERIFIED grain fact.
     if not candidates:
@@ -278,17 +322,25 @@ def enumerate_operand_paths(
 # (operand, landing), then INTERSECTS the per-operand landing sets on that full identity. A landing
 # every operand reaches is a common landing; the final join is on EVERY grain key.
 #
-# Ranking reuses the frontier's own ``_AUTHORITY_RANK``-derived per-plan rank, carried on
-# ``BindingPlanV1.preference_rank`` (its full precedence already folds in _AUTHORITY_RANK -> bridge
-# count -> binding quality -> hops -> realizer authority). Convergence is CONN-FREE by contract
-# (spec §8) and never re-reads the graph for authority (§12 read-only): it consumes the authority the
-# frontier already computed. A common landing's SEMANTIC rank is (Σ preference_rank, Σ bridge_count):
-# authority of the crossings first, fewest TOTAL crossings second. A top-semantic-rank tie across
-# DISTINCT landings is ``ambiguous_physical_grain`` (+ ``landing_ambiguous``) — detected BEFORE any
-# stable-identity presentation order, so an ambiguity is surfaced, never silently resolved by a
-# tiebreak. No common landing -> ``no_common_physical_grain``. The theoretical cross-operand product
-# is capped at ``MAX_OPERAND_COMBINATIONS`` (truncation is a recorded bound). Fail-closed: an empty
-# ``landed_combinations`` ALWAYS carries a reason, never a bare empty tuple.
+# Ranking uses the candidate's CROSS-RUN-COMPARABLE ``authority_key`` (Task-6 fix #T6), materialized by
+# Task 5 from each candidate's OWN ``path_segments`` (``_AUTHORITY_RANK`` worst realizer -> bridge count
+# -> semantic hops) — NOT the frontier's ``preference_rank``. ``preference_rank`` is a per-``assemble_
+# paths``-run POSITIONAL index (reset to 0 per semantic-path run, assigned before ungoverned landings
+# are dropped); ``_enumerate_plans`` concatenates one run PER semantic path, so summing ``preference_
+# rank`` across runs/operands was not a valid authority order — it both hid genuine ties (dropped
+# ungoverned siblings shift a surviving candidate's index) and manufactured false ones (two best-in-
+# their-own-run landings both index 0, erasing an APPROVED-vs-INFERRED authority difference). The
+# authority tuple is derived from the path itself, so it is comparable across runs and operands.
+# Convergence stays CONN-FREE by contract (spec §8) and never re-reads the graph for authority (§12
+# read-only): it consumes the authority Task 5 already folded onto the candidate. A common landing's
+# SEMANTIC rank is (Σ worst realizer authority, Σ bridge_count, Σ hops): authority of the crossings
+# first, fewest TOTAL crossings second, fewest hops third. A top-semantic-rank tie across DISTINCT
+# landings is ``ambiguous_physical_grain`` (+ ``landing_ambiguous``) — detected BEFORE any stable-
+# identity presentation order, so an ambiguity is surfaced, never silently resolved by a tiebreak. No
+# common landing -> ``no_common_physical_grain``. The realised work is the INTERSECTION; ``budget_
+# truncated`` is recorded ONLY when the materialised common landings genuinely exceed
+# ``MAX_OPERAND_COMBINATIONS`` (or an upstream bound truncated), never merely because the theoretical
+# product is large. Fail-closed: an empty ``landed_combinations`` ALWAYS carries a reason.
 # ═══════════════════════════════════════════════════════════════════════════════════════════════
 
 
@@ -325,12 +377,13 @@ def _landing_of(candidate: OperandPathCandidateV1) -> PhysicalLandingV1:
         grain_key_refs=candidate.landing_endpoint.grain_key_refs)
 
 
-def _candidate_rank(candidate: OperandPathCandidateV1) -> tuple[int, int, str]:
+def _candidate_rank(candidate: OperandPathCandidateV1) -> tuple[int, int, int, str]:
     """Per-candidate rank (best = smallest) for choosing the best plan at a given (operand, landing):
-    the frontier's ``_AUTHORITY_RANK``-derived ``preference_rank``, then fewest crossings
-    (``bridge_count``), then the canonical ``physical_plan_id`` for a deterministic final tiebreak."""
-    plan = candidate.binding_plan
-    return (plan.preference_rank, plan.bridge_count, plan.physical_plan_id)
+    the CROSS-RUN-COMPARABLE ``authority_key`` (worst realizer authority -> total crossings -> hops),
+    then the canonical ``physical_plan_id`` for a deterministic final tiebreak. Candidates for one
+    landing can come from DIFFERENT ``assemble_paths`` runs (distinct bridge-key plans re-derive to the
+    same landing), so the per-run ``preference_rank`` was unsound here too — ``authority_key`` is not."""
+    return (*candidate.authority_key, candidate.binding_plan.physical_plan_id)
 
 
 def _best_per_landing(
@@ -347,14 +400,18 @@ def _best_per_landing(
     return best
 
 
-def _landing_semantic_key(operand_bests: tuple[OperandPathCandidateV1, ...]) -> tuple[int, int]:
+def _landing_semantic_key(operand_bests: tuple[OperandPathCandidateV1, ...]) -> tuple[int, int, int]:
     """The SEMANTIC rank of a common landing (best = smallest), EXCLUDING any stable landing identity
-    so a genuine tie surfaces before ordering: authority of the crossings first (Σ frontier
-    ``preference_rank``, which is ``_AUTHORITY_RANK``-derived), fewest TOTAL crossings second
-    (Σ ``bridge_count``) across every operand's best candidate at the landing."""
+    so a genuine tie surfaces before ordering: the Σ of every operand's best candidate's CROSS-RUN-
+    COMPARABLE ``authority_key`` — authority of the crossings first (Σ worst realizer authority),
+    fewest TOTAL crossings second (Σ ``bridge_count``), fewest hops third (Σ hops). Each component is
+    comparable ACROSS ``assemble_paths`` runs (derived from the candidate's OWN path, not a per-run
+    index), so a genuine top-authority tie across DISTINCT landings surfaces as ambiguous and an
+    unambiguous best is selected — the per-run ``preference_rank`` reset made summing it unsound (#T6)."""
     return (
-        sum(c.binding_plan.preference_rank for c in operand_bests),
-        sum(c.binding_plan.bridge_count for c in operand_bests),
+        sum(c.authority_key[0] for c in operand_bests),
+        sum(c.authority_key[1] for c in operand_bests),
+        sum(c.authority_key[2] for c in operand_bests),
     )
 
 
@@ -374,39 +431,45 @@ def converge(operand_results: Sequence[OperandEnumerationResultV1], *,
     """Converge every operand onto ONE exact physical landing (spec §5 step 4, §8).
 
     Intersect the per-operand landing sets on full ``PhysicalLandingV1`` identity, rank the common
-    landings by the frontier's ``_AUTHORITY_RANK``-derived semantic rank (authority of the crossings
-    -> fewest total crossings), and select the single unambiguous best — surfacing a top-semantic-rank
-    tie across DISTINCT landings as ``ambiguous_physical_grain`` (+ ``landing_ambiguous``) BEFORE any
-    stable-identity tiebreak, and no common landing as ``no_common_physical_grain``. Conn-free
-    (spec §8): the crossing authority the frontier already folded into each governed plan is reused,
-    never re-read (§12). Operates only on the governed candidates handed in (Task-5 note M11). The
-    theoretical cross-operand product is capped at ``MAX_OPERAND_COMBINATIONS`` (a recorded bound).
-    Fail-closed: an empty ``landed_combinations`` always carries a reason."""
+    landings by each candidate's CROSS-RUN-COMPARABLE ``authority_key`` semantic rank (authority of the
+    crossings -> fewest total crossings -> fewest hops), and select the single unambiguous best —
+    surfacing a top-semantic-rank tie across DISTINCT landings as ``ambiguous_physical_grain`` (+
+    ``landing_ambiguous``) BEFORE any stable-identity tiebreak, and no common landing as
+    ``no_common_physical_grain``. Conn-free (spec §8): the ``authority_key`` Task 5 folded onto each
+    candidate from its OWN path is reused, never re-read (§12) — the per-run ``preference_rank`` is NOT
+    consulted (it is not comparable across the runs convergence concatenates, #T6). Operates only on
+    the governed candidates handed in (Task-5 note M11). ``budget_truncated`` is recorded ONLY when the
+    materialised common landings genuinely exceed ``MAX_OPERAND_COMBINATIONS`` (or an upstream bound
+    truncated), never merely because the theoretical product is large. Fail-closed: an empty
+    ``landed_combinations`` always carries a reason."""
     # Per-operand landing -> best candidate. An operand that resolved no candidate contributes an
     # empty set, which fails the intersection closed (no common landing).
     per_operand = [_best_per_landing(r) for r in operand_results]
 
-    # Cross-operand product cap (spec §8): the theoretical (one-landing-per-operand) combination
-    # space. The realised work is bounded by the intersection (<= the smallest per-operand set), so
-    # the cap only records an honest bound; it never drops a genuinely common landing.
-    product = 1
-    for bests in per_operand:
-        product *= len(bests)
-    truncated = bounds.operand_combinations_truncated or product > MAX_OPERAND_COMBINATIONS
-
     if not per_operand:
         return _empty_convergence(MultiSourceReason.no_common_physical_grain, bounds,
-                                  truncated=truncated, ambiguous=False)
+                                  truncated=bounds.operand_combinations_truncated, ambiguous=False)
     common = set(per_operand[0])
     for bests in per_operand[1:]:
         common &= set(bests)
+
+    # Cross-operand cap (spec §8), Task-6 minor: the theoretical (one-landing-per-operand) product can
+    # be huge, but the REALISED work is the INTERSECTION (<= the smallest per-operand set) — every
+    # common landing is fully ranked, NONE dropped. So ``budget_truncated`` is recorded ONLY when the
+    # materialised common landings genuinely exceed ``MAX_OPERAND_COMBINATIONS`` (a real over-
+    # materialisation) or an upstream bound already truncated — never merely because the theoretical
+    # product is large, so a fully-captured run is never falsely tagged capture-incomplete.
+    truncated = (bounds.operand_combinations_truncated
+                 or len(common) > MAX_OPERAND_COMBINATIONS)
+
     if not common:
         return _empty_convergence(MultiSourceReason.no_common_physical_grain, bounds,
                                   truncated=truncated, ambiguous=False)
 
     # Rank the common landings by SEMANTIC key; detect a top-rank tie across distinct landings BEFORE
     # any stable-identity ordering (the ambiguity must surface, not be silently tiebroken).
-    keyed: list[tuple[tuple[int, int], PhysicalLandingV1, tuple[OperandPathCandidateV1, ...]]] = []
+    keyed: list[tuple[tuple[int, int, int], PhysicalLandingV1,
+                      tuple[OperandPathCandidateV1, ...]]] = []
     for landing in common:
         operand_bests = tuple(bests[landing] for bests in per_operand)
         keyed.append((_landing_semantic_key(operand_bests), landing, operand_bests))
