@@ -10,9 +10,12 @@ SAFE dict shape, with NULLABLE graph `definition`/`concept` — must pass the ga
 """
 import json
 
+import featuregen.overlay.upload.feature_assist as fa
 from featuregen.intake.llm import PROVIDER_OK, FakeLLM, FakeResponse, LLMResult
 from featuregen.intake.redaction import INPUT_KEY_CATALOG, INPUT_KEY_CLASSIFICATION
+from featuregen.overlay.upload.canonical import CanonicalRow
 from featuregen.overlay.upload.enrich_llm import sanitize_feature_context
+from featuregen.overlay.upload.graph import build_graph
 
 _SAMPLE = ("Posting amount is the monetary value of the ledger entry, with representative values "
            "such as 3708484836801; 3708446902413; 3708454004701, which supports interpretation.")
@@ -243,3 +246,45 @@ def test_audited_structured_call_blocks_blanked_definition_no_dispatch(db):
     n = db.execute(
         "SELECT count(*) FROM security_audit WHERE event_type = 'EGRESS_BLOCKED'").fetchone()[0]
     assert n == 1
+
+
+_PLANTED = "3708484836801"
+_DEF = ("Posting amount is the monetary value of the ledger entry, with representative values "
+        "such as 3708484836801; 3708446902413; 3708454004701, which supports interpretation.")
+
+
+def test_planted_sample_token_never_egresses_and_is_audited(db, monkeypatch):
+    monkeypatch.setenv("FEATUREGEN_FEATURE_CONTEXT", "1")
+    build_graph(db, "bank", [
+        CanonicalRow("bank", "transactions", "amount", "numeric", definition=_DEF)])
+
+    captured: list = []
+
+    class _CaptureLLM:
+        def call(self, request):
+            captured.append(json.loads(json.dumps(dict(request.inputs), default=str)))
+            return LLMResult(output={"features": []}, self_reported_scores={}, call_ref="",
+                             status="ok")
+
+    fa.recommend_features(db, "predict spend", _CaptureLLM(), catalog_source="bank",
+                          budget=1, critic=False)
+
+    # 1. Absent from the actual provider request.
+    assert captured, "the model was never called"
+    req_meta = captured[0]["catalog_metadata"]
+    col = next(c for c in req_meta["columns"] if c["object_ref"] == "public.transactions.amount")
+    assert _PLANTED not in col["definition"]
+    assert _PLANTED not in json.dumps(captured[0])
+
+    # 2. Absent from the persisted llm_call.redacted_input.
+    row = db.execute("SELECT redacted_input, input_redaction FROM llm_call "
+                     "WHERE task = 'overlay.feature.recommend' "
+                     "ORDER BY created_at DESC LIMIT 1").fetchone()
+    redacted_input, input_redaction = row[0], row[1]
+    assert _PLANTED not in json.dumps(redacted_input)
+
+    # 3. A sample_strip audit was persisted for that definition path.
+    sample_strip = input_redaction.get("sample_strip", [])
+    hit = next((a for a in sample_strip if a["path"] == "columns[0].definition"), None)
+    assert hit is not None and hit["removed_count"] >= 1
+    assert hit["state"] == "stripped"
