@@ -18,8 +18,10 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 
 from featuregen.overlay.upload.contract._serial import actor_json as _actor_json
+from featuregen.overlay.upload.dispatch_audit import DispatchAuditContext
 from featuregen.overlay.upload.enrich_llm import audited_enrich_call
 from featuregen.overlay.upload.graph import rebuild_search_doc
+from featuregen.overlay.upload.object_ref import normalize_ref
 from featuregen.overlay.upload.read_scope import allowed_sensitivities
 
 # A blank / unknown / list-stringified entity suggestion is not applied.
@@ -92,11 +94,14 @@ def cross_join_via_entity(conn, from_source: str, from_table: str, to_source: st
 
 
 def suggest_entity(conn, client, *, table: str, column: str, type: str, concept: str | None = None,
-                   actor=None) -> str | None:
+                   actor=None, dispatch_audit: DispatchAuditContext | None = None) -> str | None:
     """ADVISORY: ask the LLM which business entity an id-like column denotes (Customer, Account, ...),
     from metadata only (name/type/concept — no data). A SUGGESTION for a human to confirm before it's
     written as the column's entity — never auto-applied (a wrong entity mis-links catalogs). Returns
-    the suggested entity name, or None on failure / empty / implausible output."""
+    the suggested entity name, or None on failure / empty / implausible output.
+
+    ``dispatch_audit`` (C5-T5): the caller's ingestion-attribution context (``suggest_entities``
+    builds one per column when it has a run id); ``None`` is byte-identical to today."""
     raw = audited_enrich_call(
         conn, client, task="overlay.enrich.entity", prompt_id="overlay_entity_v1",
         schema_id="overlay_entity",
@@ -104,7 +109,7 @@ def suggest_entity(conn, client, *, table: str, column: str, type: str, concept:
         out_key="entity",
         instruction="Which business entity (e.g. Customer, Account) does this id-like column denote, "
                     "if any? Reply with the entity name only, or empty if it denotes none.",
-        actor=actor)
+        actor=actor, dispatch_audit=dispatch_audit)
     if not raw or len(raw) > _KNOWN_ENTITYISH or "\n" in raw or raw.startswith("["):
         return None
     return raw
@@ -132,11 +137,16 @@ class EntitySuggestion:
 
 
 def suggest_entities(conn, client, catalog_source: str, *, roles: Iterable[str] = (),
-                     actor=None) -> int:
+                     actor=None, ingestion_run_id: str | None = None) -> int:
     """For each id-like column in this catalog that has NO entity yet, ask the LLM (advisory) which
     entity it denotes and store a PENDING suggestion — never auto-applied. Read-scoped. On-demand
     (NOT in the ingest hot path). Returns the number of suggestions written. Re-running refreshes
-    pending rows but never clobbers an already-applied one."""
+    pending rows but never clobbers an already-applied one.
+
+    ``ingestion_run_id`` (C5-T5): when a caller runs this in service of an ingestion run, each
+    per-column dispatch is pre-audited + attributed to that run and the column subject (stage
+    ``entity``). The on-demand API route passes nothing — ``None`` dispatches unattributed,
+    byte-for-byte as before."""
     cols = conn.execute(
         "SELECT object_ref, table_name, column_name, data_type, concept FROM graph_node "
         "WHERE kind = 'column' AND catalog_source = %s AND entity IS NULL "
@@ -146,8 +156,15 @@ def suggest_entities(conn, client, catalog_source: str, *, roles: Iterable[str] 
     for object_ref, table, column, data_type, concept in cols:
         if not _is_id_like(column, data_type):
             continue
+        ctx = None
+        if ingestion_run_id is not None:
+            ctx = DispatchAuditContext(
+                ingestion_run_id=ingestion_run_id, stage="entity",
+                subjects=({"catalog_source": catalog_source, "object_ref": object_ref,
+                           "logical_ref": normalize_ref(catalog_source, None, table, column),
+                           "field_names": [column]},))
         suggested = suggest_entity(conn, client, table=table, column=column, type=data_type,
-                                   concept=concept, actor=actor)
+                                   concept=concept, actor=actor, dispatch_audit=ctx)
         if not suggested:
             continue
         conn.execute(

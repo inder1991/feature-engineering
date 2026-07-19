@@ -25,6 +25,7 @@ from typing import Any
 from featuregen.contracts import SchemaValidationError
 from featuregen.contracts.envelopes import IdentityEnvelope
 from featuregen.intake.llm import DEFAULT_LLM_MODEL, LLMClient
+from featuregen.overlay.upload.dispatch_audit import DispatchAuditContext
 from featuregen.overlay.upload.enrich_llm import audited_structured_call
 from featuregen.overlay.upload.taxonomy.recognition import (
     TAXONOMY_VERSION,
@@ -101,6 +102,7 @@ def recognize(
     redacted_goal: str | None = None,
     model_id: str | None = None,
     actor: IdentityEnvelope | None = None,
+    ingestion_run_id: str | None = None,
 ) -> RecognitionResult:
     """Recognise the governed use-case scope of a *redacted* request. LLM-only and FAIL-OPEN: never
     raises to its caller. Routes through the platform's AUDITED seam (``audited_structured_call``) so a
@@ -109,14 +111,24 @@ def recognize(
     failure/refusal, invalid body, dispatch/mapping error) folds to a candidate-free
     ``TECHNICAL_FAILURE``; a well-formed ``unscoped`` body folds to ``UNSCOPED``. The input carries only
     the redacted hypothesis + prediction goal (``catalog_metadata`` is empty — recognition never sees
-    columns). ``model_id`` defaults to the env-configured model (matching the wired client)."""
+    columns). ``model_id`` defaults to the env-configured model (matching the wired client).
+
+    ``ingestion_run_id`` (C5-T5): when a caller runs recognition in service of an ingestion run, the
+    dispatch is pre-audited + attributed to that run (stage ``recognizer``; subjects empty — the
+    call is about the redacted request, never a catalog object). Today's callers pass nothing —
+    ``None`` dispatches unattributed, byte-for-byte as before."""
     model = model_id or os.environ.get("FEATUREGEN_LLM_MODEL", DEFAULT_LLM_MODEL)
     instruction = _recognition_instruction(redacted_hypothesis, redacted_goal)
+    dispatch_audit = None
+    if ingestion_run_id is not None:
+        dispatch_audit = DispatchAuditContext(ingestion_run_id=ingestion_run_id,
+                                              stage="recognizer", subjects=())
 
     try:
         output = audited_structured_call(
             conn, client, task=RECOGNIZER_TASK, prompt_id=PROMPT_ID,
-            schema_id=_OUTPUT_SCHEMA_ID, catalog_metadata={}, instruction=instruction, actor=actor)
+            schema_id=_OUTPUT_SCHEMA_ID, catalog_metadata={}, instruction=instruction, actor=actor,
+            dispatch_audit=dispatch_audit)
     except Exception:
         logger.exception("recognition dispatch raised; failing open to technical_failure")
         return unscoped_result(

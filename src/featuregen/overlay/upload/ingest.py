@@ -1560,13 +1560,17 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
         try:
             # Glossary carry-forward (Task 6): thread the sidecar + bindings + snapshot so Pass A
             # writes item-level LLM concept evidence. Non-glossary keeps the exact original call.
+            # C5-T5: `ingestion_run_id` threads into every enrichment stage so each LLM dispatch is
+            # pre-audited + attributed to THIS run and the object subjects it enriches. `None`
+            # (a direct caller with no run) dispatches unattributed — byte-for-byte as before.
             with conn.transaction():
                 concepts = (
                     enrich_concepts(conn, vr.good, client, actor, glossary=glossary,
                                     bindings=bindings, source_snapshot_id=snapshot_id,
-                                    stats=concept_stats)
+                                    stats=concept_stats, ingestion_run_id=ingestion_run_id)
                     if is_glossary
-                    else enrich_concepts(conn, vr.good, client, actor, stats=concept_stats)
+                    else enrich_concepts(conn, vr.good, client, actor, stats=concept_stats,
+                                         ingestion_run_id=ingestion_run_id)
                 )
         except Exception:  # noqa: BLE001
             logger.warning("advisory concept enrichment failed for %r", catalog_source, exc_info=True)
@@ -1581,7 +1585,8 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
                 # R5-3: the glossary sidecar lets draft_definitions SKIP sanitizer-suppressed
                 # blanks (suppressed ≠ missing — never silently LLM-drafted); None for technical.
                 definitions = draft_definitions(conn, vr.good, client, actor, concepts=concepts,
-                                                glossary=glossary)
+                                                glossary=glossary,
+                                                ingestion_run_id=ingestion_run_id)
         except Exception:  # noqa: BLE001
             logger.warning("advisory definition enrichment failed for %r", catalog_source, exc_info=True)
         state, reason, detail = _enrichment_outcome(
@@ -1595,7 +1600,8 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
         stage_started = datetime.now(UTC)
         try:
             with conn.transaction():
-                domains = classify_domains(conn, vr.good, client, actor)
+                domains = classify_domains(conn, vr.good, client, actor,
+                                           ingestion_run_id=ingestion_run_id)
         except Exception:  # noqa: BLE001
             logger.warning("advisory domain enrichment failed for %r", catalog_source, exc_info=True)
         state, reason, detail = _enrichment_outcome(domains, len({r.table for r in vr.good}))
@@ -1709,14 +1715,20 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
                 cols: dict[str, set[str]] = {}
                 for r in vr.good:
                     cols.setdefault(r.table.strip().lower(), set()).add(r.column)
+                # Computed HERE (pure — no DB) so the C5-T5 dispatch subjects key each table under
+                # the SAME schema its fact proposals use below; reused by the propose block.
+                schema_by_table = _schema_by_table(glossary)
                 syntheses = synthesize_tables(conn, client, items, columns_by_table=cols,
                                               actor=actor,     # LLM-call attribution only
-                                              dispositions=dispositions)
+                                              dispositions=dispositions,
+                                              # C5-T5: run + table-subject dispatch attribution
+                                              ingestion_run_id=ingestion_run_id,
+                                              catalog_source=catalog_source,
+                                              schema_by_table=schema_by_table)
             with conn.transaction():
                 # Key the advisory table ref + its projection under the SAME schema the glossary
                 # columns use (a non-public schema for an FTR glossary; public for a technical
                 # upload) so readiness sees ONE (schema, table) pair per physical table.
-                schema_by_table = _schema_by_table(glossary)
                 # Propose under the SERVICE actor so a human confirmer later satisfies four-eyes.
                 # The SAME collector threads in so the [F9] staling flips land on the records the
                 # accept appended (prior_value_staled is live on the ingest path, not just tests):

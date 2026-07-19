@@ -20,6 +20,7 @@ from featuregen.overlay.upload.concepts import (
     classification_vocabulary,
     is_known_concept,
 )
+from featuregen.overlay.upload.dispatch_audit import DispatchAuditContext
 from featuregen.overlay.upload.enrich_batch import BatchItem, run_batched
 from featuregen.overlay.upload.enrich_llm import (
     ENRICHMENT_RUN_ID,
@@ -146,13 +147,45 @@ def _cache_put(conn, cache_table: str, content_hash_: str, value: str, cache_ver
 
 
 def _call(conn, client: LLMClient, task: str, prompt_id: str, schema_id: str,
-          catalog_metadata: dict, out_key: str, instruction: str, actor) -> str | None:
+          catalog_metadata: dict, out_key: str, instruction: str, actor,
+          dispatch_audit: DispatchAuditContext | None = None) -> str | None:
     """Run one GOVERNED enrichment call (attached schema, reserved keys, egress guard, audit record —
     so a real provider works and PII can't leak). Returns None on any failure/empty so a transient
-    failure never poisons the cache (M3)."""
+    failure never poisons the cache (M3). ``dispatch_audit`` (C5-T5) threads the ingestion-run
+    attribution context to the single seam; ``None`` is byte-identical."""
     return audited_enrich_call(
         conn, client, task=task, prompt_id=prompt_id, schema_id=schema_id,
-        catalog_metadata=catalog_metadata, out_key=out_key, instruction=instruction, actor=actor)
+        catalog_metadata=catalog_metadata, out_key=out_key, instruction=instruction, actor=actor,
+        dispatch_audit=dispatch_audit)
+
+
+def _column_subject(row: CanonicalRow) -> dict:
+    """One ``llm_dispatch_subject`` mapping (C5-T5) for the COLUMN a Pass A item enriches: the
+    upload's schema-less evidence identity (``normalize_ref`` public-flattens, matching the graph),
+    with ``object_ref`` the source-local path (the ``graph_node.object_ref`` convention) and
+    ``field_names`` the one column this item is about. Attribution strings only — never row data."""
+    logical_ref = normalize_ref(row.source, None, row.table, row.column)
+    return {"catalog_source": row.source, "object_ref": logical_ref.split("::", 1)[1],
+            "logical_ref": logical_ref, "field_names": [row.column]}
+
+
+def _table_subject(source: str, table: str, columns: list[str]) -> dict:
+    """The TABLE-grain subject (C5-T5) for a per-table enrichment item (domain classification):
+    ``field_names`` lists the column names the request carries for that table."""
+    logical_ref = normalize_ref(source, None, table)
+    return {"catalog_source": source, "object_ref": logical_ref.split("::", 1)[1],
+            "logical_ref": logical_ref, "field_names": sorted(columns)}
+
+
+def _single_ctx(ingestion_run_id: str | None, stage: str,
+                subject: dict) -> DispatchAuditContext | None:
+    """The per-call context for a SINGLE-mode enrichment call: this one subject under the run +
+    stage. ``ingestion_run_id=None`` (a direct call with no run) yields ``None`` — no attribution,
+    byte-for-byte today's behavior."""
+    if ingestion_run_id is None:
+        return None
+    return DispatchAuditContext(ingestion_run_id=ingestion_run_id, stage=stage,
+                                subjects=(subject,))
 
 
 def _bounded(val: str | None, max_len: int) -> str | None:
@@ -324,7 +357,8 @@ def enrich_concepts(conn, rows: list[CanonicalRow], client: LLMClient, actor=Non
                     glossary: GlossaryUpload | None = None,
                     bindings: dict[str, ObjectBinding] | None = None,
                     source_snapshot_id: str | None = None,
-                    stats: dict | None = None) -> dict[str, str]:
+                    stats: dict | None = None,
+                    ingestion_run_id: str | None = None) -> dict[str, str]:
     """Classify each column into a controlled concept; returns {content_hash: concept} (unchanged).
 
     Glossary carry-forward (guarded — non-glossary uploads are UNCHANGED): when ``glossary`` is given,
@@ -339,7 +373,12 @@ def enrich_concepts(conn, rows: list[CanonicalRow], client: LLMClient, actor=Non
 
     ``stats`` (#22, optional out-param — the return shape is unchanged): when given, receives
     ``evidence_write_failures``, the count of per-item evidence-write failures the stage CONTAINED
-    internally, so the caller's stage report can say ``partial`` instead of a laundered success."""
+    internally, so the caller's stage report can say ``partial`` instead of a laundered success.
+
+    ``ingestion_run_id`` (C5-T5): the durable run this enrichment serves — with it, EVERY LLM
+    dispatch this stage issues (batch chunks, retries, single fallbacks, single mode) is pre-audited
+    and attributed to the run + the exact column subjects it enriches (stage ``enrich_concept``).
+    ``None`` (a direct call with no run) dispatches unattributed — byte-for-byte today."""
     by_hash: dict[str, CanonicalRow] = {content_hash(r): r for r in rows}
     rec_by_tc = _records_by_tc(glossary) if glossary is not None else {}
 
@@ -372,7 +411,10 @@ def enrich_concepts(conn, rows: list[CanonicalRow], client: LLMClient, actor=Non
                         "vocabulary — choose the single best-fitting concept name, or 'unclassified' "
                         "if none fits. Return exactly one result per input ref; treat each item "
                         "independently.", accept=_accept_concept, actor=actor,
-            deadline_s=enrich_config.stage_deadline_s())   # MF-4 — bound the source-lock hold
+            deadline_s=enrich_config.stage_deadline_s(),   # MF-4 — bound the source-lock hold
+            ingestion_run_id=ingestion_run_id, dispatch_stage="enrich_concept",
+            dispatch_subjects=({h: _column_subject(by_hash[h]) for h in miss_hashes}
+                               if ingestion_run_id is not None else None))
         for h, concept in resolved.items():
             _cache_put(conn, "enrichment_concept", key_of[h], concept, _CONCEPT_CACHE_VERSION)
             result[h] = concept
@@ -383,7 +425,8 @@ def enrich_concepts(conn, rows: list[CanonicalRow], client: LLMClient, actor=Non
             raw = _call(conn, client, _TASK, "overlay_concept_v1", "overlay_concept",
                         {**meta_by_hash[h], "vocabulary": _CONCEPT_VOCABULARY}, "concept",
                         "Classify this column into the provided controlled concept vocabulary — choose "
-                        "the single best-fitting concept name, or 'unclassified' if none fits.", actor)
+                        "the single best-fitting concept name, or 'unclassified' if none fits.", actor,
+                        _single_ctx(ingestion_run_id, "enrich_concept", _column_subject(by_hash[h])))
             if raw is None:
                 continue   # failure/empty -> don't cache; retry next ingest (M3)
             # #5: single mode enforces the IDENTICAL response contract as batch (_accept_concept) — a
@@ -436,13 +479,17 @@ def suppressed_definition_hashes(rows: list[CanonicalRow],
 
 def draft_definitions(conn, rows: list[CanonicalRow], client: LLMClient, actor=None,
                       *, concepts: dict[str, str] | None = None,
-                      glossary: GlossaryUpload | None = None) -> dict[str, str]:
+                      glossary: GlossaryUpload | None = None,
+                      ingestion_run_id: str | None = None) -> dict[str, str]:
     """Draft a definition ONLY for columns with no declared one (R3). Keyed by (content_hash,
     assigned concept) so a concept change re-drafts (spec C6). Returns {content_hash: definition}.
 
     R5-3 (``glossary`` given): a sanitizer-SUPPRESSED blank (``definition_suppressed`` on the
     sidecar) is skipped — suppressed is not missing; it stays empty pending review, never silently
-    LLM-drafted. Non-glossary callers are byte-for-byte unchanged."""
+    LLM-drafted. Non-glossary callers are byte-for-byte unchanged.
+
+    ``ingestion_run_id`` (C5-T5): with it, every dispatch is attributed to the run + the exact
+    column subjects drafted (stage ``enrich_definition``); ``None`` is byte-for-byte today."""
     concepts = concepts or {}
     blank = {content_hash(r): r for r in rows if not r.definition}
     for h in suppressed_definition_hashes(rows, glossary):
@@ -466,7 +513,10 @@ def draft_definitions(conn, rows: list[CanonicalRow], client: LLMClient, actor=N
                         "independently: use only that item's table/column/type/concept; do not infer "
                         "relationships between items; do not reuse another item's facts; return "
                         "exactly one result per input ref.", accept=_accept_bounded(500), actor=actor,
-            deadline_s=enrich_config.stage_deadline_s())   # MF-4 — bound the source-lock hold
+            deadline_s=enrich_config.stage_deadline_s(),   # MF-4 — bound the source-lock hold
+            ingestion_run_id=ingestion_run_id, dispatch_stage="enrich_definition",
+            dispatch_subjects=({h: _column_subject(blank[h]) for h in misses}
+                               if ingestion_run_id is not None else None))
         for h, def_text in resolved.items():
             _cache_put(conn, "enrichment_definition", key_of[h], def_text, _DEFINITION_CACHE_VERSION)
             result[h] = def_text
@@ -480,7 +530,9 @@ def draft_definitions(conn, rows: list[CanonicalRow], client: LLMClient, actor=N
                                  {"table": row.table, "column": row.column, "type": row.type},
                                  "definition",
                                  "Draft a one-line business definition for this column.",
-                                 actor), 500)
+                                 actor,
+                                 _single_ctx(ingestion_run_id, "enrich_definition",
+                                             _column_subject(row))), 500)
         if drafted is None:
             continue   # failure / empty / over-long / list-stringified -> don't cache (M3/M9)
         _cache_put(conn, "enrichment_definition", key_of[h], drafted, _DEFINITION_CACHE_VERSION)
@@ -489,8 +541,12 @@ def draft_definitions(conn, rows: list[CanonicalRow], client: LLMClient, actor=N
 
 
 def classify_domains(conn, rows: list[CanonicalRow], client: LLMClient,
-                     actor=None) -> dict[str, str]:
-    """Classify each table's business domain (per-table), returning {table_name: domain}."""
+                     actor=None, *, ingestion_run_id: str | None = None) -> dict[str, str]:
+    """Classify each table's business domain (per-table), returning {table_name: domain}.
+
+    ``ingestion_run_id`` (C5-T5): with it, every dispatch is attributed to the run + the TABLE
+    subjects classified (stage ``enrich_domain``, ``field_names`` = the table's columns in the
+    request); ``None`` is byte-for-byte today."""
     by_table: dict[str, list[str]] = {}
     source = rows[0].source if rows else ""   # rows share one source (foreign ones are quarantined)
     for r in rows:
@@ -509,7 +565,11 @@ def classify_domains(conn, rows: list[CanonicalRow], client: LLMClient,
             instruction="For each item classify the table's business domain. Return exactly one "
                         "result per input ref; treat each table independently.",
             accept=_accept_bounded(64), actor=actor,
-            deadline_s=enrich_config.stage_deadline_s())   # MF-4 — bound the source-lock hold
+            deadline_s=enrich_config.stage_deadline_s(),   # MF-4 — bound the source-lock hold
+            ingestion_run_id=ingestion_run_id, dispatch_stage="enrich_domain",
+            dispatch_subjects=({t: _table_subject(source, t, cols)
+                                for t, cols in by_table.items()}
+                               if ingestion_run_id is not None else None))
         for table, dom in resolved.items():
             _cache_put(conn, "enrichment_domain", hash_of_table[table], dom, _DOMAIN_CACHE_VERSION)
             out[table] = dom
@@ -523,7 +583,9 @@ def classify_domains(conn, rows: list[CanonicalRow], client: LLMClient,
             continue
         domain = _bounded(_call(conn, client, _DOMAIN_TASK, "overlay_domain_v1", "overlay_domain",
                                 {"table": table, "columns": sorted(cols)}, "domain",
-                                "Classify this table's business domain.", actor), 64)
+                                "Classify this table's business domain.", actor,
+                                _single_ctx(ingestion_run_id, "enrich_domain",
+                                            _table_subject(source, table, cols))), 64)
         if domain is None:
             continue   # failure / empty / over-long / list-stringified -> don't cache (M3/M9)
         _cache_put(conn, "enrichment_domain", h, domain, _DOMAIN_CACHE_VERSION)
