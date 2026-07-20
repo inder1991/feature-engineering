@@ -16,7 +16,7 @@ the pinned versions + isolation level). Same committed state ⇒ same ``content_
 """
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from types import MappingProxyType
 
@@ -36,6 +36,7 @@ from featuregen.overlay.upload.field_resolution import (
 )
 from featuregen.overlay.upload.object_ref import parse_ref
 from featuregen.overlay.upload.source_profile import SOURCE_CAPABILITY_PROFILE_VERSION
+from featuregen.overlay.upload.templates import _Col, _load_columns
 from featuregen.projections.runner import _checkpoint_seq, _head_seq
 
 # The standard governed+hint field set the snapshot captures — mirrors the fields
@@ -206,6 +207,59 @@ class SnapshotContext:
         """The snapshotted facts for one ``(catalog_source, object_ref, field)`` — from memory, no
         DB hit. ``None`` when that field/ref was not captured (skipped or not requested)."""
         return self._index.get((catalog_source, object_ref, field))
+
+
+# ── Delivery H3b — the C0-snapshot column adapter for the planner ───────────────────────────────────
+# The planner's candidate discovery reads catalog columns via ``templates._load_columns`` — a LIVE
+# ``graph_node`` read. On the feature-generation path (REPEATABLE READ, C0-T2) the read is instead
+# served from THIS frozen capture, so the planner and downstream feature validation (C2–C4) observe
+# ONE torn-free committed catalog state — the SAME view the metadata :class:`SnapshotContext` above
+# seals. Risk-4: the capture is produced by the IDENTICAL ``_load_columns`` SELECT, so the ``_Col``
+# set + every binding-relevant attribute is byte-equal to a live read for the captured state; the
+# ingredient bindings, the sorted refs and the hashed material are unchanged, and ``physical_plan_id``
+# stays byte-identical. Additive: with no capture the planner keeps the live read (see
+# ``planner.declarations.build_compiler_context``).
+@dataclass(frozen=True, slots=True)
+class ColumnSnapshot:
+    """A frozen, in-memory capture of each in-scope catalog's read-scoped ``_load_columns`` result,
+    taken ONCE (ideally on the REPEATABLE READ feature-generation connection). ``columns(...)`` serves
+    those ``_Col`` rows from memory, so a ``graph_node`` mutation AFTER capture NEVER leaks into plan
+    discovery — the planner reads the snapshot, not live. Read scope (``roles``/``allowed_sensitivities``)
+    is baked in at capture and re-asserted on read (fail closed)."""
+
+    roles: tuple[str, ...]
+    _columns_by_catalog: Mapping[str, tuple[_Col, ...]]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "_columns_by_catalog",
+            MappingProxyType({k: tuple(v) for k, v in self._columns_by_catalog.items()}))
+
+    def columns(self, catalog_source: str, roles: Iterable[str]) -> list[_Col]:
+        """The frozen read-scoped columns for ``catalog_source`` — the drop-in replacement for a live
+        ``_load_columns(conn, catalog_source, roles)``. Fail CLOSED when the requested read scope differs
+        from the capture's: a different ``roles`` set would see a different sensitivity-filtered column
+        set, so serving the wrong scope would be a leak / a hash divergence. A catalog not in the
+        capture returns ``[]`` (it was outside the snapshot's scope)."""
+        if tuple(roles) != self.roles:
+            raise ValueError(
+                f"ColumnSnapshot captured for roles {self.roles!r} cannot serve "
+                f"roles {tuple(roles)!r} — read scope must match the capture")
+        return list(self._columns_by_catalog.get(catalog_source, ()))
+
+
+def capture_column_snapshot(
+    conn: DbConn, catalogs: Iterable[str], roles: Iterable[str] = ()
+) -> ColumnSnapshot:
+    """Capture the planner's frozen C0 column source: run the IDENTICAL read-scoped ``_load_columns``
+    SELECT once per catalog and freeze the result. Meant to run on the REPEATABLE READ feature-
+    generation connection (C0-T2) so the capture and the C0 metadata snapshot observe ONE torn-free
+    committed ``graph_node`` view. Because it delegates to ``_load_columns`` itself, the captured
+    ``_Col`` rows are byte-identical to a live read for the same state (Risk-4)."""
+    roles = tuple(roles)
+    return ColumnSnapshot(
+        roles=roles,
+        _columns_by_catalog={src: tuple(_load_columns(conn, src, roles)) for src in catalogs})
 
 
 def _assert_repeatable_read(conn: DbConn) -> str:

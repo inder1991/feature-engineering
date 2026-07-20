@@ -38,7 +38,10 @@ from featuregen.overlay.upload.feature_assist import (
     recommend_set,
     set_signals,
 )
-from featuregen.overlay.upload.feature_metadata_snapshot import build_metadata_snapshot
+from featuregen.overlay.upload.feature_metadata_snapshot import (
+    build_metadata_snapshot,
+    capture_column_snapshot,
+)
 from featuregen.overlay.upload.planner.contracts import (
     BindingPlanningResultV1,
     BindingPlanV1,
@@ -306,7 +309,14 @@ def _governed_cross_catalog_options(conn, *, target_entity: str, eligible_recipe
     tmpls = templates if templates is not None else ALL_TEMPLATES
     by_id = {t.id: t for t in tmpls}
     scope = resolve_catalog_scope(conn, roles=roles, target_entity=target_entity, now=now)
-    compile_ctx = build_compiler_context(conn, scope, roles, now)
+    # Delivery H3b: on the REPEATABLE READ feature-generation connection (C0-T2) the planner's candidate
+    # discovery reads columns from the C0 immutable snapshot — a frozen ``_load_columns`` capture over the
+    # SAME torn-free graph_node view the C0 metadata snapshot seals — never a fresh live read. Byte-
+    # identical to live ``_load_columns`` for the frozen state, so physical_plan_id is unchanged. A READ
+    # COMMITTED caller (direct gate1 unit tests) takes NO snapshot and keeps the live read (additive).
+    column_source = (capture_column_snapshot(conn, scope.authorized_catalog_sources, roles)
+                     if _on_repeatable_read(conn) else None)
+    compile_ctx = build_compiler_context(conn, scope, roles, now, column_source=column_source)
     budget = CompileBudget(remaining=MAX_COMPILES_PER_RUN,
                            deadline_monotonic=time.monotonic() + COMPILE_BUDGET.total_seconds(),
                            clock=time.monotonic)

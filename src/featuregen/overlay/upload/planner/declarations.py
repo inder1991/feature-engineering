@@ -18,6 +18,7 @@ from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime
 from types import MappingProxyType
+from typing import Protocol
 
 from featuregen.overlay.catalog_changes import drift_head_seq, drift_watermark
 from featuregen.overlay.config import OverlayConfig, overlay_config_from_env
@@ -1091,8 +1092,18 @@ def load_aggregation_declarations(
     return registry, frozenset(conflicts)
 
 
+class ColumnSource(Protocol):
+    """The C0-snapshot column adapter contract (Delivery H3b): serve the read-scoped ``_Col`` set for a
+    catalog from a FROZEN capture instead of a live ``graph_node`` query. ``feature_metadata_snapshot.
+    ColumnSnapshot`` is the production implementation; a caller with no snapshot passes ``None`` and
+    ``build_compiler_context`` keeps the live ``_load_columns`` read (additive, byte-identical)."""
+
+    def columns(self, catalog_source: str, roles: Iterable[str]) -> list[_Col]: ...
+
+
 def build_compiler_context(conn, scope: CatalogScopeV1, roles: Iterable[str],
-                           now: datetime) -> CompilerContext:
+                           now: datetime, *,
+                           column_source: ColumnSource | None = None) -> CompilerContext:
     """The PRODUCTION per-run context builder — batch-loads EVERYTHING the compiler reads ONCE
     per shadow run (the §11 guard: no per-plan re-query): the realizations, the active governed
     crossings, the READ-SCOPED columns, and the scope-start fingerprints the compile-end recheck
@@ -1101,7 +1112,14 @@ def build_compiler_context(conn, scope: CatalogScopeV1, roles: Iterable[str],
     loaded from the durable ``recipe_aggregation_declaration`` registry (H3a) — the ACTIVE
     declarations at ``now``, exactly one per (recipe_id, need_role) or a fail-closed conflict.
     Validate, never fabricate: an empty registry stays empty (no governed rows), keeping the
-    compiler byte-identical to the pre-registry behaviour."""
+    compiler byte-identical to the pre-registry behaviour.
+
+    Delivery H3b: on the feature-generation path a C0 immutable ``column_source`` is supplied —
+    candidate discovery then reads the FROZEN, torn-free ``graph_node`` view the C0 metadata snapshot
+    seals, not a fresh READ COMMITTED query. The capture is produced by the IDENTICAL ``_load_columns``
+    SELECT, so ``columns_by_catalog`` (and thus every ``physical_plan_id``) is byte-identical to the
+    live read. With ``column_source=None`` (gold/shadow/direct callers) the live ``_load_columns`` read
+    is unchanged."""
     roles = tuple(roles)
     catalogs = scope.authorized_catalog_sources
     agg_declarations, agg_conflicts = load_aggregation_declarations(conn, now)
@@ -1110,7 +1128,9 @@ def build_compiler_context(conn, scope: CatalogScopeV1, roles: Iterable[str],
             src: derive_catalog_realizations(conn, src).realizations for src in catalogs},
         active_bridges=active_bridges(conn),
         columns_by_catalog={
-            src: {col.object_ref: col for col in _load_columns(conn, src, roles)}
+            src: {col.object_ref: col
+                  for col in (column_source.columns(src, roles) if column_source is not None
+                              else _load_columns(conn, src, roles))}
             for src in catalogs},
         catalog_fingerprint_at_start={
             src: realization_fingerprint(conn, src) for src in catalogs},
