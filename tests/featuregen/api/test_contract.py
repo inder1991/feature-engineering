@@ -84,6 +84,31 @@ def test_draft_rejects_a_choice_not_in_the_considered_set_422(make_client):
     assert res.status_code == 422
 
 
+def test_confirm_maps_pointer_conflict_to_409(make_client, monkeypatch):
+    """M-a: a ``ContractPointerConflict`` raised by ``confirm_contract`` (the pointer CAS lost a race)
+    maps to HTTP 409 at the route, never escaping as an uncaught 500."""
+    import featuregen.api.routes.contract as contract_routes
+    from featuregen.overlay.upload.contract.govern import ContractPointerConflict
+
+    client = make_client(_fake())
+    upload_csv(client, "deposits", DEPOSITS_CSV)
+    intent_id = _intent_id(client)
+    dr = client.post("/contract/draft", json={
+        "intent_id": intent_id, "chosen_source": "anchor",
+        "chosen_option_id": "avg_balance_90d", "why": "best fit"}, headers=AUTH)
+    assert dr.status_code == 200
+    draft = dr.json()["draft"]
+    draft["intent_id"] = dr.json()["intent_id"]
+
+    def _raise_conflict(*args, **kwargs):
+        raise ContractPointerConflict("simulated pointer CAS loss")
+    monkeypatch.setattr(contract_routes, "confirm_contract", _raise_conflict)
+
+    cr = client.post("/contract/confirm", json=draft, headers=AUTH)
+    assert cr.status_code == 409, cr.text
+    assert "pointer conflict" in cr.json()["detail"]
+
+
 def test_confirm_rejects_a_leaky_draft_422(make_client):
     client = make_client(_fake())
     upload_csv(client, "deposits", DEPOSITS_CSV)

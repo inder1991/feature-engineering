@@ -16,6 +16,7 @@ from __future__ import annotations
 import psycopg
 import pytest
 
+from featuregen.aggregates.ids import mint_id
 from featuregen.overlay.upload.canonical import CanonicalRow
 from featuregen.overlay.upload.contract.author import ContractDraft
 from featuregen.overlay.upload.contract.govern import (
@@ -29,6 +30,16 @@ from featuregen.overlay.upload.contract.pointer_repair import (
 )
 from featuregen.overlay.upload.features import FeatureSpec, register_feature
 from featuregen.overlay.upload.graph import build_graph
+
+
+def _insert_legacy_contract(conn, feature_id, feature_name, *, version=1, contract_id=None):
+    """A PRE-H2b legacy contract: a raw ``contract`` row with NO ``contract_input_column`` lineage and NO
+    pointer (that table + the pointer postdate the legacy confirm). Used to exercise the repair/backfill
+    legacy paths without going through ``confirm_contract`` (which would write input rows + a pointer)."""
+    cid = contract_id or mint_id("contract")
+    conn.execute("INSERT INTO contract (contract_id, feature_id, feature_name, definition, version) "
+                 "VALUES (%s, %s, %s, %s, %s)", (cid, feature_id, feature_name, "Legacy def.", version))
+    return cid
 
 
 def _bank(conn, source="bank"):
@@ -113,6 +124,75 @@ def test_repair_holds_the_feature_advisory_lock(db, _dsn):
 def test_repair_unknown_feature_raises(db):
     with pytest.raises(KeyError):
         repair_feature_pointer(db, "feat_does_not_exist")
+
+
+def test_repair_on_legacy_zero_input_contract_preserves_compat_and_sets_pointer(db):
+    """I-1dm: a pre-H2b legacy contract has ZERO ``contract_input_column`` rows. Repair must set the
+    pointer but must NOT rebuild the compat projection from that empty set — doing so would NULL
+    ``grain_table``/``as_of_column`` and DELETE every ``feature_derives_from`` row with nothing to
+    re-insert, BLINDING the feature's real lineage. The existing compat rows stay intact (pointer-only,
+    mirroring backfill's legacy posture)."""
+    # a legacy feature with REAL compat lineage on `feature`/`feature_derives_from`, a contract row, but
+    # no input rows and no pointer.
+    fid = register_feature(db, FeatureSpec(
+        name="legacy_zero_input", description="legacy", grain_table="accounts",
+        as_of_column="posted_at", derives_from=[("bank", "public.accounts.balance")],
+        verification="DESIGN-CHECKED"))
+    cid = _insert_legacy_contract(db, fid, "legacy_zero_input")
+    assert _pointer(db, fid) is None
+    assert db.execute("SELECT count(*) FROM contract_input_column WHERE contract_id = %s",
+                      (cid,)).fetchone()[0] == 0
+
+    compat_before = db.execute("SELECT grain_table, as_of_column FROM feature WHERE feature_id = %s",
+                               (fid,)).fetchone()
+    derives_before = db.execute("SELECT catalog_source, object_ref FROM feature_derives_from "
+                                "WHERE feature_id = %s ORDER BY object_ref", (fid,)).fetchall()
+    assert compat_before == ("accounts", "posted_at") and derives_before   # legacy compat present
+
+    assert repair_feature_pointer(db, fid) is True          # pointer installed
+    assert _pointer(db, fid) == (cid, 1)                     # points at the legacy contract
+    # compat rows UNTOUCHED — NOT blinded by the empty input set.
+    assert db.execute("SELECT grain_table, as_of_column FROM feature WHERE feature_id = %s",
+                      (fid,)).fetchone() == compat_before
+    assert db.execute("SELECT catalog_source, object_ref FROM feature_derives_from WHERE feature_id = %s "
+                      "ORDER BY object_ref", (fid,)).fetchall() == derives_before
+
+
+def test_repair_and_backfill_deterministic_under_a_version_tie(db):
+    """I-2dm: per-feature version uniqueness is NOT schema-enforced (0961 keys on ``feature_name``, and
+    nothing ties ``contract.feature_name`` to ``feature_id``), so two contracts can tie at one version for
+    a feature_id. Repair AND backfill must resolve the tie IDENTICALLY on every run via the total order
+    ``ORDER BY version DESC, contract_id DESC``."""
+    fid = register_feature(db, FeatureSpec(name="tie_feat", description="tie"))
+    # two contracts, SAME feature_id + version, distinct feature_name (dodges 0961's unique) + distinct id.
+    _insert_legacy_contract(db, fid, "tie_feat", version=1, contract_id="contract_aaa_lo")
+    _insert_legacy_contract(db, fid, "tie_feat_alt", version=1, contract_id="contract_zzz_hi")
+    expected = "contract_zzz_hi"                             # contract_id DESC tie-break winner
+
+    assert repair_feature_pointer(db, fid) is True
+    assert _pointer(db, fid)[0] == expected                 # repair picks the tie-break winner
+    db.execute("DELETE FROM feature_current_contract WHERE feature_id = %s", (fid,))
+    backfill_feature_pointers(db)
+    assert _pointer(db, fid)[0] == expected                 # backfill picks the SAME winner
+
+
+def test_backfill_releases_advisory_locks_per_feature_not_held_to_commit(db):
+    """M-b: the sweep takes a SESSION advisory lock per feature and RELEASES it immediately, so a large
+    backfill never accumulates one advisory lock per feature until the single final commit ('out of shared
+    memory'). Two legacy features are created WITHOUT confirm (so no confirm-time xact lock confounds the
+    count); after the sweep the connection holds NO NET advisory locks — proof each per-feature lock was
+    released as the sweep ran (a per-feature xact lock would still be held here, un-committed)."""
+    def held():
+        return db.execute("SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' "
+                          "AND pid = pg_backend_pid()").fetchone()[0]
+
+    for name in ("legacy_lock_a", "legacy_lock_b"):
+        fid = register_feature(db, FeatureSpec(name=name, description="legacy"))
+        _insert_legacy_contract(db, fid, name)
+    before = held()
+    n = backfill_feature_pointers(db)
+    assert n >= 2                              # both legacy features (+ any leaked pointer-less) got one
+    assert held() == before                    # backfill released EVERY per-feature lock it took
 
 
 # ── BACKFILL ───────────────────────────────────────────────────────────────────────────────────────

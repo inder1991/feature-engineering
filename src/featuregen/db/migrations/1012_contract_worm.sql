@@ -5,15 +5,21 @@
 -- a mutation of the contract row. H2b made `confirm_contract` INSERT a NEW version each time (never an
 -- UPDATE), and a repo-wide grep found NO `UPDATE contract` / `DELETE FROM contract` / upsert-on-contract
 -- writer in `src/`, so this trigger only LOCKS IN the append-only posture the write path already follows
--- (it changes no behavior; it makes tampering physically impossible).
+-- (it changes no behavior; it makes tampering by the non-superuser application role impossible).
 --
 -- Mirrors the established write-once pattern (0900 events / 1009 validation log / 1011 input+dependency):
---   * a BEFORE UPDATE OR DELETE row trigger that RAISEs — a FOR EACH ROW trigger fires for EVERY role
---     (a superuser cannot bypass a trigger the way it bypasses grants), so row DML is physically blocked;
+--   * a BEFORE UPDATE OR DELETE row trigger that RAISEs — an ORIGIN (default) FOR EACH ROW trigger fires
+--     for EVERY role INCLUDING the owner/superuser under the normal `session_replication_role = origin`,
+--     so ordinary row DML is physically blocked. It is NOT an absolute bar against a superuser: a
+--     superuser CAN suppress ORIGIN row triggers by setting `session_replication_role = replica` (a
+--     session-local, superuser-only setting) or via `ALTER TABLE ... DISABLE TRIGGER`. That bypass is BY
+--     DESIGN — the test suite uses exactly this `replica`-scoped path to DELETE a handful of committed
+--     WORM rows during teardown (see the pointer-model / validation-projection race cleanups). The real
+--     production guarantee is this trigger PLUS the NON-superuser `featuregen_app` role (below) together;
 --   * a guarded REVOKE UPDATE, DELETE, TRUNCATE ON contract FROM featuregen_app — a FOR EACH ROW trigger
 --     does NOT fire on a statement-level TRUNCATE, so the revoke is the TRUNCATE control. It is a
 --     DEPLOYMENT control (production runs under the NON-superuser `featuregen_app` role; a superuser
---     bypasses grants), guarded by a role-exists check so it is a clean no-op in the superuser test
+--     bypasses grants too), guarded by a role-exists check so it is a clean no-op in the superuser test
 --     cluster where the role is absent. `feature_current_contract` is DELIBERATELY untouched — it is the
 --     MUTABLE CAS pointer (repointing to a new version is an in-place UPDATE), matching 1011.
 --

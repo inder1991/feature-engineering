@@ -48,6 +48,7 @@ from featuregen.overlay.upload.contract.gate1 import (
 )
 from featuregen.overlay.upload.contract.govern import (
     Contract,
+    ContractPointerConflict,
     ContractValidationError,
     confirm_contract,
     get_contract_detail,
@@ -714,6 +715,9 @@ def confirm(body: DraftIn, conn: _Conn, identity: _Identity) -> Contract:
                                 now=datetime.now(UTC), target_ref=target, intent_id=body.intent_id)
     except ContractValidationError as e:
         raise HTTPException(status_code=422, detail=str(e)) from e
+    except ContractPointerConflict as e:   # M-a: the pointer CAS lost a race -> conflict, not 500
+        raise HTTPException(status_code=409,
+                            detail="a contract pointer conflict occurred; re-fetch and retry") from e
     except psycopg.errors.UniqueViolation as e:   # concurrent double-confirm -> conflict, not 500
         raise HTTPException(status_code=409,
                             detail="a contract version conflict occurred; re-fetch and retry") from e

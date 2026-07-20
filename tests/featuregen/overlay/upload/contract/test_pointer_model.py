@@ -215,11 +215,16 @@ def _race_draft():
 
 @pytest.fixture
 def race_cleanup(_dsn):
-    """Delete the DELETABLE committed rows this race writes on teardown, so the shared session cluster
-    is not polluted (test_graph_build asserts an EMPTY graph_node; other suites read object_refs
-    unscoped). The write-once chain (contract / contract_input_column / validation events) CANNOT be
-    deleted — the 1011/1009 no-mutation triggers block it — so those private-scoped rows stay until the
-    ephemeral cluster tears down; no suite asserts a global count on them (verified by the full sweep)."""
+    """Delete EVERY committed row this race writes on teardown, so the shared session cluster is not
+    polluted (test_graph_build asserts an EMPTY graph_node; ``test_contract_live_cross_catalog`` asserts a
+    GLOBAL ``count(*) FROM contract == 0``). The write-once chain (contract / contract_input_column /
+    contract_metadata_dependency / validation events + requirements + state) is now WORM (1011/1012): its
+    BEFORE UPDATE/DELETE row triggers fire even for the superuser test role, so a plain DELETE RAISEs.
+    Suppress ORIGIN row triggers on THIS throwaway autocommit cleanup connection only
+    (``session_replication_role`` is superuser-only + session-local) so the SCOPED delete of just this
+    race's committed rows works — the exact pattern ``test_feature_validation_projection``'s race teardown
+    uses. FK-safe order: mutable children first, then the WORM child rows that reference the 2 contracts,
+    then the contracts, then the feature."""
     yield
     with psycopg.connect(_dsn, autocommit=True) as c:
         c.execute("DELETE FROM graph_edge WHERE catalog_source = %s", (_RACE_SRC,))
@@ -228,6 +233,21 @@ def race_cleanup(_dsn):
                   "(SELECT feature_id FROM feature WHERE name = %s)", (_RACE_FEATURE,))
         c.execute("DELETE FROM feature_derives_from WHERE feature_id IN "
                   "(SELECT feature_id FROM feature WHERE name = %s)", (_RACE_FEATURE,))
+        # The WORM chain: bypass the ORIGIN row triggers for this scoped cleanup only.
+        cids = "(SELECT contract_id FROM contract WHERE feature_name = %s)"
+        c.execute("SET session_replication_role = replica")
+        c.execute(f"DELETE FROM feature_validation_requirement WHERE contract_id IN {cids}",
+                  (_RACE_FEATURE,))
+        c.execute(f"DELETE FROM feature_contract_validation_state WHERE contract_id IN {cids}",
+                  (_RACE_FEATURE,))
+        c.execute(f"DELETE FROM feature_contract_validation_event WHERE contract_id IN {cids}",
+                  (_RACE_FEATURE,))
+        c.execute(f"DELETE FROM contract_input_column WHERE contract_id IN {cids}", (_RACE_FEATURE,))
+        c.execute(f"DELETE FROM contract_metadata_dependency WHERE contract_id IN {cids}",
+                  (_RACE_FEATURE,))
+        c.execute("DELETE FROM contract WHERE feature_name = %s", (_RACE_FEATURE,))
+        c.execute("DELETE FROM feature WHERE name = %s", (_RACE_FEATURE,))
+        c.execute("SET session_replication_role = origin")
 
 
 def test_concurrent_confirms_serialize_via_advisory_lock(_dsn, race_cleanup):

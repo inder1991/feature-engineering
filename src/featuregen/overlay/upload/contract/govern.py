@@ -78,7 +78,7 @@ def feature_contract_lock_key(feature_name: str) -> int:
         "big", signed=True)
 
 
-def _contract_input_items(draft: ContractDraft):
+def _contract_input_items(conn, draft: ContractDraft):
     """H2b — expand the RECONCILED draft into role-labelled input items (the immutable lineage a contract
     version was built from). Yields ``(source, graph_ref, logical_ref, physical_ref, role, decision_id,
     fact_id)``. Reflects the POST-reconciliation (Slice-3 server-authoritative grain/derives) values,
@@ -90,11 +90,12 @@ def _contract_input_items(draft: ContractDraft):
     only lineage is INCOMPLETE. decision_id/fact_id are NULL here: the draft carries no field-decision /
     governed-fact id yet (H2c reverse-dependency + H1b governed-support wire those)."""
     catalogs = {cs for cs, _ in draft.derives_pairs}
-    # grain_table / as_of_column are bare names on the draft; attribute them to the grain's catalog.
-    # Single-catalog: the one catalog. Cross-catalog: first catalog deterministically (the governed
-    # planner's grain-catalog is H1a/H3 — approximate here, never NULL since `source` is NOT NULL).
-    grain_source = (next(iter(catalogs)) if len(catalogs) == 1
-                    else (sorted(catalogs)[0] if catalogs else None))
+    # grain_table / as_of_column are bare names on the draft; attribute them to the catalog that ACTUALLY
+    # holds the grain-table node (single-catalog: the one catalog; cross-catalog: the source whose
+    # graph_node carries public.<grain_table>, else sorted[0]) — the SAME resolution the dependency-item
+    # build uses, so the input-lineage catalog_source matches the dependency row instead of a
+    # sorted(catalogs)[0] that mis-attributes a cross-catalog grain to the wrong source.
+    grain_source = _grain_catalog(conn, draft.grain_table, catalogs)
     # derives — every measure/source column the feature reads (B3 carried pairs).
     for cs, ref in draft.derives_pairs:
         yield (cs, ref, ref, ref, "derives", None, None)
@@ -121,7 +122,7 @@ def _insert_contract_input_columns(conn, contract_id: str, draft: ContractDraft)
     contract never collide. ON CONFLICT DO NOTHING makes the insert idempotent (a re-run is a no-op — the
     1011 no-mutation trigger blocks UPDATE/DELETE, NOT an INSERT that DO-NOTHINGs)."""
     for source, graph_ref, logical_ref, physical_ref, role, decision_id, fact_id in \
-            _contract_input_items(draft):
+            _contract_input_items(conn, draft):
         item_hash = canonical_hash({
             "contract_id": contract_id, "source": source, "graph_ref": graph_ref,
             "logical_ref": logical_ref, "physical_ref": physical_ref, "role": role,
