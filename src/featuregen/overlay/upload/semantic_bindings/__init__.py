@@ -14,6 +14,11 @@ D2 public surface:
 * :mod:`propose` — map a strong candidate → E1's ``entity_assignment`` / ``currency_binding`` DRAFT
   fact command (never a VERIFIED fact); link the proposal only after ``propose_fact`` succeeds.
 """
+from featuregen.overlay.upload.semantic_bindings.enrich import (
+    SEMANTIC_BINDINGS_TASK,
+    EnrichResult,
+    enrich_semantic_bindings,
+)
 from featuregen.overlay.upload.semantic_bindings.propose import (
     ProposeOutcome,
     propose,
@@ -53,7 +58,9 @@ __all__ = [
     "DEFAULT_CANDIDATE_CAP",
     "DISPOSITIONS",
     "REASON_CODES",
+    "SEMANTIC_BINDINGS_TASK",
     "ColumnRef",
+    "EnrichResult",
     "Evidence",
     "PassBColumn",
     "PassCIdentifier",
@@ -62,6 +69,7 @@ __all__ = [
     "StoreResult",
     "ValidationOutcome",
     "candidate_id_for",
+    "enrich_semantic_bindings",
     "link_proposal",
     "propose",
     "shortlist",
