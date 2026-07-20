@@ -64,7 +64,9 @@ from featuregen.overlay.upload.contract.intake import (
     submit_intent,
 )
 from featuregen.overlay.upload.contract.live_activation import (
+    CROSS_CATALOG_GROUNDING_NOT_ENABLED,
     LiveActivationNotReady,
+    cross_catalog_grounding_enabled,
     is_live_cross_catalog_enabled,
     require_live_ready,
 )
@@ -708,19 +710,45 @@ def confirm(body: DraftIn, conn: _Conn, identity: _Identity) -> Contract:
     # is_live guard. The cross-catalog-without-envelope 422 fires ONLY when the deployment is flag-on-and-
     # approved; FLAG-OFF a cross-catalog feature confirms via the permissive path, byte-identical to before.
     env = chosen.plan_envelope
+    # H1c — does the candidate's SELECTED inputs span more than one catalog_source? Computed from the
+    # SERVER-reconstructed chosen feature's ``derives_pairs`` (``_catalogs`` above — the same set H1b
+    # hashes), never the client body. A cross-catalog contract may be governed ONLY under the full
+    # interlock; anything short of it fails closed with ``CROSS_CATALOG_GROUNDING_NOT_ENABLED``.
+    cross_catalog = len(_catalogs) > 1
     if env is not None:
         if recheck_plan_freshness(conn, env, identity.role_claims) is not ReplayFreshness.current:
             raise HTTPException(status_code=409, detail="plan stale, regenerate")
+        # H1c fail-closed — a CROSS-catalog governed contract may be finalized ONLY while cross-catalog
+        # grounding is GENUINELY enabled for this deployment AT THE GOVERNING WRITE: the durable
+        # live-activation interlock (flag + PASS enablement + APPROVE + version vector) AND a valid signed
+        # 3C gate artifact must BOTH still hold. Activation can be revoked / the signed artifact can expire
+        # between draft and confirm, so re-check HERE (reusing the existing interlock + verifier) and refuse
+        # rather than finalize a cross-catalog contract whose enablement lapsed. A single-catalog governed
+        # plan needs no cross-catalog enablement — this sub-check is scoped to ``cross_catalog`` and is
+        # byte-identical for every single-catalog / flag-off envelope.
+        if cross_catalog and not cross_catalog_grounding_enabled(conn):
+            raise HTTPException(
+                status_code=422,
+                detail=f"{CROSS_CATALOG_GROUNDING_NOT_ENABLED}: live cross-catalog grounding is not "
+                       "enabled for this deployment (missing/stale activation or signed 3C gate artifact)")
         # 3C.2a fail-closed: a governed contract's persisted join_path is RE-DERIVED from the SERVER
         # envelope's ordered_path, NEVER the client body — the match-check above validates
         # name/derives_pairs/aggregation but NOT join_path, so a replay carrying a FABRICATED path (which
         # the freshness recheck still passes) would otherwise be persisted as the "governed" bridge. Scoped
         # strictly to the envelope-present case (single-catalog / flag-off drafts keep their client path).
         draft = replace(draft, join_path=tuple(_envelope_join_path(env.ordered_path)))
-    elif (is_live_cross_catalog_enabled(conn)
-          and len({cs for cs, _ref in chosen.derives_pairs}) > 1):
-        raise HTTPException(status_code=422,
-                            detail="cross-catalog feature requires a governed plan envelope")
+    elif cross_catalog:
+        # H1c fail-closed — a cross-catalog candidate with NO governed plan envelope can NEVER be governed,
+        # whatever the deployment state: it has no governed physical plan to author from, and the governing
+        # write must NEVER fall back to the permissive ``find_cross_catalog_path``. This closes the hole
+        # where a flag-off / unapproved multi-catalog confirm fell through to ``confirm_contract`` on the
+        # client-supplied permissive join_path. (Supersedes the prior is_live-gated 422: a no-envelope
+        # cross-catalog candidate is now refused unconditionally — the strongest fail-closed. The detail
+        # still names the governed plan envelope, the specific missing prerequisite.)
+        raise HTTPException(
+            status_code=422,
+            detail=f"{CROSS_CATALOG_GROUNDING_NOT_ENABLED}: cross-catalog feature requires a governed "
+                   "plan envelope")
     target = intent_target_ref(conn, body.intent_id)   # SERVER truth — never the client body
     # Delivery C0 Task 5: reload the SERVER snapshot lineage the considered set was authored against and
     # bind the governing write to it in the audit trail (a regulator can prove EXACTLY what catalog state

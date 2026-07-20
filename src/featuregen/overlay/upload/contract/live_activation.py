@@ -12,6 +12,7 @@ import uuid
 from datetime import datetime
 from typing import Any
 
+from featuregen.config import get_settings
 from featuregen.overlay.upload.planner.contract_gold import GOLD_SET_VERSION
 from featuregen.overlay.upload.planner.contracts import (
     ADDITIVITY_RULE_VERSION,
@@ -25,6 +26,11 @@ from featuregen.overlay.upload.planner.contracts import (
     TEMPORAL_RULE_VERSION,
 )
 from featuregen.overlay.upload.planner.shadow_report import EVALUATOR_VERSION
+
+# H1c — the umbrella rejection reason. A candidate whose SELECTED inputs span more than one
+# catalog_source may be governed ONLY while cross-catalog grounding is genuinely enabled (governed plan
+# envelope + this interlock + a valid signed 3C gate artifact). Any doubt → refuse with this reason.
+CROSS_CATALOG_GROUNDING_NOT_ENABLED = "CROSS_CATALOG_GROUNDING_NOT_ENABLED"
 
 
 class LiveActivationNotReady(RuntimeError):
@@ -127,3 +133,31 @@ def require_live_ready(conn) -> None:
         raise LiveActivationNotReady(
             "live cross-catalog is flagged on but not activation-approved for this deployment/version "
             "(missing / revoked / superseded / version-vector mismatch)")
+
+
+def signed_gate_artifact_valid() -> bool:
+    """H1c THIRD prong — a VALID signed 3C enablement-gate artifact. Verified with the ed25519
+    detached-signature machinery (``planner.signing.verify_report_file``): the artifact's canonical bytes
+    at ``FEATUREGEN_INTENT_GATE_ARTIFACT`` must carry a ``.sig`` sidecar that verifies against the trusted
+    public key ``FEATUREGEN_INTENT_GATE_PUBLIC_KEY``. Fail-CLOSED whenever the gate is DEPLOYED: a
+    configured public key with a missing / tampered / wrong-key / unreadable artifact → False. When NO
+    public key is configured this deployment has not opted into signed-gate enforcement, so the prong is
+    inert (the activation interlock alone governs) — keeping the flag-off path byte-identical and the
+    current production posture unchanged. Reuses the existing verifier; it is NEVER rebuilt here."""
+    if not get_settings().intent_gate_public_key:
+        return True   # signed-gate enforcement not deployed → prong inert (activation interlock governs)
+    artifact_path = os.environ.get("FEATUREGEN_INTENT_GATE_ARTIFACT")
+    if not artifact_path:
+        return False  # a trusted key IS configured but there is no artifact to verify → fail closed
+    from featuregen.overlay.upload.planner.signing import verify_report_file
+    return verify_report_file(artifact_path)   # ALL failure modes → False (fail-closed)
+
+
+def cross_catalog_grounding_enabled(conn) -> bool:
+    """H1c — the FULL runtime cross-catalog-grounding interlock the governing write consults for a
+    MULTI-catalog contract: the durable live-activation interlock (flag + persisted PASS enablement +
+    APPROVE decision + version vector — :func:`is_live_cross_catalog_enabled`) AND a valid signed 3C gate
+    artifact (:func:`signed_gate_artifact_valid`). BOTH must hold; fail closed on any doubt. The candidate
+    ALSO carrying a governed ``plan_envelope`` is asserted at the call site — this answers only "is live
+    cross-catalog grounding enabled for THIS deployment right now"."""
+    return is_live_cross_catalog_enabled(conn) and signed_gate_artifact_valid()
