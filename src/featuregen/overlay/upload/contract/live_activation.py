@@ -7,12 +7,15 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import uuid
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 from featuregen.config import get_settings
+from featuregen.overlay.upload.planner.cause import CATEGORY_MAP_VERSION
 from featuregen.overlay.upload.planner.contract_gold import GOLD_SET_VERSION
 from featuregen.overlay.upload.planner.contracts import (
     ADDITIVITY_RULE_VERSION,
@@ -26,11 +29,17 @@ from featuregen.overlay.upload.planner.contracts import (
     TEMPORAL_RULE_VERSION,
 )
 from featuregen.overlay.upload.planner.shadow_report import EVALUATOR_VERSION
+from featuregen.overlay.upload.planner.strata import STRATA_VERSION
+
+logger = logging.getLogger(__name__)
 
 # H1c — the umbrella rejection reason. A candidate whose SELECTED inputs span more than one
 # catalog_source may be governed ONLY while cross-catalog grounding is genuinely enabled (governed plan
 # envelope + this interlock + a valid signed 3C gate artifact). Any doubt → refuse with this reason.
 CROSS_CATALOG_GROUNDING_NOT_ENABLED = "CROSS_CATALOG_GROUNDING_NOT_ENABLED"
+
+# F2 — the ISO-8601 expiry keys the signed 3C artifact may carry (either name); enforced if present.
+_ARTIFACT_EXPIRY_KEYS = ("expires_at", "valid_until")
 
 
 class LiveActivationNotReady(RuntimeError):
@@ -135,22 +144,80 @@ def require_live_ready(conn) -> None:
             "(missing / revoked / superseded / version-vector mismatch)")
 
 
+def _expected_gate_versions() -> dict[str, str]:
+    """The CURRENT running-code versions the signed 3C artifact must match — the gate evaluator, the gold
+    set, the Layer-A category map, and the strata definition. A signature-valid but STALE artifact
+    (produced under superseded gate logic) fails closed on any mismatch (F2)."""
+    return {"evaluator_version": EVALUATOR_VERSION, "gold_set_version": GOLD_SET_VERSION,
+            "category_map_version": CATEGORY_MAP_VERSION, "strata_version": STRATA_VERSION}
+
+
+def _artifact_content_enforced(artifact_path: str) -> bool:
+    """F2 — after the detached signature verifies, ENFORCE the signed CONTENT (fail-closed on any doubt):
+    the gate must have PASSED (``gate_passed is True``); the gate/gold-set/category-map/strata versions
+    must match the CURRENT running code (a stale artifact is refused); and any embedded expiry
+    (``expires_at``/``valid_until``, ISO-8601) must be in the future. Signature validity ALONE is not
+    sufficient — a signed-but-failed / signed-but-stale / signed-but-expired artifact is REJECTED."""
+    try:
+        material = json.loads(Path(artifact_path).read_bytes())
+    except (OSError, ValueError) as exc:
+        logger.warning("3C gate artifact %s unreadable/malformed after signature verify (%s) — failing "
+                       "closed", artifact_path, exc)
+        return False
+    if material.get("gate_passed") is not True:
+        logger.warning("3C gate artifact %s did not PASS (gate_passed=%r) — refusing cross-catalog",
+                       artifact_path, material.get("gate_passed"))
+        return False
+    for field_name, want in _expected_gate_versions().items():
+        got = material.get(field_name)
+        if got != want:
+            logger.warning("3C gate artifact %s version mismatch: %s=%r, expected %r — failing closed",
+                           artifact_path, field_name, got, want)
+            return False
+    raw_expiry = next((material[k] for k in _ARTIFACT_EXPIRY_KEYS if material.get(k) is not None), None)
+    if raw_expiry is not None:
+        try:
+            expires = datetime.fromisoformat(str(raw_expiry))
+        except ValueError:
+            logger.warning("3C gate artifact %s has an unparseable expiry %r — failing closed",
+                           artifact_path, raw_expiry)
+            return False
+        if datetime.now(expires.tzinfo) >= expires:
+            logger.warning("3C gate artifact %s expired at %s — failing closed", artifact_path, raw_expiry)
+            return False
+    return True
+
+
 def signed_gate_artifact_valid() -> bool:
-    """H1c THIRD prong — a VALID signed 3C enablement-gate artifact. Verified with the ed25519
-    detached-signature machinery (``planner.signing.verify_report_file``): the artifact's canonical bytes
-    at ``FEATUREGEN_INTENT_GATE_ARTIFACT`` must carry a ``.sig`` sidecar that verifies against the trusted
-    public key ``FEATUREGEN_INTENT_GATE_PUBLIC_KEY``. Fail-CLOSED whenever the gate is DEPLOYED: a
-    configured public key with a missing / tampered / wrong-key / unreadable artifact → False. When NO
+    """H1c THIRD prong — a VALID + ENFORCED signed 3C enablement-gate artifact. The detached ed25519
+    signature is verified with ``planner.signing.verify_report_file`` (the artifact's canonical bytes at
+    ``FEATUREGEN_INTENT_GATE_ARTIFACT`` must carry a ``.sig`` sidecar verifying against the trusted public
+    key ``FEATUREGEN_INTENT_GATE_PUBLIC_KEY``); then (F2) the signed CONTENT is ENFORCED via
+    :func:`_artifact_content_enforced` — signature validity ALONE is NOT sufficient: ``gate_passed`` must
+    be true, the gate/gold-set/category-map/strata versions must match the running code, and any embedded
+    expiry must be in the future. Fail-CLOSED whenever the gate is DEPLOYED: a configured public key with a
+    missing / tampered / wrong-key / unreadable / FAILED / STALE / EXPIRED artifact → False.
+
+    DEPLOYMENT POSTURE (explicit + logged): enforcement is GATED ON A PUBLIC KEY BEING CONFIGURED. When NO
     public key is configured this deployment has not opted into signed-gate enforcement, so the prong is
-    inert (the activation interlock alone governs) — keeping the flag-off path byte-identical and the
-    current production posture unchanged. Reuses the existing verifier; it is NEVER rebuilt here."""
+    INERT (returns True — the durable live-activation interlock alone gates), keeping the flag-off path
+    byte-identical and the current production posture unchanged. When a key IS configured the artifact is
+    fully enforced. The chosen posture is LOGGED on every call so the inert path is never silent. Reuses
+    the existing verifier; it is NEVER rebuilt here."""
     if not get_settings().intent_gate_public_key:
+        logger.info("3C signed-gate enforcement NOT deployed (no FEATUREGEN_INTENT_GATE_PUBLIC_KEY) — "
+                    "prong inert; the live-activation interlock alone gates cross-catalog grounding")
         return True   # signed-gate enforcement not deployed → prong inert (activation interlock governs)
     artifact_path = os.environ.get("FEATUREGEN_INTENT_GATE_ARTIFACT")
     if not artifact_path:
+        logger.warning("3C signed-gate enforcement IS deployed (public key configured) but no artifact "
+                       "path (FEATUREGEN_INTENT_GATE_ARTIFACT) is set — failing closed")
         return False  # a trusted key IS configured but there is no artifact to verify → fail closed
     from featuregen.overlay.upload.planner.signing import verify_report_file
-    return verify_report_file(artifact_path)   # ALL failure modes → False (fail-closed)
+    if not verify_report_file(artifact_path):   # ALL signature failure modes → False (fail-closed)
+        logger.warning("3C gate artifact %s failed signature verification — failing closed", artifact_path)
+        return False
+    return _artifact_content_enforced(artifact_path)   # F2 — enforce gate_passed / versions / expiry
 
 
 def cross_catalog_grounding_enabled(conn) -> bool:

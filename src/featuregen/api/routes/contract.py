@@ -616,20 +616,22 @@ def draft(body: DraftReqIn, conn: _Conn, identity: _Identity, client: _LLM) -> d
     record_gate1_choice(conn, body.intent_id, chosen_source=body.chosen_source,
                         chosen_option_id=body.chosen_option_id, actor=identity.subject, why=body.why)
     target = intent_target_ref(conn, body.intent_id)   # server truth, not client-supplied
-    # 3C.2a — the live-activation boolean is resolved ONLY here (the route boundary) and threaded down.
-    # FLAG-OFF (default) → byte-identical: a cross-catalog feature draws the permissive
-    # find_cross_catalog_path path exactly as before. FLAG-ON fail-closed: a governed feature drafts its
-    # compiled plan envelope's path, rechecked for freshness under the REQUEST's roles (the set it compiled
-    # under — else it would spuriously drift); a drifted plan → 409 (regenerate, never a substitute path),
-    # and a cross-catalog feature with no governed envelope → 422 (regenerate under the governed planner).
-    is_live = is_live_cross_catalog_enabled(conn)
+    # 3C.2a authoring fail-closed: a governed feature drafts its compiled plan envelope's path, rechecked
+    # for freshness under the REQUEST's roles (the set it compiled under — else it would spuriously drift);
+    # a drifted plan → 409 (regenerate, never a substitute path). I-1 draft/confirm parity: a cross-catalog
+    # feature with NO governed envelope is refused at draft with the SAME umbrella reason confirm uses
+    # (``CROSS_CATALOG_GROUNDING_NOT_ENABLED``) whatever the deployment state, so a user never drafts
+    # something confirm will always reject; ``find_cross_catalog_path`` is never invoked from a draft (3C.2b).
     try:
         d = draft_contract(conn, feature, client, roles=identity.role_claims, target_ref=target,
-                           actor=identity, is_live=is_live)
+                           actor=identity)
     except StalePlan as e:
         raise HTTPException(status_code=409, detail="plan stale, regenerate") from e
     except CrossCatalogPlanRequired as e:
-        raise HTTPException(status_code=422, detail=str(e)) from e
+        raise HTTPException(
+            status_code=422,
+            detail=f"{CROSS_CATALOG_GROUNDING_NOT_ENABLED}: cross-catalog feature requires a governed "
+                   "plan envelope") from e
     d, unresolved = author_contract(conn, d, client, now=datetime.now(UTC), actor=identity)
     # Delivery C0 Task 5: carry the SERVER-persisted snapshot lineage forward (the run + immutable
     # snapshot the considered set was authored against). Reloaded from the server considered-set row —
@@ -710,11 +712,19 @@ def confirm(body: DraftIn, conn: _Conn, identity: _Identity) -> Contract:
     # is_live guard. The cross-catalog-without-envelope 422 fires ONLY when the deployment is flag-on-and-
     # approved; FLAG-OFF a cross-catalog feature confirms via the permissive path, byte-identical to before.
     env = chosen.plan_envelope
-    # H1c — does the candidate's SELECTED inputs span more than one catalog_source? Computed from the
-    # SERVER-reconstructed chosen feature's ``derives_pairs`` (``_catalogs`` above — the same set H1b
-    # hashes), never the client body. A cross-catalog contract may be governed ONLY under the full
-    # interlock; anything short of it fails closed with ``CROSS_CATALOG_GROUNDING_NOT_ENABLED``.
-    cross_catalog = len(_catalogs) > 1
+    # H1c — does the candidate SPAN more than one catalog_source? Computed from the SERVER-reconstructed
+    # chosen feature's ``derives_pairs`` (``_catalogs`` above — the same set H1b hashes), never the client
+    # body. F3: when a governed ``plan_envelope`` is present the span MUST also fold in the envelope's OWN
+    # participating catalogs (``catalog_sources``) and its ordered-path catalogs — a governed plan can
+    # BRIDGE >1 catalog while its derives_pairs read-set stays single-catalog, and that bridge is exactly
+    # the cross-catalog participation the interlock must gate. Union everything so ANY multi-catalog
+    # participation trips the interlock (fail-closed). A cross-catalog contract may be governed ONLY under
+    # the full interlock; anything short of it fails closed with ``CROSS_CATALOG_GROUNDING_NOT_ENABLED``.
+    span_catalogs = set(_catalogs)
+    if env is not None:
+        span_catalogs |= set(env.catalog_sources)
+        span_catalogs |= {seg.split(":", 1)[0] for seg in env.ordered_path if seg}
+    cross_catalog = len(span_catalogs) > 1
     if env is not None:
         if recheck_plan_freshness(conn, env, identity.role_claims) is not ReplayFreshness.current:
             raise HTTPException(status_code=409, detail="plan stale, regenerate")

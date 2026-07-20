@@ -1,4 +1,6 @@
 """Phase 3 — contract authoring: deterministic facts + LLM-authored definition (audited)."""
+import pytest
+
 from featuregen.intake.llm import FakeLLM, FakeResponse
 from featuregen.overlay.upload.canonical import CanonicalRow
 from featuregen.overlay.upload.contract.author import draft_contract
@@ -86,10 +88,11 @@ def test_draft_authors_the_join_path(db):
     assert step["from"] and step["to"] and "accounts" in (step["from"] + step["to"])
 
 
-def test_draft_authors_cross_catalog_join_path_via_entity(db):
-    # 3C.2a flag-off (is_live default False): byte-identical to pre-3C.2a — a feature spanning two catalogs
-    # with no governed envelope gets an entity-bridged permissive path via find_cross_catalog_path. The
-    # flag-on fail-closed (CrossCatalogPlanRequired) path is covered in test_draft_rebinding.
+def test_draft_cross_catalog_without_envelope_is_refused(db):
+    # I-1 draft/confirm parity: a feature spanning two catalogs with NO governed envelope is refused at
+    # draft UNCONDITIONALLY (matching confirm's CROSS_CATALOG_GROUNDING_NOT_ENABLED refusal), never an
+    # entity-bridged permissive path — else the user drafts something confirm will always reject.
+    from featuregen.overlay.upload.contract.author import CrossCatalogPlanRequired
     build_graph(db, "deposits", [
         CanonicalRow("deposits", "accounts", "cust_ref", "integer", entity="Customer"),
         CanonicalRow("deposits", "accounts", "balance", "numeric")])
@@ -101,6 +104,19 @@ def test_draft_authors_cross_catalog_join_path_via_entity(db):
                           derives_pairs=(("deposits", "public.accounts.balance"),
                                          ("cards", "public.card_accounts.spend")))
     client = FakeLLM(script={"overlay.contract.draft": FakeResponse(output={"definition": "x"})})
-    draft = draft_contract(db, feature, client)
-    assert any(step.get("kind") == "entity" and step.get("via") == "Customer"
-               for step in draft.join_path)   # accounts --entity(Customer)--> card_accounts
+    with pytest.raises(CrossCatalogPlanRequired):
+        draft_contract(db, feature, client)
+
+
+def test_as_of_column_deterministic_pick_across_two_as_of_columns(db):
+    # M-1: a grain table with TWO is_as_of columns must yield the SAME as-of column deterministically —
+    # _as_of_column is called at BOTH draft and confirm and its result folds into the binding_hash, so a
+    # nondeterministic LIMIT-1 pick would raise a SPURIOUS binding-drift 409. ORDER BY column_name pins it.
+    from featuregen.overlay.upload.contract.author import _as_of_column
+    build_graph(db, "bank", [
+        CanonicalRow("bank", "accounts", "account_id", "integer", is_grain=True),
+        CanonicalRow("bank", "accounts", "as_of_z", "date", as_of=True),
+        CanonicalRow("bank", "accounts", "as_of_a", "date", as_of=True)])
+    picked = _as_of_column(db, "accounts", "bank")
+    assert picked == "as_of_a"                        # the ORDER BY column_name minimum, not an arbitrary row
+    assert _as_of_column(db, "accounts", "bank") == picked    # stable across the draft/confirm re-call

@@ -16,6 +16,7 @@ chosen feature is overridden to a MULTI-catalog candidate so the span gate fires
 """
 from __future__ import annotations
 
+import json
 import os
 from datetime import UTC, datetime
 from pathlib import Path
@@ -34,8 +35,12 @@ from featuregen.overlay.upload.contract.live_activation import (
 )
 from featuregen.overlay.upload.feature_assist import FeatureIdea
 from featuregen.overlay.upload.planner import signing
+from featuregen.overlay.upload.planner.cause import CATEGORY_MAP_VERSION
+from featuregen.overlay.upload.planner.contract_gold import GOLD_SET_VERSION
 from featuregen.overlay.upload.planner.contracts import ReplayFreshness
 from featuregen.overlay.upload.planner.plan_envelope import PlanEnvelopeV1
+from featuregen.overlay.upload.planner.shadow_report import EVALUATOR_VERSION
+from featuregen.overlay.upload.planner.strata import STRATA_VERSION
 
 FLAG = "FEATUREGEN_INTENT_LIVE_CROSS_CATALOG"
 DEP = "FEATUREGEN_DEPLOYMENT_ID"
@@ -91,11 +96,22 @@ def _multi_env() -> PlanEnvelopeV1:
                        "head_seq": 1, "projection_checkpoint": 1}))
 
 
-def _configure_valid_artifact(monkeypatch, tmp_path) -> None:
-    """Write a signed 3C gate artifact + its detached ``.sig`` sidecar and point config at it. The
-    verifier is signature-over-bytes (content-agnostic; signing.py has its own artifact-shape tests), so
-    canonical stand-in bytes suffice to prove the PRONG gates enablement."""
-    report_bytes = b'{"gate_passed":true,"producer_cohort":"deploy-sha"}'
+def _gate_material(**overrides) -> bytes:
+    """The signed 3C gate artifact's canonical content — a PASSED gate whose gate/gold-set/category-map/
+    strata versions match the CURRENT running code (so the F2 content-enforcement admits it). ``overrides``
+    flip one field (gate_passed / a version / an expiry) to drive the fail-closed paths."""
+    material = {"gate_passed": True, "producer_cohort": "deploy-sha",
+                "evaluator_version": EVALUATOR_VERSION, "gold_set_version": GOLD_SET_VERSION,
+                "category_map_version": CATEGORY_MAP_VERSION, "strata_version": STRATA_VERSION}
+    material.update(overrides)
+    return json.dumps(material, sort_keys=True, separators=(",", ":")).encode()
+
+
+def _configure_valid_artifact(monkeypatch, tmp_path, **overrides) -> None:
+    """Write a signed 3C gate artifact + its detached ``.sig`` sidecar and point config at it. F2: the
+    prong now ENFORCES the signed content (gate_passed/versions/expiry), so the artifact carries real
+    fields (:func:`_gate_material`); ``overrides`` flip one to exercise the fail-closed paths."""
+    report_bytes = _gate_material(**overrides)
     p = tmp_path / "gate_artifact.json"
     p.write_bytes(report_bytes)
     signing.write_signature_sidecar(p, signing.sign_report(report_bytes, _PRIV_PEM))
@@ -304,3 +320,73 @@ def test_signed_prong_fail_closed_for_wrong_trusted_key(monkeypatch, tmp_path):
     _, other_pub = signing.generate_keypair()
     monkeypatch.setenv(KEY, other_pub)            # a DIFFERENT trusted key than the signer's
     assert signed_gate_artifact_valid() is False
+
+
+# ═══════════════ F2 — signature-valid but CONTENT must be enforced (gate_passed/version/expiry) ═══════════
+def test_signed_prong_fail_closed_for_failed_gate(monkeypatch, tmp_path):
+    """F2 — a signature-VALID artifact whose gate FAILED (`gate_passed=false`) is refused: the prong
+    enforces the verdict, not merely the signature."""
+    _configure_valid_artifact(monkeypatch, tmp_path, gate_passed=False)
+    assert signed_gate_artifact_valid() is False
+
+
+def test_signed_prong_fail_closed_for_version_mismatch(monkeypatch, tmp_path):
+    """F2 — a signature-VALID artifact signed under a STALE gate version (superseded gate logic) is
+    refused; the running-code versions must match."""
+    _configure_valid_artifact(monkeypatch, tmp_path, evaluator_version="0.0.0-stale")
+    assert signed_gate_artifact_valid() is False
+
+
+def test_signed_prong_fail_closed_for_expired_artifact(monkeypatch, tmp_path):
+    """F2 — a signature-VALID, PASSED artifact whose embedded expiry is in the PAST is refused."""
+    _configure_valid_artifact(monkeypatch, tmp_path, expires_at="2000-01-01T00:00:00+00:00")
+    assert signed_gate_artifact_valid() is False
+
+
+def test_signed_prong_true_for_future_expiry(monkeypatch, tmp_path):
+    """F2 — a PASSED, current-version, not-yet-expired artifact is admitted (positive control)."""
+    _configure_valid_artifact(monkeypatch, tmp_path, expires_at="2999-01-01T00:00:00+00:00")
+    assert signed_gate_artifact_valid() is True
+
+
+# ═══════════════ F3 — span must include the envelope's OWN catalogs, not just the read-set ═══════════════
+# derives_pairs read-set spans ONE catalog, but the governed envelope (_multi_env) BRIDGES deposits+cards.
+SINGLE_READSET = (("deposits", "public.accounts.balance"), ("deposits", "public.accounts.spend"))
+
+
+def test_envelope_spanning_two_catalogs_trips_interlock_even_if_readset_single(
+        make_client, conn, monkeypatch):
+    """F3 — the span must fold in the ENVELOPE's own participating catalogs, not just the derives_pairs
+    read-set. A governed plan that BRIDGES deposits+cards while its read-set reads only deposits columns
+    must STILL be subjected to the cross-catalog interlock (refused when not enabled) — otherwise a
+    multi-catalog governed feature slips through the span check. Pre-fix, ``cross_catalog`` came from the
+    single-catalog read-set alone (False), skipping the interlock; post-fix the envelope's catalogs union
+    in and the interlock fires."""
+    monkeypatch.delenv(FLAG, raising=False)   # cross-catalog grounding NOT enabled
+    monkeypatch.setattr("featuregen.api.routes.contract.recheck_plan_freshness",
+                        lambda *a, **k: ReplayFreshness.current)
+    client = make_client(_fake())
+    upload_csv(client, "deposits", DEPOSITS_CSV)
+    intent_id = _intent_id(client)
+    dr = client.post("/contract/draft", json={
+        "intent_id": intent_id, "chosen_source": "anchor",
+        "chosen_option_id": "avg_balance_90d", "why": ""}, headers=AUTH)
+    assert dr.status_code == 200, dr.text
+    draft = dr.json()["draft"]
+    draft["intent_id"] = intent_id
+    draft["derives_pairs"] = [list(p) for p in SINGLE_READSET]   # read-set is single-catalog
+
+    def _chosen(*a, **k):
+        return FeatureIdea(
+            draft["feature_name"], "", list(draft["derives_from"]), draft["aggregation"], None,
+            derives_pairs=SINGLE_READSET, plan_envelope=_multi_env(),   # envelope spans TWO catalogs
+            origin="governed_planner", path_authority="governed_cross_catalog")
+
+    monkeypatch.setattr("featuregen.api.routes.contract.chosen_feature", _chosen)
+    calls = _permissive_recorder(monkeypatch)
+
+    cr = client.post("/contract/confirm", json=draft, headers=AUTH)
+    assert cr.status_code == 422, cr.text
+    assert CROSS_CATALOG_GROUNDING_NOT_ENABLED in cr.json()["detail"]
+    assert "not enabled" in cr.json()["detail"]   # the envelope-present enablement-lapsed message
+    assert calls == []
