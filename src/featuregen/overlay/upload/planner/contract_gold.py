@@ -174,6 +174,22 @@ def _gold_set_hash() -> str:
 GOLD_SET_HASH = _gold_set_hash()
 
 
+def _isolate_agg_declarations(ctx, case: GoldCase):
+    """M-4 hermeticity: ``build_compiler_context`` LOADS the mutable production aggregation registry
+    (``recipe_aggregation_declaration``), so a gold case — whose ``case_id`` doubles as its plan's
+    ``recipe_id`` — could be SHADOWED by a production declaration sharing that id, or inherit a production
+    cardinality CONFLICT that ``dataclasses.replace(agg_declarations=...)`` alone would NOT clear (the
+    conflict set survives the replace). Assert no id collision, then replace with ONLY this case's
+    declarations AND an EMPTY ``agg_declaration_conflicts`` — done UNCONDITIONALLY (even for an empty
+    ``case.agg``) so every gold compile is hermetic regardless of production registry state."""
+    prod_recipes = ({k[0] for k in ctx.agg_declarations}
+                    | {k[0] for k in ctx.agg_declaration_conflicts})
+    assert case.case_id not in prod_recipes, (
+        f"gold case_id {case.case_id!r} collides with a production recipe_id — namespace the gold case")
+    return dataclasses.replace(ctx, agg_declarations=dict(case.agg),
+                               agg_declaration_conflicts=frozenset())
+
+
 def run_gold_case(conn, case: GoldCase, *, seed: Callable[[object], None] = _seed
                   ) -> tuple[str, ExpectedVerdict, ActualVerdict]:
     """Seed the fixture, run the REAL compile pipeline over the case's plan, and return the
@@ -183,8 +199,7 @@ def run_gold_case(conn, case: GoldCase, *, seed: Callable[[object], None] = _see
     seed(conn)
     scope = resolve_catalog_scope(conn, roles=(), target_entity="customer", now=_GOLD_NOW)
     ctx = build_compiler_context(conn, scope, (), _GOLD_NOW)
-    if case.agg:
-        ctx = dataclasses.replace(ctx, agg_declarations=dict(case.agg))
+    ctx = _isolate_agg_declarations(ctx, case)
     plan = _build_plan(ctx, case)
     compiled = compile_contract(conn, ctx, plan, _TEMPLATE,
                                 base_envelope=_envelope(conn, scope, case.case_id, "customer"))
@@ -213,8 +228,7 @@ def compile_gold_case(conn, case: GoldCase, *, seed: Callable[[object], None] = 
     seed(conn)
     scope = resolve_catalog_scope(conn, roles=(), target_entity="customer", now=_GOLD_NOW)
     ctx = build_compiler_context(conn, scope, (), _GOLD_NOW)
-    if case.agg:
-        ctx = dataclasses.replace(ctx, agg_declarations=dict(case.agg))
+    ctx = _isolate_agg_declarations(ctx, case)
     plan = _build_plan(ctx, case)
     compiled = compile_contract(conn, ctx, plan, _TEMPLATE,
                                 base_envelope=_envelope(conn, scope, case.case_id, "customer"))

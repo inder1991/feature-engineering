@@ -68,6 +68,17 @@ _UNRESOLVED_AT_CONFIRM = "UNRESOLVED_AT_CONFIRM"
 # one deterministic item, mirroring how the projector touches an edge in both orientations.
 _EDGE_PREFIX = "joinedge:"
 
+# H3 fix — a GOVERNED-SEGMENT dependency (a governed cross-catalog plan's bridge fact / realization) is
+# ALSO not a graph_node: its ``ordered_path`` ref is a bridge fact KEY (``bfk_*``, the PK of
+# ``entity_bridge_edge``) or a realization ID (``{catalog}:{from_key}->{to_key}``). Recording those raw as
+# graph_node deps made ``_catalog_state_signature`` return ``MISSING`` at confirm → the ``confirm_dependency_hash``
+# poison → the contract read as permanently drifted (no governed contract could ever serve a promoted stamp).
+# They are recorded under these markers instead, which ``_catalog_state_signature`` routes to the RIGHT
+# authoritative state (the bridge's VERIFIED sanction / the realization's cardinality) — mirroring the
+# ``joinedge:`` pattern: RESOLVES at confirm (no poison, promotable) and CHANGES on revocation/drift.
+_BRIDGEFACT_PREFIX = "bridgefact:"
+_REALIZATION_PREFIX = "realization:"
+
 
 def join_edge_marker(from_ref: str, to_ref: str) -> str:
     """The ``logical_ref`` marker for the join EDGE between two column endpoints (C-1). Endpoints are
@@ -75,6 +86,23 @@ def join_edge_marker(from_ref: str, to_ref: str) -> str:
     step names — the read gate then hashes the edge's CURRENT state (see ``_join_edge_signature``)."""
     a, b = sorted((from_ref.lower(), to_ref.lower()))
     return f"{_EDGE_PREFIX}{a}|{b}"
+
+
+def bridge_fact_marker(fact_key: str) -> str:
+    """H3 fix — the ``logical_ref`` marker for a governed cross-catalog plan's BRIDGE-FACT segment. The
+    read gate hashes the bridge's CURRENT VERIFIED sanction in ``entity_bridge_edge`` (see
+    :func:`_bridge_fact_signature`): a dropped / revoked bridge (its row DELETEd) ⟶ ``MISSING`` ⟶ drift.
+    ``fact_key`` is the bridge fact's key (the ``entity_bridge_edge`` PK), an opaque id — matched EXACTLY."""
+    return f"{_BRIDGEFACT_PREFIX}{fact_key}"
+
+
+def realization_marker(realization_id: str) -> str:
+    """H3 fix — the ``logical_ref`` marker for a governed plan's intra-catalog REALIZATION segment. The
+    read gate hashes the realization's CURRENT cardinality + governed authority from ``graph_edge`` (see
+    :func:`_realization_signature`): a cardinality retype, an approval revocation, or the edge's drop ⟶ a
+    changed / ``MISSING`` signature ⟶ drift. ``realization_id`` is ``{catalog}:{from_key}->{to_key}`` (the
+    deriver's id); it is hashed verbatim as the item's identity and parsed for the state lookup."""
+    return f"{_REALIZATION_PREFIX}{realization_id}"
 
 # The graph_node VALUE columns that make an item load-bearing. Deliberately EXCLUDES the volatile
 # ``*_decision_id`` link columns (a benign re-upload re-mints them, which would be false drift) — only
@@ -106,12 +134,19 @@ def _catalog_state_signature(conn: DbConn, catalog_source: str, object_ref: str 
 
     C-1: an ``object_ref`` carrying the ``joinedge:`` marker is a JOIN EDGE dependency — its state comes
     from ``graph_edge`` (existence + approved-join status/authority/cardinality), not a graph_node.
+    H3 fix: a ``bridgefact:`` marker is a governed cross-catalog BRIDGE segment (state from the VERIFIED
+    ``entity_bridge_edge`` sanction) and a ``realization:`` marker is a governed intra-catalog REALIZATION
+    segment (cardinality + governed authority from ``graph_edge``) — neither is a graph_node.
     M-d: a deterministic ``ORDER BY`` guards the case-insensitive match against nondeterministic picks
     when two case-variant sibling nodes coexist for one ``lower(object_ref)``."""
     if not object_ref:
         return _MISSING
     if object_ref.startswith(_EDGE_PREFIX):
         return _join_edge_signature(conn, catalog_source, object_ref)
+    if object_ref.startswith(_BRIDGEFACT_PREFIX):
+        return _bridge_fact_signature(conn, object_ref)
+    if object_ref.startswith(_REALIZATION_PREFIX):
+        return _realization_signature(conn, catalog_source, object_ref)
     with conn.cursor(row_factory=dict_row) as cur:
         cur.execute(
             "SELECT kind, data_type, declared_type, definition, is_grain, is_as_of, concept, domain, "
@@ -149,6 +184,59 @@ def _join_edge_signature(conn: DbConn, catalog_source: str, marker: str):
     if row is None:
         return _MISSING
     return {"edge": True, "cardinality": row["cardinality"], "authority": row["authority"],
+            "approved_join_status": row["approved_join_status"], "has_approved_fact": row["has_fact"]}
+
+
+def _bridge_fact_signature(conn: DbConn, marker: str):
+    """H3 fix (I-3) — the CURRENT state of the governed cross-catalog BRIDGE a plan segment crossed, keyed
+    by its bridge fact key (the ``bridgefact:`` marker body). The bridge's source of truth is the overlay
+    fact stream projected into ``entity_bridge_edge`` (VERIFIED only); a reject / expire / stale DELETEs
+    the row (``bridge_projection.demote_bridge_edges``). Captures existence + the VERIFIED ``status`` +
+    the projected endpoints + entity: a REVOKED bridge ⟶ the row is gone ⟶ ``MISSING`` (the recomputed
+    hash can no longer match the live hash stored at confirm) ⟶ the read gate downgrades. A live VERIFIED
+    bridge RESOLVES to a real dict at confirm, so the item hash is NOT poisoned — the governed contract is
+    PROMOTABLE. ``fact_key`` is the ``entity_bridge_edge`` PK (global, not catalog-scoped) — matched exactly."""
+    fact_key = marker[len(_BRIDGEFACT_PREFIX):]
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            "SELECT status, entity_id, left_catalog_source, left_object_ref, "
+            "right_catalog_source, right_object_ref FROM entity_bridge_edge WHERE fact_key = %s",
+            (fact_key,))
+        row = cur.fetchone()
+    if row is None:
+        return _MISSING
+    return {"bridge": True, "status": row["status"], "entity_id": row["entity_id"],
+            "left": f"{row['left_catalog_source']}.{row['left_object_ref']}",
+            "right": f"{row['right_catalog_source']}.{row['right_object_ref']}"}
+
+
+def _realization_signature(conn: DbConn, catalog_source: str, marker: str):
+    """H3 fix (I-1) — the CURRENT cardinality + governed authority of an intra-catalog REALIZATION a plan
+    segment used, keyed by its realization id (``realization:{catalog}:{from_key}->{to_key}``). A
+    realization is DERIVED from a declared ``graph_edge`` join (``catalog_realizations.derive_catalog_
+    realizations``), so the read gate re-reads that edge's CURRENT cardinality / authority / approved-join
+    status: a cardinality retype, an approval revocation (VERIFIED→display_only), or the edge's drop ⟶ a
+    changed / ``MISSING`` signature ⟶ drift. It RESOLVES to a real dict at confirm (no poison), so the
+    governed contract is PROMOTABLE. The realization IDENTITY is preserved because the marker (``logical_ref``)
+    is itself part of the item hash; this reads only the load-bearing cardinality/authority state.
+    Case-insensitive match with a deterministic ``ORDER BY`` (mirrors ``_join_edge_signature``)."""
+    rid = marker[len(_REALIZATION_PREFIX):]
+    _catalog, _, keypair = rid.partition(":")          # strip the leading catalog (== catalog_source)
+    from_key, _, to_key = keypair.partition("->")
+    if not from_key or not to_key:
+        return _MISSING                                # malformed / legacy id — fail closed (poisonable)
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            "SELECT cardinality, authority, approved_join_status, "
+            "(approved_join_fact_key IS NOT NULL) AS has_fact FROM graph_edge "
+            "WHERE catalog_source = %s AND kind = 'joins' "
+            "AND lower(from_ref) = lower(%s) AND lower(to_ref) = lower(%s) "
+            "ORDER BY from_ref, to_ref LIMIT 1",
+            (catalog_source, from_key, to_key))
+        row = cur.fetchone()
+    if row is None:
+        return _MISSING
+    return {"realization": True, "cardinality": row["cardinality"], "authority": row["authority"],
             "approved_join_status": row["approved_join_status"], "has_approved_fact": row["has_fact"]}
 
 

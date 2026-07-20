@@ -23,6 +23,7 @@ from featuregen.overlay.upload.planner.contracts import (
     BindingPlanV1,
     PhysicalReadSetV1,
     ReplayFreshness,
+    make_binding_plan,
 )
 from featuregen.overlay.upload.planner.declarations import (
     build_compiler_context,
@@ -62,11 +63,11 @@ def _template_for(recipe_id: str, templates: Sequence[Template] | None) -> Templ
 def revalidate_governed_plan(
         conn, envelope: PlanEnvelopeV1, roles: Iterable[str], now: datetime | None = None, *,
         templates: Sequence[Template] | None = None,
-) -> tuple[BindingPlanV1, PhysicalReadSetV1] | None:
+) -> tuple[BindingPlanV1, PhysicalReadSetV1]:
     """REBUILD the governed plan the envelope pins, against the CURRENT catalog state, and require it
     to reproduce the SAME ids + a ``current`` freshness verdict. Returns ``(plan, physical_read_set)``
-    for the caller to persist as role-labelled lineage, ``None`` when the plan is NOT rebuildable, or
-    raises :class:`GovernedPlanDrift` on genuine drift.
+    for the caller to persist as role-labelled lineage, or raises :class:`GovernedPlanDrift` on genuine
+    drift OR when the plan is NOT rebuildable (I-2: FAIL CLOSED, never a silent skip that promotes).
 
     The rebuild replays the planner EXACTLY as ``build_considered_set`` did: resolve the recipe's
     ``Template``, resolve the catalog scope at the envelope's ``target_entity``, build the batched
@@ -74,35 +75,48 @@ def revalidate_governed_plan(
     the governed plan; its ``physical_plan_id`` (physical identity) and ``contract_id`` (declaration
     identity / ``planner_declaration_id``) MUST equal the envelope's pinned ids, and
     ``recheck_plan_freshness`` MUST be ``current`` — else the plan drifted (a column dropped/retyped, a
-    bridge revoked, a governance declaration changed). No compile_ctx column snapshot is captured: the
-    read is CURRENT-state under the confirm's own transaction (repeatable-read gives it a consistent
-    view), so a snapshot that changed since generation genuinely rebuilds to a different id → drift.
+    bridge revoked, a governance declaration changed).
 
-    NOT REBUILDABLE → ``None`` (defense-in-depth, not the sole gate): a legacy envelope with no
-    ``target_entity`` (pre-H3c), or a ``recipe_id`` absent from THIS deployment's registry. Neither can
-    reach a live governed confirm in production — the planner only emits registry recipes at a known
-    grain, and a registry rollback that removed the recipe is a CODE change the live-activation VERSION
-    VECTOR already fails closed on (RECIPE_REGISTRY_VERSION). The route's own ``recheck_plan_freshness``
-    + cross-catalog interlock still gate catalog/activation drift; the stable-id rebuild is additive."""
+    M-2b — CONCURRENCY: ``/contract/confirm`` runs on a READ COMMITTED connection (deliberately, MF-2),
+    NOT repeatable read. No compile_ctx column snapshot is captured: the read is CURRENT-state, so a
+    snapshot that changed since generation genuinely rebuilds to a different id → drift. A commit by a
+    concurrent writer BETWEEN this freshness check and the rebuild can therefore surface as a transient
+    ``GovernedPlanDrift`` (→ 409) even though the plan is intact; the 409 is RETRYABLE and the regenerate
+    resettles on the newly-committed state — acceptable, and strictly fail-closed (never a stale promote).
+
+    I-2 — NOT REBUILDABLE FAILS CLOSED (raise, not skip): a legacy envelope with no ``target_entity``
+    (pre-H3c) or a ``recipe_id`` absent from THIS deployment's registry cannot be rebuilt, so its pinned
+    ids can neither be re-verified nor its read set recorded — a confirm on it would PROMOTE unverified
+    provenance with NO lineage. The freshness gate is applied FIRST (before these guards) so it covers
+    ALL governed confirm paths — the route AND any direct ``confirm_contract`` caller — and then a
+    not-rebuildable plan is refused (``GovernedPlanDrift`` → 409, regenerate). Neither case reaches a live
+    governed confirm in production (the planner only emits registry recipes at a known grain; a registry
+    rollback is a CODE change the live-activation version vector already fails closed on), so refusing is
+    the strongest fail-closed with no legitimate-flow cost."""
     now = now or datetime.now(UTC)
     roles = tuple(roles)
     pinned = envelope.physical_plan_id
-    if envelope.target_entity is None:
-        logger.info("governed plan %s has no target_entity (legacy envelope) — skipping the confirm-time "
-                    "rebuild; the route freshness recheck + interlock still gate", pinned)
-        return None
-    template = _template_for(envelope.recipe_id, templates)
-    if template is None:
-        logger.info("governed plan %s recipe %r is not in the running registry — skipping the "
-                    "confirm-time rebuild (registry drift is gated by the version-vector interlock)",
-                    pinned, envelope.recipe_id)
-        return None
 
-    # Freshness FIRST (cheap, fingerprint-based): a drifted / unverifiable / incompatible plan is
-    # rejected before the (heavier) rebuild — mirrors the draft-time StalePlan gate.
+    # Freshness FIRST (cheap, fingerprint-based) — applied on EVERY governed confirm path BEFORE the
+    # rebuildability guards, so a drifted plan is rejected even when it is not rebuildable (I-2: the
+    # freshness gate is never skipped by an early return). Mirrors the draft-time StalePlan gate.
     fresh = recheck_plan_freshness(conn, envelope, roles)
     if fresh is not ReplayFreshness.current:
         raise GovernedPlanDrift(f"plan freshness is {fresh.value}", pinned)
+
+    # NOT REBUILDABLE → FAIL CLOSED (I-2): cannot re-verify the pinned ids nor record read-set lineage,
+    # so REFUSE rather than let the confirm promote unverified provenance.
+    if envelope.target_entity is None:
+        logger.warning("governed plan %s has no target_entity (legacy envelope) — NOT rebuildable; "
+                       "failing closed (no unverified promote)", pinned)
+        raise GovernedPlanDrift("legacy envelope has no target_entity — not rebuildable", pinned)
+    template = _template_for(envelope.recipe_id, templates)
+    if template is None:
+        logger.warning("governed plan %s recipe %r is not in the running registry — NOT rebuildable; "
+                       "failing closed (registry drift is also gated by the version-vector interlock)",
+                       pinned, envelope.recipe_id)
+        raise GovernedPlanDrift(
+            f"recipe {envelope.recipe_id!r} absent from the running registry — not rebuildable", pinned)
 
     scope = resolve_catalog_scope(conn, roles=roles, target_entity=envelope.target_entity, now=now)
     compile_ctx = build_compiler_context(conn, scope, roles, now)
@@ -124,10 +138,22 @@ def revalidate_governed_plan(
         raise GovernedPlanDrift(
             f"planner_declaration_id drifted (rebuilt {plan.contract_id})", pinned)
 
-    # RISK-4 assertion: an UNCHANGED snapshot MUST reproduce the same physical id — this reproduction
-    # is the revalidation. (Reaching here already proves equality; the assert documents the invariant
-    # and fails loud if a future refactor ever lets the rebuild mint a different id for the same input.)
-    assert plan.physical_plan_id == envelope.physical_plan_id, "rebuild must reproduce the physical id"
+    # RISK-4 assertion (M-2a — a REAL check, not the old tautology): re-MINT the physical_plan_id from the
+    # rebuilt plan's OWN material through the canonical constructor and require it to reproduce the same id.
+    # The equality above only compares two already-minted ids; this independently proves minting is
+    # DETERMINISTIC for identical input (mint twice → same id) and fails loud if a future refactor ever
+    # makes ``make_binding_plan`` fold non-deterministic material into the id. COMPARE only — no id material
+    # changes (RISK-4 stays clean); ``candidate_role`` is reset post-construction and is NOT hashed.
+    reminted = make_binding_plan(
+        recipe_id=plan.recipe_id, target_entity=plan.target_entity, catalog_source=plan.catalog_source,
+        ingredient_bindings=plan.ingredient_bindings, path_segments=plan.path_segments,
+        resolution_status=plan.resolution_status, path_resolution_status=plan.path_resolution_status,
+        primary_reason_code=plan.primary_reason_code, reason_codes=plan.reason_codes,
+        safety=plan.safety, preference_rank=plan.preference_rank,
+        preference_reasons=plan.preference_reasons, candidate_role=plan.candidate_role)
+    if reminted.physical_plan_id != plan.physical_plan_id:
+        raise GovernedPlanDrift(
+            f"physical_plan_id minting is not deterministic (re-minted {reminted.physical_plan_id})", pinned)
 
     read_set = build_physical_read_set(compile_ctx, plan)
     return plan, read_set

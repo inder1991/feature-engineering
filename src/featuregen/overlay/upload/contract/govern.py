@@ -25,10 +25,12 @@ from featuregen.overlay.upload.contract.governed_plan import revalidate_governed
 from featuregen.overlay.upload.contract.invalidation import (
     _MISSING,
     _catalog_state_signature,
+    bridge_fact_marker,
     confirm_dependency_hash,
     dependencies_drifted,
     has_dependency_rows,
     join_edge_marker,
+    realization_marker,
 )
 from featuregen.overlay.upload.contract.review import validate_minimum
 from featuregen.overlay.upload.features import (
@@ -40,7 +42,7 @@ from featuregen.overlay.upload.features import (
     get_feature,
     register_feature,
 )
-from featuregen.overlay.upload.planner.contracts import ColumnRole, PhysicalReadSetV1
+from featuregen.overlay.upload.planner.contracts import ColumnRole, PhysicalReadSetV1, SegmentKind
 from featuregen.overlay.upload.planner.plan_envelope import PlanEnvelopeV1
 from featuregen.overlay.upload.validation_requirements import DEFAULT_SCHEMA_VERSION, schema_for
 
@@ -204,6 +206,28 @@ def _contract_dependency_items(conn, draft: ContractDraft):
     # join-path — each step's TARGET ref plus (C-1) its FROM-side column and the clearing join EDGE.
     for step in draft.join_path:
         step_catalog = step.get("catalog_source") or grain_source or ""
+        # H3 fix (I-1/I-3) — a GOVERNED-SEGMENT step (the route's envelope→ordered_path rewrite) carries a
+        # bridge fact key (``governed_bridge``) or a realization id (``*_realization``/``semantic_rollup``),
+        # NEITHER a graph_node. Record it as the matching TYPED marker so the read gate hashes the RIGHT
+        # authoritative state (the bridge's VERIFIED sanction / the realization's cardinality) — RESOLVES at
+        # confirm (no ``_UNRESOLVED_AT_CONFIRM`` poison → the governed contract is promotable) and CHANGES on
+        # bridge revocation / join-key drift. Previously the raw ``bfk_*`` / realization id was recorded as a
+        # graph_node ⟶ MISSING ⟶ poison ⟶ every governed contract permanently downgraded (the vacuous C-1).
+        if step.get("kind") == "governed_segment":
+            ref = step.get("ref")
+            if not ref:
+                continue                       # a ``direct_catalog`` source prefix — no bridge/realization
+            segment_kind = step.get("segment_kind")
+            if segment_kind == str(SegmentKind.governed_bridge):
+                marker = bridge_fact_marker(ref)
+            elif segment_kind in (str(SegmentKind.intra_catalog_realization),
+                                  str(SegmentKind.semantic_rollup)):
+                marker = realization_marker(ref)
+            else:
+                marker = ref                   # an unknown ref-carrying kind — record raw (fail-closed:
+                #                                unresolvable ⟶ poison ⟶ not promotable, never silently uncovered)
+            yield (step_catalog, marker, marker, None, None, None)
+            continue
         to_ref = step.get("ref") or step.get("to")
         if to_ref:
             yield (step_catalog, to_ref, to_ref, None, None, None)
@@ -212,8 +236,7 @@ def _contract_dependency_items(conn, draft: ContractDraft):
             yield (step_catalog, from_ref, from_ref, None, None, None)
         # C-1 — the clearing join EDGE (single-catalog column-level 'join' step). Recorded under a
         # marker so the read gate hashes the graph_edge's existence + approved-join state: dropping the
-        # edge or losing the VERIFIED approval downgrades. (Cross-catalog governed_segment steps carry
-        # no from/to edge; their ref rides the target-ref item above, poison-failed if unresolvable.)
+        # edge or losing the VERIFIED approval downgrades.
         if step.get("kind") == "join" and from_ref and to_ref:
             marker = join_edge_marker(from_ref, to_ref)
             yield (step_catalog, marker, marker, None, None, None)
@@ -249,13 +272,15 @@ def _insert_contract_metadata_dependencies(conn, contract_id: str, draft: Contra
 # structural column becomes a contract_input_column AND a contract_metadata_dependency row, so the H2c
 # read gate (which hashes the dependency's CURRENT graph_node state) downgrades on drift of ANY of them.
 # The ColumnRole → lineage-role map; the pure 'ingredient' facet is NOT re-persisted (H2b writes it as
-# the 'derives' rows).
+# the 'derives' rows). M-1: only the roles ``build_physical_read_set`` ACTUALLY emits are mapped —
+# join_key / bridge_key (both drift-relevant join keys) + temporal_anchor. The read set never emits
+# ``aggregation_weight`` / ``aggregation_component`` (weight/ordering are DECLARATION concerns folded into
+# the contract_id, not physical read columns), so those labels were dead and are removed (YAGNI); a role
+# with no mapping is skipped by ``_read_set_lineage_items``, so re-adding one later is additive.
 _READ_SET_ROLE_LABEL: dict[ColumnRole, str] = {
     ColumnRole.join_key: "join_key",
     ColumnRole.bridge_key: "join_key",
     ColumnRole.temporal_anchor: "anchor",
-    ColumnRole.aggregation_weight: "weight",
-    ColumnRole.aggregation_component: "ordering",
 }
 
 
@@ -478,12 +503,13 @@ def confirm_contract(conn, draft: ContractDraft, *, actor, roles: Iterable[str] 
         recipe_id = plan_envelope.recipe_id
         physical_plan_id = plan_envelope.physical_plan_id           # the pinned physical identity
         planner_declaration_id = plan_envelope.contract_id          # the pinned declaration identity
-        # REBUILD + revalidate (stable ids + freshness). None = not rebuildable (legacy/registry drift,
-        # gated elsewhere); a tuple = verified → its read set feeds the role-labelled lineage; a genuine
-        # drift RAISES GovernedPlanDrift (no partial writes — this runs before the contract INSERT).
-        rebuilt = revalidate_governed_plan(conn, plan_envelope, roles, now, templates=templates)
-        if rebuilt is not None:
-            _plan, governed_read_set = rebuilt
+        # REBUILD + revalidate (stable ids + freshness). Returns the verified (plan, read_set) or FAILS
+        # CLOSED (I-2): a genuine drift OR a not-rebuildable plan (legacy envelope / registry drift) both
+        # RAISE GovernedPlanDrift — never a silent None that would promote pinned ids UNVERIFIED with no
+        # read-set lineage. Runs BEFORE the contract INSERT, so a raise means no partial writes. Its read
+        # set feeds the role-labelled lineage below.
+        _plan, governed_read_set = revalidate_governed_plan(
+            conn, plan_envelope, roles, now, templates=templates)
     pairs = draft.derives_pairs   # B3: resolved (catalog_source, object_ref) carried on the draft
     # B4: ONE feature per feature_name — re-confirm reuses + refreshes the feature (no proliferation),
     # so drift impact/freshness point at a single live feature, not N duplicates.

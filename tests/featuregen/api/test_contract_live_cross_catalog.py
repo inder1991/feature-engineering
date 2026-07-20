@@ -452,6 +452,13 @@ def test_confirm_persists_server_envelope_join_path_not_client_forged(make_clien
     monkeypatch.setattr("featuregen.api.routes.contract.chosen_feature", _governed_chosen)
     monkeypatch.setattr("featuregen.api.routes.contract.recheck_plan_freshness",
                         lambda *a, **k: ReplayFreshness.current)
+    # This test's SUBJECT is the route's join_path server-derivation (routes/contract.py, BEFORE
+    # confirm_contract), not the confirm-time plan rebuild — its ``_fresh_envelope`` is a synthetic single-
+    # catalog envelope (no target_entity, recipe not in the registry) that is intentionally not rebuildable.
+    # Stub the rebuild so the confirm reaches the persist step (H3 I-2 otherwise fail-closes a not-rebuildable
+    # plan). ``(None, None)`` = no read-set lineage to persist, exactly as the pre-H3 skip did here.
+    monkeypatch.setattr("featuregen.overlay.upload.contract.govern.revalidate_governed_plan",
+                        lambda *a, **k: (None, None))
     # the client forges a join_path that does NOT match the server envelope's ordered_path
     forged = [{"kind": "governed_segment", "segment": "FORGED:evil:bridge",
                "catalog_source": "FORGED", "segment_kind": "evil", "ref": "bridge"}]
