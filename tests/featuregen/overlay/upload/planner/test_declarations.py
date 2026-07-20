@@ -26,6 +26,7 @@ from featuregen.overlay.upload.planner.declarations import (
     CompileBudget,
     CompilerContext,
     PathPositionV1,
+    aggregation_declaration_content_hash,
     audit_envelope,
     bridge_fingerprint,
     build_compiler_context,
@@ -36,6 +37,7 @@ from featuregen.overlay.upload.planner.declarations import (
     compile_contract,
     compile_temporal,
     hop_physical_cardinality,
+    load_aggregation_declarations,
     recipe_content_hash,
     resolve_additivity,
     revalidate_freshness,
@@ -1761,3 +1763,156 @@ def test_build_compiler_context_batches_the_authorized_scope_and_is_immutable(db
     plan = _c8_plan(ctx, _binding("amount", "public.transactions.amount"))
     out = _c8_compile(db, ctx, plan, _c8_template())
     assert out.contract_resolution_status is c.ContractResolutionStatus.resolved
+
+
+# ─── H3a: the durable, versioned recipe aggregation-declaration registry (migration 1013) ─────
+# build_compiler_context now LOADS agg_declarations from recipe_aggregation_declaration — the ACTIVE
+# declarations at `now`, EXACTLY ONE per (recipe_id, need_role) or a fail-closed conflict. These
+# tests use the `rate` measure (monetary_rate -> non_additive): undeclared it fails
+# aggregation_strategy_missing; a declared order-safe `max` resolves it. Risk-4: the declaration
+# changes ONLY the aggregation-compile outcome / contract_id, NEVER the physical_plan_id.
+
+def _insert_declaration(db, recipe_id, need_role, fn, *, version=1, declaration_id=None,
+                        effective_from=None, effective_to=None, authority="governed:test",
+                        content_hash=None):
+    """Insert one durable declaration row (the governed registry write; there is no in-code writer
+    API in H3a, so tests seed rows directly). content_hash defaults to the real hash so the loader's
+    integrity check passes; a caller may override it to exercise the tamper path."""
+    declaration_id = declaration_id or f"ad_{recipe_id}_{need_role}_{version}"
+    effective_from = effective_from if effective_from is not None else _NOW - timedelta(days=1)
+    fn_value = fn.value if isinstance(fn, c.AggregationFunction) else fn
+    ch = content_hash if content_hash is not None else aggregation_declaration_content_hash(
+        recipe_id, need_role, fn_value, version, authority)
+    db.execute(
+        "INSERT INTO recipe_aggregation_declaration (declaration_id, recipe_id, need_role, "
+        "function, declaration_version, authority, provenance, effective_from, effective_to, "
+        "content_hash) VALUES (%s, %s, %s, %s, %s, %s, NULL, %s, %s, %s)",
+        (declaration_id, recipe_id, need_role, fn_value, version, authority,
+         effective_from, effective_to, ch))
+    return declaration_id
+
+
+def _rate_plan_and_template(ctx):
+    plan = _c8_plan(ctx, _binding("rate", "public.transactions.rate", concept="monetary_rate"))
+    t = _c8_template((Need("source_key", "account_id", join_role=JoinRole.SOURCE_ENTITY_KEY),
+                      Need("rate", "monetary_rate")))
+    return plan, t
+
+
+def test_load_aggregation_declarations_active_one_conflict_and_window(db):
+    # An active declaration loads; a second overlapping active for the SAME key is a CONFLICT (never
+    # in the registry); a declaration outside its [from, to) window is not loaded at all.
+    _insert_declaration(db, "r1", "rate", c.AggregationFunction.max, version=1, declaration_id="a1")
+    _insert_declaration(db, "r1", "amount", c.AggregationFunction.sum, version=1, declaration_id="a2",
+                        effective_from=_NOW + timedelta(days=1))   # not yet active (future window)
+    registry, conflicts = load_aggregation_declarations(db, _NOW)
+    assert registry == {("r1", "rate"): c.AggregationFunction.max}   # amount's future row excluded
+    assert conflicts == frozenset()
+    # a SECOND overlapping active declaration for ("r1","rate") -> the key becomes a conflict
+    _insert_declaration(db, "r1", "rate", c.AggregationFunction.count, version=2, declaration_id="a3")
+    registry2, conflicts2 = load_aggregation_declarations(db, _NOW)
+    assert ("r1", "rate") not in registry2         # never a silent pick
+    assert ("r1", "rate") in conflicts2
+
+
+def test_build_compiler_context_loads_registry_and_resolves_previously_unresolved(db):
+    # The production builder loads the registry: a non_additive rate that fails undeclared with an
+    # EMPTY registry RESOLVES once a valid order-safe declaration is active.
+    _c8_seed(db)
+    _fresh(db)
+    plan, t = _rate_plan_and_template(_ctx(db, "core"))
+    # before: empty registry -> unresolved_aggregation_declaration / aggregation_strategy_missing
+    empty_out = _c8_compile(db, _ctx(db, "core"), plan, t)
+    assert empty_out.declaration_status is c.DeclarationStatus.unresolved_aggregation_declaration
+    assert empty_out.contract_primary_reason_code is c.ReasonCode.aggregation_strategy_missing
+    # after: a durable `max` declaration is active -> the production builder loads it and resolves
+    _insert_declaration(db, "r1", "rate", c.AggregationFunction.max)
+    scope = resolve_catalog_scope(db, roles=(), target_entity="account", now=_NOW)
+    ctx = build_compiler_context(db, scope, (), _NOW)
+    assert ctx.agg_declarations[("r1", "rate")] is c.AggregationFunction.max
+    assert ctx.agg_declaration_conflicts == frozenset()
+    out = _c8_compile(db, ctx, plan, t)
+    assert out.declaration_status is c.DeclarationStatus.resolved
+    assert out.contract_resolution_status is c.ContractResolutionStatus.resolved
+
+
+def test_two_overlapping_active_declarations_fail_compile_conflicting(db):
+    # ONE-ACTIVE-OR-CONFLICT: two overlapping active declarations for one key make the compile FAIL
+    # conflicting (aggregation_declaration_conflict) — never a silent pick of either function.
+    _c8_seed(db)
+    _fresh(db)
+    _insert_declaration(db, "r1", "rate", c.AggregationFunction.max, version=1, declaration_id="c1")
+    _insert_declaration(db, "r1", "rate", c.AggregationFunction.min, version=2, declaration_id="c2")
+    scope = resolve_catalog_scope(db, roles=(), target_entity="account", now=_NOW)
+    ctx = build_compiler_context(db, scope, (), _NOW)
+    assert ("r1", "rate") in ctx.agg_declaration_conflicts
+    assert ("r1", "rate") not in ctx.agg_declarations
+    plan, t = _rate_plan_and_template(ctx)
+    out = _c8_compile(db, ctx, plan, t)
+    assert out.declaration_status is c.DeclarationStatus.unresolved_aggregation_declaration
+    assert out.contract_primary_reason_code is c.ReasonCode.aggregation_declaration_conflict
+    assert c.ReasonCode.aggregation_declaration_conflict in out.contract_reason_codes
+    (hop,) = out.hop_aggregations
+    (stage,) = hop.ingredient_stages
+    assert stage.validation is c.AggregationValidation.incompatible   # not sound, not a pick
+
+
+def test_declaration_outside_effective_window_stays_unresolved(db):
+    # EFFECTIVE INTERVAL respected: a declaration whose [from, to) window does NOT contain `now` is
+    # not loaded — the recipe still fails undeclared, exactly as with no declaration at all.
+    _c8_seed(db)
+    _fresh(db)
+    _insert_declaration(db, "r1", "rate", c.AggregationFunction.max,
+                        effective_from=_NOW - timedelta(days=2),
+                        effective_to=_NOW - timedelta(days=1))       # closed BEFORE now
+    scope = resolve_catalog_scope(db, roles=(), target_entity="account", now=_NOW)
+    ctx = build_compiler_context(db, scope, (), _NOW)
+    assert ctx.agg_declarations == {} and ctx.agg_declaration_conflicts == frozenset()
+    plan, t = _rate_plan_and_template(ctx)
+    out = _c8_compile(db, ctx, plan, t)
+    assert out.declaration_status is c.DeclarationStatus.unresolved_aggregation_declaration
+    assert out.contract_primary_reason_code is c.ReasonCode.aggregation_strategy_missing
+
+
+def test_registry_declaration_does_not_change_physical_plan_id(db):
+    # RISK-4: physical_plan_id is the FROZEN physical-PATH material (make_binding_plan); aggregation
+    # is a separate compile step feeding contract_id, NOT the physical path id. A recipe that gains
+    # a registry declaration keeps the SAME physical_plan_id — only its aggregation outcome /
+    # contract_id move.
+    _c8_seed(db)
+    _fresh(db)
+    plan, t = _rate_plan_and_template(_ctx(db, "core"))
+    minted_pid = plan.physical_plan_id
+    empty_out = _c8_compile(db, _ctx(db, "core"), plan, t)
+    assert empty_out.physical_plan_id == minted_pid                  # unchanged through compilation
+    assert empty_out.declaration_status is c.DeclarationStatus.unresolved_aggregation_declaration
+
+    _insert_declaration(db, "r1", "rate", c.AggregationFunction.max)
+    scope = resolve_catalog_scope(db, roles=(), target_entity="account", now=_NOW)
+    ctx = build_compiler_context(db, scope, (), _NOW)
+    declared_plan, _ = _rate_plan_and_template(ctx)
+    assert declared_plan.physical_plan_id == minted_pid             # the declaration did NOT move it
+    declared_out = _c8_compile(db, ctx, declared_plan, t)
+    assert declared_out.physical_plan_id == minted_pid             # still unchanged through compile
+    # the declaration changed ONLY the aggregation outcome (and thus contract_id), never the path id
+    assert declared_out.declaration_status is c.DeclarationStatus.resolved
+    assert declared_out.contract_id != empty_out.contract_id
+
+
+def test_empty_registry_is_byte_identical_to_pre_registry_compiler(db):
+    # EMPTY-REGISTRY BYTE-IDENTITY: with no rows, the loader returns ({}, frozenset()) and the
+    # production builder's compile is IDENTICAL, field for field, to the pre-registry empty-dict
+    # path (the test constructor). Nothing about wiring the loader in perturbs the empty case.
+    _c8_seed(db)
+    _fresh(db)
+    assert load_aggregation_declarations(db, _NOW) == ({}, frozenset())
+    scope = resolve_catalog_scope(db, roles=(), target_entity="account", now=_NOW)
+    built = build_compiler_context(db, scope, (), _NOW)
+    assert dict(built.agg_declarations) == {} and built.agg_declaration_conflicts == frozenset()
+    plan, t = _rate_plan_and_template(built)
+    built_out = _c8_compile(db, built, plan, t)
+    old_out = _c8_compile(db, _ctx(db, "core"), plan, t)
+    fields = ("physical_plan_id", "declaration_status", "contract_resolution_status",
+              "contract_primary_reason_code", "contract_reason_codes", "contract_id")
+    assert {f: getattr(built_out, f) for f in fields} == {f: getattr(old_out, f) for f in fields}
+    assert built_out.declaration_status is c.DeclarationStatus.unresolved_aggregation_declaration

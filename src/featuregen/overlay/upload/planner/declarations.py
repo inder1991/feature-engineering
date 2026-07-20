@@ -80,8 +80,9 @@ from featuregen.overlay.upload.taxonomy.entity_relationships import (
 from featuregen.overlay.upload.templates import Template, _Col, _load_columns
 from featuregen.projections.runner import _checkpoint_seq
 
-# The injectable declared-function registry: ``(recipe_id, need_role) ->`` the recipe's DECLARED
-# aggregation function. EMPTY in production until a governed declaration source exists (validate,
+# The declared-function registry: ``(recipe_id, need_role) ->`` the recipe's DECLARED aggregation
+# function. Populated in production from the durable ``recipe_aggregation_declaration`` registry
+# (H3a) by ``load_aggregation_declarations``; empty until that table has active rows (validate,
 # never fabricate — an absent key is an honest ``undeclared``, never a guessed function).
 AggregationDeclarationRegistry = Mapping[tuple[str, str], AggregationFunction]
 
@@ -104,6 +105,10 @@ class CompilerContext:
     roles: tuple[str, ...]
     now: datetime
     agg_declarations: AggregationDeclarationRegistry
+    # H3a: the (recipe_id, need_role) keys whose durable registry has >= 2 ACTIVE declarations —
+    # a governance CONFLICT the compiler must fail (never a silent pick). Empty in production until
+    # a conflict exists; empty-registry runs are byte-identical to the pre-H3a compiler.
+    agg_declaration_conflicts: frozenset[tuple[str, str]] = frozenset()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "realizations_by_catalog",
@@ -115,6 +120,8 @@ class CompilerContext:
                            MappingProxyType(dict(self.catalog_fingerprint_at_start)))
         object.__setattr__(self, "catalog_stamps", MappingProxyType(dict(self.catalog_stamps)))
         object.__setattr__(self, "agg_declarations", MappingProxyType(dict(self.agg_declarations)))
+        object.__setattr__(self, "agg_declaration_conflicts",
+                           frozenset(self.agg_declaration_conflicts))
 
 
 @dataclass(slots=True)
@@ -573,10 +580,16 @@ def compile_aggregation(
             continue    # no fan-in at/after its position — carried at grain, nothing to validate
         card = hop[3]
         provenance = resolve_additivity(ctx, b)
-        declared = ctx.agg_declarations.get((plan.recipe_id, b.need_role))
+        key = (plan.recipe_id, b.need_role)
+        declared = ctx.agg_declarations.get(key)
         codes: list[ReasonCode] = []
         missing: tuple[str, ...] = ()
-        if card is None:
+        if key in ctx.agg_declaration_conflicts:
+            # H3a: >= 2 active durable declarations for this key — a governance conflict, never a
+            # silent pick. Fails the stage regardless of additivity/cardinality (fail-closed).
+            validation = AggregationValidation.incompatible
+            codes.append(ReasonCode.aggregation_declaration_conflict)
+        elif card is None:
             validation = AggregationValidation.undeclared   # can't validate an unknown fan-in
             codes.append(ReasonCode.physical_cardinality_unavailable)
         else:
@@ -925,6 +938,7 @@ _AGGREGATION_BLOCKING_CODES = frozenset({
     ReasonCode.semi_additive_temporal_strategy_missing,
     ReasonCode.additivity_source_conflict,
     ReasonCode.physical_cardinality_unavailable,
+    ReasonCode.aggregation_declaration_conflict,
 })
 
 
@@ -1019,16 +1033,78 @@ def compile_contract(conn, ctx: CompilerContext, plan: BindingPlanV1, template: 
                    contract_id=make_contract_id(enriched, resolved_at_compilation=ctx.now))
 
 
+def aggregation_declaration_content_hash(
+        recipe_id: str, need_role: str, function: str, declaration_version: int,
+        authority: str) -> str:
+    """The immutable content hash pinned on each durable declaration row (H3a) — over the
+    identity-bearing fields (recipe_id, need_role, function, declaration_version, authority).
+    Verified on read: a superuser-bypassed row mutation that changes any of these no longer matches
+    the stored hash and is dropped fail-closed. Deterministic; fixed field order."""
+    material = f"{recipe_id}|{need_role}|{function}|{declaration_version}|{authority}"
+    return "ad_" + hashlib.sha256(material.encode()).hexdigest()[:16]
+
+
+def load_aggregation_declarations(
+        conn, now: datetime,
+) -> tuple[dict[tuple[str, str], AggregationFunction], frozenset[tuple[str, str]]]:
+    """Load the ACTIVE recipe aggregation declarations from the durable ``recipe_aggregation_
+    declaration`` registry (H3a) — the rows whose ``[effective_from, effective_to)`` interval
+    contains ``now`` (``effective_to`` NULL = open). Returns ``(registry, conflicts)``:
+
+      * ``registry`` — ``(recipe_id, need_role) -> AggregationFunction`` for every key with EXACTLY
+        ONE active declaration; this is the ONLY source of a declared function (the compiler never
+        infers one from the column).
+      * ``conflicts`` — the keys with a CONFLICT: two or more overlapping active declarations, OR a
+        row whose stored ``content_hash`` no longer matches its fields (tamper) / an unparseable
+        function. A conflicted key is NEVER placed in the registry — never a silent pick; the
+        compile fails it via ``ReasonCode.aggregation_declaration_conflict``.
+
+    Deterministic (ORDER BY recipe_id, need_role, declaration_version); the ONE new sanctioned read,
+    called once per run by :func:`build_compiler_context`."""
+    rows = conn.execute(
+        "SELECT recipe_id, need_role, function, declaration_version, authority, content_hash"
+        " FROM recipe_aggregation_declaration"
+        " WHERE effective_from <= %s AND (effective_to IS NULL OR effective_to > %s)"
+        " ORDER BY recipe_id, need_role, declaration_version",
+        (now, now)).fetchall()
+    registry: dict[tuple[str, str], AggregationFunction] = {}
+    conflicts: set[tuple[str, str]] = set()
+    for recipe_id, need_role, function, version, authority, content_hash in rows:
+        key = (recipe_id, need_role)
+        if key in conflicts:
+            continue    # already conflicted — stays conflicted, never resolved
+        expected = aggregation_declaration_content_hash(
+            recipe_id, need_role, function, version, authority)
+        try:
+            fn: AggregationFunction | None = AggregationFunction(function)
+        except ValueError:
+            fn = None
+        if content_hash != expected or fn is None:
+            registry.pop(key, None)     # tampered / unparseable — fail closed for this key
+            conflicts.add(key)
+            continue
+        if key in registry:
+            registry.pop(key, None)     # a SECOND active declaration — conflict, never a pick
+            conflicts.add(key)
+            continue
+        registry[key] = fn
+    return registry, frozenset(conflicts)
+
+
 def build_compiler_context(conn, scope: CatalogScopeV1, roles: Iterable[str],
                            now: datetime) -> CompilerContext:
     """The PRODUCTION per-run context builder — batch-loads EVERYTHING the compiler reads ONCE
     per shadow run (the §11 guard: no per-plan re-query): the realizations, the active governed
     crossings, the READ-SCOPED columns, and the scope-start fingerprints the compile-end recheck
     revalidates. Impure by design (the sanctioned context-build reads); the returned context is
-    immutable and conn-free. The config comes from the deployment env loader; agg_declarations
-    is EMPTY in production — validate, never fabricate: no governed declaration source exists."""
+    immutable and conn-free. The config comes from the deployment env loader; agg_declarations is
+    loaded from the durable ``recipe_aggregation_declaration`` registry (H3a) — the ACTIVE
+    declarations at ``now``, exactly one per (recipe_id, need_role) or a fail-closed conflict.
+    Validate, never fabricate: an empty registry stays empty (no governed rows), keeping the
+    compiler byte-identical to the pre-registry behaviour."""
     roles = tuple(roles)
     catalogs = scope.authorized_catalog_sources
+    agg_declarations, agg_conflicts = load_aggregation_declarations(conn, now)
     return CompilerContext(
         realizations_by_catalog={
             src: derive_catalog_realizations(conn, src).realizations for src in catalogs},
@@ -1043,4 +1119,5 @@ def build_compiler_context(conn, scope: CatalogScopeV1, roles: Iterable[str],
         config=overlay_config_from_env(),
         roles=roles,
         now=now,
-        agg_declarations={})
+        agg_declarations=agg_declarations,
+        agg_declaration_conflicts=agg_conflicts)
