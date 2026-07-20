@@ -13,7 +13,7 @@ import logging
 import os
 import time
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import timedelta
 
 from featuregen.idgen import mint_id
@@ -26,8 +26,10 @@ from featuregen.overlay.upload.contract._serial import (
 )
 from featuregen.overlay.upload.contract.intake import Intent, redact_free_text
 from featuregen.overlay.upload.feature_assist import (
+    ExternalRequirementPreview,
     FeatureIdea,
     FeatureSet,
+    RoleBinding,
     SetRecommendation,
     _candidate_columns,
     _validate_idea,
@@ -179,7 +181,12 @@ def _template_candidates(conn, *, catalog_source: str, roles, target_ref: str | 
         validated, rej = _validate_idea(conn, raw, known, src_of, target_ref, now, fresh_within,
                                         roles=roles)
         if rej is None:
-            ideas.append(validated)   # [F9] keep the VALIDATOR's idea (carries status + requirements)
+            # [F9] keep the VALIDATOR's idea (carries status + requirements), then SERVER-STAMP the H1a
+            # recipe provenance: generation_source + recipe_id come from the grounded TEMPLATE id (the
+            # server's own knowledge of the recipe path), never from the LLM/candidate raw. recipe_id
+            # then survives the Gate-1 considered-set round-trip (persist → reload) via the (de)serializers.
+            ideas.append(replace(validated, generation_source="recipe", recipe_id=gf.template_id,
+                                 planner_applicability="not_applicable_single_catalog"))
             grounded_ids.add(gf.template_id)
             binding_by_id[gf.template_id] = binding_quality(gf).value   # ranker's binding signal
         else:
@@ -279,7 +286,12 @@ def _governed_idea_from_result(result: BindingPlanningResultV1, template: Templa
         derives_from=[ref for _cs, ref in pairs], aggregation=template.aggregation,
         grain_table=None, derives_pairs=pairs, verification="DESIGN-CHECKED", critic_note="",
         rationale=rationale, plan_envelope=envelope,
-        origin="governed_planner", path_authority="governed_cross_catalog")
+        origin="governed_planner", path_authority="governed_cross_catalog",
+        # H1a: the governed cross-catalog path is a RECIPE path with a compiled physical plan. Derive the
+        # H1a metadata from the SERVER's envelope — planner_applicability is "applicable_cross_catalog"
+        # BECAUSE a governed plan_envelope is present (the path_authority↔planner_applicability mapping).
+        generation_source="recipe", recipe_id=envelope.recipe_id,
+        planner_applicability="applicable_cross_catalog", physical_plan_id=envelope.physical_plan_id)
 
 
 def _governed_cross_catalog_options(conn, *, target_entity: str, eligible_recipe_ids,
@@ -495,7 +507,10 @@ def build_considered_set(conn, intent: Intent, client: LLMClient, *, entity: str
         ideas = recommend_features(
             conn, intent.redacted_definition, client, entity=entity, catalog_source=catalog_source,
             roles=roles, target_ref=target_ref, now=now, target=1)
-        anchor = ideas[0] if ideas else None
+        # H1a: the definition anchor is the USER's own definition run through the validated loop — the
+        # server-assigned generation_source for the user-anchor path is "user_defined" (distinct from the
+        # LLM alternatives' "llm_freeform" and the recipe lens's "recipe"). Never read from LLM output.
+        anchor = replace(ideas[0], generation_source="user_defined") if ideas else None
         # 3C.2a fail-closed: on a live entity-scoped run (catalog_source is None) the definition anchor is
         # generated over the WHOLE cross-catalog candidate pool, so it CAN span >1 catalog with NO
         # governed physical plan. Mirror the alternatives filter: drop such an anchor (it must never be
@@ -543,18 +558,44 @@ def _option_ids(cs: ConsideredSet) -> set[str]:
 def _idea_json(f: FeatureIdea | None) -> dict | None:
     if f is None:
         return None
-    return {"name": f.name, "derives_from": f.derives_from, "aggregation": f.aggregation,
-            "grain_table": f.grain_table,   # keep grain — it disambiguates same-named options
-            "verification": f.verification,   # honest §14.5 stamp surfaced at Gate #1 (item 4)
-            "critic_note": f.critic_note,     # advisory residual critic note — the human weighs it
-            "rationale": f.rationale,         # §14.2 one-line causal 'why' — audit the logic first
-            "validation_status": f.validation_status,   # 3A-ii honest tri-state (NEW axis)
-            "requirements": requirements_to_json(f.requirements),
-            "derives_pairs": [list(p) for p in f.derives_pairs],   # for server-side reconstruction
-            # 3C.2a carry-forward: provenance + the governed plan envelope (null for LLM/single-catalog
-            # options), persisted with the considered set so drafting reconstructs the EXACT plan.
-            "origin": f.origin, "path_authority": f.path_authority,
-            "plan_envelope": f.plan_envelope.to_json() if f.plan_envelope else None}
+    d = {"name": f.name, "derives_from": f.derives_from, "aggregation": f.aggregation,
+         "grain_table": f.grain_table,   # keep grain — it disambiguates same-named options
+         "verification": f.verification,   # honest §14.5 stamp surfaced at Gate #1 (item 4)
+         "critic_note": f.critic_note,     # advisory residual critic note — the human weighs it
+         "rationale": f.rationale,         # §14.2 one-line causal 'why' — audit the logic first
+         "validation_status": f.validation_status,   # 3A-ii honest tri-state (NEW axis)
+         "requirements": requirements_to_json(f.requirements),
+         "derives_pairs": [list(p) for p in f.derives_pairs],   # for server-side reconstruction
+         # 3C.2a carry-forward: provenance + the governed plan envelope (null for LLM/single-catalog
+         # options), persisted with the considered set so drafting reconstructs the EXACT plan.
+         "origin": f.origin, "path_authority": f.path_authority,
+         "plan_envelope": f.plan_envelope.to_json() if f.plan_envelope else None}
+    # H1a carry-through: emitted ONLY when non-default so a pre-H1a idea's persisted bytes are
+    # byte-identical (mirrors the C2-C3 requirement-`params` and 3C.2a plan-envelope only-when-present
+    # strategy). recipe_id MUST round-trip here — it is what survives the Gate-1 considered-set reload.
+    if f.generation_source != "llm_freeform":
+        d["generation_source"] = f.generation_source
+    if f.recipe_id is not None:
+        d["recipe_id"] = f.recipe_id
+    if f.candidate_status:
+        d["candidate_status"] = f.candidate_status
+    if f.input_role_bindings:
+        d["input_role_bindings"] = [b.to_json() for b in f.input_role_bindings]
+    if f.external_requirement_previews:
+        d["external_requirement_previews"] = [p.to_json() for p in f.external_requirement_previews]
+    if f.metadata_snapshot_id is not None:
+        d["metadata_snapshot_id"] = f.metadata_snapshot_id
+    if f.metadata_input_fingerprint is not None:
+        d["metadata_input_fingerprint"] = f.metadata_input_fingerprint
+    if f.binding_fact_keys:
+        d["binding_fact_keys"] = list(f.binding_fact_keys)
+    if f.planner_applicability != "not_applicable_nonrecipe":
+        d["planner_applicability"] = f.planner_applicability
+    if f.physical_plan_id is not None:
+        d["physical_plan_id"] = f.physical_plan_id
+    if f.planner_declaration_id is not None:
+        d["planner_declaration_id"] = f.planner_declaration_id
+    return d
 
 
 def _snapshot(conn, cs: ConsideredSet) -> dict:
@@ -606,7 +647,22 @@ def _idea_from_json(d: dict) -> FeatureIdea:
         requirements=requirements_from_json(d.get("requirements", [])),
         # 3C.2a: absent keys (pre-3C snapshots) deserialize to the defaults — behaviour-neutral.
         origin=d.get("origin", "llm"), path_authority=d.get("path_authority", "single_or_llm"),
-        plan_envelope=PlanEnvelopeV1.from_json(d["plan_envelope"]) if d.get("plan_envelope") else None)
+        plan_envelope=PlanEnvelopeV1.from_json(d["plan_envelope"]) if d.get("plan_envelope") else None,
+        # H1a: absent keys (pre-H1a snapshots) deserialize to the defaults — behaviour-neutral. recipe_id
+        # is restored here so a recipe-sourced idea keeps its registry id across the Gate-1 round-trip.
+        generation_source=d.get("generation_source", "llm_freeform"),
+        recipe_id=d.get("recipe_id"),
+        candidate_status=d.get("candidate_status", ""),
+        input_role_bindings=tuple(RoleBinding.from_json(b) for b in d.get("input_role_bindings", ())),
+        external_requirement_previews=tuple(
+            ExternalRequirementPreview.from_json(p)
+            for p in d.get("external_requirement_previews", ())),
+        metadata_snapshot_id=d.get("metadata_snapshot_id"),
+        metadata_input_fingerprint=d.get("metadata_input_fingerprint"),
+        binding_fact_keys=tuple(str(k) for k in d.get("binding_fact_keys", ())),
+        planner_applicability=d.get("planner_applicability", "not_applicable_nonrecipe"),
+        physical_plan_id=d.get("physical_plan_id"),
+        planner_declaration_id=d.get("planner_declaration_id"))
 
 
 def chosen_feature(conn, intent_id: str, chosen_source: str,

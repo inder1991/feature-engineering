@@ -34,7 +34,9 @@ def serialize_feature_idea_v1(idea: FeatureIdea) -> dict:
 
 
 def serialize_feature_idea_v2(idea: FeatureIdea) -> dict:
-    """v1 plus the Slice-3 typed-computation + tri-state fields."""
+    """v1 plus the Slice-3 typed-computation + tri-state fields, plus the H1a carry-through metadata.
+    The H1a fields are emitted ONLY when non-default so a plain idea's v2 (and the flag-OFF v1) stay
+    byte-identical; a recipe / governed / user-anchor idea surfaces its server-assigned labels."""
     out = serialize_feature_idea_v1(idea)
     out["operation_kind"] = idea.operation_kind
     out["measure_refs"] = [list(m) for m in idea.measure_refs]
@@ -44,6 +46,29 @@ def serialize_feature_idea_v2(idea: FeatureIdea) -> dict:
     out["grouping_refs"] = [list(g) for g in idea.grouping_refs]
     out["validation_status"] = idea.validation_status
     out["requirements"] = [_req(r) for r in idea.requirements]
+    # ── H1a carry-through metadata — only-when-non-default (see docstring) ──
+    if idea.generation_source != "llm_freeform":
+        out["generation_source"] = idea.generation_source
+    if idea.recipe_id is not None:
+        out["recipe_id"] = idea.recipe_id
+    if idea.candidate_status:
+        out["candidate_status"] = idea.candidate_status
+    if idea.input_role_bindings:
+        out["input_role_bindings"] = [b.to_json() for b in idea.input_role_bindings]
+    if idea.external_requirement_previews:
+        out["external_requirement_previews"] = [p.to_json() for p in idea.external_requirement_previews]
+    if idea.metadata_snapshot_id is not None:
+        out["metadata_snapshot_id"] = idea.metadata_snapshot_id
+    if idea.metadata_input_fingerprint is not None:
+        out["metadata_input_fingerprint"] = idea.metadata_input_fingerprint
+    if idea.binding_fact_keys:
+        out["binding_fact_keys"] = list(idea.binding_fact_keys)
+    if idea.planner_applicability != "not_applicable_nonrecipe":
+        out["planner_applicability"] = idea.planner_applicability
+    if idea.physical_plan_id is not None:
+        out["physical_plan_id"] = idea.physical_plan_id
+    if idea.planner_declaration_id is not None:
+        out["planner_declaration_id"] = idea.planner_declaration_id
     return out
 
 

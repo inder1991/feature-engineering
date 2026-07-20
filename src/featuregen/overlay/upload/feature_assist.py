@@ -387,6 +387,67 @@ def _build_menu(conn, cols: list[dict], *, objective: str | None = None,
     return columns, table_context
 
 
+# ── H1a carry-through value objects ────────────────────────────────────────────────────────────────
+# Small, frozen, HASHABLE (tuple members only) value objects the feature assistant carries so H1b's
+# Gate-1 confirmation write and H3's planner have their metadata. H1a establishes the SHAPE only; H1b
+# mints the durable ids / persists the CONFIRMED bindings. Every field is defaulted so an idea that
+# carries none serializes byte-identically to the pre-H1a shape.
+@dataclass(frozen=True, slots=True)
+class RoleBinding:
+    """One role→source binding on a FeatureIdea (entity / time / currency / measure …). `ref` is the
+    (catalog_source, object_ref) the role bound to; `authority` is the governing authority (governed /
+    declared / hint); `confirmation_required` flags a binding the human must confirm at Gate 1."""
+    role: str = ""
+    ref: tuple[str, str] | None = None
+    evidence_ids: tuple[str, ...] = ()
+    fact_ids: tuple[str, ...] = ()
+    authority: str = ""
+    confirmation_required: bool = False
+
+    def to_json(self) -> dict:
+        d: dict = {"role": self.role, "authority": self.authority}
+        if self.ref is not None:
+            d["ref"] = [self.ref[0], self.ref[1]]
+        if self.evidence_ids:
+            d["evidence_ids"] = list(self.evidence_ids)
+        if self.fact_ids:
+            d["fact_ids"] = list(self.fact_ids)
+        if self.confirmation_required:
+            d["confirmation_required"] = True
+        return d
+
+    @staticmethod
+    def from_json(d: dict) -> RoleBinding:
+        ref = d.get("ref")
+        return RoleBinding(
+            role=str(d.get("role", "")),
+            ref=(str(ref[0]), str(ref[1])) if ref else None,
+            evidence_ids=tuple(str(x) for x in d.get("evidence_ids", ())),
+            fact_ids=tuple(str(x) for x in d.get("fact_ids", ())),
+            authority=str(d.get("authority", "")),
+            confirmation_required=bool(d.get("confirmation_required", False)))
+
+
+@dataclass(frozen=True, slots=True)
+class ExternalRequirementPreview:
+    """A PREVIEW of an external-validation requirement carried on a candidate (content + schema version
+    + content hash). H1b mints the durable requirement ids from these previews; H1a only carries them."""
+    content: str = ""
+    schema_version: str = "v1"
+    content_hash: str = ""
+
+    def to_json(self) -> dict:
+        return {"content": self.content, "schema_version": self.schema_version,
+                "content_hash": self.content_hash}
+
+    @staticmethod
+    def from_json(d: dict) -> ExternalRequirementPreview:
+        return ExternalRequirementPreview(
+            content=str(d.get("content", "")),
+            schema_version=str(d.get("schema_version", "v1")),
+            content_hash=str(d.get("content_hash", "")))
+
+
 @dataclass(frozen=True, slots=True)
 class FeatureIdea:
     name: str
@@ -424,6 +485,29 @@ class FeatureIdea:
     plan_envelope: PlanEnvelopeV1 | None = None
     origin: str = "llm"
     path_authority: str = "single_or_llm"
+    # ── H1a carry-through metadata (additive; all defaulted so every existing constructor + persisted
+    #    snapshot stays byte-identical). Consumed by H1b's Gate-1 confirmation write and H3's planner.
+    #    RECONCILES with the 3C.2a fields — it does NOT duplicate them:
+    #      • generation_source is the AUTHORITATIVE, SERVER-assigned generation-path label
+    #        (recipe | llm_freeform | user_defined). It is NEVER read from LLM/client output. `origin`
+    #        ("llm" / "governed_planner") is KEPT as-is for the 3C.2a envelope-path back-compat; the two
+    #        differ by design (origin = envelope provenance, generation_source = server path authority).
+    #      • planner_applicability is DERIVED from the governed plan_envelope + cross-catalog flag state:
+    #        a governed plan_envelope present ⟹ "applicable_cross_catalog"; a recipe idea with no
+    #        envelope ⟹ "not_applicable_single_catalog"; a non-recipe (llm_freeform) idea ⟹
+    #        "not_applicable_nonrecipe" (default); a recipe eligible-but-flag-off ⟹ "gated_off". It maps
+    #        onto path_authority ("single_or_llm" / "governed_cross_catalog") without repurposing it.
+    generation_source: str = "llm_freeform"
+    recipe_id: str | None = None
+    candidate_status: str = ""
+    input_role_bindings: tuple[RoleBinding, ...] = ()
+    external_requirement_previews: tuple[ExternalRequirementPreview, ...] = ()
+    metadata_snapshot_id: str | None = None            # the C0 snapshot this idea was grounded on
+    metadata_input_fingerprint: str | None = None
+    binding_fact_keys: tuple[str, ...] = ()            # entity/time/currency fact keys used
+    planner_applicability: str = "not_applicable_nonrecipe"
+    physical_plan_id: str | None = None
+    planner_declaration_id: str | None = None
 
 
 def _column_meta(conn, pairs: list[tuple[str, str]]) -> dict[str, dict]:
