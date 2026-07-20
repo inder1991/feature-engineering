@@ -106,6 +106,14 @@ export interface IngestResult {
   join_candidates?: number
   passb_proposed?: number
   passb_abstained?: number
+  // D4 semantic-binding counts (behind OVERLAY_SEMANTIC_BINDING_CANDIDATES/_PROPOSALS; all 0 when
+  // off). candidates = persisted candidate rows (all dispositions); proposed = strong candidates
+  // routed to an E1 DRAFT fact; abstained = strong candidates whose propose was not accepted (a
+  // re-upload duplicate); failed = tables whose candidate/proposal work hit its fail-soft except.
+  semantic_binding_candidates?: number
+  semantic_binding_proposed?: number
+  semantic_binding_abstained?: number
+  semantic_binding_failed?: number
   // CLIENT-attached from the X-Ingestion-Run-Id response header, never a body field: the id of
   // the per-stage run record behind GET /ingestion-runs/{id}. Optional so existing fixtures and
   // callers keep compiling; null when the server sent no header.

@@ -405,6 +405,31 @@ def project_current_set(
     return ProjectionOutcome(status="unverifiable", candidate_set_id=None)
 
 
+def invalidate_current_set_if_stale(
+    conn: DbConn, *, catalog_source: str, table_graph_ref: str, table_fingerprint_now: str,
+    now: datetime | None = None,
+) -> ProjectionOutcome | None:
+    """Re-evaluate a table's EXISTING current candidate set against the LIVE table fingerprint — the
+    re-ingest invalidation the ingest pipeline runs on EVERY upload, EVEN when the semantic-binding
+    producer is disabled or has no LLM client (this performs NO LLM call). If a set is current and
+    its stored ``metadata_input_fingerprint`` no longer equals ``table_fingerprint_now``, the CAS
+    (:func:`project_current_set`) flips currentness to ``unverifiable`` (candidate_set_id NULL) — the
+    immutable set stays in the WORM store as history, never deleted. A still-matching fingerprint is
+    a harmless idempotent re-project (stays ``current``). Returns the outcome, or ``None`` when there
+    is no current set to re-evaluate (nothing can go stale). Disabling the producer must NOT freeze a
+    stale current set — that is exactly what this guards."""
+    now = now or datetime.now(UTC)
+    row = conn.execute(
+        "SELECT candidate_set_id FROM current_semantic_binding_candidate_set "
+        "WHERE catalog_source = %s AND table_graph_ref = %s AND candidate_set_id IS NOT NULL",
+        (catalog_source, table_graph_ref)).fetchone()
+    if row is None or row[0] is None:
+        return None
+    return project_current_set(
+        conn, catalog_source=catalog_source, table_graph_ref=table_graph_ref,
+        candidate_set_id=row[0], table_fingerprint_now=table_fingerprint_now, now=now)
+
+
 # ==================================================================================================
 # Reset / rebuild (NO LLM)
 # ==================================================================================================

@@ -37,7 +37,9 @@ CONFIRMER = {"X-User": "priya", "X-Roles": "platform-admin"}   # require_confirm
 # the response header ("never a body field") — so it must NOT appear in this set.
 INGEST_RESULT_KEYS = {"status", "reason", "asserted", "changed_objects", "quarantined", "flagged",
                       "objects_stored", "tables", "columns", "containment_edges", "facts_asserted",
-                      "join_candidates", "passb_proposed", "passb_abstained"}
+                      "join_candidates", "passb_proposed", "passb_abstained",
+                      "semantic_binding_candidates", "semantic_binding_proposed",
+                      "semantic_binding_abstained", "semantic_binding_failed"}
 
 # IngestionRun (api.ts): the fields the client reads off GET /ingestion-runs/{id}. Keyed `id` —
 # NOT `run_id` — the exact contract the #15 bug violated.

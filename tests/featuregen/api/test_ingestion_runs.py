@@ -62,6 +62,7 @@ def test_successful_upload_records_ingested_run(client):
     # the effective_config snapshot is exactly the allowlist — flags + provider/model, no secrets
     assert set(run["effective_config"]) == {
         "config_schema_version", "governed_joins", "pass_c", "table_synth",
+        "semantic_binding_candidates", "semantic_binding_proposals",
         "llm_provider", "llm_model"}
 
 
@@ -258,7 +259,8 @@ def test_successful_upload_records_ordered_stage_reports(client):
     assert [s["stage"] for s in run["stages"]] == [
         "parse", "validation", "brake", "fact_assertion", "drift", "glossary_classification",
         "enrich_concept", "enrich_definition", "enrich_domain", "graph_persistence",
-        "governed_joins", "pass_c", "pass_b", "glossary_evidence", "projection_drain",
+        "governed_joins", "pass_c", "pass_b", "glossary_evidence",
+        "semantic_binding_candidates", "semantic_binding_proposals", "projection_drain",
         "table_fact_projection", "join_projection", "semantic_binding_projection", "join_drift",
         "quarantine", "manifest_finalization"]
     assert stages["parse"]["state"] == "succeeded"

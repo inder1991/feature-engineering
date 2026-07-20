@@ -70,13 +70,20 @@ def _effective_config_snapshot() -> dict:
     never be added here. The flag helpers are imported lazily: ingest.py is a heavy module and
     this one is imported by the route layer."""
     from featuregen.overlay.upload.graph import governed_joins_enabled
-    from featuregen.overlay.upload.ingest import pass_c_enabled, table_synth_enabled
+    from featuregen.overlay.upload.ingest import (
+        pass_c_enabled,
+        semantic_binding_candidates_enabled,
+        semantic_binding_proposals_enabled,
+        table_synth_enabled,
+    )
 
     return {
         "config_schema_version": 1,
         "governed_joins": governed_joins_enabled(),
         "pass_c": pass_c_enabled(),
         "table_synth": table_synth_enabled(),
+        "semantic_binding_candidates": semantic_binding_candidates_enabled(),
+        "semantic_binding_proposals": semantic_binding_proposals_enabled(),
         "llm_provider": os.environ.get("FEATUREGEN_LLM_PROVIDER") or None,
         "llm_model": os.environ.get("FEATUREGEN_LLM_MODEL") or None,
     }

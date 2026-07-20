@@ -210,7 +210,9 @@ def test_upload_response_body_unchanged_by_run_manifest(client):
     assert list(body.keys()) == ["status", "reason", "asserted", "changed_objects",
                                  "quarantined", "flagged", "objects_stored", "tables", "columns",
                                  "containment_edges", "facts_asserted", "join_candidates",
-                                 "passb_proposed", "passb_abstained"]
+                                 "passb_proposed", "passb_abstained",
+                                 "semantic_binding_candidates", "semantic_binding_proposed",
+                                 "semantic_binding_abstained", "semantic_binding_failed"]
     run_id = res.headers["X-Ingestion-Run-Id"]
     assert run_id.encode() not in res.content
 
@@ -229,7 +231,9 @@ def test_upload_response_body_byte_identical_with_stage_reports(client):
         "quarantined": 0,
         "flagged": "first upload of 'deposits' (9 objects) — review recommended",
         "objects_stored": 12, "tables": 3, "columns": 9, "containment_edges": 9,
-        "facts_asserted": 4, "join_candidates": 0, "passb_proposed": 0, "passb_abstained": 0}
+        "facts_asserted": 4, "join_candidates": 0, "passb_proposed": 0, "passb_abstained": 0,
+        "semantic_binding_candidates": 0, "semantic_binding_proposed": 0,
+        "semantic_binding_abstained": 0, "semantic_binding_failed": 0}
     assert res.content == json.dumps(
         expected, separators=(",", ":"), ensure_ascii=False).encode()
 

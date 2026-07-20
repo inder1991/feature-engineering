@@ -297,6 +297,8 @@ def test_effective_config_snapshot_is_allowlisted(monkeypatch) -> None:
         "governed_joins": True,   # OVERLAY_PASS_C implies the governed joins_to seam
         "pass_c": True,
         "table_synth": False,
+        "semantic_binding_candidates": False,
+        "semantic_binding_proposals": False,
         "llm_provider": "anthropic",
         "llm_model": "claude-sonnet-5",
     }
