@@ -12,9 +12,10 @@ in sync by hand:
 * ``FactStatus`` mirrors the status constants in ``state.py``
   (``DRAFT``/``PARTIALLY_CONFIRMED``/``VERIFIED``/``REJECTED``/``STALE``/``REVERIFY``).
 * ``FactType`` mirrors the fact-type constants in ``facts.py``
-  (``AVAILABILITY_TIME``/``GRAIN``/``SCD_EFFECTIVE_DATING``/``APPROVED_JOIN``/``POLICY_TAG``);
-  the allowed-value frozensets ``facts.DATA_FACT_TYPES`` / ``facts.POLICY_FACT_TYPES`` remain
-  the runtime membership authority — not duplicated here.
+  (``AVAILABILITY_TIME``/``GRAIN``/``SCD_EFFECTIVE_DATING``/``APPROVED_JOIN``/``ENTITY_BRIDGE``/
+  ``ENTITY_ASSIGNMENT``/``CURRENCY_BINDING``/``POLICY_TAG``); the allowed-value frozensets
+  ``facts.DATA_FACT_TYPES`` / ``facts.POLICY_FACT_TYPES`` remain the runtime membership authority —
+  not duplicated here.
 * ``Gate`` mirrors the ``authority.gate`` human-gate names emitted by ``authority.py``.
 * ``Role`` mirrors the authority-role / confirmer-role vocabulary
   (``authority.py``, ``confirmation_commands.py``, ``join_confirmation.py``).
@@ -47,6 +48,8 @@ FactType = Literal[
     "scd_effective_dating",
     "approved_join",
     "entity_bridge",
+    "entity_assignment",
+    "currency_binding",
     "policy_tag",
 ]
 

@@ -281,6 +281,15 @@ def enter_fact(conn: DbConn, cmd: Command) -> CommandResult:
     if join_err is not None:
         return CommandResult(accepted=False, aggregate_id="", denied_reason=join_err)
     key = fact_key(ref, fact_type, use_case)
+    # Delivery E four-eyes (E1): a governed semantic fact may NOT be single-party self-confirmed —
+    # one principal must not both propose AND approve the same value. enter_fact is the audited
+    # single-party exception to four-eyes; deny it here so these types always take the two-party
+    # propose->confirm flow (service/LLM proposer + a DISTINCT human confirmer).
+    if fact_type in ("entity_assignment", "currency_binding"):
+        return _deny_audited(
+            conn, cmd, key,
+            "governed semantic fact requires the two-party propose/confirm flow (four-eyes)",
+        )
     authority = resolve_authority(conn, adapter, ref, fact_type)
     # Direct self-confirm is restricted to OWNER-KNOWN facts (§3.4): there is no platform-admin
     # enter_fact authz row (only data_owner/compliance), so an unowned fact — which resolves to the

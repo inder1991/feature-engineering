@@ -139,16 +139,68 @@ def _bridge_write_error(ref, value) -> str | None:
     return None
 
 
+def _entity_assignment_write_error(ref, value: Mapping) -> str | None:
+    """Write gate for entity_assignment (Delivery E): the subject must be an identifier-eligible
+    COLUMN ref and `entity_id` must be a member of the closed `known_entities()` vocabulary. The
+    JSON schema already forbids a target ref / any extra key (additionalProperties False), so the
+    two concerns left here are the column-ness of the subject and the entity being known."""
+    if not isinstance(ref, CatalogObjectRef):
+        return "entity_assignment requires a CatalogObjectRef"
+    if not ref.column:
+        return "entity_assignment subject must be a column (ref carries no column)"
+    # Lazy import: overlay.identity -> overlay.upload.taxonomy at module load would cycle (mirrors
+    # confirmation_commands' lazy join_referents import across the overlay/upload boundary).
+    from featuregen.overlay.upload.taxonomy.dimensions import known_entities
+
+    entity_id = value.get("entity_id")
+    if entity_id not in known_entities():
+        return f"entity_assignment entity_id {entity_id!r} is not a known entity"
+    return None
+
+
+def _currency_binding_write_error(ref, value: Mapping) -> str | None:
+    """Write gate for currency_binding (Delivery E): the subject measure must be a COLUMN ref and the
+    target currency column must be a well-formed CatalogObjectRef referencing a concrete column in the
+    SAME source/schema/table as the measure — no cross-source / cross-schema / cross-table binding
+    through this path. The value must match the fact subject (same table). The JSON schema already
+    forbids any free value beyond `currency_column`."""
+    if not isinstance(ref, CatalogObjectRef):
+        return "currency_binding requires a CatalogObjectRef"
+    if not ref.column:
+        return "currency_binding subject (measure) must be a column (ref carries no column)"
+    cc = value.get("currency_column")
+    if not isinstance(cc, Mapping):
+        return "currency_binding value.currency_column must be a CatalogObjectRef"
+    if not cc.get("column"):
+        return "currency_binding currency_column must reference a concrete column"
+    if (
+        _norm(cc.get("catalog_source")) != _norm(ref.catalog_source)
+        or _norm(cc.get("schema")) != _norm(ref.schema)
+        or _norm(cc.get("table")) != _norm(ref.table)
+    ):
+        return (
+            "currency_binding target currency column must be in the same source/schema/table as the "
+            f"measure ({ref.schema}.{ref.table})"
+        )
+    return None
+
+
 def join_write_error(ref, fact_type: str, value: Mapping, use_case: str | None = None) -> str | None:
-    """Write-path integrity gate for approved_join proposals/entries (SP-1.5 review fix). Returns a
-    rejection reason, or None when the join is well-formed:
-      * F4 — cross-catalog joins are DISALLOWED in SP-1.5 (a single catalog adapter cannot attest an
-        endpoint in another source); reject from_ref.catalog_source != to_ref.catalog_source.
-      * ref/value consistency — authority + fact_key derive from `ref` while the stored value is what
-        consumers read; reject if the proposed_value describes a DIFFERENT join than `ref` (else the
-        wrong owners could attest a join whose value points at other tables)."""
+    """Write-path integrity gate for governed column-referent facts (SP-1.5 review fix; extended for
+    Delivery E). Returns a rejection reason, or None when the write is well-formed:
+      * approved_join — F4 (cross-catalog joins DISALLOWED in SP-1.5) + ref/value consistency
+        (authority + fact_key derive from `ref` while the stored value is what consumers read; reject
+        a proposed_value describing a DIFFERENT join than `ref`).
+      * entity_bridge — cross-catalog required + ref/value consistency.
+      * entity_assignment / currency_binding (Delivery E) — subject column-ness, `entity_id` ∈
+        `known_entities()`, and same-source/schema/table currency target (no cross-schema binding).
+    Called by every write entry point (propose_fact / confirm_fact / enter_fact)."""
     if fact_type == "entity_bridge":
         return _bridge_write_error(ref, value)
+    if fact_type == "entity_assignment":
+        return _entity_assignment_write_error(ref, value)
+    if fact_type == "currency_binding":
+        return _currency_binding_write_error(ref, value)
     if fact_type != "approved_join":
         return None
     if not isinstance(ref, ApprovedJoinRef):

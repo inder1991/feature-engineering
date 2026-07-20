@@ -35,13 +35,19 @@ class Authority:
     platform-admin/data-governance queue, NEVER to whoever submitted the request (§6 step 1).
     `dual` is True when two DISTINCT confirmations are required — an `approved_join` whose two
     sides do not share a single owner (two known owners, one known + one governance side, OR
-    even both-unknown → two distinct governance approvals; §6.4)."""
+    even both-unknown → two distinct governance approvals; §6.4).
+
+    `admin_confirmable` is True for the Delivery E governed semantic facts (entity_assignment /
+    currency_binding): even when the source owner IS known, a platform admin is ALSO an accepted
+    confirmer (owner-or-admin, E1 authz). It defaults False, so every other type keeps the strict
+    owner-only rule when the owner is known."""
 
     role: Role
     gate: Gate
     subjects: tuple[str | None, ...]
     governance_queue: bool
     dual: bool = False
+    admin_confirmable: bool = False
 
     @property
     def eligible_assignees(self) -> dict[str, str]:
@@ -137,6 +143,27 @@ def resolve_authority(
                              subjects=(left_owner,), governance_queue=False)
         return Authority(role="platform-admin", gate="OVERLAY_DATA_OWNER",
                          subjects=(), governance_queue=True)
+    if fact_type in ("entity_assignment", "currency_binding"):
+        # Delivery E governed semantic facts (E1 authz): ONE authorized confirmer constrained to the
+        # owned table — the registered SOURCE OWNER *or* a platform admin. Like the generic single-
+        # owner path below, but `admin_confirmable=True` so `_actor_is_authority` accepts a platform
+        # admin ALONGSIDE a KNOWN owner (the generic path accepts only the owner). Four-eyes
+        # (proposer != confirmer) is enforced separately in confirm_fact, so owner-or-admin never
+        # permits one principal to both propose AND approve the same value.
+        if not isinstance(ref, CatalogObjectRef):
+            raise TypeError(
+                f"{fact_type!r} authority requires a CatalogObjectRef, got {type(ref).__name__}"
+            )
+        owner = adapter.owner_of(ref)
+        if owner is None:
+            return Authority(
+                role="platform-admin", gate="OVERLAY_DATA_OWNER", subjects=(),
+                governance_queue=True,
+            )
+        return Authority(
+            role="data_owner", gate="OVERLAY_DATA_OWNER", subjects=(owner,),
+            governance_queue=False, admin_confirmable=True,
+        )
     if not isinstance(ref, CatalogObjectRef):
         raise TypeError(
             f"{fact_type!r} authority requires a CatalogObjectRef, got {type(ref).__name__}"
@@ -156,6 +183,8 @@ def _actor_is_authority(authority: Authority, actor: IdentityEnvelope) -> bool:
 
     * compliance fact → actor must hold the `compliance` role claim.
     * data-owner fact → actor must BE one of the resolved owner subjects (owner-of-object).
+    * owner-or-admin fact (`admin_confirmable`, the Delivery E semantic facts) → the known owner OR
+      a `platform-admin` role claim confirms (E1); four-eyes is enforced separately in confirm_fact.
     * governance-queue fact (an unknown owner) → actor must hold the `platform-admin` role claim
       (there is no specific owner subject to match against).
 
@@ -165,6 +194,11 @@ def _actor_is_authority(authority: Authority, actor: IdentityEnvelope) -> bool:
     roles = set(actor.role_claims)
     if authority.role == "compliance":
         return "compliance" in roles
+    # Delivery E owner-or-admin (E1): a platform admin is an accepted confirmer for these types even
+    # when the owner is known. `admin_confirmable` is False for every other type, so this never
+    # widens the owner-only rule elsewhere.
+    if authority.admin_confirmable and "platform-admin" in roles:
+        return True
     if authority.governance_queue and "platform-admin" in roles:
         return True
     known = {s for s in authority.subjects if s}

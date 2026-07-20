@@ -17,9 +17,23 @@ GRAIN = "grain"
 SCD_EFFECTIVE_DATING = "scd_effective_dating"
 APPROVED_JOIN = "approved_join"
 ENTITY_BRIDGE = "entity_bridge"
+# Delivery E governed semantic fact types: a column IS a business entity / a measure's currency is
+# that column. Human-confirmed, column-referent, single-source facts (Delivery E depends on these).
+ENTITY_ASSIGNMENT = "entity_assignment"
+CURRENCY_BINDING = "currency_binding"
 POLICY_TAG = "policy_tag"
 
-DATA_FACT_TYPES = frozenset({AVAILABILITY_TIME, GRAIN, SCD_EFFECTIVE_DATING, APPROVED_JOIN, ENTITY_BRIDGE})
+DATA_FACT_TYPES = frozenset(
+    {
+        AVAILABILITY_TIME,
+        GRAIN,
+        SCD_EFFECTIVE_DATING,
+        APPROVED_JOIN,
+        ENTITY_BRIDGE,
+        ENTITY_ASSIGNMENT,
+        CURRENCY_BINDING,
+    }
+)
 POLICY_FACT_TYPES = frozenset({POLICY_TAG})
 
 _CATALOG_OBJECT_REF_SCHEMA = {
@@ -115,6 +129,27 @@ FACT_VALUE_SCHEMAS: dict[str, dict] = {
             "left_ref": _CATALOG_OBJECT_REF_SCHEMA,
             "right_ref": _CATALOG_OBJECT_REF_SCHEMA,
         },
+        "additionalProperties": False,
+    },
+    ENTITY_ASSIGNMENT: {
+        # A column IS this business entity (Delivery E). `entity_id` must be a member of the closed
+        # `known_entities()` vocabulary — enforced in the WRITE GATE (identity.join_write_error), NOT
+        # here, so the governed vocabulary can never drift into a duplicated literal set in this
+        # schema. NO target ref and NO free value beyond `entity_id` (additionalProperties False);
+        # `use_case` is PROHIBITED (a data fact — validate_fact_value enforces the use_case rule).
+        "type": "object",
+        "required": ["entity_id"],
+        "properties": {"entity_id": {"type": "string", "minLength": 1}},
+        "additionalProperties": False,
+    },
+    CURRENCY_BINDING: {
+        # This measure's currency is that column (Delivery E). value = {currency_column:
+        # CatalogObjectRef}. The target currency column must live in the SAME source/schema/table as
+        # the subject measure and reference a concrete column — enforced in the WRITE GATE. NO free
+        # value (additionalProperties False); `use_case` is PROHIBITED (a data fact).
+        "type": "object",
+        "required": ["currency_column"],
+        "properties": {"currency_column": _CATALOG_OBJECT_REF_SCHEMA},
         "additionalProperties": False,
     },
     POLICY_TAG: {
