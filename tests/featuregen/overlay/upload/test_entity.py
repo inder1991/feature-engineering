@@ -76,8 +76,15 @@ def test_cross_catalog_path_joins_then_entity_bridge(db):
     assert find_cross_catalog_path(db, "cards", "transactions", "deposits", "nowhere") is None
 
 
-def test_suggest_confirm_and_survive_reupload(db):
+def test_suggest_then_governed_apply_proposes_not_legacy(db, catalog):
+    """E4: `apply_entity_suggestion` now PROPOSES a governed entity_assignment DRAFT (E1) instead of
+    the retired legacy status='applied' UPDATE — the graph is NOT written until a distinct human
+    confirms (four-eyes) and E3 projects. The suggestion stays pending (never marked 'applied')."""
+    from tests.featuregen._helpers import mint_test_identity
+
     from featuregen.intake.llm import FakeLLM, FakeResponse
+    from featuregen.overlay.state import fold_overlay_state
+    from featuregen.overlay.store import load_fact
     from featuregen.overlay.upload.canonical import CanonicalRow
     from featuregen.overlay.upload.entity import (
         apply_entity_suggestion,
@@ -92,11 +99,19 @@ def test_suggest_confirm_and_survive_reupload(db):
     assert suggest_entities(db, client, "deposits") == 1
     sugg = list_entity_suggestions(db, "deposits")
     assert len(sugg) == 1 and sugg[0].column == "cust_ref" and sugg[0].suggested_entity == "Customer"
-    # human confirms -> written as the column's entity
-    assert apply_entity_suggestion(db, "deposits", sugg[0].object_ref)
+    # E4 apply -> a governed entity_assignment DRAFT is proposed, NOT written to the graph
+    res = apply_entity_suggestion(db, "deposits", sugg[0].object_ref,
+                                  actor=mint_test_identity(subject="user:alice",
+                                                           role_claims=("data_owner",)))
+    assert res.found and res.accepted and res.fact_key
+    assert fold_overlay_state(load_fact(db, res.fact_key)).status == "DRAFT"   # never auto-verified
     q = "SELECT entity FROM graph_node WHERE catalog_source='deposits' AND object_ref=%s"
-    assert db.execute(q, (sugg[0].object_ref,)).fetchone()[0] == "Customer"
-    # re-upload (the upload STILL doesn't declare the entity) -> the confirmed tag survives
-    build_graph(db, "deposits", rows)
-    assert db.execute(q, (sugg[0].object_ref,)).fetchone()[0] == "Customer"
-    assert list_entity_suggestions(db, "deposits") == []   # nothing pending anymore
+    assert db.execute(q, (sugg[0].object_ref,)).fetchone()[0] is None   # graph NOT written on apply
+    # the suggestion is NOT marked 'applied' (legacy UPDATE retired); it stays pending
+    assert db.execute("SELECT status FROM entity_suggestion WHERE catalog_source='deposits' "
+                      "AND object_ref=%s", (sugg[0].object_ref,)).fetchone()[0] == "pending"
+    # idempotent: a re-apply while the DRAFT is non-terminal is denied by propose_fact
+    again = apply_entity_suggestion(db, "deposits", sugg[0].object_ref,
+                                    actor=mint_test_identity(subject="user:alice",
+                                                             role_claims=("data_owner",)))
+    assert again.found and not again.accepted

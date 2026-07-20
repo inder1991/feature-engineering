@@ -274,14 +274,19 @@ def build_graph(conn, catalog_source: str, rows: list[CanonicalRow],
                     "authority) VALUES (%s, 'joins', %s, %s, %s, %s) ON CONFLICT DO NOTHING",
                     (catalog_source, c_ref, to_ref, r.cardinality or None, _join_edge_authority()))
 
-    # Re-apply human-confirmed entity tags (entity_suggestion). The graph was just rebuilt from the
-    # upload, which may not declare these; a confirmed tag must survive re-upload. Only fills a blank —
-    # a freshly-declared entity on the upload wins. Entity feeds search_doc's domain slot, and the
-    # inserts above wrote the doc with the blank entity — rebuild the touched nodes' docs (#20).
+    # Re-apply LEGACY human-confirmed entity tags (entity_suggestion.status='applied'). The graph was
+    # just rebuilt from the upload, which may not declare these; the legacy tag must survive re-upload.
+    # E4: this tag is NON-GOVERNED (`legacy_file_declared`) — a governed VERIFIED entity_assignment
+    # ALWAYS wins. Only fills a blank (a freshly-declared entity on the upload wins), and NEVER over a
+    # governed node (`entity_status <> 'VERIFIED'` — belt-and-braces: the reproject_semantic_bindings
+    # pass runs AFTER build_graph and re-projects governed values on top, so governed wins regardless).
+    # Entity feeds search_doc's domain slot, and the inserts above wrote the doc with the blank entity
+    # — rebuild the touched nodes' docs (#20).
     reapplied = conn.execute(
         "UPDATE graph_node n SET entity = s.suggested_entity FROM entity_suggestion s "
         "WHERE s.catalog_source = n.catalog_source AND s.object_ref = n.object_ref "
         "AND s.status = 'applied' AND n.catalog_source = %s AND n.entity IS NULL "
+        "AND n.entity_status IS DISTINCT FROM 'VERIFIED' "
         "RETURNING n.object_ref",
         (catalog_source,)).fetchall()
     for (ref,) in reapplied:

@@ -187,11 +187,11 @@ def test_field_resolution_projection_rebuilds_search_doc(db):
     assert not any(h.column == "balance" for h in search(db, "obsolete", now=now).hits)
 
 
-def test_entity_apply_and_reapply_rebuild_search_doc(db):
-    # Round-3 #20 (entity path): a human-confirmed entity tag lands on the node AFTER build_graph
-    # wrote search_doc — both apply_entity_suggestion and build_graph's re-apply-on-rebuild must
-    # re-derive the doc, or the confirmed entity term is unfindable.
-    from featuregen.overlay.upload.entity import apply_entity_suggestion
+def test_legacy_applied_reapply_rebuilds_search_doc(db):
+    # Round-3 #20 (entity path) + E4: a LEGACY 'applied' entity tag (legacy_file_declared) is
+    # re-applied by build_graph's re-apply-on-rebuild AFTER it wrote search_doc — the reapply must
+    # re-derive the doc, or the legacy tag term is unfindable. (The new governed apply writes nothing
+    # to the graph until a human confirms; that path is covered in test_entity_e4.)
     from featuregen.overlay.upload.graph import build_graph
 
     _seal()
@@ -200,13 +200,10 @@ def test_entity_apply_and_reapply_rebuild_search_doc(db):
     assert ingest_upload(db, "deposits", rows, actor=_actor(), now=now).status == "ingested"
     assert not any(h.column == "cust_id" for h in search(db, "customer", now=now).hits)
 
+    # A pre-existing LEGACY applied tag (kept readable, non-governed) survives re-upload.
     db.execute(
         "INSERT INTO entity_suggestion (catalog_source, object_ref, table_name, column_name, "
         "suggested_entity, status) VALUES ('deposits', 'public.accounts.cust_id', 'accounts', "
-        "'cust_id', 'Customer', 'pending')")
-    assert apply_entity_suggestion(db, "deposits", "public.accounts.cust_id")
-    assert any(h.column == "cust_id" for h in search(db, "customer", now=now).hits)
-
-    # A graph rebuild (re-upload) re-applies the confirmed tag — the term must stay searchable.
-    build_graph(db, "deposits", rows)
+        "'cust_id', 'Customer', 'applied')")
+    build_graph(db, "deposits", rows)   # legacy reapply re-writes entity + rebuilds search_doc
     assert any(h.column == "cust_id" for h in search(db, "customer", now=now).hits)

@@ -25,6 +25,7 @@ from featuregen.overlay.upload.entity import (
     list_entity_suggestions,
     suggest_entities,
 )
+from featuregen.overlay.upload.upload_catalog import ensure_upload_catalog_adapter
 
 router = APIRouter()
 _Conn = Annotated[psycopg.Connection, Depends(get_conn, scope="function")]
@@ -52,16 +53,25 @@ def suggest(body: SuggestIn, conn: _Conn, identity: _Identity, client: _LLM) -> 
 @router.get("/entity/suggestions", dependencies=[Depends(require_catalog_read)])
 def suggestions(catalog_source: str, conn: _Conn, identity: _Identity) -> list[dict]:
     return [{"object_ref": s.object_ref, "table": s.table, "column": s.column,
-             "suggested_entity": s.suggested_entity}
+             "suggested_entity": s.suggested_entity, "authority": s.authority}
             for s in list_entity_suggestions(conn, catalog_source, roles=identity.role_claims)]
 
 
 @router.post("/entity/apply", dependencies=[Depends(require_catalog_write)])
 def apply(body: ResolveIn, conn: _Conn, identity: _Identity) -> dict:
-    """The human confirms: write the suggested entity onto the column (durable across re-upload)."""
-    if not apply_entity_suggestion(conn, body.catalog_source, body.object_ref, actor=identity):
+    """E4: apply a suggestion by PROPOSING a GOVERNED entity_assignment fact (E1 propose→confirm,
+    owner-or-admin four-eyes) — the applying human proposes; a DISTINCT owner/admin confirms it via
+    the governance surface, and E3 then projects the governed entity. The retired legacy
+    status='applied' UPDATE is no longer used. 404 when no pending suggestion; 409 when a proposal
+    already exists (idempotent) or the legacy value is not a known governed entity."""
+    ensure_upload_catalog_adapter()   # owner routing for propose_fact (API process registers none)
+    result = apply_entity_suggestion(conn, body.catalog_source, body.object_ref, actor=identity)
+    if not result.found:
         raise HTTPException(status_code=404, detail="no pending suggestion for that column")
-    return {"applied": True}
+    if not result.accepted:
+        raise HTTPException(status_code=409, detail=result.denied_reason or "could not propose")
+    return {"proposed": True, "fact_key": result.fact_key,
+            "governance_status": "pending_confirmation"}
 
 
 @router.post("/entity/dismiss", dependencies=[Depends(require_catalog_write)])
