@@ -33,6 +33,7 @@ from featuregen.overlay.upload.contract.author import (
     ContractDraft,
     CrossCatalogPlanRequired,
     StalePlan,
+    _as_of_column,
     _envelope_join_path,
     draft_contract,
 )
@@ -50,7 +51,10 @@ from featuregen.overlay.upload.contract.govern import (
     Contract,
     ContractPointerConflict,
     ContractValidationError,
+    binding_exposure,
+    binding_hash,
     confirm_contract,
+    confirmed_role_bindings,
     get_contract_detail,
     list_contracts,
 )
@@ -138,6 +142,13 @@ class DraftIn(BaseModel):
     derives_pairs: list[tuple[str, str]] = []
     join_path: list[dict] = []
     intent_id: str | None = None   # server re-reads target_ref + links the contract via this
+    # H1b Gate-1 role-binding confirmation: the binding_hash the client SAW at /contract/draft. At
+    # confirm the server recomputes the CURRENT binding_hash from its authoritative reconciled bindings
+    # and 409s if it differs (bindings drifted since draft — re-review). LEGACY DEGRADATION: absent
+    # (None) ⟹ the gate is SKIPPED (a pre-H1b client that never fetched a hash is not broken); a client
+    # that sends it gets the fail-closed gate. Requirement ids / "passed" are NEVER accepted here — the
+    # server mints durable ids at confirm (Pydantic ignores any such extra body fields).
+    expected_binding_hash: str | None = None
 
     def to_draft(self) -> ContractDraft:
         return ContractDraft(
@@ -623,7 +634,14 @@ def draft(body: DraftReqIn, conn: _Conn, identity: _Identity, client: _LLM) -> d
     # the request model carries no client snapshot id, so there is nothing client-supplied to trust.
     # Null on a READ COMMITTED / pre-C0 considered set. This is ADDITIVE — the validator is unchanged.
     snapshot = considered_snapshot_lineage(conn, body.intent_id)
-    return {"draft": d, "unresolved": unresolved, "intent_id": body.intent_id, "snapshot": snapshot}
+    # H1b — expose the exact role bindings (role / column-ref / source / authority / warnings) + the
+    # overall binding_hash the human is confirming. The confirm requires this hash and 409s if the
+    # server's authoritative bindings drift before finalize (see /contract/confirm). Computed over the
+    # SERVER-authoritative reconciled draft `d`, so it equals the confirm-time recompute unless the
+    # underlying catalog state actually drifts. READ-ONLY (no global authority write).
+    bindings = confirmed_role_bindings(conn, d)
+    return {"draft": d, "unresolved": unresolved, "intent_id": body.intent_id, "snapshot": snapshot,
+            "bindings": binding_exposure(bindings), "binding_hash": binding_hash(bindings)}
 
 
 @router.get("/contracts", dependencies=[Depends(require_feature_read)])
@@ -674,8 +692,15 @@ def confirm(body: DraftIn, conn: _Conn, identity: _Identity) -> Contract:
     # NEEDS_EXTERNAL_VALIDATION -> DESIGN_CHECKED at the GOVERNING write. Overwrite both from the SERVER-
     # reconstructed chosen (the same server-authoritative pattern as join_path below), so the re-run
     # always reasons over the operands the human actually chose.
+    # H1b: reconcile as_of_column SERVER-side too (mirroring grain_table/derives_from). The as_of role
+    # is a confirmed binding; deriving it from the server chosen (never the client body) makes the
+    # persisted bindings + the binding_hash fully server-authoritative and stable draft→confirm, so an
+    # honest confirm can never be derailed and a tampered as_of is simply ignored (like grain_table).
+    _catalogs = {cs for cs, _ref in chosen.derives_pairs}
+    _grain_catalog = next(iter(_catalogs)) if len(_catalogs) == 1 else None
     draft = replace(draft, grain_table=chosen.grain_table,
-                    derives_from=list(chosen.derives_from))
+                    derives_from=list(chosen.derives_from),
+                    as_of_column=_as_of_column(conn, chosen.grain_table, _grain_catalog))
     # 3C.2a fail-closed at the GOVERNING write: re-run the freshness recheck against the SERVER-
     # reconstructed chosen feature's plan envelope (never the client body) under the request's roles —
     # a plan that drifted between draft and confirm must never silently finalize (409, regenerate). The
@@ -708,11 +733,23 @@ def confirm(body: DraftIn, conn: _Conn, identity: _Identity) -> Contract:
         logger.info("governing contract for intent %s against snapshot %s (run %s, content_hash %s)",
                     body.intent_id, lineage["snapshot_id"], lineage["generation_run_id"],
                     lineage["content_hash"])
+    # H1b — the GATE-1 ROLE-BINDING analog of the plan-staleness 409. Recompute the CURRENT binding_hash
+    # from the SERVER-authoritative reconciled bindings (the exact set confirm will persist) and, when the
+    # client sent the hash it saw at draft, fail closed (409) if they differ — a binding drifted between
+    # draft and confirm (a column retyped, a fact retired/expired, an authority changed). This is confirm-
+    # time REVALIDATION: the per-binding state signature (H2c) folds each referenced fact's current
+    # governed state, so an expired/unauthorized fact moves the hash and never finalizes on the drifted
+    # binding set. LEGACY DEGRADATION: a body with no `expected_binding_hash` skips the gate (unchanged).
+    current_binding_hash = binding_hash(confirmed_role_bindings(conn, draft))
+    if (body.expected_binding_hash is not None
+            and current_binding_hash != body.expected_binding_hash):
+        raise HTTPException(status_code=409, detail="bindings changed, re-review")
     try:
         return confirm_contract(conn, draft, actor=identity.subject,
                                 roles=identity.role_claims,   # the CONFIRMER's authority reaches the
                                 #                               re-run's join-authority disposition
-                                now=datetime.now(UTC), target_ref=target, intent_id=body.intent_id)
+                                now=datetime.now(UTC), target_ref=target, intent_id=body.intent_id,
+                                confirmed_binding_hash=current_binding_hash)
     except ContractValidationError as e:
         raise HTTPException(status_code=422, detail=str(e)) from e
     except ContractPointerConflict as e:   # M-a: the pointer CAS lost a race -> conflict, not 500

@@ -22,6 +22,8 @@ from featuregen.overlay.upload.contract._serial import actor_json as _actor_json
 from featuregen.overlay.upload.contract._serial import requirements_to_json
 from featuregen.overlay.upload.contract.author import ContractDraft
 from featuregen.overlay.upload.contract.invalidation import (
+    _MISSING,
+    _catalog_state_signature,
     confirm_dependency_hash,
     dependencies_drifted,
     has_dependency_rows,
@@ -235,6 +237,86 @@ def _insert_contract_metadata_dependencies(conn, contract_id: str, draft: Contra
              item_hash))
 
 
+# ── H1b — Gate-1 role-binding confirmation hash ─────────────────────────────────────────────────────
+# The draft exposes the exact role bindings + a deterministic ``binding_hash``; the confirm requires that
+# hash and 409s if the server-authoritative bindings DRIFTED since draft (a column retyped, a fact
+# retired/expired, an authority changed). It is the ROLE-BINDING analog of the plan-staleness 409, over
+# the SAME reconciled inputs H2b persists as ``contract_input_column`` rows. Reuses the ONE hash scheme
+# (``canonical_hash``, H2b/H2c) + H2c's ``_catalog_state_signature`` — NO second hash, NO new machinery.
+def _binding_state_ref(role: str, logical_ref: str | None, grain_table: str | None) -> str | None:
+    """The PUBLIC-FLATTENED graph object_ref whose CURRENT state signature backs a binding's drift check.
+    derives / join refs are already public-flattened; the BARE grain-TABLE and as_of-COLUMN names the
+    input rows carry are flattened here (mirroring ``_contract_dependency_items``' ref rules) so a
+    retype / retire / expire of the underlying node changes the signature — a bare name would resolve
+    MISSING and never move."""
+    if role == "grain":
+        return f"public.{grain_table}".lower() if grain_table else None
+    if role == "as_of":
+        return (f"public.{grain_table}.{logical_ref}".lower()
+                if grain_table and logical_ref else None)
+    return logical_ref
+
+
+def _binding_authority(state) -> tuple[str, list[str]]:
+    """A human-facing authority label + warnings DERIVED from a binding's CURRENT catalog-state signature
+    (the same signature the hash folds, so exposure and gate can never disagree). ``MISSING`` ⟹ the ref
+    left the catalog; a governed fact flag (``is_grain`` / ``is_as_of``) or a classification status ⟹
+    ``governed``; a sensitivity tag surfaces a read-scope-restricted binding."""
+    if state == _MISSING:
+        return "missing", ["ref_not_in_catalog"]
+    warnings: list[str] = []
+    if state.get("sensitivity"):
+        warnings.append(f"sensitivity:{state['sensitivity']}")
+    governed = bool(state.get("is_grain") or state.get("is_as_of")
+                    or state.get("classification_status"))
+    return ("governed" if governed else "declared"), warnings
+
+
+def confirmed_role_bindings(conn, draft: ContractDraft) -> list[dict]:
+    """The ordered, server-authoritative role bindings the confirm PERSISTS as ``contract_input_column``
+    rows — reused for BOTH the ``/contract/draft`` exposure and the confirm-time binding-hash gate. Reuses
+    ``_contract_input_items`` (the exact reconciled inputs: derives + grain + as_of + governed join) and
+    H2c's ``_catalog_state_signature`` (the current load-bearing state — retype/retire/expire/unauthorize
+    all move it). READ-ONLY: it never writes, so computing bindings at draft/confirm mutates no global
+    field/fact authority. The internal ``_state`` signature is folded into the hash but omitted from the
+    exposure."""
+    bindings: list[dict] = []
+    for source, _graph_ref, logical_ref, physical_ref, role, decision_id, fact_id in \
+            _contract_input_items(conn, draft):
+        state = _catalog_state_signature(
+            conn, source, _binding_state_ref(role, logical_ref, draft.grain_table))
+        authority, warnings = _binding_authority(state)
+        bindings.append({
+            "role": role, "source": source, "ref": physical_ref or logical_ref,
+            "decision_id": decision_id, "fact_id": fact_id,
+            "authority": authority, "warnings": warnings, "_state": state})
+    return bindings
+
+
+def binding_hash(bindings: list[dict]) -> str | None:
+    """A stable content hash over the SORTED per-binding hashes of the confirmed role bindings — reuses
+    ``canonical_hash`` (H2b/H2c's ONE scheme; no second hash). Contract-INDEPENDENT (no ``contract_id``),
+    so a draft and its confirm derive the SAME value for the SAME reconciled bindings; ANY drift
+    (retype / retire / expire / authority change) moves a binding's ``_state`` → a different hash → the
+    confirm 409s. ``None`` when there are no bindings (nothing to gate)."""
+    if not bindings:
+        return None
+    per = sorted(
+        canonical_hash({"role": b["role"], "source": b["source"], "ref": b["ref"],
+                        "decision_id": b["decision_id"], "fact_id": b["fact_id"],
+                        "authority": b["authority"], "state": b["_state"]})
+        for b in bindings)
+    return canonical_hash({"bindings": per})
+
+
+def binding_exposure(bindings: list[dict]) -> list[dict]:
+    """The ``/contract/draft``-facing projection of the confirmed bindings: role / column-ref / source /
+    authority / warnings per binding (the internal state signature is dropped). Shows the human EXACTLY
+    what they are confirming, alongside the overall ``binding_hash``."""
+    return [{"role": b["role"], "ref": b["ref"], "source": b["source"],
+             "authority": b["authority"], "warnings": b["warnings"]} for b in bindings]
+
+
 def _cancel_undelivered_external_submissions(conn, prior_contract_id: str | None) -> None:
     """H2b — Delivery I seam (NO-OP stub). On a pointer advance the plan requires cancelling any
     UNDELIVERED external submissions for the now-superseded contract. Delivery I (external submissions)
@@ -272,7 +354,8 @@ class Contract:
 
 def confirm_contract(conn, draft: ContractDraft, *, actor, roles: Iterable[str] = (),
                      target_ref: str | None = None,
-                     now: datetime | None = None, intent_id: str | None = None) -> Contract:
+                     now: datetime | None = None, intent_id: str | None = None,
+                     confirmed_binding_hash: str | None = None) -> Contract:
     """The human gate. RE-RUNS the deterministic MCV (B1) and refuses to govern an invalid draft, then
     registers a versioned governed contract + wires its derives-from into the feature layer. Re-confirming
     the same feature bumps the version. A non-empty definition is required (no empty-narrative contract).
@@ -327,6 +410,15 @@ def confirm_contract(conn, draft: ContractDraft, *, actor, roles: Iterable[str] 
     # broaden (which repoints the mutable contract_considered.snapshot_id) cannot change what catalog state
     # this governed contract was authored against. NULL on a pre-C0 / READ COMMITTED set (additive).
     metadata_snapshot_id, metadata_content_hash = _confirm_snapshot_binding(conn, intent_id)
+    # H1b — FOLD the confirmed role-binding hash into the 1011 ``metadata_input_fingerprint`` (the
+    # feature-contract metadata fingerprint now includes the confirmed role-binding hash; no migration —
+    # reuses the existing column). ``metadata_content_hash`` (the MF-3 immutable snapshot binding) stays
+    # PURE, so "what catalog state this contract was authored against" is unchanged; only the additive
+    # fingerprint composes the two. NULL binding_hash (a direct/pre-H1b confirm) ⟹ the pre-H1b value
+    # (the pure content_hash), byte-identical.
+    input_fingerprint = (
+        canonical_hash({"snapshot": metadata_content_hash, "binding_hash": confirmed_binding_hash})
+        if confirmed_binding_hash is not None else metadata_content_hash)
     # H2b STEP 3 — insert the immutable contract version + the new 1011 columns. generation_source /
     # recipe_id / physical_plan_id / planner_declaration_id are NULL: the draft does not carry them yet.
     # # H1a/H3 will supply them (recipe / physical-plan / planner-declaration provenance).
@@ -345,8 +437,9 @@ def confirm_contract(conn, draft: ContractDraft, *, actor, roles: Iterable[str] 
          #                            a real change and must be recorded, never silently kept stale)
          json.dumps(requirements_to_json(check.requirements)),
          metadata_snapshot_id, metadata_content_hash,   # MF-3: immutable contract -> snapshot binding
-         metadata_content_hash,      # 1011 metadata_input_fingerprint — the C0 snapshot input hash the
-         #                             contract was authored against (NULL on a pre-C0 confirm)
+         input_fingerprint,          # 1011 metadata_input_fingerprint — the C0 snapshot input hash the
+         #                             contract was authored against, FOLDED with the H1b binding_hash
+         #                             (pure content_hash when no binding_hash; NULL on a pre-C0 confirm)
          check.validation_status,    # 1011 initial_validation_status — the at-confirm INITIAL axis, same
          #                             value the ASSESSED event stamps (SEPARATE from the mutable 1003 col)
          "DESIGN-CHECKED"))          # 1011 initial_verification — the at-confirm INITIAL verification
