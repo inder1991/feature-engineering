@@ -175,7 +175,13 @@ class FieldPolicy:
     * ``disqualifiers`` — the ``Disqualifier`` reasons this field honours.
     * ``resolution_mode`` — ``GENERIC_FIELD`` (owned here) or ``SPECIALIZED_FACT`` (display-only).
     * ``conflict_strategy`` — the field-specific merge applied to the operational value.
-    * ``severity_order`` — optional weakest→strongest order for ``MOST_RESTRICTIVE`` (Phase 0)."""
+    * ``severity_order`` — optional weakest→strongest order for ``MOST_RESTRICTIVE`` (Phase 0).
+    * ``human_editable`` — opt-in (default ``False``): may this field be corrected through the
+      GENERIC scalar field-correction command (Delivery F)? It is set ``True`` ONLY on the advisory
+      display/semantic scalars (definition / concept / domain / business term / …); the identity,
+      physical/logical TYPE, sensitivity, and the specialized grain/time/join/entity/currency facts
+      keep ``False`` and retain their DEDICATED commands. Authority is UNAFFECTED — this flag gates
+      only which command may write human evidence, never how the resolver weighs it."""
 
     influence_max: InfluenceTier
     display_rule: AuthorityPredicate
@@ -184,6 +190,7 @@ class FieldPolicy:
     resolution_mode: ResolutionMode
     conflict_strategy: ConflictStrategy
     severity_order: tuple[str, ...] = ()
+    human_editable: bool = False
 
 
 @dataclass(frozen=True, slots=True)
