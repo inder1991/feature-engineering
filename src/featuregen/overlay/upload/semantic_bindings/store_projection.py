@@ -58,7 +58,15 @@ COMPLETION_STATUSES = frozenset({"complete", "partial", "failed"})
 # Versioned fingerprint algo — an INGESTION-STAGE input hash, NOT the C0 snapshot, NOT gn-v1.
 FINGERPRINT_ALGO_VERSION = "sbf-v1"
 # Versioned set content-hash algo — recomputed + verified on rebuild (fail-closed on drift).
-CONTENT_HASH_ALGO_VERSION = "sbc-content-v1"
+# Bumped to v2 with M-1: the hash now covers reason_codes/evidence_json/llm_call_ref (see below).
+CONTENT_HASH_ALGO_VERSION = "sbc-content-v2"
+
+# The DETERMINISTIC-shortlist task version — the ONLY producer whose set may ever become ``current``
+# (I-A). The D3 LLM set (``enrich.TASK_VERSION = 'd3-select-v1'``) is deliberately NEVER current: the
+# deterministic set stays the governed-proposal authority. This constant is the canonical home (store
+# imports store_projection, so putting it here avoids the reverse import cycle); ``store`` re-exports
+# it as ``DEFAULT_SHORTLIST_VERSION``.
+DETERMINISTIC_TASK_VERSION = "d2-shortlist-v1"
 
 _MAX_DEFINITION_LEN = 600
 
@@ -214,14 +222,22 @@ def _set_content_hash(
     candidates: Sequence[Mapping[str, object]],
 ) -> str:
     """The set's deterministic content hash — a pure function of its identity dims + its candidates'
-    stored content (id, disposition, proposed_value), sorted by candidate_id. Computed at persist and
-    RE-VERIFIED on rebuild: a mismatch is an impossible content-hash conflict (a replay of the same
-    identity produced different content, or a stored row was tampered) and fails closed."""
+    stored content, sorted by candidate_id. Computed at persist and RE-VERIFIED on rebuild: a mismatch
+    is an impossible content-hash conflict (a replay of the same identity produced different content,
+    or a stored row was tampered) and fails closed.
+
+    M-1: the per-candidate material covers ``disposition`` + ``proposed_value`` AND the audit-bearing
+    ``reason_codes`` / ``evidence_json`` / ``llm_call_ref`` columns, so a superuser edit of any of them
+    is caught by the rebuild's tamper re-verification (they used to be silently un-hashed). Callers on
+    BOTH the persist and rebuild paths must supply the same keys (``rebuild_current_sets`` reads them
+    back from ``semantic_binding_candidate``)."""
     items = sorted(
         (
             {
                 "candidate_id": c["candidate_id"], "disposition": c["disposition"],
                 "proposed_value": c["proposed_value"],
+                "reason_codes": c.get("reason_codes"), "evidence_json": c.get("evidence_json"),
+                "llm_call_ref": c.get("llm_call_ref"),
             }
             for c in candidates
         ),
@@ -303,7 +319,12 @@ def persist_candidate_set(
         prompt_version=prompt_version, schema_version=schema_version, config_version=config_version,
         completion_status=completion_status,
         candidates=[{"candidate_id": cid, "disposition": c.disposition,
-                     "proposed_value": c.proposed_value} for cid, c in prepared])
+                     "proposed_value": c.proposed_value,
+                     # M-1: normalize exactly as the columns round-trip through jsonb so the
+                     # rebuild's recompute (which reads them back) matches byte-for-byte.
+                     "reason_codes": list(c.reason_codes),
+                     "evidence_json": dict(c.evidence_json), "llm_call_ref": c.llm_call_ref}
+                    for cid, c in prepared])
 
     params: list[object] = [
         set_id, catalog_source, table_graph_ref, ingestion_run_id, attempt_no,
@@ -434,46 +455,63 @@ def invalidate_current_set_if_stale(
 # Reset / rebuild (NO LLM)
 # ==================================================================================================
 def rebuild_current_sets(
-    conn: DbConn, *, live_fingerprints: Mapping[tuple[str, str], str] | None = None,
+    conn: DbConn, *, live_fingerprints: Mapping[tuple[str, str], str],
     now: datetime | None = None,
 ) -> RebuildResult:
     """Deterministically rebuild ``current_semantic_binding_candidate_set`` from the immutable
     candidate store ALONE — NO LLM call. Per (catalog_source, table_graph_ref): the LATEST ``complete``
-    set by ``(created_at, candidate_set_id)``. Each winner's stored ``content_hash`` is RE-VERIFIED
-    against its candidates; a mismatch FAILS CLOSED (:class:`SemanticBindingContentConflict`).
+    DETERMINISTIC set by ``(attempt_no, created_at, candidate_set_id)``. Each winner's stored
+    ``content_hash`` is RE-VERIFIED against its candidates; a mismatch FAILS CLOSED
+    (:class:`SemanticBindingContentConflict`).
 
-    ``live_fingerprints`` (optional) maps a table to its current metadata fingerprint: a winner whose
-    fingerprint no longer matches is projected ``unverifiable`` (not silently current). Omitted → every
-    winner is trusted as current (pure projection-loss recovery)."""
+    Two fail-closed guards (I-A):
+
+    * **LLM sets are never current.** Only the DETERMINISTIC producer
+      (``DETERMINISTIC_TASK_VERSION``) is eligible — the D3 ``d3-select-v1`` set (persisted as audit
+      evidence, never the authority) can never be promoted to current, even when its id sorts higher
+      in a same-transaction tie.
+    * **``live_fingerprints`` is REQUIRED and gates every promotion.** It maps each table to its
+      CURRENT metadata fingerprint. A winner becomes ``current`` ONLY when its stored fingerprint is
+      present AND still equals the live one; a table whose live fingerprint is unknown (absent) or has
+      MOVED is projected ``unverifiable`` — so a set the re-ingest invalidation retired can NEVER be
+      silently resurrected by this recovery tool, and a stale set is never re-promoted. Pass ``{}`` to
+      deliberately mark every winner unverifiable (e.g. a bare tamper re-verification sweep)."""
     now = now or datetime.now(UTC)
     winners = conn.execute(
         "SELECT DISTINCT ON (catalog_source, table_graph_ref) "
         "  candidate_set_id, catalog_source, table_graph_ref, ingestion_run_id, attempt_no, "
         "  metadata_input_fingerprint, task_version, prompt_version, schema_version, config_version, "
         "  completion_status, content_hash "
-        "FROM semantic_binding_candidate_set WHERE completion_status = 'complete' "
-        "ORDER BY catalog_source, table_graph_ref, created_at DESC, candidate_set_id DESC"
+        "FROM semantic_binding_candidate_set "
+        "WHERE completion_status = 'complete' AND task_version = %s "
+        # attempt_no DESC first so a later retry supersedes an earlier attempt landing in the SAME
+        # transaction (identical created_at); candidate_set_id only ever breaks a true tie.
+        "ORDER BY catalog_source, table_graph_ref, attempt_no DESC, created_at DESC, "
+        "candidate_set_id DESC",
+        (DETERMINISTIC_TASK_VERSION,),
     ).fetchall()
 
     projected = unverifiable = 0
     for (set_id, cat, tbl, run_id, attempt, fp, taskv, promptv, schemav, configv,
          completion, stored_hash) in winners:
         cands = conn.execute(
-            "SELECT candidate_id, disposition, proposed_value FROM semantic_binding_candidate "
-            "WHERE candidate_set_id = %s", (set_id,)).fetchall()
+            "SELECT candidate_id, disposition, proposed_value, reason_codes, evidence_json, "
+            "llm_call_ref FROM semantic_binding_candidate WHERE candidate_set_id = %s",
+            (set_id,)).fetchall()
         recomputed = _set_content_hash(
             catalog_source=cat, table_graph_ref=tbl, ingestion_run_id=run_id, attempt_no=attempt,
             metadata_input_fingerprint=fp, task_version=taskv, prompt_version=promptv,
             schema_version=schemav, config_version=configv, completion_status=completion,
-            candidates=[{"candidate_id": cid, "disposition": disp, "proposed_value": val}
-                        for cid, disp, val in cands])
+            candidates=[{"candidate_id": cid, "disposition": disp, "proposed_value": val,
+                         "reason_codes": rc, "evidence_json": ev, "llm_call_ref": lcr}
+                        for cid, disp, val, rc, ev, lcr in cands])
         if recomputed != stored_hash:
             raise SemanticBindingContentConflict(
                 f"rebuild: candidate_set_id {set_id} content_hash does not match its candidates — "
                 "impossible content-hash conflict (tamper/corruption); fail-closed")
 
-        live_fp = None if live_fingerprints is None else live_fingerprints.get((cat, tbl))
-        if live_fingerprints is not None and live_fp != fp:
+        live_fp = live_fingerprints.get((cat, tbl))
+        if live_fp != fp:
             _upsert_current(conn, catalog_source=cat, table_graph_ref=tbl, candidate_set_id=None,
                             fingerprint=live_fp or fp, status="unverifiable", now=now)
             unverifiable += 1

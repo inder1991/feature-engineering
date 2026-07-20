@@ -19,6 +19,7 @@ from datetime import datetime
 from featuregen.contracts import DbConn
 from featuregen.overlay.upload.semantic_bindings.shortlist import PassBColumn, PassCIdentifier
 from featuregen.overlay.upload.semantic_bindings.store_projection import (
+    DETERMINISTIC_TASK_VERSION,
     CandidateInput,
     PersistResult,
     ProjectionOutcome,
@@ -34,7 +35,9 @@ from featuregen.overlay.upload.semantic_bindings.types import (
 )
 
 # D2 is deterministic + LLM-free: the provenance versions are FIXED constants (no model / prompt).
-DEFAULT_SHORTLIST_VERSION = "d2-shortlist-v1"
+# The shortlist/task version is the SAME constant the current-set CAS uses to gate eligibility
+# (I-A) — sourced from store_projection so the two can never drift apart.
+DEFAULT_SHORTLIST_VERSION = DETERMINISTIC_TASK_VERSION
 DEFAULT_SCHEMA_VERSION = "d2-schema-v1"
 DEFAULT_CONFIG_VERSION = "d2-config-v1"
 DETERMINISTIC_MODEL_VERSION = "deterministic"

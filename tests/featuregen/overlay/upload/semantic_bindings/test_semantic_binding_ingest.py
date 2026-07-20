@@ -57,6 +57,28 @@ def _currency_rows() -> list[CanonicalRow]:
     ]
 
 
+def _wide_transactions() -> list[CanonicalRow]:
+    """A 5-column ``transactions`` table (one STRONG currency candidate). Wide enough that dropping a
+    small 2-column sibling table keeps the re-upload's object overlap above the large-change brake's
+    60% floor (5+1 of 5+1+2+1 = 67%), so the re-ingest invalidation actually runs (not held)."""
+    return [
+        CanonicalRow(_SOURCE, "transactions", "txn_id", "integer", is_grain=True),
+        CanonicalRow(_SOURCE, "transactions", "amount", "numeric"),
+        CanonicalRow(_SOURCE, "transactions", "currency", "text"),
+        CanonicalRow(_SOURCE, "transactions", "memo", "text"),
+        CanonicalRow(_SOURCE, "transactions", "note", "text"),
+    ]
+
+
+def _wide_two_table_rows() -> list[CanonicalRow]:
+    """``transactions`` (wide) + a small ``accounts`` sibling -> two current candidate sets."""
+    return [
+        *_wide_transactions(),
+        CanonicalRow(_SOURCE, "accounts", "acct_id", "integer", is_grain=True),
+        CanonicalRow(_SOURCE, "accounts", "ccy", "text"),
+    ]
+
+
 def _amount_currency_key() -> str:
     return fact_key(
         CatalogObjectRef(catalog_source=_SOURCE, object_kind="column", schema="public",
@@ -222,6 +244,47 @@ def test_reingest_invalidation_when_disabled(db, monkeypatch):
     assert len(current2) == 1 and current2[0][1] is None and current2[0][2] == "unverifiable"
     # The old immutable set is KEPT as history (the disabled run wrote no new set).
     assert _count(db, "semantic_binding_candidate_set") == sets_before
+
+
+# ── 5b. I-B — a table DROPPED from a re-upload has its current set flipped to `unverifiable` ───────
+
+def test_reingest_dropped_table_current_set_becomes_unverifiable(db, monkeypatch):
+    monkeypatch.setenv(_CANDS, "1")
+    res1 = ingest_upload(db, _SOURCE, _wide_two_table_rows(), actor=_actor(), now=_NOW)
+    assert res1.status == "ingested"
+    current1 = {r[0]: (r[1], r[2]) for r in _current(db)}
+    assert current1["public.transactions"][1] == "current"
+    assert current1["public.accounts"][1] == "current"            # both tables current
+
+    # re-upload WITHOUT the accounts table -> it is dropped from the source (overlap stays > 60%).
+    res2 = ingest_upload(db, _SOURCE, _wide_transactions(), actor=_actor(), now=_NOW)
+    assert res2.status == "ingested"
+    current2 = {r[0]: (r[1], r[2]) for r in _current(db)}
+    assert current2["public.transactions"][1] == "current"        # still present -> re-projected
+    # the DROPPED table's current set is invalidated (candidate_set_id NULL) — the immutable set stays.
+    assert current2["public.accounts"] == (None, "unverifiable")
+
+
+# ── 5c. I-C — a candidate LEAVING the current set stales its linked DRAFT proposal (fact untouched) ─
+
+def test_reingest_stales_orphaned_draft_proposal(db, monkeypatch):
+    monkeypatch.setenv(_CANDS, "1")
+    monkeypatch.setenv(_PROPS, "1")
+    res1 = ingest_upload(db, _SOURCE, _currency_rows(), actor=_actor(), now=_NOW)
+    assert res1.semantic_binding_proposed == 1 and _proposals(db) == 1
+    assert fold_overlay_state(load_fact(db, _amount_currency_key())).status == "DRAFT"
+
+    # re-upload WITHOUT the currency column -> the amount->currency candidate can no longer be
+    # enumerated, so it LEAVES the current set; `stale_orphaned_proposals` (wired into the candidate
+    # stage) retires its now-orphaned DRAFT link. The new set proposes nothing (no currency column).
+    no_ccy = [CanonicalRow(_SOURCE, "transactions", "txn_id", "integer", is_grain=True),
+              CanonicalRow(_SOURCE, "transactions", "amount", "numeric")]
+    res2 = ingest_upload(db, _SOURCE, no_ccy, actor=_actor(), now=_NOW)
+    assert res2.status == "ingested"
+    assert _proposals(db) == 0                                     # the orphaned DRAFT link retired
+    # the DRAFT fact itself is UNTOUCHED — only a VERIFIED fact's own governed deps invalidate it, and
+    # a DRAFT is never served (VERIFIED-survival is proven in test_store_projection).
+    assert fold_overlay_state(load_fact(db, _amount_currency_key())).status == "DRAFT"
 
 
 # ── 6. GATE — feature + contract row counts unchanged + NO compiler entrypoint called ─────────────

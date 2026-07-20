@@ -586,7 +586,19 @@ def _invalidate_stale_semantic_binding_sets(conn, catalog_source: str, prepared:
             table_fingerprint_now=fingerprint, now=now)
         if outcome is not None and outcome.status == "unverifiable":
             invalidated += 1
-    return invalidated
+    # I-B: a table DROPPED from this re-upload is absent from `prepared`, so the loop above never
+    # re-evaluates it — and `build_graph` already wiped its nodes — yet its `current` candidate set
+    # would stay `status='current'` forever, serving candidates for a table that no longer exists.
+    # Flip every current set of this source whose table is NOT in this upload to `unverifiable` (the
+    # immutable set stays as history — the CAS's whole purpose). One UPDATE, same savepoint, NO LLM.
+    present = [table_graph_ref(view) for view, _pass_c, _fp in prepared]
+    dropped = conn.execute(
+        "UPDATE current_semantic_binding_candidate_set "
+        "SET status = 'unverifiable', candidate_set_id = NULL, projected_at = %s "
+        "WHERE catalog_source = %s AND candidate_set_id IS NOT NULL AND table_graph_ref <> ALL(%s) "
+        "RETURNING table_graph_ref",
+        (now or datetime.now(UTC), catalog_source, present)).fetchall()
+    return invalidated + len(dropped)
 
 
 def _run_semantic_binding_candidate_stage(conn, catalog_source: str, prepared: list, *,
@@ -601,7 +613,10 @@ def _run_semantic_binding_candidate_stage(conn, catalog_source: str, prepared: l
     whose D3 stage hit a bound (byte/call/deadline) or provider fault — the caller marks the stage
     ``partial`` WITHOUT changing upload acceptance. NEVER promotes a fact to VERIFIED."""
     from featuregen.overlay.upload.semantic_bindings.shortlist import shortlist
-    from featuregen.overlay.upload.semantic_bindings.store import store_shortlist
+    from featuregen.overlay.upload.semantic_bindings.store import store_shortlist, table_graph_ref
+    from featuregen.overlay.upload.semantic_bindings.store_projection import (
+        stale_orphaned_proposals,
+    )
     from featuregen.overlay.upload.semantic_bindings.types import STRONG
     from featuregen.overlay.upload.semantic_bindings.validate import validate_candidates
 
@@ -616,6 +631,13 @@ def _run_semantic_binding_candidate_stage(conn, catalog_source: str, prepared: l
             conn, table_view=view, candidates=deterministic, catalog_source=catalog_source,
             ingestion_run_id=run_id, attempt_no=1, metadata_input_fingerprint=fingerprint,
             pass_c=pass_c, now=now)
+        # I-C: `store_shortlist` just CAS-projected this upload's set current, so every candidate of a
+        # PRIOR set for this table has now left the current set (each re-upload mints a new set id).
+        # Retire the linked DRAFT proposals those departed candidates orphaned — a VERIFIED fact is
+        # untouched (its link SURVIVES as the durable divergence signal; only its own governed deps
+        # invalidate it). Runs before the proposal stage re-links this upload's current candidates.
+        stale_orphaned_proposals(conn, catalog_source=catalog_source,
+                                 table_graph_ref=table_graph_ref(view))
         candidates_total += len(deterministic)
         strong = [c for c in deterministic if c.disposition == STRONG]
         proposable.append((store_res.persist.candidate_set_id, strong))

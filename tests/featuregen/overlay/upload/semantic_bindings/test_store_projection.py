@@ -11,6 +11,7 @@ from datetime import UTC, datetime
 import pytest
 
 from featuregen.overlay.upload.semantic_bindings.store_projection import (
+    DETERMINISTIC_TASK_VERSION,
     CandidateInput,
     SemanticBindingContentConflict,
     mint_candidate_set_id,
@@ -23,6 +24,8 @@ from featuregen.overlay.upload.semantic_bindings.store_projection import (
 )
 
 _T0 = datetime(2026, 7, 20, 12, 0, tzinfo=UTC)
+# The D3 LLM producer's task version — a set persisted for audit that must NEVER become current.
+_LLM_TASK_VERSION = "d3-select-v1"
 
 
 def _currency(subject="public.txn.amt", target="public.txn.ccy", disposition="strong",
@@ -43,10 +46,11 @@ def _entity(subject="public.txn.cust", entity_id="customer", input_hash="ih_cust
 
 
 def _persist(conn, *, attempt_no=1, fingerprint="fp1", completion_status="complete",
-             candidates=None, run_id="run_1", table="public.txn", created_at=_T0):
+             candidates=None, run_id="run_1", table="public.txn", created_at=_T0,
+             task_version=DETERMINISTIC_TASK_VERSION):
     return persist_candidate_set(
         conn, catalog_source="src", table_graph_ref=table, ingestion_run_id=run_id,
-        attempt_no=attempt_no, metadata_input_fingerprint=fingerprint, task_version="tv1",
+        attempt_no=attempt_no, metadata_input_fingerprint=fingerprint, task_version=task_version,
         prompt_version="pv1", schema_version="sv1", config_version="cv1",
         completion_status=completion_status,
         candidates=[_currency()] if candidates is None else candidates, created_at=created_at)
@@ -96,6 +100,31 @@ def test_content_hash_conflict_fails_closed(conn) -> None:
     # same identity tuple (same attempt) but DIFFERENT candidate content -> fail closed.
     with pytest.raises(SemanticBindingContentConflict):
         _persist(conn, candidates=[_currency(), _entity()])
+
+
+def _currency_rc(*, reason_codes=(), evidence_json=None, llm_call_ref=None) -> CandidateInput:
+    """A currency candidate with a fixed IDENTITY (same candidate_id) but tunable audit columns."""
+    return CandidateInput(
+        binding_kind="currency_binding", subject_graph_ref="public.txn.amt",
+        subject_logical_ref="src::public.txn.amt", target_graph_ref="public.txn.ccy",
+        target_logical_ref="src::public.txn.ccy", input_hash="ih_amt", disposition="strong",
+        model_version="m1", prompt_version="pv1", schema_version="sv1", config_version="cv1",
+        reason_codes=reason_codes, evidence_json=evidence_json or {}, llm_call_ref=llm_call_ref)
+
+
+def test_content_hash_covers_audit_columns(conn) -> None:
+    # M-1: reason_codes / evidence_json / llm_call_ref are now part of the set content_hash, so a
+    # same-attempt replay whose audit columns were tampered fails closed (they used to be un-hashed —
+    # the candidate_id is identical, so the set would silently keep the original otherwise).
+    _persist(conn, candidates=[_currency_rc(reason_codes=("over_bound",))])
+    with pytest.raises(SemanticBindingContentConflict):
+        _persist(conn, candidates=[_currency_rc(reason_codes=("ambiguous_target",))])   # reason_codes
+    with pytest.raises(SemanticBindingContentConflict):
+        _persist(conn, candidates=[_currency_rc(reason_codes=("over_bound",),
+                                                evidence_json={"signals": ["x"]})])      # evidence
+    with pytest.raises(SemanticBindingContentConflict):
+        _persist(conn, candidates=[_currency_rc(reason_codes=("over_bound",),
+                                                llm_call_ref="llm_1")])                  # llm_call_ref
 
 
 def test_entity_and_currency_shapes_persist(conn) -> None:
@@ -167,6 +196,12 @@ def test_complete_empty_set_is_a_tombstone(conn) -> None:
 # ==================================================================================================
 # Reset / rebuild — NO LLM
 # ==================================================================================================
+def _live(*tables, fp="fp1"):
+    """The live-fingerprint map ``rebuild_current_sets`` now REQUIRES (I-A) — each table maps to its
+    current metadata fingerprint."""
+    return {("src", t): fp for t in tables}
+
+
 def test_rebuild_reconstructs_latest_complete_per_table(conn) -> None:
     old = _persist(conn, attempt_no=1, candidates=[_currency()],
                    created_at=datetime(2026, 7, 20, 10, 0, tzinfo=UTC))
@@ -175,8 +210,9 @@ def test_rebuild_reconstructs_latest_complete_per_table(conn) -> None:
     # a second table, one complete set.
     other = _persist(conn, table="public.acct", candidates=[_currency(subject="public.acct.bal")],
                      created_at=datetime(2026, 7, 20, 10, 30, tzinfo=UTC))
-    # projection loss: the current table is empty. Rebuild from the immutable store alone (no LLM).
-    result = rebuild_current_sets(conn)
+    # projection loss: the current table is empty. Rebuild from the immutable store alone (no LLM),
+    # supplying the live fingerprints that gate each promotion.
+    result = rebuild_current_sets(conn, live_fingerprints=_live("public.txn", "public.acct"))
     assert result.tables == 2 and result.projected == 2
     assert _current(conn, "public.txn") == (new.candidate_set_id, "current")   # latest complete wins
     assert _current(conn, "public.acct") == (other.candidate_set_id, "current")
@@ -191,18 +227,42 @@ def test_rebuild_marks_unverifiable_when_live_fingerprint_moved(conn) -> None:
     del res
 
 
+def test_rebuild_requires_live_fingerprint_never_resurrects_unknown(conn) -> None:
+    # I-A: a winner whose live fingerprint is UNKNOWN (absent from the map — e.g. a set the re-ingest
+    # invalidation had already retired) is projected `unverifiable`, NEVER silently resurrected.
+    _persist(conn, fingerprint="fp1")
+    result = rebuild_current_sets(conn, live_fingerprints={})   # no live fingerprint for the table
+    assert result.tables == 1 and result.projected == 0 and result.unverifiable == 1
+    assert _current(conn) == (None, "unverifiable")
+
+
+def test_rebuild_never_promotes_the_llm_set_to_current(conn) -> None:
+    # I-A: the D3 LLM set and the D2 deterministic set share a table + created_at (same ingest tx).
+    # Only the deterministic set may become current — the LLM set is filtered out of eligibility
+    # entirely, so the same-tx id tie-break can never repoint current at it.
+    det = _persist(conn, candidates=[_currency()], task_version=DETERMINISTIC_TASK_VERSION,
+                   run_id="run_det", created_at=_T0)
+    llm = _persist(conn, candidates=[_currency()], task_version=_LLM_TASK_VERSION,
+                   run_id="run_llm", created_at=_T0)
+    assert det.candidate_set_id != llm.candidate_set_id
+    result = rebuild_current_sets(conn, live_fingerprints=_live("public.txn"))
+    assert result.tables == 1 and result.projected == 1     # exactly the deterministic winner
+    assert _current(conn) == (det.candidate_set_id, "current")   # NEVER the LLM set
+
+
 def test_rebuild_fails_closed_on_content_hash_conflict(conn) -> None:
     # a directly-inserted corrupt set (a bogus stored content_hash) simulates tamper/corruption.
+    # task_version is the DETERMINISTIC one so the winner is enumerated (else it'd be filtered out).
     set_id = mint_candidate_set_id(
         ingestion_run_id="run_x", attempt_no=1, catalog_source="src", table_graph_ref="public.bad",
-        metadata_input_fingerprint="fp1", task_version="tv1", prompt_version="pv1",
-        schema_version="sv1", config_version="cv1")
+        metadata_input_fingerprint="fp1", task_version=DETERMINISTIC_TASK_VERSION,
+        prompt_version="pv1", schema_version="sv1", config_version="cv1")
     conn.execute(
         "INSERT INTO semantic_binding_candidate_set (candidate_set_id, catalog_source, "
         "table_graph_ref, ingestion_run_id, attempt_no, metadata_input_fingerprint, task_version, "
         "prompt_version, schema_version, config_version, completion_status, content_hash) "
-        "VALUES (%s, 'src', 'public.bad', 'run_x', 1, 'fp1', 'tv1', 'pv1', 'sv1', 'cv1', "
-        "'complete', 'bogus-hash')", (set_id,))
+        "VALUES (%s, 'src', 'public.bad', 'run_x', 1, 'fp1', %s, 'pv1', 'sv1', 'cv1', "
+        "'complete', 'bogus-hash')", (set_id, DETERMINISTIC_TASK_VERSION))
     conn.execute(
         "INSERT INTO semantic_binding_candidate (candidate_id, candidate_set_id, catalog_source, "
         "subject_graph_ref, subject_logical_ref, binding_kind, target_graph_ref, "
@@ -210,8 +270,9 @@ def test_rebuild_fails_closed_on_content_hash_conflict(conn) -> None:
         "schema_version, config_version) VALUES ('sbc_x', %s, 'src', 'public.bad.amt', "
         "'src::public.bad.amt', 'currency_binding', 'public.bad.ccy', 'src::public.bad.ccy', "
         "'strong', 'ih', 'm1', 'pv1', 'sv1', 'cv1')", (set_id,))
+    # content-hash re-verification runs for every enumerated winner, independent of live fingerprints.
     with pytest.raises(SemanticBindingContentConflict):
-        rebuild_current_sets(conn)
+        rebuild_current_sets(conn, live_fingerprints=_live("public.bad"))
 
 
 # ==================================================================================================

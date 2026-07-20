@@ -11,6 +11,17 @@ Mapping (the brief's contract):
 * entity   → ``entity_assignment`` with ``{"entity_id": <known-entity value>}``.
 The subject column becomes the fact ``ref`` (a ``CatalogObjectRef``); E1's write gate re-checks
 column-ness, ``known_entities()`` membership, and same-table currency targeting.
+
+Scope (C-1, drift-staling correctness): the E1 fact ``ref`` — subject AND currency target — is
+minted in the PUBLIC-FLATTENED graph scope (``public.<table>.<column>``) that ``build_graph`` /
+``UploadCatalog`` / ``graph_node`` all use, NEVER the glossary-declared ``rec_schema`` the candidate
+view carries (e.g. ``sales`` for an FTR glossary source). The fact's recorded dependency
+(``overlay_fact_dependency``, keyed on ``display_object_ref``) MUST live in the same scope the upload
+drift snapshot emits; otherwise a dropped/retyped target under ``public.*`` never matches a
+``sales.*`` dependency, the VERIFIED binding never stales, and it serves a dropped column forever.
+Minting in ``public`` mirrors ``bridge_candidates``/``passc.lifecycle`` (whose fact refs are also
+``schema="public"``) and keeps the STALE/REVERIFY referent match (``graph_referent_gap`` vs
+``graph_node.object_ref``, itself ``public.*``) aligned too.
 """
 from __future__ import annotations
 
@@ -33,6 +44,11 @@ from featuregen.overlay.upload.semantic_bindings.types import (
 # is a review artefact, never auto-proposed into a governed fact.
 PROPOSABLE_DISPOSITIONS = frozenset({STRONG})
 
+# The public-flattened graph scope every fact ref is minted in (C-1). Matches
+# ``upload.graph._SCHEMA`` / ``upload.upload_catalog._SCHEMA`` — the scope the drift snapshot +
+# ``graph_node`` use, so a fact's dependency refs match a re-upload's drop/retype changes.
+_PUBLIC_SCHEMA = "public"
+
 
 @dataclass(frozen=True, slots=True)
 class ProposeOutcome:
@@ -44,9 +60,11 @@ class ProposeOutcome:
 
 
 def _subject_ref(candidate: SemanticBindingCandidate) -> CatalogObjectRef:
+    # C-1: schema is PUBLIC-FLATTENED (not the candidate view's rec_schema) so the fact's dependency
+    # refs match the public-scoped drift snapshot / graph_node and drift-staling fires.
     s = candidate.subject
     return CatalogObjectRef(catalog_source=s.catalog_source, object_kind="column",
-                            schema=s.schema, table=s.table, column=s.column)
+                            schema=_PUBLIC_SCHEMA, table=s.table, column=s.column)
 
 
 def to_fact_command(
@@ -60,9 +78,11 @@ def to_fact_command(
         if candidate.target is None:
             raise ValueError("currency_binding candidate has no target currency column")
         t = candidate.target
+        # C-1: the currency target is PUBLIC-FLATTENED too (same source/schema/table as the subject
+        # measure — the write gate requires it — so both sit in the drift-snapshot scope).
         value: dict[str, object] = {"currency_column": {
             "catalog_source": t.catalog_source, "object_kind": "column",
-            "schema": t.schema, "table": t.table, "column": t.column}}
+            "schema": _PUBLIC_SCHEMA, "table": t.table, "column": t.column}}
         fact_type = CURRENCY_BINDING
     elif candidate.binding_kind == ENTITY_ASSIGNMENT:
         if not candidate.entity_id:

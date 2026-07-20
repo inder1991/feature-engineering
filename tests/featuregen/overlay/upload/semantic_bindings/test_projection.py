@@ -12,9 +12,8 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 
 from tests.featuregen._helpers import mint_test_service_identity
-from tests.featuregen.overlay._helpers import StubCatalog, seed_verified_via_command
+from tests.featuregen.overlay._helpers import seed_verified_via_command
 
-from featuregen.overlay.catalog import CatalogObject, register_catalog_adapter
 from featuregen.overlay.catalog_changes import detect_catalog_changes
 from featuregen.overlay.expiry import fire_due_overlay_expiries
 from featuregen.overlay.identity import CatalogObjectRef, fact_key
@@ -27,6 +26,14 @@ from featuregen.overlay.upload.semantic_bindings.projection import (
     verified_currency_binding,
     verified_entity_of,
 )
+from featuregen.overlay.upload.semantic_bindings.propose import to_fact_command
+from featuregen.overlay.upload.semantic_bindings.types import (
+    CURRENCY_BINDING,
+    STRONG,
+    ColumnRef,
+    SemanticBindingCandidate,
+)
+from featuregen.overlay.upload.upload_catalog import UploadCatalog
 from featuregen.projections.runner import run_projection
 
 SOURCE = "fixture"
@@ -178,28 +185,46 @@ def test_reupload_reproject_keeps_binding_and_records_conflict_without_overwrite
     assert verified_entity_of(db, SOURCE, ENTITY_OBJ) == "customer"
 
 
-# --- 6) dependency staling: drop the target -> stale -> demote ------------------------------------
+# --- 6) C-1 GATING: a glossary-schema binding, minted+dropped through the REAL upload path ---------
 
-def test_dropping_currency_target_stales_and_demotes_the_edge(db):
-    objs = [CatalogObject(object_ref=r, object_kind="column", schema="sales", table=t, column=c,
-                          data_type="text", native_oid=None)
-            for r, t, c in (("sales.trades.notional", "trades", "notional"),
-                            ("sales.trades.ccy", "trades", "ccy"))]
-    cat = StubCatalog(objects=objs, catalog_source=SOURCE)
-    cat.set_owner(_measure_col(), "user:alice")
-    register_catalog_adapter(cat)
-    key = fact_key(_measure_col(), "currency_binding")
-    seed_verified_via_command(db, ref=_measure_col(), fact_type="currency_binding",
-                              value={"currency_column": _ccy_ref()}, owner="user:alice")
-    register_catalog_adapter(cat)   # seed swapped in its own default adapter — restore ours
+def _sales_currency_candidate() -> SemanticBindingCandidate:
+    """A currency binding whose SUBJECT + TARGET live in a NON-public glossary schema (``sales``) —
+    exactly the FTR-glossary shape whose fact ref used to carry ``sales.*`` and so never matched the
+    public-flattened drift snapshot (C-1)."""
+    subject = ColumnRef(catalog_source=SOURCE, schema="sales", table="trades", column="notional",
+                        logical_ref=f"{SOURCE}::sales.trades.notional")
+    target = ColumnRef(catalog_source=SOURCE, schema="sales", table="trades", column="ccy",
+                       logical_ref=f"{SOURCE}::sales.trades.ccy")
+    return SemanticBindingCandidate(binding_kind=CURRENCY_BINDING, subject=subject, disposition=STRONG,
+                                    input_hash="ih_sales_ccy", target=target)
+
+
+def test_dropping_currency_target_stales_via_real_public_snapshot(db):
+    # (1) MINT the fact command through propose.py from a `sales`-schema candidate. C-1: the ref +
+    #     currency target are PUBLIC-flattened, so the recorded dependency matches the drift snapshot.
+    cmd = to_fact_command(_sales_currency_candidate(), actor=SVC, idempotency_key="k-sales-ccy")
+    ref, value = cmd.args["ref"], cmd.args["proposed_value"]
+    assert ref.schema == "public"                                  # NOT the glossary `sales` schema
+    assert value["currency_column"]["schema"] == "public"
+
+    # (2) confirm it VERIFIED through the real command + projection path (records deps in public scope).
+    key = fact_key(ref, "currency_binding")
+    seed_verified_via_command(db, ref=ref, fact_type="currency_binding", value=value,
+                              owner="user:alice")
     assert verified_currency_binding(db, key) is not None
 
-    detect_catalog_changes(db, cat, actor=SVC, open_reverify=False)   # snapshot the current objects
-    cat._objects = [o for o in objs if o.column != "ccy"]            # DROP the currency target column
-    changes = detect_catalog_changes(db, cat, actor=SVC, open_reverify=False)   # -> drop -> STALE
-    assert any(ch.kind == "drop" and ch.object_ref == "sales.trades.ccy" for ch in changes)
+    # (3) DRIFT via the REAL UploadCatalog snapshot — public-flattened `public.trades.ccy`, NOT a
+    #     schema-matching stub. Baseline, then DROP the currency target column and re-scan.
+    rows = [CanonicalRow(source=SOURCE, table="trades", column="notional", type="numeric"),
+            CanonicalRow(source=SOURCE, table="trades", column="ccy", type="text")]
+    cat = UploadCatalog(SOURCE, rows)
+    detect_catalog_changes(db, cat, actor=SVC, open_reverify=False)   # snapshot the public objects
+    cat._rows = [rows[0]]                                             # DROP the currency target column
+    changes = detect_catalog_changes(db, cat, actor=SVC, open_reverify=False)
+    assert any(ch.kind == "drop" and ch.object_ref == "public.trades.ccy" for ch in changes)
 
-    assert verified_currency_binding(db, key) is None   # drift-staled fact -> projection demoted
+    # (4) the public-scoped dependency now MATCHES the drop, so the VERIFIED binding stales + demotes.
+    assert verified_currency_binding(db, key) is None
     row = db.execute("SELECT status FROM semantic_binding_edge WHERE fact_key = %s", (key,)).fetchone()
     assert row[0] == "STALE"
 
