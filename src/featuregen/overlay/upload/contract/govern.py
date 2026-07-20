@@ -24,6 +24,8 @@ from featuregen.overlay.upload.contract.author import ContractDraft
 from featuregen.overlay.upload.contract.invalidation import (
     confirm_dependency_hash,
     dependencies_drifted,
+    has_dependency_rows,
+    join_edge_marker,
 )
 from featuregen.overlay.upload.contract.review import validate_minimum
 from featuregen.overlay.upload.features import (
@@ -133,35 +135,82 @@ def _insert_contract_input_columns(conn, contract_id: str, draft: ContractDraft)
              item_hash))
 
 
-def _contract_dependency_items(draft: ContractDraft):
-    """H2c — the reverse-dependency items a contract version depends on for drift fan-out: the SAME
-    catalog items that back a ``contract_input_column`` row (derives + grain + as_of + governed join)
-    and were consulted to clear a check / bind an input, each normalized to its PUBLIC-FLATTENED graph
-    ``object_ref`` so (a) the current-state signature can find its ``graph_node`` and (b) a drift ref
-    from ingest (``_graph_key``-derived) matches it. Yields ``(catalog_source, graph_ref, object_ref,
-    decision_id, fact_id, event_id)``. decision_id / fact_id / event_id are NULL — the reconciled draft
-    carries no field-decision / governed-fact / source-event id yet (# H1b wires those); the read gate
-    then tracks each item via its graph_node state signature (value/type), which is what drifts."""
+def _grain_catalog(conn, grain_table: str | None, catalogs: set[str]) -> str | None:
+    """C-2 — the catalog that ACTUALLY holds the grain TABLE node, resolved among the derives catalogs.
+    Single-catalog: the one catalog. Cross-catalog: the catalog whose ``graph_node`` has
+    ``public.<grain_table>`` (never ``sorted(catalogs)[0]``, which mis-attributes a cross-catalog grain
+    to the wrong source → a MISSING, self-matching dependency baseline). Returns None when there is no
+    grain; falls back to ``sorted(catalogs)[0]`` when no catalog holds the node (the confirm-hash poison
+    then fails that unresolvable grain closed)."""
+    if not grain_table or not catalogs:
+        return None
+    if len(catalogs) == 1:
+        return next(iter(catalogs))
+    t_ref = f"public.{grain_table}".lower()
+    row = conn.execute(
+        "SELECT catalog_source FROM graph_node WHERE catalog_source = ANY(%s) "
+        "AND lower(object_ref) = %s AND kind = 'table' ORDER BY catalog_source LIMIT 1",
+        (sorted(catalogs), t_ref)).fetchone()
+    return row[0] if row is not None else sorted(catalogs)[0]
+
+
+def _grain_key_column_ref(conn, catalog_source: str, grain_table: str) -> str | None:
+    """C-1 — the grain-KEY column node (``is_grain = true``) GRAIN_IS_UNIQUE consulted, deterministic on
+    ``object_ref``. Recording THIS node (its state signature carries ``is_grain``) is what lets the read
+    gate catch a flipped ``is_grain`` / a dropped grain fact — ``project_table_facts_for_ref`` clears the
+    column's ``is_grain`` when the governed fact staled/rejected. None when the grain has no is_grain
+    column (GRAIN_IS_UNIQUE had no grain operand to clear)."""
+    row = conn.execute(
+        "SELECT object_ref FROM graph_node WHERE catalog_source = %s AND table_name = %s "
+        "AND is_grain = true AND kind = 'column' ORDER BY object_ref LIMIT 1",
+        (catalog_source, grain_table)).fetchone()
+    return row[0] if row is not None else None
+
+
+def _contract_dependency_items(conn, draft: ContractDraft):
+    """H2c — the reverse-dependency items a contract version depends on for drift fan-out AND the
+    read-time fail-closed gate. Records the SAME catalog items that back a ``contract_input_column`` row
+    (derives + grain + as_of + join) AND, per H2 review C-1, the items that actually CLEAR the blocking
+    checks: the grain-KEY column (``is_grain`` clears GRAIN_IS_UNIQUE), and each join step's FROM-side
+    column + the clearing join EDGE (``graph_edge`` + approved-join status clears JOIN_CONNECTIVITY).
+    Yields ``(catalog_source, graph_ref, object_ref, decision_id, fact_id, event_id)``; decision_id /
+    fact_id / event_id are NULL (the reconciled draft carries no ids yet — # H1b wires those). C-2: the
+    grain catalog is resolved to the source that holds the grain-table node (not ``sorted[0]``), so a
+    cross-catalog grain's dep row is RESOLVABLE rather than a self-matching MISSING baseline."""
     catalogs = {cs for cs, _ in draft.derives_pairs}
-    grain_source = (next(iter(catalogs)) if len(catalogs) == 1
-                    else (sorted(catalogs)[0] if catalogs else None))
+    grain_source = _grain_catalog(conn, draft.grain_table, catalogs)
     # derives — every measure/source column the feature reads (already a public-flattened object_ref).
     for cs, ref in draft.derives_pairs:
         yield (cs, ref, ref, None, None, None)
-    # grain — the server-authoritative grain TABLE node (public.<table>).
     if draft.grain_table and grain_source is not None:
+        # grain — the server-authoritative grain TABLE node (public.<table>).
         t_ref = f"public.{draft.grain_table}".lower()
         yield (grain_source, t_ref, t_ref, None, None, None)
+        # C-1 grain-KEY column — the is_grain column GRAIN_IS_UNIQUE cleared. Flipping is_grain or
+        # dropping the grain fact changes/removes this node's signature → the read gate downgrades.
+        gref = _grain_key_column_ref(conn, grain_source, draft.grain_table)
+        if gref is not None:
+            yield (grain_source, gref, gref, None, None, None)
     # as_of — the grain table's as-of COLUMN node (public.<table>.<column>).
     if draft.as_of_column and draft.grain_table and grain_source is not None:
         c_ref = f"public.{draft.grain_table}.{draft.as_of_column}".lower()
         yield (grain_source, c_ref, c_ref, None, None, None)
-    # governed join-path columns — each step's target ref (already a graph object_ref).
+    # join-path — each step's TARGET ref plus (C-1) its FROM-side column and the clearing join EDGE.
     for step in draft.join_path:
-        ref = step.get("ref") or step.get("to")
-        if not ref:
-            continue
-        yield (step.get("catalog_source") or grain_source or "", ref, ref, None, None, None)
+        step_catalog = step.get("catalog_source") or grain_source or ""
+        to_ref = step.get("ref") or step.get("to")
+        if to_ref:
+            yield (step_catalog, to_ref, to_ref, None, None, None)
+        from_ref = step.get("from")
+        if from_ref:
+            yield (step_catalog, from_ref, from_ref, None, None, None)
+        # C-1 — the clearing join EDGE (single-catalog column-level 'join' step). Recorded under a
+        # marker so the read gate hashes the graph_edge's existence + approved-join state: dropping the
+        # edge or losing the VERIFIED approval downgrades. (Cross-catalog governed_segment steps carry
+        # no from/to edge; their ref rides the target-ref item above, poison-failed if unresolvable.)
+        if step.get("kind") == "join" and from_ref and to_ref:
+            marker = join_edge_marker(from_ref, to_ref)
+            yield (step_catalog, marker, marker, None, None, None)
 
 
 def _insert_contract_metadata_dependencies(conn, contract_id: str, draft: ContractDraft) -> None:
@@ -172,7 +221,7 @@ def _insert_contract_metadata_dependencies(conn, contract_id: str, draft: Contra
     recompute the current hash and HARD-downgrade the contract on any mismatch. ON CONFLICT DO NOTHING
     keeps it idempotent (the 1011 no-mutation trigger blocks UPDATE/DELETE, not a DO-NOTHING INSERT)."""
     for catalog_source, graph_ref, object_ref, decision_id, fact_id, event_id in \
-            _contract_dependency_items(draft):
+            _contract_dependency_items(conn, draft):
         item_hash = confirm_dependency_hash(
             conn, contract_id=contract_id, catalog_source=catalog_source, graph_ref=graph_ref,
             logical_ref=object_ref, decision_id=decision_id, fact_id=fact_id, event_id=event_id)
@@ -484,6 +533,12 @@ def _apply_dependency_read_gate(conn, contract_id: str, eff_status: str,
     through untouched — the gate only ever DOWNGRADES."""
     if eff_status != "design_checked":
         return eff_status, eff_verif
+    # I-1fc fail-closed: a PROMOTED (design_checked) contract with ZERO dependency rows is gate-blind
+    # (dependencies_drifted returns False on no rows) — the pre-H2c cohort (promoted C4 state, no dep
+    # rows). A promoted stamp with NO recorded lineage cannot be trusted drift-free, so downgrade.
+    # legacy_unassessed is non-promoted (eff_status != design_checked) and never reaches here.
+    if not has_dependency_rows(conn, contract_id):
+        return _EFFECTIVE_NEEDS_REVALIDATION, _EFFECTIVE_UNVERIFIED
     if dependencies_drifted(conn, contract_id):
         return _EFFECTIVE_NEEDS_REVALIDATION, _EFFECTIVE_UNVERIFIED
     return eff_status, eff_verif
@@ -640,19 +695,41 @@ def get_contract_detail(conn, contract_id: str) -> dict | None:
 def feature_detail(conn, feature_id: str, *, roles=()) -> dict | None:
     """Feature 360: everything about one feature in a single view — its definition + verification stamp
     + lineage (from get_feature, READ-SCOPED by roles), the governed contract's narrative + join path,
-    the HYPOTHESIS it was born from (feature -> latest contract -> intent), and its consumers (which
-    models use it). The hypothesis is present only for features born through the hypothesis-driven flow."""
+    the HYPOTHESIS it was born from (feature -> current contract -> intent), and its consumers (which
+    models use it). The hypothesis is present only for features born through the hypothesis-driven flow.
+
+    I-2fc (fail-closed / double-authority): the feature-level EFFECTIVE verification is routed through
+    the ``feature_current_contract`` POINTER + ``contract_read_status`` (the gated truth) — NEVER the
+    mutable ``feature.verification`` stamp (never demoted by drift) nor a latest-BY-VERSION contract
+    that isn't the pointer. A drifted current contract therefore downgrades the 360 verification instead
+    of showing a stale promoted stamp. A directly-registered feature with no governing contract keeps
+    its honest ``feature`` stamp (UNVERIFIED). Other displayed fields are preserved (additive)."""
     feat = get_feature(conn, feature_id, roles=roles)
     if feat is None:
         return None
-    row = conn.execute(
-        "SELECT contract_id, definition, version, verification, intent_id, join_path FROM contract "
-        "WHERE feature_id = %s ORDER BY version DESC LIMIT 1", (feature_id,)).fetchone()
+    # Resolve the CURRENT contract via the pointer (authoritative); fall back to latest-by-version
+    # (deterministic tie-break) only for a pre-H2b legacy feature with no pointer.
+    pointer = conn.execute(
+        "SELECT contract_id FROM feature_current_contract WHERE feature_id = %s",
+        (feature_id,)).fetchone()
+    if pointer is not None:
+        row = conn.execute(
+            "SELECT contract_id, definition, version, verification, intent_id, join_path FROM contract "
+            "WHERE contract_id = %s", (pointer[0],)).fetchone()
+    else:
+        row = conn.execute(
+            "SELECT contract_id, definition, version, verification, intent_id, join_path FROM contract "
+            "WHERE feature_id = %s ORDER BY version DESC, contract_id DESC LIMIT 1",
+            (feature_id,)).fetchone()
     contract = None
     hypothesis = None
+    eff_status = eff_verif = None
     if row is not None:
+        eff_status, eff_verif = contract_read_status(conn, row[0])
         contract = {"contract_id": row[0], "definition": row[1], "version": row[2],
-                    "verification": row[3], "join_path": row[5]}
+                    "verification": row[3],   # 1003 INITIAL stamp (additive)
+                    "effective_validation_status": eff_status,
+                    "effective_verification": eff_verif, "join_path": row[5]}
         if row[4]:   # intent_id -> the hypothesis behind the feature
             i = conn.execute(
                 "SELECT hypothesis, definition, intake_mode, target_ref FROM contract_intent "
@@ -660,5 +737,12 @@ def feature_detail(conn, feature_id: str, *, roles=()) -> dict | None:
             if i is not None:
                 hypothesis = {"hypothesis": i[0], "definition": i[1], "intake_mode": i[2],
                               "target_ref": i[3]}
-    return {**feat, "contract": contract, "hypothesis": hypothesis,
-            "consumers": consumers_of_feature(conn, feature_id)}
+    out = {**feat, "contract": contract, "hypothesis": hypothesis,
+           "consumers": consumers_of_feature(conn, feature_id)}
+    # Override the feature-level verification with the GATED effective stamp when the feature is
+    # governed; a feature with no contract keeps its honest (non-promoted) `feature` stamp.
+    if eff_verif is not None:
+        out["verification"] = eff_verif
+        out["effective_validation_status"] = eff_status
+        out["effective_verification"] = eff_verif
+    return out

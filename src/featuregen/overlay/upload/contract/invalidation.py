@@ -54,6 +54,28 @@ REASON_POLICY_VERSION_CHANGED = "POLICY_VERSION_CHANGED"
 # live item's state dict, so a dropped item's recomputed hash never matches its stored (live) hash.
 _MISSING = "MISSING"
 
+# H2 C-2 fail-closed POISON. A check-clearing dependency that is UNRESOLVABLE *at confirm* (its state
+# signature is MISSING) cannot have legitimately cleared anything — its lineage is defective. We store a
+# hash over THIS sentinel, which ``_catalog_state_signature`` NEVER returns (it only ever yields a live
+# state dict or ``_MISSING``), so a read-time recompute can never reproduce it: the item reads as
+# permanently drifted and the contract can never be served with a promoted stamp. This is what closes the
+# self-matching ``MISSING == MISSING`` hole (a confirm-time MISSING no longer equals a read-time MISSING).
+_UNRESOLVED_AT_CONFIRM = "UNRESOLVED_AT_CONFIRM"
+
+# H2 C-1 — a JOIN EDGE dependency (the ``graph_edge`` that clears JOIN_CONNECTIVITY) is not a graph_node,
+# so it is recorded under a marker ``logical_ref`` that ``_catalog_state_signature`` routes to the edge
+# state reader. The marker encodes the UNORDERED endpoint pair so either authoring orientation lands on
+# one deterministic item, mirroring how the projector touches an edge in both orientations.
+_EDGE_PREFIX = "joinedge:"
+
+
+def join_edge_marker(from_ref: str, to_ref: str) -> str:
+    """The ``logical_ref`` marker for the join EDGE between two column endpoints (C-1). Endpoints are
+    lower-cased and SORTED so the same physical edge yields one marker regardless of which side the draft
+    step names — the read gate then hashes the edge's CURRENT state (see ``_join_edge_signature``)."""
+    a, b = sorted((from_ref.lower(), to_ref.lower()))
+    return f"{_EDGE_PREFIX}{a}|{b}"
+
 # The graph_node VALUE columns that make an item load-bearing. Deliberately EXCLUDES the volatile
 # ``*_decision_id`` link columns (a benign re-upload re-mints them, which would be false drift) — only
 # the resolved VALUES/types are hashed, so an unchanged re-upload keeps the SAME signature.
@@ -80,20 +102,54 @@ class ChangedRef:
 def _catalog_state_signature(conn: DbConn, catalog_source: str, object_ref: str | None):
     """The CURRENT load-bearing state of a catalog item (its ``graph_node`` VALUE columns), or the
     ``MISSING`` sentinel when the node is absent (a dropped column/table). Read case-insensitively on
-    ``object_ref`` (mirrors ``field_resolution._graph_key``'s lower-cased projection key)."""
+    ``object_ref`` (mirrors ``field_resolution._graph_key``'s lower-cased projection key).
+
+    C-1: an ``object_ref`` carrying the ``joinedge:`` marker is a JOIN EDGE dependency — its state comes
+    from ``graph_edge`` (existence + approved-join status/authority/cardinality), not a graph_node.
+    M-d: a deterministic ``ORDER BY`` guards the case-insensitive match against nondeterministic picks
+    when two case-variant sibling nodes coexist for one ``lower(object_ref)``."""
     if not object_ref:
         return _MISSING
+    if object_ref.startswith(_EDGE_PREFIX):
+        return _join_edge_signature(conn, catalog_source, object_ref)
     with conn.cursor(row_factory=dict_row) as cur:
         cur.execute(
             "SELECT kind, data_type, declared_type, definition, is_grain, is_as_of, concept, domain, "
             "additivity, sensitivity, unit, currency, entity, effective_restriction, "
             "classification_status FROM graph_node "
-            "WHERE catalog_source = %s AND lower(object_ref) = lower(%s)",
+            "WHERE catalog_source = %s AND lower(object_ref) = lower(%s) "
+            "ORDER BY object_ref LIMIT 1",
             (catalog_source, object_ref))
         row = cur.fetchone()
     if row is None:
         return _MISSING
     return {col: row[col] for col in _STATE_COLUMNS}
+
+
+def _join_edge_signature(conn: DbConn, catalog_source: str, marker: str):
+    """C-1 — the CURRENT state of the join ``graph_edge`` a JOIN_CONNECTIVITY disposition cleared, or
+    ``MISSING`` when the edge is gone. Matches the marker's unordered endpoint pair in EITHER stored
+    orientation (an edge is written once; the traversal may name it reversed). Captures existence +
+    ``authority`` + ``approved_join_status`` + fact-link presence + ``cardinality``: dropping the edge
+    ⟶ MISSING, and losing the VERIFIED approval (async demote flips authority to ``display_only`` and
+    restamps the status) ⟶ a changed signature — either way the read gate downgrades. Deterministic
+    ``ORDER BY`` so a duplicate-orientation edge can't pick nondeterministically."""
+    body = marker[len(_EDGE_PREFIX):]
+    a, _, b = body.partition("|")
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            "SELECT cardinality, authority, approved_join_status, "
+            "(approved_join_fact_key IS NOT NULL) AS has_fact FROM graph_edge "
+            "WHERE catalog_source = %s AND kind = 'joins' AND "
+            "((lower(from_ref) = %s AND lower(to_ref) = %s) OR "
+            " (lower(from_ref) = %s AND lower(to_ref) = %s)) "
+            "ORDER BY from_ref, to_ref LIMIT 1",
+            (catalog_source, a, b, b, a))
+        row = cur.fetchone()
+    if row is None:
+        return _MISSING
+    return {"edge": True, "cardinality": row["cardinality"], "authority": row["authority"],
+            "approved_join_status": row["approved_join_status"], "has_approved_fact": row["has_fact"]}
 
 
 def dependency_item_hash(*, contract_id: str, catalog_source: str, graph_ref: str | None,
@@ -116,8 +172,18 @@ def confirm_dependency_hash(conn: DbConn, *, contract_id: str, catalog_source: s
                             fact_id: str | None, event_id: str | None) -> str:
     """Compute a dependency item's content hash over its state AT CONFIRM (called when the reverse-dep
     row is first written). Same function family as :func:`current_dependency_hash`, so a later read
-    recomputes a comparable value over the item's then-current state."""
+    recomputes a comparable value over the item's then-current state.
+
+    C-2 fail-closed: if the item is UNRESOLVABLE at confirm (its state is ``MISSING`` — a mis-attributed
+    cross-catalog ref, a display-string join step, an entity/bridge segment), we hash the
+    ``_UNRESOLVED_AT_CONFIRM`` poison instead of ``MISSING``. A check-clearing dependency that cannot be
+    resolved cannot have legitimately cleared anything, and a poison baseline can never be reproduced by
+    a read-time recompute (which only ever yields a live dict or ``MISSING``), so the read gate treats
+    the item as permanently drifted — the contract never serves a promoted stamp (no self-matching
+    ``MISSING == MISSING``)."""
     state = _catalog_state_signature(conn, catalog_source, logical_ref)
+    if state == _MISSING:
+        state = _UNRESOLVED_AT_CONFIRM
     return dependency_item_hash(
         contract_id=contract_id, catalog_source=catalog_source, graph_ref=graph_ref,
         logical_ref=logical_ref, decision_id=decision_id, fact_id=fact_id, event_id=event_id,
@@ -150,6 +216,17 @@ def dependencies_drifted(conn: DbConn, contract_id: str) -> bool:
     return any(current_dependency_hash(conn, dep) != dep["item_hash"] for dep in deps)
 
 
+def has_dependency_rows(conn: DbConn, contract_id: str) -> bool:
+    """I-1fc — whether a contract has ANY recorded ``contract_metadata_dependency`` row. A PROMOTED
+    contract with ZERO rows is gate-BLIND (``dependencies_drifted`` returns False on no rows), so the
+    read gate must fail closed on it (a promoted stamp with no recorded lineage cannot be trusted
+    drift-free). A non-promoted contract never reaches that gate branch, so a legacy_unassessed contract
+    is unaffected."""
+    return conn.execute(
+        "SELECT 1 FROM contract_metadata_dependency WHERE contract_id = %s LIMIT 1",
+        (contract_id,)).fetchone() is not None
+
+
 def _affected_contract_ids(conn: DbConn, ref: ChangedRef) -> list[str]:
     """Every contract version with a ``contract_metadata_dependency`` row matching ``ref`` — by
     ``catalog_source`` plus a graph object_ref (case-insensitive on either ``logical_ref`` or
@@ -170,17 +247,27 @@ def _affected_contract_ids(conn: DbConn, ref: ChangedRef) -> list[str]:
 
 def _already_invalidated(conn: DbConn, contract_id: str, ref: ChangedRef) -> bool:
     """Idempotency guard: has an ``INVALIDATED`` event for this contract with the SAME
-    (reason, catalog_source, object_ref, decision_id, fact_id) already been appended? Reads committed +
-    same-transaction rows, so a re-call (or a duplicate ref within one call) never stacks a duplicate."""
+    (reason, catalog_source, object_ref, decision_id, fact_id) already been appended SINCE THE LAST
+    re-clearing event? Reads committed + same-transaction rows, so a re-call (or a duplicate ref within
+    one call) never stacks a duplicate.
+
+    M-c: the dedup is scoped to the CURRENT TAIL — a matching INVALIDATED with ``seq`` GREATER than the
+    last re-clearing (ASSESSED / EXTERNAL_PASSED) event. An all-time dedup would wrongly suppress a
+    GENUINELY RECURRED drift: after INVALIDATED → re-clear (a new pass/assessment moves the epoch) →
+    the SAME drift recurs, that recurrence must re-invalidate (defense-in-depth for the read gate)."""
+    epoch = conn.execute(
+        "SELECT coalesce(max(seq), 0) FROM feature_contract_validation_event "
+        "WHERE contract_id = %s AND event_type IN ('ASSESSED', 'EXTERNAL_PASSED')",
+        (contract_id,)).fetchone()[0]
     return conn.execute(
         "SELECT 1 FROM feature_contract_validation_event "
-        "WHERE contract_id = %s AND event_type = 'INVALIDATED' "
+        "WHERE contract_id = %s AND event_type = 'INVALIDATED' AND seq > %s "
         "AND payload->>'reason' = %s "
         "AND coalesce(payload->>'catalog_source', '') = coalesce(%s, '') "
         "AND coalesce(payload->>'object_ref', '') = coalesce(%s, '') "
         "AND coalesce(payload->>'decision_id', '') = coalesce(%s, '') "
         "AND coalesce(payload->>'fact_id', '') = coalesce(%s, '') LIMIT 1",
-        (contract_id, ref.reason, ref.catalog_source, ref.object_ref, ref.decision_id,
+        (contract_id, epoch, ref.reason, ref.catalog_source, ref.object_ref, ref.decision_id,
          ref.fact_id)).fetchone() is not None
 
 

@@ -17,7 +17,11 @@ from psycopg.types.json import Jsonb
 from featuregen.aggregates.ids import mint_id
 from featuregen.overlay.upload.canonical import UNKNOWN_TYPE, CanonicalRow
 from featuregen.overlay.upload.contract.author import ContractDraft
-from featuregen.overlay.upload.contract.govern import confirm_contract, contract_read_status
+from featuregen.overlay.upload.contract.govern import (
+    confirm_contract,
+    contract_read_status,
+    feature_detail,
+)
 from featuregen.overlay.upload.contract.invalidation import (
     REASON_CATALOG_RETYPED,
     ChangedRef,
@@ -86,9 +90,11 @@ def test_confirm_writes_reverse_dependency_rows_write_once(db):
 
     rows = _deps(db, c.contract_id)
     refs = {r[1] for r in rows}
-    # one row per check-clearing / input-binding item: the derives measure, the grain table, the as-of
-    # column — each PUBLIC-FLATTENED to its graph object_ref and each carrying an item_hash.
-    assert refs == {"public.accounts.balance", "public.accounts", "public.accounts.posted_at"}
+    # one row per check-clearing / input-binding item: the derives measure, the grain TABLE, the
+    # grain-KEY column (is_grain — H2 C-1), and the as-of column — each PUBLIC-FLATTENED to its graph
+    # object_ref and each carrying an item_hash.
+    assert refs == {"public.accounts.balance", "public.accounts", "public.accounts.id",
+                    "public.accounts.posted_at"}
     assert all(r[0] == "bank" for r in rows)
     assert all(r[2] for r in rows)                         # every row has a non-empty item_hash
 
@@ -98,7 +104,7 @@ def test_confirm_writes_reverse_dependency_rows_write_once(db):
                    (c.contract_id,))
     with pytest.raises(psycopg.errors.RaiseException), db.transaction():
         db.execute("DELETE FROM contract_metadata_dependency WHERE contract_id = %s", (c.contract_id,))
-    assert len(_deps(db, c.contract_id)) == 3              # rows survived both rejected mutations
+    assert len(_deps(db, c.contract_id)) == 4              # rows survived both rejected mutations
 
 
 # ── TEST 2 — invalidate_contracts_for emits INVALIDATED (demotes) and is idempotent ──────────────────
@@ -237,3 +243,174 @@ def test_unaffected_contract_is_not_invalidated(db):
 
     assert _invalidated_count(db, a.contract_id) == 1       # X drifted -> A invalidated
     assert _invalidated_count(db, b.contract_id) == 0       # B depends only on Y -> untouched
+
+
+# ══════════════ H2 fail-closed hardening (review C-1 / C-2 / I-1fc / I-2fc / M-c) ══════════════════════
+
+# ── C-1: the grain-KEY column (is_grain) is a recorded dependency; flipping it downgrades ─────────────
+def test_c1_read_gate_downgrades_when_grain_key_is_grain_flipped(db):
+    """C-1: GRAIN_IS_UNIQUE is cleared by the grain-KEY column's is_grain (public.accounts.id), which was
+    NOT a recorded dependency before this fix. Confirm to DATA-CHECKED, then flip is_grain off (the grain
+    fact being re-projected away) WITHOUT emitting INVALIDATED -> the read gate must downgrade."""
+    _bank_nev(db)                                 # id is_grain=True (file-declared)
+    c = confirm_contract(db, _draft(), actor="ds1")   # grain "accounts"
+    _promote_all_blocking(db, c.contract_id)
+    assert "public.accounts.id" in {r[1] for r in _deps(db, c.contract_id)}   # grain-key now recorded
+    assert contract_read_status(db, c.contract_id) == ("design_checked", "DATA-CHECKED")
+
+    db.execute("UPDATE graph_node SET is_grain = false "
+               "WHERE catalog_source = 'bank' AND object_ref = 'public.accounts.id'")
+    assert _invalidated_count(db, c.contract_id) == 0                          # no eager INVALIDATED
+    assert dependencies_drifted(db, c.contract_id) is True
+    assert contract_read_status(db, c.contract_id) == ("needs_external_validation", "UNVERIFIED")
+
+
+# ── C-1: the clearing join EDGE is a recorded dependency; dropping it downgrades ──────────────────────
+def _bank_joined(db):
+    """One catalog, two tables, an OPERATIONAL file-declared join edge (flag-off default) clearing
+    JOIN_CONNECTIVITY: accounts.customer_id -> customers.id. The feature is grained on accounts and
+    derives customers.tenure_days, so the edge is load-bearing."""
+    build_graph(db, "bank", [
+        CanonicalRow("bank", "accounts", "id", "integer", is_grain=True),
+        CanonicalRow("bank", "accounts", "customer_id", "integer",
+                     joins_to="customers.id", cardinality="N:1"),
+        CanonicalRow("bank", "accounts", "posted_at", "timestamp", as_of=True),
+        CanonicalRow("bank", "customers", "id", "integer"),
+        CanonicalRow("bank", "customers", "tenure_days", UNKNOWN_TYPE, definition="tenure days")],
+        declared_types={"public.customers.tenure_days": "numeric"})
+
+
+def _joined_draft():
+    return ContractDraft(
+        "cust_tenure", "Sum of customer tenure per account.", "accounts", "sum", "posted_at",
+        ["public.customers.tenure_days"],
+        derives_pairs=(("bank", "public.customers.tenure_days"),),
+        join_path=({"kind": "join", "from": "public.accounts.customer_id",
+                    "to": "public.customers.id", "cardinality": "N:1"},))
+
+
+def test_c1_read_gate_downgrades_when_clearing_join_edge_dropped(db):
+    """C-1: JOIN_CONNECTIVITY is cleared by a graph_edge (+approved-join status), which no layer hashed
+    before. Confirm to DATA-CHECKED, then DROP the clearing edge WITHOUT INVALIDATED -> downgrade."""
+    _bank_joined(db)
+    c = confirm_contract(db, _joined_draft(), actor="ds1")
+    _promote_all_blocking(db, c.contract_id)
+    assert any(r[1].startswith("joinedge:") for r in _deps(db, c.contract_id))   # edge now recorded
+    assert contract_read_status(db, c.contract_id) == ("design_checked", "DATA-CHECKED")
+
+    db.execute("DELETE FROM graph_edge WHERE catalog_source = 'bank' AND kind = 'joins'")
+    assert _invalidated_count(db, c.contract_id) == 0
+    assert dependencies_drifted(db, c.contract_id) is True
+    assert contract_read_status(db, c.contract_id) == ("needs_external_validation", "UNVERIFIED")
+
+
+# ── C-2 (b): a dependency UNRESOLVABLE at confirm fails closed (no self-matching MISSING baseline) ────
+def test_c2_unresolvable_dependency_at_confirm_fails_closed(db):
+    """C-2: a check-clearing dependency that resolves to MISSING at confirm (a cross-catalog / display-
+    string join step) must NOT self-match forever. It is POISONED at confirm, so the promoted stamp is
+    never servable even with NO drift event and even while the projection reads DATA-CHECKED."""
+    _bank_nev(db)
+    draft = ContractDraft(
+        "avg_balance_90d", "Average 90-day ledger balance per account.", "accounts", "avg_90d",
+        "posted_at", ["public.accounts.balance"],
+        derives_pairs=(("bank", "public.accounts.balance"),),
+        # an entity/bridge step whose endpoints are NON-resolvable display strings (not graph refs).
+        join_path=({"kind": "entity", "from": "bank.accounts",
+                    "to": "othercat.othertable", "via": "Customer"},))
+    c = confirm_contract(db, draft, actor="ds1")
+    _promote_all_blocking(db, c.contract_id)
+
+    # the projection ALONE would serve DATA-CHECKED...
+    assert read_state(db, c.contract_id)["effective_verification"] == "DATA-CHECKED"
+    # ...but the unresolvable dep is poisoned at confirm -> a promoted stamp is NEVER served.
+    assert dependencies_drifted(db, c.contract_id) is True
+    assert contract_read_status(db, c.contract_id) == ("needs_external_validation", "UNVERIFIED")
+
+
+# ── C-2 (a): a cross-catalog grain dep carries the RESOLVABLE catalog (holder), not sorted[0] ─────────
+def test_c2_cross_catalog_grain_dep_is_resolvable_not_misattributed(db):
+    """C-2: the grain catalog is resolved to the source that HOLDS the grain-table node (zeta), never
+    sorted(catalogs)[0]=alpha. So the grain dep row RESOLVES (not a dead MISSING self-match) and a later
+    drop of the grain table is DETECTED — previously that dep was inert."""
+    build_graph(db, "alpha", [CanonicalRow("alpha", "events", "amount", "numeric")])
+    build_graph(db, "zeta", [
+        CanonicalRow("zeta", "grain_tbl", "id", "integer", is_grain=True),
+        CanonicalRow("zeta", "grain_tbl", "ts", "timestamp", as_of=True)])
+    draft = ContractDraft(
+        "xcat_feature", "Cross-catalog sum.", "grain_tbl", "sum", "ts",
+        ["public.events.amount", "public.grain_tbl.id"],
+        derives_pairs=(("alpha", "public.events.amount"), ("zeta", "public.grain_tbl.id")))
+    c = confirm_contract(db, draft, actor="ds1")
+
+    deps = {(r[0], r[1]) for r in _deps(db, c.contract_id)}   # (catalog_source, logical_ref)
+    assert ("zeta", "public.grain_tbl") in deps               # attributed to the HOLDER, not alpha
+    assert not any(cs == "alpha" and ref == "public.grain_tbl" for cs, ref in deps)
+    assert dependencies_drifted(db, c.contract_id) is False   # resolvable baseline, no drift yet
+
+    db.execute("DELETE FROM graph_node WHERE catalog_source = 'zeta' "
+               "AND object_ref = 'public.grain_tbl'")
+    assert dependencies_drifted(db, c.contract_id) is True    # the drop is now DETECTED (was inert)
+
+
+# ── I-1fc: a PROMOTED contract with ZERO dependency rows fails closed; legacy_unassessed unaffected ───
+def test_i1fc_promoted_with_zero_dependency_rows_fails_closed(db):
+    """I-1fc: the pre-H2c cohort (promoted state row, no dep rows) was gate-blind. A promoted stamp with
+    ZERO dependency rows downgrades; a legacy_unassessed (non-promoted) contract is unaffected."""
+    _bank_nev(db)
+    c = confirm_contract(db, _draft(), actor="ds1")
+    _promote_all_blocking(db, c.contract_id)
+    assert contract_read_status(db, c.contract_id) == ("design_checked", "DATA-CHECKED")
+
+    # simulate the pre-H2c cohort: strip the dependency rows (WORM -> replica-scoped delete).
+    db.execute("SET session_replication_role = replica")
+    db.execute("DELETE FROM contract_metadata_dependency WHERE contract_id = %s", (c.contract_id,))
+    db.execute("SET session_replication_role = origin")
+    assert _deps(db, c.contract_id) == []
+    assert contract_read_status(db, c.contract_id) == ("needs_external_validation", "UNVERIFIED")
+
+    # a legacy_unassessed contract (no projected state row) is non-promoted -> zero-dep rule doesn't bite.
+    leg = confirm_contract(db, _draft(name="legacy_feat"), actor="ds1")
+    db.execute("DELETE FROM feature_contract_validation_state WHERE contract_id = %s", (leg.contract_id,))
+    db.execute("SET session_replication_role = replica")
+    db.execute("DELETE FROM contract_metadata_dependency WHERE contract_id = %s", (leg.contract_id,))
+    db.execute("SET session_replication_role = origin")
+    assert contract_read_status(db, leg.contract_id) == ("legacy_unassessed", "UNVERIFIED")
+
+
+# ── I-2fc: the feature-360 verification is routed through the pointer + read gate (double authority) ──
+def test_i2fc_feature_360_verification_routed_through_read_gate(db):
+    """I-2fc: feature_detail must serve the GATED effective verification (pointer + contract_read_status),
+    never the mutable feature.verification stamp. A drifted current contract downgrades the 360 stamp."""
+    _bank_nev(db)
+    c = confirm_contract(db, _draft(), actor="ds1")
+    _promote_all_blocking(db, c.contract_id)
+
+    detail = feature_detail(db, c.feature_id)
+    assert detail["verification"] == "DATA-CHECKED"                          # gated, not the mutable stamp
+    assert detail["effective_verification"] == "DATA-CHECKED"
+    assert detail["contract"]["effective_verification"] == "DATA-CHECKED"
+
+    # drift a dependency WITHOUT an INVALIDATED (projection lag) -> the 360 stamp DOWNGRADES.
+    db.execute("UPDATE graph_node SET declared_type = 'text' "
+               "WHERE catalog_source = 'bank' AND object_ref = 'public.accounts.balance'")
+    detail2 = feature_detail(db, c.feature_id)
+    assert detail2["verification"] == "UNVERIFIED"                           # NOT DESIGN-/DATA-CHECKED
+    assert detail2["effective_validation_status"] == "needs_external_validation"
+    assert detail2["contract"]["effective_verification"] == "UNVERIFIED"
+
+
+# ── M-c: a drift that RECURS after a re-clear re-invalidates (tail-scoped dedup, not all-time) ────────
+def test_mc_recurred_drift_after_reclear_reinvalidates(db):
+    _bank_nev(db)
+    c = confirm_contract(db, _draft(), actor="ds1")
+    _promote_all_blocking(db, c.contract_id)
+    ref = ChangedRef(catalog_source="bank", reason=REASON_CATALOG_RETYPED,
+                     object_ref="public.accounts.balance")
+
+    assert invalidate_contracts_for(db, changed=[ref]) == 1
+    assert _invalidated_count(db, c.contract_id) == 1
+    assert invalidate_contracts_for(db, changed=[ref]) == 0        # idempotent WITHIN the epoch
+
+    _promote_all_blocking(db, c.contract_id)                       # re-clear: moves the epoch past it
+    assert invalidate_contracts_for(db, changed=[ref]) == 1        # the RECURRED drift re-invalidates
+    assert _invalidated_count(db, c.contract_id) == 2
