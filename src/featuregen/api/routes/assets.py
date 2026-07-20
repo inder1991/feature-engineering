@@ -45,7 +45,8 @@ def get_asset_detail(
     session (NEVER the request), so read-scope is enforced from the real identity. A hidden or
     absent anchor -> 404 (no existence leak); otherwise the assembled sections + version + token."""
     detail = build_asset_detail(
-        conn, source=source, object_ref=object_ref, roles=identity.role_claims, include=include
+        conn, source=source, object_ref=object_ref, roles=identity.role_claims, include=include,
+        identity=identity,
     )
     if detail is None:
         raise HTTPException(status_code=404, detail="asset not found")

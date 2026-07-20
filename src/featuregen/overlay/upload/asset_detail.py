@@ -8,9 +8,12 @@ authority — it never re-derives value, authority, or readiness, and it writes 
 * ``effective_metadata`` — the display value per field paired with its C1 authority/provenance
   (:func:`operational_facts.read_operational_value` — governed vs hint vs missing).
 * ``evidence`` — the anchor's per-field proposals (active/stale/rejected) + its latest decision.
-* ``relationships`` — containment (the parent table + sibling columns) + VERIFIED approved_joins.
-  The SEMANTIC subsection (candidate/verified semantic edges) is F1 — returned ``unavailable``
-  (listed in ``unavailable_sections``), never an empty-success that reads as "no relationships".
+* ``relationships`` — containment (the parent table + sibling columns) + VERIFIED approved_joins +
+  the SEMANTIC subsection (F2b, after Delivery E): the column's VERIFIED entity + currency edges,
+  the current-set semantic candidate history + divergences, and the server-calculated governance
+  actions the caller may run per binding — all read-scoped. A caller who lacks the catalog:read
+  permission gets it named in ``unavailable_sections`` (never an empty-success that reads as "no
+  semantic links"); an anchor with no semantic data gets an explicit empty-but-available subsection.
 * ``readiness`` — the F0-T1 per-column capability MATRIX + the parent-table blocker diagnostic.
 * ``history`` — the reverse ``ingestion_run_object`` lookup (which runs observed/changed this ref,
   newest-first) + each run's per-stage outcomes.
@@ -36,11 +39,15 @@ from collections.abc import Iterable
 from dataclasses import asdict
 
 from featuregen.contracts import DbConn
+from featuregen.contracts.envelopes import IdentityEnvelope
+from featuregen.identity.permissions import CATALOG_READ, has_permission
+from featuregen.overlay.identity import _norm
 from featuregen.overlay.upload.column_authority import logical_ref_of
 from featuregen.overlay.upload.column_readiness import column_readiness
 from featuregen.overlay.upload.operational_facts import OperationalValue, read_operational_value
 from featuregen.overlay.upload.read_scope import allowed_sensitivities
 from featuregen.overlay.upload.readiness import ReadinessScopeType, compute_readiness
+from featuregen.overlay.upload.semantic_binding_governance import caller_binding_actions
 
 # The response contract version — bump on a breaking shape change so a client can negotiate.
 ASSET_DETAIL_VERSION = "asset-detail/v1"
@@ -185,14 +192,16 @@ def _evidence_section(conn: DbConn, logical_ref: str) -> dict:
 
 
 def _relationships_section(
-    conn: DbConn, source: str, anchor: dict, allowed: list[str]
+    conn: DbConn, source: str, anchor: dict, allowed: list[str], roles: Iterable[str],
+    identity: IdentityEnvelope | None = None,
 ) -> tuple[dict, list[str]]:
     """Containment (parent table + read-scoped sibling columns) + VERIFIED approved_joins touching
-    the ref (read-scoped on BOTH endpoints). The SEMANTIC subsection is F1 — returned
-    ``unavailable`` (and named in the returned list), never an empty-success.
+    the ref (read-scoped on BOTH endpoints) + the SEMANTIC subsection (F2b — verified entity/currency
+    edges, candidate history, divergences, caller-gated governance actions). Withheld from a caller
+    lacking catalog:read (named in the returned list); otherwise real, read-scoped, never a stub.
 
-    Every related read is sensitivity-filtered IN SQL, so a hidden sibling / hidden join endpoint
-    is simply absent — no count, no id, no leak."""
+    Every related read is sensitivity-filtered IN SQL, so a hidden sibling / hidden join endpoint /
+    hidden semantic endpoint is simply absent — no count, no id, no leak."""
     is_column = anchor["kind"] == "column"
     table = anchor["table_name"]
 
@@ -245,14 +254,132 @@ def _relationships_section(
             for r in join_rows
         ]
 
+    semantic, semantic_unavailable = _semantic_subsection(
+        conn, source, anchor, allowed, roles, identity)
     section = {
         "containment": containment,
         "approved_joins": approved_joins,
-        # F1 (after Delivery E): semantic candidates + verified semantic edges. Marked unavailable
-        # so the client shows "not yet available", never an empty-success "no semantic links".
-        "semantic": {"status": "unavailable", "available_in": "F1"},
+        "semantic": semantic,
     }
-    return section, ["relationships.semantic"]
+    return section, semantic_unavailable
+
+
+def _semantic_subsection(
+    conn: DbConn, source: str, anchor: dict, allowed: list[str], roles: Iterable[str],
+    identity: IdentityEnvelope | None,
+) -> tuple[dict, list[str]]:
+    """The F2b SEMANTIC relationship subsection for the anchor (Delivery E data): VERIFIED entity +
+    currency edges, the current-set candidate history, the declared≠governed divergence signal, and
+    the server-calculated governance actions the CALLER may run per binding.
+
+    READ-SCOPED, fail-closed, no leak — mirrors the peer sections:
+    * PERMISSION gate: the subsection needs catalog:read (the SAME permission the route + the other
+      sections use). A caller who lacks it gets ``{"status": "unavailable"}`` and the subsection named
+      in ``unavailable_sections`` — explicit, never an empty-success that reads as "no semantic links",
+      and never a hidden count.
+    * SENSITIVITY: every related endpoint (a currency edge's other column, a candidate's other column)
+      is filtered IN SQL, so a hidden node makes its edge/candidate simply ABSENT — no count, no id.
+    * VERIFIED is rendered DISTINCTLY from proposed: ``verified_edges`` carry ``status="VERIFIED"`` +
+      their fact_key / confirmed_event_id provenance; a DRAFT candidate carries ``fact_status`` folded
+      via E2 (DRAFT → ``PROPOSED``). Semantic bindings are per-column, so a table anchor gets an
+      explicit empty-but-available subsection (its columns carry their own bindings).
+    * ACTIONS reuse E2's owner-or-admin available-actions authz (``caller_binding_actions``) — the
+      asset UI may NOT advertise an edge as editable unless the server returns the command here."""
+    if not has_permission(roles, CATALOG_READ):
+        # Fail closed: withheld, explicit, no hidden count (mirrors the F0 unavailable contract).
+        return {"status": "unavailable"}, ["relationships.semantic"]
+    if anchor["kind"] != "column":
+        # Semantic bindings attach to columns; a table asset has none of its own. Explicit empty.
+        return {"status": "available", "verified_edges": [], "candidates": [], "divergences": []}, []
+
+    object_ref = anchor["object_ref"]
+    verified_edges: list[dict] = []
+    divergences: list[dict] = []
+
+    # VERIFIED entity edge + the divergence signal, from the anchor's OWN governed graph_node row
+    # (the anchor already passed read-scope). A governed entity_assignment sets entity + entity_status
+    # 'VERIFIED' + provenance links; a conflicting re-upload leaves the file value in declared_entity.
+    ent = conn.execute(
+        "SELECT entity, declared_entity, entity_status, entity_fact_key, entity_fact_event_id "
+        "FROM graph_node WHERE catalog_source = %s AND object_ref = %s",
+        (source, object_ref),
+    ).fetchone()
+    if ent is not None:
+        entity, declared_entity, entity_status, e_fact_key, e_event_id = ent
+        if entity_status == "VERIFIED" and entity is not None:
+            actions = (caller_binding_actions(conn, fact_key=e_fact_key, actor=identity)["actions"]
+                       if e_fact_key else [])
+            verified_edges.append({
+                "kind": "entity_assignment", "status": "VERIFIED", "object_ref": object_ref,
+                "entity": entity, "fact_key": e_fact_key, "confirmed_event_id": e_event_id,
+                "available_actions": actions,
+            })
+            if declared_entity is not None and _norm(declared_entity) != _norm(entity):
+                # DIVERGENCE: a re-upload declared a DIFFERENT entity; the governed value wins and the
+                # file value is preserved as declared_entity — the two differing IS the signal.
+                divergences.append({
+                    "kind": "entity_divergence", "object_ref": object_ref,
+                    "declared_entity": declared_entity, "governed_entity": entity,
+                    "fact_key": e_fact_key,
+                })
+
+    # VERIFIED currency edges touching the anchor (measure→currency), read-scoped on BOTH endpoints —
+    # a hidden currency/measure column omits the whole edge (mirrors approved_joins).
+    for fk, from_ref, to_ref, kind, status, conf_event in conn.execute(
+        "SELECT e.fact_key, e.from_ref, e.to_ref, e.kind, e.status, e.confirmed_event_id "
+        "FROM semantic_binding_edge e "
+        "LEFT JOIN graph_node fn ON fn.object_ref = e.from_ref "
+        "  AND fn.catalog_source = e.catalog_source "
+        "LEFT JOIN graph_node tn ON tn.object_ref = e.to_ref "
+        "  AND tn.catalog_source = e.catalog_source "
+        "WHERE e.catalog_source = %s AND e.status = 'VERIFIED' "
+        "AND (e.from_ref = %s OR e.to_ref = %s) "
+        "AND (fn.sensitivity IS NULL OR fn.sensitivity = ANY(%s)) "
+        "AND (tn.sensitivity IS NULL OR tn.sensitivity = ANY(%s)) "
+        "ORDER BY e.from_ref, e.to_ref",
+        (source, object_ref, object_ref, allowed, allowed),
+    ).fetchall():
+        verified_edges.append({
+            "kind": kind, "status": status, "from_ref": from_ref, "to_ref": to_ref,
+            "fact_key": fk, "confirmed_event_id": conf_event,
+            "available_actions": caller_binding_actions(conn, fact_key=fk, actor=identity)["actions"],
+        })
+
+    # Current-set semantic candidates touching the anchor (disposition + reason codes), read-scoped on
+    # both endpoints. The proposal LINK (if any) folds to a fact_status (DRAFT → PROPOSED via E2) so a
+    # candidate is shown as proposed, distinct from VERIFIED; a linked binding also carries its actions.
+    candidates: list[dict] = []
+    for cid, kind, disposition, reason_codes, subj, tgt, proposed_value, fk in conn.execute(
+        "SELECT c.candidate_id, c.binding_kind, c.disposition, c.reason_codes, "
+        "c.subject_graph_ref, c.target_graph_ref, c.proposed_value, p.fact_key "
+        "FROM current_semantic_binding_candidate_set cur "
+        "JOIN semantic_binding_candidate c ON c.candidate_set_id = cur.candidate_set_id "
+        "LEFT JOIN semantic_binding_candidate_proposal p ON p.candidate_id = c.candidate_id "
+        "LEFT JOIN graph_node sn ON sn.object_ref = c.subject_graph_ref "
+        "  AND sn.catalog_source = c.catalog_source "
+        "LEFT JOIN graph_node tn ON tn.object_ref = c.target_graph_ref "
+        "  AND tn.catalog_source = c.catalog_source "
+        "WHERE cur.catalog_source = %s AND cur.status = 'current' "
+        "AND (c.subject_graph_ref = %s OR c.target_graph_ref = %s) "
+        "AND (sn.sensitivity IS NULL OR sn.sensitivity = ANY(%s)) "
+        "AND (tn.sensitivity IS NULL OR tn.sensitivity = ANY(%s)) "
+        "ORDER BY c.subject_graph_ref, c.binding_kind, c.candidate_id",
+        (source, object_ref, object_ref, allowed, allowed),
+    ).fetchall():
+        if fk:
+            gov = caller_binding_actions(conn, fact_key=fk, actor=identity)
+            fact_status, actions = gov["status"], gov["actions"]
+        else:
+            fact_status, actions = None, []
+        candidates.append({
+            "candidate_id": cid, "binding_kind": kind, "disposition": disposition,
+            "reason_codes": reason_codes if isinstance(reason_codes, list) else [],
+            "subject_graph_ref": subj, "target_graph_ref": tgt, "proposed_value": proposed_value,
+            "fact_key": fk, "fact_status": fact_status, "available_actions": actions,
+        })
+
+    return {"status": "available", "verified_edges": verified_edges,
+            "candidates": candidates, "divergences": divergences}, []
 
 
 def _readiness_section(
@@ -332,7 +459,8 @@ def _consistency_token(body: dict) -> str:
 
 
 def build_asset_detail(
-    conn: DbConn, *, source: str, object_ref: str, roles: Iterable[str], include: Iterable[str] | None = None
+    conn: DbConn, *, source: str, object_ref: str, roles: Iterable[str],
+    include: Iterable[str] | None = None, identity: IdentityEnvelope | None = None,
 ) -> dict | None:
     """Assemble the bounded F0 sections for ONE catalog asset ``(source, object_ref)``.
 
@@ -344,9 +472,12 @@ def build_asset_detail(
     the run manifest) — nothing here re-derives value, authority, or readiness.
 
     Sections that cannot be served for THIS caller are listed in ``unavailable_sections`` without a
-    hidden count; the SEMANTIC relationship subsection is always ``unavailable`` in F0 (it is F1).
-    Assemble under ONE ``REPEATABLE READ`` transaction (the caller's ``conn``) so every section
-    describes one torn-free snapshot; ``consistency_token`` fingerprints it.
+    hidden count. The SEMANTIC relationship subsection (F2b) is real, read-scoped Delivery-E data;
+    ``identity`` (the authenticated caller — the route passes the session principal) is used ONLY to
+    compute the per-binding governance actions the caller may run (owner-or-admin, E2 authz). With no
+    ``identity`` the subsection still renders read-only (no actions). Assemble under ONE
+    ``REPEATABLE READ`` transaction (the caller's ``conn``) so every section describes one torn-free
+    snapshot; ``consistency_token`` fingerprints it.
     """
     norm_source = source.strip().lower()
     allowed = allowed_sensitivities(roles)
@@ -382,7 +513,8 @@ def build_asset_detail(
         built.append("evidence")
 
     if "relationships" in requested:
-        relationships, rel_unavailable = _relationships_section(conn, norm_source, anchor, allowed)
+        relationships, rel_unavailable = _relationships_section(
+            conn, norm_source, anchor, allowed, roles, identity)
         body["relationships"] = relationships
         unavailable.extend(rel_unavailable)
         built.append("relationships")

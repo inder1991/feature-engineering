@@ -91,12 +91,14 @@ def test_asset_detail_sections_built_from_real_ingest(client):
     assert fields["currency"]["value"] == "USD"
     assert fields["entity"]["value"] == "Account"
 
-    # relationships — containment lists the REAL sibling columns; semantic is F0-unavailable.
+    # relationships — containment lists the REAL sibling columns; semantic is F2b available-but-empty
+    # for this no-enrichment ingest (no semantic bindings) — an EXPLICIT empty, never "unavailable".
     cols = {c["column"] for c in body["relationships"]["containment"]["columns"]}
     assert {"id", "posted_at", "cust_id"} <= cols
     assert "balance" not in cols                      # the anchor is not its own sibling
-    assert body["relationships"]["semantic"] == {"status": "unavailable", "available_in": "F1"}
-    assert "relationships.semantic" in body["unavailable_sections"]
+    assert body["relationships"]["semantic"] == {
+        "status": "available", "verified_edges": [], "candidates": [], "divergences": []}
+    assert "relationships.semantic" not in body["unavailable_sections"]
 
     # actions — F0 keeps this empty (the real correction command is F0-T4).
     assert body["actions"] == []
@@ -127,7 +129,7 @@ def test_read_scope_hides_anchor_and_sibling_without_leak(client, conn):
     # NO LEAK: the hidden column's name appears nowhere, and there is no total/hidden count field.
     blob = json.dumps(body)
     assert "ssn" not in blob
-    assert body["unavailable_sections"] == ["relationships.semantic"]   # no permission-count leak
+    assert body["unavailable_sections"] == []   # semantic available (empty); no permission-count leak
 
 
 # ── (2b) F1: the readiness TABLE diagnostic is read-scoped — no hidden-column leak ───────────────
@@ -223,6 +225,61 @@ def test_as_join_key_confirms_to_side_join_consistent_with_relationships(client,
     # Consistency: the SAME payload's relationships lists the very join readiness just confirmed.
     approved = body["relationships"]["approved_joins"]
     assert any(j["to_ref"] == "public.b.id" and j["status"] == "VERIFIED" for j in approved), approved
+
+
+# ── (2e) F2b: the route surfaces the VERIFIED semantic (currency) edge, read-scoped ──────────────
+
+
+def _verified_currency_edge(conn, source, from_ref, to_ref, *, fk="cur-fk", ev="cur-ev"):
+    conn.execute(
+        "INSERT INTO semantic_binding_edge (fact_key, catalog_source, kind, from_ref, to_ref, "
+        "confirmed_event_id, status) VALUES (%s, %s, 'currency_binding', %s, %s, %s, 'VERIFIED')",
+        (fk, source, from_ref, to_ref, ev))
+
+
+def test_semantic_verified_currency_edge_surfaced_by_route(client, conn):
+    """F2b: a VERIFIED currency edge notional->ccy is surfaced by GET /catalog/assets under the
+    `semantic.verified_edges` list, marked VERIFIED with its fact_key/confirmed_event_id provenance
+    — distinct from a proposed candidate. The subsection is `available` (not `unavailable`)."""
+    build_graph(conn, "csem", [
+        CanonicalRow("csem", "trades", "notional", "numeric"),
+        CanonicalRow("csem", "trades", "ccy", "text"),
+    ])
+    _verified_currency_edge(conn, "csem", "public.trades.notional", "public.trades.ccy")
+
+    sem = _asset(client, "csem", "public.trades.notional").json()["relationships"]["semantic"]
+    assert sem["status"] == "available"
+    assert "relationships.semantic" not in _asset(
+        client, "csem", "public.trades.notional").json()["unavailable_sections"]
+    edges = sem["verified_edges"]
+    assert len(edges) == 1
+    e = edges[0]
+    assert e["kind"] == "currency_binding" and e["status"] == "VERIFIED"
+    assert e["from_ref"] == "public.trades.notional" and e["to_ref"] == "public.trades.ccy"
+    assert e["fact_key"] == "cur-fk" and e["confirmed_event_id"] == "cur-ev"
+    assert sem["candidates"] == [] and sem["divergences"] == []
+
+
+def test_semantic_edge_read_scoped_hidden_currency_endpoint_omitted_no_leak(client, conn):
+    """F2b read-scope: a VERIFIED currency edge whose TARGET column is pii is OMITTED for a caller
+    without pii_reader (no count, no id leak), and VISIBLE to a pii_reader — the same both-endpoint
+    sensitivity filter approved_joins uses."""
+    build_graph(conn, "scoped2", [
+        CanonicalRow("scoped2", "trades", "notional", "numeric"),
+        CanonicalRow("scoped2", "trades", "secret_ccy", "text", sensitivity="pii"),
+    ])
+    _verified_currency_edge(conn, "scoped2", "public.trades.notional", "public.trades.secret_ccy")
+
+    # No pii_reader → the edge (and the hidden column name) is absent everywhere; no count leak.
+    body = _asset(client, "scoped2", "public.trades.notional", headers=AUTH).json()
+    assert body["relationships"]["semantic"]["verified_edges"] == []
+    assert "secret_ccy" not in json.dumps(body)
+    assert body["unavailable_sections"] == []          # available (empty), not a permission count
+
+    # A pii_reader sees the edge — proving the omission above was the scope, not absence.
+    pii = _asset(client, "scoped2", "public.trades.notional", headers=PII_AUTH).json()
+    edges = pii["relationships"]["semantic"]["verified_edges"]
+    assert [e["to_ref"] for e in edges] == ["public.trades.secret_ccy"]
 
 
 # ── (2d) F5: the history section is bounded + batches its stage reads ─────────────────────────────

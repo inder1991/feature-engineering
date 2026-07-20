@@ -264,6 +264,55 @@ def list_semantic_binding_proposals(conn: DbConn, source: str, *, limit: int = 1
     return views
 
 
+def caller_binding_actions(
+    conn: DbConn, *, fact_key: str, actor: IdentityEnvelope | None
+) -> dict:
+    """The display status + the subset of the status-sanctioned actions THIS caller may execute for
+    a semantic-binding ``fact_key`` — the READ-MODEL projection of the SAME owner-or-admin authz the
+    execute paths enforce. Returns ``{"status": <display status or None>, "actions": [...]}``.
+
+    Reuses the E2 status→actions mapping (:data:`_ACTIONS_VERIFIED` / :data:`_ACTIONS_PENDING`, the
+    same ones :func:`_build_view` returns) gated on the E1 authority predicate
+    (:func:`resolve_authority` + :func:`_actor_is_authority`, owner-or-admin) — it does NOT reinvent
+    authz. A non-authority caller, a ``None`` actor (a caller who did not authenticate as a
+    principal), a terminal/unlistable status, or an unloadable / non-semantic fact all yield
+    ``actions=[]`` — so the asset UI can never advertise an edge as editable unless the server
+    sanctions the command here.
+
+    FAIL-SOFT (mirrors the peer read models): a missing catalog adapter or an undecodable ref is
+    caught and degraded to ``actions=[]`` (a read-only view), never raised — the asset read must
+    render the edge even when authority can't be resolved."""
+    stream = load_fact(conn, fact_key)
+    if not stream:
+        return {"status": None, "actions": []}
+    payload0 = stream[0].payload
+    fact_type = payload0.get("fact_type")
+    if fact_type not in _SEMANTIC_FACT_TYPES:
+        return {"status": None, "actions": []}
+    status = fold_overlay_state(stream).status
+    display = _DISPLAY_STATUS.get(status, status)
+    if status == "VERIFIED":
+        sanctioned = _ACTIONS_VERIFIED
+    elif status in _PENDING_STATUSES:
+        sanctioned = _ACTIONS_PENDING
+    else:
+        return {"status": display, "actions": []}  # REJECTED / terminal — no editable actions
+    if actor is None:
+        return {"status": display, "actions": []}
+    try:
+        ref = _ref_from_payload(payload0["catalog_object_ref"])
+        if not isinstance(ref, CatalogObjectRef):
+            return {"status": display, "actions": []}
+        authority = resolve_authority(conn, current_catalog_adapter(), ref, fact_type)
+        authorized = _actor_is_authority(authority, actor)
+    except Exception:  # noqa: BLE001 — no adapter / undecodable ref: fail-closed to no actions
+        counters.incr("overlay.semantic_binding_governance.actions_unresolved")
+        logger.warning("semantic-binding governance: caller actions for fact %s unresolved — "
+                       "returning no actions", fact_key, exc_info=True)
+        return {"status": display, "actions": []}
+    return {"status": display, "actions": list(sanctioned) if authorized else []}
+
+
 def load_semantic_binding_confirmation_context(conn: DbConn, fact_key: str) -> dict:
     """The typed confirm/reject command args for ``fact_key``'s semantic-binding proposal:
     ``{ref, fact_type, use_case, target_event_id}`` (``use_case`` is always None — both types are
