@@ -220,6 +220,32 @@ def signed_gate_artifact_valid() -> bool:
     return _artifact_content_enforced(artifact_path)   # F2 — enforce gate_passed / versions / expiry
 
 
+def startup_artifact_check() -> bool:
+    """H3c — the lightweight STARTUP/runtime 3C.2 signed-gate signal (log-only; NEVER a hard crash).
+
+    Consults the SAME enforcement H1c's admission-time check uses (:func:`signed_gate_artifact_valid`)
+    and, when the live cross-catalog flag is ON but the artifact is absent / stale / invalid, logs a loud
+    fail-closed warning at boot — the actual refusal is already enforced fail-closed per-request by
+    :func:`cross_catalog_grounding_enabled`; this is the EARLY signal so an operator sees a
+    mis-provisioned gate at startup instead of only on the first cross-catalog confirm. Returns whether
+    the artifact axis currently admits cross-catalog grounding (True also in the no-key INERT posture,
+    where signed-gate enforcement is not deployed — the durable activation interlock alone gates). Purely
+    diagnostic: no DB read, no exception raised, safe to call from the app lifespan."""
+    flag_on = _flag_on()
+    artifact_ok = signed_gate_artifact_valid()   # already logs the inert / enforced / fail-closed posture
+    if flag_on and not artifact_ok:
+        logger.warning(
+            "3C.2 startup check: FEATUREGEN_INTENT_LIVE_CROSS_CATALOG is ON but the signed gate artifact "
+            "is absent/stale/invalid — cross-catalog grounding is FAIL-CLOSED (refused per-request) until "
+            "a valid artifact is provisioned")
+    elif flag_on:
+        logger.info("3C.2 startup check: live cross-catalog flag ON and signed-gate posture admits "
+                    "(artifact valid or enforcement not deployed) — activation interlock still gates")
+    else:
+        logger.info("3C.2 startup check: live cross-catalog flag OFF — cross-catalog grounding disabled")
+    return artifact_ok
+
+
 def cross_catalog_grounding_enabled(conn) -> bool:
     """H1c — the FULL runtime cross-catalog-grounding interlock the governing write consults for a
     MULTI-catalog contract: the durable live-activation interlock (flag + persisted PASS enablement +

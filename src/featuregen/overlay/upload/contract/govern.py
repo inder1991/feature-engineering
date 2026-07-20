@@ -21,6 +21,7 @@ from featuregen.overlay.upload import feature_validation_projection
 from featuregen.overlay.upload.contract._serial import actor_json as _actor_json
 from featuregen.overlay.upload.contract._serial import requirements_to_json
 from featuregen.overlay.upload.contract.author import ContractDraft
+from featuregen.overlay.upload.contract.governed_plan import revalidate_governed_plan
 from featuregen.overlay.upload.contract.invalidation import (
     _MISSING,
     _catalog_state_signature,
@@ -39,6 +40,8 @@ from featuregen.overlay.upload.features import (
     get_feature,
     register_feature,
 )
+from featuregen.overlay.upload.planner.contracts import ColumnRole, PhysicalReadSetV1
+from featuregen.overlay.upload.planner.plan_envelope import PlanEnvelopeV1
 from featuregen.overlay.upload.validation_requirements import DEFAULT_SCHEMA_VERSION, schema_for
 
 # Delivery C4-T3 / C2-C3 review (I-1a): the immutable-requirement schema version stamped on each
@@ -237,6 +240,81 @@ def _insert_contract_metadata_dependencies(conn, contract_id: str, draft: Contra
              item_hash))
 
 
+# ── H3c — the compiler's FULL physical read set persisted as role-labelled lineage ───────────────────
+# ``build_physical_read_set`` inventories EVERY column a governed contract reads (ingredients + join
+# keys + bridge keys + temporal anchors + weight/component inputs). Lineage based only on the draft's
+# derives/grain/as_of/join is INCOMPLETE — a dropped/retyped JOIN KEY along the physical path would not
+# move any recorded dependency, so a promoted governed contract would keep its stamp through real drift.
+# Persisting the read set closes that (the H2 review's C-1 gap, for planner-authored contracts): each
+# structural column becomes a contract_input_column AND a contract_metadata_dependency row, so the H2c
+# read gate (which hashes the dependency's CURRENT graph_node state) downgrades on drift of ANY of them.
+# The ColumnRole → lineage-role map; the pure 'ingredient' facet is NOT re-persisted (H2b writes it as
+# the 'derives' rows).
+_READ_SET_ROLE_LABEL: dict[ColumnRole, str] = {
+    ColumnRole.join_key: "join_key",
+    ColumnRole.bridge_key: "join_key",
+    ColumnRole.temporal_anchor: "anchor",
+    ColumnRole.aggregation_weight: "weight",
+    ColumnRole.aggregation_component: "ordering",
+}
+
+
+def _read_set_lineage_items(read_set: PhysicalReadSetV1):
+    """Yield ``(catalog_source, object_ref, role)`` for every STRUCTURAL column of the physical read set,
+    each ColumnRole mapped to its lineage role via ``_READ_SET_ROLE_LABEL`` (a column that is BOTH a
+    join_key and a bridge_key emits ONE 'join_key' row; deduped, deterministic by (catalog, ref)). The
+    object_ref is the graph_node column ref, so H2c's ``_catalog_state_signature`` resolves it — a
+    retype/drop moves the signature and the read gate downgrades."""
+    for col in sorted(read_set.columns, key=lambda c: (c.catalog_source, c.object_ref)):
+        labels: list[str] = []
+        for r in col.roles:
+            label = _READ_SET_ROLE_LABEL.get(r)
+            if label is not None and label not in labels:
+                labels.append(label)
+        for label in labels:
+            yield col.catalog_source, col.object_ref, label
+
+
+def _insert_read_set_input_columns(conn, contract_id: str, read_set: PhysicalReadSetV1) -> None:
+    """H3c — persist the read set's structural columns as role-labelled ``contract_input_column`` rows
+    (join_key/anchor/weight/ordering), reusing H2b's ``canonical_hash`` item scheme + the write-once
+    table. Idempotent (ON CONFLICT DO NOTHING) — a read-set column that coincides with a draft-derived
+    row simply DO-NOTHINGs on the shared item_hash."""
+    for source, ref, role in _read_set_lineage_items(read_set):
+        item_hash = canonical_hash({
+            "contract_id": contract_id, "source": source, "graph_ref": ref,
+            "logical_ref": ref, "physical_ref": ref, "role": role,
+            "decision_id": None, "fact_id": None})
+        conn.execute(
+            "INSERT INTO contract_input_column (contract_id, source, graph_ref, logical_ref, "
+            "physical_ref, role, decision_id, fact_id, item_hash) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) "
+            "ON CONFLICT (contract_id, item_hash) DO NOTHING",
+            (contract_id, source, ref, ref, ref, role, None, None, item_hash))
+
+
+def _insert_read_set_dependencies(conn, contract_id: str, read_set: PhysicalReadSetV1) -> None:
+    """H3c — persist the read set's structural columns as ``contract_metadata_dependency`` rows so the
+    read-time gate hashes each join key / anchor's CURRENT graph_node state (via H2c's
+    ``confirm_dependency_hash``). A dropped/retyped join key drifts its item hash → a promoted governed
+    contract HARD-downgrades. ``role`` is not a dependency column (H2c never hashes it), so multiple
+    roles over one column collapse to a single row — one drift signal per physical column suffices."""
+    seen: set[tuple[str, str]] = set()
+    for source, ref, _role in _read_set_lineage_items(read_set):
+        if (source, ref) in seen:
+            continue
+        seen.add((source, ref))
+        item_hash = confirm_dependency_hash(
+            conn, contract_id=contract_id, catalog_source=source, graph_ref=ref,
+            logical_ref=ref, decision_id=None, fact_id=None, event_id=None)
+        conn.execute(
+            "INSERT INTO contract_metadata_dependency (contract_id, catalog_source, graph_ref, "
+            "logical_ref, decision_id, fact_id, event_id, item_hash) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s) "
+            "ON CONFLICT (contract_id, item_hash) DO NOTHING",
+            (contract_id, source, ref, ref, None, None, None, item_hash))
+
+
 # ── H1b — Gate-1 role-binding confirmation hash ─────────────────────────────────────────────────────
 # The draft exposes the exact role bindings + a deterministic ``binding_hash``; the confirm requires that
 # hash and 409s if the server-authoritative bindings DRIFTED since draft (a column retyped, a fact
@@ -355,13 +433,24 @@ class Contract:
 def confirm_contract(conn, draft: ContractDraft, *, actor, roles: Iterable[str] = (),
                      target_ref: str | None = None,
                      now: datetime | None = None, intent_id: str | None = None,
-                     confirmed_binding_hash: str | None = None) -> Contract:
+                     confirmed_binding_hash: str | None = None,
+                     plan_envelope: PlanEnvelopeV1 | None = None,
+                     templates=None) -> Contract:
     """The human gate. RE-RUNS the deterministic MCV (B1) and refuses to govern an invalid draft, then
     registers a versioned governed contract + wires its derives-from into the feature layer. Re-confirming
     the same feature bumps the version. A non-empty definition is required (no empty-narrative contract).
     `roles` is the CONFIRMING actor's read-scope, threaded into the re-run so the cross-table
     join-authority disposition judges the confirmer's real authority — without it a sensitivity-tagged
-    hop would read DENIED and over-reject a legitimately authorized feature."""
+    hop would read DENIED and over-reject a legitimately authorized feature.
+
+    H3c — a GOVERNED contract carries a ``plan_envelope`` (the pinned governed physical plan). When
+    present, the plan is REBUILT against the CURRENT catalog state and MUST reproduce the SAME
+    physical_plan_id + planner_declaration_id (its declaration id) with a ``current`` freshness verdict —
+    any drift raises ``GovernedPlanDrift`` (the route maps it to 409, never finalizing a drifted plan).
+    The rebuilt plan's FULL physical read set (join keys / bridge keys / anchors) is then persisted as
+    role-labelled ``contract_input_column`` + ``contract_metadata_dependency`` lineage, so the H2c read
+    gate detects drift on ANY physical column the governed contract reads (the C-1 gap, closed here).
+    ``templates`` (default ALL_TEMPLATES) is injectable for tests that plan over a fixture recipe."""
     # H2b STEP 1 — ADVISORY LOCK FIRST, before ANY feature lookup or validate_minimum. Serializes
     # concurrent confirms of the SAME feature identity so their pointer CAS (STEP 5) cannot interleave:
     # two first-confirms can't both register the feature (B4 proliferation), and a re-confirm can't lose
@@ -376,6 +465,25 @@ def confirm_contract(conn, draft: ContractDraft, *, actor, roles: Iterable[str] 
         raise ContractValidationError(f"contract failed MCV, not governed: {check.reasons}")
     if not (draft.definition or "").strip():
         raise ContractValidationError("contract has an empty definition, not governed")
+    # H3c STEP 0 — for a GOVERNED contract, REBUILD + revalidate the pinned plan against the CURRENT
+    # snapshot BEFORE any write (fail fast, no partial writes on drift): require the SAME
+    # physical_plan_id + planner_declaration_id and a `current` freshness verdict, else GovernedPlanDrift
+    # (route → 409, regenerate). The rebuilt read set feeds the role-labelled lineage below. Non-governed
+    # confirms (plan_envelope is None) are byte-identical — no rebuild, no read-set rows.
+    governed_read_set: PhysicalReadSetV1 | None = None
+    gen_source = recipe_id = physical_plan_id = planner_declaration_id = None
+    if plan_envelope is not None:
+        # The planner provenance is taken from the SERVER-reconstructed envelope (never the client body).
+        gen_source = "recipe"                                # the governed path is a recipe path
+        recipe_id = plan_envelope.recipe_id
+        physical_plan_id = plan_envelope.physical_plan_id           # the pinned physical identity
+        planner_declaration_id = plan_envelope.contract_id          # the pinned declaration identity
+        # REBUILD + revalidate (stable ids + freshness). None = not rebuildable (legacy/registry drift,
+        # gated elsewhere); a tuple = verified → its read set feeds the role-labelled lineage; a genuine
+        # drift RAISES GovernedPlanDrift (no partial writes — this runs before the contract INSERT).
+        rebuilt = revalidate_governed_plan(conn, plan_envelope, roles, now, templates=templates)
+        if rebuilt is not None:
+            _plan, governed_read_set = rebuilt
     pairs = draft.derives_pairs   # B3: resolved (catalog_source, object_ref) carried on the draft
     # B4: ONE feature per feature_name — re-confirm reuses + refreshes the feature (no proliferation),
     # so drift impact/freshness point at a single live feature, not N duplicates.
@@ -420,14 +528,17 @@ def confirm_contract(conn, draft: ContractDraft, *, actor, roles: Iterable[str] 
         canonical_hash({"snapshot": metadata_content_hash, "binding_hash": confirmed_binding_hash})
         if confirmed_binding_hash is not None else metadata_content_hash)
     # H2b STEP 3 — insert the immutable contract version + the new 1011 columns. generation_source /
-    # recipe_id / physical_plan_id / planner_declaration_id are NULL: the draft does not carry them yet.
-    # # H1a/H3 will supply them (recipe / physical-plan / planner-declaration provenance).
+    # recipe_id / physical_plan_id / planner_declaration_id are the H3c planner provenance: set for a
+    # GOVERNED contract (from the revalidated plan envelope — the ids the rebuild reproduced), NULL for a
+    # direct/single-catalog confirm (byte-identical to the pre-H3c NULLs).
     conn.execute(
         "INSERT INTO contract (contract_id, feature_id, feature_name, definition, version, actor, "
         "join_path, intent_id, verification, validation_status, requirements, "
         "metadata_snapshot_id, metadata_content_hash, metadata_input_fingerprint, "
-        "initial_validation_status, initial_verification) "
-        "VALUES (%s, %s, %s, %s, %s, %s::jsonb, %s::jsonb, %s, %s, %s, %s::jsonb, %s, %s, %s, %s, %s)",
+        "initial_validation_status, initial_verification, "
+        "generation_source, recipe_id, physical_plan_id, planner_declaration_id) "
+        "VALUES (%s, %s, %s, %s, %s, %s::jsonb, %s::jsonb, %s, %s, %s, %s::jsonb, %s, %s, %s, %s, %s, "
+        "%s, %s, %s, %s)",
         (contract_id, feature_id, draft.feature_name, draft.definition, version, _actor_json(actor),
          json.dumps(list(draft.join_path)), intent_id,   # intent_id: audit link to the hypothesis (M5)
          "DESIGN-CHECKED",   # §14.5 stamp — gauntlet-passed; predictive value unverified (0968).
@@ -442,7 +553,8 @@ def confirm_contract(conn, draft: ContractDraft, *, actor, roles: Iterable[str] 
          #                             (pure content_hash when no binding_hash; NULL on a pre-C0 confirm)
          check.validation_status,    # 1011 initial_validation_status — the at-confirm INITIAL axis, same
          #                             value the ASSESSED event stamps (SEPARATE from the mutable 1003 col)
-         "DESIGN-CHECKED"))          # 1011 initial_verification — the at-confirm INITIAL verification
+         "DESIGN-CHECKED",           # 1011 initial_verification — the at-confirm INITIAL verification
+         gen_source, recipe_id, physical_plan_id, planner_declaration_id))   # H3c planner provenance
     # H2b STEP 4 — insert the immutable, write-once contract_input_column lineage: one role-labelled row
     # per reconciled input (derives + grain + as_of + governed join). This + the pointer (STEP 5) are the
     # AUTHORITATIVE write; feature/feature_derives_from (STEP 7) are the current-pointer compat projection.
@@ -451,6 +563,13 @@ def confirm_contract(conn, draft: ContractDraft, *, actor, roles: Iterable[str] 
     # check-clearing / input-binding catalog item), same transaction. These back BOTH the eager
     # invalidate_contracts_for fan-out AND the read-time second fail-closed gate.
     _insert_contract_metadata_dependencies(conn, contract_id, draft)
+    # H3c STEP 4c — for a GOVERNED contract, ALSO persist the compiler's FULL physical read set (join
+    # keys / bridge keys / anchors from the revalidated plan) as role-labelled input + dependency rows,
+    # so the read gate's drift check covers EVERY physical column the contract reads — not just the
+    # draft's derives/grain/as_of/join. This is the C-1 closure for planner-authored contracts.
+    if governed_read_set is not None:
+        _insert_read_set_input_columns(conn, contract_id, governed_read_set)
+        _insert_read_set_dependencies(conn, contract_id, governed_read_set)
     # H2b STEP 5 — CAS the feature_current_contract pointer to this new version (the AUTHORITATIVE write).
     if prior_pointer_version is None:
         conn.execute(

@@ -42,6 +42,7 @@ from featuregen.events.registry import event_registry
 from featuregen.intake.llm import LLMClient
 from featuregen.overlay.config import overlay_config_from_env, register_overlay_config
 from featuregen.overlay.facts import register_overlay_event_types
+from featuregen.overlay.upload.contract.live_activation import startup_artifact_check
 from featuregen.overlay.upload.ingestion_run import RUN_ID_HEADER
 
 logger = logging.getLogger(__name__)
@@ -87,6 +88,13 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     register_overlay_event_types(event_registry())
     register_overlay_config(overlay_config_from_env())
     _startup_migration_check(app)
+    # H3c — the lightweight 3C.2 signed-gate posture signal at boot (log-only, never blocks startup): a
+    # loud warning when the live cross-catalog flag is ON but the signed artifact is absent/stale/invalid,
+    # so a mis-provisioned gate is visible early. The per-request admission check still enforces fail-closed.
+    try:
+        startup_artifact_check()
+    except Exception:  # noqa: BLE001 — a diagnostic startup log must never prevent the app from booting
+        logger.warning("could not run the 3C.2 signed-gate startup check", exc_info=True)
     yield
 
 

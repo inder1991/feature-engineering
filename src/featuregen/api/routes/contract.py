@@ -58,6 +58,7 @@ from featuregen.overlay.upload.contract.govern import (
     get_contract_detail,
     list_contracts,
 )
+from featuregen.overlay.upload.contract.governed_plan import GovernedPlanDrift
 from featuregen.overlay.upload.contract.intake import (
     IntentValidationError,
     redact_free_text,
@@ -787,7 +788,14 @@ def confirm(body: DraftIn, conn: _Conn, identity: _Identity) -> Contract:
                                 roles=identity.role_claims,   # the CONFIRMER's authority reaches the
                                 #                               re-run's join-authority disposition
                                 now=datetime.now(UTC), target_ref=target, intent_id=body.intent_id,
-                                confirmed_binding_hash=current_binding_hash)
+                                confirmed_binding_hash=current_binding_hash,
+                                # H3c — the governed plan (from the SERVER-reconstructed chosen feature,
+                                # never the client body): confirm_contract REBUILDS it against the current
+                                # snapshot, requires the SAME physical_plan_id + declaration id + a fresh
+                                # verdict, and persists its full read set as role-labelled lineage.
+                                plan_envelope=env)
+    except GovernedPlanDrift as e:   # H3c — the rebuilt plan drifted (id / freshness) → regenerate
+        raise HTTPException(status_code=409, detail="plan drifted, regenerate") from e
     except ContractValidationError as e:
         raise HTTPException(status_code=422, detail=str(e)) from e
     except ContractPointerConflict as e:   # M-a: the pointer CAS lost a race -> conflict, not 500
