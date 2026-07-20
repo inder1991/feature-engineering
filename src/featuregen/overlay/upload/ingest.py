@@ -6,7 +6,7 @@ import logging
 import os
 import re
 from dataclasses import asdict, dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from featuregen.aggregates.ids import mint_id
 from featuregen.overlay import facts
@@ -603,15 +603,24 @@ def _invalidate_stale_semantic_binding_sets(conn, catalog_source: str, prepared:
 
 def _run_semantic_binding_candidate_stage(conn, catalog_source: str, prepared: list, *,
                                           client, actor, ingestion_run_id: str | None,
-                                          now: datetime | None) -> tuple[int, list, int]:
+                                          now: datetime | None) -> tuple[int, list, int, int]:
     """The CANDIDATE stage body (caller owns the savepoint + except). Per table: validate the D2
     shortlist, persist the immutable candidate set via D1's store, and CAS-project it current; run
     D3's audited LLM select as ADDITIONAL evidence (persisted as its own immutable set, never made
     current — the governed proposal path stays deterministic) only when a client is present. Returns
-    ``(candidates_total, proposable, llm_failed)``: ``proposable`` is a list of
+    ``(candidates_total, proposable, llm_failed, llm_partial)``: ``proposable`` is a list of
     ``(candidate_set_id, strong_candidates)`` for the proposal stage; ``llm_failed`` counts tables
-    whose D3 stage hit a bound (byte/call/deadline) or provider fault — the caller marks the stage
-    ``partial`` WITHOUT changing upload acceptance. NEVER promotes a fact to VERIFIED."""
+    whose D3 stage hit a BLOCKING bound (byte/call/deadline) or provider fault; ``llm_partial`` counts
+    tables whose D3 set was ``partial`` (candidate-cap overflow, still ranked). The caller marks the
+    stage ``partial`` when either is non-zero, WITHOUT changing upload acceptance. NEVER promotes a
+    fact to VERIFIED.
+
+    I-D — the D3 RUN-LEVEL bounds are enforced HERE (they were dead when the caller omitted them): a
+    shared per-run provider-call budget (``max_provider_calls``) and a wall-clock ``deadline`` are
+    threaded into every ``enrich_semantic_bindings`` call, so a wide upload can never make one provider
+    call per table. When the budget/deadline is spent the remaining tables ABSTAIN (a ``failed`` D3
+    set, no dispatch) — the deterministic candidate set is still persisted + current for every table."""
+    from featuregen.overlay.upload import enrich_config
     from featuregen.overlay.upload.semantic_bindings.shortlist import shortlist
     from featuregen.overlay.upload.semantic_bindings.store import store_shortlist, table_graph_ref
     from featuregen.overlay.upload.semantic_bindings.store_projection import (
@@ -623,7 +632,13 @@ def _run_semantic_binding_candidate_stage(conn, catalog_source: str, prepared: l
     run_id = ingestion_run_id or mint_id("ing")
     candidates_total = 0
     llm_failed = 0
+    llm_partial = 0
     proposable: list = []
+    # I-D run-level bounds: ONE budget + ONE wall-clock deadline shared across every table's D3 call.
+    bounds = enrich_config.semantic_binding_bounds()
+    now_basis = now or datetime.now(UTC)
+    deadline = now_basis + timedelta(seconds=bounds.deadline_s)
+    provider_calls_made = 0
     for view, pass_c, fingerprint in prepared:
         deterministic = validate_candidates(
             shortlist(view, None, pass_c), view, pass_c=pass_c)
@@ -651,10 +666,19 @@ def _run_semantic_binding_candidate_stage(conn, catalog_source: str, prepared: l
             er = enrich_semantic_bindings(
                 conn, client, table_view=view, candidates=deterministic,
                 catalog_source=catalog_source, ingestion_run_id=run_id, attempt_no=1,
-                pass_c=pass_c, actor=actor, now=now)
+                pass_c=pass_c, actor=actor, bounds=bounds,
+                calls_remaining=bounds.max_provider_calls - provider_calls_made,
+                deadline=deadline, now=now_basis)
+            # A committed ``llm_call_ref`` is the durable signal a provider call actually landed
+            # (empty-shortlist / budget / deadline / byte / egress-blocked returns leave it None and
+            # make NO provider round-trip) — decrement the shared budget only on a real call.
+            if er.llm_call_ref is not None:
+                provider_calls_made += 1
             if er.completion_status == "failed":
-                llm_failed += 1
-    return candidates_total, proposable, llm_failed
+                llm_failed += 1               # blocking bound (incl. budget-refused ABSTAIN) / fault
+            elif er.completion_status == "partial":
+                llm_partial += 1              # M-2: candidate-cap overflow — the capped subset ranked
+    return candidates_total, proposable, llm_failed, llm_partial
 
 
 def _run_semantic_binding_proposal_stage(conn, proposable: list, *, actor) -> tuple[int, int]:
@@ -2048,6 +2072,12 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
     # byte-identical (a truthful `disabled` stage entry; NO candidate rows). ──
     sembind_candidates = sembind_proposed = sembind_abstained = sembind_failed = 0
     sembind_proposable: list = []
+    # I-E / M-3 truthfulness flags: `prep_failed` means the input assembly threw (so the candidate
+    # stage did NOT succeed and must not run its body over an empty list); `candidate_stage_failed`
+    # means no persisted candidate exists to link, so the proposal stage is `not_applicable`, not a
+    # vacuous `succeeded`.
+    sembind_prep_failed = False
+    sembind_candidate_stage_failed = False
     candidates_on = semantic_binding_candidates_enabled()
     # The re-ingest invalidation must run ALWAYS (even flag-off / no client, NO LLM), but only a
     # source that ALREADY holds a current candidate set can go stale — so a cheap indexed guard
@@ -2070,10 +2100,15 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
             logger.warning("advisory semantic-binding metadata prep failed for %r — facts + graph "
                            "intact", catalog_source, exc_info=True)
             sembind_prepared = []
-    if has_current_semantic_set and sembind_prepared:
+            sembind_prep_failed = True
+    if has_current_semantic_set:
         # OWN savepoint: the re-ingest invalidation (D1 CAS) must never abort the upload. NO LLM call
         # — a metadata change flips a now-mismatched current set to `unverifiable`, keeping the
         # immutable set as history. Runs regardless of the flags (disabling can't freeze a stale set).
+        # I-E: UNCONDITIONAL on the prior current set — it runs even when the producer errored (prep
+        # threw, `sembind_prepared == []`) or is disabled. With no live fingerprints to compare, an
+        # empty `prepared` fail-closes every current set of this source to `unverifiable` (we cannot
+        # attest any still matches its live metadata), never freezing a stale set through this upload.
         try:
             with conn.transaction():
                 _invalidate_stale_semantic_binding_sets(
@@ -2083,22 +2118,38 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
             logger.warning("advisory semantic-binding re-ingest invalidation failed for %r — facts "
                            "+ graph intact", catalog_source, exc_info=True)
 
-    if candidates_on:
+    if candidates_on and sembind_prep_failed:
+        # I-E: the input assembly threw, so the candidate stage did NOT succeed. Record it truthfully
+        # as `failed` (never run the body over `[]`, which would falsely report `succeeded` with zero
+        # counts) — the unconditional invalidation above still ran; the proposal stage is downstream
+        # `not_applicable` (M-3).
+        stage_started = datetime.now(UTC)
+        counters.incr("overlay.semantic_binding.candidates.error")
+        sembind_proposable = []
+        sembind_failed += 1
+        sembind_candidate_stage_failed = True
+        record_stage(stage_recorder, "semantic_binding_candidates", "failed",
+                     reason_code="prep_exception", started_at=stage_started)
+    elif candidates_on:
         stage_started = datetime.now(UTC)
         try:
             with conn.transaction():   # OWN savepoint + except — the Pass C fail-soft pattern
-                sembind_candidates, sembind_proposable, sembind_llm_failed = (
+                sembind_candidates, sembind_proposable, sembind_llm_failed, sembind_llm_partial = (
                     _run_semantic_binding_candidate_stage(
                         conn, catalog_source, sembind_prepared, client=client, actor=actor,
                         ingestion_run_id=ingestion_run_id, now=now))
-            # A D3 bound overflow / provider fault marks the stage `partial` (the deterministic set is
-            # still persisted + current) WITHOUT changing upload acceptance — the isolation boundary.
+            # A D3 BLOCKING bound / provider fault (`llm_failed`) OR a candidate-cap `partial`
+            # (`llm_partial`, M-2) marks the stage `partial` (the deterministic set is still persisted
+            # + current) WITHOUT changing upload acceptance — the isolation boundary. Only a genuine
+            # failure counts toward `sembind_failed`; a `partial` set is not a failure.
             sembind_failed += sembind_llm_failed
+            sembind_bounded = sembind_llm_failed or sembind_llm_partial
             record_stage(stage_recorder, "semantic_binding_candidates",
-                         "partial" if sembind_llm_failed else "succeeded",
-                         reason_code="llm_bound" if sembind_llm_failed else None,
+                         "partial" if sembind_bounded else "succeeded",
+                         reason_code="llm_bound" if sembind_bounded else None,
                          detail={"candidates": sembind_candidates, "tables": len(sembind_prepared),
-                                 "llm_failed": sembind_llm_failed},
+                                 "llm_failed": sembind_llm_failed,
+                                 "llm_partial": sembind_llm_partial},
                          started_at=stage_started)
         except Exception:  # noqa: BLE001 — advisory: the candidate stage never fails an upload
             counters.incr("overlay.semantic_binding.candidates.error")
@@ -2106,12 +2157,20 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
                            "intact", catalog_source, exc_info=True)
             sembind_proposable = []
             sembind_failed += 1
+            sembind_candidate_stage_failed = True
             record_stage(stage_recorder, "semantic_binding_candidates", "failed",
                          reason_code="exception", started_at=stage_started)
     else:
         record_stage(stage_recorder, "semantic_binding_candidates", "disabled")
 
-    if semantic_binding_proposals_enabled() and candidates_on:
+    if semantic_binding_proposals_enabled() and candidates_on and sembind_candidate_stage_failed:
+        # M-3: the candidate stage failed (prep threw or the body aborted), so there is no persisted
+        # candidate for a proposal to link. Record the proposal stage truthfully as `not_applicable`
+        # with a reason — not a vacuous `succeeded` over an empty proposable list. (`skipped` is not a
+        # legal STAGE_STATES member; `not_applicable` is the sibling of the requires_candidates no-op.)
+        record_stage(stage_recorder, "semantic_binding_proposals", "not_applicable",
+                     reason_code="upstream_failed", started_at=datetime.now(UTC))
+    elif semantic_binding_proposals_enabled() and candidates_on:
         stage_started = datetime.now(UTC)
         try:
             with conn.transaction():   # OWN savepoint + except — proposals are DRAFT-only, never VERIFIED

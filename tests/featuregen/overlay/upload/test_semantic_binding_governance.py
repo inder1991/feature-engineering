@@ -302,6 +302,28 @@ def test_reverify_reopens_the_cycle_and_demotes(db):
     assert fold_overlay_state(load_fact(db, key)).status == "VERIFIED"
 
 
+def test_reverify_confirm_with_value_override_is_denied(db):
+    # I-F: a confirmer may NOT author AND approve a NEW semantic value in one confirm command (the
+    # single-party path `enter_fact` already denies). On a REVERIFY binding, a distinct authorized
+    # human passing `args["value"]` is refused — a value change must go through correct_binding.
+    key, _ = seed_verified_via_command(db, ref=_measure_col(), fact_type="currency_binding",
+                                       value=_cb_value(), owner="user:alice")
+    assert request_reverify(db, fact_key=key, actor=ADMIN)["accepted"]
+    ctx = load_semantic_binding_confirmation_context(db, key)
+    override = _cb_value(column="settle_ccy")   # a DIFFERENT (individually valid) currency target
+    res = confirm_fact(db, Command("confirm_fact", "overlay_fact", None,
+        {"ref": ctx["ref"], "fact_type": ctx["fact_type"], "use_case": ctx["use_case"],
+         "target_event_id": ctx["target_event_id"], "value": override}, ADMIN2, "override"))
+    assert res.accepted is False and "value override denied" in res.denied_reason
+    # the single-party value change never landed — the binding stays REVERIFY (demoted).
+    assert fold_overlay_state(load_fact(db, key)).status == "REVERIFY"
+    assert verified_currency_binding(db, key) is None
+    # and a plain re-confirm (NO override) still re-affirms the ORIGINAL value -> VERIFIED.
+    assert _confirm_via_context(db, key, ADMIN2, idem="reaffirm").accepted
+    state = fold_overlay_state(load_fact(db, key))
+    assert state.status == "VERIFIED" and state.value == _cb_value()
+
+
 def test_correct_opens_a_new_proposal_requiring_a_distinct_confirmer(db):
     key, _ = seed_verified_via_command(db, ref=_measure_col(), fact_type="currency_binding",
                                        value=_cb_value(), owner="user:alice")

@@ -403,8 +403,10 @@ def reject_semantic_binding(fact_key: str, body: RejectSemanticBindingRequest, c
 def reverify_semantic_binding(fact_key: str, body: ReverifySemanticBindingRequest, conn: _Conn,
                               identity: _Identity) -> dict:
     """Reopen a fresh re-verification cycle on a VERIFIED binding (VERIFIED → REVERIFY), demoting
-    the projection until a DIFFERENT authorized human re-confirms via the confirm route. Reuses the
-    overlay's own expiry/reverify transition — never hand-writes fact state."""
+    the projection until an authorized human re-confirms via the confirm route. Reuses the overlay's
+    own expiry/reverify transition — never hand-writes fact state. Four-eyes on the re-confirm is the
+    platform ``proposer ≠ confirmer`` rule ONLY (reverify does not re-propose, so the requester/original
+    confirmer may re-confirm); use the correct route to force a genuinely distinct human."""
     del body  # a bounded reviewer note field is accepted for surface symmetry; not persisted here
     _load_semantic_binding_context_or_404(conn, fact_key)  # 404 opaque before any state change
     result = request_reverify(conn, fact_key=fact_key, actor=identity)

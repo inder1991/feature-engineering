@@ -336,3 +336,130 @@ def test_d3_bound_overflow_is_partial_upload_accepted(db, monkeypatch):
     assert res.semantic_binding_failed == 1                    # the D3 stage hit its bound
     assert _current(db)[0][2] == "current"                     # deterministic set stays current
     assert _states(rec)["semantic_binding_candidates"] == ("partial", "llm_bound")
+
+
+# ── 7b. M-2 — a D3 `partial` (candidate-cap overflow) marks the stage `partial`, NOT a failure ─────
+
+def test_d3_partial_marks_stage_partial_not_failed(db, monkeypatch):
+    import featuregen.overlay.upload.semantic_bindings.enrich as enrich_mod
+    from featuregen.intake.llm import FakeLLM
+    from featuregen.overlay.upload.semantic_bindings.enrich import EnrichResult
+
+    monkeypatch.setenv(_CANDS, "1")
+
+    def _partial(*a, **kw):
+        # A candidate-cap overflow -> a `partial` D3 set (the capped subset IS ranked): the stage is
+        # `partial` (truthful), but a `partial` is NOT a failure — it must not inflate `failed`.
+        return EnrichResult(completion_status="partial", candidate_set_id="cs", llm_call_ref="ref",
+                            presented=1, selected=1, persisted=2, reason="candidate_cap_exceeded")
+
+    monkeypatch.setattr(enrich_mod, "enrich_semantic_bindings", _partial)
+    rec = StageRecorder()
+    res = ingest_upload(db, _SOURCE, _currency_rows(), actor=_actor(), now=_NOW,
+                        client=FakeLLM(script={}), stage_recorder=rec)
+
+    assert res.status == "ingested"
+    assert res.semantic_binding_candidates == 1
+    assert res.semantic_binding_failed == 0                    # a `partial` is NOT a failure (M-2)
+    assert _states(rec)["semantic_binding_candidates"] == ("partial", "llm_bound")
+
+
+# ── 8. I-D — the RUN-LEVEL LLM provider-call budget bounds provider calls; the rest ABSTAIN ────────
+
+class _CountingSelectLLM:
+    """Records every request; answers a D3 SELECT with a valid selection and lets Pass A degrade on an
+    off-schema body. ``sembind_calls`` counts ONLY the semantic-binding provider dispatches."""
+
+    def __init__(self):
+        self.requests: list = []
+
+    def call(self, request):
+        from featuregen.intake.llm import PROVIDER_OK, LLMResult
+        self.requests.append(request)
+        if request.task == "overlay.semantic_bindings":
+            items = request.inputs["catalog_metadata"]["candidates"]
+            output = {"selections": ([{"candidate_id": items[0]["candidate_id"],
+                                       "disposition": "strong", "confidence": 0.9,
+                                       "rationale": "ok"}] if items else [])}
+        else:
+            output = {}      # Pass A: an off-schema body -> that stage degrades fail-soft (not our SUT)
+        return LLMResult(output=output, self_reported_scores={}, call_ref="", status=PROVIDER_OK)
+
+    @property
+    def sembind_calls(self) -> int:
+        return sum(1 for r in self.requests if r.task == "overlay.semantic_bindings")
+
+
+def _one_currency_table(table: str) -> list[CanonicalRow]:
+    return [CanonicalRow(_SOURCE, table, "id", "integer", is_grain=True),
+            CanonicalRow(_SOURCE, table, "amount", "numeric"),
+            CanonicalRow(_SOURCE, table, "currency", "text")]
+
+
+def test_run_level_llm_budget_bounds_provider_calls_rest_abstain(db, monkeypatch):
+    monkeypatch.setenv(_CANDS, "1")
+    monkeypatch.setenv("OVERLAY_SEMBIND_MAX_PROVIDER_CALLS", "2")   # run-level budget of 2 calls
+    # FOUR tables, each with one STRONG currency candidate -> four D3 dispatches attempted.
+    rows = [*_one_currency_table("transactions"), *_one_currency_table("invoices"),
+            *_one_currency_table("payments"), *_one_currency_table("refunds")]
+    client = _CountingSelectLLM()
+    rec = StageRecorder()
+    res = ingest_upload(db, _SOURCE, rows, actor=_actor(), now=_NOW, client=client, stage_recorder=rec)
+
+    assert res.status == "ingested"                            # upload STILL accepted
+    assert res.semantic_binding_candidates == 4                # the deterministic set for EVERY table
+    # At most `budget` provider calls actually reached the model (was ~1-per-table before I-D).
+    assert client.sembind_calls == 2
+    # The two budget-refused tables ABSTAIN: their D3 set is `failed` (no dispatch) -> counted failed.
+    assert res.semantic_binding_failed == 2
+    assert _states(rec)["semantic_binding_candidates"] == ("partial", "llm_bound")
+
+
+# ── 9. I-E — a candidate-stage PREP exception records `failed` AND the invalidation still runs ─────
+
+def test_prep_exception_records_failed_and_still_invalidates(db, monkeypatch):
+    monkeypatch.setenv(_CANDS, "1")
+    # (1) producer ON -> build a current candidate set for transactions.
+    res1 = ingest_upload(db, _SOURCE, _currency_rows(), actor=_actor(), now=_NOW)
+    assert res1.status == "ingested" and res1.semantic_binding_candidates == 1
+    assert _current(db)[0][2] == "current"
+
+    # (2) force the metadata PREP to throw on the re-upload. The stage must record `failed` (truthful,
+    #     not a vacuous succeeded/tables=0) AND the always-on re-ingest invalidation must STILL run —
+    #     with no live fingerprints it fail-closes the prior current set to `unverifiable`.
+    import featuregen.overlay.upload.ingest as ingest_mod
+
+    def _prep_boom(*a, **kw):
+        raise RuntimeError("semantic-binding prep blew up")
+
+    monkeypatch.setattr(ingest_mod, "_semantic_binding_prep", _prep_boom)
+    rec = StageRecorder()
+    res2 = ingest_upload(db, _SOURCE, _currency_rows(), actor=_actor(), now=_NOW, stage_recorder=rec)
+
+    assert res2.status == "ingested"                           # never aborts the upload
+    assert _states(rec)["semantic_binding_candidates"] == ("failed", "prep_exception")
+    assert res2.semantic_binding_failed == 1                   # truthfully counted a failure
+    current2 = _current(db)                                    # the invalidation STILL ran
+    assert current2 and current2[0][1] is None and current2[0][2] == "unverifiable"
+
+
+# ── 10. M-3 — after a candidate-stage FAILURE the proposal stage is `skipped`, not a vacuous succeed ─
+
+def test_proposal_stage_skipped_after_candidate_stage_failure(db, monkeypatch):
+    monkeypatch.setenv(_CANDS, "1")
+    monkeypatch.setenv(_PROPS, "1")
+    import featuregen.overlay.upload.ingest as ingest_mod
+
+    def _db_abort(conn, *a, **kw):
+        conn.execute("SELECT boom FROM nonexistent_semantic_binding_table").fetchall()
+
+    monkeypatch.setattr(ingest_mod, "_run_semantic_binding_candidate_stage", _db_abort)
+    rec = StageRecorder()
+    res = ingest_upload(db, _SOURCE, _currency_rows(), actor=_actor(), now=_NOW, stage_recorder=rec)
+
+    assert res.status == "ingested"
+    states = _states(rec)
+    assert states["semantic_binding_candidates"] == ("failed", "exception")
+    # M-3: no persisted candidate to link -> the proposal stage is truthfully `not_applicable`.
+    assert states["semantic_binding_proposals"] == ("not_applicable", "upstream_failed")
+    assert res.semantic_binding_proposed == 0

@@ -123,6 +123,17 @@ def confirm_fact(conn: DbConn, cmd: Command) -> CommandResult:
         default_value = state.prior_value
     else:
         default_value = proposed.payload["proposed_value"]
+    # E1/E2 four-eyes (D+E review I-F): a governed SEMANTIC binding value must change only through the
+    # propose→(distinct)confirm flow (correct_binding). An explicit `args["value"]` override here would
+    # let ONE authorized human author AND approve a new value in a single command on a REVERIFY/STALE
+    # binding — exactly the single-party authorship `enter_fact` already denies for these types. Deny
+    # the override (defense-in-depth; no route exposes it today). A no-override confirm re-affirms the
+    # prior/proposed value below.
+    if fact_type in ("entity_assignment", "currency_binding") and "value" in args:
+        return _deny_audited(
+            conn, cmd, key,
+            "value override denied on a semantic-binding confirm: a value change must go through "
+            "propose→confirm (correct_binding), never single-party author+approve")
     value = args.get("value", default_value)
     try:
         validate_fact_value(fact_type, value, use_case=use_case)

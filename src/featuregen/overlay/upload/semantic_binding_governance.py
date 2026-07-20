@@ -331,10 +331,17 @@ def _verified_or_denied(conn: DbConn, key: str, action: str) -> tuple[object | N
 
 
 def request_reverify(conn: DbConn, *, fact_key: str, actor: IdentityEnvelope) -> dict:
-    """REVERIFY a VERIFIED binding: reopen a fresh re-verification cycle so a DIFFERENT authorized
-    human must re-confirm the value, demoting the operational projection until they do. Reuses the
-    sanctioned ``expiry._apply_expiry`` transition (VERIFIED → REVERIFY, demote, open the re-verify
-    task) — never hand-writes fact state. Fail-closed on authority + wrong-state."""
+    """REVERIFY a VERIFIED binding: reopen a fresh re-verification cycle and demote the operational
+    projection until an authorized human re-confirms. Reuses the sanctioned ``expiry._apply_expiry``
+    transition (VERIFIED → REVERIFY, demote, open the re-verify task) — never hand-writes fact state.
+    Fail-closed on authority + wrong-state.
+
+    FOUR-EYES GUARANTEE (D+E review M-4 — precise wording): the re-confirmation is guarded by the
+    platform's ``proposer ≠ confirmer`` rule ONLY. Reverify does NOT re-open a proposal, so it does
+    not bind the requester as the new proposer — meaning the same admin who requested this reverify,
+    or the human who originally confirmed, MAY re-confirm alone (only the ORIGINAL proposer is barred).
+    To force a genuinely DIFFERENT human, route the change through ``correct_binding``, which
+    re-proposes with the correcting human as proposer (``requires_distinct_confirmer``)."""
     ctx = load_semantic_binding_confirmation_context(conn, fact_key)
     adapter = current_catalog_adapter()
     denial = _authority_denial(conn, adapter, ctx["ref"], ctx["fact_type"], fact_key, actor,
