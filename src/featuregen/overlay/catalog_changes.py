@@ -8,7 +8,10 @@ from featuregen.contracts.db import DbConn
 from featuregen.contracts.errors import ConcurrencyError
 from featuregen.idgen import mint_id
 from featuregen.overlay.authority import resolve_authority
-from featuregen.overlay.expiry import demote_projected_join_edges
+from featuregen.overlay.expiry import (
+    demote_projected_join_edges,
+    demote_projected_semantic_binding,
+)
 from featuregen.overlay.facts import OVERLAY_FACT_STALED
 from featuregen.overlay.identity import _ref_from_payload
 from featuregen.overlay.projection import dependents_of
@@ -213,6 +216,10 @@ def _stale_one(
         # immediately, without waiting for a re-ingest. Fail-soft (savepointed inside the hook):
         # a hook fault never breaks the stale append that just succeeded.
         demote_projected_join_edges(conn, fact_key, "STALE")
+    elif state.fact_type in ("entity_assignment", "currency_binding"):
+        # E3: a dropped/retyped TARGET drift-STALEs the fact (deps recorded by E1) — demote its
+        # governed projection immediately (restore the file entity / demote the currency edge).
+        demote_projected_semantic_binding(conn, fact_key, state.fact_type, "STALE")
     if open_reverify:
         # Governance path: route the stale to the data owner(s). The upload-catalog ingest
         # (no owners) passes open_reverify=False — the fact still STALEs via the append above,

@@ -30,7 +30,11 @@ from featuregen.overlay.authority import (
 )
 from featuregen.overlay.catalog import current_catalog_adapter
 from featuregen.overlay.config import current_overlay_config
-from featuregen.overlay.expiry import demote_projected_join_edges, schedule_expiry
+from featuregen.overlay.expiry import (
+    demote_projected_join_edges,
+    demote_projected_semantic_binding,
+    schedule_expiry,
+)
 from featuregen.overlay.facts import FactValidationError, validate_fact_value
 from featuregen.overlay.identity import (
     display_object_ref,
@@ -184,6 +188,16 @@ def confirm_fact(conn: DbConn, cmd: Command) -> CommandResult:
     # Arm the SP-0 overlay_expiry timer on this fact-key stream.
     schedule_expiry(conn, key, confirmed.event_id, expires_at)
     _close_fact_tasks(conn, key, reason="fact confirmed")
+    if fact_type in ("entity_assignment", "currency_binding"):
+        # E3: the confirm just reached VERIFIED — make the governed semantic binding operational
+        # SYNCHRONOUSLY (drain-then-project, fail-soft; "pending" defers to the next caught-up
+        # reproject). A reverify/renewal re-confirm re-projects the reaffirmed value too. Lazy import
+        # across the overlay/upload boundary (mirrors the reject/expiry demote hooks).
+        from featuregen.overlay.upload.semantic_bindings.projection import (
+            project_verified_semantic_binding,
+        )
+
+        project_verified_semantic_binding(conn, ref.catalog_source, ref, fact_type, now=None)
     return CommandResult(accepted=True, aggregate_id=key, produced_event_ids=(confirmed.event_id,))
 
 
@@ -253,6 +267,10 @@ def reject_fact(conn: DbConn, cmd: Command) -> CommandResult:
         # Async demotion hook (Phase 3A Task 8): a pre-VERIFIED reject has no projected edge (the
         # UPDATE matches nothing); a REVERIFY/STALE reject re-stamps the demoted edge REJECTED.
         demote_projected_join_edges(conn, key, "REJECTED")
+    elif fact_type in ("entity_assignment", "currency_binding"):
+        # E3: a pre-VERIFIED reject has no projection (no-op); a REVERIFY/STALE reject demotes the
+        # governed semantic binding (restore the file entity / demote the currency edge).
+        demote_projected_semantic_binding(conn, key, fact_type, "REJECTED")
     _close_fact_tasks(conn, key, reason="fact rejected")
     return CommandResult(accepted=True, aggregate_id=key, produced_event_ids=(rejected.event_id,))
 

@@ -76,6 +76,7 @@ from featuregen.overlay.upload.readiness import ReadinessScopeType, compute_read
 from featuregen.overlay.upload.review_queue import persist_quarantine
 from featuregen.overlay.upload.sample_parser import ParsedProfile, reconcile_profile
 from featuregen.overlay.upload.sanitize import redact_text
+from featuregen.overlay.upload.semantic_bindings.projection import reproject_semantic_bindings
 from featuregen.overlay.upload.source_profile import (
     FTR_GLOSSARY_PROFILE,
     TECHNICAL_CSV_PROFILE,
@@ -1938,6 +1939,34 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
                            catalog_source, exc_info=True)
             record_stage(stage_recorder, "join_projection", "failed", reason_code="exception",
                          started_at=stage_started)
+
+    # semantic-binding re-projection (E3): build_graph wiped graph_node (entity + the governed
+    # entity columns), so a VERIFIED entity_assignment / currency_binding confirmed in a PRIOR cycle
+    # must be re-projected from its FACT — a re-ingest MUST NOT erase a governed binding (mirrors the
+    # approved-join reapply above). UNCONDITIONAL (not flag-gated) and byte-for-byte safe when no
+    # governed binding exists: list_semantic_binding_refs enumerates nothing and writes nothing. Same
+    # projection-lag guard: resolve_fact reads the overlay_fact_state read model, and a lagging model
+    # could serve a stale status — skip and let the next caught-up ingest re-project (the async
+    # demotion hook covers reject/expiry/drift latency).
+    if projection_lag(conn, "overlay") > 0:
+        counters.incr("overlay.semantic_binding.reproject.skipped_projection_lag")
+        logger.warning("overlay projection lags after ingest of %r — skipping semantic-binding "
+                       "re-projection (re-runs when the projection catches up)", catalog_source)
+        record_stage(stage_recorder, "semantic_binding_projection", "lagged",
+                     reason_code="projection_lag")
+    else:
+        stage_started = datetime.now(UTC)
+        try:
+            with conn.transaction():   # savepoint: a projection fault must not roll back facts
+                reproject_semantic_bindings(conn, source=catalog_source, now=now)
+            record_stage(stage_recorder, "semantic_binding_projection", "succeeded",
+                         started_at=stage_started)
+        except Exception:  # noqa: BLE001 — advisory: re-projection never fails an upload
+            counters.incr("overlay.semantic_binding.reproject.error")
+            logger.warning("advisory semantic-binding re-projection failed for %r — facts intact",
+                           catalog_source, exc_info=True)
+            record_stage(stage_recorder, "semantic_binding_projection", "failed",
+                         reason_code="exception", started_at=stage_started)
 
     if governed_joins_enabled():
         # Governed-join DRIFT detection (advisory): a re-upload that RETARGETS or DROPS a joins_to

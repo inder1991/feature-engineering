@@ -37,6 +37,25 @@ def demote_projected_join_edges(conn: DbConn, fact_key: str, status: str) -> Non
         logger.warning("approved_join edge demotion failed for %s", fact_key, exc_info=True)
 
 
+def demote_projected_semantic_binding(conn: DbConn, fact_key: str, fact_type: str,
+                                      status: str) -> None:
+    """FAIL-SOFT async demotion of a governed semantic binding's operational projection (E3): the fact
+    just left VERIFIED (reject / expiry -> REVERIFY / drift -> STALE), so restore the file entity /
+    demote the currency edge NOW — not at the next re-upload's reproject. Shared by ``reject_fact`` /
+    ``_apply_expiry`` / ``_stale_one``. Savepointed (``conn.transaction()``) so a DB fault can neither
+    poison the surrounding command/poller transaction nor undo the just-appended lifecycle event; the
+    operational readers' ``status='VERIFIED'`` 2nd gate remains the independent guard if this hook is
+    lost. Lazy import across the overlay/upload boundary (mirrors ``demote_projected_join_edges``)."""
+    try:
+        with conn.transaction():
+            from featuregen.overlay.upload.semantic_bindings.projection import (
+                demote_semantic_binding,
+            )
+            demote_semantic_binding(conn, fact_key=fact_key, fact_type=fact_type, status=status)
+    except Exception:  # noqa: BLE001 — advisory: demotion never blocks the command/poller
+        logger.warning("semantic-binding demotion failed for %s", fact_key, exc_info=True)
+
+
 def schedule_expiry(
     conn: DbConn, fact_key: str, confirmed_event_id: str, expires_at: datetime
 ) -> str:
@@ -100,6 +119,10 @@ def _apply_expiry(conn: DbConn, adapter, *, fact_key: str, confirmed_event_id: s
         # Async demotion hook (Phase 3A Task 8): EXPIRED folds to REVERIFY — the projected edge
         # (if any) stops traversing immediately, without waiting for a re-ingest.
         demote_projected_join_edges(conn, fact_key, "REVERIFY")
+    elif state.fact_type in ("entity_assignment", "currency_binding"):
+        # E3: EXPIRED folds to REVERIFY — demote the governed semantic binding's projection now
+        # (restore the file entity / demote the currency edge), without waiting for a re-ingest.
+        demote_projected_semantic_binding(conn, fact_key, state.fact_type, "REVERIFY")
     ref = _ref_from_payload(stream[0].payload["catalog_object_ref"])
     authority = resolve_authority(conn, adapter, ref, state.fact_type)
     open_reverify_task(

@@ -259,8 +259,8 @@ def test_successful_upload_records_ordered_stage_reports(client):
         "parse", "validation", "brake", "fact_assertion", "drift", "glossary_classification",
         "enrich_concept", "enrich_definition", "enrich_domain", "graph_persistence",
         "governed_joins", "pass_c", "pass_b", "glossary_evidence", "projection_drain",
-        "table_fact_projection", "join_projection", "join_drift", "quarantine",
-        "manifest_finalization"]
+        "table_fact_projection", "join_projection", "semantic_binding_projection", "join_drift",
+        "quarantine", "manifest_finalization"]
     assert stages["parse"]["state"] == "succeeded"
     assert stages["manifest_finalization"]["state"] == "succeeded"   # #13 C: terminalize reported
     assert stages["validation"]["state"] == "succeeded"

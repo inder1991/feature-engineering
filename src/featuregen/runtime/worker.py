@@ -562,6 +562,13 @@ def compose(conn: psycopg.Connection) -> tuple[object, list[Projection]]:
 
     for projection in projections:
         register_projection_for_repair(projection.name, projection)
+    # The E3 semantic-binding read model is a REGISTERED projection (rebuild/replay/repair), but NOT
+    # runner-driven per tick: its live operational updates come from the synchronous confirm-time
+    # projection + the build_graph reproject + the async reject/expiry/drift demotion hooks (the
+    # approved-join pattern). Registered for repair so resolve_degraded can prove its health.
+    from featuregen.overlay.upload.semantic_bindings.projection import SemanticBindingProjection
+
+    register_projection_for_repair(SemanticBindingProjection.name, SemanticBindingProjection())
     return registry, projections
 
 

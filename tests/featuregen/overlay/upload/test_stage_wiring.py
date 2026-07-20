@@ -63,7 +63,8 @@ def test_successful_upload_records_all_stages_in_order(db):
         "validation", "brake", "fact_assertion", "drift", "glossary_classification",
         "enrich_concept", "enrich_definition", "enrich_domain", "graph_persistence",
         "governed_joins", "pass_c", "pass_b", "glossary_evidence", "projection_drain",
-        "table_fact_projection", "join_projection", "join_drift", "quarantine"]
+        "table_fact_projection", "join_projection", "semantic_binding_projection", "join_drift",
+        "quarantine"]
     assert _states(rec) == {
         "validation": "succeeded", "brake": "succeeded", "fact_assertion": "succeeded",
         "drift": "succeeded",
@@ -74,7 +75,8 @@ def test_successful_upload_records_all_stages_in_order(db):
         "governed_joins": "disabled", "pass_c": "disabled", "pass_b": "disabled",  # flags off
         "glossary_evidence": "not_applicable",
         "projection_drain": "succeeded", "table_fact_projection": "succeeded",
-        "join_projection": "succeeded", "join_drift": "disabled",
+        "join_projection": "succeeded", "semantic_binding_projection": "succeeded",
+        "join_drift": "disabled",
         "quarantine": "succeeded"}
     assert _report(rec, "fact_assertion").detail == {"asserted": 2}   # grain + availability_time
     assert _report(rec, "drift").detail == {"changed_objects": 0}
@@ -91,7 +93,8 @@ def test_stages_that_ran_carry_started_at(db):
                         stage_recorder=rec)
     assert res.status == "ingested"
     ran = {"validation", "brake", "fact_assertion", "drift", "graph_persistence",
-           "projection_drain", "table_fact_projection", "join_projection", "quarantine"}
+           "projection_drain", "table_fact_projection", "join_projection",
+           "semantic_binding_projection", "quarantine"}
     for r in rec.reports:
         if r.stage in ran:
             assert r.started_at is not None, r.stage
@@ -111,7 +114,7 @@ def test_none_recorder_result_identical(db):
            (recorded.status, recorded.reason, recorded.asserted, recorded.changed_objects,
             recorded.quarantined)
     assert bare.flagged.replace("src_a", "SRC") == recorded.flagged.replace("src_b", "SRC")
-    assert len(rec.reports) == 18
+    assert len(rec.reports) == 19
 
 
 # ── the KEY #22 case: internal per-item failures surface as partial, never "succeeded" ───────────
@@ -252,7 +255,8 @@ _ALL_INGEST_STAGES = [
     "validation", "brake", "fact_assertion", "drift", "glossary_classification",
     "enrich_concept", "enrich_definition", "enrich_domain", "graph_persistence",
     "governed_joins", "pass_c", "pass_b", "glossary_evidence", "projection_drain",
-    "table_fact_projection", "join_projection", "join_drift", "quarantine"]
+    "table_fact_projection", "join_projection", "semantic_binding_projection", "join_drift",
+    "quarantine"]
 
 
 def test_held_upload_records_not_run_for_downstream_stages(db):
