@@ -632,3 +632,132 @@ def test_field_correction_propose_only_does_not_invalidate(db):
     p = _correct(db, "propose_override", _admin("human_a"), "p1", replacement_value="net of fees")
     assert p["accepted"] is True
     assert _invalidated_count(db, c.contract_id) == 0        # a bare proposal never invalidates
+
+
+# ══════════════ [13]x[5] gap — the drift-STALE demote's invalidation is ALSO deferred ═════════════════
+# `detect_catalog_changes` runs EARLY in ingest_upload (before Pass A/B and the D4 LLM stages). Its
+# STALE-demote chain (drop/type_change/rename -> _stale_one -> demote_projected_semantic_binding ->
+# _demote_entity -> _invalidate_entity_change) called `invalidate_contracts_for` INLINE — taking the
+# single feature_validation checkpoint row FOR UPDATE, held to ingest commit across the whole LLM
+# window, so every contract confirm (_seed_validation_lifecycle takes the SAME lock) stalled behind
+# the upload. The [13] deferral only covered `_retire_dropped_field_decisions`; this covers the
+# disjoint STALE-demote emission site via the same `changed_sink` -> end-of-ingest flush.
+from tests.featuregen.overlay._helpers import seed_verified_via_command  # noqa: E402
+
+from featuregen.overlay.catalog_changes import detect_catalog_changes  # noqa: E402
+from featuregen.overlay.identity import CatalogObjectRef  # noqa: E402
+from featuregen.overlay.upload.contract.invalidation import (  # noqa: E402
+    REASON_ENTITY_BINDING_CHANGED,
+)
+from featuregen.overlay.upload.upload_catalog import UploadCatalog  # noqa: E402
+
+_ENTITY_SRC = "g3g4_entity_src"
+
+
+def _register_overlay_cfg():
+    from datetime import timedelta
+
+    from featuregen.overlay.config import OverlayConfig, register_overlay_config
+    register_overlay_config(OverlayConfig(
+        ttl_default=timedelta(days=180), ttl_min=timedelta(days=30), ttl_max=timedelta(days=365),
+        ttl_jitter_fraction=0.1, renewal_grace=timedelta(days=14),
+        drift_scan_interval=timedelta(minutes=15), drift_freshness_sla=timedelta(hours=24),
+        profiler_require_restricted_role=False))
+
+
+def _entity_rows(col_type="text"):
+    return [CanonicalRow(source=_ENTITY_SRC, table="party", column="cust_id", type=col_type,
+                         entity="account")]
+
+
+def _seed_governed_entity_and_contract(db):
+    """A VERIFIED governed entity_assignment ('customer', over the file-declared 'account') on
+    party.cust_id + a confirmed contract deriving that column — its H2c reverse-dependency hashes
+    ``graph_node.entity``, the value the drift-STALE demote restores. The ref is PUBLIC-flattened
+    (the shape D2's ``to_fact_command`` mints — C-1), so the fact's ``overlay_fact_dependency`` row
+    matches the drift snapshot's ``public.party.cust_id`` and ``dependents_of`` finds it."""
+    seed_verified_via_command(
+        db, ref=CatalogObjectRef(_ENTITY_SRC, "column", "public", "party", "cust_id"),
+        fact_type="entity_assignment", value={"entity_id": "customer"}, owner="user:alice")
+    # Precondition for the demote-emits-invalidation chain: the governed entity is APPLIED (a
+    # deferred confirm-time projection would make the later demote a silent no-op).
+    assert db.execute(
+        "SELECT entity FROM graph_node WHERE catalog_source = %s "
+        "AND object_ref = 'public.party.cust_id'", (_ENTITY_SRC,)).fetchone()[0] == "customer"
+    draft = ContractDraft("g3g4_party_count", "Count of parties.", None, "count", None,
+                          ["public.party.cust_id"],
+                          derives_pairs=((_ENTITY_SRC, "public.party.cust_id"),))
+    return confirm_contract(db, draft, actor="ds1")
+
+
+def test_detect_catalog_changes_collects_stale_demote_invalidations_into_changed_sink(db):
+    """A drift STALE-demote of a governed entity binding must COLLECT its contract invalidation into
+    ``changed_sink`` instead of emitting inline (the inline emit takes the feature_validation
+    checkpoint FOR UPDATE — held to tx commit). The demote itself still runs NOW; only the eager
+    (defense-in-depth) INVALIDATED emit is deferred, and flushing the sink emits it."""
+    _register_overlay_cfg()
+    build_graph(db, _ENTITY_SRC, _entity_rows())
+    # Baseline snapshot FIRST — it also writes the drift watermark, without which the seed's
+    # confirm-time sync projection defers (drift-freshness fail-closed) and the demote is a no-op.
+    detect_catalog_changes(db, UploadCatalog(_ENTITY_SRC, _entity_rows()), actor=_retire_actor(),
+                           open_reverify=False)
+    c = _seed_governed_entity_and_contract(db)
+    assert _invalidated_count(db, c.contract_id) == 0
+    sink: list = []
+    changes = detect_catalog_changes(db, UploadCatalog(_ENTITY_SRC, _entity_rows("integer")),
+                                     actor=_retire_actor(), open_reverify=False, changed_sink=sink)
+    assert any(ch.kind == "type_change" for ch in changes)
+    # the demote itself ran NOW (the file's declared entity is restored)...
+    assert db.execute(
+        "SELECT entity FROM graph_node WHERE catalog_source = %s "
+        "AND object_ref = 'public.party.cust_id'", (_ENTITY_SRC,)).fetchone()[0] == "account"
+    # ...but the INVALIDATED emit was deferred into the sink, not taken inline:
+    assert _invalidated_count(db, c.contract_id) == 0
+    assert any(cr.reason == REASON_ENTITY_BINDING_CHANGED and cr.object_ref == "public.party.cust_id"
+               for cr in sink)
+    # the ingest-tail flush invalidates the dependent contract (correctness preserved):
+    invalidate_contracts_for(db, changed=sink)
+    assert _invalidated_count(db, c.contract_id) >= 1
+
+
+def test_ingest_drift_stale_demote_defers_entity_invalidation_to_end_of_ingest(db, monkeypatch):
+    """The INGEST composition: a re-upload retyping a column that carries a governed
+    entity_assignment a confirmed contract depends on must route the invalidation through the [13]
+    end-of-ingest deferral (ONE tail emit AFTER the D4 stages) — never the mid-ingest eager wire in
+    semantic_bindings.projection, whose checkpoint lock would be held across the LLM window."""
+    import featuregen.overlay.upload.ingest as ingest_mod
+    import featuregen.overlay.upload.semantic_bindings.projection as sb_proj
+    _register_overlay_cfg()
+    # Wall-clock `now`: the seed helper confirms at wall clock, and a >24h-stale drift watermark
+    # would make the confirm-time sync projection DEFER — leaving the later demote a silent no-op.
+    now = datetime.now(UTC)
+
+    res1 = ingest_mod.ingest_upload(db, _ENTITY_SRC, _entity_rows(), actor=_retire_actor(),
+                                    now=now, client=None)
+    assert res1.status == "ingested"
+    c = _seed_governed_entity_and_contract(db)
+    assert _invalidated_count(db, c.contract_id) == 0
+
+    mid_calls: list[list] = []
+    tail_calls: list[list] = []
+    real = ingest_mod.invalidate_contracts_for
+
+    def _spy(into):
+        def run(conn, *, changed):
+            changed = list(changed)
+            into.append(changed)
+            return real(conn, changed=changed)
+        return run
+
+    monkeypatch.setattr(sb_proj, "invalidate_contracts_for", _spy(mid_calls))
+    monkeypatch.setattr(ingest_mod, "invalidate_contracts_for", _spy(tail_calls))
+
+    res2 = ingest_mod.ingest_upload(db, _ENTITY_SRC, _entity_rows("integer"),
+                                    actor=_retire_actor(), now=now, client=None)
+    assert res2.status == "ingested"
+
+    assert mid_calls == []                        # the mid-ingest eager wire NEVER fired
+    assert len(tail_calls) == 1                   # ONE deferred emit at the ingest tail
+    assert any(cr.reason == REASON_ENTITY_BINDING_CHANGED and cr.object_ref == "public.party.cust_id"
+               for cr in tail_calls[0])
+    assert _invalidated_count(db, c.contract_id) >= 1      # correctness preserved

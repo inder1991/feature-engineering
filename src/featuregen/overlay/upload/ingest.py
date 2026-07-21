@@ -1722,6 +1722,15 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
     record_stage(stage_recorder, "fact_assertion", "succeeded", detail={"asserted": asserted},
                  started_at=stage_started)
 
+    # [13] the end-of-ingest DEFERRED contract-invalidation collector, declared BEFORE the drift
+    # scan: BOTH mid-ingest invalidation sites — the drift STALE-demote of a governed entity binding
+    # (detect_catalog_changes below, [13]x[5]) and `_retire_dropped_field_decisions` (the glossary/
+    # technical evidence stages) — COLLECT ChangedRefs here instead of calling
+    # `invalidate_contracts_for` inline. That call takes the single feature_validation checkpoint
+    # row FOR UPDATE (held to ingest commit); taken here, BEFORE the Pass-A/B/D4 LLM stages, it
+    # would block every contract confirm for the whole multi-minute LLM window. ONE emit at the
+    # ingest tail takes the lock once, briefly.
+    deferred_invalidations: list[ChangedRef] = []
     stage_started = datetime.now(UTC)
     _drain_projection(conn)   # catch up (bounded, #21) BEFORE the diff reads the dependency index
     drift_lagged = False
@@ -1737,7 +1746,8 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
         changes = []
         drift_lagged = True
     else:
-        changes = detect_catalog_changes(conn, upload, actor=actor, now=now, open_reverify=False)
+        changes = detect_catalog_changes(conn, upload, actor=actor, now=now, open_reverify=False,
+                                         changed_sink=deferred_invalidations)
         _drain_projection(conn)
     # Changed catalog OBJECTS (drift kinds that retire something), not facts staled (#30): each such
     # change stales its dependent facts inside detect_catalog_changes, but this counts the objects.
@@ -2042,13 +2052,9 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
             record_stage(stage_recorder, "pass_b", "failed", reason_code="exception",
                          started_at=stage_started)
 
-    # [13] end-of-ingest DEFERRED contract invalidations. `_retire_dropped_field_decisions`
-    # (invoked per-column below) COLLECTS a ChangedRef here instead of calling
-    # `invalidate_contracts_for` inline — that call takes the single feature_validation checkpoint
-    # row FOR UPDATE (held to ingest commit) and, taken per-retire mid-ingest, would contend with the
-    # D4 semantic-binding LLM stages and block every contract confirm for the D4 deadline + tail. One
-    # emit at the tail (after the D4 stages) takes the lock once, briefly.
-    deferred_invalidations: list[ChangedRef] = []
+    # [13] `_retire_dropped_field_decisions` (invoked per-column below) also COLLECTS into
+    # `deferred_invalidations` (declared above the drift scan) instead of emitting inline — see the
+    # collector's comment; the single flush happens at the ingest tail, after the D4 stages.
     if glossary is not None and bindings is not None and snapshot_id is not None:
         # Attach per-field evidence + revalidation + resolve/readiness on top of the built graph.
         # Belt-and-braces fail-soft: the helper savepoints every stage, and this outer guard makes a
@@ -2235,10 +2241,11 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
     else:
         record_stage(stage_recorder, "semantic_binding_proposals", "disabled")
 
-    # [13] Emit the DEFERRED contract invalidations collected by `_retire_dropped_field_decisions`
-    # in ONE call, AFTER the D4 semantic-binding stages above — so the feature_validation checkpoint
-    # lock is taken once, briefly, at the ingest tail rather than per-retire mid-ingest (where it
-    # contended with the D4 LLM stages, blocking every contract confirm for the D4 deadline + tail).
+    # [13] Emit the DEFERRED contract invalidations — collected by BOTH mid-ingest sites (the drift
+    # STALE-demote of governed entity bindings, [13]x[5], and `_retire_dropped_field_decisions`) —
+    # in ONE call, AFTER the D4 semantic-binding stages above: the feature_validation checkpoint
+    # lock is taken once, briefly, at the ingest tail rather than mid-ingest (where it was held
+    # across the Pass-A/B/D4 LLM stages, blocking every contract confirm for the whole window).
     # Same contracts get invalidated, just later in the SAME tx. Savepoint + fail-soft: this eager
     # emit is defense-in-depth (the read-time dependency gate already covers drift fail-closed), so a
     # fault here must never roll back the already-committed facts + graph.

@@ -46,6 +46,9 @@ _GOLD_NOW = datetime(2026, 7, 16, 12, 0, tzinfo=UTC)
 # or lock a real customer catalog — closing the AB-BA deadlock a bank naming its catalog 'core' hit
 # (composition audit finding [8]). Source-independent by construction: GOLD_SET_HASH hashes only
 # object_refs (schema.table.column), so the reserved name does NOT move the signed gate artifact.
+# SHARED-INFRA RULE ([8] gap (a)): _seed may touch ONLY rows namespaced under this source — never a
+# shared infrastructure row like projection_checkpoints('overlay'), which every in-flight ingest
+# holds FOR UPDATE from its first in-tx drain to commit (across the multi-minute LLM stages).
 GATE_GOLD_SOURCE = "__gate_gold__"
 _TEMPLATE = Template(
     id="gold_probe", family="balance_stock", intent="gold-set probe",
@@ -70,7 +73,17 @@ class GoldCase:
 
 def _seed(conn) -> None:
     """A single-catalog accounts→customers roll-up (accounts N:1 customers) covering every additivity
-    class, plus fresh watermarks so a clean contract's freshness axis resolves."""
+    class, plus a fresh PER-FIXTURE drift watermark so a clean contract's freshness axis resolves.
+
+    The watermark's ``head_seq`` is 0 — the honest head for a fixture whose graph rows are seeded
+    directly (no events were appended), and exactly what ``_write_watermark`` records over an empty
+    event stream. It makes ``revalidate_freshness``'s LAG check (``checkpoint < head``) hold against
+    ANY live checkpoint value, so the fixture needs NO checkpoint write of its own. The old seed
+    instead UPSERTed the SHARED ``projection_checkpoints('overlay')`` row to satisfy its fabricated
+    ``head_seq = 1`` — but an in-flight ``ingest_upload`` holds that exact row FOR UPDATE from its
+    first in-tx drain until commit (across the multi-minute Pass-A/B/D4 LLM stages), so every gate
+    evaluation STALLED behind every live upload ([8] gap (a)). ``_checkpoint_seq``'s plain SELECT
+    read of the live row never blocks (MVCC)."""
     rows = [
         (CanonicalRow(GATE_GOLD_SOURCE, "accounts", "account_id", "integer", is_grain=True),
          "account_id"),
@@ -86,12 +99,9 @@ def _seed(conn) -> None:
                 concepts={content_hash(r): cn for r, cn in rows})
     conn.execute(
         "INSERT INTO overlay_drift_watermark (catalog_source, last_completed_at, last_run_id, head_seq)"
-        " VALUES (%s, %s, 'gold', 1) ON CONFLICT (catalog_source) DO UPDATE SET"
+        " VALUES (%s, %s, 'gold', 0) ON CONFLICT (catalog_source) DO UPDATE SET"
         " last_completed_at = EXCLUDED.last_completed_at, head_seq = EXCLUDED.head_seq",
         (GATE_GOLD_SOURCE, _GOLD_NOW))
-    conn.execute(
-        "INSERT INTO projection_checkpoints (projection_name, checkpoint_seq) VALUES ('overlay', 1)"
-        " ON CONFLICT (projection_name) DO UPDATE SET checkpoint_seq = EXCLUDED.checkpoint_seq")
 
 
 def _binding(recipe_id: str, need_role: str, obj_ref: str, concept: str) -> c.IngredientBindingV1:

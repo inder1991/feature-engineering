@@ -2,6 +2,9 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
+import psycopg
+import pytest
+
 from featuregen.overlay.upload.planner.gate_operate import (
     run_double_compile,
     run_drift_checks,
@@ -107,3 +110,49 @@ def test_gold_seed_targets_reserved_source_and_leaves_a_real_core_untouched(db):
     assert db.execute(
         "SELECT count(*) FROM graph_node WHERE catalog_source = 'core'"
     ).fetchone()[0] == core_before                            # the real 'core' catalog is UNTOUCHED
+
+
+# ═══════ [8] gap (a) — the gold seed may not touch the SHARED projection_checkpoints row ═══════════
+# The reserved source closed the AB-BA deadlock, but the fixture ALSO UPSERTed the shared
+# projection_checkpoints('overlay') row on the live connection — the exact row an in-flight ingest
+# holds FOR UPDATE from its first in-tx drain to commit (across the multi-minute Pass-A/B/D4 LLM
+# stages) — so every gate evaluation still STALLED behind every live upload.
+
+
+@pytest.fixture
+def overlay_checkpoint_lock_holder(_dsn):
+    """A SECOND session HOLDING the committed shared ``projection_checkpoints('overlay')`` row lock
+    across an OPEN transaction — exactly what an in-flight ``ingest_upload``'s first in-tx
+    ``_drain_projection`` does. Rolled back + closed on teardown so the lock never lingers."""
+    c = psycopg.connect(_dsn)
+    c.execute("SELECT 1 FROM projection_checkpoints WHERE projection_name = 'overlay' FOR UPDATE")
+    try:
+        yield c
+    finally:
+        c.rollback()
+        c.close()
+
+
+def test_gold_seed_does_not_write_the_shared_overlay_checkpoint_row(db):
+    """The seed may touch ONLY ``__gate_gold__``-namespaced rows. Deterministic discriminator: pin
+    the live checkpoint to 7 — the old ``INSERT ... ON CONFLICT DO UPDATE`` clobbered it to 1."""
+    from featuregen.overlay.upload.planner import contract_gold
+
+    db.execute(
+        "UPDATE projection_checkpoints SET checkpoint_seq = 7 WHERE projection_name = 'overlay'")
+    contract_gold._seed(db)
+    assert db.execute(
+        "SELECT checkpoint_seq FROM projection_checkpoints WHERE projection_name = 'overlay'"
+    ).fetchone()[0] == 7
+
+
+def test_gate_console_does_not_stall_behind_an_ingest_holding_the_checkpoint(
+        db, overlay_checkpoint_lock_holder):
+    """The STALL half: the gold suite must complete — including the clean-resolve case's freshness
+    axis, which must resolve WITHOUT the fixture writing the shared checkpoint row (another session
+    holds it locked here). ``lock_timeout`` turns the pre-fix indefinite stall into a bounded
+    failure instead of hanging the suite."""
+    db.execute("SET LOCAL lock_timeout = '2s'")
+    report = run_gold_suite(db)
+    assert report.passed and report.false_resolves == ()
+    db.rollback()

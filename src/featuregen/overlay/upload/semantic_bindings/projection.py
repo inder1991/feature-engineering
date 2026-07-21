@@ -118,13 +118,27 @@ def project_semantic_binding_fact(conn: DbConn, *, source: str, ref, fact_type: 
             _demote_currency(conn, key, _clamp_status(resolved.status), now)
 
 
-def _invalidate_entity_change(conn: DbConn, source: str, obj_ref: str) -> None:
+def _invalidate_entity_change(conn: DbConn, source: str, obj_ref: str,
+                              changed_sink: list[ChangedRef] | None = None) -> None:
     """[5] EAGERLY invalidate every confirmed contract that depends on ``graph_node.entity`` for this
     column node — the value just changed (a genuine confirm/demote), and ``entity`` is in H2c's
     ``_STATE_COLUMNS``. Makes the read-gate downgrade DURABLE + AUDITED + round-trip-proof, consistent
-    with the ingest dropped-field wire. A no-op (returns 0) when no confirmed contract depends on it."""
-    invalidate_contracts_for(conn, changed=[ChangedRef(
-        catalog_source=source, reason=REASON_ENTITY_BINDING_CHANGED, object_ref=obj_ref)])
+    with the ingest dropped-field wire. A no-op (returns 0) when no confirmed contract depends on it.
+
+    ``changed_sink`` ([13]x[5] — the drift-STALE demote site): ``invalidate_contracts_for`` takes the
+    single feature_validation ``projection_checkpoints`` row FOR UPDATE, held to tx commit. The ingest
+    drift scan (``detect_catalog_changes``) runs EARLY in ``ingest_upload`` — BEFORE the Pass-A/B/D4
+    LLM stages — so an inline emit there would hold that lock across the whole multi-minute LLM
+    window, stalling every contract confirm (``_seed_validation_lifecycle`` takes the SAME lock).
+    When the ingest threads its end-of-upload deferral list, COLLECT the ChangedRef instead; the
+    tail flush emits the identical invalidation in the SAME tx, and the read-time dependency gate
+    covers the interim fail-closed. ``None`` (every non-ingest caller) keeps the eager emit."""
+    changed = ChangedRef(catalog_source=source, reason=REASON_ENTITY_BINDING_CHANGED,
+                         object_ref=obj_ref)
+    if changed_sink is not None:
+        changed_sink.append(changed)
+        return
+    invalidate_contracts_for(conn, changed=[changed])
 
 
 def _apply_verified_entity(conn: DbConn, source: str, ref, resolved, key: str,
@@ -172,14 +186,16 @@ def _apply_verified_entity(conn: DbConn, source: str, ref, resolved, key: str,
                        source, obj_ref, declared, governed)
 
 
-def _demote_entity(conn: DbConn, key: str, *, emit_invalidation: bool = True) -> None:
+def _demote_entity(conn: DbConn, key: str, *, emit_invalidation: bool = True,
+                   changed_sink: list[ChangedRef] | None = None) -> None:
     """RESTORE the file's declared entity as the effective display context, CLEAR governed provenance,
     rebuild search_doc — never data loss. Located by ``entity_fact_key`` (no ref needed); a fact that
     never projected matches no node (no-op).
 
     [5] ``emit_invalidation`` (default True) — when this demote (reject/expire/drift/withdraw) actually
     CHANGES the effective ``entity`` (the governed value differed from the restored file value), eagerly
-    invalidate dependent contracts. The benign reproject/replay pass ``False``."""
+    invalidate dependent contracts. The benign reproject/replay pass ``False``. ``changed_sink``
+    ([13]x[5]): the ingest drift path defers the emit — see :func:`_invalidate_entity_change`."""
     # Capture the pre-image (only when we may need it) so we can tell whether the effective entity value
     # actually moves — restoring an identical declared value is NOT a drift the read gate would see.
     before = conn.execute(
@@ -195,7 +211,7 @@ def _demote_entity(conn: DbConn, key: str, *, emit_invalidation: bool = True) ->
     if emit_invalidation:
         for src, obj_ref, old_entity, declared in before:
             if old_entity != declared:                 # the H2c-hashed entity value actually moved
-                _invalidate_entity_change(conn, src, obj_ref)
+                _invalidate_entity_change(conn, src, obj_ref, changed_sink=changed_sink)
 
 
 def _apply_verified_currency(conn: DbConn, source: str, ref, resolved, key: str,
@@ -230,15 +246,18 @@ def _demote_currency(conn: DbConn, key: str, status: str, now: datetime) -> None
 # Async demotion hook target (reject / expiry / drift) — located by fact_key, no resolve needed.
 # ==================================================================================================
 def demote_semantic_binding(conn: DbConn, *, fact_key: str, fact_type: str, status: str,
-                            now: datetime | None = None) -> None:
+                            now: datetime | None = None,
+                            changed_sink: list[ChangedRef] | None = None) -> None:
     """ASYNC demotion (the ingest-latency closer): the moment a governed semantic fact leaves VERIFIED
     (reject / expiry / drift-stale) demote its operational projection NOW — restore the file entity /
     demote the edge — without waiting for the next build_graph reproject. Located by fact_key. Shared
-    by ``overlay.expiry.demote_projected_semantic_binding`` (which savepoints + fail-softs it)."""
+    by ``overlay.expiry.demote_projected_semantic_binding`` (which savepoints + fail-softs it).
+    ``changed_sink`` ([13]x[5]): the ingest drift path collects the contract-invalidation ChangedRefs
+    for its end-of-upload flush instead of emitting inline — see :func:`_invalidate_entity_change`."""
     now = now or datetime.now(UTC)
     if fact_type == ENTITY_ASSIGNMENT:
         # [5] a GENUINE demote (reject/expire/drift) — invalidate dependent contracts on a real change.
-        _demote_entity(conn, fact_key, emit_invalidation=True)
+        _demote_entity(conn, fact_key, emit_invalidation=True, changed_sink=changed_sink)
     elif fact_type == CURRENCY_BINDING:
         _demote_currency(conn, fact_key, _clamp_status(status), now)
 

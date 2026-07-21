@@ -68,3 +68,24 @@ def test_semantic_binding_confirm_defers_to_lock_path_when_ingest_holds_the_chec
     assert project_verified_semantic_binding(db, "src", ref, ENTITY_ASSIGNMENT, now=None) == "pending"
     assert _count("overlay.semantic_binding.projection_skipped_lock") == before + 1
     db.rollback()
+
+
+def test_semantic_binding_list_defers_drain_when_ingest_holds_the_checkpoint(db, lock_holder):
+    """Finding [9], gap (b): the E2 LIST view (``list_semantic_binding_proposals`` — a live
+    governance GET) drains OverlayProjection on the request connection too. Pre-fix its drain took
+    the checkpoint row with a plain FOR UPDATE — a BLOCK, not an exception, so the best-effort
+    try/except never fired and the read hung behind the whole in-flight ingest tx. It must probe the
+    lock NOWAIT and fall through to the documented possibly-stale read (its existing drain-fault
+    semantics). ``lock_timeout`` bounds the pre-fix block so red FAILS (via the drain_error path)
+    rather than hanging; the fixed path never waits on the lock at all."""
+    from featuregen.overlay.upload.semantic_binding_governance import (
+        list_semantic_binding_proposals,
+    )
+
+    db.execute("SET LOCAL lock_timeout = '2s'")
+    skip_before = _count("overlay.semantic_binding_governance.drain_skipped_lock")
+    err_before = _count("overlay.semantic_binding_governance.drain_error")
+    assert list_semantic_binding_proposals(db, "src", roles=["platform-admin"]) == []
+    assert _count("overlay.semantic_binding_governance.drain_skipped_lock") == skip_before + 1
+    assert _count("overlay.semantic_binding_governance.drain_error") == err_before  # NOT the error path
+    db.rollback()

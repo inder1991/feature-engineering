@@ -38,22 +38,35 @@ def demote_projected_join_edges(conn: DbConn, fact_key: str, status: str) -> Non
 
 
 def demote_projected_semantic_binding(conn: DbConn, fact_key: str, fact_type: str,
-                                      status: str) -> None:
+                                      status: str, *, changed_sink: list | None = None) -> None:
     """FAIL-SOFT async demotion of a governed semantic binding's operational projection (E3): the fact
     just left VERIFIED (reject / expiry -> REVERIFY / drift -> STALE), so restore the file entity /
     demote the currency edge NOW — not at the next re-upload's reproject. Shared by ``reject_fact`` /
     ``_apply_expiry`` / ``_stale_one``. Savepointed (``conn.transaction()``) so a DB fault can neither
     poison the surrounding command/poller transaction nor undo the just-appended lifecycle event; the
     operational readers' ``status='VERIFIED'`` 2nd gate remains the independent guard if this hook is
-    lost. Lazy import across the overlay/upload boundary (mirrors ``demote_projected_join_edges``)."""
+    lost. Lazy import across the overlay/upload boundary (mirrors ``demote_projected_join_edges``).
+
+    ``changed_sink`` ([13]x[5], the ingest drift path): a demote that changes a governed effective
+    entity COLLECTS its contract-invalidation ``ChangedRef``s there for the ingest's end-of-upload
+    flush instead of emitting inline — the inline ``invalidate_contracts_for`` takes the single
+    feature_validation checkpoint row FOR UPDATE (held to tx commit), and the ingest's drift scan
+    runs BEFORE its multi-minute LLM stages. Entries reach the caller's sink only AFTER the
+    savepoint commits, so a rolled-back demote never queues a spurious invalidation. ``None`` (every
+    non-ingest caller) keeps the eager emit inside the savepoint, unchanged."""
+    collected: list | None = [] if changed_sink is not None else None
     try:
         with conn.transaction():
             from featuregen.overlay.upload.semantic_bindings.projection import (
                 demote_semantic_binding,
             )
-            demote_semantic_binding(conn, fact_key=fact_key, fact_type=fact_type, status=status)
+            demote_semantic_binding(conn, fact_key=fact_key, fact_type=fact_type, status=status,
+                                    changed_sink=collected)
     except Exception:  # noqa: BLE001 — advisory: demotion never blocks the command/poller
         logger.warning("semantic-binding demotion failed for %s", fact_key, exc_info=True)
+        return
+    if collected:
+        changed_sink.extend(collected)
 
 
 def schedule_expiry(

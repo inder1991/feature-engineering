@@ -277,16 +277,27 @@ def list_semantic_binding_proposals(conn: DbConn, source: str, *, limit: int = 1
     Enumerates from the ``overlay_proposal`` read model (one row per fact_key, carrying
     ``catalog_source`` + ``fact_type``); the projection is DRAINED to head first so a just-proposed
     / just-confirmed binding is not missed to projection lag (the confirm path appends on an
-    uncommitted conn — mirrors the sibling projectors' drain)."""
+    uncommitted conn — mirrors the sibling projectors' drain). The drain first probes the 'overlay'
+    checkpoint row NOWAIT (audit finding [9], gap (b)): an in-flight ingest holds that row FOR
+    UPDATE to commit (across the D4/Pass-B LLM stages), and ``run_projection``'s plain FOR UPDATE
+    would BLOCK this live governance GET behind the whole multi-minute ingest tx — a block, not an
+    exception, so the best-effort except below never fired. On lock-unavailable the drain is
+    SKIPPED and the list serves the documented possibly-stale read instead."""
     from featuregen.overlay.projection import OverlayProjection
-    from featuregen.projections.runner import run_projection
+    from featuregen.projections.runner import run_projection, try_lock_checkpoint_nowait
 
     limit = max(1, min(limit, _LIMIT_MAX))
     want = _norm(source)
     allowed = allowed_sensitivities(roles) if roles is not None else None
     try:  # bring the read model to head; a poison-halt just stops advancing (best-effort current)
-        while run_projection(conn, OverlayProjection()) >= 500:
-            pass
+        if try_lock_checkpoint_nowait(conn, "overlay"):
+            while run_projection(conn, OverlayProjection()) >= 500:
+                pass
+        else:
+            counters.incr("overlay.semantic_binding_governance.drain_skipped_lock")
+            logger.warning("semantic-binding governance: overlay checkpoint lock held by an "
+                           "in-flight ingest — listing without a drain (possibly-stale "
+                           "overlay_proposal)")
     except Exception:  # noqa: BLE001 — the list is best-effort; a drain fault must not 500 the read
         counters.incr("overlay.semantic_binding_governance.drain_error")
         logger.warning("semantic-binding governance: overlay drain failed before list — reading "
