@@ -146,6 +146,9 @@ Mostly existing screens; two are new.
 - **Asset Detail → Metadata & Evidence tab** (`AssetDetailScreen`): the `ai/attested` badge with
   confidence + the plain-English "why" (capability C) replaces today's "unattested". Surfaces the
   evidence layer, not just the (empty) decision layer. *(P1, then P2/P5)*
+- **Asset Detail → Relationships tab** (`AssetDetailScreen`): redesigned column-centric (entity /
+  synonyms, joins, feature lineage) with the candidate/proposal layer surfaced; containment demoted to
+  a one-line link, not a 125-row `unknown` dump. See §5b. *(P1)*
 - **Asset Detail → Readiness tab**: `unresolved_authority` blockers clear as fields become AI-attested. *(P1)*
 - **Governance → Rules & Clusters review** (NEW tab in `GovernanceReviewScreen`, beside join /
   table-fact / semantic-binding): AI-drafted rules and clustered escalations, each with a column
@@ -157,6 +160,34 @@ Mostly existing screens; two are new.
   and Accept / Edit / Dismiss. Blocked proposals (missing a cross-source input) shown honestly. A
   "feeds these features" cross-link on a column's Asset Detail deep-links here.
   Mockup: https://claude.ai/code/artifact/9bcf322f-233b-4d72-a525-cda20de8ec9c *(P4)*
+
+## 5b. Read-model & screen redesign (layered honesty)
+The asset-detail read model (`asset_detail.py`) today surfaces only the **governed-decision** layer and
+a **structural dump**, hiding the populated evidence/candidate layers. Both the Metadata and
+Relationships tabs suffer the same disease. The redesign is a read-model + frontend change, independent
+of the AI layers, so it ships in **P1** alongside the `ai/attested` surfacing.
+
+Principle: **surface all three layers — evidence → candidate/proposal → decision — each labelled by its
+honest authority, and demote structure to a link.**
+
+- **Metadata & Evidence tab** (`_effective_metadata_section`): when a field has no decision, fall back to
+  its recorded **evidence provenance** (`field_evidence`: `source/attested`, `llm/proposed`,
+  `taxonomy/proposed`) instead of rendering "unattested". A value with a known author reads as
+  "source attested / AI proposed / rulebook proposed — not yet confirmed", never a blank. Show the
+  plain-English "why" (capability C) when present.
+- **Relationships tab** (`_relationships_section`): make it **column-centric and semantic**, not a
+  sibling dump. Lead with (1) **entity / synonyms** — the entity this column carries and the columns
+  that are the same entity here and across sources, surfacing the **D4 candidates** as
+  *proposed — awaiting review* rather than an empty `candidates: []`; (2) **joins** — with proposed
+  joins shown as pending/ghost, not empty `[]`; (3) **feature lineage** — features derived from the
+  column. **Demote containment** from an inline list of all N sibling columns (each `unknown`) to a
+  single line: *"belongs to `<table>` (N columns) →"* linking to the table page. The sibling roster
+  lives on the table, not the column. (Note: `unknown` operational types are expected for a
+  column-mapping upload — real types require profiling the underlying data, out of scope here.)
+
+Effect: the tabs reflect **what the catalog actually knows** (source-attested definitions, AI-proposed
+concepts, taxonomy-proposed roles, 42 D4 binding candidates, pending joins) instead of leading with an
+empty governed layer plus noise.
 
 ## 6. Non-functional
 - **Async worker**, cost-governed (per-column budget, sampling low-value columns, prompt caching).
@@ -181,9 +212,11 @@ Mostly existing screens; two are new.
 ## 8. Decomposition (this is a program, not one plan)
 Each phase is an independent spec → plan → implementation cycle; later phases gate on earlier.
 
-1. **P1 — AI-attested authority tier + async enrichment.** The `ai/attested` producer, C1 recognition,
-   asset-detail/readiness surfacing, move enrichment to a worker. Unblocks the "everything unattested"
-   symptom. Gold set v0 + a fixed conservative threshold (no calibration yet).
+1. **P1 — AI-attested authority tier + async enrichment + read-model redesign.** The `ai/attested`
+   producer, C1 recognition, asset-detail/readiness surfacing, the layered-honesty Metadata &
+   Relationships tab redesign (§5b), move enrichment to a worker. Unblocks the "everything unattested"
+   symptom and the useless Relationships tab. Gold set v0 + a fixed conservative threshold (no
+   calibration yet).
 2. **P2 — Triangulation Validator + calibrated gate.** The three signals, fusion, gold-set calibration,
    the confidence × risk gate, the audit sample. Turns the fixed threshold into a measured one.
 3. **P3 — Rule/Cluster human layer + learning loop.** Clustering, AI-drafted rules, approve/edit surface,
