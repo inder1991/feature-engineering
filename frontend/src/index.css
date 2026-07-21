@@ -1795,6 +1795,13 @@ section > h2:first-child {
   padding: 4px 0;
 }
 
+/* the full column list after "+N more": scrolls inside the card so no table ever renders
+   as a viewport-dwarfing tower */
+.ln-cols--scroll {
+  max-height: 440px;
+  overflow-y: auto;
+}
+
 .ln-colrow {
   position: relative;
 }
@@ -1881,6 +1888,12 @@ section > h2:first-child {
   color: var(--chip-ink);
 }
 
+/* neutral count chip: the compact anchor-table's honest column total */
+.ln-flag--count {
+  background: var(--surface-2);
+  color: var(--ink-soft);
+}
+
 /* node states carry meaning WITHOUT fading text (WCAG AA: a faded card dropped the "stale"
    copy and column rows to ~2.5:1 — and stale is exactly the state a user must read carefully).
    State reads from the warn wash + a warn border + the STALE flag/guidance, all at full
@@ -1895,6 +1908,15 @@ section > h2:first-child {
 
 .ln-card--pending {
   border-style: dashed;
+}
+
+/* the anchored column as its own node: the accent treatment the match row used to carry */
+.ln-card--anchor {
+  border-color: var(--accent);
+}
+
+.ln-card--anchor .ln-head {
+  background: var(--accent-soft);
 }
 
 .ln-card--feature {
@@ -1928,6 +1950,56 @@ section > h2:first-child {
 .ln-expander:hover {
   background: var(--accent-soft);
   border-color: var(--accent);
+}
+
+/* the "+N more columns" row below a capped list */
+.ln-more {
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  width: 100%;
+  height: 32px;
+  min-height: 0;
+  padding: 0 12px;
+  border: none;
+  border-top: 1px solid var(--line);
+  border-radius: 0;
+  background: transparent;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--accent);
+  text-align: left;
+}
+
+.ln-more:hover {
+  background: var(--accent-soft);
+}
+
+/* empty-state panel (inside the canvas): why nothing is drawn, per layer, and where to act */
+.ln-empty {
+  max-width: 300px;
+  margin: 0;
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-panel);
+  background: var(--surface);
+  box-shadow: var(--shadow);
+}
+
+.ln-empty .micro-label {
+  margin-bottom: 6px;
+}
+
+.ln-empty p {
+  margin: 0;
+  font-size: 12.5px;
+  line-height: 1.45;
+  color: var(--ink-soft);
+}
+
+.ln-empty p + p {
+  margin-top: 8px;
 }
 
 /* connection ports: structural, hairline-quiet */

@@ -35,6 +35,7 @@ import {
   type LineageNode,
   type SearchHit,
 } from '../api'
+import { useHashRoute } from '../nav'
 
 // The view traverses both ways from the anchor (the mockup has no direction control); the
 // constant is threaded through every fetch so expander clicks stay direction-aware.
@@ -50,6 +51,11 @@ const SRC_H = 24
 const ROW_H = 32 // column rows are real buttons: hit targets >= 32px (PRODUCT.md)
 const PAD_H = 8
 const NOTE_H = 58
+const MORE_H = 32 // the "+N more columns" row, same hit-target height as a column row
+const COL_CAP = 8 // an expanded card caps its visible rows; the rest sits behind "+N more"
+// Full-list ceiling: with head + src + a stale note the card stays under the 640px canvas,
+// so even a 127-column table can never render as a viewport-dwarfing tower.
+const LIST_MAX_H = 440
 
 const SYMMETRIC = new Set<string>(['join', 'entity_bridge'])
 
@@ -96,22 +102,33 @@ function mergeGraph(
 
 type TableData = {
   node: LineageNode
-  columns: LineageNode[]
+  rows: LineageNode[] // the rows actually rendered (priority-ordered, capped or full)
+  total: number // the table's true column count, for the compact card's count chip
+  more: number // rows hidden by the cap; > 0 renders the "+N more columns" expander
+  scroll: boolean // the full list overflows LIST_MAX_H: scroll inside the card
+  countChip: boolean // compact anchor-table under a column anchor: show "N columns"
   collapsed: boolean
   matchId: string | null
   traceId: string | null
   expandable: boolean
   expanding: boolean
   onToggle: (id: string) => void
+  onShowAll: (id: string) => void
   onColumn: (col: LineageNode) => void
   onOpen: (node: LineageNode) => void
   onExpand: (node: LineageNode) => void
+}
+type AnchorColData = {
+  node: LineageNode
+  traceId: string | null
+  onColumn: (col: LineageNode) => void
 }
 type StubData = { node: LineageNode }
 type FeatureData = { node: LineageNode; onOpen: (node: LineageNode) => void }
 type ConsumerData = { node: LineageNode; reads: number; onOpen: (node: LineageNode) => void }
 
 type TableNT = Node<TableData, 'lnTable'>
+type AnchorColNT = Node<AnchorColData, 'lnAnchorCol'>
 type StubNT = Node<StubData, 'lnStub'>
 type FeatureNT = Node<FeatureData, 'lnFeature'>
 type ConsumerNT = Node<ConsumerData, 'lnConsumer'>
@@ -120,12 +137,15 @@ type ConsumerNT = Node<ConsumerData, 'lnConsumer'>
 // `flow` memo turns these into xyflow nodes with the interaction-dependent data on top.
 type PlacedNode = {
   node: LineageNode
-  type: 'lnTable' | 'lnStub' | 'lnFeature' | 'lnConsumer'
+  type: 'lnTable' | 'lnAnchorCol' | 'lnStub' | 'lnFeature' | 'lnConsumer'
   x: number
   y: number
   w: number
   h: number
-  cols: LineageNode[]
+  rows: LineageNode[]
+  total: number
+  more: number
+  scroll: boolean
 }
 
 function Ports() {
@@ -144,7 +164,7 @@ function Flag({ tone, children }: { tone: string; children: string }) {
 }
 
 function TableNode({ data }: NodeProps<TableNT>) {
-  const { node, columns, collapsed, matchId, traceId } = data
+  const { node, rows, collapsed, matchId, traceId } = data
   // `nopan` (xyflow's own escape hatch): a drag that starts on a card must not pan the
   // canvas, exactly like the mockup's grab handler ignoring drags that start on a node.
   return (
@@ -177,6 +197,13 @@ function TableNode({ data }: NodeProps<TableNT>) {
             {node.quarantine_pending} queued
           </span>
         ) : null}
+        {data.countChip && (
+          // Compact anchor-table: the anchored column is drawn as its own node, so the card
+          // carries the honest total instead of a column tower.
+          <span className="ln-flag ln-flag--count">
+            {data.total} {data.total === 1 ? 'column' : 'columns'}
+          </span>
+        )}
         <button
           type="button"
           className="ln-caret-btn"
@@ -200,9 +227,9 @@ function TableNode({ data }: NodeProps<TableNT>) {
           Not currently vouched. Re-upload this source to serve its facts.
         </div>
       )}
-      {!collapsed && (
-        <ul className="ln-cols">
-          {columns.map(col => (
+      {rows.length > 0 && (
+        <ul className={data.scroll ? 'ln-cols ln-cols--scroll' : 'ln-cols'}>
+          {rows.map(col => (
             <li key={col.id} className={col.id === matchId ? 'ln-colrow ln-colrow--match' : 'ln-colrow'}>
               <Handle
                 type="target"
@@ -234,6 +261,15 @@ function TableNode({ data }: NodeProps<TableNT>) {
           ))}
         </ul>
       )}
+      {data.more > 0 && (
+        <button
+          type="button"
+          className="ln-more"
+          onClick={() => data.onShowAll(node.id)}
+        >
+          +{data.more} more {data.more === 1 ? 'column' : 'columns'}
+        </button>
+      )}
       {data.expandable && (
         <button
           type="button"
@@ -245,6 +281,36 @@ function TableNode({ data }: NodeProps<TableNT>) {
           {data.expanding ? '…' : '+'}
         </button>
       )}
+    </div>
+  )
+}
+
+function AnchorColNode({ data }: NodeProps<AnchorColNT>) {
+  // The searched column as its own node at the map's center. The button mirrors a column
+  // row's contract (match highlight, trace toggle, drawer) so flags stay outside it and its
+  // accessible name is the bare column name.
+  const { node } = data
+  return (
+    <div className="ln-card ln-card--anchor nopan">
+      <Ports />
+      <div className="ln-head">
+        <span className="ln-kind">column</span>
+        <button
+          type="button"
+          className="ln-head-btn"
+          aria-current="true"
+          aria-pressed={node.id === data.traceId}
+          onClick={() => data.onColumn(node)}
+        >
+          <span className="ln-name" title={node.column}>
+            {node.column}
+          </span>
+        </button>
+        {node.grain && <Flag tone="grain">grain</Flag>}
+        {node.as_of && <Flag tone="asof">as-of</Flag>}
+        {node.sensitivity && <Flag tone="pii">{node.sensitivity}</Flag>}
+      </div>
+      {node.concept && <div className="ln-src">{node.concept}</div>}
     </div>
   )
 }
@@ -307,6 +373,7 @@ function ConsumerNode({ data }: NodeProps<ConsumerNT>) {
 
 const NODE_TYPES = {
   lnTable: TableNode,
+  lnAnchorCol: AnchorColNode,
   lnStub: StubNode,
   lnFeature: FeatureNode,
   lnConsumer: ConsumerNode,
@@ -366,6 +433,7 @@ function a11yLine(e: LineageEdge, byId: Map<string, LineageNode>): string {
 // ---- the view --------------------------------------------------------------------------------
 
 export function LineageView({ anchor }: { anchor: SearchHit }) {
+  const { navigate } = useHashRoute()
   const [graph, setGraph] = useState<LineageGraph | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
@@ -375,6 +443,7 @@ export function LineageView({ anchor }: { anchor: SearchHit }) {
     features: true,
   })
   const [collapsed, setCollapsed] = useState<ReadonlySet<string>>(new Set())
+  const [showAll, setShowAll] = useState<ReadonlySet<string>>(new Set())
   const [expandedUnits, setExpandedUnits] = useState<ReadonlySet<string>>(new Set())
   const [exhausted, setExhausted] = useState<ReadonlySet<string>>(new Set())
   const [expanding, setExpanding] = useState<ReadonlySet<string>>(new Set())
@@ -383,11 +452,18 @@ export function LineageView({ anchor }: { anchor: SearchHit }) {
   const [note, setNote] = useState('')
   const [expandError, setExpandError] = useState('')
 
+  // The anchor's own units: its table and, when the hit is a column, the column itself —
+  // which renders as its OWN node (the map's center), not as a row inside the table card.
+  const anchorUnitId = `${anchor.catalog_source}:public.${anchor.table}`
+  const matchId = anchor.column ? `${anchor.catalog_source}:${anchor.object_ref}` : null
+
   // Out-of-order guard: only the latest anchor fetch may apply. Expander merges go through
   // graphRef (always the latest committed graph) so two in-flight expansions merge in the
   // order their responses land, never clobbering each other.
   const seq = useRef(0)
   const graphRef = useRef<LineageGraph | null>(null)
+  // Set once per anchor load, when the anchor node has been centered at a readable zoom.
+  const centered = useRef(false)
   // In-flight expansion fetches, aborted on unmount so an orphaned promise never resolves into
   // setState on a gone component. The anchor fetch owns its own controller (aborted on re-anchor).
   const expandCtrls = useRef<Set<AbortController>>(new Set())
@@ -396,6 +472,7 @@ export function LineageView({ anchor }: { anchor: SearchHit }) {
   useEffect(() => {
     const id = ++seq.current
     const ctrl = new AbortController()
+    centered.current = false
     setLoading(true)
     setError('')
     lineageGraph(anchor.object_ref, anchor.catalog_source, {
@@ -408,6 +485,10 @@ export function LineageView({ anchor }: { anchor: SearchHit }) {
         graphRef.current = g
         setGraph(g)
         setLoading(false)
+        // A column anchor starts its table compact (the column is the center, not the card);
+        // a re-anchor resets both collapse and full-list state to that default.
+        setCollapsed(anchor.column ? new Set([anchorUnitId]) : new Set())
+        setShowAll(new Set())
       })
       .catch((err: unknown) => {
         if (id !== seq.current || ctrl.signal.aborted) return
@@ -415,36 +496,36 @@ export function LineageView({ anchor }: { anchor: SearchHit }) {
         setLoading(false)
       })
     return () => ctrl.abort()
-  }, [anchor.object_ref, anchor.catalog_source])
+    // anchorUnitId and anchor.column are derived from the same hit as object_ref; listing them
+    // keeps the deps honest without ever adding a re-fetch.
+  }, [anchor.object_ref, anchor.catalog_source, anchor.column, anchorUnitId])
 
   useEffect(() => () => {
     for (const c of expandCtrls.current) c.abort()
   }, [])
-
-  // The anchor's own units: its table (already expanded by the initial depth-1 fetch) and,
-  // when the hit is a column, the column row to highlight as the match.
-  const anchorUnitId = `${anchor.catalog_source}:public.${anchor.table}`
-  const matchId = anchor.column ? `${anchor.catalog_source}:${anchor.object_ref}` : null
 
   const byId = useMemo(
     () => new Map((graph?.nodes ?? []).map(n => [n.id, n] as const)),
     [graph],
   )
 
-  // Column -> owning table unit (columns render as rows inside their table card).
+  // Column -> owning table unit (columns render as rows inside their table card). The one
+  // exception is the anchored column: it is its own unit (its own node), so relationship
+  // edges that end on it attach to the anchor node, never to a row in the table card.
   const unitOf = useMemo(() => {
     const tableByKey = new Map<string, string>()
     for (const n of graph?.nodes ?? []) {
       if (n.kind === 'table') tableByKey.set(`${n.catalog_source}|${n.table}`, n.id)
     }
     return (id: string): string => {
+      if (id === matchId) return id
       const n = byId.get(id)
       if (n?.kind === 'column' && n.resolved) {
         return tableByKey.get(`${n.catalog_source}|${n.table}`) ?? id
       }
       return id
     }
-  }, [graph, byId])
+  }, [graph, byId, matchId])
 
   // Edges the canvas draws: everything except structural containment, filtered by the layer
   // toggles. Client-side only; the fetch always carries all permitted layers.
@@ -464,7 +545,8 @@ export function LineageView({ anchor }: { anchor: SearchHit }) {
       adj.set(b, [...(adj.get(b) ?? []), a])
     }
     const seen = new Set<string>([anchorUnitId])
-    const queue = [anchorUnitId]
+    if (matchId) seen.add(matchId) // the anchor column node is always in view
+    const queue = [...seen]
     while (queue.length > 0) {
       const u = queue.shift() as string
       for (const v of adj.get(u) ?? []) {
@@ -475,7 +557,7 @@ export function LineageView({ anchor }: { anchor: SearchHit }) {
       }
     }
     return seen
-  }, [drawnEdges, unitOf, anchorUnitId])
+  }, [drawnEdges, unitOf, anchorUnitId, matchId])
 
   const visibleEdges = useMemo(
     () => drawnEdges.filter(e => visibleUnits.has(unitOf(e.from)) && visibleUnits.has(unitOf(e.to))),
@@ -522,6 +604,16 @@ export function LineageView({ anchor }: { anchor: SearchHit }) {
       else next.add(id)
       return next
     })
+    // Collapsing always resets the card to the capped view on its next expand.
+    setShowAll(prev => {
+      if (!prev.has(id)) return prev
+      const next = new Set(prev)
+      next.delete(id)
+      return next
+    })
+  }
+  function showAllColumns(id: string) {
+    setShowAll(prev => new Set(prev).add(id))
   }
 
   async function expand(n: LineageNode) {
@@ -565,7 +657,7 @@ export function LineageView({ anchor }: { anchor: SearchHit }) {
   // resizes cards). Trace clicks, expander-flag flips, and match highlighting do NOT re-run
   // dagre; they restyle the cheap `flow` memo below, which reuses these positions.
   const layout = useMemo(() => {
-    if (!graph) return { placed: [] as PlacedNode[] }
+    if (!graph) return { placed: [] as PlacedNode[], rowIds: new Set<string>(), contain: false }
     const columnsOf = new Map<string, LineageNode[]>()
     for (const n of graph.nodes) {
       if (n.kind === 'column' && n.resolved) {
@@ -573,32 +665,86 @@ export function LineageView({ anchor }: { anchor: SearchHit }) {
         if (unit !== n.id) columnsOf.set(unit, [...(columnsOf.get(unit) ?? []), n])
       }
     }
+    // Row priority under the cap: the matched column first (when it renders as a row), then
+    // edge-endpoint columns (their handles anchor visible edges), then marker-carrying columns
+    // (grain / as-of / entity key), then the wire order. Stable sort keeps ties in order.
+    const endpoint = new Set<string>()
+    for (const e of visibleEdges) {
+      endpoint.add(e.from)
+      endpoint.add(e.to)
+    }
+    const marked = (c: LineageNode) => c.grain || c.as_of || Boolean(c.entity)
+    const rank = (c: LineageNode) =>
+      c.id === matchId ? 0 : endpoint.has(c.id) ? 1 : marked(c) ? 2 : 3
+    const rowIds = new Set<string>()
     const placed: PlacedNode[] = []
     for (const n of graph.nodes) {
       if (!visibleUnits.has(n.id)) continue
       if (n.kind === 'table') {
-        const cols = columnsOf.get(n.id) ?? []
+        const cols = [...(columnsOf.get(n.id) ?? [])].sort((a, b) => rank(a) - rank(b))
+        const compactAnchor = matchId !== null && n.id === anchorUnitId
+        let rows: LineageNode[] = []
+        let more = 0
+        let scroll = false
+        if (!collapsed.has(n.id)) {
+          if (showAll.has(n.id)) {
+            rows = cols
+            scroll = cols.length * ROW_H > LIST_MAX_H
+          } else {
+            rows = cols.slice(0, COL_CAP)
+            more = cols.length - rows.length
+          }
+        } else if (compactAnchor) {
+          // Compact card: keep the structural spine (grain / as-of / entity key) and every
+          // column that anchors a visible edge; the rest stays behind the caret.
+          rows = cols.filter(c => endpoint.has(c.id) || marked(c)).slice(0, COL_CAP)
+        }
+        for (const r of rows) rowIds.add(r.id)
+        const listH = scroll ? LIST_MAX_H : rows.length * ROW_H
         const h =
           HEAD_H +
           SRC_H +
           (n.stale ? NOTE_H : 0) +
-          (collapsed.has(n.id) ? 0 : cols.length * ROW_H + PAD_H)
-        placed.push({ node: n, type: 'lnTable', x: 0, y: 0, w: W_TABLE, h, cols })
+          (rows.length > 0 ? listH + PAD_H : 0) +
+          (more > 0 ? MORE_H : 0)
+        placed.push({
+          node: n, type: 'lnTable', x: 0, y: 0, w: W_TABLE, h, rows,
+          // The count chip reports the table's true width; the anchored column is drawn as
+          // its own node, so it is added back in.
+          total: cols.length + (compactAnchor ? 1 : 0), more, scroll,
+        })
+      } else if (n.kind === 'column' && n.id === matchId && n.resolved) {
+        placed.push({
+          node: n, type: 'lnAnchorCol', x: 0, y: 0, w: W_TABLE,
+          h: HEAD_H + (n.concept ? SRC_H : 0), rows: [], total: 0, more: 0, scroll: false,
+        })
       } else if (n.kind === 'column' && !n.resolved) {
-        placed.push({ node: n, type: 'lnStub', x: 0, y: 0, w: W_TABLE, h: HEAD_H + 64, cols: [] })
+        placed.push({
+          node: n, type: 'lnStub', x: 0, y: 0, w: W_TABLE, h: HEAD_H + 64,
+          rows: [], total: 0, more: 0, scroll: false,
+        })
       } else if (n.kind === 'feature') {
         placed.push({
-          node: n, type: 'lnFeature', x: 0, y: 0, w: W_FEATURE, h: HEAD_H + SRC_H + PAD_H, cols: [],
+          node: n, type: 'lnFeature', x: 0, y: 0, w: W_FEATURE, h: HEAD_H + SRC_H + PAD_H,
+          rows: [], total: 0, more: 0, scroll: false,
         })
       } else if (n.kind === 'consumer') {
-        placed.push({ node: n, type: 'lnConsumer', x: 0, y: 0, w: W_CONSUMER, h: HEAD_H + 30, cols: [] })
+        placed.push({
+          node: n, type: 'lnConsumer', x: 0, y: 0, w: W_CONSUMER, h: HEAD_H + 30,
+          rows: [], total: 0, more: 0, scroll: false,
+        })
       }
     }
 
+    const placedIds = new Set(placed.map(p => p.node.id))
+    // The structural containment edge (anchor column -> its table card) is drawable only when
+    // both ends made it onto the canvas.
+    const contain = matchId !== null && placedIds.has(matchId) && placedIds.has(anchorUnitId)
     const g = new dagre.graphlib.Graph()
     g.setGraph({ rankdir: 'LR', nodesep: 36, ranksep: 110, marginx: 24, marginy: 24 })
     g.setDefaultEdgeLabel(() => ({}))
     for (const p of placed) g.setNode(p.node.id, { width: p.w, height: p.h })
+    if (contain && matchId) g.setEdge(matchId, anchorUnitId)
     for (const e of visibleEdges) {
       const a = unitOf(e.from)
       const b = unitOf(e.to)
@@ -610,8 +756,8 @@ export function LineageView({ anchor }: { anchor: SearchHit }) {
       p.x = gp.x - p.w / 2
       p.y = gp.y - p.h / 2
     }
-    return { placed }
-  }, [graph, visibleEdges, visibleUnits, collapsed, unitOf])
+    return { placed, rowIds, contain }
+  }, [graph, visibleEdges, visibleUnits, collapsed, showAll, unitOf, matchId, anchorUnitId])
 
   // ---- styling: turn placed geometry into xyflow nodes/edges (the CHEAP, per-interaction step)
   const flow = useMemo(() => {
@@ -634,18 +780,34 @@ export function LineageView({ anchor }: { anchor: SearchHit }) {
           type: 'lnTable',
           data: {
             node: n,
-            columns: p.cols,
+            rows: p.rows,
+            total: p.total,
+            more: p.more,
+            scroll: p.scroll,
+            countChip: matchId !== null && n.id === anchorUnitId,
             collapsed: collapsed.has(n.id),
             matchId,
             traceId,
+            // Under a column anchor the compact table card keeps its expand-neighbors chip:
+            // the initial fetch was anchored on the column, not the table.
             expandable:
-              n.id !== anchorUnitId && !expandedUnits.has(n.id) && !exhausted.has(n.id),
+              (n.id !== anchorUnitId || matchId !== null) &&
+              !expandedUnits.has(n.id) &&
+              !exhausted.has(n.id),
             expanding: expanding.has(n.id),
             onToggle: toggleTable,
+            onShowAll: showAllColumns,
             onColumn: openColumn,
             onOpen: openNode,
             onExpand: expand,
           } satisfies TableData,
+        }
+      }
+      if (p.type === 'lnAnchorCol') {
+        return {
+          ...base,
+          type: 'lnAnchorCol',
+          data: { node: n, traceId, onColumn: openColumn } satisfies AnchorColData,
         }
       }
       if (p.type === 'lnStub') {
@@ -683,9 +845,10 @@ export function LineageView({ anchor }: { anchor: SearchHit }) {
         id: `${e.kind}|${e.from}|${e.to}`,
         source: sourceUnit,
         target: targetUnit,
-        sourceHandle:
-          e.from !== sourceUnit && !collapsed.has(sourceUnit) ? e.from : undefined,
-        targetHandle: e.to !== targetUnit && !collapsed.has(targetUnit) ? e.to : undefined,
+        // Attach to a column handle only when that row is actually rendered (capped and
+        // compact cards hide rows); otherwise fall back to the card-level port.
+        sourceHandle: e.from !== sourceUnit && layout.rowIds.has(e.from) ? e.from : undefined,
+        targetHandle: e.to !== targetUnit && layout.rowIds.has(e.to) ? e.to : undefined,
         label,
         className: isTrace ? 'ln-edge ln-edge--trace' : 'ln-edge',
         animated: false, // reduced-motion safe: no marching-ants edges anywhere
@@ -698,6 +861,18 @@ export function LineageView({ anchor }: { anchor: SearchHit }) {
             },
       }
     })
+    if (layout.contain && matchId) {
+      // Structure, not lineage: the containment tie from the anchor column to its table
+      // card draws hairline-quiet and unlabeled, and never joins a trace.
+      edges.push({
+        id: `contains|${matchId}|${anchorUnitId}`,
+        source: matchId,
+        target: anchorUnitId,
+        className: 'ln-edge ln-edge--contain',
+        animated: false,
+        style: { stroke: 'var(--line-strong)', strokeWidth: 1, strokeDasharray: '2 5' },
+      })
+    }
     return { nodes, edges }
     // eslint-disable-next-line react-hooks/exhaustive-deps -- handlers are stable per render
   }, [
@@ -715,12 +890,26 @@ export function LineageView({ anchor }: { anchor: SearchHit }) {
     byId,
   ])
 
-  // Refit after the visible node set changes: an expansion merge (or a layer toggle) can leave
-  // freshly placed nodes off-screen, and the `fitView` prop only fires on the first render.
-  // duration 0 keeps it reduced-motion safe, matching the static (never-animated) edges.
+  // On the anchor's first paint, center the anchor itself (the column node when column-anchored,
+  // the table card otherwise) at a readable zoom: fitView over a big graph pins the anchor to the
+  // viewport edge. Later node-set changes (expansion merges, layer toggles) refit around
+  // everything so freshly placed nodes come into view. duration 0 keeps it reduced-motion safe.
   const nodeCount = flow.nodes.length
   useEffect(() => {
-    rf.current?.fitView({ duration: 0 })
+    const inst = rf.current
+    if (!inst || nodeCount === 0) return
+    if (!centered.current) {
+      const p =
+        layout.placed.find(pp => pp.node.id === matchId) ??
+        layout.placed.find(pp => pp.node.id === anchorUnitId)
+      if (p) {
+        inst.setCenter(p.x + p.w / 2, p.y + p.h / 2, { zoom: 1, duration: 0 })
+        centered.current = true
+        return
+      }
+    }
+    inst.fitView({ duration: 0 })
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- reframe only when the node set changes
   }, [nodeCount])
 
   const drawerNode = drawerId ? byId.get(drawerId) : undefined
@@ -748,7 +937,11 @@ export function LineageView({ anchor }: { anchor: SearchHit }) {
     )
   }
 
-  const empty = flow.nodes.length <= 1 && flow.edges.length === 0
+  // Zero drawable edges for the current layer toggles (a declared-but-pending join still
+  // counts: it draws as a ghost card and dashed edge). The panel explains, per toggled-on
+  // layer, what would create that lineage and where to act — never a bare canvas.
+  const showWhyEmpty = visibleEdges.length === 0
+  const refWord = anchor.column ? 'column' : 'table'
 
   return (
     <>
@@ -793,6 +986,59 @@ export function LineageView({ anchor }: { anchor: SearchHit }) {
               ))}
             </fieldset>
           </Panel>
+          {showWhyEmpty && (
+            <Panel position="top-right">
+              <aside className="ln-empty" aria-label="Why nothing is drawn">
+                <h3 className="micro-label">Nothing to draw yet</h3>
+                {layersOn.joins && (
+                  <p>
+                    No joins proposed or approved yet. Proposals appear here after uploads are
+                    enriched; approvals happen on the{' '}
+                    <a
+                      href="#/governance"
+                      onClick={e => {
+                        e.preventDefault()
+                        navigate('governance')
+                      }}
+                    >
+                      Governance screen
+                    </a>
+                    .
+                  </p>
+                )}
+                {layersOn.entity && (
+                  <p>
+                    No verified entity bridge yet. Entity assignments are confirmed on the{' '}
+                    <a
+                      href="#/governance"
+                      onClick={e => {
+                        e.preventDefault()
+                        navigate('governance')
+                      }}
+                    >
+                      Governance screen
+                    </a>
+                    .
+                  </p>
+                )}
+                {layersOn.features && (
+                  <p>
+                    No features are derived from this {refWord} yet. Features are created in the{' '}
+                    <a
+                      href="#/workbench"
+                      onClick={e => {
+                        e.preventDefault()
+                        navigate('workbench')
+                      }}
+                    >
+                      Workbench
+                    </a>
+                    .
+                  </p>
+                )}
+              </aside>
+            </Panel>
+          )}
           <Controls showInteractive={false} position="bottom-right" />
           <MiniMap
             position="bottom-left"
@@ -814,12 +1060,6 @@ export function LineageView({ anchor }: { anchor: SearchHit }) {
         )}
       </div>
 
-      {empty && (
-        <p className="hint" role="status">
-          No lineage recorded around this column yet. Declared joins, entity bridges, and
-          features appear here as their uploads and registrations arrive.
-        </p>
-      )}
       {graph.truncated && (
         <p className="hint" role="status">
           The map was cut at the node limit. Expand a node to fetch more around it.
@@ -838,6 +1078,13 @@ export function LineageView({ anchor }: { anchor: SearchHit }) {
 
       <section className="ln-a11y" aria-label="Edges as text">
         <h3 className="micro-label">Edges (accessible parallel list)</h3>
+        {layout.contain && matchId && (
+          // The structural containment tie, kept out of the relationship list so the list
+          // stays a faithful mirror of the drawn lineage edges.
+          <p className="hint">
+            {byId.get(matchId)?.column ?? anchor.column} belongs to {anchor.table}
+          </p>
+        )}
         {visibleEdges.length === 0 ? (
           <p className="hint">No edges in view.</p>
         ) : (
