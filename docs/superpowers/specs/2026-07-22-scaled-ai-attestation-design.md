@@ -140,6 +140,24 @@ Ranked; the top three are must-adds. Each new proposal flows through the same tr
 - Async: a worker stage (the codebase has `outbox` / `queue` / `timers` / dispatch-ledger tables) —
   move enrichment + validation off the request path.
 
+## 5a. UI surfaces (which screen each phase touches)
+Mostly existing screens; two are new.
+
+- **Asset Detail → Metadata & Evidence tab** (`AssetDetailScreen`): the `ai/attested` badge with
+  confidence + the plain-English "why" (capability C) replaces today's "unattested". Surfaces the
+  evidence layer, not just the (empty) decision layer. *(P1, then P2/P5)*
+- **Asset Detail → Readiness tab**: `unresolved_authority` blockers clear as fields become AI-attested. *(P1)*
+- **Governance → Rules & Clusters review** (NEW tab in `GovernanceReviewScreen`, beside join /
+  table-fact / semantic-binding): AI-drafted rules and clustered escalations, each with a column
+  preview and Approve / Edit / Reject — the bulk human governance layer. *(P3)*
+- **Governance Dashboard** (`GovernanceDashboardScreen`): attestation coverage — % auto-attested, %
+  escalated, measured false-attest rate, pending rules. *(P2/P3)*
+- **Workbench → Suggested features** (NEW surface in `WorkbenchScreen`): AI-proposed features grouped
+  by **entity** (not column), each a card with its recipe, leakage + time-safety checks, relevance,
+  and Accept / Edit / Dismiss. Blocked proposals (missing a cross-source input) shown honestly. A
+  "feeds these features" cross-link on a column's Asset Detail deep-links here.
+  Mockup: https://claude.ai/code/artifact/9bcf322f-233b-4d72-a525-cda20de8ec9c *(P4)*
+
 ## 6. Non-functional
 - **Async worker**, cost-governed (per-column budget, sampling low-value columns, prompt caching).
 - **Measurement first:** a human-labelled **gold set** (a few hundred columns) sets and monitors the
