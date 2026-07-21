@@ -821,12 +821,14 @@ describe('asset detail + field-correction client (Delivery F/G)', () => {
 
   it('encodes each object_ref path segment — dots + real path slashes survive, hostile chars encoded', async () => {
     fetchMock.mockImplementation(ok(DETAIL))
-    await getAssetDetail('cards/legacy', 'schema/accounts.balance#v2')
+    // `source` is a SINGLE path segment: a '/' or '%' in it is rejected at the WRITE boundary
+    // (POST /uploads, connector-sync target_source), so a slash-bearing source can never exist to
+    // reach this read — hence a plain single-segment source here. object_ref is a :path — its slash
+    // stays a separator, dots survive, and the '#' is percent-encoded per-segment (NOT the whole
+    // ref, which would double-encode the path slash to %2F and 404 the path route).
+    await getAssetDetail('cards', 'schema/accounts.balance#v2')
     const [url] = fetchMock.mock.calls[0]
-    // source is ONE segment (its slash → %2F). object_ref is a :path — its slash stays a separator,
-    // dots survive, and the '#' is percent-encoded per-segment (NOT the whole ref, which would
-    // double-encode the path slash to %2F and 404 the path route).
-    expect(url).toBe('/catalog/assets/cards%2Flegacy/schema/accounts.balance%23v2')
+    expect(url).toBe('/catalog/assets/cards/schema/accounts.balance%23v2')
   })
 
   it('surfaces a 404 for an unknown or read-scope-hidden asset as ApiError', async () => {

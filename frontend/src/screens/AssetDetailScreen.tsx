@@ -65,6 +65,17 @@ function authorityTone(authority: string): string {
   return AUTHORITY_TONE[authority] ?? 'gj-none'
 }
 
+// A relationship row's tone/border come from the row's OWN `status` field, never from which list it
+// arrived in — the delivery's thesis is that authority is a response fact, not a position. VERIFIED
+// reads as governed (solid ok); anything else (e.g. PARTIALLY_CONFIRMED) reads as partial (warn).
+function verifiedBadgeTone(status: string): string {
+  return status === 'VERIFIED' ? 'gj-verified' : 'gj-partial'
+}
+
+function verifiedRowClass(status: string): string {
+  return status === 'VERIFIED' ? 'adg-rel-verified' : 'adg-rel-partial'
+}
+
 function humanizeField(name: string): string {
   return name.replaceAll('_', ' ')
 }
@@ -586,12 +597,12 @@ function joinKey(join: AssetApprovedJoin): string {
 
 function ApprovedJoinRow({ join }: { join: AssetApprovedJoin }) {
   return (
-    <li className="row q-item adg-rel-verified">
+    <li className={`row q-item ${verifiedRowClass(join.status)}`}>
       <div className="q-head">
         <span className="mono gj-kind">
           {shortRef(join.from_ref)} → {shortRef(join.to_ref)}
         </span>
-        <span className="badge gj-verified">{join.status}</span>
+        <span className={`badge ${verifiedBadgeTone(join.status)}`}>{join.status}</span>
         <span className="gj-score">{join.cardinality ?? 'cardinality unknown'}</span>
       </div>
     </li>
@@ -607,7 +618,7 @@ function SemanticSection({
 }) {
   // Honest unavailability: a caller lacking catalog:read gets {status:'unavailable'} (also named in
   // unavailable_sections), which reads as "not available" — never an empty-success "no links".
-  if (semantic.status === 'unavailable' || isUnavailable('semantic')) {
+  if (semantic.status === 'unavailable' || isUnavailable('relationships.semantic')) {
     return (
       <section className="adg-section">
         <h3 className="micro-label">Semantic links</h3>
@@ -668,14 +679,14 @@ function verifiedEdgeKey(edge: SemanticVerifiedEdge): string {
 
 function SemanticVerifiedRow({ edge }: { edge: SemanticVerifiedEdge }) {
   return (
-    <li className="row q-item adg-rel-verified">
+    <li className={`row q-item ${verifiedRowClass(edge.status)}`}>
       <div className="q-head">
         <span className="mono gj-kind">
           {'object_ref' in edge
             ? `${shortRef(edge.object_ref)} — entity ${edge.entity}`
             : `${shortRef(edge.from_ref)} → ${shortRef(edge.to_ref)} (${edge.kind})`}
         </span>
-        <span className="badge gj-verified">{edge.status}</span>
+        <span className={`badge ${verifiedBadgeTone(edge.status)}`}>{edge.status}</span>
       </div>
     </li>
   )
@@ -731,6 +742,16 @@ function NeighborhoodGraph({
     ? `${detail.identity.table}.${detail.identity.column}`
     : (detail.identity.table ?? detail.identity.object_ref)
 
+  // The backend returns edges where the anchor is EITHER endpoint (from_ref = ANY(..) OR to_ref =
+  // ANY(..)), so the NEIGHBOR is whichever end is NOT the anchor — for a PK-side anchor of an N:1
+  // join the counterparty is the FROM end. Picking `to_ref` unconditionally would draw the anchor as
+  // its own neighbor and hide the real counterparty. Joins + semantic column edges carry object_ref-
+  // space refs (compared against identity.object_ref); candidates carry graph_ref-space refs.
+  const anchorRef = detail.identity.object_ref
+  const anchorGraphRef = detail.identity.graph_ref
+  const otherEnd = (fromRef: string, toRef: string, self: string): string =>
+    toRef === self ? fromRef : toRef
+
   const neighbors: { id: string; label: string; verified: boolean; edgeLabel: string }[] = []
   const seen = new Set<string>()
   function add(id: string, label: string, verified: boolean, edgeLabel: string) {
@@ -739,18 +760,25 @@ function NeighborhoodGraph({
     neighbors.push({ id, label, verified, edgeLabel })
   }
   for (const join of relationships.approved_joins) {
-    add(`join:${join.to_ref}`, shortRef(join.to_ref), true, `joins (${join.cardinality ?? 'n/a'})`)
+    // Key the dedupe on the CHOSEN neighbor ref, so two inbound joins stay two distinct nodes
+    // instead of collapsing onto one phantom self-node.
+    const neighborRef = otherEnd(join.from_ref, join.to_ref, anchorRef)
+    add(`join:${neighborRef}`, shortRef(neighborRef), join.status === 'VERIFIED',
+      `joins (${join.cardinality ?? 'n/a'})`)
   }
   if (relationships.semantic.status === 'available') {
     for (const edge of relationships.semantic.verified_edges) {
       if ('object_ref' in edge) {
-        add(`entity:${edge.entity}`, `entity ${edge.entity}`, true, 'entity')
+        add(`entity:${edge.entity}`, `entity ${edge.entity}`, edge.status === 'VERIFIED', 'entity')
       } else {
-        add(`sem:${edge.to_ref}`, shortRef(edge.to_ref), true, edge.kind)
+        const neighborRef = otherEnd(edge.from_ref, edge.to_ref, anchorRef)
+        add(`sem:${neighborRef}`, shortRef(neighborRef), edge.status === 'VERIFIED', edge.kind)
       }
     }
     for (const c of relationships.semantic.candidates) {
-      add(`cand:${c.candidate_id}`, shortRef(c.target_graph_ref), false, `${c.binding_kind} (candidate)`)
+      const neighborRef =
+        c.target_graph_ref === anchorGraphRef ? c.subject_graph_ref : c.target_graph_ref
+      add(`cand:${neighborRef}`, shortRef(neighborRef), false, `${c.binding_kind} (candidate)`)
     }
   }
 

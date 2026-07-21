@@ -304,6 +304,21 @@ def test_sync_target_source_required(client):
     assert _create_sync(client, iid, target_source="  ").status_code == 400
 
 
+def test_sync_target_source_slash_or_percent_rejected_400(client):
+    """G-I-2: target_source IS the catalog source, one path segment across the whole API — a '/' or
+    '%' would (percent-)decode across the {source}/... routes and feed a DIFFERENT catalog. Reject
+    it at the connector WRITE boundary (create AND patch), the same rule POST /uploads applies."""
+    iid, sid = _configured_sync(client)
+    for bad in ("cards/legacy", "cards%2Flegacy"):
+        created = _create_sync(client, iid, service_name="svc_bad", target_source=bad)
+        assert created.status_code == 400
+        assert "single path segment" in created.json()["detail"]
+        patched = client.patch(f"/integrations/{iid}/syncs/{sid}",
+                               json={"target_source": bad}, headers=OWNER)
+        assert patched.status_code == 400
+        assert "single path segment" in patched.json()["detail"]
+
+
 def test_sync_ids_stripped_before_store(client):
     """#16: service/source ids are stripped BEFORE they are stored — ' cards ' and 'cards' must be
     ONE catalog, and a padded service name must occupy the same one-sync-per-service slot."""

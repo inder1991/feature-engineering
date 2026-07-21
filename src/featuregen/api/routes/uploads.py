@@ -31,6 +31,7 @@ from featuregen.overlay.upload.glossary_reader import (
     read_glossary,
 )
 from featuregen.overlay.upload.ingest import IngestResult, ingest_upload
+from featuregen.overlay.upload.object_ref import normalize_source_name
 from featuregen.overlay.upload.ingestion_run import (
     RUN_ID_HEADER,
     _effective_config_snapshot,
@@ -125,9 +126,14 @@ def create_upload(
     # object_ref._norm — before anything downstream sees it: 'sales', 'sales ' and 'Sales' must be
     # ONE catalog (#16). A merely-stripped 'Sales' would miss the prior 'sales' refs and bypass the
     # large-change brake as a "first upload" while its facts still keyed on the lowered stream.
-    source = source.strip().lower()
-    if not source:
-        raise HTTPException(status_code=400, detail="source is required")
+    # normalize_source_name folds case (as above) AND fails CLOSED on a name that is not a single
+    # path segment: a '/' or '%' would (percent-)decode across the {source}/{object_ref:path} route
+    # boundary (uvicorn decodes %2F to '/' before routing) and read/write a DIFFERENT source — reject
+    # it here at the write boundary rather than loosening any route.
+    try:
+        source = normalize_source_name(source)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     # Design #3: open the durable run manifest BEFORE parse, on an independent committing
     # connection, so a parse/oversize/unsupported failure still has a queryable run row. The
     # effective_config flag snapshot is pinned HERE, once — never re-read from env mid-run.

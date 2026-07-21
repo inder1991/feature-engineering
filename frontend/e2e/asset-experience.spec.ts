@@ -46,6 +46,11 @@ test.describe('asset experience — desktop, real backend, seeded via upload', (
       res.ok(),
       `seed upload failed: HTTP ${res.status()} — ${await res.text()}`,
     ).toBeTruthy()
+    // POST /uploads returns 200 for 'held'/'rejected' too, so res.ok() alone would let a seed that
+    // parsed-but-did-not-ingest through — leaving the e2e asserting stale data. Assert the ingest
+    // actually LANDED (status 'ingested'), surfacing the whole body if it did not.
+    const body = await res.json()
+    expect(body.status, JSON.stringify(body)).toBe('ingested')
   })
 
   test('search -> Details renders the real asset detail, a nonblank graph, and no overflow', async ({

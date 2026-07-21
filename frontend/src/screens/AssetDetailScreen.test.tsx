@@ -258,7 +258,9 @@ describe('asset detail — relationships: verified distinct from proposed', () =
   it('shows an unavailable semantic subsection honestly, never as an empty-success', async () => {
     const detail = fixture()
     detail.relationships!.semantic = { status: 'unavailable' }
-    detail.unavailable_sections = ['semantic', 'audit']
+    // The backend names the withheld semantic subsection 'relationships.semantic' (the real wire),
+    // not a bare 'semantic'.
+    detail.unavailable_sections = ['relationships.semantic', 'audit']
     getAssetDetail.mockResolvedValue({ detail, etag: 'etag-1' })
     renderScreen()
     await screen.findByRole('group', { name: /asset sections/i })
@@ -266,6 +268,62 @@ describe('asset detail — relationships: verified distinct from proposed', () =
     expect(await screen.findByText(/semantic links are not available/i)).toBeInTheDocument()
     // Not a "no semantic links" empty-success.
     expect(screen.queryByText('Proposed candidates')).not.toBeInTheDocument()
+  })
+
+  it('graph draws the NON-anchor endpoint as the neighbor for an inbound (anchor-as-to_ref) join', async () => {
+    const detail = fixture()
+    // an INBOUND join: the anchor (public.accounts.balance) is the to_ref; the REAL counterparty is
+    // the from_ref. The backend returns edges where the anchor is EITHER endpoint, so the graph must
+    // pick the end that is NOT the anchor — else it draws the anchor as its own neighbor.
+    detail.relationships!.approved_joins = [{
+      from_ref: 'public.orders.account_id', to_ref: 'public.accounts.balance',
+      cardinality: 'N:1', status: 'VERIFIED', approved_join_fact_key: 'ajk-in',
+    }]
+    // isolate the join: drop the verified semantic edge + candidate so only the join drives the graph.
+    detail.relationships!.semantic = {
+      status: 'available', verified_edges: [], candidates: [], divergences: [],
+    }
+    getAssetDetail.mockResolvedValue({ detail, etag: 'etag-1' })
+    const { container } = renderScreen()
+    await screen.findByRole('group', { name: /asset sections/i })
+    await userEvent.click(screen.getByRole('button', { name: 'Relationships' }))
+    await screen.findByRole('img', { name: /neighborhood graph/i })
+
+    // the a11y list names the REAL counterparty (the from_ref) — the non-anchor end is chosen.
+    const a11y = container.querySelector('.adg-graph-a11y')!
+    expect(a11y.textContent).toContain('orders.account_id')
+
+    // the anchor label is drawn EXACTLY ONCE (as the anchor node), never also as its own neighbor.
+    const nodeLabels = Array.from(container.querySelectorAll('.adg-node-label'))
+      .map(el => el.textContent)
+    expect(nodeLabels.filter(t => t === 'accounts.balance')).toHaveLength(1)
+    expect(nodeLabels).toContain('orders.account_id')
+  })
+
+  it('derives a verified-list row tone from its OWN status field, not from list membership', async () => {
+    const detail = fixture()
+    // a row the backend returned in the verified list but whose status is NOT VERIFIED must read as
+    // PARTIAL (badge + border), never hardcoded verified — authority is a response fact, not a
+    // position in a list.
+    detail.relationships!.approved_joins = [{
+      from_ref: 'public.accounts.balance', to_ref: 'public.customers.id',
+      cardinality: 'N:1', status: 'PARTIALLY_CONFIRMED', approved_join_fact_key: 'ajk-p',
+    }]
+    detail.relationships!.semantic = {
+      status: 'available', verified_edges: [], candidates: [], divergences: [],
+    }
+    getAssetDetail.mockResolvedValue({ detail, etag: 'etag-1' })
+    const { container } = renderScreen()
+    await screen.findByRole('group', { name: /asset sections/i })
+    await userEvent.click(screen.getByRole('button', { name: 'Relationships' }))
+
+    // badge tone derived from status → partial, never verified.
+    expect(authorityChip('PARTIALLY_CONFIRMED', 'gj-partial')).toBeTruthy()
+    expect(authorityChip('PARTIALLY_CONFIRMED', 'gj-verified')).toBeFalsy()
+    // row border derived from status → partial; and the graph edge draws as proposed, not verified.
+    expect(container.querySelector('.adg-rel-partial')).toBeTruthy()
+    expect(container.querySelector('.adg-edge--proposed')).toBeTruthy()
+    expect(container.querySelector('.adg-edge--verified')).toBeFalsy()
   })
 })
 

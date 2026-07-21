@@ -3294,6 +3294,12 @@ button.stat:hover {
   border-left: 3px dashed var(--proposal);
 }
 
+/* a "verified"-list row whose OWN status is not VERIFIED (e.g. PARTIALLY_CONFIRMED) reads as partial
+   (warn), mirroring the gj-partial badge tone — authority from the response field, not list position. */
+.adg-rel-partial {
+  border-left: 3px solid var(--warn-solid);
+}
+
 .adg-rel-diverge {
   border-left: 3px solid var(--warn-solid);
 }

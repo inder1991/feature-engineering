@@ -30,6 +30,25 @@ def _norm(value: str) -> str:
     return value.strip().lower()
 
 
+def normalize_source_name(source: str) -> str:
+    """Strip + lower-case a catalog source id (the ``_norm`` fold every identity component gets) AND
+    fail closed on a name that is not a single URL path segment.
+
+    ``source`` is ONE path segment across the whole API (``/sources/{source}/...``,
+    ``/catalog/assets/{source}/{object_ref:path}``, ``/uploads`` Form field). A '/' or a '%' in it
+    would (percent-)decode across the route boundary — uvicorn percent-decodes ``%2F`` to ``/``
+    BEFORE routing — and mis-split ``{source}/{object_ref:path}``, reading or writing a DIFFERENT
+    source. Reject both at the WRITE boundary rather than loosening any route. Raises ``ValueError``
+    on an empty name or one containing '/' or '%'."""
+    normalized = source.strip().lower()
+    if not normalized:
+        raise ValueError("source is required")
+    if "/" in normalized or "%" in normalized:
+        raise ValueError(
+            "source must be a single path segment: '/' and '%' are not allowed in a source name")
+    return normalized
+
+
 def normalize_ref(
     source: str, schema: str | None, table: str, column: str | None = None
 ) -> str:

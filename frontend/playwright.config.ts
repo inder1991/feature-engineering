@@ -67,8 +67,11 @@ export default defineConfig({
       // The REAL backend. Run from the repo root (the `featuregen` package must be installed, e.g.
       // `uv sync` / `pip install -e .`, so `featuregen.api.app` imports). No LLM provider is set, so
       // ingest runs un-enriched — sufficient for a real graph_node + asset detail.
+      // `uv run` resolves the project's uv-managed .venv from the repo-root cwd, so the backend
+      // imports `featuregen` even in a fresh/CI shell where the venv is NOT activated (a bare
+      // `uvicorn` would not be on PATH).
       command:
-        `uvicorn --factory featuregen.api.app:create_app_from_env `
+        `uv run uvicorn --factory featuregen.api.app:create_app_from_env `
         + `--host 127.0.0.1 --port ${BACKEND_PORT}`,
       cwd: '..',
       url: `http://127.0.0.1:${BACKEND_PORT}/health`,

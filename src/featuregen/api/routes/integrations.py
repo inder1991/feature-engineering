@@ -82,6 +82,7 @@ from featuregen.connectors.openmetadata import (
 from featuregen.contracts.envelopes import IdentityEnvelope
 from featuregen.intake.llm import LLMClient
 from featuregen.overlay.upload.ingest import ingest_upload
+from featuregen.overlay.upload.object_ref import normalize_source_name
 from featuregen.overlay.upload.ingestion_run import (
     RUN_ID_HEADER,
     _effective_config_snapshot,
@@ -384,11 +385,17 @@ def create_sync(integration_id: str, body: SyncIn, conn: _Conn, identity: _Ident
     # catalog. service_name is only STRIPPED (it keys the one-sync-per-service slot but names an
     # external OpenMetadata service, where case may matter to OM).
     service_name = body.service_name.strip()
-    target_source = body.target_source.strip().lower()
     if not service_name:
         raise HTTPException(status_code=400, detail="service_name is required")
-    if not target_source:
+    if not body.target_source.strip():
         raise HTTPException(status_code=400, detail="target_source is required")
+    # target_source IS the catalog identity (#16): fold case AND fail CLOSED on a name that is not a
+    # single path segment ('/' or '%' would (percent-)decode across the {source}/... routes and feed
+    # a DIFFERENT catalog) — the same write-boundary rule POST /uploads applies.
+    try:
+        target_source = normalize_source_name(body.target_source)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     if body.tag_map_override is not None:
         _validate_tag_map(body.tag_map_override)
     if store.sync_exists_for_service(conn, integration_id, service_name):
@@ -433,8 +440,8 @@ def patch_sync(integration_id: str, sync_id: str, body: SyncPatch, conn: _Conn,
     # create_sync: catalog identity folds case, the external OM service name keeps it.
     service_name = (body.service_name if body.service_name is not None
                     else current["service_name"]).strip()
-    target_source = (body.target_source if body.target_source is not None
-                     else current["target_source"]).strip().lower()
+    target_source_raw = (body.target_source if body.target_source is not None
+                         else current["target_source"])
     table_naming = body.table_naming if body.table_naming is not None else current["table_naming"]
     database_filter = (body.database_filter if body.database_filter is not None
                        else current["database_filter"])
@@ -445,8 +452,13 @@ def patch_sync(integration_id: str, sync_id: str, body: SyncPatch, conn: _Conn,
 
     if not service_name:
         raise HTTPException(status_code=400, detail="service_name is required")
-    if not target_source:
+    if not target_source_raw.strip():
         raise HTTPException(status_code=400, detail="target_source is required")
+    # Same write-boundary rule as create_sync: fold case AND reject a non-single-segment name.
+    try:
+        target_source = normalize_source_name(target_source_raw)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     if tag_map_override is not None:
         _validate_tag_map(tag_map_override)
     if body.service_name is not None and store.sync_exists_for_service(
