@@ -3173,3 +3173,230 @@ button.stat:hover {
   border-color: var(--accent-line);
   background: var(--paper);
 }
+
+/* ---------------------------------------------------------------- asset detail (Delivery G)
+   Appended for AssetDetailScreen: the 5-tab asset sheet. Composes the existing
+   .viewtoggle/.rows/.row/.q-item/.badge/.kv/.field/.btn/.gj-* vocabulary and the token palette;
+   authority/lifecycle tones reuse the governance chips. Nothing above this line is modified. */
+
+.adg {
+  display: grid;
+  gap: 16px;
+}
+
+.adg-id-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.adg-title {
+  margin: 0;
+  font-size: 18px;
+}
+
+.adg-id-flags {
+  display: inline-flex;
+  gap: 6px;
+}
+
+.adg-tabs {
+  flex-wrap: wrap;
+}
+
+.adg-tabpanel {
+  display: grid;
+  gap: 16px;
+}
+
+.adg-section {
+  display: grid;
+  gap: 8px;
+}
+
+.adg-sub {
+  margin-top: 4px;
+}
+
+.adg-kv dd.mono,
+.adg-field-value {
+  font-family: var(--font-mono);
+  font-size: 13px;
+}
+
+/* a compact read-only field row (overview summary / containment / audit): label, value, chips */
+.adg-field {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.adg-field-label {
+  font-weight: 600;
+  font-size: 13px;
+  min-width: 120px;
+}
+
+.adg-field-value {
+  color: var(--ink);
+}
+
+.adg-auth-meta {
+  color: var(--ink-faint);
+  font-size: 12px;
+}
+
+.adg-field-card {
+  display: grid;
+  gap: 8px;
+}
+
+.adg-evidence {
+  display: grid;
+  gap: 6px;
+  padding: 8px 10px;
+  background: var(--surface-2);
+  border-radius: var(--radius);
+}
+
+.adg-lifecycle {
+  display: grid;
+  gap: 4px;
+}
+
+.adg-proposals,
+.adg-reqs {
+  margin: 0;
+  padding-left: 18px;
+  display: grid;
+  gap: 3px;
+  font-size: 13px;
+}
+
+.adg-unavailable {
+  color: var(--ink-soft);
+  font-style: italic;
+  padding: 8px 10px;
+  border: 1px dashed var(--line-strong);
+  border-radius: var(--radius);
+  background: var(--surface-2);
+}
+
+/* verified relationships read as a solid ok edge on the left; proposed candidates as a dashed
+   accent edge; divergences as a warn edge — so verified is never confused with proposed. */
+.adg-rel-verified {
+  border-left: 3px solid var(--ok-solid);
+}
+
+.adg-rel-proposed {
+  border-left: 3px dashed var(--proposal);
+}
+
+.adg-rel-diverge {
+  border-left: 3px solid var(--warn-solid);
+}
+
+/* ---- inline SVG neighborhood graph ---- */
+.adg-graph {
+  width: 100%;
+  max-width: 340px;
+  height: auto;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface-2);
+}
+
+.adg-edge {
+  stroke-width: 1.5;
+}
+
+.adg-edge--verified {
+  stroke: var(--ok-solid);
+}
+
+.adg-edge--proposed {
+  stroke: var(--proposal);
+  stroke-dasharray: 6 5;
+}
+
+.adg-node--anchor {
+  fill: var(--accent);
+}
+
+.adg-node--verified {
+  fill: var(--ok-solid);
+}
+
+.adg-node--proposed {
+  fill: var(--surface);
+  stroke: var(--proposal);
+  stroke-width: 1.5;
+}
+
+.adg-node-label {
+  font-size: 10px;
+  fill: var(--ink-soft);
+}
+
+.adg-node-label--anchor {
+  font-weight: 600;
+  fill: var(--ink);
+}
+
+.adg-graph-a11y {
+  margin: 8px 0 0;
+  padding-left: 18px;
+  display: grid;
+  gap: 3px;
+  font-size: 13px;
+  color: var(--ink-soft);
+}
+
+/* ---- correction drawer ---- */
+.adg-drawer {
+  position: fixed;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: min(420px, 92vw);
+  overflow-y: auto;
+  display: grid;
+  align-content: start;
+  gap: 12px;
+  padding: 20px;
+  background: var(--surface);
+  border-left: 1px solid var(--line-strong);
+  box-shadow: -8px 0 24px oklch(0.2 0.02 220 / 0.12);
+  z-index: 20;
+}
+
+.adg-drawer-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.adg-drawer-title {
+  margin: 0;
+  font-size: 16px;
+}
+
+.adg-honesty {
+  padding: 8px 10px;
+  background: var(--accent-soft);
+  border-radius: var(--radius);
+  color: var(--accent);
+  font-size: 13px;
+}
+
+.adg-cas {
+  font-size: 12px;
+}
+
+.adg-cas dd.mono {
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}

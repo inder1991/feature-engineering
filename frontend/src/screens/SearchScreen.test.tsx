@@ -431,6 +431,19 @@ describe('search screen — impact and graph', () => {
     expect(screen.queryByText('Layers')).not.toBeInTheDocument()
   })
 
+  it('Details action navigates to the asset route with the hit\'s source and object_ref', async () => {
+    searchCatalog.mockResolvedValue(result([HIT], FACETS, 1))
+    render(<SearchScreen />)
+    await userEvent.click(
+      await screen.findByRole('button', { name: 'Details for public.accounts.balance' }),
+    )
+    // The hit's own catalog_source is the registration lineage key — it rides the asset route,
+    // never a client-side default; object_ref's dots survive as query-string chars.
+    expect(window.location.hash).toBe(
+      '#/asset?source=deposits&object_ref=public.accounts.balance',
+    )
+  })
+
   it('jumps to the graph anchored on the row whose Graph action was clicked', async () => {
     searchCatalog.mockResolvedValue(result([
       HIT, { ...HIT, object_ref: 'public.accounts.opened_at', column: 'opened_at' },

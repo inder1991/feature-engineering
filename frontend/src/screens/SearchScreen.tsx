@@ -161,6 +161,12 @@ export function SearchScreen() {
     setView('graph')
   }
 
+  // Open the asset-detail screen for a hit. The catalog source is the read/registration lineage
+  // key, so the asset route carries the hit's own catalog_source (never a client-side default).
+  function openDetails(hit: SearchHit) {
+    navigate('asset', { source: hit.catalog_source, object_ref: hit.object_ref })
+  }
+
   // Active-filter chips, in facet-group order, then flags.
   const chips: { id: string; label: string; pii: boolean; remove: () => void }[] = []
   for (const group of FACET_GROUPS) {
@@ -346,6 +352,7 @@ export function SearchScreen() {
                   key={`${hit.catalog_source}:${hit.object_ref}`}
                   hit={hit}
                   onGraph={jumpToGraph}
+                  onDetails={openDetails}
                 />
               ))}
             </ul>
@@ -365,7 +372,15 @@ export function SearchScreen() {
   )
 }
 
-function HitRow({ hit, onGraph }: { hit: SearchHit; onGraph: (hit: SearchHit) => void }) {
+function HitRow({
+  hit,
+  onGraph,
+  onDetails,
+}: {
+  hit: SearchHit
+  onGraph: (hit: SearchHit) => void
+  onDetails: (hit: SearchHit) => void
+}) {
   const [impact, setImpact] = useState<string[] | null>(null)
   const [impactError, setImpactError] = useState('')
   const [checking, setChecking] = useState(false)
@@ -431,6 +446,14 @@ function HitRow({ hit, onGraph }: { hit: SearchHit; onGraph: (hit: SearchHit) =>
           </div>
         )}
       </div>
+      <button
+        type="button"
+        className="btn btn--ghost"
+        aria-label={`Details for ${hit.object_ref}`}
+        onClick={() => onDetails(hit)}
+      >
+        Details
+      </button>
       <button
         type="button"
         className="btn btn--ghost"

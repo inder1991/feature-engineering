@@ -2,6 +2,7 @@ import type { ReactElement } from 'react'
 import { gateConsoleEnabled, useHashRoute } from './nav'
 import type { Route } from './nav'
 import { SessionBar } from './SessionBar'
+import { AssetDetailScreen } from './screens/AssetDetailScreen'
 import { GateEvaluationScreen } from './screens/GateEvaluationScreen'
 import { GovernanceDashboardScreen } from './screens/GovernanceDashboardScreen'
 import { GovernanceReviewScreen } from './screens/GovernanceReviewScreen'
@@ -238,6 +239,19 @@ const PAGES: { route: Route; label: string; eyebrow: string; title: string; desc
   },
 ]
 
+// The asset detail sheet's page-head. Kept OUT of PAGES (it is not a top-nav destination — it is
+// reached via a Details action on a search hit), but it still needs its own eyebrow/title/copy.
+const ASSET_PAGE = {
+  route: 'asset' as Route,
+  label: 'Asset detail',
+  eyebrow: 'CATALOG · ASSET',
+  title: 'Asset detail',
+  description:
+    'One catalog asset opened to its sections — identity, metadata & evidence, relationships, '
+    + 'readiness, and history. Every value comes from the catalog; corrections stage a new '
+    + 'evidence layer, they never rewrite the source.',
+}
+
 export default function App() {
   const { route, navigate, params } = useHashRoute()
   // The upload -> review handoff travels entirely in the URL (?source=). No component state:
@@ -259,7 +273,10 @@ export default function App() {
   // The gate console page exists only when its flag is on — checked per render (not module
   // scope) so vi.stubEnv works in tests, same as the WorkbenchScreen intent flags.
   const pages = gateConsoleEnabled() ? PAGES : PAGES.filter(p => p.route !== 'gate')
-  const page = pages.find(p => p.route === route) ?? pages[0]
+  // 'asset' is a detail sheet, not a nav tab (absent from PAGES, so no rail item highlights) — but
+  // it still needs an honest page-head, so it selects a dedicated entry instead of falling back to
+  // Overview's copy.
+  const page = route === 'asset' ? ASSET_PAGE : (pages.find(p => p.route === route) ?? pages[0])
   return (
     <div className="shell">
       <aside className="rail">
@@ -315,6 +332,15 @@ export default function App() {
           <GovernanceReviewScreen initialSource={params.get('source') ?? ''} />
         )}
         {route === 'dashboard' && <GovernanceDashboardScreen onReview={openGovernanceReview} />}
+        {route === 'asset' && (
+          // Reached via a Details action on a search hit — source + object_ref ride the hash. Keyed
+          // so an asset -> asset deep link (different params) remounts to a clean load.
+          <AssetDetailScreen
+            key={`${params.get('source') ?? ''}:${params.get('object_ref') ?? ''}`}
+            source={params.get('source') ?? ''}
+            objectRef={params.get('object_ref') ?? ''}
+          />
+        )}
         {route === 'gate' && gateConsoleEnabled() && <GateEvaluationScreen />}
         {route === 'workbench' && <WorkbenchScreen />}
       </main>
