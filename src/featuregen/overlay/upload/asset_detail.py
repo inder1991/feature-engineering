@@ -136,11 +136,39 @@ def _authority_label(ov: OperationalValue, display_value: object | None) -> str:
     return "missing"
 
 
+# Honest author of an UNCONFIRMED value: who asserted it and at what strength, from the active
+# evidence layer. Surfaced as effective_metadata's fallback so a value with a known author never reads
+# as "unattested" just because no governed DECISION exists yet.
+_EVIDENCE_PROVENANCE_LABELS: dict[tuple[str, str], str] = {
+    ("source", "attested"): "source attested",
+    ("source", "proposed"): "source proposed",
+    ("llm", "proposed"): "AI proposed",
+    ("llm", "corroborated"): "AI corroborated",
+    ("taxonomy", "confirmed"): "rulebook confirmed",
+    ("taxonomy", "proposed"): "rulebook proposed",
+    ("parser", "supported"): "parser detected",
+}
+
+
+def _evidence_provenance_label(producer: str, strength: str) -> str:
+    return _EVIDENCE_PROVENANCE_LABELS.get((producer, strength), f"{producer} {strength}")
+
+
 def _effective_metadata_section(conn: DbConn, logical_ref: str, anchor: dict) -> dict:
     """The display value + C1 authority/provenance for each metadata field (columns only). Every
     field's authority/provenance is SOURCED from C1 :func:`read_operational_value` — never
     re-derived here."""
     fields: dict[str, dict] = {}
+    # Newest ACTIVE evidence per field — the honest author of a value that has no governed decision.
+    active_ev = {
+        r[0]: (r[1], r[2])
+        for r in conn.execute(
+            "SELECT DISTINCT ON (field_name) field_name, producer, strength "
+            "FROM field_evidence WHERE logical_ref = %s AND lifecycle = 'active' "
+            "ORDER BY field_name, created_at DESC, evidence_id DESC",
+            (logical_ref,),
+        ).fetchall()
+    }
     for label, flat_col, c1_field in _METADATA_FIELDS:
         display_value = anchor.get(flat_col)
         ov = read_operational_value(conn, logical_ref, c1_field)
@@ -151,6 +179,10 @@ def _effective_metadata_section(conn: DbConn, logical_ref: str, anchor: dict) ->
             "provenance": ov.decision_event_id or ov.fact_event_id,
             "selected_evidence_ids": list(ov.selected_evidence_ids),
         }
+        ev = active_ev.get(c1_field)
+        entry["evidence_provenance"] = (
+            _evidence_provenance_label(ev[0], ev[1]) if ev else None
+        )
         # [F12] composition-audit — ``entity`` is governed by the E3 SECOND gate
         # (``entity_status='VERIFIED'``, the same gate ``verified_entity_of`` and this payload's OWN
         # relationships.semantic subsection apply), which C1 cannot model (entity has no fact/decision
