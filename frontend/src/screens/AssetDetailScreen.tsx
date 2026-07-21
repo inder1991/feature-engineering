@@ -567,20 +567,12 @@ function RelationshipsTab({
 
       <section className="adg-section">
         <h3 className="micro-label">Containment</h3>
-        <p className="hint mono">{rel.containment.table.object_ref}</p>
-        {rel.containment.columns.length === 0 ? (
-          <p className="hint">No related columns.</p>
-        ) : (
-          <ul className="rows">
-            {rel.containment.columns.map(col => (
-              <li className="row adg-field" key={col.object_ref}>
-                <span className="mono">{col.column ?? col.object_ref}</span>
-                {col.data_type && <span className="hint">{col.data_type}</span>}
-                {col.sensitivity && <span className="badge sensitivity">{col.sensitivity}</span>}
-              </li>
-            ))}
-          </ul>
-        )}
+        <p className="hint">
+          Belongs to <span className="mono">{rel.containment.table.object_ref}</span>
+          {' · '}
+          {rel.containment.columns.length}{' '}
+          {rel.containment.columns.length === 1 ? 'other column' : 'other columns'}
+        </p>
       </section>
 
       <section className="adg-section">

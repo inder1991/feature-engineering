@@ -275,6 +275,29 @@ describe('asset detail — relationships: verified distinct from proposed', () =
     expect(a11y?.textContent).toMatch(/proposed/)
   })
 
+  it('containment is a one-line summary, not a dump of every sibling column', async () => {
+    const detail = fixture()
+    detail.relationships!.containment = {
+      table: {
+        object_ref: 'public.comp_financial_tran_repos_dly',
+        table: 'comp_financial_tran_repos_dly',
+      },
+      columns: [
+        {
+          object_ref: 'public.t.actual_tran_amt', column: 'actual_tran_amt',
+          data_type: 'unknown', sensitivity: null,
+        },
+        { object_ref: 'public.t.cif_id', column: 'cif_id', data_type: 'unknown', sensitivity: null },
+      ],
+    }
+    getAssetDetail.mockResolvedValue({ detail, etag: 'etag-1' })
+    renderScreen()
+    await screen.findByRole('group', { name: /asset sections/i })
+    await userEvent.click(screen.getByRole('button', { name: 'Relationships' }))
+    expect(await screen.findByText(/2 other columns/)).toBeInTheDocument()   // the summary line
+    expect(screen.queryByText('actual_tran_amt')).not.toBeInTheDocument()    // NOT dumped as a row
+  })
+
   it('shows an unavailable semantic subsection honestly, never as an empty-success', async () => {
     const detail = fixture()
     detail.relationships!.semantic = { status: 'unavailable' }
