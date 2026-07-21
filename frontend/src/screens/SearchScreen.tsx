@@ -82,7 +82,17 @@ export function SearchScreen() {
       .then(res => {
         if (id !== seq.current) return
         setResult(res)
-        setAnchor(null) // a new result set re-anchors the graph on its first hit
+        // A clicked anchor survives re-searches while its hit is still in the set; only when it
+        // drops out does the graph fall back to the first hit. (Silently resetting to hits[0] made
+        // an unfiltered browse — where the TABLE is the first hit — hijack column anchors.)
+        setAnchor(prev =>
+          prev &&
+          res.hits.some(
+            h => h.catalog_source === prev.catalog_source && h.object_ref === prev.object_ref,
+          )
+            ? prev
+            : null,
+        )
       })
       .catch(err => {
         if (id !== seq.current) return
@@ -360,11 +370,20 @@ export function SearchScreen() {
 
           {effectiveView === 'graph' && graphAnchor && (
             // Keyed on the anchor: a new anchor remounts the view, resetting expansion, trace, and
-            // drawer state cleanly. Facets narrow the hit set; the graph anchors on its first hit.
-            <LineageView
-              key={`${graphAnchor.catalog_source}:${graphAnchor.object_ref}`}
-              anchor={graphAnchor}
-            />
+            // drawer state cleanly. The caption names the anchor: without it, users could not tell
+            // a table-anchored graph from a column-anchored one (the unfiltered browse lists the
+            // table itself first, and its Graph action was mistaken for a column's).
+            <>
+              <p className="hint" role="status">
+                Graph of: <code>{graphAnchor.object_ref}</code> (
+                {graphAnchor.column ? 'column' : 'table'}). Click Graph on any result row to
+                re-anchor.
+              </p>
+              <LineageView
+                key={`${graphAnchor.catalog_source}:${graphAnchor.object_ref}`}
+                anchor={graphAnchor}
+              />
+            </>
           )}
         </div>
       </div>
@@ -416,6 +435,7 @@ function HitRow({
       <div style={{ display: 'grid', gap: 2, minWidth: 0, flex: 1 }}>
         <div style={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 8 }}>
           <code>{hit.object_ref}</code>
+          {hit.kind === 'table' && <span className="badge kindtable">table</span>}
           {hit.is_grain && <span className="badge grain">grain</span>}
           {hit.is_as_of && <span className="badge asof">as-of</span>}
           {hit.sensitivity && <span className="badge sensitivity">{hit.sensitivity}</span>}

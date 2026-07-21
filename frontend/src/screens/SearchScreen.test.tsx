@@ -459,4 +459,61 @@ describe('search screen — impact and graph', () => {
     )
     expect(await screen.findByText('Layers')).toBeInTheDocument()
   })
+
+  // The unfiltered browse lists the TABLE itself as the first hit; its card title looks exactly
+  // like a column ref, so users clicked its Graph action believing they anchored a column. The
+  // graph must always NAME its anchor, and table rows must be visibly tables.
+  it('graph view captions which ref it is anchored on, with its kind', async () => {
+    searchCatalog.mockResolvedValue(result([
+      HIT, { ...HIT, object_ref: 'public.accounts.opened_at', column: 'opened_at' },
+    ], FACETS, 2))
+    render(<SearchScreen />)
+    await userEvent.click(
+      await screen.findByRole('button', { name: 'Graph for public.accounts.opened_at' }),
+    )
+    const caption = await screen.findByText(/Graph of:/)
+    expect(caption).toHaveTextContent('public.accounts.opened_at')
+    expect(caption).toHaveTextContent('column')
+  })
+
+  it('table hits carry a table badge so they cannot read as columns', async () => {
+    searchCatalog.mockResolvedValue(result([
+      { ...HIT, object_ref: 'public.accounts', column: null, kind: 'table' },
+      HIT,
+    ], FACETS, 2))
+    render(<SearchScreen />)
+    const tableRow = (await screen.findByText('public.accounts')).closest('li') as HTMLElement
+    expect(within(tableRow).getByText('table')).toHaveClass('badge')
+    const colRow = screen.getByText('public.accounts.balance').closest('li') as HTMLElement
+    expect(within(colRow).queryByText('table')).not.toBeInTheDocument()
+  })
+
+  it('a re-search keeps the clicked anchor when it is still in the result set', async () => {
+    const hits = [
+      { ...HIT, object_ref: 'public.accounts', column: null, kind: 'table' },
+      { ...HIT, object_ref: 'public.accounts.opened_at', column: 'opened_at' },
+    ]
+    searchCatalog.mockResolvedValue(result(hits, FACETS, 2))
+    render(<SearchScreen />)
+    await userEvent.click(
+      await screen.findByRole('button', { name: 'Graph for public.accounts.opened_at' }),
+    )
+    expect(await screen.findByText(/Graph of:/)).toHaveTextContent('public.accounts.opened_at')
+    // Re-search (same result set): the anchor must NOT silently reset to the first hit (the table).
+    await userEvent.click(screen.getByRole('button', { name: 'Search' }))
+    expect(await screen.findByText(/Graph of:/)).toHaveTextContent('public.accounts.opened_at')
+  })
+
+  it('a re-search falls back to the first hit only when the anchor left the result set', async () => {
+    const colHit = { ...HIT, object_ref: 'public.accounts.opened_at', column: 'opened_at' }
+    searchCatalog.mockResolvedValue(result([HIT, colHit], FACETS, 2))
+    render(<SearchScreen />)
+    await userEvent.click(
+      await screen.findByRole('button', { name: 'Graph for public.accounts.opened_at' }),
+    )
+    expect(await screen.findByText(/Graph of:/)).toHaveTextContent('public.accounts.opened_at')
+    searchCatalog.mockResolvedValue(result([HIT], FACETS, 1))
+    await userEvent.click(screen.getByRole('button', { name: 'Search' }))
+    expect(await screen.findByText(/Graph of:/)).toHaveTextContent('public.accounts.balance')
+  })
 })
