@@ -190,6 +190,10 @@ def run_batched(conn, client, *, short: str, task: str, prompt_id: str, schema_i
     calls = 0
     resolved: dict[str, str] = {}
     fallback_used = 0
+    # Refs actually SENT to the provider (any batch chunk this ladder issued). Its complement over
+    # `items` is the honest budget/deadline `not_attempted` count — items the cutoff skipped WITHOUT
+    # ever dispatching them, so they were never "failed", just never tried.
+    dispatched: set[str] = set()
 
     def _ctx_for(call_items: list[BatchItem]) -> DispatchAuditContext | None:
         # One context per PHYSICAL call, scoped to exactly the items it carries — a retried or
@@ -210,6 +214,7 @@ def run_batched(conn, client, *, short: str, task: str, prompt_id: str, schema_i
         if not chunk or over_budget():
             counters.incr(f"overlay.enrich.{short}.batch.budget_exhausted") if chunk else None
             return
+        dispatched.update(it.ref for it in chunk)   # this chunk is now being sent to the provider
         res = audited_batch_call(conn, client, task=task, prompt_id=prompt_id, schema_id=schema_id,
                                  shared_metadata=shared_metadata, items=chunk, out_key=out_key,
                                  instruction=instruction, accept=accept, actor=actor,
@@ -281,4 +286,12 @@ def run_batched(conn, client, *, short: str, task: str, prompt_id: str, schema_i
                 report["timed_out"] = True
             break
         process(chunk, 0)
+    # Honest truncation signal (#22): items the budget/deadline cutoff skipped WITHOUT dispatch — the
+    # complement of everything this ladder actually sent. The caller threads it into the stage detail
+    # so a truncated run is labeled `truncated`, not `items_failed`. (The in-memory `budget_exhausted`
+    # counter is metrics-only and never persisted; present only when non-zero.)
+    if report is not None:
+        not_attempted = len({it.ref for it in items} - dispatched)
+        if not_attempted:
+            report["not_attempted"] = not_attempted
     return resolved

@@ -278,7 +278,8 @@ def synthesize_tables(conn, client, items: list[BatchItem], *, columns_by_table,
                       dispositions: list[dict] | None = None,
                       ingestion_run_id: str | None = None,
                       catalog_source: str | None = None,
-                      schema_by_table: dict[str, str] | None = None) -> dict[str, dict]:
+                      schema_by_table: dict[str, str] | None = None,
+                      stats: dict | None = None) -> dict[str, dict]:
     """Run the governed batch synthesis; return {table: synthesis_dict} for VALID results only.
     Validation is done INSIDE run_batched via the ref-aware accept — this function does no
     post-filtering (an INVALID synthesis never reaches here).
@@ -303,6 +304,10 @@ def synthesize_tables(conn, client, items: list[BatchItem], *, columns_by_table,
     path a mode switch could select. Only the FEATURE switch (``OVERLAY_TABLE_SYNTH``,
     ``ingest.table_synth_enabled``) gates Pass B.
 
+    ``stats`` (optional out-param — return shape unchanged): accumulates ``not_attempted``, the count
+    of TABLES the budget/deadline cutoff skipped WITHOUT dispatching their synthesis (narrow path +
+    wide phase-2), so the caller labels a truncated Pass B ``truncated`` rather than ``items_failed``.
+
     C5-T5 — ``ingestion_run_id`` + ``catalog_source`` (+ ``schema_by_table``, the Pass-B fact-key
     schema map): with a run id, every Pass B dispatch (chunk summaries AND syntheses) is pre-audited
     and attributed to the run + its TABLE subjects under stage ``pass_b``. ``ingestion_run_id=None``
@@ -319,14 +324,14 @@ def synthesize_tables(conn, client, items: list[BatchItem], *, columns_by_table,
                                        dispositions=dispositions,
                                        ingestion_run_id=ingestion_run_id,
                                        catalog_source=catalog_source,
-                                       schema_by_table=schema_by_table))
+                                       schema_by_table=schema_by_table, stats=stats))
     if wide:
         resolved.update(_synthesize_wide_tables(conn, client, wide,
                                                 columns_by_table=columns_by_table, actor=actor,
                                                 dispositions=dispositions,
                                                 ingestion_run_id=ingestion_run_id,
                                                 catalog_source=catalog_source,
-                                                schema_by_table=schema_by_table))
+                                                schema_by_table=schema_by_table, stats=stats))
     return resolved
 
 
@@ -334,7 +339,8 @@ def _run_synthesis(conn, client, items: list[BatchItem], *, columns_by_table, ac
                    dispositions: list[dict] | None = None,
                    ingestion_run_id: str | None = None,
                    catalog_source: str | None = None,
-                   schema_by_table: dict[str, str] | None = None) -> dict[str, dict]:
+                   schema_by_table: dict[str, str] | None = None,
+                   stats: dict | None = None) -> dict[str, dict]:
     """The governed phase-2 synthesis batch (shared by the narrow fast path and the wide path): SAME
     task/schema/accept/result-shape — only the item metadata (full profiles vs summaries+roster) and
     the instruction differ. Returns {table: synthesis_dict} for VALID results only.
@@ -350,6 +356,7 @@ def _run_synthesis(conn, client, items: list[BatchItem], *, columns_by_table, ac
     resolved ref is excluded from every retry/split chunk, and only a parseable-dict raw — which
     always resolves — appends records)."""
     accept = make_ref_accept(columns_by_table, dispositions=dispositions)
+    batch_report: dict = {}   # honest-labeling: run_batched reports budget/deadline not_attempted
     resolved = run_batched(
         conn, client, short="table_synth", task="table_synth",
         prompt_id="overlay_table_synth_v3", schema_id="overlay_table_synth_batch",
@@ -358,10 +365,15 @@ def _run_synthesis(conn, client, items: list[BatchItem], *, columns_by_table, ac
         instruction=instruction, accept=accept, actor=actor,
         extract=lambda e: json.dumps(e.get("synthesis"), sort_keys=True), ref_aware=True,
         deadline_s=enrich_config.stage_deadline_s(),   # MF-4 — bound the source-lock hold
+        report=batch_report,
         ingestion_run_id=ingestion_run_id, dispatch_stage="pass_b",
         dispatch_subjects=_dispatch_subjects_for(items, catalog_source=catalog_source,
                                                  schema_by_table=schema_by_table),
     )
+    # ACCUMULATE (narrow + wide-phase-2 both funnel here): these table-granular refs are exactly
+    # Pass B's expected unit, so a truncated synthesis surfaces as the stage's `not_attempted`.
+    if stats is not None and batch_report.get("not_attempted"):
+        stats["not_attempted"] = stats.get("not_attempted", 0) + batch_report["not_attempted"]
     return {table: json.loads(raw) for table, raw in resolved.items()}
 
 
@@ -387,7 +399,8 @@ def _synthesize_wide_tables(conn, client, wide_items: list[BatchItem], *, column
                             dispositions: list[dict] | None = None,
                             ingestion_run_id: str | None = None,
                             catalog_source: str | None = None,
-                            schema_by_table: dict[str, str] | None = None) -> dict[str, dict]:
+                            schema_by_table: dict[str, str] | None = None,
+                            stats: dict | None = None) -> dict[str, dict]:
     """Two-phase synthesis for tables wider than the egress cap (#1). ``dispositions`` threads to
     the PHASE-2 synthesis only (whose refs are the table names); the phase-1 chunk summaries are
     advisory input keyed by chunk ref and record no per-field dispositions.
@@ -474,10 +487,14 @@ def _synthesize_wide_tables(conn, client, wide_items: list[BatchItem], *, column
         phase2_items.append(BatchItem(ref=table, metadata=metadata))
     if not phase2_items:
         return {}
+    # `stats` threads to PHASE-2 only (table-granular refs = Pass B's `not_attempted` unit). Phase-1
+    # summary truncation is chunk-granular; a wholly-unsummarized wide table already surfaces as
+    # unresolved (`wide.zero_summaries`), so it is deliberately not recounted here.
     return _run_synthesis(conn, client, phase2_items, columns_by_table=columns_by_table,
                           actor=actor, instruction=_SYNTH_WIDE_INSTRUCTION,
                           dispositions=dispositions, ingestion_run_id=ingestion_run_id,
-                          catalog_source=catalog_source, schema_by_table=schema_by_table)
+                          catalog_source=catalog_source, schema_by_table=schema_by_table,
+                          stats=stats)
 
 
 _TYPE_FIELDS_NOTE = (

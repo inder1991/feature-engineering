@@ -376,7 +376,9 @@ def enrich_concepts(conn, rows: list[CanonicalRow], client: LLMClient, actor=Non
 
     ``stats`` (#22, optional out-param — the return shape is unchanged): when given, receives
     ``evidence_write_failures``, the count of per-item evidence-write failures the stage CONTAINED
-    internally, so the caller's stage report can say ``partial`` instead of a laundered success.
+    internally, plus ``not_attempted`` (batch mode), the count of items the budget/deadline cutoff
+    skipped WITHOUT dispatch — so the caller's stage report can say ``partial`` (``items_failed`` or
+    the distinct ``truncated``) instead of a laundered success.
 
     ``ingestion_run_id`` (C5-T5): the durable run this enrichment serves — with it, EVERY LLM
     dispatch this stage issues (batch chunks, retries, single fallbacks, single mode) is pre-audited
@@ -406,6 +408,7 @@ def enrich_concepts(conn, rows: list[CanonicalRow], client: LLMClient, actor=Non
 
     if enrich_config.mode("concept") == "batch":
         misses = [BatchItem(h, meta_by_hash[h]) for h in miss_hashes]
+        batch_report: dict = {}   # honest-labeling: run_batched reports budget/deadline not_attempted
         resolved = run_batched(
             conn, client, short="concept", task=_TASK, prompt_id="overlay_concept_batch_v1",
             schema_id="overlay_concept_batch",
@@ -415,9 +418,12 @@ def enrich_concepts(conn, rows: list[CanonicalRow], client: LLMClient, actor=Non
                         "if none fits. Return exactly one result per input ref; treat each item "
                         "independently.", accept=_accept_concept, actor=actor,
             deadline_s=enrich_config.stage_deadline_s(),   # MF-4 — bound the source-lock hold
+            report=batch_report,
             ingestion_run_id=ingestion_run_id, dispatch_stage="enrich_concept",
             dispatch_subjects=({h: _column_subject(by_hash[h]) for h in miss_hashes}
                                if ingestion_run_id is not None else None))
+        if stats is not None:
+            stats["not_attempted"] = batch_report.get("not_attempted", 0)
         for h, concept in resolved.items():
             _cache_put(conn, "enrichment_concept", key_of[h], concept, _CONCEPT_CACHE_VERSION)
             result[h] = concept
@@ -485,13 +491,18 @@ def suppressed_definition_hashes(rows: list[CanonicalRow],
 def draft_definitions(conn, rows: list[CanonicalRow], client: LLMClient, actor=None,
                       *, concepts: dict[str, str] | None = None,
                       glossary: GlossaryUpload | None = None,
-                      ingestion_run_id: str | None = None) -> dict[str, str]:
+                      ingestion_run_id: str | None = None,
+                      stats: dict | None = None) -> dict[str, str]:
     """Draft a definition ONLY for columns with no declared one (R3). Keyed by (content_hash,
     assigned concept) so a concept change re-drafts (spec C6). Returns {content_hash: definition}.
 
     R5-3 (``glossary`` given): a sanitizer-SUPPRESSED blank (``definition_suppressed`` on the
     sidecar) is skipped — suppressed is not missing; it stays empty pending review, never silently
     LLM-drafted. Non-glossary callers are byte-for-byte unchanged.
+
+    ``stats`` (optional out-param — return shape unchanged): in batch mode, receives
+    ``not_attempted``, the count of items the budget/deadline cutoff skipped WITHOUT dispatch, so the
+    caller's stage report labels a truncated run ``truncated`` rather than ``items_failed``.
 
     ``ingestion_run_id`` (C5-T5): with it, every dispatch is attributed to the run + the exact
     column subjects drafted (stage ``enrich_definition``); ``None`` is byte-for-byte today."""
@@ -510,6 +521,7 @@ def draft_definitions(conn, rows: list[CanonicalRow], client: LLMClient, actor=N
         items = [BatchItem(h, {"table": blank[h].table, "column": blank[h].column,
                                "type": blank[h].type, **({"concept": concepts[h]} if concepts.get(h) else {})})
                  for h in misses]
+        batch_report: dict = {}   # honest-labeling: run_batched reports budget/deadline not_attempted
         resolved = run_batched(
             conn, client, short="definition", task=_DEF_TASK,
             prompt_id="overlay_definition_batch_v1", schema_id="overlay_definition_batch",
@@ -519,9 +531,12 @@ def draft_definitions(conn, rows: list[CanonicalRow], client: LLMClient, actor=N
                         "relationships between items; do not reuse another item's facts; return "
                         "exactly one result per input ref.", accept=_accept_bounded(500), actor=actor,
             deadline_s=enrich_config.stage_deadline_s(),   # MF-4 — bound the source-lock hold
+            report=batch_report,
             ingestion_run_id=ingestion_run_id, dispatch_stage="enrich_definition",
             dispatch_subjects=({h: _column_subject(blank[h]) for h in misses}
                                if ingestion_run_id is not None else None))
+        if stats is not None:
+            stats["not_attempted"] = batch_report.get("not_attempted", 0)
         for h, def_text in resolved.items():
             _cache_put(conn, "enrichment_definition", key_of[h], def_text, _DEFINITION_CACHE_VERSION)
             result[h] = def_text
@@ -546,8 +561,13 @@ def draft_definitions(conn, rows: list[CanonicalRow], client: LLMClient, actor=N
 
 
 def classify_domains(conn, rows: list[CanonicalRow], client: LLMClient,
-                     actor=None, *, ingestion_run_id: str | None = None) -> dict[str, str]:
+                     actor=None, *, ingestion_run_id: str | None = None,
+                     stats: dict | None = None) -> dict[str, str]:
     """Classify each table's business domain (per-table), returning {table_name: domain}.
+
+    ``stats`` (optional out-param — return shape unchanged): in batch mode, receives
+    ``not_attempted``, the count of tables the budget/deadline cutoff skipped WITHOUT dispatch, so
+    the caller's stage report labels a truncated run ``truncated`` rather than ``items_failed``.
 
     ``ingestion_run_id`` (C5-T5): with it, every dispatch is attributed to the run + the TABLE
     subjects classified (stage ``enrich_domain``, ``field_names`` = the table's columns in the
@@ -564,6 +584,7 @@ def classify_domains(conn, rows: list[CanonicalRow], client: LLMClient,
         misses = [BatchItem(t, {"table": t, "columns": sorted(cols)})
                   for t, cols in by_table.items() if hash_of_table[t] not in cached]
         out = {t: cached[hash_of_table[t]] for t in by_table if hash_of_table[t] in cached}
+        batch_report: dict = {}   # honest-labeling: run_batched reports budget/deadline not_attempted
         resolved = run_batched(
             conn, client, short="domain", task=_DOMAIN_TASK, prompt_id="overlay_domain_batch_v1",
             schema_id="overlay_domain_batch", shared_metadata={}, items=misses, out_key="domain",
@@ -571,10 +592,13 @@ def classify_domains(conn, rows: list[CanonicalRow], client: LLMClient,
                         "result per input ref; treat each table independently.",
             accept=_accept_bounded(64), actor=actor,
             deadline_s=enrich_config.stage_deadline_s(),   # MF-4 — bound the source-lock hold
+            report=batch_report,
             ingestion_run_id=ingestion_run_id, dispatch_stage="enrich_domain",
             dispatch_subjects=({t: _table_subject(source, t, cols)
                                 for t, cols in by_table.items()}
                                if ingestion_run_id is not None else None))
+        if stats is not None:
+            stats["not_attempted"] = batch_report.get("not_attempted", 0)
         for table, dom in resolved.items():
             _cache_put(conn, "enrichment_domain", hash_of_table[table], dom, _DOMAIN_CACHE_VERSION)
             out[table] = dom

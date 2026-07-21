@@ -201,18 +201,25 @@ class IngestResult:
     semantic_binding_failed: int = 0
 
 
-def _enrichment_outcome(result: dict | None, expected: int, *, internal_failures: int = 0
-                        ) -> tuple[str, str | None, dict]:
+def _enrichment_outcome(result: dict | None, expected: int, *, internal_failures: int = 0,
+                        not_attempted: int = 0) -> tuple[str, str | None, dict]:
     """``(state, reason_code, detail)`` for a per-item stage (#22) — the honest account. ``None``
-    (the stage's advisory except fired) is ``failed``; a non-empty expectation resolving NOTHING is
-    ``failed``; SOME items unresolved — or the stage caught per-item failures INTERNALLY (the
-    concept-evidence writes, batch discards, Pass B) — is ``partial``: an outer success is NOT
-    evidence that every item succeeded. Counts ride in ``detail`` (never row data).
+    (the stage's advisory except fired) is ``failed``; a non-empty expectation resolving NOTHING (and
+    nothing merely truncated) is ``failed``; SOME items unresolved — or the stage caught per-item
+    failures INTERNALLY (the concept-evidence writes, batch discards, Pass B) — is ``partial``: an
+    outer success is NOT evidence that every item succeeded. Counts ride in ``detail`` (never row data).
 
     A Pass B ABSTENTION (a parseable synthesis with no grain AND no as-of) is RESOLVED, not a failure
     — some tables genuinely have no single grain/as-of. Its count rides in ``detail["abstained"]``
     (present only when non-zero, like ``unresolved``). Only dict-valued stages (Pass B) can abstain;
-    string-valued stages (concept/definition/domain) never match, so their detail is unchanged."""
+    string-valued stages (concept/definition/domain) never match, so their detail is unchanged.
+
+    ``not_attempted`` (from ``run_batched``'s ``report``): items the budget/deadline cutoff skipped
+    WITHOUT ever dispatching them. They were NOT tried, so branding them ``items_failed`` is a lie.
+    When unresolved is (partly) truncation, its count rides in ``detail["not_attempted"]`` and — if
+    there is no GENUINE dispatched failure — the reason_code is the distinct, honest ``truncated``.
+    ``items_failed`` stays reserved for items actually dispatched and rejected/failed (a run with
+    BOTH still reports ``items_failed`` — the failure is real — while recording ``not_attempted``)."""
     if result is None:
         return "failed", "exception", {"expected": expected}
     detail: dict = {"resolved": len(result), "expected": expected}
@@ -226,10 +233,18 @@ def _enrichment_outcome(result: dict | None, expected: int, *, internal_failures
         detail["abstained"] = abstained
     if internal_failures:
         detail["internal_failures"] = internal_failures
-    if expected and not result:
+    # Truncated items were never dispatched, so they can never exceed the unresolved count; clamp
+    # defensively (a reused cache HIT resolves even when later chunks were cut off).
+    not_attempted = min(max(not_attempted, 0), unresolved)
+    if not_attempted:
+        detail["not_attempted"] = not_attempted
+    dispatched_failures = unresolved - not_attempted   # unresolved items that WERE tried
+    if expected and not result and not not_attempted:
         return "failed", "no_items_resolved", detail
-    if unresolved or internal_failures:
+    if dispatched_failures or internal_failures:
         return "partial", "items_failed", detail
+    if not_attempted:
+        return "partial", "truncated", detail
     return "succeeded", None, detail
 
 
@@ -1853,17 +1868,19 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
             logger.warning("advisory concept enrichment failed for %r", catalog_source, exc_info=True)
         state, reason, detail = _enrichment_outcome(
             concepts, len({content_hash(r) for r in vr.good}),
-            internal_failures=concept_stats.get("evidence_write_failures", 0))
+            internal_failures=concept_stats.get("evidence_write_failures", 0),
+            not_attempted=concept_stats.get("not_attempted", 0))
         record_stage(stage_recorder, "enrich_concept", state, reason_code=reason,
                      detail=_with_audit_degradations(detail), started_at=stage_started)
         stage_started = datetime.now(UTC)
+        def_stats: dict = {}   # honest-labeling: receives batch not_attempted (budget/deadline)
         try:
             with conn.transaction():
                 # R5-3: the glossary sidecar lets draft_definitions SKIP sanitizer-suppressed
                 # blanks (suppressed ≠ missing — never silently LLM-drafted); None for technical.
                 definitions = draft_definitions(conn, vr.good, client, actor, concepts=concepts,
                                                 glossary=glossary,
-                                                ingestion_run_id=ingestion_run_id)
+                                                ingestion_run_id=ingestion_run_id, stats=def_stats)
         except Exception:  # noqa: BLE001
             logger.warning("advisory definition enrichment failed for %r", catalog_source, exc_info=True)
         state, reason, detail = _enrichment_outcome(
@@ -1871,17 +1888,21 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
             # Honest expected count (R5-3): suppressed blanks are deliberately NOT drafted, so they
             # must not be counted as unresolved items degrading the stage to "partial".
             len({content_hash(r) for r in vr.good if not r.definition}
-                - suppressed_definition_hashes(vr.good, glossary)))
+                - suppressed_definition_hashes(vr.good, glossary)),
+            not_attempted=def_stats.get("not_attempted", 0))
         record_stage(stage_recorder, "enrich_definition", state, reason_code=reason,
                      detail=_with_audit_degradations(detail), started_at=stage_started)
         stage_started = datetime.now(UTC)
+        domain_stats: dict = {}   # honest-labeling: receives batch not_attempted (budget/deadline)
         try:
             with conn.transaction():
                 domains = classify_domains(conn, vr.good, client, actor,
-                                           ingestion_run_id=ingestion_run_id)
+                                           ingestion_run_id=ingestion_run_id, stats=domain_stats)
         except Exception:  # noqa: BLE001
             logger.warning("advisory domain enrichment failed for %r", catalog_source, exc_info=True)
-        state, reason, detail = _enrichment_outcome(domains, len({r.table for r in vr.good}))
+        state, reason, detail = _enrichment_outcome(
+            domains, len({r.table for r in vr.good}),
+            not_attempted=domain_stats.get("not_attempted", 0))
         record_stage(stage_recorder, "enrich_domain", state, reason_code=reason,
                      detail=_with_audit_degradations(detail), started_at=stage_started)
     stage_started = datetime.now(UTC)
@@ -1965,6 +1986,7 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
         # assembled table that never resolved gets five `not_evaluated` records below ([F12]).
         # Persisted as `pass_b` stage detail — a JSON-safe list of small records, never row data.
         dispositions: list[dict] = []
+        passb_stats: dict = {}   # honest-labeling: budget/deadline not_attempted (table-granular)
         try:
             # TWO savepoints (exactly like the Pass A stages and the governed-join seam
             # above): a DB abort inside either must not
@@ -2001,7 +2023,7 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
                                               # C5-T5: run + table-subject dispatch attribution
                                               ingestion_run_id=ingestion_run_id,
                                               catalog_source=catalog_source,
-                                              schema_by_table=schema_by_table)
+                                              schema_by_table=schema_by_table, stats=passb_stats)
             with conn.transaction():
                 # Key the advisory table ref + its projection under the SAME schema the glossary
                 # columns use (a non-public schema for an FTR glossary; public for a technical
@@ -2041,7 +2063,8 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
                     add_not_evaluated(dispositions, it.ref)
             # Pass B swallows per-table failures internally (an unsynthesized table is simply
             # absent from `syntheses`), so the report compares against the assembled items (#22).
-            state, reason, detail = _enrichment_outcome(syntheses, len(items))
+            state, reason, detail = _enrichment_outcome(
+                syntheses, len(items), not_attempted=passb_stats.get("not_attempted", 0))
             detail["dispositions"] = dispositions      # the durable per-field account (Task 3)
             record_stage(stage_recorder, "pass_b", state, reason_code=reason,
                          detail=_with_audit_degradations(detail), started_at=stage_started)
