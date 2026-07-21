@@ -1,11 +1,19 @@
 from datetime import UTC, datetime, timedelta
 
+import pytest
+
 from featuregen.overlay.field_decision import FieldDecisionEventType, record_field_decision
 from featuregen.overlay.field_evidence import canonical_hash
 from featuregen.overlay.upload.canonical import CanonicalRow
+from featuregen.overlay.upload.column_authority import read_column_facts
 from featuregen.overlay.upload.feature_assist import RejectCode, _validate_idea
+from featuregen.overlay.upload.feature_metadata_snapshot import (
+    CATALOG_PROJECTION_UNAVAILABLE,
+    CatalogProjectionUnavailable,
+)
 from featuregen.overlay.upload.graph import build_graph
 from featuregen.overlay.upload.object_ref import normalize_ref
+from featuregen.overlay.upload.operational_facts import read_operational_value
 
 NOW = datetime(2026, 7, 18, tzinfo=UTC)
 FRESH = timedelta(hours=24)
@@ -176,6 +184,127 @@ def test_governed_additive_sum_clears_additivity_check(db):
     assert rej is None
     assert idea.validation_status == "DESIGN_CHECKED"
     assert all(r.code != "ADDITIVITY_SUPPORTS_OPERATION" for r in idea.requirements)
+
+
+# ── C1 tamper gates on the customer feature path — a DRIFTED / forked / retired / projection-lagged
+#    governed value can NO LONGER clear a design check (the confirmed blocker's fix). Only the
+#    hash-verified status=="resolved" head clears; the rest are honest needs-check / abort. ──────────
+def test_drifted_additivity_no_longer_clears_and_old_reader_would_have(db):
+    """THE FIX. The approved decision is ``non_additive``; the flat graph value DRIFTED to
+    ``additive`` (legacy API / faulty projection / manual DB change). The OLD permissive
+    ``read_column_facts`` still serves it as GOVERNED-additive (which cleared a SUM); C1 hash-verifies
+    the flat value against the approved decision → ``hash_mismatch`` → does NOT clear → emits
+    ADDITIVITY_SUPPORTS_OPERATION (NEEDS_EXTERNAL_VALIDATION, never DESIGN_CHECKED)."""
+    build_graph(db, "bank", [
+        CanonicalRow("bank", "accounts", "balance", "numeric", additivity="non_additive")])
+    _fresh(db, "bank")
+    _govern(db, "bank", "public.accounts.balance", "additivity", "non_additive")   # approved value
+    _govern(db, "bank", "public.accounts.balance", "logical_representation", "numeric")
+    lref = normalize_ref("bank", "public", "accounts", "balance")
+    # DRIFT: mutate ONLY the flat graph value out from under the approved decision.
+    db.execute("UPDATE graph_node SET additivity = 'additive' WHERE object_ref = %s",
+               ("public.accounts.balance",))
+    # OLD-reader CONTROL: the permissive reader STILL serves governed-additive (the bypass existed) —
+    # under the old wiring "additive" is a safe additive value, so the SUM would have cleared.
+    old = read_column_facts(db, lref, "additivity")
+    assert old.authority == "governed" and old.value == "additive"
+    # C1 refuses: the drifted flat value no longer hashes to the approved decision.
+    assert read_operational_value(db, lref, "additivity").status == "hash_mismatch"
+    known, src_of = _kv(["public.accounts.balance"], "bank")
+    raw = {"name": "sum_bal", "derives_from": ["public.accounts.balance"], "aggregation": "sum"}
+    idea, rej = _validate_idea(db, raw, known, src_of, None, NOW, FRESH)
+    assert rej is None
+    assert idea.validation_status == "NEEDS_EXTERNAL_VALIDATION"
+    assert any(r.code == "ADDITIVITY_SUPPORTS_OPERATION" for r in idea.requirements)
+
+
+def test_drifted_numeric_type_no_longer_clears(db):
+    """The approved logical_representation is ``varchar`` (non-numeric); the flat ``data_type``
+    DRIFTED to ``numeric``. The OLD reader serves numeric (which cleared an AVG's type check); C1
+    hash-mismatches → does NOT clear → emits TYPE_IS_NUMERIC."""
+    ref = _ftr_col(db, "loans", "amt", data_type="varchar", declared_type=None)
+    _govern(db, "ftr", ref, "logical_representation", "varchar")   # approved value
+    lref = normalize_ref("ftr", "public", "loans", "amt")
+    db.execute("UPDATE graph_node SET data_type = 'numeric' WHERE object_ref = %s", (ref,))   # DRIFT
+    old = read_column_facts(db, lref, "logical_representation")
+    assert old.authority == "governed" and old.value == "numeric"   # OLD reader would clear AVG
+    assert read_operational_value(db, lref, "logical_representation").status == "hash_mismatch"
+    known, src_of = _kv([ref], "ftr")
+    raw = {"name": "avg_amt", "derives_from": [ref], "aggregation": "avg"}
+    idea, rej = _validate_idea(db, raw, known, src_of, None, NOW, FRESH)
+    assert rej is None
+    assert idea.validation_status == "NEEDS_EXTERNAL_VALIDATION"
+    assert any(r.code == "TYPE_IS_NUMERIC" for r in idea.requirements)
+
+
+def test_retired_additivity_decision_does_not_clear(db):
+    """A RETIRED (staled) additivity decision is never served operational → C1 ``status="retired"`` →
+    SUM cannot clear → honest needs-check."""
+    build_graph(db, "bank", [
+        CanonicalRow("bank", "accounts", "balance", "numeric", additivity="additive")])
+    _fresh(db, "bank")
+    _govern(db, "bank", "public.accounts.balance", "logical_representation", "numeric")
+    lref = normalize_ref("bank", "public", "accounts", "balance")
+    record_field_decision(
+        db, logical_ref=lref, field_name="additivity",
+        event_type=FieldDecisionEventType.STALED, selected_evidence_ids=[],
+        evidence_set_hash=canonical_hash([]), display_value_hash=None, load_bearing_value_hash=None,
+        conflict_status="staled", reason_codes=["evidence_staled"],
+        field_policy_version="upload-field-policy-v1",
+        resolver_version="upload-resolve-and-project-v1", actor_ref=None, supersedes_event_id=None)
+    assert read_operational_value(db, lref, "additivity").status == "retired"
+    known, src_of = _kv(["public.accounts.balance"], "bank")
+    raw = {"name": "sum_bal", "derives_from": ["public.accounts.balance"], "aggregation": "sum"}
+    idea, rej = _validate_idea(db, raw, known, src_of, None, NOW, FRESH)
+    assert rej is None
+    assert idea.validation_status == "NEEDS_EXTERNAL_VALIDATION"
+    assert any(r.code == "ADDITIVITY_SUPPORTS_OPERATION" for r in idea.requirements)
+
+
+def test_forked_additivity_decision_does_not_clear(db):
+    """A FORKED head — two disagreeing non-retired decisions at the same instant — is ambiguous, so
+    C1 ``status="fork"`` serves no operational value → SUM cannot clear → honest needs-check."""
+    build_graph(db, "bank", [
+        CanonicalRow("bank", "accounts", "balance", "numeric", additivity="additive")])
+    _fresh(db, "bank")
+    _govern(db, "bank", "public.accounts.balance", "logical_representation", "numeric")
+    lref = normalize_ref("bank", "public", "accounts", "balance")
+    for lb in ("additive", "non_additive"):   # two heads at the SAME created_at that DISAGREE
+        record_field_decision(
+            db, logical_ref=lref, field_name="additivity",
+            event_type=FieldDecisionEventType.RESOLVED, selected_evidence_ids=[],
+            evidence_set_hash=canonical_hash([]), display_value_hash=canonical_hash(lb),
+            load_bearing_value_hash=canonical_hash(lb), conflict_status="resolved", reason_codes=[],
+            field_policy_version="upload-field-policy-v1",
+            resolver_version="upload-resolve-and-project-v1", actor_ref=None,
+            supersedes_event_id=None, now=NOW)
+    assert read_operational_value(db, lref, "additivity").status == "fork"
+    known, src_of = _kv(["public.accounts.balance"], "bank")
+    raw = {"name": "sum_bal", "derives_from": ["public.accounts.balance"], "aggregation": "sum"}
+    idea, rej = _validate_idea(db, raw, known, src_of, None, NOW, FRESH)
+    assert rej is None
+    assert idea.validation_status == "NEEDS_EXTERNAL_VALIDATION"
+    assert any(r.code == "ADDITIVITY_SUPPORTS_OPERATION" for r in idea.requirements)
+
+
+def test_projection_unavailable_aborts_generation_retryably(db):
+    """A DEGRADED/lagged load-bearing overlay projection makes every C1 read potentially stale
+    (GATE 3): generation ABORTS with the retryable :class:`CatalogProjectionUnavailable` (the route
+    maps it to a 503) rather than silently clearing on a stale value."""
+    build_graph(db, "bank", [
+        CanonicalRow("bank", "accounts", "balance", "numeric", additivity="additive")])
+    _fresh(db, "bank")
+    _govern(db, "bank", "public.accounts.balance", "additivity", "additive")
+    _govern(db, "bank", "public.accounts.balance", "logical_representation", "numeric")
+    db.execute(
+        "INSERT INTO projection_degraded "
+        "(projection_name, aggregate, aggregate_id, reason, poison_seq) "
+        "VALUES (%s, %s, %s, %s, %s)", ["overlay", "overlay_fact", "poisoned", "poison", 1])
+    known, src_of = _kv(["public.accounts.balance"], "bank")
+    raw = {"name": "sum_bal", "derives_from": ["public.accounts.balance"], "aggregation": "sum"}
+    with pytest.raises(CatalogProjectionUnavailable) as excinfo:
+        _validate_idea(db, raw, known, src_of, None, NOW, FRESH)
+    assert excinfo.value.code == CATALOG_PROJECTION_UNAVAILABLE
 
 
 def test_windowed_declared_as_of_needs_temporal(db):

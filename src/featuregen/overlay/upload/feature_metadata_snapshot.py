@@ -62,6 +62,10 @@ _KNOWN_FIELDS: frozenset[str] = frozenset(_DEFAULT_FIELDS)
 # fact-governed field's is a ``*_fact_event_id`` (→ ``fact_event_id``); hint fields carry neither.
 _DECISION_FIELDS: frozenset[str] = frozenset({"additivity", "logical_representation"})
 _FACT_FIELDS: frozenset[str] = frozenset({"is_grain", "is_as_of"})
+# The GOVERNED-clearing fields (decision + fact governed): read through C1 (read_operational_value)
+# so a drifted graph value seals as NON-governed. The rest (unit/currency/entity/declared_type) are
+# hints by policy and stay on read_column_facts.
+_C1_GOVERNED_FIELDS: frozenset[str] = _DECISION_FIELDS | _FACT_FIELDS
 
 _ISOLATION_LEVEL = "repeatable read"
 
@@ -177,6 +181,11 @@ class SnapshotItem:
     value: str | None
     authority: str
     provenance: str | None
+    # The sealed C1 operational status (operational_facts.OperationalValue.status). ``authority`` is
+    # "governed" IFF ``status == "resolved"`` (a hash-verified load-bearing value); every other status
+    # (no_decision/no_value/not_operational/conflict/fork/hash_mismatch/retired) seals as a hint, so a
+    # DRIFTED graph value can never seal as governed. Hint-by-policy fields seal "not_operational".
+    status: str
     decision_event_id: str | None
     fact_event_id: str | None
     item_hash: str
@@ -303,21 +312,50 @@ def _physical_ref(conn: DbConn, catalog_source: str, logical_ref: str) -> str | 
 def _build_item(
     conn: DbConn, catalog_source: str, object_ref: str, field: str
 ) -> SnapshotItem:
-    """Read one field's operational facts through the authority adapter and seal them into an item.
-    ``item_hash`` = canonical SHA-256 of the exact consumed
-    ``{catalog_source, graph_ref, field, value, authority, provenance}``."""
+    """Read one field's operational facts and seal them into an item. ``item_hash`` = canonical
+    SHA-256 of the exact consumed ``{catalog_source, graph_ref, field, value, authority, provenance,
+    status}`` — the sealed ``status`` covers the C1 authority, so a DRIFTED graph value seals as
+    NON-governed, never as governed.
+
+    A GOVERNED field (:data:`_C1_GOVERNED_FIELDS`) is read through C1 (``read_operational_value``) —
+    the tamper-gated read (fork / hash-verify vs the approved decision / projection-health): only a
+    hash-verified ``status == "resolved"`` head seals ``authority="governed"`` with its value +
+    provenance link; a drifted / forked / hash-mismatched read seals ``authority="hint"`` (value
+    None, provenance dropped). A projection-lagged read ABORTS the whole snapshot (the same abort the
+    up-front :func:`check_projection_readiness` gate raises) — never seal a stale projected value. The
+    hint-by-policy fields (unit/currency/entity/declared_type) stay on ``read_column_facts``."""
     logical_ref = logical_ref_of(catalog_source, object_ref)
     facts = read_column_facts(conn, logical_ref, field)
-    decision_event_id = facts.provenance if field in _DECISION_FIELDS else None
-    fact_event_id = facts.provenance if field in _FACT_FIELDS else None
+    if field in _C1_GOVERNED_FIELDS:
+        # Function-local import: operational_facts imports check_projection_readiness /
+        # CatalogProjectionUnavailable from THIS module, so a module-top import would be a cycle.
+        from featuregen.overlay.upload.operational_facts import read_operational_value
+        ov = read_operational_value(conn, logical_ref, field)
+        if ov.status == "projection_unavailable":
+            raise CatalogProjectionUnavailable(
+                CATALOG_PROJECTION_UNAVAILABLE,
+                ov.conflict_status or "load-bearing catalog projection unavailable")
+        governed = ov.status == "resolved"
+        value = ov.value
+        authority = "governed" if governed else "hint"
+        status = ov.status
+        provenance = facts.provenance if governed else None
+    else:
+        value = facts.value
+        authority = facts.authority
+        status = "not_operational"   # hint by policy — never governed
+        provenance = facts.provenance
+    decision_event_id = provenance if field in _DECISION_FIELDS else None
+    fact_event_id = provenance if field in _FACT_FIELDS else None
     item_hash = canonical_hash(
         {
             "catalog_source": catalog_source,
             "graph_ref": object_ref,
             "field": field,
-            "value": facts.value,
-            "authority": facts.authority,
-            "provenance": facts.provenance,
+            "value": value,
+            "authority": authority,
+            "provenance": provenance,
+            "status": status,
         }
     )
     return SnapshotItem(
@@ -327,9 +365,10 @@ def _build_item(
         physical_ref=_physical_ref(conn, catalog_source, logical_ref),
         item_kind="column_field",
         field_or_fact_type=field,
-        value=facts.value,
-        authority=facts.authority,
-        provenance=facts.provenance,
+        value=value,
+        authority=authority,
+        provenance=provenance,
+        status=status,
         decision_event_id=decision_event_id,
         fact_event_id=fact_event_id,
         item_hash=item_hash,
@@ -403,7 +442,8 @@ def build_metadata_snapshot(
             (snapshot_id, item.catalog_source, item.graph_ref, item.logical_ref,
              item.physical_ref, item.item_kind, item.field_or_fact_type,
              Jsonb({"value": item.value}),
-             Jsonb({"authority": item.authority, "provenance": item.provenance}),
+             Jsonb({"authority": item.authority, "provenance": item.provenance,
+                    "status": item.status}),
              item.decision_event_id, None, item.fact_event_id, item.item_hash),
         )
     conn.execute(   # the header LAST — this write seals the item set (MF-1); item_count stamps its size

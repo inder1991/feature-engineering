@@ -190,6 +190,57 @@ def test_facts_served_from_snapshot_not_live_columns(conn) -> None:
     assert ctx.facts(_SRC, "public.accounts.unknown", "unit") is None
 
 
+# ── C1: the C0 snapshot seals the OPERATIONAL status, and ONLY a hash-verified resolved head is
+#    governed — a drifted graph value seals as NON-governed (never a false governed). ──────────────────
+def test_snapshot_seals_c1_status_resolved_and_hint(conn) -> None:
+    _rr(conn)
+    _seed_graph(conn)   # governed non_additive (consistent) + hint-by-policy fields (unit/currency/…)
+    ctx = build_metadata_snapshot(
+        conn, generation_run_id="genrun_status", refs=_REFS, read_scope_hash="sha256:scope")
+    by_field = {i.field_or_fact_type: i for i in ctx.items() if i.graph_ref == _BAL_OBJ}
+    # a GOVERNED, hash-verified additivity seals status="resolved" / authority="governed"
+    assert by_field["additivity"].status == "resolved"
+    assert by_field["additivity"].authority == "governed"
+    # a hint-by-policy field never seals governed — it seals "not_operational"
+    assert by_field["unit"].status == "not_operational"
+    assert by_field["unit"].authority == "hint"
+    # the sealed status rides in the persisted authority_json (and is part of the item_hash)
+    (status_json,) = conn.execute(
+        "SELECT authority_json->>'status' FROM catalog_metadata_snapshot_item "
+        "WHERE snapshot_id = %s AND graph_ref = %s AND field_or_fact_type = 'additivity'",
+        (ctx.snapshot_id, _BAL_OBJ)).fetchone()
+    assert status_json == "resolved"
+
+
+def test_snapshot_drift_seals_non_governed(conn) -> None:
+    """THE FIX at the snapshot boundary: the approved additivity decision is ``non_additive`` but the
+    flat graph value DRIFTED to ``additive``. The OLD ``read_column_facts`` still sees governed; C1
+    hash-verifies → the item seals ``status="hash_mismatch"`` / ``authority="hint"`` (NON-governed),
+    so a drifted value can never seal (or be served downstream) as a false governed."""
+    _rr(conn)
+    _col(conn, _BAL_OBJ, "balance", additivity="additive",
+         additivity_decision_id="fde_add_1", schema_name="finance")
+    _govern_additivity(conn, _BAL_REF, "non_additive")   # approved value ≠ flat graph value
+    # OLD-reader CONTROL: the permissive reader still serves GOVERNED-additive at this boundary.
+    old = read_column_facts(conn, _BAL_REF, "additivity")
+    assert old.authority == "governed" and old.value == "additive"
+    ctx = build_metadata_snapshot(
+        conn, generation_run_id="genrun_drift", refs=[(_SRC, _BAL_OBJ)],
+        read_scope_hash="sha256:scope")
+    add = next(i for i in ctx.items() if i.field_or_fact_type == "additivity")
+    assert add.status == "hash_mismatch"
+    assert add.authority == "hint"            # sealed NON-governed
+    assert add.value is None                  # no operational value served on a drifted read
+    assert add.decision_event_id is None      # provenance dropped for a non-governed seal
+    (status_json,) = conn.execute(
+        "SELECT authority_json->>'status' FROM catalog_metadata_snapshot_item "
+        "WHERE snapshot_id = %s AND field_or_fact_type = 'additivity'",
+        (ctx.snapshot_id,)).fetchone()
+    assert status_json == "hash_mismatch"
+    # facts() served downstream (C2-C4) reflects the C1 status — a hint, not a false governed
+    assert ctx.facts(_SRC, _BAL_OBJ, "additivity").authority == "hint"
+
+
 def test_unknown_field_is_skipped_not_fabricated(conn) -> None:
     _rr(conn)
     _seed_graph(conn)
