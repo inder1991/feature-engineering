@@ -119,3 +119,37 @@ TDD (tests written failing-first, in `LineageView.test.tsx`):
 Gate: full `npx vitest run --pool=forks` green, `tsc -b` clean, oxlint clean on touched files.
 Deploy: rebuild `featuregen-frontend:local`, `kind load`, rollout restart, verify on the running
 demo (`http://localhost:8080`) by clicking Graph on `cif_id`.
+
+## 6. Product review addendum (2026-07-21, head-of-product pass)
+
+Verdict: ship §3 as scoped, with one copy amendment, and open two product decisions it surfaced.
+
+**6.1 The empty state is the primary state, and we already have the data to make it live.**
+Governance is deliberately slow (two-admin joins, verified entities), so most catalogs spend their
+first weeks with few approved edges — "day one" is not an edge case, it is the adoption period. Two
+grounded corrections to §3.3:
+- The lineage endpoint **already returns pending joins** as `resolved=false` stubs/edges with status
+  (`lineage.py:10`, `:306`), and `LineageView` already has a pending card style (`ln-card--pending`).
+  So when proposals exist, ghost edges draw and the empty state never fires. The §3.3 copy must
+  therefore speak to the *truly-nothing* state and say that proposals will appear here automatically:
+  "No joins proposed or approved yet. Proposals appear here after uploads are enriched; approvals
+  happen on the Governance screen."
+- Success metric for this page: the share of empty-state visits that click through to Governance or
+  Workbench. The empty state is an activation surface, not an apology.
+
+**6.2 Open decision: three overlapping actions, two graphs.** A search row offers Details (dossier +
+its own proposed-vs-verified mini graph), Graph (this view), and Impact (impacted-features lookup).
+They all answer variants of "can I trust this column and what depends on it" — a compliance analyst
+cannot predict which to click. Proposal to decide separately: fold Impact into the Graph page (it is
+the features layer, downstream direction) or into Details; label actions by the question they answer
+("What is this?" / "What's connected?" / "What breaks?"); and unify the proposed-vs-verified visual
+encoding across both graphs so trust semantics look identical everywhere.
+
+**6.3 The demo must reach the "after" picture.** With one table, even the perfect design shows an
+honest empty page. The aha moment — the first approved `cif_id` join lighting up between
+transactions and a customer master — requires a second uploaded catalog and a two-admin approval
+walk-through. Script that into the demo path; it is the product moment this page exists for.
+
+**6.4 Cap ordering refinement.** §3.2's priority (anchored, then edge-endpoint columns) is right;
+within "the rest", prefer governed/grain/entity-key columns over file order — the 8 visible rows
+should be the 8 most decision-relevant, not the first 8 in the CSV.
