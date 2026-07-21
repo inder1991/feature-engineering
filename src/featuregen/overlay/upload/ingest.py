@@ -692,7 +692,12 @@ def _run_semantic_binding_proposal_stage(conn, proposable: list, *, actor) -> tu
     from featuregen.overlay.upload.semantic_bindings.propose import propose as _sb_propose
     from featuregen.overlay.upload.semantic_bindings.store import candidate_id_for
 
-    del actor  # proposals ride the SERVICE proposer so four-eyes holds against a human confirmer
+    # Proposals ride the SERVICE proposer so four-eyes holds against a human confirmer — but the
+    # VALUE is authored by the uploaded file, so the uploading HUMAN is recorded as provenance
+    # (`source_uploader`) and barred from confirming their own declared binding (program-audit F2:
+    # without this, one platform-admin could upload a file declaring a governed binding and then
+    # confirm it single-handedly — field_correction's M-7 SOURCE-provenance hole on this surface).
+    uploader = actor.subject if getattr(actor, "actor_kind", None) == "human" else None
     proposed = abstained = 0
     for candidate_set_id, strong in proposable:
         if not candidate_set_id:
@@ -700,7 +705,7 @@ def _run_semantic_binding_proposal_stage(conn, proposable: list, *, actor) -> tu
         for cand in strong:
             cid = candidate_id_for(cand, candidate_set_id=candidate_set_id)
             outcome = _sb_propose(conn, cand, candidate_id=cid, actor=_ENRICH_ACTOR,
-                                  idempotency_key=cid)
+                                  idempotency_key=cid, source_uploader=uploader)
             if outcome.accepted:
                 proposed += 1
             else:
@@ -1974,7 +1979,10 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
                 # Key the advisory table ref + its projection under the SAME schema the glossary
                 # columns use (a non-public schema for an FTR glossary; public for a technical
                 # upload) so readiness sees ONE (schema, table) pair per physical table.
-                # Propose under the SERVICE actor so a human confirmer later satisfies four-eyes.
+                # Propose under the SERVICE actor so a human confirmer later satisfies four-eyes;
+                # the uploading HUMAN is recorded as `source_uploader` so the confirm gate bars the
+                # file's author from single-handedly confirming the grain/availability their own
+                # upload shaped (program-audit F10 — same rule as the semantic-binding surface).
                 # The SAME collector threads in so the [F9] staling flips land on the records the
                 # accept appended (prior_value_staled is live on the ingest path, not just tests):
                 # `now` is the same threaded round timestamp resolve_and_project uses below, so
@@ -1983,7 +1991,11 @@ def ingest_upload(conn, catalog_source: str, rows: list[CanonicalRow], *,
                 _propose_table_facts(conn, catalog_source, syntheses, actor=_ENRICH_ACTOR,
                                      source_snapshot_id=synth_snapshot,
                                      schema_by_table=schema_by_table,
-                                     dispositions=dispositions, now=now)
+                                     dispositions=dispositions, now=now,
+                                     source_uploader=(
+                                         actor.subject
+                                         if getattr(actor, "actor_kind", None) == "human"
+                                         else None))
                 # Project the advisory table fields' DISPLAY. resolve_and_project is otherwise
                 # called ONLY over glossary COLUMN refs (_ingest_glossary_evidence); table refs need
                 # this explicit call or table_role/primary_entity/event_or_snapshot never project

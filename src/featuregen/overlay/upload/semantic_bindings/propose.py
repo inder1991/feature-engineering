@@ -69,6 +69,7 @@ def _subject_ref(candidate: SemanticBindingCandidate) -> CatalogObjectRef:
 
 def to_fact_command(
     candidate: SemanticBindingCandidate, *, actor: IdentityEnvelope, idempotency_key: str,
+    source_uploader: str | None = None,
 ) -> Command:
     """PURE map: a candidate → E1's ``propose_fact`` command (a DRAFT proposal, server-minted, NEVER
     verified). Raises ``ValueError`` on a mis-shaped candidate (currency without a target / entity
@@ -91,10 +92,15 @@ def to_fact_command(
         fact_type = ENTITY_ASSIGNMENT
     else:
         raise ValueError(f"unknown binding_kind {candidate.binding_kind!r}")
+    args: dict[str, object] = {"ref": ref, "fact_type": fact_type, "proposed_value": value}
+    # SOURCE-provenance four-eyes (program-audit F2): the candidate's value is authored by the
+    # uploaded file; recording the uploading human on the SERVICE proposal lets `confirm_fact`
+    # bar that human from confirming their own declared binding.
+    if source_uploader:
+        args["source_uploader"] = source_uploader
     return Command(
         action="propose_fact", aggregate="overlay_fact", aggregate_id=None,
-        args={"ref": ref, "fact_type": fact_type, "proposed_value": value},
-        actor=actor, idempotency_key=idempotency_key)
+        args=args, actor=actor, idempotency_key=idempotency_key)
 
 
 def propose(
@@ -104,6 +110,7 @@ def propose(
     candidate_id: str,
     actor: IdentityEnvelope,
     idempotency_key: str,
+    source_uploader: str | None = None,
     propose_fact: Callable[[DbConn, Command], CommandResult] = _propose_fact,
 ) -> ProposeOutcome:
     """Propose a ``strong`` candidate as an E1 DRAFT fact, then link it. Order matters: the
@@ -116,7 +123,8 @@ def propose(
             accepted=False, fact_key=None, proposed_event_id=None, linked=False,
             denied_reason=f"not proposable (disposition={candidate.disposition!r}; "
                           "only strong/confirmed candidates are proposed)")
-    command = to_fact_command(candidate, actor=actor, idempotency_key=idempotency_key)
+    command = to_fact_command(candidate, actor=actor, idempotency_key=idempotency_key,
+                              source_uploader=source_uploader)
     result = propose_fact(conn, command)
     if not result.accepted:
         return ProposeOutcome(accepted=False, fact_key=result.aggregate_id or None,

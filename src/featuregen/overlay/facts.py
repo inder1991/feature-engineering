@@ -271,6 +271,12 @@ OVERLAY_EVENT_SCHEMAS: dict[str, dict] = {
             "proposal_fingerprint": _STR,
             "evidence_ref": _NSTR,
             "proposed_by": _STR,  # the actor subject STRING, not an object
+            # `source_uploader` (optional; additive like `note`/`category`): the uploading HUMAN
+            # principal behind an ingest-authored SERVICE proposal (semantic bindings / Pass B
+            # grain-availability). Confirm-side four-eyes bars this subject from confirming a
+            # value their own upload declared (program-audit F2/F10). NOT required — pre-existing
+            # PROPOSED events lack the key entirely.
+            "source_uploader": _STR,
         },
         [
             "catalog_object_ref",

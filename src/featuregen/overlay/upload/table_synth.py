@@ -560,15 +560,19 @@ def _propose_table_facts(conn, source: str, syntheses: dict[str, dict], *, actor
                          source_snapshot_id: str,
                          schema_by_table: dict[str, str] | None = None,
                          dispositions: list[dict] | None = None,
-                         now: datetime | None = None) -> None:
+                         now: datetime | None = None,
+                         source_uploader: str | None = None) -> None:
     """Route Pass B grain/availability candidates into governed PROPOSED-only facts and advisory
     table-field evidence. Fail-soft (never aborts the upload). Skips QUIETLY only when a stronger
     active claim governs the key (VERIFIED / a pending proposal); otherwise lets propose_fact
     adjudicate re-proposal after a terminal state, logging any denial as a conflict diagnostic.
 
     ``actor`` MUST be the service actor (``_ENRICH_ACTOR``) so a human confirmer later satisfies
-    four-eyes. ``source_snapshot_id`` keys producer-scoped staleness for the advisory evidence (a
-    NOT-NULL column).
+    four-eyes. ``source_uploader`` is the uploading HUMAN principal's subject (or None): the
+    grain/availability operands are shaped by the uploader's own file, so the proposal records that
+    principal and ``confirm_fact`` bars them from confirming it single-handedly (program-audit F10
+    — the same M-7 SOURCE-provenance rule as the semantic-binding surface). ``source_snapshot_id``
+    keys producer-scoped staleness for the advisory evidence (a NOT-NULL column).
 
     ``schema_by_table`` maps a NORMALIZED table name to the real (non-public) schema its glossary
     column decisions are keyed under. The advisory table-field evidence MUST be keyed under that SAME
@@ -638,9 +642,13 @@ def _propose_table_facts(conn, source: str, syntheses: dict[str, dict], *, actor
                 continue
             try:
                 # Command needs ALL 6 fields (envelopes.py); mirror _propose_governed_joins exactly.
+                # `source_uploader` (when a human uploaded) is the F10 four-eyes provenance.
+                args: dict[str, object] = {"ref": ref, "fact_type": fact_type,
+                                           "proposed_value": value}
+                if source_uploader:
+                    args["source_uploader"] = source_uploader
                 result = propose_fact(conn, Command(
-                    "propose_fact", "overlay_fact", None,
-                    {"ref": ref, "fact_type": fact_type, "proposed_value": value},
+                    "propose_fact", "overlay_fact", None, args,
                     actor, proposal_fingerprint(value)))
                 if result.accepted:
                     counters.incr(f"overlay.table_synth.{fact_type}.proposed")

@@ -214,3 +214,22 @@ def proposer_ne_confirmer(stream: Sequence, actor: IdentityEnvelope) -> bool:
             proposed_by = e.payload.get("proposed_by")
             return proposed_by != actor.subject
     return True
+
+
+def uploader_ne_confirmer(stream: Sequence, actor: IdentityEnvelope) -> bool:
+    """SOURCE-provenance four-eyes SoD predicate (program-audit F2/F10 — the `field_correction`
+    M-7 standard replicated onto the overlay fact surfaces): True when the confirmer is NOT the
+    recorded UPLOADING principal of the latest proposal.
+
+    An ingest-authored governed value (a semantic binding / a Pass B grain-availability fact) is
+    proposed under the SERVICE enrichment actor — so `proposer_ne_confirmer` trivially passes for
+    every human — but the VALUE was authored by the human who uploaded the file that declared it.
+    That principal is recorded as `source_uploader` on the proposal payload; barring them here
+    closes the single-actor upload->confirm round-trip (one human authoring AND approving a
+    governed value). A proposal WITHOUT the field (a human correction, a profiler proposal,
+    pre-existing streams) has no upload provenance to enforce -> True."""
+    for e in reversed(list(stream)):
+        if e.type == "OVERLAY_FACT_PROPOSED":
+            uploader = e.payload.get("source_uploader")
+            return uploader is None or uploader != actor.subject
+    return True

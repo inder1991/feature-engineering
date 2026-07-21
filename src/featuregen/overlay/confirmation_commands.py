@@ -27,6 +27,7 @@ from featuregen.overlay.authority import (
     _actor_is_authority,
     proposer_ne_confirmer,
     resolve_authority,
+    uploader_ne_confirmer,
 )
 from featuregen.overlay.catalog import current_catalog_adapter
 from featuregen.overlay.config import current_overlay_config
@@ -109,6 +110,17 @@ def confirm_fact(conn: DbConn, cmd: Command) -> CommandResult:
     if not proposer_ne_confirmer(stream, cmd.actor):
         return _deny_audited(
             conn, cmd, key, "four-eyes: a proposer may not confirm the same fact"
+        )
+    # Program-audit F2/F10 (the M-7 SOURCE-provenance standard): a service-proposed fact whose
+    # value was AUTHORED by the uploading human (recorded as `source_uploader` on the proposal —
+    # semantic bindings + Pass B grain/availability) may not be confirmed by that same human.
+    # `proposed_by` is the service actor, so the check above cannot see them; this one does. Any
+    # OTHER authorized human single-confirms exactly as before (two distinct humans, not dual).
+    if not uploader_ne_confirmer(stream, cmd.actor):
+        return _deny_audited(
+            conn, cmd, key,
+            "four-eyes: the uploading principal who declared this value may not confirm it; "
+            "a different reviewer must confirm",
         )
     proposed = _latest_proposed(stream)
     # The confirmer may override the value on a REVERIFY/STALE correction. Validate the FINAL value
