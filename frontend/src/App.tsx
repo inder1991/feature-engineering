@@ -134,6 +134,15 @@ const ICONS: Record<Route, ReactElement> = {
       <path d="M2.75 13.5h10.5" />
     </NavIcon>
   ),
+  // A detail sheet: one catalog asset opened to its sections. Not a top-nav tab (absent from PAGES,
+  // so this icon is never rendered in the rail) — the asset route is reached via a Details action —
+  // but ICONS is an exhaustive Record<Route> so every route keeps an entry (mirrors 'gate').
+  asset: (
+    <NavIcon>
+      <rect x="3.25" y="2.75" width="9.5" height="10.5" rx="1.25" />
+      <path d="M5.5 5.75h5M5.5 8h5M5.5 10.25h3" />
+    </NavIcon>
+  ),
 }
 
 const PAGES: { route: Route; label: string; eyebrow: string; title: string; description: string }[] = [
