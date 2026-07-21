@@ -36,7 +36,7 @@ row must not take down the whole governance queue.
 from __future__ import annotations
 
 import logging
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 
 from featuregen.contracts import Command, DbConn
 from featuregen.contracts.identity import IdentityEnvelope
@@ -55,6 +55,7 @@ from featuregen.overlay.identity import (
 )
 from featuregen.overlay.state import fold_overlay_state
 from featuregen.overlay.store import load_fact
+from featuregen.overlay.upload.read_scope import allowed_sensitivities
 from featuregen.runtime.observability import counters
 from featuregen.security.audit import record_denial
 
@@ -157,9 +158,38 @@ def _effective_value(state, stream) -> object | None:
     return proposed.payload.get("proposed_value") if proposed else None
 
 
-def _build_view(conn: DbConn, key: str, want_source: str) -> dict | None:
-    """ONE binding view for ``key``, or None when it is filtered (another source, terminal REJECTED)
-    or structurally corrupt (empty stream / undecodable / non-semantic ref — counted + logged)."""
+def _column_hidden(conn: DbConn, source: str, table: str | None, column: str | None,
+                   allowed: list[str]) -> bool:
+    """READ-SCOPE (audit finding [1], the E2 existence-oracle + write-bypass fix): True iff the
+    subject/target column's ``graph_node`` row EXISTS and carries a sensitivity these roles can't see
+    (:func:`allowed_sensitivities`) — the SAME fail-closed scope the F0 asset-detail + F3
+    field-correction peers apply, so this surface can never list or mutate a governed binding on a
+    column those peers 404. The public-flattened ``public.<table>.<column>`` object_ref is the form
+    ``build_graph`` writes (mirrors ``semantic_bindings.projection._col_endpoint``).
+
+    A column with NO graph_node row is NOT hidden: the sensitivity tag lives ONLY on graph_node, so a
+    hidden PII column ALWAYS has a row (with its 'pii'/'restricted' tag) and is dropped — while a
+    column with no row carries nothing sensitivity-restricted to leak (mirrors
+    ``readiness._read_scoped_refs``'s KEEP-if-absent rule), so a binding proposed before/without its
+    subject being ingested stays listable rather than being over-dropped."""
+    if not table or not column:
+        return False
+    row = conn.execute(
+        "SELECT sensitivity FROM graph_node WHERE catalog_source = %s AND object_ref = %s "
+        "AND kind = 'column'",
+        (_norm(source), f"public.{_norm(table)}.{_norm(column)}")).fetchone()
+    if row is None:
+        return False
+    sensitivity = row[0]
+    return sensitivity is not None and sensitivity not in allowed
+
+
+def _build_view(conn: DbConn, key: str, want_source: str,
+                allowed: list[str] | None) -> dict | None:
+    """ONE binding view for ``key``, or None when it is filtered (another source, terminal REJECTED,
+    or — when read-scoped: ``allowed`` is a (possibly empty) sensitivity list, not ``None`` — a
+    subject/currency-target column that fails the fail-closed scope) or structurally corrupt (empty
+    stream / undecodable / non-semantic ref). ``allowed`` is ``None`` for the UNSCOPED legacy path."""
     stream = load_fact(conn, key)
     if not stream:
         counters.incr("overlay.semantic_binding_governance.stream_empty")
@@ -185,6 +215,10 @@ def _build_view(conn: DbConn, key: str, want_source: str) -> dict | None:
     status = state.status
     if status not in _PENDING_STATUSES and status != "VERIFIED":
         return None  # REJECTED / None — not listable (terminal / empty)
+    # READ-SCOPE (finding [1]): a binding on a sensitivity-hidden SUBJECT column is DROPPED — absent
+    # from the list with no count/id/existence leak, indistinguishable from a binding that isn't there.
+    if allowed is not None and _column_hidden(conn, want_source, ref.table, ref.column, allowed):
+        return None
     fact_type = payload0["fact_type"]
     effective = _effective_value(state, stream)
     subject = {"schema": ref.schema, "table": ref.table, "column": ref.column}
@@ -192,6 +226,11 @@ def _build_view(conn: DbConn, key: str, want_source: str) -> dict | None:
     entity_id = None
     if fact_type == CURRENCY_BINDING and isinstance(effective, Mapping):
         cc = effective.get("currency_column") or {}
+        # A currency binding also NAMES its currency-target column — drop the whole binding if that
+        # target column is hidden, so no hidden column leaks via the target ref either.
+        if allowed is not None and _column_hidden(conn, want_source, cc.get("table"),
+                                                  cc.get("column"), allowed):
+            return None
         target = {"schema": cc.get("schema"), "table": cc.get("table"), "column": cc.get("column")}
     elif fact_type == ENTITY_ASSIGNMENT and isinstance(effective, Mapping):
         entity_id = effective.get("entity_id")
@@ -219,12 +258,21 @@ def _build_view(conn: DbConn, key: str, want_source: str) -> dict | None:
     }
 
 
-def list_semantic_binding_proposals(conn: DbConn, source: str, *, limit: int = 100) -> list[dict]:
+def list_semantic_binding_proposals(conn: DbConn, source: str, *, limit: int = 100,
+                                    roles: Iterable[str] | None = None) -> list[dict]:
     """A source's governed semantic bindings — pending (DRAFT/PARTIALLY_CONFIRMED/REVERIFY/STALE)
     AND VERIFIED — ONE view per ``fact_key``, newest first. See the module docstring for the view
     shape; ``available_actions`` tells the asset UI which of confirm/reject (pending) or reverify/
     withdraw/correct (VERIFIED) the server sanctions for the binding. ``limit`` is clamped to
     1..500. Bad data on one binding is skipped — it never aborts the list.
+
+    READ-SCOPED (audit finding [1]): ``roles`` are the caller's role claims. When passed (the route
+    always does), a binding whose SUBJECT (or currency-TARGET) column is sensitivity-hidden — its
+    ``graph_node`` row absent or carrying a sensitivity these roles can't see (:func:`_column_hidden`,
+    fail-closed like asset_detail's M-5) — is DROPPED, so a platform-admin without pii_reader never
+    sees a governed binding on a PII column the F0/F3 peers already 404 (no count/id/existence leak).
+    ``roles=None`` (the default) is the UNSCOPED legacy path (no filtering) — only internal callers /
+    tests reach it; the route surface is always scoped.
 
     Enumerates from the ``overlay_proposal`` read model (one row per fact_key, carrying
     ``catalog_source`` + ``fact_type``); the projection is DRAINED to head first so a just-proposed
@@ -235,6 +283,7 @@ def list_semantic_binding_proposals(conn: DbConn, source: str, *, limit: int = 1
 
     limit = max(1, min(limit, _LIMIT_MAX))
     want = _norm(source)
+    allowed = allowed_sensitivities(roles) if roles is not None else None
     try:  # bring the read model to head; a poison-halt just stops advancing (best-effort current)
         while run_projection(conn, OverlayProjection()) >= 500:
             pass
@@ -251,7 +300,7 @@ def list_semantic_binding_proposals(conn: DbConn, source: str, *, limit: int = 1
         if key is None or _norm(csource) != want:
             continue
         try:
-            view = _build_view(conn, key, want)
+            view = _build_view(conn, key, want, allowed)
         except Exception:  # noqa: BLE001 — ONE corrupt binding must not abort the whole queue
             counters.incr("overlay.semantic_binding_governance.view_skipped")
             logger.warning("semantic-binding governance: view for fact %s unreadable — skipped",
@@ -313,12 +362,21 @@ def caller_binding_actions(
     return {"status": display, "actions": list(sanctioned) if authorized else []}
 
 
-def load_semantic_binding_confirmation_context(conn: DbConn, fact_key: str) -> dict:
+def load_semantic_binding_confirmation_context(conn: DbConn, fact_key: str, *,
+                                                roles: Iterable[str] | None = None) -> dict:
     """The typed confirm/reject command args for ``fact_key``'s semantic-binding proposal:
     ``{ref, fact_type, use_case, target_event_id}`` (``use_case`` is always None — both types are
     data facts). Raises :class:`SemanticBindingGovernanceNotFound` when the stream is empty, the
     fact is not a governed semantic binding, or the DRAFT ref will not decode to a typed
     ``CatalogObjectRef``.
+
+    READ-SCOPE (audit finding [1], WRITE half): when ``roles`` is passed (the route always does), a
+    binding whose SUBJECT (or currency-TARGET) column is sensitivity-hidden from those roles raises
+    :class:`SemanticBindingGovernanceNotFound` too — so confirm/correct/withdraw/reject/reverify 404
+    BEFORE any command dispatch, mirroring field_correction's I-1 gate. A hidden column is then
+    indistinguishable from a missing one on WRITE as well as read: no existence oracle, no
+    governed-write bypass. ``roles=None`` (the internal reverify/withdraw/correct callers, reached
+    only AFTER the route already scoped) preserves the unscoped bridge.
 
     ``target_event_id`` is ``_cas_target(state)`` — the EXACT id confirm/reject CAS against — never
     a raw stream head: under a re-verify cycle the CAS target is the cycle-stable prior
@@ -337,11 +395,26 @@ def load_semantic_binding_confirmation_context(conn: DbConn, fact_key: str) -> d
         raise SemanticBindingGovernanceNotFound(f"fact {fact_key!r} ref undecodable") from exc
     if not isinstance(ref, CatalogObjectRef):
         raise SemanticBindingGovernanceNotFound(f"fact {fact_key!r} ref is not a typed column ref")
+    state = fold_overlay_state(stream)
+    if roles is not None:
+        allowed = allowed_sensitivities(roles)
+        hidden = _column_hidden(conn, ref.catalog_source, ref.table, ref.column, allowed)
+        if not hidden and fact_type == CURRENCY_BINDING:
+            # A currency binding also WRITES a currency edge onto its target column — refuse if that
+            # target is hidden, so a confirm can't project onto a column the caller can't see.
+            value = _effective_value(state, stream)
+            if isinstance(value, Mapping):
+                cc = value.get("currency_column") or {}
+                hidden = _column_hidden(conn, ref.catalog_source, cc.get("table"),
+                                        cc.get("column"), allowed)
+        if hidden:
+            raise SemanticBindingGovernanceNotFound(
+                f"fact {fact_key!r} is not visible to these roles")
     return {
         "ref": ref,
         "fact_type": fact_type,
         "use_case": None,
-        "target_event_id": _cas_target(fold_overlay_state(stream)),
+        "target_event_id": _cas_target(state),
     }
 
 

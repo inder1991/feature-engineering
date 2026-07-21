@@ -213,6 +213,31 @@ def _render_authority(pred: AuthorityPredicate | None) -> str:
     return "unknown"
 
 
+def _hidden_columns(conn: DbConn, norm_source: str, roles: Iterable[str]) -> set[str]:
+    """The public-flattened ``public.<table>.<column>`` graph_node object_refs whose column carries a
+    sensitivity these ``roles`` can't see (:func:`allowed_sensitivities`) — mirrors
+    :func:`asset_detail._load_anchor`'s predicate. A column with NO graph_node row contributes
+    NOTHING (the sensitivity tag lives only on graph_node, so nothing sensitivity-restricted is known
+    about it), so nothing legitimately-visible is ever over-dropped downstream."""
+    allowed = allowed_sensitivities(roles)
+    return {
+        r[0]
+        for r in conn.execute(
+            "SELECT object_ref FROM graph_node WHERE catalog_source = %s AND kind = 'column' "
+            "AND sensitivity IS NOT NULL AND NOT (sensitivity = ANY(%s))",
+            (norm_source, allowed),
+        ).fetchall()
+    }
+
+
+def _public_flat(ref: str) -> str:
+    """The ``public.<table>[.<column>]`` graph_node object_ref rendering of a logical/evidence ref
+    (public-flattened, mirroring ``logical_ref_of`` / ``build_graph`` / asset_detail) — the key a
+    sensitivity-hidden membership test compares on."""
+    _src, _schema, table, column = parse_ref(ref)
+    return ".".join(["public", table, *([column] if column else [])])
+
+
 def _read_scoped_refs(
     conn: DbConn, norm_source: str, refs: list[str], roles: Iterable[str]
 ) -> list[str]:
@@ -227,25 +252,19 @@ def _read_scoped_refs(
     ``summary_scores`` count — for a caller who can't see it."""
     if not refs:
         return refs
-    allowed = allowed_sensitivities(roles)
-    hidden = {
-        r[0]
-        for r in conn.execute(
-            "SELECT object_ref FROM graph_node WHERE catalog_source = %s AND kind = 'column' "
-            "AND sensitivity IS NOT NULL AND NOT (sensitivity = ANY(%s))",
-            (norm_source, allowed),
-        ).fetchall()
-    }
+    hidden = _hidden_columns(conn, norm_source, roles)
     if not hidden:
         return refs
-    kept: list[str] = []
-    for ref in refs:
-        _src, _schema, table, column = parse_ref(ref)
-        # graph_node object_refs are public-flattened (mirrors logical_ref_of / build_graph).
-        flat = ".".join(["public", table, *([column] if column else [])])
-        if flat not in hidden:
-            kept.append(ref)
-    return kept
+    return [ref for ref in refs if _public_flat(ref) not in hidden]
+
+
+def _pair_hides_column(pair: tuple[str, str], hidden: set[str]) -> bool:
+    """Whether either endpoint of a relationship ``pair`` (``normalize_ref`` column refs) names a
+    sensitivity-hidden column — so the WHOLE pair (and the join it represents) is omitted for a caller
+    who can't see the column, exactly as asset_detail's approved_joins OMIT a join to a hidden
+    endpoint. Prevents a hidden pii column from surfacing as a confirmed/proposed/weak/conflicting
+    pair in the relationship diagnostic."""
+    return any(_public_flat(endpoint) in hidden for endpoint in pair)
 
 
 def _scoped_refs(
@@ -465,7 +484,8 @@ def compute_readiness(
     if tables:
         rel_by_table = {
             (r.schema, r.table): r.status
-            for r in compute_relationship_readiness(conn, source=source, subset=subset)
+            for r in compute_relationship_readiness(
+                conn, source=source, subset=subset, roles=roles)
         }
     for schema, table in tables:
         for fact_name, authority in _PHASE1_UNPROMOTED:
@@ -684,6 +704,7 @@ def compute_relationship_readiness(
     *,
     source: str,
     subset: str | Sequence[str] | None = None,
+    roles: Iterable[str] | None = None,
 ) -> tuple[RelationshipReadiness, ...]:
     """The per-table RELATIONSHIP readiness diagnostic for ``source`` (spec §16) — READ-ONLY.
 
@@ -692,6 +713,13 @@ def compute_relationship_readiness(
     ``"schema.table"`` / unambiguous bare ``"table"`` selector, or an explicit ref list). A subset
     matching NO decided refs returns ``()`` — this view has no blocker vocabulary; use
     :func:`compute_readiness` for the gate-shaped subset_not_found diagnostic.
+
+    ``roles`` is the READ-SCOPE seam (F1 / audit finding [6], default ``None`` = today's unscoped
+    behaviour). A non-None ``roles`` (even an empty iterable) prunes BOTH the table universe
+    (:func:`_scoped_refs`) AND every candidate PAIR that names a sensitivity-hidden column
+    (:func:`_pair_hides_column`), so a hidden sibling column never surfaces as a confirmed / proposed
+    / weak / conflicting pair — and the folded per-table status reflects only the joins the caller can
+    see, exactly as asset_detail's approved_joins OMIT a join to a hidden endpoint.
 
     Derivation per table, from the two candidate stores (:func:`_relationship_candidates`):
 
@@ -708,11 +736,21 @@ def compute_relationship_readiness(
     from featuregen.overlay.store import load_fact
     from featuregen.overlay.upload.passc.lifecycle import _ACTIVE
 
-    tables = _tables_of(_scoped_refs(conn, source=source, subset=subset))
+    tables = _tables_of(_scoped_refs(conn, source=source, subset=subset, roles=roles))
     if not tables:
         return ()
     norm_source = source.strip().lower()
     facts, weak = _relationship_candidates(conn, norm_source)
+    if roles is not None:
+        # Read-scope the PAIRS (finding [6]): drop any fact/weak candidate whose column pair names a
+        # sensitivity-hidden endpoint, so the pair lists AND the folded status never reveal a join the
+        # caller can't see (a table whose only join is on a hidden column reads NO_CANDIDATES).
+        hidden = _hidden_columns(conn, norm_source, roles)
+        if hidden:
+            facts = {fk: entry for fk, entry in facts.items()
+                     if not _pair_hides_column(entry[0], hidden)}
+            weak = {pair: tabs for pair, tabs in weak.items()
+                    if not _pair_hides_column(pair, hidden)}
     status_of_key = {
         fk: fold_overlay_state(load_fact(conn, fk)).status for fk in facts
     }

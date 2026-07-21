@@ -248,6 +248,37 @@ def test_subset_is_schema_aware_and_scope_safe(passc_conn):
         compute_relationship_readiness(passc_conn, source="src", subset="transactions")
 
 
+def test_read_scope_hides_pii_column_pairs(passc_conn):
+    """Audit finding [6]: a join on a sensitivity-hidden column NEVER surfaces as a pair (nor flips
+    the table's status) for a caller who can't see it — the relationship diagnostic omits it exactly
+    as asset_detail's approved_joins omit a join to a hidden endpoint. A pii_reader still sees it;
+    the unscoped (roles=None) default is unchanged."""
+    # Both tables enter the universe via a VISIBLE sibling column (id) — so they survive the ref
+    # prune — while the JOIN itself is on a pii-hidden column (ssn).
+    _seed_table(passc_conn, "transactions", "id")
+    _seed_table(passc_conn, "customers", "id")
+    for table in ("transactions", "customers"):
+        passc_conn.execute(
+            "INSERT INTO graph_node (catalog_source, object_ref, kind, table_name, column_name, "
+            "data_type, sensitivity) VALUES ('src', %s, 'column', %s, 'ssn', 'text', 'pii')",
+            (f"public.{table}.ssn", table))
+    _ledger_insert(passc_conn, _weak_evidence(column="ssn"), lifecycle="weak")
+
+    # A non-pii caller: the pii pair is OMITTED -> both tables read no_candidates, ssn never named.
+    scoped = compute_relationship_readiness(passc_conn, source="src", roles=())
+    assert {r.table: r.status for r in scoped} == {
+        "transactions": RelationshipStatus.NO_CANDIDATES,
+        "customers": RelationshipStatus.NO_CANDIDATES}
+    assert all("ssn" not in p for r in scoped for p in r.weak_pairs)
+    # A pii_reader: the weak pair on ssn is visible.
+    seen = compute_relationship_readiness(passc_conn, source="src", roles=("pii_reader",))
+    assert {r.status for r in seen} == {RelationshipStatus.WEAK_CANDIDATES_ONLY}
+    assert any("ssn" in p for r in seen for p in r.weak_pairs)
+    # Unscoped (roles=None) preserves today's behaviour.
+    assert {r.status for r in compute_relationship_readiness(passc_conn, source="src")} == {
+        RelationshipStatus.WEAK_CANDIDATES_ONLY}
+
+
 def test_catalog_scope_reports_every_table_and_unknown_subset_is_empty(passc_conn):
     _seed_table(passc_conn, "transactions", "cif_id")
     _seed_table(passc_conn, "customers", "cif_id")

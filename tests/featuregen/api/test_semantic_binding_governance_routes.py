@@ -80,6 +80,19 @@ def overlay_env(conn):
 
 # ── seed helpers (real propose path, service proposer → platform-admin governance queue) ──────────
 
+def _seed_src_graph(conn, source="src"):
+    """graph_node rows for every column the seeded bindings reference. The F1 read-scope gate is
+    fail-closed (asset_detail M-5: the endpoint row must EXIST and pass scope), so a binding whose
+    subject/target has no graph_node row is hidden from the scoped routes — production bindings
+    always have one (D2 shortlists FROM graph_node)."""
+    build_graph(conn, source, [
+        CanonicalRow(source, "party", "cust_id", "text"),
+        CanonicalRow(source, "trades", "notional", "numeric"),
+        CanonicalRow(source, "trades", "ccy", "text"),
+        CanonicalRow(source, "trades", "settle_ccy", "text"),
+    ])
+
+
 def _entity_ref(source="src", table="party", column="cust_id") -> CatalogObjectRef:
     return CatalogObjectRef(source, "column", "public", table, column)
 
@@ -152,6 +165,41 @@ def test_get_lists_pending_and_verified_with_actions(client, seeded_currency, co
 def test_get_excludes_other_sources(client, seeded_currency):
     r = client.get("/sources/some-other-source/governance/semantic-bindings", headers=_h("priya"))
     assert r.status_code == 200 and r.json()["proposals"] == []
+
+
+def _tag_pii(conn, source, table, column):
+    """Tag the column's graph_node row sensitivity='pii' (the form build_graph writes: object_ref
+    'public.<table>.<column>'), so the read-scope filter treats it as hidden from a non-pii caller."""
+    conn.execute(
+        "INSERT INTO graph_node (catalog_source, object_ref, kind, table_name, column_name, "
+        "data_type, sensitivity) VALUES (%s, %s, 'column', %s, %s, 'text', 'pii') "
+        "ON CONFLICT (catalog_source, object_ref) DO UPDATE SET sensitivity = 'pii'",
+        (source, f"public.{table}.{column}", table, column))
+
+
+def test_pii_subject_binding_read_scoped_on_list_and_write(client, seeded_entity, conn):
+    """Audit finding [1] CRITICAL: a governed entity_assignment on a hidden pii SUBJECT column is
+    ABSENT from the list (no count / id / existence leak) AND 404s on confirm / correct / reject for
+    a platform-admin WITHOUT pii_reader — hidden is indistinguishable from missing on read AND write,
+    closing the E2 existence-oracle + governed-write-bypass. A pii_reader sees it and can act."""
+    _ref, key = seeded_entity                          # subject = public.party.cust_id, source 'src'
+    _tag_pii(conn, "src", "party", "cust_id")          # the subject column is now pii-hidden
+
+    admin = _h("priya")                                # platform-admin, NO pii_reader
+    listing = client.get("/sources/src/governance/semantic-bindings", headers=admin)
+    assert listing.status_code == 200 and listing.json()["proposals"] == []   # no existence leak
+    for action, body in (("confirm", {}), ("correct", {"value": {"entity_id": "customer"}}),
+                         ("reject", {"category": "wrong_entity"}), ("reverify", {}),
+                         ("withdraw", {"category": "no_longer_valid"})):
+        r = client.post(f"/governance/semantic-bindings/{key}/{action}", json=body, headers=admin)
+        assert r.status_code == 404, (action, r.text)  # hidden == missing on WRITE (pre-dispatch)
+
+    pii_admin = _h("priya", roles="platform-admin,pii_reader")
+    listing = client.get("/sources/src/governance/semantic-bindings", headers=pii_admin)
+    assert [p["fact_key"] for p in listing.json()["proposals"]] == [key]   # visible to pii_reader
+    r = client.post(f"/governance/semantic-bindings/{key}/confirm", json={}, headers=pii_admin)
+    assert r.status_code == 200, r.text
+    assert r.json()["governance_status"] == "VERIFIED"
 
 
 def test_get_non_admin_403(client):

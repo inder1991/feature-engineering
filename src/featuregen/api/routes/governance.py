@@ -323,13 +323,16 @@ def reject_table_fact(fact_key: str, body: RejectTableFactRequest, conn: _Conn,
 # the reverify/withdraw/correct service; the route claim gate stays require_confirmer (like peers).
 
 
-def _load_semantic_binding_context_or_404(conn: psycopg.Connection, fact_key: str) -> dict:
-    """The fact_type-VALIDATED context bridge: a fact_key that is not a loadable
-    entity_assignment/currency_binding proposal 404s BEFORE any command dispatch, so this surface
-    can never be used to approve a join / grain / policy fact."""
+def _load_semantic_binding_context_or_404(conn: psycopg.Connection, fact_key: str,
+                                          roles) -> dict:
+    """The fact_type-VALIDATED + READ-SCOPED context bridge: a fact_key that is not a loadable
+    entity_assignment/currency_binding proposal — OR one whose subject/currency-target column is
+    sensitivity-hidden from the caller's ``roles`` (audit finding [1]) — 404s BEFORE any command
+    dispatch, so this surface can never approve a join/grain/policy fact NOR mutate a governed
+    binding on a column the read-scoped F0/F3 peers deny the same caller."""
     ensure_upload_catalog_adapter()
     try:
-        return load_semantic_binding_confirmation_context(conn, fact_key)
+        return load_semantic_binding_confirmation_context(conn, fact_key, roles=roles)
     except SemanticBindingGovernanceNotFound:
         raise HTTPException(status_code=404,
                             detail="No such semantic-binding proposal.") from None
@@ -337,10 +340,13 @@ def _load_semantic_binding_context_or_404(conn: psycopg.Connection, fact_key: st
 
 @router.get("/sources/{source}/governance/semantic-bindings",
             dependencies=[Depends(require_confirmer)])
-def list_semantic_bindings(source: str, conn: _Conn,
+def list_semantic_bindings(source: str, conn: _Conn, identity: _Identity,
                            limit: int = Query(default=100, ge=1, le=500)) -> dict:
     ensure_upload_catalog_adapter()
-    proposals = list_semantic_binding_proposals(conn, source, limit=limit)
+    # READ-SCOPED (finding [1]): the caller's role_claims drop any binding on a sensitivity-hidden
+    # subject/currency-target column, so a platform-admin without pii_reader gets no existence oracle.
+    proposals = list_semantic_binding_proposals(
+        conn, source, limit=limit, roles=identity.role_claims)
     return {"source": source.strip().lower(), "proposals": proposals, "next_cursor": None}
 
 
@@ -352,7 +358,7 @@ def confirm_semantic_binding(fact_key: str, body: ConfirmSemanticBindingRequest,
     E1's confirm_fact (which triggers E3's projection). SINGLE authorized confirmer (owner-or-admin,
     E1), four-eyes preserved: the proposer (the D2 service candidate, or the correcting human) can
     never be the confirmer. Reports the operational projection honestly ("projected"/"pending")."""
-    ctx = _load_semantic_binding_context_or_404(conn, fact_key)
+    ctx = _load_semantic_binding_context_or_404(conn, fact_key, identity.role_claims)
     cmd = Command(
         action="confirm_fact", aggregate="overlay_fact", aggregate_id=fact_key,
         args={"ref": ctx["ref"], "fact_type": ctx["fact_type"], "use_case": ctx["use_case"],
@@ -379,7 +385,7 @@ def confirm_semantic_binding(fact_key: str, body: ConfirmSemanticBindingRequest,
              dependencies=[Depends(require_confirmer)])
 def reject_semantic_binding(fact_key: str, body: RejectSemanticBindingRequest, conn: _Conn,
                             identity: _Identity) -> dict:
-    ctx = _load_semantic_binding_context_or_404(conn, fact_key)
+    ctx = _load_semantic_binding_context_or_404(conn, fact_key, identity.role_claims)
     # `category` is a first-class field on OVERLAY_FACT_REJECTED (a reliable analytics key);
     # `reason` carries ONLY the free-text note (or None) — same shape as the join/table-fact reject.
     cmd = Command(
@@ -408,7 +414,7 @@ def reverify_semantic_binding(fact_key: str, body: ReverifySemanticBindingReques
     platform ``proposer ≠ confirmer`` rule ONLY (reverify does not re-propose, so the requester/original
     confirmer may re-confirm); use the correct route to force a genuinely distinct human."""
     del body  # a bounded reviewer note field is accepted for surface symmetry; not persisted here
-    _load_semantic_binding_context_or_404(conn, fact_key)  # 404 opaque before any state change
+    _load_semantic_binding_context_or_404(conn, fact_key, identity.role_claims)  # 404 opaque before any state change
     result = request_reverify(conn, fact_key=fact_key, actor=identity)
     if not result["accepted"]:
         return JSONResponse(status_code=409,
@@ -423,7 +429,7 @@ def withdraw_semantic_binding(fact_key: str, body: WithdrawSemanticBindingReques
                               identity: _Identity) -> dict:
     """Retire a VERIFIED binding → REJECTED + demote (restore the file entity / demote the currency
     edge). Dispatches through the overlay reject_fact after the sanctioned reverify reopen."""
-    _load_semantic_binding_context_or_404(conn, fact_key)
+    _load_semantic_binding_context_or_404(conn, fact_key, identity.role_claims)
     result = withdraw_binding(conn, fact_key=fact_key, actor=identity,
                               category=body.category, note=_clean(body.note))
     if not result["accepted"]:
@@ -440,7 +446,7 @@ def correct_semantic_binding(fact_key: str, body: CorrectSemanticBindingRequest,
     """Correct a VERIFIED binding: retire the prior value and open a NEW proposal for the corrected
     value — requiring a DIFFERENT authorized human to confirm (four-eyes: the correcting human is
     the proposer). The corrected value is validated against the E1 write gate before any retire."""
-    _load_semantic_binding_context_or_404(conn, fact_key)
+    _load_semantic_binding_context_or_404(conn, fact_key, identity.role_claims)
     result = correct_binding(conn, fact_key=fact_key, actor=identity,
                              value=body.value, note=_clean(body.note))
     if not result["accepted"]:

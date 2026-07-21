@@ -179,3 +179,29 @@ def test_readiness_routes_require_catalog_read(client):
         assert client.get(path, headers=_h(roles="access_admin")).status_code == 403
         # catalog_viewer holds catalog:read -> 200 (an empty source is a valid, trivial verdict)
         assert client.get(path, headers=_h(roles="catalog_viewer")).status_code == 200
+
+
+# ── (4) READ-SCOPE: the standalone routes thread the caller's roles (audit finding [6]) ───────────
+
+
+def test_readiness_route_is_read_scoped_on_hidden_columns(client, conn):
+    """Audit finding [6]: the standalone /readiness route no longer NAMES a hidden pii column for a
+    non-pii caller (its field/advisory requirement is pruned — no requirement_id / advisory gap /
+    count leaks it), yet a pii_reader still sees it. Proves the route threads role_claims into
+    compute_readiness (roles=None=UNSCOPED before the fix)."""
+    import json
+    # A visible column + a pii-hidden sibling, each with a decided policy field (readiness universe).
+    for col, sensitivity in (("amount", None), ("ssn", "pii")):
+        conn.execute(
+            "INSERT INTO graph_node (catalog_source, object_ref, kind, table_name, column_name, "
+            "data_type, sensitivity) VALUES ('src', %s, 'column', 'people', %s, 'text', %s)",
+            (f"public.people.{col}", col, sensitivity))
+        _seed_universe_table(conn, "people", col)
+
+    def _names_ssn(headers) -> bool:
+        r = client.get("/sources/src/readiness", headers=headers)
+        assert r.status_code == 200, r.text
+        return "ssn" in json.dumps(r.json())
+
+    assert not _names_ssn(_h(roles="catalog_viewer"))            # non-pii: the pii column is absent
+    assert _names_ssn(_h(roles="catalog_viewer,pii_reader"))     # pii_reader: it is named
