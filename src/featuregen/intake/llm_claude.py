@@ -77,6 +77,41 @@ def _map_stop_reason(stop_reason: str) -> str:
     return _STOP_REASON_MAP.get(stop_reason, PROVIDER_NON_RETRYABLE)
 
 
+def _wire_prompt(request: LLMRequest) -> tuple[list[dict] | None, str]:
+    """Split the outbound content into an optional CACHED ``system`` block + the user turn.
+
+    Only the redacted, LLM-safe content reaches the model (§9.4). When the request marks metadata
+    keys CACHEABLE (``cacheable_metadata_keys`` — a large STATIC prefix shared byte-for-byte across
+    every chunk of a wide-table batch, i.e. the ~276-concept classification vocabulary), that block
+    is lifted into a ``system`` text block carrying an ephemeral ``cache_control`` breakpoint.
+    Anthropic prompt caching is a PREFIX match rendered ``tools`` -> ``system`` -> ``messages``, so the
+    vocabulary is sent (and billed at full rate) ONCE; chunks 2..N of the same table reuse the cached
+    prefix at ~0.1x cost and a fraction of the latency, instead of re-sending ~23K input tokens per
+    chunk and blowing the 240s stage deadline. The vocabulary still egresses in full — the metadata a
+    given item classifies is unchanged, so per-item classification is unchanged.
+
+    With no cacheable keys present the ``system`` block is None and the entire payload rides a single
+    user message — byte-for-byte today's rendering (definition/domain batches, single-mode calls, and
+    every non-enrichment caller are unaffected). Pure + SDK-free so the split is unit-testable
+    without importing the provider SDK. Operates on a COPY of the catalog metadata, so
+    ``request.inputs`` (what the egress guard, audit record, and idempotency hash read) is untouched."""
+    intent = request.inputs.get(INPUT_KEY_INTENT, "")
+    catalog = dict(request.inputs.get(INPUT_KEY_CATALOG, {}) or {})
+    cache_keys = [k for k in request.cacheable_metadata_keys if k in catalog]
+    system: list[dict] | None = None
+    if cache_keys:
+        cached = {k: catalog.pop(k) for k in cache_keys}
+        system = [{"type": "text",
+                   "text": f"Shared classification context (names/types/grain only): {cached}",
+                   "cache_control": {"type": "ephemeral"}}]
+    user_content = (
+        f"Structure the following intent for task '{request.task}'.\n"
+        f"Intent (redacted, LLM-safe): {intent}\n"
+        f"Catalog metadata (names/types/grain only): {catalog}"
+    )
+    return system, user_content
+
+
 def _wire_output_config(request: LLMRequest, config: ClaudeConfig) -> dict:
     """Build the `output_config` sent to Anthropic. The canonical strict schema stays the source of
     truth for validating the RESPONSE (the driver's `reg.validate`, unchanged); here we PROJECT it to
@@ -139,12 +174,10 @@ class ClaudeLLM:
 
         model = request.generation_settings.get("model", self._config.model)
         # Only the redacted, LLM-safe content reaches the model (§9.4). The output-schema is
-        # referenced structurally; it carries no PHI/PII (§9.1). See the Adapter Appendix.
-        user_content = (
-            f"Structure the following intent for task '{request.task}'.\n"
-            f"Intent (redacted, LLM-safe): {request.inputs.get(INPUT_KEY_INTENT, '')}\n"
-            f"Catalog metadata (names/types/grain only): {request.inputs.get(INPUT_KEY_CATALOG, {})}"
-        )
+        # referenced structurally; it carries no PHI/PII (§9.1). See the Adapter Appendix. A large
+        # STATIC shared prefix (the concept vocabulary) rides a cached `system` block; the volatile
+        # per-item metadata rides the user turn — see `_wire_prompt` for the caching rationale.
+        system, user_content = _wire_prompt(request)
         try:
             # N11 — ENFORCE structured output: attach the registered structural schema (resolved by
             # call_llm from output_schema_id/version onto request.output_schema) via output_config.format.
@@ -156,14 +189,18 @@ class ClaudeLLM:
             # is PROJECTED to the Anthropic-compatible subset for the wire (canonical stays the
             # response source of truth); the build is a pure, SDK-free, unit-tested helper.
             output_config = _wire_output_config(request, self._config)
-            resp = client.messages.create(
-                model=model,
-                max_tokens=request.generation_settings.get("max_tokens", self._config.max_tokens),
-                thinking={"type": request.generation_settings.get("thinking", self._config.thinking)},
-                output_config=output_config,
-                messages=[{"role": "user", "content": user_content}],
-                timeout=self._config.timeout,   # MF-4 — bound each attempt (retries stay bounded at 2)
-            )
+            create_kwargs = {
+                "model": model,
+                "max_tokens": request.generation_settings.get("max_tokens", self._config.max_tokens),
+                "thinking": {
+                    "type": request.generation_settings.get("thinking", self._config.thinking)},
+                "output_config": output_config,
+                "messages": [{"role": "user", "content": user_content}],
+                "timeout": self._config.timeout,   # MF-4 — bound each attempt (retries bounded at 2)
+            }
+            if system is not None:                 # vocab-caching: a cached shared-prefix system block
+                create_kwargs["system"] = system   # (omitted entirely when there is no static prefix)
+            resp = client.messages.create(**create_kwargs)
         except anthropic.APIStatusError as exc:  # map transport/status failures to the taxonomy
             status = getattr(exc, "status_code", 0)
             if status == 400:

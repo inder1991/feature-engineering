@@ -148,15 +148,18 @@ def _cache_put(conn, cache_table: str, content_hash_: str, value: str, cache_ver
 
 def _call(conn, client: LLMClient, task: str, prompt_id: str, schema_id: str,
           catalog_metadata: dict, out_key: str, instruction: str, actor,
-          dispatch_audit: DispatchAuditContext | None = None) -> str | None:
+          dispatch_audit: DispatchAuditContext | None = None,
+          cacheable_metadata_keys: tuple[str, ...] = ()) -> str | None:
     """Run one GOVERNED enrichment call (attached schema, reserved keys, egress guard, audit record —
     so a real provider works and PII can't leak). Returns None on any failure/empty so a transient
     failure never poisons the cache (M3). ``dispatch_audit`` (C5-T5) threads the ingestion-run
-    attribution context to the single seam; ``None`` is byte-identical."""
+    attribution context to the single seam; ``None`` is byte-identical. ``cacheable_metadata_keys``
+    (vocab-caching) marks a large static shared prefix (the concept vocabulary) so the adapter caches
+    it instead of re-billing it per call; ``()`` (definition/domain) is byte-identical."""
     return audited_enrich_call(
         conn, client, task=task, prompt_id=prompt_id, schema_id=schema_id,
         catalog_metadata=catalog_metadata, out_key=out_key, instruction=instruction, actor=actor,
-        dispatch_audit=dispatch_audit)
+        dispatch_audit=dispatch_audit, cacheable_metadata_keys=cacheable_metadata_keys)
 
 
 def _column_subject(row: CanonicalRow) -> dict:
@@ -426,7 +429,9 @@ def enrich_concepts(conn, rows: list[CanonicalRow], client: LLMClient, actor=Non
                         {**meta_by_hash[h], "vocabulary": _CONCEPT_VOCABULARY}, "concept",
                         "Classify this column into the provided controlled concept vocabulary — choose "
                         "the single best-fitting concept name, or 'unclassified' if none fits.", actor,
-                        _single_ctx(ingestion_run_id, "enrich_concept", _column_subject(by_hash[h])))
+                        _single_ctx(ingestion_run_id, "enrich_concept", _column_subject(by_hash[h])),
+                        # vocab-caching: the vocabulary is the static shared prefix on this call too.
+                        cacheable_metadata_keys=("vocabulary",))
             if raw is None:
                 continue   # failure/empty -> don't cache; retry next ingest (M3)
             # #5: single mode enforces the IDENTICAL response contract as batch (_accept_concept) — a

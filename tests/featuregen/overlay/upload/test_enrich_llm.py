@@ -414,6 +414,66 @@ def test_durable_audit_connection_built_from_settings_dsn(db, monkeypatch):
     assert n == 1                                         # fallback record stays transactional
 
 
+# ---- perf (vocab-caching): the concept vocabulary is a static shared prefix, not per-chunk input --
+
+
+def test_concept_batch_marks_vocabulary_as_shared_cacheable_block(db):
+    """Perf (vocab-caching): the ~276-concept classification vocabulary is a large STATIC prefix,
+    identical across every chunk of a wide-table concept batch. The batch seam must mark it as a
+    single cacheable block on the outbound request (``cacheable_metadata_keys``) so the Anthropic
+    adapter can send it ONCE under ``cache_control`` and chunks 2..N reuse the cached prefix — instead
+    of re-billing ~23K input tokens (and ~37s) per chunk and blowing the 240s stage deadline. The
+    vocabulary still egresses in full, so per-item classification / the vocabulary gate is unchanged."""
+    register_enrichment_schemas(db)
+    vocab = [{"name": f"concept_{i}", "definition": "x" * 40} for i in range(80)]
+    items = [BatchItem("h1", {"table": "accounts", "column": "balance", "type": "numeric"}),
+             BatchItem("h2", {"table": "accounts", "column": "opened_on", "type": "date"})]
+
+    class _BatchCapture:
+        def __init__(self):
+            self.requests = []
+
+        def call(self, request):
+            self.requests.append(request)
+            return LLMResult(output={"results": [{"ref": "h1", "concept": "monetary_amount"},
+                                                 {"ref": "h2", "concept": "event_date"}]},
+                             self_reported_scores={}, call_ref="", status=PROVIDER_OK)
+
+    client = _BatchCapture()
+    audited_batch_call(
+        db, client, task="overlay.enrich.concept", prompt_id="overlay_concept_batch_v1",
+        schema_id="overlay_concept_batch", shared_metadata={"vocabulary": vocab}, items=items,
+        out_key="concept", instruction="Classify each column.", accept=lambda raw: (raw, "valid"))
+    req = client.requests[-1]
+    # the static vocab is marked as the shared cacheable prefix...
+    assert req.cacheable_metadata_keys == ("vocabulary",)
+    # ...and it still egresses in full (per-item correctness / the vocabulary gate is unchanged).
+    assert req.inputs[INPUT_KEY_CATALOG]["vocabulary"] == vocab
+
+
+def test_empty_shared_metadata_marks_nothing_cacheable(db):
+    """A definition/domain batch (no shared vocab) marks NOTHING cacheable — byte-for-byte today's
+    single-user-message rendering, so the caching change is inert where there is no static prefix."""
+    register_enrichment_schemas(db)
+    items = [BatchItem("h1", {"table": "accounts", "column": "balance", "type": "numeric"})]
+
+    class _BatchCapture:
+        def __init__(self):
+            self.requests = []
+
+        def call(self, request):
+            self.requests.append(request)
+            return LLMResult(output={"results": [{"ref": "h1", "concept": "monetary_amount"}]},
+                             self_reported_scores={}, call_ref="", status=PROVIDER_OK)
+
+    client = _BatchCapture()
+    audited_batch_call(
+        db, client, task="overlay.enrich.concept", prompt_id="overlay_concept_batch_v1",
+        schema_id="overlay_concept_batch", shared_metadata={}, items=items, out_key="concept",
+        instruction="Classify each column.", accept=lambda raw: (raw, "valid"))
+    assert client.requests[-1].cacheable_metadata_keys == ()
+
+
 def test_flag_off_no_client_means_no_llm_egress_paths_at_all(db):
     """FLAG-OFF safety: with no LLM provider wired (client=None — the default), ingest never
     touches the enrichment/egress seams: no llm_call rows, no EGRESS_BLOCKED events, upload

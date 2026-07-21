@@ -140,7 +140,11 @@ def _single_fallback(conn, client, *, task, out_key, instruction, item: BatchIte
         schema_id=f"overlay_{single_prompt}", out_key=out_key,
         catalog_metadata={**shared_metadata, **item.metadata}, instruction=instruction, actor=actor,
         prompt_version=prompt_version, schema_version=schema_version,
-        dispatch_audit=dispatch_audit)
+        dispatch_audit=dispatch_audit,
+        # perf (vocab-caching): a batch that degrades to per-item fallback still carries the static
+        # shared_metadata (the concept vocabulary) on every item — mark it as the cached shared prefix
+        # so those fallback calls reuse it too rather than re-billing it each time.
+        cacheable_metadata_keys=tuple(shared_metadata))
     if raw is None:
         return None, FALLBACK_FAILED
     value, _reason = accept(raw)

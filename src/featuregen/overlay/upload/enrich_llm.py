@@ -621,7 +621,8 @@ def audited_structured_call(conn, client: LLMClient, *, task: str, prompt_id: st
                             catalog_metadata: dict, instruction: str,
                             actor: IdentityEnvelope | None = None,
                             prompt_version: int = 1, schema_version: int = 1,
-                            dispatch_audit: DispatchAuditContext | None = None) -> dict | None:
+                            dispatch_audit: DispatchAuditContext | None = None,
+                            cacheable_metadata_keys: tuple[str, ...] = ()) -> dict | None:
     """Run one governed metadata-only call and return the VALIDATED output dict, or None on any egress
     block / non-success. Attaches the registered output-schema (so a real provider does NOT fail closed),
     runs the egress guard, and records one immutable llm_call. The single audited seam for every overlay
@@ -675,7 +676,11 @@ def audited_structured_call(conn, client: LLMClient, *, task: str, prompt_id: st
         task=task, prompt_id=prompt_id, prompt_version=prompt_version, inputs=inputs,
         output_schema_id=schema_id, output_schema_version=schema_version,
         generation_settings=_generation_settings(),   # from env — NOT a hard-coded fake/test
-        output_schema=schema)
+        output_schema=schema,
+        # perf (vocab-caching): the single-mode concept path (and the batch's per-item fallback) also
+        # carry the static vocabulary; mark it as the cached shared prefix so it isn't re-billed per
+        # call. Empty () (definition/domain, contract authoring, feature gen) is byte-for-byte today.
+        cacheable_metadata_keys=cacheable_metadata_keys)
 
     try:
         assert_llm_safe(req)              # §9.4 egress backstop
@@ -733,7 +738,8 @@ def audited_enrich_call(conn, client: LLMClient, *, task: str, prompt_id: str, s
                         catalog_metadata: dict, out_key: str, instruction: str,
                         actor: IdentityEnvelope | None = None,
                         prompt_version: int = 1, schema_version: int = 1,
-                        dispatch_audit: DispatchAuditContext | None = None) -> str | None:
+                        dispatch_audit: DispatchAuditContext | None = None,
+                        cacheable_metadata_keys: tuple[str, ...] = ()) -> str | None:
     """Single-string convenience over `audited_structured_call`: returns the trimmed `out_key` field, or
     None on any egress block / non-success / empty output (so the caller never caches a failure).
     ``prompt_version``/``schema_version`` (default ``1``) thread straight to the structured seam.
@@ -743,7 +749,7 @@ def audited_enrich_call(conn, client: LLMClient, *, task: str, prompt_id: str, s
         conn, client, task=task, prompt_id=prompt_id, schema_id=schema_id,
         catalog_metadata=catalog_metadata, instruction=instruction, actor=actor,
         prompt_version=prompt_version, schema_version=schema_version,
-        dispatch_audit=dispatch_audit)
+        dispatch_audit=dispatch_audit, cacheable_metadata_keys=cacheable_metadata_keys)
     if not out:
         return None
     val = str(out.get(out_key, "")).strip()
@@ -1034,7 +1040,13 @@ def audited_batch_call(conn, client: LLMClient, *, task: str, prompt_id: str, sc
                               raw_input_classification="contains_pii" if all_spans else "clean")
     req = LLMRequest(task=task, prompt_id=prompt_id, prompt_version=prompt_version, inputs=inputs,
                      output_schema_id=schema_id, output_schema_version=schema_version,
-                     generation_settings=_generation_settings(), output_schema=schema)
+                     generation_settings=_generation_settings(), output_schema=schema,
+                     # perf (vocab-caching): the shared_metadata keys (the ~276-concept classification
+                     # vocabulary) are a STATIC prefix identical across every chunk — mark them so the
+                     # adapter sends the block ONCE under cache_control and chunks 2..N reuse it,
+                     # instead of re-billing ~23K input tokens per chunk. Empty shared_metadata
+                     # (definition/domain) -> () -> byte-for-byte today.
+                     cacheable_metadata_keys=tuple(shared_metadata))
 
     try:
         assert_llm_safe(req)                      # batch-level egress backstop (spec C9)
