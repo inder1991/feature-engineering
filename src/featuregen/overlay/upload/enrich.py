@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 
 from featuregen.intake.llm import LLMClient
 from featuregen.overlay.evidence import AssertionStrength, EvidenceProducer
@@ -217,6 +218,46 @@ def _accept_bounded(max_len: int):
     def _accept(raw: str) -> tuple[str | None, str]:
         v = _bounded(raw, max_len)
         return (v, "valid") if v is not None else (None, "invalid_value")
+    return _accept
+
+
+# Internal task/namespace identifiers the enrichment machinery uses. A domain response that ECHOES
+# one of these — or is shaped like one — is prompt-echo garbage, not a business domain (07-17: the
+# model returned its own task name and 'overlay.enrich.domain' was durably cached as a domain).
+_INTERNAL_TASKS = frozenset({_TASK, _DEF_TASK, _DOMAIN_TASK})
+_INTERNAL_NAMESPACE_RE = re.compile(r"^overlay[._]")
+_DOTTED_ID_RE = re.compile(r"[a-z0-9]+(?:\.[a-z0-9]+)+")
+
+
+def _is_task_echo(value: str) -> bool:
+    """True if ``value`` is a prompt/task echo or an internal dotted identifier rather than a real
+    business domain. Domains are OPEN-vocabulary, so this rejects ONLY our own machinery leaking
+    through: an exact internal task id, the reserved ``overlay.``/``overlay_`` namespace, an embedded
+    ``overlay.enrich``, or a bare dotted-lowercase token shaped like a task id (no whitespace). A
+    legitimate label ('Compliance', 'banking_payments_transactions') matches none of these."""
+    low = value.strip().lower()
+    if low in _INTERNAL_TASKS:
+        return True
+    if "overlay.enrich" in low or _INTERNAL_NAMESPACE_RE.match(low):
+        return True
+    # A dotted-lowercase token that IS the whole (whitespace-free) value — task-id-shaped, not a domain.
+    return " " not in low and "\t" not in low and _DOTTED_ID_RE.fullmatch(low) is not None
+
+
+def _accept_domain(max_len: int):
+    """Domain acceptor: a bounded short single-line label (reuses ``_accept_bounded``) that ALSO
+    rejects a prompt/task echo or an internal dotted identifier (``_is_task_echo``). A rejected value
+    is invalid -> treated as failure -> NOT cached (M3), same as any other reject. Domains stay
+    open-vocabulary: no controlled list — only our own task/namespace identifiers are filtered out."""
+    bounded = _accept_bounded(max_len)
+
+    def _accept(raw: str) -> tuple[str | None, str]:
+        value, reason = bounded(raw)
+        if value is None:
+            return None, reason
+        if _is_task_echo(value):
+            return None, "invalid_value"
+        return value, "valid"
     return _accept
 
 
@@ -590,7 +631,7 @@ def classify_domains(conn, rows: list[CanonicalRow], client: LLMClient,
             schema_id="overlay_domain_batch", shared_metadata={}, items=misses, out_key="domain",
             instruction="For each item classify the table's business domain. Return exactly one "
                         "result per input ref; treat each table independently.",
-            accept=_accept_bounded(64), actor=actor,
+            accept=_accept_domain(64), actor=actor,
             deadline_s=enrich_config.stage_deadline_s(),   # MF-4 — bound the source-lock hold
             report=batch_report,
             ingestion_run_id=ingestion_run_id, dispatch_stage="enrich_domain",
@@ -605,18 +646,22 @@ def classify_domains(conn, rows: list[CanonicalRow], client: LLMClient,
         return out
 
     result: dict[str, str] = {}
+    accept_domain = _accept_domain(64)   # same plausibility gate the batch path applies
     for table, cols in by_table.items():
         h = hash_of_table[table]
         if h in cached:
             result[table] = cached[h]
             continue
-        domain = _bounded(_call(conn, client, _DOMAIN_TASK, "overlay_domain_v1", "overlay_domain",
-                                {"table": table, "columns": sorted(cols)}, "domain",
-                                "Classify this table's business domain.", actor,
-                                _single_ctx(ingestion_run_id, "enrich_domain",
-                                            _table_subject(source, table, cols))), 64)
+        raw = _call(conn, client, _DOMAIN_TASK, "overlay_domain_v1", "overlay_domain",
+                    {"table": table, "columns": sorted(cols)}, "domain",
+                    "Classify this table's business domain.", actor,
+                    _single_ctx(ingestion_run_id, "enrich_domain",
+                                _table_subject(source, table, cols)))
+        if raw is None:
+            continue   # provider failure / empty -> don't cache (M3)
+        domain, _reason = accept_domain(raw)
         if domain is None:
-            continue   # failure / empty / over-long / list-stringified -> don't cache (M3/M9)
+            continue   # over-long / multiline / list-stringified / task-echo -> don't cache (M3/M9)
         _cache_put(conn, "enrichment_domain", h, domain, _DOMAIN_CACHE_VERSION)
         result[table] = domain
     return result
