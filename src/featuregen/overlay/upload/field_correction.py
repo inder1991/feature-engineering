@@ -34,7 +34,7 @@ from __future__ import annotations
 
 import hashlib
 from collections.abc import Sequence
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from featuregen.contracts import DbConn
 from featuregen.contracts.envelopes import Command
@@ -53,13 +53,17 @@ from featuregen.overlay.field_evidence import (
     record_field_evidence,
 )
 from featuregen.overlay.upload.column_authority import logical_ref_of
+from featuregen.overlay.upload.concepts import is_known_concept
 from featuregen.overlay.upload.field_policies import policy_for
 from featuregen.overlay.upload.field_resolution import (
     FIELD_POLICY_VERSION,
     RESOLVER_VERSION,
     _evidence_set_hash,
     resolve_and_project,
+    stale_and_clear_field,
 )
+from featuregen.overlay.upload.ingest import ingest_source_lock_key
+from featuregen.overlay.upload.read_scope import allowed_sensitivities
 from featuregen.security.audit import record_denial
 
 ACTIONS: frozenset[str] = frozenset(
@@ -70,6 +74,10 @@ ACTIONS: frozenset[str] = frozenset(
 # scalar bound. A value outside the bound (or empty/whitespace-only) is REFUSED before any write.
 _MAX_LEN: dict[str, int] = {"definition": 4000}
 _DEFAULT_MAX_LEN = 512
+
+# Fields whose value is drawn from a CLOSED, known vocabulary — a correction must land a real registry
+# term, not free text (M-8). ``definition`` / ``domain`` / ``business_term`` stay genuinely free-text.
+_KNOWN_VOCAB_VALIDATORS = {"concept": is_known_concept}
 
 _HUMAN = EvidenceProducer.HUMAN.value
 
@@ -87,11 +95,15 @@ class FieldCorrectionError(Exception):
         super().__init__(detail)
 
 
-def _lock_key(logical_ref: str, field: str) -> int:
-    """A stable signed 64-bit advisory-lock key for one ``(logical_ref, field)`` — serializes
-    concurrent corrections on the SAME field within their transactions, so the loser observes the
-    winner's appended evidence and CAS-409s (rather than both appending)."""
-    digest = hashlib.sha256(f"{logical_ref}\x00{field}".encode()).digest()[:8]
+def _lock_key(logical_ref: str) -> int:
+    """A stable signed 64-bit advisory-lock key for one ``logical_ref`` (COLUMN-scoped, F review C-1).
+
+    Serializes ALL concurrent corrections on the SAME column — NOT just the same field — because a
+    confirm's :func:`resolve_and_project` re-resolves fields on the ref: a per-``(logical_ref, field)``
+    key let a sibling-field correction interleave and silently revert a just-confirmed four-eyes
+    decision. Column-scoped, the loser observes the winner's appended evidence and CAS-409s (rather
+    than both appending / one reverting)."""
+    digest = hashlib.sha256(f"field_correction:{logical_ref}".encode()).digest()[:8]
     return int.from_bytes(digest, "big", signed=True)
 
 
@@ -106,8 +118,9 @@ def _proposed_by_actor(e: FieldEvidence, actor: IdentityEnvelope) -> bool:
 
 
 def _check_bounds(field: str, value: object) -> None:
-    """Reject an out-of-bounds ``replacement_value`` BEFORE any evidence write (empty/whitespace or
-    over the field's length ceiling)."""
+    """Reject an out-of-bounds value BEFORE any evidence write: empty/whitespace, over the field's
+    length ceiling, or — for a KNOWN-vocabulary field (``concept``, M-8) — a term not in the closed
+    registry. Genuinely free-text fields (``definition`` / ``domain``) skip the vocab gate."""
     text = "" if value is None else str(value)
     if not text.strip():
         raise FieldCorrectionError(400, "replacement_value must be a non-empty value")
@@ -115,6 +128,10 @@ def _check_bounds(field: str, value: object) -> None:
         raise FieldCorrectionError(
             400, f"replacement_value exceeds the {field} bound of "
                  f"{_MAX_LEN.get(field, _DEFAULT_MAX_LEN)} characters")
+    validator = _KNOWN_VOCAB_VALIDATORS.get(field)
+    if validator is not None and not validator(text.strip()):
+        raise FieldCorrectionError(
+            400, f"{text.strip()!r} is not a recognized {field} (unrecognized_vocab)")
 
 
 def _callable_actions(
@@ -172,17 +189,18 @@ def _deny(conn: DbConn, logical_ref: str, action: str, actor: IdentityEnvelope, 
 def _append_human_evidence(
     conn: DbConn, *, logical_ref: str, field: str, value: object, strength: AssertionStrength,
     lifecycle: EvidenceLifecycle, actor: IdentityEnvelope, idempotency_key: str, input_hash: str,
-    spans: Sequence[str],
+    spans: Sequence[str], note: str | None = None,
 ) -> str:
     """APPEND one immutable HUMAN ``field_evidence`` row (never an overwrite). ``producer_ref`` is the
     confirmer/proposer SUBJECT (load-bearing for four-eyes); ``producer_item_ref`` carries the
-    idempotency key (the replay probe); ``input_hash`` fingerprints the request."""
+    idempotency key (the replay probe); ``input_hash`` fingerprints the request. ``note`` (M-9)
+    persists the reviewer's free-text rationale on the human-action row so it survives (never dropped)."""
     return record_field_evidence(
         conn, logical_ref=logical_ref, field_name=field, proposed_value=value,
         producer=EvidenceProducer.HUMAN, strength=strength, lifecycle=lifecycle,
         producer_ref=actor.subject, producer_item_ref=idempotency_key,
         source_snapshot_id=f"human-correction:{idempotency_key}", input_hash=input_hash,
-        evidence_spans=list(spans))
+        evidence_spans=list(spans), note=note)
 
 
 def apply_field_correction(
@@ -212,19 +230,30 @@ def apply_field_correction(
             403, f"field {field!r} is not correctable via the generic command; use its dedicated "
                  "command")
 
-    # 2. Resolve the schema-preserving logical_ref + confirm the asset exists (public-flattened, the
-    #    way graph.build_graph stores object_ref — matches the asset-detail evidence read).
+    # 2. Resolve the schema-preserving logical_ref + confirm the asset exists AND is VISIBLE to this
+    #    caller (I-1 read-scope). The anchor is loaded under the actor's sensitivity scope (mirroring
+    #    asset_detail._load_anchor); a hidden column (e.g. pii) the caller can't read is
+    #    INDISTINGUISHABLE from a missing one — the SAME 404, raised BEFORE the idempotency probe / CAS
+    #    read / any write — so a platform-admin WITHOUT pii_reader gets no existence oracle and no blind
+    #    write path on a column that GET 404s for the same caller.
     norm_source = source.strip().lower()
+    allowed = allowed_sensitivities(actor.role_claims)
     anchor = conn.execute(
-        "SELECT 1 FROM graph_node WHERE catalog_source = %s AND object_ref = lower(%s)",
-        (norm_source, object_ref)).fetchone()
+        "SELECT 1 FROM graph_node WHERE catalog_source = %s AND object_ref = lower(%s) "
+        "AND (sensitivity IS NULL OR sensitivity = ANY(%s))",
+        (norm_source, object_ref, allowed)).fetchone()
     if anchor is None:
         raise FieldCorrectionError(404, "asset not found")
     logical_ref = logical_ref_of(norm_source, object_ref.lower())
 
-    # 3. Serialize concurrent corrections on this field (see _lock_key): the loser then observes the
-    #    winner's append and CAS-409s instead of double-appending.
-    conn.execute("SELECT pg_advisory_xact_lock(%s)", (_lock_key(logical_ref, field),))
+    # 3. Serialize this correction against BOTH the ingest writer (I-2) AND sibling corrections on this
+    #    column (C-1). CONSISTENT lock ordering — the SOURCE lock FIRST, then the finer column lock —
+    #    matches ingest_upload (which holds ingest_source_lock_key for the whole ingest) so the two
+    #    writers can never deadlock. The column-scoped _lock_key then serializes ALL corrections on this
+    #    column: the loser observes the winner's appended evidence and CAS-409s instead of double-
+    #    appending (or reverting a just-confirmed sibling field).
+    conn.execute("SELECT pg_advisory_xact_lock(%s)", (ingest_source_lock_key(norm_source),))
+    conn.execute("SELECT pg_advisory_xact_lock(%s)", (_lock_key(logical_ref),))
 
     # 4. The request fingerprint doubles as the evidence input_hash AND the idempotency probe.
     input_hash = field_input_hash(
@@ -253,20 +282,20 @@ def apply_field_correction(
             409, "the field changed since you loaded it (concurrent decision, evidence, or policy) "
                  "— refresh and retry")
 
-    # 7. Action-specific validation (bounds / selection / four-eyes) BEFORE any write, then effect.
+    # 7. Action-specific validation (bounds / selection / four-eyes) BEFORE any write, then effect. The
+    #    reviewer ``note`` (M-9) is persisted on the appended human-action evidence row by each helper.
     if action == "propose_override":
         projected = _propose_override(conn, logical_ref, field, replacement_value, actor,
-                                      idempotency_key, input_hash)
+                                      idempotency_key, input_hash, note)
     elif action == "confirm_override":
         projected = _confirm_override(conn, norm_source, logical_ref, field, replacement_value,
-                                      actor, idempotency_key, input_hash)
+                                      actor, idempotency_key, input_hash, note)
     elif action == "confirm_existing":
         projected = _confirm_existing(conn, norm_source, logical_ref, field, selected_evidence_ids,
-                                      actor, idempotency_key, input_hash)
+                                      actor, idempotency_key, input_hash, note)
     else:  # reject
-        projected = _reject(conn, logical_ref, field, selected_evidence_ids, actor, idempotency_key,
-                            input_hash)
-    del note  # a bounded reviewer note is accepted for surface symmetry; not persisted (no column)
+        projected = _reject(conn, norm_source, logical_ref, field, selected_evidence_ids, actor,
+                            idempotency_key, input_hash, note)
 
     if isinstance(projected, dict):  # a four-eyes/authz deny envelope — return it (audit commits)
         return projected
@@ -293,7 +322,7 @@ def _success_body(
 
 def _propose_override(
     conn: DbConn, logical_ref: str, field: str, replacement_value: str | None,
-    actor: IdentityEnvelope, idempotency_key: str, input_hash: str,
+    actor: IdentityEnvelope, idempotency_key: str, input_hash: str, note: str | None,
 ) -> bool:
     """Append a NON-load-bearing HUMAN/PROPOSED override + surface it for review; do NOT project (a
     later ``confirm_override`` by a DIFFERENT subject projects). HUMAN/PROPOSED is absent from every
@@ -302,13 +331,13 @@ def _propose_override(
     _append_human_evidence(
         conn, logical_ref=logical_ref, field=field, value=replacement_value,
         strength=AssertionStrength.PROPOSED, lifecycle=EvidenceLifecycle.ACTIVE, actor=actor,
-        idempotency_key=idempotency_key, input_hash=input_hash, spans=[])
+        idempotency_key=idempotency_key, input_hash=input_hash, spans=[], note=note)
     return False  # not projected — the pending proposal IS the review item
 
 
 def _confirm_override(
     conn: DbConn, source: str, logical_ref: str, field: str, replacement_value: str | None,
-    actor: IdentityEnvelope, idempotency_key: str, input_hash: str,
+    actor: IdentityEnvelope, idempotency_key: str, input_hash: str, note: str | None,
 ) -> bool | dict:
     """Confirm a pending human override to a load-bearing HUMAN/CONFIRMED value + re-resolve/project.
     Four-eyes: a matching pending HUMAN/PROPOSED override by a DIFFERENT subject must exist — the
@@ -327,17 +356,19 @@ def _confirm_override(
         conn, logical_ref=logical_ref, field=field, value=replacement_value,
         strength=AssertionStrength.CONFIRMED, lifecycle=EvidenceLifecycle.ACTIVE, actor=actor,
         idempotency_key=idempotency_key, input_hash=input_hash,
-        spans=[e.evidence_id for e in pending])
-    resolve_and_project(conn, source=source, logical_refs=[logical_ref])
+        spans=[e.evidence_id for e in pending], note=note)
+    # C-1: re-resolve ONLY the corrected field — never a sibling field's confirmed decision.
+    resolve_and_project(conn, source=source, logical_refs=[logical_ref], fields=[field])
     return True
 
 
 def _confirm_existing(
     conn: DbConn, source: str, logical_ref: str, field: str, selected_evidence_ids: Sequence[str],
-    actor: IdentityEnvelope, idempotency_key: str, input_hash: str,
+    actor: IdentityEnvelope, idempotency_key: str, input_hash: str, note: str | None,
 ) -> bool | dict:
     """Confirm an EXISTING active proposal's value with a load-bearing HUMAN/CONFIRMED append + re-
-    resolve/project. Four-eyes: none of the selected evidence may be a HUMAN proposal by the actor."""
+    resolve/project. Four-eyes: none of the selected evidence may be a HUMAN proposal by the actor,
+    NOR (M-7) SOURCE-declared evidence (whose author — the file uploader — four-eyes can't verify)."""
     selected_ids = list(dict.fromkeys(selected_evidence_ids))
     if not selected_ids:
         raise FieldCorrectionError(400, "confirm_existing requires selected_evidence_ids")
@@ -349,35 +380,69 @@ def _confirm_existing(
         if _proposed_by_actor(e, actor):
             return _deny(conn, logical_ref, "confirm_existing", actor,
                          "four_eyes: the confirmer is the proposer of the selected evidence")
+    # M-7 (source-evidence four-eyes gap): SOURCE evidence's producer_ref is the snapshot id, not the
+    # uploading principal, so four-eyes cannot prove the confirmer is NOT the file's uploader — a single
+    # admin could upload a file declaring X then confirm_existing it (single-party author+approve).
+    # Lightest SOUND mitigation without an ingest-side schema change: DENY confirm_existing on
+    # SOURCE-declared evidence — a source value must go through a human propose_override then
+    # confirm_override (two DISTINCT human parties). Service producers (llm / parser / taxonomy /
+    # structural_connector) are genuine third parties distinct from the confirmer, so they stay OK.
+    if any(e.producer == EvidenceProducer.SOURCE.value for e in selected):
+        return _deny(conn, logical_ref, "confirm_existing", actor,
+                     "four_eyes: source-declared evidence cannot be single-party confirmed; use "
+                     "propose_override then confirm_override with a different reviewer")
     if len({canonical_hash(e.proposed_value) for e in selected}) != 1:
         raise FieldCorrectionError(400, "selected_evidence_ids disagree on a value")
+    _check_bounds(field, selected[0].proposed_value)  # M-6: bound/vocab-validate the confirmed value
     _append_human_evidence(
         conn, logical_ref=logical_ref, field=field, value=selected[0].proposed_value,
         strength=AssertionStrength.CONFIRMED, lifecycle=EvidenceLifecycle.ACTIVE, actor=actor,
-        idempotency_key=idempotency_key, input_hash=input_hash, spans=selected_ids)
-    resolve_and_project(conn, source=source, logical_refs=[logical_ref])
+        idempotency_key=idempotency_key, input_hash=input_hash, spans=selected_ids, note=note)
+    # C-1: re-resolve ONLY the corrected field — never a sibling field's confirmed decision.
+    resolve_and_project(conn, source=source, logical_refs=[logical_ref], fields=[field])
     return True
 
 
 def _reject(
-    conn: DbConn, logical_ref: str, field: str, selected_evidence_ids: Sequence[str],
-    actor: IdentityEnvelope, idempotency_key: str, input_hash: str,
+    conn: DbConn, source: str, logical_ref: str, field: str, selected_evidence_ids: Sequence[str],
+    actor: IdentityEnvelope, idempotency_key: str, input_hash: str, note: str | None,
 ) -> bool:
-    """Append a REJECTING marker (an inert HUMAN evidence in the ``rejected`` lifecycle — never read
-    by the resolver) + a REJECTED decision EVENT. May be single-reviewer. Writes NO operational
-    replacement value: no display projection, no load-bearing value."""
+    """Reject the selected evidence DURABLY (I-3): append an inert HUMAN/REJECTED marker (the audit of
+    who rejected what), flip the SELECTED active rows to the ``rejected`` lifecycle (the substrate's
+    sanctioned per-row transition, mirroring :func:`stale_source_evidence`), RE-PROJECT the field from
+    whatever active evidence survives — or CLEAR the display if none remains — so the display no longer
+    serves the rejected value, and record the REJECTED decision LAST so it is the decision head. May be
+    single-reviewer. Writes NO operational replacement value of its own."""
+    now = datetime.now(UTC)
+    selected_ids = list(dict.fromkeys(selected_evidence_ids))
     marker = _append_human_evidence(
         conn, logical_ref=logical_ref, field=field, value=None,
         strength=AssertionStrength.PROPOSED, lifecycle=EvidenceLifecycle.REJECTED, actor=actor,
-        idempotency_key=idempotency_key, input_hash=input_hash,
-        spans=list(dict.fromkeys(selected_evidence_ids)))
+        idempotency_key=idempotency_key, input_hash=input_hash, spans=selected_ids, note=note)
+    # I-3: DURABLY retire the selected ACTIVE evidence so the resolver stops reading the rejected value
+    # (mirrors the per-row lifecycle flip stale_source_evidence uses; scoped to THIS field's rows).
+    if selected_ids:
+        conn.execute(
+            "UPDATE field_evidence SET lifecycle = 'rejected' "
+            "WHERE logical_ref = %s AND field_name = %s AND evidence_id = ANY(%s) "
+            "AND lifecycle = 'active'",
+            (logical_ref, field, selected_ids))
+    # Re-project the field from the SURVIVING active evidence (or CLEAR the display if none remains),
+    # BEFORE the REJECTED head — so the flat display column no longer serves the rejected value. C-1:
+    # scoped to THIS field so a reject never re-resolves (nor reverts) a sibling field's decision.
+    if read_active_field_evidence(conn, logical_ref, field):
+        resolve_and_project(conn, source=source, logical_refs=[logical_ref], fields=[field], now=now)
+    else:
+        stale_and_clear_field(conn, source=source, logical_ref=logical_ref, field_name=field, now=now)
+    # Record the REJECTED decision LAST, at a strictly-later created_at, so it is the decision HEAD the
+    # read model surfaces (the re-projection above wrote a RESOLVED/STALED decision, not the head).
     record_field_decision(
         conn, logical_ref=logical_ref, field_name=field,
         event_type=FieldDecisionEventType.REJECTED,
-        selected_evidence_ids=[marker, *dict.fromkeys(selected_evidence_ids)],
+        selected_evidence_ids=[marker, *selected_ids],
         evidence_set_hash=_evidence_set_hash(read_active_field_evidence(conn, logical_ref, field)),
         display_value_hash=None, load_bearing_value_hash=None, conflict_status="rejected",
         reason_codes=["human_rejected"], field_policy_version=FIELD_POLICY_VERSION,
         resolver_version=RESOLVER_VERSION, actor_ref=actor.subject, supersedes_event_id=None,
-        now=datetime.now(UTC))
-    return False  # no operational replacement — nothing projected
+        now=now + timedelta(microseconds=1))
+    return False  # no operational replacement — the rejected value is retired + the display re-projected

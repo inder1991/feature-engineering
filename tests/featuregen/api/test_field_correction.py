@@ -10,6 +10,7 @@ replay. Seeding uses the SAME real paths the asset-detail tests use (`build_grap
 """
 from __future__ import annotations
 
+import psycopg
 import pytest
 
 from featuregen.overlay.catalog import _clear_catalog_adapter
@@ -17,9 +18,10 @@ from featuregen.overlay.config import _clear_overlay_config
 from featuregen.overlay.evidence import AssertionStrength, EvidenceProducer
 from featuregen.overlay.field_evidence import field_input_hash, record_field_evidence
 from featuregen.overlay.upload.canonical import CanonicalRow
-from featuregen.overlay.upload.field_correction import read_field_cas
+from featuregen.overlay.upload.field_correction import _lock_key, read_field_cas
 from featuregen.overlay.upload.field_resolution import resolve_and_project
 from featuregen.overlay.upload.graph import build_graph
+from featuregen.overlay.upload.ingest import ingest_source_lock_key
 from featuregen.overlay.upload.object_ref import normalize_ref
 
 # Two DISTINCT platform-admin confirmers (the raw `platform-admin` claim require_confirmer gates on);
@@ -330,3 +332,198 @@ def test_returned_actions_reflect_caller_authz(client, conn):
     assert "confirm_existing" in actions
     assert "confirm_override" not in actions
     assert "propose_override" in actions and "reject" in actions
+
+
+# ── F review fixes ────────────────────────────────────────────────────────────────────────────────
+
+
+def _decision_head(conn, ref, field):
+    return conn.execute(
+        "SELECT decision_event_id, event_type FROM field_decision_event "
+        "WHERE logical_ref = %s AND field_name = %s "
+        "ORDER BY created_at DESC, decision_event_id DESC LIMIT 1", (ref, field)).fetchone()
+
+
+# ── C-1: a confirm re-resolves ONLY the corrected field; the correction lock is COLUMN-scoped ──────
+
+
+def test_c1_sibling_field_confirm_never_reverts_and_lock_is_column_scoped(client, conn, _dsn):
+    _seed_column(conn, "srcc1", "accounts", "balance", "numeric")
+    ref = normalize_ref("srcc1", None, "accounts", "balance")
+    # Two SERVICE (LLM) proposals on DIFFERENT fields of the SAME column.
+    def_eid = _seed_evidence(conn, ref, "definition", "llm definition", EvidenceProducer.LLM,
+                             AssertionStrength.PROPOSED, producer_ref="enrich")
+    dom_eid = _seed_evidence(conn, ref, "domain", "llm domain", EvidenceProducer.LLM,
+                             AssertionStrength.PROPOSED, producer_ref="enrich")
+
+    # priya confirms `definition` → projects + records its OWN decision head.
+    cas_def = _cas(conn, "srcc1", "public.accounts.balance", "definition")
+    r_def = _post(client, "srcc1", "public.accounts.balance", "definition", ADMIN_A, cas_def,
+                  "confirm_existing", idem="c1-def", selected_evidence_ids=[def_eid])
+    assert r_def.status_code == 200, r_def.text
+    def_head_before = _decision_head(conn, ref, "definition")
+    assert def_head_before is not None
+    assert _graph_value(conn, "srcc1", "public.accounts.balance", "definition") == "llm definition"
+
+    # sam confirms the SIBLING field `domain`. With C-1 (fields=[field]) this re-resolves ONLY
+    # `domain`; it must NOT re-resolve `definition` (the revert bug) — definition's decision head and
+    # display stay exactly its own confirm.
+    cas_dom = _cas(conn, "srcc1", "public.accounts.balance", "domain")
+    r_dom = _post(client, "srcc1", "public.accounts.balance", "domain", ADMIN_B, cas_dom,
+                  "confirm_existing", idem="c1-dom", selected_evidence_ids=[dom_eid])
+    assert r_dom.status_code == 200, r_dom.text
+    assert _decision_head(conn, ref, "definition") == def_head_before   # untouched — not re-resolved
+    assert _graph_value(conn, "srcc1", "public.accounts.balance", "definition") == "llm definition"
+    # each field's head IS its own confirm; domain now also carries a load-bearing decision + display.
+    assert _decision_head(conn, ref, "domain")[1] in ("resolved", "confirmed")
+    assert _graph_value(conn, "srcc1", "public.accounts.balance", "domain") == "llm domain"
+
+    # The correction lock is COLUMN-scoped (not per-field): while this uncommitted tx holds it, a
+    # SECOND session's try-lock on the SAME column key is contended — so a sibling-field correction
+    # would BLOCK (serialize) instead of interleaving and reverting. A different column's key is free.
+    with psycopg.connect(_dsn, autocommit=True) as probe:
+        held = probe.execute("SELECT pg_try_advisory_xact_lock(%s)", (_lock_key(ref),)).fetchone()[0]
+        assert held is False
+        other = normalize_ref("srcc1", None, "accounts", "other")
+        free = probe.execute("SELECT pg_try_advisory_xact_lock(%s)",
+                             (_lock_key(other),)).fetchone()[0]
+        assert free is True
+
+
+# ── I-1: the correction anchor is READ-SCOPED — a hidden (pii) column 404s (same as GET), no write ──
+
+
+def test_i1_hidden_pii_anchor_404s_for_non_pii_admin_no_write(client, conn):
+    _seed_column(conn, "srci1", "customers", "ssn", "text", sensitivity="pii")
+    ref = normalize_ref("srci1", None, "customers", "ssn")
+    # catalog:read comes from catalog_viewer; pii visibility from pii_reader — two separate axes. The
+    # SCOPED admin has catalog:read + the confirmer claim but NOT pii_reader; the PII viewer can see it.
+    pii_viewer = {"X-User": "dana", "X-Roles": "catalog_viewer,pii_reader"}
+    scoped_admin = {"X-User": "sam", "X-Roles": "platform-admin,catalog_viewer"}
+
+    # A pii_reader CAN see it (GET 200) — proving the column genuinely EXISTS.
+    r_get_pii = client.get("/catalog/assets/srci1/public.customers.ssn", headers=pii_viewer)
+    assert r_get_pii.status_code == 200, r_get_pii.text
+
+    # The scoped admin (catalog:read, NO pii_reader) gets 404 on GET — hidden, indistinguishable from
+    # missing.
+    r_get = client.get("/catalog/assets/srci1/public.customers.ssn", headers=scoped_admin)
+    assert r_get.status_code == 404, r_get.text
+
+    # The correction command must 404 the SAME caller (no existence oracle, no blind write path) even
+    # with a bogus CAS — the read-scope check fires BEFORE the idempotency probe / CAS / any write.
+    bogus = {"latest_decision_id": None, "evidence_set_hash": "x", "policy_version": "y"}
+    r_post = _post(client, "srci1", "public.customers.ssn", "definition", scoped_admin, bogus,
+                   "propose_override", idem="i1", replacement_value="leak")
+    assert r_post.status_code == 404, r_post.text
+    assert _human_count(conn, ref, "definition") == 0   # no write, no CAS side channel
+
+
+# ── I-2: the correction serializes against the ingest writer (same ingest_source_lock_key) ─────────
+
+
+def test_i2_correction_holds_ingest_source_lock(client, conn, _dsn):
+    _seed_column(conn, "srci2", "accounts", "balance", "numeric")
+    cas = _cas(conn, "srci2", "public.accounts.balance", "definition")
+    r = _post(client, "srci2", "public.accounts.balance", "definition", ADMIN_A, cas,
+              "propose_override", idem="i2", replacement_value="v")
+    assert r.status_code == 200, r.text
+
+    # The correction's still-open tx HOLDS the SAME source-scoped lock ingest_upload takes at its top,
+    # so a concurrent same-source upload would block on it (no torn evidence/decision). A DIFFERENT
+    # source is a different key — never contended.
+    with psycopg.connect(_dsn, autocommit=True) as probe:
+        same = probe.execute("SELECT pg_try_advisory_xact_lock(%s)",
+                             (ingest_source_lock_key("srci2"),)).fetchone()[0]
+        assert same is False
+        other = probe.execute("SELECT pg_try_advisory_xact_lock(%s)",
+                             (ingest_source_lock_key("srci2-other"),)).fetchone()[0]
+        assert other is True
+
+
+# ── I-3: reject is DURABLE — the rejected value is retired + the display cleared/re-projected ───────
+
+
+def test_i3_reject_durably_retires_selected_and_clears_display(client, conn):
+    _seed_column(conn, "srci3", "accounts", "balance", "numeric")
+    ref = normalize_ref("srci3", None, "accounts", "balance")
+    eid = _seed_evidence(conn, ref, "concept", "monetary_stock", EvidenceProducer.LLM,
+                         AssertionStrength.PROPOSED, producer_ref="enrich")
+    resolve_and_project(conn, source="srci3", logical_refs=[ref])   # display shows the proposed value
+    assert _graph_value(conn, "srci3", "public.accounts.balance", "concept") == "monetary_stock"
+    cas = _cas(conn, "srci3", "public.accounts.balance", "concept")
+
+    r = _post(client, "srci3", "public.accounts.balance", "concept", ADMIN_A, cas, "reject",
+              idem="i3", selected_evidence_ids=[eid], reason="wrong concept")
+    assert r.status_code == 200, r.text
+
+    # DURABLE: the selected evidence is flipped out of 'active' so the resolver stops serving it, the
+    # display column no longer shows the rejected value, and the decision HEAD reflects the rejection.
+    lifecycle = conn.execute("SELECT lifecycle FROM field_evidence WHERE evidence_id = %s",
+                             (eid,)).fetchone()[0]
+    assert lifecycle == "rejected"
+    assert _graph_value(conn, "srci3", "public.accounts.balance", "concept") is None
+    head = _decision_head(conn, ref, "concept")
+    assert head[1] == "rejected"
+
+
+# ── M-5..M-9 ──────────────────────────────────────────────────────────────────────────────────────
+
+
+def test_m6_confirm_existing_bounds_checked_before_write(client, conn):
+    _seed_column(conn, "srcm6", "accounts", "balance", "numeric")
+    ref = normalize_ref("srcm6", None, "accounts", "balance")
+    # A service proposal whose value is OVER the domain bound (512) — confirm_existing must refuse it
+    # before the append (M-6), not silently copy an out-of-bounds value into a CONFIRMED row.
+    eid = _seed_evidence(conn, ref, "domain", "x" * 600, EvidenceProducer.LLM,
+                         AssertionStrength.PROPOSED, producer_ref="enrich")
+    cas = _cas(conn, "srcm6", "public.accounts.balance", "domain")
+    r = _post(client, "srcm6", "public.accounts.balance", "domain", ADMIN_A, cas,
+              "confirm_existing", idem="m6", selected_evidence_ids=[eid])
+    assert r.status_code == 400, r.text
+    assert _human_count(conn, ref, "domain") == 0
+
+
+def test_m7_source_declared_evidence_cannot_be_single_party_confirmed(client, conn):
+    _seed_column(conn, "srcm7", "accounts", "balance", "numeric")
+    ref = normalize_ref("srcm7", None, "accounts", "balance")
+    # A file-DECLARED (SOURCE) value: its producer_ref is the snapshot id, not the uploader, so a
+    # single admin could author (upload) + approve via confirm_existing. M-7 DENIES that path.
+    eid = _seed_evidence(conn, ref, "domain", "declared domain", EvidenceProducer.SOURCE,
+                         AssertionStrength.ATTESTED, producer_ref="snap-xyz")
+    cas = _cas(conn, "srcm7", "public.accounts.balance", "domain")
+    r = _post(client, "srcm7", "public.accounts.balance", "domain", ADMIN_B, cas,
+              "confirm_existing", idem="m7", selected_evidence_ids=[eid])
+    assert r.status_code == 403, r.text
+    assert "source-declared" in r.json()["detail"]
+    assert _human_count(conn, ref, "domain") == 0
+
+
+def test_m8_unknown_concept_refused_known_concept_allowed(client, conn):
+    _seed_column(conn, "srcm8", "accounts", "balance", "numeric")
+    ref = normalize_ref("srcm8", None, "accounts", "balance")
+    cas = _cas(conn, "srcm8", "public.accounts.balance", "concept")
+    # concept is a CLOSED vocabulary — a bogus term is refused before any write (M-8).
+    r_bad = _post(client, "srcm8", "public.accounts.balance", "concept", ADMIN_A, cas,
+                  "propose_override", idem="m8-bad", replacement_value="not_a_real_concept")
+    assert r_bad.status_code == 400, r_bad.text
+    assert "unrecognized_vocab" in r_bad.json()["detail"]
+    assert _human_count(conn, ref, "concept") == 0
+    # A REAL registry concept passes.
+    r_ok = _post(client, "srcm8", "public.accounts.balance", "concept", ADMIN_A, cas,
+                 "propose_override", idem="m8-ok", replacement_value="monetary_stock")
+    assert r_ok.status_code == 200, r_ok.text
+
+
+def test_m9_reason_note_is_persisted(client, conn):
+    _seed_column(conn, "srcm9", "accounts", "balance", "numeric")
+    ref = normalize_ref("srcm9", None, "accounts", "balance")
+    cas = _cas(conn, "srcm9", "public.accounts.balance", "definition")
+    r = _post(client, "srcm9", "public.accounts.balance", "definition", ADMIN_A, cas,
+              "propose_override", idem="m9", replacement_value="a better definition",
+              reason="corrected per data-owner review")
+    assert r.status_code == 200, r.text
+    note = conn.execute(
+        "SELECT note FROM field_evidence WHERE logical_ref = %s AND field_name = 'definition' "
+        "AND producer = 'human'", (ref,)).fetchone()[0]
+    assert note == "corrected per data-owner review"

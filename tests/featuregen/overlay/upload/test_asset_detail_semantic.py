@@ -121,6 +121,22 @@ def test_verified_entity_and_currency_edges_rendered_verified(overlay_conn):
     assert sem["candidates"] == [] and sem["divergences"] == []
 
 
+# ── (1b) M-5: a VERIFIED edge whose OTHER endpoint has NO graph_node row is OMITTED (fail-closed) ───
+
+def test_m5_currency_edge_to_absent_endpoint_is_omitted(overlay_conn):
+    conn = overlay_conn
+    # Only `notional` has a graph_node row; the edge points at a column with NO node at all.
+    build_graph(conn, "t1b", [CanonicalRow("t1b", "trades", "notional", "numeric")])
+    _verified_currency_edge(conn, "t1b", "public.trades.notional", "public.trades.ghost",
+                            fk="c-fk", ev="c-ev")
+
+    # Fail-closed: the missing endpoint must NOT be admitted via a NULL LEFT-JOIN sensitivity — the
+    # whole edge is omitted (no count, no id), so the anchor shows NO verified currency edge.
+    sem = _semantic(conn, "t1b", "public.trades.notional", roles=READER.role_claims, identity=READER)
+    assert sem["status"] == "available"
+    assert [e for e in sem["verified_edges"] if e["kind"] == "currency_binding"] == []
+
+
 # ── (2) A DRAFT/candidate binding is shown as PROPOSED (disposition + reason codes), NOT verified ───
 
 def test_draft_candidate_shown_as_proposed_not_verified(overlay_conn):
