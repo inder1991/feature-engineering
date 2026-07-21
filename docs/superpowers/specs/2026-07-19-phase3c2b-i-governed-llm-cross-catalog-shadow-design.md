@@ -42,6 +42,6 @@ B accepts only `(SOURCE,ATTESTED)`/`(HUMAN,CONFIRMED)` evidence, but **no produc
 
 ## Sequencing gate
 
-Both children are shadow-only and independently gated. **3C.2b-ii (the live flip + `find_cross_catalog_path` removal) may proceed only after A's assembly gate AND B's normalization gate independently pass**, and the authority-provisioning dependency is met. Plan **A first**; B's plan waits until A's compiler and plan-carrier interfaces land and A's exact-outcome gold gate passes.
+Both children are shadow-only. **A is COMPLETE + merge-ready** (assembly gate passes on real-governance-seeded gold; migration **1010** on the branch — re-confirm at merge). B builds on top with **two gates** (B §12): **Gate 1 (component qualification)** — seeded-gold, proves the adapter + A/B contract integration, and is sufficient for B to land shadow-only; **Gate 2 (population readiness)** — real-telemetry + the authority-provisioning dependency, required before the live flip. **3C.2b-ii (the live flip + `find_cross_catalog_path` removal) may proceed only after A's assembly gate, B's Gate 1, AND B's Gate 2 (which requires the field-level authority-provisioning) all pass.** Seeded-gold success (Gate 1) alone must never approve the live flip.
 
-Migrations: A = **1005**, B = **1006** (after the rebase over `1004_ingestion_run_source_profile.sql`); re-confirm free at build time.
+Migrations: A = **1010** (built), B = **1011+** (re-confirm above origin/main's highest at build time — origin/main keeps advancing).

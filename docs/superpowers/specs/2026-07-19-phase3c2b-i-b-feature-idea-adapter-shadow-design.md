@@ -45,7 +45,18 @@ No `expected_concept`. (1) Active evidence via `read_active_field_evidence`, con
 
 ### 3.1 Authority-provisioning dependency (findings #5, #9 — tightened)
 
-No production writer attests `concept` today (`LLM/PROPOSED` from `enrich.py:310`; `d90d457` source profiles attest `unit/currency/entity/data_type/...` but **not** `concept`, `source_profile.py`; no human writer). Provisioning rules: a source profile may attest `concept` **only** when the source **explicitly supplies a canonical concept under a governed capability contract** — an LLM-derived mapping must **never** be relabeled `SOURCE/ATTESTED`. And provisioning must cover **structural authority too** (grain/time/key): FTR has no structural fields, so concept alone still leaves grain/time/key mappings unavailable, and B would reject on structural grounds. The dependency therefore covers **both** explicit concept authority **and** structural-authority provisioning, and B's gate requires a **non-vacuous** population for each activatable cohort (§12).
+No production writer attests `concept` today (`LLM/PROPOSED` from `enrich.py:310`; `d90d457` source profiles attest `unit/currency/entity/data_type/...` but **not** `concept`, `source_profile.py`; no human writer). Provisioning rules: a source profile may attest `concept` **only** when the source **explicitly supplies a canonical concept under a governed capability contract** — an LLM-derived mapping must **never** be relabeled `SOURCE/ATTESTED`. And provisioning must cover **structural authority too** (grain/time/key): FTR has no structural fields, so concept alone still leaves grain/time/key mappings unavailable, and B would reject on structural grounds. The dependency therefore covers **both** explicit concept authority **and** structural-authority provisioning, and it is the prerequisite for **Gate 2** (§12) and 3C.2b-ii — **never** for building/qualifying B (Gate 1 uses seeded authority).
+
+**Field-level authority-capability model (strict — not a blanket "an FTR glossary may attest concept + grain").** Canonical concept, physical grain, and business term are DIFFERENT authority classes; provisioning must grant each separately:
+
+| Field | Acceptable authority |
+|---|---|
+| Canonical (planner) concept | an explicit source-owned canonical mapping, or human confirmation |
+| Physical source grain | a structural connector declaration, or a human-confirmed governed grain fact |
+| FTR business term | semantic source evidence — **not** automatically a canonical planner concept |
+| Pass-B inferred grain | a **proposal only** until human confirmation |
+
+This is an INGESTION-layer capability (extend the source-capability profile under a governed capability contract), separable from B and owned by the ingestion program.
 
 ## 4. Deterministic role assignment (findings #9, #10)
 
@@ -61,9 +72,9 @@ Match derived roles to the operation shape (A §3). Numeric `path_strategy` sets
 
 Exact alias grammar → canonical op + typed `window` (no free-text `trend_90d`; `feature_assist.py:44`); unknown/compound → `OPERATION_UNRECOGNIZED`; windowed op without typed `window` → `WINDOW_REQUIRED_UNSPECIFIED`. Time anchoring does **not** use display `is_as_of` `LIMIT 1` (`feature_assist.py:452`); B **independently resolves a governed time anchor** (accepted `pit_role` + governed structural authority) → else `TIME_ANCHOR_UNGOVERNED`. The final expression references the time slot by `time_slot_id` (A §2.1).
 
-## 6. Governed grain + source-side structural bindings (findings #2, #4)
+## 6. Governed grain + source-side structural bindings (reconciled to as-built A)
 
-Grain authority (missing/conflicting → `GRAIN_UNRESOLVED`): confirmed scope `target_entity` → governed source-qualified grain candidates → LLM `grain_table` **consistency check only**. B emits the logical `target_entity`; **A selects the physical landing** — so B provides **source-side** `GovernedSourceBindingV1` per operand (authoritative `source_grain_entity` + `source_key_ref` + provenance), **not** a source→landing key mapping (B can't know the landing). Structural facts come from governed grain/key facts, never `graph_node.concept`/`is_grain`. Ungoverned → `STRUCTURAL_NEED_UNGOVERNED`.
+Grain authority (missing/conflicting → `GRAIN_UNRESOLVED`): confirmed scope `target_entity` → governed source-qualified grain candidates → LLM `grain_table` **consistency check only**. B emits the logical `target_entity`; **A selects the physical landing** — so B provides, per operand, the **as-built** carrier `GovernedSourceBindingV1(source_grain_entity, source_grain_key_refs: tuple[str, ...], grain_fact_key)`: a composite (qualified) key-ref tuple + the deterministic `fact_key` of the **CURRENT VERIFIED grain fact** on the source table (there is no separate key fact — source key columns come from the grain fact's `columns`). B **resolves** `source_grain_key_refs`/`grain_fact_key` from that VERIFIED grain fact via `resolve_fact`; it must **never manufacture** them from `graph_node`/`is_grain`/advisory grain metadata. **A independently revalidates `grain_fact_key` before planning** (Task-5.5 defense-in-depth): B resolves and supplies authority, A verifies; an absent VERIFIED grain fact or a `grain_fact_key` mismatch → `source_binding_ungoverned` (A). B rejects `STRUCTURAL_NEED_UNGOVERNED` when it cannot resolve a VERIFIED source grain fact at all (before it can build the binding).
 
 ## 7. Worker topology + orchestration (findings #11, #12)
 
@@ -85,11 +96,21 @@ No `synthetic_template_id`/"planner role". **Cohort assigned before any later-st
 
 **Resolve:** raw captured losslessly → cross-catalog → authority present → normalizes → A resolves → preserved. **Semantic rejects:** `PROPOSAL_LOSSY`, `UNRESOLVED_OPERAND`, `AMBIGUOUS_COLUMN_IDENTITY`, `CONCEPT_AUTHORITY_MISSING`, `CONCEPT_AUTHORITY_CONFLICT`, `CONCEPT_EVIDENCE_STALE`, `CONCEPT_REVALIDATION_PENDING`, `CONCEPT_NOT_IN_REGISTRY`, `OPERATION_UNRECOGNIZED`, `WINDOW_REQUIRED_UNSPECIFIED`, `OPERAND_SHAPE_INVALID`, `OPERAND_ORDER_AUTHORITY_MISSING`, `GRAIN_UNRESOLVED`, `TIME_ANCHOR_UNGOVERNED`, `STRUCTURAL_NEED_UNGOVERNED`, + A's rejects surfaced through. **Technical:** `OPERAND_OR_SLOT_NOT_PRESERVED`, `TECHNICAL_FAILURE`. **Capture-incomplete:** `BUDGET_TRUNCATED`, `AUTHORITY_STATE_DRIFTED`. **Diagnostics:** `DISPLAY_CONCEPT_MISMATCH`, lower-authority disagreement, heuristic `diagnostic_candidate`.
 
-## 12. Gate (partitioned — finding #11) + non-vacuous authority
+## 12. Two gates (component qualification + population readiness)
 
-**Correctness gold** (immutable expected outcomes; **positive cases MUST resolve** with the exact expected intent and, end-to-end through A, the exact expected plan) vs **fault-observability controls** (injected DB error, budget truncation, authority drift — pass when exactly classified; excluded from the clean population). Gate over the clean population: zero false resolves; 100% operand + operation preservation; deterministic replay from the persisted canonical raw input + identity map; no unexplained rejection category; no technical failures. Additionally: a **non-vacuous** attested/confirmed population per activatable cohort, and the **minimum distinct authoritative shapes** per cohort, measured against **trusted labels** (the gold's known-correct normalization) so real false-normalization is quantifiable. Resolution rate on real traffic is descriptive; **do not gate on it.**
+B's shadow discipline requires **two distinct gates**. Seeded-gold success qualifies the *component* but must **never** approve the live flip — allowing it to would make the shadow vacuous. Waiting for provisioning before writing B would needlessly block the adapter.
 
-## 13. Gold set (must include)
+### Gate 1 — Component qualification (lets B land, shadow-only)
+Immutable gold cases whose authority is **seeded through PRODUCTION COMMANDS, not direct table inserts** — concept evidence via the real evidence writer at `SOURCE/ATTESTED` or `HUMAN/CONFIRMED`; grain via `propose_fact`→`_confirm_grain` — exercising the full chain end to end:
+`source/human concept evidence → concept authority resolver → VERIFIED grain fact → GovernedSourceBindingV1 → MultiSourcePlannerIntentV1 → A assembly + compiler`.
+Proves: exact concept-authority resolution; exact composite grain-key preservation; `grain_fact_key` correctness; deterministic normalization; operand preservation; expected positive cases resolve (end-to-end through A to the exact expected plan); expected adversarial cases reject with the exact code; **A and B contracts integrate correctly**. Plus fault-observability controls (injected DB error / budget truncation / `AUTHORITY_STATE_DRIFTED` — pass when exactly classified, excluded from the clean population). This gate is **sufficient for B to land shadow-only**; resolution rate is descriptive, **do not gate on it**.
+
+### Gate 2 — Population readiness (required before 3C.2b-ii)
+Runs **after** the ingestion authority-provisioning (§3.1) exists **and** B has observed a real telemetry window. Proves against real data: real catalog columns carry accepted concept authority; real source tables carry VERIFIED grain facts; **≥1 real idea in the intended activation cohort resolves**; authority-missing failures are cause-labelled; **no false normalizations** in the reviewed sample; replay produces the same normalized intent + disposition; real FTR/connector identity + lifecycle behaviour match the gold environment. **A reject-everything adapter cannot pass this gate.** Population readiness — not Gate 1 — is what unblocks the live flip; measured against **trusted labels** so real false-normalization is quantifiable.
+
+## 13. Gold set (Gate 1; must include)
+
+All authority in the gold is **seeded through the real governance write paths (production commands), never direct table inserts** — concept evidence via the evidence writer at `SOURCE/ATTESTED`/`HUMAN/CONFIRMED`, grain via `propose_fact`→`_confirm_grain` (so `grain_fact_key`s are the real deterministic keys A revalidates against).
 
 **Correctness — positive (must resolve):** single-measure and `TREND` cross-catalog ideas with **real attested/confirmed** concept + governed structural bindings; a composite-grain landing. **Correctness — negative (exact code):** `RATIO`/`DIFFERENCE` → `OPERAND_ORDER_AUTHORITY_MISSING`; lossy proposal → `PROPOSAL_LOSSY`; a bare name resolving to two catalogs → `AMBIGUOUS_COLUMN_IDENTITY`; unresolved operand; unregistered concept; conflicting human evidence; source-only vs human (cohort split); stale-only / rejected-only (distinct); display≠authoritative (diagnostic, pin correct); grain contradiction; `duration_tenure`-as-TIME attempt (must not classify TIME); ungoverned time anchor; unknown/compound op; missing window; ungoverned structural need; pin-bypass. **Fault controls (separate partition):** injected DB error; budget-truncated run; authority-state drift between capture and worker → `AUTHORITY_STATE_DRIFTED`.
 
